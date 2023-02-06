@@ -1,12 +1,7 @@
-use assets::*;
-use measurement_module::*;
-use sources::*;
+use dsm_asset::*;
+use dsm_measurement::*;
+use dsm_source::*;
 use tokio::time::{sleep, Duration};
-
-mod assets;
-mod influxdb2;
-mod measurement_module;
-mod sources;
 
 #[tokio::main]
 async fn main() {

@@ -139,15 +139,51 @@ dependencies = [
 ]
 
 [[package]]
-name = "dsm-input"
-version = "0.0.1"
+name = "dsm_asset"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "dsm_influxdb"
+version = "0.1.0"
 dependencies = [
  "chrono",
  "reqwest",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "dsm_input"
+version = "0.0.1"
+dependencies = [
+ "dsm_asset",
+ "dsm_measurement",
+ "dsm_source",
  "tokio",
+]
+
+[[package]]
+name = "dsm_measurement"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dsm_asset",
+ "dsm_influxdb",
+ "dsm_source",
  "uuid",
+]
+
+[[package]]
+name = "dsm_source"
+version = "0.1.0"
+dependencies = [
+ "dsm_asset",
+ "reqwest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
