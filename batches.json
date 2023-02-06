@@ -1,0 +1,1636 @@
+{
+  "batch_measurements": [
+    {
+      "batch_measurement_timestamp": 1672921020,
+      "batch_measurement_location": 1672921020,
+      "batch_measurement_value": 16898.408329628903,
+      "batch_measurement_amplitude": 16898.408329628903,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672921080,
+      "batch_measurement_location": 1672921080,
+      "batch_measurement_value": 16898.151450357975,
+      "batch_measurement_amplitude": 16898.151450357975,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672921140,
+      "batch_measurement_location": 1672921140,
+      "batch_measurement_value": 16897.894571087043,
+      "batch_measurement_amplitude": 16897.894571087043,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672921200,
+      "batch_measurement_location": 1672921200,
+      "batch_measurement_value": 16897.63769181611,
+      "batch_measurement_amplitude": 16897.63769181611,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672921260,
+      "batch_measurement_location": 1672921260,
+      "batch_measurement_value": 16897.287587712857,
+      "batch_measurement_amplitude": 16897.287587712857,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672921320,
+      "batch_measurement_location": 1672921320,
+      "batch_measurement_value": 16896.9374836096,
+      "batch_measurement_amplitude": 16896.9374836096,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672921380,
+      "batch_measurement_location": 1672921380,
+      "batch_measurement_value": 16896.587379506345,
+      "batch_measurement_amplitude": 16896.587379506345,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672921440,
+      "batch_measurement_location": 1672921440,
+      "batch_measurement_value": 16896.237275403088,
+      "batch_measurement_amplitude": 16896.237275403088,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672921500,
+      "batch_measurement_location": 1672921500,
+      "batch_measurement_value": 16895.887171299833,
+      "batch_measurement_amplitude": 16895.887171299833,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672921560,
+      "batch_measurement_location": 1672921560,
+      "batch_measurement_value": 16894.166917068473,
+      "batch_measurement_amplitude": 16894.166917068473,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672921620,
+      "batch_measurement_location": 1672921620,
+      "batch_measurement_value": 16892.44666283711,
+      "batch_measurement_amplitude": 16892.44666283711,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672921680,
+      "batch_measurement_location": 1672921680,
+      "batch_measurement_value": 16890.726408605748,
+      "batch_measurement_amplitude": 16890.726408605748,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672921740,
+      "batch_measurement_location": 1672921740,
+      "batch_measurement_value": 16889.006154374383,
+      "batch_measurement_amplitude": 16889.006154374383,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672921800,
+      "batch_measurement_location": 1672921800,
+      "batch_measurement_value": 16887.285900143022,
+      "batch_measurement_amplitude": 16887.285900143022,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672921860,
+      "batch_measurement_location": 1672921860,
+      "batch_measurement_value": 16886.374017680937,
+      "batch_measurement_amplitude": 16886.374017680937,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672921920,
+      "batch_measurement_location": 1672921920,
+      "batch_measurement_value": 16885.462135218848,
+      "batch_measurement_amplitude": 16885.462135218848,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672921980,
+      "batch_measurement_location": 1672921980,
+      "batch_measurement_value": 16884.550252756762,
+      "batch_measurement_amplitude": 16884.550252756762,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672922040,
+      "batch_measurement_location": 1672922040,
+      "batch_measurement_value": 16883.638370294673,
+      "batch_measurement_amplitude": 16883.638370294673,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672922100,
+      "batch_measurement_location": 1672922100,
+      "batch_measurement_value": 16882.726487832588,
+      "batch_measurement_amplitude": 16882.726487832588,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672922160,
+      "batch_measurement_location": 1672922160,
+      "batch_measurement_value": 16881.409956624146,
+      "batch_measurement_amplitude": 16881.409956624146,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672922220,
+      "batch_measurement_location": 1672922220,
+      "batch_measurement_value": 16880.093425415707,
+      "batch_measurement_amplitude": 16880.093425415707,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672922280,
+      "batch_measurement_location": 1672922280,
+      "batch_measurement_value": 16878.776894207265,
+      "batch_measurement_amplitude": 16878.776894207265,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672922340,
+      "batch_measurement_location": 1672922340,
+      "batch_measurement_value": 16877.460362998827,
+      "batch_measurement_amplitude": 16877.460362998827,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672922400,
+      "batch_measurement_location": 1672922400,
+      "batch_measurement_value": 16876.143831790385,
+      "batch_measurement_amplitude": 16876.143831790385,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672922460,
+      "batch_measurement_location": 1672922460,
+      "batch_measurement_value": 16876.143831790374,
+      "batch_measurement_amplitude": 16876.143831790374,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672922520,
+      "batch_measurement_location": 1672922520,
+      "batch_measurement_value": 16876.143831790363,
+      "batch_measurement_amplitude": 16876.143831790363,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672922580,
+      "batch_measurement_location": 1672922580,
+      "batch_measurement_value": 16876.14383179035,
+      "batch_measurement_amplitude": 16876.14383179035,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672922640,
+      "batch_measurement_location": 1672922640,
+      "batch_measurement_value": 16876.143831790338,
+      "batch_measurement_amplitude": 16876.143831790338,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672922700,
+      "batch_measurement_location": 1672922700,
+      "batch_measurement_value": 16876.143831790327,
+      "batch_measurement_amplitude": 16876.143831790327,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672922760,
+      "batch_measurement_location": 1672922760,
+      "batch_measurement_value": 16874.806186242382,
+      "batch_measurement_amplitude": 16874.806186242382,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672922820,
+      "batch_measurement_location": 1672922820,
+      "batch_measurement_value": 16873.468540694437,
+      "batch_measurement_amplitude": 16873.468540694437,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672922880,
+      "batch_measurement_location": 1672922880,
+      "batch_measurement_value": 16872.130895146496,
+      "batch_measurement_amplitude": 16872.130895146496,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672922940,
+      "batch_measurement_location": 1672922940,
+      "batch_measurement_value": 16870.79324959855,
+      "batch_measurement_amplitude": 16870.79324959855,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672923000,
+      "batch_measurement_location": 1672923000,
+      "batch_measurement_value": 16869.455604050607,
+      "batch_measurement_amplitude": 16869.455604050607,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672923060,
+      "batch_measurement_location": 1672923060,
+      "batch_measurement_value": 16869.489338949716,
+      "batch_measurement_amplitude": 16869.489338949716,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672923120,
+      "batch_measurement_location": 1672923120,
+      "batch_measurement_value": 16869.523073848828,
+      "batch_measurement_amplitude": 16869.523073848828,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672923180,
+      "batch_measurement_location": 1672923180,
+      "batch_measurement_value": 16869.556808747937,
+      "batch_measurement_amplitude": 16869.556808747937,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672923240,
+      "batch_measurement_location": 1672923240,
+      "batch_measurement_value": 16869.59054364705,
+      "batch_measurement_amplitude": 16869.59054364705,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672923300,
+      "batch_measurement_location": 1672923300,
+      "batch_measurement_value": 16869.624278546158,
+      "batch_measurement_amplitude": 16869.624278546158,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672923360,
+      "batch_measurement_location": 1672923360,
+      "batch_measurement_value": 16870.886035659518,
+      "batch_measurement_amplitude": 16870.886035659518,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672923420,
+      "batch_measurement_location": 1672923420,
+      "batch_measurement_value": 16872.147792772874,
+      "batch_measurement_amplitude": 16872.147792772874,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672923480,
+      "batch_measurement_location": 1672923480,
+      "batch_measurement_value": 16873.409549886233,
+      "batch_measurement_amplitude": 16873.409549886233,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672923540,
+      "batch_measurement_location": 1672923540,
+      "batch_measurement_value": 16874.67130699959,
+      "batch_measurement_amplitude": 16874.67130699959,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672923600,
+      "batch_measurement_location": 1672923600,
+      "batch_measurement_value": 16875.93306411295,
+      "batch_measurement_amplitude": 16875.93306411295,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672923660,
+      "batch_measurement_location": 1672923660,
+      "batch_measurement_value": 16876.203774187175,
+      "batch_measurement_amplitude": 16876.203774187175,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672923720,
+      "batch_measurement_location": 1672923720,
+      "batch_measurement_value": 16876.474484261405,
+      "batch_measurement_amplitude": 16876.474484261405,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672923780,
+      "batch_measurement_location": 1672923780,
+      "batch_measurement_value": 16876.745194335632,
+      "batch_measurement_amplitude": 16876.745194335632,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672923840,
+      "batch_measurement_location": 1672923840,
+      "batch_measurement_value": 16877.015904409862,
+      "batch_measurement_amplitude": 16877.015904409862,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672923900,
+      "batch_measurement_location": 1672923900,
+      "batch_measurement_value": 16877.28661448409,
+      "batch_measurement_amplitude": 16877.28661448409,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672923960,
+      "batch_measurement_location": 1672923960,
+      "batch_measurement_value": 16877.28661448409,
+      "batch_measurement_amplitude": 16877.28661448409,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672924020,
+      "batch_measurement_location": 1672924020,
+      "batch_measurement_value": 16877.28661448409,
+      "batch_measurement_amplitude": 16877.28661448409,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672924080,
+      "batch_measurement_location": 1672924080,
+      "batch_measurement_value": 16877.286614484085,
+      "batch_measurement_amplitude": 16877.286614484085,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672924140,
+      "batch_measurement_location": 1672924140,
+      "batch_measurement_value": 16877.286614484085,
+      "batch_measurement_amplitude": 16877.286614484085,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672924200,
+      "batch_measurement_location": 1672924200,
+      "batch_measurement_value": 16877.286614484085,
+      "batch_measurement_amplitude": 16877.286614484085,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672924260,
+      "batch_measurement_location": 1672924260,
+      "batch_measurement_value": 16877.144643577834,
+      "batch_measurement_amplitude": 16877.144643577834,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672924320,
+      "batch_measurement_location": 1672924320,
+      "batch_measurement_value": 16877.002672671584,
+      "batch_measurement_amplitude": 16877.002672671584,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672924380,
+      "batch_measurement_location": 1672924380,
+      "batch_measurement_value": 16876.860701765334,
+      "batch_measurement_amplitude": 16876.860701765334,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672924440,
+      "batch_measurement_location": 1672924440,
+      "batch_measurement_value": 16876.718730859084,
+      "batch_measurement_amplitude": 16876.718730859084,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672924500,
+      "batch_measurement_location": 1672924500,
+      "batch_measurement_value": 16876.576759952834,
+      "batch_measurement_amplitude": 16876.576759952834,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672924560,
+      "batch_measurement_location": 1672924560,
+      "batch_measurement_value": 16867.92342555843,
+      "batch_measurement_amplitude": 16867.92342555843,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672924620,
+      "batch_measurement_location": 1672924620,
+      "batch_measurement_value": 16859.27009116403,
+      "batch_measurement_amplitude": 16859.27009116403,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672924680,
+      "batch_measurement_location": 1672924680,
+      "batch_measurement_value": 16850.61675676963,
+      "batch_measurement_amplitude": 16850.61675676963,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672924740,
+      "batch_measurement_location": 1672924740,
+      "batch_measurement_value": 16841.96342237523,
+      "batch_measurement_amplitude": 16841.96342237523,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672924800,
+      "batch_measurement_location": 1672924800,
+      "batch_measurement_value": 16833.310087980826,
+      "batch_measurement_amplitude": 16833.310087980826,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672924860,
+      "batch_measurement_location": 1672924860,
+      "batch_measurement_value": 16832.865070349486,
+      "batch_measurement_amplitude": 16832.865070349486,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672924920,
+      "batch_measurement_location": 1672924920,
+      "batch_measurement_value": 16832.420052718146,
+      "batch_measurement_amplitude": 16832.420052718146,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672924980,
+      "batch_measurement_location": 1672924980,
+      "batch_measurement_value": 16831.9750350868,
+      "batch_measurement_amplitude": 16831.9750350868,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672925040,
+      "batch_measurement_location": 1672925040,
+      "batch_measurement_value": 16831.53001745546,
+      "batch_measurement_amplitude": 16831.53001745546,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672925100,
+      "batch_measurement_location": 1672925100,
+      "batch_measurement_value": 16831.08499982412,
+      "batch_measurement_amplitude": 16831.08499982412,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672925160,
+      "batch_measurement_location": 1672925160,
+      "batch_measurement_value": 16830.76554652761,
+      "batch_measurement_amplitude": 16830.76554652761,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672925220,
+      "batch_measurement_location": 1672925220,
+      "batch_measurement_value": 16830.4460932311,
+      "batch_measurement_amplitude": 16830.4460932311,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672925280,
+      "batch_measurement_location": 1672925280,
+      "batch_measurement_value": 16830.12663993459,
+      "batch_measurement_amplitude": 16830.12663993459,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672925340,
+      "batch_measurement_location": 1672925340,
+      "batch_measurement_value": 16829.80718663808,
+      "batch_measurement_amplitude": 16829.80718663808,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672925400,
+      "batch_measurement_location": 1672925400,
+      "batch_measurement_value": 16829.48773334157,
+      "batch_measurement_amplitude": 16829.48773334157,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672925460,
+      "batch_measurement_location": 1672925460,
+      "batch_measurement_value": 16830.981353712967,
+      "batch_measurement_amplitude": 16830.981353712967,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672925520,
+      "batch_measurement_location": 1672925520,
+      "batch_measurement_value": 16832.47497408436,
+      "batch_measurement_amplitude": 16832.47497408436,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672925580,
+      "batch_measurement_location": 1672925580,
+      "batch_measurement_value": 16833.96859445576,
+      "batch_measurement_amplitude": 16833.96859445576,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672925640,
+      "batch_measurement_location": 1672925640,
+      "batch_measurement_value": 16835.462214827156,
+      "batch_measurement_amplitude": 16835.462214827156,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672925700,
+      "batch_measurement_location": 1672925700,
+      "batch_measurement_value": 16836.95583519855,
+      "batch_measurement_amplitude": 16836.95583519855,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672925760,
+      "batch_measurement_location": 1672925760,
+      "batch_measurement_value": 16832.185744448925,
+      "batch_measurement_amplitude": 16832.185744448925,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672925820,
+      "batch_measurement_location": 1672925820,
+      "batch_measurement_value": 16827.415653699303,
+      "batch_measurement_amplitude": 16827.415653699303,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672925880,
+      "batch_measurement_location": 1672925880,
+      "batch_measurement_value": 16822.645562949678,
+      "batch_measurement_amplitude": 16822.645562949678,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672925940,
+      "batch_measurement_location": 1672925940,
+      "batch_measurement_value": 16817.875472200056,
+      "batch_measurement_amplitude": 16817.875472200056,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672926000,
+      "batch_measurement_location": 1672926000,
+      "batch_measurement_value": 16813.10538145043,
+      "batch_measurement_amplitude": 16813.10538145043,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672926060,
+      "batch_measurement_location": 1672926060,
+      "batch_measurement_value": 16813.059718136254,
+      "batch_measurement_amplitude": 16813.059718136254,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672926120,
+      "batch_measurement_location": 1672926120,
+      "batch_measurement_value": 16813.01405482208,
+      "batch_measurement_amplitude": 16813.01405482208,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672926180,
+      "batch_measurement_location": 1672926180,
+      "batch_measurement_value": 16812.968391507904,
+      "batch_measurement_amplitude": 16812.968391507904,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672926240,
+      "batch_measurement_location": 1672926240,
+      "batch_measurement_value": 16812.92272819373,
+      "batch_measurement_amplitude": 16812.92272819373,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672926300,
+      "batch_measurement_location": 1672926300,
+      "batch_measurement_value": 16812.877064879554,
+      "batch_measurement_amplitude": 16812.877064879554,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672926360,
+      "batch_measurement_location": 1672926360,
+      "batch_measurement_value": 16813.996808874253,
+      "batch_measurement_amplitude": 16813.996808874253,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672926420,
+      "batch_measurement_location": 1672926420,
+      "batch_measurement_value": 16815.116552868953,
+      "batch_measurement_amplitude": 16815.116552868953,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672926480,
+      "batch_measurement_location": 1672926480,
+      "batch_measurement_value": 16816.236296863655,
+      "batch_measurement_amplitude": 16816.236296863655,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672926540,
+      "batch_measurement_location": 1672926540,
+      "batch_measurement_value": 16817.356040858354,
+      "batch_measurement_amplitude": 16817.356040858354,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672926600,
+      "batch_measurement_location": 1672926600,
+      "batch_measurement_value": 16818.475784853053,
+      "batch_measurement_amplitude": 16818.475784853053,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672926660,
+      "batch_measurement_location": 1672926660,
+      "batch_measurement_value": 16816.87832404299,
+      "batch_measurement_amplitude": 16816.87832404299,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672926720,
+      "batch_measurement_location": 1672926720,
+      "batch_measurement_value": 16815.28086323293,
+      "batch_measurement_amplitude": 16815.28086323293,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672926780,
+      "batch_measurement_location": 1672926780,
+      "batch_measurement_value": 16813.683402422863,
+      "batch_measurement_amplitude": 16813.683402422863,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672926840,
+      "batch_measurement_location": 1672926840,
+      "batch_measurement_value": 16812.0859416128,
+      "batch_measurement_amplitude": 16812.0859416128,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672926900,
+      "batch_measurement_location": 1672926900,
+      "batch_measurement_value": 16810.48848080274,
+      "batch_measurement_amplitude": 16810.48848080274,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672926960,
+      "batch_measurement_location": 1672926960,
+      "batch_measurement_value": 16809.179397349926,
+      "batch_measurement_amplitude": 16809.179397349926,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672927020,
+      "batch_measurement_location": 1672927020,
+      "batch_measurement_value": 16807.87031389711,
+      "batch_measurement_amplitude": 16807.87031389711,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672927080,
+      "batch_measurement_location": 1672927080,
+      "batch_measurement_value": 16806.5612304443,
+      "batch_measurement_amplitude": 16806.5612304443,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672927140,
+      "batch_measurement_location": 1672927140,
+      "batch_measurement_value": 16805.252146991483,
+      "batch_measurement_amplitude": 16805.252146991483,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672927200,
+      "batch_measurement_location": 1672927200,
+      "batch_measurement_value": 16803.94306353867,
+      "batch_measurement_amplitude": 16803.94306353867,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672927260,
+      "batch_measurement_location": 1672927260,
+      "batch_measurement_value": 16808.751636466215,
+      "batch_measurement_amplitude": 16808.751636466215,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672927320,
+      "batch_measurement_location": 1672927320,
+      "batch_measurement_value": 16813.56020939376,
+      "batch_measurement_amplitude": 16813.56020939376,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672927380,
+      "batch_measurement_location": 1672927380,
+      "batch_measurement_value": 16818.3687823213,
+      "batch_measurement_amplitude": 16818.3687823213,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672927440,
+      "batch_measurement_location": 1672927440,
+      "batch_measurement_value": 16823.177355248845,
+      "batch_measurement_amplitude": 16823.177355248845,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672927500,
+      "batch_measurement_location": 1672927500,
+      "batch_measurement_value": 16827.98592817639,
+      "batch_measurement_amplitude": 16827.98592817639,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672927560,
+      "batch_measurement_location": 1672927560,
+      "batch_measurement_value": 16829.054544103732,
+      "batch_measurement_amplitude": 16829.054544103732,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672927620,
+      "batch_measurement_location": 1672927620,
+      "batch_measurement_value": 16830.12316003108,
+      "batch_measurement_amplitude": 16830.12316003108,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672927680,
+      "batch_measurement_location": 1672927680,
+      "batch_measurement_value": 16831.19177595842,
+      "batch_measurement_amplitude": 16831.19177595842,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672927740,
+      "batch_measurement_location": 1672927740,
+      "batch_measurement_value": 16832.260391885768,
+      "batch_measurement_amplitude": 16832.260391885768,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672927800,
+      "batch_measurement_location": 1672927800,
+      "batch_measurement_value": 16833.32900781311,
+      "batch_measurement_amplitude": 16833.32900781311,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672927860,
+      "batch_measurement_location": 1672927860,
+      "batch_measurement_value": 16830.258082311764,
+      "batch_measurement_amplitude": 16830.258082311764,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672927920,
+      "batch_measurement_location": 1672927920,
+      "batch_measurement_value": 16827.18715681042,
+      "batch_measurement_amplitude": 16827.18715681042,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672927980,
+      "batch_measurement_location": 1672927980,
+      "batch_measurement_value": 16824.116231309075,
+      "batch_measurement_amplitude": 16824.116231309075,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672928040,
+      "batch_measurement_location": 1672928040,
+      "batch_measurement_value": 16821.045305807733,
+      "batch_measurement_amplitude": 16821.045305807733,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672928100,
+      "batch_measurement_location": 1672928100,
+      "batch_measurement_value": 16817.974380306387,
+      "batch_measurement_amplitude": 16817.974380306387,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672928160,
+      "batch_measurement_location": 1672928160,
+      "batch_measurement_value": 16820.45442603631,
+      "batch_measurement_amplitude": 16820.45442603631,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672928220,
+      "batch_measurement_location": 1672928220,
+      "batch_measurement_value": 16822.93447176623,
+      "batch_measurement_amplitude": 16822.93447176623,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672928280,
+      "batch_measurement_location": 1672928280,
+      "batch_measurement_value": 16825.414517496156,
+      "batch_measurement_amplitude": 16825.414517496156,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672928340,
+      "batch_measurement_location": 1672928340,
+      "batch_measurement_value": 16827.894563226077,
+      "batch_measurement_amplitude": 16827.894563226077,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672928400,
+      "batch_measurement_location": 1672928400,
+      "batch_measurement_value": 16830.374608956,
+      "batch_measurement_amplitude": 16830.374608956,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672928460,
+      "batch_measurement_location": 1672928460,
+      "batch_measurement_value": 16829.549708944392,
+      "batch_measurement_amplitude": 16829.549708944392,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672928520,
+      "batch_measurement_location": 1672928520,
+      "batch_measurement_value": 16828.724808932784,
+      "batch_measurement_amplitude": 16828.724808932784,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672928580,
+      "batch_measurement_location": 1672928580,
+      "batch_measurement_value": 16827.89990892118,
+      "batch_measurement_amplitude": 16827.89990892118,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672928640,
+      "batch_measurement_location": 1672928640,
+      "batch_measurement_value": 16827.07500890957,
+      "batch_measurement_amplitude": 16827.07500890957,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672928700,
+      "batch_measurement_location": 1672928700,
+      "batch_measurement_value": 16826.250108897962,
+      "batch_measurement_amplitude": 16826.250108897962,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672928760,
+      "batch_measurement_location": 1672928760,
+      "batch_measurement_value": 16832.23251016818,
+      "batch_measurement_amplitude": 16832.23251016818,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672928820,
+      "batch_measurement_location": 1672928820,
+      "batch_measurement_value": 16838.2149114384,
+      "batch_measurement_amplitude": 16838.2149114384,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672928880,
+      "batch_measurement_location": 1672928880,
+      "batch_measurement_value": 16844.19731270862,
+      "batch_measurement_amplitude": 16844.19731270862,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672928940,
+      "batch_measurement_location": 1672928940,
+      "batch_measurement_value": 16850.17971397884,
+      "batch_measurement_amplitude": 16850.17971397884,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672929000,
+      "batch_measurement_location": 1672929000,
+      "batch_measurement_value": 16856.16211524906,
+      "batch_measurement_amplitude": 16856.16211524906,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672929060,
+      "batch_measurement_location": 1672929060,
+      "batch_measurement_value": 16852.42763326573,
+      "batch_measurement_amplitude": 16852.42763326573,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672929120,
+      "batch_measurement_location": 1672929120,
+      "batch_measurement_value": 16848.693151282398,
+      "batch_measurement_amplitude": 16848.693151282398,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672929180,
+      "batch_measurement_location": 1672929180,
+      "batch_measurement_value": 16844.958669299063,
+      "batch_measurement_amplitude": 16844.958669299063,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672929240,
+      "batch_measurement_location": 1672929240,
+      "batch_measurement_value": 16841.224187315733,
+      "batch_measurement_amplitude": 16841.224187315733,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672929300,
+      "batch_measurement_location": 1672929300,
+      "batch_measurement_value": 16837.489705332402,
+      "batch_measurement_amplitude": 16837.489705332402,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672929360,
+      "batch_measurement_location": 1672929360,
+      "batch_measurement_value": 16836.818497853445,
+      "batch_measurement_amplitude": 16836.818497853445,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672929420,
+      "batch_measurement_location": 1672929420,
+      "batch_measurement_value": 16836.147290374487,
+      "batch_measurement_amplitude": 16836.147290374487,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672929480,
+      "batch_measurement_location": 1672929480,
+      "batch_measurement_value": 16835.476082895533,
+      "batch_measurement_amplitude": 16835.476082895533,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672929540,
+      "batch_measurement_location": 1672929540,
+      "batch_measurement_value": 16834.804875416576,
+      "batch_measurement_amplitude": 16834.804875416576,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672929600,
+      "batch_measurement_location": 1672929600,
+      "batch_measurement_value": 16834.133667937618,
+      "batch_measurement_amplitude": 16834.133667937618,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672929660,
+      "batch_measurement_location": 1672929660,
+      "batch_measurement_value": 16828.53384625139,
+      "batch_measurement_amplitude": 16828.53384625139,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672929720,
+      "batch_measurement_location": 1672929720,
+      "batch_measurement_value": 16822.934024565162,
+      "batch_measurement_amplitude": 16822.934024565162,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672929780,
+      "batch_measurement_location": 1672929780,
+      "batch_measurement_value": 16817.33420287893,
+      "batch_measurement_amplitude": 16817.33420287893,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672929840,
+      "batch_measurement_location": 1672929840,
+      "batch_measurement_value": 16811.734381192702,
+      "batch_measurement_amplitude": 16811.734381192702,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672929900,
+      "batch_measurement_location": 1672929900,
+      "batch_measurement_value": 16806.134559506474,
+      "batch_measurement_amplitude": 16806.134559506474,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672929960,
+      "batch_measurement_location": 1672929960,
+      "batch_measurement_value": 16806.250727346247,
+      "batch_measurement_amplitude": 16806.250727346247,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672930020,
+      "batch_measurement_location": 1672930020,
+      "batch_measurement_value": 16806.36689518602,
+      "batch_measurement_amplitude": 16806.36689518602,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672930080,
+      "batch_measurement_location": 1672930080,
+      "batch_measurement_value": 16806.48306302579,
+      "batch_measurement_amplitude": 16806.48306302579,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672930140,
+      "batch_measurement_location": 1672930140,
+      "batch_measurement_value": 16806.599230865562,
+      "batch_measurement_amplitude": 16806.599230865562,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672930200,
+      "batch_measurement_location": 1672930200,
+      "batch_measurement_value": 16806.715398705335,
+      "batch_measurement_amplitude": 16806.715398705335,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672930260,
+      "batch_measurement_location": 1672930260,
+      "batch_measurement_value": 16809.020009428124,
+      "batch_measurement_amplitude": 16809.020009428124,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672930320,
+      "batch_measurement_location": 1672930320,
+      "batch_measurement_value": 16811.324620150914,
+      "batch_measurement_amplitude": 16811.324620150914,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672930380,
+      "batch_measurement_location": 1672930380,
+      "batch_measurement_value": 16813.629230873703,
+      "batch_measurement_amplitude": 16813.629230873703,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672930440,
+      "batch_measurement_location": 1672930440,
+      "batch_measurement_value": 16815.933841596492,
+      "batch_measurement_amplitude": 16815.933841596492,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672930500,
+      "batch_measurement_location": 1672930500,
+      "batch_measurement_value": 16818.23845231928,
+      "batch_measurement_amplitude": 16818.23845231928,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672930560,
+      "batch_measurement_location": 1672930560,
+      "batch_measurement_value": 16825.215842723373,
+      "batch_measurement_amplitude": 16825.215842723373,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672930620,
+      "batch_measurement_location": 1672930620,
+      "batch_measurement_value": 16832.193233127462,
+      "batch_measurement_amplitude": 16832.193233127462,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672930680,
+      "batch_measurement_location": 1672930680,
+      "batch_measurement_value": 16839.170623531554,
+      "batch_measurement_amplitude": 16839.170623531554,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672930740,
+      "batch_measurement_location": 1672930740,
+      "batch_measurement_value": 16846.148013935643,
+      "batch_measurement_amplitude": 16846.148013935643,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672930800,
+      "batch_measurement_location": 1672930800,
+      "batch_measurement_value": 16853.125404339735,
+      "batch_measurement_amplitude": 16853.125404339735,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672930860,
+      "batch_measurement_location": 1672930860,
+      "batch_measurement_value": 16860.66872830174,
+      "batch_measurement_amplitude": 16860.66872830174,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672930920,
+      "batch_measurement_location": 1672930920,
+      "batch_measurement_value": 16868.21205226375,
+      "batch_measurement_amplitude": 16868.21205226375,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672930980,
+      "batch_measurement_location": 1672930980,
+      "batch_measurement_value": 16875.755376225756,
+      "batch_measurement_amplitude": 16875.755376225756,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672931040,
+      "batch_measurement_location": 1672931040,
+      "batch_measurement_value": 16883.298700187763,
+      "batch_measurement_amplitude": 16883.298700187763,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672931100,
+      "batch_measurement_location": 1672931100,
+      "batch_measurement_value": 16890.84202414977,
+      "batch_measurement_amplitude": 16890.84202414977,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672931160,
+      "batch_measurement_location": 1672931160,
+      "batch_measurement_value": 16891.622490353122,
+      "batch_measurement_amplitude": 16891.622490353122,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672931220,
+      "batch_measurement_location": 1672931220,
+      "batch_measurement_value": 16892.402956556474,
+      "batch_measurement_amplitude": 16892.402956556474,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672931280,
+      "batch_measurement_location": 1672931280,
+      "batch_measurement_value": 16893.183422759823,
+      "batch_measurement_amplitude": 16893.183422759823,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672931340,
+      "batch_measurement_location": 1672931340,
+      "batch_measurement_value": 16893.963888963175,
+      "batch_measurement_amplitude": 16893.963888963175,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672931400,
+      "batch_measurement_location": 1672931400,
+      "batch_measurement_value": 16894.744355166527,
+      "batch_measurement_amplitude": 16894.744355166527,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672931460,
+      "batch_measurement_location": 1672931460,
+      "batch_measurement_value": 16898.030858150887,
+      "batch_measurement_amplitude": 16898.030858150887,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672931520,
+      "batch_measurement_location": 1672931520,
+      "batch_measurement_value": 16901.317361135243,
+      "batch_measurement_amplitude": 16901.317361135243,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672931580,
+      "batch_measurement_location": 1672931580,
+      "batch_measurement_value": 16904.603864119603,
+      "batch_measurement_amplitude": 16904.603864119603,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672931640,
+      "batch_measurement_location": 1672931640,
+      "batch_measurement_value": 16907.89036710396,
+      "batch_measurement_amplitude": 16907.89036710396,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672931700,
+      "batch_measurement_location": 1672931700,
+      "batch_measurement_value": 16911.17687008832,
+      "batch_measurement_amplitude": 16911.17687008832,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    },
+    {
+      "batch_measurement_timestamp": 1672931760,
+      "batch_measurement_location": 1672931760,
+      "batch_measurement_value": 16907.89046383006,
+      "batch_measurement_amplitude": 16907.89046383006,
+      "batch_measurement_positive_distance": null,
+      "batch_measurement_negative_distance": null,
+      "batch_measurement_trend_vectors": null
+    }
+  ],
+  "batch_start_timestamp": 1672921020,
+  "batch_end_timestamp": 1672931760,
+  "batch_timestamp": 1672921020,
+  "batch_interval": 180,
+  "batch_size": 10800,
+  "batch_source": "AgrogateBtcBtcAndUsaUsd",
+  "batch_asset_1": "BTC.BTC",
+  "batch_asset_2": "USA.USD",
+  "batch_interpolation": "Minute",
+  "batch_measurement_event_uuid": "a2de5b8c-3def-4556-97bf-db69d14bd043",
+  "batch_uuid": "eed8fb32-6204-41ee-bfbf-e9419cff8ae6",
+  "batch_nature": null
+}
