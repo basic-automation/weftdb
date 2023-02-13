@@ -6,3 +6,30 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+axum = {version = "0", features= ["macros"]}
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+sled = "0"
+serde_qs = "0"
+#dsm_measurement = { path = "../dsm-measurement" }
+#dsm_event = { path = "../dsm-event" }
+#dsm_bucket = { path = "../dsm-bucket" }
+#num = { version = "0", features = ["serde", "std"] }
+bigdecimal = { version = "0.3.0", features = ["serde"] }
+
+
+[dependencies.uuid]
+version = "1"
+features = [
+    "v4",                # Lets you generate random UUIDs
+    "fast-rng",          # Use a faster (but still sufficiently random) RNG
+    "macro-diagnostics", # Enable better diagnostics for compile-time UUIDs
+]
+
+[profile.release]
+strip = true
+opt-level = "s"
+debug = 0
+lto = "fat"
+codegen-units = 1
