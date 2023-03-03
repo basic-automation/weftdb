@@ -1,0 +1,22 @@
+[package]
+name = "dsm_batch"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bigdecimal = { version = "0", features=["serde"] }
+serde = { version = "1", features = ["derive"] }
+uuid = { version="1", features=["v4", "fast-rng", "macro-diagnostics", "serde"] }
+dsm_measurement = { path = "../dsm-measurement" }
+rayon = "1"
+
+
+
+[profile.release]
+strip = true
+opt-level = "s"
+debug = 0
+lto = true
+codegen-units = 1
