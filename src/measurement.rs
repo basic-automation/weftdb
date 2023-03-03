@@ -1,80 +1,54 @@
-use super::parameters::*;
-use dsm_asset::*;
-use dsm_influxdb::*;
-use dsm_source::*;
+use bigdecimal::BigDecimal;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+///
+/// # Measurement
+/// ## Properties
+/// * source: source of the measurement (e.g. "thorchain")
+/// * numerator_asset: numerator asset of the measurement (e.g. "rune")
+/// * denominator_asset: denominator asset of the measurement (e.g. "usd")
+/// * uuid: uuid of the measurement
+/// * timestamp: timestamp of the measurement was taken
+/// * ratio: ratio of the measurement (e.g. numerator_asset_value/denominator_asset_value)
+/// * location: same as the timestamp but mutable by processing the measurement
+/// * amplitude: same as the ratio but mutable by processing the measurement
+/// * positive_distance: todo!()
+/// * negative_distance: todo!()
+/// * trend_vectors: todo!()
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Measurement {
-	pub measurement_timestamp: i64,
-	pub measurement_asset_1: Asset,
-	pub measurement_asset_2: Asset,
-	pub measurement_source: Source,
-	pub measurement_uuid: String,
-	pub measurement_ratio: f64,
+	pub source: String,
+	pub numerator_asset: String,
+	pub denominator_asset: String,
+	pub uuid: Uuid,
+	pub timestamp: i64,
+	pub ratio: BigDecimal,
+	pub location: Option<i64>,
+	pub amplitude: Option<BigDecimal>,
+	pub positive_distance: Option<BigDecimal>,
+	pub negative_distance: Option<BigDecimal>,
+	pub trend_vectors: Option<Vec<BigDecimal>>,
 }
 
 impl Measurement {
-	pub fn new(timestamp: i64, ratio: f64, parameters: MeasurementParameters) -> Self {
+	pub fn new(source: &str, numerator_asset: &str, denominator_asset: &str, uuid: Uuid, timestamp: i64, ratio: BigDecimal) -> Self {
 		Self {
-			measurement_timestamp: timestamp,
-			measurement_asset_1: parameters.measurement_asset_1,
-			measurement_asset_2: parameters.measurement_asset_2,
-			measurement_source: parameters.measurement_source,
-			measurement_uuid: Uuid::new_v4().to_string(),
-			measurement_ratio: ratio,
+			source: source.to_string(),
+			numerator_asset: numerator_asset.to_string(),
+			denominator_asset: denominator_asset.to_string(),
+			uuid,
+			timestamp,
+			ratio,
+			location: None,
+			amplitude: None,
+			positive_distance: None,
+			negative_distance: None,
+			trend_vectors: None,
 		}
 	}
-
-	pub async fn emit(&self) {
-		// save to database
-		let time = InfluxTimestamp::Unix(self.measurement_timestamp);
-		let field = InfluxField::Float(self.measurement_ratio);
-
-		// save source
-		let mut influx = Influxdb2::new();
-		influx.connection("http://localhost:8086", "***REMOVED-CREDENTIAL***==", "Mim", "dsm_measurements").await;
-		influx.new_measurement(&self.measurement_source.to_string()).await;
-		influx.add_tag("measurement_asset_1", &self.measurement_asset_1.to_string()).await;
-		influx.add_tag("measurement_asset_2", &self.measurement_asset_2.to_string()).await;
-		influx.add_tag("measurement_source", &self.measurement_source.to_string()).await;
-		influx.add_field("measurement_ratio", field.clone()).await;
-		influx.add_timestamp(time.clone()).await;
-		influx.write().await;
-
-		// save to source agrogate
-		influx.new_measurement(&self.measurement_source.aggrogate_source().await.to_string()).await;
-		influx.add_tag("measurement_asset_1", &self.measurement_asset_1.to_string()).await;
-		influx.add_tag("measurement_asset_2", &self.measurement_asset_2.to_string()).await;
-		influx.add_tag("measurement_source", &self.measurement_source.to_string()).await;
-		influx.add_field("measurement_ratio", field).await;
-		influx.add_timestamp(time).await;
-		influx.write().await;
-	}
-
-	pub async fn emit_event(&self) {
-		// save to database
-		let time = InfluxTimestamp::Unix(chrono::Utc::now().timestamp());
-		let field = InfluxField::String(self.measurement_uuid.clone());
-
-		// save source
-		let mut influx = Influxdb2::new();
-		influx.connection("http://localhost:8086", "***REMOVED-CREDENTIAL***==", "Mim", "dsm_events").await;
-		influx.new_measurement("measurement_new").await;
-		influx.add_tag("measurement_asset_1", &self.measurement_asset_1.to_string()).await;
-		influx.add_tag("measurement_asset_2", &self.measurement_asset_2.to_string()).await;
-		influx.add_tag("measurement_source", &self.measurement_source.to_string()).await;
-		influx.add_field("measurement_uuid", field.clone()).await;
-		influx.add_timestamp(time.clone()).await;
-		influx.write().await;
-
-		// save to source agrogate
-		influx.new_measurement("measurement_new").await;
-		influx.add_tag("measurement_asset_1", &self.measurement_asset_1.to_string()).await;
-		influx.add_tag("measurement_asset_2", &self.measurement_asset_2.to_string()).await;
-		influx.add_tag("measurement_source", &self.measurement_source.aggrogate_source().await.to_string()).await;
-		influx.add_field("measurement_uuid", field).await;
-		influx.add_timestamp(time).await;
-		influx.write().await;
-	}
 }
+
+
 
