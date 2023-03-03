@@ -1,6 +1,8 @@
 pub use bucket_type::*;
 pub use bucket_value::*;
+pub use get::*;
 pub use object_bucket::*;
+pub use params::*;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sled::Db;
@@ -10,7 +12,9 @@ use uuid::Uuid;
 
 mod bucket_type;
 mod bucket_value;
+mod get;
 mod object_bucket;
+mod params;
 mod time_series_bucket;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,7 +37,7 @@ impl Bucket {
 			};
 			let (_, value) = item.unwrap();
 			let value: Bucket = serde_json::from_str(String::from_utf8(value.to_vec()).unwrap().as_str()).unwrap();
-			if (value.type_ == BucketType::from_str(bucket_type).unwrap()) && (value.name == name.to_string()) {
+			if (value.type_ == BucketType::from_str(bucket_type).unwrap()) && (value.name == *name) {
 				return Err("Bucket already exists".to_string());
 			}
 		}
@@ -50,11 +54,11 @@ impl Bucket {
 		// create a new tree
 		db.open_tree(uuid.clone()).unwrap();
 
-		let res = Self { type_, name: name.to_string(), uuid: uuid.clone(), tags };
+		let res = Self { type_, name: name.to_string(), uuid, tags };
 		let res_json = json!(res).to_string();
 
 		// add bucket to the bucket tree
-		bucket_tree.insert(name.to_string(), res_json.as_bytes()).unwrap();
+		bucket_tree.insert(name, res_json.as_bytes()).unwrap();
 
 		Ok(res)
 	}
@@ -69,7 +73,7 @@ impl Bucket {
 			};
 			let (_, value) = item.unwrap();
 			let value: Bucket = serde_json::from_str(String::from_utf8(value.to_vec()).unwrap().as_str()).unwrap();
-			if value.name == name.to_string() {
+			if value.name == *name {
 				return Ok(value);
 			}
 		}
@@ -77,28 +81,17 @@ impl Bucket {
 		Err("Bucket not found".to_string())
 	}
 
-	pub async fn get(&self, db: Db) -> Result<Vec<BucketValue>, String> {
+	pub async fn get(&self, params: Option<BucketParams>, db: Db) -> Result<Vec<BucketValue>, String> {
 		let tree = db.open_tree(self.uuid.clone()).unwrap();
-		let mut res = Vec::new();
-		for i in 0..tree.iter().count() {
-			let item = match tree.iter().nth(i) {
-				Some(item) => item,
-				None => break,
-			};
-			let (_, value) = item.unwrap();
-			let value: BucketValue = serde_json::from_str(String::from_utf8(value.to_vec()).unwrap().as_str()).unwrap();
-			match value.clone() {
-				BucketValue::Object(object_value) => {
-					let mut value = object_value.clone();
-					value.value = serde_json::from_str(value.value.as_str().unwrap()).unwrap();
-					res.push(BucketValue::Object(value));
-				}
-				BucketValue::TimeSeries(_) => {
-					res.push(value);
-				}
-			}
+		let params = match params {
+			Some(params) => params,
+			None => BucketParams::default(),
+		};
+
+		match self.type_ {
+			BucketType::TimeSeries => get_timeseries_bucket(tree, params).await,
+			BucketType::Object => get_object_bucket(tree).await,
 		}
-		Ok(res)
 	}
 
 	pub async fn delete(&self, db: Db) -> Result<Self, String> {
@@ -113,14 +106,33 @@ impl Bucket {
 		match value.clone() {
 			BucketValue::Object(object_value) => {
 				let key = object_value.key.clone();
+
+				match tree.contains_key(object_value.key.clone()) {
+					Ok(value) => {
+						if value {
+							return Err("Key already exists".to_string());
+						}
+					}
+					Err(e) => return Err(e.to_string()),
+				}
 				let object_value_json = json!(object_value).to_string();
 				tree.insert(key, object_value_json.as_bytes()).unwrap();
-				let mut value = object_value.clone();
+				let mut value = object_value;
 				value.value = serde_json::from_str(value.value.as_str().unwrap()).unwrap();
 				Ok(BucketValue::Object(value))
 			}
 			BucketValue::TimeSeries(time_series_measurement) => {
 				let key = time_series_measurement.timestamp.to_string();
+
+				// check if a key with the same name exists
+				match tree.contains_key(key.clone()) {
+					Ok(value) => {
+						if value {
+							return Err("Key already exists".to_string());
+						}
+					}
+					Err(e) => return Err(e.to_string()),
+				}
 				let time_series_measurement = json!(time_series_measurement).to_string();
 				tree.insert(key, time_series_measurement.as_bytes()).unwrap();
 				Ok(value)
@@ -174,6 +186,26 @@ impl Bucket {
 				}
 			}
 			Err(e) => Err(e.to_string()),
+		}
+	}
+
+	pub async fn key_update(&self, value: BucketValue, db: Db) -> Result<BucketValue, String> {
+		let tree = db.open_tree(self.uuid.clone()).unwrap();
+		match value.clone() {
+			BucketValue::Object(object_value) => {
+				let key = object_value.key.clone();
+				let object_value_json = json!(object_value).to_string();
+				tree.insert(key, object_value_json.as_bytes()).unwrap();
+				let mut value = object_value;
+				value.value = serde_json::from_str(value.value.as_str().unwrap()).unwrap();
+				Ok(BucketValue::Object(value))
+			}
+			BucketValue::TimeSeries(time_series_measurement) => {
+				let key = time_series_measurement.timestamp.to_string();
+				let time_series_measurement = json!(time_series_measurement).to_string();
+				tree.insert(key, time_series_measurement.as_bytes()).unwrap();
+				Ok(value)
+			}
 		}
 	}
 }
