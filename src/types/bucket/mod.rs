@@ -294,7 +294,7 @@ impl Bucket {
 				let object_value_json = json!(object_value).to_string();
 				match tree.insert(key, object_value_json.as_bytes()) {
                                         Ok(_) => (),
-                                        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Faild to insert key: {}", e.to_string()))),
+                                        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Faild to insert key: {}", e))),
                                 };
 				let mut value = object_value;
                                 let val = match value.value.as_str() {
@@ -303,7 +303,7 @@ impl Bucket {
                                 };
 				value.value = match serde_json::from_str(val) {
                                         Ok(value) => value,
-                                        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to parse object value: {}", e.to_string()))),
+                                        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to parse object value: {}", e))),
                                 };
 				Ok(BucketValue::Object(value))
 			}
@@ -312,7 +312,7 @@ impl Bucket {
 				let time_series_measurement = json!(time_series_measurement).to_string();
 				match tree.insert(key, time_series_measurement.as_bytes()) {
                                         Ok(_) => (),
-                                        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Faild to insert key: {}", e.to_string()))),
+                                        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Faild to insert key: {}", e))),
                                 };
 				Ok(value)
 			}
