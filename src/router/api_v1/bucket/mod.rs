@@ -1,6 +1,6 @@
 use crate::types::*;
 use axum::body::Bytes;
-use axum::{extract::Path, extract::Query, extract::State};
+use axum::{extract::Path, extract::State};
 pub use buckets::*;
 pub use keys::*;
 use serde::{ser::SerializeStruct, Deserialize, Serialize};

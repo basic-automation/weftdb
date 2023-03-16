@@ -1,23 +1,30 @@
 use super::super::*;
-use axum::Json;
+use axum::{http::StatusCode, Json};
+use axum::extract::rejection::JsonRejection;
+use serde::Deserialize;
 
-pub async fn delete_bucket(Path(bucket): Path<String>, Query(params): Query<HashMap<String, String>>, State(db): State<Db>) -> Json<Value> {
-	let debug: bool = params.get("debug").unwrap_or(&"false".to_string()).parse().unwrap();
+#[derive(Deserialize)]
+pub struct DeleteBucketParams {
+        pub debug: Option<bool>,
+}
+
+pub async fn delete_bucket(Path(bucket): Path<String>, Qs(params): Qs<DeleteBucketParams>, State(db): State<Db>, _body: Result<Json<Value>, JsonRejection>) -> (StatusCode, Json<Value>) {
+	let debug: bool = params.debug.unwrap_or(false);
 
 	let bucket = match Bucket::open(&bucket, db.clone()).await {
 		Ok(bucket) => bucket,
-		Err(err) => return err_debug(&err, db.clone(), debug).await,
+		Err(err) => return (err.0, err_debug(&err.1, db.clone(), debug).await),
 	};
 
 	let value = match bucket.delete(db.clone()).await {
 		Ok(value) => value,
-		Err(err) => return err_debug(&err, db.clone(), debug).await,
+		Err(err) => return (err.0, err_debug(&err.1, db.clone(), debug).await),
 	};
 
 	if debug {
 		let debugdb = DebugDb { db: db.clone() };
-		Json(json!({ "bucket": bucket, "value": value, "db": debugdb }))
+		(StatusCode::OK, Json(json!({ "bucket": bucket, "value": value, "db": debugdb })))
 	} else {
-		Json(json!({ "bucket": bucket, "value": value }))
+		(StatusCode::OK, Json(json!({ "bucket": bucket, "value": value })))
 	}
 }

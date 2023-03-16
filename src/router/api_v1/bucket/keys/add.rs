@@ -1,6 +1,8 @@
 use super::super::*;
 use axum::extract::rejection::JsonRejection;
+use axum::http::StatusCode;
 use axum::{extract::Path, extract::State, Json};
+use bigdecimal::BigDecimal;
 use serde::Deserialize;
 use serde_json::json;
 use serde_json::Value;
@@ -14,7 +16,7 @@ pub struct AddToBucketParams {
 	pub tag: Option<Vec<String>>,
 }
 
-pub async fn add_key_to_bucket(State(db): State<Db>, Qs(params): Qs<AddToBucketParams>, Path(bucket): Path<String>, body: Result<Json<Value>, JsonRejection>) -> Json<Value> {
+pub async fn add_key_to_bucket(State(db): State<Db>, Qs(params): Qs<AddToBucketParams>, Path(bucket): Path<String>, body: Result<Json<Value>, JsonRejection>) -> (StatusCode, Json<Value>) {
 	let debug = params.debug.unwrap_or(false);
 	let key = params.key;
 	let tags = process_tags(params.tag).await;
@@ -26,14 +28,14 @@ pub async fn add_key_to_bucket(State(db): State<Db>, Qs(params): Qs<AddToBucketP
 
 	let bucket = match Bucket::open(&bucket, db.clone()).await {
 		Ok(bucket) => bucket,
-		Err(err) => return err_debug(&err.to_string(), db, debug).await,
+		Err(err) => return (err.0, err_debug(&err.1.to_string(), db, debug).await),
 	};
 
 	match bucket.type_ {
 		BucketType::TimeSeries => {
-			let key: i64 = match key.parse() {
+			let key: BigDecimal = match key.parse() {
 				Ok(key) => key,
-				Err(err) => return err_debug(&err.to_string(), db, debug).await,
+				Err(err) => return (StatusCode::BAD_REQUEST, err_debug(&format!("Invaild Key: {}", err), db, debug).await),
 			};
 
 			let value = params.value.unwrap_or_else(|| body.to_string());
@@ -42,12 +44,12 @@ pub async fn add_key_to_bucket(State(db): State<Db>, Qs(params): Qs<AddToBucketP
 				Ok(val) => {
 					if debug {
 						let debugdb = DebugDb { db: db.clone() };
-						Json(json!({ "value": val, "db": debugdb }))
+						(StatusCode::OK, Json(json!({ "value": val, "db": debugdb })))
 					} else {
-						Json(json!(val))
+						(StatusCode::OK, Json(json!(val)))
 					}
 				}
-				Err(err) => err_debug(&err.to_string(), db, debug).await,
+				Err(err) => (err.0, err_debug(&err.1.to_string(), db, debug).await),
 			}
 		}
 		BucketType::Object => {
@@ -56,16 +58,16 @@ pub async fn add_key_to_bucket(State(db): State<Db>, Qs(params): Qs<AddToBucketP
 				Ok(val) => {
 					let val = match val {
 						BucketValue::Object(val) => val,
-						_ => return err_debug("Value must be an object value.", db, debug).await,
+						_ => return (StatusCode::BAD_REQUEST, err_debug("Value must be an object value.", db, debug).await),
 					};
 					if debug {
 						let debugdb = DebugDb { db: db.clone() };
-						Json(json!({ val.key: val.value, "db": debugdb }))
+						(StatusCode::OK, Json(json!({ val.key: val.value, "db": debugdb })))
 					} else {
-						Json(json!({val.key: val.value}))
+						(StatusCode::OK, Json(json!({val.key: val.value})))
 					}
 				}
-				Err(err) => err_debug(&err.to_string(), db, debug).await,
+				Err(err) => (err.0, err_debug(&err.1.to_string(), db, debug).await),
 			}
 		}
 	}

@@ -7,12 +7,12 @@ use std::{collections::HashMap, str::FromStr};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimeSeriesMeasurement {
 	pub value: BigDecimal,
-	pub timestamp: i64,
+	pub timestamp: BigDecimal,
 	pub tags: Option<HashMap<String, String>>,
 }
 
 impl TimeSeriesMeasurement {
-	pub fn new(value: &str, timestamp: i64, tags: Option<HashMap<String, String>>) -> Self {
+	pub fn new(value: &str, timestamp: BigDecimal, tags: Option<HashMap<String, String>>) -> Self {
 		Self { value: BigDecimal::from_str(value).unwrap(), timestamp, tags }
 	}
 }
