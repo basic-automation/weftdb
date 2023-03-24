@@ -1,11 +1,11 @@
 use super::super::*;
-use axum::{http::StatusCode, Json};
 use axum::extract::rejection::JsonRejection;
+use axum::{http::StatusCode, Json};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
 pub struct DeleteBucketParams {
-        pub debug: Option<bool>,
+	pub debug: Option<bool>,
 }
 
 pub async fn delete_bucket(Path(bucket): Path<String>, Qs(params): Qs<DeleteBucketParams>, State(db): State<Db>, _body: Result<Json<Value>, JsonRejection>) -> (StatusCode, Json<Value>) {

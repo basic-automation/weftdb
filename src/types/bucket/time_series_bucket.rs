@@ -6,9 +6,9 @@ use std::{collections::HashMap, str::FromStr};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimeSeriesMeasurement {
-	pub value: BigDecimal,
+	pub value:     BigDecimal,
 	pub timestamp: BigDecimal,
-	pub tags: Option<HashMap<String, String>>,
+	pub tags:      Option<HashMap<String, String>>,
 }
 
 impl TimeSeriesMeasurement {

@@ -10,7 +10,7 @@ use sled::Db;
 #[derive(Deserialize)]
 pub struct UpdateBucketParams {
 	debug: Option<bool>,
-	tag: Option<Vec<String>>,
+	tag:   Option<Vec<String>>,
 	value: Option<String>,
 }
 

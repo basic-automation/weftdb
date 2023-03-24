@@ -10,10 +10,10 @@ use sled::Db;
 
 #[derive(Deserialize)]
 pub struct AddToBucketParams {
-	pub key: String,
+	pub key:   String,
 	pub value: Option<String>,
 	pub debug: Option<bool>,
-	pub tag: Option<Vec<String>>,
+	pub tag:   Option<Vec<String>>,
 }
 
 pub async fn add_key_to_bucket(State(db): State<Db>, Qs(params): Qs<AddToBucketParams>, Path(bucket): Path<String>, body: Result<Json<Value>, JsonRejection>) -> (StatusCode, Json<Value>) {
