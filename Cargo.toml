@@ -8,13 +8,13 @@ edition = "2021"
 [dependencies]
 axum = {version="0", features=["macros"]}
 bigdecimal = {version="0", features=["serde"]}
-reqwest = "0"
+reqwest = {version="0", features=["json"]}
 serde = {version="1", features=["derive"]}
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-dsm_measurement = { path = "../dsm-measurement" }
+dsm_measurement = { path = "../1 - dsm-measurement" }
 uuid = {version="1", features=["serde", "v4"]}
-serde_qs = "0.11.0"
+serde_qs = "0"
 
 [profile.release]
 strip = true

@@ -1,10 +1,11 @@
 #![allow(dead_code)]
+use std::str::FromStr;
+
 use bigdecimal::BigDecimal;
 pub use depth_interval::*;
 pub use pool_period::*;
 pub use pool_status::*;
 use serde::{Deserialize, Serialize};
-use std::str::FromStr;
 
 mod depth_interval;
 mod pool_period;
@@ -55,7 +56,7 @@ impl ThorchainNinerealms {
 		}
 	}
 
-	pub async fn get_usd_quote(&self, pool: &str, interval: DepthInterval, count: u16, to: Option<i64>, from: Option<i64>) -> Vec<(i64, BigDecimal)> {
+	pub async fn get_usd_quote(&self, pool: &str, interval: DepthInterval, count: u16, to: Option<i64>, from: Option<i64>) -> Vec<(BigDecimal, BigDecimal)> {
 		let client = reqwest::Client::new();
 		let url = format!("{}/v2/history/depths/{}?interval={}&count={}", self.base_url, pool, interval, count);
 		let url = match to {
@@ -69,10 +70,10 @@ impl ThorchainNinerealms {
 
 		let response = client.get(&url).send().await.unwrap().json::<serde_json::Value>().await.unwrap();
 
-		let mut quotes: Vec<(i64, BigDecimal)> = Vec::new();
+		let mut quotes: Vec<(BigDecimal, BigDecimal)> = Vec::new();
 		for interval in response["intervals"].as_array().unwrap() {
 			let price = BigDecimal::from_str(interval["assetPriceUSD"].as_str().unwrap()).unwrap();
-			let time = i64::from_str(interval["endTime"].as_str().unwrap()).unwrap();
+			let time = BigDecimal::from_str(interval["endTime"].as_str().unwrap()).unwrap();
 			quotes.push((time, price));
 		}
 

@@ -38,7 +38,7 @@ pub async fn btcbtc_usausd() -> Json<Value> {
 	let measurements: Vec<Measurement> = quotes
 		.iter()
         		.map(|(time, price)| {
-                                Measurement::new("thorchain", "BtcBtc", "UsaUsd", Uuid::new_v4(), *time, price.clone())
+                                Measurement::new("thorchain", "BtcBtc", "UsaUsd", Uuid::new_v4(), time.clone(), price.clone())
                         })
 		.collect();
 
