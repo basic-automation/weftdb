@@ -23,9 +23,9 @@ pub struct Measurement {
 	pub numerator_asset: String,
 	pub denominator_asset: String,
 	pub uuid: Uuid,
-	pub timestamp: i64,
+	pub timestamp: BigDecimal,
 	pub ratio: BigDecimal,
-	pub location: Option<i64>,
+	pub location: Option<BigDecimal>,
 	pub amplitude: Option<BigDecimal>,
 	pub positive_distance: Option<BigDecimal>,
 	pub negative_distance: Option<BigDecimal>,
@@ -33,7 +33,7 @@ pub struct Measurement {
 }
 
 impl Measurement {
-	pub fn new(source: &str, numerator_asset: &str, denominator_asset: &str, uuid: Uuid, timestamp: i64, ratio: BigDecimal) -> Self {
+	pub fn new(source: &str, numerator_asset: &str, denominator_asset: &str, uuid: Uuid, timestamp: BigDecimal, ratio: BigDecimal) -> Self {
 		Self {
 			source: source.to_string(),
 			numerator_asset: numerator_asset.to_string(),
