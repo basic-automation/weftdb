@@ -1,3 +1,3 @@
 pub use bucket::*;
 
-mod bucket;
+pub mod bucket;

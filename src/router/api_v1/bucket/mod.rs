@@ -9,7 +9,7 @@ use sled::Db;
 use std::collections::HashMap;
 
 mod buckets;
-mod keys;
+pub mod keys;
 
 pub async fn process_tags(tags: Option<Vec<String>>) -> Option<HashMap<String, String>> {
 	match tags {

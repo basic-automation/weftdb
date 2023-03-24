@@ -6,7 +6,7 @@ use std::hash::Hash;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectValue {
 	pub value: Value,
-	pub key: String,
+	pub key:   String,
 }
 
 impl ObjectValue {

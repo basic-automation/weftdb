@@ -1,15 +1,15 @@
 use super::super::*;
+use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
 use axum::{extract::Path, extract::State, Json};
+use serde::Deserialize;
 use serde_json::json;
 use serde_json::Value;
 use sled::Db;
-use serde::Deserialize;
-use axum::extract::rejection::JsonRejection;
 
 #[derive(Deserialize)]
 pub struct RemoveFromBucketParams {
-        pub debug: Option<bool>,
+	pub debug: Option<bool>,
 }
 
 pub async fn remove_from_bucket(Path(path): Path<Vec<String>>, Qs(params): Qs<DeleteBucketParams>, State(db): State<Db>, _body: Result<Json<Value>, JsonRejection>) -> (StatusCode, Json<Value>) {

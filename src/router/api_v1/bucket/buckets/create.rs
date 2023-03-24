@@ -3,11 +3,11 @@ use axum::{http::StatusCode, Json};
 
 #[derive(Deserialize)]
 pub struct CreateBucketParams {
-	pub name: String,
+	pub name:        String,
 	#[serde(rename = "type")]
 	pub bucket_type: String,
-	pub debug: Option<bool>,
-	pub tag: Option<Vec<String>>,
+	pub debug:       Option<bool>,
+	pub tag:         Option<Vec<String>>,
 }
 
 pub async fn create_bucket(State(db): State<Db>, Qs(params): Qs<CreateBucketParams>, _body: Bytes) -> (StatusCode, Json<Value>) {

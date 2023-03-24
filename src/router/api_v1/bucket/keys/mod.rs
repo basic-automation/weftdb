@@ -9,7 +9,7 @@ use sled::Db;
 pub use update::*;
 
 mod add;
-mod get;
+pub mod get;
 mod remove;
 mod update;
 
