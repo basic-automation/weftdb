@@ -1,27 +1,74 @@
 use super::Interpolation;
 use crate::interpolation::ToInterpolation;
 use crate::length::{BatchLength, ToSeconds};
-use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
+use dsm_log::Log;
+use bigdecimal::BigDecimal;
 use dsm_measurement::Measurement;
+use num_bigint::BigUint;
 use rayon::prelude::*;
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
+use serde_json::json;
 use std::collections::HashMap;
-use std::sync::{Mutex, Arc};
+use std::sync::{Arc, Mutex};
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Measurements(pub HashMap<BigUint, Measurement>);
+
+impl Serialize for Measurements {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		let mut map = serializer.serialize_map(Some(self.0.len()))?;
+		for (k, v) in &self.0 {
+			map.serialize_entry(&k.to_string(), &v)?;
+		}
+		map.end()
+	}
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Movements(pub HashMap<BigUint, BigDecimal>);
+
+impl Serialize for Movements {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		let mut map = serializer.serialize_map(Some(self.0.len()))?;
+		for (k, v) in &self.0 {
+			map.serialize_entry(&k.to_string(), &v)?;
+		}
+		map.end()
+	}
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Batch {
-	pub measurements: Option<Vec<Measurement>>,
+	pub measurements: Option<Measurements>,
 	pub length: BatchLength,
 	pub measurement_bucket: String,
 	pub uuid: Uuid,
-        pub relative_x_movements: Option<Vec<BigDecimal>>,
-        pub relative_y_movements: Option<Vec<BigDecimal>>,
+	pub relative_x_movements: Option<Movements>,
+	pub relative_y_movements: Option<Movements>,
+	pub logs: Log,
+        pub is_logging: bool,
 }
 
 impl Batch {
-	pub fn new(measurement_bucket: String, length: BatchLength) -> Self {
-		Self { measurements: None, length, measurement_bucket, uuid: Uuid::new_v4(), relative_x_movements: None, relative_y_movements: None }
+	pub fn new(measurement_bucket: String, length: BatchLength, log: bool) -> Self {
+		let id = Uuid::new_v4();
+
+		//log
+		let mut logs = Log::new(&id.to_string());
+
+                if log {
+                    logs.log("1: Created", &json!("batch created"));
+                }
+
+		Self { measurements: None, length, measurement_bucket, uuid: id, relative_x_movements: None, relative_y_movements: None, logs, is_logging: log }
 	}
 
 	pub async fn numerator_asset(&self) -> String {
@@ -33,8 +80,8 @@ impl Batch {
 	}
 
 	/// size = number of seconds in batch
-	pub async fn size(&self) -> usize {
-		self.length.to_seconds() as usize
+	pub async fn size(&self) -> BigDecimal {
+		self.length.to_seconds()
 	}
 
 	/// interpolation = unit of time between measurements
@@ -43,73 +90,101 @@ impl Batch {
 	}
 
 	/// interpolation_steps = number of seconds between measurements
-	pub async fn interpolation_steps(&self) -> usize {
-		self.interpolation().await.to_seconds() as usize
+	pub async fn interpolation_steps(&self) -> BigDecimal {
+		self.interpolation().await.to_seconds()
 	}
 
-	pub async fn interval(&self) -> u64 {
+	pub async fn interval(&self) -> BigDecimal {
 		let size = self.size().await;
-		let unit = self.interpolation().await.to_seconds();
+		let steps = self.interpolation_steps().await;
 
-		if unit == 0 {
-			0
+		if steps == BigDecimal::from(0) {
+			BigDecimal::from(0)
 		} else {
-			size as u64 / unit
+			size / steps
 		}
 	}
 
 	/// start_timestamp = first measurement timestamp
-	pub async fn start_timestamp(&self) -> Option<i64> {
-		if self.measurements.is_some() {
-			Some(self.measurements.as_ref().unwrap()[0].timestamp)
-		} else {
-			None
-		}
+	pub async fn start_timestamp(&self) -> Option<BigDecimal> {
+		let measurements = match &self.measurements {
+			Some(measurements) => measurements,
+			None => return None,
+		};
+
+		measurements.0.get(&BigUint::from(0_u8)).map(|measurement| measurement.timestamp.clone())
 	}
 
 	/// end_timestamp = last measurement timestamp
-	pub async fn end_timestamp(&self) -> Option<i64> {
-		if self.measurements.is_some() {
-			Some(self.measurements.as_ref().unwrap()[self.measurements.as_ref().unwrap().len() - 1].timestamp)
-		} else {
-			None
-		}
+	pub async fn end_timestamp(&self) -> Option<BigDecimal> {
+		let measurements = match &self.measurements {
+			Some(measurements) => measurements,
+			None => return None,
+		};
+
+		let last_measurement_index = match self.last_measurement_index().await {
+			Some(measurement) => measurement,
+			None => return None,
+		};
+
+		let measurement = match measurements.0.get(&last_measurement_index) {
+			Some(measurement) => measurement,
+			None => return None,
+		};
+
+		Some(measurement.timestamp.clone())
 	}
 
 	/// max_x_movement = largest location - smallest location
 	pub async fn max_x_movement(&self) -> Option<BigDecimal> {
-		if self.measurements.is_some() {
-			let largest_location = match self.measurements.as_ref().unwrap().par_iter().max_by(|a, b| a.location.cmp(&b.location)).unwrap().location {
-				Some(location) => BigDecimal::from_i64(location).unwrap(),
-				None => return None,
-			};
-			let smallest_location = match self.measurements.as_ref().unwrap().par_iter().min_by(|a, b| a.location.cmp(&b.location)).unwrap().location {
-				Some(location) => BigDecimal::from_i64(location).unwrap(),
-				None => return None,
-			};
+		let measurements = match &self.measurements {
+			Some(measurements) => measurements,
+			None => return None,
+		};
 
-			Some(largest_location - smallest_location)
-		} else {
-			None
-		}
+		let largest_location = match measurements.0.par_iter().max_by(|a, b| a.1.location.cmp(&b.1.location)) {
+			Some(measurement) => match &measurement.1.location {
+				Some(location) => location.clone(),
+				None => return None,
+			},
+			None => return None,
+		};
+
+		let smallest_location = match measurements.0.par_iter().min_by(|a, b| a.1.location.cmp(&b.1.location)) {
+			Some(measurement) => match &measurement.1.location {
+				Some(location) => location.clone(),
+				None => return None,
+			},
+			None => return None,
+		};
+
+		Some(largest_location - smallest_location)
 	}
 
 	/// max_y_movement = largest amplitude - smallest amplitude
 	pub async fn max_y_movement(&self) -> Option<BigDecimal> {
-		if self.measurements.is_some() {
-			let largest_amplitude = match &self.measurements.as_ref().unwrap().par_iter().max_by(|a, b| a.amplitude.cmp(&b.amplitude)).unwrap().amplitude {
-				Some(amplitude) => amplitude.clone(),
-				None => return None,
-			};
-			let smallest_amplitude = match &self.measurements.as_ref().unwrap().par_iter().min_by(|a, b| a.amplitude.cmp(&b.amplitude)).unwrap().amplitude {
-				Some(amplitude) => amplitude.clone(),
-				None => return None,
-			};
+		let measurements = match &self.measurements {
+			Some(measurements) => measurements,
+			None => return None,
+		};
 
-			Some(largest_amplitude - smallest_amplitude)
-		} else {
-			None
-		}
+		let largest_amplitude = match measurements.0.par_iter().max_by(|a, b| a.1.amplitude.cmp(&b.1.amplitude)) {
+			Some(measurement) => match &measurement.1.amplitude {
+				Some(amplitude) => amplitude,
+				None => return None,
+			},
+			None => return None,
+		};
+
+		let smallest_amplitude = match measurements.0.par_iter().min_by(|a, b| a.1.amplitude.cmp(&b.1.amplitude)) {
+			Some(measurement) => match &measurement.1.amplitude {
+				Some(amplitude) => amplitude,
+				None => return None,
+			},
+			None => return None,
+		};
+
+		Some(largest_amplitude - smallest_amplitude)
 	}
 
 	/// relative_x_movement = measurement.location / max_x_movement
@@ -119,22 +194,59 @@ impl Batch {
 			None => return Ok(()),
 		};
 
-		let relative_x_movements: Arc<Mutex<Vec<BigDecimal>>> = Arc::new(Mutex::new(vec![]));
+		let relative_x_movements: Arc<Mutex<HashMap<BigUint, BigDecimal>>> = Arc::new(Mutex::new(HashMap::new()));
 
-                self.measurements.clone().unwrap().par_iter().for_each(|measurement| {
-                        let location = match measurement.location {
-                                Some(location) => BigDecimal::from_i64(location).unwrap(),
-                                None => return,
-                        };
+		let measurements = match &self.measurements {
+			Some(measurements) => measurements,
+			None => return Err("No measurements".to_string()),
+		};
 
-                        relative_x_movements.lock().unwrap().push(location / max_x_movement.clone());
-                });
+                //log begin
+                if self.is_logging {
+                        let locations: Arc<Mutex<HashMap<String, BigDecimal>>> = Arc::new(Mutex::new(HashMap::new()));
+                        self.measurements.as_ref().unwrap().0.par_iter().for_each(|measurement| {
+                                if let Some(location) = &measurement.1.location {
+                                        let mut locations = locations.lock().unwrap();
+                                        locations.insert(measurement.0.clone().to_string(), location.clone());
+                                }
+                        });
+                        self.logs.log(&format!("11: BATCH begin calculating relative x movments MAX-X: {:?}", max_x_movement.clone()), &json!(*locations.clone().lock().unwrap()));
+                }
+                //log end
 
-                let relative_x_movements = relative_x_movements.lock().unwrap().clone();
+		measurements.0.par_iter().for_each(|measurement| {
+			let location = match &measurement.1.location {
+				Some(location) => location,
+				None => return,
+			};
 
-		self.relative_x_movements = Some(relative_x_movements);
+			match relative_x_movements.lock() {
+				Ok(mut rxm) => if max_x_movement != BigDecimal::from(0) {
+                                        rxm.insert(measurement.0.clone(), location / max_x_movement.clone())
+                                } else {
+                                        rxm.insert(measurement.0.clone(), BigDecimal::from(0))
+                                }
+				Err(_) => None,
+			};
+		});
 
-                Ok(())
+		let rxm = match relative_x_movements.lock() {
+			Ok(rxm) => rxm,
+			Err(_) => return Err("Could not lock relative_x_movements".to_string()),
+		};
+
+		let relative_x_movements = rxm.clone();
+
+		self.relative_x_movements = Some(Movements(relative_x_movements));
+
+		// log begin
+                if self.is_logging {
+                        self.logs.log(&format!("12: BATCH end calculate_relative_x_movements"), &json!(self.relative_x_movements));
+                }
+                // log end
+
+
+		Ok(())
 	}
 
 	/// relative_y_movement = measurement.amplitude / max_y_movement
@@ -144,233 +256,538 @@ impl Batch {
 			None => return Ok(()),
 		};
 
-		let relative_y_movements: Arc<Mutex<Vec<BigDecimal>>> = Arc::new(Mutex::new(vec![]));
+		let relative_y_movements: Arc<Mutex<HashMap<BigUint, BigDecimal>>> = Arc::new(Mutex::new(HashMap::new()));
 
-                self.measurements.clone().unwrap().par_iter().for_each(|measurement| {
-                        let amplitude = match &measurement.amplitude {
-                                Some(amplitude) => amplitude.clone(),
-                                None => return,
-                        };
-
-                        relative_y_movements.lock().unwrap().push(amplitude / max_y_movement.clone());
-                });
-
-                let relative_y_movements = relative_y_movements.lock().unwrap().clone();
-
-		self.relative_y_movements = Some(relative_y_movements);
-
-                Ok(())
-	}
-
-        pub async fn calculate_relative_movements(&mut self) -> Result<(), String> {
-                self.calculate_relative_x_movements().await?;
-                self.calculate_relative_y_movements().await?;
-
-                Ok(())
-        }
-
-	pub async fn add_measurement(&mut self, mut measurement: Measurement) {
-		measurement.location = Some(measurement.timestamp);
-		measurement.amplitude = Some(measurement.ratio.clone());
-
-		if self.measurements.is_none() {
-			self.measurements = Some(vec![measurement]);
-		} else {
-			self.measurements.as_mut().unwrap().push(measurement);
-		}
-	}
-
-	pub async fn sort(&mut self) {
-		self.measurements.as_mut().unwrap().sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
-	}
-
-	pub async fn calculate_measurement_distances(&mut self) -> Result<(), String> {
-		self.sort().await;
-
-		let first_location = match self.measurements.as_ref().unwrap().first().unwrap().location {
-			Some(first_location) => BigDecimal::from_i64(first_location).unwrap(),
-			None => return Err("No location found in first measurement".to_string()),
-		};
-		let last_location = match self.measurements.as_ref().unwrap().last().unwrap().location {
-			Some(last_location) => BigDecimal::from_i64(last_location).unwrap(),
-			None => return Err("No location found in last measurement".to_string()),
+		let measurements = match &self.measurements {
+			Some(measurements) => measurements,
+			None => return Err("No measurements".to_string()),
 		};
 
-		self.measurements.as_mut().unwrap().par_iter_mut().for_each(|measurement| {
-			let location = match measurement.location {
-				Some(location) => BigDecimal::from_i64(location).unwrap(),
+                // log begin
+                if self.is_logging {
+                        let amplitudes: Arc<Mutex<HashMap<String, BigDecimal>>> = Arc::new(Mutex::new(HashMap::new()));
+                        self.measurements.as_ref().unwrap().0.par_iter().for_each(|measurement| {
+                                if let Some(amplitude) = &measurement.1.amplitude {
+                                        let mut amplitudes = amplitudes.lock().unwrap();
+                                        amplitudes.insert(measurement.0.clone().to_string(), amplitude.clone());
+                                }
+                        });
+                        self.logs.log(&format!("13: BATCH begin calculating relative y movments MAX-Y: {:?}", max_y_movement.clone()), &json!(*amplitudes.clone().lock().unwrap()));
+                }
+                // log end
+
+		measurements.0.par_iter().for_each(|measurement| {
+			let amplitude = match &measurement.1.amplitude {
+				Some(amplitude) => amplitude.clone(),
 				None => return,
 			};
 
-			let positive_distance = (BigDecimal::from(1) / (last_location.clone() - first_location.clone())) * (location - first_location.clone());
-			measurement.positive_distance = Some(positive_distance.clone());
-			measurement.negative_distance = Some(BigDecimal::from(1) - positive_distance);
+			match relative_y_movements.lock() {
+				Ok(mut rym) => if max_y_movement.clone() != BigDecimal::from(0) {
+                                        rym.insert(measurement.0.clone(), amplitude / max_y_movement.clone())
+                                } else {
+                                        rym.insert(measurement.0.clone(), BigDecimal::from(0))
+                                },
+				Err(_) => None,
+			};
 		});
+
+		let relative_y_movements = match relative_y_movements.lock() {
+			Ok(rym) => rym.clone(),
+			Err(_) => return Err("Could not lock relative_y_movements".to_string()),
+		};
+
+		self.relative_y_movements = Some(Movements(relative_y_movements));
+
+		// log begin
+                if self.is_logging {
+                        self.logs.log(&format!("14: BATCH end calculate_relative_y_movements"), &json!(self.relative_y_movements));
+                }
+                // log end
+
+		Ok(())
+	}
+
+	pub async fn calculate_relative_movements(&mut self) -> Result<(), String> {
+		match self.calculate_relative_x_movements().await {
+                        Ok(_) => (),
+                        Err(e) => return Err(e),
+                };
+		match self.calculate_relative_y_movements().await {
+                        Ok(_) => (),
+                        Err(e) => return Err(e),
+                };
+
+		Ok(())
+	}
+
+	pub async fn add_measurement(&mut self, mut measurement: Measurement) {
+		measurement.location = Some(measurement.timestamp.clone());
+		measurement.amplitude = Some(measurement.ratio.clone());
+		let mut measurements = match &self.measurements {
+			Some(measurements) => measurements.0.clone(),
+			None => HashMap::new(),
+		};
+		let index = match measurements.len() {
+			0 => BigUint::from(0_u8),
+			_ => BigUint::from(measurements.len() as u8),
+		};
+		measurements.insert(index, measurement);
+
+		self.measurements = Some(Measurements(measurements));
+	}
+
+	pub async fn add_measurements(&mut self, measurements: Vec<Measurement>) {
+		for measurement in measurements {
+			self.add_measurement(measurement).await;
+		}
+	}
+
+	pub async fn last_measurement_index(&self) -> Option<BigUint> {
+		let measurements = match self.measurements {
+			Some(ref measurements) => measurements,
+			None => return None,
+		};
+
+		let last_measurement: Arc<Mutex<BigUint>> = Arc::new(Mutex::new(BigUint::from(0_u8)));
+		measurements.0.par_iter().for_each(|measurement| {
+			if let Ok(mut last_measurement) = last_measurement.lock() {
+				if measurement.0 > &last_measurement.clone() {
+					last_measurement.clone_from(measurement.0);
+				}
+			}
+		});
+
+		let last_index = match last_measurement.lock() {
+			Ok(last_index) => last_index.clone(),
+			Err(_) => return None,
+		};
+
+		Some(last_index)
+	}
+
+	pub async fn calculate_measurement_distances(&mut self) -> Result<(), String> {
+		let measurements = match &self.measurements {
+			Some(measurements) => measurements,
+			None => return Err("No measurements found".to_string()),
+		};
+
+		let first_location = match measurements.0.get(&BigUint::from(0_u8)) {
+			Some(first_measurement) => match &first_measurement.location {
+				Some(first_location) => first_location.clone(),
+				None => return Err("No location found in first measurement".to_string()),
+			},
+			None => return Err("No measurements found".to_string()),
+		};
+
+		let last_measurement_index = match self.last_measurement_index().await {
+			Some(last_measurement_index) => last_measurement_index,
+			None => return Err("No measurements found".to_string()),
+		};
+
+		let last_location = match measurements.0.get(&last_measurement_index) {
+			Some(last_measurement) => match &last_measurement.location {
+				Some(last_location) => last_location.clone(),
+				None => return Err("No location found in last measurement".to_string()),
+			},
+			None => return Err("No measurements found".to_string()),
+		};
+
+                // begin logs
+                if self.is_logging {
+                        let locations: Arc<Mutex<HashMap<String, BigDecimal>>> = Arc::new(Mutex::new(HashMap::new()));
+                        self.measurements.as_ref().unwrap().0.par_iter().for_each(|measurement| {
+                                if let Some(location) = &measurement.1.location {
+                                        let mut locations = locations.lock().unwrap();
+                                        locations.insert(measurement.0.clone().to_string(), location.clone());
+                                }
+                        });
+                        self.logs.log(&format!("2: BATCH begin calculate distances locations:"), &json!(*locations.lock().unwrap()));
+                }
+                // end logs
+
+		match self.measurements.as_mut() {
+			Some(measurements) => {
+				measurements.0.par_iter_mut().for_each(|measurement| {					
+                                        let location = match &measurement.1.location {
+						Some(location) => location,
+						None => return,
+					};
+
+					let positive_distance = (BigDecimal::from(1) / (last_location.clone() - first_location.clone())) * (location - first_location.clone());
+					measurement.1.positive_distance = Some(positive_distance.clone());
+					measurement.1.negative_distance = Some(BigDecimal::from(1) - positive_distance);
+				});
+			}
+			None => return Err("No measurements found".to_string()),
+		}
+
+                // begin logs
+                if self.is_logging {
+                        let postive_distances: Arc<Mutex<HashMap<String, BigDecimal>>> = Arc::new(Mutex::new(HashMap::new()));
+                        self.measurements.as_ref().unwrap().0.par_iter().for_each(|measurement| {
+                                if let Some(positive_distance) = &measurement.1.positive_distance {
+                                        let mut postive_distances = postive_distances.lock().unwrap();
+                                        postive_distances.insert(measurement.0.clone().to_string(), positive_distance.clone());
+                                }
+                        });
+
+                        let negative_distances: Arc<Mutex<HashMap<String, BigDecimal>>> = Arc::new(Mutex::new(HashMap::new()));
+                        self.measurements.as_ref().unwrap().0.par_iter().for_each(|measurement| {
+                                if let Some(negative_distance) = &measurement.1.negative_distance {
+                                        let mut negative_distances = negative_distances.lock().unwrap();
+                                        negative_distances.insert(measurement.0.clone().to_string(), negative_distance.clone());
+                                }
+                        });
+
+                        self.logs.log(&format!("3: BATCH end calculate distances postive_distances:"), &json!(*postive_distances.lock().unwrap()));
+                        self.logs.log(&format!("4: BATCH end calculate distances negative_distances:"), &json!(*negative_distances.lock().unwrap()));
+                }
+                // end logs
 
 		Ok(())
 	}
 
 	pub async fn vector_leveling(&mut self) -> Result<(), String> {
-		self.sort().await;
-
-		let first_amplitude = match &self.measurements.as_ref().unwrap().first().unwrap().amplitude {
-			Some(first_amplitude) => first_amplitude.clone(),
-			None => return Err("No amplitude found in first measurement".to_string()),
-		};
-		let last_amplitude = match &self.measurements.as_ref().unwrap().last().unwrap().amplitude {
-			Some(last_amplitude) => last_amplitude.clone(),
-			None => return Err("No amplitude found in last measurement".to_string()),
+		let measurements = match &self.measurements {
+			Some(measurements) => measurements,
+			None => return Err("No measurements found".to_string()),
 		};
 
-		self.measurements.as_mut().unwrap().par_iter_mut().for_each(|measurement| {
-			let mut amplitude = match &measurement.amplitude {
-				Some(amplitude) => amplitude.clone(),
-				None => return,
-			};
-			let positive_distance = match measurement.positive_distance.clone() {
-				Some(positive_distance) => positive_distance,
-				None => return,
-			};
-			let negative_distance = match measurement.negative_distance.clone() {
-				Some(negative_distance) => negative_distance,
-				None => return,
-			};
+		let first_amplitude = match measurements.0.get(&BigUint::from(0_u8)) {
+			Some(first_measurement) => match &first_measurement.amplitude {
+				Some(first_amplitude) => first_amplitude.clone(),
+				None => return Err("No amplitude found in first measurement".to_string()),
+			},
+			None => return Err("No measurements found".to_string()),
+		};
 
-			// Positive vector leveling
-			measurement.amplitude = Some(amplitude + ((BigDecimal::from(0) - first_amplitude.clone()) * negative_distance));
+		let last_measurement_index = match self.last_measurement_index().await {
+			Some(last_measurement_index) => last_measurement_index,
+			None => return Err("No measurements found".to_string()),
+		};
 
-			amplitude = match &measurement.amplitude {
-				Some(amplitude) => amplitude.clone(),
-				None => return,
-			};
+		let last_amplitude = match measurements.0.get(&last_measurement_index) {
+			Some(last_measurement) => match &last_measurement.amplitude {
+				Some(last_amplitude) => last_amplitude.clone(),
+				None => return Err("No amplitude found in last measurement".to_string()),
+			},
+			None => return Err("No measurements found".to_string()),
+		};
 
-			// Negative vector leveling
-			measurement.amplitude = Some(amplitude + ((BigDecimal::from(0) - last_amplitude.clone()) * positive_distance));
-		});
+                // log begin
+                if self.is_logging {
+                        let amplitudes: Arc<Mutex<HashMap<String, BigDecimal>>> = Arc::new(Mutex::new(HashMap::new()));
+                        self.measurements.as_ref().unwrap().0.par_iter().for_each(|measurement| {
+                                if let Some(amplitude) = &measurement.1.amplitude {
+                                        let mut amplitudes = amplitudes.lock().unwrap();
+                                        amplitudes.insert(measurement.0.clone().to_string(), amplitude.clone());
+                                }
+                        });
+                        self.logs.log(&format!("5: BATCH begin vector leveling amplitudes:"), &json!(*amplitudes.lock().unwrap()));
+                }
+                // log end
+
+		match self.measurements.as_mut() {
+			Some(measurements) => {
+				measurements.0.par_iter_mut().for_each(|measurement| {
+					let mut amplitude = match &measurement.1.amplitude {
+						Some(amplitude) => amplitude.clone(),
+						None => return,
+					};
+					let positive_distance = match measurement.1.positive_distance.clone() {
+						Some(positive_distance) => positive_distance,
+						None => return,
+					};
+					let negative_distance = match measurement.1.negative_distance.clone() {
+						Some(negative_distance) => negative_distance,
+						None => return,
+					};
+
+					// Positive vector leveling
+					measurement.1.amplitude = Some(amplitude + ((BigDecimal::from(0) - first_amplitude.clone()) * negative_distance));
+
+					amplitude = match &measurement.1.amplitude {
+						Some(amplitude) => amplitude.clone(),
+						None => return,
+					};
+
+					// Negative vector leveling
+					measurement.1.amplitude = Some(amplitude + ((BigDecimal::from(0) - last_amplitude.clone()) * positive_distance));
+				});
+			}
+			None => return Err("No measurements found".to_string()),
+		}
+
+                // log begin
+                if self.is_logging {
+                        let amplitudes: Arc<Mutex<HashMap<String, BigDecimal>>> = Arc::new(Mutex::new(HashMap::new()));
+                        self.measurements.as_ref().unwrap().0.par_iter().for_each(|measurement| {
+                                if let Some(amplitude) = &measurement.1.amplitude {
+                                        let mut amplitudes = amplitudes.lock().unwrap();
+                                        amplitudes.insert(measurement.0.clone().to_string(), amplitude.clone());
+                                }
+                        });
+                        self.logs.log(&format!("6: BATCH end vector leveling amplitudes:"), &json!(*amplitudes.lock().unwrap()));
+                }
+                // log end
 
 		Ok(())
 	}
 
-        pub async fn origin_transformation(&mut self) -> Result<(), String> {
-                self.sort().await;
+	pub async fn origin_transformation(&mut self) -> Result<(), String> {
+		let measurements = match self.measurements.as_ref() {
+			Some(measurements) => measurements,
+			None => return Err("No measurements found".to_string()),
+		};
 
-                let first_location = match self.measurements.as_ref().unwrap().first().unwrap().location {
-                        Some(first_location) => BigDecimal::from_i64(first_location).unwrap(),
-                        None => return Err("No location found in first measurement".to_string()),
-                };
+		let first_location = match measurements.0.get(&BigUint::from(0_u8)) {
+			Some(first_measurement) => match &first_measurement.location {
+				Some(first_location) => first_location.clone(),
+				None => return Err("No location found in first measurement".to_string()),
+			},
+			None => return Err("No first measurement found".to_string()),
+		};
 
-                self.measurements.as_mut().unwrap().par_iter_mut().for_each(|measurement| {
-                        let location = match measurement.location {
-                                Some(location) => BigDecimal::from_i64(location).unwrap(),
-                                None => return,
-                        };
+		let mut measurements = match self.measurements.as_ref() {
+			Some(measurements) => measurements.clone(),
+			None => return Err("No measurements found".to_string()),
+		};
 
-                        measurement.location = Some((location - first_location.clone()).to_i64().unwrap());
-                });
-
-                Ok(())
-        }
-
-        pub async fn trend_vector_analysis(&mut self) -> Result<(), String> {
-                self.sort().await;
-
-                let tvs: Arc<Mutex<HashMap<Uuid, Option<Vec<BigDecimal>>>>> = Arc::new(Mutex::new(HashMap::new()));
-
-                self.measurements.as_ref().unwrap().par_iter().for_each(|origin_measurement| {
-                        let trend_vectors: Arc<Mutex<Vec<BigDecimal>>> = Arc::new(Mutex::new(vec![]));
-                        let origin_location = match origin_measurement.location {
-                                Some(location) => BigDecimal::from_i64(location).unwrap(),
-                                None => return,
-                        };
-                        let origin_amplitude = match &origin_measurement.amplitude {
-                                Some(amplitude) => amplitude.clone(),
-                                None => return,
-                        };
-
-                        self.measurements.clone().as_ref().unwrap().par_iter().for_each(|end_measurement| {
-                                let mut t_vec = trend_vectors.lock().unwrap();
-                                
-                                if end_measurement.location.unwrap() == origin_measurement.location.unwrap() {
-                                        t_vec.push(BigDecimal::from(0));
-                                        return;
+                // logs begin
+                if self.is_logging {
+                        let locations: Arc<Mutex<HashMap<String, BigDecimal>>> = Arc::new(Mutex::new(HashMap::new()));
+                        self.measurements.as_ref().unwrap().0.par_iter().for_each(|measurement| {
+                                if let Some(location) = measurement.1.location.clone() {
+                                        let mut locations = locations.lock().unwrap();
+                                        locations.insert(measurement.0.clone().to_string(), location);
                                 }
-
-                                let end_location = match end_measurement.location {
-                                        Some(location) => BigDecimal::from_i64(location).unwrap(),
-                                        None => return,
-                                };
-                                let end_amplitude = match &end_measurement.amplitude {
-                                        Some(amplitude) => amplitude.clone(),
-                                        None => return,
-                                };
-
-                                if end_amplitude.clone() - origin_amplitude.clone() == BigDecimal::from(0) {
-                                        t_vec.push(BigDecimal::from(0));
-                                        return;
-                                }
-
-                                t_vec.push((end_location - origin_location.clone()) / (end_amplitude - origin_amplitude.clone()));
                         });
+                        self.logs.log(&format!("7: BATCH begin origin transformation locations:"), &json!(*locations.lock().unwrap()));
+                }
+                // logs end
 
-                        let mut tvs = tvs.lock().unwrap();
-                        tvs.insert(origin_measurement.uuid, Some(trend_vectors.lock().unwrap().clone()));
-                });
+		measurements.0.par_iter_mut().for_each(|measurement| {
+			let location = match &measurement.1.location {
+				Some(location) => location,
+				None => return,
+			};
 
-                self.measurements.as_mut().unwrap().par_iter_mut().for_each(|measurement| {
-                        let tvs = tvs.lock().unwrap();
-                        let trend_vectors = tvs.get(&measurement.uuid).unwrap().clone();
+			measurement.1.location = Some(location - first_location.clone());
+		});
 
-                        measurement.trend_vectors = trend_vectors;
-                });
+		self.measurements = Some(measurements.clone());
 
-                Ok(())
-        }
+                // logs begin
+                if self.is_logging {
+                        let locations: Arc<Mutex<HashMap<String, BigDecimal>>> = Arc::new(Mutex::new(HashMap::new()));
+                        self.measurements.as_ref().unwrap().0.par_iter().for_each(|measurement| {
+                                if let Some(location) = measurement.1.location.clone() {
+                                        let mut locations = locations.lock().unwrap();
+                                        locations.insert(measurement.0.clone().to_string(), location);
+                                }
+                        });
+                        self.logs.log(&format!("8: BATCH end origin transformation locations:"), &json!(*locations.lock().unwrap()));
+                }
+                // logs end
 
-        pub async fn simplify_transformation(&mut self) -> Result<(), String> {
-                self.sort().await;
+		Ok(())
+	}
 
-                let mut simplified_measurements: Vec<Measurement> = vec![];
+	pub async fn trend_vector_analysis(&mut self) -> Result<(), String> {
+		let tvs: Arc<Mutex<HashMap<Uuid, Option<Vec<BigDecimal>>>>> = Arc::new(Mutex::new(HashMap::new()));
+		let measurements = match &self.measurements {
+			Some(measurements) => measurements,
+			None => return Err("No measurements found".to_string()),
+		};
 
-                let mut p = 0;
-                let mut c = 1;
-                let mut n = 2;
-                
-                while c < self.measurements.clone().expect("no meaurements in batch").len() - 1 {
-                        let previous_amplitude = match &self.measurements.as_ref().unwrap()[p].amplitude {
-                                Some(amplitude) => amplitude.clone(),
-                                None => return Err("No amplitude found in previous measurement".to_string()),
-                        };
-                        let current_amplitude = match &self.measurements.as_ref().unwrap()[c].amplitude {
-                                Some(amplitude) => amplitude.clone(),
-                                None => return Err("No amplitude found in current measurement".to_string()),
-                        };
-                        let next_amplitude = match &self.measurements.as_ref().unwrap()[n].amplitude {
-                                Some(amplitude) => amplitude.clone(),
-                                None => return Err("No amplitude found in next measurement".to_string()),
-                        };
+		measurements.0.par_iter().for_each(|origin_measurement| {
+			let trend_vectors: Arc<Mutex<Vec<BigDecimal>>> = Arc::new(Mutex::new(vec![]));
+			let origin_location = match origin_measurement.1.location.clone() {
+				Some(location) => location,
+				None => return,
+			};
+			let origin_amplitude = match &origin_measurement.1.amplitude {
+				Some(amplitude) => amplitude.clone(),
+				None => return,
+			};
 
-                        if previous_amplitude < current_amplitude && next_amplitude > current_amplitude {
-                                simplified_measurements.push(self.measurements.as_ref().unwrap()[c].clone());
-                                c += 1;
-                                n += 1;
-                                continue;
-                        }
+			measurements.0.clone().par_iter().for_each(|end_measurement| {
+				let mut t_vec = match trend_vectors.lock() {
+					Ok(t_vec) => t_vec,
+					Err(_) => return,
+				};
 
-                        if previous_amplitude > current_amplitude && next_amplitude < current_amplitude {
-                                simplified_measurements.push(self.measurements.as_ref().unwrap()[c].clone());
-                                c += 1;
-                                n += 1;
-                                continue;
-                        }
+				let end_location = match end_measurement.1.location.clone() {
+					Some(location) => location,
+					None => return,
+				};
 
-                        p = c;
-                        c += 1;
-                        n += 1;
+				if end_location == origin_location {
+					t_vec.push(BigDecimal::from(0));
+					return;
+				}
+
+				let end_amplitude = match &end_measurement.1.amplitude {
+					Some(amplitude) => amplitude.clone(),
+					None => return,
+				};
+
+				if end_amplitude.clone() - origin_amplitude.clone() == BigDecimal::from(0) {
+					t_vec.push(BigDecimal::from(0));
+					return;
+				}
+
+				t_vec.push((end_location - origin_location.clone()) / (end_amplitude - origin_amplitude.clone()));
+			});
+
+			let mut tvs = match tvs.lock() {
+				Ok(tvs) => tvs,
+				Err(_) => return,
+			};
+
+			let trend_vectors = match trend_vectors.lock() {
+				Ok(trend_vectors) => trend_vectors,
+				Err(_) => return,
+			};
+			tvs.insert(origin_measurement.1.uuid, Some(trend_vectors.clone()));
+		});
+
+		if let Some(measurements) = self.measurements.as_mut() {
+			measurements.0.par_iter_mut().for_each(|measurement| {
+				let tvs = match tvs.lock() {
+					Ok(tvs) => tvs,
+					Err(_) => return,
+				};
+				let trend_vectors = match tvs.get(&measurement.1.uuid) {
+					Some(trend_vectors) => trend_vectors.clone(),
+					None => return,
+				};
+
+				measurement.1.trend_vectors = trend_vectors;
+			});
+		}
+
+		Ok(())
+	}
+
+	pub async fn simplify_transformation(&mut self) -> Result<(), String> {
+		let mut simplified_measurements: HashMap<BigUint, Measurement> = HashMap::new();
+
+                // logs begin
+                if self.is_logging {
+                        let locations_aplitudes: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+                        self.measurements.as_ref().unwrap().0.par_iter().for_each(|measurement| {
+                                if let Some(location) = measurement.1.location.clone() {
+                                        let mut locations_aplitudes = locations_aplitudes.lock().unwrap();
+                                        locations_aplitudes.insert(measurement.0.clone().to_string(), format!("location: {}, Amplitude: {}", location, measurement.1.amplitude.clone().unwrap()));
+                                }
+                        });
+                        self.logs.log(&format!("9: BATCH begin simplify transformation locations:"), &json!(*locations_aplitudes.lock().unwrap()));
+                }
+                // logs end
+
+		let mut p = 0;
+		let mut c = 1;
+		let mut n = 2;
+
+		let measurements = match &self.measurements {
+			Some(measurements) => measurements,
+			None => return Err("No measurements found".to_string()),
+		};
+
+		let first_measurement = match measurements.0.get(&BigUint::from(0_u8)) {
+			Some(first_measurement) => first_measurement,
+			None => return Err("No first measurement found".to_string()),
+		};
+
+		simplified_measurements.insert(BigUint::from(0_u8), first_measurement.clone());
+
+		while c < self.measurements.clone().expect("no meaurements in batch").0.len() - 2 {
+			let previous_amplitude = match measurements.0.get(&BigUint::from(p as u64)) {
+				Some(previous_amplitude) => match &previous_amplitude.amplitude {
+					Some(previous_amplitude) => previous_amplitude,
+					None => return Err("No amplitude found in previous measurement".to_string()),
+				},
+				None => return Err("No amplitude found in previous measurement".to_string()),
+			};
+
+			let current_amplitude = match measurements.0.get(&BigUint::from(c as u64)) {
+				Some(current_amplitude) => match &current_amplitude.amplitude {
+					Some(current_amplitude) => current_amplitude,
+					None => return Err("No amplitude found in current measurement".to_string()),
+				},
+				None => return Err("No amplitude found in current measurement".to_string()),
+			};
+
+			let next_amplitude = match measurements.0.get(&BigUint::from(n as u64)) {
+				Some(next_amplitude) => match &next_amplitude.amplitude {
+					Some(next_amplitude) => next_amplitude,
+					None => return Err("No amplitude found in next measurement".to_string()),
+				},
+				None => return Err("No amplitude found in next measurement".to_string()),
+			};
+
+			let current_measurement = match measurements.0.get(&BigUint::from(c as u64)) {
+				Some(current_measurement) => current_measurement,
+				None => return Err("No current measurement found".to_string()),
+			};
+
+			// if both the previous and next amplitudes are greater than the current amplitude, then the current amplitude is a local maximum and should be kept
+			if previous_amplitude > current_amplitude && next_amplitude > current_amplitude {
+				simplified_measurements.insert(BigUint::from(c as u64), current_measurement.clone());
+				p = c;
+				c += 1;
+				n += 1;
+				continue;
+			}
+
+			// if both the previous and next amplitudes are less than the current amplitude, then the current amplitude is a local minimum and should be kept
+			if previous_amplitude < current_amplitude && next_amplitude < current_amplitude {
+				simplified_measurements.insert(BigUint::from(c as u64), current_measurement.clone());
+				p = c;
+				c += 1;
+				n += 1;
+				continue;
+			}
+
+			p = c;
+			c += 1;
+			n += 1;
+		}
+
+		let next_measurement = match measurements.0.get(&BigUint::from(n as u64)) {
+			Some(next_measurement) => next_measurement,
+			None => return Err("No next measurement found".to_string()),
+		};
+
+		simplified_measurements.insert(BigUint::from(n as u64), next_measurement.clone());
+
+		self.measurements = Some(Measurements(simplified_measurements));
+
+                // logs begin
+                if self.is_logging {
+                        let locations_aplitudes: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+                        self.measurements.as_ref().unwrap().0.par_iter().for_each(|measurement| {
+                                if let Some(location) = measurement.1.location.clone() {
+                                        let mut locations_aplitudes = locations_aplitudes.lock().unwrap();
+                                        locations_aplitudes.insert(measurement.0.clone().to_string(), format!("Location: {}, Amplidute: {}", location, measurement.1.amplitude.clone().unwrap()));
+                                }
+                        });
+                        self.logs.log(&format!("10: BATCH end simplify transformation locations:"), &json!(*locations_aplitudes.lock().unwrap()));
+                }
+                // logs end
+
+		Ok(())
+	}
+
+	pub async fn finish(&mut self) {
+		// log save log
+                if self.is_logging {
+		        self.logs.log("finish", &json!(""));
                 }
 
-                self.measurements = Some(simplified_measurements);
-
-                Ok(())
-        }
-
+		// save log
+		let _ = self.logs.save("batch").await;
+	}
 }

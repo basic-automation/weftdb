@@ -9,8 +9,13 @@ edition = "2021"
 bigdecimal = { version = "0", features=["serde"] }
 serde = { version = "1", features = ["derive"] }
 uuid = { version="1", features=["v4", "fast-rng", "macro-diagnostics", "serde"] }
-dsm_measurement = { path = "../dsm-measurement" }
+dsm_measurement = { path = "../1 - dsm-measurement" }
 rayon = "1"
+num-bigint = { version="0", features = ["serde"] }
+indexmap = {version = "1", features = ["serde", "rustc-rayon"]}
+chrono = { version="0", features = ["serde"] }
+serde_json = { version="1", features = ["preserve_order"] }
+dsm_log = { path = "../dsm-log" }
 
 
 

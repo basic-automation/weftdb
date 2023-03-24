@@ -1,4 +1,5 @@
 use crate::length::ToSeconds;
+use bigdecimal::BigDecimal;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Copy, Eq)]
@@ -15,13 +16,13 @@ pub trait ToInterpolation {
 }
 
 impl ToSeconds for Interpolation {
-	fn to_seconds(&self) -> u64 {
+	fn to_seconds(&self) -> BigDecimal {
 		match self {
-			Interpolation::None => 0,
-			Interpolation::Second => 1,
-			Interpolation::Minute => 60,
-			Interpolation::Hour => 3600,
-			Interpolation::Day => 86400,
+			Interpolation::None => BigDecimal::from(0),
+			Interpolation::Second => BigDecimal::from(1),
+			Interpolation::Minute => BigDecimal::from(60),
+			Interpolation::Hour => BigDecimal::from(3600),
+			Interpolation::Day => BigDecimal::from(86400),
 		}
 	}
 }
