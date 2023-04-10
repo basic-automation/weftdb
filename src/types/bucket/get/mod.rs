@@ -8,6 +8,7 @@ pub use interp::*;
 use sled::Tree;
 use std::collections::HashMap;
 use std::str::FromStr;
+use core::cmp::Ordering;
 
 mod interp;
 
@@ -149,10 +150,51 @@ pub async fn get_timeseries_bucket(tree: Tree, params: BucketParams) -> Result<V
 		},
 	};
 
-	if range.len() < 2 {
-		for v in range {
-			res.push(BucketValue::TimeSeries(v));
+	if range.len() == 1 {
+		for v in &range {
+			res.push(BucketValue::TimeSeries(v.clone()));
 		}
+
+                if let Some(_) = params.interpolation {
+                        let take = params.take.unwrap_or(BigDecimal::from(60_u16));
+                        let step = (range_end.clone().unwrap() - range_start.clone().unwrap()) / take.clone();
+                        let mut i = range_start.unwrap();
+                        
+                        while i < range_end.clone().unwrap() {
+                                if i == range[0].timestamp {
+                                        i = i + step.clone();
+                                        continue;
+                                }
+                                let m = TimeSeriesMeasurement {
+                                        timestamp: i.clone(),
+                                        value: range[0].clone().value,
+                                        tags: None,
+                                };
+                                res.push(BucketValue::TimeSeries(m));
+
+                                i = i + step.clone();
+                        }
+
+                        let m = TimeSeriesMeasurement {
+                                timestamp: range_end.clone().unwrap().clone(),  
+                                value: range[0].value.clone(),
+                                tags: None,
+                        };
+                        res.push(BucketValue::TimeSeries(m));
+
+                        // sort res by timestamp
+                        res.sort_by(|a, b| {
+                                match a {
+                                        BucketValue::TimeSeries(a) => {
+                                                match b {
+                                                        BucketValue::TimeSeries(b) => a.timestamp.cmp(&b.timestamp),
+                                                        _ => Ordering::Less,
+                                                }
+                                        }
+                                        _ => Ordering::Less,
+                                }
+                        });
+                }
 		return Ok(res);
 	}
 
