@@ -81,6 +81,9 @@ async fn main() {
                                         let duration = start.elapsed();
                                         println!("Enforcing variability took: {:?}", duration);
 
+                                        // save logs
+                                        dictionary.finish().await;
+
                                         println!("Dictionary size: {}", dictionary.patterns.clone().unwrap().len());
 
                                         //let dictionary_json = serde_json::to_string(&dictionary).unwrap();
@@ -182,7 +185,7 @@ async fn get_dictionary(name: &str) -> Result<Dictionary, String> {
         match response.status() {
                 StatusCode::NOT_FOUND => {
                         println!("Creating new dictionary...");
-                        Ok(Dictionary::new(name, Constraints::default()))
+                        Ok(Dictionary::new(name, Constraints::default(), false))
                 },
                 StatusCode::OK => {
                         let body: Value = response.json().await.unwrap();
