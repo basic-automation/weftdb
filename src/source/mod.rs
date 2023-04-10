@@ -9,7 +9,7 @@ pub struct Source {
 	pub denominator: String,
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug, Default)]
 pub struct SourceCollection(pub Vec<Source>);
 
 impl SourceCollection {
