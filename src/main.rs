@@ -10,12 +10,13 @@ use std::str::FromStr;
 use std::{env, thread};
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
+use bigdecimal::ToPrimitive;
 
 mod router;
 
 #[tokio::main]
 async fn main() {
-	env::set_var("RUST_BACKTRACE", "full");
+	//env::set_var("RUST_BACKTRACE", "full");
 
 	let server = thread::spawn(async move || {
 		println!("server running...");
@@ -53,20 +54,25 @@ async fn main() {
 				// create batch
 				let key = event.0;
 				let event = &event.1;
-				let mut batch = Batch::new(event.bucket.clone(), length, true);
+				let mut batch = Batch::new(event.bucket.clone(), length, false);
 				let start = event.key.clone() - (batch.size().await / BigDecimal::from(2));
 				let end = event.key.clone() + (batch.size().await / BigDecimal::from(2));
 				let interpolation = "linear".to_string();
 				let interpolation_steps = batch.size().await;
 
 				// get measurements
-				let measurements = match get_measurements(&batch.measurement_bucket, start, end, &interpolation, interpolation_steps, &batch).await {
+				let measurements = match get_measurements(&batch.measurement_bucket, start, end, &interpolation, interpolation_steps.clone(), &batch).await {
 					Ok(m) => m,
 					Err(e) => {
 						println!("error: getting measurements for batch: {}", e);
 						continue 'events;
 					}
 				};
+
+                                if measurements.len() < interpolation_steps.to_u64().unwrap() as usize {
+                                        println!("error: not enough measurements for batch");
+                                        continue 'events;
+                                }
 
 				// add measurements to batch
 				batch.add_measurements(measurements).await;
