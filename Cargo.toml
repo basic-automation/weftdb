@@ -6,15 +6,15 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-bigdecimal = { version = "0", features=["serde"] }
-serde = { version = "1", features = ["derive"] }
-uuid = { version="1", features=["v4", "fast-rng", "macro-diagnostics", "serde"] }
+bigdecimal = { version = "*", features=["serde"] }
+serde = { version = "*", features = ["derive"] }
+uuid = { version="*", features=["v4", "fast-rng", "macro-diagnostics", "serde"] }
 dsm_measurement = { path = "../1 - dsm-measurement" }
-rayon = "1"
-num-bigint = { version="0", features = ["serde"] }
-indexmap = {version = "1", features = ["serde", "rustc-rayon"]}
-chrono = { version="0", features = ["serde"] }
-serde_json = { version="1", features = ["preserve_order"] }
+rayon = "*"
+num-bigint = { version="*", features = ["serde"] }
+indexmap = {version = "*", features = ["serde", "rustc-rayon"]}
+chrono = { version="*", features = ["serde"] }
+serde_json = { version="*", features = ["preserve_order"] }
 dsm_log = { path = "../dsm-log" }
 
 

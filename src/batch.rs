@@ -210,7 +210,7 @@ impl Batch {
                                         locations.insert(measurement.0.clone().to_string(), location.clone());
                                 }
                         });
-                        self.logs.log(&format!("11: BATCH begin calculating relative x movments MAX-X: {:?}", max_x_movement.clone()), &json!(*locations.clone().lock().unwrap()));
+                        self.logs.log(&format!("11: BATCH begin calculating relative x movments MAX-X: {:?}", max_x_movement), &json!(*locations.lock().unwrap()));
                 }
                 //log end
 
@@ -241,7 +241,7 @@ impl Batch {
 
 		// log begin
                 if self.is_logging {
-                        self.logs.log(&format!("12: BATCH end calculate_relative_x_movements"), &json!(self.relative_x_movements));
+                        self.logs.log("12: BATCH end calculate_relative_x_movements", &json!(self.relative_x_movements));
                 }
                 // log end
 
@@ -272,7 +272,7 @@ impl Batch {
                                         amplitudes.insert(measurement.0.clone().to_string(), amplitude.clone());
                                 }
                         });
-                        self.logs.log(&format!("13: BATCH begin calculating relative y movments MAX-Y: {:?}", max_y_movement.clone()), &json!(*amplitudes.clone().lock().unwrap()));
+                        self.logs.log(&format!("13: BATCH begin calculating relative y movments MAX-Y: {:?}", max_y_movement), &json!(*amplitudes.lock().unwrap()));
                 }
                 // log end
 
@@ -301,7 +301,7 @@ impl Batch {
 
 		// log begin
                 if self.is_logging {
-                        self.logs.log(&format!("14: BATCH end calculate_relative_y_movements"), &json!(self.relative_y_movements));
+                        self.logs.log("14: BATCH end calculate_relative_y_movements", &json!(self.relative_y_movements));
                 }
                 // log end
 
@@ -402,7 +402,7 @@ impl Batch {
                                         locations.insert(measurement.0.clone().to_string(), location.clone());
                                 }
                         });
-                        self.logs.log(&format!("2: BATCH begin calculate distances locations:"), &json!(*locations.lock().unwrap()));
+                        self.logs.log("2: BATCH begin calculate distances locations:", &json!(*locations.lock().unwrap()));
                 }
                 // end logs
 
@@ -414,7 +414,9 @@ impl Batch {
 						None => return,
 					};
 
-					let positive_distance = (BigDecimal::from(1) / (last_location.clone() - first_location.clone())) * (location - first_location.clone());
+                                        let denominator  = last_location.clone() - first_location.clone();
+
+					let positive_distance = (BigDecimal::from(1) / denominator.clone()) * (location - first_location.clone());
 					measurement.1.positive_distance = Some(positive_distance.clone());
 					measurement.1.negative_distance = Some(BigDecimal::from(1) - positive_distance);
 				});
@@ -440,8 +442,8 @@ impl Batch {
                                 }
                         });
 
-                        self.logs.log(&format!("3: BATCH end calculate distances postive_distances:"), &json!(*postive_distances.lock().unwrap()));
-                        self.logs.log(&format!("4: BATCH end calculate distances negative_distances:"), &json!(*negative_distances.lock().unwrap()));
+                        self.logs.log("3: BATCH end calculate distances postive_distances:", &json!(*postive_distances.lock().unwrap()));
+                        self.logs.log("4: BATCH end calculate distances negative_distances:", &json!(*negative_distances.lock().unwrap()));
                 }
                 // end logs
 
@@ -484,7 +486,7 @@ impl Batch {
                                         amplitudes.insert(measurement.0.clone().to_string(), amplitude.clone());
                                 }
                         });
-                        self.logs.log(&format!("5: BATCH begin vector leveling amplitudes:"), &json!(*amplitudes.lock().unwrap()));
+                        self.logs.log("5: BATCH begin vector leveling amplitudes:", &json!(*amplitudes.lock().unwrap()));
                 }
                 // log end
 
@@ -528,7 +530,7 @@ impl Batch {
                                         amplitudes.insert(measurement.0.clone().to_string(), amplitude.clone());
                                 }
                         });
-                        self.logs.log(&format!("6: BATCH end vector leveling amplitudes:"), &json!(*amplitudes.lock().unwrap()));
+                        self.logs.log("6: BATCH end vector leveling amplitudes:", &json!(*amplitudes.lock().unwrap()));
                 }
                 // log end
 
@@ -563,7 +565,7 @@ impl Batch {
                                         locations.insert(measurement.0.clone().to_string(), location);
                                 }
                         });
-                        self.logs.log(&format!("7: BATCH begin origin transformation locations:"), &json!(*locations.lock().unwrap()));
+                        self.logs.log("7: BATCH begin origin transformation locations:", &json!(*locations.lock().unwrap()));
                 }
                 // logs end
 
@@ -587,7 +589,7 @@ impl Batch {
                                         locations.insert(measurement.0.clone().to_string(), location);
                                 }
                         });
-                        self.logs.log(&format!("8: BATCH end origin transformation locations:"), &json!(*locations.lock().unwrap()));
+                        self.logs.log("8: BATCH end origin transformation locations:", &json!(*locations.lock().unwrap()));
                 }
                 // logs end
 
@@ -683,7 +685,7 @@ impl Batch {
                                         locations_aplitudes.insert(measurement.0.clone().to_string(), format!("location: {}, Amplitude: {}", location, measurement.1.amplitude.clone().unwrap()));
                                 }
                         });
-                        self.logs.log(&format!("9: BATCH begin simplify transformation locations:"), &json!(*locations_aplitudes.lock().unwrap()));
+                        self.logs.log("9: BATCH begin simplify transformation locations:", &json!(*locations_aplitudes.lock().unwrap()));
                 }
                 // logs end
 
@@ -774,7 +776,7 @@ impl Batch {
                                         locations_aplitudes.insert(measurement.0.clone().to_string(), format!("Location: {}, Amplidute: {}", location, measurement.1.amplitude.clone().unwrap()));
                                 }
                         });
-                        self.logs.log(&format!("10: BATCH end simplify transformation locations:"), &json!(*locations_aplitudes.lock().unwrap()));
+                        self.logs.log("10: BATCH end simplify transformation locations:", &json!(*locations_aplitudes.lock().unwrap()));
                 }
                 // logs end
 
