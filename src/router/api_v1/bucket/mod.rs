@@ -47,8 +47,8 @@ impl Serialize for DebugDb {
 			let mut items: Vec<Value> = Vec::new();
 			for item in tree.iter() {
 				let item = item.unwrap();
-				let key = std::str::from_utf8(item.0.as_ref()).unwrap();
-				let value: Value = serde_json::from_str(std::str::from_utf8(item.1.as_ref()).unwrap()).unwrap();
+				let key = std::str::from_utf8(item.0.as_ref()).unwrap_or("unknown value");
+				let value: Value = serde_json::from_str(std::str::from_utf8(item.1.as_ref()).unwrap_or("unknown value")).unwrap();
 				items.push(json!({ key: value }));
 			}
 			trees.push(json!({ name: items }));
