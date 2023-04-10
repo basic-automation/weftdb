@@ -23,16 +23,17 @@ pub struct Pattern {
 }
 
 impl Pattern {
-	pub fn merge_occurrences(&mut self, pattern: &Pattern) {
+	pub async fn merge_occurrences(&mut self, pattern: &Pattern) -> Self {
 		for (_, occurrence) in pattern.occurrences.iter() {
 			self.occurrences.insert(self.occurrences.len().into(), occurrence.clone());
 		}
 		let mut merged_patterns = self.merged_patterns.clone().unwrap_or_default();
 		merged_patterns.push(pattern.id);
 		self.merged_patterns = Some(merged_patterns);
+                self.clone()
 	}
 
-	pub async fn enforce_steps(&mut self, step_spacing: f64, interpolation: Interpolation) -> Self {
+	pub async fn enforce_steps(&mut self, take: f64, interpolation: Interpolation) -> Self {
 		// create bucket
 		let client = reqwest::Client::new();
 		let encoded_id = encode(&self.id.to_string()).to_string();
@@ -53,7 +54,8 @@ impl Pattern {
 			Interpolation::Linear => "linear",
 		};
 
-		let url = format!("http://127.0.0.1:8515/bucket/{}?interpolation={}&steps={}", bucket.name, interpolation, step_spacing);
+		let url = format!("http://127.0.0.1:8515/bucket/{}?interpolation={}&take={}", bucket.name, interpolation, take);
+		println!("url: {}", url);
 		let res = client.get(&url).send().await.unwrap();
 		match res.json::<Value>().await {
 			Ok(data) => {

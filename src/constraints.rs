@@ -138,6 +138,6 @@ pub struct OccurrenceDistance {
 
 impl Default for OccurrenceDistance {
 	fn default() -> Self {
-		OccurrenceDistance { enforced: true, value: BigDecimal::from(3600) }
+		OccurrenceDistance { enforced: true, value: BigDecimal::from(1) }
 	}
 }

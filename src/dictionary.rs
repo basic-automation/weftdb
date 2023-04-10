@@ -1,5 +1,7 @@
 use super::{Constraints, Pattern};
+use dsm_log::Log;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -9,11 +11,18 @@ pub struct Dictionary {
 	pub name: String,
 	pub constraints: Constraints,
 	pub patterns: Option<HashMap<Uuid, Pattern>>,
+	pub log: Log,
+	pub is_log: bool,
 }
 
 impl Dictionary {
-	pub fn new(name: &str, constraints: Constraints) -> Self {
-		Self { id: Uuid::new_v4(), name: name.to_string(), constraints, patterns: None }
+	pub fn new(name: &str, constraints: Constraints, is_log: bool) -> Self {
+		let log_name = name.replace(':', "_");
+		let mut log = Log::new(&log_name);
+		if is_log {
+			log.log("Created Dictionary", &json!(name));
+		}
+		Self { id: Uuid::new_v4(), name: name.to_string(), constraints, patterns: None, log, is_log }
 	}
 
 	pub async fn add_pattern(&mut self, mut pattern: Pattern) {
@@ -21,33 +30,129 @@ impl Dictionary {
 			Some(ref patterns) => patterns.clone(),
 			None => HashMap::new(),
 		};
+
+		// log begin
+		if self.is_log {
+                        let mut location_amplitudes = HashMap::new();
+
+                        for (lk, lv) in pattern.locations.iter() {
+                                for(ak, av) in pattern.amplitudes.iter() {
+                                        if lk == ak {
+                                                location_amplitudes.insert(lv.to_string(), av.clone());
+                                        }
+                                }
+                        }                        
+			self.log.log(&format!("{}: before steps enforced", pattern.id), &json!(location_amplitudes));
+		}
+		// log end
 		pattern = match self.constraints.steps.is_enforced {
-			true => pattern.enforce_steps(1.0_f64 / self.constraints.steps.count as f64, self.constraints.steps.interpolation.clone()).await,
+			true => pattern.enforce_steps(self.constraints.steps.count as f64, self.constraints.steps.interpolation.clone()).await,
 			false => pattern,
 		};
 
+		// log begin
+		if self.is_log {
+			let mut location_amplitudes = HashMap::new();
+
+                        for (lk, lv) in pattern.locations.iter() {
+                                for(ak, av) in pattern.amplitudes.iter() {
+                                        if lk == ak {
+                                                location_amplitudes.insert(lv.to_string(), av.clone());
+                                        }
+                                }
+                        }
+			self.log.log(&format!("{}: after steps enforced", pattern.id), &json!(location_amplitudes));
+		}
+		// log end
+
+                
+                // add pattern to dictionary
 		let mut patterns = patterns.clone();
 		patterns.insert(pattern.id, pattern.clone());
 		self.patterns = Some(patterns);
 
 		if let true = self.constraints.variability.static_variability.enforced {
-                        println!("Enforcing static variability");
+                        // log begin
+                        if self.is_log {
+                                let log_patterns = self.patterns.clone().unwrap_or(HashMap::new());
+                                let log_patterns: HashMap<String, Pattern> = log_patterns.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+                                self.log.log("Patterns before enforcing static variability", &json!(log_patterns));
+                        }
+                        // log end
+
+			println!("Enforcing static variability");
 			self.enforce_static_variability(pattern.clone()).await;
+
+                        // log begin
+                        if self.is_log {
+                                let log_patterns = self.patterns.clone().unwrap_or(HashMap::new());
+                                let log_patterns: HashMap<String, Pattern> = log_patterns.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+                                self.log.log("Patterns after enforcing static variability", &json!(log_patterns));
+                        }
+                        // log end
 		}
 
 		if let true = self.constraints.variability.absolute_static_variability.enforced {
-                        println!("Enforcing absolute static variability");
+                        // log begin
+                        if self.is_log {
+                                let log_patterns = self.patterns.clone().unwrap_or(HashMap::new());
+                                let log_patterns: HashMap<String, Pattern> = log_patterns.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+                                self.log.log("Patterns before enforcing absolute static variability", &json!(log_patterns));
+                        }
+                        // log end
+
+			println!("Enforcing absolute static variability");
 			self.enforce_absolute_static_variability(pattern.clone()).await;
+
+                        // log begin
+                        if self.is_log {
+                                let log_patterns = self.patterns.clone().unwrap_or(HashMap::new());
+                                let log_patterns: HashMap<String, Pattern> = log_patterns.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+                                self.log.log("Patterns after enforcing absolute static variability", &json!(log_patterns));
+                        }
+                        // log end
 		}
 
 		if let true = self.constraints.variability.percentage_variability.enforced {
-                        println!("Enforcing percentage variability");
+                        // log begin
+                        if self.is_log {
+                                let log_patterns = self.patterns.clone().unwrap_or(HashMap::new());
+                                let log_patterns: HashMap<String, Pattern> = log_patterns.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+                                self.log.log("Patterns before enforcing percentage variability", &json!(log_patterns));
+                        }
+                        // log end
+
+			println!("Enforcing percentage variability");
 			self.enforce_percent_variability(pattern.clone()).await;
+
+                        // log begin
+                        if self.is_log {
+                                let log_patterns = self.patterns.clone().unwrap_or(HashMap::new());
+                                let log_patterns: HashMap<String, Pattern> = log_patterns.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+                                self.log.log("Patterns after enforcing percentage variability", &json!(log_patterns));
+                        }
+                        // log end
 		}
 
 		if let true = self.constraints.variability.absolute_percentage_variability.enforced {
-                        println!("Enforcing absolute percentage variability");
+                        // log begin
+                        if self.is_log {
+                                let log_patterns = self.patterns.clone().unwrap_or(HashMap::new());
+                                let log_patterns: HashMap<String, Pattern> = log_patterns.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+                                self.log.log("Patterns before enforcing absolute percentage variability", &json!(log_patterns));
+                        }
+                        // log end
+
+			println!("Enforcing absolute percentage variability");
 			self.enforce_absolute_percent_variability(pattern).await;
+
+                        // log begin
+                        if self.is_log {
+                                let log_patterns = self.patterns.clone().unwrap_or(HashMap::new());
+                                let log_patterns: HashMap<String, Pattern> = log_patterns.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+                                self.log.log("Patterns after enforcing absolute percentage variability", &json!(log_patterns));
+                        }
+                        // log end
 		}
 	}
 
@@ -98,7 +203,7 @@ impl Dictionary {
 		number_of_merged_patterns
 	}
 
-	async fn enforce_absolute_static_variability(&mut self, pattern: Pattern) -> u64 {
+	async fn enforce_absolute_static_variability(&mut self, new_pattern: Pattern) -> u64 {
 		let mut number_of_merged_patterns: u64 = 0;
 		let mut matched = false;
 		// represented_pattern is a pattern that has matched an existing occurrence
@@ -112,256 +217,16 @@ impl Dictionary {
 
 			let patts = self.patterns.as_ref().unwrap().clone();
 
-			let (_, compare_pattern) = patts.iter().nth(i).unwrap();
-			let mut compare_pattern = compare_pattern.clone();
+			let (_, existing_pattern) = patts.iter().nth(i).unwrap();
+			let mut existing_pattern = existing_pattern.clone();
 
-			// check if the pattern is the same
-			if pattern.id == compare_pattern.id {
+			if new_pattern.id == existing_pattern.id {
 				i += 1;
 				continue;
 			}
 
 			// check variability
-			let variability = pattern.absolute_static_variability(&compare_pattern.clone(), &self.constraints.variability.absolute_static_variability.type_).await;
-			//println!("Variability: {}, Target: {}", variability, self.constraints.variability.static_variability.value.clone());
-			if variability.abs() > self.constraints.variability.absolute_static_variability.value {
-				i += 1;
-				continue;
-			}
-
-			// check if the the patterns have occurrences with start times that are within the same self.constraints.occurrences.distance.value
-			if let true = self.constraints.occurrences.distance.enforced {
-				let mut same_occurrence = false;
-				'outer: for occurrence in pattern.occurrences.iter() {
-					for compare_occurrence in compare_pattern.occurrences.iter() {
-						if (occurrence.1.start.clone() - compare_occurrence.1.start.clone()).abs() <= self.constraints.occurrences.distance.value || (occurrence.1.end.clone() - compare_occurrence.1.end.clone()).abs() <= self.constraints.occurrences.distance.value {
-							same_occurrence = true;
-							break 'outer;
-						}
-					}
-				}
-
-				if same_occurrence {
-					// remove compare pattern from the dictionary
-					self.patterns.as_mut().unwrap().remove(&compare_pattern.id);
-
-					i = i.saturating_sub(1);
-
-					represented_pattern = true;
-					i += 1;
-					continue;
-				}
-			}
-
-			// if variability is less than the percentage variability, then merge the patterns
-			//pattern.merge_occurrences(&compare_pattern.clone());
-			compare_pattern.merge_occurrences(&pattern.clone());
-
-			// replace the existing pattern in the dictionary
-			self.patterns.as_mut().unwrap().insert(compare_pattern.id, compare_pattern.clone());
-
-			// remove pattern from the dictionary
-			self.patterns.as_mut().unwrap().remove(&pattern.id);
-			i = i.saturating_sub(1);
-
-			// increment the number of merged patterns
-			number_of_merged_patterns += 1;
-
-			// set matched to true
-			matched = true;
-
-			i += 1;
-		}
-
-		if !matched && !represented_pattern {
-			self.patterns.as_mut().unwrap().insert(pattern.id, pattern.clone());
-		}
-
-		number_of_merged_patterns
-	}
-
-	async fn enforce_static_variability(&mut self, pattern: Pattern) -> u64 {
-		let mut number_of_merged_patterns: u64 = 0;
-		let mut matched = false;
-		// represented_pattern is a pattern that has matched an existing occurrence
-		let mut represented_pattern = false;
-		let mut i = 0;
-
-		loop {
-			if i >= self.patterns.as_ref().unwrap().len() {
-				break;
-			}
-
-			let patts = self.patterns.as_ref().unwrap().clone();
-
-			let (_, compare_pattern) = patts.iter().nth(i).unwrap();
-			let mut compare_pattern = compare_pattern.clone();
-
-			if pattern.id == compare_pattern.id {
-				i += 1;
-				continue;
-			}
-
-			// check variability
-			let variability = pattern.static_variability(&compare_pattern.clone(), &self.constraints.variability.static_variability.type_).await;
-			//println!("Variability: {}, Target: {}", variability, self.constraints.variability.static_variability.value.clone());
-			if variability.abs() > self.constraints.variability.static_variability.value {
-				i += 1;
-				continue;
-			}
-
-			// check if the the patterns have occurrences with start times that are within the same self.constraints.occurrences.distance.value
-			if let true = self.constraints.occurrences.distance.enforced {
-				let mut same_occurrence = false;
-				'outer: for occurrence in pattern.occurrences.iter() {
-					for compare_occurrence in compare_pattern.occurrences.iter() {
-						if (occurrence.1.start.clone() - compare_occurrence.1.start.clone()).abs() <= self.constraints.occurrences.distance.value || (occurrence.1.end.clone() - compare_occurrence.1.end.clone()).abs() <= self.constraints.occurrences.distance.value {
-							same_occurrence = true;
-							break 'outer;
-						}
-					}
-				}
-
-				if same_occurrence {
-					// remove compare pattern from the dictionary
-					self.patterns.as_mut().unwrap().remove(&compare_pattern.id);
-					i = i.saturating_sub(1);
-					represented_pattern = true;
-					i += 1;
-					continue;
-				}
-			}
-
-			// if variability is less than the percentage variability, then merge the patterns
-			compare_pattern.merge_occurrences(&pattern.clone());
-			//pattern.merge_occurrences(&compare_pattern.clone());
-
-			// replace the existing pattern in the dictionary
-			self.patterns.as_mut().unwrap().insert(compare_pattern.id, compare_pattern.clone());
-
-			// remove pattern from the dictionary
-			self.patterns.as_mut().unwrap().remove(&pattern.id);
-			i = i.saturating_sub(1);
-
-			// increment the number of merged patterns
-			number_of_merged_patterns += 1;
-
-			// set matched to true
-			matched = true;
-
-			i += 1;
-		}
-
-		if !matched && !represented_pattern {
-			self.patterns.as_mut().unwrap().insert(pattern.id, pattern.clone());
-		}
-
-		number_of_merged_patterns
-	}
-
-	async fn enforce_absolute_percent_variability(&mut self, pattern: Pattern) -> u64 {
-		let mut number_of_merged_patterns: u64 = 0;
-		let mut matched = false;
-		// represented_pattern is a pattern that has matched an existing occurrence
-		let mut represented_pattern = false;
-		let mut i = 0;
-
-		loop {
-			if i >= self.patterns.as_ref().unwrap().len() {
-				break;
-			}
-
-			let patts = self.patterns.as_ref().unwrap().clone();
-
-			let (_, compare_pattern) = patts.iter().nth(i).unwrap();
-			let mut compare_pattern = compare_pattern.clone();
-
-			if pattern.id == compare_pattern.id {
-				i += 1;
-				continue;
-			}
-
-			// check variability
-			let variability = pattern.absolute_percentage_variability(&compare_pattern.clone(), &self.constraints.variability.absolute_percentage_variability.type_).await;
-			//println!("Variability: {}, Target: {}", variability, &self.constraints.variability.absolute_percentage_variability.value.clone());
-			if variability.abs() > self.constraints.variability.absolute_percentage_variability.value {
-				i += 1;
-				continue;
-			}
-
-			// check if the the patterns have occurrences with start times that are within the same self.constraints.occurrences.distance.value
-			if let true = self.constraints.occurrences.distance.enforced {
-				let mut same_occurrence = false;
-				'outer: for occurrence in pattern.occurrences.iter() {
-					for compare_occurrence in compare_pattern.occurrences.iter() {
-						if (occurrence.1.start.clone() - compare_occurrence.1.start.clone()).abs() <= self.constraints.occurrences.distance.value || (occurrence.1.end.clone() - compare_occurrence.1.end.clone()).abs() <= self.constraints.occurrences.distance.value {
-							same_occurrence = true;
-							break 'outer;
-						}
-					}
-				}
-
-				if same_occurrence {
-					// remove compare pattern from the dictionary
-					self.patterns.as_mut().unwrap().remove(&compare_pattern.id);
-					i = i.saturating_sub(1);
-					represented_pattern = true;
-					i += 1;
-					continue;
-				}
-			}
-
-			// if variability is less than the percentage variability, then merge the patterns
-			//pattern.merge_occurrences(&compare_pattern.clone());
-			compare_pattern.merge_occurrences(&pattern.clone());
-
-			// replace the existing pattern in the dictionary
-			self.patterns.as_mut().unwrap().insert(compare_pattern.id, compare_pattern.clone());
-
-			// remove compare pattern from the dictionary
-			self.patterns.as_mut().unwrap().remove(&pattern.id);
-			i = i.saturating_sub(1);
-
-			// increment the number of merged patterns
-			number_of_merged_patterns += 1;
-
-			// set matched to true
-			matched = true;
-
-			i += 1;
-		}
-
-		if !matched && !represented_pattern {
-			self.patterns.as_mut().unwrap().insert(pattern.id, pattern.clone());
-		}
-
-		number_of_merged_patterns
-	}
-
-	async fn enforce_percent_variability(&mut self, pattern: Pattern) -> u64 {
-		let mut number_of_merged_patterns: u64 = 0;
-		let mut matched = false;
-		// represented_pattern is a pattern that has matched an existing occurrence
-		let mut represented_pattern = false;
-		let mut i = 0;
-
-		loop {
-			if i >= self.patterns.as_ref().unwrap().len() {
-				break;
-			}
-
-			let patts = self.patterns.as_ref().unwrap().clone();
-
-			let (_, compare_pattern) = patts.iter().nth(i).unwrap();
-			let mut compare_pattern = compare_pattern.clone();
-
-			if pattern.id == compare_pattern.id {
-				i += 1;
-				continue;
-			}
-
-			// check variability
-			let variability = pattern.percentage_variability(&compare_pattern.clone(), &self.constraints.variability.percentage_variability.type_).await;
+			let variability = new_pattern.absolute_static_variability(&existing_pattern.clone(), &self.constraints.variability.percentage_variability.type_).await;
 			if variability.abs() > self.constraints.variability.percentage_variability.value {
 				i += 1;
 				continue;
@@ -370,9 +235,9 @@ impl Dictionary {
 			// check if the the patterns have occurrences with start times that are within the same self.constraints.occurrences.distance.value
 			if let true = self.constraints.occurrences.distance.enforced {
 				let mut same_occurrence = false;
-				'outer: for occurrence in pattern.occurrences.iter() {
-					for compare_occurrence in compare_pattern.occurrences.iter() {
-						if (occurrence.1.start.clone() - compare_occurrence.1.start.clone()).abs() <= self.constraints.occurrences.distance.value || (occurrence.1.end.clone() - compare_occurrence.1.end.clone()).abs() <= self.constraints.occurrences.distance.value {
+				'outer: for new_occurrence in new_pattern.occurrences.iter() {
+					for existing_occurence in existing_pattern.occurrences.iter() {
+						if (new_occurrence.1.start.clone() - existing_occurence.1.start.clone()).abs() <= self.constraints.occurrences.distance.value || (new_occurrence.1.end.clone() - existing_occurence.1.end.clone()).abs() <= self.constraints.occurrences.distance.value {
 							same_occurrence = true;
 							break 'outer;
 						}
@@ -380,9 +245,8 @@ impl Dictionary {
 				}
 
 				if same_occurrence {
-					// remove compare pattern from the dictionary
-					self.patterns.as_mut().unwrap().remove(&compare_pattern.id);
-					i = i.saturating_sub(1);
+                                        println!("pattern is represented...");
+					//i = i.saturating_sub(1);
 					represented_pattern = true;
 					i += 1;
 					continue;
@@ -391,13 +255,14 @@ impl Dictionary {
 
 			// if variability is less than the percentage variability, then merge the patterns
 			//pattern.merge_occurrences(&compare_pattern.clone());
-			compare_pattern.merge_occurrences(&pattern.clone());
+                        println!("merging patterns...");
+			existing_pattern.merge_occurrences(&new_pattern.clone()).await;
 
 			// replace the existing pattern in the dictionary
-			self.patterns.as_mut().unwrap().insert(compare_pattern.id, compare_pattern.clone());
+			self.patterns.as_mut().unwrap().insert(existing_pattern.id, existing_pattern.clone());
 
-			// remove compar pattern from the dictionary
-			self.patterns.as_mut().unwrap().remove(&pattern.id);
+			// remove new pattern from the dictionary
+			//self.patterns.as_mut().unwrap().remove(&new_pattern.id);
 			i = i.saturating_sub(1);
 
 			// increment the number of merged patterns
@@ -410,15 +275,257 @@ impl Dictionary {
 		}
 
 		if !matched && !represented_pattern {
-			self.patterns.as_mut().unwrap().insert(pattern.id, pattern.clone());
+			self.patterns.as_mut().unwrap().insert(new_pattern.id, new_pattern.clone());
+		} else {
+                        self.patterns.as_mut().unwrap().remove(&new_pattern.id);
+                }
+
+		number_of_merged_patterns
+	}
+
+	async fn enforce_static_variability(&mut self, new_pattern: Pattern) -> u64 {
+		let mut number_of_merged_patterns: u64 = 0;
+		let mut matched = false;
+		// represented_pattern is a pattern that has matched an existing occurrence
+		let mut represented_pattern = false;
+		let mut i = 0;
+
+		loop {
+			if i >= self.patterns.as_ref().unwrap().len() {
+				break;
+			}
+
+			let patts = self.patterns.as_ref().unwrap().clone();
+
+			let (_, existing_pattern) = patts.iter().nth(i).unwrap();
+			let mut existing_pattern = existing_pattern.clone();
+
+			if new_pattern.id == existing_pattern.id {
+				i += 1;
+				continue;
+			}
+
+			// check variability
+			let variability = new_pattern.static_variability(&existing_pattern.clone(), &self.constraints.variability.percentage_variability.type_).await;
+			if variability.abs() > self.constraints.variability.percentage_variability.value {
+				i += 1;
+				continue;
+			}
+
+			// check if the the patterns have occurrences with start times that are within the same self.constraints.occurrences.distance.value
+			if let true = self.constraints.occurrences.distance.enforced {
+				let mut same_occurrence = false;
+				'outer: for new_occurrence in new_pattern.occurrences.iter() {
+					for existing_occurence in existing_pattern.occurrences.iter() {
+						if (new_occurrence.1.start.clone() - existing_occurence.1.start.clone()).abs() <= self.constraints.occurrences.distance.value || (new_occurrence.1.end.clone() - existing_occurence.1.end.clone()).abs() <= self.constraints.occurrences.distance.value {
+							same_occurrence = true;
+							break 'outer;
+						}
+					}
+				}
+
+				if same_occurrence {
+                                        println!("pattern is represented...");
+					//i = i.saturating_sub(1);
+					represented_pattern = true;
+					i += 1;
+					continue;
+				}
+			}
+
+			// if variability is less than the percentage variability, then merge the patterns
+			//pattern.merge_occurrences(&compare_pattern.clone());
+                        println!("merging patterns...");
+			existing_pattern.merge_occurrences(&new_pattern.clone()).await;
+
+			// replace the existing pattern in the dictionary
+			self.patterns.as_mut().unwrap().insert(existing_pattern.id, existing_pattern.clone());
+
+			// remove new pattern from the dictionary
+			//self.patterns.as_mut().unwrap().remove(&new_pattern.id);
+			i = i.saturating_sub(1);
+
+			// increment the number of merged patterns
+			number_of_merged_patterns += 1;
+
+			// set matched to true
+			matched = true;
+
+			i += 1;
 		}
+
+		if !matched && !represented_pattern {
+			self.patterns.as_mut().unwrap().insert(new_pattern.id, new_pattern.clone());
+		} else {
+                        self.patterns.as_mut().unwrap().remove(&new_pattern.id);
+                }
+
+		number_of_merged_patterns
+	}
+
+	async fn enforce_absolute_percent_variability(&mut self, new_pattern: Pattern) -> u64 {
+		let mut number_of_merged_patterns: u64 = 0;
+		let mut matched = false;
+		// represented_pattern is a pattern that has matched an existing occurrence
+		let mut represented_pattern = false;
+		let mut i = 0;
+
+		loop {
+			if i >= self.patterns.as_ref().unwrap().len() {
+				break;
+			}
+
+			let patts = self.patterns.as_ref().unwrap().clone();
+
+			let (_, existing_pattern) = patts.iter().nth(i).unwrap();
+			let mut existing_pattern = existing_pattern.clone();
+
+			if new_pattern.id == existing_pattern.id {
+				i += 1;
+				continue;
+			}
+
+			// check variability
+			let variability = new_pattern.absolute_percentage_variability(&existing_pattern.clone(), &self.constraints.variability.percentage_variability.type_).await;
+			if variability.abs() > self.constraints.variability.percentage_variability.value {
+				i += 1;
+				continue;
+			}
+
+			// check if the the patterns have occurrences with start times that are within the same self.constraints.occurrences.distance.value
+			if let true = self.constraints.occurrences.distance.enforced {
+				let mut same_occurrence = false;
+				'outer: for new_occurrence in new_pattern.occurrences.iter() {
+					for existing_occurence in existing_pattern.occurrences.iter() {
+						if (new_occurrence.1.start.clone() - existing_occurence.1.start.clone()).abs() <= self.constraints.occurrences.distance.value || (new_occurrence.1.end.clone() - existing_occurence.1.end.clone()).abs() <= self.constraints.occurrences.distance.value {
+							same_occurrence = true;
+							break 'outer;
+						}
+					}
+				}
+
+				if same_occurrence {
+                                        println!("pattern is represented...");
+					//i = i.saturating_sub(1);
+					represented_pattern = true;
+					i += 1;
+					continue;
+				}
+			}
+
+			// if variability is less than the percentage variability, then merge the patterns
+			//pattern.merge_occurrences(&compare_pattern.clone());
+                        println!("merging patterns...");
+			existing_pattern.merge_occurrences(&new_pattern.clone()).await;
+
+			// replace the existing pattern in the dictionary
+			self.patterns.as_mut().unwrap().insert(existing_pattern.id, existing_pattern.clone());
+
+			// remove new pattern from the dictionary
+			//self.patterns.as_mut().unwrap().remove(&new_pattern.id);
+			i = i.saturating_sub(1);
+
+			// increment the number of merged patterns
+			number_of_merged_patterns += 1;
+
+			// set matched to true
+			matched = true;
+
+			i += 1;
+		}
+
+		if !matched && !represented_pattern {
+			self.patterns.as_mut().unwrap().insert(new_pattern.id, new_pattern.clone());
+		} else {
+                        self.patterns.as_mut().unwrap().remove(&new_pattern.id);
+                }
+
+		number_of_merged_patterns
+	}
+
+	async fn enforce_percent_variability(&mut self, new_pattern: Pattern) -> u64 {
+		let mut number_of_merged_patterns: u64 = 0;
+		let mut matched = false;
+		// represented_pattern is a pattern that has matched an existing occurrence
+		let mut represented_pattern = false;
+		let mut i = 0;
+
+		loop {
+			if i >= self.patterns.as_ref().unwrap().len() {
+				break;
+			}
+
+			let patts = self.patterns.as_ref().unwrap().clone();
+
+			let (_, existing_pattern) = patts.iter().nth(i).unwrap();
+			let mut existing_pattern = existing_pattern.clone();
+
+			if new_pattern.id == existing_pattern.id {
+				i += 1;
+				continue;
+			}
+
+			// check variability
+			let variability = new_pattern.percentage_variability(&existing_pattern.clone(), &self.constraints.variability.percentage_variability.type_).await;
+			if variability.abs() > self.constraints.variability.percentage_variability.value {
+				i += 1;
+				continue;
+			}
+
+			// check if the the patterns have occurrences with start times that are within the same self.constraints.occurrences.distance.value
+			if let true = self.constraints.occurrences.distance.enforced {
+				let mut same_occurrence = false;
+				'outer: for new_occurrence in new_pattern.occurrences.iter() {
+					for existing_occurence in existing_pattern.occurrences.iter() {
+						if (new_occurrence.1.start.clone() - existing_occurence.1.start.clone()).abs() <= self.constraints.occurrences.distance.value || (new_occurrence.1.end.clone() - existing_occurence.1.end.clone()).abs() <= self.constraints.occurrences.distance.value {
+							same_occurrence = true;
+							break 'outer;
+						}
+					}
+				}
+
+				if same_occurrence {
+                                        println!("pattern is represented...");
+					//i = i.saturating_sub(1);
+					represented_pattern = true;
+					i += 1;
+					continue;
+				}
+			}
+
+			// if variability is less than the percentage variability, then merge the patterns
+			//pattern.merge_occurrences(&compare_pattern.clone());
+                        println!("merging patterns...");
+			existing_pattern.merge_occurrences(&new_pattern.clone()).await;
+
+			// replace the existing pattern in the dictionary
+			self.patterns.as_mut().unwrap().insert(existing_pattern.id, existing_pattern.clone());
+
+			// remove new pattern from the dictionary
+			//self.patterns.as_mut().unwrap().remove(&new_pattern.id);
+			i = i.saturating_sub(1);
+
+			// increment the number of merged patterns
+			number_of_merged_patterns += 1;
+
+			// set matched to true
+			matched = true;
+
+			i += 1;
+		}
+
+		if !matched && !represented_pattern {
+			self.patterns.as_mut().unwrap().insert(new_pattern.id, new_pattern.clone());
+		} else {
+                        self.patterns.as_mut().unwrap().remove(&new_pattern.id);
+                }
 
 		number_of_merged_patterns
 	}
 
 	pub async fn add_patterns(&mut self, patterns: Vec<Pattern>) {
 		for (_, pattern) in patterns.clone().iter_mut().enumerate() {
-                        println!("Adding pattern: {}", pattern.id);
+			println!("Adding pattern: {}", pattern.id);
 			self.add_pattern(pattern.clone()).await;
 		}
 	}
@@ -452,6 +559,12 @@ impl Dictionary {
 			}
 		}
 		None
+	}
+
+	pub async fn finish(&mut self) {
+		if self.is_log {
+			let _ = self.log.save("pattern").await;
+		}
 	}
 }
 
