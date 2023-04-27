@@ -1,17 +1,19 @@
 #![feature(async_closure)]
-use bigdecimal::BigDecimal;
+use bigdecimal::ToPrimitive;
+use dsm_config::{Configuration, SourceConfiguration};
 use dsm_measurement::{Measurement, MeasurementEvent};
+use rayon::prelude::IntoParallelRefIterator;
+use rayon::prelude::ParallelIterator;
 use reqwest::Client;
 use router::router;
 use serde_json::json;
 use serde_json::Value;
-use source::*;
+use std::collections::HashMap;
 use std::env;
 use std::thread;
 use tokio::time::{sleep, Duration};
 
 mod router;
-mod source;
 
 #[tokio::main]
 async fn main() {
@@ -19,9 +21,11 @@ async fn main() {
 
 	let server = thread::spawn(async move || {
 		println!("server running...");
-		let app = router();
 
-		let port = env::var("PORT").unwrap_or("8516".to_string());
+		let app = router();
+		let config = Configuration::open("../dsm.toml").await.unwrap();
+
+		let port = config.dsm.ports.inputer;
 		let address = format!("0.0.0.0:{}", port);
 		println!("Listening on address {}", address);
 
@@ -33,35 +37,45 @@ async fn main() {
 		println!("app running...");
 
 		loop {
-			// run tests
-			let test_measurements = test_measurements().await;
-			for measurement in test_measurements {
-				create_bucket(measurement.clone()).await;
-				add_to_bucket(measurement.clone()).await;
-				println!("{}:{}::{} time: {}, ratio: {}", measurement.source, measurement.numerator_asset, measurement.denominator_asset, measurement.timestamp, measurement.ratio);
-			}
-
 			let sources = match get_source().await {
 				Ok(sources) => sources,
 				Err(err) => {
 					println!("Error: {}", err);
-					pause().await;
+					pause(60000_u64).await;
 					continue;
 				}
 			};
 
-			for source in sources.0.iter() {
-				let measurements = get_measurement(source).await;
+			let mut handles = Vec::new();
 
-				// add measurement to bucket
-				for measurement in measurements {
-					create_bucket(measurement.clone()).await;
-					add_to_bucket(measurement.clone()).await;
-					println!("{}:{}::{} time: {}, ratio: {}", measurement.source, measurement.numerator_asset, measurement.denominator_asset, measurement.timestamp, measurement.ratio);
-				}
+			sources.iter().for_each(|(name, source)| {
+				let name = name.clone();
+				let source = source.clone();
+				let handle = thread::Builder::new()
+					.name(name.clone())
+					.spawn(move || loop {
+						let rt = tokio::runtime::Runtime::new().unwrap();
+						let measurements = rt.block_on(get_measurement(&source));
+
+						rt.block_on(create_bucket(&name));
+
+						measurements.par_iter().for_each(|measurement| {
+							let rt2 = tokio::runtime::Runtime::new().unwrap();
+							rt2.block_on(add_to_bucket(&name, measurement.clone()));
+						});
+
+						println!("{}: {} measurements added", name, measurements.len());
+
+						rt.block_on(pause(source.interval.to_u64().unwrap()));
+					})
+					.unwrap();
+
+				handles.push(handle);
+			});
+
+			for handle in handles {
+				handle.join().unwrap();
 			}
-
-			sleep(Duration::from_secs(60)).await;
 		}
 	});
 
@@ -70,41 +84,25 @@ async fn main() {
 	std::future::pending::<()>().await;
 }
 
-pub async fn pause() {
-	sleep(Duration::from_secs(60)).await;
+pub async fn pause(length: u64) {
+	sleep(Duration::from_millis(length)).await;
 }
 
-pub async fn get_source() -> Result<SourceCollection, String> {
-	let client = Client::new();
-
-	let res = match client.get("http://127.0.0.1:8515/bucket/input_sources").send().await {
-		Ok(res) => res,
-		Err(res) => return Err(res.to_string()),
-	};
-
-	let res = match res.json::<Value>().await {
-		Ok(res) => res,
-		Err(res) => return Err(res.to_string()),
-	};
-
-	let value = res["value"].clone();
-
-	if value.as_array().is_none() {
-		return Err("No sources found...".to_string());
-	}
-
-	let mut sources: SourceCollection = SourceCollection::new();
-	for source in value.as_array().unwrap() {
-		let source: Source = serde_json::from_value(source["value"].clone()).unwrap();
-		sources.add(source)
-	}
-
+pub async fn get_source() -> Result<HashMap<String, SourceConfiguration>, String> {
+	let config = Configuration::open("../dsm.toml").await.unwrap();
+	let sources = config.sources;
 	Ok(sources)
 }
 
-pub async fn get_measurement(source: &Source) -> Vec<Measurement> {
+pub async fn get_measurement(source: &SourceConfiguration) -> Vec<Measurement> {
 	let client = Client::new();
-	let res = client.get(&source.url).send().await.unwrap();
+	let res = match client.get(&source.url).send().await {
+		Ok(res) => res,
+		Err(err) => {
+			println!("Error retriving source url {}: {}", &source.url, err);
+			return Vec::new();
+		}
+	};
 	let value: Value = res.json::<Value>().await.unwrap()["measurements"].clone();
 	let mut measurements: Vec<Measurement> = Vec::new();
 	for measurement in value.as_array().unwrap() {
@@ -114,72 +112,65 @@ pub async fn get_measurement(source: &Source) -> Vec<Measurement> {
 	measurements
 }
 
-pub async fn create_bucket(measurement: Measurement) {
+pub async fn create_bucket(source_name: &str) {
+	let config = Configuration::open("../dsm.toml").await.unwrap();
 	let client = Client::new();
 
-	let measurement_name = format!("{}::{}", measurement.numerator_asset, measurement.denominator_asset);
-	let measurement_type = "timeseries".to_string();
-	let measurement_tags = format!("&tag[1]=source={}", measurement.source);
+	let host = config.dsm.database.host.clone();
+	let port = config.dsm.database.port;
 
-	//create measurement bucket
-	client.post(format!("http://127.0.0.1:8515/bucket?name={measurement_name}&type={measurement_type}{measurement_tags}")).send().await.unwrap();
+	let datasets = config.get_datasets_with_source(source_name);
 
-	//create event bucket
+	for (dataset_name, _) in datasets {
+		let dataset_bucket_name = dataset_name.clone();
+		let bucket_type = "timeseries".to_string();
+		let tags = format!("tag[1]=source={}", source_name);
+
+		let url = format!("http://{host}:{port}/bucket?name={dataset_bucket_name}&type={bucket_type}&{tags}");
+
+		//create dataset bucket
+		client.post(url).send().await.unwrap();
+	}
+
 	let event_name = "measurement_event".to_string();
 	let event_type = "object".to_string();
-	client.post(format!("http://127.0.0.1:8515/bucket?name={event_name}&type={event_type}")).send().await.unwrap();
+	let url = format!("http://{host}:{port}/bucket?name={event_name}&type={event_type}");
+
+	//create event bucket
+	client.post(url).send().await.unwrap();
 }
 
-pub async fn add_to_bucket(measurement: Measurement) {
+pub async fn add_to_bucket(source_name: &str, measurement: Measurement) {
+	let config = Configuration::open("../dsm.toml").await.unwrap();
 	let client = Client::new();
 
-	let measurement_bucket_name = format!("{}::{}:{}", measurement.source, measurement.numerator_asset, measurement.denominator_asset);
-	let measurement_key = format!("{}", measurement.timestamp);
-	let measurement_value = measurement.ratio.to_string();
-	let measurement_tags = format!("&tag[1]=source={}&tag[2]=uuid={}", measurement.source, measurement.uuid);
+	let datasets = config.get_datasets_with_source(source_name);
 
-	client.post(format!("http://127.0.0.1:8515/bucket/{}?key={}&value={}&{}", measurement_bucket_name, measurement_key, measurement_value, measurement_tags)).send().await.unwrap();
+	for (dataset_name, _) in datasets {
+		let dataset_bucket_name = dataset_name.clone();
+		let key = format!("{}", measurement.timestamp.clone());
+		let value = measurement.ratio.to_string();
+		let tags = format!("tag[1]=source={}&tag[2]=uuid={}", source_name, measurement.uuid);
+		let host = config.dsm.database.host.clone();
+		let port = config.dsm.database.port;
 
-	let event_bucket_name = "measurement_event".to_string();
-	let event_key = uuid::Uuid::new_v4().to_string();
-	let event = MeasurementEvent::new("measurement_add", measurement.timestamp, &measurement_bucket_name);
-	let event_body = json!(event);
+		let url = format!("http://{host}:{port}/bucket/{dataset_bucket_name}?key={key}&value={value}&{tags}");
 
-	client.post(format!("http://127.0.0.1:8515/bucket/{}?key={}", event_bucket_name, event_key)).json(&event_body).send().await.unwrap();
-}
+		// add measurement to bucket
+		client.post(url).send().await.unwrap();
 
-pub async fn test_measurements() -> Vec<Measurement> {
-	let mut measurements: Vec<Measurement> = Vec::new();
+		let event_bucket_name = "measurement_event".to_string();
+		let key = uuid::Uuid::new_v4().to_string();
+		let event = MeasurementEvent::new("measurement_add", measurement.timestamp.clone(), Some(dataset_bucket_name));
+		let body = json!(event);
 
-	let measurement = Measurement::new("test", "Asset1", "Asset2", uuid::Uuid::new_v4(), BigDecimal::from(1_u8), BigDecimal::from(10_u8));
-	measurements.push(measurement);
+		let url = format!("http://{host}:{port}/bucket/{event_bucket_name}?key={key}");
 
-	let measurement = Measurement::new("test", "Asset1", "Asset2", uuid::Uuid::new_v4(), BigDecimal::from(2_u8), BigDecimal::from(20_u8));
-	measurements.push(measurement);
-
-	let measurement = Measurement::new("test", "Asset1", "Asset2", uuid::Uuid::new_v4(), BigDecimal::from(3_u8), BigDecimal::from(30_u8));
-	measurements.push(measurement);
-
-	let measurement = Measurement::new("test", "Asset1", "Asset2", uuid::Uuid::new_v4(), BigDecimal::from(4_u8), BigDecimal::from(40_u8));
-	measurements.push(measurement);
-
-	let measurement = Measurement::new("test", "Asset1", "Asset2", uuid::Uuid::new_v4(), BigDecimal::from(5_u8), BigDecimal::from(50_u8));
-	measurements.push(measurement);
-
-	let measurement = Measurement::new("test", "Asset1", "Asset2", uuid::Uuid::new_v4(), BigDecimal::from(6_u8), BigDecimal::from(40_u8));
-	measurements.push(measurement);
-
-	let measurement = Measurement::new("test", "Asset1", "Asset2", uuid::Uuid::new_v4(), BigDecimal::from(7_u8), BigDecimal::from(30_u8));
-	measurements.push(measurement);
-
-	let measurement = Measurement::new("test", "Asset1", "Asset2", uuid::Uuid::new_v4(), BigDecimal::from(8_u8), BigDecimal::from(20_u8));
-	measurements.push(measurement);
-
-	let measurement = Measurement::new("test", "Asset1", "Asset2", uuid::Uuid::new_v4(), BigDecimal::from(9_u8), BigDecimal::from(30_u8));
-	measurements.push(measurement);
-
-	let measurement = Measurement::new("test", "Asset1", "Asset2", uuid::Uuid::new_v4(), BigDecimal::from(10_u8), BigDecimal::from(10_u8));
-	measurements.push(measurement);
-
-	measurements
+		// add event to bucket
+		if let Err(e) = client.post(url.clone()).json(&body.clone()).send().await {
+                        println!("Error adding measurement event to bucket: {}", e);
+                        println!("Error url: {}", url);
+                        println!("Error body: {}", body);
+                }
+	}
 }
