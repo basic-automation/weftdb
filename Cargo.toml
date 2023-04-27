@@ -1,5 +1,5 @@
 [package]
-name = "dsm-input"
+name = "dsm-inputer"
 version = "0.0.1"
 edition = "2021"
 
@@ -17,6 +17,7 @@ chrono = "*"
 uuid = { version="*", features=["v4", "fast-rng", "macro-diagnostics", "serde"] }
 bigdecimal = { version="*", features=["serde"] }
 dsm_config = { path = "../dsm-config" }
+rayon = "*"
 
 
 [profile.release]
