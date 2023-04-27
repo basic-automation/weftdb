@@ -19,9 +19,6 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Measurement {
-	pub source: String,
-	pub numerator_asset: String,
-	pub denominator_asset: String,
 	pub uuid: Uuid,
 	pub timestamp: BigDecimal,
 	pub ratio: BigDecimal,
@@ -33,22 +30,7 @@ pub struct Measurement {
 }
 
 impl Measurement {
-	pub fn new(source: &str, numerator_asset: &str, denominator_asset: &str, uuid: Uuid, timestamp: BigDecimal, ratio: BigDecimal) -> Self {
-		Self {
-			source: source.to_string(),
-			numerator_asset: numerator_asset.to_string(),
-			denominator_asset: denominator_asset.to_string(),
-			uuid,
-			timestamp,
-			ratio,
-			location: None,
-			amplitude: None,
-			positive_distance: None,
-			negative_distance: None,
-			trend_vectors: None,
-		}
+	pub fn new(uuid: Uuid, timestamp: BigDecimal, ratio: BigDecimal) -> Self {
+		Self { uuid, timestamp, ratio, location: None, amplitude: None, positive_distance: None, negative_distance: None, trend_vectors: None }
 	}
 }
-
-
-
