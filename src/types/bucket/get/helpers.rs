@@ -53,7 +53,7 @@ pub async fn extrapolate_start_for_empty_values(start: BigDecimal, start_of_rang
 		} else {
 			return Err((StatusCode::BAD_REQUEST, "No values before start".to_string()));
 		}
-		let before_last = before_last.unwrap().timestamp.to_f64().unwrap().to_be_bytes();
+		let before_last = before_last.unwrap().timestamp.to_i128().unwrap().to_be_bytes();
 		let before_next_last = match tree.range(..before_last).last() {
 			Some(Ok(v)) => {
 				let value = String::from_utf8(v.1.to_vec()).unwrap();

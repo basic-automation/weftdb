@@ -4,11 +4,11 @@ use crate::{
 };
 use axum::http::StatusCode;
 use bigdecimal::{BigDecimal, ToPrimitive};
+use core::cmp::Ordering;
 pub use interp::*;
 use sled::Tree;
 use std::collections::HashMap;
 use std::str::FromStr;
-use core::cmp::Ordering;
 
 mod interp;
 
@@ -42,26 +42,26 @@ pub async fn get_object_bucket(tree: Tree) -> Result<Vec<BucketValue>, (StatusCo
 }
 
 pub async fn get_timeseries_tree(tree: Tree) -> Result<Vec<TimeSeriesMeasurement>, (StatusCode, String)> {
-        let k_v = match tree.iter().collect::<Result<Vec<(_, _)>, _>>() {
-                Ok(values) => values,
-                Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
-        };
+	let k_v = match tree.iter().collect::<Result<Vec<(_, _)>, _>>() {
+		Ok(values) => values,
+		Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+	};
 
-        let mut values: Vec<TimeSeriesMeasurement> = Vec::new();
-        for v in k_v {
-                let value = match String::from_utf8(v.1.to_vec()) {
-                        Ok(value) => value,
-                        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
-                };
-                let value: TimeSeriesMeasurement = match serde_json::from_str(value.as_str()) {
-                        Ok(value) => value,
-                        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
-                };
-                values.push(value);
-        }
-        // sort values by timestamp
-        values.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
-        Ok(values)
+	let mut values: Vec<TimeSeriesMeasurement> = Vec::new();
+	for v in k_v {
+		let value = match String::from_utf8(v.1.to_vec()) {
+			Ok(value) => value,
+			Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+		};
+		let value: TimeSeriesMeasurement = match serde_json::from_str(value.as_str()) {
+			Ok(value) => value,
+			Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+		};
+		values.push(value);
+	}
+	// sort values by timestamp
+	values.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+	Ok(values)
 }
 
 pub async fn get_timeseries_bucket(tree: Tree, params: BucketParams) -> Result<Vec<BucketValue>, (StatusCode, String)> {
@@ -85,35 +85,35 @@ pub async fn get_timeseries_bucket(tree: Tree, params: BucketParams) -> Result<V
 
 	let range = match (range_start.clone(), range_end.clone()) {
 		(Some(range_start), Some(range_end)) => {
-                        let mut range: Vec<TimeSeriesMeasurement> = Vec::new();
-                        if range_start < BigDecimal::from(0_u8) || range_end < BigDecimal::from(0_u8) {
-                                let values = get_timeseries_tree(tree.clone()).await?;
-                                for value in values {
-                                        if value.timestamp >= range_start && value.timestamp <= range_end {
-                                                range.push(value);
-                                        }
-                                }
-                        } else {
-                                let r = tree.range(range_start.to_f64().unwrap().to_be_bytes()..range_end.to_f64().unwrap().to_be_bytes()).collect::<Result<Vec<(_, _)>, _>>().unwrap();
+			let mut range: Vec<TimeSeriesMeasurement> = Vec::new();
+			if range_start < BigDecimal::from(0_u8) || range_end < BigDecimal::from(0_u8) {
+				let values = get_timeseries_tree(tree.clone()).await?;
+				for value in values {
+					if value.timestamp >= range_start && value.timestamp <= range_end {
+						range.push(value);
+					}
+				}
+			} else {
+				let r = tree.range(range_start.to_i128().unwrap().to_be_bytes()..range_end.to_i128().unwrap().to_be_bytes()).collect::<Result<Vec<(_, _)>, _>>().unwrap();
 
-        			range = r
-        				.into_iter()
-        				.map(|v| {
-        					let value = match String::from_utf8(v.1.to_vec()) {
-        						Ok(value) => value,
-        						Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
-        					};
-        					let value: TimeSeriesMeasurement = match serde_json::from_str(value.as_str()) {
-        						Ok(value) => value,
-        						Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
-        					};
-        					Ok(value)
-        				})
-        				.collect::<Result<Vec<TimeSeriesMeasurement>, _>>()?;
-                        }
-			
+				range = r
+					.into_iter()
+					.map(|v| {
+						let value = match String::from_utf8(v.1.to_vec()) {
+							Ok(value) => value,
+							Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+						};
+						let value: TimeSeriesMeasurement = match serde_json::from_str(value.as_str()) {
+							Ok(value) => value,
+							Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+						};
+						Ok(value)
+					})
+					.collect::<Result<Vec<TimeSeriesMeasurement>, _>>()?;
+			}
 
-			let end = match tree.get(range_end.to_f64().unwrap().to_be_bytes()) {
+
+			let end = match tree.get(range_end.to_i128().unwrap().to_be_bytes()) {
 				Ok(end) => match end {
 					Some(end) => match String::from_utf8(end.to_vec()) {
 						Ok(end) => match serde_json::from_str::<TimeSeriesMeasurement>(end.as_str()) {
@@ -150,51 +150,40 @@ pub async fn get_timeseries_bucket(tree: Tree, params: BucketParams) -> Result<V
 		},
 	};
 
+
 	if range.len() == 1 {
 		for v in &range {
 			res.push(BucketValue::TimeSeries(v.clone()));
 		}
 
-                if let Some(_) = params.interpolation {
-                        let take = params.take.unwrap_or(BigDecimal::from(60_u16));
-                        let step = (range_end.clone().unwrap() - range_start.clone().unwrap()) / take.clone();
-                        let mut i = range_start.unwrap();
-                        
-                        while i < range_end.clone().unwrap() {
-                                if i == range[0].timestamp {
-                                        i = i + step.clone();
-                                        continue;
-                                }
-                                let m = TimeSeriesMeasurement {
-                                        timestamp: i.clone(),
-                                        value: range[0].clone().value,
-                                        tags: None,
-                                };
-                                res.push(BucketValue::TimeSeries(m));
+		if params.interpolation.is_some() {
+			let take = params.take.unwrap_or(BigDecimal::from(60_u16));
+			let step = (range_end.clone().unwrap() - range_start.clone().unwrap()) / take;
+			let mut i = range_start.unwrap();
 
-                                i = i + step.clone();
-                        }
+			while i < range_end.clone().unwrap() {
+				if i == range[0].timestamp {
+					i += step.clone();
+					continue;
+				}
+				let m = TimeSeriesMeasurement { timestamp: i.clone(), value: range[0].clone().value, tags: None };
+				res.push(BucketValue::TimeSeries(m));
 
-                        let m = TimeSeriesMeasurement {
-                                timestamp: range_end.clone().unwrap().clone(),  
-                                value: range[0].value.clone(),
-                                tags: None,
-                        };
-                        res.push(BucketValue::TimeSeries(m));
+				i += step.clone();
+			}
 
-                        // sort res by timestamp
-                        res.sort_by(|a, b| {
-                                match a {
-                                        BucketValue::TimeSeries(a) => {
-                                                match b {
-                                                        BucketValue::TimeSeries(b) => a.timestamp.cmp(&b.timestamp),
-                                                        _ => Ordering::Less,
-                                                }
-                                        }
-                                        _ => Ordering::Less,
-                                }
-                        });
-                }
+			let m = TimeSeriesMeasurement { timestamp: range_end.clone().unwrap(), value: range[0].value.clone(), tags: None };
+			res.push(BucketValue::TimeSeries(m));
+
+			// sort res by timestamp
+			res.sort_by(|a, b| match a {
+				BucketValue::TimeSeries(a) => match b {
+					BucketValue::TimeSeries(b) => a.timestamp.cmp(&b.timestamp),
+					_ => Ordering::Less,
+				},
+				_ => Ordering::Less,
+			});
+		}
 		return Ok(res);
 	}
 
@@ -220,7 +209,6 @@ pub async fn get_timeseries_bucket(tree: Tree, params: BucketParams) -> Result<V
 			for v in range {
 				new_values.push([v.timestamp.clone(), v.value.clone()]);
 			}
-
 			let new_values = interp::linear_interpolation(new_values, range_start, range_end, params.take.unwrap_or(BigDecimal::from(60_u16))).await.unwrap();
 			for value in new_values {
 				let tags = match preserve_tags.iter().find(|x| x.0 == value[0]) {

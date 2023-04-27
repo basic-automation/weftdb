@@ -224,16 +224,16 @@ impl Bucket {
 				let key = &time_series_measurement.timestamp;
 
 				// check if a key with the same name exists
-				match tree.contains_key(key.to_f64().unwrap().to_be_bytes()) {
-					Ok(value) => {
-						if value {
-							return Err((StatusCode::BAD_REQUEST, "Key already exists".to_string()));
-						}
-					}
-					Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
-				}
+                                match tree.contains_key(key.to_i128().unwrap().to_be_bytes()) {
+                                        Ok(exists) => {
+                                                if exists {
+                                                        return Err((StatusCode::BAD_REQUEST, "Key already exists".to_string()));
+                                                }
+                                        }
+                                        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+                                }
 				let time_series_measurement = json!(time_series_measurement).to_string();
-				match tree.insert(key.to_f64().unwrap().to_be_bytes(), time_series_measurement.as_bytes()) {
+				match tree.insert(key.to_i128().unwrap().to_be_bytes(), time_series_measurement.as_bytes()) {
 					Ok(_) => (),
 					Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
 				};
@@ -249,7 +249,7 @@ impl Bucket {
 		};
 		match self.type_.clone() {
 			BucketType::TimeSeries => {
-				let k = match key.parse::<f64>() {
+				let k = match key.parse::<i128>() {
 					Ok(key) => key.to_be_bytes(),
 					Err(e) => return Err((StatusCode::BAD_REQUEST, format!("Failed to parse key: {}", e))),
 				};
@@ -309,7 +309,7 @@ impl Bucket {
 					// get all keys and sort them
 					// find the next_next_value and pre_pre_value
 					// swap next_value and pre_value if the key is negative
-					if key.parse::<f64>().unwrap() < 0.0 {
+					if key.parse::<i128>().unwrap() < 0 {
 						let params = BucketParams::default();
 						let values = match get::get_timeseries_bucket(tree.clone(), params).await {
 							Ok(values) => values,
@@ -325,7 +325,7 @@ impl Bucket {
 						values.sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap());
 						let mut i = 0;
 						while i < values.len() {
-							if values[i].timestamp > BigDecimal::from_f64(key.parse::<f64>().unwrap()).unwrap() {
+							if values[i].timestamp > BigDecimal::from_i128(key.parse::<i128>().unwrap()).unwrap() {
 								if values.len() >= (i + 1) {
 									next_value = Some(values[i].clone());
 									next_next_value = Some(values[i + 1].clone());
@@ -366,7 +366,7 @@ impl Bucket {
 					if next_value.is_none() {
 						if pre_value.is_some() {
 							if pre_pre_value.is_none() {
-								pre_pre_value = match tree.get_lt(pre_value.clone().unwrap().timestamp.to_f64().unwrap().to_be_bytes()) {
+								pre_pre_value = match tree.get_lt(pre_value.clone().unwrap().timestamp.to_i128().unwrap().to_be_bytes()) {
 									Ok(value) => match value {
 										Some(value) => match String::from_utf8(value.1.to_vec()) {
 											Ok(value) => match serde_json::from_str(value.as_str()) {
@@ -403,7 +403,7 @@ impl Bucket {
 					if pre_value.is_none() {
 						if next_value.is_some() {
 							if next_next_value.is_none() {
-								next_next_value = match tree.get_gt(next_value.clone().unwrap().timestamp.to_f64().unwrap().to_be_bytes()) {
+								next_next_value = match tree.get_gt(next_value.clone().unwrap().timestamp.to_i128().unwrap().to_be_bytes()) {
 									Ok(value) => match value {
 										Some(value) => match String::from_utf8(value.1.to_vec()) {
 											Ok(value) => match serde_json::from_str(value.as_str()) {

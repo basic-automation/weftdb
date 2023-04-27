@@ -12,22 +12,7 @@ pub mod api_v1;
 
 pub fn router() -> Router {
 	let db = sled::open("db").unwrap();
-	Router::new()
-        .route("/", 
-                get(root))
-        .route("/destroy", 
-                get(destroy_db))
-        .route("/bucket", 
-                post(create_bucket))
-        .route("/bucket/:bucket", 
-                post(add_key_to_bucket)
-                .get(move |state, path, params, body| get_bucket(path, params, state, body))
-                .delete(move |state, path, params, body| delete_bucket(path, params, state, body)))
-        .route("/bucket/:bucket/:key", 
-        get(move |state, path, params, body| get_from_bucket(path, params, state, body))
-                .delete(move |state, path, params, body| remove_from_bucket(path, params, state, body))
-                .put(update_key))
-        .with_state(db)
+	Router::new().route("/", get(root)).route("/destroy", get(destroy_db)).route("/bucket", post(create_bucket)).route("/bucket/:bucket", post(add_key_to_bucket).get(move |state, path, params, body| get_bucket(path, params, state, body)).delete(move |state, path, params, body| delete_bucket(path, params, state, body))).route("/bucket/:bucket/:key", get(move |state, path, params, body| get_from_bucket(path, params, state, body)).delete(move |state, path, params, body| remove_from_bucket(path, params, state, body)).put(update_key)).with_state(db)
 }
 
 async fn root() -> &'static str {

@@ -9,6 +9,11 @@ pub async fn linear_interpolation(values: Vec<[BigDecimal; 2]>, start: BigDecima
 	let step = (end.clone() - start.clone()) / take.clone();
 	let mut current = start.clone();
 	let mut i = 0;
+
+        if values.is_empty() {
+            return Ok(interpolated_values);
+        }
+
 	'outer: while current <= end {
 		let value_i = values.get(i);
 		if let Some(val) = value_i {
