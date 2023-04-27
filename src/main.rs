@@ -1,4 +1,5 @@
 use axum::{routing::get, Json, Router};
+use bigdecimal::BigDecimal;
 use dsm_measurement::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -10,7 +11,7 @@ mod thorchain_ninerealms_midguard;
 #[tokio::main]
 async fn main() {
 	let app = Router::new().route("/btcbtcusausd", get(btcbtc_usausd));
-        println!("Listening on http://0.0.0.0:8519/");
+	println!("Listening on http://0.0.0.0:8519/");
 	axum::Server::bind(&"0.0.0.0:8519".parse().unwrap()).serve(app.into_make_service()).await.unwrap();
 }
 
@@ -37,16 +38,11 @@ pub async fn btcbtc_usausd() -> Json<Value> {
 
 	let measurements: Vec<Measurement> = quotes
 		.iter()
-        		.map(|(time, price)| {
-                                Measurement::new("thorchain", "BtcBtc", "UsaUsd", Uuid::new_v4(), time.clone(), price.clone())
-                        })
+		.map(|(time, price)| {
+			let time = time * BigDecimal::from(1000_u16);
+			Measurement::new(Uuid::new_v4(), time.clone(), price.clone())
+		})
 		.collect();
 
 	Json(json!({ "measurements": measurements }))
 }
-
-
-
-
-
-
