@@ -1,4 +1,4 @@
-use super::*;
+/* use super::*;
 use bigdecimal::BigDecimal;
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
@@ -7,7 +7,7 @@ use std::str::FromStr;
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub enum BatchLength {
 	#[default]
-        TenSeconds,
+		TenSeconds,
 	Minute,
 	FiveMinute,
 	TenMinute,
@@ -31,7 +31,7 @@ pub enum BatchLength {
 impl Display for BatchLength {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
-                        BatchLength::TenSeconds => write!(f, "10"),
+						BatchLength::TenSeconds => write!(f, "10"),
 			BatchLength::Minute => write!(f, "60"),
 			BatchLength::FiveMinute => write!(f, "300"),
 			BatchLength::TenMinute => write!(f, "600"),
@@ -59,7 +59,7 @@ impl FromStr for BatchLength {
 
 	fn from_str(s: &str) -> Result<Self, Self::Err> {
 		match s {
-                        "10s" => Ok(BatchLength::TenSeconds),
+						"10s" => Ok(BatchLength::TenSeconds),
 			"1m" => Ok(BatchLength::Minute),
 			"5m" => Ok(BatchLength::FiveMinute),
 			"10m" => Ok(BatchLength::TenMinute),
@@ -86,7 +86,7 @@ impl FromStr for BatchLength {
 impl ToSeconds for BatchLength {
 	fn to_seconds(&self) -> BigDecimal {
 		match self {
-                        BatchLength::TenSeconds => BigDecimal::from(10),
+						BatchLength::TenSeconds => BigDecimal::from(10),
 			BatchLength::Minute => BigDecimal::from(60),
 			BatchLength::FiveMinute => BigDecimal::from(300),
 			BatchLength::TenMinute => BigDecimal::from(600),
@@ -116,7 +116,7 @@ pub trait ToSeconds {
 impl ToInterpolation for BatchLength {
 	fn to_interpolation(&self) -> Interpolation {
 		match self {
-                        BatchLength::TenSeconds => Interpolation::Second,
+						BatchLength::TenSeconds => Interpolation::Second,
 			BatchLength::Minute => Interpolation::Second,
 			BatchLength::FiveMinute => Interpolation::Second,
 			BatchLength::TenMinute => Interpolation::Second,
@@ -138,3 +138,4 @@ impl ToInterpolation for BatchLength {
 		}
 	}
 }
+ */

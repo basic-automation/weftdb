@@ -1,17 +1,17 @@
 use super::Interpolation;
-use crate::interpolation::ToInterpolation;
-use crate::length::{BatchLength, ToSeconds};
-use dsm_log::Log;
 use bigdecimal::BigDecimal;
+use dsm_config::BatchLength;
+use dsm_log::Log;
 use dsm_measurement::Measurement;
 use num_bigint::BigUint;
-use rayon::prelude::*;
+//use rayon::prelude::*;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
+use dsm_config::ToMilliseconds;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Measurements(pub HashMap<BigUint, Measurement>);
@@ -49,49 +49,41 @@ impl Serialize for Movements {
 pub struct Batch {
 	pub measurements: Option<Measurements>,
 	pub length: BatchLength,
-	pub measurement_bucket: String,
+	pub dataset_name: String,
 	pub uuid: Uuid,
 	pub relative_x_movements: Option<Movements>,
 	pub relative_y_movements: Option<Movements>,
 	pub logs: Log,
-        pub is_logging: bool,
+	pub is_logging: bool,
 }
 
 impl Batch {
-	pub fn new(measurement_bucket: String, length: BatchLength, log: bool) -> Self {
+	pub fn new(dataset_name: String, length: BatchLength, log: bool) -> Self {
 		let id = Uuid::new_v4();
 
 		//log
 		let mut logs = Log::new(&id.to_string());
 
-                if log {
-                    logs.log("1: Created", &json!("batch created"));
-                }
+		if log {
+			logs.log("1: Created", &json!("batch created"));
+		}
 
-		Self { measurements: None, length, measurement_bucket, uuid: id, relative_x_movements: None, relative_y_movements: None, logs, is_logging: log }
-	}
-
-	pub async fn numerator_asset(&self) -> String {
-		self.measurement_bucket.split("::").collect::<Vec<&str>>()[0].to_string()
-	}
-
-	pub async fn denominator_asset(&self) -> String {
-		self.measurement_bucket.split("::").collect::<Vec<&str>>()[1].to_string()
+		Self { measurements: None, length, dataset_name, uuid: id, relative_x_movements: None, relative_y_movements: None, logs, is_logging: log }
 	}
 
 	/// size = number of seconds in batch
 	pub async fn size(&self) -> BigDecimal {
-		self.length.to_seconds()
+		self.length.to_milliseconds()
 	}
 
 	/// interpolation = unit of time between measurements
 	pub async fn interpolation(&self) -> Interpolation {
-		self.length.to_interpolation()
+		Interpolation::from_batch_length(self.length)
 	}
 
 	/// interpolation_steps = number of seconds between measurements
 	pub async fn interpolation_steps(&self) -> BigDecimal {
-		self.interpolation().await.to_seconds()
+		self.interpolation().await.to_milliseconds()
 	}
 
 	pub async fn interval(&self) -> BigDecimal {
@@ -142,7 +134,7 @@ impl Batch {
 			None => return None,
 		};
 
-		let largest_location = match measurements.0.par_iter().max_by(|a, b| a.1.location.cmp(&b.1.location)) {
+		let largest_location = match measurements.0.iter().max_by(|a, b| a.1.location.cmp(&b.1.location)) {
 			Some(measurement) => match &measurement.1.location {
 				Some(location) => location.clone(),
 				None => return None,
@@ -150,7 +142,7 @@ impl Batch {
 			None => return None,
 		};
 
-		let smallest_location = match measurements.0.par_iter().min_by(|a, b| a.1.location.cmp(&b.1.location)) {
+		let smallest_location = match measurements.0.iter().min_by(|a, b| a.1.location.cmp(&b.1.location)) {
 			Some(measurement) => match &measurement.1.location {
 				Some(location) => location.clone(),
 				None => return None,
@@ -168,7 +160,7 @@ impl Batch {
 			None => return None,
 		};
 
-		let largest_amplitude = match measurements.0.par_iter().max_by(|a, b| a.1.amplitude.cmp(&b.1.amplitude)) {
+		let largest_amplitude = match measurements.0.iter().max_by(|a, b| a.1.amplitude.cmp(&b.1.amplitude)) {
 			Some(measurement) => match &measurement.1.amplitude {
 				Some(amplitude) => amplitude,
 				None => return None,
@@ -176,7 +168,7 @@ impl Batch {
 			None => return None,
 		};
 
-		let smallest_amplitude = match measurements.0.par_iter().min_by(|a, b| a.1.amplitude.cmp(&b.1.amplitude)) {
+		let smallest_amplitude = match measurements.0.iter().min_by(|a, b| a.1.amplitude.cmp(&b.1.amplitude)) {
 			Some(measurement) => match &measurement.1.amplitude {
 				Some(amplitude) => amplitude,
 				None => return None,
@@ -201,31 +193,33 @@ impl Batch {
 			None => return Err("No measurements".to_string()),
 		};
 
-                //log begin
-                if self.is_logging {
-                        let locations: Arc<Mutex<HashMap<String, BigDecimal>>> = Arc::new(Mutex::new(HashMap::new()));
-                        self.measurements.as_ref().unwrap().0.par_iter().for_each(|measurement| {
-                                if let Some(location) = &measurement.1.location {
-                                        let mut locations = locations.lock().unwrap();
-                                        locations.insert(measurement.0.clone().to_string(), location.clone());
-                                }
-                        });
-                        self.logs.log(&format!("11: BATCH begin calculating relative x movments MAX-X: {:?}", max_x_movement), &json!(*locations.lock().unwrap()));
-                }
-                //log end
+		//log begin
+		if self.is_logging {
+			let locations: Arc<Mutex<HashMap<String, BigDecimal>>> = Arc::new(Mutex::new(HashMap::new()));
+			self.measurements.as_ref().unwrap().0.iter().for_each(|measurement| {
+				if let Some(location) = &measurement.1.location {
+					let mut locations = locations.lock().unwrap();
+					locations.insert(measurement.0.clone().to_string(), location.clone());
+				}
+			});
+			self.logs.log(&format!("11: BATCH begin calculating relative x movments MAX-X: {:?}", max_x_movement), &json!(*locations.lock().unwrap()));
+		}
+		//log end
 
-		measurements.0.par_iter().for_each(|measurement| {
+		measurements.0.iter().for_each(|measurement| {
 			let location = match &measurement.1.location {
 				Some(location) => location,
 				None => return,
 			};
 
 			match relative_x_movements.lock() {
-				Ok(mut rxm) => if max_x_movement != BigDecimal::from(0) {
-                                        rxm.insert(measurement.0.clone(), location / max_x_movement.clone())
-                                } else {
-                                        rxm.insert(measurement.0.clone(), BigDecimal::from(0))
-                                }
+				Ok(mut rxm) => {
+					if max_x_movement != BigDecimal::from(0) {
+						rxm.insert(measurement.0.clone(), location / max_x_movement.clone())
+					} else {
+						rxm.insert(measurement.0.clone(), BigDecimal::from(0))
+					}
+				}
 				Err(_) => None,
 			};
 		});
@@ -240,11 +234,10 @@ impl Batch {
 		self.relative_x_movements = Some(Movements(relative_x_movements));
 
 		// log begin
-                if self.is_logging {
-                        self.logs.log("12: BATCH end calculate_relative_x_movements", &json!(self.relative_x_movements));
-                }
-                // log end
-
+		if self.is_logging {
+			self.logs.log("12: BATCH end calculate_relative_x_movements", &json!(self.relative_x_movements));
+		}
+		// log end
 
 		Ok(())
 	}
@@ -263,31 +256,33 @@ impl Batch {
 			None => return Err("No measurements".to_string()),
 		};
 
-                // log begin
-                if self.is_logging {
-                        let amplitudes: Arc<Mutex<HashMap<String, BigDecimal>>> = Arc::new(Mutex::new(HashMap::new()));
-                        self.measurements.as_ref().unwrap().0.par_iter().for_each(|measurement| {
-                                if let Some(amplitude) = &measurement.1.amplitude {
-                                        let mut amplitudes = amplitudes.lock().unwrap();
-                                        amplitudes.insert(measurement.0.clone().to_string(), amplitude.clone());
-                                }
-                        });
-                        self.logs.log(&format!("13: BATCH begin calculating relative y movments MAX-Y: {:?}", max_y_movement), &json!(*amplitudes.lock().unwrap()));
-                }
-                // log end
+		// log begin
+		if self.is_logging {
+			let amplitudes: Arc<Mutex<HashMap<String, BigDecimal>>> = Arc::new(Mutex::new(HashMap::new()));
+			self.measurements.as_ref().unwrap().0.iter().for_each(|measurement| {
+				if let Some(amplitude) = &measurement.1.amplitude {
+					let mut amplitudes = amplitudes.lock().unwrap();
+					amplitudes.insert(measurement.0.clone().to_string(), amplitude.clone());
+				}
+			});
+			self.logs.log(&format!("13: BATCH begin calculating relative y movments MAX-Y: {:?}", max_y_movement), &json!(*amplitudes.lock().unwrap()));
+		}
+		// log end
 
-		measurements.0.par_iter().for_each(|measurement| {
+		measurements.0.iter().for_each(|measurement| {
 			let amplitude = match &measurement.1.amplitude {
 				Some(amplitude) => amplitude.clone(),
 				None => return,
 			};
 
 			match relative_y_movements.lock() {
-				Ok(mut rym) => if max_y_movement.clone() != BigDecimal::from(0) {
-                                        rym.insert(measurement.0.clone(), amplitude / max_y_movement.clone())
-                                } else {
-                                        rym.insert(measurement.0.clone(), BigDecimal::from(0))
-                                },
+				Ok(mut rym) => {
+					if max_y_movement.clone() != BigDecimal::from(0) {
+						rym.insert(measurement.0.clone(), amplitude / max_y_movement.clone())
+					} else {
+						rym.insert(measurement.0.clone(), BigDecimal::from(0))
+					}
+				}
 				Err(_) => None,
 			};
 		});
@@ -300,23 +295,23 @@ impl Batch {
 		self.relative_y_movements = Some(Movements(relative_y_movements));
 
 		// log begin
-                if self.is_logging {
-                        self.logs.log("14: BATCH end calculate_relative_y_movements", &json!(self.relative_y_movements));
-                }
-                // log end
+		if self.is_logging {
+			self.logs.log("14: BATCH end calculate_relative_y_movements", &json!(self.relative_y_movements));
+		}
+		// log end
 
 		Ok(())
 	}
 
 	pub async fn calculate_relative_movements(&mut self) -> Result<(), String> {
 		match self.calculate_relative_x_movements().await {
-                        Ok(_) => (),
-                        Err(e) => return Err(e),
-                };
+			Ok(_) => (),
+			Err(e) => return Err(e),
+		};
 		match self.calculate_relative_y_movements().await {
-                        Ok(_) => (),
-                        Err(e) => return Err(e),
-                };
+			Ok(_) => (),
+			Err(e) => return Err(e),
+		};
 
 		Ok(())
 	}
@@ -350,7 +345,7 @@ impl Batch {
 		};
 
 		let last_measurement: Arc<Mutex<BigUint>> = Arc::new(Mutex::new(BigUint::from(0_u8)));
-		measurements.0.par_iter().for_each(|measurement| {
+		measurements.0.iter().for_each(|measurement| {
 			if let Ok(mut last_measurement) = last_measurement.lock() {
 				if measurement.0 > &last_measurement.clone() {
 					last_measurement.clone_from(measurement.0);
@@ -393,28 +388,33 @@ impl Batch {
 			None => return Err("No measurements found".to_string()),
 		};
 
-                // begin logs
-                if self.is_logging {
-                        let locations: Arc<Mutex<HashMap<String, BigDecimal>>> = Arc::new(Mutex::new(HashMap::new()));
-                        self.measurements.as_ref().unwrap().0.par_iter().for_each(|measurement| {
-                                if let Some(location) = &measurement.1.location {
-                                        let mut locations = locations.lock().unwrap();
-                                        locations.insert(measurement.0.clone().to_string(), location.clone());
-                                }
-                        });
-                        self.logs.log("2: BATCH begin calculate distances locations:", &json!(*locations.lock().unwrap()));
-                }
-                // end logs
+		// begin logs
+		if self.is_logging {
+			let locations_amplitudes: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+			self.measurements.as_ref().unwrap().0.iter().for_each(|measurement| {
+				if let Some(location) = &measurement.1.location {
+                                        if let Some(amplitude) = &measurement.1.amplitude {
+        					let mut locations_amplitudes = locations_amplitudes.lock().unwrap();
+                                                let location_amplitude = format!("location: {}, amplitude: {}", location, amplitude);
+        					locations_amplitudes.insert(measurement.0.clone().to_string(), location_amplitude);
+                                        }
+				}
+			});
+
+                        
+			self.logs.log("2: BATCH begin calculate distances locations:", &json!(*locations_amplitudes.lock().unwrap()));
+		}
+		// end logs
 
 		match self.measurements.as_mut() {
 			Some(measurements) => {
-				measurements.0.par_iter_mut().for_each(|measurement| {					
-                                        let location = match &measurement.1.location {
+				measurements.0.iter_mut().for_each(|measurement| {
+					let location = match &measurement.1.location {
 						Some(location) => location,
 						None => return,
 					};
 
-                                        let denominator  = last_location.clone() - first_location.clone();
+					let denominator = last_location.clone() - first_location.clone();
 
 					let positive_distance = (BigDecimal::from(1) / denominator.clone()) * (location - first_location.clone());
 					measurement.1.positive_distance = Some(positive_distance.clone());
@@ -424,28 +424,28 @@ impl Batch {
 			None => return Err("No measurements found".to_string()),
 		}
 
-                // begin logs
-                if self.is_logging {
-                        let postive_distances: Arc<Mutex<HashMap<String, BigDecimal>>> = Arc::new(Mutex::new(HashMap::new()));
-                        self.measurements.as_ref().unwrap().0.par_iter().for_each(|measurement| {
-                                if let Some(positive_distance) = &measurement.1.positive_distance {
-                                        let mut postive_distances = postive_distances.lock().unwrap();
-                                        postive_distances.insert(measurement.0.clone().to_string(), positive_distance.clone());
-                                }
-                        });
+		// begin logs
+		if self.is_logging {
+			let postive_distances: Arc<Mutex<HashMap<String, BigDecimal>>> = Arc::new(Mutex::new(HashMap::new()));
+			self.measurements.as_ref().unwrap().0.iter().for_each(|measurement| {
+				if let Some(positive_distance) = &measurement.1.positive_distance {
+					let mut postive_distances = postive_distances.lock().unwrap();
+					postive_distances.insert(measurement.0.clone().to_string(), positive_distance.clone());
+				}
+			});
 
-                        let negative_distances: Arc<Mutex<HashMap<String, BigDecimal>>> = Arc::new(Mutex::new(HashMap::new()));
-                        self.measurements.as_ref().unwrap().0.par_iter().for_each(|measurement| {
-                                if let Some(negative_distance) = &measurement.1.negative_distance {
-                                        let mut negative_distances = negative_distances.lock().unwrap();
-                                        negative_distances.insert(measurement.0.clone().to_string(), negative_distance.clone());
-                                }
-                        });
+			let negative_distances: Arc<Mutex<HashMap<String, BigDecimal>>> = Arc::new(Mutex::new(HashMap::new()));
+			self.measurements.as_ref().unwrap().0.iter().for_each(|measurement| {
+				if let Some(negative_distance) = &measurement.1.negative_distance {
+					let mut negative_distances = negative_distances.lock().unwrap();
+					negative_distances.insert(measurement.0.clone().to_string(), negative_distance.clone());
+				}
+			});
 
-                        self.logs.log("3: BATCH end calculate distances postive_distances:", &json!(*postive_distances.lock().unwrap()));
-                        self.logs.log("4: BATCH end calculate distances negative_distances:", &json!(*negative_distances.lock().unwrap()));
-                }
-                // end logs
+			self.logs.log("3: BATCH end calculate distances postive_distances:", &json!(*postive_distances.lock().unwrap()));
+			self.logs.log("4: BATCH end calculate distances negative_distances:", &json!(*negative_distances.lock().unwrap()));
+		}
+		// end logs
 
 		Ok(())
 	}
@@ -477,22 +477,22 @@ impl Batch {
 			None => return Err("No measurements found".to_string()),
 		};
 
-                // log begin
-                if self.is_logging {
-                        let amplitudes: Arc<Mutex<HashMap<String, BigDecimal>>> = Arc::new(Mutex::new(HashMap::new()));
-                        self.measurements.as_ref().unwrap().0.par_iter().for_each(|measurement| {
-                                if let Some(amplitude) = &measurement.1.amplitude {
-                                        let mut amplitudes = amplitudes.lock().unwrap();
-                                        amplitudes.insert(measurement.0.clone().to_string(), amplitude.clone());
-                                }
-                        });
-                        self.logs.log("5: BATCH begin vector leveling amplitudes:", &json!(*amplitudes.lock().unwrap()));
-                }
-                // log end
+		// log begin
+		if self.is_logging {
+			let amplitudes: Arc<Mutex<HashMap<String, BigDecimal>>> = Arc::new(Mutex::new(HashMap::new()));
+			self.measurements.as_ref().unwrap().0.iter().for_each(|measurement| {
+				if let Some(amplitude) = &measurement.1.amplitude {
+					let mut amplitudes = amplitudes.lock().unwrap();
+					amplitudes.insert(measurement.0.clone().to_string(), amplitude.clone());
+				}
+			});
+			self.logs.log("5: BATCH begin vector leveling amplitudes:", &json!(*amplitudes.lock().unwrap()));
+		}
+		// log end
 
 		match self.measurements.as_mut() {
 			Some(measurements) => {
-				measurements.0.par_iter_mut().for_each(|measurement| {
+				measurements.0.iter_mut().for_each(|measurement| {
 					let mut amplitude = match &measurement.1.amplitude {
 						Some(amplitude) => amplitude.clone(),
 						None => return,
@@ -521,18 +521,18 @@ impl Batch {
 			None => return Err("No measurements found".to_string()),
 		}
 
-                // log begin
-                if self.is_logging {
-                        let amplitudes: Arc<Mutex<HashMap<String, BigDecimal>>> = Arc::new(Mutex::new(HashMap::new()));
-                        self.measurements.as_ref().unwrap().0.par_iter().for_each(|measurement| {
-                                if let Some(amplitude) = &measurement.1.amplitude {
-                                        let mut amplitudes = amplitudes.lock().unwrap();
-                                        amplitudes.insert(measurement.0.clone().to_string(), amplitude.clone());
-                                }
-                        });
-                        self.logs.log("6: BATCH end vector leveling amplitudes:", &json!(*amplitudes.lock().unwrap()));
-                }
-                // log end
+		// log begin
+		if self.is_logging {
+			let amplitudes: Arc<Mutex<HashMap<String, BigDecimal>>> = Arc::new(Mutex::new(HashMap::new()));
+			self.measurements.as_ref().unwrap().0.iter().for_each(|measurement| {
+				if let Some(amplitude) = &measurement.1.amplitude {
+					let mut amplitudes = amplitudes.lock().unwrap();
+					amplitudes.insert(measurement.0.clone().to_string(), amplitude.clone());
+				}
+			});
+			self.logs.log("6: BATCH end vector leveling amplitudes:", &json!(*amplitudes.lock().unwrap()));
+		}
+		// log end
 
 		Ok(())
 	}
@@ -556,20 +556,20 @@ impl Batch {
 			None => return Err("No measurements found".to_string()),
 		};
 
-                // logs begin
-                if self.is_logging {
-                        let locations: Arc<Mutex<HashMap<String, BigDecimal>>> = Arc::new(Mutex::new(HashMap::new()));
-                        self.measurements.as_ref().unwrap().0.par_iter().for_each(|measurement| {
-                                if let Some(location) = measurement.1.location.clone() {
-                                        let mut locations = locations.lock().unwrap();
-                                        locations.insert(measurement.0.clone().to_string(), location);
-                                }
-                        });
-                        self.logs.log("7: BATCH begin origin transformation locations:", &json!(*locations.lock().unwrap()));
-                }
-                // logs end
+		// logs begin
+		if self.is_logging {
+			let locations: Arc<Mutex<HashMap<String, BigDecimal>>> = Arc::new(Mutex::new(HashMap::new()));
+			self.measurements.as_ref().unwrap().0.iter().for_each(|measurement| {
+				if let Some(location) = measurement.1.location.clone() {
+					let mut locations = locations.lock().unwrap();
+					locations.insert(measurement.0.clone().to_string(), location);
+				}
+			});
+			self.logs.log("7: BATCH begin origin transformation locations:", &json!(*locations.lock().unwrap()));
+		}
+		// logs end
 
-		measurements.0.par_iter_mut().for_each(|measurement| {
+		measurements.0.iter_mut().for_each(|measurement| {
 			let location = match &measurement.1.location {
 				Some(location) => location,
 				None => return,
@@ -580,18 +580,18 @@ impl Batch {
 
 		self.measurements = Some(measurements.clone());
 
-                // logs begin
-                if self.is_logging {
-                        let locations: Arc<Mutex<HashMap<String, BigDecimal>>> = Arc::new(Mutex::new(HashMap::new()));
-                        self.measurements.as_ref().unwrap().0.par_iter().for_each(|measurement| {
-                                if let Some(location) = measurement.1.location.clone() {
-                                        let mut locations = locations.lock().unwrap();
-                                        locations.insert(measurement.0.clone().to_string(), location);
-                                }
-                        });
-                        self.logs.log("8: BATCH end origin transformation locations:", &json!(*locations.lock().unwrap()));
-                }
-                // logs end
+		// logs begin
+		if self.is_logging {
+			let locations: Arc<Mutex<HashMap<String, BigDecimal>>> = Arc::new(Mutex::new(HashMap::new()));
+			self.measurements.as_ref().unwrap().0.iter().for_each(|measurement| {
+				if let Some(location) = measurement.1.location.clone() {
+					let mut locations = locations.lock().unwrap();
+					locations.insert(measurement.0.clone().to_string(), location);
+				}
+			});
+			self.logs.log("8: BATCH end origin transformation locations:", &json!(*locations.lock().unwrap()));
+		}
+		// logs end
 
 		Ok(())
 	}
@@ -603,7 +603,7 @@ impl Batch {
 			None => return Err("No measurements found".to_string()),
 		};
 
-		measurements.0.par_iter().for_each(|origin_measurement| {
+		measurements.0.iter().for_each(|origin_measurement| {
 			let trend_vectors: Arc<Mutex<Vec<BigDecimal>>> = Arc::new(Mutex::new(vec![]));
 			let origin_location = match origin_measurement.1.location.clone() {
 				Some(location) => location,
@@ -614,7 +614,7 @@ impl Batch {
 				None => return,
 			};
 
-			measurements.0.clone().par_iter().for_each(|end_measurement| {
+			measurements.0.clone().iter().for_each(|end_measurement| {
 				let mut t_vec = match trend_vectors.lock() {
 					Ok(t_vec) => t_vec,
 					Err(_) => return,
@@ -656,7 +656,7 @@ impl Batch {
 		});
 
 		if let Some(measurements) = self.measurements.as_mut() {
-			measurements.0.par_iter_mut().for_each(|measurement| {
+			measurements.0.iter_mut().for_each(|measurement| {
 				let tvs = match tvs.lock() {
 					Ok(tvs) => tvs,
 					Err(_) => return,
@@ -676,18 +676,18 @@ impl Batch {
 	pub async fn simplify_transformation(&mut self) -> Result<(), String> {
 		let mut simplified_measurements: HashMap<BigUint, Measurement> = HashMap::new();
 
-                // logs begin
-                if self.is_logging {
-                        let locations_aplitudes: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
-                        self.measurements.as_ref().unwrap().0.par_iter().for_each(|measurement| {
-                                if let Some(location) = measurement.1.location.clone() {
-                                        let mut locations_aplitudes = locations_aplitudes.lock().unwrap();
-                                        locations_aplitudes.insert(measurement.0.clone().to_string(), format!("location: {}, Amplitude: {}", location, measurement.1.amplitude.clone().unwrap()));
-                                }
-                        });
-                        self.logs.log("9: BATCH begin simplify transformation locations:", &json!(*locations_aplitudes.lock().unwrap()));
-                }
-                // logs end
+		// logs begin
+		if self.is_logging {
+			let locations_aplitudes: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+			self.measurements.as_ref().unwrap().0.iter().for_each(|measurement| {
+				if let Some(location) = measurement.1.location.clone() {
+					let mut locations_aplitudes = locations_aplitudes.lock().unwrap();
+					locations_aplitudes.insert(measurement.0.clone().to_string(), format!("location: {}, Amplitude: {}", location, measurement.1.amplitude.clone().unwrap()));
+				}
+			});
+			self.logs.log("9: BATCH begin simplify transformation locations:", &json!(*locations_aplitudes.lock().unwrap()));
+		}
+		// logs end
 
 		let mut p = 0;
 		let mut c = 1;
@@ -767,29 +767,29 @@ impl Batch {
 
 		self.measurements = Some(Measurements(simplified_measurements));
 
-                // logs begin
-                if self.is_logging {
-                        let locations_aplitudes: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
-                        self.measurements.as_ref().unwrap().0.par_iter().for_each(|measurement| {
-                                if let Some(location) = measurement.1.location.clone() {
-                                        let mut locations_aplitudes = locations_aplitudes.lock().unwrap();
-                                        locations_aplitudes.insert(measurement.0.clone().to_string(), format!("Location: {}, Amplidute: {}", location, measurement.1.amplitude.clone().unwrap()));
-                                }
-                        });
-                        self.logs.log("10: BATCH end simplify transformation locations:", &json!(*locations_aplitudes.lock().unwrap()));
-                }
-                // logs end
+		// logs begin
+		if self.is_logging {
+			let locations_aplitudes: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+			self.measurements.as_ref().unwrap().0.iter().for_each(|measurement| {
+				if let Some(location) = measurement.1.location.clone() {
+					let mut locations_aplitudes = locations_aplitudes.lock().unwrap();
+					locations_aplitudes.insert(measurement.0.clone().to_string(), format!("Location: {}, Amplidute: {}", location, measurement.1.amplitude.clone().unwrap()));
+				}
+			});
+			self.logs.log("10: BATCH end simplify transformation locations:", &json!(*locations_aplitudes.lock().unwrap()));
+		}
+		// logs end
 
 		Ok(())
 	}
 
 	pub async fn finish(&mut self) {
 		// log save log
-                if self.is_logging {
-		        self.logs.log("finish", &json!(""));
-                }
+		if self.is_logging {
+			self.logs.log("finish", &json!(""));
 
-		// save log
-		let _ = self.logs.save("batch").await;
+                        // save log
+		        let _ = self.logs.save("batch").await;
+		}
 	}
 }
