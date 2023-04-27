@@ -15,6 +15,7 @@ uuid = {version="*", features=["v4", "fast-rng", "macro-diagnostics", "serde"]}
 bigdecimal = {version="*", features=["serde"]}
 dsm_pattern = { path = "../6 - dsm-pattern" }
 num-bigint = {version="*", features=["serde"]}
+dsm_config = { path = "../dsm-config" }
 
 
 [profile.release]
