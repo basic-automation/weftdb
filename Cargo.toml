@@ -16,9 +16,13 @@ reqwest = {version = "*", features=["json"]}
 uuid = {version="*", features=["v4", "fast-rng", "macro-diagnostics", "serde"]}
 bigdecimal = {version="*", features=["serde"]}
 num-bigint = { version="*", features = ["serde"] }
+dsm_config = { path = "../dsm-config" }
+rayon = "*"
+futures = "*"
+threadpool = "*"
 
 [profile.release]
-strip = true
+strip = false
 opt-level = "s"
 debug = 0
 lto = true

@@ -1,111 +1,154 @@
-#![feature(async_closure)]
+#![feature(async_closure, ip_in_core)]
 use bigdecimal::BigDecimal;
-use dsm_batch::{Batch, BatchLength};
+use bigdecimal::ToPrimitive;
+use core::net::SocketAddr;
+use dsm_batch::Batch;
+use dsm_config::BatchLength;
+use dsm_config::Configuration;
 use dsm_measurement::{Measurement, MeasurementEvent};
-use num_bigint::BigUint;
+use futures::future::join_all;
+use rayon::iter::IntoParallelRefIterator;
+use rayon::iter::ParallelIterator;
 use router::*;
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::str::FromStr;
-use std::{env, thread};
+use std::sync::Mutex;
+use std::thread;
+use std::{collections::HashMap, sync::Arc};
+use threadpool::ThreadPool;
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
-use bigdecimal::ToPrimitive;
+
+use std::env;
 
 mod router;
 
 #[tokio::main]
 async fn main() {
-	//env::set_var("RUST_BACKTRACE", "full");
+	// set RUST_BACKTRACE=1
+	env::set_var("RUST_BACKTRACE", "full");
 
 	let server = thread::spawn(async move || {
 		println!("server running...");
+
+		let config = match Configuration::open("../dsm.toml").await {
+			Ok(config) => config,
+			Err(e) => panic!("Error: Failed to open configuration file: {}", e),
+		};
 		let app = router();
 
-		let port = env::var("PORT").unwrap_or("8517".to_string());
+		let port = config.dsm.ports.batcher;
 		let address = format!("0.0.0.0:{}", port);
-		println!("Listening on address {}", address);
 
-		// run it with hyper on localhost:3000
-		axum::Server::bind(&address.parse().unwrap()).serve(app.into_make_service()).await.unwrap();
+		println!("Listening on address {}", address);
+		let address: SocketAddr = match address.parse() {
+			Ok(address) => address,
+			Err(e) => panic!("Error: Failed to parse address: {}", e),
+		};
+
+		if let Err(e) = axum::Server::bind(&address).serve(app.into_make_service()).await {
+			panic!("Error: Failed to bind server: {}", e);
+		}
 	});
 
 	let app = thread::spawn(async move || {
 		println!("app running...");
 		'app: loop {
-			let measurement_events = match get_measurement_events().await {
+			let measurement_events = match get_measurement_events(None, None).await {
 				Some(m) => m,
 				None => {
-					println!("no measurement events");
+					println!("no measurement events...");
 					pause().await;
 					continue 'app;
 				}
 			};
+
 			println!("number of measurements: {}", measurement_events.len());
 
-			// start timer
-			let start = std::time::Instant::now();
-			println!("processing batches...");
+			let measurement_events = match get_batch_lengths_for_events(measurement_events).await {
+				Ok(measurement_events) => measurement_events,
+				Err(e) => panic!("Error: Failed to get batch lengths for events: {}", e),
+			};
+			let measurement_events_arc = Arc::new(Mutex::new(measurement_events.clone()));
 
-			'events: for event in measurement_events.iter() {
-				// set defaults for batch
-				let length = BatchLength::TenSeconds;
+			let pool = ThreadPool::with_name("process events thread".into(), 100);
 
-				// create batch
-				let key = event.0;
-				let event = &event.1;
-				let mut batch = Batch::new(event.bucket.clone(), length, false);
-				let start = event.key.clone() - (batch.size().await / BigDecimal::from(2));
-				let end = event.key.clone() + (batch.size().await / BigDecimal::from(2));
-				let interpolation = "linear".to_string();
-				let interpolation_steps = batch.size().await;
-
-				// get measurements
-				let measurements = match get_measurements(&batch.measurement_bucket, start, end, &interpolation, interpolation_steps.clone(), &batch).await {
-					Ok(m) => m,
-					Err(e) => {
-						println!("error: getting measurements for batch: {}", e);
-						continue 'events;
-					}
+			pool.execute(move || {
+				let rt = match tokio::runtime::Runtime::new() {
+					Ok(rt) => rt,
+					Err(_) => panic!("Error: Faild to create new runtime."),
 				};
+				let i = Arc::new(Mutex::new(0));
+				let measurement_events_arc = match measurement_events_arc.lock() {
+					Ok(measurement_events_arc) => measurement_events_arc,
+					Err(e) => panic!("Error: Failed to lock measurement events arc: {}", e),
+				};
+				measurement_events_arc.par_iter().for_each(|event| {
+					// start timer
+					let start = std::time::Instant::now();
 
-                                if measurements.len() < interpolation_steps.to_u64().unwrap() as usize {
-                                        println!("error: not enough measurements for batch");
-                                        continue 'events;
-                                }
+					let (event_id, event, lengths) = event.clone();
 
-				// add measurements to batch
-				batch.add_measurements(measurements).await;
+					let event_id = Arc::new(Mutex::new(event_id));
+					let lengths = lengths;
+					let event = Arc::new(Mutex::new(event));
 
-				// process batch
-				batch.calculate_measurement_distances().await.unwrap();
-				batch.vector_leveling().await.unwrap();
-				batch.origin_transformation().await.unwrap();
-				batch.simplify_transformation().await.unwrap();
-				batch.calculate_relative_movements().await.unwrap();
-				batch.finish().await;
+					let mut lgths_handles = Vec::new();
+					for length in lengths {
+						let event_id = event_id.clone();
+						let event = event.clone();
+						lgths_handles.push(thread::spawn(async move || {
+							let length = length;
+							let event = match event.lock() {
+								Ok(event) => event.clone(),
+								Err(e) => panic!("Error: Failed to lock event: {}", e),
+							};
+							let event_id = match event_id.lock() {
+								Ok(id) => *id,
+								Err(e) => panic!("Error: Faild to lock event_id: {}", e),
+							};
 
-				//println!("batch: {}", batch.uuid);
+							if let Err(e) = process_batch(length, event.clone()).await {
+								println!("error: processing batch for measurement event {}: {}", event_id, e);
+							}
+						}));
+					}
 
-				// delete measurement event
-				if let Err(e) = delete_measurement_event(&key.to_string()).await {
-					println!("error: deleting measurement event {}: {}", key, e);
-					pause().await;
-					continue 'events;
-				}
+					let handles = lgths_handles
+						.drain(..)
+						.map(|h| match h.join() {
+							Ok(h) => h,
+							Err(e) => panic!("Faild to join thread: {:?}", e),
+						})
+						.collect::<Vec<_>>();
 
-				// add batch to bucket
-				if let Err(e) = save_batch(&batch).await {
-					println!("error: saving batch {}: {}", batch.uuid, e);
-					pause().await;
-					continue 'events;
-				}
-			}
+					rt.block_on(join_all(handles));
 
-			let duration = start.elapsed();
-			println!("Batch processing: {}s", duration.as_secs_f64());
+					let event_id = match event_id.lock() {
+						Ok(id) => *id,
+						Err(e) => panic!("Error: Faild to lock event_id: {}", e),
+					};
+					if let Err(e) = rt.block_on(delete_measurement_event(&event_id.to_string())) {
+						println!("error: deleting measurement event {}: {}", event_id, e);
+					}
 
-			sleep(Duration::from_secs(1)).await;
+					// stop timer
+					let mut i = match i.lock() {
+						Ok(i) => i,
+						Err(e) => panic!("Error: Failed to lock i: {}", e),
+					};
+					let duration = start.elapsed();
+					println!("Successfully processed measurement event {} in {}ms", i, duration.as_millis());
+
+					*i += 1;
+				});
+
+				drop(rt);
+			});
+
+			pool.join();
+
+			pause().await;
 		}
 	});
 
@@ -117,74 +160,83 @@ async fn main() {
 /// get measurement events from bucket
 /// returns a vector of tuples containing the key and the measurement event
 /// returns only events of measurement_add type
-pub async fn get_measurement_events() -> Option<Vec<(Uuid, MeasurementEvent)>> {
+pub async fn get_measurement_events(page: Option<usize>, count: Option<usize>) -> Option<Vec<(Uuid, MeasurementEvent)>> {
+	let config = match Configuration::open("../dsm.toml").await {
+		Ok(config) => config,
+		Err(e) => panic!("Error: Failed to open configuration file: {}", e),
+	};
 	let client = reqwest::Client::new();
-	let url = "http://127.0.0.1:8515/bucket/measurement_event";
+
+	let event_bucket = "measurement_event";
+	let host = config.dsm.database.host;
+	let port = config.dsm.database.port;
+
+	let mut url = format!("http://{host}:{port}/bucket/{event_bucket}");
+
+	if page.is_some() && count.is_some() {
+		let page = page.unwrap_or(1);
+		let count = count.unwrap_or(1);
+		url = format!("http://{host}:{port}/bucket/{event_bucket}?page={page}&count={count}");
+	}
+
 	let res = client.get(url).send().await;
 
-	match res {
+	let res = match res {
 		Ok(res) => {
 			if res.status() != 200 {
-				println!("Error retrieving measurement events: {}", res.status());
 				return None;
 			}
-			match res.json::<Value>().await {
-				Ok(body) => {
-					let events: Vec<Value> = match serde_json::from_value(body["value"].clone()) {
-						Ok(events) => events,
-						Err(_) => {
-							println!("No events found..");
-							return None;
-						}
-					};
-					let events: Vec<(Uuid, MeasurementEvent)> = events
-						.iter()
-						.map(|event| {
-							let e = serde_json::from_value(event["value"].clone()).unwrap();
-							let u = serde_json::from_value(event["key"].clone()).unwrap();
-							(u, e)
-						})
-						.collect();
-
-					let mut add_events = Vec::new();
-					events.iter().for_each(|event| {
-						if event.1.event_type == "measurement_add" {
-							add_events.push(event.clone());
-						}
-					});
-
-					if add_events.is_empty() {
-						return None;
-					}
-
-					Some(add_events)
-				}
-				Err(err) => {
-					println!("Error parsing response body: {}", err);
-					None
-				}
-			}
+			res
 		}
-		Err(err) => {
-			println!("Error: {}", err);
-			None
+		Err(_) => return None,
+	};
+
+	let body = match res.json::<Value>().await {
+		Ok(body) => body,
+		Err(_) => return None,
+	};
+
+	let events: Vec<Value> = match serde_json::from_value(body["value"].clone()) {
+		Ok(events) => events,
+		Err(_) => return None,
+	};
+
+	let events: Vec<(Uuid, MeasurementEvent)> = events
+		.iter()
+		.map(|event| {
+			let e = match serde_json::from_value(event["value"].clone()) {
+				Ok(e) => e,
+				Err(e) => panic!("Error: Failed to deserialize event: {}", e),
+			};
+			let u = match serde_json::from_value(event["key"].clone()) {
+				Ok(u) => u,
+				Err(e) => panic!("Error: Failed to deserialize event key: {}", e),
+			};
+			(u, e)
+		})
+		.collect();
+
+	let mut add_events = Vec::new();
+	events.iter().for_each(|event| {
+		if event.1.event_type == "measurement_add" {
+			add_events.push(event.clone());
 		}
+	});
+
+	if add_events.is_empty() {
+		return None;
 	}
+
+	Some(add_events)
 }
 
 async fn pause() {
 	sleep(Duration::from_secs(1)).await;
 }
 
-async fn measurements_from_add_events(events: Vec<Value>, batch: &Batch) -> Result<Vec<Measurement>, String> {
+async fn measurements_from_add_events(events: Vec<Value>) -> Result<Vec<Measurement>, String> {
 	let mut measurements = Vec::new();
 	for value in events.iter() {
-		let source = match value["tags"]["source"].as_str() {
-			Some(s) => s,
-			None => batch.measurement_bucket.as_str(),
-		};
-		let numerator_asset = batch.numerator_asset().await;
-		let denominator_asset = batch.denominator_asset().await;
 		let uuid = match value["tags"]["uuid"].as_str() {
 			Some(s) => match Uuid::parse_str(s) {
 				Ok(u) => u,
@@ -206,7 +258,7 @@ async fn measurements_from_add_events(events: Vec<Value>, batch: &Batch) -> Resu
 			},
 			None => return Err("no value".to_string()),
 		};
-		let measurement = Measurement::new(source, &numerator_asset, &denominator_asset, uuid, timestamp, value);
+		let measurement = Measurement::new(uuid, timestamp, value);
 		measurements.push(measurement);
 	}
 	if measurements.is_empty() {
@@ -215,9 +267,9 @@ async fn measurements_from_add_events(events: Vec<Value>, batch: &Batch) -> Resu
 	Ok(measurements)
 }
 
-async fn get_measurements(bucket: &str, start: BigDecimal, end: BigDecimal, interpolation: &str, take: BigDecimal, batch: &Batch) -> Result<Vec<Measurement>, String> {
+async fn get_measurements(bucket: &str, start: BigDecimal, end: BigDecimal, interpolation: &str, take: BigDecimal) -> Result<Vec<Measurement>, String> {
 	let client = reqwest::Client::new();
-	let url = format!("http://127.0.0.1:8515/bucket/{}?range[1]={}&range[2]={}&interpolation={}&take={}", bucket, start, end, interpolation, take);
+	let url = format!("http://127.0.0.1:8515/bucket/{bucket}?range[1]={start}&range[2]={end}&interpolation={interpolation}&take={take}");
 	//println!("batch url: {}", url);
 	let res = client.get(&url).send().await;
 	let measurements = match res {
@@ -230,7 +282,7 @@ async fn get_measurements(bucket: &str, start: BigDecimal, end: BigDecimal, inte
 				Ok(v) => v,
 				Err(e) => return Err(format!("error: getting measurements for batch: url: {} :: {}", url, e)),
 			};
-			match measurements_from_add_events(values, batch).await {
+			match measurements_from_add_events(values).await {
 				Ok(m) => m,
 				Err(e) => return Err(format!("error: getting measurements for batch: url: {} :: {}", url, e)),
 			}
@@ -259,38 +311,42 @@ pub async fn delete_measurement_event(key: &str) -> Result<(), String> {
 async fn save_batch(batch: &Batch) -> Result<(), String> {
 	let client = reqwest::Client::new();
 	let bucket = "batch";
-	let source = batch.measurements.clone().expect("No measurements found.").0.get(&BigUint::from(0_u8)).unwrap().source.clone();
 	let uuid = batch.uuid;
-	let start = batch.start_timestamp().await.unwrap();
-	let end = batch.end_timestamp().await.unwrap();
+	let start = match batch.start_timestamp().await {
+		Some(s) => s,
+		None => return Err(format!("error: getting start timestamp for batch: {uuid}")),
+	};
+	let end = match batch.end_timestamp().await {
+		Some(e) => e,
+		None => return Err(format!("error: getting end timestamp for batch: {uuid}")),
+	};
 	let locations = batch.relative_x_movements.clone().expect("no x movements");
 	let amplitudes = batch.relative_y_movements.clone().expect("no y movements");
 	let length = batch.length.clone().to_string();
-	let measurement_bucket = batch.measurement_bucket.clone();
+	let dataset_name = batch.dataset_name.clone();
 
 	let locations: HashMap<String, BigDecimal> = locations.0.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
 	let amplitudes: HashMap<String, BigDecimal> = amplitudes.0.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
 
 	let body = json!({
-			"source": source,
 			"start": start,
 			"end": end,
 			"locations": locations,
 			"amplitudes": amplitudes,
 			"length": length,
-			"measurement_bucket": measurement_bucket,
+			"dataset_name": dataset_name,
 	});
 
 	// create bucket
-	let url = format!("http://127.0.0.1:8515/bucket?name={}&type=object", bucket);
-	let res = client.post(url).send().await;
+	let url = format!("http://127.0.0.1:8515/bucket?name={bucket}&type=object");
+	let res = client.post(url.clone()).send().await;
 	match res {
 		Ok(_) => {}
-		Err(err) => return Err(format!("Error creating bucket: {}", err)),
+		Err(err) => return Err(format!("Error creating bucket: {err}")),
 	}
 
 	// add object to bucket
-	let url = format!("http://127.0.0.1:8515/bucket/{}?key={}", bucket, uuid);
+	let url = format!("http://127.0.0.1:8515/bucket/{bucket}?key={uuid}");
 	let res = client.post(url).json(&body).send().await;
 
 	match res {
@@ -300,6 +356,104 @@ async fn save_batch(batch: &Batch) -> Result<(), String> {
 			}
 			Ok(())
 		}
-		Err(err) => Err(format!("Error adding object to bucket: {}", err)),
+		Err(err) => Err(format!("Error adding object to bucket: {err}")),
 	}
+}
+
+async fn get_batch_lengths_for_events(measurement_events: Vec<(Uuid, MeasurementEvent)>) -> Result<Vec<(Uuid, MeasurementEvent, Vec<dsm_config::BatchLength>)>, String> {
+	let config = match Configuration::open("../dsm.toml").await {
+		Ok(c) => c,
+		Err(e) => return Err(format!("error: opening config: {}", e)),
+	};
+	let mut batch_lengths: Vec<(Uuid, MeasurementEvent, Vec<dsm_config::BatchLength>)> = Vec::new();
+	for (uuid, event) in measurement_events {
+		let dataset_name = match event.dataset_name.clone() {
+			Some(d) => d,
+			None => return Err(format!("error: getting dataset name for event: {uuid}")),
+		};
+		let dataset = match config.get_dataset(&dataset_name) {
+			Ok(d) => d,
+			Err(e) => return Err(format!("error: getting dataset: {e}")),
+		};
+
+		let min_length: usize = dataset.minimum_batch_length.into();
+		let max_length: usize = dataset.maximum_batch_length.into();
+
+                let mut lengths = dsm_config::BatchLength::range(min_length, max_length);
+                lengths.push(dataset.minimum_batch_length);
+                lengths.push(dataset.maximum_batch_length);
+
+		batch_lengths.push((uuid, event, lengths));
+	}
+	Ok(batch_lengths)
+}
+
+async fn process_batch(length: BatchLength, event: MeasurementEvent) -> Result<(), String> {
+        
+	let dataset_name = match event.dataset_name {
+		Some(d) => d,
+		None => return Err(format!("error: getting dataset name for event.")),
+	};
+	let mut batch = Batch::new(dataset_name, length.to_owned(), false);
+	let start = event.key.clone() - (batch.size().await / BigDecimal::from(2));
+	let end = event.key.clone() + (batch.size().await / BigDecimal::from(2));
+	let interpolation = "linear".to_string();
+	let interpolation_steps = batch.interval().await;
+
+	//println!("event: {:?}, start: {:?}, end: {:?}", event.key, start, end);
+	//println!("batch size: {:?}, batch steps: {:?} :: interpolation_steps: {}", batch.length, batch.interpolation().await, interpolation_steps);
+
+	// get measurements
+	let measurements = match get_measurements(&batch.dataset_name, start, end, &interpolation, interpolation_steps.clone()).await {
+		Ok(v) => v,
+		Err(e) => return Err(format!("error: getting measurements for batch: url: {} :: {}", batch.dataset_name, e)),
+	};
+
+	let interpolation_steps_usize = match interpolation_steps.to_u64() {
+		Some(v) => v as usize,
+		None => return Err("error: interpolation_steps.to_u64()".to_string()),
+	};
+
+	if measurements.len() < interpolation_steps_usize {
+		//println!("error: not enough measurements for batch");
+		return Err("Not enough measurements for batch.".to_string());
+	}
+
+	// add measurements to batch
+	batch.add_measurements(measurements).await;
+
+	// process batch
+	match batch.calculate_measurement_distances().await {
+		Ok(_) => {}
+		Err(e) => return Err(format!("error: calculating measurement distances: {}", e)),
+	};
+
+	match batch.vector_leveling().await {
+		Ok(_) => {}
+		Err(e) => return Err(format!("error: vector leveling: {}", e)),
+	};
+
+	match batch.origin_transformation().await {
+		Ok(_) => {}
+		Err(e) => return Err(format!("error: origin transformation: {}", e)),
+	};
+
+	match batch.simplify_transformation().await {
+		Ok(_) => {}
+		Err(e) => return Err(format!("error: simplify transformation: {}", e)),
+	};
+
+	match batch.calculate_relative_movements().await {
+		Ok(_) => {}
+		Err(e) => return Err(format!("error: calculating relative movements: {}", e)),
+	};
+
+	batch.finish().await;
+
+	// add batch to bucket
+	if let Err(e) = save_batch(&batch).await {
+		return Err(format!("error: saving batch {}: {}", batch.uuid, e));
+	}
+
+	Ok(())
 }
