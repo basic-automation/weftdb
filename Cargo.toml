@@ -18,6 +18,8 @@ uuid = { version="*", features=["v4", "fast-rng", "macro-diagnostics", "serde"] 
 bigdecimal = { version="*", features=["serde"] }
 dsm_config = { path = "../dsm-config" }
 rayon = "*"
+lazy_static = "*"
+rand = "*"
 
 
 [profile.release]
