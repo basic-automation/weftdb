@@ -5,13 +5,13 @@ use dsm_log::Log;
 use dsm_measurement::Measurement;
 use num_bigint::BigUint;
 //use rayon::prelude::*;
+use dsm_config::ToMilliseconds;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
-use dsm_config::ToMilliseconds;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Measurements(pub HashMap<BigUint, Measurement>);
@@ -50,6 +50,7 @@ pub struct Batch {
 	pub measurements: Option<Measurements>,
 	pub length: BatchLength,
 	pub dataset_name: String,
+	pub source: String,
 	pub uuid: Uuid,
 	pub relative_x_movements: Option<Movements>,
 	pub relative_y_movements: Option<Movements>,
@@ -58,7 +59,7 @@ pub struct Batch {
 }
 
 impl Batch {
-	pub fn new(dataset_name: String, length: BatchLength, log: bool) -> Self {
+	pub fn new(source: String, dataset_name: String, length: BatchLength, log: bool) -> Self {
 		let id = Uuid::new_v4();
 
 		//log
@@ -68,7 +69,7 @@ impl Batch {
 			logs.log("1: Created", &json!("batch created"));
 		}
 
-		Self { measurements: None, length, dataset_name, uuid: id, relative_x_movements: None, relative_y_movements: None, logs, is_logging: log }
+		Self { measurements: None, length, dataset_name, source, uuid: id, relative_x_movements: None, relative_y_movements: None, logs, is_logging: log }
 	}
 
 	/// size = number of seconds in batch
@@ -393,15 +394,14 @@ impl Batch {
 			let locations_amplitudes: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
 			self.measurements.as_ref().unwrap().0.iter().for_each(|measurement| {
 				if let Some(location) = &measurement.1.location {
-                                        if let Some(amplitude) = &measurement.1.amplitude {
-        					let mut locations_amplitudes = locations_amplitudes.lock().unwrap();
-                                                let location_amplitude = format!("location: {}, amplitude: {}", location, amplitude);
-        					locations_amplitudes.insert(measurement.0.clone().to_string(), location_amplitude);
-                                        }
+					if let Some(amplitude) = &measurement.1.amplitude {
+						let mut locations_amplitudes = locations_amplitudes.lock().unwrap();
+						let location_amplitude = format!("location: {}, amplitude: {}", location, amplitude);
+						locations_amplitudes.insert(measurement.0.clone().to_string(), location_amplitude);
+					}
 				}
 			});
 
-                        
 			self.logs.log("2: BATCH begin calculate distances locations:", &json!(*locations_amplitudes.lock().unwrap()));
 		}
 		// end logs
@@ -788,8 +788,8 @@ impl Batch {
 		if self.is_logging {
 			self.logs.log("finish", &json!(""));
 
-                        // save log
-		        let _ = self.logs.save("batch").await;
+			// save log
+			let _ = self.logs.save("batch").await;
 		}
 	}
 }

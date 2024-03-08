@@ -2,7 +2,6 @@ use bigdecimal::BigDecimal;
 use dsm_config::{BatchLength, ToMilliseconds};
 use serde::{Deserialize, Serialize};
 
-
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Copy, Eq)]
 pub enum Interpolation {
 	None,

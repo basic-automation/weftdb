@@ -193,6 +193,7 @@ name = "dsm_config"
 version = "0.1.0"
 dependencies = [
  "bigdecimal",
+ "num-bigint",
  "serde",
  "tokio",
  "toml",
