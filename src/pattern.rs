@@ -1,6 +1,7 @@
 use super::Occurrence;
-use crate::{Interpolation, VariabilityType};
+//use crate::{Interpolation, VariabilityType};
 use bigdecimal::BigDecimal;
+use dsm_config::{DatasetPatternsContraintsVariabilityType, Interpolation};
 use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -19,7 +20,7 @@ pub struct Pattern {
 	pub locations: HashMap<BigUint, BigDecimal>,
 	#[serde_as(as = "HashMap<DisplayFromStr, _>")]
 	pub amplitudes: HashMap<BigUint, BigDecimal>,
-	pub merged_patterns: Option<Vec<Uuid>>,
+	//pub merged_patterns: Option<Vec<Uuid>>,
 }
 
 impl Pattern {
@@ -27,13 +28,13 @@ impl Pattern {
 		for (_, occurrence) in pattern.occurrences.iter() {
 			self.occurrences.insert(self.occurrences.len().into(), occurrence.clone());
 		}
-		let mut merged_patterns = self.merged_patterns.clone().unwrap_or_default();
-		merged_patterns.push(pattern.id);
-		self.merged_patterns = Some(merged_patterns);
-                self.clone()
+		//let mut merged_patterns = self.merged_patterns.clone().unwrap_or_default();
+		//merged_patterns.push(pattern.id);
+		//self.merged_patterns = Some(merged_patterns);
+		self.clone()
 	}
 
-	pub async fn enforce_steps(&mut self, take: f64, interpolation: Interpolation) -> Self {
+	pub async fn enforce_steps(&mut self, take: BigDecimal, interpolation: Interpolation) -> Self {
 		// create bucket
 		let client = reqwest::Client::new();
 		let encoded_id = encode(&self.id.to_string()).to_string();
@@ -55,7 +56,7 @@ impl Pattern {
 		};
 
 		let url = format!("http://127.0.0.1:8515/bucket/{}?interpolation={}&take={}", bucket.name, interpolation, take);
-		println!("url: {}", url);
+		//println!("url: {}", url);
 		let res = client.get(&url).send().await.unwrap();
 		match res.json::<Value>().await {
 			Ok(data) => {
@@ -80,7 +81,7 @@ impl Pattern {
 		self.clone()
 	}
 
-	pub async fn static_variability(&self, compare_pattern: &Pattern, type_: &VariabilityType) -> BigDecimal {
+	pub async fn static_variability(&self, compare_pattern: &Pattern, type_: &DatasetPatternsContraintsVariabilityType) -> BigDecimal {
 		let mut variability: Vec<BigDecimal> = Vec::new();
 		if self.amplitudes.len() == compare_pattern.amplitudes.len() {
 			for (index, amplitude) in self.amplitudes.iter() {
@@ -91,18 +92,18 @@ impl Pattern {
 		}
 
 		match type_ {
-			VariabilityType::MaxVariability => {
+			DatasetPatternsContraintsVariabilityType::Max => {
 				variability.sort();
 				variability.last().unwrap().clone()
 			}
-			VariabilityType::AverageVariability => {
+			DatasetPatternsContraintsVariabilityType::Average => {
 				let mut sum = BigDecimal::from(0);
 				for value in &variability {
 					sum += value;
 				}
 				sum / BigDecimal::from(variability.len() as u64)
 			}
-			VariabilityType::SumVariability => {
+			DatasetPatternsContraintsVariabilityType::Sum => {
 				let mut sum = BigDecimal::from(0);
 				for value in variability {
 					sum += value;
@@ -115,7 +116,7 @@ impl Pattern {
 	///If Max-Vairability type is set, the two patterns will be deemed the same if the difference between the absolute value of any of the congruent Amplitudes is less than the AbsoluteStaticVariability.Value.
 	/// If Average-Variability type is set, the two patterns will be deemed the same if the average of all of the differences between the absolute value of the congruent Amplitudes is less than AbsoluteStaticVariability.Value.
 	/// If Sum-Variability type is set, the two patterns will be deemed the same if the sum of all of the differences between the absolute value of the congruent Amplitudes is less than AbsoluteStaticVariability.Value.
-	pub async fn absolute_static_variability(&self, compare_pattern: &Pattern, type_: &VariabilityType) -> BigDecimal {
+	pub async fn absolute_static_variability(&self, compare_pattern: &Pattern, type_: &DatasetPatternsContraintsVariabilityType) -> BigDecimal {
 		let mut variability: Vec<BigDecimal> = Vec::new();
 		if self.amplitudes.len() == compare_pattern.amplitudes.len() {
 			for (index, amplitude) in self.amplitudes.iter() {
@@ -126,18 +127,18 @@ impl Pattern {
 		}
 
 		match type_ {
-			VariabilityType::MaxVariability => {
+			DatasetPatternsContraintsVariabilityType::Max => {
 				variability.sort();
 				variability.last().unwrap().clone()
 			}
-			VariabilityType::AverageVariability => {
+			DatasetPatternsContraintsVariabilityType::Average => {
 				let mut sum = BigDecimal::from(0);
 				for value in &variability {
 					sum += value;
 				}
 				sum / BigDecimal::from(variability.len() as u64)
 			}
-			VariabilityType::SumVariability => {
+			DatasetPatternsContraintsVariabilityType::Sum => {
 				let mut sum = BigDecimal::from(0);
 				for value in variability {
 					sum += value;
@@ -147,11 +148,12 @@ impl Pattern {
 		}
 	}
 
-	pub async fn percentage_variability(&self, compare_pattern: &Pattern, type_: &VariabilityType) -> BigDecimal {
+	pub async fn percentage_variability(&self, compare_pattern: &Pattern, type_: &DatasetPatternsContraintsVariabilityType) -> BigDecimal {
 		let mut variability: Vec<BigDecimal> = Vec::new();
 		if self.amplitudes.len() == compare_pattern.amplitudes.len() {
 			for (index, amplitude) in self.amplitudes.iter() {
 				let compare_amplitude = compare_pattern.amplitudes.get(index).unwrap();
+				//println!("amplitude: {}, compare_amplitude: {}", amplitude, compare_amplitude);
 				let numerator = (amplitude - compare_amplitude).abs();
 				let denominator = (amplitude + compare_amplitude) / BigDecimal::from(2);
 				if denominator == BigDecimal::from(0) {
@@ -164,18 +166,23 @@ impl Pattern {
 		}
 
 		match type_ {
-			VariabilityType::MaxVariability => {
+			DatasetPatternsContraintsVariabilityType::Max => {
 				variability.sort();
 				variability.last().unwrap().clone()
 			}
-			VariabilityType::AverageVariability => {
+			DatasetPatternsContraintsVariabilityType::Average => {
 				let mut sum = BigDecimal::from(0);
 				for value in &variability {
 					sum += value;
 				}
+				let denominator = BigDecimal::from(variability.len() as u64);
+				if denominator == BigDecimal::from(0) {
+					return BigDecimal::from(0);
+				}
+
 				sum / BigDecimal::from(variability.len() as u64)
 			}
-			VariabilityType::SumVariability => {
+			DatasetPatternsContraintsVariabilityType::Sum => {
 				let mut sum = BigDecimal::from(0);
 				for value in variability {
 					sum += value;
@@ -185,7 +192,7 @@ impl Pattern {
 		}
 	}
 
-	pub async fn absolute_percentage_variability(&self, compare_pattern: &Pattern, type_: &VariabilityType) -> BigDecimal {
+	pub async fn absolute_percentage_variability(&self, compare_pattern: &Pattern, type_: &DatasetPatternsContraintsVariabilityType) -> BigDecimal {
 		let mut variability: Vec<BigDecimal> = Vec::new();
 		if self.amplitudes.len() == compare_pattern.amplitudes.len() {
 			for (index, amplitude) in self.amplitudes.iter() {
@@ -202,18 +209,18 @@ impl Pattern {
 		}
 
 		match type_ {
-			VariabilityType::MaxVariability => {
+			DatasetPatternsContraintsVariabilityType::Max => {
 				variability.sort();
 				variability.last().unwrap().clone()
 			}
-			VariabilityType::AverageVariability => {
+			DatasetPatternsContraintsVariabilityType::Average => {
 				let mut sum = BigDecimal::from(0);
 				for value in &variability {
 					sum += value;
 				}
 				sum / BigDecimal::from(variability.len() as u64)
 			}
-			VariabilityType::SumVariability => {
+			DatasetPatternsContraintsVariabilityType::Sum => {
 				let mut sum = BigDecimal::from(0);
 				for value in variability {
 					sum += value;

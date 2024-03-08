@@ -14,8 +14,11 @@ serde_json = "*"
 num-bigint = {version="*", features=["serde"]}
 dsm_log = {path = "../dsm-log"}
 urlencoding = "*"
-#rayon = "1"
 serde_with = "*"
+dsm_config = {path = "../dsm-config"}
+tokio = { version = "*", features=["full"] }
+threadpool = "*"
+rayon = "*"
 
 
 [profile.release]

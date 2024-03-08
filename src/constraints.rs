@@ -1,7 +1,11 @@
-use bigdecimal::BigDecimal;
+/* use bigdecimal::BigDecimal;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter, Result};
 use std::str::FromStr;
+
+pub trait ToConstraint {
+        fn to_constraint(&self) -> Constraints;
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Constraints {
@@ -17,6 +21,10 @@ pub enum Interpolation {
 	Linear,
 }
 
+pub trait ToConstraintInterpolation {
+        fn to_constraint_interpolation(&self) -> Interpolation;
+}
+
 impl Display for Interpolation {
 	fn fmt(&self, f: &mut Formatter<'_>) -> Result {
 		match self {
@@ -30,6 +38,10 @@ pub struct Steps {
 	pub is_enforced: bool,
 	pub interpolation: Interpolation,
 	pub count: u64,
+}
+
+pub trait ToConstraintSteps {
+        fn to_constraint_steps(&self) -> Steps;
 }
 
 impl Default for Steps {
@@ -130,6 +142,10 @@ pub struct Occurrences {
 	pub distance: OccurrenceDistance,
 }
 
+pub trait ToConstraintOccurrence {
+        fn to_constraint_occurrence(&self) -> Occurrences;
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OccurrenceDistance {
 	pub enforced: bool,
@@ -141,3 +157,4 @@ impl Default for OccurrenceDistance {
 		OccurrenceDistance { enforced: true, value: BigDecimal::from(1) }
 	}
 }
+ */
