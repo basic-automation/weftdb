@@ -5,21 +5,24 @@ use core::net::SocketAddr;
 use dsm_batch::Batch;
 use dsm_config::BatchLength;
 use dsm_config::Configuration;
+use dsm_config::DatasetConfiguration;
 use dsm_measurement::{Measurement, MeasurementEvent};
 use futures::future::join_all;
+use rand::Rng;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
+use reqwest::Client;
 use router::*;
 use serde_json::{json, Value};
+use std::env;
 use std::str::FromStr;
 use std::sync::Mutex;
 use std::thread;
 use std::{collections::HashMap, sync::Arc};
 use threadpool::ThreadPool;
+use tokio::sync::Mutex as TokMutex;
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
-
-use std::env;
 
 mod router;
 
@@ -27,6 +30,8 @@ mod router;
 async fn main() {
 	// set RUST_BACKTRACE=1
 	env::set_var("RUST_BACKTRACE", "full");
+	// soft limit for number of simultaneous http connections
+	let client_pool = get_client_pool(1000).await;
 
 	let server = thread::spawn(async move || {
 		println!("server running...");
@@ -54,7 +59,8 @@ async fn main() {
 	let app = thread::spawn(async move || {
 		println!("app running...");
 		'app: loop {
-			let measurement_events = match get_measurement_events(None, None).await {
+			let client_pool = Arc::clone(&client_pool);
+			let measurement_events = match get_measurement_events(Arc::clone(&client_pool), None, None).await {
 				Some(m) => m,
 				None => {
 					println!("no measurement events...");
@@ -64,14 +70,9 @@ async fn main() {
 			};
 
 			println!("number of measurements: {}", measurement_events.len());
-
-			let measurement_events = match get_batch_lengths_for_events(measurement_events).await {
-				Ok(measurement_events) => measurement_events,
-				Err(e) => panic!("Error: Failed to get batch lengths for events: {}", e),
-			};
 			let measurement_events_arc = Arc::new(Mutex::new(measurement_events.clone()));
 
-			let pool = ThreadPool::with_name("process events thread".into(), 100);
+			let pool = ThreadPool::with_name("process events thread".into(), 1000);
 
 			pool.execute(move || {
 				let rt = match tokio::runtime::Runtime::new() {
@@ -79,70 +80,64 @@ async fn main() {
 					Err(_) => panic!("Error: Faild to create new runtime."),
 				};
 				let i = Arc::new(Mutex::new(0));
-				let measurement_events_arc = match measurement_events_arc.lock() {
-					Ok(measurement_events_arc) => measurement_events_arc,
-					Err(e) => panic!("Error: Failed to lock measurement events arc: {}", e),
-				};
-				measurement_events_arc.par_iter().for_each(|event| {
+				let client_pool = Arc::clone(&client_pool);
+				let measurement_events_arc = measurement_events_arc.lock().unwrap();
+				measurement_events_arc.par_iter().for_each(|intermediate_event| {
 					// start timer
 					let start = std::time::Instant::now();
 
-					let (event_id, event, lengths) = event.clone();
+					let intermediate_event = intermediate_event.clone();
 
-					let event_id = Arc::new(Mutex::new(event_id));
-					let lengths = lengths;
-					let event = Arc::new(Mutex::new(event));
+					for dataset in intermediate_event.datasets {
+						let event_id = Arc::new(Mutex::new(intermediate_event.event_id));
+						let lengths = dataset.batch_lengths;
+						let event = Arc::new(Mutex::new(intermediate_event.event.clone()));
+						let client_pool = Arc::clone(&client_pool);
+						let dataset_name = dataset.dataset_name.clone();
 
-					let mut lgths_handles = Vec::new();
-					for length in lengths {
-						let event_id = event_id.clone();
-						let event = event.clone();
-						lgths_handles.push(thread::spawn(async move || {
-							let length = length;
-							let event = match event.lock() {
-								Ok(event) => event.clone(),
-								Err(e) => panic!("Error: Failed to lock event: {}", e),
-							};
-							let event_id = match event_id.lock() {
-								Ok(id) => *id,
-								Err(e) => panic!("Error: Faild to lock event_id: {}", e),
-							};
+						let mut lgths_handles = Vec::new();
+						for length in lengths {
+							let event = Arc::clone(&event);
+							let client_pool = Arc::clone(&client_pool);
+							let dataset_name = dataset_name.clone();
+							//let dataset_config = dataset_config.clone();
+							lgths_handles.push(thread::spawn(async move || {
+								let length = length;
+								let event = Arc::clone(&event);
+								let client_pool = Arc::clone(&client_pool);
+								let dataset_name = dataset_name.clone();
 
-							if let Err(e) = process_batch(length, event.clone()).await {
-								println!("error: processing batch for measurement event {}: {}", event_id, e);
-							}
-						}));
+								if let Err(e) = process_batch(client_pool, length, event, dataset_name).await {
+									println!("error: processing batch for measurement event: {}", e);
+								}
+							}));
+						}
+
+						let handles = lgths_handles
+							.drain(..)
+							.map(|h| match h.join() {
+								Ok(h) => h,
+								Err(e) => panic!("Faild to join thread: {:?}", e),
+							})
+							.collect::<Vec<_>>();
+
+						rt.block_on(join_all(handles));
+
+						let event_id = event_id.lock().unwrap();
+						if let Err(e) = rt.block_on(delete_measurement_event(Arc::clone(&client_pool), &event_id.to_string())) {
+							println!("error: deleting measurement event {}: {}", event_id, e);
+						}
+						drop(event_id);
+
+						// stop timer
+						let mut i = i.lock().unwrap();
+						let duration = start.elapsed();
+						println!("Successfully processed measurement event {} in {}ms", i, duration.as_millis());
+						*i += 1;
+						drop(i);
 					}
-
-					let handles = lgths_handles
-						.drain(..)
-						.map(|h| match h.join() {
-							Ok(h) => h,
-							Err(e) => panic!("Faild to join thread: {:?}", e),
-						})
-						.collect::<Vec<_>>();
-
-					rt.block_on(join_all(handles));
-
-					let event_id = match event_id.lock() {
-						Ok(id) => *id,
-						Err(e) => panic!("Error: Faild to lock event_id: {}", e),
-					};
-					if let Err(e) = rt.block_on(delete_measurement_event(&event_id.to_string())) {
-						println!("error: deleting measurement event {}: {}", event_id, e);
-					}
-
-					// stop timer
-					let mut i = match i.lock() {
-						Ok(i) => i,
-						Err(e) => panic!("Error: Failed to lock i: {}", e),
-					};
-					let duration = start.elapsed();
-					println!("Successfully processed measurement event {} in {}ms", i, duration.as_millis());
-
-					*i += 1;
 				});
-
+				drop(measurement_events_arc);
 				drop(rt);
 			});
 
@@ -160,15 +155,14 @@ async fn main() {
 /// get measurement events from bucket
 /// returns a vector of tuples containing the key and the measurement event
 /// returns only events of measurement_add type
-pub async fn get_measurement_events(page: Option<usize>, count: Option<usize>) -> Option<Vec<(Uuid, MeasurementEvent)>> {
+pub async fn get_measurement_events(client_pool: Arc<TokMutex<Vec<Arc<TokMutex<Client>>>>>, page: Option<usize>, count: Option<usize>) -> Option<Vec<IntermediateEvent>> {
 	let config = match Configuration::open("../dsm.toml").await {
 		Ok(config) => config,
 		Err(e) => panic!("Error: Failed to open configuration file: {}", e),
 	};
-	let client = reqwest::Client::new();
-
+	let client = get_client(client_pool).await;
 	let event_bucket = "measurement_event";
-	let host = config.dsm.database.host;
+	let host = config.clone().dsm.database.host;
 	let port = config.dsm.database.port;
 
 	let mut url = format!("http://{host}:{port}/bucket/{event_bucket}");
@@ -178,9 +172,9 @@ pub async fn get_measurement_events(page: Option<usize>, count: Option<usize>) -
 		let count = count.unwrap_or(1);
 		url = format!("http://{host}:{port}/bucket/{event_bucket}?page={page}&count={count}");
 	}
-
-	let res = client.get(url).send().await;
-
+	let local_client = client.lock().await;
+	let res = local_client.get(url).send().await;
+	drop(local_client);
 	let res = match res {
 		Ok(res) => {
 			if res.status() != 200 {
@@ -201,10 +195,10 @@ pub async fn get_measurement_events(page: Option<usize>, count: Option<usize>) -
 		Err(_) => return None,
 	};
 
-	let events: Vec<(Uuid, MeasurementEvent)> = events
+	let events: Vec<IntermediateEvent> = events
 		.iter()
 		.map(|event| {
-			let e = match serde_json::from_value(event["value"].clone()) {
+			let e: MeasurementEvent = match serde_json::from_value(event["value"].clone()) {
 				Ok(e) => e,
 				Err(e) => panic!("Error: Failed to deserialize event: {}", e),
 			};
@@ -212,13 +206,32 @@ pub async fn get_measurement_events(page: Option<usize>, count: Option<usize>) -
 				Ok(u) => u,
 				Err(e) => panic!("Error: Failed to deserialize event key: {}", e),
 			};
-			(u, e)
+			let d = config.get_datasets_with_source(&e.source.clone().unwrap());
+
+			let mut ds = vec![];
+			for (dataset_name, dataset_config) in &d {
+				let min_length: usize = dataset_config.minimum_batch_length.into();
+				let max_length: usize = dataset_config.maximum_batch_length.into();
+
+				let mut lengths = dsm_config::BatchLength::range(min_length, max_length);
+				if !lengths.contains(&dataset_config.minimum_batch_length) {
+					lengths.push(dataset_config.minimum_batch_length);
+				}
+
+				if !lengths.contains(&dataset_config.maximum_batch_length) {
+					lengths.push(dataset_config.maximum_batch_length);
+				}
+
+				ds.push(IntermediateDataset { dataset_name: dataset_name.clone(), dataset_config: dataset_config.clone(), batch_lengths: lengths });
+			}
+
+			IntermediateEvent { event_id: u, event: e, datasets: ds }
 		})
 		.collect();
 
-	let mut add_events = Vec::new();
+	let mut add_events: Vec<IntermediateEvent> = Vec::new();
 	events.iter().for_each(|event| {
-		if event.1.event_type == "measurement_add" {
+		if event.event.event_type == "measurement_add" {
 			add_events.push(event.clone());
 		}
 	});
@@ -267,11 +280,13 @@ async fn measurements_from_add_events(events: Vec<Value>) -> Result<Vec<Measurem
 	Ok(measurements)
 }
 
-async fn get_measurements(bucket: &str, start: BigDecimal, end: BigDecimal, interpolation: &str, take: BigDecimal) -> Result<Vec<Measurement>, String> {
-	let client = reqwest::Client::new();
+async fn get_measurements(client_pool: Arc<TokMutex<Vec<Arc<TokMutex<Client>>>>>, bucket: &str, start: BigDecimal, end: BigDecimal, interpolation: &str, take: BigDecimal) -> Result<Vec<Measurement>, String> {
+	let client = get_client(client_pool).await;
 	let url = format!("http://127.0.0.1:8515/bucket/{bucket}?range[1]={start}&range[2]={end}&interpolation={interpolation}&take={take}");
-	//println!("batch url: {}", url);
-	let res = client.get(&url).send().await;
+
+	let local_client = client.lock().await;
+	let res = local_client.get(&url).send().await;
+	drop(local_client);
 	let measurements = match res {
 		Ok(res) => {
 			let body: Value = match res.json().await {
@@ -289,14 +304,18 @@ async fn get_measurements(bucket: &str, start: BigDecimal, end: BigDecimal, inte
 		}
 		Err(e) => return Err(format!("error: getting measurements for batch: url: {} :: {}", url, e)),
 	};
+
 	Ok(measurements)
 }
 
-pub async fn delete_measurement_event(key: &str) -> Result<(), String> {
-	let client = reqwest::Client::new();
+pub async fn delete_measurement_event(client_pool: Arc<TokMutex<Vec<Arc<TokMutex<Client>>>>>, key: &str) -> Result<(), String> {
+	let client = get_client(client_pool).await;
 	let bucket = "measurement_event";
 	let url = format!("http://127.0.0.1:8515/bucket/{bucket}/{key}");
-	let res = client.delete(url).send().await;
+
+	let local_client = client.lock().await;
+	let res = local_client.delete(url).send().await;
+	drop(local_client);
 	match res {
 		Ok(res) => {
 			if res.status() != 200 {
@@ -308,8 +327,8 @@ pub async fn delete_measurement_event(key: &str) -> Result<(), String> {
 	}
 }
 
-async fn save_batch(batch: &Batch) -> Result<(), String> {
-	let client = reqwest::Client::new();
+async fn save_batch(client_pool: Arc<TokMutex<Vec<Arc<TokMutex<Client>>>>>, batch: &Batch) -> Result<(), String> {
+	let client = get_client(client_pool).await;
 	let bucket = "batch";
 	let uuid = batch.uuid;
 	let start = match batch.start_timestamp().await {
@@ -324,6 +343,7 @@ async fn save_batch(batch: &Batch) -> Result<(), String> {
 	let amplitudes = batch.relative_y_movements.clone().expect("no y movements");
 	let length = batch.length.clone().to_string();
 	let dataset_name = batch.dataset_name.clone();
+        let source = batch.source.clone();
 
 	let locations: HashMap<String, BigDecimal> = locations.0.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
 	let amplitudes: HashMap<String, BigDecimal> = amplitudes.0.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
@@ -335,11 +355,15 @@ async fn save_batch(batch: &Batch) -> Result<(), String> {
 			"amplitudes": amplitudes,
 			"length": length,
 			"dataset_name": dataset_name,
+                        "source": source,
 	});
 
 	// create bucket
 	let url = format!("http://127.0.0.1:8515/bucket?name={bucket}&type=object");
-	let res = client.post(url.clone()).send().await;
+
+	let local_client = client.lock().await;
+	let res = local_client.post(url.clone()).send().await;
+	drop(local_client);
 	match res {
 		Ok(_) => {}
 		Err(err) => return Err(format!("Error creating bucket: {err}")),
@@ -347,8 +371,10 @@ async fn save_batch(batch: &Batch) -> Result<(), String> {
 
 	// add object to bucket
 	let url = format!("http://127.0.0.1:8515/bucket/{bucket}?key={uuid}");
-	let res = client.post(url).json(&body).send().await;
 
+	let local_client = client.lock().await;
+	let res = local_client.post(url).json(&body).send().await;
+	drop(local_client);
 	match res {
 		Ok(rea) => {
 			if rea.status() != 200 {
@@ -360,51 +386,21 @@ async fn save_batch(batch: &Batch) -> Result<(), String> {
 	}
 }
 
-async fn get_batch_lengths_for_events(measurement_events: Vec<(Uuid, MeasurementEvent)>) -> Result<Vec<(Uuid, MeasurementEvent, Vec<dsm_config::BatchLength>)>, String> {
-	let config = match Configuration::open("../dsm.toml").await {
-		Ok(c) => c,
-		Err(e) => return Err(format!("error: opening config: {}", e)),
+async fn process_batch(client_pool: Arc<TokMutex<Vec<Arc<TokMutex<Client>>>>>, length: BatchLength, event: Arc<Mutex<MeasurementEvent>>, dataset_name: String) -> Result<(), String> {
+	let event = event.lock().unwrap().clone();
+	let source = match &event.source {
+		Some(s) => s,
+		None => return Err(format!("error: getting source for event.")),
 	};
-	let mut batch_lengths: Vec<(Uuid, MeasurementEvent, Vec<dsm_config::BatchLength>)> = Vec::new();
-	for (uuid, event) in measurement_events {
-		let dataset_name = match event.dataset_name.clone() {
-			Some(d) => d,
-			None => return Err(format!("error: getting dataset name for event: {uuid}")),
-		};
-		let dataset = match config.get_dataset(&dataset_name) {
-			Ok(d) => d,
-			Err(e) => return Err(format!("error: getting dataset: {e}")),
-		};
-
-		let min_length: usize = dataset.minimum_batch_length.into();
-		let max_length: usize = dataset.maximum_batch_length.into();
-
-                let mut lengths = dsm_config::BatchLength::range(min_length, max_length);
-                lengths.push(dataset.minimum_batch_length);
-                lengths.push(dataset.maximum_batch_length);
-
-		batch_lengths.push((uuid, event, lengths));
-	}
-	Ok(batch_lengths)
-}
-
-async fn process_batch(length: BatchLength, event: MeasurementEvent) -> Result<(), String> {
-        
-	let dataset_name = match event.dataset_name {
-		Some(d) => d,
-		None => return Err(format!("error: getting dataset name for event.")),
-	};
-	let mut batch = Batch::new(dataset_name, length.to_owned(), false);
+	let mut batch = Batch::new(source.to_string(), dataset_name, length.to_owned(), false);
 	let start = event.key.clone() - (batch.size().await / BigDecimal::from(2));
 	let end = event.key.clone() + (batch.size().await / BigDecimal::from(2));
+	drop(event);
 	let interpolation = "linear".to_string();
 	let interpolation_steps = batch.interval().await;
 
-	//println!("event: {:?}, start: {:?}, end: {:?}", event.key, start, end);
-	//println!("batch size: {:?}, batch steps: {:?} :: interpolation_steps: {}", batch.length, batch.interpolation().await, interpolation_steps);
-
 	// get measurements
-	let measurements = match get_measurements(&batch.dataset_name, start, end, &interpolation, interpolation_steps.clone()).await {
+	let measurements = match get_measurements(Arc::clone(&client_pool), &batch.dataset_name, start, end, &interpolation, interpolation_steps.clone()).await {
 		Ok(v) => v,
 		Err(e) => return Err(format!("error: getting measurements for batch: url: {} :: {}", batch.dataset_name, e)),
 	};
@@ -451,9 +447,42 @@ async fn process_batch(length: BatchLength, event: MeasurementEvent) -> Result<(
 	batch.finish().await;
 
 	// add batch to bucket
-	if let Err(e) = save_batch(&batch).await {
+	if let Err(e) = save_batch(Arc::clone(&client_pool), &batch).await {
 		return Err(format!("error: saving batch {}: {}", batch.uuid, e));
 	}
 
 	Ok(())
+}
+
+pub async fn get_client_pool(size: usize) -> Arc<TokMutex<Vec<Arc<TokMutex<Client>>>>> {
+	let mut pool = Vec::new();
+	for _ in 0..size {
+		let client = Arc::new(TokMutex::new(Client::new()));
+		pool.push(client);
+	}
+	Arc::new(TokMutex::new(pool))
+}
+
+pub async fn get_client(client_pool: Arc<TokMutex<Vec<Arc<TokMutex<Client>>>>>) -> Arc<TokMutex<Client>> {
+	// select random client from pool
+	let pool = client_pool.lock().await;
+	let mut rng = rand::thread_rng();
+	let index = rng.gen_range(0..pool.len());
+	let client = pool.get(index).unwrap().clone();
+	drop(pool);
+	client
+}
+
+#[derive(Clone, Debug)]
+pub struct IntermediateEvent {
+	pub event_id: Uuid,
+	pub event: MeasurementEvent,
+	pub datasets: Vec<IntermediateDataset>,
+}
+
+#[derive(Clone, Debug)]
+pub struct IntermediateDataset {
+	pub dataset_name: String,
+	pub dataset_config: DatasetConfiguration,
+	pub batch_lengths: Vec<BatchLength>,
 }

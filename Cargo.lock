@@ -265,6 +265,7 @@ dependencies = [
  "dsm_measurement",
  "futures",
  "num-bigint",
+ "rand",
  "rayon",
  "reqwest",
  "serde",
@@ -295,6 +296,7 @@ name = "dsm_config"
 version = "0.1.0"
 dependencies = [
  "bigdecimal",
+ "num-bigint",
  "serde",
  "tokio",
  "toml",

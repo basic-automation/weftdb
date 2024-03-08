@@ -20,6 +20,7 @@ dsm_config = { path = "../dsm-config" }
 rayon = "*"
 futures = "*"
 threadpool = "*"
+rand= "*"
 
 [profile.release]
 strip = false
