@@ -262,6 +262,8 @@ dependencies = [
  "chrono",
  "dsm_config",
  "dsm_measurement",
+ "lazy_static",
+ "rand",
  "rayon",
  "reqwest",
  "serde",
@@ -276,6 +278,7 @@ name = "dsm_config"
 version = "0.1.0"
 dependencies = [
  "bigdecimal",
+ "num-bigint",
  "serde",
  "tokio",
  "toml",
@@ -724,6 +727,7 @@ dependencies = [
  "autocfg",
  "num-integer",
  "num-traits",
+ "serde",
 ]
 
 [[package]]
