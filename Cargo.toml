@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-limbo = { workspace = true }
+sqlx = { workspace = true, features = ["bigdecimal", "bit-vec", "bstr", "chrono", "runtime-tokio", "rust_decimal", "sqlite", "sqlx-macros", "sqlx-sqlite", "time", "uuid"] }
 tokio = { workspace = true, features = ["full"] }
 bigdecimal = { workspace = true, features = ["serde", "serde-json", "string-only"] }
 uuid = { workspace = true, features = ["v4", "fast-rng", "serde", "zerocopy"] }

@@ -1,13 +1,14 @@
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 #![allow(clippy::multiple_crate_versions, clippy::used_underscore_binding, clippy::similar_names, clippy::module_name_repetitions, clippy::module_inception)]
-#![feature(stmt_expr_attributes)]
 
 use std::{
 	collections::HashMap, sync::{Arc, LazyLock}
 };
 
-use anyhow::{Context, Result, bail};
-use limbo::{Builder, Connection, Database, Rows, Value, params};
+use anyhow::{Context, Result};
+use bigdecimal::BigDecimal;
+use chrono::{DateTime, Utc};
+use sqlx::{Pool, Row, Sqlite, SqlitePool};
 use tokio::sync::Mutex;
 pub use types::*;
 use uuid::Uuid;
@@ -15,7 +16,7 @@ use uuid::Uuid;
 mod types;
 
 const DB_DIR: &str = "./databases";
-static SUBJECTS: LazyLock<Arc<Mutex<HashMap<String, Database>>>> = LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+static SUBJECTS: LazyLock<Arc<Mutex<HashMap<String, Pool<Sqlite>>>>> = LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
 #[derive(Debug, Clone)]
 pub struct DB {
@@ -34,7 +35,6 @@ impl DB {
 		// Ensure connection exists
 		if !SUBJECTS.lock().await.contains_key(name) {
 			println!("DEBUG: Initializing new connection for {}", name);
-                        
 			db.initialize_new_subject(name).await?;
 		}
 
@@ -51,7 +51,7 @@ impl DB {
 
 	async fn initialize_existing_subjects(&self) -> Result<()> {
 		println!("DEBUG: Starting initialize_existing_subjects for {}", self.dir);
-		tokio::time::timeout(tokio::time::Duration::from_secs(5), tokio::fs::create_dir_all(&self.dir)).await.map_err(|_| Error::CreatingDatabaseError("Directory creation timed out".to_string())).context("Failed to create database directory")??;
+		tokio::fs::create_dir_all(&self.dir).await.context("Failed to create database directory")?;
 		println!("DEBUG: Directory {} created or exists", self.dir);
 
 		let mut entries = tokio::fs::read_dir(self.dir.clone()).await.map_err(|e| Error::ReadingDirectoryError(e.to_string()))?;
@@ -71,21 +71,22 @@ impl DB {
 					continue;
 				}
 
-				let db = match tokio::time::timeout(tokio::time::Duration::from_secs(5), Builder::new_local(path_str).build()).await {
-					Ok(Ok(db)) => db,
-					Ok(Err(e)) => {
-						println!("DEBUG: Failed to build database for {}: {:?}", path_str, e);
-						continue;
-					}
-					Err(_) => {
-						println!("DEBUG: Database build timed out for {}", path_str);
+				// Use the path directly - normalize separators for consistency
+				let normalized_path = path_str.replace('/', "\\");
+				let database_url = format!("sqlite:{}", normalized_path);
+				println!("DEBUG: Connecting to database: {}", database_url);
+
+				let pool = match SqlitePool::connect(&database_url).await {
+					Ok(pool) => pool,
+					Err(e) => {
+						println!("DEBUG: Failed to connect to database {}: {:?}", database_url, e);
 						continue;
 					}
 				};
 
 				let subject_name = path.file_stem().and_then(|s| s.to_str()).ok_or_else(|| Error::InvalidPathError(path.to_string_lossy().into_owned())).context("Failed to get subject name from path")?;
-				println!("DEBUG: Inserting subject {} into SUBJECTS", subject_name);
-				SUBJECTS.lock().await.insert(subject_name.to_string(), db);
+				println!("DEBUG: Successfully connected to existing database for subject {}", subject_name);
+				SUBJECTS.lock().await.insert(subject_name.to_string(), pool);
 			}
 		}
 
@@ -93,119 +94,15 @@ impl DB {
 		Ok(())
 	}
 
-	pub async fn initialize_new_subject(&self, subject_name: &str) -> Result<()> {
-                let db_path = format!("{}/{subject_name}.db", self.dir);
-                println!("DEBUG: Starting database creation for {}", subject_name);
-            
-                println!("DEBUG: Checking directory {}", self.dir);
-                if let Ok(metadata) = tokio::fs::metadata(&self.dir).await {
-                    println!("DEBUG: Directory exists, is_dir: {}", metadata.is_dir());
-                } else {
-                    println!("DEBUG: Directory does not exist or is inaccessible");
-                }
-            
-                println!("DEBUG: Creating directory {}", self.dir);
-                tokio::time::timeout(
-                    tokio::time::Duration::from_secs(3),
-                    tokio::fs::create_dir_all(&self.dir)
-                ).await
-                    .map_err(|_| Error::CreatingDatabaseError("Directory creation timed out".to_string()))
-                    .context("Failed to create database directory")??;
-                println!("DEBUG: Directory created successfully");
-            
-                println!("DEBUG: Checking if database file {} exists", db_path);
-                if let Ok(metadata) = tokio::fs::metadata(&db_path).await {
-                    println!("DEBUG: Database file exists: {:?}", metadata);
-                }
-            
-                println!("DEBUG: Building database at {}", db_path);
-                let subject = tokio::time::timeout(
-                    tokio::time::Duration::from_secs(5),
-                    Builder::new_local(&db_path).build()
-                ).await
-                    .map_err(|_| Error::CreatingDatabaseError("Database build timed out".to_string()))
-                    .context("Failed to build database")??;
-                println!("DEBUG: Database built successfully");
-            
-                println!("DEBUG: Connecting to database");
-                let conn = subject.connect()
-                    .map_err(|e| Error::ConnectingDatabaseError(e.to_string()))
-                    .context("Failed to connect to database")?;
-            
-                println!("DEBUG: Creating tables");
-                let queries = [
-                    "CREATE TABLE IF NOT EXISTS datasets (id TEXT PRIMARY KEY, name TEXT NOT NULL);",
-                    "CREATE TABLE IF NOT EXISTS measurements (id INTEGER PRIMARY KEY AUTOINCREMENT, dataset_id TEXT NOT NULL, timestamp TEXT NOT NULL, value TEXT NOT NULL, FOREIGN KEY (dataset_id) REFERENCES datasets(id) ON DELETE CASCADE);",
-                    "CREATE INDEX IF NOT EXISTS idx_measurements_dataset_id ON measurements(dataset_id);",
-                    "CREATE INDEX IF NOT EXISTS idx_measurements_timestamp ON measurements(timestamp);",
-                ];
-            
-                for query in queries {
-                    println!("DEBUG: Executing query: {}", query);
-                    conn.execute(query, params!()).await
-                        .map_err(|e| Error::DatabaseExecutionError(e.to_string()))
-                        .context(format!("Failed to execute query: {}", query))?;
-                }
-            
-                println!("DEBUG: Storing subject {} in SUBJECTS", subject_name);
-                SUBJECTS.lock().await.insert(subject_name.to_string(), subject.clone());
-                println!("DEBUG: Database initialization complete for {}", subject_name);
-                Ok(())
-            }
-
-            pub async fn add_dataset(&self, subject_name: &str, dataset: Dataset) -> Result<Uuid> {
-                let conn = self.connect_subject(subject_name).await?;
-                println!("DEBUG: Starting add_dataset for {}", dataset.name);
-            
-                conn.execute("BEGIN TRANSACTION;", params!()).await
-                    .map_err(|e| Error::DatabaseExecutionError(e.to_string()))
-                    .context("Failed to begin transaction")?;
-            
-                let query = "INSERT INTO datasets (id, name) VALUES (?, ?);";
-                conn.execute(query, [dataset.id.to_string(), dataset.name.clone()]).await
-                    .map_err(|e| Error::DatabaseExecutionError(format!("Failed to insert dataset: {} (name: {})", e, dataset.name)))?;
-            
-                if !dataset.measurements.is_empty() {
-                    let batch_size = 100; // Adjust based on performance
-                    for chunk in dataset.measurements.chunks(batch_size) {
-                        let mut query = String::from("INSERT INTO measurements (dataset_id, timestamp, value) VALUES ");
-                        let mut params = Vec::new();
-                        for (i, m) in chunk.iter().enumerate() {
-                            if i > 0 { query.push_str(","); }
-                            query.push_str("(?, ?, ?)");
-                            params.push(dataset.id.to_string());
-                            params.push(m.timestamp.to_string());
-                            params.push(m.value.to_string());
-                        }
-                        query.push(';');
-                        println!("DEBUG: Executing batch insert of {} measurements", chunk.len());
-                        conn.execute(&query, params).await
-                            .map_err(|e| Error::DatabaseExecutionError(format!("Failed to insert measurement batch: {}", e)))?;
-                    }
-                }
-            
-                conn.execute("COMMIT;", params!()).await
-                    .map_err(|e| Error::DatabaseExecutionError(e.to_string()))
-                    .context("Failed to commit transaction")?;
-            
-                println!("DEBUG: Successfully inserted {} measurements", dataset.measurements.len());
-                Ok(dataset.id)
-            }
-
 	/// Get a dataset's id by its name.
 	/// # Errors
 	/// Returns an error if the database connection is not found, if the query fails, or if no dataset with the given name exists.
 	pub async fn get_dataset_id_by_name(&self, subject_name: &str, name: &str) -> Result<Uuid> {
-		let query = "SELECT id FROM datasets WHERE name = ? Metabolism";
-		let mut rows: Rows = self.connect_subject(subject_name).await?.query(query, [name]).await.map_err(|e| Error::DatabaseExecutionError(e.to_string())).context("Failed to query dataset ID")?;
-		let id: String = match rows.next().await.map_err(|e| Error::DatabaseExecutionError(e.to_string())).context("Failed to fetch dataset ID row")?.ok_or_else(|| Error::DatabaseExecutionError("No dataset found with the given name".to_string())).context("No dataset found")?.get_value(0).map_err(|e| Error::DatabaseExecutionError(e.to_string())).context("Failed to get dataset ID value")? {
-			Value::Text(text) => text,
-			_ => bail!(Error::DatabaseExecutionError("Unexpected value type for dataset ID".to_string())),
-		};
-		let id = Uuid::parse_str(&id).map_err(|e| Error::UuidParseError(e.to_string())).context("Failed to parse dataset ID as UUID")?;
-		if id.is_nil() {
-			bail!(Error::UuidParseError("Dataset ID is nil".to_string()));
-		}
+		let pool = self.get_pool(subject_name).await?;
+		let row = sqlx::query("SELECT id FROM datasets WHERE name = ?").bind(name).fetch_one(&pool).await.context("Failed to query dataset ID")?;
+
+		let id_str: String = row.get("id");
+		let id = Uuid::parse_str(&id_str).context("Failed to parse dataset ID as UUID")?;
 		Ok(id)
 	}
 
@@ -213,70 +110,147 @@ impl DB {
 	/// # Errors
 	/// Returns an error if the database connection is not found, if the query fails, or if the dataset does not exist.
 	pub async fn add_measurement(&self, subject_name: &str, dataset_id: Uuid, measurement: Measurement) -> Result<()> {
-		let query = "INSERT INTO measurements (dataset_id, timestamp, value) VALUES (?, ?, ?);";
-		self.connect_subject(subject_name).await?.execute(query, [dataset_id.to_string(), measurement.timestamp.to_string(), measurement.value.to_string()]).await.map_err(|e| Error::DatabaseExecutionError(e.to_string())).context("Failed to insert measurement")?;
+		let pool = self.get_pool(subject_name).await?;
+		sqlx::query("INSERT INTO measurements (dataset_id, timestamp, value) VALUES (?, ?, ?)").bind(dataset_id.to_string()).bind(measurement.timestamp.to_rfc3339()).bind(measurement.value.to_string()).execute(&pool).await.context("Failed to insert measurement")?;
 		Ok(())
 	}
 
-	async fn connect_subject(&self, subject_name: &str) -> Result<Connection> {
-		let connections = SUBJECTS.lock().await;
-		let subject = connections.get(subject_name).cloned().ok_or_else(|| Error::ConnectingDatabaseError(format!("Database connection for {} not found", subject_name)))?;
-		let conn = subject.connect().map_err(|e| Error::ConnectingDatabaseError(e.to_string())).context("Failed to connect to database")?;
-		Ok(conn)
+	/// Get all measurements for a specific dataset.
+	/// # Errors
+	/// Returns an error if the database connection is not found or if the query fails.
+	pub async fn get_measurements_by_dataset_id(&self, subject_name: &str, dataset_id: Uuid) -> Result<Vec<Measurement>> {
+		let pool = self.get_pool(subject_name).await?;
+		println!("DEBUG: Using SQLite for reading measurements");
+
+		let rows = sqlx::query("SELECT timestamp, value FROM measurements WHERE dataset_id = ? ORDER BY timestamp").bind(dataset_id.to_string()).fetch_all(&pool).await.context("Failed to query measurements")?;
+
+		let mut measurements = Vec::new();
+		for (index, row) in rows.iter().enumerate() {
+			let timestamp_str: String = row.get("timestamp");
+			let value_str: String = row.get("value");
+
+			let timestamp = match DateTime::parse_from_rfc3339(&timestamp_str) {
+				Ok(ts) => ts.with_timezone(&Utc),
+				Err(e) => {
+					println!("DEBUG: Failed to parse timestamp '{}' in row {}: {}", timestamp_str, index, e);
+					continue;
+				}
+			};
+
+			let value = match value_str.parse::<BigDecimal>() {
+				Ok(v) => v,
+				Err(e) => {
+					println!("DEBUG: Failed to parse value '{}' in row {}: {}", value_str, index, e);
+					continue;
+				}
+			};
+
+			measurements.push(Measurement { timestamp, value });
+		}
+
+		println!("DEBUG: Successfully retrieved {} measurements for dataset {}", measurements.len(), dataset_id);
+		Ok(measurements)
 	}
 
-	/// Get all measurements for a given dataset ID.
-	/// # Errors
-	/// Returns an error if the database connection is not found, if the query fails, or if no measurements are found for the given dataset ID.
-	pub async fn get_measurements_by_dataset_id(&self, subject_name: &str, dataset_id: Uuid) -> Result<Vec<Measurement>> {
-		let conn = self.connect_subject(subject_name).await?;
+	async fn get_pool(&self, subject_name: &str) -> Result<Pool<Sqlite>> {
+		let connections = SUBJECTS.lock().await;
+		let pool = connections.get(subject_name).cloned().ok_or_else(|| Error::ConnectingDatabaseError(format!("Database connection for {} not found", subject_name)))?;
+		Ok(pool)
+	}
 
-		// Check count with explicit transaction
-		let count_query = "SELECT COUNT(*) FROM measurements WHERE dataset_id = ?;";
-		let mut count_rows = conn.query(count_query, [dataset_id.to_string()]).await.map_err(|e| Error::DatabaseExecutionError(e.to_string())).context("Failed to execute count query")?;
-		if let Some(row) = count_rows.next().await.map_err(|e| Error::DatabaseExecutionError(e.to_string())).context("Failed to fetch count row")? {
-			let count = match row.get_value(0).map_err(|e| Error::DatabaseExecutionError(e.to_string())).context("Failed to get count value")? {
-				Value::Integer(n) => n,
-				Value::Real(n) => n as i64,
-				_ => 0,
-			};
-			println!("DEBUG: Count query shows {} measurements for dataset {}", count, dataset_id);
-		} else {
-			println!("DEBUG: Count query returned no rows for dataset {}", dataset_id);
+	pub async fn initialize_new_subject(&self, subject_name: &str) -> Result<()> {
+		let db_path = format!("{}/{subject_name}.db", self.dir);
+		println!("DEBUG: Starting SQLite database creation for {}", subject_name);
+
+		// Ensure directory exists first
+		tokio::fs::create_dir_all(&self.dir).await.context("Failed to create database directory")?;
+		println!("DEBUG: Directory {} created successfully", self.dir);
+
+		// Create the database file if it doesn't exist
+		if !tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
+			println!("DEBUG: Database file {} does not exist, creating it", db_path);
+			tokio::fs::File::create(&db_path).await.context("Failed to create database file")?;
+			println!("DEBUG: Database file {} created successfully", db_path);
 		}
 
-		// Use ORDER BY to ensure consistent retrieval
-		let query = "SELECT timestamp, value FROM measurements WHERE dataset_id = ? ORDER BY timestamp;";
-		let mut rows = conn.query(query, [dataset_id.to_string()]).await.map_err(|e| Error::DatabaseExecutionError(e.to_string())).context("Failed to execute measurements query")?;
-		let mut measurements = Vec::new();
-		let mut row_count = 0;
+		// Use the relative path directly for SQLite - no need for canonicalization
+		// Convert forward slashes to backslashes for Windows
+		let normalized_path = db_path.replace('/', "\\");
+		let database_url = format!("sqlite:{}", normalized_path);
+		println!("DEBUG: Connecting to SQLite database at: {}", database_url);
 
-		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseExecutionError(e.to_string())).context("Failed to fetch measurement row")? {
-			row_count += 1;
-			// Debug: Print raw row data
-			println!("DEBUG: Row {} fetched: {:?}", row_count, row);
+		let pool = SqlitePool::connect(&database_url).await.context("Failed to connect to SQLite database")?;
+		println!("DEBUG: Successfully connected to SQLite database");
 
-			let timestamp: String = match row.get_value(0).map_err(|e| Error::DatabaseExecutionError(e.to_string())).context("Failed to get timestamp value")? {
-				Value::Text(text) => text,
-				_ => bail!(Error::DatabaseExecutionError("Unexpected value type for timestamp".to_string())),
-			};
+		println!("DEBUG: Creating tables");
+		sqlx::query(
+			"CREATE TABLE IF NOT EXISTS datasets (
+				id TEXT PRIMARY KEY, 
+				name TEXT NOT NULL
+			)",
+		)
+		.execute(&pool)
+		.await
+		.context("Failed to create datasets table")?;
 
-			let value: String = match row.get_value(1).map_err(|e| Error::DatabaseExecutionError(e.to_string())).context("Failed to get value")? {
-				Value::Text(text) => text,
-				_ => bail!(Error::DatabaseExecutionError("Unexpected value type for value".to_string())),
-			};
+		sqlx::query(
+			"CREATE TABLE IF NOT EXISTS measurements (
+				id INTEGER PRIMARY KEY AUTOINCREMENT, 
+				dataset_id TEXT NOT NULL, 
+				timestamp TEXT NOT NULL, 
+				value TEXT NOT NULL, 
+				FOREIGN KEY (dataset_id) REFERENCES datasets(id) ON DELETE CASCADE
+			)",
+		)
+		.execute(&pool)
+		.await
+		.context("Failed to create measurements table")?;
 
-			let measurement = Measurement { timestamp: timestamp.parse().map_err(|e: chrono::ParseError| Error::DatabaseExecutionError(e.to_string())).context("Failed to parse timestamp")?, value: value.parse().map_err(|e: bigdecimal::ParseBigDecimalError| Error::DatabaseExecutionError(e.to_string())).context("Failed to parse value")? };
-			measurements.push(measurement);
+		sqlx::query("CREATE INDEX IF NOT EXISTS idx_measurements_dataset_id ON measurements(dataset_id)").execute(&pool).await.context("Failed to create dataset_id index")?;
 
-			// Debug: Print every 100th row to track progress
-			if row_count % 100 == 0 {
-				println!("DEBUG: Retrieved {} rows so far...", row_count);
+		sqlx::query("CREATE INDEX IF NOT EXISTS idx_measurements_timestamp ON measurements(timestamp)").execute(&pool).await.context("Failed to create timestamp index")?;
+
+		println!("DEBUG: Storing subject {} in SUBJECTS", subject_name);
+		SUBJECTS.lock().await.insert(subject_name.to_string(), pool);
+		println!("DEBUG: SQLite database initialization complete for {}", subject_name);
+		Ok(())
+	}
+
+	/// Add a dataset with all measurements at once using a transaction
+	pub async fn add_dataset(&self, subject_name: &str, dataset: Dataset) -> Result<Uuid> {
+		let pool = self.get_pool(subject_name).await?;
+		println!("DEBUG: Starting add_dataset for {} with dataset ID {}", dataset.name, dataset.id);
+
+		let mut tx = pool.begin().await.context("Failed to start transaction")?;
+
+		// Insert the dataset first
+		sqlx::query("INSERT INTO datasets (id, name) VALUES (?, ?)").bind(dataset.id.to_string()).bind(&dataset.name).execute(&mut *tx).await.context("Failed to insert dataset")?;
+
+		// Insert all measurements
+		if !dataset.measurements.is_empty() {
+			let total_measurements = dataset.measurements.len();
+
+			for (index, measurement) in dataset.measurements.iter().enumerate() {
+				sqlx::query("INSERT INTO measurements (dataset_id, timestamp, value) VALUES (?, ?, ?)").bind(dataset.id.to_string()).bind(measurement.timestamp.to_rfc3339()).bind(measurement.value.to_string()).execute(&mut *tx).await.with_context(|| format!("Failed to insert measurement {} of {}", index + 1, total_measurements))?;
+
+				if index % 100 == 0 {
+					println!("DEBUG: Inserted measurement {} of {}", index + 1, total_measurements);
+				}
 			}
+
+			println!("DEBUG: Successfully inserted {} measurements for dataset ID {}", total_measurements, dataset.id);
 		}
 
-		println!("DEBUG: Retrieved {} measurements from query (total rows processed: {})", measurements.len(), row_count);
-		Ok(measurements)
+		tx.commit().await.context("Failed to commit transaction")?;
+		println!("DEBUG: Transaction committed successfully");
+
+		// Verify the data
+		let count_row = sqlx::query("SELECT COUNT(*) as count FROM measurements WHERE dataset_id = ?").bind(dataset.id.to_string()).fetch_one(&pool).await.context("Failed to verify measurement count")?;
+
+		let count: i64 = count_row.get("count");
+		println!("DEBUG: Verification shows {} measurements for dataset {}", count, dataset.id);
+
+		Ok(dataset.id)
 	}
 }
 
@@ -290,6 +264,7 @@ mod test {
 	async fn test_db_creation() {
 		let db_name = "test_db_creation";
 		println!("DEBUG: Starting test_db_creation for {}", db_name);
+		cleanup_test_database(db_name).await;
 		let _db = DB::new(db_name).await.expect("Failed to create database");
 		println!("DEBUG: Database created, checking SUBJECTS");
 		assert!(SUBJECTS.lock().await.contains_key(db_name));
@@ -299,69 +274,85 @@ mod test {
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn test_benchmark_100_measurements() {
-		unsafe {
-			std::env::set_var("RUST_BACKTRACE", "full");
-		}
-
-		// Create fake data
-		let mut dataset: Dataset = Faker.fake();
-		// Generate measurements directly into the dataset
-		dataset.measurements = (0..1000).map(|_| Faker.fake()).collect();
-
-		// Ensure no duplicate timestamps by adding microseconds to each
-		for (i, measurement) in dataset.measurements.iter_mut().enumerate() {
-			measurement.timestamp = measurement.timestamp + chrono::Duration::microseconds(i as i64);
-		}
-
-		let measurement_hashmap: HashMap<String, Measurement> = dataset.measurements.iter().map(|m| (m.timestamp.to_string(), m.clone())).collect();
-
-		// Start benchmark
-		println!("Starting benchmark with {} measurements for dataset: {}", dataset.measurements.len(), dataset.name);
-		println!("Dataset ID: {}", dataset.id);
-		println!("Number of measurements: {}", dataset.measurements.len());
-		let timer = std::time::Instant::now();
-
-		// Create a new database for testing
 		let db_name = "test_benchmark_100_measurements";
-		println!("creating new database: {db_name}");
-		let db = DB::new(db_name).await.expect("Failed to create new database");
 
-		// Add the dataset to the database (this will add all measurements at once)
-		println!("Adding dataset: {:?}", dataset.name);
-		let dataset_id = db.add_dataset(db_name, dataset).await.expect("Failed to add dataset");
-
-		println!("Benchmark completed in: {:?}", timer.elapsed());
-
-		println!("Verifying the number of measurements for dataset ID: {}", dataset_id);
-
-		println!("Reading measurements...");
-		let timer2 = std::time::Instant::now();
-		let added_measurements = db.get_measurements_by_dataset_id(db_name, dataset_id).await.expect("Failed to get measurements");
-		let added_measurements_hashmap: HashMap<String, Measurement> = added_measurements.iter().map(|m| (m.timestamp.to_string(), m.clone())).collect();
-
-		println!("Retrieved {} measurements, time elapsed: {:?}", added_measurements_hashmap.len(), timer2.elapsed());
-
-		println!("Expected measurements: {}", measurement_hashmap.len());
-		println!("Actual measurements in DB: {}", added_measurements_hashmap.len());
-
-		println!("Verifying the measurements in the database...");
-		assert_eq!(measurement_hashmap.len(), added_measurements_hashmap.len(), "Number of measurements in the database does not match the expected number");
-		assert_eq!(measurement_hashmap, added_measurements_hashmap);
-
+		// Clean up any existing test database
 		cleanup_test_database(db_name).await;
+
+		// Generate test data
+		let dataset_name: String = Faker.fake();
+		let dataset_id = Uuid::new_v4();
+		println!("Starting benchmark with 1000 measurements for dataset: {}", dataset_name);
+		println!("Dataset ID: {}", dataset_id);
+
+		let mut measurements = Vec::new();
+		for _i in 0..1000 {
+			measurements.push(Faker.fake::<Measurement>());
+		}
+
+		println!("Number of measurements: {}", measurements.len());
+
+		let dataset = Dataset { id: dataset_id, name: dataset_name.clone(), measurements };
+
+		println!("creating new database: {}", db_name);
+		let db = DB::new(db_name).await.expect("Failed to create database");
+
+		println!("Adding dataset: {:?}", dataset.name);
+		let start_time = std::time::Instant::now();
+
+		let returned_id = db.add_dataset(db_name, dataset).await.expect("Failed to add dataset");
+
+		let elapsed = start_time.elapsed();
+		println!("Benchmark completed in: {:?}", elapsed);
+
+		// Verify by reading back
+		let measurements = db.get_measurements_by_dataset_id(db_name, returned_id).await.expect("Failed to get measurements");
+
+		println!("Expected measurements: {}", 1000);
+		println!("Actual measurements in DB: {}", measurements.len());
+
+		assert_eq!(1000, measurements.len(), "Number of measurements in the database does not match the expected number");
+
+		println!("Test completed successfully!");
 	}
 
 	async fn cleanup_test_database(db_name: &str) {
-                let db_path = format!("{DB_DIR}/{db_name}.db");
-                println!("DEBUG: Cleaning up database {}", db_path);
-                if let Some(db) = SUBJECTS.lock().await.remove(db_name) {
-                    println!("DEBUG: Closing database connection for {}", db_name);
-                    drop(db); // Explicitly drop to close connection
-                }
-                if let Err(e) = tokio::fs::remove_file(&db_path).await {
-                    eprintln!("DEBUG: Failed to remove test database file {}: {:?}", db_path, e);
-                } else {
-                    println!("DEBUG: Successfully removed {}", db_path);
-                }
-            }
+		let db_path = format!("{DB_DIR}/{db_name}.db");
+		println!("DEBUG: Cleaning up database {}", db_path);
+
+		// Close the connection first and ensure it's properly dropped
+		if let Some(pool) = SUBJECTS.lock().await.remove(db_name) {
+			println!("DEBUG: Closing database connection for {}", db_name);
+			pool.close().await;
+			// Give it a moment to fully close
+			tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+		}
+
+		// Remove main database file
+		match tokio::fs::remove_file(&db_path).await {
+			Ok(_) => println!("DEBUG: Successfully removed {}", db_path),
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+				println!("DEBUG: Database file {} already removed", db_path);
+			}
+			Err(e) => println!("DEBUG: Failed to remove file {}: {:?}", db_path, e),
+		}
+
+		// Remove SQLite journal file if it exists
+		let journal_path = format!("{}-journal", db_path);
+		if tokio::fs::remove_file(&journal_path).await.is_ok() {
+			println!("DEBUG: Successfully removed journal file {}", journal_path);
+		}
+
+		// Remove SQLite WAL file if it exists
+		let wal_path = format!("{}-wal", db_path);
+		if tokio::fs::remove_file(&wal_path).await.is_ok() {
+			println!("DEBUG: Successfully removed WAL file {}", wal_path);
+		}
+
+		// Remove SQLite SHM file if it exists
+		let shm_path = format!("{}-shm", db_path);
+		if tokio::fs::remove_file(&shm_path).await.is_ok() {
+			println!("DEBUG: Successfully removed SHM file {}", shm_path);
+		}
+	}
 }
