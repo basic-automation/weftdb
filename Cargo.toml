@@ -1,0 +1,15 @@
+[package]
+name = "database"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+limbo = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+bigdecimal = { workspace = true, features = ["serde", "serde-json", "string-only"] }
+uuid = { workspace = true, features = ["v4", "fast-rng", "serde", "zerocopy"] }
+fake = { workspace = true, features = ["chrono", "uuid", "bigdecimal", "serde_json", "derive"] }
+chrono = { workspace = true, features = ["serde", "pure-rust-locales"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
