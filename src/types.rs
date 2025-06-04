@@ -12,9 +12,23 @@ pub struct Dataset {
 }
 
 #[derive(Debug, Clone, Dummy, PartialEq, Eq)]
-pub struct Measurement {
+pub struct InputMeasurement {
 	pub timestamp: DateTime<Utc>,
 	pub value: BigDecimal,
+}
+
+#[derive(Debug, Clone, Dummy, PartialEq, Eq)]
+pub struct Measurement {
+	pub id: Uuid,
+	pub dataset_id: Uuid,
+	pub timestamp: DateTime<Utc>,
+	pub value: BigDecimal,
+}
+
+impl Measurement {
+	pub fn from_input_measurement(dataset_id: Uuid, input: InputMeasurement) -> Self {
+		Self { id: Uuid::new_v4(), dataset_id, timestamp: input.timestamp, value: input.value }
+	}
 }
 
 #[derive(Error, Debug)]
