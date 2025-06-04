@@ -8,7 +8,7 @@ use uuid::Uuid;
 pub struct Dataset {
 	pub id: Uuid,
 	pub name: String,
-	pub measurments: Vec<Measurement>,
+	pub measurements: Vec<Measurement>,
 }
 
 #[derive(Debug, Clone, Dummy, PartialEq, Eq)]
