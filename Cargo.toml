@@ -13,3 +13,4 @@ chrono = { workspace = true, features = ["serde", "pure-rust-locales"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+futures = { workspace = true , features = ["unstable", "thread-pool"] }
