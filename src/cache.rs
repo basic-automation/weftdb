@@ -36,7 +36,7 @@ impl DatabaseCache {
 
 		// Check if we need to evict old entries
 		if subject_datasets.len() >= self.max_entries_per_subject {
-			self.evict_oldest_entry(subject_datasets, subject_names).await;
+			self.evict_oldest_entry(subject_datasets, subject_names);
 		}
 
 		let cache_entry = CacheEntry { dataset: dataset.clone(), last_accessed: std::time::Instant::now() };
@@ -166,7 +166,7 @@ impl DatabaseCache {
 	}
 
 	/// Evict the oldest entry from a subject's cache
-	async fn evict_oldest_entry(&self, subject_datasets: &mut HashMap<Uuid, CacheEntry>, subject_names: &mut HashMap<String, Uuid>) {
+	fn evict_oldest_entry(&self, subject_datasets: &mut HashMap<Uuid, CacheEntry>, subject_names: &mut HashMap<String, Uuid>) {
 		if let Some((&oldest_id, _)) = subject_datasets.iter().min_by_key(|(_, entry)| entry.last_accessed) {
 			if let Some(removed_entry) = subject_datasets.remove(&oldest_id) {
 				// Remove from names cache as well

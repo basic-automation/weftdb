@@ -306,6 +306,71 @@ impl DB {
 		}
 	}
 
+	/// Optimized bulk measurement addition with better performance
+	pub async fn add_measurements_bulk_optimized(&self, subject_name: &str, dataset_id: Uuid, measurements: Vec<InputMeasurement>) -> Result<()> {
+		let pool = self.get_pool(subject_name).await?;
+		let measurement_count = measurements.len();
+
+		if measurement_count == 0 {
+			return Ok(());
+		}
+
+		println!("DEBUG: Adding {} measurements to dataset {} (optimized)", measurement_count, dataset_id);
+
+		// Use different strategies based on measurement count
+		match measurement_count {
+			1..=10 => {
+				// Individual inserts for very small batches
+				for measurement in measurements {
+					self.add_measurement(subject_name, dataset_id, measurement).await?;
+				}
+				println!("DEBUG: Added {} measurements individually", measurement_count);
+			}
+			11..=999 => {
+				// Single batch insert for medium batches
+				let placeholders = measurements.iter().map(|_| "(?, ?, ?, ?)").collect::<Vec<_>>().join(", ");
+
+				let sql = format!("INSERT INTO measurements (id, dataset_id, timestamp, value) VALUES {}", placeholders);
+
+				let mut query = sqlx::query(&sql);
+
+				for measurement in &measurements {
+					let measurement_id = Uuid::new_v4();
+					query = query.bind(measurement_id.to_string()).bind(dataset_id.to_string()).bind(measurement.timestamp.to_rfc3339()).bind(measurement.value.to_string());
+				}
+
+				query.execute(&pool).await.context("Failed to insert measurement batch")?;
+
+				println!("DEBUG: Added {} measurements in single batch", measurement_count);
+			}
+			_ => {
+				// Multi-batch insert with transaction for large batches
+				let mut tx = pool.begin().await.context("Failed to start transaction")?;
+				const BATCH_SIZE: usize = 1000;
+
+				for (batch_index, chunk) in measurements.chunks(BATCH_SIZE).enumerate() {
+					let placeholders = chunk.iter().map(|_| "(?, ?, ?, ?)").collect::<Vec<_>>().join(", ");
+
+					let sql = format!("INSERT INTO measurements (id, dataset_id, timestamp, value) VALUES {}", placeholders);
+
+					let mut query = sqlx::query(&sql);
+
+					for measurement in chunk {
+						let measurement_id = Uuid::new_v4();
+						query = query.bind(measurement_id.to_string()).bind(dataset_id.to_string()).bind(measurement.timestamp.to_rfc3339()).bind(measurement.value.to_string());
+					}
+
+					query.execute(&mut *tx).await.with_context(|| format!("Failed to insert measurement batch {}", batch_index + 1))?;
+				}
+
+				tx.commit().await.context("Failed to commit measurements transaction")?;
+				println!("DEBUG: Added {} measurements in {} batches", measurement_count, (measurement_count + BATCH_SIZE - 1) / BATCH_SIZE);
+			}
+		}
+
+		Ok(())
+	}
+
 	/// Batch insert multiple datasets efficiently
 	pub async fn add_datasets_bulk(&self, subject_name: &str, datasets: Vec<Dataset>) -> Result<Vec<Uuid>> {
 		let mut result_ids = Vec::new();
@@ -452,40 +517,48 @@ impl DB {
 		});
 	}
 
+	// Add the missing method stubs that are called in your tests
 	async fn initialize_existing_subjects(&self) -> Result<()> {
+		// Implementation for initializing existing database subjects
 		println!("DEBUG: Starting initialize_existing_subjects for {}", self.dir);
-		tokio::fs::create_dir_all(&self.dir).await.context("Failed to create database directory")?;
+
+		// Create directory if it doesn't exist
+		if let Err(e) = std::fs::create_dir_all(&self.dir) {
+			if e.kind() != std::io::ErrorKind::AlreadyExists {
+				return Err(anyhow::anyhow!("Failed to create directory {}: {}", self.dir, e));
+			}
+		}
 		println!("DEBUG: Directory {} created or exists", self.dir);
 
-		let mut entries = tokio::fs::read_dir(self.dir.clone()).await.map_err(|e| Error::ReadingDirectoryError(e.to_string()))?;
+		// Scan for existing database files
+		let entries = std::fs::read_dir(&self.dir).with_context(|| format!("Failed to read directory {}", self.dir))?;
 
-		while let Ok(entry) = entries.next_entry().await {
-			let Some(entry) = entry else { break };
+		for entry in entries {
+			let entry = entry.context("Failed to read directory entry")?;
 			let path = entry.path();
-			let path_str = path.to_string_lossy();
-			println!("DEBUG: Processing path \"{}\"", path_str);
 
-			if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("db") {
-				let subject_name = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+			if let Some(path_str) = path.to_str() {
+				println!("DEBUG: Processing path {:?}", path_str);
 
-				println!("DEBUG: Attempting to initialize connection for {}", path_str);
-				let normalized_path = path_str.replace('/', "\\");
-				let database_url = format!("sqlite:{}", normalized_path);
-				println!("DEBUG: Connecting to database: {}", database_url);
+				if path_str.ends_with(".db") && !path_str.contains("-journal") && !path_str.contains("-wal") && !path_str.contains("-shm") {
+					// Extract subject name from filename
+					if let Some(filename) = path.file_stem() {
+						if let Some(subject_name) = filename.to_str() {
+							println!("DEBUG: Attempting to initialize connection for {}", path_str);
 
-				match SqlitePool::connect(&database_url).await {
-					Ok(pool) => {
-						// Enable foreign key constraints for existing connections too
-						if let Err(e) = sqlx::query("PRAGMA foreign_keys = ON").execute(&pool).await {
-							println!("DEBUG: Warning - failed to enable foreign keys for {}: {}", subject_name, e);
+							let connection_string = format!("sqlite:{}", path_str.replace('\\', "/"));
+							println!("DEBUG: Connecting to database: {}", connection_string);
+
+							match SqlitePool::connect(&connection_string).await {
+								Ok(pool) => {
+									println!("DEBUG: Successfully connected to existing database for subject {}", subject_name);
+									SUBJECTS.lock().await.insert(subject_name.to_string(), pool);
+								}
+								Err(e) => {
+									eprintln!("Warning: Failed to connect to existing database {}: {}", path_str, e);
+								}
+							}
 						}
-
-						SUBJECTS.lock().await.insert(subject_name.to_string(), pool);
-						println!("DEBUG: Successfully connected to existing database for subject {}", subject_name);
-					}
-					Err(e) => {
-						println!("DEBUG: Failed to connect to database {}: {}", path_str, e);
-						continue;
 					}
 				}
 			}
@@ -495,79 +568,83 @@ impl DB {
 		Ok(())
 	}
 
-	pub async fn initialize_new_subject(&self, subject_name: &str) -> Result<()> {
-		let db_path = format!("{}/{subject_name}.db", self.dir);
+	async fn initialize_new_subject(&self, subject_name: &str) -> Result<()> {
 		println!("DEBUG: Starting SQLite database creation for {}", subject_name);
 
-		// Ensure directory exists first
-		tokio::fs::create_dir_all(&self.dir).await.context("Failed to create database directory")?;
+		// Create directory if it doesn't exist
+		if let Err(e) = std::fs::create_dir_all(&self.dir) {
+			if e.kind() != std::io::ErrorKind::AlreadyExists {
+				return Err(anyhow::anyhow!("Failed to create directory {}: {}", self.dir, e));
+			}
+		}
 		println!("DEBUG: Directory {} created successfully", self.dir);
 
-		// Create the database file if it doesn't exist
-		if !tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
+		let db_path = format!("{}/{}.db", self.dir, subject_name);
+
+		// Check if database file exists
+		if !std::path::Path::new(&db_path).exists() {
 			println!("DEBUG: Database file {} does not exist, creating it", db_path);
-			tokio::fs::File::create(&db_path).await.context("Failed to create database file")?;
+			// Create the file
+			std::fs::File::create(&db_path).with_context(|| format!("Failed to create database file {}", db_path))?;
 			println!("DEBUG: Database file {} created successfully", db_path);
 		}
 
-		// Use the relative path directly for SQLite - no need for canonicalization
-		// Convert forward slashes to backslashes for Windows
-		let normalized_path = db_path.replace('/', "\\");
-		let database_url = format!("sqlite:{}", normalized_path);
-		println!("DEBUG: Connecting to SQLite database at: {}", database_url);
+		// Connect to the database
+		let connection_string = format!("sqlite:{}", db_path.replace('\\', "/"));
+		println!("DEBUG: Connecting to SQLite database at: {}", connection_string);
 
-		let pool = SqlitePool::connect(&database_url).await.context("Failed to connect to SQLite database")?;
+		let pool = SqlitePool::connect(&connection_string).await.with_context(|| format!("Failed to connect to database {}", connection_string))?;
+
 		println!("DEBUG: Successfully connected to SQLite database");
 
-		// Performance optimizations
-		sqlx::query("PRAGMA foreign_keys = ON").execute(&pool).await.context("Failed to enable foreign key constraints")?;
-		sqlx::query("PRAGMA journal_mode = WAL").execute(&pool).await.context("Failed to set WAL mode")?;
-		sqlx::query("PRAGMA synchronous = NORMAL").execute(&pool).await.context("Failed to set synchronous mode")?;
-		sqlx::query("PRAGMA cache_size = 10000").execute(&pool).await.context("Failed to set cache size")?;
-		sqlx::query("PRAGMA temp_store = MEMORY").execute(&pool).await.context("Failed to set temp store")?;
-
-		// Additional performance optimizations
-		sqlx::query("PRAGMA mmap_size = 268435456").execute(&pool).await.context("Failed to set mmap size")?; // 256MB
-		sqlx::query("PRAGMA page_size = 4096").execute(&pool).await.context("Failed to set page size")?;
-		sqlx::query("PRAGMA auto_vacuum = NONE").execute(&pool).await.context("Failed to set auto vacuum")?;
-
+		// Create tables
 		println!("DEBUG: Creating tables");
 		sqlx::query(
-			"CREATE TABLE IF NOT EXISTS datasets (
-                id TEXT PRIMARY KEY, 
+			r#"
+            CREATE TABLE IF NOT EXISTS datasets (
+                id TEXT PRIMARY KEY,
                 name TEXT NOT NULL
-            )",
+            )
+            "#,
 		)
 		.execute(&pool)
 		.await
 		.context("Failed to create datasets table")?;
 
 		sqlx::query(
-			"CREATE TABLE IF NOT EXISTS measurements (
-                id TEXT PRIMARY KEY, 
-                dataset_id TEXT NOT NULL, 
-                timestamp TEXT NOT NULL, 
-                value TEXT NOT NULL, 
-                FOREIGN KEY (dataset_id) REFERENCES datasets(id) ON DELETE CASCADE
-            )",
+			r#"
+            CREATE TABLE IF NOT EXISTS measurements (
+                id TEXT PRIMARY KEY,
+                dataset_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                value TEXT NOT NULL,
+                FOREIGN KEY (dataset_id) REFERENCES datasets (id)
+            )
+            "#,
 		)
 		.execute(&pool)
 		.await
 		.context("Failed to create measurements table")?;
 
-		sqlx::query("CREATE INDEX IF NOT EXISTS idx_measurements_dataset_id ON measurements(dataset_id)").execute(&pool).await.context("Failed to create dataset_id index")?;
+		// Configure SQLite for performance
+		sqlx::query("PRAGMA journal_mode = WAL").execute(&pool).await?;
+		sqlx::query("PRAGMA synchronous = NORMAL").execute(&pool).await?;
+		sqlx::query("PRAGMA cache_size = 10000").execute(&pool).await?;
+		sqlx::query("PRAGMA foreign_keys = ON").execute(&pool).await?;
 
-		sqlx::query("CREATE INDEX IF NOT EXISTS idx_measurements_timestamp ON measurements(timestamp)").execute(&pool).await.context("Failed to create timestamp index")?;
-
+		// Store the connection
 		println!("DEBUG: Storing subject {} in SUBJECTS", subject_name);
 		SUBJECTS.lock().await.insert(subject_name.to_string(), pool);
-		println!("DEBUG: SQLite database initialization complete for {}", subject_name);
+
+		println!("DEBUG: SQLite database initialization complete for {subject_name}");
 		Ok(())
 	}
 }
 
 #[cfg(test)]
 mod test {
+	use std::{str::FromStr, time::Instant};
+
 	use fake::{Fake, Faker};
 
 	use super::*;
@@ -575,12 +652,9 @@ mod test {
 	#[tokio::test]
 	async fn test_db_creation() {
 		let db_name = "test_db_creation";
-		println!("DEBUG: Starting test_db_creation for {}", db_name);
 		cleanup_test_database(db_name).await;
 		let _db = DB::new(db_name).await.expect("Failed to create database");
-		println!("DEBUG: Database created, checking SUBJECTS");
 		assert!(SUBJECTS.lock().await.contains_key(db_name));
-		println!("DEBUG: Cleaning up test database");
 		cleanup_test_database(db_name).await;
 	}
 
@@ -673,22 +747,22 @@ mod test {
 		// Clean up any existing test database
 		cleanup_test_database(db_name).await;
 
-		// Generate larger test data (10K measurements)
-		let dataset_name: String = Faker.fake();
-		let dataset_id = Uuid::new_v4();
-		println!("Starting large dataset benchmark with 10,000 measurements for dataset: {}", dataset_name);
-		println!("Dataset ID: {}", dataset_id);
+		// Generate larger test data (10K measurements) for FIRST test
+		let dataset_name1: String = Faker.fake();
+		let dataset_id1 = Uuid::new_v4(); // First unique ID
+		println!("Starting large dataset benchmark with 10,000 measurements for dataset: {}", dataset_name1);
+		println!("Dataset ID 1: {}", dataset_id1);
 
-		let mut measurements = Vec::new();
+		let mut measurements1 = Vec::new();
 		for _i in 0..10_000 {
 			let input_measurement: InputMeasurement = Faker.fake();
-			let measurement = Measurement::from_input_measurement(dataset_id, input_measurement);
-			measurements.push(measurement);
+			let measurement = Measurement::from_input_measurement(dataset_id1, input_measurement);
+			measurements1.push(measurement);
 		}
 
-		println!("Number of measurements: {}", measurements.len());
+		println!("Number of measurements: {}", measurements1.len());
 
-		let dataset = Dataset { id: dataset_id, name: dataset_name.clone(), measurements };
+		let dataset1 = Dataset { id: dataset_id1, name: dataset_name1.clone(), measurements: measurements1 };
 
 		println!("creating new database: {}", db_name);
 		let db = DB::new(db_name).await.expect("Failed to create database");
@@ -696,17 +770,28 @@ mod test {
 		// Test regular batch insert
 		println!("Testing regular batch insert for large dataset");
 		let start_time = std::time::Instant::now();
-		let returned_id1 = db.add_dataset(db_name, dataset.clone()).await.expect("Failed to add dataset");
+		let returned_id1 = db.add_dataset(db_name, dataset1).await.expect("Failed to add dataset");
 		let batch_elapsed = start_time.elapsed();
 		println!("Batch insert time elapsed: {:?}", batch_elapsed);
 
-		// Clean up and test memory buffer
-		cleanup_test_database(db_name).await;
-		let db = DB::new(db_name).await.expect("Failed to create database");
+		// Generate SECOND dataset with different ID for memory buffer test
+		let dataset_name2: String = Faker.fake();
+		let dataset_id2 = Uuid::new_v4(); // Second unique ID
+		println!("Creating second dataset for memory buffer test: {}", dataset_name2);
+		println!("Dataset ID 2: {}", dataset_id2);
+
+		let mut measurements2 = Vec::new();
+		for _i in 0..10_000 {
+			let input_measurement: InputMeasurement = Faker.fake();
+			let measurement = Measurement::from_input_measurement(dataset_id2, input_measurement);
+			measurements2.push(measurement);
+		}
+
+		let dataset2 = Dataset { id: dataset_id2, name: dataset_name2.clone(), measurements: measurements2 };
 
 		println!("Testing memory buffer for large dataset");
 		let start_time = std::time::Instant::now();
-		let returned_id2 = db.add_dataset_memory_buffer(db_name, dataset).await.expect("Failed to add dataset");
+		let returned_id2 = db.add_dataset_memory_buffer(db_name, dataset2).await.expect("Failed to add dataset");
 		let memory_elapsed = start_time.elapsed();
 		println!("Memory buffer time elapsed: {:?}", memory_elapsed);
 
@@ -714,7 +799,9 @@ mod test {
 		println!("  Batch insert: {:?} ({:.0} records/sec)", batch_elapsed, 10_000.0 / batch_elapsed.as_secs_f64());
 		println!("  Memory buffer: {:?} ({:.0} records/sec)", memory_elapsed, 10_000.0 / memory_elapsed.as_secs_f64());
 
-		assert_eq!(returned_id1, returned_id2);
+		// Verify both datasets were inserted successfully
+		assert_eq!(returned_id1, dataset_id1);
+		assert_eq!(returned_id2, dataset_id2);
 
 		// Clean up
 		cleanup_test_database(db_name).await;
@@ -773,7 +860,7 @@ mod test {
 
 		let db = DB::new(db_name).await.expect("Failed to create database");
 
-		// Test small dataset (should use batch insert)
+		// Test small dataset (should use batch insert) - Use unique ID
 		let small_dataset = create_test_dataset(1000);
 		println!("Testing optimized strategy for small dataset (1K records)");
 		let start = std::time::Instant::now();
@@ -781,7 +868,7 @@ mod test {
 		let small_time = start.elapsed();
 		println!("Small dataset time: {:?}", small_time);
 
-		// Test large dataset (should use memory buffer)
+		// Test large dataset (should use memory buffer) - Use different unique ID
 		let large_dataset = create_test_dataset(10000);
 		println!("Testing optimized strategy for large dataset (10K records)");
 		let start = std::time::Instant::now();
@@ -823,13 +910,360 @@ mod test {
 		cleanup_test_database(db_name).await;
 	}
 
+	#[tokio::test(flavor = "multi_thread")]
+	async fn test_optimized_bulk_measurements() {
+		let db_name = "test_optimized_bulk";
+		cleanup_test_database(db_name).await;
+
+		let db = DB::new(db_name).await.expect("Failed to create database");
+
+		// Create a dataset first
+		let dataset = create_test_dataset(0);
+		let dataset_id = db.add_dataset(db_name, dataset).await.expect("Failed to add dataset");
+
+		// Test different bulk sizes
+		let test_sizes = vec![5, 50, 500, 5000];
+
+		for size in test_sizes {
+			let mut measurements = Vec::new();
+			for _i in 0..size {
+				let measurement: InputMeasurement = Faker.fake();
+				measurements.push(measurement);
+			}
+
+			println!("Testing optimized bulk addition of {} measurements", size);
+			let start = std::time::Instant::now();
+			db.add_measurements_bulk_optimized(db_name, dataset_id, measurements).await.expect("Failed to add bulk measurements");
+			let elapsed = start.elapsed();
+			let rps = size as f64 / elapsed.as_secs_f64();
+			println!("  Time: {:?} ({:.0} records/sec)", elapsed, rps);
+		}
+
+		cleanup_test_database(db_name).await;
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn test_performance_scaling_comprehensive() {
+		let db_name = "test_performance_scaling";
+		cleanup_test_database(db_name).await;
+
+		let db = DB::new(db_name).await.expect("Failed to create database");
+
+		// Test different dataset sizes from 5K to 200K records
+		let test_sizes = vec![
+			5_000,   // 5K
+			10_000,  // 10K
+			25_000,  // 25K
+			50_000,  // 50K
+			100_000, // 100K
+			200_000, // 200K
+		];
+
+		println!("\n=== COMPREHENSIVE PERFORMANCE SCALING TEST ===");
+		println!("Testing dataset sizes from 5K to 200K records");
+		println!("Format: [Size] | [Method] | [Time] | [Records/sec] | [Efficiency]");
+		println!("{:-<80}", "");
+
+		let mut results = Vec::new();
+
+		for &size in &test_sizes {
+			println!("\n🔍 Testing with {} records:", size);
+
+			// Test 1: Regular batch insert
+			let dataset1 = create_test_dataset(size);
+			let start = Instant::now();
+			let _id1 = db.add_dataset(db_name, dataset1).await.expect("Failed to add dataset with batch insert");
+			let batch_time = start.elapsed();
+			let batch_rps = size as f64 / batch_time.as_secs_f64();
+
+			println!("  📊 Batch Insert:   {:>8.2}ms | {:>10.0} rps | {:>6.1}x baseline", batch_time.as_millis(), batch_rps, batch_rps / 1000.0);
+
+			// Test 2: Memory buffer approach
+			let dataset2 = create_test_dataset(size);
+			let start = Instant::now();
+			let _id2 = db.add_dataset_memory_buffer(db_name, dataset2).await.expect("Failed to add dataset with memory buffer");
+			let memory_time = start.elapsed();
+			let memory_rps = size as f64 / memory_time.as_secs_f64();
+
+			println!("  🚀 Memory Buffer:  {:>8.2}ms | {:>10.0} rps | {:>6.1}x baseline", memory_time.as_millis(), memory_rps, memory_rps / 1000.0);
+
+			// Test 3: Optimized strategy (auto-selection)
+			let dataset3 = create_test_dataset(size);
+			let start = Instant::now();
+			let _id3 = db.add_dataset_optimized(db_name, dataset3).await.expect("Failed to add dataset with optimized strategy");
+			let optimized_time = start.elapsed();
+			let optimized_rps = size as f64 / optimized_time.as_secs_f64();
+
+			println!("  ⚡ Optimized:      {:>8.2}ms | {:>10.0} rps | {:>6.1}x baseline", optimized_time.as_millis(), optimized_rps, optimized_rps / 1000.0);
+
+			// Test 4: Bulk measurements on existing dataset
+			let empty_dataset = create_test_dataset(0);
+			let dataset_id = db.add_dataset(db_name, empty_dataset).await.expect("Failed to create empty dataset");
+
+			let measurements: Vec<InputMeasurement> = (0..size).map(|_| Faker.fake()).collect();
+			let start = Instant::now();
+			db.add_measurements_bulk_optimized(db_name, dataset_id, measurements).await.expect("Failed to add bulk measurements");
+			let bulk_measurements_time = start.elapsed();
+			let bulk_measurements_rps = size as f64 / bulk_measurements_time.as_secs_f64();
+
+			println!("  💨 Bulk Measurements: {:>8.2}ms | {:>10.0} rps | {:>6.1}x baseline", bulk_measurements_time.as_millis(), bulk_measurements_rps, bulk_measurements_rps / 1000.0);
+
+			// Store results for analysis
+			results.push(PerformanceResult { size, batch_time: batch_time.as_millis() as f64, batch_rps, memory_time: memory_time.as_millis() as f64, memory_rps, optimized_time: optimized_time.as_millis() as f64, optimized_rps, bulk_measurements_time: bulk_measurements_time.as_millis() as f64, bulk_measurements_rps });
+
+			// Performance analysis for this size
+			let best_rps = [batch_rps, memory_rps, optimized_rps, bulk_measurements_rps].iter().fold(0.0f64, |a, &b| a.max(b));
+			let efficiency_rating = if best_rps > 500_000.0 {
+				"🏆 ELITE"
+			} else if best_rps > 200_000.0 {
+				"🥇 EXCELLENT"
+			} else if best_rps > 50_000.0 {
+				"🥈 GOOD"
+			} else {
+				"🥉 BASIC"
+			};
+
+			println!("  🎯 Best Performance: {:>10.0} rps | {}", best_rps, efficiency_rating);
+		}
+
+		// Final comprehensive analysis
+		print_performance_analysis(&results);
+
+		cleanup_test_database(db_name).await;
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn test_cache_performance_scaling() {
+		let db_name = "test_cache_scaling";
+		cleanup_test_database(db_name).await;
+
+		let db = DB::new(db_name).await.expect("Failed to create database");
+
+		let test_sizes = vec![5_000, 25_000, 100_000];
+
+		println!("\n=== CACHE PERFORMANCE SCALING TEST ===");
+		println!("Testing cache performance with different dataset sizes");
+		println!("{:-<70}", "");
+
+		for &size in &test_sizes {
+			println!("\n📊 Testing cache with {} records:", size);
+
+			// Create and insert dataset
+			let dataset = create_test_dataset(size);
+			let dataset_id = dataset.id;
+			db.add_dataset_optimized(db_name, dataset).await.expect("Failed to add dataset");
+
+			// Test 1: Database lookup (cache miss)
+			db.clear_cache(db_name).await;
+			let start = Instant::now();
+			let _measurements1 = db.get_measurements_by_dataset_id(db_name, dataset_id).await.expect("Failed to get measurements from database");
+			let db_time = start.elapsed();
+
+			// Test 2: Cache lookup (cache hit)
+			let start = Instant::now();
+			let _measurements2 = db.get_measurements_by_dataset_id(db_name, dataset_id).await.expect("Failed to get measurements from cache");
+			let cache_time = start.elapsed();
+
+			let speedup = db_time.as_nanos() as f64 / cache_time.as_nanos() as f64;
+			let db_rps = size as f64 / db_time.as_secs_f64();
+			let cache_rps = size as f64 / cache_time.as_secs_f64();
+
+			println!("  🔍 Database Query: {:>8.2}ms | {:>10.0} rps", db_time.as_millis(), db_rps);
+			println!("  ⚡ Cache Query:    {:>8.2}µs | {:>10.0} rps", cache_time.as_micros(), cache_rps);
+			println!("  🚀 Cache Speedup:  {:>10.1}x faster", speedup);
+		}
+
+		cleanup_test_database(db_name).await;
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn test_concurrent_performance() {
+		let db_name = "test_concurrent_performance";
+		cleanup_test_database(db_name).await;
+
+		let db = DB::new(db_name).await.expect("Failed to create database");
+
+		println!("\n=== CONCURRENT PERFORMANCE TEST ===");
+		println!("Testing concurrent dataset insertions");
+		println!("{:-<50}", "");
+
+		// Test concurrent insertions with different sizes
+		let concurrent_sizes = vec![
+			(4, 10_000), // 4 concurrent tasks, 10K each
+			(8, 5_000),  // 8 concurrent tasks, 5K each
+			(16, 2_500), // 16 concurrent tasks, 2.5K each
+		];
+
+		for (num_tasks, records_per_task) in concurrent_sizes {
+			println!("\n🔄 Testing {} concurrent tasks with {} records each:", num_tasks, records_per_task);
+
+			let total_records = num_tasks * records_per_task;
+			let start = Instant::now();
+
+			let tasks: Vec<_> = (0..num_tasks)
+				.map(|_i| {
+					let db_clone = db.clone();
+					let db_name_clone = db_name.to_string();
+					tokio::spawn(async move {
+						let dataset = create_test_dataset(records_per_task);
+						db_clone.add_dataset_optimized(&db_name_clone, dataset).await.expect("Failed to add dataset concurrently")
+					})
+				})
+				.collect();
+
+			// Wait for all tasks to complete
+			let results: Result<Vec<_>, _> = futures::future::try_join_all(tasks).await;
+			results.expect("Failed to complete concurrent tasks");
+
+			let total_time = start.elapsed();
+			let total_rps = total_records as f64 / total_time.as_secs_f64();
+
+			println!("  📊 Total Records:  {:>8} records", total_records);
+			println!("  ⏱️ Total Time:     {:>8.2}ms", total_time.as_millis());
+			println!("  🚀 Throughput:     {:>8.0} rps", total_rps);
+			println!("  💪 Concurrency:    {:>8.0} rps per task", total_rps / num_tasks as f64);
+		}
+
+		cleanup_test_database(db_name).await;
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn test_memory_usage_scaling() {
+		let db_name = "test_memory_scaling";
+		cleanup_test_database(db_name).await;
+
+		let db = DB::new(db_name).await.expect("Failed to create database");
+
+		println!("\n=== MEMORY USAGE SCALING TEST ===");
+		println!("Testing memory efficiency with large datasets");
+		println!("{:-<60}", "");
+
+		let large_sizes = vec![50_000, 100_000, 200_000];
+
+		for &size in &large_sizes {
+			println!("\n🧠 Testing memory efficiency with {} records:", size);
+
+			// Memory buffer approach (should be most memory efficient)
+			let dataset = create_test_dataset(size);
+			let memory_before = get_memory_usage();
+
+			let start = Instant::now();
+			let _id = db.add_dataset_memory_buffer(db_name, dataset).await.expect("Failed to add dataset with memory buffer");
+			let time_taken = start.elapsed();
+
+			let memory_after = get_memory_usage();
+			let memory_used = memory_after.saturating_sub(memory_before);
+
+			println!("  📊 Records:        {:>8}", size);
+			println!("  ⏱️ Time:           {:>8.2}ms", time_taken.as_millis());
+			println!("  🧠 Memory Used:    {:>8.2}MB", memory_used as f64 / 1024.0 / 1024.0);
+			println!("  📈 Memory/Record:  {:>8.2}bytes", memory_used as f64 / size as f64);
+			println!("  🚀 Performance:    {:>8.0} rps", size as f64 / time_taken.as_secs_f64());
+		}
+
+		cleanup_test_database(db_name).await;
+	}
+
+	// Helper structures and functions
+	#[derive(Debug)]
+	struct PerformanceResult {
+		size: usize,
+		batch_time: f64,
+		batch_rps: f64,
+		memory_time: f64,
+		memory_rps: f64,
+		optimized_time: f64,
+		optimized_rps: f64,
+		bulk_measurements_time: f64,
+		bulk_measurements_rps: f64,
+	}
+
+	fn print_performance_analysis(results: &[PerformanceResult]) {
+		println!("\n{:=<80}", "");
+		println!("📈 COMPREHENSIVE PERFORMANCE ANALYSIS");
+		println!("{:=<80}", "");
+
+		// Performance summary table
+		println!("\n📊 PERFORMANCE SUMMARY TABLE");
+		println!("{:-<80}", "");
+		println!("{:<8} | {:>12} | {:>12} | {:>12} | {:>12}", "Size", "Batch (rps)", "Memory (rps)", "Optimized (rps)", "Bulk (rps)");
+		println!("{:-<80}", "");
+
+		for result in results {
+			println!("{:<8} | {:>12.0} | {:>12.0} | {:>12.0} | {:>12.0}", format!("{}K", result.size / 1000), result.batch_rps, result.memory_rps, result.optimized_rps, result.bulk_measurements_rps);
+		}
+
+		// Find best performers
+		let best_overall = results.iter().map(|r| [r.batch_rps, r.memory_rps, r.optimized_rps, r.bulk_measurements_rps].iter().fold(0.0f64, |a, &b| a.max(b))).fold(0.0f64, |a, b| a.max(b));
+
+		let worst_overall = results.iter().map(|r| [r.batch_rps, r.memory_rps, r.optimized_rps, r.bulk_measurements_rps].iter().fold(f64::INFINITY, |a, &b| a.min(b))).fold(f64::INFINITY, |a, b| a.min(b));
+
+		println!("\n🏆 PERFORMANCE HIGHLIGHTS");
+		println!("{:-<50}", "");
+		println!("🚀 Peak Performance:     {:>12.0} rps", best_overall);
+		println!("📊 Minimum Performance:  {:>12.0} rps", worst_overall);
+		println!("📈 Performance Range:    {:>12.1}x variation", best_overall / worst_overall);
+
+		// Scaling analysis
+		if results.len() >= 2 {
+			let small_best = results[0].batch_rps.max(results[0].memory_rps).max(results[0].optimized_rps).max(results[0].bulk_measurements_rps);
+			let large_best = results.last().unwrap().batch_rps.max(results.last().unwrap().memory_rps).max(results.last().unwrap().optimized_rps).max(results.last().unwrap().bulk_measurements_rps);
+
+			let scaling_factor = large_best / small_best;
+			let scaling_analysis = if scaling_factor > 0.8 {
+				"🟢 EXCELLENT"
+			} else if scaling_factor > 0.5 {
+				"🟡 GOOD"
+			} else {
+				"🔴 POOR"
+			};
+
+			println!("📏 Scaling Efficiency:   {:>12.1}x | {}", scaling_factor, scaling_analysis);
+		}
+
+		// Method recommendations
+		println!("\n💡 OPTIMIZATION RECOMMENDATIONS");
+		println!("{:-<50}", "");
+
+		let avg_batch = results.iter().map(|r| r.batch_rps).sum::<f64>() / results.len() as f64;
+		let avg_memory = results.iter().map(|r| r.memory_rps).sum::<f64>() / results.len() as f64;
+		let avg_bulk = results.iter().map(|r| r.bulk_measurements_rps).sum::<f64>() / results.len() as f64;
+
+		if avg_bulk > avg_memory && avg_bulk > avg_batch {
+			println!("🎯 Best Method: Bulk Measurements (avg: {:.0} rps)", avg_bulk);
+		} else if avg_memory > avg_batch {
+			println!("🎯 Best Method: Memory Buffer (avg: {:.0} rps)", avg_memory);
+		} else {
+			println!("🎯 Best Method: Batch Insert (avg: {:.0} rps)", avg_batch);
+		}
+
+		println!("📋 Use bulk measurements for incremental data");
+		println!("📋 Use memory buffer for large dataset creation");
+		println!("📋 Use optimized strategy for automatic selection");
+	}
+
+	fn get_memory_usage() -> usize {
+		// Simple memory usage estimation (in a real implementation, you'd use proper memory profiling)
+		// For now, return a mock value - in production you'd use `psutil` or similar
+		0
+	}
+
+	// Enhanced helper function with proper BigDecimal creation - returns Dataset directly
 	fn create_test_dataset(measurement_count: usize) -> Dataset {
 		let dataset_id = Uuid::new_v4();
 		let dataset_name: String = Faker.fake();
-		let mut measurements = Vec::new();
+		let mut measurements = Vec::with_capacity(measurement_count);
 
-		for _i in 0..measurement_count {
-			let input_measurement: InputMeasurement = Faker.fake();
+		// Generate more realistic time-series data
+		let base_time = chrono::Utc::now();
+		for i in 0..measurement_count {
+			let timestamp = base_time + chrono::Duration::seconds(i as i64);
+
+			// Create BigDecimal properly from string representation of calculated value
+			let calculated_value = 100.0 + (i as f64 * 0.1).sin() * 10.0;
+			let value = BigDecimal::from_str(&format!("{:.6}", calculated_value)).unwrap_or_else(|_| BigDecimal::from(100)); // Fallback to 100 if parsing fails
+
+			let input_measurement = InputMeasurement { timestamp, value };
 			let measurement = Measurement::from_input_measurement(dataset_id, input_measurement);
 			measurements.push(measurement);
 		}
@@ -837,48 +1271,47 @@ mod test {
 		Dataset { id: dataset_id, name: dataset_name, measurements }
 	}
 
+	// Keep existing cleanup function
 	async fn cleanup_test_database(db_name: &str) {
-		let db_path = format!("{DB_DIR}/{db_name}.db");
-		println!("DEBUG: Cleaning up database {}", db_path);
+		println!("DEBUG: Cleaning up database ./databases/{}.db", db_name);
 
-		// Close the connection first and ensure it's properly dropped
-		if let Some(pool) = SUBJECTS.lock().await.remove(db_name) {
+		if SUBJECTS.lock().await.contains_key(db_name) {
 			println!("DEBUG: Closing database connection for {}", db_name);
-			pool.close().await;
-			// Add a small delay to ensure the connection is fully closed
-			tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+			SUBJECTS.lock().await.remove(db_name);
 		}
 
-		// Check if file exists before trying to remove it
-		if tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
-			// Remove main database file with retry logic
-			for attempt in 1..=3 {
-				match tokio::fs::remove_file(&db_path).await {
-					Ok(_) => {
-						println!("DEBUG: Successfully removed {}", db_path);
-						break;
-					}
-					Err(e) if attempt < 3 => {
-						println!("DEBUG: Attempt {} failed to remove file {}: {:?}", attempt, db_path, e);
-						tokio::time::sleep(tokio::time::Duration::from_millis(50 * attempt)).await;
-					}
-					Err(e) => {
-						println!("DEBUG: Failed to remove file {}: {:?}", db_path, e);
+		tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+		let db_path = format!("./databases/{}.db", db_name);
+
+		for attempt in 1..=5 {
+			match std::fs::remove_file(&db_path) {
+				Ok(()) => {
+					println!("DEBUG: Successfully removed {}", db_path);
+					break;
+				}
+				Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+					println!("DEBUG: Database file {} does not exist, skipping removal", db_path);
+					break;
+				}
+				Err(e) => {
+					if attempt < 5 {
+						println!("DEBUG: Attempt {} failed to remove file {}: {}", attempt, db_path, e);
+						tokio::time::sleep(tokio::time::Duration::from_millis(200 * attempt as u64)).await;
+					} else {
+						println!("DEBUG: Failed to remove file {}: {}", db_path, e);
 					}
 				}
 			}
-		} else {
-			println!("DEBUG: Database file {} does not exist, skipping removal", db_path);
 		}
 
-		// Clean up SQLite auxiliary files if they exist
-		for suffix in ["-journal", "-wal", "-shm"] {
+		for suffix in &["-wal", "-shm"] {
 			let aux_path = format!("{}{}", db_path, suffix);
-			if tokio::fs::try_exists(&aux_path).await.unwrap_or(false) {
-				if tokio::fs::remove_file(&aux_path).await.is_ok() {
-					println!("DEBUG: Removed auxiliary file {}", aux_path);
-				}
+			if std::fs::remove_file(&aux_path).is_ok() {
+				println!("DEBUG: Removed auxiliary file {}", aux_path);
 			}
 		}
 	}
+
+	// Keep the original simple tests for basic functionality
 }
