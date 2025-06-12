@@ -18,8 +18,15 @@ mod types;
 pub use cache::DatabaseCache;
 
 const DB_DIR: &str = "./databases";
-static SUBJECTS: LazyLock<Arc<Mutex<HashMap<String, Pool<Sqlite>>>>> = LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
-static CACHE: LazyLock<DatabaseCache> = LazyLock::new(|| DatabaseCache::default());
+const BATCH_SIZE: usize = 1000;
+const MEMORY_BATCH_SIZE: usize = 1000; // Add this constant at module level
+const TRANSFER_BATCH_SIZE: usize = 1000; // Add this constant at module level
+
+// Define the type alias before using it
+type SubjectPoolMap = Arc<Mutex<HashMap<String, Pool<Sqlite>>>>;
+
+static SUBJECTS: LazyLock<SubjectPoolMap> = LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+static CACHE: LazyLock<DatabaseCache> = LazyLock::new(DatabaseCache::default);
 
 #[derive(Debug, Clone)]
 pub struct DB {
@@ -46,7 +53,7 @@ impl DB {
 	pub async fn existing() -> Self {
 		let db = Self { dir: DB_DIR.to_string() };
 		if let Err(e) = db.initialize_existing_subjects().await {
-			eprintln!("Warning: Failed to initialize existing subjects: {}", e);
+			eprintln!("Warning: Failed to initialize existing subjects: {e}");
 		}
 		db
 	}
@@ -56,7 +63,7 @@ impl DB {
 	/// Returns an error if the subject connection is not found
 	async fn get_pool(&self, subject_name: &str) -> Result<Pool<Sqlite>> {
 		let subjects = SUBJECTS.lock().await;
-		subjects.get(subject_name).cloned().with_context(|| format!("No database connection found for subject: {}", subject_name))
+		subjects.get(subject_name).cloned().with_context(|| format!("No database connection found for subject: {subject_name}"))
 	}
 
 	/// Get a dataset's id by its name with cache support.
@@ -121,6 +128,8 @@ impl DB {
 	}
 
 	/// Add a dataset using batch insert approach
+	/// # Errors
+	/// Returns an error if database connection fails, transaction fails, or SQL operations fail
 	pub async fn add_dataset(&self, subject_name: &str, dataset: Dataset) -> Result<Uuid> {
 		let pool = self.get_pool(subject_name).await?;
 		println!("DEBUG: Starting add_dataset for {} with dataset ID {}", dataset.name, dataset.id);
@@ -133,13 +142,12 @@ impl DB {
 		// Insert all measurements in batches
 		if !dataset.measurements.is_empty() {
 			let total_measurements = dataset.measurements.len();
-			const BATCH_SIZE: usize = 1000;
 
 			for (batch_index, chunk) in dataset.measurements.chunks(BATCH_SIZE).enumerate() {
 				// Build a batch INSERT statement
 				let placeholders = chunk.iter().map(|_| "(?, ?, ?, ?)").collect::<Vec<_>>().join(", ");
 
-				let sql = format!("INSERT INTO measurements (id, dataset_id, timestamp, value) VALUES {}", placeholders);
+				let sql = format!("INSERT INTO measurements (id, dataset_id, timestamp, value) VALUES {placeholders}");
 
 				let mut query = sqlx::query(&sql);
 
@@ -174,6 +182,8 @@ impl DB {
 	/// Add a dataset using memory buffer approach for maximum performance
 	/// This creates a temporary in-memory database, performs all inserts there,
 	/// then transfers the data to the persistent database in one operation
+	/// # Errors
+	/// Returns an error if memory database creation fails, SQL operations fail, or data transfer fails
 	pub async fn add_dataset_memory_buffer(&self, subject_name: &str, dataset: Dataset) -> Result<Uuid> {
 		println!("DEBUG: Starting add_dataset_memory_buffer for {} with dataset ID {}", dataset.name, dataset.id);
 
@@ -182,19 +192,19 @@ impl DB {
 
 		// Create tables in memory database
 		sqlx::query(
-			r#"
+			r"
             CREATE TABLE datasets (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL
             )
-            "#,
+            ",
 		)
 		.execute(&memory_pool)
 		.await
 		.context("Failed to create datasets table in memory")?;
 
 		sqlx::query(
-			r#"
+			r"
             CREATE TABLE measurements (
                 id TEXT PRIMARY KEY,
                 dataset_id TEXT NOT NULL,
@@ -202,7 +212,7 @@ impl DB {
                 value TEXT NOT NULL,
                 FOREIGN KEY (dataset_id) REFERENCES datasets (id)
             )
-            "#,
+            ",
 		)
 		.execute(&memory_pool)
 		.await
@@ -219,12 +229,11 @@ impl DB {
 		// Insert all measurements into memory database using batch insert
 		if !dataset.measurements.is_empty() {
 			let total_measurements = dataset.measurements.len();
-			const BATCH_SIZE: usize = 1000; // Larger batch size for memory operations
 
-			for (batch_index, chunk) in dataset.measurements.chunks(BATCH_SIZE).enumerate() {
+			for (batch_index, chunk) in dataset.measurements.chunks(MEMORY_BATCH_SIZE).enumerate() {
 				let placeholders = chunk.iter().map(|_| "(?, ?, ?, ?)").collect::<Vec<_>>().join(", ");
 
-				let sql = format!("INSERT INTO measurements (id, dataset_id, timestamp, value) VALUES {}", placeholders);
+				let sql = format!("INSERT INTO measurements (id, dataset_id, timestamp, value) VALUES {placeholders}");
 
 				let mut query = sqlx::query(&sql);
 
@@ -239,7 +248,7 @@ impl DB {
 				}
 			}
 
-			println!("DEBUG: Successfully inserted {} measurements into memory database", total_measurements);
+			println!("DEBUG: Successfully inserted {total_measurements} measurements into memory database");
 		}
 
 		// Now transfer data to persistent database
@@ -253,12 +262,10 @@ impl DB {
 
 		// Transfer measurements from memory to persistent database
 		if !dataset.measurements.is_empty() {
-			const TRANSFER_BATCH_SIZE: usize = 1000;
-
 			for chunk in dataset.measurements.chunks(TRANSFER_BATCH_SIZE) {
 				let placeholders = chunk.iter().map(|_| "(?, ?, ?, ?)").collect::<Vec<_>>().join(", ");
 
-				let sql = format!("INSERT INTO measurements (id, dataset_id, timestamp, value) VALUES {}", placeholders);
+				let sql = format!("INSERT INTO measurements (id, dataset_id, timestamp, value) VALUES {placeholders}");
 
 				let mut query = sqlx::query(&sql);
 
@@ -293,20 +300,24 @@ impl DB {
 	}
 
 	/// Intelligent dataset insertion that chooses the optimal method based on size
+	/// # Errors
+	/// Returns an error if the underlying insertion method fails
 	pub async fn add_dataset_optimized(&self, subject_name: &str, dataset: Dataset) -> Result<Uuid> {
 		let measurement_count = dataset.measurements.len();
 
 		// Use memory buffer for large datasets, batch insert for smaller ones
 		if measurement_count >= 5000 {
-			println!("DEBUG: Using memory buffer for large dataset ({} measurements)", measurement_count);
+			println!("DEBUG: Using memory buffer for large dataset ({measurement_count} measurements)");
 			self.add_dataset_memory_buffer(subject_name, dataset).await
 		} else {
-			println!("DEBUG: Using batch insert for small dataset ({} measurements)", measurement_count);
+			println!("DEBUG: Using batch insert for small dataset ({measurement_count} measurements)");
 			self.add_dataset(subject_name, dataset).await
 		}
 	}
 
 	/// Optimized bulk measurement addition with better performance
+	/// # Errors
+	/// Returns an error if database operations fail or measurements cannot be inserted
 	pub async fn add_measurements_bulk_optimized(&self, subject_name: &str, dataset_id: Uuid, measurements: Vec<InputMeasurement>) -> Result<()> {
 		let pool = self.get_pool(subject_name).await?;
 		let measurement_count = measurements.len();
@@ -315,7 +326,7 @@ impl DB {
 			return Ok(());
 		}
 
-		println!("DEBUG: Adding {} measurements to dataset {} (optimized)", measurement_count, dataset_id);
+		println!("DEBUG: Adding {measurement_count} measurements to dataset {dataset_id} (optimized)");
 
 		// Use different strategies based on measurement count
 		match measurement_count {
@@ -324,13 +335,13 @@ impl DB {
 				for measurement in measurements {
 					self.add_measurement(subject_name, dataset_id, measurement).await?;
 				}
-				println!("DEBUG: Added {} measurements individually", measurement_count);
+				println!("DEBUG: Added {measurement_count} measurements individually");
 			}
 			11..=999 => {
 				// Single batch insert for medium batches
 				let placeholders = measurements.iter().map(|_| "(?, ?, ?, ?)").collect::<Vec<_>>().join(", ");
 
-				let sql = format!("INSERT INTO measurements (id, dataset_id, timestamp, value) VALUES {}", placeholders);
+				let sql = format!("INSERT INTO measurements (id, dataset_id, timestamp, value) VALUES {placeholders}");
 
 				let mut query = sqlx::query(&sql);
 
@@ -341,17 +352,16 @@ impl DB {
 
 				query.execute(&pool).await.context("Failed to insert measurement batch")?;
 
-				println!("DEBUG: Added {} measurements in single batch", measurement_count);
+				println!("DEBUG: Added {measurement_count} measurements in single batch");
 			}
 			_ => {
 				// Multi-batch insert with transaction for large batches
 				let mut tx = pool.begin().await.context("Failed to start transaction")?;
-				const BATCH_SIZE: usize = 1000;
 
 				for (batch_index, chunk) in measurements.chunks(BATCH_SIZE).enumerate() {
 					let placeholders = chunk.iter().map(|_| "(?, ?, ?, ?)").collect::<Vec<_>>().join(", ");
 
-					let sql = format!("INSERT INTO measurements (id, dataset_id, timestamp, value) VALUES {}", placeholders);
+					let sql = format!("INSERT INTO measurements (id, dataset_id, timestamp, value) VALUES {placeholders}");
 
 					let mut query = sqlx::query(&sql);
 
@@ -360,11 +370,11 @@ impl DB {
 						query = query.bind(measurement_id.to_string()).bind(dataset_id.to_string()).bind(measurement.timestamp.to_rfc3339()).bind(measurement.value.to_string());
 					}
 
-					query.execute(&mut *tx).await.with_context(|| format!("Failed to insert measurement batch {}", batch_index + 1))?;
+					query.execute(&mut *tx).await.with_context(|| format!("Failed to insert batch {} of measurements", batch_index + 1))?;
 				}
 
 				tx.commit().await.context("Failed to commit measurements transaction")?;
-				println!("DEBUG: Added {} measurements in {} batches", measurement_count, (measurement_count + BATCH_SIZE - 1) / BATCH_SIZE);
+				println!("DEBUG: Added {} measurements in {} batches", measurement_count, measurement_count.div_ceil(BATCH_SIZE));
 			}
 		}
 
@@ -372,6 +382,8 @@ impl DB {
 	}
 
 	/// Batch insert multiple datasets efficiently
+	/// # Errors
+	/// Returns an error if any dataset insertion fails
 	pub async fn add_datasets_bulk(&self, subject_name: &str, datasets: Vec<Dataset>) -> Result<Vec<Uuid>> {
 		let mut result_ids = Vec::new();
 		let total_measurements: usize = datasets.iter().map(|d| d.measurements.len()).sum();
@@ -397,6 +409,8 @@ impl DB {
 	}
 
 	/// Add measurements to existing dataset with smart batching
+	/// # Errors
+	/// Returns an error if database operations fail or transaction cannot be committed
 	pub async fn add_measurements_bulk(&self, subject_name: &str, dataset_id: Uuid, measurements: Vec<InputMeasurement>) -> Result<()> {
 		let pool = self.get_pool(subject_name).await?;
 		let measurement_count = measurements.len();
@@ -405,17 +419,16 @@ impl DB {
 			return Ok(());
 		}
 
-		println!("DEBUG: Adding {} measurements to dataset {}", measurement_count, dataset_id);
+		println!("DEBUG: Adding {measurement_count} measurements to dataset {dataset_id}");
 
 		if measurement_count >= 1000 {
 			// Use batch insert for large numbers of measurements
 			let mut tx = pool.begin().await.context("Failed to start transaction")?;
-			const BATCH_SIZE: usize = 1000;
 
 			for (batch_index, chunk) in measurements.chunks(BATCH_SIZE).enumerate() {
 				let placeholders = chunk.iter().map(|_| "(?, ?, ?, ?)").collect::<Vec<_>>().join(", ");
 
-				let sql = format!("INSERT INTO measurements (id, dataset_id, timestamp, value) VALUES {}", placeholders);
+				let sql = format!("INSERT INTO measurements (id, dataset_id, timestamp, value) VALUES {placeholders}");
 
 				let mut query = sqlx::query(&sql);
 
@@ -432,13 +445,13 @@ impl DB {
 			}
 
 			tx.commit().await.context("Failed to commit measurements transaction")?;
-			println!("DEBUG: Successfully added {} measurements in batches", measurement_count);
+			println!("DEBUG: Successfully added {measurement_count} measurements in batches");
 		} else {
 			// Use individual inserts for small numbers of measurements
 			for measurement in measurements {
 				self.add_measurement(subject_name, dataset_id, measurement).await?;
 			}
-			println!("DEBUG: Successfully added {} measurements individually", measurement_count);
+			println!("DEBUG: Successfully added {measurement_count} measurements individually");
 		}
 
 		Ok(())
@@ -449,7 +462,7 @@ impl DB {
 		let cache_stats = self.get_cache_stats().await;
 		let mut stats = HashMap::new();
 
-		stats.insert("cache_entries".to_string(), format!("{:?}", cache_stats));
+		stats.insert("cache_entries".to_string(), format!("{cache_stats:?}"));
 		stats.insert("implementation".to_string(), "High-performance SQLite with intelligent batching".to_string());
 		stats.insert("small_dataset_performance".to_string(), "~170K records/sec".to_string());
 		stats.insert("large_dataset_performance".to_string(), "~160K records/sec (memory buffer)".to_string());
@@ -523,10 +536,10 @@ impl DB {
 		println!("DEBUG: Starting initialize_existing_subjects for {}", self.dir);
 
 		// Create directory if it doesn't exist
-		if let Err(e) = std::fs::create_dir_all(&self.dir) {
-			if e.kind() != std::io::ErrorKind::AlreadyExists {
-				return Err(anyhow::anyhow!("Failed to create directory {}: {}", self.dir, e));
-			}
+		if let Err(e) = std::fs::create_dir_all(&self.dir)
+			&& e.kind() != std::io::ErrorKind::AlreadyExists
+		{
+			return Err(anyhow::anyhow!("Failed to create directory {}: {}", self.dir, e));
 		}
 		println!("DEBUG: Directory {} created or exists", self.dir);
 
@@ -538,25 +551,25 @@ impl DB {
 			let path = entry.path();
 
 			if let Some(path_str) = path.to_str() {
-				println!("DEBUG: Processing path {:?}", path_str);
+				println!("DEBUG: Processing path {path_str:?}");
 
-				if path_str.ends_with(".db") && !path_str.contains("-journal") && !path_str.contains("-wal") && !path_str.contains("-shm") {
+				if std::path::Path::new(path_str).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("db")) && !path_str.contains("-journal") && !path_str.contains("-wal") && !path_str.contains("-shm") {
 					// Extract subject name from filename
-					if let Some(filename) = path.file_stem() {
-						if let Some(subject_name) = filename.to_str() {
-							println!("DEBUG: Attempting to initialize connection for {}", path_str);
+					if let Some(filename) = path.file_stem()
+						&& let Some(subject_name) = filename.to_str()
+					{
+						println!("DEBUG: Attempting to initialize connection for {path_str}");
 
-							let connection_string = format!("sqlite:{}", path_str.replace('\\', "/"));
-							println!("DEBUG: Connecting to database: {}", connection_string);
+						let connection_string = format!("sqlite:{}", path_str.replace('\\', "/"));
+						println!("DEBUG: Connecting to database: {connection_string}");
 
-							match SqlitePool::connect(&connection_string).await {
-								Ok(pool) => {
-									println!("DEBUG: Successfully connected to existing database for subject {}", subject_name);
-									SUBJECTS.lock().await.insert(subject_name.to_string(), pool);
-								}
-								Err(e) => {
-									eprintln!("Warning: Failed to connect to existing database {}: {}", path_str, e);
-								}
+						match SqlitePool::connect(&connection_string).await {
+							Ok(pool) => {
+								println!("DEBUG: Successfully connected to existing database for subject {subject_name}");
+								SUBJECTS.lock().await.insert(subject_name.to_string(), pool);
+							}
+							Err(e) => {
+								eprintln!("Warning: Failed to connect to existing database {path_str}: {e}");
 							}
 						}
 					}
@@ -569,13 +582,13 @@ impl DB {
 	}
 
 	async fn initialize_new_subject(&self, subject_name: &str) -> Result<()> {
-		println!("DEBUG: Starting SQLite database creation for {}", subject_name);
+		println!("DEBUG: Starting SQLite database creation for {subject_name}");
 
 		// Create directory if it doesn't exist
-		if let Err(e) = std::fs::create_dir_all(&self.dir) {
-			if e.kind() != std::io::ErrorKind::AlreadyExists {
-				return Err(anyhow::anyhow!("Failed to create directory {}: {}", self.dir, e));
-			}
+		if let Err(e) = std::fs::create_dir_all(&self.dir)
+			&& e.kind() != std::io::ErrorKind::AlreadyExists
+		{
+			return Err(anyhow::anyhow!("Failed to create directory {}: {}", self.dir, e));
 		}
 		println!("DEBUG: Directory {} created successfully", self.dir);
 
@@ -583,36 +596,36 @@ impl DB {
 
 		// Check if database file exists
 		if !std::path::Path::new(&db_path).exists() {
-			println!("DEBUG: Database file {} does not exist, creating it", db_path);
+			println!("DEBUG: Database file {db_path} does not exist, creating it");
 			// Create the file
-			std::fs::File::create(&db_path).with_context(|| format!("Failed to create database file {}", db_path))?;
-			println!("DEBUG: Database file {} created successfully", db_path);
+			std::fs::File::create(&db_path).with_context(|| format!("Failed to create database file {db_path}"))?;
+			println!("DEBUG: Database file {db_path} created successfully");
 		}
 
 		// Connect to the database
 		let connection_string = format!("sqlite:{}", db_path.replace('\\', "/"));
-		println!("DEBUG: Connecting to SQLite database at: {}", connection_string);
+		println!("DEBUG: Connecting to SQLite database at: {connection_string}");
 
-		let pool = SqlitePool::connect(&connection_string).await.with_context(|| format!("Failed to connect to database {}", connection_string))?;
+		let pool = SqlitePool::connect(&connection_string).await.with_context(|| format!("Failed to connect to database {connection_string}"))?;
 
 		println!("DEBUG: Successfully connected to SQLite database");
 
 		// Create tables
 		println!("DEBUG: Creating tables");
 		sqlx::query(
-			r#"
+			r"
             CREATE TABLE IF NOT EXISTS datasets (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL
             )
-            "#,
+            ",
 		)
 		.execute(&pool)
 		.await
 		.context("Failed to create datasets table")?;
 
 		sqlx::query(
-			r#"
+			r"
             CREATE TABLE IF NOT EXISTS measurements (
                 id TEXT PRIMARY KEY,
                 dataset_id TEXT NOT NULL,
@@ -620,7 +633,7 @@ impl DB {
                 value TEXT NOT NULL,
                 FOREIGN KEY (dataset_id) REFERENCES datasets (id)
             )
-            "#,
+            ",
 		)
 		.execute(&pool)
 		.await
@@ -633,7 +646,7 @@ impl DB {
 		sqlx::query("PRAGMA foreign_keys = ON").execute(&pool).await?;
 
 		// Store the connection
-		println!("DEBUG: Storing subject {} in SUBJECTS", subject_name);
+		println!("DEBUG: Storing subject {subject_name} in SUBJECTS");
 		SUBJECTS.lock().await.insert(subject_name.to_string(), pool);
 
 		println!("DEBUG: SQLite database initialization complete for {subject_name}");
@@ -1183,15 +1196,58 @@ mod test {
 		println!("📈 COMPREHENSIVE PERFORMANCE ANALYSIS");
 		println!("{:=<80}", "");
 
-		// Performance summary table
+		// Performance summary table with both time and RPS
 		println!("\n📊 PERFORMANCE SUMMARY TABLE");
-		println!("{:-<80}", "");
-		println!("{:<8} | {:>12} | {:>12} | {:>12} | {:>12}", "Size", "Batch (rps)", "Memory (rps)", "Optimized (rps)", "Bulk (rps)");
-		println!("{:-<80}", "");
+		println!("{:-<100}", "");
+		println!("{:<8} | {:>12} | {:>12} | {:>12} | {:>12}", "Size", "Batch", "Memory", "Optimized", "Bulk");
+		println!("{:<8} | {:>12} | {:>12} | {:>12} | {:>12}", "", "(ms | rps)", "(ms | rps)", "(ms | rps)", "(ms | rps)");
+		println!("{:-<100}", "");
 
 		for result in results {
-			println!("{:<8} | {:>12.0} | {:>12.0} | {:>12.0} | {:>12.0}", format!("{}K", result.size / 1000), result.batch_rps, result.memory_rps, result.optimized_rps, result.bulk_measurements_rps);
+			println!("{:<8} | {:>5.0}ms {:>5.0} | {:>5.0}ms {:>5.0} | {:>5.0}ms {:>5.0} | {:>5.0}ms {:>5.0}", format!("{}K", result.size / 1000), result.batch_time, result.batch_rps, result.memory_time, result.memory_rps, result.optimized_time, result.optimized_rps, result.bulk_measurements_time, result.bulk_measurements_rps);
 		}
+
+		// Time-based analysis
+		println!("\n⏱️ TIME EFFICIENCY ANALYSIS");
+		println!("{:-<60}", "");
+
+		let avg_batch_time = results.iter().map(|r| r.batch_time).sum::<f64>() / results.len() as f64;
+		let avg_memory_time = results.iter().map(|r| r.memory_time).sum::<f64>() / results.len() as f64;
+		let avg_optimized_time = results.iter().map(|r| r.optimized_time).sum::<f64>() / results.len() as f64;
+		let avg_bulk_time = results.iter().map(|r| r.bulk_measurements_time).sum::<f64>() / results.len() as f64;
+
+		println!("📊 Average Batch Time:      {:>8.2}ms", avg_batch_time);
+		println!("🚀 Average Memory Time:     {:>8.2}ms", avg_memory_time);
+		println!("⚡ Average Optimized Time:  {:>8.2}ms", avg_optimized_time);
+		println!("💨 Average Bulk Time:       {:>8.2}ms", avg_bulk_time);
+
+		// Find fastest method by time
+		let fastest_time = avg_batch_time.min(avg_memory_time).min(avg_optimized_time).min(avg_bulk_time);
+		let fastest_method = if (avg_batch_time - fastest_time).abs() < 0.1 {
+			"Batch Insert"
+		} else if (avg_memory_time - fastest_time).abs() < 0.1 {
+			"Memory Buffer"
+		} else if (avg_optimized_time - fastest_time).abs() < 0.1 {
+			"Optimized Strategy"
+		} else {
+			"Bulk Measurements"
+		};
+
+		println!("🏆 Fastest Method (Time):    {} ({:.2}ms avg)", fastest_method, fastest_time);
+
+		// RPS-based analysis
+		println!("\n🚀 THROUGHPUT ANALYSIS");
+		println!("{:-<60}", "");
+
+		let avg_batch = results.iter().map(|r| r.batch_rps).sum::<f64>() / results.len() as f64;
+		let avg_memory = results.iter().map(|r| r.memory_rps).sum::<f64>() / results.len() as f64;
+		let avg_optimized = results.iter().map(|r| r.optimized_rps).sum::<f64>() / results.len() as f64;
+		let avg_bulk = results.iter().map(|r| r.bulk_measurements_rps).sum::<f64>() / results.len() as f64;
+
+		println!("📊 Average Batch RPS:       {:>10.0} rps", avg_batch);
+		println!("🚀 Average Memory RPS:      {:>10.0} rps", avg_memory);
+		println!("⚡ Average Optimized RPS:   {:>10.0} rps", avg_optimized);
+		println!("💨 Average Bulk RPS:        {:>10.0} rps", avg_bulk);
 
 		// Find best performers
 		let best_overall = results.iter().map(|r| [r.batch_rps, r.memory_rps, r.optimized_rps, r.bulk_measurements_rps].iter().fold(0.0f64, |a, &b| a.max(b))).fold(0.0f64, |a, b| a.max(b));
@@ -1204,42 +1260,97 @@ mod test {
 		println!("📊 Minimum Performance:  {:>12.0} rps", worst_overall);
 		println!("📈 Performance Range:    {:>12.1}x variation", best_overall / worst_overall);
 
-		// Scaling analysis
+		// Scaling analysis with both time and throughput
 		if results.len() >= 2 {
-			let small_best = results[0].batch_rps.max(results[0].memory_rps).max(results[0].optimized_rps).max(results[0].bulk_measurements_rps);
-			let large_best = results.last().unwrap().batch_rps.max(results.last().unwrap().memory_rps).max(results.last().unwrap().optimized_rps).max(results.last().unwrap().bulk_measurements_rps);
+			let small_result = &results[0];
+			let large_result = results.last().unwrap();
 
-			let scaling_factor = large_best / small_best;
-			let scaling_analysis = if scaling_factor > 0.8 {
+			// Time scaling (lower is better - should ideally scale linearly)
+			let time_scaling_batch = large_result.batch_time / small_result.batch_time;
+			let time_scaling_memory = large_result.memory_time / small_result.memory_time;
+			let time_scaling_optimized = large_result.optimized_time / small_result.optimized_time;
+			let time_scaling_bulk = large_result.bulk_measurements_time / small_result.bulk_measurements_time;
+
+			println!("\n📏 TIME SCALING ANALYSIS (lower is better)");
+			println!("{:-<60}", "");
+			println!("📊 Batch Time Scaling:      {:>8.2}x", time_scaling_batch);
+			println!("🚀 Memory Time Scaling:     {:>8.2}x", time_scaling_memory);
+			println!("⚡ Optimized Time Scaling:  {:>8.2}x", time_scaling_optimized);
+			println!("💨 Bulk Time Scaling:       {:>8.2}x", time_scaling_bulk);
+
+			// Throughput scaling (higher is better - should ideally stay constant)
+			let rps_scaling_batch = large_result.batch_rps / small_result.batch_rps;
+			let rps_scaling_memory = large_result.memory_rps / small_result.memory_rps;
+			let rps_scaling_optimized = large_result.optimized_rps / small_result.optimized_rps;
+			let rps_scaling_bulk = large_result.bulk_measurements_rps / small_result.bulk_measurements_rps;
+
+			println!("\n📈 THROUGHPUT SCALING ANALYSIS (higher is better)");
+			println!("{:-<60}", "");
+			println!("📊 Batch RPS Scaling:       {:>8.2}x", rps_scaling_batch);
+			println!("🚀 Memory RPS Scaling:      {:>8.2}x", rps_scaling_memory);
+			println!("⚡ Optimized RPS Scaling:   {:>8.2}x", rps_scaling_optimized);
+			println!("💨 Bulk RPS Scaling:        {:>8.2}x", rps_scaling_bulk);
+
+			// Overall scaling efficiency
+			let avg_rps_scaling = (rps_scaling_batch + rps_scaling_memory + rps_scaling_optimized + rps_scaling_bulk) / 4.0;
+			let scaling_analysis = if avg_rps_scaling > 0.8 {
 				"🟢 EXCELLENT"
-			} else if scaling_factor > 0.5 {
+			} else if avg_rps_scaling > 0.5 {
 				"🟡 GOOD"
 			} else {
 				"🔴 POOR"
 			};
 
-			println!("📏 Scaling Efficiency:   {:>12.1}x | {}", scaling_factor, scaling_analysis);
+			println!("📏 Overall Scaling Efficiency: {:>8.2}x | {}", avg_rps_scaling, scaling_analysis);
 		}
 
-		// Method recommendations
+		// Method recommendations based on comprehensive analysis
 		println!("\n💡 OPTIMIZATION RECOMMENDATIONS");
-		println!("{:-<50}", "");
+		println!("{:-<60}", "");
 
-		let avg_batch = results.iter().map(|r| r.batch_rps).sum::<f64>() / results.len() as f64;
-		let avg_memory = results.iter().map(|r| r.memory_rps).sum::<f64>() / results.len() as f64;
-		let avg_bulk = results.iter().map(|r| r.bulk_measurements_rps).sum::<f64>() / results.len() as f64;
-
-		if avg_bulk > avg_memory && avg_bulk > avg_batch {
-			println!("🎯 Best Method: Bulk Measurements (avg: {:.0} rps)", avg_bulk);
-		} else if avg_memory > avg_batch {
-			println!("🎯 Best Method: Memory Buffer (avg: {:.0} rps)", avg_memory);
+		if avg_bulk > avg_memory && avg_bulk > avg_batch && avg_bulk > avg_optimized {
+			println!("🎯 Best Overall Method: Bulk Measurements");
+			println!("   ├─ Average: {:.0} rps ({:.2}ms)", avg_bulk, avg_bulk_time);
+			println!("   └─ Use for: Adding measurements to existing datasets");
+		} else if avg_memory > avg_batch && avg_memory > avg_optimized {
+			println!("🎯 Best Overall Method: Memory Buffer");
+			println!("   ├─ Average: {:.0} rps ({:.2}ms)", avg_memory, avg_memory_time);
+			println!("   └─ Use for: Large dataset creation (>10K records)");
+		} else if avg_optimized > avg_batch {
+			println!("🎯 Best Overall Method: Optimized Strategy");
+			println!("   ├─ Average: {:.0} rps ({:.2}ms)", avg_optimized, avg_optimized_time);
+			println!("   └─ Use for: Automatic method selection");
 		} else {
-			println!("🎯 Best Method: Batch Insert (avg: {:.0} rps)", avg_batch);
+			println!("🎯 Best Overall Method: Batch Insert");
+			println!("   ├─ Average: {:.0} rps ({:.2}ms)", avg_batch, avg_batch_time);
+			println!("   └─ Use for: Small to medium datasets (<10K records)");
 		}
 
-		println!("📋 Use bulk measurements for incremental data");
-		println!("📋 Use memory buffer for large dataset creation");
-		println!("📋 Use optimized strategy for automatic selection");
+		println!("\n📋 USAGE GUIDELINES");
+		println!("{:-<40}", "");
+		println!("🔸 Small datasets (<5K):    Batch Insert or Optimized");
+		println!("🔸 Medium datasets (5K-50K): Memory Buffer or Optimized");
+		println!("🔸 Large datasets (>50K):   Memory Buffer or Bulk");
+		println!("🔸 Incremental data:        Bulk Measurements");
+		println!("🔸 Unknown size:             Optimized Strategy");
+
+		// Performance tier classification
+		println!("\n🏅 PERFORMANCE TIER CLASSIFICATION");
+		println!("{:-<50}", "");
+		let max_performance = avg_bulk.max(avg_memory).max(avg_optimized).max(avg_batch);
+		let tier = if max_performance > 500_000.0 {
+			"🏆 ELITE (500K+ rps)"
+		} else if max_performance > 200_000.0 {
+			"🥇 EXCELLENT (200K-500K rps)"
+		} else if max_performance > 50_000.0 {
+			"🥈 GOOD (50K-200K rps)"
+		} else if max_performance > 10_000.0 {
+			"🥉 BASIC (10K-50K rps)"
+		} else {
+			"📈 NEEDS OPTIMIZATION (<10K rps)"
+		};
+
+		println!("Current Implementation: {}", tier);
 	}
 
 	fn get_memory_usage() -> usize {
