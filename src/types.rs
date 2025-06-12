@@ -26,7 +26,7 @@ pub struct Measurement {
 }
 
 impl Measurement {
-	pub fn from_input_measurement(dataset_id: Uuid, input: InputMeasurement) -> Self {
+	#[must_use] pub fn from_input_measurement(dataset_id: Uuid, input: InputMeasurement) -> Self {
 		Self { id: Uuid::new_v4(), dataset_id, timestamp: input.timestamp, value: input.value }
 	}
 }
