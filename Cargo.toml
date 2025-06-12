@@ -14,3 +14,5 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 futures = { workspace = true , features = ["unstable", "thread-pool"] }
+rand = { workspace = true, features = ["nightly", "serde", "simd_support", "unbiased"] }
+tokio-test = { workspace = true, features = [] }
