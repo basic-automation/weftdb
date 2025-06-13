@@ -25,4 +25,16 @@ pub enum Error {
 
 	#[error("Unable to parse UUID: {0}")]
 	UuidParseError(String),
+
+	#[error("All measurements must have the same dataset_id")]
+	InconsistentDatasetIdsError,
+
+	#[error("Start time must be before end time")]
+	InvalidTimeRangeError,
+
+	#[error("At least two measurements are required for interpolation or extrapolation")]
+	InsufficientMeasurementsError,
+
+	#[error("Need at least 2 points for cubic spline")]
+	InsufficientPointsForCubicSplineError,
 }
