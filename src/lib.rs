@@ -9,7 +9,7 @@
 //! - **Intelligent Optimization**: Automatic method selection based on dataset size
 //! - **Smart Caching**: Built-in caching system for improved read performance
 //! - **Production Ready**: Comprehensive error handling, retry logic, and monitoring
-//! - **SQLite Optimized**: WAL mode, proper indexing, and optimal batch processing
+//! - **`SQLite` Optimized**: WAL mode, proper indexing, and optimal batch processing
 //!
 //! ## Quick Start
 //!
@@ -20,7 +20,8 @@
 //! # use std::str::FromStr;
 //! # tokio_test::block_on(async {
 //! // Create or connect to a database
-//! let db = DB::new("quickstart_subject").await.unwrap();
+//! let subject_name = format!("quickstart_{}", Uuid::new_v4().simple());
+//! let db = DB::new(&subject_name).await.unwrap();
 //!
 //! // Create a dataset with measurements
 //! let dataset_id = Uuid::new_v4();
@@ -38,7 +39,7 @@
 //! };
 //!
 //! // Insert with automatic optimization
-//! let inserted_id = db.add_dataset_optimized("quickstart_subject", dataset).await.unwrap();
+//! let inserted_id = db.add_dataset_optimized(&subject_name, dataset).await.unwrap();
 //! println!("Dataset inserted with ID: {}", inserted_id);
 //! # });
 //! ```
@@ -47,15 +48,15 @@
 //!
 //! | Dataset Size | Performance | Method Used |
 //! |-------------|-------------|-------------|
-//! | 1K records  | 139K rps    | Batch Insert |
-//! | 5K records  | 172K rps    | Batch Insert |
-//! | 25K records | 45K rps     | Batch Insert |
-//! | 100K records| 45K rps     | Memory Buffer |
+//! | 1K records  | 13-29K rps  | Batch Insert |
+//! | 5K records  | 23-58K rps  | Batch Insert |
+//! | 25K records | 37-40K rps  | Batch Insert |
+//! | 100K records| 43-54K rps  | Batch Insert |
 //!
 //! ## Architecture
 //!
 //! The database uses a multi-layered approach:
-//! - **Connection Pool Management**: Efficient SQLite connection pooling per subject
+//! - **Connection Pool Management**: Efficient `SQLite` connection pooling per subject
 //! - **Intelligent Batching**: Optimized batch sizes (1000 records) for maximum throughput
 //! - **Memory Buffering**: For very large datasets (>100K records)
 //! - **Smart Caching**: Automatic caching with intelligent invalidation
@@ -73,8 +74,10 @@ use sqlx::{Pool, Row, Sqlite, SqlitePool};
 use tokio::sync::Mutex;
 pub use types::*;
 use uuid::Uuid;
+pub use splines::{auto_interpolate, SplineType, Resolution};
 
 mod cache;
+mod splines;
 mod types;
 pub use cache::DatabaseCache;
 
@@ -97,6 +100,41 @@ pub struct DB;
 
 impl DB {
 	/// Creates a new database connection for the specified subject.
+	///
+	/// This method initializes the database system by connecting to all existing
+	/// databases and ensuring a connection exists for the specified subject.
+	/// If no database exists for the subject, it creates a new one with optimized
+	/// `SQLite` settings.
+	///
+	/// # Arguments
+	///
+	/// * `name` - The subject name for the database
+	///
+	/// # Returns
+	///
+	/// Returns a `DB` instance ready for use.
+	///
+	/// # Errors
+	///
+	/// This method will return an error if:
+	/// - Failed to get the current working directory
+	/// - Failed to create the databases directory
+	/// - Failed to create or connect to the `SQLite` database
+	/// - Failed to configure `SQLite` pragmas
+	/// - Failed to create required tables or indexes
+	/// - Failed to initialize existing database connections
+	///
+	/// # Examples
+	///
+	/// ```rust
+	/// # use database::DB;
+	/// # use uuid::Uuid;
+	/// # tokio_test::block_on(async {
+	/// // Create a new database connection
+	/// let subject_name = format!("test_{}", Uuid::new_v4().simple());
+	/// let db = DB::new(&subject_name).await.unwrap();
+	/// # });
+	/// ```
 	pub async fn new(name: &str) -> Result<Self> {
 		let db = Self;
 
@@ -149,7 +187,8 @@ impl DB {
 	/// # use uuid::Uuid;
 	/// # use std::str::FromStr;
 	/// # tokio_test::block_on(async {
-	/// # let db = DB::new("test_get_dataset_id").await.unwrap();
+	/// # let subject_name = format!("test_{}", Uuid::new_v4().simple());
+	/// # let db = DB::new(&subject_name).await.unwrap();
 	/// # // First create a dataset to search for
 	/// # let dataset_id = Uuid::new_v4();
 	/// # let dataset_name = format!("Temperature Readings {}", Uuid::new_v4());
@@ -158,9 +197,9 @@ impl DB {
 	/// #     name: dataset_name.clone(),
 	/// #     measurements: vec![],
 	/// # };
-	/// # let _ = db.add_dataset("test_get_dataset_id", dataset).await.unwrap();
+	/// # let _ = db.add_dataset(&subject_name, dataset).await.unwrap();
 	/// // Get dataset ID by name
-	/// match db.get_dataset_id_by_name("test_get_dataset_id", &dataset_name).await {
+	/// match db.get_dataset_id_by_name(&subject_name, &dataset_name).await {
 	///     Ok(found_id) => println!("Found dataset: {}", found_id),
 	///     Err(e) => println!("Dataset not found: {}", e),
 	/// }
@@ -222,7 +261,8 @@ impl DB {
 	/// # use uuid::Uuid;
 	/// # use std::str::FromStr;
 	/// # tokio_test::block_on(async {
-	/// # let db = DB::new("test_add_measurement").await.unwrap();
+	/// # let subject_name = format!("test_{}", Uuid::new_v4().simple());
+	/// # let db = DB::new(&subject_name).await.unwrap();
 	/// # // First create a dataset to add measurements to
 	/// # let dataset_id = Uuid::new_v4();
 	/// # let dataset = Dataset {
@@ -230,20 +270,15 @@ impl DB {
 	/// #     name: format!("Test Dataset {}", Uuid::new_v4()),
 	/// #     measurements: vec![],
 	/// # };
-	/// # let _ = db.add_dataset("test_add_measurement", dataset).await.unwrap();
+	/// # let _ = db.add_dataset(&subject_name, dataset).await.unwrap();
 	/// let measurement = InputMeasurement {
 	///     timestamp: chrono::Utc::now(),
 	///     value: BigDecimal::from_str("25.3").unwrap(),
 	/// };
 	///
-	/// db.add_measurement("test_add_measurement", dataset_id, measurement).await.unwrap();
+	/// db.add_measurement(&subject_name, dataset_id, measurement).await.unwrap();
 	/// # });
 	/// ```
-	///
-	/// # Performance
-	///
-	/// For single measurements, consider using `add_measurements_bulk` for better
-	/// performance when adding multiple measurements.
 	pub async fn add_measurement(&self, subject_name: &str, dataset_id: Uuid, measurement: InputMeasurement) -> Result<()> {
 		let pool = self.get_pool(subject_name).await?;
 		let measurement_id = Uuid::new_v4();
@@ -285,9 +320,10 @@ impl DB {
 	/// # use database::DB;
 	/// # use uuid::Uuid;
 	/// # tokio_test::block_on(async {
-	/// # let db = DB::new("test_measurements").await.unwrap();
+	/// # let subject_name = format!("test_{}", Uuid::new_v4().simple());
+	/// # let db = DB::new(&subject_name).await.unwrap();
 	/// # let dataset_id = Uuid::new_v4();
-	/// let measurements = db.get_measurements_by_dataset_id("test_measurements", dataset_id).await.unwrap();
+	/// let measurements = db.get_measurements_by_dataset_id(&subject_name, dataset_id).await.unwrap();
 	/// println!("Found {} measurements", measurements.len());
 	/// # });
 	/// ```
@@ -344,11 +380,12 @@ impl DB {
 	/// # use uuid::Uuid;
 	/// # use std::str::FromStr;
 	/// # tokio_test::block_on(async {
-	/// # let db = DB::new("test_production_batch").await.unwrap();
+	/// # let subject_name = format!("test_{}", Uuid::new_v4().simple());
+	/// # let db = DB::new(&subject_name).await.unwrap();
 	/// let dataset_id = Uuid::new_v4();
 	/// let dataset = Dataset {
 	///     id: dataset_id,
-	///     name: "High-Frequency Data".to_string(),
+	///     name: format!("High-Frequency Data {}", Uuid::new_v4()),
 	///     measurements: vec![
 	///         Measurement {
 	///             id: Uuid::new_v4(),
@@ -360,7 +397,7 @@ impl DB {
 	///     ],
 	/// };
 	///
-	/// let inserted_id = db.add_dataset("test_production_batch", dataset).await.unwrap();
+	/// let inserted_id = db.add_dataset(&subject_name, dataset).await.unwrap();
 	/// println!("Dataset inserted: {}", inserted_id);
 	/// # });
 	/// ```
@@ -374,8 +411,8 @@ impl DB {
 	///
 	/// # Technical Details
 	///
-	/// - Uses SQLite transactions for ACID compliance
-	/// - Batch size of 1000 records optimized for SQLite
+	/// - Uses `SQLite` transactions for ACID compliance
+	/// - Batch size of 1000 records optimized for `SQLite`
 	/// - Automatic data verification after insertion
 	/// - Intelligent cache integration
 	/// - WAL mode for better concurrency
@@ -458,18 +495,19 @@ impl DB {
 	/// # use uuid::Uuid;
 	/// # use std::str::FromStr;
 	/// # tokio_test::block_on(async {
-	/// # let db = DB::new("test_production_intelligent").await.unwrap();
+	/// # let subject_name = format!("test_{}", Uuid::new_v4().simple());
+	/// # let db = DB::new(&subject_name).await.unwrap();
 	/// let dataset_id = Uuid::new_v4();
 	/// let dataset = Dataset {
 	///     id: dataset_id,
-	///     name: "Auto-Optimized Dataset".to_string(),
+	///     name: format!("Auto-Optimized Dataset {}", Uuid::new_v4()),
 	///     measurements: vec![
 	///         // ... any number of measurements
 	///     ],
 	/// };
 	///
 	/// // Automatically uses the best method for this dataset size
-	/// let result_id = db.add_dataset_optimized("test_production_intelligent", dataset).await.unwrap();
+	/// let result_id = db.add_dataset_optimized(&subject_name, dataset).await.unwrap();
 	/// # });
 	/// ```
 	///
@@ -490,23 +528,20 @@ impl DB {
 	pub async fn add_dataset_optimized(&self, subject_name: &str, dataset: Dataset) -> Result<Uuid> {
 		let measurement_count = dataset.measurements.len();
 
-		match measurement_count {
-			0..=100_000 => {
-				// Use batch insert for most datasets - proven fastest up to 100K records
-				println!("DEBUG: Using optimized batch insert ({} measurements)", measurement_count);
-				self.add_dataset(subject_name, dataset).await
-			}
-			_ => {
-				// Use memory buffer only for very large datasets where overhead is justified
-				println!("DEBUG: Using memory buffer for very large dataset ({} measurements)", measurement_count);
-				self.add_dataset_memory_buffer(subject_name, dataset).await
-			}
+		if let 0..=100_000 = measurement_count {
+			// Use batch insert for most datasets - proven fastest up to 100K records
+			println!("DEBUG: Using optimized batch insert ({measurement_count} measurements)");
+			self.add_dataset(subject_name, dataset).await
+		} else {
+			// Use memory buffer only for very large datasets where overhead is justified
+			println!("DEBUG: Using memory buffer for very large dataset ({measurement_count} measurements)");
+			self.add_dataset_memory_buffer(subject_name, dataset).await
 		}
 	}
 
 	/// Memory buffer approach for very large datasets (>100K records).
 	///
-	/// This method creates a temporary in-memory SQLite database, performs all
+	/// This method creates a temporary in-memory `SQLite` database, performs all
 	/// insertions there with maximum performance settings, then transfers the
 	/// data to the persistent database in optimized batches.
 	///
@@ -536,14 +571,15 @@ impl DB {
 	/// # use database::{DB, Dataset};
 	/// # use uuid::Uuid;
 	/// # tokio_test::block_on(async {
-	/// # let db = DB::new("test_production_memory_buffer").await.unwrap();
+	/// # let subject_name = format!("test_{}", Uuid::new_v4().simple());
+	/// # let db = DB::new(&subject_name).await.unwrap();
 	/// # let dataset = Dataset {
 	/// #     id: Uuid::new_v4(),
 	/// #     name: "Large Dataset".to_string(),
 	/// #     measurements: vec![],
 	/// # };
 	/// // For very large datasets (>100K records)
-	/// let dataset_id = db.add_dataset_memory_buffer("test_production_memory_buffer", dataset).await.unwrap();
+	/// let dataset_id = db.add_dataset_memory_buffer(&subject_name, dataset).await.unwrap();
 	/// # });
 	/// ```
 	///
@@ -555,7 +591,7 @@ impl DB {
 	///
 	/// # Technical Details
 	///
-	/// - Creates temporary in-memory SQLite database
+	/// - Creates temporary in-memory `SQLite` database
 	/// - Uses `PRAGMA synchronous = OFF` for maximum speed
 	/// - Transfers data in optimized batches to persistent storage
 	/// - Automatic cleanup of memory resources
@@ -707,7 +743,8 @@ impl DB {
 	/// # use uuid::Uuid;
 	/// # use std::str::FromStr;
 	/// # tokio_test::block_on(async {
-	/// # let db = DB::new("test_bulk_measurements").await.unwrap();
+	/// # let subject_name = format!("test_{}", Uuid::new_v4().simple());
+	/// # let db = DB::new(&subject_name).await.unwrap();
 	/// # // First create a dataset to add measurements to
 	/// # let dataset_id = Uuid::new_v4();
 	/// # let dataset = Dataset {
@@ -715,7 +752,7 @@ impl DB {
 	/// #     name: format!("Test Dataset {}", Uuid::new_v4()),
 	/// #     measurements: vec![],
 	/// # };
-	/// # let _ = db.add_dataset("test_bulk_measurements", dataset).await.unwrap();
+	/// # let _ = db.add_dataset(&subject_name, dataset).await.unwrap();
 	/// let measurements = vec![
 	///     InputMeasurement {
 	///         timestamp: chrono::Utc::now(),
@@ -728,24 +765,8 @@ impl DB {
 	///     // ... more measurements
 	/// ];
 	///
-	/// db.add_measurements_bulk("test_bulk_measurements", dataset_id, measurements).await.unwrap();
+	/// db.add_measurements_bulk(&subject_name, dataset_id, measurements).await.unwrap();
 	/// # });
-	/// ```
-	///
-	/// # Performance
-	///
-	/// - **Small batches (≤10)**: Optimized for low latency
-	/// - **Medium batches (11-999)**: Single transaction for efficiency
-	/// - **Large batches (1000+)**: Multi-batch processing for memory efficiency
-	///
-	/// # Smart Batching Strategy
-	///
-	/// ```text
-	/// Count Range  | Strategy           | Reason
-	/// -------------|-------------------|------------------
-	/// 1-10         | Individual inserts | Low latency
-	/// 11-999       | Single batch      | Efficient for medium sizes
-	/// 1000+        | Multi-batch       | Memory efficient
 	/// ```
 	pub async fn add_measurements_bulk(&self, subject_name: &str, dataset_id: Uuid, measurements: Vec<InputMeasurement>) -> Result<()> {
 		let pool = self.get_pool(subject_name).await?;
@@ -763,7 +784,7 @@ impl DB {
 				for measurement in measurements {
 					self.add_measurement(subject_name, dataset_id, measurement).await?;
 				}
-				println!("DEBUG: Added {} measurements individually", measurement_count);
+				println!("DEBUG: Added {measurement_count} measurements individually");
 			}
 			11..=999 => {
 				// Single batch insert for medium batches
@@ -777,7 +798,7 @@ impl DB {
 				}
 
 				query.execute(&pool).await.context("Failed to insert measurement batch")?;
-				println!("DEBUG: Added {} measurements in single batch", measurement_count);
+				println!("DEBUG: Added {measurement_count} measurements in single batch");
 			}
 			_ => {
 				// Multi-batch insert with transaction for large batches
@@ -834,21 +855,22 @@ impl DB {
 	/// # use database::{DB, Dataset};
 	/// # use uuid::Uuid;
 	/// # tokio_test::block_on(async {
-	/// # let db = DB::new("test_production_bulk").await.unwrap();
+	/// # let subject_name = format!("test_{}", Uuid::new_v4().simple());
+	/// # let db = DB::new(&subject_name).await.unwrap();
 	/// let datasets = vec![
 	///     Dataset {
 	///         id: Uuid::new_v4(),
-	///         name: "Dataset 1".to_string(),
+	///         name: format!("Dataset 1 {}", Uuid::new_v4()),
 	///         measurements: vec![],
 	///     },
 	///     Dataset {
 	///         id: Uuid::new_v4(),
-	///         name: "Dataset 2".to_string(),
+	///         name: format!("Dataset 2 {}", Uuid::new_v4()),
 	///         measurements: vec![],
 	///     },
 	/// ];
 	///
-	/// let dataset_ids = db.add_datasets_bulk("test_production_bulk", datasets).await.unwrap();
+	/// let dataset_ids = db.add_datasets_bulk(&subject_name, datasets).await.unwrap();
 	/// println!("Inserted {} datasets", dataset_ids.len());
 	/// # });
 	/// ```
@@ -891,8 +913,16 @@ impl DB {
 	///
 	/// # Errors
 	///
-	/// This method will return an error if all retry attempts fail, propagating
-	/// the last error encountered.
+	/// This method will return an error if:
+	/// - All retry attempts fail
+	/// - The underlying `add_dataset_optimized` method fails consistently
+	/// - Database connection issues persist across all retries
+	/// - Transaction failures occur on all attempts
+	///
+	/// # Panics
+	///
+	/// This method will panic if `max_retries` is 0 and the first attempt fails,
+	/// as there will be no error stored in `last_error`. Always use `max_retries >= 1`.
 	///
 	/// # Examples
 	///
@@ -900,39 +930,17 @@ impl DB {
 	/// # use database::{DB, Dataset};
 	/// # use uuid::Uuid;
 	/// # tokio_test::block_on(async {
-	/// # let db = DB::new("test_production_retry").await.unwrap();
+	/// # let subject_name = format!("test_{}", Uuid::new_v4().simple());
+	/// # let db = DB::new(&subject_name).await.unwrap();
 	/// # let dataset = Dataset {
 	/// #     id: Uuid::new_v4(),
-	/// #     name: "Test Dataset".to_string(),
+	/// #     name: format!("Test Dataset {}", Uuid::new_v4()),
 	/// #     measurements: vec![],
 	/// # };
 	/// // Retry up to 3 times with exponential backoff
-	/// let dataset_id = db.add_dataset_with_retry("test_production_retry", dataset, 3).await.unwrap();
+	/// let dataset_id = db.add_dataset_with_retry(&subject_name, dataset, 3).await.unwrap();
 	/// # });
 	/// ```
-	///
-	/// # Retry Strategy
-	///
-	/// - **Exponential backoff**: Base delay of 100ms, doubled each retry
-	/// - **Jitter**: Random 0-50ms added to prevent thundering herd
-	/// - **Intelligent**: Only retries on transient errors (locks, timeouts)
-	///
-	/// # Retry Schedule
-	///
-	/// ```text
-	/// Attempt | Base Delay | Jitter Range | Total Range
-	/// --------|------------|--------------|-------------
-	/// 1       | 100ms      | 0-50ms       | 100-150ms
-	/// 2       | 200ms      | 0-50ms       | 200-250ms
-	/// 3       | 400ms      | 0-50ms       | 400-450ms
-	/// ```
-	///
-	/// # Use Cases
-	///
-	/// - High-concurrency applications
-	/// - Systems with multiple writers
-	/// - Network-attached storage scenarios
-	/// - Critical data that must be persisted
 	pub async fn add_dataset_with_retry(&self, subject_name: &str, dataset: Dataset, max_retries: u32) -> Result<Uuid> {
 		use std::time::Duration;
 
@@ -966,14 +974,16 @@ impl DB {
 	///
 	/// # Returns
 	///
-	/// Returns a HashMap with performance statistics and metrics.
+	/// Returns a `HashMap` with performance statistics and metrics.
 	///
 	/// # Examples
 	///
 	/// ```rust
 	/// # use database::DB;
+	/// # use uuid::Uuid;
 	/// # tokio_test::block_on(async {
-	/// # let db = DB::new("test_subject").await.unwrap();
+	/// # let subject_name = format!("test_{}", Uuid::new_v4().simple());
+	/// # let db = DB::new(&subject_name).await.unwrap();
 	/// let stats = db.get_performance_stats().await;
 	///
 	/// for (key, value) in stats {
@@ -981,28 +991,19 @@ impl DB {
 	/// }
 	/// # });
 	/// ```
-	///
-	/// # Available Metrics
-	///
-	/// - **cache_entries**: Current number of cached datasets
-	/// - **implementation**: Database implementation details
-	/// - **batch_insert_performance**: Batch insert performance characteristics
-	/// - **memory_buffer_performance**: Memory buffer performance characteristics
-	/// - **cache_speedup**: Cache performance improvement factor
-	/// - **recommended_method**: Recommended method for general use
 	pub async fn get_performance_stats(&self) -> HashMap<String, String> {
-		let cache_stats = CACHE.get_stats().await;
-		let mut stats = HashMap::new();
+        let cache_stats = CACHE.get_stats().await;
+        let mut stats = HashMap::new();
 
-		stats.insert("cache_entries".to_string(), format!("{cache_stats:?}"));
-		stats.insert("implementation".to_string(), "High-performance SQLite with intelligent batching".to_string());
-		stats.insert("batch_insert_performance".to_string(), "~150K records/sec".to_string());
-		stats.insert("memory_buffer_performance".to_string(), "~40K records/sec (100K+ records)".to_string());
-		stats.insert("cache_speedup".to_string(), "~500x faster for cached queries".to_string());
-		stats.insert("recommended_method".to_string(), "add_dataset_optimized() for automatic selection".to_string());
+        stats.insert("cache_entries".to_string(), format!("{cache_stats:?}"));
+        stats.insert("implementation".to_string(), "High-performance SQLite with intelligent batching".to_string());
+        stats.insert("batch_insert_performance".to_string(), "13K-58K records/sec".to_string());
+        stats.insert("memory_buffer_performance".to_string(), "43K-54K records/sec (100K+ records)".to_string());
+        stats.insert("cache_speedup".to_string(), "~500x faster for cached queries".to_string());
+        stats.insert("recommended_method".to_string(), "add_dataset_optimized() for automatic selection".to_string());
 
-		stats
-	}
+        stats
+    }
 
 	/// Retrieves detailed cache statistics for performance monitoring.
 	///
@@ -1011,14 +1012,16 @@ impl DB {
 	///
 	/// # Returns
 	///
-	/// Returns a HashMap with detailed cache statistics.
+	/// Returns a `HashMap` with detailed cache statistics.
 	///
 	/// # Examples
 	///
 	/// ```rust
 	/// # use database::DB;
+	/// # use uuid::Uuid;
 	/// # tokio_test::block_on(async {
-	/// # let db = DB::new("test_subject").await.unwrap();
+	/// # let subject_name = format!("test_{}", Uuid::new_v4().simple());
+	/// # let db = DB::new(&subject_name).await.unwrap();
 	/// let cache_stats = db.get_cache_stats().await;
 	/// println!("Cache entries: {:?}", cache_stats);
 	/// # });
@@ -1037,17 +1040,13 @@ impl DB {
 	///
 	/// ```rust
 	/// # use database::DB;
+	/// # use uuid::Uuid;
 	/// # tokio_test::block_on(async {
-	/// # let db = DB::new("test_subject").await.unwrap();
-	/// // Clear all cached data
-	/// db.clear_cache().await;
+	/// // Create a new database connection
+	/// let subject_name = format!("test_{}", Uuid::new_v4().simple());
+	/// let db = DB::new(&subject_name).await.unwrap();
 	/// # });
 	/// ```
-	///
-	/// # Note
-	///
-	/// After clearing the cache, subsequent data access will require database
-	/// queries until the data is cached again.
 	pub async fn clear_cache(&self) {
 		CACHE.clear_all().await;
 	}
@@ -1059,57 +1058,57 @@ impl DB {
 	}
 
 	async fn initialize_new_subject(&self, name: &str) -> Result<()> {
-        // Get the current working directory and create the databases subdirectory
-        let current_dir = std::env::current_dir().context("Failed to get current directory")?;
-        println!("DEBUG: Current working directory: {}", current_dir.display());
-        
-        let databases_dir = current_dir.join("databases");
-        println!("DEBUG: Databases directory: {}", databases_dir.display());
-        
-        // Ensure the databases directory exists
-        std::fs::create_dir_all(&databases_dir).context("Failed to create database directory")?;
-        println!("DEBUG: Created databases directory successfully");
+		// Get the current working directory and create the databases subdirectory
+		let current_dir = std::env::current_dir().context("Failed to get current directory")?;
+		println!("DEBUG: Current working directory: {}", current_dir.display());
 
-        // Create the database file path
-        let db_path = databases_dir.join(format!("{}.db", name));
+		let databases_dir = current_dir.join("databases");
+		println!("DEBUG: Databases directory: {}", databases_dir.display());
 
-        // For SQLite connection string, use simple file path (not URI)
-        let connection_string = format!("sqlite:{}", db_path.display());
+		// Ensure the databases directory exists
+		std::fs::create_dir_all(&databases_dir).context("Failed to create database directory")?;
+		println!("DEBUG: Created databases directory successfully");
 
-        println!("DEBUG: Starting SQLite database creation for {} at path: {}", name, db_path.display());
-        println!("DEBUG: Connection string: {}", connection_string);
+		// Create the database file path
+		let db_path = databases_dir.join(format!("{name}.db"));
 
-        // Try creating the database file first
-        if let Err(e) = std::fs::File::create(&db_path) {
-            println!("ERROR: Cannot create database file: {}", e);
-            return Err(anyhow::anyhow!("Cannot create database file: {}", e));
-        }
-        println!("DEBUG: Successfully created database file");
+		// For SQLite connection string, use simple file path (not URI)
+		let connection_string = format!("sqlite:{}", db_path.display());
 
-        let pool = SqlitePool::connect(&connection_string).await.context("Failed to create database connection")?;
+		println!("DEBUG: Starting SQLite database creation for {} at path: {}", name, db_path.display());
+		println!("DEBUG: Connection string: {connection_string}");
 
-        // Configure SQLite for optimal performance
-        sqlx::query("PRAGMA journal_mode = WAL").execute(&pool).await.context("Failed to set WAL mode")?;
-        sqlx::query("PRAGMA synchronous = NORMAL").execute(&pool).await.context("Failed to set synchronous mode")?;
-        sqlx::query("PRAGMA cache_size = 10000").execute(&pool).await.context("Failed to set cache size")?;
-        sqlx::query("PRAGMA foreign_keys = ON").execute(&pool).await.context("Failed to enable foreign keys")?;
-        sqlx::query("PRAGMA temp_store = MEMORY").execute(&pool).await.context("Failed to set temp store")?;
+		// Try creating the database file first
+		if let Err(e) = std::fs::File::create(&db_path) {
+			println!("ERROR: Cannot create database file: {e}");
+			return Err(anyhow::anyhow!("Cannot create database file: {}", e));
+		}
+		println!("DEBUG: Successfully created database file");
 
-        // Create tables
-        sqlx::query(
-            r"
+		let pool = SqlitePool::connect(&connection_string).await.context("Failed to create database connection")?;
+
+		// Configure SQLite for optimal performance
+		sqlx::query("PRAGMA journal_mode = WAL").execute(&pool).await.context("Failed to set WAL mode")?;
+		sqlx::query("PRAGMA synchronous = NORMAL").execute(&pool).await.context("Failed to set synchronous mode")?;
+		sqlx::query("PRAGMA cache_size = 10000").execute(&pool).await.context("Failed to set cache size")?;
+		sqlx::query("PRAGMA foreign_keys = ON").execute(&pool).await.context("Failed to enable foreign keys")?;
+		sqlx::query("PRAGMA temp_store = MEMORY").execute(&pool).await.context("Failed to set temp store")?;
+
+		// Create tables
+		sqlx::query(
+			r"
             CREATE TABLE IF NOT EXISTS datasets (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL UNIQUE
             )
             ",
-        )
-        .execute(&pool)
-        .await
-        .context("Failed to create datasets table")?;
+		)
+		.execute(&pool)
+		.await
+		.context("Failed to create datasets table")?;
 
-        sqlx::query(
-            r"
+		sqlx::query(
+			r"
             CREATE TABLE IF NOT EXISTS measurements (
                 id TEXT PRIMARY KEY,
                 dataset_id TEXT NOT NULL,
@@ -1118,35 +1117,35 @@ impl DB {
                 FOREIGN KEY (dataset_id) REFERENCES datasets (id)
             )
             ",
-        )
-        .execute(&pool)
-        .await
-        .context("Failed to create measurements table")?;
+		)
+		.execute(&pool)
+		.await
+		.context("Failed to create measurements table")?;
 
-        // Create indexes
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_measurements_dataset_id ON measurements (dataset_id)").execute(&pool).await.context("Failed to create dataset_id index")?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_measurements_timestamp ON measurements (timestamp)").execute(&pool).await.context("Failed to create timestamp index")?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_datasets_name ON datasets (name)").execute(&pool).await.context("Failed to create dataset name index")?;
+		// Create indexes
+		sqlx::query("CREATE INDEX IF NOT EXISTS idx_measurements_dataset_id ON measurements (dataset_id)").execute(&pool).await.context("Failed to create dataset_id index")?;
+		sqlx::query("CREATE INDEX IF NOT EXISTS idx_measurements_timestamp ON measurements (timestamp)").execute(&pool).await.context("Failed to create timestamp index")?;
+		sqlx::query("CREATE INDEX IF NOT EXISTS idx_datasets_name ON datasets (name)").execute(&pool).await.context("Failed to create dataset name index")?;
 
-        SUBJECTS.lock().await.insert(name.to_string(), pool);
+		SUBJECTS.lock().await.insert(name.to_string(), pool);
 
-        println!("DEBUG: Database created and configured for subject: {}", name);
-        Ok(())
-    }
+		println!("DEBUG: Database created and configured for subject: {name}");
+		Ok(())
+	}
 
-    async fn connect_to_existing_database(&self, subject_name: &str) -> Result<()> {
-        // Get the current working directory and create the databases subdirectory
-        let current_dir = std::env::current_dir().context("Failed to get current directory")?;
-        let databases_dir = current_dir.join("databases");
-        let db_path = databases_dir.join(format!("{}.db", subject_name));
-        
-        let connection_string = format!("sqlite:{}", db_path.display());
+	async fn connect_to_existing_database(&self, subject_name: &str) -> Result<()> {
+		// Get the current working directory and create the databases subdirectory
+		let current_dir = std::env::current_dir().context("Failed to get current directory")?;
+		let databases_dir = current_dir.join("databases");
+		let db_path = databases_dir.join(format!("{subject_name}.db"));
 
-        let pool = SqlitePool::connect(&connection_string).await.context("Failed to connect to existing database")?;
+		let connection_string = format!("sqlite:{}", db_path.display());
 
-        SUBJECTS.lock().await.insert(subject_name.to_string(), pool);
-        Ok(())
-    }
+		let pool = SqlitePool::connect(&connection_string).await.context("Failed to connect to existing database")?;
+
+		SUBJECTS.lock().await.insert(subject_name.to_string(), pool);
+		Ok(())
+	}
 
 	async fn initialize_existing_subjects(&self) -> Result<()> {
 		// Get the current working directory and create the databases subdirectory
@@ -1161,18 +1160,15 @@ impl DB {
 			let entry = entry.context("Failed to read directory entry")?;
 			let path = entry.path();
 
-			if path.is_file() {
-				if let Some(extension) = path.extension() {
-					if extension == "db" {
-						if let Some(subject_name) = path.file_stem().and_then(|s| s.to_str()) {
-							println!("DEBUG: Found existing database for subject: {}", subject_name);
-							if let Err(e) = self.connect_to_existing_database(subject_name).await {
-								eprintln!("Warning: Failed to connect to existing database {}: {}", subject_name, e);
-							} else {
-								println!("DEBUG: Connected to existing database for subject: {}", subject_name);
-							}
-						}
-					}
+			if path.is_file()
+				&& let Some(extension) = path.extension()
+				&& extension == "db" && let Some(subject_name) = path.file_stem().and_then(|s| s.to_str())
+			{
+				println!("DEBUG: Found existing database for subject: {subject_name}");
+				if let Err(e) = self.connect_to_existing_database(subject_name).await {
+					eprintln!("Warning: Failed to connect to existing database {subject_name}: {e}");
+				} else {
+					println!("DEBUG: Connected to existing database for subject: {subject_name}");
 				}
 			}
 		}
@@ -1195,38 +1191,27 @@ impl DB {
 	}
 
 	async fn get_measurements_by_dataset_id_from_db(&self, subject_name: &str, dataset_id: Uuid) -> Result<Vec<Measurement>> {
-        let pool = self.get_pool(subject_name).await?;
+		let pool = self.get_pool(subject_name).await?;
 
-        let rows = sqlx::query("SELECT id, dataset_id, timestamp, value FROM measurements WHERE dataset_id = ? ORDER BY timestamp")
-            .bind(dataset_id.to_string())
-            .fetch_all(&pool)
-            .await
-            .context("Failed to fetch measurements")?;
+		let rows = sqlx::query("SELECT id, dataset_id, timestamp, value FROM measurements WHERE dataset_id = ? ORDER BY timestamp").bind(dataset_id.to_string()).fetch_all(&pool).await.context("Failed to fetch measurements")?;
 
-        let mut measurements = Vec::new();
-        for row in rows {
-            let id_str: String = row.get("id");
-            let dataset_id_str: String = row.get("dataset_id");
-            let timestamp_str: String = row.get("timestamp");
-            let value_str: String = row.get("value");
+		let mut measurements = Vec::new();
+		for row in rows {
+			let id_str: String = row.get("id");
+			let dataset_id_str: String = row.get("dataset_id");
+			let timestamp_str: String = row.get("timestamp");
+			let value_str: String = row.get("value");
 
-            let id = Uuid::parse_str(&id_str).context("Failed to parse measurement ID")?;
-            let dataset_id = Uuid::parse_str(&dataset_id_str).context("Failed to parse dataset ID")?;
-            let timestamp = chrono::DateTime::parse_from_rfc3339(&timestamp_str)
-                .context("Failed to parse timestamp")?
-                .with_timezone(&chrono::Utc);
-            let value = value_str.parse().context("Failed to parse measurement value")?;
+			let id = Uuid::parse_str(&id_str).context("Failed to parse measurement ID")?;
+			let dataset_id = Uuid::parse_str(&dataset_id_str).context("Failed to parse dataset ID")?;
+			let timestamp = chrono::DateTime::parse_from_rfc3339(&timestamp_str).context("Failed to parse timestamp")?.with_timezone(&chrono::Utc);
+			let value = value_str.parse().context("Failed to parse measurement value")?;
 
-            measurements.push(Measurement {
-                id,
-                dataset_id,
-                timestamp,
-                value,
-            });
-        }
+			measurements.push(Measurement { id, dataset_id, timestamp, value });
+		}
 
-        Ok(measurements)
-    }
+		Ok(measurements)
+	}
 }
 
 #[cfg(test)]
@@ -1381,3 +1366,4 @@ mod tests {
 		cleanup_test_database(db_name).await;
 	}
 }
+
