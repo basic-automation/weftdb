@@ -146,6 +146,21 @@ impl DatabaseCache {
 		None
 	}
 
+	/// Get measurements for a dataset by time range
+	pub async fn get_measurements_by_time(&self, subject_name: &str, dataset_id: Uuid, start_time: chrono::DateTime<chrono::Utc>, end_time: chrono::DateTime<chrono::Utc>) -> Option<Vec<Measurement>> {
+		if let Some(dataset) = self.get_dataset(subject_name, dataset_id).await {
+			// Filter measurements by time range
+			let filtered_measurements: Vec<Measurement> = dataset.measurements.iter().filter(|m| m.timestamp >= start_time && m.timestamp <= end_time).cloned().collect();
+
+			println!("DEBUG: Retrieved {} measurements from cache for dataset {} in subject {} (time range)", filtered_measurements.len(), dataset_id, subject_name);
+
+			return Some(filtered_measurements);
+		}
+
+		println!("DEBUG: Cache miss for dataset {dataset_id} in subject {subject_name} (time range)");
+		None
+	}
+
 	/// Clear cache for a specific subject
 	pub async fn clear_subject_cache(&self, subject_name: &str) {
 		self.datasets.write().await.remove(subject_name);
