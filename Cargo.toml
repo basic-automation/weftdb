@@ -16,3 +16,14 @@ anyhow = { workspace = true }
 futures = { workspace = true , features = ["unstable", "thread-pool"] }
 rand = { workspace = true, features = ["nightly", "serde", "simd_support", "unbiased"] }
 tokio-test = { workspace = true, features = [] }
+
+[dev-dependencies]
+criterion = { workspace = true, features = ["html_reports", "async_tokio"] }
+
+[[bench]]
+name = "interpolation_benchmarks"
+harness = false
+
+[[bench]]
+name = "integration_interpolation_benchmarks"
+harness = false
