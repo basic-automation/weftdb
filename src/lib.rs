@@ -35,6 +35,12 @@ pub struct DB;
 
 impl DB {
 	/// Creates a new database connection for the specified subject.
+	/// 
+	/// # Errors
+	/// 
+	/// Returns an error if:
+	/// - Failed to initialize existing subjects
+	/// - Failed to initialize new subject database
 	pub async fn new(name: &str) -> Result<Self> {
 		let db = Self;
 
@@ -58,6 +64,13 @@ impl DB {
 	}
 
 	/// Initializes connections to all existing database files.
+	/// 
+	/// # Errors
+	/// 
+	/// Returns an error if:
+	/// - Failed to get current directory
+	/// - Failed to read databases directory
+	/// - Failed to read directory entries
 	async fn initialize_existing_subjects(&self) -> Result<()> {
 		let current_dir = std::env::current_dir().context("Failed to get current directory")?;
 		let databases_dir = current_dir.join("databases");
@@ -69,30 +82,29 @@ impl DB {
 
 		let mut entries = tokio::fs::read_dir(&databases_dir).await.context("Failed to read databases directory")?;
 
-		let mut subjects = SUBJECTS.lock().await;
+		{
+			let mut subjects = SUBJECTS.lock().await;
 
-		while let Some(entry) = entries.next_entry().await.context("Failed to read directory entry")? {
-			let path = entry.path();
-			if let Some(extension) = path.extension() {
-				if extension == "db" {
-					if let Some(file_stem) = path.file_stem() {
-						if let Some(subject_name) = file_stem.to_str() {
-							if !subjects.contains_key(subject_name) {
-								println!("DEBUG: Found existing database for subject: {}", subject_name);
-								match self.connect_to_existing_database(subject_name).await {
-									Ok(pool) => {
-										subjects.insert(subject_name.to_string(), pool);
-										println!("DEBUG: Connected to existing database for subject: {}", subject_name);
-									}
-									Err(e) => {
-										eprintln!("Warning: Failed to connect to existing database for subject '{}': {}", subject_name, e);
+			while let Some(entry) = entries.next_entry().await.context("Failed to read directory entry")? {
+				let path = entry.path();
+				if let Some(extension) = path.extension()
+					&& extension == "db"
+						&& let Some(file_stem) = path.file_stem()
+							&& let Some(subject_name) = file_stem.to_str()
+								&& !subjects.contains_key(subject_name) {
+									println!("DEBUG: Found existing database for subject: {subject_name}");
+									match self.connect_to_existing_database(subject_name).await {
+										Ok(pool) => {
+											subjects.insert(subject_name.to_string(), pool);
+											println!("DEBUG: Connected to existing database for subject: {subject_name}");
+										}
+										Err(e) => {
+											eprintln!("Warning: Failed to connect to existing database for subject '{subject_name}': {e}");
+										}
 									}
 								}
-							}
-						}
-					}
-				}
 			}
+			drop(subjects);
 		}
 
 		Ok(())
@@ -102,7 +114,7 @@ impl DB {
 	async fn connect_to_existing_database(&self, subject_name: &str) -> Result<Pool<Sqlite>> {
 		let current_dir = std::env::current_dir().context("Failed to get current directory")?;
 		let databases_dir = current_dir.join("databases");
-		let db_path = databases_dir.join(format!("{}.db", subject_name));
+		let db_path = databases_dir.join(format!("{subject_name}.db"));
 
 		let connection_string = format!("sqlite:{}", db_path.display());
 		let pool = SqlitePool::connect(&connection_string).await.context("Failed to connect to existing database")?;
@@ -111,6 +123,15 @@ impl DB {
 	}
 
 	/// Initializes a new subject database.
+	/// 
+	/// # Errors
+	/// 
+	/// Returns an error if:
+	/// - Failed to get current directory
+	/// - Failed to create databases directory
+	/// - Failed to create database connection
+	/// - Failed to configure `SQLite` settings
+	/// - Failed to create tables or indexes
 	pub async fn initialize_new_subject(&self, subject_name: &str) -> Result<()> {
 		let current_dir = std::env::current_dir().context("Failed to get current directory")?;
 		println!("DEBUG: Current working directory: {}", current_dir.display());
@@ -123,11 +144,11 @@ impl DB {
 			println!("DEBUG: Created databases directory successfully");
 		}
 
-		let db_path = databases_dir.join(format!("{}.db", subject_name));
+		let db_path = databases_dir.join(format!("{subject_name}.db"));
 		println!("DEBUG: Starting SQLite database creation for {} at path: {}", subject_name, db_path.display());
 
 		let connection_string = format!("sqlite:{}", db_path.display());
-		println!("DEBUG: Connection string: {}", connection_string);
+		println!("DEBUG: Connection string: {connection_string}");
 
 		let pool = SqlitePool::connect(&connection_string).await.context("Failed to create database connection")?;
 
@@ -177,7 +198,7 @@ impl DB {
 		// Store the pool
 		SUBJECTS.lock().await.insert(subject_name.to_string(), pool);
 
-		println!("DEBUG: Database created and configured for subject: {}", subject_name);
+		println!("DEBUG: Database created and configured for subject: {subject_name}");
 		Ok(())
 	}
 
@@ -188,6 +209,13 @@ impl DB {
 	}
 
 	/// Retrieves a dataset ID by its name with intelligent caching.
+	/// 
+	/// # Errors
+	/// 
+	/// Returns an error if:
+	/// - No database connection exists for the subject
+	/// - Failed to query dataset ID from database
+	/// - Failed to parse dataset ID as UUID
 	pub async fn get_dataset_id_by_name(&self, subject_name: &str, name: &str) -> Result<Uuid> {
 		// Try cache first
 		if let Some(id) = CACHE.get_dataset_id_by_name(subject_name, name).await {
@@ -271,6 +299,12 @@ impl DB {
 	}
 
 	/// Adds a single measurement to an existing dataset with cache integration.
+	/// 
+	/// # Errors
+	/// 
+	/// Returns an error if:
+	/// - No database connection exists for the subject
+	/// - Failed to insert measurement into database
 	pub async fn add_measurement(&self, subject_name: &str, dataset_id: Uuid, measurement: InputMeasurement) -> Result<()> {
 		let pool = self.get_pool(subject_name).await?;
 		let measurement_id = Uuid::new_v4();
@@ -286,6 +320,13 @@ impl DB {
 	}
 
 	/// Retrieves all measurements for a dataset with intelligent caching.
+	/// 
+	/// # Errors
+	/// 
+	/// Returns an error if:
+	/// - No database connection exists for the subject
+	/// - Failed to query measurements from database
+	/// - Failed to parse measurement data
 	pub async fn get_measurements_by_dataset_id(&self, subject_name: &str, dataset_id: Uuid) -> Result<Vec<Measurement>> {
 		// Try cache first
 		if let Some(measurements) = CACHE.get_measurements(subject_name, dataset_id).await {
@@ -304,6 +345,15 @@ impl DB {
 	}
 
 	/// **PRODUCTION RECOMMENDED**: High-performance batch dataset insertion.
+	/// 
+	/// # Errors
+	/// 
+	/// Returns an error if:
+	/// - No database connection exists for the subject
+	/// - Failed to start database transaction
+	/// - Failed to insert dataset or measurements
+	/// - Failed to commit transaction
+	/// - Failed to verify inserted data
 	pub async fn add_dataset(&self, subject_name: &str, dataset: Dataset) -> Result<Uuid> {
 		let pool = self.get_pool(subject_name).await?;
 		println!("DEBUG: Starting add_dataset for {} with dataset ID {}", dataset.name, dataset.id);
@@ -354,6 +404,12 @@ impl DB {
 	}
 
 	/// **RECOMMENDED**: Intelligent dataset insertion with automatic optimization.
+	/// 
+	/// # Errors
+	/// 
+	/// Returns an error if:
+	/// - Failed to insert dataset using the selected method
+	/// - Any database operation fails during insertion
 	pub async fn add_dataset_optimized(&self, subject_name: &str, dataset: Dataset) -> Result<Uuid> {
 		let measurement_count = dataset.measurements.len();
 
@@ -369,6 +425,14 @@ impl DB {
 	}
 
 	/// Memory buffer approach for very large datasets (>100K records).
+	/// 
+	/// # Errors
+	/// 
+	/// Returns an error if:
+	/// - No database connection exists for the subject
+	/// - Failed to start database transaction
+	/// - Failed to insert dataset or transfer measurements
+	/// - Failed to commit transaction
 	pub async fn add_dataset_memory_buffer(&self, subject_name: &str, dataset: Dataset) -> Result<Uuid> {
 		println!("DEBUG: Starting add_dataset_memory_buffer for {} with dataset ID {}", dataset.name, dataset.id);
 
@@ -405,6 +469,13 @@ impl DB {
 	}
 
 	/// High-performance bulk measurement insertion with intelligent batching.
+	/// 
+	/// # Errors
+	/// 
+	/// Returns an error if:
+	/// - No database connection exists for the subject
+	/// - Failed to insert measurements into database
+	/// - Failed to start or commit database transaction
 	pub async fn add_measurements_bulk(&self, subject_name: &str, dataset_id: Uuid, measurements: Vec<InputMeasurement>) -> Result<()> {
 		let pool = self.get_pool(subject_name).await?;
 		let measurement_count = measurements.len();
@@ -426,7 +497,7 @@ impl DB {
 			11..=999 => {
 				// Single batch insert for medium batches
 				let placeholders = measurements.iter().map(|_| "(?, ?, ?, ?)").collect::<Vec<_>>().join(", ");
-				let sql = format!("INSERT INTO measurements (id, dataset_id, timestamp, value) VALUES {}", placeholders);
+				let sql = format!("INSERT INTO measurements (id, dataset_id, timestamp, value) VALUES {placeholders}");
 				let mut query = sqlx::query(&sql);
 
 				for measurement in &measurements {
@@ -467,6 +538,12 @@ impl DB {
 	}
 
 	/// Efficiently inserts multiple datasets using intelligent optimization.
+	/// 
+	/// # Errors
+	/// 
+	/// Returns an error if:
+	/// - Failed to insert any dataset in the collection
+	/// - Any database operation fails during bulk insertion
 	pub async fn add_datasets_bulk(&self, subject_name: &str, datasets: Vec<Dataset>) -> Result<Vec<Uuid>> {
 		let mut result_ids = Vec::new();
 		let total_measurements: usize = datasets.iter().map(|d| d.measurements.len()).sum();
@@ -483,6 +560,17 @@ impl DB {
 	}
 
 	/// Production-ready dataset insertion with automatic retry logic.
+	/// 
+	/// # Errors
+	/// 
+	/// Returns an error if:
+	/// - All retry attempts fail
+	/// - Database operations consistently fail
+	/// 
+	/// # Panics
+	/// 
+	/// Panics if `max_retries` is 0 and no successful insertion occurs,
+	/// as `last_error` will be `None` when `unwrap()` is called.
 	pub async fn add_dataset_with_retry(&self, subject_name: &str, dataset: Dataset, max_retries: u32) -> Result<Uuid> {
 		use std::time::Duration;
 
@@ -505,7 +593,7 @@ impl DB {
 			}
 		}
 
-		Err(last_error.unwrap())
+		Err(last_error.expect("last_error should be Some after failed retries"))
 	}
 
 	/// Retrieves comprehensive performance statistics for monitoring and optimization.
@@ -537,6 +625,13 @@ impl DB {
 	}
 
 	/// Retrieves measurements for a dataset within a specific time range.
+	/// 
+	/// # Errors
+	/// 
+	/// Returns an error if:
+	/// - No database connection exists for the subject
+	/// - Failed to query measurements from database
+	/// - Failed to parse measurement data
 	pub async fn get_measurments_by_time(&self, subject_name: &str, dataset_id: Uuid, start_time: chrono::DateTime<chrono::Utc>, end_time: chrono::DateTime<chrono::Utc>) -> Result<Vec<Measurement>> {
 		// Try cache first
 		if let Some(measurements) = CACHE.get_measurements_by_time(subject_name, dataset_id, start_time, end_time).await {
@@ -555,6 +650,14 @@ impl DB {
 	}
 
 	/// Retrieves interpolated measurements for a dataset within a specific time range.
+	/// 
+	/// # Errors
+	/// 
+	/// Returns an error if:
+	/// - No database connection exists for the subject
+	/// - Failed to query measurements from database
+	/// - Insufficient measurements for interpolation (less than 2)
+	/// - Failed to perform interpolation
 	pub async fn get_interpolated_measurements_by_time(&self, subject_name: &str, dataset_id: Uuid, start_time: chrono::DateTime<chrono::Utc>, end_time: chrono::DateTime<chrono::Utc>, resolution: Resolution, spline_type: SplineType) -> Result<Vec<Measurement>> {
 		// Get the step size from the resolution enum
 		let step_seconds = match resolution {
