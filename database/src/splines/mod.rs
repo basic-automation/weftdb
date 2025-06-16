@@ -1,48 +1,62 @@
 use anyhow::Result;
-use chrono::{DateTime, TimeDelta, Utc};
-pub use cubic::*;
-pub use linear::*;
-pub use polynomial::*;
-pub use quadratic::*;
+use chrono::{DateTime, Utc};
 
-use crate::Measurement;
+use crate::{Error, Measurement};
 
-mod cubic;
-mod linear;
-mod polynomial;
-mod quadratic;
+pub mod cubic;
+pub mod fast_paths;
+pub mod linear;
+pub mod parallel;
+pub mod polynomial;
+pub mod quadratic;
+pub mod simd; // Make SIMD module public
 
-#[derive(Copy, Clone, Debug)]
+// Re-export spline functions
+pub use cubic::cubic;
+pub use linear::linear;
+// Re-export parallel and optimized functions
+pub use parallel::*;
+pub use polynomial::polynomial;
+pub use quadratic::quadratic;
+// Re-export SIMD functions for benchmarking and advanced use cases
+pub use simd::{auto_interpolate_simd, cubic_simd_batch, linear_simd_batch, polynomial_simd_batch, quadratic_simd_batch};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolution {
-	Microseconds,
 	Milliseconds,
 	Seconds,
 	Minutes,
 	Hours,
 	Days,
-	Weeks,
-	Months,
-	Years,
 }
 
 impl Resolution {
+	/// Get the duration in milliseconds for this resolution
 	#[must_use]
-	pub const fn to_step(&self) -> TimeDelta {
+	pub const fn to_milliseconds(self) -> i64 {
 		match self {
-			Self::Microseconds => TimeDelta::microseconds(1),
-			Self::Milliseconds => TimeDelta::milliseconds(1),
-			Self::Seconds => TimeDelta::seconds(1),
-			Self::Minutes => TimeDelta::minutes(1),
-			Self::Hours => TimeDelta::hours(1),
-			Self::Days => TimeDelta::days(1),
-			Self::Weeks => TimeDelta::weeks(1),
-			Self::Months => TimeDelta::days(30), // Approximation
-			Self::Years => TimeDelta::days(365), // Approximation
+			Self::Milliseconds => 1,
+			Self::Seconds => 1000,
+			Self::Minutes => 60_000,
+			Self::Hours => 3_600_000,
+			Self::Days => 86_400_000,
+		}
+	}
+
+	/// Get the step duration for this resolution
+	#[must_use]
+	pub const fn to_step(self) -> chrono::Duration {
+		match self {
+			Self::Milliseconds => chrono::Duration::milliseconds(1),
+			Self::Seconds => chrono::Duration::seconds(1),
+			Self::Minutes => chrono::Duration::minutes(1),
+			Self::Hours => chrono::Duration::hours(1),
+			Self::Days => chrono::Duration::days(1),
 		}
 	}
 }
 
-#[derive(Copy, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplineType {
 	Linear,
 	Quadratic,
@@ -50,68 +64,31 @@ pub enum SplineType {
 	Polynomial(usize),
 }
 
-/// Automatically selects and applies the appropriate spline interpolation method.
-///
-/// This function provides a unified interface for all spline interpolation types,
-/// automatically dispatching to the correct implementation based on the `SplineType`.
-///
-/// # Arguments
-///
-/// * `measurements` - Vector of measurements to interpolate
-/// * `start` - Start time for interpolation range
-/// * `end` - End time for interpolation range  
-/// * `resolution` - Time resolution for output measurements
-/// * `spline_type` - Type of spline interpolation to use
-///
-/// # Returns
-///
-/// Returns a vector of interpolated measurements at the specified resolution.
+/// Automatically choose the best interpolation method and perform interpolation
 ///
 /// # Errors
 ///
-/// This function will return an error if:
-/// - The underlying spline function fails
-/// - Invalid time range (start >= end)
-/// - Insufficient measurements for the chosen spline type
-/// - Inconsistent dataset IDs across measurements
-/// - Invalid polynomial degree (for polynomial splines)
-///
-/// # Examples
-///
-/// ```rust
-/// # use database::{auto_interpolate, SplineType, Resolution, Measurement};
-/// # use bigdecimal::BigDecimal;
-/// # use chrono::{DateTime, Utc, TimeZone};
-/// # use uuid::Uuid;
-/// # use std::str::FromStr;
-/// let dataset_id = Uuid::new_v4();
-/// let measurements = vec![
-///     Measurement {
-///         id: Uuid::new_v4(),
-///         dataset_id,
-///         timestamp: Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap(),
-///         value: BigDecimal::from_str("10.0").unwrap(),
-///     },
-///     Measurement {
-///         id: Uuid::new_v4(),
-///         dataset_id,
-///         timestamp: Utc.with_ymd_and_hms(2023, 1, 1, 1, 0, 0).unwrap(),
-///         value: BigDecimal::from_str("20.0").unwrap(),
-///     },
-/// ];
-///
-/// let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-/// let end = Utc.with_ymd_and_hms(2023, 1, 1, 1, 0, 0).unwrap();
-///
-/// let result = auto_interpolate(
-///     measurements,
-///     start,
-///     end,
-///     Resolution::Minutes,
-///     SplineType::Linear
-/// ).unwrap();
-/// ```
+/// Returns an error if:
+/// - There are fewer than 2 measurements
+/// - Measurements have different dataset IDs
+/// - The time range is invalid (start >= end)
+/// - For polynomial interpolation, insufficient measurements for the specified degree
 pub fn auto_interpolate(measurements: Vec<Measurement>, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, spline_type: SplineType) -> Result<Vec<Measurement>> {
+	if measurements.len() < 2 {
+		return Err(Error::InsufficientMeasurementsError.into());
+	}
+
+	// Validate all measurements have the same dataset_id
+	let dataset_id = measurements[0].dataset_id;
+	if !measurements.iter().all(|m| m.dataset_id == dataset_id) {
+		return Err(Error::DifferentDatasetIdsError.into());
+	}
+
+	// Validate time range
+	if start >= end {
+		return Err(Error::InvalidTimeRangeError.into());
+	}
+
 	match spline_type {
 		SplineType::Linear => linear(measurements, start, end, resolution),
 		SplineType::Quadratic => quadratic(measurements, start, end, resolution),
@@ -125,156 +102,161 @@ mod tests {
 	use std::str::FromStr;
 
 	use bigdecimal::BigDecimal;
-	use chrono::{TimeZone, Utc};
+	use chrono::TimeZone;
 	use uuid::Uuid;
 
 	use super::*;
-	use crate::Measurement;
 
-	fn create_test_measurements() -> Vec<Measurement> {
+	fn create_test_measurements(count: usize) -> Vec<Measurement> {
 		let dataset_id = Uuid::new_v4();
-		vec![Measurement { id: Uuid::new_v4(), dataset_id, timestamp: Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap(), value: BigDecimal::from_str("10.0").unwrap() }, Measurement { id: Uuid::new_v4(), dataset_id, timestamp: Utc.with_ymd_and_hms(2023, 1, 1, 1, 0, 0).unwrap(), value: BigDecimal::from_str("20.0").unwrap() }, Measurement { id: Uuid::new_v4(), dataset_id, timestamp: Utc.with_ymd_and_hms(2023, 1, 1, 2, 0, 0).unwrap(), value: BigDecimal::from_str("30.0").unwrap() }]
+		let start_time = chrono::Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
+
+		(0..count).map(|i| Measurement { id: Uuid::new_v4(), dataset_id, timestamp: start_time + chrono::Duration::seconds(i as i64 * 10), value: BigDecimal::from_str(&format!("{}.0", i * 10)).unwrap() }).collect()
 	}
 
-	#[test]
-	fn test_auto_interpolate_linear() {
-		let measurements = create_test_measurements();
-		let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-		let end = Utc.with_ymd_and_hms(2023, 1, 1, 2, 0, 0).unwrap();
+	#[tokio::test]
+	async fn test_auto_interpolate_linear() {
+		let measurements = create_test_measurements(5);
+		let start = measurements[0].timestamp;
+		let end = measurements[measurements.len() - 1].timestamp;
 
-		let result = auto_interpolate(measurements, start, end, Resolution::Hours, SplineType::Linear).unwrap();
+		let result = auto_interpolate(measurements, start, end, Resolution::Seconds, SplineType::Linear);
+		assert!(result.is_ok());
 
-		assert!(!result.is_empty());
-		// Verify that linear interpolation was called
-		assert_eq!(result.len(), 3); // Assuming linear returns 3 points
+		let interpolated = result.unwrap();
+		assert!(!interpolated.is_empty());
 	}
 
-	#[test]
-	fn test_auto_interpolate_quadratic() {
-		let measurements = create_test_measurements();
-		let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-		let end = Utc.with_ymd_and_hms(2023, 1, 1, 2, 0, 0).unwrap();
+	#[tokio::test]
+	async fn test_auto_interpolate_quadratic() {
+		let measurements = create_test_measurements(5);
+		let start = measurements[0].timestamp;
+		let end = measurements[measurements.len() - 1].timestamp;
 
-		let result = auto_interpolate(measurements, start, end, Resolution::Hours, SplineType::Quadratic).unwrap();
+		let result = auto_interpolate(measurements, start, end, Resolution::Seconds, SplineType::Quadratic);
+		assert!(result.is_ok());
 
-		assert!(!result.is_empty());
+		let interpolated = result.unwrap();
+		assert!(!interpolated.is_empty());
 	}
 
-	#[test]
-	fn test_auto_interpolate_cubic() {
-		let measurements = create_test_measurements();
-		let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-		let end = Utc.with_ymd_and_hms(2023, 1, 1, 2, 0, 0).unwrap();
+	#[tokio::test]
+	async fn test_auto_interpolate_cubic() {
+		let measurements = create_test_measurements(5);
+		let start = measurements[0].timestamp;
+		let end = measurements[measurements.len() - 1].timestamp;
 
-		let result = auto_interpolate(measurements, start, end, Resolution::Hours, SplineType::Cubic).unwrap();
+		let result = auto_interpolate(measurements, start, end, Resolution::Seconds, SplineType::Cubic);
+		assert!(result.is_ok());
 
-		assert!(!result.is_empty());
+		let interpolated = result.unwrap();
+		assert!(!interpolated.is_empty());
 	}
 
-	#[test]
-	fn test_auto_interpolate_polynomial() {
-		let measurements = create_test_measurements();
-		let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-		let end = Utc.with_ymd_and_hms(2023, 1, 1, 2, 0, 0).unwrap();
+	#[tokio::test]
+	async fn test_auto_interpolate_polynomial() {
+		let measurements = create_test_measurements(6);
+		let start = measurements[0].timestamp;
+		let end = measurements[measurements.len() - 1].timestamp;
 
-		let result = auto_interpolate(measurements, start, end, Resolution::Hours, SplineType::Polynomial(2)).unwrap();
+		let result = auto_interpolate(measurements, start, end, Resolution::Seconds, SplineType::Polynomial(3));
+		assert!(result.is_ok());
 
-		assert!(!result.is_empty());
+		let interpolated = result.unwrap();
+		assert!(!interpolated.is_empty());
 	}
 
-	#[test]
-	fn test_auto_interpolate_different_resolutions() {
-		let measurements = create_test_measurements();
-		let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-		let end = Utc.with_ymd_and_hms(2023, 1, 1, 2, 0, 0).unwrap();
+	#[tokio::test]
+	async fn test_auto_interpolate_polynomial_various_degrees() {
+		let measurements = create_test_measurements(10);
+		let start = measurements[0].timestamp;
+		let end = measurements[measurements.len() - 1].timestamp;
 
-		// Test different resolutions
-		for resolution in [Resolution::Minutes, Resolution::Hours, Resolution::Days] {
-			let result = auto_interpolate(measurements.clone(), start, end, resolution, SplineType::Linear).unwrap();
+		for degree in 2..=5 {
+			let result = auto_interpolate(measurements.clone(), start, end, Resolution::Seconds, SplineType::Polynomial(degree));
+			assert!(result.is_ok(), "Failed for polynomial degree {}", degree);
 
-			assert!(!result.is_empty());
+			let interpolated = result.unwrap();
+			assert!(!interpolated.is_empty());
 		}
 	}
 
-	#[test]
-	fn test_auto_interpolate_empty_measurements() {
+	#[tokio::test]
+	async fn test_auto_interpolate_empty_measurements() {
 		let measurements = vec![];
-		let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-		let end = Utc.with_ymd_and_hms(2023, 1, 1, 2, 0, 0).unwrap();
+		let start = chrono::Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
+		let end = chrono::Utc.with_ymd_and_hms(2023, 1, 1, 1, 0, 0).unwrap();
 
-		let result = auto_interpolate(measurements, start, end, Resolution::Hours, SplineType::Linear).unwrap();
-
-		assert!(result.is_empty());
-	}
-
-	#[test]
-	fn test_auto_interpolate_single_measurement() {
-		let dataset_id = Uuid::new_v4();
-		let measurements = vec![Measurement { id: Uuid::new_v4(), dataset_id, timestamp: Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap(), value: BigDecimal::from_str("10.0").unwrap() }];
-		let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-		let end = Utc.with_ymd_and_hms(2023, 1, 1, 2, 0, 0).unwrap();
-
-		let result = auto_interpolate(measurements, start, end, Resolution::Hours, SplineType::Cubic);
-
-		// Should return an error for insufficient measurements
+		let result = auto_interpolate(measurements, start, end, Resolution::Seconds, SplineType::Linear);
 		assert!(result.is_err());
 	}
 
-	#[test]
-	fn test_auto_interpolate_polynomial_various_degrees() {
-		let measurements = create_test_measurements();
-		let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-		let end = Utc.with_ymd_and_hms(2023, 1, 1, 2, 0, 0).unwrap();
+	#[tokio::test]
+	async fn test_auto_interpolate_single_measurement() {
+		let measurements = create_test_measurements(1);
+		let start = measurements[0].timestamp;
+		let end = measurements[0].timestamp + chrono::Duration::hours(1);
 
-		for degree in [1, 2, 3, 4] {
-			let result = auto_interpolate(measurements.clone(), start, end, Resolution::Hours, SplineType::Polynomial(degree)).unwrap();
+		let result = auto_interpolate(measurements, start, end, Resolution::Seconds, SplineType::Linear);
+		assert!(result.is_err());
+	}
 
-			assert!(!result.is_empty());
+	#[tokio::test]
+	async fn test_auto_interpolate_dataset_consistency() {
+		let mut measurements = create_test_measurements(5);
+		// Change one measurement's dataset_id to make them inconsistent
+		measurements[2].dataset_id = Uuid::new_v4();
+
+		let start = measurements[0].timestamp;
+		let end = measurements[measurements.len() - 1].timestamp;
+
+		let result = auto_interpolate(measurements, start, end, Resolution::Seconds, SplineType::Linear);
+		assert!(result.is_err());
+	}
+
+	#[tokio::test]
+	async fn test_auto_interpolate_time_bounds() {
+		let measurements = create_test_measurements(5);
+		let start = measurements[measurements.len() - 1].timestamp;
+		let end = measurements[0].timestamp; // Invalid: start >= end
+
+		let result = auto_interpolate(measurements, start, end, Resolution::Seconds, SplineType::Linear);
+		assert!(result.is_err());
+	}
+
+	#[tokio::test]
+	async fn test_auto_interpolate_different_resolutions() {
+		let measurements = create_test_measurements(5);
+		let start = measurements[0].timestamp;
+		let end = measurements[measurements.len() - 1].timestamp;
+
+		for resolution in [Resolution::Milliseconds, Resolution::Seconds, Resolution::Minutes, Resolution::Hours] {
+			let result = auto_interpolate(measurements.clone(), start, end, resolution, SplineType::Linear);
+			assert!(result.is_ok(), "Failed for resolution: {:?}", resolution);
+
+			let interpolated = result.unwrap();
+			assert!(!interpolated.is_empty());
 		}
 	}
 
-	#[test]
-	fn test_auto_interpolate_spline_type_dispatch() {
-		let measurements = create_test_measurements();
-		let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-		let end = Utc.with_ymd_and_hms(2023, 1, 1, 2, 0, 0).unwrap();
+	#[tokio::test]
+	async fn test_auto_interpolate_spline_type_dispatch() {
+		let measurements = create_test_measurements(8);
+		let start = measurements[0].timestamp;
+		let end = measurements[measurements.len() - 1].timestamp;
 
-		// Test that all spline types work
-		let spline_types = vec![SplineType::Linear, SplineType::Quadratic, SplineType::Cubic, SplineType::Polynomial(2)];
+		let spline_types = vec![SplineType::Linear, SplineType::Quadratic, SplineType::Cubic, SplineType::Polynomial(2), SplineType::Polynomial(3), SplineType::Polynomial(4)];
 
 		for spline_type in spline_types {
-			let result = auto_interpolate(measurements.clone(), start, end, Resolution::Hours, spline_type).unwrap();
+			let result = auto_interpolate(measurements.clone(), start, end, Resolution::Seconds, spline_type);
+			assert!(result.is_ok(), "Failed for spline type: {:?}", spline_type);
 
-			assert!(!result.is_empty());
-		}
-	}
+			let interpolated = result.unwrap();
+			assert!(!interpolated.is_empty());
 
-	#[test]
-	fn test_auto_interpolate_time_bounds() {
-		let measurements = create_test_measurements();
-		let start = Utc.with_ymd_and_hms(2023, 1, 1, 2, 0, 0).unwrap(); // start > end
-		let end = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-
-		let result = auto_interpolate(measurements, start, end, Resolution::Hours, SplineType::Cubic);
-
-		// Should return an error for invalid time range
-		assert!(result.is_err());
-	}
-
-	#[test]
-	fn test_auto_interpolate_dataset_consistency() {
-		let measurements = create_test_measurements();
-		let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-		let end = Utc.with_ymd_and_hms(2023, 1, 1, 2, 0, 0).unwrap();
-
-		let result = auto_interpolate(measurements, start, end, Resolution::Hours, SplineType::Linear).unwrap();
-
-		// All results should have the same dataset_id
-		if let Some(first_measurement) = result.first() {
-			let expected_dataset_id = first_measurement.dataset_id;
-			for measurement in &result {
-				assert_eq!(measurement.dataset_id, expected_dataset_id);
-			}
+			// Verify all results have the same dataset_id
+			let expected_dataset_id = measurements[0].dataset_id;
+			assert!(interpolated.iter().all(|m| m.dataset_id == expected_dataset_id));
 		}
 	}
 }

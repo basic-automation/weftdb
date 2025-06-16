@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
+use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -82,24 +83,25 @@ impl DatabaseCache {
 	pub async fn get_dataset(&self, subject_name: &str, dataset_id: Uuid) -> Option<Dataset> {
 		let mut datasets = self.datasets.write().await;
 
-		if let Some(subject_datasets) = datasets.get_mut(subject_name)
-			&& let Some(entry) = subject_datasets.get_mut(&dataset_id)
-		{
-			// Check TTL
-			if entry.last_accessed.elapsed().as_secs() > self.ttl_seconds {
-				subject_datasets.remove(&dataset_id);
-				drop(datasets); // Release the lock before acquiring another
+		// Fix let chains by splitting into separate if statements
+		if let Some(subject_datasets) = datasets.get_mut(subject_name) {
+			if let Some(entry) = subject_datasets.get_mut(&dataset_id) {
+				// Check TTL
+				if entry.last_accessed.elapsed().as_secs() > self.ttl_seconds {
+					subject_datasets.remove(&dataset_id);
+					drop(datasets); // Release the lock before acquiring another
 
-				// Also remove from names cache
-				if let Some(subject_names) = self.dataset_names.write().await.get_mut(subject_name) {
-					subject_names.retain(|_, &mut id| id != dataset_id);
+					// Also remove from names cache
+					if let Some(subject_names) = self.dataset_names.write().await.get_mut(subject_name) {
+						subject_names.retain(|_, &mut id| id != dataset_id);
+					}
+					return None;
 				}
-				return None;
-			}
 
-			// Update access time and return clone
-			entry.last_accessed = std::time::Instant::now();
-			return Some(entry.dataset.clone());
+				// Update access time and return clone
+				entry.last_accessed = std::time::Instant::now();
+				return Some(entry.dataset.clone());
+			}
 		}
 		None
 	}
@@ -108,33 +110,16 @@ impl DatabaseCache {
 	pub async fn get_dataset_by_name(&self, subject_name: &str, dataset_name: &str) -> Option<Dataset> {
 		let dataset_names = self.dataset_names.read().await;
 
-		if let Some(subject_names) = dataset_names.get(subject_name)
-			&& let Some(&dataset_id) = subject_names.get(dataset_name)
-		{
-			drop(dataset_names); // Release the read lock
-			return self.get_dataset(subject_name, dataset_id).await;
+		// Fix let chains by splitting into separate if statements
+		if let Some(subject_names) = dataset_names.get(subject_name) {
+			if let Some(&dataset_id) = subject_names.get(dataset_name) {
+				drop(dataset_names); // Release the read lock
+				return self.get_dataset(subject_name, dataset_id).await;
+			}
 		}
 
 		println!("DEBUG: Cache miss for dataset name '{dataset_name}' in subject {subject_name}");
 		None
-	}
-
-	/// Get dataset ID by name
-	pub async fn get_dataset_id_by_name(&self, subject_name: &str, dataset_name: &str) -> Option<Uuid> {
-		let dataset_names = self.dataset_names.read().await;
-		dataset_names.get(subject_name)?.get(dataset_name).copied()
-	}
-
-	/// Add a measurement to a cached dataset
-	pub async fn add_measurement_to_cache(&self, subject_name: &str, dataset_id: Uuid, measurement: Measurement) -> bool {
-		if let Some(subject_datasets) = self.datasets.write().await.get_mut(subject_name)
-			&& let Some(entry) = subject_datasets.get_mut(&dataset_id)
-		{
-			entry.dataset.measurements.push(measurement);
-			entry.last_accessed = std::time::Instant::now();
-			return true;
-		}
-		false
 	}
 
 	/// Get measurements for a dataset
@@ -147,18 +132,35 @@ impl DatabaseCache {
 	}
 
 	/// Get measurements for a dataset by time range
-	pub async fn get_measurements_by_time(&self, subject_name: &str, dataset_id: Uuid, start_time: chrono::DateTime<chrono::Utc>, end_time: chrono::DateTime<chrono::Utc>) -> Option<Vec<Measurement>> {
-		if let Some(dataset) = self.get_dataset(subject_name, dataset_id).await {
-			// Filter measurements by time range
-			let filtered_measurements: Vec<Measurement> = dataset.measurements.iter().filter(|m| m.timestamp >= start_time && m.timestamp <= end_time).cloned().collect();
+	pub async fn get_measurements_by_time(&self, subject_name: &str, dataset_id: Uuid, start_time: DateTime<Utc>, end_time: DateTime<Utc>) -> Option<Vec<Measurement>> {
+		// Fix significant drop issue by using immediate access
+		if let Some(subject_datasets) = self.datasets.read().await.get(subject_name) {
+			if let Some(entry) = subject_datasets.get(&dataset_id) {
+				// Filter by time range
+				let filtered: Vec<Measurement> = entry.dataset.measurements.iter().filter(|m| m.timestamp >= start_time && m.timestamp <= end_time).cloned().collect();
 
-			println!("DEBUG: Retrieved {} measurements from cache for dataset {} in subject {} (time range)", filtered_measurements.len(), dataset_id, subject_name);
-
-			return Some(filtered_measurements);
+				return Some(filtered);
+			}
 		}
 
-		println!("DEBUG: Cache miss for dataset {dataset_id} in subject {subject_name} (time range)");
 		None
+	}
+
+	/// Get dataset ID by name from cache
+	pub async fn get_dataset_id_by_name(&self, subject_name: &str, dataset_name: &str) -> Option<Uuid> {
+		// Fix significant drop issue by using immediate access
+		self.dataset_names.read().await.get(subject_name)?.get(dataset_name).copied()
+	}
+
+	/// Add a single measurement to an existing cached dataset
+	pub async fn add_measurement_to_cache(&self, subject_name: &str, dataset_id: Uuid, measurement: Measurement) {
+		// Fix let chains issue
+		if let Some(subject_datasets) = self.datasets.write().await.get_mut(subject_name) {
+			if let Some(entry) = subject_datasets.get_mut(&dataset_id) {
+				entry.dataset.measurements.push(measurement);
+				entry.last_accessed = std::time::Instant::now();
+			}
+		}
 	}
 
 	/// Clear cache for a specific subject

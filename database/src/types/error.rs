@@ -1,40 +1,28 @@
 use thiserror::Error as ThisError;
 
-#[derive(ThisError, Debug)]
+#[derive(Debug, ThisError)]
 pub enum Error {
-	#[error("Error reading directory: {0}")]
-	ReadingDirectoryError(String),
-
-	#[error("Error creating directory: {0}")]
-	CreatingDirectoryError(String),
-
-	#[error("Error creating database: {0}")]
-	CreatingDatabaseError(String),
-
-	#[error("Error connecting to database: {0}")]
-	ConnectingDatabaseError(String),
-
-	#[error("Invalid path: {0}")]
-	InvalidPathError(String),
-
-	#[error("Error initalizing existing database connections: {0}")]
-	InitializingExistingConnectionsError(Box<Error>),
-
-	#[error("Error in database execution: {0}")]
-	DatabaseExecutionError(String),
-
-	#[error("Unable to parse UUID: {0}")]
-	UuidParseError(String),
-
-	#[error("All measurements must have the same dataset_id")]
-	InconsistentDatasetIdsError,
-
-	#[error("Start time must be before end time")]
-	InvalidTimeRangeError,
-
-	#[error("At least two measurements are required for interpolation or extrapolation")]
+	#[error("Insufficient measurements provided for interpolation")]
 	InsufficientMeasurementsError,
 
-	#[error("Need at least 2 points for cubic spline")]
+	#[error("Different dataset IDs found in measurements")]
+	DifferentDatasetIdsError,
+
+	#[error("Inconsistent dataset IDs found in measurements")]
+	InconsistentDatasetIdsError,
+
+	#[error("Insufficient points for cubic spline interpolation")]
 	InsufficientPointsForCubicSplineError,
+
+	#[error("Invalid time range: start time must be before end time")]
+	InvalidTimeRangeError,
+
+	#[error("Database error: {0}")]
+	DatabaseError(String),
+
+	#[error("Interpolation error: {0}")]
+	InterpolationError(String),
+
+	#[error("Cache error: {0}")]
+	CacheError(String),
 }

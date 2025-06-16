@@ -2,8 +2,8 @@ use std::{hint::black_box, str::FromStr};
 
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, TimeZone, Utc};
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use database::{Measurement, Resolution, SplineType, auto_interpolate};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use database::{auto_interpolate, optimized_interpolate, Measurement, Resolution, SplineType};
 use uuid::Uuid;
 
 fn create_benchmark_measurements(count: usize, dataset_id: Uuid, start_time: DateTime<Utc>, interval_seconds: i64) -> Vec<Measurement> {
@@ -175,5 +175,29 @@ fn bench_spline_type_comparison(c: &mut Criterion) {
 	group.finish();
 }
 
-criterion_group!(benches, bench_linear_interpolation, bench_cubic_interpolation, bench_quadratic_interpolation, bench_polynomial_interpolation, bench_interpolation_resolutions, bench_interpolation_vs_extrapolation, bench_spline_type_comparison);
+/// Benchmark optimized interpolation performance across spline types
+fn bench_optimized_spline_comparison(c: &mut Criterion) {
+	let dataset_id = Uuid::new_v4();
+	let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
+	let measurements = create_benchmark_measurements(1000, dataset_id, start_time, 10); // Large enough for optimizations
+
+	let interpolation_start = start_time + chrono::Duration::seconds(50);
+	let interpolation_end = start_time + chrono::Duration::seconds(9950);
+
+	let mut group = c.benchmark_group("optimized_spline_comparison");
+
+	let spline_types = [("Linear", SplineType::Linear), ("Quadratic", SplineType::Quadratic), ("Cubic", SplineType::Cubic), ("Polynomial_2", SplineType::Polynomial(2)), ("Polynomial_3", SplineType::Polynomial(3))];
+
+	for (name, spline_type) in spline_types {
+		group.bench_with_input(BenchmarkId::new("spline_type", name), &spline_type, |b, &spline_type| {
+			b.iter(|| {
+				let result = optimized_interpolate(black_box(measurements.clone()), black_box(interpolation_start), black_box(interpolation_end), black_box(Resolution::Seconds), black_box(spline_type));
+				black_box(result)
+			});
+		});
+	}
+	group.finish();
+}
+
+criterion_group!(benches, bench_linear_interpolation, bench_cubic_interpolation, bench_quadratic_interpolation, bench_polynomial_interpolation, bench_interpolation_resolutions, bench_interpolation_vs_extrapolation, bench_spline_type_comparison, bench_optimized_spline_comparison);
 criterion_main!(benches);
