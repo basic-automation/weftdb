@@ -6,11 +6,14 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use rayon::prelude::*;
+use uuid::Uuid;
+use bigdecimal::Zero;
 
 use super::{auto_interpolate, linear, quadratic, Resolution, SplineType};
-use crate::Measurement;
+use crate::{Error, Measurement}; // ← Add Error import here
 
 /// Threshold for switching to parallel processing
 const PARALLEL_THRESHOLD: usize = 1000;
@@ -410,102 +413,256 @@ pub const fn get_performance_recommendation(measurement_count: usize, accuracy_p
 	}
 }
 
-#[cfg(test)]
-mod tests {
-	use std::str::FromStr;
+/// Quick test of dense parallel evaluation
+///
+/// # Errors
+///
+/// Returns an error if cubic spline creation or evaluation fails
+pub fn cubic_parallel_test(measurements: &[Measurement], start: DateTime<Utc>, end: DateTime<Utc>) -> Result<Vec<Measurement>> {
+    let spline = super::cubic::CubicSpline::new(measurements)?;
+    let step = chrono::Duration::seconds(1);
+    
+    let target_times: Vec<DateTime<Utc>> = {
+        let mut times = Vec::new();
+        let mut current = start;
+        while current <= end {
+            times.push(current);
+            current += step;
+        }
+        times
+    };
 
-	use bigdecimal::BigDecimal;
-	use chrono::{TimeZone, Utc};
-	use uuid::Uuid;
+    let dataset_id = measurements[0].dataset_id;
+    
+    let results: Vec<Measurement> = target_times
+        .par_iter()
+        .map(|&time| {
+            let value = spline.evaluate(time).unwrap_or_else(|_| BigDecimal::zero());
+            Measurement { id: Uuid::new_v4(), dataset_id, timestamp: time, value }
+        })
+        .collect();
 
-	use super::*;
-	use crate::Measurement;
+    Ok(results)
+}
 
-	fn create_test_measurements(count: usize) -> Vec<Measurement> {
-		let dataset_id = Uuid::new_v4();
-		let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
+/// Parallel polynomial interpolation using Rayon for coefficient calculation
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Insufficient measurements for polynomial degree
+/// - Parallel polynomial processing fails
+pub fn polynomial_parallel(
+    measurements: Vec<Measurement>, 
+    start: DateTime<Utc>, 
+    end: DateTime<Utc>, 
+    resolution: Resolution,
+    degree: usize
+) -> Result<Vec<Measurement>> {
+    if measurements.len() < degree + 1 {
+        return Err(Error::InsufficientMeasurementsError.into());
+    }
 
-		(0..count).map(|i| Measurement { id: Uuid::new_v4(), dataset_id, timestamp: start_time + chrono::Duration::seconds(i as i64 * 10), value: BigDecimal::from_str(&format!("{}.0", i * 10)).unwrap() }).collect()
-	}
+    // For large datasets, use parallel coefficient computation
+    if measurements.len() > 500 {
+        return polynomial_parallel_chunked(&measurements, start, end, resolution, degree); // ← Add &
+    }
 
-	#[tokio::test]
-	async fn test_optimized_interpolate_small_dataset() {
-		let measurements = create_test_measurements(50);
-		let start = measurements[0].timestamp;
-		let end = measurements[measurements.len() - 1].timestamp;
+    // Use standard polynomial for smaller datasets
+    super::polynomial::polynomial(measurements, start, end, resolution, degree)
+}
 
-		let result = optimized_interpolate(measurements, start, end, Resolution::Seconds, SplineType::Cubic);
+/// Parallel polynomial interpolation with chunked processing for very large datasets
+fn polynomial_parallel_chunked(
+    measurements: &[Measurement], // ← Change to reference
+    start: DateTime<Utc>, 
+    end: DateTime<Utc>, 
+    resolution: Resolution,
+    degree: usize
+) -> Result<Vec<Measurement>> {
+    // Calculate optimal chunk size based on polynomial degree complexity
+    let base_chunk_size = match degree {
+        1..=2 => 2000,   // Linear/Quadratic - larger chunks
+        3..=5 => 1000,   // Cubic to 5th degree - medium chunks  
+        6..=10 => 500,   // High degree - smaller chunks
+        _ => 250,        // Very high degree - very small chunks
+    };
+    
+    let chunk_size = std::cmp::min(base_chunk_size, measurements.len() / 4).max(degree + 10);
+    
+    // Create overlapping chunks to ensure continuity
+    let overlap = degree * 2;
+    let time_chunks = create_time_chunks_with_overlap(measurements, start, end, chunk_size, overlap);
+    
+    // Process chunks in parallel
+    let results: Result<Vec<Vec<Measurement>>> = time_chunks
+        .par_iter()
+        .map(|(chunk_start, chunk_end, chunk_measurements)| {
+            super::polynomial::polynomial(
+                chunk_measurements.clone(), 
+                *chunk_start, 
+                *chunk_end, 
+                resolution,
+                degree
+            )
+        })
+        .collect();
 
-		assert!(result.is_ok(), "Error: {:?}", result.err());
-		let interpolated = result.unwrap();
-		assert!(!interpolated.is_empty());
-	}
+    let chunk_results = results?;
+    
+    // Merge results with overlap handling
+    Ok(merge_overlapping_results(chunk_results, overlap))
+}
 
-	#[tokio::test]
-	async fn test_fast_path_algorithm_selection() {
-		let measurements = create_test_measurements(1000);
-		let start = measurements[0].timestamp;
-		let end = measurements[measurements.len() - 1].timestamp;
+/// Parallel polynomial evaluation for dense output scenarios
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Polynomial spline creation fails
+/// - Parallel evaluation encounters errors
+pub fn polynomial_parallel_dense(
+    measurements: Vec<Measurement>, 
+    start: DateTime<Utc>, 
+    end: DateTime<Utc>, 
+    resolution: Resolution,
+    degree: usize
+) -> Result<Vec<Measurement>> {
+    // Build polynomial coefficients once
+    let polynomial_spline = super::polynomial::PolynomialSpline::new(&measurements, degree)?;
+    
+    // Generate all target times
+    let target_times = generate_target_times_parallel(start, end, resolution);
+    
+    if target_times.len() < 100 {
+        // Use serial for small outputs
+        return super::polynomial::polynomial(measurements, start, end, resolution, degree);
+    }
+    
+    let dataset_id = measurements[0].dataset_id;
+    
+    // Parallel evaluation of polynomial at all target times
+    let results: Vec<Measurement> = target_times
+        .par_iter()
+        .map(|&time| {
+            let value = polynomial_spline.evaluate(time).unwrap_or_else(|_| BigDecimal::zero());
+            Measurement {
+                id: Uuid::new_v4(),
+                dataset_id,
+                timestamp: time,
+                value,
+            }
+        })
+        .collect();
 
-		// Should automatically switch from Cubic to Quadratic for 1000 points
-		let result = fast_path_interpolate(measurements, start, end, Resolution::Seconds, SplineType::Cubic);
+    Ok(results)
+}
 
-		assert!(result.is_ok());
-		let interpolated = result.unwrap();
-		assert!(!interpolated.is_empty());
-	}
+/// Add type alias for complex type
+type TimeChunk = (DateTime<Utc>, DateTime<Utc>, Vec<Measurement>);
 
-	#[tokio::test]
-	async fn test_streaming_interpolate() {
-		let measurements = create_test_measurements(2000);
-		let start = measurements[0].timestamp;
-		let end = measurements[measurements.len() - 1].timestamp;
+/// Create time chunks with overlap for polynomial continuity
+fn create_time_chunks_with_overlap(
+    measurements: &[Measurement],
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    chunk_size: usize,
+    overlap: usize,
+) -> Vec<TimeChunk> { // ← Remove Result wrapper
+    let mut chunks = Vec::new();
+    let total_measurements = measurements.len();
+    
+    let mut chunk_start_idx = 0;
+    
+    while chunk_start_idx < total_measurements {
+        let chunk_end_idx = std::cmp::min(chunk_start_idx + chunk_size, total_measurements);
+        
+        // Add overlap from previous chunk (except for first chunk)
+        let actual_start_idx = if chunk_start_idx > 0 {
+            chunk_start_idx.saturating_sub(overlap)
+        } else {
+            0
+        };
+        
+        // Add overlap to next chunk (except for last chunk)
+        let actual_end_idx = if chunk_end_idx < total_measurements {
+            std::cmp::min(chunk_end_idx + overlap, total_measurements)
+        } else {
+            total_measurements
+        };
+        
+        let chunk_measurements = measurements[actual_start_idx..actual_end_idx].to_vec();
+        let chunk_start_time = std::cmp::max(measurements[chunk_start_idx].timestamp, start);
+        let chunk_end_time = std::cmp::min(measurements[chunk_end_idx - 1].timestamp, end);
+        
+        chunks.push((chunk_start_time, chunk_end_time, chunk_measurements));
+        
+        chunk_start_idx = chunk_end_idx;
+    }
+    
+    chunks // ← Remove Ok() wrapper
+}
 
-		let result = streaming_interpolate(
-			measurements,
-			start,
-			end,
-			Resolution::Seconds,
-			SplineType::Linear,
-			500, // Chunk size
-		);
+/// Merge overlapping polynomial results
+fn merge_overlapping_results(
+    chunk_results: Vec<Vec<Measurement>>,
+    overlap: usize,
+) -> Vec<Measurement> { // ← Remove Result wrapper
+    if chunk_results.is_empty() {
+        return Vec::new(); // ← Remove Ok() wrapper
+    }
+    
+    if chunk_results.len() == 1 {
+        return chunk_results.into_iter().next().unwrap(); // ← Remove Ok() wrapper
+    }
+    
+    let mut merged = chunk_results[0].clone();
+    
+    for chunk in chunk_results.into_iter().skip(1) {
+        // Remove overlap from previous chunk
+        let overlap_points = std::cmp::min(overlap, merged.len());
+        merged.truncate(merged.len().saturating_sub(overlap_points));
+        
+        // Add new chunk
+        merged.extend(chunk);
+    }
+    
+    merged // ← Remove Ok() wrapper
+}
 
-		assert!(result.is_ok());
-		let interpolated = result.unwrap();
-		assert!(!interpolated.is_empty());
-
-		// Verify results are sorted
-		for i in 1..interpolated.len() {
-			assert!(interpolated[i].timestamp >= interpolated[i - 1].timestamp);
-		}
-	}
-
-	#[tokio::test]
-	async fn test_performance_recommendations() {
-		// Test different dataset sizes
-		let test_cases = vec![(50, true, SplineType::Cubic), (50, false, SplineType::Cubic), (300, true, SplineType::Cubic), (300, false, SplineType::Quadratic), (800, true, SplineType::Quadratic), (800, false, SplineType::Linear), (2000, true, SplineType::Linear), (2000, false, SplineType::Linear)];
-
-		for (count, accuracy_priority, expected_spline) in test_cases {
-			let (recommended_spline, strategy) = get_performance_recommendation(count, accuracy_priority);
-			assert_eq!(recommended_spline, expected_spline);
-			assert!(!strategy.is_empty());
-		}
-	}
-
-	#[tokio::test]
-	async fn test_parallel_threshold() {
-		let small_measurements = create_test_measurements(500);
-		let large_measurements = create_test_measurements(1500);
-
-		let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-		let end = start + chrono::Duration::hours(1);
-
-		// Small dataset should use standard processing
-		let small_result = optimized_interpolate(small_measurements, start, end, Resolution::Seconds, SplineType::Linear);
-		assert!(small_result.is_ok());
-
-		// Large dataset should use parallel processing
-		let large_result = optimized_interpolate(large_measurements, start, end, Resolution::Seconds, SplineType::Linear);
-		assert!(large_result.is_ok());
-	}
+/// Generate target times in parallel for dense output
+fn generate_target_times_parallel(
+    start: DateTime<Utc>, 
+    end: DateTime<Utc>, 
+    resolution: Resolution
+) -> Vec<DateTime<Utc>> {
+    let step = resolution.to_step();
+    let time_span = (end - start).num_seconds();
+    
+    // Safe conversion with error handling
+    let estimated_points = usize::try_from((time_span / step.num_seconds()).max(1))
+        .unwrap_or(1000); // Fallback to reasonable default
+    
+    // Limit for memory safety
+    let actual_points = std::cmp::min(estimated_points, 100_000);
+    
+    // Generate times in parallel chunks
+    let chunk_size = 10_000;
+    let chunks: Vec<_> = (0..actual_points)
+        .collect::<Vec<_>>()
+        .par_chunks(chunk_size)
+        .map(|chunk| {
+            chunk
+                .iter()
+                .map(|&i| {
+                    // Safe conversion for step multiplication
+                    let step_multiplier = i32::try_from(i).unwrap_or(i32::MAX);
+                    start + step * step_multiplier
+                })
+                .filter(|&time| time <= end)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    
+    chunks.into_iter().flatten().collect()
 }

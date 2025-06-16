@@ -6,6 +6,7 @@
 use anyhow::Result;
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use chrono::{DateTime, Utc};
+use rayon::prelude::*;
 use uuid::Uuid;
 use wide::f64x4;
 
@@ -240,6 +241,118 @@ pub fn auto_interpolate_simd(measurements: &[Measurement], target_times: &[DateT
 		SplineType::Cubic => cubic_simd_batch(measurements, target_times, dataset_id),
 		SplineType::Polynomial(degree) => polynomial_simd_batch(measurements, target_times, degree, dataset_id),
 	}
+}
+
+/// Parallel SIMD linear interpolation for large target sets
+///
+/// # Errors
+///
+/// Returns an error if SIMD batch processing fails
+pub fn linear_simd_batch_parallel(measurements: &[Measurement], target_times: &[DateTime<Utc>], dataset_id: Uuid) -> Result<Vec<Measurement>> {
+    if target_times.len() < 256 {
+        return linear_simd_batch(measurements, target_times, dataset_id);
+    }
+
+    let chunk_size = 128;
+    let results: Result<Vec<Vec<Measurement>>> = target_times
+        .par_chunks(chunk_size)
+        .map(|time_chunk| {
+            linear_simd_batch(measurements, time_chunk, dataset_id)
+        })
+        .collect();
+
+    let chunk_results = results?;
+    Ok(chunk_results.into_iter().flatten().collect())
+}
+
+/// Parallel SIMD quadratic interpolation for large target sets
+///
+/// # Errors
+///
+/// Returns an error if SIMD batch processing fails
+pub fn quadratic_simd_batch_parallel(measurements: &[Measurement], target_times: &[DateTime<Utc>], dataset_id: Uuid) -> Result<Vec<Measurement>> {
+    if target_times.len() < 256 {
+        return quadratic_simd_batch(measurements, target_times, dataset_id);
+    }
+
+    let chunk_size = 128;
+    let results: Result<Vec<Vec<Measurement>>> = target_times
+        .par_chunks(chunk_size)
+        .map(|time_chunk| {
+            quadratic_simd_batch(measurements, time_chunk, dataset_id)
+        })
+        .collect();
+
+    let chunk_results = results?;
+    Ok(chunk_results.into_iter().flatten().collect())
+}
+
+/// Parallel SIMD cubic interpolation for large target sets
+///
+/// # Errors
+///
+/// Returns an error if SIMD batch processing fails
+pub fn cubic_simd_batch_parallel(measurements: &[Measurement], target_times: &[DateTime<Utc>], dataset_id: Uuid) -> Result<Vec<Measurement>> {
+    if target_times.len() < 256 {
+        return cubic_simd_batch(measurements, target_times, dataset_id);
+    }
+
+    let chunk_size = 128;
+    let results: Result<Vec<Vec<Measurement>>> = target_times
+        .par_chunks(chunk_size)
+        .map(|time_chunk| {
+            cubic_simd_batch(measurements, time_chunk, dataset_id)
+        })
+        .collect();
+
+    let chunk_results = results?;
+    Ok(chunk_results.into_iter().flatten().collect())
+}
+
+/// Parallel SIMD polynomial interpolation for large target sets
+///
+/// # Errors
+///
+/// Returns an error if SIMD batch processing fails
+pub fn polynomial_simd_batch_parallel(measurements: &[Measurement], target_times: &[DateTime<Utc>], degree: usize, dataset_id: Uuid) -> Result<Vec<Measurement>> {
+    if target_times.len() < 256 {
+        return polynomial_simd_batch(measurements, target_times, degree, dataset_id);
+    }
+
+    let chunk_size = 128;
+    let results: Result<Vec<Vec<Measurement>>> = target_times
+        .par_chunks(chunk_size)
+        .map(|time_chunk| {
+            polynomial_simd_batch(measurements, time_chunk, degree, dataset_id)
+        })
+        .collect();
+
+    let chunk_results = results?;
+    Ok(chunk_results.into_iter().flatten().collect())
+}
+
+/// Enhanced auto interpolation with SIMD + Rayon parallelism
+///
+/// # Errors
+///
+/// Returns an error if the selected SIMD interpolation method fails
+pub fn auto_interpolate_simd_parallel(
+    measurements: &[Measurement], 
+    target_times: &[DateTime<Utc>], 
+    spline_type: SplineType
+) -> Result<Vec<Measurement>> {
+    if target_times.len() < 256 {
+        return auto_interpolate_simd(measurements, target_times, spline_type);
+    }
+
+    let dataset_id = measurements[0].dataset_id;
+
+    match spline_type {
+        SplineType::Linear => linear_simd_batch_parallel(measurements, target_times, dataset_id),
+        SplineType::Quadratic => quadratic_simd_batch_parallel(measurements, target_times, dataset_id),
+        SplineType::Cubic => cubic_simd_batch_parallel(measurements, target_times, dataset_id),
+        SplineType::Polynomial(degree) => polynomial_simd_batch_parallel(measurements, target_times, degree, dataset_id),
+    }
 }
 
 // Core SIMD interpolation functions
@@ -539,5 +652,19 @@ mod tests {
 
 		let result = linear_simd_batch(&measurements, &large_target_times, dataset_id);
 		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_linear_simd_batch_parallel() {
+		let measurements = create_test_measurements(200);
+		let dataset_id = measurements[0].dataset_id;
+		let target_times: Vec<_> = (0..300).map(|i| measurements[0].timestamp + chrono::Duration::milliseconds(i * 250)).collect();
+
+		let result = linear_simd_batch_parallel(&measurements, &target_times, dataset_id);
+		assert!(result.is_ok());
+
+		let interpolated = result.unwrap();
+		assert_eq!(interpolated.len(), target_times.len());
+		assert!(interpolated.iter().all(|m| m.dataset_id == dataset_id));
 	}
 }

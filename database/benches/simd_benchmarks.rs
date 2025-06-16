@@ -127,7 +127,13 @@ fn benchmark_auto_interpolate_simd(c: &mut Criterion) {
 	let spline_types = vec![("Linear", SplineType::Linear), ("Quadratic", SplineType::Quadratic), ("Cubic", SplineType::Cubic), ("Polynomial_3", SplineType::Polynomial(3)), ("Polynomial_5", SplineType::Polynomial(5))];
 
 	for (name, spline_type) in spline_types {
-		group.bench_with_input(BenchmarkId::new("spline_type", name), &spline_type, |b, spline_type| b.iter(|| auto_interpolate_simd(black_box(measurements.clone()), black_box(target_times.clone()), black_box(*spline_type))));
+		group.bench_with_input(BenchmarkId::new("spline_type", name), &spline_type, |b, spline_type| {
+            b.iter(|| auto_interpolate_simd(
+                black_box(&measurements), 
+                black_box(&target_times), 
+                black_box(*spline_type)
+            ))
+        });
 	}
 
 	group.finish();

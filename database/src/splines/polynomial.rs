@@ -271,7 +271,7 @@ fn is_uniformly_spaced(measurements: &[Measurement]) -> bool {
 	})
 }
 
-struct PolynomialSpline {
+pub struct PolynomialSpline {
 	measurements: Vec<Measurement>,
 	coefficients: Vec<PolynomialSegment>,
 }
@@ -281,7 +281,15 @@ struct PolynomialSegment {
 }
 
 impl PolynomialSpline {
-	fn new(measurements: &[Measurement], degree: usize) -> Result<Self> {
+	/// Creates a new polynomial spline from measurements
+	///
+	/// # Errors
+	///
+	/// Returns an error if:
+	/// - Insufficient measurements for polynomial degree
+	/// - Polynomial coefficient calculation fails
+	/// - Numerical operations encounter errors
+	pub fn new(measurements: &[Measurement], degree: usize) -> Result<Self> {
 		let n = measurements.len();
 		if n < 2 {
 			return Err(Error::InsufficientMeasurementsError.into());
@@ -454,7 +462,15 @@ impl PolynomialSpline {
 		result
 	}
 
-	fn evaluate(&self, target_time: DateTime<Utc>) -> Result<BigDecimal> {
+	/// Evaluates the polynomial spline at a target time
+	///
+	/// # Errors
+	///
+	/// Returns an error if:
+	/// - Target time is outside interpolation bounds
+	/// - Polynomial evaluation encounters numerical errors
+	/// - Timestamp conversion to `BigDecimal` fails
+	pub fn evaluate(&self, target_time: DateTime<Utc>) -> Result<BigDecimal> {
 		let n = self.measurements.len();
 
 		// Handle extrapolation backward
