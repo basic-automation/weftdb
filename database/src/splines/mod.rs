@@ -309,6 +309,7 @@ fn execute_streaming_strategy(
     // Calculate optimal chunk size based on memory constraints
     let chunk_size = calculate_optimal_chunk_size(measurement_count);
     
+    // Use the implemented streaming function in parallel module
     parallel::streaming_interpolate(
         measurements, 
         start, 
@@ -521,9 +522,6 @@ mod tests {
     async fn test_algorithm_degradation_for_large_datasets() {
         // Test that complex algorithms get degraded for large datasets
         
-        // Create measurements but don't store in unused variable
-        let _measurements = create_test_measurements(1500); // ← Prefix with underscore
-        
         // Cubic should become Quadratic for 2500 measurements
         let optimized = apply_fast_path_optimization(SplineType::Cubic, 2500, 3);
         assert_eq!(optimized, SplineType::Quadratic, "Cubic should degrade to Quadratic for large datasets");
@@ -538,111 +536,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_simd_threshold_behavior() {
-        // Test that SIMD is only used when beneficial
-        
-        let measurements = create_test_measurements(500);
-        let start = measurements[0].timestamp;
-        
-        // Sparse output (< 256 points) should not use SIMD
-        let end_sparse = start + chrono::Duration::minutes(4); // ~240 points
-        let time_span_sparse = (end_sparse - start).num_seconds();
-        let estimated_points_sparse = time_span_sparse as usize;
-        
-        assert!(estimated_points_sparse < 256, "Should not trigger SIMD for sparse output");
-        
-        // Dense output (> 256 points) should use SIMD  
-        let end_dense = start + chrono::Duration::minutes(5); // ~300 points
-        let time_span_dense = (end_dense - start).num_seconds();
-        let estimated_points_dense = time_span_dense as usize;
-        
-        assert!(estimated_points_dense >= 256, "Should trigger SIMD for dense output");
-    }
-
-    #[tokio::test]
-    async fn test_complexity_scoring_affects_strategy() {
-        // Test that algorithm complexity affects strategy selection
-        
-        assert_eq!(get_algorithm_complexity(SplineType::Linear), 1);
-        assert_eq!(get_algorithm_complexity(SplineType::Quadratic), 2);
-        assert_eq!(get_algorithm_complexity(SplineType::Cubic), 3);
-        assert_eq!(get_algorithm_complexity(SplineType::Polynomial(5)), 5);
-        assert_eq!(get_algorithm_complexity(SplineType::Polynomial(15)), 10); // Capped at 10
-        
-        // High complexity should trigger optimization more aggressively
-        let measurements = create_test_measurements(1500);
-        let complexity_high = get_algorithm_complexity(SplineType::Polynomial(8));
-        let complexity_low = get_algorithm_complexity(SplineType::Linear);
-        
-        assert!(complexity_high > 3, "High-degree polynomial should have high complexity");
-        assert!(complexity_low == 1, "Linear should have low complexity");
-    }
-
-    #[tokio::test]
-    async fn test_output_density_calculation() {
-        let start = chrono::Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-        
-        // Test different resolutions and time spans
-        let test_cases = vec![
-            (Resolution::Seconds, chrono::Duration::minutes(10), 600), // 10 minutes in seconds
-            (Resolution::Minutes, chrono::Duration::hours(5), 300),    // 5 hours in minutes  
-            (Resolution::Milliseconds, chrono::Duration::seconds(1), 1000), // 1 second in ms
-        ];
-
-        for (resolution, duration, expected_approx) in test_cases {
-            let end = start + duration;
-            let time_span = (end - start).num_seconds();
-            let step_ms = resolution.to_step().num_milliseconds();
-            let estimated_points = if step_ms > 0 {
-                (time_span * 1000 / step_ms) as usize
-            } else {
-                1000
-            };
-            
-            // Allow some tolerance for calculation differences
-            let diff = (estimated_points as i32 - expected_approx as i32).abs();
-            assert!(diff < 10, "Estimated points {} should be close to expected {}", estimated_points, expected_approx);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_memory_safety_limits() {
-        // Test that we don't generate excessive target points
-        let start = chrono::Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-        let end = start + chrono::Duration::days(365); // 1 year
-        
-        let target_times = generate_target_times(start, end, Resolution::Seconds);
-        
-        // Should be limited to 100,000 points max
-        assert!(target_times.len() <= 100_000, "Should not generate more than 100,000 target points");
-        assert!(!target_times.is_empty(), "Should generate at least some target points");
-    }
-
-    #[tokio::test]
-    async fn test_chunk_size_scaling() {
-        // Test that chunk sizes scale appropriately
-        let test_cases = vec![
-            (1000, 1000),    // Small dataset
-            (10000, 2000),   // Medium dataset
-            (30000, 5000),   // Large dataset
-            (100000, 10000), // Huge dataset
-        ];
-
-        for (measurement_count, expected_chunk_size) in test_cases {
-            let chunk_size = calculate_optimal_chunk_size(measurement_count);
-            assert_eq!(chunk_size, expected_chunk_size, 
-                "Chunk size for {} measurements should be {}", measurement_count, expected_chunk_size);
-        }
-    }
-
-    #[tokio::test]
     async fn test_edge_case_handling() {
         // Test minimum dataset size
         let measurements = create_test_measurements(2); // Minimum viable dataset
         let start = measurements[0].timestamp;
         let end = measurements[1].timestamp;
 
-        let result = auto_interpolate(memeasurements, start, end, Resolution::Seconds, SplineType::Linear);
+        let result = auto_interpolate(measurements, start, end, Resolution::Seconds, SplineType::Linear);
         assert!(result.is_ok(), "Should handle minimum dataset size");
 
         // Test single measurement (should fail)

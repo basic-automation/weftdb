@@ -64,7 +64,7 @@ pub mod types;
 // Re-export cache functionality
 pub use cache::DatabaseCache;
 // Re-export spline functions and types
-pub use splines::{auto_interpolate, cubic, fast_path_interpolate, get_performance_recommendation, linear, optimized_interpolate, polynomial, quadratic, streaming_interpolate, Resolution, SplineType};
+pub use splines::{auto_interpolate, cubic, fast_path_interpolate, linear, optimized_interpolate, polynomial, quadratic, Resolution, SplineType};
 pub use types::{Dataset, Error, InputMeasurement, Measurement};
 
 // Note: SIMD functions are not exported by default since they're experimental

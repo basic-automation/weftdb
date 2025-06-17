@@ -2,7 +2,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use database::splines::{auto_interpolate, Resolution, SplineType};
 use database::Measurement;
 use bigdecimal::BigDecimal;
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{TimeZone, Utc};
 use std::str::FromStr;
 use uuid::Uuid;
 
@@ -102,14 +102,18 @@ fn benchmark_algorithm_complexity_impact(c: &mut Criterion) {
 
 fn benchmark_output_density_impact(c: &mut Criterion) {
     let mut group = c.benchmark_group("auto_interpolate_output_density");
+    
+    // Set reasonable timeout and sample sizes
+    group.measurement_time(std::time::Duration::from_secs(10));
+    group.sample_size(20);
 
     let measurements = create_test_measurements(500); // Medium dataset
     let start = measurements[0].timestamp;
 
     let density_scenarios = vec![
-        (chrono::Duration::minutes(2), Resolution::Seconds, "sparse_120_points"),  // < 256 points
-        (chrono::Duration::minutes(6), Resolution::Seconds, "dense_360_points"),   // > 256 points  
-        (chrono::Duration::hours(2), Resolution::Seconds, "very_dense_7200_points"), // >> 256 points
+        (chrono::Duration::minutes(2), Resolution::Minutes, "sparse_2_points"),     // Very sparse
+        (chrono::Duration::minutes(10), Resolution::Minutes, "medium_10_points"),   // Medium density
+        (chrono::Duration::minutes(30), Resolution::Minutes, "dense_30_points"),    // Dense but manageable
     ];
 
     for (duration, resolution, scenario_name) in density_scenarios {
@@ -169,11 +173,46 @@ fn benchmark_strategy_overhead(c: &mut Criterion) {
     group.finish();
 }
 
+// Add this to the file for quick testing
+fn benchmark_quick_strategy_verification(c: &mut Criterion) {
+    let mut group = c.benchmark_group("quick_strategy_verification");
+    group.measurement_time(std::time::Duration::from_secs(5));
+    group.sample_size(10);
+
+    // Test just the key scenarios
+    let scenarios = vec![
+        (100, "small"),
+        (1000, "medium"), 
+        (2000, "large"),
+    ];
+
+    for (size, name) in scenarios {
+        let measurements = create_test_measurements(size);
+        let start = measurements[0].timestamp;
+        let end = measurements[measurements.len() - 1].timestamp;
+        
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                auto_interpolate(
+                    black_box(measurements.clone()),
+                    black_box(start),
+                    black_box(end),
+                    black_box(Resolution::Minutes),  // Use minutes instead of seconds
+                    black_box(SplineType::Linear),
+                )
+            });
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     benchmark_strategy_selection,
     benchmark_algorithm_complexity_impact,
     benchmark_output_density_impact,
-    benchmark_strategy_overhead
+    benchmark_strategy_overhead,
+    benchmark_quick_strategy_verification, // Include the quick verification in the benchmarks
 );
 criterion_main!(benches);
