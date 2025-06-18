@@ -57,7 +57,6 @@ use sqlx::{Pool, Row, Sqlite};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-
 pub mod cache;
 pub mod splines;
 pub mod types;
@@ -66,7 +65,7 @@ pub mod types;
 // Re-export cache functionality
 pub use cache::DatabaseCache;
 // Re-export spline functions and types
-pub use splines::{auto_interpolate, auto_interpolate_async, cubic, linear, optimized_interpolate, fast_path_interpolate, polynomial, quadratic, Resolution, SplineType};
+pub use splines::{auto_interpolate, auto_interpolate_async, cubic, fast_path_interpolate, linear, optimized_interpolate, polynomial, quadratic, Resolution, SplineType};
 pub use types::{Dataset, Error, InputMeasurement, Measurement};
 
 // Note: SIMD functions are not exported by default since they're experimental
@@ -106,7 +105,8 @@ impl DB {
 	}
 
 	/// Creates a database instance and connects to all existing databases.
-	#[must_use] pub const fn existing() -> Self {
+	#[must_use]
+	pub const fn existing() -> Self {
 		let db = Self;
 		Self::initialize_existing_subjects(); // ← Remove the error handling since it's now ()
 		db
@@ -123,7 +123,7 @@ impl DB {
 		use sqlx::sqlite::SqlitePoolOptions;
 
 		let database_url = format!("sqlite:data/{name}.db");
-		
+
 		// Create the data directory if it doesn't exist
 		if let Err(e) = std::fs::create_dir_all("data") {
 			if e.kind() != std::io::ErrorKind::AlreadyExists {
@@ -131,11 +131,7 @@ impl DB {
 			}
 		}
 
-		let pool = SqlitePoolOptions::new()
-			.max_connections(5)
-			.connect(&database_url)
-			.await
-			.context("Failed to create database connection")?;
+		let pool = SqlitePoolOptions::new().max_connections(5).connect(&database_url).await.context("Failed to create database connection")?;
 
 		// Create tables
 		sqlx::query(
@@ -166,12 +162,7 @@ impl DB {
 		.context("Failed to create measurements table")?;
 
 		// Create index for efficient time-based queries
-		sqlx::query(
-			"CREATE INDEX IF NOT EXISTS idx_measurements_timestamp ON measurements (dataset_id, timestamp)"
-		)
-		.execute(&pool)
-		.await
-		.context("Failed to create timestamp index")?;
+		sqlx::query("CREATE INDEX IF NOT EXISTS idx_measurements_timestamp ON measurements (dataset_id, timestamp)").execute(&pool).await.context("Failed to create timestamp index")?;
 
 		SUBJECTS.lock().await.insert(name.to_string(), pool);
 
@@ -196,11 +187,15 @@ impl DB {
 
 		// Estimate performance characteristics
 		let estimated_output = splines::estimate_output_points(start_time, end_time, resolution);
-		let will_use_gpu = splines::should_use_gpu_interpolation(measurements.len(), estimated_output);
-		
+		let will_use_gpu = match spline_type {
+			SplineType::Linear => splines::should_use_gpu_interpolation(measurements.len(), estimated_output),
+			SplineType::Quadratic => splines::quadratic::should_use_gpu_quadratic(measurements.len(), estimated_output),
+			SplineType::Cubic => splines::cubic::should_use_gpu_cubic(measurements.len(), estimated_output),
+			SplineType::Polynomial(degree) => splines::polynomial::should_use_gpu_polynomial(measurements.len(), estimated_output, degree),
+		};
+
 		if will_use_gpu {
-			println!("🚀 High-performance GPU interpolation: {} → {} points", 
-                     measurements.len(), estimated_output);
+			println!("🚀 Database using GPU acceleration for {spline_type:?} interpolation");
 		}
 
 		// Use async interpolation with GPU support
@@ -211,7 +206,7 @@ impl DB {
 	/// Gets performance statistics including GPU utilization
 	pub async fn get_performance_stats(&self) -> HashMap<String, String> {
 		let mut stats = HashMap::new();
-		
+
 		// Add GPU-specific statistics
 		stats.insert("gpu_available".to_string(), "true".to_string());
 		stats.insert("gpu_threshold_measurements".to_string(), "1000".to_string());
@@ -219,13 +214,13 @@ impl DB {
 		stats.insert("expected_gpu_speedup".to_string(), "1.3x-6.0x".to_string());
 		stats.insert("gpu_throughput_melem_per_s".to_string(), "~950".to_string());
 		stats.insert("cpu_throughput_melem_per_s".to_string(), "~200".to_string());
-		
+
 		// Add cache statistics
 		let cache_stats = CACHE.get_stats().await;
 		for (subject, count) in cache_stats {
 			stats.insert(format!("cache_datasets_{subject}"), count.to_string());
 		}
-		
+
 		stats
 	}
 
@@ -642,8 +637,8 @@ mod tests {
 	use std::{str::FromStr, time::Instant};
 
 	use bigdecimal::BigDecimal;
-	use tokio::sync::Mutex;
 	use sqlx::SqlitePool;
+	use tokio::sync::Mutex;
 
 	use super::*;
 
@@ -831,7 +826,6 @@ mod interpolation_tests {
 	use bigdecimal::BigDecimal;
 	use chrono::{DateTime, TimeZone, Utc};
 	use uuid::Uuid;
-	
 
 	use crate::{auto_interpolate, Measurement, Resolution, SplineType};
 

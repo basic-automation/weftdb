@@ -3,11 +3,11 @@
 //! This module provides high-performance GPU interpolation for dense output scenarios
 //! where thousands of interpolated points are needed from large datasets.
 
+use std::{borrow::Cow, sync::Arc};
+
 use anyhow::{Context, Result};
 use bigdecimal::ToPrimitive;
 use chrono::{DateTime, Utc};
-use std::borrow::Cow;
-use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 use wgpu::util::DeviceExt;
@@ -17,11 +17,11 @@ use crate::{Error, Measurement};
 /// GPU buffer set for reusable GPU operations
 #[derive(Debug)]
 pub struct GpuBufferSet {
-    pub input_times: wgpu::Buffer,
-    pub input_values: wgpu::Buffer,
-    pub target_times: wgpu::Buffer,
-    pub output: wgpu::Buffer,
-    pub max_capacity: usize,
+	pub input_times: wgpu::Buffer,
+	pub input_values: wgpu::Buffer,
+	pub target_times: wgpu::Buffer,
+	pub output: wgpu::Buffer,
+	pub max_capacity: usize,
 }
 
 /// Simple shared GPU instance storage
@@ -29,19 +29,18 @@ static GPU_INSTANCE: tokio::sync::OnceCell<Arc<Mutex<GpuLinearInterpolator>>> = 
 
 /// Get or create shared GPU instance
 async fn get_shared_gpu_instance() -> Result<Arc<GpuLinearInterpolator>> {
-    let instance_mutex = GPU_INSTANCE
-        .get_or_init(|| async {
-            let gpu = GpuLinearInterpolator::new().await
-                .expect("Failed to initialize GPU instance");
-            Arc::new(Mutex::new(gpu))
-        })
-        .await;
-    
-    let gpu_guard = instance_mutex.lock().await;
-    let gpu_clone = gpu_guard.clone();
-    drop(gpu_guard); // Explicitly drop the guard
-    
-    Ok(Arc::new(gpu_clone))
+	let instance_mutex = GPU_INSTANCE
+		.get_or_init(|| async {
+			let gpu = GpuLinearInterpolator::new().await.expect("Failed to initialize GPU instance");
+			Arc::new(Mutex::new(gpu))
+		})
+		.await;
+
+	let gpu_guard = instance_mutex.lock().await;
+	let gpu_clone = gpu_guard.clone();
+	drop(gpu_guard); // Explicitly drop the guard
+
+	Ok(Arc::new(gpu_clone))
 }
 
 /// GPU compute shader for linear interpolation using f32 for better compatibility
@@ -163,436 +162,265 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 /// GPU accelerated linear interpolation context
 #[derive(Debug, Clone)]
 pub struct GpuLinearInterpolator {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    compute_pipeline: wgpu::ComputePipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
+	device: wgpu::Device,
+	queue: wgpu::Queue,
+	compute_pipeline: wgpu::ComputePipeline,
+	bind_group_layout: wgpu::BindGroupLayout,
 }
 
 impl GpuLinearInterpolator {
-    /// Initialize GPU linear interpolator
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - GPU adapter not found
-    /// - Device creation fails
-    /// - Shader compilation fails
-    pub async fn new() -> Result<Self> {
-        Self::new_with_logging(false).await
-    }
+	/// Initialize GPU linear interpolator
+	///
+	/// # Errors
+	///
+	/// Returns an error if:
+	/// - GPU adapter not found
+	/// - Device creation fails
+	/// - Shader compilation fails
+	pub async fn new() -> Result<Self> {
+		Self::new_with_logging(false).await
+	}
 
-    /// Initialize GPU linear interpolator with explicit logging control
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - GPU adapter not found
-    /// - Device creation fails
-    /// - Shader compilation fails
-    /// - Pipeline creation fails
-    #[allow(clippy::too_many_lines)]
-    pub async fn new_with_logging(verbose: bool) -> Result<Self> {
-        if verbose {
-            println!("🔍 Initializing GPU interpolator...");
-        }
-        
-        // Create WGPU instance
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            ..Default::default()
-        });
-        
-        if verbose {
-            println!("✅ WGPU instance created");
-        }
+	/// Initialize GPU linear interpolator with explicit logging control
+	///
+	/// # Errors
+	///
+	/// Returns an error if:
+	/// - GPU adapter not found
+	/// - Device creation fails
+	/// - Shader compilation fails
+	/// - Pipeline creation fails
+	#[allow(clippy::too_many_lines)]
+	pub async fn new_with_logging(verbose: bool) -> Result<Self> {
+		if verbose {
+			println!("🔍 Initializing GPU interpolator...");
+		}
 
-        // Get adapter
-        if verbose {
-            println!("🔍 Requesting GPU adapter...");
-        }
-        
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            })
-            .await
-            .context("Failed to find suitable GPU adapter")?;
+		// Create WGPU instance
+		let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor { backends: wgpu::Backends::all(), ..Default::default() });
 
-        // Log detailed adapter info only if verbose
-        if verbose {
-            let adapter_info = adapter.get_info();
-            println!("🎯 GPU Adapter Details:");
-            println!("   Name: {}", adapter_info.name);
-            println!("   Backend: {:?}", adapter_info.backend);
-            println!("   Device Type: {:?}", adapter_info.device_type);
-            println!("   Driver: {}", adapter_info.driver);
-            println!("   Driver Info: {}", adapter_info.driver_info);
-        }
+		if verbose {
+			println!("✅ WGPU instance created");
+		}
 
-        // Create device and queue
-        if verbose {
-            println!("🔍 Creating GPU device and queue...");
-        }
-        
-        let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("GPU Linear Interpolator Device"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
-                    memory_hints: wgpu::MemoryHints::Performance,
-                    trace: wgpu::Trace::Off
-                },
-            )
-            .await
-            .context("Failed to create GPU device")?;
-        
-        if verbose {
-            println!("✅ GPU device and queue created successfully");
-        }
+		// Get adapter
+		if verbose {
+			println!("🔍 Requesting GPU adapter...");
+		}
 
-        // Create bind group layout
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Linear Interpolation Bind Group Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
+		let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, compatible_surface: None, force_fallback_adapter: false }).await.context("Failed to find suitable GPU adapter")?;
 
-        // Create compute pipeline
-        if verbose {
-            println!("🔍 Creating compute pipeline and shader...");
-        }
-        
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Linear Interpolation Shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(LINEAR_INTERPOLATION_SHADER)),
-        });
+		// Log detailed adapter info only if verbose
+		if verbose {
+			let adapter_info = adapter.get_info();
+			println!("🎯 GPU Adapter Details:");
+			println!("   Name: {}", adapter_info.name);
+			println!("   Backend: {:?}", adapter_info.backend);
+			println!("   Device Type: {:?}", adapter_info.device_type);
+			println!("   Driver: {}", adapter_info.driver);
+			println!("   Driver Info: {}", adapter_info.driver_info);
+		}
 
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Linear Interpolation Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
-        });
+		// Create device and queue
+		if verbose {
+			println!("🔍 Creating GPU device and queue...");
+		}
 
-        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Linear Interpolation Pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("main"), // ← Wrap in Some()
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None, // ← Add missing cache field
-        });
+		let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor { label: Some("GPU Linear Interpolator Device"), required_features: wgpu::Features::empty(), required_limits: wgpu::Limits::default(), memory_hints: wgpu::MemoryHints::Performance, trace: wgpu::Trace::Off }).await.context("Failed to create GPU device")?;
 
-        if verbose {
-            println!("✅ GPU interpolator fully initialized and ready!");
-        }
+		if verbose {
+			println!("✅ GPU device and queue created successfully");
+		}
 
-        Ok(Self {
-            device,
-            queue,
-            compute_pipeline,
-            bind_group_layout,
-        })
-    }
+		// Create bind group layout
+		let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("Linear Interpolation Bind Group Layout"), entries: &[wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None }, wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None }, wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None }, wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None }] });
 
-    /// Should use GPU based on data characteristics
-    #[must_use] 
-    pub const fn should_use_gpu(measurement_count: usize, target_count: usize) -> bool {
-        // UPDATED: Much more aggressive GPU usage based on benchmark results
-        // GPU shows 1.3-4.2x performance improvement at these levels
-        measurement_count >= 1_000 && target_count >= 25_000
-    }
+		// Create compute pipeline
+		if verbose {
+			println!("🔍 Creating compute pipeline and shader...");
+		}
 
-    /// Perform GPU-accelerated linear interpolation using f32 for compatibility
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - Buffer creation fails
-    /// - GPU computation fails
-    /// - Result mapping fails
-    ///
-    /// # Panics
-    ///
-    /// Panics if the channel communication fails during async buffer mapping
-    pub fn interpolate(
-        &self,
-        input_times: &[f32],
-        input_values: &[f32],
-        target_times: &[f32],
-    ) -> Result<Vec<f32>> {
-        let input_times_bytes = bytemuck::cast_slice(input_times);
-        let input_values_bytes = bytemuck::cast_slice(input_values);
-        let target_times_bytes = bytemuck::cast_slice(target_times);
+		let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("Linear Interpolation Shader"), source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(LINEAR_INTERPOLATION_SHADER)) });
 
-        // Create buffers
-        let input_times_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Input Times Buffer"),
-            contents: input_times_bytes,
-            usage: wgpu::BufferUsages::STORAGE,
-        });
+		let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("Linear Interpolation Pipeline Layout"), bind_group_layouts: &[&bind_group_layout], push_constant_ranges: &[] });
 
-        let input_values_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Input Values Buffer"),
-            contents: input_values_bytes,
-            usage: wgpu::BufferUsages::STORAGE,
-        });
+		let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+			label: Some("Linear Interpolation Pipeline"),
+			layout: Some(&pipeline_layout),
+			module: &shader,
+			entry_point: Some("main"), // ← Wrap in Some()
+			compilation_options: wgpu::PipelineCompilationOptions::default(),
+			cache: None, // ← Add missing cache field
+		});
 
-        let target_times_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Target Times Buffer"),
-            contents: target_times_bytes,
-            usage: wgpu::BufferUsages::STORAGE,
-        });
+		if verbose {
+			println!("✅ GPU interpolator fully initialized and ready!");
+		}
 
-        let output_buffer_size = std::mem::size_of_val(target_times) as wgpu::BufferAddress;
-        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Output Buffer"),
-            size: output_buffer_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+		Ok(Self { device, queue, compute_pipeline, bind_group_layout })
+	}
 
-        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Staging Buffer"),
-            size: output_buffer_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+	/// Should use GPU based on data characteristics
+	#[must_use]
+	pub const fn should_use_gpu(measurement_count: usize, target_count: usize) -> bool {
+		// UPDATED: Much more aggressive GPU usage based on benchmark results
+		// GPU shows 1.3-4.2x performance improvement at these levels
+		measurement_count >= 1_000 && target_count >= 25_000
+	}
 
-        // Create bind group
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Linear Interpolation Bind Group"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: input_times_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: input_values_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: target_times_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: output_buffer.as_entire_binding(),
-                },
-            ],
-        });
+	/// Perform GPU-accelerated linear interpolation using f32 for compatibility
+	///
+	/// # Errors
+	///
+	/// Returns an error if:
+	/// - Buffer creation fails
+	/// - GPU computation fails
+	/// - Result mapping fails
+	///
+	/// # Panics
+	///
+	/// Panics if the channel communication fails during async buffer mapping
+	pub fn interpolate(&self, input_times: &[f32], input_values: &[f32], target_times: &[f32]) -> Result<Vec<f32>> {
+		let input_times_bytes = bytemuck::cast_slice(input_times);
+		let input_values_bytes = bytemuck::cast_slice(input_values);
+		let target_times_bytes = bytemuck::cast_slice(target_times);
 
-        // Create command encoder and dispatch
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Linear Interpolation Encoder"),
-        });
+		// Create buffers
+		let input_times_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("Input Times Buffer"), contents: input_times_bytes, usage: wgpu::BufferUsages::STORAGE });
 
-        {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Linear Interpolation Pass"),
-                timestamp_writes: None,
-            });
-            compute_pass.set_pipeline(&self.compute_pipeline);
-            compute_pass.set_bind_group(0, &bind_group, &[]);
-            
-            let workgroup_size = 256;
-            let num_workgroups = target_times.len().div_ceil(workgroup_size);
-            #[allow(clippy::cast_possible_truncation)]
-            compute_pass.dispatch_workgroups(num_workgroups as u32, 1, 1);
-        }
+		let input_values_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("Input Values Buffer"), contents: input_values_bytes, usage: wgpu::BufferUsages::STORAGE });
 
-        encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, output_buffer_size);
+		let target_times_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("Target Times Buffer"), contents: target_times_bytes, usage: wgpu::BufferUsages::STORAGE });
 
-        // Submit command buffer
-        self.queue.submit(std::iter::once(encoder.finish()));
+		let output_buffer_size = std::mem::size_of_val(target_times) as wgpu::BufferAddress;
+		let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("Output Buffer"), size: output_buffer_size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
 
-        // Wait for completion and read results
-        let (sender, receiver) = flume::unbounded();
-        let buffer_slice = staging_buffer.slice(..);
-        
-        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.send(result);
-        });
+		let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("Staging Buffer"), size: output_buffer_size, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
 
-        let _ = self.device.poll(wgpu::MaintainBase::Wait);
-        receiver.recv().unwrap().context("Failed to map buffer")?;
+		// Create bind group
+		let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("Linear Interpolation Bind Group"), layout: &self.bind_group_layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: input_times_buffer.as_entire_binding() }, wgpu::BindGroupEntry { binding: 1, resource: input_values_buffer.as_entire_binding() }, wgpu::BindGroupEntry { binding: 2, resource: target_times_buffer.as_entire_binding() }, wgpu::BindGroupEntry { binding: 3, resource: output_buffer.as_entire_binding() }] });
 
-        let data = buffer_slice.get_mapped_range();
-        let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
-        
-        drop(data);
-        staging_buffer.unmap();
+		// Create command encoder and dispatch
+		let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Linear Interpolation Encoder") });
 
-        Ok(result)
-    }
+		{
+			let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Linear Interpolation Pass"), timestamp_writes: None });
+			compute_pass.set_pipeline(&self.compute_pipeline);
+			compute_pass.set_bind_group(0, &bind_group, &[]);
 
-    /// Optimized interpolation with buffer reuse and batch processing
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - Buffer reuse fails
-    /// - GPU interpolation fails
-    /// - Input validation fails
-    pub fn interpolate_optimized(
-        &self,
-        input_times: &[f32],
-        input_values: &[f32],
-        target_times: &[f32],
-        buffers: Option<&GpuBufferSet>,
-    ) -> Result<Vec<f32>> {
-        // TODO: Implement actual buffer reuse here
-        // This should reuse pre-allocated buffers to reduce overhead
-        if let Some(reusable_buffers) = buffers {
-            // Use existing buffers if they're large enough
-            if reusable_buffers.max_capacity >= target_times.len() {
-                return self.interpolate_with_reused_buffers(
-                    input_times, input_values, target_times, reusable_buffers
-                );
-            }
-        }
-        
-        // Fallback to regular interpolation
-        self.interpolate(input_times, input_values, target_times)
-    }
+			let workgroup_size = 256;
+			let num_workgroups = target_times.len().div_ceil(workgroup_size);
+			#[allow(clippy::cast_possible_truncation)]
+			compute_pass.dispatch_workgroups(num_workgroups as u32, 1, 1);
+		}
 
-    /// Interpolate using pre-allocated buffers for reduced overhead
-    #[allow(dead_code)]
-    fn interpolate_with_reused_buffers(
-        &self,
-        input_times: &[f32],
-        input_values: &[f32],
-        target_times: &[f32],
-        _buffers: &GpuBufferSet,
-    ) -> Result<Vec<f32>> {
-        // TODO: Implement buffer reuse logic here
-        // For now, fallback to regular interpolation
-        self.interpolate(input_times, input_values, target_times)
-    }
+		encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, output_buffer_size);
 
-    /// Pre-allocate GPU buffers to reduce memory allocation overhead
-    #[allow(dead_code)]
-    fn create_optimized_buffers(&self, max_size: usize) -> GpuBufferSet {
-        let input_times_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Input Times Buffer (Optimized)"),
-            size: (max_size * std::mem::size_of::<f32>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+		// Submit command buffer
+		self.queue.submit(std::iter::once(encoder.finish()));
 
-        let input_values_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Input Values Buffer (Optimized)"),
-            size: (max_size * std::mem::size_of::<f32>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+		// Wait for completion and read results
+		let (sender, receiver) = flume::unbounded();
+		let buffer_slice = staging_buffer.slice(..);
 
-        let target_times_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Target Times Buffer (Optimized)"),
-            size: (max_size * 4 * std::mem::size_of::<f32>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+		buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+			let _ = sender.send(result);
+		});
 
-        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Output Buffer (Optimized)"),
-            size: (max_size * 4 * std::mem::size_of::<f32>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+		let _ = self.device.poll(wgpu::MaintainBase::Wait);
+		receiver.recv().unwrap().context("Failed to map buffer")?;
 
-        GpuBufferSet {
-            input_times: input_times_buffer,
-            input_values: input_values_buffer,
-            target_times: target_times_buffer,
-            output: output_buffer,
-            max_capacity: max_size,
-        }
-    }
+		let data = buffer_slice.get_mapped_range();
+		let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+
+		drop(data);
+		staging_buffer.unmap();
+
+		Ok(result)
+	}
+
+	/// Optimized interpolation with buffer reuse and batch processing
+	///
+	/// # Errors
+	///
+	/// Returns an error if:
+	/// - Buffer reuse fails
+	/// - GPU interpolation fails
+	/// - Input validation fails
+	pub fn interpolate_optimized(&self, input_times: &[f32], input_values: &[f32], target_times: &[f32], buffers: Option<&GpuBufferSet>) -> Result<Vec<f32>> {
+		// TODO: Implement actual buffer reuse here
+		// This should reuse pre-allocated buffers to reduce overhead
+		if let Some(reusable_buffers) = buffers {
+			// Use existing buffers if they're large enough
+			if reusable_buffers.max_capacity >= target_times.len() {
+				return self.interpolate_with_reused_buffers(input_times, input_values, target_times, reusable_buffers);
+			}
+		}
+
+		// Fallback to regular interpolation
+		self.interpolate(input_times, input_values, target_times)
+	}
+
+	/// Interpolate using pre-allocated buffers for reduced overhead
+	#[allow(dead_code)]
+	fn interpolate_with_reused_buffers(&self, input_times: &[f32], input_values: &[f32], target_times: &[f32], _buffers: &GpuBufferSet) -> Result<Vec<f32>> {
+		// TODO: Implement buffer reuse logic here
+		// For now, fallback to regular interpolation
+		self.interpolate(input_times, input_values, target_times)
+	}
+
+	/// Pre-allocate GPU buffers to reduce memory allocation overhead
+	#[allow(dead_code)]
+	fn create_optimized_buffers(&self, max_size: usize) -> GpuBufferSet {
+		let input_times_buffer = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("Input Times Buffer (Optimized)"), size: (max_size * std::mem::size_of::<f32>()) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+
+		let input_values_buffer = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("Input Values Buffer (Optimized)"), size: (max_size * std::mem::size_of::<f32>()) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+
+		let target_times_buffer = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("Target Times Buffer (Optimized)"), size: (max_size * 4 * std::mem::size_of::<f32>()) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+
+		let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("Output Buffer (Optimized)"), size: (max_size * 4 * std::mem::size_of::<f32>()) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+
+		GpuBufferSet { input_times: input_times_buffer, input_values: input_values_buffer, target_times: target_times_buffer, output: output_buffer, max_capacity: max_size }
+	}
 }
 
 /// Optimized data conversion functions with precision loss annotations
 fn convert_measurements_to_gpu_format(measurements: &[Measurement]) -> Result<(Vec<f32>, Vec<f32>)> {
-    let mut input_times = Vec::with_capacity(measurements.len());
-    let mut input_values = Vec::with_capacity(measurements.len());
+	let mut input_times = Vec::with_capacity(measurements.len());
+	let mut input_values = Vec::with_capacity(measurements.len());
 
-    for measurement in measurements {
-        #[allow(clippy::cast_precision_loss)]
-        let time_secs = measurement.timestamp.timestamp() as f32; // GPU requires f32
-        if !time_secs.is_finite() {
-            return Err(anyhow::anyhow!("Invalid timestamp: {}", measurement.timestamp));
-        }
-        
-        let value_f32 = measurement.value.to_f32()
-            .ok_or_else(|| anyhow::anyhow!("Failed to convert BigDecimal to f32"))?;
-        if !value_f32.is_finite() {
-            return Err(anyhow::anyhow!("Invalid measurement value"));
-        }
-        
-        input_times.push(time_secs);
-        input_values.push(value_f32);
-    }
+	for measurement in measurements {
+		#[allow(clippy::cast_precision_loss)]
+		let time_secs = measurement.timestamp.timestamp() as f32; // GPU requires f32
+		if !time_secs.is_finite() {
+			return Err(anyhow::anyhow!("Invalid timestamp: {}", measurement.timestamp));
+		}
 
-    Ok((input_times, input_values))
+		let value_f32 = measurement.value.to_f32().ok_or_else(|| anyhow::anyhow!("Failed to convert BigDecimal to f32"))?;
+		if !value_f32.is_finite() {
+			return Err(anyhow::anyhow!("Invalid measurement value"));
+		}
+
+		input_times.push(time_secs);
+		input_values.push(value_f32);
+	}
+
+	Ok((input_times, input_values))
 }
 
 fn convert_datetimes_to_gpu_format(target_times: &[DateTime<Utc>]) -> Result<Vec<f32>> {
-    target_times
-        .iter()
-        .map(|&time| {
-            #[allow(clippy::cast_precision_loss)]
-            let time_secs = time.timestamp() as f32; // GPU requires f32
-            if time_secs.is_finite() {
-                Ok(time_secs)
-            } else {
-                Err(anyhow::anyhow!("Invalid target timestamp: {}", time))
-            }
-        })
-        .collect()
+	target_times
+		.iter()
+		.map(|&time| {
+			#[allow(clippy::cast_precision_loss)]
+			let time_secs = time.timestamp() as f32; // GPU requires f32
+			if time_secs.is_finite() {
+				Ok(time_secs)
+			} else {
+				Err(anyhow::anyhow!("Invalid target timestamp: {}", time))
+			}
+		})
+		.collect()
 }
 
 /// Optimized GPU interpolation with intelligent batching and caching
@@ -604,36 +432,31 @@ fn convert_datetimes_to_gpu_format(target_times: &[DateTime<Utc>]) -> Result<Vec
 /// - GPU initialization fails
 /// - Data conversion fails
 /// - GPU computation fails
-pub async fn gpu_linear_interpolate_optimized(
-    measurements: Vec<Measurement>,
-    target_times: Vec<DateTime<Utc>>,
-    dataset_id: Uuid,
-) -> Result<Vec<Measurement>> {
-    if measurements.len() < 2 {
-        return Err(Error::InsufficientMeasurementsError.into());
-    }
+pub async fn gpu_linear_interpolate_optimized(measurements: Vec<Measurement>, target_times: Vec<DateTime<Utc>>, dataset_id: Uuid) -> Result<Vec<Measurement>> {
+	if measurements.len() < 2 {
+		return Err(Error::InsufficientMeasurementsError.into());
+	}
 
-    if target_times.is_empty() {
-        return Ok(Vec::new());
-    }
+	if target_times.is_empty() {
+		return Ok(Vec::new());
+	}
 
-    // Use shared GPU instance (eliminates initialization overhead)
-    let gpu_instance = get_shared_gpu_instance().await?;
+	// Use shared GPU instance (eliminates initialization overhead)
+	let gpu_instance = get_shared_gpu_instance().await?;
 
-    // Pre-process data efficiently
-    let mut sorted_measurements = measurements;
-    sorted_measurements.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+	// Pre-process data efficiently
+	let mut sorted_measurements = measurements;
+	sorted_measurements.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
 
-    // Convert to GPU format with validation (optimized)
-    let (input_times, input_values) = convert_measurements_to_gpu_format(&sorted_measurements)?;
-    let gpu_target_times = convert_datetimes_to_gpu_format(&target_times)?;
+	// Convert to GPU format with validation (optimized)
+	let (input_times, input_values) = convert_measurements_to_gpu_format(&sorted_measurements)?;
+	let gpu_target_times = convert_datetimes_to_gpu_format(&target_times)?;
 
-    // Use optimized interpolation with buffer reuse
-    let gpu_results = gpu_instance
-        .interpolate_optimized(&input_times, &input_values, &gpu_target_times, None)?;
+	// Use optimized interpolation with buffer reuse
+	let gpu_results = gpu_instance.interpolate_optimized(&input_times, &input_values, &gpu_target_times, None)?;
 
-    // Convert results back to Measurements
-    convert_gpu_results_to_measurements(gpu_results, target_times, dataset_id)
+	// Convert results back to Measurements
+	convert_gpu_results_to_measurements(gpu_results, target_times, dataset_id)
 }
 
 /// GPU-accelerated linear interpolation with CPU fallback
@@ -641,51 +464,37 @@ pub async fn gpu_linear_interpolate_optimized(
 /// # Errors
 ///
 /// Returns an error if both GPU and CPU interpolation fail
-pub async fn gpu_linear_interpolate_with_fallback(
-    measurements: Vec<Measurement>,
-    target_times: Vec<DateTime<Utc>>,
-    dataset_id: Uuid,
-) -> Result<Vec<Measurement>> {
-    // Try GPU first
-    match gpu_linear_interpolate_optimized(measurements.clone(), target_times.clone(), dataset_id).await {
-        Ok(result) => Ok(result),
-        Err(_gpu_error) => {
-            // Fallback to CPU linear interpolation
-            if let Some(start) = target_times.first() {
-                if let Some(end) = target_times.last() {
-                    return crate::splines::linear::linear(measurements, *start, *end, crate::splines::Resolution::Seconds);
-                }
-            }
-            Err(anyhow::anyhow!("Both GPU and CPU interpolation failed"))
-        }
-    }
+pub async fn gpu_linear_interpolate_with_fallback(measurements: Vec<Measurement>, target_times: Vec<DateTime<Utc>>, dataset_id: Uuid) -> Result<Vec<Measurement>> {
+	// Try GPU first
+	match gpu_linear_interpolate_optimized(measurements.clone(), target_times.clone(), dataset_id).await {
+		Ok(result) => Ok(result),
+		Err(_gpu_error) => {
+			// Fallback to CPU linear interpolation
+			if let Some(start) = target_times.first() {
+				if let Some(end) = target_times.last() {
+					return crate::splines::linear::linear(measurements, *start, *end, crate::splines::Resolution::Seconds);
+				}
+			}
+			Err(anyhow::anyhow!("Both GPU and CPU interpolation failed"))
+		}
+	}
 }
 
 /// Convert GPU results back to Measurements
-fn convert_gpu_results_to_measurements(
-    gpu_results: Vec<f32>,
-    target_times: Vec<DateTime<Utc>>,
-    dataset_id: Uuid,
-) -> Result<Vec<Measurement>> {
-    use bigdecimal::{BigDecimal, FromPrimitive};
-    
-    gpu_results
-        .into_iter()
-        .zip(target_times)
-        .map(|(value, timestamp)| {
-            if !value.is_finite() {
-                return Err(anyhow::anyhow!("GPU produced invalid result: {}", value));
-            }
+fn convert_gpu_results_to_measurements(gpu_results: Vec<f32>, target_times: Vec<DateTime<Utc>>, dataset_id: Uuid) -> Result<Vec<Measurement>> {
+	use bigdecimal::{BigDecimal, FromPrimitive};
 
-            Ok(Measurement {
-                id: Uuid::new_v4(),
-                dataset_id,
-                timestamp,
-                value: BigDecimal::from_f32(value)
-                    .context(format!("Failed to convert result to BigDecimal: {value}"))?,
-            })
-        })
-        .collect()
+	gpu_results
+		.into_iter()
+		.zip(target_times)
+		.map(|(value, timestamp)| {
+			if !value.is_finite() {
+				return Err(anyhow::anyhow!("GPU produced invalid result: {}", value));
+			}
+
+			Ok(Measurement { id: Uuid::new_v4(), dataset_id, timestamp, value: BigDecimal::from_f32(value).context(format!("Failed to convert result to BigDecimal: {value}"))? })
+		})
+		.collect()
 }
 
 /// Test GPU availability for benchmarking
@@ -694,8 +503,8 @@ fn convert_gpu_results_to_measurements(
 ///
 /// Returns an error if GPU initialization fails
 pub async fn test_gpu_availability() -> Result<bool> {
-    match GpuLinearInterpolator::new().await {
-        Ok(_) => Ok(true),
-        Err(_) => Ok(false),
-    }
+	match GpuLinearInterpolator::new().await {
+		Ok(_) => Ok(true),
+		Err(_) => Ok(false),
+	}
 }

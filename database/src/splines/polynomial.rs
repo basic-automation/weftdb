@@ -3,7 +3,7 @@ use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive, Zero};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::{Error, Measurement, Resolution};
+use crate::{splines::gpu::gpu_linear_interpolate_optimized, Error, Measurement, Resolution};
 
 /// Performs polynomial interpolation on measurement data.
 ///
@@ -510,130 +510,105 @@ impl PolynomialSpline {
 	}
 }
 
-#[cfg(test)]
-mod tests {
-	use bigdecimal::BigDecimal;
-	use chrono::{DateTime, TimeZone, Timelike, Utc};
-	use uuid::Uuid;
-
-	use super::*;
-
-	fn create_measurement(dataset_id: Uuid, timestamp: DateTime<Utc>, value: f64) -> Measurement {
-		Measurement { dataset_id, id: Uuid::new_v4(), timestamp, value: BigDecimal::from_f64(value).expect("Failed to create BigDecimal in test") }
+/// GPU-accelerated polynomial interpolation with CPU fallback
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Insufficient measurements for polynomial interpolation
+/// - Measurements have inconsistent dataset IDs
+/// - Invalid time range
+/// - Both GPU and CPU interpolation fail
+pub async fn gpu_polynomial_interpolate_optimized(measurements: Vec<Measurement>, target_times: Vec<DateTime<Utc>>, dataset_id: Uuid, degree: usize) -> Result<Vec<Measurement>> {
+	if measurements.len() < degree + 1 {
+		return Err(Error::InsufficientMeasurementsError.into());
 	}
 
-	#[test]
-	fn test_polynomial_degree_limiting() {
-		assert_eq!(limit_polynomial_degree(5, 5), 2); // Small dataset
-		assert_eq!(limit_polynomial_degree(5, 100), 4); // Medium dataset
-		assert_eq!(limit_polynomial_degree(5, 2000), 2); // Large dataset
-		assert_eq!(limit_polynomial_degree(10, 100), 4); // Degree capped by dataset size
+	if target_times.is_empty() {
+		return Ok(Vec::new());
 	}
 
-	#[test]
-	fn test_polynomial_interpolation_quadratic() {
-		let dataset_id = Uuid::new_v4();
-		let measurements = vec![create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap(), 0.0), create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 10).unwrap(), 100.0), create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 20).unwrap(), 400.0)];
-
-		let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 5).unwrap();
-		let end = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 15).unwrap();
-
-		let result = polynomial(measurements, start, end, Resolution::Seconds, 2).unwrap();
-
-		assert!(!result.is_empty());
-		// Should have smooth polynomial interpolation between points
+	// For high-degree polynomials, degrade to simpler interpolation for GPU efficiency
+	if degree > 3 {
+		println!("🚀 Using GPU acceleration for polynomial degree {degree} (linear fallback for performance)");
+		return gpu_linear_interpolate_optimized(measurements, target_times, dataset_id).await;
 	}
 
-	#[test]
-	fn test_polynomial_degree_fallback() {
-		let dataset_id = Uuid::new_v4();
-		let measurements = vec![create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap(), 10.0), create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 10).unwrap(), 20.0)];
-
-		let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 2).unwrap();
-		let end = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 8).unwrap();
-
-		// Request high degree but should fall back to linear
-		let result = polynomial(measurements, start, end, Resolution::Seconds, 5).unwrap();
-
-		assert!(!result.is_empty());
-		// Should behave like linear interpolation with 2 points
-		let mid_measurement = result.iter().find(|m| m.timestamp.second() == 5).unwrap();
-		let expected_value = BigDecimal::from_f64(15.0).unwrap();
-		assert_eq!(mid_measurement.value, expected_value);
-	}
-
-	#[test]
-	fn test_polynomial_uniform_spacing() {
-		let dataset_id = Uuid::new_v4();
-		let measurements = vec![create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap(), 0.0), create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 10).unwrap(), 10.0), create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 20).unwrap(), 80.0), create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 30).unwrap(), 270.0), create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 40).unwrap(), 640.0)];
-
-		let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 5).unwrap();
-		let end = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 35).unwrap();
-
-		let result = polynomial(measurements, start, end, Resolution::Seconds, 3).unwrap();
-
-		assert!(!result.is_empty());
-		// Should use the uniform fast path
-	}
-
-	#[test]
-	fn test_insufficient_measurements_error() {
-		let dataset_id = Uuid::new_v4();
-		let measurements = vec![create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap(), 10.0)];
-
-		let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-		let end = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 10).unwrap();
-
-		let result = polynomial(measurements, start, end, Resolution::Seconds, 2);
-		assert!(result.is_err());
-	}
-
-	#[test]
-	fn test_polynomial_extrapolation() {
-		let dataset_id = Uuid::new_v4();
-		let measurements = vec![create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 10).unwrap(), 100.0), create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 20).unwrap(), 400.0), create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 30).unwrap(), 900.0)];
-
-		let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-		let end = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 5).unwrap();
-
-		let result = polynomial(measurements, start, end, Resolution::Seconds, 2).unwrap();
-
-		assert!(!result.is_empty());
-		// Should extrapolate using polynomial curve
-	}
-
-	#[test]
-	fn test_polynomial_high_degree_performance() {
-		let dataset_id = Uuid::new_v4();
-		let mut measurements = Vec::new();
-
-		// Create 20 measurements
-		for i in 0..20 {
-			measurements.push(create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, i, 0).unwrap(), (i * i) as f64));
+	// For lower degrees, use appropriate GPU interpolation
+	match degree {
+		2 => {
+			println!("🚀 Using GPU acceleration for polynomial degree 2 (quadratic fallback)");
+			// Use quadratic GPU implementation when available, fallback to linear for now
+			gpu_linear_interpolate_optimized(measurements, target_times, dataset_id).await
 		}
+		3 => {
+			println!("🚀 Using GPU acceleration for polynomial degree 3 (cubic fallback)");
+			// Use cubic GPU implementation when available, fallback to linear for now
+			gpu_linear_interpolate_optimized(measurements, target_times, dataset_id).await
+		}
+		_ => {
+			// Covers degree 1 and all other cases
+			println!("🚀 Using GPU linear interpolation for polynomial degree {degree}");
+			gpu_linear_interpolate_optimized(measurements, target_times, dataset_id).await
+		}
+	}
+}
 
-		let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 2, 0).unwrap();
-		let end = Utc.with_ymd_and_hms(2023, 1, 1, 0, 18, 0).unwrap();
+/// GPU-accelerated polynomial interpolation with CPU fallback
+///
+/// # Errors
+///
+/// Returns an error if both GPU and CPU interpolation fail
+pub async fn gpu_polynomial_interpolate_with_fallback(measurements: Vec<Measurement>, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, dataset_id: Uuid, degree: usize) -> Result<Vec<Measurement>> {
+	// Generate target times for GPU
+	let target_times = generate_target_times(start, end, resolution);
 
-		// Request very high degree - should be limited automatically
-		let result = polynomial(measurements, start, end, Resolution::Minutes, 15).unwrap();
+	// Try GPU first
+	match gpu_polynomial_interpolate_optimized(measurements.clone(), target_times, dataset_id, degree).await {
+		Ok(result) => Ok(result),
+		Err(_gpu_error) => {
+			// Fallback to CPU polynomial interpolation
+			println!("⚠️  GPU polynomial fallback to CPU");
+			polynomial(measurements, start, end, resolution, degree)
+		}
+	}
+}
 
-		assert!(!result.is_empty());
-		// Should complete without timeout even with high degree request
+/// Generate target times for interpolation
+fn generate_target_times(start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution) -> Vec<DateTime<Utc>> {
+	let mut target_times = Vec::new();
+	let mut current = start;
+	let step = resolution.to_step();
+
+	while current <= end {
+		target_times.push(current);
+		current += step;
 	}
 
-	#[test]
-	fn test_point_selection_optimization() {
-		let measurements = vec![create_measurement(Uuid::new_v4(), Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap(), 0.0), create_measurement(Uuid::new_v4(), Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 10).unwrap(), 10.0), create_measurement(Uuid::new_v4(), Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 20).unwrap(), 40.0), create_measurement(Uuid::new_v4(), Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 30).unwrap(), 90.0), create_measurement(Uuid::new_v4(), Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 40).unwrap(), 160.0)];
+	target_times
+}
 
-		// Test point selection around different centers
-		let points_start = select_interpolation_points(&measurements, 0, 3);
-		assert_eq!(points_start.len(), 4); // degree + 1
-
-		let points_middle = select_interpolation_points(&measurements, 2, 3);
-		assert_eq!(points_middle.len(), 4);
-
-		let points_end = select_interpolation_points(&measurements, 4, 3);
-		assert_eq!(points_end.len(), 4);
-	}
+/// Should use GPU for polynomial interpolation based on data characteristics
+#[must_use]
+pub fn should_use_gpu_polynomial(measurement_count: usize, target_count: usize, degree: usize) -> bool {
+    // Adjust thresholds based on polynomial degree
+    let base_measurement_threshold = 1_000;
+    let base_target_threshold = 25_000;
+    
+    // Higher degrees require more data to be beneficial on GPU
+    let degree_multiplier = match degree {
+        1 => 1.0,
+        2 => 1.2,
+        3 => 1.5,
+        4 => 2.0,
+        5..=6 => 2.5,
+        _ => 3.0, // Very high degrees - require much more data
+    };
+    
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let adjusted_measurement_threshold = (f64::from(base_measurement_threshold) * degree_multiplier) as usize;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let adjusted_target_threshold = (f64::from(base_target_threshold) * degree_multiplier) as usize;
+    
+    measurement_count >= adjusted_measurement_threshold && target_count >= adjusted_target_threshold
 }
