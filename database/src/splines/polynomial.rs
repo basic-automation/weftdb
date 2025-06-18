@@ -41,7 +41,7 @@ pub fn polynomial(measurements: Vec<Measurement>, start: DateTime<Utc>, end: Dat
 	let effective_degree = limit_polynomial_degree(degree, measurements.len());
 
 	if effective_degree != degree {
-		eprintln!("Warning: Polynomial degree limited from {degree} to {effective_degree} for better performance and numerical stability");
+		//eprintln!("Warning: Polynomial degree limited from {degree} to {effective_degree} for better performance and numerical stability");
 	}
 
 	// Fast path degradation for simple cases

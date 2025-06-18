@@ -18,6 +18,13 @@ rand = "0.9.1"
 tokio-test = "0.4.4"
 criterion = "0.6.0"
 rayon = "1.10.0"
+bytemuck = "1.23.1"
+pollster = "0.4.0"
+wgpu = "25.0.2"
+wide = "0.7.32"
+tempfile = "3.20.0"
+serde = "1.0.219"
+flume = "0.11.1"
 
 [profile.release]
 opt-level = 3

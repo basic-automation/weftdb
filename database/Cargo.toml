@@ -4,22 +4,26 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-anyhow = "1.0"
-bigdecimal = { version = "0.4", features = ["serde"] }
-chrono = { version = "0.4", features = ["serde"] }
-fake = { version = "2.9", features = ["derive", "chrono", "bigdecimal", "uuid"] }
-rand = "0.8"
-rayon = "1.8"
-serde = { version = "1.0", features = ["derive"] }
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "chrono", "uuid"] }
-thiserror = "1.0"
-tokio = { version = "1.0", features = ["full"] }
-uuid = { version = "1.6", features = ["v4", "serde"] }
-wide = "0.7"
+anyhow = { workspace = true }
+bigdecimal = { workspace = true, features = ["serde"] }
+chrono = { workspace = true, features = ["serde"] }
+fake = { workspace = true, features = ["derive", "chrono", "bigdecimal", "uuid"] }
+rand = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+sqlx = { workspace = true, features = ["runtime-tokio-rustls", "sqlite", "chrono", "uuid"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+uuid = { workspace = true, features = ["v4", "serde"] }
+wide = { workspace = true }
+flume = { workspace = true }
+wgpu = { workspace = true }
+bytemuck = { workspace = true, features = ["derive"] }
+pollster = { workspace = true }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
-tempfile = "3.8"
+criterion = { workspace = true , features = ["html_reports"] }
+tempfile = { workspace = true }
 
 [[bench]]
 name = "interpolation_benchmarks"
@@ -43,4 +47,8 @@ harness = false
 
 [[bench]]
 name = "fast_path_comparison_benchmarks"
+harness = false
+
+[[bench]]
+name = "gpu_benchmarks"
 harness = false
