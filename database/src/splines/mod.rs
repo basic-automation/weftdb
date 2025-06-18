@@ -281,7 +281,7 @@ pub async fn auto_interpolate_async(measurements: Vec<Measurement>, start: DateT
 
 	if use_gpu {
 		let expected_speedup = get_expected_speedup(measurements.len(), estimated_output_points);
-		println!("🚀 Using GPU acceleration for {:?}: {} measurements → {} output points ({}x speed boost expected)", spline_type, measurements.len(), estimated_output_points, expected_speedup);
+		//println!("🚀 Using GPU acceleration for {:?}: {} measurements → {} output points ({}x speed boost expected)", spline_type, measurements.len(), estimated_output_points, expected_speedup);
 
 		match spline_type {
 			SplineType::Linear => {

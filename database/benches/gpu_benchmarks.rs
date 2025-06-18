@@ -8,6 +8,7 @@ use database::{
 };
 use fake::{Fake, Faker};
 use uuid::Uuid;
+use database::SplineType;
 
 fn create_measurement(dataset_id: Uuid, timestamp: DateTime<Utc>, value: f64) -> Measurement {
 	Measurement { id: Uuid::new_v4(), dataset_id, timestamp, value: BigDecimal::from_str(&value.to_string()).unwrap() }
@@ -364,13 +365,18 @@ fn gpu_spline_type_comparison(c: &mut Criterion) {
 			let rt = tokio::runtime::Runtime::new().unwrap();
 			b.iter_custom(|iters| {
 				let measurements = measurements.clone();
-				let spline_type = *spline_type;
+				let spline_type = spline_type; // ← Remove the dereference operator
 
 				let start_time = std::time::Instant::now();
 				rt.block_on(async {
 					for _ in 0..iters {
-						let dataset_id = measurements[0].dataset_id;
-						black_box(database::splines::auto_interpolate_async(black_box(measurements.clone()), black_box(start), black_box(end), black_box(Resolution::Seconds), black_box(spline_type)).await.unwrap());
+						black_box(database::splines::auto_interpolate_async(
+							black_box(measurements.clone()), 
+							black_box(start), 
+							black_box(end), 
+							black_box(Resolution::Seconds), 
+							black_box(spline_type)
+                        ).await.unwrap());
 					}
 				});
 				start_time.elapsed()

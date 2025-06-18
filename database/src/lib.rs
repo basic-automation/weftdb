@@ -195,7 +195,7 @@ impl DB {
 		};
 
 		if will_use_gpu {
-			println!("🚀 Database using GPU acceleration for {spline_type:?} interpolation");
+			//println!("🚀 Database using GPU acceleration for {spline_type:?} interpolation");
 		}
 
 		// Use async interpolation with GPU support

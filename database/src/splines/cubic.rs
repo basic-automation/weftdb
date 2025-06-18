@@ -214,7 +214,7 @@ pub async fn gpu_cubic_interpolate_optimized(measurements: Vec<Measurement>, tar
 
 	// For now, use GPU linear interpolation as fallback
 	// TODO: Implement true GPU cubic interpolation with spline coefficients
-	println!("🚀 Using GPU acceleration for cubic interpolation (linear fallback)");
+	//println!("🚀 Using GPU acceleration for cubic interpolation (linear fallback)");
 	gpu_linear_interpolate_optimized(measurements, target_times, dataset_id).await
 }
 

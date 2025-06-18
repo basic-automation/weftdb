@@ -530,25 +530,25 @@ pub async fn gpu_polynomial_interpolate_optimized(measurements: Vec<Measurement>
 
 	// For high-degree polynomials, degrade to simpler interpolation for GPU efficiency
 	if degree > 3 {
-		println!("🚀 Using GPU acceleration for polynomial degree {degree} (linear fallback for performance)");
+		//println!("🚀 Using GPU acceleration for polynomial degree {degree} (linear fallback for performance)");
 		return gpu_linear_interpolate_optimized(measurements, target_times, dataset_id).await;
 	}
 
 	// For lower degrees, use appropriate GPU interpolation
 	match degree {
 		2 => {
-			println!("🚀 Using GPU acceleration for polynomial degree 2 (quadratic fallback)");
+			//println!("🚀 Using GPU acceleration for polynomial degree 2 (quadratic fallback)");
 			// Use quadratic GPU implementation when available, fallback to linear for now
 			gpu_linear_interpolate_optimized(measurements, target_times, dataset_id).await
 		}
 		3 => {
-			println!("🚀 Using GPU acceleration for polynomial degree 3 (cubic fallback)");
+			//println!("🚀 Using GPU acceleration for polynomial degree 3 (cubic fallback)");
 			// Use cubic GPU implementation when available, fallback to linear for now
 			gpu_linear_interpolate_optimized(measurements, target_times, dataset_id).await
 		}
 		_ => {
 			// Covers degree 1 and all other cases
-			println!("🚀 Using GPU linear interpolation for polynomial degree {degree}");
+			//println!("🚀 Using GPU linear interpolation for polynomial degree {degree}");
 			gpu_linear_interpolate_optimized(measurements, target_times, dataset_id).await
 		}
 	}

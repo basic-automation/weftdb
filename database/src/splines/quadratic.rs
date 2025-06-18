@@ -430,7 +430,7 @@ pub async fn gpu_quadratic_interpolate_optimized(measurements: Vec<Measurement>,
 
 	// For now, use GPU linear interpolation as fallback
 	// TODO: Implement true GPU quadratic interpolation
-	println!("🚀 Using GPU acceleration for quadratic interpolation (linear fallback)");
+	//println!("🚀 Using GPU acceleration for quadratic interpolation (linear fallback)");
 	gpu_linear_interpolate_optimized(measurements, target_times, dataset_id).await
 }
 
