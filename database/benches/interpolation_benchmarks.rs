@@ -98,26 +98,40 @@ fn bench_polynomial_interpolation(c: &mut Criterion) {
 }
 
 fn bench_interpolation_resolutions(c: &mut Criterion) {
-	let dataset_id = Uuid::new_v4();
-	let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-	let measurements = create_benchmark_measurements(100, dataset_id, start_time, 60); // Every minute
+    let dataset_id = Uuid::new_v4();
+    let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
+    let measurements = create_benchmark_measurements(100, dataset_id, start_time, 60); // Every minute
 
-	let mut group = c.benchmark_group("interpolation_resolutions");
+    let mut group = c.benchmark_group("interpolation_resolutions");
 
-	let resolutions = [("Seconds", Resolution::Seconds), ("Minutes", Resolution::Minutes), ("Hours", Resolution::Hours)];
+    let resolutions = [
+        ("Nanoseconds", Resolution::Nanoseconds),
+        ("Microseconds", Resolution::Microseconds),
+        ("Milliseconds", Resolution::Milliseconds), 
+        ("Seconds", Resolution::Seconds), 
+        ("Minutes", Resolution::Minutes), 
+        ("Hours", Resolution::Hours)
+    ];
 
-	for (name, resolution) in resolutions {
-		let interpolation_start = start_time + chrono::Duration::minutes(5);
-		let interpolation_end = start_time + chrono::Duration::minutes(95);
+    for (name, resolution) in resolutions {
+        let interpolation_start = start_time + chrono::Duration::minutes(5);
+        let interpolation_end = match resolution {
+            Resolution::Nanoseconds => start_time + chrono::Duration::nanoseconds(1000), // Very short for nanoseconds
+            Resolution::Microseconds => start_time + chrono::Duration::microseconds(1000), // Short for microseconds
+            Resolution::Milliseconds => start_time + chrono::Duration::milliseconds(100), // Short for milliseconds
+            Resolution::Seconds => start_time + chrono::Duration::seconds(60), // 1 minute for seconds
+            Resolution::Minutes => start_time + chrono::Duration::minutes(95), // Original range for minutes
+            Resolution::Hours => start_time + chrono::Duration::hours(4), // 4 hours for hours
+        };
 
-		group.bench_with_input(BenchmarkId::new("resolution", name), &resolution, |b, &resolution| {
-			b.iter(|| {
-				let result = auto_interpolate(black_box(measurements.clone()), black_box(interpolation_start), black_box(interpolation_end), black_box(resolution), black_box(SplineType::Linear));
-				black_box(result)
-			});
-		});
-	}
-	group.finish();
+        group.bench_with_input(BenchmarkId::new("resolution", name), &resolution, |b, &resolution| {
+            b.iter(|| {
+                let result = auto_interpolate(black_box(measurements.clone()), black_box(interpolation_start), black_box(interpolation_end), black_box(resolution), black_box(SplineType::Linear));
+                black_box(result)
+            });
+        });
+    }
+    group.finish();
 }
 
 fn bench_interpolation_vs_extrapolation(c: &mut Criterion) {

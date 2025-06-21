@@ -17,7 +17,7 @@ fn verify_strategy_selection_comprehensive() {
 		small_measurements.clone(),
 		small_measurements[0].timestamp,
 		small_measurements[small_measurements.len() - 1].timestamp,
-		Resolution::Minutes, // ← Changed from Seconds to Minutes to reduce output
+		Resolution::Seconds, // ← Use Seconds for reasonable output size
 		SplineType::Linear,
 	);
 	let small_duration = start_time.elapsed();
@@ -25,13 +25,13 @@ fn verify_strategy_selection_comprehensive() {
 
 	// Test Case 2: Medium Dataset with Controlled Output - Should use SIMD
 	let medium_measurements = create_test_measurements(400);
-	let controlled_end = medium_measurements[0].timestamp + chrono::Duration::minutes(30); // ← Much smaller time range
+	let controlled_end = medium_measurements[0].timestamp + chrono::Duration::seconds(30); // ← 30 seconds
 	let start_time = Instant::now();
 	let result = auto_interpolate(
 		medium_measurements.clone(),
 		medium_measurements[0].timestamp,
 		controlled_end,
-		Resolution::Minutes, // ← Changed from Seconds to Minutes
+		Resolution::Seconds, // ← Use Seconds for controlled output
 		SplineType::Linear,
 	);
 	let medium_dense_duration = start_time.elapsed();
@@ -39,13 +39,13 @@ fn verify_strategy_selection_comprehensive() {
 
 	// Test Case 3: Large Dataset with Very Controlled Output - Should use parallel processing
 	let large_measurements = create_test_measurements(800); // ← Reduced from 1500 to 800
-	let controlled_large_end = large_measurements[0].timestamp + chrono::Duration::minutes(60); // ← Small time range
+	let controlled_large_end = large_measurements[0].timestamp + chrono::Duration::seconds(60); // ← 60 seconds
 	let start_time = Instant::now();
 	let result = auto_interpolate(
 		large_measurements.clone(),
 		large_measurements[0].timestamp,
 		controlled_large_end,
-		Resolution::Minutes, // ← Changed from Seconds to Minutes
+		Resolution::Seconds, // ← Use Seconds for controlled output
 		SplineType::Linear,  // ← Changed from Quadratic to Linear for better performance
 	);
 	let large_duration = start_time.elapsed();

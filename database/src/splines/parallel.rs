@@ -72,21 +72,35 @@ fn generate_target_times(start: DateTime<Utc>, end: DateTime<Utc>, resolution: R
 
 /// Interpolate a chunk of target times
 fn interpolate_chunk(measurements: &[Measurement], target_times: &[DateTime<Utc>], spline_type: SplineType) -> Result<Vec<Measurement>> {
-	// Use SIMD for the chunk if beneficial
-	if target_times.len() >= 32 {
-		return super::simd::auto_interpolate_simd(measurements, target_times, spline_type);
-	}
+    // Use SIMD for the chunk if beneficial
+    if target_times.len() >= 32 {
+        return super::simd::auto_interpolate_simd(measurements, target_times, spline_type);
+    }
 
-	// Fall back to scalar implementation
-	let start = target_times[0];
-	let end = target_times[target_times.len() - 1];
+    // Fall back to scalar implementation
+    let start = target_times[0];
+    let end = target_times[target_times.len() - 1];
 
-	match spline_type {
-		SplineType::Linear => super::linear::linear(measurements.to_vec(), start, end, Resolution::Seconds),
-		SplineType::Quadratic => super::quadratic::quadratic(measurements.to_vec(), start, end, Resolution::Seconds),
-		SplineType::Cubic => super::cubic::cubic(measurements.to_vec(), start, end, Resolution::Seconds),
-		SplineType::Polynomial(degree) => super::polynomial::polynomial(measurements.to_vec(), start, end, Resolution::Seconds, degree),
-	}
+    // Use appropriate resolution based on time span
+    let time_span = end - start;
+    let resolution = if time_span <= chrono::Duration::microseconds(1) {
+        Resolution::Nanoseconds
+    } else if time_span <= chrono::Duration::milliseconds(1) {
+        Resolution::Microseconds
+    } else if time_span <= chrono::Duration::seconds(1) {
+        Resolution::Milliseconds
+    } else if time_span <= chrono::Duration::minutes(1) {
+        Resolution::Seconds
+    } else {
+        Resolution::Minutes
+    };
+
+    match spline_type {
+        SplineType::Linear => super::linear::linear(measurements.to_vec(), start, end, resolution),
+        SplineType::Quadratic => super::quadratic::quadratic(measurements.to_vec(), start, end, resolution),
+        SplineType::Cubic => super::cubic::cubic(measurements.to_vec(), start, end, resolution),
+        SplineType::Polynomial(degree) => super::polynomial::polynomial(measurements.to_vec(), start, end, resolution, degree),
+    }
 }
 
 /// Optimized interpolation with intelligent algorithm selection

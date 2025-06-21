@@ -492,9 +492,14 @@ mod tests {
 		let end = Utc.with_ymd_and_hms(2023, 1, 1, 1, 0, 0).unwrap();
 
 		// Test different resolutions
-		for resolution in [Resolution::Minutes, Resolution::Seconds] {
+		for resolution in [Resolution::Microseconds, Resolution::Milliseconds, Resolution::Minutes, Resolution::Seconds] {
 			let result = linear(measurements.clone(), start, end, resolution).unwrap();
-			assert!(!result.is_empty());
+			assert!(!result.is_empty(), "Resolution {resolution:?} should produce results");
+
+			// Verify all results have the correct dataset_id
+			for measurement in &result {
+				assert_eq!(measurement.dataset_id, dataset_id);
+			}
 		}
 	}
 }

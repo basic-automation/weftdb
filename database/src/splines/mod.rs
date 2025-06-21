@@ -21,22 +21,28 @@ pub use quadratic::quadratic;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolution {
-	Seconds,
-	Minutes,
-	Hours,
-	Days,
+    Nanoseconds,
+    Microseconds,
+    Milliseconds,
+    Seconds,
+    Minutes,
+    Hours,
+    Days,
 }
 
 impl Resolution {
-	#[must_use]
-	pub const fn to_step(self) -> chrono::Duration {
-		match self {
-			Self::Seconds => chrono::Duration::seconds(1),
-			Self::Minutes => chrono::Duration::minutes(1),
-			Self::Hours => chrono::Duration::hours(1),
-			Self::Days => chrono::Duration::days(1),
-		}
-	}
+    #[must_use]
+    pub const fn to_step(self) -> chrono::Duration {
+        match self {
+            Self::Nanoseconds => chrono::Duration::nanoseconds(1),
+            Self::Microseconds => chrono::Duration::microseconds(1),
+            Self::Milliseconds => chrono::Duration::milliseconds(1),
+            Self::Seconds => chrono::Duration::seconds(1),
+            Self::Minutes => chrono::Duration::minutes(1),
+            Self::Hours => chrono::Duration::hours(1),
+            Self::Days => chrono::Duration::days(1),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,7 +286,7 @@ pub async fn auto_interpolate_async(measurements: Vec<Measurement>, start: DateT
 	};
 
 	if use_gpu {
-		let expected_speedup = get_expected_speedup(measurements.len(), estimated_output_points);
+		//let expected_speedup = get_expected_speedup(measurements.len(), estimated_output_points);
 		//println!("🚀 Using GPU acceleration for {:?}: {} measurements → {} output points ({}x speed boost expected)", spline_type, measurements.len(), estimated_output_points, expected_speedup);
 
 		match spline_type {
@@ -304,6 +310,7 @@ pub async fn auto_interpolate_async(measurements: Vec<Measurement>, start: DateT
 }
 
 /// Get expected GPU speedup based on benchmark results
+#[allow(dead_code)]
 const fn get_expected_speedup(measurement_count: usize, output_points: usize) -> &'static str {
 	match (measurement_count, output_points) {
 		// Combine identical speedup categories for better maintainability
@@ -317,39 +324,45 @@ const fn get_expected_speedup(measurement_count: usize, output_points: usize) ->
 /// Estimate output points based on time range and resolution (make public)
 #[must_use]
 pub fn estimate_output_points(start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution) -> usize {
-	let duration = end.signed_duration_since(start);
+    let duration = end.signed_duration_since(start);
 
-	let total_seconds = duration.num_seconds().max(0); // Ensure non-negative
+    let total_nanoseconds = duration.num_nanoseconds().unwrap_or(0).max(0); // Ensure non-negative
 
-	#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-	let total_seconds_usize = total_seconds as usize; // Safe after max(0) check
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let total_nanoseconds_usize = total_nanoseconds as usize; // Safe after max(0) check
 
-	match resolution {
-		Resolution::Seconds => total_seconds_usize,
-		Resolution::Minutes => total_seconds_usize / 60,
-		Resolution::Hours => total_seconds_usize / 3600,
-		Resolution::Days => total_seconds_usize / 86400,
-	}
+    match resolution {
+        Resolution::Nanoseconds => total_nanoseconds_usize,
+        Resolution::Microseconds => total_nanoseconds_usize / 1_000,
+        Resolution::Milliseconds => total_nanoseconds_usize / 1_000_000,
+        Resolution::Seconds => total_nanoseconds_usize / 1_000_000_000,
+        Resolution::Minutes => total_nanoseconds_usize / 60_000_000_000,
+        Resolution::Hours => total_nanoseconds_usize / 3_600_000_000_000,
+        Resolution::Days => total_nanoseconds_usize / 86_400_000_000_000,
+    }
 }
 
 /// Generate target times for interpolation
 fn generate_target_times(start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution) -> Vec<DateTime<Utc>> {
-	let mut target_times = Vec::new();
-	let mut current = start;
+    let mut target_times = Vec::new();
+    let mut current = start;
 
-	let step = match resolution {
-		Resolution::Seconds => Duration::seconds(1),
-		Resolution::Minutes => Duration::minutes(1),
-		Resolution::Hours => Duration::hours(1),
-		Resolution::Days => Duration::days(1),
-	};
+    let step = match resolution {
+        Resolution::Nanoseconds => Duration::nanoseconds(1),
+        Resolution::Microseconds => Duration::microseconds(1),
+        Resolution::Milliseconds => Duration::milliseconds(1),
+        Resolution::Seconds => Duration::seconds(1),
+        Resolution::Minutes => Duration::minutes(1),
+        Resolution::Hours => Duration::hours(1),
+        Resolution::Days => Duration::days(1),
+    };
 
-	while current <= end {
-		target_times.push(current);
-		current += step;
-	}
+    while current <= end {
+        target_times.push(current);
+        current += step;
+    }
 
-	target_times
+    target_times
 }
 
 /// Determine if GPU should be used with optimized thresholds

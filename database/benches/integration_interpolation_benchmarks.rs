@@ -56,26 +56,31 @@ fn bench_auto_interpolate_spline_comparison(c: &mut Criterion) {
 }
 
 fn bench_auto_interpolate_resolution_comparison(c: &mut Criterion) {
-	let dataset_id = Uuid::new_v4();
-	let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-	let measurements = create_benchmark_measurements(60, dataset_id, start_time, 60); // Every minute
+    let dataset_id = Uuid::new_v4();
+    let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
+    let measurements = create_benchmark_measurements(60, dataset_id, start_time, 60); // Every minute
 
-	let interpolation_start = start_time + chrono::Duration::minutes(5);
-	let interpolation_end = start_time + chrono::Duration::minutes(55);
+    let mut group = c.benchmark_group("auto_interpolate_resolutions");
 
-	let mut group = c.benchmark_group("auto_interpolate_resolutions");
+    let resolutions = [
+        ("Microseconds", Resolution::Microseconds, chrono::Duration::milliseconds(1)), // 1 millisecond = 1000 microseconds
+        ("Milliseconds", Resolution::Milliseconds, chrono::Duration::seconds(1)), // 1 second = 1000 milliseconds
+        ("Seconds", Resolution::Seconds, chrono::Duration::minutes(50)), // 50 minutes = 3000 seconds
+        ("Minutes", Resolution::Minutes, chrono::Duration::minutes(50)) // 50 minutes = 50 minutes
+    ];
 
-	let resolutions = [("Seconds", Resolution::Seconds), ("Minutes", Resolution::Minutes)];
+    for (name, resolution, duration) in resolutions {
+        let interpolation_start = start_time + chrono::Duration::minutes(5);
+        let interpolation_end = interpolation_start + duration;
 
-	for (name, resolution) in resolutions {
-		group.bench_with_input(BenchmarkId::new("resolution", name), &resolution, |b, &resolution| {
-			b.iter(|| {
-				let result = auto_interpolate(black_box(measurements.clone()), black_box(interpolation_start), black_box(interpolation_end), black_box(resolution), black_box(SplineType::Linear));
-				black_box(result)
-			});
-		});
-	}
-	group.finish();
+        group.bench_with_input(BenchmarkId::new("resolution", name), &resolution, |b, &resolution| {
+            b.iter(|| {
+                let result = auto_interpolate(black_box(measurements.clone()), black_box(interpolation_start), black_box(interpolation_end), black_box(resolution), black_box(SplineType::Linear));
+                black_box(result)
+            });
+        });
+    }
+    group.finish();
 }
 
 /// Benchmark optimized interpolation with different data sizes

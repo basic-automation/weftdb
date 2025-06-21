@@ -119,22 +119,22 @@ fn simd_linear_interpolate(input_times: &[f64], input_values: &[f64], target_tim
 /// - Timestamp conversion fails
 /// - `BigDecimal` operations fail
 pub fn quadratic_simd_batch(measurements: &[Measurement], target_times: &[DateTime<Utc>]) -> Result<Vec<Measurement>> {
-	if measurements.len() < 3 {
-		return Err(Error::InsufficientPointsForCubicSplineError.into());
-	}
+    if measurements.len() < 3 {
+        return Err(Error::InsufficientPointsForCubicSplineError.into());
+    }
 
-	if target_times.is_empty() {
-		return Ok(Vec::new());
-	}
+    if target_times.is_empty() {
+        return Ok(Vec::new());
+    }
 
-	// For now, delegate to scalar implementation
-	// TODO: Implement true SIMD quadratic interpolation
-	crate::splines::quadratic::quadratic(
-		measurements.to_vec(),
-		target_times[0],
-		target_times[target_times.len() - 1],
-		Resolution::Seconds, // Use Seconds instead of Milliseconds
-	)
+    // For now, delegate to scalar implementation
+    // TODO: Implement true SIMD quadratic interpolation
+    crate::splines::quadratic::quadratic(
+        measurements.to_vec(),
+        target_times[0],
+        target_times[target_times.len() - 1],
+        Resolution::Microseconds, // Use Microseconds for high precision
+    )
 }
 
 /// SIMD-optimized cubic interpolation
@@ -146,22 +146,22 @@ pub fn quadratic_simd_batch(measurements: &[Measurement], target_times: &[DateTi
 /// - Timestamp conversion fails
 /// - `BigDecimal` operations fail
 pub fn cubic_simd_batch(measurements: &[Measurement], target_times: &[DateTime<Utc>]) -> Result<Vec<Measurement>> {
-	if measurements.len() < 4 {
-		return Err(Error::InsufficientPointsForCubicSplineError.into());
-	}
+    if measurements.len() < 4 {
+        return Err(Error::InsufficientPointsForCubicSplineError.into());
+    }
 
-	if target_times.is_empty() {
-		return Ok(Vec::new());
-	}
+    if target_times.is_empty() {
+        return Ok(Vec::new());
+    }
 
-	// For now, delegate to scalar implementation
-	// TODO: Implement true SIMD cubic interpolation
-	crate::splines::cubic::cubic(
-		measurements.to_vec(),
-		target_times[0],
-		target_times[target_times.len() - 1],
-		Resolution::Seconds, // Use Seconds instead of Milliseconds
-	)
+    // For now, delegate to scalar implementation
+    // TODO: Implement true SIMD cubic interpolation
+    crate::splines::cubic::cubic(
+        measurements.to_vec(),
+        target_times[0],
+        target_times[target_times.len() - 1],
+        Resolution::Microseconds, // Use Microseconds for high precision
+    )
 }
 
 /// SIMD-optimized polynomial interpolation
@@ -173,23 +173,23 @@ pub fn cubic_simd_batch(measurements: &[Measurement], target_times: &[DateTime<U
 /// - Timestamp conversion fails
 /// - `BigDecimal` operations fail
 pub fn polynomial_simd_batch(measurements: &[Measurement], target_times: &[DateTime<Utc>], degree: usize) -> Result<Vec<Measurement>> {
-	if measurements.len() < degree + 1 {
-		return Err(Error::InsufficientMeasurementsError.into());
-	}
+    if measurements.len() < degree + 1 {
+        return Err(Error::InsufficientMeasurementsError.into());
+    }
 
-	if target_times.is_empty() {
-		return Ok(Vec::new());
-	}
+    if target_times.is_empty() {
+        return Ok(Vec::new());
+    }
 
-	// For now, delegate to scalar implementation
-	// TODO: Implement true SIMD polynomial interpolation
-	crate::splines::polynomial::polynomial(
-		measurements.to_vec(),
-		target_times[0],
-		target_times[target_times.len() - 1],
-		Resolution::Seconds, // Use Seconds instead of Milliseconds
-		degree,
-	)
+    // For now, delegate to scalar implementation
+    // TODO: Implement true SIMD polynomial interpolation
+    crate::splines::polynomial::polynomial(
+        measurements.to_vec(),
+        target_times[0],
+        target_times[target_times.len() - 1],
+        Resolution::Microseconds, // Use Microseconds for high precision
+        degree,
+    )
 }
 
 /// Auto-select SIMD interpolation method based on spline type
