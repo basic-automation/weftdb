@@ -15,7 +15,8 @@ use bigdecimal::ToPrimitive;
 use crate::{Error, Measurement};
 
 /// Convert measurements to GPU-compatible f32 format
-fn convert_measurements_to_gpu_format(measurements: &[Measurement]) -> Result<(Vec<f32>, Vec<f32>)> {
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn convert_measurements_to_gpu_format(measurements: &[Measurement]) -> (Vec<f32>, Vec<f32>) {
     let mut input_times = Vec::with_capacity(measurements.len());
     let mut input_values = Vec::with_capacity(measurements.len());
 
@@ -31,13 +32,14 @@ fn convert_measurements_to_gpu_format(measurements: &[Measurement]) -> Result<(V
         input_values.push(value);
     }
 
-    Ok((input_times, input_values))
+    (input_times, input_values)
 }
 
-/// Convert DateTime<Utc> to GPU-compatible f32 format
-fn convert_datetimes_to_gpu_format(target_times: &[DateTime<Utc>]) -> Result<Vec<f32>> {
+/// Convert `DateTime<Utc>` to GPU-compatible f32 format
+#[allow(clippy::cast_precision_loss)]
+fn convert_datetimes_to_gpu_format(target_times: &[DateTime<Utc>]) -> Vec<f32> {
     if target_times.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
 
     let base_time = target_times[0];
@@ -48,7 +50,7 @@ fn convert_datetimes_to_gpu_format(target_times: &[DateTime<Utc>]) -> Result<Vec
         gpu_times.push(time_offset);
     }
 
-    Ok(gpu_times)
+    gpu_times
 }
 
 /// Convert GPU results back to Measurements
@@ -69,7 +71,7 @@ fn convert_gpu_results_to_measurements(
 
     let results = gpu_results
         .into_iter()
-        .zip(target_times.into_iter())
+        .zip(target_times)  // Remove .into_iter()
         .map(|(value, timestamp)| {
             let big_decimal_value = BigDecimal::from_f32(value)
                 .unwrap_or_else(|| BigDecimal::from(0));
@@ -106,16 +108,14 @@ async fn get_shared_gpu_instance() -> Result<Arc<GpuLinearInterpolator>> {
             match GpuLinearInterpolator::new().await {
                 Ok(gpu) => Arc::new(Mutex::new(gpu)),
                 Err(e) => {
-                    eprintln!("Failed to initialize GPU: {}", e);
-                    // Return a dummy mutex that will always fail
-                    panic!("GPU initialization failed: {}", e);
+                    eprintln!("Failed to initialize GPU: {e}");
+                    panic!("GPU initialization failed: {e}");
                 }
             }
         })
         .await;
 
     let gpu_guard = instance_mutex.lock().await;
-    // Clone the inner GPU instance, not the Arc<Mutex<>>
     let gpu_clone = (*gpu_guard).clone();
     drop(gpu_guard);
 
@@ -418,37 +418,37 @@ impl GpuLinearInterpolator {
 		Ok(result)
 	}
 
-	/// Interpolate using pre-allocated buffers for reduced overhead
-	fn interpolate_with_reused_buffers(&self, input_times: &[f32], input_values: &[f32], target_times: &[f32], buffers: &GpuBufferSet) -> Result<Vec<f32>> {
-		// Write data to existing buffers
-		self.queue.write_buffer(&buffers.input_times, 0, bytemuck::cast_slice(input_times));
-		self.queue.write_buffer(&buffers.input_values, 0, bytemuck::cast_slice(input_values));
-		self.queue.write_buffer(&buffers.target_times, 0, bytemuck::cast_slice(target_times));
+    /// Interpolate using pre-allocated buffers for reduced overhead
+    fn interpolate_with_reused_buffers(&self, input_times: &[f32], input_values: &[f32], target_times: &[f32], buffers: &GpuBufferSet) -> Result<Vec<f32>> {
+        // Write data to existing buffers
+        self.queue.write_buffer(&buffers.input_times, 0, bytemuck::cast_slice(input_times));
+        self.queue.write_buffer(&buffers.input_values, 0, bytemuck::cast_slice(input_values));
+        self.queue.write_buffer(&buffers.target_times, 0, bytemuck::cast_slice(target_times));
 
-		// Create staging buffer for reading results
-		let output_size = target_times.len() * std::mem::size_of::<f32>();
-		let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-			label: Some("Staging Buffer (Reused)"),
-			size: output_size as u64,
-			usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-			mapped_at_creation: false,
-		});
+        // Create staging buffer for reading results
+        let output_size = std::mem::size_of_val(target_times);  // Fix manual calculation
+        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Staging Buffer (Reused)"),
+            size: output_size as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
-		// Create bind group with reused buffers
-		let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-			label: Some("Linear Interpolation Bind Group (Reused)"),
-			layout: &self.bind_group_layout,
-			entries: &[
-				wgpu::BindGroupEntry { binding: 0, resource: buffers.input_times.as_entire_binding() },
-				wgpu::BindGroupEntry { binding: 1, resource: buffers.input_values.as_entire_binding() },
-				wgpu::BindGroupEntry { binding: 2, resource: buffers.target_times.as_entire_binding() },
-				wgpu::BindGroupEntry { binding: 3, resource: buffers.output.as_entire_binding() },
-			],
-		});
+        // Create bind group with reused buffers
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Linear Interpolation Bind Group (Reused)"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: buffers.input_times.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: buffers.input_values.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: buffers.target_times.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: buffers.output.as_entire_binding() },
+            ],
+        });
 
-		// Execute compute pass
-		let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-			label: Some("Linear Interpolation Encoder (Reused)"),
+        // Execute compute pass
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Linear Interpolation Encoder (Reused)"),
 		});
 
 		{
@@ -509,6 +509,7 @@ impl GpuLinearInterpolator {
 	}
 
 	/// Pre-allocate GPU buffers to reduce memory allocation overhead
+	#[must_use]
 	pub fn create_optimized_buffers(&self, max_size: usize) -> GpuBufferSet {
 		let buffer_size = (max_size * std::mem::size_of::<f32>()) as u64;
 		let large_buffer_size = (max_size * 4 * std::mem::size_of::<f32>()) as u64; // 4x for dense output
@@ -580,9 +581,9 @@ pub async fn gpu_linear_interpolate_optimized(
     let mut sorted_measurements = measurements;
     sorted_measurements.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
 
-    // Convert to GPU format with validation
-    let (input_times, input_values) = convert_measurements_to_gpu_format(&sorted_measurements)?;
-    let gpu_target_times = convert_datetimes_to_gpu_format(&target_times)?;
+    // Convert to GPU format without Result wrapping
+    let (input_times, input_values) = convert_measurements_to_gpu_format(&sorted_measurements);
+    let gpu_target_times = convert_datetimes_to_gpu_format(&target_times);
 
     // For large datasets, create optimized buffers
     let optimized_buffers = if target_times.len() > 10_000 {

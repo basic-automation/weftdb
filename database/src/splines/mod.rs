@@ -48,6 +48,28 @@ pub enum SplineType {
     Polynomial(usize),
 }
 
+impl SplineType {
+    #[must_use]
+    pub const fn degree(&self) -> usize {
+        match self {
+            Self::Linear => 1,
+            Self::Quadratic => 2,
+            Self::Cubic => 3,
+            Self::Polynomial(degree) => *degree,
+        }
+    }
+
+    #[must_use]
+    pub const fn number_of_points_required(&self) -> usize {
+        match self {
+            Self::Linear => 2,
+            Self::Quadratic => 3,
+            Self::Cubic => 4,
+            Self::Polynomial(degree) => *degree + 1, // Degree n requires n+1 points
+        }
+    }
+}
+
 /// Apply fast path optimization to spline types based on dataset characteristics
 ///
 /// This function automatically downgrades complex spline types to simpler ones

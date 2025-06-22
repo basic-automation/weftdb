@@ -224,7 +224,7 @@ fn simd_quadratic_interpolate(input_times: &[f64], input_values: &[f64], target_
             let l1 = ((target_time - t0) * (target_time - t2)) / denom1;
             let l2 = ((target_time - t0) * (target_time - t1)) / denom2;
 
-            result_array[lane] = v0 * l0 + v1 * l1 + v2 * l2;
+            result_array[lane] = v2.mul_add(l2, v0.mul_add(l0, v1 * l1));
         }
     }
 

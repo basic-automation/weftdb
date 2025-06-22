@@ -9,15 +9,20 @@ use super::linear::linear;
 use super::quadratic::quadratic;
 use super::cubic::cubic;
 
-/// Polynomial interpolation using Lagrange interpolation
+/// Polynomial interpolation using Lagrange interpolation method
 ///
 /// # Errors
 ///
 /// Returns an error if:
-/// - Insufficient measurements (< degree + 1 points)
-/// - Invalid degree (> measurements.len() - 1)
-/// - Timestamp conversion fails
-/// - BigDecimal operations fail
+/// - Insufficient measurements for interpolation
+/// - Invalid degree (> `measurements.len()` - 1)
+/// - Time range validation fails
+/// - `BigDecimal` operations fail
+///
+/// # Panics
+///
+/// Panics if distance comparison fails during nearest neighbor selection
+#[allow(clippy::cast_precision_loss)]
 pub fn polynomial(measurements: Vec<Measurement>, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, degree: usize) -> Result<Vec<Measurement>> {
     if measurements.is_empty() {
         return Ok(Vec::new());

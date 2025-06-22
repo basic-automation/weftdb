@@ -206,7 +206,42 @@ impl DB {
         Ok(interpolated)
     }
 
-	
+    /// Gets a single interpolated measurement at a specific time point
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - No measurements found for the dataset
+    /// - Insufficient measurements for interpolation
+    /// - Interpolation fails
+    /// - No measurement found at the target time
+    pub async fn get_interpolated_measurement_by_time(&self, subject_name: &str, dataset_id: Uuid, time: chrono::DateTime<chrono::Utc>, resolution: Resolution, spline_type: SplineType) -> Result<Measurement> {
+        let measurements = self.get_measurements_by_dataset_id(subject_name, dataset_id).await?;
+        if measurements.is_empty() {
+            return Err(anyhow::anyhow!("No measurements found for dataset {dataset_id}"));
+        }
+
+        // Get appropriate number of measurements around the target time for the spline type
+        let num_required_measurements = spline_type.number_of_points_required();
+        let relevant_measurements = measurements.iter()
+            .filter(|m| m.timestamp >= time - chrono::Duration::minutes(5) && m.timestamp <= time + chrono::Duration::minutes(5))
+            .take(num_required_measurements)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if relevant_measurements.len() < num_required_measurements {
+            return Err(anyhow::anyhow!("Not enough measurements available for interpolation at time {time}"));
+        }
+
+        // Use async interpolation with GPU support
+        let interpolated = splines::auto_interpolate(relevant_measurements, time - chrono::Duration::minutes(5), time + chrono::Duration::minutes(5), resolution, spline_type).await?;
+        
+        // Use map_or_else instead of if let/else
+        interpolated.into_iter().find(|m| m.timestamp == time).map_or_else(
+            || Err(anyhow::anyhow!("No measurement found at time {time}")),
+            Ok
+        )
+    }
 
     /// Gets performance statistics including GPU utilization
     pub async fn get_performance_stats(&self) -> HashMap<String, String> {
