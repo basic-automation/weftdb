@@ -229,15 +229,6 @@ impl DatabaseCache {
 			}
 		}
 	}
-
-	/// Evict the oldest entry from a subject's cache
-	#[allow(dead_code)]
-	fn evict_oldest_entry(subject_datasets: &mut HashMap<Uuid, CacheEntry>, subject_names: &mut HashMap<String, Uuid>) {
-		if let Some((oldest_id, oldest_name)) = subject_datasets.iter().min_by_key(|(_, entry)| entry.last_accessed).map(|(id, entry)| (*id, entry.dataset.name.clone())) {
-			subject_datasets.remove(&oldest_id);
-			subject_names.remove(&oldest_name);
-		}
-	}
 }
 
 impl Default for DatabaseCache {

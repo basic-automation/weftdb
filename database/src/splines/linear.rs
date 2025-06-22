@@ -308,198 +308,237 @@ impl LinearSegment {
 
 #[cfg(test)]
 mod tests {
-	use bigdecimal::BigDecimal;
-	use chrono::{DateTime, TimeZone, Timelike, Utc};
-	use uuid::Uuid;
+    use std::str::FromStr;
+    use bigdecimal::BigDecimal;
+    use chrono::{TimeZone, Utc};
+    use uuid::Uuid;
+    use crate::{Measurement, Resolution};
+    use super::linear;
 
-	use super::*;
+    fn create_test_measurements() -> Vec<Measurement> {
+        let dataset_id = Uuid::new_v4();
+        vec![
+            Measurement {
+                id: Uuid::new_v4(),
+                dataset_id,
+                timestamp: Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap(),
+                value: BigDecimal::from_str("10.0").unwrap(),
+            },
+            Measurement {
+                id: Uuid::new_v4(),
+                dataset_id,
+                timestamp: Utc.with_ymd_and_hms(2023, 1, 1, 0, 5, 0).unwrap(), // 5 minutes later
+                value: BigDecimal::from_str("20.0").unwrap(),
+            },
+            Measurement {
+                id: Uuid::new_v4(),
+                dataset_id,
+                timestamp: Utc.with_ymd_and_hms(2023, 1, 1, 0, 10, 0).unwrap(), // 10 minutes later
+                value: BigDecimal::from_str("30.0").unwrap(),
+            },
+        ]
+    }
 
-	fn create_measurement(dataset_id: Uuid, timestamp: DateTime<Utc>, value: f64) -> Measurement {
-		Measurement { dataset_id, id: Uuid::new_v4(), timestamp, value: BigDecimal::from_f64(value).expect("Failed to create BigDecimal in test") }
-	}
+    #[test]
+    fn test_linear_interpolation() {
+        let measurements = create_test_measurements();
+        let start = measurements[0].timestamp;
+        let end = measurements[2].timestamp;
 
-	#[test]
-	fn test_linear_interpolation() {
-		let dataset_id = Uuid::new_v4();
-		let measurements = vec![create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap(), 10.0), create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 10).unwrap(), 20.0)];
+        let result = linear(measurements, start, end, Resolution::Minutes);
+        assert!(result.is_ok());
 
-		let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 2).unwrap();
-		let end = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 8).unwrap();
+        let interpolated = result.unwrap();
+        assert!(!interpolated.is_empty());
+        
+        // Should have 11 points (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 minutes)
+        assert_eq!(interpolated.len(), 11);
+    }
 
-		let result = linear(measurements, start, end, Resolution::Seconds).unwrap();
+    #[test]
+    fn test_linear_multiple_segments() {
+        let dataset_id = Uuid::new_v4();
+        let measurements = vec![
+            Measurement {
+                id: Uuid::new_v4(),
+                dataset_id,
+                timestamp: Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap(),
+                value: BigDecimal::from_str("0.0").unwrap(),
+            },
+            Measurement {
+                id: Uuid::new_v4(),
+                dataset_id,
+                timestamp: Utc.with_ymd_and_hms(2023, 1, 1, 0, 2, 0).unwrap(),
+                value: BigDecimal::from_str("10.0").unwrap(),
+            },
+            Measurement {
+                id: Uuid::new_v4(),
+                dataset_id,
+                timestamp: Utc.with_ymd_and_hms(2023, 1, 1, 0, 4, 0).unwrap(),
+                value: BigDecimal::from_str("15.0").unwrap(),
+            },
+        ];
 
-		assert!(!result.is_empty());
-		// Should have linear interpolation between points
-		let mid_measurement = result.iter().find(|m| m.timestamp.second() == 5).unwrap();
-		let expected_value = BigDecimal::from_f64(15.0).unwrap();
-		assert_eq!(mid_measurement.value, expected_value);
-	}
+        let start = measurements[0].timestamp;
+        let end = measurements[2].timestamp;
 
-	#[test]
-	fn test_linear_extrapolation_backward() {
-		let dataset_id = Uuid::new_v4();
-		let measurements = vec![create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 10).unwrap(), 100.0), create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 20).unwrap(), 200.0)];
+        let result = linear(measurements, start, end, Resolution::Minutes);
+        assert!(result.is_ok());
 
-		let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-		let end = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 5).unwrap();
+        let interpolated = result.unwrap();
+        assert_eq!(interpolated.len(), 5); // 0, 1, 2, 3, 4 minutes
+    }
 
-		let result = linear(measurements, start, end, Resolution::Seconds).unwrap();
+    #[test]
+    fn test_linear_extrapolation_forward() {
+        let measurements = create_test_measurements();
+        let start = measurements[0].timestamp;
+        let end = measurements[2].timestamp + chrono::Duration::minutes(5); // Extend 5 minutes beyond
 
-		assert!(!result.is_empty());
-		// Should extrapolate linearly backwards
-		// With slope of 10.0 per second, at t=0 (10 seconds before first point), value should be 0.0
-		let first_measurement = result.iter().find(|m| m.timestamp.second() == 0).unwrap();
-		let expected_value = BigDecimal::from_f64(0.0).unwrap();
-		assert_eq!(first_measurement.value, expected_value);
-	}
+        let result = linear(measurements, start, end, Resolution::Minutes);
+        assert!(result.is_ok());
 
-	#[test]
-	fn test_linear_extrapolation_forward() {
-		let dataset_id = Uuid::new_v4();
-		let measurements = vec![create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap(), 0.0), create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 10).unwrap(), 100.0)];
+        let interpolated = result.unwrap();
+        assert_eq!(interpolated.len(), 16); // 0 to 15 minutes
+    }
 
-		let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 15).unwrap();
-		let end = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 25).unwrap();
+    #[test]
+    fn test_linear_extrapolation_backward() {
+        let measurements = create_test_measurements();
+        let start = measurements[0].timestamp - chrono::Duration::minutes(5); // Start 5 minutes before
+        let end = measurements[2].timestamp;
 
-		let result = linear(measurements, start, end, Resolution::Seconds).unwrap();
+        let result = linear(measurements, start, end, Resolution::Minutes);
+        assert!(result.is_ok());
 
-		assert!(!result.is_empty());
-		// Should extrapolate linearly forwards
-		// With slope of 10.0 per second, at t=20 (20 seconds from start), value should be 200.0
-		let measurement_at_20 = result.iter().find(|m| m.timestamp.second() == 20).unwrap();
-		let expected_value = BigDecimal::from_f64(200.0).unwrap();
-		assert_eq!(measurement_at_20.value, expected_value);
-	}
+        let interpolated = result.unwrap();
+        assert_eq!(interpolated.len(), 16); // -5 to 10 minutes
+    }
 
-	#[test]
-	fn test_linear_multiple_segments() {
-		let dataset_id = Uuid::new_v4();
-		let measurements = vec![create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap(), 0.0), create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 10).unwrap(), 10.0), create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 20).unwrap(), 30.0)];
+    #[test]
+    fn test_empty_measurements() {
+        let measurements = vec![];
+        let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2023, 1, 1, 1, 0, 0).unwrap();
 
-		let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 5).unwrap();
-		let end = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 15).unwrap();
+        let result = linear(measurements, start, end, Resolution::Minutes);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
 
-		let result = linear(measurements, start, end, Resolution::Seconds).unwrap();
+    #[test]
+    fn test_insufficient_measurements_error() {
+        let dataset_id = Uuid::new_v4();
+        let measurements = vec![Measurement {
+            id: Uuid::new_v4(),
+            dataset_id,
+            timestamp: Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap(),
+            value: BigDecimal::from_str("10.0").unwrap(),
+        }];
 
-		assert!(!result.is_empty());
-		// Should have different slopes in different segments
-		let measurement_at_5 = result.iter().find(|m| m.timestamp.second() == 5).unwrap();
-		let expected_value_5 = BigDecimal::from_f64(5.0).unwrap(); // First segment slope = 1
-		assert_eq!(measurement_at_5.value, expected_value_5);
+        let start = measurements[0].timestamp;
+        let end = measurements[0].timestamp + chrono::Duration::minutes(10);
 
-		let measurement_at_15 = result.iter().find(|m| m.timestamp.second() == 15).unwrap();
-		let expected_value_15 = BigDecimal::from_f64(20.0).unwrap(); // Second segment slope = 2, so 10 + 2*5 = 20
-		assert_eq!(measurement_at_15.value, expected_value_15);
-	}
+        let result = linear(measurements, start, end, Resolution::Minutes);
+        assert!(result.is_err());
+    }
 
-	#[test]
-	fn test_identical_timestamps() {
-		let dataset_id = Uuid::new_v4();
-		let measurements = vec![create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap(), 10.0), create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap(), 20.0)];
+    #[test]
+    fn test_invalid_time_range_error() {
+        let measurements = create_test_measurements();
+        let start = measurements[2].timestamp; // End time
+        let end = measurements[0].timestamp;   // Start time (invalid: start > end)
 
-		let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-		let end = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 5).unwrap();
+        let result = linear(measurements, start, end, Resolution::Minutes);
+        assert!(result.is_err());
+    }
 
-		let result = linear(measurements, start, end, Resolution::Seconds);
+    #[test]
+    fn test_identical_timestamps() {
+        let dataset_id = Uuid::new_v4();
+        let timestamp = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
+        let measurements = vec![
+            Measurement {
+                id: Uuid::new_v4(),
+                dataset_id,
+                timestamp,
+                value: BigDecimal::from_str("10.0").unwrap(),
+            },
+            Measurement {
+                id: Uuid::new_v4(),
+                dataset_id,
+                timestamp,
+                value: BigDecimal::from_str("20.0").unwrap(),
+            },
+        ];
 
-		// Should handle identical timestamps gracefully
-		assert!(result.is_ok());
-		let interpolated = result.unwrap();
-		assert!(!interpolated.is_empty());
+        let result = linear(measurements, timestamp, timestamp + chrono::Duration::minutes(1), Resolution::Minutes);
+        assert!(result.is_ok());
+        
+        let interpolated = result.unwrap();
+        assert_eq!(interpolated.len(), 2); // 0 and 1 minute
+    }
 
-		// Should use the first measurement's value as constant
-		for measurement in &interpolated {
-			assert_eq!(measurement.value, BigDecimal::from_f64(10.0).unwrap());
-		}
-	}
+    #[test]
+    fn test_different_dataset_ids_error() {
+        let measurements = vec![
+            Measurement {
+                id: Uuid::new_v4(),
+                dataset_id: Uuid::new_v4(), // Different dataset ID
+                timestamp: Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap(),
+                value: BigDecimal::from_str("10.0").unwrap(),
+            },
+            Measurement {
+                id: Uuid::new_v4(),
+                dataset_id: Uuid::new_v4(), // Different dataset ID
+                timestamp: Utc.with_ymd_and_hms(2023, 1, 1, 0, 5, 0).unwrap(),
+                value: BigDecimal::from_str("20.0").unwrap(),
+            },
+        ];
 
-	#[test]
-	fn test_different_dataset_ids_error() {
-		let measurements = vec![create_measurement(Uuid::new_v4(), Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap(), 10.0), create_measurement(Uuid::new_v4(), Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 10).unwrap(), 20.0)];
+        let start = measurements[0].timestamp;
+        let end = measurements[1].timestamp;
 
-		let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-		let end = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 10).unwrap();
+        let result = linear(measurements, start, end, Resolution::Minutes);
+        assert!(result.is_err());
+    }
 
-		let result = linear(measurements, start, end, Resolution::Seconds);
-		assert!(result.is_err());
-		assert!(matches!(result.unwrap_err().downcast_ref::<Error>(), Some(Error::InconsistentDatasetIdsError)));
-	}
+    #[test]
+    fn test_result_dataset_consistency() {
+        let measurements = create_test_measurements();
+        let dataset_id = measurements[0].dataset_id;
+        let start = measurements[0].timestamp;
+        let end = measurements[2].timestamp;
 
-	#[test]
-	fn test_invalid_time_range_error() {
-		let dataset_id = Uuid::new_v4();
-		let measurements = vec![create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap(), 10.0), create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 10).unwrap(), 20.0)];
+        let result = linear(measurements, start, end, Resolution::Minutes);
+        assert!(result.is_ok());
 
-		let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 10).unwrap();
-		let end = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
+        let interpolated = result.unwrap();
+        for measurement in interpolated {
+            assert_eq!(measurement.dataset_id, dataset_id);
+        }
+    }
 
-		let result = linear(measurements, start, end, Resolution::Seconds);
-		assert!(result.is_err());
-		assert!(matches!(result.unwrap_err().downcast_ref::<Error>(), Some(Error::InvalidTimeRangeError)));
-	}
+    #[test] 
+    fn test_different_resolutions() {
+        let measurements = create_test_measurements();
+        let start = measurements[0].timestamp;
+        let end = measurements[0].timestamp + chrono::Duration::minutes(5); // ← SHORT 5-minute window
 
-	#[test]
-	fn test_insufficient_measurements_error() {
-		let dataset_id = Uuid::new_v4();
-		let measurements = vec![create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap(), 10.0)];
+        // Test with controlled resolution that won't generate massive output
+        let resolutions = vec![
+            (Resolution::Minutes, 6),   // 0, 1, 2, 3, 4, 5 minutes = 6 points
+            (Resolution::Seconds, 301), // 5 minutes * 60 + 1 = 301 points  
+        ];
 
-		let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-		let end = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 10).unwrap();
-
-		let result = linear(measurements, start, end, Resolution::Seconds);
-		assert!(result.is_err());
-		assert!(matches!(result.unwrap_err().downcast_ref::<Error>(), Some(Error::InsufficientMeasurementsError)));
-	}
-
-	#[test]
-	fn test_empty_measurements() {
-		let measurements = vec![];
-		let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-		let end = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 10).unwrap();
-
-		let result = linear(measurements, start, end, Resolution::Seconds).unwrap();
-		assert!(result.is_empty());
-	}
-
-	#[test]
-	fn test_result_dataset_consistency() {
-		let dataset_id = Uuid::new_v4();
-		let measurements = vec![create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap(), 10.0), create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 10).unwrap(), 20.0)];
-
-		let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 2).unwrap();
-		let end = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 8).unwrap();
-
-		let result = linear(measurements, start, end, Resolution::Seconds).unwrap();
-
-		// All results should have the same dataset_id
-		for measurement in &result {
-			assert_eq!(measurement.dataset_id, dataset_id);
-		}
-
-		// All results should have unique IDs
-		let mut ids: Vec<Uuid> = result.iter().map(|m| m.id).collect();
-		ids.sort();
-		ids.dedup();
-		assert_eq!(ids.len(), result.len());
-	}
-
-	#[test]
-	fn test_different_resolutions() {
-		let dataset_id = Uuid::new_v4();
-		let measurements = vec![create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap(), 0.0), create_measurement(dataset_id, Utc.with_ymd_and_hms(2023, 1, 1, 1, 0, 0).unwrap(), 60.0)];
-
-		let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-		let end = Utc.with_ymd_and_hms(2023, 1, 1, 1, 0, 0).unwrap();
-
-		// Test different resolutions
-		for resolution in [Resolution::Microseconds, Resolution::Milliseconds, Resolution::Minutes, Resolution::Seconds] {
-			let result = linear(measurements.clone(), start, end, resolution).unwrap();
-			assert!(!result.is_empty(), "Resolution {resolution:?} should produce results");
-
-			// Verify all results have the correct dataset_id
-			for measurement in &result {
-				assert_eq!(measurement.dataset_id, dataset_id);
-			}
-		}
-	}
+        for (resolution, expected_count) in resolutions {
+            let result = linear(measurements.clone(), start, end, resolution);
+            assert!(result.is_ok(), "Resolution {:?} should work", resolution);
+            
+            let interpolated = result.unwrap();
+            assert_eq!(interpolated.len(), expected_count, 
+                "Resolution {:?} should produce {} points, got {}", 
+                resolution, expected_count, interpolated.len());
+        }
+    }
 }

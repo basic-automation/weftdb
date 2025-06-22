@@ -9,15 +9,10 @@ pub mod linear;
 pub mod parallel;
 pub mod polynomial;
 pub mod quadratic;
-pub mod simd; // Add simd module // Add parallel module
+pub mod simd;
 
-// Re-export spline functions for convenience
-pub use cubic::cubic;
-pub use gpu::{gpu_linear_interpolate_optimized, gpu_linear_interpolate_with_fallback}; // ← Fixed import
-pub use linear::linear;
-pub use parallel::{fast_path_interpolate, optimized_interpolate};
-pub use polynomial::polynomial;
-pub use quadratic::quadratic;
+// Only export the main async interpolation function
+pub use auto_interpolate_async as auto_interpolate;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolution {
@@ -47,10 +42,10 @@ impl Resolution {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplineType {
-	Linear,
-	Quadratic,
-	Cubic,
-	Polynomial(usize),
+    Linear,
+    Quadratic,
+    Cubic,
+    Polynomial(usize),
 }
 
 /// Apply fast path optimization to spline types based on dataset characteristics
@@ -67,54 +62,53 @@ pub enum SplineType {
 /// Optimized spline type that provides better performance characteristics
 #[must_use]
 pub fn apply_fast_path_optimization(spline_type: SplineType, measurement_count: usize, _complexity_factor: usize) -> SplineType {
-	match spline_type {
-		// Linear always stays linear - it's already optimal
-		SplineType::Linear => SplineType::Linear,
+    match spline_type {
+        // Linear always stays linear - it's already optimal
+        SplineType::Linear => SplineType::Linear,
 
-		// Quadratic optimizations
-		SplineType::Quadratic => {
-			if measurement_count > 5000 {
-				// Very large datasets: degrade to linear for speed
-				SplineType::Linear
-			} else {
-				SplineType::Quadratic
-			}
-		}
+        // Quadratic optimizations
+        SplineType::Quadratic => {
+            if measurement_count > 5000 {
+                // Very large datasets: degrade to linear for speed
+                SplineType::Linear
+            } else {
+                SplineType::Quadratic
+            }
+        }
 
-		// Cubic optimizations - FIXED: Use >= instead of >
-		SplineType::Cubic => {
-			if measurement_count > 5000 {
-				// Very large datasets: degrade to linear
-				SplineType::Linear
-			} else if measurement_count >= 2500 {
-				// ← FIXED: Changed > to >=
-				// Large datasets: degrade to quadratic
-				SplineType::Quadratic
-			} else {
-				SplineType::Cubic
-			}
-		}
+        // Cubic optimizations
+        SplineType::Cubic => {
+            if measurement_count > 5000 {
+                // Very large datasets: degrade to linear
+                SplineType::Linear
+            } else if measurement_count >= 2500 {
+                // Large datasets: degrade to quadratic
+                SplineType::Quadratic
+            } else {
+                SplineType::Cubic
+            }
+        }
 
-		// Polynomial optimizations
-		SplineType::Polynomial(degree) => {
-			if degree > 5 || measurement_count > 1000 {
-				// High degree or large datasets: degrade to quadratic
-				SplineType::Quadratic
-			} else if measurement_count > 3000 {
-				// Very large datasets: degrade to linear
-				SplineType::Linear
-			} else if degree <= 2 {
-				// Low degree: use quadratic
-				SplineType::Quadratic
-			} else if degree == 3 {
-				// Degree 3: use cubic
-				SplineType::Cubic
-			} else {
-				// Moderate degree: keep as polynomial but limit degree
-				SplineType::Polynomial(degree.min(4))
-			}
-		}
-	}
+        // Polynomial optimizations
+        SplineType::Polynomial(degree) => {
+            if degree > 5 || measurement_count > 1000 {
+                // High degree or large datasets: degrade to quadratic
+                SplineType::Quadratic
+            } else if measurement_count > 3000 {
+                // Very large datasets: degrade to linear
+                SplineType::Linear
+            } else if degree <= 2 {
+                // Low degree: use quadratic
+                SplineType::Quadratic
+            } else if degree == 3 {
+                // Degree 3: use cubic
+                SplineType::Cubic
+            } else {
+                // Moderate degree: keep as polynomial but limit degree
+                SplineType::Polynomial(degree.min(4))
+            }
+        }
+    }
 }
 
 /// Apply streaming interpolation for very large datasets
@@ -130,137 +124,75 @@ pub fn apply_fast_path_optimization(spline_type: SplineType, measurement_count: 
 /// - Underlying interpolation fails
 /// - Chunk size is invalid
 pub fn streaming_interpolate(measurements: Vec<Measurement>, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, spline_type: SplineType, chunk_size: usize) -> Result<Vec<Measurement>> {
-	if measurements.is_empty() {
-		return Err(Error::InsufficientMeasurementsError.into());
-	}
+    if measurements.is_empty() {
+        return Err(Error::InsufficientMeasurementsError.into());
+    }
 
-	if start >= end {
-		return Err(Error::InvalidTimeRangeError.into());
-	}
+    if start >= end {
+        return Err(Error::InvalidTimeRangeError.into());
+    }
 
-	if chunk_size == 0 {
-		return Err(anyhow::anyhow!("Chunk size must be greater than 0"));
-	}
+    if chunk_size == 0 {
+        return Err(anyhow::anyhow!("Chunk size must be greater than 0"));
+    }
 
-	// For very large datasets, use chunked processing
-	if measurements.len() <= chunk_size * 2 {
-		// Not large enough to benefit from streaming, use regular optimized interpolation
-		return parallel::optimized_interpolate(measurements, start, end, resolution, spline_type);
-	}
+    // For very large datasets, use chunked processing
+    if measurements.len() <= chunk_size * 2 {
+        // Not large enough to benefit from streaming, use regular optimized interpolation
+        return parallel::optimized_interpolate(measurements, start, end, resolution, spline_type);
+    }
 
-	// Apply fast path optimization to the spline type
-	let optimized_spline_type = apply_fast_path_optimization(spline_type, measurements.len(), 1);
+    // Apply fast path optimization to the spline type
+    let optimized_spline_type = apply_fast_path_optimization(spline_type, measurements.len(), 1);
 
-	// Generate all target times
-	let target_times = generate_target_times(start, end, resolution);
+    // Generate all target times
+    let target_times = generate_target_times(start, end, resolution);
 
-	// Process in chunks with overlap to ensure continuity
-	let overlap_size = chunk_size / 10; // 10% overlap
-	let mut results = Vec::new();
+    // Process in chunks with overlap to ensure continuity
+    let overlap_size = chunk_size / 10; // 10% overlap
+    let mut results = Vec::new();
 
-	for chunk_start in (0..target_times.len()).step_by(chunk_size - overlap_size) {
-		let chunk_end = (chunk_start + chunk_size).min(target_times.len());
-		let chunk_target_times = &target_times[chunk_start..chunk_end];
+    for chunk_start in (0..target_times.len()).step_by(chunk_size - overlap_size) {
+        let chunk_end = (chunk_start + chunk_size).min(target_times.len());
+        let chunk_target_times = &target_times[chunk_start..chunk_end];
 
-		if chunk_target_times.is_empty() {
-			continue;
-		}
+        if chunk_target_times.is_empty() {
+            continue;
+        }
 
-		let chunk_start_time = chunk_target_times[0];
-		let chunk_end_time = chunk_target_times[chunk_target_times.len() - 1];
+        let chunk_start_time = chunk_target_times[0];
+        let chunk_end_time = chunk_target_times[chunk_target_times.len() - 1];
 
-		// Filter measurements relevant to this chunk (with some buffer)
-		let buffer_duration = resolution.to_step() * 5; // 5-step buffer
-		let chunk_measurements: Vec<Measurement> = measurements.iter().filter(|m| m.timestamp >= (chunk_start_time - buffer_duration) && m.timestamp <= (chunk_end_time + buffer_duration)).cloned().collect();
+        // Filter measurements relevant to this chunk (with some buffer)
+        let buffer_duration = resolution.to_step() * 5; // 5-step buffer
+        let chunk_measurements: Vec<Measurement> = measurements.iter().filter(|m| m.timestamp >= (chunk_start_time - buffer_duration) && m.timestamp <= (chunk_end_time + buffer_duration)).cloned().collect();
 
-		if chunk_measurements.len() < 2 {
-			// Not enough measurements for this chunk, skip
-			continue;
-		}
+        if chunk_measurements.len() < 2 {
+            // Not enough measurements for this chunk, skip
+            continue;
+        }
 
-		// Interpolate this chunk
-		let chunk_result = parallel::optimized_interpolate(chunk_measurements, chunk_start_time, chunk_end_time, resolution, optimized_spline_type)?;
+        // Interpolate this chunk
+        let chunk_result = parallel::optimized_interpolate(chunk_measurements, chunk_start_time, chunk_end_time, resolution, optimized_spline_type)?;
 
-		// Add to results, avoiding duplicates from overlap
-		if chunk_start == 0 {
-			results.extend(chunk_result);
-		} else {
-			// Skip overlap points that were already processed
-			let skip_count = overlap_size.min(chunk_result.len());
-			results.extend(chunk_result.into_iter().skip(skip_count));
-		}
-	}
+        // Add to results, avoiding duplicates from overlap
+        if chunk_start == 0 {
+            results.extend(chunk_result);
+        } else {
+            // Skip overlap points that were already processed
+            let skip_count = overlap_size.min(chunk_result.len());
+            results.extend(chunk_result.into_iter().skip(skip_count));
+        }
+    }
 
-	Ok(results)
+    Ok(results)
 }
 
-/// Parameters for strategy selection
-#[derive(Debug, Clone)]
-pub struct InterpolationParams {
-	pub measurements: Vec<Measurement>,
-	pub start: DateTime<Utc>,
-	pub end: DateTime<Utc>,
-	pub resolution: Resolution,
-	pub spline_type: SplineType,
-}
-
-/// Select optimal interpolation strategy (sync version)
-fn select_optimal_strategy_sync(params: InterpolationParams) -> Result<Vec<Measurement>> {
-	// Simple strategy selection based on measurement count
-	let measurement_count = params.measurements.len();
-
-	if measurement_count > 10_000 {
-		// Use parallel processing for large datasets
-		auto_interpolate(params.measurements, params.start, params.end, params.resolution, params.spline_type)
-	} else if measurement_count > 1_000 {
-		// Use optimized algorithms for medium datasets
-		auto_interpolate(params.measurements, params.start, params.end, params.resolution, params.spline_type)
-	} else {
-		// Use direct algorithms for small datasets
-		match params.spline_type {
-			SplineType::Linear => linear::linear(params.measurements, params.start, params.end, params.resolution),
-			SplineType::Quadratic => quadratic::quadratic(params.measurements, params.start, params.end, params.resolution),
-			SplineType::Cubic => cubic::cubic(params.measurements, params.start, params.end, params.resolution),
-			SplineType::Polynomial(degree) => polynomial::polynomial(params.measurements, params.start, params.end, params.resolution, degree),
-		}
-	}
-}
-
-/// Automatic interpolation with optimal algorithm selection
+/// Main async interpolation function with GPU acceleration support
 ///
-/// # Errors
-///
-/// Returns an error if:
-/// - Insufficient measurements for interpolation
-/// - Invalid time range
-/// - Interpolation algorithm fails
-pub fn auto_interpolate(measurements: Vec<Measurement>, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, spline_type: SplineType) -> Result<Vec<Measurement>> {
-	// Input validation
-	if measurements.is_empty() {
-		return Err(Error::InsufficientMeasurementsError.into());
-	}
-
-	if start >= end {
-		return Err(Error::InvalidTimeRangeError.into());
-	}
-
-	// Check dataset ID consistency
-	let dataset_id = measurements[0].dataset_id;
-	if !measurements.iter().all(|m| m.dataset_id == dataset_id) {
-		return Err(Error::InconsistentDatasetIdsError.into());
-	}
-
-	// Apply fast path optimization
-	let optimized_spline_type = apply_fast_path_optimization(spline_type, measurements.len(), 1);
-
-	// Create parameters for strategy selection
-	let params = InterpolationParams { measurements, start, end, resolution, spline_type: optimized_spline_type };
-
-	// Use strategy selection
-	select_optimal_strategy_sync(params)
-}
-
-/// Async automatic interpolation with GPU acceleration support
+/// This is the primary entry point for all interpolation operations in the library.
+/// It automatically selects the optimal interpolation strategy (GPU, CPU, SIMD, Parallel)
+/// based on dataset characteristics and performance benchmarks.
 ///
 /// # Errors
 ///
@@ -270,55 +202,34 @@ pub fn auto_interpolate(measurements: Vec<Measurement>, start: DateTime<Utc>, en
 /// - GPU initialization fails (with CPU fallback)
 /// - All interpolation methods fail
 pub async fn auto_interpolate_async(measurements: Vec<Measurement>, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, spline_type: SplineType) -> Result<Vec<Measurement>> {
-	if measurements.is_empty() {
-		return Ok(Vec::new());
-	}
+    if measurements.is_empty() {
+        return Ok(Vec::new());
+    }
 
-	let dataset_id = measurements[0].dataset_id;
-	let estimated_output_points = estimate_output_points(start, end, resolution);
+    let dataset_id = measurements[0].dataset_id;
+    let estimated_output_points = estimate_output_points(start, end, resolution);
 
-	// Use optimized GPU thresholds based on spline type and benchmark results
-	let use_gpu = match spline_type {
-		SplineType::Linear => should_use_gpu_interpolation(measurements.len(), estimated_output_points),
-		SplineType::Quadratic => quadratic::should_use_gpu_quadratic(measurements.len(), estimated_output_points),
-		SplineType::Cubic => cubic::should_use_gpu_cubic(measurements.len(), estimated_output_points),
-		SplineType::Polynomial(degree) => polynomial::should_use_gpu_polynomial(measurements.len(), estimated_output_points, degree),
-	};
+    // Use optimized GPU thresholds based on spline type and benchmark results
+    let use_gpu = match spline_type {
+        SplineType::Linear => should_use_gpu_interpolation(measurements.len(), estimated_output_points),
+        SplineType::Quadratic => quadratic::should_use_gpu_quadratic(measurements.len(), estimated_output_points),
+        SplineType::Cubic => cubic::should_use_gpu_cubic(measurements.len(), estimated_output_points),
+        SplineType::Polynomial(degree) => polynomial::should_use_gpu_polynomial(measurements.len(), estimated_output_points, degree),
+    };
 
-	if use_gpu {
-		//let expected_speedup = get_expected_speedup(measurements.len(), estimated_output_points);
-		//println!("🚀 Using GPU acceleration for {:?}: {} measurements → {} output points ({}x speed boost expected)", spline_type, measurements.len(), estimated_output_points, expected_speedup);
-
-		match spline_type {
-			SplineType::Linear => {
-				let target_times = generate_target_times(start, end, resolution);
-				gpu::gpu_linear_interpolate_with_fallback(measurements, target_times, dataset_id).await
-			}
-			SplineType::Quadratic => quadratic::gpu_quadratic_interpolate_with_fallback(measurements, start, end, resolution, dataset_id).await,
-			SplineType::Cubic => cubic::gpu_cubic_interpolate_with_fallback(measurements, start, end, resolution, dataset_id).await,
-			SplineType::Polynomial(degree) => polynomial::gpu_polynomial_interpolate_with_fallback(measurements, start, end, resolution, dataset_id, degree).await,
-		}
-	} else {
-		// Use CPU for smaller datasets
-		match spline_type {
-			SplineType::Linear => linear::linear(measurements, start, end, resolution),
-			SplineType::Quadratic => quadratic::quadratic(measurements, start, end, resolution),
-			SplineType::Cubic => cubic::cubic(measurements, start, end, resolution),
-			SplineType::Polynomial(degree) => polynomial::polynomial(measurements, start, end, resolution, degree),
-		}
-	}
-}
-
-/// Get expected GPU speedup based on benchmark results
-#[allow(dead_code)]
-const fn get_expected_speedup(measurement_count: usize, output_points: usize) -> &'static str {
-	match (measurement_count, output_points) {
-		// Combine identical speedup categories for better maintainability
-		(5_000..=9_999, 50_000..=99_999) | (25_000..=49_999, 200_000..=299_999) => "1.4x",
-		(10_000..=24_999, 100_000..=199_999) | (50_000..=99_999, 300_000..=499_999) => "4.2x",
-		(100_000.., 500_000..) => "6.0x",
-		_ => "1.3x",
-	}
+    if use_gpu {
+        match spline_type {
+            SplineType::Linear => {
+                let target_times = generate_target_times(start, end, resolution);
+                gpu::gpu_linear_interpolate_with_fallback(measurements, target_times, dataset_id).await
+            }
+            SplineType::Quadratic => quadratic::gpu_quadratic_interpolate_with_fallback(measurements, start, end, resolution, dataset_id).await,
+            SplineType::Cubic => cubic::gpu_cubic_interpolate_with_fallback(measurements, start, end, resolution, dataset_id).await,
+            SplineType::Polynomial(degree) => polynomial::gpu_polynomial_interpolate_with_fallback(measurements, start, end, resolution, dataset_id, degree).await,
+        }
+    } else {
+        parallel::optimized_interpolate_async(measurements, start, end, resolution, spline_type).await
+    }
 }
 
 /// Estimate output points based on time range and resolution (make public)
@@ -368,43 +279,43 @@ fn generate_target_times(start: DateTime<Utc>, end: DateTime<Utc>, resolution: R
 /// Determine if GPU should be used with optimized thresholds
 #[must_use]
 pub fn should_use_gpu_interpolation(measurement_count: usize, estimated_output_points: usize) -> bool {
-	let gpu_score = calculate_gpu_efficiency_score(measurement_count, estimated_output_points);
+    let gpu_score = calculate_gpu_efficiency_score(measurement_count, estimated_output_points);
 
-	// UPDATED: Much lower threshold based on benchmark results showing consistent GPU wins
-	gpu_score > 0.8 && estimated_output_points >= 25_000 && measurement_count >= 1_000
+    // UPDATED: Much lower threshold based on benchmark results showing consistent GPU wins
+    gpu_score > 0.8 && estimated_output_points >= 25_000 && measurement_count >= 1_000
 }
 
 /// Calculate GPU efficiency score with optimized thresholds
 fn calculate_gpu_efficiency_score(measurement_count: usize, estimated_output_points: usize) -> f64 {
-	let base_score = match estimated_output_points {
-		0..=25_000 => 0.4,      // ← UPDATED: Higher base score
-		25_001..=50_000 => 1.2, // ← UPDATED: Strong GPU preference
-		50_001..=100_000 => 1.8,
-		100_001..=500_000 => 2.5,
-		_ => 3.0, // ← UPDATED: Even stronger for very large
-	};
+    let base_score = match estimated_output_points {
+        0..=25_000 => 0.4,      // ← UPDATED: Higher base score
+        25_001..=50_000 => 1.2, // ← UPDATED: Strong GPU preference
+        50_001..=100_000 => 1.8,
+        100_001..=500_000 => 2.5,
+        _ => 3.0, // ← UPDATED: Even stronger for very large
+    };
 
-	// Enhanced bonus for dense output (GPU parallelism advantage)
-	let density_bonus = if measurement_count > 0 {
-		#[allow(clippy::cast_precision_loss)]
-		let output_density = estimated_output_points as f64 / measurement_count as f64;
-		if output_density >= 20.0 {
-			0.4
-		} else if output_density >= 10.0 {
-			0.2
-		} else {
-			0.0
-		}
-	} else {
-		0.0
-	};
+    // Enhanced bonus for dense output (GPU parallelism advantage)
+    let density_bonus = if measurement_count > 0 {
+        #[allow(clippy::cast_precision_loss)]
+        let output_density = estimated_output_points as f64 / measurement_count as f64;
+        if output_density >= 20.0 {
+            0.4
+        } else if output_density >= 10.0 {
+            0.2
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
 
-	// Enhanced bonus for larger input datasets
-	let input_bonus = match measurement_count {
-		1000..=5000 => 0.2,  // ← UPDATED: Higher bonus
-		5001..=10000 => 0.3, // ← UPDATED: Higher bonus
-		_ => 0.4,            // ← UPDATED: Higher bonus
-	};
+    // Enhanced bonus for larger input datasets
+    let input_bonus = match measurement_count {
+        1000..=5000 => 0.2,  // ← UPDATED: Higher bonus
+        5001..=10000 => 0.3, // ← UPDATED: Higher bonus
+        _ => 0.4,            // ← UPDATED: Higher bonus
+    };
 
-	base_score + density_bonus + input_bonus
+    base_score + density_bonus + input_bonus
 }

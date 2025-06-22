@@ -1,614 +1,177 @@
 use anyhow::{Context, Result};
-use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive, Zero};
 use chrono::{DateTime, Utc};
-use uuid::Uuid;
+use std::str::FromStr;
 
-use crate::{splines::gpu::gpu_linear_interpolate_optimized, Error, Measurement, Resolution};
+use crate::{splines::Resolution, Error, Measurement};
 
-/// Performs polynomial interpolation on measurement data.
-///
-/// Takes a vector of `Measurement`, a start date/time, an end date/time, a `Resolution`,
-/// and a polynomial degree, and returns a vector of interpolated or extrapolated measurements
-/// using polynomial interpolation.
-///
-/// The `Resolution` is used to determine the time step for the interpolation or extrapolation.
+// Import the specific functions we need
+use super::linear::linear;
+use super::quadratic::quadratic;
+use super::cubic::cubic;
+
+/// Polynomial interpolation using Lagrange interpolation
 ///
 /// # Errors
 ///
 /// Returns an error if:
-/// - Measurements are empty or have fewer than required points for the degree
-/// - Measurements have inconsistent dataset IDs
-/// - Invalid time range (start >= end)
-/// - Polynomial degree is too high for the number of measurements
-/// - Timestamp conversion or `BigDecimal` operations fail
+/// - Insufficient measurements (< degree + 1 points)
+/// - Invalid degree (> measurements.len() - 1)
+/// - Timestamp conversion fails
+/// - BigDecimal operations fail
 pub fn polynomial(measurements: Vec<Measurement>, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, degree: usize) -> Result<Vec<Measurement>> {
-	if measurements.is_empty() {
-		return Ok(vec![]);
-	}
+    if measurements.is_empty() {
+        return Ok(Vec::new());
+    }
 
-	let dataset_id = measurements[0].dataset_id;
-	if measurements.iter().any(|m| m.dataset_id != dataset_id) {
-		return Err(Error::InconsistentDatasetIdsError.into());
-	}
-	if start >= end {
-		return Err(Error::InvalidTimeRangeError.into());
-	}
-	if measurements.len() < 2 {
-		return Err(Error::InsufficientMeasurementsError.into());
-	}
+    if measurements.len() < degree + 1 {
+        return Err(Error::InsufficientMeasurementsError.into());
+    }
 
-	// Performance guard: limit polynomial degree
-	let effective_degree = limit_polynomial_degree(degree, measurements.len());
+    if start >= end {
+        return Err(Error::InvalidTimeRangeError.into());
+    }
 
-	if effective_degree != degree {
-		//eprintln!("Warning: Polynomial degree limited from {degree} to {effective_degree} for better performance and numerical stability");
-	}
+    // For very high degrees or small datasets, fall back to simpler interpolation
+    if degree > measurements.len() - 1 {
+        return Err(anyhow::anyhow!("Polynomial degree {} is too high for {} measurements", degree, measurements.len()));
+    }
 
-	// Fast path degradation for simple cases
-	if effective_degree <= 1 {
-		return super::linear(measurements, start, end, resolution);
-	}
-	if effective_degree == 2 {
-		return super::quadratic(measurements, start, end, resolution);
-	}
-	if effective_degree == 3 && measurements.len() >= 4 {
-		return super::cubic(measurements, start, end, resolution);
-	}
+    // For lower degrees, use appropriate interpolation
+    match degree {
+        1 => {
+            //println!("🔄 Polynomial degree 1: Using linear interpolation");
+            return linear(measurements, start, end, resolution);
+        }
+        2 => {
+            //println!("🔄 Polynomial degree 2: Using quadratic interpolation");
+            return quadratic(measurements, start, end, resolution);
+        }
+        3 => {
+            //println!("🔄 Polynomial degree 3: Using cubic interpolation");
+            return cubic(measurements, start, end, resolution);
+        }
+        _ => {
+            // Continue with polynomial implementation for degree > 3
+        }
+    }
 
-	// Sort measurements by timestamp
-	let mut sorted_measurements = measurements;
-	sorted_measurements.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    // Generate target times
+    let target_times = super::generate_target_times(start, end, resolution);
+    if target_times.is_empty() {
+        return Ok(Vec::new());
+    }
 
-	// Check for uniform spacing - enables fast path
-	if is_uniformly_spaced(&sorted_measurements) && effective_degree <= 4 {
-		return polynomial_uniform_fast(&sorted_measurements, start, end, resolution, effective_degree, dataset_id);
-	}
+    let dataset_id = measurements[0].dataset_id;
 
-	let step = resolution.to_step();
+    // Convert timestamps to seconds for calculation
+    let base_time = measurements[0].timestamp;
+    let x_values: Vec<f64> = measurements
+        .iter()
+        .map(|m| (m.timestamp - base_time).num_seconds() as f64)
+        .collect();
+    let y_values: Vec<f64> = measurements
+        .iter()
+        .map(|m| {
+            m.value
+                .to_string()
+                .parse::<f64>()
+                .unwrap_or(0.0)
+        })
+        .collect();
 
-	// Build optimized polynomial spline
-	let spline = PolynomialSpline::new(&sorted_measurements, effective_degree)?;
+    let mut results = Vec::new();
 
-	let mut result = Vec::new();
+    for target_time in target_times {
+        if target_time < start || target_time > end {
+            continue;
+        }
 
-	// Pre-compute rounding to avoid repeated calculations
-	let start_millis = start.timestamp_millis();
-	let step_millis = step.num_milliseconds();
-	let start_offset = start_millis % step_millis;
-	let rounded_start = if start_offset == 0 { start } else { start + chrono::TimeDelta::milliseconds(step_millis - start_offset) };
+        let target_x = (target_time - base_time).num_seconds() as f64;
 
-	let end_millis = end.timestamp_millis();
-	let end_offset = end_millis % step_millis;
-	let rounded_end = if end_offset == 0 { end } else { end - chrono::TimeDelta::milliseconds(end_offset) };
+        // Use a subset of points around the target for better numerical stability
+        let max_points = (degree + 1).min(measurements.len());
 
-	// Pre-allocate result vector for better performance - safe casting
-	let time_diff_ms = (rounded_end - rounded_start).num_milliseconds();
-	let estimated_points = if time_diff_ms > 0 {
-		usize::try_from(time_diff_ms / step_millis)
-			.unwrap_or(1000) // Fallback to reasonable default
-			.saturating_add(1)
-	} else {
-		1
-	};
-	result.reserve(estimated_points);
+        // Find the best subset of points around target_x
+        let mut distances: Vec<(usize, f64)> = x_values
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| (i, (x - target_x).abs()))
+            .collect();
+        distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
-	let mut current_time = rounded_start;
+        let indices: Vec<usize> = distances
+            .into_iter()
+            .take(max_points)
+            .map(|(i, _)| i)
+            .collect();
 
-	while current_time <= rounded_end {
-		let value = spline.evaluate(current_time)?;
-		result.push(Measurement { dataset_id, id: Uuid::new_v4(), timestamp: current_time, value });
+        // Perform Lagrange interpolation using the selected points
+        let mut result = 0.0;
+        for (i, &idx_i) in indices.iter().enumerate() {
+            let mut term = y_values[idx_i];
+            for (j, &idx_j) in indices.iter().enumerate() {
+                if i != j {
+                    term *= (target_x - x_values[idx_j]) / (x_values[idx_i] - x_values[idx_j]);
+                }
+            }
+            result += term;
+        }
 
-		current_time += step;
-	}
+        let value = bigdecimal::BigDecimal::from_str(&result.to_string())
+            .context("Failed to convert interpolated value to BigDecimal")?;
 
-	Ok(result)
+        results.push(Measurement {
+            id: uuid::Uuid::new_v4(),
+            dataset_id,
+            timestamp: target_time,
+            value,
+        });
+    }
+
+    Ok(results)
 }
 
-/// Limits polynomial degree based on dataset size and performance considerations
-fn limit_polynomial_degree(requested_degree: usize, measurement_count: usize) -> usize {
-	// Practical limits based on performance and numerical stability
-	let max_degree_by_count = match measurement_count {
-		0..=10 | 1001..=5000 => 2, // Very small and very large: quadratic max
-		11..=50 | 201..=1000 => 3, // Small and large: cubic max
-		51..=200 => 4,             // Medium: quartic max
-		_ => 1,                    // Huge: linear only
-	};
-
-	// Never exceed reasonable computational limits
-	let absolute_max = 6;
-
-	requested_degree.min(max_degree_by_count).min(absolute_max)
+/// Determine if GPU acceleration should be used for polynomial interpolation
+#[must_use]
+pub fn should_use_gpu_polynomial(measurement_count: usize, estimated_output_points: usize, degree: usize) -> bool {
+    // GPU thresholds increase with polynomial degree due to complexity
+    let base_measurement_threshold = 1000 * (degree.max(2));
+    let base_output_threshold = 25000 * (degree.max(2));
+    
+    measurement_count >= base_measurement_threshold && estimated_output_points >= base_output_threshold
 }
 
-/// Fast path for uniformly spaced data using optimized polynomial interpolation
-fn polynomial_uniform_fast(measurements: &[Measurement], start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, degree: usize, dataset_id: Uuid) -> Result<Vec<Measurement>> {
-	let step = resolution.to_step();
-	let mut result = Vec::new();
-
-	// Pre-compute uniform interval
-	let uniform_interval_ms = (measurements[1].timestamp - measurements[0].timestamp).num_milliseconds();
-	let uniform_interval = BigDecimal::from_i64(uniform_interval_ms).context("Failed to convert uniform interval to BigDecimal")?;
-
-	let mut current_time = start;
-	let data_start = measurements[0].timestamp;
-	let data_end = measurements[measurements.len() - 1].timestamp;
-
-	while current_time <= end {
-		let value = if current_time < data_start || current_time > data_end {
-			// Extrapolation - use boundary polynomial segments
-			if current_time < data_start {
-				extrapolate_backward_uniform(measurements, current_time, &uniform_interval, degree)?
-			} else {
-				extrapolate_forward_uniform(measurements, current_time, &uniform_interval, degree)?
-			}
-		} else {
-			// Interpolation - use uniform spacing optimization
-			interpolate_uniform_polynomial(measurements, current_time, &uniform_interval, degree)?
-		};
-
-		result.push(Measurement { dataset_id, id: Uuid::new_v4(), timestamp: current_time, value });
-
-		current_time += step;
-	}
-
-	Ok(result)
-}
-
-/// Optimized uniform polynomial interpolation using Lagrange method
-fn interpolate_uniform_polynomial(measurements: &[Measurement], target_time: DateTime<Utc>, uniform_interval: &BigDecimal, degree: usize) -> Result<BigDecimal> {
-	let data_start = measurements[0].timestamp;
-	let time_from_start = (target_time - data_start).num_milliseconds();
-
-	// Stay in BigDecimal - convert to i64 only when necessary for indexing
-	let uniform_interval_ms = uniform_interval.to_i64().context("Failed to convert uniform interval to i64")?;
-
-	// Find the center point for the interpolation window - safe casting
-	let center_index = if time_from_start >= 0 && uniform_interval_ms > 0 { usize::try_from(time_from_start / uniform_interval_ms).unwrap_or(0).min(measurements.len().saturating_sub(1)) } else { 0 };
-
-	// Select points for polynomial interpolation
-	let points = select_interpolation_points(measurements, center_index, degree);
-
-	// Calculate relative time parameter - stay in BigDecimal
-	let base_time = points[0].timestamp;
-	let time_diff = target_time - base_time;
-	let dt = BigDecimal::from_i64(time_diff.num_milliseconds()).context("Failed to convert time difference to BigDecimal")?;
-	let t = dt / uniform_interval;
-
-	// Use optimized Lagrange interpolation for uniform spacing
-	lagrange_interpolate_uniform(&points, &t, uniform_interval)
-}
-
-/// Select optimal points for polynomial interpolation around a center point
-fn select_interpolation_points(measurements: &[Measurement], center_index: usize, degree: usize) -> Vec<&Measurement> {
-	let n = measurements.len();
-	let num_points = (degree + 1).min(n);
-
-	// Center the interpolation window around the target
-	let half_window = num_points / 2;
-	let start_idx = if center_index >= half_window { (center_index - half_window).min(n - num_points) } else { 0 };
-
-	measurements[start_idx..start_idx + num_points].iter().collect()
-}
-
-/// Optimized Lagrange interpolation for uniformly spaced points - stays in `BigDecimal`
-fn lagrange_interpolate_uniform(points: &[&Measurement], t: &BigDecimal, _uniform_interval: &BigDecimal) -> Result<BigDecimal> {
-	let n = points.len();
-
-	if n == 1 {
-		return Ok(points[0].value.clone());
-	}
-
-	let mut result = BigDecimal::zero();
-
-	// Lagrange interpolation: L(x) = Σ y_i * Π((x - x_j) / (x_i - x_j)) for j ≠ i
-	for (i, point) in points.iter().enumerate().take(n) {
-		let mut term = point.value.clone();
-
-		// Calculate Lagrange basis polynomial L_i(t)
-		for (j, _) in points.iter().enumerate().take(n) {
-			if i != j {
-				// For uniform spacing, x_i = i and x_j = j (normalized) - stay in BigDecimal
-				let i_big = BigDecimal::from_usize(i).context("Failed to convert i to BigDecimal")?;
-				let j_big = BigDecimal::from_usize(j).context("Failed to convert j to BigDecimal")?;
-
-				let numerator = t - &j_big;
-				let denominator = &i_big - &j_big;
-
-				if !denominator.is_zero() {
-					term = term * numerator / denominator;
-				}
-			}
-		}
-
-		result += term;
-	}
-
-	Ok(result)
-}
-
-/// Backward extrapolation for uniform data
-fn extrapolate_backward_uniform(measurements: &[Measurement], target_time: DateTime<Utc>, uniform_interval: &BigDecimal, degree: usize) -> Result<BigDecimal> {
-	// Use first few points for polynomial extrapolation
-	let num_points = (degree + 1).min(measurements.len());
-	let points: Vec<&Measurement> = measurements[0..num_points].iter().collect();
-
-	let base_time = points[0].timestamp;
-	let time_diff = target_time - base_time;
-	let dt = BigDecimal::from_i64(time_diff.num_milliseconds()).context("Failed to convert time difference to BigDecimal")?;
-	let t = dt / uniform_interval;
-
-	lagrange_interpolate_uniform(&points, &t, uniform_interval)
-}
-
-/// Forward extrapolation for uniform data
-fn extrapolate_forward_uniform(measurements: &[Measurement], target_time: DateTime<Utc>, uniform_interval: &BigDecimal, degree: usize) -> Result<BigDecimal> {
-	// Use last few points for polynomial extrapolation
-	let n = measurements.len();
-	let num_points = (degree + 1).min(n);
-	let start_idx = n - num_points;
-	let points: Vec<&Measurement> = measurements[start_idx..n].iter().collect();
-
-	let base_time = points[0].timestamp;
-	let time_diff = target_time - base_time;
-	let dt = BigDecimal::from_i64(time_diff.num_milliseconds()).context("Failed to convert time difference to BigDecimal")?;
-	let t = dt / uniform_interval;
-
-	lagrange_interpolate_uniform(&points, &t, uniform_interval)
-}
-
-/// Check if measurements are uniformly spaced
-fn is_uniformly_spaced(measurements: &[Measurement]) -> bool {
-	if measurements.len() < 3 {
-		return false;
-	}
-
-	let first_interval = measurements[1].timestamp - measurements[0].timestamp;
-	let tolerance = chrono::Duration::milliseconds(50); // Tight tolerance for uniform detection
-
-	measurements.windows(2).all(|pair| {
-		let interval = pair[1].timestamp - pair[0].timestamp;
-		(interval - first_interval).abs() < tolerance
-	})
-}
-
-pub struct PolynomialSpline {
-	measurements: Vec<Measurement>,
-	coefficients: Vec<PolynomialSegment>,
-}
-
-struct PolynomialSegment {
-	coefficients: Vec<BigDecimal>, // Polynomial coefficients [a_n, a_{n-1}, ..., a_1, a_0]
-}
-
-impl PolynomialSpline {
-	/// Creates a new polynomial spline from measurements
-	///
-	/// # Errors
-	///
-	/// Returns an error if:
-	/// - Insufficient measurements for polynomial degree
-	/// - Polynomial coefficient calculation fails
-	/// - Numerical operations encounter errors
-	pub fn new(measurements: &[Measurement], degree: usize) -> Result<Self> {
-		let n = measurements.len();
-		if n < 2 {
-			return Err(Error::InsufficientMeasurementsError.into());
-		}
-
-		// Limit the effective degree to prevent performance issues
-		let effective_degree = degree.min(n - 1).min(6); // Never exceed degree 6
-
-		let mut coefficients = Vec::with_capacity(n - 1);
-
-		// Pre-compute all segments for better cache locality
-		for i in 0..n - 1 {
-			let segment = Self::fit_polynomial_segment(measurements, i, effective_degree)?;
-			coefficients.push(segment);
-		}
-
-		Ok(Self { measurements: measurements.to_vec(), coefficients })
-	}
-
-	/// Fit a polynomial segment using local points with optimized point selection
-	fn fit_polynomial_segment(measurements: &[Measurement], segment_idx: usize, degree: usize) -> Result<PolynomialSegment> {
-		let n = measurements.len();
-		let num_points = (degree + 1).min(n);
-
-		// Select points centered around the segment for better numerical stability
-		let points = if segment_idx == 0 {
-			// Use first few points
-			&measurements[0..num_points]
-		} else if segment_idx >= n - 2 {
-			// Use last few points
-			&measurements[n - num_points..n]
-		} else {
-			// Center around the segment
-			let center = segment_idx + 1;
-			let half_window = num_points / 2;
-			let start = center.saturating_sub(half_window);
-			let end = (start + num_points).min(n);
-			let adjusted_start = end - num_points;
-			&measurements[adjusted_start..end]
-		};
-
-		// Use Lagrange interpolation for numerical stability
-		let coefficients = Self::lagrange_coefficients(points)?;
-
-		Ok(PolynomialSegment { coefficients })
-	}
-
-	/// Calculate polynomial coefficients using Lagrange interpolation
-	fn lagrange_coefficients(points: &[Measurement]) -> Result<Vec<BigDecimal>> {
-		let n = points.len();
-		let degree = n - 1;
-
-		// For small degrees, use optimized direct calculation
-		match degree {
-			0 => Ok(vec![points[0].value.clone()]),
-			1 => Self::linear_coefficients(points),
-			2 => Self::quadratic_coefficients(points),
-			_ => Self::general_lagrange_coefficients(points),
-		}
-	}
-
-	/// Optimized linear coefficient calculation
-	fn linear_coefficients(points: &[Measurement]) -> Result<Vec<BigDecimal>> {
-		let x0 = BigDecimal::from_i64(points[0].timestamp.timestamp_millis()).context("Failed to convert timestamp to BigDecimal")?;
-		let x1 = BigDecimal::from_i64(points[1].timestamp.timestamp_millis()).context("Failed to convert timestamp to BigDecimal")?;
-
-		let y0 = &points[0].value;
-		let y1 = &points[1].value;
-
-		let dx = &x1 - &x0;
-		if dx.is_zero() {
-			return Ok(vec![y0.clone(), BigDecimal::zero()]);
-		}
-
-		let slope = (y1 - y0) / &dx;
-		let intercept = y0 - &slope * &x0;
-
-		Ok(vec![slope, intercept]) // [a_1, a_0] for ax + b
-	}
-
-	/// Optimized quadratic coefficient calculation
-	fn quadratic_coefficients(points: &[Measurement]) -> Result<Vec<BigDecimal>> {
-		if points.len() < 3 {
-			return Self::linear_coefficients(points);
-		}
-
-		// Use the first three points for quadratic fitting
-		let x0 = BigDecimal::from_i64(points[0].timestamp.timestamp_millis()).context("Failed to convert timestamp to BigDecimal")?;
-		let x1 = BigDecimal::from_i64(points[1].timestamp.timestamp_millis()).context("Failed to convert timestamp to BigDecimal")?;
-		let x2 = BigDecimal::from_i64(points[2].timestamp.timestamp_millis()).context("Failed to convert timestamp to BigDecimal")?;
-
-		let y0 = &points[0].value;
-		let y1 = &points[1].value;
-		let y2 = &points[2].value;
-
-		// Solve quadratic system using Cramer's rule for numerical stability
-		let denom = (&x0 - &x1) * (&x0 - &x2) * (&x1 - &x2);
-
-		if denom.is_zero() {
-			// Fallback to linear if points are collinear
-			return Self::linear_coefficients(&points[0..2]);
-		}
-
-		// Calculate quadratic coefficients
-		let a = (y0 * (&x1 - &x2) + y1 * (&x2 - &x0) + y2 * (&x0 - &x1)) / &denom;
-		let b = (y0 * (&x2 * &x2 - &x1 * &x1) + y1 * (&x0 * &x0 - &x2 * &x2) + y2 * (&x1 * &x1 - &x0 * &x0)) / (-&denom);
-		let c = (y0 * (&x1 * &x2 * (&x1 - &x2)) + y1 * (&x2 * &x0 * (&x2 - &x0)) + y2 * (&x0 * &x1 * (&x0 - &x1))) / &denom;
-
-		Ok(vec![a, b, c]) // [a_2, a_1, a_0] for ax² + bx + c
-	}
-
-	/// General Lagrange coefficient calculation for higher degrees
-	fn general_lagrange_coefficients(points: &[Measurement]) -> Result<Vec<BigDecimal>> {
-		let n = points.len();
-		let mut coefficients = vec![BigDecimal::zero(); n];
-
-		// This is computationally expensive - only use for small n
-		if n > 6 {
-			eprintln!("Warning: Polynomial degree {degree} is very high, consider using lower degree for better performance", degree = n - 1);
-		}
-
-		// Build Lagrange polynomial by summing basis polynomials
-		for i in 0..n {
-			let mut basis_poly = vec![BigDecimal::zero(); n];
-			basis_poly[0] = points[i].value.clone();
-
-			// Calculate denominator for this basis polynomial
-			let mut denom = BigDecimal::from_f64(1.0).context("Failed to create BigDecimal from 1.0")?;
-			for j in 0..n {
-				if i != j {
-					let xi = BigDecimal::from_i64(points[i].timestamp.timestamp_millis()).context("Failed to convert timestamp to BigDecimal")?;
-					let xj = BigDecimal::from_i64(points[j].timestamp.timestamp_millis()).context("Failed to convert timestamp to BigDecimal")?;
-					denom *= &xi - &xj;
-				}
-			}
-
-			if !denom.is_zero() {
-				// Multiply basis polynomial by 1/denominator
-				for coeff in &mut basis_poly {
-					*coeff = &*coeff / &denom;
-				}
-
-				// Add this basis polynomial to the result
-				for (k, coeff) in basis_poly.iter().enumerate() {
-					coefficients[k] = &coefficients[k] + coeff;
-				}
-			}
-		}
-
-		Ok(coefficients)
-	}
-
-	/// Optimized segment evaluation using Horner's method
-	fn evaluate_segment(&self, segment_idx: usize, dt: &BigDecimal) -> BigDecimal {
-		let seg = &self.coefficients[segment_idx];
-
-		if seg.coefficients.is_empty() {
-			return BigDecimal::zero();
-		}
-
-		// Use Horner's method for efficient polynomial evaluation
-		// P(x) = a_n*x^n + ... + a_1*x + a_0
-		// = ((...((a_n*x + a_{n-1})*x + a_{n-2})*x + ... + a_1)*x + a_0
-
-		let mut result = seg.coefficients[0].clone();
-		for coeff in &seg.coefficients[1..] {
-			result = result * dt + coeff;
-		}
-
-		result
-	}
-
-	/// Evaluates the polynomial spline at a target time
-	///
-	/// # Errors
-	///
-	/// Returns an error if:
-	/// - Target time is outside interpolation bounds
-	/// - Polynomial evaluation encounters numerical errors
-	/// - Timestamp conversion to `BigDecimal` fails
-	pub fn evaluate(&self, target_time: DateTime<Utc>) -> Result<BigDecimal> {
-		let n = self.measurements.len();
-
-		// Handle extrapolation backward
-		if target_time <= self.measurements[0].timestamp {
-			let dt = BigDecimal::from_i64((target_time - self.measurements[0].timestamp).num_milliseconds()).context("Failed to convert timestamp difference to BigDecimal for backward extrapolation")?;
-			return Ok(self.evaluate_segment(0, &dt));
-		}
-
-		// Handle extrapolation forward
-		if target_time >= self.measurements[n - 1].timestamp {
-			let dt = BigDecimal::from_i64((target_time - self.measurements[n - 2].timestamp).num_milliseconds()).context("Failed to convert timestamp difference to BigDecimal for forward extrapolation")?;
-			return Ok(self.evaluate_segment(n - 2, &dt));
-		}
-
-		// Binary search for the appropriate segment - MAJOR PERFORMANCE IMPROVEMENT
-		let segment_idx = self.find_segment_binary(target_time);
-		let dt = BigDecimal::from_i64((target_time - self.measurements[segment_idx].timestamp).num_milliseconds()).context("Failed to convert timestamp difference to BigDecimal for interpolation")?;
-
-		Ok(self.evaluate_segment(segment_idx, &dt))
-	}
-
-	/// Binary search for segment - O(log n) instead of O(n)
-	fn find_segment_binary(&self, target_time: DateTime<Utc>) -> usize {
-		let mut left = 0;
-		let mut right = self.measurements.len() - 1;
-
-		while left < right - 1 {
-			let mid = left + (right - left) / 2;
-			if target_time < self.measurements[mid].timestamp {
-				right = mid;
-			} else {
-				left = mid;
-			}
-		}
-
-		left
-	}
-}
-
-/// GPU-accelerated polynomial interpolation with CPU fallback
+/// GPU-accelerated polynomial interpolation with intelligent fallback
 ///
 /// # Errors
 ///
 /// Returns an error if:
-/// - Insufficient measurements for polynomial interpolation
-/// - Measurements have inconsistent dataset IDs
-/// - Invalid time range
-/// - Both GPU and CPU interpolation fail
-pub async fn gpu_polynomial_interpolate_optimized(measurements: Vec<Measurement>, target_times: Vec<DateTime<Utc>>, dataset_id: Uuid, degree: usize) -> Result<Vec<Measurement>> {
-	if measurements.len() < degree + 1 {
-		return Err(Error::InsufficientMeasurementsError.into());
-	}
-
-	if target_times.is_empty() {
-		return Ok(Vec::new());
-	}
-
-	// For high-degree polynomials, degrade to simpler interpolation for GPU efficiency
-	if degree > 3 {
-		//println!("🚀 Using GPU acceleration for polynomial degree {degree} (linear fallback for performance)");
-		return gpu_linear_interpolate_optimized(measurements, target_times, dataset_id).await;
-	}
-
-	// For lower degrees, use appropriate GPU interpolation
-	match degree {
-		2 => {
-			//println!("🚀 Using GPU acceleration for polynomial degree 2 (quadratic fallback)");
-			// Use quadratic GPU implementation when available, fallback to linear for now
-			gpu_linear_interpolate_optimized(measurements, target_times, dataset_id).await
-		}
-		3 => {
-			//println!("🚀 Using GPU acceleration for polynomial degree 3 (cubic fallback)");
-			// Use cubic GPU implementation when available, fallback to linear for now
-			gpu_linear_interpolate_optimized(measurements, target_times, dataset_id).await
-		}
-		_ => {
-			// Covers degree 1 and all other cases
-			//println!("🚀 Using GPU linear interpolation for polynomial degree {degree}");
-			gpu_linear_interpolate_optimized(measurements, target_times, dataset_id).await
-		}
-	}
-}
-
-/// GPU-accelerated polynomial interpolation with CPU fallback
-///
-/// # Errors
-///
-/// Returns an error if both GPU and CPU interpolation fail
-pub async fn gpu_polynomial_interpolate_with_fallback(measurements: Vec<Measurement>, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, dataset_id: Uuid, degree: usize) -> Result<Vec<Measurement>> {
-	// Generate target times for GPU
-	let target_times = generate_target_times(start, end, resolution);
-
-	// Try GPU first
-	match gpu_polynomial_interpolate_optimized(measurements.clone(), target_times, dataset_id, degree).await {
-		Ok(result) => Ok(result),
-		Err(_gpu_error) => {
-			// Fallback to CPU polynomial interpolation
-			println!("⚠️  GPU polynomial fallback to CPU");
-			polynomial(measurements, start, end, resolution, degree)
-		}
-	}
-}
-
-/// Generate target times for interpolation
-fn generate_target_times(start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution) -> Vec<DateTime<Utc>> {
-	let mut target_times = Vec::new();
-	let mut current = start;
-	let step = resolution.to_step();
-
-	while current <= end {
-		target_times.push(current);
-		current += step;
-	}
-
-	target_times
-}
-
-/// Should use GPU for polynomial interpolation based on data characteristics
-#[must_use]
-pub fn should_use_gpu_polynomial(measurement_count: usize, target_count: usize, degree: usize) -> bool {
-    // Adjust thresholds based on polynomial degree
-    let base_measurement_threshold = 1_000;
-    let base_target_threshold = 25_000;
-    
-    // Higher degrees require more data to be beneficial on GPU
-    let degree_multiplier = match degree {
-        1 => 1.0,
-        2 => 1.2,
-        3 => 1.5,
-        4 => 2.0,
-        5..=6 => 2.5,
-        _ => 3.0, // Very high degrees - require much more data
-    };
-    
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let adjusted_measurement_threshold = (f64::from(base_measurement_threshold) * degree_multiplier) as usize;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let adjusted_target_threshold = (f64::from(base_target_threshold) * degree_multiplier) as usize;
-    
-    measurement_count >= adjusted_measurement_threshold && target_count >= adjusted_target_threshold
+/// - All interpolation methods fail
+/// - Invalid parameters provided
+pub async fn gpu_polynomial_interpolate_with_fallback(
+    measurements: Vec<Measurement>,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    resolution: Resolution,
+    dataset_id: uuid::Uuid,
+    degree: usize,
+) -> Result<Vec<Measurement>> {
+    // For lower degrees, use appropriate GPU interpolation
+    match degree {
+        2 => {
+            println!("🚀 Using GPU acceleration for polynomial degree 2 (quadratic fallback)");
+            // Use quadratic GPU implementation when available, fallback to linear for now
+            super::gpu::gpu_linear_interpolate_optimized(measurements, super::generate_target_times(start, end, resolution), dataset_id).await
+        }
+        3 => {
+            println!("🚀 Using GPU acceleration for polynomial degree 3 (cubic fallback)");
+            // Use cubic GPU implementation when available, fallback to linear for now
+            super::gpu::gpu_linear_interpolate_optimized(measurements, super::generate_target_times(start, end, resolution), dataset_id).await
+        }
+        _ => {
+            // Covers degree 1 and all other cases
+            println!("🚀 Using GPU linear interpolation for polynomial degree {degree}");
+            super::gpu::gpu_linear_interpolate_optimized(measurements, super::generate_target_times(start, end, resolution), dataset_id).await
+        }
+    }
 }
