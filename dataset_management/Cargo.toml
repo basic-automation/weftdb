@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 bigdecimal = { workspace = true, features = ["serde", "serde-json", "string-only"] }
+database = { workspace = true }
