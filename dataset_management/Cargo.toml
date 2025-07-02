@@ -6,3 +6,6 @@ edition = "2024"
 [dependencies]
 bigdecimal = { workspace = true, features = ["serde", "serde-json", "string-only"] }
 database = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+

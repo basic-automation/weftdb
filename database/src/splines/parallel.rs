@@ -13,8 +13,8 @@ use super::{Resolution, SplineType};
 use crate::Measurement;
 
 /// Threshold for switching to parallel processing
-const PARALLEL_THRESHOLD: usize = 800;  // ← Lower threshold based on your results
-const SIMD_PARALLEL_THRESHOLD: usize = 4000;  // ← Adjust based on SIMD performance
+const PARALLEL_THRESHOLD: usize = 800; // ← Lower threshold based on your results
+const SIMD_PARALLEL_THRESHOLD: usize = 4000; // ← Adjust based on SIMD performance
 
 /// Parallel interpolation with automatic algorithm selection
 ///
@@ -72,35 +72,35 @@ fn generate_target_times(start: DateTime<Utc>, end: DateTime<Utc>, resolution: R
 
 /// Interpolate a chunk of target times
 fn interpolate_chunk(measurements: &[Measurement], target_times: &[DateTime<Utc>], spline_type: SplineType) -> Result<Vec<Measurement>> {
-    // Use SIMD for the chunk if beneficial
-    if target_times.len() >= 32 {
-        return super::simd::auto_interpolate_simd(measurements, target_times, spline_type);
-    }
+	// Use SIMD for the chunk if beneficial
+	if target_times.len() >= 32 {
+		return super::simd::auto_interpolate_simd(measurements, target_times, spline_type);
+	}
 
-    // Fall back to scalar implementation
-    let start = target_times[0];
-    let end = target_times[target_times.len() - 1];
+	// Fall back to scalar implementation
+	let start = target_times[0];
+	let end = target_times[target_times.len() - 1];
 
-    // Use appropriate resolution based on time span
-    let time_span = end - start;
-    let resolution = if time_span <= chrono::Duration::microseconds(1) {
-        Resolution::Nanoseconds
-    } else if time_span <= chrono::Duration::milliseconds(1) {
-        Resolution::Microseconds
-    } else if time_span <= chrono::Duration::seconds(1) {
-        Resolution::Milliseconds
-    } else if time_span <= chrono::Duration::minutes(1) {
-        Resolution::Seconds
-    } else {
-        Resolution::Minutes
-    };
+	// Use appropriate resolution based on time span
+	let time_span = end - start;
+	let resolution = if time_span <= chrono::Duration::microseconds(1) {
+		Resolution::Nanoseconds
+	} else if time_span <= chrono::Duration::milliseconds(1) {
+		Resolution::Microseconds
+	} else if time_span <= chrono::Duration::seconds(1) {
+		Resolution::Milliseconds
+	} else if time_span <= chrono::Duration::minutes(1) {
+		Resolution::Seconds
+	} else {
+		Resolution::Minutes
+	};
 
-    match spline_type {
-        SplineType::Linear => super::linear::linear(measurements.to_vec(), start, end, resolution),
-        SplineType::Quadratic => super::quadratic::quadratic(measurements.to_vec(), start, end, resolution),
-        SplineType::Cubic => super::cubic::cubic(measurements.to_vec(), start, end, resolution),
-        SplineType::Polynomial(degree) => super::polynomial::polynomial(measurements.to_vec(), start, end, resolution, degree),
-    }
+	match spline_type {
+		SplineType::Linear => super::linear::linear(measurements.to_vec(), start, end, resolution),
+		SplineType::Quadratic => super::quadratic::quadratic(measurements.to_vec(), start, end, resolution),
+		SplineType::Cubic => super::cubic::cubic(measurements.to_vec(), start, end, resolution),
+		SplineType::Polynomial(degree) => super::polynomial::polynomial(measurements.to_vec(), start, end, resolution, degree),
+	}
 }
 
 /// Optimized interpolation with intelligent algorithm selection
@@ -164,47 +164,45 @@ pub fn fast_path_interpolate(measurements: Vec<Measurement>, start: DateTime<Utc
 ///
 /// Returns an error if the underlying interpolation algorithm fails
 pub async fn optimized_interpolate_async(measurements: Vec<Measurement>, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, spline_type: SplineType) -> Result<Vec<Measurement>> {
-    let measurement_count = measurements.len();
-    let target_times = generate_target_times(start, end, resolution);
-    let output_points = target_times.len();
+	let measurement_count = measurements.len();
+	let target_times = generate_target_times(start, end, resolution);
+	let output_points = target_times.len();
 
-    // Check if GPU acceleration should be used
-    let use_gpu = match spline_type {
-        SplineType::Linear => super::should_use_gpu_interpolation(measurement_count, output_points),
-        SplineType::Quadratic => super::quadratic::should_use_gpu_quadratic(measurement_count, output_points),
-        SplineType::Cubic => super::cubic::should_use_gpu_cubic(measurement_count, output_points),
-        SplineType::Polynomial(degree) => super::polynomial::should_use_gpu_polynomial(measurement_count, output_points, degree),
-    };
+	// Check if GPU acceleration should be used
+	let use_gpu = match spline_type {
+		SplineType::Linear => super::should_use_gpu_interpolation(measurement_count, output_points),
+		SplineType::Quadratic => super::quadratic::should_use_gpu_quadratic(measurement_count, output_points),
+		SplineType::Cubic => super::cubic::should_use_gpu_cubic(measurement_count, output_points),
+		SplineType::Polynomial(degree) => super::polynomial::should_use_gpu_polynomial(measurement_count, output_points, degree),
+	};
 
-    if use_gpu {
-        // 🔧 FIXED: Direct GPU calls instead of going through auto_interpolate_async
-        let dataset_id = measurements[0].dataset_id;
-        match spline_type {
-            SplineType::Linear => {
-                super::gpu::gpu_linear_interpolate_with_fallback(measurements, target_times, dataset_id).await
-            }
-            SplineType::Quadratic => super::quadratic::gpu_quadratic_interpolate_with_fallback(measurements, start, end, resolution, dataset_id).await,
-            SplineType::Cubic => super::cubic::gpu_cubic_interpolate_with_fallback(measurements, start, end, resolution, dataset_id).await,
-            SplineType::Polynomial(degree) => super::polynomial::gpu_polynomial_interpolate_with_fallback(measurements, start, end, resolution, dataset_id, degree).await,
-        }
-    } else {
-        // Strategy selection based on benchmarked thresholds (CPU only)
-        match (measurement_count, output_points) {
-            // Small datasets - use scalar
-            (0..=200, _) => match spline_type {
-                SplineType::Linear => super::linear::linear(measurements, start, end, resolution),
-                SplineType::Quadratic => super::quadratic::quadratic(measurements, start, end, resolution),
-                SplineType::Cubic => super::cubic::cubic(measurements, start, end, resolution),
-                SplineType::Polynomial(degree) => super::polynomial::polynomial(measurements, start, end, resolution, degree),
-            },
+	if use_gpu {
+		// 🔧 FIXED: Direct GPU calls instead of going through auto_interpolate_async
+		let dataset_id = measurements[0].dataset_id;
+		match spline_type {
+			SplineType::Linear => super::gpu::gpu_linear_interpolate_with_fallback(measurements, target_times, dataset_id).await,
+			SplineType::Quadratic => super::quadratic::gpu_quadratic_interpolate_with_fallback(measurements, start, end, resolution, dataset_id).await,
+			SplineType::Cubic => super::cubic::gpu_cubic_interpolate_with_fallback(measurements, start, end, resolution, dataset_id).await,
+			SplineType::Polynomial(degree) => super::polynomial::gpu_polynomial_interpolate_with_fallback(measurements, start, end, resolution, dataset_id, degree).await,
+		}
+	} else {
+		// Strategy selection based on benchmarked thresholds (CPU only)
+		match (measurement_count, output_points) {
+			// Small datasets - use scalar
+			(0..=200, _) => match spline_type {
+				SplineType::Linear => super::linear::linear(measurements, start, end, resolution),
+				SplineType::Quadratic => super::quadratic::quadratic(measurements, start, end, resolution),
+				SplineType::Cubic => super::cubic::cubic(measurements, start, end, resolution),
+				SplineType::Polynomial(degree) => super::polynomial::polynomial(measurements, start, end, resolution, degree),
+			},
 
-            // Medium datasets with dense output - use SIMD
-            (201..=1000, 512..) => super::simd::auto_interpolate_simd(&measurements, &target_times, spline_type),
+			// Medium datasets with dense output - use SIMD
+			(201..=1000, 512..) => super::simd::auto_interpolate_simd(&measurements, &target_times, spline_type),
 
-            // Large datasets and all other cases - use parallel
-            _ => parallel_interpolate(measurements, start, end, resolution, spline_type),
-        }
-    }
+			// Large datasets and all other cases - use parallel
+			_ => parallel_interpolate(measurements, start, end, resolution, spline_type),
+		}
+	}
 }
 
 #[cfg(test)]

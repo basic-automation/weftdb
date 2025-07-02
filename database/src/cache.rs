@@ -32,8 +32,8 @@ impl DatabaseCache {
 	#[allow(clippy::significant_drop_tightening)]
 	pub async fn cache_dataset(&self, subject_name: &str, dataset: Dataset) {
 		let subject_name_string = subject_name.to_string();
-		let dataset_name = dataset.name.clone();
-		let dataset_id = dataset.id;
+		let dataset_name = dataset.name().clone();
+		let dataset_id = dataset.id();
 
 		let cache_entry = CacheEntry { dataset: dataset.clone(), last_accessed: std::time::Instant::now() };
 
@@ -76,7 +76,7 @@ impl DatabaseCache {
 			subject_names.insert(dataset_name, dataset_id);
 		}
 
-		println!("DEBUG: Cached dataset {} for subject {}", dataset.name, subject_name);
+		println!("DEBUG: Cached dataset {} for subject {}", dataset.name(), subject_name);
 	}
 
 	/// Get a dataset by ID
@@ -125,8 +125,8 @@ impl DatabaseCache {
 	/// Get measurements for a dataset
 	pub async fn get_measurements(&self, subject_name: &str, dataset_id: Uuid) -> Option<Vec<Measurement>> {
 		if let Some(dataset) = self.get_dataset(subject_name, dataset_id).await {
-			println!("DEBUG: Retrieved {} measurements from cache for dataset {} in subject {}", dataset.measurements.len(), dataset_id, subject_name);
-			return Some(dataset.measurements);
+			println!("DEBUG: Retrieved {} measurements from cache for dataset {} in subject {}", dataset.measurements().len(), dataset_id, subject_name);
+			return Some(dataset.measurements().clone());
 		}
 		None
 	}
@@ -137,7 +137,7 @@ impl DatabaseCache {
 		if let Some(subject_datasets) = self.datasets.read().await.get(subject_name) {
 			if let Some(entry) = subject_datasets.get(&dataset_id) {
 				// Filter by time range
-				let filtered: Vec<Measurement> = entry.dataset.measurements.iter().filter(|m| m.timestamp >= start_time && m.timestamp <= end_time).cloned().collect();
+				let filtered: Vec<Measurement> = entry.dataset.measurements().iter().filter(|m| m.timestamp >= start_time && m.timestamp <= end_time).cloned().collect();
 
 				return Some(filtered);
 			}
@@ -157,7 +157,7 @@ impl DatabaseCache {
 		// Fix let chains issue
 		if let Some(subject_datasets) = self.datasets.write().await.get_mut(subject_name) {
 			if let Some(entry) = subject_datasets.get_mut(&dataset_id) {
-				entry.dataset.measurements.push(measurement);
+				entry.dataset.measurements_mut().push(measurement);
 				entry.last_accessed = std::time::Instant::now();
 			}
 		}
