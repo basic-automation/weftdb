@@ -1,11 +1,11 @@
 [package]
 name = "dataset_management"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
 bigdecimal = { workspace = true, features = ["serde", "serde-json", "string-only"] }
-database = { workspace = true }
+database = { path = "../database" }  # Reference the local workspace member directly
 anyhow = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 

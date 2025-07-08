@@ -203,7 +203,7 @@ pub fn cubic_parallel_dense(
 /// - Measurements have inconsistent dataset IDs
 /// - Invalid time range
 /// - Both GPU and CPU interpolation fail
-pub async fn gpu_cubic_interpolate_optimized(measurements: Vec<Measurement>, target_times: Vec<DateTime<Utc>>, dataset_id: Uuid) -> Result<Vec<Measurement>> {
+pub async fn gpu_cubic_interpolate_optimized(measurements: Vec<Measurement>, target_times: Vec<DateTime<Utc>>, _dataset_id: Uuid) -> Result<Vec<Measurement>> {
 	if measurements.len() < 4 {
 		return Err(Error::InsufficientPointsForCubicSplineError.into());
 	}
@@ -215,7 +215,7 @@ pub async fn gpu_cubic_interpolate_optimized(measurements: Vec<Measurement>, tar
 	// For now, use GPU linear interpolation as fallback
 	// TODO: Implement true GPU cubic interpolation with spline coefficients
 	//println!("🚀 Using GPU acceleration for cubic interpolation (linear fallback)");
-	gpu_linear_interpolate_optimized(measurements, target_times, dataset_id).await
+	gpu_linear_interpolate_optimized(measurements, target_times).await
 }
 
 /// GPU-accelerated cubic interpolation with CPU fallback

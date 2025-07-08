@@ -3,7 +3,8 @@ use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive, Zero};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::{splines::gpu::gpu_linear_interpolate_optimized, Error, Measurement, Resolution};
+use crate::{Error, Measurement, Resolution}; // Removed unused SplineType import
+use crate::splines::gpu::gpu_linear_interpolate_optimized;
 
 /// Performs quadratic spline interpolation on measurement data.
 ///
@@ -419,19 +420,19 @@ impl QuadraticSpline {
 /// - Measurements have inconsistent dataset IDs
 /// - Invalid time range
 /// - Both GPU and CPU interpolation fail
-pub async fn gpu_quadratic_interpolate_optimized(measurements: Vec<Measurement>, target_times: Vec<DateTime<Utc>>, dataset_id: Uuid) -> Result<Vec<Measurement>> {
-	if measurements.len() < 3 {
-		return Err(Error::InsufficientPointsForCubicSplineError.into());
-	}
+pub async fn gpu_quadratic_interpolate_optimized(measurements: Vec<Measurement>, target_times: Vec<DateTime<Utc>>, _dataset_id: Uuid) -> Result<Vec<Measurement>> {
+    if measurements.len() < 3 {
+        return Err(Error::InsufficientPointsForCubicSplineError.into());
+    }
 
-	if target_times.is_empty() {
-		return Ok(Vec::new());
-	}
+    if target_times.is_empty() {
+        return Ok(Vec::new());
+    }
 
-	// For now, use GPU linear interpolation as fallback
-	// TODO: Implement true GPU quadratic interpolation
-	//println!("🚀 Using GPU acceleration for quadratic interpolation (linear fallback)");
-	gpu_linear_interpolate_optimized(measurements, target_times, dataset_id).await
+    // For now, use GPU linear interpolation as fallback
+    // TODO: Implement true GPU quadratic interpolation
+    //println!("🚀 Using GPU acceleration for quadratic interpolation (linear fallback)");
+    gpu_linear_interpolate_optimized(measurements, target_times).await
 }
 
 /// GPU-accelerated quadratic interpolation with CPU fallback
@@ -439,19 +440,19 @@ pub async fn gpu_quadratic_interpolate_optimized(measurements: Vec<Measurement>,
 /// # Errors
 ///
 /// Returns an error if both GPU and CPU interpolation fail
-pub async fn gpu_quadratic_interpolate_with_fallback(measurements: Vec<Measurement>, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, dataset_id: Uuid) -> Result<Vec<Measurement>> {
-	// Generate target times for GPU
-	let target_times = generate_target_times(start, end, resolution);
+pub async fn gpu_quadratic_interpolate_with_fallback(measurements: Vec<Measurement>, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, _dataset_id: Uuid) -> Result<Vec<Measurement>> {
+    // Generate target times for GPU
+    let target_times = generate_target_times(start, end, resolution);
 
-	// Try GPU first
-	match gpu_quadratic_interpolate_optimized(measurements.clone(), target_times, dataset_id).await {
-		Ok(result) => Ok(result),
-		Err(_gpu_error) => {
-			// Fallback to CPU quadratic interpolation
-			println!("⚠️  GPU quadratic fallback to CPU");
-			quadratic(measurements, start, end, resolution)
-		}
-	}
+    // Try GPU first
+    match gpu_quadratic_interpolate_optimized(measurements.clone(), target_times, _dataset_id).await {
+        Ok(result) => Ok(result),
+        Err(_gpu_error) => {
+            // Fallback to CPU quadratic interpolation
+            println!("⚠️  GPU quadratic fallback to CPU");
+            quadratic(measurements, start, end, resolution)
+        }
+    }
 }
 
 /// Generate target times for interpolation

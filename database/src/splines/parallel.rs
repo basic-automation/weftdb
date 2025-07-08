@@ -180,7 +180,7 @@ pub async fn optimized_interpolate_async(measurements: Vec<Measurement>, start: 
 		// 🔧 FIXED: Direct GPU calls instead of going through auto_interpolate_async
 		let dataset_id = measurements[0].dataset_id;
 		match spline_type {
-			SplineType::Linear => super::gpu::gpu_linear_interpolate_with_fallback(measurements, target_times, dataset_id).await,
+			SplineType::Linear => super::gpu::gpu_interpolate_with_fallback(measurements, target_times, SplineType::Linear).await,
 			SplineType::Quadratic => super::quadratic::gpu_quadratic_interpolate_with_fallback(measurements, start, end, resolution, dataset_id).await,
 			SplineType::Cubic => super::cubic::gpu_cubic_interpolate_with_fallback(measurements, start, end, resolution, dataset_id).await,
 			SplineType::Polynomial(degree) => super::polynomial::gpu_polynomial_interpolate_with_fallback(measurements, start, end, resolution, dataset_id, degree).await,
