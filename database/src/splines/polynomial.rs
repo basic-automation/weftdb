@@ -127,23 +127,7 @@ pub fn should_use_gpu_polynomial(measurement_count: usize, estimated_output_poin
 /// Returns an error if:
 /// - All interpolation methods fail
 /// - Invalid parameters provided
-pub async fn gpu_polynomial_interpolate_with_fallback(measurements: Vec<Measurement>, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, dataset_id: uuid::Uuid, degree: usize) -> Result<Vec<Measurement>> {
-	// For lower degrees, use appropriate GPU interpolation
-	match degree {
-		2 => {
-			println!("🚀 Using GPU acceleration for polynomial degree 2 (quadratic fallback)");
-			// Use quadratic GPU implementation when available, fallback to linear for now
-			super::gpu::gpu_linear_interpolate_optimized(measurements, super::generate_target_times(start, end, resolution), dataset_id).await
-		}
-		3 => {
-			println!("🚀 Using GPU acceleration for polynomial degree 3 (cubic fallback)");
-			// Use cubic GPU implementation when available, fallback to linear for now
-			super::gpu::gpu_linear_interpolate_optimized(measurements, super::generate_target_times(start, end, resolution), dataset_id).await
-		}
-		_ => {
-			// Covers degree 1 and all other cases
-			println!("🚀 Using GPU linear interpolation for polynomial degree {degree}");
-			super::gpu::gpu_linear_interpolate_optimized(measurements, super::generate_target_times(start, end, resolution), dataset_id).await
-		}
-	}
+pub async fn gpu_polynomial_interpolate_with_fallback(measurements: Vec<Measurement>, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, _dataset_id: uuid::Uuid, _degree: usize) -> Result<Vec<Measurement>> {
+    // For lower degrees, use appropriate GPU interpolation
+    super::gpu::gpu_linear_interpolate_optimized(measurements, super::generate_target_times(start, end, resolution)).await
 }
