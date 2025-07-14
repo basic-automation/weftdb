@@ -18,7 +18,7 @@ const SIMD_BATCH_SIZE: usize = 4;
 // Threshold for using SIMD vs scalar processing
 const SIMD_THRESHOLD: usize = 32;
 
-/// SIMD-optimized linear interpolation for batch processing
+/* /// SIMD-optimized linear interpolation for batch processing
 ///
 /// # Errors
 ///
@@ -79,9 +79,9 @@ pub fn linear_simd_batch(measurements: &[Measurement], target_times: &[DateTime<
 	}
 
 	Ok(interpolated)
-}
+} */
 
-/// SIMD linear interpolation core function
+/* /// SIMD linear interpolation core function
 fn simd_linear_interpolate(input_times: &[f64], input_values: &[f64], target_times: f64x4) -> f64x4 {
 	// For each SIMD lane, find the appropriate segment and interpolate
 	let target_array = target_times.to_array();
@@ -108,9 +108,9 @@ fn simd_linear_interpolate(input_times: &[f64], input_values: &[f64], target_tim
 	}
 
 	f64x4::new(result_array)
-}
+} */
 
-/// SIMD-optimized quadratic interpolation - FIXED VERSION
+/* /// SIMD-optimized quadratic interpolation - FIXED VERSION
 ///
 /// # Errors
 ///
@@ -219,9 +219,9 @@ fn simd_quadratic_interpolate(input_times: &[f64], input_values: &[f64], target_
 	}
 
 	f64x4::new(result_array)
-}
+} */
 
-/// SIMD-optimized cubic interpolation - FIXED VERSION
+/* /// SIMD-optimized cubic interpolation - FIXED VERSION
 ///
 /// # Errors
 ///
@@ -241,9 +241,9 @@ pub fn cubic_simd_batch(measurements: &[Measurement], target_times: &[DateTime<U
 	// For now, use quadratic as a faster approximation
 	// TODO: Implement true SIMD cubic interpolation
 	quadratic_simd_batch(measurements, target_times)
-}
+} */
 
-/// SIMD-optimized polynomial interpolation - FIXED VERSION
+/* /// SIMD-optimized polynomial interpolation - FIXED VERSION
 ///
 /// # Errors
 ///
@@ -270,9 +270,9 @@ pub fn polynomial_simd_batch(measurements: &[Measurement], target_times: &[DateT
 			quadratic_simd_batch(measurements, target_times)
 		}
 	}
-}
+} */
 
-/// Auto-select SIMD interpolation method based on spline type
+/* /// Auto-select SIMD interpolation method based on spline type
 ///
 /// # Errors
 ///
@@ -296,7 +296,7 @@ pub fn auto_interpolate_simd(measurements: &[Measurement], target_times: &[DateT
 		SplineType::Cubic => cubic_simd_batch(measurements, target_times),
 		SplineType::Polynomial(degree) => polynomial_simd_batch(measurements, target_times, degree),
 	}
-}
+} */
 
 /// Enhanced SIMD interpolation with parallel processing for very large datasets
 ///

@@ -1,0 +1,16 @@
+[package]
+name = "splines"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
+bigdecimal = { workspace = true, features = ["serde"] }
+thiserror = { workspace = true }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+flume = { workspace = true }
+wide = { workspace = true }
+num_cpus = { workspace = true }
+rayon = { workspace = true }

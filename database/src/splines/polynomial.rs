@@ -128,6 +128,6 @@ pub fn should_use_gpu_polynomial(measurement_count: usize, estimated_output_poin
 /// - All interpolation methods fail
 /// - Invalid parameters provided
 pub async fn gpu_polynomial_interpolate_with_fallback(measurements: Vec<Measurement>, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, _dataset_id: uuid::Uuid, _degree: usize) -> Result<Vec<Measurement>> {
-    // For lower degrees, use appropriate GPU interpolation
-    super::gpu::gpu_linear_interpolate_optimized(measurements, super::generate_target_times(start, end, resolution)).await
+	// For lower degrees, use appropriate GPU interpolation
+	super::gpu::gpu_linear_interpolate_optimized(measurements, super::generate_target_times(start, end, resolution)).await
 }
