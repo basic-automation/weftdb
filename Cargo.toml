@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["database", "dataset_management"]
+members = ["database", "dataset_management", "splines"]
 
 [workspace.dependencies]
 anyhow = "1.0"
@@ -23,6 +23,7 @@ wide = "0.7"
 wgpu = "0.19"
 bytemuck = { version = "1.13", features = ["derive"] }
 fastrand = "2.0"
+num_cpus = "1.17.0"
 
 [profile.release]
 opt-level = 3

@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::{splines::gpu::gpu_linear_interpolate_optimized, Error, Measurement, Resolution};
 
-#[derive(Debug, Clone)]
+/* #[derive(Debug, Clone)]
 struct CubicSegment {
 	a: BigDecimal, // y value
 	b: BigDecimal, // first derivative
@@ -107,8 +107,8 @@ impl CubicSpline {
 
 		Ok(self.evaluate_segment(segment_idx, &dt))
 	}
-}
-
+} */
+/* 
 /// Main cubic spline interpolation function
 ///
 /// # Errors
@@ -156,7 +156,7 @@ pub fn cubic(measurements: Vec<Measurement>, start: DateTime<Utc>, end: DateTime
 	}
 
 	Ok(results)
-}
+} */
 
 /// Enhanced parallel cubic spline evaluation for dense output scenarios
 ///

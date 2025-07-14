@@ -3,10 +3,9 @@ use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive, Zero};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::{Error, Measurement, Resolution}; // Removed unused SplineType import
-use crate::splines::gpu::gpu_linear_interpolate_optimized;
+use crate::{splines::gpu::gpu_linear_interpolate_optimized, Error, Measurement, Resolution}; // Removed unused SplineType import
 
-/// Performs quadratic spline interpolation on measurement data.
+/* /// Performs quadratic spline interpolation on measurement data.
 ///
 /// Takes a vector of `Measurement`, a start date/time, an end date/time, a `Resolution`,
 /// and returns a vector of interpolated or extrapolated measurements using quadratic spline interpolation.
@@ -89,9 +88,9 @@ pub fn quadratic(measurements: Vec<Measurement>, start: DateTime<Utc>, end: Date
 	}
 
 	Ok(result)
-}
+} */
 
-/// Fast path for uniformly spaced data using optimized quadratic interpolation
+/* /// Fast path for uniformly spaced data using optimized quadratic interpolation
 fn quadratic_uniform_fast(measurements: &[Measurement], start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, dataset_id: Uuid) -> Result<Vec<Measurement>> {
 	let step = resolution.to_step();
 	let mut result = Vec::new();
@@ -123,9 +122,9 @@ fn quadratic_uniform_fast(measurements: &[Measurement], start: DateTime<Utc>, en
 	}
 
 	Ok(result)
-}
+} */
 
-/// Optimized uniform quadratic interpolation
+/* /// Optimized uniform quadratic interpolation
 fn interpolate_uniform_quadratic(measurements: &[Measurement], target_time: DateTime<Utc>, uniform_interval: &BigDecimal) -> Result<BigDecimal> {
 	let data_start = measurements[0].timestamp;
 	let time_from_start = (target_time - data_start).num_milliseconds();
@@ -168,9 +167,9 @@ fn interpolate_uniform_quadratic(measurements: &[Measurement], target_time: Date
 	let result = &p0.value * &l0 + &p1.value * &l1 + &p2.value * &l2;
 
 	Ok(result)
-}
+} */
 
-/// Backward extrapolation for uniform data
+/* /// Backward extrapolation for uniform data
 fn extrapolate_backward_uniform(measurements: &[Measurement], target_time: DateTime<Utc>, uniform_interval: &BigDecimal) -> Result<BigDecimal> {
 	// Use first three points for quadratic extrapolation
 	let p0 = &measurements[0];
@@ -192,9 +191,9 @@ fn extrapolate_backward_uniform(measurements: &[Measurement], target_time: DateT
 	let result = &p0.value * &l0 + &p1.value * &l1 + &p2.value * &l2;
 
 	Ok(result)
-}
+} */
 
-/// Forward extrapolation for uniform data
+/* /// Forward extrapolation for uniform data
 fn extrapolate_forward_uniform(measurements: &[Measurement], target_time: DateTime<Utc>, uniform_interval: &BigDecimal) -> Result<BigDecimal> {
 	// Use last three points for quadratic extrapolation
 	let n = measurements.len();
@@ -217,9 +216,9 @@ fn extrapolate_forward_uniform(measurements: &[Measurement], target_time: DateTi
 	let result = &p0.value * &l0 + &p1.value * &l1 + &p2.value * &l2;
 
 	Ok(result)
-}
+} */
 
-/// Fast path for two points - degrade to linear interpolation
+/* /// Fast path for two points - degrade to linear interpolation
 fn quadratic_two_point_fast(measurements: &[Measurement], start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, dataset_id: Uuid) -> Result<Vec<Measurement>> {
 	let step = resolution.to_step();
 	let mut result = Vec::new();
@@ -243,9 +242,9 @@ fn quadratic_two_point_fast(measurements: &[Measurement], start: DateTime<Utc>, 
 	}
 
 	Ok(result)
-}
+} */
 
-/// Check if measurements are uniformly spaced
+/* /// Check if measurements are uniformly spaced
 fn is_uniformly_spaced(measurements: &[Measurement]) -> bool {
 	if measurements.len() < 3 {
 		return false;
@@ -258,9 +257,9 @@ fn is_uniformly_spaced(measurements: &[Measurement]) -> bool {
 		let interval = pair[1].timestamp - pair[0].timestamp;
 		(interval - first_interval).abs() < tolerance
 	})
-}
+} */
 
-struct QuadraticSpline {
+/* struct QuadraticSpline {
 	measurements: Vec<Measurement>,
 	coefficients: Vec<QuadraticSegment>,
 }
@@ -409,7 +408,7 @@ impl QuadraticSpline {
 
 		left
 	}
-}
+} */
 
 /// GPU-accelerated quadratic spline interpolation with CPU fallback
 ///
@@ -421,18 +420,18 @@ impl QuadraticSpline {
 /// - Invalid time range
 /// - Both GPU and CPU interpolation fail
 pub async fn gpu_quadratic_interpolate_optimized(measurements: Vec<Measurement>, target_times: Vec<DateTime<Utc>>, _dataset_id: Uuid) -> Result<Vec<Measurement>> {
-    if measurements.len() < 3 {
-        return Err(Error::InsufficientPointsForCubicSplineError.into());
-    }
+	if measurements.len() < 3 {
+		return Err(Error::InsufficientPointsForCubicSplineError.into());
+	}
 
-    if target_times.is_empty() {
-        return Ok(Vec::new());
-    }
+	if target_times.is_empty() {
+		return Ok(Vec::new());
+	}
 
-    // For now, use GPU linear interpolation as fallback
-    // TODO: Implement true GPU quadratic interpolation
-    //println!("🚀 Using GPU acceleration for quadratic interpolation (linear fallback)");
-    gpu_linear_interpolate_optimized(measurements, target_times).await
+	// For now, use GPU linear interpolation as fallback
+	// TODO: Implement true GPU quadratic interpolation
+	//println!("🚀 Using GPU acceleration for quadratic interpolation (linear fallback)");
+	gpu_linear_interpolate_optimized(measurements, target_times).await
 }
 
 /// GPU-accelerated quadratic interpolation with CPU fallback
@@ -441,18 +440,18 @@ pub async fn gpu_quadratic_interpolate_optimized(measurements: Vec<Measurement>,
 ///
 /// Returns an error if both GPU and CPU interpolation fail
 pub async fn gpu_quadratic_interpolate_with_fallback(measurements: Vec<Measurement>, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, _dataset_id: Uuid) -> Result<Vec<Measurement>> {
-    // Generate target times for GPU
-    let target_times = generate_target_times(start, end, resolution);
+	// Generate target times for GPU
+	let target_times = generate_target_times(start, end, resolution);
 
-    // Try GPU first
-    match gpu_quadratic_interpolate_optimized(measurements.clone(), target_times, _dataset_id).await {
-        Ok(result) => Ok(result),
-        Err(_gpu_error) => {
-            // Fallback to CPU quadratic interpolation
-            println!("⚠️  GPU quadratic fallback to CPU");
-            quadratic(measurements, start, end, resolution)
-        }
-    }
+	// Try GPU first
+	match gpu_quadratic_interpolate_optimized(measurements.clone(), target_times, _dataset_id).await {
+		Ok(result) => Ok(result),
+		Err(_gpu_error) => {
+			// Fallback to CPU quadratic interpolation
+			println!("⚠️  GPU quadratic fallback to CPU");
+			quadratic(measurements, start, end, resolution)
+		}
+	}
 }
 
 /// Generate target times for interpolation

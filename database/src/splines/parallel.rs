@@ -9,52 +9,13 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rayon::prelude::*;
 
-use super::{Resolution, SplineType};
 use crate::Measurement;
 
 /// Threshold for switching to parallel processing
 const PARALLEL_THRESHOLD: usize = 800; // ← Lower threshold based on your results
 const SIMD_PARALLEL_THRESHOLD: usize = 4000; // ← Adjust based on SIMD performance
 
-/// Parallel interpolation with automatic algorithm selection
-///
-/// # Errors
-///
-/// Returns an error if the underlying interpolation algorithm fails
-pub fn parallel_interpolate(measurements: Vec<Measurement>, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, spline_type: SplineType) -> Result<Vec<Measurement>> {
-	if measurements.len() < PARALLEL_THRESHOLD {
-		// Use single-threaded for small datasets
-		return match spline_type {
-			SplineType::Linear => super::linear::linear(measurements, start, end, resolution),
-			SplineType::Quadratic => super::quadratic::quadratic(measurements, start, end, resolution),
-			SplineType::Cubic => super::cubic::cubic(measurements, start, end, resolution),
-			SplineType::Polynomial(degree) => super::polynomial::polynomial(measurements, start, end, resolution, degree),
-		};
-	}
 
-	// Calculate target times
-	let target_times = generate_target_times(start, end, resolution);
-
-	if target_times.len() >= SIMD_PARALLEL_THRESHOLD {
-		// Use SIMD + parallel for very large output
-		return super::simd::parallel_simd_interpolate(&measurements, &target_times, spline_type);
-	}
-
-	// Use parallel processing for medium-large datasets
-	let chunk_size = std::cmp::max(target_times.len() / rayon::current_num_threads(), 100);
-
-	let measurements_arc = Arc::new(measurements);
-	let results: Result<Vec<Vec<Measurement>>> = target_times
-		.par_chunks(chunk_size)
-		.map(|chunk| {
-			let measurements_ref = measurements_arc.clone();
-			interpolate_chunk(&measurements_ref, chunk, spline_type)
-		})
-		.collect();
-
-	let chunk_results = results?;
-	Ok(chunk_results.into_iter().flatten().collect())
-}
 
 /// Generate target times for interpolation
 fn generate_target_times(start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution) -> Vec<DateTime<Utc>> {
@@ -96,10 +57,10 @@ fn interpolate_chunk(measurements: &[Measurement], target_times: &[DateTime<Utc>
 	};
 
 	match spline_type {
-		SplineType::Linear => super::linear::linear(measurements.to_vec(), start, end, resolution),
-		SplineType::Quadratic => super::quadratic::quadratic(measurements.to_vec(), start, end, resolution),
-		SplineType::Cubic => super::cubic::cubic(measurements.to_vec(), start, end, resolution),
-		SplineType::Polynomial(degree) => super::polynomial::polynomial(measurements.to_vec(), start, end, resolution, degree),
+		Spline::Linear => super::linear::linear(measurements.to_vec(), start, end, resolution),
+		Spline::Quadratic => super::quadratic::quadratic(measurements.to_vec(), start, end, resolution),
+		Spline::Cubic => super::cubic::cubic(measurements.to_vec(), start, end, resolution),
+		Spline::Polynomial(degree) => super::polynomial::polynomial(measurements.to_vec(), start, end, resolution, degree),
 	}
 }
 
@@ -155,7 +116,7 @@ pub fn fast_path_interpolate(measurements: Vec<Measurement>, start: DateTime<Utc
 	optimized_interpolate(measurements, start, end, resolution, spline_type)
 }
 
-/// Optimized interpolation with intelligent algorithm selection including GPU acceleration
+/* /// Optimized interpolation with intelligent algorithm selection including GPU acceleration
 ///
 /// This function provides the highest level of optimization by automatically
 /// selecting the best interpolation strategy based on data characteristics.
@@ -203,7 +164,7 @@ pub async fn optimized_interpolate_async(measurements: Vec<Measurement>, start: 
 			_ => parallel_interpolate(measurements, start, end, resolution, spline_type),
 		}
 	}
-}
+} */
 
 #[cfg(test)]
 mod tests {

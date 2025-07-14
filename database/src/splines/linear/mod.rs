@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+/* use anyhow::{Context, Result};
 use bigdecimal::{BigDecimal, FromPrimitive, Zero};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -87,9 +87,9 @@ pub fn linear(measurements: Vec<Measurement>, start: DateTime<Utc>, end: DateTim
 	}
 
 	Ok(result)
-}
+} */
 
-/// Fast path for uniformly spaced data
+/* /// Fast path for uniformly spaced data
 fn linear_uniform_fast(measurements: &[Measurement], start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, dataset_id: Uuid) -> Result<Vec<Measurement>> {
 	let step = resolution.to_step();
 	let mut result = Vec::new();
@@ -149,9 +149,9 @@ fn linear_uniform_fast(measurements: &[Measurement], start: DateTime<Utc>, end: 
 	}
 
 	Ok(result)
-}
+} */
 
-/// Optimized two-point linear interpolation
+/* /// Optimized two-point linear interpolation
 fn linear_two_point_fast(measurements: &[Measurement], start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, dataset_id: Uuid) -> Result<Vec<Measurement>> {
 	let step = resolution.to_step();
 	let mut result = Vec::new();
@@ -191,9 +191,9 @@ fn linear_two_point_fast(measurements: &[Measurement], start: DateTime<Utc>, end
 	}
 
 	Ok(result)
-}
+} */
 
-/// Check if measurements are uniformly spaced
+/* /// Check if measurements are uniformly spaced
 fn is_uniformly_spaced(measurements: &[Measurement]) -> bool {
 	if measurements.len() < 3 {
 		return false;
@@ -212,9 +212,9 @@ fn is_uniformly_spaced(measurements: &[Measurement]) -> bool {
 		let interval = pair[1].timestamp - pair[0].timestamp;
 		(interval - first_interval).abs() < tolerance
 	})
-}
+} */
 
-/// Linear spline implementation for efficient interpolation
+/* /// Linear spline implementation for efficient interpolation
 struct LinearSpline {
 	segments: Vec<LinearSegment>,
 	time_bounds: Vec<DateTime<Utc>>,
@@ -304,7 +304,7 @@ impl LinearSegment {
 	fn evaluate_at_end(&self) -> BigDecimal {
 		self.end_value.clone()
 	}
-}
+} */
 
 #[cfg(test)]
 mod tests {
