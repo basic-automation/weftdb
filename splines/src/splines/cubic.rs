@@ -1,26 +1,14 @@
 use anyhow::{Result, bail};
-use chrono::{DateTime, Utc};
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
+use chrono::{DateTime, Utc};
 use wide::f64x4;
-use wide::CmpLt;
 
-use super::types::CubicSpline;
 use crate::{Error, Point, Resolution, Spline};
-use crate::splines::{SECONDS_IN_DAY, SECONDS_IN_HOUR, SECONDS_IN_MINUTE, SECONDS_IN_MONTH, SECONDS_IN_WEEK, SECONDS_IN_YEAR, SIMD_BATCH_SIZE};
 
-/// Main cubic spline interpolation function
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - Insufficient points for cubic spline interpolation (< 2 points)
-/// - points have inconsistent dataset IDs
-/// - Invalid time range (start >= end)
-/// - Timestamp conversion or `BigDecimal` operations fail
-/// - Spline evaluation encounters numerical errors
+/// Main cubic spline interpolation function using Lagrange interpolation
 pub fn cubic(points: Vec<Point>, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution) -> Result<Vec<Point>> {
 	if points.is_empty() {
-		return Ok(Vec::new()); // Return empty vector for empty input
+		return Ok(Vec::new());
 	}
 
 	if points.len() < Spline::Cubic.number_of_points_required() {
@@ -36,14 +24,12 @@ pub fn cubic(points: Vec<Point>, start: DateTime<Utc>, end: DateTime<Utc>, resol
 	let mut sorted_points = points;
 	sorted_points.sort_by_key(|m| m.timestamp);
 
-	let spline = CubicSpline::new(&sorted_points, resolution)?;
-
 	let mut current = start;
 	let step = resolution.to_step();
 	let mut results = Vec::new();
 
 	while current <= end {
-		let value = spline.evaluate(current)?;
+		let value = evaluate_lagrange_cubic(&sorted_points, current, resolution)?;
 		results.push(Point { timestamp: current, value });
 		current += step;
 	}
@@ -51,151 +37,242 @@ pub fn cubic(points: Vec<Point>, start: DateTime<Utc>, end: DateTime<Utc>, resol
 	Ok(results)
 }
 
+/// Evaluate cubic Lagrange interpolation at target time
+fn evaluate_lagrange_cubic(points: &[Point], target_time: DateTime<Utc>, resolution: Resolution) -> Result<BigDecimal> {
+	let n = points.len();
 
-/// SIMD-optimized cubic interpolation.
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - Insufficient points (< 4 points)
-/// - Timestamp conversion fails
-/// - `BigDecimal` operations fail
-pub fn cubic_simd(points: &[Point], target_times: &[DateTime<Utc>], resolution: Resolution) -> Result<Vec<Point>> {
-    if points.len() < Spline::Cubic.number_of_points_required() {
-        bail!(Error::InsufficientPointsError);
-    }
+	// Handle edge cases - use boundary values for extrapolation
+	if target_time <= points[0].timestamp {
+		return Ok(points[0].value.clone());
+	}
 
-    if target_times.is_empty() {
-        return Ok(Vec::new());
-    }
+	if target_time >= points[n - 1].timestamp {
+		return Ok(points[n - 1].value.clone());
+	}
 
-    // Convert to f64 arrays for SIMD processing
-    #[allow(clippy::cast_precision_loss)]
-    let input_times: Vec<f64> = points
-        .iter()
-        .map(|m| match resolution {
-            Resolution::Nanoseconds => m.timestamp.timestamp_nanos_opt().map_or(0.0, |v| v as f64),
-            Resolution::Microseconds => m.timestamp.timestamp_micros() as f64,
-            Resolution::Milliseconds => m.timestamp.timestamp_millis() as f64,
-            Resolution::Seconds => m.timestamp.timestamp() as f64,
-            Resolution::Minutes => m.timestamp.timestamp() as f64 / SECONDS_IN_MINUTE as f64,
-            Resolution::Hours => m.timestamp.timestamp() as f64 / SECONDS_IN_HOUR as f64,
-            Resolution::Days => m.timestamp.timestamp() as f64 / SECONDS_IN_DAY as f64,
-            Resolution::Weeks => m.timestamp.timestamp() as f64 / SECONDS_IN_WEEK as f64,
-            Resolution::Months => m.timestamp.timestamp() as f64 / SECONDS_IN_MONTH as f64,
-            Resolution::Years => m.timestamp.timestamp() as f64 / SECONDS_IN_YEAR as f64,
-        })
-        .collect();
-    let input_values: Vec<f64> = points.iter().map(|m| m.value.to_f64().unwrap_or(0.0)).collect();
+	// Find segment
+	let segment_idx = find_segment(points, target_time);
 
-    // Process target times in SIMD batches
-    let mut results = Vec::with_capacity(target_times.len());
+	// Select 4 points for cubic interpolation (match GPU exactly)
+	let i1 = (1_usize).max((segment_idx).min(n - 2));
+	let i0 = i1 - 1;
+	let i2 = i1 + 1;
+	let i3 = i1 + 2;
 
-    for target_chunk in target_times.chunks(SIMD_BATCH_SIZE) {
-        #[allow(clippy::cast_precision_loss)]
-        let target_f64s: Vec<f64> = target_chunk
-            .iter()
-            .map(|t| match resolution {
-                Resolution::Nanoseconds => t.timestamp_nanos_opt().map_or(0.0, |v| v as f64),
-                Resolution::Microseconds => t.timestamp_micros() as f64,
-                Resolution::Milliseconds => t.timestamp_millis() as f64,
-                Resolution::Seconds => t.timestamp() as f64,
-                Resolution::Minutes => t.timestamp() as f64 / SECONDS_IN_MINUTE as f64,
-                Resolution::Hours => t.timestamp() as f64 / SECONDS_IN_HOUR as f64,
-                Resolution::Days => t.timestamp() as f64 / SECONDS_IN_DAY as f64,
-                Resolution::Weeks => t.timestamp() as f64 / SECONDS_IN_WEEK as f64,
-                Resolution::Months => t.timestamp() as f64 / SECONDS_IN_MONTH as f64,
-                Resolution::Years => t.timestamp() as f64 / SECONDS_IN_YEAR as f64,
-            })
-            .collect();
+	// Boundary condition adjustments
+	let (final_i0, final_i1, final_i2, final_i3) = if i3 >= n { (n - 4, n - 3, n - 2, n - 1) } else { (i0, i1, i2, i3) };
 
-        // Pad to SIMD width
-        let mut padded_targets = [0.0; SIMD_BATCH_SIZE];
-        let chunk_size = target_f64s.len();
-        padded_targets[..chunk_size].copy_from_slice(&target_f64s);
+	// Convert timestamps to f64 for numerical computation
+	let base_time = points[final_i0].timestamp;
+	let t0 = timestamp_to_f64(points[final_i0].timestamp, base_time, resolution);
+	let t1 = timestamp_to_f64(points[final_i1].timestamp, base_time, resolution);
+	let t2 = timestamp_to_f64(points[final_i2].timestamp, base_time, resolution);
+	let t3 = timestamp_to_f64(points[final_i3].timestamp, base_time, resolution);
+	let target_t = timestamp_to_f64(target_time, base_time, resolution);
 
-        if chunk_size < SIMD_BATCH_SIZE && !target_f64s.is_empty() {
-            let last_value = target_f64s[chunk_size - 1];
-            for target in &mut padded_targets[chunk_size..] {
-                *target = last_value;
-            }
-        }
+	let v0 = points[final_i0].value.to_f64().unwrap_or(0.0);
+	let v1 = points[final_i1].value.to_f64().unwrap_or(0.0);
+	let v2 = points[final_i2].value.to_f64().unwrap_or(0.0);
+	let v3 = points[final_i3].value.to_f64().unwrap_or(0.0);
 
-        let target_simd = f64x4::new(padded_targets);
-        let result_simd = simd_cubic_interpolate(&input_times, &input_values, target_simd);
+	let result = cubic_interpolate_lagrange(target_t, t0, t1, t2, t3, v0, v1, v2, v3);
 
-        let result_array = result_simd.to_array();
-        results.extend_from_slice(&result_array[..chunk_size]);
-    }
-
-    // Convert back to Points
-    let mut interpolated = Vec::with_capacity(target_times.len());
-    for (i, &value) in results.iter().enumerate() {
-        interpolated.push(Point { timestamp: target_times[i], value: BigDecimal::from_f64(value).unwrap_or_else(|| BigDecimal::from(0)) });
-    }
-
-    Ok(interpolated)
+	Ok(BigDecimal::from_f64(result).unwrap_or_default())
 }
 
-/// SIMD cubic interpolation core function
-fn simd_cubic_interpolate(input_times: &[f64], input_values: &[f64], target_times: f64x4) -> f64x4 {
-    // Assumption: all target times in the vector fall into the same segment.
-    // Use the first lane to determine the segment.
-    let target_time_scalar = target_times.to_array()[0];
-    let n = input_times.len();
+/// Lagrange cubic interpolation (matches GPU implementation)
+fn cubic_interpolate_lagrange(t: f64, t0: f64, t1: f64, t2: f64, t3: f64, v0: f64, v1: f64, v2: f64, v3: f64) -> f64 {
+	// Calculate Lagrange denominators
+	let denom0 = (t0 - t1) * (t0 - t2) * (t0 - t3);
+	let denom1 = (t1 - t0) * (t1 - t2) * (t1 - t3);
+	let denom2 = (t2 - t0) * (t2 - t1) * (t2 - t3);
+	let denom3 = (t3 - t0) * (t3 - t1) * (t3 - t2);
 
-    // Find the segment for the target time. We need 4 points.
-    let i1 = match input_times.binary_search_by(|t| t.partial_cmp(&target_time_scalar).unwrap()) {
-        Ok(i) => i,
-        Err(i) => i,
-    }
-    .max(1)
-    .min(n - 2); // Clamp to ensure i0, i1, i2 are valid
+	// Handle degenerate cases
+	if denom0.abs() < 1e-10 || denom1.abs() < 1e-10 || denom2.abs() < 1e-10 || denom3.abs() < 1e-10 {
+		return 0.0;
+	}
 
-    let i0 = i1 - 1;
-    let i2 = i1 + 1;
-    let i3 = i1 + 2;
+	// Lagrange basis functions
+	let l0 = ((t - t1) * (t - t2) * (t - t3)) / denom0;
+	let l1 = ((t - t0) * (t - t2) * (t - t3)) / denom1;
+	let l2 = ((t - t0) * (t - t1) * (t - t3)) / denom2;
+	let l3 = ((t - t0) * (t - t1) * (t - t2)) / denom3;
 
-    // Boundary condition adjustments to ensure we have 4 valid points
-    let (i0, i1, i2, i3) = if i3 >= n { (n - 4, n - 3, n - 2, n - 1) } else { (i0, i1, i2, i3) };
+	l0 * v0 + l1 * v1 + l2 * v2 + l3 * v3
+}
 
-    // Load segment points into SIMD vectors
-    let t0 = f64x4::splat(input_times[i0]);
-    let t1 = f64x4::splat(input_times[i1]);
-    let t2 = f64x4::splat(input_times[i2]);
-    let t3 = f64x4::splat(input_times[i3]);
+/// Find segment index for target time
+fn find_segment(points: &[Point], target_time: DateTime<Utc>) -> usize {
+	for (i, point) in points.iter().enumerate() {
+		if target_time <= point.timestamp {
+			return i.saturating_sub(1);
+		}
+	}
+	points.len().saturating_sub(2)
+}
 
-    let v0 = f64x4::splat(input_values[i0]);
-    let v1 = f64x4::splat(input_values[i1]);
-    let v2 = f64x4::splat(input_values[i2]);
-    let v3 = f64x4::splat(input_values[i3]);
+/// Convert timestamp to f64 relative to base time
+fn timestamp_to_f64(timestamp: DateTime<Utc>, base_time: DateTime<Utc>, resolution: Resolution) -> f64 {
+	let duration = timestamp - base_time;
+	match resolution {
+		Resolution::Nanoseconds => duration.num_nanoseconds().map_or(0.0, |v| v as f64),
+		Resolution::Microseconds => duration.num_microseconds().map_or(0.0, |v| v as f64),
+		Resolution::Milliseconds => duration.num_milliseconds() as f64,
+		Resolution::Seconds => duration.num_seconds() as f64,
+		Resolution::Minutes => duration.num_minutes() as f64,
+		Resolution::Hours => duration.num_hours() as f64,
+		Resolution::Days => duration.num_days() as f64,
+		Resolution::Weeks => duration.num_weeks() as f64,
+		Resolution::Months => duration.num_days() as f64 / super::types::DAYS_IN_MONTH as f64,
+		Resolution::Years => duration.num_days() as f64 / super::types::DAYS_IN_YEAR as f64,
+	}
+}
 
-    // Perform Lagrange cubic interpolation using SIMD operations
-    let denom0 = (t0 - t1) * (t0 - t2) * (t0 - t3);
-    let denom1 = (t1 - t0) * (t1 - t2) * (t1 - t3);
-    let denom2 = (t2 - t0) * (t2 - t1) * (t2 - t3);
-    let denom3 = (t3 - t0) * (t3 - t1) * (t3 - t2);
+/// SIMD-optimized cubic interpolation using Lagrange method
+pub fn cubic_simd(points: &[Point], target_times: &[DateTime<Utc>], resolution: Resolution) -> Result<Vec<Point>> {
+	if points.len() < Spline::Cubic.number_of_points_required() {
+		bail!(Error::InsufficientPointsError);
+	}
 
-    // Create masks for fallback conditions (e.g., division by zero)
-    let fallback_mask = denom0.abs().cmp_lt(f64x4::splat(1e-10))
-        | denom1.abs().cmp_lt(f64x4::splat(1e-10))
-        | denom2.abs().cmp_lt(f64x4::splat(1e-10))
-        | denom3.abs().cmp_lt(f64x4::splat(1e-10));
+	if target_times.is_empty() {
+		return Ok(Vec::new());
+	}
 
-    // Calculate Lagrange basis polynomials
-    let l0 = ((target_times - t1) * (target_times - t2) * (target_times - t3)) / denom0;
-    let l1 = ((target_times - t0) * (target_times - t2) * (target_times - t3)) / denom1;
-    let l2 = ((target_times - t0) * (target_times - t1) * (target_times - t3)) / denom2;
-    let l3 = ((target_times - t0) * (target_times - t1) * (target_times - t2)) / denom3;
+	// Sort points by timestamp to match main cubic function
+	let mut sorted_points = points.to_vec();
+	sorted_points.sort_by_key(|m| m.timestamp);
 
-    // Calculate final value using fused multiply-add for precision and performance
-    let val0 = v0 * l0;
-    let val1 = v1 * l1;
-    let val2 = v2 * l2;
-    let val3 = v3 * l3;
-    let result = val0 + val1 + val2 + val3;
+	// Convert to f64 arrays for SIMD processing
+	let base_time = sorted_points[0].timestamp;
+	let point_times: Vec<f64> = sorted_points.iter().map(|p| timestamp_to_f64(p.timestamp, base_time, resolution)).collect();
+	let point_values: Vec<f64> = sorted_points.iter().map(|p| p.value.to_f64().unwrap_or(0.0)).collect();
 
-    // Use a simple average of the two center points as a fallback
-    let fallback_value = (v1 + v2) * f64x4::splat(0.5);
-    fallback_mask.blend(fallback_value, result)
+	let mut results = Vec::with_capacity(target_times.len());
+	let mut target_f64s = Vec::with_capacity(target_times.len());
+
+	// Pre-convert all target times to f64
+	for target_time in target_times {
+		target_f64s.push(timestamp_to_f64(*target_time, base_time, resolution));
+	}
+
+	// Process in SIMD batches of 4
+	const SIMD_WIDTH: usize = 4;
+	let chunks = target_f64s.chunks_exact(SIMD_WIDTH);
+	let remainder = chunks.remainder();
+
+	// Process SIMD chunks
+	for chunk in chunks {
+		let target_vec = f64x4::new([chunk[0], chunk[1], chunk[2], chunk[3]]);
+		let result_vec = evaluate_lagrange_cubic_simd(&point_times, &point_values, target_vec);
+		let result_array = result_vec.to_array();
+
+		for (i, &target_time) in target_times[results.len()..results.len() + SIMD_WIDTH].iter().enumerate() {
+			let value = BigDecimal::from_f64(result_array[i]).unwrap_or_default();
+			results.push(Point { timestamp: target_time, value });
+		}
+	}
+
+	// Process remainder sequentially
+	for &target_f64 in remainder.iter() {
+		let value = evaluate_lagrange_cubic_f64(&point_times, &point_values, target_f64);
+		let target_time = target_times[results.len()];
+		results.push(Point { timestamp: target_time, value: BigDecimal::from_f64(value).unwrap_or_default() });
+	}
+
+	Ok(results)
+}
+
+/// SIMD-optimized Lagrange cubic interpolation for 4 target times at once
+fn evaluate_lagrange_cubic_simd(times: &[f64], values: &[f64], target_times: f64x4) -> f64x4 {
+	let n = times.len();
+
+	// For true SIMD optimization, we need to process all 4 lanes together
+	// Check if all target times are within bounds
+	let target_array = target_times.to_array();
+	let first_time = times[0];
+	let last_time = times[n - 1];
+
+	let mut results = [0.0f64; 4];
+
+	// Handle each target time in the SIMD vector
+	for lane in 0..4 {
+		let target_time = target_array[lane];
+
+		// Handle edge cases
+		if target_time <= first_time {
+			results[lane] = values[0];
+			continue;
+		}
+
+		if target_time >= last_time {
+			results[lane] = values[n - 1];
+			continue;
+		}
+
+		// Find segment
+		let segment_idx = find_segment_f64_binary(times, target_time);
+
+		// Select 4 points for cubic interpolation
+		let i1 = (1_usize).max((segment_idx).min(n - 2));
+		let i0 = i1 - 1;
+		let i2 = i1 + 1;
+		let i3 = i1 + 2;
+
+		// Boundary condition adjustments
+		let (final_i0, final_i1, final_i2, final_i3) = if i3 >= n { (n - 4, n - 3, n - 2, n - 1) } else { (i0, i1, i2, i3) };
+
+		results[lane] = cubic_interpolate_lagrange(target_time, times[final_i0], times[final_i1], times[final_i2], times[final_i3], values[final_i0], values[final_i1], values[final_i2], values[final_i3]);
+	}
+
+	f64x4::new(results)
+}
+
+/// Evaluate Lagrange cubic interpolation with f64 arrays (for remainder processing)
+fn evaluate_lagrange_cubic_f64(times: &[f64], values: &[f64], target_time: f64) -> f64 {
+	let n = times.len();
+
+	// Handle edge cases
+	if target_time <= times[0] {
+		return values[0];
+	}
+
+	if target_time >= times[n - 1] {
+		return values[n - 1];
+	}
+
+	// Find segment
+	let segment_idx = find_segment_f64_binary(times, target_time);
+
+	// Select 4 points for cubic interpolation
+	let i1 = (1_usize).max((segment_idx).min(n - 2));
+	let i0 = i1 - 1;
+	let i2 = i1 + 1;
+	let i3 = i1 + 2;
+
+	// Boundary condition adjustments
+	let (final_i0, final_i1, final_i2, final_i3) = if i3 >= n { (n - 4, n - 3, n - 2, n - 1) } else { (i0, i1, i2, i3) };
+
+	cubic_interpolate_lagrange(target_time, times[final_i0], times[final_i1], times[final_i2], times[final_i3], values[final_i0], values[final_i1], values[final_i2], values[final_i3])
+}
+
+/// Binary search for segment index (more efficient than linear search)
+fn find_segment_f64_binary(times: &[f64], target_time: f64) -> usize {
+	if target_time <= times[0] {
+		return 0;
+	}
+
+	let mut left = 0;
+	let mut right = times.len() - 1;
+
+	while left < right - 1 {
+		let mid = left + (right - left) / 2;
+		if target_time < times[mid] {
+			right = mid;
+		} else {
+			left = mid;
+		}
+	}
+
+	left
 }

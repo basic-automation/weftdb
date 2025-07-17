@@ -1,18 +1,20 @@
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 #![allow(clippy::multiple_crate_versions, clippy::used_underscore_binding, clippy::similar_names, clippy::module_name_repetitions, clippy::module_inception)]
+#![feature(f128)]
 
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 pub(crate) use gpu::gpu_interpolate;
 pub(crate) use helpers::{estimate_output_points, generate_target_times, is_uniformly_spaced, should_use_gpu};
-use optimizations::{apply_fast_path, cpu_interpolate};
-pub(crate) use splines::{ cubic, cubic_simd, linear, linear_simd, polynomial, polynomial_simd, quadratic, quadratic_simd };
+pub use optimizations::{apply_fast_path, cpu_interpolate, parallel_simd_interpolate, simd_interpolate};
+pub(crate) use splines::{cubic, cubic_simd, linear, linear_simd, polynomial, polynomial_simd, quadratic, quadratic_simd};
 pub use types::{Error, Point, Resolution, Spline};
 
 mod gpu;
 mod helpers;
 mod optimizations;
 mod splines;
+mod tests;
 mod types;
 
 /// Main async interpolation function with GPU acceleration support
@@ -46,7 +48,7 @@ pub async fn auto_interpolate(points: Vec<Point>, start: DateTime<Utc>, end: Dat
 		let target_times = generate_target_times(start, end, resolution);
 
 		// Try GPU interpolation with fallback - clone measurements to avoid ownership issues
-		match gpu_interpolate(points.clone(), target_times, spline).await {
+		match gpu_interpolate(points.clone(), target_times, spline, resolution).await {
 			Ok(result) => return Ok(result),
 			Err(_) => (),
 		}

@@ -25,4 +25,7 @@ pub enum Error {
 
 	#[error("Invalid timestamp error: {0}")]
 	InvalidTimestampError(String),
+
+	#[error("Invalid degree for polynomial interpolation: {0}. Must be at least 1.")]
+	InvalidDegreeError(usize),
 }
