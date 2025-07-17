@@ -41,22 +41,12 @@ pub const fn apply_fast_path(spline: Spline, measurement_count: usize) -> Spline
 		}
 
 		// Polynomial optimizations
-		Spline::Polynomial(degree) => {
-			if degree > 5 || measurement_count > 1000 {
-				// High degree or large datasets: degrade to quadratic
-				Spline::Quadratic
-			} else if measurement_count > 3000 {
-				// Very large datasets: degrade to linear
-				Spline::Linear
-			} else if degree <= 2 {
-				// Low degree: use quadratic
-				Spline::Quadratic
-			} else if degree == 3 {
-				// Degree 3: use cubic
-				Spline::Cubic
-			} else {
-				// Moderate degree: keep as polynomial but limit degree
-				Spline::Polynomial(degree)
+		Spline::Polynomial(degree, bounds_factor) => {
+			match degree {
+				1 => Spline::Linear, // Degree 1 is linear
+				2 => Spline::Quadratic, // Degree 2 is quadratic
+				3 => Spline::Cubic, // Degree 3 is cubic
+				_ => Spline::Polynomial(degree, bounds_factor), // Small datasets: keep polynomial
 			}
 		}
 	}

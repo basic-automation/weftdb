@@ -1,12 +1,8 @@
-use std::str::FromStr;
-
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use splines::{polynomial, polynomial_simd, Resolution};
 
-// Import the specific functions we need
-use super::linear::linear;
-use super::{cubic::cubic, quadratic::quadratic};
-use crate::{splines::Resolution, Error, Measurement};
+use crate::{Error, Measurement, SplineType};
 
 /// Polynomial interpolation using Lagrange interpolation method
 ///
@@ -130,4 +126,58 @@ pub fn should_use_gpu_polynomial(measurement_count: usize, estimated_output_poin
 pub async fn gpu_polynomial_interpolate_with_fallback(measurements: Vec<Measurement>, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, _dataset_id: uuid::Uuid, _degree: usize) -> Result<Vec<Measurement>> {
 	// For lower degrees, use appropriate GPU interpolation
 	super::gpu::gpu_linear_interpolate_optimized(measurements, super::generate_target_times(start, end, resolution)).await
+}
+
+/// Polynomial interpolation wrapper
+pub async fn polynomial_interpolate(measurements: Vec<Measurement>, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, degree: usize) -> Result<Vec<Measurement>> {
+    // Convert measurements to points
+    let points: Vec<splines::Point> = measurements.iter().map(|m| {
+        splines::Point {
+            timestamp: m.timestamp,
+            value: m.value.clone(),
+        }
+    }).collect();
+
+    // Use splines crate polynomial interpolation
+    let result_points = polynomial(points, start, end, resolution, degree)?;
+
+    // Convert back to measurements
+    let dataset_id = measurements[0].dataset_id;
+    let results: Vec<Measurement> = result_points.into_iter().map(|p| {
+        Measurement {
+            id: uuid::Uuid::new_v4(),
+            dataset_id,
+            timestamp: p.timestamp,
+            value: p.value,
+        }
+    }).collect();
+
+    Ok(results)
+}
+
+/// SIMD polynomial interpolation
+pub fn polynomial_simd_interpolate(measurements: &[Measurement], target_times: &[DateTime<Utc>], degree: usize) -> Result<Vec<Measurement>> {
+    // Convert measurements to points
+    let points: Vec<splines::Point> = measurements.iter().map(|m| {
+        splines::Point {
+            timestamp: m.timestamp,
+            value: m.value.clone(),
+        }
+    }).collect();
+
+    // Use splines crate SIMD polynomial interpolation
+    let result_points = polynomial_simd(&points, target_times, Resolution::Seconds, degree)?;
+
+    // Convert back to measurements
+    let dataset_id = measurements[0].dataset_id;
+    let results: Vec<Measurement> = result_points.into_iter().map(|p| {
+        Measurement {
+            id: uuid::Uuid::new_v4(),
+            dataset_id,
+            timestamp: p.timestamp,
+            value: p.value,
+        }
+    }).collect();
+
+    Ok(results)
 }

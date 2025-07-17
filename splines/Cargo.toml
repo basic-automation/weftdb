@@ -14,3 +14,10 @@ flume = { workspace = true }
 wide = { workspace = true }
 num_cpus = { workspace = true }
 rayon = { workspace = true }
+tokio = { workspace = true }
+futures-channel = { workspace = true }
+pollster = { workspace = true }
+
+[dev-dependencies]
+ratatui = { workspace = true, features = ["default", "all-widgets", "document-features", "macros", "palette", "scrolling-regions", "serde", "termion", "termwiz"] }
+crossterm = { workspace = true, features = ["event-stream", "filedescriptor", "libc", "osc52", "serde"]}

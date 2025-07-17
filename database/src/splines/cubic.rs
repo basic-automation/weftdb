@@ -108,7 +108,7 @@ impl CubicSpline {
 		Ok(self.evaluate_segment(segment_idx, &dt))
 	}
 } */
-/* 
+/*
 /// Main cubic spline interpolation function
 ///
 /// # Errors

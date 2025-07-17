@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use chrono::{DateTime, Utc};
-use wide::{CmpLt, f64x4};
+use wide::f64x4;
 
 use crate::{
 	Error, Point, Resolution, Spline, is_uniformly_spaced, splines::{DAYS_IN_MONTH, DAYS_IN_YEAR, QuadraticSpline, SECONDS_IN_DAY, SECONDS_IN_HOUR, SECONDS_IN_MINUTE, SECONDS_IN_MONTH, SECONDS_IN_WEEK, SECONDS_IN_YEAR, SIMD_BATCH_SIZE}
@@ -614,7 +614,7 @@ fn interpolate_uniform_quadratic(points: &[Point], target_time: DateTime<Utc>, u
 	Ok(result)
 }
 
-/// SIMD-optimized quadratic interpolation - FIXED VERSION
+/// SIMD-optimized quadratic interpolation - CORRECTED VERSION
 ///
 /// # Errors
 ///
@@ -631,31 +631,39 @@ pub fn quadratic_simd(points: &[Point], target_times: &[DateTime<Utc>], resoluti
 		return Ok(Vec::new());
 	}
 
+	// Sort points by timestamp (match CPU implementation)
+	let mut sorted_points = points.to_vec();
+	sorted_points.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+	// Check if data is uniformly spaced (match CPU logic exactly)
+	let is_uniform = is_uniformly_spaced(&sorted_points, resolution);
+
 	// Convert to f64 arrays for SIMD processing
 	#[allow(clippy::cast_precision_loss)]
-	let input_times: Vec<f64> = points
+	let input_times: Vec<f64> = sorted_points
 		.iter()
-		.map(|m| {
-			match resolution {
-				Resolution::Nanoseconds => {
-					match m.timestamp.timestamp_nanos_opt() {
-						Some(value) => value as f64,
-						None => 0.0, // Fallback for invalid timestamps
-					}
-				}
-				Resolution::Microseconds => m.timestamp.timestamp_micros() as f64,
-				Resolution::Milliseconds => m.timestamp.timestamp_millis() as f64,
-				Resolution::Seconds => m.timestamp.timestamp() as f64,
-				Resolution::Minutes => m.timestamp.timestamp() as f64 / SECONDS_IN_MINUTE as f64,
-				Resolution::Hours => m.timestamp.timestamp() as f64 / SECONDS_IN_HOUR as f64,
-				Resolution::Days => m.timestamp.timestamp() as f64 / SECONDS_IN_DAY as f64,
-				Resolution::Weeks => m.timestamp.timestamp() as f64 / SECONDS_IN_WEEK as f64,
-				Resolution::Months => m.timestamp.timestamp() as f64 / SECONDS_IN_MONTH as f64,
-				Resolution::Years => m.timestamp.timestamp() as f64 / SECONDS_IN_YEAR as f64,
-			}
+		.map(|m| match resolution {
+			Resolution::Nanoseconds => match m.timestamp.timestamp_nanos_opt() {
+				Some(value) => value as f64,
+				None => 0.0,
+			},
+			Resolution::Microseconds => m.timestamp.timestamp_micros() as f64,
+			Resolution::Milliseconds => m.timestamp.timestamp_millis() as f64,
+			Resolution::Seconds => m.timestamp.timestamp() as f64,
+			Resolution::Minutes => m.timestamp.timestamp() as f64 / SECONDS_IN_MINUTE as f64,
+			Resolution::Hours => m.timestamp.timestamp() as f64 / SECONDS_IN_HOUR as f64,
+			Resolution::Days => m.timestamp.timestamp() as f64 / SECONDS_IN_DAY as f64,
+			Resolution::Weeks => m.timestamp.timestamp() as f64 / SECONDS_IN_WEEK as f64,
+			Resolution::Months => m.timestamp.timestamp() as f64 / SECONDS_IN_MONTH as f64,
+			Resolution::Years => m.timestamp.timestamp() as f64 / SECONDS_IN_YEAR as f64,
 		})
 		.collect();
-	let input_values: Vec<f64> = points.iter().map(|m| m.value.to_f64().unwrap_or(0.0)).collect();
+	let input_values: Vec<f64> = sorted_points.iter().map(|m| m.value.to_f64().unwrap_or(0.0)).collect();
+
+	// Calculate data bounds
+	let data_start = input_times[0];
+	let data_end = input_times[input_times.len() - 1];
+	let uniform_interval = if is_uniform && input_times.len() >= 2 { input_times[1] - input_times[0] } else { 0.0 };
 
 	// Process target times in SIMD batches
 	let mut results = Vec::with_capacity(target_times.len());
@@ -664,24 +672,20 @@ pub fn quadratic_simd(points: &[Point], target_times: &[DateTime<Utc>], resoluti
 		#[allow(clippy::cast_precision_loss)]
 		let target_f64s: Vec<f64> = target_chunk
 			.iter()
-			.map(|t| {
-				match resolution {
-					Resolution::Nanoseconds => {
-						match t.timestamp_nanos_opt() {
-							Some(value) => value as f64,
-							None => 0.0, // Fallback for invalid timestamps
-						}
-					}
-					Resolution::Microseconds => t.timestamp_micros() as f64,
-					Resolution::Milliseconds => t.timestamp_millis() as f64,
-					Resolution::Seconds => t.timestamp() as f64,
-					Resolution::Minutes => t.timestamp() as f64 / SECONDS_IN_MINUTE as f64,
-					Resolution::Hours => t.timestamp() as f64 / SECONDS_IN_HOUR as f64,
-					Resolution::Days => t.timestamp() as f64 / SECONDS_IN_DAY as f64,
-					Resolution::Weeks => t.timestamp() as f64 / SECONDS_IN_WEEK as f64,
-					Resolution::Months => t.timestamp() as f64 / SECONDS_IN_MONTH as f64,
-					Resolution::Years => t.timestamp() as f64 / SECONDS_IN_YEAR as f64,
-				}
+			.map(|t| match resolution {
+				Resolution::Nanoseconds => match t.timestamp_nanos_opt() {
+					Some(value) => value as f64,
+					None => 0.0,
+				},
+				Resolution::Microseconds => t.timestamp_micros() as f64,
+				Resolution::Milliseconds => t.timestamp_millis() as f64,
+				Resolution::Seconds => t.timestamp() as f64,
+				Resolution::Minutes => t.timestamp() as f64 / SECONDS_IN_MINUTE as f64,
+				Resolution::Hours => t.timestamp() as f64 / SECONDS_IN_HOUR as f64,
+				Resolution::Days => t.timestamp() as f64 / SECONDS_IN_DAY as f64,
+				Resolution::Weeks => t.timestamp() as f64 / SECONDS_IN_WEEK as f64,
+				Resolution::Months => t.timestamp() as f64 / SECONDS_IN_MONTH as f64,
+				Resolution::Years => t.timestamp() as f64 / SECONDS_IN_YEAR as f64,
 			})
 			.collect();
 
@@ -698,7 +702,7 @@ pub fn quadratic_simd(points: &[Point], target_times: &[DateTime<Utc>], resoluti
 		}
 
 		let target_simd = f64x4::new(padded_targets);
-		let result_simd = simd_quadratic_interpolate(&input_times, &input_values, target_simd);
+		let result_simd = if is_uniform { simd_quadratic_interpolate_uniform(&input_times, &input_values, target_simd, data_start, data_end, uniform_interval) } else { simd_quadratic_interpolate_general(&input_times, &input_values, target_simd) };
 
 		let result_array = result_simd.to_array();
 		results.extend_from_slice(&result_array[..chunk_size]);
@@ -713,53 +717,138 @@ pub fn quadratic_simd(points: &[Point], target_times: &[DateTime<Utc>], resoluti
 	Ok(interpolated)
 }
 
-/// SIMD quadratic interpolation core function
-fn simd_quadratic_interpolate(input_times: &[f64], input_values: &[f64], target_times: f64x4) -> f64x4 {
-	// For this SIMD optimization, we make a simplifying assumption:
-	// all 4 target times in the vector fall into the same segment.
-	// We use the first lane to determine the segment.
-	let target_time_scalar = target_times.to_array()[0];
+/// SIMD uniform quadratic interpolation (matches CPU uniform logic exactly)
+fn simd_quadratic_interpolate_uniform(input_times: &[f64], input_values: &[f64], target_times: f64x4, data_start: f64, data_end: f64, uniform_interval: f64) -> f64x4 {
+	let mut results = [0.0; 4];
+	let target_array = target_times.to_array();
 
-	// Find appropriate segment for the first target time
-	let center_idx = match input_times.binary_search_by(|t| t.partial_cmp(&target_time_scalar).unwrap()) {
-		Ok(i) => i,
-		Err(i) => i.max(1).min(input_times.len() - 2),
+	for (i, &target_time) in target_array.iter().enumerate() {
+		results[i] = if target_time < data_start {
+			// Backward extrapolation - use first three points
+			extrapolate_backward_uniform_simd(input_values, target_time, data_start, uniform_interval)
+		} else if target_time > data_end {
+			// Forward extrapolation - use last three points
+			extrapolate_forward_uniform_simd(input_values, target_time, data_end, uniform_interval)
+		} else {
+			// Interpolation - match CPU uniform logic
+			interpolate_uniform_quadratic_simd(input_times, input_values, target_time, data_start, uniform_interval)
+		};
+	}
+
+	f64x4::new(results)
+}
+
+/// SIMD backward extrapolation for uniform data (matches CPU logic)
+fn extrapolate_backward_uniform_simd(input_values: &[f64], target_time: f64, data_start: f64, uniform_interval: f64) -> f64 {
+	let dt = target_time - data_start;
+	let t = dt / uniform_interval;
+
+	// Use same Lagrange formula as CPU: L0(t) = t*(t-1)/2, L1(t) = 1-t², L2(t) = t*(t+1)/2
+	let t_squared = t * t;
+	let l0 = t * (t - 1.0) * 0.5;
+	let l1 = 1.0 - t_squared;
+	let l2 = t * (t + 1.0) * 0.5;
+
+	input_values[0] * l0 + input_values[1] * l1 + input_values[2] * l2
+}
+
+/// SIMD forward extrapolation for uniform data (matches CPU logic)
+fn extrapolate_forward_uniform_simd(input_values: &[f64], target_time: f64, data_end: f64, uniform_interval: f64) -> f64 {
+	let dt = target_time - data_end;
+	let t = dt / uniform_interval;
+
+	// Use last three points
+	let n = input_values.len();
+	let l0 = t * (t - 1.0) * 0.5;
+	let l1 = 1.0 - t * t;
+	let l2 = t * (t + 1.0) * 0.5;
+
+	input_values[n - 3] * l0 + input_values[n - 2] * l1 + input_values[n - 1] * l2
+}
+
+/// SIMD uniform interpolation (matches CPU uniform logic exactly)
+fn interpolate_uniform_quadratic_simd(input_times: &[f64], input_values: &[f64], target_time: f64, data_start: f64, uniform_interval: f64) -> f64 {
+	let time_from_start = target_time - data_start;
+
+	// Find segment index using same logic as CPU
+	let segment_index = if time_from_start >= 0.0 && uniform_interval > 0.0 {
+		let idx = (time_from_start / uniform_interval) as usize;
+		idx.min(input_times.len().saturating_sub(2))
+	} else {
+		0
 	};
 
-	// Handle boundary conditions
-	let (i0, i1, i2) = if center_idx == 0 {
+	// Use same three-point selection as CPU
+	let (i0, i1, i2) = if segment_index == 0 {
 		(0, 1, 2)
-	} else if center_idx >= input_times.len() - 1 {
+	} else if segment_index >= input_times.len() - 1 {
 		let n = input_times.len();
 		(n - 3, n - 2, n - 1)
 	} else {
-		(center_idx - 1, center_idx, center_idx + 1)
+		(segment_index - 1, segment_index, segment_index + 1)
 	};
 
-	// Load segment points into SIMD vectors
-	let t0 = f64x4::splat(input_times[i0]);
-	let t1 = f64x4::splat(input_times[i1]);
-	let t2 = f64x4::splat(input_times[i2]);
-	let v0 = f64x4::splat(input_values[i0]);
-	let v1 = f64x4::splat(input_values[i1]);
-	let v2 = f64x4::splat(input_values[i2]);
+	// Calculate t parameter relative to center point (matches CPU)
+	let dt = target_time - input_times[i1];
+	let t = dt / uniform_interval;
 
-	// Perform Lagrange quadratic interpolation using SIMD operations
-	let denom0 = (t0 - t1) * (t0 - t2);
-	let denom1 = (t1 - t0) * (t1 - t2);
-	let denom2 = (t2 - t0) * (t2 - t1);
+	// Use same Lagrange formula as CPU
+	let t_squared = t * t;
+	let l0 = t * (t - 1.0) * 0.5;
+	let l1 = 1.0 - t_squared;
+	let l2 = t * (t + 1.0) * 0.5;
 
-	// Create masks for fallback conditions (e.g., division by zero)
-	let fallback_mask = denom0.abs().cmp_lt(f64x4::splat(1e-10)) | denom1.abs().cmp_lt(f64x4::splat(1e-10)) | denom2.abs().cmp_lt(f64x4::splat(1e-10));
+	input_values[i0] * l0 + input_values[i1] * l1 + input_values[i2] * l2
+}
 
-	// Calculate Lagrange basis polynomials
-	let l0 = ((target_times - t1) * (target_times - t2)) / denom0;
-	let l1 = ((target_times - t0) * (target_times - t2)) / denom1;
-	let l2 = ((target_times - t0) * (target_times - t1)) / denom2;
+/// SIMD general quadratic interpolation (matches QuadraticSpline behavior)
+fn simd_quadratic_interpolate_general(input_times: &[f64], input_values: &[f64], target_times: f64x4) -> f64x4 {
+	let mut results = [0.0; 4];
+	let target_array = target_times.to_array();
 
-	// Calculate final value using fused multiply-add for precision and performance
-	let result = v2.mul_add(l2, v0.mul_add(l0, v1 * l1));
+	for (i, &target_time) in target_array.iter().enumerate() {
+		// Find appropriate segment (match CPU spline logic)
+		let center_idx = match input_times.binary_search_by(|t| t.partial_cmp(&target_time).unwrap()) {
+			Ok(idx) => idx,
+			Err(idx) => idx.max(1).min(input_times.len() - 2),
+		};
 
-	// Use the center value as a fallback where denominators are too small
-	fallback_mask.blend(v1, result)
+		// Handle boundary conditions (match CPU spline logic)
+		let (i0, i1, i2) = if center_idx == 0 {
+			(0, 1, 2)
+		} else if center_idx >= input_times.len() - 1 {
+			let n = input_times.len();
+			(n - 3, n - 2, n - 1)
+		} else {
+			(center_idx - 1, center_idx, center_idx + 1)
+		};
+
+		// Standard Lagrange interpolation for non-uniform data
+		let t0 = input_times[i0];
+		let t1 = input_times[i1];
+		let t2 = input_times[i2];
+		let v0 = input_values[i0];
+		let v1 = input_values[i1];
+		let v2 = input_values[i2];
+
+		let denom0 = (t0 - t1) * (t0 - t2);
+		let denom1 = (t1 - t0) * (t1 - t2);
+		let denom2 = (t2 - t0) * (t2 - t1);
+
+		// Check for degenerate cases
+		if denom0.abs() < 1e-10 || denom1.abs() < 1e-10 || denom2.abs() < 1e-10 {
+			results[i] = v1; // Use center value as fallback
+			continue;
+		}
+
+		// Calculate Lagrange basis polynomials
+		let l0 = ((target_time - t1) * (target_time - t2)) / denom0;
+		let l1 = ((target_time - t0) * (target_time - t2)) / denom1;
+		let l2 = ((target_time - t0) * (target_time - t1)) / denom2;
+
+		// Calculate final value
+		results[i] = v0 * l0 + v1 * l1 + v2 * l2;
+	}
+
+	f64x4::new(results)
 }

@@ -1,4 +1,4 @@
-/// GPU compute shader for polynomial interpolation with configurable degree
+/// GPU compute shader for polynomial interpolation with configurable bounds
 pub const POLYNOMIAL_INTERPOLATION_SHADER: &str = r"
 @group(0) @binding(0) var<storage, read> input_times: array<f32>;
 @group(0) @binding(1) var<storage, read> input_values: array<f32>;
@@ -7,14 +7,14 @@ pub const POLYNOMIAL_INTERPOLATION_SHADER: &str = r"
 @group(0) @binding(4) var<uniform> config: PolynomialConfig;
 
 struct PolynomialConfig {
-    max_degree: u32,        // Maximum polynomial degree (e.g., 8 for up to 8th degree)
-    use_local_fitting: u32, // 1 to use local windows, 0 to use all points
-    window_size: u32,       // Size of local window when use_local_fitting = 1
+    offset: u32,           // Workgroup offset
+    max_degree: u32,       // Maximum polynomial degree
+    bounds_factor_bits: u32, // Bounds factor as f32 bits (NaN = unbounded)
 }
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let index = global_id.x;
+    let index = global_id.x + config.offset;
     let target_count = arrayLength(&target_times);
     
     if (index >= target_count) {
@@ -34,145 +34,147 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         return;
     }
     
-    // Determine the actual degree to use
-    let max_points = min(config.max_degree + 1u, input_count);
-    let degree = max_points - 1u;
-    
-    if (config.use_local_fitting == 1u && input_count > config.window_size) {
-        // Use local polynomial fitting
-        output_values[index] = local_polynomial_interpolate(target_time, degree);
-    } else {
-        // Use global polynomial fitting
-        output_values[index] = global_polynomial_interpolate(target_time, degree);
+    // Check if target is exactly at a data point
+    for (var i = 0u; i < input_count; i++) {
+        if (abs(input_times[i] - target_time) < 1e-7) {
+            output_values[index] = input_values[i];
+            return;
+        }
     }
+    
+    // Convert bounds factor from bits to f32
+    let bounds_factor = bitcast<f32>(config.bounds_factor_bits);
+    let is_bounded = !isnan(bounds_factor);
+    
+    // The input_times array is already sorted, so we can use first and last elements
+    let first_time = input_times[0];
+    let last_time = input_times[input_count - 1u];
+    
+    // Check if we're extrapolating
+    let is_extrapolating = target_time < first_time || target_time > last_time;
+    
+    if (is_extrapolating && is_bounded) {
+        // Calculate data bounds for extrapolation
+        var min_value = input_values[0];
+        var max_value = input_values[0];
+        
+        for (var i = 1u; i < input_count; i++) {
+            min_value = min(min_value, input_values[i]);
+            max_value = max(max_value, input_values[i]);
+        }
+        
+        let range = max_value - min_value;
+        let lower_bound = min_value - range * bounds_factor;
+        let upper_bound = max_value + range * bounds_factor;
+        
+        // Apply extrapolation bounds
+        if (target_time < first_time) {
+            output_values[index] = lower_bound;  // Left extrapolation
+        } else {
+            output_values[index] = upper_bound;  // Right extrapolation
+        }
+        return;
+    }
+    
+    // For interpolation OR unbounded extrapolation, use polynomial interpolation
+    let safe_degree = determine_safe_degree(config.max_degree, input_count);
+    let result = polynomial_interpolate(target_time, safe_degree);
+    output_values[index] = result;
 }
 
-fn global_polynomial_interpolate(target_time: f32, degree: u32) -> f32 {
+fn determine_safe_degree(requested_degree: u32, available_points: u32) -> u32 {
+    // Ensure we have enough points
+    if (available_points <= 1u) {
+        return 0u;
+    }
+    
+    // Maximum degree is limited by available points
+    let max_degree_by_points = available_points - 1u;
+    
+    // For numerical stability, limit to reasonable degree
+    let stability_cap = 8u;
+    
+    // Use the minimum of requested degree, available points limit, and stability cap
+    return min(min(requested_degree, max_degree_by_points), stability_cap);
+}
+
+fn polynomial_interpolate(target_time: f32, degree: u32) -> f32 {
     let input_count = arrayLength(&input_times);
     let num_points = min(degree + 1u, input_count);
     
-    // Use evenly spaced points or all points if few enough
-    var result = 0.0;
-    
-    if (num_points == input_count) {
-        // Use all points with Lagrange interpolation
-        for (var i = 0u; i < num_points; i++) {
-            let li = lagrange_basis(target_time, i, num_points);
-            result += li * input_values[i];
-        }
-    } else {
-        // Select evenly spaced points
-        let step = f32(input_count - 1u) / f32(num_points - 1u);
-        for (var i = 0u; i < num_points; i++) {
-            let idx = u32(f32(i) * step + 0.5);
-            let safe_idx = min(idx, input_count - 1u);
-            let li = lagrange_basis_subset(target_time, i, num_points, step);
-            result += li * input_values[safe_idx];
-        }
+    if (num_points == 0u) {
+        return 0.0;
     }
     
-    return result;
+    if (num_points == 1u) {
+        return input_values[0];
+    }
+    
+    // Select optimal window of points
+    let window_start = select_window(target_time, num_points);
+    
+    // Use Lagrange interpolation
+    return lagrange_interpolate(target_time, window_start, num_points);
 }
 
-fn local_polynomial_interpolate(target_time: f32, degree: u32) -> f32 {
+fn select_window(target_time: f32, num_points: u32) -> u32 {
     let input_count = arrayLength(&input_times);
-    let num_points = min(degree + 1u, config.window_size);
     
-    // Find the best center point for local fitting
-    var center_idx = 0u;
-    var min_distance = abs(target_time - input_times[0]);
+    if (num_points >= input_count) {
+        return 0u;  // Use all points
+    }
     
-    for (var i = 1u; i < input_count; i++) {
-        let distance = abs(target_time - input_times[i]);
-        if (distance < min_distance) {
-            min_distance = distance;
-            center_idx = i;
+    // Find the position where target_time would be inserted
+    var insert_pos = 0u;
+    for (var i = 0u; i < input_count; i++) {
+        if (input_times[i] <= target_time) {
+            insert_pos = i + 1u;
+        } else {
+            break;
         }
     }
     
-    // Determine the window bounds
+    // Center the window around the insertion point
     let half_window = num_points / 2u;
-    var start_idx: u32;
-    var end_idx: u32;
+    var start_idx = insert_pos - min(insert_pos, half_window);
     
-    if (center_idx < half_window) {
-        start_idx = 0u;
-        end_idx = min(num_points, input_count);
-    } else if (center_idx + half_window >= input_count) {
-        end_idx = input_count;
-        start_idx = max(0u, input_count - num_points);
-    } else {
-        start_idx = center_idx - half_window;
-        end_idx = start_idx + num_points;
+    // Ensure we don't go out of bounds
+    if (start_idx + num_points > input_count) {
+        start_idx = input_count - num_points;
     }
     
-    let actual_points = end_idx - start_idx;
-    
-    // Perform Lagrange interpolation on the local window
+    return start_idx;
+}
+
+fn lagrange_interpolate(target_time: f32, start_idx: u32, num_points: u32) -> f32 {
     var result = 0.0;
-    for (var i = 0u; i < actual_points; i++) {
-        let idx = start_idx + i;
-        let li = lagrange_basis_local(target_time, i, actual_points, start_idx);
-        result += li * input_values[idx];
-    }
     
-    return result;
-}
-
-fn lagrange_basis(t: f32, j: u32, n: u32) -> f32 {
-    var result = 1.0;
-    let tj = input_times[j];
-    
-    for (var k = 0u; k < n; k++) {
-        if (k != j) {
-            let tk = input_times[k];
-            let denominator = tj - tk;
-            if (abs(denominator) < 1e-10) {
-                // Handle degenerate case
-                return 0.0;
+    // Lagrange interpolation formula
+    for (var j = 0u; j < num_points; j++) {
+        let j_idx = start_idx + j;
+        let tj = input_times[j_idx];
+        let yj = input_values[j_idx];
+        
+        var basis = 1.0;
+        
+        // Calculate Lagrange basis polynomial L_j(x)
+        for (var k = 0u; k < num_points; k++) {
+            if (k != j) {
+                let k_idx = start_idx + k;
+                let tk = input_times[k_idx];
+                let denominator = tj - tk;
+                
+                // Skip if denominator is too small to avoid numerical issues
+                if (abs(denominator) < 1e-12) {
+                    basis = 0.0;
+                    break;
+                }
+                
+                basis *= (target_time - tk) / denominator;
             }
-            result *= (t - tk) / denominator;
         }
-    }
-    
-    return result;
-}
-
-fn lagrange_basis_subset(t: f32, j: u32, n: u32, step: f32) -> f32 {
-    var result = 1.0;
-    let j_idx = u32(f32(j) * step + 0.5);
-    let safe_j_idx = min(j_idx, arrayLength(&input_times) - 1u);
-    let tj = input_times[safe_j_idx];
-    
-    for (var k = 0u; k < n; k++) {
-        if (k != j) {
-            let k_idx = u32(f32(k) * step + 0.5);
-            let safe_k_idx = min(k_idx, arrayLength(&input_times) - 1u);
-            let tk = input_times[safe_k_idx];
-            let denominator = tj - tk;
-            if (abs(denominator) < 1e-10) {
-                return 0.0;
-            }
-            result *= (t - tk) / denominator;
-        }
-    }
-    
-    return result;
-}
-
-fn lagrange_basis_local(t: f32, j: u32, n: u32, start_idx: u32) -> f32 {
-    var result = 1.0;
-    let tj = input_times[start_idx + j];
-    
-    for (var k = 0u; k < n; k++) {
-        if (k != j) {
-            let tk = input_times[start_idx + k];
-            let denominator = tj - tk;
-            if (abs(denominator) < 1e-10) {
-                return 0.0;
-            }
-            result *= (t - tk) / denominator;
-        }
+        
+        result += yj * basis;
     }
     
     return result;

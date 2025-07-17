@@ -15,8 +15,6 @@ use crate::Measurement;
 const PARALLEL_THRESHOLD: usize = 800; // ← Lower threshold based on your results
 const SIMD_PARALLEL_THRESHOLD: usize = 4000; // ← Adjust based on SIMD performance
 
-
-
 /// Generate target times for interpolation
 fn generate_target_times(start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution) -> Vec<DateTime<Utc>> {
 	let step = resolution.to_step();
