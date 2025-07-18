@@ -1,95 +1,130 @@
-use anyhow::Result;
-use bigdecimal::{BigDecimal, ToPrimitive, Zero};
+use anyhow::{Context, Result};
+use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use chrono::{DateTime, Utc};
-use bigdecimal::FromPrimitive;
 
-use crate::{Point, Resolution, splines::{DAYS_IN_MONTH, DAYS_IN_YEAR}};
+use crate::{
+	Point, Resolution, splines::{DAYS_IN_MONTH, DAYS_IN_YEAR}
+};
 
-/// Convert points to GPU-compatible f32 format
-pub fn convert_points_to_gpu_format(points: &[Point], resolution: Resolution) -> Result<(Vec<f32>, Vec<f32>)> {
-    if points.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
-    }
-
-    // Use a fixed base time (Unix epoch) for consistency
-    let base_time = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
-    
-    let mut times = Vec::with_capacity(points.len());
-    let mut values = Vec::with_capacity(points.len());
-
-    for point in points {
-        // Convert timestamp to f32 offset from base time
-        let duration = point.timestamp - base_time;
-        let time_offset = match resolution {
-            Resolution::Nanoseconds => duration.num_nanoseconds().unwrap_or(0) as f32,
-            Resolution::Microseconds => duration.num_microseconds().unwrap_or(0) as f32,
-            Resolution::Milliseconds => duration.num_milliseconds() as f32,
-            Resolution::Seconds => duration.num_seconds() as f32,
-            Resolution::Minutes => duration.num_minutes() as f32,
-            Resolution::Hours => duration.num_hours() as f32,
-            Resolution::Days => duration.num_days() as f32,
-            Resolution::Weeks => duration.num_weeks() as f32,
-            Resolution::Months => duration.num_days() as f32 / DAYS_IN_MONTH as f32,
-            Resolution::Years => duration.num_days() as f32 / DAYS_IN_YEAR as f32,
-        };
-
-        times.push(time_offset);
-        
-        // Convert BigDecimal to f32
-        let value = point.value.to_f32().unwrap_or(0.0);
-        values.push(value);
-    }
-
-    Ok((times, values))
+pub async fn get_max_buffer_size() -> Result<u64> {
+	let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+	let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions::default()).await.unwrap();
+	let limits = adapter.limits();
+	Ok(limits.max_buffer_size)
 }
 
-/// Convert DateTime array to GPU-compatible f32 format
-pub fn convert_datetimes_to_gpu_format(times: &[DateTime<Utc>], resolution: Resolution) -> Result<Vec<f32>> {
-    if times.is_empty() {
-        return Ok(Vec::new());
-    }
+/// Convert Vec<Point> to GPU-compatible format (time offsets in specified resolution)
+pub fn convert_points_to_gpu_format_f64(points: &[Point], resolution: &Resolution) -> Result<(Vec<f64>, Vec<f64>)> {
+	if points.is_empty() {
+		return Ok((Vec::new(), Vec::new()));
+	}
 
-    // Use the same fixed base time (Unix epoch) for consistency
-    let base_time = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
-    
-    let mut gpu_times = Vec::with_capacity(times.len());
+	let base_time = points[0].timestamp;
+	let mut times = Vec::with_capacity(points.len());
+	let mut values = Vec::with_capacity(points.len());
 
-    for &time in times {
-        // Convert timestamp to f32 offset from base time
-        let duration = time - base_time;
-        let time_offset = match resolution {
-            Resolution::Nanoseconds => duration.num_nanoseconds().unwrap_or(0) as f32,
-            Resolution::Microseconds => duration.num_microseconds().unwrap_or(0) as f32,
-            Resolution::Milliseconds => duration.num_milliseconds() as f32,
-            Resolution::Seconds => duration.num_seconds() as f32,
-            Resolution::Minutes => duration.num_minutes() as f32,
-            Resolution::Hours => duration.num_hours() as f32,
-            Resolution::Days => duration.num_days() as f32,
-            Resolution::Weeks => duration.num_weeks() as f32,
-            Resolution::Months => duration.num_days() as f32 / DAYS_IN_MONTH as f32,
-            Resolution::Years => duration.num_days() as f32 / DAYS_IN_YEAR as f32,
-        };
+	for point in points {
+		let duration = point.timestamp.signed_duration_since(base_time);
+		let time_offset = match resolution {
+			Resolution::Nanoseconds => duration.num_nanoseconds().context("Invalid duration")? as f64,
+			Resolution::Microseconds => duration.num_microseconds().context("Invalid duration")? as f64,
+			Resolution::Milliseconds => duration.num_milliseconds() as f64,
+			Resolution::Seconds => duration.num_seconds() as f64,
+			Resolution::Minutes => duration.num_minutes() as f64,
+			Resolution::Hours => duration.num_hours() as f64,
+			Resolution::Days => duration.num_days() as f64,
+			Resolution::Weeks => duration.num_weeks() as f64,
+			Resolution::Months => duration.num_days() as f64 / DAYS_IN_MONTH as f64,
+			Resolution::Years => duration.num_days() as f64 / DAYS_IN_YEAR as f64,
+		};
+		times.push(time_offset);
+		values.push(point.value.to_f64().context("Invalid value")?);
+	}
 
-        gpu_times.push(time_offset);
-    }
-
-    Ok(gpu_times)
+	Ok((times, values))
 }
 
-/// Convert GPU results back to Points
-pub fn convert_gpu_results_to_points(gpu_results: Vec<f32>, target_times: Vec<DateTime<Utc>>) -> Result<Vec<Point>> {
-    if gpu_results.len() != target_times.len() {
-        anyhow::bail!("GPU results and target times must have the same length");
-    }
+/// Convert Vec<Point> to GPU-compatible format (time offsets in specified resolution)
+pub fn convert_points_to_gpu_format_f32(points: &[Point], resolution: &Resolution) -> Result<(Vec<f32>, Vec<f32>)> {
+	if points.is_empty() {
+		return Ok((Vec::new(), Vec::new()));
+	}
 
-    let mut points = Vec::with_capacity(gpu_results.len());
-    
-    for (value, timestamp) in gpu_results.into_iter().zip(target_times.into_iter()) {
-        points.push(Point {
-            timestamp,
-            value: BigDecimal::from_f64(value as f64).unwrap_or(BigDecimal::zero()),
-        });
-    }
+	let base_time = points[0].timestamp;
+	let mut times = Vec::with_capacity(points.len());
+	let mut values = Vec::with_capacity(points.len());
 
-    Ok(points)
+	for point in points {
+		let duration = point.timestamp.signed_duration_since(base_time);
+		let time_offset = match resolution {
+			Resolution::Nanoseconds => duration.num_nanoseconds().context("Invalid duration")? as f32,
+			Resolution::Microseconds => duration.num_microseconds().context("Invalid duration")? as f32,
+			Resolution::Milliseconds => duration.num_milliseconds() as f32,
+			Resolution::Seconds => duration.num_seconds() as f32,
+			Resolution::Minutes => duration.num_minutes() as f32,
+			Resolution::Hours => duration.num_hours() as f32,
+			Resolution::Days => duration.num_days() as f32,
+			Resolution::Weeks => duration.num_weeks() as f32,
+			Resolution::Months => duration.num_days() as f32 / DAYS_IN_MONTH as f32,
+			Resolution::Years => duration.num_days() as f32 / DAYS_IN_YEAR as f32,
+		};
+		times.push(time_offset);
+		values.push(point.value.to_f32().context("Invalid value")?);
+	}
+
+	Ok((times, values))
+}
+
+/// Convert target DateTime<Utc> to GPU-compatible format (time offsets in specified resolution)
+pub fn convert_datetimes_to_gpu_format_f64(target_times: &[DateTime<Utc>], resolution: &Resolution, base_time: DateTime<Utc>) -> Result<Vec<f64>> {
+	let mut times = Vec::with_capacity(target_times.len());
+	for &target_time in target_times {
+		let duration = target_time.signed_duration_since(base_time);
+		let time_offset = match resolution {
+			Resolution::Nanoseconds => duration.num_nanoseconds().context("Invalid duration")? as f64,
+			Resolution::Microseconds => duration.num_microseconds().context("Invalid duration")? as f64,
+			Resolution::Milliseconds => duration.num_milliseconds() as f64,
+			Resolution::Seconds => duration.num_seconds() as f64,
+			Resolution::Minutes => duration.num_minutes() as f64,
+			Resolution::Hours => duration.num_hours() as f64,
+			Resolution::Days => duration.num_days() as f64,
+			Resolution::Weeks => duration.num_weeks() as f64,
+			Resolution::Months => duration.num_days() as f64 / DAYS_IN_MONTH as f64,
+			Resolution::Years => duration.num_days() as f64 / DAYS_IN_YEAR as f64,
+		};
+		times.push(time_offset);
+	}
+	Ok(times)
+}
+
+/// Convert target DateTime<Utc> to GPU-compatible format (time offsets in specified resolution)
+pub fn convert_datetimes_to_gpu_format_f32(target_times: &[DateTime<Utc>], resolution: &Resolution, base_time: DateTime<Utc>) -> Result<Vec<f32>> {
+	let mut times = Vec::with_capacity(target_times.len());
+	for &target_time in target_times {
+		let duration = target_time.signed_duration_since(base_time);
+		let time_offset = match resolution {
+			Resolution::Nanoseconds => duration.num_nanoseconds().context("Invalid duration")? as f32,
+			Resolution::Microseconds => duration.num_microseconds().context("Invalid duration")? as f32,
+			Resolution::Milliseconds => duration.num_milliseconds() as f32,
+			Resolution::Seconds => duration.num_seconds() as f32,
+			Resolution::Minutes => duration.num_minutes() as f32,
+			Resolution::Hours => duration.num_hours() as f32,
+			Resolution::Days => duration.num_days() as f32,
+			Resolution::Weeks => duration.num_weeks() as f32,
+			Resolution::Months => duration.num_days() as f32 / DAYS_IN_MONTH as f32,
+			Resolution::Years => duration.num_days() as f32 / DAYS_IN_YEAR as f32,
+		};
+		times.push(time_offset);
+	}
+	Ok(times)
+}
+
+/// Convert GPU results back to Point structs
+pub fn convert_gpu_results_to_points_f64(results: Vec<f64>, target_times: &[DateTime<Utc>]) -> Result<Vec<Point>> {
+	Ok(results.into_iter().zip(target_times).map(|(value, timestamp)| Point { timestamp: timestamp.clone(), value: BigDecimal::from_f64(value).context("Invalid value").unwrap() }).collect())
+}
+
+/// Convert GPU results back to Point structs
+pub fn convert_gpu_results_to_points_f32(results: Vec<f32>, target_times: &[DateTime<Utc>]) -> Result<Vec<Point>> {
+	Ok(results.into_iter().zip(target_times).map(|(value, timestamp)| Point { timestamp: timestamp.clone(), value: BigDecimal::from_f32(value).context("Invalid value").unwrap() }).collect())
 }

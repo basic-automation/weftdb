@@ -65,7 +65,7 @@ impl LinearSpline {
 			};
 			return Ok(self.segments[0].evaluate(dt));
 		}
-		
+
 		// Handle extrapolation forward - use last segment with proper linear extrapolation
 		if target_time >= self.time_bounds[self.time_bounds.len() - 1] {
 			let last_segment_idx = self.segments.len() - 1;
@@ -186,10 +186,7 @@ impl LinearSegment {
 
 		if dt_base == 0 {
 			// Handle identical timestamps - create constant segment
-			return Ok(Self {
-				slope: BigDecimal::zero(),
-				intercept: p1.value.clone(),
-			});
+			return Ok(Self { slope: BigDecimal::zero(), intercept: p1.value.clone() });
 		}
 
 		let dt = match BigDecimal::from_i64(dt_base) {
