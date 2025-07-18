@@ -31,59 +31,59 @@ pub async fn cpu_interpolate(points: Vec<Point>, start: DateTime<Utc>, end: Date
 				(input, output) if input < SIMD_THRESHOLD && output < SIMD_THRESHOLD_PLUS_ONE => {
 					// Use scalar linear interpolation
 					linear(points, start, end, resolution)
-				},
+				}
 				(input, output) if input >= SIMD_THRESHOLD && output >= SIMD_THRESHOLD_PLUS_ONE => {
 					// Use parallel SIMD interpolation
 					parallel_simd_interpolate(&points, &target_times, spline, resolution)
-				},
+				}
 				_ => {
 					// Use SIMD linear interpolation
 					simd_interpolate(&points, &target_times, spline, resolution)
 				}
 			}
-		},
+		}
 		Spline::Quadratic => {
 			match (input_count, output_count) {
 				(input, output) if input < SIMD_THRESHOLD && output < SIMD_THRESHOLD_PLUS_ONE => {
 					// Use scalar quadratic interpolation
 					quadratic(points, start, end, resolution)
-				},
+				}
 				(input, output) if input >= SIMD_THRESHOLD && output >= SIMD_THRESHOLD_PLUS_ONE => {
 					// Use parallel SIMD interpolation
 					parallel_simd_interpolate(&points, &target_times, spline, resolution)
-				},
+				}
 				_ => {
 					// Use SIMD quadratic interpolation
 					simd_interpolate(&points, &target_times, spline, resolution)
 				}
 			}
-		},
+		}
 		Spline::Cubic => {
 			match (input_count, output_count) {
 				(input, output) if input < SIMD_THRESHOLD && output < SIMD_THRESHOLD_PLUS_ONE => {
 					// Use scalar cubic interpolation
 					cubic(points, start, end, resolution)
-				},
+				}
 				(input, output) if input >= SIMD_THRESHOLD && output >= SIMD_THRESHOLD_PLUS_ONE => {
 					// Use parallel SIMD interpolation
 					parallel_simd_interpolate(&points, &target_times, spline, resolution)
-				},
+				}
 				_ => {
 					// Use SIMD cubic interpolation
 					simd_interpolate(&points, &target_times, spline, resolution)
 				}
 			}
-		},
+		}
 		Spline::Polynomial(degree, bounds_factor) => {
 			match (input_count, output_count) {
 				(input, output) if input < SIMD_THRESHOLD && output < SIMD_THRESHOLD_PLUS_ONE => {
 					// Use scalar polynomial interpolation
 					polynomial(points, start, end, resolution, degree, bounds_factor)
-				},
+				}
 				(input, output) if input >= SIMD_THRESHOLD && output >= SIMD_THRESHOLD_PLUS_ONE => {
 					// Use parallel SIMD interpolation
 					parallel_simd_interpolate(&points, &target_times, spline, resolution)
-				},
+				}
 				_ => {
 					// Use SIMD polynomial interpolation
 					simd_interpolate(&points, &target_times, spline, resolution)

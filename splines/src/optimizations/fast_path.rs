@@ -43,9 +43,9 @@ pub const fn apply_fast_path(spline: Spline, measurement_count: usize) -> Spline
 		// Polynomial optimizations
 		Spline::Polynomial(degree, bounds_factor) => {
 			match degree {
-				1 => Spline::Linear, // Degree 1 is linear
-				2 => Spline::Quadratic, // Degree 2 is quadratic
-				3 => Spline::Cubic, // Degree 3 is cubic
+				1 => Spline::Linear,                            // Degree 1 is linear
+				2 => Spline::Quadratic,                         // Degree 2 is quadratic
+				3 => Spline::Cubic,                             // Degree 3 is cubic
 				_ => Spline::Polynomial(degree, bounds_factor), // Small datasets: keep polynomial
 			}
 		}

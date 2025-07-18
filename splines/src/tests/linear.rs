@@ -1,14 +1,15 @@
 #[cfg(test)]
 mod tests {
+	use std::sync::LazyLock;
+
 	use bigdecimal::{BigDecimal, FromPrimitive};
 	use chrono::{DateTime, Utc};
 
 	use super::super::plot_terminal;
-	use crate::{auto_interpolate, generate_target_times, gpu_interpolate, linear, simd_interpolate, Point, Resolution, parallel_simd_interpolate};
-	use std::sync::LazyLock;
+	use crate::{Point, Resolution, auto_interpolate, generate_target_times, gpu_interpolate, linear, parallel_simd_interpolate, simd_interpolate};
 
 	const TARGET_ACCURACY_THRESHOLD: f64 = 10.0e-1;
-	const RESOLUTION: Resolution = Resolution::Microseconds;
+	const RESOLUTION: Resolution = Resolution::Nanoseconds;
 	const START: DateTime<Utc> = DateTime::<Utc>::from_timestamp(-4, 0).unwrap();
 	const END: DateTime<Utc> = DateTime::<Utc>::from_timestamp(35, 0).unwrap();
 	const SPLINE: crate::Spline = crate::Spline::Linear;
