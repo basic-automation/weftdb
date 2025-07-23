@@ -60,7 +60,7 @@ mod tests {
 
 		// gpu interpolation
 		let timer = tokio::time::Instant::now();
-		let gpu = gpu_interpolate(points.clone(), target_times, spline, resolution).await.unwrap();
+		let gpu = gpu_interpolate(points.clone(), start, end, resolution, spline).await.unwrap();
 		let gpu_time = timer.elapsed();
 		println!("Cubic: GPU Interpolation took: {:?}", gpu_time);
 

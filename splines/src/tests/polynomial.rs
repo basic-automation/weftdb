@@ -62,7 +62,7 @@ mod tests {
 
 		// gpu interpolation with bounds from spline
 		let timer = tokio::time::Instant::now();
-		let gpu = gpu_interpolate(points.clone(), target_times.clone(), spline, resolution).await.unwrap();
+		let gpu = gpu_interpolate(points.clone(), start, end, resolution, spline).await.unwrap();
 		let gpu_time = timer.elapsed();
 		println!("Polynomial: GPU Interpolation took: {:?}", gpu_time);
 
@@ -197,7 +197,7 @@ mod tests {
 
 		// Run CPU and GPU interpolations with bounds from spline
 		let cpu = polynomial(points.clone(), start, end, resolution, degree, bounds_factor).unwrap();
-		let gpu = gpu_interpolate(points.clone(), target_times, spline, resolution).await.unwrap();
+		let gpu = gpu_interpolate(points.clone(), start, end, resolution, spline).await.unwrap();
 
 		// Extract values for comparison
 		let cpu_values: Vec<_> = cpu.iter().map(|p| p.value.clone()).collect();

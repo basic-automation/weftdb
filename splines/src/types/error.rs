@@ -28,4 +28,7 @@ pub enum Error {
 
 	#[error("Invalid degree for polynomial interpolation: {0}. Must be at least 1.")]
 	InvalidDegreeError(usize),
+
+	#[error("IO Error: {0}")]
+	IOError(String),
 }

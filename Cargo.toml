@@ -27,6 +27,7 @@ num_cpus = "1.17.0"
 ratatui = "0.29.0"
 crossterm = "0.29.0"
 futures-channel = "0.3"
+sysinfo = "0.36.1"
 
 [profile.release]
 opt-level = 3

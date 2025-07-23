@@ -45,7 +45,7 @@ pub fn quadratic(points: Vec<Point>, start: DateTime<Utc>, end: DateTime<Utc>, r
 	sorted_points.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
 
 	// Check for uniform spacing - enables fast path
-	if is_uniformly_spaced(&sorted_points, resolution) {
+	if is_uniformly_spaced(&sorted_points, &resolution) {
 		return quadratic_uniform_fast(&sorted_points, start, end, resolution);
 	}
 
@@ -57,203 +57,9 @@ pub fn quadratic(points: Vec<Point>, start: DateTime<Utc>, end: DateTime<Utc>, r
 	let mut result = Vec::new();
 
 	// Pre-compute rounding to avoid repeated calculations
-	let start_base = match resolution {
-		Resolution::Nanoseconds => match start.timestamp_nanos_opt() {
-			Some(value) => value,
-			None => bail!(Error::DecimalConversionError),
-		},
-		Resolution::Microseconds => start.timestamp_micros(),
-		Resolution::Milliseconds => start.timestamp_millis(),
-		Resolution::Seconds => start.timestamp(),
-		Resolution::Minutes => start.timestamp() / SECONDS_IN_MINUTE,
-		Resolution::Hours => start.timestamp() / SECONDS_IN_HOUR,
-		Resolution::Days => start.timestamp() / SECONDS_IN_DAY,
-		Resolution::Weeks => start.timestamp() / SECONDS_IN_WEEK,
-		Resolution::Months => start.timestamp() / SECONDS_IN_MONTH,
-		Resolution::Years => start.timestamp() / SECONDS_IN_YEAR,
-	};
-
-	let step_base = match resolution {
-		Resolution::Nanoseconds => match step.num_nanoseconds() {
-			Some(value) => value,
-			None => bail!(Error::DecimalConversionError),
-		},
-		Resolution::Microseconds => match step.num_microseconds() {
-			Some(value) => value,
-			None => bail!(Error::DecimalConversionError),
-		},
-		Resolution::Milliseconds => step.num_milliseconds(),
-		Resolution::Seconds => step.num_seconds(),
-		Resolution::Minutes => step.num_minutes(),
-		Resolution::Hours => step.num_hours(),
-		Resolution::Days => step.num_days(),
-		Resolution::Weeks => step.num_weeks(),
-		Resolution::Months => step.num_days() / DAYS_IN_MONTH,
-		Resolution::Years => step.num_days() / DAYS_IN_YEAR,
-	};
-	let start_offset = start_base % step_base;
-	let rounded_start = match resolution {
-		Resolution::Nanoseconds => {
-			if start_offset == 0 {
-				start
-			} else {
-				start + chrono::TimeDelta::nanoseconds(step_base - start_offset)
-			}
-		}
-		Resolution::Microseconds => {
-			if start_offset == 0 {
-				start
-			} else {
-				start + chrono::TimeDelta::microseconds(step_base - start_offset)
-			}
-		}
-		Resolution::Milliseconds => {
-			if start_offset == 0 {
-				start
-			} else {
-				start + chrono::TimeDelta::milliseconds(step_base - start_offset)
-			}
-		}
-		Resolution::Seconds => {
-			if start_offset == 0 {
-				start
-			} else {
-				start + chrono::TimeDelta::seconds(step_base - start_offset)
-			}
-		}
-		Resolution::Minutes => {
-			if start_offset == 0 {
-				start
-			} else {
-				start + chrono::TimeDelta::minutes(step_base - start_offset)
-			}
-		}
-		Resolution::Hours => {
-			if start_offset == 0 {
-				start
-			} else {
-				start + chrono::TimeDelta::hours(step_base - start_offset)
-			}
-		}
-		Resolution::Days => {
-			if start_offset == 0 {
-				start
-			} else {
-				start + chrono::TimeDelta::days(step_base - start_offset)
-			}
-		}
-		Resolution::Weeks => {
-			if start_offset == 0 {
-				start
-			} else {
-				start + chrono::TimeDelta::weeks(step_base - start_offset)
-			}
-		}
-		Resolution::Months => {
-			if start_offset == 0 {
-				start
-			} else {
-				start + chrono::TimeDelta::days(step_base - start_offset)
-			}
-		}
-		Resolution::Years => {
-			if start_offset == 0 {
-				start
-			} else {
-				start + chrono::TimeDelta::days(step_base - start_offset)
-			}
-		}
-	};
-
-	let end_base = match resolution {
-		Resolution::Nanoseconds => match end.timestamp_nanos_opt() {
-			Some(value) => value,
-			None => bail!(Error::DecimalConversionError),
-		},
-		Resolution::Microseconds => end.timestamp_micros(),
-		Resolution::Milliseconds => end.timestamp_millis(),
-		Resolution::Seconds => end.timestamp(),
-		Resolution::Minutes => end.timestamp() / SECONDS_IN_MINUTE,
-		Resolution::Hours => end.timestamp() / SECONDS_IN_HOUR,
-		Resolution::Days => end.timestamp() / SECONDS_IN_DAY,
-		Resolution::Weeks => end.timestamp() / SECONDS_IN_WEEK,
-		Resolution::Months => end.timestamp() / SECONDS_IN_MONTH,
-		Resolution::Years => end.timestamp() / SECONDS_IN_YEAR,
-	};
-
-	let end_offset = end_base % step_base;
-	let rounded_end = match resolution {
-		Resolution::Nanoseconds => {
-			if end_offset == 0 {
-				end
-			} else {
-				end - chrono::TimeDelta::nanoseconds(end_offset)
-			}
-		}
-		Resolution::Microseconds => {
-			if end_offset == 0 {
-				end
-			} else {
-				end - chrono::TimeDelta::microseconds(end_offset)
-			}
-		}
-		Resolution::Milliseconds => {
-			if end_offset == 0 {
-				end
-			} else {
-				end - chrono::TimeDelta::milliseconds(end_offset)
-			}
-		}
-		Resolution::Seconds => {
-			if end_offset == 0 {
-				end
-			} else {
-				end - chrono::TimeDelta::seconds(end_offset)
-			}
-		}
-		Resolution::Minutes => {
-			if end_offset == 0 {
-				end
-			} else {
-				end - chrono::TimeDelta::minutes(end_offset)
-			}
-		}
-		Resolution::Hours => {
-			if end_offset == 0 {
-				end
-			} else {
-				end - chrono::TimeDelta::hours(end_offset)
-			}
-		}
-		Resolution::Days => {
-			if end_offset == 0 {
-				end
-			} else {
-				end - chrono::TimeDelta::days(end_offset)
-			}
-		}
-		Resolution::Weeks => {
-			if end_offset == 0 {
-				end
-			} else {
-				end - chrono::TimeDelta::weeks(end_offset)
-			}
-		}
-		Resolution::Months => {
-			if end_offset == 0 {
-				end
-			} else {
-				end - chrono::TimeDelta::days(end_offset)
-			}
-		}
-		Resolution::Years => {
-			if end_offset == 0 {
-				end
-			} else {
-				end - chrono::TimeDelta::days(end_offset)
-			}
-		}
-	};
+	let step_base = resolution.to_step_base()?;
+	let rounded_start = resolution.round(&start)?;
+	let rounded_end = resolution.round(&end)?;
 
 	// Pre-allocate result vector for better performance - safe casting
 	let time_diff_base = match resolution {
@@ -636,7 +442,7 @@ pub fn quadratic_simd(points: &[Point], target_times: &[DateTime<Utc>], resoluti
 	sorted_points.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
 
 	// Check if data is uniformly spaced (match CPU logic exactly)
-	let is_uniform = is_uniformly_spaced(&sorted_points, resolution);
+	let is_uniform = is_uniformly_spaced(&sorted_points, &resolution);
 
 	// Convert to f64 arrays for SIMD processing
 	#[allow(clippy::cast_precision_loss)]

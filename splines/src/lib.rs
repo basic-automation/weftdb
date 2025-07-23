@@ -5,8 +5,8 @@
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 pub(crate) use gpu::gpu_interpolate;
-pub(crate) use helpers::{estimate_output_points, generate_target_times, is_uniformly_spaced, should_use_gpu};
-pub use optimizations::{apply_fast_path, cpu_interpolate, parallel_simd_interpolate, simd_interpolate};
+pub(crate) use helpers::{TargetTimesIterator, estimate_output_points, generate_target_times, is_uniformly_spaced, should_use_gpu};
+pub use optimizations::{apply_fast_path, cpu_interpolate, parallel_interpolate};
 pub(crate) use splines::{cubic, cubic_simd, linear, linear_simd, polynomial, polynomial_simd, quadratic, quadratic_simd};
 pub use types::{Error, Point, Resolution, Spline};
 
@@ -44,11 +44,8 @@ pub async fn auto_interpolate(points: Vec<Point>, start: DateTime<Utc>, end: Dat
 	let spline = apply_fast_path(spline, points.len());
 
 	if use_gpu {
-		// Generate target times for GPU
-		let target_times = generate_target_times(start, end, resolution);
-
 		// Try GPU interpolation with fallback - clone measurements to avoid ownership issues
-		match gpu_interpolate(points.clone(), target_times, spline, resolution).await {
+		match gpu_interpolate(points.clone(), start, end, resolution, spline).await {
 			Ok(result) => return Ok(result),
 			Err(_) => (),
 		}
