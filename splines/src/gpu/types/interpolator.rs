@@ -18,7 +18,6 @@ pub struct GpuInterpolator {
 	bind_group_layout: BindGroupLayout,
 	supports_f64: bool,
 	pub max_storage_buffer_binding_size: usize,
-	pub max_compute_workgroups_per_dimension: usize,
 }
 
 impl GpuInterpolator {
@@ -68,7 +67,7 @@ impl GpuInterpolator {
 
 		let bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor { label: Some("Interpolation Bind Group Layout"), entries: &[BindGroupLayoutEntry { binding: 0, visibility: ShaderStages::COMPUTE, ty: BindingType::Buffer { ty: BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None }, BindGroupLayoutEntry { binding: 1, visibility: ShaderStages::COMPUTE, ty: BindingType::Buffer { ty: BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None }, BindGroupLayoutEntry { binding: 2, visibility: ShaderStages::COMPUTE, ty: BindingType::Buffer { ty: BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None }, BindGroupLayoutEntry { binding: 3, visibility: ShaderStages::COMPUTE, ty: BindingType::Buffer { ty: BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None }] });
 
-		Ok(Self { device, queue, pipelines_f64: HashMap::new(), pipelines_f32: HashMap::new(), bind_group_layout, supports_f64, max_storage_buffer_binding_size, max_compute_workgroups_per_dimension })
+		Ok(Self { device, queue, pipelines_f64: HashMap::new(), pipelines_f32: HashMap::new(), bind_group_layout, supports_f64, max_storage_buffer_binding_size })
 	}
 
 	/// Check if device supports f64

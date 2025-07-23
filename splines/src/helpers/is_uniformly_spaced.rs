@@ -3,7 +3,7 @@ use chrono::Duration;
 use crate::{Point, Resolution};
 
 /// Check if measurements are uniformly spaced
-pub fn is_uniformly_spaced(points: &[Point], resolution: Resolution) -> bool {
+pub fn is_uniformly_spaced(points: &[Point], resolution: &Resolution) -> bool {
 	if points.len() < 3 {
 		return false;
 	}

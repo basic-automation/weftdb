@@ -23,7 +23,7 @@ pub struct LinearSpline {
 }
 
 impl LinearSpline {
-	pub fn new(points: &[Point], resolution: Resolution) -> Result<Self> {
+	pub fn new(points: &[Point], resolution: &Resolution) -> Result<Self> {
 		let mut segments = Vec::with_capacity(points.len().saturating_sub(1));
 		let mut time_bounds = Vec::with_capacity(points.len());
 
@@ -34,124 +34,44 @@ impl LinearSpline {
 		}
 		time_bounds.push(points[points.len() - 1].timestamp);
 
-		Ok(Self { segments, time_bounds, resolution })
+		Ok(Self { segments, time_bounds, resolution: *resolution })
 	}
 
-	pub fn evaluate(&self, target_time: DateTime<Utc>) -> Result<BigDecimal> {
+	pub fn evaluate(&self, target_time: &DateTime<Utc>) -> Result<BigDecimal> {
 		// Handle extrapolation backward - use first segment with proper linear extrapolation
-		if target_time <= self.time_bounds[0] {
-			let duration = target_time - self.time_bounds[0];
-			let dt_base = match self.resolution {
-				Resolution::Nanoseconds => match duration.num_nanoseconds() {
-					Some(value) => value,
-					None => bail!(Error::InvalidTimeRangeError),
-				},
-				Resolution::Microseconds => match duration.num_microseconds() {
-					Some(value) => value,
-					None => bail!(Error::InvalidTimeRangeError),
-				},
-				Resolution::Milliseconds => duration.num_milliseconds(),
-				Resolution::Seconds => duration.num_seconds(),
-				Resolution::Minutes => duration.num_minutes(),
-				Resolution::Hours => duration.num_hours(),
-				Resolution::Days => duration.num_days(),
-				Resolution::Weeks => duration.num_weeks(),
-				Resolution::Months => duration.num_days() / DAYS_IN_MONTH,
-				Resolution::Years => duration.num_days() / DAYS_IN_YEAR,
+		if *target_time <= self.time_bounds[0] {
+			let Some(dt) = BigDecimal::from_i64(self.resolution.difference(target_time, &self.time_bounds[0])?) else {
+				bail!(Error::InvalidTimeRangeError);
 			};
-			let dt = match BigDecimal::from_i64(dt_base) {
-				Some(value) => value,
-				None => bail!(Error::InvalidTimeRangeError),
-			};
-			return Ok(self.segments[0].evaluate(dt));
+			return Ok(self.segments[0].evaluate(&dt));
 		}
 
 		// Handle extrapolation forward - use last segment with proper linear extrapolation
-		if target_time >= self.time_bounds[self.time_bounds.len() - 1] {
+		if *target_time >= self.time_bounds[self.time_bounds.len() - 1] {
 			let last_segment_idx = self.segments.len() - 1;
-			let duration = target_time - self.time_bounds[last_segment_idx];
-			let dt_base = match self.resolution {
-				Resolution::Nanoseconds => match duration.num_nanoseconds() {
-					Some(value) => value,
-					None => bail!(Error::InvalidTimeRangeError),
-				},
-				Resolution::Microseconds => match duration.num_microseconds() {
-					Some(value) => value,
-					None => bail!(Error::InvalidTimeRangeError),
-				},
-				Resolution::Milliseconds => duration.num_milliseconds(),
-				Resolution::Seconds => duration.num_seconds(),
-				Resolution::Minutes => duration.num_minutes(),
-				Resolution::Hours => duration.num_hours(),
-				Resolution::Days => duration.num_days(),
-				Resolution::Weeks => duration.num_weeks(),
-				Resolution::Months => duration.num_days() / DAYS_IN_MONTH,
-				Resolution::Years => duration.num_days() / DAYS_IN_YEAR,
+			let Some(dt) = BigDecimal::from_i64(self.resolution.difference(target_time, &self.time_bounds[last_segment_idx])?) else {
+				bail!(Error::InvalidTimeRangeError);
 			};
-			let dt = match BigDecimal::from_i64(dt_base) {
-				Some(value) => value,
-				None => bail!(Error::InvalidTimeRangeError),
-			};
-			return Ok(self.segments[last_segment_idx].evaluate(dt));
+			return Ok(self.segments[last_segment_idx].evaluate(&dt));
 		}
 
 		// Find the appropriate segment for interpolation
 		for (i, &bound_time) in self.time_bounds.iter().enumerate().skip(1) {
-			if target_time <= bound_time {
+			if *target_time <= bound_time {
 				let segment_idx = i - 1;
-				let duration = target_time - self.time_bounds[segment_idx];
-				let dt_base = match self.resolution {
-					Resolution::Nanoseconds => match duration.num_nanoseconds() {
-						Some(value) => value,
-						None => bail!(Error::InvalidTimeRangeError),
-					},
-					Resolution::Microseconds => match duration.num_microseconds() {
-						Some(value) => value,
-						None => bail!(Error::InvalidTimeRangeError),
-					},
-					Resolution::Milliseconds => duration.num_milliseconds(),
-					Resolution::Seconds => duration.num_seconds(),
-					Resolution::Minutes => duration.num_minutes(),
-					Resolution::Hours => duration.num_hours(),
-					Resolution::Days => duration.num_days(),
-					Resolution::Weeks => duration.num_weeks(),
-					Resolution::Months => duration.num_days() / DAYS_IN_MONTH,
-					Resolution::Years => duration.num_days() / DAYS_IN_YEAR,
+				let Some(dt) = BigDecimal::from_i64(self.resolution.difference(target_time, &self.time_bounds[segment_idx])?) else {
+					bail!(Error::InvalidTimeRangeError);
 				};
-				let dt = match BigDecimal::from_i64(dt_base) {
-					Some(value) => value,
-					None => bail!(Error::InvalidTimeRangeError),
-				};
-				return Ok(self.segments[segment_idx].evaluate(dt));
+				return Ok(self.segments[segment_idx].evaluate(&dt));
 			}
 		}
 
 		// Fallback to last segment
 		let last_idx = self.segments.len() - 1;
-		let duration = target_time - self.time_bounds[last_idx];
-		let dt_base = match self.resolution {
-			Resolution::Nanoseconds => match duration.num_nanoseconds() {
-				Some(value) => value,
-				None => bail!(Error::InvalidTimeRangeError),
-			},
-			Resolution::Microseconds => match duration.num_microseconds() {
-				Some(value) => value,
-				None => bail!(Error::InvalidTimeRangeError),
-			},
-			Resolution::Milliseconds => duration.num_milliseconds(),
-			Resolution::Seconds => duration.num_seconds(),
-			Resolution::Minutes => duration.num_minutes(),
-			Resolution::Hours => duration.num_hours(),
-			Resolution::Days => duration.num_days(),
-			Resolution::Weeks => duration.num_weeks(),
-			Resolution::Months => duration.num_days() / DAYS_IN_MONTH,
-			Resolution::Years => duration.num_days() / DAYS_IN_YEAR,
+		let Some(dt) = BigDecimal::from_i64(self.resolution.difference(target_time, &self.time_bounds[last_idx])?) else {
+			bail!(Error::InvalidTimeRangeError);
 		};
-		let dt = match BigDecimal::from_i64(dt_base) {
-			Some(value) => value,
-			None => bail!(Error::InvalidTimeRangeError),
-		};
-		Ok(self.segments[last_idx].evaluate(dt))
+		Ok(self.segments[last_idx].evaluate(&dt))
 	}
 }
 
@@ -164,35 +84,16 @@ struct LinearSegment {
 
 impl LinearSegment {
 	/// Create a linear segment between two measurements
-	fn fit_linear(p1: &Point, p2: &Point, resolution: Resolution) -> Result<Self> {
-		let dt_base = match resolution {
-			Resolution::Nanoseconds => match (p2.timestamp - p1.timestamp).num_nanoseconds() {
-				Some(value) => value,
-				None => bail!(Error::InvalidTimeRangeError),
-			},
-			Resolution::Microseconds => match (p2.timestamp - p1.timestamp).num_microseconds() {
-				Some(value) => value,
-				None => bail!(Error::InvalidTimeRangeError),
-			},
-			Resolution::Milliseconds => (p2.timestamp - p1.timestamp).num_milliseconds(),
-			Resolution::Seconds => (p2.timestamp - p1.timestamp).num_seconds(),
-			Resolution::Minutes => (p2.timestamp - p1.timestamp).num_minutes(),
-			Resolution::Hours => (p2.timestamp - p1.timestamp).num_hours(),
-			Resolution::Days => (p2.timestamp - p1.timestamp).num_days(),
-			Resolution::Weeks => (p2.timestamp - p1.timestamp).num_weeks(),
-			Resolution::Months => (p2.timestamp - p1.timestamp).num_days() / DAYS_IN_MONTH,
-			Resolution::Years => (p2.timestamp - p1.timestamp).num_days() / DAYS_IN_YEAR,
+	fn fit_linear(p1: &Point, p2: &Point, resolution: &Resolution) -> Result<Self> {
+		let Some(dt) = BigDecimal::from_i64(resolution.difference(&p2.timestamp, &p1.timestamp)?) else {
+			bail!(Error::InvalidTimeRangeError);
 		};
 
-		if dt_base == 0 {
+		if dt == BigDecimal::zero() {
 			// Handle identical timestamps - create constant segment
 			return Ok(Self { slope: BigDecimal::zero(), intercept: p1.value.clone() });
 		}
 
-		let dt = match BigDecimal::from_i64(dt_base) {
-			Some(value) => value,
-			None => bail!(Error::InvalidTimeRangeError),
-		};
 		let dy = &p2.value - &p1.value;
 		let slope = dy / dt;
 
@@ -203,7 +104,7 @@ impl LinearSegment {
 	}
 
 	/// Evaluate the linear function at time offset dt (in milliseconds)
-	fn evaluate(&self, dt: BigDecimal) -> BigDecimal {
+	fn evaluate(&self, dt: &BigDecimal) -> BigDecimal {
 		&self.intercept + &self.slope * dt
 	}
 }

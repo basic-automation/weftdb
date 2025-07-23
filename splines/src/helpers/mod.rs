@@ -1,5 +1,5 @@
 pub use estimate_output_points::estimate_output_points;
-pub use generate_target_times::generate_target_times;
+pub use generate_target_times::{TargetTimesIterator, generate_target_times};
 pub use is_uniformly_spaced::is_uniformly_spaced;
 pub use should_use_gpu::should_use_gpu;
 
