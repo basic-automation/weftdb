@@ -1,3 +1,8 @@
+use anyhow::{Result, bail};
+use chrono::{DateTime, Utc};
+
+use crate::Point;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Spline {
 	Linear,
@@ -33,5 +38,18 @@ impl Spline {
 			Self::Linear | Self::Quadratic | Self::Cubic => None, // These don't support bounds
 			Self::Polynomial(_, bounds) => *bounds,
 		}
+	}
+
+	#[must_use]
+	pub fn pre_check(&self, points: &Vec<Point>, start: &DateTime<Utc>, end: &DateTime<Utc>) -> Result<()> {
+		if points.len() < self.number_of_points_required() {
+			bail!("Spline {:?} requires at least {} points, but got {}", self, self.number_of_points_required(), points.len());
+		}
+
+		if start >= end {
+			bail!("Start time {:?} must be before end time {:?}", start, end);
+		}
+
+		Ok(())
 	}
 }

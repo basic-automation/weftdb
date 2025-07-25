@@ -3,10 +3,16 @@ use chrono::Duration;
 use crate::{Point, Resolution};
 
 /// Check if measurements are uniformly spaced
-pub fn is_uniformly_spaced(points: &[Point], resolution: &Resolution) -> bool {
+pub fn is_uniformly_spaced(points: &Vec<Point>, resolution: &Resolution) -> bool {
 	if points.len() < 3 {
 		return false;
 	}
+
+	let points = {
+		let mut sorted = points.clone();
+		sorted.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+		sorted
+	};
 
 	let first_interval = points[1].timestamp - points[0].timestamp;
 

@@ -1,199 +1,103 @@
-use std::{
-	fs::File, io::{BufRead, BufReader, BufWriter, Write}
-};
+use std::io::Write;
 
 use anyhow::{Result, bail};
-use bigdecimal::{BigDecimal, FromPrimitive};
 use chrono::{DateTime, Utc};
-pub use fast_path::apply_fast_path;
 use rayon::prelude::*;
-use sysinfo::System;
-use tempfile::NamedTempFile;
 
-use super::TargetTimesIterator;
-use crate::{Error, Point, Resolution, Spline, cubic, cubic_simd, generate_target_times, linear, linear_simd, polynomial, polynomial_simd, quadratic, quadratic_simd};
+use crate::{Error, InterpolationState, POINT_SIZE, Point, Resolution, Spline, batch, cubic, cubic_simd, generate_target_times, linear, linear_simd, polynomial, polynomial_simd, quadratic, quadratic_simd};
 
 mod fast_path;
+pub use fast_path::apply_fast_path; // Re-export apply_fast_path
 
-/// Threshold for switching to parallel processing
-//const PARALLEL_THRESHOLD: usize = 1000; // ← Lower threshold based on your results
-const SIMD_THRESHOLD: usize = 200; // ← Adjust based on SIMD performance
-const SIMD_THRESHOLD_PLUS_ONE: usize = SIMD_THRESHOLD + 1; // For SIMD, we need at least one more than the threshold
+const SIMD_THRESHOLD: usize = 200;
+const SIMD_THRESHOLD_PLUS_ONE: usize = SIMD_THRESHOLD + 1;
 
-/// Optimized interpolation with intelligent algorithm selection
-///
-/// This function provides the highest level of optimization by automatically
-/// selecting the best interpolation strategy based on data characteristics.
-///
-/// # Errors
-///
-/// Returns an error if the underlying interpolation algorithm fails
 pub async fn cpu_interpolate(points: Vec<Point>, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, spline: Spline) -> Result<Vec<Point>> {
 	let input_count = points.len();
 	let target_times = generate_target_times(start, end, resolution);
 	let output_count = target_times.len();
 
 	match spline {
-		Spline::Linear => {
-			match (input_count, output_count) {
-				(input, output) if input < SIMD_THRESHOLD && output < SIMD_THRESHOLD_PLUS_ONE => {
-					// Use scalar linear interpolation
-					linear(&points, &start, &end, &resolution)
-				}
-				_ => {
-					// Use SIMD linear interpolation
-					parallel_interpolate(&points, &start, &end, spline, resolution)
-				}
-			}
-		}
-		Spline::Quadratic => {
-			match (input_count, output_count) {
-				(input, output) if input < SIMD_THRESHOLD && output < SIMD_THRESHOLD_PLUS_ONE => {
-					// Use scalar quadratic interpolation
-					quadratic(points, start, end, resolution)
-				}
-				_ => {
-					// Use SIMD quadratic interpolation
-					parallel_interpolate(&points, &start, &end, spline, resolution)
-				}
-			}
-		}
-		Spline::Cubic => {
-			match (input_count, output_count) {
-				(input, output) if input < SIMD_THRESHOLD && output < SIMD_THRESHOLD_PLUS_ONE => {
-					// Use scalar cubic interpolation
-					cubic(points, start, end, resolution)
-				}
-				_ => {
-					// Use SIMD cubic interpolation
-					parallel_interpolate(&points, &start, &end, spline, resolution)
-				}
-			}
-		}
-		Spline::Polynomial(degree, bounds_factor) => {
-			match (input_count, output_count) {
-				(input, output) if input < SIMD_THRESHOLD && output < SIMD_THRESHOLD_PLUS_ONE => {
-					// Use scalar polynomial interpolation
-					polynomial(points, start, end, resolution, degree, bounds_factor)
-				}
-				_ => {
-					// Use SIMD polynomial interpolation
-					parallel_interpolate(&points, &start, &end, spline, resolution)
-				}
-			}
-		}
+		Spline::Linear => match (input_count, output_count) {
+			(input, output) if input < SIMD_THRESHOLD && output < SIMD_THRESHOLD_PLUS_ONE => linear(&points, &start, &end, &resolution).await,
+			_ => parallel_interpolate(&points, &start, &end, spline, resolution).await,
+		},
+		Spline::Quadratic => match (input_count, output_count) {
+			(input, output) if input < SIMD_THRESHOLD && output < SIMD_THRESHOLD_PLUS_ONE => quadratic(points, start, end, resolution),
+			_ => parallel_interpolate(&points, &start, &end, spline, resolution).await,
+		},
+		Spline::Cubic => match (input_count, output_count) {
+			(input, output) if input < SIMD_THRESHOLD && output < SIMD_THRESHOLD_PLUS_ONE => cubic(points, start, end, resolution),
+			_ => parallel_interpolate(&points, &start, &end, spline, resolution).await,
+		},
+		Spline::Polynomial(degree, bounds_factor) => match (input_count, output_count) {
+			(input, output) if input < SIMD_THRESHOLD && output < SIMD_THRESHOLD_PLUS_ONE => polynomial(points, start, end, resolution, degree, bounds_factor),
+			_ => parallel_interpolate(&points, &start, &end, spline, resolution).await,
+		},
 	}
 }
 
-/// Enhanced SIMD interpolation with parallel processing for very large datasets
-///
-/// # Errors
-///
-/// Returns an error if the underlying SIMD interpolation fails
-pub fn parallel_interpolate(points: &[Point], start: &DateTime<Utc>, end: &DateTime<Utc>, spline: Spline, resolution: Resolution) -> Result<Vec<Point>> {
-	if points.len() < 2 {
-		bail!(Error::InsufficientPointsError);
-	}
+pub async fn parallel_interpolate(points: &Vec<Point>, start: &DateTime<Utc>, end: &DateTime<Utc>, spline: Spline, resolution: Resolution) -> Result<Vec<Point>> {
+	spline.pre_check(points, start, end)?;
+	batch(points, start, end, &spline, &resolution, |state| Box::pin(p_interpolate(state))).await
+}
 
-	if start >= end {
-		bail!(Error::InvalidTimeRangeError);
-	}
+// Fixed p_interpolate function in mod.rs
+// The key fix is to use state.result instead of always creating temp files
 
-	let mut system = System::new_all();
-	let mut result = Vec::new();
-	let mut temp_file: Option<BufWriter<File>> = None;
-	let mut temp_path: Option<tempfile::TempPath> = None; // Use TempPath to persist file
+pub async fn p_interpolate(state: &mut InterpolationState) -> Result<()> {
+	let Some(input_points) = &state.input_points else {
+		bail!("No input points provided for interpolation");
+	};
+	let Some(batch_times) = &state.batch_times else {
+		bail!("No batch times provided for interpolation");
+	};
 
-	let total_memory = system.total_memory(); // In bytes
-	let memory_threshold = (total_memory as f64 * 0.8) as u64; // 80% of total memory
-	let point_size = std::mem::size_of::<Point>() as u64; // ~24 bytes
+	state.system.refresh_memory();
+	let available_memory = state.system.available_memory() as usize;
 
-	// Use TargetTimesIterator for memory-efficient time generation
-	let rounded_start = resolution.round(start)?;
-	let rounded_end = resolution.round(end)?;
-	let time_iter = TargetTimesIterator::new(rounded_start, rounded_end, resolution);
-	if let Ok(estimated_points) = time_iter.estimate_len() {
-		result.reserve(estimated_points);
-		if estimated_points > 1_000_000 {
-			// Force tempfile for very large datasets
-			let temp = NamedTempFile::new().map_err(|e| Error::IOError(e.to_string()))?;
-			temp_path = Some(temp.into_temp_path()); // Persist the file
-			temp_file = Some(BufWriter::new(File::create(temp_path.as_ref().unwrap()).map_err(|e| Error::IOError(e.to_string()))?));
-		}
-	}
+	let batch_size = if available_memory < state.memory_threshold {
+		let max_points = (available_memory / POINT_SIZE).max(50) as usize;
+		batch_times.len().min(max_points).max(1)
+	} else {
+		batch_times.len()
+	};
 
-	// Split target times into chunks and process in parallel
-	let chunk_size = num_cpus::get() * 4; // Adjust chunk size based on available CPUs
-	for batch_times in time_iter {
-		system.refresh_memory();
-		let available_memory = system.available_memory();
-		let batch_size = if available_memory < memory_threshold {
-			let max_points = (available_memory / point_size).max(50) as usize;
-			batch_times.len().min(max_points / 2) // Conservative scaling
-		} else {
-			batch_times.len()
-		};
+	// Collect chunks first, then process in parallel
+	let chunks: Vec<Vec<DateTime<Utc>>> = batch_times.chunks(batch_size).map(|chunk| chunk.to_vec()).collect();
 
-		let mut batch = Vec::with_capacity(batch_size);
+	let chunk_results: Result<Vec<Vec<Point>>> = chunks
+		.par_iter()
+		.map(|times| match state.spline {
+			Spline::Linear => linear_simd(input_points, times, state.resolution),
+			Spline::Quadratic => quadratic_simd(input_points, times, state.resolution),
+			Spline::Cubic => cubic_simd(input_points, times, state.resolution),
+			Spline::Polynomial(degree, bounds_factor) => polynomial_simd(input_points, times, state.resolution, degree, bounds_factor),
+		})
+		.collect();
 
-		// Process only up to batch_size from the current batch
-		let res: Result<Vec<Vec<Point>>> = batch_times
-			.into_iter()
-			.take(batch_size)
-			.collect::<Vec<_>>()
-			.par_chunks(chunk_size)
-			.map(|chunk| match spline {
-				Spline::Linear => linear_simd(points, chunk, resolution),
-				Spline::Quadratic => quadratic_simd(points, chunk, resolution),
-				Spline::Cubic => cubic_simd(points, chunk, resolution),
-				Spline::Polynomial(degree, bounds_factor) => polynomial_simd(points, chunk, resolution, degree, bounds_factor),
-			})
-			.collect();
+	let chunk_results = chunk_results?;
 
-		let chunk_results = res.map_err(|e| e)?;
+	// Flatten results in the correct order
+	let all_points: Vec<Point> = chunk_results.into_iter().flatten().collect();
 
-		for points in chunk_results {
-			if available_memory < memory_threshold && temp_file.is_none() {
-				let temp = NamedTempFile::new().map_err(|e| Error::IOError(e.to_string()))?;
-				temp_path = Some(temp.into_temp_path()); // Persist the file
-				temp_file = Some(BufWriter::new(File::create(temp_path.as_ref().unwrap()).map_err(|e| Error::IOError(e.to_string()))?));
+	// Verify we have the expected number of points
+	assert_eq!(all_points.len(), batch_times.len(), "Parallel processing lost points: expected {}, got {}", batch_times.len(), all_points.len());
+
+	// Check if we should use temp file or in-memory storage
+	if state.temp_file.is_some() {
+		// Use temp file (for large datasets)
+		if let Some(writer) = state.temp_file.as_mut() {
+			let mut writer = writer.lock().await;
+			for point in all_points {
+				writeln!(writer, "{},{}", point.timestamp.to_rfc3339(), point.value)?;
 			}
-
-			if let Some(writer) = temp_file.as_mut() {
-				// Write timestamp in RFC3339 format
-				for point in points {
-					writeln!(writer, "{},{}", point.timestamp.to_rfc3339(), point.value)?;
-				}
-			} else {
-				// Store in memory
-				batch.extend(points);
-			}
-		}
-
-		if temp_file.is_none() {
-			result.extend(batch.into_iter());
-		}
-		if let Some(writer) = temp_file.as_mut() {
 			writer.flush().map_err(|e| Error::IOError(e.to_string()))?;
 		}
+	} else {
+		// Use in-memory storage (for smaller datasets)
+		state.result = Some(all_points);
 	}
 
-	// Read back from tempfile if used
-	if let Some(path) = &temp_path {
-		let file = File::open(path).map_err(|e| Error::IOError(e.to_string()))?;
-		let reader = BufReader::new(file);
-		for line in reader.lines() {
-			let line = line.map_err(|e| Error::IOError(e.to_string()))?;
-			let parts: Vec<&str> = line.split(',').collect();
-			if parts.len() == 2 {
-				let timestamp = DateTime::parse_from_rfc3339(parts[0]).map_err(|e| Error::IOError(format!("Failed to parse timestamp '{}': {}", parts[0], e)))?.with_timezone(&Utc);
-				let value = parts[1].parse::<f64>().map_err(|e| Error::IOError(format!("Failed to parse value '{}': {}", parts[1], e)))?;
-				let value = BigDecimal::from_f64(value).unwrap_or_default();
-				result.push(Point { timestamp, value });
-			} else {
-			}
-		}
-	}
-
-	Ok(result)
+	Ok(())
 }

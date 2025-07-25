@@ -5,10 +5,10 @@
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 pub(crate) use gpu::gpu_interpolate;
-pub(crate) use helpers::{TargetTimesIterator, estimate_output_points, generate_target_times, is_uniformly_spaced, should_use_gpu};
+pub(crate) use helpers::{InterpolationState, TargetTimesIterator, batch, estimate_output_points, generate_target_times, is_uniformly_spaced, should_use_gpu};
 pub use optimizations::{apply_fast_path, cpu_interpolate, parallel_interpolate};
 pub(crate) use splines::{cubic, cubic_simd, linear, linear_simd, polynomial, polynomial_simd, quadratic, quadratic_simd};
-pub use types::{Error, Point, Resolution, Spline};
+pub use types::{Error, POINT_SIZE, Point, Resolution, Spline};
 
 mod gpu;
 mod helpers;
