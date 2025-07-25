@@ -28,7 +28,7 @@ impl TargetTimesIterator {
 
 		let time_diff = self.resolution.difference(&self.end, &self.current)?;
 		let step_base = self.resolution.to_step_base()?;
-		Ok(((time_diff + step_base - 1) / step_base) as usize)
+		Ok((((time_diff + step_base - 1) / step_base) as usize) + 1)
 	}
 }
 

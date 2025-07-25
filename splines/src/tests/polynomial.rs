@@ -193,8 +193,6 @@ mod tests {
         Point { timestamp: DateTime::<Utc>::from_timestamp(23, 0).unwrap(), value: BigDecimal::from(115) },
     ];
 
-		let target_times = generate_target_times(start, end, resolution);
-
 		// Run CPU and GPU interpolations with bounds from spline
 		let cpu = polynomial(points.clone(), start, end, resolution, degree, bounds_factor).unwrap();
 		let gpu = gpu_interpolate(points.clone(), start, end, resolution, spline).await.unwrap();

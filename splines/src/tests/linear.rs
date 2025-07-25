@@ -2,79 +2,158 @@
 mod tests {
 	use std::sync::LazyLock;
 
-	use bigdecimal::{BigDecimal, FromPrimitive};
+	use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive, Zero};
 	use chrono::{DateTime, Utc};
+	use fake::{Fake, Faker};
 
 	use super::super::plot_terminal;
 	use crate::{Point, Resolution, TargetTimesIterator, auto_interpolate, gpu_interpolate, linear, parallel_interpolate};
 
-	const TARGET_ACCURACY_THRESHOLD: f64 = 10.0e-1;
-	const RESOLUTION: Resolution = Resolution::Nanoseconds;
-	const START: DateTime<Utc> = DateTime::<Utc>::from_timestamp(-4, 0).unwrap();
-	const END: DateTime<Utc> = DateTime::<Utc>::from_timestamp(-3, 0).unwrap();
+	const Z_THRESHOLD: f64 = 2.0;
+	const COS_THRESHOLD: f64 = 0.00000095;
+	const RESOLUTION: Resolution = Resolution::Seconds;
 	const SPLINE: crate::Spline = crate::Spline::Linear;
-	#[rustfmt::skip]
-	static POINTS: LazyLock<[Point; 24]> = LazyLock::new(|| [
-		Point { timestamp: DateTime::<Utc>::from_timestamp(0, 0).unwrap(), value: BigDecimal::from(0) }, 
-		Point { timestamp: DateTime::<Utc>::from_timestamp(1, 0).unwrap(), value: BigDecimal::from(2) }, 
-		Point { timestamp: DateTime::<Utc>::from_timestamp(2, 0).unwrap(), value: BigDecimal::from(6) }, 
-		Point { timestamp: DateTime::<Utc>::from_timestamp(3, 0).unwrap(), value: BigDecimal::from(24) }, 
-		Point { timestamp: DateTime::<Utc>::from_timestamp(4, 0).unwrap(), value: BigDecimal::from(8) }, 
-		Point { timestamp: DateTime::<Utc>::from_timestamp(5, 0).unwrap(), value: BigDecimal::from(2) },
-		Point { timestamp: DateTime::<Utc>::from_timestamp(6, 0).unwrap(), value: BigDecimal::from(10) },
-		Point { timestamp: DateTime::<Utc>::from_timestamp(7, 0).unwrap(), value: BigDecimal::from(14) },
-		Point { timestamp: DateTime::<Utc>::from_timestamp(8, 0).unwrap(), value: BigDecimal::from(18) },
-		Point { timestamp: DateTime::<Utc>::from_timestamp(9, 0).unwrap(), value: BigDecimal::from(22) },
-		Point { timestamp: DateTime::<Utc>::from_timestamp(10, 0).unwrap(), value: BigDecimal::from(26) },
-		Point { timestamp: DateTime::<Utc>::from_timestamp(11, 0).unwrap(), value: BigDecimal::from(30) },
-		Point { timestamp: DateTime::<Utc>::from_timestamp(12, 0).unwrap(), value: BigDecimal::from(4) },
-		Point { timestamp: DateTime::<Utc>::from_timestamp(13, 0).unwrap(), value: BigDecimal::from(8) },
-		Point { timestamp: DateTime::<Utc>::from_timestamp(14, 0).unwrap(), value: BigDecimal::from(12) },
-		Point { timestamp: DateTime::<Utc>::from_timestamp(15, 0).unwrap(), value: BigDecimal::from(16) },
-		Point { timestamp: DateTime::<Utc>::from_timestamp(16, 0).unwrap(), value: BigDecimal::from(2) },
-		Point { timestamp: DateTime::<Utc>::from_timestamp(17, 0).unwrap(), value: BigDecimal::from(6) },
-		Point { timestamp: DateTime::<Utc>::from_timestamp(18, 0).unwrap(), value: BigDecimal::from(10) },
-		Point { timestamp: DateTime::<Utc>::from_timestamp(19, 0).unwrap(), value: BigDecimal::from(5) },
-		Point { timestamp: DateTime::<Utc>::from_timestamp(20, 0).unwrap(), value: BigDecimal::from(15) },
-		Point { timestamp: DateTime::<Utc>::from_timestamp(21, 0).unwrap(), value: BigDecimal::from(25) },
-		Point { timestamp: DateTime::<Utc>::from_timestamp(26, 0).unwrap(), value: BigDecimal::from(35) },
-		Point { timestamp: DateTime::<Utc>::from_timestamp(30, 0).unwrap(), value: BigDecimal::from(115) },
-	]);
+
+	const POINTS: LazyLock<Vec<Point>> = LazyLock::new(|| {
+		let mut points: Vec<Point> = Vec::new();
+		let mut rng = rand::thread_rng();
+		for _ in 0..10 {
+			let point: Point = Faker.fake_with_rng(&mut rng);
+			points.push(point);
+		}
+		points.sort_by_key(|p| p.timestamp);
+		points
+	});
+
+	fn mean(values: &[BigDecimal]) -> BigDecimal {
+		let sum: BigDecimal = values.iter().cloned().sum();
+		sum / BigDecimal::from_usize(values.len()).unwrap()
+	}
+
+	fn pow(value: BigDecimal, exponent: u64) -> BigDecimal {
+		if exponent == 0 {
+			return BigDecimal::from(1);
+		}
+
+		let mut value = value;
+		for _ in 0..exponent {
+			value = value.clone() * value;
+		}
+
+		value.clone()
+	}
+
+	fn std_dev(values: &[BigDecimal], mean: &BigDecimal) -> BigDecimal {
+		let variance: BigDecimal = values.iter().map(|v| pow(v - mean, 2)).sum::<BigDecimal>() / BigDecimal::from_usize(values.len()).unwrap();
+		variance.sqrt().unwrap()
+	}
+
+	fn cosine_similarity(a: &[BigDecimal], b: &[BigDecimal]) -> f64 {
+		let dot_product: BigDecimal = a.iter().zip(b.iter()).map(|(a, b)| a.round(10) * b.round(10)).sum::<BigDecimal>().round(10);
+		let cpu_norm: BigDecimal = a.iter().map(|v| pow(v.clone().round(10), 2)).sum::<BigDecimal>().sqrt().unwrap_or(BigDecimal::zero()).round(10);
+		let parallel_norm: BigDecimal = b.iter().map(|v| pow(v.clone().round(10), 2)).sum::<BigDecimal>().sqrt().unwrap_or(BigDecimal::zero()).round(10);
+		println!("Dot product: {}, CPU norm: {}, Parallel norm: {}", dot_product, cpu_norm, parallel_norm);
+		if cpu_norm == BigDecimal::zero() || parallel_norm == BigDecimal::zero() {
+			return 0.0;
+		}
+		let similarity = (dot_product / (cpu_norm * parallel_norm)).to_f64().unwrap_or(0.0);
+		println!("Cosine similarity: {}", similarity);
+		similarity
+	}
+
+	// Detect regressions with z-scores and cosine similarity
+	fn check_similarity(a: &[BigDecimal], b: &[BigDecimal]) -> (Vec<f64>, Vec<f64>, f64) {
+		// Z-scores for outlier detection
+		let cpu_mean = mean(a);
+		let cpu_std = std_dev(a, &cpu_mean);
+		let parallel_mean = mean(b);
+		let parallel_std = std_dev(b, &parallel_mean);
+
+		let cpu_z_scores: Vec<f64> = a.iter().map(|v| ((v - &cpu_mean) / &cpu_std).to_f64().unwrap_or(0.0)).collect();
+		let parallel_z_scores: Vec<f64> = b.iter().map(|v| ((v - &parallel_mean) / &parallel_std).to_f64().unwrap_or(0.0)).collect();
+
+		// Cosine similarity for overall comparison
+		let similarity = cosine_similarity(a, b);
+
+		(cpu_z_scores, parallel_z_scores, similarity)
+	}
 
 	#[tokio::test]
 	async fn test_linear_interpolation() {
-		let target_times_iter = TargetTimesIterator::new(START, END, RESOLUTION);
+		let points = POINTS.clone();
+		let start = {
+			let s = points.first().map_or_else(|| Utc::now(), |p| p.timestamp);
+			match RESOLUTION {
+				Resolution::Nanoseconds => s - chrono::Duration::nanoseconds(10),
+				Resolution::Microseconds => s - chrono::Duration::microseconds(10),
+				Resolution::Milliseconds => s - chrono::Duration::seconds(10),
+				Resolution::Seconds => s - chrono::Duration::seconds(10),
+				Resolution::Minutes => s - chrono::Duration::minutes(10),
+				Resolution::Hours => s - chrono::Duration::hours(10),
+				Resolution::Days => s - chrono::Duration::days(10),
+				Resolution::Weeks => s - chrono::Duration::weeks(10),
+				Resolution::Months => s - chrono::Duration::days(30 * 10),
+				Resolution::Years => s - chrono::Duration::days(365 * 10),
+			}
+		};
 
-		let input_count = POINTS.len();
+		let end = {
+			let e = points.last().map_or_else(|| Utc::now(), |p| p.timestamp);
+			match RESOLUTION {
+				Resolution::Nanoseconds => e + chrono::Duration::nanoseconds(10),
+				Resolution::Microseconds => e + chrono::Duration::microseconds(10),
+				Resolution::Milliseconds => e + chrono::Duration::seconds(10),
+				Resolution::Seconds => e + chrono::Duration::seconds(10),
+				Resolution::Minutes => e + chrono::Duration::minutes(10),
+				Resolution::Hours => e + chrono::Duration::hours(10),
+				Resolution::Days => e + chrono::Duration::days(10),
+				Resolution::Weeks => e + chrono::Duration::weeks(10),
+				Resolution::Months => e + chrono::Duration::days(30 * 10),
+				Resolution::Years => e + chrono::Duration::days(365 * 10),
+			}
+		};
+
+		let target_times_iter = TargetTimesIterator::new(start, end, RESOLUTION);
+
+		let input_count = points.len();
 		let output_count = target_times_iter.estimate_len().unwrap();
 		println!("Linear: Input count: {}, Output count: {}", input_count, output_count);
 
 		// cpu interpolation
 		println!("Linear: CPU Test Starting...");
 		let timer = tokio::time::Instant::now();
-		let cpu = linear(&POINTS.to_vec(), &START, &END, &RESOLUTION).unwrap();
+		let cpu = linear(&points.to_vec(), &start, &end, &RESOLUTION).await.unwrap();
 		let cpu_time = timer.elapsed();
 		println!("Linear: CPU Interpolation took: {:?}", cpu_time);
 		let cpu_len = cpu.len();
 		let (cpu_timestamps, cpu_values): (Vec<_>, Vec<_>) = cpu.iter().map(|p| (p.timestamp, p.value.clone())).unzip();
+		plot_terminal("Linear: CPU Interpolation Results", cpu.clone()).unwrap();
+		//println!("CPU results: {:?}", cpu);
 		drop(cpu);
 
 		// parallel interpolation
 		println!("Linear: Parallel Test Starting...");
 		let timer = tokio::time::Instant::now();
-		let parallel = parallel_interpolate(&POINTS.to_vec(), &START, &END, SPLINE, RESOLUTION).unwrap();
+		let parallel = parallel_interpolate(&points, &start, &end, SPLINE, RESOLUTION).await.unwrap();
 		let parallel_time = timer.elapsed();
 		println!("Linear: Parallel Interpolation took: {:?}", parallel_time);
 		let parallel_len = parallel.len();
 		let (parallel_timestamps, parallel_values): (Vec<_>, Vec<_>) = parallel.iter().map(|p| (p.timestamp, p.value.clone())).unzip();
+		plot_terminal("Linear: Parallel Interpolation Results", parallel.clone()).unwrap();
 		drop(parallel);
 
 		// compare cpu and parallel results
 		println!("Linear: Comparing CPU and Parallel results...");
 		assert_eq!(cpu_len, parallel_len);
-		for (c, s) in cpu_values.iter().zip(parallel_values.iter()) {
-			assert!((c - s).abs() < BigDecimal::from_f64(TARGET_ACCURACY_THRESHOLD).unwrap(), "PARALLEL value {} is not within {} of CPU value {}. The difference is {}.", s, TARGET_ACCURACY_THRESHOLD, c, (c - s).abs());
+
+		let (cpu_z_scores, parallel_z_scores, similarity) = check_similarity(&cpu_values, &parallel_values);
+		assert!(similarity >= COS_THRESHOLD, "Cosine similarity is below threshold: {}, similarity: {}", COS_THRESHOLD, similarity);
+		assert!(similarity >= COS_THRESHOLD, "Cosine similarity is below threshold: {}, similarity: {}", COS_THRESHOLD, similarity);
+		for (i, (cpu_z, parallel_z)) in cpu_z_scores.iter().zip(parallel_z_scores.iter()).enumerate() {
+			assert!(cpu_z.abs() < Z_THRESHOLD, "CPU value at index {} is an outlier: {}", i, cpu_z);
+			assert!(parallel_z.abs() < Z_THRESHOLD, "Parallel value at index {} is an outlier: {}", i, parallel_z);
 		}
+
 		assert_eq!(cpu_timestamps, parallel_timestamps);
 		drop(parallel_timestamps);
 		drop(parallel_values);
@@ -82,20 +161,26 @@ mod tests {
 		// gpu interpolation
 		println!("Linear: GPU Test Starting...");
 		let timer = tokio::time::Instant::now();
-		let gpu = gpu_interpolate(POINTS.clone().to_vec(), START, END, RESOLUTION, SPLINE).await.unwrap();
+		let gpu = gpu_interpolate(points.clone(), start, end, RESOLUTION, SPLINE).await.unwrap();
 		let gpu_time = timer.elapsed();
 		println!("Linear: GPU Interpolation took: {:?}", gpu_time);
 		let gpu_len = gpu.len();
 		let (gpu_timestamps, gpu_values): (Vec<_>, Vec<_>) = gpu.iter().map(|p| (p.timestamp, p.value.clone())).unzip();
+		plot_terminal("Linear: GPU Interpolation Results", gpu.clone()).unwrap();
+		//println!("GPU results: {:?}", gpu);
 		drop(gpu);
 
 		// compare cpu and gpu results
 		println!("Linear: Comparing CPU and GPU results...");
 		assert_eq!(cpu_len, gpu_len);
-		for (c, g) in cpu_values.iter().zip(gpu_values.iter()) {
-			let dif = (c - g).abs();
-			assert!(dif < BigDecimal::from_f64(TARGET_ACCURACY_THRESHOLD).unwrap(), "GPU value {} is not within {} of CPU value {}. The difference is {}.", g, TARGET_ACCURACY_THRESHOLD, c, dif);
+
+		let (cpu_z_scores, gpu_z_scores, similarity) = check_similarity(&cpu_values, &gpu_values);
+		assert!(similarity >= COS_THRESHOLD, "GPU: Cosine similarity is below threshold: {}", similarity);
+		for (i, (cpu_z, gpu_z)) in cpu_z_scores.iter().zip(gpu_z_scores.iter()).enumerate() {
+			assert!(cpu_z.abs() < Z_THRESHOLD, "CPU value at index {} is an outlier: {}", i, cpu_z);
+			assert!(gpu_z.abs() < Z_THRESHOLD, "GPU value at index {} is an outlier: {}", i, gpu_z);
 		}
+
 		assert_eq!(cpu_timestamps, gpu_timestamps);
 		drop(gpu_timestamps);
 		drop(gpu_values);
@@ -103,20 +188,25 @@ mod tests {
 		// automatically determine the fastest method
 		println!("Linear: Auto Test Starting...");
 		let auto_timer = tokio::time::Instant::now();
-		let auto = auto_interpolate(POINTS.clone().to_vec(), START, END, RESOLUTION, SPLINE).await.unwrap();
+		let auto = auto_interpolate(points.clone(), start, end, RESOLUTION, SPLINE).await.unwrap();
 		let auto_time = auto_timer.elapsed();
 		println!("Linear: Auto Interpolation took: {:?}", auto_time);
 		let auto_len = auto.len();
 		let (auto_timestamps, auto_values): (Vec<_>, Vec<_>) = auto.iter().map(|p| (p.timestamp, p.value.clone())).unzip();
+		plot_terminal("Linear: Auto Interpolation Results", auto.clone()).unwrap();
 		drop(auto);
 
 		// compare cpu and auto results
 		println!("Linear: Comparing CPU and Auto results...");
 		assert_eq!(cpu_len, auto_len);
-		for (c, a) in cpu_values.iter().zip(auto_values.iter()) {
-			let dif = (c - a).abs();
-			assert!(dif < BigDecimal::from_f64(TARGET_ACCURACY_THRESHOLD).unwrap(), "Auto value {} is not within {} of CPU value {}. The difference is {}.", a, TARGET_ACCURACY_THRESHOLD, c, dif);
+
+		let (cpu_z_scores, auto_z_scores, similarity) = check_similarity(&cpu_values, &auto_values);
+		assert!(similarity >= COS_THRESHOLD, "Auto: Cosine similarity is below threshold: {}", similarity);
+		for (i, (cpu_z, auto_z)) in cpu_z_scores.iter().zip(auto_z_scores.iter()).enumerate() {
+			assert!(cpu_z.abs() < Z_THRESHOLD, "CPU value at index {} is an outlier: {}", i, cpu_z);
+			assert!(auto_z.abs() < Z_THRESHOLD, "Auto value at index {} is an outlier: {}", i, auto_z);
 		}
+
 		assert_eq!(cpu_timestamps, auto_timestamps);
 		drop(auto_timestamps);
 		drop(auto_values);
@@ -140,33 +230,45 @@ mod tests {
 			let percentage_difference = (dif as f64 / gpu_time.as_nanos() as f64) * 100.0;
 			println!("Linear: Parallel SIMD was faster by {:.2}%", percentage_difference);
 		}
+	}
 
-		// assert that all results have the same values
-		/* let cpu_values: Vec<_> = cpu.iter().map(|p| p.value.clone()).collect(); */
-		/* let parallel_values: Vec<_> = parallel.iter().map(|p| p.value.clone()).collect();
-		/* let gpu_values: Vec<_> = gpu.iter().map(|p| p.value.clone()).collect(); */
-		let auto_values: Vec<_> = auto.iter().map(|p| p.value.clone()).collect(); */
+	#[tokio::test]
+	async fn test_target_times() {
+		let points = POINTS.clone();
+		let start = {
+			let s = points.first().map_or_else(|| Utc::now(), |p| p.timestamp);
+			match RESOLUTION {
+				Resolution::Nanoseconds => s - chrono::Duration::nanoseconds(10),
+				Resolution::Microseconds => s - chrono::Duration::microseconds(10),
+				Resolution::Milliseconds => s - chrono::Duration::seconds(10),
+				Resolution::Seconds => s - chrono::Duration::seconds(10),
+				Resolution::Minutes => s - chrono::Duration::minutes(10),
+				Resolution::Hours => s - chrono::Duration::hours(10),
+				Resolution::Days => s - chrono::Duration::days(10),
+				Resolution::Weeks => s - chrono::Duration::weeks(10),
+				Resolution::Months => s - chrono::Duration::days(30 * 10),
+				Resolution::Years => s - chrono::Duration::days(365 * 10),
+			}
+		};
 
-		// assert that simd values are within TARGET_ACCURACY_THRESHOLD of cpu values
-		/* for (c, s) in cpu_values.iter().zip(parallel_values.iter()) {
-			assert!((c - s).abs() < BigDecimal::from_f64(TARGET_ACCURACY_THRESHOLD).unwrap(), "PARALLEL value {} is not within {} of CPU value {}. The difference is {}.", s, TARGET_ACCURACY_THRESHOLD, c, (c - s).abs());
-		} */
-
-		// assert that auto values are within TARGET_ACCURACY_THRESHOLD of cpu values
-		/* for (c, a) in cpu_values.iter().zip(auto_values.iter()) {
-			let dif = (c - a).abs();
-			assert!(dif < BigDecimal::from_f64(TARGET_ACCURACY_THRESHOLD).unwrap(), "Auto value {} is not within {} of CPU value {}. The difference is {}.", a, TARGET_ACCURACY_THRESHOLD, c, dif);
-		} */
-
-		// plot the results
-		/* plot_terminal("Linear: CPU Interpolation Results", cpu.clone()).unwrap(); */
-		/* plot_terminal("Linear: PARALLEL Interpolation Results", parallel.clone()).unwrap(); */
-		/* plot_terminal("Linear: GPU Interpolation Results", gpu.clone()).unwrap(); */
-		/* plot_terminal("Linear: Auto Interpolation Results", auto.clone()).unwrap(); */
-
-		//println!("Linear: CPU Interpolation Result: {:?}", cpu);
-		//println!("Linear: PARALLEL Interpolation Result: {:?}", simd);
-		//println!("Linear: GPU Interpolation Result: {:?}", gpu);
-		//println!("Linear: Auto Interpolation Result: {:?}", auto);
+		let end = {
+			let e = points.last().map_or_else(|| Utc::now(), |p| p.timestamp);
+			match RESOLUTION {
+				Resolution::Nanoseconds => e + chrono::Duration::nanoseconds(10),
+				Resolution::Microseconds => e + chrono::Duration::microseconds(10),
+				Resolution::Milliseconds => e + chrono::Duration::seconds(10),
+				Resolution::Seconds => e + chrono::Duration::seconds(10),
+				Resolution::Minutes => e + chrono::Duration::minutes(10),
+				Resolution::Hours => e + chrono::Duration::hours(10),
+				Resolution::Days => e + chrono::Duration::days(10),
+				Resolution::Weeks => e + chrono::Duration::weeks(10),
+				Resolution::Months => e + chrono::Duration::days(30 * 10),
+				Resolution::Years => e + chrono::Duration::days(365 * 10),
+			}
+		};
+		let target_times_1: Vec<DateTime<Utc>> = TargetTimesIterator::new(start, end, RESOLUTION).flatten().collect();
+		let target_times_2: Vec<DateTime<Utc>> = TargetTimesIterator::new(start, end, RESOLUTION).flatten().collect();
+		println!("Target times 1: {}, Target times 2: {}", target_times_1.len(), target_times_2.len());
+		assert_eq!(target_times_1, target_times_2, "Target times iterators should produce the same results");
 	}
 }

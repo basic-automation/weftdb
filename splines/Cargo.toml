@@ -19,6 +19,9 @@ futures-channel = { workspace = true }
 pollster = { workspace = true }
 sysinfo = { workspace = true }
 tempfile = { workspace = true }
+futures = { workspace = true }
+fake = { workspace = true, features = ["derive", "bigdecimal", "chrono"] }
+rand = { workspace = true }
 
 [dev-dependencies]
 ratatui = { workspace = true, features = ["default", "all-widgets", "document-features", "macros", "palette", "scrolling-regions", "serde", "termion", "termwiz"] }
