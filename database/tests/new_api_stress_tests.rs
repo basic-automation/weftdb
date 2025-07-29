@@ -2,8 +2,9 @@ use std::{str::FromStr, sync::Arc, time::Duration as StdDuration};
 
 use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
-use database::{add_subject, analyze_point, capture_measurement, new, track_aspect, InputMeasurement, Resolution, SplineType};
+use database::{add_subject, analyze_point, capture_measurement, new, track_aspect, InputMeasurement};
 use futures; // Add this import
+use splimes::{Resolution, Spline};
 use tokio::{sync::Semaphore, time::timeout};
 use uuid::Uuid;
 
@@ -39,7 +40,7 @@ async fn test_multiple_aspects_same_subject() {
 	// Analyze all aspects
 	let target_time = base_time + Duration::minutes(50);
 	for &aspect_id in &aspect_ids {
-		let result = analyze_point(aspect_id, target_time, Resolution::Seconds, SplineType::Linear).await.expect("Failed to analyze multi-aspect point");
+		let result = analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await.expect("Failed to analyze multi-aspect point");
 		assert!(!result.value.to_string().is_empty());
 	}
 
@@ -81,7 +82,7 @@ async fn test_high_frequency_measurements() {
 	// Test analysis with a time that's definitely within the dataset
 	let analysis_start = std::time::Instant::now();
 	let target_time = base_time + Duration::minutes(5); // Middle of 10-minute dataset
-	let result = analyze_point(aspect_id, target_time, Resolution::Seconds, SplineType::Linear).await.expect("Failed to analyze point");
+	let result = analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await.expect("Failed to analyze point");
 	let analysis_duration = analysis_start.elapsed();
 
 	println!("Analysis completed in {:?}", analysis_duration);
@@ -133,7 +134,7 @@ async fn test_concurrent_access() {
 					} else {
 						// Read operation - use time within initial data range
 						let target_time = base_time + Duration::minutes((task_id * 5 + op_id / 2) % 50);
-						let _result = analyze_point(aspect_id, target_time, Resolution::Seconds, SplineType::Linear).await.expect("Failed to analyze concurrent point");
+						let _result = analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await.expect("Failed to analyze concurrent point");
 					}
 				}
 				task_id as i64
@@ -199,7 +200,7 @@ async fn test_large_dataset_analysis() {
 	println!("Created large dataset in {:?}", creation_duration);
 
 	// Test analysis performance on large dataset
-	let test_cases = vec![(SplineType::Linear, "Linear"), (SplineType::Quadratic, "Quadratic"), (SplineType::Cubic, "Cubic")];
+	let test_cases = vec![(Spline::Linear, "Linear"), (Spline::Quadratic, "Quadratic"), (Spline::Cubic, "Cubic")];
 
 	for (spline_type, name) in test_cases {
 		let analysis_start = std::time::Instant::now();
@@ -255,7 +256,7 @@ async fn test_memory_usage_stability() {
 			// Reduced from 50
 			// Ensure target time is within the data we've created
 			let target_time = base_time + Duration::seconds(cycle * 100 + i * 10);
-			let _result = analyze_point(aspect_id, target_time, Resolution::Seconds, SplineType::Linear).await.expect("Failed to analyze memory test point");
+			let _result = analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await.expect("Failed to analyze memory test point");
 		}
 
 		// Force garbage collection periodically
@@ -298,7 +299,7 @@ async fn test_edge_case_scenarios() {
 
 	// Analyze between sparse points
 	let sparse_target = base_time + Duration::hours(12);
-	let sparse_result = analyze_point(aspect_id, sparse_target, Resolution::Seconds, SplineType::Linear).await.expect("Failed to analyze sparse data");
+	let sparse_result = analyze_point(aspect_id, sparse_target, Resolution::Seconds, Spline::Linear).await.expect("Failed to analyze sparse data");
 
 	assert!(sparse_result.value > BigDecimal::from_str("10.0").unwrap());
 	assert!(sparse_result.value < BigDecimal::from_str("20.0").unwrap());
@@ -317,7 +318,7 @@ async fn test_edge_case_scenarios() {
 
 	// Analyze within dense region
 	let dense_target = dense_base + Duration::seconds(5); // Within the 10-second range
-	let dense_result = analyze_point(aspect_id, dense_target, Resolution::Seconds, SplineType::Cubic).await.expect("Failed to analyze dense data");
+	let dense_result = analyze_point(aspect_id, dense_target, Resolution::Seconds, Spline::Cubic).await.expect("Failed to analyze dense data");
 
 	assert!(dense_result.value >= BigDecimal::from_str("100.0").unwrap());
 
@@ -333,7 +334,7 @@ async fn test_edge_case_scenarios() {
 
 	// Analyze between extreme values
 	let extreme_target = extreme_base + Duration::seconds(30);
-	let extreme_result = analyze_point(aspect_id, extreme_target, Resolution::Seconds, SplineType::Linear).await.expect("Failed to analyze extreme data");
+	let extreme_result = analyze_point(aspect_id, extreme_target, Resolution::Seconds, Spline::Linear).await.expect("Failed to analyze extreme data");
 
 	// Should interpolate between extreme values
 	assert!(extreme_result.value < BigDecimal::from_str("999999999.999999").unwrap());

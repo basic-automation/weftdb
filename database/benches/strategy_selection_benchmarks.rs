@@ -3,7 +3,8 @@ use std::{hint::black_box, str::FromStr};
 use bigdecimal::BigDecimal;
 use chrono::{TimeZone, Utc};
 use criterion::{criterion_group, criterion_main, Criterion};
-use database::{auto_interpolate, Measurement, Resolution, SplineType};
+use database::{measurements_to_points, Measurement};
+use splimes::{auto_interpolate, Resolution, Spline};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 
@@ -41,7 +42,7 @@ fn benchmark_strategy_selection(c: &mut Criterion) {
 		// Validate the time range
 		assert!(end > start, "End time must be after start time for benchmark {}", name);
 
-		c.bench_function(name, |b| b.iter(|| rt.block_on(async { black_box(auto_interpolate(black_box(measurements.clone()), black_box(start), black_box(end), black_box(Resolution::Seconds), black_box(SplineType::Linear)).await.unwrap()) })));
+		c.bench_function(name, |b| b.iter(|| rt.block_on(async { black_box(auto_interpolate(black_box(&mut measurements_to_points(&measurements.clone())), black_box(start), black_box(end), black_box(Resolution::Seconds), black_box(Spline::Linear)).await.unwrap()) })));
 	}
 }
 

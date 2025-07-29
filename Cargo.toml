@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["database", "dataset_management", "splines"]
+members = ["database", "dataset_management", "splimes"]
 
 [workspace.dependencies]
 anyhow = "1.0"
@@ -28,6 +28,7 @@ ratatui = "0.29.0"
 crossterm = "0.29.0"
 futures-channel = "0.3"
 sysinfo = "0.36.1"
+splimes = { path = "./splimes" }
 
 [profile.release]
 opt-level = 3

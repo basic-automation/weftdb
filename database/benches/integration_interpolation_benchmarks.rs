@@ -3,7 +3,8 @@ use std::{hint::black_box, str::FromStr};
 use bigdecimal::BigDecimal;
 use chrono::{TimeZone, Utc};
 use criterion::{criterion_group, criterion_main, Criterion};
-use database::{auto_interpolate, Measurement, Resolution, SplineType};
+use database::{measurements_to_points, Measurement};
+use splimes::{auto_interpolate, Resolution, Spline};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 
@@ -48,11 +49,11 @@ fn benchmark_production_workloads(c: &mut Criterion) {
 				rt.block_on(async {
 					black_box(
 						auto_interpolate(
-							black_box(measurements.clone()),
+							black_box(&mut measurements_to_points(&measurements.clone())),
 							black_box(start),
 							black_box(end),
 							black_box(resolution),
-							black_box(SplineType::Linear), // Production typically uses linear
+							black_box(Spline::Linear), // Production typically uses linear
 						)
 						.await
 						.unwrap(),
@@ -68,9 +69,9 @@ fn benchmark_full_integration_pipeline(c: &mut Criterion) {
 
 	// Test the complete integration pipeline with realistic scenarios - FIXED TIME RANGES
 	let integration_scenarios = vec![
-		("real_time_small", 50, 1, 60, Resolution::Seconds, SplineType::Linear),    // 50 measurements, 1-min intervals, 60-min window (FIXED: increased window)
-		("batch_medium", 500, 1, 600, Resolution::Minutes, SplineType::Quadratic),  // 500 measurements, 1-min intervals, 600-min window (FIXED: increased window)
-		("analytics_large", 1000, 1, 1200, Resolution::Seconds, SplineType::Cubic), // 1000 measurements, 1-min intervals, 1200-min window (FIXED: increased window)
+		("real_time_small", 50, 1, 60, Resolution::Seconds, Spline::Linear),    // 50 measurements, 1-min intervals, 60-min window (FIXED: increased window)
+		("batch_medium", 500, 1, 600, Resolution::Minutes, Spline::Quadratic),  // 500 measurements, 1-min intervals, 600-min window (FIXED: increased window)
+		("analytics_large", 1000, 1, 1200, Resolution::Seconds, Spline::Cubic), // 1000 measurements, 1-min intervals, 1200-min window (FIXED: increased window)
 	];
 
 	let mut group = c.benchmark_group("integration_pipeline");
@@ -90,7 +91,7 @@ fn benchmark_full_integration_pipeline(c: &mut Criterion) {
 		// Validate the time range
 		assert!(end > start, "End time must be after start time for integration scenario {}", name);
 
-		group.bench_function(name, |b| b.iter(|| rt.block_on(async { black_box(auto_interpolate(black_box(measurements.clone()), black_box(start), black_box(end), black_box(resolution), black_box(spline_type)).await.unwrap()) })));
+		group.bench_function(name, |b| b.iter(|| rt.block_on(async { black_box(auto_interpolate(black_box(&mut measurements_to_points(&measurements.clone())), black_box(start), black_box(end), black_box(resolution), black_box(spline_type)).await.unwrap()) })));
 	}
 
 	group.finish();

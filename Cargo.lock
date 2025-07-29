@@ -707,6 +707,7 @@ dependencies = [
  "rand",
  "rayon",
  "serde",
+ "splimes",
  "sqlx",
  "tempfile",
  "thiserror 1.0.69",
@@ -2864,7 +2865,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "splines"
+name = "splimes"
 version = "0.1.0"
 dependencies = [
  "anyhow",

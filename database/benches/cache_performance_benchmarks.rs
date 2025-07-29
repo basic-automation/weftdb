@@ -4,6 +4,7 @@ use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use database::*;
+use splimes::{Resolution, Spline};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 
@@ -39,7 +40,7 @@ fn benchmark_cache_miss_vs_hit(c: &mut Criterion) {
 			rt.block_on(async {
 				// Use different timestamps to avoid cache hits
 				let target_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap() + Duration::seconds(fastrand::i64(0..10000));
-				let result = analyze_point(aspect_id, target_time, Resolution::Seconds, SplineType::Linear).await.unwrap();
+				let result = analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await.unwrap();
 				black_box(result)
 			})
 		})
@@ -50,13 +51,13 @@ fn benchmark_cache_miss_vs_hit(c: &mut Criterion) {
 
 	// Prime the cache
 	rt.block_on(async {
-		let _ = analyze_point(aspect_id, fixed_time, Resolution::Seconds, SplineType::Linear).await;
+		let _ = analyze_point(aspect_id, fixed_time, Resolution::Seconds, Spline::Linear).await;
 	});
 
 	group.bench_function("cache_hit", |b| {
 		b.iter(|| {
 			rt.block_on(async {
-				let result = analyze_point(aspect_id, fixed_time, Resolution::Seconds, SplineType::Linear).await.unwrap();
+				let result = analyze_point(aspect_id, fixed_time, Resolution::Seconds, Spline::Linear).await.unwrap();
 				black_box(result)
 			})
 		})
@@ -130,7 +131,7 @@ fn benchmark_concurrent_cache_access(c: &mut Criterion) {
 					let tasks: Vec<_> = (0..concurrency)
 						.map(|i| {
 							let target_time = base_time + Duration::minutes(i * 10);
-							tokio::spawn(async move { analyze_point(aspect_id, target_time, Resolution::Seconds, SplineType::Linear).await.unwrap() })
+							tokio::spawn(async move { analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await.unwrap() })
 						})
 						.collect();
 
@@ -178,7 +179,7 @@ fn benchmark_cache_memory_usage(c: &mut Criterion) {
 					// Dataset spans from base_time to base_time + (size * 10) seconds
 					// Pick a time roughly in the middle of the dataset
 					let target_time = base_time + Duration::seconds((size / 2) * 10);
-					let result = analyze_point(aspect_id, target_time, Resolution::Seconds, SplineType::Linear).await.unwrap();
+					let result = analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await.unwrap();
 					black_box(result)
 				})
 			});
@@ -218,7 +219,7 @@ fn benchmark_cache_eviction_strategies(c: &mut Criterion) {
 				// Simulate cache pressure by accessing many different time points
 				for i in 0..50 {
 					let target_time = base_time + Duration::minutes(i * 20);
-					let _result = analyze_point(aspect_id, target_time, Resolution::Seconds, SplineType::Linear).await.unwrap();
+					let _result = analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await.unwrap();
 				}
 
 				black_box(50)
