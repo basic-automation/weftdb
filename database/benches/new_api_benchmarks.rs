@@ -4,6 +4,7 @@ use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use database::*;
+use splimes::{Resolution, Spline};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 
@@ -199,7 +200,7 @@ fn benchmark_point_analysis(c: &mut Criterion) {
 		aspect_id
 	});
 
-	let spline_types = vec![SplineType::Linear, SplineType::Quadratic, SplineType::Cubic];
+	let spline_types = vec![Spline::Linear, Spline::Quadratic, Spline::Cubic];
 
 	for spline_type in spline_types {
 		c.bench_with_input(BenchmarkId::new("point_analysis", format!("{:?}", spline_type)), &spline_type, |b, &spline_type| {
@@ -250,7 +251,7 @@ fn benchmark_range_analysis(c: &mut Criterion) {
 				rt.block_on(async {
 					let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap();
 					let end_time = start_time + Duration::hours(1);
-					let result = analyze_range(aspect_id, start_time, end_time, resolution, SplineType::Linear).await.unwrap();
+					let result = analyze_range(aspect_id, start_time, end_time, resolution, Spline::Linear).await.unwrap();
 					black_box(result.len())
 				})
 			})
@@ -292,7 +293,7 @@ fn benchmark_cache_performance(c: &mut Criterion) {
 				let target_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 45, 0).unwrap();
 
 				// This should use cache after first call
-				let _result = analyze_point(aspect_id, target_time, Resolution::Seconds, SplineType::Linear).await.unwrap();
+				let _result = analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await.unwrap();
 
 				black_box(_result)
 			})

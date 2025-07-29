@@ -2,7 +2,8 @@ use std::str::FromStr;
 
 use bigdecimal::BigDecimal;
 use chrono::{TimeZone, Utc};
-use database::{add_subject, analyze_point, analyze_range, capture_measurement, existing, new, track_aspect, InputMeasurement, Resolution, SplineType};
+use database::{add_subject, analyze_point, analyze_range, capture_measurement, existing, new, track_aspect, InputMeasurement};
+use splimes::{Resolution, Spline};
 use uuid::Uuid;
 
 #[tokio::test]
@@ -30,7 +31,7 @@ async fn test_database_lifecycle() {
 
 	// Test point analysis
 	let target_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 7, 30).unwrap();
-	let data_point = analyze_point(aspect_id, target_time, Resolution::Seconds, SplineType::Linear).await.expect("Failed to analyze point");
+	let data_point = analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await.expect("Failed to analyze point");
 
 	assert!(data_point.value > BigDecimal::from_str("21.0").unwrap());
 	assert!(data_point.value < BigDecimal::from_str("21.5").unwrap());
@@ -38,7 +39,7 @@ async fn test_database_lifecycle() {
 	// Test range analysis - Fix: Use Resolution::Seconds instead of Resolution::Minutes(1)
 	let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap();
 	let end_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 10, 0).unwrap();
-	let range_data = analyze_range(aspect_id, start_time, end_time, Resolution::Seconds, SplineType::Linear).await.expect("Failed to analyze range");
+	let range_data = analyze_range(aspect_id, start_time, end_time, Resolution::Seconds, Spline::Linear).await.expect("Failed to analyze range");
 
 	assert!(!range_data.is_empty());
 
@@ -110,11 +111,11 @@ async fn test_multiple_subjects_and_aspects() {
 	// Test analysis on different aspects
 	let analysis_time = base_time + chrono::Duration::minutes(10);
 
-	let temp1_result = analyze_point(temp_aspect1, analysis_time, Resolution::Seconds, SplineType::Linear).await.expect("Failed to analyze temperature for subject 1");
+	let temp1_result = analyze_point(temp_aspect1, analysis_time, Resolution::Seconds, Spline::Linear).await.expect("Failed to analyze temperature for subject 1");
 
-	let humidity1_result = analyze_point(humidity_aspect1, analysis_time, Resolution::Seconds, SplineType::Linear).await.expect("Failed to analyze humidity for subject 1");
+	let humidity1_result = analyze_point(humidity_aspect1, analysis_time, Resolution::Seconds, Spline::Linear).await.expect("Failed to analyze humidity for subject 1");
 
-	let temp2_result = analyze_point(temp_aspect2, analysis_time, Resolution::Seconds, SplineType::Linear).await.expect("Failed to analyze temperature for subject 2");
+	let temp2_result = analyze_point(temp_aspect2, analysis_time, Resolution::Seconds, Spline::Linear).await.expect("Failed to analyze temperature for subject 2");
 
 	// Verify results are different for different aspects/subjects
 	assert_ne!(temp1_result.value, humidity1_result.value);
@@ -174,11 +175,11 @@ async fn test_interpolation_methods() {
 	let quadratic_target = base_time + chrono::Duration::minutes(16); // Different time
 	let cubic_target = base_time + chrono::Duration::minutes(17); // Different time
 
-	let linear_result = analyze_point(aspect_id, linear_target, Resolution::Seconds, SplineType::Linear).await.expect("Failed to analyze with linear interpolation");
+	let linear_result = analyze_point(aspect_id, linear_target, Resolution::Seconds, Spline::Linear).await.expect("Failed to analyze with linear interpolation");
 
-	let quadratic_result = analyze_point(aspect_id, quadratic_target, Resolution::Seconds, SplineType::Quadratic).await.expect("Failed to analyze with quadratic interpolation");
+	let quadratic_result = analyze_point(aspect_id, quadratic_target, Resolution::Seconds, Spline::Quadratic).await.expect("Failed to analyze with quadratic interpolation");
 
-	let cubic_result = analyze_point(aspect_id, cubic_target, Resolution::Seconds, SplineType::Cubic).await.expect("Failed to analyze with cubic interpolation");
+	let cubic_result = analyze_point(aspect_id, cubic_target, Resolution::Seconds, Spline::Cubic).await.expect("Failed to analyze with cubic interpolation");
 
 	// Results should be different for different interpolation methods and times
 	println!("Linear result: {}", linear_result.value);
@@ -201,7 +202,7 @@ async fn test_interpolation_methods() {
 	assert_ne!(quadratic_result.value, cubic_result.value, "Quadratic and cubic should differ");
 
 	// Test that the methods produce consistent results when called again with the same parameters
-	let linear_result2 = analyze_point(aspect_id, linear_target, Resolution::Seconds, SplineType::Linear).await.expect("Failed to analyze with linear interpolation (second call)");
+	let linear_result2 = analyze_point(aspect_id, linear_target, Resolution::Seconds, Spline::Linear).await.expect("Failed to analyze with linear interpolation (second call)");
 
 	assert_eq!(linear_result.value, linear_result2.value, "Linear interpolation should be consistent");
 	assert_eq!(linear_result.timestamp, linear_result2.timestamp, "Linear interpolation timestamps should match");
@@ -231,12 +232,12 @@ async fn test_caching_behavior() {
 
 	// First call should populate cache
 	let start = std::time::Instant::now();
-	let result1 = analyze_point(aspect_id, target_time, Resolution::Seconds, SplineType::Linear).await.expect("Failed to analyze point (first call)");
+	let result1 = analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await.expect("Failed to analyze point (first call)");
 	let first_duration = start.elapsed();
 
 	// Second call should be faster due to caching
 	let start = std::time::Instant::now();
-	let result2 = analyze_point(aspect_id, target_time, Resolution::Seconds, SplineType::Linear).await.expect("Failed to analyze point (second call)");
+	let result2 = analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await.expect("Failed to analyze point (second call)");
 	let second_duration = start.elapsed();
 
 	// Results should be identical

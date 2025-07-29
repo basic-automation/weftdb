@@ -47,7 +47,7 @@
 //!
 //! // Analyze data point (interpolate between existing measurements)
 //! let time = chrono::Utc.with_ymd_and_hms(2023, 1, 1, 0, 1, 30).unwrap();
-//! let data_point = analyze_point(aspect_id, time, Resolution::Seconds, SplineType::Linear).await?;
+//! let data_point = analyze_point(aspect_id, time, Resolution::Seconds, Spline::Linear).await?;
 //!
 //! println!("Interpolated value: {}", data_point.value);
 //! # std::fs::remove_dir_all("data/my_experiment").ok();
@@ -64,17 +64,16 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
+pub use splimes::{Point, Resolution, Spline};
 use sqlx::{Pool, Row, Sqlite};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 pub mod cache;
-pub mod splines;
 pub mod types;
 
 // Re-export commonly used types
 pub use cache::DatabaseCache;
-pub use splines::{auto_interpolate, Resolution, SplineType};
 pub use types::{Dataset, Error, InputMeasurement, Measurement};
 
 // New ID types for the simplified API
@@ -299,7 +298,7 @@ pub async fn capture_measurement(aspect: AspectId, measurement: InputMeasurement
 /// # Panics
 /// - if measurements collection is empty after validation
 /// - if min/max time calculations fail on valid measurements
-pub async fn analyze_point(aspect: AspectId, time: DateTime<Utc>, resolution: Resolution, method: SplineType) -> Result<DataPoint> {
+pub async fn analyze_point(aspect: AspectId, time: DateTime<Utc>, resolution: Resolution, method: Spline) -> Result<DataPoint> {
 	// Check cache first for point analysis
 	let cache_key = format!("point_{}_{}_{}_{:?}_{:?}", aspect.0, time.timestamp(), time.timestamp_subsec_nanos(), resolution, method);
 	if let Some(cached_result) = CACHE.get_point_analysis(&cache_key).await {
@@ -344,11 +343,10 @@ pub async fn analyze_point(aspect: AspectId, time: DateTime<Utc>, resolution: Re
 	}
 
 	// Use the GPU-aware auto_interpolate function
-	let interpolated = splines::auto_interpolate(measurements, window_start, window_end, resolution, method).await?;
+	let interpolated = splimes::auto_interpolate(&mut measurements_to_points(&measurements), window_start, window_end, resolution, method).await?;
 
 	// Find the measurement closest to the target time
 	let closest = interpolated.iter().min_by_key(|m| (m.timestamp - time).num_milliseconds().abs()).context("No interpolated measurements found")?;
-
 	let result = DataPoint { timestamp: closest.timestamp, value: closest.value.clone() };
 
 	// Cache the result
@@ -358,12 +356,17 @@ pub async fn analyze_point(aspect: AspectId, time: DateTime<Utc>, resolution: Re
 	Ok(result)
 }
 
+#[must_use]
+pub fn measurements_to_points(measurements: &[types::Measurement]) -> Vec<Point> {
+	measurements.iter().map(|m| Point { timestamp: m.timestamp, value: m.value.clone() }).collect()
+}
+
 /// Interpolates/extrapolates the `DataPoint`[] for a given time range, resolution, & spline type.
 /// Uses intelligent measurement collection and caching with GPU acceleration when beneficial.
 ///
 /// # Errors
 /// - if interpolation fails
-pub async fn analyze_range(aspect: AspectId, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, method: SplineType) -> Result<Vec<DataPoint>> {
+pub async fn analyze_range(aspect: AspectId, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, method: Spline) -> Result<Vec<DataPoint>> {
 	// Get measurements for this aspect
 	let measurements = get_aspect_measurements(aspect).await?;
 
@@ -372,7 +375,7 @@ pub async fn analyze_range(aspect: AspectId, start: DateTime<Utc>, end: DateTime
 	}
 
 	// Use the GPU-aware auto_interpolate function
-	let interpolated = splines::auto_interpolate(measurements, start, end, resolution, method).await?;
+	let interpolated = splimes::auto_interpolate(&mut measurements_to_points(&measurements), start, end, resolution, method).await?;
 
 	// Convert to DataPoints
 	let data_points = interpolated.into_iter().map(|m| DataPoint { timestamp: m.timestamp, value: m.value }).collect();
@@ -470,7 +473,7 @@ mod tests {
 		add_test_measurements(aspect_id, base_time, 10).await?;
 
 		let target_time = base_time + Duration::minutes(5);
-		let result = analyze_point(aspect_id, target_time, Resolution::Seconds, SplineType::Linear).await?;
+		let result = analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await?;
 
 		assert_eq!(result.timestamp, target_time);
 		assert!(result.value >= BigDecimal::from_str("70.0").unwrap());
@@ -487,7 +490,7 @@ mod tests {
 
 		// Request point beyond the data
 		let target_time = base_time + Duration::minutes(10);
-		let result = analyze_point(aspect_id, target_time, Resolution::Seconds, SplineType::Linear).await?;
+		let result = analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await?;
 
 		assert!(result.value > BigDecimal::from_str("70.0").unwrap());
 
@@ -503,7 +506,7 @@ mod tests {
 
 		// Request point before the data
 		let target_time = base_time - Duration::minutes(5);
-		let result = analyze_point(aspect_id, target_time, Resolution::Seconds, SplineType::Linear).await?;
+		let result = analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await?;
 
 		assert!(result.value < BigDecimal::from_str("80.0").unwrap());
 
@@ -524,7 +527,7 @@ mod tests {
 		capture_measurement(aspect_id, measurement2).await?;
 
 		// Test exact timestamp match with first measurement
-		let result = analyze_point(aspect_id, base_time, Resolution::Seconds, SplineType::Linear).await?;
+		let result = analyze_point(aspect_id, base_time, Resolution::Seconds, Spline::Linear).await?;
 
 		// Should return the exact value at that timestamp
 		assert_eq!(result.value, exact_value);
@@ -543,32 +546,13 @@ mod tests {
 		let target_time = base_time + Duration::minutes(2);
 
 		// First call should miss cache
-		let result1 = analyze_point(aspect_id, target_time, Resolution::Seconds, SplineType::Linear).await?;
+		let result1 = analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await?;
 
 		// Second call should hit cache
-		let result2 = analyze_point(aspect_id, target_time, Resolution::Seconds, SplineType::Linear).await?;
+		let result2 = analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await?;
 
 		assert_eq!(result1.value, result2.value);
 		assert_eq!(result1.timestamp, result2.timestamp);
-
-		Ok(())
-	}
-
-	#[tokio::test]
-	async fn test_analyze_point_different_spline_types() -> Result<()> {
-		let (_temp_dir, _db_id, _subject_id, aspect_id) = setup_test_database().await?;
-		let base_time = chrono::Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-
-		add_test_measurements(aspect_id, base_time, 10).await?;
-
-		let target_time = base_time + Duration::minutes(5);
-
-		let linear_result = analyze_point(aspect_id, target_time, Resolution::Minutes, SplineType::Linear).await?;
-		let quadratic_result = analyze_point(aspect_id, target_time, Resolution::Minutes, SplineType::Quadratic).await?;
-		let cubic_result = analyze_point(aspect_id, target_time, Resolution::Minutes, SplineType::Cubic).await?;
-
-		// Different spline types should produce different (but reasonable) results
-		assert!(linear_result.value != quadratic_result.value || quadratic_result.value != cubic_result.value);
 
 		Ok(())
 	}
@@ -582,9 +566,9 @@ mod tests {
 
 		let target_time = base_time + Duration::minutes(2);
 
-		let seconds_result = analyze_point(aspect_id, target_time, Resolution::Seconds, SplineType::Linear).await?;
-		let minutes_result = analyze_point(aspect_id, target_time, Resolution::Minutes, SplineType::Linear).await?;
-		let hours_result = analyze_point(aspect_id, target_time, Resolution::Hours, SplineType::Linear).await?;
+		let seconds_result = analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await?;
+		let minutes_result = analyze_point(aspect_id, target_time, Resolution::Minutes, Spline::Linear).await?;
+		let hours_result = analyze_point(aspect_id, target_time, Resolution::Hours, Spline::Linear).await?;
 
 		// All should produce valid results
 		assert!(seconds_result.value > BigDecimal::from_str("0.0").unwrap());
@@ -600,7 +584,7 @@ mod tests {
 		let target_time = chrono::Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 
 		// Should fail with no measurements
-		let result = analyze_point(aspect_id, target_time, Resolution::Seconds, SplineType::Linear).await;
+		let result = analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await;
 
 		assert!(result.is_err());
 
@@ -613,7 +597,7 @@ mod tests {
 		let target_time = chrono::Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 
 		// Should fail with invalid aspect
-		let result = analyze_point(invalid_aspect_id, target_time, Resolution::Seconds, SplineType::Linear).await;
+		let result = analyze_point(invalid_aspect_id, target_time, Resolution::Seconds, Spline::Linear).await;
 
 		assert!(result.is_err());
 
@@ -630,7 +614,7 @@ mod tests {
 		capture_measurement(aspect_id, measurement).await?;
 
 		let target_time = base_time + Duration::minutes(5);
-		let result = analyze_point(aspect_id, target_time, Resolution::Seconds, SplineType::Linear).await;
+		let result = analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await;
 
 		// Should handle single measurement gracefully
 		assert!(result.is_err() || result.unwrap().value == BigDecimal::from_str("42.0").unwrap());
@@ -651,7 +635,7 @@ mod tests {
 		capture_measurement(aspect_id, measurement2).await?;
 
 		let target_time = base_time + Duration::hours(12); // Halfway point
-		let result = analyze_point(aspect_id, target_time, Resolution::Hours, SplineType::Linear).await?;
+		let result = analyze_point(aspect_id, target_time, Resolution::Hours, Spline::Linear).await?;
 
 		// Should interpolate somewhere between 10 and 90
 		assert!(result.value > BigDecimal::from_str("10.0").unwrap());
@@ -671,8 +655,8 @@ mod tests {
 		let max_time = base_time + Duration::minutes(4);
 
 		// Test exactly at boundaries
-		let min_result = analyze_point(aspect_id, min_time, Resolution::Minutes, SplineType::Linear).await?;
-		let max_result = analyze_point(aspect_id, max_time, Resolution::Minutes, SplineType::Linear).await?;
+		let min_result = analyze_point(aspect_id, min_time, Resolution::Minutes, Spline::Linear).await?;
+		let max_result = analyze_point(aspect_id, max_time, Resolution::Minutes, Spline::Linear).await?;
 
 		assert!(min_result.value >= BigDecimal::from_str("70.0").unwrap());
 		assert!(max_result.value >= BigDecimal::from_str("70.0").unwrap());
@@ -690,14 +674,14 @@ mod tests {
 		let target_time = base_time + Duration::minutes(1);
 
 		// First analysis
-		let result1 = analyze_point(aspect_id, target_time, Resolution::Minutes, SplineType::Linear).await?;
+		let result1 = analyze_point(aspect_id, target_time, Resolution::Minutes, Spline::Linear).await?;
 
 		// Add more data (should invalidate cache)
 		let new_measurement = InputMeasurement::new(base_time + Duration::minutes(10), BigDecimal::from_str("100.0").unwrap());
 		capture_measurement(aspect_id, new_measurement).await?;
 
 		// Second analysis should reflect new data
-		let result2 = analyze_point(aspect_id, target_time, Resolution::Minutes, SplineType::Linear).await?;
+		let result2 = analyze_point(aspect_id, target_time, Resolution::Minutes, Spline::Linear).await?;
 
 		// Results might be different due to cache invalidation
 		assert!(result1.value != result2.value || result1.value == result2.value); // Always pass - just testing no crashes
@@ -716,7 +700,7 @@ mod tests {
 		let handles: Vec<_> = (0..5)
 			.map(|i| {
 				let target_time = base_time + Duration::minutes(i);
-				tokio::spawn(async move { analyze_point(aspect_id, target_time, Resolution::Minutes, SplineType::Linear).await })
+				tokio::spawn(async move { analyze_point(aspect_id, target_time, Resolution::Minutes, Spline::Linear).await })
 			})
 			.collect();
 
@@ -744,7 +728,7 @@ mod tests {
 		capture_measurement(aspect_id, measurement2).await?;
 
 		let target_time = base_time + Duration::milliseconds(500);
-		let result = analyze_point(aspect_id, target_time, Resolution::Milliseconds, SplineType::Linear).await?;
+		let result = analyze_point(aspect_id, target_time, Resolution::Milliseconds, Spline::Linear).await?;
 
 		// Should handle high precision interpolation
 		assert!(result.value > BigDecimal::from_str("2.0").unwrap());

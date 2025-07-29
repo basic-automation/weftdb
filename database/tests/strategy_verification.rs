@@ -2,7 +2,8 @@ use std::str::FromStr;
 
 use bigdecimal::BigDecimal;
 use chrono::{TimeZone, Utc};
-use database::{add_subject, analyze_range, auto_interpolate, capture_measurement, new, track_aspect, InputMeasurement, Measurement, Resolution, SplineType};
+use database::{add_subject, analyze_range, capture_measurement, measurements_to_points, new, track_aspect, InputMeasurement, Measurement};
+use splimes::{auto_interpolate, Resolution, Spline};
 use uuid::Uuid;
 
 fn create_test_measurements(count: usize) -> Vec<Measurement> {
@@ -27,7 +28,7 @@ async fn test_linear_interpolation_accuracy() {
 	let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 	let end_time = start_time + chrono::Duration::minutes(10);
 
-	let result = auto_interpolate(measurements, start_time, end_time, Resolution::Minutes, SplineType::Linear).await;
+	let result = auto_interpolate(&mut measurements_to_points(&measurements.clone()), start_time, end_time, Resolution::Minutes, Spline::Linear).await;
 
 	if let Err(e) = &result {
 		println!("Linear interpolation error: {}", e);
@@ -43,7 +44,7 @@ async fn test_quadratic_interpolation_accuracy() {
 	let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 	let end_time = start_time + chrono::Duration::minutes(10);
 
-	let result = auto_interpolate(measurements, start_time, end_time, Resolution::Minutes, SplineType::Quadratic).await;
+	let result = auto_interpolate(&mut measurements_to_points(&measurements.clone()), start_time, end_time, Resolution::Minutes, Spline::Quadratic).await;
 
 	if let Err(e) = &result {
 		println!("Quadratic interpolation error: {}", e);
@@ -59,7 +60,7 @@ async fn test_cubic_interpolation_accuracy() {
 	let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 	let end_time = start_time + chrono::Duration::minutes(10);
 
-	let result = auto_interpolate(measurements, start_time, end_time, Resolution::Minutes, SplineType::Cubic).await;
+	let result = auto_interpolate(&mut measurements_to_points(&measurements.clone()), start_time, end_time, Resolution::Minutes, Spline::Cubic).await;
 
 	if let Err(e) = &result {
 		println!("Cubic interpolation error: {}", e);
@@ -82,7 +83,7 @@ async fn test_resolution_consistency() {
 	];
 
 	for (name, resolution, expected_points) in resolutions {
-		let result = auto_interpolate(measurements.clone(), start_time, end_time, resolution, SplineType::Linear).await;
+		let result = auto_interpolate(&mut measurements_to_points(&measurements.clone()), start_time, end_time, resolution, Spline::Linear).await;
 		if let Err(e) = &result {
 			println!("Resolution {} error: {}", name, e);
 		}
@@ -99,10 +100,10 @@ async fn test_spline_type_variations() {
 	let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 	let end_time = start_time + chrono::Duration::minutes(10);
 
-	let spline_types = vec![("Linear", SplineType::Linear), ("Quadratic", SplineType::Quadratic), ("Cubic", SplineType::Cubic), ("Polynomial(2)", SplineType::Polynomial(2)), ("Polynomial(3)", SplineType::Polynomial(3))];
+	let spline_types = vec![("Linear", Spline::Linear), ("Quadratic", Spline::Quadratic), ("Cubic", Spline::Cubic), ("Polynomial(2)", Spline::Polynomial(2, None)), ("Polynomial(3)", Spline::Polynomial(3, None))];
 
 	for (name, spline_type) in spline_types {
-		let result = auto_interpolate(measurements.clone(), start_time, end_time, Resolution::Seconds, spline_type).await;
+		let result = auto_interpolate(&mut measurements_to_points(&measurements.clone()), start_time, end_time, Resolution::Seconds, spline_type).await;
 		if let Err(e) = &result {
 			println!("Spline type {} error: {}", name, e);
 		}
@@ -123,11 +124,11 @@ async fn test_spline_type_variations() {
 }
 
 // Mock the fast_path_optimization function since it's internal
-fn fast_path_optimization(spline_type: SplineType, _data_points: usize, _min_degree: usize) -> SplineType {
+fn fast_path_optimization(spline_type: Spline, _data_points: usize, _min_degree: usize) -> Spline {
 	// Simple mock implementation for testing
 	match spline_type {
-		SplineType::Cubic if _data_points < 3000 => SplineType::Quadratic,
-		SplineType::Polynomial(n) if n > 3 && _data_points < 5000 => SplineType::Quadratic,
+		Spline::Cubic if _data_points < 3000 => Spline::Quadratic,
+		Spline::Polynomial(n, None) if n > 3 && _data_points < 5000 => Spline::Quadratic,
 		_ => spline_type,
 	}
 }
@@ -135,14 +136,14 @@ fn fast_path_optimization(spline_type: SplineType, _data_points: usize, _min_deg
 #[tokio::test]
 async fn test_fast_path_optimization() {
 	// Test that optimization logic works correctly
-	let cubic_optimized = fast_path_optimization(SplineType::Cubic, 2500, 3);
-	assert_eq!(cubic_optimized, SplineType::Quadratic, "Cubic should degrade to Quadratic for small datasets");
+	let cubic_optimized = fast_path_optimization(Spline::Cubic, 2500, 3);
+	assert_eq!(cubic_optimized, Spline::Quadratic, "Cubic should degrade to Quadratic for small datasets");
 
-	let poly_optimized = fast_path_optimization(SplineType::Polynomial(8), 4000, 8);
-	assert_eq!(poly_optimized, SplineType::Quadratic, "High-degree polynomial should degrade to Quadratic for medium datasets");
+	let poly_optimized = fast_path_optimization(Spline::Polynomial(8, None), 4000, 8);
+	assert_eq!(poly_optimized, Spline::Quadratic, "High-degree polynomial should degrade to Quadratic for medium datasets");
 
-	let linear_unchanged = fast_path_optimization(SplineType::Linear, 10000, 1);
-	assert_eq!(linear_unchanged, SplineType::Linear, "Linear should not be degraded");
+	let linear_unchanged = fast_path_optimization(Spline::Linear, 10000, 1);
+	assert_eq!(linear_unchanged, Spline::Linear, "Linear should not be degraded");
 }
 
 #[tokio::test]
@@ -166,10 +167,10 @@ async fn test_end_to_end_with_new_api() -> anyhow::Result<()> {
 	}
 
 	// Test linear interpolation
-	let linear_results = analyze_range(aspect_id, base_time, base_time + chrono::Duration::hours(1), Resolution::Minutes, SplineType::Linear).await?;
+	let linear_results = analyze_range(aspect_id, base_time, base_time + chrono::Duration::hours(1), Resolution::Minutes, Spline::Linear).await?;
 
 	// Test cubic interpolation
-	let cubic_results = analyze_range(aspect_id, base_time, base_time + chrono::Duration::hours(1), Resolution::Minutes, SplineType::Cubic).await?;
+	let cubic_results = analyze_range(aspect_id, base_time, base_time + chrono::Duration::hours(1), Resolution::Minutes, Spline::Cubic).await?;
 
 	assert!(!linear_results.is_empty(), "Linear interpolation should produce results");
 	assert!(!cubic_results.is_empty(), "Cubic interpolation should produce results");

@@ -3,7 +3,8 @@ use std::{hint::black_box, str::FromStr};
 use bigdecimal::BigDecimal;
 use chrono::{TimeZone, Utc};
 use criterion::{criterion_group, criterion_main, Criterion};
-use database::{auto_interpolate, Measurement, Resolution, SplineType};
+use database::{measurements_to_points, Measurement};
+use splimes::{auto_interpolate, Resolution, Spline};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 
@@ -24,7 +25,7 @@ fn benchmark_interpolation_sizes(c: &mut Criterion) {
 		let start_time = measurements[0].timestamp;
 		let end_time = start_time + chrono::Duration::minutes(10); // 10 minute window
 
-		c.bench_function(&format!("interpolation_size_{}", size), |b| b.iter(|| rt.block_on(async { black_box(auto_interpolate(black_box(measurements.clone()), black_box(start_time), black_box(end_time), black_box(Resolution::Minutes), black_box(SplineType::Linear)).await.unwrap()) })));
+		c.bench_function(&format!("interpolation_size_{}", size), |b| b.iter(|| rt.block_on(async { black_box(auto_interpolate(black_box(&mut measurements_to_points(&measurements.clone())), black_box(start_time), black_box(end_time), black_box(Resolution::Minutes), black_box(Spline::Linear)).await.unwrap()) })));
 	}
 }
 
@@ -49,7 +50,7 @@ fn benchmark_interpolation_resolutions(c: &mut Criterion) {
 			_ => start_time + chrono::Duration::minutes(duration_amount),
 		};
 
-		c.bench_function(&format!("interpolation_resolution_{}", name), |b| b.iter(|| rt.block_on(async { black_box(auto_interpolate(black_box(measurements.clone()), black_box(start_time), black_box(interpolation_end), black_box(resolution), black_box(SplineType::Linear)).await.unwrap()) })));
+		c.bench_function(&format!("interpolation_resolution_{}", name), |b| b.iter(|| rt.block_on(async { black_box(auto_interpolate(black_box(&mut measurements_to_points(&measurements.clone())), black_box(start_time), black_box(interpolation_end), black_box(resolution), black_box(Spline::Linear)).await.unwrap()) })));
 	}
 }
 
@@ -59,10 +60,10 @@ fn benchmark_spline_types(c: &mut Criterion) {
 	let start_time = measurements[0].timestamp;
 	let end_time = start_time + chrono::Duration::minutes(10);
 
-	let spline_types = vec![("linear", SplineType::Linear), ("quadratic", SplineType::Quadratic), ("cubic", SplineType::Cubic), ("polynomial_2", SplineType::Polynomial(2)), ("polynomial_3", SplineType::Polynomial(3))];
+	let spline_types = vec![("linear", Spline::Linear), ("quadratic", Spline::Quadratic), ("cubic", Spline::Cubic), ("polynomial_2", Spline::Polynomial(2, None)), ("polynomial_3", Spline::Polynomial(3, None))];
 
 	for (name, spline_type) in spline_types {
-		c.bench_function(&format!("spline_type_{}", name), |b| b.iter(|| rt.block_on(async { black_box(auto_interpolate(black_box(measurements.clone()), black_box(start_time), black_box(end_time), black_box(Resolution::Minutes), black_box(spline_type)).await.unwrap()) })));
+		c.bench_function(&format!("spline_type_{}", name), |b| b.iter(|| rt.block_on(async { black_box(auto_interpolate(black_box(&mut measurements_to_points(&measurements.clone())), black_box(start_time), black_box(end_time), black_box(Resolution::Minutes), black_box(spline_type)).await.unwrap()) })));
 	}
 }
 
