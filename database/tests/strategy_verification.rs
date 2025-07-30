@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use bigdecimal::BigDecimal;
 use chrono::{TimeZone, Utc};
-use database::{add_subject, analyze_range, capture_measurement, measurements_to_points, new, track_aspect, InputMeasurement, Measurement};
+use database::{Database, InputMeasurement, Measurement};
 use splimes::{auto_interpolate, Resolution, Spline};
 use uuid::Uuid;
 
@@ -28,7 +28,7 @@ async fn test_linear_interpolation_accuracy() {
 	let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 	let end_time = start_time + chrono::Duration::minutes(10);
 
-	let result = auto_interpolate(&mut measurements_to_points(&measurements.clone()), start_time, end_time, Resolution::Minutes, Spline::Linear).await;
+	let result = auto_interpolate(&mut Database::measurements_to_points(&measurements), start_time, end_time, Resolution::Minutes, Spline::Linear).await;
 
 	if let Err(e) = &result {
 		println!("Linear interpolation error: {}", e);
@@ -44,7 +44,7 @@ async fn test_quadratic_interpolation_accuracy() {
 	let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 	let end_time = start_time + chrono::Duration::minutes(10);
 
-	let result = auto_interpolate(&mut measurements_to_points(&measurements.clone()), start_time, end_time, Resolution::Minutes, Spline::Quadratic).await;
+	let result = auto_interpolate(&mut Database::measurements_to_points(&measurements), start_time, end_time, Resolution::Minutes, Spline::Quadratic).await;
 
 	if let Err(e) = &result {
 		println!("Quadratic interpolation error: {}", e);
@@ -60,7 +60,7 @@ async fn test_cubic_interpolation_accuracy() {
 	let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 	let end_time = start_time + chrono::Duration::minutes(10);
 
-	let result = auto_interpolate(&mut measurements_to_points(&measurements.clone()), start_time, end_time, Resolution::Minutes, Spline::Cubic).await;
+	let result = auto_interpolate(&mut Database::measurements_to_points(&measurements), start_time, end_time, Resolution::Minutes, Spline::Cubic).await;
 
 	if let Err(e) = &result {
 		println!("Cubic interpolation error: {}", e);
@@ -83,7 +83,7 @@ async fn test_resolution_consistency() {
 	];
 
 	for (name, resolution, expected_points) in resolutions {
-		let result = auto_interpolate(&mut measurements_to_points(&measurements.clone()), start_time, end_time, resolution, Spline::Linear).await;
+		let result = auto_interpolate(&mut Database::measurements_to_points(&measurements), start_time, end_time, resolution, Spline::Linear).await;
 		if let Err(e) = &result {
 			println!("Resolution {} error: {}", name, e);
 		}
@@ -103,7 +103,7 @@ async fn test_spline_type_variations() {
 	let spline_types = vec![("Linear", Spline::Linear), ("Quadratic", Spline::Quadratic), ("Cubic", Spline::Cubic), ("Polynomial(2)", Spline::Polynomial(2, None)), ("Polynomial(3)", Spline::Polynomial(3, None))];
 
 	for (name, spline_type) in spline_types {
-		let result = auto_interpolate(&mut measurements_to_points(&measurements.clone()), start_time, end_time, Resolution::Seconds, spline_type).await;
+		let result = auto_interpolate(&mut Database::measurements_to_points(&measurements), start_time, end_time, Resolution::Seconds, spline_type).await;
 		if let Err(e) = &result {
 			println!("Spline type {} error: {}", name, e);
 		}
@@ -154,23 +154,23 @@ async fn test_end_to_end_with_new_api() -> anyhow::Result<()> {
 	// Clean up any existing test directory first
 	std::fs::remove_dir_all(&format!("data/{}", test_name)).ok();
 
-	// Test the complete workflow using the new simplified API
-	let db_id = new(&test_name).await?;
-	let subject_id = add_subject(db_id, "test_subject").await?;
-	let aspect_id = track_aspect(subject_id, "sensor_data").await?;
+	// Test the complete workflow using the Database API
+	let db = Database::new(&test_name).await?;
+	let subject = db.track_subject("test_subject").await?;
+	let aspect = db.track_aspect(subject, "sensor_data").await?;
 
 	// Add test data
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 	for i in 0..20 {
 		let measurement = InputMeasurement::new(base_time + chrono::Duration::minutes(i * 5), BigDecimal::from_str(&format!("{}.{}", 10 + i, i % 10))?);
-		capture_measurement(aspect_id, measurement).await?;
+		db.observe_measurement(aspect.clone(), measurement).await?;
 	}
 
 	// Test linear interpolation
-	let linear_results = analyze_range(aspect_id, base_time, base_time + chrono::Duration::hours(1), Resolution::Minutes, Spline::Linear).await?;
+	let linear_results = Database::analyze_range(aspect.id(), base_time, base_time + chrono::Duration::hours(1), Resolution::Minutes, Spline::Linear).await?;
 
 	// Test cubic interpolation
-	let cubic_results = analyze_range(aspect_id, base_time, base_time + chrono::Duration::hours(1), Resolution::Minutes, Spline::Cubic).await?;
+	let cubic_results = Database::analyze_range(aspect.id(), base_time, base_time + chrono::Duration::hours(1), Resolution::Minutes, Spline::Cubic).await?;
 
 	assert!(!linear_results.is_empty(), "Linear interpolation should produce results");
 	assert!(!cubic_results.is_empty(), "Cubic interpolation should produce results");

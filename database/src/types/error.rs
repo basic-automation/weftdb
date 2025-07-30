@@ -25,4 +25,7 @@ pub enum Error {
 
 	#[error("Cache error: {0}")]
 	CacheError(String),
+
+	#[error("Invalid ID: {0}")]
+	InvalidIdError(String),
 }
