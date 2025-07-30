@@ -1,4 +1,6 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+	collections::HashMap, sync::{Arc, LazyLock}
+};
 
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
@@ -6,6 +8,8 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::types::Measurement;
+
+pub static CACHE: LazyLock<DatabaseCache> = LazyLock::new(DatabaseCache::default);
 
 #[derive(Debug, Clone)]
 pub struct AnalysisResult {
