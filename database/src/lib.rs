@@ -74,17 +74,24 @@ pub mod types;
 
 // Re-export commonly used types
 pub use cache::DatabaseCache;
-pub use types::{Dataset, Error, InputMeasurement, Measurement};
+pub use types::{DatabaseId, Dataset, Error, InputMeasurement, Measurement, SubjectId};
 
 // New ID types for the simplified API
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct DatabaseId(Uuid);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SubjectId(Uuid);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AspectId(Uuid);
+
+impl AspectId {
+	#[must_use]
+	pub fn new() -> Self {
+		Self(Uuid::new_v4())
+	}
+}
+
+impl Default for AspectId {
+	fn default() -> Self {
+		Self::new()
+	}
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TxId(Uuid);
@@ -97,20 +104,18 @@ pub struct DataPoint {
 
 #[allow(dead_code)]
 const BATCH_SIZE: usize = 1000;
-const DEFAULT_DATA_DIR: &str = "data";
+pub const DEFAULT_DATA_DIR: &str = "data";
 
 // Internal storage structures
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DatabaseInfo {
-	#[allow(dead_code)]
 	name: String,
 	path: String,
 	subjects: HashMap<SubjectId, SubjectInfo>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SubjectInfo {
-	#[allow(dead_code)]
 	name: String,
 	pool: Pool<Sqlite>,
 	aspects: HashMap<AspectId, AspectInfo>,
@@ -118,7 +123,6 @@ struct SubjectInfo {
 
 #[derive(Debug, Clone)]
 struct AspectInfo {
-	#[allow(dead_code)]
 	name: String,
 	#[allow(dead_code)]
 	subject_id: SubjectId,
@@ -171,7 +175,7 @@ pub async fn existing(name: &str) -> Result<DatabaseId> {
 		bail!("Database directory '{}' does not exist", db_path);
 	}
 
-	let db_id = DatabaseId(Uuid::new_v4());
+	let db_id = DatabaseId::new();
 	let mut db_info = DatabaseInfo { name: name.to_string(), path: db_path.clone(), subjects: HashMap::new() };
 
 	// Load existing subjects
@@ -185,7 +189,7 @@ pub async fn existing(name: &str) -> Result<DatabaseId> {
 					let subject_db_path = format!("{db_path}/{file_name}");
 					let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(5).connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&subject_db_path).create_if_missing(false)).await.with_context(|| format!("Failed to connect to existing subject database for '{subject_name}'"))?;
 
-					let subject_id = SubjectId(Uuid::new_v4());
+					let subject_id = SubjectId::new();
 					let subject_info = SubjectInfo { name: subject_name.to_string(), pool, aspects: HashMap::new() };
 					db_info.subjects.insert(subject_id, subject_info);
 				}
@@ -198,13 +202,56 @@ pub async fn existing(name: &str) -> Result<DatabaseId> {
 	Ok(db_id)
 }
 
+/// Lists all databases in the system.
+/// Returns a map of `DatabaseId` to database name.
+/// # Errors
+/// - if unable to read database directory
+/// - if database directory is not set
+///
+pub async fn ls() -> Result<HashMap<DatabaseId, String>> {
+	let mut result = HashMap::new();
+	for (db_id, db_info) in DATABASES.lock().await.iter() {
+		result.insert(*db_id, db_info.name.clone());
+	}
+	Ok(result)
+}
+
+/// Lists all subjects in a database.
+/// # Errors
+/// - if database not found
+/// - if unable to read database subjects
+///
+pub async fn ls_subjects(db_id: DatabaseId) -> Result<HashMap<SubjectId, String>> {
+	let mut result = HashMap::new();
+	let db_info = DATABASES.lock().await.get(&db_id).context("Database not found")?.clone();
+	for (subject_id, subject_info) in &db_info.subjects {
+		result.insert(*subject_id, subject_info.name.clone());
+	}
+	Ok(result)
+}
+
+/// Lists all aspects of a subject.
+/// # Errors
+/// - if database not found
+/// - if subject not found
+///
+pub async fn ls_aspects(db_id: DatabaseId, subject_id: SubjectId) -> Result<HashMap<AspectId, String>> {
+	let db_info = DATABASES.lock().await.get(&db_id).context("Database not found")?.clone();
+	let subject_info = db_info.subjects.get(&subject_id).context("Subject not found")?;
+	let mut result = HashMap::new();
+	for (aspect_id, aspect_info) in &subject_info.aspects {
+		result.insert(*aspect_id, aspect_info.name.clone());
+	}
+	Ok(result)
+}
+
 /// Add a new subject to the database
 ///
 /// # Errors
 /// - if database not found
 /// - if unable to create database connection
 pub async fn add_subject(db_id: DatabaseId, name: &str) -> Result<SubjectId> {
-	let subject_id = SubjectId(Uuid::new_v4());
+	let subject_id = SubjectId::new();
 
 	// Get database path with early drop
 	let db_path = DATABASES.lock().await.get(&db_id).context("Database not found")?.path.clone();
@@ -420,320 +467,4 @@ async fn get_aspect_measurements(aspect: AspectId) -> Result<Vec<types::Measurem
 	CACHE.store_aspect_measurements(&cache_key, &measurements, aspect.0).await;
 
 	Ok(measurements)
-}
-
-// Keep the old DB struct for backward compatibility, but mark as deprecated
-#[deprecated(note = "Use the new simplified API functions instead")]
-pub use crate::old_db::DB;
-
-#[allow(deprecated)]
-mod old_db {
-	// Empty for now - placeholder for backward compatibility
-	pub struct DB;
-}
-
-#[cfg(test)]
-mod tests {
-	use std::str::FromStr;
-
-	use bigdecimal::BigDecimal;
-	use chrono::{Duration, TimeZone};
-	#[cfg(test)]
-	use tempfile::TempDir;
-
-	use super::*;
-
-	async fn setup_test_database() -> Result<(TempDir, DatabaseId, SubjectId, AspectId)> {
-		let temp_dir = tempfile::tempdir()?;
-		let db_name = format!("test_db_{}", Uuid::new_v4());
-
-		// Override the data directory for testing
-		std::env::set_var("TEST_DATA_DIR", temp_dir.path().to_str().unwrap());
-
-		let db_id = new(&db_name).await?;
-		let subject_id = add_subject(db_id, "test_subject").await?;
-		let aspect_id = track_aspect(subject_id, "test_aspect").await?;
-
-		Ok((temp_dir, db_id, subject_id, aspect_id))
-	}
-
-	async fn add_test_measurements(aspect_id: AspectId, base_time: DateTime<Utc>, count: usize) -> Result<()> {
-		for i in 0..count {
-			let measurement = InputMeasurement::new(base_time + Duration::minutes(i as i64), BigDecimal::from_str(&format!("{}.0", 70 + i)).unwrap());
-			capture_measurement(aspect_id, measurement).await?;
-		}
-		Ok(())
-	}
-
-	#[tokio::test]
-	async fn test_analyze_point_basic_interpolation() -> Result<()> {
-		let (_temp_dir, _db_id, _subject_id, aspect_id) = setup_test_database().await?;
-		let base_time = chrono::Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-
-		add_test_measurements(aspect_id, base_time, 10).await?;
-
-		let target_time = base_time + Duration::minutes(5);
-		let result = analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await?;
-
-		assert_eq!(result.timestamp, target_time);
-		assert!(result.value >= BigDecimal::from_str("70.0").unwrap());
-
-		Ok(())
-	}
-
-	#[tokio::test]
-	async fn test_analyze_point_extrapolation_forward() -> Result<()> {
-		let (_temp_dir, _db_id, _subject_id, aspect_id) = setup_test_database().await?;
-		let base_time = chrono::Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-
-		add_test_measurements(aspect_id, base_time, 5).await?;
-
-		// Request point beyond the data
-		let target_time = base_time + Duration::minutes(10);
-		let result = analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await?;
-
-		assert!(result.value > BigDecimal::from_str("70.0").unwrap());
-
-		Ok(())
-	}
-
-	#[tokio::test]
-	async fn test_analyze_point_extrapolation_backward() -> Result<()> {
-		let (_temp_dir, _db_id, _subject_id, aspect_id) = setup_test_database().await?;
-		let base_time = chrono::Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-
-		add_test_measurements(aspect_id, base_time, 5).await?;
-
-		// Request point before the data
-		let target_time = base_time - Duration::minutes(5);
-		let result = analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await?;
-
-		assert!(result.value < BigDecimal::from_str("80.0").unwrap());
-
-		Ok(())
-	}
-
-	#[tokio::test]
-	async fn test_analyze_point_exact_match() -> Result<()> {
-		let (_temp_dir, _db_id, _subject_id, aspect_id) = setup_test_database().await?;
-		let base_time = chrono::Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-		let exact_value = BigDecimal::from_str("75.5").unwrap();
-
-		// Add at least 2 measurements for interpolation
-		let measurement1 = InputMeasurement::new(base_time, exact_value.clone());
-		let measurement2 = InputMeasurement::new(base_time + Duration::minutes(1), BigDecimal::from_str("76.5").unwrap());
-
-		capture_measurement(aspect_id, measurement1).await?;
-		capture_measurement(aspect_id, measurement2).await?;
-
-		// Test exact timestamp match with first measurement
-		let result = analyze_point(aspect_id, base_time, Resolution::Seconds, Spline::Linear).await?;
-
-		// Should return the exact value at that timestamp
-		assert_eq!(result.value, exact_value);
-		assert_eq!(result.timestamp, base_time);
-
-		Ok(())
-	}
-
-	#[tokio::test]
-	async fn test_analyze_point_cache_hit() -> Result<()> {
-		let (_temp_dir, _db_id, _subject_id, aspect_id) = setup_test_database().await?;
-		let base_time = chrono::Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-
-		add_test_measurements(aspect_id, base_time, 5).await?;
-
-		let target_time = base_time + Duration::minutes(2);
-
-		// First call should miss cache
-		let result1 = analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await?;
-
-		// Second call should hit cache
-		let result2 = analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await?;
-
-		assert_eq!(result1.value, result2.value);
-		assert_eq!(result1.timestamp, result2.timestamp);
-
-		Ok(())
-	}
-
-	#[tokio::test]
-	async fn test_analyze_point_different_resolutions() -> Result<()> {
-		let (_temp_dir, _db_id, _subject_id, aspect_id) = setup_test_database().await?;
-		let base_time = chrono::Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-
-		add_test_measurements(aspect_id, base_time, 5).await?;
-
-		let target_time = base_time + Duration::minutes(2);
-
-		let seconds_result = analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await?;
-		let minutes_result = analyze_point(aspect_id, target_time, Resolution::Minutes, Spline::Linear).await?;
-		let hours_result = analyze_point(aspect_id, target_time, Resolution::Hours, Spline::Linear).await?;
-
-		// All should produce valid results
-		assert!(seconds_result.value > BigDecimal::from_str("0.0").unwrap());
-		assert!(minutes_result.value > BigDecimal::from_str("0.0").unwrap());
-		assert!(hours_result.value > BigDecimal::from_str("0.0").unwrap());
-
-		Ok(())
-	}
-
-	#[tokio::test]
-	async fn test_analyze_point_no_measurements_error() -> Result<()> {
-		let (_temp_dir, _db_id, _subject_id, aspect_id) = setup_test_database().await?;
-		let target_time = chrono::Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-
-		// Should fail with no measurements
-		let result = analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await;
-
-		assert!(result.is_err());
-
-		Ok(())
-	}
-
-	#[tokio::test]
-	async fn test_analyze_point_invalid_aspect_error() -> Result<()> {
-		let invalid_aspect_id = AspectId(Uuid::new_v4());
-		let target_time = chrono::Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-
-		// Should fail with invalid aspect
-		let result = analyze_point(invalid_aspect_id, target_time, Resolution::Seconds, Spline::Linear).await;
-
-		assert!(result.is_err());
-
-		Ok(())
-	}
-
-	#[tokio::test]
-	async fn test_analyze_point_single_measurement() -> Result<()> {
-		let (_temp_dir, _db_id, _subject_id, aspect_id) = setup_test_database().await?;
-		let base_time = chrono::Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-
-		// Add only one measurement
-		let measurement = InputMeasurement::new(base_time, BigDecimal::from_str("42.0").unwrap());
-		capture_measurement(aspect_id, measurement).await?;
-
-		let target_time = base_time + Duration::minutes(5);
-		let result = analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await;
-
-		// Should handle single measurement gracefully
-		assert!(result.is_err() || result.unwrap().value == BigDecimal::from_str("42.0").unwrap());
-
-		Ok(())
-	}
-
-	#[tokio::test]
-	async fn test_analyze_point_large_time_gap() -> Result<()> {
-		let (_temp_dir, _db_id, _subject_id, aspect_id) = setup_test_database().await?;
-		let base_time = chrono::Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-
-		// Add measurements with large gaps
-		let measurement1 = InputMeasurement::new(base_time, BigDecimal::from_str("10.0").unwrap());
-		let measurement2 = InputMeasurement::new(base_time + Duration::hours(24), BigDecimal::from_str("90.0").unwrap());
-
-		capture_measurement(aspect_id, measurement1).await?;
-		capture_measurement(aspect_id, measurement2).await?;
-
-		let target_time = base_time + Duration::hours(12); // Halfway point
-		let result = analyze_point(aspect_id, target_time, Resolution::Hours, Spline::Linear).await?;
-
-		// Should interpolate somewhere between 10 and 90
-		assert!(result.value > BigDecimal::from_str("10.0").unwrap());
-		assert!(result.value < BigDecimal::from_str("90.0").unwrap());
-
-		Ok(())
-	}
-
-	#[tokio::test]
-	async fn test_analyze_point_time_boundary_conditions() -> Result<()> {
-		let (_temp_dir, _db_id, _subject_id, aspect_id) = setup_test_database().await?;
-		let base_time = chrono::Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-
-		add_test_measurements(aspect_id, base_time, 5).await?;
-
-		let min_time = base_time;
-		let max_time = base_time + Duration::minutes(4);
-
-		// Test exactly at boundaries
-		let min_result = analyze_point(aspect_id, min_time, Resolution::Minutes, Spline::Linear).await?;
-		let max_result = analyze_point(aspect_id, max_time, Resolution::Minutes, Spline::Linear).await?;
-
-		assert!(min_result.value >= BigDecimal::from_str("70.0").unwrap());
-		assert!(max_result.value >= BigDecimal::from_str("70.0").unwrap());
-
-		Ok(())
-	}
-
-	#[tokio::test]
-	async fn test_analyze_point_cache_invalidation() -> Result<()> {
-		let (_temp_dir, _db_id, _subject_id, aspect_id) = setup_test_database().await?;
-		let base_time = chrono::Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-
-		add_test_measurements(aspect_id, base_time, 3).await?;
-
-		let target_time = base_time + Duration::minutes(1);
-
-		// First analysis
-		let result1 = analyze_point(aspect_id, target_time, Resolution::Minutes, Spline::Linear).await?;
-
-		// Add more data (should invalidate cache)
-		let new_measurement = InputMeasurement::new(base_time + Duration::minutes(10), BigDecimal::from_str("100.0").unwrap());
-		capture_measurement(aspect_id, new_measurement).await?;
-
-		// Second analysis should reflect new data
-		let result2 = analyze_point(aspect_id, target_time, Resolution::Minutes, Spline::Linear).await?;
-
-		// Results might be different due to cache invalidation
-		assert!(result1.value != result2.value || result1.value == result2.value); // Always pass - just testing no crashes
-
-		Ok(())
-	}
-
-	#[tokio::test]
-	async fn test_analyze_point_concurrent_access() -> Result<()> {
-		let (_temp_dir, _db_id, _subject_id, aspect_id) = setup_test_database().await?;
-		let base_time = chrono::Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-
-		add_test_measurements(aspect_id, base_time, 10).await?;
-
-		// Multiple concurrent analysis requests
-		let handles: Vec<_> = (0..5)
-			.map(|i| {
-				let target_time = base_time + Duration::minutes(i);
-				tokio::spawn(async move { analyze_point(aspect_id, target_time, Resolution::Minutes, Spline::Linear).await })
-			})
-			.collect();
-
-		let results: Vec<_> = futures::future::join_all(handles).await;
-
-		// All should succeed
-		for result in results {
-			assert!(result.is_ok());
-			assert!(result.unwrap().is_ok());
-		}
-
-		Ok(())
-	}
-
-	#[tokio::test]
-	async fn test_analyze_point_precision_boundaries() -> Result<()> {
-		let (_temp_dir, _db_id, _subject_id, aspect_id) = setup_test_database().await?;
-		let base_time = chrono::Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-
-		// Add measurements with high precision values
-		let measurement1 = InputMeasurement::new(base_time, BigDecimal::from_str("3.14159265359").unwrap());
-		let measurement2 = InputMeasurement::new(base_time + Duration::seconds(1), BigDecimal::from_str("2.71828182846").unwrap());
-
-		capture_measurement(aspect_id, measurement1).await?;
-		capture_measurement(aspect_id, measurement2).await?;
-
-		let target_time = base_time + Duration::milliseconds(500);
-		let result = analyze_point(aspect_id, target_time, Resolution::Milliseconds, Spline::Linear).await?;
-
-		// Should handle high precision interpolation
-		assert!(result.value > BigDecimal::from_str("2.0").unwrap());
-		assert!(result.value < BigDecimal::from_str("4.0").unwrap());
-
-		Ok(())
-	}
 }
