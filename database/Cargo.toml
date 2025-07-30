@@ -23,6 +23,7 @@ pollster = { workspace = true }
 fastrand = { workspace = true }
 futures = { workspace = true }
 splimes = { workspace = true }
+csv = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true , features = ["html_reports"] }
