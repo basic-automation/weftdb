@@ -6,6 +6,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use database::*;
 use splimes::{Resolution, Spline};
 use tokio::runtime::Runtime;
+use uuid::Uuid;
 
 fn benchmark_production_workloads(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
@@ -20,10 +21,12 @@ fn benchmark_production_workloads(c: &mut Criterion) {
     for (name, measurement_count, interval_minutes, window_minutes, resolution) in workloads {
         c.bench_function(name, |b| {
             // Create a single database per benchmark function
-            let db_name = format!("bench_prod_{}", name);
+            let db_name = format!("bench_prod_{}_{}", name, Uuid::new_v4());
             let (_db, aspect_id) = rt.block_on(async {
                 // Clean up any existing test data
-                std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+                if let Err(e) = std::fs::remove_dir_all(format!("data/{db_name}")) {
+                    eprintln!("Warning: Failed to remove existing directory: {}", e);
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 
                 // Create database and setup data
@@ -71,7 +74,9 @@ fn benchmark_production_workloads(c: &mut Criterion) {
 
             // Cleanup after all iterations
             rt.block_on(async {
-                std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+                if let Err(e) = std::fs::remove_dir_all(format!("data/{db_name}")) {
+                    eprintln!("Warning: Failed to remove directory after benchmark: {}", e);
+                }
             });
         });
     }
