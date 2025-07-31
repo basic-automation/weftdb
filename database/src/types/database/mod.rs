@@ -1,9 +1,9 @@
 use std::{
-	collections::HashMap, path::Path, sync::{Arc, LazyLock}
+    collections::HashMap, path::Path, sync::{Arc, LazyLock}
 };
 
 use anyhow::{bail, Result};
-use sqlx::{Pool, Row, Sqlite};
+use sqlx::{Pool, Row, Sqlite, SqlitePool};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -11,6 +11,10 @@ use crate::{Error, Subject, SubjectId, DEFAULT_DATA_DIR};
 
 pub type DatabaseMap = Arc<Mutex<HashMap<DatabaseId, DatabaseInfo>>>;
 pub static DATABASES: LazyLock<DatabaseMap> = LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+
+// Add connection pool manager
+static CONNECTION_POOLS: LazyLock<Arc<Mutex<HashMap<String, SqlitePool>>>> = 
+    LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
 mod analysis;
 mod aspects;
@@ -47,12 +51,9 @@ impl Database {
 		}
 		let db_id = DatabaseId::new();
 
-		// Create metadata database
+		// Use shared connection pool
 		let metadata_db_path = format!("{db_path}/metadata.db");
-		let metadata_pool = match sqlx::sqlite::SqlitePoolOptions::new().max_connections(5).connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&metadata_db_path).create_if_missing(true)).await {
-			Ok(pool) => pool,
-			Err(e) => bail!(Error::DatabaseError(format!("Failed to connect to metadata database '{metadata_db_path}': {e}"))),
-		};
+		let metadata_pool = Self::get_or_create_pool(&metadata_db_path).await?;
 
 		// Create metadata tables
 		Self::create_metadata_tables(&metadata_pool).await?;
@@ -167,6 +168,34 @@ impl Database {
 		let databases = DATABASES.lock().await;
 		databases.get(&self.id).cloned()
 	}
+
+	/// Get or create a connection pool for reuse
+    async fn get_or_create_pool(db_path: &str) -> Result<SqlitePool> {
+        let pools = CONNECTION_POOLS.lock().await;
+        
+        if let Some(pool) = pools.get(db_path) {
+            return Ok(pool.clone());
+        }
+
+        drop(pools);
+
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(10) // Increased pool size
+            .idle_timeout(std::time::Duration::from_secs(300)) // 5 minute idle timeout
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(db_path)
+                    .create_if_missing(true)
+                    .pragma("journal_mode", "WAL") // Write-Ahead Logging for better concurrency
+                    .pragma("synchronous", "NORMAL") // Faster than FULL, still safe
+                    .pragma("cache_size", "10000") // Larger cache
+                    .pragma("temp_store", "memory") // Store temp tables in memory
+            ).await
+            .map_err(|e| Error::DatabaseError(format!("Failed to connect to database: {e}")))?;
+
+        CONNECTION_POOLS.lock().await.insert(db_path.to_string(), pool.clone());
+        Ok(pool)
+    }
 
 	#[must_use]
 	pub const fn id(&self) -> DatabaseId {
