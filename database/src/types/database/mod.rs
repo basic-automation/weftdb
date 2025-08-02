@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap, path::Path, sync::{Arc, LazyLock}
+	collections::HashMap, path::Path, sync::{Arc, LazyLock}
 };
 
 use anyhow::{bail, Result};
@@ -13,8 +13,7 @@ pub type DatabaseMap = Arc<Mutex<HashMap<DatabaseId, DatabaseInfo>>>;
 pub static DATABASES: LazyLock<DatabaseMap> = LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
 // Add connection pool manager
-static CONNECTION_POOLS: LazyLock<Arc<Mutex<HashMap<String, SqlitePool>>>> = 
-    LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+static CONNECTION_POOLS: LazyLock<Arc<Mutex<HashMap<String, SqlitePool>>>> = LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
 mod analysis;
 mod aspects;
@@ -170,32 +169,33 @@ impl Database {
 	}
 
 	/// Get or create a connection pool for reuse
-    async fn get_or_create_pool(db_path: &str) -> Result<SqlitePool> {
-        let pools = CONNECTION_POOLS.lock().await;
-        
-        if let Some(pool) = pools.get(db_path) {
-            return Ok(pool.clone());
-        }
+	async fn get_or_create_pool(db_path: &str) -> Result<SqlitePool> {
+		let pools = CONNECTION_POOLS.lock().await;
 
-        drop(pools);
+		if let Some(pool) = pools.get(db_path) {
+			return Ok(pool.clone());
+		}
 
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(10) // Increased pool size
-            .idle_timeout(std::time::Duration::from_secs(300)) // 5 minute idle timeout
-            .connect_with(
-                sqlx::sqlite::SqliteConnectOptions::new()
-                    .filename(db_path)
-                    .create_if_missing(true)
-                    .pragma("journal_mode", "WAL") // Write-Ahead Logging for better concurrency
-                    .pragma("synchronous", "NORMAL") // Faster than FULL, still safe
-                    .pragma("cache_size", "10000") // Larger cache
-                    .pragma("temp_store", "memory") // Store temp tables in memory
-            ).await
-            .map_err(|e| Error::DatabaseError(format!("Failed to connect to database: {e}")))?;
+		drop(pools);
 
-        CONNECTION_POOLS.lock().await.insert(db_path.to_string(), pool.clone());
-        Ok(pool)
-    }
+		let pool = sqlx::sqlite::SqlitePoolOptions::new()
+			.max_connections(10) // Increased pool size
+			.idle_timeout(std::time::Duration::from_secs(300)) // 5 minute idle timeout
+			.connect_with(
+				sqlx::sqlite::SqliteConnectOptions::new()
+					.filename(db_path)
+					.create_if_missing(true)
+					.pragma("journal_mode", "WAL") // Write-Ahead Logging for better concurrency
+					.pragma("synchronous", "NORMAL") // Faster than FULL, still safe
+					.pragma("cache_size", "10000") // Larger cache
+					.pragma("temp_store", "memory"), // Store temp tables in memory
+			)
+			.await
+			.map_err(|e| Error::DatabaseError(format!("Failed to connect to database: {e}")))?;
+
+		CONNECTION_POOLS.lock().await.insert(db_path.to_string(), pool.clone());
+		Ok(pool)
+	}
 
 	#[must_use]
 	pub const fn id(&self) -> DatabaseId {
@@ -205,6 +205,35 @@ impl Database {
 	#[must_use]
 	pub fn name(&self) -> &str {
 		&self.name
+	}
+
+	/// Closes the database, releasing all resources and removing from global map
+	///
+	/// # Errors
+	///
+	/// Returns an error if there are issues closing connection pools or removing resources.
+	pub async fn close(&self) -> Result<()> {
+		let db_id = self.id();
+
+		// Close all related connection pools
+		let pools: Vec<Pool<Sqlite>> = {
+			let dbs = DATABASES.lock().await;
+			dbs.get(&db_id).map_or_else(Vec::new, |db_info| db_info.subjects().values().map(|s| s.pool().clone()).collect())
+		};
+
+		for pool in pools {
+			pool.close().await;
+		}
+
+		// Remove from global map
+		DATABASES.lock().await.remove(&db_id);
+
+		// Delay to ensure handles are released
+		tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+		// Note: Add directory removal if needed, but be careful in benchmarks
+
+		Ok(())
 	}
 }
 
