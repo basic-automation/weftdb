@@ -1,13 +1,14 @@
 use std::str::FromStr;
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use database::{AspectId, Database, InputMeasurement, Subject};
+use database::{AspectId, Database, InputMeasurement, Subject, DEFAULT_DATA_DIR};
 use splimes::{Resolution, Spline};
 #[cfg(test)]
 use tempfile::TempDir;
 use uuid::Uuid;
+use std::path::Path;
 
 async fn setup_test_database() -> Result<(TempDir, Database, Subject, AspectId)> {
 	let temp_dir = tempfile::tempdir()?;
@@ -337,7 +338,7 @@ async fn test_analyze_point_precision_boundaries() -> Result<()> {
 	Ok(())
 }
 
-/* #[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 struct BTC1MinRecord {
 	#[serde(rename = "Timestamp")]
 	timestamp: String,
@@ -369,26 +370,35 @@ fn convert_unix_timestamp_to_datetime_utc(timestamp_seconds: i64) -> Option<Date
 #[tokio::test]
 async fn test_create_btc_1min_database() -> Result<()> {
     println!("Opening BTC 1-minute dataset...");
-    let file_path = "/Users/physics515/Documents/GitHub/DSP/database/datasets/btc_1min.csv";
-    let mut rdr = csv::Reader::from_path(file_path).with_context(|| format!("Failed to read CSV file at '{}'", file_path))?;
+    let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("datasets");
+    path.push("btc_1min.csv");
+    let file_path = path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid file path"))?.to_string();
+
+    if !std::path::Path::new(&file_path).exists() {
+        eprintln!("CSV file not found at {}. Download from https://www.kaggle.com/datasets/mczielinski/bitcoin-historical-data and place it in database/datasets/btc_1min.csv", file_path);
+        return Ok(());
+    }
+
+    let mut rdr = csv::Reader::from_path(&file_path).with_context(|| format!("Failed to read CSV file at '{}'", file_path))?;
     let mut records = Vec::new();
     println!("Reading BTC 1-minute records...");
     for result in rdr.deserialize() {
-	let record: BTC1MinRecord = result?;
-	records.push(record);
+        let record: BTC1MinRecord = result?;
+        records.push(record);
     }
 
     if records.is_empty() {
-	bail!("No records found in the BTC 1-minute dataset");
+        bail!("No records found in the BTC 1-minute dataset");
     }
 
     println!("Creating database and capturing measurements...");
 
-    // delete the old database if it exists
+    // Delete the old database if it exists
     let data_dir = DEFAULT_DATA_DIR;
     let db_path = format!("{data_dir}/crypto");
     if Path::new(&db_path).exists() {
-	std::fs::remove_file(&db_path).with_context(|| format!("Failed to remove existing database file at '{}'", db_path))?;
+        std::fs::remove_file(&db_path).with_context(|| format!("Failed to remove existing database file at '{}'", db_path))?;
     }
 
     let db = Database::new("crypto").await?;
@@ -397,11 +407,11 @@ async fn test_create_btc_1min_database() -> Result<()> {
 
     println!("Capturing measurements for BTC 1-minute data...");
     for record in &records {
-	let timestamp = i64::from_f64(f64::from_str(&record.timestamp)?).with_context(|| format!("Failed to parse timestamp '{}'", record.timestamp))?;
-	let timestamp = convert_unix_timestamp_to_datetime_utc(timestamp).with_context(|| format!("Failed to convert timestamp '{}' to DateTime<Utc>", record.timestamp))?;
-	let measurement = InputMeasurement::new(timestamp, BigDecimal::from_str(&record.close.to_string()).with_context(|| format!("Failed to parse close price '{}'", record.close))?);
-	Database::observe_measurement(aspect.id(), measurement).await?;
+        let timestamp = record.timestamp.parse::<f64>()? as i64;
+        let timestamp = convert_unix_timestamp_to_datetime_utc(timestamp).with_context(|| format!("Failed to convert timestamp '{}' to DateTime<Utc>", record.timestamp))?;
+        let measurement = InputMeasurement::new(timestamp, BigDecimal::from_str(&record.close.to_string()).with_context(|| format!("Failed to parse close price '{}'", record.close))?);
+        db.observe_measurement(aspect.clone(), measurement).await?;
     }
 
     Ok(())
-} */
+}
