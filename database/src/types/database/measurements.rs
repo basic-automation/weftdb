@@ -1,6 +1,10 @@
 use anyhow::{bail, Result};
+use chrono::DateTime;
+use sqlx::Row;
 
 use crate::{Aspect, Database, Error, InputMeasurement, TxId, CACHE, DATABASES};
+
+const CHUNK_SIZE: usize = 1000;
 
 impl Database {
 	/// Capture a measurement for an aspect
@@ -27,6 +31,23 @@ impl Database {
 		let cache_key = format!("aspect_measurements_{}", aspect.id().as_uuid());
 		CACHE.invalidate_aspect_cache(&cache_key, aspect.id().as_uuid()).await;
 
+		// Update earliest and latest in metadata
+		let db_info = self.get_database_info().await.ok_or_else(|| Error::DatabaseError("Database not found".to_string()))?;
+		let metadata_pool = db_info.metadata_pool().cloned().ok_or_else(|| Error::DatabaseError("Metadata pool not found".to_string()))?;
+
+		let row = sqlx::query("SELECT earliest_measurement, latest_measurement FROM aspect_metadata WHERE id = ?").bind(aspect.id().as_uuid()).fetch_optional(&metadata_pool).await.map_err(|e| Error::DatabaseError(format!("Failed to query aspect metadata: {e}")))?;
+
+		let (earliest, latest) = match row {
+			Some(r) => (r.get::<Option<i64>, _>("earliest_measurement").and_then(DateTime::from_timestamp_millis), r.get::<Option<i64>, _>("latest_measurement").and_then(DateTime::from_timestamp_millis)),
+			None => bail!(Error::DatabaseError("Aspect metadata not found".to_string())),
+		};
+
+		let new_time = measurement.timestamp();
+		let new_earliest = earliest.map_or(Some(new_time), |curr| Some(curr.min(new_time)));
+		let new_latest = latest.map_or(Some(new_time), |curr| Some(curr.max(new_time)));
+
+		sqlx::query("UPDATE aspect_metadata SET earliest_measurement = ?, latest_measurement = ? WHERE id = ?").bind(new_earliest.map(|dt| dt.timestamp_millis())).bind(new_latest.map(|dt| dt.timestamp_millis())).bind(aspect.id().as_uuid()).execute(&metadata_pool).await.map_err(|e| Error::DatabaseError(format!("Failed to update aspect metadata: {e}")))?;
+
 		Ok(tx_id)
 	}
 
@@ -37,28 +58,50 @@ impl Database {
 	/// - if unable to begin transaction
 	/// - if unable to insert measurement
 	/// - if unable to commit transaction
+	///
+	/// # Panics
+	/// - if measurements vector is empty when computing min/max (this is already checked)
 	pub async fn observe_measurements_batch(&self, aspect: Aspect, measurements: Vec<InputMeasurement>) -> Result<Vec<TxId>> {
 		if measurements.is_empty() {
 			return Ok(Vec::new());
 		}
 
-		let mut tx_ids = Vec::with_capacity(measurements.len());
+		// Pre-generate all TxIds to avoid allocation issues in closures
+		let all_tx_ids: Vec<TxId> = (0..measurements.len()).map(|_| TxId::new()).collect();
+
+		// Compute min/max upfront (outside transaction)
+		let min_new = measurements.iter().map(InputMeasurement::timestamp).min().unwrap();
+		let max_new = measurements.iter().map(InputMeasurement::timestamp).max().unwrap();
 
 		// Get pool and table name
 		let f = DATABASES.lock().await.values().find_map(|db_info| db_info.subjects().values().find_map(|subject_info| subject_info.aspects().get(&aspect.id()).map(|aspect_info| (subject_info.pool(), aspect_info)))).map(|(pool, aspect_info)| (pool.clone(), aspect_info.table_name().to_string()));
 		let Some((pool, table_name)) = f else { bail!(Error::DatabaseError("Aspect not found".to_string())) };
 
-		// Begin transaction for batch insert
+		// Begin transaction
 		let mut tx = pool.begin().await.map_err(|e| Error::DatabaseError(format!("Failed to begin transaction: {e}")))?;
 
-		// Prepare the insert statement once
-		let insert_sql = format!("INSERT INTO {table_name} (id, timestamp, value) VALUES (?, ?, ?)");
+		// Optional: Tune for max speed (WARNING: risks data loss on crash)
+		// sqlx::query("PRAGMA synchronous = OFF").execute(&mut *tx).await?;
 
-		for measurement in measurements {
-			let tx_id = TxId::new();
-			tx_ids.push(tx_id);
+		// Batch inserts in chunks to avoid param limits
+		let mut tx_id_offset = 0;
+		for chunk in measurements.chunks(CHUNK_SIZE) {
+			let mut query_builder: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(format!("INSERT INTO {table_name} (id, timestamp, value) "));
 
-			sqlx::query(&insert_sql).bind(tx_id.as_uuid().to_string()).bind(measurement.timestamp().timestamp_millis()).bind(measurement.value().to_string()).execute(&mut *tx).await.map_err(|e| Error::DatabaseError(format!("Failed to insert measurement: {e}")))?;
+			// Build values manually to avoid closure capture
+			query_builder.push("VALUES ");
+			for (i, measurement) in chunk.iter().enumerate() {
+				if i > 0 {
+					query_builder.push(", ");
+				}
+				let tx_id = all_tx_ids[tx_id_offset + i];
+				query_builder.push("(").push_bind(tx_id.as_uuid().to_string()).push(", ").push_bind(measurement.timestamp().timestamp_millis()).push(", ").push_bind(measurement.value().to_string()).push(")");
+			}
+
+			tx_id_offset += chunk.len();
+
+			let query = query_builder.build();
+			query.execute(&mut *tx).await.map_err(|e| Error::DatabaseError(format!("Failed to insert batch: {e}")))?;
 		}
 
 		// Commit transaction
@@ -68,6 +111,22 @@ impl Database {
 		let cache_key = format!("aspect_measurements_{}", aspect.id().as_uuid());
 		CACHE.invalidate_aspect_cache(&cache_key, aspect.id().as_uuid()).await;
 
-		Ok(tx_ids)
+		// Update earliest and latest in metadata
+		let db_info = self.get_database_info().await.ok_or_else(|| Error::DatabaseError("Database not found".to_string()))?;
+		let metadata_pool = db_info.metadata_pool().cloned().ok_or_else(|| Error::DatabaseError("Metadata pool not found".to_string()))?;
+
+		let row = sqlx::query("SELECT earliest_measurement, latest_measurement FROM aspect_metadata WHERE id = ?").bind(aspect.id().as_uuid()).fetch_optional(&metadata_pool).await.map_err(|e| Error::DatabaseError(format!("Failed to query aspect metadata: {e}")))?;
+
+		let (earliest, latest) = match row {
+			Some(r) => (r.get::<Option<i64>, _>("earliest_measurement").and_then(DateTime::from_timestamp_millis), r.get::<Option<i64>, _>("latest_measurement").and_then(DateTime::from_timestamp_millis)),
+			None => bail!(Error::DatabaseError("Aspect metadata not found".to_string())),
+		};
+
+		let new_earliest = earliest.map_or(Some(min_new), |curr| Some(curr.min(min_new)));
+		let new_latest = latest.map_or(Some(max_new), |curr| Some(curr.max(max_new)));
+
+		sqlx::query("UPDATE aspect_metadata SET earliest_measurement = ?, latest_measurement = ? WHERE id = ?").bind(new_earliest.map(|dt| dt.timestamp_millis())).bind(new_latest.map(|dt| dt.timestamp_millis())).bind(aspect.id().as_uuid()).execute(&metadata_pool).await.map_err(|e| Error::DatabaseError(format!("Failed to update aspect metadata: {e}")))?;
+
+		Ok(all_tx_ids)
 	}
 }

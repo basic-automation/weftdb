@@ -157,7 +157,7 @@ async fn test_end_to_end_with_new_api() -> anyhow::Result<()> {
 	// Test the complete workflow using the Database API
 	let db = Database::new(&test_name).await?;
 	let subject = db.track_subject("test_subject").await?;
-	let aspect = db.track_aspect(subject, "sensor_data").await?;
+	let aspect = db.track_aspect(subject, "sensor_data", splimes::Resolution::Milliseconds).await?;
 
 	// Add test data
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();

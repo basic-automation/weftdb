@@ -1,3 +1,4 @@
+use splimes::Resolution;
 use uuid::Uuid;
 
 use crate::SubjectId;
@@ -34,18 +35,19 @@ pub struct Aspect {
 	name: String,
 	subject_id: SubjectId,
 	table_name: String,
+	resolution: Resolution,
 }
 
 impl Aspect {
 	#[must_use]
-	pub fn new(name: String, subject_id: SubjectId, table_name: String) -> Self {
+	pub fn new(name: String, subject_id: SubjectId, table_name: String, resolution: Resolution) -> Self {
 		let id = AspectId::new();
-		Self { id, name, subject_id, table_name }
+		Self { id, name, subject_id, table_name, resolution }
 	}
 
 	#[must_use]
-	pub const fn new_with_id(id: AspectId, name: String, subject_id: SubjectId, table_name: String) -> Self {
-		Self { id, name, subject_id, table_name }
+	pub const fn new_with_id(id: AspectId, name: String, subject_id: SubjectId, table_name: String, resolution: Resolution) -> Self {
+		Self { id, name, subject_id, table_name, resolution }
 	}
 
 	#[must_use]
@@ -66,5 +68,10 @@ impl Aspect {
 	#[must_use]
 	pub fn table_name(&self) -> &str {
 		&self.table_name
+	}
+
+	#[must_use]
+	pub const fn resolution(&self) -> Resolution {
+		self.resolution
 	}
 }

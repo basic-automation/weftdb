@@ -7,14 +7,14 @@ pub use measurement::Measurement;
 pub use subject::{Subject, SubjectId};
 pub use transaction::TxId;
 
-mod aspect;
-mod cache;
-mod database;
-mod dataset;
-mod error;
-mod input_measurement;
-mod measurement;
-mod subject;
-mod transaction;
+pub mod aspect;
+pub mod cache;
+pub mod database;
+pub mod dataset;
+pub mod error;
+pub mod input_measurement;
+pub mod measurement;
+pub mod subject;
+pub mod transaction;
 
 pub use error::*;

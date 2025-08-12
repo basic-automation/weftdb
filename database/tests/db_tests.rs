@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{path::Path, str::FromStr};
 
 use anyhow::{bail, Context, Result};
 use bigdecimal::BigDecimal;
@@ -8,7 +8,6 @@ use splimes::{Resolution, Spline};
 #[cfg(test)]
 use tempfile::TempDir;
 use uuid::Uuid;
-use std::path::Path;
 
 async fn setup_test_database() -> Result<(TempDir, Database, Subject, AspectId)> {
 	let temp_dir = tempfile::tempdir()?;
@@ -19,7 +18,7 @@ async fn setup_test_database() -> Result<(TempDir, Database, Subject, AspectId)>
 
 	let db = Database::new(&db_name).await?;
 	let subject = db.track_subject("test_subject").await?;
-	let aspect = db.track_aspect(subject.clone(), "test_aspect").await?;
+	let aspect = db.track_aspect(subject.clone(), "test_aspect", splimes::Resolution::Milliseconds).await?;
 
 	Ok((temp_dir, db, subject, aspect.id()))
 }
@@ -369,49 +368,51 @@ fn convert_unix_timestamp_to_datetime_utc(timestamp_seconds: i64) -> Option<Date
 
 #[tokio::test]
 async fn test_create_btc_1min_database() -> Result<()> {
-    println!("Opening BTC 1-minute dataset...");
-    let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("datasets");
-    path.push("btc_1min.csv");
-    let file_path = path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid file path"))?.to_string();
+	println!("Opening BTC 1-minute dataset...");
+	let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+	path.push("datasets");
+	path.push("btc_1min.csv");
+	let file_path = path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid file path"))?.to_string();
 
-    if !std::path::Path::new(&file_path).exists() {
-        eprintln!("CSV file not found at {}. Download from https://www.kaggle.com/datasets/mczielinski/bitcoin-historical-data and place it in database/datasets/btc_1min.csv", file_path);
-        return Ok(());
-    }
+	if !std::path::Path::new(&file_path).exists() {
+		eprintln!("CSV file not found at {}. Download from https://www.kaggle.com/datasets/mczielinski/bitcoin-historical-data and place it in database/datasets/btc_1min.csv", file_path);
+		return Ok(());
+	}
 
-    let mut rdr = csv::Reader::from_path(&file_path).with_context(|| format!("Failed to read CSV file at '{}'", file_path))?;
-    let mut records = Vec::new();
-    println!("Reading BTC 1-minute records...");
-    for result in rdr.deserialize() {
-        let record: BTC1MinRecord = result?;
-        records.push(record);
-    }
+	let mut rdr = csv::Reader::from_path(&file_path).with_context(|| format!("Failed to read CSV file at '{}'", file_path))?;
 
-    if records.is_empty() {
-        bail!("No records found in the BTC 1-minute dataset");
-    }
+	println!("Creating database and capturing measurements...");
 
-    println!("Creating database and capturing measurements...");
+	// Delete the old database if it exists
+	let data_dir = DEFAULT_DATA_DIR;
+	let db_path = format!("{data_dir}/crypto");
+	if Path::new(&db_path).exists() {
+		// Use remove_dir_all for directories
+		std::fs::remove_dir_all(&db_path).with_context(|| format!("Failed to remove existing database directory at '{}'", db_path))?;
+	}
 
-    // Delete the old database if it exists
-    let data_dir = DEFAULT_DATA_DIR;
-    let db_path = format!("{data_dir}/crypto");
-    if Path::new(&db_path).exists() {
-        std::fs::remove_file(&db_path).with_context(|| format!("Failed to remove existing database file at '{}'", db_path))?;
-    }
+	let db = Database::new("crypto").await?;
+	let subject = db.track_subject("Bitcoin").await?;
+	let aspect = db.track_aspect(subject, "price_from_kaggle", splimes::Resolution::Minutes).await?;
 
-    let db = Database::new("crypto").await?;
-    let subject = db.track_subject("Bitcoin").await?;
-    let aspect = db.track_aspect(subject, "price_from_kaggle").await?;
+	println!("Capturing measurements for BTC 1-minute data...");
+	let mut batch = Vec::with_capacity(1000);
+	for result in rdr.deserialize() {
+		let record: BTC1MinRecord = result?;
+		let timestamp = record.timestamp.parse::<f64>()? as i64;
+		let timestamp = convert_unix_timestamp_to_datetime_utc(timestamp).with_context(|| format!("Failed to convert timestamp '{}' to DateTime<Utc>", record.timestamp))?;
+		let measurement = InputMeasurement::new(timestamp, BigDecimal::from_str(&record.close.to_string()).with_context(|| format!("Failed to parse close price '{}'", record.close))?);
+		batch.push(measurement);
 
-    println!("Capturing measurements for BTC 1-minute data...");
-    for record in &records {
-        let timestamp = record.timestamp.parse::<f64>()? as i64;
-        let timestamp = convert_unix_timestamp_to_datetime_utc(timestamp).with_context(|| format!("Failed to convert timestamp '{}' to DateTime<Utc>", record.timestamp))?;
-        let measurement = InputMeasurement::new(timestamp, BigDecimal::from_str(&record.close.to_string()).with_context(|| format!("Failed to parse close price '{}'", record.close))?);
-        db.observe_measurement(aspect.clone(), measurement).await?;
-    }
+		if batch.len() == 1000 {
+			db.observe_measurements_batch(aspect.clone(), std::mem::take(&mut batch)).await?;
+		}
+	}
 
-    Ok(())
+	// Insert any remaining
+	if !batch.is_empty() {
+		db.observe_measurements_batch(aspect, batch).await?;
+	}
+
+	Ok(())
 }

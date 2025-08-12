@@ -1,146 +1,19 @@
-use anyhow::{Result, bail};
-use bigdecimal::{BigDecimal, FromPrimitive};
-use database::{AspectId, DataPoint, Resolution};
-use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
+use anyhow::{bail, Result};
+use bigdecimal::{BigDecimal, FromPrimitive};
+use chrono::{DateTime, Utc};
+use database::{AspectId, DataPoint, Resolution};
+
 use crate::types::{Analysis, BatchedMeasurement, MeasurementVector, Relative, Trend};
-
-/// A batch of data points organized by aspect and time window
-#[derive(Debug, Clone)]
-pub struct Batch {
-    pub start_time: DateTime<Utc>,
-    pub end_time: DateTime<Utc>,
-    pub data: HashMap<AspectId, Vec<DataPoint>>,
-    pub created_at: DateTime<Utc>,
-}
-
-impl Batch {
-    /// Create a new batch with the specified time window and data
-    pub fn new(
-        start_time: DateTime<Utc>,
-        end_time: DateTime<Utc>,
-        data: HashMap<AspectId, Vec<DataPoint>>,
-    ) -> Self {
-        Self {
-            start_time,
-            end_time,
-            data,
-            created_at: Utc::now(),
-        }
-    }
-
-    /// Get the duration of this batch in milliseconds
-    pub fn duration_ms(&self) -> i64 {
-        self.end_time.signed_duration_since(self.start_time).num_milliseconds()
-    }
-
-    /// Get the number of aspects in this batch
-    pub fn aspect_count(&self) -> usize {
-        self.data.len()
-    }
-
-    /// Get the total number of data points across all aspects
-    pub fn total_points(&self) -> usize {
-        self.data.values().map(|points| points.len()).sum()
-    }
-
-    /// Get data points for a specific aspect
-    pub fn get_aspect_data(&self, aspect_id: AspectId) -> Option<&Vec<DataPoint>> {
-        self.data.get(&aspect_id)
-    }
-
-    /// Get all aspect IDs in this batch
-    pub fn aspect_ids(&self) -> Vec<AspectId> {
-        self.data.keys().copied().collect()
-    }
-
-    /// Check if this batch contains data for the specified aspect
-    pub fn contains_aspect(&self, aspect_id: AspectId) -> bool {
-        self.data.contains_key(&aspect_id)
-    }
-
-    /// Get the average number of points per aspect
-    pub fn avg_points_per_aspect(&self) -> f64 {
-        if self.data.is_empty() {
-            0.0
-        } else {
-            self.total_points() as f64 / self.data.len() as f64
-        }
-    }
-
-    /// Check if this batch is empty (no data points)
-    pub fn is_empty(&self) -> bool {
-        self.data.is_empty() || self.total_points() == 0
-    }
-
-    /// Get a summary string of this batch
-    pub fn summary(&self) -> String {
-        format!(
-            "Batch [{} to {}]: {} aspects, {} total points, avg {:.1} points/aspect",
-            self.start_time.format("%Y-%m-%d %H:%M:%S"),
-            self.end_time.format("%Y-%m-%d %H:%M:%S"),
-            self.aspect_count(),
-            self.total_points(),
-            self.avg_points_per_aspect()
-        )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use database::AspectId;
-    use uuid::Uuid;
-    use bigdecimal::BigDecimal;
-    use std::str::FromStr;
-    use chrono::TimeZone;
-
-    #[test]
-    fn test_batch_creation() {
-        let start = chrono::Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-        let end = chrono::Utc.with_ymd_and_hms(2023, 1, 1, 1, 0, 0).unwrap();
-        
-        let aspect1 = AspectId(Uuid::new_v4());
-        let aspect2 = AspectId(Uuid::new_v4());
-        
-        let mut data = HashMap::new();
-        data.insert(aspect1, vec![
-            DataPoint {
-                timestamp: start,
-                value: BigDecimal::from_str("1.0").unwrap(),
-            },
-            DataPoint {
-                timestamp: start + chrono::Duration::minutes(30),
-                value: BigDecimal::from_str("2.0").unwrap(),
-            },
-        ]);
-        data.insert(aspect2, vec![
-            DataPoint {
-                timestamp: start + chrono::Duration::minutes(15),
-                value: BigDecimal::from_str("3.0").unwrap(),
-            },
-        ]);
-        
-        let batch = Batch::new(start, end, data);
-        
-        assert_eq!(batch.aspect_count(), 2);
-        assert_eq!(batch.total_points(), 3);
-        assert_eq!(batch.duration_ms(), 3600000); // 1 hour in ms
-        assert!(!batch.is_empty());
-        assert!(batch.contains_aspect(aspect1));
-        assert!(batch.contains_aspect(aspect2));
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LegacyBatch {
+pub struct Batch {
 	size: usize,
 	measurements: Vec<BatchedMeasurement>,
 	resolution: Resolution,
 }
 
-impl LegacyBatch {
+impl Batch {
 	pub fn new(size: usize, measurements: Vec<BatchedMeasurement>, resolution: Resolution) -> Self {
 		Self { size, measurements, resolution }
 	}
@@ -317,15 +190,15 @@ impl LegacyBatch {
 
 				if measurement_timestamp < destination_timestamp {
 					let slope = (destination_value - measurment_value) / (destination_measurement_difference);
-					let trend = Trend::new(destination_measurment.clone().measurement().clone(), slope);
+					let trend = Trend::new(destination_measurment.clone().point().clone(), slope);
 					trends.push(trend);
 				} else if measurement_timestamp > destination_timestamp {
 					let slope = (measurment_value - destination_value) / (measurement_destination_timestamp_difference);
-					let trend = Trend::new(destination_measurment.clone().measurement().clone(), slope);
+					let trend = Trend::new(destination_measurment.clone().point().clone(), slope);
 					trends.push(trend);
 				} else {
 					let slope = BigDecimal::from(0);
-					let trend = Trend::new(destination_measurment.clone().measurement().clone(), slope);
+					let trend = Trend::new(destination_measurment.clone().point().clone(), slope);
 					trends.push(trend);
 				}
 			}
@@ -393,6 +266,7 @@ impl LegacyBatch {
 			analysis.set_relative(Some(relative));
 			measurement.set_analysis(analysis);
 		}
-		
+
 		Ok(())
 	}
+}

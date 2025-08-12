@@ -146,50 +146,50 @@ fn benchmark_measurement_capture(c: &mut Criterion) {
 }
 
 fn benchmark_bulk_measurement_capture(c: &mut Criterion) {
-    // Suppress verbose logging during benchmarks
-    std::env::remove_var("DSP_VERBOSE");
-    std::env::remove_var("RUST_LOG");
+	// Suppress verbose logging during benchmarks
+	std::env::remove_var("DSP_VERBOSE");
+	std::env::remove_var("RUST_LOG");
 
-    let rt = Runtime::new().unwrap();
+	let rt = Runtime::new().unwrap();
 
-    let db_name = format!("bench_bulk_{}", Uuid::new_v4());
-    let (db, aspect) = rt.block_on(async {
-        std::fs::remove_dir_all(format!("data/{db_name}")).ok();
-        let db = Database::new(&db_name).await.unwrap();
-        let subject = db.track_subject("bench_subject").await.unwrap();
-        let aspect = db.track_aspect(subject, "bench_aspect").await.unwrap();
-        (db, aspect)
-    });
+	let db_name = format!("bench_bulk_{}", Uuid::new_v4());
+	let (db, aspect) = rt.block_on(async {
+		std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+		let db = Database::new(&db_name).await.unwrap();
+		let subject = db.track_subject("bench_subject").await.unwrap();
+		let aspect = db.track_aspect(subject, "bench_aspect").await.unwrap();
+		(db, aspect)
+	});
 
-    let sizes = vec![10, 100, 1000];
+	let sizes = vec![10, 100, 1000];
 
-    let mut group = c.benchmark_group("bulk_measurement_capture");
-    for size in sizes {
-        if size == 1000 {
-            group.sample_size(10);
-        } else {
-            group.sample_size(100);
-        }
-        group.bench_with_input(BenchmarkId::new("bulk", size), &size, |b, &size| {
-            b.iter(|| {
-                rt.block_on(async {
-                    let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap();
+	let mut group = c.benchmark_group("bulk_measurement_capture");
+	for size in sizes {
+		if size == 1000 {
+			group.sample_size(10);
+		} else {
+			group.sample_size(100);
+		}
+		group.bench_with_input(BenchmarkId::new("bulk", size), &size, |b, &size| {
+			b.iter(|| {
+				rt.block_on(async {
+					let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap();
 
-                    for i in 0..size {
-                        let measurement = InputMeasurement::new(base_time + Duration::seconds(i), BigDecimal::from_str(&format!("{}.0", i)).unwrap());
-                        db.observe_measurement(aspect.clone(), measurement).await.unwrap();
-                    }
+					for i in 0..size {
+						let measurement = InputMeasurement::new(base_time + Duration::seconds(i), BigDecimal::from_str(&format!("{}.0", i)).unwrap());
+						db.observe_measurement(aspect.clone(), measurement).await.unwrap();
+					}
 
-                    black_box(size)
-                })
-            })
-        });
-    }
-    group.finish();
+					black_box(size)
+				})
+			})
+		});
+	}
+	group.finish();
 
-    rt.block_on(async {
-        std::fs::remove_dir_all(format!("data/{db_name}")).ok();
-    });
+	rt.block_on(async {
+		std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	});
 }
 
 fn benchmark_point_analysis(c: &mut Criterion) {

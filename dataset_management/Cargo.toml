@@ -8,4 +8,5 @@ bigdecimal = { workspace = true, features = ["serde", "serde-json", "string-only
 database = { path = "../database" }  # Reference the local workspace member directly
 anyhow = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
+splimes = { path = "../splimes" }
 
