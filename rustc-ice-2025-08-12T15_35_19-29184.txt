@@ -1,0 +1,43 @@
+thread 'rustc' panicked at /rustc-dev/573a01569000d395498a5f98f916d6e5305ac81a\compiler\rustc_query_system\src\dep_graph\serialized.rs:284:21:
+Error: A dep graph node (mir_drops_elaborated_and_const_checked) does not have an unique index. Running a clean build on a nightly compiler with `-Z incremental-verify-ich` can help narrow down the issue for reporting. A clean build may also work around the issue.
+
+                     DepNode: DepKind { variant: 56 }(e257bc6dceb703b5-7bcbf1dfbbad95c1)
+stack backtrace:
+   0:     0x7ffbbc7bd76e - std::backtrace_rs::backtrace::win64::trace
+                               at /rustc/573a01569000d395498a5f98f916d6e5305ac81a/library\std\src\..\..\backtrace\src\backtrace\win64.rs:85
+   1:     0x7ffbbc7bd76e - std::backtrace_rs::backtrace::trace_unsynchronized
+                               at /rustc/573a01569000d395498a5f98f916d6e5305ac81a/library\std\src\..\..\backtrace\src\backtrace\mod.rs:66
+   2:     0x7ffbbc7bd76e - std::backtrace::Backtrace::create
+                               at /rustc/573a01569000d395498a5f98f916d6e5305ac81a/library\std\src\backtrace.rs:331
+   3:     0x7ffbbc7bd6aa - std::backtrace::Backtrace::force_capture
+                               at /rustc/573a01569000d395498a5f98f916d6e5305ac81a/library\std\src\backtrace.rs:312
+   4:     0x7ffbbdfba13a - core[b5739e852ae9ce7]::slice::sort::unstable::heapsort::heapsort::<((rustc_lint_defs[8e825fc28d15fcad]::Level, &str), usize), <((rustc_lint_defs[8e825fc28d15fcad]::Level, &str), usize) as core[b5739e852ae9ce7]::cmp::PartialOrd>::lt>
+   5:     0x7ffbbc7dce8e - std::panicking::rust_panic_with_hook
+                               at /rustc/573a01569000d395498a5f98f916d6e5305ac81a/library\std\src\panicking.rs:841
+   6:     0x7ffbbc7dcbf9 - std::panicking::begin_panic_handler::closure$0
+                               at /rustc/573a01569000d395498a5f98f916d6e5305ac81a/library\std\src\panicking.rs:706
+   7:     0x7ffbbc7d743f - std::sys::backtrace::__rust_end_short_backtrace<std::panicking::begin_panic_handler::closure_env$0,never$>
+                               at /rustc/573a01569000d395498a5f98f916d6e5305ac81a/library\std\src\sys\backtrace.rs:168
+   8:     0x7ffbbc7dc7fe - std::panicking::begin_panic_handler
+                               at /rustc/573a01569000d395498a5f98f916d6e5305ac81a/library\std\src\panicking.rs:697
+   9:     0x7ffbbf931c11 - core::panicking::panic_fmt
+                               at /rustc/573a01569000d395498a5f98f916d6e5305ac81a/library\core\src\panicking.rs:75
+  10:     0x7ffbbd9f56f4 - rustc_incremental[5d5e2f0f1180f325]::persist::load::setup_dep_graph
+  11:     0x7ffbb8cd0ffa - std[64fc4a3df1479d2]::sys::backtrace::__rust_begin_short_backtrace::<<std[64fc4a3df1479d2]::thread::Builder>::spawn_unchecked_<ctrlc[3030c30cd816b5e1]::set_handler_inner<rustc_driver_impl[7e205ff092e5925f]::install_ctrlc_handler::{closure#0}>::{closure#0}, ()>::{closure#1}::{closure#0}::{closure#0}, ()>
+  12:     0x7ffbbdfd30a2 - <tracing_subscriber[fdb004139cca0d03]::util::TryInitError as core[b5739e852ae9ce7]::fmt::Display>::fmt
+  13:     0x7ffbbf905e18 - <rayon_core[fef7927ee2a6b819]::registry::WorkerThread>::wait_until_cold
+  14:     0x7ffbbf90293c - <rayon_core[fef7927ee2a6b819]::registry::ThreadBuilder>::run
+  15:     0x7ffbbdfae07e - RINvNtNtCsxAYP29wgDe_3std3sys9backtrace28___rust_begin_short_backtraceNCNCNCINvMs1_CslTborJzq2zl_10rayon_coreNtB1j_17ThreadPoolBuilder12build_scopedNCNCNCINvNtCsgHwlOGs8Mfc_15rustc_interface4util31run_in_thread_pool_with_globalsNCINvNtB2x_9interface12run_c
+  16:     0x7ffbbdfc0508 - core[b5739e852ae9ce7]::slice::sort::unstable::heapsort::heapsort::<((rustc_lint_defs[8e825fc28d15fcad]::Level, &str), usize), <((rustc_lint_defs[8e825fc28d15fcad]::Level, &str), usize) as core[b5739e852ae9ce7]::cmp::PartialOrd>::lt>
+  17:     0x7ffbbc7e11dd - alloc::boxed::impl$28::call_once
+                               at /rustc/573a01569000d395498a5f98f916d6e5305ac81a/library\alloc\src\boxed.rs:1966
+  18:     0x7ffbbc7e11dd - alloc::boxed::impl$28::call_once
+                               at /rustc/573a01569000d395498a5f98f916d6e5305ac81a/library\alloc\src\boxed.rs:1966
+  19:     0x7ffbbc7e11dd - std::sys::pal::windows::thread::impl$0::new::thread_start
+                               at /rustc/573a01569000d395498a5f98f916d6e5305ac81a/library\std\src\sys\pal\windows\thread.rs:56
+  20:     0x7ffc97eae8d7 - BaseThreadInitThunk
+  21:     0x7ffc997b28dc - RtlUserThreadStart
+
+
+rustc version: 1.89.0-nightly (573a01569 2025-06-12)
+platform: x86_64-pc-windows-msvc
