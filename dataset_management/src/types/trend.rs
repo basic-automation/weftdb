@@ -3,16 +3,16 @@ use database::Measurement;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Trend {
-	destination: Measurement,
+	destination: Point,
 	slope: BigDecimal,
 }
 
 impl Trend {
-	pub fn new(destination: Measurement, slope: BigDecimal) -> Self {
+	pub fn new(destination: Point, slope: BigDecimal) -> Self {
 		Self { destination, slope }
 	}
 
-	pub fn destination(&self) -> &Measurement {
+	pub fn destination(&self) -> &Point {
 		&self.destination
 	}
 
@@ -20,7 +20,7 @@ impl Trend {
 		&self.slope
 	}
 
-	pub fn set_destination(&mut self, destination: Measurement) {
+	pub fn set_destination(&mut self, destination: Point) {
 		self.destination = destination;
 	}
 

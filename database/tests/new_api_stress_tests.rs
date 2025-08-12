@@ -22,7 +22,7 @@ async fn test_multiple_aspects_same_subject() {
 	let mut aspects = Vec::new();
 
 	for i in 0..num_aspects {
-		let aspect = db.track_aspect(subject.clone(), &format!("aspect_{}", i)).await.expect("Failed to track aspect");
+		let aspect = db.track_aspect(subject.clone(), &format!("aspect_{}", i), splimes::Resolution::Milliseconds).await.expect("Failed to track aspect");
 		aspects.push(aspect);
 	}
 
@@ -56,7 +56,7 @@ async fn test_high_frequency_measurements() {
 
 	let db = Database::new(&db_name).await.expect("Failed to create database");
 	let subject = db.track_subject("high_freq_subject").await.expect("Failed to add subject");
-	let aspect = db.track_aspect(subject, "high_freq_aspect").await.expect("Failed to track aspect");
+	let aspect = db.track_aspect(subject, "high_freq_aspect", splimes::Resolution::Microseconds).await.expect("Failed to track aspect");
 
 	// Reduced dataset for faster testing
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap();
@@ -102,7 +102,7 @@ async fn test_concurrent_access() {
 
 	let db = Database::new(&db_name).await.expect("Failed to create database");
 	let subject = db.track_subject("concurrent_subject").await.expect("Failed to add subject");
-	let aspect = db.track_aspect(subject, "concurrent_aspect").await.expect("Failed to track aspect");
+	let aspect = db.track_aspect(subject, "concurrent_aspect", splimes::Resolution::Milliseconds).await.expect("Failed to track aspect");
 
 	// Add some initial data
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap();
@@ -177,7 +177,7 @@ async fn test_large_dataset_analysis() {
 
 	let db = Database::new(&db_name).await.expect("Failed to create database");
 	let subject = db.track_subject("large_dataset_subject").await.expect("Failed to add subject");
-	let aspect = db.track_aspect(subject, "large_dataset_aspect").await.expect("Failed to track aspect");
+	let aspect = db.track_aspect(subject, "large_dataset_aspect", splimes::Resolution::Seconds).await.expect("Failed to track aspect");
 
 	// Create a smaller dataset for faster testing
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -234,7 +234,7 @@ async fn test_memory_usage_stability() {
 
 	let db = Database::new(&db_name).await.expect("Failed to create database");
 	let subject = db.track_subject("memory_test_subject").await.expect("Failed to add subject");
-	let aspect = db.track_aspect(subject, "memory_test_aspect").await.expect("Failed to track aspect");
+	let aspect = db.track_aspect(subject, "memory_test_aspect", splimes::Resolution::Milliseconds).await.expect("Failed to track aspect");
 
 	println!("Testing memory usage stability with repeated operations...");
 
@@ -284,7 +284,7 @@ async fn test_edge_case_scenarios() {
 
 	let db = Database::new(&db_name).await.expect("Failed to create database");
 	let subject = db.track_subject("edge_case_subject").await.expect("Failed to add subject");
-	let aspect = db.track_aspect(subject, "edge_case_aspect").await.expect("Failed to track aspect");
+	let aspect = db.track_aspect(subject, "edge_case_aspect", splimes::Resolution::Milliseconds).await.expect("Failed to track aspect");
 
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap();
 

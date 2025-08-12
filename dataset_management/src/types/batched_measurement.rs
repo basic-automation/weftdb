@@ -1,21 +1,21 @@
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
-use database::Measurement;
+use database::Point;
 
 use crate::types::{Analysis, Distance, MeasurementVector};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchedMeasurement {
 	active: bool,
-	measurement: Measurement,
+	point: Point,
 	distance: Option<Distance>,
 	vector: Option<MeasurementVector>,
 	analysis: Option<Analysis>,
 }
 
 impl BatchedMeasurement {
-	pub fn new(measurement: Measurement) -> Self {
-		Self { active: true, measurement, distance: None, vector: None, analysis: None }
+	pub fn new(point: Point) -> Self {
+		Self { active: true, point, distance: None, vector: None, analysis: None }
 	}
 
 	pub fn deactivate(&mut self) {
@@ -30,20 +30,20 @@ impl BatchedMeasurement {
 		self.active
 	}
 
-	pub fn measurement(&self) -> &Measurement {
-		&self.measurement
+	pub fn point(&self) -> &Point {
+		&self.point
 	}
 
-	pub fn set_measurement(&mut self, measurement: Measurement) {
-		self.measurement = measurement;
+	pub fn set_point(&mut self, point: Point) {
+		self.point = point;
 	}
 
 	pub fn get_measurement_value(&self) -> &BigDecimal {
-		&self.measurement.value
+		&self.point.value
 	}
 
 	pub fn get_measurement_timestamp(&self) -> &DateTime<Utc> {
-		&self.measurement.timestamp
+		&self.point.timestamp
 	}
 
 	pub fn distance(&self) -> Option<&Distance> {

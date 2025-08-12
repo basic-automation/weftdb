@@ -2,7 +2,7 @@ use std::{path::Path, str::FromStr};
 
 use anyhow::{bail, Result};
 use chrono::DateTime;
-use splimes::Point;
+use splimes::{Point, Resolution};
 use sqlx::{Pool, Row, Sqlite};
 use uuid::Uuid;
 
@@ -54,7 +54,7 @@ impl Database {
 
 	pub(crate) async fn load_aspects_from_metadata(subject_info: &mut Subject, metadata_pool: &Pool<Sqlite>, subject_id: SubjectId) -> Result<()> {
 		// Load aspects from metadata - using UUID directly
-		let aspect_rows = match sqlx::query("SELECT id, name, table_name FROM aspect_metadata WHERE subject_id = ? ORDER BY created_at").bind(subject_id.as_uuid()).fetch_all(metadata_pool).await {
+		let aspect_rows = match sqlx::query("SELECT id, name, table_name, resolution FROM aspect_metadata WHERE subject_id = ? ORDER BY created_at").bind(subject_id.as_uuid()).fetch_all(metadata_pool).await {
 			Ok(rows) => rows,
 			Err(e) => bail!(Error::DatabaseError(format!("Failed to query aspect metadata: {e}"))),
 		};
@@ -63,9 +63,24 @@ impl Database {
 			let aspect_uuid: Uuid = aspect_row.get("id");
 			let aspect_name: String = aspect_row.get("name");
 			let table_name: String = aspect_row.get("table_name");
+			let resolution_str: String = aspect_row.get("resolution");
+
+			let resolution = match resolution_str.as_str() {
+				"Nanoseconds" => Resolution::Nanoseconds,
+				"Microseconds" => Resolution::Microseconds,
+				"Milliseconds" => Resolution::Milliseconds,
+				"Seconds" => Resolution::Seconds,
+				"Minutes" => Resolution::Minutes,
+				"Hours" => Resolution::Hours,
+				"Days" => Resolution::Days,
+				"Weeks" => Resolution::Weeks,
+				"Months" => Resolution::Months,
+				"Years" => Resolution::Years,
+				_ => bail!(Error::DatabaseError(format!("Invalid resolution value: {resolution_str}"))),
+			};
 
 			let aspect_id = AspectId::from_uuid(aspect_uuid);
-			let aspect = Aspect::new_with_id(aspect_id, aspect_name, subject_id, table_name);
+			let aspect = Aspect::new_with_id(aspect_id, aspect_name, subject_id, table_name, resolution);
 			subject_info.add_aspect(aspect);
 		}
 

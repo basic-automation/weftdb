@@ -82,8 +82,8 @@ impl Database {
 			Err(e) => bail!(Error::DatabaseError(format!("Failed to create subject metadata table: {e}"))),
 		}
 
-		// Create aspect metadata table
-		match sqlx::query("CREATE TABLE IF NOT EXISTS aspect_metadata (id BLOB PRIMARY KEY, subject_id BLOB NOT NULL, database_id BLOB NOT NULL, name TEXT NOT NULL, table_name TEXT NOT NULL, created_at INTEGER NOT NULL, FOREIGN KEY (subject_id) REFERENCES subject_metadata(id), FOREIGN KEY (database_id) REFERENCES database_metadata(id))").execute(pool).await {
+		// Create aspect metadata table with resolution
+		match sqlx::query("CREATE TABLE IF NOT EXISTS aspect_metadata (id BLOB PRIMARY KEY, subject_id BLOB NOT NULL, database_id BLOB NOT NULL, name TEXT NOT NULL, table_name TEXT NOT NULL, resolution TEXT NOT NULL, created_at INTEGER NOT NULL, earliest_measurement INTEGER, latest_measurement INTEGER, FOREIGN KEY (subject_id) REFERENCES subject_metadata(id), FOREIGN KEY (database_id) REFERENCES database_metadata(id))").execute(pool).await {
 			Ok(_) => (),
 			Err(e) => bail!(Error::DatabaseError(format!("Failed to create aspect metadata table: {e}"))),
 		}
@@ -102,6 +102,28 @@ impl Database {
 		match sqlx::query("CREATE INDEX IF NOT EXISTS idx_aspect_metadata_database_id ON aspect_metadata(database_id)").execute(pool).await {
 			Ok(_) => (),
 			Err(e) => bail!(Error::DatabaseError(format!("Failed to create aspect_metadata index: {e}"))),
+		}
+
+		Ok(())
+	}
+
+	// Add migration function
+	async fn migrate_aspect_metadata(pool: &Pool<Sqlite>) -> Result<()> {
+		let rows = sqlx::query("PRAGMA table_info(aspect_metadata)").fetch_all(pool).await?;
+
+		let has_earliest = rows.iter().any(|row| row.get::<String, _>("name") == "earliest_measurement");
+		if !has_earliest {
+			sqlx::query("ALTER TABLE aspect_metadata ADD COLUMN earliest_measurement INTEGER").execute(pool).await?;
+		}
+
+		let has_latest = rows.iter().any(|row| row.get::<String, _>("name") == "latest_measurement");
+		if !has_latest {
+			sqlx::query("ALTER TABLE aspect_metadata ADD COLUMN latest_measurement INTEGER").execute(pool).await?;
+		}
+
+		let has_resolution = rows.iter().any(|row| row.get::<String, _>("name") == "resolution");
+		if !has_resolution {
+			sqlx::query("ALTER TABLE aspect_metadata ADD COLUMN resolution TEXT").execute(pool).await?;
 		}
 
 		Ok(())
@@ -134,6 +156,11 @@ impl Database {
 		} else {
 			None
 		};
+
+		if let Some(ref pool) = metadata_pool {
+			Self::create_metadata_tables(pool).await?; // Ensure tables exist
+			Self::migrate_aspect_metadata(pool).await?; // Apply migrations
+		}
 
 		// Load database metadata
 		let db_id = if let Some(ref pool) = metadata_pool {
