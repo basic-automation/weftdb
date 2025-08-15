@@ -290,97 +290,46 @@ impl Database {
 			pool.close().await;
 		}
 
-		Ok(())
-	}
+		// Release the mutex locks early
+		drop(write_pools);
+		drop(pools);
+		drop(databases);
 
-	/// Clean up unused connection pools periodically
-	pub async fn cleanup_unused_pools() -> Result<()> {
-		let mut pools = CONNECTION_POOLS.lock().await;
-		let databases = DATABASES.lock().await;
-
-		// Find pools that are no longer referenced by any database
-		let active_paths: std::collections::HashSet<String> = databases.values().filter_map(|db_info| db_info.metadata_pool().map(|_| format!("{}/metadata.db", db_info.path()))).collect();
-
-		let unused_paths: Vec<String> = pools.keys().filter(|path| !active_paths.contains(*path)).cloned().collect();
-
-		for path in unused_paths {
-			if let Some(pool) = pools.remove(&path) {
-				pool.close().await;
-			}
-		}
-
-		// Clean up write pools similarly
-		let mut write_pools = WRITE_POOLS.lock().await;
-		let unused_write_paths: Vec<String> = write_pools.keys().filter(|path| !active_paths.contains(*path)).cloned().collect();
-
-		for path in unused_write_paths {
-			if let Some(pool) = write_pools.remove(&path) {
-				pool.close().await;
-			}
-		}
+		// Wait for database files to be actually released
+		self.wait_for_database_release().await?;
 
 		Ok(())
 	}
 
-	/// Get connection pool statistics for monitoring
-	pub async fn get_pool_stats() -> HashMap<String, (usize, usize)> {
-		let pools = CONNECTION_POOLS.lock().await;
-		pools.iter().map(|(path, pool)| (path.clone(), (pool.size() as usize, pool.num_idle()))).collect()
-	}
+	/// Wait for the database files to be released by checking if we can delete them
+	async fn wait_for_database_release(&self) -> Result<()> {
+		let db_dir = format!("{}/{}", DEFAULT_DATA_DIR, self.name);
+		let metadata_db_path = format!("{}/metadata.db", db_dir);
 
-	/// Create a new subject in this database
-	///
-	/// # Errors
-	/// - if unable to insert subject into metadata
-	/// - if database not found
-	pub async fn create_subject(&self, name: &str) -> Result<Subject> {
-		let subject_id = SubjectId::new();
+		const MAX_ATTEMPTS: u32 = 50; // 5 seconds total
+		const DELAY_MS: u64 = 100;
 
-		// Insert into metadata table
-		sqlx::query("INSERT INTO subjects (id, name, created_at) VALUES (?, ?, ?)").bind(subject_id.as_uuid()).bind(name).bind(chrono::Utc::now().timestamp_millis()).execute(&self.pool).await?;
-
-		let subject = Subject::new_with_id(subject_id, name.to_string(), self.id, self.pool.clone());
-
-		// Add to database info
-		if let Some(db_info) = DATABASES.lock().await.get_mut(&self.id) {
-			db_info.add_subject(subject.clone());
-		}
-
-		Ok(subject)
-	}
-
-	/// Get a subject by ID
-	///
-	/// # Errors
-	/// - if database not found
-	pub async fn get_subject(&self, subject_id: &SubjectId) -> Result<Option<Subject>> {
-		let db_info = self.get_database_info().await.ok_or_else(|| anyhow::anyhow!("Database not found"))?;
-
-		Ok(db_info.subjects().get(subject_id).cloned())
-	}
-
-	/// List all subjects in this database - returns Vec<Subject> instead of HashMap
-	///
-	/// # Errors
-	/// - if database not found
-	pub async fn get_all_subjects(&self) -> Result<Vec<Subject>> {
-		let db_info = self.get_database_info().await.ok_or_else(|| anyhow::anyhow!("Database not found"))?;
-
-		Ok(db_info.subjects().values().cloned().collect())
-	}
-
-	/// Remove a subject and all its aspects
-	///
-	/// # Errors
-	/// - if unable to delete from metadata
-	/// - if database not found
-	pub async fn remove_subject(&self, subject_id: &SubjectId) -> Result<()> {
-		// Delete from metadata table (cascading should handle aspects)
-		sqlx::query("DELETE FROM subjects WHERE id = ?").bind(subject_id.as_uuid()).execute(&self.pool).await?;
-
-		// Remove from database info
-		if let Some(db_info) = DATABASES.lock().await.get_mut(&self.id) {
-			db_info.subjects_mut().remove(subject_id);
+		for attempt in 0..MAX_ATTEMPTS {
+			// Try to open the database file exclusively to check if it's still locked
+			match std::fs::OpenOptions::new().write(true).truncate(false).open(&metadata_db_path) {
+				Ok(_) => {
+					// File is accessible, database is released
+					return Ok(());
+				}
+				Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+					// File is still locked, wait and retry
+					if attempt == MAX_ATTEMPTS - 1 {
+						// Last attempt failed, but don't error - just log
+						eprintln!("Warning: Database may still be locked after {} attempts: {}", MAX_ATTEMPTS, metadata_db_path);
+						return Ok(());
+					}
+					tokio::time::sleep(std::time::Duration::from_millis(DELAY_MS)).await;
+				}
+				Err(_) => {
+					// Other error (file doesn't exist, etc.) - consider it released
+					return Ok(());
+				}
+			}
 		}
 
 		Ok(())
