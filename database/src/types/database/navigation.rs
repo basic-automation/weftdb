@@ -1,8 +1,8 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use anyhow::{bail, Result};
 
-use crate::{Aspect, Database, Error, Subject, SubjectId, DATABASES};
+use crate::{Aspect, Database, DatabaseId, Error, SubjectId, DATABASES};
 
 impl Database {
 	/// Lists all databases in the system.
@@ -10,51 +10,81 @@ impl Database {
 	/// # Errors
 	/// - if unable to read database directory
 	/// - if database directory is not set
-	///
-	pub async fn ls() -> HashSet<Self> {
-		let mut result = HashSet::new();
+	#[must_use]
+	pub async fn list_databases() -> HashMap<DatabaseId, String> {
+		let mut result = HashMap::new();
 		for (db_id, db_info) in DATABASES.lock().await.iter() {
-			result.insert(Self { id: *db_id, name: db_info.name().to_string() });
+			result.insert(*db_id, db_info.name().to_string());
 		}
 		result
 	}
 
-	/// Lists all subjects in a database.
+	/// Lists all subjects in a database - returns HashMap<SubjectId, String> for navigation
 	/// # Errors
 	/// - if database not found
 	/// - if unable to read database subjects
-	///
-	#[allow(clippy::mutable_key_type)]
-	pub async fn ls_subjects(&self) -> Result<HashSet<Subject>> {
-		let mut result = HashSet::new();
+	pub async fn list_subjects(&self) -> Result<HashMap<SubjectId, String>> {
+		let mut result = HashMap::new();
+
 		let db_info = match DATABASES.lock().await.get(&self.id()) {
 			Some(info) => info.clone(),
 			None => bail!(Error::DatabaseError("Database not found".to_string())),
 		};
-		for (subject_id, subject_info) in db_info.subjects() {
-			result.insert(Subject::new_with_id(*subject_id, subject_info.name().to_string(), self.id(), subject_info.pool().clone()));
+
+		for (subject_id, subject) in db_info.subjects() {
+			result.insert(*subject_id, subject.name().to_string());
 		}
+
 		Ok(result)
 	}
 
-	/// Lists all aspects of a subject.
+	/// Gets all aspects for a subject in this database.
 	/// # Errors
 	/// - if database not found
-	/// - if subject not found
-	///
-	pub async fn ls_aspects(&self, subject_id: SubjectId) -> Result<HashSet<Aspect>> {
+	pub async fn get_subject_aspects(&self, subject_id: &SubjectId) -> Result<Vec<Aspect>> {
 		let db_info = match DATABASES.lock().await.get(&self.id()) {
 			Some(info) => info.clone(),
 			None => bail!(Error::DatabaseError("Database not found".to_string())),
 		};
-		let subject_info = match db_info.subjects().get(&subject_id) {
-			Some(info) => info.clone(),
+
+		let subject = match db_info.subjects().get(subject_id) {
+			Some(s) => s,
 			None => bail!(Error::DatabaseError("Subject not found".to_string())),
 		};
-		let mut result = HashSet::new();
-		for aspect_info in subject_info.aspects().values() {
-			result.insert(aspect_info.clone());
+
+		Ok(subject.aspects().values().cloned().collect())
+	}
+
+	/// Find databases by name pattern
+	pub async fn find_databases_by_name(pattern: &str) -> Vec<(DatabaseId, String)> {
+		let mut results = Vec::new();
+		let databases = DATABASES.lock().await;
+
+		for (db_id, db_info) in databases.iter() {
+			if db_info.name().contains(pattern) {
+				results.push((*db_id, db_info.name().to_string()));
+			}
 		}
-		Ok(result)
+
+		results
+	}
+
+	/// Get database by name
+	pub async fn find_database_by_name(name: &str) -> Option<DatabaseId> {
+		let databases = DATABASES.lock().await;
+
+		databases.iter().find(|(_, db_info)| db_info.name() == name).map(|(db_id, _)| *db_id)
+	}
+
+	/// Get all databases with their basic info
+	pub async fn get_all_database_info() -> Vec<(DatabaseId, String, String)> {
+		let mut results = Vec::new();
+		let databases = DATABASES.lock().await;
+
+		for (db_id, db_info) in databases.iter() {
+			results.push((*db_id, db_info.name().to_string(), db_info.path().to_string()));
+		}
+
+		results
 	}
 }
