@@ -1,11 +1,9 @@
-use std::collections::HashMap;
-
 use anyhow::{bail, Result};
 use bigdecimal::{BigDecimal, FromPrimitive};
-use chrono::{DateTime, Utc};
-use database::{AspectId, DataPoint, Resolution};
+use splimes::Resolution;
 
 use crate::types::{Analysis, BatchedMeasurement, MeasurementVector, Relative, Trend};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Batch {
 	size: usize,
@@ -150,8 +148,8 @@ impl Batch {
 			for destination_measurment in &measurments {
 				let measurment_value = measurement.get_measurement_value().clone();
 				let destination_value = destination_measurment.get_measurement_value().clone();
-				let measurement_timestamp = measurement.get_measurement_timestamp().clone();
-				let destination_timestamp = destination_measurment.get_measurement_timestamp().clone();
+				let measurement_timestamp = *measurement.get_measurement_timestamp(); // Fixed: removed .clone()
+				let destination_timestamp = *destination_measurment.get_measurement_timestamp(); // Fixed: removed .clone()
 				let destination_measurement_timestamp_difference = match self.resolution {
 					Resolution::Nanoseconds => (destination_timestamp - measurement_timestamp).num_nanoseconds().map(|n| n as f64).unwrap_or(0.0),
 					Resolution::Microseconds => (destination_timestamp - measurement_timestamp).num_microseconds().map(|n| n as f64).unwrap_or(0.0),
@@ -244,15 +242,30 @@ impl Batch {
 			bail!("Batch is empty, cannot perform relative analysis");
 		}
 
-		let max_x = self.measurements.iter().map(|m| m.get_vector_location().clone()).max().ok_or_else(|| anyhow::anyhow!("No measurements found in the batch"))?.ok_or_else(|| anyhow::anyhow!("Failed to get max x value"))?.clone();
-		let max_y = self.measurements.iter().map(|m| m.get_vector_amplitude().clone()).max().ok_or_else(|| anyhow::anyhow!("No measurements found in the batch"))?.ok_or_else(|| anyhow::anyhow!("Failed to get max y value"))?.clone();
+		let max_x = self
+			.measurements
+			.iter()
+			.map(|m| m.get_vector_location()) // Fixed: removed .clone()
+			.max()
+			.ok_or_else(|| anyhow::anyhow!("No measurements found in the batch"))?
+			.ok_or_else(|| anyhow::anyhow!("Failed to get max x value"))?
+			.clone();
+
+		let max_y = self
+			.measurements
+			.iter()
+			.map(|m| m.get_vector_amplitude()) // Fixed: removed .clone()
+			.max()
+			.ok_or_else(|| anyhow::anyhow!("No measurements found in the batch"))?
+			.ok_or_else(|| anyhow::anyhow!("Failed to get max y value"))?
+			.clone();
 
 		for measurement in &mut self.measurements {
 			let Some(location) = measurement.get_vector_location() else {
-				bail!("Measurement vector location is not set for all measurements in the batch");
+				bail!("Location is not set for all measurements in the batch");
 			};
 			let Some(amplitude) = measurement.get_vector_amplitude() else {
-				bail!("Measurement vector amplitude is not set for all measurements in the batch");
+				bail!("Amplitude is not set for all measurements in the batch");
 			};
 			let relative_location = location / &max_x;
 			let relative_amplitude = amplitude / &max_y;

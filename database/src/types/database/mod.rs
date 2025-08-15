@@ -3,17 +3,21 @@ use std::{
 };
 
 use anyhow::{bail, Result};
+use chrono::{DateTime, Utc};
 use sqlx::{Pool, Row, Sqlite, SqlitePool};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::{Error, Subject, SubjectId, DEFAULT_DATA_DIR};
+use crate::{Subject, SubjectId, DEFAULT_DATA_DIR};
 
 pub type DatabaseMap = Arc<Mutex<HashMap<DatabaseId, DatabaseInfo>>>;
 pub static DATABASES: LazyLock<DatabaseMap> = LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
 // Add connection pool manager
 static CONNECTION_POOLS: LazyLock<Arc<Mutex<HashMap<String, SqlitePool>>>> = LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+
+// Add dedicated write pools for concurrency
+static WRITE_POOLS: LazyLock<Arc<Mutex<HashMap<String, SqlitePool>>>> = LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
 mod analysis;
 mod aspects;
@@ -22,10 +26,11 @@ mod measurements;
 mod navigation;
 mod subjects;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct Database {
 	id: DatabaseId,
 	name: String,
+	pool: Pool<Sqlite>,
 }
 
 impl Database {
@@ -40,14 +45,12 @@ impl Database {
 
 		// Check if folder already exists
 		if Path::new(&db_path).exists() {
-			bail!(Error::DatabaseError(format!("Database '{name}' already exists")));
+			bail!("Database folder already exists: {}", db_path);
 		}
 
 		// Create the directory
-		match std::fs::create_dir_all(&db_path) {
-			Ok(()) => (),
-			Err(e) => bail!(Error::DatabaseError(format!("Failed to create database directory '{db_path}': {e}"))),
-		}
+		std::fs::create_dir_all(&db_path)?;
+
 		let db_id = DatabaseId::new();
 
 		// Use shared connection pool
@@ -58,73 +61,93 @@ impl Database {
 		Self::create_metadata_tables(&metadata_pool).await?;
 
 		// Insert database metadata - using UUID directly
-		match sqlx::query("INSERT INTO database_metadata (id, name, created_at) VALUES (?, ?, ?)").bind(db_id.as_uuid()).bind(name).bind(chrono::Utc::now().timestamp_millis()).execute(&metadata_pool).await {
-			Ok(_) => (),
-			Err(e) => bail!(Error::DatabaseError(format!("Failed to insert database metadata: {e}"))),
-		}
+		sqlx::query("INSERT INTO database_metadata (id, name, created_at) VALUES (?, ?, ?)").bind(db_id.as_uuid()).bind(name).bind(chrono::Utc::now().timestamp_millis()).execute(&metadata_pool).await?;
+
 		let mut db_info = DatabaseInfo::new(name.to_string(), db_path);
-		db_info.set_metadata_pool(Some(metadata_pool));
+		db_info.set_metadata_pool(Some(metadata_pool.clone()));
 		DATABASES.lock().await.insert(db_id, db_info);
 
-		Ok(Self { id: db_id, name: name.to_string() })
+		Ok(Self { id: db_id, name: name.to_string(), pool: metadata_pool })
 	}
 
 	async fn create_metadata_tables(pool: &Pool<Sqlite>) -> Result<()> {
 		// Create database metadata table - using BLOB for UUID storage
-		match sqlx::query("CREATE TABLE IF NOT EXISTS database_metadata (id BLOB PRIMARY KEY, name TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL)").execute(pool).await {
-			Ok(_) => (),
-			Err(e) => bail!(Error::DatabaseError(format!("Failed to create database metadata table: {e}"))),
-		}
+		sqlx::query(
+			r#"
+            CREATE TABLE IF NOT EXISTS database_metadata (
+                id BLOB PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            "#,
+		)
+		.execute(pool)
+		.await?;
 
-		// Create subject metadata table
-		match sqlx::query("CREATE TABLE IF NOT EXISTS subject_metadata (id BLOB PRIMARY KEY, database_id BLOB NOT NULL, name TEXT NOT NULL, created_at INTEGER NOT NULL, FOREIGN KEY (database_id) REFERENCES database_metadata(id))").execute(pool).await {
-			Ok(_) => (),
-			Err(e) => bail!(Error::DatabaseError(format!("Failed to create subject metadata table: {e}"))),
-		}
+		// Create subjects table
+		sqlx::query(
+			r#"
+            CREATE TABLE IF NOT EXISTS subjects (
+                id BLOB PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            "#,
+		)
+		.execute(pool)
+		.await?;
 
-		// Create aspect metadata table with resolution
-		match sqlx::query("CREATE TABLE IF NOT EXISTS aspect_metadata (id BLOB PRIMARY KEY, subject_id BLOB NOT NULL, database_id BLOB NOT NULL, name TEXT NOT NULL, table_name TEXT NOT NULL, resolution TEXT NOT NULL, created_at INTEGER NOT NULL, earliest_measurement INTEGER, latest_measurement INTEGER, FOREIGN KEY (subject_id) REFERENCES subject_metadata(id), FOREIGN KEY (database_id) REFERENCES database_metadata(id))").execute(pool).await {
-			Ok(_) => (),
-			Err(e) => bail!(Error::DatabaseError(format!("Failed to create aspect metadata table: {e}"))),
-		}
+		// Create subject_metadata table for track_subject compatibility
+		sqlx::query(
+			r#"
+            CREATE TABLE IF NOT EXISTS subject_metadata (
+                id BLOB PRIMARY KEY,
+                database_id BLOB NOT NULL,
+                name TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY (database_id) REFERENCES database_metadata(id)
+            )
+            "#,
+		)
+		.execute(pool)
+		.await?;
 
-		// Create indexes for efficient queries
-		match sqlx::query("CREATE INDEX IF NOT EXISTS idx_subject_metadata_database_id ON subject_metadata(database_id)").execute(pool).await {
-			Ok(_) => (),
-			Err(e) => bail!(Error::DatabaseError(format!("Failed to create subject_metadata index: {e}"))),
-		}
+		// Create aspects table
+		sqlx::query(
+			r#"
+            CREATE TABLE IF NOT EXISTS aspects (
+                id BLOB PRIMARY KEY,
+                subject_id BLOB NOT NULL,
+                name TEXT NOT NULL,
+                resolution TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY (subject_id) REFERENCES subjects(id)
+            )
+            "#,
+		)
+		.execute(pool)
+		.await?;
 
-		match sqlx::query("CREATE INDEX IF NOT EXISTS idx_aspect_metadata_subject_id ON aspect_metadata(subject_id)").execute(pool).await {
-			Ok(_) => (),
-			Err(e) => bail!(Error::DatabaseError(format!("Failed to create aspect_metadata index: {e}"))),
-		}
-
-		match sqlx::query("CREATE INDEX IF NOT EXISTS idx_aspect_metadata_database_id ON aspect_metadata(database_id)").execute(pool).await {
-			Ok(_) => (),
-			Err(e) => bail!(Error::DatabaseError(format!("Failed to create aspect_metadata index: {e}"))),
-		}
-
-		Ok(())
-	}
-
-	// Add migration function
-	async fn migrate_aspect_metadata(pool: &Pool<Sqlite>) -> Result<()> {
-		let rows = sqlx::query("PRAGMA table_info(aspect_metadata)").fetch_all(pool).await?;
-
-		let has_earliest = rows.iter().any(|row| row.get::<String, _>("name") == "earliest_measurement");
-		if !has_earliest {
-			sqlx::query("ALTER TABLE aspect_metadata ADD COLUMN earliest_measurement INTEGER").execute(pool).await?;
-		}
-
-		let has_latest = rows.iter().any(|row| row.get::<String, _>("name") == "latest_measurement");
-		if !has_latest {
-			sqlx::query("ALTER TABLE aspect_metadata ADD COLUMN latest_measurement INTEGER").execute(pool).await?;
-		}
-
-		let has_resolution = rows.iter().any(|row| row.get::<String, _>("name") == "resolution");
-		if !has_resolution {
-			sqlx::query("ALTER TABLE aspect_metadata ADD COLUMN resolution TEXT").execute(pool).await?;
-		}
+		// Create aspect metadata table for tracking earliest/latest measurements
+		sqlx::query(
+			r#"
+            CREATE TABLE IF NOT EXISTS aspect_metadata (
+                id BLOB PRIMARY KEY,
+                subject_id BLOB NOT NULL,
+                database_id BLOB NOT NULL,
+                name TEXT NOT NULL,
+                table_name TEXT NOT NULL,
+                resolution TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                earliest_measurement INTEGER,
+                latest_measurement INTEGER,
+                FOREIGN KEY (subject_id) REFERENCES subjects(id),
+                FOREIGN KEY (database_id) REFERENCES database_metadata(id)
+            )
+            "#,
+		)
+		.execute(pool)
+		.await?;
 
 		Ok(())
 	}
@@ -143,84 +166,86 @@ impl Database {
 
 		// Check if folder exists
 		if !Path::new(&db_path).exists() {
-			bail!("Database directory '{}' does not exist", db_path);
+			bail!("Database folder does not exist: {}", db_path);
 		}
 
-		// Connect to metadata database
+		// Use shared connection pool
 		let metadata_db_path = format!("{db_path}/metadata.db");
-		let metadata_pool = if Path::new(&metadata_db_path).exists() {
-			Some(match sqlx::sqlite::SqlitePoolOptions::new().max_connections(5).connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&metadata_db_path).create_if_missing(false)).await {
-				Ok(pool) => pool,
-				Err(e) => bail!(Error::DatabaseError(format!("Failed to connect to metadata database '{metadata_db_path}': {e}"))),
-			})
-		} else {
-			None
-		};
+		let metadata_pool = Self::get_or_create_pool(&metadata_db_path).await?;
 
-		if let Some(ref pool) = metadata_pool {
-			Self::create_metadata_tables(pool).await?; // Ensure tables exist
-			Self::migrate_aspect_metadata(pool).await?; // Apply migrations
+		// Query database ID from metadata
+		let row = sqlx::query("SELECT id FROM database_metadata WHERE name = ?").bind(name).fetch_one(&metadata_pool).await?;
+
+		let db_id_bytes: Vec<u8> = row.get("id");
+		let db_id = DatabaseId::from_uuid(Uuid::from_slice(&db_id_bytes)?);
+
+		// Load subjects manually instead of using query_as
+		let subject_rows = sqlx::query("SELECT id, name, created_at FROM subjects").fetch_all(&metadata_pool).await?;
+
+		let mut db_info = DatabaseInfo::new(name.to_string(), db_path);
+		db_info.set_id(db_id);
+		db_info.set_metadata_pool(Some(metadata_pool.clone()));
+
+		// Manually construct subjects from rows
+		for row in subject_rows {
+			let subject_id_bytes: Vec<u8> = row.get("id");
+			let subject_id = SubjectId::from_uuid(Uuid::from_slice(&subject_id_bytes)?);
+			let subject_name: String = row.get("name");
+
+			let subject = Subject::new_with_id(subject_id, subject_name, db_id, metadata_pool.clone());
+
+			db_info.add_subject(subject);
 		}
-
-		// Load database metadata
-		let db_id = if let Some(ref pool) = metadata_pool {
-			// Load existing database ID from metadata - using UUID directly
-			let row = match sqlx::query("SELECT id FROM database_metadata WHERE name = ?").bind(name).fetch_optional(pool).await {
-				Ok(row) => row,
-				Err(e) => bail!(Error::DatabaseError(format!("Failed to query database metadata: {e}"))),
-			};
-
-			row.map_or_else(DatabaseId::new, |row| {
-				let uuid: Uuid = row.get("id");
-				DatabaseId::from_uuid(uuid)
-			})
-		} else {
-			DatabaseId::new()
-		};
-
-		let mut db_info = DatabaseInfo::new(name.to_string(), db_path.clone());
-		db_info.set_metadata_pool(metadata_pool);
-		db_info.set_id(db_id); // Set the loaded ID
-
-		// Load existing subjects from metadata if available
-		Self::load_subjects_from_metadata(&mut db_info, &db_path).await?;
 
 		DATABASES.lock().await.insert(db_id, db_info);
 
-		Ok(Self { id: db_id, name: name.to_string() })
+		Ok(Self { id: db_id, name: name.to_string(), pool: metadata_pool })
 	}
 
 	pub async fn get_database_info(&self) -> Option<DatabaseInfo> {
-		let databases = DATABASES.lock().await;
-		databases.get(&self.id).cloned()
+		DATABASES.lock().await.get(&self.id).cloned()
 	}
 
 	/// Get or create a connection pool for reuse
 	async fn get_or_create_pool(db_path: &str) -> Result<SqlitePool> {
-		let pools = CONNECTION_POOLS.lock().await;
+		let mut pools = CONNECTION_POOLS.lock().await;
 
 		if let Some(pool) = pools.get(db_path) {
 			return Ok(pool.clone());
 		}
 
-		drop(pools);
+		let pool = SqlitePool::connect(&format!("sqlite://{db_path}?mode=rwc")).await?;
 
-		let pool = sqlx::sqlite::SqlitePoolOptions::new()
-			.max_connections(10) // Increased pool size
-			.idle_timeout(std::time::Duration::from_secs(300)) // 5 minute idle timeout
-			.connect_with(
-				sqlx::sqlite::SqliteConnectOptions::new()
-					.filename(db_path)
-					.create_if_missing(true)
-					.pragma("journal_mode", "WAL") // Write-Ahead Logging for better concurrency
-					.pragma("synchronous", "NORMAL") // Faster than FULL, still safe
-					.pragma("cache_size", "10000") // Larger cache
-					.pragma("temp_store", "memory"), // Store temp tables in memory
-			)
-			.await
-			.map_err(|e| Error::DatabaseError(format!("Failed to connect to database: {e}")))?;
+		// Enable WAL mode for better concurrency
+		sqlx::query("PRAGMA journal_mode=WAL").execute(&pool).await?;
 
-		CONNECTION_POOLS.lock().await.insert(db_path.to_string(), pool.clone());
+		// Set busy timeout for better concurrent access handling
+		sqlx::query("PRAGMA busy_timeout=30000").execute(&pool).await?;
+
+		pools.insert(db_path.to_string(), pool.clone());
+
+		Ok(pool)
+	}
+
+	/// Get or create a dedicated write pool (single connection) for concurrency
+	async fn get_or_create_write_pool(db_path: &str) -> Result<SqlitePool> {
+		let mut pools = WRITE_POOLS.lock().await;
+
+		if let Some(pool) = pools.get(db_path) {
+			return Ok(pool.clone());
+		}
+
+		// Create pool with single connection for writes to avoid locking
+		let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect(&format!("sqlite://{db_path}?mode=rwc")).await?;
+
+		// Enable WAL mode for better concurrency
+		sqlx::query("PRAGMA journal_mode=WAL").execute(&pool).await?;
+
+		// Set busy timeout for better concurrent access handling
+		sqlx::query("PRAGMA busy_timeout=30000").execute(&pool).await?;
+
+		pools.insert(db_path.to_string(), pool.clone());
+
 		Ok(pool)
 	}
 
@@ -234,31 +259,129 @@ impl Database {
 		&self.name
 	}
 
+	#[must_use]
+	pub fn pool(&self) -> &Pool<Sqlite> {
+		&self.pool
+	}
+
 	/// Closes the database, releasing all resources and removing from global map
 	///
 	/// # Errors
 	///
 	/// Returns an error if there are issues closing connection pools or removing resources.
 	pub async fn close(&self) -> Result<()> {
-		let db_id = self.id();
+		let mut databases = DATABASES.lock().await;
+		if let Some(db_info) = databases.remove(&self.id) {
+			if let Some(pool) = db_info.metadata_pool() {
+				pool.close().await;
+			}
+		}
 
-		// Close all related connection pools
-		let pools: Vec<Pool<Sqlite>> = {
-			let dbs = DATABASES.lock().await;
-			dbs.get(&db_id).map_or_else(Vec::new, |db_info| db_info.subjects().values().map(|s| s.pool().clone()).collect())
-		};
-
-		for pool in pools {
+		// Also remove from connection pools
+		let db_path = format!("{}/{}/metadata.db", DEFAULT_DATA_DIR, self.name);
+		let mut pools = CONNECTION_POOLS.lock().await;
+		if let Some(pool) = pools.remove(&db_path) {
 			pool.close().await;
 		}
 
-		// Remove from global map
-		DATABASES.lock().await.remove(&db_id);
+		// Remove from write pools
+		let mut write_pools = WRITE_POOLS.lock().await;
+		if let Some(pool) = write_pools.remove(&db_path) {
+			pool.close().await;
+		}
 
-		// Delay to ensure handles are released
-		tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+		Ok(())
+	}
 
-		// Note: Add directory removal if needed, but be careful in benchmarks
+	/// Clean up unused connection pools periodically
+	pub async fn cleanup_unused_pools() -> Result<()> {
+		let mut pools = CONNECTION_POOLS.lock().await;
+		let databases = DATABASES.lock().await;
+
+		// Find pools that are no longer referenced by any database
+		let active_paths: std::collections::HashSet<String> = databases.values().filter_map(|db_info| db_info.metadata_pool().map(|_| format!("{}/metadata.db", db_info.path()))).collect();
+
+		let unused_paths: Vec<String> = pools.keys().filter(|path| !active_paths.contains(*path)).cloned().collect();
+
+		for path in unused_paths {
+			if let Some(pool) = pools.remove(&path) {
+				pool.close().await;
+			}
+		}
+
+		// Clean up write pools similarly
+		let mut write_pools = WRITE_POOLS.lock().await;
+		let unused_write_paths: Vec<String> = write_pools.keys().filter(|path| !active_paths.contains(*path)).cloned().collect();
+
+		for path in unused_write_paths {
+			if let Some(pool) = write_pools.remove(&path) {
+				pool.close().await;
+			}
+		}
+
+		Ok(())
+	}
+
+	/// Get connection pool statistics for monitoring
+	pub async fn get_pool_stats() -> HashMap<String, (usize, usize)> {
+		let pools = CONNECTION_POOLS.lock().await;
+		pools.iter().map(|(path, pool)| (path.clone(), (pool.size() as usize, pool.num_idle()))).collect()
+	}
+
+	/// Create a new subject in this database
+	///
+	/// # Errors
+	/// - if unable to insert subject into metadata
+	/// - if database not found
+	pub async fn create_subject(&self, name: &str) -> Result<Subject> {
+		let subject_id = SubjectId::new();
+
+		// Insert into metadata table
+		sqlx::query("INSERT INTO subjects (id, name, created_at) VALUES (?, ?, ?)").bind(subject_id.as_uuid()).bind(name).bind(chrono::Utc::now().timestamp_millis()).execute(&self.pool).await?;
+
+		let subject = Subject::new_with_id(subject_id, name.to_string(), self.id, self.pool.clone());
+
+		// Add to database info
+		if let Some(db_info) = DATABASES.lock().await.get_mut(&self.id) {
+			db_info.add_subject(subject.clone());
+		}
+
+		Ok(subject)
+	}
+
+	/// Get a subject by ID
+	///
+	/// # Errors
+	/// - if database not found
+	pub async fn get_subject(&self, subject_id: &SubjectId) -> Result<Option<Subject>> {
+		let db_info = self.get_database_info().await.ok_or_else(|| anyhow::anyhow!("Database not found"))?;
+
+		Ok(db_info.subjects().get(subject_id).cloned())
+	}
+
+	/// List all subjects in this database - returns Vec<Subject> instead of HashMap
+	///
+	/// # Errors
+	/// - if database not found
+	pub async fn get_all_subjects(&self) -> Result<Vec<Subject>> {
+		let db_info = self.get_database_info().await.ok_or_else(|| anyhow::anyhow!("Database not found"))?;
+
+		Ok(db_info.subjects().values().cloned().collect())
+	}
+
+	/// Remove a subject and all its aspects
+	///
+	/// # Errors
+	/// - if unable to delete from metadata
+	/// - if database not found
+	pub async fn remove_subject(&self, subject_id: &SubjectId) -> Result<()> {
+		// Delete from metadata table (cascading should handle aspects)
+		sqlx::query("DELETE FROM subjects WHERE id = ?").bind(subject_id.as_uuid()).execute(&self.pool).await?;
+
+		// Remove from database info
+		if let Some(db_info) = DATABASES.lock().await.get_mut(&self.id) {
+			db_info.subjects_mut().remove(subject_id);
+		}
 
 		Ok(())
 	}
@@ -302,8 +425,7 @@ pub struct DatabaseInfo {
 impl DatabaseInfo {
 	#[must_use]
 	pub fn new(name: String, path: String) -> Self {
-		let id = DatabaseId::new();
-		Self { id, name, path, subjects: HashMap::new(), metadata_pool: None }
+		Self { id: DatabaseId::default(), name, path, subjects: HashMap::new(), metadata_pool: None }
 	}
 
 	#[must_use]
@@ -343,7 +465,60 @@ impl DatabaseInfo {
 		self.metadata_pool = pool;
 	}
 
-	pub const fn subjects_mut(&mut self) -> &mut HashMap<SubjectId, Subject> {
+	pub fn subjects_mut(&mut self) -> &mut HashMap<SubjectId, Subject> {
 		&mut self.subjects
 	}
+
+	/// Get subject by name
+	pub fn get_subject_by_name(&self, name: &str) -> Option<&Subject> {
+		self.subjects.values().find(|s| s.name() == name)
+	}
+
+	/// Get total number of aspects across all subjects
+	pub fn total_aspects(&self) -> usize {
+		self.subjects.values().map(|s| s.aspects().len()).sum()
+	}
+
+	/// Check if database is empty (no subjects)
+	pub fn is_empty(&self) -> bool {
+		self.subjects.is_empty()
+	}
+
+	/// Get creation timestamp if available
+	pub async fn get_creation_time(&self) -> Result<Option<DateTime<Utc>>> {
+		if let Some(pool) = &self.metadata_pool {
+			let row = sqlx::query("SELECT created_at FROM database_metadata WHERE name = ?").bind(&self.name).fetch_optional(pool).await?;
+
+			if let Some(row) = row {
+				let timestamp_millis: i64 = row.get("created_at");
+				return Ok(DateTime::from_timestamp_millis(timestamp_millis));
+			}
+		}
+		Ok(None)
+	}
+
+	/// Get database size statistics
+	pub async fn get_size_stats(&self) -> Result<DatabaseStats> {
+		let mut stats = DatabaseStats::default();
+
+		if let Some(pool) = &self.metadata_pool {
+			// Count subjects
+			let subject_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subjects").fetch_one(pool).await?;
+			stats.subject_count = subject_count as usize;
+
+			// Count aspects
+			let aspect_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM aspects").fetch_one(pool).await?;
+			stats.aspect_count = aspect_count as usize;
+		}
+
+		Ok(stats)
+	}
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct DatabaseStats {
+	pub subject_count: usize,
+	pub aspect_count: usize,
+	pub total_measurements: usize,
+	pub disk_size_bytes: u64,
 }

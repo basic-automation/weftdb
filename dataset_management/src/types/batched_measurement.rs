@@ -1,8 +1,8 @@
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
-use database::Point;
+use splimes::Point;
 
-use crate::types::{Analysis, Distance, MeasurementVector};
+use crate::types::{Analysis, Distance, MeasurementVector}; // Added Analysis to the import
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchedMeasurement {
@@ -26,11 +26,11 @@ impl BatchedMeasurement {
 		self.active = true;
 	}
 
-	pub fn is_active(&self) -> bool {
+	pub const fn is_active(&self) -> bool {
 		self.active
 	}
 
-	pub fn point(&self) -> &Point {
+	pub const fn point(&self) -> &Point {
 		&self.point
 	}
 
@@ -38,15 +38,7 @@ impl BatchedMeasurement {
 		self.point = point;
 	}
 
-	pub fn get_measurement_value(&self) -> &BigDecimal {
-		&self.point.value
-	}
-
-	pub fn get_measurement_timestamp(&self) -> &DateTime<Utc> {
-		&self.point.timestamp
-	}
-
-	pub fn distance(&self) -> Option<&Distance> {
+	pub const fn distance(&self) -> Option<&Distance> {
 		self.distance.as_ref()
 	}
 
@@ -54,8 +46,20 @@ impl BatchedMeasurement {
 		self.distance = Some(distance);
 	}
 
-	pub fn vector(&self) -> Option<&MeasurementVector> {
+	pub const fn vector(&self) -> Option<&MeasurementVector> {
 		self.vector.as_ref()
+	}
+
+	pub fn set_vector(&mut self, vector: MeasurementVector) {
+		self.vector = Some(vector);
+	}
+
+	pub fn get_measurement_value(&self) -> &BigDecimal {
+		&self.point.value
+	}
+
+	pub const fn get_measurement_timestamp(&self) -> &DateTime<Utc> {
+		&self.point.timestamp
 	}
 
 	pub fn get_vector_location(&self) -> Option<&BigDecimal> {
@@ -66,11 +70,7 @@ impl BatchedMeasurement {
 		self.vector.as_ref().map(|v| v.amplitude())
 	}
 
-	pub fn set_vector(&mut self, vector: MeasurementVector) {
-		self.vector = Some(vector);
-	}
-
-	pub fn analysis(&self) -> Option<&Analysis> {
+	pub const fn analysis(&self) -> Option<&Analysis> {
 		self.analysis.as_ref()
 	}
 

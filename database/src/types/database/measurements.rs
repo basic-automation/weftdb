@@ -19,10 +19,14 @@ impl Database {
 		let f = DATABASES.lock().await.values().find_map(|db_info| db_info.subjects().values().find_map(|subject_info| subject_info.aspects().get(&aspect.id()).map(|aspect_info| (subject_info.pool(), aspect_info)))).map(|(pool, aspect_info)| (pool.clone(), aspect_info.table_name().to_string()));
 		let Some((pool, table_name)) = f else { bail!(Error::DatabaseError("Aspect not found".to_string())) };
 
+		// Use dedicated write pool for inserts to avoid concurrency issues
+		let connect_options = pool.connect_options().clone();
+		let filename = <sqlx::sqlite::SqliteConnectOptions as Clone>::clone(&connect_options).get_filename();
+		let write_pool = Self::get_or_create_write_pool(&filename.to_string_lossy()).await?;
+
 		// Insert measurement into database
 		let insert_sql = format!("INSERT INTO {table_name} (id, timestamp, value) VALUES (?, ?, ?)");
-
-		match sqlx::query(&insert_sql).bind(tx_id.as_uuid().to_string()).bind(measurement.timestamp().timestamp_millis()).bind(measurement.value().to_string()).execute(&pool).await {
+		match sqlx::query(&insert_sql).bind(tx_id.as_uuid().to_string()).bind(measurement.timestamp().timestamp_millis()).bind(measurement.value().to_string()).execute(&write_pool).await {
 			Ok(_) => (),
 			Err(e) => bail!(Error::DatabaseError(format!("Failed to insert measurement: {e}"))),
 		}
@@ -77,8 +81,13 @@ impl Database {
 		let f = DATABASES.lock().await.values().find_map(|db_info| db_info.subjects().values().find_map(|subject_info| subject_info.aspects().get(&aspect.id()).map(|aspect_info| (subject_info.pool(), aspect_info)))).map(|(pool, aspect_info)| (pool.clone(), aspect_info.table_name().to_string()));
 		let Some((pool, table_name)) = f else { bail!(Error::DatabaseError("Aspect not found".to_string())) };
 
+		// Use dedicated write pool for batch inserts
+		let connect_options = pool.connect_options().clone();
+		let filename = <sqlx::sqlite::SqliteConnectOptions as Clone>::clone(&connect_options).get_filename();
+		let write_pool = Self::get_or_create_write_pool(&filename.to_string_lossy()).await?;
+
 		// Begin transaction
-		let mut tx = pool.begin().await.map_err(|e| Error::DatabaseError(format!("Failed to begin transaction: {e}")))?;
+		let mut tx = write_pool.begin().await.map_err(|e| Error::DatabaseError(format!("Failed to begin transaction: {e}")))?;
 
 		// Optional: Tune for max speed (WARNING: risks data loss on crash)
 		// sqlx::query("PRAGMA synchronous = OFF").execute(&mut *tx).await?;

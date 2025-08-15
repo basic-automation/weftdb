@@ -36,8 +36,15 @@ impl Database {
 
 		let subject_id = SubjectId::new();
 
-		// Insert subject metadata if metadata pool exists - using UUID directly
+		// Insert subject metadata into both tables for compatibility
 		if let Some(ref metadata_pool) = metadata_pool {
+			// Insert into subjects table (normalized schema)
+			match sqlx::query("INSERT INTO subjects (id, name, created_at) VALUES (?, ?, ?)").bind(subject_id.as_uuid()).bind(name).bind(chrono::Utc::now().timestamp_millis()).execute(metadata_pool).await {
+				Ok(_) => (),
+				Err(e) => bail!(Error::DatabaseError(format!("Failed to insert subject: {e}"))),
+			}
+
+			// Insert into subject_metadata table (for backward compatibility)
 			match sqlx::query("INSERT INTO subject_metadata (id, database_id, name, created_at) VALUES (?, ?, ?, ?)").bind(subject_id.as_uuid()).bind(self.id().as_uuid()).bind(name).bind(chrono::Utc::now().timestamp_millis()).execute(metadata_pool).await {
 				Ok(_) => (),
 				Err(e) => bail!(Error::DatabaseError(format!("Failed to insert subject metadata: {e}"))),
@@ -57,8 +64,6 @@ impl Database {
 		Ok(subject)
 	}
 
-	pub async fn get_subject(&self, subject_id: &SubjectId) -> Option<Subject> {
-		let databases = DATABASES.lock().await;
-		databases.get(&self.id()).and_then(|db_info| db_info.subjects().get(subject_id).cloned())
-	}
+	// Removed duplicate get_subject method - it's now in mod.rs as get_subject
+	// The mod.rs version returns Result<Option<Subject>> for proper error handling
 }

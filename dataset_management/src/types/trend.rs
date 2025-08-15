@@ -1,5 +1,5 @@
 use bigdecimal::BigDecimal;
-use database::Measurement;
+use splimes::Point;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Trend {
@@ -20,11 +20,11 @@ impl Trend {
 		&self.slope
 	}
 
-	pub fn set_destination(&mut self, destination: Point) {
-		self.destination = destination;
-	}
-
 	pub fn set_slope(&mut self, slope: BigDecimal) {
 		self.slope = slope;
+	}
+
+	pub fn set_destination(&mut self, destination: Point) {
+		self.destination = destination;
 	}
 }

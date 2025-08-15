@@ -1,9 +1,9 @@
 use std::{hint::black_box, path::Path, str::FromStr};
 
+use ::database::{Database, InputMeasurement};
 use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
 use criterion::{criterion_group, criterion_main, Criterion};
-use database::{Database, InputMeasurement};
 use splimes::{Resolution, Spline};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
@@ -34,7 +34,7 @@ fn benchmark_interpolation_sizes(c: &mut Criterion) {
 
 					// Setup subject and aspect (assuming similar to other benchmarks)
 					let subject = db.track_subject("interp_subject").await.unwrap();
-					let aspect = db.track_aspect(subject, "interp_aspect").await.unwrap();
+					let aspect = db.track_aspect(subject, "interp_aspect", Resolution::Seconds).await.unwrap();
 
 					// Generate and insert test data
 					let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -71,7 +71,7 @@ fn benchmark_interpolation_resolutions(c: &mut Criterion) {
 	let (db, aspect_id) = rt.block_on(async {
 		let db = Database::new(&db_name).await.unwrap();
 		let subject = db.track_subject("interp_subject").await.unwrap();
-		let aspect = db.track_aspect(subject, "interp_aspect").await.unwrap();
+		let aspect = db.track_aspect(subject, "interp_aspect", Resolution::Seconds).await.unwrap();
 
 		// Generate and insert test data (fixed size 1000)
 		let size = 1000;
@@ -122,7 +122,7 @@ fn benchmark_spline_types(c: &mut Criterion) {
 
 		let db = Database::new(db_name).await.unwrap();
 		let subject = db.track_subject("bench_subject").await.unwrap();
-		let aspect = db.track_aspect(subject, "bench_aspect").await.unwrap();
+		let aspect = db.track_aspect(subject, "bench_aspect", Resolution::Seconds).await.unwrap();
 
 		// Add test data once - reduced size
 		let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -143,6 +143,7 @@ fn benchmark_spline_types(c: &mut Criterion) {
 					// Perform interpolation analysis
 					let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 					let end_time = start_time + Duration::minutes(10);
+
 					let result = Database::analyze_range(aspect_id, start_time, end_time, Resolution::Minutes, spline_type).await.unwrap();
 
 					black_box(result)

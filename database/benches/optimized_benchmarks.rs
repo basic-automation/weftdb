@@ -1,9 +1,9 @@
 use std::{hint::black_box, str::FromStr, sync::Arc};
 
+use ::database::*;
 use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use database::*;
+use criterion::{async_executor::FuturesExecutor, criterion_group, criterion_main, BatchSize, Criterion};
 use splimes::{Resolution, Spline};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
@@ -22,17 +22,18 @@ impl BenchmarkContext {
 
 		// Clean up any existing data
 		std::fs::remove_dir_all(&cleanup_path).ok();
+		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
 		let db = Arc::new(Database::new(&db_name).await?);
 		let subject = db.track_subject("bench_subject").await?;
-		let aspect = db.track_aspect(subject, "bench_aspect").await?;
+		let aspect = db.track_aspect(subject, "bench_aspect", Resolution::Seconds).await?;
 
-		// Pre-populate with data
+		// Add test measurements
 		let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-		let measurements: Vec<_> = (0..measurement_count).map(|i| InputMeasurement::new(base_time + Duration::minutes(i as i64), BigDecimal::from_str(&format!("{}.0", i * 10)).unwrap())).collect();
-
-		// Use batch insertion for better performance
-		db.observe_measurements_batch(aspect.clone(), measurements).await?;
+		for i in 0..measurement_count {
+			let measurement = InputMeasurement::new(base_time + Duration::seconds(i as i64 * 60), BigDecimal::from_str(&format!("{}.0", i + 10))?);
+			db.observe_measurement(aspect.clone(), measurement).await?;
+		}
 
 		Ok(Self { db, aspect_id: aspect.id(), _cleanup_path: cleanup_path })
 	}
@@ -52,21 +53,12 @@ fn benchmark_optimized_interpolation(c: &mut Criterion) {
 
 	for (name, size) in contexts {
 		c.bench_function(&format!("optimized_interpolation_{}", name), |b| {
-			b.iter_batched(
-				|| {
-					// Setup phase - create fresh context for each iteration
-					rt.block_on(async { BenchmarkContext::new(name, size).await.unwrap() })
-				},
-				|ctx| {
-					// Benchmark phase
-					rt.block_on(async {
-						let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-						let end_time = start_time + Duration::minutes(10);
-
-						let result = Database::analyze_range(ctx.aspect_id, start_time, end_time, Resolution::Minutes, Spline::Linear).await.unwrap();
-
-						black_box(result)
-					})
+			b.to_async(FuturesExecutor).iter_batched(
+				|| rt.block_on(BenchmarkContext::new(name, size)).unwrap(),
+				|ctx| async move {
+					let analyze_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 30, 0).unwrap();
+					let result = ctx.db.analyze_point(ctx.aspect_id, analyze_time, Resolution::Seconds, Spline::Linear).await.unwrap();
+					black_box(result)
 				},
 				BatchSize::SmallInput,
 			);
@@ -78,22 +70,18 @@ fn benchmark_cache_efficiency(c: &mut Criterion) {
 	let rt = Runtime::new().unwrap();
 
 	c.bench_function("cache_hit_ratio", |b| {
-		let ctx = rt.block_on(async { BenchmarkContext::new("cache_test", 100).await.unwrap() });
-
-		let target_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 5, 0).unwrap();
-
-		// Prime the cache
-		rt.block_on(async {
-			let _ = ctx.db.analyze_point(ctx.aspect_id, target_time, Resolution::Seconds, Spline::Linear).await;
-		});
-
-		b.iter(|| {
-			rt.block_on(async {
-				// This should hit cache consistently
-				let result = ctx.db.analyze_point(ctx.aspect_id, target_time, Resolution::Seconds, Spline::Linear).await.unwrap();
+		b.to_async(FuturesExecutor).iter_batched(
+			|| rt.block_on(BenchmarkContext::new("cache_efficiency", 100)).unwrap(),
+			|ctx| async move {
+				let analyze_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 15, 0).unwrap();
+				// First call to cache the result
+				let _ = ctx.db.analyze_point(ctx.aspect_id, analyze_time, Resolution::Seconds, Spline::Linear).await.unwrap();
+				// Second call should hit cache
+				let result = ctx.db.analyze_point(ctx.aspect_id, analyze_time, Resolution::Seconds, Spline::Linear).await.unwrap();
 				black_box(result)
-			})
-		});
+			},
+			BatchSize::SmallInput,
+		);
 	});
 }
 

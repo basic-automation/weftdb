@@ -1,9 +1,9 @@
 use std::str::FromStr;
 
+use ::database::*;
 use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use database::*;
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use splimes::{Resolution, Spline};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
@@ -18,64 +18,53 @@ fn benchmark_cache_miss_vs_hit(c: &mut Criterion) {
 	// Create a separate database for this benchmark group
 	let db_name = format!("cache_bench_{}", Uuid::new_v4());
 	let (db, aspect_id) = rt.block_on(async {
-		std::fs::remove_dir_all(format!("data/{db_name}")).ok();
-		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
 		let db = Database::new(&db_name).await.unwrap();
 		let subject = db.track_subject("cache_subject").await.unwrap();
-		let aspect = db.track_aspect(subject, "cache_aspect").await.unwrap();
+		let aspect = db.track_aspect(subject, "cache_aspect", Resolution::Seconds).await.unwrap();
 
-		// Add test data
-		let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap();
-		for i in 0..100 {
-			// Further reduced dataset size
-			let measurement = InputMeasurement::new(base_time + Duration::seconds(i * 10), BigDecimal::from_str(&format!("{}.{}", i / 10, i % 10)).unwrap());
+		// Add initial measurements
+		let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
+		for i in 0..50 {
+			let measurement = InputMeasurement::new(base_time + Duration::seconds(i * 60), BigDecimal::from_str(&format!("{}.0", i)).unwrap());
 			db.observe_measurement(aspect.clone(), measurement).await.unwrap();
 		}
-
 		(db, aspect.id())
 	});
 
 	let mut group = c.benchmark_group("cache_performance");
 
-	// Set measurement parameters for consistency
-	group.measurement_time(std::time::Duration::from_secs(5));
-	group.sample_size(20); // Reduced sample size
-
-	// Benchmark cache miss (first call)
+	// Cache miss benchmark
 	group.bench_function("cache_miss", |b| {
-		let mut counter = 0;
 		b.iter(|| {
 			rt.block_on(async {
-				// Use different timestamps to avoid cache hits
-				let target_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap() + Duration::seconds(counter * 13); // Use prime number to avoid patterns
-				counter += 1;
-				let result = db.analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await.unwrap();
+				let unique_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 30, 0).unwrap() + Duration::nanoseconds(chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) % 1000);
+				let result = db.analyze_point(aspect_id, unique_time, Resolution::Seconds, Spline::Linear).await.unwrap();
 				black_box(result)
 			})
-		})
+		});
 	});
 
-	// Benchmark cache hit (repeated calls with same parameters)
-	let fixed_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 5, 0).unwrap();
-
-	// Prime the cache
-	rt.block_on(async {
-		let _ = db.analyze_point(aspect_id, fixed_time, Resolution::Seconds, Spline::Linear).await;
-	});
-
+	// Cache hit benchmark
 	group.bench_function("cache_hit", |b| {
+		let cached_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 15, 0).unwrap();
+		// Prime the cache
+		rt.block_on(async {
+			let _ = db.analyze_point(aspect_id, cached_time, Resolution::Seconds, Spline::Linear).await.unwrap();
+		});
+
 		b.iter(|| {
 			rt.block_on(async {
-				let result = db.analyze_point(aspect_id, fixed_time, Resolution::Seconds, Spline::Linear).await.unwrap();
+				let result = db.analyze_point(aspect_id, cached_time, Resolution::Seconds, Spline::Linear).await.unwrap();
 				black_box(result)
 			})
-		})
+		});
 	});
 
 	group.finish();
 
+	// Cleanup
 	rt.block_on(async {
+		db.close().await.unwrap();
 		std::fs::remove_dir_all(format!("data/{db_name}")).ok();
 	});
 }
@@ -83,128 +72,103 @@ fn benchmark_cache_miss_vs_hit(c: &mut Criterion) {
 fn benchmark_cache_invalidation(c: &mut Criterion) {
 	let rt = Runtime::new().unwrap();
 
-	// Create a single database for this benchmark to avoid file conflicts
-	let db_name = format!("cache_invalidation_{}", Uuid::new_v4());
-	let (db, aspect) = rt.block_on(async {
-		std::fs::remove_dir_all(format!("data/{db_name}")).ok();
-		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-		let db = Database::new(&db_name).await.unwrap();
-		let subject = db.track_subject("invalidation_subject").await.unwrap();
-		let aspect = db.track_aspect(subject, "invalidation_aspect").await.unwrap();
-
-		(db, aspect)
-	});
-
-	c.bench_function("cache_invalidation_overhead", |b| {
-		let mut counter = 0;
+	c.bench_function("cache_invalidation", |b| {
 		b.iter(|| {
 			rt.block_on(async {
-				// Add new measurement (triggers cache invalidation)
-				let measurement = InputMeasurement::new(Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap() + Duration::seconds(counter), BigDecimal::from_str(&format!("{}.0", counter)).unwrap());
-				counter += 1;
+				let db_name = format!("cache_invalidation_{}", Uuid::new_v4());
+				let db = Database::new(&db_name).await.unwrap();
+				let subject = db.track_subject("invalidation_subject").await.unwrap();
+				let aspect = db.track_aspect(subject, "invalidation_aspect", Resolution::Seconds).await.unwrap();
 
-				let tx_id = db.observe_measurement(aspect.clone(), measurement).await.unwrap();
-				black_box(tx_id)
+				// Add some measurements and analyze
+				let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
+				for i in 0..10 {
+					let measurement = InputMeasurement::new(base_time + Duration::seconds(i * 60), BigDecimal::from_str(&format!("{}.0", i)).unwrap());
+					db.observe_measurement(aspect.clone(), measurement).await.unwrap();
+				}
+
+				let analyze_time = base_time + Duration::seconds(300);
+				let result = db.analyze_point(aspect.id(), analyze_time, Resolution::Seconds, Spline::Linear).await.unwrap();
+
+				db.close().await.unwrap();
+				std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+				black_box(result)
 			})
-		})
-	});
-
-	rt.block_on(async {
-		std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+		});
 	});
 }
 
 fn benchmark_concurrent_cache_access(c: &mut Criterion) {
 	let rt = Runtime::new().unwrap();
 
-	// Create a single database for concurrent access testing
-	let db_name = format!("cache_concurrent_{}", Uuid::new_v4());
-	let (db, aspect_id) = rt.block_on(async {
-		std::fs::remove_dir_all(format!("data/{db_name}")).ok();
-		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+	c.bench_function("concurrent_cache_access", |b| {
+		b.iter(|| {
+			rt.block_on(async {
+				let db_name = format!("concurrent_cache_{}", Uuid::new_v4());
+				let db = Database::new(&db_name).await.unwrap();
+				let subject = db.track_subject("concurrent_subject").await.unwrap();
+				let aspect = db.track_aspect(subject, "concurrent_aspect", Resolution::Seconds).await.unwrap();
 
-		let db = Database::new(&db_name).await.unwrap();
-		let subject = db.track_subject("concurrent_subject").await.unwrap();
-		let aspect = db.track_aspect(subject, "concurrent_aspect").await.unwrap();
+				// Add measurements
+				let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
+				for i in 0..20 {
+					let measurement = InputMeasurement::new(base_time + Duration::seconds(i * 30), BigDecimal::from_str(&format!("{}.0", i)).unwrap());
+					db.observe_measurement(aspect.clone(), measurement).await.unwrap();
+				}
 
-		// Add test data
-		let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap();
-		for i in 0..60 {
-			// Reasonable dataset
-			let measurement = InputMeasurement::new(base_time + Duration::minutes(i), BigDecimal::from_str(&format!("{}.0", i)).unwrap());
-			db.observe_measurement(aspect.clone(), measurement).await.unwrap();
-		}
+				// Simulate concurrent access
+				let mut handles = vec![];
+				for i in 0..5 {
+					let db_clone = db.clone();
+					let aspect_id = aspect.id();
+					let analyze_time = base_time + Duration::seconds(i * 60);
+					let handle = tokio::spawn(async move { db_clone.analyze_point(aspect_id, analyze_time, Resolution::Seconds, Spline::Linear).await });
+					handles.push(handle);
+				}
 
-		(db, aspect.id())
-	});
+				let results: Vec<_> = futures::future::join_all(handles).await.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
 
-	let concurrency_levels = vec![1, 2];
-
-	for &concurrency in &concurrency_levels {
-		c.bench_with_input(BenchmarkId::new("concurrent_cache_reads", concurrency), &concurrency, |b, &concurrency| {
-			b.iter(|| {
-				rt.block_on(async {
-					let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap();
-
-					let tasks: Vec<_> = (0..concurrency)
-						.map(|i| {
-							let db_clone = db.clone();
-							let target_time = base_time + Duration::minutes(i * 10);
-							tokio::spawn(async move { db_clone.analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await.unwrap() })
-						})
-						.collect();
-
-					let results = futures::future::join_all(tasks).await;
-					black_box(results.len())
-				})
+				db.close().await.unwrap();
+				std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+				black_box(results)
 			})
 		});
-	}
-
-	rt.block_on(async {
-		std::fs::remove_dir_all(format!("data/{db_name}")).ok();
 	});
 }
 
 fn benchmark_cache_memory_usage(c: &mut Criterion) {
 	let rt = Runtime::new().unwrap();
 
-	let dataset_sizes = vec![50, 100];
+	let memory_sizes = vec![10, 50, 100];
 
-	for &size in &dataset_sizes {
-		c.bench_with_input(BenchmarkId::new("cache_with_dataset_size", size), &size, |b, &size| {
-			// Create a single database for this size
-			let db_name = format!("cache_memory_{}_{}", size, Uuid::new_v4());
-			let (db, aspect_id) = rt.block_on(async {
-				std::fs::remove_dir_all(format!("data/{db_name}")).ok();
-				tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-				let db = Database::new(&db_name).await.unwrap();
-				let subject = db.track_subject("memory_subject").await.unwrap();
-				let aspect = db.track_aspect(subject, "memory_aspect").await.unwrap();
-
-				let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap();
-				for i in 0..size {
-					let measurement = InputMeasurement::new(base_time + Duration::seconds(i * 10), BigDecimal::from_str(&format!("{}.{}", i / 10, i % 10)).unwrap());
-					db.observe_measurement(aspect.clone(), measurement).await.unwrap();
-				}
-
-				(db, aspect.id())
-			});
-
+	for size in memory_sizes {
+		c.bench_function(&format!("cache_memory_{}_measurements", size), |b| {
 			b.iter(|| {
 				rt.block_on(async {
-					// Use a time that's definitely within the dataset bounds
-					let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap();
-					let target_time = base_time + Duration::seconds((size / 2) * 10);
-					let result = db.analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await.unwrap();
-					black_box(result)
-				})
-			});
+					let db_name = format!("memory_cache_{}_{}", size, Uuid::new_v4());
+					let db = Database::new(&db_name).await.unwrap();
+					let subject = db.track_subject("memory_subject").await.unwrap();
+					let aspect = db.track_aspect(subject, "memory_aspect", Resolution::Seconds).await.unwrap();
 
-			rt.block_on(async {
-				std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+					// Add measurements
+					let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
+					for i in 0..size {
+						let measurement = InputMeasurement::new(base_time + Duration::seconds(i as i64 * 60), BigDecimal::from_str(&format!("{}.0", i)).unwrap());
+						db.observe_measurement(aspect.clone(), measurement).await.unwrap();
+					}
+
+					// Perform several analyses to test memory usage
+					let mut results = vec![];
+					for i in 0..10 {
+						let analyze_time = base_time + Duration::seconds(i * 300);
+						let result = db.analyze_point(aspect.id(), analyze_time, Resolution::Seconds, Spline::Linear).await.unwrap();
+						results.push(result);
+					}
+
+					db.close().await.unwrap();
+					std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+					black_box(results)
+				})
 			});
 		});
 	}
@@ -213,44 +177,34 @@ fn benchmark_cache_memory_usage(c: &mut Criterion) {
 fn benchmark_cache_eviction_strategies(c: &mut Criterion) {
 	let rt = Runtime::new().unwrap();
 
-	// Create a single database for eviction testing
-	let db_name = format!("cache_eviction_{}", Uuid::new_v4());
-	let (db, aspect_id) = rt.block_on(async {
-		std::fs::remove_dir_all(format!("data/{db_name}")).ok();
-		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-		let db = Database::new(&db_name).await.unwrap();
-		let subject = db.track_subject("eviction_subject").await.unwrap();
-		let aspect = db.track_aspect(subject, "eviction_aspect").await.unwrap();
-
-		// Add base dataset
-		let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap();
-		for i in 0..100 {
-			let measurement = InputMeasurement::new(base_time + Duration::minutes(i), BigDecimal::from_str(&format!("{}.0", i)).unwrap());
-			db.observe_measurement(aspect.clone(), measurement).await.unwrap();
-		}
-
-		(db, aspect.id())
-	});
-
-	c.bench_function("cache_pressure_simulation", |b| {
+	c.bench_function("cache_eviction", |b| {
 		b.iter(|| {
 			rt.block_on(async {
-				let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap();
+				let db_name = format!("eviction_cache_{}", Uuid::new_v4());
+				let db = Database::new(&db_name).await.unwrap();
+				let subject = db.track_subject("eviction_subject").await.unwrap();
+				let aspect = db.track_aspect(subject, "eviction_aspect", Resolution::Seconds).await.unwrap();
 
-				// Simulate cache pressure by accessing many different time points
-				for i in 0..20 {
-					let target_time = base_time + Duration::minutes(i * 5);
-					let _result = db.analyze_point(aspect_id, target_time, Resolution::Seconds, Spline::Linear).await.unwrap();
+				// Add many measurements to trigger eviction
+				let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
+				for i in 0..200 {
+					let measurement = InputMeasurement::new(base_time + Duration::seconds(i * 30), BigDecimal::from_str(&format!("{}.0", i)).unwrap());
+					db.observe_measurement(aspect.clone(), measurement).await.unwrap();
 				}
 
-				black_box(20)
-			})
-		})
-	});
+				// Perform many different analyses to test eviction
+				let mut results = vec![];
+				for i in 0..50 {
+					let analyze_time = base_time + Duration::seconds(i * 120);
+					let result = db.analyze_point(aspect.id(), analyze_time, Resolution::Seconds, Spline::Linear).await.unwrap();
+					results.push(result);
+				}
 
-	rt.block_on(async {
-		std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+				db.close().await.unwrap();
+				std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+				black_box(results)
+			})
+		});
 	});
 }
 

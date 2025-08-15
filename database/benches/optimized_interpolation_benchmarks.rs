@@ -1,9 +1,9 @@
 use std::{hint::black_box, str::FromStr};
 
+use ::database::*;
 use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
 use criterion::{criterion_group, criterion_main, Criterion};
-use database::*;
 use splimes::{Resolution, Spline};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
@@ -29,7 +29,7 @@ fn benchmark_optimization_strategies(c: &mut Criterion) {
 
 					let db = Database::new(&db_name).await.unwrap();
 					let subject = db.track_subject("opt_subject").await.unwrap();
-					let aspect = db.track_aspect(subject, "opt_aspect").await.unwrap();
+					let aspect = db.track_aspect(subject, "opt_aspect", Resolution::Seconds).await.unwrap();
 
 					// Add test data
 					let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -65,26 +65,23 @@ fn benchmark_optimization_strategies(c: &mut Criterion) {
 fn benchmark_memory_efficiency(c: &mut Criterion) {
 	let rt = Runtime::new().unwrap();
 
-	// Test memory efficiency with different dataset sizes
-	let memory_configs = vec![("small_memory", 100, 5), ("medium_memory", 1000, 30), ("large_memory", 2000, 60)];
+	let memory_configs = vec![("small_efficient", 100, 5), ("medium_efficient", 500, 15), ("large_efficient", 1000, 30)];
 
-	// Create a single shared database for all memory efficiency benchmarks
-	let db_name = format!("bench_mem_shared_{}", Uuid::new_v4());
+	let db_name = format!("bench_mem_{}", Uuid::new_v4());
+	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+
+	// Setup shared database and subject
 	let (db, subject) = rt.block_on(async {
-		// Clean up any existing test data
-		std::fs::remove_dir_all(format!("data/{db_name}")).ok();
-		tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-
 		let db = Database::new(&db_name).await.unwrap();
-		let subject = db.track_subject("mem_shared_subject").await.unwrap();
+		let subject = db.track_subject("mem_subject").await.unwrap();
 		(db, subject)
 	});
 
 	for (name, measurement_count, window_minutes) in memory_configs {
-		c.bench_function(name, |b| {
+		c.bench_function(&format!("memory_efficiency_{}", name), |b| {
 			// Create a unique aspect for each config
 			let aspect_id = rt.block_on(async {
-				let aspect = db.track_aspect(subject.clone(), &format!("mem_aspect_{}", name)).await.unwrap();
+				let aspect = db.track_aspect(subject.clone(), &format!("mem_aspect_{}", name), Resolution::Seconds).await.unwrap();
 
 				// Add test data for this config
 				let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -99,6 +96,7 @@ fn benchmark_memory_efficiency(c: &mut Criterion) {
 			b.iter(|| {
 				rt.block_on(async {
 					// Calculate proper time range
+					let measurement_count = measurement_count;
 					let data_start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 					let data_end = data_start + Duration::minutes(measurement_count as i64 - 1);
 					let data_span_minutes = (data_end - data_start).num_minutes();
@@ -118,6 +116,7 @@ fn benchmark_memory_efficiency(c: &mut Criterion) {
 
 	// Cleanup after all benchmarks
 	rt.block_on(async {
+		db.close().await.unwrap();
 		std::fs::remove_dir_all(format!("data/{db_name}")).ok();
 		tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 	});
