@@ -1,6 +1,8 @@
+use serde::{Deserialize, Serialize};
+
 use crate::types::{Relative, Trend};
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Analysis {
 	trend: Option<Vec<Trend>>,
 	relative: Option<Relative>,
@@ -33,5 +35,13 @@ impl Analysis {
 
 	pub fn set_relative(&mut self, relative: Option<Relative>) {
 		self.relative = relative;
+	}
+
+	pub fn remove_index(&mut self, index: usize) {
+		if let Some(trend) = &mut self.trend {
+			if index < trend.len() {
+				trend.remove(index);
+			}
+		}
 	}
 }

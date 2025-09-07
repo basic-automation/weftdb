@@ -1,16 +1,17 @@
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use splimes::Point;
 
 use crate::types::{Analysis, Distance, MeasurementVector}; // Added Analysis to the import
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchedMeasurement {
-	active: bool,
-	point: Point,
-	distance: Option<Distance>,
-	vector: Option<MeasurementVector>,
-	analysis: Option<Analysis>,
+	pub active: bool,
+	pub point: Point,
+	pub distance: Option<Distance>,
+	pub vector: Option<MeasurementVector>,
+	pub analysis: Option<Analysis>,
 }
 
 impl BatchedMeasurement {
@@ -48,6 +49,10 @@ impl BatchedMeasurement {
 
 	pub const fn vector(&self) -> Option<&MeasurementVector> {
 		self.vector.as_ref()
+	}
+
+	pub fn vector_mut(&mut self) -> Option<&mut MeasurementVector> {
+		self.vector.as_mut()
 	}
 
 	pub fn set_vector(&mut self, vector: MeasurementVector) {

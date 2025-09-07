@@ -1,6 +1,7 @@
 use bigdecimal::BigDecimal;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeasurementVector {
 	location: BigDecimal,
 	amplitude: BigDecimal,

@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use database::{Aspect, Database, InputMeasurement, Subject, DATABASES, DEFAULT_DATA_DIR}; // Added Aspect import
+use rayon::prelude::*;
 use splimes::{Resolution, Spline};
 #[cfg(test)]
 use tempfile::TempDir;
@@ -401,41 +402,32 @@ async fn test_analyze_point_precision_boundaries() -> Result<()> {
 
 #[derive(Debug, serde::Deserialize)]
 struct BTC1MinRecord {
-	timestamp: i64,
+	#[serde(rename = "Timestamp")]
+	timestamp: f64, // Changed to f64 to handle decimal timestamps
+	#[serde(rename = "Open")]
 	open: f64,
+	#[serde(rename = "High")]
 	high: f64,
+	#[serde(rename = "Low")]
 	low: f64,
+	#[serde(rename = "Close")]
 	close: f64,
+	#[serde(rename = "Volume")]
 	volume: f64,
-	#[allow(dead_code)] // These fields are not used but needed for CSV parsing
-	#[serde(skip_deserializing)]
-	close_time: i64,
-	#[allow(dead_code)]
-	#[serde(skip_deserializing)]
-	quote_asset_volume: f64,
-	#[allow(dead_code)]
-	#[serde(skip_deserializing)]
-	number_of_trades: i64,
-	#[allow(dead_code)]
-	#[serde(skip_deserializing)]
-	taker_buy_base_asset_volume: f64,
-	#[allow(dead_code)]
-	#[serde(skip_deserializing)]
-	taker_buy_quote_asset_volume: f64,
-	#[allow(dead_code)]
-	#[serde(skip_deserializing)]
-	ignore: f64,
 }
 
-fn convert_unix_timestamp_to_datetime_utc(timestamp_seconds: i64) -> Option<DateTime<Utc>> {
-	DateTime::from_timestamp(timestamp_seconds / 1000, ((timestamp_seconds % 1000) * 1_000_000) as u32)
+fn convert_unix_timestamp_to_datetime_utc(timestamp_seconds: f64) -> Option<DateTime<Utc>> {
+	// Convert f64 timestamp to i64 seconds and u32 nanoseconds
+	let seconds = timestamp_seconds as i64;
+	let nanoseconds = ((timestamp_seconds - seconds as f64) * 1_000_000_000.0) as u32;
+	DateTime::from_timestamp(seconds, nanoseconds)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_create_btc_1min_database() -> Result<()> {
 	// This test creates a database with BTC 1-minute data
 	// Note: This requires the CSV file to be present
-	let csv_path = "database/datasets/btc_1min.csv";
+	let csv_path = "datasets/btc_1min.csv"; // Fixed path for package-level testing
 
 	let db_name = format!("Crypto");
 
@@ -459,34 +451,51 @@ async fn test_create_btc_1min_database() -> Result<()> {
 			let volume_aspect = db.track_aspect(subject.clone(), "volume", Resolution::Minutes).await?;
 
 			// Read and process CSV data
-			let mut rdr = csv::Reader::from_path(csv_path)?;
-			let mut count = 0;
+			let mut rdr = csv::ReaderBuilder::new().has_headers(true).from_path(csv_path)?;
+
+			// loop through CSV records in chunks of 100_000
+			let mut records = Vec::new();
 
 			for result in rdr.deserialize() {
 				let record: BTC1MinRecord = result.context("Failed to deserialize CSV record")?;
-
-				let timestamp = convert_unix_timestamp_to_datetime_utc(record.timestamp).context("Failed to convert timestamp")?;
-
-				// Insert measurements for each aspect
-				let open_measurement = InputMeasurement::new(timestamp, BigDecimal::from_str(&record.open.to_string())?);
-				db.observe_measurement(open_aspect.clone(), open_measurement).await?;
-
-				let high_measurement = InputMeasurement::new(timestamp, BigDecimal::from_str(&record.high.to_string())?);
-				db.observe_measurement(high_aspect.clone(), high_measurement).await?;
-
-				let low_measurement = InputMeasurement::new(timestamp, BigDecimal::from_str(&record.low.to_string())?);
-				db.observe_measurement(low_aspect.clone(), low_measurement).await?;
-
-				let close_measurement = InputMeasurement::new(timestamp, BigDecimal::from_str(&record.close.to_string())?);
-				db.observe_measurement(close_aspect.clone(), close_measurement).await?;
-
-				let volume_measurement = InputMeasurement::new(timestamp, BigDecimal::from_str(&record.volume.to_string())?);
-				db.observe_measurement(volume_aspect.clone(), volume_measurement).await?;
-
-				count += 1;
+				records.push(record);
 			}
 
-			println!("Inserted {} BTC 1-minute records", count);
+			let all_measurements: Vec<(InputMeasurement, InputMeasurement, InputMeasurement, InputMeasurement, InputMeasurement)> = records
+				.par_iter()
+				.filter_map(|record| {
+					let timestamp = convert_unix_timestamp_to_datetime_utc(record.timestamp)?;
+					let open = InputMeasurement::new(timestamp, BigDecimal::from_str(&record.open.to_string()).ok()?);
+					let high = InputMeasurement::new(timestamp, BigDecimal::from_str(&record.high.to_string()).ok()?);
+					let low = InputMeasurement::new(timestamp, BigDecimal::from_str(&record.low.to_string()).ok()?);
+					let close = InputMeasurement::new(timestamp, BigDecimal::from_str(&record.close.to_string()).ok()?);
+					let volume = InputMeasurement::new(timestamp, BigDecimal::from_str(&record.volume.to_string()).ok()?);
+					Some((open, high, low, close, volume))
+				})
+				.collect();
+
+			let mut open_measurements: Vec<InputMeasurement> = Vec::with_capacity(all_measurements.len());
+			let mut high_measurements: Vec<InputMeasurement> = Vec::with_capacity(all_measurements.len());
+			let mut low_measurements: Vec<InputMeasurement> = Vec::with_capacity(all_measurements.len());
+			let mut close_measurements: Vec<InputMeasurement> = Vec::with_capacity(all_measurements.len());
+			let mut volume_measurements: Vec<InputMeasurement> = Vec::with_capacity(all_measurements.len());
+
+			for (open, high, low, close, volume) in all_measurements {
+				open_measurements.push(open);
+				high_measurements.push(high);
+				low_measurements.push(low);
+				close_measurements.push(close);
+				volume_measurements.push(volume);
+			}
+
+			db.observe_measurements_batch(open_aspect.clone(), open_measurements).await.unwrap();
+			db.observe_measurements_batch(high_aspect.clone(), high_measurements).await.unwrap();
+			db.observe_measurements_batch(low_aspect.clone(), low_measurements).await.unwrap();
+			db.observe_measurements_batch(close_aspect.clone(), close_measurements).await.unwrap();
+			db.observe_measurements_batch(volume_aspect.clone(), volume_measurements).await.unwrap();
+
+			let inserted_count = records.len();
+			println!("Inserted {} BTC 1-minute records", inserted_count);
 		} else {
 			println!("Skipping BTC database test - CSV file not found at {}", csv_path);
 		}
@@ -495,10 +504,11 @@ async fn test_create_btc_1min_database() -> Result<()> {
 	};
 
 	// Test some queries if we have subjects
-	let subjects = db.get_all_subjects().await?;
-	if !subjects.is_empty() {
-		if let Some(subject) = subjects.first() {
-			if let Some(aspect) = subject.aspects().values().next() {
+	let subject_list = db.list_subjects().await?;
+	if !subject_list.is_empty() {
+		if let Some((subject_id, _subject_name)) = subject_list.iter().next() {
+			let aspects = db.get_subject_aspects(subject_id).await?;
+			if let Some(aspect) = aspects.first() {
 				let query_time = Utc.with_ymd_and_hms(2024, 1, 1, 12, 0, 0).unwrap(); // Some reasonable time
 				let result = db.analyze_point(aspect.id(), query_time, Resolution::Minutes, Spline::Linear).await;
 

@@ -1,4 +1,4 @@
- use std::{hint::black_box, str::FromStr};
+use std::{hint::black_box, str::FromStr};
 
 use ::database::*;
 use bigdecimal::BigDecimal;
