@@ -1,6 +1,9 @@
+use std::pin::Pin;
+
 use anyhow::{bail, Result};
-use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
+use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive, Zero};
 use chrono::{DateTime, Utc};
+use futures::Stream;
 use splimes::{Point, Resolution, Spline};
 
 use crate::{types::AnalysisResult, AspectId, Database, CACHE};
@@ -138,15 +141,128 @@ impl Database {
 	/// # Errors
 	/// - if interpolation fails
 	pub async fn analyze_range(aspect: AspectId, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, method: Spline) -> Result<Vec<Point>> {
-		// Get measurements for this aspect
-		let measurements = Self::get_aspect_measurements(aspect).await?;
+		let duration = (end - start).num_seconds() as u64;
+		let resolution_seconds = match resolution {
+			Resolution::Nanoseconds => 0, // Not handling sub-second for simplicity
+			Resolution::Microseconds => 0,
+			Resolution::Milliseconds => 0,
+			Resolution::Seconds => 1,
+			Resolution::Minutes => 60,
+			Resolution::Hours => 3600,
+			Resolution::Days => 86400,
+			Resolution::Weeks => 604800,
+			Resolution::Months => 2_629_800, // Approximate
+			Resolution::Years => 31_557_600, // Approximate
+		};
+		let expected = if resolution_seconds > 0 { duration / resolution_seconds + 1 } else { 0 };
 
-		if measurements.is_empty() {
-			bail!("No measurements found for aspect");
+		if expected > 1_000_000 {
+			let chunk_size = 100_000;
+			let chunk_count = expected.div_ceil(chunk_size) as i64;
+			let chunk_duration = (duration / chunk_count as u64) as i64 * resolution_seconds as i64;
+
+			let overlap = match method {
+				Spline::Linear => 1,
+				Spline::Quadratic => 2,
+				Spline::Cubic => 3,
+				Spline::Polynomial(d, _) => d as u64,
+			};
+			let overlap_duration = chrono::Duration::seconds(overlap as i64 * resolution_seconds as i64);
+
+			let mut all_points = Vec::with_capacity(expected as usize);
+			let mut current = start;
+
+			while current < end {
+				let chunk_end = current + chrono::Duration::seconds(chunk_duration);
+				let fetch_start = (current - overlap_duration).max(start);
+				let fetch_end = (chunk_end + overlap_duration).min(end);
+
+				let chunk_measurements = Self::get_aspect_measurements_range(aspect, fetch_start, fetch_end).await?;
+				let mut chunk_points = Self::measurements_to_points(&chunk_measurements);
+				let interpolated = splimes::auto_interpolate(&mut chunk_points, current, chunk_end.min(end), resolution, method).await?;
+
+				all_points.extend(interpolated);
+
+				current = chunk_end;
+			}
+			Ok(all_points)
+		} else {
+			let measurements = Self::get_aspect_measurements_range(aspect, start, end).await?;
+
+			if measurements.is_empty() {
+				bail!("No measurements found for aspect");
+			}
+
+			splimes::auto_interpolate(&mut Self::measurements_to_points(&measurements), start, end, resolution, method).await
 		}
+	}
 
-		// Use the GPU-aware auto_interpolate function
-		splimes::auto_interpolate(&mut Self::measurements_to_points(&measurements), start, end, resolution, method).await
+	/// Interpolates/extrapolates the `DataPoint`[] for a given time range, resolution, & spline type.
+	/// Uses intelligent measurement collection and caching with GPU acceleration when beneficial.
+	///
+	/// # Errors
+	/// - if interpolation fails
+	pub fn stream_analyze_range(&self, aspect: AspectId, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, method: Spline) -> Pin<Box<dyn Stream<Item = Result<Point>> + Send + 'static>> {
+		let duration = (end - start).num_seconds() as u64;
+		let resolution_seconds = match resolution {
+			Resolution::Nanoseconds => 0,
+			Resolution::Microseconds => 0,
+			Resolution::Milliseconds => 0,
+			Resolution::Seconds => 1,
+			Resolution::Minutes => 60,
+			Resolution::Hours => 3600,
+			Resolution::Days => 86400,
+			Resolution::Weeks => 604800,
+			Resolution::Months => 2_629_800,
+			Resolution::Years => 31_557_600,
+		};
+		let expected = if resolution_seconds > 0 { duration / resolution_seconds + 1 } else { 0 };
+
+		let chunk_size = 100_000;
+		let chunk_count = if expected > 0 { expected.div_ceil(chunk_size) as i64 } else { 1 };
+
+		let chunk_duration = (duration / chunk_count as u64) as i64 * resolution_seconds as i64;
+
+		let overlap = match method {
+			Spline::Linear => 1,
+			Spline::Quadratic => 2,
+			Spline::Cubic => 3,
+			Spline::Polynomial(d, _) => d as u64,
+		};
+		let overlap_duration = chrono::Duration::seconds(overlap as i64 * resolution_seconds as i64);
+
+		Box::pin(futures::stream::unfold((start, false), move |(mut current, done)| {
+			let aspect = aspect;
+			let end = end;
+			let resolution = resolution;
+			let method = method;
+			let overlap_duration = overlap_duration;
+			let chunk_duration = chunk_duration;
+
+			async move {
+				if current >= end || done {
+					return None;
+				}
+
+				let chunk_end = (current + chrono::Duration::seconds(chunk_duration)).min(end);
+				let fetch_start = (current - overlap_duration).max(start);
+				let fetch_end = (chunk_end + overlap_duration).min(end);
+
+				match Self::get_aspect_measurements_range(aspect, fetch_start, fetch_end).await {
+					Ok(chunk_measurements) => {
+						let mut chunk_points = Self::measurements_to_points(&chunk_measurements);
+						match splimes::auto_interpolate(&mut chunk_points, current, chunk_end, resolution, method).await {
+							Ok(interpolated) => {
+								current = chunk_end;
+								Some((Ok(interpolated.into_iter().next().unwrap_or(Point::new(Utc::now(), BigDecimal::zero()))), (current, current >= end)))
+							}
+							Err(e) => Some((Err(e), (current, true))),
+						}
+					}
+					Err(e) => Some((Err(e), (current, true))),
+				}
+			}
+		}))
 	}
 }
 

@@ -39,7 +39,7 @@ impl Database {
 		let db_info = self.get_database_info().await.ok_or_else(|| Error::DatabaseError("Database not found".to_string()))?;
 		let metadata_pool = db_info.metadata_pool().cloned().ok_or_else(|| Error::DatabaseError("Metadata pool not found".to_string()))?;
 
-		let row = sqlx::query("SELECT earliest_measurement, latest_measurement FROM aspect_metadata WHERE id = ?").bind(aspect.id().as_uuid()).fetch_optional(&metadata_pool).await.map_err(|e| Error::DatabaseError(format!("Failed to query aspect metadata: {e}")))?;
+		let row = sqlx::query("SELECT earliest_measurement, latest_measurement FROM aspects WHERE id = ?").bind(aspect.id().as_uuid()).fetch_optional(&metadata_pool).await.map_err(|e| Error::DatabaseError(format!("Failed to query aspect metadata: {e}")))?;
 
 		let (earliest, latest) = match row {
 			Some(r) => (r.get::<Option<i64>, _>("earliest_measurement").and_then(DateTime::from_timestamp_millis), r.get::<Option<i64>, _>("latest_measurement").and_then(DateTime::from_timestamp_millis)),
@@ -50,7 +50,7 @@ impl Database {
 		let new_earliest = earliest.map_or(Some(new_time), |curr| Some(curr.min(new_time)));
 		let new_latest = latest.map_or(Some(new_time), |curr| Some(curr.max(new_time)));
 
-		sqlx::query("UPDATE aspect_metadata SET earliest_measurement = ?, latest_measurement = ? WHERE id = ?").bind(new_earliest.map(|dt| dt.timestamp_millis())).bind(new_latest.map(|dt| dt.timestamp_millis())).bind(aspect.id().as_uuid()).execute(&metadata_pool).await.map_err(|e| Error::DatabaseError(format!("Failed to update aspect metadata: {e}")))?;
+		sqlx::query("UPDATE aspects SET earliest_measurement = ?, latest_measurement = ? WHERE id = ?").bind(new_earliest.map(|dt| dt.timestamp_millis())).bind(new_latest.map(|dt| dt.timestamp_millis())).bind(aspect.id().as_uuid()).execute(&metadata_pool).await.map_err(|e| Error::DatabaseError(format!("Failed to update aspect metadata: {e}")))?;
 
 		Ok(tx_id)
 	}
@@ -124,7 +124,7 @@ impl Database {
 		let db_info = self.get_database_info().await.ok_or_else(|| Error::DatabaseError("Database not found".to_string()))?;
 		let metadata_pool = db_info.metadata_pool().cloned().ok_or_else(|| Error::DatabaseError("Metadata pool not found".to_string()))?;
 
-		let row = sqlx::query("SELECT earliest_measurement, latest_measurement FROM aspect_metadata WHERE id = ?").bind(aspect.id().as_uuid()).fetch_optional(&metadata_pool).await.map_err(|e| Error::DatabaseError(format!("Failed to query aspect metadata: {e}")))?;
+		let row = sqlx::query("SELECT earliest_measurement, latest_measurement FROM aspects WHERE id = ?").bind(aspect.id().as_uuid()).fetch_optional(&metadata_pool).await.map_err(|e| Error::DatabaseError(format!("Failed to query aspect metadata: {e}")))?;
 
 		let (earliest, latest) = match row {
 			Some(r) => (r.get::<Option<i64>, _>("earliest_measurement").and_then(DateTime::from_timestamp_millis), r.get::<Option<i64>, _>("latest_measurement").and_then(DateTime::from_timestamp_millis)),
@@ -134,7 +134,7 @@ impl Database {
 		let new_earliest = earliest.map_or(Some(min_new), |curr| Some(curr.min(min_new)));
 		let new_latest = latest.map_or(Some(max_new), |curr| Some(curr.max(max_new)));
 
-		sqlx::query("UPDATE aspect_metadata SET earliest_measurement = ?, latest_measurement = ? WHERE id = ?").bind(new_earliest.map(|dt| dt.timestamp_millis())).bind(new_latest.map(|dt| dt.timestamp_millis())).bind(aspect.id().as_uuid()).execute(&metadata_pool).await.map_err(|e| Error::DatabaseError(format!("Failed to update aspect metadata: {e}")))?;
+		sqlx::query("UPDATE aspects SET earliest_measurement = ?, latest_measurement = ? WHERE id = ?").bind(new_earliest.map(|dt| dt.timestamp_millis())).bind(new_latest.map(|dt| dt.timestamp_millis())).bind(aspect.id().as_uuid()).execute(&metadata_pool).await.map_err(|e| Error::DatabaseError(format!("Failed to update aspect metadata: {e}")))?;
 
 		Ok(all_tx_ids)
 	}

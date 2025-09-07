@@ -1,7 +1,8 @@
 use bigdecimal::BigDecimal;
+use serde::{Deserialize, Serialize};
 use splimes::Point;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Trend {
 	destination: Point,
 	slope: BigDecimal,

@@ -36,19 +36,13 @@ impl Database {
 
 		let subject_id = SubjectId::new();
 
-		// Insert subject metadata into both tables for compatibility
+		// Insert into merged subjects table
 		if let Some(ref metadata_pool) = metadata_pool {
-			// Insert into subjects table (normalized schema)
-			match sqlx::query("INSERT INTO subjects (id, name, created_at) VALUES (?, ?, ?)").bind(subject_id.as_uuid()).bind(name).bind(chrono::Utc::now().timestamp_millis()).execute(metadata_pool).await {
+			match sqlx::query("INSERT INTO subjects (id, database_id, name, created_at) VALUES (?, ?, ?, ?)").bind(subject_id.as_uuid()).bind(self.id().as_uuid()).bind(name).bind(chrono::Utc::now().timestamp_millis()).execute(metadata_pool).await {
 				Ok(_) => (),
 				Err(e) => bail!(Error::DatabaseError(format!("Failed to insert subject: {e}"))),
 			}
-
-			// Insert into subject_metadata table (for backward compatibility)
-			match sqlx::query("INSERT INTO subject_metadata (id, database_id, name, created_at) VALUES (?, ?, ?, ?)").bind(subject_id.as_uuid()).bind(self.id().as_uuid()).bind(name).bind(chrono::Utc::now().timestamp_millis()).execute(metadata_pool).await {
-				Ok(_) => (),
-				Err(e) => bail!(Error::DatabaseError(format!("Failed to insert subject metadata: {e}"))),
-			}
+			// Removed insert into subject_metadata
 		}
 
 		let subject = Subject::new_with_id(subject_id, name.to_string(), self.id(), pool);

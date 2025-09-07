@@ -1,5 +1,8 @@
+use std::{collections::HashMap, sync::Mutex};
+
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
+use once_cell::sync::Lazy;
 use splimes::Resolution;
 use sqlx::Row;
 
@@ -37,8 +40,8 @@ impl Database {
 			Err(e) => bail!(Error::DatabaseError(format!("Failed to create index for aspect table: {e}"))),
 		}
 
-		// Insert aspect metadata - using UUID directly
-		match sqlx::query("INSERT INTO aspect_metadata (id, subject_id, database_id, name, table_name, resolution, created_at, earliest_measurement, latest_measurement) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)").bind(aspect_id.as_uuid()).bind(subject.id().as_uuid()).bind(db_id.as_uuid()).bind(name).bind(&table_name).bind(format!("{resolution:?}")).bind(chrono::Utc::now().timestamp_millis()).execute(&metadata_pool).await {
+		// Insert aspect metadata into merged aspects table
+		match sqlx::query("INSERT INTO aspects (id, subject_id, database_id, name, table_name, resolution, created_at, earliest_measurement, latest_measurement) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)").bind(aspect_id.as_uuid()).bind(subject.id().as_uuid()).bind(db_id.as_uuid()).bind(name).bind(&table_name).bind(format!("{resolution:?}")).bind(chrono::Utc::now().timestamp_millis()).execute(&metadata_pool).await {
 			Ok(_) => (),
 			Err(e) => bail!(Error::DatabaseError(format!("Failed to insert aspect metadata: {e}"))),
 		}
@@ -77,12 +80,24 @@ impl Database {
 	/// - if metadata pool not found
 	/// - if unable to query aspect metadata
 	pub async fn get_earliest_measurement(&self, aspect_id: &AspectId) -> Result<Option<DateTime<Utc>>> {
+		static CACHE: Lazy<Mutex<HashMap<AspectId, Option<DateTime<Utc>>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+		{
+			let guard = CACHE.lock().unwrap();
+			if let Some(cached) = guard.get(aspect_id) {
+				return Ok(*cached);
+			}
+		}
 		let db_info = self.get_database_info().await.ok_or_else(|| Error::DatabaseError("Database not found".to_string()))?;
 		let metadata_pool = db_info.metadata_pool().cloned().ok_or_else(|| Error::DatabaseError("Metadata pool not found".to_string()))?;
 
-		let row = sqlx::query("SELECT earliest_measurement FROM aspect_metadata WHERE id = ?").bind(aspect_id.as_uuid()).fetch_optional(&metadata_pool).await.map_err(|e| Error::DatabaseError(format!("Failed to query earliest measurement: {e}")))?;
+		let row = sqlx::query("SELECT earliest_measurement FROM aspects WHERE id = ?").bind(aspect_id.as_uuid()).fetch_optional(&metadata_pool).await.map_err(|e| Error::DatabaseError(format!("Failed to query earliest measurement: {e}")))?;
 
-		Ok(row.and_then(|r| r.get::<Option<i64>, _>("earliest_measurement").and_then(DateTime::from_timestamp_millis)))
+		let result = row.and_then(|r| r.get::<Option<i64>, _>("earliest_measurement").and_then(DateTime::from_timestamp_millis));
+		{
+			let mut guard = CACHE.lock().unwrap();
+			guard.insert(*aspect_id, result);
+		}
+		Ok(result)
 	}
 
 	/// Get the latest measurement timestamp for an aspect
@@ -92,12 +107,24 @@ impl Database {
 	/// - if metadata pool not found
 	/// - if unable to query aspect metadata
 	pub async fn get_latest_measurement(&self, aspect_id: &AspectId) -> Result<Option<DateTime<Utc>>> {
+		static CACHE: Lazy<Mutex<HashMap<AspectId, Option<DateTime<Utc>>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+		{
+			let guard = CACHE.lock().unwrap();
+			if let Some(cached) = guard.get(aspect_id) {
+				return Ok(*cached);
+			}
+		}
 		let db_info = self.get_database_info().await.ok_or_else(|| Error::DatabaseError("Database not found".to_string()))?;
 		let metadata_pool = db_info.metadata_pool().cloned().ok_or_else(|| Error::DatabaseError("Metadata pool not found".to_string()))?;
 
-		let row = sqlx::query("SELECT latest_measurement FROM aspect_metadata WHERE id = ?").bind(aspect_id.as_uuid()).fetch_optional(&metadata_pool).await.map_err(|e| Error::DatabaseError(format!("Failed to query latest measurement: {e}")))?;
+		let row = sqlx::query("SELECT latest_measurement FROM aspects WHERE id = ?").bind(aspect_id.as_uuid()).fetch_optional(&metadata_pool).await.map_err(|e| Error::DatabaseError(format!("Failed to query latest measurement: {e}")))?;
 
-		Ok(row.and_then(|r| r.get::<Option<i64>, _>("latest_measurement").and_then(DateTime::from_timestamp_millis)))
+		let result = row.and_then(|r| r.get::<Option<i64>, _>("latest_measurement").and_then(DateTime::from_timestamp_millis));
+		{
+			let mut guard = CACHE.lock().unwrap();
+			guard.insert(*aspect_id, result);
+		}
+		Ok(result)
 	}
 
 	/// Get the resolution for an aspect
@@ -108,12 +135,19 @@ impl Database {
 	/// - if unable to query aspect metadata
 	/// - if unable to parse resolution
 	pub async fn get_aspect_resolution(&self, aspect_id: &AspectId) -> Result<Option<Resolution>> {
+		static CACHE: Lazy<Mutex<HashMap<AspectId, Option<Resolution>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+		{
+			let guard = CACHE.lock().unwrap();
+			if let Some(cached) = guard.get(aspect_id) {
+				return Ok(*cached);
+			}
+		}
 		let db_info = self.get_database_info().await.ok_or_else(|| Error::DatabaseError("Database not found".to_string()))?;
 		let metadata_pool = db_info.metadata_pool().cloned().ok_or_else(|| Error::DatabaseError("Metadata pool not found".to_string()))?;
 
-		let row = sqlx::query("SELECT resolution FROM aspect_metadata WHERE id = ?").bind(aspect_id.as_uuid()).fetch_optional(&metadata_pool).await.map_err(|e| Error::DatabaseError(format!("Failed to query resolution: {e}")))?;
+		let row = sqlx::query("SELECT resolution FROM aspects WHERE id = ?").bind(aspect_id.as_uuid()).fetch_optional(&metadata_pool).await.map_err(|e| Error::DatabaseError(format!("Failed to query resolution: {e}")))?;
 
-		match row {
+		let result = match row {
 			Some(r) => {
 				if let Some(res_str) = r.get::<Option<String>, _>("resolution") {
 					let resolution = match res_str.as_str() {
@@ -129,12 +163,17 @@ impl Database {
 						"Years" => Resolution::Years,
 						_ => bail!(Error::DatabaseError(format!("Invalid resolution value: {res_str}"))),
 					};
-					Ok(Some(resolution))
+					Some(resolution)
 				} else {
-					Ok(None)
+					None
 				}
 			}
-			None => Ok(None),
+			None => None,
+		};
+		{
+			let mut guard = CACHE.lock().unwrap();
+			guard.insert(*aspect_id, result);
 		}
+		Ok(result)
 	}
 }

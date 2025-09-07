@@ -1,8 +1,9 @@
 use bigdecimal::BigDecimal;
+use serde::{Deserialize, Serialize};
 
 use crate::types::MeasurementVector;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Relative {
 	vector: MeasurementVector,
 	max_x: BigDecimal,

@@ -242,7 +242,7 @@ pub use splimes::{Point, Resolution, Spline};
 pub use types::*;
 
 // Default data directory - can be overridden with environment variable
-pub const DEFAULT_DATA_DIR: &str = "data";
+pub const DEFAULT_DATA_DIR: &str = "C:\\Users\\physi\\Desktop\\dsp_data";
 
 // Version information
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

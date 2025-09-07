@@ -74,80 +74,52 @@ impl Database {
 		// Create database metadata table - using BLOB for UUID storage
 		sqlx::query(
 			r#"
-            CREATE TABLE IF NOT EXISTS database_metadata (
-                id BLOB PRIMARY KEY,
-                name TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            )
-            "#,
+			CREATE TABLE IF NOT EXISTS database_metadata (
+				id BLOB PRIMARY KEY,
+				name TEXT NOT NULL,
+				created_at INTEGER NOT NULL
+			)
+			"#,
 		)
 		.execute(pool)
 		.await?;
 
-		// Create subjects table
+		// Create subjects table (merged with subject_metadata)
 		sqlx::query(
 			r#"
-            CREATE TABLE IF NOT EXISTS subjects (
-                id BLOB PRIMARY KEY,
-                name TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            )
-            "#,
+			CREATE TABLE IF NOT EXISTS subjects (
+				id BLOB PRIMARY KEY,
+				database_id BLOB NOT NULL,
+				name TEXT NOT NULL,
+				created_at INTEGER NOT NULL
+			)
+			"#,
 		)
 		.execute(pool)
 		.await?;
 
-		// Create subject_metadata table for track_subject compatibility
+		// Removed subject_metadata table
+
+		// Create aspects table (merged with aspect_metadata)
 		sqlx::query(
 			r#"
-            CREATE TABLE IF NOT EXISTS subject_metadata (
-                id BLOB PRIMARY KEY,
-                database_id BLOB NOT NULL,
-                name TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                FOREIGN KEY (database_id) REFERENCES database_metadata(id)
-            )
-            "#,
+			CREATE TABLE IF NOT EXISTS aspects (
+				id BLOB PRIMARY KEY,
+				subject_id BLOB NOT NULL,
+				database_id BLOB NOT NULL,
+				name TEXT NOT NULL,
+				table_name TEXT NOT NULL,
+				resolution TEXT NOT NULL,
+				created_at INTEGER NOT NULL,
+				earliest_measurement INTEGER,
+				latest_measurement INTEGER
+			)
+			"#,
 		)
 		.execute(pool)
 		.await?;
 
-		// Create aspects table
-		sqlx::query(
-			r#"
-            CREATE TABLE IF NOT EXISTS aspects (
-                id BLOB PRIMARY KEY,
-                subject_id BLOB NOT NULL,
-                name TEXT NOT NULL,
-                resolution TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                FOREIGN KEY (subject_id) REFERENCES subjects(id)
-            )
-            "#,
-		)
-		.execute(pool)
-		.await?;
-
-		// Create aspect metadata table for tracking earliest/latest measurements
-		sqlx::query(
-			r#"
-            CREATE TABLE IF NOT EXISTS aspect_metadata (
-                id BLOB PRIMARY KEY,
-                subject_id BLOB NOT NULL,
-                database_id BLOB NOT NULL,
-                name TEXT NOT NULL,
-                table_name TEXT NOT NULL,
-                resolution TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                earliest_measurement INTEGER,
-                latest_measurement INTEGER,
-                FOREIGN KEY (subject_id) REFERENCES subjects(id),
-                FOREIGN KEY (database_id) REFERENCES database_metadata(id)
-            )
-            "#,
-		)
-		.execute(pool)
-		.await?;
+		// Removed aspect_metadata table
 
 		Ok(())
 	}
@@ -179,10 +151,10 @@ impl Database {
 		let db_id_bytes: Vec<u8> = row.get("id");
 		let db_id = DatabaseId::from_uuid(Uuid::from_slice(&db_id_bytes)?);
 
-		// Load subjects manually instead of using query_as
-		let subject_rows = sqlx::query("SELECT id, name, created_at FROM subjects").fetch_all(&metadata_pool).await?;
+		// Load subjects with database_id
+		let subject_rows = sqlx::query("SELECT id, database_id, name, created_at FROM subjects").fetch_all(&metadata_pool).await?;
 
-		let mut db_info = DatabaseInfo::new(name.to_string(), db_path);
+		let mut db_info = DatabaseInfo::new(name.to_string(), db_path.clone());
 		db_info.set_id(db_id);
 		db_info.set_metadata_pool(Some(metadata_pool.clone()));
 
@@ -191,8 +163,43 @@ impl Database {
 			let subject_id_bytes: Vec<u8> = row.get("id");
 			let subject_id = SubjectId::from_uuid(Uuid::from_slice(&subject_id_bytes)?);
 			let subject_name: String = row.get("name");
+			// database_id is now in subjects table, but since we're loading per database, we can ignore it or verify
 
-			let subject = Subject::new_with_id(subject_id, subject_name, db_id, metadata_pool.clone());
+			// Connect to the subject's individual database file
+			let subject_db_path = format!("{}/{}.db", db_path, subject_name);
+			let subject_pool = Self::get_or_create_pool(&subject_db_path).await?;
+
+			let mut subject = Subject::new_with_id(subject_id, subject_name, db_id, subject_pool);
+
+			// Load aspects for this subject
+			let aspect_rows = sqlx::query("SELECT id, name, table_name, resolution FROM aspects WHERE subject_id = ?").bind(subject_id.as_uuid()).fetch_all(&metadata_pool).await?;
+
+			for aspect_row in aspect_rows {
+				let aspect_id_bytes: Vec<u8> = aspect_row.get("id");
+				let aspect_id = crate::AspectId::from_uuid(Uuid::from_slice(&aspect_id_bytes)?);
+				let aspect_name: String = aspect_row.get("name");
+				let table_name: String = aspect_row.get("table_name");
+				let resolution_str: String = aspect_row.get("resolution");
+
+				// Parse resolution
+				use splimes::Resolution;
+				let resolution = match resolution_str.as_str() {
+					"Nanoseconds" => Resolution::Nanoseconds,
+					"Microseconds" => Resolution::Microseconds,
+					"Milliseconds" => Resolution::Milliseconds,
+					"Seconds" => Resolution::Seconds,
+					"Minutes" => Resolution::Minutes,
+					"Hours" => Resolution::Hours,
+					"Days" => Resolution::Days,
+					"Weeks" => Resolution::Weeks,
+					"Months" => Resolution::Months,
+					"Years" => Resolution::Years,
+					_ => bail!("Invalid resolution value: {}", resolution_str),
+				};
+
+				let aspect = crate::Aspect::new_with_id(aspect_id, aspect_name, subject_id, table_name, resolution);
+				subject.add_aspect(aspect);
+			}
 
 			db_info.add_subject(subject);
 		}

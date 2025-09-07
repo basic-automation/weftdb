@@ -24,6 +24,7 @@ fastrand = { workspace = true }
 futures = { workspace = true }
 splimes = { workspace = true }
 csv = { workspace = true }
+once_cell = "1.19"
 
 [dev-dependencies]
 criterion = { workspace = true , features = ["html_reports"] }
