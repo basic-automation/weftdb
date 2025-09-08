@@ -141,25 +141,20 @@ impl Database {
 	/// # Errors
 	/// - if interpolation fails
 	pub async fn analyze_range(aspect: AspectId, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, method: Spline) -> Result<Vec<Point>> {
-		let duration = (end - start).num_seconds() as u64;
-		let resolution_seconds = match resolution {
-			Resolution::Nanoseconds => 0, // Not handling sub-second for simplicity
-			Resolution::Microseconds => 0,
-			Resolution::Milliseconds => 0,
-			Resolution::Seconds => 1,
-			Resolution::Minutes => 60,
-			Resolution::Hours => 3600,
-			Resolution::Days => 86400,
-			Resolution::Weeks => 604800,
-			Resolution::Months => 2_629_800, // Approximate
-			Resolution::Years => 31_557_600, // Approximate
-		};
-		let expected = if resolution_seconds > 0 { duration / resolution_seconds + 1 } else { 0 };
+		// Calculate total duration and step in nanoseconds for precision
+		let total_duration = end - start;
+		let step_duration = resolution.to_step();
+
+		// Calculate expected number of points
+		let total_ns = total_duration.num_nanoseconds().unwrap_or(i64::MAX);
+		let step_ns = step_duration.num_nanoseconds().unwrap_or(1);
+		let expected = if step_ns > 0 { (total_ns / step_ns) + 1 } else { 1 };
 
 		if expected > 1_000_000 {
 			let chunk_size = 100_000;
-			let chunk_count = expected.div_ceil(chunk_size) as i64;
-			let chunk_duration = (duration / chunk_count as u64) as i64 * resolution_seconds as i64;
+			let chunk_count = (expected + chunk_size as i64 - 1) / chunk_size as i64;
+			let chunk_duration_ns = total_ns / chunk_count;
+			let chunk_duration = chrono::Duration::nanoseconds(chunk_duration_ns);
 
 			let overlap = match method {
 				Spline::Linear => 1,
@@ -167,13 +162,13 @@ impl Database {
 				Spline::Cubic => 3,
 				Spline::Polynomial(d, _) => d as u64,
 			};
-			let overlap_duration = chrono::Duration::seconds(overlap as i64 * resolution_seconds as i64);
+			let overlap_duration = chrono::Duration::nanoseconds(overlap as i64 * step_ns);
 
 			let mut all_points = Vec::with_capacity(expected as usize);
 			let mut current = start;
 
 			while current < end {
-				let chunk_end = current + chrono::Duration::seconds(chunk_duration);
+				let chunk_end = current + chunk_duration;
 				let fetch_start = (current - overlap_duration).max(start);
 				let fetch_end = (chunk_end + overlap_duration).min(end);
 
@@ -203,25 +198,18 @@ impl Database {
 	/// # Errors
 	/// - if interpolation fails
 	pub fn stream_analyze_range(&self, aspect: AspectId, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, method: Spline) -> Pin<Box<dyn Stream<Item = Result<Point>> + Send + 'static>> {
-		let duration = (end - start).num_seconds() as u64;
-		let resolution_seconds = match resolution {
-			Resolution::Nanoseconds => 0,
-			Resolution::Microseconds => 0,
-			Resolution::Milliseconds => 0,
-			Resolution::Seconds => 1,
-			Resolution::Minutes => 60,
-			Resolution::Hours => 3600,
-			Resolution::Days => 86400,
-			Resolution::Weeks => 604800,
-			Resolution::Months => 2_629_800,
-			Resolution::Years => 31_557_600,
-		};
-		let expected = if resolution_seconds > 0 { duration / resolution_seconds + 1 } else { 0 };
+		let total_duration = end - start;
+		let step_duration = resolution.to_step();
+
+		// Calculate expected number of points
+		let total_ns = total_duration.num_nanoseconds().unwrap_or(i64::MAX);
+		let step_ns = step_duration.num_nanoseconds().unwrap_or(1);
+		let expected = if step_ns > 0 { (total_ns / step_ns) + 1 } else { 1 };
 
 		let chunk_size = 100_000;
-		let chunk_count = if expected > 0 { expected.div_ceil(chunk_size) as i64 } else { 1 };
-
-		let chunk_duration = (duration / chunk_count as u64) as i64 * resolution_seconds as i64;
+		let chunk_count = if expected > 0 { (expected + chunk_size as i64 - 1) / chunk_size as i64 } else { 1 };
+		let chunk_duration_ns = total_ns / chunk_count;
+		let chunk_duration = chrono::Duration::nanoseconds(chunk_duration_ns);
 
 		let overlap = match method {
 			Spline::Linear => 1,
@@ -229,9 +217,9 @@ impl Database {
 			Spline::Cubic => 3,
 			Spline::Polynomial(d, _) => d as u64,
 		};
-		let overlap_duration = chrono::Duration::seconds(overlap as i64 * resolution_seconds as i64);
+		let overlap_duration = chrono::Duration::nanoseconds(overlap as i64 * step_ns);
 
-		Box::pin(futures::stream::unfold((start, false), move |(mut current, done)| {
+		Box::pin(futures::stream::unfold((start, Vec::<Point>::new().into_iter(), false), move |(mut current, mut point_iter, done)| {
 			let aspect = aspect;
 			let end = end;
 			let resolution = resolution;
@@ -240,11 +228,18 @@ impl Database {
 			let chunk_duration = chunk_duration;
 
 			async move {
+				// Return next point from current chunk if available
+				if let Some(point) = point_iter.next() {
+					return Some((Ok(point), (current, point_iter, done)));
+				}
+
+				// If we're done or current is past end, return None
 				if current >= end || done {
 					return None;
 				}
 
-				let chunk_end = (current + chrono::Duration::seconds(chunk_duration)).min(end);
+				// Process next chunk
+				let chunk_end = (current + chunk_duration).min(end);
 				let fetch_start = (current - overlap_duration).max(start);
 				let fetch_end = (chunk_end + overlap_duration).min(end);
 
@@ -254,12 +249,19 @@ impl Database {
 						match splimes::auto_interpolate(&mut chunk_points, current, chunk_end, resolution, method).await {
 							Ok(interpolated) => {
 								current = chunk_end;
-								Some((Ok(interpolated.into_iter().next().unwrap_or(Point::new(Utc::now(), BigDecimal::zero()))), (current, current >= end)))
+								let mut new_iter = interpolated.into_iter();
+								// Return first point and set up iterator for the rest
+								if let Some(first_point) = new_iter.next() {
+									Some((Ok(first_point), (current, new_iter, current >= end)))
+								} else {
+									// If no points, continue to next chunk
+									Some((Ok(Point::new(current, BigDecimal::zero())), (current, Vec::<Point>::new().into_iter(), current >= end)))
+								}
 							}
-							Err(e) => Some((Err(e), (current, true))),
+							Err(e) => Some((Err(e), (current, Vec::<Point>::new().into_iter(), true))),
 						}
 					}
-					Err(e) => Some((Err(e), (current, true))),
+					Err(e) => Some((Err(e), (current, Vec::<Point>::new().into_iter(), true))),
 				}
 			}
 		}))
@@ -268,9 +270,9 @@ impl Database {
 
 // Helper functions
 fn interpolate_linear(p1: &Point, p2: &Point, time: DateTime<Utc>) -> BigDecimal {
-	let t1 = p1.timestamp.timestamp() as f64;
-	let t2 = p2.timestamp.timestamp() as f64;
-	let t = time.timestamp() as f64;
+	let t1 = p1.timestamp.timestamp_nanos_opt().unwrap_or(p1.timestamp.timestamp() * 1_000_000_000) as f64;
+	let t2 = p2.timestamp.timestamp_nanos_opt().unwrap_or(p2.timestamp.timestamp() * 1_000_000_000) as f64;
+	let t = time.timestamp_nanos_opt().unwrap_or(time.timestamp() * 1_000_000_000) as f64;
 
 	let v1 = p1.value.to_f64().unwrap();
 	let v2 = p2.value.to_f64().unwrap();
@@ -286,10 +288,10 @@ fn extrapolate_linear(p1: &Point, p2: &Point, time: DateTime<Utc>) -> BigDecimal
 
 fn quadratic_interpolate(p1: &Point, p2: &Point, p3: &Point, time: DateTime<Utc>) -> BigDecimal {
 	// Lagrange interpolation for three points
-	let t1 = p1.timestamp.timestamp() as f64;
-	let t2 = p2.timestamp.timestamp() as f64;
-	let t3 = p3.timestamp.timestamp() as f64;
-	let t = time.timestamp() as f64;
+	let t1 = p1.timestamp.timestamp_nanos_opt().unwrap_or(p1.timestamp.timestamp() * 1_000_000_000) as f64;
+	let t2 = p2.timestamp.timestamp_nanos_opt().unwrap_or(p2.timestamp.timestamp() * 1_000_000_000) as f64;
+	let t3 = p3.timestamp.timestamp_nanos_opt().unwrap_or(p3.timestamp.timestamp() * 1_000_000_000) as f64;
+	let t = time.timestamp_nanos_opt().unwrap_or(time.timestamp() * 1_000_000_000) as f64;
 
 	let v1 = p1.value.to_f64().unwrap();
 	let v2 = p2.value.to_f64().unwrap();
@@ -304,11 +306,11 @@ fn quadratic_interpolate(p1: &Point, p2: &Point, p3: &Point, time: DateTime<Utc>
 
 fn cubic_interpolate(p0: &Point, p1: &Point, p2: &Point, p3: &Point, time: DateTime<Utc>) -> BigDecimal {
 	// Lagrange interpolation for four points
-	let t0 = p0.timestamp.timestamp() as f64;
-	let t1 = p1.timestamp.timestamp() as f64;
-	let t2 = p2.timestamp.timestamp() as f64;
-	let t3 = p3.timestamp.timestamp() as f64;
-	let t = time.timestamp() as f64;
+	let t0 = p0.timestamp.timestamp_nanos_opt().unwrap_or(p0.timestamp.timestamp() * 1_000_000_000) as f64;
+	let t1 = p1.timestamp.timestamp_nanos_opt().unwrap_or(p1.timestamp.timestamp() * 1_000_000_000) as f64;
+	let t2 = p2.timestamp.timestamp_nanos_opt().unwrap_or(p2.timestamp.timestamp() * 1_000_000_000) as f64;
+	let t3 = p3.timestamp.timestamp_nanos_opt().unwrap_or(p3.timestamp.timestamp() * 1_000_000_000) as f64;
+	let t = time.timestamp_nanos_opt().unwrap_or(time.timestamp() * 1_000_000_000) as f64;
 
 	let v0 = p0.value.to_f64().unwrap();
 	let v1 = p1.value.to_f64().unwrap();
