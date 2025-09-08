@@ -1,9 +1,12 @@
+use std::fmt::Display;
+
+use serde::{Deserialize, Serialize};
 use splimes::Resolution;
 use uuid::Uuid;
 
 use crate::SubjectId;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AspectId(Uuid);
 
 impl AspectId {
@@ -29,7 +32,13 @@ impl Default for AspectId {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+impl Display for AspectId {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}", self.0)
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Aspect {
 	id: AspectId,
 	name: String,

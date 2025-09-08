@@ -1,0 +1,43 @@
+thread 'rustc' panicked at /rustc-dev/898aff704d6f0d00343f21d31b8b9bfac8e43007\compiler\rustc_query_system\src\dep_graph\serialized.rs:284:21:
+Error: A dep graph node (mir_drops_elaborated_and_const_checked) does not have an unique index. Running a clean build on a nightly compiler with `-Z incremental-verify-ich` can help narrow down the issue for reporting. A clean build may also work around the issue.
+
+                     DepNode: DepKind { variant: 57 }(cfd3e28fc0dbaba8-9a549982ee752acc)
+stack backtrace:
+   0:     0x7ffb5151dd4e - std::backtrace_rs::backtrace::win64::trace
+                               at /rustc/898aff704d6f0d00343f21d31b8b9bfac8e43007/library\std\src\..\..\backtrace\src\backtrace\win64.rs:85
+   1:     0x7ffb5151dd4e - std::backtrace_rs::backtrace::trace_unsynchronized
+                               at /rustc/898aff704d6f0d00343f21d31b8b9bfac8e43007/library\std\src\..\..\backtrace\src\backtrace\mod.rs:66
+   2:     0x7ffb5151dd4e - std::backtrace::Backtrace::create
+                               at /rustc/898aff704d6f0d00343f21d31b8b9bfac8e43007/library\std\src\backtrace.rs:331
+   3:     0x7ffb5151d3ea - std::backtrace::Backtrace::force_capture
+                               at /rustc/898aff704d6f0d00343f21d31b8b9bfac8e43007/library\std\src\backtrace.rs:312
+   4:     0x7ffb52d28e51 - RINvNtNtNtNtCsgsuKgYIGQz7_4core5slice4sort6stable9quicksort9quicksortTReINtNtCsdPckm9D9vF1_5alloc3vec3VecNtCsjNcqNvpwjAI_15rustc_lint_defs6LintIdEENCINvMNtB1d_5sliceSB15_11sort_by_keyB16_NCNvNvCsbt7Q1eOZtqc_17rustc_driver_impl14describe_lints16sort_lint_gr
+   5:     0x7ffb51519904 - std::panicking::panic_with_hook
+                               at /rustc/898aff704d6f0d00343f21d31b8b9bfac8e43007/library\std\src\panicking.rs:842
+   6:     0x7ffb5152c8b9 - std::panicking::panic_handler::closure$0
+                               at /rustc/898aff704d6f0d00343f21d31b8b9bfac8e43007/library\std\src\panicking.rs:707
+   7:     0x7ffb5152c80f - std::sys::backtrace::__rust_end_short_backtrace<std::panicking::panic_handler::closure_env$0,never$>
+                               at /rustc/898aff704d6f0d00343f21d31b8b9bfac8e43007/library\std\src\sys\backtrace.rs:174
+   8:     0x7ffb5151aebe - std::panicking::panic_handler
+                               at /rustc/898aff704d6f0d00343f21d31b8b9bfac8e43007/library\std\src\panicking.rs:698
+   9:     0x7ffb547d04c1 - core::panicking::panic_fmt
+                               at /rustc/898aff704d6f0d00343f21d31b8b9bfac8e43007/library\core\src\panicking.rs:75
+  10:     0x7ffb52838c76 - rustc_incremental[fdd8a4acbacfc5d3]::persist::load::setup_dep_graph
+  11:     0x7ffb4d8f0848 - rustc_driver_impl[85987b9b12e4c786]::install_ctrlc_handler
+  12:     0x7ffb52d128d7 - <rustc_hashes[80f6f0f429465aaf]::Hash64 as core[bfb71c3f0a1b5043]::fmt::Debug>::fmt
+  13:     0x7ffb547a0f11 - <rustc_thread_pool[79f222f1062ef554]::registry::WorkerThread>::wait_or_steal_until_cold
+  14:     0x7ffb547a203c - <rustc_thread_pool[79f222f1062ef554]::registry::ThreadBuilder>::run
+  15:     0x7ffb52d21b0e - RINvNtNtCshooXnHSXppm_3std3sys9backtrace28___rust_begin_short_backtraceNCNCNCINvMs1_Csat77zVOr2Rc_17rustc_thread_poolNtB1k_17ThreadPoolBuilder12build_scopedNCNCNCINvNtCshJGeuOGWOV3_15rustc_interface4util31run_in_thread_pool_with_globalsNCINvNtB2F_9interfac
+  16:     0x7ffb52d183c8 - <rustc_hashes[80f6f0f429465aaf]::Hash64 as core[bfb71c3f0a1b5043]::fmt::Debug>::fmt
+  17:     0x7ffb51527dad - alloc::boxed::impl$28::call_once
+                               at /rustc/898aff704d6f0d00343f21d31b8b9bfac8e43007/library\alloc\src\boxed.rs:1971
+  18:     0x7ffb51527dad - alloc::boxed::impl$28::call_once
+                               at /rustc/898aff704d6f0d00343f21d31b8b9bfac8e43007/library\alloc\src\boxed.rs:1971
+  19:     0x7ffb51527dad - std::sys::pal::windows::thread::impl$0::new::thread_start
+                               at /rustc/898aff704d6f0d00343f21d31b8b9bfac8e43007/library\std\src\sys\pal\windows\thread.rs:60
+  20:     0x7ffc4b5ee8d7 - BaseThreadInitThunk
+  21:     0x7ffc4d2e8d9c - RtlUserThreadStart
+
+
+rustc version: 1.91.0-nightly (898aff704 2025-08-14)
+platform: x86_64-pc-windows-msvc

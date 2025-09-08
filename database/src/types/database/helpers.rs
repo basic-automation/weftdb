@@ -23,7 +23,7 @@ impl Database {
 
 		// Get from database with proper scope management - extract immediately
 		let v = DATABASES.lock().await.clone();
-		let p = v.values().find_map(|db_info| db_info.subjects().values().find_map(|subject_info| subject_info.aspects().get(&aspect).map(|aspect_info| (subject_info.pool(), aspect_info)))).map(|(pool, aspect_info)| (pool.clone(), aspect_info.table_name().to_string(), aspect.as_uuid()));
+		let p = v.values().find_map(|db_info| db_info.subjects().values().find_map(|subject_info| subject_info.aspects().get(&aspect).and_then(|aspect_info| subject_info.pool().map(|pool| (pool.clone(), aspect_info.table_name().to_string(), aspect.as_uuid())))));
 		let Some((pool, table_name, dataset_id)) = p else { bail!(Error::DatabaseError("Aspect not found".to_string())) };
 
 		let query_sql = format!("SELECT id, timestamp, value FROM {table_name} ORDER BY timestamp");
@@ -65,7 +65,7 @@ impl Database {
 	async fn get_aspect_measurements_range_limited(aspect: AspectId, start: DateTime<Utc>, end: DateTime<Utc>, limit: Option<usize>) -> Result<Vec<Measurement>> {
 		// No cache for ranged queries to avoid complexity
 		let v = DATABASES.lock().await.clone();
-		let p = v.values().find_map(|db_info| db_info.subjects().values().find_map(|subject_info| subject_info.aspects().get(&aspect).map(|aspect_info| (subject_info.pool(), aspect_info)))).map(|(pool, aspect_info)| (pool.clone(), aspect_info.table_name().to_string(), aspect.as_uuid()));
+		let p = v.values().find_map(|db_info| db_info.subjects().values().find_map(|subject_info| subject_info.aspects().get(&aspect).and_then(|aspect_info| subject_info.pool().map(|pool| (pool.clone(), aspect_info.table_name().to_string(), aspect.as_uuid())))));
 		let Some((pool, table_name, dataset_id)) = p else { bail!(Error::DatabaseError("Aspect not found".to_string())) };
 
 		let query_sql = if limit.is_some() { format!("SELECT id, timestamp, value FROM {table_name} WHERE timestamp BETWEEN ? AND ? ORDER BY timestamp LIMIT ?") } else { format!("SELECT id, timestamp, value FROM {table_name} WHERE timestamp BETWEEN ? AND ? ORDER BY timestamp") };

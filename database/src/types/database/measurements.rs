@@ -16,7 +16,7 @@ impl Database {
 		let tx_id = TxId::new();
 
 		// Get pool and table name with proper scope management - extract immediately
-		let f = DATABASES.lock().await.values().find_map(|db_info| db_info.subjects().values().find_map(|subject_info| subject_info.aspects().get(&aspect.id()).map(|aspect_info| (subject_info.pool(), aspect_info)))).map(|(pool, aspect_info)| (pool.clone(), aspect_info.table_name().to_string()));
+		let f = DATABASES.lock().await.values().find_map(|db_info| db_info.subjects().values().find_map(|subject_info| subject_info.aspects().get(&aspect.id()).and_then(|aspect_info| subject_info.pool().map(|pool| (pool.clone(), aspect_info.table_name().to_string())))));
 		let Some((pool, table_name)) = f else { bail!(Error::DatabaseError("Aspect not found".to_string())) };
 
 		// Use dedicated write pool for inserts to avoid concurrency issues
@@ -78,7 +78,7 @@ impl Database {
 		let max_new = measurements.iter().map(InputMeasurement::timestamp).max().unwrap();
 
 		// Get pool and table name
-		let f = DATABASES.lock().await.values().find_map(|db_info| db_info.subjects().values().find_map(|subject_info| subject_info.aspects().get(&aspect.id()).map(|aspect_info| (subject_info.pool(), aspect_info)))).map(|(pool, aspect_info)| (pool.clone(), aspect_info.table_name().to_string()));
+		let f = DATABASES.lock().await.values().find_map(|db_info| db_info.subjects().values().find_map(|subject_info| subject_info.aspects().get(&aspect.id()).and_then(|aspect_info| subject_info.pool().map(|pool| (pool.clone(), aspect_info.table_name().to_string())))));
 		let Some((pool, table_name)) = f else { bail!(Error::DatabaseError("Aspect not found".to_string())) };
 
 		// Use dedicated write pool for batch inserts

@@ -1,11 +1,12 @@
 use std::{collections::HashMap, hash::Hash};
 
+use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 use uuid::Uuid;
 
 use crate::{Aspect, AspectId, DatabaseId};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SubjectId(Uuid);
 
 impl SubjectId {
@@ -31,12 +32,13 @@ impl Default for SubjectId {
 	}
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Subject {
 	id: SubjectId,
 	database_id: DatabaseId,
 	name: String,
-	pool: Pool<Sqlite>,
+	#[serde(skip)]
+	pool: Option<Pool<Sqlite>>,
 	aspects: HashMap<AspectId, Aspect>,
 }
 
@@ -48,24 +50,25 @@ impl Hash for Subject {
 	}
 }
 
-impl Eq for Subject {}
-
 impl PartialEq for Subject {
 	fn eq(&self, other: &Self) -> bool {
-		self.id == other.id && self.database_id == other.database_id && self.name == other.name
+		self.id == other.id && self.database_id == other.database_id && self.name == other.name && self.aspects == other.aspects
+		// Skip pool comparison since it doesn't implement PartialEq
 	}
 }
+
+impl Eq for Subject {}
 
 impl Subject {
 	#[must_use]
 	pub fn new(name: String, database_id: DatabaseId, pool: Pool<Sqlite>) -> Self {
 		let id = SubjectId::new();
-		Self { id, name, pool, database_id, aspects: HashMap::new() }
+		Self { id, name, pool: Some(pool), database_id, aspects: HashMap::new() }
 	}
 
 	#[must_use]
 	pub fn new_with_id(id: SubjectId, name: String, database_id: DatabaseId, pool: Pool<Sqlite>) -> Self {
-		Self { id, name, pool, database_id, aspects: HashMap::new() }
+		Self { id, name, pool: Some(pool), database_id, aspects: HashMap::new() }
 	}
 
 	#[must_use]
@@ -84,8 +87,8 @@ impl Subject {
 	}
 
 	#[must_use]
-	pub const fn pool(&self) -> &Pool<Sqlite> {
-		&self.pool
+	pub const fn pool(&self) -> Option<&Pool<Sqlite>> {
+		self.pool.as_ref()
 	}
 
 	#[must_use]

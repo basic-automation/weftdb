@@ -750,6 +750,7 @@ dependencies = [
  "chrono",
  "database",
  "futures",
+ "indexmap",
  "num_cpus",
  "rand",
  "rayon",
@@ -1532,12 +1533,14 @@ dependencies = [
 
 [[package]]
 name = "indexmap"
-version = "2.9.0"
+version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cea70ddb795996207ad57735b50c5982d8844f38ba9ee5f1aedcfb708a2aa11e"
+checksum = "f2481980430f9f78649238835720ddccc57e52df14ffce1c6f37391d61b563e9"
 dependencies = [
  "equivalent",
  "hashbrown 0.15.4",
+ "rayon",
+ "serde",
 ]
 
 [[package]]

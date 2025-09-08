@@ -2,6 +2,7 @@ use anyhow::{bail, Result};
 pub use batch::Batch;
 use database::{AspectId, Database};
 use futures::stream::StreamExt;
+use num_cpus::get as get_num_cpus;
 use rayon::{prelude::*, ThreadPoolBuilder};
 use serde::{Deserialize, Serialize};
 use splimes::{Point, Resolution, Spline};
@@ -62,13 +63,15 @@ impl Batches {
 			return Ok(Batches(Vec::new()));
 		}
 
-		ThreadPoolBuilder::new().num_threads(num_cpus::get()).build_global().unwrap();
+		ThreadPoolBuilder::new().num_threads(get_num_cpus()).build_global().unwrap();
+
+		let database_info = database.get_database_info().await.expect("Database info should be available");
 
 		let batches = points
 			.par_windows(batch_size)
 			.map(|window| {
 				let measurements = window.iter().map(|p| BatchedMeasurement::new(p.clone())).collect();
-				Batch::new(window.len(), measurements, *resolution)
+				Batch::new(window.len(), measurements, *resolution, *aspect, database_info.clone())
 			})
 			.collect();
 
@@ -97,11 +100,13 @@ impl Batches {
 			return Ok(Batches(Vec::new()));
 		}
 
+		let database_info = database.get_database_info().await.expect("Database info should be available");
+
 		let batches = points
 			.windows(batch_size)
 			.map(|window| {
 				let measurements = window.iter().map(|p| BatchedMeasurement::new(p.clone())).collect();
-				Batch::new(window.len(), measurements, *resolution)
+				Batch::new(window.len(), measurements, *resolution, *aspect, database_info.clone())
 			})
 			.collect();
 

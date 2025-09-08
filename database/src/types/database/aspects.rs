@@ -24,7 +24,7 @@ impl Database {
 		let db_id = self.id();
 		let db_info = self.get_database_info().await.ok_or_else(|| Error::DatabaseError("Database not found".to_string()))?;
 		let metadata_pool = db_info.metadata_pool().cloned().ok_or_else(|| Error::DatabaseError("Metadata pool not found".to_string()))?;
-		let pool = subject.pool();
+		let pool = subject.pool().ok_or_else(|| Error::DatabaseError("Subject pool not found".to_string()))?;
 
 		// Create the aspect table
 		let create_table_sql = format!("CREATE TABLE IF NOT EXISTS {table_name} (id TEXT PRIMARY KEY, timestamp INTEGER NOT NULL, value TEXT NOT NULL)");

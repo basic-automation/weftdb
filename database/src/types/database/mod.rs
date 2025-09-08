@@ -4,6 +4,7 @@ use std::{
 
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Row, Sqlite, SqlitePool};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -343,7 +344,7 @@ impl Database {
 	}
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DatabaseId(Uuid);
 
 impl DatabaseId {
@@ -369,12 +370,13 @@ impl Default for DatabaseId {
 	}
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatabaseInfo {
 	id: DatabaseId,
 	name: String,
 	path: String,
 	subjects: HashMap<SubjectId, Subject>,
+	#[serde(skip)]
 	metadata_pool: Option<Pool<Sqlite>>,
 }
 
@@ -470,6 +472,15 @@ impl DatabaseInfo {
 		Ok(stats)
 	}
 }
+
+impl PartialEq for DatabaseInfo {
+	fn eq(&self, other: &Self) -> bool {
+		self.id == other.id && self.name == other.name && self.path == other.path && self.subjects == other.subjects
+		// Skip metadata_pool comparison since it doesn't implement PartialEq
+	}
+}
+
+impl Eq for DatabaseInfo {}
 
 #[derive(Debug, Default, Clone)]
 pub struct DatabaseStats {

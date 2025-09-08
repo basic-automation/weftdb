@@ -1,27 +1,36 @@
 use anyhow::{bail, Result};
 use bigdecimal::{BigDecimal, FromPrimitive, Zero};
+use database::{AspectId, DatabaseInfo};
 use serde::{Deserialize, Serialize};
 use splimes::Resolution;
 
 use crate::types::{Analysis, BatchedMeasurement, Distance, MeasurementVector, Relative, Trend};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Batch {
-	pub size: usize,
-	pub measurements: Vec<BatchedMeasurement>,
+pub struct BatchMetatdata {
+	pub aspect: AspectId,
 	pub resolution: Resolution,
+	pub size: usize,
+	pub database_info: DatabaseInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Batch {
+	pub metadata: BatchMetatdata,
+	pub measurements: Vec<BatchedMeasurement>,
 }
 
 impl Batch {
-	pub fn new(size: usize, measurements: Vec<BatchedMeasurement>, resolution: Resolution) -> Self {
-		let mut batch = Self { size, measurements, resolution };
+	pub fn new(size: usize, measurements: Vec<BatchedMeasurement>, resolution: Resolution, aspect: AspectId, database_info: DatabaseInfo) -> Self {
+		let metadata = BatchMetatdata { resolution, size, aspect, database_info };
+		let mut batch = Self { metadata, measurements };
 		batch.initialize_measurement_vectors().expect("Failed to initialize measurement vectors");
 		batch.initialize_distances().expect("Failed to initialize distances");
 		batch
 	}
 
 	pub fn size(&self) -> usize {
-		self.size
+		self.metadata.size
 	}
 
 	pub fn measurements(&self) -> &Vec<BatchedMeasurement> {
@@ -181,7 +190,6 @@ impl Batch {
 		Ok(())
 	}
 
-        #[allow(dead_code)]
 	fn trend_analysis(&mut self) -> Result<()> {
 		if self.measurements.is_empty() {
 			bail!("Batch is empty, cannot build trends");
@@ -196,7 +204,7 @@ impl Batch {
 				let destination_value = destination_measurment.get_measurement_value().clone();
 				let measurement_timestamp = *measurement.get_measurement_timestamp(); // Fixed: removed .clone()
 				let destination_timestamp = *destination_measurment.get_measurement_timestamp(); // Fixed: removed .clone()
-				let destination_measurement_timestamp_difference = match self.resolution {
+				let destination_measurement_timestamp_difference = match self.metadata.resolution {
 					Resolution::Nanoseconds => (destination_timestamp - measurement_timestamp).num_nanoseconds().map(|n| n as f64).unwrap_or(0.0),
 					Resolution::Microseconds => (destination_timestamp - measurement_timestamp).num_microseconds().map(|n| n as f64).unwrap_or(0.0),
 					Resolution::Milliseconds => (destination_timestamp - measurement_timestamp).num_milliseconds() as f64,
@@ -214,7 +222,7 @@ impl Batch {
 					None => bail!("Failed to convert destination measurement difference to BigDecimal"),
 				};
 
-				let measurement_destination_timestamp_difference = match self.resolution {
+				let measurement_destination_timestamp_difference = match self.metadata.resolution {
 					Resolution::Nanoseconds => (measurement_timestamp - destination_timestamp).num_nanoseconds().map(|n| n as f64).unwrap_or(0.0),
 					Resolution::Microseconds => (measurement_timestamp - destination_timestamp).num_microseconds().map(|n| n as f64).unwrap_or(0.0),
 					Resolution::Milliseconds => (measurement_timestamp - destination_timestamp).num_milliseconds() as f64,
@@ -384,7 +392,7 @@ impl Batch {
 		self.level_transform()?;
 		self.transpose_origin()?;
 		self.simplify_transformation()?;
-		//self.trend_analysis()?;
+		self.trend_analysis()?;
 		Ok(())
 	}
 }
