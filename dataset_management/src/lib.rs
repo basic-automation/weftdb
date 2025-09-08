@@ -55,7 +55,7 @@ pub async fn build_unprocessed_queue(database: &Database, aspect: &AspectId, res
 	Ok(())
 }
 
-pub async fn build_processed_queue() -> Result<()> {
+pub async fn build_processed_batch_queue() -> Result<()> {
 	// print UNPROCESSED_BATCHES_QUEUE length for verification
 	let unprocessed_lock = UNPROCESSED_BATCHES_QUEUE.lock().await;
 	println!("UNPROCESSED_BATCHES_QUEUE length: {}", unprocessed_lock.len());
@@ -109,7 +109,7 @@ mod tests {
 		let timer = std::time::Instant::now();
 		println!("Starting build_processed_queue...");
 
-		build_processed_queue().await?;
+		build_processed_batch_queue().await?;
 
 		println!("Time taken for build_processed_queue: {:?}", timer.elapsed());
 
