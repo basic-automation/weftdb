@@ -14,6 +14,7 @@ pub const BATCH_SIZE: [usize; 1] = [100];
 
 static UNPROCESSED_BATCHES_QUEUE: LazyLock<Mutex<Vec<Batch>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 static PROCESSED_BATCHES_QUEUE: LazyLock<Mutex<Vec<Batch>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+static PATTERNS_QUEUE: LazyLock<Mutex<Vec<Pattern>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 pub async fn build_unprocessed_queue(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, batch_size: usize) -> Result<()> {
 	let start_time = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
@@ -74,6 +75,38 @@ pub async fn build_processed_batch_queue() -> Result<()> {
 	Ok(())
 }
 
+pub async fn build_patterns_queue() -> Result<()> {
+	let processed_lock = PROCESSED_BATCHES_QUEUE.lock().await;
+	let mut patterns_lock = PATTERNS_QUEUE.lock().await;
+
+	for batch in processed_lock.iter() {
+		// Generate a new pattern ID for this batch
+		let pattern_id = PatternID::new();
+
+		// Get the first and last timestamps from active measurements
+		let active_measurements: Vec<_> = batch.measurements().iter().filter(|m| m.is_active()).collect();
+
+		if active_measurements.is_empty() {
+			continue; // Skip batches with no active measurements
+		}
+
+		let beginning = active_measurements.iter().map(|m| m.get_measurement_timestamp()).min().cloned().unwrap();
+
+		let end = active_measurements.iter().map(|m| m.get_measurement_timestamp()).max().cloned().unwrap();
+
+		// Create an occurrence for this pattern
+		let occurrence = Occurrence::new(batch.metadata.aspect, batch.metadata.resolution, batch.metadata.size, batch.metadata.database_info.clone(), pattern_id, beginning, end);
+
+		// Extract relatives from active measurements that have analysis
+		let relatives: Vec<Relative> = active_measurements.iter().filter_map(|measurement| measurement.analysis()?.relative().map(|r| r.clone())).collect();
+
+		// Create the pattern
+		let pattern = Pattern::new(pattern_id, vec![occurrence], relatives);
+		patterns_lock.push(pattern);
+	}
+
+	Ok(())
+}
 #[cfg(test)]
 mod tests {
 	use bigdecimal::{BigDecimal, FromPrimitive};
@@ -85,7 +118,7 @@ mod tests {
 	use super::*;
 
 	#[tokio::test(flavor = "multi_thread")]
-	async fn test_build_processed_queue() -> Result<()> {
+	async fn test_build_patterns_queue() -> Result<()> {
 		let database = Database::existing("Crypto").await?;
 		let subjects = database.list_subjects().await?;
 		let subject_id = subjects.iter().find(|(_, name)| name.as_str() == "BTCUSD").map(|(id, _)| *id).ok_or_else(|| anyhow::anyhow!("Subject 'BTCUSD' not found"))?;
@@ -116,12 +149,33 @@ mod tests {
 		let processed_lock = PROCESSED_BATCHES_QUEUE.lock().await;
 
 		// print random batch from processed queue for verification
+                let mut random_index = 0;
 		let length = processed_lock.len();
 		if length > 0 {
-			let random_index = rand::random::<usize>() % length;
+			random_index = rand::random::<usize>() % length;
 			println!("Random processed batch: {}", json!(&processed_lock[random_index]));
-			output_denk_format(&processed_lock[random_index]);
+			output_denk_format_batch(&processed_lock[random_index]);
 		}
+
+		drop(processed_lock);
+
+                let timer = std::time::Instant::now();
+                println!("Starting build_patterns_queue...");
+
+		build_patterns_queue().await?;
+
+                println!("Time taken for build_patterns_queue: {:?}", timer.elapsed());
+
+		let patterns_lock = PATTERNS_QUEUE.lock().await;
+
+		// print random pattern from patterns queue for verification
+		let length = patterns_lock.len();
+		if length > 0 {
+			println!("Random pattern: {}", json!(&patterns_lock[random_index]));
+                        output_denk_format_pattern(&patterns_lock[random_index]);
+		}
+
+		drop(patterns_lock);
 
 		Ok(())
 	}
@@ -132,7 +186,7 @@ mod tests {
 
 		println!("Generated test batch with {} measurements", test_batch.measurements.len());
 
-		output_denk_format(&test_batch);
+		output_denk_format_batch(&test_batch);
 
 		Ok(())
 	}
@@ -145,7 +199,7 @@ mod tests {
 		Batch::new(measurements.len(), measurements, Resolution::Seconds, dummy_aspect, dummy_database_info)
 	}
 
-	fn output_denk_format(batch: &Batch) {
+	fn output_denk_format_batch(batch: &Batch) {
 		println!("----- DENK FORMAT OUTPUT BEGIN -----");
 		let mut count = 0;
 		for measurement in batch.clone().into_iter() {
@@ -158,4 +212,14 @@ mod tests {
 		}
 		println!("----- DENK FORMAT OUTPUT END -----");
 	}
+
+        fn output_denk_format_pattern(pattern: &Pattern) {
+                println!("----- DENK FORMAT OUTPUT BEGIN -----");
+                println!("Pattern ID: {}", pattern.id());
+                for relative in pattern.relatives() {
+                        println!("{} {}", relative.vector().location(), relative.vector().amplitude().round(2));
+                }
+                println!("----- DENK FORMAT OUTPUT END -----");
+                println!("max_x: {}, max_y: {}", pattern.relatives().iter().map(|r| r.vector().location()).max().unwrap_or(&BigDecimal::from(0)), pattern.relatives().iter().map(|r| r.vector().amplitude()).max().unwrap_or(&BigDecimal::from(0)));
+        }
 }

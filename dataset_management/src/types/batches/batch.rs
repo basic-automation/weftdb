@@ -317,23 +317,29 @@ impl Batch {
 			bail!("Batch is empty, cannot perform relative analysis");
 		}
 
-		let max_x = self
-			.measurements
-			.iter()
-			.map(|m| m.get_vector_location()) // Fixed: removed .clone()
-			.max()
-			.ok_or_else(|| anyhow::anyhow!("No measurements found in the batch"))?
-			.ok_or_else(|| anyhow::anyhow!("Failed to get max x value"))?
-			.clone();
+		// Get all locations and amplitudes
+		let locations: Vec<BigDecimal> = self.measurements.iter().filter_map(|m| m.get_vector_location().cloned()).collect();
 
-		let max_y = self
-			.measurements
-			.iter()
-			.map(|m| m.get_vector_amplitude()) // Fixed: removed .clone()
-			.max()
-			.ok_or_else(|| anyhow::anyhow!("No measurements found in the batch"))?
-			.ok_or_else(|| anyhow::anyhow!("Failed to get max y value"))?
-			.clone();
+		let amplitudes: Vec<BigDecimal> = self.measurements.iter().filter_map(|m| m.get_vector_amplitude().cloned()).collect();
+
+		if locations.is_empty() || amplitudes.is_empty() {
+			bail!("No valid locations or amplitudes found in measurements");
+		}
+
+		// Calculate max_x as the difference between highest and lowest location values
+		let min_location = locations.iter().min().ok_or_else(|| anyhow::anyhow!("Failed to find min location"))?.clone();
+		let max_location = locations.iter().max().ok_or_else(|| anyhow::anyhow!("Failed to find max location"))?.clone();
+		let max_x = max_location - min_location;
+
+		// Calculate max_y as the difference between highest and lowest amplitude values
+		let min_amplitude = amplitudes.iter().min().ok_or_else(|| anyhow::anyhow!("Failed to find min amplitude"))?.clone();
+		let max_amplitude = amplitudes.iter().max().ok_or_else(|| anyhow::anyhow!("Failed to find max amplitude"))?.clone();
+		let max_y = max_amplitude - min_amplitude;
+
+		// Avoid division by zero
+		if max_x.is_zero() || max_y.is_zero() {
+			bail!("Cannot perform relative analysis: max_x or max_y is zero");
+		}
 
 		for measurement in &mut self.measurements {
 			let Some(location) = measurement.get_vector_location() else {
@@ -342,7 +348,11 @@ impl Batch {
 			let Some(amplitude) = measurement.get_vector_amplitude() else {
 				bail!("Amplitude is not set for all measurements in the batch");
 			};
+
+			// Relative.Location = Location / Max-X - percentage of movement relative to max movement
 			let relative_location = location / &max_x;
+
+			// Relative.Amplitude = Amplitude / Max-Y - percentage of movement relative to max movement
 			let relative_amplitude = amplitude / &max_y;
 
 			let measurement_vector = MeasurementVector::new(relative_location, relative_amplitude);
@@ -392,7 +402,7 @@ impl Batch {
 		self.level_transform()?;
 		self.transpose_origin()?;
 		self.simplify_transformation()?;
-		self.trend_analysis()?;
+		self.relative_analysis()?;
 		Ok(())
 	}
 }

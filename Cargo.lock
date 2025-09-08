@@ -758,6 +758,7 @@ dependencies = [
  "serde_json",
  "splimes",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
