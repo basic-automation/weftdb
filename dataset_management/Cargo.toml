@@ -16,7 +16,9 @@ rand = { workspace = true }
 num_cpus = "1.16"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 futures = { workspace = true }
-indexmap = { workspace = true, features = ["serde", "rayon"]}
+indexmap = { workspace = true, features = ["serde", "rayon"] }
+kiddo = "0.2"
+flume = "0.11"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

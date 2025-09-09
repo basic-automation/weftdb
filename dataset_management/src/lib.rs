@@ -2,13 +2,15 @@ use std::sync::LazyLock;
 
 use anyhow::Result;
 use database::{AspectId, Database, Resolution};
+use flume::{Receiver, Sender};
 use futures::TryStreamExt;
 use rayon::prelude::*;
 use splimes::Spline;
 use tokio::sync::Mutex;
 pub use types::*;
 
-mod types;
+mod memory_test;
+pub mod types;
 
 pub const BATCH_SIZE: [usize; 1] = [100];
 
@@ -108,44 +110,103 @@ pub async fn build_patterns_queue() -> Result<()> {
 	Ok(())
 }
 
+pub async fn load_dictionary_streaming(dictionary: &mut Dictionary, pattern_stream: impl futures::Stream<Item = Result<Pattern>> + Send + std::marker::Unpin + 'static) -> Result<()> {
+	use futures::StreamExt;
+
+	println!("Loading patterns from stream into dictionary");
+
+	const WORKER_COUNT: usize = 4; // Number of worker tasks
+	const BATCH_SIZE: usize = 50; // Patterns per batch sent to workers
+
+	// Create channels for communication
+	let (pattern_tx, pattern_rx): (Sender<Vec<Pattern>>, Receiver<Vec<Pattern>>) = flume::bounded(10);
+	let (result_tx, result_rx): (Sender<Dictionary>, Receiver<Dictionary>) = flume::bounded(WORKER_COUNT);
+
+	// Spawn worker tasks
+	for worker_id in 0..WORKER_COUNT {
+		let pattern_rx = pattern_rx.clone();
+		let result_tx = result_tx.clone();
+		let constraints = dictionary.constraints.clone();
+
+		tokio::spawn(async move {
+			let mut local_dict = Dictionary::new(format!("worker-{}", worker_id), format!("Worker {} local dictionary", worker_id), constraints);
+
+			while let Ok(batch) = pattern_rx.recv_async().await {
+				for pattern in batch {
+					if let Err(e) = local_dict.import_pattern(pattern).await {
+						eprintln!("Worker {} failed to import pattern: {}", worker_id, e);
+					}
+				}
+			}
+
+			// Send completed local dictionary back
+			if let Err(e) = result_tx.send_async(local_dict).await {
+				eprintln!("Worker {} failed to send result: {}", worker_id, e);
+			}
+		});
+	}
+
+	// Drop extra sender clones so channels can close
+	drop(result_tx);
+
+	// Collect patterns from stream and send to workers
+	tokio::spawn(async move {
+		let mut batch = Vec::with_capacity(BATCH_SIZE);
+		let mut stream = pattern_stream;
+
+		while let Some(pattern_result) = stream.next().await {
+			match pattern_result {
+				Ok(pattern) => {
+					batch.push(pattern);
+					if batch.len() >= BATCH_SIZE {
+						let batch_to_send = std::mem::replace(&mut batch, Vec::with_capacity(BATCH_SIZE));
+						if let Err(e) = pattern_tx.send_async(batch_to_send).await {
+							eprintln!("Failed to send pattern batch: {}", e);
+							break;
+						}
+					}
+				}
+				Err(e) => {
+					eprintln!("Error in pattern stream: {}", e);
+					break;
+				}
+			}
+		}
+
+		// Send remaining patterns
+		if !batch.is_empty() {
+			let _ = pattern_tx.send_async(batch).await;
+		}
+
+		// Close pattern channel
+		drop(pattern_tx);
+	});
+
+	// Collect results from workers and merge into main dictionary
+	let mut worker_count = 0;
+	while let Ok(worker_dict) = result_rx.recv_async().await {
+		println!("Merging results from worker {} ({} patterns)", worker_count, worker_dict.len());
+
+		// Merge patterns from worker dictionary into main dictionary
+		for pattern in worker_dict.patterns {
+			dictionary.import_pattern(pattern).await?;
+		}
+
+		worker_count += 1;
+	}
+
+	println!("Dictionary now contains {} patterns after streaming import", dictionary.len());
+	Ok(())
+}
+
+// Keep the original function for backward compatibility
 pub async fn load_dictionary(dictionary: &mut Dictionary) -> Result<()> {
 	let patterns = PATTERNS_QUEUE.lock().await.clone();
 
-	println!("Loading {} patterns into dictionary", patterns.len());
+	// Convert patterns to stream
+	let pattern_stream = futures::stream::iter(patterns.into_iter().map(Ok));
 
-	const IMPORT_BATCH_SIZE: usize = 200;
-
-	let mut handles = Vec::new();
-
-	for chunk in patterns.chunks(IMPORT_BATCH_SIZE) {
-		let chunk_vec = chunk.to_vec();
-		let constraints_clone = dictionary.constraints.clone();
-
-		handles.push(tokio::spawn(async move {
-			let mut temp_dict = Dictionary::new(
-				"temp".to_string(),
-				"Temporary dictionary for batch import".to_string(),
-				constraints_clone
-			);
-
-			for pattern in chunk_vec {
-				temp_dict.import_pattern(pattern).await.expect("Failed to import to temp dict");
-			}
-
-			temp_dict
-		}));
-	}
-
-	for handle in handles {
-		let temp_dict = handle.await.map_err(|e| anyhow::anyhow!("Task failed: {}", e))?;
-		for pattern in temp_dict.patterns {
-			dictionary.import_pattern(pattern).await?;
-		}
-	}
-
-	println!("Dictionary now contains {} patterns", dictionary.len());
-
-	Ok(())
+	load_dictionary_streaming(dictionary, pattern_stream).await
 }
 #[cfg(test)]
 mod tests {
