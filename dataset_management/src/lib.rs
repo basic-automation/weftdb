@@ -107,6 +107,46 @@ pub async fn build_patterns_queue() -> Result<()> {
 
 	Ok(())
 }
+
+pub async fn load_dictionary(dictionary: &mut Dictionary) -> Result<()> {
+	let patterns = PATTERNS_QUEUE.lock().await.clone();
+
+	println!("Loading {} patterns into dictionary", patterns.len());
+
+	const IMPORT_BATCH_SIZE: usize = 200;
+
+	let mut handles = Vec::new();
+
+	for chunk in patterns.chunks(IMPORT_BATCH_SIZE) {
+		let chunk_vec = chunk.to_vec();
+		let constraints_clone = dictionary.constraints.clone();
+
+		handles.push(tokio::spawn(async move {
+			let mut temp_dict = Dictionary::new(
+				"temp".to_string(),
+				"Temporary dictionary for batch import".to_string(),
+				constraints_clone
+			);
+
+			for pattern in chunk_vec {
+				temp_dict.import_pattern(pattern).await.expect("Failed to import to temp dict");
+			}
+
+			temp_dict
+		}));
+	}
+
+	for handle in handles {
+		let temp_dict = handle.await.map_err(|e| anyhow::anyhow!("Task failed: {}", e))?;
+		for pattern in temp_dict.patterns {
+			dictionary.import_pattern(pattern).await?;
+		}
+	}
+
+	println!("Dictionary now contains {} patterns", dictionary.len());
+
+	Ok(())
+}
 #[cfg(test)]
 mod tests {
 	use bigdecimal::{BigDecimal, FromPrimitive};
@@ -118,7 +158,7 @@ mod tests {
 	use super::*;
 
 	#[tokio::test(flavor = "multi_thread")]
-	async fn test_build_patterns_queue() -> Result<()> {
+	async fn test_load_dictionary() -> Result<()> {
 		let database = Database::existing("Crypto").await?;
 		let subjects = database.list_subjects().await?;
 		let subject_id = subjects.iter().find(|(_, name)| name.as_str() == "BTCUSD").map(|(id, _)| *id).ok_or_else(|| anyhow::anyhow!("Subject 'BTCUSD' not found"))?;
@@ -149,7 +189,7 @@ mod tests {
 		let processed_lock = PROCESSED_BATCHES_QUEUE.lock().await;
 
 		// print random batch from processed queue for verification
-                let mut random_index = 0;
+		let mut random_index = 0;
 		let length = processed_lock.len();
 		if length > 0 {
 			random_index = rand::random::<usize>() % length;
@@ -159,12 +199,12 @@ mod tests {
 
 		drop(processed_lock);
 
-                let timer = std::time::Instant::now();
-                println!("Starting build_patterns_queue...");
+		let timer = std::time::Instant::now();
+		println!("Starting build_patterns_queue...");
 
 		build_patterns_queue().await?;
 
-                println!("Time taken for build_patterns_queue: {:?}", timer.elapsed());
+		println!("Time taken for build_patterns_queue: {:?}", timer.elapsed());
 
 		let patterns_lock = PATTERNS_QUEUE.lock().await;
 
@@ -172,10 +212,32 @@ mod tests {
 		let length = patterns_lock.len();
 		if length > 0 {
 			println!("Random pattern: {}", json!(&patterns_lock[random_index]));
-                        output_denk_format_pattern(&patterns_lock[random_index]);
+			output_denk_format_pattern(&patterns_lock[random_index]);
 		}
 
 		drop(patterns_lock);
+
+		#[rustfmt::skip]
+		let contraints = DictionaryConstraints { 
+                        steps: Some(Steps { 
+                                count: 10, 
+                                interpolation: Spline::Linear 
+                        }), 
+                        variabilities: Some(
+                                vec![
+                                        VariablilityType::MaximumStatic(Variability {
+                                                value: BigDecimal::from(1) 
+                                        })
+                                ]
+                        ) 
+                };
+
+		let mut dictionary = Dictionary::new("Test Dictionary".to_string(), "A dictionary for testing purposes".to_string(), contraints);
+		let timer = std::time::Instant::now();
+		println!("Starting load_dictionary...");
+		load_dictionary(&mut dictionary).await?;
+		println!("Time taken for load_dictionary: {:?}", timer.elapsed());
+		println!("Dictionary now contains {} patterns", dictionary.len());
 
 		Ok(())
 	}
@@ -213,13 +275,13 @@ mod tests {
 		println!("----- DENK FORMAT OUTPUT END -----");
 	}
 
-        fn output_denk_format_pattern(pattern: &Pattern) {
-                println!("----- DENK FORMAT OUTPUT BEGIN -----");
-                println!("Pattern ID: {}", pattern.id());
-                for relative in pattern.relatives() {
-                        println!("{} {}", relative.vector().location(), relative.vector().amplitude().round(2));
-                }
-                println!("----- DENK FORMAT OUTPUT END -----");
-                println!("max_x: {}, max_y: {}", pattern.relatives().iter().map(|r| r.vector().location()).max().unwrap_or(&BigDecimal::from(0)), pattern.relatives().iter().map(|r| r.vector().amplitude()).max().unwrap_or(&BigDecimal::from(0)));
-        }
+	fn output_denk_format_pattern(pattern: &Pattern) {
+		println!("----- DENK FORMAT OUTPUT BEGIN -----");
+		println!("Pattern ID: {}", pattern.id());
+		for relative in pattern.relatives() {
+			println!("{} {}", relative.vector().location(), relative.vector().amplitude().round(2));
+		}
+		println!("----- DENK FORMAT OUTPUT END -----");
+		println!("max_x: {}, max_y: {}", pattern.relatives().iter().map(|r| r.vector().location()).max().unwrap_or(&BigDecimal::from(0)), pattern.relatives().iter().map(|r| r.vector().amplitude()).max().unwrap_or(&BigDecimal::from(0)));
+	}
 }
