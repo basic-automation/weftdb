@@ -749,8 +749,10 @@ dependencies = [
  "bigdecimal",
  "chrono",
  "database",
+ "flume",
  "futures",
  "indexmap",
+ "kiddo",
  "num_cpus",
  "rand",
  "rayon",
@@ -1630,6 +1632,15 @@ name = "khronos_api"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
+
+[[package]]
+name = "kiddo"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06ced2e69cfc5f22f86ccc9ce4ecff9f19917f3083a4bac0f402bdab034d73f1"
+dependencies = [
+ "num-traits",
+]
 
 [[package]]
 name = "lab"
