@@ -4,7 +4,7 @@ use database::{AspectId, DatabaseInfo};
 use serde::{Deserialize, Serialize};
 use splimes::Resolution;
 
-use crate::types::{Analysis, BatchedMeasurement, Distance, MeasurementVector, Relative, Trend};
+use crate::types::{Analysis, BatchedMeasurement, Distance, MeasurementVector, Relative};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchMetatdata {
@@ -187,80 +187,6 @@ impl Batch {
 			vector.set_location(new_location);
 		}
 
-		Ok(())
-	}
-
-	fn trend_analysis(&mut self) -> Result<()> {
-		if self.measurements.is_empty() {
-			bail!("Batch is empty, cannot build trends");
-		}
-
-		let measurments = self.measurements.clone();
-
-		for measurement in &mut self.measurements {
-			let mut trends: Vec<Trend> = Vec::with_capacity(measurments.len());
-			for destination_measurment in &measurments {
-				let measurment_value = measurement.get_measurement_value().clone();
-				let destination_value = destination_measurment.get_measurement_value().clone();
-				let measurement_timestamp = *measurement.get_measurement_timestamp(); // Fixed: removed .clone()
-				let destination_timestamp = *destination_measurment.get_measurement_timestamp(); // Fixed: removed .clone()
-				let destination_measurement_timestamp_difference = match self.metadata.resolution {
-					Resolution::Nanoseconds => (destination_timestamp - measurement_timestamp).num_nanoseconds().map(|n| n as f64).unwrap_or(0.0),
-					Resolution::Microseconds => (destination_timestamp - measurement_timestamp).num_microseconds().map(|n| n as f64).unwrap_or(0.0),
-					Resolution::Milliseconds => (destination_timestamp - measurement_timestamp).num_milliseconds() as f64,
-					Resolution::Seconds => (destination_timestamp - measurement_timestamp).num_seconds() as f64,
-					Resolution::Minutes => (destination_timestamp - measurement_timestamp).num_minutes() as f64,
-					Resolution::Hours => (destination_timestamp - measurement_timestamp).num_hours() as f64,
-					Resolution::Days => (destination_timestamp - measurement_timestamp).num_days() as f64,
-					Resolution::Weeks => (destination_timestamp - measurement_timestamp).num_weeks() as f64,
-					Resolution::Months => (destination_timestamp - measurement_timestamp).num_weeks() as f64 / 4.34524, // Approximation: 1 month = 4.34524 weeks
-					Resolution::Years => (destination_timestamp - measurement_timestamp).num_weeks() as f64 / 52.1775,  // Approximation: 1 year = 52.1775 weeks
-				};
-
-				let destination_measurement_difference: BigDecimal = match BigDecimal::from_f64(destination_measurement_timestamp_difference) {
-					Some(d) => d,
-					None => bail!("Failed to convert destination measurement difference to BigDecimal"),
-				};
-
-				let measurement_destination_timestamp_difference = match self.metadata.resolution {
-					Resolution::Nanoseconds => (measurement_timestamp - destination_timestamp).num_nanoseconds().map(|n| n as f64).unwrap_or(0.0),
-					Resolution::Microseconds => (measurement_timestamp - destination_timestamp).num_microseconds().map(|n| n as f64).unwrap_or(0.0),
-					Resolution::Milliseconds => (measurement_timestamp - destination_timestamp).num_milliseconds() as f64,
-					Resolution::Seconds => (measurement_timestamp - destination_timestamp).num_seconds() as f64,
-					Resolution::Minutes => (measurement_timestamp - destination_timestamp).num_minutes() as f64,
-					Resolution::Hours => (measurement_timestamp - destination_timestamp).num_hours() as f64,
-					Resolution::Days => (measurement_timestamp - destination_timestamp).num_days() as f64,
-					Resolution::Weeks => (measurement_timestamp - destination_timestamp).num_weeks() as f64,
-					Resolution::Months => (measurement_timestamp - destination_timestamp).num_weeks() as f64 / 4.34524, // Approximation: 1 month = 4.34524 weeks
-					Resolution::Years => (measurement_timestamp - destination_timestamp).num_weeks() as f64 / 52.1775,  // Approximation: 1 year = 52.1775 weeks
-				};
-
-				let measurement_destination_timestamp_difference: BigDecimal = match BigDecimal::from_f64(measurement_destination_timestamp_difference) {
-					Some(d) => d,
-					None => bail!("Failed to convert measurement destination timestamp difference to BigDecimal"),
-				};
-
-				if measurement_timestamp < destination_timestamp {
-					let slope = (destination_value - measurment_value) / (destination_measurement_difference);
-					let trend = Trend::new(destination_measurment.clone().point().clone(), slope);
-					trends.push(trend);
-				} else if measurement_timestamp > destination_timestamp {
-					let slope = (measurment_value - destination_value) / (measurement_destination_timestamp_difference);
-					let trend = Trend::new(destination_measurment.clone().point().clone(), slope);
-					trends.push(trend);
-				} else {
-					let slope = BigDecimal::from(0);
-					let trend = Trend::new(destination_measurment.clone().point().clone(), slope);
-					trends.push(trend);
-				}
-			}
-			let mut analysis = match measurement.analysis() {
-				Some(a) => a.clone(),
-				None => Analysis::default(),
-			};
-			analysis.set_trend(Some(trends));
-			measurement.set_analysis(analysis);
-		}
 		Ok(())
 	}
 
