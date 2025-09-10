@@ -1,13 +1,14 @@
 use anyhow::Result;
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive, Zero};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use splimes::{auto_interpolate, Point, Resolution as SplimesResolution, Spline};
 use uuid::Uuid;
 use wide::f64x4;
 
 use crate::types::{pattern::Pattern, MeasurementVector, Relative};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Dictionary {
 	pub id: Uuid,
 	pub name: String,
@@ -16,19 +17,19 @@ pub struct Dictionary {
 	pub constraints: DictionaryConstraints,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DictionaryConstraints {
 	pub steps: Option<Steps>,
 	pub variabilities: Option<Vec<VariablilityType>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Steps {
 	pub count: usize,
 	pub interpolation: Spline,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum VariablilityType {
 	MaximumStatic(Variability),
 	AverageStatic(Variability),
@@ -46,7 +47,7 @@ pub enum VariablilityType {
 	AbsoluteSumPercentile(Variability),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Variability {
 	pub value: BigDecimal,
 }
@@ -640,6 +641,31 @@ impl Dictionary {
 		let threshold_f64 = threshold.to_f64().unwrap_or(0.0);
 		Ok((sum1 - sum2).abs() <= threshold_f64)
 	}
+
+	/// Serialize the dictionary to JSON string
+	pub fn to_json(&self) -> Result<String> {
+		serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize dictionary: {}", e))
+	}
+
+	/// Serialize the dictionary to JSON string with pretty formatting
+	pub fn to_json_pretty(&self) -> Result<String> {
+		serde_json::to_string_pretty(self).map_err(|e| anyhow::anyhow!("Failed to serialize dictionary: {}", e))
+	}
+
+	/// Deserialize a dictionary from JSON string
+	pub fn from_json(json: &str) -> Result<Self> {
+		serde_json::from_str(json).map_err(|e| anyhow::anyhow!("Failed to deserialize dictionary: {}", e))
+	}
+
+	/// Serialize the dictionary to binary format (using bincode)
+	pub fn to_bytes(&self) -> Result<Vec<u8>> {
+		bincode::serialize(self).map_err(|e| anyhow::anyhow!("Failed to serialize dictionary to bytes: {}", e))
+	}
+
+	/// Deserialize a dictionary from binary format (using bincode)
+	pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+		bincode::deserialize(bytes).map_err(|e| anyhow::anyhow!("Failed to deserialize dictionary from bytes: {}", e))
+	}
 }
 
 #[cfg(test)]
@@ -840,5 +866,40 @@ mod tests {
 
 		assert!(!dictionary.is_empty());
 		assert_eq!(dictionary.len(), 1);
+	}
+
+	#[tokio::test]
+	async fn test_dictionary_serialization() {
+		let mut dictionary = create_test_dictionary();
+		
+		// Add a pattern to the dictionary
+		let pattern = create_test_pattern(vec![1.0, 2.0, 3.0]);
+		dictionary.import_pattern(pattern).await.unwrap();
+		
+		// Test JSON serialization
+		let json = dictionary.to_json().unwrap();
+		let deserialized_from_json = Dictionary::from_json(&json).unwrap();
+		assert_eq!(dictionary.id, deserialized_from_json.id);
+		assert_eq!(dictionary.name, deserialized_from_json.name);
+		assert_eq!(dictionary.patterns.len(), deserialized_from_json.patterns.len());
+
+		// Test pretty JSON serialization
+		let pretty_json = dictionary.to_json_pretty().unwrap();
+		let deserialized_from_pretty = Dictionary::from_json(&pretty_json).unwrap();
+		assert_eq!(dictionary.id, deserialized_from_pretty.id);
+
+		// Test binary serialization (bincode)
+		let bytes = dictionary.to_bytes().unwrap();
+		let deserialized_from_bytes = Dictionary::from_bytes(&bytes).unwrap();
+		assert_eq!(dictionary.id, deserialized_from_bytes.id);
+		assert_eq!(dictionary.name, deserialized_from_bytes.name);
+		assert_eq!(dictionary.patterns.len(), deserialized_from_bytes.patterns.len());
+
+		// Verify that binary serialization is more compact than JSON
+		assert!(bytes.len() < json.len());
+
+		println!("JSON size: {} bytes", json.len());
+		println!("Binary size: {} bytes", bytes.len());
+		println!("Compression ratio: {:.2}%", (bytes.len() as f64 / json.len() as f64) * 100.0);
 	}
 }

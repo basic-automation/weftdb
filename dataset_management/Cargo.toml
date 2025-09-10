@@ -7,10 +7,12 @@ edition = "2021"
 bigdecimal = { workspace = true, features = ["serde", "serde-json", "string-only"] }
 database = { path = "../database" }  # Reference the local workspace member directly
 anyhow = { workspace = true }
+bincode = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 splimes = { path = "../splimes"}
 rayon = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
 rand = { workspace = true }
 num_cpus = "1.16"
