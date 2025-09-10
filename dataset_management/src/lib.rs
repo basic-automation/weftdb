@@ -286,6 +286,10 @@ mod tests {
 		load_dictionary(&mut dictionary).await?;
 		println!("Time taken for load_dictionary: {:?}", timer.elapsed());
 		println!("Dictionary now contains {} patterns", dictionary.len());
+ 
+
+                // print the dictionary
+                println!("Dictionary contents: {}", json!(&dictionary));
 
 		Ok(())
 	}
