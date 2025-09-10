@@ -47,8 +47,7 @@ mod memory_tests {
 		}
 
 		println!("Successfully imported 100 patterns");
-		println!("KD-tree size: {}", dict.kd_tree.size());
-		println!("Signature map size: {}", dict.signature_map.len());
+		println!("Dictionary patterns count: {}", dict.patterns.len());
 	}
 
 	#[tokio::test]
@@ -63,8 +62,7 @@ mod memory_tests {
 		}
 
 		println!("Successfully imported 500 patterns");
-		println!("KD-tree size: {}", dict.kd_tree.size());
-		println!("Signature map size: {}", dict.signature_map.len());
+		println!("Dictionary patterns count: {}", dict.patterns.len());
 	}
 
 	#[tokio::test]
@@ -82,7 +80,6 @@ mod memory_tests {
 		}
 
 		println!("Successfully imported 1000 patterns");
-		println!("KD-tree size: {}", dict.kd_tree.size());
-		println!("Signature map size: {}", dict.signature_map.len());
+		println!("Dictionary patterns count: {}", dict.patterns.len());
 	}
 }

@@ -1,7 +1,6 @@
 use anyhow::Result;
-use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive, Zero};
+use bigdecimal::{BigDecimal, FromPrimitive, Zero};
 use chrono::Utc;
-use kiddo::KdTree;
 use splimes::{auto_interpolate, Point, Resolution as SplimesResolution, Spline};
 use uuid::Uuid;
 
@@ -14,9 +13,6 @@ pub struct Dictionary {
 	pub description: String,
 	pub patterns: Vec<Pattern>,
 	pub constraints: DictionaryConstraints,
-	// For performance optimization with reduced dimensions for memory efficiency
-	pub kd_tree: KdTree<f64, usize, 8>,
-	pub signature_map: std::collections::HashMap<String, Vec<usize>>,
 }
 
 #[derive(Clone, Debug)]
@@ -58,206 +54,45 @@ impl Dictionary {
 	/// Create a new dictionary with the given constraints
 	pub fn new(name: String, description: String, constraints: DictionaryConstraints) -> Self {
 		let id = Uuid::new_v4();
-		Self { id, name, description, patterns: Vec::new(), constraints, kd_tree: KdTree::new(), signature_map: std::collections::HashMap::new() }
+		Self { id, name, description, patterns: Vec::new(), constraints }
 	}
 
-	/// Import a new pattern into the dictionary
+	/// Import a new pattern into the dictionary following the exact specification
 	///
-	/// This function enforces the dictionary constraints and checks for pattern similarity.
-	/// If the pattern matches one or more existing patterns based on the variability constraints,
-	/// the new occurrence will be added to all matching patterns.
+	/// ALL patterns are processed identically regardless of dictionary size:
+	/// 1. Enforce steps constraint if configured
+	/// 2. Check similarity against ALL existing patterns using configured variability constraints
+	/// 3. If similar patterns found, merge occurrences; otherwise add as new pattern
 	pub async fn import_pattern(&mut self, mut new_pattern: Pattern) -> Result<()> {
 		// Step 1: Enforce steps constraint if configured
 		if let Some(steps_config) = &self.constraints.steps {
 			new_pattern = self.convert_pattern_steps(new_pattern, steps_config).await?;
 		}
 
-		// Step 2: Use memory-efficient candidate filtering for large datasets
-		let candidates = if self.patterns.len() > 1000 {
-			// For large datasets, use simple signature-based filtering only
-			self.get_simple_similarity_candidates(&new_pattern)?
-		} else {
-			// For smaller datasets, use full optimization with KD-tree
-			self.get_similarity_candidates(&new_pattern)?
-		};
-
-		// Step 3: Check similarity with all candidate patterns using configured variability constraints
+		// Step 2: Check similarity against ALL existing patterns using configured variability constraints
+		// This is the specification-compliant approach - no shortcuts or optimizations that change behavior
 		let mut matching_indices = Vec::new();
 
-		for &idx in &candidates {
-			if idx < self.patterns.len() {
-				let existing_pattern = &self.patterns[idx];
-				if self.patterns_are_similar(&new_pattern, existing_pattern)? {
-					matching_indices.push(idx);
-				}
+		for (idx, existing_pattern) in self.patterns.iter().enumerate() {
+			if self.patterns_are_similar(&new_pattern, existing_pattern)? {
+				matching_indices.push(idx);
 			}
 		}
 
-		// Step 4: If matches found, add occurrence to ALL matching patterns (as per specification)
+		// Step 3: Handle matches according to specification
 		if !matching_indices.is_empty() {
+			// "If they are deemed sufficiently similar the new pattern will be converted to an
+			// occurrence of the existing pattern" - merge with ALL matching patterns as specified
 			for &idx in &matching_indices {
 				self.merge_pattern_occurrences_at_index(idx, new_pattern.clone())?;
 			}
 		} else {
-			// Step 5: If no match found, add as new pattern
-			let pattern_idx = self.patterns.len();
-
-			// Insert into signature map for future performance optimization
-			// Only use signature map for datasets under 10,000 patterns to avoid memory issues
-			if self.patterns.len() < 10000 {
-				self.insert_pattern_into_signature_map(&new_pattern, pattern_idx);
-			}
-
-			// Add to patterns vector
+			// "If the new pattern is not found to be efficiently similar to any existing pattern
+			// then the new pattern will be added to the pattern dictionary"
 			self.patterns.push(new_pattern);
 		}
 
 		Ok(())
-	}
-
-	/// Get candidate patterns for similarity checking using performance optimizations
-	/// This serves as a pre-filter to reduce the number of expensive constraint checks
-	fn get_similarity_candidates(&self, new_pattern: &Pattern) -> Result<Vec<usize>> {
-		let mut candidates = Vec::new();
-
-		// If we have few patterns, check all of them (no optimization needed)
-		if self.patterns.len() <= 10 {
-			return Ok((0..self.patterns.len()).collect());
-		}
-
-		// Step 1: Try signature-based filtering first (fastest)
-		let signature = self.compute_pattern_signature(new_pattern);
-		if let Some(signature_candidates) = self.signature_map.get(&signature) {
-			candidates.extend(signature_candidates.iter().cloned());
-		}
-
-		// Step 2: If signature filtering didn't find candidates, use statistical feature similarity
-		// This preserves specification compliance while adding performance optimization
-		if candidates.is_empty() {
-			let new_features = self.extract_feature_vector(new_pattern)?;
-
-			for (idx, existing_pattern) in self.patterns.iter().enumerate() {
-				let existing_features = self.extract_feature_vector(existing_pattern)?;
-
-				// Use a loose similarity threshold for pre-filtering
-				// The actual constraint checking will still be specification-compliant
-				let distance: f64 = new_features.iter().zip(existing_features.iter()).map(|(a, b)| (a - b).powi(2)).sum::<f64>().sqrt();
-
-				// Use a generous threshold - we want to avoid false negatives
-				// The real constraint checking will filter out false positives
-				if distance < 2.0 {
-					candidates.push(idx);
-				}
-			}
-		}
-
-		// Fallback: if no candidates found through optimization, check all patterns
-		// This ensures we never miss a match due to optimization
-		if candidates.is_empty() {
-			candidates = (0..self.patterns.len()).collect();
-		}
-
-		Ok(candidates)
-	}
-
-	/// Memory-efficient candidate filtering using only signature map (no KD-tree)
-	/// Used for large datasets where memory usage is more important than performance
-	fn get_simple_similarity_candidates(&self, new_pattern: &Pattern) -> Result<Vec<usize>> {
-		let signature = self.compute_pattern_signature(new_pattern);
-
-		if let Some(signature_candidates) = self.signature_map.get(&signature) {
-			return Ok(signature_candidates.clone());
-		}
-
-		// If no signature matches, return limited random sample to avoid checking all patterns
-		// This trade-off prioritizes memory efficiency over perfect pattern matching
-		if self.patterns.len() > 5000 {
-			// For very large datasets, only check a small random sample
-			Ok(Vec::new())
-		} else {
-			// For moderate datasets, check all patterns as fallback
-			Ok((0..self.patterns.len()).collect())
-		}
-	}
-
-	/// Extract 8-dimensional feature vector from pattern for KD-tree
-	/// Uses the most important statistical features instead of raw amplitudes
-	fn extract_feature_vector(&self, pattern: &Pattern) -> Result<[f64; 8]> {
-		let amplitudes = pattern.amplitudes();
-
-		if amplitudes.is_empty() {
-			return Ok([0.0; 8]);
-		}
-
-		// Convert to f64 for computations
-		let amp_f64: Vec<f64> = amplitudes.iter().map(|amp| amp.to_f64().unwrap_or(0.0)).collect();
-
-		let n = amp_f64.len() as f64;
-		let sum: f64 = amp_f64.iter().sum();
-		let mean = sum / n;
-
-		// Calculate variance and higher moments
-		let variance: f64 = amp_f64.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
-		let std_dev = variance.sqrt();
-
-		// Calculate skewness and kurtosis
-		let skewness: f64 = if std_dev > 0.0 { amp_f64.iter().map(|x| ((x - mean) / std_dev).powi(3)).sum::<f64>() / n } else { 0.0 };
-
-		let kurtosis: f64 = if std_dev > 0.0 { amp_f64.iter().map(|x| ((x - mean) / std_dev).powi(4)).sum::<f64>() / n - 3.0 } else { 0.0 };
-
-		// Get min and max
-		let min_val = amp_f64.iter().cloned().fold(f64::INFINITY, f64::min);
-		let max_val = amp_f64.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-		let range = max_val - min_val;
-
-		// Calculate trend (simple linear regression slope approximation)
-		let trend: f64 = if amp_f64.len() > 1 {
-			let x_mean = (amp_f64.len() - 1) as f64 / 2.0;
-			let numerator: f64 = amp_f64.iter().enumerate().map(|(i, &y)| (i as f64 - x_mean) * (y - mean)).sum();
-			let denominator: f64 = (0..amp_f64.len()).map(|i| (i as f64 - x_mean).powi(2)).sum();
-			if denominator > 0.0 {
-				numerator / denominator
-			} else {
-				0.0
-			}
-		} else {
-			0.0
-		};
-
-		// Create 8-dimensional feature vector
-		Ok([
-			mean,     // Overall level
-			std_dev,  // Volatility
-			skewness, // Asymmetry
-			kurtosis, // Tail heaviness
-			min_val,  // Minimum value
-			max_val,  // Maximum value
-			range,    // Value range
-			trend,    // Linear trend
-		])
-	}
-
-	/// Compute signature for quick pattern filtering
-	fn compute_pattern_signature(&self, pattern: &Pattern) -> String {
-		let amplitudes = pattern.amplitudes();
-
-		if amplitudes.is_empty() {
-			return "empty".to_string();
-		}
-
-		// Create simplified signature to reduce memory usage
-		let sum = pattern.sum().to_f64().unwrap_or(0.0);
-		let len = amplitudes.len();
-
-		// Use basic features only - sum rounded to nearest integer, length
-		// This creates fewer unique signatures, reducing memory usage
-		format!("s{:.0}_l{}", sum, len)
-	}
-
-	/// Insert pattern into signature map
-	fn insert_pattern_into_signature_map(&mut self, pattern: &Pattern, pattern_idx: usize) {
-		let signature = self.compute_pattern_signature(pattern);
-		self.signature_map.entry(signature).or_default().push(pattern_idx);
 	}
 
 	/// Convert pattern to match the required number of steps using auto_interpolate
