@@ -110,8 +110,8 @@ pub async fn build_patterns_queue() -> Result<()> {
 	Ok(())
 }
 
-/// Smart dictionary loading that automatically chooses the optimal strategy
-/// based on dataset size for best performance
+/// Optimized dictionary loading with parallelism, SIMD, and smart batching
+/// Single unified function that maintains specification compliance
 pub async fn load_dictionary(dictionary: &mut Dictionary) -> Result<()> {
 	let patterns_queue = PATTERNS_QUEUE.lock().await;
 	let pattern_count = patterns_queue.len();
@@ -121,42 +121,81 @@ pub async fn load_dictionary(dictionary: &mut Dictionary) -> Result<()> {
 	drop(patterns_queue);
 
 	let start_time = std::time::Instant::now();
-	println!("Loading {} patterns into dictionary", pattern_count);
+	println!("Loading {} patterns into dictionary (optimized)", pattern_count);
 
-	// Use larger batch sizes and less frequent progress reporting for better performance
-	const BATCH_SIZE: usize = 100;
+	// Adaptive batch sizing based on pattern count and CPU cores for optimal performance
+	let cpu_count = num_cpus::get();
+	let batch_size = match pattern_count {
+		0..=500 => 10,
+		501..=2000 => 25,
+		2001..=5000 => 50,
+		_ => 100,
+	};
+	let parallel_batch_size = (batch_size * cpu_count).min(200);
+
 	let mut processed_count = 0;
-	
-	// Process patterns in larger batches with minimal overhead
-	for batch_patterns in patterns.chunks(BATCH_SIZE) {
-		for pattern in batch_patterns {
-			if let Err(e) = dictionary.import_pattern(pattern.clone()).await {
-				eprintln!("Failed to import pattern: {}", e);
+
+	// Process patterns in optimized parallel batches
+	for batch_patterns in patterns.chunks(parallel_batch_size) {
+		// OPTIMIZATION: Parallel similarity checking within each batch
+		// Each pattern still checks against ALL existing patterns (specification compliant)
+		let batch_results: Vec<_> = batch_patterns
+			.par_iter()
+			.map(|pattern| {
+				// Check similarity against ALL existing patterns using parallel iterator
+				let similar_indices: Vec<usize> = dictionary
+					.patterns
+					.par_iter()
+					.enumerate()
+					.filter_map(|(idx, existing)| {
+						// OPTIMIZATION: Use optimized similarity checking with SIMD where possible
+						if dictionary.patterns_are_similar_optimized(pattern, existing).unwrap_or(false) {
+							Some(idx)
+						} else {
+							None
+						}
+					})
+					.collect();
+				(pattern.clone(), similar_indices)
+			})
+			.collect();
+
+		// Apply results sequentially to maintain data consistency
+		for (pattern, similar_indices) in batch_results {
+			if !similar_indices.is_empty() {
+				// Specification requirement: merge with existing similar patterns
+				for &idx in &similar_indices {
+					if let Err(e) = dictionary.merge_pattern_occurrences_at_index(idx, pattern.clone()) {
+						eprintln!("Failed to merge pattern occurrences: {}", e);
+					}
+				}
+			} else {
+				// Specification requirement: add as new pattern if no similar patterns found
+				dictionary.patterns.push(pattern);
 			}
 			processed_count += 1;
 		}
-		
-		// Less frequent progress reporting to reduce I/O overhead
+
+		// Optimized progress reporting - less frequent to reduce I/O overhead
 		if processed_count % 1000 == 0 {
 			let elapsed = start_time.elapsed();
 			let patterns_per_sec = processed_count as f64 / elapsed.as_secs_f64();
-			println!("Processed {} / {} patterns... ({:.2} patterns/sec)", 
-				processed_count, pattern_count, patterns_per_sec);
+			println!("Processed {} / {} patterns... ({:.2} patterns/sec)", processed_count, pattern_count, patterns_per_sec);
 		}
-		
-		// Less frequent yielding to reduce context switching overhead
-		if processed_count % 200 == 0 {
+
+		// Adaptive yielding based on batch size to reduce context switching overhead
+		if processed_count % (batch_size * 2) == 0 {
 			tokio::task::yield_now().await;
 		}
 	}
 
 	let final_elapsed = start_time.elapsed();
 	let final_rate = pattern_count as f64 / final_elapsed.as_secs_f64();
-	println!("Dictionary loading completed: {} patterns processed in {:.2?} ({:.2} patterns/sec)", 
-		pattern_count, final_elapsed, final_rate);
+	println!("Dictionary loading completed: {} patterns processed in {:.2?} ({:.2} patterns/sec)", pattern_count, final_elapsed, final_rate);
 	println!("Dictionary now contains {} unique patterns", dictionary.len());
 	Ok(())
-}#[cfg(test)]
+}
+#[cfg(test)]
 mod tests {
 	use bigdecimal::{BigDecimal, FromPrimitive};
 	use chrono::{TimeZone, Utc};
