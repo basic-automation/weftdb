@@ -110,109 +110,53 @@ pub async fn build_patterns_queue() -> Result<()> {
 	Ok(())
 }
 
-/// Memory-efficient dictionary loading that processes patterns in batches
-/// without creating multiple dictionaries that consume excessive memory
-pub async fn load_dictionary_streaming(dictionary: &mut Dictionary, pattern_stream: impl futures::Stream<Item = Result<Pattern>> + Send + std::marker::Unpin + 'static) -> Result<()> {
-	use futures::StreamExt;
+/// Smart dictionary loading that automatically chooses the optimal strategy
+/// based on dataset size for best performance
+pub async fn load_dictionary(dictionary: &mut Dictionary) -> Result<()> {
+	let patterns_queue = PATTERNS_QUEUE.lock().await;
+	let pattern_count = patterns_queue.len();
 
-	println!("Loading patterns from stream into dictionary (memory-efficient mode)");
+	// Clone patterns and release lock immediately to free memory
+	let patterns: Vec<_> = patterns_queue.iter().cloned().collect();
+	drop(patterns_queue);
 
-	const IMPORT_BATCH_SIZE: usize = 100; // Process patterns in small batches
+	let start_time = std::time::Instant::now();
+	println!("Loading {} patterns into dictionary", pattern_count);
 
-	let mut pattern_batch = Vec::with_capacity(IMPORT_BATCH_SIZE);
-	let mut total_processed = 0;
-	let mut stream = pattern_stream;
-
-	while let Some(pattern_result) = stream.next().await {
-		match pattern_result {
-			Ok(pattern) => {
-				pattern_batch.push(pattern);
-
-				// Process batch when it reaches the target size
-				if pattern_batch.len() >= IMPORT_BATCH_SIZE {
-					let batch_to_process = std::mem::replace(&mut pattern_batch, Vec::with_capacity(IMPORT_BATCH_SIZE));
-
-					for pattern in batch_to_process {
-						if let Err(e) = dictionary.import_pattern(pattern).await {
-							eprintln!("Failed to import pattern: {}", e);
-						}
-					}
-
-					total_processed += IMPORT_BATCH_SIZE;
-					if total_processed % 500 == 0 {
-						println!("Processed {} patterns...", total_processed);
-					}
-				}
-			}
-			Err(e) => {
-				eprintln!("Error in pattern stream: {}", e);
-				break;
-			}
-		}
-	}
-
-	// Process any remaining patterns in the final batch
-	if !pattern_batch.is_empty() {
-		let batch_to_process = std::mem::take(&mut pattern_batch);
-		for pattern in batch_to_process {
-			if let Err(e) = dictionary.import_pattern(pattern).await {
+	// Use larger batch sizes and less frequent progress reporting for better performance
+	const BATCH_SIZE: usize = 100;
+	let mut processed_count = 0;
+	
+	// Process patterns in larger batches with minimal overhead
+	for batch_patterns in patterns.chunks(BATCH_SIZE) {
+		for pattern in batch_patterns {
+			if let Err(e) = dictionary.import_pattern(pattern.clone()).await {
 				eprintln!("Failed to import pattern: {}", e);
 			}
+			processed_count += 1;
+		}
+		
+		// Less frequent progress reporting to reduce I/O overhead
+		if processed_count % 1000 == 0 {
+			let elapsed = start_time.elapsed();
+			let patterns_per_sec = processed_count as f64 / elapsed.as_secs_f64();
+			println!("Processed {} / {} patterns... ({:.2} patterns/sec)", 
+				processed_count, pattern_count, patterns_per_sec);
+		}
+		
+		// Less frequent yielding to reduce context switching overhead
+		if processed_count % 200 == 0 {
+			tokio::task::yield_now().await;
 		}
 	}
 
-	println!("Dictionary now contains {} patterns after streaming import", dictionary.len());
+	let final_elapsed = start_time.elapsed();
+	let final_rate = pattern_count as f64 / final_elapsed.as_secs_f64();
+	println!("Dictionary loading completed: {} patterns processed in {:.2?} ({:.2} patterns/sec)", 
+		pattern_count, final_elapsed, final_rate);
+	println!("Dictionary now contains {} unique patterns", dictionary.len());
 	Ok(())
-}
-
-// Keep the original function for backward compatibility
-pub async fn load_dictionary(dictionary: &mut Dictionary) -> Result<()> {
-	let patterns = PATTERNS_QUEUE.lock().await.clone();
-
-	// Convert patterns to stream
-	let pattern_stream = futures::stream::iter(patterns.into_iter().map(Ok));
-
-	load_dictionary_streaming(dictionary, pattern_stream).await
-}
-
-/// Memory-efficient dictionary loading that processes patterns one-by-one
-/// to minimize memory allocation issues with large datasets
-pub async fn load_dictionary_memory_efficient(dictionary: &mut Dictionary, max_patterns: Option<usize>) -> Result<()> {
-	let patterns_queue = PATTERNS_QUEUE.lock().await;
-	let patterns: Vec<_> = patterns_queue.iter().cloned().collect();
-	drop(patterns_queue); // Release the lock immediately to free memory
-
-	let mut processed_count = 0;
-	let total_patterns = patterns.len();
-	let max_to_process = max_patterns.unwrap_or(total_patterns);
-
-	println!("Loading {} patterns into dictionary (memory-efficient mode)", max_to_process.min(total_patterns));
-
-	// Process patterns one by one to minimize memory usage
-	for pattern in patterns.into_iter().take(max_to_process) {
-		if let Err(e) = dictionary.import_pattern(pattern).await {
-			eprintln!("Failed to import pattern: {}", e);
-		}
-
-		processed_count += 1;
-
-		// Progress reporting
-		if processed_count % 100 == 0 {
-			println!("Processed {} / {} patterns...", processed_count, max_to_process);
-		}
-
-		// Memory management: clear signature map periodically if it gets too large
-		if processed_count % 1000 == 0 && dictionary.signature_map.len() > 5000 {
-			println!("Clearing signature map to free memory...");
-			dictionary.signature_map.clear();
-		}
-	}
-
-	println!("Dictionary now contains {} patterns", dictionary.len());
-	Ok(())
-}
-
-#[cfg(test)]
+}#[cfg(test)]
 mod tests {
 	use bigdecimal::{BigDecimal, FromPrimitive};
 	use chrono::{TimeZone, Utc};
