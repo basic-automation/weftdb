@@ -2,13 +2,13 @@ use std::sync::LazyLock;
 
 use anyhow::Result;
 use database::{AspectId, Database, Resolution};
-use flume::{Receiver, Sender};
 use futures::TryStreamExt;
 use rayon::prelude::*;
 use splimes::Spline;
 use tokio::sync::Mutex;
 pub use types::*;
 
+#[cfg(test)]
 mod memory_test;
 pub mod types;
 
@@ -100,7 +100,7 @@ pub async fn build_patterns_queue() -> Result<()> {
 		let occurrence = Occurrence::new(batch.metadata.aspect, batch.metadata.resolution, batch.metadata.size, batch.metadata.database_info.clone(), pattern_id, beginning, end);
 
 		// Extract relatives from active measurements that have analysis
-		let relatives: Vec<Relative> = active_measurements.iter().filter_map(|measurement| measurement.analysis()?.relative().map(|r| r.clone())).collect();
+		let relatives: Vec<Relative> = active_measurements.iter().filter_map(|measurement| measurement.analysis()?.relative().cloned()).collect();
 
 		// Create the pattern
 		let pattern = Pattern::new(pattern_id, vec![occurrence], relatives);
@@ -110,89 +110,55 @@ pub async fn build_patterns_queue() -> Result<()> {
 	Ok(())
 }
 
+/// Memory-efficient dictionary loading that processes patterns in batches
+/// without creating multiple dictionaries that consume excessive memory
 pub async fn load_dictionary_streaming(dictionary: &mut Dictionary, pattern_stream: impl futures::Stream<Item = Result<Pattern>> + Send + std::marker::Unpin + 'static) -> Result<()> {
 	use futures::StreamExt;
 
-	println!("Loading patterns from stream into dictionary");
+	println!("Loading patterns from stream into dictionary (memory-efficient mode)");
 
-	const WORKER_COUNT: usize = 4; // Number of worker tasks
-	const BATCH_SIZE: usize = 50; // Patterns per batch sent to workers
+	const IMPORT_BATCH_SIZE: usize = 100; // Process patterns in small batches
 
-	// Create channels for communication
-	let (pattern_tx, pattern_rx): (Sender<Vec<Pattern>>, Receiver<Vec<Pattern>>) = flume::bounded(10);
-	let (result_tx, result_rx): (Sender<Dictionary>, Receiver<Dictionary>) = flume::bounded(WORKER_COUNT);
+	let mut pattern_batch = Vec::with_capacity(IMPORT_BATCH_SIZE);
+	let mut total_processed = 0;
+	let mut stream = pattern_stream;
 
-	// Spawn worker tasks
-	for worker_id in 0..WORKER_COUNT {
-		let pattern_rx = pattern_rx.clone();
-		let result_tx = result_tx.clone();
-		let constraints = dictionary.constraints.clone();
+	while let Some(pattern_result) = stream.next().await {
+		match pattern_result {
+			Ok(pattern) => {
+				pattern_batch.push(pattern);
 
-		tokio::spawn(async move {
-			let mut local_dict = Dictionary::new(format!("worker-{}", worker_id), format!("Worker {} local dictionary", worker_id), constraints);
+				// Process batch when it reaches the target size
+				if pattern_batch.len() >= IMPORT_BATCH_SIZE {
+					let batch_to_process = std::mem::replace(&mut pattern_batch, Vec::with_capacity(IMPORT_BATCH_SIZE));
 
-			while let Ok(batch) = pattern_rx.recv_async().await {
-				for pattern in batch {
-					if let Err(e) = local_dict.import_pattern(pattern).await {
-						eprintln!("Worker {} failed to import pattern: {}", worker_id, e);
-					}
-				}
-			}
-
-			// Send completed local dictionary back
-			if let Err(e) = result_tx.send_async(local_dict).await {
-				eprintln!("Worker {} failed to send result: {}", worker_id, e);
-			}
-		});
-	}
-
-	// Drop extra sender clones so channels can close
-	drop(result_tx);
-
-	// Collect patterns from stream and send to workers
-	tokio::spawn(async move {
-		let mut batch = Vec::with_capacity(BATCH_SIZE);
-		let mut stream = pattern_stream;
-
-		while let Some(pattern_result) = stream.next().await {
-			match pattern_result {
-				Ok(pattern) => {
-					batch.push(pattern);
-					if batch.len() >= BATCH_SIZE {
-						let batch_to_send = std::mem::replace(&mut batch, Vec::with_capacity(BATCH_SIZE));
-						if let Err(e) = pattern_tx.send_async(batch_to_send).await {
-							eprintln!("Failed to send pattern batch: {}", e);
-							break;
+					for pattern in batch_to_process {
+						if let Err(e) = dictionary.import_pattern(pattern).await {
+							eprintln!("Failed to import pattern: {}", e);
 						}
 					}
-				}
-				Err(e) => {
-					eprintln!("Error in pattern stream: {}", e);
-					break;
+
+					total_processed += IMPORT_BATCH_SIZE;
+					if total_processed % 500 == 0 {
+						println!("Processed {} patterns...", total_processed);
+					}
 				}
 			}
+			Err(e) => {
+				eprintln!("Error in pattern stream: {}", e);
+				break;
+			}
 		}
+	}
 
-		// Send remaining patterns
-		if !batch.is_empty() {
-			let _ = pattern_tx.send_async(batch).await;
+	// Process any remaining patterns in the final batch
+	if !pattern_batch.is_empty() {
+		let batch_to_process = std::mem::take(&mut pattern_batch);
+		for pattern in batch_to_process {
+			if let Err(e) = dictionary.import_pattern(pattern).await {
+				eprintln!("Failed to import pattern: {}", e);
+			}
 		}
-
-		// Close pattern channel
-		drop(pattern_tx);
-	});
-
-	// Collect results from workers and merge into main dictionary
-	let mut worker_count = 0;
-	while let Ok(worker_dict) = result_rx.recv_async().await {
-		println!("Merging results from worker {} ({} patterns)", worker_count, worker_dict.len());
-
-		// Merge patterns from worker dictionary into main dictionary
-		for pattern in worker_dict.patterns {
-			dictionary.import_pattern(pattern).await?;
-		}
-
-		worker_count += 1;
 	}
 
 	println!("Dictionary now contains {} patterns after streaming import", dictionary.len());
@@ -208,6 +174,44 @@ pub async fn load_dictionary(dictionary: &mut Dictionary) -> Result<()> {
 
 	load_dictionary_streaming(dictionary, pattern_stream).await
 }
+
+/// Memory-efficient dictionary loading that processes patterns one-by-one
+/// to minimize memory allocation issues with large datasets
+pub async fn load_dictionary_memory_efficient(dictionary: &mut Dictionary, max_patterns: Option<usize>) -> Result<()> {
+	let patterns_queue = PATTERNS_QUEUE.lock().await;
+	let patterns: Vec<_> = patterns_queue.iter().cloned().collect();
+	drop(patterns_queue); // Release the lock immediately to free memory
+
+	let mut processed_count = 0;
+	let total_patterns = patterns.len();
+	let max_to_process = max_patterns.unwrap_or(total_patterns);
+
+	println!("Loading {} patterns into dictionary (memory-efficient mode)", max_to_process.min(total_patterns));
+
+	// Process patterns one by one to minimize memory usage
+	for pattern in patterns.into_iter().take(max_to_process) {
+		if let Err(e) = dictionary.import_pattern(pattern).await {
+			eprintln!("Failed to import pattern: {}", e);
+		}
+
+		processed_count += 1;
+
+		// Progress reporting
+		if processed_count % 100 == 0 {
+			println!("Processed {} / {} patterns...", processed_count, max_to_process);
+		}
+
+		// Memory management: clear signature map periodically if it gets too large
+		if processed_count % 1000 == 0 && dictionary.signature_map.len() > 5000 {
+			println!("Clearing signature map to free memory...");
+			dictionary.signature_map.clear();
+		}
+	}
+
+	println!("Dictionary now contains {} patterns", dictionary.len());
+	Ok(())
+}
+
 #[cfg(test)]
 mod tests {
 	use bigdecimal::{BigDecimal, FromPrimitive};

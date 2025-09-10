@@ -1,13 +1,11 @@
-use bigdecimal::{BigDecimal, FromPrimitive};
-use chrono::Utc;
-use database::{AspectId, DatabaseInfo};
-use splimes::{Resolution, Spline};
-
-use crate::types::{Dictionary, DictionaryConstraints, MeasurementVector, Occurrence, Pattern, PatternID, Relative, Steps};
-
 #[cfg(test)]
 mod memory_tests {
-	use super::*;
+	use bigdecimal::{BigDecimal, FromPrimitive};
+	use chrono::Utc;
+	use database::{AspectId, DatabaseInfo};
+	use splimes::{Resolution, Spline};
+
+	use crate::types::{Dictionary, DictionaryConstraints, MeasurementVector, Occurrence, Pattern, PatternID, Relative, Steps};
 
 	fn create_test_pattern(amplitudes: Vec<f64>) -> Pattern {
 		let pattern_id = PatternID::new();
