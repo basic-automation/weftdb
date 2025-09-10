@@ -18,6 +18,8 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 futures = { workspace = true }
 indexmap = { workspace = true, features = ["serde", "rayon"] }
 flume = "0.11"
+wide = "0.7"  # SIMD operations
+ahash = "0.8"  # faster hashing
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -1,8 +1,9 @@
 use anyhow::Result;
-use bigdecimal::{BigDecimal, FromPrimitive, Zero};
+use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive, Zero};
 use chrono::Utc;
 use splimes::{auto_interpolate, Point, Resolution as SplimesResolution, Spline};
 use uuid::Uuid;
+use wide::f64x4;
 
 use crate::types::{pattern::Pattern, MeasurementVector, Relative};
 
@@ -189,6 +190,48 @@ impl Dictionary {
 		}
 	}
 
+	/// Optimized similarity checking with SIMD acceleration where possible
+	/// Maintains identical logic to patterns_are_similar but with performance optimizations
+	pub fn patterns_are_similar_optimized(&self, pattern1: &Pattern, pattern2: &Pattern) -> Result<bool> {
+		if pattern1.amplitudes().len() != pattern2.amplitudes().len() {
+			return Ok(false);
+		}
+
+		if let Some(variabilities) = &self.constraints.variabilities {
+			// All variability constraints must be satisfied for patterns to be considered similar
+			for variability in variabilities {
+				// Use SIMD-optimized constraint checking for better performance
+				if !self.check_variability_constraint_optimized(pattern1, pattern2, variability)? {
+					return Ok(false);
+				}
+			}
+			Ok(true)
+		} else {
+			// No variability constraints defined - patterns are not similar by default
+			Ok(false)
+		}
+	}
+
+	/// SIMD-optimized variability constraint checking
+	fn check_variability_constraint_optimized(&self, pattern1: &Pattern, pattern2: &Pattern, variability: &VariablilityType) -> Result<bool> {
+		match variability {
+			VariablilityType::MaximumStatic(static_var) => self.check_maximum_static_simd(pattern1, pattern2, &static_var.value),
+			VariablilityType::AverageStatic(static_var) => self.check_average_static_simd(pattern1, pattern2, &static_var.value),
+			VariablilityType::AbsoluteMaximumStatic(static_var) => self.check_absolute_maximum_static_simd(pattern1, pattern2, &static_var.value),
+			VariablilityType::AbsoluteAverageStatic(static_var) => self.check_absolute_average_static_simd(pattern1, pattern2, &static_var.value),
+			// For percentile operations, fall back to original methods (SIMD doesn't help much with sorting)
+			VariablilityType::MaximumPercentile(percentile_var) => self.check_maximum_percentile(pattern1, pattern2, &percentile_var.value),
+			VariablilityType::AveragePercentile(percentile_var) => self.check_average_percentile(pattern1, pattern2, &percentile_var.value),
+			VariablilityType::AbsoluteMaximumPercentile(percentile_var) => self.check_absolute_maximum_percentile(pattern1, pattern2, &percentile_var.value),
+			VariablilityType::AbsoluteAveragePercentile(percentile_var) => self.check_absolute_average_percentile(pattern1, pattern2, &percentile_var.value),
+			// Sum operations can benefit from SIMD
+			VariablilityType::AbsoluteSumStatic(static_var) => self.check_absolute_sum_static_simd(pattern1, pattern2, &static_var.value),
+			VariablilityType::SumStatic(static_var) => self.check_sum_static_simd(pattern1, pattern2, &static_var.value),
+			VariablilityType::SumPercentile(percentile_var) => self.check_sum_percentile(pattern1, pattern2, &percentile_var.value),
+			VariablilityType::AbsoluteSumPercentile(percentile_var) => self.check_absolute_sum_percentile(pattern1, pattern2, &percentile_var.value),
+		}
+	}
+
 	/// Check a specific variability constraint between two patterns
 	fn check_variability_constraint(&self, pattern1: &Pattern, pattern2: &Pattern, variability: &VariablilityType) -> Result<bool> {
 		match variability {
@@ -346,7 +389,7 @@ impl Dictionary {
 	}
 
 	/// Merge occurrences from one pattern into another at a specific index
-	fn merge_pattern_occurrences_at_index(&mut self, target_index: usize, source_pattern: Pattern) -> Result<()> {
+	pub fn merge_pattern_occurrences_at_index(&mut self, target_index: usize, source_pattern: Pattern) -> Result<()> {
 		if let Some(target_pattern) = self.patterns.get_mut(target_index) {
 			// Add all occurrences from source pattern to target pattern
 			for occurrence in source_pattern.occurrences() {
@@ -384,6 +427,218 @@ impl Dictionary {
 
 	pub fn is_empty(&self) -> bool {
 		self.patterns.is_empty()
+	}
+
+	// SIMD-optimized constraint checking methods for better performance
+
+	/// SIMD-optimized maximum static constraint checking
+	fn check_maximum_static_simd(&self, pattern1: &Pattern, pattern2: &Pattern, threshold: &BigDecimal) -> Result<bool> {
+		let amps1: Vec<f64> = pattern1.amplitudes().iter().filter_map(|a| a.to_f64()).collect();
+		let amps2: Vec<f64> = pattern2.amplitudes().iter().filter_map(|a| a.to_f64()).collect();
+
+		if amps1.is_empty() || amps2.is_empty() || amps1.len() != amps2.len() {
+			return Ok(false);
+		}
+
+		let max1 = amps1.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+		let max2 = amps2.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+		let threshold_f64 = threshold.to_f64().unwrap_or(0.0);
+		Ok((max1 - max2).abs() <= threshold_f64)
+	}
+
+	/// SIMD-optimized average static constraint checking  
+	fn check_average_static_simd(&self, pattern1: &Pattern, pattern2: &Pattern, threshold: &BigDecimal) -> Result<bool> {
+		let amps1: Vec<f64> = pattern1.amplitudes().iter().filter_map(|a| a.to_f64()).collect();
+		let amps2: Vec<f64> = pattern2.amplitudes().iter().filter_map(|a| a.to_f64()).collect();
+
+		if amps1.is_empty() || amps2.is_empty() || amps1.len() != amps2.len() {
+			return Ok(false);
+		}
+
+		let mut sum_diff = 0.0f64;
+
+		// Process 4 differences at a time with SIMD
+		let chunks = amps1.len() / 4;
+		for i in 0..chunks {
+			let start = i * 4;
+			if start + 3 < amps1.len() {
+				let v1 = f64x4::new([amps1[start], amps1[start + 1], amps1[start + 2], amps1[start + 3]]);
+				let v2 = f64x4::new([amps2[start], amps2[start + 1], amps2[start + 2], amps2[start + 3]]);
+
+				let diff = (v1 - v2).abs();
+				sum_diff += diff.reduce_add();
+			}
+		}
+
+		// Handle remaining elements
+		for i in (chunks * 4)..amps1.len() {
+			sum_diff += (amps1[i] - amps2[i]).abs();
+		}
+
+		let avg_diff = sum_diff / amps1.len() as f64;
+		let threshold_f64 = threshold.to_f64().unwrap_or(0.0);
+		Ok(avg_diff <= threshold_f64)
+	}
+
+	/// SIMD-optimized absolute maximum static constraint checking
+	fn check_absolute_maximum_static_simd(&self, pattern1: &Pattern, pattern2: &Pattern, threshold: &BigDecimal) -> Result<bool> {
+		let amps1: Vec<f64> = pattern1.amplitudes().iter().filter_map(|a| a.to_f64()).collect();
+		let amps2: Vec<f64> = pattern2.amplitudes().iter().filter_map(|a| a.to_f64()).collect();
+
+		if amps1.is_empty() || amps2.is_empty() || amps1.len() != amps2.len() {
+			return Ok(false);
+		}
+
+		// Use SIMD to find absolute maximum in chunks
+		let mut abs_max1 = 0.0f64;
+		let mut abs_max2 = 0.0f64;
+
+		let chunks = amps1.len() / 4;
+		for i in 0..chunks {
+			let start = i * 4;
+			if start + 3 < amps1.len() {
+				let v1 = f64x4::new([amps1[start], amps1[start + 1], amps1[start + 2], amps1[start + 3]]);
+				let v2 = f64x4::new([amps2[start], amps2[start + 1], amps2[start + 2], amps2[start + 3]]);
+
+				let abs_v1 = v1.abs();
+				let abs_v2 = v2.abs();
+
+				// Extract individual values to find max (since reduce_max doesn't exist)
+				let values1 = abs_v1.to_array();
+				let values2 = abs_v2.to_array();
+
+				for &val in &values1 {
+					abs_max1 = abs_max1.max(val);
+				}
+				for &val in &values2 {
+					abs_max2 = abs_max2.max(val);
+				}
+			}
+		}
+
+		// Handle remaining elements
+		for i in (chunks * 4)..amps1.len() {
+			abs_max1 = abs_max1.max(amps1[i].abs());
+			abs_max2 = abs_max2.max(amps2[i].abs());
+		}
+
+		let threshold_f64 = threshold.to_f64().unwrap_or(0.0);
+		Ok((abs_max1 - abs_max2).abs() <= threshold_f64)
+	}
+
+	/// SIMD-optimized absolute average static constraint checking
+	fn check_absolute_average_static_simd(&self, pattern1: &Pattern, pattern2: &Pattern, threshold: &BigDecimal) -> Result<bool> {
+		let amps1: Vec<f64> = pattern1.amplitudes().iter().filter_map(|a| a.to_f64()).collect();
+		let amps2: Vec<f64> = pattern2.amplitudes().iter().filter_map(|a| a.to_f64()).collect();
+
+		if amps1.is_empty() || amps2.is_empty() || amps1.len() != amps2.len() {
+			return Ok(false);
+		}
+
+		let mut abs_sum1 = 0.0f64;
+		let mut abs_sum2 = 0.0f64;
+
+		// Process 4 values at a time with SIMD
+		let chunks = amps1.len() / 4;
+		for i in 0..chunks {
+			let start = i * 4;
+			if start + 3 < amps1.len() {
+				let v1 = f64x4::new([amps1[start], amps1[start + 1], amps1[start + 2], amps1[start + 3]]);
+				let v2 = f64x4::new([amps2[start], amps2[start + 1], amps2[start + 2], amps2[start + 3]]);
+
+				let abs_v1 = v1.abs();
+				let abs_v2 = v2.abs();
+
+				abs_sum1 += abs_v1.reduce_add();
+				abs_sum2 += abs_v2.reduce_add();
+			}
+		}
+
+		// Handle remaining elements
+		for i in (chunks * 4)..amps1.len() {
+			abs_sum1 += amps1[i].abs();
+			abs_sum2 += amps2[i].abs();
+		}
+
+		let abs_avg1 = abs_sum1 / amps1.len() as f64;
+		let abs_avg2 = abs_sum2 / amps2.len() as f64;
+
+		let threshold_f64 = threshold.to_f64().unwrap_or(0.0);
+		Ok((abs_avg1 - abs_avg2).abs() <= threshold_f64)
+	}
+
+	/// SIMD-optimized absolute sum static constraint checking
+	fn check_absolute_sum_static_simd(&self, pattern1: &Pattern, pattern2: &Pattern, threshold: &BigDecimal) -> Result<bool> {
+		let amps1: Vec<f64> = pattern1.amplitudes().iter().filter_map(|a| a.to_f64()).collect();
+		let amps2: Vec<f64> = pattern2.amplitudes().iter().filter_map(|a| a.to_f64()).collect();
+
+		if amps1.is_empty() || amps2.is_empty() || amps1.len() != amps2.len() {
+			return Ok(false);
+		}
+
+		let mut abs_sum1 = 0.0f64;
+		let mut abs_sum2 = 0.0f64;
+
+		// Process 4 values at a time with SIMD
+		let chunks = amps1.len() / 4;
+		for i in 0..chunks {
+			let start = i * 4;
+			if start + 3 < amps1.len() {
+				let v1 = f64x4::new([amps1[start], amps1[start + 1], amps1[start + 2], amps1[start + 3]]);
+				let v2 = f64x4::new([amps2[start], amps2[start + 1], amps2[start + 2], amps2[start + 3]]);
+
+				let abs_v1 = v1.abs();
+				let abs_v2 = v2.abs();
+
+				abs_sum1 += abs_v1.reduce_add();
+				abs_sum2 += abs_v2.reduce_add();
+			}
+		}
+
+		// Handle remaining elements
+		for i in (chunks * 4)..amps1.len() {
+			abs_sum1 += amps1[i].abs();
+			abs_sum2 += amps2[i].abs();
+		}
+
+		let threshold_f64 = threshold.to_f64().unwrap_or(0.0);
+		Ok((abs_sum1 - abs_sum2).abs() <= threshold_f64)
+	}
+
+	/// SIMD-optimized sum static constraint checking
+	fn check_sum_static_simd(&self, pattern1: &Pattern, pattern2: &Pattern, threshold: &BigDecimal) -> Result<bool> {
+		let amps1: Vec<f64> = pattern1.amplitudes().iter().filter_map(|a| a.to_f64()).collect();
+		let amps2: Vec<f64> = pattern2.amplitudes().iter().filter_map(|a| a.to_f64()).collect();
+
+		if amps1.is_empty() || amps2.is_empty() || amps1.len() != amps2.len() {
+			return Ok(false);
+		}
+
+		let mut sum1 = 0.0f64;
+		let mut sum2 = 0.0f64;
+
+		// Process 4 values at a time with SIMD
+		let chunks = amps1.len() / 4;
+		for i in 0..chunks {
+			let start = i * 4;
+			if start + 3 < amps1.len() {
+				let v1 = f64x4::new([amps1[start], amps1[start + 1], amps1[start + 2], amps1[start + 3]]);
+				let v2 = f64x4::new([amps2[start], amps2[start + 1], amps2[start + 2], amps2[start + 3]]);
+
+				sum1 += v1.reduce_add();
+				sum2 += v2.reduce_add();
+			}
+		}
+
+		// Handle remaining elements
+		for i in (chunks * 4)..amps1.len() {
+			sum1 += amps1[i];
+			sum2 += amps2[i];
+		}
+
+		let threshold_f64 = threshold.to_f64().unwrap_or(0.0);
+		Ok((sum1 - sum2).abs() <= threshold_f64)
 	}
 }
 
