@@ -26,4 +26,5 @@ ahash = "0.8"  # faster hashing
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 serde_json = { workspace = true }
+serial_test = "3.0"
 

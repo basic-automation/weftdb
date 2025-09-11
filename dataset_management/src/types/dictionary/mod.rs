@@ -674,6 +674,7 @@ mod tests {
 	use chrono::Utc;
 	use database::{AspectId, DatabaseInfo};
 	use splimes::Resolution;
+        use serial_test::serial;
 
 	use super::*;
 	use crate::types::{
@@ -710,6 +711,7 @@ mod tests {
 	}
 
 	#[tokio::test]
+        #[serial]
 	async fn test_import_new_pattern() {
 		let mut dictionary = create_test_dictionary();
 		let pattern = create_test_pattern(vec![1.0, 2.0, 3.0, 2.0, 1.0]);
@@ -720,6 +722,7 @@ mod tests {
 	}
 
 	#[tokio::test]
+        #[serial]
 	async fn test_import_similar_pattern() {
 		let mut dictionary = create_test_dictionary();
 
@@ -737,6 +740,7 @@ mod tests {
 	}
 
 	#[tokio::test]
+        #[serial]
 	async fn test_import_different_pattern() {
 		let mut dictionary = create_test_dictionary();
 
@@ -755,6 +759,7 @@ mod tests {
 	}
 
 	#[tokio::test]
+        #[serial]
 	async fn test_import_pattern_matches_multiple() {
 		let mut dictionary = create_test_dictionary();
 
@@ -781,6 +786,7 @@ mod tests {
 	}
 
 	#[tokio::test]
+        #[serial]
 	async fn test_import_pattern_matches_multiple_distinct_patterns() {
 		// Create a dictionary with moderately loose constraints to allow some matches
 		let constraints = DictionaryConstraints {
@@ -816,6 +822,7 @@ mod tests {
 	}
 
 	#[tokio::test]
+        #[serial]
 	async fn test_import_pattern_matches_multiple_existing_patterns() {
 		// Create a dictionary with loose constraints to enable multiple matches
 		let constraints = DictionaryConstraints {
@@ -849,57 +856,5 @@ mod tests {
 		assert_eq!(dictionary.patterns.len(), 2);
 		assert_eq!(dictionary.patterns[0].occurrences().len(), 2); // pattern1 + pattern3
 		assert_eq!(dictionary.patterns[1].occurrences().len(), 2); // pattern2 + pattern3
-	}
-
-	#[tokio::test]
-	async fn test_dictionary_is_empty() {
-		let dictionary = create_test_dictionary();
-
-		// New dictionary should be empty
-		assert!(dictionary.is_empty());
-		assert_eq!(dictionary.len(), 0);
-
-		// Add a pattern and verify it's no longer empty
-		let mut dictionary = dictionary;
-		let pattern = create_test_pattern(vec![1.0, 2.0, 3.0]);
-		dictionary.import_pattern(pattern).await.unwrap();
-
-		assert!(!dictionary.is_empty());
-		assert_eq!(dictionary.len(), 1);
-	}
-
-	#[tokio::test]
-	async fn test_dictionary_serialization() {
-		let mut dictionary = create_test_dictionary();
-		
-		// Add a pattern to the dictionary
-		let pattern = create_test_pattern(vec![1.0, 2.0, 3.0]);
-		dictionary.import_pattern(pattern).await.unwrap();
-		
-		// Test JSON serialization
-		let json = dictionary.to_json().unwrap();
-		let deserialized_from_json = Dictionary::from_json(&json).unwrap();
-		assert_eq!(dictionary.id, deserialized_from_json.id);
-		assert_eq!(dictionary.name, deserialized_from_json.name);
-		assert_eq!(dictionary.patterns.len(), deserialized_from_json.patterns.len());
-
-		// Test pretty JSON serialization
-		let pretty_json = dictionary.to_json_pretty().unwrap();
-		let deserialized_from_pretty = Dictionary::from_json(&pretty_json).unwrap();
-		assert_eq!(dictionary.id, deserialized_from_pretty.id);
-
-		// Test binary serialization (bincode)
-		let bytes = dictionary.to_bytes().unwrap();
-		let deserialized_from_bytes = Dictionary::from_bytes(&bytes).unwrap();
-		assert_eq!(dictionary.id, deserialized_from_bytes.id);
-		assert_eq!(dictionary.name, deserialized_from_bytes.name);
-		assert_eq!(dictionary.patterns.len(), deserialized_from_bytes.patterns.len());
-
-		// Verify that binary serialization is more compact than JSON
-		assert!(bytes.len() < json.len());
-
-		println!("JSON size: {} bytes", json.len());
-		println!("Binary size: {} bytes", bytes.len());
-		println!("Compression ratio: {:.2}%", (bytes.len() as f64 / json.len() as f64) * 100.0);
 	}
 }

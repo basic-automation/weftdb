@@ -201,11 +201,13 @@ mod tests {
 	use chrono::{TimeZone, Utc};
 	use database::{Database, DatabaseInfo};
 	use serde_json::json;
+	use serial_test::serial;
 	use splimes::{Point, Spline};
 
 	use super::*;
 
 	#[tokio::test(flavor = "multi_thread")]
+	#[serial]
 	async fn test_load_dictionary() -> Result<()> {
 		let database = Database::existing("Crypto").await?;
 		let subjects = database.list_subjects().await?;
@@ -286,15 +288,15 @@ mod tests {
 		load_dictionary(&mut dictionary).await?;
 		println!("Time taken for load_dictionary: {:?}", timer.elapsed());
 		println!("Dictionary now contains {} patterns", dictionary.len());
- 
 
-                // print the dictionary
-                println!("Dictionary contents: {}", json!(&dictionary));
+		// print the dictionary
+		println!("Dictionary contents: {}", json!(&dictionary));
 
 		Ok(())
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
+	#[serial]
 	async fn test_specific_process_batch() -> Result<()> {
 		let test_batch = generate_specific_test_batch();
 

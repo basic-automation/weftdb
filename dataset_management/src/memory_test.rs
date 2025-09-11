@@ -3,9 +3,10 @@ mod memory_tests {
 	use bigdecimal::{BigDecimal, FromPrimitive};
 	use chrono::Utc;
 	use database::{AspectId, DatabaseInfo};
+	use serial_test::serial;
 	use splimes::{Resolution, Spline};
 
-	use crate::types::{Dictionary, DictionaryConstraints, MeasurementVector, Occurrence, Pattern, PatternID, Relative, Steps};
+	use crate::types::{Dictionary, DictionaryConstraints, MeasurementVector, Occurrence, Pattern, PatternID, Relative, Steps, Variability, VariablilityType};
 
 	fn create_test_pattern(amplitudes: Vec<f64>) -> Pattern {
 		let pattern_id = PatternID::new();
@@ -26,7 +27,12 @@ mod memory_tests {
 	}
 
 	fn create_test_dict() -> Dictionary {
-		let constraints = DictionaryConstraints { steps: Some(Steps { count: 10, interpolation: Spline::Linear }), variabilities: None };
+		let constraints = DictionaryConstraints {
+			steps: Some(Steps { count: 10, interpolation: Spline::Linear }),
+			variabilities: Some(vec![VariablilityType::AbsoluteSumPercentile(Variability {
+				value: BigDecimal::from_f64(15.0).unwrap(), // 15% threshold for memory tests - more lenient than the 10% in regular tests
+			})]),
+		};
 		Dictionary::new("test_dict".to_string(), "Test dictionary".to_string(), constraints)
 	}
 
@@ -36,6 +42,7 @@ mod memory_tests {
 	}
 
 	#[tokio::test]
+	#[serial] // Run serially to prevent memory contention
 	async fn test_memory_usage_small() {
 		println!("Testing memory usage with 100 patterns...");
 		let mut dict = create_test_dict();
@@ -51,6 +58,7 @@ mod memory_tests {
 	}
 
 	#[tokio::test]
+	#[serial] // Run serially to prevent memory contention
 	async fn test_memory_usage_medium() {
 		println!("Testing memory usage with 500 patterns...");
 		let mut dict = create_test_dict();
@@ -66,6 +74,7 @@ mod memory_tests {
 	}
 
 	#[tokio::test]
+	#[serial] // Run serially to prevent memory contention
 	async fn test_memory_usage_large() {
 		println!("Testing memory usage with 1000 patterns...");
 		let mut dict = create_test_dict();

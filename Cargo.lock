@@ -768,6 +768,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "serial_test",
  "splimes",
  "tokio",
  "uuid",
