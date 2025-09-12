@@ -673,8 +673,8 @@ mod tests {
 	use bigdecimal::FromPrimitive;
 	use chrono::Utc;
 	use database::{AspectId, DatabaseInfo};
+	use serial_test::serial;
 	use splimes::Resolution;
-        use serial_test::serial;
 
 	use super::*;
 	use crate::types::{
@@ -711,7 +711,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-        #[serial]
+	#[serial]
 	async fn test_import_new_pattern() {
 		let mut dictionary = create_test_dictionary();
 		let pattern = create_test_pattern(vec![1.0, 2.0, 3.0, 2.0, 1.0]);
@@ -722,7 +722,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-        #[serial]
+	#[serial]
 	async fn test_import_similar_pattern() {
 		let mut dictionary = create_test_dictionary();
 
@@ -740,7 +740,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-        #[serial]
+	#[serial]
 	async fn test_import_different_pattern() {
 		let mut dictionary = create_test_dictionary();
 
@@ -759,7 +759,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-        #[serial]
+	#[serial]
 	async fn test_import_pattern_matches_multiple() {
 		let mut dictionary = create_test_dictionary();
 
@@ -786,7 +786,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-        #[serial]
+	#[serial]
 	async fn test_import_pattern_matches_multiple_distinct_patterns() {
 		// Create a dictionary with moderately loose constraints to allow some matches
 		let constraints = DictionaryConstraints {
@@ -822,7 +822,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-        #[serial]
+	#[serial]
 	async fn test_import_pattern_matches_multiple_existing_patterns() {
 		// Create a dictionary with loose constraints to enable multiple matches
 		let constraints = DictionaryConstraints {
