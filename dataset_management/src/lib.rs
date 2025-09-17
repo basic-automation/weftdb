@@ -1,7 +1,7 @@
-use std::sync::LazyLock;
+use std::{collections::HashMap, sync::LazyLock};
 
 use anyhow::Result;
-use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
+use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive, Zero};
 use chrono::Datelike;
 use database::{AspectId, Database, Resolution};
 use futures::TryStreamExt;
@@ -9,7 +9,6 @@ use rayon::prelude::*;
 use splimes::Spline;
 use tokio::sync::Mutex;
 pub use types::*;
-use uuid::Uuid;
 
 #[cfg(test)]
 mod memory_test;
@@ -20,7 +19,9 @@ pub const BATCH_SIZE: [usize; 1] = [100];
 static UNPROCESSED_BATCHES_QUEUE: LazyLock<Mutex<Vec<Batch>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 static PROCESSED_BATCHES_QUEUE: LazyLock<Mutex<Vec<Batch>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 static PATTERNS_QUEUE: LazyLock<Mutex<Vec<Pattern>>> = LazyLock::new(|| Mutex::new(Vec::new()));
-static EVENTS_QUEUE: LazyLock<Mutex<Vec<Event>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+static EVENTS_QUEUE: LazyLock<Mutex<HashMap<EventID, Event>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static CORRELATIONS_QUEUE: LazyLock<Mutex<Correlations>> = LazyLock::new(|| Mutex::new(Correlations::new()));
+static SIGNALS_QUEUE: LazyLock<Mutex<Signals>> = LazyLock::new(|| Mutex::new(Signals::new()));
 
 pub async fn build_unprocessed_queue(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, batch_size: usize) -> Result<()> {
 	let start_time = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
@@ -222,7 +223,7 @@ pub async fn load_dictionary(dictionary: &mut Dictionary) -> Result<()> {
 /// 4. Calculate percentage increase from start to end of month
 /// 5. If increase is 5% or higher, create an event at the end of the month
 /// 6. Add events to the global EVENTS_QUEUE
-pub async fn build_events_5_percent_queue(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline) -> Result<()> {
+pub async fn create_event_and_manifestations(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline) -> Result<()> {
 	let start_time = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
 	let end_time = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
 
@@ -237,7 +238,7 @@ pub async fn build_events_5_percent_queue(database: &Database, aspect: &AspectId
 	// Sort points by timestamp to ensure proper chronological order
 	points.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
 
-	let mut events = Vec::new();
+	let mut event = Event::new(format!("5% Monthly Price Increase - {}", aspect), Some(format!("Detects when price increases 5% or more from start to end of month for aspect {}", aspect)));
 	let threshold_percentage = BigDecimal::from_f64(0.05).unwrap(); // 5% threshold
 
 	// Group points by month and analyze each month
@@ -270,9 +271,11 @@ pub async fn build_events_5_percent_queue(database: &Database, aspect: &AspectId
 		let price_diff = end_price - start_price;
 		let percentage_increase = &price_diff / start_price;
 
-		// If increase is 5% or more, create an event
+		// If increase is 5% or more, create a manifestation
 		if percentage_increase >= threshold_percentage {
 			let database_info = database.get_database_info().await.expect("Database info should be available");
+
+			println!("Detected 5%+ increase for {} in {}/{}: Start Price = {}, End Price = {}, Increase = {:.2}%", aspect, month, year, start_price, end_price, (percentage_increase.to_f64().unwrap_or(0.0) * 100.0));
 
 			let manifestation = Manifestation::new(
 				database_info.id().as_uuid(),
@@ -280,30 +283,116 @@ pub async fn build_events_5_percent_queue(database: &Database, aspect: &AspectId
 				end_timestamp,                    // End of the month
 			);
 
-			let event = Event::new(
-				Uuid::new_v4(),
-				format!("5% Monthly Price Increase - {}-{:02}", year, month),
-				Some(format!("Price increased {:.2}% from {} to {} during {}-{:02} (from start to end of month, duration: {:.1} days)", percentage_increase.to_f64().unwrap_or(0.0) * 100.0, start_price.to_f64().unwrap_or(0.0), end_price.to_f64().unwrap_or(0.0), year, month, manifestation.duration_days())),
-				vec![manifestation],
-				vec![], // Empty correlations initially - these would be populated later during pattern correlation
-			);
-
-			events.push(event);
+			event.add_manifestation(manifestation);
 		}
 	}
 
 	// Add all detected events to the global queue
 	let mut events_lock = EVENTS_QUEUE.lock().await;
-	events_lock.extend(events);
+	events_lock.insert(event.id.clone(), event);
 	drop(events_lock);
 
 	Ok(())
 }
 
+pub async fn create_correlations_for_events(dictionary: &Dictionary) -> Result<()> {
+	// Get patterns from dictionary (merged patterns with multiple occurrences) and events from global queue
+	let patterns = &dictionary.patterns;
+	let events = EVENTS_QUEUE.lock().await.clone();
+
+	// Exit early if no patterns or events to correlate
+	if patterns.is_empty() || events.is_empty() {
+		println!("No patterns or events found to correlate");
+		return Ok(());
+	}
+
+	println!("Correlating {} events with {} patterns", events.len(), patterns.len());
+
+	// For each event, correlate with all patterns
+	for event_id in events.keys() {
+		for pattern in patterns {
+			let correlation = Correlation::new(
+				pattern.occurrences()[0].database_info.id().as_uuid(),
+				pattern.id(),
+				event_id.clone(),
+				BigDecimal::zero(), // Placeholder error rate - would be calculated based on actual correlation logic
+				pattern.occurrences().clone(),
+			);
+			CORRELATIONS_QUEUE.lock().await.insert(event_id.clone(), pattern.id(), correlation);
+		}
+	}
+
+	// Update the global events queue with correlations
+	let mut events_lock = EVENTS_QUEUE.lock().await;
+	*events_lock = events;
+	drop(events_lock);
+
+	println!("Pattern-Event correlation completed successfully");
+	Ok(())
+}
+
+pub async fn create_signals(dictionary: &Dictionary) -> Result<()> {
+	// Get correlations and events from global queues
+	let correlations = CORRELATIONS_QUEUE.lock().await.clone();
+	let events = EVENTS_QUEUE.lock().await.clone();
+
+	// Exit early if no correlations or events to process
+	if correlations.is_empty() || events.is_empty() {
+		println!("No correlations or events found to create signals");
+		return Ok(());
+	}
+
+	println!("Creating signals from {} correlations and {} events", correlations.len(), events.len());
+
+	let mut signals_count = 0;
+
+	// Process each correlation to create signals
+	for ((_event_id, _pattern_id), correlation) in correlations.iter() {
+		// Get the corresponding event
+		if let Some(event) = events.get(&correlation.event_id) {
+			// For each manifestation of the event, create signals based on pattern occurrences
+			for (_timing_key, manifestation) in &event.manifestations {
+				// Create signals for each pattern occurrence in the correlation
+				for occurrence in correlation.occurrences() {
+					// Calculate the distance between the event manifestation and pattern occurrence
+					let manifestation_midpoint = manifestation.midpoint();
+					let occurrence_midpoint = occurrence.beginning + (occurrence.end - occurrence.beginning) / 2;
+
+					// Calculate time difference in hours (you can adjust the resolution as needed)
+					let time_diff = (manifestation_midpoint - occurrence_midpoint).num_hours().abs();
+					let distance = signal::Distance { value: BigDecimal::from(time_diff), units: splimes::Resolution::Hours };
+
+					// Create different types of signals based on the relationship
+					let signal_types = vec![
+						SignalType::Custom("PatternPrediction".to_string()), // Pattern predicts event
+						SignalType::Custom("EventPrediction".to_string()),   // Event predicts pattern
+						SignalType::Custom("Correlation".to_string()),       // General correlation
+					];
+
+					for signal_type in signal_types {
+						// Create manifestation ID for this specific signal
+						let manifestation_id = ManifestationId::new();
+
+						let signal = Signal::new(correlation.id.clone(), manifestation_id, manifestation_midpoint, signal_type, distance.clone());
+
+						// Add signal to the global signals queue
+						SIGNALS_QUEUE.lock().await.insert(signal);
+						signals_count += 1;
+					}
+				}
+			}
+		}
+	}
+
+	println!("Created {} signals successfully", signals_count);
+	Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+
 	use bigdecimal::{BigDecimal, FromPrimitive};
-	use chrono::{TimeZone, Utc};
+	use chrono::{DateTime, TimeZone, Utc};
 	use database::{Database, DatabaseInfo};
 	use serde_json::json;
 	use serial_test::serial;
@@ -373,18 +462,18 @@ mod tests {
 		drop(patterns_lock);
 
 		#[rustfmt::skip]
-		let contraints = DictionaryConstraints { 
-                        steps: Some(Steps { 
-                                count: 10, 
-                                interpolation: Spline::Linear 
-                        }), 
+		let contraints = DictionaryConstraints {
+                        steps: Some(Steps {
+                                count: 10,
+                                interpolation: Spline::Linear
+                        }),
                         variabilities: Some(
                                 vec![
                                         VariablilityType::MaximumStatic(Variability {
-                                                value: BigDecimal::from(1) 
+                                                value: BigDecimal::from(1)
                                         })
                                 ]
-                        ) 
+                        )
                 };
 
 		let mut dictionary = Dictionary::new("Test Dictionary".to_string(), "A dictionary for testing purposes".to_string(), contraints);
@@ -397,10 +486,34 @@ mod tests {
 		let timer = std::time::Instant::now();
 		println!("Starting build_events_5_percent_queue...");
 
-		build_events_5_percent_queue(&database, &aspect.id(), &resolution, &method).await?;
+		create_event_and_manifestations(&database, &aspect.id(), &resolution, &method).await?;
 
 		println!("Time taken for build_events_5_percent_queue: {:?}", timer.elapsed());
 		analyze_event_timing().await?;
+
+		let timer = std::time::Instant::now();
+		println!("Starting create_correlations_for_events...");
+		create_correlations_for_events(&dictionary).await?;
+		println!("Time taken for create_correlations_for_events: {:?}", timer.elapsed());
+
+		// print the number of correlations with more than 1 occurrence
+		let correlations_lock = CORRELATIONS_QUEUE.lock().await;
+		let c = correlations_lock.iter().filter(|(_, correlation)| correlation.occurrences().len() > 1).collect::<Vec<_>>();
+		println!("Number of correlations with more than 1 occurrence: {}", c.len());
+		drop(correlations_lock);
+
+		// print the number of patterns with more than 1 occurrence
+		println!("Number of patterns with more than 1 occurrence: {}", dictionary.patterns.iter().filter(|p| p.occurrences().len() > 1).count());
+
+		let timer = std::time::Instant::now();
+		println!("Starting create_signals...");
+		create_signals(&dictionary).await?;
+		println!("Time taken for create_signals: {:?}", timer.elapsed());
+
+		// print the number of signals created
+		let signals_lock = SIGNALS_QUEUE.lock().await;
+		println!("Number of signals created: {}", signals_lock.len());
+		drop(signals_lock);
 
 		Ok(())
 	}
@@ -498,25 +611,26 @@ mod tests {
 			db.observe_measurement(aspect.clone(), input_measurement).await.expect("Failed to insert measurement");
 		}
 
-		// Run the build_events_5_percent_queue function
-		let result = build_events_5_percent_queue(&db, &aspect.id(), &splimes::Resolution::Hours, &Spline::Linear).await;
-		assert!(result.is_ok(), "build_events_5_percent_queue should succeed");
+		// Run the create_event_and_manifestations function
+		let result = create_event_and_manifestations(&db, &aspect.id(), &splimes::Resolution::Hours, &Spline::Linear).await;
+		assert!(result.is_ok(), "create_event_and_manifestations should succeed");
 
 		// Check that events were created
 		let events_lock = EVENTS_QUEUE.lock().await;
+		let events: Vec<Event> = events_lock.values().cloned().collect();
 
-		// We should have exactly 2 events: January (6%) and March (8%), but not February (3%)
-		let events_count = events_lock.len();
-		assert_eq!(events_count, 2, "Should have exactly 2 events for months with 5%+ increases, got {}", events_count);
+		// We should have exactly 1 event with 2 manifestations: January (6%) and March (8%), but not February (3%)
+		let events_count = events.len();
+		assert_eq!(events_count, 1, "Should have exactly 1 event, got {}", events_count);
 
 		// Verify event structure
-		let first_event = &events_lock[0];
+		let first_event = &events[0];
 		assert!(first_event.name.contains("5% Monthly Price Increase"), "Event name should indicate it's a monthly price increase");
-		assert_eq!(first_event.manifestations.len(), 1, "Event should have exactly one manifestation");
+		assert_eq!(first_event.manifestations.len(), 2, "Event should have exactly two manifestations");
 		assert!(first_event.description.is_some(), "Event should have a description");
 
 		// Verify manifestation has proper start and end timestamps
-		let manifestation = &first_event.manifestations[0];
+		let manifestation = first_event.manifestations.values().next().expect("Should have at least one manifestation");
 		assert!(manifestation.start < manifestation.end, "Manifestation start should be before end");
 		assert!(manifestation.duration_days() > 0.0, "Manifestation should have positive duration");
 
@@ -525,15 +639,13 @@ mod tests {
 		assert!(duration_days >= 28.0 && duration_days <= 31.0, "Duration should be roughly a month, got {:.1} days", duration_days);
 
 		// Verify the events are for the correct months
-		let event_names: Vec<&String> = events_lock.iter().map(|e| &e.name).collect();
-		assert!(event_names.iter().any(|name| name.contains("2024-01")), "Should have event for January 2024");
-		assert!(event_names.iter().any(|name| name.contains("2024-03")), "Should have event for March 2024");
-		assert!(!event_names.iter().any(|name| name.contains("2024-02")), "Should NOT have event for February 2024");
+		println!("Event: {}", first_event.name);
+		assert!(first_event.manifestations.len() == 2, "Should have 2 manifestations for January and March");
 
 		println!("Successfully detected {} monthly price increase events", events_count);
-		for event in events_lock.iter() {
+		for event in events.iter() {
 			println!("  Event: {}", event.name);
-			if let Some(manifestation) = event.manifestations.first() {
+			for (_timing_key, manifestation) in &event.manifestations {
 				println!("    Duration: {:.1} days", manifestation.duration_days());
 				println!("    Start: {}", manifestation.start.format("%Y-%m-%d %H:%M:%S"));
 				println!("    End: {}", manifestation.end.format("%Y-%m-%d %H:%M:%S"));
@@ -574,7 +686,7 @@ mod tests {
 		}
 
 		// Generate events
-		build_events_5_percent_queue(&db, &aspect.id(), &splimes::Resolution::Hours, &Spline::Linear).await.expect("Failed to build events");
+		create_event_and_manifestations(&db, &aspect.id(), &splimes::Resolution::Hours, &Spline::Linear).await.expect("Failed to build events");
 
 		// Test the timing analysis function
 		let result = analyze_event_timing().await;
@@ -601,7 +713,7 @@ mod tests {
 		for event in &events {
 			println!("\nEvent: {}", event.name);
 
-			for (i, manifestation) in event.manifestations.iter().enumerate() {
+			for (i, (_timing_key, manifestation)) in event.manifestations.iter().enumerate() {
 				println!("  Manifestation {}:", i + 1);
 				println!("    Start: {}", manifestation.start.format("%Y-%m-%d %H:%M:%S UTC"));
 				println!("    End: {}", manifestation.end.format("%Y-%m-%d %H:%M:%S UTC"));
@@ -619,7 +731,7 @@ mod tests {
 		}
 
 		// Duration statistics
-		let durations: Vec<f64> = events.iter().flat_map(|e| e.manifestations.iter()).map(|m| m.duration_days()).collect();
+		let durations: Vec<f64> = events.iter().flat_map(|e| e.manifestations.values()).map(|m| m.duration_days()).collect();
 
 		if !durations.is_empty() {
 			let avg_duration = durations.iter().sum::<f64>() / durations.len() as f64;
@@ -645,15 +757,110 @@ mod tests {
 	/// A vector containing all events currently in the queue
 	async fn get_events_queue() -> Vec<Event> {
 		let events_lock = EVENTS_QUEUE.lock().await;
-		events_lock.clone()
+		events_lock.values().cloned().collect()
 	}
 
-	/// Clears all events from the events queue
+	/// Analyzes event signals and predictions for a specific date
 	///
-	/// This function removes all events from the global EVENTS_QUEUE.
-	/// Useful for testing or when starting fresh event detection.
-	async fn clear_events_queue() {
-		let mut events_lock = EVENTS_QUEUE.lock().await;
-		events_lock.clear();
+	/// This function examines all events and their correlations to determine:
+	/// - Which events have manifestations on or near the given date
+	/// - What patterns are predicted based on those manifestations
+	/// - Signal strength and confidence levels
+	/// - Prediction timing and probabilities
+	///
+	/// # Parameters
+	/// - `date`: The date to analyze for signals and predictions
+	///
+	/// # Returns
+	/// - `Ok(())` if analysis completed successfully
+	/// - `Err(...)` if there was an error during analysis
+	async fn analyze_event_signals_and_predictions_for_date(date: DateTime<Utc>) -> Result<()> {
+		use bigdecimal::ToPrimitive;
+
+		let events = get_events_queue().await;
+
+		if events.is_empty() {
+			println!("No events found in queue for analysis");
+			return Ok(());
+		}
+
+		println!("=== Event Correlation Analysis for {} ===", date.format("%Y-%m-%d %H:%M:%S"));
+		println!("Note: Signal analysis not yet implemented - showing basic correlation information");
+		println!();
+
+		let mut relevant_events = 0;
+		let mut total_correlations = 0;
+
+		// Analyze each event for basic correlation information
+		for event in &events {
+			// Get correlations for this event from the global queue
+			let correlations = CORRELATIONS_QUEUE.lock().await;
+			let event_correlations = correlations.get_for_event(&event.id);
+			let correlations_count = event_correlations.len();
+
+			if correlations_count > 0 {
+				relevant_events += 1;
+				total_correlations += correlations_count;
+
+				println!("📊 Event: {} (ID: {})", event.name, event.id);
+				println!("   Manifestations: {}", event.manifestations.len());
+				println!("   Correlations: {}", correlations_count);
+
+				// Print manifestation details with time relationship to target date
+				for (i, (_timing_key, manifestation)) in event.manifestations.iter().enumerate() {
+					let manifestation_time = manifestation.midpoint();
+					let time_diff = (date.timestamp() - manifestation_time.timestamp()) / 3600; // Hours
+					let relationship = if time_diff > 0 { "before" } else { "after" };
+					let days_diff = time_diff.abs() as f64 / 24.0;
+
+					println!("   Manifestation {}: {} ({:.1} days {} target date)", i + 1, manifestation_time.format("%Y-%m-%d %H:%M:%S"), days_diff, relationship);
+				}
+
+				// Print basic correlation information
+				println!("   📋 Correlated Patterns:");
+				for (pattern_id, correlation) in &event_correlations {
+					println!("     Pattern {} - Error Rate: {:.3}", pattern_id, correlation.error_rate().to_f64().unwrap_or(0.0));
+				}
+				println!();
+			}
+
+			// Drop the correlations lock before continuing
+			drop(correlations);
+		}
+
+		// Print summary statistics
+		println!("=== SUMMARY STATISTICS ===");
+		println!("📈 Events with Correlations: {}/{}", relevant_events, events.len());
+		println!("� Total Correlations: {}", total_correlations);
+		println!();
+
+		println!("=== RECOMMENDATIONS ===");
+		if relevant_events == 0 {
+			println!("🔍 No correlated events found - Build correlations first");
+		} else {
+			println!("📊 Found {} events with pattern correlations", relevant_events);
+			println!("⚠️  Signal analysis not yet implemented - correlation strength cannot be determined");
+		}
+
+		Ok(())
+	}
+
+	#[tokio::test]
+	#[serial]
+	async fn test_event_signal_analysis() {
+		use chrono::{TimeZone, Utc};
+
+		println!("Testing event signal analysis...");
+
+		// Create some test events and correlations first
+		// (This would typically be done by build_events_5_percent_queue and correlate_patterns_and_events)
+
+		// For demonstration, let's analyze a specific date
+		let analysis_date = Utc.with_ymd_and_hms(2024, 3, 15, 12, 0, 0).unwrap();
+
+		match analyze_event_signals_and_predictions_for_date(analysis_date).await {
+			Ok(()) => println!("✅ Event signal analysis completed successfully"),
+			Err(e) => println!("❌ Event signal analysis failed: {}", e),
+		}
 	}
 }

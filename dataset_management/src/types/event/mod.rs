@@ -1,12 +1,54 @@
-use bigdecimal::BigDecimal;
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::types::pattern::Occurrence;
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub struct ManifestationId(Uuid); // Wrapper for event ID
+
+impl Default for ManifestationId {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+impl ManifestationId {
+	pub fn new() -> Self {
+		Self(Uuid::new_v4())
+	}
+
+	pub fn from_uuid(id: Uuid) -> Self {
+		Self(id)
+	}
+
+	pub fn to_uuid(&self) -> Uuid {
+		self.0
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub struct ManifestationDate(DateTime<Utc>);
+
+impl ManifestationDate {
+    pub fn new(date: DateTime<Utc>) -> Self {
+        Self(date)
+    }
+
+    pub fn to_datetime(&self) -> DateTime<Utc> {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ManifestationId {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}", self.to_uuid())
+	}
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifestation {
+	pub id: ManifestationId,
 	pub dataset_id: Uuid,
 	pub start: DateTime<Utc>,
 	pub end: DateTime<Utc>,
@@ -15,7 +57,7 @@ pub struct Manifestation {
 impl Manifestation {
 	/// Create a new manifestation with start and end timestamps
 	pub fn new(dataset_id: Uuid, start: DateTime<Utc>, end: DateTime<Utc>) -> Self {
-		Self { dataset_id, start, end }
+		Self { id: ManifestationId::new(), dataset_id, start, end }
 	}
 
 	/// Get the duration of this manifestation
@@ -45,39 +87,50 @@ impl Manifestation {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Signal {
-	pub distance: BigDecimal,
-	pub average: ErrVal,
-	pub sum: ErrVal,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub struct EventID(Uuid); // Wrapper for event ID
+
+impl Default for EventID {
+	fn default() -> Self {
+		Self::new()
+	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ErrVal {
-	pub value: BigDecimal,
-	pub error: BigDecimal,
+impl EventID {
+	pub fn new() -> Self {
+		EventID(Uuid::new_v4())
+	}
+
+	pub fn from_uuid(id: Uuid) -> Self {
+		EventID(id)
+	}
+
+	pub fn to_uuid(&self) -> Uuid {
+		self.0
+	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Correlation {
-	pub dictionary_id: Uuid,
-	pub pattern_id: Uuid,
-	error_rate: BigDecimal,
-	signal: Signal,
-	occurrences: Vec<Occurrence>,
+impl std::fmt::Display for EventID {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}", self.0)
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
-	pub id: Uuid,
+	pub id: EventID,
 	pub name: String,
 	pub description: Option<String>,
-	pub manifestations: Vec<Manifestation>,
-	pub correlations: Vec<Correlation>,
+	pub manifestations: HashMap<(DateTime<Utc>, DateTime<Utc>), Manifestation>, // Keyed by (start, end) tuple
 }
 
 impl Event {
-	pub fn new(id: Uuid, name: String, description: Option<String>, manifestations: Vec<Manifestation>, correlations: Vec<Correlation>) -> Self {
-		Self { id, name, description, manifestations, correlations }
+	pub fn new(name: String, description: Option<String>) -> Self {
+		let id = EventID::new();
+		Self { id, name, description, manifestations: HashMap::new() }
+	}
+
+	pub fn add_manifestation(&mut self, manifestation: Manifestation) {
+		self.manifestations.entry((manifestation.start, manifestation.end)).or_insert(manifestation);
 	}
 }
