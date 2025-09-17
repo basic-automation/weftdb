@@ -1,21 +1,25 @@
 pub use analysis::Analysis;
 pub use batched_measurement::BatchedMeasurement;
 pub use batches::{Batch, Batches};
+pub use correlation::{Correlation, CorrelationID, Correlations};
 pub use dictionary::{Dictionary, DictionaryConstraints, Steps, Variability, VariablilityType};
 pub use distance::Distance;
-pub use event::{Event, Manifestation};
+pub use event::{Event, EventID, Manifestation, ManifestationId};
 pub use measurement_vector::MeasurementVector;
 pub use pattern::{Occurrence, Pattern, PatternID};
 pub use relative::Relative;
+pub use signal::{ErrVal, Signal, SignalType, Signals};
 pub use trend::Trend;
 
 mod analysis;
 mod batched_measurement;
 mod batches;
+mod correlation;
 mod dictionary;
 mod distance;
 mod event;
 mod measurement_vector;
 mod pattern;
 mod relative;
+pub mod signal;
 mod trend;
