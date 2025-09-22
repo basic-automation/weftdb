@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::event::EventID;
-use crate::{types::pattern::Occurrence, PatternID};
+use crate::{types::pattern::Occurrence, PatternID, SignalType};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub struct CorrelationID(Uuid); // Wrapper for event ID
@@ -36,24 +36,38 @@ impl std::fmt::Display for CorrelationID {
 	}
 }
 
+pub type AvgErrorRate = BigDecimal;
+pub type SumErrorRate = BigDecimal;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Correlation {
 	pub id: CorrelationID,
 	pub dictionary_id: Uuid,
 	pub pattern_id: PatternID,
 	pub event_id: EventID,
-	pub error_rate: BigDecimal,
+	pub error_rate: HashMap<SignalType, (AvgErrorRate, SumErrorRate)>, // Average and sum error rates per signal type
 	pub occurrences: Vec<Occurrence>,
 }
 
 impl Correlation {
-	pub fn new(dictionary_id: Uuid, pattern_id: PatternID, event_id: EventID, error_rate: BigDecimal, occurrences: Vec<Occurrence>) -> Self {
+	pub fn new(dictionary_id: Uuid, pattern_id: PatternID, event_id: EventID, error_rate: (AvgErrorRate, SumErrorRate), occurrences: Vec<Occurrence>) -> Self {
 		let id = CorrelationID::new();
-		Self { id, dictionary_id, pattern_id, event_id, error_rate, occurrences }
+		let mut error_rate_map = HashMap::new();
+		// Initialize with a default SignalType - we can add other types later
+		error_rate_map.insert(SignalType::Custom("default".to_string()), error_rate);
+		Self { id, dictionary_id, pattern_id, event_id, error_rate: error_rate_map, occurrences }
 	}
 
-	pub fn error_rate(&self) -> &BigDecimal {
+	pub fn error_rate(&self) -> &HashMap<SignalType, (AvgErrorRate, SumErrorRate)> {
 		&self.error_rate
+	}
+
+	pub fn get_error_rate(&self, signal_type: &SignalType) -> Option<&(AvgErrorRate, SumErrorRate)> {
+		self.error_rate.get(signal_type)
+	}
+
+	pub fn set_error_rate(&mut self, signal_type: SignalType, error_rate: (AvgErrorRate, SumErrorRate)) {
+		self.error_rate.insert(signal_type, error_rate);
 	}
 
 	pub fn occurrences(&self) -> &Vec<Occurrence> {

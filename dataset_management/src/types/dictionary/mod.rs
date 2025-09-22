@@ -1,8 +1,7 @@
 use anyhow::Result;
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive, Zero};
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use splimes::{auto_interpolate, Point, Resolution as SplimesResolution, Spline};
+use splimes::Spline;
 use uuid::Uuid;
 use wide::f64x4;
 
@@ -97,7 +96,7 @@ impl Dictionary {
 		Ok(())
 	}
 
-	/// Convert pattern to match the required number of steps using auto_interpolate
+	/// Convert pattern to match the required number of steps using direct interpolation
 	async fn convert_pattern_steps(&self, pattern: Pattern, steps_config: &Steps) -> Result<Pattern> {
 		let relatives = pattern.relatives();
 		if relatives.is_empty() {
@@ -111,25 +110,14 @@ impl Dictionary {
 			return Ok(pattern);
 		}
 
-		// Convert relatives to points for interpolation
-		let mut points: Vec<Point> = relatives
-			.iter()
-			.enumerate()
-			.map(|(i, relative)| {
-				let timestamp = Utc::now() + chrono::Duration::seconds(i as i64);
-				Point::new(timestamp, relative.vector().amplitude().clone())
-			})
-			.collect();
-
-		// If we only have one point, we can't interpolate - just duplicate it
-		if points.len() == 1 {
-			let single_amplitude = &points[0].value;
+		// If we only have one point, duplicate it across all required steps
+		if relatives.len() == 1 {
+			let single_relative = &relatives[0];
 			let new_relatives: Vec<Relative> = (0..required_steps)
 				.map(|i| {
 					let location = BigDecimal::from_f64(i as f64 / (required_steps - 1) as f64).unwrap_or_else(|| BigDecimal::from(0));
-					let vector = MeasurementVector::new(location, single_amplitude.clone());
-					// Use the same max_x and max_y from the original relative
-					Relative::new(vector, relatives[0].max_x().clone(), relatives[0].max_y().clone())
+					let vector = MeasurementVector::new(location, single_relative.vector().amplitude().clone());
+					Relative::new(vector, single_relative.max_x().clone(), single_relative.max_y().clone())
 				})
 				.collect();
 
@@ -137,42 +125,34 @@ impl Dictionary {
 			return Ok(new_pattern);
 		}
 
-		// Use auto_interpolate from splimes for sophisticated interpolation
-		let start_time = points[0].timestamp;
-		let end_time = points[points.len() - 1].timestamp;
-		let resolution = SplimesResolution::Seconds;
+		println!("DEBUG: convert_pattern_steps - current_steps: {}, required_steps: {}", current_steps, required_steps);
 
-		// Calculate the time duration and step size for required steps
-		let total_duration = end_time.signed_duration_since(start_time);
-		let step_duration = total_duration / (required_steps - 1) as i32;
+		// Perform direct interpolation on the relative data
+		let new_relatives: Vec<Relative> = (0..required_steps)
+			.map(|i| {
+				// Calculate target location (0.0 to 1.0)
+				let target_location = if required_steps == 1 { BigDecimal::from(0) } else { BigDecimal::from_f64(i as f64 / (required_steps - 1) as f64).unwrap_or_else(|| BigDecimal::from(0)) };
 
-		// Ensure we have enough time range for interpolation
-		let interpolation_end_time = start_time + step_duration * (required_steps - 1) as i32;
-
-		// Use auto_interpolate with the specified spline type from steps_config
-		let interpolated_points = auto_interpolate(&mut points, start_time, interpolation_end_time, resolution, steps_config.interpolation).await?;
-
-		// Convert interpolated points back to relatives
-		let new_relatives: Vec<Relative> = interpolated_points
-			.into_iter()
-			.enumerate()
-			.map(|(i, point)| {
-				let location = BigDecimal::from_f64(i as f64 / (required_steps - 1) as f64).unwrap_or_else(|| BigDecimal::from(0));
-				let vector = MeasurementVector::new(location, point.value);
+				// Find the interpolated amplitude at this location using linear interpolation
+				let interpolated_amplitude = interpolate_amplitude_at_location(relatives, &target_location);
 
 				// Use average max_x and max_y from original relatives
 				let avg_max_x = self.calculate_average_max_x(relatives);
 				let avg_max_y = self.calculate_average_max_y(relatives);
+
+				let vector = MeasurementVector::new(target_location, interpolated_amplitude);
 				Relative::new(vector, avg_max_x, avg_max_y)
 			})
 			.collect();
+
+		println!("DEBUG: input relatives count: {}, output relatives count: {}", relatives.len(), new_relatives.len());
 
 		let new_pattern = Pattern::new(pattern.id(), pattern.occurrences().clone(), new_relatives);
 		Ok(new_pattern)
 	}
 
 	/// Check if two patterns are similar based on the dictionary's variability constraints
-	fn patterns_are_similar(&self, pattern1: &Pattern, pattern2: &Pattern) -> Result<bool> {
+	pub fn patterns_are_similar(&self, pattern1: &Pattern, pattern2: &Pattern) -> Result<bool> {
 		if pattern1.amplitudes().len() != pattern2.amplitudes().len() {
 			return Ok(false);
 		}
@@ -191,49 +171,7 @@ impl Dictionary {
 		}
 	}
 
-	/// Optimized similarity checking with SIMD acceleration where possible
-	/// Maintains identical logic to patterns_are_similar but with performance optimizations
-	pub fn patterns_are_similar_optimized(&self, pattern1: &Pattern, pattern2: &Pattern) -> Result<bool> {
-		if pattern1.amplitudes().len() != pattern2.amplitudes().len() {
-			return Ok(false);
-		}
-
-		if let Some(variabilities) = &self.constraints.variabilities {
-			// All variability constraints must be satisfied for patterns to be considered similar
-			for variability in variabilities {
-				// Use SIMD-optimized constraint checking for better performance
-				if !self.check_variability_constraint_optimized(pattern1, pattern2, variability)? {
-					return Ok(false);
-				}
-			}
-			Ok(true)
-		} else {
-			// No variability constraints defined - patterns are not similar by default
-			Ok(false)
-		}
-	}
-
-	/// SIMD-optimized variability constraint checking
-	fn check_variability_constraint_optimized(&self, pattern1: &Pattern, pattern2: &Pattern, variability: &VariablilityType) -> Result<bool> {
-		match variability {
-			VariablilityType::MaximumStatic(static_var) => self.check_maximum_static_simd(pattern1, pattern2, &static_var.value),
-			VariablilityType::AverageStatic(static_var) => self.check_average_static_simd(pattern1, pattern2, &static_var.value),
-			VariablilityType::AbsoluteMaximumStatic(static_var) => self.check_absolute_maximum_static_simd(pattern1, pattern2, &static_var.value),
-			VariablilityType::AbsoluteAverageStatic(static_var) => self.check_absolute_average_static_simd(pattern1, pattern2, &static_var.value),
-			// For percentile operations, fall back to original methods (SIMD doesn't help much with sorting)
-			VariablilityType::MaximumPercentile(percentile_var) => self.check_maximum_percentile(pattern1, pattern2, &percentile_var.value),
-			VariablilityType::AveragePercentile(percentile_var) => self.check_average_percentile(pattern1, pattern2, &percentile_var.value),
-			VariablilityType::AbsoluteMaximumPercentile(percentile_var) => self.check_absolute_maximum_percentile(pattern1, pattern2, &percentile_var.value),
-			VariablilityType::AbsoluteAveragePercentile(percentile_var) => self.check_absolute_average_percentile(pattern1, pattern2, &percentile_var.value),
-			// Sum operations can benefit from SIMD
-			VariablilityType::AbsoluteSumStatic(static_var) => self.check_absolute_sum_static_simd(pattern1, pattern2, &static_var.value),
-			VariablilityType::SumStatic(static_var) => self.check_sum_static_simd(pattern1, pattern2, &static_var.value),
-			VariablilityType::SumPercentile(percentile_var) => self.check_sum_percentile(pattern1, pattern2, &percentile_var.value),
-			VariablilityType::AbsoluteSumPercentile(percentile_var) => self.check_absolute_sum_percentile(pattern1, pattern2, &percentile_var.value),
-		}
-	}
-
-	/// Check a specific variability constraint between two patterns
+	/// Check a specific variability constraint between two patterns using SIMD optimization
 	fn check_variability_constraint(&self, pattern1: &Pattern, pattern2: &Pattern, variability: &VariablilityType) -> Result<bool> {
 		match variability {
 			VariablilityType::MaximumStatic(static_var) => self.check_maximum_static(pattern1, pattern2, &static_var.value),
@@ -251,64 +189,32 @@ impl Dictionary {
 		}
 	}
 
-	/// Check absolute sum static variability
-	fn check_absolute_sum_static(&self, pattern1: &Pattern, pattern2: &Pattern, threshold: &BigDecimal) -> Result<bool> {
-		let sum1 = pattern1.abs_sum();
-		let sum2 = pattern2.abs_sum();
-		Ok((sum1 - sum2).abs() <= *threshold)
-	}
-
 	/// Check absolute sum percentile variability
 	fn check_absolute_sum_percentile(&self, pattern1: &Pattern, pattern2: &Pattern, threshold: &BigDecimal) -> Result<bool> {
+		// Handle empty patterns
+		if pattern1.amplitudes().is_empty() || pattern2.amplitudes().is_empty() {
+			return Ok(true); // Empty patterns are considered similar
+		}
+
 		let sum1 = pattern1.abs_sum();
 		let sum2 = pattern2.abs_sum();
 		let diff = (sum1 - sum2).abs();
 		let percentile = if sum2.is_zero() { BigDecimal::zero() } else { (&diff / sum2) * BigDecimal::from(100) };
 		Ok(percentile <= *threshold)
-	}
-
-	/// Check sum static variability
-	fn check_sum_static(&self, pattern1: &Pattern, pattern2: &Pattern, threshold: &BigDecimal) -> Result<bool> {
-		let sum1 = pattern1.sum();
-		let sum2 = pattern2.sum();
-		Ok((sum1 - sum2).abs() <= *threshold)
 	}
 
 	/// Check sum percentile variability
 	fn check_sum_percentile(&self, pattern1: &Pattern, pattern2: &Pattern, threshold: &BigDecimal) -> Result<bool> {
+		// Handle empty patterns
+		if pattern1.amplitudes().is_empty() || pattern2.amplitudes().is_empty() {
+			return Ok(true); // Empty patterns are considered similar
+		}
+
 		let sum1 = pattern1.sum();
 		let sum2 = pattern2.sum();
 		let diff = (sum1 - sum2).abs();
 		let percentile = if sum2.is_zero() { BigDecimal::zero() } else { (&diff / sum2) * BigDecimal::from(100) };
 		Ok(percentile <= *threshold)
-	}
-
-	/// Check maximum static variability
-	fn check_maximum_static(&self, pattern1: &Pattern, pattern2: &Pattern, threshold: &BigDecimal) -> Result<bool> {
-		let max_diff = pattern1.amplitudes().iter().zip(pattern2.amplitudes()).map(|(a1, a2)| (a1 - a2).abs()).max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or_else(BigDecimal::zero);
-		Ok(max_diff <= *threshold)
-	}
-
-	/// Check average static variability
-	fn check_average_static(&self, pattern1: &Pattern, pattern2: &Pattern, threshold: &BigDecimal) -> Result<bool> {
-		let len = BigDecimal::from_usize(pattern1.amplitudes().len()).unwrap();
-		let sum_diff = pattern1.amplitudes().iter().zip(pattern2.amplitudes()).map(|(a1, a2)| (a1 - a2).abs()).fold(BigDecimal::zero(), |acc, d| acc + d);
-		let avg_diff = sum_diff / len;
-		Ok(avg_diff <= *threshold)
-	}
-
-	/// Check absolute maximum static variability
-	fn check_absolute_maximum_static(&self, pattern1: &Pattern, pattern2: &Pattern, threshold: &BigDecimal) -> Result<bool> {
-		let max_diff = pattern1.amplitudes().iter().zip(pattern2.amplitudes()).map(|(a1, a2)| (a1.abs() - a2.abs()).abs()).max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or_else(BigDecimal::zero);
-		Ok(max_diff <= *threshold)
-	}
-
-	/// Check absolute average static variability
-	fn check_absolute_average_static(&self, pattern1: &Pattern, pattern2: &Pattern, threshold: &BigDecimal) -> Result<bool> {
-		let len = BigDecimal::from_usize(pattern1.amplitudes().len()).unwrap();
-		let sum_diff = pattern1.amplitudes().iter().zip(pattern2.amplitudes()).map(|(a1, a2)| (a1.abs() - a2.abs()).abs()).fold(BigDecimal::zero(), |acc, d| acc + d);
-		let avg_diff = sum_diff / len;
-		Ok(avg_diff <= *threshold)
 	}
 
 	/// Check maximum percentile variability
@@ -371,6 +277,11 @@ impl Dictionary {
 
 	/// Check absolute average percentile variability
 	fn check_absolute_average_percentile(&self, pattern1: &Pattern, pattern2: &Pattern, threshold: &BigDecimal) -> Result<bool> {
+		// Handle empty patterns
+		if pattern1.amplitudes().is_empty() || pattern2.amplitudes().is_empty() {
+			return Ok(true); // Empty patterns are considered similar
+		}
+
 		let len = BigDecimal::from_usize(pattern1.amplitudes().len()).unwrap();
 		let sum_percent = pattern1
 			.amplitudes()
@@ -378,7 +289,7 @@ impl Dictionary {
 			.zip(pattern2.amplitudes())
 			.map(|(a1, a2)| {
 				let diff = (a1.abs() - a2.abs()).abs();
-				if a2.is_zero() {
+				if a2.abs().is_zero() {
 					BigDecimal::zero()
 				} else {
 					(diff / a2.abs()) * BigDecimal::from(100)
@@ -386,6 +297,7 @@ impl Dictionary {
 			})
 			.fold(BigDecimal::zero(), |acc, p| acc + p);
 		let avg_percent = sum_percent / len;
+
 		Ok(avg_percent <= *threshold)
 	}
 
@@ -433,7 +345,7 @@ impl Dictionary {
 	// SIMD-optimized constraint checking methods for better performance
 
 	/// SIMD-optimized maximum static constraint checking
-	fn check_maximum_static_simd(&self, pattern1: &Pattern, pattern2: &Pattern, threshold: &BigDecimal) -> Result<bool> {
+	fn check_maximum_static(&self, pattern1: &Pattern, pattern2: &Pattern, threshold: &BigDecimal) -> Result<bool> {
 		let amps1: Vec<f64> = pattern1.amplitudes().iter().filter_map(|a| a.to_f64()).collect();
 		let amps2: Vec<f64> = pattern2.amplitudes().iter().filter_map(|a| a.to_f64()).collect();
 
@@ -449,7 +361,7 @@ impl Dictionary {
 	}
 
 	/// SIMD-optimized average static constraint checking  
-	fn check_average_static_simd(&self, pattern1: &Pattern, pattern2: &Pattern, threshold: &BigDecimal) -> Result<bool> {
+	fn check_average_static(&self, pattern1: &Pattern, pattern2: &Pattern, threshold: &BigDecimal) -> Result<bool> {
 		let amps1: Vec<f64> = pattern1.amplitudes().iter().filter_map(|a| a.to_f64()).collect();
 		let amps2: Vec<f64> = pattern2.amplitudes().iter().filter_map(|a| a.to_f64()).collect();
 
@@ -483,7 +395,7 @@ impl Dictionary {
 	}
 
 	/// SIMD-optimized absolute maximum static constraint checking
-	fn check_absolute_maximum_static_simd(&self, pattern1: &Pattern, pattern2: &Pattern, threshold: &BigDecimal) -> Result<bool> {
+	fn check_absolute_maximum_static(&self, pattern1: &Pattern, pattern2: &Pattern, threshold: &BigDecimal) -> Result<bool> {
 		let amps1: Vec<f64> = pattern1.amplitudes().iter().filter_map(|a| a.to_f64()).collect();
 		let amps2: Vec<f64> = pattern2.amplitudes().iter().filter_map(|a| a.to_f64()).collect();
 
@@ -529,7 +441,7 @@ impl Dictionary {
 	}
 
 	/// SIMD-optimized absolute average static constraint checking
-	fn check_absolute_average_static_simd(&self, pattern1: &Pattern, pattern2: &Pattern, threshold: &BigDecimal) -> Result<bool> {
+	fn check_absolute_average_static(&self, pattern1: &Pattern, pattern2: &Pattern, threshold: &BigDecimal) -> Result<bool> {
 		let amps1: Vec<f64> = pattern1.amplitudes().iter().filter_map(|a| a.to_f64()).collect();
 		let amps2: Vec<f64> = pattern2.amplitudes().iter().filter_map(|a| a.to_f64()).collect();
 
@@ -570,7 +482,7 @@ impl Dictionary {
 	}
 
 	/// SIMD-optimized absolute sum static constraint checking
-	fn check_absolute_sum_static_simd(&self, pattern1: &Pattern, pattern2: &Pattern, threshold: &BigDecimal) -> Result<bool> {
+	fn check_absolute_sum_static(&self, pattern1: &Pattern, pattern2: &Pattern, threshold: &BigDecimal) -> Result<bool> {
 		let amps1: Vec<f64> = pattern1.amplitudes().iter().filter_map(|a| a.to_f64()).collect();
 		let amps2: Vec<f64> = pattern2.amplitudes().iter().filter_map(|a| a.to_f64()).collect();
 
@@ -608,7 +520,7 @@ impl Dictionary {
 	}
 
 	/// SIMD-optimized sum static constraint checking
-	fn check_sum_static_simd(&self, pattern1: &Pattern, pattern2: &Pattern, threshold: &BigDecimal) -> Result<bool> {
+	fn check_sum_static(&self, pattern1: &Pattern, pattern2: &Pattern, threshold: &BigDecimal) -> Result<bool> {
 		let amps1: Vec<f64> = pattern1.amplitudes().iter().filter_map(|a| a.to_f64()).collect();
 		let amps2: Vec<f64> = pattern2.amplitudes().iter().filter_map(|a| a.to_f64()).collect();
 
@@ -642,6 +554,17 @@ impl Dictionary {
 		Ok((sum1 - sum2).abs() <= threshold_f64)
 	}
 
+	/// Merge another dictionary into this one
+	/// All patterns from the other dictionary are imported using the standard import_pattern logic
+	/// This ensures all similarity constraints are respected during the merge
+	pub async fn merge_dictionary(&mut self, other: Dictionary) -> Result<()> {
+		// Import each pattern from the other dictionary
+		for pattern in other.patterns {
+			self.import_pattern(pattern).await?;
+		}
+		Ok(())
+	}
+
 	/// Serialize the dictionary to JSON string
 	pub fn to_json(&self) -> Result<String> {
 		serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize dictionary: {}", e))
@@ -666,6 +589,61 @@ impl Dictionary {
 	pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
 		bincode::deserialize(bytes).map_err(|e| anyhow::anyhow!("Failed to deserialize dictionary from bytes: {}", e))
 	}
+}
+
+/// Helper function to interpolate amplitude at a specific location using linear interpolation
+fn interpolate_amplitude_at_location(relatives: &[Relative], target_location: &BigDecimal) -> BigDecimal {
+	if relatives.is_empty() {
+		return BigDecimal::zero();
+	}
+
+	// If we only have one point, return its amplitude
+	if relatives.len() == 1 {
+		return relatives[0].vector().amplitude().clone();
+	}
+
+	// Convert target location to f64 for easier calculations
+	let target_loc_f64 = target_location.to_f64().unwrap_or(0.0);
+
+	// Find the two relatives that bracket our target location
+	let mut left_idx = 0;
+	let mut right_idx = relatives.len() - 1;
+
+	for (i, relative) in relatives.iter().enumerate() {
+		let loc_f64 = relative.vector().location().to_f64().unwrap_or(0.0);
+		if loc_f64 <= target_loc_f64 {
+			left_idx = i;
+		}
+		if loc_f64 >= target_loc_f64 && right_idx == relatives.len() - 1 {
+			right_idx = i;
+			break;
+		}
+	}
+
+	// If target is exactly at a known point, return that amplitude
+	if left_idx == right_idx {
+		return relatives[left_idx].vector().amplitude().clone();
+	}
+
+	// Perform linear interpolation between left and right points
+	let left_relative = &relatives[left_idx];
+	let right_relative = &relatives[right_idx];
+
+	let left_loc = left_relative.vector().location().to_f64().unwrap_or(0.0);
+	let right_loc = right_relative.vector().location().to_f64().unwrap_or(0.0);
+	let left_amp = left_relative.vector().amplitude().to_f64().unwrap_or(0.0);
+	let right_amp = right_relative.vector().amplitude().to_f64().unwrap_or(0.0);
+
+	// Handle edge case where locations are the same
+	if (right_loc - left_loc).abs() < f64::EPSILON {
+		return left_relative.vector().amplitude().clone();
+	}
+
+	// Linear interpolation: y = y1 + (y2 - y1) * (x - x1) / (x2 - x1)
+	let interpolation_factor = (target_loc_f64 - left_loc) / (right_loc - left_loc);
+	let interpolated_amplitude = left_amp + (right_amp - left_amp) * interpolation_factor;
+
+	BigDecimal::from_f64(interpolated_amplitude).unwrap_or_else(BigDecimal::zero)
 }
 
 #[cfg(test)]
