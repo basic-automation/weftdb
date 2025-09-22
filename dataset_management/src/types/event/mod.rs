@@ -27,19 +27,6 @@ impl ManifestationId {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
-pub struct ManifestationDate(DateTime<Utc>);
-
-impl ManifestationDate {
-    pub fn new(date: DateTime<Utc>) -> Self {
-        Self(date)
-    }
-
-    pub fn to_datetime(&self) -> DateTime<Utc> {
-        self.0
-    }
-}
-
 impl std::fmt::Display for ManifestationId {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		write!(f, "{}", self.to_uuid())
