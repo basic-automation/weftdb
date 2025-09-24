@@ -8,7 +8,7 @@ use splimes::Resolution;
 
 use crate::{
 	types::{
-		correlation::{AvgErrorRate, Correlation, CorrelationID, SumErrorRate}, event::ManifestationId
+		correlation::{Correlation, CorrelationID, ErrorRate}, event::ManifestationId
 	}, EventID, CORRELATIONS_QUEUE
 };
 
@@ -105,7 +105,7 @@ impl Signal {
 		Ok(target_value)
 	}
 
-	pub async fn get_error_rate(&self) -> Result<(AvgErrorRate, SumErrorRate)> {
+	pub async fn get_error_rate(&self) -> Result<ErrorRate> {
 		let error_rate = CORRELATIONS_QUEUE.lock().await.get_by_id(&self.correlation_id.clone()).ok_or_else(|| anyhow::anyhow!("No correlation found for signal"))?.get_error_rate(&self.signal_type).ok_or_else(|| anyhow::anyhow!("No error rate found for signal type in correlation"))?.clone();
 		Ok(error_rate)
 	}
@@ -230,59 +230,17 @@ impl Signals {
 
 		// Get the signal before removing it
 		if let Some(signal) = self.get(correlation_id, manifestation_id, signal_type) {
-			// Calculate the signal probability at the resolution time using provided error rates
-			let average_signal_probability = signal.probability(resolution_time, &signal_error_rates.0)?;
-			let sum_signal_probability = signal.probability(resolution_time, &signal_error_rates.1)?;
-
-			println!("DEBUG ERROR CORRECTION:");
-			println!("  Signal distance: {}", signal.distance.value);
-			println!("  Signal manifestation date: {}", signal.manifestation_date);
-			println!("  Resolution time: {}", resolution_time);
-			println!("  Current avg error rate: {}", signal_error_rates.0.value);
-			println!("  Current sum error rate: {}", signal_error_rates.1.value);
-			println!("  Calculated avg probability: {}", average_signal_probability);
-			println!("  Calculated sum probability: {}", sum_signal_probability);
+			// Calculate the signal probability at the resolution time using provided error rate
+			let signal_probability = signal.probability(resolution_time, &signal_error_rates)?;
 
 			// Apply error correction formula: (Signal - 1) + Current Error Rate = New Error Rate
-			let new_average_error_rate = Distance { value: (&average_signal_probability - 1) + &signal_error_rates.0.value, units: signal_error_rates.0.units };
-			let new_sum_error_rate = Distance { value: (&sum_signal_probability - 1) + &signal_error_rates.1.value, units: signal_error_rates.1.units };
-
-			println!("  New avg error rate: {}", new_average_error_rate.value);
-			println!("  New sum error rate: {}", new_sum_error_rate.value);
+			let new_error_rate = Distance { value: (&signal_probability - 1) + &signal_error_rates.value, units: signal_error_rates.units };
 
 			// Update the correlation's error rate
-			correlation.error_rate.insert(signal_type.clone(), (new_average_error_rate, new_sum_error_rate));
+			correlation.error_rate.insert(signal_type.clone(), new_error_rate);
 
 			// Remove and return the signal
 			Ok(self.remove(correlation_id, manifestation_id, signal_type))
-		} else {
-			Ok(None)
-		}
-	}
-
-	pub async fn probability_average(&self, event_id: &EventID, signal_type: &SignalType, date: DateTime<Utc>) -> Result<Option<BigDecimal>> {
-		let signals = self.get_by_event(event_id, signal_type);
-		if !signals.is_empty() {
-			let mut prob = Vec::new();
-			let mut total_avg_error_rate = BigDecimal::zero();
-			let mut error_rate_count = 0;
-
-			for s in signals.iter() {
-				let default_distance = Distance { value: BigDecimal::zero(), units: Resolution::Seconds };
-				let error_rate = s.get_error_rate().await.unwrap_or((default_distance.clone(), default_distance.clone()));
-				total_avg_error_rate = &total_avg_error_rate + &error_rate.0.value;
-				error_rate_count += 1;
-				prob.push(s.probability(date, &error_rate.0)?);
-			}
-			if prob.is_empty() {
-				Ok(None)
-			} else {
-				let avg_error_rate = &total_avg_error_rate / BigDecimal::from(error_rate_count);
-				println!("DEBUG probability_average: Using {} signals with average error rate: {}", signals.len(), avg_error_rate);
-				let sum: BigDecimal = prob.iter().cloned().fold(BigDecimal::zero(), |acc, x| acc + x);
-				let avg = sum / BigDecimal::from_usize(prob.len()).unwrap();
-				Ok(Some(avg))
-			}
 		} else {
 			Ok(None)
 		}
@@ -292,21 +250,21 @@ impl Signals {
 		let signals = self.get_by_event(event_id, signal_type);
 		if !signals.is_empty() {
 			let mut prob = Vec::new();
-			let mut total_sum_error_rate = BigDecimal::zero();
+			let mut total_error_rate = BigDecimal::zero();
 			let mut error_rate_count = 0;
 
 			for s in signals.iter() {
 				let default_distance = Distance { value: BigDecimal::zero(), units: Resolution::Seconds };
-				let error_rate = s.get_error_rate().await.unwrap_or((default_distance.clone(), default_distance.clone()));
-				total_sum_error_rate = &total_sum_error_rate + &error_rate.1.value;
+				let error_rate = s.get_error_rate().await.unwrap_or(default_distance.clone());
+				total_error_rate = &total_error_rate + &error_rate.value;
 				error_rate_count += 1;
-				prob.push(s.probability(date, &error_rate.1)?);
+				prob.push(s.probability(date, &error_rate)?);
 			}
 			if prob.is_empty() {
 				Ok(None)
 			} else {
-				let avg_sum_error_rate = &total_sum_error_rate / BigDecimal::from(error_rate_count);
-				println!("DEBUG probability_sum: Using {} signals with average sum error rate: {}", signals.len(), avg_sum_error_rate);
+				let avg_error_rate = &total_error_rate / BigDecimal::from(error_rate_count);
+				println!("DEBUG probability_sum: Using {} signals with average error rate: {}", signals.len(), avg_error_rate);
 				let sum: BigDecimal = prob.iter().cloned().fold(BigDecimal::zero(), |acc, x| acc + x);
 				Ok(Some(sum))
 			}

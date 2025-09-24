@@ -15,11 +15,7 @@ mod memory_test;
 pub mod types;
 
 pub const BATCH_SIZE: [usize; 1] = [100];
-pub static DEFAULT_AVERAGE_ERROR_RATE: LazyLock<signal::Distance> = LazyLock::new(|| signal::Distance { 
-	value: BigDecimal::zero(), 
-	units: splimes::Resolution::Seconds  // Use seconds as the canonical unit for error rates
-});
-pub static DEFAULT_SUM_ERROR_RATE: LazyLock<signal::Distance> = LazyLock::new(|| signal::Distance { 
+pub static DEFAULT_ERROR_RATE: LazyLock<signal::Distance> = LazyLock::new(|| signal::Distance { 
 	value: BigDecimal::zero(), 
 	units: splimes::Resolution::Seconds  // Use seconds as the canonical unit for error rates
 });
@@ -382,14 +378,10 @@ pub async fn create_correlations_for_events(dictionary: &Dictionary) -> Result<(
 	// For each event, correlate with all patterns
 	for event_id in events.keys() {
 		for pattern in patterns {
-			// Assign constants to local variables before borrowing to avoid clippy warning
-			let avg_error_rate = DEFAULT_AVERAGE_ERROR_RATE.clone();
-			let sum_error_rate = DEFAULT_SUM_ERROR_RATE.clone();
-			
-			println!("DEBUG: Creating correlation for event {} with pattern {}", event_id, pattern.id());
-			println!("DEBUG: Initial error rates - avg: {}, sum: {}", avg_error_rate.value, sum_error_rate.value);
-			
-			let correlation = Correlation::new(pattern.occurrences()[0].database_info.id().as_uuid(), pattern.id(), event_id.clone(), (avg_error_rate, sum_error_rate), pattern.occurrences().clone());
+			// Assign constant to local variable before borrowing to avoid clippy warning
+			let error_rate = DEFAULT_ERROR_RATE.clone();
+                        			
+			let correlation = Correlation::new(pattern.occurrences()[0].database_info.id().as_uuid(), pattern.id(), event_id.clone(), error_rate, pattern.occurrences().clone());
 			CORRELATIONS_QUEUE.lock().await.insert(event_id.clone(), pattern.id(), correlation);
 		}
 	}
@@ -440,13 +432,6 @@ pub async fn create_signals(_dictionary: &Dictionary) -> Result<()> {
 					let time_diff_start = pattern_resolution.difference(&manifestation_start, &occurrence_beginning)?;
 					let time_diff_midpoint = pattern_resolution.difference(&manifestation_midpoint, &occurrence_midpoint)?;
 					let time_diff_end = pattern_resolution.difference(&manifestation_end, &occurrence_end)?;
-					
-					println!("DEBUG SIGNAL CREATION:");
-					println!("  Pattern resolution: {:?}", pattern_resolution);
-					println!("  Manifestation start: {}, Occurrence beginning: {}", manifestation_start, occurrence_beginning);
-					println!("  Manifestation midpoint: {}, Occurrence midpoint: {}", manifestation_midpoint, occurrence_midpoint);
-					println!("  Manifestation end: {}, Occurrence end: {}", manifestation_end, occurrence_end);
-					println!("  Time diffs - start: {}, mid: {}, end: {}", time_diff_start, time_diff_midpoint, time_diff_end);
 					
 					let distance_start = signal::Distance { value: BigDecimal::from(time_diff_start), units: pattern_resolution };
 					let distance_midpoint = signal::Distance { value: BigDecimal::from(time_diff_midpoint), units: pattern_resolution };
@@ -744,16 +729,15 @@ mod tests {
 
 			if let Some((key, correlation)) = correlation_data {
 				// Check if error rates are zero
-				let has_nonzero = correlation.error_rate().values().any(|(avg_err, sum_err)| !avg_err.value.is_zero() || !sum_err.value.is_zero());
+				let has_nonzero = correlation.error_rate().values().any(|err| !err.value.is_zero());
 
 				if !has_nonzero {
 					// Clone the correlation, modify it, and put it back
 					let mut modified_correlation = correlation;
-					println!("Setting test error rates for correlation {} to make testing more meaningful", modified_correlation.id);
-					modified_correlation.set_error_rate(signal.signal_type.clone(), (
-						signal::Distance { value: BigDecimal::from_f64(0.1).unwrap(), units: splimes::Resolution::Seconds },
-						signal::Distance { value: BigDecimal::from_f64(0.2).unwrap(), units: splimes::Resolution::Seconds }
-					));
+					println!("Setting test error rate for correlation {} to make testing more meaningful", modified_correlation.id);
+					modified_correlation.set_error_rate(signal.signal_type.clone(), 
+						signal::Distance { value: BigDecimal::from_f64(0.1).unwrap(), units: splimes::Resolution::Seconds }
+					);
 
 					// Replace the correlation in the map
 					correlations_lock.remove(&key.0, &key.1);
@@ -777,20 +761,17 @@ mod tests {
 		let random_correlation_error_rate = random_correlation.error_rate.clone();
 
 		// Get the error rate for the specific signal type we're using
-		let error_rate = random_correlation_error_rate.get(&signal_type).or_else(|| random_correlation_error_rate.values().next()).cloned().unwrap_or_else(|| (
-		signal::Distance { value: BigDecimal::from(0), units: splimes::Resolution::Seconds },
+		let error_rate = random_correlation_error_rate.get(&signal_type).or_else(|| random_correlation_error_rate.values().next()).cloned().unwrap_or_else(|| 
 		signal::Distance { value: BigDecimal::from(0), units: splimes::Resolution::Seconds }
-	));
+	);
 
 		let timer = std::time::Instant::now();
 		println!("Calculating sample signal probability...");
-		let sig_avg_probability = signals_lock.probability_average(&random_event_id, &signal_type, Utc::now()).await?.unwrap_or(BigDecimal::from(0));
 		let sig_sum_probability = signals_lock.probability_sum(&random_event_id, &signal_type, Utc::now()).await?.unwrap_or(BigDecimal::from(0));
 
 		println!("Time taken for sample signal probability calculation: {:?}", timer.elapsed());
 		println!("Sample signal probability for correlation ID {}, manifestation ID {}, signal type {:?}:", random_correlation_id, random_manifestation_id, signal_type);
-		println!("  Average-based Probability: {:.6} (using error rates: avg={}, sum={})", sig_avg_probability, error_rate.0, error_rate.1);
-		println!("  Sum-based Probability: {:.6} (using error rates: avg={}, sum={})", sig_sum_probability, error_rate.0, error_rate.1);
+		println!("  Sum-based Probability: {:.6} (using error rate: {})", sig_sum_probability, error_rate.value);
 
 		drop(signals_lock);
 
@@ -959,8 +940,6 @@ mod tests {
 			if curr_value == global_max && curr_value > prev_value && curr_value > next_value {
 				let database_info = database.get_database_info().await.expect("Database info should be available");
 
-				println!("Detected peak for {} at timestamp {}: Value = {} (global maximum)", aspect, points[i].timestamp, curr_value);
-
 				// Create manifestation spanning from the previous point (start of rise) to next point (start of decline)
 				let manifestation = Manifestation::new(
 					database_info.id().as_uuid(),
@@ -1078,11 +1057,8 @@ mod tests {
 			let Some(sum_probability) = signals_lock.probability_sum(&event_id, &SignalType::Custom("PredictMid".to_string()), start_time + chrono::Duration::hours(61)).await? else {
 				bail!("No signals found for event ID {}", event_id);
 			};
-			let Some(avg_probability) = signals_lock.probability_average(&event_id, &SignalType::Custom("PredictMid".to_string()), start_time + chrono::Duration::hours(61)).await? else {
-				bail!("No signals found for event ID {}", event_id);
-			};
 
-			println!("Peak Event Probability - Sum: {}, Average: {}", sum_probability, avg_probability);
+			println!("Peak Event Probability - Sum: {}", sum_probability);
 			drop(signals_lock);
 		}
 
@@ -1173,12 +1149,7 @@ mod tests {
 		create_peak_detection_events(&db, &test_aspect.id(), &Resolution::Hours, &Spline::Linear, "Peak Detection Test").await.unwrap();
 		println!("Events in queue after peak detection:");
 		let events_lock = EVENTS_QUEUE.lock().await;
-		for event in events_lock.values() {
-			println!("Event: {} with {} manifestations", event.name, event.manifestations.len());
-			for (i, (_timing_key, manifestation)) in event.manifestations.iter().enumerate() {
-				println!("  Manifestation {}: Start: {}, End: {}, Duration: {:.1} hours", i + 1, manifestation.start, manifestation.end, manifestation.duration_hours());
-			}
-		}
+		println!("Events in queue: {}", events_lock.len());
 		drop(events_lock);
 
 		db
