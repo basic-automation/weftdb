@@ -65,19 +65,12 @@ impl Dictionary {
 	/// 2. Check similarity against ALL existing patterns using configured variability constraints
 	/// 3. If similar patterns found, merge occurrences; otherwise add as new pattern
 	pub async fn import_pattern(&mut self, mut new_pattern: Pattern) -> Result<()> {
-		// Debug: Check initial pattern
-		if new_pattern.relatives().is_empty() {
-			println!("WARNING: Importing pattern with no relatives: {}", new_pattern.id());
-			return Ok(());
-		}
-
 		// Step 1: Enforce steps constraint if configured
 		if let Some(steps_config) = &self.constraints.steps {
 			new_pattern = self.convert_pattern_steps(new_pattern, steps_config).await?;
 
 			// Debug: Check after step conversion
 			if new_pattern.relatives().is_empty() {
-				println!("WARNING: Pattern has no relatives after step conversion: {}", new_pattern.id());
 				return Ok(());
 			}
 		}

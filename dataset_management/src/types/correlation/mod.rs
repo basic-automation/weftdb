@@ -37,8 +37,7 @@ impl std::fmt::Display for CorrelationID {
 	}
 }
 
-pub type AvgErrorRate = Distance;
-pub type SumErrorRate = Distance;
+pub type ErrorRate = Distance;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Correlation {
@@ -46,12 +45,12 @@ pub struct Correlation {
 	pub dictionary_id: Uuid,
 	pub pattern_id: PatternID,
 	pub event_id: EventID,
-	pub error_rate: HashMap<SignalType, (AvgErrorRate, SumErrorRate)>, // Average and sum error rates per signal type
+	pub error_rate: HashMap<SignalType, ErrorRate>,
 	pub occurrences: Vec<Occurrence>,
 }
 
 impl Correlation {
-	pub fn new(dictionary_id: Uuid, pattern_id: PatternID, event_id: EventID, error_rate: (AvgErrorRate, SumErrorRate), occurrences: Vec<Occurrence>) -> Self {
+	pub fn new(dictionary_id: Uuid, pattern_id: PatternID, event_id: EventID, error_rate: ErrorRate, occurrences: Vec<Occurrence>) -> Self {
 		let id = CorrelationID::new();
 		let mut error_rate_map = HashMap::new();
 		// Initialize error rates for all signal types that will be created
@@ -61,15 +60,15 @@ impl Correlation {
 		Self { id, dictionary_id, pattern_id, event_id, error_rate: error_rate_map, occurrences }
 	}
 
-	pub fn error_rate(&self) -> &HashMap<SignalType, (AvgErrorRate, SumErrorRate)> {
+	pub fn error_rate(&self) -> &HashMap<SignalType, ErrorRate> {
 		&self.error_rate
 	}
 
-	pub fn get_error_rate(&self, signal_type: &SignalType) -> Option<&(AvgErrorRate, SumErrorRate)> {
+	pub fn get_error_rate(&self, signal_type: &SignalType) -> Option<&ErrorRate> {
 		self.error_rate.get(signal_type)
 	}
 
-	pub fn set_error_rate(&mut self, signal_type: SignalType, error_rate: (AvgErrorRate, SumErrorRate)) {
+	pub fn set_error_rate(&mut self, signal_type: SignalType, error_rate: ErrorRate) {
 		self.error_rate.insert(signal_type, error_rate);
 	}
 
