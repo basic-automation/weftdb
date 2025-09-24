@@ -3,13 +3,13 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use splimes::Point;
 
-use crate::types::{Analysis, Distance, MeasurementVector}; // Added Analysis to the import
+use crate::types::{Analysis, BatchDistance, MeasurementVector}; // Added Analysis to the import
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchedMeasurement {
 	pub active: bool,
 	pub point: Point,
-	pub distance: Option<Distance>,
+	pub distance: Option<BatchDistance>,
 	pub vector: Option<MeasurementVector>,
 	pub analysis: Option<Analysis>,
 }
@@ -39,11 +39,11 @@ impl BatchedMeasurement {
 		self.point = point;
 	}
 
-	pub const fn distance(&self) -> Option<&Distance> {
+	pub const fn distance(&self) -> Option<&BatchDistance> {
 		self.distance.as_ref()
 	}
 
-	pub fn set_distance(&mut self, distance: Distance) {
+	pub fn set_distance(&mut self, distance: BatchDistance) {
 		self.distance = Some(distance);
 	}
 

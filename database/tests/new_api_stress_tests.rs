@@ -3,7 +3,7 @@ use std::{str::FromStr, sync::Arc, time::Duration as StdDuration};
 use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
 use database::{Database, InputMeasurement};
-use futures; // Add this import
+// Add this import
 use splimes::{Resolution, Spline};
 use tokio::{sync::Semaphore, time::timeout};
 use uuid::Uuid;
@@ -141,7 +141,7 @@ async fn test_concurrent_access() {
 						let _result = db.analyze_point(aspect.id(), target_time, Resolution::Seconds, Spline::Linear).await.expect("Failed to analyze concurrent point");
 					}
 				}
-				task_id as i64
+				task_id
 			})
 		})
 		.collect();
@@ -188,7 +188,7 @@ async fn test_large_dataset_analysis() {
 	let start = std::time::Instant::now();
 
 	for i in 0..num_measurements {
-		let timestamp = base_time + time_interval * i as i32;
+		let timestamp = base_time + time_interval * i;
 		let value = (i as f64 / 100.0).sin() * 50.0 + 50.0;
 
 		let measurement = InputMeasurement::new(timestamp, BigDecimal::from_str(&format!("{:.2}", value)).unwrap());

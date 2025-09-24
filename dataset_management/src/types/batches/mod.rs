@@ -70,8 +70,9 @@ impl Batches {
 		let batches = points
 			.par_windows(batch_size)
 			.map(|window| {
+				assert_eq!(window.len(), batch_size, "Sliding window should always have exactly batch_size elements");
 				let measurements = window.iter().map(|p| BatchedMeasurement::new(p.clone())).collect();
-				Batch::new(window.len(), measurements, *resolution, *aspect, database_info.clone())
+				Batch::new(batch_size, measurements, *resolution, *aspect, database_info.clone())
 			})
 			.collect();
 
@@ -105,8 +106,9 @@ impl Batches {
 		let batches = points
 			.windows(batch_size)
 			.map(|window| {
+				assert_eq!(window.len(), batch_size, "Sliding window should always have exactly batch_size elements");
 				let measurements = window.iter().map(|p| BatchedMeasurement::new(p.clone())).collect();
-				Batch::new(window.len(), measurements, *resolution, *aspect, database_info.clone())
+				Batch::new(batch_size, measurements, *resolution, *aspect, database_info.clone())
 			})
 			.collect();
 

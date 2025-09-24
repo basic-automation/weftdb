@@ -65,9 +65,21 @@ impl Dictionary {
 	/// 2. Check similarity against ALL existing patterns using configured variability constraints
 	/// 3. If similar patterns found, merge occurrences; otherwise add as new pattern
 	pub async fn import_pattern(&mut self, mut new_pattern: Pattern) -> Result<()> {
+		// Debug: Check initial pattern
+		if new_pattern.relatives().is_empty() {
+			println!("WARNING: Importing pattern with no relatives: {}", new_pattern.id());
+			return Ok(());
+		}
+
 		// Step 1: Enforce steps constraint if configured
 		if let Some(steps_config) = &self.constraints.steps {
 			new_pattern = self.convert_pattern_steps(new_pattern, steps_config).await?;
+
+			// Debug: Check after step conversion
+			if new_pattern.relatives().is_empty() {
+				println!("WARNING: Pattern has no relatives after step conversion: {}", new_pattern.id());
+				return Ok(());
+			}
 		}
 
 		// Step 2: Check similarity against ALL existing patterns using configured variability constraints
@@ -125,8 +137,6 @@ impl Dictionary {
 			return Ok(new_pattern);
 		}
 
-		println!("DEBUG: convert_pattern_steps - current_steps: {}, required_steps: {}", current_steps, required_steps);
-
 		// Perform direct interpolation on the relative data
 		let new_relatives: Vec<Relative> = (0..required_steps)
 			.map(|i| {
@@ -144,8 +154,6 @@ impl Dictionary {
 				Relative::new(vector, avg_max_x, avg_max_y)
 			})
 			.collect();
-
-		println!("DEBUG: input relatives count: {}, output relatives count: {}", relatives.len(), new_relatives.len());
 
 		let new_pattern = Pattern::new(pattern.id(), pattern.occurrences().clone(), new_relatives);
 		Ok(new_pattern)
@@ -770,26 +778,26 @@ mod tests {
 		let constraints = DictionaryConstraints {
 			steps: Some(Steps { count: 10, interpolation: Spline::Linear }),
 			variabilities: Some(vec![VariablilityType::AbsoluteSumPercentile(Variability {
-				value: BigDecimal::from_f64(30.0).unwrap(), // 30% threshold
+				value: BigDecimal::from_f64(25.0).unwrap(), // 25% threshold
 			})]),
 		};
 		let mut dictionary = Dictionary::new("Moderate Test Dictionary".to_string(), "A test dictionary with moderate constraints".to_string(), constraints);
 
-		// Import first pattern - sum = 9.0
+		// Import first pattern - interpolated sum ≈ 13.56
 		let pattern1 = create_test_pattern(vec![1.0, 2.0, 3.0, 2.0, 1.0]);
 		dictionary.import_pattern(pattern1).await.unwrap();
 
-		// Import a significantly different pattern - sum = 25.0
+		// Import a significantly different pattern - interpolated sum ≈ 22.56
 		let pattern2 = create_test_pattern(vec![3.0, 6.0, 10.0, 6.0, 0.0]);
 		dictionary.import_pattern(pattern2).await.unwrap();
 
 		// These should be separate patterns due to significant difference
-		// Difference: |25.0 - 9.0| = 16.0, Percentage: 16.0/25.0 = 64% > 30% threshold
+		// After interpolation: |22.56 - 13.56|/13.56 = 66.4% > 25% threshold
 		assert_eq!(dictionary.patterns.len(), 2);
 
 		// Now import a pattern that matches the first but not the second
-		// Sum = 10.8 (within 30% of 9.0: |10.8 - 9.0|/10.8 = 16.7% < 30%)
-		// But not within 30% of 25.0: |25.0 - 10.8|/25.0 = 56.8% > 30%
+		// Interpolated sum ≈ 16.27: |16.27 - 13.56|/13.56 = 20% < 25% (should match)
+		// But not within 25% of 22.56: |22.56 - 16.27|/16.27 = 38.6% > 25%
 		let pattern3 = create_test_pattern(vec![1.2, 2.4, 3.6, 2.4, 1.2]);
 		dictionary.import_pattern(pattern3).await.unwrap();
 

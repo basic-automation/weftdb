@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::LazyLock};
+use std::sync::LazyLock;
 
 use anyhow::Result;
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive, Zero};
@@ -15,13 +15,19 @@ mod memory_test;
 pub mod types;
 
 pub const BATCH_SIZE: [usize; 1] = [100];
-pub static DEFAULT_AVERAGE_ERROR_RATE: LazyLock<BigDecimal> = LazyLock::new(BigDecimal::zero);
-pub static DEFAULT_SUM_ERROR_RATE: LazyLock<BigDecimal> = LazyLock::new(BigDecimal::zero);
+pub static DEFAULT_AVERAGE_ERROR_RATE: LazyLock<signal::Distance> = LazyLock::new(|| signal::Distance { 
+	value: BigDecimal::zero(), 
+	units: splimes::Resolution::Seconds  // Use seconds as the canonical unit for error rates
+});
+pub static DEFAULT_SUM_ERROR_RATE: LazyLock<signal::Distance> = LazyLock::new(|| signal::Distance { 
+	value: BigDecimal::zero(), 
+	units: splimes::Resolution::Seconds  // Use seconds as the canonical unit for error rates
+});
 
 static UNPROCESSED_BATCHES_QUEUE: LazyLock<Mutex<Vec<Batch>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 static PROCESSED_BATCHES_QUEUE: LazyLock<Mutex<Vec<Batch>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 static PATTERNS_QUEUE: LazyLock<Mutex<Vec<Pattern>>> = LazyLock::new(|| Mutex::new(Vec::new()));
-static EVENTS_QUEUE: LazyLock<Mutex<HashMap<EventID, Event>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static EVENTS_QUEUE: LazyLock<Mutex<Events>> = LazyLock::new(|| Mutex::new(Events::new()));
 static CORRELATIONS_QUEUE: LazyLock<Mutex<Correlations>> = LazyLock::new(|| Mutex::new(Correlations::new()));
 static SIGNALS_QUEUE: LazyLock<Mutex<Signals>> = LazyLock::new(|| Mutex::new(Signals::new()));
 
@@ -29,44 +35,34 @@ pub async fn build_unprocessed_queue(database: &Database, aspect: &AspectId, res
 	let start_time = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
 	let end_time = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
 
-	// Use optimized bulk analysis without limit
+	// Collect all points first to create sliding window batches
 	let mut point_stream = database.stream_analyze_range(*aspect, start_time, end_time, *resolution, *method);
-
-	let mut points_streamed = 0;
-	let mut batch_points = Vec::new();
+	let mut all_points = Vec::new();
 	while let Some(point) = point_stream.try_next().await? {
-		points_streamed += 1;
-		// add batch to batches up to BATCH_SIZE then process batch and clear
-		batch_points.push(point);
-		if batch_points.len() >= batch_size && batch_points.len() >= 2 {
-			let measurements = batch_points.iter().map(|p| BatchedMeasurement::new(p.clone())).collect();
-			let database_info = database.get_database_info().await.expect("Database info should be available");
-			let batch = Batch::new(batch_points.len(), measurements, *resolution, *aspect, database_info);
+		all_points.push(point);
+	}
+
+	println!("Total points streamed: {}", all_points.len());
+	println!("Batch size: {}", batch_size);
+	println!("Start time: {}, End time: {}", start_time, end_time);
+
+	// Create sliding window batches (overlapping)
+	if batch_size > 0 && all_points.len() >= batch_size {
+		let database_info = database.get_database_info().await.expect("Database info should be available");
+
+		// Create overlapping sliding window batches - each batch has exactly batch_size measurements
+		for i in 0..=(all_points.len() - batch_size) {
+			let window = &all_points[i..i + batch_size];
+			assert_eq!(window.len(), batch_size, "Window should always have exactly batch_size elements");
+
+			let measurements = window.iter().map(|p| BatchedMeasurement::new(p.clone())).collect();
+			let batch = Batch::new(batch_size, measurements, *resolution, *aspect, database_info.clone());
 
 			let mut batches_lock = UNPROCESSED_BATCHES_QUEUE.lock().await;
 			batches_lock.push(batch);
 			drop(batches_lock);
-
-			batch_points.clear();
 		}
 	}
-
-	// Process any remaining points as a final batch if at least 2 points
-	if batch_points.len() >= 2 {
-		let measurements = batch_points.iter().map(|p| BatchedMeasurement::new(p.clone())).collect();
-		let database_info = database.get_database_info().await.expect("Database info should be available");
-		let batch = Batch::new(batch_points.len(), measurements, *resolution, *aspect, database_info);
-
-		let mut batches_lock = UNPROCESSED_BATCHES_QUEUE.lock().await;
-		batches_lock.push(batch);
-		drop(batches_lock); // Explicitly drop the lock
-
-		batch_points.clear();
-	}
-
-	println!("Total points streamed: {}", points_streamed);
-	println!("Batch size: {}", batch_size);
-	println!("Start time: {}, End time: {}", start_time, end_time);
 
 	let final_lock = UNPROCESSED_BATCHES_QUEUE.lock().await;
 	println!("Final UNPROCESSED_BATCHES_QUEUE length: {}", final_lock.len());
@@ -389,6 +385,10 @@ pub async fn create_correlations_for_events(dictionary: &Dictionary) -> Result<(
 			// Assign constants to local variables before borrowing to avoid clippy warning
 			let avg_error_rate = DEFAULT_AVERAGE_ERROR_RATE.clone();
 			let sum_error_rate = DEFAULT_SUM_ERROR_RATE.clone();
+			
+			println!("DEBUG: Creating correlation for event {} with pattern {}", event_id, pattern.id());
+			println!("DEBUG: Initial error rates - avg: {}, sum: {}", avg_error_rate.value, sum_error_rate.value);
+			
 			let correlation = Correlation::new(pattern.occurrences()[0].database_info.id().as_uuid(), pattern.id(), event_id.clone(), (avg_error_rate, sum_error_rate), pattern.occurrences().clone());
 			CORRELATIONS_QUEUE.lock().await.insert(event_id.clone(), pattern.id(), correlation);
 		}
@@ -435,13 +435,22 @@ pub async fn create_signals(_dictionary: &Dictionary) -> Result<()> {
 					let occurrence_midpoint = occurrence.beginning + (occurrence.end - occurrence.beginning) / 2;
 					let occurrence_end = occurrence.end;
 
-					// Calculate time difference in hours (you can adjust the resolution as needed)
-					let time_diff_start = Resolution::Minutes.difference(&manifestation_start, &occurrence_beginning)?;
-					let time_diff_midpoint = Resolution::Minutes.difference(&manifestation_midpoint, &occurrence_midpoint)?;
-					let time_diff_end = Resolution::Minutes.difference(&manifestation_end, &occurrence_end)?;
-					let distance_start = signal::Distance { value: BigDecimal::from(time_diff_start), units: Resolution::Minutes };
-					let distance_midpoint = signal::Distance { value: BigDecimal::from(time_diff_midpoint), units: Resolution::Minutes };
-					let distance_end = signal::Distance { value: BigDecimal::from(time_diff_end), units: Resolution::Minutes };
+					// Calculate time difference using the pattern's resolution from the occurrence
+					let pattern_resolution = occurrence.resolution;
+					let time_diff_start = pattern_resolution.difference(&manifestation_start, &occurrence_beginning)?;
+					let time_diff_midpoint = pattern_resolution.difference(&manifestation_midpoint, &occurrence_midpoint)?;
+					let time_diff_end = pattern_resolution.difference(&manifestation_end, &occurrence_end)?;
+					
+					println!("DEBUG SIGNAL CREATION:");
+					println!("  Pattern resolution: {:?}", pattern_resolution);
+					println!("  Manifestation start: {}, Occurrence beginning: {}", manifestation_start, occurrence_beginning);
+					println!("  Manifestation midpoint: {}, Occurrence midpoint: {}", manifestation_midpoint, occurrence_midpoint);
+					println!("  Manifestation end: {}, Occurrence end: {}", manifestation_end, occurrence_end);
+					println!("  Time diffs - start: {}, mid: {}, end: {}", time_diff_start, time_diff_midpoint, time_diff_end);
+					
+					let distance_start = signal::Distance { value: BigDecimal::from(time_diff_start), units: pattern_resolution };
+					let distance_midpoint = signal::Distance { value: BigDecimal::from(time_diff_midpoint), units: pattern_resolution };
+					let distance_end = signal::Distance { value: BigDecimal::from(time_diff_end), units: pattern_resolution };
 
 					// Create different types of signals based on the relationship
 					let signal_types = vec![
@@ -516,13 +525,16 @@ pub async fn filter_expired_signals() -> Result<()> {
 					if let Some(next_manifestation) = future_manifestations.first() {
 						if current_time >= next_manifestation.end {
 							// Signal has expired - the predicted manifestation has ended
-							signals_to_remove.push((signal.correlation_id.clone(), signal.manifestation_id.clone(), signal.signal_type.clone()));
+							// Use the MIDPOINT of the next manifestation as the resolution time (when event was supposed to happen)
+							let resolution_time = next_manifestation.midpoint();
+							signals_to_remove.push((signal.correlation_id.clone(), signal.manifestation_id.clone(), signal.signal_type.clone(), resolution_time));
 						}
 					}
 					// If there are no future manifestations, the signal doesn't expire yet
 				} else {
 					// If we can't find the baseline manifestation this signal was created from, remove it as invalid
-					signals_to_remove.push((signal.correlation_id.clone(), signal.manifestation_id.clone(), signal.signal_type.clone()));
+					// Use current time as fallback resolution time for invalid signals
+					signals_to_remove.push((signal.correlation_id.clone(), signal.manifestation_id.clone(), signal.signal_type.clone(), current_time));
 				}
 			}
 		}
@@ -531,9 +543,11 @@ pub async fn filter_expired_signals() -> Result<()> {
 	// Release the correlations lock before modifying signals
 	drop(correlations_lock);
 
+        println!("Removing {} expired or invalid signals", signals_to_remove.len());
+
 	// Remove expired signals with error correction
 	let mut removed_count = 0;
-	for (correlation_id, manifestation_id, signal_type) in signals_to_remove {
+	for (correlation_id, manifestation_id, signal_type, resolution_time) in signals_to_remove {
 		// Find the correlation for this signal and apply error correction
 		let mut correlations_lock = CORRELATIONS_QUEUE.lock().await;
 
@@ -542,7 +556,7 @@ pub async fn filter_expired_signals() -> Result<()> {
 
 		if let Some(mut correlation) = correlation_clone {
 			// Use error correction when removing the signal
-			if let Ok(Some(_removed_signal)) = signals_lock.remove_with_error_correction(&correlation_id, &manifestation_id, &signal_type, &mut correlation, current_time) {
+			if let Ok(Some(_removed_signal)) = signals_lock.remove_with_error_correction(&mut correlation, &manifestation_id, &signal_type, resolution_time).await {
 				// Find the key for this correlation to update it
 				let key_to_update = correlations_lock.iter().find(|((_, _), c)| c.id == correlation_id).map(|((event_id, pattern_id), _)| (event_id.clone(), *pattern_id));
 
@@ -571,6 +585,7 @@ pub async fn filter_expired_signals() -> Result<()> {
 #[cfg(test)]
 mod tests {
 
+	use anyhow::bail;
 	use bigdecimal::{BigDecimal, FromPrimitive};
 	use chrono::{TimeZone, Utc};
 	use database::{Database, DatabaseInfo, InputMeasurement};
@@ -714,10 +729,10 @@ mod tests {
 		let mut correlation_to_modify = None;
 
 		// First, find a signal and identify which correlation needs modification
-		for signal in signals_lock.values() {
+		if let Some(signal) = signals_lock.values().next() {
 			random_signal = Some(signal.clone());
 			correlation_to_modify = Some(signal.correlation_id.clone());
-			break; // Just take the first signal for now
+			// Just take the first signal for now
 		}
 
 		// If we found a signal, check and potentially modify its correlation's error rates
@@ -729,13 +744,16 @@ mod tests {
 
 			if let Some((key, correlation)) = correlation_data {
 				// Check if error rates are zero
-				let has_nonzero = correlation.error_rate().values().any(|(avg_err, sum_err)| !avg_err.is_zero() || !sum_err.is_zero());
+				let has_nonzero = correlation.error_rate().values().any(|(avg_err, sum_err)| !avg_err.value.is_zero() || !sum_err.value.is_zero());
 
 				if !has_nonzero {
 					// Clone the correlation, modify it, and put it back
 					let mut modified_correlation = correlation;
 					println!("Setting test error rates for correlation {} to make testing more meaningful", modified_correlation.id);
-					modified_correlation.set_error_rate(signal.signal_type.clone(), (BigDecimal::from_f64(0.1).unwrap(), BigDecimal::from_f64(0.2).unwrap()));
+					modified_correlation.set_error_rate(signal.signal_type.clone(), (
+						signal::Distance { value: BigDecimal::from_f64(0.1).unwrap(), units: splimes::Resolution::Seconds },
+						signal::Distance { value: BigDecimal::from_f64(0.2).unwrap(), units: splimes::Resolution::Seconds }
+					));
 
 					// Replace the correlation in the map
 					correlations_lock.remove(&key.0, &key.1);
@@ -759,12 +777,15 @@ mod tests {
 		let random_correlation_error_rate = random_correlation.error_rate.clone();
 
 		// Get the error rate for the specific signal type we're using
-		let error_rate = random_correlation_error_rate.get(&signal_type).or_else(|| random_correlation_error_rate.values().next()).cloned().unwrap_or_else(|| (BigDecimal::from(0), BigDecimal::from(0)));
+		let error_rate = random_correlation_error_rate.get(&signal_type).or_else(|| random_correlation_error_rate.values().next()).cloned().unwrap_or_else(|| (
+		signal::Distance { value: BigDecimal::from(0), units: splimes::Resolution::Seconds },
+		signal::Distance { value: BigDecimal::from(0), units: splimes::Resolution::Seconds }
+	));
 
 		let timer = std::time::Instant::now();
 		println!("Calculating sample signal probability...");
-		let sig_avg_probability = signals_lock.probability_average(&random_event_id, &signal_type, Utc::now(), &error_rate)?.unwrap_or(BigDecimal::from(0));
-		let sig_sum_probability = signals_lock.probability_sum(&random_event_id, &signal_type, Utc::now(), &error_rate)?.unwrap_or(BigDecimal::from(0));
+		let sig_avg_probability = signals_lock.probability_average(&random_event_id, &signal_type, Utc::now()).await?.unwrap_or(BigDecimal::from(0));
+		let sig_sum_probability = signals_lock.probability_sum(&random_event_id, &signal_type, Utc::now()).await?.unwrap_or(BigDecimal::from(0));
 
 		println!("Time taken for sample signal probability calculation: {:?}", timer.elapsed());
 		println!("Sample signal probability for correlation ID {}, manifestation ID {}, signal type {:?}:", random_correlation_id, random_manifestation_id, signal_type);
@@ -792,21 +813,23 @@ mod tests {
 	fn generate_specific_test_batch() -> Batch {
 		let measurements = vec![BatchedMeasurement { active: true, point: Point::new(Utc.timestamp_opt(0, 0).unwrap(), BigDecimal::from(0)), distance: None, vector: Some(MeasurementVector::new(BigDecimal::from(0), BigDecimal::from(0))), analysis: None }, BatchedMeasurement { active: true, point: Point::new(Utc.timestamp_opt(600, 0).unwrap(), BigDecimal::from_f64(4.03).unwrap()), distance: None, vector: Some(MeasurementVector::new(BigDecimal::from(600), BigDecimal::from_f64(4.03).unwrap())), analysis: None }, BatchedMeasurement { active: true, point: Point::new(Utc.timestamp_opt(1200, 0).unwrap(), BigDecimal::from_f64(8.06).unwrap()), distance: None, vector: Some(MeasurementVector::new(BigDecimal::from(1200), BigDecimal::from_f64(8.06).unwrap())), analysis: None }, BatchedMeasurement { active: true, point: Point::new(Utc.timestamp_opt(1800, 0).unwrap(), BigDecimal::from_f64(10.88).unwrap()), distance: None, vector: Some(MeasurementVector::new(BigDecimal::from(1800), BigDecimal::from_f64(10.88).unwrap())), analysis: None }, BatchedMeasurement { active: true, point: Point::new(Utc.timestamp_opt(2400, 0).unwrap(), BigDecimal::from_f64(11.48).unwrap()), distance: None, vector: Some(MeasurementVector::new(BigDecimal::from(2400), BigDecimal::from_f64(11.48).unwrap())), analysis: None }, BatchedMeasurement { active: true, point: Point::new(Utc.timestamp_opt(3000, 0).unwrap(), BigDecimal::from_f64(10.06).unwrap()), distance: None, vector: Some(MeasurementVector::new(BigDecimal::from(3000), BigDecimal::from_f64(10.06).unwrap())), analysis: None }, BatchedMeasurement { active: true, point: Point::new(Utc.timestamp_opt(3600, 0).unwrap(), BigDecimal::from_f64(12.57).unwrap()), distance: None, vector: Some(MeasurementVector::new(BigDecimal::from(3600), BigDecimal::from_f64(12.57).unwrap())), analysis: None }, BatchedMeasurement { active: true, point: Point::new(Utc.timestamp_opt(4200, 0).unwrap(), BigDecimal::from_f64(6.18).unwrap()), distance: None, vector: Some(MeasurementVector::new(BigDecimal::from(4200), BigDecimal::from_f64(6.18).unwrap())), analysis: None }, BatchedMeasurement { active: true, point: Point::new(Utc.timestamp_opt(4800, 0).unwrap(), BigDecimal::from_f64(5.37).unwrap()), distance: None, vector: Some(MeasurementVector::new(BigDecimal::from(4800), BigDecimal::from_f64(5.37).unwrap())), analysis: None }, BatchedMeasurement { active: true, point: Point::new(Utc.timestamp_opt(5400, 0).unwrap(), BigDecimal::from_f64(-1.09).unwrap()), distance: None, vector: Some(MeasurementVector::new(BigDecimal::from(5400), BigDecimal::from_f64(-1.09).unwrap())), analysis: None }, BatchedMeasurement { active: true, point: Point::new(Utc.timestamp_opt(5940, 0).unwrap(), BigDecimal::from(0)), distance: None, vector: Some(MeasurementVector::new(BigDecimal::from(5940), BigDecimal::from(0))), analysis: None }];
 
+		// This test batch has exactly 11 measurements as intended
+		let expected_size = 11;
+		assert_eq!(measurements.len(), expected_size, "Test batch should have exactly {} measurements", expected_size);
+
 		let dummy_database_info = DatabaseInfo::new("test".to_string(), "/tmp/test".to_string());
 		let dummy_aspect = AspectId::new();
-		Batch::new(measurements.len(), measurements, Resolution::Seconds, dummy_aspect, dummy_database_info)
+		Batch::new(expected_size, measurements, Resolution::Seconds, dummy_aspect, dummy_database_info)
 	}
 
 	fn output_denk_format_batch(batch: &Batch) {
 		println!("----- DENK FORMAT OUTPUT BEGIN -----");
-		let mut count = 0;
-		for measurement in batch.clone().into_iter() {
-			if (count == 0 || count == batch.size() - 1) || count % 1 == 0 {
+		for (count, measurement) in batch.clone().into_iter().enumerate() {
+			if count == 0 || count == batch.size() - 1 {
 				let vector = measurement.vector().unwrap();
 				let amplitude = vector.amplitude().round(2);
 				println!("{} {}", vector.location(), amplitude);
 			}
-			count += 1;
 		}
 		println!("----- DENK FORMAT OUTPUT END -----");
 	}
@@ -881,6 +904,88 @@ mod tests {
 		events_lock.values().cloned().collect()
 	}
 
+	/// Detects peak values in the dataset
+	///
+	/// This function analyzes measurements to detect when the value reaches a local peak
+	/// (higher than both previous and next values) AND is the global maximum in the dataset.
+	/// Each detected peak creates an event with a manifestation spanning from the rise to the decline.
+	///
+	/// For the test data (1,2,3,2,3,5,3,2,1,1), this will detect exactly one peak at value 5.
+	///
+	/// # Parameters
+	/// - `database`: Database instance to query measurements from
+	/// - `aspect`: The aspect ID to analyze for peak detection
+	/// - `resolution`: The resolution for data analysis
+	/// - `method`: The spline interpolation method to use
+	///
+	/// # Algorithm
+	/// 1. Retrieve all measurements for the aspect within the date range
+	/// 2. Find the global maximum value in the dataset
+	/// 3. For each point that equals the global maximum, check if it's a local peak
+	/// 4. If it's a local peak, create an event spanning from rise to decline
+	/// 5. Add events to the global EVENTS_QUEUE
+	async fn create_peak_detection_events(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, name: &str) -> Result<()> {
+		let start_time = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
+		let end_time = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
+
+		// Use optimized bulk analysis to get all points
+		let mut point_stream = database.stream_analyze_range(*aspect, start_time, end_time, *resolution, *method);
+
+		let mut points = Vec::new();
+		while let Some(point) = point_stream.try_next().await? {
+			points.push(point);
+		}
+
+		// Sort points by timestamp to ensure proper chronological order
+		points.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+		if points.len() < 3 {
+			println!("Not enough points for peak detection (need at least 3)");
+			return Ok(());
+		}
+
+		// Find the global maximum value
+		let global_max = points.iter().map(|p| &p.value).max().unwrap();
+
+		let mut event = Event::new(name.to_string(), Some(format!("Detects peak values (local maxima that are also global maximum) for aspect {}", aspect)));
+
+		// Check each point to see if it's a peak
+		for i in 1..points.len() - 1 {
+			let prev_value = &points[i - 1].value;
+			let curr_value = &points[i].value;
+			let next_value = &points[i + 1].value;
+
+			// Check if current point is a local peak AND equals global maximum
+			if curr_value == global_max && curr_value > prev_value && curr_value > next_value {
+				let database_info = database.get_database_info().await.expect("Database info should be available");
+
+				println!("Detected peak for {} at timestamp {}: Value = {} (global maximum)", aspect, points[i].timestamp, curr_value);
+
+				// Create manifestation spanning from the previous point (start of rise) to next point (start of decline)
+				let manifestation = Manifestation::new(
+					database_info.id().as_uuid(),
+					points[i - 1].timestamp, // Start of rise to peak
+					points[i + 1].timestamp, // Start of decline from peak
+				);
+
+				event.add_manifestation(manifestation);
+			}
+		}
+
+		// Only add the event if we found at least one peak
+		if !event.manifestations.is_empty() {
+			let manifestation_count = event.manifestations.len();
+			let mut events_lock = EVENTS_QUEUE.lock().await;
+			events_lock.insert(event.id.clone(), event);
+			drop(events_lock);
+			println!("Added peak detection event with {} manifestation(s)", manifestation_count);
+		} else {
+			println!("No peaks detected in the dataset");
+		}
+
+		Ok(())
+	}
+
 	#[tokio::test(flavor = "multi_thread")]
 	#[serial]
 	async fn test_api_precise() -> Result<()> {
@@ -889,9 +994,9 @@ mod tests {
 		let subject = subjects.iter().find(|(_, name)| name.as_str() == "TestSubject").map(|(id, _)| *id).ok_or_else(|| anyhow::anyhow!("Subject 'TestSubject' not found"))?;
 		let aspects = db.get_subject_aspects(&subject).await?;
 		let aspect = aspects.iter().find(|a| a.name() == "TestAspect").ok_or_else(|| anyhow::anyhow!("Aspect 'TestAspect' not found"))?;
-		let resolution = Resolution::Hours;
+		let resolution = Resolution::Minutes;
 		let method = Spline::Linear;
-		let batch_size = 10;
+		let batch_size = 60;
 
 		println!("Aspect ID: {}", aspect.id());
 
@@ -928,18 +1033,57 @@ mod tests {
                                         interpolation: Spline::Linear 
                                 }), 
                                 variabilities: Some(vec![
-                                        VariablilityType::AbsoluteAveragePercentile(Variability { value: BigDecimal::from_f64(0.01).unwrap() }),
+                                        VariablilityType::AbsoluteAveragePercentile(Variability { value: BigDecimal::from_f64(10.0).unwrap() }),
                                 ]) });
 
 		load_dictionary(&mut dictionary).await?;
 
-		println!("Dictionary now contains {} patterns", dictionary.len());
+		println!("Dictionary now contains {} patterns", dictionary.patterns.len());
 
-		// Print patterns from dictionary to see interpolated results
+		// Show the pattern after dictionary import (should have 10 steps)
 		if !dictionary.patterns.is_empty() {
-			let dict_pattern = &dictionary.patterns[0];
-			println!("Dictionary pattern (after interpolation): {}", json!(dict_pattern));
-			output_denk_format_pattern(dict_pattern);
+			let first_pattern = &dictionary.patterns[0];
+			println!("First pattern has {} relatives", first_pattern.relatives().len());
+			println!("Pattern after dictionary import:");
+			output_denk_format_pattern(first_pattern);
+		}
+
+		// create a peak detection event for testing
+		let event_name = "peaks";
+		create_peak_detection_events(&db, &aspect.id(), &Resolution::Hours, &Spline::Linear, event_name).await?;
+		analyze_event_timing().await?;
+
+		create_correlations_for_events(&dictionary).await?;
+		let correlations_lock = CORRELATIONS_QUEUE.lock().await;
+		println!("Number of correlations created: {}", correlations_lock.len());
+		drop(correlations_lock);
+		create_signals(&dictionary).await?;
+		let signals_lock = SIGNALS_QUEUE.lock().await;
+		println!("Number of signals created: {}", signals_lock.len());
+		drop(signals_lock);
+		filter_expired_signals().await?;
+		let signals_lock = SIGNALS_QUEUE.lock().await;
+		println!("Number of signals after filtering: {}", signals_lock.len());
+		drop(signals_lock);
+
+		// Calculate and print the probability for the Signals in the queue
+		let events_lock = EVENTS_QUEUE.lock().await;
+		let event_id_option = events_lock.keys().next().cloned();
+		drop(events_lock);
+
+		let start_time = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+
+		if let Some(event_id) = event_id_option {
+			let signals_lock = SIGNALS_QUEUE.lock().await;
+			let Some(sum_probability) = signals_lock.probability_sum(&event_id, &SignalType::Custom("PredictMid".to_string()), start_time + chrono::Duration::hours(61)).await? else {
+				bail!("No signals found for event ID {}", event_id);
+			};
+			let Some(avg_probability) = signals_lock.probability_average(&event_id, &SignalType::Custom("PredictMid".to_string()), start_time + chrono::Duration::hours(61)).await? else {
+				bail!("No signals found for event ID {}", event_id);
+			};
+
+			println!("Peak Event Probability - Sum: {}, Average: {}", sum_probability, avg_probability);
+			drop(signals_lock);
 		}
 
 		Ok(())
@@ -958,15 +1102,65 @@ mod tests {
 		#[rustfmt::skip]
 		let points = vec![
                         (1, BigDecimal::from(1)), 
-                        (2, BigDecimal::from(2)), 
-                        (3, BigDecimal::from(3)), 
-                        (4, BigDecimal::from(2)), 
-                        (5, BigDecimal::from(3)), 
-                        (6, BigDecimal::from(5)), 
-                        (7, BigDecimal::from(3)), 
-                        (8, BigDecimal::from(2)), 
+                        (2, BigDecimal::from(0)), 
+                        (3, BigDecimal::from(0)), 
+                        (4, BigDecimal::from(0)), 
+                        (5, BigDecimal::from(1)), 
+                        (6, BigDecimal::from(0)), 
+                        (7, BigDecimal::from(0)), 
+                        (8, BigDecimal::from(0)), 
                         (9, BigDecimal::from(1)), 
-                        (10, BigDecimal::from(1))
+                        (10, BigDecimal::from(0)),
+                        (11, BigDecimal::from(0)), 
+                        (12, BigDecimal::from(0)), 
+                        (13, BigDecimal::from(1)), 
+                        (14, BigDecimal::from(0)), 
+                        (15, BigDecimal::from(0)), 
+                        (16, BigDecimal::from(0)), 
+                        (17, BigDecimal::from(1)), 
+                        (18, BigDecimal::from(0)), 
+                        (19, BigDecimal::from(0)), 
+                        (20, BigDecimal::from(0)),
+                        (21, BigDecimal::from(1)), 
+                        (22, BigDecimal::from(0)), 
+                        (23, BigDecimal::from(0)), 
+                        (24, BigDecimal::from(0)), 
+                        (25, BigDecimal::from(1)), 
+                        (26, BigDecimal::from(0)), 
+                        (27, BigDecimal::from(0)), 
+                        (28, BigDecimal::from(0)), 
+                        (29, BigDecimal::from(1)), 
+                        (30, BigDecimal::from(0)),
+                        (31, BigDecimal::from(0)), 
+                        (32, BigDecimal::from(0)), 
+                        (33, BigDecimal::from(1)), 
+                        (34, BigDecimal::from(0)), 
+                        (35, BigDecimal::from(0)), 
+                        (36, BigDecimal::from(0)), 
+                        (37, BigDecimal::from(1)), 
+                        (38, BigDecimal::from(0)), 
+                        (39, BigDecimal::from(0)), 
+                        (40, BigDecimal::from(0)),
+                        (41, BigDecimal::from(1)), 
+                        (42, BigDecimal::from(0)), 
+                        (43, BigDecimal::from(0)), 
+                        (44, BigDecimal::from(0)), 
+                        (45, BigDecimal::from(1)), 
+                        (46, BigDecimal::from(0)), 
+                        (47, BigDecimal::from(0)), 
+                        (48, BigDecimal::from(0)), 
+                        (49, BigDecimal::from(1)), 
+                        (50, BigDecimal::from(0)),
+                        (51, BigDecimal::from(0)), 
+                        (52, BigDecimal::from(0)), 
+                        (53, BigDecimal::from(1)), 
+                        (54, BigDecimal::from(0)), 
+                        (55, BigDecimal::from(0)), 
+                        (56, BigDecimal::from(0)), 
+                        (57, BigDecimal::from(1)), 
+                        (58, BigDecimal::from(0)), 
+                        (59, BigDecimal::from(0)), 
+                        (60, BigDecimal::from(0))
                 ];
 
 		for (i, value) in points {
@@ -974,6 +1168,18 @@ mod tests {
 			let measurement = InputMeasurement::new(timestamp, value);
 			db.observe_measurement(test_aspect.clone(), measurement).await.unwrap();
 		}
+
+		// create a peak detection event for testing
+		create_peak_detection_events(&db, &test_aspect.id(), &Resolution::Hours, &Spline::Linear, "Peak Detection Test").await.unwrap();
+		println!("Events in queue after peak detection:");
+		let events_lock = EVENTS_QUEUE.lock().await;
+		for event in events_lock.values() {
+			println!("Event: {} with {} manifestations", event.name, event.manifestations.len());
+			for (i, (_timing_key, manifestation)) in event.manifestations.iter().enumerate() {
+				println!("  Manifestation {}: Start: {}, End: {}, Duration: {:.1} hours", i + 1, manifestation.start, manifestation.end, manifestation.duration_hours());
+			}
+		}
+		drop(events_lock);
 
 		db
 	}
@@ -1072,7 +1278,8 @@ mod tests {
 
 		println!("Processed batches count: {}", PROCESSED_BATCHES_QUEUE.lock().await.len());
 
-		assert_eq!(PROCESSED_BATCHES_QUEUE.lock().await.len(), 1);
+		// With 60 points and batch size 10, sliding window creates: 60 - 10 + 1 = 51 overlapping batches
+		assert_eq!(PROCESSED_BATCHES_QUEUE.lock().await.len(), 51);
 
 		Ok(())
 	}

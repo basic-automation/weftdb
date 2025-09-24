@@ -4,7 +4,7 @@ use database::{AspectId, DatabaseInfo};
 use serde::{Deserialize, Serialize};
 use splimes::Resolution;
 
-use crate::types::{Analysis, BatchedMeasurement, Distance, MeasurementVector, Relative};
+use crate::types::{Analysis, BatchDistance, BatchedMeasurement, MeasurementVector, Relative};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchMetatdata {
@@ -22,6 +22,9 @@ pub struct Batch {
 
 impl Batch {
 	pub fn new(size: usize, measurements: Vec<BatchedMeasurement>, resolution: Resolution, aspect: AspectId, database_info: DatabaseInfo) -> Self {
+		// Validate that measurements vector has exactly the expected size
+		assert_eq!(measurements.len(), size, "Batch measurements count ({}) must equal expected size ({})", measurements.len(), size);
+
 		let metadata = BatchMetatdata { resolution, size, aspect, database_info };
 		let mut batch = Self { metadata, measurements };
 		batch.initialize_measurement_vectors().expect("Failed to initialize measurement vectors");
@@ -317,7 +320,7 @@ impl Batch {
 			let positive_distance = (location.clone() - &first_location) / &location_range;
 			let negative_distance = BigDecimal::from(1) - &positive_distance;
 
-			let distance = Distance::new(positive_distance, negative_distance);
+			let distance = BatchDistance::new(positive_distance, negative_distance);
 			measurement.set_distance(distance);
 		}
 
