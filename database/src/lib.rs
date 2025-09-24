@@ -14,7 +14,7 @@
 //! # #[tokio::main]
 //! # async fn main() -> anyhow::Result<()> {
 //! # // Clean up any existing test data first
-//! # std::fs::remove_dir_all("data/my_experiment").ok();
+//! # std::fs::remove_dir_all(format!("{}/my_experiment", DEFAULT_DATA_DIR)).ok();
 //! #
 //! // Create a new database
 //! let db = Database::new("my_experiment").await?;

@@ -2,12 +2,12 @@ use bigdecimal::BigDecimal;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Distance {
+pub struct BatchDistance {
 	positive: BigDecimal,
 	negative: BigDecimal,
 }
 
-impl Distance {
+impl BatchDistance {
 	pub fn new(positive: BigDecimal, negative: BigDecimal) -> Self {
 		Self { positive, negative }
 	}

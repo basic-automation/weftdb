@@ -9,7 +9,7 @@ use splimes::Resolution;
 use crate::{
 	types::{
 		correlation::{AvgErrorRate, Correlation, CorrelationID, SumErrorRate}, event::ManifestationId
-	}, EventID
+	}, EventID, CORRELATIONS_QUEUE
 };
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Hash)]
@@ -21,6 +21,12 @@ pub enum SignalType {
 pub struct Distance {
 	pub value: BigDecimal,
 	pub units: Resolution,
+}
+
+impl std::fmt::Display for Distance {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{} {:?}", self.value, self.units)
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,23 +48,109 @@ impl Signal {
 		&self.distance
 	}
 
-	/// probability of the signal at a given date
-	/// distance from the event maniestation divided by signal distance, after adjusting for resolution
-	pub fn probability(&self, date: DateTime<Utc>, error_rate: BigDecimal) -> Result<BigDecimal> {
-		use bigdecimal::FromPrimitive;
+	/// Convert a Distance from one resolution to the signal's distance units
+	/// This ensures all distance values are in compatible units for calculations
+	fn convert_distance_to_signal_units(&self, distance: &Distance) -> Result<BigDecimal> {
+		// Convert source distance to seconds first, then to target units
+		let seconds = self.distance_to_seconds(distance)?;
+		let target_value = self.seconds_to_distance_units(seconds)?;
+		Ok(target_value)
+	}
 
+	/// Convert a distance value to seconds based on its resolution
+	fn distance_to_seconds(&self, distance: &Distance) -> Result<BigDecimal> {
+		let conversion_factor = match distance.units {
+			Resolution::Nanoseconds => BigDecimal::from(1_000_000_000i64),
+			Resolution::Microseconds => BigDecimal::from(1_000_000i64),
+			Resolution::Milliseconds => BigDecimal::from(1_000i64),
+			Resolution::Seconds => BigDecimal::from(1i64),
+			Resolution::Minutes => BigDecimal::from(60i64),
+			Resolution::Hours => BigDecimal::from(3600i64),
+			Resolution::Days => BigDecimal::from(86400i64),
+			Resolution::Weeks => BigDecimal::from(604800i64),
+			Resolution::Months => BigDecimal::from(2592000i64), // 30 days
+			Resolution::Years => BigDecimal::from(31536000i64), // 365 days
+		};
+
+		// For sub-second units, divide by factor; for super-second units, multiply by factor
+		let seconds = match distance.units {
+			Resolution::Nanoseconds | Resolution::Microseconds | Resolution::Milliseconds => &distance.value / &conversion_factor,
+			_ => &distance.value * &conversion_factor,
+		};
+
+		Ok(seconds)
+	}
+
+	/// Convert seconds to the signal's distance units
+	fn seconds_to_distance_units(&self, seconds: BigDecimal) -> Result<BigDecimal> {
+		let conversion_factor = match self.distance.units {
+			Resolution::Nanoseconds => BigDecimal::from(1_000_000_000i64),
+			Resolution::Microseconds => BigDecimal::from(1_000_000i64),
+			Resolution::Milliseconds => BigDecimal::from(1_000i64),
+			Resolution::Seconds => BigDecimal::from(1i64),
+			Resolution::Minutes => BigDecimal::from(60i64),
+			Resolution::Hours => BigDecimal::from(3600i64),
+			Resolution::Days => BigDecimal::from(86400i64),
+			Resolution::Weeks => BigDecimal::from(604800i64),
+			Resolution::Months => BigDecimal::from(2592000i64), // 30 days
+			Resolution::Years => BigDecimal::from(31536000i64), // 365 days
+		};
+
+		// For sub-second units, multiply by factor; for super-second units, divide by factor
+		let target_value = match self.distance.units {
+			Resolution::Nanoseconds | Resolution::Microseconds | Resolution::Milliseconds => &seconds * &conversion_factor,
+			_ => &seconds / &conversion_factor,
+		};
+
+		Ok(target_value)
+	}
+
+	pub async fn get_error_rate(&self) -> Result<(AvgErrorRate, SumErrorRate)> {
+		let error_rate = CORRELATIONS_QUEUE.lock().await.get_by_id(&self.correlation_id.clone()).ok_or_else(|| anyhow::anyhow!("No correlation found for signal"))?.get_error_rate(&self.signal_type).ok_or_else(|| anyhow::anyhow!("No error rate found for signal type in correlation"))?.clone();
+		Ok(error_rate)
+	}
+
+	/// probability of the signal at a given date
+	/// The signal represents a prediction curve starting at manifestation_date.
+	/// The curve passes through probability = 1 at time = manifestation_date + distance.value + error_rate
+	pub fn probability(&self, date: DateTime<Utc>, error_rate: &Distance) -> Result<BigDecimal> {
 		// Check for division by zero
-		if self.distance.value.is_zero() {
+		if self.distance.value.is_zero() && error_rate.value.is_zero() {
 			return Ok(BigDecimal::zero()); // Avoid division by zero
 		}
 
-		let time_diff = match BigDecimal::from_i64(self.distance.units.difference(&self.manifestation_date, &date)?) {
-			Some(diff) => diff.abs(),
+		// Calculate time elapsed since the signal's manifestation date
+		let time_elapsed = match BigDecimal::from_i64(self.distance.units.difference(&date, &self.manifestation_date)?) {
+			Some(diff) => diff,
 			None => bail!("Failed to convert time difference to BigDecimal"),
 		};
 
-		// Probability is (time_diff / distance) + error_rate
-		let probability = (&time_diff / &self.distance.value) + &error_rate;
+		// Convert error rate to the signal's distance units if they differ
+		let error_rate_in_signal_units = if error_rate.units == self.distance.units {
+			// Same units, use error rate value directly
+			error_rate.value.clone()
+		} else {
+			// Different units, convert error rate to signal's units using Resolution methods
+			self.convert_distance_to_signal_units(error_rate)?
+		};
+
+		// The predicted event time is: manifestation_date + distance.value + error_rate (in signal units)
+		let predicted_event_time = &self.distance.value + &error_rate_in_signal_units;
+
+		// If we haven't reached the predicted time yet, probability should be proportional to time elapsed
+		// If time_elapsed <= 0, we're before or at the manifestation date
+		if time_elapsed <= BigDecimal::zero() {
+			return Ok(BigDecimal::zero());
+		}
+
+		// If predicted_event_time <= 0, handle edge case
+		if predicted_event_time <= BigDecimal::zero() {
+			return Ok(BigDecimal::from(1));
+		}
+
+		// Probability = time_elapsed / predicted_event_time
+		// This creates a linear curve from 0 at manifestation_date to 1 at predicted_event_time
+		let probability = &time_elapsed / predicted_event_time;
 
 		Ok(probability)
 	}
@@ -120,7 +212,7 @@ impl Signals {
 	/// - `signal_type`: The signal type to remove
 	/// - `correlation`: Mutable reference to the correlation to update with new error rate
 	/// - `resolution_time`: The time when the prediction resolves (usually current time)
-	/// - `default_correction_rate`: The default correction rate (usually 1)
+	/// - `signal_error_rates`: The current error rates for this signal type (to avoid deadlock)
 	///
 	/// # Returns
 	/// - The removed signal if it existed, None otherwise
@@ -129,21 +221,34 @@ impl Signals {
 	/// New Error Rate = (Signal Probability - default_correction_rate) + Current Error Rate
 	///
 	/// Where Signal Probability is calculated at the resolution time.
-	pub fn remove_with_error_correction(&mut self, correlation_id: &CorrelationID, manifestation_id: &ManifestationId, signal_type: &SignalType, correlation: &mut Correlation, resolution_time: DateTime<Utc>) -> Result<Option<Signal>> {
-		let current_error_rate = match correlation.error_rate.get(signal_type) {
-			Some(rate) => rate.clone(),
-			None => bail!("No error rate found for signal type in correlation"),
+	pub async fn remove_with_error_correction(&mut self, correlation: &mut Correlation, manifestation_id: &ManifestationId, signal_type: &SignalType, resolution_time: DateTime<Utc>) -> Result<Option<Signal>> {
+		let correlation_id = &correlation.id;
+		let Some(signal_error_rates) = correlation.get_error_rate(signal_type) else {
+			// No error rates for this signal type, cannot perform error correction
+			bail!("No error rates found for signal type in correlation");
 		};
 
 		// Get the signal before removing it
 		if let Some(signal) = self.get(correlation_id, manifestation_id, signal_type) {
-			// Calculate the signal probability at the resolution time
-			let average_signal_probability = signal.probability(resolution_time, current_error_rate.0.clone())?;
-			let sum_signal_probability = signal.probability(resolution_time, current_error_rate.1.clone())?;
+			// Calculate the signal probability at the resolution time using provided error rates
+			let average_signal_probability = signal.probability(resolution_time, &signal_error_rates.0)?;
+			let sum_signal_probability = signal.probability(resolution_time, &signal_error_rates.1)?;
+
+			println!("DEBUG ERROR CORRECTION:");
+			println!("  Signal distance: {}", signal.distance.value);
+			println!("  Signal manifestation date: {}", signal.manifestation_date);
+			println!("  Resolution time: {}", resolution_time);
+			println!("  Current avg error rate: {}", signal_error_rates.0.value);
+			println!("  Current sum error rate: {}", signal_error_rates.1.value);
+			println!("  Calculated avg probability: {}", average_signal_probability);
+			println!("  Calculated sum probability: {}", sum_signal_probability);
 
 			// Apply error correction formula: (Signal - 1) + Current Error Rate = New Error Rate
-			let new_average_error_rate = (&average_signal_probability - 1) + &current_error_rate.0;
-			let new_sum_error_rate = (&sum_signal_probability + 1) + &current_error_rate.1;
+			let new_average_error_rate = Distance { value: (&average_signal_probability - 1) + &signal_error_rates.0.value, units: signal_error_rates.0.units };
+			let new_sum_error_rate = Distance { value: (&sum_signal_probability - 1) + &signal_error_rates.1.value, units: signal_error_rates.1.units };
+
+			println!("  New avg error rate: {}", new_average_error_rate.value);
+			println!("  New sum error rate: {}", new_sum_error_rate.value);
 
 			// Update the correlation's error rate
 			correlation.error_rate.insert(signal_type.clone(), (new_average_error_rate, new_sum_error_rate));
@@ -155,13 +260,25 @@ impl Signals {
 		}
 	}
 
-	pub fn probability_average(&self, event_id: &EventID, signal_type: &SignalType, date: DateTime<Utc>, error_rate: &(AvgErrorRate, SumErrorRate)) -> Result<Option<BigDecimal>> {
+	pub async fn probability_average(&self, event_id: &EventID, signal_type: &SignalType, date: DateTime<Utc>) -> Result<Option<BigDecimal>> {
 		let signals = self.get_by_event(event_id, signal_type);
 		if !signals.is_empty() {
-			let prob = signals.iter().map(|s| s.probability(date, error_rate.0.clone())).collect::<Result<Vec<_>>>()?;
+			let mut prob = Vec::new();
+			let mut total_avg_error_rate = BigDecimal::zero();
+			let mut error_rate_count = 0;
+
+			for s in signals.iter() {
+				let default_distance = Distance { value: BigDecimal::zero(), units: Resolution::Seconds };
+				let error_rate = s.get_error_rate().await.unwrap_or((default_distance.clone(), default_distance.clone()));
+				total_avg_error_rate = &total_avg_error_rate + &error_rate.0.value;
+				error_rate_count += 1;
+				prob.push(s.probability(date, &error_rate.0)?);
+			}
 			if prob.is_empty() {
 				Ok(None)
 			} else {
+				let avg_error_rate = &total_avg_error_rate / BigDecimal::from(error_rate_count);
+				println!("DEBUG probability_average: Using {} signals with average error rate: {}", signals.len(), avg_error_rate);
 				let sum: BigDecimal = prob.iter().cloned().fold(BigDecimal::zero(), |acc, x| acc + x);
 				let avg = sum / BigDecimal::from_usize(prob.len()).unwrap();
 				Ok(Some(avg))
@@ -171,13 +288,25 @@ impl Signals {
 		}
 	}
 
-	pub fn probability_sum(&self, event_id: &EventID, signal_type: &SignalType, date: DateTime<Utc>, error_rate: &(AvgErrorRate, SumErrorRate)) -> Result<Option<BigDecimal>> {
+	pub async fn probability_sum(&self, event_id: &EventID, signal_type: &SignalType, date: DateTime<Utc>) -> Result<Option<BigDecimal>> {
 		let signals = self.get_by_event(event_id, signal_type);
 		if !signals.is_empty() {
-			let prob = signals.iter().map(|s| s.probability(date, error_rate.1.clone())).collect::<Result<Vec<_>>>()?;
+			let mut prob = Vec::new();
+			let mut total_sum_error_rate = BigDecimal::zero();
+			let mut error_rate_count = 0;
+
+			for s in signals.iter() {
+				let default_distance = Distance { value: BigDecimal::zero(), units: Resolution::Seconds };
+				let error_rate = s.get_error_rate().await.unwrap_or((default_distance.clone(), default_distance.clone()));
+				total_sum_error_rate = &total_sum_error_rate + &error_rate.1.value;
+				error_rate_count += 1;
+				prob.push(s.probability(date, &error_rate.1)?);
+			}
 			if prob.is_empty() {
 				Ok(None)
 			} else {
+				let avg_sum_error_rate = &total_sum_error_rate / BigDecimal::from(error_rate_count);
+				println!("DEBUG probability_sum: Using {} signals with average sum error rate: {}", signals.len(), avg_sum_error_rate);
 				let sum: BigDecimal = prob.iter().cloned().fold(BigDecimal::zero(), |acc, x| acc + x);
 				Ok(Some(sum))
 			}

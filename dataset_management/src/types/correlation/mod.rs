@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 
-use bigdecimal::BigDecimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::event::EventID;
+// Import Distance from signal module for error rate types
+use super::signal::Distance;
 use crate::{types::pattern::Occurrence, PatternID, SignalType};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
@@ -36,8 +37,8 @@ impl std::fmt::Display for CorrelationID {
 	}
 }
 
-pub type AvgErrorRate = BigDecimal;
-pub type SumErrorRate = BigDecimal;
+pub type AvgErrorRate = Distance;
+pub type SumErrorRate = Distance;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Correlation {
@@ -53,8 +54,10 @@ impl Correlation {
 	pub fn new(dictionary_id: Uuid, pattern_id: PatternID, event_id: EventID, error_rate: (AvgErrorRate, SumErrorRate), occurrences: Vec<Occurrence>) -> Self {
 		let id = CorrelationID::new();
 		let mut error_rate_map = HashMap::new();
-		// Initialize with a default SignalType - we can add other types later
-		error_rate_map.insert(SignalType::Custom("default".to_string()), error_rate);
+		// Initialize error rates for all signal types that will be created
+		error_rate_map.insert(SignalType::Custom("PredictStart".to_string()), error_rate.clone());
+		error_rate_map.insert(SignalType::Custom("PredictMid".to_string()), error_rate.clone());
+		error_rate_map.insert(SignalType::Custom("PredictEnd".to_string()), error_rate);
 		Self { id, dictionary_id, pattern_id, event_id, error_rate: error_rate_map, occurrences }
 	}
 
@@ -97,8 +100,16 @@ impl Correlations {
 		self.0.get(&(event_id.clone(), *pattern_id))
 	}
 
+	pub fn get_by_id(&self, correlation_id: &CorrelationID) -> Option<&Correlation> {
+		self.0.values().find(|correlation| &correlation.id == correlation_id)
+	}
+
 	pub fn get_for_event(&self, event_id: &EventID) -> Vec<(&PatternID, &Correlation)> {
 		self.0.iter().filter_map(|((eid, pid), correlation)| if eid == event_id { Some((pid, correlation)) } else { None }).collect()
+	}
+
+	pub fn get_for_event_name(&self, event_name: &str) -> Vec<(&PatternID, &Correlation)> {
+		self.0.iter().filter_map(|((eid, pid), correlation)| if eid.to_string() == event_name { Some((pid, correlation)) } else { None }).collect()
 	}
 
 	pub fn count_for_event(&self, event_id: &EventID) -> usize {

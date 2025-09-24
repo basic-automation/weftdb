@@ -429,7 +429,7 @@ async fn test_create_btc_1min_database() -> Result<()> {
 	// Note: This requires the CSV file to be present
 	let csv_path = "datasets/btc_1min.csv"; // Fixed path for package-level testing
 
-	let db_name = format!("Crypto");
+	let db_name = "Crypto".to_string();
 
 	// Check if database already exists, if so use it
 	let db = if std::path::Path::new(&format!("{}/{}", DEFAULT_DATA_DIR, db_name)).exists() {
