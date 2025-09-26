@@ -231,7 +231,7 @@ impl Signals {
 		// Get the signal before removing it
 		if let Some(signal) = self.get(correlation_id, manifestation_id, signal_type) {
 			// Calculate the signal probability at the resolution time using provided error rate
-			let signal_probability = signal.probability(resolution_time, &signal_error_rates)?;
+			let signal_probability = signal.probability(resolution_time, signal_error_rates)?;
 
 			// Apply error correction formula: (Signal - 1) + Current Error Rate = New Error Rate
 			let new_error_rate = Distance { value: (&signal_probability - 1) + &signal_error_rates.value, units: signal_error_rates.units };

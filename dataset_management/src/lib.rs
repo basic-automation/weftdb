@@ -1,7 +1,7 @@
 use std::sync::LazyLock;
 
 use anyhow::Result;
-use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive, Zero};
+use bigdecimal::{BigDecimal, FromPrimitive, Zero};
 use chrono::Datelike;
 use database::{AspectId, Database, Resolution};
 use futures::TryStreamExt;
@@ -9,10 +9,12 @@ use rayon::prelude::*;
 use splimes::Spline;
 use tokio::sync::Mutex;
 pub use types::*;
+pub use batch_utils::{UNPROCESSED_BATCHES_QUEUE, build_unprocessed_queue};
 
 #[cfg(test)]
 mod memory_test;
 pub mod types;
+mod batch_utils;
 
 pub const BATCH_SIZE: [usize; 1] = [100];
 pub static DEFAULT_ERROR_RATE: LazyLock<signal::Distance> = LazyLock::new(|| signal::Distance { 
@@ -20,52 +22,13 @@ pub static DEFAULT_ERROR_RATE: LazyLock<signal::Distance> = LazyLock::new(|| sig
 	units: splimes::Resolution::Seconds  // Use seconds as the canonical unit for error rates
 });
 
-static UNPROCESSED_BATCHES_QUEUE: LazyLock<Mutex<Vec<Batch>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 static PROCESSED_BATCHES_QUEUE: LazyLock<Mutex<Vec<Batch>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 static PATTERNS_QUEUE: LazyLock<Mutex<Vec<Pattern>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 static EVENTS_QUEUE: LazyLock<Mutex<Events>> = LazyLock::new(|| Mutex::new(Events::new()));
 static CORRELATIONS_QUEUE: LazyLock<Mutex<Correlations>> = LazyLock::new(|| Mutex::new(Correlations::new()));
 static SIGNALS_QUEUE: LazyLock<Mutex<Signals>> = LazyLock::new(|| Mutex::new(Signals::new()));
 
-pub async fn build_unprocessed_queue(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, batch_size: usize) -> Result<()> {
-	let start_time = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
-	let end_time = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
 
-	// Collect all points first to create sliding window batches
-	let mut point_stream = database.stream_analyze_range(*aspect, start_time, end_time, *resolution, *method);
-	let mut all_points = Vec::new();
-	while let Some(point) = point_stream.try_next().await? {
-		all_points.push(point);
-	}
-
-	println!("Total points streamed: {}", all_points.len());
-	println!("Batch size: {}", batch_size);
-	println!("Start time: {}, End time: {}", start_time, end_time);
-
-	// Create sliding window batches (overlapping)
-	if batch_size > 0 && all_points.len() >= batch_size {
-		let database_info = database.get_database_info().await.expect("Database info should be available");
-
-		// Create overlapping sliding window batches - each batch has exactly batch_size measurements
-		for i in 0..=(all_points.len() - batch_size) {
-			let window = &all_points[i..i + batch_size];
-			assert_eq!(window.len(), batch_size, "Window should always have exactly batch_size elements");
-
-			let measurements = window.iter().map(|p| BatchedMeasurement::new(p.clone())).collect();
-			let batch = Batch::new(batch_size, measurements, *resolution, *aspect, database_info.clone());
-
-			let mut batches_lock = UNPROCESSED_BATCHES_QUEUE.lock().await;
-			batches_lock.push(batch);
-			drop(batches_lock);
-		}
-	}
-
-	let final_lock = UNPROCESSED_BATCHES_QUEUE.lock().await;
-	println!("Final UNPROCESSED_BATCHES_QUEUE length: {}", final_lock.len());
-	drop(final_lock);
-
-	Ok(())
-}
 
 pub async fn build_processed_batch_queue() -> Result<()> {
 	// print UNPROCESSED_BATCHES_QUEUE length for verification
@@ -196,7 +159,7 @@ pub async fn load_dictionary(dictionary: &mut Dictionary) -> Result<()> {
 
 			let remaining = patterns_queue.len();
 			if remaining > 0 {
-				println!("Processed {} patterns, {} remaining", pattern_count - remaining, remaining);
+				// println!("Processed {} patterns, {} remaining", pattern_count - remaining, remaining);
 			}
 
 			// Yield to prevent blocking other tasks
@@ -320,7 +283,7 @@ pub async fn create_event_and_manifestations(database: &Database, aspect: &Aspec
 	}
 
 	// Analyze each month for 5% increases
-	for ((year, month), month_points) in months_data {
+	for ((_year, _month), month_points) in months_data {
 		if month_points.len() < 2 {
 			continue; // Need at least 2 points to compare start and end
 		}
@@ -341,9 +304,6 @@ pub async fn create_event_and_manifestations(database: &Database, aspect: &Aspec
 		// If increase is 5% or more, create a manifestation
 		if percentage_increase >= threshold_percentage {
 			let database_info = database.get_database_info().await.expect("Database info should be available");
-
-			println!("Detected 5%+ increase for {} in {}/{}: Start Price = {}, End Price = {}, Increase = {:.2}%", aspect, month, year, start_price, end_price, (percentage_increase.to_f64().unwrap_or(0.0) * 100.0));
-
 			let manifestation = Manifestation::new(
 				database_info.id().as_uuid(),
 				sorted_month_points[0].timestamp, // Start of the month
@@ -380,7 +340,7 @@ pub async fn create_correlations_for_events(dictionary: &Dictionary) -> Result<(
 		for pattern in patterns {
 			// Assign constant to local variable before borrowing to avoid clippy warning
 			let error_rate = DEFAULT_ERROR_RATE.clone();
-                        			
+
 			let correlation = Correlation::new(pattern.occurrences()[0].database_info.id().as_uuid(), pattern.id(), event_id.clone(), error_rate, pattern.occurrences().clone());
 			CORRELATIONS_QUEUE.lock().await.insert(event_id.clone(), pattern.id(), correlation);
 		}
@@ -577,6 +537,7 @@ mod tests {
 	use serde_json::json;
 	use serial_test::serial;
 	use splimes::{Point, Spline};
+        use batch_utils::build_unprocessed_queue;
 
 	use super::*;
 
@@ -610,7 +571,7 @@ mod tests {
 
 		println!("Time taken for build_processed_queue: {:?}", timer.elapsed());
 
-		let processed_lock = PROCESSED_BATCHES_QUEUE.lock().await;
+		let processed_lock = PROCESSED_BATCHES_QUEUE.lock().await; 
 
 		// print random batch from processed queue for verification
 		let mut random_index = 0;
@@ -650,7 +611,7 @@ mod tests {
                         variabilities: Some(
                                 vec![
                                         VariablilityType::MaximumStatic(Variability {
-                                                value: BigDecimal::from(1)
+                                                value: BigDecimal::from_f64(0.1).unwrap()
                                         })
                                 ]
                         )
@@ -669,7 +630,6 @@ mod tests {
 		create_event_and_manifestations(&database, &aspect.id(), &resolution, &method).await?;
 
 		println!("Time taken for build_events_5_percent_queue: {:?}", timer.elapsed());
-		analyze_event_timing().await?;
 
 		let timer = std::time::Instant::now();
 		println!("Starting create_correlations_for_events...");
@@ -767,7 +727,11 @@ mod tests {
 
 		let timer = std::time::Instant::now();
 		println!("Calculating sample signal probability...");
-		let sig_sum_probability = signals_lock.probability_sum(&random_event_id, &signal_type, Utc::now()).await?.unwrap_or(BigDecimal::from(0));
+
+                // get oct. 1st 2025 DateTime<Utc>
+                let sample_datetime = Utc.with_ymd_and_hms(2025, 12, 15, 0, 0, 0).unwrap();
+
+		let sig_sum_probability = signals_lock.probability_sum(&random_event_id, &signal_type, sample_datetime).await?.unwrap_or(BigDecimal::from(0));
 
 		println!("Time taken for sample signal probability calculation: {:?}", timer.elapsed());
 		println!("Sample signal probability for correlation ID {}, manifestation ID {}, signal type {:?}:", random_correlation_id, random_manifestation_id, signal_type);
@@ -825,7 +789,8 @@ mod tests {
 		println!("max_x: {}, max_y: {}", pattern.relatives().iter().map(|r| r.vector().location()).max().unwrap_or(&BigDecimal::from(0)), pattern.relatives().iter().map(|r| r.vector().amplitude()).max().unwrap_or(&BigDecimal::from(0)));
 	}
 
-	async fn analyze_event_timing() -> Result<()> {
+	#[allow(dead_code)]
+	pub async fn analyze_event_timing() -> Result<()> {
 		let events = get_events_queue().await;
 
 		if events.is_empty() {
@@ -880,9 +845,20 @@ mod tests {
 	///
 	/// # Returns
 	/// A vector containing all events currently in the queue
-	async fn get_events_queue() -> Vec<Event> {
+	#[allow(dead_code)]
+	pub async fn get_events_queue() -> Vec<Event> {
 		let events_lock = EVENTS_QUEUE.lock().await;
 		events_lock.values().cloned().collect()
+	}
+
+	/// Clears all events from the events queue
+	///
+	/// # Returns
+	/// Nothing
+	#[allow(dead_code)]
+	pub async fn clear_events_queue() {
+		let mut events_lock = EVENTS_QUEUE.lock().await;
+		events_lock.clear();
 	}
 
 	/// Detects peak values in the dataset
@@ -1030,7 +1006,6 @@ mod tests {
 		// create a peak detection event for testing
 		let event_name = "peaks";
 		create_peak_detection_events(&db, &aspect.id(), &Resolution::Hours, &Spline::Linear, event_name).await?;
-		analyze_event_timing().await?;
 
 		create_correlations_for_events(&dictionary).await?;
 		let correlations_lock = CORRELATIONS_QUEUE.lock().await;

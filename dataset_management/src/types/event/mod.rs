@@ -110,10 +110,6 @@ impl EventName {
 	pub fn new(name: String) -> Self {
 		Self(name)
 	}
-
-	pub fn to_string(&self) -> String {
-		self.0.clone()
-	}
 }
 
 impl std::fmt::Display for EventName {
@@ -185,6 +181,10 @@ impl Events {
 
 	pub fn is_empty(&self) -> bool {
 		self.0.is_empty()
+	}
+
+	pub fn clear(&mut self) {
+		self.0.clear();
 	}
 
 	pub fn get_event_by_name(&self, name: &str) -> Option<&Event> {
