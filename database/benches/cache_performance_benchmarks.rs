@@ -72,7 +72,13 @@ fn benchmark_cache_miss_vs_hit(c: &mut Criterion) {
 fn benchmark_cache_invalidation(c: &mut Criterion) {
 	let rt = Runtime::new().unwrap();
 
-	c.bench_function("cache_invalidation", |b| {
+	// Configure for faster benchmarking
+	let mut group = c.benchmark_group("cache_invalidation_group");
+	group.sample_size(20); // Reduce from 100 to 20 samples
+	group.measurement_time(std::time::Duration::from_secs(2)); // Reduce measurement time
+	group.warm_up_time(std::time::Duration::from_secs(1)); // Reduce warm-up time
+
+	group.bench_function("cache_invalidation", |b| {
 		b.iter(|| {
 			rt.block_on(async {
 				let db_name = format!("cache_invalidation_{}", Uuid::new_v4());
@@ -96,12 +102,19 @@ fn benchmark_cache_invalidation(c: &mut Criterion) {
 			})
 		});
 	});
+	group.finish();
 }
 
 fn benchmark_concurrent_cache_access(c: &mut Criterion) {
 	let rt = Runtime::new().unwrap();
 
-	c.bench_function("concurrent_cache_access", |b| {
+	// Configure for faster benchmarking
+	let mut group = c.benchmark_group("concurrent_cache_group");
+	group.sample_size(10); // Reduce sample count further
+	group.measurement_time(std::time::Duration::from_secs(2)); // Reduce measurement time
+	group.warm_up_time(std::time::Duration::from_secs(1)); // Reduce warm-up time
+
+	group.bench_function("concurrent_cache_access", |b| {
 		b.iter(|| {
 			rt.block_on(async {
 				let db_name = format!("concurrent_cache_{}", Uuid::new_v4());
@@ -134,15 +147,23 @@ fn benchmark_concurrent_cache_access(c: &mut Criterion) {
 			})
 		});
 	});
+	group.finish();
 }
 
 fn benchmark_cache_memory_usage(c: &mut Criterion) {
 	let rt = Runtime::new().unwrap();
 
+	// Configure for slow benchmarks with high variance (memory operations can be variable)
+	let mut group = c.benchmark_group("cache_memory_group");
+	group.sample_size(10);
+	group.measurement_time(std::time::Duration::from_secs(50)); // Increased for variable memory operations
+	group.warm_up_time(std::time::Duration::from_secs(4));
+	group.sampling_mode(criterion::SamplingMode::Flat); // Use flat sampling for variable execution times
+
 	let memory_sizes = vec![10, 50, 100];
 
 	for size in memory_sizes {
-		c.bench_function(&format!("cache_memory_{}_measurements", size), |b| {
+		group.bench_function(format!("cache_memory_{}_measurements", size), |b| {
 			b.iter(|| {
 				rt.block_on(async {
 					let db_name = format!("memory_cache_{}_{}", size, Uuid::new_v4());
@@ -172,12 +193,19 @@ fn benchmark_cache_memory_usage(c: &mut Criterion) {
 			});
 		});
 	}
+	group.finish();
 }
 
 fn benchmark_cache_eviction_strategies(c: &mut Criterion) {
 	let rt = Runtime::new().unwrap();
 
-	c.bench_function("cache_eviction", |b| {
+	// Configure for very slow benchmark (cache eviction takes 1-2+ seconds per iteration)
+	let mut group = c.benchmark_group("cache_eviction_group");
+	group.sample_size(10);
+	group.measurement_time(std::time::Duration::from_secs(30)); // Increased to address 26.4s warning
+	group.warm_up_time(std::time::Duration::from_secs(3));
+
+	group.bench_function("cache_eviction", |b| {
 		b.iter(|| {
 			rt.block_on(async {
 				let db_name = format!("eviction_cache_{}", Uuid::new_v4());
@@ -206,6 +234,7 @@ fn benchmark_cache_eviction_strategies(c: &mut Criterion) {
 			})
 		});
 	});
+	group.finish();
 }
 
 criterion_group!(cache_benches, benchmark_cache_miss_vs_hit, benchmark_cache_invalidation, benchmark_concurrent_cache_access, benchmark_cache_memory_usage, benchmark_cache_eviction_strategies);

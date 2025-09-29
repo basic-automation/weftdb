@@ -1,7 +1,7 @@
 use std::{collections::HashMap, hash::Hash};
 
 use serde::{Deserialize, Serialize};
-use sqlx::{Pool, Sqlite};
+use turso::Database as TursoDatabase;
 use uuid::Uuid;
 
 use crate::{Aspect, AspectId, DatabaseId};
@@ -38,7 +38,7 @@ pub struct Subject {
 	database_id: DatabaseId,
 	name: String,
 	#[serde(skip)]
-	pool: Option<Pool<Sqlite>>,
+	turso_db: Option<TursoDatabase>,
 	aspects: HashMap<AspectId, Aspect>,
 }
 
@@ -53,7 +53,7 @@ impl Hash for Subject {
 impl PartialEq for Subject {
 	fn eq(&self, other: &Self) -> bool {
 		self.id == other.id && self.database_id == other.database_id && self.name == other.name && self.aspects == other.aspects
-		// Skip pool comparison since it doesn't implement PartialEq
+		// Skip turso_db comparison since it doesn't implement PartialEq
 	}
 }
 
@@ -61,14 +61,14 @@ impl Eq for Subject {}
 
 impl Subject {
 	#[must_use]
-	pub fn new(name: String, database_id: DatabaseId, pool: Pool<Sqlite>) -> Self {
+	pub fn new(name: String, database_id: DatabaseId, turso_db: TursoDatabase) -> Self {
 		let id = SubjectId::new();
-		Self { id, name, pool: Some(pool), database_id, aspects: HashMap::new() }
+		Self { id, name, turso_db: Some(turso_db), database_id, aspects: HashMap::new() }
 	}
 
 	#[must_use]
-	pub fn new_with_id(id: SubjectId, name: String, database_id: DatabaseId, pool: Pool<Sqlite>) -> Self {
-		Self { id, name, pool: Some(pool), database_id, aspects: HashMap::new() }
+	pub fn new_with_id(id: SubjectId, name: String, database_id: DatabaseId, turso_db: TursoDatabase) -> Self {
+		Self { id, name, turso_db: Some(turso_db), database_id, aspects: HashMap::new() }
 	}
 
 	#[must_use]
@@ -87,8 +87,8 @@ impl Subject {
 	}
 
 	#[must_use]
-	pub const fn pool(&self) -> Option<&Pool<Sqlite>> {
-		self.pool.as_ref()
+	pub const fn turso_db(&self) -> Option<&TursoDatabase> {
+		self.turso_db.as_ref()
 	}
 
 	#[must_use]

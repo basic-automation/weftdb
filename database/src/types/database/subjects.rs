@@ -1,4 +1,5 @@
 use anyhow::{bail, Result};
+use turso::{params, Builder};
 
 use crate::{Database, Error, Subject, SubjectId, DATABASES};
 
@@ -12,11 +13,11 @@ impl Database {
 	/// A `Subject` instance representing the newly created subject.
 	///
 	pub async fn track_subject(&self, name: &str) -> Result<Subject> {
-		// Get database path and metadata pool with early drop
-		let (db_path, metadata_pool) = {
+		// Get database path and metadata turso_db with early drop
+		let (db_path, metadata_turso_db) = {
 			let databases = DATABASES.lock().await.clone();
 			let Some(db_info) = databases.get(&self.id()) else { bail!(Error::DatabaseError("Database not found".to_string())) };
-			(db_info.path().to_string(), db_info.metadata_pool().cloned())
+			(db_info.path().to_string(), db_info.metadata_turso_db().cloned())
 		};
 
 		// Ensure the database directory exists
@@ -28,24 +29,18 @@ impl Database {
 		// Create subject database file
 		let subject_db_path = format!("{db_path}/{name}.db");
 
-		// Create the database file and connect
-		let pool = match sqlx::sqlite::SqlitePoolOptions::new().max_connections(5).connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&subject_db_path).create_if_missing(true)).await {
-			Ok(pool) => pool,
-			Err(e) => bail!(Error::DatabaseError(format!("Failed to connect to subject database: {e}"))),
-		};
+		// Create the Turso database
+		let subject_turso_db = Builder::new_local(&subject_db_path).build().await.map_err(|e| Error::DatabaseError(format!("Failed to create subject database: {e}")))?;
 
 		let subject_id = SubjectId::new();
 
 		// Insert into merged subjects table
-		if let Some(ref metadata_pool) = metadata_pool {
-			match sqlx::query("INSERT INTO subjects (id, database_id, name, created_at) VALUES (?, ?, ?, ?)").bind(subject_id.as_uuid()).bind(self.id().as_uuid()).bind(name).bind(chrono::Utc::now().timestamp_millis()).execute(metadata_pool).await {
-				Ok(_) => (),
-				Err(e) => bail!(Error::DatabaseError(format!("Failed to insert subject: {e}"))),
-			}
-			// Removed insert into subject_metadata
+		if let Some(ref metadata_turso_db) = metadata_turso_db {
+			let conn = metadata_turso_db.connect()?;
+			conn.execute("INSERT INTO subjects (id, database_id, name, created_at) VALUES (?, ?, ?, ?)", params![subject_id.as_uuid().to_string(), self.id().as_uuid().to_string(), name.to_string(), chrono::Utc::now().timestamp_millis().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to insert subject: {e}")))?;
 		}
 
-		let subject = Subject::new_with_id(subject_id, name.to_string(), self.id(), pool);
+		let subject = Subject::new_with_id(subject_id, name.to_string(), self.id(), subject_turso_db);
 
 		// Add subject to database
 		match DATABASES.lock().await.get_mut(&self.id()) {

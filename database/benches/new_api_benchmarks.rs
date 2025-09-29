@@ -156,26 +156,34 @@ fn benchmark_range_analysis(c: &mut Criterion) {
 		let subject = db.track_subject("bench_subject").await.unwrap();
 		let aspect = db.track_aspect(subject, "bench_aspect", Resolution::Seconds).await.unwrap();
 
-		// Add test data
+		// Add reduced test data for faster benchmark (reduced from 1000 to 200)
 		let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-		for i in 0..1000 {
-			let measurement = InputMeasurement::new(base_time + Duration::seconds(i * 60), BigDecimal::from_str(&format!("{}.0", i)).unwrap());
-			db.observe_measurement(aspect.clone(), measurement).await.unwrap();
+		let mut measurements = Vec::with_capacity(200);
+		for i in 0..200 {
+			measurements.push(InputMeasurement::new(base_time + Duration::seconds(i * 60), BigDecimal::from_str(&format!("{}.0", i)).unwrap()));
 		}
+		db.observe_measurements_batch(aspect.clone(), measurements).await.unwrap();
 
 		(db, aspect.id())
 	});
 
-	c.bench_function("range_analysis", |b| {
+	// Configure criterion for very slow benchmarks
+	let mut group = c.benchmark_group("range_analysis");
+	group.sample_size(10); // Minimum 10 samples required by Criterion
+	group.measurement_time(std::time::Duration::from_secs(15)); // Increase measurement time to match warnings
+	group.warm_up_time(std::time::Duration::from_secs(5)); // Longer warm-up for database ops
+
+	group.bench_function("analyze_range", |b| {
 		b.iter(|| {
 			rt.block_on(async {
 				let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-				let end = start + Duration::hours(5);
+				let end = start + Duration::hours(2); // Reduced analysis range for faster benchmark
 				let result = Database::analyze_range(aspect_id, start, end, Resolution::Minutes, Spline::Linear).await.unwrap();
 				black_box(result)
 			})
 		});
 	});
+	group.finish();
 
 	// Cleanup
 	rt.block_on(async {

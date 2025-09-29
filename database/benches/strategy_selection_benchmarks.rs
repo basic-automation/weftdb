@@ -11,15 +11,21 @@ use uuid::Uuid;
 fn benchmark_strategy_selection(c: &mut Criterion) {
 	let rt = Runtime::new().unwrap();
 
-	// Reduced dataset sizes for reasonable benchmark times
+	// Further reduced dataset sizes for faster benchmarks
 	let dataset_sizes = vec![
-		("small_dataset", 100, Resolution::Minutes),
-		("medium_dataset", 500, Resolution::Seconds),
-		("large_dataset", 1000, Resolution::Seconds), // Reduced from 10000 to 1000
+		("small_dataset", 50, Resolution::Minutes),   // Reduced from 100 to 50
+		("medium_dataset", 100, Resolution::Minutes), // Reduced from 500 to 100, changed to Minutes
+		("large_dataset", 200, Resolution::Minutes),  // Reduced from 1000 to 200, changed to Minutes
 	];
 
+	// Configure criterion for slow benchmarks
+	let mut group = c.benchmark_group("strategy_selection");
+	group.sample_size(10); // Minimum 10 samples required by Criterion
+	group.measurement_time(std::time::Duration::from_secs(16)); // Increased to address 14.3-14.4s warnings
+	group.warm_up_time(std::time::Duration::from_secs(3)); // Warm-up for database ops
+
 	for (name, size, resolution) in dataset_sizes {
-		c.bench_function(name, |b| {
+		group.bench_function(name, |b| {
 			b.iter(|| {
 				rt.block_on(async {
 					// Create unique database for each iteration
@@ -58,6 +64,7 @@ fn benchmark_strategy_selection(c: &mut Criterion) {
 			});
 		});
 	}
+	group.finish();
 }
 
 criterion_group!(benches, benchmark_strategy_selection);

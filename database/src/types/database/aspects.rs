@@ -4,7 +4,6 @@ use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
 use splimes::Resolution;
-use sqlx::Row;
 
 use crate::{Aspect, AspectId, Database, Error, Subject, DATABASES};
 
@@ -20,31 +19,24 @@ impl Database {
 		let aspect_id = AspectId::new();
 		let table_name = Self::sanitize_table_name(name);
 
-		// Get pool and metadata pool with proper scope management - extract immediately
+		// Get client and metadata client with proper scope management - extract immediately
 		let db_id = self.id();
 		let db_info = self.get_database_info().await.ok_or_else(|| Error::DatabaseError("Database not found".to_string()))?;
-		let metadata_pool = db_info.metadata_pool().cloned().ok_or_else(|| Error::DatabaseError("Metadata pool not found".to_string()))?;
-		let pool = subject.pool().ok_or_else(|| Error::DatabaseError("Subject pool not found".to_string()))?;
+		let metadata_turso_db = db_info.metadata_turso_db().cloned().ok_or_else(|| Error::DatabaseError("Metadata turso_db not found".to_string()))?;
+		let subject_turso_db = subject.turso_db().cloned().ok_or_else(|| Error::DatabaseError("Subject turso_db not found".to_string()))?;
 
 		// Create the aspect table
-		let create_table_sql = format!("CREATE TABLE IF NOT EXISTS {table_name} (id TEXT PRIMARY KEY, timestamp INTEGER NOT NULL, value TEXT NOT NULL)");
-		match sqlx::query(&create_table_sql).execute(pool).await {
-			Ok(_) => (),
-			Err(e) => bail!(Error::DatabaseError(format!("Failed to create aspect table: {e}"))),
-		}
+		let conn = subject_turso_db.connect()?;
+		let create_table_sql = format!("CREATE TABLE IF NOT EXISTS {table_name} (id TEXT PRIMARY KEY, timestamp TEXT NOT NULL, value TEXT NOT NULL)");
+		conn.execute(&create_table_sql, turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to create aspect table: {e}")))?;
 
 		// Create index for efficient time-based queries
 		let create_index_sql = format!("CREATE INDEX IF NOT EXISTS idx_{table_name}_timestamp ON {table_name} (timestamp)");
-		match sqlx::query(&create_index_sql).execute(pool).await {
-			Ok(_) => (),
-			Err(e) => bail!(Error::DatabaseError(format!("Failed to create index for aspect table: {e}"))),
-		}
+		conn.execute(&create_index_sql, turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to create index for aspect table: {e}")))?;
 
 		// Insert aspect metadata into merged aspects table
-		match sqlx::query("INSERT INTO aspects (id, subject_id, database_id, name, table_name, resolution, created_at, earliest_measurement, latest_measurement) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)").bind(aspect_id.as_uuid()).bind(subject.id().as_uuid()).bind(db_id.as_uuid()).bind(name).bind(&table_name).bind(format!("{resolution:?}")).bind(chrono::Utc::now().timestamp_millis()).execute(&metadata_pool).await {
-			Ok(_) => (),
-			Err(e) => bail!(Error::DatabaseError(format!("Failed to insert aspect metadata: {e}"))),
-		}
+		let metadata_conn = metadata_turso_db.connect()?;
+		metadata_conn.execute("INSERT INTO aspects (id, subject_id, database_id, name, table_name, resolution, created_at, earliest_measurement, latest_measurement) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)", turso::params![aspect_id.as_uuid().to_string(), subject.id().as_uuid().to_string(), db_id.as_uuid().to_string(), name.to_string(), table_name.clone(), format!("{resolution:?}"), chrono::Utc::now().timestamp_millis().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to insert aspect metadata: {e}")))?;
 
 		let aspect_info = Aspect::new_with_id(aspect_id, name.to_string(), subject.id(), table_name, resolution);
 
@@ -88,11 +80,25 @@ impl Database {
 			}
 		}
 		let db_info = self.get_database_info().await.ok_or_else(|| Error::DatabaseError("Database not found".to_string()))?;
-		let metadata_pool = db_info.metadata_pool().cloned().ok_or_else(|| Error::DatabaseError("Metadata pool not found".to_string()))?;
+		let metadata_turso_db = db_info.metadata_turso_db().cloned().ok_or_else(|| Error::DatabaseError("Metadata turso_db not found".to_string()))?;
 
-		let row = sqlx::query("SELECT earliest_measurement FROM aspects WHERE id = ?").bind(aspect_id.as_uuid()).fetch_optional(&metadata_pool).await.map_err(|e| Error::DatabaseError(format!("Failed to query earliest measurement: {e}")))?;
+		let conn = metadata_turso_db.connect()?;
+		let mut rows = conn.query("SELECT earliest_measurement FROM aspects WHERE id = ?", turso::params![aspect_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query earliest measurement: {e}")))?;
 
-		let result = row.and_then(|r| r.get::<Option<i64>, _>("earliest_measurement").and_then(DateTime::from_timestamp_millis));
+		let result = if let Some(r) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get row: {e}")))? {
+			match r.get_value(0) {
+				Ok(value) => {
+					if let Some(text) = value.as_text() {
+						text.parse::<i64>().ok().and_then(DateTime::from_timestamp_millis)
+					} else {
+						None
+					}
+				}
+				Err(_) => None,
+			}
+		} else {
+			None
+		};
 		{
 			let mut guard = CACHE.lock().unwrap();
 			guard.insert(*aspect_id, result);
@@ -115,11 +121,25 @@ impl Database {
 			}
 		}
 		let db_info = self.get_database_info().await.ok_or_else(|| Error::DatabaseError("Database not found".to_string()))?;
-		let metadata_pool = db_info.metadata_pool().cloned().ok_or_else(|| Error::DatabaseError("Metadata pool not found".to_string()))?;
+		let metadata_turso_db = db_info.metadata_turso_db().cloned().ok_or_else(|| Error::DatabaseError("Metadata turso_db not found".to_string()))?;
 
-		let row = sqlx::query("SELECT latest_measurement FROM aspects WHERE id = ?").bind(aspect_id.as_uuid()).fetch_optional(&metadata_pool).await.map_err(|e| Error::DatabaseError(format!("Failed to query latest measurement: {e}")))?;
+		let conn = metadata_turso_db.connect()?;
+		let mut rows = conn.query("SELECT latest_measurement FROM aspects WHERE id = ?", turso::params![aspect_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query latest measurement: {e}")))?;
 
-		let result = row.and_then(|r| r.get::<Option<i64>, _>("latest_measurement").and_then(DateTime::from_timestamp_millis));
+		let result = if let Some(r) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get row: {e}")))? {
+			match r.get_value(0) {
+				Ok(value) => {
+					if let Some(text) = value.as_text() {
+						text.parse::<i64>().ok().and_then(DateTime::from_timestamp_millis)
+					} else {
+						None
+					}
+				}
+				Err(_) => None,
+			}
+		} else {
+			None
+		};
 		{
 			let mut guard = CACHE.lock().unwrap();
 			guard.insert(*aspect_id, result);
@@ -143,32 +163,36 @@ impl Database {
 			}
 		}
 		let db_info = self.get_database_info().await.ok_or_else(|| Error::DatabaseError("Database not found".to_string()))?;
-		let metadata_pool = db_info.metadata_pool().cloned().ok_or_else(|| Error::DatabaseError("Metadata pool not found".to_string()))?;
+		let metadata_turso_db = db_info.metadata_turso_db().cloned().ok_or_else(|| Error::DatabaseError("Metadata turso_db not found".to_string()))?;
 
-		let row = sqlx::query("SELECT resolution FROM aspects WHERE id = ?").bind(aspect_id.as_uuid()).fetch_optional(&metadata_pool).await.map_err(|e| Error::DatabaseError(format!("Failed to query resolution: {e}")))?;
+		let conn = metadata_turso_db.connect()?;
+		let mut rows = conn.query("SELECT resolution FROM aspects WHERE id = ?", turso::params![aspect_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query resolution: {e}")))?;
 
-		let result = match row {
-			Some(r) => {
-				if let Some(res_str) = r.get::<Option<String>, _>("resolution") {
-					let resolution = match res_str.as_str() {
-						"Nanoseconds" => Resolution::Nanoseconds,
-						"Microseconds" => Resolution::Microseconds,
-						"Milliseconds" => Resolution::Milliseconds,
-						"Seconds" => Resolution::Seconds,
-						"Minutes" => Resolution::Minutes,
-						"Hours" => Resolution::Hours,
-						"Days" => Resolution::Days,
-						"Weeks" => Resolution::Weeks,
-						"Months" => Resolution::Months,
-						"Years" => Resolution::Years,
-						_ => bail!(Error::DatabaseError(format!("Invalid resolution value: {res_str}"))),
-					};
-					Some(resolution)
-				} else {
-					None
+		let result = if let Some(r) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get row: {e}")))? {
+			match r.get_value(0) {
+				Ok(value) => {
+					if let Some(res_str) = value.as_text() {
+						Some(match res_str.as_str() {
+							"Nanoseconds" => Resolution::Nanoseconds,
+							"Microseconds" => Resolution::Microseconds,
+							"Milliseconds" => Resolution::Milliseconds,
+							"Seconds" => Resolution::Seconds,
+							"Minutes" => Resolution::Minutes,
+							"Hours" => Resolution::Hours,
+							"Days" => Resolution::Days,
+							"Weeks" => Resolution::Weeks,
+							"Months" => Resolution::Months,
+							"Years" => Resolution::Years,
+							_ => return Err(Error::DatabaseError(format!("Invalid resolution value: {}", res_str)).into()),
+						})
+					} else {
+						None
+					}
 				}
+				Err(_) => None,
 			}
-			None => None,
+		} else {
+			None
 		};
 		{
 			let mut guard = CACHE.lock().unwrap();

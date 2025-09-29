@@ -11,15 +11,21 @@ use uuid::Uuid;
 fn benchmark_interpolation_sizes(c: &mut Criterion) {
 	let rt = Runtime::new().unwrap();
 
-	let sizes = vec![100, 1000, 10000];
+	let sizes = vec![50, 200, 500]; // Reduced sizes for faster benchmarks
+
+	// Configure criterion for very slow benchmarks
+	let mut group = c.benchmark_group("interpolation_sizes");
+	group.sample_size(10); // Minimum 10 samples required by Criterion
+	group.measurement_time(std::time::Duration::from_secs(36)); // Increased to address 32-35s warnings
+	group.warm_up_time(std::time::Duration::from_secs(5)); // Longer warm-up for database ops
 
 	for size in sizes {
-		c.bench_function(&format!("interpolation_size_{}", size), |b| {
+		group.bench_function(format!("size_{}", size), |b| {
 			b.iter(|| {
 				rt.block_on(async {
 					// Generate unique name for each iteration
 					let db_name = format!("bench_interp_{}_{}", size, Uuid::new_v4());
-					let db_path = format!("data/{db_name}");
+					let db_path = format!("{}/{}", ::database::DEFAULT_DATA_DIR, db_name);
 
 					// Clean up if exists
 					if Path::new(&db_path).exists() {
@@ -61,6 +67,7 @@ fn benchmark_interpolation_sizes(c: &mut Criterion) {
 			});
 		});
 	}
+	group.finish();
 }
 
 fn benchmark_interpolation_resolutions(c: &mut Criterion) {
@@ -73,8 +80,8 @@ fn benchmark_interpolation_resolutions(c: &mut Criterion) {
 		let subject = db.track_subject("interp_subject").await.unwrap();
 		let aspect = db.track_aspect(subject, "interp_aspect", Resolution::Seconds).await.unwrap();
 
-		// Generate and insert test data (fixed size 1000)
-		let size = 1000;
+		// Generate and insert test data (reduced size from 1000 to 200)
+		let size = 200;
 		let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 		let mut measurements = Vec::with_capacity(size);
 		for i in 0..size {
@@ -87,13 +94,19 @@ fn benchmark_interpolation_resolutions(c: &mut Criterion) {
 
 	let resolutions = vec![Resolution::Seconds, Resolution::Minutes, Resolution::Hours];
 
+	// Configure criterion for very slow benchmarks
+	let mut group = c.benchmark_group("interpolation_resolutions");
+	group.sample_size(10); // Minimum 10 samples required by Criterion
+	group.measurement_time(std::time::Duration::from_secs(15)); // Increase measurement time
+	group.warm_up_time(std::time::Duration::from_secs(5)); // Longer warm-up for database ops
+
 	for res in resolutions {
-		c.bench_function(&format!("interpolation_resolution_{:?}", res), |b| {
+		group.bench_function(format!("{:?}", res), |b| {
 			b.iter(|| {
 				rt.block_on(async {
 					// Perform interpolation
 					let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-					let end = start + Duration::seconds(999);
+					let end = start + Duration::seconds(199); // Adjusted for reduced data size
 					let result = Database::analyze_range(aspect_id, start, end, res, Spline::Linear).await.unwrap();
 
 					black_box(result)
@@ -101,12 +114,14 @@ fn benchmark_interpolation_resolutions(c: &mut Criterion) {
 			});
 		});
 	}
+	group.finish();
 
 	// Cleanup after all benchmarks
 	rt.block_on(async {
 		db.close().await.unwrap();
 		tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-		std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+		let db_path = format!("{}/{}", ::database::DEFAULT_DATA_DIR, db_name);
+		std::fs::remove_dir_all(&db_path).ok();
 	});
 }
 
@@ -117,27 +132,35 @@ fn benchmark_spline_types(c: &mut Criterion) {
 	let db_name = "bench_spline_shared";
 	let (_db, aspect_id) = rt.block_on(async {
 		// Clean up any existing test data
-		std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+		let db_path = format!("{}/{}", ::database::DEFAULT_DATA_DIR, db_name);
+		std::fs::remove_dir_all(&db_path).ok();
 		tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
 		let db = Database::new(db_name).await.unwrap();
 		let subject = db.track_subject("bench_subject").await.unwrap();
 		let aspect = db.track_aspect(subject, "bench_aspect", Resolution::Seconds).await.unwrap();
 
-		// Add test data once - reduced size
+		// Add test data once - further reduced size for faster benchmarks
 		let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-		for i in 0..100 {
-			let measurement = InputMeasurement::new(start_time + Duration::minutes(i), BigDecimal::from_str(&format!("{}.0", i * 10)).unwrap());
-			db.observe_measurement(aspect.clone(), measurement).await.unwrap();
+		let mut measurements = Vec::with_capacity(50);
+		for i in 0..50 {
+			measurements.push(InputMeasurement::new(start_time + Duration::minutes(i), BigDecimal::from_str(&format!("{}.0", i * 10)).unwrap()));
 		}
+		db.observe_measurements_batch(aspect.clone(), measurements).await.unwrap();
 
 		(db, aspect.id())
 	});
 
 	let spline_types = vec![("linear", Spline::Linear), ("quadratic", Spline::Quadratic), ("cubic", Spline::Cubic)];
 
+	// Configure criterion for slow benchmarks
+	let mut group = c.benchmark_group("spline_types");
+	group.sample_size(10); // Minimum 10 samples required by Criterion
+	group.measurement_time(std::time::Duration::from_secs(16)); // Increased to address 12-14s warnings
+	group.warm_up_time(std::time::Duration::from_secs(3)); // Warm-up for database ops
+
 	for (name, spline_type) in spline_types {
-		c.bench_function(&format!("spline_type_{}", name), |b| {
+		group.bench_function(name, |b| {
 			b.iter(|| {
 				rt.block_on(async {
 					// Perform interpolation analysis
@@ -151,10 +174,12 @@ fn benchmark_spline_types(c: &mut Criterion) {
 			})
 		});
 	}
+	group.finish();
 
 	// Cleanup after all benchmarks
 	rt.block_on(async {
-		std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+		let db_path = format!("{}/{}", ::database::DEFAULT_DATA_DIR, db_name);
+		std::fs::remove_dir_all(&db_path).ok();
 	});
 }
 
