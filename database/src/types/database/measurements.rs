@@ -1,6 +1,5 @@
 use anyhow::{bail, Result};
 use chrono::DateTime;
-use sqlx::Row;
 
 use crate::{Aspect, Database, Error, InputMeasurement, TxId, CACHE, DATABASES};
 
@@ -15,34 +14,37 @@ impl Database {
 	pub async fn observe_measurement(&self, aspect: Aspect, measurement: InputMeasurement) -> Result<TxId> {
 		let tx_id = TxId::new();
 
-		// Get pool and table name with proper scope management - extract immediately
-		let f = DATABASES.lock().await.values().find_map(|db_info| db_info.subjects().values().find_map(|subject_info| subject_info.aspects().get(&aspect.id()).and_then(|aspect_info| subject_info.pool().map(|pool| (pool.clone(), aspect_info.table_name().to_string())))));
-		let Some((pool, table_name)) = f else { bail!(Error::DatabaseError("Aspect not found".to_string())) };
+		// Get client and table name
+		let f = DATABASES.lock().await.values().find_map(|db_info| db_info.subjects().values().find_map(|subject_info| subject_info.aspects().get(&aspect.id()).and_then(|aspect_info| subject_info.turso_db().map(|turso_db| (turso_db.clone(), aspect_info.table_name().to_string())))));
+		let Some((turso_db, table_name)) = f else { bail!(Error::DatabaseError("Aspect not found".to_string())) };
 
-		// Use dedicated write pool for inserts to avoid concurrency issues
-		let connect_options = pool.connect_options().clone();
-		let filename = <sqlx::sqlite::SqliteConnectOptions as Clone>::clone(&connect_options).get_filename();
-		let write_pool = Self::get_or_create_write_pool(&filename.to_string_lossy()).await?;
-
-		// Insert measurement into database
+		// Insert measurement
+		let conn = turso_db.connect()?;
 		let insert_sql = format!("INSERT INTO {table_name} (id, timestamp, value) VALUES (?, ?, ?)");
-		match sqlx::query(&insert_sql).bind(tx_id.as_uuid().to_string()).bind(measurement.timestamp().timestamp_millis()).bind(measurement.value().to_string()).execute(&write_pool).await {
-			Ok(_) => (),
-			Err(e) => bail!(Error::DatabaseError(format!("Failed to insert measurement: {e}"))),
-		}
+		conn.execute(&insert_sql, turso::params![tx_id.as_uuid().to_string(), measurement.timestamp().timestamp_millis().to_string(), measurement.value().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to insert measurement: {e}")))?;
 
-		// Invalidate cache for this aspect
+		// Invalidate cache
 		let cache_key = format!("aspect_measurements_{}", aspect.id().as_uuid());
 		CACHE.invalidate_aspect_cache(&cache_key, aspect.id().as_uuid()).await;
 
 		// Update earliest and latest in metadata
 		let db_info = self.get_database_info().await.ok_or_else(|| Error::DatabaseError("Database not found".to_string()))?;
-		let metadata_pool = db_info.metadata_pool().cloned().ok_or_else(|| Error::DatabaseError("Metadata pool not found".to_string()))?;
+		let metadata_turso_db = db_info.metadata_turso_db().cloned().ok_or_else(|| Error::DatabaseError("Metadata turso_db not found".to_string()))?;
 
-		let row = sqlx::query("SELECT earliest_measurement, latest_measurement FROM aspects WHERE id = ?").bind(aspect.id().as_uuid()).fetch_optional(&metadata_pool).await.map_err(|e| Error::DatabaseError(format!("Failed to query aspect metadata: {e}")))?;
+		let metadata_conn = metadata_turso_db.connect()?;
+		let mut rows = metadata_conn.query("SELECT earliest_measurement, latest_measurement FROM aspects WHERE id = ?", turso::params![aspect.id().as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query aspect metadata: {e}")))?;
 
-		let (earliest, latest) = match row {
-			Some(r) => (r.get::<Option<i64>, _>("earliest_measurement").and_then(DateTime::from_timestamp_millis), r.get::<Option<i64>, _>("latest_measurement").and_then(DateTime::from_timestamp_millis)),
+		let (earliest, latest) = match rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get row: {e}")))? {
+			Some(r) => (
+				match r.get::<Option<String>>(0) {
+					Ok(Some(s)) => s.parse::<i64>().ok().and_then(DateTime::from_timestamp_millis),
+					_ => None,
+				},
+				match r.get::<Option<String>>(1) {
+					Ok(Some(s)) => s.parse::<i64>().ok().and_then(DateTime::from_timestamp_millis),
+					_ => None,
+				},
+			),
 			None => bail!(Error::DatabaseError("Aspect metadata not found".to_string())),
 		};
 
@@ -50,7 +52,7 @@ impl Database {
 		let new_earliest = earliest.map_or(Some(new_time), |curr| Some(curr.min(new_time)));
 		let new_latest = latest.map_or(Some(new_time), |curr| Some(curr.max(new_time)));
 
-		sqlx::query("UPDATE aspects SET earliest_measurement = ?, latest_measurement = ? WHERE id = ?").bind(new_earliest.map(|dt| dt.timestamp_millis())).bind(new_latest.map(|dt| dt.timestamp_millis())).bind(aspect.id().as_uuid()).execute(&metadata_pool).await.map_err(|e| Error::DatabaseError(format!("Failed to update aspect metadata: {e}")))?;
+		metadata_conn.execute("UPDATE aspects SET earliest_measurement = ?, latest_measurement = ? WHERE id = ?", turso::params![new_earliest.map(|dt| dt.timestamp_millis().to_string()), new_latest.map(|dt| dt.timestamp_millis().to_string()), aspect.id().as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to update aspect metadata: {e}")))?;
 
 		Ok(tx_id)
 	}
@@ -70,71 +72,64 @@ impl Database {
 			return Ok(Vec::new());
 		}
 
-		// Pre-generate all TxIds to avoid allocation issues in closures
+		// Pre-generate all TxIds
 		let all_tx_ids: Vec<TxId> = (0..measurements.len()).map(|_| TxId::new()).collect();
 
-		// Compute min/max upfront (outside transaction)
+		// Compute min/max upfront
 		let min_new = measurements.iter().map(InputMeasurement::timestamp).min().unwrap();
 		let max_new = measurements.iter().map(InputMeasurement::timestamp).max().unwrap();
 
-		// Get pool and table name
-		let f = DATABASES.lock().await.values().find_map(|db_info| db_info.subjects().values().find_map(|subject_info| subject_info.aspects().get(&aspect.id()).and_then(|aspect_info| subject_info.pool().map(|pool| (pool.clone(), aspect_info.table_name().to_string())))));
-		let Some((pool, table_name)) = f else { bail!(Error::DatabaseError("Aspect not found".to_string())) };
-
-		// Use dedicated write pool for batch inserts
-		let connect_options = pool.connect_options().clone();
-		let filename = <sqlx::sqlite::SqliteConnectOptions as Clone>::clone(&connect_options).get_filename();
-		let write_pool = Self::get_or_create_write_pool(&filename.to_string_lossy()).await?;
+		// Get client and table name
+		let f = DATABASES.lock().await.values().find_map(|db_info| db_info.subjects().values().find_map(|subject_info| subject_info.aspects().get(&aspect.id()).and_then(|aspect_info| subject_info.turso_db().map(|turso_db| (turso_db.clone(), aspect_info.table_name().to_string())))));
+		let Some((turso_db, table_name)) = f else { bail!(Error::DatabaseError("Aspect not found".to_string())) };
 
 		// Begin transaction
-		let mut tx = write_pool.begin().await.map_err(|e| Error::DatabaseError(format!("Failed to begin transaction: {e}")))?;
+		let mut conn = turso_db.connect()?;
+		let tx = conn.transaction().await.map_err(|e| Error::DatabaseError(format!("Failed to begin transaction: {e}")))?;
 
-		// Optional: Tune for max speed (WARNING: risks data loss on crash)
-		// sqlx::query("PRAGMA synchronous = OFF").execute(&mut *tx).await?;
-
-		// Batch inserts in chunks to avoid param limits
+		// Batch inserts in chunks
 		let mut tx_id_offset = 0;
 		for chunk in measurements.chunks(CHUNK_SIZE) {
-			let mut query_builder: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(format!("INSERT INTO {table_name} (id, timestamp, value) "));
-
-			// Build values manually to avoid closure capture
-			query_builder.push("VALUES ");
 			for (i, measurement) in chunk.iter().enumerate() {
-				if i > 0 {
-					query_builder.push(", ");
-				}
-				let tx_id = all_tx_ids[tx_id_offset + i];
-				query_builder.push("(").push_bind(tx_id.as_uuid().to_string()).push(", ").push_bind(measurement.timestamp().timestamp_millis()).push(", ").push_bind(measurement.value().to_string()).push(")");
+				let tx_id = &all_tx_ids[tx_id_offset + i];
+				let insert_sql = format!("INSERT INTO {table_name} (id, timestamp, value) VALUES (?, ?, ?)");
+				tx.execute(&insert_sql, turso::params![tx_id.as_uuid().to_string(), measurement.timestamp().timestamp_millis().to_string(), measurement.value().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to insert batch measurement: {e}")))?;
 			}
-
 			tx_id_offset += chunk.len();
-
-			let query = query_builder.build();
-			query.execute(&mut *tx).await.map_err(|e| Error::DatabaseError(format!("Failed to insert batch: {e}")))?;
 		}
 
 		// Commit transaction
 		tx.commit().await.map_err(|e| Error::DatabaseError(format!("Failed to commit transaction: {e}")))?;
 
-		// Invalidate cache once for the entire batch
+		// Invalidate cache
 		let cache_key = format!("aspect_measurements_{}", aspect.id().as_uuid());
 		CACHE.invalidate_aspect_cache(&cache_key, aspect.id().as_uuid()).await;
 
 		// Update earliest and latest in metadata
 		let db_info = self.get_database_info().await.ok_or_else(|| Error::DatabaseError("Database not found".to_string()))?;
-		let metadata_pool = db_info.metadata_pool().cloned().ok_or_else(|| Error::DatabaseError("Metadata pool not found".to_string()))?;
+		let metadata_turso_db = db_info.metadata_turso_db().cloned().ok_or_else(|| Error::DatabaseError("Metadata turso_db not found".to_string()))?;
 
-		let row = sqlx::query("SELECT earliest_measurement, latest_measurement FROM aspects WHERE id = ?").bind(aspect.id().as_uuid()).fetch_optional(&metadata_pool).await.map_err(|e| Error::DatabaseError(format!("Failed to query aspect metadata: {e}")))?;
+		let metadata_conn = metadata_turso_db.connect()?;
+		let mut rows = metadata_conn.query("SELECT earliest_measurement, latest_measurement FROM aspects WHERE id = ?", turso::params![aspect.id().as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query aspect metadata: {e}")))?;
 
-		let (earliest, latest) = match row {
-			Some(r) => (r.get::<Option<i64>, _>("earliest_measurement").and_then(DateTime::from_timestamp_millis), r.get::<Option<i64>, _>("latest_measurement").and_then(DateTime::from_timestamp_millis)),
+		let (earliest, latest) = match rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get row: {e}")))? {
+			Some(r) => (
+				match r.get::<Option<String>>(0) {
+					Ok(Some(s)) => s.parse::<i64>().ok().and_then(DateTime::from_timestamp_millis),
+					_ => None,
+				},
+				match r.get::<Option<String>>(1) {
+					Ok(Some(s)) => s.parse::<i64>().ok().and_then(DateTime::from_timestamp_millis),
+					_ => None,
+				},
+			),
 			None => bail!(Error::DatabaseError("Aspect metadata not found".to_string())),
 		};
 
 		let new_earliest = earliest.map_or(Some(min_new), |curr| Some(curr.min(min_new)));
 		let new_latest = latest.map_or(Some(max_new), |curr| Some(curr.max(max_new)));
 
-		sqlx::query("UPDATE aspects SET earliest_measurement = ?, latest_measurement = ? WHERE id = ?").bind(new_earliest.map(|dt| dt.timestamp_millis())).bind(new_latest.map(|dt| dt.timestamp_millis())).bind(aspect.id().as_uuid()).execute(&metadata_pool).await.map_err(|e| Error::DatabaseError(format!("Failed to update aspect metadata: {e}")))?;
+		metadata_conn.execute("UPDATE aspects SET earliest_measurement = ?, latest_measurement = ? WHERE id = ?", turso::params![new_earliest.map(|dt| dt.timestamp_millis().to_string()), new_latest.map(|dt| dt.timestamp_millis().to_string()), aspect.id().as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to update aspect metadata: {e}")))?;
 
 		Ok(all_tx_ids)
 	}

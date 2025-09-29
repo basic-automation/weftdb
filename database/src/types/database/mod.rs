@@ -5,20 +5,19 @@ use std::{
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{Pool, Row, Sqlite, SqlitePool};
 use tokio::sync::Mutex;
+use turso::{Builder, Database as TursoDatabase};
 use uuid::Uuid;
 
-use crate::{Subject, SubjectId, DEFAULT_DATA_DIR};
+use crate::{AspectId, Subject, SubjectId, DEFAULT_DATA_DIR};
 
 pub type DatabaseMap = Arc<Mutex<HashMap<DatabaseId, DatabaseInfo>>>;
 pub static DATABASES: LazyLock<DatabaseMap> = LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
-// Add connection pool manager
-static CONNECTION_POOLS: LazyLock<Arc<Mutex<HashMap<String, SqlitePool>>>> = LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+// Add connection manager for Turso
+static CONNECTION_DATABASES: LazyLock<Arc<Mutex<HashMap<String, TursoDatabase>>>> = LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
-// Add dedicated write pools for concurrency
-static WRITE_POOLS: LazyLock<Arc<Mutex<HashMap<String, SqlitePool>>>> = LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+// Add dedicated write connections for concurrency (Turso handles this internally)
 
 mod analysis;
 mod aspects;
@@ -31,7 +30,7 @@ mod subjects;
 pub struct Database {
 	id: DatabaseId,
 	name: String,
-	pool: Pool<Sqlite>,
+	turso_db: TursoDatabase,
 }
 
 impl Database {
@@ -54,73 +53,74 @@ impl Database {
 
 		let db_id = DatabaseId::new();
 
-		// Use shared connection pool
+		// Use shared connection database
 		let metadata_db_path = format!("{db_path}/metadata.db");
-		let metadata_pool = Self::get_or_create_pool(&metadata_db_path).await?;
+		let metadata_turso_db = Self::get_or_create_turso_database(&metadata_db_path).await?;
 
 		// Create metadata tables
-		Self::create_metadata_tables(&metadata_pool).await?;
+		Self::create_metadata_tables(&metadata_turso_db).await?;
 
-		// Insert database metadata - using UUID directly
-		sqlx::query("INSERT INTO database_metadata (id, name, created_at) VALUES (?, ?, ?)").bind(db_id.as_uuid()).bind(name).bind(chrono::Utc::now().timestamp_millis()).execute(&metadata_pool).await?;
+		// Insert database metadata
+		let conn = metadata_turso_db.connect()?;
+		let mut result = conn.query("INSERT INTO database_metadata (id, name, created_at) VALUES (?, ?, ?)", turso::params![db_id.as_uuid().to_string(), name.to_string(), chrono::Utc::now().timestamp_millis().to_string()]).await?;
+		// Consume the result to ensure the insert completes
+		while (result.next().await?).is_some() {}
 
 		let mut db_info = DatabaseInfo::new(name.to_string(), db_path);
-		db_info.set_metadata_pool(Some(metadata_pool.clone()));
+		db_info.set_metadata_turso_db(Some(metadata_turso_db.clone()));
 		DATABASES.lock().await.insert(db_id, db_info);
 
-		Ok(Self { id: db_id, name: name.to_string(), pool: metadata_pool })
+		Ok(Self { id: db_id, name: name.to_string(), turso_db: metadata_turso_db })
 	}
 
-	async fn create_metadata_tables(pool: &Pool<Sqlite>) -> Result<()> {
-		// Create database metadata table - using BLOB for UUID storage
-		sqlx::query(
+	async fn create_metadata_tables(turso_db: &TursoDatabase) -> Result<()> {
+		let conn = turso_db.connect()?;
+
+		// Create database metadata table
+		conn.execute(
 			r#"
 			CREATE TABLE IF NOT EXISTS database_metadata (
-				id BLOB PRIMARY KEY,
+				id TEXT PRIMARY KEY,
 				name TEXT NOT NULL,
 				created_at INTEGER NOT NULL
 			)
 			"#,
+			turso::params![],
 		)
-		.execute(pool)
 		.await?;
 
 		// Create subjects table (merged with subject_metadata)
-		sqlx::query(
+		conn.execute(
 			r#"
 			CREATE TABLE IF NOT EXISTS subjects (
-				id BLOB PRIMARY KEY,
-				database_id BLOB NOT NULL,
+				id TEXT PRIMARY KEY,
+				database_id TEXT NOT NULL,
 				name TEXT NOT NULL,
 				created_at INTEGER NOT NULL
 			)
 			"#,
+			turso::params![],
 		)
-		.execute(pool)
 		.await?;
 
-		// Removed subject_metadata table
-
 		// Create aspects table (merged with aspect_metadata)
-		sqlx::query(
+		conn.execute(
 			r#"
 			CREATE TABLE IF NOT EXISTS aspects (
-				id BLOB PRIMARY KEY,
-				subject_id BLOB NOT NULL,
-				database_id BLOB NOT NULL,
+				id TEXT PRIMARY KEY,
+				subject_id TEXT NOT NULL,
+				database_id TEXT NOT NULL,
 				name TEXT NOT NULL,
 				table_name TEXT NOT NULL,
 				resolution TEXT NOT NULL,
 				created_at INTEGER NOT NULL,
-				earliest_measurement INTEGER,
-				latest_measurement INTEGER
+				earliest_measurement TEXT,
+				latest_measurement TEXT
 			)
 			"#,
+			turso::params![],
 		)
-		.execute(pool)
 		.await?;
-
-		// Removed aspect_metadata table
 
 		Ok(())
 	}
@@ -142,45 +142,50 @@ impl Database {
 			bail!("Database folder does not exist: {}", db_path);
 		}
 
-		// Use shared connection pool
+		// Use shared connection database
 		let metadata_db_path = format!("{db_path}/metadata.db");
-		let metadata_pool = Self::get_or_create_pool(&metadata_db_path).await?;
+		let metadata_turso_db = Self::get_or_create_turso_database(&metadata_db_path).await?;
 
 		// Query database ID from metadata
-		let row = sqlx::query("SELECT id FROM database_metadata WHERE name = ?").bind(name).fetch_one(&metadata_pool).await?;
+		let conn = metadata_turso_db.connect()?;
+		let mut rows = conn.query("SELECT id FROM database_metadata WHERE name = ?", turso::params![name]).await?;
+		let row = rows.next().await?.ok_or_else(|| anyhow::anyhow!("Database not found"))?;
 
-		let db_id_bytes: Vec<u8> = row.get("id");
-		let db_id = DatabaseId::from_uuid(Uuid::from_slice(&db_id_bytes)?);
+		let db_id_str = value_to_string(row.get_value(0)?, "DB ID")?;
+		let db_id = DatabaseId::from_uuid(Uuid::parse_str(&db_id_str)?);
 
 		// Load subjects with database_id
-		let subject_rows = sqlx::query("SELECT id, database_id, name, created_at FROM subjects").fetch_all(&metadata_pool).await?;
+		let conn = metadata_turso_db.connect()?;
+		let mut subject_rows = conn.query("SELECT id, database_id, name, created_at FROM subjects", ()).await?;
 
 		let mut db_info = DatabaseInfo::new(name.to_string(), db_path.clone());
 		db_info.set_id(db_id);
-		db_info.set_metadata_pool(Some(metadata_pool.clone()));
+		db_info.set_metadata_turso_db(Some(metadata_turso_db.clone()));
 
 		// Manually construct subjects from rows
-		for row in subject_rows {
-			let subject_id_bytes: Vec<u8> = row.get("id");
-			let subject_id = SubjectId::from_uuid(Uuid::from_slice(&subject_id_bytes)?);
-			let subject_name: String = row.get("name");
+		while let Some(row) = subject_rows.next().await? {
+			let subject_id_str = value_to_string(row.get_value(0)?, "Subject ID")?;
+			let subject_name = value_to_string(row.get_value(2)?, "Subject name")?;
 			// database_id is now in subjects table, but since we're loading per database, we can ignore it or verify
+
+			let subject_id = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str)?);
 
 			// Connect to the subject's individual database file
 			let subject_db_path = format!("{}/{}.db", db_path, subject_name);
-			let subject_pool = Self::get_or_create_pool(&subject_db_path).await?;
+			let subject_turso_db = Self::get_or_create_turso_database(&subject_db_path).await?;
 
-			let mut subject = Subject::new_with_id(subject_id, subject_name, db_id, subject_pool);
+			let mut subject = Subject::new_with_id(subject_id, subject_name, db_id, subject_turso_db);
 
 			// Load aspects for this subject
-			let aspect_rows = sqlx::query("SELECT id, name, table_name, resolution FROM aspects WHERE subject_id = ?").bind(subject_id.as_uuid()).fetch_all(&metadata_pool).await?;
+			let mut aspect_rows = conn.query("SELECT id, name, table_name, resolution FROM aspects WHERE subject_id = ?", turso::params![subject_id.as_uuid().to_string()]).await?;
 
-			for aspect_row in aspect_rows {
-				let aspect_id_bytes: Vec<u8> = aspect_row.get("id");
-				let aspect_id = crate::AspectId::from_uuid(Uuid::from_slice(&aspect_id_bytes)?);
-				let aspect_name: String = aspect_row.get("name");
-				let table_name: String = aspect_row.get("table_name");
-				let resolution_str: String = aspect_row.get("resolution");
+			while let Some(aspect_row) = aspect_rows.next().await? {
+				let aspect_id_str = value_to_string(aspect_row.get_value(0)?, "Aspect ID")?;
+				let aspect_name = value_to_string(aspect_row.get_value(1)?, "Aspect name")?;
+				let table_name = value_to_string(aspect_row.get_value(2)?, "Table name")?;
+				let resolution_str = value_to_string(aspect_row.get_value(3)?, "Resolution")?;
+
+				let aspect_id = AspectId::from_uuid(Uuid::parse_str(&aspect_id_str)?);
 
 				// Parse resolution
 				use splimes::Resolution;
@@ -207,54 +212,37 @@ impl Database {
 
 		DATABASES.lock().await.insert(db_id, db_info);
 
-		Ok(Self { id: db_id, name: name.to_string(), pool: metadata_pool })
+		Ok(Self { id: db_id, name: name.to_string(), turso_db: metadata_turso_db })
 	}
 
 	pub async fn get_database_info(&self) -> Option<DatabaseInfo> {
 		DATABASES.lock().await.get(&self.id).cloned()
 	}
 
-	/// Get or create a connection pool for reuse
-	async fn get_or_create_pool(db_path: &str) -> Result<SqlitePool> {
-		let mut pools = CONNECTION_POOLS.lock().await;
+	/// Get or create a Turso database for reuse
+	async fn get_or_create_turso_database(db_path: &str) -> Result<TursoDatabase> {
+		let mut databases = CONNECTION_DATABASES.lock().await;
 
-		if let Some(pool) = pools.get(db_path) {
-			return Ok(pool.clone());
+		if let Some(turso_db) = databases.get(db_path) {
+			return Ok(turso_db.clone());
 		}
 
-		let pool = SqlitePool::connect(&format!("sqlite://{db_path}?mode=rwc")).await?;
+		// Create Turso database
+		let turso_db = Builder::new_local(db_path).build().await?;
 
 		// Enable WAL mode for better concurrency
-		sqlx::query("PRAGMA journal_mode=WAL").execute(&pool).await?;
+		let conn = turso_db.connect()?;
+		let mut result = conn.query("PRAGMA journal_mode=WAL", turso::params![]).await?;
+		// Consume any results
+		while (result.next().await?).is_some() {}
 
-		// Set busy timeout for better concurrent access handling
-		sqlx::query("PRAGMA busy_timeout=30000").execute(&pool).await?;
+		let mut result = conn.query("PRAGMA busy_timeout=30000", turso::params![]).await?;
+		// Consume any results
+		while (result.next().await?).is_some() {}
 
-		pools.insert(db_path.to_string(), pool.clone());
+		let _ = std::collections::HashMap::insert(&mut *databases, db_path.to_string(), turso_db.clone());
 
-		Ok(pool)
-	}
-
-	/// Get or create a dedicated write pool (single connection) for concurrency
-	async fn get_or_create_write_pool(db_path: &str) -> Result<SqlitePool> {
-		let mut pools = WRITE_POOLS.lock().await;
-
-		if let Some(pool) = pools.get(db_path) {
-			return Ok(pool.clone());
-		}
-
-		// Create pool with single connection for writes to avoid locking
-		let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect(&format!("sqlite://{db_path}?mode=rwc")).await?;
-
-		// Enable WAL mode for better concurrency
-		sqlx::query("PRAGMA journal_mode=WAL").execute(&pool).await?;
-
-		// Set busy timeout for better concurrent access handling
-		sqlx::query("PRAGMA busy_timeout=30000").execute(&pool).await?;
-
-		pools.insert(db_path.to_string(), pool.clone());
-
-		Ok(pool)
+		Ok(turso_db)
 	}
 
 	#[must_use]
@@ -268,8 +256,8 @@ impl Database {
 	}
 
 	#[must_use]
-	pub fn pool(&self) -> &Pool<Sqlite> {
-		&self.pool
+	pub fn turso_db(&self) -> &TursoDatabase {
+		&self.turso_db
 	}
 
 	/// Closes the database, releasing all resources and removing from global map
@@ -279,28 +267,18 @@ impl Database {
 	/// Returns an error if there are issues closing connection pools or removing resources.
 	pub async fn close(&self) -> Result<()> {
 		let mut databases = DATABASES.lock().await;
-		if let Some(db_info) = databases.remove(&self.id) {
-			if let Some(pool) = db_info.metadata_pool() {
-				pool.close().await;
-			}
+		if let Some(_db_info) = databases.remove(&self.id) {
+			// Turso databases don't need explicit closing like SQLx pools
+			// The connections will be closed when dropped
 		}
 
-		// Also remove from connection pools
+		// Also remove from connection databases
 		let db_path = format!("{}/{}/metadata.db", DEFAULT_DATA_DIR, self.name);
-		let mut pools = CONNECTION_POOLS.lock().await;
-		if let Some(pool) = pools.remove(&db_path) {
-			pool.close().await;
-		}
-
-		// Remove from write pools
-		let mut write_pools = WRITE_POOLS.lock().await;
-		if let Some(pool) = write_pools.remove(&db_path) {
-			pool.close().await;
-		}
+		let mut connection_databases = CONNECTION_DATABASES.lock().await;
+		connection_databases.remove(&db_path);
 
 		// Release the mutex locks early
-		drop(write_pools);
-		drop(pools);
+		drop(connection_databases);
 		drop(databases);
 
 		// Wait for database files to be actually released
@@ -377,13 +355,22 @@ pub struct DatabaseInfo {
 	path: String,
 	subjects: HashMap<SubjectId, Subject>,
 	#[serde(skip)]
-	metadata_pool: Option<Pool<Sqlite>>,
+	metadata_turso_db: Option<TursoDatabase>,
 }
+
+impl PartialEq for DatabaseInfo {
+	fn eq(&self, other: &Self) -> bool {
+		self.id == other.id && self.name == other.name && self.path == other.path && self.subjects == other.subjects
+		// Skip turso_db comparison since it doesn't implement PartialEq
+	}
+}
+
+impl Eq for DatabaseInfo {}
 
 impl DatabaseInfo {
 	#[must_use]
 	pub fn new(name: String, path: String) -> Self {
-		Self { id: DatabaseId::default(), name, path, subjects: HashMap::new(), metadata_pool: None }
+		Self { id: DatabaseId::default(), name, path, subjects: HashMap::new(), metadata_turso_db: None }
 	}
 
 	#[must_use]
@@ -415,12 +402,12 @@ impl DatabaseInfo {
 	}
 
 	#[must_use]
-	pub const fn metadata_pool(&self) -> Option<&Pool<Sqlite>> {
-		self.metadata_pool.as_ref()
+	pub const fn metadata_turso_db(&self) -> Option<&TursoDatabase> {
+		self.metadata_turso_db.as_ref()
 	}
 
-	pub fn set_metadata_pool(&mut self, pool: Option<Pool<Sqlite>>) {
-		self.metadata_pool = pool;
+	pub fn set_metadata_turso_db(&mut self, turso_db: Option<TursoDatabase>) {
+		self.metadata_turso_db = turso_db;
 	}
 
 	pub fn subjects_mut(&mut self) -> &mut HashMap<SubjectId, Subject> {
@@ -444,11 +431,13 @@ impl DatabaseInfo {
 
 	/// Get creation timestamp if available
 	pub async fn get_creation_time(&self) -> Result<Option<DateTime<Utc>>> {
-		if let Some(pool) = &self.metadata_pool {
-			let row = sqlx::query("SELECT created_at FROM database_metadata WHERE name = ?").bind(&self.name).fetch_optional(pool).await?;
+		if let Some(turso_db) = &self.metadata_turso_db {
+			let conn = turso_db.connect()?;
+			let mut rows = conn.query("SELECT created_at FROM database_metadata WHERE name = ?", turso::params![self.name.clone()]).await?;
 
-			if let Some(row) = row {
-				let timestamp_millis: i64 = row.get("created_at");
+			if let Some(row) = rows.next().await? {
+				let timestamp_millis_str = value_to_string(row.get_value(0)?, "Timestamp")?;
+				let timestamp_millis: i64 = timestamp_millis_str.parse()?;
 				return Ok(DateTime::from_timestamp_millis(timestamp_millis));
 			}
 		}
@@ -459,28 +448,46 @@ impl DatabaseInfo {
 	pub async fn get_size_stats(&self) -> Result<DatabaseStats> {
 		let mut stats = DatabaseStats::default();
 
-		if let Some(pool) = &self.metadata_pool {
+		if let Some(turso_db) = &self.metadata_turso_db {
+			let conn = turso_db.connect()?;
+
 			// Count subjects
-			let subject_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subjects").fetch_one(pool).await?;
-			stats.subject_count = subject_count as usize;
+			let mut subject_rows = conn.query("SELECT COUNT(*) as count FROM subjects", ()).await?;
+			if let Some(row) = subject_rows.next().await? {
+				let count_str = value_to_string(row.get_value(0)?, "Count")?;
+				stats.subject_count = count_str.parse::<usize>()?;
+			}
 
 			// Count aspects
-			let aspect_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM aspects").fetch_one(pool).await?;
-			stats.aspect_count = aspect_count as usize;
+			let mut aspect_rows = conn.query("SELECT COUNT(*) as count FROM aspects", ()).await?;
+			if let Some(row) = aspect_rows.next().await? {
+				let count_str = value_to_string(row.get_value(0)?, "Count")?;
+				stats.aspect_count = count_str.parse::<usize>()?;
+			}
 		}
 
 		Ok(stats)
 	}
 }
 
-impl PartialEq for DatabaseInfo {
-	fn eq(&self, other: &Self) -> bool {
-		self.id == other.id && self.name == other.name && self.path == other.path && self.subjects == other.subjects
-		// Skip metadata_pool comparison since it doesn't implement PartialEq
+/// Helper function to convert Turso values to strings, handling different storage formats
+fn value_to_string(value: turso::Value, field_name: &str) -> Result<String> {
+	match value {
+		turso::Value::Text(s) => Ok(s.to_string()),
+		turso::Value::Blob(bytes) => {
+			// Try to interpret as UUID bytes
+			if bytes.len() == 16 {
+				let uuid = uuid::Uuid::from_bytes(bytes.as_slice().try_into().map_err(|_| anyhow::anyhow!("{} blob is not 16 bytes", field_name))?);
+				Ok(uuid.to_string())
+			} else {
+				String::from_utf8(bytes.to_vec()).map_err(|e| anyhow::anyhow!("{} blob is not valid UTF-8: {}", field_name, e))
+			}
+		}
+		turso::Value::Integer(i) => Ok(i.to_string()),
+		turso::Value::Real(r) => Ok(r.to_string()),
+		turso::Value::Null => Err(anyhow::anyhow!("{} is null", field_name)),
 	}
 }
-
-impl Eq for DatabaseInfo {}
 
 #[derive(Debug, Default, Clone)]
 pub struct DatabaseStats {

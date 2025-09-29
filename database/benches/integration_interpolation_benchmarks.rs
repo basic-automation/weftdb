@@ -11,18 +11,19 @@ use uuid::Uuid;
 fn benchmark_production_workloads(c: &mut Criterion) {
 	let rt = Runtime::new().unwrap();
 
-	// DRASTICALLY reduced sizes for reasonable benchmark times
+	// Ultra-small sizes for very fast benchmarks
 	let workloads = vec![
-		("small_production", 10, 5, 1),   // 10 measurements, 5 min window, 1 min intervals
-		("medium_production", 25, 10, 2), // 25 measurements, 10 min window, 2 min intervals
-		("large_production", 50, 15, 3),  // 50 measurements, 15 min window, 3 min intervals
+		("small_production", 5, 3, 1),  // 5 measurements, 3 min window, 1 min intervals
+		("medium_production", 8, 5, 1), // 8 measurements, 5 min window, 1 min intervals
+		("large_production", 12, 8, 1), // 12 measurements, 8 min window, 1 min intervals
 	];
 
-	// Configure criterion for faster benchmarking
+	// Configure criterion for very slow benchmarks with high variance
 	let mut group = c.benchmark_group("production_workloads");
-	group.sample_size(10); // Reduce sample size from 100 to 10
-	group.measurement_time(std::time::Duration::from_secs(2)); // Reduce measurement time
-	group.warm_up_time(std::time::Duration::from_secs(1)); // Reduce warm-up time
+	group.sample_size(10); // Minimum 10 samples required by Criterion
+	group.measurement_time(std::time::Duration::from_secs(50)); // Increased for high-variance database operations
+	group.warm_up_time(std::time::Duration::from_secs(3)); // Longer warm-up for database ops
+	group.sampling_mode(criterion::SamplingMode::Flat); // Use flat sampling for variable execution times
 
 	for (name, measurement_count, window_minutes, interval_minutes) in workloads {
 		group.bench_function(name, |b| {
@@ -92,18 +93,19 @@ fn benchmark_production_workloads(c: &mut Criterion) {
 fn benchmark_full_integration_pipeline(c: &mut Criterion) {
 	let rt = Runtime::new().unwrap();
 
-	// Much smaller pipeline configs
+	// Ultra-small pipeline configs for very fast benchmarks
 	let pipeline_configs = vec![
-		("basic_pipeline", 10, Resolution::Minutes),      // Reduced from 50 to 10
-		("production_pipeline", 20, Resolution::Minutes), // Reduced from 100 to 20
-		("enterprise_pipeline", 30, Resolution::Hours),   // Reduced from 200 to 30
+		("basic_pipeline", 5, Resolution::Minutes),      // Reduced to 5
+		("production_pipeline", 8, Resolution::Minutes), // Reduced to 8
+		("enterprise_pipeline", 12, Resolution::Hours),  // Reduced to 12
 	];
 
-	// Configure criterion for faster benchmarking
+	// Configure criterion for very slow benchmarks with high variance
 	let mut group = c.benchmark_group("integration_pipeline");
-	group.sample_size(10);
-	group.measurement_time(std::time::Duration::from_secs(2));
-	group.warm_up_time(std::time::Duration::from_secs(1));
+	group.sample_size(10); // Minimum 10 samples required by Criterion
+	group.measurement_time(std::time::Duration::from_secs(45)); // Increased for variable database operations
+	group.warm_up_time(std::time::Duration::from_secs(3)); // Longer warm-up for database ops
+	group.sampling_mode(criterion::SamplingMode::Flat); // Use flat sampling for variable execution times
 
 	for (name, measurement_count, resolution) in pipeline_configs {
 		group.bench_function(name, |b| {

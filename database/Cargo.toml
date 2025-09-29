@@ -11,7 +11,7 @@ fake = { workspace = true, features = ["derive", "chrono", "bigdecimal", "uuid"]
 rand = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-sqlx = { workspace = true, features = ["runtime-tokio-rustls", "sqlite", "chrono", "uuid"] }
+turso = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 uuid = { workspace = true, features = ["v4", "serde"] }

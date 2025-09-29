@@ -30,6 +30,12 @@ fn benchmark_optimization_strategies(c: &mut Criterion) {
 		(db, subject)
 	});
 
+	// Configure criterion for very slow benchmarks
+	let mut group = c.benchmark_group("optimization_strategies");
+	group.sample_size(10); // Minimum 10 samples required by Criterion
+	group.measurement_time(std::time::Duration::from_secs(20)); // Increase measurement time to match warnings
+	group.warm_up_time(std::time::Duration::from_secs(5)); // Longer warm-up for database ops
+
 	for (name, measurement_count, window_minutes, resolution) in optimization_configs {
 		// Pre-setup aspect and data for this benchmark
 		let aspect_id = rt.block_on(async {
@@ -46,7 +52,7 @@ fn benchmark_optimization_strategies(c: &mut Criterion) {
 			aspect.id()
 		});
 
-		c.bench_function(name, |b| {
+		group.bench_function(name, |b| {
 			b.iter(|| {
 				rt.block_on(async {
 					// Much smaller analysis window
@@ -61,6 +67,7 @@ fn benchmark_optimization_strategies(c: &mut Criterion) {
 			})
 		});
 	}
+	group.finish();
 
 	// Single cleanup at the end
 	rt.block_on(async {
@@ -90,6 +97,12 @@ fn benchmark_memory_efficiency(c: &mut Criterion) {
 		(db, subject)
 	});
 
+	// Configure criterion for slow benchmarks
+	let mut mem_group = c.benchmark_group("memory_efficiency");
+	mem_group.sample_size(10); // Minimum 10 samples required by Criterion
+	mem_group.measurement_time(std::time::Duration::from_secs(16)); // Increased to address 14.0-14.7s warnings
+	mem_group.warm_up_time(std::time::Duration::from_secs(3)); // Warm-up for database ops
+
 	for (name, measurement_count, window_minutes) in memory_configs {
 		// Pre-setup data for this configuration
 		let aspect_id = rt.block_on(async {
@@ -106,7 +119,7 @@ fn benchmark_memory_efficiency(c: &mut Criterion) {
 			aspect.id()
 		});
 
-		c.bench_function(&format!("memory_efficiency_{}", name), |b| {
+		mem_group.bench_function(name, |b| {
 			b.iter(|| {
 				rt.block_on(async {
 					let data_start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -120,6 +133,7 @@ fn benchmark_memory_efficiency(c: &mut Criterion) {
 			});
 		});
 	}
+	mem_group.finish();
 
 	// Cleanup after all benchmarks
 	rt.block_on(async {

@@ -3,7 +3,7 @@ use std::{hint::black_box, str::FromStr, sync::Arc};
 use ::database::*;
 use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
-use criterion::{async_executor::FuturesExecutor, criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use splimes::{Resolution, Spline};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
@@ -53,12 +53,14 @@ fn benchmark_optimized_interpolation(c: &mut Criterion) {
 
 	for (name, size) in contexts {
 		c.bench_function(&format!("optimized_interpolation_{}", name), |b| {
-			b.to_async(FuturesExecutor).iter_batched(
+			b.iter_batched(
 				|| rt.block_on(BenchmarkContext::new(name, size)).unwrap(),
-				|ctx| async move {
-					let analyze_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 30, 0).unwrap();
-					let result = ctx.db.analyze_point(ctx.aspect_id, analyze_time, Resolution::Seconds, Spline::Linear).await.unwrap();
-					black_box(result)
+				|ctx| {
+					rt.block_on(async {
+						let analyze_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 30, 0).unwrap();
+						let result = ctx.db.analyze_point(ctx.aspect_id, analyze_time, Resolution::Seconds, Spline::Linear).await.unwrap();
+						black_box(result)
+					})
 				},
 				BatchSize::SmallInput,
 			);
@@ -70,15 +72,17 @@ fn benchmark_cache_efficiency(c: &mut Criterion) {
 	let rt = Runtime::new().unwrap();
 
 	c.bench_function("cache_hit_ratio", |b| {
-		b.to_async(FuturesExecutor).iter_batched(
+		b.iter_batched(
 			|| rt.block_on(BenchmarkContext::new("cache_efficiency", 100)).unwrap(),
-			|ctx| async move {
-				let analyze_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 15, 0).unwrap();
-				// First call to cache the result
-				let _ = ctx.db.analyze_point(ctx.aspect_id, analyze_time, Resolution::Seconds, Spline::Linear).await.unwrap();
-				// Second call should hit cache
-				let result = ctx.db.analyze_point(ctx.aspect_id, analyze_time, Resolution::Seconds, Spline::Linear).await.unwrap();
-				black_box(result)
+			|ctx| {
+				rt.block_on(async {
+					let analyze_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 15, 0).unwrap();
+					// First call to cache the result
+					let _ = ctx.db.analyze_point(ctx.aspect_id, analyze_time, Resolution::Seconds, Spline::Linear).await.unwrap();
+					// Second call should hit cache
+					let result = ctx.db.analyze_point(ctx.aspect_id, analyze_time, Resolution::Seconds, Spline::Linear).await.unwrap();
+					black_box(result)
+				})
 			},
 			BatchSize::SmallInput,
 		);
