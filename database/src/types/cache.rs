@@ -11,10 +11,37 @@ use crate::Measurement;
 
 #[derive(Debug, Clone)]
 pub struct AnalysisResult {
-	pub timestamp: DateTime<Utc>,
-	pub value: BigDecimal,
-	pub method: String,
-	pub resolution: String,
+	timestamp: DateTime<Utc>,
+	value: BigDecimal,
+	method: String,
+	resolution: String,
+}
+
+impl AnalysisResult {
+	#[must_use]
+	pub const fn new(timestamp: DateTime<Utc>, value: BigDecimal, method: String, resolution: String) -> Self {
+		Self { timestamp, value, method, resolution }
+	}
+
+	#[must_use]
+	pub const fn timestamp(&self) -> DateTime<Utc> {
+		self.timestamp
+	}
+
+	#[must_use]
+	pub const fn value(&self) -> &BigDecimal {
+		&self.value
+	}
+
+	#[must_use]
+	pub fn method(&self) -> &str {
+		&self.method
+	}
+
+	#[must_use]
+	pub fn resolution(&self) -> &str {
+		&self.resolution
+	}
 }
 
 #[derive(Debug, Clone)]

@@ -10,13 +10,6 @@ pub struct InputMeasurement {
 }
 
 impl InputMeasurement {
-	/// Generate fake input measurement data for testing
-	#[must_use]
-	pub fn fake() -> Self {
-		let mut rng = rand::thread_rng();
-		Self { timestamp: Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap() + chrono::Duration::seconds(rng.gen_range(0..86400)), value: BigDecimal::from_f64(rng.gen_range(0.0..100.0)).unwrap_or_default() }
-	}
-
 	#[must_use]
 	pub const fn new(timestamp: chrono::DateTime<Utc>, value: BigDecimal) -> Self {
 		Self { timestamp, value }

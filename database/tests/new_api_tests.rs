@@ -1,8 +1,10 @@
 use std::str::FromStr;
 
+use ::database::database::traits::Inputs;
 use bigdecimal::BigDecimal;
 use chrono::{TimeZone, Utc};
-use database::{Database, InputMeasurement};
+use database::{database::traits::DatabaseStructure, Database, InputMeasurement, Outputs};
+use futures::StreamExt;
 use splimes::{Resolution, Spline};
 use uuid::Uuid;
 
@@ -17,16 +19,16 @@ async fn test_database_lifecycle() {
 	let db = Database::new(&db_name).await.expect("Failed to create database");
 
 	// Test adding a subject
-	let subject = db.track_subject("test_subject").await.expect("Failed to add subject");
+	let subject = db.observe_subject("test_subject").await.expect("Failed to add subject");
 
 	// Test tracking an aspect
-	let aspect = db.track_aspect(subject, "temperature", splimes::Resolution::Seconds).await.expect("Failed to track aspect");
+	let aspect = db.track_aspect(subject.id(), "temperature", splimes::Resolution::Seconds).await.expect("Failed to track aspect");
 
 	// Test capturing measurements
 	let measurements = vec![InputMeasurement::new(Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap(), BigDecimal::from_str("20.5").unwrap()), InputMeasurement::new(Utc.with_ymd_and_hms(2023, 1, 1, 12, 5, 0).unwrap(), BigDecimal::from_str("21.0").unwrap()), InputMeasurement::new(Utc.with_ymd_and_hms(2023, 1, 1, 12, 10, 0).unwrap(), BigDecimal::from_str("21.5").unwrap())];
 
 	for measurement in measurements {
-		db.observe_measurement(aspect.clone(), measurement).await.expect("Failed to capture measurement");
+		db.capture_measurement(aspect.clone(), measurement).await.expect("Failed to capture measurement");
 	}
 
 	// Test point analysis
@@ -39,9 +41,14 @@ async fn test_database_lifecycle() {
 	// Test range analysis
 	let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap();
 	let end_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 10, 0).unwrap();
-	let range_data = Database::analyze_range(aspect.id(), start_time, end_time, Resolution::Seconds, Spline::Linear).await.expect("Failed to analyze range");
+	let mut range_stream = db.analyze_range(aspect.id(), start_time, end_time, Resolution::Seconds, Spline::Linear).await.expect("Failed to analyze range");
+	let first_point = match range_stream.next().await {
+		Some(Ok(point)) => point,
+		Some(Err(err)) => panic!("Range analysis produced error: {err}"),
+		None => panic!("Range stream produced no points"),
+	};
 
-	assert!(!range_data.is_empty());
+	assert_eq!(first_point.timestamp, start_time);
 
 	// Clean up
 	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
@@ -56,17 +63,17 @@ async fn test_existing_database() {
 
 	// Create initial database
 	let db = Database::new(&db_name).await.expect("Failed to create database");
-	let subject = db.track_subject("persistent_subject").await.expect("Failed to add subject");
-	let aspect = db.track_aspect(subject, "humidity", splimes::Resolution::Seconds).await.expect("Failed to track aspect");
+	let subject = db.observe_subject("persistent_subject").await.expect("Failed to add subject");
+	let aspect = db.track_aspect(subject.id(), "humidity", splimes::Resolution::Seconds).await.expect("Failed to track aspect");
 
 	// Add some data
-	db.observe_measurement(aspect, InputMeasurement::new(Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap(), BigDecimal::from_str("45.0").unwrap())).await.expect("Failed to capture measurement");
+	db.capture_measurement(aspect, InputMeasurement::new(Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap(), BigDecimal::from_str("45.0").unwrap())).await.expect("Failed to capture measurement");
 
 	// Test loading existing database
 	let loaded_db = Database::existing(&db_name).await.expect("Failed to load existing database");
 
 	// Verify we can work with the loaded database
-	let _new_subject = loaded_db.track_subject("new_subject_in_loaded_db").await.expect("Failed to add subject to loaded database");
+	let _new_subject = loaded_db.observe_subject("new_subject_in_loaded_db").await.expect("Failed to add subject to loaded database");
 
 	// Clean up
 	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
@@ -82,13 +89,13 @@ async fn test_multiple_subjects_and_aspects() {
 	let db = Database::new(&db_name).await.expect("Failed to create database");
 
 	// Create multiple subjects
-	let subject1 = db.track_subject("subject_1").await.expect("Failed to add subject 1");
-	let subject2 = db.track_subject("subject_2").await.expect("Failed to add subject 2");
+	let subject1 = db.observe_subject("subject_1").await.expect("Failed to add subject 1");
+	let subject2 = db.observe_subject("subject_2").await.expect("Failed to add subject 2");
 
 	// Create multiple aspects for each subject
-	let temp_aspect1 = db.track_aspect(subject1.clone(), "temperature", splimes::Resolution::Seconds).await.expect("Failed to track temperature for subject 1");
-	let humidity_aspect1 = db.track_aspect(subject1, "humidity", splimes::Resolution::Seconds).await.expect("Failed to track humidity for subject 1");
-	let temp_aspect2 = db.track_aspect(subject2, "temperature", splimes::Resolution::Seconds).await.expect("Failed to track temperature for subject 2");
+	let temp_aspect1 = db.track_aspect(subject1.id(), "temperature", splimes::Resolution::Seconds).await.expect("Failed to track temperature for subject 1");
+	let humidity_aspect1 = db.track_aspect(subject1.id(), "humidity", splimes::Resolution::Seconds).await.expect("Failed to track humidity for subject 1");
+	let temp_aspect2 = db.track_aspect(subject2.id(), "temperature", splimes::Resolution::Seconds).await.expect("Failed to track temperature for subject 2");
 
 	// Add data to different aspects
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap();
@@ -97,13 +104,13 @@ async fn test_multiple_subjects_and_aspects() {
 		let timestamp = base_time + chrono::Duration::minutes(i * 5);
 
 		// Subject 1 temperature
-		db.observe_measurement(temp_aspect1.clone(), InputMeasurement::new(timestamp, BigDecimal::from_str(&format!("{}.0", 20 + i)).unwrap())).await.expect("Failed to capture temp measurement for subject 1");
+		db.capture_measurement(temp_aspect1.clone(), InputMeasurement::new(timestamp, BigDecimal::from_str(&format!("{}.0", 20 + i)).unwrap())).await.expect("Failed to capture temp measurement for subject 1");
 
 		// Subject 1 humidity
-		db.observe_measurement(humidity_aspect1.clone(), InputMeasurement::new(timestamp, BigDecimal::from_str(&format!("{}.0", 40 + i)).unwrap())).await.expect("Failed to capture humidity measurement for subject 1");
+		db.capture_measurement(humidity_aspect1.clone(), InputMeasurement::new(timestamp, BigDecimal::from_str(&format!("{}.0", 40 + i)).unwrap())).await.expect("Failed to capture humidity measurement for subject 1");
 
 		// Subject 2 temperature
-		db.observe_measurement(temp_aspect2.clone(), InputMeasurement::new(timestamp, BigDecimal::from_str(&format!("{}.0", 15 + i)).unwrap())).await.expect("Failed to capture temp measurement for subject 2");
+		db.capture_measurement(temp_aspect2.clone(), InputMeasurement::new(timestamp, BigDecimal::from_str(&format!("{}.0", 15 + i)).unwrap())).await.expect("Failed to capture temp measurement for subject 2");
 	}
 
 	// Test analysis on different aspects
@@ -151,8 +158,8 @@ async fn test_interpolation_methods() {
 	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
 
 	let db = Database::new(&db_name).await.expect("Failed to create database");
-	let subject = db.track_subject("test_subject").await.expect("Failed to add subject");
-	let aspect = db.track_aspect(subject, "test_aspect", splimes::Resolution::Milliseconds).await.expect("Failed to track aspect");
+	let subject = db.observe_subject("test_subject").await.expect("Failed to add subject");
+	let aspect = db.track_aspect(subject.id(), "test_aspect", splimes::Resolution::Milliseconds).await.expect("Failed to track aspect");
 
 	// Add test data with a clear pattern
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap();
@@ -165,7 +172,7 @@ async fn test_interpolation_methods() {
 	];
 
 	for (minutes, value) in measurements {
-		db.observe_measurement(aspect.clone(), InputMeasurement::new(base_time + chrono::Duration::minutes(minutes), BigDecimal::from_str(value).unwrap())).await.expect("Failed to capture measurement");
+		db.capture_measurement(aspect.clone(), InputMeasurement::new(base_time + chrono::Duration::minutes(minutes), BigDecimal::from_str(value).unwrap())).await.expect("Failed to capture measurement");
 	}
 
 	// Test different spline types with different target times to avoid cache conflicts
@@ -217,13 +224,13 @@ async fn test_caching_behavior() {
 	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
 
 	let db = Database::new(&db_name).await.expect("Failed to create database");
-	let subject = db.track_subject("cache_test_subject").await.expect("Failed to add subject");
-	let aspect = db.track_aspect(subject, "cache_test_aspect", splimes::Resolution::Milliseconds).await.expect("Failed to track aspect");
+	let subject = db.observe_subject("cache_test_subject").await.expect("Failed to add subject");
+	let aspect = db.track_aspect(subject.id(), "cache_test_aspect", splimes::Resolution::Milliseconds).await.expect("Failed to track aspect");
 
 	// Add test data
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap();
 	for i in 0..10 {
-		db.observe_measurement(aspect.clone(), InputMeasurement::new(base_time + chrono::Duration::minutes(i * 5), BigDecimal::from_str(&format!("{}.0", i)).unwrap())).await.expect("Failed to capture measurement");
+		db.capture_measurement(aspect.clone(), InputMeasurement::new(base_time + chrono::Duration::minutes(i * 5), BigDecimal::from_str(&format!("{i}.0")).unwrap())).await.expect("Failed to capture measurement");
 	}
 
 	let target_time = base_time + chrono::Duration::minutes(22);
@@ -244,7 +251,7 @@ async fn test_caching_behavior() {
 
 	// Second call should be faster (cached)
 	// Note: This might be flaky in CI, so we'll just verify the results match
-	println!("First call: {:?}, Second call: {:?}", first_duration, second_duration);
+	println!("First call: {first_duration:?}, Second call: {second_duration:?}");
 
 	// Clean up
 	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
