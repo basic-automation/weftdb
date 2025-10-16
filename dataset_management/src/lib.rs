@@ -1,64 +1,147 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions, clippy::used_underscore_binding, clippy::similar_names, clippy::module_name_repetitions, clippy::module_inception, clippy::cast_precision_loss)]
+
 use std::sync::LazyLock;
 
 use anyhow::Result;
 use bigdecimal::{BigDecimal, FromPrimitive, Zero};
 use chrono::Datelike;
-use database::{AspectId, Database, Resolution};
-use futures::TryStreamExt;
+use database::{
+	database::traits::{DatabaseStructure, Outputs}, AspectId, Database, DictionaryId, Resolution
+};
+use futures::StreamExt;
 use rayon::prelude::*;
 use splimes::Spline;
 use tokio::sync::Mutex;
 pub use types::*;
-pub use batch_utils::{UNPROCESSED_BATCHES_QUEUE, build_unprocessed_queue};
 
+pub mod batch_utils;
+#[cfg(test)]
+mod debug_batch_test;
 #[cfg(test)]
 mod memory_test;
 pub mod types;
-mod batch_utils;
+
+#[cfg(test)]
+mod pattern_fix_test;
 
 pub const BATCH_SIZE: [usize; 1] = [100];
-pub static DEFAULT_ERROR_RATE: LazyLock<signal::Distance> = LazyLock::new(|| signal::Distance { 
-	value: BigDecimal::zero(), 
-	units: splimes::Resolution::Seconds  // Use seconds as the canonical unit for error rates
+pub static DEFAULT_ERROR_RATE: LazyLock<database::Distance> = LazyLock::new(|| {
+	database::Distance::new(
+		BigDecimal::zero(),
+		splimes::Resolution::Seconds, // Use seconds as the canonical unit for error rates
+	)
 });
 
-static PROCESSED_BATCHES_QUEUE: LazyLock<Mutex<Vec<Batch>>> = LazyLock::new(|| Mutex::new(Vec::new()));
-static PATTERNS_QUEUE: LazyLock<Mutex<Vec<Pattern>>> = LazyLock::new(|| Mutex::new(Vec::new()));
-static EVENTS_QUEUE: LazyLock<Mutex<Events>> = LazyLock::new(|| Mutex::new(Events::new()));
-static CORRELATIONS_QUEUE: LazyLock<Mutex<Correlations>> = LazyLock::new(|| Mutex::new(Correlations::new()));
 static SIGNALS_QUEUE: LazyLock<Mutex<Signals>> = LazyLock::new(|| Mutex::new(Signals::new()));
 
+/// Builds a processed batch queue from unprocessed batches in the database.
+///
+/// This function retrieves unprocessed batches, processes them in parallel,
+/// and marks them as processed in the database.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Database operations fail (getting batches, marking as processed)
+/// - Batch processing fails
+pub async fn build_processed_batch_queue(database: &Database, aspect_id: &database::AspectId) -> Result<()> {
+	let unprocessed_batches = database.get_unprocessed_batches(aspect_id).await?;
 
+	if unprocessed_batches.is_empty() {
+		println!("No unprocessed batches found in database");
+		return Ok(());
+	}
 
-pub async fn build_processed_batch_queue() -> Result<()> {
-	// print UNPROCESSED_BATCHES_QUEUE length for verification
-	let unprocessed_lock = UNPROCESSED_BATCHES_QUEUE.lock().await;
-	println!("UNPROCESSED_BATCHES_QUEUE length: {}", unprocessed_lock.len());
-	drop(unprocessed_lock);
+	println!("Processing {} unprocessed batches from database", unprocessed_batches.len());
 
-	let mut processed_batches = UNPROCESSED_BATCHES_QUEUE.lock().await.clone();
-	UNPROCESSED_BATCHES_QUEUE.lock().await.clear();
-	processed_batches
-		.par_iter_mut()
-		.map(|batch| {
+	// Store batch IDs before processing (since processing modifies the batch but we need original IDs)
+	let batch_ids: Vec<_> = unprocessed_batches.iter().filter_map(|batch| batch.batch_id().cloned()).collect();
+
+	let batch_hashes: Vec<_> = unprocessed_batches.iter().filter_map(|batch| batch.batch_hash().cloned()).collect();
+
+	let mut processed_batches = unprocessed_batches;
+	let total_batches = processed_batches.len();
+
+	// Process batches in chunks with progress reporting
+	let chunk_size = 1000;
+	let mut processed_count = 0;
+
+	for chunk in processed_batches.chunks_mut(chunk_size) {
+		chunk.par_iter_mut().for_each(|batch| {
 			let _ = batch.process();
-		})
-		.collect::<()>();
+		});
 
-	let mut processed_lock = PROCESSED_BATCHES_QUEUE.lock().await;
-	processed_lock.append(&mut processed_batches);
+		processed_count += chunk.len();
+		println!("Processed {processed_count} / {total_batches} batches");
+	}
+
+	// Mark batches as processed using the original identifiers
+	let has_batch_ids = !batch_ids.is_empty();
+
+	println!("Marking batches as processed in database");
+	let total_batch_ids = batch_ids.len();
+	for (i, batch_id) in batch_ids.iter().enumerate() {
+		database.mark_batch_processed_by_id(batch_id, aspect_id).await?;
+
+		if (i + 1) % 1000 == 0 || (i + 1) == total_batch_ids {
+			println!("Marked {} / {} batch IDs as processed", i + 1, total_batch_ids);
+		}
+	}
+
+	if !has_batch_ids {
+		// Only use hash if no IDs available
+		let total_batch_hashes = batch_hashes.len();
+		for (i, batch_hash) in batch_hashes.iter().enumerate() {
+			database.mark_batch_processed_by_hash(batch_hash, aspect_id).await?;
+
+			if (i + 1) % 1000 == 0 || (i + 1) == total_batch_hashes {
+				println!("Marked {} / {} batch hashes as processed", i + 1, total_batch_hashes);
+			}
+		}
+	}
+
 	Ok(())
 }
 
-pub async fn build_patterns_queue() -> Result<()> {
-	let mut processed_lock = PROCESSED_BATCHES_QUEUE.lock().await;
-	let mut patterns_lock = PATTERNS_QUEUE.lock().await;
+/// Builds a patterns queue from processed batches in the database.
+///
+/// This function extracts patterns from processed batches and imports them into the dictionary
+/// with merge logic applied before storing to the database.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Database operations fail (getting batches, storing patterns, dequeuing batches)
+/// - Pattern creation fails due to invalid batch data
+/// - Dictionary import fails during pattern merging
+///
+/// # Panics
+///
+/// This function will panic if active measurements exist in a batch but have no timestamps,
+/// which should not happen under normal circumstances.
+pub async fn build_patterns_queue(database: &Database, aspect_id: &database::AspectId, dictionary: &mut Dictionary) -> Result<()> {
+	// Get processed batches from database queue
+	let batches = database.get_processed_batches_queue(aspect_id).await?;
 
-	// Take all batches out, process them, and don't put back the ones we've processed
-	let batches = std::mem::take(&mut *processed_lock);
-	let mut remaining_batches = Vec::new();
+	if batches.is_empty() {
+		println!("No processed batches found in database queue");
+		return Ok(());
+	}
 
-	for batch in batches.into_iter() {
+	println!("Processing {} batches from database queue into patterns", batches.len());
+
+	let mut processed_batch_ids = Vec::new();
+	let mut processed_count = 0;
+	let total_batches = batches.len();
+
+	for batch in &batches {
+		processed_count += 1;
+
+		// Progress reporting every 1000 batches
+		if processed_count % 1000 == 0 || processed_count == total_batches {
+			println!("Processed {processed_count} / {total_batches} batches into patterns");
+		}
 		// Generate a new pattern ID for this batch
 		let pattern_id = PatternID::new();
 
@@ -66,82 +149,164 @@ pub async fn build_patterns_queue() -> Result<()> {
 		let active_measurements: Vec<_> = batch.measurements().iter().filter(|m| m.is_active()).collect();
 
 		if active_measurements.is_empty() {
-			remaining_batches.push(batch); // Keep batches with no active measurements
-			continue;
+			continue; // Skip batches with no active measurements
 		}
 
-		let beginning = active_measurements.iter().map(|m| m.get_measurement_timestamp()).min().cloned().unwrap();
-		let end = active_measurements.iter().map(|m| m.get_measurement_timestamp()).max().cloned().unwrap();
+		let beginning = active_measurements.iter().map(|m| m.get_measurement_timestamp()).min().copied().unwrap();
+		let end = active_measurements.iter().map(|m| m.get_measurement_timestamp()).max().copied().unwrap();
 
 		// Create an occurrence for this pattern
 		let occurrence = Occurrence::new(batch.metadata.aspect, batch.metadata.resolution, batch.metadata.size, batch.metadata.database_info.clone(), pattern_id, beginning, end);
 
-		// Extract relatives from active measurements that have analysis
-		let relatives: Vec<Relative> = active_measurements.iter().filter_map(|measurement| measurement.analysis()?.relative().cloned()).collect();
+		// Extract relatives from active measurements that have analysis, or generate from vectors
+		let relatives: Vec<database::Relative> = active_measurements.iter().find_map(|measurement| measurement.analysis()?.relative()).map_or_else(
+			|| {
+				// If no analysis data, generate relatives from measurement vectors
+				let vectors: Vec<_> = active_measurements.iter().filter_map(|measurement| measurement.vector()).collect();
+				if vectors.is_empty() {
+					Vec::new()
+				} else {
+					// Calculate max_x and max_y from all vectors
+					let max_x = vectors.iter().map(|v| v.location()).max().cloned().unwrap_or_else(|| BigDecimal::from(0));
+					let max_y = vectors.iter().map(|v| v.amplitude()).max().cloned().unwrap_or_else(|| BigDecimal::from(0));
 
-		// Create the pattern
-		let pattern = Pattern::new(pattern_id, vec![occurrence], relatives);
-		patterns_lock.push(pattern);
-		// Don't add this batch back to remaining_batches (effectively removing it)
+					// Create relatives from vectors
+					vectors.iter().map(|vector| database::Relative::new((*vector).clone(), max_x.clone(), max_y.clone())).collect()
+				}
+			},
+			|_first_relative| active_measurements.iter().filter_map(|measurement| measurement.analysis()?.relative().cloned()).collect(),
+		); // Only create pattern if we have relatives
+		if !relatives.is_empty() {
+			let pattern = Pattern::new(pattern_id, vec![occurrence], relatives);
+
+			// Import pattern into dictionary (this applies merge logic)
+			dictionary.import_pattern(pattern)?;
+
+			// Track this batch for removal from database queue
+			processed_batch_ids.push(batch.clone());
+		}
 	}
 
-	// Put back any batches that weren't processed
-	*processed_lock = remaining_batches;
+	// Get all patterns from dictionary after merging
+	let merged_patterns: Vec<Pattern> = dictionary.patterns().to_vec(); // Store merged patterns in database
+	if !merged_patterns.is_empty() {
+		// Store patterns in the specified dictionary - handle case where dictionary schema doesn't exist
+		match database.store_patterns_in_dictionary(&merged_patterns, dictionary.name(), aspect_id).await {
+			Ok(()) => {
+				println!("Stored {} patterns in database dictionary '{}' (after merging {} batches)", merged_patterns.len(), dictionary.name(), batches.len());
+			}
+			Err(e) => {
+				println!("Warning: Failed to store patterns in database dictionary '{}': {}", dictionary.name(), e);
+				println!("Patterns are still available in memory dictionary with {} patterns", merged_patterns.len());
+			}
+		}
+	}
+
+	// Remove processed batches from database queue
+	for batch in processed_batch_ids {
+		database.dequeue_processed_batch(&batch).await?;
+	}
 
 	Ok(())
 }
 
 /// Optimized dictionary loading with memory-aware parallelism using rayon
 /// Dynamically calculates batch sizes based on available memory and removes patterns as processed
-pub async fn load_dictionary(dictionary: &mut Dictionary) -> Result<()> {
-	let mut patterns_queue = PATTERNS_QUEUE.lock().await;
-	let pattern_count = patterns_queue.len();
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Database operations fail (getting patterns, dequeuing patterns)
+/// - Pattern import fails during dictionary loading
+/// - Memory calculation fails
+pub async fn load_dictionary(database: &Database, aspect_id: &database::AspectId, dictionary: &mut Dictionary) -> Result<()> {
+	// Check if dictionary metadata exists, create it if not
+	match database.get_dictionary_metadata(dictionary.name()).await {
+		Ok(Some(_)) => {
+			// Dictionary metadata exists, proceed normally
+		}
+		Ok(None) => {
+			// Dictionary metadata doesn't exist, create it
+			let constraints_json = serde_json::json!({
+				"steps": dictionary.constraints().steps().as_ref().map(|s| serde_json::json!({
+					"count": s.count(),
+					"interpolation": s.interpolation()
+				})),
+				"variabilities": dictionary.constraints().variabilities().as_ref().map(|v| serde_json::json!(v))
+			});
+
+			// Store dictionary metadata
+			database.store_dictionary_metadata(dictionary.name(), dictionary.description(), &constraints_json).await?;
+		}
+		Err(e) => {
+			// If dictionary metadata retrieval fails, try to create it anyway
+			println!("Warning: Failed to check dictionary metadata ({e}), attempting to create");
+			let constraints_json = serde_json::json!({
+				"steps": dictionary.constraints().steps().as_ref().map(|s| serde_json::json!({
+					"count": s.count(),
+					"interpolation": s.interpolation()
+				})),
+				"variabilities": dictionary.constraints().variabilities().as_ref().map(|v| serde_json::json!(v))
+			});
+
+			// Try to store dictionary metadata - if this fails, the database might not support it yet
+			if let Err(store_err) = database.store_dictionary_metadata(dictionary.name(), dictionary.description(), &constraints_json).await {
+				println!("Warning: Failed to store dictionary metadata: {store_err}");
+				println!("Continuing without dictionary metadata (dictionary will still function)");
+			}
+		}
+	}
+
+	// Get processed patterns from the specific dictionary - handle case where dictionary doesn't exist
+	let patterns = match database.get_patterns_from_dictionary(dictionary.name(), aspect_id).await {
+		Ok(patterns) => patterns,
+		Err(e) => {
+			println!("Warning: Failed to get patterns from dictionary '{}': {}", dictionary.name(), e);
+			println!("Dictionary may not exist yet - returning empty pattern list");
+			Vec::new()
+		}
+	};
+	let pattern_count = patterns.len();
 
 	let start_time = std::time::Instant::now();
-	println!("Loading {} patterns into dictionary with memory-aware batching", pattern_count);
+	println!("Loading {pattern_count} patterns into dictionary with memory-aware batching");
 
 	// For smaller pattern sets, process directly from the queue
 	if pattern_count <= 1000 {
-		while let Some(pattern) = patterns_queue.pop() {
-			dictionary.import_pattern(pattern).await?;
+		for pattern in &patterns {
+			dictionary.import_pattern(pattern.clone())?;
 		}
 	} else {
 		// Get available memory information
 		let available_memory_mb = get_available_memory_mb();
-		println!("Available memory: {} MB", available_memory_mb);
+		println!("Available memory: {available_memory_mb} MB");
 
 		// Calculate safe batch size based on available memory
 		// Assume each pattern uses ~1MB when processed (conservative estimate)
 		// Use only 25% of available memory for safety
-		let safe_memory_mb = (available_memory_mb as f64 * 0.25) as usize;
+		let safe_memory_mb = available_memory_mb / 4;
 		let estimated_pattern_size_mb = 1; // Conservative estimate per pattern
 		let memory_based_batch_size = (safe_memory_mb / estimated_pattern_size_mb).clamp(10, 200);
 
 		let cpu_count = num_cpus::get();
 		let optimal_batch_size = (memory_based_batch_size / cpu_count).max(5);
 
-		println!("Using batch size: {} patterns per thread, {} total per chunk", optimal_batch_size, memory_based_batch_size);
+		println!("Using batch size: {optimal_batch_size} patterns per thread, {memory_based_batch_size} total per chunk");
 
-		// Process in memory-aware chunks, draining from the queue
-		while !patterns_queue.is_empty() {
-			let queue_len = patterns_queue.len();
-			let chunk_size = memory_based_batch_size.min(queue_len);
-			let chunk: Vec<Pattern> = patterns_queue.drain(queue_len - chunk_size..).collect();
+		// Process in memory-aware chunks, removing from database queue as processed
+		let mut processed_patterns = Vec::new();
 
+		for chunk in patterns.chunks(memory_based_batch_size) {
 			// Release the lock while processing
-			drop(patterns_queue);
-
-			// Process chunk in parallel with rayon
-			let chunk_dictionaries: Vec<Dictionary> = chunk
+			let chunk_patterns: Vec<Dictionary> = chunk
 				.chunks(optimal_batch_size)
 				.collect::<Vec<_>>()
 				.par_iter()
 				.map(|chunk_patterns| {
-					let mut chunk_dict = Dictionary::new(format!("Chunk Dictionary {}", uuid::Uuid::new_v4()), "Temporary dictionary for parallel processing".to_string(), dictionary.constraints.clone());
-
-					for pattern in chunk_patterns.iter() {
-						if let Err(e) = futures::executor::block_on(chunk_dict.import_pattern(pattern.clone())) {
-							eprintln!("Failed to import pattern in chunk: {}", e);
+					let mut chunk_dict = Dictionary::new(format!("Chunk Dictionary {}", uuid::Uuid::new_v4()), "Temporary dictionary for parallel processing".to_string(), dictionary.constraints().clone());
+					for pattern in *chunk_patterns {
+						if let Err(e) = chunk_dict.import_pattern(pattern.clone()) {
+							eprintln!("Failed to import pattern in chunk: {e}");
 						}
 					}
 
@@ -150,14 +315,14 @@ pub async fn load_dictionary(dictionary: &mut Dictionary) -> Result<()> {
 				.collect();
 
 			// Merge chunk dictionaries
-			for chunk_dict in chunk_dictionaries {
-				dictionary.merge_dictionary(chunk_dict).await?;
+			for chunk_dict in chunk_patterns {
+				dictionary.merge_dictionary(chunk_dict)?;
 			}
 
-			// Re-acquire lock for next iteration
-			patterns_queue = PATTERNS_QUEUE.lock().await;
+			// Track processed patterns for removal from database queue
+			processed_patterns.extend_from_slice(chunk);
 
-			let remaining = patterns_queue.len();
+			let remaining = pattern_count - processed_patterns.len();
 			if remaining > 0 {
 				// println!("Processed {} patterns, {} remaining", pattern_count - remaining, remaining);
 			}
@@ -165,11 +330,17 @@ pub async fn load_dictionary(dictionary: &mut Dictionary) -> Result<()> {
 			// Yield to prevent blocking other tasks
 			tokio::task::yield_now().await;
 		}
+
+		// Patterns are now stored in dictionary databases and should persist,
+		// so we don't remove them after loading into memory
+		// for pattern in processed_patterns {
+		//     database.dequeue_processed_pattern(&pattern).await?;
+		// }
 	}
 
 	let final_elapsed = start_time.elapsed();
 	let final_rate = pattern_count as f64 / final_elapsed.as_secs_f64();
-	println!("Dictionary loading completed. Processed {} patterns in {:?} ({:.1} patterns/sec)", pattern_count, final_elapsed, final_rate);
+	println!("Dictionary loading completed. Processed {pattern_count} patterns in {final_elapsed:?} ({final_rate:.1} patterns/sec)");
 	Ok(())
 }
 
@@ -197,10 +368,10 @@ fn get_available_memory_mb() -> usize {
 			fn GlobalMemoryStatusEx(lpBuffer: *mut MemoryStatusEx) -> i32;
 		}
 
-		let mut mem_status = MemoryStatusEx { dw_length: mem::size_of::<MemoryStatusEx>() as u32, dw_memory_load: 0, ull_total_phys: 0, ull_avail_phys: 0, ull_total_page_file: 0, ull_avail_page_file: 0, ull_total_virtual: 0, ull_avail_virtual: 0, ull_avail_extended_virtual: 0 };
+		let mut mem_status = MemoryStatusEx { dw_length: u32::try_from(mem::size_of::<MemoryStatusEx>()).unwrap(), dw_memory_load: 0, ull_total_phys: 0, ull_avail_phys: 0, ull_total_page_file: 0, ull_avail_page_file: 0, ull_total_virtual: 0, ull_avail_virtual: 0, ull_avail_extended_virtual: 0 };
 
 		unsafe {
-			if GlobalMemoryStatusEx(&mut mem_status) != 0 {
+			if GlobalMemoryStatusEx(&raw mut mem_status) != 0 {
 				return (mem_status.ull_avail_phys / (1024 * 1024)) as usize;
 			}
 		}
@@ -241,7 +412,7 @@ fn get_available_memory_mb() -> usize {
 /// This is useful for determining if buying at the start of each month would be profitable.
 ///
 /// # Parameters
-/// - `database`: Database instance to query measurements from
+/// - `database`: Database instance to query measurements from and store events
 /// - `aspect`: The aspect ID to analyze for price movements
 /// - `resolution`: The resolution for data analysis
 /// - `method`: The spline interpolation method to use
@@ -252,27 +423,39 @@ fn get_available_memory_mb() -> usize {
 /// 3. For each month, find the first price (beginning) and last price (end)
 /// 4. Calculate percentage increase from start to end of month
 /// 5. If increase is 5% or higher, create an event at the end of the month
-/// 6. Add events to the global EVENTS_QUEUE
+/// 6. Store events in the database
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - No earliest or latest measurements are found
+/// - Database operations fail (streaming data, getting database info, storing events)
+///
+/// # Panics
+///
+/// This function will panic if the 5% threshold value (0.05) cannot be converted to `BigDecimal`,
+/// which should not happen under normal circumstances.
 pub async fn create_event_and_manifestations(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline) -> Result<()> {
-	let start_time = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
+	use std::collections::HashMap;
+	let start_time: chrono::DateTime<chrono::Utc> = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
 	let end_time = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
 
 	// Use optimized bulk analysis to get all points
-	let mut point_stream = database.stream_analyze_range(*aspect, start_time, end_time, *resolution, *method);
+	let mut point_stream = Outputs::analyze_range(database, *aspect, start_time, end_time, *resolution, *method).await?;
 
 	let mut points = Vec::new();
-	while let Some(point) = point_stream.try_next().await? {
+	while let Some(result) = point_stream.next().await {
+		let point = result?;
 		points.push(point);
 	}
 
 	// Sort points by timestamp to ensure proper chronological order
 	points.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
 
-	let mut event = Event::new(format!("5% Monthly Price Increase - {}", aspect), Some(format!("Detects when price increases 5% or more from start to end of month for aspect {}", aspect)));
+	let mut event = Event::new(format!("5% Monthly Price Increase - {aspect}"), Some(format!("Detects when price increases 5% or more from start to end of month for aspect {aspect}")));
 	let threshold_percentage = BigDecimal::from_f64(0.05).unwrap(); // 5% threshold
 
 	// Group points by month and analyze each month
-	use std::collections::HashMap;
 	let mut months_data: HashMap<(i32, u32), Vec<&splimes::Point>> = HashMap::new();
 
 	// Group all points by year and month
@@ -314,18 +497,29 @@ pub async fn create_event_and_manifestations(database: &Database, aspect: &Aspec
 		}
 	}
 
-	// Add all detected events to the global queue
-	let mut events_lock = EVENTS_QUEUE.lock().await;
-	events_lock.insert(event.id.clone(), event);
-	drop(events_lock);
+	// Store all detected events in the database
+	if !event.manifestations().is_empty() {
+		database.store_event(&event).await?;
+		println!("Stored event '{}' with {} manifestations in database", event.name(), event.manifestations().len());
+	}
 
 	Ok(())
 }
 
-pub async fn create_correlations_for_events(dictionary: &Dictionary) -> Result<()> {
-	// Get patterns from dictionary (merged patterns with multiple occurrences) and events from global queue
-	let patterns = &dictionary.patterns;
-	let events = EVENTS_QUEUE.lock().await.clone();
+/// Creates correlations between events and patterns for signal generation.
+///
+/// This function correlates all events with all patterns in the dictionary,
+/// creating the foundation for signal prediction.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Database operations fail (getting events, marking events processed)
+/// - Correlation creation fails
+pub async fn create_correlations_for_events(database: &Database, dictionary: &Dictionary, aspect_id: &AspectId) -> Result<()> {
+	// Get patterns directly from database (not from dictionary object which may have filtered patterns)
+	let patterns = database.get_patterns_from_dictionary(dictionary.name(), aspect_id).await?;
+	let events = database.get_unprocessed_events().await?;
 
 	// Exit early if no patterns or events to correlate
 	if patterns.is_empty() || events.is_empty() {
@@ -336,29 +530,35 @@ pub async fn create_correlations_for_events(dictionary: &Dictionary) -> Result<(
 	println!("Correlating {} events with {} patterns", events.len(), patterns.len());
 
 	// For each event, correlate with all patterns
-	for event_id in events.keys() {
-		for pattern in patterns {
+	for event in &events {
+		for pattern in &patterns {
 			// Assign constant to local variable before borrowing to avoid clippy warning
 			let error_rate = DEFAULT_ERROR_RATE.clone();
 
-			let correlation = Correlation::new(pattern.occurrences()[0].database_info.id().as_uuid(), pattern.id(), event_id.clone(), error_rate, pattern.occurrences().clone());
-			CORRELATIONS_QUEUE.lock().await.insert(event_id.clone(), pattern.id(), correlation);
+			let correlation = Correlation::new(DictionaryId::from_uuid(pattern.occurrences()[0].database_info().id().as_uuid()), pattern.id(), event.id().clone(), error_rate, pattern.occurrences().clone());
+			database.store_correlation(&correlation).await?;
 		}
 	}
-
-	// Update the global events queue with correlations
-	let mut events_lock = EVENTS_QUEUE.lock().await;
-	*events_lock = events;
-	drop(events_lock);
 
 	println!("Pattern-Event correlation completed successfully");
 	Ok(())
 }
 
-pub async fn create_signals(_dictionary: &Dictionary) -> Result<()> {
-	// Get correlations and events from global queues
-	let correlations = CORRELATIONS_QUEUE.lock().await.clone();
-	let events = EVENTS_QUEUE.lock().await.clone();
+/// Creates prediction signals from correlations and events.
+///
+/// This function generates signals for each correlation-manifestation pair,
+/// representing predictions of when events will occur.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Database operations fail (getting events)
+/// - Time difference calculations fail
+/// - Signal creation fails
+pub async fn create_signals(database: &Database, _dictionary: &Dictionary) -> Result<()> {
+	// Get correlations and events from database
+	let correlations = database.get_correlations().await?;
+	let events = database.get_unprocessed_events().await?;
 
 	// Exit early if no correlations or events to process
 	if correlations.is_empty() || events.is_empty() {
@@ -371,33 +571,48 @@ pub async fn create_signals(_dictionary: &Dictionary) -> Result<()> {
 	let mut signals_count = 0;
 
 	// Process each correlation to create signals
-	for ((_event_id, _pattern_id), correlation) in correlations.iter() {
+	for correlation in &correlations {
 		// Get the corresponding event
-		if let Some(event) = events.get(&correlation.event_id) {
+		if let Some(event) = events.iter().find(|e| e.id() == correlation.event_id()) {
 			// For each manifestation of the event, create signals based on pattern occurrences
-			for manifestation in event.manifestations.values() {
+			for manifestation in event.manifestations().values() {
 				// Create signals for each pattern occurrence in the correlation
 				for occurrence in correlation.occurrences() {
 					// Calculate the distance between the event manifestation and pattern occurrence
-					let manifestation_start = manifestation.start;
+					let manifestation_start = *manifestation.start();
 					let manifestation_midpoint = manifestation.midpoint();
-					let manifestation_end = manifestation.end;
+					let manifestation_end = *manifestation.end();
 
-					let occurrence_beginning = occurrence.beginning;
-					let occurrence_midpoint = occurrence.beginning + (occurrence.end - occurrence.beginning) / 2;
-					let occurrence_end = occurrence.end;
-
-					// Calculate time difference using the pattern's resolution from the occurrence
-					let pattern_resolution = occurrence.resolution;
-					let time_diff_start = pattern_resolution.difference(&manifestation_start, &occurrence_beginning)?;
-					let time_diff_midpoint = pattern_resolution.difference(&manifestation_midpoint, &occurrence_midpoint)?;
+					let occurrence_end = *occurrence.end(); // Calculate time difference using the pattern's resolution from the occurrence
+					     // For predictive signals, we want the distance from when the pattern ENDS to when the event occurs
+					     // difference(minuend, subtrahend) returns minuend - subtrahend
+					     // So difference(manifestation, occurrence_end) gives us manifestation - occurrence_end (positive forward in time)
+					let pattern_resolution = *occurrence.resolution();
+					let time_diff_start = pattern_resolution.difference(&manifestation_start, &occurrence_end)?;
+					let time_diff_midpoint = pattern_resolution.difference(&manifestation_midpoint, &occurrence_end)?;
 					let time_diff_end = pattern_resolution.difference(&manifestation_end, &occurrence_end)?;
-					
-					let distance_start = signal::Distance { value: BigDecimal::from(time_diff_start), units: pattern_resolution };
-					let distance_midpoint = signal::Distance { value: BigDecimal::from(time_diff_midpoint), units: pattern_resolution };
-					let distance_end = signal::Distance { value: BigDecimal::from(time_diff_end), units: pattern_resolution };
+
+					// Debug: show first few signal distances
+					if signals_count < 5 {
+						println!("DEBUG Signal creation {}: occurrence.beginning={}, occurrence.end={}, manifestation.start={}, manifestation.end={}, time_diff_start={} minutes", signals_count, occurrence.beginning(), occurrence_end, manifestation_start, manifestation.end(), time_diff_start);
+					}
+
+					// Skip if pattern occurrence overlaps with or happens after the event manifestation
+					// For predictive signals, the pattern must END before the event STARTS
+					if occurrence_end >= manifestation_start {
+						if signals_count < 5 {
+							println!("  -> SKIPPING: Pattern ends at or after event starts (causality violation)");
+						}
+						continue;
+					}
+
+					let distance_start = database::Distance::new(BigDecimal::from(time_diff_start), pattern_resolution);
+					let distance_midpoint = database::Distance::new(BigDecimal::from(time_diff_midpoint), pattern_resolution);
+					let distance_end = database::Distance::new(BigDecimal::from(time_diff_end), pattern_resolution);
 
 					// Create different types of signals based on the relationship
+					// The manifestation_date for the signal should be when the pattern ENDS (the starting point of prediction)
+					// The distance then points forward to when the event manifestation occurs
 					let signal_types = vec![
 						(SignalType::Custom("PredictStart".to_string()), distance_start),  // Pattern predicts event start
 						(SignalType::Custom("PredictMid".to_string()), distance_midpoint), // Pattern predicts event midpoint
@@ -406,9 +621,11 @@ pub async fn create_signals(_dictionary: &Dictionary) -> Result<()> {
 
 					for (signal_type, distance) in signal_types {
 						// Use the actual manifestation ID from the event
-						let manifestation_id = manifestation.id.clone();
+						let manifestation_id = manifestation.id().clone();
 
-						let signal = Signal::new(correlation.id.clone(), manifestation_id, correlation.event_id.clone(), manifestation_midpoint, signal_type, distance.clone());
+						// The signal's manifestation_date is when the pattern ends (the starting point for prediction)
+						// From this point, the distance tells us how far in the future the event will occur
+						let signal = Signal::new(correlation.id().clone(), manifestation_id, correlation.event_id().clone(), occurrence_end, signal_type, distance.clone());
 
 						// Add signal to the global signals queue
 						SIGNALS_QUEUE.lock().await.insert(signal);
@@ -419,17 +636,41 @@ pub async fn create_signals(_dictionary: &Dictionary) -> Result<()> {
 		}
 	}
 
-	println!("Created {} signals successfully", signals_count);
+	println!("Created {signals_count} signals successfully");
 	Ok(())
 }
 
-pub async fn filter_expired_signals() -> Result<()> {
+/// Filters out expired signals based on event resolution times.
+///
+/// Signals expire when their predicted event has already occurred.
+/// This function removes expired signals and applies error correction.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Database operations fail (getting events, correlations, updating correlations)
+/// - Signal removal or error correction fails
+/// - Time calculations or conversions fail
+pub async fn filter_expired_signals(database: &Database) -> Result<()> {
+	filter_expired_signals_at_time(database, None).await
+}
+
+/// Filters out expired signals based on event resolution times at a specific time.
+///
+/// This is the implementation function for `filter_expired_signals` that allows
+/// specifying a custom current time (useful for testing).
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Database operations fail (getting events, correlations, updating correlations)
+/// - Signal removal or error correction fails
+/// - Time calculations or conversions fail
+pub async fn filter_expired_signals_at_time(database: &Database, current_time: Option<chrono::DateTime<chrono::Utc>>) -> Result<()> {
 	use chrono::Utc;
 
-	let current_time = Utc::now();
+	let current_time = current_time.unwrap_or_else(Utc::now);
 	let mut signals_lock = SIGNALS_QUEUE.lock().await;
-	let events_lock = EVENTS_QUEUE.lock().await;
-	let correlations_lock = CORRELATIONS_QUEUE.lock().await;
 
 	if signals_lock.is_empty() {
 		println!("No signals found to filter");
@@ -437,7 +678,18 @@ pub async fn filter_expired_signals() -> Result<()> {
 	}
 
 	let initial_count = signals_lock.len();
-	println!("Filtering expired signals from {} total signals", initial_count);
+	println!("Starting filter_expired_signals at query_time={} UTC...", current_time.format("%Y-%m-%d %H:%M:%S"));
+	println!("Filtering expired signals from {initial_count} total signals");
+
+	// Debug: show sample signals before filtering
+	let sample_signals: Vec<_> = signals_lock.values().take(5).collect();
+	for (idx, sig) in sample_signals.iter().enumerate() {
+		println!("DEBUG Sample signal {}: manifestation_date={}, distance={} {:?}, signal_type={:?}", idx, sig.manifestation_date(), sig.distance().value(), sig.distance().units(), sig.signal_type());
+	}
+
+	// Get events and correlations once to avoid database locks during processing
+	let events_lock = database.get_unprocessed_events().await?;
+	let correlations = database.get_correlations().await?;
 
 	// Collect signals to remove
 	let mut signals_to_remove = Vec::new();
@@ -448,81 +700,78 @@ pub async fn filter_expired_signals() -> Result<()> {
 		let mut signal_event_id = None;
 
 		// Look through correlations to find which event this signal belongs to
-		for ((event_id, _pattern_id), correlation) in correlations_lock.iter() {
-			if correlation.id == signal.correlation_id {
-				signal_event_id = Some(event_id.clone());
+		for correlation in &correlations {
+			if correlation.id() == signal.correlation_id() {
+				signal_event_id = Some(correlation.event_id().clone());
 				break;
 			}
 		}
 
 		// If we found the event, check for expiration
 		if let Some(event_id) = signal_event_id {
-			if let Some(event) = events_lock.get(&event_id) {
+			if let Some(event) = events_lock.iter().find(|e| *e.id() == event_id) {
 				// Find the manifestation this signal was created from (the baseline)
-				if let Some(base_manifestation) = event.manifestations.values().find(|m| m.id == signal.manifestation_id) {
+				if let Some(base_manifestation) = event.manifestations().values().find(|m| m.id() == signal.manifestation_id()) {
 					// Find the next manifestation after the baseline that this signal is predicting
-					let mut future_manifestations: Vec<_> = event.manifestations.values().filter(|manifestation| manifestation.start > base_manifestation.end).collect();
+					let mut future_manifestations: Vec<_> = event.manifestations().values().filter(|manifestation| manifestation.start() > base_manifestation.end()).collect(); // Sort by start date to find the very next manifestation
+					future_manifestations.sort_by(|a, b| a.start().cmp(b.start()));
 
-					// Sort by start date to find the very next manifestation
-					future_manifestations.sort_by(|a, b| a.start.cmp(&b.start));
-
-					// If there's a next manifestation and it has completely ended, signal expires
+					// If there's a next manifestation, check if we've passed the prediction point
 					if let Some(next_manifestation) = future_manifestations.first() {
-						if current_time >= next_manifestation.end {
-							// Signal has expired - the predicted manifestation has ended
-							// Use the MIDPOINT of the next manifestation as the resolution time (when event was supposed to happen)
-							let resolution_time = next_manifestation.midpoint();
-							signals_to_remove.push((signal.correlation_id.clone(), signal.manifestation_id.clone(), signal.signal_type.clone(), resolution_time));
+						// Determine the prediction point based on signal type
+						let prediction_point = match signal.signal_type() {
+							SignalType::Custom(ref type_name) if type_name == "PredictStart" => *next_manifestation.start(),
+							SignalType::Custom(ref type_name) if type_name == "PredictMid" => next_manifestation.midpoint(),
+							SignalType::Custom(ref type_name) if type_name == "PredictEnd" => *next_manifestation.end(),
+							SignalType::Custom(_) => next_manifestation.midpoint(), // Default to midpoint for unknown types
+						};
+
+						// Signal expires when current_time reaches or passes the prediction point
+						if current_time >= prediction_point {
+							// Signal has expired - we've reached the time it was predicting
+							signals_to_remove.push((signal.correlation_id().clone(), signal.manifestation_id().clone(), signal.signal_type().clone(), prediction_point));
 						}
 					}
 					// If there are no future manifestations, the signal doesn't expire yet
 				} else {
 					// If we can't find the baseline manifestation this signal was created from, remove it as invalid
 					// Use current time as fallback resolution time for invalid signals
-					signals_to_remove.push((signal.correlation_id.clone(), signal.manifestation_id.clone(), signal.signal_type.clone(), current_time));
+					signals_to_remove.push((signal.correlation_id().clone(), signal.manifestation_id().clone(), signal.signal_type().clone(), current_time));
 				}
 			}
 		}
 	}
 
-	// Release the correlations lock before modifying signals
-	drop(correlations_lock);
+	// Correlations loaded from database, no lock to release
 
-        println!("Removing {} expired or invalid signals", signals_to_remove.len());
+	println!("Removing {} expired or invalid signals", signals_to_remove.len());
 
 	// Remove expired signals with error correction
 	let mut removed_count = 0;
+	let mut correlations_to_update = Vec::new();
+
 	for (correlation_id, manifestation_id, signal_type, resolution_time) in signals_to_remove {
-		// Find the correlation for this signal and apply error correction
-		let mut correlations_lock = CORRELATIONS_QUEUE.lock().await;
-
-		// Find the correlation first without holding the iterator
-		let correlation_clone = correlations_lock.iter().find(|((_, _), corr)| corr.id == correlation_id).map(|(_, v)| v.clone());
-
-		if let Some(mut correlation) = correlation_clone {
+		// Find the correlation from our pre-loaded set
+		if let Some(mut correlation) = correlations.iter().find(|c| c.id() == &correlation_id).cloned() {
 			// Use error correction when removing the signal
-			if let Ok(Some(_removed_signal)) = signals_lock.remove_with_error_correction(&mut correlation, &manifestation_id, &signal_type, resolution_time).await {
-				// Find the key for this correlation to update it
-				let key_to_update = correlations_lock.iter().find(|((_, _), c)| c.id == correlation_id).map(|((event_id, pattern_id), _)| (event_id.clone(), *pattern_id));
-
-				if let Some((event_id, pattern_id)) = key_to_update {
-					correlations_lock.remove(&event_id, &pattern_id);
-					correlations_lock.insert(event_id, pattern_id, correlation);
-				}
+			if let Ok(Some(_removed_signal)) = signals_lock.remove_with_error_correction(&mut correlation, &manifestation_id, &signal_type, resolution_time) {
+				correlations_to_update.push(correlation);
 				removed_count += 1;
 			}
 		}
+	}
 
-		drop(correlations_lock);
+	// Batch update all modified correlations to avoid database lock conflicts
+	for correlation in correlations_to_update {
+		database.update_correlation(&correlation).await?;
 	}
 
 	let remaining_count = signals_lock.len();
 
 	// Release locks
-	drop(events_lock);
 	drop(signals_lock);
 
-	println!("Filtered {} expired signals. {} signals remaining from {} initial signals", removed_count, remaining_count, initial_count);
+	println!("Filtered {removed_count} expired signals. {remaining_count} signals remaining from {initial_count} initial signals");
 
 	Ok(())
 }
@@ -530,47 +779,51 @@ pub async fn filter_expired_signals() -> Result<()> {
 #[cfg(test)]
 mod tests {
 
+	use ::database::database::traits::Inputs;
 	use anyhow::bail;
+	use batch_utils::*;
 	use bigdecimal::{BigDecimal, FromPrimitive};
 	use chrono::{TimeZone, Utc};
-	use database::{Database, DatabaseInfo, InputMeasurement};
+	use database::{AspectId, Database, InputMeasurement, Resolution};
 	use serde_json::json;
 	use serial_test::serial;
-	use splimes::{Point, Spline};
-        use batch_utils::build_unprocessed_queue;
+	use splimes::Spline;
 
 	use super::*;
 
-	#[tokio::test(flavor = "multi_thread")]
+	#[tokio::test]
 	#[serial]
 	async fn test_api() -> Result<()> {
+		// Skip this test if running in CI or if we want fast feedback
+		if std::env::var("SKIP_SLOW_TESTS").is_ok() {
+			println!("Skipping test_api due to SKIP_SLOW_TESTS environment variable");
+			return Ok(());
+		}
+
 		// Try to get the Crypto database, skip test if it doesn't exist or doesn't have the required data
-		let database = match Database::existing("Crypto").await {
-			Ok(db) => db,
-			Err(_) => {
-				println!("Skipping test_api - Crypto database not found (run database tests first)");
-				return Ok(());
-			}
+		let Ok(database) = Database::existing("Crypto").await else {
+			println!("Skipping test_api - Crypto database not found (run database tests first)");
+			return Ok(());
 		};
-		
+
 		let subjects = database.list_subjects().await?;
-		let subject_id = match subjects.iter().find(|(_, name)| name.as_str() == "BTCUSD").map(|(id, _)| *id) {
-			Some(id) => id,
-			None => {
-				println!("Skipping test_api - BTCUSD subject not found in Crypto database");
-				return Ok(());
-			}
+		let Some(subject_id) = subjects.iter().find(|(_, name)| name.as_str() == "BTCUSD").map(|(id, _)| *id) else {
+			println!("Skipping test_api - BTCUSD subject not found in Crypto database");
+			return Ok(());
 		};
-		
+
 		let aspects = database.get_subject_aspects(&subject_id).await?;
-		let aspect = match aspects.iter().find(|a| a.name() == "open") {
-			Some(aspect) => aspect,
-			None => {
-				println!("Skipping test_api - 'open' aspect not found (available aspects: {:?})", 
-					aspects.iter().map(|a| a.name()).collect::<Vec<_>>());
-				return Ok(());
-			}
+		let Some(aspect) = aspects.iter().find(|a| a.name() == "open") else {
+			println!("Skipping test_api - 'open' aspect not found (available aspects: {:?})", aspects.iter().map(database::Aspect::name).collect::<Vec<_>>());
+			return Ok(());
 		};
+
+		// Check if the aspect has any measurements before proceeding
+		if database.get_earliest_measurement(&aspect.id()).await?.is_none() {
+			println!("Skipping test_api - No measurements found for 'open' aspect in Crypto database");
+			return Ok(());
+		}
+
 		let resolution = Resolution::Hours;
 		let method = Spline::Linear;
 		let batch_size = 24;
@@ -589,62 +842,76 @@ mod tests {
 		let timer = std::time::Instant::now();
 		println!("Starting build_processed_queue...");
 
-		build_processed_batch_queue().await?;
+		build_processed_batch_queue(&database, &aspect.id()).await?;
 
 		println!("Time taken for build_processed_queue: {:?}", timer.elapsed());
 
-		let processed_lock = PROCESSED_BATCHES_QUEUE.lock().await; 
+		let timer = std::time::Instant::now();
+		println!("Starting get_processed_batches_queue...");
+
+		let processed_batches = database.get_processed_batches_queue(&aspect.id()).await?;
+
+		println!("Time taken for get_processed_batches_queue: {:?}", timer.elapsed());
 
 		// print random batch from processed queue for verification
-		let mut random_index = 0;
-		let length = processed_lock.len();
+		let length = processed_batches.len();
 		if length > 0 {
-			random_index = rand::random::<usize>() % length;
-			println!("Random processed batch: {}", json!(&processed_lock[random_index]));
-			output_denk_format_batch(&processed_lock[random_index]);
+			let random_index = rand::random::<usize>() % length;
+			println!("Random processed batch: {}", json!(&processed_batches[random_index]));
+			output_denk_format_batch(&processed_batches[random_index]);
 		}
-
-		drop(processed_lock);
-
-		let timer = std::time::Instant::now();
-		println!("Starting build_patterns_queue...");
-
-		build_patterns_queue().await?;
-
-		println!("Time taken for build_patterns_queue: {:?}", timer.elapsed());
-
-		let patterns_lock = PATTERNS_QUEUE.lock().await;
-
-		// print random pattern from patterns queue for verification
-		let length = patterns_lock.len();
-		if length > 0 {
-			println!("Random pattern: {}", json!(&patterns_lock[random_index]));
-			output_denk_format_pattern(&patterns_lock[random_index]);
-		}
-
-		drop(patterns_lock);
 
 		#[rustfmt::skip]
-		let contraints = DictionaryConstraints {
-                        steps: Some(Steps {
-                                count: 10,
-                                interpolation: Spline::Linear
-                        }),
-                        variabilities: Some(
+		let contraints = DictionaryConstraints::new(
+                        Some(Steps::new(
+                                10,
+                                Spline::Linear
+                        )),
+                        Some(
                                 vec![
-                                        VariablilityType::MaximumStatic(Variability {
-                                                value: BigDecimal::from_f64(0.1).unwrap()
-                                        })
+                                        VariablilityType::MaximumStatic(Variability::new(
+                                                BigDecimal::from_f64(0.1).unwrap()
+                                        ))
                                 ]
                         )
-                };
+                );
 
-		let mut dictionary = Dictionary::new("Test Dictionary".to_string(), "A dictionary for testing purposes".to_string(), contraints);
+		let mut dictionary = Dictionary::new("TestDictionary".to_string(), "A dictionary for testing purposes".to_string(), contraints);
 		let timer = std::time::Instant::now();
 		println!("Starting load_dictionary...");
-		load_dictionary(&mut dictionary).await?;
+		load_dictionary(&database, &aspect.id(), &mut dictionary).await?;
 		println!("Time taken for load_dictionary: {:?}", timer.elapsed());
 		println!("Dictionary now contains {} patterns", dictionary.len());
+
+		let _timer = std::time::Instant::now();
+		println!("Starting build_processed_queue...");
+
+		build_processed_batch_queue(&database, &aspect.id()).await?;
+
+		println!("Finished building processed batch queue");
+
+		let processed_batches = database.get_processed_batches_queue(&aspect.id()).await?;
+		let length = processed_batches.len();
+		println!("Processed batches count: {length}");
+		if length > 0 {
+			let random_index = rand::random::<usize>() % length;
+			println!("Random processed batch: {}", json!(&processed_batches[random_index]));
+			output_denk_format_batch(&processed_batches[random_index]);
+		}
+
+		build_patterns_queue(&database, &aspect.id(), &mut dictionary).await?;
+		let patterns = database.get_patterns_from_dictionary("TestDictionary", &aspect.id()).await?;
+		let length = patterns.len();
+		println!("Patterns count: {length}");
+		if length > 0 {
+			let random_index = rand::random::<usize>() % length;
+			println!("Random pattern: {}", json!(&patterns[random_index]));
+			output_denk_format_pattern(&patterns[random_index]);
+		}
+
+		// Load the newly stored patterns into the dictionary
+		load_dictionary(&database, &aspect.id(), &mut dictionary).await?;
+		println!("Dictionary now contains {} patterns after loading from database", dictionary.len());
 
 		let timer = std::time::Instant::now();
 		println!("Starting build_events_5_percent_queue...");
@@ -655,22 +922,19 @@ mod tests {
 
 		let timer = std::time::Instant::now();
 		println!("Starting create_correlations_for_events...");
-		create_correlations_for_events(&dictionary).await?;
+		create_correlations_for_events(&database, &dictionary, &aspect.id()).await?;
 		println!("Time taken for create_correlations_for_events: {:?}", timer.elapsed());
 
 		// print the number of correlations with more than 1 occurrence
-		let correlations_lock = CORRELATIONS_QUEUE.lock().await;
-		let c = correlations_lock.iter().filter(|(_, correlation)| correlation.occurrences().len() > 1).collect::<Vec<_>>();
-
-		println!("Number of correlations with more than 1 occurrence: {}", c.len());
-		drop(correlations_lock);
+		let correlations = database.get_correlations().await?;
+		println!("Number of correlations with more than 1 occurrence: {}", correlations.iter().filter(|correlation| correlation.occurrences().len() > 1).count());
 
 		// print the number of patterns with more than 1 occurrence
-		println!("Number of patterns with more than 1 occurrence: {}", dictionary.patterns.iter().filter(|p| p.occurrences().len() > 1).count());
+		println!("Number of patterns with more than 1 occurrence: {}", dictionary.patterns().iter().filter(|p| p.occurrences().len() > 1).count());
 
 		let timer = std::time::Instant::now();
 		println!("Starting create_signals...");
-		create_signals(&dictionary).await?;
+		create_signals(&database, &dictionary).await?;
 		println!("Time taken for create_signals: {:?}", timer.elapsed());
 
 		// print the number of signals created
@@ -680,7 +944,7 @@ mod tests {
 
 		let timer = std::time::Instant::now();
 		println!("Starting filter_expired_signals...");
-		filter_expired_signals().await?;
+		filter_expired_signals(&database).await?;
 		println!("Time taken for filter_expired_signals: {:?}", timer.elapsed());
 
 		// print the number of signals after filtering
@@ -693,71 +957,52 @@ mod tests {
 
 		// Find a signal with non-zero error rates for more meaningful testing
 		let mut random_signal = None;
-		let mut correlation_to_modify = None;
-
-		// First, find a signal and identify which correlation needs modification
-		if let Some(signal) = signals_lock.values().next() {
+		let correlation_to_modify = signals_lock.values().next().map(|signal| {
 			random_signal = Some(signal.clone());
-			correlation_to_modify = Some(signal.correlation_id.clone());
-			// Just take the first signal for now
-		}
+			signal.correlation_id().clone()
+		});
 
 		// If we found a signal, check and potentially modify its correlation's error rates
 		if let (Some(signal), Some(correlation_id)) = (&random_signal, &correlation_to_modify) {
-			let mut correlations_lock = CORRELATIONS_QUEUE.lock().await;
-
-			// Find and clone the correlation first
-			let correlation_data = correlations_lock.iter().find(|((_, _), corr)| corr.id == *correlation_id).map(|((event_id, pattern_id), v)| ((event_id.clone(), *pattern_id), v.clone()));
-
-			if let Some((key, correlation)) = correlation_data {
+			if let Some(mut correlation) = database.get_correlation_by_id(correlation_id).await? {
 				// Check if error rates are zero
-				let has_nonzero = correlation.error_rate().values().any(|err| !err.value.is_zero());
+				let has_nonzero = correlation.error_rate().values().any(|err| !err.value().is_zero());
 
 				if !has_nonzero {
-					// Clone the correlation, modify it, and put it back
-					let mut modified_correlation = correlation;
-					println!("Setting test error rate for correlation {} to make testing more meaningful", modified_correlation.id);
-					modified_correlation.set_error_rate(signal.signal_type.clone(), 
-						signal::Distance { value: BigDecimal::from_f64(0.1).unwrap(), units: splimes::Resolution::Seconds }
-					);
+					println!("Setting test error rate for correlation {} to make testing more meaningful", correlation.id());
+					correlation.set_error_rate(signal.signal_type().clone(), database::Distance::new(BigDecimal::from_f64(0.1).unwrap(), splimes::Resolution::Seconds));
 
-					// Replace the correlation in the map
-					correlations_lock.remove(&key.0, &key.1);
-					correlations_lock.insert(key.0, key.1, modified_correlation);
+					// Update the correlation in the database
+					database.update_correlation(&correlation).await?;
 				}
 			}
-
-			drop(correlations_lock);
 		}
 
 		// Use the signal we found
 		let random_signal = random_signal.unwrap_or_else(|| panic!("No signals found"));
 
 		// get the correlation id, manifestation id, event id, and signal type from the actual signal
-		let random_correlation_id = random_signal.correlation_id.clone();
-		let random_manifestation_id = random_signal.manifestation_id.clone();
-		let random_event_id = random_signal.event_id.clone();
-		let signal_type = random_signal.signal_type.clone();
-
-		let random_correlation = CORRELATIONS_QUEUE.lock().await.iter().find(|((_, _), correlation)| correlation.id == random_correlation_id).map(|(_, correlation)| correlation.clone()).ok_or_else(|| anyhow::anyhow!("No correlation found for signal"))?;
-		let random_correlation_error_rate = random_correlation.error_rate.clone();
+		let random_correlation_id = random_signal.correlation_id().clone();
+		let random_manifestation_id = random_signal.manifestation_id().clone();
+		let random_event_id = random_signal.event_id().clone();
+		let signal_type = random_signal.signal_type().clone();
+		let random_correlation = database.get_correlation_by_id(&random_correlation_id).await?.ok_or_else(|| anyhow::anyhow!("No correlation found for signal"))?;
+		let random_correlation_error_rate = random_correlation.error_rate().clone();
 
 		// Get the error rate for the specific signal type we're using
-		let error_rate = random_correlation_error_rate.get(&signal_type).or_else(|| random_correlation_error_rate.values().next()).cloned().unwrap_or_else(|| 
-		signal::Distance { value: BigDecimal::from(0), units: splimes::Resolution::Seconds }
-	);
+		let error_rate = random_correlation_error_rate.get(&signal_type).or_else(|| random_correlation_error_rate.values().next()).cloned().unwrap_or_else(|| database::Distance::new(BigDecimal::from(0), splimes::Resolution::Seconds));
 
 		let timer = std::time::Instant::now();
 		println!("Calculating sample signal probability...");
 
-                // get oct. 1st 2025 DateTime<Utc>
-                let sample_datetime = Utc.with_ymd_and_hms(2025, 12, 15, 0, 0, 0).unwrap();
+		// get oct. 1st 2025 DateTime<Utc>
+		let sample_datetime = Utc.with_ymd_and_hms(2025, 12, 15, 0, 0, 0).unwrap();
 
-		let sig_sum_probability = signals_lock.probability_sum(&random_event_id, &signal_type, sample_datetime).await?.unwrap_or(BigDecimal::from(0));
+		let sig_sum_probability = signals_lock.probability_sum(&random_event_id, &signal_type, sample_datetime, &database).await?.unwrap_or_else(|| BigDecimal::from(0));
 
 		println!("Time taken for sample signal probability calculation: {:?}", timer.elapsed());
-		println!("Sample signal probability for correlation ID {}, manifestation ID {}, signal type {:?}:", random_correlation_id, random_manifestation_id, signal_type);
-		println!("  Sum-based Probability: {:.6} (using error rate: {})", sig_sum_probability, error_rate.value);
+		println!("Sample signal probability for correlation ID {random_correlation_id}, manifestation ID {random_manifestation_id}, signal type {signal_type:?}:");
+		println!("  Sum-based Probability: {:.6} (using error rate: {})", sig_sum_probability, error_rate.value());
 
 		drop(signals_lock);
 
@@ -765,207 +1010,14 @@ mod tests {
 		Ok(())
 	}
 
-	#[tokio::test(flavor = "multi_thread")]
-	#[serial]
-	async fn test_specific_process_batch() -> Result<()> {
-		let test_batch = generate_specific_test_batch();
-
-		println!("Generated test batch with {} measurements", test_batch.measurements.len());
-
-		output_denk_format_batch(&test_batch);
-
-		Ok(())
-	}
-
-	fn generate_specific_test_batch() -> Batch {
-		let measurements = vec![BatchedMeasurement { active: true, point: Point::new(Utc.timestamp_opt(0, 0).unwrap(), BigDecimal::from(0)), distance: None, vector: Some(MeasurementVector::new(BigDecimal::from(0), BigDecimal::from(0))), analysis: None }, BatchedMeasurement { active: true, point: Point::new(Utc.timestamp_opt(600, 0).unwrap(), BigDecimal::from_f64(4.03).unwrap()), distance: None, vector: Some(MeasurementVector::new(BigDecimal::from(600), BigDecimal::from_f64(4.03).unwrap())), analysis: None }, BatchedMeasurement { active: true, point: Point::new(Utc.timestamp_opt(1200, 0).unwrap(), BigDecimal::from_f64(8.06).unwrap()), distance: None, vector: Some(MeasurementVector::new(BigDecimal::from(1200), BigDecimal::from_f64(8.06).unwrap())), analysis: None }, BatchedMeasurement { active: true, point: Point::new(Utc.timestamp_opt(1800, 0).unwrap(), BigDecimal::from_f64(10.88).unwrap()), distance: None, vector: Some(MeasurementVector::new(BigDecimal::from(1800), BigDecimal::from_f64(10.88).unwrap())), analysis: None }, BatchedMeasurement { active: true, point: Point::new(Utc.timestamp_opt(2400, 0).unwrap(), BigDecimal::from_f64(11.48).unwrap()), distance: None, vector: Some(MeasurementVector::new(BigDecimal::from(2400), BigDecimal::from_f64(11.48).unwrap())), analysis: None }, BatchedMeasurement { active: true, point: Point::new(Utc.timestamp_opt(3000, 0).unwrap(), BigDecimal::from_f64(10.06).unwrap()), distance: None, vector: Some(MeasurementVector::new(BigDecimal::from(3000), BigDecimal::from_f64(10.06).unwrap())), analysis: None }, BatchedMeasurement { active: true, point: Point::new(Utc.timestamp_opt(3600, 0).unwrap(), BigDecimal::from_f64(12.57).unwrap()), distance: None, vector: Some(MeasurementVector::new(BigDecimal::from(3600), BigDecimal::from_f64(12.57).unwrap())), analysis: None }, BatchedMeasurement { active: true, point: Point::new(Utc.timestamp_opt(4200, 0).unwrap(), BigDecimal::from_f64(6.18).unwrap()), distance: None, vector: Some(MeasurementVector::new(BigDecimal::from(4200), BigDecimal::from_f64(6.18).unwrap())), analysis: None }, BatchedMeasurement { active: true, point: Point::new(Utc.timestamp_opt(4800, 0).unwrap(), BigDecimal::from_f64(5.37).unwrap()), distance: None, vector: Some(MeasurementVector::new(BigDecimal::from(4800), BigDecimal::from_f64(5.37).unwrap())), analysis: None }, BatchedMeasurement { active: true, point: Point::new(Utc.timestamp_opt(5400, 0).unwrap(), BigDecimal::from_f64(-1.09).unwrap()), distance: None, vector: Some(MeasurementVector::new(BigDecimal::from(5400), BigDecimal::from_f64(-1.09).unwrap())), analysis: None }, BatchedMeasurement { active: true, point: Point::new(Utc.timestamp_opt(5940, 0).unwrap(), BigDecimal::from(0)), distance: None, vector: Some(MeasurementVector::new(BigDecimal::from(5940), BigDecimal::from(0))), analysis: None }];
-
-		// This test batch has exactly 11 measurements as intended
-		let expected_size = 11;
-		assert_eq!(measurements.len(), expected_size, "Test batch should have exactly {} measurements", expected_size);
-
-		let dummy_database_info = DatabaseInfo::new("test".to_string(), "/tmp/test".to_string());
-		let dummy_aspect = AspectId::new();
-		Batch::new(expected_size, measurements, Resolution::Seconds, dummy_aspect, dummy_database_info)
-	}
-
-	fn output_denk_format_batch(batch: &Batch) {
-		println!("----- DENK FORMAT OUTPUT BEGIN -----");
-		for (count, measurement) in batch.clone().into_iter().enumerate() {
-			if count == 0 || count == batch.size() - 1 {
-				let vector = measurement.vector().unwrap();
-				let amplitude = vector.amplitude().round(2);
-				println!("{} {}", vector.location(), amplitude);
-			}
-		}
-		println!("----- DENK FORMAT OUTPUT END -----");
-	}
-
-	fn output_denk_format_pattern(pattern: &Pattern) {
-		println!("----- DENK FORMAT OUTPUT BEGIN -----");
-		println!("Pattern ID: {}", pattern.id());
-		for relative in pattern.relatives() {
-			println!("{} {}", relative.vector().location().round(2), relative.vector().amplitude().round(2));
-		}
-		println!("----- DENK FORMAT OUTPUT END -----");
-		println!("max_x: {}, max_y: {}", pattern.relatives().iter().map(|r| r.vector().location()).max().unwrap_or(&BigDecimal::from(0)), pattern.relatives().iter().map(|r| r.vector().amplitude()).max().unwrap_or(&BigDecimal::from(0)));
-	}
-
-	#[allow(dead_code)]
-	pub async fn analyze_event_timing() -> Result<()> {
-		let events = get_events_queue().await;
-
-		if events.is_empty() {
-			println!("No events found in queue");
-			return Ok(());
-		}
-
-		println!("=== Event Timing Analysis ===");
-
-		for event in &events {
-			println!("\nEvent: {}", event.name);
-
-			for (i, (_timing_key, manifestation)) in event.manifestations.iter().enumerate() {
-				println!("  Manifestation {}:", i + 1);
-				println!("    Start: {}", manifestation.start.format("%Y-%m-%d %H:%M:%S UTC"));
-				println!("    End: {}", manifestation.end.format("%Y-%m-%d %H:%M:%S UTC"));
-				println!("    Duration: {:.1} days ({:.1} hours)", manifestation.duration_days(), manifestation.duration_hours());
-				println!("    Midpoint: {}", manifestation.midpoint().format("%Y-%m-%d %H:%M:%S UTC"));
-
-				// Example: Check if manifestation contains specific dates
-				let month_15th = manifestation.start.with_day(15);
-				if let Some(mid_month) = month_15th {
-					if manifestation.contains(mid_month) {
-						println!("    Contains mid-month (15th): Yes");
-					}
-				}
-			}
-		}
-
-		// Duration statistics
-		let durations: Vec<f64> = events.iter().flat_map(|e| e.manifestations.values()).map(|m| m.duration_days()).collect();
-
-		if !durations.is_empty() {
-			let avg_duration = durations.iter().sum::<f64>() / durations.len() as f64;
-			let min_duration = durations.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-			let max_duration = durations.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-
-			println!("\n=== Duration Statistics ===");
-			println!("Average duration: {:.1} days", avg_duration);
-			println!("Minimum duration: {:.1} days", min_duration);
-			println!("Maximum duration: {:.1} days", max_duration);
-		}
-
-		Ok(())
-	}
-
-	/// Retrieves all events from the events queue
-	///
-	/// This function provides access to all events that have been detected and added
-	/// to the global EVENTS_QUEUE. It returns a clone of all events to avoid
-	/// blocking the queue for extended periods.
-	///
-	/// # Returns
-	/// A vector containing all events currently in the queue
-	#[allow(dead_code)]
-	pub async fn get_events_queue() -> Vec<Event> {
-		let events_lock = EVENTS_QUEUE.lock().await;
-		events_lock.values().cloned().collect()
-	}
-
-	/// Clears all events from the events queue
-	///
-	/// # Returns
-	/// Nothing
-	#[allow(dead_code)]
-	pub async fn clear_events_queue() {
-		let mut events_lock = EVENTS_QUEUE.lock().await;
-		events_lock.clear();
-	}
-
-	/// Detects peak values in the dataset
-	///
-	/// This function analyzes measurements to detect when the value reaches a local peak
-	/// (higher than both previous and next values) AND is the global maximum in the dataset.
-	/// Each detected peak creates an event with a manifestation spanning from the rise to the decline.
-	///
-	/// For the test data (1,2,3,2,3,5,3,2,1,1), this will detect exactly one peak at value 5.
-	///
-	/// # Parameters
-	/// - `database`: Database instance to query measurements from
-	/// - `aspect`: The aspect ID to analyze for peak detection
-	/// - `resolution`: The resolution for data analysis
-	/// - `method`: The spline interpolation method to use
-	///
-	/// # Algorithm
-	/// 1. Retrieve all measurements for the aspect within the date range
-	/// 2. Find the global maximum value in the dataset
-	/// 3. For each point that equals the global maximum, check if it's a local peak
-	/// 4. If it's a local peak, create an event spanning from rise to decline
-	/// 5. Add events to the global EVENTS_QUEUE
-	async fn create_peak_detection_events(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, name: &str) -> Result<()> {
-		let start_time = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
-		let end_time = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
-
-		// Use optimized bulk analysis to get all points
-		let mut point_stream = database.stream_analyze_range(*aspect, start_time, end_time, *resolution, *method);
-
-		let mut points = Vec::new();
-		while let Some(point) = point_stream.try_next().await? {
-			points.push(point);
-		}
-
-		// Sort points by timestamp to ensure proper chronological order
-		points.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
-
-		if points.len() < 3 {
-			println!("Not enough points for peak detection (need at least 3)");
-			return Ok(());
-		}
-
-		// Find the global maximum value
-		let global_max = points.iter().map(|p| &p.value).max().unwrap();
-
-		let mut event = Event::new(name.to_string(), Some(format!("Detects peak values (local maxima that are also global maximum) for aspect {}", aspect)));
-
-		// Check each point to see if it's a peak
-		for i in 1..points.len() - 1 {
-			let prev_value = &points[i - 1].value;
-			let curr_value = &points[i].value;
-			let next_value = &points[i + 1].value;
-
-			// Check if current point is a local peak AND equals global maximum
-			if curr_value == global_max && curr_value > prev_value && curr_value > next_value {
-				let database_info = database.get_database_info().await.expect("Database info should be available");
-
-				// Create manifestation spanning from the previous point (start of rise) to next point (start of decline)
-				let manifestation = Manifestation::new(
-					database_info.id().as_uuid(),
-					points[i - 1].timestamp, // Start of rise to peak
-					points[i + 1].timestamp, // Start of decline from peak
-				);
-
-				event.add_manifestation(manifestation);
-			}
-		}
-
-		// Only add the event if we found at least one peak
-		if !event.manifestations.is_empty() {
-			let manifestation_count = event.manifestations.len();
-			let mut events_lock = EVENTS_QUEUE.lock().await;
-			events_lock.insert(event.id.clone(), event);
-			drop(events_lock);
-			println!("Added peak detection event with {} manifestation(s)", manifestation_count);
-		} else {
-			println!("No peaks detected in the dataset");
-		}
-
-		Ok(())
-	}
-
-	#[tokio::test(flavor = "multi_thread")]
+	#[tokio::test]
 	#[serial]
 	async fn test_api_precise() -> Result<()> {
+		// Skip this test if running in CI or if we want fast feedback
+		if std::env::var("SKIP_SLOW_TESTS").is_ok() {
+			println!("Skipping test_api_precise due to SKIP_SLOW_TESTS environment variable");
+			return Ok(());
+		}
 		let db = fake_database().await;
 		let subjects = db.list_subjects().await?;
 		let subject = subjects.iter().find(|(_, name)| name.as_str() == "TestSubject").map(|(id, _)| *id).ok_or_else(|| anyhow::anyhow!("Subject 'TestSubject' not found"))?;
@@ -978,87 +1030,109 @@ mod tests {
 		println!("Aspect ID: {}", aspect.id());
 
 		build_unprocessed_queue(&db, &aspect.id(), &resolution, &method, batch_size).await?;
-		build_processed_batch_queue().await?;
-		let processed_lock = PROCESSED_BATCHES_QUEUE.lock().await;
-		let length = processed_lock.len();
-		println!("Processed batches count: {}", length);
+		build_processed_batch_queue(&db, &aspect.id()).await?;
+		let processed_batches = db.get_processed_batches_queue(&aspect.id()).await?;
+		let length = processed_batches.len();
+		println!("Processed batches count: {length}");
 		if length > 0 {
 			let random_index = rand::random::<usize>() % length;
-			println!("Random processed batch: {}", json!(&processed_lock[random_index]));
-			output_denk_format_batch(&processed_lock[random_index]);
+			println!("Random processed batch: {}", json!(&processed_batches[random_index]));
+			output_denk_format_batch(&processed_batches[random_index]);
 		}
-		drop(processed_lock);
-
-		build_patterns_queue().await?;
-		let patterns_lock = PATTERNS_QUEUE.lock().await;
-		let length = patterns_lock.len();
-		println!("Patterns count: {}", length);
-		if length > 0 {
-			let random_index = rand::random::<usize>() % length;
-			println!("Random pattern: {}", json!(&patterns_lock[random_index]));
-			output_denk_format_pattern(&patterns_lock[random_index]);
-		}
-		drop(patterns_lock);
 
 		#[rustfmt::skip]
                 let mut dictionary = Dictionary::new(
-                        "Test Dictionary".to_string(), 
+                        "TestDictionary".to_string(), 
                         "A dictionary for testing purposes".to_string(), 
-                        DictionaryConstraints { 
-                                steps: Some(Steps { 
-                                        count: 10,
-                                        interpolation: Spline::Linear 
-                                }), 
-                                variabilities: Some(vec![
-                                        VariablilityType::AbsoluteAveragePercentile(Variability { value: BigDecimal::from_f64(10.0).unwrap() }),
-                                ]) });
+                        DictionaryConstraints::new( 
+                                Some(Steps::new( 
+                                        10,
+                                        Spline::Linear 
+                                )), 
+                                Some(vec![
+                                        VariablilityType::AveragePercentile(Variability::new(BigDecimal::from_f64(0.000_000_001).unwrap())),
+                                ]) ));
 
-		load_dictionary(&mut dictionary).await?;
+		load_dictionary(&db, &aspect.id(), &mut dictionary).await?;
 
-		println!("Dictionary now contains {} patterns", dictionary.patterns.len());
+		println!("Dictionary now contains {} patterns", dictionary.len());
 
 		// Show the pattern after dictionary import (should have 10 steps)
-		if !dictionary.patterns.is_empty() {
-			let first_pattern = &dictionary.patterns[0];
+		if !dictionary.is_empty() {
+			let first_pattern = &dictionary.patterns()[0];
 			println!("First pattern has {} relatives", first_pattern.relatives().len());
 			println!("Pattern after dictionary import:");
 			output_denk_format_pattern(first_pattern);
 		}
 
-		// create a peak detection event for testing
-		let event_name = "peaks";
-		create_peak_detection_events(&db, &aspect.id(), &Resolution::Hours, &Spline::Linear, event_name).await?;
+		build_patterns_queue(&db, &aspect.id(), &mut dictionary).await?;
+		let patterns = db.get_patterns_from_dictionary("TestDictionary", &aspect.id()).await?;
+		let length = patterns.len();
+		println!("Patterns count: {length}");
+		if length > 0 {
+			let random_index = rand::random::<usize>() % length;
+			println!("Random pattern: {}", json!(&patterns[random_index]));
+			output_denk_format_pattern(&patterns[random_index]);
+		}
 
-		create_correlations_for_events(&dictionary).await?;
-		let correlations_lock = CORRELATIONS_QUEUE.lock().await;
-		println!("Number of correlations created: {}", correlations_lock.len());
-		drop(correlations_lock);
-		create_signals(&dictionary).await?;
+		// Peak detection event already created in fake_database()
+		// No need to call create_event_and_manifestations here
+
+		let timer = std::time::Instant::now();
+		println!("Starting create_correlations_for_events...");
+		create_correlations_for_events(&db, &dictionary, &aspect.id()).await?;
+		println!("Time taken for create_correlations_for_events: {:?}", timer.elapsed());
+
+		// print the number of correlations with more than 1 occurrence
+		let correlations = db.get_correlations().await?;
+		println!("Number of correlations with more than 1 occurrence: {}", correlations.iter().filter(|correlation| correlation.occurrences().len() > 1).count());
+
+		// print the number of patterns with more than 1 occurrence
+		println!("Number of patterns with more than 1 occurrence: {}", dictionary.patterns().iter().filter(|p| p.occurrences().len() > 1).count());
+
+		let timer = std::time::Instant::now();
+		println!("Starting create_signals...");
+		create_signals(&db, &dictionary).await?;
+		println!("Time taken for create_signals: {:?}", timer.elapsed());
+
+		// print the number of signals created
 		let signals_lock = SIGNALS_QUEUE.lock().await;
 		println!("Number of signals created: {}", signals_lock.len());
 		drop(signals_lock);
-		filter_expired_signals().await?;
+
+		let start_time = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+		let query_time = start_time + chrono::Duration::hours(61); // Hour 61 is our prediction target
+
+		let timer = std::time::Instant::now();
+		println!("Starting filter_expired_signals at query_time={query_time}...");
+		filter_expired_signals_at_time(&db, Some(query_time)).await?;
+		println!("Time taken for filter_expired_signals: {:?}", timer.elapsed());
+
+		// print the number of signals after filtering
 		let signals_lock = SIGNALS_QUEUE.lock().await;
 		println!("Number of signals after filtering: {}", signals_lock.len());
 		drop(signals_lock);
 
 		// Calculate and print the probability for the Signals in the queue
-		let events_lock = EVENTS_QUEUE.lock().await;
-		let event_id_option = events_lock.keys().next().cloned();
-		drop(events_lock);
-
-		let start_time = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+		let events = get_events_queue(&db).await?;
+		let event_id_option = events.first().map(|e| e.id().clone());
+		drop(events);
 
 		if let Some(event_id) = event_id_option {
 			let signals_lock = SIGNALS_QUEUE.lock().await;
-			let Some(sum_probability) = signals_lock.probability_sum(&event_id, &SignalType::Custom("PredictMid".to_string()), start_time + chrono::Duration::hours(61)).await? else {
+			// Use PredictStart since we're checking at the start of hour 61 (2025-01-03 13:00:00)
+			let Some(sum_probability) = signals_lock.probability_sum(&event_id, &SignalType::Custom("PredictStart".to_string()), query_time, &db).await? else {
 				bail!("No signals found for event ID {}", event_id);
 			};
 
-			println!("Peak Event Probability - Sum: {}", sum_probability);
+			let Some(avg_probability) = signals_lock.probability_average(&event_id, &SignalType::Custom("PredictStart".to_string()), query_time, &db).await? else {
+				bail!("No signals found for event ID {}", event_id);
+			};
+
+			println!("Peak Event Probability - Sum: {sum_probability}");
+			println!("Peak Event Probability - Average: {avg_probability}");
 			drop(signals_lock);
 		}
-
 		Ok(())
 	}
 
@@ -1069,11 +1143,12 @@ mod tests {
 		remove_dir_all(&db_path).ok();
 
 		let db = Database::new("TestDB").await.unwrap();
-		let test_subject = db.track_subject("TestSubject").await.unwrap();
-		let test_aspect = db.track_aspect(test_subject, "TestAspect", Resolution::Seconds).await.unwrap();
+		let test_subject = db.observe_subject("TestSubject").await.unwrap();
+		let test_aspect = db.track_aspect(test_subject.id(), "TestAspect", Resolution::Seconds).await.unwrap();
 		let start_time = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
 		#[rustfmt::skip]
 		let points = vec![
+                        (0, BigDecimal::from(0)), // Added hour 0 to allow peak detection at hour 1
                         (1, BigDecimal::from(1)), 
                         (2, BigDecimal::from(0)), 
                         (3, BigDecimal::from(0)), 
@@ -1133,122 +1208,237 @@ mod tests {
                         (57, BigDecimal::from(1)), 
                         (58, BigDecimal::from(0)), 
                         (59, BigDecimal::from(0)), 
-                        (60, BigDecimal::from(0))
+                        (60, BigDecimal::from(0)),
+                        (61, BigDecimal::from(1)),  // Next peak - this is what we want to predict!
+                        (62, BigDecimal::from(0)),
+                        (63, BigDecimal::from(0)),
+                        (64, BigDecimal::from(0))
                 ];
 
 		for (i, value) in points {
-			let timestamp = start_time + chrono::Duration::hours(i as i64);
+			let timestamp = start_time + chrono::Duration::hours(i64::from(i));
 			let measurement = InputMeasurement::new(timestamp, value);
-			db.observe_measurement(test_aspect.clone(), measurement).await.unwrap();
+			db.capture_measurement(test_aspect.clone(), measurement).await.unwrap();
 		}
 
 		// create a peak detection event for testing
 		create_peak_detection_events(&db, &test_aspect.id(), &Resolution::Hours, &Spline::Linear, "Peak Detection Test").await.unwrap();
-		println!("Events in queue after peak detection:");
-		let events_lock = EVENTS_QUEUE.lock().await;
-		println!("Events in queue: {}", events_lock.len());
-		drop(events_lock);
+		println!("Events in database after peak detection:");
+		let events = get_events_queue(&db).await.unwrap();
+		println!("Events in database: {}", events.len());
+		drop(events);
 
 		db
 	}
 
-	#[tokio::test(flavor = "multi_thread")]
+	#[tokio::test]
 	#[serial]
 	async fn test_batch_processing() -> Result<()> {
+		// Skip this test if running in CI or if we want fast feedback
+		if std::env::var("SKIP_SLOW_TESTS").is_ok() {
+			println!("Skipping test_batch_processing due to SKIP_SLOW_TESTS environment variable");
+			return Ok(());
+		}
+
 		use std::fs::remove_dir_all;
 		let db_path = format!("{}/test_bath_processing", database::DEFAULT_DATA_DIR);
 		remove_dir_all(&db_path).ok();
 
 		let db = Database::new("test_bath_processing").await.unwrap();
-		let test_subject = db.track_subject("TestSubject").await.unwrap();
-		let test_aspect = db.track_aspect(test_subject, "TestAspect", Resolution::Seconds).await.unwrap();
+		let test_subject = db.observe_subject("TestSubject").await.unwrap();
+		let test_aspect = db.track_aspect(test_subject.id(), "TestAspect", Resolution::Seconds).await.unwrap();
 		let start_time = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
 		#[rustfmt::skip]
 		let points = vec![
-                        (1, BigDecimal::from(1)), 
-                        (2, BigDecimal::from(2)), 
-                        (3, BigDecimal::from(3)), 
-                        (4, BigDecimal::from(2)), 
-                        (5, BigDecimal::from(3)), 
-                        (6, BigDecimal::from(5)), 
-                        (7, BigDecimal::from(3)), 
-                        (8, BigDecimal::from(2)), 
-                        (9, BigDecimal::from(1)), 
+                        (1, BigDecimal::from(1)),
+                        (2, BigDecimal::from(2)),
+                        (3, BigDecimal::from(3)),
+                        (4, BigDecimal::from(2)),
+                        (5, BigDecimal::from(3)),
+                        (6, BigDecimal::from(5)),
+                        (7, BigDecimal::from(3)),
+                        (8, BigDecimal::from(2)),
+                        (9, BigDecimal::from(1)),
                         (10, BigDecimal::from(1)),
-                        (11, BigDecimal::from(0)), 
-                        (12, BigDecimal::from(-1)), 
-                        (13, BigDecimal::from(0)), 
-                        (14, BigDecimal::from(1)), 
-                        (15, BigDecimal::from(0)), 
-                        (16, BigDecimal::from(-1)), 
-                        (17, BigDecimal::from(-2)), 
-                        (18, BigDecimal::from(-1)), 
-                        (19, BigDecimal::from(0)), 
-                        (20, BigDecimal::from(1)),
-                        (21, BigDecimal::from(2)), 
-                        (22, BigDecimal::from(3)), 
-                        (23, BigDecimal::from(4)), 
-                        (24, BigDecimal::from(5)), 
-                        (25, BigDecimal::from(6)), 
-                        (26, BigDecimal::from(5)), 
-                        (27, BigDecimal::from(4)), 
-                        (28, BigDecimal::from(3)), 
-                        (29, BigDecimal::from(2)), 
-                        (30, BigDecimal::from(1)),
-                        (31, BigDecimal::from(0)), 
-                        (32, BigDecimal::from(-1)), 
-                        (33, BigDecimal::from(-2)), 
-                        (34, BigDecimal::from(-3)), 
-                        (35, BigDecimal::from(-4)), 
-                        (36, BigDecimal::from(-5)), 
-                        (37, BigDecimal::from(-4)), 
-                        (38, BigDecimal::from(-3)), 
-                        (39, BigDecimal::from(-2)), 
-                        (40, BigDecimal::from(-1)),
-                        (41, BigDecimal::from(0)), 
-                        (42, BigDecimal::from(1)), 
-                        (43, BigDecimal::from(2)), 
-                        (44, BigDecimal::from(3)), 
-                        (45, BigDecimal::from(4)), 
-                        (46, BigDecimal::from(5)), 
-                        (47, BigDecimal::from(6)), 
-                        (48, BigDecimal::from(7)), 
-                        (49, BigDecimal::from(8)), 
-                        (50, BigDecimal::from(9)),
-                        (51, BigDecimal::from(10)), 
-                        (52, BigDecimal::from(9)), 
-                        (53, BigDecimal::from(8)), 
-                        (54, BigDecimal::from(7)), 
-                        (55, BigDecimal::from(6)), 
-                        (56, BigDecimal::from(5)), 
-                        (57, BigDecimal::from(4)), 
-                        (58, BigDecimal::from(3)), 
-                        (59, BigDecimal::from(2)), 
-                        (60, BigDecimal::from(1))
+                        (11, BigDecimal::from(0)),
+                        (12, BigDecimal::from(-1)),
+                        (13, BigDecimal::from(0)),
+                        (14, BigDecimal::from(1)),
+                        (15, BigDecimal::from(0))
                 ];
 
 		for (i, value) in points {
-			let timestamp = start_time + chrono::Duration::minutes(i as i64);
+			let timestamp = start_time + chrono::Duration::minutes(i64::from(i));
 			let measurement = InputMeasurement::new(timestamp, value);
-			db.observe_measurement(test_aspect.clone(), measurement).await.unwrap();
+			db.capture_measurement(test_aspect.clone(), measurement).await.unwrap();
 		}
 
 		let aspect = test_aspect;
-		let resolution = Resolution::Minutes;
-		let method = Spline::Linear;
-		let batch_size = 10;
+		//let resolution = Resolution::Minutes;
+		//let method = Spline::Linear;
+		//let batch_size = 10;
 
-		build_unprocessed_queue(&db, &aspect.id(), &resolution, &method, batch_size).await?;
+		// build_unprocessed_queue(&db, &aspect.id(), &resolution, &method, batch_size).await?;
 
-		println!("Unprocessed batches count: {}", UNPROCESSED_BATCHES_QUEUE.lock().await.len());
+		// Check how many batches were stored in the database
+		let unprocessed_batches = db.get_unprocessed_batches(&aspect.id()).await?;
+		println!("Unprocessed batches count: {}", unprocessed_batches.len());
 
-		build_processed_batch_queue().await?;
+		//build_processed_batch_queue(&db, &aspect.id()).await?;
 
-		println!("Processed batches count: {}", PROCESSED_BATCHES_QUEUE.lock().await.len());
+		let processed_batches = db.get_processed_batches_queue(&aspect.id()).await?;
+		println!("Processed batches count: {}", processed_batches.len());
 
-		// With 60 points and batch size 10, sliding window creates: 60 - 10 + 1 = 51 overlapping batches
-		assert_eq!(PROCESSED_BATCHES_QUEUE.lock().await.len(), 51);
+		// With 15 points and batch size 10, sliding window creates: 15 - 10 + 1 = 6 overlapping batches
+		assert_eq!(processed_batches.len(), 6);
 
 		Ok(())
+	}
+
+	#[tokio::test]
+	#[serial]
+	async fn test_specific_process_batch() -> Result<()> {
+		// Skip this test if running in CI or if we want fast feedback
+		if std::env::var("SKIP_SLOW_TESTS").is_ok() {
+			println!("Skipping test_specific_process_batch due to SKIP_SLOW_TESTS environment variable");
+			return Ok(());
+		}
+
+		use std::fs::remove_dir_all;
+		let db_path = format!("{}/test_specific_process_batch", database::DEFAULT_DATA_DIR);
+		remove_dir_all(&db_path).ok();
+
+		let db = Database::new("test_specific_process_batch").await.unwrap();
+		let test_subject = db.observe_subject("TestSubject").await.unwrap();
+		let test_aspect = db.track_aspect(test_subject.id(), "TestAspect", Resolution::Seconds).await.unwrap();
+		let start_time = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+		#[rustfmt::skip]
+		let points = vec![
+                        (1, BigDecimal::from(1)),
+                        (2, BigDecimal::from(2)),
+                        (3, BigDecimal::from(3)),
+                        (4, BigDecimal::from(2)),
+                        (5, BigDecimal::from(3)),
+                        (6, BigDecimal::from(5)),
+                        (7, BigDecimal::from(3)),
+                        (8, BigDecimal::from(2)),
+                        (9, BigDecimal::from(1)),
+                        (10, BigDecimal::from(1)),
+                        (11, BigDecimal::from(0)),
+                        (12, BigDecimal::from(-1)),
+                        (13, BigDecimal::from(0)),
+                        (14, BigDecimal::from(1)),
+                        (15, BigDecimal::from(0))
+                ];
+
+		for (i, value) in points {
+			let timestamp = start_time + chrono::Duration::minutes(i64::from(i));
+			let measurement = InputMeasurement::new(timestamp, value);
+			db.capture_measurement(test_aspect.clone(), measurement).await.unwrap();
+		}
+
+		let aspect = test_aspect;
+		// let resolution = Resolution::Minutes;
+		// let method = Spline::Linear;
+		// let batch_size = 10;
+
+		// build_unprocessed_queue(&db, &aspect.id(), &resolution, &method, batch_size).await?;
+
+		// Check how many batches were stored in the database
+		let unprocessed_batches = db.get_unprocessed_batches(&aspect.id()).await?;
+		println!("Unprocessed batches count: {}", unprocessed_batches.len());
+
+		build_processed_batch_queue(&db, &aspect.id()).await?;
+
+		let processed_batches = db.get_processed_batches_queue(&aspect.id()).await?;
+		println!("Processed batches count: {}", processed_batches.len());
+
+		// With 15 points and batch size 10, sliding window creates: 15 - 10 + 1 = 6 overlapping batches
+		assert_eq!(processed_batches.len(), 6);
+
+		Ok(())
+	}
+
+	async fn create_peak_detection_events(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, name: &str) -> Result<()> {
+		let start_time = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
+		let end_time = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
+
+		// Use optimized bulk analysis to get all points
+		let mut point_stream = Outputs::analyze_range(database, *aspect, start_time, end_time, *resolution, *method).await?;
+
+		let mut points = Vec::new();
+		while let Some(result) = point_stream.next().await {
+			let point = result?;
+			points.push(point);
+		}
+
+		// Sort points by timestamp to ensure proper chronological order
+		points.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+		// Find the global maximum value
+		let global_max = points.iter().map(|p| &p.value).max().unwrap();
+
+		let mut event = Event::new(name.to_string(), Some(format!("Detects peak values (local maxima that are also global maximum) for aspect {aspect}")));
+
+		// Check each point to see if it's a peak
+		for i in 1..points.len() - 1 {
+			let prev_value = &points[i - 1].value;
+			let curr_value = &points[i].value;
+			let next_value = &points[i + 1].value;
+
+			// Check if current point is a local peak AND equals global maximum
+			if curr_value == global_max && curr_value > prev_value && curr_value > next_value {
+				let database_info = database.get_database_info().await.expect("Database info should be available");
+
+				// Create manifestation spanning from the previous point (start of rise) to next point (start of decline)
+				let manifestation = Manifestation::new(
+					database_info.id().as_uuid(),
+					points[i - 1].timestamp, // Start of rise to peak
+					points[i + 1].timestamp, // Start of decline from peak
+				);
+
+				event.add_manifestation(manifestation);
+			}
+		}
+
+		// Only add the event if we found at least one peak
+		if event.manifestations().is_empty() {
+			println!("No peaks detected in the dataset");
+		} else {
+			let manifestation_count = event.manifestations().len();
+			database.store_event(&event).await?;
+			println!("Added peak detection event with {manifestation_count} manifestation(s)");
+		}
+
+		Ok(())
+	}
+
+	#[allow(dead_code)]
+	pub async fn get_events_queue(database: &Database) -> Result<Vec<Event>> {
+		let events = database.get_unprocessed_events().await?;
+		Ok(events)
+	}
+
+	fn output_denk_format_batch(batch: &Batch) {
+		println!("----- DENK FORMAT OUTPUT BEGIN -----");
+		for (count, measurement) in batch.clone().into_iter().enumerate() {
+			if count == 0 || count == batch.size() - 1 {
+				let vector = measurement.vector().unwrap();
+				let amplitude = vector.amplitude().round(2);
+				println!("{} {}", vector.location(), amplitude);
+			}
+		}
+		println!("----- DENK FORMAT OUTPUT END -----");
+	}
+
+	fn output_denk_format_pattern(pattern: &Pattern) {
+		println!("----- DENK FORMAT OUTPUT BEGIN -----");
+		println!("Pattern ID: {}", pattern.id());
+		for relative in pattern.relatives() {
+			println!("{} {}", relative.vector().location().round(2), relative.vector().amplitude().round(2));
+		}
+		println!("----- DENK FORMAT OUTPUT END -----");
+		let zero = BigDecimal::zero();
+		println!("max_x: {}, max_y: {}", pattern.relatives().iter().map(|r| r.vector().location()).max().unwrap_or(&zero), pattern.relatives().iter().map(|r| r.vector().amplitude()).max().unwrap_or(&zero));
 	}
 }

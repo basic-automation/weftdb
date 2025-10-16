@@ -1,6 +1,8 @@
 use std::{hint::black_box, path::Path, str::FromStr};
 
-use ::database::*;
+use ::database::{
+	database::traits::{DatabaseStructure, Inputs, Outputs}, Database, InputMeasurement
+};
 use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
@@ -42,8 +44,8 @@ fn benchmark_production_workloads(c: &mut Criterion) {
 
 						// Create database and setup data
 						let db = Database::new(&db_name).await.unwrap();
-						let subject = db.track_subject("benchmark_subject").await.unwrap();
-						let aspect = db.track_aspect(subject, "benchmark_aspect", Resolution::Seconds).await.unwrap();
+						let subject = db.observe_subject("benchmark_subject").await.unwrap();
+						let aspect = db.track_aspect(subject.id(), "benchmark_aspect", Resolution::Seconds).await.unwrap();
 
 						// Add test data using batch for efficiency
 						let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -51,7 +53,7 @@ fn benchmark_production_workloads(c: &mut Criterion) {
 						for i in 0..measurement_count {
 							measurements.push(InputMeasurement::new(base_time + Duration::minutes(i as i64 * interval_minutes), BigDecimal::from_str(&format!("{}.0", i * 10)).unwrap()));
 						}
-						db.observe_measurements_batch(aspect.clone(), measurements).await.unwrap();
+						db.batch_capture_measurements(aspect.clone(), measurements).await.unwrap();
 
 						// Calculate analysis parameters
 						let data_start = base_time;
@@ -65,15 +67,16 @@ fn benchmark_production_workloads(c: &mut Criterion) {
 				|(db, aspect_id, start, end, db_path)| {
 					rt.block_on(async {
 						// This is the only part being measured - use coarser resolution
-						let result = Database::analyze_range(
-							aspect_id,
-							start,
-							end,
-							Resolution::Minutes, // Use Minutes instead of Seconds
-							Spline::Linear,
-						)
-						.await
-						.unwrap();
+						let result = db
+							.analyze_range(
+								aspect_id,
+								start,
+								end,
+								Resolution::Minutes, // Use Minutes instead of Seconds
+								Spline::Linear,
+							)
+							.await
+							.unwrap();
 
 						// Immediate cleanup (not measured due to iter_batched)
 						db.close().await.unwrap();
@@ -124,16 +127,16 @@ fn benchmark_full_integration_pipeline(c: &mut Criterion) {
 
 						// Create database
 						let db = Database::new(&db_name).await.unwrap();
-						let subject = db.track_subject("pipeline_subject").await.unwrap();
-						let aspect = db.track_aspect(subject, "pipeline_aspect", Resolution::Seconds).await.unwrap();
+						let subject = db.observe_subject("pipeline_subject").await.unwrap();
+						let aspect = db.track_aspect(subject.id(), "pipeline_aspect", Resolution::Seconds).await.unwrap();
 
 						// Ingest data using batch
 						let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 						let mut measurements = Vec::with_capacity(measurement_count);
 						for i in 0..measurement_count {
-							measurements.push(InputMeasurement::new(base_time + Duration::minutes(i as i64), BigDecimal::from_str(&format!("{}.0", i)).unwrap()));
+							measurements.push(InputMeasurement::new(base_time + Duration::minutes(i as i64), BigDecimal::from_str(&format!("{i}.0")).unwrap()));
 						}
-						db.observe_measurements_batch(aspect.clone(), measurements).await.unwrap();
+						db.batch_capture_measurements(aspect.clone(), measurements).await.unwrap();
 
 						// Define analysis range
 						let start = base_time;
@@ -146,7 +149,7 @@ fn benchmark_full_integration_pipeline(c: &mut Criterion) {
 				|(db, aspect_id, start, end, resolution, db_path)| {
 					rt.block_on(async {
 						// Only this operation is measured
-						let result = Database::analyze_range(aspect_id, start, end, resolution, Spline::Linear).await.unwrap();
+						let result = db.analyze_range(aspect_id, start, end, resolution, Spline::Linear).await.unwrap();
 
 						// Cleanup (not measured)
 						db.close().await.unwrap();

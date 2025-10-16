@@ -1,6 +1,8 @@
 use std::str::FromStr;
 
-use ::database::*;
+use ::database::{
+	database::traits::{DatabaseStructure, Inputs, Outputs}, Database, InputMeasurement
+};
 use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
@@ -19,14 +21,14 @@ fn benchmark_cache_miss_vs_hit(c: &mut Criterion) {
 	let db_name = format!("cache_bench_{}", Uuid::new_v4());
 	let (db, aspect_id) = rt.block_on(async {
 		let db = Database::new(&db_name).await.unwrap();
-		let subject = db.track_subject("cache_subject").await.unwrap();
-		let aspect = db.track_aspect(subject, "cache_aspect", Resolution::Seconds).await.unwrap();
+		let subject = db.observe_subject("cache_subject").await.unwrap();
+		let aspect = db.track_aspect(subject.id(), "cache_aspect", Resolution::Seconds).await.unwrap();
 
 		// Add initial measurements
 		let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 		for i in 0..50 {
-			let measurement = InputMeasurement::new(base_time + Duration::seconds(i * 60), BigDecimal::from_str(&format!("{}.0", i)).unwrap());
-			db.observe_measurement(aspect.clone(), measurement).await.unwrap();
+			let measurement = InputMeasurement::new(base_time + Duration::seconds(i * 60), BigDecimal::from_str(&format!("{i}.0")).unwrap());
+			db.capture_measurement(aspect.clone(), measurement).await.unwrap();
 		}
 		(db, aspect.id())
 	});
@@ -83,14 +85,14 @@ fn benchmark_cache_invalidation(c: &mut Criterion) {
 			rt.block_on(async {
 				let db_name = format!("cache_invalidation_{}", Uuid::new_v4());
 				let db = Database::new(&db_name).await.unwrap();
-				let subject = db.track_subject("invalidation_subject").await.unwrap();
-				let aspect = db.track_aspect(subject, "invalidation_aspect", Resolution::Seconds).await.unwrap();
+				let subject = db.observe_subject("invalidation_subject").await.unwrap();
+				let aspect = db.track_aspect(subject.id(), "invalidation_aspect", Resolution::Seconds).await.unwrap();
 
 				// Add some measurements and analyze
 				let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 				for i in 0..10 {
-					let measurement = InputMeasurement::new(base_time + Duration::seconds(i * 60), BigDecimal::from_str(&format!("{}.0", i)).unwrap());
-					db.observe_measurement(aspect.clone(), measurement).await.unwrap();
+					let measurement = InputMeasurement::new(base_time + Duration::seconds(i * 60), BigDecimal::from_str(&format!("{i}.0")).unwrap());
+					db.capture_measurement(aspect.clone(), measurement).await.unwrap();
 				}
 
 				let analyze_time = base_time + Duration::seconds(300);
@@ -119,14 +121,14 @@ fn benchmark_concurrent_cache_access(c: &mut Criterion) {
 			rt.block_on(async {
 				let db_name = format!("concurrent_cache_{}", Uuid::new_v4());
 				let db = Database::new(&db_name).await.unwrap();
-				let subject = db.track_subject("concurrent_subject").await.unwrap();
-				let aspect = db.track_aspect(subject, "concurrent_aspect", Resolution::Seconds).await.unwrap();
+				let subject = db.observe_subject("concurrent_subject").await.unwrap();
+				let aspect = db.track_aspect(subject.id(), "concurrent_aspect", Resolution::Seconds).await.unwrap();
 
 				// Add measurements
 				let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 				for i in 0..20 {
-					let measurement = InputMeasurement::new(base_time + Duration::seconds(i * 30), BigDecimal::from_str(&format!("{}.0", i)).unwrap());
-					db.observe_measurement(aspect.clone(), measurement).await.unwrap();
+					let measurement = InputMeasurement::new(base_time + Duration::seconds(i * 30), BigDecimal::from_str(&format!("{i}.0")).unwrap());
+					db.capture_measurement(aspect.clone(), measurement).await.unwrap();
 				}
 
 				// Simulate concurrent access
@@ -163,19 +165,19 @@ fn benchmark_cache_memory_usage(c: &mut Criterion) {
 	let memory_sizes = vec![10, 50, 100];
 
 	for size in memory_sizes {
-		group.bench_function(format!("cache_memory_{}_measurements", size), |b| {
+		group.bench_function(format!("cache_memory_{size}_measurements"), |b| {
 			b.iter(|| {
 				rt.block_on(async {
 					let db_name = format!("memory_cache_{}_{}", size, Uuid::new_v4());
 					let db = Database::new(&db_name).await.unwrap();
-					let subject = db.track_subject("memory_subject").await.unwrap();
-					let aspect = db.track_aspect(subject, "memory_aspect", Resolution::Seconds).await.unwrap();
+					let subject = db.observe_subject("memory_subject").await.unwrap();
+					let aspect = db.track_aspect(subject.id(), "memory_aspect", Resolution::Seconds).await.unwrap();
 
 					// Add measurements
 					let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 					for i in 0..size {
-						let measurement = InputMeasurement::new(base_time + Duration::seconds(i as i64 * 60), BigDecimal::from_str(&format!("{}.0", i)).unwrap());
-						db.observe_measurement(aspect.clone(), measurement).await.unwrap();
+						let measurement = InputMeasurement::new(base_time + Duration::seconds(i64::from(i) * 60), BigDecimal::from_str(&format!("{i}.0")).unwrap());
+						db.capture_measurement(aspect.clone(), measurement).await.unwrap();
 					}
 
 					// Perform several analyses to test memory usage
@@ -210,14 +212,14 @@ fn benchmark_cache_eviction_strategies(c: &mut Criterion) {
 			rt.block_on(async {
 				let db_name = format!("eviction_cache_{}", Uuid::new_v4());
 				let db = Database::new(&db_name).await.unwrap();
-				let subject = db.track_subject("eviction_subject").await.unwrap();
-				let aspect = db.track_aspect(subject, "eviction_aspect", Resolution::Seconds).await.unwrap();
+				let subject = db.observe_subject("eviction_subject").await.unwrap();
+				let aspect = db.track_aspect(subject.id(), "eviction_aspect", Resolution::Seconds).await.unwrap();
 
 				// Add many measurements to trigger eviction
 				let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 				for i in 0..200 {
-					let measurement = InputMeasurement::new(base_time + Duration::seconds(i * 30), BigDecimal::from_str(&format!("{}.0", i)).unwrap());
-					db.observe_measurement(aspect.clone(), measurement).await.unwrap();
+					let measurement = InputMeasurement::new(base_time + Duration::seconds(i * 30), BigDecimal::from_str(&format!("{i}.0")).unwrap());
+					db.capture_measurement(aspect.clone(), measurement).await.unwrap();
 				}
 
 				// Perform many different analyses to test eviction

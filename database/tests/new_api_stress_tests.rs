@@ -1,8 +1,9 @@
 use std::{str::FromStr, sync::Arc, time::Duration as StdDuration};
 
+use ::database::database::traits::Inputs;
 use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
-use database::{Database, InputMeasurement};
+use database::{database::traits::DatabaseStructure, Database, InputMeasurement, Outputs};
 // Add this import
 use splimes::{Resolution, Spline};
 use tokio::{sync::Semaphore, time::timeout};
@@ -15,14 +16,14 @@ async fn test_multiple_aspects_same_subject() {
 	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
 
 	let db = Database::new(&db_name).await.expect("Failed to create database");
-	let subject = db.track_subject("multi_aspect_subject").await.expect("Failed to add subject");
+	let subject = db.observe_subject("multi_aspect_subject").await.expect("Failed to add subject");
 
 	// Create multiple aspects
 	let num_aspects = 10;
 	let mut aspects = Vec::new();
 
 	for i in 0..num_aspects {
-		let aspect = db.track_aspect(subject.clone(), &format!("aspect_{}", i), splimes::Resolution::Milliseconds).await.expect("Failed to track aspect");
+		let aspect = db.track_aspect(subject.id(), &format!("aspect_{i}"), splimes::Resolution::Milliseconds).await.expect("Failed to track aspect");
 		aspects.push(aspect);
 	}
 
@@ -33,7 +34,7 @@ async fn test_multiple_aspects_same_subject() {
 		for i in 0..100i64 {
 			// Make i explicitly i64
 			let measurement = InputMeasurement::new(base_time + Duration::minutes(i), BigDecimal::from_str(&format!("{}.{}", aspect_idx * 10 + (i as usize % 10), i % 100)).unwrap());
-			db.observe_measurement(aspect.clone(), measurement).await.expect("Failed to capture multi-aspect measurement");
+			db.capture_measurement(aspect.clone(), measurement).await.expect("Failed to capture multi-aspect measurement");
 		}
 	}
 
@@ -55,24 +56,24 @@ async fn test_high_frequency_measurements() {
 	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
 
 	let db = Database::new(&db_name).await.expect("Failed to create database");
-	let subject = db.track_subject("high_freq_subject").await.expect("Failed to add subject");
-	let aspect = db.track_aspect(subject, "high_freq_aspect", splimes::Resolution::Microseconds).await.expect("Failed to track aspect");
+	let subject = db.observe_subject("high_freq_subject").await.expect("Failed to add subject");
+	let aspect = db.track_aspect(subject.id(), "high_freq_aspect", splimes::Resolution::Microseconds).await.expect("Failed to track aspect");
 
 	// Reduced dataset for faster testing
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap();
 	let num_measurements = 600; // 10 minutes of data
 
-	println!("Capturing {} high-frequency measurements...", num_measurements);
+	println!("Capturing {num_measurements} high-frequency measurements...");
 	let start = std::time::Instant::now();
 
 	for i in 0..num_measurements {
 		let measurement = InputMeasurement::new(base_time + Duration::seconds(i), BigDecimal::from_str(&format!("{}.{}", (i % 100), (i % 10))).unwrap());
 
-		db.observe_measurement(aspect.clone(), measurement).await.expect("Failed to capture measurement");
+		db.capture_measurement(aspect.clone(), measurement).await.expect("Failed to capture measurement");
 
 		if i % 100 == 0 {
 			// Log progress every 100 measurements
-			println!("Captured {} measurements", i);
+			println!("Captured {i} measurements");
 		}
 	}
 
@@ -85,7 +86,7 @@ async fn test_high_frequency_measurements() {
 	let result = db.analyze_point(aspect.id(), target_time, Resolution::Seconds, Spline::Linear).await.expect("Failed to analyze point");
 	let analysis_duration = analysis_start.elapsed();
 
-	println!("Analysis completed in {:?}", analysis_duration);
+	println!("Analysis completed in {analysis_duration:?}");
 	// Don't assert exact timestamp match since interpolation may adjust it
 	assert!(!result.value.to_string().is_empty());
 
@@ -101,21 +102,21 @@ async fn test_concurrent_access() {
 	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
 
 	let db = Database::new(&db_name).await.expect("Failed to create database");
-	let subject = db.track_subject("concurrent_subject").await.expect("Failed to add subject");
-	let aspect = db.track_aspect(subject, "concurrent_aspect", splimes::Resolution::Milliseconds).await.expect("Failed to track aspect");
+	let subject = db.observe_subject("concurrent_subject").await.expect("Failed to add subject");
+	let aspect = db.track_aspect(subject.id(), "concurrent_aspect", splimes::Resolution::Milliseconds).await.expect("Failed to track aspect");
 
 	// Add some initial data
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap();
 	for i in 0..60 {
 		// Reduced initial data
-		let measurement = InputMeasurement::new(base_time + Duration::minutes(i), BigDecimal::from_str(&format!("{}.0", i)).unwrap());
-		db.observe_measurement(aspect.clone(), measurement).await.expect("Failed to capture initial measurement");
+		let measurement = InputMeasurement::new(base_time + Duration::minutes(i), BigDecimal::from_str(&format!("{i}.0")).unwrap());
+		db.capture_measurement(aspect.clone(), measurement).await.expect("Failed to capture initial measurement");
 	}
 
 	let num_concurrent_tasks = 8; // Reduced concurrency
 	let operations_per_task = 20; // Reduced operations
 
-	println!("Running {} concurrent tasks with {} operations each...", num_concurrent_tasks, operations_per_task);
+	println!("Running {num_concurrent_tasks} concurrent tasks with {operations_per_task} operations each...");
 
 	let semaphore = Arc::new(Semaphore::new(4)); // Lower concurrency limit
 	let start = std::time::Instant::now();
@@ -133,8 +134,8 @@ async fn test_concurrent_access() {
 
 					if op_id % 2 == 0 {
 						// Write operation
-						let measurement = InputMeasurement::new(base_time + Duration::minutes(100 + task_id * operations_per_task + op_id), BigDecimal::from_str(&format!("{}.{}", task_id, op_id)).unwrap());
-						db.observe_measurement((*aspect).clone(), measurement).await.expect("Failed to capture concurrent measurement");
+						let measurement = InputMeasurement::new(base_time + Duration::minutes(100 + task_id * operations_per_task + op_id), BigDecimal::from_str(&format!("{task_id}.{op_id}")).unwrap());
+						db.capture_measurement((*aspect).clone(), measurement).await.expect("Failed to capture concurrent measurement");
 					} else {
 						// Read operation - use time within initial data range
 						let target_time = base_time + Duration::minutes((task_id * 5 + op_id / 2) % 50);
@@ -176,32 +177,32 @@ async fn test_large_dataset_analysis() {
 	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
 
 	let db = Database::new(&db_name).await.expect("Failed to create database");
-	let subject = db.track_subject("large_dataset_subject").await.expect("Failed to add subject");
-	let aspect = db.track_aspect(subject, "large_dataset_aspect", splimes::Resolution::Seconds).await.expect("Failed to track aspect");
+	let subject = db.observe_subject("large_dataset_subject").await.expect("Failed to add subject");
+	let aspect = db.track_aspect(subject.id(), "large_dataset_aspect", splimes::Resolution::Seconds).await.expect("Failed to track aspect");
 
 	// Create a smaller dataset for faster testing
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 	let num_measurements = 5000; // Reduced from 10000
 	let time_interval = Duration::minutes(1);
 
-	println!("Creating large dataset with {} measurements...", num_measurements);
+	println!("Creating large dataset with {num_measurements} measurements...");
 	let start = std::time::Instant::now();
 
 	for i in 0..num_measurements {
 		let timestamp = base_time + time_interval * i;
-		let value = (i as f64 / 100.0).sin() * 50.0 + 50.0;
+		let value = (f64::from(i) / 100.0).sin() * 50.0 + 50.0;
 
-		let measurement = InputMeasurement::new(timestamp, BigDecimal::from_str(&format!("{:.2}", value)).unwrap());
+		let measurement = InputMeasurement::new(timestamp, BigDecimal::from_str(&format!("{value:.2}")).unwrap());
 
-		db.observe_measurement(aspect.clone(), measurement).await.expect("Failed to capture large dataset measurement");
+		db.capture_measurement(aspect.clone(), measurement).await.expect("Failed to capture large dataset measurement");
 
 		if i % 1000 == 0 {
-			println!("Captured {} measurements", i);
+			println!("Captured {i} measurements");
 		}
 	}
 
 	let creation_duration = start.elapsed();
-	println!("Created large dataset in {:?}", creation_duration);
+	println!("Created large dataset in {creation_duration:?}");
 
 	// Test analysis performance on large dataset
 	let test_cases = vec![(Spline::Linear, "Linear"), (Spline::Quadratic, "Quadratic"), (Spline::Cubic, "Cubic")];
@@ -214,7 +215,7 @@ async fn test_large_dataset_analysis() {
 		let result = db.analyze_point(aspect.id(), target_time, Resolution::Seconds, spline_type).await.expect("Failed to analyze large dataset point");
 
 		let analysis_duration = analysis_start.elapsed();
-		println!("{} analysis on large dataset completed in {:?}", name, analysis_duration);
+		println!("{name} analysis on large dataset completed in {analysis_duration:?}");
 
 		// Verify result is reasonable
 		assert!(result.value >= BigDecimal::from_str("0.0").unwrap());
@@ -233,8 +234,8 @@ async fn test_memory_usage_stability() {
 	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
 
 	let db = Database::new(&db_name).await.expect("Failed to create database");
-	let subject = db.track_subject("memory_test_subject").await.expect("Failed to add subject");
-	let aspect = db.track_aspect(subject, "memory_test_aspect", splimes::Resolution::Milliseconds).await.expect("Failed to track aspect");
+	let subject = db.observe_subject("memory_test_subject").await.expect("Failed to add subject");
+	let aspect = db.track_aspect(subject.id(), "memory_test_aspect", splimes::Resolution::Milliseconds).await.expect("Failed to track aspect");
 
 	println!("Testing memory usage stability with repeated operations...");
 
@@ -252,7 +253,7 @@ async fn test_memory_usage_stability() {
 				base_time + Duration::seconds(cycle * 100 + i), // Adjusted timing
 				BigDecimal::from_str(&format!("{}.{}", cycle, i % 100)).unwrap(),
 			);
-			db.observe_measurement(aspect.clone(), measurement).await.expect("Failed to capture memory test measurement");
+			db.capture_measurement(aspect.clone(), measurement).await.expect("Failed to capture memory test measurement");
 		}
 
 		// Perform analyses on times within the data range
@@ -283,8 +284,8 @@ async fn test_edge_case_scenarios() {
 	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
 
 	let db = Database::new(&db_name).await.expect("Failed to create database");
-	let subject = db.track_subject("edge_case_subject").await.expect("Failed to add subject");
-	let aspect = db.track_aspect(subject, "edge_case_aspect", splimes::Resolution::Milliseconds).await.expect("Failed to track aspect");
+	let subject = db.observe_subject("edge_case_subject").await.expect("Failed to add subject");
+	let aspect = db.track_aspect(subject.id(), "edge_case_aspect", splimes::Resolution::Milliseconds).await.expect("Failed to track aspect");
 
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap();
 
@@ -298,7 +299,7 @@ async fn test_edge_case_scenarios() {
 
 	for (seconds_offset, value) in sparse_measurements {
 		let measurement = InputMeasurement::new(base_time + Duration::seconds(seconds_offset), BigDecimal::from_str(value).unwrap());
-		db.observe_measurement(aspect.clone(), measurement).await.expect("Failed to capture sparse measurement");
+		db.capture_measurement(aspect.clone(), measurement).await.expect("Failed to capture sparse measurement");
 	}
 
 	// Analyze between sparse points
@@ -317,7 +318,7 @@ async fn test_edge_case_scenarios() {
 			dense_base + Duration::milliseconds(i * 100), // 100ms intervals
 			BigDecimal::from_str(&format!("{}.{:03}", 100, i)).unwrap(),
 		);
-		db.observe_measurement(aspect.clone(), measurement).await.expect("Failed to capture dense measurement");
+		db.capture_measurement(aspect.clone(), measurement).await.expect("Failed to capture dense measurement");
 	}
 
 	// Analyze within dense region
@@ -333,7 +334,7 @@ async fn test_edge_case_scenarios() {
 
 	for (seconds_offset, value) in extreme_measurements {
 		let measurement = InputMeasurement::new(extreme_base + Duration::seconds(seconds_offset), BigDecimal::from_str(value).unwrap());
-		db.observe_measurement(aspect.clone(), measurement).await.expect("Failed to capture extreme measurement");
+		db.capture_measurement(aspect.clone(), measurement).await.expect("Failed to capture extreme measurement");
 	}
 
 	// Analyze between extreme values

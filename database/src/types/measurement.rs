@@ -8,10 +8,10 @@ use crate::InputMeasurement;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Measurement {
-	pub id: Uuid,
-	pub dataset_id: Uuid,
-	pub timestamp: chrono::DateTime<Utc>,
-	pub value: BigDecimal,
+	id: Uuid,
+	dataset_id: Uuid,
+	timestamp: chrono::DateTime<Utc>,
+	value: BigDecimal,
 }
 
 impl Measurement {

@@ -5,7 +5,9 @@ edition = "2021"
 
 [dependencies]
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 bigdecimal = { workspace = true, features = ["serde"] }
+bincode = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 fake = { workspace = true, features = ["derive", "chrono", "bigdecimal", "uuid"] }
 rand = { workspace = true }
@@ -25,10 +27,14 @@ futures = { workspace = true }
 splimes = { workspace = true }
 csv = { workspace = true }
 once_cell = "1.19"
+num_cpus = { workspace = true }
+serde_json = { workspace = true }
+md5 = "0.7"
 
 [dev-dependencies]
 criterion = { workspace = true , features = ["html_reports"] }
 tempfile = { workspace = true }
+serial_test = "3.0"
 
 [[bench]]
 name = "interpolation_benchmarks"

@@ -1,9 +1,11 @@
-use std::str::FromStr;
+use std::{str::FromStr, sync::Arc};
 
+use ::database::database::traits::Inputs;
 use anyhow::{Context, Result};
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use database::{Aspect, Database, InputMeasurement, Subject, DATABASES, DEFAULT_DATA_DIR}; // Added Aspect import
+use database::database::traits::DatabaseStructure;
+use database::{Aspect, Database, InputMeasurement, Outputs, Subject, DATABASES, DEFAULT_DATA_DIR}; // Added Aspect import
 use rayon::prelude::*;
 use splimes::{Resolution, Spline};
 #[cfg(test)]
@@ -19,8 +21,8 @@ async fn setup_test_database() -> Result<(TempDir, Database, Subject, Aspect)> {
 	std::env::set_var("TEST_DATA_DIR", temp_dir.path().to_str().unwrap());
 
 	let db = Database::new(&db_name).await?;
-	let subject = db.track_subject("test_subject").await?;
-	let aspect = db.track_aspect(subject.clone(), "test_aspect", splimes::Resolution::Milliseconds).await?;
+	let subject = db.observe_subject("test_subject").await?;
+	let aspect = db.track_aspect(subject.id(), "test_aspect", splimes::Resolution::Milliseconds).await?;
 
 	Ok((temp_dir, db, subject, aspect)) // Return aspect instead of aspect.id()
 }
@@ -31,7 +33,7 @@ async fn add_test_measurements(db: &Database, aspect: &Aspect, base_time: DateTi
 		let timestamp = base_time + Duration::seconds(i as i64);
 		let value = BigDecimal::from_str(&format!("{}.{}", i + 1, i * 10 % 100))?;
 		let measurement = InputMeasurement::new(timestamp, value);
-		db.observe_measurement(aspect.clone(), measurement).await?; // Use aspect instead of aspect_id
+		db.capture_measurement(aspect.clone(), measurement).await?; // Use aspect instead of aspect_id
 	}
 	Ok(())
 }
@@ -98,7 +100,7 @@ async fn test_analyze_point_exact_match() -> Result<()> {
 	let timestamp = base_time;
 	let value = BigDecimal::from_str("42.5")?;
 	let measurement = InputMeasurement::new(timestamp, value.clone());
-	db.observe_measurement(aspect.clone(), measurement).await?;
+	db.capture_measurement(aspect.clone(), measurement).await?;
 
 	// Query the exact same time
 	let result = db.analyze_point(aspect.id(), timestamp, Resolution::Milliseconds, Spline::Linear).await;
@@ -110,10 +112,10 @@ async fn test_analyze_point_exact_match() -> Result<()> {
 			assert_eq!(point.timestamp, timestamp, "Exact match should return the same timestamp");
 		}
 		Err(e) => {
-			println!("Exact match error (may be expected for single measurement): {}", e);
+			println!("Exact match error (may be expected for single measurement): {e}");
 			// If error is expected, we can assert on the error type or message
 			// For now, we'll allow the test to pass if it's the insufficient measurements error
-			assert!(e.to_string().contains("Insufficient measurements"), "Unexpected error: {}", e);
+			assert!(e.to_string().contains("Insufficient measurements"), "Unexpected error: {e}");
 		}
 	}
 
@@ -211,7 +213,7 @@ async fn test_analyze_point_single_measurement() -> Result<()> {
 	let timestamp = base_time;
 	let value = BigDecimal::from_str("10.0")?;
 	let measurement = InputMeasurement::new(timestamp, value.clone());
-	db.observe_measurement(aspect.clone(), measurement).await?;
+	db.capture_measurement(aspect.clone(), measurement).await?;
 
 	// Query a different time - should extrapolate or return the single value
 	let query_time = base_time + Duration::seconds(10);
@@ -225,7 +227,7 @@ async fn test_analyze_point_single_measurement() -> Result<()> {
 			println!("Single measurement result: {} at {}", point.value, point.timestamp);
 		}
 		Err(e) => {
-			println!("Single measurement error (expected): {}", e);
+			println!("Single measurement error (expected): {e}");
 			// This is acceptable behavior for single measurements
 		}
 	}
@@ -248,12 +250,12 @@ async fn test_analyze_point_large_time_gap() -> Result<()> {
 	let timestamp1 = base_time;
 	let value1 = BigDecimal::from_str("10.0")?;
 	let measurement1 = InputMeasurement::new(timestamp1, value1);
-	db.observe_measurement(aspect.clone(), measurement1).await?;
+	db.capture_measurement(aspect.clone(), measurement1).await?;
 
 	let timestamp2 = base_time + Duration::hours(24); // 24 hours later
 	let value2 = BigDecimal::from_str("20.0")?;
 	let measurement2 = InputMeasurement::new(timestamp2, value2);
-	db.observe_measurement(aspect.clone(), measurement2).await?;
+	db.capture_measurement(aspect.clone(), measurement2).await?;
 
 	// Query a time in the middle
 	let query_time = base_time + Duration::hours(12);
@@ -316,7 +318,7 @@ async fn test_analyze_point_cache_invalidation() -> Result<()> {
 	let new_timestamp = base_time + Duration::seconds(1) + Duration::milliseconds(250);
 	let new_value = BigDecimal::from_str("99.9")?;
 	let new_measurement = InputMeasurement::new(new_timestamp, new_value);
-	db.observe_measurement(aspect.clone(), new_measurement).await?;
+	db.capture_measurement(aspect.clone(), new_measurement).await?;
 
 	// Query again - should return different result due to new data
 	let result2 = db.analyze_point(aspect.id(), query_time, Resolution::Milliseconds, Spline::Linear).await?;
@@ -380,12 +382,12 @@ async fn test_analyze_point_precision_boundaries() -> Result<()> {
 	let timestamp1 = base_time;
 	let value1 = BigDecimal::from_str("1.123456789012345")?;
 	let measurement1 = InputMeasurement::new(timestamp1, value1);
-	db.observe_measurement(aspect.clone(), measurement1).await?;
+	db.capture_measurement(aspect.clone(), measurement1).await?;
 
 	let timestamp2 = base_time + Duration::milliseconds(1000);
 	let value2 = BigDecimal::from_str("2.987654321098765")?;
 	let measurement2 = InputMeasurement::new(timestamp2, value2);
-	db.observe_measurement(aspect.clone(), measurement2).await?;
+	db.capture_measurement(aspect.clone(), measurement2).await?;
 
 	// Query a time in between with high precision
 	let query_time = base_time + Duration::milliseconds(500);
@@ -427,28 +429,56 @@ fn convert_unix_timestamp_to_datetime_utc(timestamp_seconds: f64) -> Option<Date
 async fn test_create_btc_1min_database() -> Result<()> {
 	// This test creates a database with BTC 1-minute data
 	// Note: This requires the CSV file to be present
-	let csv_path = "datasets/btc_1min.csv"; // Fixed path for package-level testing
+	let csv_path = "datasets/btc_1min.csv"; // Correct path when running from database directory
 
 	let db_name = "Crypto".to_string();
 
-	// Check if database already exists, if so use it
-	let db = if std::path::Path::new(&format!("{}/{}", DEFAULT_DATA_DIR, db_name)).exists() {
-		println!("Using existing BTC database at {}/{}", DEFAULT_DATA_DIR, db_name);
+	// Create database (will use existing if present)
+	let db = Arc::new(if std::path::Path::new(&format!("{DEFAULT_DATA_DIR}/{db_name}")).exists() {
+		println!("Using existing BTC database at {DEFAULT_DATA_DIR}/{db_name}");
 		Database::existing(&db_name).await?
 	} else {
 		println!("Creating new BTC database");
-		let db = Database::new(&db_name).await?;
+		Database::new(&db_name).await?
+	});
 
-		// Only populate with data if CSV exists and database is new
+	// Always check if we need to load data
+	let subject_list = db.list_subjects().await?;
+	let has_btcusd = subject_list.iter().any(|(_, name)| name.as_str() == "BTCUSD");
+
+	// If BTCUSD subject exists, check if it has measurements
+	let needs_data = if has_btcusd {
+		if let Some((subject_id, _)) = subject_list.iter().find(|(_, name)| name.as_str() == "BTCUSD") {
+			let aspects = db.get_subject_aspects(subject_id).await?;
+			if let Some(aspect) = aspects.iter().find(|a| a.name() == "open") {
+				// Check if the aspect has measurements
+				db.get_earliest_measurement(&aspect.id()).await?.is_none()
+			} else {
+				true // No "open" aspect found
+			}
+		} else {
+			true // Shouldn't happen since we found BTCUSD above
+		}
+	} else {
+		true // No BTCUSD subject
+	};
+
+	println!("Database has BTCUSD subject: {has_btcusd}, needs data: {needs_data}");
+
+	if needs_data {
+		// Populate with data if CSV exists
+		println!("Checking for CSV file at: {csv_path}");
+		println!("Current working directory: {:?}", std::env::current_dir());
 		if std::path::Path::new(csv_path).exists() {
-			let subject = db.track_subject("BTCUSD").await?;
+			println!("CSV file found, loading data...");
+			let subject = db.observe_subject("BTCUSD").await?;
 
 			// Create aspects for different price types
-			let open_aspect = db.track_aspect(subject.clone(), "open", Resolution::Minutes).await?;
-			let high_aspect = db.track_aspect(subject.clone(), "high", Resolution::Minutes).await?;
-			let low_aspect = db.track_aspect(subject.clone(), "low", Resolution::Minutes).await?;
-			let close_aspect = db.track_aspect(subject.clone(), "close", Resolution::Minutes).await?;
-			let volume_aspect = db.track_aspect(subject.clone(), "volume", Resolution::Minutes).await?;
+			let open_aspect = db.track_aspect(subject.id(), "open", Resolution::Minutes).await?;
+			let high_aspect = db.track_aspect(subject.id(), "high", Resolution::Minutes).await?;
+			let low_aspect = db.track_aspect(subject.id(), "low", Resolution::Minutes).await?;
+			let close_aspect = db.track_aspect(subject.id(), "close", Resolution::Minutes).await?;
+			let volume_aspect = db.track_aspect(subject.id(), "volume", Resolution::Minutes).await?;
 
 			// Read and process CSV data
 			let mut rdr = csv::ReaderBuilder::new().has_headers(true).from_path(csv_path)?;
@@ -488,20 +518,49 @@ async fn test_create_btc_1min_database() -> Result<()> {
 				volume_measurements.push(volume);
 			}
 
-			db.observe_measurements_batch(open_aspect.clone(), open_measurements).await.unwrap();
-			db.observe_measurements_batch(high_aspect.clone(), high_measurements).await.unwrap();
-			db.observe_measurements_batch(low_aspect.clone(), low_measurements).await.unwrap();
-			db.observe_measurements_batch(close_aspect.clone(), close_measurements).await.unwrap();
-			db.observe_measurements_batch(volume_aspect.clone(), volume_measurements).await.unwrap();
+			let tasks = vec![
+				tokio::spawn({
+					let db = Arc::clone(&db);
+					let open_aspect = open_aspect.clone();
+					let open_measurements = open_measurements.clone();
+					async move { db.batch_capture_measurements(open_aspect, open_measurements).await }
+				}),
+				tokio::spawn({
+					let db = Arc::clone(&db);
+					let high_aspect = high_aspect.clone();
+					let high_measurements = high_measurements.clone();
+					async move { db.batch_capture_measurements(high_aspect, high_measurements).await }
+				}),
+				tokio::spawn({
+					let db = Arc::clone(&db);
+					let low_aspect = low_aspect.clone();
+					let low_measurements = low_measurements.clone();
+					async move { db.batch_capture_measurements(low_aspect, low_measurements).await }
+				}),
+				tokio::spawn({
+					let db = Arc::clone(&db);
+					let close_aspect = close_aspect.clone();
+					let close_measurements = close_measurements.clone();
+					async move { db.batch_capture_measurements(close_aspect, close_measurements).await }
+				}),
+				tokio::spawn({
+					let db = Arc::clone(&db);
+					let volume_aspect = volume_aspect.clone();
+					let volume_measurements = volume_measurements.clone();
+					async move { db.batch_capture_measurements(volume_aspect, volume_measurements).await }
+				}),
+			];
+
+			for task in tasks {
+				task.await.unwrap().unwrap();
+			}
 
 			let inserted_count = records.len();
-			println!("Inserted {} BTC 1-minute records", inserted_count);
+			println!("Inserted {inserted_count} BTC 1-minute records");
 		} else {
-			println!("Skipping BTC database test - CSV file not found at {}", csv_path);
+			println!("Skipping BTC database test - CSV file not found at {csv_path}");
 		}
-
-		db
-	};
+	}
 
 	// Test some queries if we have subjects
 	let subject_list = db.list_subjects().await?;
@@ -514,7 +573,7 @@ async fn test_create_btc_1min_database() -> Result<()> {
 
 				match result {
 					Ok(point) => println!("BTC price at {}: ${}", query_time, point.value),
-					Err(e) => println!("Query failed (may be expected): {}", e),
+					Err(e) => println!("Query failed (may be expected): {e}"),
 				}
 			}
 		}

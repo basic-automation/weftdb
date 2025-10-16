@@ -1,10 +1,12 @@
 use std::{collections::HashMap, hash::Hash};
 
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
-use turso::Database as TursoDatabase;
 use uuid::Uuid;
 
-use crate::{Aspect, AspectId, DatabaseId};
+use crate::{
+	types::database::traits::{aspect_structure::AspectStructure, DatabaseStructure}, Aspect, AspectId, Database, DatabaseId
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SubjectId(Uuid);
@@ -36,9 +38,8 @@ impl Default for SubjectId {
 pub struct Subject {
 	id: SubjectId,
 	database_id: DatabaseId,
+	database_metadata_db_path: String,
 	name: String,
-	#[serde(skip)]
-	turso_db: Option<TursoDatabase>,
 	aspects: HashMap<AspectId, Aspect>,
 }
 
@@ -61,14 +62,51 @@ impl Eq for Subject {}
 
 impl Subject {
 	#[must_use]
-	pub fn new(name: String, database_id: DatabaseId, turso_db: TursoDatabase) -> Self {
-		let id = SubjectId::new();
-		Self { id, name, turso_db: Some(turso_db), database_id, aspects: HashMap::new() }
+	pub fn new(id: Option<SubjectId>, name: String, database_id: DatabaseId, database_metadata_db_path: String) -> Self {
+		let id = id.unwrap_or_else(SubjectId::new);
+
+		let subject_path = Self::get_subject_path(database_metadata_db_path.clone(), id).await.unwrap();
+
+		// recursively create directory if it doesn't exist
+		tokio::fs::create_dir_all(&subject_path).await.unwrap();
+
+		Self { id, name, database_id, database_metadata_db_path, aspects: HashMap::new() }
 	}
 
-	#[must_use]
-	pub fn new_with_id(id: SubjectId, name: String, database_id: DatabaseId, turso_db: TursoDatabase) -> Self {
-		Self { id, name, turso_db: Some(turso_db), database_id, aspects: HashMap::new() }
+	async fn get_database_metadata_path(turso_db_path: String) -> Result<String> {
+		let turso_db = Database::get_turso_database(&turso_db_path).await?;
+
+		// Query the database for the metadata_path field of the first item in the database table
+		let conn = turso_db.connect()?;
+		let mut rows = conn.query("SELECT metadata_path FROM database", turso::params![]).await?;
+		let row = rows.next().await?.ok_or_else(|| anyhow::anyhow!("Database metadata not found"))?;
+		let metadata_path: String = row.get(0)?;
+
+		Ok(metadata_path)
+	}
+
+	async fn get_subject_name(turso_db: TursoDatabase, subject_id: SubjectId) -> Result<String> {
+		// Query the database for the name field where id = subject_id in the subjects table
+		let conn = turso_db.connect()?;
+		let mut rows = conn.query("SELECT name FROM subjects WHERE id = ?", turso::params![subject_id.as_uuid().to_string()]).await?;
+		let row = rows.next().await?.ok_or_else(|| anyhow::anyhow!("Subject not found"))?;
+		let subject_name: String = row.get(0)?;
+
+		Ok(subject_name)
+	}
+
+	async fn get_subject_path(database_metadata_db_path: String, subject_id: SubjectId) -> Result<String> {
+		let database_metadata_path = Aspect::get_database_metadata_path(self.database_metadata_db_path.clone()).await?;
+		let database_metadata_db = Database::get_turso_database(&database_metadata_path).await?;
+		let subject_name = Self::get_subject_name(database_metadata_db, subject_id).await?;
+
+		let subject_metadata_path = Path::new(&database_metadata_db_path).join(subject_name);
+
+		if subject_metadata_path.exists() {
+			Ok(subject_metadata_path.to_string_lossy().to_string())
+		} else {
+			bail!("Subject metadata path does not exist");
+		}
 	}
 
 	#[must_use]
@@ -87,16 +125,17 @@ impl Subject {
 	}
 
 	#[must_use]
-	pub const fn turso_db(&self) -> Option<&TursoDatabase> {
-		self.turso_db.as_ref()
-	}
-
-	#[must_use]
 	pub const fn aspects(&self) -> &HashMap<AspectId, Aspect> {
 		&self.aspects
 	}
 
 	pub fn add_aspect(&mut self, aspect: Aspect) {
 		self.aspects.insert(aspect.id(), aspect);
+	}
+
+	/// Get aspect by name
+	#[must_use]
+	pub fn get_aspect_by_name(&self, name: &str) -> Option<&Aspect> {
+		self.aspects.values().find(|a| a.name() == name)
 	}
 }

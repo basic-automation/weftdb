@@ -28,4 +28,7 @@ pub enum Error {
 
 	#[error("Invalid ID: {0}")]
 	InvalidIdError(String),
+
+	#[error("Numeric conversion error: {0}")]
+	NumericConversionError(String),
 }

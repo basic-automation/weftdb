@@ -128,7 +128,7 @@
 //!
 //! - **Operating Systems**: Linux, macOS, Windows
 //! - **Rust Version**: 1.70.0 or later
-//! - **Hardware**: x86_64, ARM64 architectures
+//! - **Hardware**: `x86_64`, ARM64 architectures
 //! - **GPU Support**: NVIDIA GPUs with CUDA support (optional)
 //!
 //! ## FAQ
@@ -143,7 +143,7 @@
 //!
 //! A: This database focuses on high-performance interpolation and advanced analytics
 //! capabilities, particularly for sensor data and continuous measurements. While it may
-//! not have all the enterprise features of larger databases like TimescaleDB or InfluxDB,
+//! not have all the enterprise features of larger databases like `TimescaleDB` or `InfluxDB`,
 //! it offers unique capabilities for interpolation-heavy workloads and GPU acceleration.
 //!
 //! **Q: Can I migrate data from other databases?**
@@ -192,7 +192,7 @@
 //! **Q: What are some potential use cases for this database?**
 //!
 //! A: This database is suitable for a wide range of use cases involving time-series data,
-//! such as IoT sensor data processing, financial market analysis, real-time monitoring
+//! such as `IoT` sensor data processing, financial market analysis, real-time monitoring
 //! and alerting, historical data analysis, and more. Its high performance, advanced
 //! interpolation and analytics capabilities, and flexible resolution make it ideal for
 //! any application that requires efficient and accurate processing and analysis of
@@ -222,7 +222,7 @@
 //!
 //! **Q: What are the data consistency and durability guarantees?**
 //!
-//! A: The database provides strong consistency for individual operations and uses SQLite
+//! A: The database provides strong consistency for individual operations and uses `SQLite`
 //! as the underlying storage engine, which provides ACID guarantees. Data is automatically
 //! persisted to disk and can survive system crashes. However, like most databases, it's
 //! the responsibility of the application and the users to define and enforce the appropriate
@@ -233,6 +233,11 @@
 //! A: The default settings and configurations for the database are designed to provide a
 //! balance between performance and usability for a wide range of use cases. Some of the
 //! key default settings include:
+//!
+
+#![recursion_limit = "2048"]
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions, clippy::used_underscore_binding, clippy::similar_names, clippy::module_name_repetitions, clippy::module_inception)]
 
 mod types;
 
