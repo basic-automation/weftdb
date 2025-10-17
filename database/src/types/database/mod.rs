@@ -343,7 +343,7 @@ impl DatabaseStructure for Database {
 			let subject_id_str = Self::value_to_string(&row.get_value(0)?, "Subject ID").await?;
 			let subject_name = Self::value_to_string(&row.get_value(2)?, "Subject name").await?;
 			let subject_id = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str)?);
-			let mut subject = Subject::new(Some(subject_id), subject_name.clone(), db_id, metadata_db_path.clone());
+			let mut subject = Subject::new(Some(subject_id), subject_name.clone(), db_id, metadata_db_path.clone()).await?;
 
 			// Load aspects for this subject
 			let mut aspect_rows = conn.query("SELECT id, name, table_name, resolution FROM aspects WHERE subject_id = ?", turso::params![subject_id.as_uuid().to_string()]).await?;
@@ -477,7 +477,7 @@ impl DatabaseStructure for Database {
 		let metadata_db = self.metadata.connect()?;
 
 		// create subject
-		let subject = Subject::new(None, name.to_string(), self.id, self.metadata_path.clone());
+		let subject = Subject::new(None, name.to_string(), self.id, self.metadata_path.clone()).await?;
 
 		// Add subject to metadata database
 		metadata_db.execute("INSERT INTO subjects (name, database_id) VALUES (?, ?)", turso::params![name, self.id.as_uuid().to_string()]).await?;
@@ -502,7 +502,7 @@ impl DatabaseStructure for Database {
 			let subject_id = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str)?);
 			let database_id = DatabaseId::from_uuid(Uuid::parse_str(&database_id_str)?);
 
-			Ok(Subject::new(Some(subject_id), name, database_id, self.metadata_path.clone()))
+			Ok(Subject::new(Some(subject_id), name, database_id, self.metadata_path.clone()).await?)
 		} else {
 			Err(anyhow::anyhow!("Subject not found"))
 		}
@@ -521,7 +521,7 @@ impl DatabaseStructure for Database {
 			let subject_id = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str)?);
 			let database_id = DatabaseId::from_uuid(Uuid::parse_str(&database_id_str)?);
 
-			Ok(Subject::new(Some(subject_id), name, database_id, self.metadata_path.clone()))
+			Ok(Subject::new(Some(subject_id), name, database_id, self.metadata_path.clone()).await?)
 		} else {
 			Err(anyhow::anyhow!("Subject not found"))
 		}
@@ -567,7 +567,7 @@ impl DatabaseStructure for Database {
 			let subject_id = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str)?);
 			let database_id = DatabaseId::from_uuid(Uuid::parse_str(&database_id_str)?);
 
-			subjects.push(Subject::new(Some(subject_id), name, database_id, self.metadata_path.clone()));
+			subjects.push(Subject::new(Some(subject_id), name, database_id, self.metadata_path.clone()).await?);
 		}
 
 		Ok(subjects)

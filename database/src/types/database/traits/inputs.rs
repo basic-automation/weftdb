@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::{Aspect, AspectId, Batch, InputMeasurement, TxId};
+use crate::{AspectId, Batch, InputMeasurement, TxId};
 
 /// Trait for database structure operations
 /// This trait defines the operations related to managing the structure of the database.
@@ -27,10 +27,10 @@ pub trait Inputs {
 
 	/// Capture multiple measurements for a given aspect
 	/// If a measurement with the same timestamp already exists, the measurement is skipped.
-	async fn batch_capture_new_measurements(&self, aspect_id: AspectId, input_measurements: Vec<InputMeasurement>) -> Result<Vec<TxId>>;
+	async fn batch_capture_new_measurements(&self, aspect_id: AspectId, dataset_id: DatasetId, input_measurements: Vec<InputMeasurement>) -> Result<Vec<TxId>>;
 
 	/// Capture a chunk of new measurements with batch processing
-	async fn capture_new_measurement_chunk(&self, conn: &turso::Connection, chunk: &[InputMeasurement], all_tx_ids: &[TxId], tx_id_offset: usize, aspect: &Aspect) -> Result<Vec<TxId>>;
+	async fn capture_new_measurement_chunk(&self, conn: &turso::Connection, dataset_id: DatasetId, chunk: &[InputMeasurement], all_tx_ids: &[TxId], tx_id_offset: usize) -> Result<Vec<TxId>>;
 
 	// Unprocessed Batches
 
@@ -42,7 +42,7 @@ pub trait Inputs {
 
 	// Capture a chunk of batches - works for both processed and unprocessed batches
 	/// The only difference is the database connection passed in
-	async fn insert_batch_chunk(&self, aspect_id: AspectId, conn: &turso::Connection, chunk: &[Batch]) -> Result<Vec<TxId>>;
+	async fn insert_batch_chunk(&self, conn: &turso::Connection, chunk: &[Batch]) -> Result<Vec<TxId>>;
 
 	// Processed Batches
 

@@ -62,15 +62,15 @@ impl Eq for Subject {}
 
 impl Subject {
 	#[must_use]
-	pub fn new(id: Option<SubjectId>, name: String, database_id: DatabaseId, database_metadata_db_path: String) -> Self {
+	pub async fn new(id: Option<SubjectId>, name: String, database_id: DatabaseId, database_metadata_db_path: String) -> Result<Self> {
 		let id = id.unwrap_or_else(SubjectId::new);
 
 		let subject_path = Self::get_subject_path(database_metadata_db_path.clone(), id).await.unwrap();
 
 		// recursively create directory if it doesn't exist
-		tokio::fs::create_dir_all(&subject_path).await.unwrap();
+		tokio::fs::create_dir_all(&subject_path).await?;
 
-		Self { id, name, database_id, database_metadata_db_path, aspects: HashMap::new() }
+		Ok(Self { id, name, database_id, database_metadata_db_path, aspects: HashMap::new() })
 	}
 
 	async fn get_database_metadata_path(turso_db_path: String) -> Result<String> {

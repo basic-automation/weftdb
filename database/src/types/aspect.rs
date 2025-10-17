@@ -304,31 +304,33 @@ impl AspectStructure for Aspect {
 	async fn wireframe_batches_tables(conn: &turso::Connection) -> Result<()> {
 		conn.execute(
 			r"
-                        CREATE TABLE IF NOT EXISTS batches (
-                                id TEXT PRIMARY KEY,
-                                aspect_id TEXT NOT NULL,
-                                database_id TEXT NOT NULL,
-                                size INTEGER NOT NULL,
-                                resolution TEXT NOT NULL,
-                                batch_hash TEXT,
-                                created_at INTEGER NOT NULL,
-                                processed_at INTEGER,
-                                updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000),
+                                CREATE TABLE IF NOT EXISTS batches (
+                                        id TEXT PRIMARY KEY,
+                                        aspect_id TEXT NOT NULL,
+                                        database_id TEXT NOT NULL,
+                                        size INTEGER NOT NULL,
+                                        resolution TEXT NOT NULL,
+                                        batch_hash TEXT,
+                                        created_at INTEGER NOT NULL,
+                                        updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000),
 
-                                metadata_json TEXT NOT NULL,
-                                measurements_json TEXT NOT NULL,
+                                        metadata_json TEXT NOT NULL,
+                                        measurements_json TEXT NOT NULL,
 
-                                FOREIGN KEY (aspect_id) REFERENCES aspects(id),
+                                        FOREIGN KEY (aspect_id) REFERENCES aspects(id),
 
-                                -- Add unique constraint for batch_hash to prevent duplicate batches
-                                UNIQUE(batch_hash) WHERE batch_hash IS NOT NULL
-                )",
+                                        -- Add unique constraint for batch_hash to prevent duplicate batches
+                                        UNIQUE(batch_hash) WHERE batch_hash IS NOT NULL
+                        )",
 			turso::params![],
 		)
 		.await?;
 
-		// Enhanced indexes for concurrent write scenarios (removed status reference)
-		conn.execute("CREATE INDEX IF NOT EXISTS idx_batches_aspect_processed ON batches(aspect_id, processed_at)", turso::params![]).await?;
+		// Enhanced indexes for concurrent write scenarios and queue processing
+		// OPTIMIZATION: Composite index for the exact query pattern used in get_unprocessed_batches
+		conn.execute("CREATE INDEX IF NOT EXISTS idx_batches_aspect_database_created ON batches(aspect_id, database_id, created_at)", turso::params![]).await?;
+
+		// Keep individual indexes for other query patterns
 		conn.execute("CREATE INDEX IF NOT EXISTS idx_batches_created_at ON batches(created_at)", turso::params![]).await?;
 		conn.execute("CREATE INDEX IF NOT EXISTS idx_batches_hash ON batches(batch_hash) WHERE batch_hash IS NOT NULL", turso::params![]).await?;
 
