@@ -25,7 +25,7 @@ impl Inputs for Database {
 		let conn = measurement_db.connect()?;
 		let tx_id = TxId::new();
 
-		let measurement = Measurement::from_input_measurement(dataset_id, input_measurement);
+		let measurement = Measurement::from_input_measurement(dataset_id, &input_measurement);
 
 		// Use INSERT ... ON CONFLICT for atomic upsert with concurrent writes support
 		// This handles the case where a measurement with the same timestamp already exists
@@ -55,7 +55,7 @@ impl Inputs for Database {
 		let conn = measurement_db.connect()?;
 		let tx_id = TxId::new();
 
-		let measurement = Measurement::from_input_measurement(dataset_id, input_measurement);
+		let measurement = Measurement::from_input_measurement(dataset_id, &input_measurement);
 
 		// Use INSERT with ON CONFLICT DO NOTHING, then check if any rows were affected
 		// This is atomic and handles concurrent writes safely
@@ -127,7 +127,7 @@ impl Inputs for Database {
 
 		// Invalidate cache
 		let cache_key = format!("aspect_measurements_{}", aspect.id().as_uuid());
-		CACHE.invalidate_aspect_cache(&cache_key, aspect.id().as_uuid()).await;
+		CACHE.invalidate_aspect_cache(&cache_key).await;
 
 		// Update earliest and latest in metadata
 		self.update_aspect_timestamps(&aspect, min_new, max_new).await?;
@@ -149,7 +149,7 @@ impl Inputs for Database {
 		// Execute each measurement individually
 		for (i, input_measurement) in chunk.iter().enumerate() {
 			let tx_id = &all_tx_ids[tx_id_offset + i];
-			let measurement = Measurement::from_input_measurement(dataset_id, *input_measurement);
+			let measurement = Measurement::from_input_measurement(dataset_id, input_measurement);
 
 			conn.execute(&upsert_sql, turso::params![tx_id.as_uuid().to_string(), dataset_id.as_uuid().to_string(), measurement.timestamp().timestamp_millis().to_string(), measurement.value().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to insert measurement: {e}")))?;
 		}
@@ -170,58 +170,60 @@ impl Inputs for Database {
 	///
 	/// # Panics
 	/// - if measurements vector is empty when computing min/max (this is already checked)
-	async fn batch_capture_new_measurements(&self, aspect: Aspect, measurements: Vec<InputMeasurement>) -> Result<Vec<TxId>> {
-		if measurements.is_empty() {
+	async fn batch_capture_new_measurements(&self, aspect_id: AspectId, dataset_id: DatasetId, input_measurements: Vec<InputMeasurement>) -> Result<Vec<TxId>> {
+		if input_measurements.is_empty() {
 			return Ok(Vec::new());
 		}
 
+		let mut aspect = self.get_aspect(aspect_id).await?;
+		let measurement_db = aspect.measurements().await?;
+		let conn = measurement_db.connect()?;
+
 		// Generate all TxIds upfront
-		let all_tx_ids: Vec<TxId> = (0..measurements.len()).map(|_| TxId::new()).collect();
+		let all_tx_ids: Vec<TxId> = (0..input_measurements.len()).map(|_| TxId::new()).collect();
 
 		// Compute min/max upfront
-		let min_new = measurements.iter().map(InputMeasurement::timestamp).min().unwrap();
-		let max_new = measurements.iter().map(InputMeasurement::timestamp).max().unwrap();
-
-		let metadata_db = self.metadata().connect()?;
+		let min_new = input_measurements.iter().map(InputMeasurement::timestamp).min().unwrap();
+		let max_new = input_measurements.iter().map(InputMeasurement::timestamp).max().unwrap();
 
 		// Print initial progress message for large batches
-		if measurements.len() > 100_000 {
-			println!("Loading {} new measurements for aspect '{}'...", measurements.len(), aspect.name());
+		if input_measurements.len() > 100_000 {
+			println!("Loading {} new measurements for aspect '{}'...", input_measurements.len(), aspect.name());
 		}
 
 		// Use concurrent writes - no need for transactions or complex retry logic
 		// Process in parallel chunks for better performance
-		let chunk_size = if measurements.len() > 100_000 { 1000 } else { 500 };
-		let chunks: Vec<_> = measurements.chunks(chunk_size).enumerate().collect();
+		let chunk_size = if input_measurements.len() > 100_000 { 1000 } else { 500 };
+		let chunks: Vec<_> = input_measurements.chunks(chunk_size).enumerate().collect();
 
 		let mut successful_tx_ids = Vec::new();
 
 		for (chunk_idx, chunk) in chunks {
 			// Progress reporting for large batches
-			if measurements.len() > 100_000 && chunk_idx % 100 == 0 && chunk_idx > 0 {
-				if let (Ok(processed_f64), Ok(len_f64)) = (safe_usize_to_f64(chunk_idx * chunk_size), safe_usize_to_f64(measurements.len())) {
+			if input_measurements.len() > 100_000 && chunk_idx % 100 == 0 && chunk_idx > 0 {
+				if let (Ok(processed_f64), Ok(len_f64)) = (safe_usize_to_f64(chunk_idx * chunk_size), safe_usize_to_f64(input_measurements.len())) {
 					let pct = (processed_f64 / len_f64) * 100.0;
 					println!("  {} - {:.0}%", aspect.name(), pct);
 				} else {
-					println!("  {} - processed {} / {} measurements", aspect.name(), chunk_idx * chunk_size, measurements.len());
+					println!("  {} - processed {} / {} measurements", aspect.name(), chunk_idx * chunk_size, input_measurements.len());
 				}
 			}
 
 			// Process chunk using concurrent writes and collect successful TxIds
-			let chunk_successful_tx_ids = self.capture_new_measurement_chunk(&metadata_db, chunk, &all_tx_ids, chunk_idx * chunk_size, &aspect).await?;
+			let chunk_successful_tx_ids = self.capture_new_measurement_chunk(&conn, dataset_id, chunk, &all_tx_ids, chunk_idx * chunk_size).await?;
 			successful_tx_ids.extend(chunk_successful_tx_ids);
 		}
 
 		// Invalidate cache
 		let cache_key = format!("aspect_measurements_{}", aspect.id().as_uuid());
-		CACHE.invalidate_aspect_cache(&cache_key, aspect.id().as_uuid()).await;
+		CACHE.invalidate_aspect_cache(&cache_key).await;
 
 		// Update earliest and latest in metadata
 		self.update_aspect_timestamps(&aspect, min_new, max_new).await?;
 
 		// Print summary for large batches
-		if measurements.len() > 100_000 {
-			let skipped = measurements.len() - successful_tx_ids.len();
+		if input_measurements.len() > 100_000 {
+			let skipped = input_measurements.len() - successful_tx_ids.len();
 			println!("  {} - Completed: {} inserted, {} skipped (duplicates)", aspect.name(), successful_tx_ids.len(), skipped);
 		}
 
@@ -234,16 +236,22 @@ impl Inputs for Database {
 	}
 
 	/// Helper for new measurements using individual execute calls
-	async fn capture_new_measurement_chunk(&self, conn: &turso::Connection, chunk: &[InputMeasurement], all_tx_ids: &[TxId], tx_id_offset: usize, aspect: &Aspect) -> Result<Vec<TxId>> {
-		let insert_sql = format!("INSERT INTO {} (id, timestamp, value) VALUES (?, ?, ?) ON CONFLICT(timestamp) DO NOTHING", aspect.name());
+	async fn capture_new_measurement_chunk(&self, conn: &turso::Connection, dataset_id: DatasetId, chunk: &[InputMeasurement], all_tx_ids: &[TxId], tx_id_offset: usize) -> Result<Vec<TxId>> {
+		// Use the fixed measurements table with dataset_id
+		let insert_sql = r#"
+            INSERT INTO measurements (id, dataset_id, timestamp, value) 
+            VALUES (?, ?, ?, ?) 
+            ON CONFLICT(timestamp) DO NOTHING
+        "#;
 
 		let mut successful_tx_ids = Vec::new();
 
 		// Execute each measurement individually and check results
-		for (i, measurement) in chunk.iter().enumerate() {
+		for (i, input_measurement) in chunk.iter().enumerate() {
 			let tx_id = &all_tx_ids[tx_id_offset + i];
+			let measurement = Measurement::from_input_measurement(dataset_id, input_measurement);
 
-			let rows_affected = conn.execute(&insert_sql, turso::params![tx_id.as_uuid().to_string(), measurement.timestamp().timestamp_millis().to_string(), measurement.value().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to insert measurement: {e}")))?;
+			let rows_affected = conn.execute(&insert_sql, turso::params![tx_id.as_uuid().to_string(), dataset_id.as_uuid().to_string(), measurement.timestamp().timestamp_millis().to_string(), measurement.value().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to insert measurement: {e}")))?;
 
 			// Only add TxId if the insert was successful (rows_affected > 0)
 			if rows_affected > 0 {
@@ -254,8 +262,9 @@ impl Inputs for Database {
 		Ok(successful_tx_ids)
 	}
 
-	async fn insert_unprocessed_batch(&self, batch: &Batch) -> Result<TxId> {
-		let unprocessed_batches_db = self.unprocessed_batches().await?;
+	async fn insert_unprocessed_batch(&self, aspect_id: AspectId, batch: &Batch) -> Result<TxId> {
+		let aspect = self.get_aspect(aspect_id).await?;
+		let unprocessed_batches_db = aspect.unprocessed_batches().await?;
 		let conn = unprocessed_batches_db.connect()?;
 		let tx_id = TxId::new();
 
@@ -427,8 +436,9 @@ impl Inputs for Database {
 		Ok(successful_tx_ids)
 	}
 
-	async fn insert_processed_batch(&self, batch: &Batch) -> Result<TxId> {
-		let processed_batches_db = self.processed_batches().await?;
+	async fn insert_processed_batch(&self, aspect_id: AspectId, batch: &Batch) -> Result<TxId> {
+		let aspect = self.get_aspect(aspect_id).await?;
+		let processed_batches_db = aspect.processed_batches().await?;
 		let conn = processed_batches_db.connect()?;
 		let tx_id = TxId::new();
 
@@ -473,11 +483,11 @@ impl Inputs for Database {
 		}
 	}
 
-	async fn batch_insert_processed_batches(&self, batches: Vec<Batch>) -> Result<Vec<TxId>> {
+	async fn batch_insert_processed_batches(&self, aspect_id: AspectId, batches: Vec<Batch>) -> Result<Vec<TxId>> {
 		if batches.is_empty() {
 			return Ok(Vec::new());
 		}
-
+		let aspect = self.get_aspect(aspect_id).await?;
 		let processed_batches_db = aspect.processed_batches().await?;
 		let conn = processed_batches_db.connect()?;
 

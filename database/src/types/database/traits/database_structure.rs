@@ -1,6 +1,5 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use fake::locales::Data;
 use splimes::Resolution;
 
 use crate::{Aspect, AspectId, Database, Subject, SubjectId, Transaction, TxId};

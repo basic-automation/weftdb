@@ -80,7 +80,7 @@ impl super::Database {
 
 		// Invalidate relevant caches
 		let cache_key = format!("aspect_batches_{}", batch.metadata.aspect.as_uuid());
-		CACHE.invalidate_aspect_cache(&cache_key, batch.metadata.aspect.as_uuid()).await;
+		CACHE.invalidate_aspect_cache(&cache_key).await;
 
 		Ok(())
 	}
@@ -134,46 +134,57 @@ impl super::Database {
 		Ok(batches)
 	}
 
-	/// Mark a batch as processed
-	///
-	/// # Errors
-	/// - if database not found
-	/// - if unable to update batch status
 	pub async fn mark_batch_processed(&self, batch: &Batch) -> Result<()> {
-		// Get database info with proper validation
-		let db_id = self.id();
-		let db_info = {
-			let databases = DATABASES.lock().await;
-			databases.get(&db_id).cloned().ok_or_else(|| Error::DatabaseError("Database not found".to_string()))?
-		};
+		// Get aspect information for database path building
+		let aspect = batch.metadata.aspect;
+		let mut aspect_data = self.get_aspect(aspect).await?;
+		let subject_name = aspect_data.name();
+		let aspect_name = aspect_data.name();
 
-		// Find the subject and aspect
-		let (subject_name, aspect_name) = db_info.subjects().values().find_map(|subject| subject.aspects().get(&batch.metadata.aspect).map(|aspect| (subject.name().to_string(), aspect.name().to_string()))).ok_or_else(|| Error::DatabaseError("Subject or aspect not found".to_string()))?;
+		// Move batch from unprocessed to processed database
+		// 1. Insert into processed_batches database
+		let processed_batches_db = aspect_data.processed_batches().await?;
+		let processed_conn = processed_batches_db.connect()?;
 
-		// Get batches database
-		let batches_db_path = format!("{}/{subject_name}/{aspect_name}/batches.db", db_info.path());
-		let batches_turso_db = Self::get_or_create_batches_database(&batches_db_path).await?;
+		let batch_id = batch.batch_id();
+		let metadata_json = serde_json::to_string(&batch.metadata).map_err(|e| Error::DatabaseError(format!("Failed to serialize batch metadata: {e}")))?;
+		let measurements_json = serde_json::to_string(&batch.measurements).map_err(|e| Error::DatabaseError(format!("Failed to serialize batch measurements: {e}")))?;
 
-		// Use batch ID or hash for identification
-		let conn = batches_turso_db.connect()?;
-		let rows_affected = if let Some(batch_id) = batch.batch_id() {
-			// Use batch ID if available
-			conn.execute("UPDATE batches SET status = 'processed', processed_at = ? WHERE id = ? AND status = 'unprocessed'", turso::params![chrono::Utc::now().timestamp_millis(), batch_id.clone()]).await.map_err(|e| Error::DatabaseError(format!("Failed to update batch status: {e}")))?
-		} else if let Some(batch_hash) = batch.batch_hash() {
-			// Fall back to batch hash
-			conn.execute("UPDATE batches SET status = 'processed', processed_at = ? WHERE batch_hash = ? AND aspect_id = ? AND database_id = ? AND status = 'unprocessed'", turso::params![chrono::Utc::now().timestamp_millis(), batch_hash.clone(), batch.metadata.aspect.as_uuid().to_string(), self.id().as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to update batch status: {e}")))?
-		} else {
-			return Err(anyhow::Error::msg("Batch has no ID or hash for identification"));
-		};
+		// Insert into processed batches database using concurrent writes
+		let insert_sql = r#"
+        INSERT INTO batches (id, aspect_id, database_id, size, resolution, batch_hash, created_at, metadata_json, measurements_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            updated_at = strftime('%s', 'now') * 1000,
+            metadata_json = excluded.metadata_json,
+            measurements_json = excluded.measurements_json
+    "#;
 
-		// Verify that a batch was actually updated
+		processed_conn.execute(insert_sql, turso::params![batch_id.as_uuid().to_string(), batch.metadata.aspect.as_uuid().to_string(), self.id().as_uuid().to_string(), batch.measurements.len() as i64, serde_json::to_string(&batch.metadata.resolution).unwrap_or_default(), batch.batch_hash().map(|s| s.clone()), chrono::Utc::now().timestamp_millis(), metadata_json, measurements_json]).await.map_err(|e| Error::DatabaseError(format!("Failed to insert batch into processed database: {e}")))?;
+
+		// 2. Remove from unprocessed_batches database
+		let unprocessed_batches_db = aspect_data.unprocessed_batches().await?;
+		let unprocessed_conn = unprocessed_batches_db.connect()?;
+
+		let rows_affected = unprocessed_conn.execute("DELETE FROM batches WHERE id = ?", turso::params![batch_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to remove batch from unprocessed database: {e}")))?;
+
+		// Verify that a batch was actually moved
 		if rows_affected == 0 {
-			return Err(anyhow::Error::msg("No matching unprocessed batch found to mark as processed"));
+			// Try fallback with batch hash if ID deletion failed
+			if let Some(batch_hash) = batch.batch_hash() {
+				let rows_affected = unprocessed_conn.execute("DELETE FROM batches WHERE batch_hash = ? AND aspect_id = ? AND database_id = ?", turso::params![batch_hash.clone(), batch.metadata.aspect.as_uuid().to_string(), self.id().as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to remove batch by hash from unprocessed database: {e}")))?;
+
+				if rows_affected == 0 {
+					return Err(anyhow::Error::msg("No matching unprocessed batch found to mark as processed"));
+				}
+			} else {
+				return Err(anyhow::Error::msg("No matching unprocessed batch found to mark as processed"));
+			}
 		}
 
 		// Invalidate relevant caches
 		let cache_key = format!("aspect_batches_{}", batch.metadata.aspect.as_uuid());
-		CACHE.invalidate_aspect_cache(&cache_key, batch.metadata.aspect.as_uuid()).await;
+		CACHE.invalidate_aspect_cache(&cache_key).await;
 
 		Ok(())
 	}
@@ -323,7 +334,7 @@ impl super::Database {
 		for batch in batches {
 			if invalidated_aspects.insert(batch.metadata.aspect) {
 				let cache_key = format!("aspect_batches_{}", batch.metadata.aspect.as_uuid());
-				CACHE.invalidate_aspect_cache(&cache_key, batch.metadata.aspect.as_uuid()).await;
+				CACHE.invalidate_aspect_cache(&cache_key).await;
 			}
 		}
 
@@ -412,7 +423,7 @@ impl super::Database {
 
 		// Invalidate relevant caches
 		let cache_key = format!("aspect_batches_{}", aspect_id.as_uuid());
-		CACHE.invalidate_aspect_cache(&cache_key, aspect_id.as_uuid()).await;
+		CACHE.invalidate_aspect_cache(&cache_key).await;
 
 		Ok(usize::try_from(rows_affected).map_err(|_| Error::DatabaseError("Too many rows affected".to_string()))?)
 	}
@@ -442,7 +453,7 @@ impl super::Database {
 
 		// Invalidate relevant caches
 		let cache_key = format!("aspect_batches_{}", aspect_id.as_uuid());
-		CACHE.invalidate_aspect_cache(&cache_key, aspect_id.as_uuid()).await;
+		CACHE.invalidate_aspect_cache(&cache_key).await;
 
 		Ok(usize::try_from(rows_affected).map_err(|_| Error::DatabaseError("Too many rows affected".to_string()))?)
 	}
@@ -542,45 +553,36 @@ impl super::Database {
 		Ok(batches)
 	}
 
-	/// Remove a processed batch from the queue (after it has been processed into patterns)
-	///
-	/// # Errors
-	/// - if database not found
-	/// - if unable to delete processed batch
 	pub async fn dequeue_processed_batch(&self, batch: &Batch) -> Result<()> {
-		// Get database info with proper validation
-		let db_id = self.id();
-		let db_info = {
-			let databases = DATABASES.lock().await;
-			databases.get(&db_id).cloned().ok_or_else(|| Error::DatabaseError("Database not found".to_string()))?
-		};
+		// Get aspect information for database access
+		let aspect = batch.metadata.aspect;
+		let mut aspect_data = self.get_aspect(aspect).await?;
 
-		// Find the subject and aspect
-		let (subject_name, aspect_name) = db_info.subjects().values().find_map(|subject| subject.aspects().get(&batch.metadata.aspect).map(|aspect| (subject.name().to_string(), aspect.name().to_string()))).ok_or_else(|| Error::DatabaseError("Subject or aspect not found".to_string()))?;
+		// Remove from processed_batches database
+		let processed_batches_db = aspect_data.processed_batches().await?;
+		let processed_conn = processed_batches_db.connect()?;
 
-		// Get batches database
-		let batches_db_path = format!("{}/{subject_name}/{aspect_name}/batches.db", db_info.path());
-		let batches_turso_db = Self::get_or_create_batches_database(&batches_db_path).await?;
+		let batch_id = batch.batch_id();
 
-		let conn = batches_turso_db.connect()?;
-		let rows_affected = if let Some(batch_id) = batch.batch_id() {
-			// Use batch ID if available
-			conn.execute("DELETE FROM batches WHERE id = ? AND status = 'processed'", turso::params![batch_id.clone()]).await.map_err(|e| Error::DatabaseError(format!("Failed to dequeue processed batch by ID: {e}")))?
-		} else if let Some(batch_hash) = batch.batch_hash() {
-			// Fall back to batch hash
-			conn.execute("DELETE FROM batches WHERE batch_hash = ? AND aspect_id = ? AND database_id = ? AND status = 'processed'", turso::params![batch_hash.clone(), batch.metadata.aspect.as_uuid().to_string(), self.id().as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to dequeue processed batch by hash: {e}")))?
-		} else {
-			return Err(anyhow::Error::msg("Batch has no ID or hash for dequeue identification"));
-		};
+		// Delete from processed batches database
+		let rows_affected = processed_conn.execute("DELETE FROM batches WHERE id = ?", turso::params![batch_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to dequeue processed batch by ID: {e}")))?;
 
-		// Verify that a batch was actually deleted
+		// If no rows affected with batch ID, try with batch hash as fallback
 		if rows_affected == 0 {
-			return Err(anyhow::Error::msg("No matching processed batch found to dequeue"));
+			if let Some(batch_hash) = batch.batch_hash() {
+				let rows_affected = processed_conn.execute("DELETE FROM batches WHERE batch_hash = ? AND aspect_id = ? AND database_id = ?", turso::params![batch_hash.clone(), batch.metadata.aspect.as_uuid().to_string(), self.id().as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to dequeue processed batch by hash: {e}")))?;
+
+				if rows_affected == 0 {
+					return Err(anyhow::Error::msg("No matching processed batch found to dequeue"));
+				}
+			} else {
+				return Err(anyhow::Error::msg("No matching processed batch found to dequeue"));
+			}
 		}
 
 		// Invalidate relevant caches
 		let cache_key = format!("aspect_batches_{}", batch.metadata.aspect.as_uuid());
-		CACHE.invalidate_aspect_cache(&cache_key, batch.metadata.aspect.as_uuid()).await;
+		CACHE.invalidate_aspect_cache(&cache_key).await;
 
 		Ok(())
 	}
@@ -611,7 +613,7 @@ impl super::Database {
 
 		// Invalidate relevant caches
 		let cache_key = format!("aspect_batches_{}", aspect_id.as_uuid());
-		CACHE.invalidate_aspect_cache(&cache_key, aspect_id.as_uuid()).await;
+		CACHE.invalidate_aspect_cache(&cache_key).await;
 
 		Ok(usize::try_from(rows_affected).map_err(|_| Error::DatabaseError("Too many rows affected".to_string()))?)
 	}

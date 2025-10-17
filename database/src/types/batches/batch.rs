@@ -1,10 +1,45 @@
+use std::fmt::Display;
+
 use anyhow::{bail, Result};
 use bigdecimal::{BigDecimal, FromPrimitive, Zero};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::{
 	types::{Analysis, BatchDistance, BatchedMeasurement, MeasurementVector, Relative}, AspectId, DatabaseInfo
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct BatchId(Uuid);
+
+impl BatchId {
+	#[must_use]
+	pub fn new() -> Self {
+		Self(Uuid::new_v4())
+	}
+
+	#[must_use]
+	pub const fn from_uuid(uuid: Uuid) -> Self {
+		Self(uuid)
+	}
+
+	#[must_use]
+	pub const fn as_uuid(&self) -> Uuid {
+		self.0
+	}
+}
+
+impl Default for BatchId {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+impl Display for BatchId {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}", self.0)
+	}
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchMetatdata {
@@ -18,8 +53,7 @@ pub struct BatchMetatdata {
 pub struct Batch {
 	pub metadata: BatchMetatdata,
 	pub measurements: Vec<BatchedMeasurement>,
-	#[serde(skip_serializing_if = "Option::is_none")]
-	pub batch_id: Option<String>,
+	pub batch_id: BatchId,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub batch_hash: Option<String>,
 }
@@ -36,7 +70,7 @@ impl Batch {
 		assert_eq!(measurements.len(), size, "Batch measurements count ({}) must equal expected size ({})", measurements.len(), size);
 
 		let metadata = BatchMetatdata { aspect, resolution, size, database_info };
-		let mut batch = Self { metadata, measurements, batch_id: None, batch_hash: None };
+		let mut batch = Self { metadata, measurements, batch_id: BatchId::new(), batch_hash: None };
 		batch.initialize_measurement_vectors().expect("Failed to initialize measurement vectors");
 		batch.initialize_distances().expect("Failed to initialize distances");
 		batch
@@ -60,12 +94,14 @@ impl Batch {
 		self.measurements.push(measurement);
 	}
 
+	// Updated: since batch_id is no longer optional, return &BatchId directly
 	#[must_use]
-	pub const fn batch_id(&self) -> Option<&String> {
-		self.batch_id.as_ref()
+	pub const fn batch_id(&self) -> &BatchId {
+		&self.batch_id
 	}
 
-	pub fn set_batch_id(&mut self, batch_id: Option<String>) {
+	// Updated: set the batch_id directly (not optional anymore)
+	pub fn set_batch_id(&mut self, batch_id: BatchId) {
 		self.batch_id = batch_id;
 	}
 
