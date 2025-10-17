@@ -1,4 +1,4 @@
-use std::{collections::HashMap, hash::Hash};
+use std::{collections::HashMap, hash::Hash, path::Path};
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -63,7 +63,7 @@ impl Eq for Subject {}
 impl Subject {
 	#[must_use]
 	pub async fn new(id: Option<SubjectId>, name: String, database_id: DatabaseId, database_metadata_db_path: String) -> Result<Self> {
-		let id = id.unwrap_or_else(SubjectId::new);
+		let id = id.unwrap_or_default();
 
 		let subject_path = Self::get_subject_path(database_metadata_db_path.clone(), id).await.unwrap();
 
@@ -73,7 +73,7 @@ impl Subject {
 		Ok(Self { id, name, database_id, database_metadata_db_path, aspects: HashMap::new() })
 	}
 
-	async fn get_database_metadata_path(turso_db_path: String) -> Result<String> {
+	pub async fn get_database_metadata_path(turso_db_path: String) -> Result<String> {
 		let turso_db = Database::get_turso_database(&turso_db_path).await?;
 
 		// Query the database for the metadata_path field of the first item in the database table
@@ -85,7 +85,7 @@ impl Subject {
 		Ok(metadata_path)
 	}
 
-	async fn get_subject_name(turso_db: TursoDatabase, subject_id: SubjectId) -> Result<String> {
+	async fn get_subject_name(turso_db: turso::Database, subject_id: SubjectId) -> Result<String> {
 		// Query the database for the name field where id = subject_id in the subjects table
 		let conn = turso_db.connect()?;
 		let mut rows = conn.query("SELECT name FROM subjects WHERE id = ?", turso::params![subject_id.as_uuid().to_string()]).await?;
@@ -96,7 +96,7 @@ impl Subject {
 	}
 
 	async fn get_subject_path(database_metadata_db_path: String, subject_id: SubjectId) -> Result<String> {
-		let database_metadata_path = Aspect::get_database_metadata_path(self.database_metadata_db_path.clone()).await?;
+		let database_metadata_path = Aspect::get_database_metadata_path(database_metadata_db_path.clone()).await?;
 		let database_metadata_db = Database::get_turso_database(&database_metadata_path).await?;
 		let subject_name = Self::get_subject_name(database_metadata_db, subject_id).await?;
 

@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::{fmt::Display, str::FromStr};
 
 use anyhow::{bail, Result};
 use bigdecimal::{BigDecimal, FromPrimitive, Zero};
@@ -33,6 +33,14 @@ impl Default for BatchId {
 	fn default() -> Self {
 		Self::new()
 	}
+}
+
+impl FromStr for BatchId {
+        type Err = uuid::Error;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Uuid::parse_str(s).map(Self)
+        }
 }
 
 impl Display for BatchId {
@@ -101,7 +109,7 @@ impl Batch {
 	}
 
 	// Updated: set the batch_id directly (not optional anymore)
-	pub fn set_batch_id(&mut self, batch_id: BatchId) {
+	pub const fn set_batch_id(&mut self, batch_id: BatchId) {
 		self.batch_id = batch_id;
 	}
 

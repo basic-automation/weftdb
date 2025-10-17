@@ -1,8 +1,9 @@
 use anyhow::Result;
+use std::str::FromStr;
 
 use super::helpers::safe_ratio;
 use crate::{
-	types::database::traits::{aspect_structure::AspectStructure, database_structure::DatabaseStructure}, AspectId, Batch, BatchedMeasurement, Error, CACHE, DATABASES
+	types::database::traits::{aspect_structure::AspectStructure, database_structure::DatabaseStructure}, AspectId, Batch, BatchId, BatchedMeasurement, Error, CACHE, DATABASES
 };
 
 const BATCH_CHUNK_SIZE: usize = 100;
@@ -112,11 +113,11 @@ impl super::Database {
 
 		let mut batches = Vec::new();
 		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get row: {e}")))? {
-			let batch_id_str = super::value_to_string(row.get_value(0)?, "Batch ID")?;
-			let size_str = super::value_to_string(row.get_value(1)?, "Size")?;
-			let resolution_str = super::value_to_string(row.get_value(2)?, "Resolution")?;
-			let measurements_json = super::value_to_string(row.get_value(3)?, "Measurements")?;
-			let batch_hash = super::value_to_string(row.get_value(4)?, "Batch Hash")?;
+			let batch_id_str = Self::value_to_string(&row.get_value(0)?, "Batch ID").await?;
+			let size_str = Self::value_to_string(&row.get_value(1)?, "Size").await?;
+			let resolution_str = Self::value_to_string(&row.get_value(2)?, "Resolution").await?;
+			let measurements_json = Self::value_to_string(&row.get_value(3)?, "Measurements").await?;
+			let batch_hash = Self::value_to_string(&row.get_value(4)?, "Batch Hash").await?;
 
 			let size: usize = size_str.parse().map_err(|e| Error::DatabaseError(format!("Failed to parse batch size: {e}")))?;
 			let measurements: Vec<BatchedMeasurement> = serde_json::from_str(&measurements_json).map_err(|e| Error::DatabaseError(format!("Failed to deserialize measurements: {e}")))?;
@@ -127,7 +128,7 @@ impl super::Database {
 			let mut batch = Batch::new(size, measurements, resolution, *aspect_id, db_info.clone());
 			// Store the batch hash for identification
 			batch.set_batch_hash(Some(batch_hash));
-			batch.set_batch_id(Some(batch_id_str));
+			batch.set_batch_id(BatchId::from_str(&batch_id_str)?);
 			batches.push(batch);
 		}
 
@@ -138,8 +139,6 @@ impl super::Database {
 		// Get aspect information for database path building
 		let aspect = batch.metadata.aspect;
 		let mut aspect_data = self.get_aspect(aspect).await?;
-		let subject_name = aspect_data.name();
-		let aspect_name = aspect_data.name();
 
 		// Move batch from unprocessed to processed database
 		// 1. Insert into processed_batches database
@@ -151,16 +150,16 @@ impl super::Database {
 		let measurements_json = serde_json::to_string(&batch.measurements).map_err(|e| Error::DatabaseError(format!("Failed to serialize batch measurements: {e}")))?;
 
 		// Insert into processed batches database using concurrent writes
-		let insert_sql = r#"
+		let insert_sql = r"
         INSERT INTO batches (id, aspect_id, database_id, size, resolution, batch_hash, created_at, metadata_json, measurements_json)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             updated_at = strftime('%s', 'now') * 1000,
             metadata_json = excluded.metadata_json,
             measurements_json = excluded.measurements_json
-    "#;
+    ";
 
-		processed_conn.execute(insert_sql, turso::params![batch_id.as_uuid().to_string(), batch.metadata.aspect.as_uuid().to_string(), self.id().as_uuid().to_string(), batch.measurements.len() as i64, serde_json::to_string(&batch.metadata.resolution).unwrap_or_default(), batch.batch_hash().map(|s| s.clone()), chrono::Utc::now().timestamp_millis(), metadata_json, measurements_json]).await.map_err(|e| Error::DatabaseError(format!("Failed to insert batch into processed database: {e}")))?;
+		processed_conn.execute(insert_sql, turso::params![batch_id.as_uuid().to_string(), batch.metadata.aspect.as_uuid().to_string(), self.id().as_uuid().to_string(), batch.measurements.len() as i64, serde_json::to_string(&batch.metadata.resolution).unwrap_or_default(), batch.batch_hash().cloned(), chrono::Utc::now().timestamp_millis(), metadata_json, measurements_json]).await.map_err(|e| Error::DatabaseError(format!("Failed to insert batch into processed database: {e}")))?;
 
 		// 2. Remove from unprocessed_batches database
 		let unprocessed_batches_db = aspect_data.unprocessed_batches().await?;
@@ -383,8 +382,8 @@ impl super::Database {
 
 		let mut stats = BatchStats::default();
 		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get row: {e}")))? {
-			let status = super::value_to_string(row.get_value(0)?, "Status")?;
-			let count_str = super::value_to_string(row.get_value(1)?, "Count")?;
+			let status = Self::value_to_string(&row.get_value(0)?, "Status").await?;
+			let count_str = Self::value_to_string(&row.get_value(1)?, "Count").await?;
 			let count: usize = count_str.parse().map_err(|e| Error::DatabaseError(format!("Failed to parse count: {e}")))?;
 
 			match status.as_str() {
@@ -483,11 +482,11 @@ impl super::Database {
 
 		let mut batches = Vec::new();
 		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get row: {e}")))? {
-			let batch_id_str = super::value_to_string(row.get_value(0)?, "Batch ID")?;
-			let size_str = super::value_to_string(row.get_value(1)?, "Size")?;
-			let resolution_str = super::value_to_string(row.get_value(2)?, "Resolution")?;
-			let measurements_json = super::value_to_string(row.get_value(3)?, "Measurements")?;
-			let batch_hash = super::value_to_string(row.get_value(4)?, "Batch Hash")?;
+			let batch_id_str = Self::value_to_string(&row.get_value(0)?, "Batch ID").await?;
+			let size_str = Self::value_to_string(&row.get_value(1)?, "Size").await?;
+			let resolution_str = Self::value_to_string(&row.get_value(2)?, "Resolution").await?;
+			let measurements_json = Self::value_to_string(&row.get_value(3)?, "Measurements").await?;
+			let batch_hash = Self::value_to_string(&row.get_value(4)?, "Batch Hash").await?;
 
 			let size: usize = size_str.parse().map_err(|e| Error::DatabaseError(format!("Failed to parse batch size: {e}")))?;
 			let measurements: Vec<BatchedMeasurement> = serde_json::from_str(&measurements_json).map_err(|e| Error::DatabaseError(format!("Failed to deserialize measurements: {e}")))?;
@@ -498,7 +497,7 @@ impl super::Database {
 			let mut batch = Batch::new(size, measurements, resolution, *aspect_id, db_info.clone());
 			// Store the batch hash and ID for identification
 			batch.set_batch_hash(Some(batch_hash));
-			batch.set_batch_id(Some(batch_id_str));
+			batch.set_batch_id(BatchId::from_str(&batch_id_str)?);
 			batches.push(batch);
 		}
 
@@ -531,11 +530,11 @@ impl super::Database {
 
 		let mut batches = Vec::new();
 		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get row: {e}")))? {
-			let batch_id_str = super::value_to_string(row.get_value(0)?, "Batch ID")?;
-			let size_str = super::value_to_string(row.get_value(1)?, "Size")?;
-			let resolution_str = super::value_to_string(row.get_value(2)?, "Resolution")?;
-			let measurements_json = super::value_to_string(row.get_value(3)?, "Measurements")?;
-			let batch_hash = super::value_to_string(row.get_value(4)?, "Batch Hash")?;
+			let batch_id_str = Self::value_to_string(&row.get_value(0)?, "Batch ID").await?;
+			let size_str = Self::value_to_string(&row.get_value(1)?, "Size").await?;
+			let resolution_str = Self::value_to_string(&row.get_value(2)?, "Resolution").await?;
+			let measurements_json = Self::value_to_string(&row.get_value(3)?, "Measurements").await?;
+			let batch_hash = Self::value_to_string(&row.get_value(4)?, "Batch Hash").await?;
 
 			let size: usize = size_str.parse().map_err(|e| Error::DatabaseError(format!("Failed to parse batch size: {e}")))?;
 			let measurements: Vec<BatchedMeasurement> = serde_json::from_str(&measurements_json).map_err(|e| Error::DatabaseError(format!("Failed to deserialize measurements: {e}")))?;
@@ -546,7 +545,7 @@ impl super::Database {
 			let mut batch = Batch::new(size, measurements, resolution, *aspect_id, db_info.clone());
 			// Store the batch hash and ID for identification
 			batch.set_batch_hash(Some(batch_hash));
-			batch.set_batch_id(Some(batch_id_str));
+			batch.set_batch_id(BatchId::from_str(&batch_id_str)?);
 			batches.push(batch);
 		}
 

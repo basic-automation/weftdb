@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-pub use batch::Batch;
+pub use batch::{Batch, BatchId, BatchMetatdata};
 use futures::stream::StreamExt;
 use num_cpus::get as get_num_cpus;
 use rayon::{prelude::*, ThreadPoolBuilder};
@@ -9,7 +9,7 @@ use crate::{
 	database::traits::DatabaseStructure, types::{database::traits::ouputs::Outputs, BatchedMeasurement}, AspectId, Database
 };
 
-mod batch;
+pub mod batch;
 pub mod batched_measurements;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,17 +1,17 @@
 pub use aspect::{Aspect, AspectId};
 pub use batches::{
-	batched_measurements::{analysis::Analysis, batched_distance::BatchDistance, BatchedMeasurement}, Batch, Batches
+	batched_measurements::{analysis::Analysis, batched_distance::BatchDistance, BatchedMeasurement}, Batch, BatchId, BatchMetatdata, Batches
 };
 pub use cache::{AnalysisResult, DatabaseCache, CACHE};
 pub use correlation::{Correlation, CorrelationID, Correlations};
 pub use database::{
 	traits::{CorrelationDatabase, DatabaseStructure, EventDatabase, Outputs, PatternDatabase}, Database, DatabaseId, DatabaseInfo, DatabaseMap, DATABASES
 };
-pub use dataset::Dataset;
+pub use dataset::{Dataset, DatasetId};
 pub use dictionary::{Dictionary, DictionaryConstraints, DictionaryId, Steps, Variability, VariablilityType};
 pub use event::{Event, EventID, EventName, Events, Manifestation, ManifestationId};
 pub use input_measurement::InputMeasurement;
-pub use measurement::Measurement;
+pub use measurement::{Measurement, MeasurementId};
 pub use measurement_vector::MeasurementVector;
 pub use occurrence::Occurrence;
 pub use pattern::{Pattern, PatternID};

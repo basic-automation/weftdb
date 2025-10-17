@@ -1,15 +1,14 @@
-use core::panic::PanicMessage;
 use std::{pin::Pin, str::FromStr};
 
 use anyhow::{bail, Result};
 use bigdecimal::{BigDecimal, Zero};
-use chrono::{offset, DateTime, Utc};
+use chrono::{DateTime, Utc};
 use futures::Stream;
 use splimes::{Point, Resolution, Spline};
 use uuid::Uuid;
 
 use crate::{
-	database::traits::{AspectStructure, DatabaseStructure, Outputs}, types::cache::CACHE, AnalysisResult, AspectId, Batch, BatchId, BatchMetatdata, BatchedMeasurement, Database, DatasetId, Error, Measurement
+	AnalysisResult, AspectId, Batch, BatchId, BatchMetatdata, BatchedMeasurement, Database, DatasetId, Error, Measurement, MeasurementId, database::traits::{AspectStructure, DatabaseStructure, Outputs}, types::cache::CACHE
 };
 
 #[async_trait::async_trait]
@@ -28,7 +27,7 @@ impl Outputs for Database {
 		}
 
 		// Get from database with proper scope management
-		let aspect = self.get_aspect(aspect_id).await?;
+		let mut aspect = self.get_aspect(aspect_id).await?;
 		let measurement_db = aspect.measurements().await?;
 
 		// Build query and parameters based on time range
@@ -36,12 +35,12 @@ impl Outputs for Database {
 			(None, None) => {
 				// Return all points
 				(
-					r#"
+					r"
                     SELECT id, dataset_id, timestamp, value 
                     FROM measurements 
                     ORDER BY timestamp ASC 
                     LIMIT ? OFFSET ?
-                    "#
+                    "
 					.to_string(),
 					vec![max_per_page.to_string(), offset.to_string()],
 				)
@@ -49,13 +48,13 @@ impl Outputs for Database {
 			(Some(start_time), None) => {
 				// From start to end of data
 				(
-					r#"
+					r"
                     SELECT id, dataset_id, timestamp, value 
                     FROM measurements 
                     WHERE timestamp >= ?
                     ORDER BY timestamp ASC 
                     LIMIT ? OFFSET ?
-                    "#
+                    "
 					.to_string(),
 					vec![start_time.timestamp_millis().to_string(), max_per_page.to_string(), offset.to_string()],
 				)
@@ -63,13 +62,13 @@ impl Outputs for Database {
 			(None, Some(end_time)) => {
 				// From beginning to end
 				(
-					r#"
+					r"
                     SELECT id, dataset_id, timestamp, value 
                     FROM measurements 
                     WHERE timestamp <= ?
                     ORDER BY timestamp ASC 
                     LIMIT ? OFFSET ?
-                    "#
+                    "
 					.to_string(),
 					vec![end_time.timestamp_millis().to_string(), max_per_page.to_string(), offset.to_string()],
 				)
@@ -77,13 +76,13 @@ impl Outputs for Database {
 			(Some(start_time), Some(end_time)) => {
 				// Specific range
 				(
-					r#"
+					r"
                     SELECT id, dataset_id, timestamp, value 
                     FROM measurements 
                     WHERE timestamp >= ? AND timestamp <= ?
                     ORDER BY timestamp ASC 
                     LIMIT ? OFFSET ?
-                    "#
+                    "
 					.to_string(),
 					vec![start_time.timestamp_millis().to_string(), end_time.timestamp_millis().to_string(), max_per_page.to_string(), offset.to_string()],
 				)
@@ -106,9 +105,9 @@ impl Outputs for Database {
 			let value_str = row.get_value(3)?.as_text().ok_or_else(|| Error::DatabaseError("Value is not text".to_string()))?.clone();
 
 			// Parse the UUIDs from string
-			let id = Uuid::parse_str(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for measurement ID: {e}")))?;
+			let id = MeasurementId::from_string(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for measurement ID: {e}")))?;
 
-			let dataset_id = Uuid::parse_str(&dataset_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for dataset ID: {e}")))?;
+			let dataset_id = DatasetId::from_str(&dataset_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for dataset ID: {e}")))?;
 
 			let timestamp_millis: i64 = timestamp_millis_str.parse().map_err(|e| Error::DatabaseError(format!("Invalid timestamp format: {e}")))?;
 
@@ -137,21 +136,21 @@ impl Outputs for Database {
 	/// Helper function to get boundary measurements (earliest 2 and latest 2 points)
 	/// Used when requested range is outside of available data
 	async fn get_boundary_measurements(&self, aspect_id: AspectId) -> Result<Vec<Measurement>> {
-		let aspect = self.get_aspect(aspect_id).await?;
+		let mut aspect = self.get_aspect(aspect_id).await?;
 		let measurement_db = aspect.measurements().await?;
 		let conn = measurement_db.connect()?;
 
 		let mut all_measurements: Vec<Measurement> = Vec::new();
 
 		// Get earliest 2 measurements
-		let earliest_sql = r#"
-            SELECT id, dataset_id, timestamp, value 
-            FROM measurements 
-            ORDER BY timestamp ASC 
-            LIMIT 2
-        "#;
+		let earliest_sql = r"
+        SELECT id, dataset_id, timestamp, value 
+        FROM measurements 
+        ORDER BY timestamp ASC 
+        LIMIT 2
+    ";
 
-		let mut rows = conn.query(earliest_sql, vec![]).await.map_err(|e| Error::DatabaseError(format!("Failed to query earliest measurements: {e}")))?;
+		let mut rows = conn.query(earliest_sql, turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to query earliest measurements: {e}")))?;
 
 		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get earliest row: {e}")))? {
 			let measurement: Measurement = self.parse_measurement_row(row).await?;
@@ -159,14 +158,14 @@ impl Outputs for Database {
 		}
 
 		// Get latest 2 measurements (avoid duplicates if we have <= 2 total measurements)
-		let latest_sql = r#"
-            SELECT id, dataset_id, timestamp, value 
-            FROM measurements 
-            ORDER BY timestamp DESC 
-            LIMIT 2
-        "#;
+		let latest_sql = r"
+        SELECT id, dataset_id, timestamp, value 
+        FROM measurements 
+        ORDER BY timestamp DESC 
+        LIMIT 2
+    ";
 
-		let mut rows = conn.query(latest_sql, vec![]).await.map_err(|e| Error::DatabaseError(format!("Failed to query latest measurements: {e}")))?;
+		let mut rows = conn.query(latest_sql, turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to query latest measurements: {e}")))?;
 
 		let mut latest_measurements: Vec<Measurement> = Vec::new();
 		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get latest row: {e}")))? {
@@ -195,8 +194,8 @@ impl Outputs for Database {
 		let timestamp_millis_str = row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Timestamp is not text".to_string()))?.clone();
 		let value_str = row.get_value(3)?.as_text().ok_or_else(|| Error::DatabaseError("Value is not text".to_string()))?.clone();
 
-		let id = Uuid::parse_str(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for measurement ID: {e}")))?;
-		let dataset_id = Uuid::parse_str(&dataset_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for dataset ID: {e}")))?;
+		let id = MeasurementId::from_string(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for measurement ID: {e}")))?;
+		let dataset_id = DatasetId::from_str(&dataset_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for dataset ID: {e}")))?;
 		let timestamp_millis: i64 = timestamp_millis_str.parse().map_err(|e| Error::DatabaseError(format!("Invalid timestamp format: {e}")))?;
 		let timestamp = DateTime::from_timestamp_millis(timestamp_millis).ok_or_else(|| Error::DatabaseError("Invalid timestamp".to_string()))?;
 		let value = BigDecimal::from_str(&value_str).map_err(|e| Error::DatabaseError(format!("Invalid value format: {e}")))?;
@@ -206,12 +205,12 @@ impl Outputs for Database {
 
 	/// Get the total count of measurements for an aspect (useful for pagination)
 	async fn get_measurements_count(&self, aspect_id: AspectId) -> Result<usize> {
-		let aspect = self.get_aspect(aspect_id).await?;
+		let mut aspect = self.get_aspect(aspect_id).await?;
 		let measurement_db = aspect.measurements().await?;
 
 		let count_sql = "SELECT COUNT(*) FROM measurements";
 		let conn = measurement_db.connect()?;
-		let mut rows = conn.query(&count_sql, vec![]).await.map_err(|e| Error::DatabaseError(format!("Failed to count measurements: {e}")))?;
+		let mut rows = conn.query(count_sql, turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to count measurements: {e}")))?;
 
 		if let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get count row: {e}")))? {
 			let count_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Count is not text".to_string()))?.clone();
@@ -263,8 +262,8 @@ impl Outputs for Database {
 			}
 
 			// Check if our target time falls within this page's time range
-			let first_time = measurements.first().map(|m| m.timestamp());
-			let last_time = measurements.last().map(|m| m.timestamp());
+			let first_time = measurements.first().map(super::super::measurement::Measurement::timestamp);
+			let last_time = measurements.last().map(super::super::measurement::Measurement::timestamp);
 
 			if let (Some(first), Some(last)) = (first_time, last_time) {
 				if time >= first && time <= last {
@@ -462,7 +461,7 @@ impl Outputs for Database {
 				break; // No more data
 			}
 
-			all_measurements.extend(measurements);
+			all_measurements.extend(measurements.clone());
 
 			// If we got less than a full page, we've reached the end
 			if measurements.len() < page_size {
@@ -491,25 +490,25 @@ impl Outputs for Database {
 		// Try to get from cache first
 		if let Some(cached_batches) = CACHE.get_unprocessed_batches(&cache_key).await {
 			// Since we're looking for a specific batch, find it in the cached results
-			if let Some(batch) = cached_batches.into_iter().find(|b| b.batch_id() == *batch_id) {
+			if let Some(batch) = cached_batches.into_iter().find(|b| *b.batch_id() == *batch_id) {
 				return Ok(batch);
 			}
 			// If not found in cache, fall through to database query
 		}
 
 		// Get from database
-		let aspect = self.get_aspect(*aspect_id).await?;
+		let mut aspect = self.get_aspect(*aspect_id).await?;
 		let unprocessed_batches_db = aspect.unprocessed_batches().await?;
 		let conn = unprocessed_batches_db.connect()?;
 
-		let query_sql = r#"
+		let query_sql = r"
 			SELECT id, aspect_id, database_id, size, resolution, batch_hash, 
 				created_at, processed_at, updated_at, metadata_json, measurements_json
 			FROM batches 
 			WHERE id = ?
-		"#;
+		";
 
-		let mut rows = conn.query(&query_sql, vec![turso::Value::from(batch_id.as_uuid().to_string())]).await.map_err(|e| Error::DatabaseError(format!("Failed to query batch: {e}")))?;
+		let mut rows = conn.query(query_sql, vec![turso::Value::from(batch_id.as_uuid().to_string())]).await.map_err(|e| Error::DatabaseError(format!("Failed to query batch: {e}")))?;
 
 		if let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get batch row: {e}")))? {
 			let metadata_json_str = row.get_value(9)?.as_text().ok_or_else(|| Error::DatabaseError("Metadata JSON is not text".to_string()))?.clone();
@@ -519,7 +518,7 @@ impl Outputs for Database {
 
 			let measurements: Vec<BatchedMeasurement> = serde_json::from_str(&measurements_json_str).map_err(|e| Error::DatabaseError(format!("Failed to parse batch measurements JSON: {e}")))?;
 
-			let batch_hash_str = row.get_value(5)?.as_text().map(|s| s.clone());
+			let batch_hash_str = row.get_value(5)?.as_text().cloned();
 
 			let batch = Batch { metadata, measurements, batch_id: *batch_id, batch_hash: batch_hash_str };
 
@@ -549,13 +548,13 @@ impl Outputs for Database {
 		let conn = unprocessed_batches_db.connect()?;
 
 		// Query batches ordered by created_at (oldest first) for queue processing
-		let query_sql = r#"
+		let query_sql = r"
                         SELECT id, aspect_id, database_id, size, resolution, batch_hash, 
                                 created_at, updated_at, metadata_json, measurements_json
                         FROM batches 
                         WHERE aspect_id = ? AND database_id = ?
                         ORDER BY created_at ASC
-                "#;
+                ";
 
 		let mut rows = conn.query(query_sql, turso::params![aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query unprocessed batches: {e}")))?;
 
@@ -595,7 +594,7 @@ impl Outputs for Database {
 
 		let measurements: Vec<BatchedMeasurement> = serde_json::from_str(&measurements_json_str).map_err(|e| Error::DatabaseError(format!("Failed to parse batch measurements JSON: {e}")))?;
 
-		let batch_hash_str = row.get_value(5)?.as_text().map(|s| s.clone());
+		let batch_hash_str = row.get_value(5)?.as_text().cloned();
 
 		Ok(Batch { metadata, measurements, batch_id, batch_hash: batch_hash_str })
 	}

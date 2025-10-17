@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::{fmt::Display, str::FromStr};
 
 use fake::{Dummy, Faker};
 use rand::Rng;
@@ -37,6 +37,14 @@ impl Display for DatasetId {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		write!(f, "{}", self.0)
 	}
+}
+
+impl FromStr for DatasetId {
+        type Err = uuid::Error;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Uuid::parse_str(s).map(Self)
+        }
 }
 
 #[derive(Debug, Clone)]

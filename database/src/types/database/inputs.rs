@@ -1,14 +1,12 @@
 use anyhow::{bail, Result};
 
 use crate::{
-	aspect, database::traits::Inputs, types::{
+	database::traits::Inputs, types::{
 		database::{
 			helpers::safe_usize_to_f64, traits::{aspect_structure::AspectStructure, DatabaseStructure}
 		}, Transaction, TxId
-	}, Aspect, Database, Error, InputMeasurement, Measurement, CACHE
+	}, AspectId, Batch, Database, DatasetId, Error, InputMeasurement, Measurement, CACHE
 };
-
-const CHUNK_SIZE: usize = 1000;
 
 #[async_trait::async_trait]
 impl Inputs for Database {
@@ -30,12 +28,12 @@ impl Inputs for Database {
 		// Use INSERT ... ON CONFLICT for atomic upsert with concurrent writes support
 		// This handles the case where a measurement with the same timestamp already exists
 		let upsert_sql = r#"
-            INSERT INTO measurements (id, dataset_id, timestamp, value) 
-            VALUES (?, ?, ?, ?) 
-            ON CONFLICT(timestamp) DO UPDATE SET 
-                value = (CAST(excluded.value AS REAL) + CAST(measurements.value AS REAL)) / 2.0,
-                id = excluded.id
-        "#;
+                        INSERT INTO measurements (id, dataset_id, timestamp, value) 
+                        VALUES (?, ?, ?, ?) 
+                        ON CONFLICT(timestamp) DO UPDATE SET 
+                                value = (CAST(excluded.value AS REAL) + CAST(measurements.value AS REAL)) / 2.0,
+                                id = excluded.id
+                "#;
 
 		conn.execute(&upsert_sql, turso::params![tx_id.as_uuid().to_string(), dataset_id.as_uuid().to_string(), measurement.timestamp().timestamp_millis().to_string(), measurement.value().to_string()]).await?;
 
@@ -130,7 +128,7 @@ impl Inputs for Database {
 		CACHE.invalidate_aspect_cache(&cache_key).await;
 
 		// Update earliest and latest in metadata
-		self.update_aspect_timestamps(&aspect, min_new, max_new).await?;
+		self.update_aspect_timestamps(&aspect.id(), min_new, max_new).await?;
 
 		Ok(all_tx_ids)
 	}
@@ -219,7 +217,7 @@ impl Inputs for Database {
 		CACHE.invalidate_aspect_cache(&cache_key).await;
 
 		// Update earliest and latest in metadata
-		self.update_aspect_timestamps(&aspect, min_new, max_new).await?;
+		self.update_aspect_timestamps(&aspect.id(), min_new, max_new).await?;
 
 		// Print summary for large batches
 		if input_measurements.len() > 100_000 {
@@ -263,7 +261,7 @@ impl Inputs for Database {
 	}
 
 	async fn insert_unprocessed_batch(&self, aspect_id: AspectId, batch: &Batch) -> Result<TxId> {
-		let aspect = self.get_aspect(aspect_id).await?;
+		let mut aspect = self.get_aspect(aspect_id).await?;
 		let unprocessed_batches_db = aspect.unprocessed_batches().await?;
 		let conn = unprocessed_batches_db.connect()?;
 		let tx_id = TxId::new();
@@ -295,13 +293,13 @@ impl Inputs for Database {
 			.execute(
 				insert_sql,
 				turso::params![
-					batch.batch_id().unwrap_or(&tx_id.as_uuid().to_string()), // Use tx_id as fallback ID
+					batch.batch_id().as_uuid().to_string(),
 					batch.metadata.aspect.as_uuid().to_string(),
-					batch.metadata.database_info.to_string(), // Assuming DatabaseInfo has Display/ToString
+					batch.metadata.database_info.to_json_str()?,
 					batch.metadata.size.to_string(),
 					batch.metadata.resolution.to_string(),
 					"unprocessed", // Default status since Batch doesn't have this field
-					batch.batch_hash().unwrap_or(&String::new()),
+					batch.batch_hash().unwrap_or(&String::new()).clone(),
 					current_timestamp.to_string(),
 					Option::<String>::None, // processed_at is None for unprocessed batches
 					current_timestamp.to_string(),
@@ -314,10 +312,10 @@ impl Inputs for Database {
 		// Check if the insert was successful or skipped
 		if rows_affected > 0 {
 			// Record the transaction for successful insert
-			self.record_transaction(&format!("Inserted unprocessed batch {} for aspect {}", batch.batch_id().unwrap_or(&tx_id.as_uuid().to_string()), batch.metadata.aspect)).await
+			self.record_transaction(&format!("Inserted unprocessed batch {} for aspect {}", batch.batch_id().as_uuid().to_string(), batch.metadata.aspect)).await
 		} else {
 			// Batch already exists, log that it was skipped
-			self.record_transaction(&format!("Skipped duplicate batch {} for aspect {} (already exists)", batch.batch_id().unwrap_or(&tx_id.as_uuid().to_string()), batch.metadata.aspect)).await?;
+			self.record_transaction(&format!("Skipped duplicate batch {} for aspect {} (already exists)", batch.batch_id().as_uuid().to_string(), batch.metadata.aspect)).await?;
 			Ok(tx_id)
 		}
 	}
@@ -337,7 +335,7 @@ impl Inputs for Database {
 			return Ok(Vec::new());
 		}
 
-		let aspect = self.get_aspect(aspect_id).await?;
+		let mut aspect = self.get_aspect(aspect_id).await?;
 		let unprocessed_batches_db = aspect.unprocessed_batches().await?;
 		let conn = unprocessed_batches_db.connect()?;
 
@@ -411,12 +409,12 @@ impl Inputs for Database {
 				.execute(
 					insert_sql,
 					turso::params![
-						batch.batch_id().unwrap_or(&tx_id.as_uuid().to_string()),
+						batch.batch_id().as_uuid().to_string(),
 						batch.metadata.aspect.as_uuid().to_string(),
-						batch.metadata.database_info.to_string(),
+						batch.metadata.database_info.to_json_str()?,
 						batch.metadata.size.to_string(),
 						batch.metadata.resolution.to_string(),
-						batch.batch_hash().unwrap_or(&String::new()),
+						batch.batch_hash().unwrap_or(&String::new()).clone(),
 						current_timestamp.to_string(),
 						Option::<String>::None, // processed_at is None for unprocessed batches
 						current_timestamp.to_string(),
@@ -437,7 +435,7 @@ impl Inputs for Database {
 	}
 
 	async fn insert_processed_batch(&self, aspect_id: AspectId, batch: &Batch) -> Result<TxId> {
-		let aspect = self.get_aspect(aspect_id).await?;
+		let mut aspect = self.get_aspect(aspect_id).await?;
 		let processed_batches_db = aspect.processed_batches().await?;
 		let conn = processed_batches_db.connect()?;
 		let tx_id = TxId::new();
@@ -459,12 +457,12 @@ impl Inputs for Database {
 			.execute(
 				insert_sql,
 				turso::params![
-					batch.batch_id().unwrap_or(&tx_id.as_uuid().to_string()),
+					batch.batch_id().as_uuid().to_string(),
 					batch.metadata.aspect.as_uuid().to_string(),
-					batch.metadata.database_info.to_string(),
+					batch.metadata.database_info.to_json_str()?,
 					batch.metadata.size.to_string(),
 					batch.metadata.resolution.to_string(),
-					batch.batch_hash().unwrap_or(&String::new()),
+					batch.batch_hash().unwrap_or(&String::new()).clone(),
 					current_timestamp.to_string(),
 					current_timestamp.to_string(), // processed_at
 					current_timestamp.to_string(),
@@ -475,10 +473,10 @@ impl Inputs for Database {
 			.await?;
 
 		if rows_affected > 0 {
-			self.record_transaction(&format!("Inserted processed batch {} for aspect {}", batch.batch_id().unwrap_or(&tx_id.as_uuid().to_string()), batch.metadata.aspect)).await
+			self.record_transaction(&format!("Inserted processed batch {} for aspect {}", batch.batch_id().as_uuid().to_string(), batch.metadata.aspect.as_uuid().to_string())).await
 		} else {
 			// Batch already exists, log that it was skipped
-			self.record_transaction(&format!("Skipped duplicate processed batch {} for aspect {} (already exists)", batch.batch_id().unwrap_or(&tx_id.as_uuid().to_string()), batch.metadata.aspect)).await?;
+			self.record_transaction(&format!("Skipped duplicate processed batch {} for aspect {} (already exists)", batch.batch_id().as_uuid().to_string(), batch.metadata.aspect.as_uuid().to_string())).await?;
 			Ok(tx_id)
 		}
 	}
@@ -487,7 +485,7 @@ impl Inputs for Database {
 		if batches.is_empty() {
 			return Ok(Vec::new());
 		}
-		let aspect = self.get_aspect(aspect_id).await?;
+		let mut aspect = self.get_aspect(aspect_id).await?;
 		let processed_batches_db = aspect.processed_batches().await?;
 		let conn = processed_batches_db.connect()?;
 
