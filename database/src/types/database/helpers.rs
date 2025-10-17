@@ -1,18 +1,8 @@
-use std::str::FromStr;
-
-use anyhow::{bail, Result};
-use chrono::{DateTime, Utc};
 use splimes::Point;
-use uuid::Uuid;
 
-use crate::{types::database::traits::aspect_structure::AspectStructure, AspectId, Database, Error, Measurement, CACHE, DATABASES};
+use crate::{Database, Error, Measurement};
 
 impl Database {
-	pub(crate) fn sanitize_table_name(name: &str) -> String {
-		// Replace special characters with underscores
-		name.chars().map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' }).collect()
-	}
-
 	#[must_use]
 	pub fn measurements_to_points(measurements: &[Measurement]) -> Vec<Point> {
 		measurements.iter().map(|m| Point { timestamp: m.timestamp(), value: m.value().clone() }).collect()

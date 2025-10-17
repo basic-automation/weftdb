@@ -7,7 +7,7 @@ use anyhow::Result;
 use bigdecimal::{BigDecimal, FromPrimitive, Zero};
 use chrono::Datelike;
 use database::{
-	database::traits::{DatabaseStructure, Outputs}, AspectId, Database, DictionaryId, Resolution
+	database::traits::{DatabaseStructure, Outputs}, AspectId, BatchId, Database, DictionaryId, Resolution
 };
 use futures::StreamExt;
 use rayon::prelude::*;
@@ -56,7 +56,7 @@ pub async fn build_processed_batch_queue(database: &Database, aspect_id: &databa
 	println!("Processing {} unprocessed batches from database", unprocessed_batches.len());
 
 	// Store batch IDs before processing (since processing modifies the batch but we need original IDs)
-	let batch_ids: Vec<_> = unprocessed_batches.iter().filter_map(|batch| batch.batch_id().cloned()).collect();
+	let batch_ids: Vec<BatchId> = unprocessed_batches.iter().map(|batch| *batch.batch_id()).collect();
 
 	let batch_hashes: Vec<_> = unprocessed_batches.iter().filter_map(|batch| batch.batch_hash().cloned()).collect();
 
@@ -82,7 +82,7 @@ pub async fn build_processed_batch_queue(database: &Database, aspect_id: &databa
 	println!("Marking batches as processed in database");
 	let total_batch_ids = batch_ids.len();
 	for (i, batch_id) in batch_ids.iter().enumerate() {
-		database.mark_batch_processed_by_id(batch_id, aspect_id).await?;
+		database.mark_batch_processed_by_id(&batch_id.to_string(), aspect_id).await?;
 
 		if (i + 1) % 1000 == 0 || (i + 1) == total_batch_ids {
 			println!("Marked {} / {} batch IDs as processed", i + 1, total_batch_ids);

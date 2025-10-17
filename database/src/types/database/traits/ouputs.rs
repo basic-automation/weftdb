@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use futures::Stream;
 use splimes::{Point, Resolution, Spline};
 
-use crate::AspectId;
+use crate::{AspectId, Batch, BatchId, Measurement};
 
 /// Trait for database analysis and output operations
 #[async_trait::async_trait]

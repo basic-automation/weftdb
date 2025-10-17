@@ -61,9 +61,9 @@ impl Database {
 
 		let mut events = Vec::new();
 		while let Some(row) = rows.next().await.map_err(|e| crate::Error::DatabaseError(format!("Failed to get row: {e}")))? {
-			let event_id_str = super::value_to_string(row.get_value(0)?, "Event ID")?;
-			let event_name = super::value_to_string(row.get_value(1)?, "Event name")?;
-			let manifestations_json = super::value_to_string(row.get_value(2)?, "Manifestations")?;
+			let event_id_str = Self::value_to_string(&row.get_value(0)?, "Event ID").await?;
+			let event_name = Self::value_to_string(&row.get_value(1)?, "Event name").await?;
+			let manifestations_json = Self::value_to_string(&row.get_value(2)?, "Manifestations").await?;
 
 			let event_id = crate::EventID::from_uuid(Uuid::parse_str(&event_id_str)?);
 			let manifestations: HashMap<crate::ManifestationId, crate::Manifestation> = serde_json::from_str(&manifestations_json).map_err(|e| crate::Error::DatabaseError(format!("Failed to deserialize manifestations: {e}")))?;
@@ -190,8 +190,8 @@ impl Database {
 
 		let mut stats = EventStats::default();
 		while let Some(row) = rows.next().await.map_err(|e| crate::Error::DatabaseError(format!("Failed to get row: {e}")))? {
-			let status = super::value_to_string(row.get_value(0)?, "Status")?;
-			let count_str = super::value_to_string(row.get_value(1)?, "Count")?;
+			let status = Self::value_to_string(&row.get_value(0)?, "Status").await?;
+			let count_str = Self::value_to_string(&row.get_value(1)?, "Count").await?;
 			let count: usize = count_str.parse().map_err(|e| crate::Error::DatabaseError(format!("Failed to parse count: {e}")))?;
 
 			match status.as_str() {
@@ -273,9 +273,9 @@ impl Database {
 
 		let mut events = Vec::new();
 		while let Some(row) = rows.next().await.map_err(|e| crate::Error::DatabaseError(format!("Failed to get row: {e}")))? {
-			let event_id_str = super::value_to_string(row.get_value(0)?, "Event ID")?;
-			let event_name = super::value_to_string(row.get_value(1)?, "Event name")?;
-			let manifestations_json = super::value_to_string(row.get_value(2)?, "Manifestations")?;
+			let event_id_str = Self::value_to_string(&row.get_value(0)?, "Event ID").await?;
+			let event_name = Self::value_to_string(&row.get_value(1)?, "Event name").await?;
+			let manifestations_json = Self::value_to_string(&row.get_value(2)?, "Manifestations").await?;
 
 			let event_id = crate::EventID::from_uuid(Uuid::parse_str(&event_id_str)?);
 			let manifestations: HashMap<crate::ManifestationId, crate::Manifestation> = serde_json::from_str(&manifestations_json).map_err(|e| crate::Error::DatabaseError(format!("Failed to deserialize manifestations: {e}")))?;
@@ -312,9 +312,9 @@ impl Database {
 
 		let mut events = Vec::new();
 		while let Some(row) = rows.next().await.map_err(|e| crate::Error::DatabaseError(format!("Failed to get row: {e}")))? {
-			let event_id_str = super::value_to_string(row.get_value(0)?, "Event ID")?;
-			let event_name = super::value_to_string(row.get_value(1)?, "Event name")?;
-			let manifestations_json = super::value_to_string(row.get_value(2)?, "Manifestations")?;
+			let event_id_str = Self::value_to_string(&row.get_value(0)?, "Event ID").await?;
+			let event_name = Self::value_to_string(&row.get_value(1)?, "Event name").await?;
+			let manifestations_json = Self::value_to_string(&row.get_value(2)?, "Manifestations").await?;
 
 			let event_id = crate::EventID::from_uuid(Uuid::parse_str(&event_id_str)?);
 			let manifestations: HashMap<crate::ManifestationId, crate::Manifestation> = serde_json::from_str(&manifestations_json).map_err(|e| crate::Error::DatabaseError(format!("Failed to deserialize manifestations: {e}")))?;

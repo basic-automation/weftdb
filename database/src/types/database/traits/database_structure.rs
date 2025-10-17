@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use splimes::Resolution;
 
-use crate::{Aspect, AspectId, Database, Subject, SubjectId, Transaction, TxId};
+use crate::{Aspect, AspectId, Database, DatabaseId, DatabaseInfo, Subject, SubjectId, Transaction, TxId};
 
 /// Trait for database structure operations
 /// This trait defines the operations related to managing the structure of the database.
@@ -18,7 +18,7 @@ pub trait DatabaseStructure {
 	/// Load an existing Database
 	async fn existing(name: &str) -> Result<Database>;
 
-	/// Get database db_info
+	/// Get database `db_info`
 	async fn get_database_info(&self) -> Result<DatabaseInfo>;
 
 	/// get Turso database
@@ -28,13 +28,13 @@ pub trait DatabaseStructure {
 	async fn create_turso_database(path: &str) -> Result<turso::Database>;
 
 	/// get database id
-	const fn id(&self) -> DatabaseId;
+	fn id(&self) -> DatabaseId;
 
 	/// get database name
 	fn name(&self) -> &str;
 
 	/// Get Metadata Database
-	const fn metadata(&self) -> &turso::Database;
+	fn metadata(&self) -> &turso::Database;
 
 	fn metadata_path(&self) -> &str;
 
@@ -117,5 +117,5 @@ pub trait DatabaseStructure {
 	async fn get_aspect_resolution(&self, aspect_id: &AspectId) -> Result<Option<Resolution>>;
 
 	/// Helper to update aspect metadata timestamps
-	async fn update_aspect_timestamps(&self, aspect: &Aspect, min_new: DateTime<Utc>, max_new: DateTime<Utc>) -> Result<()>;
+	async fn update_aspect_timestamps(&self, aspect_id: &AspectId, min_new: DateTime<Utc>, max_new: DateTime<Utc>) -> Result<()>;
 }

@@ -1,11 +1,7 @@
-use std::path::Path;
-
 use anyhow::Result;
-use chrono::{DateTime, Utc};
 use splimes::Resolution;
-use turso::Transaction;
 
-use crate::{Aspect, AspectId, Subject, SubjectId, TxId};
+use crate::{Aspect, AspectId, SubjectId};
 
 /// Trait for database structure operations
 /// This trait defines the operations related to managing the structure of the database.
@@ -17,13 +13,13 @@ pub trait AspectStructure {
 
 	async fn new(id: Option<AspectId>, name: String, subject_id: SubjectId, resolution: Resolution, database_metadata_db_path: String) -> Result<Aspect>;
 
-	const fn id(&self) -> AspectId;
+	fn id(&self) -> AspectId;
 
-	const fn name(&self) -> &str;
+	fn name(&self) -> &str;
 
-	const fn subject_id(&self) -> SubjectId;
+	fn subject_id(&self) -> SubjectId;
 
-	const fn resolution(&self) -> Resolution;
+	fn resolution(&self) -> Resolution;
 
 	async fn database_metadata(&self) -> Result<turso::Database>;
 
@@ -34,7 +30,7 @@ pub trait AspectStructure {
 	async fn get_aspect_path(turso_db_path: String, subject_id: SubjectId, aspect_name: String) -> Result<String>;
 
 	/// get measurements database
-	async fn measurements(&mut self) -> Result<TursoDatabase>;
+	async fn measurements(&mut self) -> Result<turso::Database>;
 
 	/// set measurements database
 	fn set_measurements(&mut self, turso_db: turso::Database);

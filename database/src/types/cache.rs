@@ -5,7 +5,6 @@ use std::{
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
-use uuid::Uuid;
 
 use crate::{Batch, Measurement};
 

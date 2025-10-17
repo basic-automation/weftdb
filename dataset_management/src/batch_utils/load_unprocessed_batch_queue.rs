@@ -33,7 +33,7 @@ pub async fn build_unprocessed_queue(database: &Database, aspect: &AspectId, res
 
 	// Create sliding window batches (overlapping)
 	if batch_size > 0 && all_points.len() >= batch_size {
-		let database_info = database.get_database_info().await.ok_or_else(|| anyhow::anyhow!("Database info not available"))?;
+		let database_info = database.get_database_info().await.map_err(|_| anyhow::anyhow!("Database info not available"))?;
 
 		let total_batches = all_points.len() - batch_size + 1;
 		println!("Creating {total_batches} sliding window batches...");

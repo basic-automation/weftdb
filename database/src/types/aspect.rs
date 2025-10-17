@@ -1,17 +1,12 @@
-use std::{
-	fmt::Display, path::{self, Path}
-};
+use std::{fmt::Display, path::Path};
 
 use anyhow::{bail, Result};
-use fake::locales::Data;
 use serde::{Deserialize, Serialize};
 use splimes::Resolution;
 use turso::Database as TursoDatabase;
 use uuid::Uuid;
 
-use crate::{
-	aspect, batches, database::{self, traits::AspectStructure}, event, transaction::Transaction, types::database::traits::aspect_structure::AspectStructure, Database, DatabaseStructure, SubjectId, TxId
-};
+use crate::{types::database::traits::aspect_structure::AspectStructure, Database, DatabaseStructure, SubjectId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AspectId(Uuid);
@@ -70,7 +65,7 @@ pub struct Aspect {
 #[async_trait::async_trait]
 impl AspectStructure for Aspect {
 	async fn new(id: Option<AspectId>, name: String, subject_id: SubjectId, resolution: Resolution, database_metadata_db_path: String) -> Result<Self> {
-		let id = id.unwrap_or_else(AspectId::new);
+		let id = id.unwrap_or_default();
 
 		let aspect_path = Self::get_aspect_path(database_metadata_db_path.clone(), subject_id, name.clone()).await?;
 
@@ -86,10 +81,10 @@ impl AspectStructure for Aspect {
 		match measurements {
 			Some(ref db) => {
 				let conn = db.connect()?;
-				Aspect::wireframe_measurements_tables(&conn).await?
+				Self::wireframe_measurements_tables(&conn).await?;
 			}
 			None => bail!("Failed to get or create measurements database"),
-		};
+		}
 
 		let unprocessed_batches_db_path = aspect_path.clone() + "/unprocessed_batches.db";
 		let unprocessed_batches = match Database::get_turso_database(&unprocessed_batches_db_path).await {
@@ -100,7 +95,7 @@ impl AspectStructure for Aspect {
 		match unprocessed_batches {
 			Some(ref db) => {
 				let conn = db.connect()?;
-				Aspect::wireframe_batches_tables(&conn).await?;
+				Self::wireframe_batches_tables(&conn).await?;
 			}
 			None => bail!("Failed to get or create unprocessed batches database"),
 		}
@@ -114,7 +109,7 @@ impl AspectStructure for Aspect {
 		match processed_batches {
 			Some(ref db) => {
 				let conn = db.connect()?;
-				Aspect::wireframe_batches_tables(&conn).await?;
+				Self::wireframe_batches_tables(&conn).await?;
 			}
 			None => bail!("Failed to get or create processed batches database"),
 		}
@@ -128,7 +123,7 @@ impl AspectStructure for Aspect {
 		match patterns {
 			Some(ref db) => {
 				let conn = db.connect()?;
-				Aspect::wireframe_patterns_tables(&conn).await?
+				Self::wireframe_patterns_tables(&conn).await?;
 			}
 			None => bail!("Failed to get or create patterns database"),
 		}
@@ -142,7 +137,7 @@ impl AspectStructure for Aspect {
 		match events {
 			Some(ref db) => {
 				let conn = db.connect()?;
-				Aspect::wireframe_events_tables(&conn).await?
+				Self::wireframe_events_tables(&conn).await?;
 			}
 			None => bail!("Failed to get or create events database"),
 		}
@@ -156,10 +151,10 @@ impl AspectStructure for Aspect {
 		match correlations {
 			Some(ref db) => {
 				let conn = db.connect()?;
-				Aspect::wireframe_correlations_tables(&conn).await?
+				Self::wireframe_correlations_tables(&conn).await?;
 			}
 			None => bail!("Failed to get or create correlations database"),
-		};
+		}
 
 		#[rustfmt::skip]
 		Ok(Self {
@@ -177,7 +172,7 @@ impl AspectStructure for Aspect {
                 })
 	}
 
-	const fn id(&self) -> AspectId {
+	fn id(&self) -> AspectId {
 		self.id
 	}
 
@@ -185,11 +180,11 @@ impl AspectStructure for Aspect {
 		&self.name
 	}
 
-	const fn subject_id(&self) -> SubjectId {
+	fn subject_id(&self) -> SubjectId {
 		self.subject_id
 	}
 
-	const fn resolution(&self) -> Resolution {
+	fn resolution(&self) -> Resolution {
 		self.resolution
 	}
 
@@ -221,11 +216,10 @@ impl AspectStructure for Aspect {
 	}
 
 	async fn get_aspect_path(turso_db_path: String, subject_id: SubjectId, aspect_name: String) -> Result<String> {
-		let database_metadata_path = Aspect::get_database_metadata_path(self.database_metadata_db_path.clone()).await?;
-		let database_metadata_db = Database::get_turso_database(&database_metadata_path).await?;
+		let database_metadata_db = Database::get_turso_database(&turso_db_path).await?;
 		let subject_name = Self::get_subject_name(database_metadata_db, subject_id).await?;
 
-		let aspect_metadata_path = Path::new(&database_metadata_path).join(subject_name).join(aspect_name);
+		let aspect_metadata_path = Path::new(&turso_db_path).join(subject_name).join(aspect_name);
 
 		if aspect_metadata_path.exists() {
 			Ok(aspect_metadata_path.to_string_lossy().to_string())
@@ -236,11 +230,11 @@ impl AspectStructure for Aspect {
 
 	async fn measurements(&mut self) -> Result<TursoDatabase> {
 		if self.measurements.is_none() {
-			let database_metadata_path = Aspect::get_database_metadata_path(self.database_metadata_db_path.clone()).await?;
+			let database_metadata_path = Self::get_database_metadata_path(self.database_metadata_db_path.clone()).await?;
 			let database_metadata_db = Database::get_turso_database(&database_metadata_path).await?;
-			let _subject_name = Aspect::get_subject_name(database_metadata_db, self.subject_id).await?;
+			let _subject_name = Self::get_subject_name(database_metadata_db, self.subject_id).await?;
 
-			let aspect_path = Aspect::get_aspect_path(database_metadata_path, self.subject_id, self.name.clone()).await?;
+			let aspect_path = Self::get_aspect_path(database_metadata_path, self.subject_id, self.name.clone()).await?;
 			let aspect_measurements_path = Path::new(&aspect_path).with_file_name("measurements.db").to_string_lossy().to_string();
 
 			// If the measurements_path exists, open the TursoDatabase
@@ -255,7 +249,7 @@ impl AspectStructure for Aspect {
 	}
 
 	fn set_measurements(&mut self, turso_db: TursoDatabase) {
-		self.measurements = Some(turso_db)
+		self.measurements = Some(turso_db);
 	}
 
 	async fn wireframe_measurements_tables(conn: &turso::Connection) -> Result<()> {
@@ -279,11 +273,11 @@ impl AspectStructure for Aspect {
 
 	async fn unprocessed_batches(&mut self) -> Result<TursoDatabase> {
 		if self.unprocessed_batches.is_none() {
-			let database_metadata_path = Aspect::get_database_metadata_path(self.database_metadata_db_path.clone()).await?;
+			let database_metadata_path = Self::get_database_metadata_path(self.database_metadata_db_path.clone()).await?;
 			let database_metadata_db = Database::get_turso_database(&database_metadata_path).await?;
-			let _subject_name = Aspect::get_subject_name(database_metadata_db, self.subject_id).await?;
+			let _subject_name = Self::get_subject_name(database_metadata_db, self.subject_id).await?;
 
-			let aspect_path = Aspect::get_aspect_path(database_metadata_path, self.subject_id, self.name.clone()).await?;
+			let aspect_path = Self::get_aspect_path(database_metadata_path, self.subject_id, self.name.clone()).await?;
 			let aspect_batches_path = Path::new(&aspect_path).with_file_name("unprocessed_batches.db").to_string_lossy().to_string();
 
 			// If the batches_path exists, open the TursoDatabase
@@ -339,11 +333,11 @@ impl AspectStructure for Aspect {
 
 	async fn processed_batches(&mut self) -> Result<TursoDatabase> {
 		if self.processed_batches.is_none() {
-			let database_metadata_path = Aspect::get_database_metadata_path(self.database_metadata_db_path.clone()).await?;
+			let database_metadata_path = Self::get_database_metadata_path(self.database_metadata_db_path.clone()).await?;
 			let database_metadata_db = Database::get_turso_database(&database_metadata_path).await?;
-			let _subject_name = Aspect::get_subject_name(database_metadata_db, self.subject_id).await?;
+			let _subject_name = Self::get_subject_name(database_metadata_db, self.subject_id).await?;
 
-			let aspect_path = Aspect::get_aspect_path(database_metadata_path, self.subject_id, self.name.clone()).await?;
+			let aspect_path = Self::get_aspect_path(database_metadata_path, self.subject_id, self.name.clone()).await?;
 			let aspect_batches_path = Path::new(&aspect_path).with_file_name("processed_batches.db").to_string_lossy().to_string();
 
 			// If the batches_path exists, open the TursoDatabase
@@ -363,11 +357,11 @@ impl AspectStructure for Aspect {
 
 	async fn patterns(&mut self) -> Result<TursoDatabase> {
 		if self.patterns.is_none() {
-			let database_metadata_path = Aspect::get_database_metadata_path(self.database_metadata_db_path.clone()).await?;
+			let database_metadata_path = Self::get_database_metadata_path(self.database_metadata_db_path.clone()).await?;
 			let database_metadata_db = Database::get_turso_database(&database_metadata_path).await?;
-			let _subject_name = Aspect::get_subject_name(database_metadata_db, self.subject_id).await?;
+			let _subject_name = Self::get_subject_name(database_metadata_db, self.subject_id).await?;
 
-			let aspect_path = Aspect::get_aspect_path(database_metadata_path, self.subject_id, self.name.clone()).await?;
+			let aspect_path = Self::get_aspect_path(database_metadata_path, self.subject_id, self.name.clone()).await?;
 			let aspect_patterns_path = Path::new(&aspect_path).with_file_name("patterns.db").to_string_lossy().to_string();
 
 			// If the patterns_path exists, open the TursoDatabase
@@ -458,11 +452,11 @@ impl AspectStructure for Aspect {
 
 	async fn events(&mut self) -> Result<TursoDatabase> {
 		if self.events.is_none() {
-			let database_metadata_path = Aspect::get_database_metadata_path(self.database_metadata_db_path.clone()).await?;
+			let database_metadata_path = Self::get_database_metadata_path(self.database_metadata_db_path.clone()).await?;
 			let database_metadata_db = Database::get_turso_database(&database_metadata_path).await?;
-			let _subject_name = Aspect::get_subject_name(database_metadata_db, self.subject_id).await?;
+			let _subject_name = Self::get_subject_name(database_metadata_db, self.subject_id).await?;
 
-			let aspect_path = Aspect::get_aspect_path(database_metadata_path.to_string(), self.subject_id, self.name.clone()).await?;
+			let aspect_path = Self::get_aspect_path(database_metadata_path.clone(), self.subject_id, self.name.clone()).await?;
 			let aspect_events_path = Path::new(&aspect_path).with_file_name("events.db").to_string_lossy().to_string();
 
 			// If the events_path exists, open the TursoDatabase
@@ -523,11 +517,11 @@ impl AspectStructure for Aspect {
 
 	async fn correlations(&mut self) -> Result<TursoDatabase> {
 		if self.correlations.is_none() {
-			let database_metadata_path = Aspect::get_database_metadata_path(self.database_metadata_db_path.clone()).await?;
+			let database_metadata_path = Self::get_database_metadata_path(self.database_metadata_db_path.clone()).await?;
 			let database_metadata_db = Database::get_turso_database(&database_metadata_path).await?;
-			let _subject_name = Aspect::get_subject_name(database_metadata_db, self.subject_id).await?;
+			let _subject_name = Self::get_subject_name(database_metadata_db, self.subject_id).await?;
 
-			let aspect_path = Aspect::get_aspect_path(database_metadata_path, self.subject_id, self.name.clone()).await?;
+			let aspect_path = Self::get_aspect_path(database_metadata_path, self.subject_id, self.name.clone()).await?;
 			let aspect_correlations_path = Path::new(&aspect_path).with_file_name("correlations.db").to_string_lossy().to_string();
 
 			// If the correlations_path exists, open the TursoDatabase

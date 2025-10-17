@@ -104,12 +104,12 @@ impl super::Database {
 
 		let mut correlations = Vec::new();
 		while let Some(row) = rows.next().await.map_err(|e| crate::Error::DatabaseError(format!("Failed to get row: {e}")))? {
-			let correlation_id_str = super::value_to_string(row.get_value(0)?, "Correlation ID")?;
-			let dictionary_id_str = super::value_to_string(row.get_value(1)?, "Dictionary ID")?;
-			let pattern_id_str = super::value_to_string(row.get_value(2)?, "Pattern ID")?;
-			let event_id_str = super::value_to_string(row.get_value(3)?, "Event ID")?;
-			let error_rates_json = super::value_to_string(row.get_value(4)?, "Error rates")?;
-			let occurrences_json = super::value_to_string(row.get_value(5)?, "Occurrences")?;
+			let correlation_id_str = Self::value_to_string(&row.get_value(0)?, "Correlation ID").await?;
+			let dictionary_id_str = Self::value_to_string(&row.get_value(1)?, "Dictionary ID").await?;
+			let pattern_id_str = Self::value_to_string(&row.get_value(2)?, "Pattern ID").await?;
+			let event_id_str = Self::value_to_string(&row.get_value(3)?, "Event ID").await?;
+			let error_rates_json = Self::value_to_string(&row.get_value(4)?, "Error rates").await?;
+			let occurrences_json = Self::value_to_string(&row.get_value(5)?, "Occurrences").await?;
 
 			let correlation_id = crate::CorrelationID::from_uuid(uuid::Uuid::parse_str(&correlation_id_str)?);
 			let dictionary_id = crate::DictionaryId::from_uuid(uuid::Uuid::parse_str(&dictionary_id_str)?);
@@ -158,12 +158,12 @@ impl super::Database {
 			return Ok(None);
 		};
 
-		let correlation_id_str = super::value_to_string(row.get_value(0)?, "Correlation ID")?;
-		let dictionary_id_str = super::value_to_string(row.get_value(1)?, "Dictionary ID")?;
-		let pattern_id_str = super::value_to_string(row.get_value(2)?, "Pattern ID")?;
-		let event_id_str = super::value_to_string(row.get_value(3)?, "Event ID")?;
-		let error_rates_json = super::value_to_string(row.get_value(4)?, "Error rates")?;
-		let occurrences_json = super::value_to_string(row.get_value(5)?, "Occurrences")?;
+		let correlation_id_str = Self::value_to_string(&row.get_value(0)?, "Correlation ID").await?;
+		let dictionary_id_str = Self::value_to_string(&row.get_value(1)?, "Dictionary ID").await?;
+		let pattern_id_str = Self::value_to_string(&row.get_value(2)?, "Pattern ID").await?;
+		let event_id_str = Self::value_to_string(&row.get_value(3)?, "Event ID").await?;
+		let error_rates_json = Self::value_to_string(&row.get_value(4)?, "Error rates").await?;
+		let occurrences_json = Self::value_to_string(&row.get_value(5)?, "Occurrences").await?;
 
 		let correlation_id = crate::CorrelationID::from_uuid(uuid::Uuid::parse_str(&correlation_id_str)?);
 		let dictionary_id = crate::DictionaryId::from_uuid(uuid::Uuid::parse_str(&dictionary_id_str)?);

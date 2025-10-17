@@ -7,14 +7,13 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use splimes::Resolution;
 use tokio::sync::Mutex;
-use traits::DatabaseStructure;
 use turso::Builder;
 use uuid::Uuid;
 
 use crate::{
-	subject, types::{
+	types::{
 		database::traits::{aspect_structure::AspectStructure, database_structure::DatabaseStructure}, Transaction, TxId
-	}, AspectId, Error, Subject, SubjectId, DEFAULT_DATA_DIR
+	}, Aspect, AspectId, Error, Subject, SubjectId, DEFAULT_DATA_DIR
 };
 
 pub type DatabaseMap = Arc<Mutex<HashMap<DatabaseId, DatabaseInfo>>>;
@@ -246,7 +245,7 @@ impl DatabaseStructure for Database {
 
 		// Insert database metadata
 		let conn = metadata_turso_db.connect()?;
-		let mut result = conn.query("INSERT INTO database_metadata (id, name, created_at, metadata_path) VALUES (?, ?, ?, ?)", turso::params![db_id.as_uuid().to_string(), name.to_string(), chrono::Utc::now().timestamp_millis().to_string(), metadata_db_path]).await?;
+		let mut result = conn.query("INSERT INTO database_metadata (id, name, created_at, metadata_path) VALUES (?, ?, ?, ?)", turso::params![db_id.as_uuid().to_string(), name.to_string(), chrono::Utc::now().timestamp_millis().to_string(), metadata_db_path.clone()]).await?;
 
 		// Consume the result to ensure the insert completes
 		while (result.next().await?).is_some() {}
@@ -260,7 +259,7 @@ impl DatabaseStructure for Database {
 		let db = Self { id: db_id, name: name.to_string(), metadata: metadata_turso_db, metadata_path: metadata_db_path };
 
 		for transaction in transactions {
-			self.log_transaction(&transaction).await?;
+			db.log_transaction(&transaction).await?;
 		}
 
 		Ok(db)
@@ -269,14 +268,14 @@ impl DatabaseStructure for Database {
 	/// Helper function to convert Turso values to strings, handling different storage formats
 	async fn value_to_string(value: &turso::Value, field_name: &str) -> Result<String> {
 		match value {
-			turso::Value::Text(s) => Ok(s.to_string()),
+			turso::Value::Text(s) => Ok(s.clone()),
 			turso::Value::Blob(bytes) => {
 				// Try to interpret as UUID bytes
 				if bytes.len() == 16 {
 					let uuid = uuid::Uuid::from_bytes(bytes.as_slice().try_into().map_err(|_| anyhow::anyhow!("{} blob is not 16 bytes", field_name))?);
 					Ok(uuid.to_string())
 				} else {
-					String::from_utf8(bytes.to_vec()).map_err(|e| anyhow::anyhow!("{} blob is not valid UTF-8: {}", field_name, e))
+					String::from_utf8(bytes.clone()).map_err(|e| anyhow::anyhow!("{} blob is not valid UTF-8: {}", field_name, e))
 				}
 			}
 			turso::Value::Integer(i) => Ok(i.to_string()),
@@ -285,7 +284,7 @@ impl DatabaseStructure for Database {
 		}
 	}
 
-	const fn id(&self) -> DatabaseId {
+	fn id(&self) -> DatabaseId {
 		self.id
 	}
 
@@ -293,7 +292,7 @@ impl DatabaseStructure for Database {
 		&self.name
 	}
 
-	const fn metadata(&self) -> &turso::Database {
+	fn metadata(&self) -> &turso::Database {
 		&self.metadata
 	}
 
@@ -367,8 +366,8 @@ impl DatabaseStructure for Database {
 		Ok(Self { id: db_id, name: name.to_string(), metadata: metadata_turso_db, metadata_path: metadata_db_path.clone() })
 	}
 
-	pub async fn get_database_info(&self) -> Option<DatabaseInfo> {
-		DATABASES.lock().await.get(&self.id).cloned()
+	async fn get_database_info(&self) -> Result<DatabaseInfo> {
+		DATABASES.lock().await.get(&self.id).cloned().ok_or_else(|| anyhow::anyhow!("Database info not found for ID: {}", self.id.as_uuid()))
 	}
 
 	/// Closes the database, releasing all resources and removing from global map
@@ -376,7 +375,7 @@ impl DatabaseStructure for Database {
 	/// # Errors
 	///
 	/// Returns an error if there are issues closing connection pools or removing resources.
-	pub async fn close(&self) -> Result<()> {
+	async fn close(&self) -> Result<()> {
 		{
 			let mut databases = DATABASES.lock().await;
 			if let Some(_db_info) = databases.remove(&self.id) {
@@ -483,7 +482,7 @@ impl DatabaseStructure for Database {
 		metadata_db.execute("INSERT INTO subjects (name, database_id) VALUES (?, ?)", turso::params![name, self.id.as_uuid().to_string()]).await?;
 
 		// Log the transaction
-		self.record_transaction(&format!("Added subject '{}'", name)).await?;
+		self.record_transaction(&format!("Added subject '{name}'")).await?;
 
 		Ok(subject)
 	}
@@ -646,7 +645,7 @@ impl DatabaseStructure for Database {
 			let subject_id = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str)?);
 			let resolution: Resolution = serde_json::from_str(&resolution_str)?;
 
-			return Ok(Aspect::new(Some(aspect_id), name, subject_id, resolution, self.metadata_path.clone()).await?);
+			return Aspect::new(Some(aspect_id), name, subject_id, resolution, self.metadata_path.clone()).await;
 		}
 
 		bail!("Aspect not found")
@@ -666,7 +665,7 @@ impl DatabaseStructure for Database {
 			let subject_id = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str)?);
 			let resolution: Resolution = serde_json::from_str(&resolution_str)?;
 
-			return Ok(Aspect::new(Some(aspect_id), name, subject_id, resolution, self.metadata_path.clone()).await?);
+			return Aspect::new(Some(aspect_id), name, subject_id, resolution, self.metadata_path.clone()).await;
 		}
 
 		bail!("Aspect not found")
@@ -720,9 +719,9 @@ impl DatabaseStructure for Database {
 		Ok(None)
 	}
 
-	async fn update_aspect_timestamps(&self, aspect: &Aspect, min_new: DateTime<Utc>, max_new: DateTime<Utc>) -> Result<()> {
+	async fn update_aspect_timestamps(&self, aspect_id: &AspectId, min_new: DateTime<Utc>, max_new: DateTime<Utc>) -> Result<()> {
 		let conn = self.metadata.connect()?;
-		conn.execute("UPDATE aspects SET min_timestamp = ?, max_timestamp = ? WHERE id = ?", turso::params![min_new.to_rfc3339(), max_new.to_rfc3339(), aspect.id().as_uuid().to_string()]).await?;
+		conn.execute("UPDATE aspects SET min_timestamp = ?, max_timestamp = ? WHERE id = ?", turso::params![min_new.to_rfc3339(), max_new.to_rfc3339(), aspect_id.as_uuid().to_string()]).await?;
 		Ok(())
 	}
 }
@@ -883,6 +882,11 @@ impl DatabaseInfo {
 		}
 
 		Ok(stats)
+	}
+
+	pub fn to_json_str(&self) -> Result<String> {
+		let json_str = serde_json::to_string_pretty(self)?;
+		Ok(json_str)
 	}
 }
 

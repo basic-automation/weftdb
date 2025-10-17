@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::{AspectId, Batch, InputMeasurement, TxId};
+use crate::{AspectId, Batch, DatasetId, InputMeasurement, TxId};
 
 /// Trait for database structure operations
 /// This trait defines the operations related to managing the structure of the database.

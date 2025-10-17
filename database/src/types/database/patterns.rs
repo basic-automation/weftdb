@@ -58,9 +58,9 @@ impl super::Database {
 
 		let mut patterns = Vec::new();
 		while let Some(row) = rows.next().await.map_err(|e| crate::Error::DatabaseError(format!("Failed to get row: {e}")))? {
-			let pattern_id_str = super::value_to_string(row.get_value(0)?, "Pattern ID")?;
-			let occurrences_json = super::value_to_string(row.get_value(1)?, "Occurrences")?;
-			let relatives_json = super::value_to_string(row.get_value(2)?, "Relatives")?;
+			let pattern_id_str = Self::value_to_string(&row.get_value(0)?, "Pattern ID").await?;
+			let occurrences_json = Self::value_to_string(&row.get_value(1)?, "Occurrences").await?;
+			let relatives_json = Self::value_to_string(&row.get_value(2)?, "Relatives").await?;
 
 			let pattern_id = PatternID::from_string(&pattern_id_str)?;
 			let occurrences: Vec<crate::Occurrence> = serde_json::from_str(&occurrences_json).map_err(|e| crate::Error::DatabaseError(format!("Failed to deserialize occurrences: {e}")))?;
@@ -186,8 +186,8 @@ impl super::Database {
 
 		let mut stats = PatternStats::default();
 		while let Some(row) = rows.next().await.map_err(|e| crate::Error::DatabaseError(format!("Failed to get row: {e}")))? {
-			let status = super::value_to_string(row.get_value(0)?, "Status")?;
-			let count_str = super::value_to_string(row.get_value(1)?, "Count")?;
+			let status = Self::value_to_string(&row.get_value(0)?, "Status").await?;
+			let count_str = Self::value_to_string(&row.get_value(1)?, "Count").await?;
 			let count: usize = count_str.parse().map_err(|e| crate::Error::DatabaseError(format!("Failed to parse count: {e}")))?;
 
 			match status.as_str() {
@@ -269,9 +269,9 @@ impl super::Database {
 
 		let mut patterns = Vec::new();
 		while let Some(row) = rows.next().await.map_err(|e| crate::Error::DatabaseError(format!("Failed to get row: {e}")))? {
-			let pattern_id_str = super::value_to_string(row.get_value(0)?, "Pattern ID")?;
-			let occurrences_json = super::value_to_string(row.get_value(1)?, "Occurrences")?;
-			let relatives_json = super::value_to_string(row.get_value(2)?, "Relatives")?;
+			let pattern_id_str = Self::value_to_string(&row.get_value(0)?, "Pattern ID").await?;
+			let occurrences_json = Self::value_to_string(&row.get_value(1)?, "Occurrences").await?;
+			let relatives_json = Self::value_to_string(&row.get_value(2)?, "Relatives").await?;
 
 			let pattern_id = PatternID::from_string(&pattern_id_str)?;
 			let occurrences: Vec<crate::Occurrence> = serde_json::from_str(&occurrences_json).map_err(|e| crate::Error::DatabaseError(format!("Failed to deserialize occurrences: {e}")))?;
@@ -307,9 +307,9 @@ impl super::Database {
 
 		let mut patterns = Vec::new();
 		while let Some(row) = rows.next().await.map_err(|e| crate::Error::DatabaseError(format!("Failed to get row: {e}")))? {
-			let pattern_id_str = super::value_to_string(row.get_value(0)?, "Pattern ID")?;
-			let occurrences_json = super::value_to_string(row.get_value(1)?, "Occurrences")?;
-			let relatives_json = super::value_to_string(row.get_value(2)?, "Relatives")?;
+			let pattern_id_str = Self::value_to_string(&row.get_value(0)?, "Pattern ID").await?;
+			let occurrences_json = Self::value_to_string(&row.get_value(1)?, "Occurrences").await?;
+			let relatives_json = Self::value_to_string(&row.get_value(2)?, "Relatives").await?;
 
 			let pattern_id = PatternID::from_string(&pattern_id_str)?;
 			let occurrences: Vec<crate::Occurrence> = serde_json::from_str(&occurrences_json).map_err(|e| crate::Error::DatabaseError(format!("Failed to deserialize occurrences: {e}")))?;

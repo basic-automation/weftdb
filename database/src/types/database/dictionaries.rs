@@ -174,9 +174,9 @@ impl super::Database {
 
 		let mut patterns = Vec::new();
 		while let Some(row) = rows.next().await.map_err(|e| crate::Error::DatabaseError(format!("Failed to get row: {e}")))? {
-			let pattern_id_str = super::value_to_string(row.get_value(0)?, "Pattern ID")?;
-			let occurrences_json = super::value_to_string(row.get_value(1)?, "Occurrences")?;
-			let relatives_json = super::value_to_string(row.get_value(2)?, "Relatives")?;
+			let pattern_id_str = Self::value_to_string(&row.get_value(0)?, "Pattern ID").await?;
+			let occurrences_json = Self::value_to_string(&row.get_value(1)?, "Occurrences").await?;
+			let relatives_json = Self::value_to_string(&row.get_value(2)?, "Relatives").await?;
 
 			let pattern_id = PatternID::from_string(&pattern_id_str).map_err(|e| crate::Error::DatabaseError(format!("Failed to parse pattern ID: {e}")))?;
 			let occurrences: Vec<crate::Occurrence> = serde_json::from_str(&occurrences_json).map_err(|e| crate::Error::DatabaseError(format!("Failed to deserialize occurrences: {e}")))?;
@@ -240,8 +240,8 @@ impl super::Database {
 		let mut rows = conn.query("SELECT description, constraints FROM dictionaries WHERE name = ?", turso::params![name]).await.map_err(|e| crate::Error::DatabaseError(format!("Failed to query dictionary metadata: {e}")))?;
 
 		if let Some(row) = rows.next().await.map_err(|e| crate::Error::DatabaseError(format!("Failed to get row: {e}")))? {
-			let description = super::value_to_string(row.get_value(0)?, "Description")?;
-			let constraints_json = super::value_to_string(row.get_value(1)?, "Constraints")?;
+			let description = Self::value_to_string(&row.get_value(0)?, "Description").await?;
+			let constraints_json = Self::value_to_string(&row.get_value(1)?, "Constraints").await?;
 			let constraints: serde_json::Value = serde_json::from_str(&constraints_json).map_err(|e| crate::Error::DatabaseError(format!("Failed to deserialize constraints: {e}")))?;
 
 			Ok(Some((description, constraints)))
@@ -270,7 +270,7 @@ impl super::Database {
 
 		let mut dictionaries = Vec::new();
 		while let Some(row) = rows.next().await.map_err(|e| crate::Error::DatabaseError(format!("Failed to get row: {e}")))? {
-			let name = super::value_to_string(row.get_value(0)?, "Dictionary name")?;
+			let name = Self::value_to_string(&row.get_value(0)?, "Dictionary name").await?;
 			dictionaries.push(name);
 		}
 
