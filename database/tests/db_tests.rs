@@ -1,11 +1,11 @@
 use std::{str::FromStr, sync::Arc};
 
-use ::database::database::traits::Inputs;
+use ::database::database::traits::{AspectStructure, Inputs};
 use anyhow::{Context, Result};
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use database::database::traits::DatabaseStructure;
-use database::{Aspect, Database, InputMeasurement, Outputs, Subject, DATABASES, DEFAULT_DATA_DIR}; // Added Aspect import
+use database::{Aspect, Database, DatasetId, InputMeasurement, Outputs, Subject, DATABASES, DEFAULT_DATA_DIR};
 use rayon::prelude::*;
 use splimes::{Resolution, Spline};
 #[cfg(test)]
@@ -33,7 +33,7 @@ async fn add_test_measurements(db: &Database, aspect: &Aspect, base_time: DateTi
 		let timestamp = base_time + Duration::seconds(i as i64);
 		let value = BigDecimal::from_str(&format!("{}.{}", i + 1, i * 10 % 100))?;
 		let measurement = InputMeasurement::new(timestamp, value);
-		db.capture_measurement(aspect.clone(), measurement).await?; // Use aspect instead of aspect_id
+		db.capture_measurement(aspect.id(), DatasetId::new(), measurement).await?; // Use aspect instead of aspect_id
 	}
 	Ok(())
 }
@@ -100,7 +100,7 @@ async fn test_analyze_point_exact_match() -> Result<()> {
 	let timestamp = base_time;
 	let value = BigDecimal::from_str("42.5")?;
 	let measurement = InputMeasurement::new(timestamp, value.clone());
-	db.capture_measurement(aspect.clone(), measurement).await?;
+	db.capture_measurement(aspect.id(), DatasetId::new(), measurement).await?;
 
 	// Query the exact same time
 	let result = db.analyze_point(aspect.id(), timestamp, Resolution::Milliseconds, Spline::Linear).await;
@@ -213,7 +213,7 @@ async fn test_analyze_point_single_measurement() -> Result<()> {
 	let timestamp = base_time;
 	let value = BigDecimal::from_str("10.0")?;
 	let measurement = InputMeasurement::new(timestamp, value.clone());
-	db.capture_measurement(aspect.clone(), measurement).await?;
+	db.capture_measurement(aspect.id(), DatasetId::new(), measurement).await?;
 
 	// Query a different time - should extrapolate or return the single value
 	let query_time = base_time + Duration::seconds(10);
@@ -250,12 +250,12 @@ async fn test_analyze_point_large_time_gap() -> Result<()> {
 	let timestamp1 = base_time;
 	let value1 = BigDecimal::from_str("10.0")?;
 	let measurement1 = InputMeasurement::new(timestamp1, value1);
-	db.capture_measurement(aspect.clone(), measurement1).await?;
+	db.capture_measurement(aspect.id(), DatasetId::new(), measurement1).await?;
 
 	let timestamp2 = base_time + Duration::hours(24); // 24 hours later
 	let value2 = BigDecimal::from_str("20.0")?;
 	let measurement2 = InputMeasurement::new(timestamp2, value2);
-	db.capture_measurement(aspect.clone(), measurement2).await?;
+	db.capture_measurement(aspect.id(), DatasetId::new(), measurement2).await?;
 
 	// Query a time in the middle
 	let query_time = base_time + Duration::hours(12);
@@ -318,9 +318,7 @@ async fn test_analyze_point_cache_invalidation() -> Result<()> {
 	let new_timestamp = base_time + Duration::seconds(1) + Duration::milliseconds(250);
 	let new_value = BigDecimal::from_str("99.9")?;
 	let new_measurement = InputMeasurement::new(new_timestamp, new_value);
-	db.capture_measurement(aspect.clone(), new_measurement).await?;
-
-	// Query again - should return different result due to new data
+	db.capture_measurement(aspect.id(), DatasetId::new(), new_measurement).await?; // Query again - should return different result due to new data
 	let result2 = db.analyze_point(aspect.id(), query_time, Resolution::Milliseconds, Spline::Linear).await?;
 
 	// Results should be different due to the new measurement affecting interpolation
@@ -382,12 +380,12 @@ async fn test_analyze_point_precision_boundaries() -> Result<()> {
 	let timestamp1 = base_time;
 	let value1 = BigDecimal::from_str("1.123456789012345")?;
 	let measurement1 = InputMeasurement::new(timestamp1, value1);
-	db.capture_measurement(aspect.clone(), measurement1).await?;
+	db.capture_measurement(aspect.id(), DatasetId::new(), measurement1).await?;
 
 	let timestamp2 = base_time + Duration::milliseconds(1000);
 	let value2 = BigDecimal::from_str("2.987654321098765")?;
 	let measurement2 = InputMeasurement::new(timestamp2, value2);
-	db.capture_measurement(aspect.clone(), measurement2).await?;
+	db.capture_measurement(aspect.id(), DatasetId::new(), measurement2).await?;
 
 	// Query a time in between with high precision
 	let query_time = base_time + Duration::milliseconds(500);
@@ -521,33 +519,33 @@ async fn test_create_btc_1min_database() -> Result<()> {
 			let tasks = vec![
 				tokio::spawn({
 					let db = Arc::clone(&db);
-					let open_aspect = open_aspect.clone();
+					let open_aspect_id = open_aspect.id();
 					let open_measurements = open_measurements.clone();
-					async move { db.batch_capture_measurements(open_aspect, open_measurements).await }
+					async move { db.batch_capture_measurements(open_aspect_id, DatasetId::new(), open_measurements).await }
 				}),
 				tokio::spawn({
 					let db = Arc::clone(&db);
-					let high_aspect = high_aspect.clone();
+					let high_aspect_id = high_aspect.id();
 					let high_measurements = high_measurements.clone();
-					async move { db.batch_capture_measurements(high_aspect, high_measurements).await }
+					async move { db.batch_capture_measurements(high_aspect_id, DatasetId::new(), high_measurements).await }
 				}),
 				tokio::spawn({
 					let db = Arc::clone(&db);
-					let low_aspect = low_aspect.clone();
+					let low_aspect_id = low_aspect.id();
 					let low_measurements = low_measurements.clone();
-					async move { db.batch_capture_measurements(low_aspect, low_measurements).await }
+					async move { db.batch_capture_measurements(low_aspect_id, DatasetId::new(), low_measurements).await }
 				}),
 				tokio::spawn({
 					let db = Arc::clone(&db);
-					let close_aspect = close_aspect.clone();
+					let close_aspect_id = close_aspect.id();
 					let close_measurements = close_measurements.clone();
-					async move { db.batch_capture_measurements(close_aspect, close_measurements).await }
+					async move { db.batch_capture_measurements(close_aspect_id, DatasetId::new(), close_measurements).await }
 				}),
 				tokio::spawn({
 					let db = Arc::clone(&db);
-					let volume_aspect = volume_aspect.clone();
+					let volume_aspect_id = volume_aspect.id();
 					let volume_measurements = volume_measurements.clone();
-					async move { db.batch_capture_measurements(volume_aspect, volume_measurements).await }
+					async move { db.batch_capture_measurements(volume_aspect_id, DatasetId::new(), volume_measurements).await }
 				}),
 			];
 

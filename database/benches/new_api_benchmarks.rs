@@ -1,7 +1,7 @@
 use std::{hint::black_box, str::FromStr};
 
 use ::database::{
-	database::traits::{Inputs, Outputs}, Database, DatabaseStructure, InputMeasurement
+	database::traits::{AspectStructure, Inputs, Outputs}, Database, DatabaseStructure, DatasetId, InputMeasurement
 };
 use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
@@ -62,10 +62,10 @@ fn benchmark_data_insertion(c: &mut Criterion) {
 		b.iter(|| {
 			rt.block_on(async {
 				let time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap() + Duration::seconds(counter);
-				let measurement = InputMeasurement::new(time, BigDecimal::from_str("42.0").unwrap());
-				let aspect = db.get_aspect(aspect_id).await.unwrap();
-				db.capture_measurement(aspect, measurement).await.unwrap();
-				counter += 1;
+			let measurement = InputMeasurement::new(time, BigDecimal::from_str("42.0").unwrap());
+			let aspect = db.get_aspect(aspect_id).await.unwrap();
+			db.capture_measurement(aspect.id(), DatasetId::new(), measurement).await.unwrap();
+			counter += 1;
 			});
 		});
 	});
@@ -97,7 +97,7 @@ fn benchmark_batch_insertion(c: &mut Criterion) {
 					let measurement = InputMeasurement::new(start_time + Duration::seconds(i), BigDecimal::from_str(&format!("{i}.0")).unwrap());
 					measurements.push(measurement);
 				}
-				db.batch_capture_measurements(aspect.clone(), measurements).await.unwrap();
+				db.batch_capture_measurements(aspect.id(), DatasetId::new(), measurements).await.unwrap();
 			});
 		});
 	});
@@ -122,7 +122,7 @@ fn benchmark_point_analysis(c: &mut Criterion) {
 		let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 		for i in 0..100 {
 			let measurement = InputMeasurement::new(base_time + Duration::minutes(i), BigDecimal::from_str(&format!("{}.{}", i / 10, i % 10)).unwrap());
-			db.capture_measurement(aspect.clone(), measurement).await.unwrap();
+			db.capture_measurement(aspect.id(), DatasetId::new(), measurement).await.unwrap();
 		}
 
 		(db, aspect.id())
@@ -164,7 +164,7 @@ fn benchmark_range_analysis(c: &mut Criterion) {
 		for i in 0..200 {
 			measurements.push(InputMeasurement::new(base_time + Duration::seconds(i * 60), BigDecimal::from_str(&format!("{i}.0")).unwrap()));
 		}
-		db.batch_capture_measurements(aspect.clone(), measurements).await.unwrap();
+		db.batch_capture_measurements(aspect.id(), DatasetId::new(), measurements).await.unwrap();
 
 		(db, aspect.id())
 	});
@@ -207,7 +207,7 @@ fn benchmark_cache_usage(c: &mut Criterion) {
 		let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 		for i in 0..100 {
 			let measurement = InputMeasurement::new(base_time + Duration::minutes(i), BigDecimal::from_str(&format!("{i}.0")).unwrap());
-			db.capture_measurement(aspect.clone(), measurement).await.unwrap();
+			db.capture_measurement(aspect.id(), DatasetId::new(), measurement).await.unwrap();
 		}
 
 		(db, aspect.id())
@@ -243,7 +243,7 @@ fn benchmark_concurrent_access(c: &mut Criterion) {
 		let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 		for i in 0..200 {
 			let measurement = InputMeasurement::new(base_time + Duration::seconds(i * 30), BigDecimal::from_str(&format!("{i}.0")).unwrap());
-			db.capture_measurement(aspect.clone(), measurement).await.unwrap();
+			db.capture_measurement(aspect.id(), DatasetId::new(), measurement).await.unwrap();
 		}
 
 		(db, aspect.id())

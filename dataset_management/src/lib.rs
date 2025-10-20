@@ -779,12 +779,12 @@ pub async fn filter_expired_signals_at_time(database: &Database, current_time: O
 #[cfg(test)]
 mod tests {
 
-	use ::database::database::traits::Inputs;
+	use ::database::database::traits::{AspectStructure, Inputs};
 	use anyhow::bail;
 	use batch_utils::*;
 	use bigdecimal::{BigDecimal, FromPrimitive};
 	use chrono::{TimeZone, Utc};
-	use database::{AspectId, Database, InputMeasurement, Resolution};
+	use database::{AspectId, Database, DatasetId, InputMeasurement, Resolution};
 	use serde_json::json;
 	use serial_test::serial;
 	use splimes::Spline;
@@ -1218,7 +1218,7 @@ mod tests {
 		for (i, value) in points {
 			let timestamp = start_time + chrono::Duration::hours(i64::from(i));
 			let measurement = InputMeasurement::new(timestamp, value);
-			db.capture_measurement(test_aspect.clone(), measurement).await.unwrap();
+			db.capture_measurement(test_aspect.id(), DatasetId::new(), measurement).await.unwrap();
 		}
 
 		// create a peak detection event for testing
@@ -1234,13 +1234,14 @@ mod tests {
 	#[tokio::test]
 	#[serial]
 	async fn test_batch_processing() -> Result<()> {
+		use std::fs::remove_dir_all;
+
 		// Skip this test if running in CI or if we want fast feedback
 		if std::env::var("SKIP_SLOW_TESTS").is_ok() {
 			println!("Skipping test_batch_processing due to SKIP_SLOW_TESTS environment variable");
 			return Ok(());
 		}
 
-		use std::fs::remove_dir_all;
 		let db_path = format!("{}/test_bath_processing", database::DEFAULT_DATA_DIR);
 		remove_dir_all(&db_path).ok();
 
@@ -1270,7 +1271,7 @@ mod tests {
 		for (i, value) in points {
 			let timestamp = start_time + chrono::Duration::minutes(i64::from(i));
 			let measurement = InputMeasurement::new(timestamp, value);
-			db.capture_measurement(test_aspect.clone(), measurement).await.unwrap();
+			db.capture_measurement(test_aspect.id(), DatasetId::new(), measurement).await.unwrap();
 		}
 
 		let aspect = test_aspect;
@@ -1298,13 +1299,14 @@ mod tests {
 	#[tokio::test]
 	#[serial]
 	async fn test_specific_process_batch() -> Result<()> {
+		use std::fs::remove_dir_all;
+
 		// Skip this test if running in CI or if we want fast feedback
 		if std::env::var("SKIP_SLOW_TESTS").is_ok() {
 			println!("Skipping test_specific_process_batch due to SKIP_SLOW_TESTS environment variable");
 			return Ok(());
 		}
 
-		use std::fs::remove_dir_all;
 		let db_path = format!("{}/test_specific_process_batch", database::DEFAULT_DATA_DIR);
 		remove_dir_all(&db_path).ok();
 
@@ -1334,7 +1336,7 @@ mod tests {
 		for (i, value) in points {
 			let timestamp = start_time + chrono::Duration::minutes(i64::from(i));
 			let measurement = InputMeasurement::new(timestamp, value);
-			db.capture_measurement(test_aspect.clone(), measurement).await.unwrap();
+			db.capture_measurement(test_aspect.id(), DatasetId::new(), measurement).await.unwrap();
 		}
 
 		let aspect = test_aspect;

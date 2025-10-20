@@ -1,7 +1,7 @@
 use std::{hint::black_box, str::FromStr, sync::Arc};
 
 use ::database::{
-	database::traits::{DatabaseStructure, Inputs, Outputs}, *
+	database::traits::{AspectStructure, DatabaseStructure, Inputs, Outputs}, DatasetId, *
 };
 use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
@@ -34,7 +34,7 @@ impl BenchmarkContext {
 		let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 		for i in 0..measurement_count {
 			let measurement = InputMeasurement::new(base_time + Duration::seconds(i as i64 * 60), BigDecimal::from_str(&format!("{}.0", i + 10))?);
-			db.capture_measurement(aspect.clone(), measurement).await?;
+			db.capture_measurement(aspect.id(), DatasetId::new(), measurement).await?;
 		}
 
 		Ok(Self { db, aspect_id: aspect.id(), _cleanup_path: cleanup_path })

@@ -61,11 +61,15 @@ impl PartialEq for Subject {
 impl Eq for Subject {}
 
 impl Subject {
-	#[must_use]
+	/// Creates a new Subject with the given parameters.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the subject path cannot be determined or the directory cannot be created.
 	pub async fn new(id: Option<SubjectId>, name: String, database_id: DatabaseId, database_metadata_db_path: String) -> Result<Self> {
 		let id = id.unwrap_or_default();
 
-		let subject_path = Self::get_subject_path(database_metadata_db_path.clone(), id).await.unwrap();
+		let subject_path = Self::get_subject_path(database_metadata_db_path.clone(), id).await?;
 
 		// recursively create directory if it doesn't exist
 		tokio::fs::create_dir_all(&subject_path).await?;
@@ -73,6 +77,11 @@ impl Subject {
 		Ok(Self { id, name, database_id, database_metadata_db_path, aspects: HashMap::new() })
 	}
 
+	/// Retrieves the database metadata path from the Turso database.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the database connection fails or the metadata path cannot be retrieved.
 	pub async fn get_database_metadata_path(turso_db_path: String) -> Result<String> {
 		let turso_db = Database::get_turso_database(&turso_db_path).await?;
 

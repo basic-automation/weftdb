@@ -27,15 +27,15 @@ impl Inputs for Database {
 
 		// Use INSERT ... ON CONFLICT for atomic upsert with concurrent writes support
 		// This handles the case where a measurement with the same timestamp already exists
-		let upsert_sql = r#"
+		let upsert_sql = r"
                         INSERT INTO measurements (id, dataset_id, timestamp, value) 
                         VALUES (?, ?, ?, ?) 
                         ON CONFLICT(timestamp) DO UPDATE SET 
                                 value = (CAST(excluded.value AS REAL) + CAST(measurements.value AS REAL)) / 2.0,
                                 id = excluded.id
-                "#;
+                ";
 
-		conn.execute(&upsert_sql, turso::params![tx_id.as_uuid().to_string(), dataset_id.as_uuid().to_string(), measurement.timestamp().timestamp_millis().to_string(), measurement.value().to_string()]).await?;
+		conn.execute(upsert_sql, turso::params![tx_id.as_uuid().to_string(), dataset_id.as_uuid().to_string(), measurement.timestamp().timestamp_millis().to_string(), measurement.value().to_string()]).await?;
 
 		// Record the transaction - we don't know if it was an insert or update, but that's okay
 		self.record_transaction(&format!("Captured measurement at {} with value {} for dataset {} (upsert operation)", measurement.timestamp(), measurement.value(), dataset_id)).await
@@ -57,13 +57,13 @@ impl Inputs for Database {
 
 		// Use INSERT with ON CONFLICT DO NOTHING, then check if any rows were affected
 		// This is atomic and handles concurrent writes safely
-		let insert_sql = r#"
+		let insert_sql = r"
             INSERT INTO measurements (id, dataset_id, timestamp, value) 
             VALUES (?, ?, ?, ?) 
             ON CONFLICT(timestamp) DO NOTHING
-        "#;
+        ";
 
-		let rows_affected = conn.execute(&insert_sql, turso::params![tx_id.as_uuid().to_string(), dataset_id.as_uuid().to_string(), measurement.timestamp().timestamp_millis().to_string(), measurement.value().to_string()]).await?;
+		let rows_affected = conn.execute(insert_sql, turso::params![tx_id.as_uuid().to_string(), dataset_id.as_uuid().to_string(), measurement.timestamp().timestamp_millis().to_string(), measurement.value().to_string()]).await?;
 
 		// Check if the insert actually happened (rows_affected > 0 means it was inserted)
 		if rows_affected == 0 {
@@ -136,20 +136,20 @@ impl Inputs for Database {
 	/// Helper using individual execute calls for maximum compatibility
 	async fn capture_measurement_chunk(&self, conn: &turso::Connection, dataset_id: DatasetId, chunk: &[InputMeasurement], all_tx_ids: &[TxId], tx_id_offset: usize) -> Result<()> {
 		// Use the fixed measurements table with dataset_id
-		let upsert_sql = r#"
+		let upsert_sql = r"
             INSERT INTO measurements (id, dataset_id, timestamp, value) 
             VALUES (?, ?, ?, ?) 
             ON CONFLICT(timestamp) DO UPDATE SET 
                 value = (CAST(excluded.value AS REAL) + CAST(measurements.value AS REAL)) / 2.0,
                 id = excluded.id
-        "#;
+        ";
 
 		// Execute each measurement individually
 		for (i, input_measurement) in chunk.iter().enumerate() {
 			let tx_id = &all_tx_ids[tx_id_offset + i];
 			let measurement = Measurement::from_input_measurement(dataset_id, input_measurement);
 
-			conn.execute(&upsert_sql, turso::params![tx_id.as_uuid().to_string(), dataset_id.as_uuid().to_string(), measurement.timestamp().timestamp_millis().to_string(), measurement.value().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to insert measurement: {e}")))?;
+			conn.execute(upsert_sql, turso::params![tx_id.as_uuid().to_string(), dataset_id.as_uuid().to_string(), measurement.timestamp().timestamp_millis().to_string(), measurement.value().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to insert measurement: {e}")))?;
 		}
 
 		Ok(())
@@ -164,7 +164,7 @@ impl Inputs for Database {
 	/// - if unable to insert measurements into database
 	///
 	/// # Returns
-	/// - Vector of TxIds for measurements that were actually inserted (skipped measurements won't have TxIds in result)
+	/// - Vector of `TxIds` for measurements that were actually inserted (skipped measurements won't have `TxIds` in result)
 	///
 	/// # Panics
 	/// - if measurements vector is empty when computing min/max (this is already checked)
@@ -236,11 +236,11 @@ impl Inputs for Database {
 	/// Helper for new measurements using individual execute calls
 	async fn capture_new_measurement_chunk(&self, conn: &turso::Connection, dataset_id: DatasetId, chunk: &[InputMeasurement], all_tx_ids: &[TxId], tx_id_offset: usize) -> Result<Vec<TxId>> {
 		// Use the fixed measurements table with dataset_id
-		let insert_sql = r#"
+		let insert_sql = r"
             INSERT INTO measurements (id, dataset_id, timestamp, value) 
             VALUES (?, ?, ?, ?) 
             ON CONFLICT(timestamp) DO NOTHING
-        "#;
+        ";
 
 		let mut successful_tx_ids = Vec::new();
 
@@ -249,7 +249,7 @@ impl Inputs for Database {
 			let tx_id = &all_tx_ids[tx_id_offset + i];
 			let measurement = Measurement::from_input_measurement(dataset_id, input_measurement);
 
-			let rows_affected = conn.execute(&insert_sql, turso::params![tx_id.as_uuid().to_string(), dataset_id.as_uuid().to_string(), measurement.timestamp().timestamp_millis().to_string(), measurement.value().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to insert measurement: {e}")))?;
+			let rows_affected = conn.execute(insert_sql, turso::params![tx_id.as_uuid().to_string(), dataset_id.as_uuid().to_string(), measurement.timestamp().timestamp_millis().to_string(), measurement.value().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to insert measurement: {e}")))?;
 
 			// Only add TxId if the insert was successful (rows_affected > 0)
 			if rows_affected > 0 {
@@ -312,10 +312,10 @@ impl Inputs for Database {
 		// Check if the insert was successful or skipped
 		if rows_affected > 0 {
 			// Record the transaction for successful insert
-			self.record_transaction(&format!("Inserted unprocessed batch {} for aspect {}", batch.batch_id().as_uuid().to_string(), batch.metadata.aspect)).await
+			self.record_transaction(&format!("Inserted unprocessed batch {} for aspect {}", batch.batch_id().as_uuid(), batch.metadata.aspect)).await
 		} else {
 			// Batch already exists, log that it was skipped
-			self.record_transaction(&format!("Skipped duplicate batch {} for aspect {} (already exists)", batch.batch_id().as_uuid().to_string(), batch.metadata.aspect)).await?;
+			self.record_transaction(&format!("Skipped duplicate batch {} for aspect {} (already exists)", batch.batch_id().as_uuid(), batch.metadata.aspect)).await?;
 			Ok(tx_id)
 		}
 	}
@@ -329,7 +329,7 @@ impl Inputs for Database {
 	/// - if unable to insert batches into database
 	///
 	/// # Returns
-	/// - Vector of TxIds for batches that were actually inserted (skipped batches won't have TxIds in result)
+	/// - Vector of `TxIds` for batches that were actually inserted (skipped batches won't have `TxIds` in result)
 	async fn batch_insert_unprocessed_batches(&self, aspect_id: AspectId, batches: Vec<Batch>) -> Result<Vec<TxId>> {
 		if batches.is_empty() {
 			return Ok(Vec::new());
@@ -356,7 +356,7 @@ impl Inputs for Database {
 			if batches.len() > 1000 && chunk_idx % 10 == 0 && chunk_idx > 0 {
 				if let (Ok(processed_f64), Ok(len_f64)) = (safe_usize_to_f64(chunk_idx * chunk_size), safe_usize_to_f64(batches.len())) {
 					let pct = (processed_f64 / len_f64) * 100.0;
-					println!("  Batches - {:.0}%", pct);
+					println!("  Batches - {pct:.0}%");
 				} else {
 					println!("  Batches - processed {} / {}", chunk_idx * chunk_size, batches.len());
 				}
@@ -377,7 +377,7 @@ impl Inputs for Database {
 	}
 
 	/// Helper to process a chunk of batches using concurrent writes
-	/// Returns TxIds of batches that were actually inserted (skips duplicates)
+	/// Returns `TxIds` of batches that were actually inserted (skips duplicates)
 	async fn insert_batch_chunk(&self, conn: &turso::Connection, chunk: &[Batch]) -> Result<Vec<TxId>> {
 		// Use INSERT ... ON CONFLICT DO NOTHING for concurrent writes
 		// This automatically skips batches with existing IDs
@@ -473,10 +473,10 @@ impl Inputs for Database {
 			.await?;
 
 		if rows_affected > 0 {
-			self.record_transaction(&format!("Inserted processed batch {} for aspect {}", batch.batch_id().as_uuid().to_string(), batch.metadata.aspect.as_uuid().to_string())).await
+			self.record_transaction(&format!("Inserted processed batch {} for aspect {}", batch.batch_id().as_uuid(), batch.metadata.aspect.as_uuid())).await
 		} else {
 			// Batch already exists, log that it was skipped
-			self.record_transaction(&format!("Skipped duplicate processed batch {} for aspect {} (already exists)", batch.batch_id().as_uuid().to_string(), batch.metadata.aspect.as_uuid().to_string())).await?;
+			self.record_transaction(&format!("Skipped duplicate processed batch {} for aspect {} (already exists)", batch.batch_id().as_uuid(), batch.metadata.aspect.as_uuid())).await?;
 			Ok(tx_id)
 		}
 	}
@@ -506,7 +506,7 @@ impl Inputs for Database {
 			if batches.len() > 1000 && chunk_idx % 10 == 0 && chunk_idx > 0 {
 				if let (Ok(processed_f64), Ok(len_f64)) = (safe_usize_to_f64(chunk_idx * chunk_size), safe_usize_to_f64(batches.len())) {
 					let pct = (processed_f64 / len_f64) * 100.0;
-					println!("  Processed Batches - {:.0}%", pct);
+					println!("  Processed Batches - {pct:.0}%");
 				} else {
 					println!("  Processed Batches - processed {} / {}", chunk_idx * chunk_size, batches.len());
 				}

@@ -436,10 +436,10 @@ impl Outputs for Database {
 						current = chunk_end;
 						let mut new_iter = interpolated.into_iter();
 						// Return first point and set up iterator for the rest
-						match new_iter.next() {
-							Some(first_point) => Some((Ok(first_point), (current, Some(new_iter)))),
-							None => Some((Ok(Point { timestamp: current, value: BigDecimal::zero() }), (current, None))),
-						}
+						new_iter.next().map_or_else(
+							|| Some((Ok(Point { timestamp: current, value: BigDecimal::zero() }), (current, None))),
+							|first_point| Some((Ok(first_point), (current, Some(new_iter))))
+						)
 					}
 					Err(e) => Some((Err(e), (current, None))),
 				}
@@ -523,7 +523,7 @@ impl Outputs for Database {
 			let batch = Batch { metadata, measurements, batch_id: *batch_id, batch_hash: batch_hash_str };
 
 			// Cache the single batch (as a vec with one element)
-			CACHE.store_unprocessed_batches(&cache_key, &[batch.clone()]).await;
+			CACHE.store_unprocessed_batches(&cache_key, std::slice::from_ref(&batch)).await;
 
 			Ok(batch)
 		} else {
@@ -561,18 +561,14 @@ impl Outputs for Database {
 		// Collect all batches first to avoid async issues in the stream
 		let mut batches = Vec::new();
 
-		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get batch row: {e}")))? {
-			match Self::parse_batch_row(row).await {
-				Ok(batch) => batches.push(batch),
-				Err(e) => {
-					// Log error but continue processing other batches
-					eprintln!("Warning: Failed to parse batch row: {e}");
-					continue;
-				}
-			}
+	while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get batch row: {e}")))? {
+		if let Ok(batch) = Self::parse_batch_row(row).await {
+			batches.push(batch);
+		} else {
+			// Log error but continue processing other batches
+			eprintln!("Warning: Failed to parse batch row");
 		}
-
-		// Cache the results for future queries
+	}		// Cache the results for future queries
 		if !batches.is_empty() {
 			CACHE.store_unprocessed_batches(&cache_key, &batches).await;
 		}
