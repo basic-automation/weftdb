@@ -1,11 +1,11 @@
 // Debug test to examine batch processing issue
 use std::fs::remove_dir_all;
 
-use ::database::database::traits::Inputs;
+use ::database::database::traits::{AspectStructure, Inputs};
 use anyhow::Result;
 use bigdecimal::BigDecimal;
 use chrono::{TimeZone, Utc};
-use database::{database::traits::DatabaseStructure, Database, InputMeasurement, DEFAULT_DATA_DIR};
+use database::{database::traits::DatabaseStructure, Database, DatasetId, InputMeasurement, DEFAULT_DATA_DIR};
 use splimes::{Resolution, Spline};
 
 use crate::batch_utils::build_unprocessed_queue;
@@ -27,7 +27,7 @@ async fn debug_batch_processing() -> Result<()> {
 		let timestamp = start_time + chrono::Duration::minutes(i64::from(i));
 		let value = BigDecimal::from(i % 5); // Simple repeating pattern
 		let measurement = InputMeasurement::new(timestamp, value);
-		db.capture_measurement(test_aspect.clone(), measurement).await.unwrap();
+		db.capture_measurement(test_aspect.id(), DatasetId::new(), measurement).await.unwrap();
 	}
 
 	println!("Created 20 measurements");
@@ -44,8 +44,8 @@ async fn debug_batch_processing() -> Result<()> {
 		println!(
 			"Batch {}: ID={:?}, Hash={:?}, Size={}",
 			i,
-			batch.batch_id().map(|s| &s[..8]),   // Show first 8 chars of ID
-			batch.batch_hash().map(|s| &s[..8]), // Show first 8 chars of hash
+			batch.batch_id().as_uuid().to_string().get(..8), // Show first 8 chars of ID
+			batch.batch_hash().map(|s| &s[..8]),             // Show first 8 chars of hash
 			batch.size()
 		);
 	}

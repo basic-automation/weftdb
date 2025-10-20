@@ -48,7 +48,7 @@ impl DatabaseStructure for Database {
 	/// Create a Turso database for reuse with concurrent writes enabled
 	async fn create_turso_database(db_path: &str) -> Result<turso::Database> {
 		// if the db is already in cache return error.
-		if let Some(_) = CONNECTION_DATABASES.lock().await.get(db_path) {
+		if CONNECTION_DATABASES.lock().await.get(db_path).is_some() {
 			bail!("Database already exists.");
 		}
 
@@ -884,6 +884,11 @@ impl DatabaseInfo {
 		Ok(stats)
 	}
 
+	/// Converts the database to a JSON string representation.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the serialization fails.
 	pub fn to_json_str(&self) -> Result<String> {
 		let json_str = serde_json::to_string_pretty(self)?;
 		Ok(json_str)

@@ -11,6 +11,7 @@ use crate::{Aspect, AspectId, SubjectId};
 pub trait AspectStructure {
 	// Aspect
 
+	#[allow(clippy::new_ret_no_self)]
 	async fn new(id: Option<AspectId>, name: String, subject_id: SubjectId, resolution: Resolution, database_metadata_db_path: String) -> Result<Aspect>;
 
 	fn id(&self) -> AspectId;

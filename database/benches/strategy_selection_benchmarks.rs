@@ -1,7 +1,7 @@
 use std::{hint::black_box, str::FromStr};
 
 use ::database::{
-	database::traits::{DatabaseStructure, Inputs, Outputs}, Database, InputMeasurement
+	database::traits::{AspectStructure, DatabaseStructure, Inputs, Outputs}, Database, DatasetId, InputMeasurement
 };
 use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
@@ -48,7 +48,7 @@ fn benchmark_strategy_selection(c: &mut Criterion) {
 					}
 
 					// Use batch insertion instead of individual insertions
-					db.batch_capture_measurements(aspect.clone(), measurements).await.unwrap();
+					db.batch_capture_measurements(aspect.id(), DatasetId::new(), measurements).await.unwrap();
 
 					// Perform interpolation analysis
 					let analyze_time = base_time + Duration::minutes((size / 2) as i64);

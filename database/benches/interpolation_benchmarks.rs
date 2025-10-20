@@ -1,7 +1,7 @@
 use std::{hint::black_box, path::Path, str::FromStr};
 
 use ::database::{
-	database::traits::{DatabaseStructure, Inputs, Outputs}, Database, InputMeasurement
+	database::traits::{AspectStructure, DatabaseStructure, Inputs, Outputs}, Database, DatasetId, InputMeasurement
 };
 use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
@@ -50,7 +50,7 @@ fn benchmark_interpolation_sizes(c: &mut Criterion) {
 					for i in 0..size {
 						measurements.push(InputMeasurement::new(base_time + Duration::seconds(i as i64), BigDecimal::from_str(&format!("{i}.0")).unwrap()));
 					}
-					db.batch_capture_measurements(aspect.clone(), measurements).await.unwrap();
+					db.batch_capture_measurements(aspect.id(), DatasetId::new(), measurements).await.unwrap();
 
 					// Perform interpolation
 					let start = base_time;
@@ -89,7 +89,7 @@ fn benchmark_interpolation_resolutions(c: &mut Criterion) {
 		for i in 0..size {
 			measurements.push(InputMeasurement::new(base_time + Duration::seconds(i as i64), BigDecimal::from_str(&format!("{i}.0")).unwrap()));
 		}
-		db.batch_capture_measurements(aspect.clone(), measurements).await.unwrap();
+		db.batch_capture_measurements(aspect.id(), DatasetId::new(), measurements).await.unwrap();
 
 		(db, aspect.id())
 	});
@@ -148,7 +148,7 @@ fn benchmark_spline_types(c: &mut Criterion) {
 		for i in 0..50 {
 			measurements.push(InputMeasurement::new(start_time + Duration::minutes(i), BigDecimal::from_str(&format!("{}.0", i * 10)).unwrap()));
 		}
-		db.batch_capture_measurements(aspect.clone(), measurements).await.unwrap();
+		db.batch_capture_measurements(aspect.id(), DatasetId::new(), measurements).await.unwrap();
 
 		(db, aspect.id())
 	});

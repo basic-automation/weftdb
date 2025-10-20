@@ -1,9 +1,9 @@
 use std::{str::FromStr, sync::Arc, time::Duration as StdDuration};
 
-use ::database::database::traits::Inputs;
+use ::database::database::traits::{AspectStructure, Inputs};
 use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
-use database::{database::traits::DatabaseStructure, Database, InputMeasurement, Outputs};
+use database::{database::traits::DatabaseStructure, Database, DatasetId, InputMeasurement, Outputs};
 // Add this import
 use splimes::{Resolution, Spline};
 use tokio::{sync::Semaphore, time::timeout};
@@ -34,7 +34,7 @@ async fn test_multiple_aspects_same_subject() {
 		for i in 0..100i64 {
 			// Make i explicitly i64
 			let measurement = InputMeasurement::new(base_time + Duration::minutes(i), BigDecimal::from_str(&format!("{}.{}", aspect_idx * 10 + (i as usize % 10), i % 100)).unwrap());
-			db.capture_measurement(aspect.clone(), measurement).await.expect("Failed to capture multi-aspect measurement");
+			db.capture_measurement(aspect.id(), DatasetId::new(), measurement).await.expect("Failed to capture multi-aspect measurement");
 		}
 	}
 
@@ -69,7 +69,7 @@ async fn test_high_frequency_measurements() {
 	for i in 0..num_measurements {
 		let measurement = InputMeasurement::new(base_time + Duration::seconds(i), BigDecimal::from_str(&format!("{}.{}", (i % 100), (i % 10))).unwrap());
 
-		db.capture_measurement(aspect.clone(), measurement).await.expect("Failed to capture measurement");
+		db.capture_measurement(aspect.id(), DatasetId::new(), measurement).await.expect("Failed to capture measurement");
 
 		if i % 100 == 0 {
 			// Log progress every 100 measurements
@@ -110,7 +110,7 @@ async fn test_concurrent_access() {
 	for i in 0..60 {
 		// Reduced initial data
 		let measurement = InputMeasurement::new(base_time + Duration::minutes(i), BigDecimal::from_str(&format!("{i}.0")).unwrap());
-		db.capture_measurement(aspect.clone(), measurement).await.expect("Failed to capture initial measurement");
+		db.capture_measurement(aspect.id(), DatasetId::new(), measurement).await.expect("Failed to capture initial measurement");
 	}
 
 	let num_concurrent_tasks = 8; // Reduced concurrency
@@ -135,7 +135,7 @@ async fn test_concurrent_access() {
 					if op_id % 2 == 0 {
 						// Write operation
 						let measurement = InputMeasurement::new(base_time + Duration::minutes(100 + task_id * operations_per_task + op_id), BigDecimal::from_str(&format!("{task_id}.{op_id}")).unwrap());
-						db.capture_measurement((*aspect).clone(), measurement).await.expect("Failed to capture concurrent measurement");
+						db.capture_measurement(aspect.id(), DatasetId::new(), measurement).await.expect("Failed to capture concurrent measurement");
 					} else {
 						// Read operation - use time within initial data range
 						let target_time = base_time + Duration::minutes((task_id * 5 + op_id / 2) % 50);
@@ -194,7 +194,7 @@ async fn test_large_dataset_analysis() {
 
 		let measurement = InputMeasurement::new(timestamp, BigDecimal::from_str(&format!("{value:.2}")).unwrap());
 
-		db.capture_measurement(aspect.clone(), measurement).await.expect("Failed to capture large dataset measurement");
+		db.capture_measurement(aspect.id(), DatasetId::new(), measurement).await.expect("Failed to capture large dataset measurement");
 
 		if i % 1000 == 0 {
 			println!("Captured {i} measurements");
@@ -253,7 +253,7 @@ async fn test_memory_usage_stability() {
 				base_time + Duration::seconds(cycle * 100 + i), // Adjusted timing
 				BigDecimal::from_str(&format!("{}.{}", cycle, i % 100)).unwrap(),
 			);
-			db.capture_measurement(aspect.clone(), measurement).await.expect("Failed to capture memory test measurement");
+			db.capture_measurement(aspect.id(), DatasetId::new(), measurement).await.expect("Failed to capture memory test measurement");
 		}
 
 		// Perform analyses on times within the data range
@@ -299,7 +299,7 @@ async fn test_edge_case_scenarios() {
 
 	for (seconds_offset, value) in sparse_measurements {
 		let measurement = InputMeasurement::new(base_time + Duration::seconds(seconds_offset), BigDecimal::from_str(value).unwrap());
-		db.capture_measurement(aspect.clone(), measurement).await.expect("Failed to capture sparse measurement");
+		db.capture_measurement(aspect.id(), DatasetId::new(), measurement).await.expect("Failed to capture sparse measurement");
 	}
 
 	// Analyze between sparse points
@@ -318,7 +318,7 @@ async fn test_edge_case_scenarios() {
 			dense_base + Duration::milliseconds(i * 100), // 100ms intervals
 			BigDecimal::from_str(&format!("{}.{:03}", 100, i)).unwrap(),
 		);
-		db.capture_measurement(aspect.clone(), measurement).await.expect("Failed to capture dense measurement");
+		db.capture_measurement(aspect.id(), DatasetId::new(), measurement).await.expect("Failed to capture dense measurement");
 	}
 
 	// Analyze within dense region
@@ -334,7 +334,7 @@ async fn test_edge_case_scenarios() {
 
 	for (seconds_offset, value) in extreme_measurements {
 		let measurement = InputMeasurement::new(extreme_base + Duration::seconds(seconds_offset), BigDecimal::from_str(value).unwrap());
-		db.capture_measurement(aspect.clone(), measurement).await.expect("Failed to capture extreme measurement");
+		db.capture_measurement(aspect.id(), DatasetId::new(), measurement).await.expect("Failed to capture extreme measurement");
 	}
 
 	// Analyze between extreme values

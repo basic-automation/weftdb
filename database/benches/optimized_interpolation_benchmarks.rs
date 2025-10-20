@@ -1,7 +1,7 @@
 use std::{hint::black_box, str::FromStr};
 
 use ::database::{
-	database::traits::{DatabaseStructure, Inputs, Outputs}, Database, InputMeasurement
+	database::traits::{AspectStructure, DatabaseStructure, Inputs, Outputs}, Database, DatasetId, InputMeasurement
 };
 use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
@@ -50,7 +50,7 @@ fn benchmark_optimization_strategies(c: &mut Criterion) {
 			for i in 0..measurement_count {
 				measurements.push(InputMeasurement::new(start_time + Duration::minutes(i as i64), BigDecimal::from_str(&format!("{}.0", i * 10)).unwrap()));
 			}
-			shared_db.batch_capture_measurements(aspect.clone(), measurements).await.unwrap();
+			shared_db.batch_capture_measurements(aspect.id(), DatasetId::new(), measurements).await.unwrap();
 
 			aspect.id()
 		});
@@ -117,7 +117,7 @@ fn benchmark_memory_efficiency(c: &mut Criterion) {
 			for i in 0..measurement_count {
 				measurements.push(InputMeasurement::new(start_time + Duration::minutes(i as i64), BigDecimal::from_str(&format!("{}.0", i * 10)).unwrap()));
 			}
-			db.batch_capture_measurements(aspect.clone(), measurements).await.unwrap();
+			db.batch_capture_measurements(aspect.id(), DatasetId::new(), measurements).await.unwrap();
 
 			aspect.id()
 		});

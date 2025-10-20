@@ -1,9 +1,9 @@
 use std::str::FromStr;
 
-use ::database::database::traits::Inputs;
+use ::database::database::traits::{AspectStructure, Inputs};
 use bigdecimal::BigDecimal;
 use chrono::{TimeZone, Utc};
-use database::{database::traits::DatabaseStructure, Database, InputMeasurement, Outputs};
+use database::{database::traits::DatabaseStructure, Database, DatasetId, InputMeasurement, Outputs};
 use futures::StreamExt;
 use splimes::{Resolution, Spline};
 use uuid::Uuid;
@@ -28,7 +28,7 @@ async fn test_database_lifecycle() {
 	let measurements = vec![InputMeasurement::new(Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap(), BigDecimal::from_str("20.5").unwrap()), InputMeasurement::new(Utc.with_ymd_and_hms(2023, 1, 1, 12, 5, 0).unwrap(), BigDecimal::from_str("21.0").unwrap()), InputMeasurement::new(Utc.with_ymd_and_hms(2023, 1, 1, 12, 10, 0).unwrap(), BigDecimal::from_str("21.5").unwrap())];
 
 	for measurement in measurements {
-		db.capture_measurement(aspect.clone(), measurement).await.expect("Failed to capture measurement");
+		db.capture_measurement(aspect.id(), DatasetId::new(), measurement).await.expect("Failed to capture measurement");
 	}
 
 	// Test point analysis
@@ -67,7 +67,7 @@ async fn test_existing_database() {
 	let aspect = db.track_aspect(subject.id(), "humidity", splimes::Resolution::Seconds).await.expect("Failed to track aspect");
 
 	// Add some data
-	db.capture_measurement(aspect, InputMeasurement::new(Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap(), BigDecimal::from_str("45.0").unwrap())).await.expect("Failed to capture measurement");
+	db.capture_measurement(aspect.id(), DatasetId::new(), InputMeasurement::new(Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap(), BigDecimal::from_str("45.0").unwrap())).await.expect("Failed to capture measurement");
 
 	// Test loading existing database
 	let loaded_db = Database::existing(&db_name).await.expect("Failed to load existing database");
@@ -104,13 +104,13 @@ async fn test_multiple_subjects_and_aspects() {
 		let timestamp = base_time + chrono::Duration::minutes(i * 5);
 
 		// Subject 1 temperature
-		db.capture_measurement(temp_aspect1.clone(), InputMeasurement::new(timestamp, BigDecimal::from_str(&format!("{}.0", 20 + i)).unwrap())).await.expect("Failed to capture temp measurement for subject 1");
+		db.capture_measurement(temp_aspect1.id(), DatasetId::new(), InputMeasurement::new(timestamp, BigDecimal::from_str(&format!("{}.0", 20 + i)).unwrap())).await.expect("Failed to capture temp measurement for subject 1");
 
 		// Subject 1 humidity
-		db.capture_measurement(humidity_aspect1.clone(), InputMeasurement::new(timestamp, BigDecimal::from_str(&format!("{}.0", 40 + i)).unwrap())).await.expect("Failed to capture humidity measurement for subject 1");
+		db.capture_measurement(humidity_aspect1.id(), DatasetId::new(), InputMeasurement::new(timestamp, BigDecimal::from_str(&format!("{}.0", 40 + i)).unwrap())).await.expect("Failed to capture humidity measurement for subject 1");
 
 		// Subject 2 temperature
-		db.capture_measurement(temp_aspect2.clone(), InputMeasurement::new(timestamp, BigDecimal::from_str(&format!("{}.0", 15 + i)).unwrap())).await.expect("Failed to capture temp measurement for subject 2");
+		db.capture_measurement(temp_aspect2.id(), DatasetId::new(), InputMeasurement::new(timestamp, BigDecimal::from_str(&format!("{}.0", 15 + i)).unwrap())).await.expect("Failed to capture temp measurement for subject 2");
 	}
 
 	// Test analysis on different aspects
@@ -172,7 +172,7 @@ async fn test_interpolation_methods() {
 	];
 
 	for (minutes, value) in measurements {
-		db.capture_measurement(aspect.clone(), InputMeasurement::new(base_time + chrono::Duration::minutes(minutes), BigDecimal::from_str(value).unwrap())).await.expect("Failed to capture measurement");
+		db.capture_measurement(aspect.id(), DatasetId::new(), InputMeasurement::new(base_time + chrono::Duration::minutes(minutes), BigDecimal::from_str(value).unwrap())).await.expect("Failed to capture measurement");
 	}
 
 	// Test different spline types with different target times to avoid cache conflicts
@@ -230,7 +230,7 @@ async fn test_caching_behavior() {
 	// Add test data
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap();
 	for i in 0..10 {
-		db.capture_measurement(aspect.clone(), InputMeasurement::new(base_time + chrono::Duration::minutes(i * 5), BigDecimal::from_str(&format!("{i}.0")).unwrap())).await.expect("Failed to capture measurement");
+		db.capture_measurement(aspect.id(), DatasetId::new(), InputMeasurement::new(base_time + chrono::Duration::minutes(i * 5), BigDecimal::from_str(&format!("{i}.0")).unwrap())).await.expect("Failed to capture measurement");
 	}
 
 	let target_time = base_time + chrono::Duration::minutes(22);

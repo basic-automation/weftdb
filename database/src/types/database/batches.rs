@@ -135,6 +135,11 @@ impl super::Database {
 		Ok(batches)
 	}
 
+	/// Marks a batch as processed by moving it from the unprocessed to processed database.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the database operations fail or the batch cannot be moved.
 	pub async fn mark_batch_processed(&self, batch: &Batch) -> Result<()> {
 		// Get aspect information for database path building
 		let aspect = batch.metadata.aspect;
@@ -159,7 +164,7 @@ impl super::Database {
             measurements_json = excluded.measurements_json
     ";
 
-		processed_conn.execute(insert_sql, turso::params![batch_id.as_uuid().to_string(), batch.metadata.aspect.as_uuid().to_string(), self.id().as_uuid().to_string(), batch.measurements.len() as i64, serde_json::to_string(&batch.metadata.resolution).unwrap_or_default(), batch.batch_hash().cloned(), chrono::Utc::now().timestamp_millis(), metadata_json, measurements_json]).await.map_err(|e| Error::DatabaseError(format!("Failed to insert batch into processed database: {e}")))?;
+		processed_conn.execute(insert_sql, turso::params![batch_id.as_uuid().to_string(), batch.metadata.aspect.as_uuid().to_string(), self.id().as_uuid().to_string(), i64::try_from(batch.measurements.len()).unwrap_or(i64::MAX), serde_json::to_string(&batch.metadata.resolution).unwrap_or_default(), batch.batch_hash().cloned(), chrono::Utc::now().timestamp_millis(), metadata_json, measurements_json]).await.map_err(|e| Error::DatabaseError(format!("Failed to insert batch into processed database: {e}")))?;
 
 		// 2. Remove from unprocessed_batches database
 		let unprocessed_batches_db = aspect_data.unprocessed_batches().await?;
@@ -552,6 +557,11 @@ impl super::Database {
 		Ok(batches)
 	}
 
+	/// Removes a processed batch from the processed batches database.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the database operations fail or the batch cannot be removed.
 	pub async fn dequeue_processed_batch(&self, batch: &Batch) -> Result<()> {
 		// Get aspect information for database access
 		let aspect = batch.metadata.aspect;

@@ -13,6 +13,7 @@ pub trait DatabaseStructure {
 	// Database
 
 	/// Create a new Database
+	#[allow(clippy::new_ret_no_self)]
 	async fn new(name: &str) -> Result<Database>;
 
 	/// Load an existing Database

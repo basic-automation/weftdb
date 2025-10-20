@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use ::database::{
-	database::traits::{DatabaseStructure, Inputs, Outputs}, Database, InputMeasurement
+	database::traits::{AspectStructure, DatabaseStructure, Inputs, Outputs}, Database, DatasetId, InputMeasurement
 };
 use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
@@ -28,7 +28,7 @@ fn benchmark_cache_miss_vs_hit(c: &mut Criterion) {
 		let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 		for i in 0..50 {
 			let measurement = InputMeasurement::new(base_time + Duration::seconds(i * 60), BigDecimal::from_str(&format!("{i}.0")).unwrap());
-			db.capture_measurement(aspect.clone(), measurement).await.unwrap();
+			db.capture_measurement(aspect.id(), DatasetId::new(), measurement).await.unwrap();
 		}
 		(db, aspect.id())
 	});
@@ -92,7 +92,7 @@ fn benchmark_cache_invalidation(c: &mut Criterion) {
 				let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 				for i in 0..10 {
 					let measurement = InputMeasurement::new(base_time + Duration::seconds(i * 60), BigDecimal::from_str(&format!("{i}.0")).unwrap());
-					db.capture_measurement(aspect.clone(), measurement).await.unwrap();
+					db.capture_measurement(aspect.id(), DatasetId::new(), measurement).await.unwrap();
 				}
 
 				let analyze_time = base_time + Duration::seconds(300);
@@ -128,10 +128,8 @@ fn benchmark_concurrent_cache_access(c: &mut Criterion) {
 				let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 				for i in 0..20 {
 					let measurement = InputMeasurement::new(base_time + Duration::seconds(i * 30), BigDecimal::from_str(&format!("{i}.0")).unwrap());
-					db.capture_measurement(aspect.clone(), measurement).await.unwrap();
-				}
-
-				// Simulate concurrent access
+					db.capture_measurement(aspect.id(), DatasetId::new(), measurement).await.unwrap();
+				} // Simulate concurrent access
 				let mut handles = vec![];
 				for i in 0..5 {
 					let db_clone = db.clone();
@@ -177,10 +175,8 @@ fn benchmark_cache_memory_usage(c: &mut Criterion) {
 					let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 					for i in 0..size {
 						let measurement = InputMeasurement::new(base_time + Duration::seconds(i64::from(i) * 60), BigDecimal::from_str(&format!("{i}.0")).unwrap());
-						db.capture_measurement(aspect.clone(), measurement).await.unwrap();
-					}
-
-					// Perform several analyses to test memory usage
+						db.capture_measurement(aspect.id(), DatasetId::new(), measurement).await.unwrap();
+					} // Perform several analyses to test memory usage
 					let mut results = vec![];
 					for i in 0..10 {
 						let analyze_time = base_time + Duration::seconds(i * 300);
@@ -219,10 +215,8 @@ fn benchmark_cache_eviction_strategies(c: &mut Criterion) {
 				let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 				for i in 0..200 {
 					let measurement = InputMeasurement::new(base_time + Duration::seconds(i * 30), BigDecimal::from_str(&format!("{i}.0")).unwrap());
-					db.capture_measurement(aspect.clone(), measurement).await.unwrap();
-				}
-
-				// Perform many different analyses to test eviction
+					db.capture_measurement(aspect.id(), DatasetId::new(), measurement).await.unwrap();
+				} // Perform many different analyses to test eviction
 				let mut results = vec![];
 				for i in 0..50 {
 					let analyze_time = base_time + Duration::seconds(i * 120);
