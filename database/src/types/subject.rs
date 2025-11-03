@@ -1,6 +1,6 @@
 use std::{collections::HashMap, hash::Hash, path::Path};
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -69,7 +69,10 @@ impl Subject {
 	pub async fn new(id: Option<SubjectId>, name: String, database_id: DatabaseId, database_metadata_db_path: String) -> Result<Self> {
 		let id = id.unwrap_or_default();
 
-		let subject_path = Self::get_subject_path(database_metadata_db_path.clone(), id).await?;
+		// For new subjects (when id is None), we construct the path directly using the provided name
+		// The database_metadata_db_path points to the database metadata file, so we need to get the database directory
+		let database_dir = Path::new(&database_metadata_db_path).parent().ok_or_else(|| anyhow::anyhow!("Cannot determine database directory"))?;
+		let subject_path = database_dir.join(&name);
 
 		// recursively create directory if it doesn't exist
 		tokio::fs::create_dir_all(&subject_path).await?;
@@ -94,29 +97,7 @@ impl Subject {
 		Ok(metadata_path)
 	}
 
-	async fn get_subject_name(turso_db: turso::Database, subject_id: SubjectId) -> Result<String> {
-		// Query the database for the name field where id = subject_id in the subjects table
-		let conn = turso_db.connect()?;
-		let mut rows = conn.query("SELECT name FROM subjects WHERE id = ?", turso::params![subject_id.as_uuid().to_string()]).await?;
-		let row = rows.next().await?.ok_or_else(|| anyhow::anyhow!("Subject not found"))?;
-		let subject_name: String = row.get(0)?;
-
-		Ok(subject_name)
-	}
-
-	async fn get_subject_path(database_metadata_db_path: String, subject_id: SubjectId) -> Result<String> {
-		let database_metadata_path = Aspect::get_database_metadata_path(database_metadata_db_path.clone()).await?;
-		let database_metadata_db = Database::get_turso_database(&database_metadata_path).await?;
-		let subject_name = Self::get_subject_name(database_metadata_db, subject_id).await?;
-
-		let subject_metadata_path = Path::new(&database_metadata_db_path).join(subject_name);
-
-		if subject_metadata_path.exists() {
-			Ok(subject_metadata_path.to_string_lossy().to_string())
-		} else {
-			bail!("Subject metadata path does not exist");
-		}
-	}
+	// Removed unused helper methods to fix warnings
 
 	#[must_use]
 	pub const fn id(&self) -> SubjectId {

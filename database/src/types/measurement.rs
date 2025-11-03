@@ -4,9 +4,8 @@ use bigdecimal::{BigDecimal, FromPrimitive};
 use chrono::{TimeZone, Utc};
 use fake::Dummy;
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::{DatasetId, InputMeasurement};
 

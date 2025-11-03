@@ -8,7 +8,7 @@ use splimes::{Point, Resolution, Spline};
 use uuid::Uuid;
 
 use crate::{
-	AnalysisResult, AspectId, Batch, BatchId, BatchMetatdata, BatchedMeasurement, Database, DatasetId, Error, Measurement, MeasurementId, database::traits::{AspectStructure, DatabaseStructure, Outputs}, types::cache::CACHE
+	database::traits::{AspectStructure, DatabaseStructure, Outputs}, types::cache::CACHE, AnalysisResult, AspectId, Batch, BatchId, BatchMetatdata, BatchedMeasurement, Database, DatasetId, Error, Measurement, MeasurementId
 };
 
 #[async_trait::async_trait]
@@ -89,12 +89,13 @@ impl Outputs for Database {
 			}
 		};
 
-		let conn = measurement_db.connect()?;
+		let cache_key = format!("measurement_db_query_{}_{}_{}_{}", aspect_id, start.map(|s| s.timestamp_millis()).unwrap_or(0), end.map(|e| e.timestamp_millis()).unwrap_or(i64::MAX), max_per_page);
+		let conn = Self::begin_concurrent(&measurement_db, &cache_key).await?;
 
 		// Convert String parameters to turso::Value
 		let turso_params: Vec<turso::Value> = params.into_iter().map(turso::Value::from).collect();
 
-		let mut rows = conn.query(&query_sql, turso_params).await.map_err(|e| Error::DatabaseError(format!("Failed to query measurements: {e}")))?;
+		let mut rows = conn.as_ref().query(&query_sql, turso_params).await.map_err(|e| Error::DatabaseError(format!("Failed to query measurements: {e}")))?;
 
 		let mut measurements = Vec::with_capacity(max_per_page.min(1000));
 
@@ -436,10 +437,7 @@ impl Outputs for Database {
 						current = chunk_end;
 						let mut new_iter = interpolated.into_iter();
 						// Return first point and set up iterator for the rest
-						new_iter.next().map_or_else(
-							|| Some((Ok(Point { timestamp: current, value: BigDecimal::zero() }), (current, None))),
-							|first_point| Some((Ok(first_point), (current, Some(new_iter))))
-						)
+						new_iter.next().map_or_else(|| Some((Ok(Point { timestamp: current, value: BigDecimal::zero() }), (current, None))), |first_point| Some((Ok(first_point), (current, Some(new_iter)))))
 					}
 					Err(e) => Some((Err(e), (current, None))),
 				}
@@ -561,14 +559,14 @@ impl Outputs for Database {
 		// Collect all batches first to avoid async issues in the stream
 		let mut batches = Vec::new();
 
-	while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get batch row: {e}")))? {
-		if let Ok(batch) = Self::parse_batch_row(row).await {
-			batches.push(batch);
-		} else {
-			// Log error but continue processing other batches
-			eprintln!("Warning: Failed to parse batch row");
-		}
-	}		// Cache the results for future queries
+		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get batch row: {e}")))? {
+			if let Ok(batch) = Self::parse_batch_row(row).await {
+				batches.push(batch);
+			} else {
+				// Log error but continue processing other batches
+				eprintln!("Warning: Failed to parse batch row");
+			}
+		} // Cache the results for future queries
 		if !batches.is_empty() {
 			CACHE.store_unprocessed_batches(&cache_key, &batches).await;
 		}

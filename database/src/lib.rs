@@ -250,6 +250,12 @@ pub use types::*;
 // Default data directory - can be overridden with environment variable
 pub const DEFAULT_DATA_DIR: &str = "C:\\Users\\physi\\Desktop\\dsp_data";
 
+/// Get the data directory, respecting `TEST_DATA_DIR` environment variable for tests
+#[must_use]
+pub fn get_data_dir() -> String {
+	std::env::var("TEST_DATA_DIR").unwrap_or_else(|_| DEFAULT_DATA_DIR.to_string())
+}
+
 // Version information
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PKG_NAME: &str = env!("CARGO_PKG_NAME");

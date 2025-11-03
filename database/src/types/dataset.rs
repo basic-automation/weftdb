@@ -40,11 +40,11 @@ impl Display for DatasetId {
 }
 
 impl FromStr for DatasetId {
-        type Err = uuid::Error;
+	type Err = uuid::Error;
 
-        fn from_str(s: &str) -> Result<Self, Self::Err> {
-                Uuid::parse_str(s).map(Self)
-        }
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		Uuid::parse_str(s).map(Self)
+	}
 }
 
 #[derive(Debug, Clone)]

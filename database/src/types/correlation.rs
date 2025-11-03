@@ -5,7 +5,9 @@ use uuid::Uuid;
 
 // Import Distance from signal module for error rate types
 use crate::types::{dictionary::DictionaryId, signal::Distance};
-use crate::{types::event::EventID, Occurrence, PatternID, SignalType};
+use crate::{
+	types::{aspect::AspectId, event::EventID, subject::SubjectId}, Occurrence, PatternID, SignalType
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub struct CorrelationID(Uuid); // Wrapper for event ID
@@ -84,6 +86,8 @@ where
 pub struct Correlation {
 	id: CorrelationID,
 	dictionary_id: DictionaryId,
+	subject_id: SubjectId,
+	aspect_id: AspectId,
 	pattern_id: PatternID,
 	event_id: EventID,
 	#[serde(serialize_with = "serialize_error_rates", deserialize_with = "deserialize_error_rates")]
@@ -93,20 +97,9 @@ pub struct Correlation {
 
 impl Correlation {
 	#[must_use]
-	pub fn new(dictionary_id: DictionaryId, pattern_id: PatternID, event_id: EventID, error_rate: ErrorRate, occurrences: Vec<Occurrence>) -> Self {
-		let id = CorrelationID::new();
-		let mut error_rate_map = HashMap::new();
-		// Initialize error rates for all signal types that will be created
-		error_rate_map.insert(SignalType::Custom("PredictStart".to_string()), error_rate.clone());
-		error_rate_map.insert(SignalType::Custom("PredictMid".to_string()), error_rate.clone());
-		error_rate_map.insert(SignalType::Custom("PredictEnd".to_string()), error_rate);
-		Self { id, dictionary_id, pattern_id, event_id, error_rate: error_rate_map, occurrences }
-	}
-
-	/// Create a correlation with a specific ID (useful for database deserialization)
-	#[must_use]
-	pub const fn with_id(id: CorrelationID, dictionary_id: DictionaryId, pattern_id: PatternID, event_id: EventID, error_rates: HashMap<SignalType, ErrorRate>, occurrences: Vec<Occurrence>) -> Self {
-		Self { id, dictionary_id, pattern_id, event_id, error_rate: error_rates, occurrences }
+	pub fn new(id: Option<CorrelationID>, dictionary_id: DictionaryId, subject_id: SubjectId, aspect_id: &AspectId, pattern_id: PatternID, event_id: EventID, error_rate: HashMap<SignalType, ErrorRate>, occurrences: Vec<Occurrence>) -> Self {
+		let id = id.unwrap_or_else(CorrelationID::new);
+		Self { id, dictionary_id, subject_id, aspect_id: *aspect_id, pattern_id, event_id, error_rate: error_rate, occurrences }
 	}
 
 	#[must_use]
@@ -136,6 +129,11 @@ impl Correlation {
 	#[must_use]
 	pub const fn dictionary_id(&self) -> &DictionaryId {
 		&self.dictionary_id
+	}
+
+	#[must_use]
+	pub const fn aspect_id(&self) -> &AspectId {
+		&self.aspect_id
 	}
 
 	#[must_use]

@@ -53,7 +53,7 @@ impl Batches {
 	pub async fn new(database: &Database, aspect: &AspectId, resolution: &splimes::Resolution, method: &splimes::Spline, batch_size: usize) -> Result<Self> {
 		let start_time = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
 		let end_time = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
-		let min_resolution = database.get_aspect_resolution(aspect).await?.ok_or_else(|| anyhow::anyhow!("No aspect resolution found"))?;
+		let min_resolution = database.get_aspect_resolution(aspect).await.or_else(|_| bail!("No aspect resolution found"))?;
 
 		if resolution < &min_resolution {
 			bail!("Resolution is less than minimum resolution for aspect");
@@ -101,7 +101,7 @@ impl Batches {
 	pub async fn new_with_limited_data(database: &Database, aspect: &AspectId, resolution: &splimes::Resolution, method: &splimes::Spline, batch_size: usize, max_points: usize) -> Result<Self> {
 		let start_time = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
 		let end_time = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
-		let min_resolution = database.get_aspect_resolution(aspect).await?.ok_or_else(|| anyhow::anyhow!("No aspect resolution found"))?;
+		let min_resolution = database.get_aspect_resolution(aspect).await.or_else(|_| bail!("No aspect resolution found"))?;
 
 		if resolution < &min_resolution {
 			bail!("Resolution is less than minimum resolution for aspect");

@@ -1,12 +1,14 @@
-use std::{fmt::Display, path::Path};
+use std::fmt::Display;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use splimes::Resolution;
 use turso::Database as TursoDatabase;
 use uuid::Uuid;
 
-use crate::{types::database::traits::aspect_structure::AspectStructure, Database, DatabaseStructure, SubjectId};
+use crate::{
+	cache::Connection, database::{aspect_correlations_db_path, aspect_dictionaries_path, aspect_events_db_path, aspect_measurements_db_path, aspect_path, aspect_patterns_db_path, aspect_processed_batches_db_path, aspect_unprocessed_batches_db_path}, types::database::traits::aspect_structure::AspectStructure, Database, DatabaseStructure, SubjectId
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AspectId(Uuid);
@@ -47,129 +49,166 @@ pub struct Aspect {
 	subject_id: SubjectId,
 	resolution: Resolution,
 	database_metadata_db_path: String,
+	subject_name: String,
+	aspect_path: String,
 
 	#[serde(skip)]
 	measurements: Option<TursoDatabase>,
+	measurements_path: String,
+
 	#[serde(skip)]
 	unprocessed_batches: Option<TursoDatabase>,
+	unprocessed_batches_path: String,
+
 	#[serde(skip)]
 	processed_batches: Option<TursoDatabase>,
+	processed_batches_path: String,
+
 	#[serde(skip)]
 	patterns: Option<TursoDatabase>,
+	patterns_path: String,
+
 	#[serde(skip)]
 	events: Option<TursoDatabase>,
+	events_path: String,
+
 	#[serde(skip)]
 	correlations: Option<TursoDatabase>,
+	correlations_path: String,
 }
 
 #[async_trait::async_trait]
 impl AspectStructure for Aspect {
-	async fn new(id: Option<AspectId>, name: String, subject_id: SubjectId, resolution: Resolution, database_metadata_db_path: String) -> Result<Self> {
+	async fn new(id: Option<AspectId>, name: String, subject_id: SubjectId, db_name: String, resolution: Resolution, database_metadata_db_path: String) -> Result<Self> {
 		let id = id.unwrap_or_default();
-
-		let aspect_path = Self::get_aspect_path(database_metadata_db_path.clone(), subject_id, name.clone()).await?;
+		let database_metadata_db = Database::get_turso_database(&database_metadata_db_path).await?;
+		let subject_name = Self::get_subject_name(database_metadata_db, subject_id).await?;
+		let aspect_path = aspect_path(&db_name, &subject_name, &name);
 
 		// recursively create directory if it doesn't exist
 		tokio::fs::create_dir_all(&aspect_path).await?;
 
-		let measurements_db_path = aspect_path.clone() + "/measurements.db";
-		let measurements = match Database::get_turso_database(&measurements_db_path).await {
-			Ok(db) => Some(db),
-			Err(_) => Some(Database::create_turso_database(&measurements_db_path).await?),
-		};
+		// Create databases sequentially to avoid lock contention during concurrent aspect creation
+		// The databases themselves will use MVCC for internal concurrency
+		let measurements_path = aspect_measurements_db_path(&db_name, &subject_name, &name);
+		println!("[TRACE] Creating measurements DB at: {measurements_path}");
+		let measurements = Database::get_or_create_turso_database(&measurements_path).await?;
+		println!("[TRACE] Connected measurements DB: {measurements_path}");
+		let conn = Database::begin_concurrent(&measurements, &measurements_path).await?;
+		println!("[TRACE] Wireframing measurements tables for: {measurements_path}");
+		Self::wireframe_measurements_tables(&conn).await?;
+		Database::commit_concurrent(&conn).await?;
+		println!("[TRACE] Wireframed measurements tables for: {measurements_path}");
+                let measurements = Some(measurements);
 
-		match measurements {
-			Some(ref db) => {
-				let conn = db.connect()?;
-				Self::wireframe_measurements_tables(&conn).await?;
-			}
-			None => bail!("Failed to get or create measurements database"),
-		}
+		let unprocessed_batches_path = aspect_unprocessed_batches_db_path(&db_name, &subject_name, &name);
+		println!("[TRACE] Creating unprocessed_batches DB at: {unprocessed_batches_path}");
+		let unprocessed_batches = Database::get_or_create_turso_database(&unprocessed_batches_path).await?;
+		println!("[TRACE] Connected unprocessed_batches DB: {unprocessed_batches_path}");
+		let conn = Database::begin_concurrent(&unprocessed_batches, &unprocessed_batches_path).await?;
+		println!("[TRACE] Wireframing batches tables for: {unprocessed_batches_path}");
+		Self::wireframe_batches_tables(&conn).await?;
+		println!("[TRACE] Wireframed batches tables for: {unprocessed_batches_path}");
+		let unprocessed_batches = Some(unprocessed_batches);
+		Database::commit_concurrent(&conn).await?;
 
-		let unprocessed_batches_db_path = aspect_path.clone() + "/unprocessed_batches.db";
-		let unprocessed_batches = match Database::get_turso_database(&unprocessed_batches_db_path).await {
-			Ok(db) => Some(db),
-			Err(_) => Some(Database::create_turso_database(&unprocessed_batches_db_path).await?),
-		};
+		let processed_batches_path = aspect_processed_batches_db_path(&db_name, &subject_name, &name);
+		println!("[TRACE] Creating processed_batches DB at: {processed_batches_path}");
+		let processed_batches = Database::get_or_create_turso_database(&processed_batches_path).await?;
+		println!("[TRACE] Connected processed_batches DB: {processed_batches_path}");
+		let conn = Database::begin_concurrent(&processed_batches, &processed_batches_path).await?;
+		println!("[TRACE] Wireframing batches tables for: {processed_batches_path}");
+		Self::wireframe_batches_tables(&conn).await?;
+		println!("[TRACE] Wireframed batches tables for: {processed_batches_path}");
+		let processed_batches = Some(processed_batches);
+		Database::commit_concurrent(&conn).await?;
 
-		match unprocessed_batches {
-			Some(ref db) => {
-				let conn = db.connect()?;
-				Self::wireframe_batches_tables(&conn).await?;
-			}
-			None => bail!("Failed to get or create unprocessed batches database"),
-		}
+		let patterns_path = aspect_patterns_db_path(&db_name, &subject_name, &name);
+		println!("[TRACE] Creating patterns DB at: {patterns_path}");
+		let patterns = Database::get_or_create_turso_database(&patterns_path).await?;
+		println!("[TRACE] Connected patterns DB: {patterns_path}");
+		let conn = Database::begin_concurrent(&patterns, &patterns_path).await?;
+		println!("[TRACE] Wireframing patterns tables for: {patterns_path}");
+		Self::wireframe_patterns_tables(&conn).await?;
+		println!("[TRACE] Wireframed patterns tables for: {patterns_path}");
+		let patterns = Some(patterns);
+		Database::commit_concurrent(&conn).await?;
 
-		let processed_batches_db_path = aspect_path.clone() + "/processed_batches.db";
-		let processed_batches = match Database::get_turso_database(&processed_batches_db_path).await {
-			Ok(db) => Some(db),
-			Err(_) => Some(Database::create_turso_database(&processed_batches_db_path).await?),
-		};
+		let events_path = aspect_events_db_path(&db_name, &subject_name, &name);
+		println!("[TRACE] Creating events DB at: {events_path}");
+		let events = Database::get_or_create_turso_database(&events_path).await?;
+		println!("[TRACE] Connected events DB: {events_path}");
+		let conn = Database::begin_concurrent(&events, &events_path).await?;
+		println!("[TRACE] Wireframing events tables for: {events_path}");
+		Self::wireframe_events_tables(&conn).await?;
+		println!("[TRACE] Wireframed events tables for: {events_path}");
+		let events = Some(events);
+		Database::commit_concurrent(&conn).await?;
 
-		match processed_batches {
-			Some(ref db) => {
-				let conn = db.connect()?;
-				Self::wireframe_batches_tables(&conn).await?;
-			}
-			None => bail!("Failed to get or create processed batches database"),
-		}
+		let correlations_path = aspect_correlations_db_path(&db_name, &subject_name, &name);
+		println!("[TRACE] Creating correlations DB at: {correlations_path}");
+		let correlations = Database::get_or_create_turso_database(&correlations_path).await?;
+		println!("[TRACE] Connected correlations DB: {correlations_path}");
+		let conn = Database::begin_concurrent(&correlations, &correlations_path).await?;
+		println!("[TRACE] Wireframing correlations tables for: {correlations_path}");
+		Self::wireframe_correlations_tables(&conn).await?;
+		println!("[TRACE] Wireframed correlations tables for: {correlations_path}");
+		let correlations = Some(correlations);
+		Database::commit_concurrent(&conn).await?;
 
-		let patterns_db_path = aspect_path.clone() + "/patterns.db";
-		let patterns = match Database::get_turso_database(&patterns_db_path).await {
-			Ok(db) => Some(db),
-			Err(_) => Some(Database::create_turso_database(&patterns_db_path).await?),
-		};
-
-		match patterns {
-			Some(ref db) => {
-				let conn = db.connect()?;
-				Self::wireframe_patterns_tables(&conn).await?;
-			}
-			None => bail!("Failed to get or create patterns database"),
-		}
-
-		let events_db_path = aspect_path.clone() + "/events.db";
-		let events = match Database::get_turso_database(&events_db_path).await {
-			Ok(db) => Some(db),
-			Err(_) => Some(Database::create_turso_database(&events_db_path).await?),
-		};
-
-		match events {
-			Some(ref db) => {
-				let conn = db.connect()?;
-				Self::wireframe_events_tables(&conn).await?;
-			}
-			None => bail!("Failed to get or create events database"),
-		}
-
-		let correlations_db_path = aspect_path + "/correlations.db";
-		let correlations = match Database::get_turso_database(&correlations_db_path).await {
-			Ok(db) => Some(db),
-			Err(_) => Some(Database::create_turso_database(&correlations_db_path).await?),
-		};
-
-		match correlations {
-			Some(ref db) => {
-				let conn = db.connect()?;
-				Self::wireframe_correlations_tables(&conn).await?;
-			}
-			None => bail!("Failed to get or create correlations database"),
-		}
+		let dictionaries_path = aspect_dictionaries_path(&db_name, &subject_name, &name);
+		println!("[TRACE] Creating dictionaries directory at: {dictionaries_path}");
+		std::fs::create_dir_all(&dictionaries_path)?;
 
 		#[rustfmt::skip]
 		Ok(Self {
-                        id,
-                        name,
-                        subject_id,
-                        resolution,
-                        database_metadata_db_path,
-                        measurements,
-                        unprocessed_batches,
-                        processed_batches,
-                        patterns,
-                        events,
-                        correlations,
-                })
+			id,
+			name,
+			subject_id,
+			resolution,
+			database_metadata_db_path,
+			subject_name,
+			aspect_path,
+			measurements,
+			measurements_path,
+			unprocessed_batches,
+			unprocessed_batches_path,
+			processed_batches,
+			processed_batches_path,
+			patterns,
+			patterns_path,
+			events,
+			events_path,
+			correlations,
+			correlations_path,
+		})
+	}
+
+	/// Lightweight constructor used when we only need the Aspect metadata
+	/// without opening or wireframing per-aspect databases. This avoids
+	/// holding metadata DB locks during expensive IO when simply listing
+	/// aspects or performing existence checks.
+	async fn from_metadata(id: Option<AspectId>, name: String, subject_id: SubjectId, resolution: Resolution, database_metadata_db_path: String, subject_name_opt: Option<String>) -> Result<Self> {
+		let provided_subject_name = if let Some(sn) = subject_name_opt {
+			sn
+		} else {
+			let database_metadata_db = Database::get_turso_database(&database_metadata_db_path).await?;
+			Self::get_subject_name(database_metadata_db, subject_id).await?
+		};
+
+		let database_dir = std::path::Path::new(&database_metadata_db_path).parent().ok_or_else(|| anyhow::anyhow!("Cannot determine database directory"))?;
+
+		let aspect_path = database_dir.join(&provided_subject_name).join(&name);
+		let aspect_path_str = aspect_path.to_string_lossy().to_string();
+
+		let measurements_path = aspect_path_str.clone() + "/measurements.db";
+		let unprocessed_batches_path = aspect_path_str.clone() + "/unprocessed_batches.db";
+		let processed_batches_path = aspect_path_str.clone() + "/processed_batches.db";
+		let patterns_path = aspect_path_str.clone() + "/patterns.db";
+		let events_path = aspect_path_str.clone() + "/events.db";
+		let correlations_path = aspect_path_str.clone() + "/correlations.db";
+
+		Ok(Self { id: id.unwrap_or_default(), name, subject_id, resolution, database_metadata_db_path, subject_name: provided_subject_name, aspect_path: aspect_path_str, measurements: None, unprocessed_batches: None, processed_batches: None, patterns: None, events: None, correlations: None, measurements_path, unprocessed_batches_path, processed_batches_path, patterns_path, events_path, correlations_path })
 	}
 
 	fn id(&self) -> AspectId {
@@ -186,6 +225,14 @@ impl AspectStructure for Aspect {
 
 	fn resolution(&self) -> Resolution {
 		self.resolution
+	}
+
+	fn subject_name(&self) -> &str {
+		&self.subject_name
+	}
+
+	fn aspect_path(&self) -> &str {
+		&self.aspect_path
 	}
 
 	async fn database_metadata(&self) -> Result<TursoDatabase> {
@@ -206,408 +253,398 @@ impl AspectStructure for Aspect {
 	}
 
 	async fn get_subject_name(turso_db: TursoDatabase, subject_id: SubjectId) -> Result<String> {
-		// Query the database for the name field where id = subject_id in the subjects table
-		let conn = turso_db.connect()?;
-		let mut rows = conn.query("SELECT name FROM subjects WHERE id = ?", turso::params![subject_id.as_uuid().to_string()]).await?;
-		let row = rows.next().await?.ok_or_else(|| anyhow::anyhow!("Subject not found"))?;
-		let subject_name: String = row.get(0)?;
+		// Read-only query with simple retry/backoff; no explicit transaction to avoid writer locks
+		let mut attempts = 0u32;
+		const MAX_ATTEMPTS: u32 = 8;
 
-		Ok(subject_name)
+		loop {
+			attempts += 1;
+			let conn = match turso_db.connect() {
+				Ok(c) => c,
+				Err(e) => {
+					if attempts < MAX_ATTEMPTS && e.to_string().to_lowercase().contains("locked") {
+						tokio::time::sleep(std::time::Duration::from_millis(25 * attempts as u64)).await;
+						continue;
+					}
+					return Err(anyhow::anyhow!("Failed to connect for subject_name: {e}"));
+				}
+			};
+
+			// Ensure this read waits on busy locks rather than failing fast
+			let _ = conn.execute("PRAGMA busy_timeout=600000", turso::params![]).await;
+
+			let res = conn.query("SELECT name FROM subjects WHERE id = ?", turso::params![subject_id.as_uuid().to_string()]).await;
+			match res {
+				Ok(mut rows) => {
+					let row = rows.next().await?.ok_or_else(|| anyhow::anyhow!("Subject not found"))?;
+					let subject_name: String = row.get(0)?;
+					return Ok(subject_name);
+				}
+				Err(e) => {
+					let em = e.to_string().to_lowercase();
+					if attempts < MAX_ATTEMPTS && (em.contains("locked") || em.contains("busy") || em.contains("conflict")) {
+						tokio::time::sleep(std::time::Duration::from_millis(25 * attempts as u64)).await;
+						continue;
+					}
+					return Err(anyhow::anyhow!("SQL execution failure getting subject_name: `{}`", e));
+				}
+			}
+		}
 	}
 
 	async fn get_aspect_path(turso_db_path: String, subject_id: SubjectId, aspect_name: String) -> Result<String> {
 		let database_metadata_db = Database::get_turso_database(&turso_db_path).await?;
 		let subject_name = Self::get_subject_name(database_metadata_db, subject_id).await?;
 
-		let aspect_metadata_path = Path::new(&turso_db_path).join(subject_name).join(aspect_name);
+		let aspect_metadata_path = std::path::Path::new(&turso_db_path).parent().ok_or_else(|| anyhow::anyhow!("Cannot determine database directory"))?.join(subject_name).join(aspect_name);
 
 		if aspect_metadata_path.exists() {
 			Ok(aspect_metadata_path.to_string_lossy().to_string())
 		} else {
-			bail!("Aspect metadata path does not exist");
+			Err(anyhow::anyhow!("Aspect metadata path does not exist"))
 		}
 	}
 
 	async fn measurements(&mut self) -> Result<TursoDatabase> {
-		if self.measurements.is_none() {
-			let database_metadata_path = Self::get_database_metadata_path(self.database_metadata_db_path.clone()).await?;
-			let database_metadata_db = Database::get_turso_database(&database_metadata_path).await?;
-			let _subject_name = Self::get_subject_name(database_metadata_db, self.subject_id).await?;
-
-			let aspect_path = Self::get_aspect_path(database_metadata_path, self.subject_id, self.name.clone()).await?;
-			let aspect_measurements_path = Path::new(&aspect_path).with_file_name("measurements.db").to_string_lossy().to_string();
-
-			// If the measurements_path exists, open the TursoDatabase
-			let measurements_db = Database::get_turso_database(&aspect_measurements_path).await?;
-			self.measurements = Some(measurements_db);
-		}
-
-		Ok(match self.measurements {
-			Some(ref db) => db.clone(),
-			None => bail!("Measurements database is not initialized"),
-		})
+		self.measurements.as_ref().cloned().ok_or_else(|| anyhow::anyhow!("Measurements database is not initialized"))
 	}
 
 	fn set_measurements(&mut self, turso_db: TursoDatabase) {
 		self.measurements = Some(turso_db);
 	}
 
-	async fn wireframe_measurements_tables(conn: &turso::Connection) -> Result<()> {
-		conn.execute(
+	fn measurements_path(&self) -> String {
+		self.measurements_path.clone()
+	}
+
+	async fn set_measurements_path(&mut self, path: String) {
+		self.measurements_path = path;
+	}
+
+	async fn wireframe_measurements_tables(conn: &Connection) -> Result<()> {
+		conn.as_ref().execute(
 			"CREATE TABLE IF NOT EXISTS measurements (
-                                id TEXT PRIMARY KEY,
-                                dataset_id TEXT NOT NULL,
-                                timestamp INTEGER NOT NULL UNIQUE,
-                                value TEXT NOT NULL,
-                                FOREIGN KEY (dataset_id) REFERENCES datasets(id)
-                        )",
+				id TEXT PRIMARY KEY,
+				dataset_id TEXT NOT NULL,
+				timestamp INTEGER NOT NULL UNIQUE,
+				value TEXT NOT NULL
+			)",
 			turso::params![],
 		)
 		.await?;
 
 		// Add index for common queries
-		conn.execute("CREATE INDEX IF NOT EXISTS idx_measurements_dataset_timestamp ON measurements(dataset_id, timestamp)", turso::params![]).await?;
+		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_measurements_dataset_timestamp ON measurements(dataset_id, timestamp)", turso::params![]).await?;
 
 		Ok(())
 	}
 
 	async fn unprocessed_batches(&mut self) -> Result<TursoDatabase> {
-		if self.unprocessed_batches.is_none() {
-			let database_metadata_path = Self::get_database_metadata_path(self.database_metadata_db_path.clone()).await?;
-			let database_metadata_db = Database::get_turso_database(&database_metadata_path).await?;
-			let _subject_name = Self::get_subject_name(database_metadata_db, self.subject_id).await?;
-
-			let aspect_path = Self::get_aspect_path(database_metadata_path, self.subject_id, self.name.clone()).await?;
-			let aspect_batches_path = Path::new(&aspect_path).with_file_name("unprocessed_batches.db").to_string_lossy().to_string();
-
-			// If the batches_path exists, open the TursoDatabase
-			let batches_db = Database::get_turso_database(&aspect_batches_path).await?;
-			self.unprocessed_batches = Some(batches_db);
-		}
-
-		Ok(match self.unprocessed_batches {
-			Some(ref db) => db.clone(),
-			None => bail!("Unprocessed batches database is not initialized"),
-		})
+		self.unprocessed_batches.as_ref().cloned().ok_or_else(|| anyhow::anyhow!("Unprocessed batches database is not initialized"))
 	}
 
 	fn set_unprocessed_batches(&mut self, turso_db: TursoDatabase) {
 		self.unprocessed_batches = Some(turso_db);
 	}
 
-	async fn wireframe_batches_tables(conn: &turso::Connection) -> Result<()> {
-		conn.execute(
+	fn unprocessed_batches_path(&self) -> String {
+		self.unprocessed_batches_path.clone()
+	}
+
+	async fn wireframe_batches_tables(conn: &Connection) -> Result<()> {
+		conn.as_ref().execute(
 			r"
-                                CREATE TABLE IF NOT EXISTS batches (
-                                        id TEXT PRIMARY KEY,
-                                        aspect_id TEXT NOT NULL,
-                                        database_id TEXT NOT NULL,
-                                        size INTEGER NOT NULL,
-                                        resolution TEXT NOT NULL,
-                                        batch_hash TEXT,
-                                        created_at INTEGER NOT NULL,
-                                        updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000),
+			CREATE TABLE IF NOT EXISTS batches (
+				id TEXT PRIMARY KEY,
+				aspect_id TEXT NOT NULL,
+				database_id TEXT NOT NULL,
+				size INTEGER NOT NULL,
+				resolution TEXT NOT NULL,
+				batch_hash TEXT,
+				created_at INTEGER NOT NULL,
+				updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000),
 
-                                        metadata_json TEXT NOT NULL,
-                                        measurements_json TEXT NOT NULL,
+				metadata_json TEXT NOT NULL,
+				measurements_json TEXT NOT NULL,
 
-                                        FOREIGN KEY (aspect_id) REFERENCES aspects(id),
-
-                                        -- Add unique constraint for batch_hash to prevent duplicate batches
-                                        UNIQUE(batch_hash) WHERE batch_hash IS NOT NULL
-                        )",
+				FOREIGN KEY (aspect_id) REFERENCES aspects(id)
+			)",
 			turso::params![],
 		)
 		.await?;
 
+		// Add unique constraint for batch_hash to prevent duplicate batches
+		conn.as_ref().execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_batches_unique_hash ON batches(batch_hash) WHERE batch_hash IS NOT NULL", turso::params![]).await?;
+
 		// Enhanced indexes for concurrent write scenarios and queue processing
 		// OPTIMIZATION: Composite index for the exact query pattern used in get_unprocessed_batches
-		conn.execute("CREATE INDEX IF NOT EXISTS idx_batches_aspect_database_created ON batches(aspect_id, database_id, created_at)", turso::params![]).await?;
+		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_batches_aspect_database_created ON batches(aspect_id, database_id, created_at)", turso::params![]).await?;
 
 		// Keep individual indexes for other query patterns
-		conn.execute("CREATE INDEX IF NOT EXISTS idx_batches_created_at ON batches(created_at)", turso::params![]).await?;
-		conn.execute("CREATE INDEX IF NOT EXISTS idx_batches_hash ON batches(batch_hash) WHERE batch_hash IS NOT NULL", turso::params![]).await?;
+		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_batches_created_at ON batches(created_at)", turso::params![]).await?;
+		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_batches_hash ON batches(batch_hash) WHERE batch_hash IS NOT NULL", turso::params![]).await?;
+
+                Database::commit_concurrent(&conn).await?;
 
 		Ok(())
 	}
 
+	async fn set_unprocessed_batches_path(&mut self, path: String) {
+		self.unprocessed_batches_path = path;
+	}
+
 	async fn processed_batches(&mut self) -> Result<TursoDatabase> {
-		if self.processed_batches.is_none() {
-			let database_metadata_path = Self::get_database_metadata_path(self.database_metadata_db_path.clone()).await?;
-			let database_metadata_db = Database::get_turso_database(&database_metadata_path).await?;
-			let _subject_name = Self::get_subject_name(database_metadata_db, self.subject_id).await?;
-
-			let aspect_path = Self::get_aspect_path(database_metadata_path, self.subject_id, self.name.clone()).await?;
-			let aspect_batches_path = Path::new(&aspect_path).with_file_name("processed_batches.db").to_string_lossy().to_string();
-
-			// If the batches_path exists, open the TursoDatabase
-			let batches_db = Database::get_turso_database(&aspect_batches_path).await?;
-			self.processed_batches = Some(batches_db);
-		}
-
-		Ok(match self.processed_batches {
-			Some(ref db) => db.clone(),
-			None => bail!("Processed batches database is not initialized"),
-		})
+		self.processed_batches.as_ref().cloned().ok_or_else(|| anyhow::anyhow!("Processed batches database is not initialized"))
 	}
 
 	fn set_processed_batches(&mut self, turso_db: TursoDatabase) {
 		self.processed_batches = Some(turso_db);
 	}
 
+	fn processed_batches_path(&self) -> String {
+		self.processed_batches_path.clone()
+	}
+
+	async fn set_processed_batches_path(&mut self, path: String) {
+		self.processed_batches_path = path;
+	}
+
 	async fn patterns(&mut self) -> Result<TursoDatabase> {
-		if self.patterns.is_none() {
-			let database_metadata_path = Self::get_database_metadata_path(self.database_metadata_db_path.clone()).await?;
-			let database_metadata_db = Database::get_turso_database(&database_metadata_path).await?;
-			let _subject_name = Self::get_subject_name(database_metadata_db, self.subject_id).await?;
-
-			let aspect_path = Self::get_aspect_path(database_metadata_path, self.subject_id, self.name.clone()).await?;
-			let aspect_patterns_path = Path::new(&aspect_path).with_file_name("patterns.db").to_string_lossy().to_string();
-
-			// If the patterns_path exists, open the TursoDatabase
-			let patterns_db = Database::get_turso_database(&aspect_patterns_path).await?;
-			self.patterns = Some(patterns_db);
-		}
-
-		Ok(match self.patterns {
-			Some(ref db) => db.clone(),
-			None => bail!("Patterns database is not initialized"),
-		})
+		self.patterns.as_ref().cloned().ok_or_else(|| anyhow::anyhow!("Patterns database is not initialized"))
 	}
 
 	fn set_patterns(&mut self, turso_db: TursoDatabase) {
 		self.patterns = Some(turso_db);
 	}
 
-	async fn wireframe_patterns_tables(conn: &turso::Connection) -> Result<()> {
-		// Main patterns table with precomputed statistics
-		conn.execute(
-			r"
-                                CREATE TABLE IF NOT EXISTS patterns (
-                                        id TEXT PRIMARY KEY,
+	fn patterns_path(&self) -> String {
+		self.patterns_path.clone()
+	}
 
-                                        sum_value TEXT NOT NULL,
-                                        abs_sum_value TEXT NOT NULL,
-                                        max_value TEXT NOT NULL,
-                                        min_value TEXT NOT NULL,
-                                        abs_max_value TEXT NOT NULL,
-                                        avg_value TEXT NOT NULL,
-                                        abs_avg_value TEXT NOT NULL
-                                )
-                        ",
-			turso::params![],
-		)
-		.await?;
+	async fn set_patterns_path(&mut self, path: String) {
+		self.patterns_path = path;
+	}
+
+	async fn wireframe_patterns_tables(conn: &Connection) -> Result<()> {
+		// Main patterns table with precomputed statistics
+		conn.as_ref()
+			.execute(
+				r"
+			CREATE TABLE IF NOT EXISTS patterns (
+				id TEXT PRIMARY KEY,
+
+				sum_value TEXT NOT NULL,
+				abs_sum_value TEXT NOT NULL,
+				max_value TEXT NOT NULL,
+				min_value TEXT NOT NULL,
+				abs_max_value TEXT NOT NULL,
+				avg_value TEXT NOT NULL,
+				abs_avg_value TEXT NOT NULL
+			)
+			",
+				turso::params![],
+			)
+			.await?;
 
 		// Pattern occurrences table
-		conn.execute(
-			r"
-                                CREATE TABLE IF NOT EXISTS pattern_occurrences (
-                                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                        pattern_id TEXT NOT NULL,
-                                        aspect_id TEXT NOT NULL,
-                                        resolution TEXT NOT NULL,
-                                        size INTEGER NOT NULL,
-                                        database_info TEXT NOT NULL, -- JSON blob
-                                        beginning_timestamp INTEGER NOT NULL,
-                                        end_timestamp INTEGER NOT NULL,
+		conn.as_ref()
+			.execute(
+				r"
+			CREATE TABLE IF NOT EXISTS pattern_occurrences (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				pattern_id TEXT NOT NULL,
+				aspect_id TEXT NOT NULL,
+				resolution TEXT NOT NULL,
+				size INTEGER NOT NULL,
+				database_info TEXT NOT NULL, -- JSON blob
+				beginning_timestamp INTEGER NOT NULL,
+				end_timestamp INTEGER NOT NULL,
 
-                                        FOREIGN KEY (pattern_id) REFERENCES patterns(id) ON DELETE CASCADE
-                                )
-                        ",
-			turso::params![],
-		)
-		.await?;
+				FOREIGN KEY (pattern_id) REFERENCES patterns(id) ON DELETE CASCADE
+			)
+			",
+				turso::params![],
+			)
+			.await?;
 
 		// Pattern relatives table
-		conn.execute(
-			r"
-                                CREATE TABLE IF NOT EXISTS pattern_relatives (
-                                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                        pattern_id TEXT NOT NULL,
-                                        relative_index INTEGER NOT NULL,
+		conn.as_ref()
+			.execute(
+				r"
+			CREATE TABLE IF NOT EXISTS pattern_relatives (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				pattern_id TEXT NOT NULL,
+				relative_index INTEGER NOT NULL,
 
-                                        -- MeasurementVector data
-                                        vector_location TEXT NOT NULL,
-                                        vector_amplitude TEXT NOT NULL,
+				-- MeasurementVector data
+				vector_location TEXT NOT NULL,
+				vector_amplitude TEXT NOT NULL,
 
-                                        -- Relative-specific data
-                                        max_x TEXT NOT NULL,
-                                        max_y TEXT NOT NULL,
+				-- Relative-specific data
+				max_x TEXT NOT NULL,
+				max_y TEXT NOT NULL,
 
-                                        FOREIGN KEY (pattern_id) REFERENCES patterns(id) ON DELETE CASCADE,
-                                        UNIQUE(pattern_id, relative_index)
-                                )
-                        ",
-			turso::params![],
-		)
-		.await?;
+				FOREIGN KEY (pattern_id) REFERENCES patterns(id) ON DELETE CASCADE,
+				UNIQUE(pattern_id, relative_index)
+			)
+			",
+				turso::params![],
+			)
+			.await?;
 
 		// Indexes for performance
-		conn.execute("CREATE INDEX IF NOT EXISTS idx_pattern_occurrences_pattern_id ON pattern_occurrences(pattern_id)", turso::params![]).await?;
-		conn.execute("CREATE INDEX IF NOT EXISTS idx_pattern_relatives_pattern_id ON pattern_relatives(pattern_id)", turso::params![]).await?;
+		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_pattern_occurrences_pattern_id ON pattern_occurrences(pattern_id)", turso::params![]).await?;
+		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_pattern_relatives_pattern_id ON pattern_relatives(pattern_id)", turso::params![]).await?;
 
 		Ok(())
 	}
 
 	async fn events(&mut self) -> Result<TursoDatabase> {
-		if self.events.is_none() {
-			let database_metadata_path = Self::get_database_metadata_path(self.database_metadata_db_path.clone()).await?;
-			let database_metadata_db = Database::get_turso_database(&database_metadata_path).await?;
-			let _subject_name = Self::get_subject_name(database_metadata_db, self.subject_id).await?;
-
-			let aspect_path = Self::get_aspect_path(database_metadata_path.clone(), self.subject_id, self.name.clone()).await?;
-			let aspect_events_path = Path::new(&aspect_path).with_file_name("events.db").to_string_lossy().to_string();
-
-			// If the events_path exists, open the TursoDatabase
-			let events_db = Database::get_turso_database(&aspect_events_path).await?;
-			self.events = Some(events_db);
-		}
-
-		Ok(match self.events {
-			Some(ref db) => db.clone(),
-			None => bail!("Events database is not initialized"),
-		})
+		self.events.as_ref().cloned().ok_or_else(|| anyhow::anyhow!("Events database is not initialized"))
 	}
 
 	fn set_events(&mut self, turso_db: TursoDatabase) {
 		self.events = Some(turso_db);
 	}
 
-	async fn wireframe_events_tables(conn: &turso::Connection) -> Result<()> {
+	fn events_path(&self) -> String {
+		self.events_path.clone()
+	}
+
+	async fn set_events_path(&mut self, path: String) {
+		self.events_path = path;
+	}
+
+	async fn wireframe_events_tables(conn: &Connection) -> Result<()> {
 		// Main events table
-		conn.execute(
-			r"
-                                CREATE TABLE IF NOT EXISTS events (
-                                        id TEXT PRIMARY KEY,
-                                        name TEXT NOT NULL,
-                                        description TEXT,
-                                        created_at INTEGER NOT NULL
-                                )
-                        ",
-			turso::params![],
-		)
-		.await?;
+		conn.as_ref()
+			.execute(
+				r"
+			CREATE TABLE IF NOT EXISTS events (
+				id TEXT PRIMARY KEY,
+				name TEXT NOT NULL,
+				description TEXT,
+				created_at INTEGER NOT NULL
+			)
+			",
+				turso::params![],
+			)
+			.await?;
 
 		// Event manifestations table
-		conn.execute(
-			r"
-                                CREATE TABLE IF NOT EXISTS event_manifestations (
-                                        id TEXT PRIMARY KEY,
-                                        event_id TEXT NOT NULL,
-                                        dataset_id TEXT NOT NULL,
-                                        start_timestamp INTEGER NOT NULL,
-                                        end_timestamp INTEGER NOT NULL,
+		conn.as_ref()
+			.execute(
+				r"
+			CREATE TABLE IF NOT EXISTS event_manifestations (
+				id TEXT PRIMARY KEY,
+				event_id TEXT NOT NULL,
+				dataset_id TEXT NOT NULL,
+				start_timestamp INTEGER NOT NULL,
+				end_timestamp INTEGER NOT NULL,
 
-                                        FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE
-                                )
-                        ",
-			turso::params![],
-		)
-		.await?;
+				FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE
+			)
+			",
+				turso::params![],
+			)
+			.await?;
 
 		// Indexes for performance
-		conn.execute("CREATE INDEX IF NOT EXISTS idx_event_manifestations_event_id ON event_manifestations(event_id)", turso::params![]).await?;
-		conn.execute("CREATE INDEX IF NOT EXISTS idx_event_manifestations_dataset ON event_manifestations(dataset_id)", turso::params![]).await?;
-		conn.execute("CREATE INDEX IF NOT EXISTS idx_event_manifestations_time_range ON event_manifestations(start_timestamp, end_timestamp)", turso::params![]).await?;
-		conn.execute("CREATE INDEX IF NOT EXISTS idx_events_name ON events(name)", turso::params![]).await?;
+		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_event_manifestations_event_id ON event_manifestations(event_id)", turso::params![]).await?;
+		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_event_manifestations_dataset ON event_manifestations(dataset_id)", turso::params![]).await?;
+		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_event_manifestations_time_range ON event_manifestations(start_timestamp, end_timestamp)", turso::params![]).await?;
+		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_events_name ON events(name)", turso::params![]).await?;
 
 		Ok(())
 	}
 
 	async fn correlations(&mut self) -> Result<TursoDatabase> {
-		if self.correlations.is_none() {
-			let database_metadata_path = Self::get_database_metadata_path(self.database_metadata_db_path.clone()).await?;
-			let database_metadata_db = Database::get_turso_database(&database_metadata_path).await?;
-			let _subject_name = Self::get_subject_name(database_metadata_db, self.subject_id).await?;
-
-			let aspect_path = Self::get_aspect_path(database_metadata_path, self.subject_id, self.name.clone()).await?;
-			let aspect_correlations_path = Path::new(&aspect_path).with_file_name("correlations.db").to_string_lossy().to_string();
-
-			// If the correlations_path exists, open the TursoDatabase
-			let correlations_db = Database::get_turso_database(&aspect_correlations_path).await?;
-			self.correlations = Some(correlations_db);
-		}
-
-		Ok(match self.correlations {
-			Some(ref db) => db.clone(),
-			None => bail!("Correlations database is not initialized"),
-		})
+		self.correlations.as_ref().cloned().ok_or_else(|| anyhow::anyhow!("Correlations database is not initialized"))
 	}
 
 	fn set_correlations(&mut self, turso_db: TursoDatabase) {
 		self.correlations = Some(turso_db);
 	}
 
-	async fn wireframe_correlations_tables(conn: &turso::Connection) -> Result<()> {
-		// Main correlations table
-		conn.execute(
-			r"
-                                CREATE TABLE IF NOT EXISTS correlations (
-                                        id TEXT PRIMARY KEY,
-                                        dictionary_id TEXT NOT NULL,
-                                        pattern_id TEXT NOT NULL,
-                                        event_id TEXT NOT NULL,
-                                        created_at INTEGER NOT NULL,
-                                        updated_at INTEGER NOT NULL,
+	fn correlations_path(&self) -> String {
+		self.correlations_path.clone()
+	}
 
-                                        FOREIGN KEY (pattern_id) REFERENCES patterns(id),
-                                        FOREIGN KEY (event_id) REFERENCES events(id)
-                                )
-                        ",
-			turso::params![],
-		)
-		.await?;
+	async fn set_correlations_path(&mut self, path: String) {
+		self.correlations_path = path;
+	}
+
+	async fn wireframe_correlations_tables(conn: &Connection) -> Result<()> {
+		// Main correlations table
+		conn.as_ref()
+			.execute(
+				r"
+			CREATE TABLE IF NOT EXISTS correlations (
+				id TEXT PRIMARY KEY,
+				dictionary_id TEXT NOT NULL,
+				pattern_id TEXT NOT NULL,
+				event_id TEXT NOT NULL,
+				created_at INTEGER NOT NULL,
+				updated_at INTEGER NOT NULL,
+
+				FOREIGN KEY (pattern_id) REFERENCES patterns(id),
+				FOREIGN KEY (event_id) REFERENCES events(id)
+			)
+			",
+				turso::params![],
+			)
+			.await?;
 
 		// Error rates table for the HashMap<SignalType, ErrorRate>
-		conn.execute(
-			r"
-                                CREATE TABLE IF NOT EXISTS correlation_error_rates (
-                                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                        correlation_id TEXT NOT NULL,
-                                        signal_type TEXT NOT NULL,
-                                        error_rate_value TEXT NOT NULL, -- BigDecimal as TEXT
-                                        error_rate_units TEXT NOT NULL, -- Resolution as JSON
+		conn.as_ref()
+			.execute(
+				r"
+			CREATE TABLE IF NOT EXISTS correlation_error_rates (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				correlation_id TEXT NOT NULL,
+				signal_type TEXT NOT NULL,
+				error_rate_value TEXT NOT NULL, -- BigDecimal as TEXT
+				error_rate_units TEXT NOT NULL, -- Resolution as JSON
 
-                                        FOREIGN KEY (correlation_id) REFERENCES correlations(id) ON DELETE CASCADE,
-                                        UNIQUE(correlation_id, signal_type)
-                                )
-                        ",
-			turso::params![],
-		)
-		.await?;
+				FOREIGN KEY (correlation_id) REFERENCES correlations(id) ON DELETE CASCADE,
+				UNIQUE(correlation_id, signal_type)
+			)
+			",
+				turso::params![],
+			)
+			.await?;
 
 		// Correlation occurrences table
-		conn.execute(
-			r"
-                                CREATE TABLE IF NOT EXISTS correlation_occurrences (
-                                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                        correlation_id TEXT NOT NULL,
-                                        occurrence_index INTEGER NOT NULL,
-                                        aspect_id TEXT NOT NULL,
-                                        resolution TEXT NOT NULL, -- Resolution as JSON
-                                        size INTEGER NOT NULL,
-                                        database_info TEXT NOT NULL, -- DatabaseInfo as JSON blob
-                                        pattern_id TEXT NOT NULL,
-                                        beginning_timestamp INTEGER NOT NULL,
-                                        end_timestamp INTEGER NOT NULL,
+		conn.as_ref()
+			.execute(
+				r"
+			CREATE TABLE IF NOT EXISTS correlation_occurrences (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				correlation_id TEXT NOT NULL,
+				occurrence_index INTEGER NOT NULL,
+				aspect_id TEXT NOT NULL,
+				resolution TEXT NOT NULL, -- Resolution as JSON
+				size INTEGER NOT NULL,
+				database_info TEXT NOT NULL, -- DatabaseInfo as JSON blob
+				pattern_id TEXT NOT NULL,
+				beginning_timestamp INTEGER NOT NULL,
+				end_timestamp INTEGER NOT NULL,
 
-                                        FOREIGN KEY (correlation_id) REFERENCES correlations(id) ON DELETE CASCADE,
-                                        UNIQUE(correlation_id, occurrence_index)
-                                )
-                        ",
-			turso::params![],
-		)
-		.await?;
+				FOREIGN KEY (correlation_id) REFERENCES correlations(id) ON DELETE CASCADE,
+				UNIQUE(correlation_id, occurrence_index)
+			)
+			",
+				turso::params![],
+			)
+			.await?;
 
 		// Indexes for performance
-		conn.execute("CREATE INDEX IF NOT EXISTS idx_correlations_dictionary ON correlations(dictionary_id)", turso::params![]).await?;
-		conn.execute("CREATE INDEX IF NOT EXISTS idx_correlations_pattern ON correlations(pattern_id)", turso::params![]).await?;
-		conn.execute("CREATE INDEX IF NOT EXISTS idx_correlations_event ON correlations(event_id)", turso::params![]).await?;
-		conn.execute("CREATE INDEX IF NOT EXISTS idx_correlations_event ON correlations(event_id)", turso::params![]).await?;
-		conn.execute("CREATE INDEX IF NOT EXISTS idx_correlation_error_rates_correlation_id ON correlation_error_rates(correlation_id)", turso::params![]).await?;
-		conn.execute("CREATE INDEX IF NOT EXISTS idx_correlation_occurrences_correlation_id ON correlation_occurrences(correlation_id)", turso::params![]).await?;
-		conn.execute("CREATE INDEX IF NOT EXISTS idx_correlation_occurrences_time_range ON correlation_occurrences(beginning_timestamp, end_timestamp)", turso::params![]).await?;
+		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_correlations_dictionary ON correlations(dictionary_id)", turso::params![]).await?;
+		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_correlations_pattern ON correlations(pattern_id)", turso::params![]).await?;
+		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_correlations_event ON correlations(event_id)", turso::params![]).await?;
+		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_correlation_error_rates_correlation_id ON correlation_error_rates(correlation_id)", turso::params![]).await?;
+		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_correlation_occurrences_correlation_id ON correlation_occurrences(correlation_id)", turso::params![]).await?;
+		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_correlation_occurrences_time_range ON correlation_occurrences(beginning_timestamp, end_timestamp)", turso::params![]).await?;
 
 		Ok(())
 	}

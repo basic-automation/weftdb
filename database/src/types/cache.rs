@@ -5,6 +5,7 @@ use std::{
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
+use turso::Connection as TursoConnection;
 
 use crate::{Batch, Measurement};
 
@@ -44,6 +45,26 @@ impl AnalysisResult {
 }
 
 #[derive(Debug, Clone)]
+pub struct Connection(pub TursoConnection);
+
+impl Connection {
+	#[must_use]
+	pub const fn new(conn: TursoConnection) -> Self {
+		Self(conn)
+	}
+
+	#[must_use]
+	pub const fn as_ref(&self) -> &TursoConnection {
+		&self.0
+	}
+
+	#[must_use]
+	pub fn into_inner(self) -> TursoConnection {
+		self.0
+	}
+}
+
+#[derive(Debug, Clone)]
 struct CacheEntry<T> {
 	data: T,
 	created_at: Instant,
@@ -75,14 +96,19 @@ pub struct DatabaseCache {
 	point_analysis_cache: Arc<RwLock<HashMap<String, CacheEntry<AnalysisResult>>>>,
 	unprocessed_batch_cache: Arc<RwLock<HashMap<String, CacheEntry<Vec<Batch>>>>>,
 
+	// Connection cache for database connections
+	connection_cache: Arc<RwLock<HashMap<String, CacheEntry<Connection>>>>,
+
 	// Cache configuration
 	max_measurement_entries: usize,
 	max_analysis_entries: usize,
 	max_unprocessed_batch_entries: usize,
+	max_connection_entries: usize,
 
 	measurement_ttl: Duration,
 	analysis_ttl: Duration,
 	unprocessed_batch_ttl: Duration,
+	connection_ttl: Duration,
 }
 
 impl DatabaseCache {
@@ -166,6 +192,39 @@ impl DatabaseCache {
 		}
 
 		cache.insert(cache_key.to_string(), CacheEntry::new(batches.to_vec()));
+	}
+
+	// Connection cache methods
+	pub async fn get_connection(&self, cache_key: &str) -> Option<Connection> {
+		let mut cache = self.connection_cache.write().await;
+
+		if let Some(entry) = cache.get_mut(cache_key) {
+			if entry.is_expired(self.connection_ttl) {
+				cache.remove(cache_key);
+			} else {
+				let result = entry.access().clone();
+				drop(cache);
+				return Some(result);
+			}
+		}
+		drop(cache);
+		None
+	}
+
+	pub async fn store_connection(&self, cache_key: &str, connection: Connection) {
+		let mut cache = self.connection_cache.write().await;
+
+		// Implement LRU eviction if cache is full
+		if cache.len() >= self.max_connection_entries {
+			Self::evict_lru_connections(&mut cache);
+		}
+
+		cache.insert(cache_key.to_string(), CacheEntry::new(connection));
+	}
+
+	pub async fn invalidate_connection(&self, cache_key: &str) {
+		let mut cache = self.connection_cache.write().await;
+		cache.remove(cache_key);
 	}
 
 	pub async fn get_aspect_measurements(&self, cache_key: &str) -> Option<Vec<Measurement>> {
@@ -281,18 +340,37 @@ impl DatabaseCache {
 		}
 	}
 
+	// LRU eviction for connections
+	fn evict_lru_connections(cache: &mut HashMap<String, CacheEntry<Connection>>) {
+		// Remove 10% of entries, prioritizing least recently used
+		let evict_count = cache.len() / 10;
+		if evict_count == 0 {
+			return;
+		}
+
+		let mut entries: Vec<(String, Instant)> = cache.iter().map(|(k, entry)| (k.clone(), entry.last_accessed)).collect();
+		entries.sort_by_key(|&(_, time)| time);
+
+		for (key, _) in entries.into_iter().take(evict_count) {
+			cache.remove(&key);
+		}
+	}
+
 	#[must_use]
 	pub fn new() -> Self {
 		Self {
 			measurement_cache: Arc::new(RwLock::new(HashMap::new())),
 			point_analysis_cache: Arc::new(RwLock::new(HashMap::new())),
 			unprocessed_batch_cache: Arc::new(RwLock::new(HashMap::new())),
+			connection_cache: Arc::new(RwLock::new(HashMap::new())),
 			max_measurement_entries: 1000,
-			max_analysis_entries: 10000,
-			max_unprocessed_batch_entries: 100,
+			max_analysis_entries: 500,
+			max_unprocessed_batch_entries: 200,
+			max_connection_entries: 50,
 			measurement_ttl: Duration::from_secs(300),       // 5 minutes
-			analysis_ttl: Duration::from_secs(60),           // 1 minute
-			unprocessed_batch_ttl: Duration::from_secs(600), // 10 minutes
+			analysis_ttl: Duration::from_secs(600),          // 10 minutes
+			unprocessed_batch_ttl: Duration::from_secs(180), // 3 minutes
+			connection_ttl: Duration::from_secs(1800),       // 30 minutes
 		}
 	}
 
@@ -312,6 +390,12 @@ impl DatabaseCache {
 		{
 			let mut unprocessed_batch_cache = self.unprocessed_batch_cache.write().await;
 			unprocessed_batch_cache.retain(|_, entry| !entry.is_expired(self.unprocessed_batch_ttl));
+		}
+
+		// Cleanup expired connections
+		{
+			let mut connection_cache = self.connection_cache.write().await;
+			connection_cache.retain(|_, entry| !entry.is_expired(self.connection_ttl));
 		}
 	}
 }

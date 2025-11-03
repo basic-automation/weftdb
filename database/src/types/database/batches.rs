@@ -1,5 +1,6 @@
-use anyhow::Result;
 use std::str::FromStr;
+
+use anyhow::Result;
 
 use super::helpers::safe_ratio;
 use crate::{
@@ -60,7 +61,7 @@ impl super::Database {
 		};
 
 		// Find the subject and aspect
-		let (subject_name, aspect_name) = db_info.subjects().values().find_map(|subject| subject.aspects().get(&batch.metadata.aspect).map(|aspect| (subject.name().to_string(), aspect.name().to_string()))).ok_or_else(|| Error::DatabaseError("Subject or aspect not found".to_string()))?;
+		let (subject_name, aspect_name) = db_info.subjects.values().find_map(|subject| subject.aspects().get(&batch.metadata.aspect).map(|aspect| (subject.name().to_string(), aspect.name()))).ok_or_else(|| anyhow::anyhow!("Aspect not found"))?;
 
 		// Create batches.db path within aspect folder
 		let batches_db_path = format!("{}/{subject_name}/{aspect_name}/batches.db", db_info.path());
@@ -100,7 +101,7 @@ impl super::Database {
 		};
 
 		// Find the subject and aspect
-		let (subject_name, aspect_name) = db_info.subjects().values().find_map(|subject| subject.aspects().get(aspect_id).map(|aspect| (subject.name().to_string(), aspect.name().to_string()))).ok_or_else(|| Error::DatabaseError("Subject or aspect not found".to_string()))?;
+		let (subject_name, aspect_name) = db_info.subjects.values().find_map(|subject| subject.aspects().get(aspect_id).map(|aspect| (subject.name().to_string(), aspect.name().to_string()))).ok_or_else(|| Error::DatabaseError("Subject or aspect not found".to_string()))?;
 
 		// Create batches.db path within aspect folder
 		let batches_db_path = format!("{}/{subject_name}/{aspect_name}/batches.db", db_info.path());
@@ -211,7 +212,7 @@ impl super::Database {
 		};
 
 		// Find the subject and aspect
-		let (subject_name, aspect_name) = db_info.subjects().values().find_map(|subject| subject.aspects().get(aspect_id).map(|aspect| (subject.name().to_string(), aspect.name().to_string()))).ok_or_else(|| Error::DatabaseError("Subject or aspect not found".to_string()))?;
+		let (subject_name, aspect_name) = db_info.subjects.values().find_map(|subject| subject.aspects().get(aspect_id).map(|aspect| (subject.name().to_string(), aspect.name().to_string()))).ok_or_else(|| Error::DatabaseError("Subject or aspect not found".to_string()))?;
 
 		// Get batches database
 		let batches_db_path = format!("{}/{subject_name}/{aspect_name}/batches.db", db_info.path());
@@ -242,7 +243,7 @@ impl super::Database {
 		};
 
 		// Find the subject and aspect
-		let (subject_name, aspect_name) = db_info.subjects().values().find_map(|subject| subject.aspects().get(aspect_id).map(|aspect| (subject.name().to_string(), aspect.name().to_string()))).ok_or_else(|| Error::DatabaseError("Subject or aspect not found".to_string()))?;
+		let (subject_name, aspect_name) = db_info.subjects.values().find_map(|subject| subject.aspects().get(aspect_id).map(|aspect| (subject.name().to_string(), aspect.name().to_string()))).ok_or_else(|| Error::DatabaseError("Subject or aspect not found".to_string()))?;
 
 		// Get batches database
 		let batches_db_path = format!("{}/{subject_name}/{aspect_name}/batches.db", db_info.path());
@@ -288,7 +289,7 @@ impl super::Database {
 		// Process each aspect's batches in its own database
 		for (aspect_id, aspect_batches) in batches_by_aspect {
 			// Find the subject and aspect
-			let (subject_name, aspect_name) = db_info.subjects().values().find_map(|subject| subject.aspects().get(&aspect_id).map(|aspect| (subject.name().to_string(), aspect.name().to_string()))).ok_or_else(|| Error::DatabaseError("Subject or aspect not found".to_string()))?;
+			let (subject_name, aspect_name) = db_info.subjects.values().find_map(|subject| subject.aspects().get(&aspect_id).map(|aspect| (subject.name().to_string(), aspect.name().to_string()))).ok_or_else(|| Error::DatabaseError("Subject or aspect not found".to_string()))?;
 
 			// Get batches database for this aspect
 			let batches_db_path = format!("{}/{subject_name}/{aspect_name}/batches.db", db_info.path());
@@ -376,7 +377,7 @@ impl super::Database {
 		};
 
 		// Find the subject and aspect
-		let (subject_name, aspect_name) = db_info.subjects().values().find_map(|subject| subject.aspects().get(aspect_id).map(|aspect| (subject.name().to_string(), aspect.name().to_string()))).ok_or_else(|| Error::DatabaseError("Subject or aspect not found".to_string()))?;
+		let (subject_name, aspect_name) = db_info.subjects.values().find_map(|subject| subject.aspects().get(aspect_id).map(|aspect| (subject.name().to_string(), aspect.name().to_string()))).ok_or_else(|| Error::DatabaseError("Subject or aspect not found".to_string()))?;
 
 		// Create batches.db path within aspect folder
 		let batches_db_path = format!("{}/{subject_name}/{aspect_name}/batches.db", db_info.path());
@@ -415,7 +416,7 @@ impl super::Database {
 		};
 
 		// Find the subject and aspect
-		let (subject_name, aspect_name) = db_info.subjects().values().find_map(|subject| subject.aspects().get(aspect_id).map(|aspect| (subject.name().to_string(), aspect.name().to_string()))).ok_or_else(|| Error::DatabaseError("Subject or aspect not found".to_string()))?;
+		let (subject_name, aspect_name) = db_info.subjects.values().find_map(|subject| subject.aspects().get(aspect_id).map(|aspect| (subject.name().to_string(), aspect.name().to_string()))).ok_or_else(|| Error::DatabaseError("Subject or aspect not found".to_string()))?;
 
 		// Create batches.db path within aspect folder
 		let batches_db_path = format!("{}/{subject_name}/{aspect_name}/batches.db", db_info.path());
@@ -446,7 +447,7 @@ impl super::Database {
 		};
 
 		// Find the subject and aspect
-		let (subject_name, aspect_name) = db_info.subjects().values().find_map(|subject| subject.aspects().get(aspect_id).map(|aspect| (subject.name().to_string(), aspect.name().to_string()))).ok_or_else(|| Error::DatabaseError("Subject or aspect not found".to_string()))?;
+		let (subject_name, aspect_name) = db_info.subjects.values().find_map(|subject| subject.aspects().get(aspect_id).map(|aspect| (subject.name().to_string(), aspect.name().to_string()))).ok_or_else(|| Error::DatabaseError("Subject or aspect not found".to_string()))?;
 
 		// Create batches.db path within aspect folder
 		let batches_db_path = format!("{}/{subject_name}/{aspect_name}/batches.db", db_info.path());
@@ -476,7 +477,7 @@ impl super::Database {
 		};
 
 		// Find the subject and aspect
-		let (subject_name, aspect_name) = db_info.subjects().values().find_map(|subject| subject.aspects().get(aspect_id).map(|aspect| (subject.name().to_string(), aspect.name().to_string()))).ok_or_else(|| Error::DatabaseError("Subject or aspect not found".to_string()))?;
+		let (subject_name, aspect_name) = db_info.subjects.values().find_map(|subject| subject.aspects().get(aspect_id).map(|aspect| (subject.name().to_string(), aspect.name().to_string()))).ok_or_else(|| Error::DatabaseError("Subject or aspect not found".to_string()))?;
 
 		// Create batches.db path within aspect folder
 		let batches_db_path = format!("{}/{subject_name}/{aspect_name}/batches.db", db_info.path());
@@ -524,7 +525,7 @@ impl super::Database {
 		};
 
 		// Find the subject and aspect
-		let (subject_name, aspect_name) = db_info.subjects().values().find_map(|subject| subject.aspects().get(aspect_id).map(|aspect| (subject.name().to_string(), aspect.name().to_string()))).ok_or_else(|| Error::DatabaseError("Subject or aspect not found".to_string()))?;
+		let (subject_name, aspect_name) = db_info.subjects.values().find_map(|subject| subject.aspects().get(aspect_id).map(|aspect| (subject.name().to_string(), aspect.name().to_string()))).ok_or_else(|| Error::DatabaseError("Subject or aspect not found".to_string()))?;
 
 		// Create batches.db path within aspect folder
 		let batches_db_path = format!("{}/{subject_name}/{aspect_name}/batches.db", db_info.path());
@@ -611,7 +612,7 @@ impl super::Database {
 		};
 
 		// Find the subject and aspect
-		let (subject_name, aspect_name) = db_info.subjects().values().find_map(|subject| subject.aspects().get(aspect_id).map(|aspect| (subject.name().to_string(), aspect.name().to_string()))).ok_or_else(|| Error::DatabaseError("Subject or aspect not found".to_string()))?;
+		let (subject_name, aspect_name) = db_info.subjects.values().find_map(|subject| subject.aspects().get(aspect_id).map(|aspect| (subject.name().to_string(), aspect.name().to_string()))).ok_or_else(|| Error::DatabaseError("Subject or aspect not found".to_string()))?;
 
 		// Create batches.db path within aspect folder
 		let batches_db_path = format!("{}/{subject_name}/{aspect_name}/batches.db", db_info.path());
