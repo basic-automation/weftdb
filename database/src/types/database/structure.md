@@ -2,10 +2,16 @@
 # Database Structure
 
 -> Self --- ./{db_name}
+-> -> Metadata --- ./metadata.db
+
 -> -> Subjects --- ./{subject_name}
 -> -> -> Aspects --- ./{aspect_name}
--> -> -> -> Metadata --- ./metadata.db
 -> -> -> -> Measurements --- ./measurements.db
--> -> -> -> -> Tables --- measurements
--> -> -> -> Batches --- ./batches.db
--> -> -> -> -> Tables --- unprocessed_batches | processed_batches
+-> -> -> -> Unprocessed Batches --- ./unprocessed_batches.db
+-> -> -> -> Processed Batches --- ./processed_batches.db
+-> -> -> -> Patterns --- ./patterns.db
+-> -> -> -> Events --- ./events.db
+-> -> -> -> Correlations --- ./correlations.db
+
+-> -> -> -> Dictionaries --- ./dictionaries
+-> -> -> -> -> Dictionary --- ./{dictionary_name}.db

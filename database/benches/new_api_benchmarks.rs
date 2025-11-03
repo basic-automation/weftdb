@@ -62,10 +62,10 @@ fn benchmark_data_insertion(c: &mut Criterion) {
 		b.iter(|| {
 			rt.block_on(async {
 				let time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap() + Duration::seconds(counter);
-			let measurement = InputMeasurement::new(time, BigDecimal::from_str("42.0").unwrap());
-			let aspect = db.get_aspect(aspect_id).await.unwrap();
-			db.capture_measurement(aspect.id(), DatasetId::new(), measurement).await.unwrap();
-			counter += 1;
+				let measurement = InputMeasurement::new(time, BigDecimal::from_str("42.0").unwrap());
+				let aspect = db.get_aspect(aspect_id).await.unwrap();
+				db.capture_measurement(aspect.id(), DatasetId::new(), measurement).await.unwrap();
+				counter += 1;
 			});
 		});
 	});

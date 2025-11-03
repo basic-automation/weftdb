@@ -1,7 +1,7 @@
 use anyhow::Result;
 use splimes::Resolution;
 
-use crate::{Aspect, AspectId, SubjectId};
+use crate::{cache::Connection, Aspect, AspectId, SubjectId};
 
 /// Trait for database structure operations
 /// This trait defines the operations related to managing the structure of the database.
@@ -12,7 +12,13 @@ pub trait AspectStructure {
 	// Aspect
 
 	#[allow(clippy::new_ret_no_self)]
-	async fn new(id: Option<AspectId>, name: String, subject_id: SubjectId, resolution: Resolution, database_metadata_db_path: String) -> Result<Aspect>;
+	async fn new(id: Option<AspectId>, name: String, subject_id: SubjectId, db_name: String, resolution: Resolution, database_metadata_db_path: String) -> Result<Aspect>;
+
+	/// Lightweight constructor that creates an Aspect instance from metadata
+	/// without opening or wireframing per-aspect databases. Useful for
+	/// existence checks and listing operations where we want to avoid
+	/// holding metadata DB locks.
+	async fn from_metadata(id: Option<AspectId>, name: String, subject_id: SubjectId, resolution: Resolution, database_metadata_db_path: String, subject_name_opt: Option<String>) -> Result<Aspect>;
 
 	fn id(&self) -> AspectId;
 
@@ -21,6 +27,10 @@ pub trait AspectStructure {
 	fn subject_id(&self) -> SubjectId;
 
 	fn resolution(&self) -> Resolution;
+
+	fn subject_name(&self) -> &str;
+
+	fn aspect_path(&self) -> &str;
 
 	async fn database_metadata(&self) -> Result<turso::Database>;
 
@@ -36,20 +46,32 @@ pub trait AspectStructure {
 	/// set measurements database
 	fn set_measurements(&mut self, turso_db: turso::Database);
 
+	fn measurements_path(&self) -> String;
+
+	async fn set_measurements_path(&mut self, path: String);
+
 	/// Create Measurements tables
-	async fn wireframe_measurements_tables(conn: &turso::Connection) -> Result<()>;
+	async fn wireframe_measurements_tables(conn: &Connection) -> Result<()>;
 
 	async fn unprocessed_batches(&mut self) -> Result<turso::Database>;
 
 	/// set unprocessed batches database
 	fn set_unprocessed_batches(&mut self, turso_db: turso::Database);
 
+	fn unprocessed_batches_path(&self) -> String;
+
+	async fn set_unprocessed_batches_path(&mut self, path: String);
+
 	async fn processed_batches(&mut self) -> Result<turso::Database>;
 
 	/// set processed batches database
 	fn set_processed_batches(&mut self, turso_db: turso::Database);
 
-	async fn wireframe_batches_tables(conn: &turso::Connection) -> Result<()>;
+	fn processed_batches_path(&self) -> String;
+
+	async fn set_processed_batches_path(&mut self, path: String);
+
+	async fn wireframe_batches_tables(conn: &Connection) -> Result<()>;
 
 	/// get patterns database
 	async fn patterns(&mut self) -> Result<turso::Database>;
@@ -57,7 +79,11 @@ pub trait AspectStructure {
 	/// set patterns database
 	fn set_patterns(&mut self, turso_db: turso::Database);
 
-	async fn wireframe_patterns_tables(conn: &turso::Connection) -> Result<()>;
+	fn patterns_path(&self) -> String;
+
+	async fn set_patterns_path(&mut self, path: String);
+
+	async fn wireframe_patterns_tables(conn: &Connection) -> Result<()>;
 
 	/// get events database
 	async fn events(&mut self) -> Result<turso::Database>;
@@ -65,7 +91,11 @@ pub trait AspectStructure {
 	/// set events database
 	fn set_events(&mut self, turso_db: turso::Database);
 
-	async fn wireframe_events_tables(conn: &turso::Connection) -> Result<()>;
+	fn events_path(&self) -> String;
+
+	async fn set_events_path(&mut self, path: String);
+
+	async fn wireframe_events_tables(conn: &Connection) -> Result<()>;
 
 	/// get correlations database
 	async fn correlations(&mut self) -> Result<turso::Database>;
@@ -73,5 +103,9 @@ pub trait AspectStructure {
 	/// set correlations database
 	fn set_correlations(&mut self, turso_db: turso::Database);
 
-	async fn wireframe_correlations_tables(conn: &turso::Connection) -> Result<()>;
+	fn correlations_path(&self) -> String;
+
+	async fn set_correlations_path(&mut self, path: String);
+
+	async fn wireframe_correlations_tables(conn: &Connection) -> Result<()>;
 }

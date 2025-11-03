@@ -51,11 +51,11 @@ fn benchmark_production_workloads(c: &mut Criterion) {
 						let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 						let mut measurements = Vec::with_capacity(measurement_count);
 						for i in 0..measurement_count {
-						measurements.push(InputMeasurement::new(base_time + Duration::minutes(i as i64 * interval_minutes), BigDecimal::from_str(&format!("{}.0", i * 10)).unwrap()));
-					}
-					db.batch_capture_measurements(aspect.id(), DatasetId::new(), measurements).await.unwrap();
+							measurements.push(InputMeasurement::new(base_time + Duration::minutes(i as i64 * interval_minutes), BigDecimal::from_str(&format!("{}.0", i * 10)).unwrap()));
+						}
+						db.batch_capture_measurements(aspect.id(), DatasetId::new(), measurements).await.unwrap();
 
-					// Calculate analysis parameters
+						// Calculate analysis parameters
 						let data_start = base_time;
 						let start = data_start;
 						let end = start + Duration::minutes(window_minutes);
@@ -134,11 +134,11 @@ fn benchmark_full_integration_pipeline(c: &mut Criterion) {
 						let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 						let mut measurements = Vec::with_capacity(measurement_count);
 						for i in 0..measurement_count {
-						measurements.push(InputMeasurement::new(base_time + Duration::minutes(i as i64), BigDecimal::from_str(&format!("{i}.0")).unwrap()));
-					}
-					db.batch_capture_measurements(aspect.id(), DatasetId::new(), measurements).await.unwrap();
+							measurements.push(InputMeasurement::new(base_time + Duration::minutes(i as i64), BigDecimal::from_str(&format!("{i}.0")).unwrap()));
+						}
+						db.batch_capture_measurements(aspect.id(), DatasetId::new(), measurements).await.unwrap();
 
-					// Define analysis range
+						// Define analysis range
 						let start = base_time;
 						let end = base_time + Duration::minutes(measurement_count as i64);
 

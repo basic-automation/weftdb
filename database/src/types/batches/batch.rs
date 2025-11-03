@@ -36,11 +36,11 @@ impl Default for BatchId {
 }
 
 impl FromStr for BatchId {
-        type Err = uuid::Error;
+	type Err = uuid::Error;
 
-        fn from_str(s: &str) -> Result<Self, Self::Err> {
-                Uuid::parse_str(s).map(Self)
-        }
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		Uuid::parse_str(s).map(Self)
+	}
 }
 
 impl Display for BatchId {
@@ -105,6 +105,12 @@ impl Batch {
 	// Updated: since batch_id is no longer optional, return &BatchId directly
 	#[must_use]
 	pub const fn batch_id(&self) -> &BatchId {
+		&self.batch_id
+	}
+
+	// Method for consistency with database interface
+	#[must_use]
+	pub const fn id(&self) -> &BatchId {
 		&self.batch_id
 	}
 

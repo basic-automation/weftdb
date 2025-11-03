@@ -28,6 +28,9 @@ pub trait DatabaseStructure {
 	/// create Turso database
 	async fn create_turso_database(path: &str) -> Result<turso::Database>;
 
+	/// get or create Turso database, ensuring proper caching and avoiding conflicts
+	async fn get_or_create_turso_database(path: &str) -> Result<turso::Database>;
+
 	/// get database id
 	fn id(&self) -> DatabaseId;
 
@@ -40,22 +43,22 @@ pub trait DatabaseStructure {
 	fn metadata_path(&self) -> &str;
 
 	/// Create the metadata database
-	async fn wireframe_metadata_database(turso_db: &turso::Database) -> Result<Vec<Transaction>>;
+	async fn wireframe_metadata_database(db: &turso::Database, db_path: &str) -> Result<Vec<Transaction>>;
 
 	/// Create the transactions table for the metadata database
-	async fn metadata_database_create_transactions_table(connection: &turso::Connection) -> Result<Transaction>;
+	async fn metadata_database_create_transactions_table(db: &turso::Database, db_path: &str) -> Result<Transaction>;
 
 	/// Create the database table for the metadata database
 	/// Holds general metadata about the database
-	async fn metadata_database_create_database_table(connection: &turso::Connection) -> Result<Transaction>;
+	async fn metadata_database_create_database_table(db: &turso::Database, db_path: &str) -> Result<Transaction>;
 
 	/// Create the subjects table for the metadata database
 	/// Keeps track of all of the Subjects being observed by the database
-	async fn metadata_database_create_subjects_table(connection: &turso::Connection) -> Result<Transaction>;
+	async fn metadata_database_create_subjects_table(db: &turso::Database, db_path: &str) -> Result<Transaction>;
 
 	/// Create the aspects table for the metadata database
 	/// Keeps track of all of the Aspects on each Subject in the database
-	async fn metadata_database_create_aspects_table(connection: &turso::Connection) -> Result<Transaction>;
+	async fn metadata_database_create_aspects_table(db: &turso::Database, db_path: &str) -> Result<Transaction>;
 
 	/// Value to String helpers
 	async fn value_to_string(value: &turso::Value, field_name: &str) -> Result<String>;
@@ -115,7 +118,7 @@ pub trait DatabaseStructure {
 	async fn get_latest_measurement(&self, aspect_id: &AspectId) -> Result<Option<DateTime<Utc>>>;
 
 	/// Get the resolution for an aspect
-	async fn get_aspect_resolution(&self, aspect_id: &AspectId) -> Result<Option<Resolution>>;
+	async fn get_aspect_resolution(&self, aspect_id: &AspectId) -> Result<Resolution>;
 
 	/// Helper to update aspect metadata timestamps
 	async fn update_aspect_timestamps(&self, aspect_id: &AspectId, min_new: DateTime<Utc>, max_new: DateTime<Utc>) -> Result<()>;

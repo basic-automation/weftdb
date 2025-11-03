@@ -1,10 +1,10 @@
 use anyhow::Result;
 
-use crate::{types::database::traits::database_structure::DatabaseStructure, AspectId, Pattern, PatternID};
+use crate::{database::metadata_db_path, types::database::traits::database_structure::DatabaseStructure, AspectId, Database, Pattern, PatternID, DATABASES};
 
-const PATTERN_CHUNK_SIZE: usize = 100;
+const DICTIONARY_CHUNK_SIZE: usize = 100;
 
-impl super::Database {
+impl Database {
 	/// Get or create a dictionary patterns database and ensure the table structure exists
 	///
 	/// # Errors
@@ -12,7 +12,7 @@ impl super::Database {
 	/// - if unable to create table structure
 	async fn get_or_create_dictionary_patterns_database(dictionary_name: &str, db_path: &str) -> Result<turso::Database> {
 		let dictionary_dir = format!("{db_path}/dictionaries/{dictionary_name}");
-		std::fs::create_dir_all(&dictionary_dir).map_err(|e| crate::Error::DatabaseError(format!("Failed to create dictionary directory: {e}")))?;
+		std::fs::create_dir_all(&dictionary_dir).map_err(|e| anyhow::anyhow!(format!("Failed to create dictionary directory: {e}")))?;
 
 		let patterns_db_path = format!("{dictionary_dir}/patterns.db");
 		let patterns_turso_db = match Self::get_turso_database(&patterns_db_path).await {
@@ -35,10 +35,10 @@ impl super::Database {
 			turso::params![],
 		)
 		.await
-		.map_err(|e| crate::Error::DatabaseError(format!("Failed to create patterns table: {e}")))?;
+		.map_err(|e| anyhow::anyhow!(format!("Failed to create patterns table: {e}")))?;
 
 		// Create index for efficient querying
-		conn.execute("CREATE INDEX IF NOT EXISTS idx_patterns_dictionary ON patterns(dictionary_name, aspect_id)", turso::params![]).await.map_err(|e| crate::Error::DatabaseError(format!("Failed to create patterns index: {e}")))?;
+		conn.execute("CREATE INDEX IF NOT EXISTS idx_patterns_dictionary ON patterns(dictionary_name, aspect_id)", turso::params![]).await.map_err(|e| anyhow::anyhow!(format!("Failed to create patterns index: {e}")))?;
 
 		Ok(patterns_turso_db)
 	}
@@ -48,29 +48,39 @@ impl super::Database {
 	/// # Errors
 	/// - if unable to create database
 	/// - if unable to create table structure
-	async fn get_or_create_dictionary_metadata_database(db_path: &str) -> Result<turso::Database> {
-		let metadata_db_path = format!("{db_path}/dictionaries/metadata.db");
-		let metadata_turso_db = match Self::get_turso_database(&metadata_db_path).await {
+	async fn get_or_create_dictionary_metadata_database(db_name: String) -> Result<turso::Database> {
+		let metadata_db_path = metadata_db_path(&db_name);
+		let metadata_db = match Self::get_turso_database(&metadata_db_path).await {
 			Ok(db) => db,
 			Err(_) => Self::create_turso_database(&metadata_db_path).await?,
 		};
 
 		// Ensure the dictionaries table exists
-		let conn = metadata_turso_db.connect()?;
-		conn.execute(
-			"CREATE TABLE IF NOT EXISTS dictionaries (
-				name TEXT PRIMARY KEY,
-				description TEXT NOT NULL,
-				constraints TEXT NOT NULL,
-				created_at INTEGER NOT NULL,
-				updated_at INTEGER NOT NULL
-			)",
-			turso::params![],
-		)
-		.await
-		.map_err(|e| crate::Error::DatabaseError(format!("Failed to create dictionaries table: {e}")))?;
+		let conn = Self::begin_concurrent(&metadata_db, &metadata_db_path).await?;
 
-		Ok(metadata_turso_db)
+		let res = conn
+			.as_ref()
+			.execute(
+				"CREATE TABLE IF NOT EXISTS dictionaries (
+        			name TEXT PRIMARY KEY,
+        			description TEXT NOT NULL,
+        			constraints TEXT NOT NULL,
+        			created_at INTEGER NOT NULL,
+        			updated_at INTEGER NOT NULL
+        	        )",
+				turso::params![],
+			)
+			.await;
+		match res {
+			Ok(_) => println!("Dictionaries table ensured successfully"),
+			Err(e) => {
+				Self::rollback_concurrent(&conn).await?;
+				return Err(anyhow::anyhow!(format!("Failed to create dictionaries table: {e}")));
+			}
+		}
+
+		Self::commit_concurrent(&conn).await?;
+		Ok(metadata_db)
 	}
 
 	/// Store a pattern in a specific dictionary
@@ -82,21 +92,21 @@ impl super::Database {
 		// Get database info with proper validation
 		let db_id = self.id();
 		let db_info = {
-			let databases = super::DATABASES.lock().await;
-			databases.get(&db_id).cloned().ok_or_else(|| crate::Error::DatabaseError("Database not found".to_string()))?
+			let databases = DATABASES.lock().await;
+			databases.get(&db_id).cloned().ok_or_else(|| anyhow::anyhow!("Database not found".to_string()))?
 		};
 
-		let patterns_turso_db = Self::get_or_create_dictionary_patterns_database(dictionary_name, db_info.path()).await?;
+		let patterns_turso_db = Self::get_or_create_dictionary_patterns_database(dictionary_name, &db_info.path).await?;
 
 		// Serialize the pattern occurrences and relatives
-		let occurrences_json = serde_json::to_string(&pattern.occurrences()).map_err(|e| crate::Error::DatabaseError(format!("Failed to serialize pattern occurrences: {e}")))?;
-		let relatives_json = serde_json::to_string(&pattern.relatives()).map_err(|e| crate::Error::DatabaseError(format!("Failed to serialize pattern relatives: {e}")))?;
+		let occurrences_json = serde_json::to_string(&pattern.occurrences()).map_err(|e| anyhow::anyhow!(format!("Failed to serialize pattern occurrences: {e}")))?;
+		let relatives_json = serde_json::to_string(&pattern.relatives()).map_err(|e| anyhow::anyhow!(format!("Failed to serialize pattern relatives: {e}")))?;
 
 		let pattern_id = pattern.id().to_string();
 		let conn = patterns_turso_db.connect()?;
 
 		// Insert pattern
-		conn.execute("INSERT INTO patterns (id, aspect_id, database_id, dictionary_name, occurrences, relatives, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", turso::params![pattern_id, pattern.occurrences()[0].database_info().id().as_uuid().to_string(), self.id().as_uuid().to_string(), dictionary_name, occurrences_json, relatives_json, chrono::Utc::now().timestamp_millis()]).await.map_err(|e| crate::Error::DatabaseError(format!("Failed to insert pattern: {e}")))?;
+		conn.execute("INSERT INTO patterns (id, aspect_id, database_id, dictionary_name, occurrences, relatives, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", turso::params![pattern_id, pattern.occurrences()[0].database_info().id().as_uuid().to_string(), self.id().as_uuid().to_string(), dictionary_name, occurrences_json, relatives_json, chrono::Utc::now().timestamp_millis()]).await.map_err(|e| anyhow::anyhow!(format!("Failed to insert pattern: {e}")))?;
 
 		Ok(())
 	}
@@ -114,26 +124,26 @@ impl super::Database {
 		// Get database info with proper validation
 		let db_id = self.id();
 		let db_info = {
-			let databases = super::DATABASES.lock().await;
-			databases.get(&db_id).cloned().ok_or_else(|| crate::Error::DatabaseError("Database not found".to_string()))?
+			let databases = DATABASES.lock().await;
+			databases.get(&db_id).cloned().ok_or_else(|| anyhow::anyhow!("Database not found".to_string()))?
 		};
 
-		let patterns_turso_db = Self::get_or_create_dictionary_patterns_database(dictionary_name, db_info.path()).await?;
+		let patterns_turso_db = Self::get_or_create_dictionary_patterns_database(dictionary_name, &db_info.path).await?;
 
 		// Process in chunks for better performance
-		for chunk in patterns.chunks(PATTERN_CHUNK_SIZE) {
+		for chunk in patterns.chunks(DICTIONARY_CHUNK_SIZE) {
 			let mut conn = patterns_turso_db.connect()?;
-			let tx = conn.transaction().await.map_err(|e| crate::Error::DatabaseError(format!("Failed to begin transaction: {e}")))?;
+			let tx = conn.transaction().await.map_err(|e| anyhow::anyhow!(format!("Failed to begin transaction: {e}")))?;
 
 			let result = async {
 				for pattern in chunk {
 					// Serialize the pattern occurrences and relatives
-					let occurrences_json = serde_json::to_string(&pattern.occurrences()).map_err(|e| crate::Error::DatabaseError(format!("Failed to serialize pattern occurrences: {e}")))?;
-					let relatives_json = serde_json::to_string(&pattern.relatives()).map_err(|e| crate::Error::DatabaseError(format!("Failed to serialize pattern relatives: {e}")))?;
+					let occurrences_json = serde_json::to_string(&pattern.occurrences()).map_err(|e| anyhow::anyhow!(format!("Failed to serialize pattern occurrences: {e}")))?;
+					let relatives_json = serde_json::to_string(&pattern.relatives()).map_err(|e| anyhow::anyhow!(format!("Failed to serialize pattern relatives: {e}")))?;
 
 					let pattern_id = pattern.id().to_string();
 
-					tx.execute("INSERT INTO patterns (id, aspect_id, database_id, dictionary_name, occurrences, relatives, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", turso::params![pattern_id, aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string(), dictionary_name, occurrences_json, relatives_json, chrono::Utc::now().timestamp_millis()]).await.map_err(|e| crate::Error::DatabaseError(format!("Failed to insert pattern in transaction: {e}")))?;
+					tx.execute("INSERT INTO patterns (id, aspect_id, database_id, dictionary_name, occurrences, relatives, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", turso::params![pattern_id, aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string(), dictionary_name, occurrences_json, relatives_json, chrono::Utc::now().timestamp_millis()]).await.map_err(|e| anyhow::anyhow!(format!("Failed to insert pattern in transaction: {e}")))?;
 				}
 				Ok::<(), anyhow::Error>(())
 			}
@@ -142,7 +152,7 @@ impl super::Database {
 			// Commit or rollback transaction based on result
 			match result {
 				Ok(()) => {
-					tx.commit().await.map_err(|e| crate::Error::DatabaseError(format!("Failed to commit pattern transaction: {e}")))?;
+					tx.commit().await.map_err(|e| anyhow::anyhow!(format!("Failed to commit pattern transaction: {e}")))?;
 				}
 				Err(e) => {
 					let _ = tx.rollback().await;
@@ -150,7 +160,6 @@ impl super::Database {
 				}
 			}
 		}
-
 		Ok(())
 	}
 
@@ -163,24 +172,24 @@ impl super::Database {
 		// Get database info with proper validation
 		let db_id = self.id();
 		let db_info = {
-			let databases = super::DATABASES.lock().await;
-			databases.get(&db_id).cloned().ok_or_else(|| crate::Error::DatabaseError("Database not found".to_string()))?
+			let databases = DATABASES.lock().await;
+			databases.get(&db_id).cloned().ok_or_else(|| anyhow::anyhow!("Database not found".to_string()))?
 		};
 
-		let patterns_turso_db = Self::get_or_create_dictionary_patterns_database(dictionary_name, db_info.path()).await?;
+		let patterns_turso_db = Self::get_or_create_dictionary_patterns_database(dictionary_name, &db_info.path).await?;
 		let conn = patterns_turso_db.connect()?;
 
-		let mut rows = conn.query("SELECT id, occurrences, relatives FROM patterns WHERE dictionary_name = ? AND aspect_id = ? AND database_id = ? ORDER BY created_at", turso::params![dictionary_name, aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string()]).await.map_err(|e| crate::Error::DatabaseError(format!("Failed to query patterns: {e}")))?;
+		let mut rows = conn.query("SELECT id, occurrences, relatives FROM patterns WHERE dictionary_name = ? AND aspect_id = ? AND database_id = ? ORDER BY created_at", turso::params![dictionary_name, aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string()]).await.map_err(|e| anyhow::anyhow!(format!("Failed to query patterns: {e}")))?;
 
 		let mut patterns = Vec::new();
-		while let Some(row) = rows.next().await.map_err(|e| crate::Error::DatabaseError(format!("Failed to get row: {e}")))? {
+		while let Some(row) = rows.next().await.map_err(|e| anyhow::anyhow!(format!("Failed to get row: {e}")))? {
 			let pattern_id_str = Self::value_to_string(&row.get_value(0)?, "Pattern ID").await?;
 			let occurrences_json = Self::value_to_string(&row.get_value(1)?, "Occurrences").await?;
 			let relatives_json = Self::value_to_string(&row.get_value(2)?, "Relatives").await?;
 
-			let pattern_id = PatternID::from_string(&pattern_id_str).map_err(|e| crate::Error::DatabaseError(format!("Failed to parse pattern ID: {e}")))?;
-			let occurrences: Vec<crate::Occurrence> = serde_json::from_str(&occurrences_json).map_err(|e| crate::Error::DatabaseError(format!("Failed to deserialize occurrences: {e}")))?;
-			let relatives: Vec<crate::Relative> = serde_json::from_str(&relatives_json).map_err(|e| crate::Error::DatabaseError(format!("Failed to deserialize relatives: {e}")))?;
+			let pattern_id = PatternID::from_string(&pattern_id_str).map_err(|e| anyhow::anyhow!(format!("Failed to parse pattern ID: {e}")))?;
+			let occurrences: Vec<crate::Occurrence> = serde_json::from_str(&occurrences_json).map_err(|e| anyhow::anyhow!(format!("Failed to deserialize occurrences: {e}")))?;
+			let relatives: Vec<crate::Relative> = serde_json::from_str(&relatives_json).map_err(|e| anyhow::anyhow!(format!("Failed to deserialize relatives: {e}")))?;
 
 			let pattern = Pattern::new(pattern_id, occurrences, relatives);
 			patterns.push(pattern);
@@ -195,29 +204,35 @@ impl super::Database {
 	/// - if database not found
 	/// - if unable to insert dictionary metadata
 	pub async fn store_dictionary_metadata(&self, name: &str, description: &str, constraints: &serde_json::Value) -> Result<()> {
-		// Get database info with proper validation
-		let db_id = self.id();
-		let db_info = {
-			let databases = super::DATABASES.lock().await;
-			databases.get(&db_id).cloned().ok_or_else(|| crate::Error::DatabaseError("Database not found".to_string()))?
-		};
-
-		let metadata_turso_db = Self::get_or_create_dictionary_metadata_database(db_info.path()).await?;
-
-		// Serialize constraints
-		let constraints_json = serde_json::to_string(constraints).map_err(|e| crate::Error::DatabaseError(format!("Failed to serialize constraints: {e}")))?;
-
-		let conn = metadata_turso_db.connect()?;
+		let metadata_db = &self.metadata;
+		let metadata_db_path = &self.metadata_path;
+		let constraints_json = serde_json::to_string(constraints).map_err(|e| anyhow::anyhow!(format!("Failed to serialize constraints: {e}")))?;
+		let conn = Self::begin_concurrent(metadata_db, metadata_db_path).await?;
 		let now = chrono::Utc::now().timestamp_millis();
 
-		// Try to insert, if it fails due to constraint, update instead
-		let insert_result = conn.execute("INSERT INTO dictionaries (name, description, constraints, created_at, updated_at) VALUES (?, ?, ?, ?, ?)", turso::params![name, description, constraints_json.clone(), now, now]).await;
+		let res = conn.as_ref().execute("INSERT INTO dictionaries (name, description, constraints, created_at, updated_at) VALUES (?, ?, ?, ?, ?)", turso::params![name, description, constraints_json.clone(), now, now]).await;
+		let mut insert_ok = false;
 
-		if insert_result.is_err() {
-			// If insert failed (likely due to constraint), try update
-			conn.execute("UPDATE dictionaries SET description = ?, constraints = ?, updated_at = ? WHERE name = ?", turso::params![description, constraints_json, now, name]).await.map_err(|e| crate::Error::DatabaseError(format!("Failed to update dictionary metadata: {e}")))?;
+		match res {
+			Ok(_) => {
+				println!("Dictionary metadata inserted successfully");
+				insert_ok = true;
+			}
+			Err(_) => (),
 		}
 
+		if !insert_ok {
+			let res = conn.as_ref().execute("UPDATE dictionaries SET description = ?, constraints = ?, updated_at = ? WHERE name = ?", turso::params![description, constraints_json.clone(), now, name]).await;
+			match res {
+				Ok(_) => println!("Dictionary metadata updated successfully"),
+				Err(e) => {
+					Self::rollback_concurrent(&conn).await?;
+					return Err(anyhow::anyhow!(format!("Failed to update dictionary metadata: {e}")));
+				}
+			}
+		}
+
+		Self::commit_concurrent(&conn).await?;
 		Ok(())
 	}
 
@@ -230,19 +245,19 @@ impl super::Database {
 		// Get database info with proper validation
 		let db_id = self.id();
 		let db_info = {
-			let databases = super::DATABASES.lock().await;
-			databases.get(&db_id).cloned().ok_or_else(|| crate::Error::DatabaseError("Database not found".to_string()))?
+			let databases = DATABASES.lock().await;
+			databases.get(&db_id).cloned().ok_or_else(|| anyhow::anyhow!("Database not found".to_string()))?
 		};
 
-		let metadata_turso_db = Self::get_or_create_dictionary_metadata_database(db_info.path()).await?;
+		let metadata_turso_db = Self::get_or_create_dictionary_metadata_database(db_info.path).await?;
 		let conn = metadata_turso_db.connect()?;
 
-		let mut rows = conn.query("SELECT description, constraints FROM dictionaries WHERE name = ?", turso::params![name]).await.map_err(|e| crate::Error::DatabaseError(format!("Failed to query dictionary metadata: {e}")))?;
+		let mut rows = conn.query("SELECT description, constraints FROM dictionaries WHERE name = ?", turso::params![name]).await.map_err(|e| anyhow::anyhow!(format!("Failed to query dictionary metadata: {e}")))?;
 
-		if let Some(row) = rows.next().await.map_err(|e| crate::Error::DatabaseError(format!("Failed to get row: {e}")))? {
+		if let Some(row) = rows.next().await.map_err(|e| anyhow::anyhow!(format!("Failed to get row: {e}")))? {
 			let description = Self::value_to_string(&row.get_value(0)?, "Description").await?;
 			let constraints_json = Self::value_to_string(&row.get_value(1)?, "Constraints").await?;
-			let constraints: serde_json::Value = serde_json::from_str(&constraints_json).map_err(|e| crate::Error::DatabaseError(format!("Failed to deserialize constraints: {e}")))?;
+			let constraints: serde_json::Value = serde_json::from_str(&constraints_json).map_err(|e| anyhow::anyhow!(format!("Failed to deserialize constraints: {e}")))?;
 
 			Ok(Some((description, constraints)))
 		} else {
@@ -259,17 +274,17 @@ impl super::Database {
 		// Get database info with proper validation
 		let db_id = self.id();
 		let db_info = {
-			let databases = super::DATABASES.lock().await;
-			databases.get(&db_id).cloned().ok_or_else(|| crate::Error::DatabaseError("Database not found".to_string()))?
+			let databases = DATABASES.lock().await;
+			databases.get(&db_id).cloned().ok_or_else(|| anyhow::anyhow!("Database not found".to_string()))?
 		};
 
-		let metadata_turso_db = Self::get_or_create_dictionary_metadata_database(db_info.path()).await?;
+		let metadata_turso_db = Self::get_or_create_dictionary_metadata_database(db_info.path).await?;
 		let conn = metadata_turso_db.connect()?;
 
-		let mut rows = conn.query("SELECT name FROM dictionaries ORDER BY name", turso::params![]).await.map_err(|e| crate::Error::DatabaseError(format!("Failed to query dictionaries: {e}")))?;
+		let mut rows = conn.query("SELECT name FROM dictionaries ORDER BY name", turso::params![]).await.map_err(|e| anyhow::anyhow!(format!("Failed to query dictionaries: {e}")))?;
 
 		let mut dictionaries = Vec::new();
-		while let Some(row) = rows.next().await.map_err(|e| crate::Error::DatabaseError(format!("Failed to get row: {e}")))? {
+		while let Some(row) = rows.next().await.map_err(|e| anyhow::anyhow!(format!("Failed to get row: {e}")))? {
 			let name = Self::value_to_string(&row.get_value(0)?, "Dictionary name").await?;
 			dictionaries.push(name);
 		}

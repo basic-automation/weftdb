@@ -1,3 +1,5 @@
+use std::fmt::Display;
+
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
@@ -27,6 +29,12 @@ impl Default for TxId {
 	}
 }
 
+impl Display for TxId {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}", self.0)
+	}
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Transaction {
 	id: TxId,
@@ -35,22 +43,22 @@ pub struct Transaction {
 }
 
 impl Transaction {
-	#[must_use] 
+	#[must_use]
 	pub fn new(id: Option<TxId>, message: String) -> Self {
 		Self { id: id.unwrap_or_default(), message, created_at: chrono::Utc::now() }
 	}
 
-	#[must_use] 
+	#[must_use]
 	pub const fn id(&self) -> TxId {
 		self.id
 	}
 
-	#[must_use] 
+	#[must_use]
 	pub fn message(&self) -> &str {
 		&self.message
 	}
 
-	#[must_use] 
+	#[must_use]
 	pub const fn created_at(&self) -> DateTime<Utc> {
 		self.created_at
 	}

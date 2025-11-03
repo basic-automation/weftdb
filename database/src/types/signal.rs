@@ -6,8 +6,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use splimes::Resolution;
 
-use crate::types::{
-	correlation::{Correlation, CorrelationID}, event::{EventID, ManifestationId}
+use crate::{
+	types::{
+		correlation::{Correlation, CorrelationID}, event::{EventID, ManifestationId}
+	}, AspectId
 };
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -230,8 +232,8 @@ impl Signal {
 	/// Returns an error if:
 	/// - No correlation is found for the signal's correlation ID
 	/// - No error rate is found for the signal's type in the correlation
-	pub async fn get_error_rate(&self, database: &crate::Database) -> Result<Distance> {
-		let correlations = database.get_correlations().await?;
+	pub async fn get_error_rate(&self, database: &crate::Database, aspect_id: &AspectId) -> Result<Distance> {
+		let correlations = database.get_correlations(aspect_id).await?;
 
 		let correlation = correlations.iter().find(|c| c.id() == &self.correlation_id).ok_or_else(|| anyhow::anyhow!("No correlation found for correlation_id {:?}", self.correlation_id))?;
 
@@ -445,7 +447,7 @@ impl Signals {
 	/// # Errors
 	///
 	/// Returns an error if signal probability calculation fails for any signal.
-	pub async fn probability_sum(&self, event_id: &EventID, signal_type: &SignalType, date: DateTime<Utc>, database: &crate::Database) -> Result<Option<BigDecimal>> {
+	pub async fn probability_sum(&self, event_id: &EventID, signal_type: &SignalType, date: DateTime<Utc>, database: &crate::Database, aspect_id: &AspectId) -> Result<Option<BigDecimal>> {
 		let signals = self.get_by_event(event_id, signal_type);
 		if signals.is_empty() {
 			Ok(None)
@@ -456,7 +458,7 @@ impl Signals {
 
 			for s in &signals {
 				let default_distance = Distance::new(BigDecimal::zero(), Resolution::Seconds);
-				let error_rate = s.get_error_rate(database).await.unwrap_or_else(|_| default_distance.clone());
+				let error_rate = s.get_error_rate(database, aspect_id).await.unwrap_or_else(|_| default_distance.clone());
 				total_error_rate = &total_error_rate + error_rate.value();
 				error_rate_count += 1;
 				prob.push(s.probability(date, &error_rate)?);
@@ -478,7 +480,7 @@ impl Signals {
 	/// # Errors
 	///
 	/// Returns an error if signal probability calculation fails for any signal.
-	pub async fn probability_average(&self, event_id: &EventID, signal_type: &SignalType, date: DateTime<Utc>, database: &crate::Database) -> Result<Option<BigDecimal>> {
+	pub async fn probability_average(&self, event_id: &EventID, signal_type: &SignalType, date: DateTime<Utc>, database: &crate::Database, aspect_id: &AspectId) -> Result<Option<BigDecimal>> {
 		let signals = self.get_by_event(event_id, signal_type);
 		if signals.is_empty() {
 			Ok(None)
@@ -489,7 +491,7 @@ impl Signals {
 
 			for s in &signals {
 				let default_distance = Distance::new(BigDecimal::zero(), Resolution::Seconds);
-				let error_rate = s.get_error_rate(database).await.unwrap_or_else(|_| default_distance.clone());
+				let error_rate = s.get_error_rate(database, aspect_id).await.unwrap_or_else(|_| default_distance.clone());
 				total_error_rate = &total_error_rate + error_rate.value();
 				error_rate_count += 1;
 				prob.push(s.probability(date, &error_rate)?);
