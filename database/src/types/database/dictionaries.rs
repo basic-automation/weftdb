@@ -1,8 +1,10 @@
 use anyhow::Result;
 
-use crate::{database::metadata_db_path, types::database::traits::database_structure::DatabaseStructure, AspectId, Database, Pattern, PatternID, DATABASES};
+use crate::{types::database::traits::database_structure::DatabaseStructure, AspectId, Database, Pattern, PatternID, DATABASES};
 
 const DICTIONARY_CHUNK_SIZE: usize = 100;
+use crate::database::Config;
+use crate::types::database::traits::connection::Connection;
 
 impl Database {
 	/// Get or create a dictionary patterns database and ensure the table structure exists
@@ -49,7 +51,7 @@ impl Database {
 	/// - if unable to create database
 	/// - if unable to create table structure
 	async fn get_or_create_dictionary_metadata_database(db_name: String) -> Result<turso::Database> {
-		let metadata_db_path = metadata_db_path(&db_name);
+		let metadata_db_path = Self::metadata_db_path(&db_name);
 		let metadata_db = match Self::get_turso_database(&metadata_db_path).await {
 			Ok(db) => db,
 			Err(_) => Self::create_turso_database(&metadata_db_path).await?,
@@ -79,7 +81,7 @@ impl Database {
 			}
 		}
 
-		Self::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 		Ok(metadata_db)
 	}
 
@@ -232,7 +234,7 @@ impl Database {
 			}
 		}
 
-		Self::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 		Ok(())
 	}
 

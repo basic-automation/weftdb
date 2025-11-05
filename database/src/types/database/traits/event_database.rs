@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::{database::events::EventStats, Event, AspectId};
+use crate::{database::events::EventStats, AspectId, Event};
 
 /// Trait for event database operations
 #[async_trait::async_trait]

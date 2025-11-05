@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use splimes::Resolution;
 
-use crate::{Aspect, AspectId, Database, DatabaseId, DatabaseInfo, Subject, SubjectId, Transaction, TxId};
+use crate::{cache::Connection, Aspect, AspectId, Database, DatabaseId, DatabaseInfo, Subject, SubjectId, Transaction, TxId};
 
 /// Trait for database structure operations
 /// This trait defines the operations related to managing the structure of the database.
@@ -43,22 +43,22 @@ pub trait DatabaseStructure {
 	fn metadata_path(&self) -> &str;
 
 	/// Create the metadata database
-	async fn wireframe_metadata_database(db: &turso::Database, db_path: &str) -> Result<Vec<Transaction>>;
+	async fn wireframe_metadata_database(conn: &Connection) -> Result<Vec<Transaction>>;
 
 	/// Create the transactions table for the metadata database
-	async fn metadata_database_create_transactions_table(db: &turso::Database, db_path: &str) -> Result<Transaction>;
+	async fn metadata_database_create_transactions_table(conn: &Connection) -> Result<Transaction>;
 
 	/// Create the database table for the metadata database
 	/// Holds general metadata about the database
-	async fn metadata_database_create_database_table(db: &turso::Database, db_path: &str) -> Result<Transaction>;
+	async fn metadata_database_create_database_table(conn: &Connection) -> Result<Transaction>;
 
 	/// Create the subjects table for the metadata database
 	/// Keeps track of all of the Subjects being observed by the database
-	async fn metadata_database_create_subjects_table(db: &turso::Database, db_path: &str) -> Result<Transaction>;
+	async fn metadata_database_create_subjects_table(conn: &Connection) -> Result<Transaction>;
 
 	/// Create the aspects table for the metadata database
 	/// Keeps track of all of the Aspects on each Subject in the database
-	async fn metadata_database_create_aspects_table(db: &turso::Database, db_path: &str) -> Result<Transaction>;
+	async fn metadata_database_create_aspects_table(conn: &Connection) -> Result<Transaction>;
 
 	/// Value to String helpers
 	async fn value_to_string(value: &turso::Value, field_name: &str) -> Result<String>;

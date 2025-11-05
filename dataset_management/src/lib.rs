@@ -1,13 +1,15 @@
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 #![allow(clippy::multiple_crate_versions, clippy::used_underscore_binding, clippy::similar_names, clippy::module_name_repetitions, clippy::module_inception, clippy::cast_precision_loss)]
 
-use std::sync::LazyLock;
+use std::{collections::HashMap, sync::LazyLock};
 
 use anyhow::Result;
 use bigdecimal::{BigDecimal, FromPrimitive, Zero};
 use chrono::Datelike;
 use database::{
-	database::traits::{DatabaseStructure, Outputs}, AspectId, BatchId, Database, DictionaryId, Resolution
+	database::{
+	        traits::{AspectStructure, DatabaseStructure, Outputs}
+	}, AspectId, BatchId, Database, DictionaryId, Resolution
 };
 use futures::StreamExt;
 use rayon::prelude::*;
@@ -520,6 +522,7 @@ pub async fn create_correlations_for_events(database: &Database, dictionary: &Di
 	// Get patterns directly from database (not from dictionary object which may have filtered patterns)
 	let patterns = database.get_patterns_from_dictionary(dictionary.name(), aspect_id).await?;
 	let events = database.get_unprocessed_events().await?;
+	let aspect = database.get_aspect(*aspect_id).await?;
 
 	// Exit early if no patterns or events to correlate
 	if patterns.is_empty() || events.is_empty() {
@@ -533,9 +536,9 @@ pub async fn create_correlations_for_events(database: &Database, dictionary: &Di
 	for event in &events {
 		for pattern in &patterns {
 			// Assign constant to local variable before borrowing to avoid clippy warning
-			let error_rate = DEFAULT_ERROR_RATE.clone();
+			let error_rate = HashMap::new();
 
-			let correlation = Correlation::new(DictionaryId::from_uuid(pattern.occurrences()[0].database_info().id().as_uuid()), pattern.id(), event.id().clone(), error_rate, pattern.occurrences().clone());
+			let correlation = Correlation::new(None, DictionaryId::from_uuid(pattern.occurrences()[0].database_info().id().as_uuid()), aspect.subject_id(), aspect_id, pattern.id(), event.id().clone(), error_rate, pattern.occurrences().clone());
 			database.store_correlation(&correlation).await?;
 		}
 	}
@@ -555,9 +558,9 @@ pub async fn create_correlations_for_events(database: &Database, dictionary: &Di
 /// - Database operations fail (getting events)
 /// - Time difference calculations fail
 /// - Signal creation fails
-pub async fn create_signals(database: &Database, _dictionary: &Dictionary) -> Result<()> {
+pub async fn create_signals(database: &Database, aspect_id: &AspectId) -> Result<()> {
 	// Get correlations and events from database
-	let correlations = database.get_correlations().await?;
+	let correlations = database.get_correlations(aspect_id).await?;
 	let events = database.get_unprocessed_events().await?;
 
 	// Exit early if no correlations or events to process
@@ -651,8 +654,8 @@ pub async fn create_signals(database: &Database, _dictionary: &Dictionary) -> Re
 /// - Database operations fail (getting events, correlations, updating correlations)
 /// - Signal removal or error correction fails
 /// - Time calculations or conversions fail
-pub async fn filter_expired_signals(database: &Database) -> Result<()> {
-	filter_expired_signals_at_time(database, None).await
+pub async fn filter_expired_signals(database: &Database, aspect_id: &AspectId) -> Result<()> {
+	filter_expired_signals_at_time(database, aspect_id, None).await
 }
 
 /// Filters out expired signals based on event resolution times at a specific time.
@@ -666,7 +669,7 @@ pub async fn filter_expired_signals(database: &Database) -> Result<()> {
 /// - Database operations fail (getting events, correlations, updating correlations)
 /// - Signal removal or error correction fails
 /// - Time calculations or conversions fail
-pub async fn filter_expired_signals_at_time(database: &Database, current_time: Option<chrono::DateTime<chrono::Utc>>) -> Result<()> {
+pub async fn filter_expired_signals_at_time(database: &Database, aspect_id: &AspectId, current_time: Option<chrono::DateTime<chrono::Utc>>) -> Result<()> {
 	use chrono::Utc;
 
 	let current_time = current_time.unwrap_or_else(Utc::now);
@@ -689,7 +692,7 @@ pub async fn filter_expired_signals_at_time(database: &Database, current_time: O
 
 	// Get events and correlations once to avoid database locks during processing
 	let events_lock = database.get_unprocessed_events().await?;
-	let correlations = database.get_correlations().await?;
+	let correlations = database.get_correlations(aspect_id).await?;
 
 	// Collect signals to remove
 	let mut signals_to_remove = Vec::new();
@@ -926,7 +929,7 @@ mod tests {
 		println!("Time taken for create_correlations_for_events: {:?}", timer.elapsed());
 
 		// print the number of correlations with more than 1 occurrence
-		let correlations = database.get_correlations().await?;
+		let correlations = database.get_correlations(&aspect.id()).await?;
 		println!("Number of correlations with more than 1 occurrence: {}", correlations.iter().filter(|correlation| correlation.occurrences().len() > 1).count());
 
 		// print the number of patterns with more than 1 occurrence
@@ -934,7 +937,7 @@ mod tests {
 
 		let timer = std::time::Instant::now();
 		println!("Starting create_signals...");
-		create_signals(&database, &dictionary).await?;
+		create_signals(&database, &aspect.id()).await?;
 		println!("Time taken for create_signals: {:?}", timer.elapsed());
 
 		// print the number of signals created
@@ -944,7 +947,7 @@ mod tests {
 
 		let timer = std::time::Instant::now();
 		println!("Starting filter_expired_signals...");
-		filter_expired_signals(&database).await?;
+		filter_expired_signals(&database, &aspect.id()).await?;
 		println!("Time taken for filter_expired_signals: {:?}", timer.elapsed());
 
 		// print the number of signals after filtering
@@ -964,7 +967,7 @@ mod tests {
 
 		// If we found a signal, check and potentially modify its correlation's error rates
 		if let (Some(signal), Some(correlation_id)) = (&random_signal, &correlation_to_modify) {
-			if let Some(mut correlation) = database.get_correlation_by_id(correlation_id).await? {
+			if let Some(mut correlation) = database.get_correlation_by_id(correlation_id, &aspect.id()).await? {
 				// Check if error rates are zero
 				let has_nonzero = correlation.error_rate().values().any(|err| !err.value().is_zero());
 
@@ -986,7 +989,7 @@ mod tests {
 		let random_manifestation_id = random_signal.manifestation_id().clone();
 		let random_event_id = random_signal.event_id().clone();
 		let signal_type = random_signal.signal_type().clone();
-		let random_correlation = database.get_correlation_by_id(&random_correlation_id).await?.ok_or_else(|| anyhow::anyhow!("No correlation found for signal"))?;
+		let random_correlation = database.get_correlation_by_id(&random_correlation_id, &aspect.id()).await?.ok_or_else(|| anyhow::anyhow!("No correlation found for signal"))?;
 		let random_correlation_error_rate = random_correlation.error_rate().clone();
 
 		// Get the error rate for the specific signal type we're using
@@ -998,7 +1001,7 @@ mod tests {
 		// get oct. 1st 2025 DateTime<Utc>
 		let sample_datetime = Utc.with_ymd_and_hms(2025, 12, 15, 0, 0, 0).unwrap();
 
-		let sig_sum_probability = signals_lock.probability_sum(&random_event_id, &signal_type, sample_datetime, &database).await?.unwrap_or_else(|| BigDecimal::from(0));
+		let sig_sum_probability = signals_lock.probability_sum(&random_event_id, &signal_type, sample_datetime, &database, &aspect.id()).await?.unwrap_or_else(|| BigDecimal::from(0));
 
 		println!("Time taken for sample signal probability calculation: {:?}", timer.elapsed());
 		println!("Sample signal probability for correlation ID {random_correlation_id}, manifestation ID {random_manifestation_id}, signal type {signal_type:?}:");
@@ -1084,7 +1087,7 @@ mod tests {
 		println!("Time taken for create_correlations_for_events: {:?}", timer.elapsed());
 
 		// print the number of correlations with more than 1 occurrence
-		let correlations = db.get_correlations().await?;
+		let correlations = db.get_correlations(&aspect.id()).await?;
 		println!("Number of correlations with more than 1 occurrence: {}", correlations.iter().filter(|correlation| correlation.occurrences().len() > 1).count());
 
 		// print the number of patterns with more than 1 occurrence
@@ -1092,7 +1095,7 @@ mod tests {
 
 		let timer = std::time::Instant::now();
 		println!("Starting create_signals...");
-		create_signals(&db, &dictionary).await?;
+		create_signals(&db, &aspect.id()).await?;
 		println!("Time taken for create_signals: {:?}", timer.elapsed());
 
 		// print the number of signals created
@@ -1105,7 +1108,7 @@ mod tests {
 
 		let timer = std::time::Instant::now();
 		println!("Starting filter_expired_signals at query_time={query_time}...");
-		filter_expired_signals_at_time(&db, Some(query_time)).await?;
+		filter_expired_signals_at_time(&db, &aspect.id(), Some(query_time)).await?;
 		println!("Time taken for filter_expired_signals: {:?}", timer.elapsed());
 
 		// print the number of signals after filtering
@@ -1121,11 +1124,11 @@ mod tests {
 		if let Some(event_id) = event_id_option {
 			let signals_lock = SIGNALS_QUEUE.lock().await;
 			// Use PredictStart since we're checking at the start of hour 61 (2025-01-03 13:00:00)
-			let Some(sum_probability) = signals_lock.probability_sum(&event_id, &SignalType::Custom("PredictStart".to_string()), query_time, &db).await? else {
+			let Some(sum_probability) = signals_lock.probability_sum(&event_id, &SignalType::Custom("PredictStart".to_string()), query_time, &db, &aspect.id()).await? else {
 				bail!("No signals found for event ID {}", event_id);
 			};
 
-			let Some(avg_probability) = signals_lock.probability_average(&event_id, &SignalType::Custom("PredictStart".to_string()), query_time, &db).await? else {
+			let Some(avg_probability) = signals_lock.probability_average(&event_id, &SignalType::Custom("PredictStart".to_string()), query_time, &db, &aspect.id()).await? else {
 				bail!("No signals found for event ID {}", event_id);
 			};
 
@@ -1139,7 +1142,7 @@ mod tests {
 	async fn fake_database() -> Database {
 		// Cleanup existing test database if it exists
 		use std::fs::remove_dir_all;
-		let db_path = format!("{}/TestDB", database::DEFAULT_DATA_DIR);
+		let db_path = format!("{}/TestDB", DEFAULT_DATA_DIR);
 		remove_dir_all(&db_path).ok();
 
 		let db = Database::new("TestDB").await.unwrap();
@@ -1242,7 +1245,7 @@ mod tests {
 			return Ok(());
 		}
 
-		let db_path = format!("{}/test_bath_processing", database::DEFAULT_DATA_DIR);
+		let db_path = format!("{}/test_bath_processing", DEFAULT_DATA_DIR);
 		remove_dir_all(&db_path).ok();
 
 		let db = Database::new("test_bath_processing").await.unwrap();
@@ -1307,7 +1310,7 @@ mod tests {
 			return Ok(());
 		}
 
-		let db_path = format!("{}/test_specific_process_batch", database::DEFAULT_DATA_DIR);
+		let db_path = format!("{}/test_specific_process_batch", DEFAULT_DATA_DIR);
 		remove_dir_all(&db_path).ok();
 
 		let db = Database::new("test_specific_process_batch").await.unwrap();

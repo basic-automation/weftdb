@@ -5,8 +5,9 @@ use ::database::database::traits::{AspectStructure, Inputs};
 use anyhow::Result;
 use bigdecimal::BigDecimal;
 use chrono::{TimeZone, Utc};
-use database::{database::traits::DatabaseStructure, Database, DatasetId, InputMeasurement, DEFAULT_DATA_DIR};
+use database::{database::traits::DatabaseStructure, Database, DatasetId, InputMeasurement};
 use splimes::{Resolution, Spline};
+use database::database::config::DEFAULT_DATA_DIR;
 
 use crate::batch_utils::build_unprocessed_queue;
 

@@ -1,14 +1,15 @@
 use std::fmt::Display;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use splimes::Resolution;
 use turso::Database as TursoDatabase;
 use uuid::Uuid;
 
 use crate::{
-	cache::Connection, database::{aspect_correlations_db_path, aspect_dictionaries_path, aspect_events_db_path, aspect_measurements_db_path, aspect_path, aspect_patterns_db_path, aspect_processed_batches_db_path, aspect_unprocessed_batches_db_path}, types::database::traits::aspect_structure::AspectStructure, Database, DatabaseStructure, SubjectId
+	cache::Connection, types::database::{traits::aspect_structure::AspectStructure, Config}, Database, DatabaseStructure, SubjectId
 };
+use crate::types::database::traits::connection::Connection as ConnectionTrait;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AspectId(Uuid);
@@ -79,29 +80,30 @@ pub struct Aspect {
 
 #[async_trait::async_trait]
 impl AspectStructure for Aspect {
-	async fn new(id: Option<AspectId>, name: String, subject_id: SubjectId, db_name: String, resolution: Resolution, database_metadata_db_path: String) -> Result<Self> {
+	async fn new(id: Option<AspectId>, name: String, subject_id: SubjectId, resolution: Resolution, metadata_conn: &Connection) -> Result<Self> {
 		let id = id.unwrap_or_default();
-		let database_metadata_db = Database::get_turso_database(&database_metadata_db_path).await?;
-		let subject_name = Self::get_subject_name(database_metadata_db, subject_id).await?;
-		let aspect_path = aspect_path(&db_name, &subject_name, &name);
+		let subject_name = Self::get_subject_name(metadata_conn, subject_id).await?;
+		let db_name = <Database as Config>::db_name(&metadata_conn).await?;
+		let database_metadata_db_path = Database::db_metadata_path(metadata_conn).await?;
+		let aspect_path = Database::aspect_path(&db_name, &subject_name, &name);
 
 		// recursively create directory if it doesn't exist
 		tokio::fs::create_dir_all(&aspect_path).await?;
 
 		// Create databases sequentially to avoid lock contention during concurrent aspect creation
 		// The databases themselves will use MVCC for internal concurrency
-		let measurements_path = aspect_measurements_db_path(&db_name, &subject_name, &name);
+		let measurements_path = Database::aspect_measurements_db_path(&db_name, &subject_name, &name);
 		println!("[TRACE] Creating measurements DB at: {measurements_path}");
 		let measurements = Database::get_or_create_turso_database(&measurements_path).await?;
 		println!("[TRACE] Connected measurements DB: {measurements_path}");
 		let conn = Database::begin_concurrent(&measurements, &measurements_path).await?;
 		println!("[TRACE] Wireframing measurements tables for: {measurements_path}");
 		Self::wireframe_measurements_tables(&conn).await?;
-		Database::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 		println!("[TRACE] Wireframed measurements tables for: {measurements_path}");
-                let measurements = Some(measurements);
+		let measurements = Some(measurements);
 
-		let unprocessed_batches_path = aspect_unprocessed_batches_db_path(&db_name, &subject_name, &name);
+		let unprocessed_batches_path = Database::aspect_unprocessed_batches_db_path(&db_name, &subject_name, &name);
 		println!("[TRACE] Creating unprocessed_batches DB at: {unprocessed_batches_path}");
 		let unprocessed_batches = Database::get_or_create_turso_database(&unprocessed_batches_path).await?;
 		println!("[TRACE] Connected unprocessed_batches DB: {unprocessed_batches_path}");
@@ -110,9 +112,9 @@ impl AspectStructure for Aspect {
 		Self::wireframe_batches_tables(&conn).await?;
 		println!("[TRACE] Wireframed batches tables for: {unprocessed_batches_path}");
 		let unprocessed_batches = Some(unprocessed_batches);
-		Database::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 
-		let processed_batches_path = aspect_processed_batches_db_path(&db_name, &subject_name, &name);
+		let processed_batches_path = Database::aspect_processed_batches_db_path(&db_name, &subject_name, &name);
 		println!("[TRACE] Creating processed_batches DB at: {processed_batches_path}");
 		let processed_batches = Database::get_or_create_turso_database(&processed_batches_path).await?;
 		println!("[TRACE] Connected processed_batches DB: {processed_batches_path}");
@@ -121,9 +123,9 @@ impl AspectStructure for Aspect {
 		Self::wireframe_batches_tables(&conn).await?;
 		println!("[TRACE] Wireframed batches tables for: {processed_batches_path}");
 		let processed_batches = Some(processed_batches);
-		Database::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 
-		let patterns_path = aspect_patterns_db_path(&db_name, &subject_name, &name);
+		let patterns_path = Database::aspect_patterns_db_path(&db_name, &subject_name, &name);
 		println!("[TRACE] Creating patterns DB at: {patterns_path}");
 		let patterns = Database::get_or_create_turso_database(&patterns_path).await?;
 		println!("[TRACE] Connected patterns DB: {patterns_path}");
@@ -132,9 +134,9 @@ impl AspectStructure for Aspect {
 		Self::wireframe_patterns_tables(&conn).await?;
 		println!("[TRACE] Wireframed patterns tables for: {patterns_path}");
 		let patterns = Some(patterns);
-		Database::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 
-		let events_path = aspect_events_db_path(&db_name, &subject_name, &name);
+		let events_path = Database::aspect_events_db_path(&db_name, &subject_name, &name);
 		println!("[TRACE] Creating events DB at: {events_path}");
 		let events = Database::get_or_create_turso_database(&events_path).await?;
 		println!("[TRACE] Connected events DB: {events_path}");
@@ -143,9 +145,9 @@ impl AspectStructure for Aspect {
 		Self::wireframe_events_tables(&conn).await?;
 		println!("[TRACE] Wireframed events tables for: {events_path}");
 		let events = Some(events);
-		Database::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 
-		let correlations_path = aspect_correlations_db_path(&db_name, &subject_name, &name);
+		let correlations_path = Database::aspect_correlations_db_path(&db_name, &subject_name, &name);
 		println!("[TRACE] Creating correlations DB at: {correlations_path}");
 		let correlations = Database::get_or_create_turso_database(&correlations_path).await?;
 		println!("[TRACE] Connected correlations DB: {correlations_path}");
@@ -154,9 +156,9 @@ impl AspectStructure for Aspect {
 		Self::wireframe_correlations_tables(&conn).await?;
 		println!("[TRACE] Wireframed correlations tables for: {correlations_path}");
 		let correlations = Some(correlations);
-		Database::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 
-		let dictionaries_path = aspect_dictionaries_path(&db_name, &subject_name, &name);
+		let dictionaries_path = <Database as Config>::aspect_dictionaries_path(&db_name, &subject_name, &name);
 		println!("[TRACE] Creating dictionaries directory at: {dictionaries_path}");
 		std::fs::create_dir_all(&dictionaries_path)?;
 
@@ -193,7 +195,10 @@ impl AspectStructure for Aspect {
 			sn
 		} else {
 			let database_metadata_db = Database::get_turso_database(&database_metadata_db_path).await?;
-			Self::get_subject_name(database_metadata_db, subject_id).await?
+			let conn = Database::begin_concurrent(&database_metadata_db, &database_metadata_db_path).await?;
+			let s = Self::get_subject_name(&conn, subject_id).await?;
+			let _ = Database::commit_concurrent(&conn).await;
+			s
 		};
 
 		let database_dir = std::path::Path::new(&database_metadata_db_path).parent().ok_or_else(|| anyhow::anyhow!("Cannot determine database directory"))?;
@@ -252,52 +257,23 @@ impl AspectStructure for Aspect {
 		Ok(metadata_path)
 	}
 
-	async fn get_subject_name(turso_db: TursoDatabase, subject_id: SubjectId) -> Result<String> {
+	async fn get_subject_name(conn: &Connection, subject_id: SubjectId) -> Result<String> {
 		// Read-only query with simple retry/backoff; no explicit transaction to avoid writer locks
-		let mut attempts = 0u32;
-		const MAX_ATTEMPTS: u32 = 8;
-
-		loop {
-			attempts += 1;
-			let conn = match turso_db.connect() {
-				Ok(c) => c,
-				Err(e) => {
-					if attempts < MAX_ATTEMPTS && e.to_string().to_lowercase().contains("locked") {
-						tokio::time::sleep(std::time::Duration::from_millis(25 * attempts as u64)).await;
-						continue;
-					}
-					return Err(anyhow::anyhow!("Failed to connect for subject_name: {e}"));
-				}
-			};
-
-			// Ensure this read waits on busy locks rather than failing fast
-			let _ = conn.execute("PRAGMA busy_timeout=600000", turso::params![]).await;
-
-			let res = conn.query("SELECT name FROM subjects WHERE id = ?", turso::params![subject_id.as_uuid().to_string()]).await;
-			match res {
-				Ok(mut rows) => {
-					let row = rows.next().await?.ok_or_else(|| anyhow::anyhow!("Subject not found"))?;
-					let subject_name: String = row.get(0)?;
-					return Ok(subject_name);
-				}
-				Err(e) => {
-					let em = e.to_string().to_lowercase();
-					if attempts < MAX_ATTEMPTS && (em.contains("locked") || em.contains("busy") || em.contains("conflict")) {
-						tokio::time::sleep(std::time::Duration::from_millis(25 * attempts as u64)).await;
-						continue;
-					}
-					return Err(anyhow::anyhow!("SQL execution failure getting subject_name: `{}`", e));
-				}
+		let res = conn.as_ref().query("SELECT name FROM subjects WHERE id = ?", turso::params![subject_id.as_uuid().to_string()]).await;
+		let subject_name = match res {
+			Ok(mut rows) => {
+				let row = rows.next().await?.ok_or_else(|| anyhow::anyhow!("Subject not found"))?;
+				let subject_name: String = row.get(0)?;
+				subject_name
 			}
-		}
+			Err(e) => bail!("SQL execution failure 3: in get_subject_name: `{}`", e),
+		};
+		Ok(subject_name)
 	}
 
-	async fn get_aspect_path(turso_db_path: String, subject_id: SubjectId, aspect_name: String) -> Result<String> {
-		let database_metadata_db = Database::get_turso_database(&turso_db_path).await?;
-		let subject_name = Self::get_subject_name(database_metadata_db, subject_id).await?;
-
-		let aspect_metadata_path = std::path::Path::new(&turso_db_path).parent().ok_or_else(|| anyhow::anyhow!("Cannot determine database directory"))?.join(subject_name).join(aspect_name);
-
+	async fn get_aspect_path(conn: &Connection, metadata_path: &str, subject_id: SubjectId, aspect_name: String) -> Result<String> {
+		let subject_name = Self::get_subject_name(&conn, subject_id).await?;
+		let aspect_metadata_path = std::path::Path::new(&metadata_path).parent().ok_or_else(|| anyhow::anyhow!("Cannot determine database directory"))?.join(subject_name).join(aspect_name);
 		if aspect_metadata_path.exists() {
 			Ok(aspect_metadata_path.to_string_lossy().to_string())
 		} else {
@@ -322,16 +298,17 @@ impl AspectStructure for Aspect {
 	}
 
 	async fn wireframe_measurements_tables(conn: &Connection) -> Result<()> {
-		conn.as_ref().execute(
-			"CREATE TABLE IF NOT EXISTS measurements (
+		conn.as_ref()
+			.execute(
+				"CREATE TABLE IF NOT EXISTS measurements (
 				id TEXT PRIMARY KEY,
 				dataset_id TEXT NOT NULL,
 				timestamp INTEGER NOT NULL UNIQUE,
 				value TEXT NOT NULL
 			)",
-			turso::params![],
-		)
-		.await?;
+				turso::params![],
+			)
+			.await?;
 
 		// Add index for common queries
 		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_measurements_dataset_timestamp ON measurements(dataset_id, timestamp)", turso::params![]).await?;
@@ -352,8 +329,9 @@ impl AspectStructure for Aspect {
 	}
 
 	async fn wireframe_batches_tables(conn: &Connection) -> Result<()> {
-		conn.as_ref().execute(
-			r"
+		conn.as_ref()
+			.execute(
+				r"
 			CREATE TABLE IF NOT EXISTS batches (
 				id TEXT PRIMARY KEY,
 				aspect_id TEXT NOT NULL,
@@ -369,9 +347,9 @@ impl AspectStructure for Aspect {
 
 				FOREIGN KEY (aspect_id) REFERENCES aspects(id)
 			)",
-			turso::params![],
-		)
-		.await?;
+				turso::params![],
+			)
+			.await?;
 
 		// Add unique constraint for batch_hash to prevent duplicate batches
 		conn.as_ref().execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_batches_unique_hash ON batches(batch_hash) WHERE batch_hash IS NOT NULL", turso::params![]).await?;
@@ -384,7 +362,7 @@ impl AspectStructure for Aspect {
 		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_batches_created_at ON batches(created_at)", turso::params![]).await?;
 		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_batches_hash ON batches(batch_hash) WHERE batch_hash IS NOT NULL", turso::params![]).await?;
 
-                Database::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 
 		Ok(())
 	}

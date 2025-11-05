@@ -534,23 +534,17 @@ async fn test_create_btc_1min_database() -> Result<()> {
 				volume_measurements.push(volume);
 			}
 
-			println!("Starting batch insertion of measurements");
+			println!("Starting batch insertion of measurements in parallel");
 
-			// Run batch insertions sequentially to avoid database contention
-			println!("Inserting open measurements...");
-			db.batch_capture_measurements(open_aspect.id(), DatasetId::new(), open_measurements).await?;
+			// Run batch insertions in parallel
+			let (open_result, high_result, low_result, close_result, volume_result) = tokio::join!(db.batch_capture_measurements(open_aspect.id(), DatasetId::new(), open_measurements), db.batch_capture_measurements(high_aspect.id(), DatasetId::new(), high_measurements), db.batch_capture_measurements(low_aspect.id(), DatasetId::new(), low_measurements), db.batch_capture_measurements(close_aspect.id(), DatasetId::new(), close_measurements), db.batch_capture_measurements(volume_aspect.id(), DatasetId::new(), volume_measurements));
 
-			println!("Inserting high measurements...");
-			db.batch_capture_measurements(high_aspect.id(), DatasetId::new(), high_measurements).await?;
-
-			println!("Inserting low measurements...");
-			db.batch_capture_measurements(low_aspect.id(), DatasetId::new(), low_measurements).await?;
-
-			println!("Inserting close measurements...");
-			db.batch_capture_measurements(close_aspect.id(), DatasetId::new(), close_measurements).await?;
-
-			println!("Inserting volume measurements...");
-			db.batch_capture_measurements(volume_aspect.id(), DatasetId::new(), volume_measurements).await?;
+			// Check all results
+			open_result?;
+			high_result?;
+			low_result?;
+			close_result?;
+			volume_result?;
 
 			println!("Batch insertion of measurements completed");
 
