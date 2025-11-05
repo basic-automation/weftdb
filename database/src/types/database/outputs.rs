@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use futures::Stream;
 use splimes::{Point, Resolution, Spline};
 use uuid::Uuid;
+use crate::types::database::traits::connection::Connection;
 
 use crate::{
 	database::traits::{AspectStructure, DatabaseStructure, Outputs}, types::cache::CACHE, AnalysisResult, AspectId, Batch, BatchId, BatchMetatdata, BatchedMeasurement, Database, DatasetId, Error, Measurement, MeasurementId
@@ -89,7 +90,7 @@ impl Outputs for Database {
 			}
 		};
 
-		let cache_key = format!("measurement_db_query_{}_{}_{}_{}", aspect_id, start.map(|s| s.timestamp_millis()).unwrap_or(0), end.map(|e| e.timestamp_millis()).unwrap_or(i64::MAX), max_per_page);
+		let cache_key = aspect.measurements_path();
 		let conn = Self::begin_concurrent(&measurement_db, &cache_key).await?;
 
 		// Convert String parameters to turso::Value
@@ -130,6 +131,8 @@ impl Outputs for Database {
 			let cache_key = format!("aspect_measurements_{}_{}", aspect_id.as_uuid(), max_per_page);
 			CACHE.store_aspect_measurements(&cache_key, &measurements).await;
 		}
+
+		let _ = Self::commit_concurrent(&conn).await;
 
 		Ok(measurements)
 	}

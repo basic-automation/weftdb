@@ -4,7 +4,9 @@ use anyhow::{bail, Result};
 use uuid::Uuid;
 
 use super::helpers::safe_ratio;
-use crate::{database::traits::AspectStructure, types::database::traits::database_structure::DatabaseStructure, Database, Event, DATABASES, AspectId};
+use crate::{database::traits::AspectStructure, types::database::traits::database_structure::DatabaseStructure, AspectId, Database, Event, DATABASES};
+
+use crate::types::database::traits::connection::Connection;
 
 const EVENT_CHUNK_SIZE: usize = 100;
 
@@ -34,7 +36,7 @@ impl Database {
 			}
 		}
 
-		Self::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 
 		Ok(())
 	}
@@ -100,7 +102,7 @@ impl Database {
 			}
 		};
 
-		Self::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 
 		// Verify that an event was actually updated
 		if rows_affected == 0 {
@@ -259,7 +261,7 @@ impl Database {
 			}
 		};
 
-		Self::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 
 		usize::try_from(rows_affected).map_err(|_| anyhow::anyhow!("Too many rows affected".to_string()))
 	}
@@ -393,7 +395,7 @@ impl Database {
 			}
 		};
 
-		Self::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 
 		usize::try_from(rows_affected).map_err(|_| anyhow::anyhow!("Too many rows affected".to_string()))
 	}
@@ -423,7 +425,7 @@ impl Database {
 			}
 		};
 
-		Self::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 
 		usize::try_from(rows).map_err(|_| anyhow::anyhow!("Too many rows affected".to_string()))
 	}

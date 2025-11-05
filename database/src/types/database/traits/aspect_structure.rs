@@ -11,8 +11,9 @@ use crate::{cache::Connection, Aspect, AspectId, SubjectId};
 pub trait AspectStructure {
 	// Aspect
 
-	#[allow(clippy::new_ret_no_self)]
-	async fn new(id: Option<AspectId>, name: String, subject_id: SubjectId, db_name: String, resolution: Resolution, database_metadata_db_path: String) -> Result<Aspect>;
+	async fn new(id: Option<AspectId>, name: String, subject_id: SubjectId, resolution: Resolution, metadata_conn: &Connection) -> Result<Self>
+	where
+		Self: Sized;
 
 	/// Lightweight constructor that creates an Aspect instance from metadata
 	/// without opening or wireframing per-aspect databases. Useful for
@@ -36,9 +37,9 @@ pub trait AspectStructure {
 
 	async fn get_database_metadata_path(turso_db_path: String) -> Result<String>;
 
-	async fn get_subject_name(turso_db: turso::Database, subject_id: SubjectId) -> Result<String>;
+	async fn get_subject_name(conn: &Connection, subject_id: SubjectId) -> Result<String>;
 
-	async fn get_aspect_path(turso_db_path: String, subject_id: SubjectId, aspect_name: String) -> Result<String>;
+	async fn get_aspect_path(conn: &Connection, metadata_path: &str, subject_id: SubjectId, aspect_name: String) -> Result<String>;
 
 	/// get measurements database
 	async fn measurements(&mut self) -> Result<turso::Database>;

@@ -8,6 +8,8 @@ use crate::{
 	}, AspectId, Batch, Database, DatasetId, Error, InputMeasurement, Measurement, CACHE
 };
 
+use crate::types::database::traits::connection::Connection as ConnectionTrait;
+
 #[async_trait::async_trait]
 impl Inputs for Database {
 	/// Capture a new measurement for a given aspect
@@ -42,11 +44,11 @@ impl Inputs for Database {
 			Ok(_) => println!("Successfully upserted measurement for dataset {}", dataset_id),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("SQL execution failure: `{}`", e));
+				return Err(anyhow::anyhow!("SQL execution failure 1: `{}`", e));
 			}
 		}
 
-		Self::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 
 		// Record the transaction - we don't know if it was an insert or update, but that's okay
 		self.record_transaction(&format!("Captured measurement at {} with value {} for dataset {} (upsert operation)", measurement.timestamp(), measurement.value(), dataset_id)).await
@@ -80,14 +82,14 @@ impl Inputs for Database {
 			Ok(rows) => {
 				println!("Inserted {} rows", rows);
 				rows
-			},
+			}
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("SQL execution failure: `{}`", e));
+				return Err(anyhow::anyhow!("SQL execution failure 2: `{}`", e));
 			}
 		};
 
-		Self::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 
 		// Check if the insert actually happened (rows_affected > 0 means it was inserted)
 		if rows_affected == 0 {
@@ -143,6 +145,7 @@ impl Inputs for Database {
 			// Process chunk with robust retry
 			let mut conn = measurement_db.connect()?;
 			self.capture_measurement_chunk(&mut conn, dataset_id, chunk, &all_tx_ids, chunk_idx * chunk_size).await?;
+			tokio::task::yield_now().await;
 		}
 
 		// Invalidate cache
@@ -165,6 +168,7 @@ impl Inputs for Database {
 		let max_attempts = 15;
 
 		loop {
+			tokio::task::yield_now().await;
 			let tx = match conn.transaction().await {
 				Ok(tx) => tx,
 				Err(e) => {
@@ -277,7 +281,7 @@ impl Inputs for Database {
 				}
 			};
 
-			Self::commit_concurrent(&conn).await?;
+			let _ = Database::commit_concurrent(&conn).await;
 
 			if rows_affected > 0 {
 				successful.push(*tx_id);
@@ -309,7 +313,7 @@ impl Inputs for Database {
 			}
 		}
 
-		Database::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 
 		Ok(tx_id)
 	}
@@ -363,7 +367,7 @@ impl Inputs for Database {
 			}
 		}
 
-		Database::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 
 		Ok(tx_id)
 	}

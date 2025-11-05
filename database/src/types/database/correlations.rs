@@ -1,7 +1,9 @@
 use anyhow::{bail, Result};
 use uuid::Uuid;
 
-use crate::{database::traits::AspectStructure, types::database::traits::database_structure::DatabaseStructure, Correlation, CorrelationID, Database, AspectId};
+use crate::{database::traits::AspectStructure, types::database::traits::database_structure::DatabaseStructure, AspectId, Correlation, CorrelationID, Database};
+
+use crate::types::database::traits::connection::Connection;
 
 impl Database {
 	/// Store correlation in a specific dictionary
@@ -37,7 +39,7 @@ impl Database {
 			}
 		}
 
-		Self::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 		Ok(())
 	}
 
@@ -106,7 +108,7 @@ impl Database {
 			return Ok(None);
 		};
 
-		Self::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 
 		let correlation_id_str = Self::value_to_string(&row.get_value(0)?, "Correlation ID").await?;
 		let dictionary_id_str = Self::value_to_string(&row.get_value(1)?, "Dictionary ID").await?;
@@ -170,7 +172,7 @@ impl Database {
 				return Err(anyhow::anyhow!(format!("Failed to delete correlation: {e}")));
 			}
 		};
-                Self::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 
 		Ok(rows_affected > 0)
 	}

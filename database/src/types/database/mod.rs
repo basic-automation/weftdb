@@ -1,5 +1,5 @@
 use std::{
-	collections::HashMap, fmt, fmt::{Formatter}, path::{Path, PathBuf}, sync::{Arc, LazyLock}
+	collections::HashMap, fmt, fmt::{Display, Formatter}, path::Path, sync::{Arc, LazyLock}
 };
 
 use anyhow::{bail, Result};
@@ -9,97 +9,24 @@ use splimes::Resolution;
 use tokio::sync::Mutex;
 use turso::Builder;
 use uuid::Uuid;
-use std::fmt::Display;
 
+pub use crate::types::database::traits::config::Config;
 use crate::{
-	get_data_dir, types::{
-		cache::Connection as CachedConnection, database::traits::{aspect_structure::AspectStructure, database_structure::DatabaseStructure}, Transaction, TxId
-	}, Aspect, AspectId, Error, Subject, SubjectId, CACHE
+	types::{
+		database::traits::{aspect_structure::AspectStructure, database_structure::DatabaseStructure}, Transaction, TxId
+	}, Aspect, AspectId, Error, Subject, SubjectId
 };
-
+use crate::database::traits::Connection;
+use crate::cache;
 
 pub type DatabaseMap = Arc<Mutex<HashMap<DatabaseId, DatabaseInfo>>>;
 pub static DATABASES: LazyLock<DatabaseMap> = LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
 // Add connection manager for Turso with connection pools
 static CONNECTION_DATABASES: LazyLock<Arc<Mutex<HashMap<String, turso::Database>>>> = LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
-static METADATA_DB_FILENAME: &str = "metadata.db";
-static MEASUREMENT_DB_FILENAME: &str = "measurements.db";
-static UNPROCESSED_BATCHES_DB_FILENAME: &str = "unprocessed_batches.db";
-static PROCESSED_BATCHES_DB_FILENAME: &str = "processed_batches.db";
-static PATTERNS_DB_FILENAME: &str = "patterns.db";
-static EVENTS_DB_FILENAME: &str = "events.db";
-static CORRELATIONS_DB_FILENAME: &str = "correlations.db";
-static DICTIONARIES_DB_FOLDERNAME: &str = "dictionaries";
-
-pub fn db_path(db_name: &str) -> String {
-	let mut path_buf: PathBuf = get_data_dir().into();
-	path_buf.push(db_name);
-	path_buf.to_string_lossy().to_string()
-}
-
-pub fn metadata_db_path(db_name: &str) -> String {
-	let mut db_path: PathBuf = db_path(db_name).into();
-	db_path.push(METADATA_DB_FILENAME);
-	db_path.to_string_lossy().to_string()
-}
-
-pub fn aspect_path(db_name: &str, subject_name: &str, aspect_name: &str) -> String {
-	let mut db_path: PathBuf = db_path(db_name).into();
-	db_path.push(subject_name);
-	db_path.push(aspect_name);
-	db_path.to_string_lossy().to_string()
-}
-
-pub fn aspect_measurements_db_path(db_name: &str, subject_name: &str, aspect_name: &str) -> String {
-	let mut db_path: PathBuf = aspect_path(db_name, subject_name, aspect_name).into();
-	db_path.push(MEASUREMENT_DB_FILENAME);
-	db_path.to_string_lossy().to_string()
-}
-
-pub fn aspect_unprocessed_batches_db_path(db_name: &str, subject_name: &str, aspect_name: &str) -> String {
-	let mut db_path: PathBuf = aspect_path(db_name, subject_name, aspect_name).into();
-	db_path.push(UNPROCESSED_BATCHES_DB_FILENAME);
-	db_path.to_string_lossy().to_string()
-}
-
-pub fn aspect_processed_batches_db_path(db_name: &str, subject_name: &str, aspect_name: &str) -> String {
-	let mut db_path: PathBuf = aspect_path(db_name, subject_name, aspect_name).into();
-	db_path.push(PROCESSED_BATCHES_DB_FILENAME);
-	db_path.to_string_lossy().to_string()
-}
-
-pub fn aspect_patterns_db_path(db_name: &str, subject_name: &str, aspect_name: &str) -> String {
-	let mut db_path: PathBuf = aspect_path(db_name, subject_name, aspect_name).into();
-	db_path.push(PATTERNS_DB_FILENAME);
-	db_path.to_string_lossy().to_string()
-}
-
-pub fn aspect_events_db_path(db_name: &str, subject_name: &str, aspect_name: &str) -> String {
-	let mut db_path: PathBuf = aspect_path(db_name, subject_name, aspect_name).into();
-	db_path.push(EVENTS_DB_FILENAME);
-	db_path.to_string_lossy().to_string()
-}
-
-pub fn aspect_correlations_db_path(db_name: &str, subject_name: &str, aspect_name: &str) -> String {
-	let mut db_path: PathBuf = aspect_path(db_name, subject_name, aspect_name).into();
-	db_path.push(CORRELATIONS_DB_FILENAME);
-	db_path.to_string_lossy().to_string()
-}
-
-pub fn aspect_dictionaries_path(db_name: &str, subject_name: &str, aspect_name: &str) -> String {
-	let mut db_path: PathBuf = aspect_path(db_name, subject_name, aspect_name).into();
-	db_path.push(DICTIONARIES_DB_FOLDERNAME);
-	db_path.to_string_lossy().to_string()
-}
-
-pub fn dictionary_path(db_name: &str, subject_name: &str, aspect_name: &str, dictionary_name: &str) -> String {
-	let mut db_path: PathBuf = aspect_dictionaries_path(db_name, subject_name, aspect_name).into();
-	db_path.push(format!("{}.db", dictionary_name));
-	db_path.to_string_lossy().to_string()
-}
 
 pub mod batches;
+pub mod config;
 pub mod correlations;
 pub mod dictionaries;
 pub mod events;
@@ -109,6 +36,7 @@ pub mod navigation;
 pub mod outputs;
 pub mod patterns;
 pub mod traits;
+pub mod connection;
 
 #[derive(Debug, Clone)]
 pub struct Database {
@@ -118,71 +46,6 @@ pub struct Database {
 	metadata_path: String,
 }
 
-impl Database {
-	/// Get a cached database connection with MVCC concurrent transaction support
-	/// Returns a cached connection if available, otherwise creates a new one
-	pub async fn begin_concurrent(turso_db: &turso::Database, cache_key: &str) -> Result<CachedConnection> {
-		// Try to get cached connection first
-		if let Some(cached_conn) = CACHE.get_connection(cache_key).await {
-			return Ok(cached_conn);
-		}
-
-		// Create new connection if not cached
-		let conn = turso_db.connect()?;
-
-		// Try BEGIN CONCURRENT first for MVCC support
-		match conn.execute("BEGIN CONCURRENT", turso::params![]).await {
-			Ok(_) => {}
-			Err(_) => {
-				// Fallback to BEGIN IMMEDIATE for compatibility
-				match conn.execute("BEGIN IMMEDIATE", turso::params![]).await {
-					Ok(_) => {}
-					Err(_) => {
-						// Final fallback to regular BEGIN
-						conn.execute("BEGIN", turso::params![]).await.map_err(|e| anyhow::anyhow!("Failed to begin transaction: {}", e))?;
-					}
-				}
-			}
-		}
-
-		// Wrap in our Connection type and cache it
-		let cached_conn = CachedConnection::new(conn);
-		CACHE.store_connection(cache_key, cached_conn.clone()).await;
-
-		Ok(cached_conn)
-	}
-
-	pub async fn commit_concurrent(conn: &CachedConnection) -> anyhow::Result<()> {
-		conn.as_ref().execute("COMMIT", turso::params![]).await.map_err(Into::into).map(|_| ())
-	}
-
-	pub async fn rollback_concurrent(conn: &CachedConnection) -> Result<()> {
-		match conn.as_ref().execute("ROLLBACK", turso::params![]).await {
-			Ok(_) => Ok(()),
-			Err(e) => Err(anyhow::anyhow!("Rollback failed: {}", e)),
-		}
-	}
-
-	/// Configure database for MVCC concurrent writes
-	pub async fn configure_database_for_mvcc(turso_db: &turso::Database) -> Result<()> {
-		let conn = turso_db.connect()?;
-
-		// Apply basic concurrent write configuration
-		conn.execute("PRAGMA journal_mode=WAL", turso::params![]).await.ok();
-		conn.execute("PRAGMA busy_timeout=600000", turso::params![]).await.ok(); // 10 minutes for large concurrent operations
-		conn.execute("PRAGMA synchronous=NORMAL", turso::params![]).await.ok();
-		conn.execute("PRAGMA temp_store=memory", turso::params![]).await.ok();
-		conn.execute("PRAGMA wal_autocheckpoint=1000", turso::params![]).await.ok(); // Better WAL handling for large writes
-		conn.execute("PRAGMA cache_size=-64000", turso::params![]).await.ok(); // 64MB cache for performance
-
-		// Test BEGIN CONCURRENT support
-		if conn.execute("BEGIN CONCURRENT", turso::params![]).await.is_ok() {
-			conn.execute("ROLLBACK", turso::params![]).await.ok();
-		}
-
-		Ok(())
-	}
-}
 
 #[async_trait::async_trait]
 impl DatabaseStructure for Database {
@@ -272,7 +135,7 @@ impl DatabaseStructure for Database {
 			}
 		}
 
-		Database::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 
 		// Return immediately without waiting for the logging to complete
 		Ok(tx_id)
@@ -301,22 +164,22 @@ impl DatabaseStructure for Database {
 			}
 		}
 
-		Database::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 
 		// Return immediately without waiting for the logging to complete
 		Ok(())
 	}
 
-	async fn metadata_database_create_transactions_table(db: &turso::Database, db_path: &str) -> Result<Transaction> {
-		let conn = Self::begin_concurrent(db, db_path).await?;
+	async fn metadata_database_create_transactions_table(conn: &cache::Connection) -> Result<Transaction> {
 		let res = conn
 			.as_ref()
 			.execute(
-				r"CREATE TABLE IF NOT EXISTS transactions (
+				r"
+                        CREATE TABLE IF NOT EXISTS transactions (
         			id TEXT PRIMARY KEY,
         			message TEXT NOT NULL,
         			created_at INTEGER NOT NULL
-			)",
+        		)",
 				turso::params![],
 			)
 			.await;
@@ -325,29 +188,25 @@ impl DatabaseStructure for Database {
 			Ok(_) => println!("[DEBUG] Transactions table created or already exists"),
 			Err(e) => {
 				println!("[DEBUG] Failed to create transactions table: {}", e);
-				Database::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("SQL execution failure: `{}`", e));
+				return Err(anyhow::anyhow!("SQL execution failure 5: `{}`", e));
 			}
 		}
-
-		Database::commit_concurrent(&conn).await?;
 
 		Ok(Transaction::new(None, "Create transactions table".to_string()))
 	}
 
-	async fn metadata_database_create_database_table(db: &turso::Database, db_path: &str) -> Result<Transaction> {
-		let conn = Self::begin_concurrent(db, db_path).await?;
+	async fn metadata_database_create_database_table(conn: &cache::Connection) -> Result<Transaction> {
 		let res = conn
 			.as_ref()
 			.execute(
 				r"
-			        CREATE TABLE IF NOT EXISTS database (
+        		        CREATE TABLE IF NOT EXISTS database (
         				id TEXT PRIMARY KEY,
         				name TEXT NOT NULL,
         				created_at INTEGER NOT NULL,
-					metadata_path TEXT NOT NULL
-			        )
-			",
+        				metadata_path TEXT NOT NULL
+        		        )
+        		",
 				turso::params![],
 			)
 			.await;
@@ -355,17 +214,14 @@ impl DatabaseStructure for Database {
 		match res {
 			Ok(_) => println!("[DEBUG] Database table created or already exists"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("SQL execution failure: `{}`", e));
+				return Err(anyhow::anyhow!("SQL execution failure 6: `{}`", e));
 			}
 		}
-		Database::commit_concurrent(&conn).await?;
 
 		Ok(Transaction::new(None, "Create database table".to_string()))
 	}
 
-	async fn metadata_database_create_subjects_table(db: &turso::Database, db_path: &str) -> Result<Transaction> {
-		let conn = Self::begin_concurrent(db, db_path).await?;
+	async fn metadata_database_create_subjects_table(conn: &cache::Connection) -> Result<Transaction> {
 		let res = conn
 			.as_ref()
 			.execute(
@@ -385,23 +241,19 @@ impl DatabaseStructure for Database {
 			Ok(_) => println!("[DEBUG] Subjects table created or already exists"),
 			Err(e) => {
 				println!("[DEBUG] Failed to create subjects table: {}", e);
-				Database::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("SQL execution failure: `{}`", e));
+				return Err(anyhow::anyhow!("SQL execution failure 7: `{}`", e));
 			}
 		}
-
-		Database::commit_concurrent(&conn).await?;
 
 		Ok(Transaction::new(None, "Create subjects table".to_string()))
 	}
 
-	async fn metadata_database_create_aspects_table(db: &turso::Database, db_path: &str) -> Result<Transaction> {
-		let conn = Database::begin_concurrent(db, db_path).await?;
+	async fn metadata_database_create_aspects_table(conn: &cache::Connection) -> Result<Transaction> {
 		let res = conn
 			.as_ref()
 			.execute(
 				r"
-                        	CREATE TABLE IF NOT EXISTS aspects (
+                	CREATE TABLE IF NOT EXISTS aspects (
                         		id TEXT PRIMARY KEY,
                         		subject_id TEXT NOT NULL,
                         		database_id TEXT NOT NULL,
@@ -421,26 +273,23 @@ impl DatabaseStructure for Database {
 			Ok(_) => println!("[DEBUG] Aspects table created or already exists"),
 			Err(e) => {
 				println!("[DEBUG] Failed to create aspects table: {}", e);
-				Database::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("SQL execution failure: `{}`", e));
+				return Err(anyhow::anyhow!("SQL execution failure 8: `{}`", e));
 			}
 		}
-
-		Database::commit_concurrent(&conn).await?;
 
 		Ok(Transaction::new(None, "Create aspects table".to_string()))
 	}
 
-	async fn wireframe_metadata_database(db: &turso::Database, db_path: &str) -> Result<Vec<Transaction>> {
+	async fn wireframe_metadata_database(conn: &cache::Connection) -> Result<Vec<Transaction>> {
 		println!("[DEBUG] Connecting to database for table creation...");
 		println!("[DEBUG] Creating transactions table...");
-		let create_transactions_table_transaction = Self::metadata_database_create_transactions_table(db, db_path).await?;
+		let create_transactions_table_transaction = Self::metadata_database_create_transactions_table(conn).await?;
 		println!("[DEBUG] Creating database table...");
-		let create_database_table_transaction = Self::metadata_database_create_database_table(db, db_path).await?;
+		let create_database_table_transaction = Self::metadata_database_create_database_table(conn).await?;
 		println!("[DEBUG] Creating subjects table...");
-		let create_subjects_table_transaction = Self::metadata_database_create_subjects_table(db, db_path).await?;
+		let create_subjects_table_transaction = Self::metadata_database_create_subjects_table(conn).await?;
 		println!("[DEBUG] Creating aspects table...");
-		let create_aspects_table_transaction = Self::metadata_database_create_aspects_table(db, db_path).await?;
+		let create_aspects_table_transaction = Self::metadata_database_create_aspects_table(conn).await?;
 		println!("[DEBUG] All tables created successfully");
 
 		#[rustfmt::skip]
@@ -459,7 +308,7 @@ impl DatabaseStructure for Database {
 	/// - if folder /data/{name} already exists.
 	async fn new(name: &str) -> Result<Self> {
 		println!("[DEBUG] Creating new database: {name}");
-		let data_dir = get_data_dir();
+		let data_dir = Self::get_data_dir();
 		let db_path = format!("{data_dir}/{name}");
 		println!("[DEBUG] Database path: {db_path}");
 
@@ -481,15 +330,24 @@ impl DatabaseStructure for Database {
 		let metadata_turso_db = Self::create_turso_database(&metadata_db_path).await?;
 		println!("[DEBUG] Turso database created successfully");
 
+		let conn = Self::begin_concurrent(&metadata_turso_db, &metadata_db_path).await?;
+
 		// Create metadata tables
 		println!("[DEBUG] Creating metadata tables...");
-		let mut transactions = Self::wireframe_metadata_database(&metadata_turso_db, &metadata_db_path).await?;
+		let transactions = Self::wireframe_metadata_database(&conn).await;
+		let mut transactions = match transactions {
+			Ok(txs) => txs,
+			Err(e) => {
+				println!("[DEBUG] Failed to create metadata tables: {}", e);
+				Database::rollback_concurrent(&conn).await?;
+				return Err(anyhow::anyhow!("Failed to create metadata tables: {}", e));
+			}
+		};
 		println!("[DEBUG] Metadata tables created, {} transactions logged", transactions.len());
 
 		// Insert database metadata using concurrent-safe transaction pattern
 		println!("[DEBUG] Inserting database metadata...");
 
-		let conn = Self::begin_concurrent(&metadata_turso_db, &metadata_db_path).await?;
 		let exec_res = conn.as_ref().execute("INSERT INTO database (id, name, created_at, metadata_path) VALUES (?, ?, ?, ?)", turso::params![db_id.as_uuid().to_string(), name.to_string(), chrono::Utc::now().timestamp_millis(), metadata_db_path.clone()]).await;
 
 		match exec_res {
@@ -497,11 +355,11 @@ impl DatabaseStructure for Database {
 			Err(e) => {
 				println!("[DEBUG] Failed to insert database metadata: {}", e);
 				Database::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("SQL execution failure: `{}`", e));
+				return Err(anyhow::anyhow!("SQL execution failure 9: `{}`", e));
 			}
 		}
 
-		Database::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 
 		drop(conn);
 
@@ -514,7 +372,7 @@ impl DatabaseStructure for Database {
 		let db = Self { id: db_id, name: name.to_string(), metadata: metadata_turso_db, metadata_path: metadata_db_path };
 
 		for transaction in transactions {
-			db.log_transaction(&transaction).await?;
+			let _ = db.log_transaction(&transaction).await?;
 		}
 
 		Ok(db)
@@ -564,7 +422,7 @@ impl DatabaseStructure for Database {
 	/// - if database connection fails
 	/// - if unable to query existing tables
 	async fn existing(name: &str) -> Result<Self> {
-		let data_dir = get_data_dir();
+		let data_dir = Self::get_data_dir();
 		let db_path = format!("{data_dir}/{name}");
 
 		// Check if folder exists
@@ -607,16 +465,15 @@ impl DatabaseStructure for Database {
 				let resolution_str = Self::value_to_string(&aspect_row.get_value(3)?, "Resolution").await?;
 				let aspect_id = AspectId::from_uuid(Uuid::parse_str(&aspect_id_str)?);
 				let resolution: Resolution = serde_json::from_str(&resolution_str)?;
-                                
 
-				let aspect = Aspect::new(Some(aspect_id), aspect_name, subject_id, db_info.name().to_string(), resolution, metadata_db_path.to_string()).await?;
+				let aspect = Aspect::new(Some(aspect_id), aspect_name, subject_id, resolution, &conn).await?;
 				subject.add_aspect(aspect);
 			}
 
 			db_info.add_subject(subject);
 		}
 
-		Self::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 
 		DATABASES.lock().await.insert(db_id, db_info);
 
@@ -642,7 +499,7 @@ impl DatabaseStructure for Database {
 		}
 
 		// Also remove from connection databases
-		let db_path = format!("{}/{}/metadata.db", get_data_dir(), self.name);
+		let db_path = format!("{}/{}/metadata.db", Self::get_data_dir(), self.name);
 		{
 			let mut connection_databases = CONNECTION_DATABASES.lock().await;
 			connection_databases.remove(&db_path);
@@ -659,7 +516,7 @@ impl DatabaseStructure for Database {
 		const MAX_ATTEMPTS: u32 = 50; // 5 seconds total
 		const DELAY_MS: u64 = 100;
 
-		let db_dir = format!("{}/{}", get_data_dir(), self.name);
+		let db_dir = format!("{}/{}", <Database as Config>::get_data_dir(), self.name);
 		let metadata_db_path = format!("{db_dir}/metadata.db");
 
 		for attempt in 0..MAX_ATTEMPTS {
@@ -727,7 +584,7 @@ impl DatabaseStructure for Database {
 		}
 
 		// Create subject folder
-		let subject_path = format!("{}/{}/{}", get_data_dir(), self.name, name);
+		let subject_path = format!("{}/{}/{}", Database::get_data_dir(), self.name, name);
 		println!("[DEBUG] Creating subject folder: {subject_path}");
 		tokio::fs::create_dir_all(&subject_path).await?;
 
@@ -753,11 +610,11 @@ impl DatabaseStructure for Database {
 			Ok(_) => println!("[DEBUG] Subject inserted successfully"),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("SQL execution failure: `{}`", e));
+				return Err(anyhow::anyhow!("SQL execution failure 10: `{}`", e));
 			}
 		}
 
-		Self::commit_concurrent(&conn).await?;
+		let _ = Self::commit_concurrent(&conn).await;
 		println!("[DEBUG] Subject inserted successfully");
 
 		// Update in-memory cache so subsequent operations don't need metadata DB
@@ -779,92 +636,56 @@ impl DatabaseStructure for Database {
 		// Read-only subject lookup with busy_timeout and retry; avoid transactions to reduce lock contention
 		println!("[DEBUG] Getting subject by ID: {}", id.as_uuid());
 
-		let mut attempts = 0u32;
-		const MAX_ATTEMPTS: u32 = 40;
+		let conn = Self::begin_concurrent(&self.metadata, &self.metadata_path).await?;
+		println!("[DEBUG] Connected to metadata DB, querying for subject ID {}", id.as_uuid());
+		let res = conn.as_ref().query("SELECT id, name, database_id FROM subjects WHERE id = ?", turso::params![id.as_uuid().to_string()]).await;
 
-		loop {
-			attempts += 1;
-			let conn = match self.metadata.connect() {
-				Ok(c) => c,
-				Err(e) => {
-					let em = e.to_string().to_lowercase();
-					if attempts < MAX_ATTEMPTS && (em.contains("locked") || em.contains("busy")) {
-						tokio::time::sleep(std::time::Duration::from_millis(25 * attempts as u64)).await;
-						continue;
-					}
-					return Err(anyhow::anyhow!("Failed to connect to metadata DB in get_subject: {e}"));
+		let subject = match res {
+			Ok(mut rows) => match rows.next().await? {
+				Some(row) => {
+					println!("[DEBUG] Found subject row for ID {}", id.as_uuid());
+					let subject_id_str = Self::value_to_string(&row.get_value(0)?, "Subject ID").await?;
+					let name = Self::value_to_string(&row.get_value(1)?, "Subject name").await?;
+					let database_id_str = Self::value_to_string(&row.get_value(2)?, "Database ID").await?;
+
+					let subject_id = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str)?);
+					let database_id = DatabaseId::from_uuid(Uuid::parse_str(&database_id_str)?);
+					Subject::new(Some(subject_id), name, database_id, self.metadata_path.clone()).await?
 				}
-			};
-
-			println!("[DEBUG] Connected to metadata DB, querying for subject ID {}", id.as_uuid());
-			let _ = conn.execute("PRAGMA busy_timeout=600000", turso::params![]).await;
-
-			let query_res = conn.query("SELECT id, name, database_id FROM subjects WHERE id = ?", turso::params![id.as_uuid().to_string()]).await;
-
-			match query_res {
-				Ok(mut rows) => match rows.next().await? {
-					Some(row) => {
-						println!("[DEBUG] Found subject row for ID {}", id.as_uuid());
-						let subject_id_str = Self::value_to_string(&row.get_value(0)?, "Subject ID").await?;
-						let name = Self::value_to_string(&row.get_value(1)?, "Subject name").await?;
-						let database_id_str = Self::value_to_string(&row.get_value(2)?, "Database ID").await?;
-
-						let subject_id = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str)?);
-						let database_id = DatabaseId::from_uuid(Uuid::parse_str(&database_id_str)?);
-						return Subject::new(Some(subject_id), name, database_id, self.metadata_path.clone()).await;
-					}
-					None => {
-						println!("[DEBUG] Subject ID {} not found in database", id.as_uuid());
-						return Err(anyhow::anyhow!("Subject not found"));
-					}
-				},
-				Err(e) => {
-					let em = e.to_string().to_lowercase();
-					if attempts < MAX_ATTEMPTS && (em.contains("locked") || em.contains("busy") || em.contains("conflict")) {
-						let delay = 25u64.saturating_mul(1u64 << (attempts.min(7)));
-						tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-						continue;
-					}
-					println!("[ERROR] SQL execution failure in get_subject for ID {}: {}", id.as_uuid(), e);
-					return Err(anyhow::anyhow!("SQL execution failure in get_subject: `{}`", e));
+				None => {
+					println!("[DEBUG] Subject ID {} not found in database", id.as_uuid());
+					return Err(anyhow::anyhow!("Subject not found"));
 				}
+			},
+			Err(e) => {
+				Self::rollback_concurrent(&conn).await?;
+				return Err(anyhow::anyhow!("SQL execution failure 12: in get_subject: `{}`", e));
 			}
-		}
+		};
+
+		let _ = Self::commit_concurrent(&conn).await;
+		Ok(subject)
 	}
 
 	/// Get a subject by its name
 	async fn get_subject_by_name(&self, name: &str) -> Result<Subject> {
 		// Read-only subject lookup with busy_timeout and retry; avoid transactions to reduce lock contention
-		let mut attempts = 0u32;
-		const MAX_ATTEMPTS: u32 = 40;
-		loop {
-			attempts += 1;
-			let conn = match self.metadata.connect() {
-				Ok(c) => c,
-				Err(e) => {
-					let em = e.to_string().to_lowercase();
-					if attempts < MAX_ATTEMPTS && (em.contains("locked") || em.contains("busy") || em.contains("conflict")) {
-						let delay = 25u64.saturating_mul(1u64 << (attempts.min(7)));
-						tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-						continue;
-					}
-					return Err(anyhow::anyhow!("Failed to connect to metadata DB in get_subject_by_name: {e}"));
-				}
-			};
+		let conn = Self::begin_concurrent(&self.metadata, &self.metadata_path).await?;
+		let mut rows = conn.as_ref().query("SELECT id, name, database_id FROM subjects WHERE name = ?", turso::params![name]).await?;
+		if let Some(row) = rows.next().await? {
+			let subject_id_str = Self::value_to_string(&row.get_value(0)?, "Subject ID").await?;
+			let name = Self::value_to_string(&row.get_value(1)?, "Subject name").await?;
+			let database_id_str = Self::value_to_string(&row.get_value(2)?, "Database ID").await?;
 
-			let _ = conn.execute("PRAGMA busy_timeout=600000", turso::params![]).await;
-			let mut rows = conn.query("SELECT id, name, database_id FROM subjects WHERE name = ?", turso::params![name]).await?;
-			if let Some(row) = rows.next().await? {
-				let subject_id_str = Self::value_to_string(&row.get_value(0)?, "Subject ID").await?;
-				let name = Self::value_to_string(&row.get_value(1)?, "Subject name").await?;
-				let database_id_str = Self::value_to_string(&row.get_value(2)?, "Database ID").await?;
+			let subject_id = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str)?);
+			let database_id = DatabaseId::from_uuid(Uuid::parse_str(&database_id_str)?);
 
-				let subject_id = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str)?);
-				let database_id = DatabaseId::from_uuid(Uuid::parse_str(&database_id_str)?);
-				return Ok(Subject::new(Some(subject_id), name, database_id, self.metadata_path.clone()).await?);
-			} else {
-				return Err(anyhow::anyhow!("Subject not found"));
-			}
+			Self::commit_concurrent(&conn).await?;
+
+			return Ok(Subject::new(Some(subject_id), name, database_id, self.metadata_path.clone()).await?);
+		} else {
+			Self::rollback_concurrent(&conn).await?;
+			return Err(anyhow::anyhow!("Subject not found"));
 		}
 	}
 
@@ -882,7 +703,7 @@ impl DatabaseStructure for Database {
 		let metadata_db_path = self.metadata_path.clone();
 
 		// Delete the subject folder and all child files and folders
-		let subject_path = format!("{}/{}/{}", get_data_dir(), self.name, subject.name());
+		let subject_path = format!("{}/{}/{}", Self::get_data_dir(), self.name, subject.name());
 		tokio::fs::remove_dir_all(&subject_path).await?;
 
 		// Remove subject from database metadata
@@ -894,10 +715,10 @@ impl DatabaseStructure for Database {
 			Ok(_) => println!("Deleted subject with ID {}", id.as_uuid()),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("SQL execution failure: `{}`", e));
+				return Err(anyhow::anyhow!("SQL execution failure 13: `{}`", e));
 			}
 		}
-		Self::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 
 		// Log the transaction
 		self.record_transaction(&format!("Removed subject '{}'", subject.name())).await?;
@@ -913,11 +734,11 @@ impl DatabaseStructure for Database {
 			Ok(rows) => rows,
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("SQL execution failure: `{}`", e));
+				return Err(anyhow::anyhow!("SQL execution failure 14: `{}`", e));
 			}
 		};
 
-		Self::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 
 		let mut raw_rows: Vec<(String, String, String)> = Vec::new();
 		while let Some(row) = rows.next().await? {
@@ -939,53 +760,35 @@ impl DatabaseStructure for Database {
 
 	/// List all tracked aspects of a subject
 	async fn list_aspects(&self, subject_id: SubjectId) -> Result<Vec<Aspect>> {
-		let mut attempts = 0u32;
-		const MAX_ATTEMPTS: u32 = 40;
-		loop {
-			attempts += 1;
-			let conn = match self.metadata.connect() {
-				Ok(c) => c,
-				Err(e) => {
-					if attempts < MAX_ATTEMPTS && e.to_string().to_lowercase().contains("locked") {
-						tokio::time::sleep(std::time::Duration::from_millis(25 * attempts as u64)).await;
-						continue;
-					}
-					return Err(anyhow::anyhow!("Failed to connect to metadata DB in list_aspects: {e}"));
-				}
-			};
+		let conn = Self::begin_concurrent(&self.metadata, &self.metadata_path).await?;
+		let result = conn.as_ref().query("SELECT id, name, subject_id, resolution FROM aspects WHERE subject_id = ?", turso::params![subject_id.as_uuid().to_string()]).await;
 
-			let _ = conn.execute("PRAGMA busy_timeout=600000", turso::params![]).await;
-			let result = conn.query("SELECT id, name, subject_id, resolution FROM aspects WHERE subject_id = ?", turso::params![subject_id.as_uuid().to_string()]).await;
-
-			match result {
-				Ok(mut rows) => {
-					let mut raw_rows: Vec<(String, String, String, String)> = Vec::new();
-					while let Some(row) = rows.next().await? {
-						let aspect_id_str = Self::value_to_string(&row.get_value(0)?, "Aspect ID").await?;
-						let name = Self::value_to_string(&row.get_value(1)?, "Aspect name").await?;
-						let subject_id_str = Self::value_to_string(&row.get_value(2)?, "Subject ID").await?;
-						let resolution_str = Self::value_to_string(&row.get_value(3)?, "Resolution").await?;
-						raw_rows.push((aspect_id_str, name, subject_id_str, resolution_str));
-					}
-
-					let mut aspects = Vec::new();
-					for (aspect_id_str, name, subject_id_str, resolution_str) in raw_rows {
-						let aspect_id = AspectId::from_uuid(Uuid::parse_str(&aspect_id_str)?);
-						let subject_id_parsed = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str)?);
-						let resolution: Resolution = serde_json::from_str(&resolution_str)?;
-						aspects.push(Aspect::from_metadata(Some(aspect_id), name, subject_id_parsed, resolution, self.metadata_path.clone(), None).await?);
-					}
-					return Ok(aspects);
+		match result {
+			Ok(mut rows) => {
+				let mut raw_rows: Vec<(String, String, String, String)> = Vec::new();
+				while let Some(row) = rows.next().await? {
+					let aspect_id_str = Self::value_to_string(&row.get_value(0)?, "Aspect ID").await?;
+					let name = Self::value_to_string(&row.get_value(1)?, "Aspect name").await?;
+					let subject_id_str = Self::value_to_string(&row.get_value(2)?, "Subject ID").await?;
+					let resolution_str = Self::value_to_string(&row.get_value(3)?, "Resolution").await?;
+					raw_rows.push((aspect_id_str, name, subject_id_str, resolution_str));
 				}
-				Err(e) => {
-					let em = e.to_string().to_lowercase();
-					if attempts < MAX_ATTEMPTS && (em.contains("locked") || em.contains("busy") || em.contains("conflict")) {
-						let delay = 25u64.saturating_mul(1u64 << (attempts.min(7)));
-						tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-						continue;
-					}
-					return Err(anyhow::anyhow!("SQL execution failure in list_aspects: `{}`", e));
+
+				let mut aspects = Vec::new();
+				for (aspect_id_str, name, subject_id_str, resolution_str) in raw_rows {
+					let aspect_id = AspectId::from_uuid(Uuid::parse_str(&aspect_id_str)?);
+					let subject_id_parsed = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str)?);
+					let resolution: Resolution = serde_json::from_str(&resolution_str)?;
+					aspects.push(Aspect::from_metadata(Some(aspect_id), name, subject_id_parsed, resolution, self.metadata_path.clone(), None).await?);
 				}
+
+				let _ = Self::commit_concurrent(&conn).await;
+
+				return Ok(aspects);
+			}
+			Err(e) => {
+				Self::rollback_concurrent(&conn).await?;
+				return Err(anyhow::anyhow!("SQL execution failure 15: in list_aspects: `{}`", e));
 			}
 		}
 	}
@@ -1012,7 +815,7 @@ impl DatabaseStructure for Database {
 		}
 
 		// Create a new aspect folder
-		let aspect_path = format!("{}/{}/{}/{}", get_data_dir(), self.name, subject.name(), name);
+		let aspect_path = format!("{}/{}/{}/{}", Self::get_data_dir(), self.name, subject.name(), name);
 		println!("[DEBUG] Creating aspect folder: {aspect_path}");
 		tokio::fs::create_dir_all(&aspect_path).await?;
 
@@ -1041,17 +844,15 @@ impl DatabaseStructure for Database {
 		// Execute the INSERT while holding the mutex
 		conn.as_ref().execute("INSERT INTO aspects (id, name, subject_id, database_id, table_name, resolution, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", turso::params![aspect_id_str.clone(), name_str.clone(), subj_id_str.clone(), db_id_str.clone(), table_name.clone(), resolution_json.clone(), created_at]).await?;
 
-		Self::commit_concurrent(&conn).await?;
-
-		drop(conn); // Explicitly drop the connection to release locks
-
 		println!("[DEBUG] Aspect inserted successfully");
 
 		// At this point the metadata INSERT succeeded and we've dropped the metadata connection.
 		// Release the aspect creation mutex (it was locked above) implicitly by letting the
 		// earlier guard drop (we only held it across the insertion). Now perform the
 		// heavier wireframing without holding the metadata lock.
-		let aspect = Aspect::new(Some(aspect_id), name.to_string(), subject_id, self.name.clone(), resolution, self.metadata_path.clone()).await?;
+		let aspect = Aspect::new(Some(aspect_id), name.to_string(), subject_id, resolution, &conn).await?;
+
+		let _ = Database::commit_concurrent(&conn).await;
 
 		// Update in-memory cache with the newly created aspect to avoid future metadata reads
 		{
@@ -1078,123 +879,80 @@ impl DatabaseStructure for Database {
 	}
 
 	async fn get_aspect(&self, id: AspectId) -> Result<Aspect> {
-		// Fast path: try in-memory cache first to avoid touching metadata DB during heavy writes
-		if let Some(cached) = {
-			let dbs = DATABASES.lock().await;
-			dbs.get(&self.id).and_then(|info| info.subjects().values().find_map(|s| s.aspects().get(&id).cloned()))
-		} {
-			return Ok(cached);
-		}
+		let conn = Self::begin_concurrent(&self.metadata, &self.metadata_path).await?;
 
-		// Use a simple, short-lived connection for metadata reads to avoid shared-connection contention
-		let mut attempts = 0u32;
-		const MAX_ATTEMPTS: u32 = 40; // allow ample time while large batch setup finishes
+		// No explicit transaction for a read-only, single-row query; add retry on transient locks
+		let res = conn
+			.as_ref()
+			.query(
+				"SELECT a.id, a.name, a.subject_id, a.resolution, s.name AS subject_name \
+			        FROM aspects a JOIN subjects s ON s.id = a.subject_id \
+			        WHERE a.id = ?",
+				turso::params![id.as_uuid().to_string()],
+			)
+			.await;
 
-		loop {
-			attempts += 1;
-			let conn = match self.metadata.connect() {
-				Ok(c) => c,
-				Err(e) => {
-					if attempts < MAX_ATTEMPTS && e.to_string().to_lowercase().contains("locked") {
-						tokio::time::sleep(std::time::Duration::from_millis(25 * attempts as u64)).await;
-						continue;
-					}
-					return Err(anyhow::anyhow!("Failed to connect to metadata DB: {e}"));
-				}
-			};
+		let aspect = match res {
+			Ok(mut rows) => {
+				if let Some(row) = rows.next().await? {
+					let aspect_id_str = Self::value_to_string(&row.get_value(0)?, "Aspect ID").await?;
+					let name = Self::value_to_string(&row.get_value(1)?, "Aspect name").await?;
+					let subject_id_str = Self::value_to_string(&row.get_value(2)?, "Subject ID").await?;
+					let resolution_str = Self::value_to_string(&row.get_value(3)?, "Resolution").await?;
+					let aspect_id = AspectId::from_uuid(Uuid::parse_str(&aspect_id_str)?);
+					let subject_id = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str)?);
+					let resolution: Resolution = serde_json::from_str(&resolution_str)?;
 
-			// Ensure this connection waits on locks instead of failing immediately
-			let _ = conn.execute("PRAGMA busy_timeout=600000", turso::params![]).await; // 10 minutes
-
-			// No explicit transaction for a read-only, single-row query; add retry on transient locks
-			let query_res = conn
-				.query(
-					"SELECT a.id, a.name, a.subject_id, a.resolution, s.name AS subject_name \
-					 FROM aspects a JOIN subjects s ON s.id = a.subject_id \
-					 WHERE a.id = ?",
-					turso::params![id.as_uuid().to_string()],
-				)
-				.await;
-
-			match query_res {
-				Ok(mut rows) => {
-					if let Some(row) = rows.next().await? {
-						let aspect_id_str = Self::value_to_string(&row.get_value(0)?, "Aspect ID").await?;
-						let name = Self::value_to_string(&row.get_value(1)?, "Aspect name").await?;
-						let subject_id_str = Self::value_to_string(&row.get_value(2)?, "Subject ID").await?;
-						let resolution_str = Self::value_to_string(&row.get_value(3)?, "Resolution").await?;
-						let aspect_id = AspectId::from_uuid(Uuid::parse_str(&aspect_id_str)?);
-						let subject_id = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str)?);
-						let resolution: Resolution = serde_json::from_str(&resolution_str)?;
-
-						return Aspect::new(Some(aspect_id), name, subject_id, self.name.clone(), resolution, self.metadata_path.clone()).await;
-					} else {
-						bail!("Aspect not found");
-					}
-				}
-				Err(e) => {
-					let em = e.to_string().to_lowercase();
-					if attempts < MAX_ATTEMPTS && (em.contains("locked") || em.contains("busy") || em.contains("conflict")) {
-						// exponential backoff up to ~2s
-						let delay = 25u64.saturating_mul(1u64 << (attempts.min(7)));
-						tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-						continue;
-					}
-					return Err(anyhow::anyhow!("SQL execution failure in get_aspect: `{}`", e));
+					Aspect::new(Some(aspect_id), name, subject_id, resolution, &conn).await?
+				} else {
+					bail!("Aspect not found");
 				}
 			}
-		}
+			Err(e) => {
+				Self::rollback_concurrent(&conn).await?;
+				return Err(anyhow::anyhow!("SQL execution failure 16: in get_aspect: `{}`", e));
+			}
+		};
+		let _ = Self::commit_concurrent(&conn).await;
+		Ok(aspect)
 	}
 
 	async fn get_aspect_by_name(&self, name: &str) -> Result<Aspect> {
-		// Use a simple, short-lived connection for metadata reads to avoid shared-connection contention
-		let mut attempts = 0u32;
-		const MAX_ATTEMPTS: u32 = 40; // allow ample time while large batch setup finishes
+		let conn = Self::begin_concurrent(&self.metadata, &self.metadata_path).await?;
+		let query_res = conn
+			.as_ref()
+			.query(
+				"SELECT a.id, a.name, a.subject_id, a.resolution, s.name AS subject_name \
+				FROM aspects a JOIN subjects s ON s.id = a.subject_id \
+				WHERE a.name = ?",
+				turso::params![name],
+			)
+			.await;
 
-		loop {
-			attempts += 1;
-			let conn = Self::begin_concurrent(&self.metadata, &self.metadata_path).await?;
+		let aspect = match query_res {
+			Ok(mut rows) => {
+				if let Some(row) = rows.next().await? {
+					let aspect_id_str = Self::value_to_string(&row.get_value(0)?, "Aspect ID").await?;
+					let name = Self::value_to_string(&row.get_value(1)?, "Aspect name").await?;
+					let subject_id_str = Self::value_to_string(&row.get_value(2)?, "Subject ID").await?;
+					let resolution_str = Self::value_to_string(&row.get_value(3)?, "Resolution").await?;
 
-			// Ensure this connection waits on locks instead of failing immediately
-			let _ = conn.as_ref().execute("PRAGMA busy_timeout=600000", turso::params![]).await;
+					let aspect_id = AspectId::from_uuid(Uuid::parse_str(&aspect_id_str)?);
+					let subject_id = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str)?);
+					let resolution: Resolution = serde_json::from_str(&resolution_str)?;
 
-
-			let query_res = conn.as_ref().query(
-					"SELECT a.id, a.name, a.subject_id, a.resolution, s.name AS subject_name \
-					 FROM aspects a JOIN subjects s ON s.id = a.subject_id \
-					 WHERE a.name = ?",
-					turso::params![name],
-				)
-				.await;
-
-			match query_res {
-				Ok(mut rows) => {
-					if let Some(row) = rows.next().await? {
-						let aspect_id_str = Self::value_to_string(&row.get_value(0)?, "Aspect ID").await?;
-						let name = Self::value_to_string(&row.get_value(1)?, "Aspect name").await?;
-						let subject_id_str = Self::value_to_string(&row.get_value(2)?, "Subject ID").await?;
-						let resolution_str = Self::value_to_string(&row.get_value(3)?, "Resolution").await?;
-
-						let aspect_id = AspectId::from_uuid(Uuid::parse_str(&aspect_id_str)?);
-						let subject_id = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str)?);
-						let resolution: Resolution = serde_json::from_str(&resolution_str)?;
-
-						return Aspect::new(Some(aspect_id), name, subject_id, self.name.clone(), resolution, self.metadata_path.clone()).await;
-					} else {
-						bail!("Aspect not found");
-					}
-				}
-				Err(e) => {
-					let em = e.to_string().to_lowercase();
-					if attempts < MAX_ATTEMPTS && (em.contains("locked") || em.contains("busy") || em.contains("conflict")) {
-						let delay = 25u64.saturating_mul(1u64 << (attempts.min(7)));
-						tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-						continue;
-					}
-					return Err(anyhow::anyhow!("SQL execution failure in get_aspect_by_name: `{}`", e));
+					Aspect::new(Some(aspect_id), name, subject_id, resolution, &conn).await?
+				} else {
+					bail!("Aspect not found");
 				}
 			}
-		}
+			Err(e) => {
+				Self::rollback_concurrent(&conn).await?;
+				return Err(anyhow::anyhow!("SQL execution failure in 17: get_aspect_by_name: `{}`", e));
+			}
+		};
+		let _ = Self::commit_concurrent(&conn).await;
+		Ok(aspect)
 	}
 
 	async fn get_earliest_measurement(&self, aspect_id: &AspectId) -> Result<Option<DateTime<Utc>>> {
@@ -1218,11 +976,11 @@ impl DatabaseStructure for Database {
 			}
 			Err(e) => {
 				let _ = Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("SQL execution failure in get_earliest_measurement: `{}`", e));
+				return Err(anyhow::anyhow!("SQL execution failure 18: in get_earliest_measurement: `{}`", e));
 			}
 		};
 
-		Self::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 		Ok(Some(timestamp))
 	}
 
@@ -1234,7 +992,7 @@ impl DatabaseStructure for Database {
 		match res {
 			Ok(mut rows) => {
 				if let Some(row) = rows.next().await? {
-					Self::commit_concurrent(&conn).await?;
+					let _ = Database::commit_concurrent(&conn).await;
 					let timestamp_str = Self::value_to_string(&row.get_value(0)?, "Latest Measurement Timestamp").await?;
 					if timestamp_str.is_empty() {
 						return Ok(None);
@@ -1246,7 +1004,7 @@ impl DatabaseStructure for Database {
 			}
 			Err(e) => {
 				let _ = Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("SQL execution failure in get_latest_measurement: `{}`", e));
+				return Err(anyhow::anyhow!("SQL execution failure 19: in get_latest_measurement: `{}`", e));
 			}
 		}
 	}
@@ -1267,10 +1025,10 @@ impl DatabaseStructure for Database {
 			Ok(_) => println!("Updated aspect timestamps for aspect {}", aspect_id),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("SQL execution failure: `{}`", e));
+				return Err(anyhow::anyhow!("SQL execution failure 20: `{}`", e));
 			}
 		}
-		Self::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 		Ok(())
 	}
 }
@@ -1421,22 +1179,22 @@ impl DatabaseInfo {
 						if let Some(row) = rows.next().await? {
 							let timestamp_str = Database::value_to_string(&row.get_value(0)?, "Creation Timestamp").await?;
 							if timestamp_str.is_empty() {
-								Database::commit_concurrent(&conn).await?;
+								let _ = Database::commit_concurrent(&conn).await;
 								return Ok(None);
 							}
 							DateTime::parse_from_rfc3339(&timestamp_str)?.with_timezone(&Utc)
 						} else {
-							Database::commit_concurrent(&conn).await?;
+							let _ = Database::commit_concurrent(&conn).await;
 							return Ok(None);
 						}
 					}
 					Err(e) => {
 						Database::rollback_concurrent(&conn).await?;
-						return Err(anyhow::anyhow!("SQL execution failure in get_creation_time: `{}`", e));
+						return Err(anyhow::anyhow!("SQL execution failure 21: in get_creation_time: `{}`", e));
 					}
 				};
 
-				Database::commit_concurrent(&conn).await?;
+				let _ = Database::commit_concurrent(&conn).await;
 				return Ok(Some(timestamp));
 			}
 		}
@@ -1471,7 +1229,7 @@ impl DatabaseInfo {
 			}
 			Err(e) => {
 				Database::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("SQL execution failure in get_size_stats: `{}`", e));
+				return Err(anyhow::anyhow!("SQL execution failure 22: in get_size_stats: `{}`", e));
 			}
 		}
 
@@ -1486,11 +1244,11 @@ impl DatabaseInfo {
 			}
 			Err(e) => {
 				Database::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("SQL execution failure in get_size_stats: `{}`", e));
+				return Err(anyhow::anyhow!(" 13: in get_size_stats: `{}`", e));
 			}
 		}
 
-		Database::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 		Ok(stats)
 	}
 

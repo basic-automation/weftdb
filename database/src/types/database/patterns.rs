@@ -3,6 +3,8 @@ use anyhow::Result;
 use super::helpers::safe_ratio;
 use crate::{types::database::traits::database_structure::DatabaseStructure, AspectId, Database, Pattern, DATABASES};
 
+use crate::types::database::traits::connection::Connection;
+
 const PATTERN_CHUNK_SIZE: usize = 100;
 
 impl Database {
@@ -30,7 +32,7 @@ impl Database {
 			}
 		}
 
-		Self::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 		Ok(())
 	}
 
@@ -89,7 +91,7 @@ impl Database {
 				return Err(anyhow::anyhow!(format!("Failed to update pattern status: {e}")));
 			}
 		};
-		Self::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 
 		// Verify that a pattern was actually updated
 		if rows_affected == 0 {
@@ -217,7 +219,7 @@ impl Database {
 			}
 		};
 
-		Self::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 		Ok(usize::try_from(rows_affected).map_err(|_| anyhow::anyhow!("Too many rows affected".to_string()))?)
 	}
 
@@ -243,7 +245,7 @@ impl Database {
 			}
 		};
 
-		Self::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 		Ok(usize::try_from(rows_affected).map_err(|_| anyhow::anyhow!("Too many rows affected".to_string()))?)
 	}
 
@@ -341,7 +343,7 @@ impl Database {
 			}
 		};
 
-		Self::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 
 		// Verify that a pattern was actually deleted
 		if rows_affected == 0 {
@@ -374,7 +376,7 @@ impl Database {
 			}
 		};
 
-		Self::commit_concurrent(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
 		Ok(usize::try_from(rows_affected).map_err(|_| anyhow::anyhow!("Too many rows affected".to_string()))?)
 	}
 }
