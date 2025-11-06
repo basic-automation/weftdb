@@ -7,9 +7,10 @@ use turso::Database as TursoDatabase;
 use uuid::Uuid;
 
 use crate::{
-	cache::Connection, types::database::{traits::aspect_structure::AspectStructure, Config}, Database, DatabaseStructure, SubjectId
+	cache::Connection, types::database::{
+		traits::{aspect_structure::AspectStructure, connection::Connection as ConnectionTrait}, Config
+	}, Database, DatabaseStructure, SubjectId
 };
-use crate::types::database::traits::connection::Connection as ConnectionTrait;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AspectId(Uuid);
@@ -51,7 +52,7 @@ pub struct Aspect {
 	resolution: Resolution,
 	database_metadata_db_path: String,
 	subject_name: String,
-	aspect_path: String,
+	path: String,
 
 	#[serde(skip)]
 	measurements: Option<TursoDatabase>,
@@ -83,7 +84,7 @@ impl AspectStructure for Aspect {
 	async fn new(id: Option<AspectId>, name: String, subject_id: SubjectId, resolution: Resolution, metadata_conn: &Connection) -> Result<Self> {
 		let id = id.unwrap_or_default();
 		let subject_name = Self::get_subject_name(metadata_conn, subject_id).await?;
-		let db_name = <Database as Config>::db_name(&metadata_conn).await?;
+		let db_name = <Database as Config>::db_name(metadata_conn).await?;
 		let database_metadata_db_path = Database::db_metadata_path(metadata_conn).await?;
 		let aspect_path = Database::aspect_path(&db_name, &subject_name, &name);
 
@@ -96,7 +97,7 @@ impl AspectStructure for Aspect {
 		println!("[TRACE] Creating measurements DB at: {measurements_path}");
 		let measurements = Database::get_or_create_turso_database(&measurements_path).await?;
 		println!("[TRACE] Connected measurements DB: {measurements_path}");
-		let conn = Database::begin_concurrent(&measurements, &measurements_path).await?;
+		let conn = Database::begin_concurrent(&measurements, &measurements_path, None).await?;
 		println!("[TRACE] Wireframing measurements tables for: {measurements_path}");
 		Self::wireframe_measurements_tables(&conn).await?;
 		let _ = Database::commit_concurrent(&conn).await;
@@ -107,7 +108,7 @@ impl AspectStructure for Aspect {
 		println!("[TRACE] Creating unprocessed_batches DB at: {unprocessed_batches_path}");
 		let unprocessed_batches = Database::get_or_create_turso_database(&unprocessed_batches_path).await?;
 		println!("[TRACE] Connected unprocessed_batches DB: {unprocessed_batches_path}");
-		let conn = Database::begin_concurrent(&unprocessed_batches, &unprocessed_batches_path).await?;
+		let conn = Database::begin_concurrent(&unprocessed_batches, &unprocessed_batches_path, None).await?;
 		println!("[TRACE] Wireframing batches tables for: {unprocessed_batches_path}");
 		Self::wireframe_batches_tables(&conn).await?;
 		println!("[TRACE] Wireframed batches tables for: {unprocessed_batches_path}");
@@ -118,7 +119,7 @@ impl AspectStructure for Aspect {
 		println!("[TRACE] Creating processed_batches DB at: {processed_batches_path}");
 		let processed_batches = Database::get_or_create_turso_database(&processed_batches_path).await?;
 		println!("[TRACE] Connected processed_batches DB: {processed_batches_path}");
-		let conn = Database::begin_concurrent(&processed_batches, &processed_batches_path).await?;
+		let conn = Database::begin_concurrent(&processed_batches, &processed_batches_path, None).await?;
 		println!("[TRACE] Wireframing batches tables for: {processed_batches_path}");
 		Self::wireframe_batches_tables(&conn).await?;
 		println!("[TRACE] Wireframed batches tables for: {processed_batches_path}");
@@ -129,7 +130,7 @@ impl AspectStructure for Aspect {
 		println!("[TRACE] Creating patterns DB at: {patterns_path}");
 		let patterns = Database::get_or_create_turso_database(&patterns_path).await?;
 		println!("[TRACE] Connected patterns DB: {patterns_path}");
-		let conn = Database::begin_concurrent(&patterns, &patterns_path).await?;
+		let conn = Database::begin_concurrent(&patterns, &patterns_path, None).await?;
 		println!("[TRACE] Wireframing patterns tables for: {patterns_path}");
 		Self::wireframe_patterns_tables(&conn).await?;
 		println!("[TRACE] Wireframed patterns tables for: {patterns_path}");
@@ -140,7 +141,7 @@ impl AspectStructure for Aspect {
 		println!("[TRACE] Creating events DB at: {events_path}");
 		let events = Database::get_or_create_turso_database(&events_path).await?;
 		println!("[TRACE] Connected events DB: {events_path}");
-		let conn = Database::begin_concurrent(&events, &events_path).await?;
+		let conn = Database::begin_concurrent(&events, &events_path, None).await?;
 		println!("[TRACE] Wireframing events tables for: {events_path}");
 		Self::wireframe_events_tables(&conn).await?;
 		println!("[TRACE] Wireframed events tables for: {events_path}");
@@ -151,7 +152,7 @@ impl AspectStructure for Aspect {
 		println!("[TRACE] Creating correlations DB at: {correlations_path}");
 		let correlations = Database::get_or_create_turso_database(&correlations_path).await?;
 		println!("[TRACE] Connected correlations DB: {correlations_path}");
-		let conn = Database::begin_concurrent(&correlations, &correlations_path).await?;
+		let conn = Database::begin_concurrent(&correlations, &correlations_path, None).await?;
 		println!("[TRACE] Wireframing correlations tables for: {correlations_path}");
 		Self::wireframe_correlations_tables(&conn).await?;
 		println!("[TRACE] Wireframed correlations tables for: {correlations_path}");
@@ -170,7 +171,7 @@ impl AspectStructure for Aspect {
 			resolution,
 			database_metadata_db_path,
 			subject_name,
-			aspect_path,
+			path: aspect_path,
 			measurements,
 			measurements_path,
 			unprocessed_batches,
@@ -195,7 +196,7 @@ impl AspectStructure for Aspect {
 			sn
 		} else {
 			let database_metadata_db = Database::get_turso_database(&database_metadata_db_path).await?;
-			let conn = Database::begin_concurrent(&database_metadata_db, &database_metadata_db_path).await?;
+			let conn = Database::begin_concurrent(&database_metadata_db, &database_metadata_db_path, None).await?;
 			let s = Self::get_subject_name(&conn, subject_id).await?;
 			let _ = Database::commit_concurrent(&conn).await;
 			s
@@ -213,7 +214,7 @@ impl AspectStructure for Aspect {
 		let events_path = aspect_path_str.clone() + "/events.db";
 		let correlations_path = aspect_path_str.clone() + "/correlations.db";
 
-		Ok(Self { id: id.unwrap_or_default(), name, subject_id, resolution, database_metadata_db_path, subject_name: provided_subject_name, aspect_path: aspect_path_str, measurements: None, unprocessed_batches: None, processed_batches: None, patterns: None, events: None, correlations: None, measurements_path, unprocessed_batches_path, processed_batches_path, patterns_path, events_path, correlations_path })
+		Ok(Self { id: id.unwrap_or_default(), name, subject_id, resolution, database_metadata_db_path, subject_name: provided_subject_name, path: aspect_path_str, measurements: None, unprocessed_batches: None, processed_batches: None, patterns: None, events: None, correlations: None, measurements_path, unprocessed_batches_path, processed_batches_path, patterns_path, events_path, correlations_path })
 	}
 
 	fn id(&self) -> AspectId {
@@ -237,7 +238,7 @@ impl AspectStructure for Aspect {
 	}
 
 	fn aspect_path(&self) -> &str {
-		&self.aspect_path
+		&self.path
 	}
 
 	async fn database_metadata(&self) -> Result<TursoDatabase> {
@@ -272,7 +273,7 @@ impl AspectStructure for Aspect {
 	}
 
 	async fn get_aspect_path(conn: &Connection, metadata_path: &str, subject_id: SubjectId, aspect_name: String) -> Result<String> {
-		let subject_name = Self::get_subject_name(&conn, subject_id).await?;
+		let subject_name = Self::get_subject_name(conn, subject_id).await?;
 		let aspect_metadata_path = std::path::Path::new(&metadata_path).parent().ok_or_else(|| anyhow::anyhow!("Cannot determine database directory"))?.join(subject_name).join(aspect_name);
 		if aspect_metadata_path.exists() {
 			Ok(aspect_metadata_path.to_string_lossy().to_string())
@@ -282,7 +283,7 @@ impl AspectStructure for Aspect {
 	}
 
 	async fn measurements(&mut self) -> Result<TursoDatabase> {
-		self.measurements.as_ref().cloned().ok_or_else(|| anyhow::anyhow!("Measurements database is not initialized"))
+		self.measurements.clone().ok_or_else(|| anyhow::anyhow!("Measurements database is not initialized"))
 	}
 
 	fn set_measurements(&mut self, turso_db: TursoDatabase) {
@@ -317,7 +318,7 @@ impl AspectStructure for Aspect {
 	}
 
 	async fn unprocessed_batches(&mut self) -> Result<TursoDatabase> {
-		self.unprocessed_batches.as_ref().cloned().ok_or_else(|| anyhow::anyhow!("Unprocessed batches database is not initialized"))
+		self.unprocessed_batches.clone().ok_or_else(|| anyhow::anyhow!("Unprocessed batches database is not initialized"))
 	}
 
 	fn set_unprocessed_batches(&mut self, turso_db: TursoDatabase) {
@@ -362,7 +363,7 @@ impl AspectStructure for Aspect {
 		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_batches_created_at ON batches(created_at)", turso::params![]).await?;
 		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_batches_hash ON batches(batch_hash) WHERE batch_hash IS NOT NULL", turso::params![]).await?;
 
-		let _ = Database::commit_concurrent(&conn).await;
+		let _ = Database::commit_concurrent(conn).await;
 
 		Ok(())
 	}
@@ -372,7 +373,7 @@ impl AspectStructure for Aspect {
 	}
 
 	async fn processed_batches(&mut self) -> Result<TursoDatabase> {
-		self.processed_batches.as_ref().cloned().ok_or_else(|| anyhow::anyhow!("Processed batches database is not initialized"))
+		self.processed_batches.clone().ok_or_else(|| anyhow::anyhow!("Processed batches database is not initialized"))
 	}
 
 	fn set_processed_batches(&mut self, turso_db: TursoDatabase) {
@@ -388,7 +389,7 @@ impl AspectStructure for Aspect {
 	}
 
 	async fn patterns(&mut self) -> Result<TursoDatabase> {
-		self.patterns.as_ref().cloned().ok_or_else(|| anyhow::anyhow!("Patterns database is not initialized"))
+		self.patterns.clone().ok_or_else(|| anyhow::anyhow!("Patterns database is not initialized"))
 	}
 
 	fn set_patterns(&mut self, turso_db: TursoDatabase) {
@@ -478,7 +479,7 @@ impl AspectStructure for Aspect {
 	}
 
 	async fn events(&mut self) -> Result<TursoDatabase> {
-		self.events.as_ref().cloned().ok_or_else(|| anyhow::anyhow!("Events database is not initialized"))
+		self.events.clone().ok_or_else(|| anyhow::anyhow!("Events database is not initialized"))
 	}
 
 	fn set_events(&mut self, turso_db: TursoDatabase) {
@@ -537,7 +538,7 @@ impl AspectStructure for Aspect {
 	}
 
 	async fn correlations(&mut self) -> Result<TursoDatabase> {
-		self.correlations.as_ref().cloned().ok_or_else(|| anyhow::anyhow!("Correlations database is not initialized"))
+		self.correlations.clone().ok_or_else(|| anyhow::anyhow!("Correlations database is not initialized"))
 	}
 
 	fn set_correlations(&mut self, turso_db: TursoDatabase) {

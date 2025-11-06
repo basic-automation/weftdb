@@ -1,20 +1,21 @@
-use super::Database;
+use std::sync::Arc;
 
 use anyhow::Result;
+use tokio::sync::Mutex;
 
+use super::Database;
 pub use crate::types::database::traits::config::Config;
-use crate::CACHE;
-use crate::database::traits::Connection;
-use crate::cache;
-
+use crate::{cache, database::traits::Connection, DatabaseCache};
 
 #[async_trait::async_trait]
 impl Connection for Database {
 	/// Get a cached database connection with MVCC concurrent transaction support
 	/// Returns a cached connection if available, otherwise creates a new one
-	async fn begin_concurrent(turso_db: &turso::Database, cache_key: &str) -> Result<cache::Connection> {
+	async fn begin_concurrent(turso_db: &turso::Database, cache_key: &str, cache: Option<Arc<Mutex<DatabaseCache>>>) -> Result<cache::Connection> {
+		let cache = cache.map_or_else(|| Arc::new(Mutex::new(DatabaseCache::default())), |c| c);
+
 		// Try to get cached connection first
-		if let Some(cached_conn) = CACHE.get_connection(cache_key).await {
+		if let Some(cached_conn) = cache.lock().await.get::<cache::Connection>(cache_key).await {
 			return Ok(cached_conn);
 		}
 
@@ -38,7 +39,7 @@ impl Connection for Database {
 
 		// Wrap in our Connection type and cache it
 		let cached_conn = cache::Connection::new(conn);
-		CACHE.store_connection(cache_key, cached_conn.clone()).await;
+	        cache.lock().await.store::<cache::Connection>(cache_key, cached_conn.clone()).await;
 
 		Ok(cached_conn)
 	}

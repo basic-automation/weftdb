@@ -7,10 +7,9 @@ use anyhow::Result;
 use bigdecimal::{BigDecimal, FromPrimitive, Zero};
 use chrono::Datelike;
 use database::{
-	database::{
-	        traits::{AspectStructure, DatabaseStructure, Outputs}
-	}, AspectId, BatchId, Database, DictionaryId, Resolution
+	database::traits::{AspectStructure, DatabaseStructure, Outputs}, AspectId, BatchId, Database, DictionaryId, Resolution
 };
+
 use futures::StreamExt;
 use rayon::prelude::*;
 use splimes::Spline;
@@ -787,10 +786,11 @@ mod tests {
 	use batch_utils::*;
 	use bigdecimal::{BigDecimal, FromPrimitive};
 	use chrono::{TimeZone, Utc};
-	use database::{AspectId, Database, DatasetId, InputMeasurement, Resolution};
+	use database::{AspectId, Database, DatasetId, InputMeasurement, Resolution, DEFAULT_DATA_DIR};
 	use serde_json::json;
 	use serial_test::serial;
 	use splimes::Spline;
+
 
 	use super::*;
 
@@ -1142,7 +1142,7 @@ mod tests {
 	async fn fake_database() -> Database {
 		// Cleanup existing test database if it exists
 		use std::fs::remove_dir_all;
-		let db_path = format!("{}/TestDB", DEFAULT_DATA_DIR);
+		let db_path = format!("{DEFAULT_DATA_DIR}/TestDB");
 		remove_dir_all(&db_path).ok();
 
 		let db = Database::new("TestDB").await.unwrap();
@@ -1245,7 +1245,7 @@ mod tests {
 			return Ok(());
 		}
 
-		let db_path = format!("{}/test_bath_processing", DEFAULT_DATA_DIR);
+		let db_path = format!("{DEFAULT_DATA_DIR}/test_bath_processing");
 		remove_dir_all(&db_path).ok();
 
 		let db = Database::new("test_bath_processing").await.unwrap();
@@ -1310,7 +1310,7 @@ mod tests {
 			return Ok(());
 		}
 
-		let db_path = format!("{}/test_specific_process_batch", DEFAULT_DATA_DIR);
+		let db_path = format!("{DEFAULT_DATA_DIR}/test_specific_process_batch");
 		remove_dir_all(&db_path).ok();
 
 		let db = Database::new("test_specific_process_batch").await.unwrap();

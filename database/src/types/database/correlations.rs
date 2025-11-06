@@ -1,9 +1,9 @@
 use anyhow::{bail, Result};
 use uuid::Uuid;
 
-use crate::{database::traits::AspectStructure, types::database::traits::database_structure::DatabaseStructure, AspectId, Correlation, CorrelationID, Database};
-
-use crate::types::database::traits::connection::Connection;
+use crate::{
+	database::traits::AspectStructure, types::database::traits::{connection::Connection, database_structure::DatabaseStructure}, AspectId, Correlation, CorrelationID, Database
+};
 
 impl Database {
 	/// Store correlation in a specific dictionary
@@ -17,7 +17,7 @@ impl Database {
 		let correlations_db = aspect.correlations().await?;
 		let correlation_path = aspect.correlations_path();
 
-		let conn = Self::begin_concurrent(&correlations_db, &correlation_path).await?;
+		let conn = Self::begin_concurrent(&correlations_db, &correlation_path, Some(self.cache.clone())).await?;
 
 		// Serialize the correlation data
 		// Convert HashMap<SignalType, ErrorRate> to HashMap<String, ErrorRate> for JSON serialization
@@ -31,15 +31,14 @@ impl Database {
 		let current_timestamp = chrono::Utc::now().timestamp_millis();
 		let res = conn.as_ref().execute("INSERT INTO correlations (id, dictionary_id, pattern_id, event_id, error_rates, occurrences, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", turso::params![correlation_id.clone(), correlation.dictionary_id().as_uuid().to_string(), correlation.pattern_id().to_string(), correlation.event_id().to_string(), error_rate_json.clone(), occurrences_json.clone(), current_timestamp, current_timestamp]).await;
 
-		match res {
-			Ok(_) => println!("Correlation inserted successfully"),
-			Err(_) => {
-				Self::rollback_concurrent(&conn).await?;
-				bail!("Failed to insert correlation");
-			}
+		if res.is_ok() { 
+                        println!("Correlation inserted successfully"); 
+                } else {
+			Self::rollback_concurrent(&conn).await?;
+			bail!("Failed to insert correlation");
 		}
 
-		let _ = Database::commit_concurrent(&conn).await;
+		let _ = Self::commit_concurrent(&conn).await;
 		Ok(())
 	}
 
@@ -52,7 +51,7 @@ impl Database {
 		let mut aspect = self.get_aspect(*aspect_id).await?;
 		let correlations_turso_db = &aspect.correlations().await?;
 		let correlation_db_path = &aspect.correlations_path();
-		let conn = Self::begin_concurrent(correlations_turso_db, correlation_db_path).await?;
+		let conn = Self::begin_concurrent(correlations_turso_db, correlation_db_path, Some(self.cache.clone())).await?;
 
 		let mut rows = conn.as_ref().query("SELECT id, dictionary_id, pattern_id, event_id, error_rates, occurrences FROM correlations ORDER BY updated_at DESC", turso::params![]).await.map_err(|e| anyhow::anyhow!(format!("Failed to query correlations: {e}")))?;
 
@@ -100,7 +99,7 @@ impl Database {
 		let mut aspect = self.get_aspect(*aspect_id).await?;
 		let correlations_db = &aspect.correlations().await?;
 		let correlation_db_path = &aspect.correlations_path();
-		let conn = Self::begin_concurrent(correlations_db, correlation_db_path).await?;
+		let conn = Self::begin_concurrent(correlations_db, correlation_db_path, Some(self.cache.clone())).await?;
 		let mut rows = conn.as_ref().query("SELECT id, dictionary_id, pattern_id, event_id, error_rates, occurrences FROM correlations WHERE id = ? LIMIT 1", turso::params![correlation_id.to_string()]).await.map_err(|e| anyhow::anyhow!(format!("Failed to query correlation: {e}")))?;
 
 		let Some(row) = rows.next().await.map_err(|e| anyhow::anyhow!(format!("Failed to get row: {e}")))? else {
@@ -108,7 +107,7 @@ impl Database {
 			return Ok(None);
 		};
 
-		let _ = Database::commit_concurrent(&conn).await;
+		let _ = Self::commit_concurrent(&conn).await;
 
 		let correlation_id_str = Self::value_to_string(&row.get_value(0)?, "Correlation ID").await?;
 		let dictionary_id_str = Self::value_to_string(&row.get_value(1)?, "Dictionary ID").await?;
@@ -159,7 +158,7 @@ impl Database {
 		let mut aspect = self.get_aspect(*aspect_id).await?;
 		let correlations_db = &aspect.correlations().await?;
 		let correlation_db_path = &aspect.correlations_path();
-		let conn = Self::begin_concurrent(correlations_db, correlation_db_path).await?;
+		let conn = Self::begin_concurrent(correlations_db, correlation_db_path, Some(self.cache.clone())).await?;
 
 		let res = conn.as_ref().execute("DELETE FROM correlations WHERE id = ?", turso::params![correlation_id.to_string()]).await;
 		let rows_affected = match res {
@@ -172,7 +171,7 @@ impl Database {
 				return Err(anyhow::anyhow!(format!("Failed to delete correlation: {e}")));
 			}
 		};
-		let _ = Database::commit_concurrent(&conn).await;
+		let _ = Self::commit_concurrent(&conn).await;
 
 		Ok(rows_affected > 0)
 	}

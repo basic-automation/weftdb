@@ -4,9 +4,9 @@ use anyhow::{bail, Result};
 use uuid::Uuid;
 
 use super::helpers::safe_ratio;
-use crate::{database::traits::AspectStructure, types::database::traits::database_structure::DatabaseStructure, AspectId, Database, Event, DATABASES};
-
-use crate::types::database::traits::connection::Connection;
+use crate::{
+	database::traits::AspectStructure, types::database::traits::{connection::Connection, database_structure::DatabaseStructure}, AspectId, Database, Event, DATABASES
+};
 
 const EVENT_CHUNK_SIZE: usize = 100;
 
@@ -25,7 +25,7 @@ impl Database {
 
 		let event_id = event.id().to_string();
 		let event_name = event.name().to_string();
-		let conn = Self::begin_concurrent(metadata_db, metadata_db_path).await?;
+		let conn = Self::begin_concurrent(metadata_db, metadata_db_path, Some(self.cache.clone())).await?;
 
 		let res = conn.as_ref().execute("INSERT INTO events (id, database_id, name, manifestations, created_at) VALUES (?, ?, ?, ?, ?)", turso::params![event_id.clone(), self.id().as_uuid().to_string(), event_name.clone(), manifestations_json.clone(), chrono::Utc::now().timestamp_millis()]).await;
 		match res {
@@ -36,7 +36,7 @@ impl Database {
 			}
 		}
 
-		let _ = Database::commit_concurrent(&conn).await;
+		let _ = Self::commit_concurrent(&conn).await;
 
 		Ok(())
 	}
@@ -88,7 +88,7 @@ impl Database {
 		let metadata_db = &self.metadata;
 		let metadata_db_path = &self.metadata_path;
 
-		let conn = Self::begin_concurrent(metadata_db, metadata_db_path).await?;
+		let conn = Self::begin_concurrent(metadata_db, metadata_db_path, Some(self.cache.clone())).await?;
 
 		let res = conn.as_ref().execute("UPDATE events SET status = 'processed', processed_at = ? WHERE id = ? AND status = 'unprocessed'", turso::params![chrono::Utc::now().timestamp_millis(), event.id().to_string()]).await;
 		let rows_affected = match res {
@@ -102,7 +102,7 @@ impl Database {
 			}
 		};
 
-		let _ = Database::commit_concurrent(&conn).await;
+		let _ = Self::commit_concurrent(&conn).await;
 
 		// Verify that an event was actually updated
 		if rows_affected == 0 {
@@ -221,12 +221,12 @@ impl Database {
 		let metadata_db_path = self.metadata_path();
 
 		let cutoff_time = chrono::Utc::now() - chrono::Duration::days(older_than_days);
-		let conn = Self::begin_concurrent(metadata_db, metadata_db_path).await?;
+		let conn = Self::begin_concurrent(metadata_db, metadata_db_path, Some(self.cache.clone())).await?;
 
 		let res = conn.as_ref().execute("DELETE FROM events WHERE database_id = ? AND status = 'processed' AND processed_at < ?", turso::params![self.id().as_uuid().to_string(), cutoff_time.timestamp_millis()]).await;
 		let rows_affected = match res {
 			Ok(rows) => {
-				println!("Cleaned up {} processed events older than {} days", rows, older_than_days);
+				println!("Cleaned up {rows} processed events older than {older_than_days} days");
 				rows
 			}
 			Err(e) => {
@@ -247,12 +247,12 @@ impl Database {
 		let metadata_db = self.metadata();
 		let metadata_db_path = self.metadata_path();
 
-		let conn = Self::begin_concurrent(metadata_db, metadata_db_path).await?;
+		let conn = Self::begin_concurrent(metadata_db, metadata_db_path, Some(self.cache.clone())).await?;
 
 		let res = conn.as_ref().execute("DELETE FROM events WHERE database_id = ? AND status = 'processed'", turso::params![self.id().as_uuid().to_string()]).await;
 		let rows_affected = match res {
 			Ok(rows) => {
-				println!("Cleaned up {} processed events", rows);
+				println!("Cleaned up {rows} processed events");
 				rows
 			}
 			Err(e) => {
@@ -261,7 +261,7 @@ impl Database {
 			}
 		};
 
-		let _ = Database::commit_concurrent(&conn).await;
+		let _ = Self::commit_concurrent(&conn).await;
 
 		usize::try_from(rows_affected).map_err(|_| anyhow::anyhow!("Too many rows affected".to_string()))
 	}
@@ -351,7 +351,7 @@ impl Database {
 	pub async fn dequeue_processed_event(&self, event: &Event) -> Result<()> {
 		let metadata_db = self.metadata();
 		let metadata_db_path = self.metadata_path();
-		let conn = Self::begin_concurrent(metadata_db, metadata_db_path).await?;
+		let conn = Self::begin_concurrent(metadata_db, metadata_db_path, Some(self.cache.clone())).await?;
 
 		let res = conn.as_ref().execute("DELETE FROM events WHERE id = ? AND status = 'processed'", turso::params![event.id().to_string()]).await;
 		let rows_affected = match res {
@@ -382,11 +382,11 @@ impl Database {
 	pub async fn clear_processed_events_queue(&self) -> Result<usize> {
 		let metadata_db = self.metadata();
 		let metadata_db_path = self.metadata_path();
-		let conn = Self::begin_concurrent(metadata_db, metadata_db_path).await?;
+		let conn = Self::begin_concurrent(metadata_db, metadata_db_path, Some(self.cache.clone())).await?;
 		let res = conn.as_ref().execute("DELETE FROM events WHERE database_id = ? AND status = 'processed'", turso::params![self.id().as_uuid().to_string()]).await;
 		let rows_affected = match res {
 			Ok(rows) => {
-				println!("Cleared {} processed events from queue", rows);
+				println!("Cleared {rows} processed events from queue");
 				rows
 			}
 			Err(e) => {
@@ -395,7 +395,7 @@ impl Database {
 			}
 		};
 
-		let _ = Database::commit_concurrent(&conn).await;
+		let _ = Self::commit_concurrent(&conn).await;
 
 		usize::try_from(rows_affected).map_err(|_| anyhow::anyhow!("Too many rows affected".to_string()))
 	}
@@ -411,12 +411,12 @@ impl Database {
 		let event_db_path = &aspect.events_path();
 		let event_db = &aspect.events().await?;
 
-		let conn = Self::begin_concurrent(event_db, event_db_path).await?;
+		let conn = Self::begin_concurrent(event_db, event_db_path, Some(self.cache.clone())).await?;
 
 		let res = conn.as_ref().execute("DELETE FROM events WHERE database_id = ?", turso::params![self.id().as_uuid().to_string()]).await;
 		let rows = match res {
 			Ok(rows) => {
-				println!("Deleted {} rows from events", rows);
+				println!("Deleted {rows} rows from events");
 				rows
 			}
 			Err(e) => {
@@ -425,7 +425,7 @@ impl Database {
 			}
 		};
 
-		let _ = Database::commit_concurrent(&conn).await;
+		let _ = Self::commit_concurrent(&conn).await;
 
 		usize::try_from(rows).map_err(|_| anyhow::anyhow!("Too many rows affected".to_string()))
 	}

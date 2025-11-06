@@ -4,7 +4,7 @@ use ::database::database::traits::{AspectStructure, Inputs};
 use anyhow::{Context, Result};
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use database::{database::traits::DatabaseStructure, get_data_dir, Aspect, Database, DatasetId, InputMeasurement, Outputs, Subject, DATABASES};
+use database::{database::traits::DatabaseStructure, Aspect, Database, DatasetId, InputMeasurement, Outputs, Subject, DATABASES, Config};
 use rayon::prelude::*;
 use splimes::{Resolution, Spline};
 #[cfg(test)]
@@ -431,7 +431,7 @@ async fn test_create_btc_1min_database() -> Result<()> {
 	let db_name = "Crypto".to_string();
 
 	// Create database (will use existing if present)
-	let db = if std::path::Path::new(&format!("{}/{db_name}", get_data_dir())).exists() {
+	let db = if std::path::Path::new(&format!("{}/{db_name}", Database::get_data_dir())).exists() {
 		println!("Database already exists, test passed");
 		return Ok(());
 	} else {

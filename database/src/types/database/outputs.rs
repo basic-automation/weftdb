@@ -6,10 +6,9 @@ use chrono::{DateTime, Utc};
 use futures::Stream;
 use splimes::{Point, Resolution, Spline};
 use uuid::Uuid;
-use crate::types::database::traits::connection::Connection;
 
 use crate::{
-	database::traits::{AspectStructure, DatabaseStructure, Outputs}, types::cache::CACHE, AnalysisResult, AspectId, Batch, BatchId, BatchMetatdata, BatchedMeasurement, Database, DatasetId, Error, Measurement, MeasurementId
+	database::traits::{AspectStructure, DatabaseStructure, Outputs}, types::database::traits::connection::Connection, AnalysisResult, AspectId, Batch, BatchId, BatchMetatdata, BatchedMeasurement, Database, DatasetId, Error, Measurement, MeasurementId
 };
 
 #[async_trait::async_trait]
@@ -22,7 +21,7 @@ impl Outputs for Database {
 		// Only cache if requesting first page, reasonable page size, and no time filtering
 		if page == 0 && max_per_page <= 10_000 && start.is_none() && end.is_none() {
 			let cache_key = format!("aspect_measurements_{}_{}", aspect_id.as_uuid(), max_per_page);
-			if let Some(cached) = CACHE.get_aspect_measurements(&cache_key).await {
+			if let Some(cached) = self.cache.lock().await.get::<Vec<Measurement>>(&cache_key).await {
 				return Ok(cached);
 			}
 		}
@@ -91,7 +90,7 @@ impl Outputs for Database {
 		};
 
 		let cache_key = aspect.measurements_path();
-		let conn = Self::begin_concurrent(&measurement_db, &cache_key).await?;
+		let conn = Self::begin_concurrent(&measurement_db, &cache_key, Some(self.cache.clone())).await?;
 
 		// Convert String parameters to turso::Value
 		let turso_params: Vec<turso::Value> = params.into_iter().map(turso::Value::from).collect();
@@ -129,7 +128,7 @@ impl Outputs for Database {
 		// Cache the results only for first page, reasonable sizes, and full range queries
 		if page == 0 && max_per_page <= 10_000 && !measurements.is_empty() && start.is_none() && end.is_none() {
 			let cache_key = format!("aspect_measurements_{}_{}", aspect_id.as_uuid(), max_per_page);
-			CACHE.store_aspect_measurements(&cache_key, &measurements).await;
+			self.cache.lock().await.store(&cache_key, measurements.clone()).await;
 		}
 
 		let _ = Self::commit_concurrent(&conn).await;
@@ -235,7 +234,7 @@ impl Outputs for Database {
 	async fn analyze_point(&self, aspect_id: AspectId, time: DateTime<Utc>, resolution: Resolution, method: Spline) -> Result<Point> {
 		// Check cache first for point analysis
 		let cache_key = format!("point_{}_{}_{}_{:?}_{:?}", aspect_id.as_uuid(), time.timestamp(), time.timestamp_subsec_nanos(), resolution, method);
-		if let Some(cached_result) = CACHE.get_point_analysis(&cache_key).await {
+		if let Some(cached_result) = self.cache.lock().await.get::<AnalysisResult>(&cache_key).await {
 			return Ok(Point { timestamp: cached_result.timestamp(), value: cached_result.value().clone() });
 		}
 
@@ -335,7 +334,7 @@ impl Outputs for Database {
 		};
 
 		let analysis_result = AnalysisResult::new(time, point.value.clone(), method_description, format!("{resolution:?}"));
-		CACHE.store_point_analysis(&cache_key, &analysis_result).await;
+		self.cache.lock().await.store(&cache_key, analysis_result).await;
 
 		Ok(point)
 	}
@@ -489,7 +488,7 @@ impl Outputs for Database {
 		let cache_key = format!("unprocessed_batch_{}_{}", aspect_id.as_uuid(), batch_id.as_uuid());
 
 		// Try to get from cache first
-		if let Some(cached_batches) = CACHE.get_unprocessed_batches(&cache_key).await {
+		if let Some(cached_batches) = self.cache.lock().await.get::<Vec<Batch>>(&cache_key).await {
 			// Since we're looking for a specific batch, find it in the cached results
 			if let Some(batch) = cached_batches.into_iter().find(|b| *b.batch_id() == *batch_id) {
 				return Ok(batch);
@@ -524,7 +523,7 @@ impl Outputs for Database {
 			let batch = Batch { metadata, measurements, batch_id: *batch_id, batch_hash: batch_hash_str };
 
 			// Cache the single batch (as a vec with one element)
-			CACHE.store_unprocessed_batches(&cache_key, std::slice::from_ref(&batch)).await;
+			self.cache.lock().await.store(&cache_key, vec![batch.clone()]).await;
 
 			Ok(batch)
 		} else {
@@ -537,7 +536,7 @@ impl Outputs for Database {
 	async fn get_unprocessed_batches(&self, aspect_id: &AspectId) -> Result<Pin<Box<dyn Stream<Item = Result<Batch>> + Send + 'static>>> {
 		// Check cache first
 		let cache_key = format!("unprocessed_batches_{}", aspect_id.as_uuid());
-		if let Some(cached_batches) = CACHE.get_unprocessed_batches(&cache_key).await {
+		if let Some(cached_batches) = self.cache.lock().await.get::<Vec<Batch>>(&cache_key).await {
 			// Convert cached batches to stream
 			let batch_stream = futures::stream::iter(cached_batches.into_iter().map(Ok));
 			return Ok(Box::pin(batch_stream));
@@ -571,7 +570,7 @@ impl Outputs for Database {
 			}
 		} // Cache the results for future queries
 		if !batches.is_empty() {
-			CACHE.store_unprocessed_batches(&cache_key, &batches).await;
+			self.cache.lock().await.store(&cache_key, batches.clone()).await;
 		}
 
 		// Convert to stream

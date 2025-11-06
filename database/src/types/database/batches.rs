@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use super::helpers::safe_ratio;
 use crate::{
-	types::database::traits::{aspect_structure::AspectStructure, database_structure::DatabaseStructure}, AspectId, Batch, BatchId, BatchedMeasurement, Error, CACHE, DATABASES
+	types::database::traits::{aspect_structure::AspectStructure, database_structure::DatabaseStructure}, AspectId, Batch, BatchId, BatchedMeasurement, Error, DATABASES
 };
 
 const BATCH_CHUNK_SIZE: usize = 100;
@@ -82,7 +82,7 @@ impl super::Database {
 
 		// Invalidate relevant caches
 		let cache_key = format!("aspect_batches_{}", batch.metadata.aspect.as_uuid());
-		CACHE.invalidate_aspect_cache(&cache_key).await;
+		self.cache.lock().await.invalidate(&cache_key).await;
 
 		Ok(())
 	}
@@ -189,7 +189,7 @@ impl super::Database {
 
 		// Invalidate relevant caches
 		let cache_key = format!("aspect_batches_{}", batch.metadata.aspect.as_uuid());
-		CACHE.invalidate_aspect_cache(&cache_key).await;
+		self.cache.lock().await.invalidate(&cache_key).await;
 
 		Ok(())
 	}
@@ -339,7 +339,7 @@ impl super::Database {
 		for batch in batches {
 			if invalidated_aspects.insert(batch.metadata.aspect) {
 				let cache_key = format!("aspect_batches_{}", batch.metadata.aspect.as_uuid());
-				CACHE.invalidate_aspect_cache(&cache_key).await;
+				self.cache.lock().await.invalidate(&cache_key).await;
 			}
 		}
 
@@ -428,7 +428,7 @@ impl super::Database {
 
 		// Invalidate relevant caches
 		let cache_key = format!("aspect_batches_{}", aspect_id.as_uuid());
-		CACHE.invalidate_aspect_cache(&cache_key).await;
+		self.cache.lock().await.invalidate(&cache_key).await;
 
 		Ok(usize::try_from(rows_affected).map_err(|_| Error::DatabaseError("Too many rows affected".to_string()))?)
 	}
@@ -458,7 +458,7 @@ impl super::Database {
 
 		// Invalidate relevant caches
 		let cache_key = format!("aspect_batches_{}", aspect_id.as_uuid());
-		CACHE.invalidate_aspect_cache(&cache_key).await;
+		self.cache.lock().await.invalidate(&cache_key).await;
 
 		Ok(usize::try_from(rows_affected).map_err(|_| Error::DatabaseError("Too many rows affected".to_string()))?)
 	}
@@ -592,7 +592,7 @@ impl super::Database {
 
 		// Invalidate relevant caches
 		let cache_key = format!("aspect_batches_{}", batch.metadata.aspect.as_uuid());
-		CACHE.invalidate_aspect_cache(&cache_key).await;
+		self.cache.lock().await.invalidate(&cache_key).await;
 
 		Ok(())
 	}
@@ -623,7 +623,7 @@ impl super::Database {
 
 		// Invalidate relevant caches
 		let cache_key = format!("aspect_batches_{}", aspect_id.as_uuid());
-		CACHE.invalidate_aspect_cache(&cache_key).await;
+		self.cache.lock().await.invalidate(&cache_key).await;
 
 		Ok(usize::try_from(rows_affected).map_err(|_| Error::DatabaseError("Too many rows affected".to_string()))?)
 	}
