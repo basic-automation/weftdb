@@ -3,8 +3,7 @@ use anyhow::Result;
 use crate::{types::database::traits::database_structure::DatabaseStructure, AspectId, Database, Pattern, PatternID, DATABASES};
 
 const DICTIONARY_CHUNK_SIZE: usize = 100;
-use crate::database::Config;
-use crate::types::database::traits::connection::Connection;
+use crate::{database::Config, types::database::traits::connection::Connection};
 
 impl Database {
 	/// Get or create a dictionary patterns database and ensure the table structure exists
@@ -58,7 +57,7 @@ impl Database {
 		};
 
 		// Ensure the dictionaries table exists
-		let conn = Self::begin_concurrent(&metadata_db, &metadata_db_path).await?;
+		let conn = Self::begin_concurrent(&metadata_db, &metadata_db_path, None).await?;
 
 		let res = conn
 			.as_ref()
@@ -81,7 +80,7 @@ impl Database {
 			}
 		}
 
-		let _ = Database::commit_concurrent(&conn).await;
+		let _ = Self::commit_concurrent(&conn).await;
 		Ok(metadata_db)
 	}
 
@@ -209,21 +208,13 @@ impl Database {
 		let metadata_db = &self.metadata;
 		let metadata_db_path = &self.metadata_path;
 		let constraints_json = serde_json::to_string(constraints).map_err(|e| anyhow::anyhow!(format!("Failed to serialize constraints: {e}")))?;
-		let conn = Self::begin_concurrent(metadata_db, metadata_db_path).await?;
+		let conn = Self::begin_concurrent(metadata_db, metadata_db_path, Some(self.cache.clone())).await?;
 		let now = chrono::Utc::now().timestamp_millis();
 
 		let res = conn.as_ref().execute("INSERT INTO dictionaries (name, description, constraints, created_at, updated_at) VALUES (?, ?, ?, ?, ?)", turso::params![name, description, constraints_json.clone(), now, now]).await;
-		let mut insert_ok = false;
-
-		match res {
-			Ok(_) => {
-				println!("Dictionary metadata inserted successfully");
-				insert_ok = true;
-			}
-			Err(_) => (),
-		}
-
-		if !insert_ok {
+		if res.is_ok() {
+			println!("Dictionary metadata inserted successfully");
+		} else {
 			let res = conn.as_ref().execute("UPDATE dictionaries SET description = ?, constraints = ?, updated_at = ? WHERE name = ?", turso::params![description, constraints_json.clone(), now, name]).await;
 			match res {
 				Ok(_) => println!("Dictionary metadata updated successfully"),
@@ -234,7 +225,7 @@ impl Database {
 			}
 		}
 
-		let _ = Database::commit_concurrent(&conn).await;
+		let _ = Self::commit_concurrent(&conn).await;
 		Ok(())
 	}
 

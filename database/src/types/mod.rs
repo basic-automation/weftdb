@@ -2,10 +2,10 @@ pub use aspect::{Aspect, AspectId};
 pub use batches::{
 	batched_measurements::{analysis::Analysis, batched_distance::BatchDistance, BatchedMeasurement}, Batch, BatchId, BatchMetatdata, Batches
 };
-pub use cache::{AnalysisResult, DatabaseCache, CACHE};
+pub use cache::{AnalysisResult, DatabaseCache, Connection, Cacheable};
 pub use correlation::{Correlation, CorrelationID, Correlations};
 pub use database::{
-	traits::{CorrelationDatabase, DatabaseStructure, EventDatabase, Outputs, PatternDatabase}, Database, DatabaseId, DatabaseInfo, DatabaseMap, DATABASES
+	traits::{CorrelationDatabase, DatabaseStructure, EventDatabase, Outputs, PatternDatabase, Config}, Database, DatabaseId, DatabaseInfo, DatabaseMap, DATABASES, DEFAULT_DATA_DIR
 };
 pub use dataset::{Dataset, DatasetId};
 pub use dictionary::{Dictionary, DictionaryConstraints, DictionaryId, Steps, Variability, VariablilityType};

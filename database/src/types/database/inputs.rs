@@ -3,12 +3,10 @@ use anyhow::{bail, Result};
 use crate::{
 	cache::Connection, database::traits::Inputs, types::{
 		database::{
-			helpers::safe_usize_to_f64, traits::{aspect_structure::AspectStructure, DatabaseStructure}
+			helpers::safe_usize_to_f64, traits::{aspect_structure::AspectStructure, connection::Connection as ConnectionTrait, DatabaseStructure}
 		}, TxId
-	}, AspectId, Batch, Database, DatasetId, Error, InputMeasurement, Measurement, CACHE
+	}, AspectId, Batch, Database, DatasetId, Error, InputMeasurement, Measurement
 };
-
-use crate::types::database::traits::connection::Connection as ConnectionTrait;
 
 #[async_trait::async_trait]
 impl Inputs for Database {
@@ -22,33 +20,33 @@ impl Inputs for Database {
 	async fn capture_measurement(&self, aspect_id: AspectId, dataset_id: DatasetId, input_measurement: InputMeasurement) -> Result<TxId> {
 		let mut aspect = self.get_aspect(aspect_id).await?;
 		let measurement_db = aspect.measurements().await?;
-		let cache_key = format!("measurement_db_{}_{}", aspect_id, dataset_id);
+		let cache_key = format!("measurement_db_{aspect_id}_{dataset_id}");
 		let tx_id = TxId::new();
 
 		let measurement = Measurement::from_input_measurement(dataset_id, &input_measurement);
 
 		// Use INSERT ... ON CONFLICT for atomic upsert with concurrent writes support
 		// This handles the case where a measurement with the same timestamp already exists
-		let upsert_sql = r#"
+		let upsert_sql = r"
 			INSERT INTO measurements (id, dataset_id, timestamp, value) 
 			VALUES (?, ?, ?, ?) 
 			ON CONFLICT(timestamp) DO UPDATE SET 
 				value = (CAST(excluded.value AS REAL) + CAST(measurements.value AS REAL)) / 2.0,
 				id = excluded.id
-		"#;
+		";
 
 		// Execute with BEGIN CONCURRENT and retry on lock/conflict
-		let conn = Self::begin_concurrent(&measurement_db, &cache_key).await?;
+		let conn = Self::begin_concurrent(&measurement_db, &cache_key, Some(self.cache.clone())).await?;
 		let res = conn.as_ref().execute(upsert_sql, turso::params![tx_id.as_uuid().to_string(), dataset_id.as_uuid().to_string(), measurement.timestamp().timestamp_millis().to_string(), measurement.value().to_string()]).await;
 		match res {
-			Ok(_) => println!("Successfully upserted measurement for dataset {}", dataset_id),
+			Ok(_) => println!("Successfully upserted measurement for dataset {dataset_id}"),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("SQL execution failure 1: `{}`", e));
 			}
 		}
 
-		let _ = Database::commit_concurrent(&conn).await;
+		let _ = Self::commit_concurrent(&conn).await;
 
 		// Record the transaction - we don't know if it was an insert or update, but that's okay
 		self.record_transaction(&format!("Captured measurement at {} with value {} for dataset {} (upsert operation)", measurement.timestamp(), measurement.value(), dataset_id)).await
@@ -70,17 +68,17 @@ impl Inputs for Database {
 
 		// Use INSERT with ON CONFLICT DO NOTHING, then check if any rows were affected
 		// This is atomic and handles concurrent writes safely
-		let insert_sql = r#"
+		let insert_sql = r"
 			INSERT INTO measurements (id, dataset_id, timestamp, value) 
 			VALUES (?, ?, ?, ?) 
 			ON CONFLICT(timestamp) DO NOTHING
-		"#;
+		";
 
-		let conn = Self::begin_concurrent(&measurement_db, &measurement_db_path).await?;
+		let conn = Self::begin_concurrent(&measurement_db, measurement_db_path, Some(self.cache.clone())).await?;
 		let res = conn.as_ref().execute(insert_sql, turso::params![tx_id.as_uuid().to_string(), dataset_id.as_uuid().to_string(), measurement.timestamp().timestamp_millis().to_string(), measurement.value().to_string()]).await;
 		let rows_affected = match res {
 			Ok(rows) => {
-				println!("Inserted {} rows", rows);
+				println!("Inserted {rows} rows");
 				rows
 			}
 			Err(e) => {
@@ -89,7 +87,7 @@ impl Inputs for Database {
 			}
 		};
 
-		let _ = Database::commit_concurrent(&conn).await;
+		let _ = Self::commit_concurrent(&conn).await;
 
 		// Check if the insert actually happened (rows_affected > 0 means it was inserted)
 		if rows_affected == 0 {
@@ -150,7 +148,7 @@ impl Inputs for Database {
 
 		// Invalidate cache
 		let cache_key = format!("aspect_measurements_{}", aspect.id().as_uuid());
-		CACHE.invalidate_aspect_cache(&cache_key).await;
+		self.cache.lock().await.invalidate(&cache_key).await;
 
 		// Update earliest and latest in metadata
 		self.update_aspect_timestamps(&aspect.id(), min_new, max_new).await?;
@@ -175,7 +173,8 @@ impl Inputs for Database {
 					let em = e.to_string().to_lowercase();
 					if attempt < max_attempts && (em.contains("locked") || em.contains("busy")) {
 						attempt += 1;
-						let sleep_ms = 200u64 * (1u64 << (attempt.min(8) as u32));
+						let attempt_min_8: u32 = u32::try_from(attempt.min(8)).unwrap_or(8);
+						let sleep_ms = 200u64 * (1u64 << attempt_min_8);
 						tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
 						continue;
 					}
@@ -188,13 +187,13 @@ impl Inputs for Database {
 					let tx_id = &all_tx_ids[tx_id_offset + i];
 					let measurement = Measurement::from_input_measurement(dataset_id, input_measurement);
 
-					let upsert_sql = r#"
+					let upsert_sql = r"
 						INSERT INTO measurements (id, dataset_id, timestamp, value) 
 						VALUES (?, ?, ?, ?) 
 						ON CONFLICT(timestamp) DO UPDATE SET 
 							value = (CAST(excluded.value AS REAL) + CAST(measurements.value AS REAL)) / 2.0,
 							id = excluded.id
-					"#;
+					";
 
 					tx.execute(upsert_sql, turso::params![tx_id.as_uuid().to_string(), dataset_id.as_uuid().to_string(), measurement.timestamp().timestamp_millis().to_string(), measurement.value().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to insert measurement in chunk: {e}")))?;
 				}
@@ -206,7 +205,7 @@ impl Inputs for Database {
 				Ok(()) => {
 					// Commit the transaction
 					match tx.commit().await {
-						Ok(_) => {
+						Ok(()) => {
 							break;
 						}
 						Err(e) => {
@@ -214,7 +213,8 @@ impl Inputs for Database {
 							let em = e.to_string().to_lowercase();
 							if attempt < max_attempts && (em.contains("locked") || em.contains("busy")) {
 								attempt += 1;
-								let sleep_ms = 400u64 * (1u64 << (attempt.min(8) as u32));
+                                                                let attempt_min_8: u32 = u32::try_from(attempt.min(8)).unwrap_or(8);
+								let sleep_ms = 400u64 * (1u64 << attempt_min_8);
 								tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
 								continue;
 							}
@@ -230,7 +230,8 @@ impl Inputs for Database {
 						if attempt >= max_attempts {
 							return Err(Error::DatabaseError(format!("Failed to process chunk after retries: {e}")).into());
 						}
-						let sleep_ms = 600u64 * (1u64 << (attempt.min(8) as u32));
+                                                let attempt_min_8: u32 = u32::try_from(attempt.min(8)).unwrap_or(8);
+						let sleep_ms = 600u64 * (1u64 << attempt_min_8);
 						tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
 						continue;
 					}
@@ -246,10 +247,7 @@ impl Inputs for Database {
 	async fn batch_capture_new_measurements(&self, aspect_id: AspectId, dataset_id: DatasetId, input_measurements: Vec<InputMeasurement>) -> Result<Vec<TxId>> {
 		let mut tx_ids = Vec::new();
 		for m in input_measurements {
-			match self.capture_new_measurement(aspect_id, dataset_id, m).await {
-				Ok(tx) => tx_ids.push(tx),
-				Err(_) => {} // Skip duplicates silently
-			}
+			if let Ok(tx) = self.capture_new_measurement(aspect_id, dataset_id, m).await { tx_ids.push(tx) }
 		}
 		Ok(tx_ids)
 	}
@@ -260,19 +258,19 @@ impl Inputs for Database {
 		for (i, m) in chunk.iter().enumerate() {
 			let tx_id = &all_tx_ids[tx_id_offset + i];
 			let measurement = Measurement::from_input_measurement(dataset_id, m);
-			let insert_sql = r#"
+			let insert_sql = r"
 				INSERT INTO measurements (id, dataset_id, timestamp, value) 
 				VALUES (?, ?, ?, ?) 
 				ON CONFLICT(timestamp) DO NOTHING
-			"#;
+			";
 
 			let mut rows_affected = 0;
 
-			let conn = Self::begin_concurrent(db, db_path).await?;
+			let conn = Self::begin_concurrent(db, db_path, Some(self.cache.clone())).await?;
 			let res = conn.as_ref().execute(insert_sql, turso::params![tx_id.as_uuid().to_string(), dataset_id.as_uuid().to_string(), measurement.timestamp().timestamp_millis().to_string(), measurement.value().to_string()]).await;
 			rows_affected = match res {
 				Ok(rows) => {
-					println!("Inserted measurement for tx_id {}: {} rows affected", tx_id, rows_affected);
+					println!("Inserted measurement for tx_id {tx_id}: {rows_affected} rows affected");
 					rows
 				}
 				Err(e) => {
@@ -281,7 +279,7 @@ impl Inputs for Database {
 				}
 			};
 
-			let _ = Database::commit_concurrent(&conn).await;
+			let _ = Self::commit_concurrent(&conn).await;
 
 			if rows_affected > 0 {
 				successful.push(*tx_id);
@@ -297,23 +295,30 @@ impl Inputs for Database {
 		let batch_hash = format!("{:x}", md5::compute(&measurements_json));
 		let batch_id = batch.id().to_string();
 		let mut aspect = self.get_aspect(aspect_id).await?;
-		let conn = Database::begin_concurrent(&aspect.measurements().await?, &format!("{}/measurements.db", aspect.aspect_path())).await?;
-		let insert_sql = r#"
+		let conn = Self::begin_concurrent(&aspect.measurements().await?, &format!("{}/measurements.db", aspect.aspect_path()), Some(self.cache.clone())).await?;
+		let insert_sql = r"
 			INSERT INTO batches (id, aspect_id, database_id, size, resolution, measurements, batch_hash, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(id) DO NOTHING
-		"#;
+		";
+                
+                let batch_metadata_size: i64 = match i64::try_from(batch.metadata.size) {
+                    Ok(size) => size,
+                    Err(e) => {
+                        return Err(anyhow::anyhow!("Batch size conversion error: {e}"));
+                    }
+                };
 
-		let res = conn.as_ref().execute(insert_sql, turso::params![batch_id.clone(), aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string(), batch.metadata.size as i64, format!("{:?}", batch.metadata.resolution), measurements_json.clone(), batch_hash.clone(), "unprocessed", chrono::Utc::now().timestamp_millis()]).await;
+		let res = conn.as_ref().execute(insert_sql, turso::params![batch_id.clone(), aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string(), batch_metadata_size, format!("{:?}", batch.metadata.resolution), measurements_json.clone(), batch_hash.clone(), "unprocessed", chrono::Utc::now().timestamp_millis()]).await;
 		match res {
-			Ok(_) => println!("Inserted unprocessed batch {}", batch_id),
+			Ok(_) => println!("Inserted unprocessed batch {batch_id}"),
 			Err(e) => {
-				println!("Failed to insert unprocessed batch {}: {}", batch_id, e);
-				Database::rollback_concurrent(&conn).await?;
+				println!("Failed to insert unprocessed batch {batch_id}: {e}");
+				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("Failed to insert unprocessed batch: {e}"));
 			}
 		}
 
-		let _ = Database::commit_concurrent(&conn).await;
+		let _ = Self::commit_concurrent(&conn).await;
 
 		Ok(tx_id)
 	}
@@ -333,9 +338,22 @@ impl Inputs for Database {
 		let mut tx_ids = Vec::new();
 		for b in chunk {
 			let tx_id = TxId::new();
-			let insert_sql = r#"INSERT INTO batches (id, aspect_id, database_id, size, resolution, measurements, batch_hash, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#;
+			let insert_sql = r"INSERT INTO batches (id, aspect_id, database_id, size, resolution, measurements, batch_hash, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                        let batch_metadata_size: i64 = match i64::try_from(b.metadata.size) {
+                            Ok(size) => size,
+                            Err(e) => {
+                                return Err(anyhow::anyhow!("Batch size conversion error: {e}"));
+                            }
+                        };
 
-			let res = conn.as_ref().execute(insert_sql, turso::params![b.id().to_string(), b.metadata.aspect.as_uuid().to_string(), self.id().as_uuid().to_string(), b.metadata.size as i64, format!("{:?}", b.metadata.resolution), "{}", b.measurements.len() as i64, "stub_hash", "unprocessed", chrono::Utc::now().timestamp_millis()]).await;
+                        let batch_measurements_len: i64 = match i64::try_from(b.measurements.len()) {
+                            Ok(len) => len,
+                            Err(e) => {
+                                return Err(anyhow::anyhow!("Batch measurements length conversion error: {e}"));
+                            }
+                        };
+
+			let res = conn.as_ref().execute(insert_sql, turso::params![b.id().to_string(), b.metadata.aspect.as_uuid().to_string(), self.id().as_uuid().to_string(), batch_metadata_size, format!("{:?}", b.metadata.resolution), "{}", batch_measurements_len, "stub_hash", "unprocessed", chrono::Utc::now().timestamp_millis()]).await;
 			match res {
 				Ok(_) => println!("Inserted batch chunk {}", b.id()),
 				Err(e) => {
@@ -354,20 +372,28 @@ impl Inputs for Database {
 		let batch_hash = format!("{:x}", md5::compute(&measurements_json));
 		let batch_id = batch.batch_id().to_string();
 		let mut aspect = self.get_aspect(aspect_id).await?;
-		let conn = Database::begin_concurrent(&aspect.measurements().await?, &format!("{}/measurements.db", aspect.aspect_path())).await?;
-		let insert_sql = r#"INSERT INTO batches (id, aspect_id, database_id, size, resolution, measurements, batch_hash, status, created_at, processed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#;
+		let conn = Self::begin_concurrent(&aspect.measurements().await?, &format!("{}/measurements.db", aspect.aspect_path()), Some(self.cache.clone())).await?;
+		let insert_sql = r"INSERT INTO batches (id, aspect_id, database_id, size, resolution, measurements, batch_hash, status, created_at, processed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
-		let res = conn.as_ref().execute(insert_sql, turso::params![batch_id.clone(), aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string(), batch.metadata.size as i64, format!("{:?}", batch.metadata.resolution), measurements_json.clone(), batch_hash.clone(), "processed", chrono::Utc::now().timestamp_millis(), chrono::Utc::now().timestamp_millis()]).await;
+                let batch_metadata_size: i64 = match i64::try_from(batch.metadata.size) {
+                    Ok(size) => size,
+                    Err(e) => {
+                        Self::rollback_concurrent(&conn).await?;
+                        return Err(anyhow::anyhow!("Batch size conversion error: {e}"));
+                    }
+                };
+
+		let res = conn.as_ref().execute(insert_sql, turso::params![batch_id.clone(), aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string(), batch_metadata_size, format!("{:?}", batch.metadata.resolution), measurements_json.clone(), batch_hash.clone(), "processed", chrono::Utc::now().timestamp_millis(), chrono::Utc::now().timestamp_millis()]).await;
 		match res {
-			Ok(_) => println!("Inserted processed batch {}", batch_id),
+			Ok(_) => println!("Inserted processed batch {batch_id}"),
 			Err(e) => {
-				println!("Failed to insert processed batch {}: {}", batch_id, e);
-				Database::rollback_concurrent(&conn).await?;
+				println!("Failed to insert processed batch {batch_id}: {e}");
+				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("Failed to insert processed batch: {e}"));
 			}
 		}
 
-		let _ = Database::commit_concurrent(&conn).await;
+		let _ = Self::commit_concurrent(&conn).await;
 
 		Ok(tx_id)
 	}

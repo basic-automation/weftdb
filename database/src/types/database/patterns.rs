@@ -1,9 +1,9 @@
 use anyhow::Result;
 
 use super::helpers::safe_ratio;
-use crate::{types::database::traits::database_structure::DatabaseStructure, AspectId, Database, Pattern, DATABASES};
-
-use crate::types::database::traits::connection::Connection;
+use crate::{
+	types::database::traits::{connection::Connection, database_structure::DatabaseStructure}, AspectId, Database, Pattern, DATABASES
+};
 
 const PATTERN_CHUNK_SIZE: usize = 100;
 
@@ -16,7 +16,7 @@ impl Database {
 	pub async fn store_pattern(&self, pattern: &Pattern) -> Result<()> {
 		let metadata_db = &self.metadata;
 		let metadata_db_path = self.metadata_path();
-		let conn = Self::begin_concurrent(metadata_db, &metadata_db_path).await?;
+		let conn = Self::begin_concurrent(metadata_db, metadata_db_path, Some(self.cache.clone())).await?;
 
 		// Serialize the pattern occurrences and relatives
 		let occurrences_json = serde_json::to_string(&pattern.occurrences()).map_err(|e| anyhow::anyhow!(format!("Failed to serialize pattern occurrences: {e}")))?;
@@ -25,14 +25,14 @@ impl Database {
 
 		let res = conn.as_ref().execute("INSERT INTO patterns (id, aspect_id, database_id, occurrences, relatives, created_at) VALUES (?, ?, ?, ?, ?, ?)", turso::params![pattern_id.clone(), pattern.occurrences()[0].database_info().id().as_uuid().to_string(), self.id().as_uuid().to_string(), occurrences_json.clone(), relatives_json.clone(), chrono::Utc::now().timestamp_millis()]).await;
 		match res {
-			Ok(_) => println!("Inserted pattern {}", pattern_id),
+			Ok(_) => println!("Inserted pattern {pattern_id}"),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!(format!("Failed to insert pattern: {e}")));
 			}
 		}
 
-		let _ = Database::commit_concurrent(&conn).await;
+		let _ = Self::commit_concurrent(&conn).await;
 		Ok(())
 	}
 
@@ -49,7 +49,7 @@ impl Database {
 			databases.get(&db_id).cloned().ok_or_else(|| anyhow::anyhow!("Database not found".to_string()))?
 		};
 
-		let metadata_turso_db = db_info.metadata.as_ref().unwrap();
+		let Some(metadata_turso_db) = db_info.metadata.as_ref() else { return Err(anyhow::anyhow!("Metadata database not found".to_string())) };
 
 		let conn = metadata_turso_db.connect()?;
 		let mut rows = conn.query("SELECT id, occurrences, relatives FROM patterns WHERE aspect_id = ? AND database_id = ? AND status = 'unprocessed' ORDER BY created_at", turso::params![aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string()]).await.map_err(|e| anyhow::anyhow!(format!("Failed to query patterns: {e}")))?;
@@ -79,11 +79,11 @@ impl Database {
 	pub async fn mark_pattern_processed(&self, pattern: &Pattern) -> Result<()> {
 		let metadata_db = &self.metadata;
 		let metadata_db_path = &self.metadata_path;
-		let conn = Self::begin_concurrent(metadata_db, metadata_db_path).await?;
+		let conn = Self::begin_concurrent(metadata_db, metadata_db_path, Some(self.cache.clone())).await?;
 		let res = conn.as_ref().execute("UPDATE patterns SET status = 'processed', processed_at = ? WHERE id = ? AND status = 'unprocessed'", turso::params![chrono::Utc::now().timestamp_millis(), pattern.id().to_string()]).await;
 		let rows_affected = match res {
 			Ok(rows) => {
-				println!("Mark pattern processed affected rows: {}", rows);
+				println!("Mark pattern processed affected rows: {rows}");
 				rows
 			}
 			Err(e) => {
@@ -91,7 +91,7 @@ impl Database {
 				return Err(anyhow::anyhow!(format!("Failed to update pattern status: {e}")));
 			}
 		};
-		let _ = Database::commit_concurrent(&conn).await;
+		let _ = Self::commit_concurrent(&conn).await;
 
 		// Verify that a pattern was actually updated
 		if rows_affected == 0 {
@@ -118,7 +118,7 @@ impl Database {
 			databases.get(&db_id).cloned().ok_or_else(|| anyhow::anyhow!("Database not found".to_string()))?
 		};
 
-		let metadata_turso_db = db_info.metadata.as_ref().unwrap();
+		let Some(metadata_turso_db) = db_info.metadata.as_ref() else { return Err(anyhow::anyhow!("Metadata database not found".to_string())) };
 
 		// Process in chunks, with each chunk in its own transaction
 		let total_patterns = patterns.len();
@@ -175,7 +175,7 @@ impl Database {
 			databases.get(&db_id).cloned().ok_or_else(|| anyhow::anyhow!("Database not found".to_string()))?
 		};
 
-		let metadata_turso_db = db_info.metadata.as_ref().unwrap();
+		let Some(metadata_turso_db) = db_info.metadata.as_ref() else { return Err(anyhow::anyhow!("Metadata database not found".to_string())) };
 
 		let conn = metadata_turso_db.connect()?;
 		let mut rows = conn.query("SELECT status, COUNT(*) as count FROM patterns WHERE aspect_id = ? AND database_id = ? GROUP BY status", turso::params![aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string()]).await.map_err(|e| anyhow::anyhow!(format!("Failed to query pattern stats: {e}")))?;
@@ -205,12 +205,12 @@ impl Database {
 		let metadata_db = &self.metadata;
 		let metadata_db_path = self.metadata_path();
 		let cutoff_time = chrono::Utc::now() - chrono::Duration::days(older_than_days);
-		let conn = Self::begin_concurrent(metadata_db, &metadata_db_path).await?;
+		let conn = Self::begin_concurrent(metadata_db, metadata_db_path, Some(self.cache.clone())).await?;
 
 		let res = conn.as_ref().execute("DELETE FROM patterns WHERE aspect_id = ? AND database_id = ? AND status = 'processed' AND processed_at < ?", turso::params![aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string(), cutoff_time.timestamp_millis()]).await;
 		let rows_affected = match res {
 			Ok(rows) => {
-				println!("Cleanup processed patterns affected rows: {}", rows);
+				println!("Cleanup processed patterns affected rows: {rows}");
 				rows
 			}
 			Err(e) => {
@@ -219,8 +219,8 @@ impl Database {
 			}
 		};
 
-		let _ = Database::commit_concurrent(&conn).await;
-		Ok(usize::try_from(rows_affected).map_err(|_| anyhow::anyhow!("Too many rows affected".to_string()))?)
+		let _ = Self::commit_concurrent(&conn).await;
+		usize::try_from(rows_affected).map_err(|_| anyhow::anyhow!("Too many rows affected".to_string()))
 	}
 
 	/// Remove all processed patterns for an aspect (immediate cleanup)
@@ -231,12 +231,12 @@ impl Database {
 	pub async fn cleanup_all_processed_patterns(&self, aspect_id: &AspectId) -> Result<usize> {
 		let metadata_db = &self.metadata;
 		let metadata_db_path = &self.metadata_path;
-		let conn = Self::begin_concurrent(metadata_db, &metadata_db_path).await?;
+		let conn = Self::begin_concurrent(metadata_db, metadata_db_path, Some(self.cache.clone())).await?;
 
 		let res = conn.as_ref().execute("DELETE FROM patterns WHERE aspect_id = ? AND database_id = ? AND status = 'processed'", turso::params![aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string()]).await;
 		let rows_affected = match res {
 			Ok(rows) => {
-				println!("Cleanup all processed patterns affected rows: {}", rows);
+				println!("Cleanup all processed patterns affected rows: {rows}");
 				rows
 			}
 			Err(e) => {
@@ -245,8 +245,8 @@ impl Database {
 			}
 		};
 
-		let _ = Database::commit_concurrent(&conn).await;
-		Ok(usize::try_from(rows_affected).map_err(|_| anyhow::anyhow!("Too many rows affected".to_string()))?)
+		let _ = Self::commit_concurrent(&conn).await;
+		usize::try_from(rows_affected).map_err(|_| anyhow::anyhow!("Too many rows affected".to_string()))
 	}
 
 	/// Get processed patterns for an aspect (for cleanup verification)
@@ -262,7 +262,7 @@ impl Database {
 			databases.get(&db_id).cloned().ok_or_else(|| anyhow::anyhow!("Database not found".to_string()))?
 		};
 
-		let metadata_turso_db = db_info.metadata.as_ref().unwrap();
+		let Some(metadata_turso_db) = db_info.metadata.as_ref() else { return Err(anyhow::anyhow!("Metadata database not found".to_string())) };
 
 		let conn = metadata_turso_db.connect()?;
 		let mut rows = conn.query("SELECT id, occurrences, relatives FROM patterns WHERE aspect_id = ? AND database_id = ? AND status = 'processed' ORDER BY processed_at", turso::params![aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string()]).await.map_err(|e| anyhow::anyhow!(format!("Failed to query processed patterns: {e}")))?;
@@ -298,7 +298,7 @@ impl Database {
 			databases.get(&db_id).cloned().ok_or_else(|| anyhow::anyhow!("Database not found".to_string()))?
 		};
 
-		let metadata_turso_db = db_info.metadata.as_ref().unwrap();
+		let Some(metadata_turso_db) = db_info.metadata.as_ref() else { return Err(anyhow::anyhow!("Metadata database not found".to_string())) };
 
 		let conn = metadata_turso_db.connect()?;
 		let mut rows = conn.query("SELECT id, occurrences, relatives FROM patterns WHERE aspect_id = ? AND database_id = ? AND status = 'processed' ORDER BY processed_at ASC", turso::params![aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string()]).await.map_err(|e| anyhow::anyhow!(format!("Failed to query processed patterns queue: {e}")))?;
@@ -329,12 +329,12 @@ impl Database {
 		let metadata_db = &self.metadata;
 		let metadata_db_path = &self.metadata_path;
 
-		let conn = Self::begin_concurrent(metadata_db, &metadata_db_path).await?;
+		let conn = Self::begin_concurrent(metadata_db, metadata_db_path, Some(self.cache.clone())).await?;
 
 		let res = conn.as_ref().execute("DELETE FROM patterns WHERE id = ? AND status = 'processed'", turso::params![pattern.id().to_string()]).await;
 		let rows_affected = match res {
 			Ok(rows) => {
-				println!("Dequeue processed pattern affected rows: {}", rows);
+				println!("Dequeue processed pattern affected rows: {rows}");
 				rows
 			}
 			Err(e) => {
@@ -343,7 +343,7 @@ impl Database {
 			}
 		};
 
-		let _ = Database::commit_concurrent(&conn).await;
+		let _ = Self::commit_concurrent(&conn).await;
 
 		// Verify that a pattern was actually deleted
 		if rows_affected == 0 {
@@ -363,11 +363,11 @@ impl Database {
 		let metadata_db = &self.metadata;
 		let metadata_db_path = &self.metadata_path;
 
-		let conn = Self::begin_concurrent(metadata_db, &metadata_db_path).await?;
+		let conn = Self::begin_concurrent(metadata_db, metadata_db_path, Some(self.cache.clone())).await?;
 		let res = conn.as_ref().execute("DELETE FROM patterns WHERE aspect_id = ? AND database_id = ? AND status = 'processed'", turso::params![aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string()]).await;
 		let rows_affected = match res {
 			Ok(rows) => {
-				println!("Clear processed patterns queue affected rows: {}", rows);
+				println!("Clear processed patterns queue affected rows: {rows}");
 				rows
 			}
 			Err(e) => {
@@ -376,8 +376,8 @@ impl Database {
 			}
 		};
 
-		let _ = Database::commit_concurrent(&conn).await;
-		Ok(usize::try_from(rows_affected).map_err(|_| anyhow::anyhow!("Too many rows affected".to_string()))?)
+		let _ = Self::commit_concurrent(&conn).await;
+		usize::try_from(rows_affected).map_err(|_| anyhow::anyhow!("Too many rows affected".to_string()))
 	}
 }
 

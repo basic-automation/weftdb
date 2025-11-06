@@ -803,6 +803,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "splimes",
+ "sysinfo",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
