@@ -115,8 +115,8 @@ impl Batch {
 	}
 
 	// Updated: set the batch_id directly (not optional anymore)
-	pub const fn set_batch_id(&mut self, batch_id: BatchId) {
-		self.batch_id = batch_id;
+	pub const fn set_batch_id(&mut self, batch_id: &BatchId) {
+		self.batch_id = *batch_id;
 	}
 
 	#[must_use]

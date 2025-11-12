@@ -13,7 +13,7 @@ use crate::{
 
 #[async_trait::async_trait]
 impl Outputs for Database {
-	async fn get_raw_measurements(&self, aspect_id: AspectId, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, max_per_page: usize, page: usize) -> Result<Vec<Measurement>> {
+	async fn get_raw_measurements(&self, aspect_id: &AspectId, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, max_per_page: usize, page: usize) -> Result<Vec<Measurement>> {
 		// Calculate offset for pagination (0-based page indexing)
 		let offset = page * max_per_page;
 
@@ -138,7 +138,7 @@ impl Outputs for Database {
 
 	/// Helper function to get boundary measurements (earliest 2 and latest 2 points)
 	/// Used when requested range is outside of available data
-	async fn get_boundary_measurements(&self, aspect_id: AspectId) -> Result<Vec<Measurement>> {
+	async fn get_boundary_measurements(&self, aspect_id: &AspectId) -> Result<Vec<Measurement>> {
 		let mut aspect = self.get_aspect(aspect_id).await?;
 		let measurement_db = aspect.measurements().await?;
 		let conn = measurement_db.connect()?;
@@ -207,7 +207,7 @@ impl Outputs for Database {
 	}
 
 	/// Get the total count of measurements for an aspect (useful for pagination)
-	async fn get_measurements_count(&self, aspect_id: AspectId) -> Result<usize> {
+	async fn get_measurements_count(&self, aspect_id: &AspectId) -> Result<usize> {
 		let mut aspect = self.get_aspect(aspect_id).await?;
 		let measurement_db = aspect.measurements().await?;
 
@@ -231,7 +231,7 @@ impl Outputs for Database {
 	/// - if aspect not found
 	/// - if unable to retrieve measurements
 	/// - if interpolation fails
-	async fn analyze_point(&self, aspect_id: AspectId, time: DateTime<Utc>, resolution: Resolution, method: Spline) -> Result<Point> {
+	async fn analyze_point(&self, aspect_id: &AspectId, time: DateTime<Utc>, resolution: &Resolution, method: &Spline) -> Result<Point> {
 		// Check cache first for point analysis
 		let cache_key = format!("point_{}_{}_{}_{:?}_{:?}", aspect_id.as_uuid(), time.timestamp(), time.timestamp_subsec_nanos(), resolution, method);
 		if let Some(cached_result) = self.cache.lock().await.get::<AnalysisResult>(&cache_key).await {
@@ -311,7 +311,7 @@ impl Outputs for Database {
 		// Use splimes::auto_interpolate which handles both interpolation and extrapolation
 		// We just need a single point, so set end_time slightly after our target
 		let end_time = time + resolution.to_step();
-		let interpolated = splimes::auto_interpolate(&mut points, time, end_time, resolution, method).await?;
+		let interpolated = splimes::auto_interpolate(&mut points, time, end_time, *resolution, *method).await?;
 
 		// Get the interpolated point (should be the first and likely only point)
 		let point = interpolated.into_iter().next().unwrap_or_else(|| Point { timestamp: time, value: BigDecimal::zero() });
@@ -344,7 +344,7 @@ impl Outputs for Database {
 	///
 	/// # Errors
 	/// - if interpolation fails
-	async fn analyze_range(&self, aspect_id: AspectId, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, method: Spline) -> Result<Pin<Box<dyn Stream<Item = Result<Point>> + Send + 'static>>> {
+	async fn analyze_range(&self, aspect_id: &AspectId, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, method: Spline) -> Result<Pin<Box<dyn Stream<Item = Result<Point>> + Send + 'static>>> {
 		// Pre-fetch all measurements for the range to avoid async issues in the stream
 		// For very large ranges, this could be optimized further with lazy loading
 		let all_measurements = self.fetch_measurements_for_range(aspect_id, start, end).await?;
@@ -449,13 +449,13 @@ impl Outputs for Database {
 
 	/// Helper function to fetch measurements for a time range using pagination
 	/// Efficiently loads all measurements within the specified time range
-	async fn fetch_measurements_for_range(&self, aspect_id: AspectId, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<Vec<Measurement>> {
+	async fn fetch_measurements_for_range(&self, aspect_id: &AspectId, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<Vec<Measurement>> {
 		let mut all_measurements = Vec::new();
 		let page_size = 10_000; // Reasonable page size for range queries
 		let mut page = 0;
 
 		loop {
-			let measurements = self.get_raw_measurements(aspect_id, Some(start), Some(end), page_size, page).await?;
+			let measurements = self.get_raw_measurements(&aspect_id, Some(start), Some(end), page_size, page).await?;
 
 			if measurements.is_empty() {
 				break; // No more data
@@ -497,7 +497,7 @@ impl Outputs for Database {
 		}
 
 		// Get from database
-		let mut aspect = self.get_aspect(*aspect_id).await?;
+		let mut aspect = self.get_aspect(aspect_id).await?;
 		let unprocessed_batches_db = aspect.unprocessed_batches().await?;
 		let conn = unprocessed_batches_db.connect()?;
 
@@ -543,7 +543,7 @@ impl Outputs for Database {
 		}
 
 		// Get from database
-		let mut aspect = self.get_aspect(*aspect_id).await?;
+		let mut aspect = self.get_aspect(&aspect_id).await?;
 		let unprocessed_batches_db = aspect.unprocessed_batches().await?;
 		let conn = unprocessed_batches_db.connect()?;
 

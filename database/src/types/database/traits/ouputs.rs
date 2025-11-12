@@ -12,19 +12,19 @@ use crate::{AspectId, Batch, BatchId, Measurement};
 pub trait Outputs {
 	// Measurements
 
-	async fn analyze_point(&self, aspect_id: AspectId, time: DateTime<Utc>, resolution: Resolution, method: Spline) -> Result<Point>;
+	async fn analyze_point(&self, aspect_id: &AspectId, time: DateTime<Utc>, resolution: &Resolution, method: &Spline) -> Result<Point>;
 
-	async fn analyze_range(&self, aspect_id: AspectId, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, method: Spline) -> Result<Pin<Box<dyn Stream<Item = Result<Point>> + Send + 'static>>>;
+	async fn analyze_range(&self, aspect_id: &AspectId, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, method: Spline) -> Result<Pin<Box<dyn Stream<Item = Result<Point>> + Send + 'static>>>;
 
-	async fn get_raw_measurements(&self, aspect_id: AspectId, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, max_per_page: usize, page: usize) -> Result<Vec<Measurement>>;
+	async fn get_raw_measurements(&self, aspect_id: &AspectId, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, max_per_page: usize, page: usize) -> Result<Vec<Measurement>>;
 
-	async fn get_measurements_count(&self, aspect_id: AspectId) -> Result<usize>;
+	async fn get_measurements_count(&self, aspect_id: &AspectId) -> Result<usize>;
 
 	async fn parse_measurement_row(&self, row: turso::Row) -> Result<Measurement>;
 
-	async fn get_boundary_measurements(&self, aspect_id: AspectId) -> Result<Vec<Measurement>>;
+	async fn get_boundary_measurements(&self, aspect_id: &AspectId) -> Result<Vec<Measurement>>;
 
-	async fn fetch_measurements_for_range(&self, aspect_id: AspectId, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<Vec<Measurement>>;
+	async fn fetch_measurements_for_range(&self, aspect_id: &AspectId, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<Vec<Measurement>>;
 
 	// UnprocessedBatches
 

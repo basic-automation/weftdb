@@ -39,5 +39,5 @@ pub trait EventDatabase {
 	async fn clear_processed_events_queue(&self) -> Result<usize>;
 
 	/// Clear all events (both processed and unprocessed)
-	async fn clear_all_events(&self, aspect_id: AspectId) -> Result<usize>;
+	async fn clear_all_events(&self, aspect_id: &AspectId) -> Result<usize>;
 }

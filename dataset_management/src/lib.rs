@@ -9,7 +9,6 @@ use chrono::Datelike;
 use database::{
 	database::traits::{AspectStructure, DatabaseStructure, Outputs}, AspectId, BatchId, Database, DictionaryId, Resolution
 };
-
 use futures::StreamExt;
 use rayon::prelude::*;
 use splimes::Spline;
@@ -83,7 +82,7 @@ pub async fn build_processed_batch_queue(database: &Database, aspect_id: &databa
 	println!("Marking batches as processed in database");
 	let total_batch_ids = batch_ids.len();
 	for (i, batch_id) in batch_ids.iter().enumerate() {
-		database.mark_batch_processed_by_id(&batch_id.to_string(), aspect_id).await?;
+		database.mark_batch_processed_by_id(&batch_id, aspect_id).await?;
 
 		if (i + 1) % 1000 == 0 || (i + 1) == total_batch_ids {
 			println!("Marked {} / {} batch IDs as processed", i + 1, total_batch_ids);
@@ -442,7 +441,7 @@ pub async fn create_event_and_manifestations(database: &Database, aspect: &Aspec
 	let end_time = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
 
 	// Use optimized bulk analysis to get all points
-	let mut point_stream = Outputs::analyze_range(database, *aspect, start_time, end_time, *resolution, *method).await?;
+	let mut point_stream = Outputs::analyze_range(database, aspect, start_time, end_time, *resolution, *method).await?;
 
 	let mut points = Vec::new();
 	while let Some(result) = point_stream.next().await {
@@ -521,7 +520,7 @@ pub async fn create_correlations_for_events(database: &Database, dictionary: &Di
 	// Get patterns directly from database (not from dictionary object which may have filtered patterns)
 	let patterns = database.get_patterns_from_dictionary(dictionary.name(), aspect_id).await?;
 	let events = database.get_unprocessed_events().await?;
-	let aspect = database.get_aspect(*aspect_id).await?;
+	let aspect = database.get_aspect(aspect_id).await?;
 
 	// Exit early if no patterns or events to correlate
 	if patterns.is_empty() || events.is_empty() {
@@ -790,7 +789,6 @@ mod tests {
 	use serde_json::json;
 	use serial_test::serial;
 	use splimes::Spline;
-
 
 	use super::*;
 

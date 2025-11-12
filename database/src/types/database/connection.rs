@@ -39,7 +39,7 @@ impl Connection for Database {
 
 		// Wrap in our Connection type and cache it
 		let cached_conn = cache::Connection::new(conn);
-	        cache.lock().await.store::<cache::Connection>(cache_key, cached_conn.clone()).await;
+		cache.lock().await.store::<cache::Connection>(cache_key, cached_conn.clone()).await;
 
 		Ok(cached_conn)
 	}

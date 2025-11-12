@@ -17,13 +17,13 @@ impl Inputs for Database {
 	/// # Errors
 	/// - if aspect not found
 	/// - if unable to insert measurement into database
-	async fn capture_measurement(&self, aspect_id: AspectId, dataset_id: DatasetId, input_measurement: InputMeasurement) -> Result<TxId> {
+	async fn capture_measurement(&self, aspect_id: &AspectId, dataset_id: &DatasetId, input_measurement: &InputMeasurement) -> Result<TxId> {
 		let mut aspect = self.get_aspect(aspect_id).await?;
 		let measurement_db = aspect.measurements().await?;
 		let cache_key = format!("measurement_db_{aspect_id}_{dataset_id}");
 		let tx_id = TxId::new();
 
-		let measurement = Measurement::from_input_measurement(dataset_id, &input_measurement);
+		let measurement = Measurement::from_input_measurement(dataset_id, input_measurement);
 
 		// Use INSERT ... ON CONFLICT for atomic upsert with concurrent writes support
 		// This handles the case where a measurement with the same timestamp already exists
@@ -58,7 +58,7 @@ impl Inputs for Database {
 	///
 	/// # Errors
 	/// - if measurement with the same timestamp already exists
-	async fn capture_new_measurement(&self, aspect_id: AspectId, dataset_id: DatasetId, input_measurement: InputMeasurement) -> Result<TxId> {
+	async fn capture_new_measurement(&self, aspect_id: &AspectId, dataset_id: &DatasetId, input_measurement: &InputMeasurement) -> Result<TxId> {
 		let mut aspect = self.get_aspect(aspect_id).await?;
 		let measurement_db = aspect.measurements().await?;
 		let measurement_db_path = aspect.aspect_path();
@@ -111,7 +111,7 @@ impl Inputs for Database {
 			return Ok(Vec::new());
 		}
 
-		let mut aspect = self.get_aspect(aspect_id).await?;
+		let mut aspect = self.get_aspect(&aspect_id).await?;
 		let measurement_db = aspect.measurements().await?;
 
 		// Generate all TxIds upfront
@@ -185,7 +185,7 @@ impl Inputs for Database {
 			let result = async {
 				for (i, input_measurement) in chunk.iter().enumerate() {
 					let tx_id = &all_tx_ids[tx_id_offset + i];
-					let measurement = Measurement::from_input_measurement(dataset_id, input_measurement);
+					let measurement = Measurement::from_input_measurement(&dataset_id, input_measurement);
 
 					let upsert_sql = r"
 						INSERT INTO measurements (id, dataset_id, timestamp, value) 
@@ -213,7 +213,7 @@ impl Inputs for Database {
 							let em = e.to_string().to_lowercase();
 							if attempt < max_attempts && (em.contains("locked") || em.contains("busy")) {
 								attempt += 1;
-                                                                let attempt_min_8: u32 = u32::try_from(attempt.min(8)).unwrap_or(8);
+								let attempt_min_8: u32 = u32::try_from(attempt.min(8)).unwrap_or(8);
 								let sleep_ms = 400u64 * (1u64 << attempt_min_8);
 								tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
 								continue;
@@ -230,7 +230,7 @@ impl Inputs for Database {
 						if attempt >= max_attempts {
 							return Err(Error::DatabaseError(format!("Failed to process chunk after retries: {e}")).into());
 						}
-                                                let attempt_min_8: u32 = u32::try_from(attempt.min(8)).unwrap_or(8);
+						let attempt_min_8: u32 = u32::try_from(attempt.min(8)).unwrap_or(8);
 						let sleep_ms = 600u64 * (1u64 << attempt_min_8);
 						tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
 						continue;
@@ -244,16 +244,18 @@ impl Inputs for Database {
 	}
 
 	/// Batch insert new measurements - skips duplicates (implement missing trait method)
-	async fn batch_capture_new_measurements(&self, aspect_id: AspectId, dataset_id: DatasetId, input_measurements: Vec<InputMeasurement>) -> Result<Vec<TxId>> {
+	async fn batch_capture_new_measurements(&self, aspect_id: &AspectId, dataset_id: &DatasetId, input_measurements: Vec<InputMeasurement>) -> Result<Vec<TxId>> {
 		let mut tx_ids = Vec::new();
 		for m in input_measurements {
-			if let Ok(tx) = self.capture_new_measurement(aspect_id, dataset_id, m).await { tx_ids.push(tx) }
+			if let Ok(tx) = self.capture_new_measurement(aspect_id, dataset_id, &m).await {
+				tx_ids.push(tx)
+			}
 		}
 		Ok(tx_ids)
 	}
 
 	/// Capture new measurement chunk (implement missing trait method - simple loop)
-	async fn capture_new_measurement_chunk(&self, db: &turso::Database, db_path: &str, dataset_id: DatasetId, chunk: &[InputMeasurement], all_tx_ids: &[TxId], tx_id_offset: usize) -> Result<Vec<TxId>> {
+	async fn capture_new_measurement_chunk(&self, db: &turso::Database, db_path: &str, dataset_id: &DatasetId, chunk: &[InputMeasurement], all_tx_ids: &[TxId], tx_id_offset: usize) -> Result<Vec<TxId>> {
 		let mut successful = Vec::new();
 		for (i, m) in chunk.iter().enumerate() {
 			let tx_id = &all_tx_ids[tx_id_offset + i];
@@ -289,7 +291,7 @@ impl Inputs for Database {
 	}
 
 	/// Insert unprocessed batch (implement missing trait method)
-	async fn insert_unprocessed_batch(&self, aspect_id: AspectId, batch: &Batch) -> Result<TxId> {
+	async fn insert_unprocessed_batch(&self, aspect_id: &AspectId, batch: &Batch) -> Result<TxId> {
 		let tx_id = TxId::new();
 		let measurements_json = serde_json::to_string(&batch.measurements).map_err(|e| Error::DatabaseError(format!("Failed to serialize: {e}")))?;
 		let batch_hash = format!("{:x}", md5::compute(&measurements_json));
@@ -300,13 +302,13 @@ impl Inputs for Database {
 			INSERT INTO batches (id, aspect_id, database_id, size, resolution, measurements, batch_hash, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(id) DO NOTHING
 		";
-                
-                let batch_metadata_size: i64 = match i64::try_from(batch.metadata.size) {
-                    Ok(size) => size,
-                    Err(e) => {
-                        return Err(anyhow::anyhow!("Batch size conversion error: {e}"));
-                    }
-                };
+
+		let batch_metadata_size: i64 = match i64::try_from(batch.metadata.size) {
+			Ok(size) => size,
+			Err(e) => {
+				return Err(anyhow::anyhow!("Batch size conversion error: {e}"));
+			}
+		};
 
 		let res = conn.as_ref().execute(insert_sql, turso::params![batch_id.clone(), aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string(), batch_metadata_size, format!("{:?}", batch.metadata.resolution), measurements_json.clone(), batch_hash.clone(), "unprocessed", chrono::Utc::now().timestamp_millis()]).await;
 		match res {
@@ -327,7 +329,7 @@ impl Inputs for Database {
 	async fn batch_insert_unprocessed_batches(&self, aspect_id: AspectId, batches: Vec<Batch>) -> Result<Vec<TxId>> {
 		let mut tx_ids = Vec::new();
 		for b in batches {
-			let tx = self.insert_unprocessed_batch(aspect_id, &b).await?;
+			let tx = self.insert_unprocessed_batch(&aspect_id, &b).await?;
 			tx_ids.push(tx);
 		}
 		Ok(tx_ids)
@@ -339,19 +341,19 @@ impl Inputs for Database {
 		for b in chunk {
 			let tx_id = TxId::new();
 			let insert_sql = r"INSERT INTO batches (id, aspect_id, database_id, size, resolution, measurements, batch_hash, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
-                        let batch_metadata_size: i64 = match i64::try_from(b.metadata.size) {
-                            Ok(size) => size,
-                            Err(e) => {
-                                return Err(anyhow::anyhow!("Batch size conversion error: {e}"));
-                            }
-                        };
+			let batch_metadata_size: i64 = match i64::try_from(b.metadata.size) {
+				Ok(size) => size,
+				Err(e) => {
+					return Err(anyhow::anyhow!("Batch size conversion error: {e}"));
+				}
+			};
 
-                        let batch_measurements_len: i64 = match i64::try_from(b.measurements.len()) {
-                            Ok(len) => len,
-                            Err(e) => {
-                                return Err(anyhow::anyhow!("Batch measurements length conversion error: {e}"));
-                            }
-                        };
+			let batch_measurements_len: i64 = match i64::try_from(b.measurements.len()) {
+				Ok(len) => len,
+				Err(e) => {
+					return Err(anyhow::anyhow!("Batch measurements length conversion error: {e}"));
+				}
+			};
 
 			let res = conn.as_ref().execute(insert_sql, turso::params![b.id().to_string(), b.metadata.aspect.as_uuid().to_string(), self.id().as_uuid().to_string(), batch_metadata_size, format!("{:?}", b.metadata.resolution), "{}", batch_measurements_len, "stub_hash", "unprocessed", chrono::Utc::now().timestamp_millis()]).await;
 			match res {
@@ -371,17 +373,17 @@ impl Inputs for Database {
 		let measurements_json = serde_json::to_string(&batch.measurements).map_err(|e| Error::DatabaseError(format!("Failed to serialize: {e}")))?;
 		let batch_hash = format!("{:x}", md5::compute(&measurements_json));
 		let batch_id = batch.batch_id().to_string();
-		let mut aspect = self.get_aspect(aspect_id).await?;
+		let mut aspect = self.get_aspect(&aspect_id).await?;
 		let conn = Self::begin_concurrent(&aspect.measurements().await?, &format!("{}/measurements.db", aspect.aspect_path()), Some(self.cache.clone())).await?;
 		let insert_sql = r"INSERT INTO batches (id, aspect_id, database_id, size, resolution, measurements, batch_hash, status, created_at, processed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
-                let batch_metadata_size: i64 = match i64::try_from(batch.metadata.size) {
-                    Ok(size) => size,
-                    Err(e) => {
-                        Self::rollback_concurrent(&conn).await?;
-                        return Err(anyhow::anyhow!("Batch size conversion error: {e}"));
-                    }
-                };
+		let batch_metadata_size: i64 = match i64::try_from(batch.metadata.size) {
+			Ok(size) => size,
+			Err(e) => {
+				Self::rollback_concurrent(&conn).await?;
+				return Err(anyhow::anyhow!("Batch size conversion error: {e}"));
+			}
+		};
 
 		let res = conn.as_ref().execute(insert_sql, turso::params![batch_id.clone(), aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string(), batch_metadata_size, format!("{:?}", batch.metadata.resolution), measurements_json.clone(), batch_hash.clone(), "processed", chrono::Utc::now().timestamp_millis(), chrono::Utc::now().timestamp_millis()]).await;
 		match res {

@@ -59,7 +59,7 @@ impl Batches {
 			bail!("Resolution is less than minimum resolution for aspect");
 		}
 
-		let mut stream = Outputs::analyze_range(database, *aspect, start_time, end_time, *resolution, *method).await?;
+		let mut stream = Outputs::analyze_range(database, aspect, start_time, end_time, *resolution, *method).await?;
 		let mut points: Vec<splimes::Point> = Vec::new();
 		while let Some(result) = stream.next().await {
 			match result {
@@ -107,7 +107,7 @@ impl Batches {
 			bail!("Resolution is less than minimum resolution for aspect");
 		}
 
-		let mut stream = Outputs::analyze_range(database, *aspect, start_time, end_time, *resolution, *method).await?;
+		let mut stream = Outputs::analyze_range(database, aspect, start_time, end_time, *resolution, *method).await?;
 		let mut points: Vec<splimes::Point> = Vec::new();
 		while let Some(result) = stream.next().await {
 			match result {

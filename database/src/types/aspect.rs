@@ -81,7 +81,7 @@ pub struct Aspect {
 
 #[async_trait::async_trait]
 impl AspectStructure for Aspect {
-	async fn new(id: Option<AspectId>, name: String, subject_id: SubjectId, resolution: Resolution, metadata_conn: &Connection) -> Result<Self> {
+	async fn new(id: Option<AspectId>, name: &str, subject_id: &SubjectId, resolution: &Resolution, metadata_conn: &Connection) -> Result<Self> {
 		let id = id.unwrap_or_default();
 		let subject_name = Self::get_subject_name(metadata_conn, subject_id).await?;
 		let db_name = <Database as Config>::db_name(metadata_conn).await?;
@@ -166,9 +166,9 @@ impl AspectStructure for Aspect {
 		#[rustfmt::skip]
 		Ok(Self {
 			id,
-			name,
-			subject_id,
-			resolution,
+			name: name.to_string(),
+			subject_id: *subject_id,
+			resolution: *resolution,
 			database_metadata_db_path,
 			subject_name,
 			path: aspect_path,
@@ -191,7 +191,7 @@ impl AspectStructure for Aspect {
 	/// without opening or wireframing per-aspect databases. This avoids
 	/// holding metadata DB locks during expensive IO when simply listing
 	/// aspects or performing existence checks.
-	async fn from_metadata(id: Option<AspectId>, name: String, subject_id: SubjectId, resolution: Resolution, database_metadata_db_path: String, subject_name_opt: Option<String>) -> Result<Self> {
+	async fn from_metadata(id: Option<AspectId>, name: String, subject_id: &SubjectId, resolution: &Resolution, database_metadata_db_path: String, subject_name_opt: Option<String>) -> Result<Self> {
 		let provided_subject_name = if let Some(sn) = subject_name_opt {
 			sn
 		} else {
@@ -214,7 +214,28 @@ impl AspectStructure for Aspect {
 		let events_path = aspect_path_str.clone() + "/events.db";
 		let correlations_path = aspect_path_str.clone() + "/correlations.db";
 
-		Ok(Self { id: id.unwrap_or_default(), name, subject_id, resolution, database_metadata_db_path, subject_name: provided_subject_name, path: aspect_path_str, measurements: None, unprocessed_batches: None, processed_batches: None, patterns: None, events: None, correlations: None, measurements_path, unprocessed_batches_path, processed_batches_path, patterns_path, events_path, correlations_path })
+		#[rustfmt::skip]
+		Ok(Self {
+                        id: id.unwrap_or_default(),
+                        name: name.to_string(),
+                        subject_id: *subject_id,
+                        resolution: *resolution,
+                        database_metadata_db_path: database_metadata_db_path.to_string(),
+                        subject_name: provided_subject_name,
+                        path: aspect_path_str,
+                        measurements: None,
+                        unprocessed_batches: None,
+                        processed_batches: None,
+                        patterns: None,
+                        events: None,
+                        correlations: None,
+                        measurements_path,
+                        unprocessed_batches_path,
+                        processed_batches_path,
+                        patterns_path,
+                        events_path,
+                        correlations_path
+                })
 	}
 
 	fn id(&self) -> AspectId {
@@ -258,7 +279,7 @@ impl AspectStructure for Aspect {
 		Ok(metadata_path)
 	}
 
-	async fn get_subject_name(conn: &Connection, subject_id: SubjectId) -> Result<String> {
+	async fn get_subject_name(conn: &Connection, subject_id: &SubjectId) -> Result<String> {
 		// Read-only query with simple retry/backoff; no explicit transaction to avoid writer locks
 		let res = conn.as_ref().query("SELECT name FROM subjects WHERE id = ?", turso::params![subject_id.as_uuid().to_string()]).await;
 		let subject_name = match res {
@@ -272,7 +293,7 @@ impl AspectStructure for Aspect {
 		Ok(subject_name)
 	}
 
-	async fn get_aspect_path(conn: &Connection, metadata_path: &str, subject_id: SubjectId, aspect_name: String) -> Result<String> {
+	async fn get_aspect_path(conn: &Connection, metadata_path: &str, subject_id: &SubjectId, aspect_name: &str) -> Result<String> {
 		let subject_name = Self::get_subject_name(conn, subject_id).await?;
 		let aspect_metadata_path = std::path::Path::new(&metadata_path).parent().ok_or_else(|| anyhow::anyhow!("Cannot determine database directory"))?.join(subject_name).join(aspect_name);
 		if aspect_metadata_path.exists() {

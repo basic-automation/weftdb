@@ -97,7 +97,7 @@ pub struct Correlation {
 
 impl Correlation {
 	#[must_use]
-        #[allow(clippy::too_many_arguments)]
+	#[allow(clippy::too_many_arguments)]
 	pub fn new(id: Option<CorrelationID>, dictionary_id: DictionaryId, subject_id: SubjectId, aspect_id: &AspectId, pattern_id: PatternID, event_id: EventID, error_rate: HashMap<SignalType, ErrorRate>, occurrences: Vec<Occurrence>) -> Self {
 		let id = id.unwrap_or_default();
 		Self { id, dictionary_id, subject_id, aspect_id: *aspect_id, pattern_id, event_id, error_rate, occurrences }

@@ -406,7 +406,7 @@ impl Database {
 	/// # Errors
 	/// - if database not found
 	/// - if unable to delete events
-	pub async fn clear_all_events(&self, aspect_id: AspectId) -> Result<usize> {
+	pub async fn clear_all_events(&self, aspect_id: &AspectId) -> Result<usize> {
 		let mut aspect = self.get_aspect(aspect_id).await?;
 		let event_db_path = &aspect.events_path();
 		let event_db = &aspect.events().await?;
@@ -477,7 +477,7 @@ impl super::traits::EventDatabase for Database {
 		self.clear_processed_events_queue().await
 	}
 
-	async fn clear_all_events(&self, aspect_id: AspectId) -> Result<usize> {
+	async fn clear_all_events(&self, aspect_id: &AspectId) -> Result<usize> {
 		self.clear_all_events(aspect_id).await
 	}
 }

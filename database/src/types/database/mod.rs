@@ -466,7 +466,7 @@ impl DatabaseStructure for Database {
 				let aspect_id = AspectId::from_uuid(Uuid::parse_str(&aspect_id_str)?);
 				let resolution: Resolution = serde_json::from_str(&resolution_str)?;
 
-				let aspect = Aspect::new(Some(aspect_id), aspect_name, subject_id, resolution, &conn).await?;
+				let aspect = Aspect::new(Some(aspect_id), &aspect_name, &subject_id, &resolution, &conn).await?;
 				subject.add_aspect(aspect);
 			}
 
@@ -632,7 +632,7 @@ impl DatabaseStructure for Database {
 	}
 
 	/// Get a subject by its ID
-	async fn get_subject(&self, id: SubjectId) -> Result<Subject> {
+	async fn get_subject(&self, id: &SubjectId) -> Result<Subject> {
 		// Read-only subject lookup with busy_timeout and retry; avoid transactions to reduce lock contention
 		println!("[DEBUG] Getting subject by ID: {}", id.as_uuid());
 
@@ -641,19 +641,21 @@ impl DatabaseStructure for Database {
 		let res = conn.as_ref().query("SELECT id, name, database_id FROM subjects WHERE id = ?", turso::params![id.as_uuid().to_string()]).await;
 
 		let subject = match res {
-			Ok(mut rows) => if let Some(row) = rows.next().await? {
-   					println!("[DEBUG] Found subject row for ID {}", id.as_uuid());
-   					let subject_id_str = Self::value_to_string(&row.get_value(0)?, "Subject ID").await?;
-   					let name = Self::value_to_string(&row.get_value(1)?, "Subject name").await?;
-   					let database_id_str = Self::value_to_string(&row.get_value(2)?, "Database ID").await?;
+			Ok(mut rows) => {
+				if let Some(row) = rows.next().await? {
+					println!("[DEBUG] Found subject row for ID {}", id.as_uuid());
+					let subject_id_str = Self::value_to_string(&row.get_value(0)?, "Subject ID").await?;
+					let name = Self::value_to_string(&row.get_value(1)?, "Subject name").await?;
+					let database_id_str = Self::value_to_string(&row.get_value(2)?, "Database ID").await?;
 
-   					let subject_id = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str)?);
-   					let database_id = DatabaseId::from_uuid(Uuid::parse_str(&database_id_str)?);
-   					Subject::new(Some(subject_id), name, database_id, self.metadata_path.clone()).await?
-   				} else {
-   					println!("[DEBUG] Subject ID {} not found in database", id.as_uuid());
-   					return Err(anyhow::anyhow!("Subject not found"));
-   				},
+					let subject_id = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str)?);
+					let database_id = DatabaseId::from_uuid(Uuid::parse_str(&database_id_str)?);
+					Subject::new(Some(subject_id), name, database_id, self.metadata_path.clone()).await?
+				} else {
+					println!("[DEBUG] Subject ID {} not found in database", id.as_uuid());
+					return Err(anyhow::anyhow!("Subject not found"));
+				}
+			}
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("SQL execution failure 12: in get_subject: `{}`", e));
@@ -681,8 +683,8 @@ impl DatabaseStructure for Database {
 
 			return Subject::new(Some(subject_id), name, database_id, self.metadata_path.clone()).await;
 		}
-  			Self::rollback_concurrent(&conn).await?;
-  			return Err(anyhow::anyhow!("Subject not found"));
+		Self::rollback_concurrent(&conn).await?;
+		return Err(anyhow::anyhow!("Subject not found"));
 	}
 
 	/// Remove a subject from observation
@@ -692,7 +694,7 @@ impl DatabaseStructure for Database {
 	///
 	/// # Errors
 	/// Returns an error if the subject does not exist
-	async fn remove_subject(&self, id: SubjectId) -> Result<()> {
+	async fn remove_subject(&self, id: &SubjectId) -> Result<()> {
 		// Retrieve subject from metadata database
 		let subject = self.get_subject(id).await?;
 		let metadata_db = &self.metadata;
@@ -755,7 +757,7 @@ impl DatabaseStructure for Database {
 	}
 
 	/// List all tracked aspects of a subject
-	async fn list_aspects(&self, subject_id: SubjectId) -> Result<Vec<Aspect>> {
+	async fn list_aspects(&self, subject_id: &SubjectId) -> Result<Vec<Aspect>> {
 		let conn = Self::begin_concurrent(&self.metadata, &self.metadata_path, Some(self.cache.clone())).await?;
 		let result = conn.as_ref().query("SELECT id, name, subject_id, resolution FROM aspects WHERE subject_id = ?", turso::params![subject_id.as_uuid().to_string()]).await;
 
@@ -775,7 +777,7 @@ impl DatabaseStructure for Database {
 					let aspect_id = AspectId::from_uuid(Uuid::parse_str(&aspect_id_str)?);
 					let subject_id_parsed = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str)?);
 					let resolution: Resolution = serde_json::from_str(&resolution_str)?;
-					aspects.push(Aspect::from_metadata(Some(aspect_id), name, subject_id_parsed, resolution, self.metadata_path.clone(), None).await?);
+					aspects.push(Aspect::from_metadata(Some(aspect_id), name, &subject_id_parsed, &resolution, self.metadata_path.clone(), None).await?);
 				}
 
 				let _ = Self::commit_concurrent(&conn).await;
@@ -797,7 +799,7 @@ impl DatabaseStructure for Database {
 	///
 	/// # Errors
 	/// Returns an error if the subject does not exist or aspect creation fails or the aspect already exists.
-	async fn track_aspect(&self, subject_id: SubjectId, name: &str, resolution: Resolution) -> Result<Aspect> {
+	async fn track_aspect(&self, subject_id: &SubjectId, name: &str, resolution: &Resolution) -> Result<Aspect> {
 		println!("[DEBUG] Tracking aspect '{}' for subject {}", name, subject_id.as_uuid());
 		// Check if subject exists
 		println!("[DEBUG] Retrieving subject with ID: {}", subject_id.as_uuid());
@@ -846,7 +848,7 @@ impl DatabaseStructure for Database {
 		// Release the aspect creation mutex (it was locked above) implicitly by letting the
 		// earlier guard drop (we only held it across the insertion). Now perform the
 		// heavier wireframing without holding the metadata lock.
-		let aspect = Aspect::new(Some(aspect_id), name.to_string(), subject_id, resolution, &conn).await?;
+		let aspect = Aspect::new(Some(aspect_id), name, subject_id, resolution, &conn).await?;
 
 		let _ = Self::commit_concurrent(&conn).await;
 
@@ -874,7 +876,7 @@ impl DatabaseStructure for Database {
 		Ok(aspect)
 	}
 
-	async fn get_aspect(&self, id: AspectId) -> Result<Aspect> {
+	async fn get_aspect(&self, id: &AspectId) -> Result<Aspect> {
 		let conn = Self::begin_concurrent(&self.metadata, &self.metadata_path, Some(self.cache.clone())).await?;
 
 		// No explicit transaction for a read-only, single-row query; add retry on transient locks
@@ -899,7 +901,7 @@ impl DatabaseStructure for Database {
 					let subject_id = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str)?);
 					let resolution: Resolution = serde_json::from_str(&resolution_str)?;
 
-					Aspect::new(Some(aspect_id), name, subject_id, resolution, &conn).await?
+					Aspect::new(Some(aspect_id), &name, &subject_id, &resolution, &conn).await?
 				} else {
 					bail!("Aspect not found");
 				}
@@ -937,7 +939,7 @@ impl DatabaseStructure for Database {
 					let subject_id = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str)?);
 					let resolution: Resolution = serde_json::from_str(&resolution_str)?;
 
-					Aspect::new(Some(aspect_id), name, subject_id, resolution, &conn).await?
+					Aspect::new(Some(aspect_id), &name, &subject_id, &resolution, &conn).await?
 				} else {
 					bail!("Aspect not found");
 				}
@@ -964,7 +966,7 @@ impl DatabaseStructure for Database {
 					if timestamp_str.is_empty() {
 						return Ok(None);
 					}
-					
+
 					DateTime::parse_from_rfc3339(&timestamp_str)?.with_timezone(&Utc)
 				} else {
 					return Ok(None);
@@ -1006,7 +1008,7 @@ impl DatabaseStructure for Database {
 	}
 
 	async fn get_aspect_resolution(&self, aspect_id: &AspectId) -> Result<Resolution> {
-		let aspect = self.get_aspect(*aspect_id).await?;
+		let aspect = self.get_aspect(aspect_id).await?;
 		let resolution = aspect.resolution();
 		Ok(resolution)
 	}
@@ -1033,17 +1035,17 @@ impl DatabaseStructure for Database {
 pub struct DatabaseId(Uuid);
 
 impl DatabaseId {
-	#[must_use] 
+	#[must_use]
 	pub fn new() -> Self {
 		Self(Uuid::new_v4())
 	}
 
-	#[must_use] 
+	#[must_use]
 	pub const fn from_uuid(uuid: Uuid) -> Self {
 		Self(uuid)
 	}
 
-	#[must_use] 
+	#[must_use]
 	pub const fn as_uuid(&self) -> Uuid {
 		self.0
 	}
@@ -1135,7 +1137,6 @@ impl DatabaseInfo {
 		&self.metadata_path
 	}
 
-	
 	pub fn set_metadata_path(&mut self, path: Option<String>) {
 		self.metadata_path = path;
 	}
