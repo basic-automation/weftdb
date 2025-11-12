@@ -4,7 +4,7 @@ use ::database::database::traits::{AspectStructure, Inputs};
 use anyhow::{Context, Result};
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use database::{database::traits::DatabaseStructure, Aspect, Database, DatasetId, InputMeasurement, Outputs, Subject, DATABASES, Config};
+use database::{database::traits::DatabaseStructure, Aspect, Config, Database, DatasetId, InputMeasurement, Outputs, Subject, DATABASES};
 use rayon::prelude::*;
 use splimes::{Resolution, Spline};
 #[cfg(test)]

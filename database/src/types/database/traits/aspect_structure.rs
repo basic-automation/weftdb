@@ -1,7 +1,7 @@
 use anyhow::Result;
 use splimes::Resolution;
 
-use crate::{cache::Connection, Aspect, AspectId, SubjectId};
+use crate::{cache::Connection, AspectId, SubjectId};
 
 /// Trait for database structure operations
 /// This trait defines the operations related to managing the structure of the database.
@@ -11,7 +11,7 @@ use crate::{cache::Connection, Aspect, AspectId, SubjectId};
 pub trait AspectStructure {
 	// Aspect
 
-	async fn new(id: Option<AspectId>, name: String, subject_id: SubjectId, resolution: Resolution, metadata_conn: &Connection) -> Result<Self>
+	async fn new(id: Option<AspectId>, name: &str, subject_id: &SubjectId, resolution: &Resolution, metadata_conn: &Connection) -> Result<Self>
 	where
 		Self: Sized;
 
@@ -19,7 +19,9 @@ pub trait AspectStructure {
 	/// without opening or wireframing per-aspect databases. Useful for
 	/// existence checks and listing operations where we want to avoid
 	/// holding metadata DB locks.
-	async fn from_metadata(id: Option<AspectId>, name: String, subject_id: SubjectId, resolution: Resolution, database_metadata_db_path: String, subject_name_opt: Option<String>) -> Result<Aspect>;
+	async fn from_metadata(id: Option<AspectId>, name: String, subject_id: &SubjectId, resolution: &Resolution, database_metadata_db_path: String, subject_name_opt: Option<String>) -> Result<Self>
+	where
+		Self: Sized;
 
 	fn id(&self) -> AspectId;
 
@@ -37,9 +39,9 @@ pub trait AspectStructure {
 
 	async fn get_database_metadata_path(turso_db_path: String) -> Result<String>;
 
-	async fn get_subject_name(conn: &Connection, subject_id: SubjectId) -> Result<String>;
+	async fn get_subject_name(conn: &Connection, subject_id: &SubjectId) -> Result<String>;
 
-	async fn get_aspect_path(conn: &Connection, metadata_path: &str, subject_id: SubjectId, aspect_name: String) -> Result<String>;
+	async fn get_aspect_path(conn: &Connection, metadata_path: &str, subject_id: &SubjectId, aspect_name: &str) -> Result<String>;
 
 	/// get measurements database
 	async fn measurements(&mut self) -> Result<turso::Database>;

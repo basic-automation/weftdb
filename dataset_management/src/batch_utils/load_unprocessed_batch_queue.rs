@@ -20,7 +20,7 @@ pub async fn build_unprocessed_queue(database: &Database, aspect: &AspectId, res
 	let end_time = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
 
 	// Collect all points first to create sliding window batches
-	let mut point_stream = Outputs::analyze_range(database, *aspect, start_time, end_time, *resolution, *method).await?;
+	let mut point_stream = Outputs::analyze_range(database, aspect, start_time, end_time, *resolution, *method).await?;
 	let mut all_points = Vec::new();
 	while let Some(result) = point_stream.next().await {
 		let point = result?;
@@ -58,7 +58,7 @@ pub async fn build_unprocessed_queue(database: &Database, aspect: &AspectId, res
 
 		println!("Storing {} batches in database...", batches.len());
 		// Store all batches at once using bulk insert
-		database.store_batches(&batches).await?;
+		database.store_unprocessed_batches(&batches).await?;
 	}
 
 	// Note: No longer using global queue length since batches are stored in database

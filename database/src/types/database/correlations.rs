@@ -13,7 +13,7 @@ impl Database {
 	/// - if unable to insert correlation
 	pub async fn store_correlation_in_dictionary(&self, correlation: &Correlation) -> Result<()> {
 		let aspect_id = correlation.aspect_id();
-		let mut aspect = self.get_aspect(*aspect_id).await?;
+		let mut aspect = self.get_aspect(aspect_id).await?;
 		let correlations_db = aspect.correlations().await?;
 		let correlation_path = aspect.correlations_path();
 
@@ -31,9 +31,9 @@ impl Database {
 		let current_timestamp = chrono::Utc::now().timestamp_millis();
 		let res = conn.as_ref().execute("INSERT INTO correlations (id, dictionary_id, pattern_id, event_id, error_rates, occurrences, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", turso::params![correlation_id.clone(), correlation.dictionary_id().as_uuid().to_string(), correlation.pattern_id().to_string(), correlation.event_id().to_string(), error_rate_json.clone(), occurrences_json.clone(), current_timestamp, current_timestamp]).await;
 
-		if res.is_ok() { 
-                        println!("Correlation inserted successfully"); 
-                } else {
+		if res.is_ok() {
+			println!("Correlation inserted successfully");
+		} else {
 			Self::rollback_concurrent(&conn).await?;
 			bail!("Failed to insert correlation");
 		}
@@ -48,7 +48,7 @@ impl Database {
 	/// - if database not found
 	/// - if unable to query correlations
 	pub async fn get_correlations_from_dictionary(&self, aspect_id: &AspectId) -> Result<Vec<Correlation>> {
-		let mut aspect = self.get_aspect(*aspect_id).await?;
+		let mut aspect = self.get_aspect(aspect_id).await?;
 		let correlations_turso_db = &aspect.correlations().await?;
 		let correlation_db_path = &aspect.correlations_path();
 		let conn = Self::begin_concurrent(correlations_turso_db, correlation_db_path, Some(self.cache.clone())).await?;
@@ -96,7 +96,7 @@ impl Database {
 	/// - if database not found
 	/// - if unable to query correlation
 	pub async fn get_correlation_by_id_from_dictionary(&self, correlation_id: &CorrelationID, aspect_id: &AspectId) -> Result<Option<Correlation>> {
-		let mut aspect = self.get_aspect(*aspect_id).await?;
+		let mut aspect = self.get_aspect(aspect_id).await?;
 		let correlations_db = &aspect.correlations().await?;
 		let correlation_db_path = &aspect.correlations_path();
 		let conn = Self::begin_concurrent(correlations_db, correlation_db_path, Some(self.cache.clone())).await?;
@@ -155,7 +155,7 @@ impl Database {
 	/// - if database not found
 	/// - if unable to delete correlation
 	pub async fn delete_correlation_from_dictionary(&self, correlation_id: &CorrelationID, aspect_id: &AspectId) -> Result<bool> {
-		let mut aspect = self.get_aspect(*aspect_id).await?;
+		let mut aspect = self.get_aspect(aspect_id).await?;
 		let correlations_db = &aspect.correlations().await?;
 		let correlation_db_path = &aspect.correlations_path();
 		let conn = Self::begin_concurrent(correlations_db, correlation_db_path, Some(self.cache.clone())).await?;

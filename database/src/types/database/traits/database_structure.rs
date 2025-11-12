@@ -86,27 +86,27 @@ pub trait DatabaseStructure {
 	async fn observe_subject(&self, name: &str) -> Result<Subject>;
 
 	/// Get a subject by its ID
-	async fn get_subject(&self, id: SubjectId) -> Result<Subject>;
+	async fn get_subject(&self, id: &SubjectId) -> Result<Subject>;
 
 	/// Get a Subject by its name
 	async fn get_subject_by_name(&self, name: &str) -> Result<Subject>;
 
 	/// Remove a subject from observation
-	async fn remove_subject(&self, id: SubjectId) -> Result<()>;
+	async fn remove_subject(&self, id: &SubjectId) -> Result<()>;
 
 	/// List all subjects in the database
 	async fn list_subjects(&self) -> Result<Vec<Subject>>;
 
 	/// List all tracked aspects of a subject
-	async fn list_aspects(&self, subject_id: SubjectId) -> Result<Vec<Aspect>>;
+	async fn list_aspects(&self, subject_id: &SubjectId) -> Result<Vec<Aspect>>;
 
 	// Aspects
 
 	/// Creates and initializes a new Aspect
-	async fn track_aspect(&self, subject_id: SubjectId, name: &str, resolution: Resolution) -> Result<Aspect>;
+	async fn track_aspect(&self, subject_id: &SubjectId, name: &str, resolution: &Resolution) -> Result<Aspect>;
 
 	/// Get an Aspect by its ID
-	async fn get_aspect(&self, id: AspectId) -> Result<Aspect>;
+	async fn get_aspect(&self, id: &AspectId) -> Result<Aspect>;
 
 	/// Get an Aspect by its name
 	async fn get_aspect_by_name(&self, name: &str) -> Result<Aspect>;

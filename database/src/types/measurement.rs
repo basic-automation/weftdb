@@ -60,8 +60,8 @@ pub struct Measurement {
 impl Measurement {
 	/// Creates a new measurement from an input measurement with a generated ID
 	#[must_use]
-	pub fn from_input_measurement(dataset_id: DatasetId, input: &InputMeasurement) -> Self {
-		Self { id: MeasurementId::new(), dataset_id, timestamp: input.timestamp(), value: input.value().clone() }
+	pub fn from_input_measurement(dataset_id: &DatasetId, input: &InputMeasurement) -> Self {
+		Self { id: MeasurementId::new(), dataset_id: *dataset_id, timestamp: input.timestamp(), value: input.value().clone() }
 	}
 
 	/// Generate fake measurement data for testing
