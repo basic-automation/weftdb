@@ -86,14 +86,14 @@ impl AspectStructure for Aspect {
 		let subject_name = Self::get_subject_name(metadata_conn, subject_id).await?;
 		let db_name = <Database as Config>::db_name(metadata_conn).await?;
 		let database_metadata_db_path = Database::db_metadata_path(metadata_conn).await?;
-		let aspect_path = Database::aspect_path(&db_name, &subject_name, &name);
+		let aspect_path = Database::aspect_path(&db_name, &subject_name, name);
 
 		// recursively create directory if it doesn't exist
 		tokio::fs::create_dir_all(&aspect_path).await?;
 
 		// Create databases sequentially to avoid lock contention during concurrent aspect creation
 		// The databases themselves will use MVCC for internal concurrency
-		let measurements_path = Database::aspect_measurements_db_path(&db_name, &subject_name, &name);
+		let measurements_path = Database::aspect_measurements_db_path(&db_name, &subject_name, name);
 		println!("[TRACE] Creating measurements DB at: {measurements_path}");
 		let measurements = Database::get_or_create_turso_database(&measurements_path).await?;
 		println!("[TRACE] Connected measurements DB: {measurements_path}");
@@ -104,7 +104,7 @@ impl AspectStructure for Aspect {
 		println!("[TRACE] Wireframed measurements tables for: {measurements_path}");
 		let measurements = Some(measurements);
 
-		let unprocessed_batches_path = Database::aspect_unprocessed_batches_db_path(&db_name, &subject_name, &name);
+		let unprocessed_batches_path = Database::aspect_unprocessed_batches_db_path(&db_name, &subject_name, name);
 		println!("[TRACE] Creating unprocessed_batches DB at: {unprocessed_batches_path}");
 		let unprocessed_batches = Database::get_or_create_turso_database(&unprocessed_batches_path).await?;
 		println!("[TRACE] Connected unprocessed_batches DB: {unprocessed_batches_path}");
@@ -115,7 +115,7 @@ impl AspectStructure for Aspect {
 		let unprocessed_batches = Some(unprocessed_batches);
 		let _ = Database::commit_concurrent(&conn).await;
 
-		let processed_batches_path = Database::aspect_processed_batches_db_path(&db_name, &subject_name, &name);
+		let processed_batches_path = Database::aspect_processed_batches_db_path(&db_name, &subject_name, name);
 		println!("[TRACE] Creating processed_batches DB at: {processed_batches_path}");
 		let processed_batches = Database::get_or_create_turso_database(&processed_batches_path).await?;
 		println!("[TRACE] Connected processed_batches DB: {processed_batches_path}");
@@ -126,7 +126,7 @@ impl AspectStructure for Aspect {
 		let processed_batches = Some(processed_batches);
 		let _ = Database::commit_concurrent(&conn).await;
 
-		let patterns_path = Database::aspect_patterns_db_path(&db_name, &subject_name, &name);
+		let patterns_path = Database::aspect_patterns_db_path(&db_name, &subject_name, name);
 		println!("[TRACE] Creating patterns DB at: {patterns_path}");
 		let patterns = Database::get_or_create_turso_database(&patterns_path).await?;
 		println!("[TRACE] Connected patterns DB: {patterns_path}");
@@ -137,7 +137,7 @@ impl AspectStructure for Aspect {
 		let patterns = Some(patterns);
 		let _ = Database::commit_concurrent(&conn).await;
 
-		let events_path = Database::aspect_events_db_path(&db_name, &subject_name, &name);
+		let events_path = Database::aspect_events_db_path(&db_name, &subject_name, name);
 		println!("[TRACE] Creating events DB at: {events_path}");
 		let events = Database::get_or_create_turso_database(&events_path).await?;
 		println!("[TRACE] Connected events DB: {events_path}");
@@ -148,7 +148,7 @@ impl AspectStructure for Aspect {
 		let events = Some(events);
 		let _ = Database::commit_concurrent(&conn).await;
 
-		let correlations_path = Database::aspect_correlations_db_path(&db_name, &subject_name, &name);
+		let correlations_path = Database::aspect_correlations_db_path(&db_name, &subject_name, name);
 		println!("[TRACE] Creating correlations DB at: {correlations_path}");
 		let correlations = Database::get_or_create_turso_database(&correlations_path).await?;
 		println!("[TRACE] Connected correlations DB: {correlations_path}");
@@ -159,7 +159,7 @@ impl AspectStructure for Aspect {
 		let correlations = Some(correlations);
 		let _ = Database::commit_concurrent(&conn).await;
 
-		let dictionaries_path = <Database as Config>::aspect_dictionaries_path(&db_name, &subject_name, &name);
+		let dictionaries_path = <Database as Config>::aspect_dictionaries_path(&db_name, &subject_name, name);
 		println!("[TRACE] Creating dictionaries directory at: {dictionaries_path}");
 		std::fs::create_dir_all(&dictionaries_path)?;
 
@@ -217,10 +217,10 @@ impl AspectStructure for Aspect {
 		#[rustfmt::skip]
 		Ok(Self {
                         id: id.unwrap_or_default(),
-                        name: name.to_string(),
+                        name: name.clone(),
                         subject_id: *subject_id,
                         resolution: *resolution,
-                        database_metadata_db_path: database_metadata_db_path.to_string(),
+                        database_metadata_db_path: database_metadata_db_path.clone(),
                         subject_name: provided_subject_name,
                         path: aspect_path_str,
                         measurements: None,

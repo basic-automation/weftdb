@@ -455,7 +455,7 @@ impl Outputs for Database {
 		let mut page = 0;
 
 		loop {
-			let measurements = self.get_raw_measurements(&aspect_id, Some(start), Some(end), page_size, page).await?;
+			let measurements = self.get_raw_measurements(aspect_id, Some(start), Some(end), page_size, page).await?;
 
 			if measurements.is_empty() {
 				break; // No more data
@@ -543,7 +543,7 @@ impl Outputs for Database {
 		}
 
 		// Get from database
-		let mut aspect = self.get_aspect(&aspect_id).await?;
+		let mut aspect = self.get_aspect(aspect_id).await?;
 		let unprocessed_batches_db = aspect.unprocessed_batches().await?;
 		let conn = unprocessed_batches_db.connect()?;
 

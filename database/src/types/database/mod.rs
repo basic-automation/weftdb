@@ -857,10 +857,10 @@ impl DatabaseStructure for Database {
 			let mut dbs = DATABASES.lock().await;
 			if let Some(info) = dbs.get_mut(&self.id) {
 				// Ensure subject exists in cache; use the subject we already loaded above
-				if !info.subjects().contains_key(&subject_id) {
+				if !info.subjects().contains_key(subject_id) {
 					info.add_subject(subject.clone());
 				}
-				if let Some(subj) = info.subjects_mut().get_mut(&subject_id) {
+				if let Some(subj) = info.subjects_mut().get_mut(subject_id) {
 					subj.add_aspect(aspect.clone());
 				}
 			}

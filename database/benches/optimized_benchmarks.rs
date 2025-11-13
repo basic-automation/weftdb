@@ -28,13 +28,13 @@ impl BenchmarkContext {
 
 		let db = Arc::new(Database::new(&db_name).await?);
 		let subject = db.observe_subject("bench_subject").await?;
-		let aspect = db.track_aspect(subject.id(), "bench_aspect", Resolution::Seconds).await?;
+		let aspect = db.track_aspect(&subject.id(), "bench_aspect", &Resolution::Seconds).await?;
 
 		// Add test measurements
 		let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 		for i in 0..measurement_count {
 			let measurement = InputMeasurement::new(base_time + Duration::seconds(i as i64 * 60), BigDecimal::from_str(&format!("{}.0", i + 10))?);
-			db.capture_measurement(aspect.id(), DatasetId::new(), measurement).await?;
+			db.capture_measurement(&aspect.id(), &DatasetId::new(), &measurement).await?;
 		}
 
 		Ok(Self { db, aspect_id: aspect.id(), _cleanup_path: cleanup_path })
@@ -60,7 +60,7 @@ fn benchmark_optimized_interpolation(c: &mut Criterion) {
 				|ctx| {
 					rt.block_on(async {
 						let analyze_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 30, 0).unwrap();
-						let result = ctx.db.analyze_point(ctx.aspect_id, analyze_time, Resolution::Seconds, Spline::Linear).await.unwrap();
+						let result = ctx.db.analyze_point(&ctx.aspect_id, analyze_time, &Resolution::Seconds, &Spline::Linear).await.unwrap();
 						black_box(result)
 					})
 				},
@@ -80,9 +80,9 @@ fn benchmark_cache_efficiency(c: &mut Criterion) {
 				rt.block_on(async {
 					let analyze_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 15, 0).unwrap();
 					// First call to cache the result
-					let _ = ctx.db.analyze_point(ctx.aspect_id, analyze_time, Resolution::Seconds, Spline::Linear).await.unwrap();
+					let _ = ctx.db.analyze_point(&ctx.aspect_id, analyze_time, &Resolution::Seconds, &Spline::Linear).await.unwrap();
 					// Second call should hit cache
-					let result = ctx.db.analyze_point(ctx.aspect_id, analyze_time, Resolution::Seconds, Spline::Linear).await.unwrap();
+					let result = ctx.db.analyze_point(&ctx.aspect_id, analyze_time, &Resolution::Seconds, &Spline::Linear).await.unwrap();
 					black_box(result)
 				})
 			},

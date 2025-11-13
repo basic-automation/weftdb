@@ -5,7 +5,7 @@ use crate::{
 		database::{
 			helpers::safe_usize_to_f64, traits::{aspect_structure::AspectStructure, connection::Connection as ConnectionTrait, DatabaseStructure}
 		}, TxId
-	}, AspectId, Batch, Database, DatasetId, Error, InputMeasurement, Measurement
+	}, AspectId, Batch, BatchId, Database, DatasetId, Error, InputMeasurement, Measurement
 };
 
 #[async_trait::async_trait]
@@ -64,7 +64,7 @@ impl Inputs for Database {
 		let measurement_db_path = aspect.aspect_path();
 		let tx_id = TxId::new();
 
-		let measurement = Measurement::from_input_measurement(dataset_id, &input_measurement);
+		let measurement = Measurement::from_input_measurement(dataset_id, input_measurement);
 
 		// Use INSERT with ON CONFLICT DO NOTHING, then check if any rows were affected
 		// This is atomic and handles concurrent writes safely
@@ -248,7 +248,7 @@ impl Inputs for Database {
 		let mut tx_ids = Vec::new();
 		for m in input_measurements {
 			if let Ok(tx) = self.capture_new_measurement(aspect_id, dataset_id, &m).await {
-				tx_ids.push(tx)
+				tx_ids.push(tx);
 			}
 		}
 		Ok(tx_ids)
@@ -326,10 +326,10 @@ impl Inputs for Database {
 	}
 
 	/// Batch insert unprocessed batches (implement missing trait method)
-	async fn batch_insert_unprocessed_batches(&self, aspect_id: AspectId, batches: Vec<Batch>) -> Result<Vec<TxId>> {
+	async fn batch_insert_unprocessed_batches(&self, aspect_id: &AspectId, batches: Vec<Batch>) -> Result<Vec<TxId>> {
 		let mut tx_ids = Vec::new();
 		for b in batches {
-			let tx = self.insert_unprocessed_batch(&aspect_id, &b).await?;
+			let tx = self.insert_unprocessed_batch(aspect_id, &b).await?;
 			tx_ids.push(tx);
 		}
 		Ok(tx_ids)
@@ -367,13 +367,36 @@ impl Inputs for Database {
 		Ok(tx_ids)
 	}
 
+	async fn remove_unprocessed_batch(&self, aspect_id: &AspectId, batch_id: &BatchId) -> Result<TxId> {
+		let tx_id = TxId::new();
+
+		let mut aspect = self.get_aspect(aspect_id).await?;
+		let db = aspect.unprocessed_batches().await?;
+		let db_path = aspect.unprocessed_batches_path();
+		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+
+		let delete_sql = r"DELETE FROM batches WHERE id = ?";
+
+		let res = conn.as_ref().execute(delete_sql, turso::params![batch_id.to_string()]).await;
+		match res {
+			Ok(_) => println!("Removed unprocessed batch {batch_id}"),
+			Err(e) => {
+				Self::rollback_concurrent(&conn).await?;
+				return Err(anyhow::anyhow!("Failed to remove unprocessed batch: {e}"));
+			}
+		}
+
+		let _ = Self::commit_concurrent(&conn).await;
+		Ok(tx_id)
+	}
+
 	/// Insert processed batch (implement missing trait method)
-	async fn insert_processed_batch(&self, aspect_id: AspectId, batch: &Batch) -> Result<TxId> {
+	async fn insert_processed_batch(&self, aspect_id: &AspectId, batch: &Batch) -> Result<TxId> {
 		let tx_id = TxId::new();
 		let measurements_json = serde_json::to_string(&batch.measurements).map_err(|e| Error::DatabaseError(format!("Failed to serialize: {e}")))?;
 		let batch_hash = format!("{:x}", md5::compute(&measurements_json));
 		let batch_id = batch.batch_id().to_string();
-		let mut aspect = self.get_aspect(&aspect_id).await?;
+		let mut aspect = self.get_aspect(aspect_id).await?;
 		let conn = Self::begin_concurrent(&aspect.measurements().await?, &format!("{}/measurements.db", aspect.aspect_path()), Some(self.cache.clone())).await?;
 		let insert_sql = r"INSERT INTO batches (id, aspect_id, database_id, size, resolution, measurements, batch_hash, status, created_at, processed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
@@ -401,7 +424,7 @@ impl Inputs for Database {
 	}
 
 	/// Batch insert processed batches (implement missing trait method)
-	async fn batch_insert_processed_batches(&self, aspect_id: AspectId, batches: Vec<Batch>) -> Result<Vec<TxId>> {
+	async fn batch_insert_processed_batches(&self, aspect_id: &AspectId, batches: Vec<Batch>) -> Result<Vec<TxId>> {
 		let mut tx_ids = Vec::new();
 		for b in batches {
 			let tx = self.insert_processed_batch(aspect_id, &b).await?;

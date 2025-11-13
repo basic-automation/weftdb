@@ -45,7 +45,7 @@ fn benchmark_production_workloads(c: &mut Criterion) {
 						// Create database and setup data
 						let db = Database::new(&db_name).await.unwrap();
 						let subject = db.observe_subject("benchmark_subject").await.unwrap();
-						let aspect = db.track_aspect(subject.id(), "benchmark_aspect", Resolution::Seconds).await.unwrap();
+						let aspect = db.track_aspect(&subject.id(), "benchmark_aspect", &Resolution::Seconds).await.unwrap();
 
 						// Add test data using batch for efficiency
 						let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -69,7 +69,7 @@ fn benchmark_production_workloads(c: &mut Criterion) {
 						// This is the only part being measured - use coarser resolution
 						let result = db
 							.analyze_range(
-								aspect_id,
+								&aspect_id,
 								start,
 								end,
 								Resolution::Minutes, // Use Minutes instead of Seconds
@@ -128,7 +128,7 @@ fn benchmark_full_integration_pipeline(c: &mut Criterion) {
 						// Create database
 						let db = Database::new(&db_name).await.unwrap();
 						let subject = db.observe_subject("pipeline_subject").await.unwrap();
-						let aspect = db.track_aspect(subject.id(), "pipeline_aspect", Resolution::Seconds).await.unwrap();
+						let aspect = db.track_aspect(&subject.id(), "pipeline_aspect", &Resolution::Seconds).await.unwrap();
 
 						// Ingest data using batch
 						let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -149,7 +149,7 @@ fn benchmark_full_integration_pipeline(c: &mut Criterion) {
 				|(db, aspect_id, start, end, resolution, db_path)| {
 					rt.block_on(async {
 						// Only this operation is measured
-						let result = db.analyze_range(aspect_id, start, end, resolution, Spline::Linear).await.unwrap();
+						let result = db.analyze_range(&aspect_id, start, end, resolution, Spline::Linear).await.unwrap();
 
 						// Cleanup (not measured)
 						db.close().await.unwrap();
