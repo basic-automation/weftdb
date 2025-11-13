@@ -7,9 +7,9 @@ use anyhow::Result;
 use bigdecimal::{BigDecimal, FromPrimitive, Zero};
 use chrono::Datelike;
 use database::{
-	database::traits::{AspectStructure, DatabaseStructure, Outputs}, AspectId, BatchId, Database, DictionaryId, Resolution
+	database::traits::{AspectStructure, DatabaseStructure, Inputs, Outputs}, AspectId, Database, DictionaryId, Resolution
 };
-use futures::StreamExt;
+use futures::{future, StreamExt, TryStreamExt};
 use rayon::prelude::*;
 use splimes::Spline;
 use tokio::sync::Mutex;
@@ -46,61 +46,43 @@ static SIGNALS_QUEUE: LazyLock<Mutex<Signals>> = LazyLock::new(|| Mutex::new(Sig
 /// - Database operations fail (getting batches, marking as processed)
 /// - Batch processing fails
 pub async fn build_processed_batch_queue(database: &Database, aspect_id: &database::AspectId) -> Result<()> {
-	let unprocessed_batches = database.get_unprocessed_batches(aspect_id).await?;
+	let mut stream = database.get_unprocessed_batches(aspect_id).await?;
 
-	if unprocessed_batches.is_empty() {
-		println!("No unprocessed batches found in database");
-		return Ok(());
-	}
-
-	println!("Processing {} unprocessed batches from database", unprocessed_batches.len());
-
-	// Store batch IDs before processing (since processing modifies the batch but we need original IDs)
-	let batch_ids: Vec<BatchId> = unprocessed_batches.iter().map(|batch| *batch.batch_id()).collect();
-
-	let batch_hashes: Vec<_> = unprocessed_batches.iter().filter_map(|batch| batch.batch_hash().cloned()).collect();
-
-	let mut processed_batches = unprocessed_batches;
-	let total_batches = processed_batches.len();
-
-	// Process batches in chunks with progress reporting
+	// Process batches in chunks to avoid loading all into memory
 	let chunk_size = 1000;
 	let mut processed_count = 0;
 
-	for chunk in processed_batches.chunks_mut(chunk_size) {
+	loop {
+		let mut chunk: Vec<Batch> = stream.by_ref().take(chunk_size).try_collect().await?;
+		if chunk.is_empty() {
+			break;
+		}
+
+		println!("Processing chunk of {} batches", chunk.len());
+
+		// Process batches in parallel (batch.process() is synchronous)
 		chunk.par_iter_mut().for_each(|batch| {
 			let _ = batch.process();
 		});
 
-		processed_count += chunk.len();
-		println!("Processed {processed_count} / {total_batches} batches");
-	}
-
-	// Mark batches as processed using the original identifiers
-	let has_batch_ids = !batch_ids.is_empty();
-
-	println!("Marking batches as processed in database");
-	let total_batch_ids = batch_ids.len();
-	for (i, batch_id) in batch_ids.iter().enumerate() {
-		database.mark_batch_processed_by_id(&batch_id, aspect_id).await?;
-
-		if (i + 1) % 1000 == 0 || (i + 1) == total_batch_ids {
-			println!("Marked {} / {} batch IDs as processed", i + 1, total_batch_ids);
-		}
-	}
-
-	if !has_batch_ids {
-		// Only use hash if no IDs available
-		let total_batch_hashes = batch_hashes.len();
-		for (i, batch_hash) in batch_hashes.iter().enumerate() {
-			database.mark_batch_processed_by_hash(batch_hash, aspect_id).await?;
-
-			if (i + 1) % 1000 == 0 || (i + 1) == total_batch_hashes {
-				println!("Marked {} / {} batch hashes as processed", i + 1, total_batch_hashes);
+		// Perform database operations in parallel for the chunk
+		let db_tasks: Vec<_> = chunk.iter().map(|batch| {
+			let insert_future = database.insert_processed_batch(aspect_id, batch);
+			let remove_future = database.remove_unprocessed_batch(aspect_id, batch.batch_id());
+			async move {
+				insert_future.await?;
+				remove_future.await?;
+				Ok::<(), anyhow::Error>(())
 			}
-		}
+		}).collect();
+
+		future::try_join_all(db_tasks).await?;
+
+		processed_count += chunk.len();
+		println!("Processed {processed_count} batches");
 	}
 
+	println!("Batch processing completed");
 	Ok(())
 }
 
@@ -1145,7 +1127,7 @@ mod tests {
 
 		let db = Database::new("TestDB").await.unwrap();
 		let test_subject = db.observe_subject("TestSubject").await.unwrap();
-		let test_aspect = db.track_aspect(test_subject.id(), "TestAspect", Resolution::Seconds).await.unwrap();
+		let test_aspect = db.track_aspect(&test_subject.id(), "TestAspect", &Resolution::Seconds).await.unwrap();
 		let start_time = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
 		#[rustfmt::skip]
 		let points = vec![
@@ -1219,7 +1201,7 @@ mod tests {
 		for (i, value) in points {
 			let timestamp = start_time + chrono::Duration::hours(i64::from(i));
 			let measurement = InputMeasurement::new(timestamp, value);
-			db.capture_measurement(test_aspect.id(), DatasetId::new(), measurement).await.unwrap();
+			db.capture_measurement(&test_aspect.id(), &DatasetId::new(), &measurement).await.unwrap();
 		}
 
 		// create a peak detection event for testing
@@ -1248,7 +1230,7 @@ mod tests {
 
 		let db = Database::new("test_bath_processing").await.unwrap();
 		let test_subject = db.observe_subject("TestSubject").await.unwrap();
-		let test_aspect = db.track_aspect(test_subject.id(), "TestAspect", Resolution::Seconds).await.unwrap();
+		let test_aspect = db.track_aspect(&test_subject.id(), "TestAspect", &Resolution::Seconds).await.unwrap();
 		let start_time = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
 		#[rustfmt::skip]
 		let points = vec![
@@ -1272,7 +1254,7 @@ mod tests {
 		for (i, value) in points {
 			let timestamp = start_time + chrono::Duration::minutes(i64::from(i));
 			let measurement = InputMeasurement::new(timestamp, value);
-			db.capture_measurement(test_aspect.id(), DatasetId::new(), measurement).await.unwrap();
+			db.capture_measurement(&test_aspect.id(), &DatasetId::new(), &measurement).await.unwrap();
 		}
 
 		let aspect = test_aspect;
@@ -1280,13 +1262,9 @@ mod tests {
 		//let method = Spline::Linear;
 		//let batch_size = 10;
 
-		// build_unprocessed_queue(&db, &aspect.id(), &resolution, &method, batch_size).await?;
-
 		// Check how many batches were stored in the database
-		let unprocessed_batches = db.get_unprocessed_batches(&aspect.id()).await?;
+		let unprocessed_batches: Vec<database::Batch> = db.get_unprocessed_batches(&aspect.id()).await?.try_collect().await?;
 		println!("Unprocessed batches count: {}", unprocessed_batches.len());
-
-		//build_processed_batch_queue(&db, &aspect.id()).await?;
 
 		let processed_batches = db.get_processed_batches_queue(&aspect.id()).await?;
 		println!("Processed batches count: {}", processed_batches.len());
@@ -1313,7 +1291,7 @@ mod tests {
 
 		let db = Database::new("test_specific_process_batch").await.unwrap();
 		let test_subject = db.observe_subject("TestSubject").await.unwrap();
-		let test_aspect = db.track_aspect(test_subject.id(), "TestAspect", Resolution::Seconds).await.unwrap();
+		let test_aspect = db.track_aspect(&test_subject.id(), "TestAspect", &Resolution::Seconds).await.unwrap();
 		let start_time = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
 		#[rustfmt::skip]
 		let points = vec![
@@ -1337,7 +1315,7 @@ mod tests {
 		for (i, value) in points {
 			let timestamp = start_time + chrono::Duration::minutes(i64::from(i));
 			let measurement = InputMeasurement::new(timestamp, value);
-			db.capture_measurement(test_aspect.id(), DatasetId::new(), measurement).await.unwrap();
+			db.capture_measurement(&test_aspect.id(), &DatasetId::new(), &measurement).await.unwrap();
 		}
 
 		let aspect = test_aspect;
@@ -1348,7 +1326,7 @@ mod tests {
 		// build_unprocessed_queue(&db, &aspect.id(), &resolution, &method, batch_size).await?;
 
 		// Check how many batches were stored in the database
-		let unprocessed_batches = db.get_unprocessed_batches(&aspect.id()).await?;
+		let unprocessed_batches: Vec<database::Batch> = db.get_unprocessed_batches(&aspect.id()).await?.try_collect().await?;
 		println!("Unprocessed batches count: {}", unprocessed_batches.len());
 
 		build_processed_batch_queue(&db, &aspect.id()).await?;
@@ -1367,7 +1345,7 @@ mod tests {
 		let end_time = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
 
 		// Use optimized bulk analysis to get all points
-		let mut point_stream = Outputs::analyze_range(database, *aspect, start_time, end_time, *resolution, *method).await?;
+		let mut point_stream = Outputs::analyze_range(database, aspect, start_time, end_time, *resolution, *method).await?;
 
 		let mut points = Vec::new();
 		while let Some(result) = point_stream.next().await {

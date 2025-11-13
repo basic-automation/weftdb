@@ -1,368 +1,14 @@
-use anyhow::{bail, Result};
+use std::str::FromStr;
+
+use anyhow::Result;
+use splimes::Resolution;
 
 use super::{helpers::safe_ratio, Database};
 use crate::{
-	types::database::traits::{aspect_structure::AspectStructure, config::Config, connection::Connection, database_structure::DatabaseStructure}, AspectId, Batch, BatchId, BatchedMeasurement, Error, DATABASES
+	types::database::traits::{aspect_structure::AspectStructure, connection::Connection, database_structure::DatabaseStructure}, AspectId, Batch, BatchId, BatchedMeasurement, Error, DATABASES
 };
 
-const BATCH_CHUNK_SIZE: usize = 100;
-
 impl Database {
-	/// Store a batch in the database
-	///
-	/// # Errors
-	/// - if database not found
-	/// - if unable to insert batch
-	pub async fn store_unprocessed_batch(&self, batch: &Batch) -> Result<()> {
-		// Get database info and subject info
-		let db_id = self.id();
-		let db_info = {
-			let databases = DATABASES.lock().await;
-			databases.get(&db_id).cloned().ok_or_else(|| Error::DatabaseError("Database not found".to_string()))?
-		};
-
-		// Find the subject and aspect
-		let (subject_name, aspect_name) = db_info.subjects.values().find_map(|subject| subject.aspects().get(&batch.metadata.aspect).map(|aspect| (subject.name().to_string(), aspect.name()))).ok_or_else(|| anyhow::anyhow!("Aspect not found"))?;
-		let mut aspect = self.get_aspect(&batch.metadata.aspect).await?;
-
-		let db = aspect.unprocessed_batches().await?;
-		let batches_db_path = Database::aspect_unprocessed_batches_db_path(&db_info.name, &subject_name, &aspect_name);
-
-		let measurements_json = serde_json::to_string(&batch.measurements).map_err(|e| Error::DatabaseError(format!("Failed to serialize batch measurements: {e}")))?;
-		let batch_hash = format!("{:x}", md5::compute(&measurements_json));
-		let batch_id = batch.batch_id().as_uuid().to_string();
-		let conn = Self::begin_concurrent(&db, batches_db_path.as_str(), Some(self.cache.clone())).await?;
-
-		// Insert batch with transaction safety
-		conn.as_ref().execute("INSERT INTO batches (id, aspect_id, database_id, size, resolution, measurements, batch_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", turso::params![batch_id, batch.metadata.aspect.as_uuid().to_string(), self.id().as_uuid().to_string(), i64::try_from(batch.metadata.size).map_err(|_| Error::DatabaseError("Batch size too large".to_string()))?, format!("{:?}", batch.metadata.resolution), measurements_json, batch_hash, chrono::Utc::now().timestamp_millis()]).await.map_err(|e| Error::DatabaseError(format!("Failed to insert batch: {e}")))?;
-
-		// Invalidate relevant caches
-		let cache_key = format!("aspect_unprocessed_batches_{}", batch.metadata.aspect.as_uuid());
-		self.cache.lock().await.invalidate(&cache_key).await;
-
-		Ok(())
-	}
-
-	/// Get unprocessed batches for an aspect
-	///
-	/// # Errors
-	/// - if database not found
-	/// - if unable to query batches
-	pub async fn get_unprocessed_batches(&self, aspect_id: &AspectId) -> Result<Vec<Batch>> {
-		// Get database info and subject info
-		let db_id = self.id();
-		let db_info = {
-			let databases = DATABASES.lock().await;
-			databases.get(&db_id).cloned().ok_or_else(|| Error::DatabaseError("Database not found".to_string()))?
-		};
-
-		// Find the subject and aspect
-		let (subject_name, aspect_name) = db_info.subjects.values().find_map(|subject| subject.aspects().get(aspect_id).map(|aspect| (subject.name().to_string(), aspect.name().to_string()))).ok_or_else(|| Error::DatabaseError("Subject or aspect not found".to_string()))?;
-
-		let mut aspect = self.get_aspect(aspect_id).await?;
-
-		// Create batches.db path within aspect folder
-		let db_path = Database::aspect_unprocessed_batches_db_path(&db_info.name, &subject_name, &aspect_name);
-		let db = aspect.unprocessed_batches().await?;
-
-		// Get or create the batches database
-
-		let conn = Self::begin_concurrent(&db, db_path.as_str(), Some(self.cache.clone())).await?;
-		let mut rows = conn.as_ref().query("SELECT id, size, resolution, measurements, batch_hash FROM batches WHERE aspect_id = ? AND database_id = ? AND status = 'unprocessed' ORDER BY created_at", turso::params![aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query batches: {e}")))?;
-		let _ = Database::commit_concurrent(&conn).await;
-
-		let mut batches = Vec::new();
-		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get row: {e}")))? {
-			let batch_id_str = Self::value_to_string(&row.get_value(0)?, "Batch ID").await?;
-			let batch_id = BatchId::from_uuid(uuid::Uuid::parse_str(&batch_id_str).map_err(|e| Error::DatabaseError(format!("Failed to parse batch ID: {e}")))?);
-                        let size_str = Self::value_to_string(&row.get_value(1)?, "Size").await?;
-			let resolution_str = Self::value_to_string(&row.get_value(2)?, "Resolution").await?;
-			let measurements_json = Self::value_to_string(&row.get_value(3)?, "Measurements").await?;
-			let batch_hash = Self::value_to_string(&row.get_value(4)?, "Batch Hash").await?;
-
-			let size: usize = size_str.parse().map_err(|e| Error::DatabaseError(format!("Failed to parse batch size: {e}")))?;
-			let measurements: Vec<BatchedMeasurement> = serde_json::from_str(&measurements_json).map_err(|e| Error::DatabaseError(format!("Failed to deserialize measurements: {e}")))?;
-
-			// Parse resolution with proper error handling
-			let resolution = Self::parse_resolution(&resolution_str)?;
-
-			let mut batch = Batch::new(size, measurements, resolution, *aspect_id, db_info.clone());
-			// Store the batch hash for identification
-			batch.set_batch_hash(Some(batch_hash));
-			batch.set_batch_id(&batch_id);
-			batches.push(batch);
-		}
-
-		Ok(batches)
-	}
-
-	/// Marks a batch as processed by moving it from the unprocessed to processed database.
-	///
-	/// # Errors
-	///
-	/// Returns an error if the database operations fail or the batch cannot be moved.
-	pub async fn mark_batch_processed(&self, batch: &Batch) -> Result<()> {
-		// Get aspect information for database path building
-		let aspect = batch.metadata.aspect;
-		let mut aspect_data = self.get_aspect(&aspect).await?;
-
-		// Move batch from unprocessed to processed database
-		// 1. Insert into processed_batches database
-		let processed_batches_db = aspect_data.processed_batches().await?;
-		let processed_conn = processed_batches_db.connect()?;
-
-		let batch_id = batch.batch_id();
-		let metadata_json = serde_json::to_string(&batch.metadata).map_err(|e| Error::DatabaseError(format!("Failed to serialize batch metadata: {e}")))?;
-		let measurements_json = serde_json::to_string(&batch.measurements).map_err(|e| Error::DatabaseError(format!("Failed to serialize batch measurements: {e}")))?;
-
-		// Insert into processed batches database using concurrent writes
-		let insert_sql = r"
-        INSERT INTO batches (id, aspect_id, database_id, size, resolution, batch_hash, created_at, metadata_json, measurements_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            updated_at = strftime('%s', 'now') * 1000,
-            metadata_json = excluded.metadata_json,
-            measurements_json = excluded.measurements_json
-    ";
-
-		processed_conn.execute(insert_sql, turso::params![batch_id.as_uuid().to_string(), batch.metadata.aspect.as_uuid().to_string(), self.id().as_uuid().to_string(), i64::try_from(batch.measurements.len()).unwrap_or(i64::MAX), serde_json::to_string(&batch.metadata.resolution).unwrap_or_default(), batch.batch_hash().cloned(), chrono::Utc::now().timestamp_millis(), metadata_json, measurements_json]).await.map_err(|e| Error::DatabaseError(format!("Failed to insert batch into processed database: {e}")))?;
-
-		// 2. Remove from unprocessed_batches database
-		let unprocessed_batches_db = aspect_data.unprocessed_batches().await?;
-		let unprocessed_conn = unprocessed_batches_db.connect()?;
-
-		let rows_affected = unprocessed_conn.execute("DELETE FROM batches WHERE id = ?", turso::params![batch_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to remove batch from unprocessed database: {e}")))?;
-
-		// Verify that a batch was actually moved
-		if rows_affected == 0 {
-			// Try fallback with batch hash if ID deletion failed
-			if let Some(batch_hash) = batch.batch_hash() {
-				let rows_affected = unprocessed_conn.execute("DELETE FROM batches WHERE batch_hash = ? AND aspect_id = ? AND database_id = ?", turso::params![batch_hash.clone(), batch.metadata.aspect.as_uuid().to_string(), self.id().as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to remove batch by hash from unprocessed database: {e}")))?;
-
-				if rows_affected == 0 {
-					return Err(anyhow::Error::msg("No matching unprocessed batch found to mark as processed"));
-				}
-			} else {
-				return Err(anyhow::Error::msg("No matching unprocessed batch found to mark as processed"));
-			}
-		}
-
-		// Invalidate relevant caches
-		let cache_key = format!("aspect_batches_{}", batch.metadata.aspect.as_uuid());
-		self.cache.lock().await.invalidate(&cache_key).await;
-
-		Ok(())
-	}
-
-	/// Mark a batch as processed using batch ID
-	///
-	/// # Errors
-	/// - if database not found
-	/// - if unable to update batch status
-	///
-	/// Note: This function requires looking up the aspect from the batch ID,
-	/// which means it needs to query potentially multiple batches databases.
-	/// Consider using `mark_batch_processed()` instead if you have the batch object.
-	pub async fn mark_batch_processed_by_id(&self, batch_id: &BatchId, aspect_id: &AspectId) -> Result<()> {
-		// Get database info with proper validation
-		let db_id = self.id();
-		let db_info = {
-			let databases = DATABASES.lock().await;
-			databases.get(&db_id).cloned().ok_or_else(|| Error::DatabaseError("Database not found".to_string()))?
-		};
-
-		let mut aspect = self.get_aspect(aspect_id).await?;
-
-		// Get batches database
-		let unprocessed_db_path = aspect.unprocessed_batches_path();
-		let unprocessed_db = aspect.unprocessed_batches().await?;
-		let conn = Database::begin_concurrent(&unprocessed_db, unprocessed_db_path.as_str(), Some(self.cache.clone())).await?;
-
-		// get batch from unprocessed batches
-		let mut rows = conn.as_ref().query("SELECT id, size, resolution, measurements, batch_hash FROM batches WHERE id = ? AND aspect_id = ? AND database_id = ? AND status = 'unprocessed' ORDER BY created_at", turso::params![batch_id.as_uuid().to_string(), aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query batch: {e}")))?;
-		let _ = Database::commit_concurrent(&conn).await;
-
-		let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get row: {e}")))? else {
-			return Err(anyhow::Error::msg(format!("No matching unprocessed batch found with ID: {batch_id}")));
-		};
-
-		let size_str = Self::value_to_string(&row.get_value(1)?, "Size").await?;
-		let resolution_str = Self::value_to_string(&row.get_value(2)?, "Resolution").await?;
-		let measurements_json = Self::value_to_string(&row.get_value(3)?, "Measurements").await?;
-		let batch_hash = Self::value_to_string(&row.get_value(4)?, "Batch Hash").await?;
-		let size: usize = size_str.parse().map_err(|e| Error::DatabaseError(format!("Failed to parse batch size: {e}")))?;
-		let measurements: Vec<BatchedMeasurement> = serde_json::from_str(&measurements_json).map_err(|e| Error::DatabaseError(format!("Failed to deserialize measurements: {e}")))?;
-		let resolution = Self::parse_resolution(&resolution_str)?;
-		let mut batch = Batch::new(size, measurements, resolution, *aspect_id, db_info.clone());
-		batch.set_batch_hash(Some(batch_hash));
-		batch.set_batch_id(batch_id);
-
-		// insert into processed batches database
-		let processed_db_path = aspect.processed_batches_path();
-		let processed_db = aspect.processed_batches().await?;
-		let processed_conn = Database::begin_concurrent(&processed_db, processed_db_path.as_str(), Some(self.cache.clone())).await?;
-		let metadata_json = serde_json::to_string(&batch.metadata).map_err(|e| Error::DatabaseError(format!("Failed to serialize batch metadata: {e}")))?;
-		let measurements_json = serde_json::to_string(&batch.measurements).map_err(|e| Error::DatabaseError(format!("Failed to serialize batch measurements: {e}")))?;
-		processed_conn.as_ref().execute("INSERT INTO batches (id, aspect_id, database_id, size, resolution, batch_hash, created_at, metadata_json, measurements_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", turso::params![batch_id.as_uuid().to_string(), batch.metadata.aspect.as_uuid().to_string(), self.id().as_uuid().to_string(), i64::try_from(batch.measurements.len()).unwrap_or(i64::MAX), format!("{:?}", batch.metadata.resolution), batch.batch_hash().cloned(), chrono::Utc::now().timestamp_millis(), metadata_json, measurements_json]).await.map_err(|e| Error::DatabaseError(format!("Failed to insert batch into processed database: {e}")))?;
-
-		// Remove from unprocessed_batches database
-		let unprocessed_db_path = aspect.unprocessed_batches_path();
-		let unprocessed_db = aspect.unprocessed_batches().await?;
-		let unprocessed_conn = Database::begin_concurrent(&unprocessed_db, unprocessed_db_path.as_str(), Some(self.cache.clone())).await?;
-		let rows_affected = unprocessed_conn.as_ref().execute("DELETE FROM batches WHERE id = ?", turso::params![batch_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to remove batch from unprocessed database: {e}")))?;
-		if rows_affected == 0 {
-			return Err(anyhow::Error::msg(format!("No matching unprocessed batch found with ID: {batch_id}")));
-		}
-
-		// Invalidate relevant caches
-		let cache_key = format!("aspect_unprocessed_batches_{}", batch.metadata.aspect.as_uuid());
-		self.cache.lock().await.invalidate(&cache_key).await;
-
-		Ok(())
-	}
-
-	/// Mark a batch as processed using batch hash
-	///
-	/// # Errors
-	/// - if database not found
-	/// - if unable to update batch status
-	pub async fn mark_batch_processed_by_hash(&self, batch_hash: &str, aspect_id: &AspectId) -> Result<()> {
-		// get batch by hash
-		if let Some(batch) = self.get_unprocessed_batch_by_hash(batch_hash, aspect_id).await? {
-			self.mark_batch_processed_by_id(batch.id(), aspect_id).await?;
-		} else {
-			return Err(anyhow::Error::msg(format!("No matching unprocessed batch found with hash: {batch_hash}")));
-		}
-
-		Ok(())
-	}
-
-	pub async fn get_unprocessed_batch_by_hash(&self, batch_hash: &str, aspect_id: &AspectId) -> Result<Option<Batch>> {
-		// Get database info with proper validation
-		let db_id = self.id();
-		let db_info = {
-			let databases = DATABASES.lock().await;
-			databases.get(&db_id).cloned().ok_or_else(|| Error::DatabaseError("Database not found".to_string()))?
-		};
-
-		// Find the subject and aspect
-		let (subject_name, aspect_name) = db_info.subjects.values().find_map(|subject| subject.aspects().get(aspect_id).map(|aspect| (subject.name().to_string(), aspect.name().to_string()))).ok_or_else(|| Error::DatabaseError("Subject or aspect not found".to_string()))?;
-		let mut aspect = self.get_aspect(aspect_id).await?;
-		// Get batches database
-		let db_path = Database::aspect_unprocessed_batches_db_path(&db_info.name, &subject_name, &aspect_name);
-		let db = aspect.unprocessed_batches().await?;
-		let conn = Self::begin_concurrent(&db, db_path.as_str(), Some(self.cache.clone())).await?;
-		let mut rows = conn.as_ref().query("SELECT id, size, resolution, measurements FROM batches WHERE batch_hash = ? AND aspect_id = ? AND database_id = ? AND status = 'unprocessed' ORDER BY created_at", turso::params![batch_hash, aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query batch by hash: {e}")))?;
-		let _ = Database::commit_concurrent(&conn).await;
-		if let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get row: {e}")))? {
-			let batch_id_str = Self::value_to_string(&row.get_value(0)?, "Batch ID").await?;
-			let batch_id = BatchId::from_uuid(uuid::Uuid::parse_str(&batch_id_str).map_err(|e| Error::DatabaseError(format!("Failed to parse batch ID UUID: {e}")))?);
-			let size_str = Self::value_to_string(&row.get_value(1)?, "Size").await?;
-			let resolution_str = Self::value_to_string(&row.get_value(2)?, "Resolution").await?;
-			let measurements_json = Self::value_to_string(&row.get_value(3)?, "Measurements").await?;
-
-			let size: usize = size_str.parse().map_err(|e| Error::DatabaseError(format!("Failed to parse batch size: {e}")))?;
-			let measurements: Vec<BatchedMeasurement> = serde_json::from_str(&measurements_json).map_err(|e| Error::DatabaseError(format!("Failed to deserialize measurements: {e}")))?;
-
-			// Parse resolution with proper error handling
-			let resolution = Self::parse_resolution(&resolution_str)?;
-
-			let mut batch = Batch::new(size, measurements, resolution, *aspect_id, db_info.clone());
-			batch.set_batch_id(&batch_id);
-
-			Ok(Some(batch))
-		} else {
-			Ok(None)
-		}
-	}
-
-	/// Store multiple batches efficiently using batch operations
-	///
-	/// # Errors
-	/// - if database not found
-	/// - if unable to serialize or insert batches
-	pub async fn store_unprocessed_batches(&self, batches: &[Batch]) -> Result<()> {
-		if batches.is_empty() {
-			return Ok(());
-		}
-
-		// Group batches by aspect to process them in their respective databases
-		let mut batches_by_aspect: std::collections::HashMap<AspectId, Vec<&Batch>> = std::collections::HashMap::new();
-		for batch in batches {
-			batches_by_aspect.entry(batch.metadata.aspect).or_default().push(batch);
-		}
-
-		let total_batches = batches.len();
-		let mut processed = 0;
-
-		// Process each aspect's batches in its own database
-		for (aspect_id, aspect_batches) in batches_by_aspect {
-			let mut aspect = self.get_aspect(&aspect_id).await?;
-
-			// Get batches database for this aspect
-			let db_path = aspect.unprocessed_batches_path();
-			let db = aspect.unprocessed_batches().await?;
-
-			// Process in chunks using concurrent writes
-			for (chunk_idx, chunk) in aspect_batches.chunks(BATCH_CHUNK_SIZE).enumerate() {
-				let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
-
-				// Insert each batch in the chunk
-				for batch in chunk {
-					// Serialize the batch measurements
-					let measurements_json = serde_json::to_string(&batch.measurements).map_err(|e| Error::DatabaseError(format!("Failed to serialize batch measurements: {e}")))?;
-					let batch_id = uuid::Uuid::new_v4().to_string();
-
-					// Generate a hash from the original measurements for identification
-					let batch_hash = format!("{:x}", md5::compute(&measurements_json));
-
-					let res = conn.as_ref().execute("INSERT INTO batches (id, aspect_id, database_id, size, resolution, measurements, batch_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", turso::params![batch_id, batch.metadata.aspect.as_uuid().to_string(), self.id().as_uuid().to_string(), i64::try_from(batch.metadata.size).map_err(|_| Error::DatabaseError("Batch size too large".to_string()))?, format!("{:?}", batch.metadata.resolution), measurements_json, batch_hash, chrono::Utc::now().timestamp_millis()]).await;
-
-					if let Err(e) = res {
-						let _ = Self::rollback_concurrent(&conn).await;
-						bail!("Failed to insert batch: {e}");
-					}
-				}
-
-				let _ = Database::commit_concurrent(&conn).await;
-				processed += chunk.len();
-
-				// Progress reporting for large batch storage operations
-				if total_batches > 1000 && chunk_idx % 10 == 0 && chunk_idx > 0 {
-					println!("Stored {processed} / {total_batches} batches");
-				}
-			}
-		}
-
-		// Invalidate caches for all affected aspects
-		let mut invalidated_aspects = std::collections::HashSet::new();
-		for batch in batches {
-			if invalidated_aspects.insert(batch.metadata.aspect) {
-				let cache_key = format!("aspect_unprocessed_batches_{}", batch.metadata.aspect.as_uuid());
-				self.cache.lock().await.invalidate(&cache_key).await;
-			}
-		}
-
-		Ok(())
-	}
-
-	/// Helper method to parse resolution strings
-	fn parse_resolution(resolution_str: &str) -> Result<splimes::Resolution> {
-		match resolution_str {
-			"Nanoseconds" => Ok(splimes::Resolution::Nanoseconds),
-			"Microseconds" => Ok(splimes::Resolution::Microseconds),
-			"Milliseconds" => Ok(splimes::Resolution::Milliseconds),
-			"Seconds" => Ok(splimes::Resolution::Seconds),
-			"Minutes" => Ok(splimes::Resolution::Minutes),
-			"Hours" => Ok(splimes::Resolution::Hours),
-			"Days" => Ok(splimes::Resolution::Days),
-			"Weeks" => Ok(splimes::Resolution::Weeks),
-			"Months" => Ok(splimes::Resolution::Months),
-			"Years" => Ok(splimes::Resolution::Years),
-			_ => Err(anyhow::Error::msg(format!("Invalid resolution value: {resolution_str}"))),
-		}
-	}
-
 	/// Get batch count statistics for an aspect
 	///
 	/// # Errors
@@ -373,7 +19,7 @@ impl Database {
 		let db_path = aspect.unprocessed_batches_path();
 		let db = aspect.unprocessed_batches().await?;
 
-		let conn = Database::begin_concurrent(&db, db_path.as_str(), Some(self.cache.clone())).await?;
+		let conn = Self::begin_concurrent(&db, db_path.as_str(), Some(self.cache.clone())).await?;
 		let mut rows = conn.as_ref().query("SELECT status, COUNT(*) as count FROM batches WHERE aspect_id = ? AND database_id = ? GROUP BY status", turso::params![aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query batch stats: {e}")))?;
 
 		let mut stats = BatchStats::default();
@@ -389,7 +35,7 @@ impl Database {
 			}
 		}
 
-		let _ = Database::commit_concurrent(&conn).await;
+		let _ = Self::commit_concurrent(&conn).await;
 
 		Ok(stats)
 	}
@@ -405,9 +51,9 @@ impl Database {
 		let db = aspect.processed_batches().await?;
 
 		let cutoff_time = chrono::Utc::now() - chrono::Duration::days(older_than_days);
-		let conn = Database::begin_concurrent(&db, batches_db_path.as_str(), Some(self.cache.clone())).await?;
+		let conn = Self::begin_concurrent(&db, batches_db_path.as_str(), Some(self.cache.clone())).await?;
 		let rows_affected = conn.as_ref().execute("DELETE FROM batches WHERE aspect_id = ? AND database_id = ? AND status = 'processed' AND processed_at < ?", turso::params![aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string(), cutoff_time.timestamp_millis()]).await.map_err(|e| Error::DatabaseError(format!("Failed to cleanup processed batches: {e}")))?;
-		let _ = Database::commit_concurrent(&conn).await;
+		let _ = Self::commit_concurrent(&conn).await;
 
 		// Invalidate relevant caches
 		let cache_key = format!("aspect_batches_{}", aspect_id.as_uuid());
@@ -426,9 +72,9 @@ impl Database {
 		let batches_db_path = aspect.processed_batches_path();
 		let db = aspect.processed_batches().await?;
 
-		let conn = Database::begin_concurrent(&db, batches_db_path.as_str(), Some(self.cache.clone())).await?;
+		let conn = Self::begin_concurrent(&db, batches_db_path.as_str(), Some(self.cache.clone())).await?;
 		let rows_affected = conn.as_ref().execute("DELETE FROM batches WHERE aspect_id = ? AND database_id = ? AND status = 'processed'", turso::params![aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to cleanup all processed batches: {e}")))?;
-		let _ = Database::commit_concurrent(&conn).await;
+		let _ = Self::commit_concurrent(&conn).await;
 
 		// Invalidate relevant caches
 		let cache_key = format!("aspect_batches_{}", aspect_id.as_uuid());
@@ -454,7 +100,7 @@ impl Database {
 		let db_path = aspect.processed_batches_path();
 		let db = aspect.processed_batches().await?;
 
-		let conn = Database::begin_concurrent(&db, db_path.as_str(), Some(self.cache.clone())).await?;
+		let conn = Self::begin_concurrent(&db, db_path.as_str(), Some(self.cache.clone())).await?;
 		let mut rows = conn.as_ref().query("SELECT id, size, resolution, measurements, batch_hash FROM batches WHERE aspect_id = ? AND database_id = ? AND status = 'processed' ORDER BY processed_at", turso::params![aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query processed batches: {e}")))?;
 
 		let mut batches = Vec::new();
@@ -470,7 +116,7 @@ impl Database {
 			let measurements: Vec<BatchedMeasurement> = serde_json::from_str(&measurements_json).map_err(|e| Error::DatabaseError(format!("Failed to deserialize measurements: {e}")))?;
 
 			// Parse resolution with proper error handling
-			let resolution = Self::parse_resolution(&resolution_str)?;
+			let resolution = Resolution::from_str(&resolution_str)?;
 
 			let mut batch = Batch::new(size, measurements, resolution, *aspect_id, db_info.clone());
 			// Store the batch hash and ID for identification
@@ -479,7 +125,7 @@ impl Database {
 			batches.push(batch);
 		}
 
-		let _ = Database::commit_concurrent(&conn).await;
+		let _ = Self::commit_concurrent(&conn).await;
 
 		Ok(batches)
 	}
@@ -503,7 +149,7 @@ impl Database {
 		// Create batches.db path within aspect folder
 		let db_path = aspect.processed_batches_path();
 		let db = aspect.processed_batches().await?;
-		let conn = Database::begin_concurrent(&db, db_path.as_str(), Some(self.cache.clone())).await?;
+		let conn = Self::begin_concurrent(&db, db_path.as_str(), Some(self.cache.clone())).await?;
 
 		let mut rows = conn.as_ref().query("SELECT id, size, resolution, measurements, batch_hash FROM batches WHERE aspect_id = ? AND database_id = ? AND status = 'processed' ORDER BY processed_at ASC", turso::params![aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query processed batches queue: {e}")))?;
 
@@ -520,7 +166,7 @@ impl Database {
 			let measurements: Vec<BatchedMeasurement> = serde_json::from_str(&measurements_json).map_err(|e| Error::DatabaseError(format!("Failed to deserialize measurements: {e}")))?;
 
 			// Parse resolution with proper error handling
-			let resolution = Self::parse_resolution(&resolution_str)?;
+			let resolution = Resolution::from_str(&resolution_str)?;
 
 			let mut batch = Batch::new(size, measurements, resolution, *aspect_id, db_info.clone());
 			// Store the batch hash and ID for identification
@@ -529,7 +175,7 @@ impl Database {
 			batches.push(batch);
 		}
 
-		let _ = Database::commit_concurrent(&conn).await;
+		let _ = Self::commit_concurrent(&conn).await;
 
 		Ok(batches)
 	}
@@ -586,9 +232,9 @@ impl Database {
 		let db_path = aspect.processed_batches_path();
 		let db = aspect.processed_batches().await?;
 
-		let conn = Database::begin_concurrent(&db, db_path.as_str(), Some(self.cache.clone())).await?;
+		let conn = Self::begin_concurrent(&db, db_path.as_str(), Some(self.cache.clone())).await?;
 		let rows_affected = conn.as_ref().execute("DELETE FROM batches WHERE aspect_id = ? AND database_id = ? AND status = 'processed'", turso::params![aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to clear processed batches queue: {e}")))?;
-		let _ = Database::commit_concurrent(&conn).await;
+		let _ = Self::commit_concurrent(&conn).await;
 
 		// Invalidate relevant caches
 		let cache_key = format!("aspect_batches_{}", aspect_id.as_uuid());

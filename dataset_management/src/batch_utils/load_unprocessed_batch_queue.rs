@@ -6,6 +6,7 @@ use futures::StreamExt;
 use splimes::{Resolution, Spline};
 
 use crate::{Batch, BatchedMeasurement};
+use database::database::traits::Inputs;
 
 /// Builds sliding-window batches from the provided aspect and stores them in the database.
 ///
@@ -58,7 +59,7 @@ pub async fn build_unprocessed_queue(database: &Database, aspect: &AspectId, res
 
 		println!("Storing {} batches in database...", batches.len());
 		// Store all batches at once using bulk insert
-		database.store_unprocessed_batches(&batches).await?;
+		database.batch_insert_unprocessed_batches(aspect, batches).await?;
 	}
 
 	// Note: No longer using global queue length since batches are stored in database

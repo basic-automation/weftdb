@@ -12,7 +12,7 @@ impl Connection for Database {
 	/// Get a cached database connection with MVCC concurrent transaction support
 	/// Returns a cached connection if available, otherwise creates a new one
 	async fn begin_concurrent(turso_db: &turso::Database, cache_key: &str, cache: Option<Arc<Mutex<DatabaseCache>>>) -> Result<cache::Connection> {
-		let cache = cache.map_or_else(|| Arc::new(Mutex::new(DatabaseCache::default())), |c| c);
+		let cache = cache.unwrap_or_else(|| Arc::new(Mutex::new(DatabaseCache::default())));
 
 		// Try to get cached connection first
 		if let Some(cached_conn) = cache.lock().await.get::<cache::Connection>(cache_key).await {

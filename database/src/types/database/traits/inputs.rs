@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::{cache::Connection, AspectId, Batch, DatasetId, InputMeasurement, TxId};
+use crate::{cache::Connection, AspectId, Batch, BatchId, DatasetId, InputMeasurement, TxId};
 
 /// Trait for database structure operations
 /// This trait defines the operations related to managing the structure of the database.
@@ -38,17 +38,19 @@ pub trait Inputs {
 	async fn insert_unprocessed_batch(&self, aspect_id: &AspectId, batch: &Batch) -> Result<TxId>;
 
 	// Capture multiple unprocessed batches for a given aspect
-	async fn batch_insert_unprocessed_batches(&self, aspect_id: AspectId, batches: Vec<Batch>) -> Result<Vec<TxId>>;
+	async fn batch_insert_unprocessed_batches(&self, aspect_id: &AspectId, batches: Vec<Batch>) -> Result<Vec<TxId>>;
 
 	// Capture a chunk of batches - works for both processed and unprocessed batches
 	/// The only difference is the database connection passed in
 	async fn insert_batch_chunk(&self, conn: &mut Connection, chunk: &[Batch]) -> Result<Vec<TxId>>;
 
+	async fn remove_unprocessed_batch(&self, aspect_id: &AspectId, batch_id: &BatchId) -> Result<TxId>;
+
 	// Processed Batches
 
 	/// insert processed batch for a given aspect
-	async fn insert_processed_batch(&self, aspect_id: AspectId, batch: &Batch) -> Result<TxId>;
+	async fn insert_processed_batch(&self, aspect_id: &AspectId, batch: &Batch) -> Result<TxId>;
 
 	// Capture multiple processed batches for a given aspect
-	async fn batch_insert_processed_batches(&self, aspect_id: AspectId, batches: Vec<Batch>) -> Result<Vec<TxId>>;
+	async fn batch_insert_processed_batches(&self, aspect_id: &AspectId, batches: Vec<Batch>) -> Result<Vec<TxId>>;
 }

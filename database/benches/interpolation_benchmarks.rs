@@ -42,7 +42,7 @@ fn benchmark_interpolation_sizes(c: &mut Criterion) {
 
 					// Setup subject and aspect (assuming similar to other benchmarks)
 					let subject = db.observe_subject("interp_subject").await.unwrap();
-					let aspect = db.track_aspect(subject.id(), "interp_aspect", Resolution::Seconds).await.unwrap();
+					let aspect = db.track_aspect(&subject.id(), "interp_aspect", &Resolution::Seconds).await.unwrap();
 
 					// Generate and insert test data
 					let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -55,7 +55,7 @@ fn benchmark_interpolation_sizes(c: &mut Criterion) {
 					// Perform interpolation
 					let start = base_time;
 					let end = base_time + Duration::seconds((size - 1) as i64);
-					let result = db.analyze_range(aspect.id(), start, end, Resolution::Seconds, Spline::Linear).await.unwrap();
+					let result = db.analyze_range(&aspect.id(), start, end, Resolution::Seconds, Spline::Linear).await.unwrap();
 
 					// Cleanup
 					db.close().await.unwrap();
@@ -80,7 +80,7 @@ fn benchmark_interpolation_resolutions(c: &mut Criterion) {
 	let (db, aspect_id) = rt.block_on(async {
 		let db = Database::new(&db_name).await.unwrap();
 		let subject = db.observe_subject("interp_subject").await.unwrap();
-		let aspect = db.track_aspect(subject.id(), "interp_aspect", Resolution::Seconds).await.unwrap();
+		let aspect = db.track_aspect(&subject.id(), "interp_aspect", &Resolution::Seconds).await.unwrap();
 
 		// Generate and insert test data (reduced size from 1000 to 200)
 		let size = 200;
@@ -109,7 +109,7 @@ fn benchmark_interpolation_resolutions(c: &mut Criterion) {
 					// Perform interpolation
 					let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 					let end = start + Duration::seconds(199); // Adjusted for reduced data size
-					let result = db.analyze_range(aspect_id, start, end, res, Spline::Linear).await.unwrap();
+					let result = db.analyze_range(&aspect_id, start, end, res, Spline::Linear).await.unwrap();
 
 					black_box(result)
 				})
@@ -140,7 +140,7 @@ fn benchmark_spline_types(c: &mut Criterion) {
 
 		let db = Database::new(db_name).await.unwrap();
 		let subject = db.observe_subject("bench_subject").await.unwrap();
-		let aspect = db.track_aspect(subject.id(), "bench_aspect", Resolution::Seconds).await.unwrap();
+		let aspect = db.track_aspect(&subject.id(), "bench_aspect", &Resolution::Seconds).await.unwrap();
 
 		// Add test data once - further reduced size for faster benchmarks
 		let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -169,7 +169,7 @@ fn benchmark_spline_types(c: &mut Criterion) {
 					let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 					let end_time = start_time + Duration::minutes(10);
 
-					let result = db.analyze_range(aspect_id, start_time, end_time, Resolution::Minutes, spline_type).await.unwrap();
+					let result = db.analyze_range(&aspect_id, start_time, end_time, Resolution::Minutes, spline_type).await.unwrap();
 
 					black_box(result)
 				})

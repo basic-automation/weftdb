@@ -17,7 +17,7 @@ rand = "0.8"
 rayon = "1.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.143"
-turso = { version = "0.2.2" }
+turso = { version = "0.3.2" }
 tempfile = "3.8"
 thiserror = "1.0"
 tokio = { version = "1.0", features = ["full"] }
