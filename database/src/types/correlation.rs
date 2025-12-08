@@ -133,6 +133,11 @@ impl Correlation {
 	}
 
 	#[must_use]
+	pub const fn subject_id(&self) -> &SubjectId {
+		&self.subject_id
+	}
+
+	#[must_use]
 	pub const fn aspect_id(&self) -> &AspectId {
 		&self.aspect_id
 	}

@@ -1,4 +1,4 @@
-use std::{pin::Pin, str::FromStr};
+use std::{pin::Pin, str::{FromStr, pattern}};
 
 use anyhow::{bail, Result};
 use bigdecimal::{BigDecimal, Zero};
@@ -8,7 +8,7 @@ use splimes::{Point, Resolution, Spline};
 use uuid::Uuid;
 
 use crate::{
-	database::traits::{AspectStructure, DatabaseStructure, Outputs}, types::database::traits::connection::Connection, AnalysisResult, AspectId, Batch, BatchId, BatchMetatdata, BatchedMeasurement, Database, DatasetId, Error, Measurement, MeasurementId
+	AnalysisResult, Correlation, Occurrence, AspectId, Batch, BatchId, BatchMetatdata, BatchedMeasurement, Database, DatasetId, DictionaryConstraints, DictionaryMetadata, Error, Measurement, MeasurementId, MeasurementVector, Occurrence, Pattern, Relative, SignalType, VariablilityType, cache, database::traits::{DatabaseStructure, Outputs}, occurrence, types::database::traits::connection::Connection
 };
 
 #[async_trait::async_trait]
@@ -16,6 +16,10 @@ impl Outputs for Database {
 	async fn get_raw_measurements(&self, aspect_id: &AspectId, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, max_per_page: usize, page: usize) -> Result<Vec<Measurement>> {
 		// Calculate offset for pagination (0-based page indexing)
 		let offset = page * max_per_page;
+
+		// Safe conversions to i64
+		let max_per_page_i64 = i64::try_from(max_per_page).map_err(|_| anyhow::anyhow!("max_per_page too large for i64"))?;
+		let offset_i64 = i64::try_from(offset).map_err(|_| anyhow::anyhow!("offset too large for i64"))?;
 
 		// For small page sizes with caching, check cache first (only for full range queries)
 		// Only cache if requesting first page, reasonable page size, and no time filtering
@@ -27,11 +31,16 @@ impl Outputs for Database {
 		}
 
 		// Get from database with proper scope management
-		let mut aspect = self.get_aspect(aspect_id).await?;
-		let measurement_db = aspect.measurements().await?;
+		let db = self.get_measurement_db(aspect_id).await?;
+		let db_path = self.get_measurement_db_path(aspect_id).await?;
+
+		let _conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		// Get from database with proper scope management
+		let db = self.get_measurement_db(aspect_id).await?;
+		let db_path = self.get_measurement_db_path(aspect_id).await?;
 
 		// Build query and parameters based on time range
-		let (query_sql, params): (String, Vec<String>) = match (start, end) {
+		let (query_sql, params): (String, Vec<turso::Value>) = match (start, end) {
 			(None, None) => {
 				// Return all points
 				(
@@ -42,7 +51,7 @@ impl Outputs for Database {
                     LIMIT ? OFFSET ?
                     "
 					.to_string(),
-					vec![max_per_page.to_string(), offset.to_string()],
+					vec![turso::Value::from(max_per_page_i64), turso::Value::from(offset_i64)],
 				)
 			}
 			(Some(start_time), None) => {
@@ -56,7 +65,7 @@ impl Outputs for Database {
                     LIMIT ? OFFSET ?
                     "
 					.to_string(),
-					vec![start_time.timestamp_millis().to_string(), max_per_page.to_string(), offset.to_string()],
+					vec![turso::Value::from(start_time.timestamp_millis()), turso::Value::from(max_per_page_i64), turso::Value::from(offset_i64)],
 				)
 			}
 			(None, Some(end_time)) => {
@@ -70,7 +79,7 @@ impl Outputs for Database {
                     LIMIT ? OFFSET ?
                     "
 					.to_string(),
-					vec![end_time.timestamp_millis().to_string(), max_per_page.to_string(), offset.to_string()],
+					vec![turso::Value::from(end_time.timestamp_millis()), turso::Value::from(max_per_page_i64), turso::Value::from(offset_i64)],
 				)
 			}
 			(Some(start_time), Some(end_time)) => {
@@ -84,39 +93,20 @@ impl Outputs for Database {
                     LIMIT ? OFFSET ?
                     "
 					.to_string(),
-					vec![start_time.timestamp_millis().to_string(), end_time.timestamp_millis().to_string(), max_per_page.to_string(), offset.to_string()],
+					vec![turso::Value::from(start_time.timestamp_millis()), turso::Value::from(end_time.timestamp_millis()), turso::Value::from(max_per_page_i64), turso::Value::from(offset_i64)],
 				)
 			}
 		};
 
-		let cache_key = aspect.measurements_path();
-		let conn = Self::begin_concurrent(&measurement_db, &cache_key, Some(self.cache.clone())).await?;
+		let conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
 
-		// Convert String parameters to turso::Value
-		let turso_params: Vec<turso::Value> = params.into_iter().map(turso::Value::from).collect();
-
-		let mut rows = conn.as_ref().query(&query_sql, turso_params).await.map_err(|e| Error::DatabaseError(format!("Failed to query measurements: {e}")))?;
+		let mut rows: turso::Rows = conn.as_ref().query(&query_sql, params).await.map_err(|e| Error::DatabaseError(format!("Failed to query measurements: {e}")))?;
 
 		let mut measurements = Vec::with_capacity(max_per_page.min(1000));
 
 		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get row: {e}")))? {
-			let id_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("ID is not text".to_string()))?.clone();
-			let dataset_id_str = row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Dataset ID is not text".to_string()))?.clone();
-			let timestamp_millis_str = row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Timestamp is not text".to_string()))?.clone();
-			let value_str = row.get_value(3)?.as_text().ok_or_else(|| Error::DatabaseError("Value is not text".to_string()))?.clone();
-
-			// Parse the UUIDs from string
-			let id = MeasurementId::from_string(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for measurement ID: {e}")))?;
-
-			let dataset_id = DatasetId::from_str(&dataset_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for dataset ID: {e}")))?;
-
-			let timestamp_millis: i64 = timestamp_millis_str.parse().map_err(|e| Error::DatabaseError(format!("Invalid timestamp format: {e}")))?;
-
-			let timestamp = DateTime::from_timestamp_millis(timestamp_millis).ok_or_else(|| Error::DatabaseError("Invalid timestamp".to_string()))?;
-
-			let value = BigDecimal::from_str(&value_str).map_err(|e| Error::DatabaseError(format!("Invalid value format: {e}")))?;
-
-			measurements.push(Measurement::new(id, dataset_id, timestamp, value));
+			let measurement: Measurement = self.parse_measurement_row(row).await?;
+			measurements.push(measurement);
 		}
 
 		// Handle case where requested range is outside of available data
@@ -139,21 +129,22 @@ impl Outputs for Database {
 	/// Helper function to get boundary measurements (earliest 2 and latest 2 points)
 	/// Used when requested range is outside of available data
 	async fn get_boundary_measurements(&self, aspect_id: &AspectId) -> Result<Vec<Measurement>> {
-		let mut aspect = self.get_aspect(aspect_id).await?;
-		let measurement_db = aspect.measurements().await?;
-		let conn = measurement_db.connect()?;
+		let db = self.get_measurement_db(aspect_id).await?;
+		let db_path = self.get_measurement_db_path(aspect_id).await?;
+
+		let conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
 
 		let mut all_measurements: Vec<Measurement> = Vec::new();
 
 		// Get earliest 2 measurements
 		let earliest_sql = r"
-        SELECT id, dataset_id, timestamp, value 
-        FROM measurements 
-        ORDER BY timestamp ASC 
-        LIMIT 2
-    ";
+                        SELECT id, dataset_id, timestamp, value 
+                                FROM measurements 
+                                ORDER BY timestamp ASC 
+                                LIMIT 2
+                ";
 
-		let mut rows = conn.query(earliest_sql, turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to query earliest measurements: {e}")))?;
+		let mut rows: turso::Rows = conn.as_ref().query(earliest_sql, turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to query earliest measurements: {e}")))?;
 
 		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get earliest row: {e}")))? {
 			let measurement: Measurement = self.parse_measurement_row(row).await?;
@@ -162,13 +153,13 @@ impl Outputs for Database {
 
 		// Get latest 2 measurements (avoid duplicates if we have <= 2 total measurements)
 		let latest_sql = r"
-        SELECT id, dataset_id, timestamp, value 
-        FROM measurements 
-        ORDER BY timestamp DESC 
-        LIMIT 2
-    ";
+                        SELECT id, dataset_id, timestamp, value 
+                                FROM measurements 
+                                ORDER BY timestamp DESC 
+                                LIMIT 2
+                ";
 
-		let mut rows = conn.query(latest_sql, turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to query latest measurements: {e}")))?;
+		let mut rows: turso::Rows = conn.as_ref().query(latest_sql, turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to query latest measurements: {e}")))?;
 
 		let mut latest_measurements: Vec<Measurement> = Vec::new();
 		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get latest row: {e}")))? {
@@ -184,6 +175,8 @@ impl Outputs for Database {
 			}
 		}
 
+		let _ = Self::commit_concurrent(&conn).await;
+
 		// Sort by timestamp to maintain chronological order
 		all_measurements.sort_by_key(|m: &Measurement| m.timestamp());
 
@@ -194,12 +187,11 @@ impl Outputs for Database {
 	async fn parse_measurement_row(&self, row: turso::Row) -> Result<Measurement> {
 		let id_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("ID is not text".to_string()))?.clone();
 		let dataset_id_str = row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Dataset ID is not text".to_string()))?.clone();
-		let timestamp_millis_str = row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Timestamp is not text".to_string()))?.clone();
+		let timestamp_millis: i64 = *row.get_value(2)?.as_integer().ok_or_else(|| Error::DatabaseError("Timestamp is not integer".to_string()))?;
 		let value_str = row.get_value(3)?.as_text().ok_or_else(|| Error::DatabaseError("Value is not text".to_string()))?.clone();
 
 		let id = MeasurementId::from_string(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for measurement ID: {e}")))?;
 		let dataset_id = DatasetId::from_str(&dataset_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for dataset ID: {e}")))?;
-		let timestamp_millis: i64 = timestamp_millis_str.parse().map_err(|e| Error::DatabaseError(format!("Invalid timestamp format: {e}")))?;
 		let timestamp = DateTime::from_timestamp_millis(timestamp_millis).ok_or_else(|| Error::DatabaseError("Invalid timestamp".to_string()))?;
 		let value = BigDecimal::from_str(&value_str).map_err(|e| Error::DatabaseError(format!("Invalid value format: {e}")))?;
 
@@ -208,12 +200,14 @@ impl Outputs for Database {
 
 	/// Get the total count of measurements for an aspect (useful for pagination)
 	async fn get_measurements_count(&self, aspect_id: &AspectId) -> Result<usize> {
-		let mut aspect = self.get_aspect(aspect_id).await?;
-		let measurement_db = aspect.measurements().await?;
+		let measurement_db = self.get_measurement_db(aspect_id).await?;
+		let db_path = self.get_measurement_db_path(aspect_id).await?;
 
 		let count_sql = "SELECT COUNT(*) FROM measurements";
-		let conn = measurement_db.connect()?;
-		let mut rows = conn.query(count_sql, turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to count measurements: {e}")))?;
+		let conn: cache::Connection = Self::begin_concurrent(&measurement_db, &db_path, Some(self.cache.clone())).await?;
+		let mut rows: turso::Rows = conn.as_ref().query(count_sql, turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to count measurements: {e}")))?;
+
+		let _ = Self::commit_concurrent(&conn).await;
 
 		if let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get count row: {e}")))? {
 			let count_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Count is not text".to_string()))?.clone();
@@ -497,9 +491,10 @@ impl Outputs for Database {
 		}
 
 		// Get from database
-		let mut aspect = self.get_aspect(aspect_id).await?;
-		let unprocessed_batches_db = aspect.unprocessed_batches().await?;
-		let conn = unprocessed_batches_db.connect()?;
+		let _aspect = self.get_aspect(aspect_id).await?;
+		let db = self.get_unprocessed_batches_db(aspect_id).await?;
+		let db_path = self.get_unprocessed_batches_db_path(aspect_id).await?;
+		let conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
 
 		let query_sql = r"
 			SELECT id, aspect_id, database_id, size, resolution, batch_hash, 
@@ -508,9 +503,12 @@ impl Outputs for Database {
 			WHERE id = ?
 		";
 
-		let mut rows = conn.query(query_sql, vec![turso::Value::from(batch_id.as_uuid().to_string())]).await.map_err(|e| Error::DatabaseError(format!("Failed to query batch: {e}")))?;
+		let mut rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![batch_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query batch: {e}")))?;
+
+		let _ = Self::commit_concurrent(&conn).await;
 
 		if let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get batch row: {e}")))? {
+			let row: turso::Row = row;
 			let metadata_json_str = row.get_value(9)?.as_text().ok_or_else(|| Error::DatabaseError("Metadata JSON is not text".to_string()))?.clone();
 			let measurements_json_str = row.get_value(10)?.as_text().ok_or_else(|| Error::DatabaseError("Measurements JSON is not text".to_string()))?.clone();
 
@@ -527,7 +525,7 @@ impl Outputs for Database {
 
 			Ok(batch)
 		} else {
-			Err(anyhow::anyhow!("Batch with ID {} not found", batch_id))
+			Err(anyhow::anyhow!("Batch with ID {batch_id} not found"))
 		}
 	}
 
@@ -543,9 +541,9 @@ impl Outputs for Database {
 		}
 
 		// Get from database
-		let mut aspect = self.get_aspect(aspect_id).await?;
-		let unprocessed_batches_db = aspect.unprocessed_batches().await?;
-		let conn = unprocessed_batches_db.connect()?;
+		let db = self.get_unprocessed_batches_db(aspect_id).await?;
+		let db_path = self.get_unprocessed_batches_db_path(aspect_id).await?;
+		let conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
 
 		// Query batches ordered by created_at (oldest first) for queue processing
 		let query_sql = r"
@@ -556,7 +554,7 @@ impl Outputs for Database {
                         ORDER BY created_at ASC
                 ";
 
-		let mut rows = conn.query(query_sql, turso::params![aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query unprocessed batches: {e}")))?;
+		let mut rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query unprocessed batches: {e}")))?;
 
 		// Collect all batches first to avoid async issues in the stream
 		let mut batches = Vec::new();
@@ -575,6 +573,8 @@ impl Outputs for Database {
 
 		// Convert to stream
 		let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
+
+		let _ = Self::commit_concurrent(&conn).await;
 		Ok(Box::pin(batch_stream))
 	}
 
@@ -594,4 +594,504 @@ impl Outputs for Database {
 
 		Ok(Batch { metadata, measurements, batch_id, batch_hash: batch_hash_str })
 	}
+
+	// Processed batches
+
+	async fn get_processed_batch(&self, aspect_id: &AspectId, batch_id: &BatchId) -> Result<Batch> {
+		// Check cache first using aspect_id and batch_id as cache key
+		let cache_key = format!("processed_batch_{}_{}", aspect_id.as_uuid(), batch_id.as_uuid());
+
+		// Try to get from cache first
+		if let Some(cached_batches) = self.cache.lock().await.get::<Vec<Batch>>(&cache_key).await {
+			// Since we're looking for a specific batch, find it in the cached results
+			if let Some(batch) = cached_batches.into_iter().find(|b| *b.batch_id() == *batch_id) {
+				return Ok(batch);
+			}
+			// If not found in cache, fall through to database query
+		}
+
+		// Get from database
+		let db = self.get_processed_batches_db(aspect_id).await?;
+		let db_path = self.get_processed_batches_db_path(aspect_id).await?;
+		let conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+
+		let query_sql = r"
+                SELECT id, aspect_id, database_id, size, resolution, batch_hash, 
+                    created_at, updated_at, metadata_json, measurements_json
+                FROM batches 
+                WHERE id = ?
+            ";
+
+		let mut rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![batch_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query batch: {e}")))?;
+
+		if let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get batch row: {e}")))? {
+			let batch = Self::parse_batch_row(row).await?;
+
+			// Cache the single batch (as a vec with one element)
+			self.cache.lock().await.store(&cache_key, vec![batch.clone()]).await;
+
+			let _ = Self::commit_concurrent(&conn).await;
+
+			Ok(batch)
+		} else {
+			let _ = Self::commit_concurrent(&conn).await;
+			Err(anyhow::anyhow!("Batch with ID {batch_id} not found"))
+		}
+	}
+
+	async fn get_processed_batches(&self, aspect_id: &AspectId) -> Result<Pin<Box<dyn Stream<Item = Result<Batch>> + Send + 'static>>> {
+		// Check cache first
+		let cache_key = format!("processed_batches_{}", aspect_id.as_uuid());
+		if let Some(cached_batches) = self.cache.lock().await.get::<Vec<Batch>>(&cache_key).await {
+			// Convert cached batches to stream
+			let batch_stream = futures::stream::iter(cached_batches.into_iter().map(Ok));
+			return Ok(Box::pin(batch_stream));
+		}
+
+		// Get from database
+		let db = self.get_processed_batches_db(aspect_id).await?;
+		let db_path = self.get_processed_batches_db_path(aspect_id).await?;
+		let conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+
+		// Query processed batches ordered by created_at
+		let query_sql = r"
+                            SELECT id, aspect_id, database_id, size, resolution, batch_hash, 
+                                    created_at, updated_at, metadata_json, measurements_json
+                            FROM batches 
+                            WHERE aspect_id = ? AND database_id = ?
+                            ORDER BY created_at ASC
+                    ";
+
+		let mut rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query processed batches: {e}")))?;
+
+		// Collect all batches first to avoid async issues in the stream
+		let mut batches = Vec::new();
+
+		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get batch row: {e}")))? {
+			if let Ok(batch) = Self::parse_batch_row(row).await {
+				batches.push(batch);
+			} else {
+				// Log error but continue processing other batches
+				eprintln!("Warning: Failed to parse batch row");
+			}
+		}
+
+		let _ = Self::commit_concurrent(&conn).await;
+
+		// Cache the results for future queries
+		if !batches.is_empty() {
+			self.cache.lock().await.store(&cache_key, batches.clone()).await;
+		}
+
+		// Convert to stream
+		let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
+		Ok(Box::pin(batch_stream))
+	}
+
+        //
+        // dictionaries
+        //
+
+        async fn get_dictionary_metadata(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<Option<DictionaryMetadata>> {
+                // Check cache first
+                let cache_key = format!("dictionary_metadata_{}", dictionary_name);
+                if let Some(metadata) = self.cache.lock().await.get::<DictionaryMetadata>(&cache_key).await {
+                        return Ok(Some(metadata));
+                }
+
+                // Get from database
+                let db = self.get_dictionary_db(aspect_id, dictionary_name).await?;
+                let conn = Self::begin_concurrent(&db, &dictionary_name, Some(self.cache.clone())).await?;
+                let query_sql = r"
+                        SELECT id, name, description, created_at, updated_at
+                        FROM dictionary_metadata 
+                        WHERE name = ?
+                ";
+
+                let mut metadata_rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![dictionary_name]).await.map_err(|e| Error::DatabaseError(format!("Failed to query dictionary metadata: {e}")))?;
+                if let Some(row) = metadata_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get metadata row: {e}")))? {
+                        let id_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary ID is not text".to_string()))?.clone();
+                        let name_str = row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary name is not text".to_string()))?.clone();
+                        let description_str = row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary description is not text".to_string()))?.clone();
+                        let created_at_millis: i64 = *row.get_value(3)?.as_integer().ok_or_else(|| Error::DatabaseError("Created at is not integer".to_string()))?;
+                        let updated_at_millis: i64 = *row.get_value(4)?.as_integer().ok_or_else(|| Error::DatabaseError("Updated at is not integer".to_string()))?;
+
+                        let id = DictionaryId::from_uuid(Uuid::parse_str(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for dictionary ID: {e}")))?);
+                        let created_at = DateTime::from_timestamp_millis(created_at_millis).ok_or_else(|| Error::DatabaseError("Invalid created at timestamp".to_string()))?;
+                        let updated_at = DateTime::from_timestamp_millis(updated_at_millis).ok_or_else(|| Error::DatabaseError("Invalid updated at timestamp".to_string()))?;
+
+                        let mut constraint_query_sql = r"
+                                SELECT steps_count, steps_interpolation
+                                FROM dictionary_constraints
+                                WHERE dictionary_id = ?
+                        ".to_string();
+
+                        let mut constraint_rows: turso::Rows = conn.as_ref().query(&constraint_query_sql, turso::params![id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query dictionary constraints: {e}")))?;
+                        if let Some(constraint_row) = constraint_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get constraint row: {e}")))? {
+                                let steps_count_str = constraint_row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Steps count is not text".to_string()))?.clone();
+                                let steps_interpolation_str = constraint_row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Steps interpolation is not text".to_string()))?.clone();
+
+                                // Currently not used, but could be stored in DictionaryMetadata if needed
+                                let steps: Option<usize> = steps_count_str.parse().map_err(|e| Error::DatabaseError(format!("Invalid steps count format: {e}")))?;
+                                let variabilities: Option<Vec<VariablilityType>> = serde_json::from_str(&steps_interpolation_str).map_err(|e| Error::DatabaseError(format!("Failed to parse steps interpolation JSON: {e}")))?;
+                        
+                                let constraints =  DictionaryConstraints::new(steps, variabilities);
+
+                                let metadata = DictionaryMetadata { id, name: name_str, description: description_str, constraints};
+
+                                // Cache the metadata
+                                self.cache.lock().await.store(&cache_key, metadata.clone()).await;
+
+                                let _ = Self::commit_concurrent(&conn).await;
+
+                                Ok(Some(metadata))
+                        }
+                        let _ = Self::commit_concurrent(&conn).await;
+                        Ok(None)
+                } else {
+                        let _ = Self::commit_concurrent(&conn).await;
+                        Ok(None)
+                }
+        }
+
+        async fn list_dictionaries(&self, aspect_id: &AspectId) -> Result<Vec<DictionaryMetadata>> {
+                // Check cache first
+                let cache_key = format!("dictionaries_list_{}", aspect_id.as_uuid());
+                if let Some(dictionaries) = self.cache.lock().await.get::<Vec<DictionaryMetadata>>(&cache_key).await {
+                        return Ok(dictionaries);
+                }
+
+                // Get from database
+                let db = self.get_dictionary_db(aspect_id, "default").await?;
+                let conn = Self::begin_concurrent(&db, "default", Some(self.cache.clone())).await?;
+                let query_sql = r"
+                        SELECT id, name, description, created_at, updated_at
+                        FROM dictionary_metadata
+                ";
+
+                let mut rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to query dictionaries: {e}")))?;
+                let mut dictionaries: Vec<DictionaryMetadata> = Vec::new();
+
+                while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get dictionary row: {e}")))? {
+                        let id_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary ID is not text".to_string()))?.clone();
+                        let name_str = row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary name is not text".to_string()))?.clone();
+                        let description_str = row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary description is not text".to_string()))?.clone();
+                        let created_at_millis: i64 = *row.get_value(3)?.as_integer().ok_or_else(|| Error::DatabaseError("Created at is not integer".to_string()))?;
+                        let updated_at_millis: i64 = *row.get_value(4)?.as_integer().ok_or_else(|| Error::DatabaseError("Updated at is not integer".to_string()))?;
+
+                        let id = DictionaryId::from_uuid(Uuid::parse_str(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for dictionary ID: {e}")))?);
+                        let created_at = DateTime::from_timestamp_millis(created_at_millis).ok_or_else(|| Error::DatabaseError("Invalid created at timestamp".to_string()))?;
+                        let updated_at = DateTime::from_timestamp_millis(updated_at_millis).ok_or_else(|| Error::DatabaseError("Invalid updated at timestamp".to_string()))?;
+
+                        let metadata = DictionaryMetadata { id, name: name_str, description: description_str, constraints: DictionaryConstraints::default() };
+
+                        dictionaries.push(metadata);
+                }
+                let _ = Self::commit_concurrent(&conn).await;
+                self.cache.lock().await.insert(&cache_key, &dictionaries).await;
+                Ok(dictionaries)
+        }
+
+
+        async fn get_dictionary_pattern(&self, aspect_id: &AspectId, dictionary_name: &str, pattern_id: &PatternID) -> Result<Pattern> {
+                // Check cache first using aspect_id and batch_id as cache key
+		let cache_key = format!("pattern_{}", pattern_id.as_uuid());
+
+		// Try to get from cache first
+		if let Some(pattern) = self.cache.lock().await.get::<Pattern>(&cache_key).await {
+			return Ok(pattern);
+		}
+
+                // Get from database
+                let db = self.get_dictionary_db(aspect_id, dictionary_name).await?;
+                let conn = Self::begin_concurrent(&db, &dictionary_name, Some(self.cache.clone())).await?;
+                let query_sql = r"
+                        SELECT id, sum_value, abs_sum_value, max_value, min_value, abs_max_value, avg_value, abs_avg_value
+                        FROM patterns 
+                        WHERE id = ?
+                ";
+
+                let mut rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![pattern_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query pattern: {e}")))?; 
+                let _ = Self::commit_concurrent(&conn).await;
+
+                if let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get pattern row: {e}")))? {
+                        let id_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Pattern ID is not text".to_string()))?.clone();
+                        let sum_value_str = row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Sum value is not text".to_string()))?.clone();
+                        let abs_sum_value_str = row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Abs sum value is not text".to_string()))?.clone();
+                        let max_value_str = row.get_value(3)?.as_text().ok_or_else(|| Error::DatabaseError("Max value is not text".to_string()))?.clone();
+                        let min_value_str = row.get_value(4)?.as_text().ok_or_else(|| Error::DatabaseError("Min value is not text".to_string()))?.clone();
+                        let abs_max_value_str = row.get_value(5)?.as_text().ok_or_else(|| Error::DatabaseError("Abs max value is not text".to_string()))?.clone();
+                        let avg_value_str = row.get_value(6)?.as_text().ok_or_else(|| Error::DatabaseError("Avg value is not text".to_string()))?.clone();
+                        let abs_avg_value_str = row.get_value(7)?.as_text().ok_or_else(|| Error::DatabaseError("Abs avg value is not text".to_string()))?.clone();
+                        
+                        let id = PatternID::from_uuid(Uuid::parse_str(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for pattern ID: {e}")))?);
+                        let sum_value = BigDecimal::from_str(&sum_value_str).map_err(|e| Error::DatabaseError(format!("Invalid sum value format: {e}")))?;
+                        let abs_sum_value = BigDecimal::from_str(&abs_sum_value_str).map_err(|e| Error::DatabaseError(format!("Invalid abs sum value format: {e}")))?;
+                        let max_value = BigDecimal::from_str(&max_value_str).map_err(|e| Error::DatabaseError(format!("Invalid max value format: {e}")))?;
+                        let min_value = BigDecimal::from_str(&min_value_str).map_err(|e| Error::DatabaseError(format!("Invalid min value format: {e}")))?;
+                        let abs_max_value = BigDecimal::from_str(&abs_max_value_str).map_err(|e| Error::DatabaseError(format!("Invalid abs max value format: {e}")))?;
+                        let avg_value = BigDecimal::from_str(&avg_value_str).map_err(|e| Error::DatabaseError(format!("Invalid avg value format: {e}")))?;
+                        let abs_avg_value = BigDecimal::from_str(&abs_avg_value_str).map_err(|e| Error::DatabaseError(format!("Invalid abs avg value format: {e}")))?;
+
+                        // Get occurrences from pattern_occurrences table
+                        let occurrences_query_sql = r"
+                                SELECT pattern_id, aspect_id, resolution, size, database_info, beginning_timestamp, end_timestamp
+                                FROM pattern_occurrences
+                                WHERE pattern_id = ?
+                        ";
+                        let mut occ_rows: turso::Rows = conn.as_ref().query(occurrences_query_sql, turso::params![pattern_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query pattern occurrences: {e}")))?;
+                        let mut occurrences: Vec<Occurrence> = Vec::new();
+                        while let Some(occ_row) = occ_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get pattern occurrence row: {e}")))? {
+                                let occ_pattern_id_str = occ_row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Pattern ID is not text".to_string()))?.clone();
+                                let occ_aspect_id_str = occ_row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Aspect ID is not text".to_string()))?.clone();
+                                let occ_resolution_str = occ_row.get_value(3)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Resolution is not text".to_string()))?.clone();
+                                let occ_size: usize = *occ_row.get_value(4)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence Size is not integer".to_string()))?;
+                                let occ_database_info_str = occ_row.get_value(5)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Database Info is not text".to_string()))?.clone();
+                                let occ_beginning_timestamp_millis: i64 = *occ_row.get_value(6)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence Beginning Timestamp is not integer".to_string()))?;
+                                let occ_end_timestamp_millis: i64 = *occ_row.get_value(7)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence End Timestamp is not integer".to_string()))?;
+
+                                let occ_pattern_id = PatternID::from_uuid(Uuid::parse_str(&occ_pattern_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for occurrence Pattern ID: {e}")))?);
+                                let occ_aspect_id = AspectId::from_str(&occ_aspect_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for occurrence Aspect ID: {e}")))?;
+                                let occ_resolution = Resolution::from_str(&occ_resolution_str).map_err(|e| Error::DatabaseError(format!("Invalid resolution format: {e}")))?;
+                                let occ_database_info: DatabaseInfo = serde_json::from_str(&occ_database_info_str).map_err(|e| Error::DatabaseError(format!("Failed to parse occurrence database info JSON: {e}")))?;
+                                let occ_beginning_timestamp = DateTime::from_timestamp_millis(occ_beginning_timestamp_millis).ok_or_else(|| Error::DatabaseError("Invalid beginning timestamp".to_string()))?;
+                                let occ_end_timestamp = DateTime::from_timestamp_millis(occ_end_timestamp_millis).ok_or_else(|| Error::DatabaseError("Invalid end timestamp".to_string()))?;
+                                
+                                let occurrence = Occurrence::new(occ_aspect_id, occ_resolution, occ_size, occ_database_info, occ_pattern_id, occ_beginning_timestamp, occ_end_timestamp);
+                                occurrences.push(occurrence);
+                        }
+
+                        // Get relatives from pattern_relatives table
+                        let relatives_query_sql = r"
+                                SELECT pattern_id, relative_index, vector_location, vector_amplitude, max_x, max_y
+                                FROM pattern_relatives
+                                WHERE pattern_id = ?
+                        ";
+
+                        let mut rel_rows: turso::Rows = conn.as_ref().query(relatives_query_sql, turso::params![pattern_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query pattern relatives: {e}")))?;
+                        let mut relatives: Vec<Relative> = Vec::new();
+                        while let Some(rel_row) = rel_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get pattern relative row: {e}")))? {
+                                let rel_pattern_id_str = rel_row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Relative Pattern ID is not text".to_string()))?.clone();
+                                let rel_relative_index: usize = *rel_row.get_value(2)?.as_integer().ok_or_else(|| Error::DatabaseError("Relative Index is not integer".to_string()))?;
+                                let rel_vector_location_str = rel_row.get_value(3)?.as_text().ok_or_else(|| Error::DatabaseError("Relative Vector Location is not text".to_string()))?.clone();
+                                let rel_vector_amplitude_str = rel_row.get_value(4)?.as_text().ok_or_else(|| Error::DatabaseError("Relative Vector Amplitude is not text".to_string()))?.clone();
+                                let rel_max_x_str = rel_row.get_value(5)?.as_text().ok_or_else(|| Error::DatabaseError("Relative Max X is not text".to_string()))?.clone();
+                                let rel_max_y_str = rel_row.get_value(6)?.as_text().ok_or_else(|| Error::DatabaseError("Relative Max Y is not text".to_string()))?.clone();
+                        
+                                let rel_pattern_id = PatternID::from_uuid(Uuid::parse_str(&rel_pattern_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for relative Pattern ID: {e}")))?);
+                                let rel_vector_location = BigDecimal::from_str(&rel_vector_location_str).map_err(|e| Error::DatabaseError(format!("Invalid vector location format: {e}")))?;
+                                let rel_vector_amplitude = BigDecimal::from_str(&rel_vector_amplitude_str).map_err(|e| Error::DatabaseError(format!("Invalid vector amplitude format: {e}")))?;
+                                let rel_max_x = BigDecimal::from_str(&rel_max_x_str).map_err(|e| Error::DatabaseError(format!("Invalid max x format: {e}")))?;
+                                let rel_max_y = BigDecimal::from_str(&rel_max_y_str).map_err(|e| Error::DatabaseError(format!("Invalid max y format: {e}")))?;
+                                let measurement_vector = MeasurementVector::new(rel_vector_location, rel_vector_amplitude);
+                                let relative = Relative::new(measurement_vector, rel_max_x, rel_max_y);
+                                relatives.push(relative);
+                        }
+
+                        let pattern = Pattern::new(rel_pattern_id, occurrences, relatives);
+
+                        // Cache the pattern
+                        self.cache.lock().await.store(&cache_key, pattern.clone()).await;
+
+                        Ok(pattern)
+                } else {
+                        Err(anyhow::anyhow!("Pattern with ID {pattern_id} not found"))
+                }
+        }
+
+        async fn get_dictionary_patterns(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<Pin<Box<dyn Stream<Item = Result<Pattern>> + Send + 'static>>> {
+                // Check cache first
+                let cache_key = format!("patterns_{}", dictionary_name);
+                if let Some(cached_patterns) = self.cache.lock().await.get::<Vec<Pattern>>(&cache_key).await {
+                        // Convert cached patterns to stream
+                        let pattern_stream = futures::stream::iter(cached_patterns.into_iter().map(Ok));
+                        return Ok(Box::pin(pattern_stream));
+                }
+
+                // Get from database
+                let db = self.get_dictionary_db(aspect_id, dictionary_name).await?;
+                let conn = Self::begin_concurrent(&db, &dictionary_name, Some(self.cache.clone())).await?;
+                let query_sql = r"
+                        SELECT id, sum_value, abs_sum_value, max_value, min_value, abs_max_value, avg_value, abs_avg_value
+                        FROM patterns 
+                ";
+                let mut rows: turso::Rows = conn.as_ref().query(query_sql, []).await.map_err(|e| Error::DatabaseError(format!("Failed to query patterns: {e}")))?;
+                // Collect all patterns first to avoid async issues in the stream
+                let mut patterns = Vec::new();
+                while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get pattern row: {e}")))? {
+                        if let Ok(pattern) = Self::parse_pattern_row(&conn, row).await {
+                                patterns.push(pattern);
+                        } else {
+                                // Log error but continue processing other patterns
+                                eprintln!("Warning: Failed to parse pattern row");
+                        }
+                }
+                let _ = Self::commit_concurrent(&conn).await;
+                // Cache the results for future queries
+                if !patterns.is_empty() {
+                        self.cache.lock().await.store(&cache_key, patterns.clone()).await;
+                }
+                // Convert to stream
+                let pattern_stream = futures::stream::iter(patterns.into_iter().map(Ok));
+                Ok(Box::pin(pattern_stream))
+        }
+
+
+        //
+        // Correlations
+        //
+
+        async fn get_correlation(&self, aspect_id: &AspectId, correlation_id: &CorrelationId) -> Result<Correlation> {
+                // Check cache first using aspect_id and correlation_id as cache key
+                let cache_key = format!("correlation_{}_{}", aspect_id.as_uuid(), correlation_id.as_uuid());
+
+                // Try to get from cache first
+                if let Some(cached_correlation) = self.cache.lock().await.get::<Correlation>(&cache_key).await {
+                        return Ok(cached_correlation);
+                }
+
+                // Get from database
+                let aspect = self.get_aspect(aspect_id).await?;
+                let db = aspect.correlations().await?;
+                let db_path = aspect.correlations_path().await?;
+                let conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+                let query_sql = r"
+                        SELECT id, dictionary_id, subject_id, aspect_id, pattern_id, event_id
+                        FROM correlations 
+                        WHERE id = ?
+                ";
+
+                let mut rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![correlation_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query correlation: {e}")))?;
+                if let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get correlation row: {e}")))? {
+                        let id_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Correlation ID is not text".to_string()))?.clone();
+                        let dictionary_id_str = row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary ID is not text".to_string()))?.clone();
+                        let subject_id_str = row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Subject ID is not text".to_string()))?.clone();
+                        let aspect_id_str = row.get_value(3)?.as_text().ok_or_else(|| Error::DatabaseError("Aspect ID is not text".to_string()))?.clone();
+                        let pattern_id_str = row.get_value(4)?.as_text().ok_or_else(|| Error::DatabaseError("Pattern ID is not text".to_string()))?.clone();
+                        let event_id_str = row.get_value(5)?.as_text().ok_or_else(|| Error::DatabaseError("Event ID is not text".to_string()))?.clone();
+                       
+                        let id = CorrelationId::from_uuid(Uuid::parse_str(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for correlation ID: {e}")))?);
+                        let dictionary_id = DictionaryId::from_uuid(Uuid::parse_str(&dictionary_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for dictionary ID: {e}")))?);
+                        let subject_id = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for subject ID: {e}")))?);
+                        let aspect_id = AspectId::from_uuid(Uuid::parse_str(&aspect_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for aspect ID: {e}")))?);
+                        let pattern_id = PatternID::from_uuid(Uuid::parse_str(&pattern_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for pattern ID: {e}")))?);
+                        let event_id = EventId::from_uuid(Uuid::parse_str(&event_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for event ID: {e}")))?);
+                        
+                        // get error rates
+                        let error_rate_query_sql = r"
+                                SELECT signal_type, error_rate_value, error_rate_units
+                                FROM correlation_error_rates
+                                WHERE correlation_id = ?
+                        ";
+                        let mut error_rate_rows: turso::Rows = conn.as_ref().query(error_rate_query_sql, turso::params![correlation_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query correlation error rates: {e}")))?;
+                        let mut error_rate: HashMap<ErrorType, f64> = HashMap::new();
+                        while let Some(error_rate_row) = error_rate_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get correlation error rate row: {e}")))? {
+                                let signal_type_str = error_rate_row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Error rate signal type is not text".to_string()))?.clone();
+                                let error_rate_value: BigDecimal = {
+                                        let value_str = error_rate_row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Error rate value is not text".to_string()))?.clone();
+                                        BigDecimal::from_str(&value_str).map_err(|e| Error::DatabaseError(format!("Invalid error rate value format: {e}")))?;
+                                };
+                                let error_rate_units_str = error_rate_row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Error rate units is not text".to_string()))?.clone();
+
+                                let units: Resolution = Resolution::from_str(&error_rate_units_str).map_err(|e| Error::DatabaseError(format!("Invalid error rate units format: {e}")))?;
+                                let err_rate = ErrorRate::new(error_rate_value, units);
+
+                                let signal_type = SignalType::from_str(&signal_type_str).map_err(|e| Error::DatabaseError(format!("Invalid error type format: {e}")))?;
+                                // Currently not used, but could be stored in Correlation if needed
+                                
+
+                                error_rate.insert(signal_type, err_rate);
+                        }
+
+                        // get occurrences
+                        let occurrences_query_sql = r"
+                                SELECT correlation_id, occurrence_index, aspect_id, resolution, size, database_info, pattern_id, beginning_timestamp, end_timestamp
+                                FROM correlation_occurrences
+                                WHERE correlation_id = ?
+                        ";
+                        let mut occ_rows: turso::Rows = conn.as_ref().query(occurrences_query_sql, turso::params![correlation_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query correlation occurrences: {e}")))?;
+                        let mut occurrences: Vec<Occurrence> = Vec::new();
+                        // load occerrences in order of occurrence_index
+                        let mut occ_map: HashMap<usize, Occurrence> = HashMap::new();
+                        while let Some(occ_row) = occ_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get correlation occurrence row: {e}")))? {
+                                let occ_index: usize = *occ_row.get_value(1)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence Index is not integer".to_string()))?;
+                                let occ_aspect_id_str = occ_row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Aspect ID is not text".to_string()))?.clone();
+                                let occ_resolution_str = occ_row.get_value(3)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Resolution is not text".to_string()))?.clone();
+                                let occ_size: usize = *occ_row.get_value(4)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence Size is not integer".to_string()))?;
+                                let occ_database_info_str = occ_row.get_value(5)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Database Info is not text".to_string()))?.clone();
+                                let occ_pattern_id_str = occ_row.get_value(6)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Pattern ID is not text".to_string()))?.clone();
+                                let occ_beginning_timestamp_millis: i64 = *occ_row.get_value(7)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence Beginning Timestamp is not integer".to_string()))?;
+                                let occ_end_timestamp_millis: i64 = *occ_row.get_value(8)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence End Timestamp is not integer".to_string()))?;
+                                let occ_aspect_id = AspectId::from_str(&occ_aspect_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for occurrence Aspect ID: {e}")))?;
+                                let occ_resolution = Resolution::from_str(&occ_resolution_str).map_err(|e| Error::DatabaseError(format!("Invalid resolution format: {e}")))?;
+                                let occ_database_info: DatabaseInfo = serde_json::from_str(&occ_database_info_str).map_err(|e| Error::DatabaseError(format!("Failed to parse occurrence database info JSON: {e}")))?;
+                                let occ_pattern_id = PatternID::from_uuid(Uuid::parse_str(&occ_pattern_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for occurrence Pattern ID: {e}")))?);
+                                let occ_beginning_timestamp = DateTime::from_timestamp_millis(occ_beginning_timestamp_millis).ok_or_else(|| Error::DatabaseError("Invalid beginning timestamp".to_string()))?;
+                                let occ_end_timestamp = DateTime::from_timestamp_millis(occ_end_timestamp_millis).ok_or_else(|| Error::DatabaseError("Invalid end timestamp".to_string()))?;
+                                let occurrence = Occurrence::new(occ_aspect_id, occ_resolution, occ_size, occ_database_info, occ_pattern_id, occ_beginning_timestamp, occ_end_timestamp);
+                                occ_map.insert(occ_index, occurrence);
+                        }
+                        // Sort occurrences by index
+                        let mut occ_indices: Vec<usize> = occ_map.keys().cloned().collect();
+                        occ_indices.sort();
+                        for index in occ_indices {
+                                if let Some(occurrence) = occ_map.get(&index) {
+                                        occurrences.push(occurrence.clone());
+                                }
+                        }
+
+                        let correlation = Correlation::new(Some(id), dictionary_id, subject_id, aspect_id, pattern_id, event_id, error_rate, occurrences);
+
+                        // Cache the correlation
+                        self.cache.lock().await.store(&cache_key, correlation.clone()).await;
+                        let _ = Self::commit_concurrent(&conn).await;
+                        Ok(correlation)
+                } else {
+                        let _ = Self::commit_concurrent(&conn).await;
+                        Err(anyhow::anyhow!("Correlation with ID {correlation_id} not found"))
+                }
+        }
+
+
+        async fn get_correlations(&self, aspect_id: &AspectId) -> Result<Pin<Box<dyn Stream<Item = Result<Correlation>> + Send + 'static>>> {
+                // Check cache first
+                let cache_key = format!("correlations_{}", aspect_id.as_uuid());
+                if let Some(cached_correlations) = self.cache.lock().await.get::<Vec<Correlation>>(&cache_key).await {
+                        // Convert cached correlations to stream
+                        let correlation_stream = futures::stream::iter(cached_correlations.into_iter().map(Ok));
+                        return Ok(Box::pin(correlation_stream));
+                }
+
+                // Get from database
+                let aspect = self.get_aspect(aspect_id).await?;
+                let db = aspect.correlations().await?;
+                let db_path = aspect.correlations_path().await?;
+                let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+                let query_sql = r"
+                        SELECT id
+                        FROM correlations 
+                ";
+                let mut rows: turso::Rows = conn.as_ref().query(query_sql, []).await.map_err(|e| Error::DatabaseError(format!("Failed to query correlations: {e}")))?;
+                // Collect all correlations first to avoid async issues in the stream
+                let mut correlations = Vec::new();
+                while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get correlation row: {e}")))? {
+                        let id_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Correlation ID is not text".to_string()))?.clone();
+                        let correlation_id = CorrelationId::from_uuid(Uuid::parse_str(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for correlation ID: {e}")))?);
+                        if let Ok(correlation) = self.get_correlation(aspect_id, &correlation_id).await {
+                                correlations.push(correlation);
+                        } else {
+                                // Log error but continue processing other correlations
+                                eprintln!("Warning: Failed to parse correlation with ID {}", correlation_id);
+                        }
+                }
+                let _ = Self::commit_concurrent(&conn).await;
+                // Cache the results for future queries
+                if !correlations.is_empty() {
+                        self.cache.lock().await.store(&cache_key, correlations.clone()).await;
+                }
+                // Convert to stream
+                let correlation_stream = futures::stream::iter(correlations.into_iter().map(Ok));
+                Ok(Box::pin(correlation_stream))
+        }
+
 }

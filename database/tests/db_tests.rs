@@ -422,12 +422,12 @@ fn convert_unix_timestamp_to_datetime_utc(timestamp_seconds: f64) -> Option<Date
 	DateTime::from_timestamp(seconds, nanoseconds)
 }
 
+/// load BTC 1-minute data into a test database for use in other tests
 #[tokio::test(flavor = "multi_thread")]
 async fn test_create_btc_1min_database() -> Result<()> {
 	// This test creates a database with BTC 1-minute data
 	// Note: This requires the CSV file to be present
 	let csv_path = "datasets/btc_1min.csv"; // Correct path when running from database directory
-
 	let db_name = "Crypto".to_string();
 
 	// Create database (will use existing if present)
@@ -468,24 +468,15 @@ async fn test_create_btc_1min_database() -> Result<()> {
 		println!("Current working directory: {:?}", std::env::current_dir());
 		if std::path::Path::new(csv_path).exists() {
 			println!("CSV file found, loading data...");
-
 			println!("Observing subject BTCUSD");
 			let subject = db.observe_subject("BTCUSD").await?;
 
 			println!("Tracking aspects for BTCUSD");
 			// Create aspects for different price types (with delays to prevent resource exhaustion)
 			let open_aspect = db.track_aspect(&subject.id(), "open", &Resolution::Minutes).await?;
-			tokio::time::sleep(std::time::Duration::from_millis(100)).await; // Allow cleanup
-
 			let high_aspect = db.track_aspect(&subject.id(), "high", &Resolution::Minutes).await?;
-			tokio::time::sleep(std::time::Duration::from_millis(100)).await; // Allow cleanup
-
 			let low_aspect = db.track_aspect(&subject.id(), "low", &Resolution::Minutes).await?;
-			tokio::time::sleep(std::time::Duration::from_millis(100)).await; // Allow cleanup
-
 			let close_aspect = db.track_aspect(&subject.id(), "close", &Resolution::Minutes).await?;
-			tokio::time::sleep(std::time::Duration::from_millis(100)).await; // Allow cleanup
-
 			let volume_aspect = db.track_aspect(&subject.id(), "volume", &Resolution::Minutes).await?;
 
 			println!("Tracking aspects for BTCUSD: {}, {}, {}, {}, {}", open_aspect.id(), high_aspect.id(), low_aspect.id(), close_aspect.id(), volume_aspect.id());
@@ -537,7 +528,14 @@ async fn test_create_btc_1min_database() -> Result<()> {
 			println!("Starting batch insertion of measurements in parallel");
 
 			// Run batch insertions in parallel
-			let (open_result, high_result, low_result, close_result, volume_result) = tokio::join!(db.batch_capture_measurements(open_aspect.id(), DatasetId::new(), open_measurements), db.batch_capture_measurements(high_aspect.id(), DatasetId::new(), high_measurements), db.batch_capture_measurements(low_aspect.id(), DatasetId::new(), low_measurements), db.batch_capture_measurements(close_aspect.id(), DatasetId::new(), close_measurements), db.batch_capture_measurements(volume_aspect.id(), DatasetId::new(), volume_measurements));
+			#[rustfmt::skip]
+			let (open_result, high_result, low_result, close_result, volume_result) = tokio::join!(
+                                db.batch_capture_measurements(open_aspect.id(), DatasetId::new(), open_measurements),
+                                db.batch_capture_measurements(high_aspect.id(), DatasetId::new(), high_measurements),
+                                db.batch_capture_measurements(low_aspect.id(), DatasetId::new(), low_measurements),
+                                db.batch_capture_measurements(close_aspect.id(), DatasetId::new(), close_measurements),
+                                db.batch_capture_measurements(volume_aspect.id(), DatasetId::new(), volume_measurements)
+                        );
 
 			// Check all results
 			open_result?;
@@ -552,23 +550,6 @@ async fn test_create_btc_1min_database() -> Result<()> {
 			println!("Inserted {inserted_count} BTC 1-minute records");
 		} else {
 			println!("Skipping BTC database test - CSV file not found at {csv_path}");
-		}
-	}
-
-	// Test some queries if we have subjects
-	let subject_list = db.list_subjects().await?;
-	if !subject_list.is_empty() {
-		if let Some((subject_id, _subject_name)) = subject_list.iter().next() {
-			let aspects = db.get_subject_aspects(subject_id).await?;
-			if let Some(aspect) = aspects.first() {
-				let query_time = Utc.with_ymd_and_hms(2024, 1, 1, 12, 0, 0).unwrap(); // Some reasonable time
-				let result = db.analyze_point(&aspect.id(), query_time, &Resolution::Minutes, &Spline::Linear).await;
-
-				match result {
-					Ok(point) => println!("BTC price at {}: ${}", query_time, point.value),
-					Err(e) => println!("Query failed (may be expected): {e}"),
-				}
-			}
 		}
 	}
 

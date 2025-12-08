@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use futures::Stream;
 use splimes::{Point, Resolution, Spline};
 
-use crate::{AspectId, Batch, BatchId, Measurement};
+use crate::{AspectId, Batch, BatchId, Measurement, DictionaryMetadata};
 
 /// Trait for database analysis and output operations
 #[async_trait::async_trait]
@@ -26,7 +26,9 @@ pub trait Outputs {
 
 	async fn fetch_measurements_for_range(&self, aspect_id: &AspectId, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<Vec<Measurement>>;
 
+	//
 	// UnprocessedBatches
+	//
 
 	async fn get_unprocessed_batch(&self, aspect_id: &AspectId, batch_id: &BatchId) -> Result<Batch>;
 
@@ -35,4 +37,35 @@ pub trait Outputs {
 	async fn get_unprocessed_batches(&self, aspect_id: &AspectId) -> Result<Pin<Box<dyn Stream<Item = Result<Batch>> + Send + 'static>>>;
 
 	async fn parse_batch_row(row: turso::Row) -> Result<Batch>;
+
+	//
+	// ProcessedBatches
+	//
+
+	async fn get_processed_batch(&self, aspect_id: &AspectId, batch_id: &BatchId) -> Result<Batch>;
+
+	/// Get processed batches in queue order (oldest first)
+	async fn get_processed_batches(&self, aspect_id: &AspectId) -> Result<Pin<Box<dyn Stream<Item = Result<Batch>> + Send + 'static>>>;
+
+        //
+        // Dictionaries
+        //
+
+        async fn get_dictionary_metadata(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<Option<DictionaryMetadata>>;
+
+        async fn list_dictionaries(&self, aspect_id: &AspectId) -> Result<Vec<DictionaryMetadata>>;
+
+        async fn get_dictionary_pattern(&self, aspect_id: &AspectId, dictionary_name: &str, pattern_id: &PatternID) -> Result<Pattern>;
+
+        async fn get_dictionary_patterns(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<Pin<Box<dyn Stream<Item = Result<Pattern>> + Send + 'static>>>;
+
+
+        //
+        // Correlations
+        //
+
+        async fn get_correlation(&self, aspect_id: &AspectId, correlation_id: &CorrelationID) -> Result<Correlation>;
+
+        async fn get_correlations(&self, aspect_id: &AspectId) -> Result<Pin<Box<dyn Stream<Item = Result<Correlation>> + Send + 'static>>>;
+ 
 }

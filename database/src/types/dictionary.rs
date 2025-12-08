@@ -1,9 +1,10 @@
 use std::fmt::Display;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive, Zero};
 use serde::{Deserialize, Serialize};
 use splimes::Spline;
+use std::str::FromStr;
 use uuid::Uuid;
 use wide::f64x4;
 
@@ -50,6 +51,14 @@ pub struct Dictionary {
 	description: String,
 	patterns: Vec<Pattern>,
 	constraints: DictionaryConstraints,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DictionaryMetadata {
+	pub id: DictionaryId,
+	pub name: String,
+	pub description: String,
+	pub constraints: DictionaryConstraints,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -140,6 +149,58 @@ pub enum VariablilityType {
 	SumPercentile(Variability),
 	AbsoluteSumStatic(Variability),
 	AbsoluteSumPercentile(Variability),
+}
+
+impl Display for VariablilityType {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self {
+                        Self::MaximumStatic(var) => write!(f, "MaximumStatic({})", var.value()),
+                        Self::AverageStatic(var) => write!(f, "AverageStatic({})", var.value()),
+                        Self::AbsoluteMaximumStatic(var) => write!(f, "AbsoluteMaximumStatic({})", var.value()),
+                        Self::AbsoluteAverageStatic(var) => write!(f, "AbsoluteAverageStatic({})", var.value()),
+                        Self::MaximumPercentile(var) => write!(f, "MaximumPercentile({})", var.value()),
+                        Self::AveragePercentile(var) => write!(f, "AveragePercentile({})", var.value()),
+                        Self::AbsoluteMaximumPercentile(var) => write!(f, "AbsoluteMaximumPercentile({})", var.value()),
+                        Self::AbsoluteAveragePercentile(var) => write!(f, "AbsoluteAveragePercentile({})", var.value()),
+                        Self::SumStatic(var) => write!(f, "SumStatic({})", var.value()),
+                        Self::SumPercentile(var) => write!(f, "SumPercentile({})", var.value()),
+                        Self::AbsoluteSumStatic(var) => write!(f, "AbsoluteSumStatic({})", var.value()),
+                        Self::AbsoluteSumPercentile(var) => write!(f, "AbsoluteSumPercentile({})", var.value()),
+                }
+        }
+}
+
+impl FromStr for VariablilityType {
+        type Err = anyhow::Error;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+                let parts: Vec<&str> = s.trim_end_matches(')').split('(').collect();
+                if parts.len() != 2 {
+                        bail!("Invalid VariabilityType format");
+                }
+
+                let var_type = parts[0];
+                let value_str = parts[1];
+                let value = BigDecimal::from_str(value_str)?;
+
+                let variability = Variability::new(value);
+
+                match var_type {
+                        "MaximumStatic" => Ok(Self::MaximumStatic(variability)),
+                        "AverageStatic" => Ok(Self::AverageStatic(variability)),
+                        "AbsoluteMaximumStatic" => Ok(Self::AbsoluteMaximumStatic(variability)),
+                        "AbsoluteAverageStatic" => Ok(Self::AbsoluteAverageStatic(variability)),
+                        "MaximumPercentile" => Ok(Self::MaximumPercentile(variability)),
+                        "AveragePercentile" => Ok(Self::AveragePercentile(variability)),
+                        "AbsoluteMaximumPercentile" => Ok(Self::AbsoluteMaximumPercentile(variability)),
+                        "AbsoluteAveragePercentile" => Ok(Self::AbsoluteAveragePercentile(variability)),
+                        "SumStatic" => Ok(Self::SumStatic(variability)),
+                        "SumPercentile" => Ok(Self::SumPercentile(variability)),
+                        "AbsoluteSumStatic" => Ok(Self::AbsoluteSumStatic(variability)),
+                        "AbsoluteSumPercentile" => Ok(Self::AbsoluteSumPercentile(variability)),
+                        _ => bail!("Unknown VariabilityType: {var_type}"),
+                }
+        }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -813,7 +874,7 @@ impl Dictionary {
 	///
 	/// Returns an error if JSON serialization fails.
 	pub fn to_json(&self) -> Result<String> {
-		serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize dictionary: {}", e))
+		serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize dictionary: {e}"))
 	}
 
 	/// Serialize the dictionary to JSON string with pretty formatting
@@ -822,7 +883,7 @@ impl Dictionary {
 	///
 	/// Returns an error if JSON serialization fails.
 	pub fn to_json_pretty(&self) -> Result<String> {
-		serde_json::to_string_pretty(self).map_err(|e| anyhow::anyhow!("Failed to serialize dictionary: {}", e))
+		serde_json::to_string_pretty(self).map_err(|e| anyhow::anyhow!("Failed to serialize dictionary: {e}"))
 	}
 
 	/// Deserialize a dictionary from JSON string
@@ -831,7 +892,7 @@ impl Dictionary {
 	///
 	/// Returns an error if JSON deserialization fails or the JSON is invalid.
 	pub fn from_json(json: &str) -> Result<Self> {
-		serde_json::from_str(json).map_err(|e| anyhow::anyhow!("Failed to deserialize dictionary: {}", e))
+		serde_json::from_str(json).map_err(|e| anyhow::anyhow!("Failed to deserialize dictionary: {e}"))
 	}
 
 	/// Serialize the dictionary to binary format (using bincode)
@@ -840,7 +901,7 @@ impl Dictionary {
 	///
 	/// Returns an error if binary serialization fails.
 	pub fn to_bytes(&self) -> Result<Vec<u8>> {
-		bincode::serialize(self).map_err(|e| anyhow::anyhow!("Failed to serialize dictionary to bytes: {}", e))
+		bincode::serialize(self).map_err(|e| anyhow::anyhow!("Failed to serialize dictionary to bytes: {e}"))
 	}
 
 	/// Deserialize a dictionary from binary format (using bincode)
@@ -849,7 +910,7 @@ impl Dictionary {
 	///
 	/// Returns an error if binary deserialization fails or the data is invalid.
 	pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-		bincode::deserialize(bytes).map_err(|e| anyhow::anyhow!("Failed to deserialize dictionary from bytes: {}", e))
+		bincode::deserialize(bytes).map_err(|e| anyhow::anyhow!("Failed to deserialize dictionary from bytes: {e}"))
 	}
 }
 

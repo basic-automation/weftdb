@@ -85,6 +85,12 @@ impl Config for Database {
 		db_path.to_string_lossy().to_string()
 	}
 
+	fn aspect_dictionaries_db_path(db_name: &str, subject_name: &str, aspect_name: &str, dictionary_name: &str) -> String {
+		let mut db_path: PathBuf = Self::aspect_dictionaries_path(db_name, subject_name, aspect_name).into();
+		db_path.push(format!("{dictionary_name}.db"));
+		db_path.to_string_lossy().to_string()
+	}
+
 	fn dictionary_path(db_name: &str, subject_name: &str, aspect_name: &str, dictionary_name: &str) -> String {
 		let mut db_path: PathBuf = Self::aspect_dictionaries_path(db_name, subject_name, aspect_name).into();
 		db_path.push(format!("{dictionary_name}.db"));

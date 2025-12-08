@@ -25,7 +25,6 @@ static CONNECTION_DATABASES: LazyLock<Arc<Mutex<HashMap<String, turso::Database>
 
 pub use config::DEFAULT_DATA_DIR;
 
-pub mod batches;
 pub mod config;
 pub mod connection;
 pub mod correlations;
@@ -35,7 +34,6 @@ pub mod helpers;
 pub mod inputs;
 pub mod navigation;
 pub mod outputs;
-pub mod patterns;
 pub mod traits;
 
 #[derive(Debug, Clone)]
@@ -130,8 +128,8 @@ impl DatabaseStructure for Database {
 			Ok(_) => println!("[TRACE] Background logged transaction id={id_str}"),
 			Err(e) => {
 				println!("[TRACE] Background transaction logging attempt failed: {e}");
-				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("Failed to log transaction {}: {}", id_str, e));
+				let _ = Self::rollback_concurrent(&conn).await;
+				return Err(anyhow::anyhow!("Failed to log transaction {id_str}: {e}"));
 			}
 		}
 
@@ -160,7 +158,7 @@ impl DatabaseStructure for Database {
 			Err(e) => {
 				println!("[TRACE] Transaction logging attempt failed: {e}");
 				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("Failed to log transaction {}: {}", id_str, e));
+				return Err(anyhow::anyhow!("Failed to log transaction {id_str}: {e}"));
 			}
 		}
 
@@ -188,7 +186,7 @@ impl DatabaseStructure for Database {
 			Ok(_) => println!("[DEBUG] Transactions table created or already exists"),
 			Err(e) => {
 				println!("[DEBUG] Failed to create transactions table: {e}");
-				return Err(anyhow::anyhow!("SQL execution failure 5: `{}`", e));
+				return Err(anyhow::anyhow!("SQL execution failure 5: `{e}`"));
 			}
 		}
 
@@ -214,7 +212,7 @@ impl DatabaseStructure for Database {
 		match res {
 			Ok(_) => println!("[DEBUG] Database table created or already exists"),
 			Err(e) => {
-				return Err(anyhow::anyhow!("SQL execution failure 6: `{}`", e));
+				return Err(anyhow::anyhow!("SQL execution failure 6: `{e}`"));
 			}
 		}
 
@@ -241,7 +239,7 @@ impl DatabaseStructure for Database {
 			Ok(_) => println!("[DEBUG] Subjects table created or already exists"),
 			Err(e) => {
 				println!("[DEBUG] Failed to create subjects table: {e}");
-				return Err(anyhow::anyhow!("SQL execution failure 7: `{}`", e));
+				return Err(anyhow::anyhow!("SQL execution failure 7: `{e}`"));
 			}
 		}
 
@@ -273,7 +271,7 @@ impl DatabaseStructure for Database {
 			Ok(_) => println!("[DEBUG] Aspects table created or already exists"),
 			Err(e) => {
 				println!("[DEBUG] Failed to create aspects table: {e}");
-				return Err(anyhow::anyhow!("SQL execution failure 8: `{}`", e));
+				return Err(anyhow::anyhow!("SQL execution failure 8: `{e}`"));
 			}
 		}
 
@@ -314,7 +312,7 @@ impl DatabaseStructure for Database {
 
 		// Check if folder already exists
 		if Path::new(&db_path).exists() {
-			bail!("Database folder already exists: {}", db_path);
+			bail!("Database folder already exists: {db_path}");
 		}
 
 		// Create the directory
@@ -340,7 +338,7 @@ impl DatabaseStructure for Database {
 			Err(e) => {
 				println!("[DEBUG] Failed to create metadata tables: {e}");
 				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("Failed to create metadata tables: {}", e));
+				return Err(anyhow::anyhow!("Failed to create metadata tables: {e}"));
 			}
 		};
 		println!("[DEBUG] Metadata tables created, {} transactions logged", transactions.len());
@@ -355,7 +353,7 @@ impl DatabaseStructure for Database {
 			Err(e) => {
 				println!("[DEBUG] Failed to insert database metadata: {e}");
 				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("SQL execution failure 9: `{}`", e));
+				return Err(anyhow::anyhow!("SQL execution failure 9: `{e}`"));
 			}
 		}
 
@@ -385,15 +383,15 @@ impl DatabaseStructure for Database {
 			turso::Value::Blob(bytes) => {
 				// Try to interpret as UUID bytes
 				if bytes.len() == 16 {
-					let uuid = uuid::Uuid::from_bytes(bytes.as_slice().try_into().map_err(|_| anyhow::anyhow!("{} blob is not 16 bytes", field_name))?);
+					let uuid = uuid::Uuid::from_bytes(bytes.as_slice().try_into().map_err(|_| anyhow::anyhow!("{field_name} blob is not 16 bytes"))?);
 					Ok(uuid.to_string())
 				} else {
-					String::from_utf8(bytes.clone()).map_err(|e| anyhow::anyhow!("{} blob is not valid UTF-8: {}", field_name, e))
+					String::from_utf8(bytes.clone()).map_err(|e| anyhow::anyhow!("{field_name} blob is not valid UTF-8: {e}"))
 				}
 			}
 			turso::Value::Integer(i) => Ok(i.to_string()),
 			turso::Value::Real(r) => Ok(r.to_string()),
-			turso::Value::Null => Err(anyhow::anyhow!("{} is null", field_name)),
+			turso::Value::Null => Err(anyhow::anyhow!("{field_name} is null")),
 		}
 	}
 
@@ -427,7 +425,7 @@ impl DatabaseStructure for Database {
 
 		// Check if folder exists
 		if !Path::new(&db_path).exists() {
-			bail!("Database folder does not exist: {}", db_path);
+			bail!("Database folder does not exist: {db_path}");
 		}
 
 		// Use shared connection database
@@ -580,7 +578,7 @@ impl DatabaseStructure for Database {
 		println!("[DEBUG] Observing subject: {name}");
 		// Check if subject already exists
 		if self.get_subject_by_name(name).await.is_ok() {
-			return Err(anyhow::anyhow!("Subject '{}' already exists", name));
+			return Err(anyhow::anyhow!("Subject '{name}' already exists"));
 		}
 
 		// Create subject folder
@@ -610,7 +608,7 @@ impl DatabaseStructure for Database {
 			Ok(_) => println!("[DEBUG] Subject inserted successfully"),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("SQL execution failure 10: `{}`", e));
+				return Err(anyhow::anyhow!("SQL execution failure 10: `{e}`"));
 			}
 		}
 
@@ -658,7 +656,7 @@ impl DatabaseStructure for Database {
 			}
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("SQL execution failure 12: in get_subject: `{}`", e));
+				return Err(anyhow::anyhow!("SQL execution failure 12: in get_subject: `{e}`"));
 			}
 		};
 
@@ -713,7 +711,7 @@ impl DatabaseStructure for Database {
 			Ok(_) => println!("Deleted subject with ID {}", id.as_uuid()),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("SQL execution failure 13: `{}`", e));
+				return Err(anyhow::anyhow!("SQL execution failure 13: `{e}`"));
 			}
 		}
 		let _ = Self::commit_concurrent(&conn).await;
@@ -732,7 +730,7 @@ impl DatabaseStructure for Database {
 			Ok(rows) => rows,
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("SQL execution failure 14: `{}`", e));
+				return Err(anyhow::anyhow!("SQL execution failure 14: `{e}`"));
 			}
 		};
 
@@ -786,7 +784,7 @@ impl DatabaseStructure for Database {
 			}
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("SQL execution failure 15: in list_aspects: `{}`", e));
+				return Err(anyhow::anyhow!("SQL execution failure 15: in list_aspects: `{e}`"));
 			}
 		}
 	}
@@ -877,6 +875,12 @@ impl DatabaseStructure for Database {
 	}
 
 	async fn get_aspect(&self, id: &AspectId) -> Result<Aspect> {
+		let cache_key = format!("aspect_{}", id.as_uuid());
+		self.cache.lock().await.cleanup_expired().await;
+		if let Some(cached) = self.cache.lock().await.get(&cache_key).await {
+			return Ok(cached);
+		}
+
 		let conn = Self::begin_concurrent(&self.metadata, &self.metadata_path, Some(self.cache.clone())).await?;
 
 		// No explicit transaction for a read-only, single-row query; add retry on transient locks
@@ -901,17 +905,18 @@ impl DatabaseStructure for Database {
 					let subject_id = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str)?);
 					let resolution: Resolution = serde_json::from_str(&resolution_str)?;
 
-					Aspect::new(Some(aspect_id), &name, &subject_id, &resolution, &conn).await?
+					Aspect::from_metadata(Some(aspect_id), name, &subject_id, &resolution, self.metadata_path.clone(), None).await?
 				} else {
 					bail!("Aspect not found");
 				}
 			}
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("SQL execution failure 16: in get_aspect: `{}`", e));
+				return Err(anyhow::anyhow!("SQL execution failure 16: in get_aspect: `{e}`"));
 			}
 		};
 		let _ = Self::commit_concurrent(&conn).await;
+		self.cache.lock().await.store(&cache_key, aspect.clone()).await;
 		Ok(aspect)
 	}
 
@@ -939,14 +944,14 @@ impl DatabaseStructure for Database {
 					let subject_id = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str)?);
 					let resolution: Resolution = serde_json::from_str(&resolution_str)?;
 
-					Aspect::new(Some(aspect_id), &name, &subject_id, &resolution, &conn).await?
+					Aspect::from_metadata(Some(aspect_id), name, &subject_id, &resolution, self.metadata_path.clone(), None).await?
 				} else {
 					bail!("Aspect not found");
 				}
 			}
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("SQL execution failure in 17: get_aspect_by_name: `{}`", e));
+				return Err(anyhow::anyhow!("SQL execution failure in 17: get_aspect_by_name: `{e}`"));
 			}
 		};
 		let _ = Self::commit_concurrent(&conn).await;
@@ -955,9 +960,15 @@ impl DatabaseStructure for Database {
 
 	async fn get_earliest_measurement(&self, aspect_id: &AspectId) -> Result<Option<DateTime<Utc>>> {
 		let cache_key = format!("metadata_earliest_measurement_{}", aspect_id.as_uuid());
-		let conn = Self::begin_concurrent(&self.metadata, &cache_key, Some(self.cache.clone())).await?;
+		self.cache.lock().await.cleanup_expired().await;
+		if let Some(cached) = self.cache.lock().await.get(&cache_key).await {
+			return Ok(Some(cached));
+		}
 
-		let res = conn.as_ref().query("SELECT MIN(timestamp) FROM measurements WHERE aspect_id = ?", turso::params![aspect_id.as_uuid().to_string()]).await;
+		let db = self.get_measurement_db(aspect_id).await?;
+		let db_path = self.get_measurement_db_path(aspect_id).await?;
+		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		let res = conn.as_ref().query("SELECT MIN(timestamp) FROM measurements", turso::params![]).await;
 
 		let timestamp = match res {
 			Ok(mut rows) => {
@@ -966,27 +977,36 @@ impl DatabaseStructure for Database {
 					if timestamp_str.is_empty() {
 						return Ok(None);
 					}
-
-					DateTime::parse_from_rfc3339(&timestamp_str)?.with_timezone(&Utc)
+					// Parse as milliseconds (i64) instead of RFC3339
+					let timestamp_millis: i64 = timestamp_str.parse().map_err(|e| anyhow::anyhow!("Invalid timestamp format: {e}"))?;
+					let timestamp = DateTime::from_timestamp_millis(timestamp_millis).ok_or_else(|| anyhow::anyhow!("Invalid timestamp"))?;
+					Some(timestamp)
 				} else {
-					return Ok(None);
+					None
 				}
 			}
 			Err(e) => {
-				let () = Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("SQL execution failure 18: in get_earliest_measurement: `{}`", e));
+				let _ = Self::rollback_concurrent(&conn).await;
+				return Err(anyhow::anyhow!("SQL execution failure 18: in get_earliest_measurement: `{e}`"));
 			}
 		};
 
 		let _ = Self::commit_concurrent(&conn).await;
-		Ok(Some(timestamp))
+
+		if let Some(ts) = timestamp {
+			self.cache.lock().await.store(&cache_key, ts).await;
+			Ok(Some(ts))
+		} else {
+			Ok(None)
+		}
 	}
 
 	async fn get_latest_measurement(&self, aspect_id: &AspectId) -> Result<Option<DateTime<Utc>>> {
-		let metadata_db = &self.metadata;
-		let metadata_db_path = self.metadata_path.clone();
-		let conn = Self::begin_concurrent(metadata_db, &metadata_db_path, Some(self.cache.clone())).await?;
-		let res = conn.as_ref().query("SELECT MAX(timestamp) FROM measurements WHERE aspect_id = ?", turso::params![aspect_id.as_uuid().to_string()]).await;
+		let db = self.get_measurement_db(aspect_id).await?;
+		let db_path = self.get_measurement_db_path(aspect_id).await?;
+		let _cache_key = format!("measurement_db_{aspect_id}");
+		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		let res = conn.as_ref().query("SELECT MAX(timestamp) FROM measurements", turso::params![]).await;
 		match res {
 			Ok(mut rows) => {
 				if let Some(row) = rows.next().await? {
@@ -995,14 +1015,17 @@ impl DatabaseStructure for Database {
 					if timestamp_str.is_empty() {
 						return Ok(None);
 					}
-					let timestamp = DateTime::parse_from_rfc3339(&timestamp_str)?.with_timezone(&Utc);
-					return Ok(Some(timestamp));
+					// Parse as milliseconds (i64) instead of RFC3339
+					let timestamp_millis: i64 = timestamp_str.parse().map_err(|e| anyhow::anyhow!("Invalid timestamp format: {e}"))?;
+					let timestamp = DateTime::from_timestamp_millis(timestamp_millis).ok_or_else(|| anyhow::anyhow!("Invalid timestamp"))?;
+					Ok(Some(timestamp))
+				} else {
+					Ok(None)
 				}
-				return Ok(None);
 			}
 			Err(e) => {
-				let () = Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("SQL execution failure 19: in get_latest_measurement: `{}`", e));
+				let _ = Self::rollback_concurrent(&conn).await;
+				return Err(anyhow::anyhow!("SQL execution failure 19: in get_latest_measurement: `{e}`"));
 			}
 		}
 	}
@@ -1022,13 +1045,165 @@ impl DatabaseStructure for Database {
 		match res {
 			Ok(_) => println!("Updated aspect timestamps for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("SQL execution failure 20: `{}`", e));
+				let _ = Self::rollback_concurrent(&conn).await;
+				return Err(anyhow::anyhow!("SQL execution failure 20: `{e}`"));
 			}
 		}
 		let _ = Self::commit_concurrent(&conn).await;
 		Ok(())
 	}
+
+	async fn get_measurement_db(&self, aspect_id: &AspectId) -> Result<turso::Database> {
+		// Build the measurements path directly from aspect_id
+		let cache_key = format!("measurements_db_{aspect_id}");
+
+		// Try cache first
+		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
+			return Ok(db);
+		}
+
+		// Get aspect metadata (lightweight - no wireframing)
+		let mut aspect = self.get_aspect(aspect_id).await?;
+		let db = aspect.measurements().await?;
+
+		// Cache it
+		self.cache.lock().await.store(&cache_key, db.clone()).await;
+
+		Ok(db)
+	}
+
+	async fn get_measurement_db_path(&self, aspect_id: &AspectId) -> Result<String> {
+		let cache_key = format!("measurements_db_path_{aspect_id}");
+		if let Some(path) = self.cache.lock().await.get::<String>(&cache_key).await {
+			return Ok(path);
+		}
+		let aspect = self.get_aspect(aspect_id).await?;
+		let measurements_path = aspect.measurements_path();
+		self.cache.lock().await.store(&cache_key, measurements_path.clone()).await;
+		Ok(measurements_path)
+	}
+
+	async fn get_unprocessed_batches_db(&self, aspect_id: &AspectId) -> Result<turso::Database> {
+		let cache_key = format!("unprocessed_batches_db_{aspect_id}");
+		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
+			return Ok(db);
+		}
+		let mut aspect = self.get_aspect(aspect_id).await?;
+		let db = aspect.unprocessed_batches().await?;
+		self.cache.lock().await.store(&cache_key, db.clone()).await;
+		Ok(db)
+	}
+
+	async fn get_unprocessed_batches_db_path(&self, aspect_id: &AspectId) -> Result<String> {
+		let cache_key = format!("unprocessed_batches_db_path_{aspect_id}");
+		if let Some(path) = self.cache.lock().await.get::<String>(&cache_key).await {
+			return Ok(path);
+		}
+		let aspect = self.get_aspect(aspect_id).await?;
+		let unprocessed_batches_path = aspect.unprocessed_batches_path();
+		self.cache.lock().await.store(&cache_key, unprocessed_batches_path.clone()).await;
+		Ok(unprocessed_batches_path)
+	}
+
+	async fn get_processed_batches_db(&self, aspect_id: &AspectId) -> Result<turso::Database> {
+		let cache_key = format!("processed_batches_db_{aspect_id}");
+		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
+			return Ok(db);
+		}
+		let mut aspect = self.get_aspect(aspect_id).await?;
+		let db = aspect.processed_batches().await?;
+		self.cache.lock().await.store(&cache_key, db.clone()).await;
+		Ok(db)
+	}
+
+	async fn get_processed_batches_db_path(&self, aspect_id: &AspectId) -> Result<String> {
+		let cache_key = format!("processed_batches_db_path_{aspect_id}");
+		if let Some(path) = self.cache.lock().await.get::<String>(&cache_key).await {
+			return Ok(path);
+		}
+		let aspect = self.get_aspect(aspect_id).await?;
+		let processed_batches_path = aspect.processed_batches_path();
+		self.cache.lock().await.store(&cache_key, processed_batches_path.clone()).await;
+		Ok(processed_batches_path)
+	}
+
+	async fn get_patterns_db(&self, aspect_id: &AspectId) -> Result<turso::Database> {
+		let cache_key = format!("patterns_db_{aspect_id}");
+		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
+			return Ok(db);
+		}
+		let mut aspect = self.get_aspect(aspect_id).await?;
+		let db = aspect.patterns().await?;
+		self.cache.lock().await.store(&cache_key, db.clone()).await;
+
+		Ok(db)
+	}
+
+	async fn get_patterns_db_path(&self, aspect_id: &AspectId) -> Result<String> {
+		let cache_key = format!("patterns_db_path_{aspect_id}");
+		if let Some(path) = self.cache.lock().await.get::<String>(&cache_key).await {
+			return Ok(path);
+		}
+		let aspect = self.get_aspect(aspect_id).await?;
+		let patterns_path = aspect.patterns_path();
+		self.cache.lock().await.store(&cache_key, patterns_path.clone()).await;
+		Ok(patterns_path)
+	}
+
+	async fn get_events_db(&self, aspect_id: &AspectId) -> Result<turso::Database> {
+		let cache_key = format!("events_db_{aspect_id}");
+		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
+			return Ok(db);
+		}
+		let mut aspect = self.get_aspect(aspect_id).await?;
+		let events_db = aspect.events().await?;
+		self.cache.lock().await.store(&cache_key, events_db.clone()).await;
+		Ok(events_db)
+	}
+
+	async fn get_events_db_path(&self, aspect_id: &AspectId) -> Result<String> {
+		let cache_key = format!("events_db_path_{aspect_id}");
+		if let Some(path) = self.cache.lock().await.get::<String>(&cache_key).await {
+			return Ok(path);
+		}
+		let aspect = self.get_aspect(aspect_id).await?;
+		let events_db_path = aspect.events_path();
+		self.cache.lock().await.store(&cache_key, events_db_path.clone()).await;
+		Ok(events_db_path)
+	}
+
+	async fn get_correlations_db(&self, aspect_id: &AspectId) -> Result<turso::Database> {
+		let cache_key = format!("correlations_db_{aspect_id}");
+		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
+			return Ok(db);
+		}
+		let mut aspect = self.get_aspect(aspect_id).await?;
+		let db = aspect.correlations().await?;
+		self.cache.lock().await.store(&cache_key, db.clone()).await;
+		Ok(db)
+	}
+
+	async fn get_correlations_db_path(&self, aspect_id: &AspectId) -> Result<String> {
+		let cache_key = format!("correlations_db_path_{aspect_id}");
+		if let Some(path) = self.cache.lock().await.get::<String>(&cache_key).await {
+			return Ok(path);
+		}
+		let aspect = self.get_aspect(aspect_id).await?;
+		let correlations_path = aspect.correlations_path();
+		self.cache.lock().await.store(&cache_key, correlations_path.clone()).await;
+		Ok(correlations_path)
+	}
+
+        async fn get_dictionary_db(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<turso::Database> {
+                let cache_key = format!("dictionary_db_{}_{}", aspect_id, dictionary_name);
+                if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
+                        return Ok(db);
+                }
+                let mut aspect = self.get_aspect(aspect_id).await?;
+                let db = aspect.dictionary(dictionary_name).await?;
+                self.cache.lock().await.store(&cache_key, db.clone()).await;
+                Ok(db)
+        }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1190,7 +1365,7 @@ impl DatabaseInfo {
 					}
 					Err(e) => {
 						Database::rollback_concurrent(&conn).await?;
-						return Err(anyhow::anyhow!("SQL execution failure 21: in get_creation_time: `{}`", e));
+						return Err(anyhow::anyhow!("SQL execution failure 21: in get_creation_time: `{e}`"));
 					}
 				};
 
@@ -1229,7 +1404,7 @@ impl DatabaseInfo {
 			}
 			Err(e) => {
 				Database::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("SQL execution failure 22: in get_size_stats: `{}`", e));
+				return Err(anyhow::anyhow!("SQL execution failure 22: in get_size_stats: `{e}`"));
 			}
 		}
 
@@ -1244,7 +1419,7 @@ impl DatabaseInfo {
 			}
 			Err(e) => {
 				Database::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!(" 13: in get_size_stats: `{}`", e));
+				return Err(anyhow::anyhow!(" 13: in get_size_stats: `{e}`"));
 			}
 		}
 

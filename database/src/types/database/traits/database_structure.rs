@@ -122,4 +122,43 @@ pub trait DatabaseStructure {
 
 	/// Helper to update aspect metadata timestamps
 	async fn update_aspect_timestamps(&self, aspect_id: &AspectId, min_new: DateTime<Utc>, max_new: DateTime<Utc>) -> Result<()>;
+
+	/// get measurement db by aspect id
+	async fn get_measurement_db(&self, aspect_id: &AspectId) -> Result<turso::Database>;
+
+	/// get measurement db path by aspect id
+	async fn get_measurement_db_path(&self, aspect_id: &AspectId) -> Result<String>;
+
+	/// get unprocessed batches db by aspect id
+	async fn get_unprocessed_batches_db(&self, aspect_id: &AspectId) -> Result<turso::Database>;
+
+	/// get unprocessed batches db path by aspect id
+	async fn get_unprocessed_batches_db_path(&self, aspect_id: &AspectId) -> Result<String>;
+
+	/// get processed batches db by aspect id
+	async fn get_processed_batches_db(&self, aspect_id: &AspectId) -> Result<turso::Database>;
+
+	/// get processed batches db path by aspect id
+	async fn get_processed_batches_db_path(&self, aspect_id: &AspectId) -> Result<String>;
+
+	/// get patterns db by aspect id
+	async fn get_patterns_db(&self, aspect_id: &AspectId) -> Result<turso::Database>;
+
+	/// get patterns db path by aspect id
+	async fn get_patterns_db_path(&self, aspect_id: &AspectId) -> Result<String>;
+
+	/// get events db by aspect id
+	async fn get_events_db(&self, aspect_id: &AspectId) -> Result<turso::Database>;
+
+	/// get events db path by aspect id
+	async fn get_events_db_path(&self, aspect_id: &AspectId) -> Result<String>;
+
+	/// get correlations db by aspect id
+	async fn get_correlations_db(&self, aspect_id: &AspectId) -> Result<turso::Database>;
+
+	/// get correlations db path by aspect id
+	async fn get_correlations_db_path(&self, aspect_id: &AspectId) -> Result<String>;
+
+        /// get dictionary db by aspect id and dictionary name
+        async fn get_dictionary_db(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<turso::Database>;
 }

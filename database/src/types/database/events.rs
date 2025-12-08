@@ -5,42 +5,12 @@ use uuid::Uuid;
 
 use super::helpers::safe_ratio;
 use crate::{
-	database::traits::AspectStructure, types::database::traits::{connection::Connection, database_structure::DatabaseStructure}, AspectId, Database, Event, DATABASES
+	types::database::traits::{connection::Connection, database_structure::DatabaseStructure}, AspectId, Database, Event, DATABASES
 };
 
 const EVENT_CHUNK_SIZE: usize = 100;
 
 impl Database {
-	/// Store an event in the database
-	///
-	/// # Errors
-	/// - if database not found
-	/// - if unable to insert event
-	pub async fn store_event(&self, event: &Event) -> Result<()> {
-		let metadata_db = &self.metadata;
-		let metadata_db_path = &self.metadata_path;
-
-		// Serialize the event manifestations
-		let manifestations_json = serde_json::to_string(event.manifestations()).map_err(|e| anyhow::anyhow!(format!("Failed to serialize event manifestations: {e}")))?;
-
-		let event_id = event.id().to_string();
-		let event_name = event.name().to_string();
-		let conn = Self::begin_concurrent(metadata_db, metadata_db_path, Some(self.cache.clone())).await?;
-
-		let res = conn.as_ref().execute("INSERT INTO events (id, database_id, name, manifestations, created_at) VALUES (?, ?, ?, ?, ?)", turso::params![event_id.clone(), self.id().as_uuid().to_string(), event_name.clone(), manifestations_json.clone(), chrono::Utc::now().timestamp_millis()]).await;
-		match res {
-			Ok(_) => println!("Stored event {} in database {}", event_id, self.id()),
-			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!(format!("Failed to insert event: {e}")));
-			}
-		}
-
-		let _ = Self::commit_concurrent(&conn).await;
-
-		Ok(())
-	}
-
 	/// Get unprocessed events for the database
 	///
 	/// # Errors
@@ -407,9 +377,8 @@ impl Database {
 	/// - if database not found
 	/// - if unable to delete events
 	pub async fn clear_all_events(&self, aspect_id: &AspectId) -> Result<usize> {
-		let mut aspect = self.get_aspect(aspect_id).await?;
-		let event_db_path = &aspect.events_path();
-		let event_db = &aspect.events().await?;
+		let event_db_path = &self.get_events_db_path(aspect_id).await?;
+		let event_db = &self.get_events_db(aspect_id).await?;
 
 		let conn = Self::begin_concurrent(event_db, event_db_path, Some(self.cache.clone())).await?;
 

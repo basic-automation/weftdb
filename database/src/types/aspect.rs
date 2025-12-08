@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::{collections::HashMap, fmt::Display};
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -7,9 +7,9 @@ use turso::Database as TursoDatabase;
 use uuid::Uuid;
 
 use crate::{
-	cache::Connection, types::database::{
-		traits::{aspect_structure::AspectStructure, connection::Connection as ConnectionTrait}, Config
-	}, Database, DatabaseStructure, SubjectId
+	Database, DatabaseStructure, DictionaryConstraints, DictionaryId, SubjectId, cache::Connection, database::dictionaries, types::{database::{
+		Config, traits::{aspect_structure::AspectStructure, connection::Connection as ConnectionTrait}
+	}, dictionary::VariablilityType}
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -77,6 +77,10 @@ pub struct Aspect {
 	#[serde(skip)]
 	correlations: Option<TursoDatabase>,
 	correlations_path: String,
+
+        #[serde(skip)]
+        dictionaries: Option<HashMap<String, TursoDatabase>>,
+        dictionaries_paths: HashMap<String, String>,
 }
 
 #[async_trait::async_trait]
@@ -184,6 +188,8 @@ impl AspectStructure for Aspect {
 			events_path,
 			correlations,
 			correlations_path,
+                        dictionaries: None,
+                        dictionaries_paths: HashMap::new(),
 		})
 	}
 
@@ -213,6 +219,24 @@ impl AspectStructure for Aspect {
 		let patterns_path = aspect_path_str.clone() + "/patterns.db";
 		let events_path = aspect_path_str.clone() + "/events.db";
 		let correlations_path = aspect_path_str.clone() + "/correlations.db";
+		let dictionaries_path = aspect_path_str.clone() + "/dictionaries";
+
+                let mut dictionaries_paths = HashMap::new();
+                // Find all dictionary database paths in the dictionaries directory
+                if let Ok(entries) = tokio::fs::read_dir(&dictionaries_path).await {
+                        let mut dir_entries = entries;
+                        while let Ok(Some(entry)) = dir_entries.next_entry().await {
+                                let path = entry.path();
+                                if path.is_file() {
+                                        if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                                                if file_name.ends_with(".db") {
+                                                        let dict_name = file_name.trim_end_matches(".db").to_string();
+                                                        dictionaries_paths.insert(dict_name, path.to_string_lossy().to_string());
+                                                }
+                                        }
+                                }
+                        }
+                }
 
 		#[rustfmt::skip]
 		Ok(Self {
@@ -234,7 +258,9 @@ impl AspectStructure for Aspect {
                         processed_batches_path,
                         patterns_path,
                         events_path,
-                        correlations_path
+                        correlations_path,
+                        dictionaries: None,
+                        dictionaries_paths,
                 })
 	}
 
@@ -288,7 +314,7 @@ impl AspectStructure for Aspect {
 				let subject_name: String = row.get(0)?;
 				subject_name
 			}
-			Err(e) => bail!("SQL execution failure 3: in get_subject_name: `{}`", e),
+			Err(e) => bail!("SQL execution failure 3: in get_subject_name: `{e}`"),
 		};
 		Ok(subject_name)
 	}
@@ -304,7 +330,18 @@ impl AspectStructure for Aspect {
 	}
 
 	async fn measurements(&mut self) -> Result<TursoDatabase> {
-		self.measurements.clone().ok_or_else(|| anyhow::anyhow!("Measurements database is not initialized"))
+		if let Some(ref db) = self.measurements {
+			return Ok(db.clone());
+		}
+
+		// Lazily initialize the measurements database
+		let measurements = Database::get_or_create_turso_database(&self.measurements_path).await?;
+		let conn = Database::begin_concurrent(&measurements, &self.measurements_path, None).await?;
+		Self::wireframe_measurements_tables(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
+
+		self.measurements = Some(measurements.clone());
+		Ok(measurements)
 	}
 
 	fn set_measurements(&mut self, turso_db: TursoDatabase) {
@@ -339,7 +376,18 @@ impl AspectStructure for Aspect {
 	}
 
 	async fn unprocessed_batches(&mut self) -> Result<TursoDatabase> {
-		self.unprocessed_batches.clone().ok_or_else(|| anyhow::anyhow!("Unprocessed batches database is not initialized"))
+		if let Some(ref db) = self.unprocessed_batches {
+			return Ok(db.clone());
+		}
+
+		// Lazily initialize the unprocessed_batches database
+		let unprocessed_batches = Database::get_or_create_turso_database(&self.unprocessed_batches_path).await?;
+		let conn = Database::begin_concurrent(&unprocessed_batches, &self.unprocessed_batches_path, None).await?;
+		Self::wireframe_batches_tables(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
+
+		self.unprocessed_batches = Some(unprocessed_batches.clone());
+		Ok(unprocessed_batches)
 	}
 
 	fn set_unprocessed_batches(&mut self, turso_db: TursoDatabase) {
@@ -394,7 +442,18 @@ impl AspectStructure for Aspect {
 	}
 
 	async fn processed_batches(&mut self) -> Result<TursoDatabase> {
-		self.processed_batches.clone().ok_or_else(|| anyhow::anyhow!("Processed batches database is not initialized"))
+		if let Some(ref db) = self.processed_batches {
+			return Ok(db.clone());
+		}
+
+		// Lazily initialize the processed_batches database
+		let processed_batches = Database::get_or_create_turso_database(&self.processed_batches_path).await?;
+		let conn = Database::begin_concurrent(&processed_batches, &self.processed_batches_path, None).await?;
+		Self::wireframe_batches_tables(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
+
+		self.processed_batches = Some(processed_batches.clone());
+		Ok(processed_batches)
 	}
 
 	fn set_processed_batches(&mut self, turso_db: TursoDatabase) {
@@ -410,7 +469,18 @@ impl AspectStructure for Aspect {
 	}
 
 	async fn patterns(&mut self) -> Result<TursoDatabase> {
-		self.patterns.clone().ok_or_else(|| anyhow::anyhow!("Patterns database is not initialized"))
+		if let Some(ref db) = self.patterns {
+			return Ok(db.clone());
+		}
+
+		// Lazily initialize the patterns database
+		let patterns = Database::get_or_create_turso_database(&self.patterns_path).await?;
+		let conn = Database::begin_concurrent(&patterns, &self.patterns_path, None).await?;
+		Self::wireframe_patterns_tables(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
+
+		self.patterns = Some(patterns.clone());
+		Ok(patterns)
 	}
 
 	fn set_patterns(&mut self, turso_db: TursoDatabase) {
@@ -500,7 +570,18 @@ impl AspectStructure for Aspect {
 	}
 
 	async fn events(&mut self) -> Result<TursoDatabase> {
-		self.events.clone().ok_or_else(|| anyhow::anyhow!("Events database is not initialized"))
+		if let Some(ref db) = self.events {
+			return Ok(db.clone());
+		}
+
+		// Lazily initialize the events database
+		let events = Database::get_or_create_turso_database(&self.events_path).await?;
+		let conn = Database::begin_concurrent(&events, &self.events_path, None).await?;
+		Self::wireframe_events_tables(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
+
+		self.events = Some(events.clone());
+		Ok(events)
 	}
 
 	fn set_events(&mut self, turso_db: TursoDatabase) {
@@ -559,7 +640,18 @@ impl AspectStructure for Aspect {
 	}
 
 	async fn correlations(&mut self) -> Result<TursoDatabase> {
-		self.correlations.clone().ok_or_else(|| anyhow::anyhow!("Correlations database is not initialized"))
+		if let Some(ref db) = self.correlations {
+			return Ok(db.clone());
+		}
+
+		// Lazily initialize the correlations database
+		let correlations = Database::get_or_create_turso_database(&self.correlations_path).await?;
+		let conn = Database::begin_concurrent(&correlations, &self.correlations_path, None).await?;
+		Self::wireframe_correlations_tables(&conn).await?;
+		let _ = Database::commit_concurrent(&conn).await;
+
+		self.correlations = Some(correlations.clone());
+		Ok(correlations)
 	}
 
 	fn set_correlations(&mut self, turso_db: TursoDatabase) {
@@ -582,6 +674,8 @@ impl AspectStructure for Aspect {
 			CREATE TABLE IF NOT EXISTS correlations (
 				id TEXT PRIMARY KEY,
 				dictionary_id TEXT NOT NULL,
+				subject_id TEXT NOT NULL,
+				aspect_id TEXT NOT NULL,
 				pattern_id TEXT NOT NULL,
 				event_id TEXT NOT NULL,
 				created_at INTEGER NOT NULL,
@@ -594,6 +688,10 @@ impl AspectStructure for Aspect {
 				turso::params![],
 			)
 			.await?;
+
+		// Add columns if they don't exist (for existing tables)
+		conn.as_ref().execute("ALTER TABLE correlations ADD COLUMN subject_id TEXT", turso::params![]).await.ok();
+		conn.as_ref().execute("ALTER TABLE correlations ADD COLUMN aspect_id TEXT", turso::params![]).await.ok();
 
 		// Error rates table for the HashMap<SignalType, ErrorRate>
 		conn.as_ref()
@@ -640,12 +738,137 @@ impl AspectStructure for Aspect {
 
 		// Indexes for performance
 		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_correlations_dictionary ON correlations(dictionary_id)", turso::params![]).await?;
+		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_correlations_subject ON correlations(subject_id)", turso::params![]).await?;
+		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_correlations_aspect ON correlations(aspect_id)", turso::params![]).await?;
 		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_correlations_pattern ON correlations(pattern_id)", turso::params![]).await?;
 		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_correlations_event ON correlations(event_id)", turso::params![]).await?;
 		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_correlation_error_rates_correlation_id ON correlation_error_rates(correlation_id)", turso::params![]).await?;
 		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_correlation_occurrences_correlation_id ON correlation_occurrences(correlation_id)", turso::params![]).await?;
 		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_correlation_occurrences_time_range ON correlation_occurrences(beginning_timestamp, end_timestamp)", turso::params![]).await?;
 
+		Ok(())
+	}
+
+	async fn wireframe_dictionary_tables(&self, conn: &Connection) -> Result<()> {
+		// Main dictionary metadata table
+		conn.as_ref()
+			.execute(
+				r"
+                                        CREATE TABLE IF NOT EXISTS dictionary_metadata (
+                                                id TEXT PRIMARY KEY,
+                                                name TEXT NOT NULL UNIQUE,
+                                                description TEXT,
+                                                created_at INTEGER NOT NULL
+                                        )
+                                ",
+				turso::params![],
+			)
+			.await?;
+
+		// Dictionary constraints table - stores steps configuration
+		conn.as_ref()
+			.execute(
+				r"
+                                        CREATE TABLE IF NOT EXISTS dictionary_constraints (
+                                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                                dictionary_id TEXT NOT NULL,
+                                                steps_count INTEGER,
+                                                steps_interpolation TEXT,
+
+                                                FOREIGN KEY (dictionary_id) REFERENCES dictionary_metadata(id) ON DELETE CASCADE
+                                        )
+                                ",
+				turso::params![],
+			)
+			.await?;
+
+		// Dictionary variabilities table - stores variability constraints
+		conn.as_ref()
+			.execute(
+				r"
+                                        CREATE TABLE IF NOT EXISTS dictionary_variabilities (
+                                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                                dictionary_id TEXT NOT NULL,
+                                                variability_type TEXT NOT NULL,
+                                                variability_value TEXT NOT NULL,
+
+                                                FOREIGN KEY (dictionary_id) REFERENCES dictionary_metadata(id) ON DELETE CASCADE
+                                        )
+                                ",
+				turso::params![],
+			)
+			.await?;
+
+		// Dictionary patterns table - links patterns to dictionaries
+		conn.as_ref()
+			.execute(
+				r"
+                                        CREATE TABLE IF NOT EXISTS dictionary_patterns (
+                                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                                dictionary_id TEXT NOT NULL,
+                                                pattern_id TEXT NOT NULL,
+                                                added_at INTEGER NOT NULL,
+
+                                                FOREIGN KEY (dictionary_id) REFERENCES dictionary_metadata(id) ON DELETE CASCADE,
+                                                FOREIGN KEY (pattern_id) REFERENCES patterns(id) ON DELETE CASCADE,
+                                                UNIQUE(dictionary_id, pattern_id)
+                                        )
+                                ",
+				turso::params![],
+			)
+			.await?;
+
+		// Indexes for performance
+		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_dictionary_name ON dictionary_metadata(name)", turso::params![]).await?;
+
+		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_dictionary_constraints_dict_id ON dictionary_constraints(dictionary_id)", turso::params![]).await?;
+
+		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_dictionary_variabilities_dict_id ON dictionary_variabilities(dictionary_id)", turso::params![]).await?;
+
+		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_dictionary_patterns_dict_id ON dictionary_patterns(dictionary_id)", turso::params![]).await?;
+
+		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_dictionary_patterns_pattern_id ON dictionary_patterns(pattern_id)", turso::params![]).await?;
+
+		Ok(())
+	}
+
+	async fn new_dictionary(&self, name: &str, description: &str, constraints: &DictionaryConstraints) -> Result<()> {
+		let dictionaries_db_path = Database::aspect_dictionaries_db_path(&self.database_metadata_db_path, &self.subject_name, &self.name, name);
+		let dictionaries_db = Database::get_or_create_turso_database(&dictionaries_db_path).await?;
+		let conn = Database::begin_concurrent(&dictionaries_db, &dictionaries_db_path, None).await?;
+		self.wireframe_dictionary_tables(&conn).await?;
+		let id = DictionaryId::new();
+
+		// Insert metadata
+		conn.as_ref().execute("INSERT INTO dictionary_metadata (id, name, description, created_at) VALUES (?, ?, ?, ?)", turso::params![id.as_uuid().to_string(), name, description, chrono::Utc::now().timestamp_millis()]).await?;
+
+		// Insert constraints
+		let steps_count = constraints.steps().as_ref().map(|s| s.count().to_string());
+		let steps_interpolation = constraints.steps().as_ref().map(|s| s.interpolation().to_string());
+		conn.as_ref().execute("INSERT INTO dictionary_constraints (dictionary_id, steps_count, steps_interpolation) VALUES (?, ?, ?)", turso::params![id.as_uuid().to_string(), steps_count, steps_interpolation]).await?;
+
+		// Insert variabilities
+		if let Some(variabilities) = constraints.variabilities() {
+			for variability in variabilities {
+				let (var_type, var_value) = match variability {
+					VariablilityType::MaximumStatic(v) => ("MaximumStatic", v.value().to_string()),
+					VariablilityType::AverageStatic(v) => ("AverageStatic", v.value().to_string()),
+					VariablilityType::AbsoluteMaximumStatic(v) => ("AbsoluteMaximumStatic", v.value().to_string()),
+					VariablilityType::AbsoluteAverageStatic(v) => ("AbsoluteAverageStatic", v.value().to_string()),
+					VariablilityType::MaximumPercentile(v) => ("MaximumPercentile", v.value().to_string()),
+					VariablilityType::AveragePercentile(v) => ("AveragePercentile", v.value().to_string()),
+					VariablilityType::AbsoluteMaximumPercentile(v) => ("AbsoluteMaximumPercentile", v.value().to_string()),
+					VariablilityType::AbsoluteAveragePercentile(v) => ("AbsoluteAveragePercentile", v.value().to_string()),
+					VariablilityType::SumStatic(v) => ("SumStatic", v.value().to_string()),
+					VariablilityType::SumPercentile(v) => ("SumPercentile", v.value().to_string()),
+					VariablilityType::AbsoluteSumStatic(v) => ("AbsoluteSumStatic", v.value().to_string()),
+					VariablilityType::AbsoluteSumPercentile(v) => ("AbsoluteSumPercentile", v.value().to_string()),
+				};
+				conn.as_ref().execute("INSERT INTO dictionary_variabilities (dictionary_id, variability_type, variability_value) VALUES (?, ?, ?)", turso::params![id.as_uuid().to_string(), var_type, var_value]).await?;
+			}
+		}
+
+		let _ = Database::commit_concurrent(&conn).await;
 		Ok(())
 	}
 }

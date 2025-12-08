@@ -7,7 +7,7 @@ use anyhow::Result;
 use bigdecimal::{BigDecimal, FromPrimitive, Zero};
 use chrono::Datelike;
 use database::{
-	database::traits::{AspectStructure, DatabaseStructure, Inputs, Outputs}, AspectId, Database, DictionaryId, Resolution
+	database::traits::{AspectStructure, DatabaseStructure, EventDatabase, Inputs, Outputs}, AspectId, Database, DictionaryId, Resolution
 };
 use futures::{future, StreamExt, TryStreamExt};
 use rayon::prelude::*;
@@ -66,15 +66,18 @@ pub async fn build_processed_batch_queue(database: &Database, aspect_id: &databa
 		});
 
 		// Perform database operations in parallel for the chunk
-		let db_tasks: Vec<_> = chunk.iter().map(|batch| {
-			let insert_future = database.insert_processed_batch(aspect_id, batch);
-			let remove_future = database.remove_unprocessed_batch(aspect_id, batch.batch_id());
-			async move {
-				insert_future.await?;
-				remove_future.await?;
-				Ok::<(), anyhow::Error>(())
-			}
-		}).collect();
+		let db_tasks: Vec<_> = chunk
+			.iter()
+			.map(|batch| {
+				let insert_future = database.insert_processed_batch(aspect_id, batch);
+				let remove_future = database.remove_unprocessed_batch(aspect_id, batch.batch_id());
+				async move {
+					insert_future.await?;
+					remove_future.await?;
+					Ok::<(), anyhow::Error>(())
+				}
+			})
+			.collect();
 
 		future::try_join_all(db_tasks).await?;
 
@@ -103,79 +106,87 @@ pub async fn build_processed_batch_queue(database: &Database, aspect_id: &databa
 /// This function will panic if active measurements exist in a batch but have no timestamps,
 /// which should not happen under normal circumstances.
 pub async fn build_patterns_queue(database: &Database, aspect_id: &database::AspectId, dictionary: &mut Dictionary) -> Result<()> {
-	// Get processed batches from database queue
-	let batches = database.get_processed_batches_queue(aspect_id).await?;
+	let mut stream = database.get_processed_batches(aspect_id).await?;
 
-	if batches.is_empty() {
-		println!("No processed batches found in database queue");
-		return Ok(());
-	}
-
-	println!("Processing {} batches from database queue into patterns", batches.len());
-
+	// Process batches in chunks to avoid loading all into memory
+	let chunk_size = 1000;
 	let mut processed_batch_ids = Vec::new();
 	let mut processed_count = 0;
-	let total_batches = batches.len();
 
-	for batch in &batches {
-		processed_count += 1;
-
-		// Progress reporting every 1000 batches
-		if processed_count % 1000 == 0 || processed_count == total_batches {
-			println!("Processed {processed_count} / {total_batches} batches into patterns");
-		}
-		// Generate a new pattern ID for this batch
-		let pattern_id = PatternID::new();
-
-		// Get the first and last timestamps from active measurements
-		let active_measurements: Vec<_> = batch.measurements().iter().filter(|m| m.is_active()).collect();
-
-		if active_measurements.is_empty() {
-			continue; // Skip batches with no active measurements
+	loop {
+		let chunk: Vec<Batch> = stream.by_ref().take(chunk_size).try_collect().await?;
+		if chunk.is_empty() {
+			break;
 		}
 
-		let beginning = active_measurements.iter().map(|m| m.get_measurement_timestamp()).min().copied().unwrap();
-		let end = active_measurements.iter().map(|m| m.get_measurement_timestamp()).max().copied().unwrap();
+		println!("Processing chunk of {} batches", chunk.len());
 
-		// Create an occurrence for this pattern
-		let occurrence = Occurrence::new(batch.metadata.aspect, batch.metadata.resolution, batch.metadata.size, batch.metadata.database_info.clone(), pattern_id, beginning, end);
+		// Process each batch in the chunk
+		for batch in &chunk {
+			processed_count += 1;
 
-		// Extract relatives from active measurements that have analysis, or generate from vectors
-		let relatives: Vec<database::Relative> = active_measurements.iter().find_map(|measurement| measurement.analysis()?.relative()).map_or_else(
-			|| {
-				// If no analysis data, generate relatives from measurement vectors
-				let vectors: Vec<_> = active_measurements.iter().filter_map(|measurement| measurement.vector()).collect();
-				if vectors.is_empty() {
-					Vec::new()
-				} else {
-					// Calculate max_x and max_y from all vectors
-					let max_x = vectors.iter().map(|v| v.location()).max().cloned().unwrap_or_else(|| BigDecimal::from(0));
-					let max_y = vectors.iter().map(|v| v.amplitude()).max().cloned().unwrap_or_else(|| BigDecimal::from(0));
+			// Progress reporting every 1000 batches
+			if processed_count % 1000 == 0 {
+				println!("Processed {processed_count} batches into patterns");
+			}
 
-					// Create relatives from vectors
-					vectors.iter().map(|vector| database::Relative::new((*vector).clone(), max_x.clone(), max_y.clone())).collect()
-				}
-			},
-			|_first_relative| active_measurements.iter().filter_map(|measurement| measurement.analysis()?.relative().cloned()).collect(),
-		); // Only create pattern if we have relatives
-		if !relatives.is_empty() {
-			let pattern = Pattern::new(pattern_id, vec![occurrence], relatives);
+			// Generate a new pattern ID for this batch
+			let pattern_id = PatternID::new();
 
-			// Import pattern into dictionary (this applies merge logic)
-			dictionary.import_pattern(pattern)?;
+			// Get the first and last timestamps from active measurements
+			let active_measurements: Vec<_> = batch.measurements().iter().filter(|m| m.is_active()).collect();
 
-			// Track this batch for removal from database queue
-			processed_batch_ids.push(batch.clone());
+			if active_measurements.is_empty() {
+				continue; // Skip batches with no active measurements
+			}
+
+			let beginning = active_measurements.iter().map(|m| m.get_measurement_timestamp()).min().copied().unwrap();
+			let end = active_measurements.iter().map(|m| m.get_measurement_timestamp()).max().copied().unwrap();
+
+			// Create an occurrence for this pattern
+			let occurrence = Occurrence::new(batch.metadata.aspect, batch.metadata.resolution, batch.metadata.size, batch.metadata.database_info.clone(), pattern_id, beginning, end);
+
+			// Extract relatives from active measurements that have analysis, or generate from vectors
+			let relatives: Vec<database::Relative> = active_measurements.iter().find_map(|measurement| measurement.analysis()?.relative()).map_or_else(
+				|| {
+					// If no analysis data, generate relatives from measurement vectors
+					let vectors: Vec<_> = active_measurements.iter().filter_map(|measurement| measurement.vector()).collect();
+					if vectors.is_empty() {
+						Vec::new()
+					} else {
+						// Calculate max_x and max_y from all vectors
+						let max_x = vectors.iter().map(|v| v.location()).max().cloned().unwrap_or_else(|| BigDecimal::from(0));
+						let max_y = vectors.iter().map(|v| v.amplitude()).max().cloned().unwrap_or_else(|| BigDecimal::from(0));
+
+						// Create relatives from vectors
+						vectors.iter().map(|vector| database::Relative::new((*vector).clone(), max_x.clone(), max_y.clone())).collect()
+					}
+				},
+				|_first_relative| active_measurements.iter().filter_map(|measurement| measurement.analysis()?.relative().cloned()).collect(),
+			);
+
+			// Only create pattern if we have relatives
+			if !relatives.is_empty() {
+				let pattern = Pattern::new(pattern_id, vec![occurrence], relatives);
+
+				// Import pattern into dictionary (this applies merge logic)
+				dictionary.import_pattern(pattern)?;
+			}
 		}
+
+		// Collect batch IDs for later dequeuing (only for successfully processed batches)
+		processed_batch_ids.extend(chunk.into_iter().map(|batch| *batch.batch_id()));
 	}
 
+	println!("Batch processing into patterns completed. Total processed: {processed_count}");
+
 	// Get all patterns from dictionary after merging
-	let merged_patterns: Vec<Pattern> = dictionary.patterns().to_vec(); // Store merged patterns in database
+	let merged_patterns: Vec<Pattern> = dictionary.patterns().to_vec();
 	if !merged_patterns.is_empty() {
 		// Store patterns in the specified dictionary - handle case where dictionary schema doesn't exist
-		match database.store_patterns_in_dictionary(&merged_patterns, dictionary.name(), aspect_id).await {
-			Ok(()) => {
-				println!("Stored {} patterns in database dictionary '{}' (after merging {} batches)", merged_patterns.len(), dictionary.name(), batches.len());
+		match database.batch_insert_patterns_into_dictionary(aspect_id, dictionary.name(), merged_patterns.clone()).await {
+			Ok(_tx_ids) => {
+				println!("Stored {} patterns in database dictionary '{}' (after merging {} batches)", merged_patterns.len(), dictionary.name(), processed_count);
 			}
 			Err(e) => {
 				println!("Warning: Failed to store patterns in database dictionary '{}': {}", dictionary.name(), e);
@@ -185,8 +196,8 @@ pub async fn build_patterns_queue(database: &Database, aspect_id: &database::Asp
 	}
 
 	// Remove processed batches from database queue
-	for batch in processed_batch_ids {
-		database.dequeue_processed_batch(&batch).await?;
+	for batch_id in processed_batch_ids {
+		database.remove_processed_batch(aspect_id, &batch_id).await?;
 	}
 
 	Ok(())
@@ -800,6 +811,7 @@ mod tests {
 			println!("Skipping test_api - 'open' aspect not found (available aspects: {:?})", aspects.iter().map(database::Aspect::name).collect::<Vec<_>>());
 			return Ok(());
 		};
+		let aspect_id = aspect.id();
 
 		// Check if the aspect has any measurements before proceeding
 		if database.get_earliest_measurement(&aspect.id()).await?.is_none() {
@@ -832,7 +844,7 @@ mod tests {
 		let timer = std::time::Instant::now();
 		println!("Starting get_processed_batches_queue...");
 
-		let processed_batches = database.get_processed_batches_queue(&aspect.id()).await?;
+		let processed_batches: Vec<Batch> = database.get_processed_batches(&aspect.id()).await?.try_collect().await?;
 
 		println!("Time taken for get_processed_batches_queue: {:?}", timer.elapsed());
 
@@ -873,7 +885,7 @@ mod tests {
 
 		println!("Finished building processed batch queue");
 
-		let processed_batches = database.get_processed_batches_queue(&aspect.id()).await?;
+		let processed_batches: Vec<Batch> = database.get_processed_batches(&aspect.id()).await?.try_collect().await?;
 		let length = processed_batches.len();
 		println!("Processed batches count: {length}");
 		if length > 0 {
@@ -882,7 +894,7 @@ mod tests {
 			output_denk_format_batch(&processed_batches[random_index]);
 		}
 
-		build_patterns_queue(&database, &aspect.id(), &mut dictionary).await?;
+		build_patterns_queue(&database, &aspect_id, &mut dictionary).await?;
 		let patterns = database.get_patterns_from_dictionary("TestDictionary", &aspect.id()).await?;
 		let length = patterns.len();
 		println!("Patterns count: {length}");
@@ -1014,7 +1026,7 @@ mod tests {
 
 		build_unprocessed_queue(&db, &aspect.id(), &resolution, &method, batch_size).await?;
 		build_processed_batch_queue(&db, &aspect.id()).await?;
-		let processed_batches = db.get_processed_batches_queue(&aspect.id()).await?;
+		let processed_batches: Vec<Batch> = db.get_processed_batches(&aspect.id()).await?.try_collect().await?;
 		let length = processed_batches.len();
 		println!("Processed batches count: {length}");
 		if length > 0 {
@@ -1105,11 +1117,11 @@ mod tests {
 			let signals_lock = SIGNALS_QUEUE.lock().await;
 			// Use PredictStart since we're checking at the start of hour 61 (2025-01-03 13:00:00)
 			let Some(sum_probability) = signals_lock.probability_sum(&event_id, &SignalType::Custom("PredictStart".to_string()), query_time, &db, &aspect.id()).await? else {
-				bail!("No signals found for event ID {}", event_id);
+				bail!("No signals found for event ID {event_id}");
 			};
 
 			let Some(avg_probability) = signals_lock.probability_average(&event_id, &SignalType::Custom("PredictStart".to_string()), query_time, &db, &aspect.id()).await? else {
-				bail!("No signals found for event ID {}", event_id);
+				bail!("No signals found for event ID {event_id}");
 			};
 
 			println!("Peak Event Probability - Sum: {sum_probability}");
@@ -1266,7 +1278,7 @@ mod tests {
 		let unprocessed_batches: Vec<database::Batch> = db.get_unprocessed_batches(&aspect.id()).await?.try_collect().await?;
 		println!("Unprocessed batches count: {}", unprocessed_batches.len());
 
-		let processed_batches = db.get_processed_batches_queue(&aspect.id()).await?;
+		let processed_batches: Vec<Batch> = db.get_processed_batches(&aspect.id()).await?.try_collect().await?;
 		println!("Processed batches count: {}", processed_batches.len());
 
 		// With 15 points and batch size 10, sliding window creates: 15 - 10 + 1 = 6 overlapping batches
@@ -1331,7 +1343,7 @@ mod tests {
 
 		build_processed_batch_queue(&db, &aspect.id()).await?;
 
-		let processed_batches = db.get_processed_batches_queue(&aspect.id()).await?;
+		let processed_batches: Vec<Batch> = db.get_processed_batches(&aspect.id()).await?.try_collect().await?;
 		println!("Processed batches count: {}", processed_batches.len());
 
 		// With 15 points and batch size 10, sliding window creates: 15 - 10 + 1 = 6 overlapping batches
