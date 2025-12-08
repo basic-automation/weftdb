@@ -31,7 +31,7 @@ impl Connection for Database {
 					Ok(_) => {}
 					Err(_) => {
 						// Final fallback to regular BEGIN
-						conn.execute("BEGIN", turso::params![]).await.map_err(|e| anyhow::anyhow!("Failed to begin transaction: {}", e))?;
+						conn.execute("BEGIN", turso::params![]).await.map_err(|e| anyhow::anyhow!("Failed to begin transaction: {e}"))?;
 					}
 				}
 			}
@@ -51,7 +51,7 @@ impl Connection for Database {
 	async fn rollback_concurrent(conn: &cache::Connection) -> Result<()> {
 		match conn.as_ref().execute("ROLLBACK", turso::params![]).await {
 			Ok(_) => Ok(()),
-			Err(e) => Err(anyhow::anyhow!("Rollback failed: {}", e)),
+			Err(e) => Err(anyhow::anyhow!("Rollback failed: {e}")),
 		}
 	}
 

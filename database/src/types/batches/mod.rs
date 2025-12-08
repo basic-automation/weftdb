@@ -6,7 +6,7 @@ use rayon::{prelude::*, ThreadPoolBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-	database::traits::DatabaseStructure, types::{database::traits::ouputs::Outputs, BatchedMeasurement}, AspectId, Database
+	database::traits::DatabaseStructure, types::{database::traits::outputs::Outputs, BatchedMeasurement}, AspectId, Database
 };
 
 pub mod batch;

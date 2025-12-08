@@ -28,6 +28,8 @@ pub trait Config {
 
 	fn aspect_dictionaries_path(db_name: &str, subject_name: &str, aspect_name: &str) -> String;
 
+	fn aspect_dictionaries_db_path(db_name: &str, subject_name: &str, aspect_name: &str, dictionary_name: &str) -> String;
+
 	fn dictionary_path(db_name: &str, subject_name: &str, aspect_name: &str, dictionary_name: &str) -> String;
 
 	async fn db_name(metadata_conn: &Connection) -> Result<String>;

@@ -1,12 +1,11 @@
 use anyhow::Result;
 use database::{
-	database::traits::{DatabaseStructure, Outputs}, AspectId, Database
+	database::traits::{DatabaseStructure, Inputs, Outputs}, AspectId, Database
 };
 use futures::StreamExt;
 use splimes::{Resolution, Spline};
 
 use crate::{Batch, BatchedMeasurement};
-use database::database::traits::Inputs;
 
 /// Builds sliding-window batches from the provided aspect and stores them in the database.
 ///

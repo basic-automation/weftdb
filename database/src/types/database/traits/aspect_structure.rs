@@ -1,7 +1,7 @@
 use anyhow::Result;
 use splimes::Resolution;
 
-use crate::{cache::Connection, AspectId, SubjectId};
+use crate::{cache::Connection, AspectId, DictionaryConstraints, SubjectId};
 
 /// Trait for database structure operations
 /// This trait defines the operations related to managing the structure of the database.
@@ -111,4 +111,8 @@ pub trait AspectStructure {
 	async fn set_correlations_path(&mut self, path: String);
 
 	async fn wireframe_correlations_tables(conn: &Connection) -> Result<()>;
+
+	async fn new_dictionary(&self, name: &str, description: &str, constraints: &DictionaryConstraints) -> Result<()>;
+
+	async fn wireframe_dictionary_tables(&self, conn: &Connection) -> Result<()>;
 }

@@ -8,7 +8,7 @@ use sysinfo::System;
 use tokio::sync::RwLock;
 use turso::Connection as TursoConnection;
 
-use crate::{Batch, Measurement};
+use crate::{Batch, Event, Measurement, Pattern};
 
 #[derive(Debug, Clone)]
 pub struct AnalysisResult {
@@ -111,6 +111,86 @@ impl Cacheable for Connection {
 		Box::new(self.clone())
 	}
 }
+
+impl Cacheable for DateTime<Utc> {
+	fn as_any(&self) -> &dyn Any {
+		self
+	}
+
+	fn clone_box(&self) -> Box<dyn Cacheable> {
+		Box::new(*self)
+	}
+}
+
+impl Cacheable for turso::Database {
+	fn as_any(&self) -> &dyn Any {
+		self
+	}
+
+	fn clone_box(&self) -> Box<dyn Cacheable> {
+		Box::new(self.clone())
+	}
+}
+
+impl Cacheable for String {
+	fn as_any(&self) -> &dyn Any {
+		self
+	}
+
+	fn clone_box(&self) -> Box<dyn Cacheable> {
+		Box::new(self.clone())
+	}
+}
+
+impl Cacheable for crate::Aspect {
+	fn as_any(&self) -> &dyn Any {
+		self
+	}
+
+	fn clone_box(&self) -> Box<dyn Cacheable> {
+		Box::new(self.clone())
+	}
+}
+
+impl Cacheable for Event {
+	fn as_any(&self) -> &dyn Any {
+		self
+	}
+
+	fn clone_box(&self) -> Box<dyn Cacheable> {
+		Box::new(self.clone())
+	}
+}
+
+impl Cacheable for Vec<Event> {
+	fn as_any(&self) -> &dyn Any {
+		self
+	}
+
+	fn clone_box(&self) -> Box<dyn Cacheable> {
+		Box::new(self.clone())
+	}
+}
+
+impl Cacheable for Pattern {
+        fn as_any(&self) -> &dyn Any {
+                self
+        }
+
+        fn clone_box(&self) -> Box<dyn Cacheable> {
+                Box::new(self.clone())
+        }
+}
+
+impl Cacheable for Vec<Pattern> {
+        fn as_any(&self) -> &dyn Any {
+                self
+        }
+
+        fn clone_box(&self) -> Box<dyn Cacheable> {
+                Box::new(self.clone())
+        }
+} 
 
 // Internal trait object wrapper
 struct CacheableEntry {

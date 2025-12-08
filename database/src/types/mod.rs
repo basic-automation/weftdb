@@ -8,7 +8,7 @@ pub use database::{
 	traits::{Config, CorrelationDatabase, DatabaseStructure, EventDatabase, Outputs, PatternDatabase}, Database, DatabaseId, DatabaseInfo, DatabaseMap, DATABASES, DEFAULT_DATA_DIR
 };
 pub use dataset::{Dataset, DatasetId};
-pub use dictionary::{Dictionary, DictionaryConstraints, DictionaryId, Steps, Variability, VariablilityType};
+pub use dictionary::{Dictionary, DictionaryConstraints, DictionaryId, Steps, Variability, VariablilityType, DictionaryMetadata};
 pub use event::{Event, EventID, EventName, Events, Manifestation, ManifestationId};
 pub use input_measurement::InputMeasurement;
 pub use measurement::{Measurement, MeasurementId};

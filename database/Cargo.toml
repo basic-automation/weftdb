@@ -31,6 +31,8 @@ num_cpus = { workspace = true }
 serde_json = { workspace = true }
 md5 = "0.7"
 sysinfo = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true , features = ["html_reports"] }

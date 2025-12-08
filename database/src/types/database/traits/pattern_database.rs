@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::{database::patterns::PatternStats, AspectId, Pattern};
+use crate::{AspectId, Pattern};
 
 /// Trait for pattern database operations
 #[async_trait::async_trait]
@@ -16,9 +16,6 @@ pub trait PatternDatabase {
 
 	/// Store multiple patterns efficiently using batch operations
 	async fn store_patterns(&self, patterns: &[Pattern], aspect_id: &AspectId) -> Result<()>;
-
-	/// Get pattern count statistics for an aspect
-	async fn get_pattern_stats(&self, aspect_id: &AspectId) -> Result<PatternStats>;
 
 	/// Remove/cleanup processed patterns older than specified days
 	async fn cleanup_processed_patterns(&self, aspect_id: &AspectId, older_than_days: i64) -> Result<usize>;
