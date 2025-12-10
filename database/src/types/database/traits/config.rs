@@ -24,6 +24,10 @@ pub trait Config {
 
 	fn aspect_events_db_path(db_name: &str, subject_name: &str, aspect_name: &str) -> String;
 
+	fn aspect_unprocessed_events_db_path(db_name: &str, subject_name: &str, aspect_name: &str) -> String;
+
+	fn aspect_processed_events_db_path(db_name: &str, subject_name: &str, aspect_name: &str) -> String;
+
 	fn aspect_correlations_db_path(db_name: &str, subject_name: &str, aspect_name: &str) -> String;
 
 	fn aspect_dictionaries_path(db_name: &str, subject_name: &str, aspect_name: &str) -> String;

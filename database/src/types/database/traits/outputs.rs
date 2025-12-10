@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use futures::Stream;
 use splimes::{Point, Resolution, Spline};
 
-use crate::{AspectId, Batch, BatchId, Measurement, DictionaryMetadata};
+use crate::{AspectId, Batch, BatchId, Correlation, CorrelationID, DictionaryMetadata, Event, EventID, Measurement, Pattern, PatternID};
 
 /// Trait for database analysis and output operations
 #[async_trait::async_trait]
@@ -36,8 +36,6 @@ pub trait Outputs {
 	/// This represents unprocessed batches that are ready to be processed into processed batches
 	async fn get_unprocessed_batches(&self, aspect_id: &AspectId) -> Result<Pin<Box<dyn Stream<Item = Result<Batch>> + Send + 'static>>>;
 
-	async fn parse_batch_row(row: turso::Row) -> Result<Batch>;
-
 	//
 	// ProcessedBatches
 	//
@@ -47,25 +45,39 @@ pub trait Outputs {
 	/// Get processed batches in queue order (oldest first)
 	async fn get_processed_batches(&self, aspect_id: &AspectId) -> Result<Pin<Box<dyn Stream<Item = Result<Batch>> + Send + 'static>>>;
 
-        //
-        // Dictionaries
-        //
+	//
+	// Dictionaries
+	//
 
-        async fn get_dictionary_metadata(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<Option<DictionaryMetadata>>;
+	async fn get_dictionary_metadata(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<Option<DictionaryMetadata>>;
 
-        async fn list_dictionaries(&self, aspect_id: &AspectId) -> Result<Vec<DictionaryMetadata>>;
+	async fn list_dictionaries(&self, aspect_id: &AspectId) -> Result<Vec<DictionaryMetadata>>;
 
-        async fn get_dictionary_pattern(&self, aspect_id: &AspectId, dictionary_name: &str, pattern_id: &PatternID) -> Result<Pattern>;
+	async fn get_dictionary_pattern(&self, aspect_id: &AspectId, dictionary_name: &str, pattern_id: &PatternID) -> Result<Pattern>;
 
-        async fn get_dictionary_patterns(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<Pin<Box<dyn Stream<Item = Result<Pattern>> + Send + 'static>>>;
+	async fn get_dictionary_patterns(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<Pin<Box<dyn Stream<Item = Result<Pattern>> + Send + 'static>>>;
 
+	//
+	// Correlations
+	//
 
-        //
-        // Correlations
-        //
+	async fn get_correlation(&self, aspect_id: &AspectId, correlation_id: &CorrelationID) -> Result<Correlation>;
 
-        async fn get_correlation(&self, aspect_id: &AspectId, correlation_id: &CorrelationID) -> Result<Correlation>;
+	async fn get_correlations(&self, aspect_id: &AspectId) -> Result<Pin<Box<dyn Stream<Item = Result<Correlation>> + Send + 'static>>>;
 
-        async fn get_correlations(&self, aspect_id: &AspectId) -> Result<Pin<Box<dyn Stream<Item = Result<Correlation>> + Send + 'static>>>;
- 
+	//
+	// Unprocessed Events
+	//
+
+	async fn get_unprocessed_event(&self, aspect_id: &AspectId, event_id: &EventID) -> Result<Event>;
+
+	async fn get_unprocessed_events(&self, aspect_id: &AspectId) -> Result<Pin<Box<dyn Stream<Item = Result<Event>> + Send + 'static>>>;
+
+	//
+	// Processed Events
+	//
+
+	async fn get_processed_event(&self, aspect_id: &AspectId, event_id: &EventID) -> Result<Event>;
+
+	async fn get_processed_events(&self, aspect_id: &AspectId) -> Result<Pin<Box<dyn Stream<Item = Result<Event>> + Send + 'static>>>;
 }

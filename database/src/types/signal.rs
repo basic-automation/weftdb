@@ -1,14 +1,15 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, pin::Pin, str::FromStr};
 
 use anyhow::{bail, Result};
 use bigdecimal::{BigDecimal, FromPrimitive, Zero};
 use chrono::{DateTime, Utc};
+use futures::Stream;
 use serde::{Deserialize, Serialize};
 use splimes::Resolution;
 
 use crate::{
 	types::{
-		correlation::{Correlation, CorrelationID}, event::{EventID, ManifestationId}
+		correlation::{Correlation, CorrelationID}, database::traits::Outputs, event::{EventID, ManifestationId}
 	}, AspectId
 };
 
@@ -22,6 +23,19 @@ impl std::fmt::Display for SignalType {
 		match self {
 			Self::Custom(name) => write!(f, "Custom({name})"),
 		}
+	}
+}
+
+impl FromStr for SignalType {
+	type Err = anyhow::Error;
+
+	fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+		s.strip_prefix("Custom(")
+			.and_then(|s| s.strip_suffix(')'))
+			.map_or_else(
+				|| Err(anyhow::anyhow!("Invalid SignalType: {s}")),
+				|name| Ok(Self::Custom(name.to_string()))
+			)
 	}
 }
 
@@ -233,15 +247,22 @@ impl Signal {
 	/// - No correlation is found for the signal's correlation ID
 	/// - No error rate is found for the signal's type in the correlation
 	pub async fn get_error_rate(&self, database: &crate::Database, aspect_id: &AspectId) -> Result<Distance> {
-		let correlations = database.get_correlations(aspect_id).await?;
+		use futures::StreamExt;
+		let mut correlation_stream: Pin<Box<dyn Stream<Item = Result<Correlation>> + Send>> = database.get_correlations(aspect_id).await?;
 
-		let correlation = correlations.iter().find(|c| c.id() == &self.correlation_id).ok_or_else(|| anyhow::anyhow!("No correlation found for correlation_id {:?}", self.correlation_id))?;
+		// Search through the stream for the matching correlation
+		while let Some(result) = correlation_stream.next().await {
+			if let Ok(correlation) = result {
+				if correlation.id() == &self.correlation_id {
+					let Some(signal_error_rate) = correlation.error_rate().get(self.signal_type()) else {
+						return Err(anyhow::anyhow!("No error rate found for signal type {:?} in correlation {:?}", self.signal_type(), self.correlation_id()));
+					};
+					return Ok(signal_error_rate.clone());
+				}
+			}
+		}
 
-		let Some(signal_error_rate) = correlation.error_rate().get(self.signal_type()) else {
-			return Err(anyhow::anyhow!("No error rate found for signal type {:?} in correlation {:?}", self.signal_type(), self.correlation_id()));
-		};
-
-		Ok(signal_error_rate.clone())
+		Err(anyhow::anyhow!("No correlation found for correlation_id {:?}", self.correlation_id))
 	}
 
 	/// probability of the signal at a given date
@@ -558,8 +579,8 @@ impl Signals {
 	/// Find a random signal (useful for testing)
 	#[must_use]
 	pub fn find_random(&self) -> Option<&Signal> {
-		use rand::{seq::IteratorRandom, thread_rng};
-		self.0.values().choose(&mut thread_rng())
+		use rand::{seq::IteratorRandom, rng};
+		self.0.values().choose(&mut rng())
 	}
 
 	/// Get all unique correlation IDs

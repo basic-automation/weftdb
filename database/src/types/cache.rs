@@ -173,24 +173,64 @@ impl Cacheable for Vec<Event> {
 }
 
 impl Cacheable for Pattern {
-        fn as_any(&self) -> &dyn Any {
-                self
-        }
+	fn as_any(&self) -> &dyn Any {
+		self
+	}
 
-        fn clone_box(&self) -> Box<dyn Cacheable> {
-                Box::new(self.clone())
-        }
+	fn clone_box(&self) -> Box<dyn Cacheable> {
+		Box::new(self.clone())
+	}
 }
 
 impl Cacheable for Vec<Pattern> {
-        fn as_any(&self) -> &dyn Any {
-                self
-        }
+	fn as_any(&self) -> &dyn Any {
+		self
+	}
 
-        fn clone_box(&self) -> Box<dyn Cacheable> {
-                Box::new(self.clone())
-        }
-} 
+	fn clone_box(&self) -> Box<dyn Cacheable> {
+		Box::new(self.clone())
+	}
+}
+
+impl Cacheable for crate::Correlation {
+	fn as_any(&self) -> &dyn Any {
+		self
+	}
+
+	fn clone_box(&self) -> Box<dyn Cacheable> {
+		Box::new(self.clone())
+	}
+}
+
+impl Cacheable for Vec<crate::Correlation> {
+	fn as_any(&self) -> &dyn Any {
+		self
+	}
+
+	fn clone_box(&self) -> Box<dyn Cacheable> {
+		Box::new(self.clone())
+	}
+}
+
+impl Cacheable for crate::DictionaryMetadata {
+	fn as_any(&self) -> &dyn Any {
+		self
+	}
+
+	fn clone_box(&self) -> Box<dyn Cacheable> {
+		Box::new(self.clone())
+	}
+}
+
+impl Cacheable for Vec<crate::DictionaryMetadata> {
+	fn as_any(&self) -> &dyn Any {
+		self
+	}
+
+	fn clone_box(&self) -> Box<dyn Cacheable> {
+		Box::new(self.clone())
+	}
+}
 
 // Internal trait object wrapper
 struct CacheableEntry {

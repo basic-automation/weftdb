@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt::Display};
+use std::{collections::HashMap, fmt::Display, str::FromStr};
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -7,9 +7,11 @@ use turso::Database as TursoDatabase;
 use uuid::Uuid;
 
 use crate::{
-	Database, DatabaseStructure, DictionaryConstraints, DictionaryId, SubjectId, cache::Connection, database::dictionaries, types::{database::{
-		Config, traits::{aspect_structure::AspectStructure, connection::Connection as ConnectionTrait}
-	}, dictionary::VariablilityType}
+	cache::Connection, types::{
+		database::{
+			traits::{aspect_structure::AspectStructure, connection::Connection as ConnectionTrait}, Config
+		}, dictionary::VariablilityType
+	}, Database, DatabaseStructure, DictionaryConstraints, DictionaryId, SubjectId
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -44,6 +46,14 @@ impl Display for AspectId {
 	}
 }
 
+impl FromStr for AspectId {
+	type Err = uuid::Error;
+
+	fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+		Uuid::parse_str(s).map(Self)
+	}
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Aspect {
 	id: AspectId,
@@ -71,20 +81,25 @@ pub struct Aspect {
 	patterns_path: String,
 
 	#[serde(skip)]
-	events: Option<TursoDatabase>,
-	events_path: String,
+	unprocessed_events: Option<TursoDatabase>,
+	unprocessed_events_path: String,
+
+	#[serde(skip)]
+	processed_events: Option<TursoDatabase>,
+	processed_events_path: String,
 
 	#[serde(skip)]
 	correlations: Option<TursoDatabase>,
 	correlations_path: String,
 
-        #[serde(skip)]
-        dictionaries: Option<HashMap<String, TursoDatabase>>,
-        dictionaries_paths: HashMap<String, String>,
+	#[serde(skip)]
+	dictionaries: Option<HashMap<String, TursoDatabase>>,
+	dictionaries_paths: HashMap<String, String>,
 }
 
 #[async_trait::async_trait]
 impl AspectStructure for Aspect {
+	#[allow(clippy::too_many_lines)]
 	async fn new(id: Option<AspectId>, name: &str, subject_id: &SubjectId, resolution: &Resolution, metadata_conn: &Connection) -> Result<Self> {
 		let id = id.unwrap_or_default();
 		let subject_name = Self::get_subject_name(metadata_conn, subject_id).await?;
@@ -96,15 +111,17 @@ impl AspectStructure for Aspect {
 		tokio::fs::create_dir_all(&aspect_path).await?;
 
 		// Create databases sequentially to avoid lock contention during concurrent aspect creation
-		// The databases themselves will use MVCC for internal concurrency
+		// For DDL operations (CREATE TABLE), use direct connection without BEGIN CONCURRENT
+		// DDL operations are not compatible with MVCC concurrent transactions
 		let measurements_path = Database::aspect_measurements_db_path(&db_name, &subject_name, name);
 		println!("[TRACE] Creating measurements DB at: {measurements_path}");
 		let measurements = Database::get_or_create_turso_database(&measurements_path).await?;
 		println!("[TRACE] Connected measurements DB: {measurements_path}");
-		let conn = Database::begin_concurrent(&measurements, &measurements_path, None).await?;
+		// Use direct connection for DDL (table creation)
+		let schema_conn = measurements.connect()?;
 		println!("[TRACE] Wireframing measurements tables for: {measurements_path}");
-		Self::wireframe_measurements_tables(&conn).await?;
-		let _ = Database::commit_concurrent(&conn).await;
+		Self::wireframe_measurements_tables_direct(&schema_conn).await?;
+		drop(schema_conn);
 		println!("[TRACE] Wireframed measurements tables for: {measurements_path}");
 		let measurements = Some(measurements);
 
@@ -112,56 +129,67 @@ impl AspectStructure for Aspect {
 		println!("[TRACE] Creating unprocessed_batches DB at: {unprocessed_batches_path}");
 		let unprocessed_batches = Database::get_or_create_turso_database(&unprocessed_batches_path).await?;
 		println!("[TRACE] Connected unprocessed_batches DB: {unprocessed_batches_path}");
-		let conn = Database::begin_concurrent(&unprocessed_batches, &unprocessed_batches_path, None).await?;
+		let schema_conn = unprocessed_batches.connect()?;
 		println!("[TRACE] Wireframing batches tables for: {unprocessed_batches_path}");
-		Self::wireframe_batches_tables(&conn).await?;
+		Self::wireframe_batches_tables_direct(&schema_conn).await?;
+		drop(schema_conn);
 		println!("[TRACE] Wireframed batches tables for: {unprocessed_batches_path}");
 		let unprocessed_batches = Some(unprocessed_batches);
-		let _ = Database::commit_concurrent(&conn).await;
 
 		let processed_batches_path = Database::aspect_processed_batches_db_path(&db_name, &subject_name, name);
 		println!("[TRACE] Creating processed_batches DB at: {processed_batches_path}");
 		let processed_batches = Database::get_or_create_turso_database(&processed_batches_path).await?;
 		println!("[TRACE] Connected processed_batches DB: {processed_batches_path}");
-		let conn = Database::begin_concurrent(&processed_batches, &processed_batches_path, None).await?;
+		let schema_conn = processed_batches.connect()?;
 		println!("[TRACE] Wireframing batches tables for: {processed_batches_path}");
-		Self::wireframe_batches_tables(&conn).await?;
+		Self::wireframe_batches_tables_direct(&schema_conn).await?;
+		drop(schema_conn);
 		println!("[TRACE] Wireframed batches tables for: {processed_batches_path}");
 		let processed_batches = Some(processed_batches);
-		let _ = Database::commit_concurrent(&conn).await;
 
 		let patterns_path = Database::aspect_patterns_db_path(&db_name, &subject_name, name);
 		println!("[TRACE] Creating patterns DB at: {patterns_path}");
 		let patterns = Database::get_or_create_turso_database(&patterns_path).await?;
 		println!("[TRACE] Connected patterns DB: {patterns_path}");
-		let conn = Database::begin_concurrent(&patterns, &patterns_path, None).await?;
+		let schema_conn = patterns.connect()?;
 		println!("[TRACE] Wireframing patterns tables for: {patterns_path}");
-		Self::wireframe_patterns_tables(&conn).await?;
+		Self::wireframe_patterns_tables_direct(&schema_conn).await?;
+		drop(schema_conn);
 		println!("[TRACE] Wireframed patterns tables for: {patterns_path}");
 		let patterns = Some(patterns);
-		let _ = Database::commit_concurrent(&conn).await;
 
-		let events_path = Database::aspect_events_db_path(&db_name, &subject_name, name);
-		println!("[TRACE] Creating events DB at: {events_path}");
-		let events = Database::get_or_create_turso_database(&events_path).await?;
-		println!("[TRACE] Connected events DB: {events_path}");
-		let conn = Database::begin_concurrent(&events, &events_path, None).await?;
-		println!("[TRACE] Wireframing events tables for: {events_path}");
-		Self::wireframe_events_tables(&conn).await?;
-		println!("[TRACE] Wireframed events tables for: {events_path}");
-		let events = Some(events);
-		let _ = Database::commit_concurrent(&conn).await;
+		let unprocessed_events_path = Database::aspect_unprocessed_events_db_path(&db_name, &subject_name, name);
+		println!("[TRACE] Creating unprocessed_events DB at: {unprocessed_events_path}");
+		let unprocessed_events = Database::get_or_create_turso_database(&unprocessed_events_path).await?;
+		println!("[TRACE] Connected unprocessed_events DB: {unprocessed_events_path}");
+		let schema_conn = unprocessed_events.connect()?;
+		println!("[TRACE] Wireframing unprocessed_events tables for: {unprocessed_events_path}");
+		Self::wireframe_events_tables_direct(&schema_conn).await?;
+		drop(schema_conn);
+		println!("[TRACE] Wireframed unprocessed_events tables for: {unprocessed_events_path}");
+		let unprocessed_events = Some(unprocessed_events);
+
+		let processed_events_path = Database::aspect_processed_events_db_path(&db_name, &subject_name, name);
+		println!("[TRACE] Creating processed_events DB at: {processed_events_path}");
+		let processed_events = Database::get_or_create_turso_database(&processed_events_path).await?;
+		println!("[TRACE] Connected processed_events DB: {processed_events_path}");
+		let schema_conn = processed_events.connect()?;
+		println!("[TRACE] Wireframing processed_events tables for: {processed_events_path}");
+		Self::wireframe_events_tables_direct(&schema_conn).await?;
+		drop(schema_conn);
+		println!("[TRACE] Wireframed processed_events tables for: {processed_events_path}");
+		let processed_events = Some(processed_events);
 
 		let correlations_path = Database::aspect_correlations_db_path(&db_name, &subject_name, name);
 		println!("[TRACE] Creating correlations DB at: {correlations_path}");
 		let correlations = Database::get_or_create_turso_database(&correlations_path).await?;
 		println!("[TRACE] Connected correlations DB: {correlations_path}");
-		let conn = Database::begin_concurrent(&correlations, &correlations_path, None).await?;
+		let schema_conn = correlations.connect()?;
 		println!("[TRACE] Wireframing correlations tables for: {correlations_path}");
-		Self::wireframe_correlations_tables(&conn).await?;
+		Self::wireframe_correlations_tables_direct(&schema_conn).await?;
+		drop(schema_conn);
 		println!("[TRACE] Wireframed correlations tables for: {correlations_path}");
 		let correlations = Some(correlations);
-		let _ = Database::commit_concurrent(&conn).await;
 
 		let dictionaries_path = <Database as Config>::aspect_dictionaries_path(&db_name, &subject_name, name);
 		println!("[TRACE] Creating dictionaries directory at: {dictionaries_path}");
@@ -184,8 +212,10 @@ impl AspectStructure for Aspect {
 			processed_batches_path,
 			patterns,
 			patterns_path,
-			events,
-			events_path,
+			unprocessed_events,
+			unprocessed_events_path,
+			processed_events,
+			processed_events_path,
 			correlations,
 			correlations_path,
                         dictionaries: None,
@@ -217,26 +247,30 @@ impl AspectStructure for Aspect {
 		let unprocessed_batches_path = aspect_path_str.clone() + "/unprocessed_batches.db";
 		let processed_batches_path = aspect_path_str.clone() + "/processed_batches.db";
 		let patterns_path = aspect_path_str.clone() + "/patterns.db";
-		let events_path = aspect_path_str.clone() + "/events.db";
+		let unprocessed_events_path = aspect_path_str.clone() + "/unprocessed_events.db";
+		let processed_events_path = aspect_path_str.clone() + "/processed_events.db";
 		let correlations_path = aspect_path_str.clone() + "/correlations.db";
 		let dictionaries_path = aspect_path_str.clone() + "/dictionaries";
 
-                let mut dictionaries_paths = HashMap::new();
-                // Find all dictionary database paths in the dictionaries directory
-                if let Ok(entries) = tokio::fs::read_dir(&dictionaries_path).await {
-                        let mut dir_entries = entries;
-                        while let Ok(Some(entry)) = dir_entries.next_entry().await {
-                                let path = entry.path();
-                                if path.is_file() {
-                                        if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                                                if file_name.ends_with(".db") {
-                                                        let dict_name = file_name.trim_end_matches(".db").to_string();
-                                                        dictionaries_paths.insert(dict_name, path.to_string_lossy().to_string());
-                                                }
-                                        }
-                                }
-                        }
-                }
+		let mut dictionaries_paths = HashMap::new();
+		// Find all dictionary database paths in the dictionaries directory
+		if let Ok(entries) = tokio::fs::read_dir(&dictionaries_path).await {
+			let mut dir_entries = entries;
+			while let Ok(Some(entry)) = dir_entries.next_entry().await {
+				let path = entry.path();
+				if path.is_file() {
+					if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+						if std::path::Path::new(file_name)
+							.extension()
+							.is_some_and(|ext| ext.eq_ignore_ascii_case("db"))
+						{
+							let dict_name = file_name.trim_end_matches(".db").to_string();
+							dictionaries_paths.insert(dict_name, path.to_string_lossy().to_string());
+						}
+					}
+				}
+			}
+		}
 
 		#[rustfmt::skip]
 		Ok(Self {
@@ -251,13 +285,15 @@ impl AspectStructure for Aspect {
                         unprocessed_batches: None,
                         processed_batches: None,
                         patterns: None,
-                        events: None,
+                        unprocessed_events: None,
+                        processed_events: None,
                         correlations: None,
                         measurements_path,
                         unprocessed_batches_path,
                         processed_batches_path,
                         patterns_path,
-                        events_path,
+                        unprocessed_events_path,
+                        processed_events_path,
                         correlations_path,
                         dictionaries: None,
                         dictionaries_paths,
@@ -297,10 +333,11 @@ impl AspectStructure for Aspect {
 		let turso_db = Database::get_turso_database(&turso_db_path).await?;
 
 		// Query the database for the metadata_path field of the first item in the database table
-		let conn = turso_db.connect()?;
-		let mut rows = conn.query("SELECT metadata_path FROM database", turso::params![]).await?;
+		let conn = Database::begin_concurrent(&turso_db, &turso_db_path, None).await?;
+		let mut rows = conn.as_ref().query("SELECT metadata_path FROM database", turso::params![]).await?;
 		let row = rows.next().await?.ok_or_else(|| anyhow::anyhow!("Database metadata not found"))?;
 		let metadata_path: String = row.get(0)?;
+		let _ = Database::commit_concurrent(&conn).await;
 
 		Ok(metadata_path)
 	}
@@ -335,10 +372,11 @@ impl AspectStructure for Aspect {
 		}
 
 		// Lazily initialize the measurements database
+		// Use direct connection for DDL (not compatible with MVCC transactions)
 		let measurements = Database::get_or_create_turso_database(&self.measurements_path).await?;
-		let conn = Database::begin_concurrent(&measurements, &self.measurements_path, None).await?;
-		Self::wireframe_measurements_tables(&conn).await?;
-		let _ = Database::commit_concurrent(&conn).await;
+		let schema_conn = measurements.connect()?;
+		Self::wireframe_measurements_tables_direct(&schema_conn).await?;
+		drop(schema_conn);
 
 		self.measurements = Some(measurements.clone());
 		Ok(measurements)
@@ -357,20 +395,18 @@ impl AspectStructure for Aspect {
 	}
 
 	async fn wireframe_measurements_tables(conn: &Connection) -> Result<()> {
+		// Note: No PRIMARY KEY or indexes to support MVCC (turso MVCC doesn't support indexes yet)
 		conn.as_ref()
 			.execute(
 				"CREATE TABLE IF NOT EXISTS measurements (
-				id TEXT PRIMARY KEY,
+				id TEXT NOT NULL,
 				dataset_id TEXT NOT NULL,
-				timestamp INTEGER NOT NULL UNIQUE,
+				timestamp INTEGER NOT NULL,
 				value TEXT NOT NULL
 			)",
 				turso::params![],
 			)
 			.await?;
-
-		// Add index for common queries
-		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_measurements_dataset_timestamp ON measurements(dataset_id, timestamp)", turso::params![]).await?;
 
 		Ok(())
 	}
@@ -381,10 +417,11 @@ impl AspectStructure for Aspect {
 		}
 
 		// Lazily initialize the unprocessed_batches database
+		// Use direct connection for DDL (not compatible with MVCC transactions)
 		let unprocessed_batches = Database::get_or_create_turso_database(&self.unprocessed_batches_path).await?;
-		let conn = Database::begin_concurrent(&unprocessed_batches, &self.unprocessed_batches_path, None).await?;
-		Self::wireframe_batches_tables(&conn).await?;
-		let _ = Database::commit_concurrent(&conn).await;
+		let schema_conn = unprocessed_batches.connect()?;
+		Self::wireframe_batches_tables_direct(&schema_conn).await?;
+		drop(schema_conn);
 
 		self.unprocessed_batches = Some(unprocessed_batches.clone());
 		Ok(unprocessed_batches)
@@ -403,34 +440,23 @@ impl AspectStructure for Aspect {
 			.execute(
 				r"
 			CREATE TABLE IF NOT EXISTS batches (
-				id TEXT PRIMARY KEY,
+				id TEXT NOT NULL,
 				aspect_id TEXT NOT NULL,
 				database_id TEXT NOT NULL,
 				size INTEGER NOT NULL,
 				resolution TEXT NOT NULL,
+				measurements TEXT NOT NULL,
 				batch_hash TEXT,
+				status TEXT NOT NULL DEFAULT 'pending',
 				created_at INTEGER NOT NULL,
-				updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000),
-
-				metadata_json TEXT NOT NULL,
-				measurements_json TEXT NOT NULL,
-
-				FOREIGN KEY (aspect_id) REFERENCES aspects(id)
+				updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000)
 			)",
 				turso::params![],
 			)
 			.await?;
 
-		// Add unique constraint for batch_hash to prevent duplicate batches
-		conn.as_ref().execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_batches_unique_hash ON batches(batch_hash) WHERE batch_hash IS NOT NULL", turso::params![]).await?;
-
-		// Enhanced indexes for concurrent write scenarios and queue processing
-		// OPTIMIZATION: Composite index for the exact query pattern used in get_unprocessed_batches
-		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_batches_aspect_database_created ON batches(aspect_id, database_id, created_at)", turso::params![]).await?;
-
-		// Keep individual indexes for other query patterns
-		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_batches_created_at ON batches(created_at)", turso::params![]).await?;
-		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_batches_hash ON batches(batch_hash) WHERE batch_hash IS NOT NULL", turso::params![]).await?;
+		// Note: No indexes to support MVCC (turso MVCC doesn't support indexes yet)
+		// Duplicate batch detection must be handled at application level
 
 		let _ = Database::commit_concurrent(conn).await;
 
@@ -447,10 +473,11 @@ impl AspectStructure for Aspect {
 		}
 
 		// Lazily initialize the processed_batches database
+		// Use direct connection for DDL (not compatible with MVCC transactions)
 		let processed_batches = Database::get_or_create_turso_database(&self.processed_batches_path).await?;
-		let conn = Database::begin_concurrent(&processed_batches, &self.processed_batches_path, None).await?;
-		Self::wireframe_batches_tables(&conn).await?;
-		let _ = Database::commit_concurrent(&conn).await;
+		let schema_conn = processed_batches.connect()?;
+		Self::wireframe_batches_tables_direct(&schema_conn).await?;
+		drop(schema_conn);
 
 		self.processed_batches = Some(processed_batches.clone());
 		Ok(processed_batches)
@@ -474,10 +501,11 @@ impl AspectStructure for Aspect {
 		}
 
 		// Lazily initialize the patterns database
+		// Use direct connection for DDL (not compatible with MVCC transactions)
 		let patterns = Database::get_or_create_turso_database(&self.patterns_path).await?;
-		let conn = Database::begin_concurrent(&patterns, &self.patterns_path, None).await?;
-		Self::wireframe_patterns_tables(&conn).await?;
-		let _ = Database::commit_concurrent(&conn).await;
+		let schema_conn = patterns.connect()?;
+		Self::wireframe_patterns_tables_direct(&schema_conn).await?;
+		drop(schema_conn);
 
 		self.patterns = Some(patterns.clone());
 		Ok(patterns)
@@ -496,12 +524,13 @@ impl AspectStructure for Aspect {
 	}
 
 	async fn wireframe_patterns_tables(conn: &Connection) -> Result<()> {
+		// Note: No PRIMARY KEY on TEXT columns or indexes to support MVCC
 		// Main patterns table with precomputed statistics
 		conn.as_ref()
 			.execute(
 				r"
 			CREATE TABLE IF NOT EXISTS patterns (
-				id TEXT PRIMARY KEY,
+				id TEXT NOT NULL,
 
 				sum_value TEXT NOT NULL,
 				abs_sum_value TEXT NOT NULL,
@@ -516,7 +545,7 @@ impl AspectStructure for Aspect {
 			)
 			.await?;
 
-		// Pattern occurrences table
+		// Pattern occurrences table (INTEGER PRIMARY KEY AUTOINCREMENT is rowid alias, no index)
 		conn.as_ref()
 			.execute(
 				r"
@@ -526,18 +555,16 @@ impl AspectStructure for Aspect {
 				aspect_id TEXT NOT NULL,
 				resolution TEXT NOT NULL,
 				size INTEGER NOT NULL,
-				database_info TEXT NOT NULL, -- JSON blob
+				database_info TEXT NOT NULL,
 				beginning_timestamp INTEGER NOT NULL,
-				end_timestamp INTEGER NOT NULL,
-
-				FOREIGN KEY (pattern_id) REFERENCES patterns(id) ON DELETE CASCADE
+				end_timestamp INTEGER NOT NULL
 			)
 			",
 				turso::params![],
 			)
 			.await?;
 
-		// Pattern relatives table
+		// Pattern relatives table (INTEGER PRIMARY KEY AUTOINCREMENT is rowid alias, no index)
 		conn.as_ref()
 			.execute(
 				r"
@@ -552,57 +579,108 @@ impl AspectStructure for Aspect {
 
 				-- Relative-specific data
 				max_x TEXT NOT NULL,
-				max_y TEXT NOT NULL,
-
-				FOREIGN KEY (pattern_id) REFERENCES patterns(id) ON DELETE CASCADE,
-				UNIQUE(pattern_id, relative_index)
+				max_y TEXT NOT NULL
 			)
 			",
 				turso::params![],
 			)
 			.await?;
 
-		// Indexes for performance
-		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_pattern_occurrences_pattern_id ON pattern_occurrences(pattern_id)", turso::params![]).await?;
-		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_pattern_relatives_pattern_id ON pattern_relatives(pattern_id)", turso::params![]).await?;
-
 		Ok(())
 	}
 
 	async fn events(&mut self) -> Result<TursoDatabase> {
-		if let Some(ref db) = self.events {
+		if let Some(ref db) = self.unprocessed_events {
 			return Ok(db.clone());
 		}
 
 		// Lazily initialize the events database
-		let events = Database::get_or_create_turso_database(&self.events_path).await?;
-		let conn = Database::begin_concurrent(&events, &self.events_path, None).await?;
-		Self::wireframe_events_tables(&conn).await?;
-		let _ = Database::commit_concurrent(&conn).await;
+		// Use direct connection for DDL (not compatible with MVCC transactions)
+		let events = Database::get_or_create_turso_database(&self.unprocessed_events_path).await?;
+		let schema_conn = events.connect()?;
+		Self::wireframe_events_tables_direct(&schema_conn).await?;
+		drop(schema_conn);
 
-		self.events = Some(events.clone());
+		self.unprocessed_events = Some(events.clone());
 		Ok(events)
 	}
 
 	fn set_events(&mut self, turso_db: TursoDatabase) {
-		self.events = Some(turso_db);
+		self.unprocessed_events = Some(turso_db);
 	}
 
 	fn events_path(&self) -> String {
-		self.events_path.clone()
+		self.unprocessed_events_path.clone()
 	}
 
 	async fn set_events_path(&mut self, path: String) {
-		self.events_path = path;
+		self.unprocessed_events_path = path;
+	}
+
+	async fn unprocessed_events(&mut self) -> Result<TursoDatabase> {
+		if let Some(ref db) = self.unprocessed_events {
+			return Ok(db.clone());
+		}
+
+		// Lazily initialize the unprocessed events database
+		// Use direct connection for DDL (not compatible with MVCC transactions)
+		let events = Database::get_or_create_turso_database(&self.unprocessed_events_path).await?;
+		let schema_conn = events.connect()?;
+		Self::wireframe_events_tables_direct(&schema_conn).await?;
+		drop(schema_conn);
+
+		self.unprocessed_events = Some(events.clone());
+		Ok(events)
+	}
+
+	fn set_unprocessed_events(&mut self, turso_db: TursoDatabase) {
+		self.unprocessed_events = Some(turso_db);
+	}
+
+	fn unprocessed_events_path(&self) -> String {
+		self.unprocessed_events_path.clone()
+	}
+
+	async fn set_unprocessed_events_path(&mut self, path: String) {
+		self.unprocessed_events_path = path;
+	}
+
+	async fn processed_events(&mut self) -> Result<TursoDatabase> {
+		if let Some(ref db) = self.processed_events {
+			return Ok(db.clone());
+		}
+
+		// Lazily initialize the processed events database
+		// Use direct connection for DDL (not compatible with MVCC transactions)
+		let events = Database::get_or_create_turso_database(&self.processed_events_path).await?;
+		let schema_conn = events.connect()?;
+		Self::wireframe_events_tables_direct(&schema_conn).await?;
+		drop(schema_conn);
+
+		self.processed_events = Some(events.clone());
+		Ok(events)
+	}
+
+	fn set_processed_events(&mut self, turso_db: TursoDatabase) {
+		self.processed_events = Some(turso_db);
+	}
+
+	fn processed_events_path(&self) -> String {
+		self.processed_events_path.clone()
+	}
+
+	async fn set_processed_events_path(&mut self, path: String) {
+		self.processed_events_path = path;
 	}
 
 	async fn wireframe_events_tables(conn: &Connection) -> Result<()> {
+		// Note: No PRIMARY KEY on TEXT columns or indexes to support MVCC
 		// Main events table
 		conn.as_ref()
 			.execute(
 				r"
 			CREATE TABLE IF NOT EXISTS events (
-				id TEXT PRIMARY KEY,
+				id TEXT NOT NULL,
 				name TEXT NOT NULL,
 				description TEXT,
 				created_at INTEGER NOT NULL
@@ -617,24 +695,16 @@ impl AspectStructure for Aspect {
 			.execute(
 				r"
 			CREATE TABLE IF NOT EXISTS event_manifestations (
-				id TEXT PRIMARY KEY,
+				id TEXT NOT NULL,
 				event_id TEXT NOT NULL,
 				dataset_id TEXT NOT NULL,
 				start_timestamp INTEGER NOT NULL,
-				end_timestamp INTEGER NOT NULL,
-
-				FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE
+				end_timestamp INTEGER NOT NULL
 			)
 			",
 				turso::params![],
 			)
 			.await?;
-
-		// Indexes for performance
-		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_event_manifestations_event_id ON event_manifestations(event_id)", turso::params![]).await?;
-		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_event_manifestations_dataset ON event_manifestations(dataset_id)", turso::params![]).await?;
-		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_event_manifestations_time_range ON event_manifestations(start_timestamp, end_timestamp)", turso::params![]).await?;
-		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_events_name ON events(name)", turso::params![]).await?;
 
 		Ok(())
 	}
@@ -645,10 +715,11 @@ impl AspectStructure for Aspect {
 		}
 
 		// Lazily initialize the correlations database
+		// Use direct connection for DDL (not compatible with MVCC transactions)
 		let correlations = Database::get_or_create_turso_database(&self.correlations_path).await?;
-		let conn = Database::begin_concurrent(&correlations, &self.correlations_path, None).await?;
-		Self::wireframe_correlations_tables(&conn).await?;
-		let _ = Database::commit_concurrent(&conn).await;
+		let schema_conn = correlations.connect()?;
+		Self::wireframe_correlations_tables_direct(&schema_conn).await?;
+		drop(schema_conn);
 
 		self.correlations = Some(correlations.clone());
 		Ok(correlations)
@@ -667,22 +738,20 @@ impl AspectStructure for Aspect {
 	}
 
 	async fn wireframe_correlations_tables(conn: &Connection) -> Result<()> {
+		// Note: No PRIMARY KEY on TEXT columns or indexes to support MVCC
 		// Main correlations table
 		conn.as_ref()
 			.execute(
 				r"
 			CREATE TABLE IF NOT EXISTS correlations (
-				id TEXT PRIMARY KEY,
+				id TEXT NOT NULL,
 				dictionary_id TEXT NOT NULL,
 				subject_id TEXT NOT NULL,
 				aspect_id TEXT NOT NULL,
 				pattern_id TEXT NOT NULL,
 				event_id TEXT NOT NULL,
 				created_at INTEGER NOT NULL,
-				updated_at INTEGER NOT NULL,
-
-				FOREIGN KEY (pattern_id) REFERENCES patterns(id),
-				FOREIGN KEY (event_id) REFERENCES events(id)
+				updated_at INTEGER NOT NULL
 			)
 			",
 				turso::params![],
@@ -693,7 +762,7 @@ impl AspectStructure for Aspect {
 		conn.as_ref().execute("ALTER TABLE correlations ADD COLUMN subject_id TEXT", turso::params![]).await.ok();
 		conn.as_ref().execute("ALTER TABLE correlations ADD COLUMN aspect_id TEXT", turso::params![]).await.ok();
 
-		// Error rates table for the HashMap<SignalType, ErrorRate>
+		// Error rates table (INTEGER PRIMARY KEY AUTOINCREMENT is rowid alias, no index)
 		conn.as_ref()
 			.execute(
 				r"
@@ -701,18 +770,15 @@ impl AspectStructure for Aspect {
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
 				correlation_id TEXT NOT NULL,
 				signal_type TEXT NOT NULL,
-				error_rate_value TEXT NOT NULL, -- BigDecimal as TEXT
-				error_rate_units TEXT NOT NULL, -- Resolution as JSON
-
-				FOREIGN KEY (correlation_id) REFERENCES correlations(id) ON DELETE CASCADE,
-				UNIQUE(correlation_id, signal_type)
+				error_rate_value TEXT NOT NULL,
+				error_rate_units TEXT NOT NULL
 			)
 			",
 				turso::params![],
 			)
 			.await?;
 
-		// Correlation occurrences table
+		// Correlation occurrences table (INTEGER PRIMARY KEY AUTOINCREMENT is rowid alias, no index)
 		conn.as_ref()
 			.execute(
 				r"
@@ -721,42 +787,30 @@ impl AspectStructure for Aspect {
 				correlation_id TEXT NOT NULL,
 				occurrence_index INTEGER NOT NULL,
 				aspect_id TEXT NOT NULL,
-				resolution TEXT NOT NULL, -- Resolution as JSON
+				resolution TEXT NOT NULL,
 				size INTEGER NOT NULL,
-				database_info TEXT NOT NULL, -- DatabaseInfo as JSON blob
+				database_info TEXT NOT NULL,
 				pattern_id TEXT NOT NULL,
 				beginning_timestamp INTEGER NOT NULL,
-				end_timestamp INTEGER NOT NULL,
-
-				FOREIGN KEY (correlation_id) REFERENCES correlations(id) ON DELETE CASCADE,
-				UNIQUE(correlation_id, occurrence_index)
+				end_timestamp INTEGER NOT NULL
 			)
 			",
 				turso::params![],
 			)
 			.await?;
 
-		// Indexes for performance
-		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_correlations_dictionary ON correlations(dictionary_id)", turso::params![]).await?;
-		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_correlations_subject ON correlations(subject_id)", turso::params![]).await?;
-		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_correlations_aspect ON correlations(aspect_id)", turso::params![]).await?;
-		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_correlations_pattern ON correlations(pattern_id)", turso::params![]).await?;
-		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_correlations_event ON correlations(event_id)", turso::params![]).await?;
-		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_correlation_error_rates_correlation_id ON correlation_error_rates(correlation_id)", turso::params![]).await?;
-		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_correlation_occurrences_correlation_id ON correlation_occurrences(correlation_id)", turso::params![]).await?;
-		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_correlation_occurrences_time_range ON correlation_occurrences(beginning_timestamp, end_timestamp)", turso::params![]).await?;
-
 		Ok(())
 	}
 
 	async fn wireframe_dictionary_tables(&self, conn: &Connection) -> Result<()> {
+		// Note: No PRIMARY KEY on TEXT columns or indexes to support MVCC
 		// Main dictionary metadata table
 		conn.as_ref()
 			.execute(
 				r"
                                         CREATE TABLE IF NOT EXISTS dictionary_metadata (
-                                                id TEXT PRIMARY KEY,
-                                                name TEXT NOT NULL UNIQUE,
+                                                id TEXT NOT NULL,
+                                                name TEXT NOT NULL,
                                                 description TEXT,
                                                 created_at INTEGER NOT NULL
                                         )
@@ -765,7 +819,7 @@ impl AspectStructure for Aspect {
 			)
 			.await?;
 
-		// Dictionary constraints table - stores steps configuration
+		// Dictionary constraints table (INTEGER PRIMARY KEY AUTOINCREMENT is rowid alias, no index)
 		conn.as_ref()
 			.execute(
 				r"
@@ -773,16 +827,14 @@ impl AspectStructure for Aspect {
                                                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                                                 dictionary_id TEXT NOT NULL,
                                                 steps_count INTEGER,
-                                                steps_interpolation TEXT,
-
-                                                FOREIGN KEY (dictionary_id) REFERENCES dictionary_metadata(id) ON DELETE CASCADE
+                                                steps_interpolation TEXT
                                         )
                                 ",
 				turso::params![],
 			)
 			.await?;
 
-		// Dictionary variabilities table - stores variability constraints
+		// Dictionary variabilities table (INTEGER PRIMARY KEY AUTOINCREMENT is rowid alias, no index)
 		conn.as_ref()
 			.execute(
 				r"
@@ -790,16 +842,14 @@ impl AspectStructure for Aspect {
                                                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                                                 dictionary_id TEXT NOT NULL,
                                                 variability_type TEXT NOT NULL,
-                                                variability_value TEXT NOT NULL,
-
-                                                FOREIGN KEY (dictionary_id) REFERENCES dictionary_metadata(id) ON DELETE CASCADE
+                                                variability_value TEXT NOT NULL
                                         )
                                 ",
 				turso::params![],
 			)
 			.await?;
 
-		// Dictionary patterns table - links patterns to dictionaries
+		// Dictionary patterns table (INTEGER PRIMARY KEY AUTOINCREMENT is rowid alias, no index)
 		conn.as_ref()
 			.execute(
 				r"
@@ -807,36 +857,34 @@ impl AspectStructure for Aspect {
                                                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                                                 dictionary_id TEXT NOT NULL,
                                                 pattern_id TEXT NOT NULL,
-                                                added_at INTEGER NOT NULL,
-
-                                                FOREIGN KEY (dictionary_id) REFERENCES dictionary_metadata(id) ON DELETE CASCADE,
-                                                FOREIGN KEY (pattern_id) REFERENCES patterns(id) ON DELETE CASCADE,
-                                                UNIQUE(dictionary_id, pattern_id)
+                                                added_at INTEGER NOT NULL
                                         )
                                 ",
 				turso::params![],
 			)
 			.await?;
 
-		// Indexes for performance
-		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_dictionary_name ON dictionary_metadata(name)", turso::params![]).await?;
-
-		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_dictionary_constraints_dict_id ON dictionary_constraints(dictionary_id)", turso::params![]).await?;
-
-		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_dictionary_variabilities_dict_id ON dictionary_variabilities(dictionary_id)", turso::params![]).await?;
-
-		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_dictionary_patterns_dict_id ON dictionary_patterns(dictionary_id)", turso::params![]).await?;
-
-		conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_dictionary_patterns_pattern_id ON dictionary_patterns(pattern_id)", turso::params![]).await?;
-
 		Ok(())
 	}
 
 	async fn new_dictionary(&self, name: &str, description: &str, constraints: &DictionaryConstraints) -> Result<()> {
-		let dictionaries_db_path = Database::aspect_dictionaries_db_path(&self.database_metadata_db_path, &self.subject_name, &self.name, name);
+		// Extract db_name from path (path is like C:\Users\...\dsp_data\{db_name}\{subject}\{aspect})
+		// Use the parent's parent to get db_name from the aspect path
+		let path = std::path::Path::new(&self.path);
+		let subject_path = path.parent().ok_or_else(|| anyhow::anyhow!("Cannot get subject path from aspect path"))?;
+		let db_path = subject_path.parent().ok_or_else(|| anyhow::anyhow!("Cannot get db path from subject path"))?;
+		let db_name = db_path.file_name().ok_or_else(|| anyhow::anyhow!("Cannot extract db_name from path"))?.to_string_lossy().to_string();
+		
+		let dictionaries_db_path = Database::aspect_dictionaries_db_path(&db_name, &self.subject_name, &self.name, name);
 		let dictionaries_db = Database::get_or_create_turso_database(&dictionaries_db_path).await?;
+		
+		// Use direct connection for DDL (not compatible with MVCC transactions)
+		let schema_conn = dictionaries_db.connect()?;
+		Self::wireframe_dictionary_tables_direct(&schema_conn).await?;
+		drop(schema_conn);
+
+		// Now use BEGIN CONCURRENT for data operations
 		let conn = Database::begin_concurrent(&dictionaries_db, &dictionaries_db_path, None).await?;
-		self.wireframe_dictionary_tables(&conn).await?;
 		let id = DictionaryId::new();
 
 		// Insert metadata
@@ -869,6 +917,360 @@ impl AspectStructure for Aspect {
 		}
 
 		let _ = Database::commit_concurrent(&conn).await;
+		Ok(())
+	}
+
+	async fn dictionary(&mut self, name: &str) -> Result<TursoDatabase> {
+		// Check if we already have this dictionary cached
+		if let Some(ref dictionaries) = self.dictionaries {
+			if let Some(db) = dictionaries.get(name) {
+				return Ok(db.clone());
+			}
+		}
+
+		// Extract db_name from path (path is like C:\Users\...\dsp_data\{db_name}\{subject}\{aspect})
+		let path = std::path::Path::new(&self.path);
+		let subject_path = path.parent().ok_or_else(|| anyhow::anyhow!("Cannot get subject path from aspect path"))?;
+		let db_path_parent = subject_path.parent().ok_or_else(|| anyhow::anyhow!("Cannot get db path from subject path"))?;
+		let db_name = db_path_parent.file_name().ok_or_else(|| anyhow::anyhow!("Cannot extract db_name from path"))?.to_string_lossy().to_string();
+
+		// Get the path for this dictionary
+		let dictionary_path = Database::aspect_dictionaries_db_path(&db_name, &self.subject_name, &self.name, name);
+		
+		// Check if path exists on disk (dictionary may have been created but not cached in paths map)
+		if !std::path::Path::new(&dictionary_path).exists() && !self.dictionaries_paths.contains_key(name) {
+			anyhow::bail!("Dictionary '{}' does not exist for aspect '{}'", name, self.name);
+		}
+
+		// Get or create the database
+		let dictionary_db = Database::get_or_create_turso_database(&dictionary_path).await?;
+		
+		// Ensure all tables exist (DDL uses direct connection, not MVCC transaction)
+		// This handles the case where the dictionary was created before new tables were added
+		let schema_conn = dictionary_db.connect()?;
+		Self::wireframe_dictionary_tables_direct(&schema_conn).await?;
+		drop(schema_conn);
+		
+		// Cache it
+		if self.dictionaries.is_none() {
+			self.dictionaries = Some(HashMap::new());
+		}
+		if let Some(ref mut dictionaries) = self.dictionaries {
+			dictionaries.insert(name.to_string(), dictionary_db.clone());
+		}
+		// Also cache the path if not already there
+		if !self.dictionaries_paths.contains_key(name) {
+			self.dictionaries_paths.insert(name.to_string(), dictionary_path);
+		}
+
+		Ok(dictionary_db)
+	}
+}
+
+// ===== Direct wireframe functions for DDL (CREATE TABLE) operations =====
+// These use turso::Connection directly instead of Connection wrapper
+// Required because DDL is not compatible with MVCC concurrent transactions
+impl Aspect {
+	async fn wireframe_measurements_tables_direct(conn: &turso::Connection) -> Result<()> {
+		// Note: No PRIMARY KEY or indexes to support MVCC (turso MVCC doesn't support indexes yet)
+		conn.execute(
+			"CREATE TABLE IF NOT EXISTS measurements (
+				id TEXT NOT NULL,
+				dataset_id TEXT NOT NULL,
+				timestamp INTEGER NOT NULL,
+				value TEXT NOT NULL
+			)",
+			turso::params![],
+		)
+		.await?;
+
+		Ok(())
+	}
+
+	async fn wireframe_batches_tables_direct(conn: &turso::Connection) -> Result<()> {
+		conn.execute(
+			r"
+			CREATE TABLE IF NOT EXISTS batches (
+				id TEXT NOT NULL,
+				aspect_id TEXT NOT NULL,
+				database_id TEXT NOT NULL,
+				size INTEGER NOT NULL,
+				resolution TEXT NOT NULL,
+				measurements TEXT NOT NULL,
+				batch_hash TEXT,
+				status TEXT NOT NULL DEFAULT 'pending',
+				created_at INTEGER NOT NULL,
+				updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000)
+			)",
+			turso::params![],
+		)
+		.await?;
+
+		Ok(())
+	}
+
+	async fn wireframe_patterns_tables_direct(conn: &turso::Connection) -> Result<()> {
+		// Note: No PRIMARY KEY on TEXT columns or indexes to support MVCC
+		// Main patterns table with precomputed statistics
+		conn.execute(
+			r"
+			CREATE TABLE IF NOT EXISTS patterns (
+				id TEXT NOT NULL,
+
+				sum_value TEXT NOT NULL,
+				abs_sum_value TEXT NOT NULL,
+				max_value TEXT NOT NULL,
+				min_value TEXT NOT NULL,
+				abs_max_value TEXT NOT NULL,
+				avg_value TEXT NOT NULL,
+				abs_avg_value TEXT NOT NULL
+			)
+			",
+			turso::params![],
+		)
+		.await?;
+
+		// Pattern occurrences table (INTEGER PRIMARY KEY AUTOINCREMENT is rowid alias, no index)
+		conn.execute(
+			r"
+			CREATE TABLE IF NOT EXISTS pattern_occurrences (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				pattern_id TEXT NOT NULL,
+				occurrence_index INTEGER NOT NULL,
+				aspect_id TEXT NOT NULL,
+				resolution TEXT NOT NULL,
+				size INTEGER NOT NULL,
+				database_info TEXT NOT NULL,
+				beginning_timestamp INTEGER NOT NULL,
+				end_timestamp INTEGER NOT NULL
+			)
+			",
+			turso::params![],
+		)
+		.await?;
+
+		// Pattern relatives table (INTEGER PRIMARY KEY AUTOINCREMENT is rowid alias, no index)
+		conn.execute(
+			r"
+			CREATE TABLE IF NOT EXISTS pattern_relatives (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				pattern_id TEXT NOT NULL,
+				relative_index INTEGER NOT NULL,
+				relative_value TEXT NOT NULL
+			)
+			",
+			turso::params![],
+		)
+		.await?;
+
+		Ok(())
+	}
+
+	async fn wireframe_events_tables_direct(conn: &turso::Connection) -> Result<()> {
+		// Note: No PRIMARY KEY on TEXT columns or indexes to support MVCC
+		// Main events table
+		conn.execute(
+			r"
+			CREATE TABLE IF NOT EXISTS events (
+				id TEXT NOT NULL,
+				name TEXT NOT NULL,
+				description TEXT,
+				created_at INTEGER NOT NULL
+			)
+			",
+			turso::params![],
+		)
+		.await?;
+
+		// Event manifestations table
+		conn.execute(
+			r"
+			CREATE TABLE IF NOT EXISTS event_manifestations (
+				id TEXT NOT NULL,
+				event_id TEXT NOT NULL,
+				dataset_id TEXT NOT NULL,
+				start_timestamp INTEGER NOT NULL,
+				end_timestamp INTEGER NOT NULL
+			)
+			",
+			turso::params![],
+		)
+		.await?;
+
+		Ok(())
+	}
+
+	async fn wireframe_correlations_tables_direct(conn: &turso::Connection) -> Result<()> {
+		// Note: No PRIMARY KEY on TEXT columns or indexes to support MVCC
+		// Main correlations table
+		conn.execute(
+			r"
+			CREATE TABLE IF NOT EXISTS correlations (
+				id TEXT NOT NULL,
+				dictionary_id TEXT NOT NULL,
+				subject_id TEXT NOT NULL,
+				aspect_id TEXT NOT NULL,
+				pattern_id TEXT NOT NULL,
+				event_id TEXT NOT NULL,
+				created_at INTEGER NOT NULL,
+				updated_at INTEGER NOT NULL
+			)
+			",
+			turso::params![],
+		)
+		.await?;
+
+		// Add columns if they don't exist (for existing tables)
+		conn.execute("ALTER TABLE correlations ADD COLUMN subject_id TEXT", turso::params![]).await.ok();
+		conn.execute("ALTER TABLE correlations ADD COLUMN aspect_id TEXT", turso::params![]).await.ok();
+
+		// Error rates table (INTEGER PRIMARY KEY AUTOINCREMENT is rowid alias, no index)
+		conn.execute(
+			r"
+			CREATE TABLE IF NOT EXISTS correlation_error_rates (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				correlation_id TEXT NOT NULL,
+				signal_type TEXT NOT NULL,
+				error_rate_value TEXT NOT NULL,
+				error_rate_units TEXT NOT NULL
+			)
+			",
+			turso::params![],
+		)
+		.await?;
+
+		// Correlation occurrences table (INTEGER PRIMARY KEY AUTOINCREMENT is rowid alias, no index)
+		conn.execute(
+			r"
+			CREATE TABLE IF NOT EXISTS correlation_occurrences (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				correlation_id TEXT NOT NULL,
+				occurrence_index INTEGER NOT NULL,
+				aspect_id TEXT NOT NULL,
+				resolution TEXT NOT NULL,
+				size INTEGER NOT NULL,
+				database_info TEXT NOT NULL,
+				pattern_id TEXT NOT NULL,
+				beginning_timestamp INTEGER NOT NULL,
+				end_timestamp INTEGER NOT NULL
+			)
+			",
+			turso::params![],
+		)
+		.await?;
+
+		Ok(())
+	}
+
+	async fn wireframe_dictionary_tables_direct(conn: &turso::Connection) -> Result<()> {
+		// Note: No PRIMARY KEY on TEXT columns or indexes to support MVCC
+		// Main dictionary metadata table
+		conn.execute(
+			r"
+			CREATE TABLE IF NOT EXISTS dictionary_metadata (
+				id TEXT NOT NULL,
+				name TEXT NOT NULL,
+				description TEXT,
+				created_at INTEGER NOT NULL
+			)
+			",
+			turso::params![],
+		)
+		.await?;
+
+		// Dictionary constraints table (INTEGER PRIMARY KEY AUTOINCREMENT is rowid alias, no index)
+		conn.execute(
+			r"
+			CREATE TABLE IF NOT EXISTS dictionary_constraints (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				dictionary_id TEXT NOT NULL,
+				steps_count INTEGER,
+				steps_interpolation TEXT
+			)
+			",
+			turso::params![],
+		)
+		.await?;
+
+		// Dictionary variabilities table (INTEGER PRIMARY KEY AUTOINCREMENT is rowid alias, no index)
+		conn.execute(
+			r"
+			CREATE TABLE IF NOT EXISTS dictionary_variabilities (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				dictionary_id TEXT NOT NULL,
+				variability_type TEXT NOT NULL,
+				variability_value TEXT NOT NULL
+			)
+			",
+			turso::params![],
+		)
+		.await?;
+
+		// Dictionary patterns linking table (INTEGER PRIMARY KEY AUTOINCREMENT is rowid alias, no index)
+		conn.execute(
+			r"
+			CREATE TABLE IF NOT EXISTS dictionary_patterns (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				dictionary_id TEXT NOT NULL,
+				pattern_id TEXT NOT NULL,
+				added_at INTEGER NOT NULL
+			)
+			",
+			turso::params![],
+		)
+		.await?;
+
+		// Main patterns table with precomputed statistics (same schema as aspect-level patterns)
+		conn.execute(
+			r"
+			CREATE TABLE IF NOT EXISTS patterns (
+				id TEXT NOT NULL,
+				sum_value TEXT NOT NULL,
+				abs_sum_value TEXT NOT NULL,
+				max_value TEXT NOT NULL,
+				min_value TEXT NOT NULL,
+				abs_max_value TEXT NOT NULL,
+				avg_value TEXT NOT NULL,
+				abs_avg_value TEXT NOT NULL
+			)
+			",
+			turso::params![],
+		)
+		.await?;
+
+		// Pattern occurrences table (INTEGER PRIMARY KEY AUTOINCREMENT is rowid alias, no index)
+		conn.execute(
+			r"
+			CREATE TABLE IF NOT EXISTS pattern_occurrences (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				pattern_id TEXT NOT NULL,
+				occurrence_index INTEGER NOT NULL,
+				aspect_id TEXT NOT NULL,
+				resolution TEXT NOT NULL,
+				size INTEGER NOT NULL,
+				database_info TEXT NOT NULL,
+				beginning_timestamp INTEGER NOT NULL,
+				end_timestamp INTEGER NOT NULL
+			)
+			",
+			turso::params![],
+		)
+		.await?;
+
+		// Pattern relatives table (INTEGER PRIMARY KEY AUTOINCREMENT is rowid alias, no index)
+		conn.execute(
+			r"
+			CREATE TABLE IF NOT EXISTS pattern_relatives (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				pattern_id TEXT NOT NULL,
+				relative_index INTEGER NOT NULL,
+				relative_value TEXT NOT NULL
+			)
+			",
+			turso::params![],
+		)
+		.await?;
+
 		Ok(())
 	}
 }

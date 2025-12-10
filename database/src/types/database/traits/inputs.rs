@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::{cache::Connection, AspectId, Batch, BatchId, DatasetId, Event, EventID, InputMeasurement, Pattern, PatternID, TxId};
+use crate::{cache::Connection, AspectId, Batch, BatchId, Correlation, CorrelationID, DatasetId, DictionaryMetadata, Event, EventID, InputMeasurement, Pattern, PatternID, TxId};
 
 /// Trait for database structure operations
 /// This trait defines the operations related to managing the structure of the database.
@@ -108,32 +108,53 @@ pub trait Inputs {
 	/// clear all events for a given aspect
 	async fn clear_events(&self, aspect_id: &AspectId) -> Result<TxId>;
 
-        //
-        // Dictionary
-        //
+	//
+	// Dictionary
+	//
 
-        /// update the metadata for a given dictionary
-        async fn set_dictionary_metadata(&self, aspect_id: &AspectId, dictionary_name: &str, metadata: &DictionaryMetadata) -> Result<TxId>;
+	/// update the metadata for a given dictionary
+	async fn set_dictionary_metadata(&self, aspect_id: &AspectId, dictionary_name: &str, metadata: &DictionaryMetadata) -> Result<TxId>;
 
-        /// insert pattern into dictionary for a given aspect
-        async fn insert_pattern_into_dictionary(&self, aspect_id: &AspectId, dictionary_name: &str, pattern: &Pattern) -> Result<TxId>;
+	/// insert pattern into dictionary for a given aspect
+	async fn insert_pattern_into_dictionary(&self, aspect_id: &AspectId, dictionary_name: &str, pattern: &Pattern) -> Result<TxId>;
 
-        /// Capture multiple patterns into dictionary for a given aspect
-        async fn batch_insert_patterns_into_dictionary(&self, aspect_id: &AspectId, dictionary_name: &str, patterns: Vec<Pattern>) -> Result<Vec<TxId>>;
+	/// Capture multiple patterns into dictionary for a given aspect
+	async fn batch_insert_patterns_into_dictionary(&self, aspect_id: &AspectId, dictionary_name: &str, patterns: Vec<Pattern>) -> Result<Vec<TxId>>;
 
+	//
+	// Correlations
+	//
 
-        //
-        // Correlations
-        //
+	/// insert correlation for a given aspect
+	async fn insert_correlation(&self, aspect_id: &AspectId, correlation: &Correlation) -> Result<TxId>;
 
-        /// insert correlation for a given aspect
-        async fn insert_correlation(&self, aspect_id: &AspectId, correlation: &Correlation) -> Result<TxId>;
+	/// update correlation for a given aspect
+	async fn update_correlation(&self, aspect_id: &AspectId, correlation: &Correlation) -> Result<TxId>;
 
-        /// update correlation for a given aspect
-        async fn update_correlation(&self, aspect_id: &AspectId, correlation: &Correlation) -> Result<TxId>;
-        
-        /// remove correlation for a given aspect
-        async fn remove_correlation(&self, aspect_id: &AspectId, correlation_id: &CorrelationID) -> Result<TxId>;
-        
+	/// remove correlation for a given aspect
+	async fn remove_correlation(&self, aspect_id: &AspectId, correlation_id: &CorrelationID) -> Result<TxId>;
 
+	//
+	// Unprocessed Events
+	//
+
+	async fn insert_unprocessed_event(&self, aspect_id: &AspectId, event: &Event) -> Result<TxId>;
+
+	async fn remove_unprocessed_event(&self, aspect_id: &AspectId, event_id: &EventID) -> Result<TxId>;
+
+	async fn clear_unprocessed_events(&self, aspect_id: &AspectId) -> Result<TxId>;
+
+	async fn cleanup_unprocessed_events(&self, aspect_id: &AspectId, older_than: chrono::DateTime<chrono::Utc>) -> Result<TxId>;
+
+	//
+	// Processed Events
+	//
+
+	async fn insert_processed_event(&self, aspect_id: &AspectId, event: &Event) -> Result<TxId>;
+
+	async fn remove_processed_event(&self, aspect_id: &AspectId, event_id: &EventID) -> Result<TxId>;
+
+	async fn clear_processed_events(&self, aspect_id: &AspectId) -> Result<TxId>;
+
+	async fn cleanup_processed_events(&self, aspect_id: &AspectId, older_than: chrono::DateTime<chrono::Utc>) -> Result<TxId>;
 }

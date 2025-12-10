@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-	types::database::traits::{aspect_structure::AspectStructure, DatabaseStructure}, Aspect, AspectId, Database, DatabaseId
+	database::traits::connection::Connection as ConnectionTrait, types::database::traits::{aspect_structure::AspectStructure, DatabaseStructure}, Aspect, AspectId, Database, DatabaseId
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -31,6 +31,12 @@ impl SubjectId {
 impl Default for SubjectId {
 	fn default() -> Self {
 		Self::new()
+	}
+}
+
+impl std::fmt::Display for SubjectId {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}", self.0)
 	}
 }
 
@@ -89,10 +95,11 @@ impl Subject {
 		let turso_db = Database::get_turso_database(&turso_db_path).await?;
 
 		// Query the database for the metadata_path field of the first item in the database table
-		let conn = turso_db.connect()?;
-		let mut rows = conn.query("SELECT metadata_path FROM database", turso::params![]).await?;
+		let conn = Database::begin_concurrent(&turso_db, &turso_db_path, None).await?;
+		let mut rows = conn.as_ref().query("SELECT metadata_path FROM database", turso::params![]).await?;
 		let row = rows.next().await?.ok_or_else(|| anyhow::anyhow!("Database metadata not found"))?;
 		let metadata_path: String = row.get(0)?;
+		let _ = Database::commit_concurrent(&conn).await;
 
 		Ok(metadata_path)
 	}

@@ -1,7 +1,6 @@
 use std::{fmt::Display, str::FromStr};
 
-use fake::{Dummy, Faker};
-use rand::Rng;
+use fake::{Fake, faker::lorem::en::Word};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -101,13 +100,10 @@ impl Dataset {
 	pub fn set_measurements(&mut self, measurements: Vec<Measurement>) {
 		self.measurements = measurements;
 	}
-}
 
-// Implement Dummy manually for the types that need it
-impl Dummy<Faker> for Dataset {
-	fn dummy_with_rng<R: Rng + ?Sized>(_config: &Faker, _rng: &mut R) -> Self {
-		use fake::{faker::lorem::en::Word, Fake};
-
+	/// Generate a random Dataset for testing
+	#[must_use]
+	pub fn random() -> Self {
 		Self {
 			id: DatasetId::new(),
 			name: Word().fake(),

@@ -9,37 +9,39 @@ use crate::{cache, database::traits::Connection, DatabaseCache};
 
 #[async_trait::async_trait]
 impl Connection for Database {
-	/// Get a cached database connection with MVCC concurrent transaction support
-	/// Returns a cached connection if available, otherwise creates a new one
-	async fn begin_concurrent(turso_db: &turso::Database, cache_key: &str, cache: Option<Arc<Mutex<DatabaseCache>>>) -> Result<cache::Connection> {
-		let cache = cache.unwrap_or_else(|| Arc::new(Mutex::new(DatabaseCache::default())));
-
-		// Try to get cached connection first
-		if let Some(cached_conn) = cache.lock().await.get::<cache::Connection>(cache_key).await {
-			return Ok(cached_conn);
-		}
-
-		// Create new connection if not cached
+	/// Create a new database connection with MVCC concurrent transaction support
+	/// Each call creates a fresh connection with its own transaction - no caching at transaction level
+	/// to avoid transaction conflicts when multiple tasks use the same cached connection
+	/// 
+	/// Uses BEGIN CONCURRENT which requires MVCC to be enabled on the database (via `Builder::with_mvcc(true)`)
+	async fn begin_concurrent(turso_db: &turso::Database, _cache_key: &str, _cache: Option<Arc<Mutex<DatabaseCache>>>) -> Result<cache::Connection> {
+		// Always create a new connection for each transaction to avoid conflicts
+		// Connection caching at the transaction level causes issues with concurrent writes
 		let conn = turso_db.connect()?;
 
-		// Try BEGIN CONCURRENT first for MVCC support
-		match conn.execute("BEGIN CONCURRENT", turso::params![]).await {
-			Ok(_) => {}
-			Err(_) => {
-				// Fallback to BEGIN IMMEDIATE for compatibility
-				match conn.execute("BEGIN IMMEDIATE", turso::params![]).await {
-					Ok(_) => {}
-					Err(_) => {
-						// Final fallback to regular BEGIN
-						conn.execute("BEGIN", turso::params![]).await.map_err(|e| anyhow::anyhow!("Failed to begin transaction: {e}"))?;
+		// BEGIN CONCURRENT allows multiple concurrent write transactions with MVCC
+		// Retry with exponential backoff on transient errors
+		let mut attempts = 0;
+		let max_attempts = 100; // ~30 seconds total with backoff
+		
+		loop {
+			match conn.execute("BEGIN CONCURRENT", turso::params![]).await {
+				Ok(_) => break,
+				Err(e) => {
+					attempts += 1;
+					if attempts >= max_attempts {
+						return Err(anyhow::anyhow!("Failed to begin concurrent transaction after {attempts} attempts: {e}"));
 					}
+					// Exponential backoff with jitter: 10-20ms, 20-40ms, ... capped at 500ms
+					let base_delay = std::cmp::min(10 * (1 << attempts.min(6)), 500);
+					let jitter = fastrand::u64(0..base_delay / 2);
+					tokio::time::sleep(std::time::Duration::from_millis(base_delay + jitter)).await;
 				}
 			}
 		}
 
-		// Wrap in our Connection type and cache it
+		// Wrap in our Connection type (no caching - each transaction gets its own connection)
 		let cached_conn = cache::Connection::new(conn);
-		cache.lock().await.store::<cache::Connection>(cache_key, cached_conn.clone()).await;
 
 		Ok(cached_conn)
 	}
@@ -67,10 +69,8 @@ impl Connection for Database {
 		conn.execute("PRAGMA wal_autocheckpoint=1000", turso::params![]).await.ok(); // Better WAL handling for large writes
 		conn.execute("PRAGMA cache_size=-64000", turso::params![]).await.ok(); // 64MB cache for performance
 
-		// Test BEGIN CONCURRENT support
-		if conn.execute("BEGIN CONCURRENT", turso::params![]).await.is_ok() {
-			conn.execute("ROLLBACK", turso::params![]).await.ok();
-		}
+		// Explicitly drop connection to ensure it's closed before returning
+		drop(conn);
 
 		Ok(())
 	}

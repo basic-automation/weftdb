@@ -27,9 +27,6 @@ pub use config::DEFAULT_DATA_DIR;
 
 pub mod config;
 pub mod connection;
-pub mod correlations;
-pub mod dictionaries;
-pub mod events;
 pub mod helpers;
 pub mod inputs;
 pub mod navigation;
@@ -62,7 +59,7 @@ impl DatabaseStructure for Database {
 
 		// If not in cache check if the database file exists on disk
 		if Path::new(db_path).exists() {
-			let turso_db = Builder::new_local(db_path).build().await?;
+			let turso_db = Builder::new_local(db_path).with_mvcc(true).build().await?;
 
 			// Configure database for concurrent writes
 			{
@@ -76,6 +73,9 @@ impl DatabaseStructure for Database {
 
 				// Optimize for concurrent access
 				conn.execute("PRAGMA synchronous = NORMAL", turso::params![]).await.ok();
+				
+				// Explicitly drop connection to ensure it's closed
+				drop(conn);
 			}
 
 			CONNECTION_DATABASES.lock().await.insert(db_path.to_string(), turso_db.clone());
@@ -96,10 +96,13 @@ impl DatabaseStructure for Database {
 		}
 
 		// Create the database (file will be created if it doesn't exist)
-		let turso_db = Builder::new_local(db_path).build().await?;
+		let turso_db = Builder::new_local(db_path).with_mvcc(true).build().await?;
 
 		// Configure database for MVCC concurrent writes
 		Self::configure_database_for_mvcc(&turso_db).await?;
+		
+		// Allow connection to fully close before returning
+		tokio::task::yield_now().await;
 
 		cache.insert(db_path.to_string(), turso_db.clone());
 		drop(cache);
@@ -121,8 +124,8 @@ impl DatabaseStructure for Database {
 
 		let conn = Self::begin_concurrent(&self.metadata.clone(), self.metadata_path(), Some(self.cache.clone())).await?;
 
-		// Simple INSERT without explicit transaction wrapper - SQLite handles this atomically
-		let res = conn.as_ref().execute("INSERT INTO transactions (id, message, created_at) VALUES (?, ?, ?) ON CONFLICT(id) DO NOTHING", turso::params![id_str.clone(), msg.clone(), created_at]).await;
+		// Simple INSERT - duplicates are unlikely with UUID ids
+		let res = conn.as_ref().execute("INSERT INTO transactions (id, message, created_at) VALUES (?, ?, ?)", turso::params![id_str.clone(), msg.clone(), created_at]).await;
 
 		match res {
 			Ok(_) => println!("[TRACE] Background logged transaction id={id_str}"),
@@ -150,8 +153,8 @@ impl DatabaseStructure for Database {
 
 		// Create a fresh connection for each attempt
 
-		// Simple INSERT without explicit transaction wrapper
-		let res = conn.as_ref().execute("INSERT INTO transactions (id, message, created_at) VALUES (?, ?, ?) ON CONFLICT(id) DO NOTHING", turso::params![id_str.clone(), msg.clone(), created_at]).await;
+		// Simple INSERT - duplicates are unlikely with UUID ids
+		let res = conn.as_ref().execute("INSERT INTO transactions (id, message, created_at) VALUES (?, ?, ?)", turso::params![id_str.clone(), msg.clone(), created_at]).await;
 
 		match res {
 			Ok(_) => println!("[TRACE] Logged transaction id={id_str}"),
@@ -174,7 +177,7 @@ impl DatabaseStructure for Database {
 			.execute(
 				r"
                         CREATE TABLE IF NOT EXISTS transactions (
-        			id TEXT PRIMARY KEY,
+        			id TEXT NOT NULL,
         			message TEXT NOT NULL,
         			created_at INTEGER NOT NULL
         		)",
@@ -199,7 +202,7 @@ impl DatabaseStructure for Database {
 			.execute(
 				r"
         		        CREATE TABLE IF NOT EXISTS database (
-        				id TEXT PRIMARY KEY,
+        				id TEXT NOT NULL,
         				name TEXT NOT NULL,
         				created_at INTEGER NOT NULL,
         				metadata_path TEXT NOT NULL
@@ -225,7 +228,7 @@ impl DatabaseStructure for Database {
 			.execute(
 				r"
         			CREATE TABLE IF NOT EXISTS subjects (
-        				id TEXT PRIMARY KEY,
+        				id TEXT NOT NULL,
         				database_id TEXT NOT NULL,
         				name TEXT NOT NULL,
         				created_at INTEGER NOT NULL
@@ -252,7 +255,7 @@ impl DatabaseStructure for Database {
 			.execute(
 				r"
                 	CREATE TABLE IF NOT EXISTS aspects (
-                        		id TEXT PRIMARY KEY,
+                        		id TEXT NOT NULL,
                         		subject_id TEXT NOT NULL,
                         		database_id TEXT NOT NULL,
                         		name TEXT NOT NULL,
@@ -328,21 +331,24 @@ impl DatabaseStructure for Database {
 		let metadata_turso_db = Self::create_turso_database(&metadata_db_path).await?;
 		println!("[DEBUG] Turso database created successfully");
 
-		let conn = Self::begin_concurrent(&metadata_turso_db, &metadata_db_path, None).await?;
-
-		// Create metadata tables
+		// For DDL operations (CREATE TABLE), use a direct connection without BEGIN CONCURRENT
+		// DDL operations may not be compatible with MVCC concurrent transactions
 		println!("[DEBUG] Creating metadata tables...");
-		let transactions = Self::wireframe_metadata_database(&conn).await;
+		let schema_conn = metadata_turso_db.connect()?;
+		let transactions = Self::wireframe_metadata_database_direct(&schema_conn).await;
 		let mut transactions = match transactions {
 			Ok(txs) => txs,
 			Err(e) => {
 				println!("[DEBUG] Failed to create metadata tables: {e}");
-				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("Failed to create metadata tables: {e}"));
 			}
 		};
+		drop(schema_conn);
 		println!("[DEBUG] Metadata tables created, {} transactions logged", transactions.len());
 
+		// Now use BEGIN CONCURRENT for data operations (INSERT)
+		let conn = Self::begin_concurrent(&metadata_turso_db, &metadata_db_path, None).await?;
+		
 		// Insert database metadata using concurrent-safe transaction pattern
 		println!("[DEBUG] Inserting database metadata...");
 
@@ -1172,6 +1178,50 @@ impl DatabaseStructure for Database {
 		Ok(events_db_path)
 	}
 
+	async fn get_unprocessed_events_db(&self, aspect_id: &AspectId) -> Result<turso::Database> {
+		let cache_key = format!("unprocessed_events_db_{aspect_id}");
+		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
+			return Ok(db);
+		}
+		let mut aspect = self.get_aspect(aspect_id).await?;
+		let events_db = aspect.unprocessed_events().await?;
+		self.cache.lock().await.store(&cache_key, events_db.clone()).await;
+		Ok(events_db)
+	}
+
+	async fn get_unprocessed_events_db_path(&self, aspect_id: &AspectId) -> Result<String> {
+		let cache_key = format!("unprocessed_events_db_path_{aspect_id}");
+		if let Some(path) = self.cache.lock().await.get::<String>(&cache_key).await {
+			return Ok(path);
+		}
+		let aspect = self.get_aspect(aspect_id).await?;
+		let events_db_path = aspect.unprocessed_events_path();
+		self.cache.lock().await.store(&cache_key, events_db_path.clone()).await;
+		Ok(events_db_path)
+	}
+
+	async fn get_processed_events_db(&self, aspect_id: &AspectId) -> Result<turso::Database> {
+		let cache_key = format!("processed_events_db_{aspect_id}");
+		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
+			return Ok(db);
+		}
+		let mut aspect = self.get_aspect(aspect_id).await?;
+		let events_db = aspect.processed_events().await?;
+		self.cache.lock().await.store(&cache_key, events_db.clone()).await;
+		Ok(events_db)
+	}
+
+	async fn get_processed_events_db_path(&self, aspect_id: &AspectId) -> Result<String> {
+		let cache_key = format!("processed_events_db_path_{aspect_id}");
+		if let Some(path) = self.cache.lock().await.get::<String>(&cache_key).await {
+			return Ok(path);
+		}
+		let aspect = self.get_aspect(aspect_id).await?;
+		let events_db_path = aspect.processed_events_path();
+		self.cache.lock().await.store(&cache_key, events_db_path.clone()).await;
+		Ok(events_db_path)
+	}
+
 	async fn get_correlations_db(&self, aspect_id: &AspectId) -> Result<turso::Database> {
 		let cache_key = format!("correlations_db_{aspect_id}");
 		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
@@ -1194,16 +1244,84 @@ impl DatabaseStructure for Database {
 		Ok(correlations_path)
 	}
 
-        async fn get_dictionary_db(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<turso::Database> {
-                let cache_key = format!("dictionary_db_{}_{}", aspect_id, dictionary_name);
-                if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
-                        return Ok(db);
-                }
-                let mut aspect = self.get_aspect(aspect_id).await?;
-                let db = aspect.dictionary(dictionary_name).await?;
-                self.cache.lock().await.store(&cache_key, db.clone()).await;
-                Ok(db)
-        }
+	async fn get_dictionary_db(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<turso::Database> {
+		let cache_key = format!("dictionary_db_{aspect_id}_{dictionary_name}");
+		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
+			return Ok(db);
+		}
+		let mut aspect = self.get_aspect(aspect_id).await?;
+		let db = aspect.dictionary(dictionary_name).await?;
+		self.cache.lock().await.store(&cache_key, db.clone()).await;
+		Ok(db)
+	}
+}
+
+impl Database {
+	/// DDL-safe version that uses a direct `turso::Connection` for schema creation
+	/// DDL operations (CREATE TABLE) may not work well with BEGIN CONCURRENT transactions
+	/// Note: Tables have no indexes to support MVCC (turso MVCC doesn't support indexes yet)
+	async fn wireframe_metadata_database_direct(conn: &turso::Connection) -> Result<Vec<Transaction>> {
+		println!("[DEBUG] Connecting to database for table creation...");
+		
+		println!("[DEBUG] Creating transactions table...");
+		conn.execute(
+			r"CREATE TABLE IF NOT EXISTS transactions (
+				id TEXT NOT NULL,
+				message TEXT NOT NULL,
+				created_at INTEGER NOT NULL
+			)",
+			turso::params![],
+		).await.map_err(|e| anyhow::anyhow!("Failed to create transactions table: {e}"))?;
+		println!("[DEBUG] Transactions table created");
+		
+		println!("[DEBUG] Creating database table...");
+		conn.execute(
+			r"CREATE TABLE IF NOT EXISTS database (
+				id TEXT NOT NULL,
+				name TEXT NOT NULL,
+				created_at INTEGER NOT NULL,
+				metadata_path TEXT NOT NULL
+			)",
+			turso::params![],
+		).await.map_err(|e| anyhow::anyhow!("Failed to create database table: {e}"))?;
+		println!("[DEBUG] Database table created");
+		
+		println!("[DEBUG] Creating subjects table...");
+		conn.execute(
+			r"CREATE TABLE IF NOT EXISTS subjects (
+				id TEXT NOT NULL,
+				database_id TEXT NOT NULL,
+				name TEXT NOT NULL,
+				created_at INTEGER NOT NULL
+			)",
+			turso::params![],
+		).await.map_err(|e| anyhow::anyhow!("Failed to create subjects table: {e}"))?;
+		println!("[DEBUG] Subjects table created");
+		
+		println!("[DEBUG] Creating aspects table...");
+		conn.execute(
+			r"CREATE TABLE IF NOT EXISTS aspects (
+				id TEXT NOT NULL,
+				subject_id TEXT NOT NULL,
+				database_id TEXT NOT NULL,
+				name TEXT NOT NULL,
+				table_name TEXT NOT NULL,
+				resolution TEXT NOT NULL,
+				created_at INTEGER NOT NULL,
+				earliest_measurement TEXT,
+				latest_measurement TEXT
+			)",
+			turso::params![],
+		).await.map_err(|e| anyhow::anyhow!("Failed to create aspects table: {e}"))?;
+		println!("[DEBUG] All tables created successfully");
+
+		Ok(vec![
+			Transaction::new(None, "Create transactions table".to_string()),
+			Transaction::new(None, "Create database table".to_string()),
+			Transaction::new(None, "Create subjects table".to_string()),
+			Transaction::new(None, "Create aspects table".to_string()),
+		])
+	}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
