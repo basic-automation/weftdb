@@ -26,10 +26,10 @@ fastrand = { workspace = true }
 futures = { workspace = true }
 splimes = { workspace = true }
 csv = { workspace = true }
-once_cell = "1.19"
+once_cell = { workspace = true }
 num_cpus = { workspace = true }
 serde_json = { workspace = true }
-md5 = "0.7"
+md5 = { workspace = true }
 sysinfo = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -37,7 +37,7 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true , features = ["html_reports"] }
 tempfile = { workspace = true }
-serial_test = "3.0"
+serial_test = { workspace = true }
 
 [[bench]]
 name = "interpolation_benchmarks"

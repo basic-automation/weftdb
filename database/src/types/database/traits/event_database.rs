@@ -1,6 +1,14 @@
 use anyhow::Result;
 
-use crate::{database::events::EventStats, AspectId, Event};
+use crate::{AspectId, Event};
+
+/// Event statistics struct
+#[derive(Debug, Clone, Default)]
+pub struct EventStats {
+	pub total_events: usize,
+	pub unprocessed_events: usize,
+	pub processed_events: usize,
+}
 
 /// Trait for event database operations
 #[async_trait::async_trait]

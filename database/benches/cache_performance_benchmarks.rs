@@ -1,11 +1,11 @@
-use std::str::FromStr;
+use std::{hint::black_box, str::FromStr};
 
 use ::database::{
 	database::traits::{AspectStructure, DatabaseStructure, Inputs, Outputs}, Database, DatasetId, InputMeasurement
 };
 use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use splimes::{Resolution, Spline};
 use tokio::runtime::Runtime;
 use uuid::Uuid;

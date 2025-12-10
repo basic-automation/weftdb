@@ -88,15 +88,36 @@ pub trait AspectStructure {
 
 	async fn wireframe_patterns_tables(conn: &Connection) -> Result<()>;
 
-	/// get events database
+	/// get events database (legacy - same as `unprocessed_events`)
 	async fn events(&mut self) -> Result<turso::Database>;
 
-	/// set events database
+	/// set events database (legacy - same as `set_unprocessed_events`)
 	fn set_events(&mut self, turso_db: turso::Database);
 
+	/// get events path (legacy - same as `unprocessed_events_path`)
 	fn events_path(&self) -> String;
 
 	async fn set_events_path(&mut self, path: String);
+
+	/// get unprocessed events database
+	async fn unprocessed_events(&mut self) -> Result<turso::Database>;
+
+	/// set unprocessed events database
+	fn set_unprocessed_events(&mut self, turso_db: turso::Database);
+
+	fn unprocessed_events_path(&self) -> String;
+
+	async fn set_unprocessed_events_path(&mut self, path: String);
+
+	/// get processed events database
+	async fn processed_events(&mut self) -> Result<turso::Database>;
+
+	/// set processed events database
+	fn set_processed_events(&mut self, turso_db: turso::Database);
+
+	fn processed_events_path(&self) -> String;
+
+	async fn set_processed_events_path(&mut self, path: String);
 
 	async fn wireframe_events_tables(conn: &Connection) -> Result<()>;
 
@@ -113,6 +134,9 @@ pub trait AspectStructure {
 	async fn wireframe_correlations_tables(conn: &Connection) -> Result<()>;
 
 	async fn new_dictionary(&self, name: &str, description: &str, constraints: &DictionaryConstraints) -> Result<()>;
+
+	/// Get a dictionary database by name
+	async fn dictionary(&mut self, name: &str) -> Result<turso::Database>;
 
 	async fn wireframe_dictionary_tables(&self, conn: &Connection) -> Result<()>;
 }

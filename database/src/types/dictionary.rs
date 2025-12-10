@@ -1,10 +1,9 @@
-use std::fmt::Display;
+use std::{fmt::Display, str::FromStr};
 
 use anyhow::{bail, Result};
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive, Zero};
 use serde::{Deserialize, Serialize};
 use splimes::Spline;
-use std::str::FromStr;
 use uuid::Uuid;
 use wide::f64x4;
 
@@ -97,6 +96,12 @@ impl DictionaryConstraints {
 	}
 }
 
+impl Default for DictionaryConstraints {
+	fn default() -> Self {
+		Self::new(None, None)
+	}
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Steps {
 	count: usize,
@@ -152,55 +157,55 @@ pub enum VariablilityType {
 }
 
 impl Display for VariablilityType {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                match self {
-                        Self::MaximumStatic(var) => write!(f, "MaximumStatic({})", var.value()),
-                        Self::AverageStatic(var) => write!(f, "AverageStatic({})", var.value()),
-                        Self::AbsoluteMaximumStatic(var) => write!(f, "AbsoluteMaximumStatic({})", var.value()),
-                        Self::AbsoluteAverageStatic(var) => write!(f, "AbsoluteAverageStatic({})", var.value()),
-                        Self::MaximumPercentile(var) => write!(f, "MaximumPercentile({})", var.value()),
-                        Self::AveragePercentile(var) => write!(f, "AveragePercentile({})", var.value()),
-                        Self::AbsoluteMaximumPercentile(var) => write!(f, "AbsoluteMaximumPercentile({})", var.value()),
-                        Self::AbsoluteAveragePercentile(var) => write!(f, "AbsoluteAveragePercentile({})", var.value()),
-                        Self::SumStatic(var) => write!(f, "SumStatic({})", var.value()),
-                        Self::SumPercentile(var) => write!(f, "SumPercentile({})", var.value()),
-                        Self::AbsoluteSumStatic(var) => write!(f, "AbsoluteSumStatic({})", var.value()),
-                        Self::AbsoluteSumPercentile(var) => write!(f, "AbsoluteSumPercentile({})", var.value()),
-                }
-        }
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::MaximumStatic(var) => write!(f, "MaximumStatic({})", var.value()),
+			Self::AverageStatic(var) => write!(f, "AverageStatic({})", var.value()),
+			Self::AbsoluteMaximumStatic(var) => write!(f, "AbsoluteMaximumStatic({})", var.value()),
+			Self::AbsoluteAverageStatic(var) => write!(f, "AbsoluteAverageStatic({})", var.value()),
+			Self::MaximumPercentile(var) => write!(f, "MaximumPercentile({})", var.value()),
+			Self::AveragePercentile(var) => write!(f, "AveragePercentile({})", var.value()),
+			Self::AbsoluteMaximumPercentile(var) => write!(f, "AbsoluteMaximumPercentile({})", var.value()),
+			Self::AbsoluteAveragePercentile(var) => write!(f, "AbsoluteAveragePercentile({})", var.value()),
+			Self::SumStatic(var) => write!(f, "SumStatic({})", var.value()),
+			Self::SumPercentile(var) => write!(f, "SumPercentile({})", var.value()),
+			Self::AbsoluteSumStatic(var) => write!(f, "AbsoluteSumStatic({})", var.value()),
+			Self::AbsoluteSumPercentile(var) => write!(f, "AbsoluteSumPercentile({})", var.value()),
+		}
+	}
 }
 
 impl FromStr for VariablilityType {
-        type Err = anyhow::Error;
+	type Err = anyhow::Error;
 
-        fn from_str(s: &str) -> Result<Self, Self::Err> {
-                let parts: Vec<&str> = s.trim_end_matches(')').split('(').collect();
-                if parts.len() != 2 {
-                        bail!("Invalid VariabilityType format");
-                }
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		let parts: Vec<&str> = s.trim_end_matches(')').split('(').collect();
+		if parts.len() != 2 {
+			bail!("Invalid VariabilityType format");
+		}
 
-                let var_type = parts[0];
-                let value_str = parts[1];
-                let value = BigDecimal::from_str(value_str)?;
+		let var_type = parts[0];
+		let value_str = parts[1];
+		let value = BigDecimal::from_str(value_str)?;
 
-                let variability = Variability::new(value);
+		let variability = Variability::new(value);
 
-                match var_type {
-                        "MaximumStatic" => Ok(Self::MaximumStatic(variability)),
-                        "AverageStatic" => Ok(Self::AverageStatic(variability)),
-                        "AbsoluteMaximumStatic" => Ok(Self::AbsoluteMaximumStatic(variability)),
-                        "AbsoluteAverageStatic" => Ok(Self::AbsoluteAverageStatic(variability)),
-                        "MaximumPercentile" => Ok(Self::MaximumPercentile(variability)),
-                        "AveragePercentile" => Ok(Self::AveragePercentile(variability)),
-                        "AbsoluteMaximumPercentile" => Ok(Self::AbsoluteMaximumPercentile(variability)),
-                        "AbsoluteAveragePercentile" => Ok(Self::AbsoluteAveragePercentile(variability)),
-                        "SumStatic" => Ok(Self::SumStatic(variability)),
-                        "SumPercentile" => Ok(Self::SumPercentile(variability)),
-                        "AbsoluteSumStatic" => Ok(Self::AbsoluteSumStatic(variability)),
-                        "AbsoluteSumPercentile" => Ok(Self::AbsoluteSumPercentile(variability)),
-                        _ => bail!("Unknown VariabilityType: {var_type}"),
-                }
-        }
+		match var_type {
+			"MaximumStatic" => Ok(Self::MaximumStatic(variability)),
+			"AverageStatic" => Ok(Self::AverageStatic(variability)),
+			"AbsoluteMaximumStatic" => Ok(Self::AbsoluteMaximumStatic(variability)),
+			"AbsoluteAverageStatic" => Ok(Self::AbsoluteAverageStatic(variability)),
+			"MaximumPercentile" => Ok(Self::MaximumPercentile(variability)),
+			"AveragePercentile" => Ok(Self::AveragePercentile(variability)),
+			"AbsoluteMaximumPercentile" => Ok(Self::AbsoluteMaximumPercentile(variability)),
+			"AbsoluteAveragePercentile" => Ok(Self::AbsoluteAveragePercentile(variability)),
+			"SumStatic" => Ok(Self::SumStatic(variability)),
+			"SumPercentile" => Ok(Self::SumPercentile(variability)),
+			"AbsoluteSumStatic" => Ok(Self::AbsoluteSumStatic(variability)),
+			"AbsoluteSumPercentile" => Ok(Self::AbsoluteSumPercentile(variability)),
+			_ => bail!("Unknown VariabilityType: {var_type}"),
+		}
+	}
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

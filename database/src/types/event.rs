@@ -53,6 +53,12 @@ impl Manifestation {
 		Self { id: ManifestationId::new(), dataset_id, start, end }
 	}
 
+	/// Create a manifestation with a specific ID (for loading from database)
+	#[must_use]
+	pub const fn with_id(id: ManifestationId, dataset_id: Uuid, start: DateTime<Utc>, end: DateTime<Utc>) -> Self {
+		Self { id, dataset_id, start, end }
+	}
+
 	/// Get the duration of this manifestation
 	#[must_use]
 	pub fn duration(&self) -> chrono::Duration {
@@ -188,9 +194,9 @@ pub struct Event {
 
 impl Event {
 	#[must_use]
-	pub fn new(name: String, description: Option<String>) -> Self {
-		let id = EventID::new();
-		Self { id, name: EventName::new(name), description, manifestations: HashMap::new() }
+	pub fn new(id: Option<EventID>, name: String, description: Option<String>, manifestations: Option<HashMap<ManifestationId, Manifestation>>) -> Self {
+		let id = id.unwrap_or_default();
+		Self { id, name: EventName::new(name), description, manifestations: manifestations.unwrap_or_default() }
 	}
 
 	pub fn add_manifestation(&mut self, manifestation: Manifestation) {

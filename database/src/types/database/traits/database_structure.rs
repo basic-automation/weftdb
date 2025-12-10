@@ -153,12 +153,24 @@ pub trait DatabaseStructure {
 	/// get events db path by aspect id
 	async fn get_events_db_path(&self, aspect_id: &AspectId) -> Result<String>;
 
+	/// get unprocessed events db by aspect id
+	async fn get_unprocessed_events_db(&self, aspect_id: &AspectId) -> Result<turso::Database>;
+
+	/// get unprocessed events db path by aspect id
+	async fn get_unprocessed_events_db_path(&self, aspect_id: &AspectId) -> Result<String>;
+
+	/// get processed events db by aspect id
+	async fn get_processed_events_db(&self, aspect_id: &AspectId) -> Result<turso::Database>;
+
+	/// get processed events db path by aspect id
+	async fn get_processed_events_db_path(&self, aspect_id: &AspectId) -> Result<String>;
+
 	/// get correlations db by aspect id
 	async fn get_correlations_db(&self, aspect_id: &AspectId) -> Result<turso::Database>;
 
 	/// get correlations db path by aspect id
 	async fn get_correlations_db_path(&self, aspect_id: &AspectId) -> Result<String>;
 
-        /// get dictionary db by aspect id and dictionary name
-        async fn get_dictionary_db(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<turso::Database>;
+	/// get dictionary db by aspect id and dictionary name
+	async fn get_dictionary_db(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<turso::Database>;
 }

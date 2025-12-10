@@ -1,18 +1,18 @@
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 #![allow(clippy::multiple_crate_versions, clippy::used_underscore_binding, clippy::similar_names, clippy::module_name_repetitions, clippy::module_inception, clippy::cast_precision_loss)]
 
-use std::{collections::HashMap, sync::LazyLock};
+use std::{collections::HashMap, sync::{Arc, LazyLock}};
 
 use anyhow::Result;
 use bigdecimal::{BigDecimal, FromPrimitive, Zero};
 use chrono::Datelike;
 use database::{
-	database::traits::{AspectStructure, DatabaseStructure, EventDatabase, Inputs, Outputs}, AspectId, Database, DictionaryId, Resolution
+	database::traits::{AspectStructure, DatabaseStructure, Inputs, Outputs}, AspectId, Database, DictionaryId, Resolution
 };
 use futures::{future, StreamExt, TryStreamExt};
 use rayon::prelude::*;
 use splimes::Spline;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 pub use types::*;
 
 pub mod batch_utils;
@@ -65,13 +65,19 @@ pub async fn build_processed_batch_queue(database: &Database, aspect_id: &databa
 			let _ = batch.process();
 		});
 
-		// Perform database operations in parallel for the chunk
+		// Limit concurrent database operations to avoid "database is locked" errors
+		// BEGIN CONCURRENT has limits on how many concurrent transactions SQLite can handle
+		let semaphore = Arc::new(Semaphore::new(10)); // Max 10 concurrent DB operations
+
+		// Perform database operations with concurrency limiting
 		let db_tasks: Vec<_> = chunk
 			.iter()
 			.map(|batch| {
+				let sem = Arc::clone(&semaphore);
 				let insert_future = database.insert_processed_batch(aspect_id, batch);
 				let remove_future = database.remove_unprocessed_batch(aspect_id, batch.batch_id());
 				async move {
+					let _permit = sem.acquire().await?;
 					insert_future.await?;
 					remove_future.await?;
 					Ok::<(), anyhow::Error>(())
@@ -214,36 +220,34 @@ pub async fn build_patterns_queue(database: &Database, aspect_id: &database::Asp
 /// - Memory calculation fails
 pub async fn load_dictionary(database: &Database, aspect_id: &database::AspectId, dictionary: &mut Dictionary) -> Result<()> {
 	// Check if dictionary metadata exists, create it if not
-	match database.get_dictionary_metadata(dictionary.name()).await {
+	match database.get_dictionary_metadata(aspect_id, dictionary.name()).await {
 		Ok(Some(_)) => {
 			// Dictionary metadata exists, proceed normally
 		}
 		Ok(None) => {
 			// Dictionary metadata doesn't exist, create it
-			let constraints_json = serde_json::json!({
-				"steps": dictionary.constraints().steps().as_ref().map(|s| serde_json::json!({
-					"count": s.count(),
-					"interpolation": s.interpolation()
-				})),
-				"variabilities": dictionary.constraints().variabilities().as_ref().map(|v| serde_json::json!(v))
-			});
+			let metadata = database::DictionaryMetadata {
+				id: DictionaryId::new(),
+				name: dictionary.name().to_string(),
+				description: dictionary.description().to_string(),
+				constraints: dictionary.constraints().clone(),
+			};
 
 			// Store dictionary metadata
-			database.store_dictionary_metadata(dictionary.name(), dictionary.description(), &constraints_json).await?;
+			database.set_dictionary_metadata(aspect_id, dictionary.name(), &metadata).await?;
 		}
 		Err(e) => {
 			// If dictionary metadata retrieval fails, try to create it anyway
 			println!("Warning: Failed to check dictionary metadata ({e}), attempting to create");
-			let constraints_json = serde_json::json!({
-				"steps": dictionary.constraints().steps().as_ref().map(|s| serde_json::json!({
-					"count": s.count(),
-					"interpolation": s.interpolation()
-				})),
-				"variabilities": dictionary.constraints().variabilities().as_ref().map(|v| serde_json::json!(v))
-			});
+			let metadata = database::DictionaryMetadata {
+				id: DictionaryId::new(),
+				name: dictionary.name().to_string(),
+				description: dictionary.description().to_string(),
+				constraints: dictionary.constraints().clone(),
+			};
 
 			// Try to store dictionary metadata - if this fails, the database might not support it yet
-			if let Err(store_err) = database.store_dictionary_metadata(dictionary.name(), dictionary.description(), &constraints_json).await {
+			if let Err(store_err) = database.set_dictionary_metadata(aspect_id, dictionary.name(), &metadata).await {
 				println!("Warning: Failed to store dictionary metadata: {store_err}");
 				println!("Continuing without dictionary metadata (dictionary will still function)");
 			}
@@ -251,8 +255,11 @@ pub async fn load_dictionary(database: &Database, aspect_id: &database::AspectId
 	}
 
 	// Get processed patterns from the specific dictionary - handle case where dictionary doesn't exist
-	let patterns = match database.get_patterns_from_dictionary(dictionary.name(), aspect_id).await {
-		Ok(patterns) => patterns,
+	let patterns: Vec<database::Pattern> = match database.get_dictionary_patterns(aspect_id, dictionary.name()).await {
+		Ok(stream) => stream.try_collect().await.unwrap_or_else(|e| {
+			println!("Warning: Failed to collect patterns from dictionary '{}': {}", dictionary.name(), e);
+			Vec::new()
+		}),
 		Err(e) => {
 			println!("Warning: Failed to get patterns from dictionary '{}': {}", dictionary.name(), e);
 			println!("Dictionary may not exist yet - returning empty pattern list");
@@ -445,7 +452,7 @@ pub async fn create_event_and_manifestations(database: &Database, aspect: &Aspec
 	// Sort points by timestamp to ensure proper chronological order
 	points.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
 
-	let mut event = Event::new(format!("5% Monthly Price Increase - {aspect}"), Some(format!("Detects when price increases 5% or more from start to end of month for aspect {aspect}")));
+	let mut event = Event::new(None, format!("5% Monthly Price Increase - {aspect}"), Some(format!("Detects when price increases 5% or more from start to end of month for aspect {aspect}")), None);
 	let threshold_percentage = BigDecimal::from_f64(0.05).unwrap(); // 5% threshold
 
 	// Group points by month and analyze each month
@@ -492,7 +499,7 @@ pub async fn create_event_and_manifestations(database: &Database, aspect: &Aspec
 
 	// Store all detected events in the database
 	if !event.manifestations().is_empty() {
-		database.store_event(&event).await?;
+		database.insert_unprocessed_event(aspect, &event).await?;
 		println!("Stored event '{}' with {} manifestations in database", event.name(), event.manifestations().len());
 	}
 
@@ -511,8 +518,8 @@ pub async fn create_event_and_manifestations(database: &Database, aspect: &Aspec
 /// - Correlation creation fails
 pub async fn create_correlations_for_events(database: &Database, dictionary: &Dictionary, aspect_id: &AspectId) -> Result<()> {
 	// Get patterns directly from database (not from dictionary object which may have filtered patterns)
-	let patterns = database.get_patterns_from_dictionary(dictionary.name(), aspect_id).await?;
-	let events = database.get_unprocessed_events().await?;
+	let patterns: Vec<database::Pattern> = database.get_dictionary_patterns(aspect_id, dictionary.name()).await?.try_collect().await?;
+	let events: Vec<database::Event> = database.get_unprocessed_events(aspect_id).await?.try_collect().await?;
 	let aspect = database.get_aspect(aspect_id).await?;
 
 	// Exit early if no patterns or events to correlate
@@ -530,7 +537,7 @@ pub async fn create_correlations_for_events(database: &Database, dictionary: &Di
 			let error_rate = HashMap::new();
 
 			let correlation = Correlation::new(None, DictionaryId::from_uuid(pattern.occurrences()[0].database_info().id().as_uuid()), aspect.subject_id(), aspect_id, pattern.id(), event.id().clone(), error_rate, pattern.occurrences().clone());
-			database.store_correlation(&correlation).await?;
+			database.insert_correlation(aspect_id, &correlation).await?;
 		}
 	}
 
@@ -551,8 +558,8 @@ pub async fn create_correlations_for_events(database: &Database, dictionary: &Di
 /// - Signal creation fails
 pub async fn create_signals(database: &Database, aspect_id: &AspectId) -> Result<()> {
 	// Get correlations and events from database
-	let correlations = database.get_correlations(aspect_id).await?;
-	let events = database.get_unprocessed_events().await?;
+	let correlations: Vec<database::Correlation> = Outputs::get_correlations(database, aspect_id).await?.try_collect().await?;
+	let events: Vec<database::Event> = Outputs::get_unprocessed_events(database, aspect_id).await?.try_collect().await?;
 
 	// Exit early if no correlations or events to process
 	if correlations.is_empty() || events.is_empty() {
@@ -682,8 +689,8 @@ pub async fn filter_expired_signals_at_time(database: &Database, aspect_id: &Asp
 	}
 
 	// Get events and correlations once to avoid database locks during processing
-	let events_lock = database.get_unprocessed_events().await?;
-	let correlations = database.get_correlations(aspect_id).await?;
+	let events: Vec<database::Event> = Outputs::get_unprocessed_events(database, aspect_id).await?.try_collect().await?;
+	let correlations: Vec<database::Correlation> = Outputs::get_correlations(database, aspect_id).await?.try_collect().await?;
 
 	// Collect signals to remove
 	let mut signals_to_remove = Vec::new();
@@ -703,11 +710,11 @@ pub async fn filter_expired_signals_at_time(database: &Database, aspect_id: &Asp
 
 		// If we found the event, check for expiration
 		if let Some(event_id) = signal_event_id {
-			if let Some(event) = events_lock.iter().find(|e| *e.id() == event_id) {
+			if let Some(event) = events.iter().find(|e| *e.id() == event_id) {
 				// Find the manifestation this signal was created from (the baseline)
-				if let Some(base_manifestation) = event.manifestations().values().find(|m| m.id() == signal.manifestation_id()) {
+				if let Some((_, base_manifestation)) = event.manifestations().iter().find(|(_, m)| m.id() == signal.manifestation_id()) {
 					// Find the next manifestation after the baseline that this signal is predicting
-					let mut future_manifestations: Vec<_> = event.manifestations().values().filter(|manifestation| manifestation.start() > base_manifestation.end()).collect(); // Sort by start date to find the very next manifestation
+					let mut future_manifestations: Vec<&database::Manifestation> = event.manifestations().iter().filter(|(_, manifestation)| manifestation.start() > base_manifestation.end()).map(|(_, m)| m).collect(); // Sort by start date to find the very next manifestation
 					future_manifestations.sort_by(|a, b| a.start().cmp(b.start()));
 
 					// If there's a next manifestation, check if we've passed the prediction point
@@ -757,7 +764,7 @@ pub async fn filter_expired_signals_at_time(database: &Database, aspect_id: &Asp
 
 	// Batch update all modified correlations to avoid database lock conflicts
 	for correlation in correlations_to_update {
-		database.update_correlation(&correlation).await?;
+		database.update_correlation(aspect_id, &correlation).await?;
 	}
 
 	let remaining_count = signals_lock.len();
@@ -779,6 +786,7 @@ mod tests {
 	use bigdecimal::{BigDecimal, FromPrimitive};
 	use chrono::{TimeZone, Utc};
 	use database::{AspectId, Database, DatasetId, InputMeasurement, Resolution, DEFAULT_DATA_DIR};
+	use rand::Rng;
 	use serde_json::json;
 	use serial_test::serial;
 	use splimes::Spline;
@@ -851,7 +859,7 @@ mod tests {
 		// print random batch from processed queue for verification
 		let length = processed_batches.len();
 		if length > 0 {
-			let random_index = rand::random::<usize>() % length;
+			let random_index = rand::rng().random_range(0..length);
 			println!("Random processed batch: {}", json!(&processed_batches[random_index]));
 			output_denk_format_batch(&processed_batches[random_index]);
 		}
@@ -889,17 +897,17 @@ mod tests {
 		let length = processed_batches.len();
 		println!("Processed batches count: {length}");
 		if length > 0 {
-			let random_index = rand::random::<usize>() % length;
+			let random_index = rand::rng().random_range(0..length);
 			println!("Random processed batch: {}", json!(&processed_batches[random_index]));
 			output_denk_format_batch(&processed_batches[random_index]);
 		}
 
 		build_patterns_queue(&database, &aspect_id, &mut dictionary).await?;
-		let patterns = database.get_patterns_from_dictionary("TestDictionary", &aspect.id()).await?;
+		let patterns: Vec<database::Pattern> = Outputs::get_dictionary_patterns(&database, &aspect.id(), "TestDictionary").await?.try_collect().await?;
 		let length = patterns.len();
 		println!("Patterns count: {length}");
 		if length > 0 {
-			let random_index = rand::random::<usize>() % length;
+			let random_index = rand::rng().random_range(0..length);
 			println!("Random pattern: {}", json!(&patterns[random_index]));
 			output_denk_format_pattern(&patterns[random_index]);
 		}
@@ -920,9 +928,18 @@ mod tests {
 		create_correlations_for_events(&database, &dictionary, &aspect.id()).await?;
 		println!("Time taken for create_correlations_for_events: {:?}", timer.elapsed());
 
-		// print the number of correlations with more than 1 occurrence
-		let correlations = database.get_correlations(&aspect.id()).await?;
-		println!("Number of correlations with more than 1 occurrence: {}", correlations.iter().filter(|correlation| correlation.occurrences().len() > 1).count());
+		// print the number of correlations with more than 1 occurrence (using streaming)
+		use futures::StreamExt;
+		let mut correlation_stream = database.get_correlations(&aspect.id()).await?;
+		let mut multi_occurrence_count = 0usize;
+		while let Some(result) = correlation_stream.next().await {
+			if let Ok(correlation) = result {
+				if correlation.occurrences().len() > 1 {
+					multi_occurrence_count += 1;
+				}
+			}
+		}
+		println!("Number of correlations with more than 1 occurrence: {multi_occurrence_count}");
 
 		// print the number of patterns with more than 1 occurrence
 		println!("Number of patterns with more than 1 occurrence: {}", dictionary.patterns().iter().filter(|p| p.occurrences().len() > 1).count());
@@ -959,7 +976,7 @@ mod tests {
 
 		// If we found a signal, check and potentially modify its correlation's error rates
 		if let (Some(signal), Some(correlation_id)) = (&random_signal, &correlation_to_modify) {
-			if let Some(mut correlation) = database.get_correlation_by_id(correlation_id, &aspect.id()).await? {
+			if let Ok(mut correlation) = database.get_correlation(&aspect.id(), correlation_id).await {
 				// Check if error rates are zero
 				let has_nonzero = correlation.error_rate().values().any(|err| !err.value().is_zero());
 
@@ -968,7 +985,7 @@ mod tests {
 					correlation.set_error_rate(signal.signal_type().clone(), database::Distance::new(BigDecimal::from_f64(0.1).unwrap(), splimes::Resolution::Seconds));
 
 					// Update the correlation in the database
-					database.update_correlation(&correlation).await?;
+					database.update_correlation(&aspect.id(), &correlation).await?;
 				}
 			}
 		}
@@ -981,7 +998,7 @@ mod tests {
 		let random_manifestation_id = random_signal.manifestation_id().clone();
 		let random_event_id = random_signal.event_id().clone();
 		let signal_type = random_signal.signal_type().clone();
-		let random_correlation = database.get_correlation_by_id(&random_correlation_id, &aspect.id()).await?.ok_or_else(|| anyhow::anyhow!("No correlation found for signal"))?;
+		let random_correlation = database.get_correlation(&aspect.id(), &random_correlation_id).await?;
 		let random_correlation_error_rate = random_correlation.error_rate().clone();
 
 		// Get the error rate for the specific signal type we're using
@@ -1030,7 +1047,7 @@ mod tests {
 		let length = processed_batches.len();
 		println!("Processed batches count: {length}");
 		if length > 0 {
-			let random_index = rand::random::<usize>() % length;
+			let random_index = rand::rng().random_range(0..length);
 			println!("Random processed batch: {}", json!(&processed_batches[random_index]));
 			output_denk_format_batch(&processed_batches[random_index]);
 		}
@@ -1061,11 +1078,11 @@ mod tests {
 		}
 
 		build_patterns_queue(&db, &aspect.id(), &mut dictionary).await?;
-		let patterns = db.get_patterns_from_dictionary("TestDictionary", &aspect.id()).await?;
+		let patterns: Vec<database::Pattern> = Outputs::get_dictionary_patterns(&db, &aspect.id(), "TestDictionary").await?.try_collect().await?;
 		let length = patterns.len();
 		println!("Patterns count: {length}");
 		if length > 0 {
-			let random_index = rand::random::<usize>() % length;
+			let random_index = rand::rng().random_range(0..length);
 			println!("Random pattern: {}", json!(&patterns[random_index]));
 			output_denk_format_pattern(&patterns[random_index]);
 		}
@@ -1078,9 +1095,18 @@ mod tests {
 		create_correlations_for_events(&db, &dictionary, &aspect.id()).await?;
 		println!("Time taken for create_correlations_for_events: {:?}", timer.elapsed());
 
-		// print the number of correlations with more than 1 occurrence
-		let correlations = db.get_correlations(&aspect.id()).await?;
-		println!("Number of correlations with more than 1 occurrence: {}", correlations.iter().filter(|correlation| correlation.occurrences().len() > 1).count());
+		// print the number of correlations with more than 1 occurrence (using streaming)
+		use futures::StreamExt;
+		let mut correlation_stream = db.get_correlations(&aspect.id()).await?;
+		let mut multi_occurrence_count = 0usize;
+		while let Some(result) = correlation_stream.next().await {
+			if let Ok(correlation) = result {
+				if correlation.occurrences().len() > 1 {
+					multi_occurrence_count += 1;
+				}
+			}
+		}
+		println!("Number of correlations with more than 1 occurrence: {multi_occurrence_count}");
 
 		// print the number of patterns with more than 1 occurrence
 		println!("Number of patterns with more than 1 occurrence: {}", dictionary.patterns().iter().filter(|p| p.occurrences().len() > 1).count());
@@ -1109,7 +1135,7 @@ mod tests {
 		drop(signals_lock);
 
 		// Calculate and print the probability for the Signals in the queue
-		let events = get_events_queue(&db).await?;
+		let events = get_events_queue(&db, &aspect.id()).await?;
 		let event_id_option = events.first().map(|e| e.id().clone());
 		drop(events);
 
@@ -1219,7 +1245,7 @@ mod tests {
 		// create a peak detection event for testing
 		create_peak_detection_events(&db, &test_aspect.id(), &Resolution::Hours, &Spline::Linear, "Peak Detection Test").await.unwrap();
 		println!("Events in database after peak detection:");
-		let events = get_events_queue(&db).await.unwrap();
+		let events = get_events_queue(&db, &test_aspect.id()).await.unwrap();
 		println!("Events in database: {}", events.len());
 		drop(events);
 
@@ -1371,7 +1397,7 @@ mod tests {
 		// Find the global maximum value
 		let global_max = points.iter().map(|p| &p.value).max().unwrap();
 
-		let mut event = Event::new(name.to_string(), Some(format!("Detects peak values (local maxima that are also global maximum) for aspect {aspect}")));
+		let mut event = Event::new(None, name.to_string(), Some(format!("Detects peak values (local maxima that are also global maximum) for aspect {aspect}")), None);
 
 		// Check each point to see if it's a peak
 		for i in 1..points.len() - 1 {
@@ -1399,7 +1425,7 @@ mod tests {
 			println!("No peaks detected in the dataset");
 		} else {
 			let manifestation_count = event.manifestations().len();
-			database.store_event(&event).await?;
+			Inputs::insert_unprocessed_event(database, aspect, &event).await?;
 			println!("Added peak detection event with {manifestation_count} manifestation(s)");
 		}
 
@@ -1407,8 +1433,8 @@ mod tests {
 	}
 
 	#[allow(dead_code)]
-	pub async fn get_events_queue(database: &Database) -> Result<Vec<Event>> {
-		let events = database.get_unprocessed_events().await?;
+	pub async fn get_events_queue(database: &Database, aspect_id: &AspectId) -> Result<Vec<Event>> {
+		let events: Vec<Event> = Outputs::get_unprocessed_events(database, aspect_id).await?.try_collect().await?;
 		Ok(events)
 	}
 

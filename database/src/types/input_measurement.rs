@@ -1,7 +1,6 @@
 use bigdecimal::{BigDecimal, FromPrimitive};
 use chrono::{TimeZone, Utc};
-use fake::Dummy;
-use rand::Rng;
+use fake::Fake;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputMeasurement {
@@ -32,12 +31,14 @@ impl InputMeasurement {
 	pub fn set_value(&mut self, value: BigDecimal) {
 		self.value = value;
 	}
-}
 
-impl<T> Dummy<T> for InputMeasurement {
-	fn dummy_with_rng<R: Rng + ?Sized>(_config: &T, rng: &mut R) -> Self {
-		let timestamp = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap() + chrono::Duration::seconds(rng.gen_range(0..86400));
-		let value = BigDecimal::from_f64(rng.gen_range(0.0..100.0)).unwrap_or_else(|| BigDecimal::from(50));
+	/// Generate a random `InputMeasurement` for testing
+	#[must_use]
+	pub fn random() -> Self {
+		let offset_secs: i64 = fake::Faker.fake();
+		let timestamp = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap() + chrono::Duration::seconds(offset_secs.rem_euclid(86400));
+		let value_f64: f64 = fake::Faker.fake();
+		let value = BigDecimal::from_f64(value_f64.rem_euclid(100.0)).unwrap_or_else(|| BigDecimal::from(50));
 
 		Self { timestamp, value }
 	}

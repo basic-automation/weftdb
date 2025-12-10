@@ -1,11 +1,11 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
 
 use crate::{
-	AspectId, Correlation, Batch, BatchId, Database, DatasetId, Error, Event, EventID, InputMeasurement, Measurement, Pattern, PatternID, aspect, cache::Connection, database::traits::{AspectStructure, Inputs}, types::{
-		TxId, database::{
-			helpers::safe_usize_to_f64, traits::{DatabaseStructure, config::Config, connection::Connection as ConnectionTrait}
-		}
-	}
+	cache::Connection, database::traits::{AspectStructure, Inputs}, types::{
+		database::{
+			helpers::safe_usize_to_f64, traits::{config::Config, connection::Connection as ConnectionTrait, DatabaseStructure}
+		}, TxId
+	}, AspectId, Batch, BatchId, Correlation, CorrelationID, Database, DatasetId, DictionaryMetadata, Error, Event, EventID, InputMeasurement, Measurement, Pattern, PatternID
 };
 
 #[async_trait::async_trait]
@@ -24,21 +24,17 @@ impl Inputs for Database {
 
 		let measurement = Measurement::from_input_measurement(dataset_id, input_measurement);
 
-		// Use INSERT ... ON CONFLICT for atomic upsert with concurrent writes support
-		// This handles the case where a measurement with the same timestamp already exists
-		let upsert_sql = r"
+		// Simple INSERT - no unique constraints with MVCC, duplicates handled at app level
+		let insert_sql = r"
 			INSERT INTO measurements (id, dataset_id, timestamp, value) 
-			VALUES (?, ?, ?, ?) 
-			ON CONFLICT(timestamp) DO UPDATE SET 
-				value = (CAST(excluded.value AS REAL) + CAST(measurements.value AS REAL)) / 2.0,
-				id = excluded.id
+			VALUES (?, ?, ?, ?)
 		";
 
 		// Execute with BEGIN CONCURRENT and retry on lock/conflict
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
-		let res = conn.as_ref().execute(upsert_sql, turso::params![tx_id.as_uuid().to_string(), dataset_id.as_uuid().to_string(), measurement.timestamp().timestamp_millis(), measurement.value().to_string()]).await;
+		let res = conn.as_ref().execute(insert_sql, turso::params![tx_id.as_uuid().to_string(), dataset_id.as_uuid().to_string(), measurement.timestamp().timestamp_millis(), measurement.value().to_string()]).await;
 		match res {
-			Ok(_) => println!("Successfully upserted measurement for dataset {dataset_id}"),
+			Ok(_) => println!("Successfully inserted measurement for dataset {dataset_id}"),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("SQL execution failure 1: `{e}`"));
@@ -47,16 +43,12 @@ impl Inputs for Database {
 
 		let _ = Self::commit_concurrent(&conn).await;
 
-		// Record the transaction - we don't know if it was an insert or update, but that's okay
-		self.record_transaction(&format!("Captured measurement at {} with value {} for dataset {} (upsert operation)", measurement.timestamp(), measurement.value(), dataset_id)).await
+		self.record_transaction(&format!("Captured measurement at {} with value {} for dataset {}", measurement.timestamp(), measurement.value(), dataset_id)).await
 	}
 
 	/// Capture new measurements for a given aspect
-	/// If a measurement with the same timestamp already exists, an error is returned.
+	/// Simple INSERT - duplicates handled at application level
 	/// Uses Turso's concurrent writes feature for better performance.
-	///
-	/// # Errors
-	/// - if measurement with the same timestamp already exists
 	async fn capture_new_measurement(&self, aspect_id: &AspectId, dataset_id: &DatasetId, input_measurement: &InputMeasurement) -> Result<TxId> {
 		let db = self.get_measurement_db(aspect_id).await?;
 		let db_path = self.get_measurement_db_path(aspect_id).await?;
@@ -64,39 +56,29 @@ impl Inputs for Database {
 
 		let measurement = Measurement::from_input_measurement(dataset_id, input_measurement);
 
-		// Use INSERT with ON CONFLICT DO NOTHING, then check if any rows were affected
-		// This is atomic and handles concurrent writes safely
+		// Simple INSERT - no unique constraints with MVCC
 		let insert_sql = r"
 			INSERT INTO measurements (id, dataset_id, timestamp, value) 
-			VALUES (?, ?, ?, ?) 
-			ON CONFLICT(timestamp) DO NOTHING
+			VALUES (?, ?, ?, ?)
 		";
 
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
 		let res = conn.as_ref().execute(insert_sql, turso::params![tx_id.as_uuid().to_string(), dataset_id.as_uuid().to_string(), measurement.timestamp().timestamp_millis(), measurement.value().to_string()]).await;
-		let rows_affected = match res {
-			Ok(rows) => {
-				println!("Inserted {rows} rows");
-				rows
-			}
+		match res {
+			Ok(rows) => println!("Inserted {rows} rows"),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("SQL execution failure 2: `{e}`"));
 			}
-		};
+		}
 
 		let _ = Self::commit_concurrent(&conn).await;
-
-		// Check if the insert actually happened (rows_affected > 0 means it was inserted)
-		if rows_affected == 0 {
-			bail!("Measurement with timestamp {} already exists", measurement.timestamp());
-		}
 
 		self.record_transaction(&format!("Inserted new measurement at {} for dataset {}", measurement.timestamp(), dataset_id)).await
 	}
 
 	/// Batch insert measurements for better performance using Turso's concurrent writes
-	/// Uses INSERT ... ON CONFLICT for automatic conflict resolution with averaging
+	/// Uses simple INSERT - app handles duplicates since MVCC doesn't support unique constraints
 	///
 	/// # Errors
 	/// - if aspect not found
@@ -174,12 +156,7 @@ impl Inputs for Database {
 			placeholders_str.push_str(placeholder_str);
 		}
 
-		let bulk_sql = format!(
-			"INSERT INTO measurements (id, dataset_id, timestamp, value) VALUES {placeholders_str} 
-			 ON CONFLICT(timestamp) DO UPDATE SET 
-			 	value = (CAST(excluded.value AS REAL) + CAST(measurements.value AS REAL)) / 2.0,
-			 	id = excluded.id"
-		);
+		let bulk_sql = format!("INSERT INTO measurements (id, dataset_id, timestamp, value) VALUES {placeholders_str}");
 
 		// Flatten all parameters into a single vector with pre-allocated capacity
 		let dataset_id_str = dataset_id.as_uuid().to_string();
@@ -218,30 +195,26 @@ impl Inputs for Database {
 		for (i, m) in chunk.iter().enumerate() {
 			let tx_id = &all_tx_ids[tx_id_offset + i];
 			let measurement = Measurement::from_input_measurement(dataset_id, m);
+			// Simple INSERT - no unique constraints with MVCC
 			let insert_sql = r"
 				INSERT INTO measurements (id, dataset_id, timestamp, value) 
-				VALUES (?, ?, ?, ?) 
-				ON CONFLICT(timestamp) DO NOTHING
+				VALUES (?, ?, ?, ?)
 			";
 
 			let conn = Self::begin_concurrent(db, db_path, Some(self.cache.clone())).await?;
 			let res = conn.as_ref().execute(insert_sql, turso::params![tx_id.as_uuid().to_string(), dataset_id.as_uuid().to_string(), measurement.timestamp().timestamp_millis(), measurement.value().to_string()]).await;
-			let rows_affected = match res {
+			match res {
 				Ok(rows) => {
 					println!("Inserted measurement for tx_id {tx_id}: {rows} rows affected");
-					rows
+					successful.push(*tx_id);
 				}
 				Err(e) => {
 					Self::rollback_concurrent(&conn).await?;
 					return Err(anyhow::anyhow!("Failed to insert in chunk: {e}"));
 				}
-			};
+			}
 
 			let _ = Self::commit_concurrent(&conn).await;
-
-			if rows_affected > 0 {
-				successful.push(*tx_id);
-			}
 		}
 
 		Ok(successful)
@@ -256,9 +229,9 @@ impl Inputs for Database {
 		let db = self.get_unprocessed_batches_db(aspect_id).await?;
 		let db_path = self.get_unprocessed_batches_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		// Simple INSERT - no unique constraints with MVCC
 		let insert_sql = r"
 			INSERT INTO batches (id, aspect_id, database_id, size, resolution, measurements, batch_hash, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(id) DO NOTHING
 		";
 
 		let batch_metadata_size: i64 = match i64::try_from(batch.metadata.size) {
@@ -268,7 +241,7 @@ impl Inputs for Database {
 			}
 		};
 
-		let res = conn.as_ref().execute(insert_sql, turso::params![batch_id.clone(), aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string(), batch_metadata_size, format!("{:?}", batch.metadata.resolution), measurements_json.clone(), batch_hash.clone(), "unprocessed", chrono::Utc::now().timestamp_millis()]).await;
+		let res = conn.as_ref().execute(insert_sql, turso::params![batch_id.clone(), aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string(), batch_metadata_size, format!("{}", batch.metadata.resolution), measurements_json.clone(), batch_hash.clone(), "unprocessed", chrono::Utc::now().timestamp_millis()]).await;
 		match res {
 			Ok(_) => println!("Inserted unprocessed batch {batch_id}"),
 			Err(e) => {
@@ -313,7 +286,7 @@ impl Inputs for Database {
 				}
 			};
 
-			let res = conn.as_ref().execute(insert_sql, turso::params![b.id().to_string(), b.metadata.aspect.as_uuid().to_string(), self.id().as_uuid().to_string(), batch_metadata_size, format!("{:?}", b.metadata.resolution), "{}", batch_measurements_len, "stub_hash", "unprocessed", chrono::Utc::now().timestamp_millis()]).await;
+			let res = conn.as_ref().execute(insert_sql, turso::params![b.id().to_string(), b.metadata.aspect.as_uuid().to_string(), self.id().as_uuid().to_string(), batch_metadata_size, format!("{}", b.metadata.resolution), "{}", batch_measurements_len, "stub_hash", "unprocessed", chrono::Utc::now().timestamp_millis()]).await;
 			match res {
 				Ok(_) => println!("Inserted batch chunk {}", b.id()),
 				Err(e) => {
@@ -398,7 +371,7 @@ impl Inputs for Database {
 		let db = self.get_processed_batches_db(aspect_id).await?;
 		let db_path = self.get_processed_batches_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
-		let insert_sql = r"INSERT INTO batches (id, aspect_id, database_id, size, resolution, measurements, batch_hash, status, created_at, processed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+		let insert_sql = r"INSERT INTO batches (id, aspect_id, database_id, size, resolution, measurements, batch_hash, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
 		let batch_metadata_size: i64 = match i64::try_from(batch.metadata.size) {
 			Ok(size) => size,
@@ -408,7 +381,7 @@ impl Inputs for Database {
 			}
 		};
 
-		let res = conn.as_ref().execute(insert_sql, turso::params![batch_id.clone(), aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string(), batch_metadata_size, format!("{:?}", batch.metadata.resolution), measurements_json.clone(), batch_hash.clone(), "processed", chrono::Utc::now().timestamp_millis(), chrono::Utc::now().timestamp_millis()]).await;
+		let res = conn.as_ref().execute(insert_sql, turso::params![batch_id.clone(), aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string(), batch_metadata_size, format!("{}", batch.metadata.resolution), measurements_json.clone(), batch_hash.clone(), "processed", chrono::Utc::now().timestamp_millis()]).await;
 		match res {
 			Ok(_) => println!("Inserted processed batch {batch_id}"),
 			Err(e) => {
@@ -484,7 +457,7 @@ impl Inputs for Database {
 		let db_path = self.get_processed_batches_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
 
-		let delete_sql = r"DELETE FROM batches WHERE processed_at < ?";
+		let delete_sql = r"DELETE FROM batches WHERE created_at < ?";
 
 		let res = conn.as_ref().execute(delete_sql, turso::params![older_than.timestamp_millis()]).await;
 		match res {
@@ -702,260 +675,524 @@ impl Inputs for Database {
 		Ok(TxId::new())
 	}
 
-        async fn set_dictionary_metadata(&self, aspect_id: &AspectId, dictionary_name: &str, metadata: &DictionaryMetadata) -> Result<TxId> {
-                let tx_id = TxId::new();
-                let aspect = self.get_aspect(aspect_id).await?;
-                let db_name = &self.name;
-                let db_path = Self::aspect_dictionaries_db_path(db_name.as_str(), aspect.subject_name(), aspect.name(), dictionary_name);
-                let db = Self::get_or_create_turso_database(&db_path).await?;
-                let conn = Self::begin_concurrent(&db, db_name, Some(self.cache.clone())).await?;
+	async fn set_dictionary_metadata(&self, aspect_id: &AspectId, dictionary_name: &str, metadata: &DictionaryMetadata) -> Result<TxId> {
+		let tx_id = TxId::new();
+		let aspect = self.get_aspect(aspect_id).await?;
+		let db_name = &self.name;
+		let db_path = Self::aspect_dictionaries_db_path(db_name.as_str(), aspect.subject_name(), aspect.name(), dictionary_name);
+		let db = Self::get_or_create_turso_database(&db_path).await?;
+		let conn = Self::begin_concurrent(&db, db_name, Some(self.cache.clone())).await?;
 
-                // Upsert into dictionary metadata table
-                let upsert_sql = r"INSERT INTO dictionary_metadata (name, description, created_at) VALUES (?, ?, ?)
-                                  ON CONFLICT(name) DO UPDATE SET description = excluded.description, created_at = excluded.created_at";
-                let res = conn.as_ref().execute(upsert_sql, turso::params![dictionary_name, metadata.description.clone(), chrono::Utc::now().timestamp_millis()]).await;
-                match res {
-                        Ok(_) => (),
-                        Err(e) => {
-                                eprintln!("Failed to set metadata for dictionary '{dictionary_name}' for aspect {aspect_id}: {e}");
-                                Self::rollback_concurrent(&conn).await?;
-                                return Err(anyhow::anyhow!("Failed to set dictionary metadata: {e}"));
-                        }
-                }
+		// Ensure dictionary tables exist (create if not exists)
+		// Note: No PRIMARY KEY on TEXT columns or indexes to support MVCC
+		conn.as_ref().execute(r"CREATE TABLE IF NOT EXISTS dictionary_metadata (
+			id TEXT NOT NULL,
+			name TEXT NOT NULL,
+			description TEXT,
+			created_at INTEGER NOT NULL
+		)", turso::params![]).await?;
 
-                let _ = Self::commit_concurrent(&conn).await;
+		conn.as_ref().execute(r"CREATE TABLE IF NOT EXISTS dictionary_constraints (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			dictionary_id TEXT NOT NULL,
+			steps_count INTEGER,
+			steps_interpolation TEXT
+		)", turso::params![]).await?;
 
-                let log = format!("Set metadata for dictionary '{}' for aspect {}", dictionary_name, aspect_id);
-                let _ = self.record_transaction(&log).await?;
+		conn.as_ref().execute(r"CREATE TABLE IF NOT EXISTS dictionary_variabilities (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			dictionary_id TEXT NOT NULL,
+			variability_type TEXT NOT NULL,
+			variability_value TEXT NOT NULL
+		)", turso::params![]).await?;
 
-                Ok(tx_id)
-        }
+		conn.as_ref().execute(r"CREATE TABLE IF NOT EXISTS dictionary_patterns (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			dictionary_id TEXT NOT NULL,
+			pattern_id TEXT NOT NULL,
+			added_at INTEGER NOT NULL
+		)", turso::params![]).await?;
 
-        /// insert pattern into dictionary for a given aspect
-        async fn insert_pattern_into_dictionary(&self, aspect_id: &AspectId, dictionary_name: &str, pattern: &Pattern) -> Result<TxId> {
-                let tx_id = TxId::new();
-                let aspect = self.get_aspect(aspect_id).await?;
-                let db_name = &self.name;
-                let db_path = Self::aspect_dictionaries_db_path(db_name.as_str(), aspect.subject_name(), aspect.name(), dictionary_name);
-                let db = Self::get_or_create_turso_database(&db_path).await?;
-                let conn = Self::begin_concurrent(&db, db_name, Some(self.cache.clone())).await?;
+		// Insert dictionary metadata (no ON CONFLICT since no unique constraint - app handles duplicates)
+		let insert_sql = r"INSERT INTO dictionary_metadata (id, name, description, created_at) VALUES (?, ?, ?, ?)";
+		let res = conn.as_ref().execute(insert_sql, turso::params![metadata.id.as_uuid().to_string(), dictionary_name, metadata.description.clone(), chrono::Utc::now().timestamp_millis()]).await;
+		match res {
+			Ok(_) => (),
+			Err(e) => {
+				eprintln!("Failed to set metadata for dictionary '{dictionary_name}' for aspect {aspect_id}: {e}");
+				Self::rollback_concurrent(&conn).await?;
+				return Err(anyhow::anyhow!("Failed to set dictionary metadata: {e}"));
+			}
+		}
 
-                // Insert into dictionary patterns table
-                let insert_sql = r"INSERT INTO dictionary_patterns (id, sum_value, abs_sum_value, max_value, min_value, abs_max_value, avg_value, abs_avg_value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
-                let res = conn.as_ref().execute(insert_sql, turso::params![pattern.id().to_string(), pattern.sum().to_string(), pattern.abs_sum().to_string(), pattern.max().to_string(), pattern.min().to_string(), pattern.abs_max().to_string(), pattern.avg().to_string(), pattern.abs_avg().to_string()]).await;
-                match res {
-                        Ok(_) => (),
-                        Err(e) => {
-                                let id = pattern.id();
-                                eprintln!("Failed to insert pattern '{id}' into dictionary '{dictionary_name}' for aspect {aspect_id}: {e}");
-                                Self::rollback_concurrent(&conn).await?;
-                                return Err(anyhow::anyhow!("Failed to insert pattern into dictionary: {e}"));
-                        }
-                }
+		let _ = Self::commit_concurrent(&conn).await;
 
-                let _ = Self::commit_concurrent(&conn).await;
+		let log = format!("Set metadata for dictionary '{dictionary_name}' for aspect {aspect_id}");
+		let _ = self.record_transaction(&log).await?;
 
-                let log = format!("Inserted pattern '{}' into dictionary '{}' for aspect {}", pattern.id(), dictionary_name, aspect_id);
-                let _ = self.record_transaction(&log).await?;
+		Ok(tx_id)
+	}
 
-                Ok(tx_id)
-        }
+	/// insert pattern into dictionary for a given aspect
+	async fn insert_pattern_into_dictionary(&self, aspect_id: &AspectId, dictionary_name: &str, pattern: &Pattern) -> Result<TxId> {
+		let tx_id = TxId::new();
+		let aspect = self.get_aspect(aspect_id).await?;
+		let db_name = &self.name;
+		let db_path = Self::aspect_dictionaries_db_path(db_name.as_str(), aspect.subject_name(), aspect.name(), dictionary_name);
+		let db = Self::get_or_create_turso_database(&db_path).await?;
+		let conn = Self::begin_concurrent(&db, db_name, Some(self.cache.clone())).await?;
 
-        /// Capture multiple patterns into dictionary for a given aspect
-        async fn batch_insert_patterns_into_dictionary(&self, aspect_id: &AspectId, dictionary_name: &str, patterns: Vec<Pattern>) -> Result<Vec<TxId>> {
-                let mut tx_ids = Vec::new();
-                for p in patterns {
-                        let tx = self.insert_pattern_into_dictionary(aspect_id, dictionary_name, &p).await?;
-                        tx_ids.push(tx);
-                }
-                Ok(tx_ids)
-        }
+		// Insert into dictionary patterns table
+		let insert_sql = r"INSERT INTO dictionary_patterns (id, sum_value, abs_sum_value, max_value, min_value, abs_max_value, avg_value, abs_avg_value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+		let res = conn.as_ref().execute(insert_sql, turso::params![pattern.id().to_string(), pattern.sum().to_string(), pattern.abs_sum().to_string(), pattern.max().to_string(), pattern.min().to_string(), pattern.abs_max().to_string(), pattern.avg().to_string(), pattern.abs_avg().to_string()]).await;
+		match res {
+			Ok(_) => (),
+			Err(e) => {
+				let id = pattern.id();
+				eprintln!("Failed to insert pattern '{id}' into dictionary '{dictionary_name}' for aspect {aspect_id}: {e}");
+				Self::rollback_concurrent(&conn).await?;
+				return Err(anyhow::anyhow!("Failed to insert pattern into dictionary: {e}"));
+			}
+		}
 
+		let _ = Self::commit_concurrent(&conn).await;
 
-        //
-        // Correlations
-        //
+		let log = format!("Inserted pattern '{}' into dictionary '{}' for aspect {}", pattern.id(), dictionary_name, aspect_id);
+		let _ = self.record_transaction(&log).await?;
 
-        /// insert correlation for a given aspect
-        async fn insert_correlation(&self, aspect_id: &AspectId, correlation: &Correlation) -> Result<TxId> {
-                let tx_id = TxId::new();
-                let aspect = self.get_aspect(aspect_id).await?;
-                let db = aspect.correlations().await?;
-                let db_path = aspect.correlations_path();
-                let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		Ok(tx_id)
+	}
 
-                // Insert into correlations table
-                let insert_sql = r"INSERT INTO correlations (id, dictionary_id, subject_id, aspect_id, pattern_id, event_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
-                let res = conn.as_ref().execute(insert_sql, turso::params![correlation.id().to_string(), correlation.dictionary_id().to_string(), correlation.subject_id().to_string(), correlation.aspect_id().to_string(), correlation.pattern_id().to_string(), correlation.event_id().to_string(), chrono::Utc::now().timestamp_millis(), chrono::Utc::now().timestamp_millis()]).await;
-                match res {
-                        Ok(_) => (),
-                        Err(e) => {
-                                let id = correlation.id();
-                                eprintln!("Failed to insert correlation '{id}' for aspect {aspect_id}: {e}");
-                                Self::rollback_concurrent(&conn).await?;
-                                return Err(anyhow::anyhow!("Failed to insert correlation: {e}"));
-                        }
-                }
+	/// Capture multiple patterns into dictionary for a given aspect
+	async fn batch_insert_patterns_into_dictionary(&self, aspect_id: &AspectId, dictionary_name: &str, patterns: Vec<Pattern>) -> Result<Vec<TxId>> {
+		let mut tx_ids = Vec::new();
+		for p in patterns {
+			let tx = self.insert_pattern_into_dictionary(aspect_id, dictionary_name, &p).await?;
+			tx_ids.push(tx);
+		}
+		Ok(tx_ids)
+	}
 
-                // Insert error rates if any
-                for (signal_type, distance) in correlation.error_rate().iter() {
-                        let insert_err_sql = r"INSERT INTO correlation_error_rates (correlation_id, signal_type, error_rate_value, error_rate_units) VALUES (?, ?, ?, ?)";
-                        let res = conn.as_ref().execute(insert_err_sql, turso::params![correlation.id().to_string(), signal_type.to_string(), distance.value().to_string(), distance.units().to_string()]).await;
-                        match res {
-                                Ok(_) => (),
-                                Err(e) => {
-                                        let id = correlation.id();
-                                        eprintln!("Failed to insert error rate for correlation '{id}': {e}");
-                                        Self::rollback_concurrent(&conn).await?;
-                                        return Err(anyhow::anyhow!("Failed to insert correlation error rate: {e}"));
-                                }
-                        }
-                }
+	//
+	// Correlations
+	//
 
-                // Insert occurrences
-                for (index, occurrence) in correlation.occurrences().iter().enumerate() {
-                        let occurrence_index = i64::try_from(index).map_err(|_| anyhow::anyhow!("Occurrence index too large for i64"))?;
-                        let size = i64::try_from(occurrence.size()).map_err(|_| anyhow::anyhow!("Occurrence size too large for i64"))?;
-                        let database_info_json = serde_json::to_string(occurrence.database_info())?;
-                        let insert_occ_sql = r"INSERT INTO correlation_occurrences (correlation_id, occurrence_index, aspect_id, resolution, size, database_info, pattern_id, beginning_timestamp, end_timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
-                        let res = conn.as_ref().execute(insert_occ_sql, turso::params![correlation.id().to_string(), occurrence_index, occurrence.aspect().to_string(), occurrence.resolution().to_string(), size, database_info_json, occurrence.pattern_id().to_string(), occurrence.beginning().timestamp(), occurrence.end().timestamp()]).await;
-                        match res {
-                                Ok(_) => (),
-                                Err(e) => {
-                                        let id = correlation.id();
-                                        eprintln!("Failed to insert occurrence {index} for correlation '{id}': {e}");
-                                        Self::rollback_concurrent(&conn).await?;
-                                        return Err(anyhow::anyhow!("Failed to insert correlation occurrence: {e}"));
-                                }
-                        }
-                }
+	/// insert correlation for a given aspect
+	async fn insert_correlation(&self, aspect_id: &AspectId, correlation: &Correlation) -> Result<TxId> {
+		let tx_id = TxId::new();
+		let mut aspect = self.get_aspect(aspect_id).await?;
+		let db = aspect.correlations().await?;
+		let db_path = aspect.correlations_path();
+		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
 
-                let _ = Self::commit_concurrent(&conn).await;
+		// Insert into correlations table
+		let insert_sql = r"INSERT INTO correlations (id, dictionary_id, subject_id, aspect_id, pattern_id, event_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+		let res = conn.as_ref().execute(insert_sql, turso::params![correlation.id().to_string(), correlation.dictionary_id().to_string(), correlation.subject_id().to_string(), correlation.aspect_id().to_string(), correlation.pattern_id().to_string(), correlation.event_id().to_string(), chrono::Utc::now().timestamp_millis(), chrono::Utc::now().timestamp_millis()]).await;
+		match res {
+			Ok(_) => (),
+			Err(e) => {
+				let id = correlation.id();
+				eprintln!("Failed to insert correlation '{id}' for aspect {aspect_id}: {e}");
+				Self::rollback_concurrent(&conn).await?;
+				return Err(anyhow::anyhow!("Failed to insert correlation: {e}"));
+			}
+		}
 
-                let log = format!("Inserted correlation '{}' for aspect {}", correlation.id(), aspect_id);
-                let _ = self.record_transaction(&log).await?;
+		// Insert error rates if any
+		for (signal_type, distance) in correlation.error_rate() {
+			let insert_err_sql = r"INSERT INTO correlation_error_rates (correlation_id, signal_type, error_rate_value, error_rate_units) VALUES (?, ?, ?, ?)";
+			let res = conn.as_ref().execute(insert_err_sql, turso::params![correlation.id().to_string(), signal_type.to_string(), distance.value().to_string(), distance.units().to_string()]).await;
+			match res {
+				Ok(_) => (),
+				Err(e) => {
+					let id = correlation.id();
+					eprintln!("Failed to insert error rate for correlation '{id}': {e}");
+					Self::rollback_concurrent(&conn).await?;
+					return Err(anyhow::anyhow!("Failed to insert correlation error rate: {e}"));
+				}
+			}
+		}
 
-                Ok(tx_id)
-        }
+		// Insert occurrences
+		for (index, occurrence) in correlation.occurrences().iter().enumerate() {
+			let occurrence_index = i64::try_from(index).map_err(|_| anyhow::anyhow!("Occurrence index too large for i64"))?;
+			let size = i64::try_from(occurrence.size()).map_err(|_| anyhow::anyhow!("Occurrence size too large for i64"))?;
+			let database_info_json = serde_json::to_string(occurrence.database_info())?;
+			let insert_occ_sql = r"INSERT INTO correlation_occurrences (correlation_id, occurrence_index, aspect_id, resolution, size, database_info, pattern_id, beginning_timestamp, end_timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+			let res = conn.as_ref().execute(insert_occ_sql, turso::params![correlation.id().to_string(), occurrence_index, occurrence.aspect().to_string(), occurrence.resolution().to_string(), size, database_info_json, occurrence.pattern_id().to_string(), occurrence.beginning().timestamp(), occurrence.end().timestamp()]).await;
+			match res {
+				Ok(_) => (),
+				Err(e) => {
+					let id = correlation.id();
+					eprintln!("Failed to insert occurrence {index} for correlation '{id}': {e}");
+					Self::rollback_concurrent(&conn).await?;
+					return Err(anyhow::anyhow!("Failed to insert correlation occurrence: {e}"));
+				}
+			}
+		}
 
-        async fn update_correlation(&self, aspect_id: &AspectId, correlation: &Correlation) -> Result<TxId> {
-                let tx_id = TxId::new();
-                let aspect = self.get_aspect(aspect_id).await?;
-                let db = aspect.correlations().await?;
-                let db_path = aspect.correlations_path();
-                let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		let _ = Self::commit_concurrent(&conn).await;
 
-                // Update correlations table with all fields
-                let update_sql = r"UPDATE correlations SET dictionary_id = ?, subject_id = ?, aspect_id = ?, pattern_id = ?, event_id = ?, updated_at = ? WHERE id = ?";
-                let res = conn.as_ref().execute(update_sql, turso::params![correlation.dictionary_id().to_string(), correlation.subject_id().to_string(), correlation.aspect_id().to_string(), correlation.pattern_id().to_string(), correlation.event_id().to_string(), chrono::Utc::now().timestamp_millis(), correlation.id().to_string()]).await;
-                match res {
-                        Ok(_) => (),
-                        Err(e) => {
-                                let id = correlation.id();
-                                eprintln!("Failed to update correlation '{id}' for aspect {aspect_id}: {e}");
-                                Self::rollback_concurrent(&conn).await?;
-                                return Err(anyhow::anyhow!("Failed to update correlation: {e}"));
-                        }
-                }
+		let log = format!("Inserted correlation '{}' for aspect {}", correlation.id(), aspect_id);
+		let _ = self.record_transaction(&log).await?;
 
-                // Delete existing error rates and re-insert
-                let delete_err_sql = r"DELETE FROM correlation_error_rates WHERE correlation_id = ?";
-                let res = conn.as_ref().execute(delete_err_sql, turso::params![correlation.id().to_string()]).await;
-                if let Err(e) = res {
-                        let id = correlation.id();
-                        eprintln!("Failed to delete error rates for correlation '{id}': {e}");
-                        Self::rollback_concurrent(&conn).await?;
-                        return Err(anyhow::anyhow!("Failed to delete correlation error rates: {e}"));
-                }
+		Ok(tx_id)
+	}
 
-                // Insert updated error rates
-                for (signal_type, distance) in correlation.error_rate().iter() {
-                        let insert_err_sql = r"INSERT INTO correlation_error_rates (correlation_id, signal_type, error_rate_value, error_rate_units) VALUES (?, ?, ?, ?)";
-                        let res = conn.as_ref().execute(insert_err_sql, turso::params![correlation.id().to_string(), signal_type.to_string(), distance.value().to_string(), distance.units().to_string()]).await;
-                        match res {
-                                Ok(_) => (),
-                                Err(e) => {
-                                        let id = correlation.id();
-                                        eprintln!("Failed to insert error rate for correlation '{id}': {e}");
-                                        Self::rollback_concurrent(&conn).await?;
-                                        return Err(anyhow::anyhow!("Failed to insert correlation error rate: {e}"));
-                                }
-                        }
-                }
+	async fn update_correlation(&self, aspect_id: &AspectId, correlation: &Correlation) -> Result<TxId> {
+		let tx_id = TxId::new();
+		let mut aspect = self.get_aspect(aspect_id).await?;
+		let db = aspect.correlations().await?;
+		let db_path = aspect.correlations_path();
+		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
 
-                // Delete existing occurrences and re-insert
-                let delete_occ_sql = r"DELETE FROM correlation_occurrences WHERE correlation_id = ?";
-                let res = conn.as_ref().execute(delete_occ_sql, turso::params![correlation.id().to_string()]).await;
-                if let Err(e) = res {
-                        let id = correlation.id();
-                        eprintln!("Failed to delete occurrences for correlation '{id}': {e}");
-                        Self::rollback_concurrent(&conn).await?;
-                        return Err(anyhow::anyhow!("Failed to delete correlation occurrences: {e}"));
-                }
+		// Update correlations table with all fields
+		let update_sql = r"UPDATE correlations SET dictionary_id = ?, subject_id = ?, aspect_id = ?, pattern_id = ?, event_id = ?, updated_at = ? WHERE id = ?";
+		let res = conn.as_ref().execute(update_sql, turso::params![correlation.dictionary_id().to_string(), correlation.subject_id().to_string(), correlation.aspect_id().to_string(), correlation.pattern_id().to_string(), correlation.event_id().to_string(), chrono::Utc::now().timestamp_millis(), correlation.id().to_string()]).await;
+		match res {
+			Ok(_) => (),
+			Err(e) => {
+				let id = correlation.id();
+				eprintln!("Failed to update correlation '{id}' for aspect {aspect_id}: {e}");
+				Self::rollback_concurrent(&conn).await?;
+				return Err(anyhow::anyhow!("Failed to update correlation: {e}"));
+			}
+		}
 
-                // Insert updated occurrences
-                for (index, occurrence) in correlation.occurrences().iter().enumerate() {
-                        let occurrence_index = i64::try_from(index).map_err(|_| anyhow::anyhow!("Occurrence index too large for i64"))?;
-                        let size = i64::try_from(occurrence.size()).map_err(|_| anyhow::anyhow!("Occurrence size too large for i64"))?;
-                        let database_info_json = serde_json::to_string(occurrence.database_info())?;
-                        let insert_occ_sql = r"INSERT INTO correlation_occurrences (correlation_id, occurrence_index, aspect_id, resolution, size, database_info, pattern_id, beginning_timestamp, end_timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
-                        let res = conn.as_ref().execute(insert_occ_sql, turso::params![correlation.id().to_string(), occurrence_index, occurrence.aspect().to_string(), occurrence.resolution().to_string(), size, database_info_json, occurrence.pattern_id().to_string(), occurrence.beginning().timestamp(), occurrence.end().timestamp()]).await;
-                        match res {
-                                Ok(_) => (),
-                                Err(e) => {
-                                        let id = correlation.id();
-                                        eprintln!("Failed to insert occurrence {index} for correlation '{id}': {e}");
-                                        Self::rollback_concurrent(&conn).await?;
-                                        return Err(anyhow::anyhow!("Failed to insert correlation occurrence: {e}"));
-                                }
-                        }
-                }
+		// Delete existing error rates and re-insert
+		let delete_err_sql = r"DELETE FROM correlation_error_rates WHERE correlation_id = ?";
+		let res = conn.as_ref().execute(delete_err_sql, turso::params![correlation.id().to_string()]).await;
+		if let Err(e) = res {
+			let id = correlation.id();
+			eprintln!("Failed to delete error rates for correlation '{id}': {e}");
+			Self::rollback_concurrent(&conn).await?;
+			return Err(anyhow::anyhow!("Failed to delete correlation error rates: {e}"));
+		}
 
-                let _ = Self::commit_concurrent(&conn).await;
+		// Insert updated error rates
+		for (signal_type, distance) in correlation.error_rate() {
+			let insert_err_sql = r"INSERT INTO correlation_error_rates (correlation_id, signal_type, error_rate_value, error_rate_units) VALUES (?, ?, ?, ?)";
+			let res = conn.as_ref().execute(insert_err_sql, turso::params![correlation.id().to_string(), signal_type.to_string(), distance.value().to_string(), distance.units().to_string()]).await;
+			match res {
+				Ok(_) => (),
+				Err(e) => {
+					let id = correlation.id();
+					eprintln!("Failed to insert error rate for correlation '{id}': {e}");
+					Self::rollback_concurrent(&conn).await?;
+					return Err(anyhow::anyhow!("Failed to insert correlation error rate: {e}"));
+				}
+			}
+		}
 
-                let log = format!("Updated correlation '{}' for aspect {}", correlation.id(), aspect_id);
-                let _ = self.record_transaction(&log).await?;
+		// Delete existing occurrences and re-insert
+		let delete_occ_sql = r"DELETE FROM correlation_occurrences WHERE correlation_id = ?";
+		let res = conn.as_ref().execute(delete_occ_sql, turso::params![correlation.id().to_string()]).await;
+		if let Err(e) = res {
+			let id = correlation.id();
+			eprintln!("Failed to delete occurrences for correlation '{id}': {e}");
+			Self::rollback_concurrent(&conn).await?;
+			return Err(anyhow::anyhow!("Failed to delete correlation occurrences: {e}"));
+		}
 
-                Ok(tx_id)
-        }
+		// Insert updated occurrences
+		for (index, occurrence) in correlation.occurrences().iter().enumerate() {
+			let occurrence_index = i64::try_from(index).map_err(|_| anyhow::anyhow!("Occurrence index too large for i64"))?;
+			let size = i64::try_from(occurrence.size()).map_err(|_| anyhow::anyhow!("Occurrence size too large for i64"))?;
+			let database_info_json = serde_json::to_string(occurrence.database_info())?;
+			let insert_occ_sql = r"INSERT INTO correlation_occurrences (correlation_id, occurrence_index, aspect_id, resolution, size, database_info, pattern_id, beginning_timestamp, end_timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+			let res = conn.as_ref().execute(insert_occ_sql, turso::params![correlation.id().to_string(), occurrence_index, occurrence.aspect().to_string(), occurrence.resolution().to_string(), size, database_info_json, occurrence.pattern_id().to_string(), occurrence.beginning().timestamp(), occurrence.end().timestamp()]).await;
+			match res {
+				Ok(_) => (),
+				Err(e) => {
+					let id = correlation.id();
+					eprintln!("Failed to insert occurrence {index} for correlation '{id}': {e}");
+					Self::rollback_concurrent(&conn).await?;
+					return Err(anyhow::anyhow!("Failed to insert correlation occurrence: {e}"));
+				}
+			}
+		}
 
-        async fn remove_correlation(&self, aspect_id: &AspectId, correlation_id: &CorrelationID) -> Result<TxId> {
-                let db = self.get_correlations_db(aspect_id).await?;
-                let db_path = self.get_correlations_db_path(aspect_id).await?;
-                let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		let _ = Self::commit_concurrent(&conn).await;
 
-                // Delete error rates first
-                let delete_err_sql = r"DELETE FROM correlation_error_rates WHERE correlation_id = ?";
-                let res = conn.as_ref().execute(delete_err_sql, turso::params![correlation_id.to_string()]).await;
-                if let Err(e) = res {
-                        eprintln!("Failed to delete error rates for correlation '{correlation_id}': {e}");
-                        Self::rollback_concurrent(&conn).await?;
-                        return Err(anyhow::anyhow!("Failed to delete correlation error rates: {e}"));
-                }
+		let log = format!("Updated correlation '{}' for aspect {}", correlation.id(), aspect_id);
+		let _ = self.record_transaction(&log).await?;
 
-                // Delete occurrences
-                let delete_occ_sql = r"DELETE FROM correlation_occurrences WHERE correlation_id = ?";
-                let res = conn.as_ref().execute(delete_occ_sql, turso::params![correlation_id.to_string()]).await;
-                if let Err(e) = res {
-                        eprintln!("Failed to delete occurrences for correlation '{correlation_id}': {e}");
-                        Self::rollback_concurrent(&conn).await?;
-                        return Err(anyhow::anyhow!("Failed to delete correlation occurrences: {e}"));
-                }
+		Ok(tx_id)
+	}
 
-                // Delete the correlation itself
-                let delete_sql = r"DELETE FROM correlations WHERE id = ?";
-                let res = conn.as_ref().execute(delete_sql, turso::params![correlation_id.to_string()]).await;
-                match res {
-                        Ok(_) => println!("Removed correlation {correlation_id} for aspect {aspect_id}"),
-                        Err(e) => {
-                                Self::rollback_concurrent(&conn).await?;
-                                return Err(anyhow::anyhow!("Failed to remove correlation: {e}"));
-                        }
-                }
+	async fn remove_correlation(&self, aspect_id: &AspectId, correlation_id: &CorrelationID) -> Result<TxId> {
+		let db = self.get_correlations_db(aspect_id).await?;
+		let db_path = self.get_correlations_db_path(aspect_id).await?;
+		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
 
-                let _ = Self::commit_concurrent(&conn).await;
-                let log = format!("Removed correlation {correlation_id} for aspect {aspect_id}");
-                let _ = self.record_transaction(&log).await?;
-                Ok(TxId::new())
-        }
+		// Delete error rates first
+		let delete_err_sql = r"DELETE FROM correlation_error_rates WHERE correlation_id = ?";
+		let res = conn.as_ref().execute(delete_err_sql, turso::params![correlation_id.to_string()]).await;
+		if let Err(e) = res {
+			eprintln!("Failed to delete error rates for correlation '{correlation_id}': {e}");
+			Self::rollback_concurrent(&conn).await?;
+			return Err(anyhow::anyhow!("Failed to delete correlation error rates: {e}"));
+		}
+
+		// Delete occurrences
+		let delete_occ_sql = r"DELETE FROM correlation_occurrences WHERE correlation_id = ?";
+		let res = conn.as_ref().execute(delete_occ_sql, turso::params![correlation_id.to_string()]).await;
+		if let Err(e) = res {
+			eprintln!("Failed to delete occurrences for correlation '{correlation_id}': {e}");
+			Self::rollback_concurrent(&conn).await?;
+			return Err(anyhow::anyhow!("Failed to delete correlation occurrences: {e}"));
+		}
+
+		// Delete the correlation itself
+		let delete_sql = r"DELETE FROM correlations WHERE id = ?";
+		let res = conn.as_ref().execute(delete_sql, turso::params![correlation_id.to_string()]).await;
+		match res {
+			Ok(_) => println!("Removed correlation {correlation_id} for aspect {aspect_id}"),
+			Err(e) => {
+				Self::rollback_concurrent(&conn).await?;
+				return Err(anyhow::anyhow!("Failed to remove correlation: {e}"));
+			}
+		}
+
+		let _ = Self::commit_concurrent(&conn).await;
+		let log = format!("Removed correlation {correlation_id} for aspect {aspect_id}");
+		let _ = self.record_transaction(&log).await?;
+		Ok(TxId::new())
+	}
+
+	//
+	// Unprocessed Events
+	//
+
+	async fn insert_unprocessed_event(&self, aspect_id: &AspectId, event: &Event) -> Result<TxId> {
+		let tx_id = TxId::new();
+		let db = self.get_unprocessed_events_db(aspect_id).await?;
+		let db_path = self.get_unprocessed_events_db_path(aspect_id).await?;
+		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		let _manifestations_json = serde_json::to_string(event.manifestations()).map_err(|e| anyhow::anyhow!(format!("Failed to serialize event manifestations: {e}")))?;
+		let event_id = event.id().to_string();
+
+		let res = conn.as_ref().execute("INSERT INTO events (id, name, created_at) VALUES (?, ?, ?)", turso::params![event_id.clone(), event.name().to_string(), chrono::Utc::now().timestamp_millis()]).await;
+		match res {
+			Ok(_) => println!("Inserted unprocessed event {} in database {}", event_id, self.id()),
+			Err(e) => {
+				let _ = Self::rollback_concurrent(&conn).await;
+				return Err(anyhow::anyhow!(format!("Failed to insert unprocessed event: {e}")));
+			}
+		}
+
+		// insert manifestations
+		for (manifestation_id, manifestation) in event.manifestations() {
+			let _manifestation_json = serde_json::to_string(manifestation).map_err(|e| anyhow::anyhow!(format!("Failed to serialize event manifestation: {e}")))?;
+			let res = conn.as_ref().execute("INSERT INTO event_manifestations (id, event_id, dataset_id, start_timestamp, end_timestamp) VALUES (?, ?, ?, ?, ?)", turso::params![manifestation_id.to_uuid().to_string(), event_id.clone(), manifestation.dataset_id().to_string(), manifestation.start().timestamp_millis(), manifestation.end().timestamp_millis()]).await;
+			match res {
+				Ok(_) => (),
+				Err(e) => {
+					let _ = Self::rollback_concurrent(&conn).await;
+					return Err(anyhow::anyhow!(format!("Failed to insert unprocessed event manifestation: {e}")));
+				}
+			}
+		}
+		let _ = Self::commit_concurrent(&conn).await;
+		let log = format!("Inserted unprocessed event {event_id} for aspect {aspect_id}");
+		let _ = self.record_transaction(&log).await?;
+		Ok(tx_id)
+	}
+
+	async fn remove_unprocessed_event(&self, aspect_id: &AspectId, event_id: &EventID) -> Result<TxId> {
+		let db = self.get_unprocessed_events_db(aspect_id).await?;
+		let db_path = self.get_unprocessed_events_db_path(aspect_id).await?;
+		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+
+		// Delete manifestations first
+		let delete_manifestations_sql = r"DELETE FROM event_manifestations WHERE event_id = ?";
+		let res = conn.as_ref().execute(delete_manifestations_sql, turso::params![event_id.to_string()]).await;
+		if let Err(e) = res {
+			eprintln!("Failed to delete manifestations for unprocessed event '{event_id}': {e}");
+			Self::rollback_concurrent(&conn).await?;
+			return Err(anyhow::anyhow!("Failed to delete unprocessed event manifestations: {e}"));
+		}
+
+		// Delete the unprocessed event itself
+		let delete_sql = r"DELETE FROM events WHERE id = ?";
+		let res = conn.as_ref().execute(delete_sql, turso::params![event_id.to_string()]).await;
+		match res {
+			Ok(_) => println!("Removed unprocessed event {event_id} for aspect {aspect_id}"),
+			Err(e) => {
+				Self::rollback_concurrent(&conn).await?;
+				return Err(anyhow::anyhow!("Failed to remove unprocessed event: {e}"));
+			}
+		}
+
+		let _ = Self::commit_concurrent(&conn).await;
+		let log = format!("Removed unprocessed event {event_id} for aspect {aspect_id}");
+		let _ = self.record_transaction(&log).await?;
+		Ok(TxId::new())
+	}
+
+	async fn clear_unprocessed_events(&self, aspect_id: &AspectId) -> Result<TxId> {
+		let db = self.get_unprocessed_events_db(aspect_id).await?;
+		let db_path = self.get_unprocessed_events_db_path(aspect_id).await?;
+		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		let delete_manifestations_sql = r"DELETE FROM event_manifestations";
+		let res = conn.as_ref().execute(delete_manifestations_sql, turso::params![]).await;
+		match res {
+			Ok(_) => println!("Cleared all unprocessed event manifestations for aspect {aspect_id}"),
+			Err(e) => {
+				Self::rollback_concurrent(&conn).await?;
+				return Err(anyhow::anyhow!("Failed to clear unprocessed event manifestations: {e}"));
+			}
+		}
+
+		let delete_sql = r"DELETE FROM events";
+		let res = conn.as_ref().execute(delete_sql, turso::params![]).await;
+		match res {
+			Ok(_) => println!("Cleared all unprocessed events for aspect {aspect_id}"),
+			Err(e) => {
+				Self::rollback_concurrent(&conn).await?;
+				return Err(anyhow::anyhow!("Failed to clear unprocessed events: {e}"));
+			}
+		}
+
+		let _ = Self::commit_concurrent(&conn).await;
+		let log = format!("Cleared all unprocessed events for aspect {aspect_id}");
+		let _ = self.record_transaction(&log).await?;
+		Ok(TxId::new())
+	}
+
+	async fn cleanup_unprocessed_events(&self, aspect_id: &AspectId, older_than: chrono::DateTime<chrono::Utc>) -> Result<TxId> {
+		let db = self.get_unprocessed_events_db(aspect_id).await?;
+		let db_path = self.get_unprocessed_events_db_path(aspect_id).await?;
+		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		let delete_sql = r"DELETE FROM events WHERE created_at < ?";
+		let res = conn.as_ref().execute(delete_sql, turso::params![older_than.timestamp_millis()]).await;
+		match res {
+			Ok(deleted) => println!("Cleaned up {deleted} unprocessed events older than {older_than} for aspect {aspect_id}"),
+			Err(e) => {
+				Self::rollback_concurrent(&conn).await?;
+				return Err(anyhow::anyhow!("Failed to cleanup unprocessed events: {e}"));
+			}
+		}
+		let _ = Self::commit_concurrent(&conn).await;
+		let log = format!("Cleaned up unprocessed events older than {older_than} for aspect {aspect_id}");
+		let _ = self.record_transaction(&log).await?;
+		Ok(TxId::new())
+	}
+
+	//
+	// Processed Events
+	//
+	async fn insert_processed_event(&self, aspect_id: &AspectId, event: &Event) -> Result<TxId> {
+		let tx_id = TxId::new();
+		let db = self.get_processed_events_db(aspect_id).await?;
+		let db_path = self.get_processed_events_db_path(aspect_id).await?;
+		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		let _manifestations_json = serde_json::to_string(event.manifestations()).map_err(|e| anyhow::anyhow!(format!("Failed to serialize event manifestations: {e}")))?;
+		let event_id = event.id().to_string();
+		let res = conn.as_ref().execute("INSERT INTO events (id, name, created_at) VALUES (?, ?, ?)", turso::params![event_id.clone(), event.name().to_string(), chrono::Utc::now().timestamp_millis()]).await;
+		match res {
+			Ok(_) => println!("Inserted processed event {} in database {}", event_id, self.id()),
+			Err(e) => {
+				let _ = Self::rollback_concurrent(&conn).await;
+				return Err(anyhow::anyhow!(format!("Failed to insert processed event: {e}")));
+			}
+		}
+
+		// insert manifestations
+		for (manifestation_id, manifestation) in event.manifestations() {
+			let _manifestation_json = serde_json::to_string(manifestation).map_err(|e| anyhow::anyhow!(format!("Failed to serialize event manifestation: {e}")))?;
+			let res = conn.as_ref().execute("INSERT INTO event_manifestations (id, event_id, dataset_id, start_timestamp, end_timestamp) VALUES (?, ?, ?, ?, ?)", turso::params![manifestation_id.to_uuid().to_string(), event_id.clone(), manifestation.dataset_id().to_string(), manifestation.start().timestamp_millis(), manifestation.end().timestamp_millis()]).await;
+			match res {
+				Ok(_) => (),
+				Err(e) => {
+					let _ = Self::rollback_concurrent(&conn).await;
+					return Err(anyhow::anyhow!(format!("Failed to insert processed event manifestation: {e}")));
+				}
+			}
+		}
+		let _ = Self::commit_concurrent(&conn).await;
+		let log = format!("Inserted processed event {event_id} for aspect {aspect_id}");
+		let _ = self.record_transaction(&log).await?;
+		Ok(tx_id)
+	}
+
+	async fn remove_processed_event(&self, aspect_id: &AspectId, event_id: &EventID) -> Result<TxId> {
+		let db = self.get_processed_events_db(aspect_id).await?;
+		let db_path = self.get_processed_events_db_path(aspect_id).await?;
+		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+
+		// Delete manifestations first
+		let delete_manifestations_sql = r"DELETE FROM event_manifestations WHERE event_id = ?";
+		let res = conn.as_ref().execute(delete_manifestations_sql, turso::params![event_id.to_string()]).await;
+		if let Err(e) = res {
+			eprintln!("Failed to delete manifestations for processed event '{event_id}': {e}");
+			Self::rollback_concurrent(&conn).await?;
+			return Err(anyhow::anyhow!("Failed to delete processed event manifestations: {e}"));
+		}
+
+		// Delete the processed event itself
+		let delete_sql = r"DELETE FROM events WHERE id = ?";
+		let res = conn.as_ref().execute(delete_sql, turso::params![event_id.to_string()]).await;
+		match res {
+			Ok(_) => println!("Removed processed event {event_id} for aspect {aspect_id}"),
+			Err(e) => {
+				Self::rollback_concurrent(&conn).await?;
+				return Err(anyhow::anyhow!("Failed to remove processed event: {e}"));
+			}
+		}
+
+		let _ = Self::commit_concurrent(&conn).await;
+		let log = format!("Removed processed event {event_id} for aspect {aspect_id}");
+		let _ = self.record_transaction(&log).await?;
+		Ok(TxId::new())
+	}
+
+	async fn clear_processed_events(&self, aspect_id: &AspectId) -> Result<TxId> {
+		let db = self.get_processed_events_db(aspect_id).await?;
+		let db_path = self.get_processed_events_db_path(aspect_id).await?;
+		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		let delete_manifestations_sql = r"DELETE FROM event_manifestations";
+		let res = conn.as_ref().execute(delete_manifestations_sql, turso::params![]).await;
+		match res {
+			Ok(_) => println!("Cleared all processed event manifestations for aspect {aspect_id}"),
+			Err(e) => {
+				Self::rollback_concurrent(&conn).await?;
+				return Err(anyhow::anyhow!("Failed to clear processed event manifestations: {e}"));
+			}
+		}
+
+		let delete_sql = r"DELETE FROM events";
+		let res = conn.as_ref().execute(delete_sql, turso::params![]).await;
+		match res {
+			Ok(_) => println!("Cleared all processed events for aspect {aspect_id}"),
+			Err(e) => {
+				Self::rollback_concurrent(&conn).await?;
+				return Err(anyhow::anyhow!("Failed to clear processed events: {e}"));
+			}
+		}
+
+		let _ = Self::commit_concurrent(&conn).await;
+		let log = format!("Cleared all processed events for aspect {aspect_id}");
+		let _ = self.record_transaction(&log).await?;
+		Ok(TxId::new())
+	}
+
+	async fn cleanup_processed_events(&self, aspect_id: &AspectId, older_than: chrono::DateTime<chrono::Utc>) -> Result<TxId> {
+		let db = self.get_processed_events_db(aspect_id).await?;
+		let db_path = self.get_processed_events_db_path(aspect_id).await?;
+		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		let delete_sql = r"DELETE FROM events WHERE created_at < ?";
+		let res = conn.as_ref().execute(delete_sql, turso::params![older_than.timestamp_millis()]).await;
+		match res {
+			Ok(deleted) => println!("Cleaned up {deleted} processed events older than {older_than} for aspect {aspect_id}"),
+			Err(e) => {
+				Self::rollback_concurrent(&conn).await?;
+				return Err(anyhow::anyhow!("Failed to cleanup processed events: {e}"));
+			}
+		}
+		let _ = Self::commit_concurrent(&conn).await;
+		let log = format!("Cleaned up processed events older than {older_than} for aspect {aspect_id}");
+		let _ = self.record_transaction(&log).await?;
+		Ok(TxId::new())
+	}
 }
