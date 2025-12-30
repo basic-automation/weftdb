@@ -93,14 +93,30 @@ pub struct Correlation {
 	#[serde(serialize_with = "serialize_error_rates", deserialize_with = "deserialize_error_rates")]
 	error_rate: HashMap<SignalType, ErrorRate>,
 	occurrences: Vec<Occurrence>,
+	/// The average distance from pattern occurrences to event manifestations.
+	/// Used as the divisor in probability calculations per documentation:
+	/// probability = time_elapsed / average_distance
+	#[serde(default)]
+	average_distance: Option<Distance>,
 }
 
 impl Correlation {
 	#[must_use]
 	#[allow(clippy::too_many_arguments)]
-	pub fn new(id: Option<CorrelationID>, dictionary_id: DictionaryId, subject_id: SubjectId, aspect_id: &AspectId, pattern_id: PatternID, event_id: EventID, error_rate: HashMap<SignalType, ErrorRate>, occurrences: Vec<Occurrence>) -> Self {
+	pub fn new(id: Option<CorrelationID>, dictionary_id: DictionaryId, subject_id: SubjectId, aspect_id: &AspectId, pattern_id: PatternID, event_id: EventID, error_rate: HashMap<SignalType, ErrorRate>, occurrences: Vec<Occurrence>, average_distance: Option<Distance>) -> Self {
 		let id = id.unwrap_or_default();
-		Self { id, dictionary_id, subject_id, aspect_id: *aspect_id, pattern_id, event_id, error_rate, occurrences }
+		Self { id, dictionary_id, subject_id, aspect_id: *aspect_id, pattern_id, event_id, error_rate, occurrences, average_distance }
+	}
+
+	/// Get the average distance from pattern occurrences to event manifestations
+	#[must_use]
+	pub const fn average_distance(&self) -> Option<&Distance> {
+		self.average_distance.as_ref()
+	}
+
+	/// Set the average distance
+	pub fn set_average_distance(&mut self, average_distance: Distance) {
+		self.average_distance = Some(average_distance);
 	}
 
 	#[must_use]
