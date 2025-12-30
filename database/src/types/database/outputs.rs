@@ -5,7 +5,7 @@ use std::{
 use anyhow::{bail, Result};
 use bigdecimal::{BigDecimal, Zero};
 use chrono::{DateTime, Utc};
-use futures::Stream;
+use futures::{Stream, StreamExt, stream};
 use splimes::{Point, Resolution, Spline};
 use uuid::Uuid;
 
@@ -15,122 +15,181 @@ use crate::{
 
 #[async_trait::async_trait]
 impl Outputs for Database {
-	async fn get_raw_measurements(&self, aspect_id: &AspectId, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, max_per_page: usize, page: usize) -> Result<Vec<Measurement>> {
-		// Calculate offset for pagination (0-based page indexing)
-		let offset = page * max_per_page;
-
-		// Safe conversions to i64
-		let max_per_page_i64 = i64::try_from(max_per_page).map_err(|_| anyhow::anyhow!("max_per_page too large for i64"))?;
-		let offset_i64 = i64::try_from(offset).map_err(|_| anyhow::anyhow!("offset too large for i64"))?;
-
+	async fn get_raw_measurements(&self, aspect_id: &AspectId, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, max_per_page: usize, page: usize) -> Result<Pin<Box<dyn Stream<Item = Result<Measurement>> + Send + 'static>>> {
 		// For small page sizes with caching, check cache first (only for full range queries)
 		// Only cache if requesting first page, reasonable page size, and no time filtering
 		if page == 0 && max_per_page <= 10_000 && start.is_none() && end.is_none() {
 			let cache_key = format!("aspect_measurements_{}_{}", aspect_id.as_uuid(), max_per_page);
 			if let Some(cached) = self.cache.lock().await.get::<Vec<Measurement>>(&cache_key).await {
-				return Ok(cached);
+				return Ok(Box::pin(stream::iter(cached.into_iter().map(Ok))));
 			}
 		}
 
-		// Get from database with proper scope management
+		// Get database connection info upfront for the streaming closure
 		let db = self.get_measurement_db(aspect_id).await?;
 		let db_path = self.get_measurement_db_path(aspect_id).await?;
+		let cache = self.cache.clone();
+		let aspect_id_owned = *aspect_id;
+		let start_owned = start;
+		let end_owned = end;
+		let max_per_page_owned = max_per_page;
 
-		let _conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
-		// Get from database with proper scope management
-		let db = self.get_measurement_db(aspect_id).await?;
-		let db_path = self.get_measurement_db_path(aspect_id).await?;
+		// Page size for chunked loading (use the requested page size)
+		const CHUNK_SIZE: usize = 1000;
+		let actual_page_size = max_per_page_owned.min(CHUNK_SIZE);
 
-		// Build query and parameters based on time range
-		let (query_sql, params): (String, Vec<turso::Value>) = match (start, end) {
-			(None, None) => {
-				// Return all points
-				(
-					r"
-                    SELECT id, dataset_id, timestamp, value 
-                    FROM measurements 
-                    ORDER BY timestamp ASC 
-                    LIMIT ? OFFSET ?
-                    "
-					.to_string(),
-					vec![turso::Value::from(max_per_page_i64), turso::Value::from(offset_i64)],
-				)
-			}
-			(Some(start_time), None) => {
-				// From start to end of data
-				(
-					r"
-                    SELECT id, dataset_id, timestamp, value 
-                    FROM measurements 
-                    WHERE timestamp >= ?
-                    ORDER BY timestamp ASC 
-                    LIMIT ? OFFSET ?
-                    "
-					.to_string(),
-					vec![turso::Value::from(start_time.timestamp_millis()), turso::Value::from(max_per_page_i64), turso::Value::from(offset_i64)],
-				)
-			}
-			(None, Some(end_time)) => {
-				// From beginning to end
-				(
-					r"
-                    SELECT id, dataset_id, timestamp, value 
-                    FROM measurements 
-                    WHERE timestamp <= ?
-                    ORDER BY timestamp ASC 
-                    LIMIT ? OFFSET ?
-                    "
-					.to_string(),
-					vec![turso::Value::from(end_time.timestamp_millis()), turso::Value::from(max_per_page_i64), turso::Value::from(offset_i64)],
-				)
-			}
-			(Some(start_time), Some(end_time)) => {
-				// Specific range
-				(
-					r"
-                    SELECT id, dataset_id, timestamp, value 
-                    FROM measurements 
-                    WHERE timestamp >= ? AND timestamp <= ?
-                    ORDER BY timestamp ASC 
-                    LIMIT ? OFFSET ?
-                    "
-					.to_string(),
-					vec![turso::Value::from(start_time.timestamp_millis()), turso::Value::from(end_time.timestamp_millis()), turso::Value::from(max_per_page_i64), turso::Value::from(offset_i64)],
-				)
-			}
-		};
+		// Use unfold to create a true streaming iterator that fetches in chunks
+		let stream = futures::stream::unfold(
+			(page, Vec::<Measurement>::new(), db, db_path, cache, aspect_id_owned, start_owned, end_owned, max_per_page_owned),
+			move |(current_page, mut current_measurements, db, db_path, cache, aspect_id, start, end, max_per_page)| {
+				async move {
+					// If we have measurements in the current chunk, pop one and return it
+					if let Some(measurement) = current_measurements.pop() {
+						Some((Ok(measurement), (current_page, current_measurements, db, db_path, cache, aspect_id, start, end, max_per_page)))
+					} else {
+						// Need to fetch next chunk
+						let conn = match Self::begin_concurrent(&db, &db_path, Some(cache.clone())).await {
+							Ok(c) => c,
+							Err(e) => return Some((Err(e), (current_page, current_measurements, db, db_path, cache, aspect_id, start, end, max_per_page))),
+						};
 
-		let conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+						// Calculate offset for this page
+						let offset = current_page * actual_page_size;
+						let offset_i64 = match i64::try_from(offset) {
+							Ok(o) => o,
+							Err(e) => {
+								let _ = Self::commit_concurrent(&conn).await;
+								return Some((Err(anyhow::anyhow!("Offset too large: {e}")), (current_page, current_measurements, db, db_path, cache, aspect_id, start, end, max_per_page)));
+							}
+						};
 
-		let mut rows: turso::Rows = conn.as_ref().query(&query_sql, params).await.map_err(|e| Error::DatabaseError(format!("Failed to query measurements: {e}")))?;
+						let max_per_page_i64 = match i64::try_from(actual_page_size) {
+							Ok(m) => m,
+							Err(e) => {
+								let _ = Self::commit_concurrent(&conn).await;
+								return Some((Err(anyhow::anyhow!("Page size too large: {e}")), (current_page, current_measurements, db, db_path, cache, aspect_id, start, end, max_per_page)));
+							}
+						};
 
-		let mut measurements = Vec::with_capacity(max_per_page.min(1000));
+						// Build query and parameters based on time range
+						let (query_sql, params): (String, Vec<turso::Value>) = match (start, end) {
+							(None, None) => {
+								// Return all points
+								(
+									r"
+				                    SELECT id, dataset_id, timestamp, value
+				                    FROM measurements
+				                    ORDER BY timestamp ASC
+				                    LIMIT ? OFFSET ?
+				                    "
+									.to_string(),
+									vec![turso::Value::from(max_per_page_i64), turso::Value::from(offset_i64)],
+								)
+							}
+							(Some(start_time), None) => {
+								// From start to end of data
+								(
+									r"
+				                    SELECT id, dataset_id, timestamp, value
+				                    FROM measurements
+				                    WHERE timestamp >= ?
+				                    ORDER BY timestamp ASC
+				                    LIMIT ? OFFSET ?
+				                    "
+									.to_string(),
+									vec![turso::Value::from(start_time.timestamp_millis()), turso::Value::from(max_per_page_i64), turso::Value::from(offset_i64)],
+								)
+							}
+							(None, Some(end_time)) => {
+								// From beginning to end
+								(
+									r"
+				                    SELECT id, dataset_id, timestamp, value
+				                    FROM measurements
+				                    WHERE timestamp <= ?
+				                    ORDER BY timestamp ASC
+				                    LIMIT ? OFFSET ?
+				                    "
+									.to_string(),
+									vec![turso::Value::from(end_time.timestamp_millis()), turso::Value::from(max_per_page_i64), turso::Value::from(offset_i64)],
+								)
+							}
+							(Some(start_time), Some(end_time)) => {
+								// Specific range
+								(
+									r"
+				                    SELECT id, dataset_id, timestamp, value
+				                    FROM measurements
+				                    WHERE timestamp >= ? AND timestamp <= ?
+				                    ORDER BY timestamp ASC
+				                    LIMIT ? OFFSET ?
+				                    "
+									.to_string(),
+									vec![turso::Value::from(start_time.timestamp_millis()), turso::Value::from(end_time.timestamp_millis()), turso::Value::from(max_per_page_i64), turso::Value::from(offset_i64)],
+								)
+							}
+						};
 
-		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get row: {e}")))? {
-			let measurement: Measurement = self.parse_measurement_row(row).await?;
-			measurements.push(measurement);
-		}
+						let rows_result = conn.as_ref().query(&query_sql, params).await;
+						let mut rows = match rows_result {
+							Ok(r) => r,
+							Err(e) => {
+								let _ = Self::commit_concurrent(&conn).await;
+								return Some((Err(Error::DatabaseError(format!("Failed to query measurements: {e}")).into()), (current_page, current_measurements, db, db_path, cache, aspect_id, start, end, max_per_page)));
+							}
+						};
 
-		// Handle case where requested range is outside of available data
-		if measurements.is_empty() && (start.is_some() || end.is_some()) {
-			// Check if we have any data at all and if the requested range is outside
-			return self.get_boundary_measurements(aspect_id).await;
-		}
+						// Collect measurements from this chunk
+						let mut new_measurements = Vec::new();
+						loop {
+							match rows.next().await {
+								Ok(Some(row)) => {
+									match Self::parse_measurement_row_static(row).await {
+										Ok(measurement) => new_measurements.push(measurement),
+										Err(e) => {
+											let _ = Self::commit_concurrent(&conn).await;
+											return Some((Err(e), (current_page, current_measurements, db, db_path, cache, aspect_id, start, end, max_per_page)));
+										}
+									}
+								}
+								Ok(None) => break,
+								Err(e) => {
+									let _ = Self::commit_concurrent(&conn).await;
+									return Some((Err(Error::DatabaseError(format!("Failed to read measurement row: {e}")).into()), (current_page, current_measurements, db, db_path, cache, aspect_id, start, end, max_per_page)));
+								}
+							}
+						}
 
-		// Cache the results only for first page, reasonable sizes, and full range queries
-		if page == 0 && max_per_page <= 10_000 && !measurements.is_empty() && start.is_none() && end.is_none() {
-			let cache_key = format!("aspect_measurements_{}_{}", aspect_id.as_uuid(), max_per_page);
-			self.cache.lock().await.store(&cache_key, measurements.clone()).await;
-		}
+						let _ = Self::commit_concurrent(&conn).await;
 
-		let _ = Self::commit_concurrent(&conn).await;
+						if new_measurements.is_empty() {
+							// No more data, end the stream
+							return None;
+						}
 
-		Ok(measurements)
+						// Update page for next iteration
+						let next_page = current_page + 1;
+
+						// Reverse so we can pop from the end efficiently
+						new_measurements.reverse();
+
+						// Pop first measurement and return it
+						if let Some(measurement) = new_measurements.pop() {
+							Some((Ok(measurement), (next_page, new_measurements, db, db_path, cache, aspect_id, start, end, max_per_page)))
+						} else {
+							None
+						}
+					}
+				}
+			},
+		);
+
+		Ok(Box::pin(stream))
 	}
 
 	/// Helper function to get boundary measurements (earliest 2 and latest 2 points)
 	/// Used when requested range is outside of available data
-	async fn get_boundary_measurements(&self, aspect_id: &AspectId) -> Result<Vec<Measurement>> {
+	async fn get_boundary_measurements(&self, aspect_id: &AspectId) -> Result<Pin<Box<dyn Stream<Item = Result<Measurement>> + Send + 'static>>> {
 		let db = self.get_measurement_db(aspect_id).await?;
 		let db_path = self.get_measurement_db_path(aspect_id).await?;
 
@@ -140,24 +199,24 @@ impl Outputs for Database {
 
 		// Get earliest 2 measurements
 		let earliest_sql = r"
-                        SELECT id, dataset_id, timestamp, value 
-                                FROM measurements 
-                                ORDER BY timestamp ASC 
+                        SELECT id, dataset_id, timestamp, value
+                                FROM measurements
+                                ORDER BY timestamp ASC
                                 LIMIT 2
                 ";
 
 		let mut rows: turso::Rows = conn.as_ref().query(earliest_sql, turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to query earliest measurements: {e}")))?;
 
 		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get earliest row: {e}")))? {
-			let measurement: Measurement = self.parse_measurement_row(row).await?;
+			let measurement: Measurement = Self::parse_measurement_row_static(row).await?;
 			all_measurements.push(measurement);
 		}
 
 		// Get latest 2 measurements (avoid duplicates if we have <= 2 total measurements)
 		let latest_sql = r"
-                        SELECT id, dataset_id, timestamp, value 
-                                FROM measurements 
-                                ORDER BY timestamp DESC 
+                        SELECT id, dataset_id, timestamp, value
+                                FROM measurements
+                                ORDER BY timestamp DESC
                                 LIMIT 2
                 ";
 
@@ -165,7 +224,7 @@ impl Outputs for Database {
 
 		let mut latest_measurements: Vec<Measurement> = Vec::new();
 		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get latest row: {e}")))? {
-			let measurement: Measurement = self.parse_measurement_row(row).await?;
+			let measurement: Measurement = Self::parse_measurement_row_static(row).await?;
 			latest_measurements.push(measurement);
 		}
 
@@ -182,7 +241,9 @@ impl Outputs for Database {
 		// Sort by timestamp to maintain chronological order
 		all_measurements.sort_by_key(|m: &Measurement| m.timestamp());
 
-		Ok(all_measurements)
+		// Convert to stream
+		let measurement_stream = futures::stream::iter(all_measurements.into_iter().map(Ok));
+		Ok(Box::pin(measurement_stream))
 	}
 
 	/// Helper function to parse a measurement row
@@ -247,15 +308,12 @@ impl Outputs for Database {
 
 		// Fetch measurements until we have enough data around our target time
 		loop {
-			let measurements = self.get_raw_measurements(aspect_id, Some(range_start), Some(range_end), initial_page_size, page).await?;
+			let measurements: Vec<Measurement> = self.get_raw_measurements(aspect_id, Some(range_start), Some(range_end), initial_page_size, page).await?.collect::<Vec<_>>().await.into_iter().collect::<Result<Vec<_>>>()?;
 
 			if measurements.is_empty() {
 				// No data in the time window, try getting boundary measurements
 				if page == 0 {
-					let boundary_measurements = self.get_boundary_measurements(aspect_id).await?;
-					if !boundary_measurements.is_empty() {
-						all_measurements = boundary_measurements;
-					}
+						let _boundary_measurements: Vec<Measurement> = self.get_boundary_measurements(aspect_id).await?.collect::<Vec<_>>().await.into_iter().collect::<Result<Vec<_>>>()?;
 				}
 				break;
 			}
@@ -343,11 +401,11 @@ impl Outputs for Database {
 	async fn analyze_range(&self, aspect_id: &AspectId, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, method: Spline) -> Result<Pin<Box<dyn Stream<Item = Result<Point>> + Send + 'static>>> {
 		// Pre-fetch all measurements for the range to avoid async issues in the stream
 		// For very large ranges, this could be optimized further with lazy loading
-		let all_measurements = self.fetch_measurements_for_range(aspect_id, start, end).await?;
+		let all_measurements: Vec<Measurement> = self.fetch_measurements_for_range(aspect_id, start, end).await?.collect::<Vec<_>>().await.into_iter().collect::<Result<Vec<_>>>()?;
 
 		if all_measurements.is_empty() {
 			// Try boundary measurements if no data in range
-			let boundary_measurements = self.get_boundary_measurements(aspect_id).await?;
+			let boundary_measurements: Vec<Measurement> = self.get_boundary_measurements(aspect_id).await?.collect::<Vec<_>>().await.into_iter().collect::<Result<Vec<_>>>()?;
 			if boundary_measurements.is_empty() {
 				return Err(anyhow::anyhow!("No measurements found for aspect"));
 			}
@@ -445,38 +503,14 @@ impl Outputs for Database {
 
 	/// Helper function to fetch measurements for a time range using pagination
 	/// Efficiently loads all measurements within the specified time range
-	async fn fetch_measurements_for_range(&self, aspect_id: &AspectId, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<Vec<Measurement>> {
-		let mut all_measurements = Vec::new();
-		let page_size = 10_000; // Reasonable page size for range queries
-		let mut page = 0;
+	async fn fetch_measurements_for_range(&self, aspect_id: &AspectId, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<Pin<Box<dyn Stream<Item = Result<Measurement>> + Send + 'static>>> {
+		// Use get_raw_measurements directly to get a streaming result
+		// Set max_per_page to a reasonable size and page to 0 to start
+		// The stream will handle pagination internally
+		let page_size = 10_000;
+		let measurements_stream = self.get_raw_measurements(aspect_id, Some(start), Some(end), page_size, 0).await?;
 
-		loop {
-			let measurements = self.get_raw_measurements(aspect_id, Some(start), Some(end), page_size, page).await?;
-
-			if measurements.is_empty() {
-				break; // No more data
-			}
-
-			all_measurements.extend(measurements.clone());
-
-			// If we got less than a full page, we've reached the end
-			if measurements.len() < page_size {
-				break;
-			}
-
-			page += 1;
-
-			// Safety check to prevent infinite loops
-			if page > 1000 {
-				// Maximum 10M measurements
-				break;
-			}
-		}
-
-		// Sort by timestamp to ensure proper ordering for interpolation - fix type annotation
-		all_measurements.sort_by_key(|m: &Measurement| m.timestamp());
-
-		Ok(all_measurements)
+		Ok(measurements_stream)
 	}
 
 	async fn get_unprocessed_batch(&self, aspect_id: &AspectId, batch_id: &BatchId) -> Result<Batch> {
@@ -828,13 +862,14 @@ impl Outputs for Database {
 			let mut occ_rows: turso::Rows = conn.as_ref().query(occurrences_query_sql, turso::params![pattern_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query pattern occurrences: {e}")))?;
 			let mut occurrences: Vec<Occurrence> = Vec::new();
 			while let Some(occ_row) = occ_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get pattern occurrence row: {e}")))? {
-				let occ_pattern_id_str = occ_row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Pattern ID is not text".to_string()))?.clone();
-				let occ_aspect_id_str = occ_row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Aspect ID is not text".to_string()))?.clone();
-				let occ_resolution_str = occ_row.get_value(3)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Resolution is not text".to_string()))?.clone();
-				let occ_size: usize = usize::try_from(*occ_row.get_value(4)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence Size is not integer".to_string()))?).map_err(|e| Error::DatabaseError(format!("Occurrence size out of range: {e}")))?;
-				let occ_database_info_str = occ_row.get_value(5)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Database Info is not text".to_string()))?.clone();
-				let occ_beginning_timestamp_millis: i64 = *occ_row.get_value(6)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence Beginning Timestamp is not integer".to_string()))?;
-				let occ_end_timestamp_millis: i64 = *occ_row.get_value(7)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence End Timestamp is not integer".to_string()))?;
+				// Column indices: 0=pattern_id, 1=aspect_id, 2=resolution, 3=size, 4=database_info, 5=beginning_timestamp, 6=end_timestamp
+				let occ_pattern_id_str = occ_row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Pattern ID is not text".to_string()))?.clone();
+				let occ_aspect_id_str = occ_row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Aspect ID is not text".to_string()))?.clone();
+				let occ_resolution_str = occ_row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Resolution is not text".to_string()))?.clone();
+				let occ_size: usize = usize::try_from(*occ_row.get_value(3)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence Size is not integer".to_string()))?).map_err(|e| Error::DatabaseError(format!("Occurrence size out of range: {e}")))?;
+				let occ_database_info_str = occ_row.get_value(4)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Database Info is not text".to_string()))?.clone();
+				let occ_beginning_timestamp_millis: i64 = *occ_row.get_value(5)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence Beginning Timestamp is not integer".to_string()))?;
+				let occ_end_timestamp_millis: i64 = *occ_row.get_value(6)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence End Timestamp is not integer".to_string()))?;
 
 				let occ_pattern_id = PatternID::from_uuid(Uuid::parse_str(&occ_pattern_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for occurrence Pattern ID: {e}")))?);
 				let occ_aspect_id = AspectId::from_str(&occ_aspect_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for occurrence Aspect ID: {e}")))?;
@@ -849,28 +884,20 @@ impl Outputs for Database {
 
 			// Get relatives from pattern_relatives table
 			let relatives_query_sql = r"
-                                SELECT pattern_id, relative_index, vector_location, vector_amplitude, max_x, max_y
+                                SELECT pattern_id, relative_index, relative_value
                                 FROM pattern_relatives
                                 WHERE pattern_id = ?
+                                ORDER BY relative_index ASC
                         ";
 
 			let mut rel_rows: turso::Rows = conn.as_ref().query(relatives_query_sql, turso::params![pattern_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query pattern relatives: {e}")))?;
 			let mut relatives: Vec<Relative> = Vec::new();
 			while let Some(rel_row) = rel_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get pattern relative row: {e}")))? {
-				let rel_pattern_id_str = rel_row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Relative Pattern ID is not text".to_string()))?.clone();
-				let _rel_relative_index: usize = usize::try_from(*rel_row.get_value(2)?.as_integer().ok_or_else(|| Error::DatabaseError("Relative Index is not integer".to_string()))?).map_err(|e| Error::DatabaseError(format!("Relative index out of range: {e}")))?;
-				let rel_vector_location_str = rel_row.get_value(3)?.as_text().ok_or_else(|| Error::DatabaseError("Relative Vector Location is not text".to_string()))?.clone();
-				let rel_vector_amplitude_str = rel_row.get_value(4)?.as_text().ok_or_else(|| Error::DatabaseError("Relative Vector Amplitude is not text".to_string()))?.clone();
-				let rel_max_x_str = rel_row.get_value(5)?.as_text().ok_or_else(|| Error::DatabaseError("Relative Max X is not text".to_string()))?.clone();
-				let rel_max_y_str = rel_row.get_value(6)?.as_text().ok_or_else(|| Error::DatabaseError("Relative Max Y is not text".to_string()))?.clone();
+				let _rel_pattern_id_str = rel_row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Relative Pattern ID is not text".to_string()))?.clone();
+				let _rel_relative_index: usize = usize::try_from(*rel_row.get_value(1)?.as_integer().ok_or_else(|| Error::DatabaseError("Relative Index is not integer".to_string()))?).map_err(|e| Error::DatabaseError(format!("Relative index out of range: {e}")))?;
+				let rel_value_json = rel_row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Relative Value is not text".to_string()))?.clone();
 
-				let _rel_pattern_id = PatternID::from_uuid(Uuid::parse_str(&rel_pattern_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for relative Pattern ID: {e}")))?);
-				let rel_vector_location = BigDecimal::from_str(&rel_vector_location_str).map_err(|e| Error::DatabaseError(format!("Invalid vector location format: {e}")))?;
-				let rel_vector_amplitude = BigDecimal::from_str(&rel_vector_amplitude_str).map_err(|e| Error::DatabaseError(format!("Invalid vector amplitude format: {e}")))?;
-				let rel_max_x = BigDecimal::from_str(&rel_max_x_str).map_err(|e| Error::DatabaseError(format!("Invalid max x format: {e}")))?;
-				let rel_max_y = BigDecimal::from_str(&rel_max_y_str).map_err(|e| Error::DatabaseError(format!("Invalid max y format: {e}")))?;
-				let measurement_vector = MeasurementVector::new(rel_vector_location, rel_vector_amplitude);
-				let relative = Relative::new(measurement_vector, rel_max_x, rel_max_y);
+				let relative: Relative = serde_json::from_str(&rel_value_json).map_err(|e| Error::DatabaseError(format!("Failed to parse relative JSON: {e}")))?;
 				relatives.push(relative);
 			}
 
@@ -944,7 +971,7 @@ impl Outputs for Database {
 		let db_path = aspect.correlations_path();
 		let conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
 		let query_sql = r"
-                        SELECT id, dictionary_id, subject_id, aspect_id, pattern_id, event_id
+                        SELECT id, dictionary_id, subject_id, aspect_id, pattern_id, event_id, average_distance_value, average_distance_units
                         FROM correlations 
                         WHERE id = ?
                 ";
@@ -957,6 +984,24 @@ impl Outputs for Database {
 			let aspect_id_str = row.get_value(3)?.as_text().ok_or_else(|| Error::DatabaseError("Aspect ID is not text".to_string()))?.clone();
 			let pattern_id_str = row.get_value(4)?.as_text().ok_or_else(|| Error::DatabaseError("Pattern ID is not text".to_string()))?.clone();
 			let event_id_str = row.get_value(5)?.as_text().ok_or_else(|| Error::DatabaseError("Event ID is not text".to_string()))?.clone();
+			
+			// Parse average_distance (nullable columns)
+			let average_distance = {
+				let avg_dist_value_opt = row.get_value(6).ok().and_then(|v| v.as_text().cloned());
+				let avg_dist_units_opt = row.get_value(7).ok().and_then(|v| v.as_text().cloned());
+				
+				match (avg_dist_value_opt, avg_dist_units_opt) {
+					(Some(value_str), Some(units_str)) => {
+						let value = BigDecimal::from_str(&value_str).ok();
+						let units = Resolution::from_str(&units_str).ok();
+						match (value, units) {
+							(Some(v), Some(u)) => Some(crate::types::signal::Distance::new(v, u)),
+							_ => None,
+						}
+					}
+					_ => None,
+				}
+			};
 
 			let id = CorrelationID::from_uuid(Uuid::parse_str(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for correlation ID: {e}")))?);
 			let dictionary_id = DictionaryId::from_uuid(Uuid::parse_str(&dictionary_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for dictionary ID: {e}")))?);
@@ -1027,7 +1072,7 @@ impl Outputs for Database {
 				}
 			}
 
-			let correlation = Correlation::new(Some(id), dictionary_id, subject_id, &aspect_id, pattern_id, event_id, error_rate, occurrences);
+			let correlation = Correlation::new(Some(id), dictionary_id, subject_id, &aspect_id, pattern_id, event_id, error_rate, occurrences, average_distance);
 
 			// Cache the correlation
 			self.cache.lock().await.store(&cache_key, correlation.clone()).await;
@@ -1383,7 +1428,7 @@ impl Database {
 		let conn = Self::begin_concurrent(db, db_path, Some(cache.clone())).await?;
 		
 		let query_sql = r"
-			SELECT id, dictionary_id, subject_id, aspect_id, pattern_id, event_id
+			SELECT id, dictionary_id, subject_id, aspect_id, pattern_id, event_id, average_distance_value, average_distance_units
 			FROM correlations 
 			WHERE id = ?
 		";
@@ -1401,6 +1446,24 @@ impl Database {
 		let aspect_id_str = row.get_value(3)?.as_text().ok_or_else(|| Error::DatabaseError("Aspect ID is not text".to_string()))?.clone();
 		let pattern_id_str = row.get_value(4)?.as_text().ok_or_else(|| Error::DatabaseError("Pattern ID is not text".to_string()))?.clone();
 		let event_id_str = row.get_value(5)?.as_text().ok_or_else(|| Error::DatabaseError("Event ID is not text".to_string()))?.clone();
+		
+		// Parse average_distance (nullable columns)
+		let average_distance = {
+			let avg_dist_value_opt = row.get_value(6).ok().and_then(|v| v.as_text().cloned());
+			let avg_dist_units_opt = row.get_value(7).ok().and_then(|v| v.as_text().cloned());
+			
+			match (avg_dist_value_opt, avg_dist_units_opt) {
+				(Some(value_str), Some(units_str)) => {
+					let value = BigDecimal::from_str(&value_str).ok();
+					let units = Resolution::from_str(&units_str).ok();
+					match (value, units) {
+						(Some(v), Some(u)) => Some(crate::types::signal::Distance::new(v, u)),
+						_ => None,
+					}
+				}
+				_ => None,
+			}
+		};
 
 		let id = CorrelationID::from_uuid(Uuid::parse_str(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for correlation ID: {e}")))?);
 		let dictionary_id = DictionaryId::from_uuid(Uuid::parse_str(&dictionary_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for dictionary ID: {e}")))?);
@@ -1474,12 +1537,27 @@ impl Database {
 			}
 		}
 
-		let correlation = Correlation::new(Some(id), dictionary_id, subject_id, &aspect_id_parsed, pattern_id, event_id, error_rate, occurrences);
+		let correlation = Correlation::new(Some(id), dictionary_id, subject_id, &aspect_id_parsed, pattern_id, event_id, error_rate, occurrences, average_distance);
 
 		// Cache the correlation
 		cache.lock().await.store(&cache_key, correlation.clone()).await;
 		let _ = Self::commit_concurrent(&conn).await;
 		
 		Ok(correlation)
+	}
+
+	/// Parse a measurement row without requiring &self (for use in streaming closures)
+	async fn parse_measurement_row_static(row: turso::Row) -> Result<Measurement> {
+		let id_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("ID is not text".to_string()))?.clone();
+		let dataset_id_str = row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Dataset ID is not text".to_string()))?.clone();
+		let timestamp_millis: i64 = *row.get_value(2)?.as_integer().ok_or_else(|| Error::DatabaseError("Timestamp is not integer".to_string()))?;
+		let value_str = row.get_value(3)?.as_text().ok_or_else(|| Error::DatabaseError("Value is not text".to_string()))?.clone();
+
+		let id = MeasurementId::from_string(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for measurement ID: {e}")))?;
+		let dataset_id = DatasetId::from_str(&dataset_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for dataset ID: {e}")))?;
+		let timestamp = DateTime::from_timestamp_millis(timestamp_millis).ok_or_else(|| Error::DatabaseError("Invalid timestamp".to_string()))?;
+		let value = BigDecimal::from_str(&value_str).map_err(|e| Error::DatabaseError(format!("Invalid value format: {e}")))?;
+
+		Ok(Measurement::new(id, dataset_id, timestamp, value))
 	}
 }

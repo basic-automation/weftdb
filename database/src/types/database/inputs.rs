@@ -502,7 +502,7 @@ impl Inputs for Database {
 			let database_info_json = serde_json::to_string(occurrence.database_info())?;
 			let size = i64::try_from(occurrence.size()).map_err(|_| anyhow::anyhow!("Occurrence size too large for i64"))?;
 			let insert_occ_sql = r"INSERT INTO pattern_occurrences (pattern_id, aspect_id, resolution, size, database_info, beginning_timestamp, end_timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)";
-			let res = conn.as_ref().execute(insert_occ_sql, turso::params![pattern.id().to_string(), aspect_id.to_string(), occurrence.resolution().to_string(), size, database_info_json, occurrence.beginning().timestamp(), occurrence.end().timestamp()]).await;
+			let res = conn.as_ref().execute(insert_occ_sql, turso::params![pattern.id().to_string(), aspect_id.to_string(), occurrence.resolution().to_string(), size, database_info_json, occurrence.beginning().timestamp_millis(), occurrence.end().timestamp_millis()]).await;
 			match res {
 				Ok(_) => (),
 				Err(e) => {
@@ -742,9 +742,9 @@ impl Inputs for Database {
 		let db = Self::get_or_create_turso_database(&db_path).await?;
 		let conn = Self::begin_concurrent(&db, db_name, Some(self.cache.clone())).await?;
 
-		// Insert into dictionary patterns table
-		let insert_sql = r"INSERT INTO dictionary_patterns (id, sum_value, abs_sum_value, max_value, min_value, abs_max_value, avg_value, abs_avg_value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
-		let res = conn.as_ref().execute(insert_sql, turso::params![pattern.id().to_string(), pattern.sum().to_string(), pattern.abs_sum().to_string(), pattern.max().to_string(), pattern.min().to_string(), pattern.abs_max().to_string(), pattern.avg().to_string(), pattern.abs_avg().to_string()]).await;
+		// Insert into patterns table (the main patterns table with pattern data)
+		let insert_patterns_sql = r"INSERT INTO patterns (id, sum_value, abs_sum_value, max_value, min_value, abs_max_value, avg_value, abs_avg_value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+		let res = conn.as_ref().execute(insert_patterns_sql, turso::params![pattern.id().to_string(), pattern.sum().to_string(), pattern.abs_sum().to_string(), pattern.max().to_string(), pattern.min().to_string(), pattern.abs_max().to_string(), pattern.avg().to_string(), pattern.abs_avg().to_string()]).await;
 		match res {
 			Ok(_) => (),
 			Err(e) => {
@@ -752,6 +752,41 @@ impl Inputs for Database {
 				eprintln!("Failed to insert pattern '{id}' into dictionary '{dictionary_name}' for aspect {aspect_id}: {e}");
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("Failed to insert pattern into dictionary: {e}"));
+			}
+		}
+
+		// Insert occurrences
+		for (index, occurrence) in pattern.occurrences().iter().enumerate() {
+			let occurrence_index = i64::try_from(index).map_err(|_| anyhow::anyhow!("Occurrence index too large for i64"))?;
+			let database_info_json = serde_json::to_string(occurrence.database_info())?;
+			let size = i64::try_from(occurrence.size()).map_err(|_| anyhow::anyhow!("Occurrence size too large for i64"))?;
+			let insert_occ_sql = r"INSERT INTO pattern_occurrences (pattern_id, occurrence_index, aspect_id, resolution, size, database_info, beginning_timestamp, end_timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+			let res = conn.as_ref().execute(insert_occ_sql, turso::params![pattern.id().to_string(), occurrence_index, aspect_id.to_string(), occurrence.resolution().to_string(), size, database_info_json, occurrence.beginning().timestamp_millis(), occurrence.end().timestamp_millis()]).await;
+			match res {
+				Ok(_) => (),
+				Err(e) => {
+					let id = pattern.id();
+					eprintln!("Failed to insert occurrence for pattern '{id}' in dictionary '{dictionary_name}': {e}");
+					Self::rollback_concurrent(&conn).await?;
+					return Err(anyhow::anyhow!("Failed to insert occurrence: {e}"));
+				}
+			}
+		}
+
+		// Insert relatives - serialize the relative as JSON for the relative_value column
+		for (i, relative) in pattern.relatives().iter().enumerate() {
+			let relative_index = i64::try_from(i).map_err(|_| anyhow::anyhow!("Relative index too large for i64"))?;
+			let relative_value_json = serde_json::to_string(relative)?;
+			let insert_rel_sql = r"INSERT INTO pattern_relatives (pattern_id, relative_index, relative_value) VALUES (?, ?, ?)";
+			let res = conn.as_ref().execute(insert_rel_sql, turso::params![pattern.id().to_string(), relative_index, relative_value_json]).await;
+			match res {
+				Ok(_) => (),
+				Err(e) => {
+					let id = pattern.id();
+					eprintln!("Failed to insert relative {i} for pattern '{id}' in dictionary '{dictionary_name}': {e}");
+					Self::rollback_concurrent(&conn).await?;
+					return Err(anyhow::anyhow!("Failed to insert relative: {e}"));
+				}
 			}
 		}
 
@@ -785,9 +820,13 @@ impl Inputs for Database {
 		let db_path = aspect.correlations_path();
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
 
-		// Insert into correlations table
-		let insert_sql = r"INSERT INTO correlations (id, dictionary_id, subject_id, aspect_id, pattern_id, event_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
-		let res = conn.as_ref().execute(insert_sql, turso::params![correlation.id().to_string(), correlation.dictionary_id().to_string(), correlation.subject_id().to_string(), correlation.aspect_id().to_string(), correlation.pattern_id().to_string(), correlation.event_id().to_string(), chrono::Utc::now().timestamp_millis(), chrono::Utc::now().timestamp_millis()]).await;
+		// Insert into correlations table with average_distance
+		let (avg_dist_value, avg_dist_units) = match correlation.average_distance() {
+			Some(dist) => (Some(dist.value().to_string()), Some(dist.units().to_string())),
+			None => (None, None),
+		};
+		let insert_sql = r"INSERT INTO correlations (id, dictionary_id, subject_id, aspect_id, pattern_id, event_id, average_distance_value, average_distance_units, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+		let res = conn.as_ref().execute(insert_sql, turso::params![correlation.id().to_string(), correlation.dictionary_id().to_string(), correlation.subject_id().to_string(), correlation.aspect_id().to_string(), correlation.pattern_id().to_string(), correlation.event_id().to_string(), avg_dist_value, avg_dist_units, chrono::Utc::now().timestamp_millis(), chrono::Utc::now().timestamp_millis()]).await;
 		match res {
 			Ok(_) => (),
 			Err(e) => {
@@ -819,7 +858,7 @@ impl Inputs for Database {
 			let size = i64::try_from(occurrence.size()).map_err(|_| anyhow::anyhow!("Occurrence size too large for i64"))?;
 			let database_info_json = serde_json::to_string(occurrence.database_info())?;
 			let insert_occ_sql = r"INSERT INTO correlation_occurrences (correlation_id, occurrence_index, aspect_id, resolution, size, database_info, pattern_id, beginning_timestamp, end_timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
-			let res = conn.as_ref().execute(insert_occ_sql, turso::params![correlation.id().to_string(), occurrence_index, occurrence.aspect().to_string(), occurrence.resolution().to_string(), size, database_info_json, occurrence.pattern_id().to_string(), occurrence.beginning().timestamp(), occurrence.end().timestamp()]).await;
+			let res = conn.as_ref().execute(insert_occ_sql, turso::params![correlation.id().to_string(), occurrence_index, occurrence.aspect().to_string(), occurrence.resolution().to_string(), size, database_info_json, occurrence.pattern_id().to_string(), occurrence.beginning().timestamp_millis(), occurrence.end().timestamp_millis()]).await;
 			match res {
 				Ok(_) => (),
 				Err(e) => {
@@ -846,9 +885,13 @@ impl Inputs for Database {
 		let db_path = aspect.correlations_path();
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
 
-		// Update correlations table with all fields
-		let update_sql = r"UPDATE correlations SET dictionary_id = ?, subject_id = ?, aspect_id = ?, pattern_id = ?, event_id = ?, updated_at = ? WHERE id = ?";
-		let res = conn.as_ref().execute(update_sql, turso::params![correlation.dictionary_id().to_string(), correlation.subject_id().to_string(), correlation.aspect_id().to_string(), correlation.pattern_id().to_string(), correlation.event_id().to_string(), chrono::Utc::now().timestamp_millis(), correlation.id().to_string()]).await;
+		// Update correlations table with all fields including average_distance
+		let (avg_dist_value, avg_dist_units) = match correlation.average_distance() {
+			Some(dist) => (Some(dist.value().to_string()), Some(dist.units().to_string())),
+			None => (None, None),
+		};
+		let update_sql = r"UPDATE correlations SET dictionary_id = ?, subject_id = ?, aspect_id = ?, pattern_id = ?, event_id = ?, average_distance_value = ?, average_distance_units = ?, updated_at = ? WHERE id = ?";
+		let res = conn.as_ref().execute(update_sql, turso::params![correlation.dictionary_id().to_string(), correlation.subject_id().to_string(), correlation.aspect_id().to_string(), correlation.pattern_id().to_string(), correlation.event_id().to_string(), avg_dist_value, avg_dist_units, chrono::Utc::now().timestamp_millis(), correlation.id().to_string()]).await;
 		match res {
 			Ok(_) => (),
 			Err(e) => {
@@ -914,6 +957,10 @@ impl Inputs for Database {
 
 		let _ = Self::commit_concurrent(&conn).await;
 
+		// Update the cache with the new correlation data
+		let cache_key = format!("correlation_{}_{}", aspect_id.as_uuid(), correlation.id().to_uuid());
+		self.cache.lock().await.store(&cache_key, correlation.clone()).await;
+
 		let log = format!("Updated correlation '{}' for aspect {}", correlation.id(), aspect_id);
 		let _ = self.record_transaction(&log).await?;
 
@@ -971,8 +1018,9 @@ impl Inputs for Database {
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
 		let _manifestations_json = serde_json::to_string(event.manifestations()).map_err(|e| anyhow::anyhow!(format!("Failed to serialize event manifestations: {e}")))?;
 		let event_id = event.id().to_string();
+		let description = event.description().clone().unwrap_or_default();
 
-		let res = conn.as_ref().execute("INSERT INTO events (id, name, created_at) VALUES (?, ?, ?)", turso::params![event_id.clone(), event.name().to_string(), chrono::Utc::now().timestamp_millis()]).await;
+		let res = conn.as_ref().execute("INSERT INTO events (id, name, description, created_at) VALUES (?, ?, ?, ?)", turso::params![event_id.clone(), event.name().to_string(), description, chrono::Utc::now().timestamp_millis()]).await;
 		match res {
 			Ok(_) => println!("Inserted unprocessed event {} in database {}", event_id, self.id()),
 			Err(e) => {
@@ -1089,7 +1137,8 @@ impl Inputs for Database {
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
 		let _manifestations_json = serde_json::to_string(event.manifestations()).map_err(|e| anyhow::anyhow!(format!("Failed to serialize event manifestations: {e}")))?;
 		let event_id = event.id().to_string();
-		let res = conn.as_ref().execute("INSERT INTO events (id, name, created_at) VALUES (?, ?, ?)", turso::params![event_id.clone(), event.name().to_string(), chrono::Utc::now().timestamp_millis()]).await;
+		let description = event.description().clone().unwrap_or_default();
+		let res = conn.as_ref().execute("INSERT INTO events (id, name, description, created_at) VALUES (?, ?, ?, ?)", turso::params![event_id.clone(), event.name().to_string(), description, chrono::Utc::now().timestamp_millis()]).await;
 		match res {
 			Ok(_) => println!("Inserted processed event {} in database {}", event_id, self.id()),
 			Err(e) => {

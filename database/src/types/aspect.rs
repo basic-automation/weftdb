@@ -761,6 +761,8 @@ impl AspectStructure for Aspect {
 		// Add columns if they don't exist (for existing tables)
 		conn.as_ref().execute("ALTER TABLE correlations ADD COLUMN subject_id TEXT", turso::params![]).await.ok();
 		conn.as_ref().execute("ALTER TABLE correlations ADD COLUMN aspect_id TEXT", turso::params![]).await.ok();
+		conn.as_ref().execute("ALTER TABLE correlations ADD COLUMN average_distance_value TEXT", turso::params![]).await.ok();
+		conn.as_ref().execute("ALTER TABLE correlations ADD COLUMN average_distance_units TEXT", turso::params![]).await.ok();
 
 		// Error rates table (INTEGER PRIMARY KEY AUTOINCREMENT is rowid alias, no index)
 		conn.as_ref()
@@ -1123,6 +1125,8 @@ impl Aspect {
 		// Add columns if they don't exist (for existing tables)
 		conn.execute("ALTER TABLE correlations ADD COLUMN subject_id TEXT", turso::params![]).await.ok();
 		conn.execute("ALTER TABLE correlations ADD COLUMN aspect_id TEXT", turso::params![]).await.ok();
+		conn.execute("ALTER TABLE correlations ADD COLUMN average_distance_value TEXT", turso::params![]).await.ok();
+		conn.execute("ALTER TABLE correlations ADD COLUMN average_distance_units TEXT", turso::params![]).await.ok();
 
 		// Error rates table (INTEGER PRIMARY KEY AUTOINCREMENT is rowid alias, no index)
 		conn.execute(

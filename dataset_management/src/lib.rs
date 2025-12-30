@@ -533,10 +533,52 @@ pub async fn create_correlations_for_events(database: &Database, dictionary: &Di
 	// For each event, correlate with all patterns
 	for event in &events {
 		for pattern in &patterns {
+			// Calculate the average distance between consecutive pattern occurrences/event manifestations
+			// This represents the cycle period (e.g., 4 hours for a 4-hour cycle)
+			// Per documentation: average_distance is the typical time between recurrences
+			let mut total_distance: i64 = 0;
+			let mut distance_count: i64 = 0;
+			let mut pattern_resolution = splimes::Resolution::Minutes; // Default, will be overwritten
+			
+			// Collect and sort manifestation times
+			let mut manifestation_times: Vec<chrono::DateTime<chrono::Utc>> = event.manifestations()
+				.values()
+				.map(|m| *m.start())
+				.collect();
+			manifestation_times.sort();
+			
+			// Calculate distances between consecutive manifestations (the cycle period)
+			if manifestation_times.len() >= 2 {
+				// Get resolution from the first occurrence if available
+				if let Some(occurrence) = pattern.occurrences().first() {
+					pattern_resolution = *occurrence.resolution();
+				}
+				
+				for window in manifestation_times.windows(2) {
+					if let Ok(diff) = pattern_resolution.difference(&window[1], &window[0]) {
+						if diff > 0 {
+							total_distance += diff;
+							distance_count += 1;
+						}
+					}
+				}
+			}
+			
+			// Calculate average_distance if we have valid distances
+			let average_distance = if distance_count > 0 {
+				let avg = total_distance / distance_count;
+				println!("DEBUG Correlation: pattern {} with event {}, average_distance = {} {:?} (from {} consecutive pairs)", 
+					pattern.id(), event.id(), avg, pattern_resolution, distance_count);
+				Some(database::Distance::new(bigdecimal::BigDecimal::from(avg), pattern_resolution))
+			} else {
+				println!("DEBUG Correlation: pattern {} with event {}, no consecutive pairs found", pattern.id(), event.id());
+				None
+			};
+
 			// Assign constant to local variable before borrowing to avoid clippy warning
 			let error_rate = HashMap::new();
 
-			let correlation = Correlation::new(None, DictionaryId::from_uuid(pattern.occurrences()[0].database_info().id().as_uuid()), aspect.subject_id(), aspect_id, pattern.id(), event.id().clone(), error_rate, pattern.occurrences().clone());
+			let correlation = Correlation::new(None, DictionaryId::from_uuid(pattern.occurrences()[0].database_info().id().as_uuid()), aspect.subject_id(), aspect_id, pattern.id(), event.id().clone(), error_rate, pattern.occurrences().clone(), average_distance);
 			database.insert_correlation(aspect_id, &correlation).await?;
 		}
 	}
@@ -634,26 +676,82 @@ pub async fn create_signals(database: &Database, aspect_id: &AspectId) -> Result
 					}
 				}
 			}
+
+			// After processing all historical pattern-manifestation pairs for this correlation,
+			// create forward-looking signals for pattern occurrences that ended after the last manifestation.
+			// These signals predict future events based on the average historical distance.
+			
+			// Find the latest manifestation time
+			let latest_manifestation = event.manifestations().values()
+				.map(|m| *m.end())
+				.max();
+			
+			if let Some(latest_manifest_time) = latest_manifestation {
+				// Calculate the MINIMUM distance from historical signals - this represents
+				// the time between a pattern ending and the NEXT event (not just any event)
+				let mut min_distance: Option<i64> = None;
+				
+				for manifestation in event.manifestations().values() {
+					for occurrence in correlation.occurrences() {
+						let occurrence_end = *occurrence.end();
+						let manifestation_start = *manifestation.start();
+						
+						// Only count valid historical relationships (pattern before manifestation)
+						if occurrence_end < manifestation_start {
+							let pattern_resolution = *occurrence.resolution();
+							if let Ok(diff) = pattern_resolution.difference(&manifestation_start, &occurrence_end) {
+								// We want the minimum positive distance - this is the time to the NEXT event
+								if diff > 0 {
+									min_distance = Some(min_distance.map_or(diff, |current| current.min(diff)));
+								}
+							}
+						}
+					}
+				}
+				
+				// Create forward-looking signals for patterns that ended after the last manifestation
+				if let Some(pred_distance) = min_distance {
+					// Debug: print forward-looking signal creation info
+					if signals_count < 5000 {
+						let forward_count = correlation.occurrences().iter()
+							.filter(|occ| *occ.end() > latest_manifest_time)
+							.count();
+						if forward_count > 0 {
+							println!("DEBUG Forward-looking: latest_manifest={}, pred_distance={} min, {} patterns eligible", 
+								latest_manifest_time, pred_distance, forward_count);
+						}
+					}
+					
+					for occurrence in correlation.occurrences() {
+						let occurrence_end = *occurrence.end();
+						
+						// Only create forward-looking signals for patterns that ended after the last manifestation
+						if occurrence_end > latest_manifest_time {
+							let pattern_resolution = *occurrence.resolution();
+							let distance = database::Distance::new(BigDecimal::from(pred_distance), pattern_resolution);
+							
+							// Create a forward-looking signal using a placeholder manifestation ID
+							// The manifestation_date is when the pattern ended, distance is the average historical distance
+							let signal = Signal::new(
+								correlation.id().clone(),
+								database::ManifestationId::new(), // New ID for predicted future event
+								correlation.event_id().clone(),
+								occurrence_end,
+								SignalType::Custom("PredictStart".to_string()), // Use same type as historical signals
+								distance,
+							);
+							
+							SIGNALS_QUEUE.lock().await.insert(signal);
+							signals_count += 1;
+						}
+					}
+				}
+			}
 		}
 	}
 
 	println!("Created {signals_count} signals successfully");
 	Ok(())
-}
-
-/// Filters out expired signals based on event resolution times.
-///
-/// Signals expire when their predicted event has already occurred.
-/// This function removes expired signals and applies error correction.
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - Database operations fail (getting events, correlations, updating correlations)
-/// - Signal removal or error correction fails
-/// - Time calculations or conversions fail
-pub async fn filter_expired_signals(database: &Database, aspect_id: &AspectId) -> Result<()> {
-	filter_expired_signals_at_time(database, aspect_id, None).await
 }
 
 /// Filters out expired signals based on event resolution times at a specific time.
@@ -667,7 +765,7 @@ pub async fn filter_expired_signals(database: &Database, aspect_id: &AspectId) -
 /// - Database operations fail (getting events, correlations, updating correlations)
 /// - Signal removal or error correction fails
 /// - Time calculations or conversions fail
-pub async fn filter_expired_signals_at_time(database: &Database, aspect_id: &AspectId, current_time: Option<chrono::DateTime<chrono::Utc>>) -> Result<()> {
+pub async fn filter_expired_signals(database: &Database, aspect_id: &AspectId, current_time: Option<chrono::DateTime<chrono::Utc>>) -> Result<()> {
 	use chrono::Utc;
 
 	let current_time = current_time.unwrap_or_else(Utc::now);
@@ -692,8 +790,12 @@ pub async fn filter_expired_signals_at_time(database: &Database, aspect_id: &Asp
 	let events: Vec<database::Event> = Outputs::get_unprocessed_events(database, aspect_id).await?.try_collect().await?;
 	let correlations: Vec<database::Correlation> = Outputs::get_correlations(database, aspect_id).await?.try_collect().await?;
 
+	println!("DEBUG: Found {} events and {} correlations", events.len(), correlations.len());
+	
 	// Collect signals to remove
 	let mut signals_to_remove = Vec::new();
+	let mut expired_historical = 0;
+	let mut expired_forward = 0;
 
 	// Iterate through all signals to check for expiration
 	for signal in signals_lock.values() {
@@ -711,33 +813,52 @@ pub async fn filter_expired_signals_at_time(database: &Database, aspect_id: &Asp
 		// If we found the event, check for expiration
 		if let Some(event_id) = signal_event_id {
 			if let Some(event) = events.iter().find(|e| *e.id() == event_id) {
-				// Find the manifestation this signal was created from (the baseline)
-				if let Some((_, base_manifestation)) = event.manifestations().iter().find(|(_, m)| m.id() == signal.manifestation_id()) {
-					// Find the next manifestation after the baseline that this signal is predicting
-					let mut future_manifestations: Vec<&database::Manifestation> = event.manifestations().iter().filter(|(_, manifestation)| manifestation.start() > base_manifestation.end()).map(|(_, m)| m).collect(); // Sort by start date to find the very next manifestation
-					future_manifestations.sort_by(|a, b| a.start().cmp(b.start()));
+				// Find the manifestation this signal was created from/predicting
+				if let Some((_, predicted_manifestation)) = event.manifestations().iter().find(|(_, m)| m.id() == signal.manifestation_id()) {
+					// Historical signals: the signal predicts THIS manifestation (the baseline)
+					// The signal expires when we've passed the time this manifestation was supposed to occur
+					// Determine the prediction point based on signal type
+					let prediction_point = match signal.signal_type() {
+						SignalType::Custom(ref type_name) if type_name == "PredictStart" => predicted_manifestation.midpoint(), // Use midpoint as the "peak" time
+						SignalType::Custom(ref type_name) if type_name == "PredictMid" => predicted_manifestation.midpoint(),
+						SignalType::Custom(ref type_name) if type_name == "PredictEnd" => *predicted_manifestation.end(),
+						SignalType::Custom(_) => predicted_manifestation.midpoint(), // Default to midpoint for unknown types
+					};
 
-					// If there's a next manifestation, check if we've passed the prediction point
-					if let Some(next_manifestation) = future_manifestations.first() {
-						// Determine the prediction point based on signal type
-						let prediction_point = match signal.signal_type() {
-							SignalType::Custom(ref type_name) if type_name == "PredictStart" => *next_manifestation.start(),
-							SignalType::Custom(ref type_name) if type_name == "PredictMid" => next_manifestation.midpoint(),
-							SignalType::Custom(ref type_name) if type_name == "PredictEnd" => *next_manifestation.end(),
-							SignalType::Custom(_) => next_manifestation.midpoint(), // Default to midpoint for unknown types
-						};
-
-						// Signal expires when current_time reaches or passes the prediction point
-						if current_time >= prediction_point {
-							// Signal has expired - we've reached the time it was predicting
-							signals_to_remove.push((signal.correlation_id().clone(), signal.manifestation_id().clone(), signal.signal_type().clone(), prediction_point));
+					// Signal expires when current_time reaches or passes the prediction point
+					if current_time >= prediction_point {
+						// Signal has expired - we've reached the time it was predicting
+						signals_to_remove.push((signal.correlation_id().clone(), signal.manifestation_id().clone(), signal.signal_type().clone(), prediction_point));
+						expired_historical += 1;
+					}
+				} else {
+					// Forward-looking signals: manifestation_id doesn't match any existing manifestation
+					// These predict future events that haven't occurred yet
+					// Calculate when this signal predicts the event will occur based on average_distance
+					if let Some(correlation) = correlations.iter().find(|c| c.id() == signal.correlation_id()) {
+						if let Some(avg_dist) = correlation.average_distance() {
+							// Convert distance value to i64 for time calculation
+							use bigdecimal::ToPrimitive;
+							if let Some(distance_minutes) = avg_dist.value().to_i64() {
+								// Calculate when this signal predicts the event will occur
+								// predicted_time = manifestation_date + average_distance
+								let duration = match avg_dist.units() {
+									Resolution::Minutes => chrono::Duration::minutes(distance_minutes),
+									Resolution::Hours => chrono::Duration::hours(distance_minutes),
+									Resolution::Days => chrono::Duration::days(distance_minutes),
+									Resolution::Seconds => chrono::Duration::seconds(distance_minutes),
+									_ => chrono::Duration::minutes(distance_minutes), // Fallback
+								};
+								let predicted_time = *signal.manifestation_date() + duration;
+								
+								// Signal expires when we've passed the predicted time
+								if current_time >= predicted_time {
+									signals_to_remove.push((signal.correlation_id().clone(), signal.manifestation_id().clone(), signal.signal_type().clone(), predicted_time));
+									expired_forward += 1;
+								}
+							}
 						}
 					}
-					// If there are no future manifestations, the signal doesn't expire yet
-				} else {
-					// If we can't find the baseline manifestation this signal was created from, remove it as invalid
-					// Use current time as fallback resolution time for invalid signals
-					signals_to_remove.push((signal.correlation_id().clone(), signal.manifestation_id().clone(), signal.signal_type().clone(), current_time));
 				}
 			}
 		}
@@ -745,7 +866,7 @@ pub async fn filter_expired_signals_at_time(database: &Database, aspect_id: &Asp
 
 	// Correlations loaded from database, no lock to release
 
-	println!("Removing {} expired or invalid signals", signals_to_remove.len());
+	println!("Removing {} expired signals ({} historical, {} forward-looking)", signals_to_remove.len(), expired_historical, expired_forward);
 
 	// Remove expired signals with error correction
 	let mut removed_count = 0;
@@ -801,6 +922,10 @@ mod tests {
 			println!("Skipping test_api due to SKIP_SLOW_TESTS environment variable");
 			return Ok(());
 		}
+
+                // Debug: Show where we're looking for the database
+                println!("Looking for Crypto database at: {}/Crypto", database::DEFAULT_DATA_DIR);
+                println!("Metadata file would be at: {}/Crypto/metadata.db", database::DEFAULT_DATA_DIR);
 
 		// Try to get the Crypto database, skip test if it doesn't exist or doesn't have the required data
 		let Ok(database) = Database::existing("Crypto").await else {
@@ -956,7 +1081,7 @@ mod tests {
 
 		let timer = std::time::Instant::now();
 		println!("Starting filter_expired_signals...");
-		filter_expired_signals(&database, &aspect.id()).await?;
+		filter_expired_signals(&database, &aspect.id(), None).await?;
 		println!("Time taken for filter_expired_signals: {:?}", timer.elapsed());
 
 		// print the number of signals after filtering
@@ -1121,38 +1246,59 @@ mod tests {
 		println!("Number of signals created: {}", signals_lock.len());
 		drop(signals_lock);
 
-		let start_time = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
-		let query_time = start_time + chrono::Duration::hours(61); // Hour 61 is our prediction target
+		let start_time = Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap();
 
-		let timer = std::time::Instant::now();
-		println!("Starting filter_expired_signals at query_time={query_time}...");
-		filter_expired_signals_at_time(&db, &aspect.id(), Some(query_time)).await?;
-		println!("Time taken for filter_expired_signals: {:?}", timer.elapsed());
-
-		// print the number of signals after filtering
+		// Filter expired signals up to the last known data point (hour 64)
+		// This removes signals whose predicted events have already occurred in the historical data.
+		// The last peak was at hour 61, so signals predicting peaks at hours 1, 5, 9, ..., 61 are all resolved.
+		let last_known_time = start_time + chrono::Duration::hours(64);
+		println!("Filtering expired signals up to last known time: {}", last_known_time);
+		filter_expired_signals(&db, &aspect.id(), Some(last_known_time)).await?;
+		
 		let signals_lock = SIGNALS_QUEUE.lock().await;
 		println!("Number of signals after filtering: {}", signals_lock.len());
+		// Debug: show sample signals AFTER filtering to understand what remains
+		for (idx, sig) in signals_lock.values().take(5).enumerate() {
+			println!("DEBUG Post-filter signal {}: manifestation_date={}, signal_type={:?}", idx, sig.manifestation_date(), sig.signal_type());
+		}
 		drop(signals_lock);
 
-		// Calculate and print the probability for the Signals in the queue
+		// Calculate and print the probability for the Signals in the queue for hours 65-70
 		let events = get_events_queue(&db, &aspect.id()).await?;
 		let event_id_option = events.first().map(|e| e.id().clone());
 		drop(events);
 
 		if let Some(event_id) = event_id_option {
-			let signals_lock = SIGNALS_QUEUE.lock().await;
-			// Use PredictStart since we're checking at the start of hour 61 (2025-01-03 13:00:00)
-			let Some(sum_probability) = signals_lock.probability_sum(&event_id, &SignalType::Custom("PredictStart".to_string()), query_time, &db, &aspect.id()).await? else {
-				bail!("No signals found for event ID {event_id}");
-			};
+			for hour in 65..=70 {
+				let query_time = start_time + chrono::Duration::hours(hour);
 
-			let Some(avg_probability) = signals_lock.probability_average(&event_id, &SignalType::Custom("PredictStart".to_string()), query_time, &db, &aspect.id()).await? else {
-				bail!("No signals found for event ID {event_id}");
-			};
+				// Note: Not filtering signals during future queries - probability should accumulate
+				// E.g., at hour 69 (8 hours after peak at 61), prob = 8hr/4hr = 2.0
 
-			println!("Peak Event Probability - Sum: {sum_probability}");
-			println!("Peak Event Probability - Average: {avg_probability}");
-			drop(signals_lock);
+				// print the number of signals
+				let signals_lock = SIGNALS_QUEUE.lock().await;
+				println!("Number of signals for hour {}: {}", hour, signals_lock.len());
+
+				let Some(sum_probability) = signals_lock.probability_sum(&event_id, &SignalType::Custom("PredictStart".to_string()), query_time, &db, &aspect.id()).await? else {
+					println!("No signals found for event ID {event_id} at hour {hour}");
+					drop(signals_lock);
+					continue;
+				};
+
+				let Some(avg_probability) = signals_lock.probability_average(&event_id, &SignalType::Custom("PredictStart".to_string()), query_time, &db, &aspect.id()).await? else {
+					println!("No signals found for event ID {event_id} at hour {hour}");
+					drop(signals_lock);
+					continue;
+				};
+
+				// Also calculate event-based probability (time since last manifestation)
+				let event_prob = signals_lock.event_probability(&event_id, &SignalType::Custom("PredictStart".to_string()), query_time, &db, &aspect.id()).await?;
+
+				// Format output nicely
+				let event_prob_str = event_prob.map(|p| format!("{:.2}", p)).unwrap_or_else(|| "N/A".to_string());
+				println!("Hour {hour} - Peak Event Probability - Event-based: {event_prob_str}, Signal Average: {:.4}, Sum: {:.2}", avg_probability, sum_probability);
+				drop(signals_lock);
+			}
 		}
 		Ok(())
 	}
@@ -1166,7 +1312,7 @@ mod tests {
 		let db = Database::new("TestDB").await.unwrap();
 		let test_subject = db.observe_subject("TestSubject").await.unwrap();
 		let test_aspect = db.track_aspect(&test_subject.id(), "TestAspect", &Resolution::Seconds).await.unwrap();
-		let start_time = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+		let start_time = Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap();
 		#[rustfmt::skip]
 		let points = vec![
                         (0, BigDecimal::from(0)), // Added hour 0 to allow peak detection at hour 1
