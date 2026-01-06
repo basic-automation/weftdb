@@ -10,175 +10,154 @@ use splimes::{Point, Resolution, Spline};
 use uuid::Uuid;
 
 use crate::{
-	cache, correlation::ErrorRate, database::traits::{AspectStructure, DatabaseStructure, Outputs}, types::database::traits::connection::Connection, AnalysisResult, AspectId, Batch, BatchId, BatchMetatdata, BatchedMeasurement, Correlation, CorrelationID, Database, DatabaseInfo, DatasetId, DictionaryConstraints, DictionaryId, DictionaryMetadata, Error, Event, EventID, Manifestation, ManifestationId, Measurement, MeasurementId, MeasurementVector, Occurrence, Pattern, PatternID, Relative, SignalType, Steps, SubjectId, VariablilityType
+	cache, correlation::ErrorRate, database::traits::{AspectStructure, DatabaseStructure, Outputs}, types::database::traits::connection::Connection, AnalysisResult, AspectId, Batch, BatchId, BatchMetatdata, BatchedMeasurement, Correlation, CorrelationID, Database, DatabaseInfo, DatasetId, DictionaryConstraints, DictionaryId, DictionaryMetadata, Error, Event, EventID, Manifestation, ManifestationId, Measurement, MeasurementId, Occurrence, Pattern, PatternID, Relative, SignalType, Steps, SubjectId, VariablilityType
 };
 
 #[async_trait::async_trait]
 impl Outputs for Database {
-	async fn get_raw_measurements(&self, aspect_id: &AspectId, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, max_per_page: usize, page: usize) -> Result<Pin<Box<dyn Stream<Item = Result<Measurement>> + Send + 'static>>> {
+	/// Streams measurements using cursor-based pagination for O(n) performance.
+	/// Uses WHERE timestamp > last_timestamp instead of OFFSET for efficient large dataset handling.
+	async fn get_raw_measurements(&self, aspect_id: &AspectId, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, max_per_page: usize, _page: usize) -> Result<Pin<Box<dyn Stream<Item = Result<Measurement>> + Send + 'static>>> {
+		tracing::debug!(aspect_id = %aspect_id.as_uuid(), "[get_raw_measurements] Starting");
+		
 		// For small page sizes with caching, check cache first (only for full range queries)
-		// Only cache if requesting first page, reasonable page size, and no time filtering
-		if page == 0 && max_per_page <= 10_000 && start.is_none() && end.is_none() {
+		if max_per_page <= 10_000 && start.is_none() && end.is_none() {
 			let cache_key = format!("aspect_measurements_{}_{}", aspect_id.as_uuid(), max_per_page);
 			if let Some(cached) = self.cache.lock().await.get::<Vec<Measurement>>(&cache_key).await {
+				tracing::debug!("[get_raw_measurements] Returning cached measurements");
 				return Ok(Box::pin(stream::iter(cached.into_iter().map(Ok))));
 			}
 		}
 
 		// Get database connection info upfront for the streaming closure
+		tracing::debug!("[get_raw_measurements] Getting measurement db...");
 		let db = self.get_measurement_db(aspect_id).await?;
+		tracing::debug!("[get_raw_measurements] Got measurement db");
 		let db_path = self.get_measurement_db_path(aspect_id).await?;
+		tracing::debug!(db_path = %db_path, "[get_raw_measurements] Got db path");
 		let cache = self.cache.clone();
-		let aspect_id_owned = *aspect_id;
 		let start_owned = start;
 		let end_owned = end;
-		let max_per_page_owned = max_per_page;
 
-		// Page size for chunked loading (use the requested page size)
-		const CHUNK_SIZE: usize = 1000;
-		let actual_page_size = max_per_page_owned.min(CHUNK_SIZE);
+		// Use very large chunk size for efficiency - fewer transactions
+		const CHUNK_SIZE: usize = 1_000_000;
 
-		// Use unfold to create a true streaming iterator that fetches in chunks
+		// State: (last_timestamp_cursor, current_chunk_buffer, db, db_path, cache, start, end, is_first_query)
+		// last_timestamp_cursor: None means we haven't started, Some(ts) means fetch records > ts
 		let stream = futures::stream::unfold(
-			(page, Vec::<Measurement>::new(), db, db_path, cache, aspect_id_owned, start_owned, end_owned, max_per_page_owned),
-			move |(current_page, mut current_measurements, db, db_path, cache, aspect_id, start, end, max_per_page)| {
+			(None::<i64>, Vec::<Measurement>::new(), db, db_path, cache, start_owned, end_owned),
+			move |(cursor, mut buffer, db, db_path, cache, start, end)| {
 				async move {
-					// If we have measurements in the current chunk, pop one and return it
-					if let Some(measurement) = current_measurements.pop() {
-						Some((Ok(measurement), (current_page, current_measurements, db, db_path, cache, aspect_id, start, end, max_per_page)))
-					} else {
-						// Need to fetch next chunk
-						let conn = match Self::begin_concurrent(&db, &db_path, Some(cache.clone())).await {
-							Ok(c) => c,
-							Err(e) => return Some((Err(e), (current_page, current_measurements, db, db_path, cache, aspect_id, start, end, max_per_page))),
-						};
+					// If we have measurements in the buffer, return one
+					if let Some(measurement) = buffer.pop() {
+						return Some((Ok(measurement), (cursor, buffer, db, db_path, cache, start, end)));
+					}
 
-						// Calculate offset for this page
-						let offset = current_page * actual_page_size;
-						let offset_i64 = match i64::try_from(offset) {
-							Ok(o) => o,
-							Err(e) => {
-								let _ = Self::commit_concurrent(&conn).await;
-								return Some((Err(anyhow::anyhow!("Offset too large: {e}")), (current_page, current_measurements, db, db_path, cache, aspect_id, start, end, max_per_page)));
-							}
-						};
+					tracing::debug!(cursor = ?cursor, "[stream] Buffer empty, fetching next chunk");
 
-						let max_per_page_i64 = match i64::try_from(actual_page_size) {
-							Ok(m) => m,
-							Err(e) => {
-								let _ = Self::commit_concurrent(&conn).await;
-								return Some((Err(anyhow::anyhow!("Page size too large: {e}")), (current_page, current_measurements, db, db_path, cache, aspect_id, start, end, max_per_page)));
-							}
-						};
+					// Need to fetch next chunk using cursor-based pagination
+					tracing::debug!("[stream] About to begin_concurrent...");
+					let conn = match Self::begin_concurrent(&db, &db_path, Some(cache.clone())).await {
+						Ok(c) => {
+							tracing::debug!("[stream] begin_concurrent succeeded");
+							c
+						},
+						Err(e) => {
+							tracing::error!(error = %e, "[stream] begin_concurrent FAILED");
+							return Some((Err(e), (cursor, buffer, db, db_path, cache, start, end)));
+						}
+					};
 
-						// Build query and parameters based on time range
-						let (query_sql, params): (String, Vec<turso::Value>) = match (start, end) {
-							(None, None) => {
-								// Return all points
-								(
-									r"
-				                    SELECT id, dataset_id, timestamp, value
-				                    FROM measurements
-				                    ORDER BY timestamp ASC
-				                    LIMIT ? OFFSET ?
-				                    "
-									.to_string(),
-									vec![turso::Value::from(max_per_page_i64), turso::Value::from(offset_i64)],
-								)
-							}
-							(Some(start_time), None) => {
-								// From start to end of data
-								(
-									r"
-				                    SELECT id, dataset_id, timestamp, value
-				                    FROM measurements
-				                    WHERE timestamp >= ?
-				                    ORDER BY timestamp ASC
-				                    LIMIT ? OFFSET ?
-				                    "
-									.to_string(),
-									vec![turso::Value::from(start_time.timestamp_millis()), turso::Value::from(max_per_page_i64), turso::Value::from(offset_i64)],
-								)
-							}
-							(None, Some(end_time)) => {
-								// From beginning to end
-								(
-									r"
-				                    SELECT id, dataset_id, timestamp, value
-				                    FROM measurements
-				                    WHERE timestamp <= ?
-				                    ORDER BY timestamp ASC
-				                    LIMIT ? OFFSET ?
-				                    "
-									.to_string(),
-									vec![turso::Value::from(end_time.timestamp_millis()), turso::Value::from(max_per_page_i64), turso::Value::from(offset_i64)],
-								)
-							}
-							(Some(start_time), Some(end_time)) => {
-								// Specific range
-								(
-									r"
-				                    SELECT id, dataset_id, timestamp, value
-				                    FROM measurements
-				                    WHERE timestamp >= ? AND timestamp <= ?
-				                    ORDER BY timestamp ASC
-				                    LIMIT ? OFFSET ?
-				                    "
-									.to_string(),
-									vec![turso::Value::from(start_time.timestamp_millis()), turso::Value::from(end_time.timestamp_millis()), turso::Value::from(max_per_page_i64), turso::Value::from(offset_i64)],
-								)
-							}
-						};
+					let limit_i64 = CHUNK_SIZE as i64;
 
-						let rows_result = conn.as_ref().query(&query_sql, params).await;
-						let mut rows = match rows_result {
-							Ok(r) => r,
-							Err(e) => {
-								let _ = Self::commit_concurrent(&conn).await;
-								return Some((Err(Error::DatabaseError(format!("Failed to query measurements: {e}")).into()), (current_page, current_measurements, db, db_path, cache, aspect_id, start, end, max_per_page)));
-							}
-						};
+					// Build query using cursor-based pagination (WHERE timestamp > cursor)
+					// This is O(1) per page instead of O(n) with OFFSET
+					let (query_sql, params): (String, Vec<turso::Value>) = match (cursor, start, end) {
+						// First query: use start time as lower bound
+						(None, None, None) => (
+							"SELECT id, dataset_id, timestamp, value FROM measurements ORDER BY timestamp ASC LIMIT ?".to_string(),
+							vec![turso::Value::from(limit_i64)],
+						),
+						(None, Some(start_time), None) => (
+							"SELECT id, dataset_id, timestamp, value FROM measurements WHERE timestamp >= ? ORDER BY timestamp ASC LIMIT ?".to_string(),
+							vec![turso::Value::from(start_time.timestamp_millis()), turso::Value::from(limit_i64)],
+						),
+						(None, None, Some(end_time)) => (
+							"SELECT id, dataset_id, timestamp, value FROM measurements WHERE timestamp <= ? ORDER BY timestamp ASC LIMIT ?".to_string(),
+							vec![turso::Value::from(end_time.timestamp_millis()), turso::Value::from(limit_i64)],
+						),
+						(None, Some(start_time), Some(end_time)) => (
+							"SELECT id, dataset_id, timestamp, value FROM measurements WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp ASC LIMIT ?".to_string(),
+							vec![turso::Value::from(start_time.timestamp_millis()), turso::Value::from(end_time.timestamp_millis()), turso::Value::from(limit_i64)],
+						),
+						// Subsequent queries: use cursor (last timestamp) as lower bound
+						(Some(last_ts), _, None) => (
+							"SELECT id, dataset_id, timestamp, value FROM measurements WHERE timestamp > ? ORDER BY timestamp ASC LIMIT ?".to_string(),
+							vec![turso::Value::from(last_ts), turso::Value::from(limit_i64)],
+						),
+						(Some(last_ts), _, Some(end_time)) => (
+							"SELECT id, dataset_id, timestamp, value FROM measurements WHERE timestamp > ? AND timestamp <= ? ORDER BY timestamp ASC LIMIT ?".to_string(),
+							vec![turso::Value::from(last_ts), turso::Value::from(end_time.timestamp_millis()), turso::Value::from(limit_i64)],
+						),
+					};
 
-						// Collect measurements from this chunk
-						let mut new_measurements = Vec::new();
-						loop {
-							match rows.next().await {
-								Ok(Some(row)) => {
-									match Self::parse_measurement_row_static(row).await {
-										Ok(measurement) => new_measurements.push(measurement),
-										Err(e) => {
-											let _ = Self::commit_concurrent(&conn).await;
-											return Some((Err(e), (current_page, current_measurements, db, db_path, cache, aspect_id, start, end, max_per_page)));
-										}
+					tracing::debug!("[stream] About to execute query...");
+					let rows_result = conn.as_ref().query(&query_sql, params).await;
+					tracing::debug!("[stream] Query executed!");
+					let mut rows = match rows_result {
+						Ok(r) => {
+							tracing::debug!("[stream] Query succeeded");
+							r
+						},
+						Err(e) => {
+							tracing::error!(error = %e, "[stream] Query FAILED");
+							let _ = Self::commit_concurrent(&conn).await;
+							return Some((Err(Error::DatabaseError(format!("Failed to query measurements: {e}")).into()), (cursor, buffer, db, db_path, cache, start, end)));
+						}
+					};
+
+					// Collect measurements from this chunk and track the last timestamp
+					let mut new_measurements = Vec::with_capacity(CHUNK_SIZE);
+					let mut new_cursor: Option<i64> = cursor;
+
+					loop {
+						match rows.next().await {
+							Ok(Some(row)) => {
+								match Self::parse_measurement_row_static(row).await {
+									Ok(measurement) => {
+										// Update cursor to the timestamp of this measurement
+										new_cursor = Some(measurement.timestamp().timestamp_millis());
+										new_measurements.push(measurement);
+									}
+									Err(e) => {
+										let _ = Self::commit_concurrent(&conn).await;
+										return Some((Err(e), (new_cursor, buffer, db, db_path, cache, start, end)));
 									}
 								}
-								Ok(None) => break,
-								Err(e) => {
-									let _ = Self::commit_concurrent(&conn).await;
-									return Some((Err(Error::DatabaseError(format!("Failed to read measurement row: {e}")).into()), (current_page, current_measurements, db, db_path, cache, aspect_id, start, end, max_per_page)));
-								}
+							}
+							Ok(None) => break,
+							Err(e) => {
+								let _ = Self::commit_concurrent(&conn).await;
+								return Some((Err(Error::DatabaseError(format!("Failed to read measurement row: {e}")).into()), (new_cursor, buffer, db, db_path, cache, start, end)));
 							}
 						}
+					}
 
-						let _ = Self::commit_concurrent(&conn).await;
+					let _ = Self::commit_concurrent(&conn).await;
 
-						if new_measurements.is_empty() {
-							// No more data, end the stream
-							return None;
-						}
+					if new_measurements.is_empty() {
+						// No more data, end the stream
+						return None;
+					}
 
-						// Update page for next iteration
-						let next_page = current_page + 1;
+					// Reverse so we can pop from the end efficiently (LIFO for FIFO order)
+					new_measurements.reverse();
 
-						// Reverse so we can pop from the end efficiently
-						new_measurements.reverse();
-
-						// Pop first measurement and return it
-						if let Some(measurement) = new_measurements.pop() {
-							Some((Ok(measurement), (next_page, new_measurements, db, db_path, cache, aspect_id, start, end, max_per_page)))
-						} else {
-							None
-						}
+					// Pop first measurement and return it
+					if let Some(measurement) = new_measurements.pop() {
+						Some((Ok(measurement), (new_cursor, new_measurements, db, db_path, cache, start, end)))
+					} else {
+						None
 					}
 				}
 			},
@@ -401,7 +380,29 @@ impl Outputs for Database {
 	async fn analyze_range(&self, aspect_id: &AspectId, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, method: Spline) -> Result<Pin<Box<dyn Stream<Item = Result<Point>> + Send + 'static>>> {
 		// Pre-fetch all measurements for the range to avoid async issues in the stream
 		// For very large ranges, this could be optimized further with lazy loading
-		let all_measurements: Vec<Measurement> = self.fetch_measurements_for_range(aspect_id, start, end).await?.collect::<Vec<_>>().await.into_iter().collect::<Result<Vec<_>>>()?;
+		tracing::info!(start = %start, end = %end, "[analyze_range] Starting measurement collection");
+		tracing::debug!("[analyze_range] About to call fetch_measurements_for_range...");
+		
+		let mut measurement_stream = self.fetch_measurements_for_range(aspect_id, start, end).await?;
+		tracing::debug!("[analyze_range] fetch_measurements_for_range returned, stream created");
+		tracing::debug!("[analyze_range] About to call stream.next() for first item...");
+		
+		let mut all_measurements: Vec<Measurement> = Vec::new();
+		let mut count = 0usize;
+		let progress_interval = 1_000_000; // Report every 1M measurements
+		
+		while let Some(result) = measurement_stream.next().await {
+			if count == 0 {
+				tracing::debug!("[analyze_range] Received first measurement from stream!");
+			}
+			let measurement = result?;
+			all_measurements.push(measurement);
+			count += 1;
+			if count % progress_interval == 0 {
+				tracing::info!(count = count, "[analyze_range] Loaded measurements...");
+			}
+		}
+		tracing::info!(total = count, "[analyze_range] Finished loading measurements");
 
 		if all_measurements.is_empty() {
 			// Try boundary measurements if no data in range
@@ -422,6 +423,7 @@ impl Outputs for Database {
 		}
 
 		// Convert measurements to points
+		tracing::debug!(count = all_measurements.len(), "[analyze_range] Converting measurements to points...");
 		let mut points: Vec<Point> = all_measurements.iter().map(|m| Point { timestamp: m.timestamp(), value: m.value().clone() }).collect();
 
 		// For large datasets, we'll process in chunks to avoid memory issues
@@ -430,16 +432,20 @@ impl Outputs for Database {
 		let total_ns = total_duration.num_nanoseconds().unwrap_or(i64::MAX);
 		let step_ns = step_duration.num_nanoseconds().unwrap_or(1);
 		let expected_points = if step_ns > 0 { (total_ns / step_ns) + 1 } else { 1 };
+		tracing::info!(expected_points = expected_points, step = ?step_duration, "[analyze_range] Calculated output");
 
 		// If expected output is reasonable, process all at once
 		if expected_points < 1_000_000 {
 			// Small enough to process all at once
+			tracing::debug!(expected_points = expected_points, "[analyze_range] Processing all at once (< 1M threshold)");
 			let interpolated = splimes::auto_interpolate(&mut points, start, end, resolution, method).await?;
+			tracing::info!(output_points = interpolated.len(), "[analyze_range] Interpolation complete");
 			let point_stream = futures::stream::iter(interpolated.into_iter().map(Ok));
 			return Ok(Box::pin(point_stream));
 		}
 
 		// For very large outputs, process in time-based chunks
+		tracing::info!(expected_points = expected_points, "[analyze_range] Using chunked processing");
 		let chunk_size = 100_000; // Target points per chunk
 		let chunk_count = (expected_points + chunk_size - 1) / chunk_size; // Ceiling division
 		let chunk_duration_ns = total_ns / chunk_count;
@@ -590,7 +596,7 @@ impl Outputs for Database {
 				batches.push(batch);
 			} else {
 				// Log error but continue processing other batches
-				eprintln!("Warning: Failed to parse batch row");
+				tracing::warn!("Failed to parse batch row");
 			}
 		}
 		
@@ -684,7 +690,7 @@ impl Outputs for Database {
 				batches.push(batch);
 			} else {
 				// Log error but continue processing other batches
-				eprintln!("Warning: Failed to parse batch row");
+				tracing::warn!("Failed to parse batch row");
 			}
 		}
 
@@ -939,7 +945,7 @@ impl Outputs for Database {
 				patterns.push(pattern);
 			} else {
 				// Log error but continue processing other patterns
-				eprintln!("Warning: Failed to parse pattern row for ID {pattern_id_str}");
+				tracing::warn!("Failed to parse pattern row for ID {pattern_id_str}");
 			}
 		}
 		let _ = Self::commit_concurrent(&conn).await;
@@ -1106,7 +1112,7 @@ impl Outputs for Database {
 						match Self::fetch_correlation_by_id(&db, &db_path, &cache, &aspect_id, &correlation_id).await {
 							Ok(correlation) => Some((Ok(correlation), (offset, current_ids, db, db_path, cache, aspect_id))),
 							Err(e) => {
-								eprintln!("Warning: Failed to fetch correlation {correlation_id}: {e}");
+								tracing::warn!("Failed to fetch correlation {correlation_id}: {e}");
 								// Continue with next ID
 								Some((Err(e), (offset, current_ids, db, db_path, cache, aspect_id)))
 							}
@@ -1144,8 +1150,8 @@ impl Outputs for Database {
 								}
 								Ok(None) => break,
 								Err(e) => {
-									eprintln!("Warning: Error reading correlation ID row: {e}");
-									break;
+											tracing::warn!("Error reading correlation ID row: {e}");
+											break;
 								}
 							}
 						}
@@ -1168,7 +1174,7 @@ impl Outputs for Database {
 							match Self::fetch_correlation_by_id(&db, &db_path, &cache, &aspect_id, &correlation_id).await {
 								Ok(correlation) => Some((Ok(correlation), (new_offset, new_ids, db, db_path, cache, aspect_id))),
 								Err(e) => {
-									eprintln!("Warning: Failed to fetch correlation {correlation_id}: {e}");
+									tracing::warn!("Failed to fetch correlation {correlation_id}: {e}");
 									Some((Err(e), (new_offset, new_ids, db, db_path, cache, aspect_id)))
 								}
 							}
@@ -1281,7 +1287,7 @@ impl Outputs for Database {
 				events.push(event);
 			} else {
 				// Log error but continue processing other events
-				eprintln!("Warning: Failed to parse unprocessed event with ID {event_id}");
+				tracing::warn!("Failed to parse unprocessed event with ID {event_id}");
 			}
 		}
 		// Cache the events
@@ -1364,7 +1370,7 @@ impl Outputs for Database {
                                 events.push(event);
                         } else {
                                 // Log error but continue processing other events
-                                eprintln!("Warning: Failed to parse processed event with ID {event_id}");
+                                tracing::warn!("Failed to parse processed event with ID {event_id}");
                         }
                 }
                 // Cache the events

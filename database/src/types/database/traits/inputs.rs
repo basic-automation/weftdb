@@ -51,6 +51,9 @@ pub trait Inputs {
 	/// remove unprocessed batch for a given aspect
 	async fn remove_unprocessed_batch(&self, aspect_id: &AspectId, batch_id: &BatchId) -> Result<TxId>;
 
+	/// Bulk remove unprocessed batches for a given aspect (single transaction)
+	async fn bulk_remove_unprocessed_batches(&self, aspect_id: &AspectId, batch_ids: &[BatchId]) -> Result<()>;
+
 	/// clear all unprocessed batches for a given aspect
 	async fn clear_unprocessed_batches(&self, aspect_id: &AspectId) -> Result<TxId>;
 
@@ -67,14 +70,24 @@ pub trait Inputs {
 	// Capture multiple processed batches for a given aspect
 	async fn batch_insert_processed_batches(&self, aspect_id: &AspectId, batches: Vec<Batch>) -> Result<Vec<TxId>>;
 
+	/// Bulk insert processed batches using a single transaction with multi-row INSERT
+	async fn bulk_insert_processed_batches(&self, aspect_id: &AspectId, batches: &[Batch]) -> Result<()>;
+
 	/// remove processed batch for a given aspect
 	async fn remove_processed_batch(&self, aspect_id: &AspectId, batch_id: &BatchId) -> Result<TxId>;
+
+	/// Bulk remove processed batches for a given aspect (single transaction)
+	async fn bulk_remove_processed_batches(&self, aspect_id: &AspectId, batch_ids: &[BatchId]) -> Result<()>;
 
 	/// clear all processed batches for a given aspect
 	async fn clear_processed_batches(&self, aspect_id: &AspectId) -> Result<TxId>;
 
 	/// cleanup processed batches older than the specified timestamp for a given aspect
 	async fn cleanup_processed_batches(&self, aspect_id: &AspectId, older_than: chrono::DateTime<chrono::Utc>) -> Result<TxId>;
+
+	/// Move batches from unprocessed to processed in bulk (atomic operation)
+	/// This is more efficient than separate insert + delete for each batch
+	async fn move_batches_to_processed(&self, aspect_id: &AspectId, batches: &[Batch]) -> Result<()>;
 
 	//
 	// Patterns

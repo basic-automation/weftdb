@@ -4,6 +4,7 @@ use database::{
 };
 use futures::StreamExt;
 use splimes::{Resolution, Spline};
+use tracing::{debug, info};
 
 use crate::{Batch, BatchedMeasurement};
 
@@ -27,16 +28,15 @@ pub async fn build_unprocessed_queue(database: &Database, aspect: &AspectId, res
 		all_points.push(point);
 	}
 
-	println!("Total points streamed: {}", all_points.len());
-	println!("Batch size: {batch_size}");
-	println!("Start time: {start_time}, End time: {end_time}");
+	info!(total_points = all_points.len(), batch_size, %start_time, %end_time, "Points streamed for batch creation");
 
 	// Create sliding window batches (overlapping)
 	if batch_size > 0 && all_points.len() >= batch_size {
 		let database_info = database.get_database_info().await.map_err(|_| anyhow::anyhow!("Database info not available"))?;
 
 		let total_batches = all_points.len() - batch_size + 1;
-		println!("Creating {total_batches} sliding window batches...");
+		let report_interval = std::cmp::max(1000, total_batches / 10); // Report every 1000 or 10% (whichever is larger)
+		info!(total_batches, "Creating sliding window batches");
 
 		// Collect all batches first, then store them in bulk for better performance
 		let mut batches = Vec::with_capacity(total_batches);
@@ -51,18 +51,18 @@ pub async fn build_unprocessed_queue(database: &Database, aspect: &AspectId, res
 			batches.push(batch);
 
 			// Progress indicator for batch creation
-			if total_batches > 1000 && (i + 1) % 1000 == 0 {
-				println!("Created {} / {} batches", i + 1, total_batches);
+			if (i + 1) % report_interval == 0 || i + 1 == total_batches {
+				debug!(created = i + 1, total = total_batches, "Batch creation progress");
 			}
 		}
 
-		println!("Storing {} batches in database...", batches.len());
+		info!(batch_count = batches.len(), "Storing batches in database");
 		// Store all batches at once using bulk insert
 		database.batch_insert_unprocessed_batches(aspect, batches).await?;
 	}
 
 	// Note: No longer using global queue length since batches are stored in database
-	println!("Batches stored in database successfully");
+	info!("Batches stored in database successfully");
 
 	Ok(())
 }
