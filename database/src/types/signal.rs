@@ -299,10 +299,6 @@ impl Signal {
 	///
 	/// Returns an error if time difference calculation fails
 	pub fn probability_with_average_distance(&self, date: DateTime<Utc>, average_distance: &Distance) -> Result<BigDecimal> {
-		// Debug: Track probability calculations (first 5)
-		static PROBABILITY_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-		let count = PROBABILITY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
 		// Check for division by zero
 		if average_distance.value.is_zero() {
 			return Ok(BigDecimal::zero()); // Avoid division by zero
@@ -340,10 +336,6 @@ impl Signal {
 	/// - Distance unit conversion fails
 	#[deprecated(note = "Use probability_with_average_distance instead, which uses the correlation's average_distance as per documentation")]
 	pub fn probability(&self, date: DateTime<Utc>, error_rate: &Distance) -> Result<BigDecimal> {
-		// Debug: Track probability calculations (first 5)
-		static PROBABILITY_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-		let count = PROBABILITY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
 		// Check for division by zero
 		if self.distance.value.is_zero() && error_rate.value.is_zero() {
 			return Ok(BigDecimal::zero()); // Avoid division by zero
@@ -516,7 +508,6 @@ impl Signals {
 		let mut seen_correlations: HashSet<CorrelationID> = HashSet::new();
 		let mut total_error_rate = BigDecimal::zero();
 		let mut error_rate_count = 0usize;
-		let mut debug_signal_count = 0;
 		
 		for s in &signals {
 			// Skip signals whose manifestation_date is in the future (not yet relevant)
@@ -871,8 +862,8 @@ impl Signals {
 	/// Find a random signal (useful for testing)
 	#[must_use]
 	pub fn find_random(&self) -> Option<&Signal> {
-		use rand::{seq::IteratorRandom, rng};
-		self.0.values().choose(&mut rng())
+		use rand::{seq::IteratorRandom, thread_rng};
+		self.0.values().choose(&mut thread_rng())
 	}
 
 	/// Get all unique correlation IDs

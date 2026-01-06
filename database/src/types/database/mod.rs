@@ -59,14 +59,35 @@ impl DatabaseStructure for Database {
 
 		// If not in cache check if the database file exists on disk
 		if Path::new(db_path).exists() {
-			let turso_db = Builder::new_local(db_path).with_mvcc(true).build().await?;
+			// Check if MVCC log files exist - if so, try to clean them up first
+			// The turso MVCC mode can leave behind log files that cause permission errors on Windows
+			let log_path = format!("{}-log", db_path);
+			let wal_path = format!("{}-wal", db_path);
+			
+			// Remove stale MVCC log files if they exist (they cause permission errors on reopening)
+			if Path::new(&log_path).exists() {
+				match std::fs::remove_file(&log_path) {
+					Ok(_) => tracing::debug!("Removed stale MVCC log file: {}", log_path),
+					Err(e) => tracing::warn!("Could not remove MVCC log file {}: {}", log_path, e),
+				}
+			}
+			// Only remove WAL files if they're empty (indicating incomplete transactions)
+			if Path::new(&wal_path).exists() && std::fs::metadata(&wal_path).map(|m| m.len() == 0).unwrap_or(false) {
+				match std::fs::remove_file(&wal_path) {
+					Ok(_) => tracing::debug!("Removed empty WAL file: {}", wal_path),
+					Err(e) => tracing::warn!("Could not remove WAL file {}: {}", wal_path, e),
+				}
+			}
+			
+			// Open database (MVCC is now enabled via PRAGMA journal_mode=experimental_mvcc in 0.4.0)
+			let turso_db = Builder::new_local(db_path).build().await?;
 
-			// Configure database for concurrent writes
+			// Configure database for MVCC concurrent writes
 			{
 				let conn = turso_db.connect()?;
 
-				// Enable WAL mode - required for concurrent writes
-				conn.execute("PRAGMA journal_mode=WAL", turso::params![]).await.ok();
+				// Enable MVCC mode - required for BEGIN CONCURRENT transactions (Turso 0.4.0+)
+				conn.execute("PRAGMA journal_mode=experimental_mvcc", turso::params![]).await.ok();
 
 				// Set busy timeout for handling transient locks
 				conn.execute("PRAGMA busy_timeout = 30000", turso::params![]).await.ok();
@@ -96,9 +117,10 @@ impl DatabaseStructure for Database {
 		}
 
 		// Create the database (file will be created if it doesn't exist)
-		let turso_db = Builder::new_local(db_path).with_mvcc(true).build().await?;
+		// MVCC is now enabled via PRAGMA journal_mode in Turso 0.4.0+
+		let turso_db = Builder::new_local(db_path).build().await?;
 
-		// Configure database for MVCC concurrent writes
+		// Configure database for MVCC concurrent writes (enables MVCC via PRAGMA)
 		Self::configure_database_for_mvcc(&turso_db).await?;
 		
 		// Allow connection to fully close before returning
@@ -128,9 +150,9 @@ impl DatabaseStructure for Database {
 		let res = conn.as_ref().execute("INSERT INTO transactions (id, message, created_at) VALUES (?, ?, ?)", turso::params![id_str.clone(), msg.clone(), created_at]).await;
 
 		match res {
-			Ok(_) => println!("[TRACE] Background logged transaction id={id_str}"),
+			Ok(_) => tracing::trace!("Background logged transaction id={id_str}"),
 			Err(e) => {
-				println!("[TRACE] Background transaction logging attempt failed: {e}");
+				tracing::trace!("Background transaction logging attempt failed: {e}");
 				let _ = Self::rollback_concurrent(&conn).await;
 				return Err(anyhow::anyhow!("Failed to log transaction {id_str}: {e}"));
 			}
@@ -157,9 +179,9 @@ impl DatabaseStructure for Database {
 		let res = conn.as_ref().execute("INSERT INTO transactions (id, message, created_at) VALUES (?, ?, ?)", turso::params![id_str.clone(), msg.clone(), created_at]).await;
 
 		match res {
-			Ok(_) => println!("[TRACE] Logged transaction id={id_str}"),
+			Ok(_) => tracing::trace!("Logged transaction id={id_str}"),
 			Err(e) => {
-				println!("[TRACE] Transaction logging attempt failed: {e}");
+				tracing::trace!("Transaction logging attempt failed: {e}");
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("Failed to log transaction {id_str}: {e}"));
 			}
@@ -186,9 +208,9 @@ impl DatabaseStructure for Database {
 			.await;
 
 		match res {
-			Ok(_) => println!("[DEBUG] Transactions table created or already exists"),
+			Ok(_) => tracing::debug!("Transactions table created or already exists"),
 			Err(e) => {
-				println!("[DEBUG] Failed to create transactions table: {e}");
+				tracing::debug!("Failed to create transactions table: {e}");
 				return Err(anyhow::anyhow!("SQL execution failure 5: `{e}`"));
 			}
 		}
@@ -213,7 +235,7 @@ impl DatabaseStructure for Database {
 			.await;
 
 		match res {
-			Ok(_) => println!("[DEBUG] Database table created or already exists"),
+			Ok(_) => tracing::debug!("Database table created or already exists"),
 			Err(e) => {
 				return Err(anyhow::anyhow!("SQL execution failure 6: `{e}`"));
 			}
@@ -239,9 +261,9 @@ impl DatabaseStructure for Database {
 			.await;
 
 		match res {
-			Ok(_) => println!("[DEBUG] Subjects table created or already exists"),
+			Ok(_) => tracing::debug!("Subjects table created or already exists"),
 			Err(e) => {
-				println!("[DEBUG] Failed to create subjects table: {e}");
+				tracing::debug!("Failed to create subjects table: {e}");
 				return Err(anyhow::anyhow!("SQL execution failure 7: `{e}`"));
 			}
 		}
@@ -271,9 +293,9 @@ impl DatabaseStructure for Database {
 			.await;
 
 		match res {
-			Ok(_) => println!("[DEBUG] Aspects table created or already exists"),
+			Ok(_) => tracing::debug!("Aspects table created or already exists"),
 			Err(e) => {
-				println!("[DEBUG] Failed to create aspects table: {e}");
+				tracing::debug!("Failed to create aspects table: {e}");
 				return Err(anyhow::anyhow!("SQL execution failure 8: `{e}`"));
 			}
 		}
@@ -282,16 +304,16 @@ impl DatabaseStructure for Database {
 	}
 
 	async fn wireframe_metadata_database(conn: &cache::Connection) -> Result<Vec<Transaction>> {
-		println!("[DEBUG] Connecting to database for table creation...");
-		println!("[DEBUG] Creating transactions table...");
+		tracing::debug!("Connecting to database for table creation...");
+		tracing::debug!("Creating transactions table...");
 		let create_transactions_table_transaction = Self::metadata_database_create_transactions_table(conn).await?;
-		println!("[DEBUG] Creating database table...");
+		tracing::debug!("Creating database table...");
 		let create_database_table_transaction = Self::metadata_database_create_database_table(conn).await?;
-		println!("[DEBUG] Creating subjects table...");
+		tracing::debug!("Creating subjects table...");
 		let create_subjects_table_transaction = Self::metadata_database_create_subjects_table(conn).await?;
-		println!("[DEBUG] Creating aspects table...");
+		tracing::debug!("Creating aspects table...");
 		let create_aspects_table_transaction = Self::metadata_database_create_aspects_table(conn).await?;
-		println!("[DEBUG] All tables created successfully");
+		tracing::debug!("All tables created successfully");
 
 		#[rustfmt::skip]
 		Ok(vec![
@@ -308,10 +330,10 @@ impl DatabaseStructure for Database {
 	/// # Errors
 	/// - if folder /data/{name} already exists.
 	async fn new(name: &str) -> Result<Self> {
-		println!("[DEBUG] Creating new database: {name}");
+		tracing::debug!("Creating new database: {name}");
 		let data_dir = Self::get_data_dir();
 		let db_path = format!("{data_dir}/{name}");
-		println!("[DEBUG] Database path: {db_path}");
+		tracing::debug!("Database path: {db_path}");
 
 		// Check if folder already exists
 		if Path::new(&db_path).exists() {
@@ -320,44 +342,44 @@ impl DatabaseStructure for Database {
 
 		// Create the directory
 		std::fs::create_dir_all(&db_path)?;
-		println!("[DEBUG] Created directory: {db_path}");
+		tracing::debug!("Created directory: {db_path}");
 
 		let db_id = DatabaseId::new();
-		println!("[DEBUG] Generated database ID: {}", db_id.as_uuid());
+		tracing::debug!("Generated database ID: {}", db_id.as_uuid());
 
 		// Use shared connection database
 		let metadata_db_path = format!("{db_path}/metadata.db");
-		println!("[DEBUG] Creating Turso database at: {metadata_db_path}");
+		tracing::debug!("Creating Turso database at: {metadata_db_path}");
 		let metadata_turso_db = Self::create_turso_database(&metadata_db_path).await?;
-		println!("[DEBUG] Turso database created successfully");
+		tracing::debug!("Turso database created successfully");
 
 		// For DDL operations (CREATE TABLE), use a direct connection without BEGIN CONCURRENT
 		// DDL operations may not be compatible with MVCC concurrent transactions
-		println!("[DEBUG] Creating metadata tables...");
+		tracing::debug!("Creating metadata tables...");
 		let schema_conn = metadata_turso_db.connect()?;
 		let transactions = Self::wireframe_metadata_database_direct(&schema_conn).await;
 		let mut transactions = match transactions {
 			Ok(txs) => txs,
 			Err(e) => {
-				println!("[DEBUG] Failed to create metadata tables: {e}");
+				tracing::debug!("Failed to create metadata tables: {e}");
 				return Err(anyhow::anyhow!("Failed to create metadata tables: {e}"));
 			}
 		};
 		drop(schema_conn);
-		println!("[DEBUG] Metadata tables created, {} transactions logged", transactions.len());
+		tracing::debug!("Metadata tables created, {} transactions logged", transactions.len());
 
 		// Now use BEGIN CONCURRENT for data operations (INSERT)
 		let conn = Self::begin_concurrent(&metadata_turso_db, &metadata_db_path, None).await?;
 		
 		// Insert database metadata using concurrent-safe transaction pattern
-		println!("[DEBUG] Inserting database metadata...");
+		tracing::debug!("Inserting database metadata...");
 
 		let exec_res = conn.as_ref().execute("INSERT INTO database (id, name, created_at, metadata_path) VALUES (?, ?, ?, ?)", turso::params![db_id.as_uuid().to_string(), name.to_string(), chrono::Utc::now().timestamp_millis(), metadata_db_path.clone()]).await;
 
 		match exec_res {
-			Ok(_) => println!("[DEBUG] Database metadata inserted successfully"),
+			Ok(_) => tracing::debug!("Database metadata inserted successfully"),
 			Err(e) => {
-				println!("[DEBUG] Failed to insert database metadata: {e}");
+				tracing::debug!("Failed to insert database metadata: {e}");
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("SQL execution failure 9: `{e}`"));
 			}
@@ -378,6 +400,9 @@ impl DatabaseStructure for Database {
 		for transaction in transactions {
 			let () = db.log_transaction(&transaction).await?;
 		}
+
+		// Checkpoint metadata WAL to ensure schema and initial data are persisted
+		Self::checkpoint_wal(&db.metadata).await?;
 
 		Ok(db)
 	}
@@ -481,7 +506,7 @@ impl DatabaseStructure for Database {
 
 		DATABASES.lock().await.insert(db_id, db_info);
 
-		Ok(Self { id: db_id, name: name.to_string(), metadata: metadata_turso_db, metadata_path: db_path.clone(), cache: Arc::new(Mutex::new(cache::DatabaseCache::new())) })
+		Ok(Self { id: db_id, name: name.to_string(), metadata: metadata_turso_db, metadata_path: metadata_db_path.to_string(), cache: Arc::new(Mutex::new(cache::DatabaseCache::new())) })
 	}
 
 	async fn get_database_info(&self) -> Result<DatabaseInfo> {
@@ -494,6 +519,9 @@ impl DatabaseStructure for Database {
 	///
 	/// Returns an error if there are issues closing connection pools or removing resources.
 	async fn close(&self) -> Result<()> {
+		// Checkpoint metadata WAL before closing to ensure all data is persisted
+		Self::checkpoint_wal(&self.metadata).await.ok();
+
 		{
 			let mut databases = DATABASES.lock().await;
 			if let Some(_db_info) = databases.remove(&self.id) {
@@ -530,7 +558,7 @@ impl DatabaseStructure for Database {
 					// File is still locked, wait and retry
 					if attempt == MAX_ATTEMPTS - 1 {
 						// Last attempt failed, but don't error - just log
-						eprintln!("Warning: Database may still be locked after {MAX_ATTEMPTS} attempts: {metadata_db_path}");
+						tracing::warn!("Database may still be locked after {MAX_ATTEMPTS} attempts: {metadata_db_path}");
 						return Ok(());
 					}
 					tokio::time::sleep(std::time::Duration::from_millis(DELAY_MS)).await;
@@ -555,7 +583,7 @@ impl DatabaseStructure for Database {
 				let error_msg = e.to_string().to_lowercase();
 				if error_msg.contains("i/o error") || error_msg.contains("unexpected end of file") {
 					if attempts == 1 {
-						eprintln!("⚠️  Database appears to be locked by another application (like DB Browser). Retrying...");
+						tracing::warn!("Database appears to be locked by another application (like DB Browser). Retrying...");
 					}
 					tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 				} else {
@@ -566,7 +594,7 @@ impl DatabaseStructure for Database {
 			Err(e) => {
 				let error_msg = e.to_string().to_lowercase();
 				if error_msg.contains("i/o error") || error_msg.contains("unexpected end of file") {
-					eprintln!("\n❌ Database locked after {max_attempts} attempts. Close DB Browser and try again.\n");
+					tracing::warn!("Database locked after {max_attempts} attempts. Close DB Browser and try again.");
 				}
 				Err(Error::DatabaseError(format!("Failed to connect after {max_attempts} attempts: {e}")).into())
 			}
@@ -581,7 +609,7 @@ impl DatabaseStructure for Database {
 	/// # Errors
 	/// 1. Returns error if the subject already exists
 	async fn observe_subject(&self, name: &str) -> Result<Subject> {
-		println!("[DEBUG] Observing subject: {name}");
+		tracing::debug!("Observing subject: {name}");
 		// Check if subject already exists
 		if self.get_subject_by_name(name).await.is_ok() {
 			return Err(anyhow::anyhow!("Subject '{name}' already exists"));
@@ -589,7 +617,7 @@ impl DatabaseStructure for Database {
 
 		// Create subject folder
 		let subject_path = format!("{}/{}/{}", Self::get_data_dir(), self.name, name);
-		println!("[DEBUG] Creating subject folder: {subject_path}");
+		tracing::debug!("Creating subject folder: {subject_path}");
 		tokio::fs::create_dir_all(&subject_path).await?;
 
 		// Add subject to database metadata
@@ -597,12 +625,12 @@ impl DatabaseStructure for Database {
 		let metadata_db_path = self.metadata_path.clone();
 
 		// create subject
-		println!("[DEBUG] Creating Subject instance...");
+		tracing::debug!("Creating Subject instance...");
 		let subject = Subject::new(None, name.to_string(), self.id, self.metadata_path.clone()).await?;
-		println!("[DEBUG] Subject created with ID: {}", subject.id().as_uuid());
+		tracing::debug!("Subject created with ID: {}", subject.id().as_uuid());
 
 		// Add subject to metadata database
-		println!("[DEBUG] Inserting subject into database...");
+		tracing::debug!("Inserting subject into database...");
 		let id_str = subject.id().as_uuid().to_string();
 		let name_str = name.to_string();
 		let db_id_str = self.id.as_uuid().to_string();
@@ -611,7 +639,7 @@ impl DatabaseStructure for Database {
 		let conn = Self::begin_concurrent(metadata_db, &metadata_db_path, Some(self.cache.clone())).await?;
 		let res = conn.as_ref().execute("INSERT INTO subjects (id, name, database_id, created_at) VALUES (?, ?, ?, ?)", turso::params![id_str.clone(), name_str.clone(), db_id_str.clone(), created_at]).await;
 		match res {
-			Ok(_) => println!("[DEBUG] Subject inserted successfully"),
+			Ok(_) => tracing::debug!("Subject inserted successfully"),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("SQL execution failure 10: `{e}`"));
@@ -619,7 +647,7 @@ impl DatabaseStructure for Database {
 		}
 
 		let _ = Self::commit_concurrent(&conn).await;
-		println!("[DEBUG] Subject inserted successfully");
+		tracing::debug!("Subject inserted successfully");
 
 		// Update in-memory cache so subsequent operations don't need metadata DB
 		{
@@ -632,22 +660,25 @@ impl DatabaseStructure for Database {
 		// Log the transaction
 		self.record_transaction(&format!("Added subject '{name}'")).await?;
 
+		// Checkpoint metadata WAL to ensure subject is persisted
+		Self::checkpoint_wal(&self.metadata).await?;
+
 		Ok(subject)
 	}
 
 	/// Get a subject by its ID
 	async fn get_subject(&self, id: &SubjectId) -> Result<Subject> {
 		// Read-only subject lookup with busy_timeout and retry; avoid transactions to reduce lock contention
-		println!("[DEBUG] Getting subject by ID: {}", id.as_uuid());
+		tracing::debug!("Getting subject by ID: {}", id.as_uuid());
 
 		let conn = Self::begin_concurrent(&self.metadata, &self.metadata_path, Some(self.cache.clone())).await?;
-		println!("[DEBUG] Connected to metadata DB, querying for subject ID {}", id.as_uuid());
+		tracing::debug!("Connected to metadata DB, querying for subject ID {}", id.as_uuid());
 		let res = conn.as_ref().query("SELECT id, name, database_id FROM subjects WHERE id = ?", turso::params![id.as_uuid().to_string()]).await;
 
 		let subject = match res {
 			Ok(mut rows) => {
 				if let Some(row) = rows.next().await? {
-					println!("[DEBUG] Found subject row for ID {}", id.as_uuid());
+					tracing::debug!("Found subject row for ID {}", id.as_uuid());
 					let subject_id_str = Self::value_to_string(&row.get_value(0)?, "Subject ID").await?;
 					let name = Self::value_to_string(&row.get_value(1)?, "Subject name").await?;
 					let database_id_str = Self::value_to_string(&row.get_value(2)?, "Database ID").await?;
@@ -656,7 +687,7 @@ impl DatabaseStructure for Database {
 					let database_id = DatabaseId::from_uuid(Uuid::parse_str(&database_id_str)?);
 					Subject::new(Some(subject_id), name, database_id, self.metadata_path.clone()).await?
 				} else {
-					println!("[DEBUG] Subject ID {} not found in database", id.as_uuid());
+					tracing::debug!("Subject ID {} not found in database", id.as_uuid());
 					return Err(anyhow::anyhow!("Subject not found"));
 				}
 			}
@@ -714,7 +745,7 @@ impl DatabaseStructure for Database {
 		let conn = Self::begin_concurrent(metadata_db, &metadata_db_path, Some(self.cache.clone())).await?;
 		let res = conn.as_ref().execute("DELETE FROM subjects WHERE id = ?", turso::params![id_str.clone()]).await;
 		match res {
-			Ok(_) => println!("Deleted subject with ID {}", id.as_uuid()),
+			Ok(_) => tracing::debug!("Deleted subject with ID {}", id.as_uuid()),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("SQL execution failure 13: `{e}`"));
@@ -724,6 +755,9 @@ impl DatabaseStructure for Database {
 
 		// Log the transaction
 		self.record_transaction(&format!("Removed subject '{}'", subject.name())).await?;
+
+		// Checkpoint metadata WAL to ensure deletion is persisted
+		Self::checkpoint_wal(&self.metadata).await?;
 
 		Ok(())
 	}
@@ -804,13 +838,13 @@ impl DatabaseStructure for Database {
 	/// # Errors
 	/// Returns an error if the subject does not exist or aspect creation fails or the aspect already exists.
 	async fn track_aspect(&self, subject_id: &SubjectId, name: &str, resolution: &Resolution) -> Result<Aspect> {
-		println!("[DEBUG] Tracking aspect '{}' for subject {}", name, subject_id.as_uuid());
+		tracing::debug!("Tracking aspect '{}' for subject {}", name, subject_id.as_uuid());
 		// Check if subject exists
-		println!("[DEBUG] Retrieving subject with ID: {}", subject_id.as_uuid());
+		tracing::debug!("Retrieving subject with ID: {}", subject_id.as_uuid());
 		let subject = self.get_subject(subject_id).await?;
 
 		// Check if aspect already exists for the subject
-		println!("[DEBUG] Checking existing aspects for subject '{}'", subject.name());
+		tracing::debug!("Checking existing aspects for subject '{}'", subject.name());
 		let existing_aspects = self.list_aspects(subject_id).await?;
 		if existing_aspects.iter().any(|a| a.name() == name) {
 			return Err(anyhow::anyhow!("Aspect '{}' already exists for subject '{}'", name, subject.name()));
@@ -818,15 +852,15 @@ impl DatabaseStructure for Database {
 
 		// Create a new aspect folder
 		let aspect_path = format!("{}/{}/{}/{}", Self::get_data_dir(), self.name, subject.name(), name);
-		println!("[DEBUG] Creating aspect folder: {aspect_path}");
+		tracing::debug!("Creating aspect folder: {aspect_path}");
 		tokio::fs::create_dir_all(&aspect_path).await?;
 
 		// Add aspect to database metadata
 		let aspect_id = AspectId::new();
-		println!("[DEBUG] Generated aspect ID: {}", aspect_id.as_uuid());
+		tracing::debug!("Generated aspect ID: {}", aspect_id.as_uuid());
 
 		let table_name = format!("aspect_{}_{}", subject_id.as_uuid().to_string().replace('-', "_"), name.replace([' ', '-'], "_"));
-		println!("[DEBUG] Inserting aspect into database with table_name: {table_name}");
+		tracing::debug!("Inserting aspect into database with table_name: {table_name}");
 
 		let aspect_id_str = aspect_id.as_uuid().to_string();
 		let name_str = name.to_string();
@@ -841,12 +875,12 @@ impl DatabaseStructure for Database {
 
 		// Begin transaction on this connection
 		let conn = Self::begin_concurrent(metadata_db_conn, &metadata_db_path, Some(self.cache.clone())).await?;
-		println!("[TRACE] About to execute INSERT INTO aspects (aspect_id={aspect_id_str} table_name={table_name})");
+		tracing::trace!("About to execute INSERT INTO aspects (aspect_id={aspect_id_str} table_name={table_name})");
 
 		// Execute the INSERT while holding the mutex
 		conn.as_ref().execute("INSERT INTO aspects (id, name, subject_id, database_id, table_name, resolution, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", turso::params![aspect_id_str.clone(), name_str.clone(), subj_id_str.clone(), db_id_str.clone(), table_name.clone(), resolution_json.clone(), created_at]).await?;
 
-		println!("[DEBUG] Aspect inserted successfully");
+		tracing::debug!("Aspect inserted successfully");
 
 		// At this point the metadata INSERT succeeded and we've dropped the metadata connection.
 		// Release the aspect creation mutex (it was locked above) implicitly by letting the
@@ -870,19 +904,22 @@ impl DatabaseStructure for Database {
 			}
 		}
 
-		println!("Aspect created and wireframed successfully: {}", aspect.name());
+		tracing::debug!("Aspect created and wireframed successfully: {}", aspect.name());
 
 		// Log the transaction
 		self.record_transaction(&format!("Tracking new aspect '{}' for subject '{}'", name, subject.name())).await?;
 
-		println!("Transaction recorded successfully for aspect creation.");
+		// Checkpoint metadata WAL to ensure aspect is persisted
+		Self::checkpoint_wal(&self.metadata).await?;
+
+		tracing::debug!("Transaction recorded successfully for aspect creation.");
 
 		Ok(aspect)
 	}
 
 	async fn get_aspect(&self, id: &AspectId) -> Result<Aspect> {
 		let cache_key = format!("aspect_{}", id.as_uuid());
-		self.cache.lock().await.cleanup_expired().await;
+		// Check cache first (cleanup is done periodically, not on every call)
 		if let Some(cached) = self.cache.lock().await.get(&cache_key).await {
 			return Ok(cached);
 		}
@@ -1049,7 +1086,7 @@ impl DatabaseStructure for Database {
 		let conn = Self::begin_concurrent(metadata_db, &metadata_db_path, Some(self.cache.clone())).await?;
 		let res = conn.as_ref().execute("UPDATE aspects SET earliest_measurement = ?, latest_measurement = ? WHERE id = ?", turso::params![min_new.to_rfc3339(), max_new.to_rfc3339(), aspect_id.as_uuid().to_string()]).await;
 		match res {
-			Ok(_) => println!("Updated aspect timestamps for aspect {aspect_id}"),
+			Ok(_) => tracing::debug!("Updated aspect timestamps for aspect {aspect_id}"),
 			Err(e) => {
 				let _ = Self::rollback_concurrent(&conn).await;
 				return Err(anyhow::anyhow!("SQL execution failure 20: `{e}`"));
@@ -1261,9 +1298,9 @@ impl Database {
 	/// DDL operations (CREATE TABLE) may not work well with BEGIN CONCURRENT transactions
 	/// Note: Tables have no indexes to support MVCC (turso MVCC doesn't support indexes yet)
 	async fn wireframe_metadata_database_direct(conn: &turso::Connection) -> Result<Vec<Transaction>> {
-		println!("[DEBUG] Connecting to database for table creation...");
+		tracing::debug!("Connecting to database for table creation...");
 		
-		println!("[DEBUG] Creating transactions table...");
+		tracing::debug!("Creating transactions table...");
 		conn.execute(
 			r"CREATE TABLE IF NOT EXISTS transactions (
 				id TEXT NOT NULL,
@@ -1272,9 +1309,9 @@ impl Database {
 			)",
 			turso::params![],
 		).await.map_err(|e| anyhow::anyhow!("Failed to create transactions table: {e}"))?;
-		println!("[DEBUG] Transactions table created");
+		tracing::debug!("Transactions table created");
 		
-		println!("[DEBUG] Creating database table...");
+		tracing::debug!("Creating database table...");
 		conn.execute(
 			r"CREATE TABLE IF NOT EXISTS database (
 				id TEXT NOT NULL,
@@ -1284,9 +1321,9 @@ impl Database {
 			)",
 			turso::params![],
 		).await.map_err(|e| anyhow::anyhow!("Failed to create database table: {e}"))?;
-		println!("[DEBUG] Database table created");
+		tracing::debug!("Database table created");
 		
-		println!("[DEBUG] Creating subjects table...");
+		tracing::debug!("Creating subjects table...");
 		conn.execute(
 			r"CREATE TABLE IF NOT EXISTS subjects (
 				id TEXT NOT NULL,
@@ -1296,9 +1333,9 @@ impl Database {
 			)",
 			turso::params![],
 		).await.map_err(|e| anyhow::anyhow!("Failed to create subjects table: {e}"))?;
-		println!("[DEBUG] Subjects table created");
+		tracing::debug!("Subjects table created");
 		
-		println!("[DEBUG] Creating aspects table...");
+		tracing::debug!("Creating aspects table...");
 		conn.execute(
 			r"CREATE TABLE IF NOT EXISTS aspects (
 				id TEXT NOT NULL,
@@ -1313,7 +1350,7 @@ impl Database {
 			)",
 			turso::params![],
 		).await.map_err(|e| anyhow::anyhow!("Failed to create aspects table: {e}"))?;
-		println!("[DEBUG] All tables created successfully");
+		tracing::debug!("All tables created successfully");
 
 		Ok(vec![
 			Transaction::new(None, "Create transactions table".to_string()),
@@ -1468,7 +1505,7 @@ impl DatabaseInfo {
 				let res = conn.as_ref().query("SELECT created_at FROM database WHERE name = ?", turso::params![self.name.clone()]).await;
 				let timestamp = match res {
 					Ok(mut rows) => {
-						println!("[DEBUG] Querying creation time for database '{}'", self.name);
+						tracing::debug!("Querying creation time for database '{}'", self.name);
 						if let Some(row) = rows.next().await? {
 							let timestamp_str = Database::value_to_string(&row.get_value(0)?, "Creation Timestamp").await?;
 							if timestamp_str.is_empty() {

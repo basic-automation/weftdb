@@ -34,7 +34,7 @@ impl Inputs for Database {
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
 		let res = conn.as_ref().execute(insert_sql, turso::params![tx_id.as_uuid().to_string(), dataset_id.as_uuid().to_string(), measurement.timestamp().timestamp_millis(), measurement.value().to_string()]).await;
 		match res {
-			Ok(_) => println!("Successfully inserted measurement for dataset {dataset_id}"),
+			Ok(_) => tracing::debug!("Successfully inserted measurement for dataset {dataset_id}"),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("SQL execution failure 1: `{e}`"));
@@ -42,6 +42,9 @@ impl Inputs for Database {
 		}
 
 		let _ = Self::commit_concurrent(&conn).await;
+
+		// Checkpoint WAL to ensure measurement is persisted
+		Self::checkpoint_wal(&db).await?;
 
 		self.record_transaction(&format!("Captured measurement at {} with value {} for dataset {}", measurement.timestamp(), measurement.value(), dataset_id)).await
 	}
@@ -65,7 +68,7 @@ impl Inputs for Database {
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
 		let res = conn.as_ref().execute(insert_sql, turso::params![tx_id.as_uuid().to_string(), dataset_id.as_uuid().to_string(), measurement.timestamp().timestamp_millis(), measurement.value().to_string()]).await;
 		match res {
-			Ok(rows) => println!("Inserted {rows} rows"),
+			Ok(rows) => tracing::debug!("Inserted {rows} rows"),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("SQL execution failure 2: `{e}`"));
@@ -73,6 +76,9 @@ impl Inputs for Database {
 		}
 
 		let _ = Self::commit_concurrent(&conn).await;
+
+		// Checkpoint WAL to ensure measurement is persisted
+		Self::checkpoint_wal(&db).await?;
 
 		self.record_transaction(&format!("Inserted new measurement at {} for dataset {}", measurement.timestamp(), dataset_id)).await
 	}
@@ -97,42 +103,93 @@ impl Inputs for Database {
 
 		// Print initial progress message for large batches
 		if input_measurements.len() > 100_000 {
-			println!("Loading {} measurements for aspect '{}'...", input_measurements.len(), aspect_id);
+			tracing::info!("Loading {} measurements for aspect '{}'...", input_measurements.len(), aspect_id);
 		}
 
-		// Process in much larger chunks for better bulk insert performance
-		// SQLite/Turso can handle very large bulk inserts efficiently
-		let chunk_size = if input_measurements.len() > 100_000 { 50_000 } else { 25_000 };
+		// Use smaller chunks to avoid SQLite performance issues with very large SQL statements
+		// 50,000 placeholders in a single INSERT can cause parsing slowdowns
+		let chunk_size = if input_measurements.len() > 100_000 { 5_000 } else { 2_500 };
 		let total_measurements = input_measurements.len();
 		let mut all_tx_ids = Vec::with_capacity(total_measurements);
+
+		// Get DB connection info once upfront to avoid repeated lookups
+		let db = self.get_measurement_db(&aspect_id).await?;
+		let db_path = self.get_measurement_db_path(&aspect_id).await?;
+		let dataset_id_str = dataset_id.as_uuid().to_string();
 
 		for (chunk_idx, chunk) in input_measurements.chunks(chunk_size).enumerate() {
 			let start = chunk_idx * chunk_size;
 
-			// Progress reporting for large batches (report every 3 chunks)
-			if total_measurements > 100_000 && chunk_idx % 3 == 0 && chunk_idx > 0 {
+			// Progress reporting for large batches (report every ~10%)
+			let report_interval = std::cmp::max(1, total_measurements / chunk_size / 10);
+			if total_measurements > 100_000 && chunk_idx % report_interval == 0 && chunk_idx > 0 {
 				if let (Ok(processed_f64), Ok(len_f64)) = (safe_usize_to_f64(start), safe_usize_to_f64(total_measurements)) {
 					let pct = (processed_f64 / len_f64) * 100.0;
-					println!("  {aspect_id} - {pct:.1}%");
+					tracing::info!("  {aspect_id} - {pct:.1}%");
 				} else {
-					println!("  {aspect_id} - processed {start} / {total_measurements} measurements");
+					tracing::info!("  {aspect_id} - processed {start} / {total_measurements} measurements");
 				}
 			}
 
-			let chunk_tx_ids = self.capture_measurement_chunk(&aspect_id, dataset_id, chunk).await.map_err(|e| anyhow::anyhow!("Failed to process measurement chunk: {e}"))?;
+			// Inline bulk insert to reuse db handle
+			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+
+			// Generate TxIds for this chunk only
+			let chunk_tx_ids: Vec<TxId> = (0..chunk.len()).map(|_| TxId::new()).collect();
+
+			// Build bulk INSERT statement with all measurements
+			let placeholder_str = "(?, ?, ?, ?)";
+			let mut placeholders_str = String::with_capacity(chunk.len() * (placeholder_str.len() + 2));
+			for i in 0..chunk.len() {
+				if i > 0 {
+					placeholders_str.push_str(", ");
+				}
+				placeholders_str.push_str(placeholder_str);
+			}
+
+			let bulk_sql = format!("INSERT INTO measurements (id, dataset_id, timestamp, value) VALUES {placeholders_str}");
+
+			// Prepare all parameters
+			let mut params: Vec<String> = Vec::with_capacity(chunk.len() * 4);
+			for (i, input_measurement) in chunk.iter().enumerate() {
+				let measurement = Measurement::from_input_measurement(&dataset_id, input_measurement);
+				params.push(chunk_tx_ids[i].as_uuid().to_string());
+				params.push(dataset_id_str.to_string());
+				params.push(measurement.timestamp().timestamp_millis().to_string());
+				params.push(measurement.value().to_string());
+			}
+
+			// Execute the bulk insert
+			conn.as_ref().execute(&bulk_sql, turso::params_from_iter(params)).await.map_err(|e| Error::DatabaseError(format!("Failed to bulk insert measurements: {e}")))?;
+
+			let _ = Self::commit_concurrent(&conn).await;
 			all_tx_ids.extend(chunk_tx_ids);
+
+			// Periodic PASSIVE checkpoint every 100 chunks to prevent WAL from growing too large
+			// PASSIVE doesn't block, unlike TRUNCATE
+			if total_measurements > 100_000 && chunk_idx > 0 && chunk_idx % 100 == 0 {
+				// Inline passive checkpoint
+				if let Ok(chk_conn) = db.connect() {
+					if let Ok(mut rows) = chk_conn.query("PRAGMA wal_checkpoint(PASSIVE)", turso::params![]).await {
+						while let Ok(Some(_)) = rows.next().await {}
+					}
+				}
+			}
 		}
 
 		// Invalidate cache
 		let cache_key = format!("aspect_measurements_{}", aspect_id.as_uuid());
 		self.cache.lock().await.invalidate(&cache_key).await;
 
+		// Final checkpoint with TRUNCATE to ensure data is written to main database file
+		Self::checkpoint_wal(&db).await?;
+
 		// Update earliest and latest in metadata
 		self.update_aspect_timestamps(&aspect_id, min_new, max_new).await?;
 		Ok(all_tx_ids)
 	}
 
-	/// Helper: Process a chunk of measurements with bulk insert
+	/// Helper: Process a chunk of measurements with bulk insert (trait method)
 	async fn capture_measurement_chunk(&self, aspect_id: &AspectId, dataset_id: DatasetId, chunk: &[InputMeasurement]) -> Result<Vec<TxId>> {
 		if chunk.is_empty() {
 			return Ok(Vec::new());
@@ -146,7 +203,6 @@ impl Inputs for Database {
 		let chunk_tx_ids: Vec<TxId> = (0..chunk.len()).map(|_| TxId::new()).collect();
 
 		// Build bulk INSERT statement with all measurements
-		// Pre-calculate string capacity to reduce allocations
 		let placeholder_str = "(?, ?, ?, ?)";
 		let mut placeholders_str = String::with_capacity(chunk.len() * (placeholder_str.len() + 2));
 		for i in 0..chunk.len() {
@@ -163,7 +219,6 @@ impl Inputs for Database {
 		let mut params = Vec::with_capacity(chunk.len() * 4);
 		for (i, input_measurement) in chunk.iter().enumerate() {
 			let measurement = Measurement::from_input_measurement(&dataset_id, input_measurement);
-
 			params.push(chunk_tx_ids[i].as_uuid().to_string());
 			params.push(dataset_id_str.clone());
 			params.push(measurement.timestamp().timestamp_millis().to_string());
@@ -205,7 +260,7 @@ impl Inputs for Database {
 			let res = conn.as_ref().execute(insert_sql, turso::params![tx_id.as_uuid().to_string(), dataset_id.as_uuid().to_string(), measurement.timestamp().timestamp_millis(), measurement.value().to_string()]).await;
 			match res {
 				Ok(rows) => {
-					println!("Inserted measurement for tx_id {tx_id}: {rows} rows affected");
+					tracing::debug!("Inserted measurement for tx_id {tx_id}: {rows} rows affected");
 					successful.push(*tx_id);
 				}
 				Err(e) => {
@@ -243,9 +298,9 @@ impl Inputs for Database {
 
 		let res = conn.as_ref().execute(insert_sql, turso::params![batch_id.clone(), aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string(), batch_metadata_size, format!("{}", batch.metadata.resolution), measurements_json.clone(), batch_hash.clone(), "unprocessed", chrono::Utc::now().timestamp_millis()]).await;
 		match res {
-			Ok(_) => println!("Inserted unprocessed batch {batch_id}"),
+			Ok(_) => {}
 			Err(e) => {
-				println!("Failed to insert unprocessed batch {batch_id}: {e}");
+				tracing::warn!("Failed to insert unprocessed batch {batch_id}: {e}");
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("Failed to insert unprocessed batch: {e}"));
 			}
@@ -258,10 +313,18 @@ impl Inputs for Database {
 
 	/// Batch insert unprocessed batches (implement missing trait method)
 	async fn batch_insert_unprocessed_batches(&self, aspect_id: &AspectId, batches: Vec<Batch>) -> Result<Vec<TxId>> {
-		let mut tx_ids = Vec::new();
-		for b in batches {
+		let total = batches.len();
+		let mut tx_ids = Vec::with_capacity(total);
+		let report_interval = std::cmp::max(1000, total / 10); // Report every 1000 or 10% (whichever is larger)
+		
+		for (i, b) in batches.into_iter().enumerate() {
 			let tx = self.insert_unprocessed_batch(aspect_id, &b).await?;
 			tx_ids.push(tx);
+			
+			// Report progress intermittently
+			if (i + 1) % report_interval == 0 || i + 1 == total {
+				tracing::debug!("Inserted unprocessed batches: {}/{}", i + 1, total);
+			}
 		}
 		Ok(tx_ids)
 	}
@@ -287,11 +350,8 @@ impl Inputs for Database {
 			};
 
 			let res = conn.as_ref().execute(insert_sql, turso::params![b.id().to_string(), b.metadata.aspect.as_uuid().to_string(), self.id().as_uuid().to_string(), batch_metadata_size, format!("{}", b.metadata.resolution), "{}", batch_measurements_len, "stub_hash", "unprocessed", chrono::Utc::now().timestamp_millis()]).await;
-			match res {
-				Ok(_) => println!("Inserted batch chunk {}", b.id()),
-				Err(e) => {
-					return Err(anyhow::anyhow!("Failed to insert batch chunk: {e}"));
-				}
+			if let Err(e) = res {
+				return Err(anyhow::anyhow!("Failed to insert batch chunk: {e}"));
 			}
 			tx_ids.push(tx_id);
 		}
@@ -306,12 +366,9 @@ impl Inputs for Database {
 		let delete_sql = r"DELETE FROM batches WHERE id = ?";
 
 		let res = conn.as_ref().execute(delete_sql, turso::params![batch_id.to_string()]).await;
-		match res {
-			Ok(_) => println!("Removed unprocessed batch {batch_id}"),
-			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("Failed to remove unprocessed batch: {e}"));
-			}
+		if let Err(e) = res {
+			Self::rollback_concurrent(&conn).await?;
+			return Err(anyhow::anyhow!("Failed to remove unprocessed batch: {e}"));
 		}
 
 		let _ = Self::commit_concurrent(&conn).await;
@@ -329,7 +386,7 @@ impl Inputs for Database {
 
 		let res = conn.as_ref().execute(delete_sql, turso::params![]).await;
 		match res {
-			Ok(_) => println!("Cleared all unprocessed batches for aspect {aspect_id}"),
+			Ok(_) => tracing::debug!("Cleared all unprocessed batches for aspect {aspect_id}"),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("Failed to clear unprocessed batches: {e}"));
@@ -350,7 +407,7 @@ impl Inputs for Database {
 
 		let res = conn.as_ref().execute(delete_sql, turso::params![older_than.timestamp_millis()]).await;
 		match res {
-			Ok(deleted) => println!("Cleaned up {deleted} unprocessed batches older than {older_than} for aspect {aspect_id}"),
+			Ok(deleted) => tracing::debug!("Cleaned up {deleted} unprocessed batches older than {older_than} for aspect {aspect_id}"),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("Failed to cleanup unprocessed batches: {e}"));
@@ -382,13 +439,10 @@ impl Inputs for Database {
 		};
 
 		let res = conn.as_ref().execute(insert_sql, turso::params![batch_id.clone(), aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string(), batch_metadata_size, format!("{}", batch.metadata.resolution), measurements_json.clone(), batch_hash.clone(), "processed", chrono::Utc::now().timestamp_millis()]).await;
-		match res {
-			Ok(_) => println!("Inserted processed batch {batch_id}"),
-			Err(e) => {
-				println!("Failed to insert processed batch {batch_id}: {e}");
-				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("Failed to insert processed batch: {e}"));
-			}
+		if let Err(e) = res {
+			tracing::warn!("Failed to insert processed batch {batch_id}: {e}");
+			Self::rollback_concurrent(&conn).await?;
+			return Err(anyhow::anyhow!("Failed to insert processed batch: {e}"));
 		}
 
 		let _ = Self::commit_concurrent(&conn).await;
@@ -398,10 +452,18 @@ impl Inputs for Database {
 
 	/// Batch insert processed batches (implement missing trait method)
 	async fn batch_insert_processed_batches(&self, aspect_id: &AspectId, batches: Vec<Batch>) -> Result<Vec<TxId>> {
-		let mut tx_ids = Vec::new();
-		for b in batches {
+		let total = batches.len();
+		let mut tx_ids = Vec::with_capacity(total);
+		let report_interval = std::cmp::max(1000, total / 10); // Report every 1000 or 10% (whichever is larger)
+		
+		for (i, b) in batches.into_iter().enumerate() {
 			let tx = self.insert_processed_batch(aspect_id, &b).await?;
 			tx_ids.push(tx);
+			
+			// Report progress intermittently
+			if (i + 1) % report_interval == 0 || i + 1 == total {
+				tracing::debug!("Inserted processed batches: {}/{}", i + 1, total);
+			}
 		}
 		Ok(tx_ids)
 	}
@@ -415,18 +477,40 @@ impl Inputs for Database {
 		let delete_sql = r"DELETE FROM batches WHERE id = ?";
 
 		let res = conn.as_ref().execute(delete_sql, turso::params![batch_id.to_string()]).await;
-		match res {
-			Ok(_) => println!("Removed processed batch {batch_id}"),
-			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("Failed to remove processed batch: {e}"));
-			}
+		if let Err(e) = res {
+			Self::rollback_concurrent(&conn).await?;
+			return Err(anyhow::anyhow!("Failed to remove processed batch: {e}"));
 		}
 
 		let _ = Self::commit_concurrent(&conn).await;
 
 		let log = format!("Removed processed batch {batch_id} for aspect {aspect_id}");
 		Ok(self.record_transaction(&log).await?)
+	}
+
+	/// Bulk remove processed batches (single transaction with WHERE IN)
+	async fn bulk_remove_processed_batches(&self, aspect_id: &AspectId, batch_ids: &[BatchId]) -> Result<()> {
+		if batch_ids.is_empty() {
+			return Ok(());
+		}
+
+		let db = self.get_processed_batches_db(aspect_id).await?;
+		let db_path = self.get_processed_batches_db_path(aspect_id).await?;
+		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+
+		// Process in sub-chunks to avoid SQLite variable limits
+		let sub_chunk_size = 500;
+		for sub_chunk in batch_ids.chunks(sub_chunk_size) {
+			let placeholders: Vec<&str> = (0..sub_chunk.len()).map(|_| "?").collect();
+			let delete_sql = format!("DELETE FROM batches WHERE id IN ({})", placeholders.join(", "));
+
+			let params: Vec<String> = sub_chunk.iter().map(|id| id.to_string()).collect();
+			conn.as_ref().execute(&delete_sql, turso::params_from_iter(params)).await
+				.map_err(|e| Error::DatabaseError(format!("Failed to bulk delete processed batches: {e}")))?;
+		}
+
+		let _ = Self::commit_concurrent(&conn).await;
+		Ok(())
 	}
 
 	/// clear all processed batches for a given aspect
@@ -439,7 +523,7 @@ impl Inputs for Database {
 
 		let res = conn.as_ref().execute(delete_sql, turso::params![]).await;
 		match res {
-			Ok(_) => println!("Cleared all processed batches for aspect {aspect_id}"),
+			Ok(_) => tracing::debug!("Cleared all processed batches for aspect {aspect_id}"),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("Failed to clear processed batches: {e}"));
@@ -461,7 +545,7 @@ impl Inputs for Database {
 
 		let res = conn.as_ref().execute(delete_sql, turso::params![older_than.timestamp_millis()]).await;
 		match res {
-			Ok(deleted) => println!("Cleaned up {deleted} processed batches older than {older_than} for aspect {aspect_id}"),
+			Ok(deleted) => tracing::debug!("Cleaned up {deleted} processed batches older than {older_than} for aspect {aspect_id}"),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("Failed to cleanup processed batches: {e}"));
@@ -471,6 +555,102 @@ impl Inputs for Database {
 		let _ = Self::commit_concurrent(&conn).await;
 		let log = format!("Cleaned up processed batches older than {older_than} for aspect {aspect_id}");
 		Ok(self.record_transaction(&log).await?)
+	}
+
+	/// Bulk insert processed batches using multi-row INSERT (single transaction)
+	async fn bulk_insert_processed_batches(&self, aspect_id: &AspectId, batches: &[Batch]) -> Result<()> {
+		if batches.is_empty() {
+			return Ok(());
+		}
+
+		let db = self.get_processed_batches_db(aspect_id).await?;
+		let db_path = self.get_processed_batches_db_path(aspect_id).await?;
+		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+
+		// Process in sub-chunks of 100 to avoid SQLite variable limits
+		// SQLite has a limit of ~32,766 variables per statement
+		// Each batch has 9 columns, so max ~3600 batches per INSERT
+		// Using 100 for safety and to keep individual statements fast
+		let sub_chunk_size = 100;
+		let now = chrono::Utc::now().timestamp_millis();
+		let db_id_str = self.id().as_uuid().to_string();
+		let aspect_id_str = aspect_id.as_uuid().to_string();
+
+		for sub_chunk in batches.chunks(sub_chunk_size) {
+			let placeholder = "(?, ?, ?, ?, ?, ?, ?, ?, ?)";
+			let placeholders: Vec<&str> = (0..sub_chunk.len()).map(|_| placeholder).collect();
+			let bulk_sql = format!(
+				"INSERT INTO batches (id, aspect_id, database_id, size, resolution, measurements, batch_hash, status, created_at) VALUES {}",
+				placeholders.join(", ")
+			);
+
+			let mut params: Vec<String> = Vec::with_capacity(sub_chunk.len() * 9);
+			for batch in sub_chunk {
+				let measurements_json = serde_json::to_string(&batch.measurements).map_err(|e| Error::DatabaseError(format!("Failed to serialize: {e}")))?;
+				let batch_hash = format!("{:x}", md5::compute(&measurements_json));
+				let batch_metadata_size: i64 = i64::try_from(batch.metadata.size).unwrap_or(0);
+
+				params.push(batch.batch_id().to_string());
+				params.push(aspect_id_str.clone());
+				params.push(db_id_str.clone());
+				params.push(batch_metadata_size.to_string());
+				params.push(format!("{}", batch.metadata.resolution));
+				params.push(measurements_json);
+				params.push(batch_hash);
+				params.push("processed".to_string());
+				params.push(now.to_string());
+			}
+
+			conn.as_ref().execute(&bulk_sql, turso::params_from_iter(params)).await
+				.map_err(|e| Error::DatabaseError(format!("Failed to bulk insert processed batches: {e}")))?;
+		}
+
+		let _ = Self::commit_concurrent(&conn).await;
+		Ok(())
+	}
+
+	/// Bulk remove unprocessed batches (single transaction with WHERE IN)
+	async fn bulk_remove_unprocessed_batches(&self, aspect_id: &AspectId, batch_ids: &[BatchId]) -> Result<()> {
+		if batch_ids.is_empty() {
+			return Ok(());
+		}
+
+		let db = self.get_unprocessed_batches_db(aspect_id).await?;
+		let db_path = self.get_unprocessed_batches_db_path(aspect_id).await?;
+		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+
+		// Process in sub-chunks to avoid SQLite variable limits
+		let sub_chunk_size = 500;
+		for sub_chunk in batch_ids.chunks(sub_chunk_size) {
+			let placeholders: Vec<&str> = (0..sub_chunk.len()).map(|_| "?").collect();
+			let delete_sql = format!("DELETE FROM batches WHERE id IN ({})", placeholders.join(", "));
+
+			let params: Vec<String> = sub_chunk.iter().map(|id| id.to_string()).collect();
+			conn.as_ref().execute(&delete_sql, turso::params_from_iter(params)).await
+				.map_err(|e| Error::DatabaseError(format!("Failed to bulk delete unprocessed batches: {e}")))?;
+		}
+
+		let _ = Self::commit_concurrent(&conn).await;
+		Ok(())
+	}
+
+	/// Move batches from unprocessed to processed in bulk
+	/// Does bulk INSERT into processed + bulk DELETE from unprocessed
+	async fn move_batches_to_processed(&self, aspect_id: &AspectId, batches: &[Batch]) -> Result<()> {
+		if batches.is_empty() {
+			return Ok(());
+		}
+
+		// Get batch IDs before the insert (need them for the delete)
+		let batch_ids: Vec<BatchId> = batches.iter().map(|b| *b.batch_id()).collect();
+
+		// Bulk insert into processed
+		self.bulk_insert_processed_batches(aspect_id, batches).await?;
+
+		// Bulk delete from unprocessed
+		self.bulk_remove_unprocessed_batches(aspect_id, &batch_ids).await?;
+
+		Ok(())
 	}
 
 	//
@@ -491,7 +671,7 @@ impl Inputs for Database {
 			Ok(_) => (),
 			Err(e) => {
 				let id = pattern.id();
-				eprintln!("Failed to insert pattern '{id}' for aspect {aspect_id}: {e}");
+				tracing::warn!("Failed to insert pattern '{id}' for aspect {aspect_id}: {e}");
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("Failed to insert pattern: {e}"));
 			}
@@ -507,7 +687,7 @@ impl Inputs for Database {
 				Ok(_) => (),
 				Err(e) => {
 					let id = pattern.id();
-					eprintln!("Failed to insert occurrence for pattern '{id}': {e}");
+					tracing::warn!("Failed to insert occurrence for pattern '{id}': {e}");
 					Self::rollback_concurrent(&conn).await?;
 					return Err(anyhow::anyhow!("Failed to insert occurrence: {e}"));
 				}
@@ -524,7 +704,7 @@ impl Inputs for Database {
 				Ok(_) => (),
 				Err(e) => {
 					let id = pattern.id();
-					eprintln!("Failed to insert relative {i} for pattern '{id}': {e}");
+					tracing::warn!("Failed to insert relative {i} for pattern '{id}': {e}");
 					Self::rollback_concurrent(&conn).await?;
 					return Err(anyhow::anyhow!("Failed to insert relative: {e}"));
 				}
@@ -557,7 +737,7 @@ impl Inputs for Database {
 		let delete_sql = r"DELETE FROM patterns WHERE id = ?";
 		let res = conn.as_ref().execute(delete_sql, turso::params![pattern.to_string()]).await;
 		match res {
-			Ok(_) => println!("Removed pattern '{pattern}' for aspect {aspect_id}"),
+			Ok(_) => tracing::debug!("Removed pattern '{pattern}' for aspect {aspect_id}"),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("Failed to remove pattern: {e}"));
@@ -576,7 +756,7 @@ impl Inputs for Database {
 		let delete_sql = r"DELETE FROM patterns";
 		let res = conn.as_ref().execute(delete_sql, turso::params![]).await;
 		match res {
-			Ok(_) => println!("Cleared all patterns for aspect {aspect_id}"),
+			Ok(_) => tracing::debug!("Cleared all patterns for aspect {aspect_id}"),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("Failed to clear patterns: {e}"));
@@ -610,7 +790,7 @@ impl Inputs for Database {
 
 		let res = conn.as_ref().execute("INSERT INTO events (id, database_id, name, manifestations, created_at) VALUES (?, ?, ?, ?, ?)", turso::params![event_id.clone(), self.id().as_uuid().to_string(), event_name.clone(), manifestations_json.clone(), chrono::Utc::now().timestamp_millis()]).await;
 		match res {
-			Ok(_) => println!("Stored event {} in database {}", event_id, self.id()),
+			Ok(_) => tracing::debug!("Stored event {} in database {}", event_id, self.id()),
 			Err(e) => {
 				let _ = Self::rollback_concurrent(&conn).await;
 				return Err(anyhow::anyhow!(format!("Failed to insert event: {e}")));
@@ -643,7 +823,7 @@ impl Inputs for Database {
 		let delete_sql = r"DELETE FROM events WHERE id = ?";
 		let res = conn.as_ref().execute(delete_sql, turso::params![event_id.to_string()]).await;
 		match res {
-			Ok(_) => println!("Removed event {event_id} for aspect {aspect_id}"),
+			Ok(_) => tracing::debug!("Removed event {event_id} for aspect {aspect_id}"),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("Failed to remove event: {e}"));
@@ -663,7 +843,7 @@ impl Inputs for Database {
 		let delete_sql = r"DELETE FROM events";
 		let res = conn.as_ref().execute(delete_sql, turso::params![]).await;
 		match res {
-			Ok(_) => println!("Cleared all events for aspect {aspect_id}"),
+			Ok(_) => tracing::debug!("Cleared all events for aspect {aspect_id}"),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("Failed to clear events: {e}"));
@@ -719,7 +899,7 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => (),
 			Err(e) => {
-				eprintln!("Failed to set metadata for dictionary '{dictionary_name}' for aspect {aspect_id}: {e}");
+				tracing::warn!("Failed to set metadata for dictionary '{dictionary_name}' for aspect {aspect_id}: {e}");
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("Failed to set dictionary metadata: {e}"));
 			}
@@ -749,7 +929,7 @@ impl Inputs for Database {
 			Ok(_) => (),
 			Err(e) => {
 				let id = pattern.id();
-				eprintln!("Failed to insert pattern '{id}' into dictionary '{dictionary_name}' for aspect {aspect_id}: {e}");
+				tracing::warn!("Failed to insert pattern '{id}' into dictionary '{dictionary_name}' for aspect {aspect_id}: {e}");
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("Failed to insert pattern into dictionary: {e}"));
 			}
@@ -766,7 +946,7 @@ impl Inputs for Database {
 				Ok(_) => (),
 				Err(e) => {
 					let id = pattern.id();
-					eprintln!("Failed to insert occurrence for pattern '{id}' in dictionary '{dictionary_name}': {e}");
+					tracing::warn!("Failed to insert occurrence for pattern '{id}' in dictionary '{dictionary_name}': {e}");
 					Self::rollback_concurrent(&conn).await?;
 					return Err(anyhow::anyhow!("Failed to insert occurrence: {e}"));
 				}
@@ -783,7 +963,7 @@ impl Inputs for Database {
 				Ok(_) => (),
 				Err(e) => {
 					let id = pattern.id();
-					eprintln!("Failed to insert relative {i} for pattern '{id}' in dictionary '{dictionary_name}': {e}");
+					tracing::warn!("Failed to insert relative {i} for pattern '{id}' in dictionary '{dictionary_name}': {e}");
 					Self::rollback_concurrent(&conn).await?;
 					return Err(anyhow::anyhow!("Failed to insert relative: {e}"));
 				}
@@ -831,7 +1011,7 @@ impl Inputs for Database {
 			Ok(_) => (),
 			Err(e) => {
 				let id = correlation.id();
-				eprintln!("Failed to insert correlation '{id}' for aspect {aspect_id}: {e}");
+				tracing::warn!("Failed to insert correlation '{id}' for aspect {aspect_id}: {e}");
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("Failed to insert correlation: {e}"));
 			}
@@ -845,7 +1025,7 @@ impl Inputs for Database {
 				Ok(_) => (),
 				Err(e) => {
 					let id = correlation.id();
-					eprintln!("Failed to insert error rate for correlation '{id}': {e}");
+					tracing::warn!("Failed to insert error rate for correlation '{id}': {e}");
 					Self::rollback_concurrent(&conn).await?;
 					return Err(anyhow::anyhow!("Failed to insert correlation error rate: {e}"));
 				}
@@ -863,7 +1043,7 @@ impl Inputs for Database {
 				Ok(_) => (),
 				Err(e) => {
 					let id = correlation.id();
-					eprintln!("Failed to insert occurrence {index} for correlation '{id}': {e}");
+					tracing::warn!("Failed to insert occurrence {index} for correlation '{id}': {e}");
 					Self::rollback_concurrent(&conn).await?;
 					return Err(anyhow::anyhow!("Failed to insert correlation occurrence: {e}"));
 				}
@@ -896,7 +1076,7 @@ impl Inputs for Database {
 			Ok(_) => (),
 			Err(e) => {
 				let id = correlation.id();
-				eprintln!("Failed to update correlation '{id}' for aspect {aspect_id}: {e}");
+				tracing::warn!("Failed to update correlation '{id}' for aspect {aspect_id}: {e}");
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("Failed to update correlation: {e}"));
 			}
@@ -907,7 +1087,7 @@ impl Inputs for Database {
 		let res = conn.as_ref().execute(delete_err_sql, turso::params![correlation.id().to_string()]).await;
 		if let Err(e) = res {
 			let id = correlation.id();
-			eprintln!("Failed to delete error rates for correlation '{id}': {e}");
+			tracing::warn!("Failed to delete error rates for correlation '{id}': {e}");
 			Self::rollback_concurrent(&conn).await?;
 			return Err(anyhow::anyhow!("Failed to delete correlation error rates: {e}"));
 		}
@@ -920,7 +1100,7 @@ impl Inputs for Database {
 				Ok(_) => (),
 				Err(e) => {
 					let id = correlation.id();
-					eprintln!("Failed to insert error rate for correlation '{id}': {e}");
+					tracing::warn!("Failed to insert error rate for correlation '{id}': {e}");
 					Self::rollback_concurrent(&conn).await?;
 					return Err(anyhow::anyhow!("Failed to insert correlation error rate: {e}"));
 				}
@@ -932,7 +1112,7 @@ impl Inputs for Database {
 		let res = conn.as_ref().execute(delete_occ_sql, turso::params![correlation.id().to_string()]).await;
 		if let Err(e) = res {
 			let id = correlation.id();
-			eprintln!("Failed to delete occurrences for correlation '{id}': {e}");
+			tracing::warn!("Failed to delete occurrences for correlation '{id}': {e}");
 			Self::rollback_concurrent(&conn).await?;
 			return Err(anyhow::anyhow!("Failed to delete correlation occurrences: {e}"));
 		}
@@ -948,7 +1128,7 @@ impl Inputs for Database {
 				Ok(_) => (),
 				Err(e) => {
 					let id = correlation.id();
-					eprintln!("Failed to insert occurrence {index} for correlation '{id}': {e}");
+					tracing::warn!("Failed to insert occurrence {index} for correlation '{id}': {e}");
 					Self::rollback_concurrent(&conn).await?;
 					return Err(anyhow::anyhow!("Failed to insert correlation occurrence: {e}"));
 				}
@@ -976,7 +1156,7 @@ impl Inputs for Database {
 		let delete_err_sql = r"DELETE FROM correlation_error_rates WHERE correlation_id = ?";
 		let res = conn.as_ref().execute(delete_err_sql, turso::params![correlation_id.to_string()]).await;
 		if let Err(e) = res {
-			eprintln!("Failed to delete error rates for correlation '{correlation_id}': {e}");
+			tracing::warn!("Failed to delete error rates for correlation '{correlation_id}': {e}");
 			Self::rollback_concurrent(&conn).await?;
 			return Err(anyhow::anyhow!("Failed to delete correlation error rates: {e}"));
 		}
@@ -985,7 +1165,7 @@ impl Inputs for Database {
 		let delete_occ_sql = r"DELETE FROM correlation_occurrences WHERE correlation_id = ?";
 		let res = conn.as_ref().execute(delete_occ_sql, turso::params![correlation_id.to_string()]).await;
 		if let Err(e) = res {
-			eprintln!("Failed to delete occurrences for correlation '{correlation_id}': {e}");
+			tracing::warn!("Failed to delete occurrences for correlation '{correlation_id}': {e}");
 			Self::rollback_concurrent(&conn).await?;
 			return Err(anyhow::anyhow!("Failed to delete correlation occurrences: {e}"));
 		}
@@ -994,7 +1174,7 @@ impl Inputs for Database {
 		let delete_sql = r"DELETE FROM correlations WHERE id = ?";
 		let res = conn.as_ref().execute(delete_sql, turso::params![correlation_id.to_string()]).await;
 		match res {
-			Ok(_) => println!("Removed correlation {correlation_id} for aspect {aspect_id}"),
+			Ok(_) => tracing::debug!("Removed correlation {correlation_id} for aspect {aspect_id}"),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("Failed to remove correlation: {e}"));
@@ -1022,7 +1202,7 @@ impl Inputs for Database {
 
 		let res = conn.as_ref().execute("INSERT INTO events (id, name, description, created_at) VALUES (?, ?, ?, ?)", turso::params![event_id.clone(), event.name().to_string(), description, chrono::Utc::now().timestamp_millis()]).await;
 		match res {
-			Ok(_) => println!("Inserted unprocessed event {} in database {}", event_id, self.id()),
+			Ok(_) => tracing::debug!("Inserted unprocessed event {} in database {}", event_id, self.id()),
 			Err(e) => {
 				let _ = Self::rollback_concurrent(&conn).await;
 				return Err(anyhow::anyhow!(format!("Failed to insert unprocessed event: {e}")));
@@ -1056,7 +1236,7 @@ impl Inputs for Database {
 		let delete_manifestations_sql = r"DELETE FROM event_manifestations WHERE event_id = ?";
 		let res = conn.as_ref().execute(delete_manifestations_sql, turso::params![event_id.to_string()]).await;
 		if let Err(e) = res {
-			eprintln!("Failed to delete manifestations for unprocessed event '{event_id}': {e}");
+			tracing::warn!("Failed to delete manifestations for unprocessed event '{event_id}': {e}");
 			Self::rollback_concurrent(&conn).await?;
 			return Err(anyhow::anyhow!("Failed to delete unprocessed event manifestations: {e}"));
 		}
@@ -1065,7 +1245,7 @@ impl Inputs for Database {
 		let delete_sql = r"DELETE FROM events WHERE id = ?";
 		let res = conn.as_ref().execute(delete_sql, turso::params![event_id.to_string()]).await;
 		match res {
-			Ok(_) => println!("Removed unprocessed event {event_id} for aspect {aspect_id}"),
+			Ok(_) => tracing::debug!("Removed unprocessed event {event_id} for aspect {aspect_id}"),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("Failed to remove unprocessed event: {e}"));
@@ -1085,7 +1265,7 @@ impl Inputs for Database {
 		let delete_manifestations_sql = r"DELETE FROM event_manifestations";
 		let res = conn.as_ref().execute(delete_manifestations_sql, turso::params![]).await;
 		match res {
-			Ok(_) => println!("Cleared all unprocessed event manifestations for aspect {aspect_id}"),
+			Ok(_) => tracing::debug!("Cleared all unprocessed event manifestations for aspect {aspect_id}"),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("Failed to clear unprocessed event manifestations: {e}"));
@@ -1095,7 +1275,7 @@ impl Inputs for Database {
 		let delete_sql = r"DELETE FROM events";
 		let res = conn.as_ref().execute(delete_sql, turso::params![]).await;
 		match res {
-			Ok(_) => println!("Cleared all unprocessed events for aspect {aspect_id}"),
+			Ok(_) => tracing::debug!("Cleared all unprocessed events for aspect {aspect_id}"),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("Failed to clear unprocessed events: {e}"));
@@ -1115,7 +1295,7 @@ impl Inputs for Database {
 		let delete_sql = r"DELETE FROM events WHERE created_at < ?";
 		let res = conn.as_ref().execute(delete_sql, turso::params![older_than.timestamp_millis()]).await;
 		match res {
-			Ok(deleted) => println!("Cleaned up {deleted} unprocessed events older than {older_than} for aspect {aspect_id}"),
+			Ok(deleted) => tracing::debug!("Cleaned up {deleted} unprocessed events older than {older_than} for aspect {aspect_id}"),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("Failed to cleanup unprocessed events: {e}"));
@@ -1140,7 +1320,7 @@ impl Inputs for Database {
 		let description = event.description().clone().unwrap_or_default();
 		let res = conn.as_ref().execute("INSERT INTO events (id, name, description, created_at) VALUES (?, ?, ?, ?)", turso::params![event_id.clone(), event.name().to_string(), description, chrono::Utc::now().timestamp_millis()]).await;
 		match res {
-			Ok(_) => println!("Inserted processed event {} in database {}", event_id, self.id()),
+			Ok(_) => tracing::debug!("Inserted processed event {} in database {}", event_id, self.id()),
 			Err(e) => {
 				let _ = Self::rollback_concurrent(&conn).await;
 				return Err(anyhow::anyhow!(format!("Failed to insert processed event: {e}")));
@@ -1174,7 +1354,7 @@ impl Inputs for Database {
 		let delete_manifestations_sql = r"DELETE FROM event_manifestations WHERE event_id = ?";
 		let res = conn.as_ref().execute(delete_manifestations_sql, turso::params![event_id.to_string()]).await;
 		if let Err(e) = res {
-			eprintln!("Failed to delete manifestations for processed event '{event_id}': {e}");
+			tracing::warn!("Failed to delete manifestations for processed event '{event_id}': {e}");
 			Self::rollback_concurrent(&conn).await?;
 			return Err(anyhow::anyhow!("Failed to delete processed event manifestations: {e}"));
 		}
@@ -1183,7 +1363,7 @@ impl Inputs for Database {
 		let delete_sql = r"DELETE FROM events WHERE id = ?";
 		let res = conn.as_ref().execute(delete_sql, turso::params![event_id.to_string()]).await;
 		match res {
-			Ok(_) => println!("Removed processed event {event_id} for aspect {aspect_id}"),
+			Ok(_) => tracing::debug!("Removed processed event {event_id} for aspect {aspect_id}"),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("Failed to remove processed event: {e}"));
@@ -1203,7 +1383,7 @@ impl Inputs for Database {
 		let delete_manifestations_sql = r"DELETE FROM event_manifestations";
 		let res = conn.as_ref().execute(delete_manifestations_sql, turso::params![]).await;
 		match res {
-			Ok(_) => println!("Cleared all processed event manifestations for aspect {aspect_id}"),
+			Ok(_) => tracing::debug!("Cleared all processed event manifestations for aspect {aspect_id}"),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("Failed to clear processed event manifestations: {e}"));
@@ -1213,7 +1393,7 @@ impl Inputs for Database {
 		let delete_sql = r"DELETE FROM events";
 		let res = conn.as_ref().execute(delete_sql, turso::params![]).await;
 		match res {
-			Ok(_) => println!("Cleared all processed events for aspect {aspect_id}"),
+			Ok(_) => tracing::debug!("Cleared all processed events for aspect {aspect_id}"),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("Failed to clear processed events: {e}"));
@@ -1233,7 +1413,7 @@ impl Inputs for Database {
 		let delete_sql = r"DELETE FROM events WHERE created_at < ?";
 		let res = conn.as_ref().execute(delete_sql, turso::params![older_than.timestamp_millis()]).await;
 		match res {
-			Ok(deleted) => println!("Cleaned up {deleted} processed events older than {older_than} for aspect {aspect_id}"),
+			Ok(deleted) => tracing::debug!("Cleaned up {deleted} processed events older than {older_than} for aspect {aspect_id}"),
 			Err(e) => {
 				Self::rollback_concurrent(&conn).await?;
 				return Err(anyhow::anyhow!("Failed to cleanup processed events: {e}"));

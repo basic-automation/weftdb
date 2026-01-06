@@ -18,4 +18,17 @@ pub trait Connection {
 	async fn rollback_concurrent(conn: &cache::Connection) -> Result<()>;
 
 	async fn configure_database_for_mvcc(turso_db: &turso::Database) -> Result<()>;
+
+	/// Begin an immediate transaction for DDL operations (CREATE TABLE, etc.)
+	/// DDL operations are not compatible with BEGIN CONCURRENT in MVCC mode.
+	/// This uses BEGIN IMMEDIATE which acquires a write lock but allows schema changes.
+	async fn begin_immediate(turso_db: &turso::Database) -> Result<cache::Connection>;
+
+	/// Commit an immediate transaction
+	async fn commit_immediate(conn: &cache::Connection) -> Result<()>;
+
+	/// Checkpoint the WAL (Write-Ahead Log) to flush pending writes to the main database file.
+	/// This should be called after large batch operations to ensure data is persisted.
+	/// Uses PRAGMA wal_checkpoint(TRUNCATE) to checkpoint and truncate the WAL file.
+	async fn checkpoint_wal(turso_db: &turso::Database) -> Result<()>;
 }

@@ -9,6 +9,8 @@ use rayon::prelude::*;
 use splimes::{Resolution, Spline};
 #[cfg(test)]
 use tempfile::TempDir;
+use tracing::{debug, instrument};
+use tracing_subscriber;
 use uuid::Uuid;
 
 async fn setup_test_database() -> Result<(TempDir, Database, Subject, Aspect)> {
@@ -424,7 +426,17 @@ fn convert_unix_timestamp_to_datetime_utc(timestamp_seconds: f64) -> Option<Date
 
 /// load BTC 1-minute data into a test database for use in other tests
 #[tokio::test(flavor = "multi_thread")]
+#[instrument]
 async fn test_create_btc_1min_database() -> Result<()> {
+	// Initialize tracing subscriber for this test
+	// Filter out verbose turso_core logs that slow down execution
+	use tracing_subscriber::EnvFilter;
+	let filter = EnvFilter::new("debug,turso_core=warn");
+	let _subscriber = tracing_subscriber::fmt()
+		.with_env_filter(filter)
+		.with_test_writer()
+		.try_init();
+
 	// This test creates a database with BTC 1-minute data
 	// Note: This requires the CSV file to be present
 	let csv_path = "datasets/btc_1min.csv"; // Correct path when running from database directory
@@ -432,10 +444,10 @@ async fn test_create_btc_1min_database() -> Result<()> {
 
 	// Create database (will use existing if present)
 	let db = if std::path::Path::new(&format!("{}/{db_name}", Database::get_data_dir())).exists() {
-		println!("Database already exists, test passed");
+		debug!("Database already exists, test passed");
 		return Ok(());
 	} else {
-		println!("Creating new BTC database");
+		debug!("Creating new BTC database");
 		Database::new(&db_name).await?
 	};
 
@@ -460,18 +472,18 @@ async fn test_create_btc_1min_database() -> Result<()> {
 		true // No BTCUSD subject
 	};
 
-	println!("Database has BTCUSD subject: {has_btcusd}, needs data: {needs_data}");
+	debug!("Database has BTCUSD subject: {}, needs data: {}", has_btcusd, needs_data);
 
 	if needs_data {
 		// Populate with data if CSV exists
-		println!("Checking for CSV file at: {csv_path}");
-		println!("Current working directory: {:?}", std::env::current_dir());
+		debug!("Checking for CSV file at: {}", csv_path);
+		debug!("Current working directory: {:?}", std::env::current_dir());
 		if std::path::Path::new(csv_path).exists() {
-			println!("CSV file found, loading data...");
-			println!("Observing subject BTCUSD");
+			debug!("CSV file found, loading data...");
+			debug!("Observing subject BTCUSD");
 			let subject = db.observe_subject("BTCUSD").await?;
 
-			println!("Tracking aspects for BTCUSD");
+			debug!("Tracking aspects for BTCUSD");
 			// Create aspects for different price types (with delays to prevent resource exhaustion)
 			let open_aspect = db.track_aspect(&subject.id(), "open", &Resolution::Minutes).await?;
 			let high_aspect = db.track_aspect(&subject.id(), "high", &Resolution::Minutes).await?;
@@ -479,7 +491,7 @@ async fn test_create_btc_1min_database() -> Result<()> {
 			let close_aspect = db.track_aspect(&subject.id(), "close", &Resolution::Minutes).await?;
 			let volume_aspect = db.track_aspect(&subject.id(), "volume", &Resolution::Minutes).await?;
 
-			println!("Tracking aspects for BTCUSD: {}, {}, {}, {}, {}", open_aspect.id(), high_aspect.id(), low_aspect.id(), close_aspect.id(), volume_aspect.id());
+			debug!("Tracking aspects for BTCUSD: {}, {}, {}, {}, {}", open_aspect.id(), high_aspect.id(), low_aspect.id(), close_aspect.id(), volume_aspect.id());
 
 			// Read and process CSV data
 			let mut rdr = csv::ReaderBuilder::new().has_headers(true).from_path(csv_path)?;
@@ -492,7 +504,7 @@ async fn test_create_btc_1min_database() -> Result<()> {
 				records.push(record);
 			}
 
-			println!("Loaded {} records from CSV", records.len());
+			debug!("Loaded {} records from CSV", records.len());
 
 			let all_measurements: Vec<(InputMeasurement, InputMeasurement, InputMeasurement, InputMeasurement, InputMeasurement)> = records
 				.par_iter()
@@ -507,7 +519,7 @@ async fn test_create_btc_1min_database() -> Result<()> {
 				})
 				.collect();
 
-			println!("Converted records to measurements");
+			debug!("Converted records to measurements");
 
 			let mut open_measurements: Vec<InputMeasurement> = Vec::with_capacity(all_measurements.len());
 			let mut high_measurements: Vec<InputMeasurement> = Vec::with_capacity(all_measurements.len());
@@ -515,7 +527,7 @@ async fn test_create_btc_1min_database() -> Result<()> {
 			let mut close_measurements: Vec<InputMeasurement> = Vec::with_capacity(all_measurements.len());
 			let mut volume_measurements: Vec<InputMeasurement> = Vec::with_capacity(all_measurements.len());
 
-			println!("Preparing measurement vectors");
+			debug!("Preparing measurement vectors");
 
 			for (open, high, low, close, volume) in all_measurements {
 				open_measurements.push(open);
@@ -525,7 +537,7 @@ async fn test_create_btc_1min_database() -> Result<()> {
 				volume_measurements.push(volume);
 			}
 
-			println!("Starting batch insertion of measurements in parallel");
+			debug!("Starting batch insertion of measurements in parallel");
 
 			// Run batch insertions in parallel
 			#[rustfmt::skip]
@@ -544,12 +556,12 @@ async fn test_create_btc_1min_database() -> Result<()> {
 			close_result?;
 			volume_result?;
 
-			println!("Batch insertion of measurements completed");
+			debug!("Batch insertion of measurements completed");
 
 			let inserted_count = records.len();
-			println!("Inserted {inserted_count} BTC 1-minute records");
+			debug!("Inserted {} BTC 1-minute records", inserted_count);
 		} else {
-			println!("Skipping BTC database test - CSV file not found at {csv_path}");
+			debug!("Skipping BTC database test - CSV file not found at {}", csv_path);
 		}
 	}
 
