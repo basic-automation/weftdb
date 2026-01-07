@@ -61,20 +61,20 @@ impl DatabaseStructure for Database {
 		if Path::new(db_path).exists() {
 			// Check if MVCC log files exist - if so, try to clean them up first
 			// The turso MVCC mode can leave behind log files that cause permission errors on Windows
-			let log_path = format!("{}-log", db_path);
-			let wal_path = format!("{}-wal", db_path);
+			let log_path = format!("{db_path}-log");
+			let wal_path = format!("{db_path}-wal");
 			
 			// Remove stale MVCC log files if they exist (they cause permission errors on reopening)
 			if Path::new(&log_path).exists() {
 				match std::fs::remove_file(&log_path) {
-					Ok(_) => tracing::debug!("Removed stale MVCC log file: {}", log_path),
+					Ok(()) => tracing::debug!("Removed stale MVCC log file: {}", log_path),
 					Err(e) => tracing::warn!("Could not remove MVCC log file {}: {}", log_path, e),
 				}
 			}
 			// Only remove WAL files if they're empty (indicating incomplete transactions)
 			if Path::new(&wal_path).exists() && std::fs::metadata(&wal_path).map(|m| m.len() == 0).unwrap_or(false) {
 				match std::fs::remove_file(&wal_path) {
-					Ok(_) => tracing::debug!("Removed empty WAL file: {}", wal_path),
+					Ok(()) => tracing::debug!("Removed empty WAL file: {}", wal_path),
 					Err(e) => tracing::warn!("Could not remove WAL file {}: {}", wal_path, e),
 				}
 			}
@@ -506,7 +506,7 @@ impl DatabaseStructure for Database {
 
 		DATABASES.lock().await.insert(db_id, db_info);
 
-		Ok(Self { id: db_id, name: name.to_string(), metadata: metadata_turso_db, metadata_path: metadata_db_path.to_string(), cache: Arc::new(Mutex::new(cache::DatabaseCache::new())) })
+		Ok(Self { id: db_id, name: name.to_string(), metadata: metadata_turso_db, metadata_path: metadata_db_path.clone(), cache: Arc::new(Mutex::new(cache::DatabaseCache::new())) })
 	}
 
 	async fn get_database_info(&self) -> Result<DatabaseInfo> {

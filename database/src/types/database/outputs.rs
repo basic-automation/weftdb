@@ -5,166 +5,32 @@ use std::{
 use anyhow::{bail, Result};
 use bigdecimal::{BigDecimal, Zero};
 use chrono::{DateTime, Utc};
-use futures::{Stream, StreamExt, stream};
+use futures::{Stream, StreamExt};
 use splimes::{Point, Resolution, Spline};
+
 use uuid::Uuid;
 
 use crate::{
-	cache, correlation::ErrorRate, database::traits::{AspectStructure, DatabaseStructure, Outputs}, types::database::traits::connection::Connection, AnalysisResult, AspectId, Batch, BatchId, BatchMetatdata, BatchedMeasurement, Correlation, CorrelationID, Database, DatabaseInfo, DatasetId, DictionaryConstraints, DictionaryId, DictionaryMetadata, Error, Event, EventID, Manifestation, ManifestationId, Measurement, MeasurementId, Occurrence, Pattern, PatternID, Relative, SignalType, Steps, SubjectId, VariablilityType
+	cache::{self},
+	Correlation, CorrelationID, AspectId, Measurement, MeasurementId, DatasetId, Error, AnalysisResult,
+	Batch, BatchId, BatchMetatdata, DatabaseInfo, DictionaryId, DictionaryMetadata, SubjectId, PatternID,
+	EventID, SignalType, Occurrence, ManifestationId, Manifestation, Pattern, DictionaryConstraints, Steps,
+	VariablilityType, Event, Relative, BatchedMeasurement,
 };
 
-#[async_trait::async_trait]
-impl Outputs for Database {
-	/// Streams measurements using cursor-based pagination for O(n) performance.
-	/// Uses WHERE timestamp > last_timestamp instead of OFFSET for efficient large dataset handling.
-	async fn get_raw_measurements(&self, aspect_id: &AspectId, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, max_per_page: usize, _page: usize) -> Result<Pin<Box<dyn Stream<Item = Result<Measurement>> + Send + 'static>>> {
-		tracing::debug!(aspect_id = %aspect_id.as_uuid(), "[get_raw_measurements] Starting");
-		
-		// For small page sizes with caching, check cache first (only for full range queries)
-		if max_per_page <= 10_000 && start.is_none() && end.is_none() {
-			let cache_key = format!("aspect_measurements_{}_{}", aspect_id.as_uuid(), max_per_page);
-			if let Some(cached) = self.cache.lock().await.get::<Vec<Measurement>>(&cache_key).await {
-				tracing::debug!("[get_raw_measurements] Returning cached measurements");
-				return Ok(Box::pin(stream::iter(cached.into_iter().map(Ok))));
-			}
-		}
+use async_trait::async_trait;
+use crate::types::database::traits::connection::Connection as _ConnectionTrait;
+use crate::types::database::traits::aspect_structure::AspectStructure;
+use crate::types::database::traits::database_structure::DatabaseStructure;
 
-		// Get database connection info upfront for the streaming closure
-		tracing::debug!("[get_raw_measurements] Getting measurement db...");
-		let db = self.get_measurement_db(aspect_id).await?;
-		tracing::debug!("[get_raw_measurements] Got measurement db");
-		let db_path = self.get_measurement_db_path(aspect_id).await?;
-		tracing::debug!(db_path = %db_path, "[get_raw_measurements] Got db path");
-		let cache = self.cache.clone();
-		let start_owned = start;
-		let end_owned = end;
+use crate::correlation::ErrorRate;
+use crate::Database;
 
-		// Use very large chunk size for efficiency - fewer transactions
-		const CHUNK_SIZE: usize = 1_000_000;
+// Avoid triggering pedantic 'too_many_lines' on this large impl
+#[allow(clippy::too_many_lines)]
 
-		// State: (last_timestamp_cursor, current_chunk_buffer, db, db_path, cache, start, end, is_first_query)
-		// last_timestamp_cursor: None means we haven't started, Some(ts) means fetch records > ts
-		let stream = futures::stream::unfold(
-			(None::<i64>, Vec::<Measurement>::new(), db, db_path, cache, start_owned, end_owned),
-			move |(cursor, mut buffer, db, db_path, cache, start, end)| {
-				async move {
-					// If we have measurements in the buffer, return one
-					if let Some(measurement) = buffer.pop() {
-						return Some((Ok(measurement), (cursor, buffer, db, db_path, cache, start, end)));
-					}
-
-					tracing::debug!(cursor = ?cursor, "[stream] Buffer empty, fetching next chunk");
-
-					// Need to fetch next chunk using cursor-based pagination
-					tracing::debug!("[stream] About to begin_concurrent...");
-					let conn = match Self::begin_concurrent(&db, &db_path, Some(cache.clone())).await {
-						Ok(c) => {
-							tracing::debug!("[stream] begin_concurrent succeeded");
-							c
-						},
-						Err(e) => {
-							tracing::error!(error = %e, "[stream] begin_concurrent FAILED");
-							return Some((Err(e), (cursor, buffer, db, db_path, cache, start, end)));
-						}
-					};
-
-					let limit_i64 = CHUNK_SIZE as i64;
-
-					// Build query using cursor-based pagination (WHERE timestamp > cursor)
-					// This is O(1) per page instead of O(n) with OFFSET
-					let (query_sql, params): (String, Vec<turso::Value>) = match (cursor, start, end) {
-						// First query: use start time as lower bound
-						(None, None, None) => (
-							"SELECT id, dataset_id, timestamp, value FROM measurements ORDER BY timestamp ASC LIMIT ?".to_string(),
-							vec![turso::Value::from(limit_i64)],
-						),
-						(None, Some(start_time), None) => (
-							"SELECT id, dataset_id, timestamp, value FROM measurements WHERE timestamp >= ? ORDER BY timestamp ASC LIMIT ?".to_string(),
-							vec![turso::Value::from(start_time.timestamp_millis()), turso::Value::from(limit_i64)],
-						),
-						(None, None, Some(end_time)) => (
-							"SELECT id, dataset_id, timestamp, value FROM measurements WHERE timestamp <= ? ORDER BY timestamp ASC LIMIT ?".to_string(),
-							vec![turso::Value::from(end_time.timestamp_millis()), turso::Value::from(limit_i64)],
-						),
-						(None, Some(start_time), Some(end_time)) => (
-							"SELECT id, dataset_id, timestamp, value FROM measurements WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp ASC LIMIT ?".to_string(),
-							vec![turso::Value::from(start_time.timestamp_millis()), turso::Value::from(end_time.timestamp_millis()), turso::Value::from(limit_i64)],
-						),
-						// Subsequent queries: use cursor (last timestamp) as lower bound
-						(Some(last_ts), _, None) => (
-							"SELECT id, dataset_id, timestamp, value FROM measurements WHERE timestamp > ? ORDER BY timestamp ASC LIMIT ?".to_string(),
-							vec![turso::Value::from(last_ts), turso::Value::from(limit_i64)],
-						),
-						(Some(last_ts), _, Some(end_time)) => (
-							"SELECT id, dataset_id, timestamp, value FROM measurements WHERE timestamp > ? AND timestamp <= ? ORDER BY timestamp ASC LIMIT ?".to_string(),
-							vec![turso::Value::from(last_ts), turso::Value::from(end_time.timestamp_millis()), turso::Value::from(limit_i64)],
-						),
-					};
-
-					tracing::debug!("[stream] About to execute query...");
-					let rows_result = conn.as_ref().query(&query_sql, params).await;
-					tracing::debug!("[stream] Query executed!");
-					let mut rows = match rows_result {
-						Ok(r) => {
-							tracing::debug!("[stream] Query succeeded");
-							r
-						},
-						Err(e) => {
-							tracing::error!(error = %e, "[stream] Query FAILED");
-							let _ = Self::commit_concurrent(&conn).await;
-							return Some((Err(Error::DatabaseError(format!("Failed to query measurements: {e}")).into()), (cursor, buffer, db, db_path, cache, start, end)));
-						}
-					};
-
-					// Collect measurements from this chunk and track the last timestamp
-					let mut new_measurements = Vec::with_capacity(CHUNK_SIZE);
-					let mut new_cursor: Option<i64> = cursor;
-
-					loop {
-						match rows.next().await {
-							Ok(Some(row)) => {
-								match Self::parse_measurement_row_static(row).await {
-									Ok(measurement) => {
-										// Update cursor to the timestamp of this measurement
-										new_cursor = Some(measurement.timestamp().timestamp_millis());
-										new_measurements.push(measurement);
-									}
-									Err(e) => {
-										let _ = Self::commit_concurrent(&conn).await;
-										return Some((Err(e), (new_cursor, buffer, db, db_path, cache, start, end)));
-									}
-								}
-							}
-							Ok(None) => break,
-							Err(e) => {
-								let _ = Self::commit_concurrent(&conn).await;
-								return Some((Err(Error::DatabaseError(format!("Failed to read measurement row: {e}")).into()), (new_cursor, buffer, db, db_path, cache, start, end)));
-							}
-						}
-					}
-
-					let _ = Self::commit_concurrent(&conn).await;
-
-					if new_measurements.is_empty() {
-						// No more data, end the stream
-						return None;
-					}
-
-					// Reverse so we can pop from the end efficiently (LIFO for FIFO order)
-					new_measurements.reverse();
-
-					// Pop first measurement and return it
-					if let Some(measurement) = new_measurements.pop() {
-						Some((Ok(measurement), (new_cursor, new_measurements, db, db_path, cache, start, end)))
-					} else {
-						None
-					}
-				}
-			},
-		);
-
-		Ok(Box::pin(stream))
-	}
+#[async_trait]
+impl crate::types::database::traits::outputs::Outputs for Database {
 
 	/// Helper function to get boundary measurements (earliest 2 and latest 2 points)
 	/// Used when requested range is outside of available data
@@ -186,8 +52,8 @@ impl Outputs for Database {
 
 		let mut rows: turso::Rows = conn.as_ref().query(earliest_sql, turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to query earliest measurements: {e}")))?;
 
-		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get earliest row: {e}")))? {
-			let measurement: Measurement = Self::parse_measurement_row_static(row).await?;
+								while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get earliest row: {e}")))? {
+			let measurement: Measurement = Self::parse_measurement_row_static(&row)?;
 			all_measurements.push(measurement);
 		}
 
@@ -203,7 +69,7 @@ impl Outputs for Database {
 
 		let mut latest_measurements: Vec<Measurement> = Vec::new();
 		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get latest row: {e}")))? {
-			let measurement: Measurement = Self::parse_measurement_row_static(row).await?;
+			let measurement: Measurement = Self::parse_measurement_row_static(&row)?;
 			latest_measurements.push(measurement);
 		}
 
@@ -398,7 +264,7 @@ impl Outputs for Database {
 			let measurement = result?;
 			all_measurements.push(measurement);
 			count += 1;
-			if count % progress_interval == 0 {
+			if count.is_multiple_of(progress_interval) {
 				tracing::info!(count = count, "[analyze_range] Loaded measurements...");
 			}
 		}
@@ -525,11 +391,9 @@ impl Outputs for Database {
 
 		// Try to get from cache first
 		if let Some(cached_batches) = self.cache.lock().await.get::<Vec<Batch>>(&cache_key).await {
-			// Since we're looking for a specific batch, find it in the cached results
-			if let Some(batch) = cached_batches.into_iter().find(|b| *b.batch_id() == *batch_id) {
-				return Ok(batch);
+			if let Some(batch) = cached_batches.iter().find(|b| *b.batch_id() == *batch_id) {
+				return Ok(batch.clone());
 			}
-			// If not found in cache, fall through to database query
 		}
 
 		// Get from database
@@ -549,7 +413,7 @@ impl Outputs for Database {
 		let _ = Self::commit_concurrent(&conn).await;
 
 		if let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get batch row: {e}")))? {
-			let batch = parse_batch_row_helper(&row, self.name(), &db_path)?;
+			let batch = Self::parse_batch_row_helper(&row, self.name(), &db_path)?;
 
 			// Cache the single batch (as a vec with one element)
 			self.cache.lock().await.store(&cache_key, vec![batch.clone()]).await;
@@ -592,7 +456,7 @@ impl Outputs for Database {
 		let db_path_clone = db_path.clone();
 
 		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get batch row: {e}")))? {
-			if let Ok(batch) = parse_batch_row_helper(&row, db_name, &db_path_clone) {
+			if let Ok(batch) = Self::parse_batch_row_helper(&row, db_name, &db_path_clone) {
 				batches.push(batch);
 			} else {
 				// Log error but continue processing other batches
@@ -642,7 +506,7 @@ impl Outputs for Database {
 		let mut rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![batch_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query batch: {e}")))?;
 
 		if let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get batch row: {e}")))? {
-			let batch = parse_batch_row_helper(&row, self.name(), &db_path)?;
+			let batch = Self::parse_batch_row_helper(&row, self.name(), &db_path)?;
 
 			// Cache the single batch (as a vec with one element)
 			self.cache.lock().await.store(&cache_key, vec![batch.clone()]).await;
@@ -686,7 +550,7 @@ impl Outputs for Database {
 		let db_path_clone = db_path.clone();
 
 		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get batch row: {e}")))? {
-			if let Ok(batch) = parse_batch_row_helper(&row, db_name, &db_path_clone) {
+			if let Ok(batch) = Self::parse_batch_row_helper(&row, db_name, &db_path_clone) {
 				batches.push(batch);
 			} else {
 				// Log error but continue processing other batches
@@ -719,7 +583,7 @@ impl Outputs for Database {
 
 		// Get from database
 		let db = self.get_dictionary_db(aspect_id, dictionary_name).await?;
-		let conn = Self::begin_concurrent(&db, dictionary_name, Some(self.cache.clone())).await?;
+		let conn: cache::Connection = Self::begin_concurrent(&db, dictionary_name, Some(self.cache.clone())).await?;
 		let query_sql = r"
                         SELECT id, name, description, created_at, updated_at
                         FROM dictionary_metadata 
@@ -790,7 +654,7 @@ impl Outputs for Database {
 
 		// Get from database
 		let db = self.get_dictionary_db(aspect_id, "default").await?;
-		let conn = Self::begin_concurrent(&db, "default", Some(self.cache.clone())).await?;
+		let conn: cache::Connection = Self::begin_concurrent(&db, "default", Some(self.cache.clone())).await?;
 		let query_sql = r"
                         SELECT id, name, description, created_at, updated_at
                         FROM dictionary_metadata
@@ -830,7 +694,7 @@ impl Outputs for Database {
 
 		// Get from database
 		let db = self.get_dictionary_db(aspect_id, dictionary_name).await?;
-		let conn = Self::begin_concurrent(&db, dictionary_name, Some(self.cache.clone())).await?;
+		let conn: cache::Connection = Self::begin_concurrent(&db, dictionary_name, Some(self.cache.clone())).await?;
 		let query_sql = r"
                         SELECT id, sum_value, abs_sum_value, max_value, min_value, abs_max_value, avg_value, abs_avg_value
                         FROM patterns 
@@ -929,7 +793,7 @@ impl Outputs for Database {
 
 		// Get from database
 		let db = self.get_dictionary_db(aspect_id, dictionary_name).await?;
-		let conn = Self::begin_concurrent(&db, dictionary_name, Some(self.cache.clone())).await?;
+		let conn: cache::Connection = Self::begin_concurrent(&db, dictionary_name, Some(self.cache.clone())).await?;
 		let query_sql = r"
                         SELECT id, sum_value, abs_sum_value, max_value, min_value, abs_max_value, avg_value, abs_avg_value
                         FROM patterns 
@@ -1091,6 +955,9 @@ impl Outputs for Database {
 	}
 
 	async fn get_correlations(&self, aspect_id: &AspectId) -> Result<Pin<Box<dyn Stream<Item = Result<Correlation>> + Send + 'static>>> {
+		// Page size for chunked loading
+		const PAGE_SIZE: i64 = 100;
+
 		// Get database connection info upfront for the streaming closure
 		let mut aspect = self.get_aspect(aspect_id).await?;
 		let db = aspect.correlations().await?;
@@ -1098,12 +965,11 @@ impl Outputs for Database {
 		let cache = self.cache.clone();
 		let aspect_id_owned = *aspect_id;
 		
-		// Page size for chunked loading
-		const PAGE_SIZE: i64 = 100;
 		
 		// Use unfold to create a true streaming iterator that fetches in chunks
+		let initial_state: (i64, Vec<CorrelationID>, turso::Database, String, std::sync::Arc<tokio::sync::Mutex<cache::DatabaseCache>>, AspectId) = (0i64, Vec::<CorrelationID>::new(), db, db_path, cache, aspect_id_owned);
 		let stream = futures::stream::unfold(
-			(0i64, Vec::<CorrelationID>::new(), db, db_path, cache, aspect_id_owned),
+			initial_state,
 			move |(offset, mut current_ids, db, db_path, cache, aspect_id)| {
 				async move {
 					// If we have IDs in the current batch, pop one and fetch it
@@ -1119,7 +985,7 @@ impl Outputs for Database {
 						}
 					} else {
 						// Need to fetch next page of IDs
-						let conn = match Self::begin_concurrent(&db, &db_path, Some(cache.clone())).await {
+						let conn: cache::Connection = match Self::begin_concurrent(&db, &db_path, Some(cache.clone())).await {
 							Ok(c) => c,
 							Err(e) => return Some((Err(e), (offset, current_ids, db, db_path, cache, aspect_id))),
 						};
@@ -1272,7 +1138,7 @@ impl Outputs for Database {
 		// Get from database
 		let db = self.get_unprocessed_events_db(aspect_id).await?;
 		let db_path = self.get_unprocessed_events_db_path(aspect_id).await?;
-		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		let conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
 		let query_sql = r"
                         SELECT id
                         FROM events 
@@ -1355,7 +1221,7 @@ impl Outputs for Database {
                 // Get from database
                 let db = self.get_processed_events_db(aspect_id).await?;
                 let db_path = self.get_processed_events_db_path(aspect_id).await?;
-                let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+				let conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
                 let query_sql = r"
                                 SELECT id
                                 FROM processed_events 
@@ -1378,41 +1244,47 @@ impl Outputs for Database {
 
                 // Convert events to stream
                 let event_stream = futures::stream::iter(events.into_iter().map(Ok));
-                Ok(Box::pin(event_stream))
-        }
-}
+				Ok(Box::pin(event_stream))
+			}
 
-/// Helper function to parse a batch row from the database with aspect context
-/// 
-/// Expected columns: `id(0)`, `aspect_id(1)`, `database_id(2)`, `size(3)`, `resolution(4)`, `measurements(5)`, `batch_hash(6)`
-#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-fn parse_batch_row_helper(row: &turso::Row, db_name: &str, db_path: &str) -> Result<Batch> {
-	let id_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Batch ID is not text".to_string()))?.clone();
-	let batch_id = BatchId::from_uuid(Uuid::parse_str(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for batch ID: {e}")))?);
+    
 
-	let aspect_id_str = row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Aspect ID is not text".to_string()))?.clone();
-	let aspect_id = AspectId::from_uuid(Uuid::parse_str(&aspect_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for aspect ID: {e}")))?);
+	async fn get_raw_measurements(&self, aspect_id: &AspectId, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, max_per_page: usize, page: usize) -> Result<Pin<Box<dyn Stream<Item = Result<Measurement>> + Send + 'static>>> {
+		let db = self.get_measurement_db(aspect_id).await?;
+		let db_path = self.get_measurement_db_path(aspect_id).await?;
+		let conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
 
-	let size = *row.get_value(3)?.as_integer().ok_or_else(|| Error::DatabaseError("Size is not an integer".to_string()))? as usize;
-	
-	let resolution_str = row.get_value(4)?.as_text().ok_or_else(|| Error::DatabaseError("Resolution is not text".to_string()))?.clone();
-	let resolution = Resolution::from_str(&resolution_str).map_err(|e| Error::DatabaseError(format!("Invalid resolution format: {e}")))?;
+		// Safely convert page and max_per_page to i64 to avoid potential wrapping on 64-bit targets
+		let page_i64 = i64::try_from(page).map_err(|_| Error::DatabaseError("Page value too large".to_string()))?;
+		let per_page_i64 = i64::try_from(max_per_page).map_err(|_| Error::DatabaseError("max_per_page value too large".to_string()))?;
+		let offset = page_i64.checked_mul(per_page_i64).ok_or_else(|| Error::DatabaseError("Offset multiplication overflow".to_string()))?;
 
-	let measurements_json_str = row.get_value(5)?.as_text().ok_or_else(|| Error::DatabaseError("Measurements is not text".to_string()))?.clone();
-	let measurements: Vec<BatchedMeasurement> = serde_json::from_str(&measurements_json_str).map_err(|e| Error::DatabaseError(format!("Failed to parse batch measurements JSON: {e}")))?;
+		let mut rows: turso::Rows = if let (Some(s), Some(e)) = (start, end) {
+			let query_sql = "SELECT id, dataset_id, timestamp, value FROM measurements WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp ASC LIMIT ? OFFSET ?";
+			conn.as_ref().query(query_sql, turso::params![s.timestamp_millis(), e.timestamp_millis(), per_page_i64, offset]).await.map_err(|e| Error::DatabaseError(format!("Failed to query measurements: {e}")))?
+		} else if let Some(s) = start {
+			let query_sql = "SELECT id, dataset_id, timestamp, value FROM measurements WHERE timestamp >= ? ORDER BY timestamp ASC LIMIT ? OFFSET ?";
+			conn.as_ref().query(query_sql, turso::params![s.timestamp_millis(), per_page_i64, offset]).await.map_err(|e| Error::DatabaseError(format!("Failed to query measurements: {e}")))?
+		} else if let Some(e) = end {
+			let query_sql = "SELECT id, dataset_id, timestamp, value FROM measurements WHERE timestamp <= ? ORDER BY timestamp ASC LIMIT ? OFFSET ?";
+			conn.as_ref().query(query_sql, turso::params![e.timestamp_millis(), per_page_i64, offset]).await.map_err(|e| Error::DatabaseError(format!("Failed to query measurements: {e}")))?
+		} else {
+			let query_sql = "SELECT id, dataset_id, timestamp, value FROM measurements ORDER BY timestamp ASC LIMIT ? OFFSET ?";
+			conn.as_ref().query(query_sql, turso::params![per_page_i64, offset]).await.map_err(|e| Error::DatabaseError(format!("Failed to query measurements: {e}")))?
+		};
 
-	let batch_hash_str = row.get_value(6)?.as_text().cloned();
+		let mut measurements: Vec<Measurement> = Vec::new();
+		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get measurement row: {e}")))? {
+			let m = Self::parse_measurement_row_static(&row)?;
+			measurements.push(m);
+		}
 
-	// Reconstruct DatabaseInfo with minimal required fields
-	let database_info = DatabaseInfo::new(db_name.to_string(), db_path.to_string());
-	let metadata = BatchMetatdata {
-		aspect: aspect_id,
-		resolution,
-		size,
-		database_info,
-	};
+		let _ = Self::commit_concurrent(&conn).await;
 
-	Ok(Batch { metadata, measurements, batch_id, batch_hash: batch_hash_str })
+		let stream = futures::stream::iter(measurements.into_iter().map(Ok));
+		Ok(Box::pin(stream))
+	}
+
 }
 
 /// Helper methods for streaming operations that don't require &self
@@ -1431,7 +1303,7 @@ impl Database {
 			return Ok(cached_correlation);
 		}
 
-		let conn = Self::begin_concurrent(db, db_path, Some(cache.clone())).await?;
+		let conn: cache::Connection = Self::begin_concurrent(db, db_path, Some(cache.clone())).await?;
 		
 		let query_sql = r"
 			SELECT id, dictionary_id, subject_id, aspect_id, pattern_id, event_id, average_distance_value, average_distance_units
@@ -1457,7 +1329,7 @@ impl Database {
 		let average_distance = {
 			let avg_dist_value_opt = row.get_value(6).ok().and_then(|v| v.as_text().cloned());
 			let avg_dist_units_opt = row.get_value(7).ok().and_then(|v| v.as_text().cloned());
-			
+
 			match (avg_dist_value_opt, avg_dist_units_opt) {
 				(Some(value_str), Some(units_str)) => {
 					let value = BigDecimal::from_str(&value_str).ok();
@@ -1478,15 +1350,30 @@ impl Database {
 		let pattern_id = PatternID::from_uuid(Uuid::parse_str(&pattern_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for pattern ID: {e}")))?);
 		let event_id = EventID::from_uuid(Uuid::parse_str(&event_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for event ID: {e}")))?);
 
-		// Get error rates
+		// Load error rates and occurrences using helpers to keep this function concise
+		let error_rate: HashMap<SignalType, ErrorRate> = Self::load_correlation_error_rates(&conn, correlation_id).await?;
+		let occurrences: Vec<Occurrence> = Self::load_correlation_occurrences(&conn, correlation_id).await?;
+
+		let correlation = Correlation::new(Some(id), dictionary_id, subject_id, &aspect_id_parsed, pattern_id, event_id, error_rate, occurrences, average_distance);
+
+		// Cache the correlation
+		cache.lock().await.store(&cache_key, correlation.clone()).await;
+		let _ = Self::commit_concurrent(&conn).await;
+
+		Ok(correlation)
+	}
+
+
+	async fn load_correlation_error_rates(
+		conn: &cache::Connection,
+		correlation_id: &CorrelationID,
+	) -> Result<HashMap<SignalType, ErrorRate>> {
 		let error_rate_query_sql = r"
-			SELECT signal_type, error_rate_value, error_rate_units
-			FROM correlation_error_rates
-			WHERE correlation_id = ?
-		";
-		let mut error_rate_rows = conn.as_ref().query(error_rate_query_sql, turso::params![correlation_id.to_uuid().to_string()]).await
-			.map_err(|e| Error::DatabaseError(format!("Failed to query correlation error rates: {e}")))?;
-		
+	                                SELECT signal_type, error_rate_value, error_rate_units
+	                                FROM correlation_error_rates
+	                                WHERE correlation_id = ?
+	                        ";
+		let mut error_rate_rows: turso::Rows = conn.as_ref().query(error_rate_query_sql, turso::params![correlation_id.to_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query correlation error rates: {e}")))?;
 		let mut error_rate: HashMap<SignalType, ErrorRate> = HashMap::new();
 		while let Some(error_rate_row) = error_rate_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get correlation error rate row: {e}")))? {
 			let signal_type_str = error_rate_row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Error rate signal type is not text".to_string()))?.clone();
@@ -1498,19 +1385,26 @@ impl Database {
 
 			let units: Resolution = Resolution::from_str(&error_rate_units_str).map_err(|e| Error::DatabaseError(format!("Invalid error rate units format: {e}")))?;
 			let err_rate = ErrorRate::new(error_rate_value, units);
+
 			let signal_type = SignalType::from_str(&signal_type_str).map_err(|e| Error::DatabaseError(format!("Invalid error type format: {e}")))?;
+
 			error_rate.insert(signal_type, err_rate);
 		}
+		Ok(error_rate)
+	}
 
-		// Get occurrences
+	async fn load_correlation_occurrences(
+		conn: &cache::Connection,
+		correlation_id: &CorrelationID,
+	) -> Result<Vec<Occurrence>> {
 		let occurrences_query_sql = r"
-			SELECT correlation_id, occurrence_index, aspect_id, resolution, size, database_info, pattern_id, beginning_timestamp, end_timestamp
-			FROM correlation_occurrences
-			WHERE correlation_id = ?
-		";
-		let mut occ_rows = conn.as_ref().query(occurrences_query_sql, turso::params![correlation_id.to_uuid().to_string()]).await
-			.map_err(|e| Error::DatabaseError(format!("Failed to query correlation occurrences: {e}")))?;
-		
+	                                SELECT correlation_id, occurrence_index, aspect_id, resolution, size, database_info, pattern_id, beginning_timestamp, end_timestamp
+	                                FROM correlation_occurrences
+	                                WHERE correlation_id = ?
+	                        ";
+		let mut occ_rows: turso::Rows = conn.as_ref().query(occurrences_query_sql, turso::params![correlation_id.to_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query correlation occurrences: {e}")))?;
+		let mut occurrences: Vec<Occurrence> = Vec::new();
+		// load occurrences in order of occurrence_index
 		let mut occ_map: HashMap<usize, Occurrence> = HashMap::new();
 		while let Some(occ_row) = occ_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get correlation occurrence row: {e}")))? {
 			let occ_index: usize = usize::try_from(*occ_row.get_value(1)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence Index is not integer".to_string()))?).map_err(|e| Error::DatabaseError(format!("Occurrence index out of range: {e}")))?;
@@ -1521,20 +1415,16 @@ impl Database {
 			let occ_pattern_id_str = occ_row.get_value(6)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Pattern ID is not text".to_string()))?.clone();
 			let occ_beginning_timestamp_millis: i64 = *occ_row.get_value(7)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence Beginning Timestamp is not integer".to_string()))?;
 			let occ_end_timestamp_millis: i64 = *occ_row.get_value(8)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence End Timestamp is not integer".to_string()))?;
-			
 			let occ_aspect_id = AspectId::from_str(&occ_aspect_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for occurrence Aspect ID: {e}")))?;
 			let occ_resolution = Resolution::from_str(&occ_resolution_str).map_err(|e| Error::DatabaseError(format!("Invalid resolution format: {e}")))?;
 			let occ_database_info: DatabaseInfo = serde_json::from_str(&occ_database_info_str).map_err(|e| Error::DatabaseError(format!("Failed to parse occurrence database info JSON: {e}")))?;
 			let occ_pattern_id = PatternID::from_uuid(Uuid::parse_str(&occ_pattern_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for occurrence Pattern ID: {e}")))?);
 			let occ_beginning_timestamp = DateTime::from_timestamp_millis(occ_beginning_timestamp_millis).ok_or_else(|| Error::DatabaseError("Invalid beginning timestamp".to_string()))?;
 			let occ_end_timestamp = DateTime::from_timestamp_millis(occ_end_timestamp_millis).ok_or_else(|| Error::DatabaseError("Invalid end timestamp".to_string()))?;
-			
 			let occurrence = Occurrence::new(occ_aspect_id, occ_resolution, occ_size, occ_database_info, occ_pattern_id, occ_beginning_timestamp, occ_end_timestamp);
 			occ_map.insert(occ_index, occurrence);
 		}
-		
 		// Sort occurrences by index
-		let mut occurrences: Vec<Occurrence> = Vec::new();
 		let mut occ_indices: Vec<usize> = occ_map.keys().copied().collect();
 		occ_indices.sort_unstable();
 		for index in occ_indices {
@@ -1542,18 +1432,43 @@ impl Database {
 				occurrences.push(occurrence.clone());
 			}
 		}
-
-		let correlation = Correlation::new(Some(id), dictionary_id, subject_id, &aspect_id_parsed, pattern_id, event_id, error_rate, occurrences, average_distance);
-
-		// Cache the correlation
-		cache.lock().await.store(&cache_key, correlation.clone()).await;
-		let _ = Self::commit_concurrent(&conn).await;
-		
-		Ok(correlation)
+		Ok(occurrences)
 	}
 
 	/// Parse a measurement row without requiring &self (for use in streaming closures)
-	async fn parse_measurement_row_static(row: turso::Row) -> Result<Measurement> {
+	/// Helper function to parse a batch row from the database with aspect context
+	///
+	/// Expected columns: `id(0)`, `aspect_id(1)`, `database_id(2)`, `size(3)`, `resolution(4)`, `measurements(5)`, `batch_hash(6)`
+	#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+	fn parse_batch_row_helper(row: &turso::Row, db_name: &str, db_path: &str) -> Result<Batch> {
+		let id_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Batch ID is not text".to_string()))?.clone();
+		let batch_id = BatchId::from_uuid(Uuid::parse_str(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for batch ID: {e}")))?);
+
+		let aspect_id_str = row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Aspect ID is not text".to_string()))?.clone();
+		let aspect_id = AspectId::from_uuid(Uuid::parse_str(&aspect_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for aspect ID: {e}")))?);
+
+		let size = *row.get_value(3)?.as_integer().ok_or_else(|| Error::DatabaseError("Size is not an integer".to_string()))? as usize;
+
+		let resolution_str = row.get_value(4)?.as_text().ok_or_else(|| Error::DatabaseError("Resolution is not text".to_string()))?.clone();
+		let resolution = Resolution::from_str(&resolution_str).map_err(|e| Error::DatabaseError(format!("Invalid resolution format: {e}")))?;
+
+		let measurements_json_str = row.get_value(5)?.as_text().ok_or_else(|| Error::DatabaseError("Measurements is not text".to_string()))?.clone();
+		let measurements: Vec<BatchedMeasurement> = serde_json::from_str(&measurements_json_str).map_err(|e| Error::DatabaseError(format!("Failed to parse batch measurements JSON: {e}")))?;
+
+		let batch_hash_str = row.get_value(6)?.as_text().cloned();
+
+		// Reconstruct DatabaseInfo with minimal required fields
+		let database_info = DatabaseInfo::new(db_name.to_string(), db_path.to_string());
+		let metadata = BatchMetatdata {
+			aspect: aspect_id,
+			resolution,
+			size,
+			database_info,
+		};
+
+		Ok(Batch { metadata, measurements, batch_id, batch_hash: batch_hash_str })
+	}
+	fn parse_measurement_row_static(row: &turso::Row) -> Result<Measurement> {
 		let id_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("ID is not text".to_string()))?.clone();
 		let dataset_id_str = row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Dataset ID is not text".to_string()))?.clone();
 		let timestamp_millis: i64 = *row.get_value(2)?.as_integer().ok_or_else(|| Error::DatabaseError("Timestamp is not integer".to_string()))?;

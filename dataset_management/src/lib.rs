@@ -16,14 +16,28 @@ use tokio::sync::Mutex;
 pub use types::*;
 
 pub mod batch_utils;
+pub mod detectors;
+pub mod pipeline;
+pub mod types;
+
 #[cfg(test)]
 mod debug_batch_test;
 #[cfg(test)]
 mod memory_test;
-pub mod types;
-
 #[cfg(test)]
 mod pattern_fix_test;
+
+// Re-export main Pipeline API
+pub use pipeline::{
+    DetectorId, EventDetector, EventDetectorFn, Pipeline, PipelineBuilder, PipelineConfig,
+    PipelineState, ProbabilityResult,
+};
+
+// Re-export built-in detectors
+pub use detectors::{
+    detect_all_peaks, detect_all_valleys, detect_drawdown, detect_monthly_increase, detect_peaks,
+    detect_threshold_crossing_down, detect_threshold_crossing_up, detect_valleys,
+};
 
 pub const BATCH_SIZE: [usize; 1] = [100];
 pub static DEFAULT_ERROR_RATE: LazyLock<database::Distance> = LazyLock::new(|| {
@@ -34,6 +48,66 @@ pub static DEFAULT_ERROR_RATE: LazyLock<database::Distance> = LazyLock::new(|| {
 });
 
 static SIGNALS_QUEUE: LazyLock<Mutex<Signals>> = LazyLock::new(|| Mutex::new(Signals::new()));
+
+type ExpiredSignal = (database::CorrelationID, database::ManifestationId, SignalType, chrono::DateTime<chrono::Utc>);
+
+fn collect_expired_signals(
+	signals: &Signals,
+	events: &[database::Event],
+	correlations: &[database::Correlation],
+	current_time: chrono::DateTime<chrono::Utc>,
+) -> (Vec<ExpiredSignal>, usize, usize) {
+	let mut signals_to_remove = Vec::new();
+	let mut expired_historical = 0usize;
+	let mut expired_forward = 0usize;
+
+	for signal in signals.values() {
+		let mut signal_event_id = None;
+		for correlation in correlations {
+			if correlation.id() == signal.correlation_id() {
+				signal_event_id = Some(correlation.event_id().clone());
+				break;
+			}
+		}
+
+		if let Some(event_id) = signal_event_id {
+			if let Some(event) = events.iter().find(|e| *e.id() == event_id) {
+				if let Some((_, predicted_manifestation)) = event.manifestations().iter().find(|(_, m)| m.id() == signal.manifestation_id()) {
+					let prediction_point = match signal.signal_type() {
+						SignalType::Custom(ref type_name) if type_name == "PredictStart" => predicted_manifestation.midpoint(),
+						SignalType::Custom(ref type_name) if type_name == "PredictMid" => predicted_manifestation.midpoint(),
+						SignalType::Custom(ref type_name) if type_name == "PredictEnd" => *predicted_manifestation.end(),
+						SignalType::Custom(_) => predicted_manifestation.midpoint(),
+					};
+
+					if current_time >= prediction_point {
+						signals_to_remove.push((signal.correlation_id().clone(), signal.manifestation_id().clone(), signal.signal_type().clone(), prediction_point));
+						expired_historical += 1;
+					}
+				} else if let Some(correlation) = correlations.iter().find(|c| c.id() == signal.correlation_id()) {
+					if let Some(avg_dist) = correlation.average_distance() {
+						use bigdecimal::ToPrimitive;
+						if let Some(distance_minutes) = avg_dist.value().to_i64() {
+							let duration = match avg_dist.units() {
+								Resolution::Hours => chrono::Duration::hours(distance_minutes),
+								Resolution::Days => chrono::Duration::days(distance_minutes),
+								Resolution::Seconds => chrono::Duration::seconds(distance_minutes),
+								_ => chrono::Duration::minutes(distance_minutes),
+							};
+							let predicted_time = *signal.manifestation_date() + duration;
+							if current_time >= predicted_time {
+								signals_to_remove.push((signal.correlation_id().clone(), signal.manifestation_id().clone(), signal.signal_type().clone(), predicted_time));
+								expired_forward += 1;
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	(signals_to_remove, expired_historical, expired_forward)
+}
 
 /// Builds a processed batch queue from unprocessed batches in the database.
 ///
@@ -605,6 +679,90 @@ pub async fn create_correlations_for_events(database: &Database, dictionary: &Di
 	Ok(())
 }
 
+async fn process_correlation_signals(correlation: &database::Correlation, events: &[database::Event]) -> Result<usize> {
+	let mut signals_count = 0usize;
+
+	if let Some(event) = events.iter().find(|e| e.id() == correlation.event_id()) {
+		// For each manifestation of the event, create signals based on pattern occurrences
+		for manifestation in event.manifestations().values() {
+			for occurrence in correlation.occurrences() {
+				let manifestation_start = *manifestation.start();
+				let manifestation_midpoint = manifestation.midpoint();
+				let manifestation_end = *manifestation.end();
+
+				let occurrence_end = *occurrence.end();
+				let pattern_resolution = *occurrence.resolution();
+				let time_diff_start = pattern_resolution.difference(&manifestation_start, &occurrence_end)?;
+				let time_diff_midpoint = pattern_resolution.difference(&manifestation_midpoint, &occurrence_end)?;
+				let time_diff_end = pattern_resolution.difference(&manifestation_end, &occurrence_end)?;
+
+				if occurrence_end >= manifestation_start {
+					continue;
+				}
+
+				let distance_start = database::Distance::new(BigDecimal::from(time_diff_start), pattern_resolution);
+				let distance_midpoint = database::Distance::new(BigDecimal::from(time_diff_midpoint), pattern_resolution);
+				let distance_end = database::Distance::new(BigDecimal::from(time_diff_end), pattern_resolution);
+
+				let signal_types = vec![
+					(SignalType::Custom("PredictStart".to_string()), distance_start),
+					(SignalType::Custom("PredictMid".to_string()), distance_midpoint),
+					(SignalType::Custom("PredictEnd".to_string()), distance_end),
+				];
+
+				for (signal_type, distance) in signal_types {
+					let manifestation_id = manifestation.id().clone();
+					let signal = Signal::new(correlation.id().clone(), manifestation_id, correlation.event_id().clone(), occurrence_end, signal_type, distance.clone());
+					SIGNALS_QUEUE.lock().await.insert(signal);
+					signals_count += 1;
+				}
+			}
+		}
+
+		// Forward-looking signals: use minimum historical distance
+		let latest_manifestation = event.manifestations().values().map(|m| *m.end()).max();
+		if let Some(latest_manifest_time) = latest_manifestation {
+			let mut min_distance: Option<i64> = None;
+			for manifestation in event.manifestations().values() {
+				for occurrence in correlation.occurrences() {
+					let occurrence_end = *occurrence.end();
+					let manifestation_start = *manifestation.start();
+					if occurrence_end < manifestation_start {
+						let pattern_resolution = *occurrence.resolution();
+						if let Ok(diff) = pattern_resolution.difference(&manifestation_start, &occurrence_end) {
+							if diff > 0 {
+								min_distance = Some(min_distance.map_or(diff, |current| current.min(diff)));
+							}
+						}
+					}
+				}
+			}
+
+			if let Some(pred_distance) = min_distance {
+				for occurrence in correlation.occurrences() {
+					let occurrence_end = *occurrence.end();
+					if occurrence_end > latest_manifest_time {
+						let pattern_resolution = *occurrence.resolution();
+						let distance = database::Distance::new(BigDecimal::from(pred_distance), pattern_resolution);
+						let signal = Signal::new(
+							correlation.id().clone(),
+							database::ManifestationId::new(),
+							correlation.event_id().clone(),
+							occurrence_end,
+							SignalType::Custom("PredictStart".to_string()),
+							distance,
+						);
+						SIGNALS_QUEUE.lock().await.insert(signal);
+						signals_count += 1;
+					}
+				}
+			}
+		}
+	}
+
+	Ok(signals_count)
+}
+
 /// Creates prediction signals from correlations and events.
 ///
 /// This function generates signals for each correlation-manifestation pair,
@@ -629,155 +787,9 @@ pub async fn create_signals(database: &Database, aspect_id: &AspectId) -> Result
 
 	tracing::info!(correlations = correlations.len(), events = events.len(), "Creating signals");
 
-	let mut signals_count = 0;
-
-	// Process each correlation to create signals
+	let mut signals_count = 0usize;
 	for correlation in &correlations {
-		// Get the corresponding event
-		if let Some(event) = events.iter().find(|e| e.id() == correlation.event_id()) {
-			// For each manifestation of the event, create signals based on pattern occurrences
-			for manifestation in event.manifestations().values() {
-				// Create signals for each pattern occurrence in the correlation
-				for occurrence in correlation.occurrences() {
-					// Calculate the distance between the event manifestation and pattern occurrence
-					let manifestation_start = *manifestation.start();
-					let manifestation_midpoint = manifestation.midpoint();
-					let manifestation_end = *manifestation.end();
-
-					let occurrence_end = *occurrence.end(); // Calculate time difference using the pattern's resolution from the occurrence
-					     // For predictive signals, we want the distance from when the pattern ENDS to when the event occurs
-					     // difference(minuend, subtrahend) returns minuend - subtrahend
-					     // So difference(manifestation, occurrence_end) gives us manifestation - occurrence_end (positive forward in time)
-					let pattern_resolution = *occurrence.resolution();
-					let time_diff_start = pattern_resolution.difference(&manifestation_start, &occurrence_end)?;
-					let time_diff_midpoint = pattern_resolution.difference(&manifestation_midpoint, &occurrence_end)?;
-					let time_diff_end = pattern_resolution.difference(&manifestation_end, &occurrence_end)?;
-
-					// Debug: show first few signal distances
-					if signals_count < 5 {
-						tracing::debug!(
-							signal_index = signals_count,
-							occurrence_beginning = %occurrence.beginning(),
-							occurrence_end = %occurrence_end,
-							manifestation_start = %manifestation_start,
-							manifestation_end = %manifestation.end(),
-							time_diff_start_minutes = time_diff_start,
-							"Signal creation"
-						);
-					}
-
-					// Skip if pattern occurrence overlaps with or happens after the event manifestation
-					// For predictive signals, the pattern must END before the event STARTS
-					if occurrence_end >= manifestation_start {
-						if signals_count < 5 {
-							tracing::debug!("Skipping: Pattern ends at or after event starts (causality violation)");
-						}
-						continue;
-					}
-
-					let distance_start = database::Distance::new(BigDecimal::from(time_diff_start), pattern_resolution);
-					let distance_midpoint = database::Distance::new(BigDecimal::from(time_diff_midpoint), pattern_resolution);
-					let distance_end = database::Distance::new(BigDecimal::from(time_diff_end), pattern_resolution);
-
-					// Create different types of signals based on the relationship
-					// The manifestation_date for the signal should be when the pattern ENDS (the starting point of prediction)
-					// The distance then points forward to when the event manifestation occurs
-					let signal_types = vec![
-						(SignalType::Custom("PredictStart".to_string()), distance_start),  // Pattern predicts event start
-						(SignalType::Custom("PredictMid".to_string()), distance_midpoint), // Pattern predicts event midpoint
-						(SignalType::Custom("PredictEnd".to_string()), distance_end),      // Pattern predicts event end
-					];
-
-					for (signal_type, distance) in signal_types {
-						// Use the actual manifestation ID from the event
-						let manifestation_id = manifestation.id().clone();
-
-						// The signal's manifestation_date is when the pattern ends (the starting point for prediction)
-						// From this point, the distance tells us how far in the future the event will occur
-						let signal = Signal::new(correlation.id().clone(), manifestation_id, correlation.event_id().clone(), occurrence_end, signal_type, distance.clone());
-
-						// Add signal to the global signals queue
-						SIGNALS_QUEUE.lock().await.insert(signal);
-						signals_count += 1;
-					}
-				}
-			}
-
-			// After processing all historical pattern-manifestation pairs for this correlation,
-			// create forward-looking signals for pattern occurrences that ended after the last manifestation.
-			// These signals predict future events based on the average historical distance.
-			
-			// Find the latest manifestation time
-			let latest_manifestation = event.manifestations().values()
-				.map(|m| *m.end())
-				.max();
-			
-			if let Some(latest_manifest_time) = latest_manifestation {
-				// Calculate the MINIMUM distance from historical signals - this represents
-				// the time between a pattern ending and the NEXT event (not just any event)
-				let mut min_distance: Option<i64> = None;
-				
-				for manifestation in event.manifestations().values() {
-					for occurrence in correlation.occurrences() {
-						let occurrence_end = *occurrence.end();
-						let manifestation_start = *manifestation.start();
-						
-						// Only count valid historical relationships (pattern before manifestation)
-						if occurrence_end < manifestation_start {
-							let pattern_resolution = *occurrence.resolution();
-							if let Ok(diff) = pattern_resolution.difference(&manifestation_start, &occurrence_end) {
-								// We want the minimum positive distance - this is the time to the NEXT event
-								if diff > 0 {
-									min_distance = Some(min_distance.map_or(diff, |current| current.min(diff)));
-								}
-							}
-						}
-					}
-				}
-				
-				// Create forward-looking signals for patterns that ended after the last manifestation
-				if let Some(pred_distance) = min_distance {
-					// Debug: print forward-looking signal creation info
-					if signals_count < 5000 {
-						let forward_count = correlation.occurrences().iter()
-							.filter(|occ| *occ.end() > latest_manifest_time)
-							.count();
-						if forward_count > 0 {
-							tracing::debug!(
-								latest_manifest = %latest_manifest_time,
-								pred_distance_min = pred_distance,
-								eligible_patterns = forward_count,
-								"Forward-looking signal creation"
-							);
-						}
-					}
-					
-					for occurrence in correlation.occurrences() {
-						let occurrence_end = *occurrence.end();
-						
-						// Only create forward-looking signals for patterns that ended after the last manifestation
-						if occurrence_end > latest_manifest_time {
-							let pattern_resolution = *occurrence.resolution();
-							let distance = database::Distance::new(BigDecimal::from(pred_distance), pattern_resolution);
-							
-							// Create a forward-looking signal using a placeholder manifestation ID
-							// The manifestation_date is when the pattern ended, distance is the average historical distance
-							let signal = Signal::new(
-								correlation.id().clone(),
-								database::ManifestationId::new(), // New ID for predicted future event
-								correlation.event_id().clone(),
-								occurrence_end,
-								SignalType::Custom("PredictStart".to_string()), // Use same type as historical signals
-								distance,
-							);
-							
-							SIGNALS_QUEUE.lock().await.insert(signal);
-							signals_count += 1;
-						}
-					}
-				}
-			}
-		}
+		signals_count += process_correlation_signals(correlation, &events).await?;
 	}
 
 	tracing::info!(signals_created = signals_count, "Signal creation completed");
@@ -829,77 +841,7 @@ pub async fn filter_expired_signals(database: &Database, aspect_id: &AspectId, c
 
 	tracing::debug!(events = events.len(), correlations = correlations.len(), "Found events and correlations");
 	
-	// Collect signals to remove
-	let mut signals_to_remove = Vec::new();
-	let mut expired_historical = 0;
-	let mut expired_forward = 0;
-
-	// Iterate through all signals to check for expiration
-	for signal in signals_lock.values() {
-		// Find the event this signal is predicting by matching correlation IDs
-		let mut signal_event_id = None;
-
-		// Look through correlations to find which event this signal belongs to
-		for correlation in &correlations {
-			if correlation.id() == signal.correlation_id() {
-				signal_event_id = Some(correlation.event_id().clone());
-				break;
-			}
-		}
-
-		// If we found the event, check for expiration
-		if let Some(event_id) = signal_event_id {
-			if let Some(event) = events.iter().find(|e| *e.id() == event_id) {
-				// Find the manifestation this signal was created from/predicting
-				if let Some((_, predicted_manifestation)) = event.manifestations().iter().find(|(_, m)| m.id() == signal.manifestation_id()) {
-					// Historical signals: the signal predicts THIS manifestation (the baseline)
-					// The signal expires when we've passed the time this manifestation was supposed to occur
-					// Determine the prediction point based on signal type
-					let prediction_point = match signal.signal_type() {
-						SignalType::Custom(ref type_name) if type_name == "PredictStart" => predicted_manifestation.midpoint(), // Use midpoint as the "peak" time
-						SignalType::Custom(ref type_name) if type_name == "PredictMid" => predicted_manifestation.midpoint(),
-						SignalType::Custom(ref type_name) if type_name == "PredictEnd" => *predicted_manifestation.end(),
-						SignalType::Custom(_) => predicted_manifestation.midpoint(), // Default to midpoint for unknown types
-					};
-
-					// Signal expires when current_time reaches or passes the prediction point
-					if current_time >= prediction_point {
-						// Signal has expired - we've reached the time it was predicting
-						signals_to_remove.push((signal.correlation_id().clone(), signal.manifestation_id().clone(), signal.signal_type().clone(), prediction_point));
-						expired_historical += 1;
-					}
-				} else {
-					// Forward-looking signals: manifestation_id doesn't match any existing manifestation
-					// These predict future events that haven't occurred yet
-					// Calculate when this signal predicts the event will occur based on average_distance
-					if let Some(correlation) = correlations.iter().find(|c| c.id() == signal.correlation_id()) {
-						if let Some(avg_dist) = correlation.average_distance() {
-							// Convert distance value to i64 for time calculation
-							use bigdecimal::ToPrimitive;
-							if let Some(distance_minutes) = avg_dist.value().to_i64() {
-								// Calculate when this signal predicts the event will occur
-								// predicted_time = manifestation_date + average_distance
-								let duration = match avg_dist.units() {
-									Resolution::Minutes => chrono::Duration::minutes(distance_minutes),
-									Resolution::Hours => chrono::Duration::hours(distance_minutes),
-									Resolution::Days => chrono::Duration::days(distance_minutes),
-									Resolution::Seconds => chrono::Duration::seconds(distance_minutes),
-									_ => chrono::Duration::minutes(distance_minutes), // Fallback
-								};
-								let predicted_time = *signal.manifestation_date() + duration;
-								
-								// Signal expires when we've passed the predicted time
-								if current_time >= predicted_time {
-									signals_to_remove.push((signal.correlation_id().clone(), signal.manifestation_id().clone(), signal.signal_type().clone(), predicted_time));
-									expired_forward += 1;
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-	}
+	let (signals_to_remove, expired_historical, expired_forward) = collect_expired_signals(&signals_lock, &events, &correlations, current_time);
 
 	// Correlations loaded from database, no lock to release
 
@@ -1128,7 +1070,6 @@ mod tests {
 		tracing::info!(elapsed = ?timer.elapsed(), "Time taken for create_correlations_for_events");
 
 		// print the number of correlations with more than 1 occurrence (using streaming)
-		use futures::StreamExt;
 		let mut correlation_stream = database.get_correlations(&aspect.id()).await?;
 		let mut multi_occurrence_count = 0usize;
 		while let Some(result) = correlation_stream.next().await {
@@ -1218,7 +1159,7 @@ mod tests {
 
 		tracing::info!(elapsed = ?timer.elapsed(), "Time taken for sample signal probability calculation");
 
-		let event_prob_str = sig_event_probability.map(|p| format!("{:.4}", p)).unwrap_or_else(|| "N/A".to_string());
+		let event_prob_str = sig_event_probability.map_or_else(|| "N/A".to_string(), |p| format!("{p:.4}"));
 		tracing::info!(
 			correlation_id = %random_correlation_id,
 			manifestation_id = %random_manifestation_id,
@@ -1324,7 +1265,6 @@ mod tests {
 		tracing::info!(elapsed = ?timer.elapsed(), "Time taken for create_correlations_for_events");
 
 		// print the number of correlations with more than 1 occurrence (using streaming)
-		use futures::StreamExt;
 		let mut correlation_stream = db.get_correlations(&aspect.id()).await?;
 		let mut multi_occurrence_count = 0usize;
 		while let Some(result) = correlation_stream.next().await {
@@ -1405,7 +1345,7 @@ mod tests {
 				let event_prob = signals_lock.event_probability(&event_id, &signal_type, query_time, &db, &aspect.id()).await?;
 
 				// Format output nicely
-				let event_prob_str = event_prob.map(|p| format!("{:.4}", p)).unwrap_or_else(|| "N/A".to_string());
+				let event_prob_str = event_prob.map_or_else(|| "N/A".to_string(), |p| format!("{p:.4}"));
 				tracing::info!(
 					hour = hour,
 					event_based = %event_prob_str,
@@ -1726,5 +1666,146 @@ mod tests {
 			max_y = %pattern.relatives().iter().map(|r| r.vector().amplitude()).max().unwrap_or(&zero),
 			"Pattern bounds"
 		);
+	}
+
+	/// Test for the new Pipeline API
+	#[tokio::test]
+	#[serial]
+	async fn test_pipeline_api() -> Result<()> {
+		// Initialize tracing
+		let _ = tracing_subscriber::fmt()
+			.with_env_filter(
+				tracing_subscriber::EnvFilter::try_from_default_env()
+					.unwrap_or_else(|_| {
+						tracing_subscriber::EnvFilter::new(
+							"info,dataset_management=debug,database=debug"
+						)
+					})
+			)
+			.with_test_writer()
+			.try_init();
+
+		// Skip this test if running in CI
+		if std::env::var("SKIP_SLOW_TESTS").is_ok() {
+			tracing::info!("Skipping test_pipeline_api due to SKIP_SLOW_TESTS environment variable");
+			return Ok(());
+		}
+
+		// Use the fake database for testing
+		let db = fake_database().await;
+		let subjects = db.list_subjects().await?;
+		let subject = subjects.iter().find(|(_, name)| name.as_str() == "TestSubject")
+			.map(|(id, _)| *id)
+			.ok_or_else(|| anyhow::anyhow!("Subject 'TestSubject' not found"))?;
+		let aspects = db.get_subject_aspects(&subject).await?;
+		let aspect = aspects.iter().find(|a| a.name() == "TestAspect")
+			.ok_or_else(|| anyhow::anyhow!("Aspect 'TestAspect' not found"))?;
+
+		tracing::info!("=== Testing Pipeline Builder ===");
+
+		// Build a pipeline using the new API
+		let mut pipeline = Pipeline::builder(db.clone(), aspect.id())
+			.resolution(Resolution::Minutes)
+			.spline_method(Spline::Linear)
+			.batch_size(60)
+			.dictionary_name("PipelineTestDictionary")
+			.dictionary_constraints(DictionaryConstraints::new(
+				Some(Steps::new(10, Spline::Linear)),
+				Some(vec![
+					VariablilityType::AveragePercentile(Variability::new(BigDecimal::from_f64(0.000_000_001).unwrap())),
+				])
+			))
+			// Register the built-in peak detector
+			.with_peak_detector("Pipeline Peak Detection")
+			.build()
+			.await?;
+
+		tracing::info!(
+			detector_count = pipeline.detector_count(),
+			"Pipeline built with detectors"
+		);
+
+		// Verify detectors are registered
+		assert_eq!(pipeline.detector_count(), 1);
+		assert!(pipeline.get_detector(&DetectorId::new("peak_pipeline_peak_detection")).is_some());
+
+		tracing::info!("=== Running Pipeline ===");
+
+		// Run the full pipeline
+		pipeline.run().await?;
+
+		// Verify pipeline completed
+		assert!(pipeline.state().run_count > 0);
+		assert!(pipeline.state().last_run.is_some());
+
+		tracing::info!(
+			run_count = pipeline.state().run_count,
+			last_run = ?pipeline.state().last_run,
+			pattern_count = pipeline.dictionary().len(),
+			signal_count = pipeline.signals().len(),
+			"Pipeline completed"
+		);
+
+		tracing::info!("=== Testing Persistence ===");
+
+		// Test state persistence
+		assert!(Pipeline::state_exists(&db, &aspect.id()).await?);
+
+		// Load the pipeline state
+		let mut loaded_pipeline = Pipeline::load(db.clone(), &aspect.id()).await?;
+
+		// Verify loaded state matches
+		assert_eq!(loaded_pipeline.state().run_count, pipeline.state().run_count);
+		assert_eq!(loaded_pipeline.config().batch_size, pipeline.config().batch_size);
+
+		tracing::info!(
+			run_count = loaded_pipeline.state().run_count,
+			detector_ids = ?loaded_pipeline.state().config.detector_ids,
+			"Loaded pipeline state"
+		);
+
+		// Detectors need to be re-registered after loading
+		assert_eq!(loaded_pipeline.detector_count(), 0);
+
+		// Re-register the detector
+		loaded_pipeline.register_detector(EventDetector::new(
+			"peak_pipeline_peak_detection",
+			"Pipeline Peak Detection",
+			Some("Detects peak values".to_string()),
+			std::sync::Arc::new(move |db, aspect, resolution, method| {
+				Box::pin(async move {
+					crate::detectors::detect_peaks(db, aspect, resolution, method, "Pipeline Peak Detection").await
+				})
+			}),
+		));
+
+		assert_eq!(loaded_pipeline.detector_count(), 1);
+
+		tracing::info!("=== Testing Detector Management ===");
+
+		// Test removing a detector
+		let removed = loaded_pipeline.remove_detector(&DetectorId::new("peak_pipeline_peak_detection"));
+		assert!(removed);
+		assert_eq!(loaded_pipeline.detector_count(), 0);
+
+		// Test clear_detectors
+		loaded_pipeline.register_detector(EventDetector::new(
+			"test1", "Test 1", None,
+			std::sync::Arc::new(|_, _, _, _| Box::pin(async { Ok(vec![]) })),
+		));
+		loaded_pipeline.register_detector(EventDetector::new(
+			"test2", "Test 2", None,
+			std::sync::Arc::new(|_, _, _, _| Box::pin(async { Ok(vec![]) })),
+		));
+		assert_eq!(loaded_pipeline.detector_count(), 2);
+		loaded_pipeline.clear_detectors();
+		assert_eq!(loaded_pipeline.detector_count(), 0);
+
+		// Cleanup: delete the state file
+		loaded_pipeline.delete_state().await?;
+		assert!(!Pipeline::state_exists(&db, &aspect.id()).await?);
+
+		tracing::info!("test_pipeline_api completed successfully!");
+		Ok(())
 	}
 }
