@@ -154,7 +154,7 @@ impl Inputs for Database {
 			for (i, input_measurement) in chunk.iter().enumerate() {
 				let measurement = Measurement::from_input_measurement(&dataset_id, input_measurement);
 				params.push(chunk_tx_ids[i].as_uuid().to_string());
-				params.push(dataset_id_str.to_string());
+				params.push(dataset_id_str.clone());
 				params.push(measurement.timestamp().timestamp_millis().to_string());
 				params.push(measurement.value().to_string());
 			}
@@ -504,7 +504,7 @@ impl Inputs for Database {
 			let placeholders: Vec<&str> = (0..sub_chunk.len()).map(|_| "?").collect();
 			let delete_sql = format!("DELETE FROM batches WHERE id IN ({})", placeholders.join(", "));
 
-			let params: Vec<String> = sub_chunk.iter().map(|id| id.to_string()).collect();
+			let params: Vec<String> = sub_chunk.iter().map(std::string::ToString::to_string).collect();
 			conn.as_ref().execute(&delete_sql, turso::params_from_iter(params)).await
 				.map_err(|e| Error::DatabaseError(format!("Failed to bulk delete processed batches: {e}")))?;
 		}
@@ -625,7 +625,7 @@ impl Inputs for Database {
 			let placeholders: Vec<&str> = (0..sub_chunk.len()).map(|_| "?").collect();
 			let delete_sql = format!("DELETE FROM batches WHERE id IN ({})", placeholders.join(", "));
 
-			let params: Vec<String> = sub_chunk.iter().map(|id| id.to_string()).collect();
+			let params: Vec<String> = sub_chunk.iter().map(std::string::ToString::to_string).collect();
 			conn.as_ref().execute(&delete_sql, turso::params_from_iter(params)).await
 				.map_err(|e| Error::DatabaseError(format!("Failed to bulk delete unprocessed batches: {e}")))?;
 		}
@@ -1001,10 +1001,7 @@ impl Inputs for Database {
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
 
 		// Insert into correlations table with average_distance
-		let (avg_dist_value, avg_dist_units) = match correlation.average_distance() {
-			Some(dist) => (Some(dist.value().to_string()), Some(dist.units().to_string())),
-			None => (None, None),
-		};
+		let (avg_dist_value, avg_dist_units) = correlation.average_distance().map_or((None, None), |dist| (Some(dist.value().to_string()), Some(dist.units().to_string())));
 		let insert_sql = r"INSERT INTO correlations (id, dictionary_id, subject_id, aspect_id, pattern_id, event_id, average_distance_value, average_distance_units, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 		let res = conn.as_ref().execute(insert_sql, turso::params![correlation.id().to_string(), correlation.dictionary_id().to_string(), correlation.subject_id().to_string(), correlation.aspect_id().to_string(), correlation.pattern_id().to_string(), correlation.event_id().to_string(), avg_dist_value, avg_dist_units, chrono::Utc::now().timestamp_millis(), chrono::Utc::now().timestamp_millis()]).await;
 		match res {
@@ -1066,10 +1063,7 @@ impl Inputs for Database {
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
 
 		// Update correlations table with all fields including average_distance
-		let (avg_dist_value, avg_dist_units) = match correlation.average_distance() {
-			Some(dist) => (Some(dist.value().to_string()), Some(dist.units().to_string())),
-			None => (None, None),
-		};
+		let (avg_dist_value, avg_dist_units) = correlation.average_distance().map_or((None, None), |dist| (Some(dist.value().to_string()), Some(dist.units().to_string())));
 		let update_sql = r"UPDATE correlations SET dictionary_id = ?, subject_id = ?, aspect_id = ?, pattern_id = ?, event_id = ?, average_distance_value = ?, average_distance_units = ?, updated_at = ? WHERE id = ?";
 		let res = conn.as_ref().execute(update_sql, turso::params![correlation.dictionary_id().to_string(), correlation.subject_id().to_string(), correlation.aspect_id().to_string(), correlation.pattern_id().to_string(), correlation.event_id().to_string(), avg_dist_value, avg_dist_units, chrono::Utc::now().timestamp_millis(), correlation.id().to_string()]).await;
 		match res {

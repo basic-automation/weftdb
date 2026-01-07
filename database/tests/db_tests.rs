@@ -10,7 +10,6 @@ use splimes::{Resolution, Spline};
 #[cfg(test)]
 use tempfile::TempDir;
 use tracing::{debug, instrument};
-use tracing_subscriber;
 use uuid::Uuid;
 
 async fn setup_test_database() -> Result<(TempDir, Database, Subject, Aspect)> {

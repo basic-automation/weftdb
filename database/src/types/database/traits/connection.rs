@@ -29,6 +29,6 @@ pub trait Connection {
 
 	/// Checkpoint the WAL (Write-Ahead Log) to flush pending writes to the main database file.
 	/// This should be called after large batch operations to ensure data is persisted.
-	/// Uses PRAGMA wal_checkpoint(TRUNCATE) to checkpoint and truncate the WAL file.
+	/// Uses PRAGMA `wal_checkpoint(TRUNCATE)` to checkpoint and truncate the WAL file.
 	async fn checkpoint_wal(turso_db: &turso::Database) -> Result<()>;
 }

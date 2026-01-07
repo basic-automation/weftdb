@@ -13,10 +13,10 @@ use crate::{
 	}, AspectId
 };
 
-/// Helper function to find the previous manifestation's midpoint for a given manifestation_id.
-/// Given a sorted list of (ManifestationId, midpoint) tuples, finds the midpoint of the
-/// manifestation that occurred immediately before the specified manifestation_id.
-/// Returns None if the manifestation_id is not found or if it's the first manifestation.
+/// Helper function to find the previous manifestation's midpoint for a given `manifestation_id`.
+/// Given a sorted list of (`ManifestationId`, midpoint) tuples, finds the midpoint of the
+/// manifestation that occurred immediately before the specified `manifestation_id`.
+/// Returns None if the `manifestation_id` is not found or if it's the first manifestation.
 fn find_previous_manifestation_midpoint(
 	manifestation_id: &ManifestationId,
 	sorted_midpoints: &[(ManifestationId, DateTime<Utc>)]
@@ -285,11 +285,11 @@ impl Signal {
 		Err(anyhow::anyhow!("No correlation found for correlation_id {:?}", self.correlation_id))
 	}
 
-	/// Probability of the signal at a given date using the correlation's average_distance.
+	/// Probability of the signal at a given date using the correlation's `average_distance`.
 	/// 
-	/// Per documentation: probability = time_elapsed / average_distance
+	/// Per documentation: probability = `time_elapsed` / `average_distance`
 	/// The signal represents a prediction starting at `manifestation_date`.
-	/// The curve passes through probability = 1 at time = `manifestation_date` + average_distance
+	/// The curve passes through probability = 1 at time = `manifestation_date` + `average_distance`
 	///
 	/// # Arguments
 	/// * `date` - The query date to calculate probability for
@@ -325,7 +325,7 @@ impl Signal {
 		Ok(probability)
 	}
 
-	/// probability of the signal at a given date (legacy method using individual distance + error_rate)
+	/// probability of the signal at a given date (legacy method using individual distance + `error_rate`)
 	/// The signal represents a prediction curve starting at `manifestation_date`.
 	/// The curve passes through probability = 1 at time = `manifestation_date` + distance.value + `error_rate`
 	///
@@ -483,10 +483,10 @@ impl Signals {
 	}
 
 	/// Calculate the sum of probabilities for all signals of a given event and signal type at a specific date
-	/// Uses the correlation's average_distance as per documentation: probability = time_elapsed / average_distance
+	/// Uses the correlation's `average_distance` as per documentation: probability = `time_elapsed` / `average_distance`
 	/// 
-	/// Per documentation: Signal Sum = sum of all probabilities - signal_sum_error_rate
-	/// The error_rate is averaged across all contributing correlations and subtracted once from the sum.
+	/// Per documentation: Signal Sum = sum of all probabilities - `signal_sum_error_rate`
+	/// The `error_rate` is averaged across all contributing correlations and subtracted once from the sum.
 	///
 	/// # Errors
 	///
@@ -579,14 +579,14 @@ impl Signals {
 	}
 
 	/// Calculate the average probability for all signals of a given event and signal type at a specific date
-	/// Uses the correlation's average_distance as per documentation: probability = time_elapsed / average_distance
+	/// Uses the correlation's `average_distance` as per documentation: probability = `time_elapsed` / `average_distance`
 	/// This provides a normalized probability value by averaging individual signal probabilities
 	/// 
-	/// Per documentation: Signal Average = average of all probabilities - signal_avg_error_rate
-	/// The error_rate is averaged across all unique contributing correlations and subtracted once.
+	/// Per documentation: Signal Average = average of all probabilities - `signal_avg_error_rate`
+	/// The `error_rate` is averaged across all unique contributing correlations and subtracted once.
 	/// 
 	/// The probability for each signal is calculated from the LAST KNOWN MANIFESTATION's midpoint,
-	/// not from the signal's manifestation_date (which is the pattern end time). This ensures
+	/// not from the signal's `manifestation_date` (which is the pattern end time). This ensures
 	/// the signal-based probability matches the event-based probability calculation.
 	///
 	/// # Errors
@@ -653,7 +653,7 @@ impl Signals {
 					// Fallback to signal's manifestation_date only if no manifestation data exists
 					let reference_time = previous_midpoint
 						.or(last_manifestation_midpoint)
-						.unwrap_or(*s.manifestation_date());
+						.unwrap_or_else(|| *s.manifestation_date());
 					
 					// Calculate time elapsed from reference point
 					let time_elapsed_i64 = avg_dist.units().difference(&date, &reference_time)?;
@@ -724,16 +724,16 @@ impl Signals {
 	/// 
 	/// This function returns a single probability value based on time elapsed since the
 	/// **last manifestation** of the event, rather than averaging across individual signal
-	/// manifestation_dates.
+	/// `manifestation_dates`.
 	///
-	/// Formula: probability = (query_date - last_manifestation_end) / average_distance
+	/// Formula: probability = (`query_date` - `last_manifestation_end`) / `average_distance`
 	///
 	/// This is useful when you want to know "how overdue is the next event?" rather than
 	/// averaging signals from different pattern occurrences.
 	///
 	/// Returns None if:
 	/// - No signals exist for the event
-	/// - No correlation can be found with an average_distance
+	/// - No correlation can be found with an `average_distance`
 	/// - The event has no manifestations
 	/// - The query date is before or at the last manifestation
 	///

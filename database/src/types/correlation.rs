@@ -95,7 +95,7 @@ pub struct Correlation {
 	occurrences: Vec<Occurrence>,
 	/// The average distance from pattern occurrences to event manifestations.
 	/// Used as the divisor in probability calculations per documentation:
-	/// probability = time_elapsed / average_distance
+	/// probability = `time_elapsed` / `average_distance`
 	#[serde(default)]
 	average_distance: Option<Distance>,
 }
