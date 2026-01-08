@@ -176,10 +176,14 @@ fn benchmark_cache_memory_usage(c: &mut Criterion) {
 					for i in 0..size {
 						let measurement = InputMeasurement::new(base_time + Duration::seconds(i64::from(i) * 60), BigDecimal::from_str(&format!("{i}.0")).unwrap());
 						db.capture_measurement(&aspect.id(), &DatasetId::new(), &measurement).await.unwrap();
-					} // Perform several analyses to test memory usage
+					}
+					// Perform several analyses to test memory usage
+					// Keep analysis times within the measurement range to avoid
+					// "Insufficient measurements provided for interpolation" panics.
 					let mut results = vec![];
-					for i in 0..10 {
-						let analyze_time = base_time + Duration::seconds(i * 300);
+					for j in 0..10 {
+						let offset = (j as i64 * 60) % (size as i64 * 60);
+						let analyze_time = base_time + Duration::seconds(offset);
 						let result = db.analyze_point(&aspect.id(), analyze_time, &Resolution::Seconds, &Spline::Linear).await.unwrap();
 						results.push(result);
 					}

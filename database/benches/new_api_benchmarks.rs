@@ -134,8 +134,11 @@ fn benchmark_point_analysis(c: &mut Criterion) {
 		c.bench_with_input(BenchmarkId::new("point_analysis", format!("{spline_type:?}")), &spline_type, |b, &spline_type| {
 			b.iter(|| {
 				rt.block_on(async {
-					let target_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 45, 30).unwrap();
-					let result = db.analyze_point(&aspect_id, target_time, &Resolution::Seconds, &spline_type).await.unwrap();
+					// Use a time within the inserted measurements (0..99 minutes)
+					let target_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 50, 0).unwrap();
+					// Measurements were inserted at minute intervals; use Minutes resolution
+					// so the interpolation window includes enough neighbors for cubic splines.
+					let result = db.analyze_point(&aspect_id, target_time, &Resolution::Minutes, &spline_type).await.unwrap();
 					black_box(result)
 				})
 			});
