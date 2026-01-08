@@ -1,3 +1,3 @@
-pub use load_unprocessed_batch_queue::{build_unprocessed_queue, UNPROCESSED_BATCHES_QUEUE};
+pub use load_unprocessed_batch_queue::build_unprocessed_queue;
 
 mod load_unprocessed_batch_queue;

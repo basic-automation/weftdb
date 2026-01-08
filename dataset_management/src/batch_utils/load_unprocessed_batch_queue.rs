@@ -1,36 +1,45 @@
-use std::sync::LazyLock;
-use tokio::sync::Mutex;
 use anyhow::Result;
-use crate::Batch;
-use database::Database;
-use futures::TryStreamExt;
-use splimes::Spline;
-use splimes::Resolution;
-use database::AspectId;
-use crate::BatchedMeasurement;
+use database::{
+	database::traits::{DatabaseStructure, Inputs, Outputs}, AspectId, Database
+};
+use futures::StreamExt;
+use splimes::{Resolution, Spline};
+use tracing::{debug, info};
 
+use crate::{Batch, BatchedMeasurement};
 
-pub static UNPROCESSED_BATCHES_QUEUE: LazyLock<Mutex<Vec<Batch>>> = LazyLock::new(|| Mutex::new(Vec::new()));
-
-
+/// Builds sliding-window batches from the provided aspect and stores them in the database.
+///
+/// # Errors
+/// Returns an error if database reads or writes fail while constructing or persisting batches.
+///
+/// # Panics
+/// Panics if the internally generated sliding window ever yields a batch with a size different
+/// from the requested `batch_size`.
 pub async fn build_unprocessed_queue(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, batch_size: usize) -> Result<()> {
 	let start_time = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
 	let end_time = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
 
 	// Collect all points first to create sliding window batches
-	let mut point_stream = database.stream_analyze_range(*aspect, start_time, end_time, *resolution, *method);
+	let mut point_stream = Outputs::analyze_range(database, aspect, start_time, end_time, *resolution, *method).await?;
 	let mut all_points = Vec::new();
-	while let Some(point) = point_stream.try_next().await? {
+	while let Some(result) = point_stream.next().await {
+		let point = result?;
 		all_points.push(point);
 	}
 
-	println!("Total points streamed: {}", all_points.len());
-	println!("Batch size: {}", batch_size);
-	println!("Start time: {}, End time: {}", start_time, end_time);
+	info!(total_points = all_points.len(), batch_size, %start_time, %end_time, "Collected points for batch creation");
 
 	// Create sliding window batches (overlapping)
 	if batch_size > 0 && all_points.len() >= batch_size {
-		let database_info = database.get_database_info().await.expect("Database info should be available");
+		let database_info = database.get_database_info().await.map_err(|_| anyhow::anyhow!("Database info not available"))?;
+
+		let total_batches = all_points.len() - batch_size + 1;
+		let report_interval = std::cmp::max(1, total_batches / 10); // Report every 10% of total batches (at least every batch)
+		info!(total_batches, "Creating sliding window batches");
+
+		// Collect all batches first, then store them in bulk for better performance
+		let mut batches = Vec::with_capacity(total_batches);
 
 		// Create overlapping sliding window batches - each batch has exactly batch_size measurements
 		for i in 0..=(all_points.len() - batch_size) {
@@ -39,16 +48,21 @@ pub async fn build_unprocessed_queue(database: &Database, aspect: &AspectId, res
 
 			let measurements = window.iter().map(|p| BatchedMeasurement::new(p.clone())).collect();
 			let batch = Batch::new(batch_size, measurements, *resolution, *aspect, database_info.clone());
+			batches.push(batch);
 
-			let mut batches_lock = UNPROCESSED_BATCHES_QUEUE.lock().await;
-			batches_lock.push(batch);
-			drop(batches_lock);
+			// Progress indicator for batch creation
+			if (i + 1) % report_interval == 0 || i + 1 == total_batches {
+				debug!(created = i + 1, total = total_batches, "Batch creation progress");
+			}
 		}
+
+		info!(batch_count = batches.len(), "Storing batches in database");
+		// Store all batches at once using bulk insert
+		database.batch_insert_unprocessed_batches(aspect, batches).await?;
 	}
 
-	let final_lock = UNPROCESSED_BATCHES_QUEUE.lock().await;
-	println!("Final UNPROCESSED_BATCHES_QUEUE length: {}", final_lock.len());
-	drop(final_lock);
+	// Note: No longer using global queue length since batches are stored in database
+	info!("Batches stored in database successfully");
 
 	Ok(())
 }
