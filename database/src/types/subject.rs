@@ -1,10 +1,12 @@
-use std::{collections::HashMap, hash::Hash};
+use std::{collections::HashMap, hash::Hash, path::Path};
 
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use turso::Database as TursoDatabase;
 use uuid::Uuid;
 
-use crate::{Aspect, AspectId, DatabaseId};
+use crate::{
+	database::traits::connection::Connection as ConnectionTrait, types::database::traits::{aspect_structure::AspectStructure, DatabaseStructure}, Aspect, AspectId, Database, DatabaseId
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SubjectId(Uuid);
@@ -32,13 +34,18 @@ impl Default for SubjectId {
 	}
 }
 
+impl std::fmt::Display for SubjectId {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}", self.0)
+	}
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Subject {
 	id: SubjectId,
 	database_id: DatabaseId,
+	database_metadata_db_path: String,
 	name: String,
-	#[serde(skip)]
-	turso_db: Option<TursoDatabase>,
 	aspects: HashMap<AspectId, Aspect>,
 }
 
@@ -60,16 +67,44 @@ impl PartialEq for Subject {
 impl Eq for Subject {}
 
 impl Subject {
-	#[must_use]
-	pub fn new(name: String, database_id: DatabaseId, turso_db: TursoDatabase) -> Self {
-		let id = SubjectId::new();
-		Self { id, name, turso_db: Some(turso_db), database_id, aspects: HashMap::new() }
+	/// Creates a new Subject with the given parameters.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the subject path cannot be determined or the directory cannot be created.
+	pub async fn new(id: Option<SubjectId>, name: String, database_id: DatabaseId, database_metadata_db_path: String) -> Result<Self> {
+		let id = id.unwrap_or_default();
+
+		// For new subjects (when id is None), we construct the path directly using the provided name
+		// The database_metadata_db_path points to the database metadata file, so we need to get the database directory
+		let database_dir = Path::new(&database_metadata_db_path).parent().ok_or_else(|| anyhow::anyhow!("Cannot determine database directory"))?;
+		let subject_path = database_dir.join(&name);
+
+		// recursively create directory if it doesn't exist
+		tokio::fs::create_dir_all(&subject_path).await?;
+
+		Ok(Self { id, name, database_id, database_metadata_db_path, aspects: HashMap::new() })
 	}
 
-	#[must_use]
-	pub fn new_with_id(id: SubjectId, name: String, database_id: DatabaseId, turso_db: TursoDatabase) -> Self {
-		Self { id, name, turso_db: Some(turso_db), database_id, aspects: HashMap::new() }
+	/// Retrieves the database metadata path from the Turso database.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the database connection fails or the metadata path cannot be retrieved.
+	pub async fn get_database_metadata_path(turso_db_path: String) -> Result<String> {
+		let turso_db = Database::get_turso_database(&turso_db_path).await?;
+
+		// Query the database for the metadata_path field of the first item in the database table
+		let conn = Database::begin_concurrent(&turso_db, &turso_db_path, None).await?;
+		let mut rows = conn.as_ref().query("SELECT metadata_path FROM database", turso::params![]).await?;
+		let row = rows.next().await?.ok_or_else(|| anyhow::anyhow!("Database metadata not found"))?;
+		let metadata_path: String = row.get(0)?;
+		let _ = Database::commit_concurrent(&conn).await;
+
+		Ok(metadata_path)
 	}
+
+	// Removed unused helper methods to fix warnings
 
 	#[must_use]
 	pub const fn id(&self) -> SubjectId {
@@ -87,16 +122,17 @@ impl Subject {
 	}
 
 	#[must_use]
-	pub const fn turso_db(&self) -> Option<&TursoDatabase> {
-		self.turso_db.as_ref()
-	}
-
-	#[must_use]
 	pub const fn aspects(&self) -> &HashMap<AspectId, Aspect> {
 		&self.aspects
 	}
 
 	pub fn add_aspect(&mut self, aspect: Aspect) {
 		self.aspects.insert(aspect.id(), aspect);
+	}
+
+	/// Get aspect by name
+	#[must_use]
+	pub fn get_aspect_by_name(&self, name: &str) -> Option<&Aspect> {
+		self.aspects.values().find(|a| a.name() == name)
 	}
 }

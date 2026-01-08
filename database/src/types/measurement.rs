@@ -1,45 +1,88 @@
+use std::fmt::Display;
+
 use bigdecimal::{BigDecimal, FromPrimitive};
 use chrono::{TimeZone, Utc};
-use fake::Dummy;
-use rand::Rng;
+use fake::Fake;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::InputMeasurement;
+use crate::{DatasetId, InputMeasurement};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MeasurementId(Uuid);
+
+impl MeasurementId {
+	#[must_use]
+	pub fn new() -> Self {
+		Self(Uuid::new_v4())
+	}
+
+	#[must_use]
+	pub const fn from_uuid(uuid: Uuid) -> Self {
+		Self(uuid)
+	}
+
+	#[must_use]
+	pub const fn as_uuid(&self) -> Uuid {
+		self.0
+	}
+
+	/// Create a `PatternID` from a string representation
+	///
+	/// # Errors
+	/// Returns an error if the string is not a valid UUID
+	pub fn from_string(s: &str) -> Result<Self, uuid::Error> {
+		Uuid::parse_str(s).map(Self)
+	}
+}
+
+impl Default for MeasurementId {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+impl Display for MeasurementId {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}", self.0)
+	}
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Measurement {
-	pub id: Uuid,
-	pub dataset_id: Uuid,
-	pub timestamp: chrono::DateTime<Utc>,
-	pub value: BigDecimal,
+	id: MeasurementId,
+	dataset_id: DatasetId,
+	timestamp: chrono::DateTime<Utc>,
+	value: BigDecimal,
 }
 
 impl Measurement {
 	/// Creates a new measurement from an input measurement with a generated ID
 	#[must_use]
-	pub fn from_input_measurement(dataset_id: Uuid, input: &InputMeasurement) -> Self {
-		Self { id: Uuid::new_v4(), dataset_id, timestamp: input.timestamp(), value: input.value().clone() }
+	pub fn from_input_measurement(dataset_id: &DatasetId, input: &InputMeasurement) -> Self {
+		Self { id: MeasurementId::new(), dataset_id: *dataset_id, timestamp: input.timestamp(), value: input.value().clone() }
 	}
 
 	/// Generate fake measurement data for testing
 	#[must_use]
-	pub fn fake(dataset_id: Uuid) -> Self {
-		let mut rng = rand::thread_rng();
-		Self { id: Uuid::new_v4(), dataset_id, timestamp: Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap() + chrono::Duration::seconds(rng.gen_range(0..86400)), value: BigDecimal::from_f64(rng.gen_range(0.0..100.0)).unwrap_or_default() }
+	pub fn fake(dataset_id: DatasetId) -> Self {
+		let offset_secs: i64 = fake::Faker.fake();
+		let value_f64: f64 = fake::Faker.fake();
+		Self { id: MeasurementId::new(), dataset_id, timestamp: Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap() + chrono::Duration::seconds(offset_secs.rem_euclid(86400)), value: BigDecimal::from_f64(value_f64.rem_euclid(100.0)).unwrap_or_default() }
 	}
 
 	#[must_use]
-	pub const fn new(id: Uuid, dataset_id: Uuid, timestamp: chrono::DateTime<Utc>, value: BigDecimal) -> Self {
+	pub const fn new(id: MeasurementId, dataset_id: DatasetId, timestamp: chrono::DateTime<Utc>, value: BigDecimal) -> Self {
 		Self { id, dataset_id, timestamp, value }
 	}
 
 	#[must_use]
-	pub const fn id(&self) -> Uuid {
+	pub const fn id(&self) -> MeasurementId {
 		self.id
 	}
 
 	#[must_use]
-	pub const fn dataset_id(&self) -> Uuid {
+	pub const fn dataset_id(&self) -> DatasetId {
 		self.dataset_id
 	}
 
@@ -53,11 +96,11 @@ impl Measurement {
 		&self.value
 	}
 
-	pub const fn set_id(&mut self, id: Uuid) {
+	pub const fn set_id(&mut self, id: MeasurementId) {
 		self.id = id;
 	}
 
-	pub const fn set_dataset_id(&mut self, dataset_id: Uuid) {
+	pub const fn set_dataset_id(&mut self, dataset_id: DatasetId) {
 		self.dataset_id = dataset_id;
 	}
 
@@ -74,13 +117,15 @@ impl Measurement {
 	pub fn to_input_measurement(&self) -> InputMeasurement {
 		InputMeasurement::new(self.timestamp, self.value.clone())
 	}
-}
 
-impl<T> Dummy<T> for Measurement {
-	fn dummy_with_rng<R: Rng + ?Sized>(_config: &T, rng: &mut R) -> Self {
-		let timestamp = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap() + chrono::Duration::seconds(rng.gen_range(0..86400));
-		let value = BigDecimal::from_f64(rng.gen_range(0.0..100.0)).unwrap_or_else(|| BigDecimal::from(50));
+	/// Generate a random Measurement for testing
+	#[must_use]
+	pub fn random() -> Self {
+		let offset_secs: i64 = fake::Faker.fake();
+		let value_f64: f64 = fake::Faker.fake();
+		let timestamp = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap() + chrono::Duration::seconds(offset_secs.rem_euclid(86400));
+		let value = BigDecimal::from_f64(value_f64.rem_euclid(100.0)).unwrap_or_else(|| BigDecimal::from(50));
 
-		Self { id: Uuid::new_v4(), dataset_id: Uuid::new_v4(), timestamp, value }
+		Self { id: MeasurementId::new(), dataset_id: DatasetId::new(), timestamp, value }
 	}
 }

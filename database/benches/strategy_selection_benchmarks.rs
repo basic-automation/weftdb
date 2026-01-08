@@ -1,6 +1,8 @@
 use std::{hint::black_box, str::FromStr};
 
-use ::database::*;
+use ::database::{
+	database::traits::{AspectStructure, DatabaseStructure, Inputs, Outputs}, Database, DatasetId, InputMeasurement
+};
 use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
 use criterion::{criterion_group, criterion_main, Criterion};
@@ -35,8 +37,8 @@ fn benchmark_strategy_selection(c: &mut Criterion) {
 					tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
 					let db = Database::new(&db_name).await.unwrap();
-					let subject = db.track_subject("strategy_subject").await.unwrap();
-					let aspect = db.track_aspect(subject, "strategy_aspect", resolution).await.unwrap();
+					let subject = db.observe_subject("strategy_subject").await.unwrap();
+					let aspect = db.track_aspect(&subject.id(), "strategy_aspect", &resolution).await.unwrap();
 
 					// Generate test data using batch insertion for efficiency
 					let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -46,11 +48,11 @@ fn benchmark_strategy_selection(c: &mut Criterion) {
 					}
 
 					// Use batch insertion instead of individual insertions
-					db.observe_measurements_batch(aspect.clone(), measurements).await.unwrap();
+					db.batch_capture_measurements(aspect.id(), DatasetId::new(), measurements).await.unwrap();
 
 					// Perform interpolation analysis
 					let analyze_time = base_time + Duration::minutes((size / 2) as i64);
-					let result = db.analyze_point(aspect.id(), analyze_time, resolution, Spline::Linear).await.unwrap();
+					let result = db.analyze_point(&aspect.id(), analyze_time, &resolution, &Spline::Linear).await.unwrap();
 
 					// Cleanup
 					db.close().await.unwrap();

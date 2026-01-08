@@ -1,6 +1,8 @@
 use std::{hint::black_box, str::FromStr};
 
-use ::database::*;
+use ::database::{
+	database::traits::{AspectStructure, Inputs, Outputs}, Database, DatabaseStructure, DatasetId, InputMeasurement
+};
 use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
@@ -21,7 +23,7 @@ fn benchmark_aspect_creation(c: &mut Criterion) {
 		std::fs::remove_dir_all(format!("data/{db_name}")).ok();
 
 		let db = Database::new(&db_name).await.unwrap();
-		let subject = db.track_subject("bench_subject").await.unwrap();
+		let subject = db.observe_subject("bench_subject").await.unwrap();
 		(db, subject, db_name)
 	});
 
@@ -30,7 +32,7 @@ fn benchmark_aspect_creation(c: &mut Criterion) {
 		b.iter(|| {
 			rt.block_on(async {
 				let aspect_name = format!("aspect_{}_{}", counter, Uuid::new_v4());
-				let aspect = db.track_aspect(subject.clone(), &aspect_name, Resolution::Seconds).await.unwrap();
+				let aspect = db.track_aspect(&subject.id(), &aspect_name, &Resolution::Seconds).await.unwrap();
 				counter += 1;
 				black_box(aspect)
 			})
@@ -50,8 +52,8 @@ fn benchmark_data_insertion(c: &mut Criterion) {
 	let db_name = format!("bench_insertion_{}", Uuid::new_v4());
 	let (db, aspect_id) = rt.block_on(async {
 		let db = Database::new(&db_name).await.unwrap();
-		let subject = db.track_subject("bench_subject").await.unwrap();
-		let aspect = db.track_aspect(subject, "bench_aspect", Resolution::Seconds).await.unwrap();
+		let subject = db.observe_subject("bench_subject").await.unwrap();
+		let aspect = db.track_aspect(&subject.id(), "bench_aspect", &Resolution::Seconds).await.unwrap();
 		(db, aspect.id())
 	});
 
@@ -62,9 +64,9 @@ fn benchmark_data_insertion(c: &mut Criterion) {
 				let time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap() + Duration::seconds(counter);
 				let measurement = InputMeasurement::new(time, BigDecimal::from_str("42.0").unwrap());
 				let aspect = db.get_aspect(&aspect_id).await.unwrap();
-				db.observe_measurement(aspect, measurement).await.unwrap();
+				db.capture_measurement(&aspect.id(), &DatasetId::new(), &measurement).await.unwrap();
 				counter += 1;
-			})
+			});
 		});
 	});
 
@@ -81,8 +83,8 @@ fn benchmark_batch_insertion(c: &mut Criterion) {
 	let db_name = format!("bench_batch_{}", Uuid::new_v4());
 	let (db, aspect) = rt.block_on(async {
 		let db = Database::new(&db_name).await.unwrap();
-		let subject = db.track_subject("bench_subject").await.unwrap();
-		let aspect = db.track_aspect(subject, "bench_aspect", Resolution::Seconds).await.unwrap();
+		let subject = db.observe_subject("bench_subject").await.unwrap();
+		let aspect = db.track_aspect(&subject.id(), "bench_aspect", &Resolution::Seconds).await.unwrap();
 		(db, aspect)
 	});
 
@@ -92,11 +94,11 @@ fn benchmark_batch_insertion(c: &mut Criterion) {
 				let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 				let mut measurements = Vec::new();
 				for i in 0..100 {
-					let measurement = InputMeasurement::new(start_time + Duration::seconds(i), BigDecimal::from_str(&format!("{}.0", i)).unwrap());
+					let measurement = InputMeasurement::new(start_time + Duration::seconds(i), BigDecimal::from_str(&format!("{i}.0")).unwrap());
 					measurements.push(measurement);
 				}
-				db.observe_measurements_batch(aspect.clone(), measurements).await.unwrap();
-			})
+				db.batch_capture_measurements(aspect.id(), DatasetId::new(), measurements).await.unwrap();
+			});
 		});
 	});
 
@@ -113,14 +115,14 @@ fn benchmark_point_analysis(c: &mut Criterion) {
 	let db_name = format!("bench_point_{}", Uuid::new_v4());
 	let (db, aspect_id) = rt.block_on(async {
 		let db = Database::new(&db_name).await.unwrap();
-		let subject = db.track_subject("bench_subject").await.unwrap();
-		let aspect = db.track_aspect(subject, "bench_aspect", Resolution::Seconds).await.unwrap();
+		let subject = db.observe_subject("bench_subject").await.unwrap();
+		let aspect = db.track_aspect(&subject.id(), "bench_aspect", &Resolution::Seconds).await.unwrap();
 
 		// Add some test data
 		let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 		for i in 0..100 {
 			let measurement = InputMeasurement::new(base_time + Duration::minutes(i), BigDecimal::from_str(&format!("{}.{}", i / 10, i % 10)).unwrap());
-			db.observe_measurement(aspect.clone(), measurement).await.unwrap();
+			db.capture_measurement(&aspect.id(), &DatasetId::new(), &measurement).await.unwrap();
 		}
 
 		(db, aspect.id())
@@ -129,14 +131,17 @@ fn benchmark_point_analysis(c: &mut Criterion) {
 	let spline_types = vec![Spline::Linear, Spline::Quadratic, Spline::Cubic];
 
 	for spline_type in spline_types {
-		c.bench_with_input(BenchmarkId::new("point_analysis", format!("{:?}", spline_type)), &spline_type, |b, &spline_type| {
+		c.bench_with_input(BenchmarkId::new("point_analysis", format!("{spline_type:?}")), &spline_type, |b, &spline_type| {
 			b.iter(|| {
 				rt.block_on(async {
-					let target_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 45, 30).unwrap();
-					let result = db.analyze_point(aspect_id, target_time, Resolution::Seconds, spline_type).await.unwrap();
+					// Use a time within the inserted measurements (0..99 minutes)
+					let target_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 50, 0).unwrap();
+					// Measurements were inserted at minute intervals; use Minutes resolution
+					// so the interpolation window includes enough neighbors for cubic splines.
+					let result = db.analyze_point(&aspect_id, target_time, &Resolution::Minutes, &spline_type).await.unwrap();
 					black_box(result)
 				})
-			})
+			});
 		});
 	}
 
@@ -153,16 +158,16 @@ fn benchmark_range_analysis(c: &mut Criterion) {
 	let db_name = format!("bench_range_{}", Uuid::new_v4());
 	let (db, aspect_id) = rt.block_on(async {
 		let db = Database::new(&db_name).await.unwrap();
-		let subject = db.track_subject("bench_subject").await.unwrap();
-		let aspect = db.track_aspect(subject, "bench_aspect", Resolution::Seconds).await.unwrap();
+		let subject = db.observe_subject("bench_subject").await.unwrap();
+		let aspect = db.track_aspect(&subject.id(), "bench_aspect", &Resolution::Seconds).await.unwrap();
 
 		// Add reduced test data for faster benchmark (reduced from 1000 to 200)
 		let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 		let mut measurements = Vec::with_capacity(200);
 		for i in 0..200 {
-			measurements.push(InputMeasurement::new(base_time + Duration::seconds(i * 60), BigDecimal::from_str(&format!("{}.0", i)).unwrap()));
+			measurements.push(InputMeasurement::new(base_time + Duration::seconds(i * 60), BigDecimal::from_str(&format!("{i}.0")).unwrap()));
 		}
-		db.observe_measurements_batch(aspect.clone(), measurements).await.unwrap();
+		db.batch_capture_measurements(aspect.id(), DatasetId::new(), measurements).await.unwrap();
 
 		(db, aspect.id())
 	});
@@ -178,7 +183,7 @@ fn benchmark_range_analysis(c: &mut Criterion) {
 			rt.block_on(async {
 				let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 				let end = start + Duration::hours(2); // Reduced analysis range for faster benchmark
-				let result = Database::analyze_range(aspect_id, start, end, Resolution::Minutes, Spline::Linear).await.unwrap();
+				let result = db.analyze_range(&aspect_id, start, end, Resolution::Minutes, Spline::Linear).await.unwrap();
 				black_box(result)
 			})
 		});
@@ -198,14 +203,14 @@ fn benchmark_cache_usage(c: &mut Criterion) {
 	let db_name = format!("bench_cache_{}", Uuid::new_v4());
 	let (db, aspect_id) = rt.block_on(async {
 		let db = Database::new(&db_name).await.unwrap();
-		let subject = db.track_subject("cache_subject").await.unwrap();
-		let aspect = db.track_aspect(subject, "cache_aspect", Resolution::Seconds).await.unwrap();
+		let subject = db.observe_subject("cache_subject").await.unwrap();
+		let aspect = db.track_aspect(&subject.id(), "cache_aspect", &Resolution::Seconds).await.unwrap();
 
 		// Add test data
 		let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 		for i in 0..100 {
-			let measurement = InputMeasurement::new(base_time + Duration::minutes(i), BigDecimal::from_str(&format!("{}.0", i)).unwrap());
-			db.observe_measurement(aspect.clone(), measurement).await.unwrap();
+			let measurement = InputMeasurement::new(base_time + Duration::minutes(i), BigDecimal::from_str(&format!("{i}.0")).unwrap());
+			db.capture_measurement(&aspect.id(), &DatasetId::new(), &measurement).await.unwrap();
 		}
 
 		(db, aspect.id())
@@ -215,7 +220,7 @@ fn benchmark_cache_usage(c: &mut Criterion) {
 		b.iter(|| {
 			rt.block_on(async {
 				let query_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 30, 0).unwrap();
-				let result = db.analyze_point(aspect_id, query_time, Resolution::Seconds, Spline::Linear).await.unwrap();
+				let result = db.analyze_point(&aspect_id, query_time, &Resolution::Seconds, &Spline::Linear).await.unwrap();
 				black_box(result)
 			})
 		});
@@ -234,14 +239,14 @@ fn benchmark_concurrent_access(c: &mut Criterion) {
 	let db_name = format!("bench_concurrent_{}", Uuid::new_v4());
 	let (db, aspect_id) = rt.block_on(async {
 		let db = Database::new(&db_name).await.unwrap();
-		let subject = db.track_subject("concurrent_subject").await.unwrap();
-		let aspect = db.track_aspect(subject, "concurrent_aspect", Resolution::Seconds).await.unwrap();
+		let subject = db.observe_subject("concurrent_subject").await.unwrap();
+		let aspect = db.track_aspect(&subject.id(), "concurrent_aspect", &Resolution::Seconds).await.unwrap();
 
 		// Add test data
 		let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 		for i in 0..200 {
-			let measurement = InputMeasurement::new(base_time + Duration::seconds(i * 30), BigDecimal::from_str(&format!("{}.0", i)).unwrap());
-			db.observe_measurement(aspect.clone(), measurement).await.unwrap();
+			let measurement = InputMeasurement::new(base_time + Duration::seconds(i * 30), BigDecimal::from_str(&format!("{i}.0")).unwrap());
+			db.capture_measurement(&aspect.id(), &DatasetId::new(), &measurement).await.unwrap();
 		}
 
 		(db, aspect.id())
@@ -254,7 +259,7 @@ fn benchmark_concurrent_access(c: &mut Criterion) {
 				for i in 0..5 {
 					let db_clone = db.clone();
 					let query_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap() + Duration::minutes(i * 10);
-					let handle = tokio::spawn(async move { db_clone.analyze_point(aspect_id, query_time, Resolution::Seconds, Spline::Linear).await.unwrap() });
+					let handle = tokio::spawn(async move { db_clone.analyze_point(&aspect_id, query_time, &Resolution::Seconds, &Spline::Linear).await.unwrap() });
 					handles.push(handle);
 				}
 

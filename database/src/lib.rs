@@ -1,238 +1,259 @@
 //! # High-Performance Time-Series Database
 //!
 //! A high-performance time-series database with advanced interpolation capabilities,
-//! optimized for real-time sensor data processing and analysis.
+//! optimized for real-time sensor data processing and analysis. Built on top of
+//! [Turso](https://turso.tech/) (libSQL) with MVCC support for concurrent writes.
+//!
+//! ## Overview
+//!
+//! This crate provides a hierarchical data model for organizing time-series data:
+//!
+//! - **Database**: The top-level container that holds all data
+//! - **Subject**: A logical grouping (e.g., a sensor, user, or asset like "BTCUSD")
+//! - **Aspect**: A specific measurement type for a subject (e.g., "temperature", "price", "open")
+//! - **Measurement**: Individual timestamped data points with `BigDecimal` precision
+//!
+//! The crate also provides advanced features for pattern recognition and event prediction:
+//!
+//! - **Batches**: Groups of measurements processed together
+//! - **Patterns**: Extracted recurring shapes in the data
+//! - **Dictionaries**: Collections of patterns with similarity constraints
+//! - **Events**: Detected occurrences (e.g., "5% monthly increase")
+//! - **Correlations**: Links between patterns and events
+//! - **Signals**: Predictions based on pattern-event correlations
 //!
 //! ## Quick Start
 //!
-//! ```rust
-//! use database::*;
+//! ### Creating a Database and Capturing Measurements
+//!
+//! ```rust,ignore
+//! use database::{Database, DatabaseStructure, Inputs, InputMeasurement, Resolution, Spline};
 //! use bigdecimal::BigDecimal;
 //! use std::str::FromStr;
-//! use chrono::TimeZone;
+//! use chrono::{TimeZone, Utc};
 //!
-//! # #[tokio::main]
-//! # async fn main() -> anyhow::Result<()> {
-//! # // Clean up any existing test data first
-//! # std::fs::remove_dir_all(format!("{}/my_experiment", DEFAULT_DATA_DIR)).ok();
-//! #
-//! // Create a new database
-//! let db = Database::new("my_experiment").await?;
+//! #[tokio::main]
+//! async fn main() -> anyhow::Result<()> {
+//!     // Create a new database (creates folder structure on disk)
+//!     let db = Database::new("my_sensors").await?;
 //!
-//! // Add a subject
-//! let subject = db.track_subject("participant_001").await?;
+//!     // Create a subject to track
+//!     let sensor = db.observe_subject("temperature_sensor_001").await?;
 //!
-//! // Track an aspect (e.g., heart rate) with resolution
-//! let aspect = db.track_aspect(subject, "heart_rate", Resolution::Seconds).await?;
+//!     // Track a specific aspect with time resolution
+//!     let temperature = db.track_aspect(
+//!         &sensor.id(),
+//!         "ambient_temp",
+//!         &Resolution::Seconds
+//!     ).await?;
 //!
-//! // Capture multiple measurements for interpolation
-//! let measurements = vec![
-//!     InputMeasurement::new(
-//!         chrono::Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap(),
-//!         BigDecimal::from_str("70.0").unwrap()
-//!     ),
-//!     InputMeasurement::new(
-//!         chrono::Utc.with_ymd_and_hms(2023, 1, 1, 0, 1, 0).unwrap(),
-//!         BigDecimal::from_str("72.5").unwrap()
-//!     ),
-//!     InputMeasurement::new(
-//!         chrono::Utc.with_ymd_and_hms(2023, 1, 1, 0, 2, 0).unwrap(),
-//!         BigDecimal::from_str("75.0").unwrap()
-//!     ),
-//! ];
+//!     // Capture measurements
+//!     let dataset_id = database::DatasetId::new();
+//!     let measurements = vec![
+//!         InputMeasurement::new(
+//!             Utc.with_ymd_and_hms(2024, 1, 1, 12, 0, 0).unwrap(),
+//!             BigDecimal::from_str("22.5").unwrap()
+//!         ),
+//!         InputMeasurement::new(
+//!             Utc.with_ymd_and_hms(2024, 1, 1, 12, 1, 0).unwrap(),
+//!             BigDecimal::from_str("22.8").unwrap()
+//!         ),
+//!         InputMeasurement::new(
+//!             Utc.with_ymd_and_hms(2024, 1, 1, 12, 2, 0).unwrap(),
+//!             BigDecimal::from_str("23.1").unwrap()
+//!         ),
+//!     ];
 //!
-//! for measurement in measurements {
-//!     db.observe_measurement(aspect.clone(), measurement).await?;
+//!     // Batch insert for optimal performance
+//!     db.batch_capture_measurements(
+//!         temperature.id(),
+//!         dataset_id,
+//!         measurements
+//!     ).await?;
+//!
+//!     Ok(())
 //! }
-//!
-//! // Analyze data point (interpolate between existing measurements)
-//! let time = chrono::Utc.with_ymd_and_hms(2023, 1, 1, 0, 1, 30).unwrap();
-//! let data_point = db.analyze_point(aspect.id(), time, Resolution::Seconds, Spline::Linear).await?;
-//!
-//! println!("Interpolated value: {}", data_point.value);
-//! println!("GPS Strategy recommendation: {:?}",
-//!     splimes::helpers::should_use_gpu(1000, 1000));
-//!
-//! # // Clean up test data
-//! # std::fs::remove_dir_all("data/my_experiment").ok();
-//! # Ok(())
-//! # }
 //! ```
+//!
+//! ### Querying and Interpolating Data
+//!
+//! ```rust,ignore
+//! use database::{Database, DatabaseStructure, Outputs, Resolution, Spline};
+//! use chrono::{TimeZone, Utc};
+//! use futures::StreamExt;
+//!
+//! #[tokio::main]
+//! async fn main() -> anyhow::Result<()> {
+//!     // Open an existing database
+//!     let db = Database::existing("my_sensors").await?;
+//!
+//!     // Get the aspect we want to query
+//!     let subjects = db.list_subjects().await?;
+//!     let sensor_id = subjects.iter()
+//!         .find(|(_, name)| name == "temperature_sensor_001")
+//!         .map(|(id, _)| *id)
+//!         .expect("Sensor not found");
+//!
+//!     let aspects = db.get_subject_aspects(&sensor_id).await?;
+//!     let temp_aspect = aspects.iter()
+//!         .find(|a| a.name() == "ambient_temp")
+//!         .expect("Aspect not found");
+//!
+//!     // Query a specific point in time (interpolates if needed)
+//!     let query_time = Utc.with_ymd_and_hms(2024, 1, 1, 12, 0, 30).unwrap();
+//!     let point = db.analyze_point(
+//!         &temp_aspect.id(),
+//!         query_time,
+//!         &Resolution::Seconds,
+//!         &Spline::Linear
+//!     ).await?;
+//!
+//!     println!("Temperature at {:?}: {}", point.timestamp, point.value);
+//!
+//!     // Query a range of data
+//!     let start = Utc.with_ymd_and_hms(2024, 1, 1, 12, 0, 0).unwrap();
+//!     let end = Utc.with_ymd_and_hms(2024, 1, 1, 12, 5, 0).unwrap();
+//!
+//!     let mut stream = db.analyze_range(
+//!         &temp_aspect.id(),
+//!         start,
+//!         end,
+//!         Resolution::Seconds,
+//!         Spline::Linear
+//!     ).await?;
+//!
+//!     while let Some(result) = stream.next().await {
+//!         let point = result?;
+//!         println!("{}: {}", point.timestamp, point.value);
+//!     }
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ### Working with Events and Patterns
+//!
+//! ```rust,ignore
+//! use database::{
+//!     Database, DatabaseStructure, Inputs, Outputs,
+//!     Event, Manifestation, Pattern, Correlation,
+//!     Dictionary, DictionaryConstraints, Resolution
+//! };
+//!
+//! #[tokio::main]
+//! async fn main() -> anyhow::Result<()> {
+//!     let db = Database::existing("my_sensors").await?;
+//!     // ... get aspect_id ...
+//!
+//!     // Create an event to track (e.g., temperature spike)
+//!     let mut event = Event::new(
+//!         None,
+//!         "Temperature Spike".to_string(),
+//!         Some("Temperature exceeded threshold".to_string()),
+//!         None
+//!     );
+//!
+//!     // Add manifestations (occurrences of the event)
+//!     let db_info = db.get_database_info().await?;
+//!     let manifestation = Manifestation::new(
+//!         db_info.id().as_uuid(),
+//!         chrono::Utc::now() - chrono::Duration::hours(1),
+//!         chrono::Utc::now(),
+//!     );
+//!     event.add_manifestation(manifestation);
+//!
+//!     // Store the event
+//!     // db.insert_unprocessed_event(&aspect_id, &event).await?;
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ## Core Types
+//!
+//! | Type | Description |
+//! |------|-------------|
+//! | [`Database`] | Main database handle for all operations |
+//! | [`Subject`] | Logical grouping of related aspects |
+//! | [`Aspect`] | A specific measurement type with its own storage |
+//! | [`InputMeasurement`] | Timestamped value to be stored |
+//! | [`Measurement`] | Stored measurement with ID |
+//! | [`Resolution`] | Time precision (Nanoseconds to Years) |
+//! | [`Spline`] | Interpolation method (Linear, Cubic, etc.) |
+//!
+//! ## Pattern Recognition Types
+//!
+//! | Type | Description |
+//! |------|-------------|
+//! | [`Batch`] | Group of measurements for processing |
+//! | [`Pattern`] | Extracted recurring shape with occurrences |
+//! | [`Dictionary`] | Collection of patterns with constraints |
+//! | [`Event`] | Detected occurrence with manifestations |
+//! | [`Correlation`] | Link between a pattern and an event |
+//! | [`Signal`] | Prediction based on correlation |
+//!
+//! ## Key Traits
+//!
+//! The database operations are organized into traits:
+//!
+//! - [`DatabaseStructure`]: Database creation and management
+//! - [`Inputs`](database::traits::Inputs): Data insertion operations
+//! - [`Outputs`]: Data querying operations
+//! - [`Config`]: Path and configuration management
 //!
 //! ## Features
 //!
-//! - **High Performance**: Optimized for real-time data processing
-//! - **Advanced Interpolation**: Support for linear, cubic, and other spline methods
-//! - **GPU Acceleration**: Automatic strategy selection for optimal performance
-//! - **Time Series Analysis**: Built-in support for trend analysis and batch processing
+//! - **High Performance**: Optimized for real-time data processing with batch operations
+//! - **Advanced Interpolation**: Linear, cubic, quadratic, and polynomial spline methods
+//! - **GPU Acceleration**: Automatic strategy selection for large datasets
+//! - **MVCC Concurrency**: Concurrent writes with `BEGIN CONCURRENT` transactions
+//! - **Pattern Recognition**: Extract and match recurring patterns in time-series data
+//! - **Event Detection**: Detect significant occurrences and predict future events
 //! - **Flexible Resolution**: Support from nanoseconds to years
+//! - **Caching**: Intelligent caching of interpolation results
 //!
-//! ## Design Goals
+//! ## Architecture
 //!
-//! The primary design goal of this database is to provide high-performance ingestion
-//! and querying of time-series data, with a focus on real-time analytics and monitoring.
-//! This is achieved through a combination of efficient data structures, parallel processing,
-//! and hardware acceleration (e.g., GPU support). Additionally, the database aims to be
-//! user-friendly, with a simple and intuitive API, and flexible, supporting a wide range
-//! of use cases and data types.
+//! The database uses a file-based storage structure:
 //!
-//! ## Getting Involved
-//!
-//! Contributions are welcome! Please check out the [GitHub repository](https://github.com/yourusername/your-repo)
-//! for more information on how to contribute, report issues, or request features.
-//!
-//! ## License
-//!
-//! This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-//!
-//! ## Acknowledgments
-//!
-//! - Inspired by [TimescaleDB](https://www.timescale.com/), [InfluxDB](https://www.influxdata.com/),
-//!   and other great time-series databases
-//! - Built with [Rust](https://www.rust-lang.org/), [Tokio](https://tokio.rs/), and other awesome
-//!   open-source projects
-//!
-//! ## Limitations
-//!
-//! - Currently, only supports a single-node setup (no built-in clustering or sharding)
-//! - Limited support for complex queries (e.g., JOINs, subqueries) - focus on time-series
-//!   analytics functions
-//! - Some advanced features (e.g., continuous aggregates, data retention policies) are
-//!   yet to be implemented
-//!
-//! ## Future Work
-//!
-//! - Improve query optimization and execution planning
-//! - Add support for more advanced SQL features and time-series functions
-//! - Implement data retention policies, continuous aggregates, and other advanced
-//!   time-series database features
-//! - Explore distributed architecture for horizontal scalability
+//! ```text
+//! {data_dir}/
+//! └── {database_name}/
+//!     ├── metadata.db           # Database metadata
+//!     └── {subject_name}/
+//!         └── {aspect_name}/
+//!             ├── measurements.db
+//!             ├── unprocessed_batches.db
+//!             ├── processed_batches.db
+//!             ├── patterns.db
+//!             ├── events.db
+//!             ├── correlations.db
+//!             └── dictionaries/
+//!                 └── {dictionary_name}.db
+//! ```
 //!
 //! ## Performance Benchmarks
 //!
 //! | Operation                | Time (ms) | Notes                               |
 //! |--------------------------|-----------|-------------------------------------|
-//! | Insert (single)          | 0.1-0.5   | Depends on storage backend         |
-//! | Insert (batch of 1000)   | 10-50     | Bulk insert optimization           |
-//! | Query (point lookup)     | 0.1-1     | Indexed lookup                     |
-//! | Query (range scan)       | 1-100     | Depends on range size              |
-//! | Interpolation (1K points)| 5-50      | Depends on method and hardware     |
-//! | GPU Interpolation (1M)   | 100-500   | Requires compatible GPU            |
-//!
-//! These benchmarks are representative and may vary depending on your hardware, data
-//! characteristics, and workload patterns.
+//! | Insert (single)          | 0.1-0.5   | With MVCC concurrent writes         |
+//! | Insert (batch of 1000)   | 10-50     | Bulk insert optimization            |
+//! | Query (point lookup)     | 0.1-1     | Indexed lookup with caching         |
+//! | Query (range scan)       | 1-100     | Depends on range size               |
+//! | Interpolation (1K points)| 5-50      | Depends on method and hardware      |
+//! | GPU Interpolation (1M)   | 100-500   | Requires compatible GPU             |
 //!
 //! ## Compatibility
 //!
-//! This database is designed to work with:
-//!
 //! - **Operating Systems**: Linux, macOS, Windows
-//! - **Rust Version**: 1.70.0 or later
-//! - **Hardware**: x86_64, ARM64 architectures
-//! - **GPU Support**: NVIDIA GPUs with CUDA support (optional)
-//!
-//! ## FAQ
-//!
-//! **Q: Can I use this database for real-time applications?**
-//!
-//! A: Yes, this database is designed for real-time applications and can handle high-throughput
-//! ingestion and low-latency querying. However, the exact performance will depend on your
-//! specific use case, data volume, and hardware.
-//!
-//! **Q: How does this database compare to other time-series databases?**
-//!
-//! A: This database focuses on high-performance interpolation and advanced analytics
-//! capabilities, particularly for sensor data and continuous measurements. While it may
-//! not have all the enterprise features of larger databases like TimescaleDB or InfluxDB,
-//! it offers unique capabilities for interpolation-heavy workloads and GPU acceleration.
-//!
-//! **Q: Can I migrate data from other databases?**
-//!
-//! A: While there's no built-in migration tool yet, you can export your data from other
-//! databases in a compatible format (e.g., CSV, JSON) and then import it into this database
-//! using the appropriate commands. Please refer to the documentation for detailed instructions
-//! on data migration.
-//!
-//! **Q: What are the hardware requirements for running this database?**
-//!
-//! A: The hardware requirements depend on the size of your data, the complexity of your
-//! queries, and the performance you expect. As a general guideline, for small to medium
-//! datasets (up to a few million points), a modern laptop or desktop computer should be
-//! sufficient. For larger datasets or more demanding workloads, a server-class machine
-//! with a fast CPU, plenty of RAM, and SSD storage is recommended. If you plan to use the
-//! GPU acceleration features, a compatible NVIDIA GPU with sufficient VRAM is also
-//! recommended.
-//!
-//! **Q: How can I get help or support for using this database?**
-//!
-//! A: You can check the documentation, FAQs, and examples provided in the GitHub repository
-//! for help with common issues and questions. If you need further assistance, you can
-//! open an issue on the GitHub repository or contact the maintainers directly.
-//!
-//! **Q: Is this database production-ready?**
-//!
-//! A: This database is actively developed and continuously improved. While it's used in
-//! various projects and applications, you should evaluate it thoroughly for your specific
-//! use case and requirements before deploying it in a production environment. Please refer
-//! to the documentation and test suites for more information on stability and reliability.
-//!
-//! **Q: Who maintains this database?**
-//!
-//! A: This database is maintained by [Your Name](https://github.com/yourusername) and
-//! contributors. Please check the GitHub repository for the list of contributors and
-//! maintainers.
-//!
-//! **Q: How can I contact the maintainers of this database?**
-//!
-//! A: You can contact the maintainers by opening an issue on the GitHub repository or
-//! by contacting them directly through their GitHub profiles. Please note that response
-//! times may vary depending on the nature of the inquiry and the availability of the
-//! maintainers.
-//!
-//! **Q: What are some potential use cases for this database?**
-//!
-//! A: This database is suitable for a wide range of use cases involving time-series data,
-//! such as IoT sensor data processing, financial market analysis, real-time monitoring
-//! and alerting, historical data analysis, and more. Its high performance, advanced
-//! interpolation and analytics capabilities, and flexible resolution make it ideal for
-//! any application that requires efficient and accurate processing and analysis of
-//! time-stamped data.
-//!
-//! **Q: What are the default settings and configurations for the database?**
-//!
-//! A: The default settings and configurations for the database are designed to provide a
-//! balance between performance and usability for a wide range of use cases. Some of the
-//! key default settings include:
-//!
-//! - **Data Directory**: `data/` (can be overridden with environment variable)
-//! - **Connection Pool Size**: 5 connections per database
-//! - **Cache Size**: Adaptive based on available memory
-//! - **Interpolation Method**: Linear (fastest, good for most use cases)
-//! - **Resolution**: Milliseconds (good balance between precision and performance)
-//!
-//! Most of these settings can be customized when creating databases, subjects, or aspects.
-//!
-//! **Q: How does the caching system work?**
-//!
-//! A: The database includes an intelligent caching system that automatically caches
-//! frequently accessed data and interpolation results. The cache is designed to be
-//! transparent to the user and automatically manages memory usage based on available
-//! system resources. You don't need to manually manage the cache, but you can monitor
-//! its performance through the provided metrics and logging.
-//!
-//! **Q: What are the data consistency and durability guarantees?**
-//!
-//! A: The database provides strong consistency for individual operations and uses SQLite
-//! as the underlying storage engine, which provides ACID guarantees. Data is automatically
-//! persisted to disk and can survive system crashes. However, like most databases, it's
-//! the responsibility of the application and the users to define and enforce the appropriate
-//! integrity constraints and to handle any data quality issues.
-//!
-//! **Q: What are the default settings and configurations for the database?**
-//!
-//! A: The default settings and configurations for the database are designed to provide a
-//! balance between performance and usability for a wide range of use cases. Some of the
-//! key default settings include:
+//! - **Rust Version**: 1.75.0 or later (requires 2024 edition features)
+//! - **Hardware**: `x86_64`, ARM64 architectures
+//! - **GPU Support**: Via wgpu (Vulkan, Metal, DX12)
+
+#![recursion_limit = "1024"]
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions, clippy::used_underscore_binding, clippy::similar_names, clippy::module_name_repetitions, clippy::module_inception)]
+#![feature(stmt_expr_attributes)]
 
 mod types;
 
@@ -240,10 +261,3 @@ mod types;
 // Re-export types from splimes that are commonly used
 pub use splimes::{Point, Resolution, Spline};
 pub use types::*;
-
-// Default data directory - can be overridden with environment variable
-pub const DEFAULT_DATA_DIR: &str = "C:\\Users\\physi\\Desktop\\dsp_data";
-
-// Version information
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const PKG_NAME: &str = env!("CARGO_PKG_NAME");
