@@ -106,7 +106,12 @@ pub type EventDetectorFn = Arc<
 
 /// Helper macro to create an `EventDetectorFn` from an async function.
 ///
-/// # Example
+/// **Important**: This macro works best with standalone async functions. If you need
+/// to capture additional parameters (like threshold values), create the detector
+/// function inline using `Arc::new` with an `async move` block instead. See the
+/// examples below.
+///
+/// # Example with Standalone Function
 ///
 /// ```ignore
 /// use dataset_management::{event_detector_fn, EventDetectorFn};
@@ -123,14 +128,27 @@ pub type EventDetectorFn = Arc<
 ///
 /// let detector_fn: EventDetectorFn = event_detector_fn!(my_detector);
 /// ```
+///
+/// # Example with Captured Parameters
+///
+/// When you need to capture additional parameters, use this pattern instead:
+///
+/// ```ignore
+/// use dataset_management::pipeline::EventDetectorFn;
+/// use std::sync::Arc;
+///
+/// let threshold = 0.05;
+/// let detector_fn: EventDetectorFn = Arc::new(move |db, aspect, res, method| {
+///     Box::pin(async move {
+///         detectors::detect_monthly_increase(db, aspect, res, method, threshold).await
+///     })
+/// });
+/// ```
 #[macro_export]
 macro_rules! event_detector_fn {
     ($func:expr) => {
         std::sync::Arc::new(move |db, aspect, res, method| {
-            Box::pin($func(db, aspect, res, method))
-                as std::pin::Pin<
-                    Box<dyn std::future::Future<Output = anyhow::Result<Vec<$crate::Event>>> + Send + 'static>,
-                >
+            Box::pin($func(db, aspect, res, method)) as std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<database::Event>>> + Send + '_>>
         }) as $crate::pipeline::EventDetectorFn
     };
 }

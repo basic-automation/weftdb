@@ -5,6 +5,7 @@ members = ["database", "dataset_management", "splimes"]
 [workspace.dependencies]
 anyhow = "1"
 async-trait = "0"
+ahash = "0"
 bigdecimal = "0"
 bincode = "1"
 chrono = { version = "0", features = ["serde"] }
