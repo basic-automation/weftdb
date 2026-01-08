@@ -13,16 +13,32 @@ use crate::{
 	}, AspectId
 };
 
-/// Helper function to find the previous manifestation's midpoint for a given `manifestation_id`.
-/// Given a sorted list of (`ManifestationId`, midpoint) tuples, finds the midpoint of the
-/// manifestation that occurred immediately before the specified `manifestation_id`.
-/// Returns None if the `manifestation_id` is not found or if it's the first manifestation.
+/// Finds the midpoint of the manifestation that occurred immediately before the given
+/// `manifestation_id`.
+///
+/// This helper is used when computing probabilities over a sequence of manifestations for
+/// a signal. It uses a pre-built index for O(1) lookup instead of linear search.
+///
+/// # Parameters
+/// - `manifestation_id`: The identifier of the manifestation whose *previous* midpoint
+///   should be retrieved.
+/// - `midpoint_index`: A `HashMap` mapping each `ManifestationId` to its index in the sorted sequence.
+/// - `sorted_midpoints`: A slice of (`ManifestationId`, `DateTime<Utc>`) tuples. This slice
+///   must be sorted in the same order in which manifestations are considered for probability
+///   calculations (typically chronological order by midpoint).
+///
+/// # Returns
+/// - `Some(DateTime<Utc>)` with the midpoint of the manifestation that appears immediately
+///   before `manifestation_id` in `sorted_midpoints`.
+/// - `None` if `manifestation_id` is not present in the index or if it is the first
+///   entry in the slice (i.e., there is no previous manifestation).
 fn find_previous_manifestation_midpoint(
 	manifestation_id: &ManifestationId,
+	midpoint_index: &HashMap<ManifestationId, usize>,
 	sorted_midpoints: &[(ManifestationId, DateTime<Utc>)]
 ) -> Option<DateTime<Utc>> {
-	// Find the index of the target manifestation
-	let idx = sorted_midpoints.iter().position(|(id, _)| id == manifestation_id)?;
+	// O(1) lookup using the pre-built index
+	let idx = *midpoint_index.get(manifestation_id)?;
 	
 	// If it's the first manifestation, there's no previous one
 	if idx == 0 {
@@ -31,6 +47,16 @@ fn find_previous_manifestation_midpoint(
 	
 	// Return the previous manifestation's midpoint
 	Some(sorted_midpoints[idx - 1].1)
+}
+
+/// Builds an index mapping `ManifestationId` to its position in the sorted midpoints slice.
+/// This enables O(1) lookups instead of O(n) linear searches.
+fn build_midpoint_index(sorted_midpoints: &[(ManifestationId, DateTime<Utc>)]) -> HashMap<ManifestationId, usize> {
+	sorted_midpoints
+		.iter()
+		.enumerate()
+		.map(|(idx, (id, _))| (id.clone(), idx))
+		.collect()
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -621,6 +647,9 @@ impl Signals {
 			})
 			.unwrap_or_default();
 		
+		// Build index for O(1) lookups instead of O(n) linear search per signal
+		let midpoint_index = build_midpoint_index(&manifestation_midpoints);
+		
 		// Get the last manifestation's midpoint as fallback for forward-looking signals
 		let last_manifestation_midpoint = manifestation_midpoints.last().map(|(_, midpoint)| *midpoint);
 		
@@ -644,6 +673,7 @@ impl Signals {
 					// We need to find the manifestation that occurred BEFORE it
 					let previous_midpoint = find_previous_manifestation_midpoint(
 						s.manifestation_id(),
+						&midpoint_index,
 						&manifestation_midpoints
 					);
 					
