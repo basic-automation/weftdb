@@ -38,7 +38,7 @@ impl Batches {
 	/// (if resolution is less than `min_resolution` return error)
 	///
 	/// This method creates overlapping sliding window batches. For example, with `batch_size=3`:
-	/// Points [A,B,C,D,E,F] become batches: [A,B,C], [B,C,D], [C,D,E], [D,E,F]
+	/// Points \[A,B,C,D,E,F\] become batches: \[A,B,C\], \[B,C,D\], \[C,D,E\], \[D,E,F\]
 	///
 	/// 1. get the points for the aspect from the database using `database.analyze_range()`
 	/// 2. create sliding window batches of points based on `batch_size`

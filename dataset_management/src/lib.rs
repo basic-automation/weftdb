@@ -1,3 +1,350 @@
+//! # Dataset Management - Time-Series Pattern Recognition and Signal Generation
+//!
+//! A high-level library for processing time-series data, extracting patterns,
+//! detecting events, and generating prediction signals. Built on top of the
+//! [`database`] crate.
+//!
+//! ## Overview
+//!
+//! This crate provides a complete pipeline for time-series analysis:
+//!
+//! 1. **Data Preparation**: Batch and process raw measurements
+//! 2. **Pattern Extraction**: Identify recurring patterns in the data
+//! 3. **Event Detection**: Detect significant occurrences (peaks, valleys, thresholds)
+//! 4. **Correlation**: Link patterns to events
+//! 5. **Signal Generation**: Create predictions for future events
+//!
+//! ## Quick Start with Pipeline API
+//!
+//! The [`Pipeline`] API provides a fluent builder pattern for the entire workflow:
+//!
+//! ```rust,ignore
+//! use dataset_management::{Pipeline, DictionaryConstraints, Steps, Variability, VariablilityType};
+//! use database::{Database, DatabaseStructure, Resolution};
+//! use splimes::Spline;
+//! use bigdecimal::BigDecimal;
+//!
+//! #[tokio::main]
+//! async fn main() -> anyhow::Result<()> {
+//!     // Open an existing database with measurement data
+//!     let database = Database::existing("my_sensor_data").await?;
+//!
+//!     // Get the aspect to analyze
+//!     let subjects = database.list_subjects().await?;
+//!     let subject_id = subjects[0].0;
+//!     let aspects = database.get_subject_aspects(&subject_id).await?;
+//!     let aspect_id = aspects[0].id();
+//!
+//!     // Build and configure the pipeline
+//!     let mut pipeline = Pipeline::builder(database.clone(), aspect_id)
+//!         // Set analysis parameters
+//!         .resolution(Resolution::Hours)
+//!         .spline_method(Spline::Linear)
+//!         .batch_size(24)  // 24-hour batches
+//!
+//!         // Configure pattern dictionary
+//!         .dictionary_name("SensorPatterns")
+//!         .dictionary_description("Patterns extracted from sensor data")
+//!         .dictionary_constraints(DictionaryConstraints::new(
+//!             Some(Steps::new(10, Spline::Linear)),
+//!             Some(vec![
+//!                 VariablilityType::MaximumStatic(Variability::new(
+//!                     BigDecimal::from(1) / BigDecimal::from(10)
+//!                 ))
+//!             ])
+//!         ))
+//!
+//!         // Register event detectors
+//!         .with_monthly_increase_detector(0.05)  // 5% monthly increase
+//!         .with_peak_detector("Sensor Peaks")
+//!
+//!         .build()
+//!         .await?;
+//!
+//!     // Run the complete pipeline
+//!     pipeline.run().await?;
+//!
+//!     // Query prediction probability
+//!     let events = pipeline.get_events().await?;
+//!     if let Some(event) = events.first() {
+//!         let result = pipeline.query_probability(
+//!             event.id(),
+//!             &dataset_management::SignalType::Custom("PredictStart".to_string()),
+//!             chrono::Utc::now()
+//!         ).await?;
+//!
+//!         println!("Prediction probability: {}", result);
+//!     }
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ## Step-by-Step Processing
+//!
+//! For more control, you can run individual pipeline steps:
+//!
+//! ```rust,ignore
+//! use dataset_management::Pipeline;
+//!
+//! // Build the pipeline
+//! let mut pipeline = Pipeline::builder(database, aspect_id)
+//!     .resolution(Resolution::Hours)
+//!     .with_peak_detector("My Peaks")
+//!     .build()
+//!     .await?;
+//!
+//! // Run steps individually
+//! pipeline.prepare_data().await?;      // Batch and process measurements
+//! pipeline.extract_patterns().await?;  // Extract patterns into dictionary
+//! pipeline.detect_events().await?;     // Run registered event detectors
+//! pipeline.correlate_events().await?;  // Create pattern-event correlations
+//! pipeline.generate_signals().await?;  // Generate prediction signals
+//!
+//! // Access results
+//! println!("Patterns found: {}", pipeline.dictionary().len());
+//! println!("Signals generated: {}", pipeline.signals().len());
+//! ```
+//!
+//! ## Custom Event Detectors
+//!
+//! Create custom event detectors for domain-specific patterns:
+//!
+//! ```rust,ignore
+//! use dataset_management::{Pipeline, EventDetector, Event, event_detector_fn};
+//! use database::{Database, AspectId, Resolution};
+//! use splimes::Spline;
+//! use std::sync::Arc;
+//!
+//! // Define a custom detector function
+//! async fn detect_anomalies(
+//!     db: &Database,
+//!     aspect: &AspectId,
+//!     resolution: &Resolution,
+//!     method: &Spline,
+//! ) -> anyhow::Result<Vec<Event>> {
+//!     // Your custom detection logic here
+//!     // Access data via db.analyze_range(), db.get_raw_measurements(), etc.
+//!     Ok(vec![])
+//! }
+//!
+//! // Register with the pipeline using the macro
+//! let mut pipeline = Pipeline::builder(database, aspect_id)
+//!     .with_detector(EventDetector::new(
+//!         "anomaly_detector",
+//!         "Anomaly Detection",
+//!         Some("Detects unusual patterns in the data".to_string()),
+//!         event_detector_fn!(detect_anomalies),
+//!     ))
+//!     .build()
+//!     .await?;
+//!
+//! // Or register after building
+//! pipeline.register_detector(EventDetector::new(
+//!     "another_detector",
+//!     "Another Detector",
+//!     None,
+//!     Arc::new(|db, aspect, res, method| {
+//!         Box::pin(async move { Ok(vec![]) })
+//!     }),
+//! ));
+//! ```
+//!
+//! ## Built-in Event Detectors
+//!
+//! The crate provides several ready-to-use detectors in the [`detectors`] module:
+//!
+//! | Function | Description |
+//! |----------|-------------|
+//! | [`detect_monthly_increase`] | Detects months with price increase above threshold |
+//! | [`detect_peaks`] | Finds local maxima equal to global maximum |
+//! | [`detect_all_peaks`] | Finds all local maxima |
+//! | [`detect_valleys`] | Finds local minima equal to global minimum |
+//! | [`detect_all_valleys`] | Finds all local minima |
+//! | [`detect_threshold_crossing_up`] | Detects upward threshold crossings |
+//! | [`detect_threshold_crossing_down`] | Detects downward threshold crossings |
+//! | [`detect_drawdown`] | Detects significant price drops |
+//!
+//! ## Pipeline State Persistence
+//!
+//! Pipelines can save and restore their state:
+//!
+//! ```rust,ignore
+//! use dataset_management::Pipeline;
+//!
+//! // Check if state exists
+//! if Pipeline::state_exists(&database, &aspect_id).await? {
+//!     // Load existing pipeline
+//!     let mut pipeline = Pipeline::load(database.clone(), &aspect_id).await?;
+//!
+//!     // Re-register detectors (functions can't be serialized)
+//!     pipeline.register_detector(/* ... */);
+//!
+//!     // Continue from where we left off
+//!     pipeline.run().await?;
+//! } else {
+//!     // Create new pipeline
+//!     let mut pipeline = Pipeline::builder(database, aspect_id)
+//!         .build()
+//!         .await?;
+//!     pipeline.run().await?;
+//!     // State is auto-saved after run()
+//! }
+//! ```
+//!
+//! ## Lower-Level Functions
+//!
+//! For even more control, use the individual functions directly:
+//!
+//! ```rust,ignore
+//! use dataset_management::{
+//!     build_processed_batch_queue,
+//!     build_patterns_queue,
+//!     load_dictionary,
+//!     create_correlations_for_events,
+//!     create_signals,
+//!     filter_expired_signals,
+//!     Dictionary, DictionaryConstraints,
+//! };
+//! use dataset_management::batch_utils::build_unprocessed_queue;
+//!
+//! // Manual step-by-step processing
+//! build_unprocessed_queue(&database, &aspect_id, &resolution, &method, batch_size).await?;
+//! build_processed_batch_queue(&database, &aspect_id).await?;
+//!
+//! let mut dictionary = Dictionary::new(
+//!     "MyDictionary".to_string(),
+//!     "Description".to_string(),
+//!     DictionaryConstraints::default()
+//! );
+//! load_dictionary(&database, &aspect_id, &mut dictionary).await?;
+//! build_patterns_queue(&database, &aspect_id, &mut dictionary).await?;
+//!
+//! create_correlations_for_events(&database, &dictionary, &aspect_id).await?;
+//! create_signals(&database, &aspect_id).await?;
+//! filter_expired_signals(&database, &aspect_id, Some(chrono::Utc::now())).await?;
+//! ```
+//!
+//! ## Key Types
+//!
+//! ### Pipeline Types
+//!
+//! | Type | Description |
+//! |------|-------------|
+//! | [`Pipeline`] | Main pipeline orchestrator |
+//! | [`PipelineBuilder`] | Fluent builder for pipeline configuration |
+//! | [`PipelineConfig`] | Serializable pipeline configuration |
+//! | [`PipelineState`] | Persisted pipeline state |
+//! | [`EventDetector`] | Registered event detector with metadata |
+//! | [`EventDetectorFn`] | Type alias for detector function |
+//! | [`DetectorId`] | Unique identifier for detectors |
+//!
+//! ### Data Types (re-exported from `database`)
+//!
+//! | Type | Description |
+//! |------|-------------|
+//! | [`Dictionary`] | Collection of patterns with constraints |
+//! | [`DictionaryConstraints`] | Rules for pattern matching |
+//! | [`Pattern`] | Extracted recurring shape |
+//! | [`Event`] | Detected occurrence with manifestations |
+//! | [`Correlation`] | Link between pattern and event |
+//! | [`Signal`] | Prediction based on correlation |
+//! | [`SignalType`] | Type of prediction signal |
+//!
+//! ## Architecture
+//!
+//! ```text
+//! ┌──────────────────────────────────────────────────────────────────┐
+//! │                          Pipeline                                │
+//! ├──────────────────────────────────────────────────────────────────┤
+//! │                                                                  │
+//! │  ┌─────────────┐   ┌─────────────┐   ┌─────────────────────────┐ │
+//! │  │ Measurements│ → │   Batches   │ → │ Processed Batches       │ │
+//! │  └─────────────┘   └─────────────┘   └─────────────────────────┘ │
+//! │                                              ↓                   │
+//! │  ┌─────────────────────────────────────────────────────────────┐ │
+//! │  │                      Dictionary                             │ │
+//! │  │  ┌─────────┐  ┌─────────┐  ┌─────────┐                      │ │
+//! │  │  │Pattern 1│  │Pattern 2│  │Pattern N│  ...                 │ │
+//! │  │  └─────────┘  └─────────┘  └─────────┘                      │ │
+//! │  └─────────────────────────────────────────────────────────────┘ │
+//! │                              ↓                                   │
+//! │  ┌─────────────────────────────────────────────────────────────┐ │
+//! │  │                    Event Detectors                          │ │
+//! │  │  ┌────────────┐  ┌────────────┐  ┌────────────┐             │ │
+//! │  │  │Monthly Incr│  │Peak Detect │  │Custom Det. │  ...        │ │
+//! │  │  └────────────┘  └────────────┘  └────────────┘             │ │
+//! │  └─────────────────────────────────────────────────────────────┘ │
+//! │                              ↓                                   │
+//! │  ┌─────────────┐   ┌─────────────┐   ┌─────────────────────────┐ │
+//! │  │   Events    │ → │Correlations │ → │       Signals           │ │
+//! │  └─────────────┘   └─────────────┘   └─────────────────────────┘ │
+//! │                                              ↓                   │
+//! │  ┌─────────────────────────────────────────────────────────────┐ │
+//! │  │              query_probability(event, time)                 │ │
+//! │  │                         → ProbabilityResult                 │ │
+//! │  └─────────────────────────────────────────────────────────────┘ │
+//! └──────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ## Performance Tips
+//!
+//! - Use appropriate batch sizes (typically 24-100 for hourly data)
+//! - Set dictionary constraints to control pattern granularity
+//! - Use `SKIP_SLOW_TESTS=1` environment variable to skip long-running tests
+//! - Parallel processing is automatic via rayon for CPU-bound operations
+//! - Memory-aware batching prevents exhaustion during large dataset processing
+//!
+//! ## Example: Financial Data Analysis
+//!
+//! ```rust,ignore
+//! use dataset_management::{Pipeline, DictionaryConstraints, Steps, Variability, VariablilityType};
+//! use database::{Database, DatabaseStructure, Resolution};
+//! use splimes::Spline;
+//! use bigdecimal::BigDecimal;
+//!
+//! #[tokio::main]
+//! async fn main() -> anyhow::Result<()> {
+//!     let database = Database::existing("Crypto").await?;
+//!
+//!     // Find BTCUSD subject
+//!     let subjects = database.list_subjects().await?;
+//!     let btc_subject = subjects.iter()
+//!         .find(|(_, name)| name == "BTCUSD")
+//!         .map(|(id, _)| *id)
+//!         .expect("BTCUSD not found");
+//!
+//!     // Get the "open" price aspect
+//!     let aspects = database.get_subject_aspects(&btc_subject).await?;
+//!     let open_aspect = aspects.iter()
+//!         .find(|a| a.name() == "open")
+//!         .expect("open aspect not found");
+//!
+//!     // Build pipeline for BTC price analysis
+//!     let mut pipeline = Pipeline::builder(database.clone(), open_aspect.id())
+//!         .resolution(Resolution::Hours)
+//!         .batch_size(24)  // Daily patterns
+//!         .dictionary_constraints(DictionaryConstraints::new(
+//!             Some(Steps::new(10, Spline::Linear)),
+//!             Some(vec![VariablilityType::MaximumStatic(
+//!                 Variability::new(BigDecimal::from(1) / BigDecimal::from(10))
+//!             )])
+//!         ))
+//!         .with_monthly_increase_detector(0.05)
+//!         .with_peak_detector("BTC Price Peaks")
+//!         .build()
+//!         .await?;
+//!
+//!     // Run analysis
+//!     pipeline.run().await?;
+//!
+//!     println!("Patterns found: {}", pipeline.dictionary().len());
+//!     println!("Signals generated: {}", pipeline.signals().len());
+//!
+//!     Ok(())
+//! }
+//! ```
+
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 #![allow(clippy::multiple_crate_versions, clippy::used_underscore_binding, clippy::similar_names, clippy::module_name_repetitions, clippy::module_inception, clippy::cast_precision_loss)]
 
@@ -1177,6 +1524,235 @@ mod tests {
 		Ok(())
 	}
 
+	/// Test using the new Pipeline API - mirrors `test_api` but uses the fluent builder pattern
+	#[tokio::test]
+	#[serial]
+	async fn test_pipeline_api() -> Result<()> {
+		// Initialize tracing subscriber for test output
+		let _ = tracing_subscriber::fmt()
+			.with_env_filter(
+				tracing_subscriber::EnvFilter::try_from_default_env()
+					.unwrap_or_else(|_| {
+						tracing_subscriber::EnvFilter::new(
+							"info,dataset_management=debug,database=debug,splimes=info,turso_core=warn"
+						)
+					})
+			)
+			.with_test_writer()
+			.try_init();
+
+		// Skip this test if running in CI or if we want fast feedback
+		if std::env::var("SKIP_SLOW_TESTS").is_ok() {
+			tracing::info!("Skipping test_pipeline_api due to SKIP_SLOW_TESTS environment variable");
+			return Ok(());
+		}
+
+		// Debug: Show where we're looking for the database
+		tracing::info!(path = %format!("{}/Crypto", database::DEFAULT_DATA_DIR), "Looking for Crypto database");
+
+		// Try to get the Crypto database, skip test if it doesn't exist or doesn't have the required data
+		let database = match Database::existing("Crypto").await {
+			Ok(db) => db,
+			Err(e) => {
+				tracing::warn!(error = ?e, "Skipping test_pipeline_api - Crypto database not found (run database tests first)");
+				return Ok(());
+			}
+		};
+
+		let subjects = database.list_subjects().await?;
+		let Some(subject_id) = subjects.iter().find(|(_, name)| name.as_str() == "BTCUSD").map(|(id, _)| *id) else {
+			tracing::warn!("Skipping test_pipeline_api - BTCUSD subject not found in Crypto database");
+			return Ok(());
+		};
+
+		let aspects = database.get_subject_aspects(&subject_id).await?;
+		let Some(aspect) = aspects.iter().find(|a| a.name() == "open") else {
+			tracing::warn!(available_aspects = ?aspects.iter().map(database::Aspect::name).collect::<Vec<_>>(), "Skipping test_pipeline_api - 'open' aspect not found");
+			return Ok(());
+		};
+		let aspect_id = aspect.id();
+
+		// Check if the aspect has any measurements before proceeding
+		if database.get_earliest_measurement(&aspect.id()).await?.is_none() {
+			tracing::warn!("Skipping test_pipeline_api - No measurements found for 'open' aspect in Crypto database");
+			return Ok(());
+		}
+
+		tracing::info!(aspect_id = %aspect_id, "Aspect ID");
+
+		// Build the pipeline using the fluent builder API
+		let timer = std::time::Instant::now();
+		tracing::info!("Building pipeline with Pipeline::builder...");
+
+		#[rustfmt::skip]
+		let dictionary_constraints = DictionaryConstraints::new(
+			Some(Steps::new(
+				10,
+				Spline::Linear
+			)),
+			Some(
+				vec![
+					VariablilityType::MaximumStatic(Variability::new(
+						BigDecimal::from_f64(0.1).unwrap()
+					))
+				]
+			)
+		);
+
+		let mut pipeline = Pipeline::builder(database.clone(), aspect_id)
+			.resolution(Resolution::Hours)
+			.spline_method(Spline::Linear)
+			.batch_size(24)
+			.dictionary_name("TestDictionary")
+			.dictionary_description("A dictionary for testing purposes")
+			.dictionary_constraints(dictionary_constraints)
+			.with_monthly_increase_detector(0.05)
+			.with_peak_detector("BTC Price Peaks")
+			.build()
+			.await?;
+
+		tracing::info!(elapsed = ?timer.elapsed(), "Pipeline built");
+		tracing::info!(detector_count = pipeline.detector_count(), "Registered event detectors");
+
+		// Run the full pipeline
+		let timer = std::time::Instant::now();
+		tracing::info!("Running pipeline.run()...");
+
+		pipeline.run().await?;
+
+		tracing::info!(elapsed = ?timer.elapsed(), "Pipeline run completed");
+
+		// Inspect pipeline results
+		tracing::info!(
+			dictionary_patterns = pipeline.dictionary().len(),
+			signals_count = pipeline.signals().len(),
+			run_count = pipeline.state().run_count,
+			last_run = ?pipeline.state().last_run,
+			"Pipeline results"
+		);
+
+		// Get processed batches to verify data preparation worked
+		let processed_batches: Vec<Batch> = database.get_processed_batches(&aspect_id).await?.try_collect().await?;
+		let length = processed_batches.len();
+		tracing::info!(count = length, "Processed batches count");
+		if length > 0 {
+			let random_index = rand::thread_rng().gen_range(0..length);
+			tracing::debug!(batch = %json!(&processed_batches[random_index]), "Random processed batch");
+			output_denk_format_batch(&processed_batches[random_index]);
+		}
+
+		// Get patterns to verify pattern extraction worked
+		let patterns: Vec<database::Pattern> = Outputs::get_dictionary_patterns(&database, &aspect_id, "TestDictionary").await?.try_collect().await?;
+		let length = patterns.len();
+		tracing::info!(count = length, "Patterns count");
+		if length > 0 {
+			let random_index = rand::thread_rng().gen_range(0..length);
+			tracing::debug!(pattern = %json!(&patterns[random_index]), "Random pattern");
+			output_denk_format_pattern(&patterns[random_index]);
+		}
+
+		// Check correlations
+		let mut correlation_stream = database.get_correlations(&aspect_id).await?;
+		let mut multi_occurrence_count = 0usize;
+		while let Some(result) = correlation_stream.next().await {
+			if let Ok(correlation) = result {
+				if correlation.occurrences().len() > 1 {
+					multi_occurrence_count += 1;
+				}
+			}
+		}
+		tracing::info!(count = multi_occurrence_count, "Number of correlations with more than 1 occurrence");
+
+		// Check patterns with multiple occurrences
+		tracing::info!(count = pipeline.dictionary().patterns().iter().filter(|p| p.occurrences().len() > 1).count(), "Number of patterns with more than 1 occurrence");
+
+		// Query probability for a random signal if signals exist
+		if pipeline.signals().is_empty() {
+  			tracing::info!("No signals generated - skipping probability query");
+  		} else {
+  			let random_signal = pipeline.signals().values().next().unwrap();
+  			let random_event_id = random_signal.event_id().clone();
+  			let signal_type = random_signal.signal_type().clone();
+
+  			// If the correlation has zero error rates, set a test error rate
+  			let correlation_id = random_signal.correlation_id().clone();
+  			if let Ok(mut correlation) = database.get_correlation(&aspect_id, &correlation_id).await {
+  				let has_nonzero = correlation.error_rate().values().any(|err| !err.value().is_zero());
+  				if !has_nonzero {
+  					tracing::debug!(correlation_id = %correlation.id(), "Setting test error rate for correlation");
+  					correlation.set_error_rate(signal_type.clone(), database::Distance::new(BigDecimal::from_f64(0.1).unwrap(), splimes::Resolution::Seconds));
+  					database.update_correlation(&aspect_id, &correlation).await?;
+  				}
+  			}
+
+  			let timer = std::time::Instant::now();
+  			tracing::info!("Calculating sample signal probability using pipeline.query_probability...");
+
+  			let sample_datetime = Utc.with_ymd_and_hms(2025, 12, 15, 0, 0, 0).unwrap();
+
+  			// Use the pipeline's query_probability method
+  			let prob_result = pipeline.query_probability(&random_event_id, &signal_type, sample_datetime).await?;
+
+  			tracing::info!(elapsed = ?timer.elapsed(), "Time taken for probability calculation");
+  			tracing::info!(
+  				event_id = %random_event_id,
+  				signal_type = ?signal_type,
+  				result = %prob_result,
+  				"Sample signal probability"
+  			);
+
+  			// Also test individual probability methods for comparison
+  			let sig_sum_probability = pipeline.signals().probability_sum(&random_event_id, &signal_type, sample_datetime, &database, &aspect_id).await?.unwrap_or_else(|| BigDecimal::from(0));
+  			let sig_avg_probability = pipeline.signals().probability_average(&random_event_id, &signal_type, sample_datetime, &database, &aspect_id).await?.unwrap_or_else(|| BigDecimal::from(0));
+  			let sig_event_probability = pipeline.signals().event_probability(&random_event_id, &signal_type, sample_datetime, &database, &aspect_id).await?;
+
+  			let event_prob_str = sig_event_probability.map_or_else(|| "N/A".to_string(), |p| format!("{p:.4}"));
+  			tracing::info!(
+  				sum = %format!("{:.4}", sig_sum_probability),
+  				average = %format!("{:.4}", sig_avg_probability),
+  				event_based = %event_prob_str,
+  				"Direct probability calculation comparison"
+  			);
+  		}
+
+		// Verify pipeline state was saved
+		let state_exists = Pipeline::state_exists(&database, &aspect_id).await?;
+		tracing::info!(state_saved = state_exists, "Pipeline state persistence");
+
+		// Test loading the pipeline from saved state
+		if state_exists {
+			let timer = std::time::Instant::now();
+			tracing::info!("Testing Pipeline::load from saved state...");
+
+			let mut loaded_pipeline = Pipeline::load(database.clone(), &aspect_id).await?;
+
+			// Re-register detectors (they can't be serialized)
+			// Use Arc::new with async move block for proper lifetime handling when capturing values
+			let threshold = 0.05;
+			let detector_fn: pipeline::EventDetectorFn = std::sync::Arc::new(move |db, aspect, res, method| {
+				Box::pin(async move {
+					detectors::detect_monthly_increase(db, aspect, res, method, threshold).await
+				})
+			});
+			loaded_pipeline.register_detector(EventDetector::new(
+				"monthly_increase_5pct",
+				"5% Monthly Increase Detector",
+				Some("Detects when price increases 5% or more from start to end of month".to_string()),
+				detector_fn,
+			));
+
+			tracing::info!(
+				elapsed = ?timer.elapsed(),
+				run_count = loaded_pipeline.state().run_count,
+				detector_count = loaded_pipeline.detector_count(),
+				"Pipeline loaded from saved state"
+			);
+		}
+
+		tracing::info!("Pipeline API test completed successfully!");
+		Ok(())
+	}
+
 	#[tokio::test]
 	#[serial]
 	async fn test_api_precise() -> Result<()> {
@@ -1357,6 +1933,190 @@ mod tests {
 				drop(signals_lock);
 			}
 		}
+		Ok(())
+	}
+
+	/// Test using the Pipeline API with `fake_database` - mirrors `test_api_precise`
+	#[tokio::test]
+	#[serial]
+	async fn test_pipeline_api_precise() -> Result<()> {
+		// Initialize tracing subscriber for test output
+		let _ = tracing_subscriber::fmt()
+			.with_env_filter(
+				tracing_subscriber::EnvFilter::try_from_default_env()
+					.unwrap_or_else(|_| {
+						tracing_subscriber::EnvFilter::new(
+							"info,dataset_management=debug,database=debug,splimes=info,turso_core=warn"
+						)
+					})
+			)
+			.with_test_writer()
+			.try_init();
+
+		// Skip this test if running in CI or if we want fast feedback
+		if std::env::var("SKIP_SLOW_TESTS").is_ok() {
+			tracing::info!("Skipping test_pipeline_api_precise due to SKIP_SLOW_TESTS environment variable");
+			return Ok(());
+		}
+
+		let db = fake_database().await;
+		let subjects = db.list_subjects().await?;
+		let subject = subjects.iter().find(|(_, name)| name.as_str() == "TestSubject").map(|(id, _)| *id).ok_or_else(|| anyhow::anyhow!("Subject 'TestSubject' not found"))?;
+		let aspects = db.get_subject_aspects(&subject).await?;
+		let aspect = aspects.iter().find(|a| a.name() == "TestAspect").ok_or_else(|| anyhow::anyhow!("Aspect 'TestAspect' not found"))?;
+		let aspect_id = aspect.id();
+
+		tracing::info!(aspect_id = %aspect_id, "Aspect ID");
+
+		// Build the pipeline using the fluent builder API
+		// Note: fake_database already creates the peak detection event, so we don't register a detector here
+		#[rustfmt::skip]
+		let dictionary_constraints = DictionaryConstraints::new(
+			Some(Steps::new(
+				10,
+				Spline::Linear
+			)),
+			Some(vec![
+				VariablilityType::AveragePercentile(Variability::new(BigDecimal::from_f64(0.000_000_001).unwrap())),
+			])
+		);
+
+		let mut pipeline = Pipeline::builder(db.clone(), aspect_id)
+			.resolution(Resolution::Minutes)
+			.spline_method(Spline::Linear)
+			.batch_size(60)
+			.dictionary_name("TestDictionary")
+			.dictionary_description("A dictionary for testing purposes")
+			.dictionary_constraints(dictionary_constraints)
+			// Note: Not registering peak detector since fake_database already creates events
+			.build()
+			.await?;
+
+		tracing::info!("Running pipeline steps individually...");
+
+		// Run data preparation
+		let timer = std::time::Instant::now();
+		pipeline.prepare_data().await?;
+		tracing::info!(elapsed = ?timer.elapsed(), "Data preparation completed");
+
+		// Check processed batches
+		let processed_batches: Vec<Batch> = db.get_processed_batches(&aspect_id).await?.try_collect().await?;
+		let length = processed_batches.len();
+		tracing::info!(count = length, "Processed batches count");
+		if length > 0 {
+			let random_index = rand::thread_rng().gen_range(0..length);
+			tracing::debug!(batch = %json!(&processed_batches[random_index]), "Random processed batch");
+			output_denk_format_batch(&processed_batches[random_index]);
+		}
+
+		// Run pattern extraction
+		let timer = std::time::Instant::now();
+		pipeline.extract_patterns().await?;
+		tracing::info!(elapsed = ?timer.elapsed(), pattern_count = pipeline.dictionary().len(), "Pattern extraction completed");
+
+		// Show the pattern after dictionary import
+		if !pipeline.dictionary().is_empty() {
+			let first_pattern = &pipeline.dictionary().patterns()[0];
+			tracing::debug!(relatives_count = first_pattern.relatives().len(), "First pattern relatives");
+			tracing::debug!("Pattern after dictionary import:");
+			output_denk_format_pattern(first_pattern);
+		}
+
+		// Check patterns in database
+		let patterns: Vec<database::Pattern> = Outputs::get_dictionary_patterns(&db, &aspect_id, "TestDictionary").await?.try_collect().await?;
+		let length = patterns.len();
+		tracing::info!(count = length, "Patterns count");
+		if length > 0 {
+			let random_index = rand::thread_rng().gen_range(0..length);
+			tracing::debug!(pattern = %json!(&patterns[random_index]), "Random pattern");
+			output_denk_format_pattern(&patterns[random_index]);
+		}
+
+		// Peak detection event already created in fake_database()
+		// Skip detect_events step since we're using pre-created events
+
+		// Run correlation creation
+		let timer = std::time::Instant::now();
+		tracing::info!("Starting correlate_events via pipeline...");
+		pipeline.correlate_events().await?;
+		tracing::info!(elapsed = ?timer.elapsed(), "Correlation creation completed");
+
+		// Check correlations
+		let mut correlation_stream = db.get_correlations(&aspect_id).await?;
+		let mut multi_occurrence_count = 0usize;
+		while let Some(result) = correlation_stream.next().await {
+			if let Ok(correlation) = result {
+				if correlation.occurrences().len() > 1 {
+					multi_occurrence_count += 1;
+				}
+			}
+		}
+		tracing::info!(count = multi_occurrence_count, "Number of correlations with more than 1 occurrence");
+		tracing::info!(count = pipeline.dictionary().patterns().iter().filter(|p| p.occurrences().len() > 1).count(), "Number of patterns with more than 1 occurrence");
+
+		// Run signal generation
+		let timer = std::time::Instant::now();
+		tracing::info!("Starting generate_signals via pipeline...");
+		pipeline.generate_signals().await?;
+		tracing::info!(elapsed = ?timer.elapsed(), signals_count = pipeline.signals().len(), "Signal generation completed");
+
+		// Define timeline
+		let start_time = Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap();
+
+		// Filter expired signals up to the last known data point (hour 64)
+		let last_known_time = start_time + chrono::Duration::hours(64);
+		tracing::debug!(last_known_time = %last_known_time, "Filtering expired signals up to last known time");
+		pipeline.filter_signals_at(last_known_time).await?;
+
+		tracing::info!(count = pipeline.signals().len(), "Number of signals after filtering");
+		// Debug: show sample signals AFTER filtering
+		for (idx, sig) in pipeline.signals().values().take(5).enumerate() {
+			tracing::debug!(idx = idx, manifestation_date = %sig.manifestation_date(), signal_type = ?sig.signal_type(), "Post-filter signal");
+		}
+
+		// Calculate and print the probability for the Signals in the queue for hours 65-70
+		let events = get_events_queue(&db, &aspect_id).await?;
+		let event_id_option = events.first().map(|e| e.id().clone());
+		drop(events);
+
+		if let Some(event_id) = event_id_option {
+			// Get the first correlation to show error rate
+			let correlations: Vec<database::Correlation> = db.get_correlations(&aspect_id).await?.try_collect().await?;
+			let signal_type = SignalType::Custom("PredictStart".to_string());
+			let error_rate = correlations.first()
+				.and_then(|c| c.error_rate().get(&signal_type).cloned())
+				.unwrap_or_else(|| database::Distance::new(BigDecimal::from(0), splimes::Resolution::Seconds));
+
+			for hour in 65..=70 {
+				let query_time = start_time + chrono::Duration::hours(hour);
+
+				tracing::debug!(hour = hour, count = pipeline.signals().len(), "Number of signals for hour");
+
+				// Use pipeline's query_probability method
+				let prob_result = pipeline.query_probability(&event_id, &signal_type, query_time).await?;
+
+				if prob_result.is_empty() {
+					tracing::debug!(event_id = %event_id, hour = hour, "No signals found for event at hour");
+					continue;
+				}
+
+				// Format output nicely
+				let event_prob_str = prob_result.event_based.as_ref().map_or_else(|| "N/A".to_string(), |p| format!("{p:.4}"));
+				let avg_str = prob_result.average.as_ref().map_or_else(|| "N/A".to_string(), |p| format!("{p:.4}"));
+				let sum_str = prob_result.sum.as_ref().map_or_else(|| "N/A".to_string(), |p| format!("{p:.4}"));
+
+				tracing::info!(
+					hour = hour,
+					event_based = %event_prob_str,
+					average = %avg_str,
+					sum = %sum_str,
+					error_rate = %error_rate.value(),
+					"Peak Event Probability (via Pipeline)"
+				);
+			}
+		}
+
+		tracing::info!("Pipeline API precise test completed successfully!");
 		Ok(())
 	}
 
@@ -1668,10 +2428,10 @@ mod tests {
 		);
 	}
 
-	/// Test for the new Pipeline API
+	/// Test for the new Pipeline API using fake database
 	#[tokio::test]
 	#[serial]
-	async fn test_pipeline_api() -> Result<()> {
+	async fn test_pipeline_api_with_fake_db() -> Result<()> {
 		// Initialize tracing
 		let _ = tracing_subscriber::fmt()
 			.with_env_filter(
@@ -1687,7 +2447,7 @@ mod tests {
 
 		// Skip this test if running in CI
 		if std::env::var("SKIP_SLOW_TESTS").is_ok() {
-			tracing::info!("Skipping test_pipeline_api due to SKIP_SLOW_TESTS environment variable");
+			tracing::info!("Skipping test_pipeline_api_with_fake_db due to SKIP_SLOW_TESTS environment variable");
 			return Ok(());
 		}
 

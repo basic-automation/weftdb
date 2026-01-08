@@ -1,19 +1,118 @@
 //! Built-in event detector functions.
 //!
-//! These can be used directly with the Pipeline API or as templates for custom detectors.
-//! Each detector function follows the same signature and can be registered with the pipeline.
+//! This module provides ready-to-use event detectors for common time-series patterns.
+//! Each detector function follows the standard [`EventDetectorFn`](crate::EventDetectorFn)
+//! signature and can be used directly or registered with the [`Pipeline`](crate::Pipeline).
 //!
-//! # Example
+//! ## Available Detectors
+//!
+//! | Function | Description |
+//! |----------|-------------|
+//! | [`detect_monthly_increase`] | Detects months with price increase above threshold |
+//! | [`detect_peaks`] | Finds local maxima equal to the global maximum |
+//! | [`detect_all_peaks`] | Finds all local maxima (regardless of global max) |
+//! | [`detect_valleys`] | Finds local minima equal to the global minimum |
+//! | [`detect_all_valleys`] | Finds all local minima |
+//! | [`detect_threshold_crossing_up`] | Detects upward threshold crossings |
+//! | [`detect_threshold_crossing_down`] | Detects downward threshold crossings |
+//! | [`detect_drawdown`] | Detects significant price drops from peaks |
+//!
+//! ## Usage with Pipeline (Recommended)
+//!
+//! The easiest way to use detectors is through the Pipeline builder:
+//!
+//! ```ignore
+//! use dataset_management::Pipeline;
+//!
+//! let mut pipeline = Pipeline::builder(database, aspect_id)
+//!     .with_monthly_increase_detector(0.05)  // 5% monthly increase
+//!     .with_peak_detector("Price Peaks")
+//!     .with_valley_detector("Price Valleys")
+//!     .build()
+//!     .await?;
+//!
+//! pipeline.run().await?;
+//! ```
+//!
+//! ## Direct Usage
+//!
+//! Detectors can also be called directly for standalone analysis:
 //!
 //! ```ignore
 //! use dataset_management::detectors;
+//! use database::{Database, Resolution};
+//! use splimes::Spline;
 //!
-//! // Use built-in detector directly
-//! let events = detectors::detect_monthly_increase(&db, &aspect, &resolution, &method, 0.05).await?;
+//! let events = detectors::detect_monthly_increase(
+//!     &database,
+//!     &aspect_id,
+//!     &Resolution::Hours,
+//!     &Spline::Linear,
+//!     0.05  // 5% threshold
+//! ).await?;
 //!
-//! // Or register with pipeline
-//! let pipeline = Pipeline::builder(database, aspect_id)
-//!     .with_monthly_increase_detector(0.05)
+//! for event in events {
+//!     println!("Found event: {} with {} manifestations",
+//!         event.name(),
+//!         event.manifestations().len()
+//!     );
+//! }
+//! ```
+//!
+//! ## Creating Custom Detectors
+//!
+//! You can create custom detectors following the same pattern. A detector function
+//! receives database access and returns a list of detected events:
+//!
+//! ```ignore
+//! use dataset_management::{Event, Manifestation, EventDetector, event_detector_fn};
+//! use database::{Database, AspectId, Resolution, DatabaseStructure, Outputs};
+//! use splimes::Spline;
+//! use anyhow::Result;
+//!
+//! async fn detect_custom_pattern(
+//!     database: &Database,
+//!     aspect: &AspectId,
+//!     resolution: &Resolution,
+//!     method: &Spline,
+//! ) -> Result<Vec<Event>> {
+//!     // Get the data range
+//!     let start = database.get_earliest_measurement(aspect).await?
+//!         .ok_or_else(|| anyhow::anyhow!("No data"))?;
+//!     let end = database.get_latest_measurement(aspect).await?
+//!         .ok_or_else(|| anyhow::anyhow!("No data"))?;
+//!
+//!     // Analyze the data
+//!     let mut stream = database.analyze_range(
+//!         aspect, start, end, *resolution, *method
+//!     ).await?;
+//!
+//!     let mut event = Event::new(
+//!         None,
+//!         "Custom Pattern".to_string(),
+//!         Some("Detects my custom pattern".to_string()),
+//!         None
+//!     );
+//!
+//!     // Your detection logic here...
+//!     // Add manifestations when pattern is detected:
+//!     // event.add_manifestation(manifestation);
+//!
+//!     if event.manifestations().is_empty() {
+//!         Ok(vec![])
+//!     } else {
+//!         Ok(vec![event])
+//!     }
+//! }
+//!
+//! // Register with pipeline
+//! let mut pipeline = Pipeline::builder(database, aspect_id)
+//!     .with_detector(EventDetector::new(
+//!         "custom_pattern",
+//!         "Custom Pattern Detector",
+//!         Some("Detects my custom pattern".to_string()),
+//!         event_detector_fn!(detect_custom_pattern),
+//!     ))
 //!     .build()
 //!     .await?;
 //! ```
