@@ -351,6 +351,10 @@ impl Dictionary {
 		let current_steps = relatives.len();
 		let required_steps = steps_config.count;
 
+		if required_steps == 0 {
+			bail!("Steps count must be greater than 0");
+		}
+
 		if current_steps == required_steps {
 			return Ok(pattern);
 		}

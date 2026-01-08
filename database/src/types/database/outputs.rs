@@ -26,6 +26,15 @@ use crate::types::database::traits::database_structure::DatabaseStructure;
 use crate::correlation::ErrorRate;
 use crate::Database;
 
+/// Parsed correlation row data from database query.
+/// Contains (`correlation_id`, `dictionary_id`, `subject_id`, `aspect_id`, `pattern_id`, `event_id`, `average_distance`).
+type CorrelationRowData = (CorrelationID, DictionaryId, SubjectId, AspectId, PatternID, EventID, Option<crate::types::signal::Distance>);
+
+/// Maximum number of pages to fetch when performing point analysis.
+/// This limit prevents infinite loops when searching for data around a target time
+/// and ensures bounded memory usage during interpolation data collection.
+const MAX_PAGES_FOR_POINT_ANALYSIS: usize = 10;
+
 // Avoid triggering pedantic 'too_many_lines' on this large impl
 #[allow(clippy::too_many_lines)]
 
@@ -158,7 +167,8 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 			if measurements.is_empty() {
 				// No data in the time window, try getting boundary measurements
 				if page == 0 {
-						let _boundary_measurements: Vec<Measurement> = self.get_boundary_measurements(aspect_id).await?.collect::<Vec<_>>().await.into_iter().collect::<Result<Vec<_>>>()?;
+						let boundary_measurements: Vec<Measurement> = self.get_boundary_measurements(aspect_id).await?.collect::<Vec<_>>().await.into_iter().collect::<Result<Vec<_>>>()?;
+						all_measurements.extend(boundary_measurements);
 				}
 				break;
 			}
@@ -191,7 +201,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 			page += 1;
 
 			// Safety check to prevent infinite loops
-			if page > 10 {
+			if page > MAX_PAGES_FOR_POINT_ANALYSIS {
 				// Reduced since we're using a time window
 				break;
 			}
@@ -841,108 +851,22 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		let db_path = aspect.correlations_path();
 		let conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
 		let query_sql = r"
-                        SELECT id, dictionary_id, subject_id, aspect_id, pattern_id, event_id, average_distance_value, average_distance_units
-                        FROM correlations 
-                        WHERE id = ?
-                ";
+						SELECT id, dictionary_id, subject_id, aspect_id, pattern_id, event_id, average_distance_value, average_distance_units
+						FROM correlations 
+						WHERE id = ?
+				";
 
 		let mut rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![correlation_id.to_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query correlation: {e}")))?;
 		if let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get correlation row: {e}")))? {
-			let id_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Correlation ID is not text".to_string()))?.clone();
-			let dictionary_id_str = row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary ID is not text".to_string()))?.clone();
-			let subject_id_str = row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Subject ID is not text".to_string()))?.clone();
-			let aspect_id_str = row.get_value(3)?.as_text().ok_or_else(|| Error::DatabaseError("Aspect ID is not text".to_string()))?.clone();
-			let pattern_id_str = row.get_value(4)?.as_text().ok_or_else(|| Error::DatabaseError("Pattern ID is not text".to_string()))?.clone();
-			let event_id_str = row.get_value(5)?.as_text().ok_or_else(|| Error::DatabaseError("Event ID is not text".to_string()))?.clone();
-			
-			// Parse average_distance (nullable columns)
-			let average_distance = {
-				let avg_dist_value_opt = row.get_value(6).ok().and_then(|v| v.as_text().cloned());
-				let avg_dist_units_opt = row.get_value(7).ok().and_then(|v| v.as_text().cloned());
-				
-				match (avg_dist_value_opt, avg_dist_units_opt) {
-					(Some(value_str), Some(units_str)) => {
-						let value = BigDecimal::from_str(&value_str).ok();
-						let units = Resolution::from_str(&units_str).ok();
-						match (value, units) {
-							(Some(v), Some(u)) => Some(crate::types::signal::Distance::new(v, u)),
-							_ => None,
-						}
-					}
-					_ => None,
-				}
-			};
+			// Parse the row using shared helper
+			let (id, dictionary_id, subject_id, aspect_id_parsed, pattern_id, event_id, average_distance) = 
+				Self::parse_correlation_row(&row)?;
 
-			let id = CorrelationID::from_uuid(Uuid::parse_str(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for correlation ID: {e}")))?);
-			let dictionary_id = DictionaryId::from_uuid(Uuid::parse_str(&dictionary_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for dictionary ID: {e}")))?);
-			let subject_id = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for subject ID: {e}")))?);
-			let aspect_id = AspectId::from_uuid(Uuid::parse_str(&aspect_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for aspect ID: {e}")))?);
-			let pattern_id = PatternID::from_uuid(Uuid::parse_str(&pattern_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for pattern ID: {e}")))?);
-			let event_id = EventID::from_uuid(Uuid::parse_str(&event_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for event ID: {e}")))?);
+			// Load error rates and occurrences using helpers
+			let error_rate: HashMap<SignalType, ErrorRate> = Self::load_correlation_error_rates(&conn, &id).await?;
+			let occurrences: Vec<Occurrence> = Self::load_correlation_occurrences(&conn, &id).await?;
 
-			// get error rates
-			let error_rate_query_sql = r"
-                                SELECT signal_type, error_rate_value, error_rate_units
-                                FROM correlation_error_rates
-                                WHERE correlation_id = ?
-                        ";
-			let mut error_rate_rows: turso::Rows = conn.as_ref().query(error_rate_query_sql, turso::params![correlation_id.to_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query correlation error rates: {e}")))?;
-			let mut error_rate: HashMap<SignalType, ErrorRate> = HashMap::new();
-			while let Some(error_rate_row) = error_rate_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get correlation error rate row: {e}")))? {
-				let signal_type_str = error_rate_row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Error rate signal type is not text".to_string()))?.clone();
-				let error_rate_value: BigDecimal = {
-					let value_str = error_rate_row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Error rate value is not text".to_string()))?.clone();
-					BigDecimal::from_str(&value_str).map_err(|e| Error::DatabaseError(format!("Invalid error rate value format: {e}")))?
-				};
-				let error_rate_units_str = error_rate_row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Error rate units is not text".to_string()))?.clone();
-
-				let units: Resolution = Resolution::from_str(&error_rate_units_str).map_err(|e| Error::DatabaseError(format!("Invalid error rate units format: {e}")))?;
-				let err_rate = ErrorRate::new(error_rate_value, units);
-
-				let signal_type = SignalType::from_str(&signal_type_str).map_err(|e| Error::DatabaseError(format!("Invalid error type format: {e}")))?;
-				// Currently not used, but could be stored in Correlation if needed
-
-				error_rate.insert(signal_type, err_rate);
-			}
-
-			// get occurrences
-			let occurrences_query_sql = r"
-                                SELECT correlation_id, occurrence_index, aspect_id, resolution, size, database_info, pattern_id, beginning_timestamp, end_timestamp
-                                FROM correlation_occurrences
-                                WHERE correlation_id = ?
-                        ";
-			let mut occ_rows: turso::Rows = conn.as_ref().query(occurrences_query_sql, turso::params![correlation_id.to_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query correlation occurrences: {e}")))?;
-			let mut occurrences: Vec<Occurrence> = Vec::new();
-			// load occerrences in order of occurrence_index
-			let mut occ_map: HashMap<usize, Occurrence> = HashMap::new();
-			while let Some(occ_row) = occ_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get correlation occurrence row: {e}")))? {
-				let occ_index: usize = usize::try_from(*occ_row.get_value(1)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence Index is not integer".to_string()))?).map_err(|e| Error::DatabaseError(format!("Occurrence index out of range: {e}")))?;
-				let occ_aspect_id_str = occ_row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Aspect ID is not text".to_string()))?.clone();
-				let occ_resolution_str = occ_row.get_value(3)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Resolution is not text".to_string()))?.clone();
-				let occ_size: usize = usize::try_from(*occ_row.get_value(4)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence Size is not integer".to_string()))?).map_err(|e| Error::DatabaseError(format!("Occurrence size out of range: {e}")))?;
-				let occ_database_info_str = occ_row.get_value(5)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Database Info is not text".to_string()))?.clone();
-				let occ_pattern_id_str = occ_row.get_value(6)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Pattern ID is not text".to_string()))?.clone();
-				let occ_beginning_timestamp_millis: i64 = *occ_row.get_value(7)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence Beginning Timestamp is not integer".to_string()))?;
-				let occ_end_timestamp_millis: i64 = *occ_row.get_value(8)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence End Timestamp is not integer".to_string()))?;
-				let occ_aspect_id = AspectId::from_str(&occ_aspect_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for occurrence Aspect ID: {e}")))?;
-				let occ_resolution = Resolution::from_str(&occ_resolution_str).map_err(|e| Error::DatabaseError(format!("Invalid resolution format: {e}")))?;
-				let occ_database_info: DatabaseInfo = serde_json::from_str(&occ_database_info_str).map_err(|e| Error::DatabaseError(format!("Failed to parse occurrence database info JSON: {e}")))?;
-				let occ_pattern_id = PatternID::from_uuid(Uuid::parse_str(&occ_pattern_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for occurrence Pattern ID: {e}")))?);
-				let occ_beginning_timestamp = DateTime::from_timestamp_millis(occ_beginning_timestamp_millis).ok_or_else(|| Error::DatabaseError("Invalid beginning timestamp".to_string()))?;
-				let occ_end_timestamp = DateTime::from_timestamp_millis(occ_end_timestamp_millis).ok_or_else(|| Error::DatabaseError("Invalid end timestamp".to_string()))?;
-				let occurrence = Occurrence::new(occ_aspect_id, occ_resolution, occ_size, occ_database_info, occ_pattern_id, occ_beginning_timestamp, occ_end_timestamp);
-				occ_map.insert(occ_index, occurrence);
-			}
-			// Sort occurrences by index
-			let mut occ_indices: Vec<usize> = occ_map.keys().copied().collect();
-			occ_indices.sort_unstable();
-			for index in occ_indices {
-				if let Some(occurrence) = occ_map.get(&index) {
-					occurrences.push(occurrence.clone());
-				}
-			}
-
-			let correlation = Correlation::new(Some(id), dictionary_id, subject_id, &aspect_id, pattern_id, event_id, error_rate, occurrences, average_distance);
+			let correlation = Correlation::new(Some(id), dictionary_id, subject_id, &aspect_id_parsed, pattern_id, event_id, error_rate, occurrences, average_distance);
 
 			// Cache the correlation
 			self.cache.lock().await.store(&cache_key, correlation.clone()).await;
@@ -1318,6 +1242,26 @@ impl Database {
 			.map_err(|e| Error::DatabaseError(format!("Failed to get correlation row: {e}")))?
 			.ok_or_else(|| anyhow::anyhow!("Correlation with ID {correlation_id} not found"))?;
 
+		// Parse the row using shared helper
+		let (id, dictionary_id, subject_id, aspect_id_parsed, pattern_id, event_id, average_distance) = 
+			Self::parse_correlation_row(&row)?;
+
+		// Load error rates and occurrences using helpers to keep this function concise
+		let error_rate: HashMap<SignalType, ErrorRate> = Self::load_correlation_error_rates(&conn, &id).await?;
+		let occurrences: Vec<Occurrence> = Self::load_correlation_occurrences(&conn, &id).await?;
+
+		let correlation = Correlation::new(Some(id), dictionary_id, subject_id, &aspect_id_parsed, pattern_id, event_id, error_rate, occurrences, average_distance);
+
+		// Cache the correlation
+		cache.lock().await.store(&cache_key, correlation.clone()).await;
+		let _ = Self::commit_concurrent(&conn).await;
+
+		Ok(correlation)
+	}
+
+	/// Parse a correlation row from the database
+	/// Returns tuple of (id, `dictionary_id`, `subject_id`, `aspect_id`, `pattern_id`, `event_id`, `average_distance`)
+	fn parse_correlation_row(row: &turso::Row) -> Result<CorrelationRowData> {
 		let id_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Correlation ID is not text".to_string()))?.clone();
 		let dictionary_id_str = row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary ID is not text".to_string()))?.clone();
 		let subject_id_str = row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Subject ID is not text".to_string()))?.clone();
@@ -1346,21 +1290,11 @@ impl Database {
 		let id = CorrelationID::from_uuid(Uuid::parse_str(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for correlation ID: {e}")))?);
 		let dictionary_id = DictionaryId::from_uuid(Uuid::parse_str(&dictionary_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for dictionary ID: {e}")))?);
 		let subject_id = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for subject ID: {e}")))?);
-		let aspect_id_parsed = AspectId::from_uuid(Uuid::parse_str(&aspect_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for aspect ID: {e}")))?);
+		let aspect_id = AspectId::from_uuid(Uuid::parse_str(&aspect_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for aspect ID: {e}")))?);
 		let pattern_id = PatternID::from_uuid(Uuid::parse_str(&pattern_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for pattern ID: {e}")))?);
 		let event_id = EventID::from_uuid(Uuid::parse_str(&event_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for event ID: {e}")))?);
 
-		// Load error rates and occurrences using helpers to keep this function concise
-		let error_rate: HashMap<SignalType, ErrorRate> = Self::load_correlation_error_rates(&conn, correlation_id).await?;
-		let occurrences: Vec<Occurrence> = Self::load_correlation_occurrences(&conn, correlation_id).await?;
-
-		let correlation = Correlation::new(Some(id), dictionary_id, subject_id, &aspect_id_parsed, pattern_id, event_id, error_rate, occurrences, average_distance);
-
-		// Cache the correlation
-		cache.lock().await.store(&cache_key, correlation.clone()).await;
-		let _ = Self::commit_concurrent(&conn).await;
-
-		Ok(correlation)
+		Ok((id, dictionary_id, subject_id, aspect_id, pattern_id, event_id, average_distance))
 	}
 
 

@@ -1,5 +1,5 @@
 // Debug test to examine batch processing issue
-use std::fs::remove_dir_all;
+use tokio::fs::remove_dir_all;
 
 use ::database::database::traits::{AspectStructure, Inputs, Outputs};
 use anyhow::Result;
@@ -18,7 +18,7 @@ async fn debug_batch_processing() -> Result<()> {
 	println!("=== Starting debug batch processing test ===");
 	// Create a test database with a smaller dataset first
 	let db_path = format!("{DEFAULT_DATA_DIR}/debug_batch_test");
-	remove_dir_all(&db_path).ok();
+	remove_dir_all(&db_path).await.ok();
 
 	let db = Database::new("debug_batch_test").await.unwrap();
 	let test_subject = db.observe_subject("TestSubject").await.unwrap();

@@ -207,7 +207,7 @@ pub async fn detect_monthly_increase(
     }
 
     // Analyze each month
-    for (_, mut month_points) in months_data {
+    for (_month_key, mut month_points) in months_data {
         if month_points.len() < 2 {
             continue;
         }

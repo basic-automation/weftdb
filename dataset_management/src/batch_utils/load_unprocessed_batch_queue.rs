@@ -28,14 +28,14 @@ pub async fn build_unprocessed_queue(database: &Database, aspect: &AspectId, res
 		all_points.push(point);
 	}
 
-	info!(total_points = all_points.len(), batch_size, %start_time, %end_time, "Points streamed for batch creation");
+	info!(total_points = all_points.len(), batch_size, %start_time, %end_time, "Collected points for batch creation");
 
 	// Create sliding window batches (overlapping)
 	if batch_size > 0 && all_points.len() >= batch_size {
 		let database_info = database.get_database_info().await.map_err(|_| anyhow::anyhow!("Database info not available"))?;
 
 		let total_batches = all_points.len() - batch_size + 1;
-		let report_interval = std::cmp::max(1000, total_batches / 10); // Report every 1000 or 10% (whichever is larger)
+		let report_interval = std::cmp::max(1, total_batches / 10); // Report every 10% of total batches (at least every batch)
 		info!(total_batches, "Creating sliding window batches");
 
 		// Collect all batches first, then store them in bulk for better performance
@@ -43,7 +43,7 @@ pub async fn build_unprocessed_queue(database: &Database, aspect: &AspectId, res
 
 		// Create overlapping sliding window batches - each batch has exactly batch_size measurements
 		for i in 0..=(all_points.len() - batch_size) {
-			let window: &[splimes::Point] = &all_points[i..i + batch_size];
+			let window = &all_points[i..i + batch_size];
 			assert_eq!(window.len(), batch_size, "Window should always have exactly batch_size elements");
 
 			let measurements = window.iter().map(|p| BatchedMeasurement::new(p.clone())).collect();
