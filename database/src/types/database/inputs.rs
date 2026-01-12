@@ -10,9 +10,113 @@ use crate::{
 
 #[async_trait::async_trait]
 impl Inputs for Database {
+	//
+	// Unbatched Measurements Queue
+	//
+
+	/// Enqueue a measurement timestamp as unbatched (to be included in future batch creation)
+	async fn enqueue_unbatched_measurement(&self, aspect_id: &AspectId, data_timestamp: chrono::DateTime<chrono::Utc>) -> Result<()> {
+		self.enqueue_unbatched_measurements(aspect_id, &[data_timestamp]).await
+	}
+
+	/// Enqueue multiple measurement timestamps as unbatched (bulk insert with INSERT OR IGNORE for deduplication)
+	async fn enqueue_unbatched_measurements(&self, aspect_id: &AspectId, data_timestamps: &[chrono::DateTime<chrono::Utc>]) -> Result<()> {
+		if data_timestamps.is_empty() {
+			return Ok(());
+		}
+
+		let metadata_db = self.metadata();
+		let metadata_db_path = self.metadata_path();
+		let conn = Self::begin_concurrent(metadata_db, metadata_db_path, Some(self.cache.clone())).await?;
+
+		// Process in chunks to avoid SQLite variable limits
+		let chunk_size = 500;
+		let aspect_id_str = aspect_id.as_uuid().to_string();
+		let queued_at = chrono::Utc::now().timestamp_millis();
+
+		for chunk in data_timestamps.chunks(chunk_size) {
+			let placeholder = "(?, ?, ?)";
+			let placeholders: Vec<&str> = (0..chunk.len()).map(|_| placeholder).collect();
+			// Use INSERT OR IGNORE to deduplicate (aspect_id + data_timestamp combo)
+			let bulk_sql = format!("INSERT OR IGNORE INTO unbatched_measurements (aspect_id, data_timestamp, queued_at) VALUES {}", placeholders.join(", "));
+
+			let mut params: Vec<String> = Vec::with_capacity(chunk.len() * 3);
+			for ts in chunk {
+				params.push(aspect_id_str.clone());
+				params.push(ts.timestamp_millis().to_string());
+				params.push(queued_at.to_string());
+			}
+
+			let res = conn.as_ref().execute(&bulk_sql, turso::params_from_iter(params)).await;
+			if let Err(e) = res {
+				Self::rollback_concurrent(&conn).await?;
+				return Err(anyhow::anyhow!("Failed to enqueue unbatched measurements: {e}"));
+			}
+		}
+
+		let _ = Self::commit_concurrent(&conn).await;
+		Ok(())
+	}
+
+	/// Dequeue unbatched measurements after they have been included in batches
+	async fn dequeue_unbatched_measurements(&self, aspect_id: &AspectId, data_timestamps: &[chrono::DateTime<chrono::Utc>]) -> Result<()> {
+		if data_timestamps.is_empty() {
+			return Ok(());
+		}
+
+		let metadata_db = self.metadata();
+		let metadata_db_path = self.metadata_path();
+		let conn = Self::begin_concurrent(metadata_db, metadata_db_path, Some(self.cache.clone())).await?;
+
+		// Process in chunks to avoid SQLite variable limits
+		let chunk_size = 500;
+		let aspect_id_str = aspect_id.as_uuid().to_string();
+
+		for chunk in data_timestamps.chunks(chunk_size) {
+			let placeholders: Vec<&str> = (0..chunk.len()).map(|_| "?").collect();
+			let delete_sql = format!("DELETE FROM unbatched_measurements WHERE aspect_id = ? AND data_timestamp IN ({})", placeholders.join(", "));
+
+			let mut params: Vec<String> = Vec::with_capacity(chunk.len() + 1);
+			params.push(aspect_id_str.clone());
+			for ts in chunk {
+				params.push(ts.timestamp_millis().to_string());
+			}
+
+			let res = conn.as_ref().execute(&delete_sql, turso::params_from_iter(params)).await;
+			if let Err(e) = res {
+				Self::rollback_concurrent(&conn).await?;
+				return Err(anyhow::anyhow!("Failed to dequeue unbatched measurements: {e}"));
+			}
+		}
+
+		let _ = Self::commit_concurrent(&conn).await;
+		Ok(())
+	}
+
+	/// Clear all unbatched measurements for an aspect
+	async fn clear_unbatched_measurements(&self, aspect_id: &AspectId) -> Result<()> {
+		let metadata_db = self.metadata();
+		let metadata_db_path = self.metadata_path();
+		let conn = Self::begin_concurrent(metadata_db, metadata_db_path, Some(self.cache.clone())).await?;
+
+		let delete_sql = "DELETE FROM unbatched_measurements WHERE aspect_id = ?";
+		let res = conn.as_ref().execute(delete_sql, turso::params![aspect_id.as_uuid().to_string()]).await;
+		match res {
+			Ok(_) => tracing::debug!("Cleared all unbatched measurements for aspect {aspect_id}"),
+			Err(e) => {
+				Self::rollback_concurrent(&conn).await?;
+				return Err(anyhow::anyhow!("Failed to clear unbatched measurements: {e}"));
+			}
+		}
+
+		let _ = Self::commit_concurrent(&conn).await;
+		Ok(())
+	}
+
 	/// Capture a new measurement for a given aspect
 	/// If a measurement with the same timestamp already exists, the average of the two values is stored.
 	/// Uses Turso's concurrent writes feature for better performance and conflict resolution.
+	/// Also enqueues the measurement timestamp for incremental batch processing.
 	///
 	/// # Errors
 	/// - if aspect not found
@@ -23,6 +127,7 @@ impl Inputs for Database {
 		let tx_id = TxId::new();
 
 		let measurement = Measurement::from_input_measurement(dataset_id, input_measurement);
+		let data_timestamp = measurement.timestamp();
 
 		// Simple INSERT - no unique constraints with MVCC, duplicates handled at app level
 		let insert_sql = r"
@@ -46,18 +151,23 @@ impl Inputs for Database {
 		// Checkpoint WAL to ensure measurement is persisted
 		Self::checkpoint_wal(&db).await?;
 
+		// Enqueue measurement for incremental batch processing
+		self.enqueue_unbatched_measurement(aspect_id, data_timestamp).await?;
+
 		self.record_transaction(&format!("Captured measurement at {} with value {} for dataset {}", measurement.timestamp(), measurement.value(), dataset_id)).await
 	}
 
 	/// Capture new measurements for a given aspect
 	/// Simple INSERT - duplicates handled at application level
 	/// Uses Turso's concurrent writes feature for better performance.
+	/// Also enqueues the measurement timestamp for incremental batch processing.
 	async fn capture_new_measurement(&self, aspect_id: &AspectId, dataset_id: &DatasetId, input_measurement: &InputMeasurement) -> Result<TxId> {
 		let db = self.get_measurement_db(aspect_id).await?;
 		let db_path = self.get_measurement_db_path(aspect_id).await?;
 		let tx_id = TxId::new();
 
 		let measurement = Measurement::from_input_measurement(dataset_id, input_measurement);
+		let data_timestamp = measurement.timestamp();
 
 		// Simple INSERT - no unique constraints with MVCC
 		let insert_sql = r"
@@ -79,6 +189,9 @@ impl Inputs for Database {
 
 		// Checkpoint WAL to ensure measurement is persisted
 		Self::checkpoint_wal(&db).await?;
+
+		// Enqueue measurement for incremental batch processing
+		self.enqueue_unbatched_measurement(aspect_id, data_timestamp).await?;
 
 		self.record_transaction(&format!("Inserted new measurement at {} for dataset {}", measurement.timestamp(), dataset_id)).await
 	}
@@ -184,6 +297,10 @@ impl Inputs for Database {
 		// Final checkpoint with TRUNCATE to ensure data is written to main database file
 		Self::checkpoint_wal(&db).await?;
 
+		// Enqueue all measurement timestamps for incremental batch processing
+		let all_timestamps: Vec<chrono::DateTime<chrono::Utc>> = input_measurements.iter().map(InputMeasurement::timestamp).collect();
+		self.enqueue_unbatched_measurements(&aspect_id, &all_timestamps).await?;
+
 		// Update earliest and latest in metadata
 		self.update_aspect_timestamps(&aspect_id, min_new, max_new).await?;
 		Ok(all_tx_ids)
@@ -230,6 +347,10 @@ impl Inputs for Database {
 
 		let _ = Self::commit_concurrent(&conn).await;
 
+		// Enqueue all measurement timestamps for incremental batch processing
+		let chunk_timestamps: Vec<chrono::DateTime<chrono::Utc>> = chunk.iter().map(InputMeasurement::timestamp).collect();
+		self.enqueue_unbatched_measurements(aspect_id, &chunk_timestamps).await?;
+
 		Ok(chunk_tx_ids)
 	}
 
@@ -245,8 +366,9 @@ impl Inputs for Database {
 	}
 
 	/// Capture new measurement chunk (implement missing trait method - simple loop)
-	async fn capture_new_measurement_chunk(&self, db: &turso::Database, db_path: &str, dataset_id: &DatasetId, chunk: &[InputMeasurement], all_tx_ids: &[TxId], tx_id_offset: usize) -> Result<Vec<TxId>> {
+	async fn capture_new_measurement_chunk(&self, aspect_id: &AspectId, db: &turso::Database, db_path: &str, dataset_id: &DatasetId, chunk: &[InputMeasurement], all_tx_ids: &[TxId], tx_id_offset: usize) -> Result<Vec<TxId>> {
 		let mut successful = Vec::new();
+		let mut successful_timestamps = Vec::new();
 		for (i, m) in chunk.iter().enumerate() {
 			let tx_id = &all_tx_ids[tx_id_offset + i];
 			let measurement = Measurement::from_input_measurement(dataset_id, m);
@@ -262,6 +384,7 @@ impl Inputs for Database {
 				Ok(rows) => {
 					tracing::debug!("Inserted measurement for tx_id {tx_id}: {rows} rows affected");
 					successful.push(*tx_id);
+					successful_timestamps.push(m.timestamp());
 				}
 				Err(e) => {
 					Self::rollback_concurrent(&conn).await?;
@@ -270,6 +393,11 @@ impl Inputs for Database {
 			}
 
 			let _ = Self::commit_concurrent(&conn).await;
+		}
+
+		// Enqueue all successfully inserted measurement timestamps for incremental batch processing
+		if !successful_timestamps.is_empty() {
+			self.enqueue_unbatched_measurements(aspect_id, &successful_timestamps).await?;
 		}
 
 		Ok(successful)
@@ -316,11 +444,11 @@ impl Inputs for Database {
 		let total = batches.len();
 		let mut tx_ids = Vec::with_capacity(total);
 		let report_interval = std::cmp::max(1000, total / 10); // Report every 1000 or 10% (whichever is larger)
-		
+
 		for (i, b) in batches.into_iter().enumerate() {
 			let tx = self.insert_unprocessed_batch(aspect_id, &b).await?;
 			tx_ids.push(tx);
-			
+
 			// Report progress intermittently
 			if (i + 1) % report_interval == 0 || i + 1 == total {
 				tracing::debug!("Inserted unprocessed batches: {}/{}", i + 1, total);
@@ -455,11 +583,11 @@ impl Inputs for Database {
 		let total = batches.len();
 		let mut tx_ids = Vec::with_capacity(total);
 		let report_interval = std::cmp::max(1000, total / 10); // Report every 1000 or 10% (whichever is larger)
-		
+
 		for (i, b) in batches.into_iter().enumerate() {
 			let tx = self.insert_processed_batch(aspect_id, &b).await?;
 			tx_ids.push(tx);
-			
+
 			// Report progress intermittently
 			if (i + 1) % report_interval == 0 || i + 1 == total {
 				tracing::debug!("Inserted processed batches: {}/{}", i + 1, total);
@@ -505,8 +633,7 @@ impl Inputs for Database {
 			let delete_sql = format!("DELETE FROM batches WHERE id IN ({})", placeholders.join(", "));
 
 			let params: Vec<String> = sub_chunk.iter().map(std::string::ToString::to_string).collect();
-			conn.as_ref().execute(&delete_sql, turso::params_from_iter(params)).await
-				.map_err(|e| Error::DatabaseError(format!("Failed to bulk delete processed batches: {e}")))?;
+			conn.as_ref().execute(&delete_sql, turso::params_from_iter(params)).await.map_err(|e| Error::DatabaseError(format!("Failed to bulk delete processed batches: {e}")))?;
 		}
 
 		let _ = Self::commit_concurrent(&conn).await;
@@ -579,10 +706,7 @@ impl Inputs for Database {
 		for sub_chunk in batches.chunks(sub_chunk_size) {
 			let placeholder = "(?, ?, ?, ?, ?, ?, ?, ?, ?)";
 			let placeholders: Vec<&str> = (0..sub_chunk.len()).map(|_| placeholder).collect();
-			let bulk_sql = format!(
-				"INSERT INTO batches (id, aspect_id, database_id, size, resolution, measurements, batch_hash, status, created_at) VALUES {}",
-				placeholders.join(", ")
-			);
+			let bulk_sql = format!("INSERT INTO batches (id, aspect_id, database_id, size, resolution, measurements, batch_hash, status, created_at) VALUES {}", placeholders.join(", "));
 
 			let mut params: Vec<String> = Vec::with_capacity(sub_chunk.len() * 9);
 			for batch in sub_chunk {
@@ -601,8 +725,7 @@ impl Inputs for Database {
 				params.push(now.to_string());
 			}
 
-			conn.as_ref().execute(&bulk_sql, turso::params_from_iter(params)).await
-				.map_err(|e| Error::DatabaseError(format!("Failed to bulk insert processed batches: {e}")))?;
+			conn.as_ref().execute(&bulk_sql, turso::params_from_iter(params)).await.map_err(|e| Error::DatabaseError(format!("Failed to bulk insert processed batches: {e}")))?;
 		}
 
 		let _ = Self::commit_concurrent(&conn).await;
@@ -626,8 +749,7 @@ impl Inputs for Database {
 			let delete_sql = format!("DELETE FROM batches WHERE id IN ({})", placeholders.join(", "));
 
 			let params: Vec<String> = sub_chunk.iter().map(std::string::ToString::to_string).collect();
-			conn.as_ref().execute(&delete_sql, turso::params_from_iter(params)).await
-				.map_err(|e| Error::DatabaseError(format!("Failed to bulk delete unprocessed batches: {e}")))?;
+			conn.as_ref().execute(&delete_sql, turso::params_from_iter(params)).await.map_err(|e| Error::DatabaseError(format!("Failed to bulk delete unprocessed batches: {e}")))?;
 		}
 
 		let _ = Self::commit_concurrent(&conn).await;
@@ -865,33 +987,53 @@ impl Inputs for Database {
 
 		// Ensure dictionary tables exist (create if not exists)
 		// Note: No PRIMARY KEY on TEXT columns or indexes to support MVCC
-		conn.as_ref().execute(r"CREATE TABLE IF NOT EXISTS dictionary_metadata (
+		conn.as_ref()
+			.execute(
+				r"CREATE TABLE IF NOT EXISTS dictionary_metadata (
 			id TEXT NOT NULL,
 			name TEXT NOT NULL,
 			description TEXT,
 			created_at INTEGER NOT NULL
-		)", turso::params![]).await?;
+		)",
+				turso::params![],
+			)
+			.await?;
 
-		conn.as_ref().execute(r"CREATE TABLE IF NOT EXISTS dictionary_constraints (
+		conn.as_ref()
+			.execute(
+				r"CREATE TABLE IF NOT EXISTS dictionary_constraints (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			dictionary_id TEXT NOT NULL,
 			steps_count INTEGER,
 			steps_interpolation TEXT
-		)", turso::params![]).await?;
+		)",
+				turso::params![],
+			)
+			.await?;
 
-		conn.as_ref().execute(r"CREATE TABLE IF NOT EXISTS dictionary_variabilities (
+		conn.as_ref()
+			.execute(
+				r"CREATE TABLE IF NOT EXISTS dictionary_variabilities (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			dictionary_id TEXT NOT NULL,
 			variability_type TEXT NOT NULL,
 			variability_value TEXT NOT NULL
-		)", turso::params![]).await?;
+		)",
+				turso::params![],
+			)
+			.await?;
 
-		conn.as_ref().execute(r"CREATE TABLE IF NOT EXISTS dictionary_patterns (
+		conn.as_ref()
+			.execute(
+				r"CREATE TABLE IF NOT EXISTS dictionary_patterns (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			dictionary_id TEXT NOT NULL,
 			pattern_id TEXT NOT NULL,
 			added_at INTEGER NOT NULL
-		)", turso::params![]).await?;
+		)",
+				turso::params![],
+			)
+			.await?;
 
 		// Insert dictionary metadata (no ON CONFLICT since no unique constraint - app handles duplicates)
 		let insert_sql = r"INSERT INTO dictionary_metadata (id, name, description, created_at) VALUES (?, ?, ?, ?)";

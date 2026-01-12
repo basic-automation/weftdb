@@ -1,4 +1,5 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 
 use crate::{cache::Connection, AspectId, Batch, BatchId, Correlation, CorrelationID, DatasetId, DictionaryMetadata, Event, EventID, InputMeasurement, Pattern, PatternID, TxId};
 
@@ -7,7 +8,24 @@ use crate::{cache::Connection, AspectId, Batch, BatchId, Correlation, Correlatio
 ///
 /// Add a Subject for observation -> track various aspects of the subject
 #[async_trait::async_trait]
+#[allow(clippy::too_many_arguments)]
 pub trait Inputs {
+	//
+	// Unbatched Measurements Queue
+	//
+
+	/// Enqueue a measurement timestamp as unbatched (to be included in future batch creation)
+	async fn enqueue_unbatched_measurement(&self, aspect_id: &AspectId, data_timestamp: DateTime<Utc>) -> Result<()>;
+
+	/// Enqueue multiple measurement timestamps as unbatched (bulk insert)
+	async fn enqueue_unbatched_measurements(&self, aspect_id: &AspectId, data_timestamps: &[DateTime<Utc>]) -> Result<()>;
+
+	/// Dequeue unbatched measurements after they have been included in batches
+	async fn dequeue_unbatched_measurements(&self, aspect_id: &AspectId, data_timestamps: &[DateTime<Utc>]) -> Result<()>;
+
+	/// Clear all unbatched measurements for an aspect
+	async fn clear_unbatched_measurements(&self, aspect_id: &AspectId) -> Result<()>;
+
 	//
 	// Measurements
 	//
@@ -32,7 +50,7 @@ pub trait Inputs {
 	async fn batch_capture_new_measurements(&self, aspect_id: &AspectId, dataset_id: &DatasetId, input_measurements: Vec<InputMeasurement>) -> Result<Vec<TxId>>;
 
 	/// Capture a chunk of new measurements with batch processing
-	async fn capture_new_measurement_chunk(&self, db: &turso::Database, db_path: &str, dataset_id: &DatasetId, chunk: &[InputMeasurement], all_tx_ids: &[TxId], tx_id_offset: usize) -> Result<Vec<TxId>>;
+	async fn capture_new_measurement_chunk(&self, aspect_id: &AspectId, db: &turso::Database, db_path: &str, dataset_id: &DatasetId, chunk: &[InputMeasurement], all_tx_ids: &[TxId], tx_id_offset: usize) -> Result<Vec<TxId>>;
 
 	//
 	// Unprocessed Batches

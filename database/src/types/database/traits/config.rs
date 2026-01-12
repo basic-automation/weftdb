@@ -30,6 +30,8 @@ pub trait Config {
 
 	fn aspect_correlations_db_path(db_name: &str, subject_name: &str, aspect_name: &str) -> String;
 
+	fn aspect_pipeline_db_path(db_name: &str, subject_name: &str, aspect_name: &str) -> String;
+
 	fn aspect_dictionaries_path(db_name: &str, subject_name: &str, aspect_name: &str) -> String;
 
 	fn aspect_dictionaries_db_path(db_name: &str, subject_name: &str, aspect_name: &str, dictionary_name: &str) -> String;

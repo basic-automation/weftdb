@@ -25,12 +25,24 @@ static CONNECTION_DATABASES: LazyLock<Arc<Mutex<HashMap<String, turso::Database>
 
 pub use config::DEFAULT_DATA_DIR;
 
+/// Clear all cached connections that contain the given name in their path.
+/// This is useful for test cleanup to ensure database connections are released
+/// before deleting the database files.
+pub async fn clear_connection_cache_by_name(name: &str) {
+	let mut cache = CONNECTION_DATABASES.lock().await;
+	let keys_to_remove: Vec<_> = cache.keys().filter(|path| path.contains(name)).cloned().collect();
+	for key in keys_to_remove {
+		cache.remove(&key);
+	}
+}
+
 pub mod config;
 pub mod connection;
 pub mod helpers;
 pub mod inputs;
 pub mod navigation;
 pub mod outputs;
+pub mod pipeline;
 pub mod traits;
 
 #[derive(Debug, Clone)]
@@ -63,7 +75,7 @@ impl DatabaseStructure for Database {
 			// The turso MVCC mode can leave behind log files that cause permission errors on Windows
 			let log_path = format!("{db_path}-log");
 			let wal_path = format!("{db_path}-wal");
-			
+
 			// Remove stale MVCC log files if they exist (they cause permission errors on reopening)
 			if Path::new(&log_path).exists() {
 				match std::fs::remove_file(&log_path) {
@@ -78,7 +90,7 @@ impl DatabaseStructure for Database {
 					Err(e) => tracing::warn!("Could not remove WAL file {}: {}", wal_path, e),
 				}
 			}
-			
+
 			// Open database (MVCC is now enabled via PRAGMA journal_mode=experimental_mvcc in 0.4.0)
 			let turso_db = Builder::new_local(db_path).build().await?;
 
@@ -94,7 +106,7 @@ impl DatabaseStructure for Database {
 
 				// Optimize for concurrent access
 				conn.execute("PRAGMA synchronous = NORMAL", turso::params![]).await.ok();
-				
+
 				// Explicitly drop connection to ensure it's closed
 				drop(conn);
 			}
@@ -122,7 +134,7 @@ impl DatabaseStructure for Database {
 
 		// Configure database for MVCC concurrent writes (enables MVCC via PRAGMA)
 		Self::configure_database_for_mvcc(&turso_db).await?;
-		
+
 		// Allow connection to fully close before returning
 		tokio::task::yield_now().await;
 
@@ -370,7 +382,7 @@ impl DatabaseStructure for Database {
 
 		// Now use BEGIN CONCURRENT for data operations (INSERT)
 		let conn = Self::begin_concurrent(&metadata_turso_db, &metadata_db_path, None).await?;
-		
+
 		// Insert database metadata using concurrent-safe transaction pattern
 		tracing::debug!("Inserting database metadata...");
 
@@ -1299,7 +1311,7 @@ impl Database {
 	/// Note: Tables have no indexes to support MVCC (turso MVCC doesn't support indexes yet)
 	async fn wireframe_metadata_database_direct(conn: &turso::Connection) -> Result<Vec<Transaction>> {
 		tracing::debug!("Connecting to database for table creation...");
-		
+
 		tracing::debug!("Creating transactions table...");
 		conn.execute(
 			r"CREATE TABLE IF NOT EXISTS transactions (
@@ -1308,9 +1320,11 @@ impl Database {
 				created_at INTEGER NOT NULL
 			)",
 			turso::params![],
-		).await.map_err(|e| anyhow::anyhow!("Failed to create transactions table: {e}"))?;
+		)
+		.await
+		.map_err(|e| anyhow::anyhow!("Failed to create transactions table: {e}"))?;
 		tracing::debug!("Transactions table created");
-		
+
 		tracing::debug!("Creating database table...");
 		conn.execute(
 			r"CREATE TABLE IF NOT EXISTS database (
@@ -1320,9 +1334,11 @@ impl Database {
 				metadata_path TEXT NOT NULL
 			)",
 			turso::params![],
-		).await.map_err(|e| anyhow::anyhow!("Failed to create database table: {e}"))?;
+		)
+		.await
+		.map_err(|e| anyhow::anyhow!("Failed to create database table: {e}"))?;
 		tracing::debug!("Database table created");
-		
+
 		tracing::debug!("Creating subjects table...");
 		conn.execute(
 			r"CREATE TABLE IF NOT EXISTS subjects (
@@ -1332,9 +1348,11 @@ impl Database {
 				created_at INTEGER NOT NULL
 			)",
 			turso::params![],
-		).await.map_err(|e| anyhow::anyhow!("Failed to create subjects table: {e}"))?;
+		)
+		.await
+		.map_err(|e| anyhow::anyhow!("Failed to create subjects table: {e}"))?;
 		tracing::debug!("Subjects table created");
-		
+
 		tracing::debug!("Creating aspects table...");
 		conn.execute(
 			r"CREATE TABLE IF NOT EXISTS aspects (
@@ -1349,15 +1367,28 @@ impl Database {
 				latest_measurement TEXT
 			)",
 			turso::params![],
-		).await.map_err(|e| anyhow::anyhow!("Failed to create aspects table: {e}"))?;
+		)
+		.await
+		.map_err(|e| anyhow::anyhow!("Failed to create aspects table: {e}"))?;
+		tracing::debug!("Aspects table created");
+
+		tracing::debug!("Creating unbatched_measurements table...");
+		conn.execute(
+			r"CREATE TABLE IF NOT EXISTS unbatched_measurements (
+				aspect_id TEXT NOT NULL,
+				data_timestamp INTEGER NOT NULL,
+				queued_at INTEGER NOT NULL,
+				UNIQUE(aspect_id, data_timestamp)
+			)",
+			turso::params![],
+		)
+		.await
+		.map_err(|e| anyhow::anyhow!("Failed to create unbatched_measurements table: {e}"))?;
+		tracing::debug!("Unbatched measurements table created");
+
 		tracing::debug!("All tables created successfully");
 
-		Ok(vec![
-			Transaction::new(None, "Create transactions table".to_string()),
-			Transaction::new(None, "Create database table".to_string()),
-			Transaction::new(None, "Create subjects table".to_string()),
-			Transaction::new(None, "Create aspects table".to_string()),
-		])
+		Ok(vec![Transaction::new(None, "Create transactions table".to_string()), Transaction::new(None, "Create database table".to_string()), Transaction::new(None, "Create subjects table".to_string()), Transaction::new(None, "Create aspects table".to_string()), Transaction::new(None, "Create unbatched_measurements table".to_string())])
 	}
 }
 

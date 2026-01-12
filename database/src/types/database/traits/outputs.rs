@@ -10,6 +10,22 @@ use crate::{AspectId, Batch, BatchId, Correlation, CorrelationID, DictionaryMeta
 /// Trait for database analysis and output operations
 #[async_trait::async_trait]
 pub trait Outputs {
+	//
+	// Unbatched Measurements Queue
+	//
+
+	/// Get all unbatched measurement timestamps for an aspect (measurements not yet included in batches)
+	async fn get_unbatched_measurements(&self, aspect_id: &AspectId) -> Result<Vec<DateTime<Utc>>>;
+
+	/// Count unbatched measurements for an aspect
+	async fn count_unbatched_measurements(&self, aspect_id: &AspectId) -> Result<u64>;
+
+	/// Count unprocessed batches for an aspect
+	async fn count_unprocessed_batches(&self, aspect_id: &AspectId) -> Result<u64>;
+
+	/// Count processed batches for an aspect
+	async fn count_processed_batches(&self, aspect_id: &AspectId) -> Result<u64>;
+
 	// Measurements
 
 	async fn analyze_point(&self, aspect_id: &AspectId, time: DateTime<Utc>, resolution: &Resolution, method: &Spline) -> Result<Point>;
