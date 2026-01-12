@@ -5,7 +5,7 @@ pub use batches::{
 pub use cache::{AnalysisResult, Cacheable, Connection, DatabaseCache};
 pub use correlation::{Correlation, CorrelationID, Correlations};
 pub use database::{
-	traits::{Config, DatabaseStructure, EventDatabase, Outputs, PatternDatabase}, Database, DatabaseId, DatabaseInfo, DatabaseMap, DATABASES, DEFAULT_DATA_DIR
+	clear_connection_cache_by_name, traits::{Config, DatabaseStructure, EventDatabase, Outputs, PatternDatabase, PipelineInputs, PipelineOutputs}, Database, DatabaseId, DatabaseInfo, DatabaseMap, DATABASES, DEFAULT_DATA_DIR
 };
 pub use dataset::{Dataset, DatasetId};
 pub use dictionary::{Dictionary, DictionaryConstraints, DictionaryId, DictionaryMetadata, Steps, Variability, VariablilityType};
@@ -15,6 +15,7 @@ pub use measurement::{Measurement, MeasurementId};
 pub use measurement_vector::MeasurementVector;
 pub use occurrence::Occurrence;
 pub use pattern::{Pattern, PatternID};
+pub use pipeline::{DetectorMetadata, DetectorType, PipelineConfig, PipelineState};
 pub use relative::Relative;
 pub use signal::{Distance, ErrVal, Signal, SignalType, Signals};
 pub use subject::{Subject, SubjectId};
@@ -35,6 +36,7 @@ pub mod measurement;
 pub mod measurement_vector;
 pub mod occurrence;
 pub mod pattern;
+pub mod pipeline;
 pub mod relative;
 pub mod signal;
 pub mod subject;

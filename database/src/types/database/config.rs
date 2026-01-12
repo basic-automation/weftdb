@@ -15,6 +15,7 @@ static EVENTS_DB_FILENAME: &str = "events.db";
 static UNPROCESSED_EVENTS_DB_FILENAME: &str = "unprocessed_events.db";
 static PROCESSED_EVENTS_DB_FILENAME: &str = "processed_events.db";
 static CORRELATIONS_DB_FILENAME: &str = "correlations.db";
+static PIPELINE_DB_FILENAME: &str = "pipeline.db";
 static DICTIONARIES_DB_FOLDERNAME: &str = "dictionaries";
 
 // Default data directory - can be overridden with environment variable
@@ -90,6 +91,12 @@ impl Config for Database {
 	fn aspect_correlations_db_path(db_name: &str, subject_name: &str, aspect_name: &str) -> String {
 		let mut db_path: PathBuf = Self::aspect_path(db_name, subject_name, aspect_name).into();
 		db_path.push(CORRELATIONS_DB_FILENAME);
+		db_path.to_string_lossy().to_string()
+	}
+
+	fn aspect_pipeline_db_path(db_name: &str, subject_name: &str, aspect_name: &str) -> String {
+		let mut db_path: PathBuf = Self::aspect_path(db_name, subject_name, aspect_name).into();
+		db_path.push(PIPELINE_DB_FILENAME);
 		db_path.to_string_lossy().to_string()
 	}
 

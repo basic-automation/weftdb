@@ -7,6 +7,7 @@ pub mod inputs;
 pub mod modifiers;
 pub mod outputs;
 pub mod pattern_database;
+pub mod pipeline;
 
 pub use aspect_structure::AspectStructure;
 pub use config::Config;
@@ -17,3 +18,4 @@ pub use inputs::Inputs;
 pub use modifiers::Modifiers;
 pub use outputs::Outputs;
 pub use pattern_database::PatternDatabase;
+pub use pipeline::{PipelineInputs, PipelineOutputs};

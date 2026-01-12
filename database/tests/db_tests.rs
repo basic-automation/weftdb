@@ -6,6 +6,7 @@ use bigdecimal::BigDecimal;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use database::{database::traits::DatabaseStructure, Aspect, Config, Database, DatasetId, InputMeasurement, Outputs, Subject, DATABASES};
 use rayon::prelude::*;
+use serial_test::serial;
 use splimes::{Resolution, Spline};
 #[cfg(test)]
 use tempfile::TempDir;
@@ -39,6 +40,7 @@ async fn add_test_measurements(db: &Database, aspect: &Aspect, base_time: DateTi
 }
 
 #[tokio::test]
+#[serial]
 async fn test_analyze_point_basic_interpolation() -> Result<()> {
 	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?; // Changed variable name
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -58,6 +60,7 @@ async fn test_analyze_point_basic_interpolation() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_analyze_point_extrapolation_forward() -> Result<()> {
 	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -75,6 +78,7 @@ async fn test_analyze_point_extrapolation_forward() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_analyze_point_extrapolation_backward() -> Result<()> {
 	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -92,6 +96,7 @@ async fn test_analyze_point_extrapolation_backward() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_analyze_point_exact_match() -> Result<()> {
 	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -129,6 +134,7 @@ async fn test_analyze_point_exact_match() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_analyze_point_cache_hit() -> Result<()> {
 	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -150,6 +156,7 @@ async fn test_analyze_point_cache_hit() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_analyze_point_different_resolutions() -> Result<()> {
 	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -170,6 +177,7 @@ async fn test_analyze_point_different_resolutions() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_analyze_point_no_measurements_error() -> Result<()> {
 	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
 	let query_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -182,6 +190,7 @@ async fn test_analyze_point_no_measurements_error() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_analyze_point_invalid_aspect_error() -> Result<()> {
 	let temp_dir = tempfile::tempdir()?;
 	// Override the data directory for this test
@@ -205,6 +214,7 @@ async fn test_analyze_point_invalid_aspect_error() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_analyze_point_single_measurement() -> Result<()> {
 	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -242,6 +252,7 @@ async fn test_analyze_point_single_measurement() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_analyze_point_large_time_gap() -> Result<()> {
 	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -275,6 +286,7 @@ async fn test_analyze_point_large_time_gap() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_analyze_point_time_boundary_conditions() -> Result<()> {
 	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -302,6 +314,7 @@ async fn test_analyze_point_time_boundary_conditions() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_analyze_point_cache_invalidation() -> Result<()> {
 	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -334,6 +347,7 @@ async fn test_analyze_point_cache_invalidation() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_analyze_point_concurrent_access() -> Result<()> {
 	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -372,6 +386,7 @@ async fn test_analyze_point_concurrent_access() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_analyze_point_precision_boundaries() -> Result<()> {
 	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -425,16 +440,14 @@ fn convert_unix_timestamp_to_datetime_utc(timestamp_seconds: f64) -> Option<Date
 
 /// load BTC 1-minute data into a test database for use in other tests
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 #[instrument]
 async fn test_create_btc_1min_database() -> Result<()> {
 	// Initialize tracing subscriber for this test
 	// Filter out verbose turso_core logs that slow down execution
 	use tracing_subscriber::EnvFilter;
 	let filter = EnvFilter::new("debug,turso_core=warn");
-	let _subscriber = tracing_subscriber::fmt()
-		.with_env_filter(filter)
-		.with_test_writer()
-		.try_init();
+	let _subscriber = tracing_subscriber::fmt().with_env_filter(filter).with_test_writer().try_init();
 
 	// This test creates a database with BTC 1-minute data
 	// Note: This requires the CSV file to be present

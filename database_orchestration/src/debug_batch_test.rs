@@ -1,6 +1,4 @@
 // Debug test to examine batch processing issue
-use tokio::fs::remove_dir_all;
-
 use ::database::database::traits::{AspectStructure, Inputs, Outputs};
 use anyhow::Result;
 use bigdecimal::BigDecimal;
@@ -10,6 +8,7 @@ use database::{
 };
 use futures::TryStreamExt;
 use splimes::{Resolution, Spline};
+use tokio::fs::remove_dir_all;
 
 use crate::batch_utils::build_unprocessed_queue;
 
