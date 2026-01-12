@@ -1,6 +1,6 @@
 use std::{fmt::Display, str::FromStr};
 
-use fake::{Fake, faker::lorem::en::Word};
+use fake::{faker::lorem::en::Word, Fake};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

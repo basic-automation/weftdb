@@ -133,6 +133,18 @@ pub trait AspectStructure {
 
 	async fn wireframe_correlations_tables(conn: &Connection) -> Result<()>;
 
+	/// get pipeline database
+	async fn pipeline(&mut self) -> Result<turso::Database>;
+
+	/// set pipeline database
+	fn set_pipeline(&mut self, turso_db: turso::Database);
+
+	fn pipeline_path(&self) -> String;
+
+	async fn set_pipeline_path(&mut self, path: String);
+
+	async fn wireframe_pipeline_tables(conn: &Connection) -> Result<()>;
+
 	async fn new_dictionary(&self, name: &str, description: &str, constraints: &DictionaryConstraints) -> Result<()>;
 
 	/// Get a dictionary database by name

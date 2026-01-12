@@ -12,7 +12,7 @@ impl Connection for Database {
 	/// Create a new database connection with MVCC concurrent transaction support
 	/// Each call creates a fresh connection with its own transaction - no caching at transaction level
 	/// to avoid transaction conflicts when multiple tasks use the same cached connection
-	/// 
+	///
 	/// Uses BEGIN CONCURRENT which requires MVCC to be enabled on the database (via `PRAGMA journal_mode=experimental_mvcc`)
 	async fn begin_concurrent(turso_db: &turso::Database, _cache_key: &str, _cache: Option<Arc<Mutex<DatabaseCache>>>) -> Result<cache::Connection> {
 		// Always create a new connection for each transaction to avoid conflicts
@@ -23,7 +23,7 @@ impl Connection for Database {
 		// Retry with exponential backoff on transient errors
 		let mut attempts = 0;
 		let max_attempts = 100; // ~30 seconds total with backoff
-		
+
 		loop {
 			match conn.execute("BEGIN CONCURRENT", turso::params![]).await {
 				Ok(_) => break,
@@ -85,7 +85,7 @@ impl Connection for Database {
 		// Retry with exponential backoff on transient errors
 		let mut attempts = 0;
 		let max_attempts = 100;
-		
+
 		loop {
 			match conn.execute("BEGIN IMMEDIATE", turso::params![]).await {
 				Ok(_) => break,
@@ -115,7 +115,7 @@ impl Connection for Database {
 	/// Uses PRAGMA `wal_checkpoint(TRUNCATE)` to checkpoint and truncate the WAL file.
 	async fn checkpoint_wal(turso_db: &turso::Database) -> Result<()> {
 		let conn = turso_db.connect()?;
-		
+
 		// TRUNCATE mode: checkpoint and truncate the WAL file
 		// This ensures all data is written to the main database file
 		// Use query() instead of execute() because PRAGMA wal_checkpoint returns rows
