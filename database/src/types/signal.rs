@@ -32,19 +32,15 @@ use crate::{
 ///   before `manifestation_id` in `sorted_midpoints`.
 /// - `None` if `manifestation_id` is not present in the index or if it is the first
 ///   entry in the slice (i.e., there is no previous manifestation).
-fn find_previous_manifestation_midpoint(
-	manifestation_id: &ManifestationId,
-	midpoint_index: &HashMap<ManifestationId, usize>,
-	sorted_midpoints: &[(ManifestationId, DateTime<Utc>)]
-) -> Option<DateTime<Utc>> {
+fn find_previous_manifestation_midpoint(manifestation_id: &ManifestationId, midpoint_index: &HashMap<ManifestationId, usize>, sorted_midpoints: &[(ManifestationId, DateTime<Utc>)]) -> Option<DateTime<Utc>> {
 	// O(1) lookup using the pre-built index
 	let idx = *midpoint_index.get(manifestation_id)?;
-	
+
 	// If it's the first manifestation, there's no previous one
 	if idx == 0 {
 		return None;
 	}
-	
+
 	// Return the previous manifestation's midpoint
 	Some(sorted_midpoints[idx - 1].1)
 }
@@ -52,22 +48,22 @@ fn find_previous_manifestation_midpoint(
 /// Builds an index mapping `ManifestationId` to its position in the sorted midpoints slice.
 /// This enables O(1) lookups instead of O(n) linear searches.
 fn build_midpoint_index(sorted_midpoints: &[(ManifestationId, DateTime<Utc>)]) -> HashMap<ManifestationId, usize> {
-	sorted_midpoints
-		.iter()
-		.enumerate()
-		.map(|(idx, (id, _))| (id.clone(), idx))
-		.collect()
+	sorted_midpoints.iter().enumerate().map(|(idx, (id, _))| (id.clone(), idx)).collect()
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum SignalType {
-	Custom(String),
+	PredictStart,
+	PredictMid,
+	PredictEnd,
 }
 
 impl std::fmt::Display for SignalType {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
-			Self::Custom(name) => write!(f, "Custom({name})"),
+			Self::PredictStart => write!(f, "Custom(PredictStart)"),
+			Self::PredictMid => write!(f, "Custom(PredictMid)"),
+			Self::PredictEnd => write!(f, "Custom(PredictEnd)"),
 		}
 	}
 }
@@ -76,12 +72,19 @@ impl FromStr for SignalType {
 	type Err = anyhow::Error;
 
 	fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-		s.strip_prefix("Custom(")
-			.and_then(|s| s.strip_suffix(')'))
-			.map_or_else(
-				|| Err(anyhow::anyhow!("Invalid SignalType: {s}")),
-				|name| Ok(Self::Custom(name.to_string()))
-			)
+		// Support both legacy "Custom(X)" and new "X" formats
+		let type_name = if let Some(name) = s.strip_prefix("Custom(").and_then(|s| s.strip_suffix(')')) {
+			name
+		} else {
+			s
+		};
+
+		match type_name {
+			"PredictStart" => Ok(Self::PredictStart),
+			"PredictMid" => Ok(Self::PredictMid),
+			"PredictEnd" => Ok(Self::PredictEnd),
+			_ => Err(anyhow::anyhow!("Invalid SignalType: {s}")),
+		}
 	}
 }
 
@@ -102,7 +105,7 @@ impl<'de> serde::Deserialize<'de> for SignalType {
 		D: serde::Deserializer<'de>,
 	{
 		let s = String::deserialize(deserializer)?;
-		s.strip_prefix("Custom(").and_then(|s| s.strip_suffix(')')).map_or_else(|| Err(serde::de::Error::custom(format!("Invalid SignalType: {s}"))), |name| Ok(Self::Custom(name.to_string())))
+		FromStr::from_str(&s).map_err(serde::de::Error::custom)
 	}
 }
 
@@ -312,7 +315,7 @@ impl Signal {
 	}
 
 	/// Probability of the signal at a given date using the correlation's `average_distance`.
-	/// 
+	///
 	/// Per documentation: probability = `time_elapsed` / `average_distance`
 	/// The signal represents a prediction starting at `manifestation_date`.
 	/// The curve passes through probability = 1 at time = `manifestation_date` + `average_distance`
@@ -344,7 +347,7 @@ impl Signal {
 
 		// Debug output disabled - uncomment for troubleshooting
 		// if count < 5 {
-		// 	println!("DEBUG probability_with_avg {}: manifestation_date={}, query_date={}, average_distance={} {:?}, time_elapsed={}, probability={}", 
+		// 	println!("DEBUG probability_with_avg {}: manifestation_date={}, query_date={}, average_distance={} {:?}, time_elapsed={}, probability={}",
 		// 		count, self.manifestation_date, date, average_distance.value(), average_distance.units(), time_elapsed, probability);
 		// }
 
@@ -500,7 +503,7 @@ impl Signals {
 			// We don't update error_rate here to avoid accumulation issues with the
 			// formula: New Error Rate = (Signal - 1) + Current Error Rate
 			// which would cause unbounded growth.
-			
+
 			// Just remove and return the signal
 			Ok(self.remove(&correlation_id, manifestation_id, signal_type))
 		} else {
@@ -510,7 +513,7 @@ impl Signals {
 
 	/// Calculate the sum of probabilities for all signals of a given event and signal type at a specific date
 	/// Uses the correlation's `average_distance` as per documentation: probability = `time_elapsed` / `average_distance`
-	/// 
+	///
 	/// Per documentation: Signal Sum = sum of all probabilities - `signal_sum_error_rate`
 	/// The `error_rate` is averaged across all contributing correlations and subtracted once from the sum.
 	///
@@ -519,28 +522,29 @@ impl Signals {
 	/// Returns an error if signal probability calculation fails for any signal.
 	#[allow(deprecated)]
 	pub async fn probability_sum(&self, event_id: &EventID, signal_type: &SignalType, date: DateTime<Utc>, database: &crate::Database, aspect_id: &AspectId) -> Result<Option<BigDecimal>> {
-		use futures::StreamExt;
 		use std::collections::HashSet;
-		
+
+		use futures::StreamExt;
+
 		let signals = self.get_by_event(event_id, signal_type);
 		if signals.is_empty() {
 			return Ok(None);
 		}
-		
+
 		// Load correlations once to lookup average_distance and error_rate
 		let correlations: Vec<Correlation> = database.get_correlations(aspect_id).await?.filter_map(|r| async { r.ok() }).collect().await;
-		
+
 		let mut prob = Vec::new();
 		let mut seen_correlations: HashSet<CorrelationID> = HashSet::new();
 		let mut total_error_rate = BigDecimal::zero();
 		let mut error_rate_count = 0usize;
-		
+
 		for s in &signals {
 			// Skip signals whose manifestation_date is in the future (not yet relevant)
 			if s.manifestation_date() > &date {
 				continue;
 			}
-			
+
 			// Find the correlation for this signal
 			if let Some(correlation) = correlations.iter().find(|c| c.id() == s.correlation_id()) {
 				// Use average_distance if available, otherwise fall back to individual distance + error_rate
@@ -552,12 +556,12 @@ impl Signals {
 					}
 					// Debug output disabled
 					// if debug_signal_count < 3 {
-					// 	println!("DEBUG prob_sum signal: manif_date={}, query_date={}, avg_dist={}, prob={}", 
+					// 	println!("DEBUG prob_sum signal: manif_date={}, query_date={}, avg_dist={}, prob={}",
 					// 		s.manifestation_date().format("%Y-%m-%d %H:%M"), date.format("%Y-%m-%d %H:%M"), avg_dist.value(), p);
 					// 	debug_signal_count += 1;
 					// }
 					prob.push(p);
-					
+
 					// Collect error rates from unique correlations only (not per-signal)
 					if !seen_correlations.contains(correlation.id()) {
 						seen_correlations.insert(correlation.id().clone());
@@ -573,7 +577,7 @@ impl Signals {
 					let p = s.probability(date, &error_rate)?;
 					if !p.is_zero() {
 						prob.push(p);
-						
+
 						if !seen_correlations.contains(correlation.id()) {
 							seen_correlations.insert(correlation.id().clone());
 							if let Some(err_rate) = correlation.get_error_rate(signal_type) {
@@ -585,18 +589,14 @@ impl Signals {
 				}
 			}
 		}
-		
+
 		if prob.is_empty() {
 			Ok(None)
 		} else {
 			let raw_sum: BigDecimal = prob.iter().cloned().fold(BigDecimal::zero(), |acc, x| acc + x);
 			// Apply error correction: Signal Sum = raw_sum - avg_error_rate
 			// Average the error rates from contributing correlations
-			let avg_error_rate = if error_rate_count > 0 {
-				&total_error_rate / &BigDecimal::from(error_rate_count as u64)
-			} else {
-				BigDecimal::zero()
-			};
+			let avg_error_rate = if error_rate_count > 0 { &total_error_rate / &BigDecimal::from(error_rate_count as u64) } else { BigDecimal::zero() };
 			let corrected_sum = &raw_sum - &avg_error_rate;
 			// Debug output disabled
 			// println!("DEBUG probability_sum: Using {} signals, raw_sum={}, avg_error_rate={}, corrected_sum={}", prob.len(), raw_sum, avg_error_rate, corrected_sum);
@@ -607,10 +607,10 @@ impl Signals {
 	/// Calculate the average probability for all signals of a given event and signal type at a specific date
 	/// Uses the correlation's `average_distance` as per documentation: probability = `time_elapsed` / `average_distance`
 	/// This provides a normalized probability value by averaging individual signal probabilities
-	/// 
+	///
 	/// Per documentation: Signal Average = average of all probabilities - `signal_avg_error_rate`
 	/// The `error_rate` is averaged across all unique contributing correlations and subtracted once.
-	/// 
+	///
 	/// The probability for each signal is calculated from the LAST KNOWN MANIFESTATION's midpoint,
 	/// not from the signal's `manifestation_date` (which is the pattern end time). This ensures
 	/// the signal-based probability matches the event-based probability calculation.
@@ -620,50 +620,48 @@ impl Signals {
 	/// Returns an error if signal probability calculation fails for any signal.
 	#[allow(deprecated)]
 	pub async fn probability_average(&self, event_id: &EventID, signal_type: &SignalType, date: DateTime<Utc>, database: &crate::Database, aspect_id: &AspectId) -> Result<Option<BigDecimal>> {
-		use futures::StreamExt;
 		use std::collections::HashSet;
-		
+
+		use futures::StreamExt;
+
 		let signals = self.get_by_event(event_id, signal_type);
 		if signals.is_empty() {
 			return Ok(None);
 		}
-		
+
 		// Load correlations once to lookup average_distance and error_rate
 		let correlations: Vec<Correlation> = database.get_correlations(aspect_id).await?.filter_map(|r| async { r.ok() }).collect().await;
-		
+
 		// Load the event to get manifestations for proper probability calculation
 		let events: Vec<Event> = database.get_unprocessed_events(aspect_id).await?.filter_map(|r| async { r.ok() }).collect().await;
 		let event = events.iter().find(|e| e.id() == event_id);
-		
+
 		// Build a sorted list of manifestation midpoints for looking up the previous manifestation
 		let manifestation_midpoints: Vec<(ManifestationId, DateTime<Utc>)> = event
 			.map(|e| {
-				let mut midpoints: Vec<_> = e.manifestations()
-					.iter()
-					.map(|(id, m)| (id.clone(), m.midpoint()))
-					.collect();
+				let mut midpoints: Vec<_> = e.manifestations().iter().map(|(id, m)| (id.clone(), m.midpoint())).collect();
 				midpoints.sort_by_key(|(_, midpoint)| *midpoint);
 				midpoints
 			})
 			.unwrap_or_default();
-		
+
 		// Build index for O(1) lookups instead of O(n) linear search per signal
 		let midpoint_index = build_midpoint_index(&manifestation_midpoints);
-		
+
 		// Get the last manifestation's midpoint as fallback for forward-looking signals
 		let last_manifestation_midpoint = manifestation_midpoints.last().map(|(_, midpoint)| *midpoint);
-		
+
 		let mut prob = Vec::new();
 		let mut seen_correlations: HashSet<CorrelationID> = HashSet::new();
 		let mut total_error_rate = BigDecimal::zero();
 		let mut error_rate_count = 0usize;
-		
+
 		for s in &signals {
 			// Skip signals whose manifestation_date is in the future (not yet relevant)
 			if s.manifestation_date() > &date {
 				continue;
 			}
-			
+
 			// Find the correlation for this signal
 			if let Some(correlation) = correlations.iter().find(|c| c.id() == s.correlation_id()) {
 				// Use average_distance if available, otherwise fall back to individual distance + error_rate
@@ -671,35 +669,29 @@ impl Signals {
 					// Find the previous manifestation's midpoint for this signal
 					// The signal's manifestation_id is the manifestation it PREDICTS
 					// We need to find the manifestation that occurred BEFORE it
-					let previous_midpoint = find_previous_manifestation_midpoint(
-						s.manifestation_id(),
-						&midpoint_index,
-						&manifestation_midpoints
-					);
-					
+					let previous_midpoint = find_previous_manifestation_midpoint(s.manifestation_id(), &midpoint_index, &manifestation_midpoints);
+
 					// Calculate probability from the previous manifestation's midpoint
 					// For historical signals: use the manifestation before the one being predicted
 					// For forward-looking signals (manifestation_id not found): use the last known manifestation
 					// Fallback to signal's manifestation_date only if no manifestation data exists
-					let reference_time = previous_midpoint
-						.or(last_manifestation_midpoint)
-						.unwrap_or_else(|| *s.manifestation_date());
-					
+					let reference_time = previous_midpoint.or(last_manifestation_midpoint).unwrap_or_else(|| *s.manifestation_date());
+
 					// Calculate time elapsed from reference point
 					let time_elapsed_i64 = avg_dist.units().difference(&date, &reference_time)?;
 					if time_elapsed_i64 <= 0 {
 						continue; // Not yet past the reference point
 					}
-					
+
 					let time_elapsed = BigDecimal::from(time_elapsed_i64);
 					let p = &time_elapsed / avg_dist.value();
-					
+
 					// Skip signals with zero probability
 					if p.is_zero() {
 						continue;
 					}
 					prob.push(p);
-					
+
 					// Collect error rates from unique correlations only (not per-signal)
 					if !seen_correlations.contains(correlation.id()) {
 						seen_correlations.insert(correlation.id().clone());
@@ -715,7 +707,7 @@ impl Signals {
 					let p = s.probability(date, &error_rate)?;
 					if !p.is_zero() {
 						prob.push(p);
-						
+
 						if !seen_correlations.contains(correlation.id()) {
 							seen_correlations.insert(correlation.id().clone());
 							if let Some(err_rate) = correlation.get_error_rate(signal_type) {
@@ -727,23 +719,19 @@ impl Signals {
 				}
 			}
 		}
-		
+
 		if prob.is_empty() {
 			Ok(None)
 		} else {
 			let sum: BigDecimal = prob.iter().cloned().fold(BigDecimal::zero(), |acc, x| acc + x);
 			let signal_count = BigDecimal::from(u64::try_from(prob.len()).unwrap_or(0));
 			let raw_average = &sum / &signal_count;
-			
+
 			// Apply error correction: Signal Average = raw_average - avg_error_rate
 			// The avg_error_rate is the average of error rates from unique contributing correlations
-			let avg_error_rate = if error_rate_count > 0 {
-				&total_error_rate / &BigDecimal::from(error_rate_count as u64)
-			} else {
-				BigDecimal::zero()
-			};
+			let avg_error_rate = if error_rate_count > 0 { &total_error_rate / &BigDecimal::from(error_rate_count as u64) } else { BigDecimal::zero() };
 			let corrected_average = &raw_average - &avg_error_rate;
-			
+
 			// Debug output disabled
 			// println!("DEBUG probability_average: Using {} signals, raw_average={}, avg_error_rate={}, corrected_average={}", prob.len(), raw_average, avg_error_rate, corrected_average);
 			Ok(Some(corrected_average))
@@ -751,7 +739,7 @@ impl Signals {
 	}
 
 	/// Calculates the event-based probability at a given time.
-	/// 
+	///
 	/// This function returns a single probability value based on time elapsed since the
 	/// **last manifestation** of the event, rather than averaging across individual signal
 	/// `manifestation_dates`.
@@ -772,74 +760,68 @@ impl Signals {
 	/// Returns an error if database operations fail.
 	pub async fn event_probability(&self, event_id: &EventID, signal_type: &SignalType, date: DateTime<Utc>, database: &crate::Database, aspect_id: &AspectId) -> Result<Option<BigDecimal>> {
 		use futures::StreamExt;
-		
+
 		let signals = self.get_by_event(event_id, signal_type);
 		if signals.is_empty() {
 			return Ok(None);
 		}
-		
+
 		// Load correlations to get average_distance
 		let correlations: Vec<Correlation> = database.get_correlations(aspect_id).await?.filter_map(|r| async { r.ok() }).collect().await;
-		
+
 		// Find any correlation for this event with an average_distance
-		let avg_dist = correlations
-			.iter()
-			.find(|c| c.event_id() == event_id && c.average_distance().is_some())
-			.and_then(|c| c.average_distance().cloned());
-		
+		let avg_dist = correlations.iter().find(|c| c.event_id() == event_id && c.average_distance().is_some()).and_then(|c| c.average_distance().cloned());
+
 		let Some(average_distance) = avg_dist else {
 			return Ok(None);
 		};
-		
+
 		if average_distance.value().is_zero() {
 			return Ok(None);
 		}
-		
+
 		// Get the event to find the last manifestation
 		let events: Vec<Event> = database.get_unprocessed_events(aspect_id).await?.filter_map(|r| async { r.ok() }).collect().await;
 		let event = events.iter().find(|e| e.id() == event_id);
-		
+
 		let Some(event) = event else {
 			return Ok(None);
 		};
-		
+
 		// Find the last manifestation and extract the relevant timestamp based on signal_type
 		// For "PredictStart" we measure from start-to-start (when will the next event START)
 		// For "PredictEnd" we measure from end-to-end (when will the next event END)
-		let last_manifestation = event.manifestations()
-			.values()
-			.max_by_key(|m| m.start());
-		
+		let last_manifestation = event.manifestations().values().max_by_key(|m| m.start());
+
 		let Some(last_manifest) = last_manifestation else {
 			return Ok(None);
 		};
-		
+
 		// Choose the reference point based on signal type
 		// The manifestation spans from before the peak to after the peak
 		// For predictions, we typically want to measure from when the event peaked (midpoint)
 		// except for PredictEnd which measures from when the event finished
 		let reference_time = match signal_type {
-			SignalType::Custom(ref type_name) if type_name == "PredictStart" => last_manifest.midpoint(),
-			SignalType::Custom(ref type_name) if type_name == "PredictMid" => last_manifest.midpoint(),
-			SignalType::Custom(ref type_name) if type_name == "PredictEnd" => *last_manifest.end(),
-			SignalType::Custom(_) => last_manifest.midpoint(), // Default to midpoint
+			SignalType::PredictStart => last_manifest.midpoint(),
+			SignalType::PredictMid => last_manifest.midpoint(),
+			SignalType::PredictEnd => *last_manifest.end(),
 		};
-		
+
 		// Calculate time elapsed since reference point (in the average_distance units)
 		let time_elapsed = average_distance.units().difference(&date, &reference_time)?;
-		
+
 		// If we're before or at the reference point, probability is 0
 		if time_elapsed <= 0 {
 			return Ok(Some(BigDecimal::zero()));
 		}
-		
+
 		let time_elapsed_bd = BigDecimal::from(time_elapsed);
 		let probability = &time_elapsed_bd / average_distance.value();
-		
+
 		// Debug output disabled
-		// println!("DEBUG event_probability: reference_time={} ({}), query_date={}, time_elapsed={}, avg_dist={}, probability={}", 
+		// println!("DEBUG event_probability: reference_time={} ({}), query_date={}, time_elapsed={}, avg_dist={}, probability={}",
 		// 	reference_time.format("%Y-%m-%d %H:%M"), signal_type, date.format("%Y-%m-%d %H:%M"), time_elapsed, average_distance.value(), probability);
-		
+
 		Ok(Some(probability))
 	}
 
@@ -892,8 +874,8 @@ impl Signals {
 	/// Find a random signal (useful for testing)
 	#[must_use]
 	pub fn find_random(&self) -> Option<&Signal> {
-		use rand::{seq::IteratorRandom, thread_rng};
-		self.0.values().choose(&mut thread_rng())
+		use rand::seq::IteratorRandom;
+		self.0.values().choose(&mut rand::rng())
 	}
 
 	/// Get all unique correlation IDs

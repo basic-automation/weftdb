@@ -52,9 +52,7 @@ where
 	let mut map = serializer.serialize_map(Some(error_rates.len()))?;
 	for (signal_type, error_rate) in error_rates {
 		// Convert SignalType to string for JSON key
-		let key = match signal_type {
-			SignalType::Custom(ref name) => format!("Custom({name})"),
-		};
+		let key = signal_type.to_string();
 		map.serialize_entry(&key, error_rate)?;
 	}
 	map.end()
@@ -66,16 +64,13 @@ where
 	D: Deserializer<'de>,
 {
 	use serde::de::Error;
+	use std::str::FromStr;
 	let string_map: HashMap<String, ErrorRate> = HashMap::deserialize(deserializer)?;
 	let mut result = HashMap::new();
 
 	for (key, value) in string_map {
 		// Convert string key back to SignalType
-		let signal_type = if let Some(name) = key.strip_prefix("Custom(").and_then(|s| s.strip_suffix(')')) {
-			SignalType::Custom(name.to_string())
-		} else {
-			return Err(D::Error::custom(format!("Invalid SignalType key: {key}")));
-		};
+		let signal_type = SignalType::from_str(&key).map_err(|e| D::Error::custom(format!("Invalid SignalType key: {key}, error: {e}")))?;
 		result.insert(signal_type, value);
 	}
 
