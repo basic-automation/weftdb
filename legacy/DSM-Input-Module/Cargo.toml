@@ -1,0 +1,30 @@
+[package]
+name = "dsm-inputer"
+version = "0.0.1"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+dsm_measurement = { path = "../1 - dsm-measurement" }
+axum = {version = "*", features= []}
+serde = { version = "*", features = ["derive"] }
+serde_json = "*"
+tokio = { version = "*", features = ["full"] }
+reqwest = { version = "*", features = ["json"] }
+urlencoding = "*"
+chrono = "*"
+uuid = { version="*", features=["v4", "fast-rng", "macro-diagnostics", "serde"] }
+bigdecimal = { version="*", features=["serde"] }
+dsm_config = { path = "../dsm-config" }
+rayon = "*"
+lazy_static = "*"
+rand = "*"
+
+
+[profile.release]
+strip = true
+opt-level = "s"
+debug = 0
+lto = "fat"
+codegen-units = 1
