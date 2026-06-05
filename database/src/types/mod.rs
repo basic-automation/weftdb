@@ -3,9 +3,12 @@ pub use batches::{
 	batched_measurements::{analysis::Analysis, batched_distance::BatchDistance, BatchedMeasurement}, Batch, BatchId, BatchMetatdata, Batches
 };
 pub use cache::{AnalysisResult, Cacheable, Connection, DatabaseCache};
+pub use compression::{
+	AggressivenessScaling, CompressionConfig, CompressionPhase, CompressionProgress, CompressionResult, CompressionSummary, DetailedCompressionSummary, DirtyRegion, LastCompressionInfo, ProgressCallback, SizeBasedCompressionConfig, TierCompressionResult, TimeBasedCompressionConfig,
+};
 pub use correlation::{Correlation, CorrelationID, Correlations};
 pub use database::{
-	clear_connection_cache_by_name, traits::{Config, DatabaseStructure, EventDatabase, Outputs, PatternDatabase, PipelineInputs, PipelineOutputs}, Database, DatabaseId, DatabaseInfo, DatabaseMap, DATABASES, DEFAULT_DATA_DIR
+	clear_connection_cache_by_name, traits::{Config, DatabaseStructure, EventDatabase, Outputs, PatternDatabase, PipelineInputs, PipelineOutputs}, Database, DatabaseId, DatabaseInfo, DatabaseMap, DATABASES, data_dir, default_data_dir
 };
 pub use dataset::{Dataset, DatasetId};
 pub use dictionary::{Dictionary, DictionaryConstraints, DictionaryId, DictionaryMetadata, Steps, Variability, VariablilityType};
@@ -25,6 +28,7 @@ pub use trend::Trend;
 pub mod aspect;
 pub mod batches;
 pub mod cache;
+pub mod compression;
 pub mod correlation;
 pub mod database;
 pub mod dataset;

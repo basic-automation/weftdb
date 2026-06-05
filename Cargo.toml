@@ -1,9 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["database", "database_orchestration", "splimes"]
+members = ["database", "database_orchestration", "splimes", "dsp-tui"]
 
 [workspace.dependencies]
 anyhow = "1"
+ctor = "0.4"
 async-trait = "0"
 ahash = "0"
 bigdecimal = "0"
@@ -37,10 +38,12 @@ csv = "1"
 indexmap = "2"
 serial_test = { version = "3", default-features = false, features = ["async"] }
 tracing = "0"
+tracing-core = "0"
 tracing-subscriber = { version = "0", features = ["env-filter"] }
 once_cell = "1"
 md5 = "0"
 rand_chacha = "0.9"
+dirs = "5"
 
 [profile.release]
 opt-level = 3

@@ -149,10 +149,16 @@ impl Inputs for Database {
 		let _ = Self::commit_concurrent(&conn).await;
 
 		// Checkpoint WAL to ensure measurement is persisted
-		Self::checkpoint_wal(&db).await?;
+		Self::checkpoint_wal_passive(&db).await?;
 
 		// Enqueue measurement for incremental batch processing
 		self.enqueue_unbatched_measurement(aspect_id, data_timestamp).await?;
+
+		// Check if this measurement falls in a previously compressed range and mark dirty if so
+		// This is best-effort - errors are logged but don't fail the insert
+		if let Err(e) = self.mark_dirty_region_if_needed(aspect_id, data_timestamp).await {
+			tracing::debug!("Failed to check dirty region for measurement: {e}");
+		}
 
 		self.record_transaction(&format!("Captured measurement at {} with value {} for dataset {}", measurement.timestamp(), measurement.value(), dataset_id)).await
 	}
@@ -188,7 +194,7 @@ impl Inputs for Database {
 		let _ = Self::commit_concurrent(&conn).await;
 
 		// Checkpoint WAL to ensure measurement is persisted
-		Self::checkpoint_wal(&db).await?;
+		Self::checkpoint_wal_passive(&db).await?;
 
 		// Enqueue measurement for incremental batch processing
 		self.enqueue_unbatched_measurement(aspect_id, data_timestamp).await?;
@@ -226,8 +232,11 @@ impl Inputs for Database {
 		let mut all_tx_ids = Vec::with_capacity(total_measurements);
 
 		// Get DB connection info once upfront to avoid repeated lookups
+		tracing::debug!("[batch_capture] Getting measurement DB for aspect {}", aspect_id);
 		let db = self.get_measurement_db(&aspect_id).await?;
+		tracing::debug!("[batch_capture] Got measurement DB, getting path...");
 		let db_path = self.get_measurement_db_path(&aspect_id).await?;
+		tracing::debug!("[batch_capture] Got DB path, starting chunk loop ({} chunks of {})", total_measurements / chunk_size + 1, chunk_size);
 		let dataset_id_str = dataset_id.as_uuid().to_string();
 
 		for (chunk_idx, chunk) in input_measurements.chunks(chunk_size).enumerate() {
@@ -244,8 +253,17 @@ impl Inputs for Database {
 				}
 			}
 
+			// Log first few chunks to diagnose blocking
+			if chunk_idx < 3 {
+				tracing::debug!("[batch_capture] Chunk {}: starting begin_concurrent...", chunk_idx);
+			}
+
 			// Inline bulk insert to reuse db handle
 			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+
+			if chunk_idx < 3 {
+				tracing::debug!("[batch_capture] Chunk {}: begin_concurrent succeeded, building INSERT...", chunk_idx);
+			}
 
 			// Generate TxIds for this chunk only
 			let chunk_tx_ids: Vec<TxId> = (0..chunk.len()).map(|_| TxId::new()).collect();
@@ -272,8 +290,16 @@ impl Inputs for Database {
 				params.push(measurement.value().to_string());
 			}
 
+			if chunk_idx < 3 {
+				tracing::debug!("[batch_capture] Chunk {}: executing INSERT for {} measurements...", chunk_idx, chunk.len());
+			}
+
 			// Execute the bulk insert
 			conn.as_ref().execute(&bulk_sql, turso::params_from_iter(params)).await.map_err(|e| Error::DatabaseError(format!("Failed to bulk insert measurements: {e}")))?;
+
+			if chunk_idx < 3 {
+				tracing::debug!("[batch_capture] Chunk {}: INSERT succeeded, committing...", chunk_idx);
+			}
 
 			let _ = Self::commit_concurrent(&conn).await;
 			all_tx_ids.extend(chunk_tx_ids);
@@ -294,15 +320,28 @@ impl Inputs for Database {
 		let cache_key = format!("aspect_measurements_{}", aspect_id.as_uuid());
 		self.cache.lock().await.invalidate(&cache_key).await;
 
-		// Final checkpoint with TRUNCATE to ensure data is written to main database file
-		Self::checkpoint_wal(&db).await?;
+		// Use PASSIVE checkpoint during imports to avoid blocking subsequent operations
+		// TRUNCATE checkpoint requires exclusive access which can cause contention with MVCC
+		tracing::debug!("[batch_capture] Starting final PASSIVE checkpoint...");
+		Self::checkpoint_wal_passive(&db).await?;
+		tracing::debug!("[batch_capture] Final checkpoint complete");
 
 		// Enqueue all measurement timestamps for incremental batch processing
+		tracing::debug!("[batch_capture] Enqueuing {} unbatched measurements...", input_measurements.len());
 		let all_timestamps: Vec<chrono::DateTime<chrono::Utc>> = input_measurements.iter().map(InputMeasurement::timestamp).collect();
 		self.enqueue_unbatched_measurements(&aspect_id, &all_timestamps).await?;
+		tracing::debug!("[batch_capture] Unbatched measurements enqueued");
+
+		// Check if any measurements in this batch fall within previously compressed ranges
+		// This is best-effort - errors are logged but don't fail the import
+		if let Err(e) = self.mark_dirty_regions_for_batch(&aspect_id, min_new, max_new).await {
+			tracing::debug!("[batch_capture] Failed to check dirty regions for batch: {e}");
+		}
 
 		// Update earliest and latest in metadata
+		tracing::debug!("[batch_capture] Updating aspect timestamps...");
 		self.update_aspect_timestamps(&aspect_id, min_new, max_new).await?;
+		tracing::info!("[batch_capture] Batch complete: {} measurements imported for aspect {}", total_measurements, aspect_id);
 		Ok(all_tx_ids)
 	}
 
@@ -982,7 +1021,7 @@ impl Inputs for Database {
 		let aspect = self.get_aspect(aspect_id).await?;
 		let db_name = &self.name;
 		let db_path = Self::aspect_dictionaries_db_path(db_name.as_str(), aspect.subject_name(), aspect.name(), dictionary_name);
-		let db = Self::get_or_create_turso_database(&db_path).await?;
+		let (db, _was_new) = Self::get_or_create_turso_database(&db_path).await?;
 		let conn = Self::begin_concurrent(&db, db_name, Some(self.cache.clone())).await?;
 
 		// Ensure dictionary tables exist (create if not exists)
@@ -1061,7 +1100,7 @@ impl Inputs for Database {
 		let aspect = self.get_aspect(aspect_id).await?;
 		let db_name = &self.name;
 		let db_path = Self::aspect_dictionaries_db_path(db_name.as_str(), aspect.subject_name(), aspect.name(), dictionary_name);
-		let db = Self::get_or_create_turso_database(&db_path).await?;
+		let (db, _was_new) = Self::get_or_create_turso_database(&db_path).await?;
 		let conn = Self::begin_concurrent(&db, db_name, Some(self.cache.clone())).await?;
 
 		// Insert into patterns table (the main patterns table with pattern data)
@@ -1559,5 +1598,243 @@ impl Inputs for Database {
 		let log = format!("Cleaned up processed events older than {older_than} for aspect {aspect_id}");
 		let _ = self.record_transaction(&log).await?;
 		Ok(TxId::new())
+	}
+
+	//
+	// Compression
+	//
+
+	/// Replace measurements in a time range with new compressed measurements.
+	/// This is an atomic delete + insert operation used during compression.
+	async fn replace_measurements_in_range(&self, aspect_id: &AspectId, dataset_id: &DatasetId, start: chrono::DateTime<chrono::Utc>, end: chrono::DateTime<chrono::Utc>, new_measurements: Vec<InputMeasurement>) -> Result<()> {
+		if new_measurements.is_empty() {
+			// Just delete the range if no new measurements
+			let db = self.get_measurement_db(aspect_id).await?;
+			let db_path = self.get_measurement_db_path(aspect_id).await?;
+			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+
+			let delete_sql = "DELETE FROM measurements WHERE timestamp >= ? AND timestamp <= ?";
+			let res = conn.as_ref().execute(delete_sql, turso::params![start.timestamp_millis(), end.timestamp_millis()]).await;
+			if let Err(e) = res {
+				Self::rollback_concurrent(&conn).await?;
+				return Err(anyhow::anyhow!("Failed to delete measurements in range: {e}"));
+			}
+
+			let _ = Self::commit_concurrent(&conn).await;
+			Self::checkpoint_wal_passive(&db).await?;
+			return Ok(());
+		}
+
+		let db = self.get_measurement_db(aspect_id).await?;
+		let db_path = self.get_measurement_db_path(aspect_id).await?;
+		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+
+		// Delete existing measurements in range
+		let delete_sql = "DELETE FROM measurements WHERE timestamp >= ? AND timestamp <= ?";
+		let res = conn.as_ref().execute(delete_sql, turso::params![start.timestamp_millis(), end.timestamp_millis()]).await;
+		if let Err(e) = res {
+			Self::rollback_concurrent(&conn).await?;
+			return Err(anyhow::anyhow!("Failed to delete measurements in range: {e}"));
+		}
+
+		// Insert new measurements in chunks
+		let chunk_size = 500;
+		let dataset_id_str = dataset_id.as_uuid().to_string();
+
+		for chunk in new_measurements.chunks(chunk_size) {
+			let placeholder = "(?, ?, ?, ?)";
+			let placeholders: Vec<&str> = (0..chunk.len()).map(|_| placeholder).collect();
+			let bulk_sql = format!("INSERT INTO measurements (id, dataset_id, timestamp, value) VALUES {}", placeholders.join(", "));
+
+			let mut params: Vec<String> = Vec::with_capacity(chunk.len() * 4);
+			for m in chunk {
+				let measurement = Measurement::from_input_measurement(dataset_id, m);
+				let tx_id = TxId::new();
+				params.push(tx_id.as_uuid().to_string());
+				params.push(dataset_id_str.clone());
+				params.push(measurement.timestamp().timestamp_millis().to_string());
+				params.push(measurement.value().to_string());
+			}
+
+			let res = conn.as_ref().execute(&bulk_sql, turso::params_from_iter(params)).await;
+			if let Err(e) = res {
+				Self::rollback_concurrent(&conn).await?;
+				return Err(anyhow::anyhow!("Failed to insert compressed measurements: {e}"));
+			}
+		}
+
+		let _ = Self::commit_concurrent(&conn).await;
+		Self::checkpoint_wal_passive(&db).await?;
+
+		// Invalidate cache
+		let cache_key = format!("aspect_measurements_{}", aspect_id.as_uuid());
+		self.cache.lock().await.invalidate(&cache_key).await;
+
+		tracing::debug!(
+			aspect_id = %aspect_id,
+			start = %start,
+			end = %end,
+			new_count = new_measurements.len(),
+			"Replaced measurements in range"
+		);
+
+		Ok(())
+	}
+
+}
+
+/// Helper methods for dirty region tracking (not part of trait)
+impl Database {
+	/// Check if a timestamp falls within a previously compressed range and mark it as dirty if so.
+	///
+	/// This is called after inserting measurements to track when new data is inserted
+	/// into time ranges that have already been compressed. The dirty regions can then
+	/// be recompressed to maintain data integrity.
+	///
+	/// # Arguments
+	/// * `aspect_id` - The aspect ID to check
+	/// * `timestamp` - The timestamp to check
+	///
+	/// # Errors
+	/// Returns Ok(()) if no error occurs. Errors are logged but not propagated to avoid
+	/// breaking the insert flow for this non-critical tracking operation.
+	pub async fn mark_dirty_region_if_needed(&self, aspect_id: &AspectId, timestamp: chrono::DateTime<chrono::Utc>) -> Result<()> {
+		let db = self.get_measurement_db(aspect_id).await?;
+		let db_path = self.get_measurement_db_path(aspect_id).await?;
+		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+
+		// Query compression_tier_results to see if timestamp falls within a compressed range
+		let mut rows = conn
+			.as_ref()
+			.query(
+				"SELECT time_range_start, time_range_end FROM compression_tier_results WHERE time_range_start <= ? AND time_range_end >= ? LIMIT 1",
+				turso::params![timestamp.timestamp_millis(), timestamp.timestamp_millis()],
+			)
+			.await?;
+
+		let compressed_range = if let Some(row) = rows.next().await? {
+			let start_millis = *row.get_value(0)?.as_integer().unwrap_or(&0);
+			let end_millis = *row.get_value(1)?.as_integer().unwrap_or(&0);
+			Some((start_millis, end_millis))
+		} else {
+			None
+		};
+
+		// Need to commit this read transaction before starting a new write
+		let _ = Self::commit_concurrent(&conn).await;
+
+		if let Some((start_millis, end_millis)) = compressed_range {
+			// Open a new connection for the write
+			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+
+			let now = chrono::Utc::now();
+
+			// Insert the dirty region
+			conn.as_ref()
+				.execute(
+					"INSERT INTO dirty_regions (region_start, region_end, marked_at, reason) VALUES (?, ?, ?, ?)",
+					turso::params![
+						start_millis,
+						end_millis,
+						now.timestamp_millis(),
+						"New measurement inserted into compressed range".to_string(),
+					],
+				)
+				.await?;
+
+			// Update dirty_regions_count in compression_state
+			conn.as_ref()
+				.execute(
+					"UPDATE compression_state SET dirty_regions_count = (SELECT COUNT(*) FROM dirty_regions) WHERE id = 1",
+					turso::params![],
+				)
+				.await?;
+
+			let _ = Self::commit_concurrent(&conn).await;
+
+			tracing::debug!(
+				aspect_id = %aspect_id,
+				timestamp = %timestamp,
+				region_start_millis = start_millis,
+				region_end_millis = end_millis,
+				"Marked dirty region for new measurement in compressed range"
+			);
+		}
+
+		Ok(())
+	}
+
+	/// Batch check if any timestamps fall within previously compressed ranges and mark them as dirty.
+	///
+	/// More efficient than calling `mark_dirty_region_if_needed` for each timestamp when
+	/// doing bulk inserts.
+	///
+	/// # Arguments
+	/// * `aspect_id` - The aspect ID to check
+	/// * `timestamps` - The timestamps to check (should be the min and max of the batch for efficiency)
+	///
+	/// # Errors
+	/// Returns Ok(()) if no error occurs.
+	pub async fn mark_dirty_regions_for_batch(&self, aspect_id: &AspectId, min_timestamp: chrono::DateTime<chrono::Utc>, max_timestamp: chrono::DateTime<chrono::Utc>) -> Result<()> {
+		let db = self.get_measurement_db(aspect_id).await?;
+		let db_path = self.get_measurement_db_path(aspect_id).await?;
+		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+
+		// Find all compressed ranges that overlap with the batch range
+		let mut rows = conn
+			.as_ref()
+			.query(
+				"SELECT DISTINCT time_range_start, time_range_end FROM compression_tier_results WHERE time_range_start <= ? AND time_range_end >= ?",
+				turso::params![max_timestamp.timestamp_millis(), min_timestamp.timestamp_millis()],
+			)
+			.await?;
+
+		let mut compressed_ranges = Vec::new();
+		while let Some(row) = rows.next().await? {
+			let start_millis = *row.get_value(0)?.as_integer().unwrap_or(&0);
+			let end_millis = *row.get_value(1)?.as_integer().unwrap_or(&0);
+			compressed_ranges.push((start_millis, end_millis));
+		}
+
+		// Need to commit this read transaction before starting a new write
+		let _ = Self::commit_concurrent(&conn).await;
+
+		if !compressed_ranges.is_empty() {
+			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+			let now = chrono::Utc::now();
+
+			for (start_millis, end_millis) in &compressed_ranges {
+				// Insert the dirty region
+				conn.as_ref()
+					.execute(
+						"INSERT INTO dirty_regions (region_start, region_end, marked_at, reason) VALUES (?, ?, ?, ?)",
+						turso::params![
+							*start_millis,
+							*end_millis,
+							now.timestamp_millis(),
+							"Batch insert overlapped with compressed range".to_string(),
+						],
+					)
+					.await?;
+			}
+
+			// Update dirty_regions_count in compression_state
+			conn.as_ref()
+				.execute(
+					"UPDATE compression_state SET dirty_regions_count = (SELECT COUNT(*) FROM dirty_regions) WHERE id = 1",
+					turso::params![],
+				)
+				.await?;
+
+			let _ = Self::commit_concurrent(&conn).await;
+
+			tracing::debug!(
+				aspect_id = %aspect_id,
+				dirty_regions_count = compressed_ranges.len(),
+				"Marked dirty regions for batch insert overlapping compressed ranges"
+			);
+		}
+
+		Ok(())
 	}
 }

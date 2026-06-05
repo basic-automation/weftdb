@@ -22,7 +22,7 @@ fn benchmark_cache_miss_vs_hit(c: &mut Criterion) {
 	let (db, aspect_id) = rt.block_on(async {
 		let db = Database::new(&db_name).await.unwrap();
 		let subject = db.observe_subject("cache_subject").await.unwrap();
-		let aspect = db.track_aspect(&subject.id(), "cache_aspect", &Resolution::Seconds).await.unwrap();
+		let aspect = db.track_aspect(&subject.id(), "cache_aspect", &Resolution::Seconds, None).await.unwrap();
 
 		// Add initial measurements
 		let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -86,7 +86,7 @@ fn benchmark_cache_invalidation(c: &mut Criterion) {
 				let db_name = format!("cache_invalidation_{}", Uuid::new_v4());
 				let db = Database::new(&db_name).await.unwrap();
 				let subject = db.observe_subject("invalidation_subject").await.unwrap();
-				let aspect = db.track_aspect(&subject.id(), "invalidation_aspect", &Resolution::Seconds).await.unwrap();
+				let aspect = db.track_aspect(&subject.id(), "invalidation_aspect", &Resolution::Seconds, None).await.unwrap();
 
 				// Add some measurements and analyze
 				let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -122,7 +122,7 @@ fn benchmark_concurrent_cache_access(c: &mut Criterion) {
 				let db_name = format!("concurrent_cache_{}", Uuid::new_v4());
 				let db = Database::new(&db_name).await.unwrap();
 				let subject = db.observe_subject("concurrent_subject").await.unwrap();
-				let aspect = db.track_aspect(&subject.id(), "concurrent_aspect", &Resolution::Seconds).await.unwrap();
+				let aspect = db.track_aspect(&subject.id(), "concurrent_aspect", &Resolution::Seconds, None).await.unwrap();
 
 				// Add measurements
 				let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -169,7 +169,7 @@ fn benchmark_cache_memory_usage(c: &mut Criterion) {
 					let db_name = format!("memory_cache_{}_{}", size, Uuid::new_v4());
 					let db = Database::new(&db_name).await.unwrap();
 					let subject = db.observe_subject("memory_subject").await.unwrap();
-					let aspect = db.track_aspect(&subject.id(), "memory_aspect", &Resolution::Seconds).await.unwrap();
+					let aspect = db.track_aspect(&subject.id(), "memory_aspect", &Resolution::Seconds, None).await.unwrap();
 
 					// Add measurements
 					let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -213,7 +213,7 @@ fn benchmark_cache_eviction_strategies(c: &mut Criterion) {
 				let db_name = format!("eviction_cache_{}", Uuid::new_v4());
 				let db = Database::new(&db_name).await.unwrap();
 				let subject = db.observe_subject("eviction_subject").await.unwrap();
-				let aspect = db.track_aspect(&subject.id(), "eviction_aspect", &Resolution::Seconds).await.unwrap();
+				let aspect = db.track_aspect(&subject.id(), "eviction_aspect", &Resolution::Seconds, None).await.unwrap();
 
 				// Add many measurements to trigger eviction
 				let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();

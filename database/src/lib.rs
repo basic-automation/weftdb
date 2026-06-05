@@ -252,7 +252,20 @@
 
 #![recursion_limit = "1024"]
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]
-#![allow(clippy::multiple_crate_versions, clippy::used_underscore_binding, clippy::similar_names, clippy::module_name_repetitions, clippy::module_inception)]
+#![allow(
+    clippy::multiple_crate_versions,
+    clippy::used_underscore_binding,
+    clippy::similar_names,
+    clippy::module_name_repetitions,
+    clippy::module_inception,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::option_if_let_else,
+    clippy::needless_continue,
+    clippy::manual_let_else
+)]
 #![feature(stmt_expr_attributes)]
 
 mod types;

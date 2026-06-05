@@ -42,7 +42,7 @@ fn benchmark_optimization_strategies(c: &mut Criterion) {
 	for (name, measurement_count, window_minutes, resolution) in optimization_configs {
 		// Pre-setup aspect and data for this benchmark
 		let aspect_id = rt.block_on(async {
-			let aspect = shared_db.track_aspect(&shared_subject.id(), &format!("opt_aspect_{name}"), &Resolution::Seconds).await.unwrap();
+			let aspect = shared_db.track_aspect(&shared_subject.id(), &format!("opt_aspect_{name}"), &Resolution::Seconds, None).await.unwrap();
 
 			// Use batch insertion for much better performance
 			let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -109,7 +109,7 @@ fn benchmark_memory_efficiency(c: &mut Criterion) {
 	for (name, measurement_count, window_minutes) in memory_configs {
 		// Pre-setup data for this configuration
 		let aspect_id = rt.block_on(async {
-			let aspect = db.track_aspect(&subject.id(), &format!("mem_aspect_{name}"), &Resolution::Seconds).await.unwrap();
+			let aspect = db.track_aspect(&subject.id(), &format!("mem_aspect_{name}"), &Resolution::Seconds, None).await.unwrap();
 
 			// Use batch insertion
 			let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();

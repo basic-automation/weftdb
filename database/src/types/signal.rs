@@ -73,11 +73,7 @@ impl FromStr for SignalType {
 
 	fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
 		// Support both legacy "Custom(X)" and new "X" formats
-		let type_name = if let Some(name) = s.strip_prefix("Custom(").and_then(|s| s.strip_suffix(')')) {
-			name
-		} else {
-			s
-		};
+		let type_name = s.strip_prefix("Custom(").and_then(|s| s.strip_suffix(')')).map_or(s, |name| name);
 
 		match type_name {
 			"PredictStart" => Ok(Self::PredictStart),
@@ -218,7 +214,7 @@ impl Signal {
 	}
 
 	/// Set the signal type
-	pub fn set_signal_type(&mut self, signal_type: SignalType) {
+	pub const fn set_signal_type(&mut self, signal_type: SignalType) {
 		self.type_ = signal_type;
 	}
 
@@ -802,13 +798,13 @@ impl Signals {
 		// For predictions, we typically want to measure from when the event peaked (midpoint)
 		// except for PredictEnd which measures from when the event finished
 		let reference_time = match signal_type {
-			SignalType::PredictStart => last_manifest.midpoint(),
-			SignalType::PredictMid => last_manifest.midpoint(),
-			SignalType::PredictEnd => *last_manifest.end(),
+			SignalType::PredictStart => last_manifest.start(),
+			SignalType::PredictMid => &last_manifest.midpoint(),
+			SignalType::PredictEnd => last_manifest.end(),
 		};
 
 		// Calculate time elapsed since reference point (in the average_distance units)
-		let time_elapsed = average_distance.units().difference(&date, &reference_time)?;
+		let time_elapsed = average_distance.units().difference(&date, reference_time)?;
 
 		// If we're before or at the reference point, probability is 0
 		if time_elapsed <= 0 {

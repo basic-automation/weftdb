@@ -30,7 +30,12 @@ impl Connection for Database {
 				Err(e) => {
 					attempts += 1;
 					if attempts >= max_attempts {
+						tracing::error!("[begin_concurrent] Failed after {attempts} attempts: {e}");
 						return Err(anyhow::anyhow!("Failed to begin concurrent transaction after {attempts} attempts: {e}"));
+					}
+					// Log retries to diagnose blocking
+					if attempts == 1 || attempts % 10 == 0 {
+						tracing::debug!("[begin_concurrent] Attempt {} failed: {}, retrying...", attempts, e);
 					}
 					// Exponential backoff with jitter: 10-20ms, 20-40ms, ... capped at 500ms
 					let base_delay = std::cmp::min(10 * (1 << attempts.min(6)), 500);
@@ -110,28 +115,26 @@ impl Connection for Database {
 		conn.as_ref().execute("COMMIT", turso::params![]).await.map_err(Into::into).map(|_| ())
 	}
 
-	/// Checkpoint the WAL (Write-Ahead Log) to flush pending writes to the main database file.
-	/// This should be called after large batch operations to ensure data is persisted.
-	/// Uses PRAGMA `wal_checkpoint(TRUNCATE)` to checkpoint and truncate the WAL file.
-	async fn checkpoint_wal(turso_db: &turso::Database) -> Result<()> {
+	/// Non-blocking WAL checkpoint using PASSIVE mode.
+	/// This checkpoints as much as possible without blocking readers/writers.
+	/// Use this during imports to avoid contention with concurrent operations.
+	async fn checkpoint_wal_passive(turso_db: &turso::Database) -> Result<()> {
+		let start = std::time::Instant::now();
+		tracing::debug!("[checkpoint_wal_passive] Starting PASSIVE checkpoint...");
 		let conn = turso_db.connect()?;
 
-		// TRUNCATE mode: checkpoint and truncate the WAL file
-		// This ensures all data is written to the main database file
-		// Use query() instead of execute() because PRAGMA wal_checkpoint returns rows
-		match conn.query("PRAGMA wal_checkpoint(TRUNCATE)", turso::params![]).await {
+		// PASSIVE mode: checkpoint without blocking
+		// Does not wait for readers/writers to finish
+		match conn.query("PRAGMA wal_checkpoint(PASSIVE)", turso::params![]).await {
 			Ok(mut rows) => {
-				// Consume the result set (contains busy, log, checkpointed columns)
+				// Consume the result set
 				while let Ok(Some(_)) = rows.next().await {}
-				tracing::debug!("WAL checkpoint completed successfully");
+				tracing::debug!("[checkpoint_wal_passive] PASSIVE checkpoint completed in {:?}", start.elapsed());
 				Ok(())
 			}
 			Err(e) => {
-				tracing::warn!("WAL checkpoint failed: {e}");
-				// Try PASSIVE checkpoint as fallback (doesn't block)
-				if let Ok(mut rows) = conn.query("PRAGMA wal_checkpoint(PASSIVE)", turso::params![]).await {
-					while let Ok(Some(_)) = rows.next().await {}
-				}
+				tracing::warn!("[checkpoint_wal_passive] PASSIVE checkpoint failed: {e}");
+				// Not critical - data is still in WAL
 				Ok(())
 			}
 		}

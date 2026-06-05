@@ -4,7 +4,7 @@ use anyhow::Result;
 use bigdecimal::BigDecimal;
 use chrono::{TimeZone, Utc};
 use database::{
-	database::{config::DEFAULT_DATA_DIR, traits::DatabaseStructure}, Database, DatasetId, InputMeasurement
+	data_dir, database::traits::DatabaseStructure, Database, DatasetId, InputMeasurement
 };
 use futures::TryStreamExt;
 use splimes::{Resolution, Spline};
@@ -16,12 +16,12 @@ use crate::batch_utils::build_unprocessed_queue;
 async fn debug_batch_processing() -> Result<()> {
 	println!("=== Starting debug batch processing test ===");
 	// Create a test database with a smaller dataset first
-	let db_path = format!("{DEFAULT_DATA_DIR}/debug_batch_test");
+	let db_path = format!("{}/debug_batch_test", data_dir());
 	remove_dir_all(&db_path).await.ok();
 
 	let db = Database::new("debug_batch_test").await.unwrap();
 	let test_subject = db.observe_subject("TestSubject").await.unwrap();
-	let test_aspect = db.track_aspect(&test_subject.id(), "TestAspect", &Resolution::Minutes).await.unwrap();
+	let test_aspect = db.track_aspect(&test_subject.id(), "TestAspect", &Resolution::Minutes, None).await.unwrap();
 	let start_time = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
 
 	// Create a small test dataset

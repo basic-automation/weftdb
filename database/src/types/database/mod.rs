@@ -23,7 +23,7 @@ pub static DATABASES: LazyLock<DatabaseMap> = LazyLock::new(|| Arc::new(Mutex::n
 // Add connection manager for Turso with connection pools
 static CONNECTION_DATABASES: LazyLock<Arc<Mutex<HashMap<String, turso::Database>>>> = LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
-pub use config::DEFAULT_DATA_DIR;
+pub use config::{data_dir, default_data_dir};
 
 /// Clear all cached connections that contain the given name in their path.
 /// This is useful for test cleanup to ensure database connections are released
@@ -59,7 +59,8 @@ impl DatabaseStructure for Database {
 	/// Create a Turso database for reuse with concurrent writes enabled
 	async fn create_turso_database(db_path: &str) -> Result<turso::Database> {
 		// Use get_or_create_turso_database for consistency and proper race condition handling
-		Self::get_or_create_turso_database(db_path).await
+		let (db, _was_new) = Self::get_or_create_turso_database(db_path).await?;
+		Ok(db)
 	}
 
 	/// Get a Turso database for reuse with concurrent writes enabled
@@ -119,13 +120,15 @@ impl DatabaseStructure for Database {
 	}
 
 	/// Get or create a Turso database with proper MVCC configuration and connection pooling
-	async fn get_or_create_turso_database(db_path: &str) -> Result<turso::Database> {
+	/// Returns (database, `was_newly_created`) - `was_newly_created` is true if the database
+	/// was just created, false if it was retrieved from cache
+	async fn get_or_create_turso_database(db_path: &str) -> Result<(turso::Database, bool)> {
 		// Use a critical section to prevent race conditions during database creation
 		let mut cache = CONNECTION_DATABASES.lock().await;
 
 		// Check if the database is already in the cache, if so return it
 		if let Some(turso_db) = cache.get(db_path) {
-			return Ok(turso_db.clone());
+			return Ok((turso_db.clone(), false)); // From cache, not newly created
 		}
 
 		// Create the database (file will be created if it doesn't exist)
@@ -140,7 +143,7 @@ impl DatabaseStructure for Database {
 
 		cache.insert(db_path.to_string(), turso_db.clone());
 		drop(cache);
-		Ok(turso_db)
+		Ok((turso_db, true)) // Newly created
 	}
 
 	async fn record_transaction(&self, message: &str) -> Result<TxId> {
@@ -297,7 +300,8 @@ impl DatabaseStructure for Database {
                         		resolution TEXT NOT NULL,
                         		created_at INTEGER NOT NULL,
                         		earliest_measurement TEXT,
-                        		latest_measurement TEXT
+                        		latest_measurement TEXT,
+                        		compression_config TEXT
                         	)
                 	",
 				turso::params![],
@@ -414,7 +418,7 @@ impl DatabaseStructure for Database {
 		}
 
 		// Checkpoint metadata WAL to ensure schema and initial data are persisted
-		Self::checkpoint_wal(&db.metadata).await?;
+		Self::checkpoint_wal_passive(&db.metadata).await?;
 
 		Ok(db)
 	}
@@ -477,14 +481,17 @@ impl DatabaseStructure for Database {
 
 		// Query database ID from metadata
 		let conn = Self::begin_concurrent(&metadata_turso_db, metadata_db_path, None).await?;
-		let mut rows = conn.as_ref().query("SELECT id FROM database WHERE name = ?", turso::params![name]).await?;
-		let row = rows.next().await?.ok_or_else(|| anyhow::anyhow!("Database not found"))?;
+
+		let mut rows = conn.as_ref().query("SELECT id, name FROM database LIMIT 1", ()).await?;
+		let row = rows.next().await?.ok_or_else(|| anyhow::anyhow!("No database record found in metadata.db"))?;
 
 		let db_id_str = Self::value_to_string(&row.get_value(0)?, "DB ID").await?;
+		let _stored_name = Self::value_to_string(&row.get_value(1)?, "DB Name").await?;
 		let db_id = DatabaseId::from_uuid(Uuid::parse_str(&db_id_str)?);
 
 		let mut subject_rows = conn.as_ref().query("SELECT id, database_id, name, created_at FROM subjects", ()).await?;
 
+		// Use the folder name for the DatabaseInfo, but the stored name is available if needed
 		let mut db_info = DatabaseInfo::new(name.to_string(), db_path.clone());
 		db_info.set_id(db_id);
 		db_info.set_metadata(Some(metadata_turso_db.clone()));
@@ -532,7 +539,7 @@ impl DatabaseStructure for Database {
 	/// Returns an error if there are issues closing connection pools or removing resources.
 	async fn close(&self) -> Result<()> {
 		// Checkpoint metadata WAL before closing to ensure all data is persisted
-		Self::checkpoint_wal(&self.metadata).await.ok();
+		Self::checkpoint_wal_passive(&self.metadata).await.ok();
 
 		{
 			let mut databases = DATABASES.lock().await;
@@ -623,14 +630,26 @@ impl DatabaseStructure for Database {
 	async fn observe_subject(&self, name: &str) -> Result<Subject> {
 		tracing::debug!("Observing subject: {name}");
 		// Check if subject already exists
-		if self.get_subject_by_name(name).await.is_ok() {
-			return Err(anyhow::anyhow!("Subject '{name}' already exists"));
+		match self.get_subject_by_name(name).await {
+			Ok(_) => {
+				tracing::warn!("Subject '{name}' already exists");
+				return Err(anyhow::anyhow!("Subject '{name}' already exists"));
+			}
+			Err(e) => {
+				tracing::debug!("Subject check (expected not found): {}", e);
+			}
 		}
 
 		// Create subject folder
 		let subject_path = format!("{}/{}/{}", Self::get_data_dir(), self.name, name);
 		tracing::debug!("Creating subject folder: {subject_path}");
-		tokio::fs::create_dir_all(&subject_path).await?;
+		match tokio::fs::create_dir_all(&subject_path).await {
+			Ok(()) => tracing::debug!("Subject folder created successfully"),
+			Err(e) => {
+				tracing::error!("Failed to create subject folder: {}", e);
+				return Err(e.into());
+			}
+		}
 
 		// Add subject to database metadata
 		let metadata_db = &self.metadata;
@@ -673,7 +692,7 @@ impl DatabaseStructure for Database {
 		self.record_transaction(&format!("Added subject '{name}'")).await?;
 
 		// Checkpoint metadata WAL to ensure subject is persisted
-		Self::checkpoint_wal(&self.metadata).await?;
+		Self::checkpoint_wal_passive(&self.metadata).await?;
 
 		Ok(subject)
 	}
@@ -769,7 +788,7 @@ impl DatabaseStructure for Database {
 		self.record_transaction(&format!("Removed subject '{}'", subject.name())).await?;
 
 		// Checkpoint metadata WAL to ensure deletion is persisted
-		Self::checkpoint_wal(&self.metadata).await?;
+		Self::checkpoint_wal_passive(&self.metadata).await?;
 
 		Ok(())
 	}
@@ -849,7 +868,7 @@ impl DatabaseStructure for Database {
 	///
 	/// # Errors
 	/// Returns an error if the subject does not exist or aspect creation fails or the aspect already exists.
-	async fn track_aspect(&self, subject_id: &SubjectId, name: &str, resolution: &Resolution) -> Result<Aspect> {
+	async fn track_aspect(&self, subject_id: &SubjectId, name: &str, resolution: &Resolution, compression_config: Option<crate::CompressionConfig>) -> Result<Aspect> {
 		tracing::debug!("Tracking aspect '{}' for subject {}", name, subject_id.as_uuid());
 		// Check if subject exists
 		tracing::debug!("Retrieving subject with ID: {}", subject_id.as_uuid());
@@ -879,6 +898,7 @@ impl DatabaseStructure for Database {
 		let subj_id_str = subject_id.as_uuid().to_string();
 		let db_id_str = self.id.as_uuid().to_string();
 		let resolution_json = serde_json::to_string(&resolution)?;
+		let compression_config_json = compression_config.as_ref().map(serde_json::to_string).transpose()?;
 		let created_at = chrono::Utc::now().timestamp_millis();
 
 		// Establish a fresh connection for this attempt while holding the mutex
@@ -890,7 +910,7 @@ impl DatabaseStructure for Database {
 		tracing::trace!("About to execute INSERT INTO aspects (aspect_id={aspect_id_str} table_name={table_name})");
 
 		// Execute the INSERT while holding the mutex
-		conn.as_ref().execute("INSERT INTO aspects (id, name, subject_id, database_id, table_name, resolution, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", turso::params![aspect_id_str.clone(), name_str.clone(), subj_id_str.clone(), db_id_str.clone(), table_name.clone(), resolution_json.clone(), created_at]).await?;
+		conn.as_ref().execute("INSERT INTO aspects (id, name, subject_id, database_id, table_name, resolution, created_at, compression_config) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", turso::params![aspect_id_str.clone(), name_str.clone(), subj_id_str.clone(), db_id_str.clone(), table_name.clone(), resolution_json.clone(), created_at, compression_config_json]).await?;
 
 		tracing::debug!("Aspect inserted successfully");
 
@@ -898,7 +918,10 @@ impl DatabaseStructure for Database {
 		// Release the aspect creation mutex (it was locked above) implicitly by letting the
 		// earlier guard drop (we only held it across the insertion). Now perform the
 		// heavier wireframing without holding the metadata lock.
-		let aspect = Aspect::new(Some(aspect_id), name, subject_id, resolution, &conn).await?;
+		let mut aspect = Aspect::new(Some(aspect_id), name, subject_id, resolution, &conn).await?;
+
+		// Set compression config on the created aspect
+		aspect.set_compression_config_local(compression_config);
 
 		let _ = Self::commit_concurrent(&conn).await;
 
@@ -922,7 +945,7 @@ impl DatabaseStructure for Database {
 		self.record_transaction(&format!("Tracking new aspect '{}' for subject '{}'", name, subject.name())).await?;
 
 		// Checkpoint metadata WAL to ensure aspect is persisted
-		Self::checkpoint_wal(&self.metadata).await?;
+		Self::checkpoint_wal_passive(&self.metadata).await?;
 
 		tracing::debug!("Transaction recorded successfully for aspect creation.");
 
@@ -938,11 +961,10 @@ impl DatabaseStructure for Database {
 
 		let conn = Self::begin_concurrent(&self.metadata, &self.metadata_path, Some(self.cache.clone())).await?;
 
-		// No explicit transaction for a read-only, single-row query; add retry on transient locks
 		let res = conn
 			.as_ref()
 			.query(
-				"SELECT a.id, a.name, a.subject_id, a.resolution, s.name AS subject_name \
+				"SELECT a.id, a.name, a.subject_id, a.resolution, s.name AS subject_name, a.compression_config \
 			        FROM aspects a JOIN subjects s ON s.id = a.subject_id \
 			        WHERE a.id = ?",
 				turso::params![id.as_uuid().to_string()],
@@ -956,11 +978,15 @@ impl DatabaseStructure for Database {
 					let name = Self::value_to_string(&row.get_value(1)?, "Aspect name").await?;
 					let subject_id_str = Self::value_to_string(&row.get_value(2)?, "Subject ID").await?;
 					let resolution_str = Self::value_to_string(&row.get_value(3)?, "Resolution").await?;
+					let compression_config_json: Option<String> = row.get(5).ok();
 					let aspect_id = AspectId::from_uuid(Uuid::parse_str(&aspect_id_str)?);
 					let subject_id = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str)?);
 					let resolution: Resolution = serde_json::from_str(&resolution_str)?;
+					let compression_config: Option<crate::CompressionConfig> = compression_config_json.filter(|s| !s.is_empty()).map(|s| serde_json::from_str(&s)).transpose()?;
 
-					Aspect::from_metadata(Some(aspect_id), name, &subject_id, &resolution, self.metadata_path.clone(), None).await?
+					let mut aspect = Aspect::from_metadata(Some(aspect_id), name, &subject_id, &resolution, self.metadata_path.clone(), None).await?;
+					aspect.set_compression_config_local(compression_config);
+					aspect
 				} else {
 					bail!("Aspect not found");
 				}
@@ -977,10 +1003,11 @@ impl DatabaseStructure for Database {
 
 	async fn get_aspect_by_name(&self, name: &str) -> Result<Aspect> {
 		let conn = Self::begin_concurrent(&self.metadata, &self.metadata_path, Some(self.cache.clone())).await?;
+
 		let query_res = conn
 			.as_ref()
 			.query(
-				"SELECT a.id, a.name, a.subject_id, a.resolution, s.name AS subject_name \
+				"SELECT a.id, a.name, a.subject_id, a.resolution, s.name AS subject_name, a.compression_config \
 				FROM aspects a JOIN subjects s ON s.id = a.subject_id \
 				WHERE a.name = ?",
 				turso::params![name],
@@ -994,12 +1021,16 @@ impl DatabaseStructure for Database {
 					let name = Self::value_to_string(&row.get_value(1)?, "Aspect name").await?;
 					let subject_id_str = Self::value_to_string(&row.get_value(2)?, "Subject ID").await?;
 					let resolution_str = Self::value_to_string(&row.get_value(3)?, "Resolution").await?;
+					let compression_config_json: Option<String> = row.get(5).ok();
 
 					let aspect_id = AspectId::from_uuid(Uuid::parse_str(&aspect_id_str)?);
 					let subject_id = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str)?);
 					let resolution: Resolution = serde_json::from_str(&resolution_str)?;
+					let compression_config: Option<crate::CompressionConfig> = compression_config_json.filter(|s| !s.is_empty()).map(|s| serde_json::from_str(&s)).transpose()?;
 
-					Aspect::from_metadata(Some(aspect_id), name, &subject_id, &resolution, self.metadata_path.clone(), None).await?
+					let mut aspect = Aspect::from_metadata(Some(aspect_id), name, &subject_id, &resolution, self.metadata_path.clone(), None).await?;
+					aspect.set_compression_config_local(compression_config);
+					aspect
 				} else {
 					bail!("Aspect not found");
 				}
@@ -1028,14 +1059,20 @@ impl DatabaseStructure for Database {
 		let timestamp = match res {
 			Ok(mut rows) => {
 				if let Some(row) = rows.next().await? {
-					let timestamp_str = Self::value_to_string(&row.get_value(0)?, "Earliest Measurement Timestamp").await?;
-					if timestamp_str.is_empty() {
-						return Ok(None);
+					// Check if the value is null (empty table)
+					let value = row.get_value(0)?;
+					if matches!(value, turso::Value::Null) {
+						None
+					} else {
+						let timestamp_str = Self::value_to_string(&value, "Earliest Measurement Timestamp").await?;
+						if timestamp_str.is_empty() {
+							return Ok(None);
+						}
+						// Parse as milliseconds (i64) instead of RFC3339
+						let timestamp_millis: i64 = timestamp_str.parse().map_err(|e| anyhow::anyhow!("Invalid timestamp format: {e}"))?;
+						let timestamp = DateTime::from_timestamp_millis(timestamp_millis).ok_or_else(|| anyhow::anyhow!("Invalid timestamp"))?;
+						Some(timestamp)
 					}
-					// Parse as milliseconds (i64) instead of RFC3339
-					let timestamp_millis: i64 = timestamp_str.parse().map_err(|e| anyhow::anyhow!("Invalid timestamp format: {e}"))?;
-					let timestamp = DateTime::from_timestamp_millis(timestamp_millis).ok_or_else(|| anyhow::anyhow!("Invalid timestamp"))?;
-					Some(timestamp)
 				} else {
 					None
 				}
@@ -1066,7 +1103,12 @@ impl DatabaseStructure for Database {
 			Ok(mut rows) => {
 				if let Some(row) = rows.next().await? {
 					let _ = Self::commit_concurrent(&conn).await;
-					let timestamp_str = Self::value_to_string(&row.get_value(0)?, "Latest Measurement Timestamp").await?;
+					// Check if the value is null (empty table)
+					let value = row.get_value(0)?;
+					if matches!(value, turso::Value::Null) {
+						return Ok(None);
+					}
+					let timestamp_str = Self::value_to_string(&value, "Latest Measurement Timestamp").await?;
 					if timestamp_str.is_empty() {
 						return Ok(None);
 					}
@@ -1303,6 +1345,95 @@ impl DatabaseStructure for Database {
 		self.cache.lock().await.store(&cache_key, db.clone()).await;
 		Ok(db)
 	}
+
+	/// Check if database is currently locked
+	/// Returns true if locked, false if available
+	/// Uses a minimal timeout (100ms) to avoid blocking
+	async fn is_locked(&self) -> bool {
+		// Try to get a connection and begin a transaction with minimal timeout
+		match self.metadata.connect() {
+			Ok(conn) => {
+				// Set minimal busy timeout for this check
+				let _ = conn.execute("PRAGMA busy_timeout=100", turso::params![]).await;
+
+				// Try to begin a concurrent transaction
+				match conn.execute("BEGIN CONCURRENT", turso::params![]).await {
+					Ok(_) => {
+						// Successfully got lock, clean up and return false (not locked)
+						let _ = conn.execute("ROLLBACK", turso::params![]).await;
+						drop(conn);
+						false
+					}
+					Err(e) => {
+						// Check if error is due to lock
+						let err_msg = e.to_string().to_lowercase();
+						drop(conn);
+						err_msg.contains("locked") || err_msg.contains("busy")
+					}
+				}
+			}
+			Err(_) => {
+				// Connection failed, treat as locked
+				true
+			}
+		}
+	}
+
+	/// Check if a specific measurement database is locked
+	/// This is more accurate for plot updates since `analyze_range` queries the measurement DB
+	/// CRITICAL: This must NOT load/initialize the aspect database as that's expensive!
+	/// Instead, we check the database file directly.
+	async fn is_measurement_db_locked(&self, aspect_id: &AspectId) -> bool {
+		// Build the measurement database path directly from aspect_id (without loading metadata)
+		let _data_dir = Self::get_data_dir();
+
+		// Get aspect details from cache to find the database path
+		// If not cached, we can't check it, so return false to allow the import to proceed
+		let measurement_db_path = match self.get_measurement_db_path(aspect_id).await {
+			Ok(path) => path,
+			Err(_) => {
+				// Can't determine path, assume not locked to avoid blocking
+				return false;
+			}
+		};
+
+		// Try to create a fresh connection to just this measurement database
+		match turso::Builder::new_local(&measurement_db_path).build().await {
+			Ok(measurement_db) => {
+				// Try to get a connection with minimal timeout
+				match measurement_db.connect() {
+					Ok(conn) => {
+						// Set minimal busy timeout for this check (100ms)
+						let _ = conn.execute("PRAGMA busy_timeout=100", turso::params![]).await;
+
+						// Try to begin a concurrent transaction
+						match conn.execute("BEGIN CONCURRENT", turso::params![]).await {
+							Ok(_) => {
+								// Successfully got lock, clean up and return false (not locked)
+								let _ = conn.execute("ROLLBACK", turso::params![]).await;
+								drop(conn);
+								false
+							}
+							Err(e) => {
+								// Check if error is due to lock
+								let err_msg = e.to_string().to_lowercase();
+								drop(conn);
+								err_msg.contains("locked") || err_msg.contains("busy")
+							}
+						}
+					}
+					Err(_) => {
+						// Connection failed, treat as locked
+						true
+					}
+				}
+			}
+			Err(_) => {
+				// Couldn't build database, assume not locked to avoid blocking
+				false
+			}
+		}
+	}
 }
 
 impl Database {
@@ -1364,13 +1495,17 @@ impl Database {
 				resolution TEXT NOT NULL,
 				created_at INTEGER NOT NULL,
 				earliest_measurement TEXT,
-				latest_measurement TEXT
+				latest_measurement TEXT,
+				compression_config TEXT
 			)",
 			turso::params![],
 		)
 		.await
 		.map_err(|e| anyhow::anyhow!("Failed to create aspects table: {e}"))?;
 		tracing::debug!("Aspects table created");
+
+		// Add compression_config column for existing databases (migration)
+		conn.execute("ALTER TABLE aspects ADD COLUMN compression_config TEXT", turso::params![]).await.ok(); // Ignore error if column already exists
 
 		tracing::debug!("Creating unbatched_measurements table...");
 		conn.execute(

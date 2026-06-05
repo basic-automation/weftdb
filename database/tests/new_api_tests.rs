@@ -22,7 +22,7 @@ async fn test_database_lifecycle() {
 	let subject = db.observe_subject("test_subject").await.expect("Failed to add subject");
 
 	// Test tracking an aspect
-	let aspect = db.track_aspect(&subject.id(), "temperature", &splimes::Resolution::Seconds).await.expect("Failed to track aspect");
+	let aspect = db.track_aspect(&subject.id(), "temperature", &splimes::Resolution::Seconds, None).await.expect("Failed to track aspect");
 
 	// Test capturing measurements
 	let measurements = vec![InputMeasurement::new(Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap(), BigDecimal::from_str("20.5").unwrap()), InputMeasurement::new(Utc.with_ymd_and_hms(2023, 1, 1, 12, 5, 0).unwrap(), BigDecimal::from_str("21.0").unwrap()), InputMeasurement::new(Utc.with_ymd_and_hms(2023, 1, 1, 12, 10, 0).unwrap(), BigDecimal::from_str("21.5").unwrap())];
@@ -64,7 +64,7 @@ async fn test_existing_database() {
 	// Create initial database
 	let db = Database::new(&db_name).await.expect("Failed to create database");
 	let subject = db.observe_subject("persistent_subject").await.expect("Failed to add subject");
-	let aspect = db.track_aspect(&subject.id(), "humidity", &splimes::Resolution::Seconds).await.expect("Failed to track aspect");
+	let aspect = db.track_aspect(&subject.id(), "humidity", &splimes::Resolution::Seconds, None).await.expect("Failed to track aspect");
 
 	// Add some data
 	db.capture_measurement(&aspect.id(), &DatasetId::new(), &InputMeasurement::new(Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap(), BigDecimal::from_str("45.0").unwrap())).await.expect("Failed to capture measurement");
@@ -93,9 +93,9 @@ async fn test_multiple_subjects_and_aspects() {
 	let subject2 = db.observe_subject("subject_2").await.expect("Failed to add subject 2");
 
 	// Create multiple aspects for each subject
-	let temp_aspect1 = db.track_aspect(&subject1.id(), "temperature", &splimes::Resolution::Seconds).await.expect("Failed to track temperature for subject 1");
-	let humidity_aspect1 = db.track_aspect(&subject1.id(), "humidity", &splimes::Resolution::Seconds).await.expect("Failed to track humidity for subject 1");
-	let temp_aspect2 = db.track_aspect(&subject2.id(), "temperature", &splimes::Resolution::Seconds).await.expect("Failed to track temperature for subject 2");
+	let temp_aspect1 = db.track_aspect(&subject1.id(), "temperature", &splimes::Resolution::Seconds, None).await.expect("Failed to track temperature for subject 1");
+	let humidity_aspect1 = db.track_aspect(&subject1.id(), "humidity", &splimes::Resolution::Seconds, None).await.expect("Failed to track humidity for subject 1");
+	let temp_aspect2 = db.track_aspect(&subject2.id(), "temperature", &splimes::Resolution::Seconds, None).await.expect("Failed to track temperature for subject 2");
 
 	// Add data to different aspects
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap();
@@ -159,7 +159,7 @@ async fn test_interpolation_methods() {
 
 	let db = Database::new(&db_name).await.expect("Failed to create database");
 	let subject = db.observe_subject("test_subject").await.expect("Failed to add subject");
-	let aspect = db.track_aspect(&subject.id(), "test_aspect", &splimes::Resolution::Milliseconds).await.expect("Failed to track aspect");
+	let aspect = db.track_aspect(&subject.id(), "test_aspect", &splimes::Resolution::Milliseconds, None).await.expect("Failed to track aspect");
 
 	// Add test data with a clear pattern
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap();
@@ -225,7 +225,7 @@ async fn test_caching_behavior() {
 
 	let db = Database::new(&db_name).await.expect("Failed to create database");
 	let subject = db.observe_subject("cache_test_subject").await.expect("Failed to add subject");
-	let aspect = db.track_aspect(&subject.id(), "cache_test_aspect", &splimes::Resolution::Milliseconds).await.expect("Failed to track aspect");
+	let aspect = db.track_aspect(&subject.id(), "cache_test_aspect", &splimes::Resolution::Milliseconds, None).await.expect("Failed to track aspect");
 
 	// Add test data
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap();

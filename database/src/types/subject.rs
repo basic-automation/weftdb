@@ -2,6 +2,7 @@ use std::{collections::HashMap, hash::Hash, path::Path};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use tracing::{debug, error};
 use uuid::Uuid;
 
 use crate::{
@@ -73,16 +74,32 @@ impl Subject {
 	///
 	/// Returns an error if the subject path cannot be determined or the directory cannot be created.
 	pub async fn new(id: Option<SubjectId>, name: String, database_id: DatabaseId, database_metadata_db_path: String) -> Result<Self> {
+		debug!("Creating new Subject: name='{}', database_id={}", name, database_id.as_uuid());
 		let id = id.unwrap_or_default();
+		debug!("Subject ID: {}", id.as_uuid());
 
 		// For new subjects (when id is None), we construct the path directly using the provided name
 		// The database_metadata_db_path points to the database metadata file, so we need to get the database directory
-		let database_dir = Path::new(&database_metadata_db_path).parent().ok_or_else(|| anyhow::anyhow!("Cannot determine database directory"))?;
+		debug!("Determining database directory from metadata path: {}", database_metadata_db_path);
+		let database_dir = Path::new(&database_metadata_db_path).parent().ok_or_else(|| {
+			let err = anyhow::anyhow!("Cannot determine database directory from path: {database_metadata_db_path}");
+			error!("{}", err);
+			err
+		})?;
 		let subject_path = database_dir.join(&name);
+		debug!("Subject path: {}", subject_path.display());
 
 		// recursively create directory if it doesn't exist
-		tokio::fs::create_dir_all(&subject_path).await?;
+		debug!("Creating subject directory recursively");
+		match tokio::fs::create_dir_all(&subject_path).await {
+			Ok(()) => debug!("Subject directory created successfully"),
+			Err(e) => {
+				error!("Failed to create subject directory '{}': {}", subject_path.display(), e);
+				return Err(e.into());
+			}
+		}
 
+		debug!("Subject instance created successfully");
 		Ok(Self { id, name, database_id, database_metadata_db_path, aspects: HashMap::new() })
 	}
 

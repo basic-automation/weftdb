@@ -23,7 +23,7 @@ async fn setup_test_database() -> Result<(TempDir, Database, Subject, Aspect)> {
 
 	let db = Database::new(&db_name).await?;
 	let subject = db.observe_subject("test_subject").await?;
-	let aspect = db.track_aspect(&subject.id(), "test_aspect", &splimes::Resolution::Milliseconds).await?;
+	let aspect = db.track_aspect(&subject.id(), "test_aspect", &splimes::Resolution::Milliseconds, None).await?;
 
 	Ok((temp_dir, db, subject, aspect)) // Return aspect instead of aspect.id()
 }
@@ -497,11 +497,11 @@ async fn test_create_btc_1min_database() -> Result<()> {
 
 			debug!("Tracking aspects for BTCUSD");
 			// Create aspects for different price types (with delays to prevent resource exhaustion)
-			let open_aspect = db.track_aspect(&subject.id(), "open", &Resolution::Minutes).await?;
-			let high_aspect = db.track_aspect(&subject.id(), "high", &Resolution::Minutes).await?;
-			let low_aspect = db.track_aspect(&subject.id(), "low", &Resolution::Minutes).await?;
-			let close_aspect = db.track_aspect(&subject.id(), "close", &Resolution::Minutes).await?;
-			let volume_aspect = db.track_aspect(&subject.id(), "volume", &Resolution::Minutes).await?;
+			let open_aspect = db.track_aspect(&subject.id(), "open", &Resolution::Minutes, None).await?;
+			let high_aspect = db.track_aspect(&subject.id(), "high", &Resolution::Minutes, None).await?;
+			let low_aspect = db.track_aspect(&subject.id(), "low", &Resolution::Minutes, None).await?;
+			let close_aspect = db.track_aspect(&subject.id(), "close", &Resolution::Minutes, None).await?;
+			let volume_aspect = db.track_aspect(&subject.id(), "volume", &Resolution::Minutes, None).await?;
 
 			debug!("Tracking aspects for BTCUSD: {}, {}, {}, {}, {}", open_aspect.id(), high_aspect.id(), low_aspect.id(), close_aspect.id(), volume_aspect.id());
 

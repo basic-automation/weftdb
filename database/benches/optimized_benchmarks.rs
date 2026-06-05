@@ -28,7 +28,7 @@ impl BenchmarkContext {
 
 		let db = Arc::new(Database::new(&db_name).await?);
 		let subject = db.observe_subject("bench_subject").await?;
-		let aspect = db.track_aspect(&subject.id(), "bench_aspect", &Resolution::Seconds).await?;
+		let aspect = db.track_aspect(&subject.id(), "bench_aspect", &Resolution::Seconds, None).await?;
 
 		// Add test measurements
 		let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
