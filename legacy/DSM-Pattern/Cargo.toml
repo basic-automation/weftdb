@@ -1,0 +1,29 @@
+[package]
+name = "dsm_pattern"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+uuid = {version="*", features=["v4", "fast-rng", "macro-diagnostics", "serde"]}
+serde = { version = "*", features = ["derive"] }
+bigdecimal = {version="*", features=["serde"]}
+reqwest = {version = "*", features=["json"]}
+serde_json = "*"
+num-bigint = {version="*", features=["serde"]}
+dsm_log = {path = "../dsm-log"}
+urlencoding = "*"
+serde_with = "*"
+dsm_config = {path = "../dsm-config"}
+tokio = { version = "*", features=["full"] }
+threadpool = "*"
+rayon = "*"
+
+
+[profile.release]
+strip = true
+opt-level = "s"
+debug = 0
+lto = true
+codegen-units = 1
