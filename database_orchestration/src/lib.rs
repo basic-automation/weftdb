@@ -1,3 +1,6 @@
+// Increase recursion limit for complex async type checking
+#![recursion_limit = "512"]
+
 //! # Dataset Management - Time-Series Pattern Recognition and Signal Generation
 //!
 //! A high-level library for processing time-series data, extracting patterns,
@@ -448,6 +451,8 @@ mod pattern_fix_test;
 
 // Re-export main Pipeline API
 // Re-export built-in detectors
+// Re-export compression types for convenience
+pub use database::compression::{AggressivenessScaling, CompressionConfig, CompressionResult, CompressionSummary, SizeBasedCompressionConfig, TimeBasedCompressionConfig};
 pub use detectors::{detect_all_peaks, detect_all_valleys, detect_drawdown, detect_monthly_increase, detect_peaks, detect_threshold_crossing_down, detect_threshold_crossing_up, detect_valleys};
 pub use pipeline::{DetectorId, DictionaryConfig, EventDetector, EventDetectorFn, Pipeline, PipelineBuilder, PipelineRunConfig, ProbabilityResult};
 
@@ -673,8 +678,7 @@ fn collect_expired_signals(signals: &Signals, events: &[database::Event], correl
 			if let Some(event) = events.iter().find(|e| *e.id() == event_id) {
 				if let Some((_, predicted_manifestation)) = event.manifestations().iter().find(|(_, m)| m.id() == signal.manifestation_id()) {
 					let prediction_point = match signal.signal_type() {
-						SignalType::PredictStart => predicted_manifestation.midpoint(),
-						SignalType::PredictMid => predicted_manifestation.midpoint(),
+						SignalType::PredictStart | SignalType::PredictMid => predicted_manifestation.midpoint(),
 						SignalType::PredictEnd => *predicted_manifestation.end(),
 					};
 
@@ -1460,7 +1464,7 @@ mod tests {
 	use batch_utils::*;
 	use bigdecimal::{BigDecimal, FromPrimitive};
 	use chrono::{TimeZone, Utc};
-	use database::{AspectId, Database, DatasetId, InputMeasurement, Resolution, DEFAULT_DATA_DIR};
+	use database::{AspectId, Database, DatasetId, InputMeasurement, Resolution, data_dir};
 	use rand::Rng;
 	use serde_json::json;
 	use serial_test::serial;
@@ -1482,8 +1486,8 @@ mod tests {
 		}
 
 		// Debug: Show where we're looking for the database
-		tracing::info!(path = %format!("{}/Crypto", database::DEFAULT_DATA_DIR), "Looking for Crypto database");
-		tracing::debug!(metadata_path = %format!("{}/Crypto/metadata.db", database::DEFAULT_DATA_DIR), "Metadata file location");
+		tracing::info!(path = %format!("{}/Crypto", data_dir()), "Looking for Crypto database");
+		tracing::debug!(metadata_path = %format!("{}/Crypto/metadata.db", data_dir()), "Metadata file location");
 
 		// Try to get the Crypto database, skip test if it doesn't exist or doesn't have the required data
 		let database = match Database::existing("Crypto").await {
@@ -1736,7 +1740,7 @@ mod tests {
 		}
 
 		// Debug: Show where we're looking for the database
-		tracing::info!(path = %format!("{}/Crypto", database::DEFAULT_DATA_DIR), "Looking for Crypto database");
+		tracing::info!(path = %format!("{}/Crypto", data_dir()), "Looking for Crypto database");
 
 		// Try to get the Crypto database, skip test if it doesn't exist or doesn't have the required data
 		let database = match Database::existing("Crypto").await {
@@ -2294,12 +2298,12 @@ mod tests {
 		// Also clear the connection cache to release file handles
 		clear_connection_cache_by_name("TestDB").await;
 
-		let db_path = format!("{DEFAULT_DATA_DIR}/TestDB");
+		let db_path = format!("{}/TestDB", data_dir());
 		remove_dir_all(&db_path).ok();
 
 		let db = Database::new("TestDB").await.unwrap();
 		let test_subject = db.observe_subject("TestSubject").await.unwrap();
-		let test_aspect = db.track_aspect(&test_subject.id(), "TestAspect", &Resolution::Seconds).await.unwrap();
+		let test_aspect = db.track_aspect(&test_subject.id(), "TestAspect", &Resolution::Seconds, None).await.unwrap();
 		let start_time = Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap();
 
 		for (i, value) in generate_test_points() {
@@ -2329,12 +2333,12 @@ mod tests {
 			return Ok(());
 		}
 
-		let db_path = format!("{DEFAULT_DATA_DIR}/test_bath_processing");
+		let db_path = format!("{}/test_bath_processing", data_dir());
 		remove_dir_all(&db_path).ok();
 
 		let db = Database::new("test_bath_processing").await.unwrap();
 		let test_subject = db.observe_subject("TestSubject").await.unwrap();
-		let test_aspect = db.track_aspect(&test_subject.id(), "TestAspect", &Resolution::Seconds).await.unwrap();
+		let test_aspect = db.track_aspect(&test_subject.id(), "TestAspect", &Resolution::Seconds, None).await.unwrap();
 		let start_time = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
 		#[rustfmt::skip]
 		let points = vec![
@@ -2396,12 +2400,12 @@ mod tests {
 			return Ok(());
 		}
 
-		let db_path = format!("{DEFAULT_DATA_DIR}/test_specific_process_batch");
+		let db_path = format!("{}/test_specific_process_batch", data_dir());
 		remove_dir_all(&db_path).ok();
 
 		let db = Database::new("test_specific_process_batch").await.unwrap();
 		let test_subject = db.observe_subject("TestSubject").await.unwrap();
-		let test_aspect = db.track_aspect(&test_subject.id(), "TestAspect", &Resolution::Seconds).await.unwrap();
+		let test_aspect = db.track_aspect(&test_subject.id(), "TestAspect", &Resolution::Seconds, None).await.unwrap();
 		let start_time = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
 		#[rustfmt::skip]
 		let points = vec![
@@ -2656,13 +2660,13 @@ mod tests {
 			}
 		}
 		clear_connection_cache_by_name("TestLoadOrCreate").await;
-		let db_path = format!("{DEFAULT_DATA_DIR}/TestLoadOrCreate");
+		let db_path = format!("{}/TestLoadOrCreate", data_dir());
 		remove_dir_all(&db_path).ok();
 
 		// Create database with test data
 		let db = Database::new("TestLoadOrCreate").await?;
 		let subject = db.observe_subject("TestSubject").await?;
-		let aspect = db.track_aspect(&subject.id(), "TestAspect", &Resolution::Hours).await?;
+		let aspect = db.track_aspect(&subject.id(), "TestAspect", &Resolution::Hours, None).await?;
 
 		// Add some measurements
 		let start_time = chrono::Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap();
@@ -2716,7 +2720,7 @@ mod tests {
 			}
 		}
 		clear_connection_cache_by_name("TestParallelPipelines").await;
-		let db_path = format!("{DEFAULT_DATA_DIR}/TestParallelPipelines");
+		let db_path = format!("{}/TestParallelPipelines", data_dir());
 		remove_dir_all(&db_path).ok();
 
 		// Create database with multiple aspects
@@ -2724,9 +2728,9 @@ mod tests {
 		let subject = db.observe_subject("TestSubject").await?;
 
 		// Create 3 aspects
-		let aspect1 = db.track_aspect(&subject.id(), "Aspect1", &Resolution::Hours).await?;
-		let aspect2 = db.track_aspect(&subject.id(), "Aspect2", &Resolution::Hours).await?;
-		let aspect3 = db.track_aspect(&subject.id(), "Aspect3", &Resolution::Hours).await?;
+		let aspect1 = db.track_aspect(&subject.id(), "Aspect1", &Resolution::Hours, None).await?;
+		let aspect2 = db.track_aspect(&subject.id(), "Aspect2", &Resolution::Hours, None).await?;
+		let aspect3 = db.track_aspect(&subject.id(), "Aspect3", &Resolution::Hours, None).await?;
 
 		// Add measurements to each aspect
 		let start_time = chrono::Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap();

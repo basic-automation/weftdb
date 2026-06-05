@@ -27,7 +27,7 @@ fn benchmark_interpolation_sizes(c: &mut Criterion) {
 				rt.block_on(async {
 					// Generate unique name for each iteration
 					let db_name = format!("bench_interp_{}_{}", size, Uuid::new_v4());
-					let db_path = format!("{}/{}", ::database::DEFAULT_DATA_DIR, db_name);
+					let db_path = format!("{}/{}", ::database::data_dir(), db_name);
 
 					// Clean up if exists
 					if Path::new(&db_path).exists() {
@@ -42,7 +42,7 @@ fn benchmark_interpolation_sizes(c: &mut Criterion) {
 
 					// Setup subject and aspect (assuming similar to other benchmarks)
 					let subject = db.observe_subject("interp_subject").await.unwrap();
-					let aspect = db.track_aspect(&subject.id(), "interp_aspect", &Resolution::Seconds).await.unwrap();
+					let aspect = db.track_aspect(&subject.id(), "interp_aspect", &Resolution::Seconds, None).await.unwrap();
 
 					// Generate and insert test data
 					let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -80,7 +80,7 @@ fn benchmark_interpolation_resolutions(c: &mut Criterion) {
 	let (db, aspect_id) = rt.block_on(async {
 		let db = Database::new(&db_name).await.unwrap();
 		let subject = db.observe_subject("interp_subject").await.unwrap();
-		let aspect = db.track_aspect(&subject.id(), "interp_aspect", &Resolution::Seconds).await.unwrap();
+		let aspect = db.track_aspect(&subject.id(), "interp_aspect", &Resolution::Seconds, None).await.unwrap();
 
 		// Generate and insert test data (reduced size from 1000 to 200)
 		let size = 200;
@@ -122,7 +122,7 @@ fn benchmark_interpolation_resolutions(c: &mut Criterion) {
 	rt.block_on(async {
 		db.close().await.unwrap();
 		tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-		let db_path = format!("{}/{}", ::database::DEFAULT_DATA_DIR, db_name);
+		let db_path = format!("{}/{}", ::database::data_dir(), db_name);
 		std::fs::remove_dir_all(&db_path).ok();
 	});
 }
@@ -134,13 +134,13 @@ fn benchmark_spline_types(c: &mut Criterion) {
 	let db_name = "bench_spline_shared";
 	let (db, aspect_id) = rt.block_on(async {
 		// Clean up any existing test data
-		let db_path = format!("{}/{}", ::database::DEFAULT_DATA_DIR, db_name);
+		let db_path = format!("{}/{}", ::database::data_dir(), db_name);
 		std::fs::remove_dir_all(&db_path).ok();
 		tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
 		let db = Database::new(db_name).await.unwrap();
 		let subject = db.observe_subject("bench_subject").await.unwrap();
-		let aspect = db.track_aspect(&subject.id(), "bench_aspect", &Resolution::Seconds).await.unwrap();
+		let aspect = db.track_aspect(&subject.id(), "bench_aspect", &Resolution::Seconds, None).await.unwrap();
 
 		// Add test data once - further reduced size for faster benchmarks
 		let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -181,7 +181,7 @@ fn benchmark_spline_types(c: &mut Criterion) {
 	// Cleanup after all benchmarks
 	rt.block_on(async {
 		db.close().await.unwrap();
-		let db_path = format!("{}/{}", ::database::DEFAULT_DATA_DIR, db_name);
+		let db_path = format!("{}/{}", ::database::data_dir(), db_name);
 		std::fs::remove_dir_all(&db_path).ok();
 	});
 }

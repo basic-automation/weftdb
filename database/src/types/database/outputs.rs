@@ -9,8 +9,14 @@ use splimes::{Point, Resolution, Spline};
 use uuid::Uuid;
 
 use crate::{
-	cache::{self}, correlation::ErrorRate, types::database::traits::{aspect_structure::AspectStructure, connection::Connection as _ConnectionTrait, database_structure::DatabaseStructure}, AnalysisResult, AspectId, Batch, BatchId, BatchMetatdata, BatchedMeasurement, Correlation, CorrelationID, Database, DatabaseInfo, DatasetId, DictionaryConstraints, DictionaryId, DictionaryMetadata, Error, Event, EventID, Manifestation, ManifestationId, Measurement, MeasurementId, Occurrence, Pattern, PatternID, Relative, SignalType, Steps, SubjectId, VariablilityType
+	cache::{self}, correlation::ErrorRate, types::{database::traits::{aspect_structure::AspectStructure, connection::Connection as _ConnectionTrait, database_structure::DatabaseStructure}, error::is_transient_mvcc_error}, AnalysisResult, AspectId, Batch, BatchId, BatchMetatdata, BatchedMeasurement, Correlation, CorrelationID, Database, DatabaseInfo, DatasetId, DictionaryConstraints, DictionaryId, DictionaryMetadata, Error, Event, EventID, Manifestation, ManifestationId, Measurement, MeasurementId, Occurrence, Pattern, PatternID, Relative, SignalType, Steps, SubjectId, VariablilityType
 };
+
+/// Maximum retries for transient MVCC errors during concurrent compression
+const MAX_MVCC_RETRIES: u32 = 3;
+
+/// Base delay between retries (exponential backoff)
+const MVCC_RETRY_BASE_DELAY_MS: u64 = 50;
 
 /// Parsed correlation row data from database query.
 /// Contains (`correlation_id`, `dictionary_id`, `subject_id`, `aspect_id`, `pattern_id`, `event_id`, `average_distance`).
@@ -200,8 +206,14 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		let _ = Self::commit_concurrent(&conn).await;
 
 		if let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get count row: {e}")))? {
-			let count_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Count is not text".to_string()))?.clone();
-			let count: usize = count_str.parse().map_err(|e| Error::DatabaseError(format!("Invalid count format: {e}")))?;
+			let count_value = row.get_value(0)?;
+			let count = if let Some(int_val) = count_value.as_integer() {
+				*int_val as usize
+			} else if let Some(text_val) = count_value.as_text() {
+				text_val.parse().map_err(|e| Error::DatabaseError(format!("Invalid count format: {e}")))?
+			} else {
+				return Err(Error::DatabaseError("Count value is neither integer nor text".to_string()).into());
+			};
 			Ok(count)
 		} else {
 			Ok(0)
@@ -356,83 +368,19 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 	}
 
 	/// Interpolates/extrapolates the `DataPoint`[] for a given time range, resolution, & spline type.
-	/// Uses intelligent measurement collection with pagination for memory efficiency.
+	/// Uses true chunked streaming: fetches, interpolates, and yields per chunk for responsive UI.
 	///
 	/// # Errors
 	/// - if interpolation fails
 	async fn analyze_range(&self, aspect_id: &AspectId, start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, method: Spline) -> Result<Pin<Box<dyn Stream<Item = Result<Point>> + Send + 'static>>> {
-		// Pre-fetch all measurements for the range to avoid async issues in the stream
-		// For very large ranges, this could be optimized further with lazy loading
-		tracing::info!(start = %start, end = %end, "[analyze_range] Starting measurement collection");
-		tracing::debug!("[analyze_range] About to call fetch_measurements_for_range...");
+		tracing::info!(start = %start, end = %end, "[analyze_range] Starting chunked streaming");
 
-		let mut measurement_stream = self.fetch_measurements_for_range(aspect_id, start, end).await?;
-		tracing::debug!("[analyze_range] fetch_measurements_for_range returned, stream created");
-		tracing::debug!("[analyze_range] About to call stream.next() for first item...");
-
-		let mut all_measurements: Vec<Measurement> = Vec::new();
-		let mut count = 0usize;
-		let progress_interval = 1_000_000; // Report every 1M measurements
-
-		while let Some(result) = measurement_stream.next().await {
-			if count == 0 {
-				tracing::debug!("[analyze_range] Received first measurement from stream!");
-			}
-			let measurement = result?;
-			all_measurements.push(measurement);
-			count += 1;
-			if count.is_multiple_of(progress_interval) {
-				tracing::info!(count = count, "[analyze_range] Loaded measurements...");
-			}
-		}
-		tracing::info!(total = count, "[analyze_range] Finished loading measurements");
-
-		if all_measurements.is_empty() {
-			// Try boundary measurements if no data in range
-			let boundary_measurements: Vec<Measurement> = self.get_boundary_measurements(aspect_id).await?.collect::<Vec<_>>().await.into_iter().collect::<Result<Vec<_>>>()?;
-			if boundary_measurements.is_empty() {
-				return Err(anyhow::anyhow!("No measurements found for aspect"));
-			}
-
-			// Use boundary measurements for extrapolation
-			let mut points: Vec<Point> = boundary_measurements.iter().map(|m| Point { timestamp: m.timestamp(), value: m.value().clone() }).collect();
-
-			// Interpolate the entire range at once
-			let interpolated = splimes::auto_interpolate(&mut points, start, end, resolution, method).await?;
-
-			// Convert to stream
-			let point_stream = futures::stream::iter(interpolated.into_iter().map(Ok));
-			return Ok(Box::pin(point_stream));
-		}
-
-		// Convert measurements to points
-		tracing::debug!(count = all_measurements.len(), "[analyze_range] Converting measurements to points...");
-		let mut points: Vec<Point> = all_measurements.iter().map(|m| Point { timestamp: m.timestamp(), value: m.value().clone() }).collect();
-
-		// For large datasets, we'll process in chunks to avoid memory issues
+		// Calculate chunk parameters
 		let total_duration = end - start;
 		let step_duration = resolution.to_step();
 		let total_ns = total_duration.num_nanoseconds().unwrap_or(i64::MAX);
 		let step_ns = step_duration.num_nanoseconds().unwrap_or(1);
 		let expected_points = if step_ns > 0 { (total_ns / step_ns) + 1 } else { 1 };
-		tracing::info!(expected_points = expected_points, step = ?step_duration, "[analyze_range] Calculated output");
-
-		// If expected output is reasonable, process all at once
-		if expected_points < 1_000_000 {
-			// Small enough to process all at once
-			tracing::debug!(expected_points = expected_points, "[analyze_range] Processing all at once (< 1M threshold)");
-			let interpolated = splimes::auto_interpolate(&mut points, start, end, resolution, method).await?;
-			tracing::info!(output_points = interpolated.len(), "[analyze_range] Interpolation complete");
-			let point_stream = futures::stream::iter(interpolated.into_iter().map(Ok));
-			return Ok(Box::pin(point_stream));
-		}
-
-		// For very large outputs, process in time-based chunks
-		tracing::info!(expected_points = expected_points, "[analyze_range] Using chunked processing");
-		let chunk_size = 100_000; // Target points per chunk
-		let chunk_count = (expected_points + chunk_size - 1) / chunk_size; // Ceiling division
-		let chunk_duration_ns = total_ns / chunk_count;
-		let chunk_duration = chrono::Duration::nanoseconds(chunk_duration_ns);
 
 		// Calculate overlap needed for interpolation method
 		let overlap_points = match method {
@@ -443,63 +391,191 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		};
 		let overlap_duration = step_duration * i32::try_from(overlap_points).unwrap_or(3);
 
-		Ok(Box::pin(futures::stream::unfold((start, None::<std::vec::IntoIter<Point>>), move |(mut current, mut current_iter)| {
-			let points_clone = points.clone();
-			let end_time = end;
-			let resolution_val = resolution;
-			let method_val = method;
+		// Target ~50,000 output points per chunk for responsive streaming
+		let chunk_size = 50_000i64;
+		let chunk_count = ((expected_points + chunk_size - 1) / chunk_size).max(1);
+		let chunk_duration_ns = total_ns / chunk_count;
+		let chunk_duration = chrono::Duration::nanoseconds(chunk_duration_ns);
 
-			async move {
-				// Return next point from current chunk if available
-				if let Some(ref mut iter) = current_iter {
-					if let Some(point) = iter.next() {
-						return Some((Ok(point), (current, current_iter)));
+		tracing::info!(
+			expected_points = expected_points,
+			chunk_count = chunk_count,
+			chunk_duration_ms = chunk_duration.num_milliseconds(),
+			"[analyze_range] Chunked streaming setup"
+		);
+
+		// Clone self for use in async stream
+		let db_name = self.name().to_string();
+		let aspect_id = *aspect_id;
+
+		// Create streaming iterator that fetches and interpolates per chunk
+		let stream = futures::stream::unfold(
+			(start, None::<std::vec::IntoIter<Point>>, false),
+			move |(current_chunk_start, mut current_iter, done)| {
+				let db_name = db_name.clone();
+				let aspect_id = aspect_id;
+				let end_time = end;
+				let resolution_val = resolution;
+				let method_val = method;
+				let overlap = overlap_duration;
+				let chunk_dur = chunk_duration;
+				let range_start = start;
+
+				async move {
+					// Return next point from current chunk if available
+					if let Some(ref mut iter) = current_iter {
+						if let Some(point) = iter.next() {
+							return Some((Ok(point), (current_chunk_start, current_iter, done)));
+						}
 					}
-				}
 
-				// If we're done, return None
-				if current >= end_time {
-					return None;
-				}
-
-				// Process next chunk
-				let chunk_end = (current + chunk_duration).min(end_time);
-				let fetch_start = (current - overlap_duration).max(start);
-				let fetch_end = (chunk_end + overlap_duration).min(end_time);
-
-				// Filter points for this chunk's time range
-				let mut chunk_points: Vec<Point> = points_clone.iter().filter(|p| p.timestamp >= fetch_start && p.timestamp <= fetch_end).cloned().collect();
-
-				if chunk_points.is_empty() {
-					// No data for this chunk, skip to next
-					current = chunk_end;
-					return Some((Ok(Point { timestamp: current, value: BigDecimal::zero() }), (current, None)));
-				}
-
-				// Interpolate this chunk
-				match splimes::auto_interpolate(&mut chunk_points, current, chunk_end, resolution_val, method_val).await {
-					Ok(interpolated) => {
-						current = chunk_end;
-						let mut new_iter = interpolated.into_iter();
-						// Return first point and set up iterator for the rest
-						new_iter.next().map_or_else(|| Some((Ok(Point { timestamp: current, value: BigDecimal::zero() }), (current, None))), |first_point| Some((Ok(first_point), (current, Some(new_iter)))))
+					// If we're done, return None
+					if done || current_chunk_start >= end_time {
+						return None;
 					}
-					Err(e) => Some((Err(e), (current, None))),
+
+					// Calculate this chunk's boundaries
+					let chunk_end = (current_chunk_start + chunk_dur).min(end_time);
+					let fetch_start = (current_chunk_start - overlap).max(range_start);
+					let fetch_end = (chunk_end + overlap).min(end_time);
+
+					tracing::debug!(
+						chunk_start = %current_chunk_start,
+						chunk_end = %chunk_end,
+						fetch_start = %fetch_start,
+						fetch_end = %fetch_end,
+						"[analyze_range] Processing chunk"
+					);
+
+					// Fetch measurements for this chunk (with overlap)
+					let db = match Self::existing(&db_name).await {
+						Ok(db) => db,
+						Err(e) => return Some((Err(e), (chunk_end, None, true))),
+					};
+
+					let measurements = match db.fetch_measurements_for_chunk(&aspect_id, fetch_start, fetch_end).await {
+						Ok(m) => m,
+						Err(e) => return Some((Err(e), (chunk_end, None, true))),
+					};
+
+					if measurements.is_empty() {
+						// No data for this chunk, move to next
+						if chunk_end >= end_time {
+							return None;
+						}
+						return Some((
+							Ok(Point { timestamp: current_chunk_start, value: BigDecimal::from(0) }),
+							(chunk_end, None, false)
+						));
+					}
+
+					// Convert to points
+					let mut points: Vec<Point> = measurements
+						.iter()
+						.map(|m| Point { timestamp: m.timestamp(), value: m.value().clone() })
+						.collect();
+
+					// Adjust effective end to not extrapolate beyond actual data
+					let actual_data_end = points.iter().map(|p| p.timestamp).max().unwrap_or(chunk_end);
+					let effective_chunk_end = chunk_end.min(actual_data_end);
+
+					// Interpolate this chunk
+					match splimes::auto_interpolate(
+						&mut points,
+						current_chunk_start,
+						effective_chunk_end,
+						resolution_val,
+						method_val
+					).await {
+						Ok(interpolated) => {
+							let is_last_chunk = chunk_end >= end_time;
+							let mut new_iter = interpolated.into_iter();
+
+							// Return first point and set up iterator for the rest
+							match new_iter.next() {
+								Some(first_point) => Some((
+									Ok(first_point),
+									(chunk_end, Some(new_iter), is_last_chunk)
+								)),
+								None => {
+									if is_last_chunk {
+										None
+									} else {
+										Some((
+											Ok(Point { timestamp: current_chunk_start, value: BigDecimal::from(0) }),
+											(chunk_end, None, false)
+										))
+									}
+								}
+							}
+						}
+						Err(e) => Some((Err(e), (chunk_end, None, true))),
+					}
 				}
 			}
-		})))
+		);
+
+		Ok(Box::pin(stream))
 	}
 
-	/// Helper function to fetch measurements for a time range using pagination
-	/// Efficiently loads all measurements within the specified time range
+	/// Helper function to fetch all measurements for a time range
+	/// Loads all measurements within the specified time range without pagination
+	/// Includes retry logic for transient MVCC errors during concurrent compression
 	async fn fetch_measurements_for_range(&self, aspect_id: &AspectId, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<Pin<Box<dyn Stream<Item = Result<Measurement>> + Send + 'static>>> {
-		// Use get_raw_measurements directly to get a streaming result
-		// Set max_per_page to a reasonable size and page to 0 to start
-		// The stream will handle pagination internally
-		let page_size = 10_000;
-		let measurements_stream = self.get_raw_measurements(aspect_id, Some(start), Some(end), page_size, 0).await?;
+		// Retry loop for transient MVCC errors
+		for attempt in 0..MAX_MVCC_RETRIES {
+			match Self::fetch_measurements_for_range_inner_impl(self, aspect_id, start, end).await {
+				Ok(measurements) => {
+					let stream = futures::stream::iter(measurements.into_iter().map(Ok));
+					return Ok(Box::pin(stream));
+				}
+				Err(e) if is_transient_mvcc_error(&e) && attempt < MAX_MVCC_RETRIES - 1 => {
+					let delay = MVCC_RETRY_BASE_DELAY_MS * 2u64.pow(attempt);
+					tracing::debug!(
+						attempt = attempt + 1,
+						delay_ms = delay,
+						"Transient MVCC error during fetch_measurements_for_range, retrying..."
+					);
+					tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+					continue;
+				}
+				Err(e) => return Err(e),
+			}
+		}
+		// Should not reach here, but just in case
+		Self::fetch_measurements_for_range_inner_impl(self, aspect_id, start, end).await.map(|m| {
+			let stream = futures::stream::iter(m.into_iter().map(Ok));
+			Box::pin(stream) as Pin<Box<dyn Stream<Item = Result<Measurement>> + Send + 'static>>
+		})
+	}
 
-		Ok(measurements_stream)
+	/// Fetch measurements for a specific time chunk with overlap for interpolation
+	/// Includes retry logic for transient MVCC errors during concurrent compression
+	async fn fetch_measurements_for_chunk(
+		&self,
+		aspect_id: &AspectId,
+		chunk_start: DateTime<Utc>,
+		chunk_end: DateTime<Utc>,
+	) -> Result<Vec<Measurement>> {
+		// Retry loop for transient MVCC errors
+		for attempt in 0..MAX_MVCC_RETRIES {
+			match Self::fetch_measurements_for_chunk_inner_impl(self, aspect_id, chunk_start, chunk_end).await {
+				Ok(measurements) => return Ok(measurements),
+				Err(e) if is_transient_mvcc_error(&e) && attempt < MAX_MVCC_RETRIES - 1 => {
+					let delay = MVCC_RETRY_BASE_DELAY_MS * 2u64.pow(attempt);
+					tracing::debug!(
+						attempt = attempt + 1,
+						delay_ms = delay,
+						"Transient MVCC error during fetch_measurements_for_chunk, retrying..."
+					);
+					tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+					continue;
+				}
+				Err(e) => return Err(e),
+			}
+		}
+		// Should not reach here, but just in case
+		Self::fetch_measurements_for_chunk_inner_impl(self, aspect_id, chunk_start, chunk_end).await
 	}
 
 	async fn get_unprocessed_batch(&self, aspect_id: &AspectId, batch_id: &BatchId) -> Result<Batch> {
@@ -1310,6 +1386,57 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 	}
 }
 
+/// Helper methods for retry-with-MVCC operations
+impl Database {
+	/// Inner implementation of `fetch_measurements_for_range` without retry
+	async fn fetch_measurements_for_range_inner_impl(&self, aspect_id: &AspectId, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<Vec<Measurement>> {
+		let db = self.get_measurement_db(aspect_id).await?;
+		let db_path = self.get_measurement_db_path(aspect_id).await?;
+		let conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+
+		// Query all measurements in range without LIMIT - we need all data for accurate interpolation
+		let query_sql = "SELECT id, dataset_id, timestamp, value FROM measurements WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp ASC";
+		let mut rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![start.timestamp_millis(), end.timestamp_millis()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query measurements: {e}")))?;
+
+		let mut measurements: Vec<Measurement> = Vec::new();
+		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get measurement row: {e}")))? {
+			let m = Self::parse_measurement_row_static(&row)?;
+			measurements.push(m);
+		}
+
+		let _ = Self::commit_concurrent(&conn).await;
+
+		Ok(measurements)
+	}
+
+	/// Inner implementation of `fetch_measurements_for_chunk` without retry
+	async fn fetch_measurements_for_chunk_inner_impl(
+		&self,
+		aspect_id: &AspectId,
+		chunk_start: DateTime<Utc>,
+		chunk_end: DateTime<Utc>,
+	) -> Result<Vec<Measurement>> {
+		let db = self.get_measurement_db(aspect_id).await?;
+		let db_path = self.get_measurement_db_path(aspect_id).await?;
+		let conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+
+		let query_sql = "SELECT id, dataset_id, timestamp, value FROM measurements WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp ASC";
+		let mut rows: turso::Rows = conn.as_ref().query(
+			query_sql,
+			turso::params![chunk_start.timestamp_millis(), chunk_end.timestamp_millis()]
+		).await.map_err(|e| Error::DatabaseError(format!("Failed to query measurements: {e}")))?;
+
+		let mut measurements: Vec<Measurement> = Vec::new();
+		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get measurement row: {e}")))? {
+			let m = Self::parse_measurement_row_static(&row)?;
+			measurements.push(m);
+		}
+
+		let _ = Self::commit_concurrent(&conn).await;
+		Ok(measurements)
+	}
+}
+
 /// Helper methods for streaming operations that don't require &self
 impl Database {
 	/// Fetch a correlation by ID without requiring &self (for use in streaming closures)
@@ -1481,10 +1608,51 @@ impl Database {
 	}
 
 	fn parse_measurement_row_static(row: &turso::Row) -> Result<Measurement> {
-		let id_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("ID is not text".to_string()))?.clone();
-		let dataset_id_str = row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Dataset ID is not text".to_string()))?.clone();
-		let timestamp_millis: i64 = *row.get_value(2)?.as_integer().ok_or_else(|| Error::DatabaseError("Timestamp is not integer".to_string()))?;
-		let value_str = row.get_value(3)?.as_text().ok_or_else(|| Error::DatabaseError("Value is not text".to_string()))?.clone();
+		// During concurrent compression (DELETE + INSERT), MVCC reads can observe partial states
+		// where type casting fails. Return TransientMvccError for these cases to allow retries.
+		let id_val = row.get_value(0)?;
+		let id_str = match id_val.as_text() {
+			Some(s) => s.clone(),
+			None => {
+				return Err(Error::TransientMvccError(
+					"ID field type mismatch - concurrent compression in progress".to_string(),
+				)
+				.into());
+			}
+		};
+
+		let dataset_id_val = row.get_value(1)?;
+		let dataset_id_str = match dataset_id_val.as_text() {
+			Some(s) => s.clone(),
+			None => {
+				return Err(Error::TransientMvccError(
+					"Dataset ID field type mismatch - concurrent compression in progress".to_string(),
+				)
+				.into());
+			}
+		};
+
+		let timestamp_val = row.get_value(2)?;
+		let timestamp_millis: i64 = match timestamp_val.as_integer() {
+			Some(i) => *i,
+			None => {
+				return Err(Error::TransientMvccError(
+					"Timestamp field type mismatch - concurrent compression in progress".to_string(),
+				)
+				.into());
+			}
+		};
+
+		let value_val = row.get_value(3)?;
+		let value_str = match value_val.as_text() {
+			Some(s) => s.clone(),
+			None => {
+				return Err(Error::TransientMvccError(
+					"Value field type mismatch - concurrent compression in progress".to_string(),
+				)
+				.into());
+			}
+		};
 
 		let id = MeasurementId::from_string(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for measurement ID: {e}")))?;
 		let dataset_id = DatasetId::from_str(&dataset_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for dataset ID: {e}")))?;

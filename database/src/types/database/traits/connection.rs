@@ -27,8 +27,8 @@ pub trait Connection {
 	/// Commit an immediate transaction
 	async fn commit_immediate(conn: &cache::Connection) -> Result<()>;
 
-	/// Checkpoint the WAL (Write-Ahead Log) to flush pending writes to the main database file.
-	/// This should be called after large batch operations to ensure data is persisted.
-	/// Uses PRAGMA `wal_checkpoint(TRUNCATE)` to checkpoint and truncate the WAL file.
-	async fn checkpoint_wal(turso_db: &turso::Database) -> Result<()>;
+	/// Non-blocking WAL checkpoint using PASSIVE mode.
+	/// This checkpoints as much as possible without blocking readers/writers.
+	/// Safe to use with MVCC concurrent transactions.
+	async fn checkpoint_wal_passive(turso_db: &turso::Database) -> Result<()>;
 }

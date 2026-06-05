@@ -38,7 +38,7 @@ fn benchmark_strategy_selection(c: &mut Criterion) {
 
 					let db = Database::new(&db_name).await.unwrap();
 					let subject = db.observe_subject("strategy_subject").await.unwrap();
-					let aspect = db.track_aspect(&subject.id(), "strategy_aspect", &resolution).await.unwrap();
+					let aspect = db.track_aspect(&subject.id(), "strategy_aspect", &resolution, None).await.unwrap();
 
 					// Generate test data using batch insertion for efficiency
 					let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();

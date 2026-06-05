@@ -31,4 +31,20 @@ pub enum Error {
 
 	#[error("Numeric conversion error: {0}")]
 	NumericConversionError(String),
+
+	#[error("Transient MVCC error (retryable): {0}")]
+	TransientMvccError(String),
+}
+
+impl Error {
+	/// Check if this error is a transient MVCC error that should be retried
+	#[must_use]
+	pub const fn is_transient_mvcc(&self) -> bool {
+		matches!(self, Self::TransientMvccError(_))
+	}
+}
+
+/// Check if an anyhow error contains a transient MVCC error
+pub fn is_transient_mvcc_error(err: &anyhow::Error) -> bool {
+	err.downcast_ref::<Error>().is_some_and(Error::is_transient_mvcc)
 }

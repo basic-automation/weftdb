@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use splimes::Resolution;
 
-use crate::{cache::Connection, Aspect, AspectId, Database, DatabaseId, DatabaseInfo, Subject, SubjectId, Transaction, TxId};
+use crate::{cache::Connection, compression::CompressionConfig, Aspect, AspectId, Database, DatabaseId, DatabaseInfo, Subject, SubjectId, Transaction, TxId};
 
 /// Trait for database structure operations
 /// This trait defines the operations related to managing the structure of the database.
@@ -29,7 +29,9 @@ pub trait DatabaseStructure {
 	async fn create_turso_database(path: &str) -> Result<turso::Database>;
 
 	/// get or create Turso database, ensuring proper caching and avoiding conflicts
-	async fn get_or_create_turso_database(path: &str) -> Result<turso::Database>;
+	/// Returns (database, `was_newly_created`) - `was_newly_created` is true if the database
+	/// was just created, false if it was retrieved from cache
+	async fn get_or_create_turso_database(path: &str) -> Result<(turso::Database, bool)>;
 
 	/// get database id
 	fn id(&self) -> DatabaseId;
@@ -103,7 +105,7 @@ pub trait DatabaseStructure {
 	// Aspects
 
 	/// Creates and initializes a new Aspect
-	async fn track_aspect(&self, subject_id: &SubjectId, name: &str, resolution: &Resolution) -> Result<Aspect>;
+	async fn track_aspect(&self, subject_id: &SubjectId, name: &str, resolution: &Resolution, compression_config: Option<CompressionConfig>) -> Result<Aspect>;
 
 	/// Get an Aspect by its ID
 	async fn get_aspect(&self, id: &AspectId) -> Result<Aspect>;
@@ -173,4 +175,13 @@ pub trait DatabaseStructure {
 
 	/// get dictionary db by aspect id and dictionary name
 	async fn get_dictionary_db(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<turso::Database>;
+
+	/// Check if database is currently locked
+	/// Returns true if locked, false if available
+	/// Uses a minimal timeout (100ms) to avoid blocking
+	async fn is_locked(&self) -> bool;
+
+	/// Check if a specific measurement database is locked
+	/// This is more accurate for plot updates since `analyze_range` queries the measurement DB
+	async fn is_measurement_db_locked(&self, aspect_id: &AspectId) -> bool;
 }

@@ -188,4 +188,19 @@ pub trait Inputs {
 	async fn clear_processed_events(&self, aspect_id: &AspectId) -> Result<TxId>;
 
 	async fn cleanup_processed_events(&self, aspect_id: &AspectId, older_than: chrono::DateTime<chrono::Utc>) -> Result<TxId>;
+
+	//
+	// Compression
+	//
+
+	/// Replace measurements in a time range with new compressed measurements.
+	/// This is an atomic delete + insert operation used during compression.
+	///
+	/// # Arguments
+	/// * `aspect_id` - The aspect containing the measurements
+	/// * `dataset_id` - The dataset ID for the new measurements
+	/// * `start` - Start of the time range (inclusive)
+	/// * `end` - End of the time range (inclusive)
+	/// * `new_measurements` - The compressed measurements to insert
+	async fn replace_measurements_in_range(&self, aspect_id: &AspectId, dataset_id: &DatasetId, start: DateTime<Utc>, end: DateTime<Utc>, new_measurements: Vec<InputMeasurement>) -> Result<()>;
 }

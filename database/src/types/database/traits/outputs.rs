@@ -42,6 +42,9 @@ pub trait Outputs {
 
 	async fn fetch_measurements_for_range(&self, aspect_id: &AspectId, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<Pin<Box<dyn Stream<Item = Result<Measurement>> + Send + 'static>>>;
 
+	/// Fetch measurements for a specific time chunk (used by `analyze_range` for chunked streaming)
+	async fn fetch_measurements_for_chunk(&self, aspect_id: &AspectId, chunk_start: DateTime<Utc>, chunk_end: DateTime<Utc>) -> Result<Vec<Measurement>>;
+
 	//
 	// UnprocessedBatches
 	//

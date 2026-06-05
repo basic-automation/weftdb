@@ -18,8 +18,37 @@ static CORRELATIONS_DB_FILENAME: &str = "correlations.db";
 static PIPELINE_DB_FILENAME: &str = "pipeline.db";
 static DICTIONARIES_DB_FOLDERNAME: &str = "dictionaries";
 
-// Default data directory - can be overridden with environment variable
-pub const DEFAULT_DATA_DIR: &str = "C:\\Users\\physi\\Desktop\\dsp_data";
+/// Returns the portable, per-user default data directory for DSP databases.
+///
+/// No hard-coded paths: this resolves to a writable, machine-independent location
+/// for the current user. Resolution order:
+/// 1. `~/.dsp/data` — consistent with the `dsp-tui` home directory (`~/.dsp`).
+/// 2. The platform data directory + `dsp` (e.g. `%APPDATA%\dsp`,
+///    `~/Library/Application Support/dsp`, `~/.local/share/dsp`) when the home
+///    directory cannot be determined.
+/// 3. A relative `dsp_data` directory as a last resort.
+#[must_use]
+pub fn default_data_dir() -> String {
+	dirs::home_dir()
+		.map(|home| home.join(".dsp").join("data"))
+		.or_else(|| dirs::data_dir().map(|data| data.join("dsp")))
+		.unwrap_or_else(|| PathBuf::from("dsp_data"))
+		.to_string_lossy()
+		.into_owned()
+}
+
+/// Returns the active data directory for DSP databases.
+///
+/// Resolution order:
+/// 1. `TEST_DATA_DIR` — explicit override (used by the test suite).
+/// 2. `DSP_DATA_DIR` — shared override, also honored by `dsp-tui` for its logs.
+/// 3. [`default_data_dir`] — the portable per-user default.
+#[must_use]
+pub fn data_dir() -> String {
+	std::env::var("TEST_DATA_DIR")
+		.or_else(|_| std::env::var("DSP_DATA_DIR"))
+		.unwrap_or_else(|_| default_data_dir())
+}
 
 // Version information
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -141,6 +170,6 @@ impl Config for Database {
 	}
 
 	fn get_data_dir() -> String {
-		std::env::var("TEST_DATA_DIR").unwrap_or_else(|_| DEFAULT_DATA_DIR.to_string())
+		data_dir()
 	}
 }

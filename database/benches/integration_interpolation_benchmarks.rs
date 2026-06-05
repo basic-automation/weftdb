@@ -45,7 +45,7 @@ fn benchmark_production_workloads(c: &mut Criterion) {
 						// Create database and setup data
 						let db = Database::new(&db_name).await.unwrap();
 						let subject = db.observe_subject("benchmark_subject").await.unwrap();
-						let aspect = db.track_aspect(&subject.id(), "benchmark_aspect", &Resolution::Seconds).await.unwrap();
+						let aspect = db.track_aspect(&subject.id(), "benchmark_aspect", &Resolution::Seconds, None).await.unwrap();
 
 						// Add test data using batch for efficiency
 						let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -128,7 +128,7 @@ fn benchmark_full_integration_pipeline(c: &mut Criterion) {
 						// Create database
 						let db = Database::new(&db_name).await.unwrap();
 						let subject = db.observe_subject("pipeline_subject").await.unwrap();
-						let aspect = db.track_aspect(&subject.id(), "pipeline_aspect", &Resolution::Seconds).await.unwrap();
+						let aspect = db.track_aspect(&subject.id(), "pipeline_aspect", &Resolution::Seconds, None).await.unwrap();
 
 						// Ingest data using batch
 						let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();

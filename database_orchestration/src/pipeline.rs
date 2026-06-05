@@ -748,6 +748,81 @@ impl Pipeline {
 		Ok(())
 	}
 
+	/// Runs compression on the aspect's raw measurements.
+	///
+	/// Delegates to `Aspect::compress()` which applies the compression configuration
+	/// stored in the Aspect's metadata. Compression is permanent/lossy and replaces
+	/// the original measurements with compressed versions.
+	///
+	/// # Compression Modes
+	///
+	/// - **Time-based**: Data within a "pure" time range stays uncompressed;
+	///   older data gets progressively more compressed based on tiers.
+	/// - **Size-based**: Compress to fit within a maximum size (takes precedence).
+	///
+	/// # Errors
+	///
+	/// Returns an error if:
+	/// - The aspect has no compression config set
+	/// - Database operations fail
+	///
+	/// # Example
+	///
+	/// ```ignore
+	/// // Configure compression on the aspect first
+	/// let mut aspect = database.get_aspect(&aspect_id).await?;
+	/// aspect.set_compression_config(Some(CompressionConfig::time_based(
+	///     TimeBasedCompressionConfig::default_seven_years()
+	/// ))).await?;
+	///
+	/// // Then run compression via pipeline
+	/// let mut pipeline = Pipeline::load_or_create(database, &aspect_id).await?;
+	/// let summary = pipeline.compress_data().await?;
+	/// println!("Compressed {} -> {} measurements", summary.total_original_count, summary.total_compressed_count);
+	/// ```
+	pub async fn compress_data(&mut self) -> Result<database::compression::CompressionSummary> {
+		compress_aspect(&self.database, &self.aspect_id).await
+	}
+
+	/// Runs the full pipeline with an optional compression step.
+	///
+	/// This is a convenience method that runs compression before the standard pipeline
+	/// steps if the aspect has a compression configuration.
+	///
+	/// # Errors
+	///
+	/// Returns an error if any pipeline step fails.
+	pub async fn run_with_compression(&mut self) -> Result<()> {
+		let start_time = std::time::Instant::now();
+		tracing::info!(aspect_id = %self.aspect_id, "Starting pipeline run with compression");
+
+		// Check if compression is configured
+		let aspect = self.database.get_aspect(&self.aspect_id).await?;
+		if aspect.compression_config().is_some() {
+			self.compress_data().await?;
+		} else {
+			tracing::debug!("No compression config set, skipping compression step");
+		}
+
+		// Run standard pipeline steps
+		self.prepare_data().await?;
+		self.extract_patterns().await?;
+		self.detect_events().await?;
+		self.correlate_events().await?;
+		self.generate_signals().await?;
+
+		// Update state
+		self.state.record_run();
+		self.save().await?;
+
+		tracing::info!(
+			elapsed = ?start_time.elapsed(),
+			run_count = self.state.run_count,
+			"Pipeline run with compression completed"
+		);
+		Ok(())
+	}
+
 	/// Runs data preparation with full batch rebuild (ignores incremental processing).
 	///
 	/// This forces a complete rebuild of all batches, useful when the resolution or
@@ -1364,4 +1439,24 @@ impl std::fmt::Display for ProbabilityResult {
 
 		write!(f, "ProbabilityResult {{ sum: {sum_str}, average: {avg_str}, event_based: {event_str} }}")
 	}
+}
+
+/// Helper function to compress aspect data.
+///
+/// This is extracted as a free function to avoid type recursion issues with async
+/// methods on complex structs.
+async fn compress_aspect(database: &Database, aspect_id: &AspectId) -> Result<database::compression::CompressionSummary> {
+	tracing::info!(aspect_id = %aspect_id, "Running compression...");
+
+	let mut aspect = database.get_aspect(aspect_id).await?;
+	let summary = aspect.compress(database).await?;
+
+	tracing::info!(
+		original = summary.total_original_count,
+		compressed = summary.total_compressed_count,
+		ratio = %summary.overall_compression_ratio(),
+		"Compression completed"
+	);
+
+	Ok(summary)
 }

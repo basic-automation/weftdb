@@ -63,8 +63,9 @@ fn deserialize_error_rates<'de, D>(deserializer: D) -> Result<HashMap<SignalType
 where
 	D: Deserializer<'de>,
 {
-	use serde::de::Error;
 	use std::str::FromStr;
+
+	use serde::de::Error;
 	let string_map: HashMap<String, ErrorRate> = HashMap::deserialize(deserializer)?;
 	let mut result = HashMap::new();
 
