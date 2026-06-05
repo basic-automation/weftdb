@@ -1,0 +1,23 @@
+[package]
+name = "dsm-database"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+axum = {version = "*", features= ["macros"]}
+serde = { version = "*", features = ["derive"] }
+serde_json = "*"
+tokio = { version = "*", features = ["full"] }
+sled = "*"
+serde_qs = "*"
+bigdecimal = { version = "*", features = ["serde"] }
+uuid = { version = "*", features = ["v4", "fast-rng", "macro-diagnostics"] }
+
+[profile.release]
+strip = true
+opt-level = "s"
+debug = 0
+lto = "fat"
+codegen-units = 1

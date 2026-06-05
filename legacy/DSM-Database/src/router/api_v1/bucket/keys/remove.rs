@@ -1,0 +1,36 @@
+use super::super::*;
+use axum::extract::rejection::JsonRejection;
+use axum::http::StatusCode;
+use axum::{extract::Path, extract::State, Json};
+use serde::Deserialize;
+use serde_json::json;
+use serde_json::Value;
+use sled::Db;
+
+#[derive(Deserialize)]
+pub struct RemoveFromBucketParams {
+	pub debug: Option<bool>,
+}
+
+pub async fn remove_from_bucket(Path(path): Path<Vec<String>>, Qs(params): Qs<DeleteBucketParams>, State(db): State<Db>, _body: Result<Json<Value>, JsonRejection>) -> (StatusCode, Json<Value>) {
+	let bucket = path[0].clone();
+	let key = path[1].clone();
+	let debug = params.debug.unwrap_or(false);
+
+	let bucket = match Bucket::open(&bucket, db.clone()).await {
+		Ok(bucket) => bucket,
+		Err(err) => return (err.0, err_debug(&err.1, db.clone(), debug).await),
+	};
+
+	let value = match bucket.key_remove(&key, db.clone()).await {
+		Ok(val) => val,
+		Err(err) => return (err.0, err_debug(&err.1, db.clone(), debug).await),
+	};
+
+	if debug {
+		let debugdb = DebugDb { db: db.clone() };
+		(StatusCode::OK, Json(json!({ "value": value, "db": debugdb })))
+	} else {
+		(StatusCode::OK, Json(json!(value)))
+	}
+}
