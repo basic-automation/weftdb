@@ -1,0 +1,29 @@
+[package]
+name = "database"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sqlx = { workspace = true, features = ["bigdecimal", "bit-vec", "bstr", "chrono", "runtime-tokio", "rust_decimal", "sqlite", "sqlx-macros", "sqlx-sqlite", "time", "uuid"] }
+tokio = { workspace = true, features = ["full"] }
+bigdecimal = { workspace = true, features = ["serde", "serde-json", "string-only"] }
+uuid = { workspace = true, features = ["v4", "fast-rng", "serde", "zerocopy"] }
+fake = { workspace = true, features = ["chrono", "uuid", "bigdecimal", "serde_json", "derive"] }
+chrono = { workspace = true, features = ["serde", "pure-rust-locales"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+futures = { workspace = true , features = ["unstable", "thread-pool"] }
+rand = { workspace = true, features = ["nightly", "serde", "simd_support", "unbiased"] }
+tokio-test = { workspace = true, features = [] }
+
+[dev-dependencies]
+criterion = { workspace = true, features = ["html_reports", "async_tokio"] }
+
+[[bench]]
+name = "interpolation_benchmarks"
+harness = false
+
+[[bench]]
+name = "integration_interpolation_benchmarks"
+harness = false
