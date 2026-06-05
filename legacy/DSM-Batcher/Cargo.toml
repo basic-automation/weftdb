@@ -1,0 +1,30 @@
+[package]
+name = "dsm-batcher"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+axum = {version = "*", features= []}
+serde = { version = "*", features = ["derive"] }
+serde_json = "*"
+tokio = { version = "*", features = ["full"] }
+dsm_measurement = { path = "../1 - dsm-measurement" }
+dsm_batch = { path = "../4 - dsm-batch" }
+reqwest = {version = "*", features=["json"]}
+uuid = {version="*", features=["v4", "fast-rng", "macro-diagnostics", "serde"]}
+bigdecimal = {version="*", features=["serde"]}
+num-bigint = { version="*", features = ["serde"] }
+dsm_config = { path = "../dsm-config" }
+rayon = "*"
+futures = "*"
+threadpool = "*"
+rand= "*"
+
+[profile.release]
+strip = false
+opt-level = "s"
+debug = 0
+lto = true
+codegen-units = 1
