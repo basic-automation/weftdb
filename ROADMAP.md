@@ -207,6 +207,29 @@ and configuration API. Phases 5+ unlock the remaining performance and introduce 
 asynchronous operation. Everything integrates via `interpolate_f64_static` /
 `interpolate_f32_static` with no breaking public-API changes.
 
+### Phases 1–4 — completed (what shipped)
+
+The GPU foundation already lives in `splimes/src/gpu/`:
+
+| Phase | Module | What it does |
+|-------|--------|--------------|
+| 1 — Buffer pool | `buffer_pool.rs` | Size-tiered (4 KB–128 MB), LRU-evicted pool; cut allocations from 7,000+ to <50 per 1M-point run. |
+| 2 — Staging buffers | `staging_buffer_manager.rs` | 3-buffer round-robin with persistent mapping; removes unmap/remap cycles. |
+| 3 — Async handle | `async_handle.rs` | `GpuInterpolationResult<T>` + `IntoFuture` for an async-compatible interface (computes synchronously today; true async is Phase 5.5). |
+| 4 — Configuration | `config.rs` | `GpuConfig` presets + `prewarm_gpu_with_config()` / `gpu_buffer_pool_stats()`. |
+
+GPU configuration presets:
+
+| Preset | Pool memory | Staging buffers | Command batch |
+|--------|-------------|-----------------|---------------|
+| `minimal()` | 64 MB | 1 | 4 |
+| `low_memory()` | 128 MB | 2 | 8 |
+| `default()` | 512 MB | 3 | 16 |
+| `high_performance()` | 1 GB | 4 | 32 |
+
+*(Distilled from the former `GPU_OPTIMIZATION_COMPLETE.md`, `OPTIMIZATION_ANALYSIS.md`,
+and `IMPLEMENTATION_SUMMARY.md`, now removed.)*
+
 ### Phase 5 — Command Batching (est. +50 ms)
 
 **Goal:** reduce GPU queue-submission overhead by batching operations. Today each
