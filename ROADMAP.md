@@ -53,16 +53,27 @@ other processes.
 
 ---
 
-## Theme 3 — Query-Layer Enhancements 🟡
+## Theme 3 — Query-Layer Interpolation ✅ (already implemented)
 
-DSP interpolates in-process (CPU/GPU/SIMD) but doesn't expose interpolation as a
-*query option*, and can't answer beyond the data's edges.
+**Correction:** an earlier draft listed query-time interpolation/extrapolation as a
+gap. It is not — DSP already does everything the predecessors did here, in-process
+via `splimes`:
 
-| # | Item | Status | Source | Value/Effort |
-|---|------|--------|--------|--------------|
-| 3.1 | **Interpolate-on-read** — a query flag that returns a series gap-filled/aligned to an interval, wiring `splimes` into the query path (analogous to Influx `interpolate.linear(every:)`). | 🟡 | `legacy/dsm-influxdb`, `legacy/DSM-Database` | Med-High / Med |
-| 3.2 | **Single-timestamp `?interpolate` lookup** — ask for *any* instant and get an exact or interpolated value in one call (great for the TUI and clients). | 🟡 | `legacy/DSM-Database` | Med / Low |
-| 3.3 | **Out-of-range linear extrapolation** — extend gracefully beyond the dataset's first/last point using the two nearest samples, auto-tagging results as synthetic. | 🔴 | `legacy/DSM-Database` (`get/interp.rs`) | Med / Med |
+- **Interpolate-on-read** and **single-instant lookup** — `Outputs::analyze_range`
+  returns a series gap-filled/aligned to the requested `Resolution`, and
+  `Outputs::analyze_point` returns the interpolated value at *any* instant. Both
+  delegate to `splimes::auto_interpolate`, which *"handles both interpolation and
+  extrapolation"* (`database/src/types/database/outputs.rs`).
+- **Out-of-range extrapolation** — every method extrapolates beyond the data's
+  edges (linear / quadratic / cubic / polynomial, on CPU, SIMD, **and** GPU;
+  polynomial additionally supports `bounds_factor` damping). Exercised by
+  `test_analyze_point_extrapolation_forward` / `_backward` in
+  `database/tests/db_tests.rs`.
+
+The one genuinely-open nuance — **marking interpolated/extrapolated points as
+synthetic in the returned data** — is folded into item 4.1 (per-measurement tags):
+`analyze_point` already *describes* the operation (e.g. "forward extrapolation") in
+its returned strategy string, but the `Point` itself carries no synthetic flag.
 
 ---
 
@@ -139,7 +150,7 @@ DSP uses `tracing` (event/line logging). The predecessors complemented this with
 
 ## Suggested sequencing
 
-1. **Foundation (model + query):** 4.1 tags → 3.1/3.2/3.3 query-time interpolation & extrapolation → 2.2 query-params type. These are self-contained and unlock everything downstream.
+1. **Foundation (model + query):** 4.1 tags (this also delivers the one open nuance from Theme 3 — marking synthetic points) → 2.2 query-params type. These are self-contained and unlock everything downstream.
 2. **Connectors:** 1.1 connector trait → 1.2 InfluxDB → 1.3 Thorchain → 1.4/1.5 scheduled polling + retry buffer.
 3. **Service:** 2.1 REST facade → 1.6 runtime source registration → 2.3 pagination.
 4. **Analysis depth:** 6.1–6.4 pattern similarity/dedup → 4.2 per-point analysis completion → 5.1/5.2 windowing.
@@ -156,7 +167,7 @@ DSP uses `tracing` (event/line logging). The predecessors complemented this with
 | [`legacy/dsm-influxdb`](legacy/dsm-influxdb) | InfluxDB 2.x client, line protocol, Flux, `interpolate.linear` |
 | [`legacy/DSM-Thorchain`](legacy/DSM-Thorchain) | Midgard price client (BigDecimal), windowed backfill, HTTP ingestion service |
 | [`legacy/DSM-Input-Module`](legacy/DSM-Input-Module) | Per-source scheduling, retry buffer, runtime source registration |
-| [`legacy/DSM-Database`](legacy/DSM-Database) | REST surface, tags, object buckets, query params, pagination, on-read interp/extrapolation |
+| [`legacy/DSM-Database`](legacy/DSM-Database) | REST surface, tags, object buckets, query params, pagination |
 | [`legacy/DSM-Measurement`](legacy/DSM-Measurement) | Enriched measurement model (raw-vs-processed, per-point analytics) |
 | [`legacy/database`](legacy/database) | Retry+backoff writes, size-tiered batching, window extension, typed errors, TTL/LRU cache |
 | [`legacy/dsm-batch`](legacy/dsm-batch) | Sliding windows, event-UUID dedup, horizon→interp mapping, MessagePack |
