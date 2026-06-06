@@ -1,4 +1,4 @@
-# Interpolation Methods Buffer Pool Update - Summary
+# Changelog
 
 ## Overview
 Updated the GPU interpolation methods (`interpolate_f64_static` and `interpolate_f32_static`) to use the buffer pool instead of creating buffers directly. This improves memory efficiency and reduces allocation overhead.

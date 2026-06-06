@@ -497,10 +497,8 @@ DSP/
     └── src/                    # app state machine, rendering, logging
 ```
 
-Additional design notes live in the repo root and crate directories:
-[`ROADMAP.md`](ROADMAP.md), [`IMPLEMENTATION_SUMMARY.md`](IMPLEMENTATION_SUMMARY.md),
-[`GPU_OPTIMIZATION_COMPLETE.md`](GPU_OPTIMIZATION_COMPLETE.md), and
-[`OPTIMIZATION_ANALYSIS.md`](OPTIMIZATION_ANALYSIS.md).
+Additional design notes live in [`ROADMAP.md`](ROADMAP.md); release notes in
+[`CHANGELOG.md`](CHANGELOG.md).
 
 ---
 
