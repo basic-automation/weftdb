@@ -24,14 +24,29 @@ Status legend: 🔴 absent today · 🟡 partial / verify-and-complete · 🟢 e
 ## Theme 1 — External Data Sources & Ingestion 🔴 (largest gap)
 
 Today DSP ingests via CSV import and direct API calls; it has **no connector
-framework and no live data feeds**. The predecessors collectively prove out a full
-connector architecture, from abstraction down to two working clients.
+framework and no live data feeds**. The predecessors prove out a full connector
+architecture, from a vendor-neutral abstraction down to concrete clients.
+
+> **Design principle — vendor neutrality (hard constraint).** The DSP codebase
+> defines **only** a vendor-neutral connector abstraction: ideally a small dedicated
+> crate (e.g. `dsp-connector`) holding the `Source`/`Connector` trait, shared types,
+> and a runtime registry. **Every concrete connector — Thorchain, InfluxDB, CSV, … —
+> lives outside the DSP core as its own pluggable crate that depends on the
+> abstraction, never the reverse.** No vendor-specific code, types, or dependencies
+> (no Midgard/Thorchain client, no Influx client) may enter the core crates or the
+> active workspace. Thorchain is just *one of many* sources and must not be coupled
+> to DSP; connectors self-register into the runtime registry so DSP can drive any
+> source it is handed without knowing what it is.
+>
+> The same boundary applies to storage: **Turso/libSQL is DSP's store.** External
+> databases such as InfluxDB are *integrations* reached through connectors (as a
+> source and/or a sink) — never replacement backends.
 
 | # | Item | Status | Source | Value/Effort |
 |---|------|--------|--------|--------------|
-| 1.1 | **Connector trait + source registry.** A `Source`/`ToAsset`-style abstraction where each connector self-describes which `Subject`/`Aspect` it feeds and how to fetch it; string-keyed selection for config/CLI. | 🔴 | `legacy/dsm-source`, `legacy/dsm-asset` | High / Med |
-| 1.2 | **InfluxDB 2.x connector** — read (Flux), write (line protocol), and predicate delete over the v2 HTTP API. Gives DSP interop with the dominant TSDB as both a source and a sink. | 🔴 | `legacy/dsm-influxdb`, `legacy/dsm-batch/src/influxdb2` | High / Med |
-| 1.3 | **Thorchain / Midgard price-feed connector** — pull windowed BTC (and other pool) price history, gated on pool liveness, normalized into native `Measurement`s. A working template for "remote time-series → DSP." | 🔴 | `legacy/DSM-Thorchain` | Med / Low |
+| 1.1 | **Connector abstraction (core, vendor-neutral).** A `Source`/`Connector` trait + runtime registry: each connector self-describes which `Subject`/`Aspect` it feeds and how to fetch/normalize into native `Measurement`s; string-keyed selection for config/CLI. **This trait is the only connector code that lives in the DSP codebase.** | 🔴 | `legacy/dsm-source`, `legacy/dsm-asset` | High / Med |
+| 1.2 | **InfluxDB 2.x connector (separate crate, interop only).** Reference connector implementing the 1.1 trait against an *external* Influx instance — as a **source** (Flux query → ingest into DSP) and/or a **sink** (export DSP measurements via line protocol; predicate delete). **Not a storage swap — Turso/libSQL stays the store.** Lives outside the core with its own `reqwest`/Influx deps. | 🔴 | `legacy/dsm-influxdb`, `legacy/dsm-batch/src/influxdb2` | High / Med |
+| 1.3 | **Thorchain / Midgard connector (separate crate).** One of many sources, kept entirely out of the DSP codebase: an external crate implementing the 1.1 trait to pull windowed pool price history (liveness-gated) and normalize it. Proves the abstraction supports arbitrary remote feeds without any vendor code in core. | 🔴 | `legacy/DSM-Thorchain` | Med / Low |
 | 1.4 | **Scheduled polling daemon** — one task per source with a **per-source configurable interval**, continuously producing measurements + `measurement_add` events. | 🔴 | `legacy/DSM-Input-Module` | High / Med |
 | 1.5 | **Ingestion retry buffer (at-least-once).** On write failure, push measurements back into an unprocessed buffer and retry next cycle instead of dropping; distinguish connection errors from others to gate retries. | 🔴 | `legacy/DSM-Input-Module` | Med / Low |
 | 1.6 | **Runtime source registration** — add/remove feeds live (the old crate exposed `POST /sources/add` persisting to a sources bucket). Pairs with the service API in Theme 2. | 🔴 | `legacy/DSM-Input-Module` | Med / Med |
@@ -151,7 +166,7 @@ DSP uses `tracing` (event/line logging). The predecessors complemented this with
 ## Suggested sequencing
 
 1. **Foundation (model + query):** 4.1 tags (this also delivers the one open nuance from Theme 3 — marking synthetic points) → 2.2 query-params type. These are self-contained and unlock everything downstream.
-2. **Connectors:** 1.1 connector trait → 1.2 InfluxDB → 1.3 Thorchain → 1.4/1.5 scheduled polling + retry buffer.
+2. **Connectors:** 1.1 vendor-neutral connector trait (in core) → 1.2 InfluxDB and 1.3 Thorchain as *separate, out-of-core* connector crates → 1.4/1.5 scheduled polling + retry buffer.
 3. **Service:** 2.1 REST facade → 1.6 runtime source registration → 2.3 pagination.
 4. **Analysis depth:** 6.1–6.4 pattern similarity/dedup → 4.2 per-point analysis completion → 5.1/5.2 windowing.
 5. **Hardening & ops:** Theme 7 audits → 8.1 snapshot observability.
