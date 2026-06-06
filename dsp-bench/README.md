@@ -1,0 +1,47 @@
+# dsp-bench
+
+DSP-Bench is DSP's reproducible, correctness-gated benchmark harness — the first
+track of the roadmap's benchmark-led commercial thesis. It is both an internal
+engineering suite and a public/customer-runnable diagnostic: every number it
+emits ships with the dataset seed, the workload profile, and a correctness
+verdict, so results are reproducible and trustworthy rather than synthetic wins.
+
+> Policy: *DSP benchmarks guide real engineering decisions, not synthetic wins.*
+> A latency number is only publishable when its correctness check passes.
+
+## Status — scaffold
+
+This is the initial scaffold. What exists today:
+
+- **Workload profile + dataset generator** (`src/profile.rs`) — the flagship
+  `interpolation-heavy-irregular` profile generates a seeded, irregularly-spaced,
+  gap-containing series over a fixed time span (`ChaCha8Rng`, published seed →
+  byte-for-byte reproducible).
+- **Vendor-neutral adapter trait** (`src/adapter.rs`) — every benchmarked system
+  is driven through `SystemAdapter`; concrete adapters stay decoupled from the
+  harness core, mirroring the roadmap's connector hard-constraint.
+- **DSP reference adapter** (`src/dsp_adapter.rs`) — drives DSP's native
+  interpolation engine (`splimes::auto_interpolate`).
+- **Result schema** (`src/schema.rs`) — serializable `BenchResult` capturing the
+  latency distribution, dataset metadata, and correctness verdict.
+- **Latency statistics** (`src/stats.rs`) — p50/p95/p99 + min/max/mean/stddev
+  (nearest-rank percentiles), per the fair-protocol requirements.
+- **Runner** (`run_profile` in `src/lib.rs`) — runs a profile against an adapter
+  for N timed reps and produces a `BenchResult`.
+
+## Not yet (tracked in `ROADMAP.md`)
+
+Competitor adapters (DuckDB, ClickHouse, InfluxDB 3, QuestDB, TimescaleDB),
+InfluxDB Line Protocol ingest, additional workloads (range fetch, downsample,
+compression, …), dataset corpora, bootstrap confidence intervals, report runners
+(JSON/Parquet/HTML), and the methodology document.
+
+## Run
+
+```sh
+cargo test -p dsp-bench
+```
+
+The smoke test generates the `interpolation-heavy-irregular` dataset, runs it
+through the DSP adapter, and asserts the produced grid is correctly sized,
+finite, and that the result schema round-trips through JSON.
