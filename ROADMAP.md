@@ -8,7 +8,8 @@ document is the distilled "what's worth carrying forward."
 
 It is organized by theme, roughly in priority order. Each item notes its
 **source** (the archived crate it came from), its **status** in current DSP, and a
-rough **value / effort** read.
+rough **value / effort** read. A final section folds in the **GPU acceleration
+roadmap** (Phases 5+) for `splimes`, consolidated from the former `PHASE5_ROADMAP.md`.
 
 > **Porting principle.** The legacy crates are edition-2021, lean heavily on
 > `.unwrap()`/`panic!`, hardcode credentials/URLs, and several are nightly-only
@@ -195,6 +196,122 @@ DSP uses `tracing` (event/line logging). The predecessors complemented this with
 
 ---
 
-*Generated from a review of the archived predecessor repositories. The `legacy/`
-crates are retained for reference and full git history; they are excluded from the
-active Cargo workspace build.*
+## GPU Acceleration Roadmap (Phases 5+)
+
+*A separate optimization track from the feature themes above: this targets DSP's own
+`splimes` GPU interpolation path rather than predecessor features. Consolidated here
+from the former `PHASE5_ROADMAP.md`.*
+
+Phases 1–4 are **complete** — buffer pool, persistent staging buffers, async handle,
+and configuration API. Phases 5+ unlock the remaining performance and introduce true
+asynchronous operation. Everything integrates via `interpolate_f64_static` /
+`interpolate_f32_static` with no breaking public-API changes.
+
+### Phase 5 — Command Batching (est. +50 ms)
+
+**Goal:** reduce GPU queue-submission overhead by batching operations. Today each
+batch submits its own command encoder (create encoder → record compute pass → copy to
+staging → `queue.submit()`), so submission cost is paid per batch.
+
+```rust
+let mut batcher = CommandBatcher::new(device, /* max_batch_size */ 10);
+for batch in all_batches {
+    batcher.add_compute_operation(/* ... */);
+    if batcher.is_full() {
+        batcher.flush(&queue); // single submit for 10 operations
+    }
+}
+batcher.flush(&queue); // flush remaining
+```
+
+- **Benefit:** `queue.submit()` calls drop from N to N/10 → ~50 ms for 1M points.
+- **Steps:** add `splimes/src/gpu/command_batcher.rs`; size-limited batching; integrate
+  into both `interpolate_*_static` paths; benchmark.
+- **Acceptance:** submissions reduced ~10×, +50 ms verified, batched results correct.
+
+### Phase 5.5 — Enhanced Async Infrastructure
+
+**Goal:** non-blocking GPU work tracking for true CPU–GPU parallelism. Phase 3's
+`GpuInterpolationResult<T>` exposes the async interface but still computes
+synchronously; the enhancement adds a deferred-readback handle:
+
+```rust
+pub struct GpuInterpolationHandle<T> {
+    staging_buffer: Arc<Buffer>,
+    submission_index: Option<SubmissionIndex>,
+    device: Arc<Device>,
+}
+
+impl<T> GpuInterpolationHandle<T> {
+    /// Non-blocking: returns None until GPU work completes.
+    pub fn try_poll(&mut self) -> Option<Result<Vec<T>>> { /* device.poll() check */ }
+    /// Blocking: ensure completion, then read.
+    pub fn block_until_complete(self) -> Result<Vec<T>> { /* device.poll(Wait) */ }
+}
+```
+
+- **Steps:** redesign `StagingBufferManager` for deferred unmapping; track submission
+  indices; non-blocking poll; wire into async/await.
+- **Benefit:** CPU–GPU parallelism for streaming/pipelined work; foundation for
+  concurrent interpolation calls.
+- **Acceptance:** non-blocking poll correct; CPU–GPU parallelism demonstrated.
+
+### Phase 6 — Memory-Mapped I/O (est. +30 ms)
+
+**Goal:** cut CPU↔GPU transfer overhead with persistent mapped buffers (zero-copy on
+hot paths) instead of `write_buffer` + unmap/remap cycles.
+
+- **Steps:** profile transfer overhead; identify bottleneck transfers; persistent
+  mapped buffers for hot paths; benchmark.
+- **Benefit:** ~20–30% less transfer overhead; better small-batch latency.
+
+### Phase 7 — Multi-GPU Support
+
+**Goal:** load-balance across multiple devices — extend `GLOBAL_INTERPOLATOR` to N
+devices with a workload distributor and GPU-affinity options.
+
+- **Benefit:** near-linear scaling with GPU count for large workloads; better use of
+  heterogeneous systems.
+- **Priority:** lower — after 5 / 5.5 / 6.
+
+### Performance prediction
+
+| Phase | Component | Savings | Cumulative |
+|-------|-----------|---------|------------|
+| 1 | Buffer pool | 80 ms | 80 ms |
+| 2 | Staging buffers | 150 ms | 230 ms |
+| 3 | Async handle | 100 ms\* | 330 ms\* |
+| 5 | Command batching | 50 ms | 380 ms\* |
+| 5.5 | Async I/O | 50 ms | 430 ms\* |
+| 6 | Memory mapping | 30 ms | 460 ms\* |
+
+\* Requires streamed/pipelined operation. Baseline single-call GPU ≈ 600–1400 ms;
+Phases 1–4 already reach ≈ 600–700 ms (~80% reduction); the full set targets streaming
+at **200–400 ms/batch**.
+
+### Priority, effort & order
+
+| Phase | Priority | Effort | Value |
+|-------|----------|--------|-------|
+| 5 | High | ~2 days | +50 ms → 380 ms total |
+| 5.5 | High | ~3 days | +50 ms + parallelism |
+| 6 | Medium | ~2 days | +30 ms + better latency |
+| 7 | Low | ~4 days | linear scaling |
+
+**Recommended order:** 5 → 5.5 → 6 → 7. **Timeline:** ~2–3 weeks for Phases 5–6
+(high value), 1+ week for Phase 7.
+
+### Testing & profiling
+
+Targeted tests: command batching reduces submissions ~10× and preserves correctness
+(Phase 5); async poll completes and concurrent interpolations work (Phase 5.5);
+persistent mapping measurably reduces transfers (Phase 6). Track GPU queue time,
+CPU–GPU transfer time, overall latency, GPU utilization, and pool memory; profile with
+`cargo flamegraph`, the `wgpu` validation layer, and custom timing instrumentation.
+
+---
+
+*Generated from a review of the archived predecessor repositories (Themes 1–8) and
+consolidated with DSP's GPU acceleration roadmap (Phases 5+, formerly
+`PHASE5_ROADMAP.md`). The `legacy/` crates are retained for reference and full git
+history; they are excluded from the active Cargo workspace build.*

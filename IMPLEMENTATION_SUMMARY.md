@@ -325,7 +325,7 @@ splimes/benches/
 ```
 ├── OPTIMIZATION_ANALYSIS.md
 ├── GPU_OPTIMIZATION_COMPLETE.md
-├── PHASE5_ROADMAP.md
+├── ROADMAP.md (now includes the former PHASE5_ROADMAP.md)
 └── IMPLEMENTATION_SUMMARY.md (this file)
 ```
 
@@ -404,7 +404,7 @@ ed56718 - refactor: Complete async GPU handle implementation
 **Complexity**: High
 **Recommended**: Later
 
-See `PHASE5_ROADMAP.md` for detailed information.
+See the "GPU Acceleration Roadmap (Phases 5+)" section of `ROADMAP.md` for detailed information.
 
 ---
 
@@ -433,7 +433,7 @@ The foundation is solid for achieving 60-75% performance improvements in streami
 
 For questions about the implementation:
 - See inline code comments for technical details
-- Review PHASE5_ROADMAP.md for future directions
+- Review ROADMAP.md (GPU Acceleration Roadmap section) for future directions
 - Check GPU_OPTIMIZATION_COMPLETE.md for design rationale
 - Examine integration tests for usage examples
 

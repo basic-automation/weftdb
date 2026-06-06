@@ -498,10 +498,9 @@ DSP/
 ```
 
 Additional design notes live in the repo root and crate directories:
-[`IMPLEMENTATION_SUMMARY.md`](IMPLEMENTATION_SUMMARY.md),
-[`GPU_OPTIMIZATION_COMPLETE.md`](GPU_OPTIMIZATION_COMPLETE.md),
-[`OPTIMIZATION_ANALYSIS.md`](OPTIMIZATION_ANALYSIS.md), and
-[`PHASE5_ROADMAP.md`](PHASE5_ROADMAP.md).
+[`ROADMAP.md`](ROADMAP.md), [`IMPLEMENTATION_SUMMARY.md`](IMPLEMENTATION_SUMMARY.md),
+[`GPU_OPTIMIZATION_COMPLETE.md`](GPU_OPTIMIZATION_COMPLETE.md), and
+[`OPTIMIZATION_ANALYSIS.md`](OPTIMIZATION_ANALYSIS.md).
 
 ---
 
@@ -521,9 +520,10 @@ Additional design notes live in the repo root and crate directories:
 
 ## Roadmap
 
-GPU optimization has completed Phases 1–4 (buffer pooling, persistent staging
-buffers, async handles, configuration API). Planned future work
-(see [`PHASE5_ROADMAP.md`](PHASE5_ROADMAP.md)):
+See [`ROADMAP.md`](ROADMAP.md) for the full roadmap — feature ideas harvested from
+DSP's predecessor repositories **and** the GPU acceleration track. GPU optimization
+has completed Phases 1–4 (buffer pooling, persistent staging buffers, async handles,
+configuration API); planned future work:
 
 - **Phase 5** — GPU command batching.
 - **Phase 5.5** — true async GPU I/O for CPU–GPU overlap.
