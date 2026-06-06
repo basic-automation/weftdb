@@ -28,13 +28,19 @@ This is the initial scaffold. What exists today:
   (nearest-rank percentiles), per the fair-protocol requirements.
 - **Runner** (`run_profile` in `src/lib.rs`) — runs a profile against an adapter
   for N timed reps and produces a `BenchResult`.
+- **JSON report runner** (`src/report.rs`) — wraps one or more `BenchResult`s in
+  a `BenchReport` envelope with lightweight run metadata (`dsp-bench` version,
+  OS, CPU arch, generation timestamp) and persists it as pretty-printed JSON to a
+  `reports/json/` artifact, satisfying the "keep raw results" reproducibility
+  rule. A report is publishable only when every result it holds is publishable.
 
 ## Not yet (tracked in `ROADMAP.md`)
 
 Competitor adapters (DuckDB, ClickHouse, InfluxDB 3, QuestDB, TimescaleDB),
 InfluxDB Line Protocol ingest, additional workloads (range fetch, downsample,
-compression, …), dataset corpora, bootstrap confidence intervals, report runners
-(JSON/Parquet/HTML), and the methodology document.
+compression, …), dataset corpora, bootstrap confidence intervals, the richer
+report formats (Parquet/HTML) and full hardware capture (CPU model, RAM, GPU,
+drivers) in run metadata, and the methodology document.
 
 ## Run
 
