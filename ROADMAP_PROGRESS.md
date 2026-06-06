@@ -64,4 +64,4 @@ results (exact counts) · done-vs-open · next step · PR.
   `VACUUM INTO` backups, audit triggers) lands in their mapped phases (7/8).
 - **Next step:** when Phase 7/8 work begins, implement `VACUUM INTO` control-plane
   backups and at-rest encryption for catalog/metadata DBs.
-- **PR:** _(filled below once opened)_
+- **PR:** https://github.com/physics515/DSP/pull/4
