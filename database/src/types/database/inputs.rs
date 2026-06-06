@@ -1041,7 +1041,7 @@ impl Inputs for Database {
 		conn.as_ref()
 			.execute(
 				r"CREATE TABLE IF NOT EXISTS dictionary_constraints (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			id INTEGER PRIMARY KEY,
 			dictionary_id TEXT NOT NULL,
 			steps_count INTEGER,
 			steps_interpolation TEXT
@@ -1053,7 +1053,7 @@ impl Inputs for Database {
 		conn.as_ref()
 			.execute(
 				r"CREATE TABLE IF NOT EXISTS dictionary_variabilities (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			id INTEGER PRIMARY KEY,
 			dictionary_id TEXT NOT NULL,
 			variability_type TEXT NOT NULL,
 			variability_value TEXT NOT NULL
@@ -1065,7 +1065,7 @@ impl Inputs for Database {
 		conn.as_ref()
 			.execute(
 				r"CREATE TABLE IF NOT EXISTS dictionary_patterns (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			id INTEGER PRIMARY KEY,
 			dictionary_id TEXT NOT NULL,
 			pattern_id TEXT NOT NULL,
 			added_at INTEGER NOT NULL
