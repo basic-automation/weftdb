@@ -595,13 +595,20 @@ redistributed. *For commercial trust, be more transparent than competitors.*
 
 ## Immediate next actions
 
-1. Create `dsp-bench` as a first-class workspace member.
-2. Define the first benchmark profile: `interpolation-heavy-irregular`.
-3. Add DSP and DuckDB adapters.
+1. ✅ Create `dsp-bench` as a first-class workspace member. *(Scaffold landed:
+   library crate wired into the workspace, builds + tests green.)*
+2. ✅ Define the first benchmark profile: `interpolation-heavy-irregular`.
+   *(Seeded, reproducible dataset generator + workload profile in
+   `dsp-bench/src/profile.rs`.)*
+3. 🟡 Add DSP and DuckDB adapters. *(DSP adapter implemented against the
+   vendor-neutral `SystemAdapter` trait, driving `splimes::auto_interpolate`;
+   DuckDB adapter still to do.)*
 4. Add ClickHouse, InfluxDB 3, QuestDB, TimescaleDB adapters.
 5. Implement InfluxDB Line Protocol ingest.
 6. Add end-to-end timing spans.
-7. Add p50/p95/p99 + confidence-interval reporting.
+7. 🟡 Add p50/p95/p99 + confidence-interval reporting. *(p50/p95/p99 +
+   min/max/mean/stddev landed in `dsp-bench/src/stats.rs`; bootstrap CIs still
+   to do.)*
 8. Add physical value types for at least `F64`, `ScaledI64`, `BigDecimalText`.
 9. Prototype columnar segment reads for one aspect type.
 10. Publish a methodology document **before** any performance claim.
