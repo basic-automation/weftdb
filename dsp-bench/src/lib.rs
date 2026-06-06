@@ -17,6 +17,8 @@
 //! - [`schema`] — the serializable [`BenchResult`] record (Phase 1.1 latency
 //!   distribution + correctness + dataset metadata).
 //! - [`stats`] — p50/p95/p99 latency summarization.
+//! - [`report`] — the JSON report runner: a [`BenchReport`] envelope (run
+//!   metadata + results) persisted as a durable `reports/json/` artifact.
 //!
 //! Competitor adapters (`ClickHouse`, `InfluxDB 3`, `QuestDB`, `TimescaleDB`,
 //! `DuckDB`), additional workloads, dataset corpora, and report runners land in
@@ -28,6 +30,7 @@
 pub mod adapter;
 pub mod dsp_adapter;
 pub mod profile;
+pub mod report;
 pub mod schema;
 pub mod stats;
 
@@ -37,7 +40,7 @@ use bigdecimal::ToPrimitive;
 use splimes::generate_target_times;
 
 pub use crate::{
-	adapter::SystemAdapter, dsp_adapter::DspAdapter, profile::InterpolationProfile, schema::{BenchResult, CorrectnessReport, DatasetMeta, SCHEMA_VERSION}, stats::LatencyStats
+	adapter::SystemAdapter, dsp_adapter::DspAdapter, profile::InterpolationProfile, report::{BenchReport, RunMetadata}, schema::{BenchResult, CorrectnessReport, DatasetMeta, SCHEMA_VERSION}, stats::LatencyStats
 };
 
 /// Workload class label recorded for the interpolation profile.
@@ -132,6 +135,34 @@ mod tests {
 		assert_eq!(result.correctness, back.correctness);
 		let throughput_drift = (result.throughput_points_per_sec - back.throughput_points_per_sec).abs();
 		assert!(throughput_drift < 1e-6, "throughput must survive round-trip within tolerance, drifted {throughput_drift}");
+	}
+
+	#[tokio::test]
+	async fn run_result_persists_as_a_json_report_artifact() {
+		use crate::report::{default_filename, BenchReport, RunMetadata};
+
+		let profile = InterpolationProfile::interpolation_heavy_irregular();
+		let adapter = DspAdapter::new();
+		let result = run_profile(&adapter, &profile, 3).await.expect("benchmark run succeeds");
+
+		let metadata = RunMetadata::capture("2026-06-06T00:00:00+00:00".to_string());
+		let report = BenchReport::with_results(metadata, vec![result]);
+		assert!(report.is_publishable(), "a passing DSP run yields a publishable report");
+
+		// Persist the artifact to a unique temp path and read it straight back, so
+		// the whole run -> report -> disk -> parse path is exercised end to end.
+		let mut path = std::env::temp_dir();
+		path.push(format!("dsp-bench-e2e-{}", std::process::id()));
+		path.push(default_filename(&report.results[0].profile, &report.results[0].adapter));
+
+		report.write_json(&path).expect("write report artifact");
+		let raw = std::fs::read_to_string(&path).expect("read report artifact");
+		let back: BenchReport = serde_json::from_str(&raw).expect("parse report artifact");
+		assert_eq!(back.results.len(), 1);
+		assert_eq!(back.results[0].adapter, "dsp");
+		assert!(back.is_publishable());
+
+		let _ = std::fs::remove_dir_all(path.parent().unwrap_or(&path));
 	}
 
 	#[tokio::test]

@@ -123,3 +123,68 @@ results (exact counts) · done-vs-open · next step · PR.
   the same `SystemAdapter` trait + a JSON report writer for `BenchResult`, so
   `run_profile` results can be persisted as artifacts. Then InfluxDB Line Protocol ingest.
 - **PR:** https://github.com/physics515/DSP/pull/3
+
+---
+
+## 2026-06-06 — DSP-Bench JSON report runner
+
+- **Item:** Phase 1 / Track 1 — **DSP-Bench**. First half of the prior run's stated
+  next step ("a JSON report writer for `BenchResult` so `run_profile` results can be
+  persisted as artifacts"). Delivers the `reports/json/` slice of the DSP-Bench layout
+  and the roadmap's fair-protocol "keep raw results" reproducibility requirement.
+  (The DuckDB adapter — the other half — is intentionally deferred: it needs the heavy
+  native `duckdb` crate and is too risky for a time-boxed run; tracked as next step.)
+- **What changed (new module in `dsp-bench`, no new dependencies):**
+  - `dsp-bench/src/report.rs` — new module:
+    - `RunMetadata` — lightweight, dependency-free environment capture (`dsp-bench`
+      version via `CARGO_PKG_VERSION`, target OS/arch via `std::env::consts`, and an
+      injected `generated_at` RFC-3339 timestamp so construction stays deterministic
+      and testable). Honestly scoped: full hardware capture (CPU/RAM/GPU/drivers) is
+      documented as a later increment.
+    - `BenchReport` — envelope `{ schema_version, metadata, results: Vec<BenchResult> }`
+      holding one or many results (e.g. a multi-adapter comparison) as a single
+      self-describing artifact. `new`/`with_results`/`push`, `to_json_pretty`,
+      `write_json` (creates missing parent dirs, writes pretty JSON), plus
+      `is_publishable` (gated: empty → false, any failing result → false) and
+      `publishable_count`.
+    - `default_filename(profile, adapter)` — sanitized `…__….json` artifact name
+      (non-`[A-Za-z0-9._-]` → `-`, empty component → `unnamed`).
+  - `dsp-bench/src/lib.rs` — `pub mod report;`, re-exported `BenchReport`/`RunMetadata`,
+    crate-doc bullet, and a new end-to-end test wiring a real `run_profile` result →
+    `BenchReport` → `write_json` to a unique temp path → read back → parse → assert
+    publishable.
+  - `dsp-bench/README.md` — documented the JSON report runner under Status; narrowed
+    the "Not yet" list accordingly (Parquet/HTML formats + full hardware capture
+    remain open).
+  - **Summary:** DSP-Bench results are now durable, inspectable JSON artifacts with a
+    correctness-gated publishability check at the report level, not just per result.
+- **Build/test/clippy (real, this run; nightly `rustc 1.96.0-nightly`):**
+  - `cargo build --workspace` — **GREEN** (full workspace; the new module compiled in
+    1m12s on top of the warm workspace; clean baseline confirmed green before edits).
+  - `cargo test -p dsp-bench` — **17 passed, 0 failed, 0 ignored** (was 11; +6:
+    5 in `report::tests` — `capture_fills_version_and_target`,
+    `report_round_trips_through_json`, `publishability_requires_all_results_to_pass`,
+    `write_json_creates_parents_and_round_trips_from_disk`,
+    `default_filename_is_sanitized` — plus 1 e2e in `lib::tests`,
+    `run_result_persists_as_a_json_report_artifact`). 0 doc-tests.
+  - `cargo clippy -p dsp-bench --all-targets` — **0 warnings in dsp-bench** (pedantic +
+    nursery enabled in the crate). The only clippy output is the **4 pre-existing**
+    `splimes` warnings (`gpu/mod.rs`, `helpers/batch.rs` ×?, `splines/quadratic.rs`) in
+    untouched files — identical to the prior run, not introduced here. No `#![allow]`
+    added.
+  - `cargo fmt -p dsp-bench --check` — clean (applied repo rustfmt: hard tabs).
+  - **Not run:** full `cargo test --workspace` and the `database` `tests/db_tests.rs`
+    GPU integration suite (long-running, time-boxed out as in prior runs). This change
+    is isolated to the `dsp-bench` crate — no `splimes`/`database`/orchestration code
+    was touched — so the per-crate suite above fully covers it; the workspace build is
+    green.
+- **Done vs open:** DONE — JSON report runner (`BenchReport` + `RunMetadata` +
+  `write_json` + filename helper), report-level publishability gate, e2e
+  run→report→disk test, docs. OPEN — DuckDB adapter (next), then ILP ingest; richer
+  report formats (Parquet/HTML); full hardware capture in run metadata; bootstrap CIs;
+  more workloads/datasets; methodology doc.
+- **Next step:** add the **DuckDB adapter** (first competitor baseline, CPU-only)
+  behind the existing `SystemAdapter` trait, then have a small runner emit a
+  multi-adapter `BenchReport` (DSP + DuckDB) to `reports/json/`. Then InfluxDB Line
+  Protocol ingest.
+- **PR:** https://github.com/physics515/DSP/pull/5
