@@ -72,4 +72,4 @@ results (exact counts) · done-vs-open · next step · PR.
 - **Next step:** add the **DuckDB adapter** (first competitor baseline, CPU-only) behind
   the same `SystemAdapter` trait + a JSON report writer for `BenchResult`, so
   `run_profile` results can be persisted as artifacts. Then InfluxDB Line Protocol ingest.
-- **PR:** _(filled below once opened)_
+- **PR:** https://github.com/physics515/DSP/pull/3
