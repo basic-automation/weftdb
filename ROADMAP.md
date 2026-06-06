@@ -28,6 +28,7 @@ analysis reprioritizes that backlog; the concrete items live in
 - [Predecessor-derived backlog](#predecessor-derived-backlog)
 - [GPU acceleration detail (Phases 1–4 done, 5+ next)](#gpu-acceleration-detail)
 - [Research foundation](#research-foundation)
+- [Control-plane engine: Turso/libSQL 0.6 adoption](#control-plane-engine-tursolibsql-06-adoption)
 - [Six-month execution plan](#six-month-execution-plan)
 - [Benchmark report template](#benchmark-report-template)
 - [Business validation](#business-validation)
@@ -458,6 +459,57 @@ stability) as well as speed.
 **ML/event research:** promising future premium layer (self-supervised prediction,
 causal detection, temporal point processes) — but storage + interpolation +
 compression + benchmark proof first.
+
+---
+
+## Control-plane engine: Turso/libSQL 0.6 adoption
+
+DSP pins `turso = "0.6"` (bumped from 0.4). Per hard-constraint #3, Turso/libSQL is
+the **control plane** (catalog, metadata, config, pipeline state, transactions) — it
+does **not** own the measurement hot path (that is Storage v2's typed columnar
+segments). The features below are evaluated **only** for control-plane use; none of
+them turn Turso into the measurement backend.
+
+**Migration already applied (0.4 → 0.6):** Turso 0.6 rejects `AUTOINCREMENT` under
+`PRAGMA journal_mode=experimental_mvcc` at parse time (it was tolerated in 0.4). All
+control-plane schemas were migrated from `INTEGER PRIMARY KEY AUTOINCREMENT` to plain
+`INTEGER PRIMARY KEY` (still a rowid alias that auto-assigns on insert; DSP never
+relied on the monotonic-no-reuse guarantee). MVCC concurrent writes (`BEGIN
+CONCURRENT`) remain the basis of the write path.
+
+**Adopt (mapped to phase):**
+
+| Turso 0.6 feature | DSP use (control plane) | Phase |
+|-------------------|-------------------------|-------|
+| **Production MVCC concurrent writes** (`BEGIN CONCURRENT`, no "database is locked") | Already the write path; now non-experimental — lean on it for concurrent ingest + catalog updates under load. | 7 |
+| **Encryption at rest** (AEAD pager + chunked 32 KiB frame encryption; the MVCC `.db-log` is also encrypted) | Encrypt catalog/metadata/pipeline-state DBs that hold tenant config + provenance. | 8 |
+| **`VACUUM INTO 'file'`** (compacted copy) + in-place `VACUUM` | Online, consistent **backup/snapshot** of control-plane DBs without a custom dumper; feeds backup/restore + RPO/RTO drills. | 7.4 |
+| **Triggers (now production)** — `BEFORE/AFTER/INSTEAD OF` + `WHEN` | Enforce catalog invariants and emit **audit-log** rows on metadata mutations. | 7/8 |
+| **`Statement::n_change()`** (affected-row counts) | Exact write accounting for idempotent batch ingest + per-stage instrumentation spans. | 3/7 |
+| **Dynamic auth tokens as closures** (credential rotation) | Hosted/remote control-plane auth without restart. | 8 |
+| **`UPDATE … FROM`, aggregate `FILTER`, `INDEXED BY`, `NULLS FIRST/LAST`** | Simplifies catalog/metadata queries; lets the planner be steered explicitly. | 2/4 |
+
+**Evaluate, do not rush:**
+
+- **Native vector search / embedding storage + cosine similarity.** Real, in-engine
+  now — but the roadmap is explicit: *do not rebrand as a vector DB before real
+  embedding functionality exists*. Park this for **Phase 9** shape-summary /
+  pattern-embedding search, as a control-plane index over *summaries*, never over raw
+  measurements.
+- **Change Data Capture (CDC) / sync engine.** Potentially useful for online
+  ingest/replication (Phase 7) and for shipping catalog changes to a hosted control
+  plane — assess once single-node durability (7.2) is solid.
+- **Custom I/O (`with_io_impl`)** and **generated columns / domains / array types.**
+  Advanced; only if a concrete control-plane need appears. No measurement-path use.
+
+**Explicitly defer / avoid:**
+
+- **Multi-process WAL access** (`?experimental=multiprocess_wal`) — lets external tools
+  read a live `.db`, but it is **incompatible with `BEGIN CONCURRENT`**, which DSP's
+  MVCC write path depends on. Not worth losing concurrent writes; revisit only if a
+  hard live-inspection requirement emerges.
+- Treating Turso vector search or any Turso table as the **measurement store** — this
+  violates hard-constraint #3.
 
 ---
 
