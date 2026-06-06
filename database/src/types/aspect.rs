@@ -648,12 +648,12 @@ impl AspectStructure for Aspect {
 			)
 			.await?;
 
-		// Pattern occurrences table (INTEGER PRIMARY KEY AUTOINCREMENT is rowid alias, no index)
+		// Pattern occurrences table (INTEGER PRIMARY KEY is rowid alias, no index)
 		conn.as_ref()
 			.execute(
 				r"
 			CREATE TABLE IF NOT EXISTS pattern_occurrences (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				id INTEGER PRIMARY KEY,
 				pattern_id TEXT NOT NULL,
 				aspect_id TEXT NOT NULL,
 				resolution TEXT NOT NULL,
@@ -667,12 +667,12 @@ impl AspectStructure for Aspect {
 			)
 			.await?;
 
-		// Pattern relatives table (INTEGER PRIMARY KEY AUTOINCREMENT is rowid alias, no index)
+		// Pattern relatives table (INTEGER PRIMARY KEY is rowid alias, no index)
 		conn.as_ref()
 			.execute(
 				r"
 			CREATE TABLE IF NOT EXISTS pattern_relatives (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				id INTEGER PRIMARY KEY,
 				pattern_id TEXT NOT NULL,
 				relative_index INTEGER NOT NULL,
 
@@ -894,12 +894,12 @@ impl AspectStructure for Aspect {
 		conn.as_ref().execute("ALTER TABLE correlations ADD COLUMN average_distance_value TEXT", turso::params![]).await.ok();
 		conn.as_ref().execute("ALTER TABLE correlations ADD COLUMN average_distance_units TEXT", turso::params![]).await.ok();
 
-		// Error rates table (INTEGER PRIMARY KEY AUTOINCREMENT is rowid alias, no index)
+		// Error rates table (INTEGER PRIMARY KEY is rowid alias, no index)
 		conn.as_ref()
 			.execute(
 				r"
 			CREATE TABLE IF NOT EXISTS correlation_error_rates (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				id INTEGER PRIMARY KEY,
 				correlation_id TEXT NOT NULL,
 				signal_type TEXT NOT NULL,
 				error_rate_value TEXT NOT NULL,
@@ -910,12 +910,12 @@ impl AspectStructure for Aspect {
 			)
 			.await?;
 
-		// Correlation occurrences table (INTEGER PRIMARY KEY AUTOINCREMENT is rowid alias, no index)
+		// Correlation occurrences table (INTEGER PRIMARY KEY is rowid alias, no index)
 		conn.as_ref()
 			.execute(
 				r"
 			CREATE TABLE IF NOT EXISTS correlation_occurrences (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				id INTEGER PRIMARY KEY,
 				correlation_id TEXT NOT NULL,
 				occurrence_index INTEGER NOT NULL,
 				aspect_id TEXT NOT NULL,
@@ -1050,12 +1050,12 @@ impl AspectStructure for Aspect {
 			)
 			.await?;
 
-		// Dictionary constraints table (INTEGER PRIMARY KEY AUTOINCREMENT is rowid alias, no index)
+		// Dictionary constraints table (INTEGER PRIMARY KEY is rowid alias, no index)
 		conn.as_ref()
 			.execute(
 				r"
                                         CREATE TABLE IF NOT EXISTS dictionary_constraints (
-                                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                                id INTEGER PRIMARY KEY,
                                                 dictionary_id TEXT NOT NULL,
                                                 steps_count INTEGER,
                                                 steps_interpolation TEXT
@@ -1065,12 +1065,12 @@ impl AspectStructure for Aspect {
 			)
 			.await?;
 
-		// Dictionary variabilities table (INTEGER PRIMARY KEY AUTOINCREMENT is rowid alias, no index)
+		// Dictionary variabilities table (INTEGER PRIMARY KEY is rowid alias, no index)
 		conn.as_ref()
 			.execute(
 				r"
                                         CREATE TABLE IF NOT EXISTS dictionary_variabilities (
-                                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                                id INTEGER PRIMARY KEY,
                                                 dictionary_id TEXT NOT NULL,
                                                 variability_type TEXT NOT NULL,
                                                 variability_value TEXT NOT NULL
@@ -1080,12 +1080,12 @@ impl AspectStructure for Aspect {
 			)
 			.await?;
 
-		// Dictionary patterns table (INTEGER PRIMARY KEY AUTOINCREMENT is rowid alias, no index)
+		// Dictionary patterns table (INTEGER PRIMARY KEY is rowid alias, no index)
 		conn.as_ref()
 			.execute(
 				r"
                                         CREATE TABLE IF NOT EXISTS dictionary_patterns (
-                                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                                id INTEGER PRIMARY KEY,
                                                 dictionary_id TEXT NOT NULL,
                                                 pattern_id TEXT NOT NULL,
                                                 added_at INTEGER NOT NULL
@@ -1263,7 +1263,7 @@ impl Aspect {
 		conn.as_ref()
 			.execute(
 				"CREATE TABLE IF NOT EXISTS compression_tier_results (
-					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					id INTEGER PRIMARY KEY,
 					history_id TEXT NOT NULL,
 					tier_number INTEGER NOT NULL,
 					phase TEXT NOT NULL,
@@ -1283,7 +1283,7 @@ impl Aspect {
 		conn.as_ref()
 			.execute(
 				"CREATE TABLE IF NOT EXISTS dirty_regions (
-					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					id INTEGER PRIMARY KEY,
 					region_start INTEGER NOT NULL,
 					region_end INTEGER NOT NULL,
 					marked_at INTEGER NOT NULL,
@@ -1378,12 +1378,12 @@ impl Aspect {
 			)
 			.await?;
 
-		// Pattern occurrences table (INTEGER PRIMARY KEY AUTOINCREMENT is rowid alias, no index)
+		// Pattern occurrences table (INTEGER PRIMARY KEY is rowid alias, no index)
 		conn.as_ref()
 			.execute(
 				r"
 			CREATE TABLE IF NOT EXISTS pattern_occurrences (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				id INTEGER PRIMARY KEY,
 				pattern_id TEXT NOT NULL,
 				occurrence_index INTEGER NOT NULL,
 				aspect_id TEXT NOT NULL,
@@ -1398,12 +1398,12 @@ impl Aspect {
 			)
 			.await?;
 
-		// Pattern relatives table (INTEGER PRIMARY KEY AUTOINCREMENT is rowid alias, no index)
+		// Pattern relatives table (INTEGER PRIMARY KEY is rowid alias, no index)
 		conn.as_ref()
 			.execute(
 				r"
 			CREATE TABLE IF NOT EXISTS pattern_relatives (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				id INTEGER PRIMARY KEY,
 				pattern_id TEXT NOT NULL,
 				relative_index INTEGER NOT NULL,
 				relative_value TEXT NOT NULL
@@ -1481,12 +1481,12 @@ impl Aspect {
 		conn.as_ref().execute("ALTER TABLE correlations ADD COLUMN average_distance_value TEXT", turso::params![]).await.ok();
 		conn.as_ref().execute("ALTER TABLE correlations ADD COLUMN average_distance_units TEXT", turso::params![]).await.ok();
 
-		// Error rates table (INTEGER PRIMARY KEY AUTOINCREMENT is rowid alias, no index)
+		// Error rates table (INTEGER PRIMARY KEY is rowid alias, no index)
 		conn.as_ref()
 			.execute(
 				r"
 			CREATE TABLE IF NOT EXISTS correlation_error_rates (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				id INTEGER PRIMARY KEY,
 				correlation_id TEXT NOT NULL,
 				signal_type TEXT NOT NULL,
 				error_rate_value TEXT NOT NULL,
@@ -1497,12 +1497,12 @@ impl Aspect {
 			)
 			.await?;
 
-		// Correlation occurrences table (INTEGER PRIMARY KEY AUTOINCREMENT is rowid alias, no index)
+		// Correlation occurrences table (INTEGER PRIMARY KEY is rowid alias, no index)
 		conn.as_ref()
 			.execute(
 				r"
 			CREATE TABLE IF NOT EXISTS correlation_occurrences (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				id INTEGER PRIMARY KEY,
 				correlation_id TEXT NOT NULL,
 				occurrence_index INTEGER NOT NULL,
 				aspect_id TEXT NOT NULL,
@@ -1615,7 +1615,7 @@ impl Aspect {
 		conn.as_ref()
 			.execute(
 				r"CREATE TABLE IF NOT EXISTS dictionary_constraints (
-				id INTEGER PRIMARY KEY AUTOINCREMENT, dictionary_id TEXT NOT NULL,
+				id INTEGER PRIMARY KEY, dictionary_id TEXT NOT NULL,
 				steps_count INTEGER, steps_interpolation TEXT)",
 				turso::params![],
 			)
@@ -1627,7 +1627,7 @@ impl Aspect {
 		conn.as_ref()
 			.execute(
 				r"CREATE TABLE IF NOT EXISTS dictionary_variabilities (
-				id INTEGER PRIMARY KEY AUTOINCREMENT, dictionary_id TEXT NOT NULL,
+				id INTEGER PRIMARY KEY, dictionary_id TEXT NOT NULL,
 				variability_type TEXT NOT NULL, variability_value TEXT NOT NULL)",
 				turso::params![],
 			)
@@ -1639,7 +1639,7 @@ impl Aspect {
 		conn.as_ref()
 			.execute(
 				r"CREATE TABLE IF NOT EXISTS dictionary_patterns (
-				id INTEGER PRIMARY KEY AUTOINCREMENT, dictionary_id TEXT NOT NULL,
+				id INTEGER PRIMARY KEY, dictionary_id TEXT NOT NULL,
 				pattern_id TEXT NOT NULL, added_at INTEGER NOT NULL)",
 				turso::params![],
 			)
@@ -1664,7 +1664,7 @@ impl Aspect {
 		conn.as_ref()
 			.execute(
 				r"CREATE TABLE IF NOT EXISTS pattern_occurrences (
-				id INTEGER PRIMARY KEY AUTOINCREMENT, pattern_id TEXT NOT NULL,
+				id INTEGER PRIMARY KEY, pattern_id TEXT NOT NULL,
 				occurrence_index INTEGER NOT NULL, aspect_id TEXT NOT NULL, resolution TEXT NOT NULL,
 				size INTEGER NOT NULL, database_info TEXT NOT NULL,
 				beginning_timestamp INTEGER NOT NULL, end_timestamp INTEGER NOT NULL)",
@@ -1678,7 +1678,7 @@ impl Aspect {
 		conn.as_ref()
 			.execute(
 				r"CREATE TABLE IF NOT EXISTS pattern_relatives (
-				id INTEGER PRIMARY KEY AUTOINCREMENT, pattern_id TEXT NOT NULL,
+				id INTEGER PRIMARY KEY, pattern_id TEXT NOT NULL,
 				relative_index INTEGER NOT NULL, relative_value TEXT NOT NULL)",
 				turso::params![],
 			)
