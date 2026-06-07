@@ -188,3 +188,66 @@ results (exact counts) · done-vs-open · next step · PR.
   multi-adapter `BenchReport` (DSP + DuckDB) to `reports/json/`. Then InfluxDB Line
   Protocol ingest.
 - **PR:** https://github.com/physics515/DSP/pull/5
+
+---
+
+## 2026-06-07 — DSP-Bench bootstrap confidence intervals
+
+- **Item:** Phase 1 / Track 1 — **DSP-Bench**; roadmap "Immediate next actions" #7
+  ("p50/p95/p99 + confidence-interval reporting") and the Phase 1.1 fair-protocol
+  requirement "report median/mean/stddev and p50/p95/p99/max **with bootstrap CIs**".
+  The percentile/summary half landed earlier; this run delivers the bootstrap-CI half,
+  taking #7 from 🟡 to ✅. Chosen over the long-deferred DuckDB adapter because it is
+  pure, dependency-free math (the crate already had `rand`/`rand_chacha`), fully
+  self-contained to `dsp-bench`, and low-risk for a time-boxed run — whereas the DuckDB
+  adapter still needs the heavy native `duckdb` crate.
+- **What changed (isolated to `dsp-bench`, no new dependencies):**
+  - `src/stats.rs` — new seeded nonparametric bootstrap:
+    - `BootstrapConfig { resamples, confidence, seed }` (+ `Default`: 1000 resamples,
+      0.95, fixed seed) — all three knobs published for exact reproducibility.
+    - `ConfidenceInterval { point_ns, lower_ns, upper_ns }` (invariant
+      `lower <= point <= upper`, enforced by clamping the point into the resampled
+      spread).
+    - `LatencyCis { resamples, confidence, seed, mean, p50, p95, p99 }`.
+    - `LatencyStats::bootstrap_cis(samples, &config)` — resamples with replacement via a
+      `ChaCha8Rng` seeded from `config.seed` (one shared stream; computes all four
+      statistics per resample), reads each interval off the bootstrap distribution by
+      the percentile method. Empty / zero-resample inputs yield zeroed intervals; a
+      constant sample yields a degenerate interval.
+  - `src/schema.rs` — `BenchResult` gains `latency_ci: Option<LatencyCis>`
+    (`#[serde(default, skip_serializing_if = "Option::is_none")]`); `SCHEMA_VERSION`
+    bumped 1 → 2. The field is additive + optional, so **v1 artifacts still deserialize**
+    (covered by a new `v1_artifact_without_latency_ci_still_deserializes` test).
+  - `src/lib.rs` — `run_profile` now populates `latency_ci` using a CI seed derived from
+    the dataset seed (`profile.seed ^ 0xC0FFEE15C0DE`) so it is reproducible yet
+    decoupled from the dataset-generation RNG stream; re-exports
+    `BootstrapConfig`/`ConfidenceInterval`/`LatencyCis`; the e2e test asserts the CIs are
+    present, ordered, and survive the JSON round-trip.
+  - `README.md` — documented bootstrap CIs under Status; removed them from "Not yet".
+  - `ROADMAP.md` — Immediate next action #7 🟡 → ✅.
+- **Build/test/clippy (real, this run; nightly `rustc 1.96.0-nightly`):**
+  - `cargo build --workspace` — **GREEN** (clean baseline confirmed green before edits;
+    re-verified green after, 1.85s incremental).
+  - `cargo test -p dsp-bench` — **23 passed, 0 failed, 0 ignored** (was 17; +6:
+    `bootstrap_is_deterministic_for_a_given_seed`, `bootstrap_seed_changes_the_interval`,
+    `bootstrap_interval_brackets_the_point_and_is_ordered`,
+    `bootstrap_of_constant_sample_is_degenerate`,
+    `bootstrap_of_empty_or_zero_resamples_is_zeroed`,
+    `v1_artifact_without_latency_ci_still_deserializes`). 0 doc-tests.
+  - `cargo clippy -p dsp-bench --all-targets` — **0 warnings in dsp-bench**. The only
+    clippy output is the **4 pre-existing** `splimes` `unnecessary_sort_by` warnings
+    (`gpu/mod.rs`, `helpers/batch.rs`, `splines/quadratic.rs`) in untouched files —
+    identical to prior runs, not introduced here. No `#![allow]` added.
+  - `cargo fmt -p dsp-bench --check` — clean (repo rustfmt: hard tabs, max_width 10000).
+  - **Not run:** full `cargo test --workspace` and the `database` `tests/db_tests.rs`
+    GPU integration suite (long-running, time-boxed out as in prior runs). This change
+    is isolated to `dsp-bench` — no `splimes`/`database`/orchestration code touched — so
+    the per-crate suite fully covers it; the workspace build is green.
+- **Done vs open:** DONE — seeded bootstrap CIs for mean + p50/p95/p99, wired into
+  `run_profile`/`BenchResult`, schema v2 with v1 back-compat, docs. OPEN — DuckDB adapter
+  (next), then ILP ingest; richer report formats (Parquet/HTML); full hardware capture in
+  run metadata; more workloads/datasets; methodology doc.
+- **Next step:** add the **DuckDB adapter** (first competitor baseline, CPU-only) behind
+  the existing `SystemAdapter` trait, then emit a multi-adapter `BenchReport` (DSP +
+  DuckDB, each with latency + CIs) to `reports/json/`. Then InfluxDB Line Protocol ingest.
+- **PR:** PR_URL_PLACEHOLDER
