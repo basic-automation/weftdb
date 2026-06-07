@@ -16,7 +16,8 @@
 //! - [`dsp_adapter`] — the DSP reference adapter ([`DspAdapter`]).
 //! - [`schema`] — the serializable [`BenchResult`] record (Phase 1.1 latency
 //!   distribution + correctness + dataset metadata).
-//! - [`stats`] — p50/p95/p99 latency summarization.
+//! - [`stats`] — p50/p95/p99 latency summarization + seeded bootstrap
+//!   confidence intervals ([`LatencyStats::bootstrap_cis`]).
 //! - [`report`] — the JSON report runner: a [`BenchReport`] envelope (run
 //!   metadata + results) persisted as a durable `reports/json/` artifact.
 //!
@@ -40,7 +41,7 @@ use bigdecimal::ToPrimitive;
 use splimes::generate_target_times;
 
 pub use crate::{
-	adapter::SystemAdapter, dsp_adapter::DspAdapter, profile::InterpolationProfile, report::{BenchReport, RunMetadata}, schema::{BenchResult, CorrectnessReport, DatasetMeta, SCHEMA_VERSION}, stats::LatencyStats
+	adapter::SystemAdapter, dsp_adapter::DspAdapter, profile::InterpolationProfile, report::{BenchReport, RunMetadata}, schema::{BenchResult, CorrectnessReport, DatasetMeta, SCHEMA_VERSION}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}
 };
 
 /// Workload class label recorded for the interpolation profile.
@@ -84,6 +85,10 @@ pub async fn run_profile<A: SystemAdapter + ?Sized>(adapter: &A, profile: &Inter
 	let correctness = CorrectnessReport { output_count_ok: actual_output_points > 0 && actual_output_points == expected_output_points, expected_output_points, actual_output_points, values_finite };
 
 	let latency = LatencyStats::from_samples(&samples_ns);
+	// Bootstrap CIs for the latency distribution (fair-protocol Phase 1.1). The
+	// resampling seed is derived from the dataset seed so the interval is
+	// reproducible yet decoupled from the dataset-generation RNG stream.
+	let latency_ci = Some(LatencyStats::bootstrap_cis(&samples_ns, &BootstrapConfig { seed: profile.seed ^ 0x_C0FF_EE15_C0DE_u64, ..BootstrapConfig::default() }));
 	let throughput_points_per_sec = if latency.mean_ns > 0 {
 		#[allow(clippy::cast_precision_loss)]
 		let secs = latency.mean_ns as f64 / 1e9;
@@ -94,7 +99,7 @@ pub async fn run_profile<A: SystemAdapter + ?Sized>(adapter: &A, profile: &Inter
 		0.0
 	};
 
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: adapter.name().to_string(), workload: WORKLOAD_UPSAMPLE_INTERPOLATE.to_string(), reps, dataset: DatasetMeta { input_points, output_points: actual_output_points, irregular: true, missingness_fraction: profile.missingness_fraction, seed: profile.seed }, latency, throughput_points_per_sec, correctness })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: adapter.name().to_string(), workload: WORKLOAD_UPSAMPLE_INTERPOLATE.to_string(), reps, dataset: DatasetMeta { input_points, output_points: actual_output_points, irregular: true, missingness_fraction: profile.missingness_fraction, seed: profile.seed }, latency, latency_ci, throughput_points_per_sec, correctness })
 }
 
 #[cfg(test)]
@@ -120,6 +125,13 @@ mod tests {
 		assert!(result.is_publishable(), "result should be publishable");
 		assert!(result.throughput_points_per_sec > 0.0, "throughput must be positive");
 
+		// The run must carry reproducible bootstrap CIs, each properly ordered.
+		let cis = result.latency_ci.as_ref().expect("run must populate latency CIs");
+		assert_eq!(cis.resamples, BootstrapConfig::default().resamples);
+		for ci in [&cis.mean, &cis.p50, &cis.p95, &cis.p99] {
+			assert!(ci.lower_ns <= ci.point_ns && ci.point_ns <= ci.upper_ns, "CI must bracket its point estimate: {ci:?}");
+		}
+
 		// Result schema must round-trip through JSON for artifact storage. The
 		// exact (integer/string) fields are compared directly; the derived
 		// `throughput_points_per_sec` is compared with a tolerance because a
@@ -132,6 +144,7 @@ mod tests {
 		assert_eq!(result.reps, back.reps);
 		assert_eq!(result.dataset, back.dataset);
 		assert_eq!(result.latency, back.latency);
+		assert_eq!(result.latency_ci, back.latency_ci);
 		assert_eq!(result.correctness, back.correctness);
 		let throughput_drift = (result.throughput_points_per_sec - back.throughput_points_per_sec).abs();
 		assert!(throughput_drift < 1e-6, "throughput must survive round-trip within tolerance, drifted {throughput_drift}");

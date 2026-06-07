@@ -606,9 +606,10 @@ redistributed. *For commercial trust, be more transparent than competitors.*
 4. Add ClickHouse, InfluxDB 3, QuestDB, TimescaleDB adapters.
 5. Implement InfluxDB Line Protocol ingest.
 6. Add end-to-end timing spans.
-7. 🟡 Add p50/p95/p99 + confidence-interval reporting. *(p50/p95/p99 +
-   min/max/mean/stddev landed in `dsp-bench/src/stats.rs`; bootstrap CIs still
-   to do.)*
+7. ✅ Add p50/p95/p99 + confidence-interval reporting. *(p50/p95/p99 +
+   min/max/mean/stddev and seeded **bootstrap confidence intervals**
+   (`LatencyStats::bootstrap_cis`, wired into `run_profile` →
+   `BenchResult.latency_ci`) landed in `dsp-bench/src/stats.rs`.)*
 8. Add physical value types for at least `F64`, `ScaledI64`, `BigDecimalText`.
 9. Prototype columnar segment reads for one aspect type.
 10. Publish a methodology document **before** any performance claim.
