@@ -25,7 +25,10 @@ This is the initial scaffold. What exists today:
 - **Result schema** (`src/schema.rs`) — serializable `BenchResult` capturing the
   latency distribution, dataset metadata, and correctness verdict.
 - **Latency statistics** (`src/stats.rs`) — p50/p95/p99 + min/max/mean/stddev
-  (nearest-rank percentiles), per the fair-protocol requirements.
+  (nearest-rank percentiles), plus **seeded bootstrap confidence intervals**
+  (`LatencyStats::bootstrap_cis`) for the mean and the p50/p95/p99 percentiles.
+  Resampling is driven by a published RNG seed, so every interval is exactly
+  reproducible — per the fair-protocol requirements.
 - **Runner** (`run_profile` in `src/lib.rs`) — runs a profile against an adapter
   for N timed reps and produces a `BenchResult`.
 - **JSON report runner** (`src/report.rs`) — wraps one or more `BenchResult`s in
@@ -38,9 +41,9 @@ This is the initial scaffold. What exists today:
 
 Competitor adapters (DuckDB, ClickHouse, InfluxDB 3, QuestDB, TimescaleDB),
 InfluxDB Line Protocol ingest, additional workloads (range fetch, downsample,
-compression, …), dataset corpora, bootstrap confidence intervals, the richer
-report formats (Parquet/HTML) and full hardware capture (CPU model, RAM, GPU,
-drivers) in run metadata, and the methodology document.
+compression, …), dataset corpora, the richer report formats (Parquet/HTML) and
+full hardware capture (CPU model, RAM, GPU, drivers) in run metadata, and the
+methodology document.
 
 ## Run
 

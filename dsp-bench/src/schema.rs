@@ -14,10 +14,13 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::stats::LatencyStats;
+use crate::stats::{LatencyCis, LatencyStats};
 
 /// Version of the result schema. Bump on any breaking field change.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// v2 added the optional `latency_ci` field (bootstrap confidence intervals).
+/// The field is `#[serde(default)]`, so v1 artifacts still deserialize.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Metadata describing the dataset a result was measured against.
 ///
@@ -77,6 +80,11 @@ pub struct BenchResult {
 	pub dataset: DatasetMeta,
 	/// Latency distribution across the timed reps.
 	pub latency: LatencyStats,
+	/// Bootstrap confidence intervals for the headline latency statistics.
+	/// Optional so v1 artifacts (which predate it) still deserialize and so a
+	/// caller may omit CIs for a single-rep run where they are not meaningful.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub latency_ci: Option<LatencyCis>,
 	/// Throughput in output points per second, derived from mean latency.
 	pub throughput_points_per_sec: f64,
 	/// Correctness verdict; gates whether the latency is publishable.
@@ -97,7 +105,8 @@ mod tests {
 	use super::*;
 
 	fn sample_result() -> BenchResult {
-		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "dsp".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7 }, latency: LatencyStats::from_samples(&[100, 200, 300]), throughput_points_per_sec: 5_000_000.0, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true } }
+		let samples = [100, 200, 300];
+		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "dsp".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7 }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true } }
 	}
 
 	#[test]
@@ -119,5 +128,26 @@ mod tests {
 		result.correctness.values_finite = true;
 		result.reps = 0;
 		assert!(!result.is_publishable());
+	}
+
+	#[test]
+	fn v1_artifact_without_latency_ci_still_deserializes() {
+		// A pre-v2 artifact has no `latency_ci` key at all; serde's default must
+		// fill it with `None` rather than failing the parse.
+		let v1 = r#"{
+			"schema_version": 1,
+			"profile": "interpolation-heavy-irregular",
+			"adapter": "dsp",
+			"workload": "upsample_interpolate",
+			"reps": 3,
+			"dataset": { "input_points": 200, "output_points": 1000, "irregular": true, "missingness_fraction": 0.2, "seed": 7 },
+			"latency": { "count": 3, "min_ns": 100, "max_ns": 300, "mean_ns": 200, "stddev_ns": 82, "p50_ns": 200, "p95_ns": 300, "p99_ns": 300 },
+			"throughput_points_per_sec": 5000000.0,
+			"correctness": { "output_count_ok": true, "expected_output_points": 1000, "actual_output_points": 1000, "values_finite": true }
+		}"#;
+		let parsed: BenchResult = serde_json::from_str(v1).expect("v1 artifact must still parse");
+		assert!(parsed.latency_ci.is_none());
+		assert_eq!(parsed.schema_version, 1);
+		assert!(parsed.is_publishable());
 	}
 }
