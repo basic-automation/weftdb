@@ -250,4 +250,4 @@ results (exact counts) · done-vs-open · next step · PR.
 - **Next step:** add the **DuckDB adapter** (first competitor baseline, CPU-only) behind
   the existing `SystemAdapter` trait, then emit a multi-adapter `BenchReport` (DSP +
   DuckDB, each with latency + CIs) to `reports/json/`. Then InfluxDB Line Protocol ingest.
-- **PR:** PR_URL_PLACEHOLDER
+- **PR:** https://github.com/physics515/DSP/pull/6
