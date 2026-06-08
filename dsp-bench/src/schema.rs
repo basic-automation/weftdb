@@ -19,8 +19,9 @@ use crate::stats::{LatencyCis, LatencyStats};
 /// Version of the result schema. Bump on any breaking field change.
 ///
 /// v2 added the optional `latency_ci` field (bootstrap confidence intervals).
-/// The field is `#[serde(default)]`, so v1 artifacts still deserialize.
-pub const SCHEMA_VERSION: u32 = 2;
+/// v3 added the `timing` field (end-to-end span breakdown). Both are
+/// `#[serde(default)]`, so older artifacts still deserialize.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Metadata describing the dataset a result was measured against.
 ///
@@ -63,6 +64,38 @@ impl CorrectnessReport {
 	}
 }
 
+/// End-to-end wall-clock breakdown of a single `run_profile` invocation, in
+/// nanoseconds.
+///
+/// The latency distribution in [`BenchResult::latency`] measures *only* the
+/// adapter call, never the one-time dataset construction — a fair-protocol
+/// requirement. This breakdown makes that separation explicit and auditable:
+/// `dataset_generation_ns` is the seeded setup cost (excluded from latency),
+/// `measured_ns` is the sum of all per-rep adapter calls (the operation under
+/// test), and `end_to_end_ns` is the whole timed span. By construction
+/// `dataset_generation_ns + measured_ns <= end_to_end_ns`; the remainder
+/// ([`Self::overhead_ns`]) is harness bookkeeping (per-rep input clones,
+/// summary statistics).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimingBreakdown {
+	/// One-time cost of generating the seeded dataset (excluded from latency).
+	pub dataset_generation_ns: u64,
+	/// Sum of every timed adapter call (the operation under test).
+	pub measured_ns: u64,
+	/// Whole-run span, from dataset generation through the last rep.
+	pub end_to_end_ns: u64,
+}
+
+impl TimingBreakdown {
+	/// Harness overhead not attributable to dataset generation or the measured
+	/// adapter calls (per-rep clones, summary statistics). Saturates at zero so
+	/// a zeroed/default breakdown never underflows.
+	#[must_use]
+	pub const fn overhead_ns(&self) -> u64 {
+		self.end_to_end_ns.saturating_sub(self.dataset_generation_ns).saturating_sub(self.measured_ns)
+	}
+}
+
 /// A single DSP-Bench result: one workload, one adapter, one profile, N reps.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchResult {
@@ -87,6 +120,11 @@ pub struct BenchResult {
 	pub latency_ci: Option<LatencyCis>,
 	/// Throughput in output points per second, derived from mean latency.
 	pub throughput_points_per_sec: f64,
+	/// End-to-end timing spans for the run. `#[serde(default)]` so pre-v3
+	/// artifacts (which predate it) still deserialize, filling a zeroed
+	/// breakdown rather than failing the parse.
+	#[serde(default)]
+	pub timing: TimingBreakdown,
 	/// Correctness verdict; gates whether the latency is publishable.
 	pub correctness: CorrectnessReport,
 }
@@ -106,7 +144,16 @@ mod tests {
 
 	fn sample_result() -> BenchResult {
 		let samples = [100, 200, 300];
-		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "dsp".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7 }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true } }
+		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "dsp".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7 }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true } }
+	}
+
+	#[test]
+	fn timing_overhead_is_the_saturating_remainder() {
+		let t = TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 };
+		assert_eq!(t.overhead_ns(), 600);
+		// A zeroed/inconsistent breakdown must never underflow.
+		assert_eq!(TimingBreakdown::default().overhead_ns(), 0);
+		assert_eq!(TimingBreakdown { dataset_generation_ns: 10, measured_ns: 10, end_to_end_ns: 5 }.overhead_ns(), 0);
 	}
 
 	#[test]
@@ -147,7 +194,29 @@ mod tests {
 		}"#;
 		let parsed: BenchResult = serde_json::from_str(v1).expect("v1 artifact must still parse");
 		assert!(parsed.latency_ci.is_none());
+		assert_eq!(parsed.timing, TimingBreakdown::default());
 		assert_eq!(parsed.schema_version, 1);
+		assert!(parsed.is_publishable());
+	}
+
+	#[test]
+	fn v2_artifact_without_timing_still_deserializes() {
+		// A v2 artifact carries `latency_ci` but no `timing` key; serde's default
+		// must fill a zeroed breakdown rather than failing the parse.
+		let v2 = r#"{
+			"schema_version": 2,
+			"profile": "interpolation-heavy-irregular",
+			"adapter": "dsp",
+			"workload": "upsample_interpolate",
+			"reps": 3,
+			"dataset": { "input_points": 200, "output_points": 1000, "irregular": true, "missingness_fraction": 0.2, "seed": 7 },
+			"latency": { "count": 3, "min_ns": 100, "max_ns": 300, "mean_ns": 200, "stddev_ns": 82, "p50_ns": 200, "p95_ns": 300, "p99_ns": 300 },
+			"throughput_points_per_sec": 5000000.0,
+			"correctness": { "output_count_ok": true, "expected_output_points": 1000, "actual_output_points": 1000, "values_finite": true }
+		}"#;
+		let parsed: BenchResult = serde_json::from_str(v2).expect("v2 artifact must still parse");
+		assert_eq!(parsed.timing, TimingBreakdown::default());
+		assert_eq!(parsed.schema_version, 2);
 		assert!(parsed.is_publishable());
 	}
 }

@@ -605,7 +605,11 @@ redistributed. *For commercial trust, be more transparent than competitors.*
    DuckDB adapter still to do.)*
 4. Add ClickHouse, InfluxDB 3, QuestDB, TimescaleDB adapters.
 5. Implement InfluxDB Line Protocol ingest.
-6. Add end-to-end timing spans.
+6. 🟡 Add end-to-end timing spans. *(Harness-level spans landed:
+   `TimingBreakdown` in `dsp-bench/src/schema.rs` records dataset-generation
+   cost, the summed measured adapter calls, and the whole-run span, wired into
+   `run_profile` → `BenchResult.timing` (schema v3, back-compatible). Deeper
+   per-pipeline-stage spans belong to the instrumentation track.)*
 7. ✅ Add p50/p95/p99 + confidence-interval reporting. *(p50/p95/p99 +
    min/max/mean/stddev and seeded **bootstrap confidence intervals**
    (`LatencyStats::bootstrap_cis`, wired into `run_profile` →
