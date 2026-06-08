@@ -17,7 +17,7 @@
 //! - [`line_protocol`] — `InfluxDB` Line Protocol parsing ([`parse_points`]) for
 //!   TSBS-compatible dataset ingest.
 //! - [`schema`] — the serializable [`BenchResult`] record (Phase 1.1 latency
-//!   distribution + correctness + dataset metadata).
+//!   distribution + correctness + dataset metadata + end-to-end timing spans).
 //! - [`stats`] — p50/p95/p99 latency summarization + seeded bootstrap
 //!   confidence intervals ([`LatencyStats::bootstrap_cis`]).
 //! - [`report`] — the JSON report runner: a [`BenchReport`] envelope (run
@@ -44,11 +44,18 @@ use bigdecimal::ToPrimitive;
 use splimes::generate_target_times;
 
 pub use crate::{
-	adapter::SystemAdapter, dsp_adapter::DspAdapter, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, profile::InterpolationProfile, report::{BenchReport, RunMetadata}, schema::{BenchResult, CorrectnessReport, DatasetMeta, SCHEMA_VERSION}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}
+	adapter::SystemAdapter, dsp_adapter::DspAdapter, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, profile::InterpolationProfile, report::{BenchReport, RunMetadata}, schema::{BenchResult, CorrectnessReport, DatasetMeta, TimingBreakdown, SCHEMA_VERSION}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}
 };
 
 /// Workload class label recorded for the interpolation profile.
 const WORKLOAD_UPSAMPLE_INTERPOLATE: &str = "upsample_interpolate";
+
+/// Elapsed nanoseconds since `since`, saturated into a `u64` so a pathologically
+/// long span can never overflow or wrap the recorded timing.
+#[allow(clippy::cast_possible_truncation)]
+fn span_ns(since: Instant) -> u64 {
+	since.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+}
 
 /// Run an interpolation profile against an adapter for `reps` timed repetitions
 /// and return a fully-populated [`BenchResult`].
@@ -65,7 +72,14 @@ const WORKLOAD_UPSAMPLE_INTERPOLATE: &str = "upsample_interpolate";
 pub async fn run_profile<A: SystemAdapter + ?Sized>(adapter: &A, profile: &InterpolationProfile, reps: usize) -> anyhow::Result<BenchResult> {
 	anyhow::ensure!(reps > 0, "reps must be > 0");
 
+	// End-to-end span starts at the very top of the timed work (dataset
+	// generation included) and is read off again after the last rep, so the
+	// reported breakdown accounts for the whole run, not just the adapter calls.
+	let run_start = Instant::now();
+
+	let gen_start = Instant::now();
 	let dataset = profile.generate();
+	let dataset_generation_ns = span_ns(gen_start);
 	let input_points = dataset.len();
 	let (start, end) = (profile.start(), profile.end());
 	let expected_output_points = generate_target_times(start, end, profile.resolution).len();
@@ -77,11 +91,15 @@ pub async fn run_profile<A: SystemAdapter + ?Sized>(adapter: &A, profile: &Inter
 		let mut points = dataset.clone();
 		let t0 = Instant::now();
 		let output = adapter.interpolate_range(&mut points, start, end, profile.resolution, profile.spline).await?;
-		let elapsed = t0.elapsed();
-		#[allow(clippy::cast_possible_truncation)]
-		samples_ns.push(elapsed.as_nanos().min(u128::from(u64::MAX)) as u64);
+		samples_ns.push(span_ns(t0));
 		last_output = output;
 	}
+
+	// The operation under test is the sum of the timed adapter calls; the
+	// end-to-end span is the whole function up to here.
+	let measured_ns = samples_ns.iter().copied().fold(0_u64, u64::saturating_add);
+	let end_to_end_ns = span_ns(run_start);
+	let timing = TimingBreakdown { dataset_generation_ns, measured_ns, end_to_end_ns };
 
 	let actual_output_points = last_output.len();
 	let values_finite = last_output.iter().all(|p| p.value.to_f64().is_some_and(f64::is_finite));
@@ -102,7 +120,7 @@ pub async fn run_profile<A: SystemAdapter + ?Sized>(adapter: &A, profile: &Inter
 		0.0
 	};
 
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: adapter.name().to_string(), workload: WORKLOAD_UPSAMPLE_INTERPOLATE.to_string(), reps, dataset: DatasetMeta { input_points, output_points: actual_output_points, irregular: true, missingness_fraction: profile.missingness_fraction, seed: profile.seed }, latency, latency_ci, throughput_points_per_sec, correctness })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: adapter.name().to_string(), workload: WORKLOAD_UPSAMPLE_INTERPOLATE.to_string(), reps, dataset: DatasetMeta { input_points, output_points: actual_output_points, irregular: true, missingness_fraction: profile.missingness_fraction, seed: profile.seed }, latency, latency_ci, throughput_points_per_sec, timing, correctness })
 }
 
 #[cfg(test)]
@@ -128,6 +146,20 @@ mod tests {
 		assert!(result.is_publishable(), "result should be publishable");
 		assert!(result.throughput_points_per_sec > 0.0, "throughput must be positive");
 
+		// The run must carry an end-to-end timing breakdown whose spans are
+		// internally consistent: the operation under test is non-zero, dataset
+		// generation plus the measured calls never exceed the whole-run span, and
+		// the measured span equals the sum of the per-rep latencies.
+		let timing = result.timing;
+		assert!(timing.measured_ns > 0, "measured span must be non-zero");
+		assert!(timing.end_to_end_ns >= timing.dataset_generation_ns + timing.measured_ns, "end-to-end span must cover dataset generation + measured work: {timing:?}");
+		// `measured_ns` is the raw sum of samples; `mean_ns * count` reconstructs
+		// it up to integer-division rounding (the dropped remainder is `< count`),
+		// so the two must agree within `count` nanoseconds.
+		let reconstructed = result.latency.mean_ns * result.latency.count as u64;
+		let drift = timing.measured_ns.abs_diff(reconstructed);
+		assert!(drift < result.latency.count as u64 + 1, "measured_ns must match summed per-rep latency within rounding: measured={} reconstructed={} drift={}", timing.measured_ns, reconstructed, drift);
+
 		// The run must carry reproducible bootstrap CIs, each properly ordered.
 		let cis = result.latency_ci.as_ref().expect("run must populate latency CIs");
 		assert_eq!(cis.resamples, BootstrapConfig::default().resamples);
@@ -148,6 +180,7 @@ mod tests {
 		assert_eq!(result.dataset, back.dataset);
 		assert_eq!(result.latency, back.latency);
 		assert_eq!(result.latency_ci, back.latency_ci);
+		assert_eq!(result.timing, back.timing);
 		assert_eq!(result.correctness, back.correctness);
 		let throughput_drift = (result.throughput_points_per_sec - back.throughput_points_per_sec).abs();
 		assert!(throughput_drift < 1e-6, "throughput must survive round-trip within tolerance, drifted {throughput_drift}");

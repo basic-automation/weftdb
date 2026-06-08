@@ -610,7 +610,11 @@ redistributed. *For commercial trust, be more transparent than competitors.*
    tag/typed-field/escape/comment/precision handling and no vendor deps — the
    TSBS-compatibility on-ramp. Still open: wiring an ILP/TSBS dataset through a
    workload profile, and the server-side ILP ingest endpoint (Phase 2).)*
-6. Add end-to-end timing spans.
+6. 🟡 Add end-to-end timing spans. *(Harness-level spans landed:
+   `TimingBreakdown` in `dsp-bench/src/schema.rs` records dataset-generation
+   cost, the summed measured adapter calls, and the whole-run span, wired into
+   `run_profile` → `BenchResult.timing` (schema v3, back-compatible). Deeper
+   per-pipeline-stage spans belong to the instrumentation track.)*
 7. ✅ Add p50/p95/p99 + confidence-interval reporting. *(p50/p95/p99 +
    min/max/mean/stddev and seeded **bootstrap confidence intervals**
    (`LatencyStats::bootstrap_cis`, wired into `run_profile` →

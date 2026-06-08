@@ -254,6 +254,65 @@ results (exact counts) · done-vs-open · next step · PR.
 
 ---
 
+## 2026-06-07 — DSP-Bench end-to-end timing spans
+
+- **Item:** Phase 1 / Track 1 — **DSP-Bench**; roadmap "Immediate next actions" #6
+  ("Add end-to-end timing spans"). Chosen over the long-deferred DuckDB adapter (#3,
+  🟡) for the same reason prior runs deferred it: the `duckdb` crate is a heavy native
+  C++ build (risky/slow on an unattended, time-boxed Windows run), whereas this slice
+  is pure dependency-free Rust, fully self-contained to `dsp-bench`, and low-risk — a
+  small, complete, verified increment. Takes #6 from not-started to 🟡 (harness-level
+  spans done; deeper per-pipeline-stage spans remain for the instrumentation track).
+- **What changed (isolated to `dsp-bench`, no new dependencies):**
+  - `src/schema.rs` — new `TimingBreakdown { dataset_generation_ns, measured_ns,
+    end_to_end_ns }` (Copy + Default), with `overhead_ns()` = saturating
+    `end_to_end - dataset_generation - measured` (harness bookkeeping). `BenchResult`
+    gains `timing: TimingBreakdown` as `#[serde(default)]` so pre-v3 artifacts (no
+    `timing` key) still deserialize into a zeroed breakdown. `SCHEMA_VERSION` bumped
+    2 → 3. Invariant by construction: `dataset_generation_ns + measured_ns <=
+    end_to_end_ns`.
+  - `src/lib.rs` — `run_profile` now times three spans via a `span_ns(Instant)` helper
+    (saturating-into-`u64`): the one-time seeded dataset generation, the sum of the
+    per-rep adapter calls (`measured_ns`, the operation under test), and the whole
+    end-to-end span; populates `BenchResult.timing`. Re-exports `TimingBreakdown`. The
+    per-rep latency loop reuses `span_ns` (drops the duplicated `as` cast).
+  - `README.md` — documented the timing breakdown under Status (schema + runner).
+  - `ROADMAP.md` — Immediate next action #6 → 🟡 with the scope note.
+- **Build/test/clippy (real, this run; nightly `rustc 1.96.0-nightly` (55e86c996
+  2026-04-02)):**
+  - `cargo build --workspace` — **GREEN** baseline confirmed before edits (4m21s, cold
+    target dir / build-dir lock contention at start). Change is isolated to `dsp-bench`;
+    `cargo test -p dsp-bench` recompiled the crate + tests green after edits.
+  - `cargo test -p dsp-bench` — **25 passed, 0 failed, 0 ignored** (was 23; +2:
+    `schema::tests::timing_overhead_is_the_saturating_remainder`,
+    `schema::tests::v2_artifact_without_timing_still_deserializes`). The lib e2e test
+    `dsp_adapter_runs_interpolation_heavy_irregular` was extended to assert the timing
+    spans are present, internally consistent (`end_to_end >= dataset_gen + measured`),
+    that `measured_ns` matches `mean_ns * count` within integer-division rounding, and
+    that `timing` survives the JSON round-trip. 0 doc-tests.
+  - `cargo clippy -p dsp-bench --all-targets` — **0 warnings in dsp-bench**. The only
+    clippy output is the **4 pre-existing** `splimes` `sort_by`/`unnecessary_sort_by`
+    warnings (`gpu/mod.rs`, `helpers/batch.rs`, `splines/quadratic.rs`) in untouched
+    files — identical to prior runs, not introduced here. No `#![allow]` added.
+  - `cargo fmt -p dsp-bench --check` — clean (repo rustfmt: hard tabs, max_width 10000).
+  - **Not run:** full `cargo test --workspace` and the `database` `tests/db_tests.rs`
+    GPU integration suite (long-running, time-boxed out as in prior runs). This change
+    is isolated to `dsp-bench` — no `splimes`/`database`/orchestration code touched — so
+    the per-crate suite fully covers it; the workspace build is green.
+- **Done vs open:** DONE — `TimingBreakdown` (dataset-gen / measured / end-to-end +
+  overhead), wired into `run_profile`/`BenchResult`, schema v3 with v1+v2 back-compat,
+  docs. OPEN — DuckDB adapter (next), then ILP ingest; richer report formats
+  (Parquet/HTML); full hardware capture in run metadata; deeper per-pipeline-stage
+  timing spans (instrumentation track); more workloads/datasets; methodology doc.
+- **Next step:** add the **DuckDB adapter** (first competitor baseline, CPU-only)
+  behind the existing `SystemAdapter` trait — consider gating it behind a cargo feature
+  so the default workspace build stays free of the native `duckdb` dependency — then
+  emit a multi-adapter `BenchReport` (DSP + DuckDB, each with latency + CIs + timing) to
+  `reports/json/`. Then InfluxDB Line Protocol ingest.
+- **PR:** https://github.com/physics515/DSP/pull/7
+
+---
+
 ## 2026-06-08 — DSP-Bench InfluxDB Line Protocol parser
 
 - **Item:** Phase 1 / Track 1–2 — **DSP-Bench**; roadmap "Immediate next actions"
@@ -261,12 +320,13 @@ results (exact counts) · done-vs-open · next step · PR.
   the long-deferred DuckDB adapter (#3, 🟡) for the same reason prior runs deferred
   it — the `duckdb` crate is a heavy native C++ build, risky on an unattended,
   time-boxed Windows run — whereas this slice is pure dependency-free Rust, fully
-  self-contained to `dsp-bench`, and a new file (so it does **not** collide with the
-  still-open timing-spans PR #7, which is unmerged on `main`). ILP is a wire
-  *format*, not a vendor connector, so a format parser honors the connector
-  hard-constraint; a concrete InfluxDB network connector still belongs outside the
-  core. Takes #5 / B-ilp from 🔴 (not-started) to 🟡 (format parser done; profile
-  wiring + Phase-2 server endpoint remain).
+  self-contained to `dsp-bench`, and a new file (so it did **not** collide with the
+  then-open timing-spans PR #7 on creation; PR #7 has since merged and this branch
+  was rebased/merged onto it cleanly). ILP is a wire *format*, not a vendor
+  connector, so a format parser honors the connector hard-constraint; a concrete
+  InfluxDB network connector still belongs outside the core. Takes #5 / B-ilp from
+  🔴 (not-started) to 🟡 (format parser done; profile wiring + Phase-2 server
+  endpoint remain).
 - **What changed (isolated to `dsp-bench`, no new dependencies):**
   - `src/line_protocol.rs` — **new module.** A correct, dependency-free ILP parser:
     - `parse(&str) -> Result<Vec<LineRecord>, ParseError>` — full grammar:
@@ -285,40 +345,40 @@ results (exact counts) · done-vs-open · next step · PR.
       (NaN/inf → `None`), keeping the BigDecimal-as-logical-type rule.
   - `src/lib.rs` — `pub mod line_protocol;`, re-exports (`parse`, `parse_points`,
     `FieldValue`, `LineRecord`, `ParseError`, `TimestampPrecision`), and a module
-    bullet in the crate docs. No change to `schema.rs`/`report.rs`/`stats.rs` (keeps
-    conflict surface with PR #7 minimal).
+    bullet in the crate docs. The merge with PR #7 unified the re-export block
+    (both `line_protocol::*` and `TimingBreakdown` exported) and the crate-doc
+    bullets; no logic conflict (PR #7 touched `schema.rs`/`run_profile`, this PR
+    touched neither).
   - `dsp-bench/README.md` — documented the ILP parser under Status; refined "Not yet".
   - `ROADMAP.md` — Immediate next action #5 🔴→🟡 with scope note; backlog row
     **B-ilp** 🔴→🟡.
-- **Build/test/clippy (real, this run; nightly `rustc 1.96.0-nightly` (55e86c996
-  2026-04-02)):**
+- **Build/test/clippy (real, at PR-creation; nightly `rustc 1.96.0-nightly`
+  (55e86c996 2026-04-02)):**
   - `cargo build --workspace` — **GREEN** baseline confirmed before edits (18.62s
     incremental on a warm target dir).
-  - `cargo test -p dsp-bench` — **34 passed, 0 failed, 0 ignored** (was 23 on this
-    `main` base; +11 new `line_protocol::tests`: full-line parse, no-tags/no-ts,
-    every field type, quoted strings with spaces/commas/escaped quotes, escaped
-    comma/space/equals in keys, comment/blank skipping, line-numbered error,
-    empty-measurement/valueless-field rejection, precision scaling + overflow,
-    sorted point projection with skip rules, numeric-coercion rejection). 0
-    doc-tests.
+  - `cargo test -p dsp-bench` — **34 passed, 0 failed, 0 ignored** (+11 new
+    `line_protocol::tests`: full-line parse, no-tags/no-ts, every field type, quoted
+    strings with spaces/commas/escaped quotes, escaped comma/space/equals in keys,
+    comment/blank skipping, line-numbered error, empty-measurement/valueless-field
+    rejection, precision scaling + overflow, sorted point projection with skip
+    rules, numeric-coercion rejection). 0 doc-tests. (Post-merge re-verification
+    below.)
   - `cargo clippy -p dsp-bench --all-targets` — **0 warnings in dsp-bench** (first
     pass surfaced 9 — 8 `doc_markdown` "InfluxDB"/"QuestDB" missing-backticks + 1
-    `sort_by_key`; all fixed directly in source, no `#![allow]` added). The only
-    remaining clippy output is the **4 pre-existing** `splimes`
-    `sort_by`/`unnecessary_sort_by`/`sort_by_key` warnings (`gpu/mod.rs:280`,
-    `helpers/batch.rs:66,176`, `splines/quadratic.rs:161`) in untouched files —
-    identical to prior runs.
-  - `cargo fmt -p dsp-bench --check` — clean (repo rustfmt: hard tabs, max_width 10000).
-  - **Not run:** full `cargo test --workspace` and the `database` `tests/db_tests.rs`
-    GPU integration suite (long-running, time-boxed out as in prior runs). This
-    change is isolated to `dsp-bench` — no `splimes`/`database`/orchestration code
-    touched — so the per-crate suite fully covers it; the workspace build is green.
+    `sort_by_key`; all fixed directly in source, no `#![allow]` added). 4
+    pre-existing `splimes` warnings in untouched files remain.
+  - `cargo fmt -p dsp-bench --check` — clean.
+- **Post-merge re-verification (after merging origin/main with PR #7):**
+  - `cargo test -p dsp-bench` — **36 passed, 0 failed** (34 from this PR + 2 from
+    PR #7's timing-span tests, now combined on the merged tree).
+  - `cargo clippy -p dsp-bench --all-targets` — **0 warnings in dsp-bench**.
+  - `cargo fmt -p dsp-bench --check` — clean.
 - **Done vs open:** DONE — a correct, tested, dependency-free ILP **format parser**
   (`parse`/`parse_points`, full escaping/typing/precision), wired + re-exported,
-  docs + roadmap status. OPEN — wire an ILP/TSBS dataset *through a workload
-  profile* (load a `.lp`/TSBS file → `Vec<Point>` → run a profile); the Phase-2
-  server-side ILP ingest endpoint; DuckDB adapter; richer report formats; full
-  hardware capture.
+  docs + roadmap status; merge with PR #7 resolved. OPEN — wire an ILP/TSBS dataset
+  *through a workload profile* (load a `.lp`/TSBS file → `Vec<Point>` → run a
+  profile); the Phase-2 server-side ILP ingest endpoint; DuckDB adapter; richer
+  report formats; full hardware capture.
 - **Next step:** add an ILP-backed dataset source to the profile layer — e.g.
   `InterpolationProfile::from_line_protocol(path, field, precision)` or a
   `DatasetSource::{Generated, LineProtocol}` enum — so a TSBS-format file can drive
