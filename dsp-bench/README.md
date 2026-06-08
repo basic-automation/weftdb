@@ -36,11 +36,20 @@ This is the initial scaffold. What exists today:
   OS, CPU arch, generation timestamp) and persists it as pretty-printed JSON to a
   `reports/json/` artifact, satisfying the "keep raw results" reproducibility
   rule. A report is publishable only when every result it holds is publishable.
+- **InfluxDB Line Protocol ingest** (`src/line_protocol.rs`) — a dependency-free
+  ILP *format* parser (`parse` → `LineRecord`s; `parse_points` → sorted
+  `splimes::Point`s for a chosen numeric field). Handles tags, typed fields
+  (float/int/unsigned/bool/quoted-string), `\,`/`\ `/`\=` and in-string `\"`
+  escaping, comments, and caller-declared timestamp precision
+  (`TimestampPrecision`). This is the cheapest path to **TSBS compatibility**; it
+  is a format parser only — a concrete InfluxDB *connector* (network client)
+  stays outside the core per the connector hard-constraint.
 
 ## Not yet (tracked in `ROADMAP.md`)
 
-Competitor adapters (DuckDB, ClickHouse, InfluxDB 3, QuestDB, TimescaleDB),
-InfluxDB Line Protocol ingest, additional workloads (range fetch, downsample,
+Competitor adapters (DuckDB, ClickHouse, InfluxDB 3, QuestDB, TimescaleDB), an
+ILP *ingest path into a profile* (the parser exists; wiring TSBS-format datasets
+through a workload is next), additional workloads (range fetch, downsample,
 compression, …), dataset corpora, the richer report formats (Parquet/HTML) and
 full hardware capture (CPU model, RAM, GPU, drivers) in run metadata, and the
 methodology document.
