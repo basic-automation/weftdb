@@ -23,14 +23,19 @@ This is the initial scaffold. What exists today:
 - **DSP reference adapter** (`src/dsp_adapter.rs`) — drives DSP's native
   interpolation engine (`splimes::auto_interpolate`).
 - **Result schema** (`src/schema.rs`) — serializable `BenchResult` capturing the
-  latency distribution, dataset metadata, and correctness verdict.
+  latency distribution, dataset metadata, correctness verdict, and an
+  **end-to-end timing breakdown** (`TimingBreakdown`: one-time dataset-generation
+  cost, the summed measured adapter calls, and the whole-run span) that makes it
+  auditable that the latency distribution times only the adapter call, never
+  dataset setup.
 - **Latency statistics** (`src/stats.rs`) — p50/p95/p99 + min/max/mean/stddev
   (nearest-rank percentiles), plus **seeded bootstrap confidence intervals**
   (`LatencyStats::bootstrap_cis`) for the mean and the p50/p95/p99 percentiles.
   Resampling is driven by a published RNG seed, so every interval is exactly
   reproducible — per the fair-protocol requirements.
 - **Runner** (`run_profile` in `src/lib.rs`) — runs a profile against an adapter
-  for N timed reps and produces a `BenchResult`.
+  for N timed reps and produces a `BenchResult`, recording the end-to-end timing
+  spans (dataset generation vs. measured operation vs. whole run).
 - **JSON report runner** (`src/report.rs`) — wraps one or more `BenchResult`s in
   a `BenchReport` envelope with lightweight run metadata (`dsp-bench` version,
   OS, CPU arch, generation timestamp) and persists it as pretty-printed JSON to a
