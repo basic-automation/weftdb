@@ -14,6 +14,8 @@
 //! - [`adapter`] — the vendor-neutral [`SystemAdapter`] trait every benchmarked
 //!   system is driven through.
 //! - [`dsp_adapter`] — the DSP reference adapter ([`DspAdapter`]).
+//! - [`line_protocol`] — `InfluxDB` Line Protocol parsing ([`parse_points`]) for
+//!   TSBS-compatible dataset ingest.
 //! - [`schema`] — the serializable [`BenchResult`] record (Phase 1.1 latency
 //!   distribution + correctness + dataset metadata + end-to-end timing spans).
 //! - [`stats`] — p50/p95/p99 latency summarization + seeded bootstrap
@@ -30,6 +32,7 @@
 
 pub mod adapter;
 pub mod dsp_adapter;
+pub mod line_protocol;
 pub mod profile;
 pub mod report;
 pub mod schema;
@@ -41,7 +44,7 @@ use bigdecimal::ToPrimitive;
 use splimes::generate_target_times;
 
 pub use crate::{
-	adapter::SystemAdapter, dsp_adapter::DspAdapter, profile::InterpolationProfile, report::{BenchReport, RunMetadata}, schema::{BenchResult, CorrectnessReport, DatasetMeta, TimingBreakdown, SCHEMA_VERSION}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}
+	adapter::SystemAdapter, dsp_adapter::DspAdapter, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, profile::InterpolationProfile, report::{BenchReport, RunMetadata}, schema::{BenchResult, CorrectnessReport, DatasetMeta, TimingBreakdown, SCHEMA_VERSION}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}
 };
 
 /// Workload class label recorded for the interpolation profile.
