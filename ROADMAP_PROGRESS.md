@@ -324,4 +324,4 @@ results (exact counts) · done-vs-open · next step · PR.
   `DatasetSource::{Generated, LineProtocol}` enum — so a TSBS-format file can drive
   the existing interpolation workload end-to-end, then the DuckDB adapter for the
   first competitor baseline.
-- **PR:** (filled in below once opened)
+- **PR:** https://github.com/physics515/DSP/pull/8
