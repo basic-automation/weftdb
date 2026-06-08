@@ -364,7 +364,7 @@ Status: 🔴 absent · 🟡 partial/verify · 🟢 exists, enhance · ✅ done.
 |----|------|--------|-------|--------|
 | B-tags | **Per-measurement tags/labels** (incl. `interpolated=true`/provenance) — `measurement.rs` has none. | 🔴 | 2/4 | `DSM-Database`, `DSM-Measurement` |
 | B-conn | **Vendor-neutral connector trait + registry** (core). | 🔴 | 2/7 | `dsm-source`, `dsm-asset` |
-| B-ilp | **InfluxDB Line Protocol ingest** (and ILP/Influx **interop** connector, separate crate — *not* a storage swap). | 🔴 | 2 | `dsm-influxdb`, `dsm-batch` |
+| B-ilp | **InfluxDB Line Protocol ingest** (and ILP/Influx **interop** connector, separate crate — *not* a storage swap). | 🟡 | 2 | `dsm-influxdb`, `dsm-batch` |
 | B-rest | **REST facade** + **declarative query-params** (`range`/`take`/`count`/`page`/`interpolation`) + **pagination**. | 🔴/🟡 | 2 | `DSM-Database` |
 | B-poll | **Scheduled polling daemon** (per-source interval) + **B-retry** at-least-once retry buffer + **B-register** runtime source registration. | 🔴 | 7 | `DSM-Input-Module` |
 | B-interp | **Interpolate-on-read, single-instant lookup, out-of-range extrapolation.** | ✅ | 5 | `splimes` / `database` (already implemented) |
@@ -604,7 +604,12 @@ redistributed. *For commercial trust, be more transparent than competitors.*
    vendor-neutral `SystemAdapter` trait, driving `splimes::auto_interpolate`;
    DuckDB adapter still to do.)*
 4. Add ClickHouse, InfluxDB 3, QuestDB, TimescaleDB adapters.
-5. Implement InfluxDB Line Protocol ingest.
+5. 🟡 Implement InfluxDB Line Protocol ingest. *(ILP **format parser** landed in
+   `dsp-bench/src/line_protocol.rs`: `parse` → `LineRecord`s and `parse_points`
+   → sorted `splimes::Point`s for a chosen numeric field, with full
+   tag/typed-field/escape/comment/precision handling and no vendor deps — the
+   TSBS-compatibility on-ramp. Still open: wiring an ILP/TSBS dataset through a
+   workload profile, and the server-side ILP ingest endpoint (Phase 2).)*
 6. 🟡 Add end-to-end timing spans. *(Harness-level spans landed:
    `TimingBreakdown` in `dsp-bench/src/schema.rs` records dataset-generation
    cost, the summed measured adapter calls, and the whole-run span, wired into

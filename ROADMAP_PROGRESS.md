@@ -310,3 +310,78 @@ results (exact counts) · done-vs-open · next step · PR.
   emit a multi-adapter `BenchReport` (DSP + DuckDB, each with latency + CIs + timing) to
   `reports/json/`. Then InfluxDB Line Protocol ingest.
 - **PR:** https://github.com/physics515/DSP/pull/7
+
+---
+
+## 2026-06-08 — DSP-Bench InfluxDB Line Protocol parser
+
+- **Item:** Phase 1 / Track 1–2 — **DSP-Bench**; roadmap "Immediate next actions"
+  #5 ("Implement InfluxDB Line Protocol ingest") and backlog **B-ilp**. Chosen over
+  the long-deferred DuckDB adapter (#3, 🟡) for the same reason prior runs deferred
+  it — the `duckdb` crate is a heavy native C++ build, risky on an unattended,
+  time-boxed Windows run — whereas this slice is pure dependency-free Rust, fully
+  self-contained to `dsp-bench`, and a new file (so it did **not** collide with the
+  then-open timing-spans PR #7 on creation; PR #7 has since merged and this branch
+  was rebased/merged onto it cleanly). ILP is a wire *format*, not a vendor
+  connector, so a format parser honors the connector hard-constraint; a concrete
+  InfluxDB network connector still belongs outside the core. Takes #5 / B-ilp from
+  🔴 (not-started) to 🟡 (format parser done; profile wiring + Phase-2 server
+  endpoint remain).
+- **What changed (isolated to `dsp-bench`, no new dependencies):**
+  - `src/line_protocol.rs` — **new module.** A correct, dependency-free ILP parser:
+    - `parse(&str) -> Result<Vec<LineRecord>, ParseError>` — full grammar:
+      `measurement[,tags] fields [timestamp]`; tags + typed fields
+      (`Float`/`Integer` `i`/`Unsigned` `u`/`Boolean`/quoted `Str`); `\,`, `\ `,
+      `\=` escaping in the measurement/tag/key region and `\"`/`\` inside string
+      values (a quote-aware, backslash-aware `split_unescaped` + `unescape`); blank
+      and `#`-comment lines skipped; `ParseError` carries the 1-based line number.
+    - `parse_points(&str, field, TimestampPrecision) -> Result<Vec<Point>, _>` — the
+      harness on-ramp: projects records into sorted `splimes::Point`s on a chosen
+      numeric field, skipping records that lack the field/timestamp or whose field
+      is non-numeric. `TimestampPrecision::{Nanoseconds,Microseconds,Milliseconds,
+      Seconds}` (ns default) scales raw integer stamps via checked-mul (overflow →
+      `None`, no wrap) to a `DateTime<Utc>`.
+    - `FieldValue::as_big_decimal()` coerces numeric fields to `BigDecimal`
+      (NaN/inf → `None`), keeping the BigDecimal-as-logical-type rule.
+  - `src/lib.rs` — `pub mod line_protocol;`, re-exports (`parse`, `parse_points`,
+    `FieldValue`, `LineRecord`, `ParseError`, `TimestampPrecision`), and a module
+    bullet in the crate docs. The merge with PR #7 unified the re-export block
+    (both `line_protocol::*` and `TimingBreakdown` exported) and the crate-doc
+    bullets; no logic conflict (PR #7 touched `schema.rs`/`run_profile`, this PR
+    touched neither).
+  - `dsp-bench/README.md` — documented the ILP parser under Status; refined "Not yet".
+  - `ROADMAP.md` — Immediate next action #5 🔴→🟡 with scope note; backlog row
+    **B-ilp** 🔴→🟡.
+- **Build/test/clippy (real, at PR-creation; nightly `rustc 1.96.0-nightly`
+  (55e86c996 2026-04-02)):**
+  - `cargo build --workspace` — **GREEN** baseline confirmed before edits (18.62s
+    incremental on a warm target dir).
+  - `cargo test -p dsp-bench` — **34 passed, 0 failed, 0 ignored** (+11 new
+    `line_protocol::tests`: full-line parse, no-tags/no-ts, every field type, quoted
+    strings with spaces/commas/escaped quotes, escaped comma/space/equals in keys,
+    comment/blank skipping, line-numbered error, empty-measurement/valueless-field
+    rejection, precision scaling + overflow, sorted point projection with skip
+    rules, numeric-coercion rejection). 0 doc-tests. (Post-merge re-verification
+    below.)
+  - `cargo clippy -p dsp-bench --all-targets` — **0 warnings in dsp-bench** (first
+    pass surfaced 9 — 8 `doc_markdown` "InfluxDB"/"QuestDB" missing-backticks + 1
+    `sort_by_key`; all fixed directly in source, no `#![allow]` added). 4
+    pre-existing `splimes` warnings in untouched files remain.
+  - `cargo fmt -p dsp-bench --check` — clean.
+- **Post-merge re-verification (after merging origin/main with PR #7):**
+  - `cargo test -p dsp-bench` — **36 passed, 0 failed** (34 from this PR + 2 from
+    PR #7's timing-span tests, now combined on the merged tree).
+  - `cargo clippy -p dsp-bench --all-targets` — **0 warnings in dsp-bench**.
+  - `cargo fmt -p dsp-bench --check` — clean.
+- **Done vs open:** DONE — a correct, tested, dependency-free ILP **format parser**
+  (`parse`/`parse_points`, full escaping/typing/precision), wired + re-exported,
+  docs + roadmap status; merge with PR #7 resolved. OPEN — wire an ILP/TSBS dataset
+  *through a workload profile* (load a `.lp`/TSBS file → `Vec<Point>` → run a
+  profile); the Phase-2 server-side ILP ingest endpoint; DuckDB adapter; richer
+  report formats; full hardware capture.
+- **Next step:** add an ILP-backed dataset source to the profile layer — e.g.
+  `InterpolationProfile::from_line_protocol(path, field, precision)` or a
+  `DatasetSource::{Generated, LineProtocol}` enum — so a TSBS-format file can drive
+  the existing interpolation workload end-to-end, then the DuckDB adapter for the
+  first competitor baseline.
+- **PR:** https://github.com/physics515/DSP/pull/8
