@@ -309,4 +309,4 @@ results (exact counts) · done-vs-open · next step · PR.
   so the default workspace build stays free of the native `duckdb` dependency — then
   emit a multi-adapter `BenchReport` (DSP + DuckDB, each with latency + CIs + timing) to
   `reports/json/`. Then InfluxDB Line Protocol ingest.
-- **PR:** _(filled in after `gh pr create`)_
+- **PR:** https://github.com/physics515/DSP/pull/7
