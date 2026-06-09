@@ -608,8 +608,11 @@ redistributed. *For commercial trust, be more transparent than competitors.*
    `dsp-bench/src/line_protocol.rs`: `parse` → `LineRecord`s and `parse_points`
    → sorted `splimes::Point`s for a chosen numeric field, with full
    tag/typed-field/escape/comment/precision handling and no vendor deps — the
-   TSBS-compatibility on-ramp. Still open: wiring an ILP/TSBS dataset through a
-   workload profile, and the server-side ILP ingest endpoint (Phase 2).)*
+   TSBS-compatibility on-ramp. **Now wired end-to-end through a workload profile:**
+   `DatasetSource::{Generated, LineProtocol}` + `InterpolationProfile::from_line_protocol`
+   in `dsp-bench/src/profile.rs` drive the same interpolation harness, correctness
+   gate, and JSON report from a real `.lp`/TSBS payload (timestamp bounds derived
+   from the data). Still open: the server-side ILP ingest **endpoint** (Phase 2).)*
 6. 🟡 Add end-to-end timing spans. *(Harness-level spans landed:
    `TimingBreakdown` in `dsp-bench/src/schema.rs` records dataset-generation
    cost, the summed measured adapter calls, and the whole-run span, wired into
