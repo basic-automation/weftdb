@@ -9,8 +9,10 @@
 //!
 //! ## Shape (this is the scaffold)
 //!
-//! - [`profile`] — workload profiles + seeded dataset generation. The flagship
-//!   is [`InterpolationProfile::interpolation_heavy_irregular`].
+//! - [`profile`] — workload profiles + dataset sourcing. The flagship is
+//!   [`InterpolationProfile::interpolation_heavy_irregular`] (seeded synthetic);
+//!   [`InterpolationProfile::from_line_protocol`] drives the same workload from a
+//!   TSBS / `InfluxDB`-Line-Protocol payload.
 //! - [`adapter`] — the vendor-neutral [`SystemAdapter`] trait every benchmarked
 //!   system is driven through.
 //! - [`dsp_adapter`] — the DSP reference adapter ([`DspAdapter`]).
@@ -44,7 +46,7 @@ use bigdecimal::ToPrimitive;
 use splimes::generate_target_times;
 
 pub use crate::{
-	adapter::SystemAdapter, dsp_adapter::DspAdapter, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, profile::InterpolationProfile, report::{BenchReport, RunMetadata}, schema::{BenchResult, CorrectnessReport, DatasetMeta, TimingBreakdown, SCHEMA_VERSION}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}
+	adapter::SystemAdapter, dsp_adapter::DspAdapter, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError}, report::{BenchReport, RunMetadata}, schema::{BenchResult, CorrectnessReport, DatasetMeta, TimingBreakdown, SCHEMA_VERSION}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}
 };
 
 /// Workload class label recorded for the interpolation profile.
@@ -212,6 +214,41 @@ mod tests {
 		assert!(back.is_publishable());
 
 		let _ = std::fs::remove_dir_all(path.parent().unwrap_or(&path));
+	}
+
+	#[tokio::test]
+	async fn dsp_adapter_runs_a_line_protocol_sourced_profile() {
+		// A TSBS-style ILP payload: irregular, out-of-order, second-precision stamps
+		// spanning ten minutes. Driving it through `from_line_protocol` must produce
+		// a result indistinguishable in shape from the synthetic flagship run — same
+		// harness, same correctness gate, same reporting — just a different source.
+		let payload = "\
+cpu,host=h0 usage=10.0 0\n\
+cpu,host=h0 usage=14.5 180\n\
+cpu,host=h0 usage=12.0 60\n\
+cpu,host=h0 usage=11.5 240\n\
+cpu,host=h0 usage=13.0 120\n\
+cpu,host=h0 usage=15.5 360\n\
+cpu,host=h0 usage=16.0 480\n\
+cpu,host=h0 usage=14.0 600\n";
+		let profile = InterpolationProfile::from_line_protocol("tsbs-cpu-usage", payload, "usage", TimestampPrecision::Seconds, splimes::Spline::Cubic, splimes::Resolution::Minutes).expect("payload builds a profile");
+
+		let adapter = DspAdapter::new();
+		let result = run_profile(&adapter, &profile, 3).await.expect("ILP-sourced benchmark run succeeds");
+
+		assert_eq!(result.adapter, "dsp");
+		assert_eq!(result.profile, "tsbs-cpu-usage");
+		assert_eq!(result.workload, "upsample_interpolate");
+		assert_eq!(result.dataset.input_points, 8, "all eight ILP records reach the harness");
+		assert_eq!(result.dataset.seed, 0, "a line-protocol source carries no synthetic seed");
+
+		// The full correctness gate must pass on real-sourced data exactly as it does
+		// on synthetic data: a non-empty, correctly-sized, finite interpolated grid.
+		assert!(result.dataset.output_points > 0, "interpolation produced no points");
+		assert!(result.correctness.passed(), "correctness must pass: {:?}", result.correctness);
+		assert!(result.is_publishable(), "an ILP-sourced run should be publishable");
+		assert!(result.throughput_points_per_sec > 0.0, "throughput must be positive");
+		assert!(result.timing.measured_ns > 0, "measured span must be non-zero");
 	}
 
 	#[tokio::test]
