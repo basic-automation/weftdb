@@ -385,3 +385,81 @@ results (exact counts) · done-vs-open · next step · PR.
   the existing interpolation workload end-to-end, then the DuckDB adapter for the
   first competitor baseline.
 - **PR:** https://github.com/physics515/DSP/pull/8
+
+---
+
+## 2026-06-09 — DSP-Bench: ILP/TSBS dataset wired through a workload profile
+
+- **Item:** Phase 1 / Track 1–2 — **DSP-Bench**; roadmap "Immediate next actions"
+  #5 ("Implement InfluxDB Line Protocol ingest") and backlog **B-ilp**. This is the
+  exact next step the prior run's handoff named: take the dependency-free ILP
+  *format parser* (`parse_points`, landed in PR #8) and wire a `.lp`/TSBS payload
+  through an actual workload profile so it drives the existing interpolation harness
+  end-to-end. Pure Rust, isolated to the `dsp-bench` leaf crate, no new deps. Keeps
+  #5 / B-ilp at 🟡 — the profile-wiring sub-item is now done; the Phase-2 *server*
+  ILP ingest endpoint remains the open work for that line.
+- **What changed (isolated to `dsp-bench`, no new dependencies):**
+  - `src/profile.rs` —
+    - **new `DatasetSource` enum** (`Generated` | `LineProtocol { points }`): where a
+      profile's input series comes from. The flagship stays `Generated` (seeded
+      synthetic); `LineProtocol` carries a fixed, sorted, parsed series.
+    - **new `InterpolationProfile::from_line_protocol(name, payload, field,
+      precision, spline, resolution)`** — parses the payload via
+      `line_protocol::parse_points`, projects the chosen numeric field onto sorted
+      `Point`s, and returns a profile that drives the *same* `run_profile` harness.
+      Records `seed=0`, `missingness=0.0` (data taken as given) and `span` = the
+      data's actual extent.
+    - **new `LineProtocolProfileError`** (`Parse(ParseError)` | `TooFewPoints(usize)`
+      | `ZeroSpan`) with `Display` + `Error` (+ `source()`) + `From<ParseError>`:
+      a spline needs ≥2 points spanning a non-zero range, so a one-point or
+      single-instant series is rejected with a typed error rather than a panic or a
+      bogus empty grid.
+    - **`start()`/`end()` made source-aware**: a `LineProtocol` profile derives its
+      time bounds from the data's own first/last timestamp (the synthetic epoch
+      anchor is only used for `Generated`); factored the anchor into a private
+      associated `anchor()` fn.
+    - **`generate()` made source-aware**: returns the seeded synthetic series for
+      `Generated`, a clone of the parsed series for `LineProtocol`. The old body was
+      renamed `generate_synthetic()`. `run_profile` is unchanged — it calls
+      `generate()`/`start()`/`end()` exactly as before, so the whole pipeline
+      (latency stats, bootstrap CIs, timing spans, correctness gate, JSON report)
+      now works on ILP-sourced data with zero harness changes.
+  - `src/lib.rs` — re-export `DatasetSource`, `LineProtocolProfileError`
+    (alongside `InterpolationProfile`); updated the `profile` module crate-doc
+    bullet to mention the ILP source; added the end-to-end integration test.
+  - `ROADMAP.md` — Immediate next action #5 note updated (parser → now wired
+    end-to-end through a workload profile; stays 🟡, server endpoint still open).
+- **Build/test/clippy (real, nightly `rustc 1.96.0-nightly` (55e86c996 2026-04-02)):**
+  - `cargo build --workspace` — **GREEN** baseline confirmed before edits (38.98s).
+  - `cargo test -p dsp-bench` — **42 passed, 0 failed, 0 ignored** (was 36; **+6
+    new**: `from_line_protocol_parses_sorts_and_bounds_from_data`,
+    `from_line_protocol_skips_records_missing_the_field`,
+    `from_line_protocol_rejects_too_few_points`,
+    `from_line_protocol_rejects_zero_span`,
+    `from_line_protocol_surfaces_parse_errors`, and the lib-level
+    `dsp_adapter_runs_a_line_protocol_sourced_profile` — a full `run_profile` over
+    an 8-record TSBS-style payload that asserts the correctness gate passes and the
+    result is publishable). 0 doc-tests.
+  - `cargo clippy -p dsp-bench --all-targets` — **0 warnings in dsp-bench** (first
+    pass surfaced 2 — `derive_partial_eq_without_eq` on `DatasetSource` and
+    `unused_self` on `anchor`; both fixed directly: added `Eq` to the derive since
+    `splimes::Point` is `Eq`, made `anchor` an associated fn. No `#![allow]` added.)
+    4 pre-existing `splimes` warnings in untouched files remain (logged before).
+  - `cargo fmt -p dsp-bench --check` — clean (exit 0).
+  - Scope note: tests scoped to `-p dsp-bench` because the change is confined to the
+    `dsp-bench` leaf crate (no other workspace member depends on it); the full
+    workspace **build** is green, so no other crate could be affected. Did not run
+    the full (heavy wgpu/GPU) `cargo test --workspace` to stay in the time budget.
+- **Done vs open:** DONE — ILP/TSBS payloads now drive the real interpolation
+  workload end-to-end via `DatasetSource::LineProtocol` + `from_line_protocol`,
+  with typed-error guards, data-derived time bounds, and full test coverage incl. a
+  `run_profile` integration test. OPEN — the Phase-2 server-side ILP ingest
+  **endpoint**; loading a `.lp` file from disk in a runnable bench binary/CLI (the
+  wiring exists at the library level; there's no `main` yet that reads a path); the
+  long-deferred DuckDB adapter; richer report formats; full hardware capture.
+- **Next step:** either (a) add a tiny bench runner/CLI entry point that reads a
+  `.lp` file path + field/precision and emits a `BenchReport` to `reports/json/`
+  (makes the ILP path runnable, not just library-testable), or (b) start the
+  Phase-2 `axum` server with the ILP ingest endpoint. (a) is the smaller,
+  budget-friendly increment and the natural close of the ILP-ingest line.
+- **PR:** (to be filled in after `gh pr create`)
