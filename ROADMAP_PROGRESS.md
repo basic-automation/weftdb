@@ -463,3 +463,85 @@ results (exact counts) · done-vs-open · next step · PR.
   Phase-2 `axum` server with the ILP ingest endpoint. (a) is the smaller,
   budget-friendly increment and the natural close of the ILP-ingest line.
 - **PR:** https://github.com/physics515/DSP/pull/9
+
+---
+
+## 2026-06-10 — DSP-Bench: runnable CLI for line-protocol/TSBS benchmark runs
+
+- **Item:** Phase 1 / Track 1–2 — **DSP-Bench**; roadmap "Immediate next actions"
+  #5 ("Implement InfluxDB Line Protocol ingest") and backlog **B-ilp**. This is
+  exactly option (a) the prior run's handoff named: add a small bench runner/CLI
+  that reads a `.lp` file + field/precision and emits a `BenchReport` to
+  `reports/json/`, so the ILP→interpolation path is *runnable from disk*, not just
+  library-testable. Pure Rust, isolated to the `dsp-bench` leaf crate, no new deps
+  (hand-rolled arg parsing, no `clap`). Keeps #5 / B-ilp at 🟡 — the file/CLI
+  ingest path is now done; the Phase-2 *server* ILP ingest endpoint remains open.
+- **What changed (isolated to `dsp-bench`, no new dependencies):**
+  - **new `src/main.rs`** (binary `dsp-bench`) —
+    - `Cli::from_args` — a pure, unit-tested arg parser accepting `--key value`
+      and `--key=value` plus short flags (`-i`/`-f`); `--input` and `--field`
+      required, everything else defaulted. Returns a `Command::{Help, Run}` enum so
+      `-h`/`--help` short-circuits cleanly. A bare positional is taken as the input
+      path; a second positional or unknown flag is a typed error.
+    - value parsers `parse_precision` (ns|us|ms|s + long forms), `parse_spline`
+      (linear|quadratic|cubic|`poly[:N]` → `Spline::Polynomial(N, None)`),
+      `parse_resolution` (ns|us|ms|s|m|h|d|w|mo|y), `parse_reps` (rejects 0, which
+      `run_profile` requires).
+    - `run` — reads the file, builds the profile via
+      `InterpolationProfile::from_line_protocol`, runs the `DspAdapter` through
+      `run_profile`, wraps the result in a `BenchReport` with real wall-clock
+      `RunMetadata::capture(Utc::now().to_rfc3339())`, and writes
+      `<out-dir>/<profile>__dsp.json` (default `reports/json/`). Profile name
+      defaults to the input file stem.
+    - exit codes: `0` on a publishable (correctness-passing) run, `1` on a parse
+      error / missing file / failed correctness gate — so a CI/scripted caller can
+      gate on it. A current-thread tokio runtime keeps the binary lean.
+    - `print_summary` — concise human summary (profile/adapter/reps/in–out points,
+      p50/p95/p99/mean latency in ms, throughput, correctness, publishable, report
+      path).
+  - `README.md` — new bullets for the end-to-end-wired ILP profile source and the
+    CLI runner; corrected the stale "Not yet" line (the ILP-through-profile item is
+    done — the open ILP work is the Phase-2 server endpoint); added a `cargo run`
+    usage example.
+  - `ROADMAP.md` — Immediate next action #5 note updated ("Now runnable from
+    disk"); stays 🟡 (server endpoint still open).
+- **Build/test/clippy (real, nightly `rustc 1.98.0-nightly` (cb46fbb8c 2026-06-08)):**
+  - `cargo build --workspace` — **GREEN** baseline confirmed before edits
+    (2m43s; heavy turso/wgpu deps).
+  - `cargo build -p dsp-bench --bins` — **GREEN** (binary compiles; first pass
+    failed on a `derive(Eq)` for `Cli`/`Command` because `Spline::Polynomial`
+    carries an `f64` — fixed by dropping to `PartialEq`, tests use `assert_eq!`).
+  - `cargo test -p dsp-bench` — **53 passed, 0 failed, 0 ignored** (42 lib, was 42;
+    **+11 new** in `main.rs`: arg-parsing defaults, short/positional/`=`-forms,
+    every precision/spline(incl. polynomial)/resolution token, `--help`
+    short-circuit, missing-required errors, unknown-flag/zero-reps/dangling-value
+    rejection, second-positional rejection, and `derive_profile_name`). 0
+    doc-tests.
+  - `cargo clippy -p dsp-bench --all-targets` — **0 warnings in dsp-bench** (first
+    pass surfaced 2 — `clippy::use_self` on the `Self`-return and a needless
+    `.peekable()`; both fixed directly, no `#![allow]`). The 4 pre-existing
+    `splimes` `sort_by_key` warnings in untouched files remain (logged before).
+  - `cargo fmt -p dsp-bench --check` — clean (exit 0).
+  - **Real end-to-end run** (not just tests): built an 8-record TSBS-style
+    `sample.lp` in the per-run scratch dir and ran
+    `dsp-bench --input sample.lp --field usage --precision s --spline cubic
+    --resolution minutes --reps 12 --out-dir <scratch>` — exit 0, correctness
+    PASS, wrote a valid **schema v3** JSON report (8 input → 11 output points,
+    `metadata.os=windows`, real RFC-3339 `generated_at`). Error paths verified:
+    `--help`→0, missing `--field`→1, nonexistent file→1, unknown flag→1.
+  - Scope note: tests scoped to `-p dsp-bench` (the change is confined to the
+    `dsp-bench` leaf crate; no other workspace member depends on it, and the full
+    workspace **build** is green). Did not run the full (heavy wgpu/GPU)
+    `cargo test --workspace` to stay in the time budget.
+- **Done vs open:** DONE — the ILP→interpolation path is now runnable from disk
+  via the `dsp-bench` binary, with a tested arg parser, typed value parsing,
+  correctness-gated exit codes, JSON artifact output, and a verified end-to-end
+  run. OPEN — the Phase-2 server-side ILP ingest **endpoint** (`axum`); the
+  long-deferred DuckDB adapter (first competitor baseline); richer report formats
+  (Parquet/HTML); full hardware capture in run metadata; the methodology document.
+- **Next step:** either (a) the **DuckDB adapter** — the first competitor baseline,
+  so reports compare DSP against a real CPU-only engine (roadmap Immediate Next
+  Action #3, long deferred), or (b) start the **Phase-2 `axum` server** with the
+  ILP ingest endpoint. (a) is the higher-leverage benchmark increment now that the
+  DSP-side ingest/run/report loop is complete end-to-end.
+- **PR:** <!-- filled in after PR creation -->
