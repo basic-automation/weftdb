@@ -612,7 +612,10 @@ redistributed. *For commercial trust, be more transparent than competitors.*
    `DatasetSource::{Generated, LineProtocol}` + `InterpolationProfile::from_line_protocol`
    in `dsp-bench/src/profile.rs` drive the same interpolation harness, correctness
    gate, and JSON report from a real `.lp`/TSBS payload (timestamp bounds derived
-   from the data). Still open: the server-side ILP ingest **endpoint** (Phase 2).)*
+   from the data). **Now runnable from disk:** the `dsp-bench` binary
+   (`dsp-bench/src/main.rs`) reads a `.lp` file + field/precision/spline/resolution
+   and writes a `BenchReport` to `reports/json/`, exiting non-zero on a failed
+   correctness gate. Still open: the server-side ILP ingest **endpoint** (Phase 2).)*
 6. 🟡 Add end-to-end timing spans. *(Harness-level spans landed:
    `TimingBreakdown` in `dsp-bench/src/schema.rs` records dataset-generation
    cost, the summed measured adapter calls, and the whole-run span, wired into

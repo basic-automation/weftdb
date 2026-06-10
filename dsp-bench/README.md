@@ -48,18 +48,29 @@ This is the initial scaffold. What exists today:
   escaping, comments, and caller-declared timestamp precision
   (`TimestampPrecision`). This is the cheapest path to **TSBS compatibility**; it
   is a format parser only — a concrete InfluxDB *connector* (network client)
-  stays outside the core per the connector hard-constraint.
+  stays outside the core per the connector hard-constraint. The parser is wired
+  end-to-end through a workload via
+  `InterpolationProfile::from_line_protocol` (`DatasetSource::LineProtocol`), so a
+  real `.lp`/TSBS payload drives the same interpolation harness, correctness
+  gate, and reporting as the synthetic flagship profile.
+- **Command-line runner** (`src/main.rs`, binary `dsp-bench`) — reads a `.lp` /
+  TSBS file, projects the chosen numeric field through the DSP interpolation
+  profile, and writes a `BenchReport` JSON artifact to `reports/json/`. Pure
+  hand-rolled arg parsing (no `clap`); exits non-zero when the correctness gate
+  fails so a scripted caller can gate on it.
 
 ## Not yet (tracked in `ROADMAP.md`)
 
-Competitor adapters (DuckDB, ClickHouse, InfluxDB 3, QuestDB, TimescaleDB), an
-ILP *ingest path into a profile* (the parser exists; wiring TSBS-format datasets
-through a workload is next), additional workloads (range fetch, downsample,
+Competitor adapters (DuckDB, ClickHouse, InfluxDB 3, QuestDB, TimescaleDB), the
+Phase-2 server-side ILP *ingest endpoint* (the file/CLI ingest path exists; an
+`axum` HTTP endpoint is next), additional workloads (range fetch, downsample,
 compression, …), dataset corpora, the richer report formats (Parquet/HTML) and
 full hardware capture (CPU model, RAM, GPU, drivers) in run metadata, and the
 methodology document.
 
 ## Run
+
+Smoke-test the harness:
 
 ```sh
 cargo test -p dsp-bench
@@ -68,3 +79,15 @@ cargo test -p dsp-bench
 The smoke test generates the `interpolation-heavy-irregular` dataset, runs it
 through the DSP adapter, and asserts the produced grid is correctly sized,
 finite, and that the result schema round-trips through JSON.
+
+Run a benchmark over a line-protocol / TSBS file and emit a JSON report:
+
+```sh
+cargo run -p dsp-bench -- \
+    --input data.lp --field usage \
+    --precision s --spline cubic --resolution minutes --reps 10
+```
+
+The report lands at `reports/json/<profile>__dsp.json` (the profile name defaults
+to the input file stem). `--help` lists every flag; the precision, spline, and
+resolution accept short forms (`s`, `cubic`, `m`).
