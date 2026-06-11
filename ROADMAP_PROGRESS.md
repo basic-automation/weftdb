@@ -545,3 +545,90 @@ results (exact counts) · done-vs-open · next step · PR.
   ILP ingest endpoint. (a) is the higher-leverage benchmark increment now that the
   DSP-side ingest/run/report loop is complete end-to-end.
 - **PR:** https://github.com/physics515/DSP/pull/10
+
+---
+
+## 2026-06-11 — DSP-Bench: portable linear baseline adapter + `--compare`
+
+- **Item:** Phase 1 / Track 1 — **DSP-Bench**; roadmap "Immediate next actions"
+  #3 ("Add DSP and DuckDB adapters") and fair-protocol **Phase 1.2 class (C)**
+  ("portable client-side baseline: fetch raw → interpolate in the same Rust
+  client → total end-to-end"). Until tonight DSP-Bench had exactly one system
+  (`DspAdapter`), so it could not emit a *comparison* at all. This adds the first
+  non-DSP system — a dependency-free, in-process linear baseline — turning the
+  harness from "measure DSP" into "compare DSP against a reference". Chose this
+  over the long-deferred DuckDB adapter the prior handoff floated because DuckDB
+  needs a native library + the `duckdb` crate (heavy/fragile build on Windows,
+  risks the nightly time budget); the portable baseline is the honest reference
+  the roadmap explicitly asks for and lands clean with zero new deps. Keeps #3 at
+  🟡 (the external-engine DuckDB baseline is still open).
+- **What changed (isolated to `dsp-bench`, no new dependencies):**
+  - **new `src/baseline_adapter.rs`** (`BaselineLinearAdapter`) — implements the
+    vendor-neutral `SystemAdapter` trait with piecewise-linear reconstruction:
+    sorts the (possibly out-of-order/ILP-sourced) input in place, builds the same
+    `generate_target_times(start,end,resolution)` grid the harness expects (so
+    output counts match DSP and the correctness gate passes identically), and
+    interpolates each grid point from its bracketing pair. **Precision-aware:** the
+    whole interpolation runs in `BigDecimal` (time ratio is an exact `i64`-ns
+    rational), so it never silently downcasts through `f64` — honouring the same
+    hard constraint as the engine. Out-of-range grid points extrapolate along the
+    nearest end segment; a single input point degenerates to a constant;
+    zero/unrepresentable spans degenerate to the left value (no divide-by-zero);
+    empty input is a typed error. The adapter is **always linear by definition**
+    (ignores the requested `Spline`) and named `baseline-linear`, documented
+    plainly so the comparison is an honest quality/speed reference, not a disguised
+    apples-to-apples spline race. 7 unit tests (regular grid, irregular midpoint,
+    out-of-order sort, linear extrapolation past both ends, single-point constant,
+    empty-input rejection, spline-ignored-stays-linear).
+  - `src/lib.rs` — `pub mod baseline_adapter;`, re-export `BaselineLinearAdapter`,
+    crate-doc bullet.
+  - `src/main.rs` — new `--compare`/`-c` flag (`Cli.compare`): runs DSP and, when
+    set, the baseline, collecting both into one `BenchReport`. Artifact filename
+    now tags every adapter (`<profile>__dsp+baseline-linear.json`, sanitized to
+    `...dsp-baseline-linear.json`) so a comparison and a solo run never collide;
+    `print_summary` now prints one block per adapter; USAGE updated. +1 CLI test
+    (`compare_flag_is_parsed_in_both_forms`) and a `compare`-default assertion.
+  - `dsp-bench/README.md` — baseline-adapter bullet, `--compare` usage example,
+    reworded the "Not yet" line (the baseline is the first non-DSP system; the
+    external-engine DuckDB adapter remains open).
+  - `ROADMAP.md` — Immediate next action #3 note updated (baseline landed; stays
+    🟡, external DuckDB adapter still open).
+- **Build/test/clippy (real, nightly `rustc 1.98.0-nightly` (cb46fbb8c 2026-06-08)):**
+  - `cargo build --workspace` — **GREEN** baseline confirmed before edits (1m22s;
+    heavy turso/wgpu deps).
+  - `cargo test -p dsp-bench` — **61 passed, 0 failed, 0 ignored** (49 lib, was 42,
+    **+7** baseline-adapter tests; 12 bin, was 11, **+1** compare-flag test). 0
+    doc-tests.
+  - `cargo clippy -p dsp-bench --all-targets` — **0 warnings in dsp-bench** (first
+    pass surfaced 2 `clippy::cast_precision_loss` from `i as f64` in my new tests;
+    fixed directly with an `idx()` helper using `f64::from(u16::try_from(..))`, no
+    `#[allow]`). The 4 pre-existing `splimes` `sort_by_key` warnings in untouched
+    files remain (logged before).
+  - `cargo fmt -p dsp-bench --check` — clean (exit 0).
+  - **Real end-to-end `--compare` run** (not just tests): built an 8-record
+    TSBS-style `sample.lp` in the per-run scratch dir and ran
+    `dsp-bench --input sample.lp --field usage --precision s --spline cubic
+    --resolution minutes --reps 12 --out-dir <scratch> --compare` — exit 0, **both**
+    adapters PASS correctness, both produce 11 output points from 8 inputs, report
+    publishable, wrote a valid schema-v3 `sample__dsp-baseline-linear.json` with
+    both `"adapter": "dsp"` and `"adapter": "baseline-linear"`. Honest datapoint:
+    on this tiny dataset DSP's cubic GPU/SIMD path carries real fixed setup cost
+    (~498 ms mean) while the naive in-process linear baseline is ~0.014 ms — the
+    benchmark surfacing DSP's small-input overhead rather than hiding it. Error
+    paths reverified: `--help`→0, missing `--field`→1, nonexistent file→1.
+  - Scope note: tests scoped to `-p dsp-bench` (the change is confined to the
+    `dsp-bench` leaf crate; no other workspace member depends on it, and the full
+    workspace **build** is green). Did not run the full (heavy wgpu/GPU)
+    `cargo test --workspace` to stay in the time budget.
+- **Done vs open:** DONE — DSP-Bench now has a second, vendor-neutral, in-process
+  system and can emit a real two-system comparison report end-to-end (library +
+  CLI + verified run). OPEN — the external-engine **DuckDB adapter** (a real
+  database baseline); ClickHouse/InfluxDB 3/QuestDB/TimescaleDB adapters; the
+  Phase-2 server-side ILP ingest **endpoint** (`axum`); richer report formats
+  (Parquet/HTML); full hardware capture; the methodology document.
+- **Next step:** either (a) the **DuckDB adapter** — the first *real-database*
+  competitor baseline (needs the `duckdb` crate + bundled lib; do it as its own
+  out-of-core adapter module, budget permitting), or (b) start the **Phase-2
+  `axum` server** with the ILP ingest endpoint. With the comparison plumbing now
+  proven, (a) is the higher-leverage benchmark increment.
+- **PR:** _(opened below; URL recorded in the follow-up commit)_
