@@ -631,4 +631,4 @@ results (exact counts) · done-vs-open · next step · PR.
   out-of-core adapter module, budget permitting), or (b) start the **Phase-2
   `axum` server** with the ILP ingest endpoint. With the comparison plumbing now
   proven, (a) is the higher-leverage benchmark increment.
-- **PR:** _(opened below; URL recorded in the follow-up commit)_
+- **PR:** https://github.com/physics515/DSP/pull/11
