@@ -22,6 +22,15 @@ This is the initial scaffold. What exists today:
   harness core, mirroring the roadmap's connector hard-constraint.
 - **DSP reference adapter** (`src/dsp_adapter.rs`) — drives DSP's native
   interpolation engine (`splimes::auto_interpolate`).
+- **Portable linear baseline adapter** (`src/baseline_adapter.rs`,
+  `BaselineLinearAdapter`) — the fair-protocol *class (C)* client-side baseline:
+  a dependency-free, precision-aware (`BigDecimal`-throughout, no silent `f64`
+  downcast) piecewise-linear reconstruction implemented directly in the harness.
+  It is DSP-Bench's first *second* system, so a report can carry a real
+  two-system comparison rather than a lone number. It is always linear by
+  definition (it ignores the requested spline) and named `baseline-linear`, so a
+  comparison against DSP's chosen method is an honest quality/speed reference,
+  not a disguised apples-to-apples spline race.
 - **Result schema** (`src/schema.rs`) — serializable `BenchResult` capturing the
   latency distribution, dataset metadata, correctness verdict, and an
   **end-to-end timing breakdown** (`TimingBreakdown`: one-time dataset-generation
@@ -61,7 +70,9 @@ This is the initial scaffold. What exists today:
 
 ## Not yet (tracked in `ROADMAP.md`)
 
-Competitor adapters (DuckDB, ClickHouse, InfluxDB 3, QuestDB, TimescaleDB), the
+External-engine competitor adapters (DuckDB, ClickHouse, InfluxDB 3, QuestDB,
+TimescaleDB) — the portable linear baseline above is the first *non-DSP* system,
+but it runs in-process rather than against a real database. The
 Phase-2 server-side ILP *ingest endpoint* (the file/CLI ingest path exists; an
 `axum` HTTP endpoint is next), additional workloads (range fetch, downsample,
 compression, …), dataset corpora, the richer report formats (Parquet/HTML) and
@@ -91,3 +102,15 @@ cargo run -p dsp-bench -- \
 The report lands at `reports/json/<profile>__dsp.json` (the profile name defaults
 to the input file stem). `--help` lists every flag; the precision, spline, and
 resolution accept short forms (`s`, `cubic`, `m`).
+
+Add `--compare` (`-c`) to run the portable linear baseline alongside DSP and emit
+a single comparison report holding both results:
+
+```sh
+cargo run -p dsp-bench -- \
+    --input data.lp --field usage --spline cubic --resolution minutes --compare
+```
+
+The artifact name tags every adapter, e.g.
+`reports/json/<profile>__dsp+baseline-linear.json`, and the process still exits
+non-zero if *any* result's correctness gate fails.

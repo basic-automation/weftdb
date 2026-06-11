@@ -23,7 +23,7 @@
 use std::{path::PathBuf, process::ExitCode};
 
 use chrono::Utc;
-use dsp_bench::{report::default_filename, run_profile, BenchReport, DspAdapter, InterpolationProfile, RunMetadata, TimestampPrecision};
+use dsp_bench::{report::default_filename, run_profile, BaselineLinearAdapter, BenchReport, BenchResult, DspAdapter, InterpolationProfile, RunMetadata, TimestampPrecision};
 use splimes::{Resolution, Spline};
 
 /// Program name used in usage / error output.
@@ -73,15 +73,25 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 	let profile_name = cli.name.clone().unwrap_or_else(|| derive_profile_name(&cli.input));
 	let profile = InterpolationProfile::from_line_protocol(profile_name, &payload, &cli.field, cli.precision, cli.spline, cli.resolution).map_err(|e| anyhow::anyhow!("cannot build a profile from {}: {e}", cli.input.display()))?;
 
-	let adapter = DspAdapter::new();
-	let result = run_profile(&adapter, &profile, cli.reps).await.map_err(|e| anyhow::anyhow!("benchmark run failed: {e}"))?;
+	// DSP is always run; the portable linear baseline is run too under `--compare`
+	// so the report carries a real two-system comparison rather than a lone number.
+	let mut results: Vec<BenchResult> = Vec::with_capacity(if cli.compare { 2 } else { 1 });
+	let dsp_result = run_profile(&DspAdapter::new(), &profile, cli.reps).await.map_err(|e| anyhow::anyhow!("DSP benchmark run failed: {e}"))?;
+	results.push(dsp_result);
+	if cli.compare {
+		let baseline = run_profile(&BaselineLinearAdapter::new(), &profile, cli.reps).await.map_err(|e| anyhow::anyhow!("baseline benchmark run failed: {e}"))?;
+		results.push(baseline);
+	}
 
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
-	let report = BenchReport::with_results(metadata, vec![result]);
+	// The artifact name tags every adapter in the report (e.g. `dsp+baseline-linear`)
+	// so a comparison and a solo run never collide on disk.
+	let adapter_tag = results.iter().map(|r| r.adapter.as_str()).collect::<Vec<_>>().join("+");
+	let report = BenchReport::with_results(metadata, results);
 
 	// Persist before printing so a write failure surfaces as a non-zero exit even
 	// if the summary already streamed.
-	let out_path = cli.out_dir.join(default_filename(&report.results[0].profile, &report.results[0].adapter));
+	let out_path = cli.out_dir.join(default_filename(&report.results[0].profile, &adapter_tag));
 	report.write_json(&out_path).map_err(|e| anyhow::anyhow!("cannot write report to {}: {e}", out_path.display()))?;
 
 	print_summary(&report, &out_path);
@@ -91,20 +101,22 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 	Ok(if report.is_publishable() { ExitCode::SUCCESS } else { ExitCode::FAILURE })
 }
 
-/// Print a concise human-readable summary of a single-result report.
+/// Print a concise human-readable summary of a report, one block per adapter.
 fn print_summary(report: &BenchReport, out_path: &std::path::Path) {
-	let r = &report.results[0];
-	let l = &r.latency;
 	println!("DSP-Bench run complete");
-	println!("  profile      : {}", r.profile);
-	println!("  adapter      : {}", r.adapter);
-	println!("  workload     : {}", r.workload);
-	println!("  reps         : {}", r.reps);
-	println!("  input points : {}", r.dataset.input_points);
-	println!("  output points: {}", r.dataset.output_points);
-	println!("  latency (ms) : p50={:.3} p95={:.3} p99={:.3} mean={:.3}", ms(l.p50_ns), ms(l.p95_ns), ms(l.p99_ns), ms(l.mean_ns));
-	println!("  throughput   : {:.0} points/sec", r.throughput_points_per_sec);
-	println!("  correctness  : {}", if r.correctness.passed() { "PASS" } else { "FAIL" });
+	let first = &report.results[0];
+	println!("  profile      : {}", first.profile);
+	println!("  workload     : {}", first.workload);
+	println!("  reps         : {}", first.reps);
+	for r in &report.results {
+		let l = &r.latency;
+		println!("  --- {} ---", r.adapter);
+		println!("    input points : {}", r.dataset.input_points);
+		println!("    output points: {}", r.dataset.output_points);
+		println!("    latency (ms) : p50={:.3} p95={:.3} p99={:.3} mean={:.3}", ms(l.p50_ns), ms(l.p95_ns), ms(l.p99_ns), ms(l.mean_ns));
+		println!("    throughput   : {:.0} points/sec", r.throughput_points_per_sec);
+		println!("    correctness  : {}", if r.correctness.passed() { "PASS" } else { "FAIL" });
+	}
 	println!("  publishable  : {}", if report.is_publishable() { "yes" } else { "no" });
 	println!("  report       : {}", out_path.display());
 }
@@ -140,6 +152,8 @@ struct Cli {
 	out_dir: PathBuf,
 	/// Optional explicit profile name (defaults to the input file stem).
 	name: Option<String>,
+	/// Also run the portable linear baseline and emit a comparison report.
+	compare: bool,
 }
 
 /// What the parsed command line asks the program to do.
@@ -172,6 +186,7 @@ impl Cli {
 		let mut reps: usize = 10;
 		let mut out_dir = PathBuf::from("reports").join("json");
 		let mut name: Option<String> = None;
+		let mut compare = false;
 
 		let mut iter = args.into_iter();
 		while let Some(token) = iter.next() {
@@ -200,6 +215,7 @@ impl Cli {
 				"--reps" => reps = parse_reps(&take_value(&key)?)?,
 				"--out-dir" => out_dir = PathBuf::from(take_value(&key)?),
 				"--name" => name = Some(take_value(&key)?),
+				"-c" | "--compare" => compare = true,
 				other if other.starts_with('-') => return Err(format!("unknown flag `{other}`")),
 				// A bare positional is taken as the input path if one is not set yet.
 				other => {
@@ -214,7 +230,7 @@ impl Cli {
 		let input = input.ok_or_else(|| "missing required `--input <file.lp>`".to_string())?;
 		let field = field.ok_or_else(|| "missing required `--field <name>`".to_string())?;
 
-		Ok(Command::Run(Self { input, field, precision, spline, resolution, reps, out_dir, name }))
+		Ok(Command::Run(Self { input, field, precision, spline, resolution, reps, out_dir, name, compare }))
 	}
 }
 
@@ -295,10 +311,12 @@ OPTIONS:
         --reps <N>           Timed repetitions (>0)                  [default: 10]
         --out-dir <DIR>      Report output directory          [default: reports/json]
         --name <NAME>        Profile name            [default: input file stem]
+    -c, --compare            Also run the portable linear baseline for comparison
     -h, --help               Print this help
 
-The report is written as <out-dir>/<profile>__dsp.json and the process exits
-non-zero if the run's correctness gate does not pass.
+The report is written as <out-dir>/<profile>__<adapters>.json (e.g.
+`__dsp.json`, or `__dsp+baseline-linear.json` under --compare) and the process
+exits non-zero if any run's correctness gate does not pass.
 ";
 
 #[cfg(test)]
@@ -327,6 +345,14 @@ mod tests {
 		assert_eq!(cli.reps, 10);
 		assert_eq!(cli.out_dir, PathBuf::from("reports").join("json"));
 		assert_eq!(cli.name, None);
+		assert!(!cli.compare, "comparison is off unless requested");
+	}
+
+	#[test]
+	fn compare_flag_is_parsed_in_both_forms() {
+		assert!(expect_run(&["data.lp", "-f", "v", "--compare"]).compare);
+		assert!(expect_run(&["data.lp", "-f", "v", "-c"]).compare);
+		assert!(!expect_run(&["data.lp", "-f", "v"]).compare);
 	}
 
 	#[test]

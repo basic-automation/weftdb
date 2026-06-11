@@ -601,8 +601,12 @@ redistributed. *For commercial trust, be more transparent than competitors.*
    *(Seeded, reproducible dataset generator + workload profile in
    `dsp-bench/src/profile.rs`.)*
 3. 🟡 Add DSP and DuckDB adapters. *(DSP adapter implemented against the
-   vendor-neutral `SystemAdapter` trait, driving `splimes::auto_interpolate`;
-   DuckDB adapter still to do.)*
+   vendor-neutral `SystemAdapter` trait, driving `splimes::auto_interpolate`. A
+   portable **`BaselineLinearAdapter`** (`dsp-bench/src/baseline_adapter.rs`) now
+   adds the fair-protocol class-(C) client-side linear baseline — DSP-Bench's
+   first second system, so reports carry a real two-system comparison
+   (`dsp` vs `baseline-linear`), runnable via the CLI's `--compare` flag. The
+   external-engine DuckDB adapter — a real database baseline — is still to do.)*
 4. Add ClickHouse, InfluxDB 3, QuestDB, TimescaleDB adapters.
 5. 🟡 Implement InfluxDB Line Protocol ingest. *(ILP **format parser** landed in
    `dsp-bench/src/line_protocol.rs`: `parse` → `LineRecord`s and `parse_points`
