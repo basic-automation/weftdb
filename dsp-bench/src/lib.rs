@@ -18,6 +18,9 @@
 //! - [`dsp_adapter`] — the DSP reference adapter ([`DspAdapter`]).
 //! - [`baseline_adapter`] — the portable client-side linear baseline
 //!   ([`BaselineLinearAdapter`]) DSP is compared against (fair-protocol class C).
+//! - [`forward_fill_adapter`] — the portable forward-fill / LOCF baseline
+//!   ([`ForwardFillAdapter`]), the in-process mirror of native TSDB
+//!   `FILL(previous)` gap-fill (fair-protocol class B reproduced portably).
 //! - [`line_protocol`] — `InfluxDB` Line Protocol parsing ([`parse_points`]) for
 //!   TSBS-compatible dataset ingest.
 //! - [`schema`] — the serializable [`BenchResult`] record (Phase 1.1 latency
@@ -37,6 +40,7 @@
 pub mod adapter;
 pub mod baseline_adapter;
 pub mod dsp_adapter;
+pub mod forward_fill_adapter;
 pub mod line_protocol;
 pub mod profile;
 pub mod report;
@@ -49,7 +53,7 @@ use bigdecimal::ToPrimitive;
 use splimes::generate_target_times;
 
 pub use crate::{
-	adapter::SystemAdapter, baseline_adapter::BaselineLinearAdapter, dsp_adapter::DspAdapter, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError}, report::{BenchReport, RunMetadata}, schema::{BenchResult, CorrectnessReport, DatasetMeta, TimingBreakdown, SCHEMA_VERSION}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}
+	adapter::SystemAdapter, baseline_adapter::BaselineLinearAdapter, dsp_adapter::DspAdapter, forward_fill_adapter::ForwardFillAdapter, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError}, report::{BenchReport, RunMetadata}, schema::{BenchResult, CorrectnessReport, DatasetMeta, TimingBreakdown, SCHEMA_VERSION}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}
 };
 
 /// Workload class label recorded for the interpolation profile.

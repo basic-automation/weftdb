@@ -31,6 +31,17 @@ This is the initial scaffold. What exists today:
   definition (it ignores the requested spline) and named `baseline-linear`, so a
   comparison against DSP's chosen method is an honest quality/speed reference,
   not a disguised apples-to-apples spline race.
+- **Portable forward-fill (LOCF) baseline adapter** (`src/forward_fill_adapter.rs`,
+  `ForwardFillAdapter`) — the in-process mirror of the gap-fill real time-series
+  engines actually ship: InfluxDB's `FILL(previous)`, QuestDB's `FILL(prev)`,
+  TimescaleDB's `locf()`. It reconstructs each grid point by holding the latest
+  prior sample (a piecewise-constant step), copying that sample's exact
+  `BigDecimal` verbatim — never arithmetic, so no float drift. Before the first
+  sample it holds the first value backward (the standard finite-valued choice when
+  no back-fill exists). Always forward-fill by definition (ignores the requested
+  spline) and named `baseline-forward-fill`, so a comparison gives DSP's
+  interpolation against the *fair-protocol class (B)* native-gap-fill behaviour,
+  not only the linear baseline.
 - **Result schema** (`src/schema.rs`) — serializable `BenchResult` capturing the
   latency distribution, dataset metadata, correctness verdict, and an
   **end-to-end timing breakdown** (`TimingBreakdown`: one-time dataset-generation
@@ -71,8 +82,8 @@ This is the initial scaffold. What exists today:
 ## Not yet (tracked in `ROADMAP.md`)
 
 External-engine competitor adapters (DuckDB, ClickHouse, InfluxDB 3, QuestDB,
-TimescaleDB) — the portable linear baseline above is the first *non-DSP* system,
-but it runs in-process rather than against a real database. The
+TimescaleDB) — the portable linear and forward-fill baselines above are the first
+*non-DSP* systems, but they run in-process rather than against a real database. The
 Phase-2 server-side ILP *ingest endpoint* (the file/CLI ingest path exists; an
 `axum` HTTP endpoint is next), additional workloads (range fetch, downsample,
 compression, …), dataset corpora, the richer report formats (Parquet/HTML) and
@@ -103,8 +114,8 @@ The report lands at `reports/json/<profile>__dsp.json` (the profile name default
 to the input file stem). `--help` lists every flag; the precision, spline, and
 resolution accept short forms (`s`, `cubic`, `m`).
 
-Add `--compare` (`-c`) to run the portable linear baseline alongside DSP and emit
-a single comparison report holding both results:
+Add `--compare` (`-c`) to run the portable baseline suite (linear + forward-fill)
+alongside DSP and emit a single comparison report holding all three results:
 
 ```sh
 cargo run -p dsp-bench -- \
@@ -112,5 +123,5 @@ cargo run -p dsp-bench -- \
 ```
 
 The artifact name tags every adapter, e.g.
-`reports/json/<profile>__dsp+baseline-linear.json`, and the process still exits
-non-zero if *any* result's correctness gate fails.
+`reports/json/<profile>__dsp+baseline-linear+baseline-forward-fill.json`, and the
+process still exits non-zero if *any* result's correctness gate fails.

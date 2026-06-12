@@ -601,12 +601,15 @@ redistributed. *For commercial trust, be more transparent than competitors.*
    *(Seeded, reproducible dataset generator + workload profile in
    `dsp-bench/src/profile.rs`.)*
 3. 🟡 Add DSP and DuckDB adapters. *(DSP adapter implemented against the
-   vendor-neutral `SystemAdapter` trait, driving `splimes::auto_interpolate`. A
-   portable **`BaselineLinearAdapter`** (`dsp-bench/src/baseline_adapter.rs`) now
-   adds the fair-protocol class-(C) client-side linear baseline — DSP-Bench's
-   first second system, so reports carry a real two-system comparison
-   (`dsp` vs `baseline-linear`), runnable via the CLI's `--compare` flag. The
-   external-engine DuckDB adapter — a real database baseline — is still to do.)*
+   vendor-neutral `SystemAdapter` trait, driving `splimes::auto_interpolate`. Two
+   portable in-process baselines now stand beside it: **`BaselineLinearAdapter`**
+   (`dsp-bench/src/baseline_adapter.rs`) — the fair-protocol class-(C) client-side
+   linear baseline — and **`ForwardFillAdapter`**
+   (`dsp-bench/src/forward_fill_adapter.rs`) — the class-(B) portable mirror of
+   native TSDB gap-fill (`FILL(previous)`/`locf()`). The CLI's `--compare` flag now
+   runs the full baseline suite, so reports carry a real three-system comparison
+   (`dsp` vs `baseline-linear` vs `baseline-forward-fill`). The external-engine
+   DuckDB adapter — a real database baseline — is still to do.)*
 4. Add ClickHouse, InfluxDB 3, QuestDB, TimescaleDB adapters.
 5. 🟡 Implement InfluxDB Line Protocol ingest. *(ILP **format parser** landed in
    `dsp-bench/src/line_protocol.rs`: `parse` → `LineRecord`s and `parse_points`
