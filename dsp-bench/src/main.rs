@@ -23,7 +23,7 @@
 use std::{path::PathBuf, process::ExitCode};
 
 use chrono::Utc;
-use dsp_bench::{report::default_filename, run_profile, BaselineLinearAdapter, BenchReport, BenchResult, DspAdapter, InterpolationProfile, RunMetadata, TimestampPrecision};
+use dsp_bench::{report::default_filename, run_profile, BaselineLinearAdapter, BenchReport, BenchResult, DspAdapter, ForwardFillAdapter, InterpolationProfile, RunMetadata, TimestampPrecision};
 use splimes::{Resolution, Spline};
 
 /// Program name used in usage / error output.
@@ -73,14 +73,18 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 	let profile_name = cli.name.clone().unwrap_or_else(|| derive_profile_name(&cli.input));
 	let profile = InterpolationProfile::from_line_protocol(profile_name, &payload, &cli.field, cli.precision, cli.spline, cli.resolution).map_err(|e| anyhow::anyhow!("cannot build a profile from {}: {e}", cli.input.display()))?;
 
-	// DSP is always run; the portable linear baseline is run too under `--compare`
-	// so the report carries a real two-system comparison rather than a lone number.
-	let mut results: Vec<BenchResult> = Vec::with_capacity(if cli.compare { 2 } else { 1 });
+	// DSP is always run; under `--compare` the full portable-baseline suite runs
+	// too — linear (fair-protocol class C) and forward-fill/LOCF (class B, the
+	// in-process mirror of native TSDB `FILL(previous)`) — so the report carries a
+	// real multi-system comparison rather than a lone number.
+	let mut results: Vec<BenchResult> = Vec::with_capacity(if cli.compare { 3 } else { 1 });
 	let dsp_result = run_profile(&DspAdapter::new(), &profile, cli.reps).await.map_err(|e| anyhow::anyhow!("DSP benchmark run failed: {e}"))?;
 	results.push(dsp_result);
 	if cli.compare {
-		let baseline = run_profile(&BaselineLinearAdapter::new(), &profile, cli.reps).await.map_err(|e| anyhow::anyhow!("baseline benchmark run failed: {e}"))?;
-		results.push(baseline);
+		let linear = run_profile(&BaselineLinearAdapter::new(), &profile, cli.reps).await.map_err(|e| anyhow::anyhow!("linear baseline run failed: {e}"))?;
+		results.push(linear);
+		let forward_fill = run_profile(&ForwardFillAdapter::new(), &profile, cli.reps).await.map_err(|e| anyhow::anyhow!("forward-fill baseline run failed: {e}"))?;
+		results.push(forward_fill);
 	}
 
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
@@ -152,7 +156,8 @@ struct Cli {
 	out_dir: PathBuf,
 	/// Optional explicit profile name (defaults to the input file stem).
 	name: Option<String>,
-	/// Also run the portable linear baseline and emit a comparison report.
+	/// Also run the portable baseline suite (linear + forward-fill) and emit a
+	/// comparison report.
 	compare: bool,
 }
 
@@ -311,12 +316,14 @@ OPTIONS:
         --reps <N>           Timed repetitions (>0)                  [default: 10]
         --out-dir <DIR>      Report output directory          [default: reports/json]
         --name <NAME>        Profile name            [default: input file stem]
-    -c, --compare            Also run the portable linear baseline for comparison
+    -c, --compare            Also run the portable baseline suite (linear +
+                             forward-fill) for comparison
     -h, --help               Print this help
 
 The report is written as <out-dir>/<profile>__<adapters>.json (e.g.
-`__dsp.json`, or `__dsp+baseline-linear.json` under --compare) and the process
-exits non-zero if any run's correctness gate does not pass.
+`__dsp.json`, or `__dsp+baseline-linear+baseline-forward-fill.json` under
+--compare) and the process exits non-zero if any run's correctness gate does not
+pass.
 ";
 
 #[cfg(test)]
