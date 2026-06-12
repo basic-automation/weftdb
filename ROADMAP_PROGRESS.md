@@ -632,3 +632,94 @@ results (exact counts) · done-vs-open · next step · PR.
   `axum` server** with the ILP ingest endpoint. With the comparison plumbing now
   proven, (a) is the higher-leverage benchmark increment.
 - **PR:** https://github.com/physics515/DSP/pull/11
+
+---
+
+## 2026-06-12 — DSP-Bench: portable forward-fill (LOCF) baseline + 3-system `--compare`
+
+- **Item:** Phase 1 / Track 1 — **DSP-Bench**; roadmap "Immediate next actions"
+  #3 ("Add DSP and DuckDB adapters") and fair-protocol **Phase 1.2 class (B)**
+  ("native in-DB gap-fill, reproduced portably"). Until tonight DSP-Bench had
+  exactly two systems — DSP and the in-process linear baseline (class C). The
+  single most common reconstruction real time-series engines actually ship is
+  *last-observation-carried-forward* (LOCF): InfluxDB `FILL(previous)`, QuestDB
+  `FILL(prev)`, TimescaleDB `locf()`. This adds that as a third portable,
+  dependency-free, in-process system so a comparison report can carry DSP's
+  interpolation against the gap-fill databases really use — not only linear.
+  Chose this over the long-deferred external DuckDB adapter (needs the `duckdb`
+  crate + a bundled native lib; heavy/fragile build on Windows, risks the nightly
+  time budget) because the portable LOCF baseline is the honest class-(B)
+  reference the roadmap explicitly asks for and lands clean with zero new deps.
+  Keeps #3 at 🟡 (the external-engine DuckDB baseline is still open).
+- **What changed (isolated to `dsp-bench`, no new dependencies):**
+  - **new `src/forward_fill_adapter.rs`** (`ForwardFillAdapter`, name
+    `baseline-forward-fill`) — implements the vendor-neutral `SystemAdapter` trait
+    with piecewise-constant LOCF reconstruction: sorts the (possibly
+    out-of-order/ILP-sourced) input in place, builds the same
+    `generate_target_times(start,end,resolution)` grid the harness expects (so
+    output counts match DSP and the correctness gate passes identically), and for
+    each grid point holds the value of the latest sample whose timestamp is `<= t`
+    (binary search). **No fabricated precision:** a held value is the prior
+    sample's exact `BigDecimal`, copied verbatim — never arithmetic — so it cannot
+    drift through `f64` and every value stays finite. Boundary convention: before
+    the first sample (no prior observation) it holds the *first* value backward
+    rather than emitting a null the correctness gate forbids; after the last sample
+    it holds flat (no extrapolated slope, unlike the linear baseline). Empty input
+    is a typed error; a single point degenerates to a constant. Always forward-fill
+    by definition (ignores the requested `Spline`). 7 unit tests (holds-between-
+    samples step, carry-last-forward, hold-first-backward, out-of-order sort,
+    single-point constant, empty-input rejection, spline-ignored-stays-a-step).
+  - `src/lib.rs` — `pub mod forward_fill_adapter;`, re-export `ForwardFillAdapter`,
+    crate-doc bullet.
+  - `src/main.rs` — `--compare` now runs the full portable-baseline suite (linear
+    **and** forward-fill), collecting all three into one `BenchReport`; doc comment
+    + USAGE text updated. The artifact tag already joins every adapter name, so the
+    filename auto-extends to `<profile>__dsp+baseline-linear+baseline-forward-fill.json`.
+  - `dsp-bench/README.md` — forward-fill-adapter bullet, reworded the "Not yet"
+    line (two portable baselines now), updated the `--compare` usage example.
+  - `ROADMAP.md` — Immediate next action #3 note updated (forward-fill landed;
+    three-system comparison; stays 🟡, external DuckDB adapter still open).
+- **Build/test/clippy (real, nightly `rustc 1.98.0-nightly` (cb46fbb8c 2026-06-08)):**
+  - `cargo build --workspace` — **GREEN** baseline confirmed before edits (2m00s;
+    heavy turso/wgpu deps).
+  - `cargo test -p dsp-bench` — **68 passed, 0 failed, 0 ignored** (56 lib, was 49,
+    **+7** forward-fill-adapter tests; 12 bin, unchanged). 0 doc-tests.
+  - `cargo clippy -p dsp-bench --all-targets` — **0 warnings in dsp-bench** (first
+    pass surfaced 3 `clippy::doc_markdown` "missing backticks" on `InfluxDB`/
+    `QuestDB`/`TimescaleDB` in my new module doc; fixed directly by backticking
+    them, no `#[allow]`). The 4 pre-existing `splimes` `sort_by_key` warnings in
+    untouched files remain (logged before).
+  - `cargo fmt -p dsp-bench --check` — clean (exit 0).
+  - **Real end-to-end `--compare` run** (not just tests): built an 8-record
+    TSBS-style `sample.lp` in the per-run scratch dir and ran
+    `dsp-bench --input sample.lp --field usage --precision s --spline cubic
+    --resolution minutes --reps 12 --out-dir <scratch> --compare` — exit 0, **all
+    three** adapters PASS correctness, each produces 10 output points from 8 inputs,
+    report publishable, wrote a valid schema-v3
+    `sample__dsp-baseline-linear-baseline-forward-fill.json` with all three
+    `"adapter"` entries (`dsp`, `baseline-linear`, `baseline-forward-fill`), every
+    `values_finite=true`. Honest datapoint on this tiny dataset: forward-fill is
+    the fastest (~0.004 ms mean, pure copies), linear next (~0.010 ms), DSP's cubic
+    GPU/SIMD path carries real fixed setup cost (~505 ms mean) — the benchmark
+    surfacing DSP's small-input overhead rather than hiding it. Error paths
+    reverified: `--help`->0, missing `--field`->1, nonexistent file->1.
+  - Scope note: tests scoped to `-p dsp-bench` (the change is confined to the
+    `dsp-bench` leaf crate; no other workspace member depends on it, and the full
+    workspace **build** is green). Did not run the full (heavy wgpu/GPU)
+    `cargo test --workspace` to stay in the time budget.
+- **Done vs open:** DONE — DSP-Bench now has a third, vendor-neutral, in-process
+  system (LOCF) and can emit a real three-system comparison report end-to-end
+  (library + CLI + verified run). OPEN — the external-engine **DuckDB adapter** (a
+  real database baseline); ClickHouse/InfluxDB 3/QuestDB/TimescaleDB adapters; the
+  Phase-2 server-side ILP ingest **endpoint** (`axum`); richer report formats
+  (Parquet/HTML); full hardware capture; the methodology document.
+- **Next step:** either (a) the **DuckDB adapter** — the first *real-database*
+  competitor baseline (needs the `duckdb` crate + bundled lib; do it as its own
+  out-of-core adapter module, budget permitting), or (b) an **accuracy-metrics
+  module** (RMSE/MAE/max-error/bias over a known synthetic ground truth) so the
+  three reconstruction methods can be compared on *quality*, not only speed —
+  which the roadmap repeatedly calls for (Phase 1.2 correctness, Phase 6.4). With
+  three reconstruction methods now in place, (b) is the natural higher-leverage
+  increment; (a) remains the path to a real-engine comparison.
+- **PR:** https://github.com/physics515/DSP/pull/12
+
