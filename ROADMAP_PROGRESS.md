@@ -721,4 +721,5 @@ results (exact counts) · done-vs-open · next step · PR.
   which the roadmap repeatedly calls for (Phase 1.2 correctness, Phase 6.4). With
   three reconstruction methods now in place, (b) is the natural higher-leverage
   increment; (a) remains the path to a real-engine comparison.
-- **PR:** (to be filled after `gh pr create`)
+- **PR:** https://github.com/physics515/DSP/pull/12
+
