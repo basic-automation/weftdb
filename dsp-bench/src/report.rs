@@ -96,6 +96,19 @@ impl BenchReport {
 		!self.results.is_empty() && self.results.iter().all(BenchResult::is_publishable)
 	}
 
+	/// The most accurate *publishable* result in the report: the one with the
+	/// smallest RMSE against ground truth, among results that carry accuracy
+	/// metrics (synthetic profiles) and passed correctness.
+	///
+	/// Returns `None` when no publishable result has accuracy — e.g. a
+	/// line-protocol report (no ground truth) or an all-failing one. A result
+	/// whose RMSE is `NaN` is skipped rather than allowed to win a comparison it
+	/// cannot meaningfully participate in.
+	#[must_use]
+	pub fn most_accurate(&self) -> Option<&BenchResult> {
+		self.results.iter().filter(|r| r.is_publishable()).filter_map(|r| r.accuracy.map(|a| (r, a.rmse))).filter(|(_, rmse)| rmse.is_finite()).min_by(|(_, a), (_, b)| a.total_cmp(b)).map(|(r, _)| r)
+	}
+
 	/// Serialize the report to pretty-printed JSON.
 	///
 	/// # Errors
@@ -153,11 +166,42 @@ mod tests {
 	};
 
 	fn sample_result(adapter: &str, publishable: bool) -> BenchResult {
-		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: adapter.to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7 }, latency: LatencyStats::from_samples(&[100, 200, 300]), latency_ci: None, throughput_points_per_sec: 5_000_000.0, timing: crate::schema::TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: publishable, expected_output_points: 1000, actual_output_points: if publishable { 1000 } else { 0 }, values_finite: publishable } }
+		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: adapter.to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7 }, latency: LatencyStats::from_samples(&[100, 200, 300]), latency_ci: None, throughput_points_per_sec: 5_000_000.0, timing: crate::schema::TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: publishable, expected_output_points: 1000, actual_output_points: if publishable { 1000 } else { 0 }, values_finite: publishable }, accuracy: None }
+	}
+
+	/// A publishable result for `adapter` carrying an accuracy report with the given
+	/// RMSE (the other accuracy fields are irrelevant to `most_accurate`).
+	fn result_with_rmse(adapter: &str, rmse: f64) -> BenchResult {
+		let mut r = sample_result(adapter, true);
+		r.accuracy = Some(crate::accuracy::AccuracyMetrics { count: 1000, rmse, mae: rmse, max_abs_error: rmse, bias: 0.0 });
+		r
 	}
 
 	fn metadata() -> RunMetadata {
 		RunMetadata { dsp_bench_version: "0.1.0".to_string(), os: "testos".to_string(), arch: "testarch".to_string(), generated_at: "2026-06-06T00:00:00+00:00".to_string() }
+	}
+
+	#[test]
+	fn most_accurate_picks_the_lowest_finite_rmse_publishable_result() {
+		let report = BenchReport::with_results(metadata(), vec![result_with_rmse("dsp", 1.9), result_with_rmse("baseline-linear", 1.2), result_with_rmse("baseline-forward-fill", 2.9)]);
+		assert_eq!(report.most_accurate().map(|r| r.adapter.as_str()), Some("baseline-linear"), "the smallest RMSE must win");
+	}
+
+	#[test]
+	fn most_accurate_ignores_results_without_accuracy_or_failing_correctness() {
+		// A line-protocol-style result (no accuracy) and a failing result must be
+		// skipped; only the one publishable result that carries accuracy can win.
+		let mut failing = result_with_rmse("dsp-broken", 0.1);
+		failing.correctness.values_finite = false; // makes it non-publishable
+		let report = BenchReport::with_results(metadata(), vec![sample_result("ilp-dsp", true), failing, result_with_rmse("baseline-linear", 1.2)]);
+		assert_eq!(report.most_accurate().map(|r| r.adapter.as_str()), Some("baseline-linear"));
+	}
+
+	#[test]
+	fn most_accurate_is_none_when_no_publishable_result_has_accuracy() {
+		// All results are line-protocol-style (no accuracy) -> no winner.
+		let report = BenchReport::with_results(metadata(), vec![sample_result("dsp", true), sample_result("baseline-linear", true)]);
+		assert!(report.most_accurate().is_none());
 	}
 
 	#[test]
