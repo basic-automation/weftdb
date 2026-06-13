@@ -137,6 +137,13 @@ fn print_summary(report: &BenchReport, out_path: &std::path::Path) {
 			println!("    accuracy     : rmse={:.4} mae={:.4} max={:.4} bias={:+.4}", a.rmse, a.mae, a.max_abs_error, a.bias);
 		}
 	}
+	// When the run carries accuracy (synthetic mode), name the quality winner so a
+	// comparison report answers "which method recovered the signal best?" at a glance.
+	if let Some(best) = report.most_accurate() {
+		if let Some(a) = &best.accuracy {
+			println!("  most accurate: {} (rmse={:.4})", best.adapter, a.rmse);
+		}
+	}
 	println!("  publishable  : {}", if report.is_publishable() { "yes" } else { "no" });
 	println!("  report       : {}", out_path.display());
 }
