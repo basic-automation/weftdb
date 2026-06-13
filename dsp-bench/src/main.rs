@@ -23,7 +23,7 @@
 use std::{path::PathBuf, process::ExitCode};
 
 use chrono::Utc;
-use dsp_bench::{report::default_filename, run_profile, BaselineLinearAdapter, BenchReport, BenchResult, DspAdapter, ForwardFillAdapter, InterpolationProfile, RunMetadata, TimestampPrecision};
+use dsp_bench::{report::default_filename, run_profile, BaselineLinearAdapter, BenchReport, BenchResult, DspAdapter, ForwardFillAdapter, InterpolationProfile, RunMetadata, SyntheticParams, TimestampPrecision};
 use splimes::{Resolution, Spline};
 
 /// Program name used in usage / error output.
@@ -73,7 +73,8 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 	// accuracy metrics; line-protocol mode does not.
 	let profile = if cli.synthetic {
 		let profile_name = cli.name.clone().unwrap_or_else(|| "interpolation-heavy-irregular".to_string());
-		InterpolationProfile::synthetic(profile_name, cli.seed, cli.points, cli.missingness, cli.jitter, cli.spline, cli.resolution)
+		let params = SyntheticParams { seed: cli.seed, input_points: cli.points, missingness_fraction: cli.missingness, jitter_fraction: cli.jitter, noise_amplitude: cli.noise, spline: cli.spline, resolution: cli.resolution };
+		InterpolationProfile::synthetic(profile_name, params)
 	} else {
 		// Validated in `from_args`: line-protocol mode always carries input + field.
 		let input = cli.input.as_ref().expect("line-protocol mode has an input path");
@@ -174,6 +175,8 @@ struct Cli {
 	missingness: f64,
 	/// Synthetic timestamp jitter fraction (`0.0..=1.0`).
 	jitter: f64,
+	/// Synthetic additive-noise amplitude (`>= 0`; `0` puts samples on truth).
+	noise: f64,
 	/// Timestamp precision of the input file.
 	precision: TimestampPrecision,
 	/// Spline method requested of the adapter.
@@ -213,17 +216,18 @@ impl Cli {
 	/// Returns a human-readable message for an unknown flag, a flag missing its
 	/// value, a malformed enum/number value, or a missing required argument.
 	fn from_args(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
-		// Synthetic-knob defaults are read from the flagship profile so the CLI
-		// never hardcodes a second copy of those constants.
-		let flagship = InterpolationProfile::interpolation_heavy_irregular();
+		// Synthetic-knob defaults come from the flagship knob set so the CLI never
+		// hardcodes a second copy of those constants.
+		let defaults = SyntheticParams::default();
 
 		let mut input: Option<PathBuf> = None;
 		let mut field: Option<String> = None;
 		let mut synthetic = false;
-		let mut seed = flagship.seed;
-		let mut points = flagship.input_points;
-		let mut missingness = flagship.missingness_fraction;
-		let mut jitter = flagship.jitter_fraction;
+		let mut seed = defaults.seed;
+		let mut points = defaults.input_points;
+		let mut missingness = defaults.missingness_fraction;
+		let mut jitter = defaults.jitter_fraction;
+		let mut noise = defaults.noise_amplitude;
 		let mut precision = TimestampPrecision::Nanoseconds;
 		let mut spline = Spline::Cubic;
 		let mut resolution = Resolution::Seconds;
@@ -258,6 +262,7 @@ impl Cli {
 				"--points" => points = parse_points_count(&take_value(&key)?)?,
 				"--missingness" => missingness = parse_fraction(&take_value(&key)?, "missingness")?,
 				"--jitter" => jitter = parse_fraction(&take_value(&key)?, "jitter")?,
+				"--noise" => noise = parse_noise(&take_value(&key)?)?,
 				"--precision" => precision = parse_precision(&take_value(&key)?)?,
 				"--spline" => spline = parse_spline(&take_value(&key)?)?,
 				"--resolution" => resolution = parse_resolution(&take_value(&key)?)?,
@@ -295,7 +300,7 @@ impl Cli {
 			}
 		}
 
-		Ok(Command::Run(Self { input, field, synthetic, seed, points, missingness, jitter, precision, spline, resolution, reps, out_dir, name, compare }))
+		Ok(Command::Run(Self { input, field, synthetic, seed, points, missingness, jitter, noise, precision, spline, resolution, reps, out_dir, name, compare }))
 	}
 }
 
@@ -383,6 +388,16 @@ fn parse_fraction(s: &str, flag: &str) -> Result<f64, String> {
 	Ok(v)
 }
 
+/// Parse the `--noise` amplitude: any finite, non-negative number (`0` puts every
+/// synthetic sample exactly on the analytic ground truth).
+fn parse_noise(s: &str) -> Result<f64, String> {
+	let v = s.parse::<f64>().map_err(|_| format!("invalid --noise `{s}` (expected a non-negative number)"))?;
+	if !v.is_finite() || v < 0.0 {
+		return Err(format!("--noise must be finite and >= 0, got {v}"));
+	}
+	Ok(v)
+}
+
 /// Usage text shown for `--help` and on a parse error.
 const USAGE: &str = "\
 dsp-bench — run a DSP interpolation benchmark over a line-protocol file or the
@@ -405,6 +420,7 @@ SYNTHETIC OPTIONS (with --synthetic):
         --points <N>         Sample count (>=2)                    [default: 480]
         --missingness <F>    Gap fraction in [0, 1]                [default: 0.20]
         --jitter <F>         Timestamp jitter fraction in [0, 1]   [default: 0.60]
+        --noise <F>          Sample noise amplitude (>=0; 0=clean) [default: 2.0]
 
 OPTIONS:
         --precision <P>      Timestamp precision: ns|us|ms|s         [default: ns]
@@ -465,6 +481,7 @@ mod tests {
 		assert_eq!(cli.points, flagship.input_points);
 		assert!((cli.missingness - flagship.missingness_fraction).abs() < f64::EPSILON);
 		assert!((cli.jitter - flagship.jitter_fraction).abs() < f64::EPSILON);
+		assert!((cli.noise - flagship.noise_amplitude).abs() < f64::EPSILON);
 	}
 
 	#[test]
@@ -490,6 +507,14 @@ mod tests {
 		assert!(run_cli(&["-s", "--missingness", "1.5"]).unwrap_err().contains("[0, 1]"));
 		assert!(run_cli(&["-s", "--jitter", "-0.1"]).unwrap_err().contains("[0, 1]"));
 		assert!(run_cli(&["-s", "--seed", "notanumber"]).unwrap_err().contains("--seed"));
+		assert!(run_cli(&["-s", "--noise", "-1"]).unwrap_err().contains("--noise"));
+	}
+
+	#[test]
+	fn noise_knob_accepts_zero_and_amplitudes_above_one() {
+		// Unlike the [0, 1] fractions, noise is an unbounded non-negative amplitude.
+		assert!((expect_run(&["-s", "--noise", "0"]).noise - 0.0).abs() < f64::EPSILON);
+		assert!((expect_run(&["-s", "--noise", "5.5"]).noise - 5.5).abs() < 1e-12);
 	}
 
 	#[test]
