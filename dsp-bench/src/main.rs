@@ -68,10 +68,20 @@ fn main() -> ExitCode {
 
 /// Load the dataset, run the DSP interpolation profile, and persist the report.
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
-	let payload = std::fs::read_to_string(&cli.input).map_err(|e| anyhow::anyhow!("cannot read input file {}: {e}", cli.input.display()))?;
-
-	let profile_name = cli.name.clone().unwrap_or_else(|| derive_profile_name(&cli.input));
-	let profile = InterpolationProfile::from_line_protocol(profile_name, &payload, &cli.field, cli.precision, cli.spline, cli.resolution).map_err(|e| anyhow::anyhow!("cannot build a profile from {}: {e}", cli.input.display()))?;
+	// Build the profile from whichever input mode was selected. Synthetic mode
+	// carries a known analytic ground truth, so its report will also include
+	// accuracy metrics; line-protocol mode does not.
+	let profile = if cli.synthetic {
+		let profile_name = cli.name.clone().unwrap_or_else(|| "interpolation-heavy-irregular".to_string());
+		InterpolationProfile::synthetic(profile_name, cli.seed, cli.points, cli.missingness, cli.jitter, cli.spline, cli.resolution)
+	} else {
+		// Validated in `from_args`: line-protocol mode always carries input + field.
+		let input = cli.input.as_ref().expect("line-protocol mode has an input path");
+		let field = cli.field.as_ref().expect("line-protocol mode has a field");
+		let payload = std::fs::read_to_string(input).map_err(|e| anyhow::anyhow!("cannot read input file {}: {e}", input.display()))?;
+		let profile_name = cli.name.clone().unwrap_or_else(|| derive_profile_name(input));
+		InterpolationProfile::from_line_protocol(profile_name, &payload, field, cli.precision, cli.spline, cli.resolution).map_err(|e| anyhow::anyhow!("cannot build a profile from {}: {e}", input.display()))?
+	};
 
 	// DSP is always run; under `--compare` the full portable-baseline suite runs
 	// too — linear (fair-protocol class C) and forward-fill/LOCF (class B, the
@@ -143,12 +153,27 @@ fn derive_profile_name(input: &std::path::Path) -> String {
 }
 
 /// The parsed, validated run configuration.
+///
+/// The input source is exactly one of two modes: a line-protocol file
+/// (`input` + `field`) or the seeded `synthetic` generator. Synthetic mode is the
+/// only one with a known analytic ground truth, so it is the only one that yields
+/// accuracy metrics.
 #[derive(Debug, Clone, PartialEq)]
 struct Cli {
-	/// Path to the `.lp` / TSBS line-protocol input file.
-	input: PathBuf,
-	/// Numeric field to project onto the interpolated series.
-	field: String,
+	/// Path to the `.lp` / TSBS line-protocol input file (line-protocol mode).
+	input: Option<PathBuf>,
+	/// Numeric field to project onto the interpolated series (line-protocol mode).
+	field: Option<String>,
+	/// Run the seeded synthetic generator instead of reading a file.
+	synthetic: bool,
+	/// Synthetic generator seed (published for reproducibility).
+	seed: u64,
+	/// Synthetic post-missingness target sample count.
+	points: usize,
+	/// Synthetic missingness fraction (`0.0..=1.0`).
+	missingness: f64,
+	/// Synthetic timestamp jitter fraction (`0.0..=1.0`).
+	jitter: f64,
 	/// Timestamp precision of the input file.
 	precision: TimestampPrecision,
 	/// Spline method requested of the adapter.
@@ -188,8 +213,17 @@ impl Cli {
 	/// Returns a human-readable message for an unknown flag, a flag missing its
 	/// value, a malformed enum/number value, or a missing required argument.
 	fn from_args(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
+		// Synthetic-knob defaults are read from the flagship profile so the CLI
+		// never hardcodes a second copy of those constants.
+		let flagship = InterpolationProfile::interpolation_heavy_irregular();
+
 		let mut input: Option<PathBuf> = None;
 		let mut field: Option<String> = None;
+		let mut synthetic = false;
+		let mut seed = flagship.seed;
+		let mut points = flagship.input_points;
+		let mut missingness = flagship.missingness_fraction;
+		let mut jitter = flagship.jitter_fraction;
 		let mut precision = TimestampPrecision::Nanoseconds;
 		let mut spline = Spline::Cubic;
 		let mut resolution = Resolution::Seconds;
@@ -219,6 +253,11 @@ impl Cli {
 				"-h" | "--help" => return Ok(Command::Help),
 				"-i" | "--input" => input = Some(PathBuf::from(take_value(&key)?)),
 				"-f" | "--field" => field = Some(take_value(&key)?),
+				"-s" | "--synthetic" => synthetic = true,
+				"--seed" => seed = parse_seed(&take_value(&key)?)?,
+				"--points" => points = parse_points_count(&take_value(&key)?)?,
+				"--missingness" => missingness = parse_fraction(&take_value(&key)?, "missingness")?,
+				"--jitter" => jitter = parse_fraction(&take_value(&key)?, "jitter")?,
 				"--precision" => precision = parse_precision(&take_value(&key)?)?,
 				"--spline" => spline = parse_spline(&take_value(&key)?)?,
 				"--resolution" => resolution = parse_resolution(&take_value(&key)?)?,
@@ -237,10 +276,26 @@ impl Cli {
 			}
 		}
 
-		let input = input.ok_or_else(|| "missing required `--input <file.lp>`".to_string())?;
-		let field = field.ok_or_else(|| "missing required `--field <name>`".to_string())?;
+		// Exactly one input mode. Synthetic mode generates its own data, so an input
+		// file (or a `--field` projection) is meaningless and rejected as a conflict;
+		// line-protocol mode requires both `--input` and `--field`.
+		if synthetic {
+			if input.is_some() {
+				return Err("`--synthetic` cannot be combined with an input file".to_string());
+			}
+			if field.is_some() {
+				return Err("`--field` has no meaning in `--synthetic` mode".to_string());
+			}
+		} else {
+			if input.is_none() {
+				return Err("missing required `--input <file.lp>` (or pass `--synthetic`)".to_string());
+			}
+			if field.is_none() {
+				return Err("missing required `--field <name>`".to_string());
+			}
+		}
 
-		Ok(Command::Run(Self { input, field, precision, spline, resolution, reps, out_dir, name, compare }))
+		Ok(Command::Run(Self { input, field, synthetic, seed, points, missingness, jitter, precision, spline, resolution, reps, out_dir, name, compare }))
 	}
 }
 
@@ -302,17 +357,54 @@ fn parse_reps(s: &str) -> Result<usize, String> {
 	Ok(n)
 }
 
+/// Parse a synthetic seed, accepting either a decimal or a `0x`-prefixed hex
+/// literal (seeds are often published in hex).
+fn parse_seed(s: &str) -> Result<u64, String> {
+	let parsed = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).map_or_else(|| s.parse::<u64>(), |hex| u64::from_str_radix(hex, 16));
+	parsed.map_err(|_| format!("invalid --seed `{s}` (expected a u64, decimal or 0x-hex)"))
+}
+
+/// Parse a synthetic sample count, requiring at least two points (a spline needs
+/// two points to interpolate between).
+fn parse_points_count(s: &str) -> Result<usize, String> {
+	let n = s.parse::<usize>().map_err(|_| format!("invalid --points `{s}` (expected a positive integer)"))?;
+	if n < 2 {
+		return Err("--points must be >= 2".to_string());
+	}
+	Ok(n)
+}
+
+/// Parse a fraction in `[0.0, 1.0]` for `--missingness` / `--jitter`.
+fn parse_fraction(s: &str, flag: &str) -> Result<f64, String> {
+	let v = s.parse::<f64>().map_err(|_| format!("invalid --{flag} `{s}` (expected a number in [0, 1])"))?;
+	if !(0.0..=1.0).contains(&v) {
+		return Err(format!("--{flag} must be in [0, 1], got {v}"));
+	}
+	Ok(v)
+}
+
 /// Usage text shown for `--help` and on a parse error.
 const USAGE: &str = "\
-dsp-bench — run a DSP interpolation benchmark over an InfluxDB-Line-Protocol / TSBS file
+dsp-bench — run a DSP interpolation benchmark over a line-protocol file or the
+seeded synthetic generator
 
 USAGE:
     dsp-bench --input <FILE.lp> --field <NAME> [OPTIONS]
     dsp-bench <FILE.lp> --field <NAME> [OPTIONS]
+    dsp-bench --synthetic [OPTIONS]
 
-REQUIRED:
+INPUT MODE (choose one):
     -i, --input <FILE>       Line-protocol input file (.lp / TSBS payload)
-    -f, --field <NAME>       Numeric field to interpolate
+    -f, --field <NAME>       Numeric field to interpolate (with --input)
+    -s, --synthetic          Generate a seeded synthetic series instead. Only this
+                             mode has a known ground truth, so only it reports
+                             accuracy (RMSE/MAE/max-error/bias).
+
+SYNTHETIC OPTIONS (with --synthetic):
+        --seed <N>           Generator seed, decimal or 0x-hex     [default: flagship]
+        --points <N>         Sample count (>=2)                    [default: 480]
+        --missingness <F>    Gap fraction in [0, 1]                [default: 0.20]
+        --jitter <F>         Timestamp jitter fraction in [0, 1]   [default: 0.60]
 
 OPTIONS:
         --precision <P>      Timestamp precision: ns|us|ms|s         [default: ns]
@@ -320,7 +412,7 @@ OPTIONS:
         --resolution <R>     Output grid: ns|us|ms|s|m|h|d|w|mo|y    [default: s]
         --reps <N>           Timed repetitions (>0)                  [default: 10]
         --out-dir <DIR>      Report output directory          [default: reports/json]
-        --name <NAME>        Profile name            [default: input file stem]
+        --name <NAME>        Profile name      [default: input stem / flagship name]
     -c, --compare            Also run the portable baseline suite (linear +
                              forward-fill) for comparison
     -h, --help               Print this help
@@ -349,8 +441,9 @@ mod tests {
 	#[test]
 	fn parses_required_flags_with_defaults() {
 		let cli = expect_run(&["--input", "data.lp", "--field", "usage"]);
-		assert_eq!(cli.input, PathBuf::from("data.lp"));
-		assert_eq!(cli.field, "usage");
+		assert_eq!(cli.input, Some(PathBuf::from("data.lp")));
+		assert_eq!(cli.field, Some("usage".to_string()));
+		assert!(!cli.synthetic, "synthetic is off unless requested");
 		assert_eq!(cli.precision, TimestampPrecision::Nanoseconds);
 		assert_eq!(cli.spline, Spline::Cubic);
 		assert_eq!(cli.resolution, Resolution::Seconds);
@@ -358,6 +451,45 @@ mod tests {
 		assert_eq!(cli.out_dir, PathBuf::from("reports").join("json"));
 		assert_eq!(cli.name, None);
 		assert!(!cli.compare, "comparison is off unless requested");
+	}
+
+	#[test]
+	fn synthetic_mode_needs_no_input_and_carries_knob_defaults() {
+		let cli = expect_run(&["--synthetic"]);
+		assert!(cli.synthetic);
+		assert_eq!(cli.input, None);
+		assert_eq!(cli.field, None);
+		// Knob defaults mirror the flagship profile.
+		let flagship = InterpolationProfile::interpolation_heavy_irregular();
+		assert_eq!(cli.seed, flagship.seed);
+		assert_eq!(cli.points, flagship.input_points);
+		assert!((cli.missingness - flagship.missingness_fraction).abs() < f64::EPSILON);
+		assert!((cli.jitter - flagship.jitter_fraction).abs() < f64::EPSILON);
+	}
+
+	#[test]
+	fn synthetic_knobs_parse_including_hex_seed() {
+		let cli = expect_run(&["-s", "--seed", "0xBEEF", "--points", "120", "--missingness", "0.1", "--jitter", "0.0"]);
+		assert!(cli.synthetic);
+		assert_eq!(cli.seed, 0xBEEF);
+		assert_eq!(cli.points, 120);
+		assert!((cli.missingness - 0.1).abs() < 1e-12);
+		assert!((cli.jitter - 0.0).abs() < f64::EPSILON);
+	}
+
+	#[test]
+	fn synthetic_conflicts_with_input_and_field_are_rejected() {
+		assert!(run_cli(&["--synthetic", "--input", "x.lp"]).unwrap_err().contains("cannot be combined"));
+		assert!(run_cli(&["--synthetic", "data.lp"]).unwrap_err().contains("cannot be combined"));
+		assert!(run_cli(&["--synthetic", "--field", "v"]).unwrap_err().contains("no meaning"));
+	}
+
+	#[test]
+	fn synthetic_knob_bounds_are_enforced() {
+		assert!(run_cli(&["-s", "--points", "1"]).unwrap_err().contains(">= 2"));
+		assert!(run_cli(&["-s", "--missingness", "1.5"]).unwrap_err().contains("[0, 1]"));
+		assert!(run_cli(&["-s", "--jitter", "-0.1"]).unwrap_err().contains("[0, 1]"));
+		assert!(run_cli(&["-s", "--seed", "notanumber"]).unwrap_err().contains("--seed"));
 	}
 
 	#[test]
@@ -370,18 +502,18 @@ mod tests {
 	#[test]
 	fn accepts_short_flags_and_positional_input() {
 		let cli = expect_run(&["data.lp", "-f", "usage"]);
-		assert_eq!(cli.input, PathBuf::from("data.lp"));
-		assert_eq!(cli.field, "usage");
+		assert_eq!(cli.input, Some(PathBuf::from("data.lp")));
+		assert_eq!(cli.field, Some("usage".to_string()));
 
 		let cli = expect_run(&["-i", "x.lp", "-f", "v"]);
-		assert_eq!(cli.input, PathBuf::from("x.lp"));
+		assert_eq!(cli.input, Some(PathBuf::from("x.lp")));
 	}
 
 	#[test]
 	fn accepts_key_equals_value_form() {
 		let cli = expect_run(&["--input=data.lp", "--field=usage", "--reps=25", "--spline=linear"]);
-		assert_eq!(cli.input, PathBuf::from("data.lp"));
-		assert_eq!(cli.field, "usage");
+		assert_eq!(cli.input, Some(PathBuf::from("data.lp")));
+		assert_eq!(cli.field, Some("usage".to_string()));
 		assert_eq!(cli.reps, 25);
 		assert_eq!(cli.spline, Spline::Linear);
 	}
