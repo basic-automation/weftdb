@@ -58,7 +58,7 @@ use bigdecimal::ToPrimitive;
 use splimes::generate_target_times;
 
 pub use crate::{
-	accuracy::{synthetic_ground_truth, AccuracyError, AccuracyMetrics}, adapter::SystemAdapter, baseline_adapter::BaselineLinearAdapter, dsp_adapter::DspAdapter, forward_fill_adapter::ForwardFillAdapter, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError}, report::{BenchReport, RunMetadata}, schema::{BenchResult, CorrectnessReport, DatasetMeta, TimingBreakdown, SCHEMA_VERSION}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}
+	accuracy::{synthetic_ground_truth, AccuracyError, AccuracyMetrics}, adapter::SystemAdapter, baseline_adapter::BaselineLinearAdapter, dsp_adapter::DspAdapter, forward_fill_adapter::ForwardFillAdapter, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError, SyntheticParams}, report::{BenchReport, RunMetadata}, schema::{BenchResult, CorrectnessReport, DatasetMeta, TimingBreakdown, SCHEMA_VERSION}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}
 };
 
 /// Workload class label recorded for the interpolation profile.
@@ -331,6 +331,22 @@ cpu,host=h0 usage=14.0 600\n";
 			assert!(m.mae >= 0.0, "{label}: mae must be non-negative");
 			assert!(m.bias.abs() <= m.mae + 1e-9, "{label}: |bias| {} <= mae {}", m.bias.abs(), m.mae);
 		}
+	}
+
+	#[tokio::test]
+	async fn noise_free_data_reconstructs_far_more_accurately_than_noisy() {
+		// Same seed and geometry, only the noise amplitude differs. Measurement noise
+		// is error no reconstruction can remove, so the clean run must score strictly
+		// better — and a well-sampled smooth signal should reconstruct with low RMSE.
+		// This is the regime where DSP's spline path is meant to shine.
+		let clean = InterpolationProfile::synthetic("clean", SyntheticParams { seed: 7, noise_amplitude: 0.0, ..SyntheticParams::default() });
+		let noisy = InterpolationProfile::synthetic("noisy", SyntheticParams { seed: 7, noise_amplitude: 2.0, ..SyntheticParams::default() });
+
+		let clean_acc = measure_accuracy(&DspAdapter::new(), &clean).await.expect("clean accuracy");
+		let noisy_acc = measure_accuracy(&DspAdapter::new(), &noisy).await.expect("noisy accuracy");
+
+		assert!(clean_acc.rmse < noisy_acc.rmse, "clean data must reconstruct more accurately than noisy: clean {} vs noisy {}", clean_acc.rmse, noisy_acc.rmse);
+		assert!(clean_acc.rmse < 1.5, "cubic should recover a noise-free smooth signal with low error, got rmse {}", clean_acc.rmse);
 	}
 
 	#[tokio::test]
