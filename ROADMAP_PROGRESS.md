@@ -723,3 +723,114 @@ results (exact counts) · done-vs-open · next step · PR.
   increment; (a) remains the path to a real-engine comparison.
 - **PR:** https://github.com/physics515/DSP/pull/12
 
+
+---
+
+## 2026-06-13 — DSP-Bench: reconstruction-accuracy / quality axis (6 increments)
+
+A focused night building DSP-Bench's **quality** axis end-to-end, all in the
+`dsp-bench` leaf crate. Until tonight the harness measured only speed; it now
+scores how *right* each reconstruction is against a known analytic ground truth,
+and can emit a real DSP-vs-baselines quality comparison from the command line.
+
+**Item:** Phase 1 / Track 1 — DSP-Bench; roadmap "Immediate next actions" #3
+(now records the quality axis) and fair-protocol **Phase 1.2** ("benchmark
+interpolation quality as well as speed") + **Phase 6.4** (RMSE/MAE/max-error/bias).
+Picked the previous run's recommended option (b) — the accuracy-metrics module —
+over the long-deferred external DuckDB adapter (heavy/fragile native build on
+Windows, risks the budget); it lands clean with zero new dependencies and the
+roadmap repeatedly asks for it.
+
+**Increment 1 — `accuracy.rs` (new) + ground-truth plumbing** (commit `7157312`)
+- `profile.rs`: factored the synthetic clean signal into a shared
+  `clean_signal(phase)` so generation and ground truth can never drift; exposed
+  `clean_signal_at(t) -> Option<f64>` (Some for Generated, None for line-protocol).
+- `accuracy.rs`: `AccuracyMetrics { count, rmse, mae, max_abs_error, bias }` via
+  `from_aligned(predicted, truth)`; `synthetic_ground_truth(profile)` evaluates
+  truth on the same `generate_target_times` grid a passing adapter produces.
+  Typed `AccuracyError` for length-mismatch / empty / non-finite / no-ground-truth.
+- `lib.rs`: `measure_accuracy(adapter, profile)` runner + re-exports.
+- Tests: +13 (2 profile, 9 accuracy, 2 lib). Build green; clippy fixed directly
+  (mul_add, doc-paragraph split, i64::try_from) — no `#[allow]`.
+
+**Increment 2 — accuracy in `BenchResult` (schema v4)** (commit `d87cc2f`)
+- `schema.rs`: `BenchResult.accuracy: Option<AccuracyMetrics>`, SCHEMA_VERSION 4,
+  `#[serde(default, skip_serializing_if = "Option::is_none")]` (pre-v4 artifacts
+  still parse; absent accuracy omitted, not `null`).
+- `lib.rs`: `run_profile` scores the final rep's output against ground truth when
+  available (reuses `last_output`, no extra adapter run); absent for line-protocol.
+- `main.rs`: summary prints an accuracy line when present. `report.rs` fixture updated.
+- Tests: +1 (75→... cumulative). f64 round-trip compared with tolerance (ULP drift).
+
+**Increment 3 — `--synthetic` CLI mode** (commit `8448998`)
+- `profile.rs`: public `InterpolationProfile::synthetic(name, params)` constructor;
+  flagship delegates to it. `DEFAULT_SEED` made pub.
+- `main.rs`: `--synthetic`/`-s` runs the generator (the only mode with a ground
+  truth, so the only one reporting accuracy); `--seed` (dec/0x-hex), `--points`
+  (>=2), `--missingness`/`--jitter` ([0,1]). `input`/`field` now Option, validated
+  per mode (synthetic rejects an input file / `--field` as a conflict).
+- Verified real run: first quality comparison artifact. Honest anti-Goodhart
+  result on the noisy flagship signal — linear best RMSE (1.19), DSP cubic
+  overshoots noise (1.91), forward-fill worst (2.93). +4 bin tests.
+
+**Increment 4 — configurable noise amplitude + `SyntheticParams`** (commit `7d06ced`)
+- `profile.rs`: `noise_amplitude` knob (`0` = samples exactly on ground truth);
+  introduced `SyntheticParams` (7 knobs, `Default` = flagship) and reduced
+  `synthetic` to `(name, params)` — this structurally fixed the `too_many_arguments`
+  clippy lint the 8th arg would trip (no `#[allow]`), then derived `Copy` to clear
+  `needless_pass_by_value`.
+- `main.rs`: `--noise <F>` (finite, >=0). `lib.rs`: re-export `SyntheticParams`.
+- Tests: +3 (zero-noise-on-truth; noise>1 accepted; clean reconstructs strictly
+  better than noisy). Honest finding: `--noise 0` cuts DSP cubic RMSE 1.9→0.87 but
+  linear still leads on this high-frequency signal (cubic overshoots near gaps).
+
+**Increment 5 — docs** (commit `c61ec85`)
+- `dsp-bench/README.md`: accuracy + two-input-mode bullets, a "Quality comparison
+  (synthetic mode)" run section with the linear-beats-cubic honesty note.
+- `ROADMAP.md`: Immediate-next-action #3 records the accuracy module, schema-v4
+  field, `--synthetic` mode + knobs, and the first anti-Goodhart result. Stays 🟡.
+
+**Increment 6 — `BenchReport::most_accurate()` + CLI winner line** (commit `047be53`)
+- `report.rs`: returns the publishable result with the smallest finite RMSE among
+  those carrying accuracy; skips no-accuracy / failing / NaN results. +3 tests.
+- `main.rs`: prints `most accurate: <adapter> (rmse=..)` for synthetic compare runs.
+
+**Build/test/clippy (real, nightly):**
+- `cargo build --workspace` — GREEN (confirmed at baseline and again at end).
+- `cargo test -p dsp-bench` — **75 lib + 17 bin + 0 doc, all pass** (was 56 lib +
+  12 bin; +19 lib, +5 bin this night).
+- `cargo clippy -p dsp-bench --all-targets` — **0 dsp-bench warnings** (every lint
+  introduced was fixed structurally, never with `#[allow]`). The 4 pre-existing
+  `splimes` `sort_by_key` warnings in untouched files remain (logged before).
+- `cargo fmt -p dsp-bench --check` — clean.
+- Real end-to-end runs verified per increment (line-protocol `--compare`, synthetic
+  `--compare`, `--noise 0`); all exit 0 with passing correctness gates.
+- Scope note: tests scoped to `-p dsp-bench` — the change is confined to the
+  `dsp-bench` leaf crate (no other workspace member depends on it) and the full
+  workspace **build** is green. Did not run the full (heavy wgpu/GPU/turso)
+  `cargo test --workspace` to stay in the time budget.
+
+**Done vs open:** DONE — DSP-Bench now has a complete quality axis: accuracy
+metrics module, accuracy carried in every synthetic result (schema v4), a
+`--synthetic` CLI mode with seed/points/missingness/jitter/noise knobs, and a
+report-level "most accurate" query, all surfaced in the CLI. OPEN — the
+external-engine **DuckDB adapter** (a real database baseline);
+ClickHouse/InfluxDB 3/QuestDB/TimescaleDB adapters; the Phase-2 server-side ILP
+ingest **endpoint** (`axum`); richer report formats (Parquet/HTML); full hardware
+capture; the standalone methodology document (#10); signal-shape variety in the
+generator.
+
+**STOP REASON:** completed a coherent feature arc (the whole accuracy/quality axis
+end-to-end across 6 increments, well above the 2–4 bar). The next substantive
+roadmap items — the external DuckDB adapter and the axum ILP-ingest server — are
+too large/fragile to land as another clean bounded slice in the remaining window
+(landing one half-built would leave the PR unfocused); stopping here keeps the PR
+reviewable and the workspace green.
+
+**Next step (tomorrow):** start the **DuckDB external-engine adapter** as its own
+out-of-core module (the first *real-database* baseline; needs the `duckdb` crate
++ bundled native lib — budget a clean Windows build) OR begin the **Phase-2
+`axum` server** with the ILP ingest endpoint. With the quality axis now proven,
+either advances the benchmark toward real competitor comparisons.
+
+**PR:** (opened at end of run — see below)
