@@ -119,6 +119,13 @@ pub async fn run_profile<A: SystemAdapter + ?Sized>(adapter: &A, profile: &Inter
 	let values_finite = last_output.iter().all(|p| p.value.to_f64().is_some_and(f64::is_finite));
 	let correctness = CorrectnessReport { output_count_ok: actual_output_points > 0 && actual_output_points == expected_output_points, expected_output_points, actual_output_points, values_finite };
 
+	// Quality alongside speed: when the profile has a known analytic ground truth
+	// (synthetic source), score the final rep's reconstruction against it. Reusing
+	// `last_output` means no extra adapter run. A line-protocol source has no
+	// ground truth (`synthetic_ground_truth` errors) and a grid-size mismatch makes
+	// alignment fail — either way accuracy is simply absent, never fatal.
+	let accuracy = accuracy::synthetic_ground_truth(profile).ok().and_then(|truth| AccuracyMetrics::from_aligned(&last_output, &truth).ok());
+
 	let latency = LatencyStats::from_samples(&samples_ns);
 	// Bootstrap CIs for the latency distribution (fair-protocol Phase 1.1). The
 	// resampling seed is derived from the dataset seed so the interval is
@@ -134,7 +141,7 @@ pub async fn run_profile<A: SystemAdapter + ?Sized>(adapter: &A, profile: &Inter
 		0.0
 	};
 
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: adapter.name().to_string(), workload: WORKLOAD_UPSAMPLE_INTERPOLATE.to_string(), reps, dataset: DatasetMeta { input_points, output_points: actual_output_points, irregular: true, missingness_fraction: profile.missingness_fraction, seed: profile.seed }, latency, latency_ci, throughput_points_per_sec, timing, correctness })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: adapter.name().to_string(), workload: WORKLOAD_UPSAMPLE_INTERPOLATE.to_string(), reps, dataset: DatasetMeta { input_points, output_points: actual_output_points, irregular: true, missingness_fraction: profile.missingness_fraction, seed: profile.seed }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy })
 }
 
 /// Measure reconstruction *accuracy*: run `adapter` once over `profile` and score
@@ -183,6 +190,13 @@ mod tests {
 		assert!(result.is_publishable(), "result should be publishable");
 		assert!(result.throughput_points_per_sec > 0.0, "throughput must be positive");
 
+		// A synthetic profile has a known ground truth, so the run must carry
+		// finite accuracy metrics scored over the whole grid.
+		let acc = result.accuracy.expect("synthetic run must carry accuracy metrics");
+		assert_eq!(acc.count, result.dataset.output_points, "accuracy must score the whole output grid");
+		assert!(acc.rmse.is_finite() && acc.mae.is_finite() && acc.max_abs_error.is_finite() && acc.bias.is_finite(), "accuracy metrics must be finite: {acc:?}");
+		assert!(acc.max_abs_error >= acc.rmse - 1e-9 && acc.rmse >= acc.mae - 1e-9, "metric invariants must hold: {acc:?}");
+
 		// The run must carry an end-to-end timing breakdown whose spans are
 		// internally consistent: the operation under test is non-zero, dataset
 		// generation plus the measured calls never exceed the whole-run span, and
@@ -219,6 +233,14 @@ mod tests {
 		assert_eq!(result.latency_ci, back.latency_ci);
 		assert_eq!(result.timing, back.timing);
 		assert_eq!(result.correctness, back.correctness);
+		// The integer `count` must match exactly; the `f64` metrics are compared with
+		// a tolerance because a real-world `f64` can shift by a ULP across a decimal
+		// JSON round-trip (same reason `throughput` is compared loosely below).
+		let (ra, ba) = (result.accuracy.expect("synthetic run has accuracy"), back.accuracy.expect("round-trip keeps accuracy"));
+		assert_eq!(ra.count, ba.count, "accuracy point count must survive the round-trip");
+		for (a, b, name) in [(ra.rmse, ba.rmse, "rmse"), (ra.mae, ba.mae, "mae"), (ra.max_abs_error, ba.max_abs_error, "max"), (ra.bias, ba.bias, "bias")] {
+			assert!((a - b).abs() < 1e-9, "accuracy.{name} must survive the round-trip within tolerance: {a} vs {b}");
+		}
 		let throughput_drift = (result.throughput_points_per_sec - back.throughput_points_per_sec).abs();
 		assert!(throughput_drift < 1e-6, "throughput must survive round-trip within tolerance, drifted {throughput_drift}");
 	}
@@ -284,6 +306,7 @@ cpu,host=h0 usage=14.0 600\n";
 		assert!(result.is_publishable(), "an ILP-sourced run should be publishable");
 		assert!(result.throughput_points_per_sec > 0.0, "throughput must be positive");
 		assert!(result.timing.measured_ns > 0, "measured span must be non-zero");
+		assert!(result.accuracy.is_none(), "a line-protocol source has no ground truth, so no accuracy");
 	}
 
 	#[tokio::test]
