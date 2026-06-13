@@ -608,7 +608,15 @@ redistributed. *For commercial trust, be more transparent than competitors.*
    (`dsp-bench/src/forward_fill_adapter.rs`) — the class-(B) portable mirror of
    native TSDB gap-fill (`FILL(previous)`/`locf()`). The CLI's `--compare` flag now
    runs the full baseline suite, so reports carry a real three-system comparison
-   (`dsp` vs `baseline-linear` vs `baseline-forward-fill`). The external-engine
+   (`dsp` vs `baseline-linear` vs `baseline-forward-fill`). The three methods are
+   now compared on **quality, not only speed**: `dsp-bench/src/accuracy.rs`
+   (`AccuracyMetrics`: RMSE/MAE/max-error/bias) scores each reconstruction against
+   the synthetic profile's **known analytic ground truth** (fair-protocol Phase
+   1.2 / Phase 6.4), carried as `BenchResult.accuracy` (schema v4) and surfaced by
+   the new CLI `--synthetic` mode (with `--seed`/`--points`/`--missingness`/
+   `--jitter`/`--noise` knobs). First honest finding it exposes: on the
+   high-frequency flagship signal the portable linear baseline out-accuracies
+   DSP's cubic spline near block gaps — surfaced, not hidden. The external-engine
    DuckDB adapter — a real database baseline — is still to do.)*
 4. Add ClickHouse, InfluxDB 3, QuestDB, TimescaleDB adapters.
 5. 🟡 Implement InfluxDB Line Protocol ingest. *(ILP **format parser** landed in
