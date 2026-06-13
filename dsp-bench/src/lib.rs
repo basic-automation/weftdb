@@ -9,6 +9,10 @@
 //!
 //! ## Shape (this is the scaffold)
 //!
+//! - [`accuracy`] — reconstruction-quality metrics ([`AccuracyMetrics`]:
+//!   RMSE / MAE / max-error / bias) scored against the synthetic profile's known
+//!   analytic ground truth, so the reconstruction methods can be compared on
+//!   accuracy, not only speed.
 //! - [`profile`] — workload profiles + dataset sourcing. The flagship is
 //!   [`InterpolationProfile::interpolation_heavy_irregular`] (seeded synthetic);
 //!   [`InterpolationProfile::from_line_protocol`] drives the same workload from a
@@ -37,6 +41,7 @@
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod accuracy;
 pub mod adapter;
 pub mod baseline_adapter;
 pub mod dsp_adapter;
@@ -53,7 +58,7 @@ use bigdecimal::ToPrimitive;
 use splimes::generate_target_times;
 
 pub use crate::{
-	adapter::SystemAdapter, baseline_adapter::BaselineLinearAdapter, dsp_adapter::DspAdapter, forward_fill_adapter::ForwardFillAdapter, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError}, report::{BenchReport, RunMetadata}, schema::{BenchResult, CorrectnessReport, DatasetMeta, TimingBreakdown, SCHEMA_VERSION}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}
+	accuracy::{synthetic_ground_truth, AccuracyError, AccuracyMetrics}, adapter::SystemAdapter, baseline_adapter::BaselineLinearAdapter, dsp_adapter::DspAdapter, forward_fill_adapter::ForwardFillAdapter, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError, SyntheticParams}, report::{BenchReport, RunMetadata}, schema::{BenchResult, CorrectnessReport, DatasetMeta, TimingBreakdown, SCHEMA_VERSION}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}
 };
 
 /// Workload class label recorded for the interpolation profile.
@@ -114,6 +119,13 @@ pub async fn run_profile<A: SystemAdapter + ?Sized>(adapter: &A, profile: &Inter
 	let values_finite = last_output.iter().all(|p| p.value.to_f64().is_some_and(f64::is_finite));
 	let correctness = CorrectnessReport { output_count_ok: actual_output_points > 0 && actual_output_points == expected_output_points, expected_output_points, actual_output_points, values_finite };
 
+	// Quality alongside speed: when the profile has a known analytic ground truth
+	// (synthetic source), score the final rep's reconstruction against it. Reusing
+	// `last_output` means no extra adapter run. A line-protocol source has no
+	// ground truth (`synthetic_ground_truth` errors) and a grid-size mismatch makes
+	// alignment fail — either way accuracy is simply absent, never fatal.
+	let accuracy = accuracy::synthetic_ground_truth(profile).ok().and_then(|truth| AccuracyMetrics::from_aligned(&last_output, &truth).ok());
+
 	let latency = LatencyStats::from_samples(&samples_ns);
 	// Bootstrap CIs for the latency distribution (fair-protocol Phase 1.1). The
 	// resampling seed is derived from the dataset seed so the interval is
@@ -129,7 +141,30 @@ pub async fn run_profile<A: SystemAdapter + ?Sized>(adapter: &A, profile: &Inter
 		0.0
 	};
 
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: adapter.name().to_string(), workload: WORKLOAD_UPSAMPLE_INTERPOLATE.to_string(), reps, dataset: DatasetMeta { input_points, output_points: actual_output_points, irregular: true, missingness_fraction: profile.missingness_fraction, seed: profile.seed }, latency, latency_ci, throughput_points_per_sec, timing, correctness })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: adapter.name().to_string(), workload: WORKLOAD_UPSAMPLE_INTERPOLATE.to_string(), reps, dataset: DatasetMeta { input_points, output_points: actual_output_points, irregular: true, missingness_fraction: profile.missingness_fraction, seed: profile.seed }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy })
+}
+
+/// Measure reconstruction *accuracy*: run `adapter` once over `profile` and score
+/// its output grid against the profile's known analytic ground truth.
+///
+/// This is the quality counterpart to [`run_profile`]'s speed measurement. It is
+/// only meaningful for a synthetic ([`DatasetSource::Generated`]) profile; a
+/// line-protocol profile has no ground truth and yields
+/// [`AccuracyError::NoGroundTruth`]. A single run (not `reps`) is enough because
+/// accuracy is deterministic for a seed — the reconstruction of a fixed dataset
+/// does not vary across repetitions.
+///
+/// # Errors
+///
+/// Propagates an adapter failure, or surfaces an [`AccuracyError`] (no ground
+/// truth, a length mismatch between the output grid and the truth grid, or a
+/// non-finite predicted value) as an `anyhow::Error`.
+pub async fn measure_accuracy<A: SystemAdapter + ?Sized>(adapter: &A, profile: &InterpolationProfile) -> anyhow::Result<AccuracyMetrics> {
+	let truth = accuracy::synthetic_ground_truth(profile)?;
+	let mut points = profile.generate();
+	let (start, end) = (profile.start(), profile.end());
+	let output = adapter.interpolate_range(&mut points, start, end, profile.resolution, profile.spline).await?;
+	Ok(AccuracyMetrics::from_aligned(&output, &truth)?)
 }
 
 #[cfg(test)]
@@ -154,6 +189,13 @@ mod tests {
 		assert!(result.correctness.passed(), "correctness must pass: {:?}", result.correctness);
 		assert!(result.is_publishable(), "result should be publishable");
 		assert!(result.throughput_points_per_sec > 0.0, "throughput must be positive");
+
+		// A synthetic profile has a known ground truth, so the run must carry
+		// finite accuracy metrics scored over the whole grid.
+		let acc = result.accuracy.expect("synthetic run must carry accuracy metrics");
+		assert_eq!(acc.count, result.dataset.output_points, "accuracy must score the whole output grid");
+		assert!(acc.rmse.is_finite() && acc.mae.is_finite() && acc.max_abs_error.is_finite() && acc.bias.is_finite(), "accuracy metrics must be finite: {acc:?}");
+		assert!(acc.max_abs_error >= acc.rmse - 1e-9 && acc.rmse >= acc.mae - 1e-9, "metric invariants must hold: {acc:?}");
 
 		// The run must carry an end-to-end timing breakdown whose spans are
 		// internally consistent: the operation under test is non-zero, dataset
@@ -191,6 +233,14 @@ mod tests {
 		assert_eq!(result.latency_ci, back.latency_ci);
 		assert_eq!(result.timing, back.timing);
 		assert_eq!(result.correctness, back.correctness);
+		// The integer `count` must match exactly; the `f64` metrics are compared with
+		// a tolerance because a real-world `f64` can shift by a ULP across a decimal
+		// JSON round-trip (same reason `throughput` is compared loosely below).
+		let (ra, ba) = (result.accuracy.expect("synthetic run has accuracy"), back.accuracy.expect("round-trip keeps accuracy"));
+		assert_eq!(ra.count, ba.count, "accuracy point count must survive the round-trip");
+		for (a, b, name) in [(ra.rmse, ba.rmse, "rmse"), (ra.mae, ba.mae, "mae"), (ra.max_abs_error, ba.max_abs_error, "max"), (ra.bias, ba.bias, "bias")] {
+			assert!((a - b).abs() < 1e-9, "accuracy.{name} must survive the round-trip within tolerance: {a} vs {b}");
+		}
 		let throughput_drift = (result.throughput_points_per_sec - back.throughput_points_per_sec).abs();
 		assert!(throughput_drift < 1e-6, "throughput must survive round-trip within tolerance, drifted {throughput_drift}");
 	}
@@ -256,6 +306,56 @@ cpu,host=h0 usage=14.0 600\n";
 		assert!(result.is_publishable(), "an ILP-sourced run should be publishable");
 		assert!(result.throughput_points_per_sec > 0.0, "throughput must be positive");
 		assert!(result.timing.measured_ns > 0, "measured span must be non-zero");
+		assert!(result.accuracy.is_none(), "a line-protocol source has no ground truth, so no accuracy");
+	}
+
+	#[tokio::test]
+	async fn measure_accuracy_scores_every_reconstruction_against_ground_truth() {
+		let profile = InterpolationProfile::interpolation_heavy_irregular();
+		let expected = generate_target_times(profile.start(), profile.end(), profile.resolution).len();
+
+		// Every in-process reconstruction method must yield finite, grid-aligned
+		// accuracy metrics obeying the universal error-statistic invariants
+		// (max >= rmse >= mae >= 0, |bias| <= mae). We do not assert one method
+		// beats another: with seeded noise that ordering is a real result to
+		// report, not a property to bake into a test.
+		let dsp = measure_accuracy(&DspAdapter::new(), &profile).await.expect("dsp accuracy");
+		let linear = measure_accuracy(&BaselineLinearAdapter::new(), &profile).await.expect("linear accuracy");
+		let locf = measure_accuracy(&ForwardFillAdapter::new(), &profile).await.expect("forward-fill accuracy");
+
+		for (label, m) in [("dsp", dsp), ("linear", linear), ("forward-fill", locf)] {
+			assert_eq!(m.count, expected, "{label}: accuracy must score the whole grid");
+			assert!(m.rmse.is_finite() && m.mae.is_finite() && m.max_abs_error.is_finite() && m.bias.is_finite(), "{label}: metrics must be finite: {m:?}");
+			assert!(m.max_abs_error >= m.rmse - 1e-9, "{label}: max {} >= rmse {}", m.max_abs_error, m.rmse);
+			assert!(m.rmse >= m.mae - 1e-9, "{label}: rmse {} >= mae {}", m.rmse, m.mae);
+			assert!(m.mae >= 0.0, "{label}: mae must be non-negative");
+			assert!(m.bias.abs() <= m.mae + 1e-9, "{label}: |bias| {} <= mae {}", m.bias.abs(), m.mae);
+		}
+	}
+
+	#[tokio::test]
+	async fn noise_free_data_reconstructs_far_more_accurately_than_noisy() {
+		// Same seed and geometry, only the noise amplitude differs. Measurement noise
+		// is error no reconstruction can remove, so the clean run must score strictly
+		// better — and a well-sampled smooth signal should reconstruct with low RMSE.
+		// This is the regime where DSP's spline path is meant to shine.
+		let clean = InterpolationProfile::synthetic("clean", SyntheticParams { seed: 7, noise_amplitude: 0.0, ..SyntheticParams::default() });
+		let noisy = InterpolationProfile::synthetic("noisy", SyntheticParams { seed: 7, noise_amplitude: 2.0, ..SyntheticParams::default() });
+
+		let clean_acc = measure_accuracy(&DspAdapter::new(), &clean).await.expect("clean accuracy");
+		let noisy_acc = measure_accuracy(&DspAdapter::new(), &noisy).await.expect("noisy accuracy");
+
+		assert!(clean_acc.rmse < noisy_acc.rmse, "clean data must reconstruct more accurately than noisy: clean {} vs noisy {}", clean_acc.rmse, noisy_acc.rmse);
+		assert!(clean_acc.rmse < 1.5, "cubic should recover a noise-free smooth signal with low error, got rmse {}", clean_acc.rmse);
+	}
+
+	#[tokio::test]
+	async fn measure_accuracy_rejects_a_line_protocol_profile() {
+		// A real-world ILP source has no analytic ground truth to score against.
+		let payload = "cpu,host=h0 usage=10.0 0\ncpu,host=h0 usage=12.0 120\n";
+		let profile = InterpolationProfile::from_line_protocol("tsbs-cpu", payload, "usage", TimestampPrecision::Seconds, splimes::Spline::Cubic, splimes::Resolution::Minutes).expect("valid payload");
+		let err = measure_accuracy(&DspAdapter::new(), &profile).await.expect_err("no ground truth must error");
+		assert!(err.downcast_ref::<AccuracyError>().is_some_and(|e| *e == AccuracyError::NoGroundTruth), "expected NoGroundTruth, got {err:?}");
 	}
 
 	#[tokio::test]

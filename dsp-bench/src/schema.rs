@@ -14,14 +14,17 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::stats::{LatencyCis, LatencyStats};
+use crate::{
+	accuracy::AccuracyMetrics, stats::{LatencyCis, LatencyStats}
+};
 
 /// Version of the result schema. Bump on any breaking field change.
 ///
 /// v2 added the optional `latency_ci` field (bootstrap confidence intervals).
-/// v3 added the `timing` field (end-to-end span breakdown). Both are
-/// `#[serde(default)]`, so older artifacts still deserialize.
-pub const SCHEMA_VERSION: u32 = 3;
+/// v3 added the `timing` field (end-to-end span breakdown). v4 added the optional
+/// `accuracy` field (reconstruction-quality metrics vs a known ground truth). All
+/// three are `#[serde(default)]`, so older artifacts still deserialize.
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Metadata describing the dataset a result was measured against.
 ///
@@ -127,6 +130,14 @@ pub struct BenchResult {
 	pub timing: TimingBreakdown,
 	/// Correctness verdict; gates whether the latency is publishable.
 	pub correctness: CorrectnessReport,
+	/// Reconstruction-quality metrics (RMSE / MAE / max-error / bias) scored
+	/// against the profile's known analytic ground truth. `Some` only for a
+	/// synthetic profile, whose true signal is known; `None` for a line-protocol
+	/// source (no ground truth) and for pre-v4 artifacts. `#[serde(default)]` +
+	/// `skip_serializing_if` keep old artifacts parsing and omit the key when
+	/// absent.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub accuracy: Option<AccuracyMetrics>,
 }
 
 impl BenchResult {
@@ -144,7 +155,7 @@ mod tests {
 
 	fn sample_result() -> BenchResult {
 		let samples = [100, 200, 300];
-		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "dsp".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7 }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true } }
+		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "dsp".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7 }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true }, accuracy: Some(AccuracyMetrics { count: 1000, rmse: 1.5, mae: 1.1, max_abs_error: 4.2, bias: -0.3 }) }
 	}
 
 	#[test]
@@ -216,7 +227,21 @@ mod tests {
 		}"#;
 		let parsed: BenchResult = serde_json::from_str(v2).expect("v2 artifact must still parse");
 		assert_eq!(parsed.timing, TimingBreakdown::default());
+		assert!(parsed.accuracy.is_none(), "a pre-v4 artifact carries no accuracy");
 		assert_eq!(parsed.schema_version, 2);
 		assert!(parsed.is_publishable());
+	}
+
+	#[test]
+	fn accuracy_is_omitted_from_json_when_absent() {
+		// A line-protocol-sourced result has no ground truth, so `accuracy` is None;
+		// `skip_serializing_if` must keep the key out of the artifact entirely (not
+		// emit `"accuracy": null`), and it must round-trip back to None.
+		let mut result = sample_result();
+		result.accuracy = None;
+		let json = serde_json::to_string(&result).expect("serialize");
+		assert!(!json.contains("accuracy"), "absent accuracy must be omitted, got: {json}");
+		let back: BenchResult = serde_json::from_str(&json).expect("deserialize");
+		assert!(back.accuracy.is_none());
 	}
 }

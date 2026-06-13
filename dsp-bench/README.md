@@ -53,9 +53,22 @@ This is the initial scaffold. What exists today:
   (`LatencyStats::bootstrap_cis`) for the mean and the p50/p95/p99 percentiles.
   Resampling is driven by a published RNG seed, so every interval is exactly
   reproducible — per the fair-protocol requirements.
+- **Reconstruction-accuracy metrics** (`src/accuracy.rs`, `AccuracyMetrics`) —
+  the quality axis beside the speed axis (fair-protocol Phase 1.2 / Phase 6.4).
+  The synthetic generator samples a known analytic signal, so a reconstruction's
+  output grid can be scored against the *true* shape it was meant to recover:
+  **RMSE / MAE / max-error / bias**, via `from_aligned`, with
+  `synthetic_ground_truth` evaluating truth at the same grid the adapter
+  produces. This lets the three reconstruction methods (DSP spline, linear,
+  forward-fill) be compared on accuracy, not only speed. A line-protocol source
+  has no ground truth, so it carries no accuracy. (These are error *statistics*
+  over an analytic `f64` truth — a reporting quantity, not a stored or hot-path
+  measurement value, so the no-silent-downcast rule is unaffected.)
 - **Runner** (`run_profile` in `src/lib.rs`) — runs a profile against an adapter
   for N timed reps and produces a `BenchResult`, recording the end-to-end timing
-  spans (dataset generation vs. measured operation vs. whole run).
+  spans (dataset generation vs. measured operation vs. whole run) and, for a
+  synthetic profile, the reconstruction accuracy of the final rep (`measure_accuracy`
+  is also exposed standalone).
 - **JSON report runner** (`src/report.rs`) — wraps one or more `BenchResult`s in
   a `BenchReport` envelope with lightweight run metadata (`dsp-bench` version,
   OS, CPU arch, generation timestamp) and persists it as pretty-printed JSON to a
@@ -73,11 +86,13 @@ This is the initial scaffold. What exists today:
   `InterpolationProfile::from_line_protocol` (`DatasetSource::LineProtocol`), so a
   real `.lp`/TSBS payload drives the same interpolation harness, correctness
   gate, and reporting as the synthetic flagship profile.
-- **Command-line runner** (`src/main.rs`, binary `dsp-bench`) — reads a `.lp` /
-  TSBS file, projects the chosen numeric field through the DSP interpolation
-  profile, and writes a `BenchReport` JSON artifact to `reports/json/`. Pure
-  hand-rolled arg parsing (no `clap`); exits non-zero when the correctness gate
-  fails so a scripted caller can gate on it.
+- **Command-line runner** (`src/main.rs`, binary `dsp-bench`) — two input modes:
+  read a `.lp` / TSBS file and project a chosen numeric field, **or** `--synthetic`
+  to drive the seeded generator (knobs: `--seed`, `--points`, `--missingness`,
+  `--jitter`, `--noise`). Only the synthetic mode has a known ground truth, so
+  only it reports accuracy. Writes a `BenchReport` JSON artifact to
+  `reports/json/`. Pure hand-rolled arg parsing (no `clap`); exits non-zero when
+  the correctness gate fails so a scripted caller can gate on it.
 
 ## Not yet (tracked in `ROADMAP.md`)
 
@@ -125,3 +140,23 @@ cargo run -p dsp-bench -- \
 The artifact name tags every adapter, e.g.
 `reports/json/<profile>__dsp+baseline-linear+baseline-forward-fill.json`, and the
 process still exits non-zero if *any* result's correctness gate fails.
+
+### Quality comparison (synthetic mode)
+
+`--synthetic` runs the seeded generator instead of a file. Because its underlying
+signal is known analytically, the report adds **accuracy** (RMSE / MAE /
+max-error / bias) for every system — the only mode that can:
+
+```sh
+cargo run -p dsp-bench -- \
+    --synthetic --points 300 --noise 0 \
+    --spline cubic --resolution minutes --reps 5 --compare
+```
+
+`--noise 0` puts every sample exactly on the ground truth, isolating each
+method's own reconstruction error; raise it to probe robustness. The run prints
+an `accuracy : rmse=.. mae=.. max=.. bias=..` line per adapter and the metrics
+land in the JSON artifact (schema v4). Honesty note: on the high-frequency
+flagship signal the portable linear baseline often *out-accuracies* DSP's cubic
+spline (which overshoots near block gaps) — DSP-Bench surfaces that rather than
+hiding it.
