@@ -120,6 +120,11 @@ fn print_summary(report: &BenchReport, out_path: &std::path::Path) {
 		println!("    latency (ms) : p50={:.3} p95={:.3} p99={:.3} mean={:.3}", ms(l.p50_ns), ms(l.p95_ns), ms(l.p99_ns), ms(l.mean_ns));
 		println!("    throughput   : {:.0} points/sec", r.throughput_points_per_sec);
 		println!("    correctness  : {}", if r.correctness.passed() { "PASS" } else { "FAIL" });
+		// Accuracy is present only for a synthetic profile (known ground truth);
+		// a line-protocol source has none, so the line is simply skipped.
+		if let Some(a) = &r.accuracy {
+			println!("    accuracy     : rmse={:.4} mae={:.4} max={:.4} bias={:+.4}", a.rmse, a.mae, a.max_abs_error, a.bias);
+		}
 	}
 	println!("  publishable  : {}", if report.is_publishable() { "yes" } else { "no" });
 	println!("  report       : {}", out_path.display());
