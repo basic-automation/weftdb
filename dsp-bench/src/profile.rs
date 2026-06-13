@@ -201,6 +201,41 @@ impl InterpolationProfile {
 		Utc.timestamp_opt(EPOCH_ANCHOR_SECS, 0).single().expect("valid fixed epoch anchor")
 	}
 
+	/// The noise-free underlying signal of the synthetic generator, evaluated at a
+	/// fractional `phase` in `[0, 1]` across the series span.
+	///
+	/// This is the analytic *ground truth*: [`Self::generate_synthetic`] samples
+	/// exactly this signal (plus bounded noise) at irregular instants, so an
+	/// accuracy benchmark can score how well a reconstruction recovers the true
+	/// shape. Defined once here so generation and ground truth can never drift
+	/// apart. Range is `50 ± 40` (`[10, 90]`).
+	#[must_use]
+	fn clean_signal(phase: f64) -> f64 {
+		let wave_3 = (phase * std::f64::consts::TAU * 3.0).sin();
+		let wave_11 = (phase * std::f64::consts::TAU * 11.0).sin();
+		10.0_f64.mul_add(wave_11, 30.0_f64.mul_add(wave_3, 50.0))
+	}
+
+	/// Evaluate the noise-free underlying signal at instant `t`, if this profile
+	/// has an analytic ground truth (i.e. it is [`DatasetSource::Generated`]).
+	///
+	/// Returns `None` for a [`DatasetSource::LineProtocol`] profile, whose
+	/// real-world input carries no known true signal to score against. `t` is
+	/// projected onto the same `[0, 1]` phase the generator uses (offset from
+	/// [`Self::start`] over the total `span`); instants outside `[start, end]` are
+	/// clamped into the span so a boundary grid point still yields a defined value.
+	#[must_use]
+	#[allow(clippy::cast_precision_loss)]
+	pub fn clean_signal_at(&self, t: DateTime<Utc>) -> Option<f64> {
+		if !matches!(self.source, DatasetSource::Generated) {
+			return None;
+		}
+		let span_ns = self.span.num_nanoseconds().unwrap_or(0).max(1);
+		let offset_ns = (t - self.start()).num_nanoseconds().unwrap_or(0).clamp(0, span_ns);
+		let phase = offset_ns as f64 / span_ns as f64;
+		Some(Self::clean_signal(phase))
+	}
+
 	/// Produce the profile's input series.
 	///
 	/// For a [`DatasetSource::Generated`] profile this regenerates the seeded,
@@ -254,13 +289,12 @@ impl InterpolationProfile {
 			let timestamp = start + Duration::nanoseconds(offset_ns);
 
 			// Smooth underlying signal so interpolation is meaningful, plus a
-			// little noise. Frequencies chosen to vary within the span.
+			// little noise. The clean signal is the shared analytic ground truth
+			// (see `clean_signal`) so accuracy scoring can never drift from it.
 			#[allow(clippy::cast_precision_loss)]
 			let phase = offset_ns as f64 / span_ns as f64;
-			let wave_3 = (phase * std::f64::consts::TAU * 3.0).sin();
-			let wave_11 = (phase * std::f64::consts::TAU * 11.0).sin();
 			let noise = rng.random_range(-2.0..2.0);
-			let signal = 10.0_f64.mul_add(wave_11, 30.0_f64.mul_add(wave_3, 50.0)) + noise;
+			let signal = Self::clean_signal(phase) + noise;
 			let value = BigDecimal::from_f64(signal).unwrap_or_else(|| BigDecimal::from(0));
 			points.push(Point { timestamp, value });
 		}
@@ -364,6 +398,27 @@ cpu,host=h0 usage=13.0 120\n";
 		let payload = "cpu,host=h0 usage=10.0 60\ncpu,host=h0 usage=12.0 60\n";
 		let err = InterpolationProfile::from_line_protocol("x", payload, "usage", TimestampPrecision::Seconds, Spline::Linear, Resolution::Minutes).expect_err("a zero-span series must be rejected");
 		assert_eq!(err, LineProtocolProfileError::ZeroSpan);
+	}
+
+	#[test]
+	fn clean_signal_at_is_defined_in_range_for_a_generated_profile() {
+		let profile = InterpolationProfile::interpolation_heavy_irregular();
+		let (start, end) = (profile.start(), profile.end());
+		// Endpoints and the midpoint must all yield a finite truth within [10, 90].
+		for t in [start, start + (end - start) / 2, end] {
+			let truth = profile.clean_signal_at(t).expect("generated profile has ground truth");
+			assert!(truth.is_finite(), "ground truth must be finite at {t}");
+			assert!((10.0..=90.0).contains(&truth), "signal must stay in [10, 90], got {truth} at {t}");
+		}
+		// Instants outside the span clamp into it rather than returning garbage.
+		assert_eq!(profile.clean_signal_at(start - Duration::days(1)), profile.clean_signal_at(start), "before-start clamps to start");
+		assert_eq!(profile.clean_signal_at(end + Duration::days(1)), profile.clean_signal_at(end), "after-end clamps to end");
+	}
+
+	#[test]
+	fn clean_signal_at_has_no_ground_truth_for_a_line_protocol_profile() {
+		let profile = InterpolationProfile::from_line_protocol("tsbs-cpu", SAMPLE_LP, "usage", TimestampPrecision::Seconds, Spline::Cubic, Resolution::Minutes).expect("valid payload builds a profile");
+		assert!(profile.clean_signal_at(profile.start()).is_none(), "real-world data carries no analytic ground truth");
 	}
 
 	#[test]
