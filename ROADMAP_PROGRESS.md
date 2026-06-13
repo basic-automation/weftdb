@@ -833,4 +833,4 @@ out-of-core module (the first *real-database* baseline; needs the `duckdb` crate
 `axum` server** with the ILP ingest endpoint. With the quality axis now proven,
 either advances the benchmark toward real competitor comparisons.
 
-**PR:** (opened at end of run — see below)
+**PR:** https://github.com/physics515/DSP/pull/13
