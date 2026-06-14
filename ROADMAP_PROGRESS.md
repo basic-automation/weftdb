@@ -834,3 +834,118 @@ out-of-core module (the first *real-database* baseline; needs the `duckdb` crate
 either advances the benchmark toward real competitor comparisons.
 
 **PR:** https://github.com/physics515/DSP/pull/13
+
+
+---
+
+## 2026-06-14 — DSP-Bench: signal-shape variety + HTML report + hardware capture (7 increments)
+
+A night extending DSP-Bench's quality/reporting axes, all in the `dsp-bench` leaf
+crate. The synthetic generator could only ever produce one signal shape, reports
+were JSON-only, and run metadata carried no hardware — three open items the prior
+log flagged. All three are now closed end-to-end.
+
+**Item:** Phase 1 / Track 1 — DSP-Bench; roadmap "Immediate next actions" #3
+(records the shape-selectable ground truth) and the benchmark-report template's
+hardware block. Picked these clean, no-large-dependency slices over the two big
+deferred items (external DuckDB native build · Phase-2 `axum` server) which the
+prior two runs flagged as too large/fragile to land as a bounded late-night slice.
+
+**Increment 1 — `SignalShape` enum** (commit `41e72ca`)
+- `profile.rs`: `SignalShape { MultiSine, Sawtooth, Step, DampedSine }` +
+  `evaluate(phase)`, each a deterministic, finite, `[10,90]`-bounded curve;
+  `signal_shape` field on `SyntheticParams` (Default = MultiSine) and
+  `InterpolationProfile`. Both generation and the analytic ground truth
+  (`clean_signal_at`) route through the selected shape so they can never drift.
+  Removed the private `clean_signal` fn. lib.rs/main.rs re-export; CLI kept the
+  default for now. Tests: +4 (range-bounded for all shapes; default is MultiSine;
+  step is piecewise-constant; changing shape changes the truth).
+
+**Increment 2 — `--shape` CLI flag** (commit `1375436`)
+- `main.rs`: `--shape multisine|sawtooth|step|dampedsine` (case/separator-
+  insensitive, short aliases) feeds `SyntheticParams.signal_shape`; inert in
+  line-protocol mode (no ground truth), matching the other synthetic knobs. Help
+  + 2 bin tests. Verified end-to-end: on `sawtooth` the linear baseline
+  out-accuracies DSP's cubic (overshoots the discontinuities) — honest, surfaced.
+
+**Increment 3 — record `signal_shape` in the artifact (schema v5)** (commit `b3effa8`)
+- The `--shape` knob had opened a reproducibility gap. `profile.rs`: derive
+  serde on `SignalShape` (lowercase tokens) + `ground_truth_shape()` (Some for
+  generated, None for line-protocol). `schema.rs`: `DatasetMeta.signal_shape:
+  Option<SignalShape>`, SCHEMA_VERSION 4→5, serde default+skip. `lib.rs` records
+  it; `main.rs` prints it. Tests: +4 (v4 artifact still parses; round-trips
+  lowercase; omitted when absent; ground_truth_shape Some/None).
+
+**Increment 5 — end-to-end shape-sweep test** (commit `86e6879`)
+- `lib.rs`: drives `run_profile` through every shape, asserting the artifact
+  records the shape, correctness passes, and accuracy is present + finite. +1.
+
+**Increment 4 — docs** (commit `04e680b`)
+- `dsp-bench/README.md` + `ROADMAP.md` #3: record the shape-selectable ground
+  truth, `--shape`, schema-v5 `dataset.signal_shape`, and the per-shape honesty
+  finding (cubic leads on multisine/step, linear wins on sawtooth). (Committed
+  before increment 5; listed here in feature order.)
+
+**Increment 6 — self-contained HTML report (`--html`)** (commit `e7047fb`)
+- `report.rs`: `BenchReport::to_html()` renders a full HTML document (inline CSS,
+  no external assets/scripts) — one table row per system (shape, latency
+  percentiles, throughput, correctness, accuracy), most-accurate row highlighted;
+  all caller strings `escape_html`'d. `write_html()` + `default_html_filename`
+  mirror the JSON path. `main.rs`: `--html` writes it beside the JSON. README
+  updated. Tests: +5 lib +1 bin (filename mirror; document structure; exactly-one
+  best row / none without accuracy; HTML-escaping; disk round-trip; flag parse).
+
+**Increment 7 — CPU/RAM hardware capture in run metadata** (commit `3a18f42`)
+- `report.rs`: `RunMetadata` gains `cpu_model`, `cpu_cores_physical`,
+  `cpu_cores_logical`, `total_memory_bytes` (all Option, serde default+skip).
+  `capture()` probes via `sysinfo` (already a workspace dep — no new lockfile
+  packages) using a *targeted* refresh (`new()` + `refresh_memory` +
+  `refresh_cpu_all`), NOT `new_all()`: `new_all` enumerates every process and
+  OOM'd the test run on this host (a 16 GiB allocation) — the lighter probe is
+  also more correct for CPU+memory-only needs. HTML renders a hardware meta line;
+  the CLI summary prints the CPU model. Cargo.toml + Cargo.lock (sysinfo edge).
+  Tests: +2 (probe self-consistency: positive counts, logical >= physical, a host
+  reports cores+RAM; HTML surfaces the hardware).
+
+**Build/test/clippy (real, nightly `rustc 1.98.0-nightly`):**
+- `cargo build --workspace` — GREEN (confirmed at baseline and again at end).
+- `cargo test -p dsp-bench` — **91 lib + 20 bin + 0 doc, all pass** (was 75 lib +
+  17 bin at the start of the night; +16 lib, +3 bin).
+- `cargo clippy -p dsp-bench --all-targets` — **0 dsp-bench warnings** under
+  `#![warn(clippy::pedantic, clippy::nursery, clippy::all)]`; every lint
+  introduced (trailing-comma, cast, etc.) was fixed structurally, never with
+  `#[allow]` beyond the file's existing cast allows. The 4 pre-existing `splimes`
+  `sort_by_key` warnings in untouched files remain (logged before).
+- `cargo fmt -p dsp-bench --check` — clean.
+- Real end-to-end runs verified per increment (`--shape step`/`sawtooth`,
+  `--html`, hardware capture); all exit 0 with passing correctness gates.
+- Scope note: tests scoped to `-p dsp-bench` — the change is confined to the
+  `dsp-bench` leaf crate (no other workspace member depends on it) and the full
+  workspace **build** is green. Did not run the full (heavy wgpu/GPU/turso)
+  `cargo test --workspace` to stay in the night's budget.
+
+**Done vs open:** DONE — the synthetic generator is now shape-selectable across
+four analytic curves, each recorded in the artifact (schema v5) for exact
+regeneration and surfaced through `--shape`; reports render to a self-contained
+HTML view (`--html`) beside the JSON; run metadata captures CPU model / core
+counts / total RAM. OPEN — the external-engine **DuckDB adapter** (real-database
+baseline); ClickHouse/InfluxDB 3/QuestDB/TimescaleDB adapters; the Phase-2
+server-side ILP ingest **endpoint** (`axum`); the **Parquet** report format; the
+rest of the hardware block (disk, GPU, driver versions); the standalone
+methodology document (#10).
+
+**STOP REASON:** no workable next slice that fits as another clean bounded
+increment on this PR. The seven increments completed a coherent arc (shape
+variety + HTML + hardware capture, well above the 2–4 bar); the remaining
+top-priority roadmap items each require a large new dependency tree (`axum` →
+hyper/tower, absent from the workspace) or a fragile native build (`duckdb`
+bundled lib on Windows) — both deferred by the prior two runs — and starting one
+half-built would pull two unrelated concerns onto this PR and risk the build.
+
+**Next step (tomorrow):** start the **Phase-2 `axum` server** as its own new
+workspace member (`dsp-server`), first slice = server skeleton + `/health` +
+`/ready` returning JSON, compiles + 1 test, wired into the root `Cargo.toml`
+(adds the axum dependency tree deliberately, as its own increment) — then the ILP
+ingest endpoint next; OR the **DuckDB external-engine adapter** as its own
+out-of-core module (budget a clean Windows bundled build). Either advances the
+benchmark toward real competitor comparisons / a public API.
