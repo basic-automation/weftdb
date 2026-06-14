@@ -612,12 +612,17 @@ redistributed. *For commercial trust, be more transparent than competitors.*
    now compared on **quality, not only speed**: `dsp-bench/src/accuracy.rs`
    (`AccuracyMetrics`: RMSE/MAE/max-error/bias) scores each reconstruction against
    the synthetic profile's **known analytic ground truth** (fair-protocol Phase
-   1.2 / Phase 6.4), carried as `BenchResult.accuracy` (schema v4) and surfaced by
-   the new CLI `--synthetic` mode (with `--seed`/`--points`/`--missingness`/
-   `--jitter`/`--noise` knobs). First honest finding it exposes: on the
-   high-frequency flagship signal the portable linear baseline out-accuracies
-   DSP's cubic spline near block gaps — surfaced, not hidden. The external-engine
-   DuckDB adapter — a real database baseline — is still to do.)*
+   1.2 / Phase 6.4), carried as `BenchResult.accuracy` and surfaced by
+   the CLI `--synthetic` mode (with `--seed`/`--points`/`--missingness`/
+   `--jitter`/`--noise`/`--shape` knobs). The synthetic ground truth is now
+   **shape-selectable** — `SignalShape::{MultiSine, Sawtooth, Step, DampedSine}`
+   (`dsp-bench/src/profile.rs`), each recorded in the artifact (schema v5:
+   `dataset.signal_shape`) so a result regenerates exactly from seed + knobs +
+   shape. Honest findings it exposes depend on the shape: on the smooth
+   high-frequency `multisine` (and on `step`) DSP's cubic spline leads on RMSE,
+   but on the `sawtooth` the portable linear baseline out-accuracies the cubic
+   (which overshoots the sharp discontinuities) — surfaced, not hidden. The
+   external-engine DuckDB adapter — a real database baseline — is still to do.)*
 4. Add ClickHouse, InfluxDB 3, QuestDB, TimescaleDB adapters.
 5. 🟡 Implement InfluxDB Line Protocol ingest. *(ILP **format parser** landed in
    `dsp-bench/src/line_protocol.rs`: `parse` → `LineRecord`s and `parse_points`

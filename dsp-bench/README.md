@@ -16,7 +16,11 @@ This is the initial scaffold. What exists today:
 - **Workload profile + dataset generator** (`src/profile.rs`) — the flagship
   `interpolation-heavy-irregular` profile generates a seeded, irregularly-spaced,
   gap-containing series over a fixed time span (`ChaCha8Rng`, published seed →
-  byte-for-byte reproducible).
+  byte-for-byte reproducible). The noise-free underlying signal is selectable via
+  `SignalShape` (`MultiSine`, `Sawtooth`, `Step`, `DampedSine`) — each a
+  deterministic, `[10, 90]`-bounded analytic curve that doubles as the accuracy
+  ground truth — so reconstruction quality can be probed across smooth vs.
+  sharp-discontinuity signals, not just one shape.
 - **Vendor-neutral adapter trait** (`src/adapter.rs`) — every benchmarked system
   is driven through `SystemAdapter`; concrete adapters stay decoupled from the
   harness core, mirroring the roadmap's connector hard-constraint.
@@ -89,8 +93,8 @@ This is the initial scaffold. What exists today:
 - **Command-line runner** (`src/main.rs`, binary `dsp-bench`) — two input modes:
   read a `.lp` / TSBS file and project a chosen numeric field, **or** `--synthetic`
   to drive the seeded generator (knobs: `--seed`, `--points`, `--missingness`,
-  `--jitter`, `--noise`). Only the synthetic mode has a known ground truth, so
-  only it reports accuracy. Writes a `BenchReport` JSON artifact to
+  `--jitter`, `--noise`, `--shape`). Only the synthetic mode has a known ground
+  truth, so only it reports accuracy. Writes a `BenchReport` JSON artifact to
   `reports/json/`. Pure hand-rolled arg parsing (no `clap`); exits non-zero when
   the correctness gate fails so a scripted caller can gate on it.
 
@@ -149,14 +153,20 @@ max-error / bias) for every system — the only mode that can:
 
 ```sh
 cargo run -p dsp-bench -- \
-    --synthetic --points 300 --noise 0 \
+    --synthetic --points 300 --noise 0 --shape sawtooth \
     --spline cubic --resolution minutes --reps 5 --compare
 ```
 
 `--noise 0` puts every sample exactly on the ground truth, isolating each
-method's own reconstruction error; raise it to probe robustness. The run prints
-an `accuracy : rmse=.. mae=.. max=.. bias=..` line per adapter and the metrics
-land in the JSON artifact (schema v4). Honesty note: on the high-frequency
-flagship signal the portable linear baseline often *out-accuracies* DSP's cubic
-spline (which overshoots near block gaps) — DSP-Bench surfaces that rather than
-hiding it.
+method's own reconstruction error; raise it to probe robustness. `--shape`
+(`multisine` | `sawtooth` | `step` | `dampedsine`) selects the analytic
+ground-truth curve, which is recorded in the artifact (schema v5) so the dataset
+regenerates exactly from seed + knobs + shape. The run prints a `signal shape`
+line, an `accuracy : rmse=.. mae=.. max=.. bias=..` line per adapter, and the
+metrics land in the JSON artifact.
+
+Honesty note: the winner depends on the shape, and DSP-Bench surfaces that rather
+than hiding it. On the smooth high-frequency `multisine` (and on `step`) DSP's
+cubic spline leads on RMSE, but on the `sawtooth` the portable linear baseline
+*out-accuracies* the cubic — the cubic overshoots the sharp discontinuities — so
+the "most accurate" line names linear, not DSP.
