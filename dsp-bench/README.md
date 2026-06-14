@@ -105,9 +105,9 @@ TimescaleDB) — the portable linear and forward-fill baselines above are the fi
 *non-DSP* systems, but they run in-process rather than against a real database. The
 Phase-2 server-side ILP *ingest endpoint* (the file/CLI ingest path exists; an
 `axum` HTTP endpoint is next), additional workloads (range fetch, downsample,
-compression, …), dataset corpora, the richer report formats (Parquet/HTML) and
-full hardware capture (CPU model, RAM, GPU, drivers) in run metadata, and the
-methodology document.
+compression, …), dataset corpora, the remaining richer report format (Parquet —
+an **HTML** report already ships, see `--html` below) and full hardware capture
+(CPU model, RAM, GPU, drivers) in run metadata, and the methodology document.
 
 ## Run
 
@@ -144,6 +144,12 @@ cargo run -p dsp-bench -- \
 The artifact name tags every adapter, e.g.
 `reports/json/<profile>__dsp+baseline-linear+baseline-forward-fill.json`, and the
 process still exits non-zero if *any* result's correctness gate fails.
+
+Add `--html` to also write a self-contained, dependency-free HTML report
+(`<profile>__<adapters>.html`) beside the JSON — one table of every system's
+latency percentiles, throughput, correctness, and (for synthetic runs) accuracy,
+with the most-accurate row highlighted. A human-readable view of the same numbers
+the JSON carries, with no external assets.
 
 ### Quality comparison (synthetic mode)
 
