@@ -13,6 +13,7 @@ use bigdecimal::{BigDecimal, FromPrimitive};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use serde::{Deserialize, Serialize};
 use splimes::{Point, Resolution, Spline};
 
 use crate::line_protocol::{parse_points, ParseError, TimestampPrecision};
@@ -87,6 +88,76 @@ impl From<ParseError> for LineProtocolProfileError {
 	}
 }
 
+/// The analytic shape of the synthetic generator's noise-free underlying signal.
+///
+/// Every shape is a deterministic function of a fractional `phase` in `[0, 1]`
+/// across the series span, bounded to `[10, 90]`, so an accuracy benchmark always
+/// has a known ground truth in a fixed range regardless of shape. The shapes
+/// stress reconstruction methods differently, which is exactly what makes them
+/// worth varying: a smooth [`SignalShape::MultiSine`] favors a cubic spline; a
+/// [`SignalShape::Sawtooth`] or [`SignalShape::Step`] has sharp discontinuities
+/// that punish a cubic's overshoot and play to forward-fill's strength near the
+/// jump; a [`SignalShape::DampedSine`] mixes a decaying smooth oscillation. The
+/// research foundation calls for benchmarking interpolation *quality* (extrema
+/// preservation, behavior near block missingness) across diverse signals, not
+/// only speed on one curve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SignalShape {
+	/// The flagship signal: a sum of two sinusoids (3 and 11 cycles), `50 ± 40`.
+	#[default]
+	MultiSine,
+	/// A periodic rising ramp that resets sharply — five ramps across the span,
+	/// each a discontinuity a smooth spline cannot follow without overshoot.
+	Sawtooth,
+	/// A periodic square wave alternating between two levels (`20`/`80`) — the
+	/// piecewise-constant shape forward-fill reconstructs exactly between edges.
+	Step,
+	/// A decaying oscillation: a six-cycle sine whose `±40` amplitude shrinks
+	/// across the span toward the `50` midline.
+	DampedSine,
+}
+
+impl SignalShape {
+	/// Evaluate the shape's noise-free value at fractional `phase` in `[0, 1]`.
+	///
+	/// The result is always finite and within `[10, 90]` for any `phase` in range.
+	#[must_use]
+	pub fn evaluate(self, phase: f64) -> f64 {
+		use std::f64::consts::TAU;
+		match self {
+			Self::MultiSine => {
+				let wave_3 = (phase * TAU * 3.0).sin();
+				let wave_11 = (phase * TAU * 11.0).sin();
+				10.0_f64.mul_add(wave_11, 30.0_f64.mul_add(wave_3, 50.0))
+			}
+			Self::Sawtooth => {
+				// Five rising ramps over the span; `fract` resets each sharply.
+				let frac = (phase * 5.0).fract();
+				80.0_f64.mul_add(frac, 10.0)
+			}
+			Self::Step => {
+				// Six half-periods alternating 20/80 with sharp edges. `phase` is
+				// in `[0, 1]`, so `phase * 6.0` is in `[0, 6]` and the cast cannot
+				// wrap; truncation toward zero equals `floor` for a non-negative.
+				#[allow(clippy::cast_possible_truncation)]
+				let half = (phase * 6.0) as i64;
+				if half % 2 == 0 {
+					20.0
+				} else {
+					80.0
+				}
+			}
+			Self::DampedSine => {
+				// A six-cycle sine whose ±40 amplitude decays toward ±5 by span end.
+				let decay = (-2.0 * phase).exp();
+				let wave = (phase * TAU * 6.0).sin();
+				(40.0 * decay).mul_add(wave, 50.0)
+			}
+		}
+	}
+}
+
 /// The tunable knobs for a synthetic interpolation profile (everything except the
 /// human-readable name).
 ///
@@ -106,6 +177,8 @@ pub struct SyntheticParams {
 	pub jitter_fraction: f64,
 	/// Additive sample-noise amplitude (`±`); `0.0` puts samples on the ground truth.
 	pub noise_amplitude: f64,
+	/// Analytic shape of the noise-free underlying signal (the ground truth).
+	pub signal_shape: SignalShape,
 	/// Spline method requested of the adapter.
 	pub spline: Spline,
 	/// Output grid resolution requested of the adapter.
@@ -114,9 +187,10 @@ pub struct SyntheticParams {
 
 impl Default for SyntheticParams {
 	/// The flagship `interpolation-heavy-irregular` knob set: 480 irregular samples
-	/// over a day, 20% gaps, 0.6 jitter, ±2.0 noise, per-minute cubic reconstruction.
+	/// over a day, 20% gaps, 0.6 jitter, ±2.0 noise, a multi-sine signal, per-minute
+	/// cubic reconstruction.
 	fn default() -> Self {
-		Self { seed: DEFAULT_SEED, input_points: 480, missingness_fraction: 0.20, jitter_fraction: 0.6, noise_amplitude: DEFAULT_NOISE_AMPLITUDE, spline: Spline::Cubic, resolution: Resolution::Minutes }
+		Self { seed: DEFAULT_SEED, input_points: 480, missingness_fraction: 0.20, jitter_fraction: 0.6, noise_amplitude: DEFAULT_NOISE_AMPLITUDE, signal_shape: SignalShape::MultiSine, spline: Spline::Cubic, resolution: Resolution::Minutes }
 	}
 }
 
@@ -143,6 +217,10 @@ pub struct InterpolationProfile {
 	/// makes every sample lie exactly on the analytic ground truth, isolating the
 	/// reconstruction method's own error from measurement noise.
 	pub noise_amplitude: f64,
+	/// Analytic shape of the noise-free underlying signal. Selects the ground truth
+	/// the generator samples and an accuracy benchmark scores against. Unused for a
+	/// [`DatasetSource::LineProtocol`] profile, which carries no analytic truth.
+	pub signal_shape: SignalShape,
 	/// Total span of the series.
 	pub span: Duration,
 	/// Spline method requested of the adapter.
@@ -175,8 +253,8 @@ impl InterpolationProfile {
 	/// signal (and thus a known analytic ground truth for accuracy scoring).
 	#[must_use]
 	pub fn synthetic(name: impl Into<String>, params: SyntheticParams) -> Self {
-		let SyntheticParams { seed, input_points, missingness_fraction, jitter_fraction, noise_amplitude, spline, resolution } = params;
-		Self { name: name.into(), seed, input_points, missingness_fraction, jitter_fraction, noise_amplitude, span: Duration::days(1), spline, resolution, source: DatasetSource::Generated }
+		let SyntheticParams { seed, input_points, missingness_fraction, jitter_fraction, noise_amplitude, signal_shape, spline, resolution } = params;
+		Self { name: name.into(), seed, input_points, missingness_fraction, jitter_fraction, noise_amplitude, signal_shape, span: Duration::days(1), spline, resolution, source: DatasetSource::Generated }
 	}
 
 	/// Build a profile whose input series is parsed from an `InfluxDB`
@@ -208,7 +286,7 @@ impl InterpolationProfile {
 		if first >= last {
 			return Err(LineProtocolProfileError::ZeroSpan);
 		}
-		Ok(Self { name: name.into(), seed: 0, input_points: points.len(), missingness_fraction: 0.0, jitter_fraction: 0.0, noise_amplitude: 0.0, span: last - first, spline, resolution, source: DatasetSource::LineProtocol { points } })
+		Ok(Self { name: name.into(), seed: 0, input_points: points.len(), missingness_fraction: 0.0, jitter_fraction: 0.0, noise_amplitude: 0.0, signal_shape: SignalShape::default(), span: last - first, spline, resolution, source: DatasetSource::LineProtocol { points } })
 	}
 
 	/// Start instant of the series.
@@ -254,19 +332,13 @@ impl InterpolationProfile {
 		Utc.timestamp_opt(EPOCH_ANCHOR_SECS, 0).single().expect("valid fixed epoch anchor")
 	}
 
-	/// The noise-free underlying signal of the synthetic generator, evaluated at a
-	/// fractional `phase` in `[0, 1]` across the series span.
-	///
-	/// This is the analytic *ground truth*: [`Self::generate_synthetic`] samples
-	/// exactly this signal (plus bounded noise) at irregular instants, so an
-	/// accuracy benchmark can score how well a reconstruction recovers the true
-	/// shape. Defined once here so generation and ground truth can never drift
-	/// apart. Range is `50 ± 40` (`[10, 90]`).
+	/// The analytic ground-truth shape this profile's synthetic data was generated
+	/// from, or `None` for a [`DatasetSource::LineProtocol`] source (which carries
+	/// no synthetic shape). Mirrors [`Self::clean_signal_at`]'s `None`-for-real-data
+	/// contract and is what the result schema records for reproducibility.
 	#[must_use]
-	fn clean_signal(phase: f64) -> f64 {
-		let wave_3 = (phase * std::f64::consts::TAU * 3.0).sin();
-		let wave_11 = (phase * std::f64::consts::TAU * 11.0).sin();
-		10.0_f64.mul_add(wave_11, 30.0_f64.mul_add(wave_3, 50.0))
+	pub fn ground_truth_shape(&self) -> Option<SignalShape> {
+		matches!(self.source, DatasetSource::Generated).then_some(self.signal_shape)
 	}
 
 	/// Evaluate the noise-free underlying signal at instant `t`, if this profile
@@ -286,7 +358,7 @@ impl InterpolationProfile {
 		let span_ns = self.span.num_nanoseconds().unwrap_or(0).max(1);
 		let offset_ns = (t - self.start()).num_nanoseconds().unwrap_or(0).clamp(0, span_ns);
 		let phase = offset_ns as f64 / span_ns as f64;
-		Some(Self::clean_signal(phase))
+		Some(self.signal_shape.evaluate(phase))
 	}
 
 	/// Produce the profile's input series.
@@ -341,16 +413,17 @@ impl InterpolationProfile {
 			let offset_ns = (base_offset + jitter).clamp(0, span_ns);
 			let timestamp = start + Duration::nanoseconds(offset_ns);
 
-			// Smooth underlying signal so interpolation is meaningful, plus a
-			// little noise. The clean signal is the shared analytic ground truth
-			// (see `clean_signal`) so accuracy scoring can never drift from it.
+			// Underlying signal so interpolation is meaningful, plus a little noise.
+			// The signal is the shared analytic ground truth (see [`SignalShape`])
+			// evaluated through `self.signal_shape`, so accuracy scoring can never
+			// drift from what was generated.
 			#[allow(clippy::cast_precision_loss)]
 			let phase = offset_ns as f64 / span_ns as f64;
 			// A zero (or negative) amplitude means a noise-free sample sitting
 			// exactly on the analytic ground truth; `random_range` requires a
 			// non-empty range, so guard the degenerate case explicitly.
 			let noise = if self.noise_amplitude > 0.0 { rng.random_range(-self.noise_amplitude..=self.noise_amplitude) } else { 0.0 };
-			let signal = Self::clean_signal(phase) + noise;
+			let signal = self.signal_shape.evaluate(phase) + noise;
 			let value = BigDecimal::from_f64(signal).unwrap_or_else(|| BigDecimal::from(0));
 			points.push(Point { timestamp, value });
 		}
@@ -477,7 +550,7 @@ cpu,host=h0 usage=13.0 120\n";
 		// No noise: every generated sample's value must equal the analytic ground
 		// truth at its own (jittered) timestamp, so the only reconstruction error a
 		// benchmark sees is the method's own — not measurement noise.
-		let profile = InterpolationProfile::synthetic("clean", SyntheticParams { seed: 7, input_points: 100, missingness_fraction: 0.0, jitter_fraction: 0.5, noise_amplitude: 0.0, spline: Spline::Cubic, resolution: Resolution::Minutes });
+		let profile = InterpolationProfile::synthetic("clean", SyntheticParams { seed: 7, input_points: 100, missingness_fraction: 0.0, jitter_fraction: 0.5, noise_amplitude: 0.0, signal_shape: SignalShape::MultiSine, spline: Spline::Cubic, resolution: Resolution::Minutes });
 		let points = profile.generate();
 		assert!(points.len() >= 2);
 		for p in &points {
@@ -491,6 +564,58 @@ cpu,host=h0 usage=13.0 120\n";
 	fn clean_signal_at_has_no_ground_truth_for_a_line_protocol_profile() {
 		let profile = InterpolationProfile::from_line_protocol("tsbs-cpu", SAMPLE_LP, "usage", TimestampPrecision::Seconds, Spline::Cubic, Resolution::Minutes).expect("valid payload builds a profile");
 		assert!(profile.clean_signal_at(profile.start()).is_none(), "real-world data carries no analytic ground truth");
+	}
+
+	#[test]
+	fn every_signal_shape_stays_finite_and_in_range() {
+		// All four shapes must be bounded to [10, 90] across the whole phase domain
+		// so an accuracy benchmark has a known-range ground truth regardless of shape.
+		for shape in [SignalShape::MultiSine, SignalShape::Sawtooth, SignalShape::Step, SignalShape::DampedSine] {
+			for i in 0..=1000 {
+				let phase = f64::from(i) / 1000.0;
+				let v = shape.evaluate(phase);
+				assert!(v.is_finite() && (10.0..=90.0).contains(&v), "{shape:?} out of range at phase {phase}: {v}");
+			}
+		}
+	}
+
+	#[test]
+	fn the_default_shape_is_multi_sine_and_drives_the_flagship() {
+		assert_eq!(SignalShape::default(), SignalShape::MultiSine);
+		let flagship = InterpolationProfile::interpolation_heavy_irregular();
+		assert_eq!(flagship.signal_shape, SignalShape::MultiSine, "the flagship profile keeps the multi-sine signal");
+	}
+
+	#[test]
+	fn step_is_piecewise_constant_at_two_levels() {
+		// The step shape only ever takes its two levels, never a value between —
+		// the property that makes forward-fill reconstruct it exactly between edges.
+		for i in 0..=1000 {
+			let v = SignalShape::Step.evaluate(f64::from(i) / 1000.0);
+			assert!((v - 20.0).abs() < 1e-9 || (v - 80.0).abs() < 1e-9, "step must be 20 or 80, got {v}");
+		}
+	}
+
+	#[test]
+	fn changing_the_shape_changes_the_ground_truth() {
+		// Two profiles identical but for the signal shape must produce different
+		// ground-truth midpoints, proving the knob actually reaches generation.
+		let base = SyntheticParams { signal_shape: SignalShape::MultiSine, ..Default::default() };
+		let sawtooth = SyntheticParams { signal_shape: SignalShape::Sawtooth, ..base };
+		let p_sine = InterpolationProfile::synthetic("sine", base);
+		let p_saw = InterpolationProfile::synthetic("saw", sawtooth);
+		let mid = p_sine.start() + p_sine.span / 4; // a quarter in, where the shapes differ
+		let a = p_sine.clean_signal_at(mid).expect("ground truth");
+		let b = p_saw.clean_signal_at(mid).expect("ground truth");
+		assert!((a - b).abs() > 1e-6, "different shapes must yield different truth, got {a} vs {b}");
+	}
+
+	#[test]
+	fn ground_truth_shape_is_some_for_synthetic_and_none_for_line_protocol() {
+		let saw = InterpolationProfile::synthetic("saw", SyntheticParams { signal_shape: SignalShape::Sawtooth, ..Default::default() });
+		assert_eq!(saw.ground_truth_shape(), Some(SignalShape::Sawtooth), "a synthetic profile reports its shape");
+		let lp = InterpolationProfile::from_line_protocol("tsbs-cpu", SAMPLE_LP, "usage", TimestampPrecision::Seconds, Spline::Cubic, Resolution::Minutes).expect("valid payload");
+		assert_eq!(lp.ground_truth_shape(), None, "real-world data has no synthetic shape");
 	}
 
 	#[test]

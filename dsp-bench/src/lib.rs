@@ -58,7 +58,7 @@ use bigdecimal::ToPrimitive;
 use splimes::generate_target_times;
 
 pub use crate::{
-	accuracy::{synthetic_ground_truth, AccuracyError, AccuracyMetrics}, adapter::SystemAdapter, baseline_adapter::BaselineLinearAdapter, dsp_adapter::DspAdapter, forward_fill_adapter::ForwardFillAdapter, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError, SyntheticParams}, report::{BenchReport, RunMetadata}, schema::{BenchResult, CorrectnessReport, DatasetMeta, TimingBreakdown, SCHEMA_VERSION}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}
+	accuracy::{synthetic_ground_truth, AccuracyError, AccuracyMetrics}, adapter::SystemAdapter, baseline_adapter::BaselineLinearAdapter, dsp_adapter::DspAdapter, forward_fill_adapter::ForwardFillAdapter, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError, SignalShape, SyntheticParams}, report::{BenchReport, RunMetadata}, schema::{BenchResult, CorrectnessReport, DatasetMeta, TimingBreakdown, SCHEMA_VERSION}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}
 };
 
 /// Workload class label recorded for the interpolation profile.
@@ -141,7 +141,7 @@ pub async fn run_profile<A: SystemAdapter + ?Sized>(adapter: &A, profile: &Inter
 		0.0
 	};
 
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: adapter.name().to_string(), workload: WORKLOAD_UPSAMPLE_INTERPOLATE.to_string(), reps, dataset: DatasetMeta { input_points, output_points: actual_output_points, irregular: true, missingness_fraction: profile.missingness_fraction, seed: profile.seed }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: adapter.name().to_string(), workload: WORKLOAD_UPSAMPLE_INTERPOLATE.to_string(), reps, dataset: DatasetMeta { input_points, output_points: actual_output_points, irregular: true, missingness_fraction: profile.missingness_fraction, seed: profile.seed, signal_shape: profile.ground_truth_shape() }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy })
 }
 
 /// Measure reconstruction *accuracy*: run `adapter` once over `profile` and score
@@ -356,6 +356,23 @@ cpu,host=h0 usage=14.0 600\n";
 		let profile = InterpolationProfile::from_line_protocol("tsbs-cpu", payload, "usage", TimestampPrecision::Seconds, splimes::Spline::Cubic, splimes::Resolution::Minutes).expect("valid payload");
 		let err = measure_accuracy(&DspAdapter::new(), &profile).await.expect_err("no ground truth must error");
 		assert!(err.downcast_ref::<AccuracyError>().is_some_and(|e| *e == AccuracyError::NoGroundTruth), "expected NoGroundTruth, got {err:?}");
+	}
+
+	#[tokio::test]
+	async fn run_profile_records_the_signal_shape_and_accuracy_for_every_shape() {
+		// The full runner must thread each selectable ground-truth shape through to
+		// the artifact (`dataset.signal_shape`) and still score accuracy against it.
+		// This locks the end-to-end path the unit tests only cover piecewise.
+		for shape in [SignalShape::MultiSine, SignalShape::Sawtooth, SignalShape::Step, SignalShape::DampedSine] {
+			let profile = InterpolationProfile::synthetic("shape-sweep", SyntheticParams { signal_shape: shape, noise_amplitude: 0.0, ..SyntheticParams::default() });
+			let result = run_profile(&DspAdapter::new(), &profile, 3).await.expect("run completes");
+
+			assert_eq!(result.dataset.signal_shape, Some(shape), "the artifact must record the generated shape");
+			assert!(result.correctness.passed(), "{shape:?}: correctness must pass: {:?}", result.correctness);
+			let accuracy = result.accuracy.expect("a synthetic run carries accuracy");
+			assert!(accuracy.rmse.is_finite() && accuracy.mae.is_finite() && accuracy.max_abs_error.is_finite() && accuracy.bias.is_finite(), "{shape:?}: accuracy metrics must be finite: {accuracy:?}");
+			assert!(accuracy.count > 0, "{shape:?}: accuracy must score the grid");
+		}
 	}
 
 	#[tokio::test]

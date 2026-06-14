@@ -15,16 +15,18 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-	accuracy::AccuracyMetrics, stats::{LatencyCis, LatencyStats}
+	accuracy::AccuracyMetrics, profile::SignalShape, stats::{LatencyCis, LatencyStats}
 };
 
 /// Version of the result schema. Bump on any breaking field change.
 ///
 /// v2 added the optional `latency_ci` field (bootstrap confidence intervals).
 /// v3 added the `timing` field (end-to-end span breakdown). v4 added the optional
-/// `accuracy` field (reconstruction-quality metrics vs a known ground truth). All
-/// three are `#[serde(default)]`, so older artifacts still deserialize.
-pub const SCHEMA_VERSION: u32 = 4;
+/// `accuracy` field (reconstruction-quality metrics vs a known ground truth). v5
+/// added the optional `dataset.signal_shape` field (which synthetic ground-truth
+/// curve was generated). All are `#[serde(default)]`, so older artifacts still
+/// deserialize.
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Metadata describing the dataset a result was measured against.
 ///
@@ -42,6 +44,13 @@ pub struct DatasetMeta {
 	pub missingness_fraction: f64,
 	/// Seed used to generate the dataset (publishable for reproducibility).
 	pub seed: u64,
+	/// Analytic ground-truth signal shape, for a synthetic dataset. Completes the
+	/// reproducibility tuple (seed + knobs + shape regenerate the data exactly).
+	/// `None` for a line-protocol source (no synthetic shape) and for pre-v5
+	/// artifacts; `#[serde(default)]` + `skip_serializing_if` keep those parsing
+	/// and omit the key when absent.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub signal_shape: Option<SignalShape>,
 }
 
 /// Correctness verdict for a run. A number is only publishable when correctness
@@ -155,7 +164,7 @@ mod tests {
 
 	fn sample_result() -> BenchResult {
 		let samples = [100, 200, 300];
-		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "dsp".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7 }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true }, accuracy: Some(AccuracyMetrics { count: 1000, rmse: 1.5, mae: 1.1, max_abs_error: 4.2, bias: -0.3 }) }
+		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "dsp".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: Some(SignalShape::MultiSine) }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true }, accuracy: Some(AccuracyMetrics { count: 1000, rmse: 1.5, mae: 1.1, max_abs_error: 4.2, bias: -0.3 }) }
 	}
 
 	#[test]
@@ -230,6 +239,47 @@ mod tests {
 		assert!(parsed.accuracy.is_none(), "a pre-v4 artifact carries no accuracy");
 		assert_eq!(parsed.schema_version, 2);
 		assert!(parsed.is_publishable());
+	}
+
+	#[test]
+	fn v4_artifact_without_signal_shape_still_deserializes() {
+		// A v4 artifact carries accuracy but no `dataset.signal_shape`; serde's
+		// default must fill `None` rather than failing the parse.
+		let v4 = r#"{
+			"schema_version": 4,
+			"profile": "interpolation-heavy-irregular",
+			"adapter": "dsp",
+			"workload": "upsample_interpolate",
+			"reps": 3,
+			"dataset": { "input_points": 200, "output_points": 1000, "irregular": true, "missingness_fraction": 0.2, "seed": 7 },
+			"latency": { "count": 3, "min_ns": 100, "max_ns": 300, "mean_ns": 200, "stddev_ns": 82, "p50_ns": 200, "p95_ns": 300, "p99_ns": 300 },
+			"throughput_points_per_sec": 5000000.0,
+			"correctness": { "output_count_ok": true, "expected_output_points": 1000, "actual_output_points": 1000, "values_finite": true }
+		}"#;
+		let parsed: BenchResult = serde_json::from_str(v4).expect("v4 artifact must still parse");
+		assert!(parsed.dataset.signal_shape.is_none(), "a pre-v5 artifact carries no signal shape");
+		assert!(parsed.is_publishable());
+	}
+
+	#[test]
+	fn signal_shape_round_trips_and_serializes_lowercase() {
+		// The recorded shape must survive a JSON round-trip and serialize as its
+		// stable lowercase token (matching the CLI), not the variant name.
+		let result = sample_result();
+		let json = serde_json::to_string(&result).expect("serialize");
+		assert!(json.contains("\"signal_shape\":\"multisine\""), "shape must serialize lowercase, got: {json}");
+		let back: BenchResult = serde_json::from_str(&json).expect("deserialize");
+		assert_eq!(back.dataset.signal_shape, Some(SignalShape::MultiSine));
+	}
+
+	#[test]
+	fn signal_shape_is_omitted_from_json_when_absent() {
+		// A line-protocol-sourced dataset has no synthetic shape; the key must be
+		// omitted entirely rather than emitted as `null`.
+		let mut result = sample_result();
+		result.dataset.signal_shape = None;
+		let json = serde_json::to_string(&result).expect("serialize");
+		assert!(!json.contains("signal_shape"), "absent shape must be omitted, got: {json}");
 	}
 
 	#[test]

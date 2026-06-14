@@ -16,7 +16,11 @@ This is the initial scaffold. What exists today:
 - **Workload profile + dataset generator** (`src/profile.rs`) — the flagship
   `interpolation-heavy-irregular` profile generates a seeded, irregularly-spaced,
   gap-containing series over a fixed time span (`ChaCha8Rng`, published seed →
-  byte-for-byte reproducible).
+  byte-for-byte reproducible). The noise-free underlying signal is selectable via
+  `SignalShape` (`MultiSine`, `Sawtooth`, `Step`, `DampedSine`) — each a
+  deterministic, `[10, 90]`-bounded analytic curve that doubles as the accuracy
+  ground truth — so reconstruction quality can be probed across smooth vs.
+  sharp-discontinuity signals, not just one shape.
 - **Vendor-neutral adapter trait** (`src/adapter.rs`) — every benchmarked system
   is driven through `SystemAdapter`; concrete adapters stay decoupled from the
   harness core, mirroring the roadmap's connector hard-constraint.
@@ -69,11 +73,14 @@ This is the initial scaffold. What exists today:
   spans (dataset generation vs. measured operation vs. whole run) and, for a
   synthetic profile, the reconstruction accuracy of the final rep (`measure_accuracy`
   is also exposed standalone).
-- **JSON report runner** (`src/report.rs`) — wraps one or more `BenchResult`s in
-  a `BenchReport` envelope with lightweight run metadata (`dsp-bench` version,
-  OS, CPU arch, generation timestamp) and persists it as pretty-printed JSON to a
+- **Report runner** (`src/report.rs`) — wraps one or more `BenchResult`s in a
+  `BenchReport` envelope with run metadata (`dsp-bench` version, OS, CPU arch,
+  generation timestamp, **plus a best-effort hardware probe** via `sysinfo`: CPU
+  model, physical/logical core counts, total RAM — toward the benchmark-report
+  template's hardware block) and persists it as pretty-printed JSON to a
   `reports/json/` artifact, satisfying the "keep raw results" reproducibility
-  rule. A report is publishable only when every result it holds is publishable.
+  rule. It also renders a self-contained **HTML** view (`to_html` / `write_html`,
+  `--html`). A report is publishable only when every result it holds is publishable.
 - **InfluxDB Line Protocol ingest** (`src/line_protocol.rs`) — a dependency-free
   ILP *format* parser (`parse` → `LineRecord`s; `parse_points` → sorted
   `splimes::Point`s for a chosen numeric field). Handles tags, typed fields
@@ -89,8 +96,8 @@ This is the initial scaffold. What exists today:
 - **Command-line runner** (`src/main.rs`, binary `dsp-bench`) — two input modes:
   read a `.lp` / TSBS file and project a chosen numeric field, **or** `--synthetic`
   to drive the seeded generator (knobs: `--seed`, `--points`, `--missingness`,
-  `--jitter`, `--noise`). Only the synthetic mode has a known ground truth, so
-  only it reports accuracy. Writes a `BenchReport` JSON artifact to
+  `--jitter`, `--noise`, `--shape`). Only the synthetic mode has a known ground
+  truth, so only it reports accuracy. Writes a `BenchReport` JSON artifact to
   `reports/json/`. Pure hand-rolled arg parsing (no `clap`); exits non-zero when
   the correctness gate fails so a scripted caller can gate on it.
 
@@ -101,9 +108,10 @@ TimescaleDB) — the portable linear and forward-fill baselines above are the fi
 *non-DSP* systems, but they run in-process rather than against a real database. The
 Phase-2 server-side ILP *ingest endpoint* (the file/CLI ingest path exists; an
 `axum` HTTP endpoint is next), additional workloads (range fetch, downsample,
-compression, …), dataset corpora, the richer report formats (Parquet/HTML) and
-full hardware capture (CPU model, RAM, GPU, drivers) in run metadata, and the
-methodology document.
+compression, …), dataset corpora, the remaining richer report format (Parquet —
+an **HTML** report already ships, see `--html` below) and the rest of the
+hardware capture (CPU model / cores / RAM now land in run metadata; **disk, GPU,
+and driver versions** remain), and the methodology document.
 
 ## Run
 
@@ -141,6 +149,12 @@ The artifact name tags every adapter, e.g.
 `reports/json/<profile>__dsp+baseline-linear+baseline-forward-fill.json`, and the
 process still exits non-zero if *any* result's correctness gate fails.
 
+Add `--html` to also write a self-contained, dependency-free HTML report
+(`<profile>__<adapters>.html`) beside the JSON — one table of every system's
+latency percentiles, throughput, correctness, and (for synthetic runs) accuracy,
+with the most-accurate row highlighted. A human-readable view of the same numbers
+the JSON carries, with no external assets.
+
 ### Quality comparison (synthetic mode)
 
 `--synthetic` runs the seeded generator instead of a file. Because its underlying
@@ -149,14 +163,20 @@ max-error / bias) for every system — the only mode that can:
 
 ```sh
 cargo run -p dsp-bench -- \
-    --synthetic --points 300 --noise 0 \
+    --synthetic --points 300 --noise 0 --shape sawtooth \
     --spline cubic --resolution minutes --reps 5 --compare
 ```
 
 `--noise 0` puts every sample exactly on the ground truth, isolating each
-method's own reconstruction error; raise it to probe robustness. The run prints
-an `accuracy : rmse=.. mae=.. max=.. bias=..` line per adapter and the metrics
-land in the JSON artifact (schema v4). Honesty note: on the high-frequency
-flagship signal the portable linear baseline often *out-accuracies* DSP's cubic
-spline (which overshoots near block gaps) — DSP-Bench surfaces that rather than
-hiding it.
+method's own reconstruction error; raise it to probe robustness. `--shape`
+(`multisine` | `sawtooth` | `step` | `dampedsine`) selects the analytic
+ground-truth curve, which is recorded in the artifact (schema v5) so the dataset
+regenerates exactly from seed + knobs + shape. The run prints a `signal shape`
+line, an `accuracy : rmse=.. mae=.. max=.. bias=..` line per adapter, and the
+metrics land in the JSON artifact.
+
+Honesty note: the winner depends on the shape, and DSP-Bench surfaces that rather
+than hiding it. On the smooth high-frequency `multisine` (and on `step`) DSP's
+cubic spline leads on RMSE, but on the `sawtooth` the portable linear baseline
+*out-accuracies* the cubic — the cubic overshoots the sharp discontinuities — so
+the "most accurate" line names linear, not DSP.
