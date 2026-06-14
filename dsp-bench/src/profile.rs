@@ -13,6 +13,7 @@ use bigdecimal::{BigDecimal, FromPrimitive};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use serde::{Deserialize, Serialize};
 use splimes::{Point, Resolution, Spline};
 
 use crate::line_protocol::{parse_points, ParseError, TimestampPrecision};
@@ -100,7 +101,8 @@ impl From<ParseError> for LineProtocolProfileError {
 /// research foundation calls for benchmarking interpolation *quality* (extrema
 /// preservation, behavior near block missingness) across diverse signals, not
 /// only speed on one curve.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SignalShape {
 	/// The flagship signal: a sum of two sinusoids (3 and 11 cycles), `50 ± 40`.
 	#[default]
@@ -328,6 +330,15 @@ impl InterpolationProfile {
 	#[must_use]
 	fn anchor() -> DateTime<Utc> {
 		Utc.timestamp_opt(EPOCH_ANCHOR_SECS, 0).single().expect("valid fixed epoch anchor")
+	}
+
+	/// The analytic ground-truth shape this profile's synthetic data was generated
+	/// from, or `None` for a [`DatasetSource::LineProtocol`] source (which carries
+	/// no synthetic shape). Mirrors [`Self::clean_signal_at`]'s `None`-for-real-data
+	/// contract and is what the result schema records for reproducibility.
+	#[must_use]
+	pub fn ground_truth_shape(&self) -> Option<SignalShape> {
+		matches!(self.source, DatasetSource::Generated).then_some(self.signal_shape)
 	}
 
 	/// Evaluate the noise-free underlying signal at instant `t`, if this profile
@@ -597,6 +608,14 @@ cpu,host=h0 usage=13.0 120\n";
 		let a = p_sine.clean_signal_at(mid).expect("ground truth");
 		let b = p_saw.clean_signal_at(mid).expect("ground truth");
 		assert!((a - b).abs() > 1e-6, "different shapes must yield different truth, got {a} vs {b}");
+	}
+
+	#[test]
+	fn ground_truth_shape_is_some_for_synthetic_and_none_for_line_protocol() {
+		let saw = InterpolationProfile::synthetic("saw", SyntheticParams { signal_shape: SignalShape::Sawtooth, ..Default::default() });
+		assert_eq!(saw.ground_truth_shape(), Some(SignalShape::Sawtooth), "a synthetic profile reports its shape");
+		let lp = InterpolationProfile::from_line_protocol("tsbs-cpu", SAMPLE_LP, "usage", TimestampPrecision::Seconds, Spline::Cubic, Resolution::Minutes).expect("valid payload");
+		assert_eq!(lp.ground_truth_shape(), None, "real-world data has no synthetic shape");
 	}
 
 	#[test]

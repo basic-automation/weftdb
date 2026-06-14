@@ -122,6 +122,11 @@ fn print_summary(report: &BenchReport, out_path: &std::path::Path) {
 	let first = &report.results[0];
 	println!("  profile      : {}", first.profile);
 	println!("  workload     : {}", first.workload);
+	// Synthetic runs record which analytic ground-truth shape was generated; a
+	// line-protocol run has none, so the line is skipped.
+	if let Some(shape) = first.dataset.signal_shape {
+		println!("  signal shape : {shape:?}");
+	}
 	println!("  reps         : {}", first.reps);
 	for r in &report.results {
 		let l = &r.latency;
