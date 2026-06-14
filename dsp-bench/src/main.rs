@@ -73,7 +73,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 	// accuracy metrics; line-protocol mode does not.
 	let profile = if cli.synthetic {
 		let profile_name = cli.name.clone().unwrap_or_else(|| "interpolation-heavy-irregular".to_string());
-		let params = SyntheticParams { seed: cli.seed, input_points: cli.points, missingness_fraction: cli.missingness, jitter_fraction: cli.jitter, noise_amplitude: cli.noise, signal_shape: SignalShape::default(), spline: cli.spline, resolution: cli.resolution };
+		let params = SyntheticParams { seed: cli.seed, input_points: cli.points, missingness_fraction: cli.missingness, jitter_fraction: cli.jitter, noise_amplitude: cli.noise, signal_shape: cli.shape, spline: cli.spline, resolution: cli.resolution };
 		InterpolationProfile::synthetic(profile_name, params)
 	} else {
 		// Validated in `from_args`: line-protocol mode always carries input + field.
@@ -184,6 +184,8 @@ struct Cli {
 	jitter: f64,
 	/// Synthetic additive-noise amplitude (`>= 0`; `0` puts samples on truth).
 	noise: f64,
+	/// Analytic shape of the synthetic ground-truth signal.
+	shape: SignalShape,
 	/// Timestamp precision of the input file.
 	precision: TimestampPrecision,
 	/// Spline method requested of the adapter.
@@ -235,6 +237,7 @@ impl Cli {
 		let mut missingness = defaults.missingness_fraction;
 		let mut jitter = defaults.jitter_fraction;
 		let mut noise = defaults.noise_amplitude;
+		let mut shape = defaults.signal_shape;
 		let mut precision = TimestampPrecision::Nanoseconds;
 		let mut spline = Spline::Cubic;
 		let mut resolution = Resolution::Seconds;
@@ -270,6 +273,7 @@ impl Cli {
 				"--missingness" => missingness = parse_fraction(&take_value(&key)?, "missingness")?,
 				"--jitter" => jitter = parse_fraction(&take_value(&key)?, "jitter")?,
 				"--noise" => noise = parse_noise(&take_value(&key)?)?,
+				"--shape" => shape = parse_shape(&take_value(&key)?)?,
 				"--precision" => precision = parse_precision(&take_value(&key)?)?,
 				"--spline" => spline = parse_spline(&take_value(&key)?)?,
 				"--resolution" => resolution = parse_resolution(&take_value(&key)?)?,
@@ -307,7 +311,7 @@ impl Cli {
 			}
 		}
 
-		Ok(Command::Run(Self { input, field, synthetic, seed, points, missingness, jitter, noise, precision, spline, resolution, reps, out_dir, name, compare }))
+		Ok(Command::Run(Self { input, field, synthetic, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare }))
 	}
 }
 
@@ -405,6 +409,18 @@ fn parse_noise(s: &str) -> Result<f64, String> {
 	Ok(v)
 }
 
+/// Parse a synthetic signal-shape token (case-insensitive). Selects the analytic
+/// ground-truth curve the generator samples in `--synthetic` mode.
+fn parse_shape(s: &str) -> Result<SignalShape, String> {
+	match s.to_ascii_lowercase().replace(['-', '_'], "").as_str() {
+		"multisine" | "sine" | "sines" => Ok(SignalShape::MultiSine),
+		"sawtooth" | "saw" | "ramp" => Ok(SignalShape::Sawtooth),
+		"step" | "square" => Ok(SignalShape::Step),
+		"dampedsine" | "damped" | "decay" => Ok(SignalShape::DampedSine),
+		other => Err(format!("invalid shape `{other}` (expected multisine|sawtooth|step|dampedsine)")),
+	}
+}
+
 /// Usage text shown for `--help` and on a parse error.
 const USAGE: &str = "\
 dsp-bench — run a DSP interpolation benchmark over a line-protocol file or the
@@ -428,6 +444,8 @@ SYNTHETIC OPTIONS (with --synthetic):
         --missingness <F>    Gap fraction in [0, 1]                [default: 0.20]
         --jitter <F>         Timestamp jitter fraction in [0, 1]   [default: 0.60]
         --noise <F>          Sample noise amplitude (>=0; 0=clean) [default: 2.0]
+        --shape <S>          Ground-truth signal: multisine|sawtooth|step|
+                             dampedsine                       [default: multisine]
 
 OPTIONS:
         --precision <P>      Timestamp precision: ns|us|ms|s         [default: ns]
@@ -522,6 +540,24 @@ mod tests {
 		// Unlike the [0, 1] fractions, noise is an unbounded non-negative amplitude.
 		assert!((expect_run(&["-s", "--noise", "0"]).noise - 0.0).abs() < f64::EPSILON);
 		assert!((expect_run(&["-s", "--noise", "5.5"]).noise - 5.5).abs() < 1e-12);
+	}
+
+	#[test]
+	fn shape_defaults_to_multisine_and_parses_every_form() {
+		// Default mirrors the flagship signal.
+		assert_eq!(expect_run(&["-s"]).shape, SignalShape::MultiSine);
+		// Each variant's canonical token and an alias, case- and separator-insensitive.
+		assert_eq!(expect_run(&["-s", "--shape", "multisine"]).shape, SignalShape::MultiSine);
+		assert_eq!(expect_run(&["-s", "--shape", "Sawtooth"]).shape, SignalShape::Sawtooth);
+		assert_eq!(expect_run(&["-s", "--shape=saw"]).shape, SignalShape::Sawtooth);
+		assert_eq!(expect_run(&["-s", "--shape", "step"]).shape, SignalShape::Step);
+		assert_eq!(expect_run(&["-s", "--shape", "damped-sine"]).shape, SignalShape::DampedSine);
+		assert_eq!(expect_run(&["-s", "--shape", "DECAY"]).shape, SignalShape::DampedSine);
+	}
+
+	#[test]
+	fn an_unknown_shape_is_rejected() {
+		assert!(run_cli(&["-s", "--shape", "triangle"]).unwrap_err().contains("invalid shape"));
 	}
 
 	#[test]
