@@ -359,6 +359,23 @@ cpu,host=h0 usage=14.0 600\n";
 	}
 
 	#[tokio::test]
+	async fn run_profile_records_the_signal_shape_and_accuracy_for_every_shape() {
+		// The full runner must thread each selectable ground-truth shape through to
+		// the artifact (`dataset.signal_shape`) and still score accuracy against it.
+		// This locks the end-to-end path the unit tests only cover piecewise.
+		for shape in [SignalShape::MultiSine, SignalShape::Sawtooth, SignalShape::Step, SignalShape::DampedSine] {
+			let profile = InterpolationProfile::synthetic("shape-sweep", SyntheticParams { signal_shape: shape, noise_amplitude: 0.0, ..SyntheticParams::default() });
+			let result = run_profile(&DspAdapter::new(), &profile, 3).await.expect("run completes");
+
+			assert_eq!(result.dataset.signal_shape, Some(shape), "the artifact must record the generated shape");
+			assert!(result.correctness.passed(), "{shape:?}: correctness must pass: {:?}", result.correctness);
+			let accuracy = result.accuracy.expect("a synthetic run carries accuracy");
+			assert!(accuracy.rmse.is_finite() && accuracy.mae.is_finite() && accuracy.max_abs_error.is_finite() && accuracy.bias.is_finite(), "{shape:?}: accuracy metrics must be finite: {accuracy:?}");
+			assert!(accuracy.count > 0, "{shape:?}: accuracy must score the grid");
+		}
+	}
+
+	#[tokio::test]
 	async fn zero_reps_is_rejected() {
 		let profile = InterpolationProfile::interpolation_heavy_irregular();
 		let adapter = DspAdapter::new();
