@@ -73,11 +73,14 @@ This is the initial scaffold. What exists today:
   spans (dataset generation vs. measured operation vs. whole run) and, for a
   synthetic profile, the reconstruction accuracy of the final rep (`measure_accuracy`
   is also exposed standalone).
-- **JSON report runner** (`src/report.rs`) — wraps one or more `BenchResult`s in
-  a `BenchReport` envelope with lightweight run metadata (`dsp-bench` version,
-  OS, CPU arch, generation timestamp) and persists it as pretty-printed JSON to a
+- **Report runner** (`src/report.rs`) — wraps one or more `BenchResult`s in a
+  `BenchReport` envelope with run metadata (`dsp-bench` version, OS, CPU arch,
+  generation timestamp, **plus a best-effort hardware probe** via `sysinfo`: CPU
+  model, physical/logical core counts, total RAM — toward the benchmark-report
+  template's hardware block) and persists it as pretty-printed JSON to a
   `reports/json/` artifact, satisfying the "keep raw results" reproducibility
-  rule. A report is publishable only when every result it holds is publishable.
+  rule. It also renders a self-contained **HTML** view (`to_html` / `write_html`,
+  `--html`). A report is publishable only when every result it holds is publishable.
 - **InfluxDB Line Protocol ingest** (`src/line_protocol.rs`) — a dependency-free
   ILP *format* parser (`parse` → `LineRecord`s; `parse_points` → sorted
   `splimes::Point`s for a chosen numeric field). Handles tags, typed fields
@@ -106,8 +109,9 @@ TimescaleDB) — the portable linear and forward-fill baselines above are the fi
 Phase-2 server-side ILP *ingest endpoint* (the file/CLI ingest path exists; an
 `axum` HTTP endpoint is next), additional workloads (range fetch, downsample,
 compression, …), dataset corpora, the remaining richer report format (Parquet —
-an **HTML** report already ships, see `--html` below) and full hardware capture
-(CPU model, RAM, GPU, drivers) in run metadata, and the methodology document.
+an **HTML** report already ships, see `--html` below) and the rest of the
+hardware capture (CPU model / cores / RAM now land in run metadata; **disk, GPU,
+and driver versions** remain), and the methodology document.
 
 ## Run
 
