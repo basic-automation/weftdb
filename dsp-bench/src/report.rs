@@ -136,6 +136,42 @@ impl BenchReport {
 		let json = self.to_json_pretty().map_err(io::Error::other)?;
 		fs::write(path, json)
 	}
+
+	/// Render the report as a single self-contained HTML document (no external
+	/// assets or scripts) — the roadmap's `reports/html/` slice, a human-readable
+	/// view of the same results the JSON artifact carries. Every system appears in
+	/// one table: dataset shape, latency percentiles, throughput, the correctness
+	/// verdict, and (for synthetic runs) reconstruction accuracy, with the
+	/// most-accurate row highlighted. All caller-supplied strings are HTML-escaped.
+	#[must_use]
+	pub fn to_html(&self) -> String {
+		let m = &self.metadata;
+		let best = self.most_accurate();
+		let rows: String = self.results.iter().map(|r| result_row_html(r, best.is_some_and(|b| std::ptr::eq(b, r)))).collect();
+		let version = escape_html(&m.dsp_bench_version);
+		let os = escape_html(&m.os);
+		let arch = escape_html(&m.arch);
+		let generated = escape_html(if m.generated_at.is_empty() { "(unstamped)" } else { m.generated_at.as_str() });
+		let publishable = if self.is_publishable() { "yes" } else { "no" };
+		format!("<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>DSP-Bench report</title>\n<style>{style}</style>\n</head>\n<body>\n<h1>DSP-Bench report</h1>\n<p class=\"meta\">dsp-bench {version} \u{b7} {os}/{arch} \u{b7} schema v{schema} \u{b7} generated {generated} \u{b7} publishable: {publishable}</p>\n<table>\n<thead><tr>{head}</tr></thead>\n<tbody>\n{rows}</tbody>\n</table>\n</body>\n</html>\n", style = HTML_STYLE, schema = self.schema_version, head = HTML_HEAD_CELLS)
+	}
+
+	/// Write the report as a self-contained HTML document to `path`, creating any
+	/// missing parent directories first.
+	///
+	/// # Errors
+	///
+	/// Returns an error if a parent directory cannot be created or the file cannot
+	/// be written.
+	pub fn write_html(&self, path: impl AsRef<Path>) -> io::Result<()> {
+		let path = path.as_ref();
+		if let Some(parent) = path.parent() {
+			if !parent.as_os_str().is_empty() {
+				fs::create_dir_all(parent)?;
+			}
+		}
+		fs::write(path, self.to_html())
+	}
 }
 
 /// Build a filesystem-safe artifact filename for a `(profile, adapter)` pair,
@@ -146,6 +182,57 @@ impl BenchReport {
 #[must_use]
 pub fn default_filename(profile: &str, adapter: &str) -> String {
 	format!("{}__{}.json", sanitize_component(profile), sanitize_component(adapter))
+}
+
+/// Build a filesystem-safe HTML artifact filename for a `(profile, adapter)`
+/// pair, e.g. `interpolation-heavy-irregular__dsp.html` — the HTML sibling of
+/// [`default_filename`].
+#[must_use]
+pub fn default_html_filename(profile: &str, adapter: &str) -> String {
+	format!("{}__{}.html", sanitize_component(profile), sanitize_component(adapter))
+}
+
+/// Inline stylesheet for [`BenchReport::to_html`]. Kept tiny and self-contained so
+/// the artifact needs no external assets.
+const HTML_STYLE: &str = "body{font-family:system-ui,sans-serif;margin:2rem;color:#1a1a1a}h1{font-size:1.4rem}.meta{color:#555;font-size:.9rem}table{border-collapse:collapse;margin-top:1rem;font-size:.9rem}th,td{border:1px solid #ccc;padding:.3rem .6rem;text-align:right}th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}thead{background:#f0f0f0}tr.best{background:#e7f7e7;font-weight:600}";
+
+/// Table header cells for [`BenchReport::to_html`], matching [`result_row_html`].
+const HTML_HEAD_CELLS: &str = "<th>adapter</th><th>shape</th><th>in</th><th>out</th><th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>mean ms</th><th>pts/s</th><th>correct</th><th>rmse</th><th>mae</th><th>max</th><th>bias</th>";
+
+/// Nanoseconds rendered as fractional milliseconds for display.
+#[allow(clippy::cast_precision_loss)]
+fn ms(ns: u64) -> f64 {
+	ns as f64 / 1e6
+}
+
+/// Render one result as an HTML table row. `is_best` tags the most-accurate row.
+fn result_row_html(r: &BenchResult, is_best: bool) -> String {
+	let l = &r.latency;
+	let adapter = escape_html(&r.adapter);
+	let shape = r.dataset.signal_shape.map_or_else(|| "&mdash;".to_string(), |s| format!("{s:?}"));
+	let correctness = if r.correctness.passed() { "PASS" } else { "FAIL" };
+	// Accuracy is present only for a synthetic profile; otherwise the four cells
+	// are em-dashes so the column stays aligned.
+	let accuracy = r.accuracy.map_or_else(|| "<td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td>".to_string(), |a| format!("<td>{:.4}</td><td>{:.4}</td><td>{:.4}</td><td>{:+.4}</td>", a.rmse, a.mae, a.max_abs_error, a.bias));
+	let cls = if is_best { " class=\"best\"" } else { "" };
+	format!("<tr{cls}><td>{adapter}</td><td>{shape}</td><td>{in_pts}</td><td>{out_pts}</td><td>{p50:.3}</td><td>{p95:.3}</td><td>{p99:.3}</td><td>{mean:.3}</td><td>{tput:.0}</td><td>{correctness}</td>{accuracy}</tr>\n", in_pts = r.dataset.input_points, out_pts = r.dataset.output_points, p50 = ms(l.p50_ns), p95 = ms(l.p95_ns), p99 = ms(l.p99_ns), mean = ms(l.mean_ns), tput = r.throughput_points_per_sec)
+}
+
+/// Escape the five HTML-significant characters so caller-supplied strings (adapter
+/// and profile names, captured metadata) cannot break or inject into the document.
+fn escape_html(s: &str) -> String {
+	let mut out = String::with_capacity(s.len());
+	for c in s.chars() {
+		match c {
+			'&' => out.push_str("&amp;"),
+			'<' => out.push_str("&lt;"),
+			'>' => out.push_str("&gt;"),
+			'"' => out.push_str("&quot;"),
+			'\'' => out.push_str("&#39;"),
+			other => out.push(other),
+		}
+	}
+	out
 }
 
 /// Replace any character that is not alphanumeric, `.`, `_`, or `-` with `-`.
@@ -260,5 +347,65 @@ mod tests {
 		assert_eq!(default_filename("interpolation-heavy-irregular", "dsp"), "interpolation-heavy-irregular__dsp.json");
 		assert_eq!(default_filename("range fetch/v2", "Influx DB 3"), "range-fetch-v2__Influx-DB-3.json");
 		assert_eq!(default_filename("", ""), "unnamed__unnamed.json");
+	}
+
+	#[test]
+	fn default_html_filename_mirrors_json_with_an_html_extension() {
+		assert_eq!(default_html_filename("interpolation-heavy-irregular", "dsp"), "interpolation-heavy-irregular__dsp.html");
+		assert_eq!(default_html_filename("range fetch/v2", "Influx DB 3"), "range-fetch-v2__Influx-DB-3.html");
+	}
+
+	#[test]
+	fn to_html_renders_a_document_with_one_row_per_result() {
+		let report = BenchReport::with_results(metadata(), vec![result_with_rmse("dsp", 1.9), result_with_rmse("baseline-linear", 1.2)]);
+		let html = report.to_html();
+		assert!(html.starts_with("<!doctype html>"), "must be a full HTML document");
+		assert!(html.contains("DSP-Bench report"));
+		// Metadata is surfaced in the header.
+		assert!(html.contains("testos/testarch"), "metadata must appear: {html}");
+		// Every adapter gets a row.
+		assert!(html.contains("<td>dsp</td>"), "dsp row missing");
+		assert!(html.contains("<td>baseline-linear</td>"), "baseline-linear row missing");
+		// Two data rows.
+		assert_eq!(html.matches("<tr").count(), 3, "one header row + two data rows expected");
+	}
+
+	#[test]
+	fn to_html_marks_exactly_the_most_accurate_row() {
+		let report = BenchReport::with_results(metadata(), vec![result_with_rmse("dsp", 1.9), result_with_rmse("baseline-linear", 1.2)]);
+		let html = report.to_html();
+		// Exactly one row is the best, and it is the lowest-RMSE adapter.
+		assert_eq!(html.matches("class=\"best\"").count(), 1, "exactly one best row");
+		assert!(html.contains("<tr class=\"best\"><td>baseline-linear</td>"), "the lowest-RMSE adapter must be marked best: {html}");
+
+		// With no accuracy anywhere, no row is marked.
+		let plain = BenchReport::with_results(metadata(), vec![sample_result("dsp", true)]);
+		assert_eq!(plain.to_html().matches("class=\"best\"").count(), 0, "no accuracy -> no best row");
+	}
+
+	#[test]
+	fn to_html_escapes_caller_supplied_strings() {
+		// An adapter name carrying HTML-significant characters must be escaped, never
+		// emitted raw — the document is self-contained and must not be injectable.
+		let report = BenchReport::with_results(metadata(), vec![sample_result("<script>x</script>", true)]);
+		let html = report.to_html();
+		assert!(html.contains("&lt;script&gt;x&lt;/script&gt;"), "adapter name must be escaped: {html}");
+		assert!(!html.contains("<script>x</script>"), "raw markup must not survive: {html}");
+	}
+
+	#[test]
+	fn write_html_creates_parents_and_writes_a_document() {
+		let report = BenchReport::with_results(metadata(), vec![result_with_rmse("dsp", 1.2)]);
+		let mut dir = std::env::temp_dir();
+		dir.push(format!("dsp-bench-html-test-{}", std::process::id()));
+		dir.push("html");
+		let path = dir.join(default_html_filename("interpolation-heavy-irregular", "dsp"));
+
+		report.write_html(&path).expect("write html report");
+		let raw = fs::read_to_string(&path).expect("read back html report");
+		assert!(raw.starts_with("<!doctype html>"));
+		assert!(raw.contains("<td>dsp</td>"));
+
+		let _ = fs::remove_dir_all(dir.parent().unwrap_or(&dir));
 	}
 }

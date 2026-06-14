@@ -23,7 +23,9 @@
 use std::{path::PathBuf, process::ExitCode};
 
 use chrono::Utc;
-use dsp_bench::{report::default_filename, run_profile, BaselineLinearAdapter, BenchReport, BenchResult, DspAdapter, ForwardFillAdapter, InterpolationProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision};
+use dsp_bench::{
+	report::{default_filename, default_html_filename}, run_profile, BaselineLinearAdapter, BenchReport, BenchResult, DspAdapter, ForwardFillAdapter, InterpolationProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision
+};
 use splimes::{Resolution, Spline};
 
 /// Program name used in usage / error output.
@@ -109,7 +111,20 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 	let out_path = cli.out_dir.join(default_filename(&report.results[0].profile, &adapter_tag));
 	report.write_json(&out_path).map_err(|e| anyhow::anyhow!("cannot write report to {}: {e}", out_path.display()))?;
 
+	// Optionally also emit a human-readable HTML view of the same results,
+	// co-located with the JSON artifact (same stem, `.html`).
+	let html_path = if cli.html {
+		let path = cli.out_dir.join(default_html_filename(&report.results[0].profile, &adapter_tag));
+		report.write_html(&path).map_err(|e| anyhow::anyhow!("cannot write HTML report to {}: {e}", path.display()))?;
+		Some(path)
+	} else {
+		None
+	};
+
 	print_summary(&report, &out_path);
+	if let Some(path) = &html_path {
+		println!("  html report  : {}", path.display());
+	}
 
 	// The run is honest about its own verdict: a correctness failure is a non-zero
 	// exit so a CI / scripted caller can gate on it.
@@ -206,6 +221,8 @@ struct Cli {
 	/// Also run the portable baseline suite (linear + forward-fill) and emit a
 	/// comparison report.
 	compare: bool,
+	/// Also write a human-readable HTML report alongside the JSON artifact.
+	html: bool,
 }
 
 /// What the parsed command line asks the program to do.
@@ -250,6 +267,7 @@ impl Cli {
 		let mut out_dir = PathBuf::from("reports").join("json");
 		let mut name: Option<String> = None;
 		let mut compare = false;
+		let mut html = false;
 
 		let mut iter = args.into_iter();
 		while let Some(token) = iter.next() {
@@ -286,6 +304,7 @@ impl Cli {
 				"--out-dir" => out_dir = PathBuf::from(take_value(&key)?),
 				"--name" => name = Some(take_value(&key)?),
 				"-c" | "--compare" => compare = true,
+				"--html" => html = true,
 				other if other.starts_with('-') => return Err(format!("unknown flag `{other}`")),
 				// A bare positional is taken as the input path if one is not set yet.
 				other => {
@@ -316,7 +335,7 @@ impl Cli {
 			}
 		}
 
-		Ok(Command::Run(Self { input, field, synthetic, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare }))
+		Ok(Command::Run(Self { input, field, synthetic, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare, html }))
 	}
 }
 
@@ -461,6 +480,8 @@ OPTIONS:
         --name <NAME>        Profile name      [default: input stem / flagship name]
     -c, --compare            Also run the portable baseline suite (linear +
                              forward-fill) for comparison
+        --html               Also write a human-readable HTML report alongside
+                             the JSON artifact
     -h, --help               Print this help
 
 The report is written as <out-dir>/<profile>__<adapters>.json (e.g.
@@ -570,6 +591,13 @@ mod tests {
 		assert!(expect_run(&["data.lp", "-f", "v", "--compare"]).compare);
 		assert!(expect_run(&["data.lp", "-f", "v", "-c"]).compare);
 		assert!(!expect_run(&["data.lp", "-f", "v"]).compare);
+	}
+
+	#[test]
+	fn html_flag_is_off_by_default_and_parsed_when_present() {
+		assert!(!expect_run(&["data.lp", "-f", "v"]).html, "html is off unless requested");
+		assert!(expect_run(&["data.lp", "-f", "v", "--html"]).html);
+		assert!(expect_run(&["-s", "--html"]).html);
 	}
 
 	#[test]
