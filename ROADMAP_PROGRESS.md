@@ -949,3 +949,5 @@ workspace member (`dsp-server`), first slice = server skeleton + `/health` +
 ingest endpoint next; OR the **DuckDB external-engine adapter** as its own
 out-of-core module (budget a clean Windows bundled build). Either advances the
 benchmark toward real competitor comparisons / a public API.
+
+**PR:** https://github.com/physics515/DSP/pull/14
