@@ -137,6 +137,11 @@ fn print_summary(report: &BenchReport, out_path: &std::path::Path) {
 	let first = &report.results[0];
 	println!("  profile      : {}", first.profile);
 	println!("  workload     : {}", first.workload);
+	// Surface the captured CPU model when available (the full hardware block —
+	// cores, RAM — lands in the artifact and the HTML report).
+	if let Some(cpu) = &report.metadata.cpu_model {
+		println!("  cpu          : {cpu}");
+	}
 	// Synthetic runs record which analytic ground-truth shape was generated; a
 	// line-protocol run has none, so the line is skipped.
 	if let Some(shape) = first.dataset.signal_shape {
