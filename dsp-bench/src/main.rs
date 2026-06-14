@@ -23,7 +23,7 @@
 use std::{path::PathBuf, process::ExitCode};
 
 use chrono::Utc;
-use dsp_bench::{report::default_filename, run_profile, BaselineLinearAdapter, BenchReport, BenchResult, DspAdapter, ForwardFillAdapter, InterpolationProfile, RunMetadata, SyntheticParams, TimestampPrecision};
+use dsp_bench::{report::default_filename, run_profile, BaselineLinearAdapter, BenchReport, BenchResult, DspAdapter, ForwardFillAdapter, InterpolationProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision};
 use splimes::{Resolution, Spline};
 
 /// Program name used in usage / error output.
@@ -73,7 +73,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 	// accuracy metrics; line-protocol mode does not.
 	let profile = if cli.synthetic {
 		let profile_name = cli.name.clone().unwrap_or_else(|| "interpolation-heavy-irregular".to_string());
-		let params = SyntheticParams { seed: cli.seed, input_points: cli.points, missingness_fraction: cli.missingness, jitter_fraction: cli.jitter, noise_amplitude: cli.noise, spline: cli.spline, resolution: cli.resolution };
+		let params = SyntheticParams { seed: cli.seed, input_points: cli.points, missingness_fraction: cli.missingness, jitter_fraction: cli.jitter, noise_amplitude: cli.noise, signal_shape: SignalShape::default(), spline: cli.spline, resolution: cli.resolution };
 		InterpolationProfile::synthetic(profile_name, params)
 	} else {
 		// Validated in `from_args`: line-protocol mode always carries input + field.

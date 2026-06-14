@@ -58,7 +58,7 @@ use bigdecimal::ToPrimitive;
 use splimes::generate_target_times;
 
 pub use crate::{
-	accuracy::{synthetic_ground_truth, AccuracyError, AccuracyMetrics}, adapter::SystemAdapter, baseline_adapter::BaselineLinearAdapter, dsp_adapter::DspAdapter, forward_fill_adapter::ForwardFillAdapter, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError, SyntheticParams}, report::{BenchReport, RunMetadata}, schema::{BenchResult, CorrectnessReport, DatasetMeta, TimingBreakdown, SCHEMA_VERSION}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}
+	accuracy::{synthetic_ground_truth, AccuracyError, AccuracyMetrics}, adapter::SystemAdapter, baseline_adapter::BaselineLinearAdapter, dsp_adapter::DspAdapter, forward_fill_adapter::ForwardFillAdapter, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError, SignalShape, SyntheticParams}, report::{BenchReport, RunMetadata}, schema::{BenchResult, CorrectnessReport, DatasetMeta, TimingBreakdown, SCHEMA_VERSION}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}
 };
 
 /// Workload class label recorded for the interpolation profile.
