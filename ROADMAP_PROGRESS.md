@@ -1057,4 +1057,4 @@ it needs no new dependency tree; OR begin **Arrow/Parquet** bench-report output
 (`dsp-bench` `--parquet`), deliberately adding the `arrow`/`parquet` deps as their
 own increment. Either advances the public API / interchange surface.
 
-**PR:** (opened at wrap — see below)
+**PR:** https://github.com/physics515/DSP/pull/15
