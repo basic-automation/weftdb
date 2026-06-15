@@ -951,3 +951,110 @@ out-of-core module (budget a clean Windows bundled build). Either advances the
 benchmark toward real competitor comparisons / a public API.
 
 **PR:** https://github.com/physics515/DSP/pull/14
+
+---
+
+## 2026-06-15 — Phase 2 ignition: dsp-server (axum) + shared ILP crate (6 increments)
+
+The night that started the **Phase-2 benchmark-grade server/API**, deferred by the
+prior three runs as "too large for a late-night slice". It is pure-Rust (no
+fragile native build), so it landed cleanly as a series of bounded increments: a
+new `dsp-server` crate grew from a health/ready skeleton to a real interpolation
+API (JSON + InfluxDB Line Protocol) with Prometheus metrics, and the ILP parser
+was extracted into a shared `dsp-line-protocol` crate so the server and the bench
+harness speak one dialect.
+
+**Item:** roadmap Phase 2 (benchmark-grade server/API) + "Immediate next actions"
+#5 (InfluxDB Line Protocol ingest). Followed the prior run's explicit "next step"
+recommendation to start the axum server as its own workspace member.
+
+**Increment 1 — `dsp-server` Phase-2 API skeleton** (commit `dc22eb4`)
+- New workspace member `dsp-server` (axum 0.8 + tower dev-dep added to the
+  workspace dep table). `app()` is the single source of truth for the route
+  table; `GET /health` (liveness) and `GET /ready` (readiness) return JSON.
+  Binary binds `127.0.0.1:8080`, overridable via `DSP_SERVER_ADDR`. No
+  vendor-specific deps. Tests: 4 lib.
+
+**Increment 2 — `POST /api/v1/interpolate`** (commit `c5d48b4`)
+- First capability endpoint: drives `splimes::auto_interpolate` over HTTP+JSON.
+  Vendor-neutral `SplineSpec` (linear/quadratic/cubic/polynomial) + `ResolutionSpec`
+  map to the engine enums; range bounds default to the input span. `ApiError`
+  renders `{"error": "..."}` (empty set / non-finite value / inverted range -> 400).
+  Wire values are JSON f64, widened to BigDecimal before the engine (BigDecimal
+  stays the logical type; documented). Verified live (linear 0->60 over 60s = 61
+  points). Tests: +6 (10 lib total).
+
+**Increment 3 — Prometheus `/metrics`** (commit `21f01ff`)
+- Dependency-free metrics layer (renders Prometheus text v0.0.4 by hand).
+  `Metrics` groups per-endpoint sub-counters behind `SharedMetrics = Arc<Metrics>`;
+  the interpolate handler records request/error/output-point counts via a thin
+  wrapper. `app_with_metrics` lets a test observe live counters. The
+  `struct_field_names` clippy lint was fixed structurally (per-endpoint nesting),
+  not suppressed. Tests: +4 (14 lib total).
+
+**Increment 4 — extract shared `dsp-line-protocol` crate** (commit `c469c8d`)
+- Moved the vendor-neutral ILP format parser out of `dsp-bench` into a new
+  workspace member so the harness and the server share one parser. `dsp-bench`
+  keeps a thin `line_protocol` re-export module — every existing
+  `crate::line_protocol::*` path is unchanged. The 11 ILP tests moved with the
+  code (dsp-bench lib 91->80, dsp-line-protocol +11; total preserved).
+
+**Increment 5 — `POST /api/v1/interpolate/ilp`** (commit `1c25a96`)
+- Server-side ILP ingest built on the shared crate: ILP payload as the
+  `text/plain` body, field/precision/spline/resolution as query params, series
+  range = the data's own span. Reuses the same `run_interpolation` core as the
+  JSON endpoint (identical response envelope) and the same metrics counters.
+  Robust token parsing gives clear 400s; rejects malformed payloads, <2 points,
+  zero-span series. Verified live (2-row cpu payload -> 61-point grid; /metrics
+  reflects it). Tests: +5 (19 lib total).
+
+**Increment 6 — README + ROADMAP status** (commit `eb93615`)
+- `dsp-server/README.md`: running the binary, every endpoint with curl examples,
+  the numeric boundary, the Prometheus output. `ROADMAP.md`: marked Immediate
+  Next Action #5 (ILP ingest) ✅ and added a Phase-2 "started" status note. No
+  code touched.
+
+**Build/test/clippy (real, nightly `rustc 1.98.0-nightly (cb46fbb8c 2026-06-08)`):**
+- `cargo build --workspace` — GREEN (confirmed at baseline and at end).
+- `cargo test -p dsp-server` — **19 lib pass**.
+- `cargo test -p dsp-line-protocol` — **11 lib pass**.
+- `cargo test -p dsp-bench` — **80 lib + 20 bin pass** (was 91 lib before the ILP
+  parser moved out; 80 + 11 in the new crate = the same total, no test lost).
+- `cargo clippy -p dsp-server -p dsp-line-protocol --all-targets` — **0 warnings**
+  under `#![warn(clippy::pedantic, clippy::nursery, clippy::all)]`; every lint
+  hit (double_must_use, missing-backticks, struct_field_names, too_long_first_doc,
+  map().unwrap_or_else()) was fixed structurally, never with `#[allow]`. The 4
+  pre-existing `splimes` `sort_by_key` warnings in untouched files remain.
+- `cargo fmt` — clean for both new crates (hard tabs, max_width 10000).
+- Live end-to-end runs verified per capability increment (health/ready,
+  interpolate JSON, interpolate ILP, /metrics) against a bound server.
+- Scope note: tests scoped to the touched crates; the change is confined to two
+  new leaf crates + a re-export shim in `dsp-bench`, and the full workspace
+  **build** is green. Did not run the full (heavy wgpu/GPU/turso) `cargo test
+  --workspace` to stay in the night's budget.
+
+**Done vs open:** DONE — Phase 2 is off the ground: a real `dsp-server` with
+liveness/readiness, JSON interpolation over the `splimes` engine, server-side
+InfluxDB-Line-Protocol ingest, and Prometheus metrics; the ILP parser is now a
+shared vendor-neutral crate. OPEN (Phase 2 remainder) — DB/subject/aspect
+management, schema & physical-type definition, range/point/downsample query
+endpoints, Arrow/Parquet import-export, OpenTelemetry, Python/Rust SDKs. Also
+still open from prior runs: the external-engine **DuckDB adapter** (real-database
+baseline) and the other competitor adapters; the **Parquet** report format; the
+rest of the hardware block (disk/GPU/driver); the standalone methodology document.
+
+**STOP REASON:** cutoff/natural-arc — six coherent increments completed the
+Phase-2 ignition arc (skeleton -> JSON interpolate -> metrics -> shared ILP crate
+-> server ILP ingest -> docs), well above the 2-4 bar. A clean stopping point:
+the next Phase-2 slices (query endpoints needing a stored-data model, or
+Arrow/Parquet needing the arrow dependency tree) are each a fresh concern better
+started on their own PR rather than half-built onto this one.
+
+**Next step (tomorrow):** continue Phase 2 on `dsp-server`. Best next slice = a
+**downsample/aggregation query endpoint** (`POST /api/v1/downsample`: min/max/avg/
+count over a JSON or ILP series, reusing the same engine + metrics pattern) since
+it needs no new dependency tree; OR begin **Arrow/Parquet** bench-report output
+(`dsp-bench` `--parquet`), deliberately adding the `arrow`/`parquet` deps as their
+own increment. Either advances the public API / interchange surface.
+
+**PR:** https://github.com/physics515/DSP/pull/15

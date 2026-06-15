@@ -189,6 +189,13 @@ wins."*
 
 ### Phase 2 — Benchmark-grade server/API · 3–6 wks · *Very high*
 
+> **Status (started).** The `dsp-server` crate (axum) now exists with the API
+> skeleton (`/health`, `/ready`), the flagship `POST /api/v1/interpolate` over
+> the `splimes` engine, the InfluxDB-Line-Protocol ingest endpoint
+> `POST /api/v1/interpolate/ilp`, and a Prometheus `/metrics` surface. Still to
+> do: DB/subject/aspect management, range/point/downsample queries, schema &
+> physical-type definition, Arrow/Parquet, and OpenTelemetry.
+
 A commercial DB can't lead with an embedded Rust API + TUI. Build an `axum` server:
 create DB / subject / aspect; define schema/physical type; batch ingest; range query;
 point query; interpolated range query; downsample query; compression trigger; health;
@@ -624,18 +631,20 @@ redistributed. *For commercial trust, be more transparent than competitors.*
    (which overshoots the sharp discontinuities) — surfaced, not hidden. The
    external-engine DuckDB adapter — a real database baseline — is still to do.)*
 4. Add ClickHouse, InfluxDB 3, QuestDB, TimescaleDB adapters.
-5. 🟡 Implement InfluxDB Line Protocol ingest. *(ILP **format parser** landed in
-   `dsp-bench/src/line_protocol.rs`: `parse` → `LineRecord`s and `parse_points`
-   → sorted `splimes::Point`s for a chosen numeric field, with full
-   tag/typed-field/escape/comment/precision handling and no vendor deps — the
-   TSBS-compatibility on-ramp. **Now wired end-to-end through a workload profile:**
-   `DatasetSource::{Generated, LineProtocol}` + `InterpolationProfile::from_line_protocol`
-   in `dsp-bench/src/profile.rs` drive the same interpolation harness, correctness
-   gate, and JSON report from a real `.lp`/TSBS payload (timestamp bounds derived
-   from the data). **Now runnable from disk:** the `dsp-bench` binary
-   (`dsp-bench/src/main.rs`) reads a `.lp` file + field/precision/spline/resolution
-   and writes a `BenchReport` to `reports/json/`, exiting non-zero on a failed
-   correctness gate. Still open: the server-side ILP ingest **endpoint** (Phase 2).)*
+5. ✅ Implement InfluxDB Line Protocol ingest. *(ILP **format parser** lives in
+   the shared, vendor-neutral **`dsp-line-protocol`** crate (extracted from
+   `dsp-bench` so the harness and the server speak one dialect): `parse` →
+   `LineRecord`s and `parse_points` → sorted `splimes::Point`s for a chosen
+   numeric field, with full tag/typed-field/escape/comment/precision handling
+   and no vendor deps — the TSBS-compatibility on-ramp. **Wired end-to-end
+   through a workload profile:** `DatasetSource::{Generated, LineProtocol}` +
+   `InterpolationProfile::from_line_protocol` in `dsp-bench/src/profile.rs` drive
+   the same interpolation harness, correctness gate, and JSON report from a real
+   `.lp`/TSBS payload. **Runnable from disk** via the `dsp-bench` binary. **And
+   now a server endpoint:** `POST /api/v1/interpolate/ilp` in the new
+   **`dsp-server`** crate ingests an ILP payload (body = `text/plain`,
+   field/precision/spline/resolution as query params) and interpolates it
+   through the shared engine path — the Phase-2 server-side ILP ingest endpoint.)*
 6. 🟡 Add end-to-end timing spans. *(Harness-level spans landed:
    `TimingBreakdown` in `dsp-bench/src/schema.rs` records dataset-generation
    cost, the summed measured adapter calls, and the whole-run span, wired into

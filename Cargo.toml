@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["database", "database_orchestration", "splimes", "dsp-tui", "dsp-bench"]
+members = ["database", "database_orchestration", "splimes", "dsp-tui", "dsp-bench", "dsp-server", "dsp-line-protocol"]
 # Predecessor repositories archived under legacy/ (history preserved); not part of the active build.
 exclude = ["legacy"]
 
@@ -36,6 +36,7 @@ crossterm = "0"
 futures-channel = "0"
 sysinfo = "0"
 splimes = { path = "./splimes" }
+dsp-line-protocol = { path = "./dsp-line-protocol" }
 csv = "1"
 indexmap = "2"
 serial_test = { version = "3", default-features = false, features = ["async"] }
@@ -46,6 +47,8 @@ once_cell = "1"
 md5 = "0"
 rand_chacha = "0.9"
 dirs = "5"
+axum = "0.8"
+tower = "0.5"
 
 [profile.release]
 opt-level = 3
