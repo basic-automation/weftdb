@@ -16,10 +16,11 @@
 //! which point this endpoint gains a precision-preserving value representation.
 
 use axum::{
-	extract::State, http::StatusCode, response::{IntoResponse, Response}, Json
+	extract::{Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json
 };
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use chrono::{DateTime, Utc};
+use dsp_line_protocol::TimestampPrecision;
 use serde::{Deserialize, Serialize};
 use splimes::{Point, Resolution, Spline};
 
@@ -205,15 +206,21 @@ impl IntoResponse for ApiError {
 pub async fn interpolate(State(metrics): State<SharedMetrics>, Json(request): Json<InterpolateRequest>) -> Result<Json<InterpolateResponse>, ApiError> {
 	metrics.record_interpolate_request();
 	let result = interpolate_inner(request).await;
-	match &result {
-		Ok(response) => metrics.add_output_points(response.0.output_points as u64),
-		Err(_) => metrics.record_interpolate_error(),
-	}
+	record_outcome(&metrics, &result);
 	result
 }
 
-/// The core interpolation work, free of metrics so the counting wrapper stays
-/// trivial and the error paths read cleanly.
+/// Update the interpolation counters from a finished request's outcome, so both
+/// the JSON and ILP handlers account identically.
+fn record_outcome(metrics: &SharedMetrics, result: &Result<Json<InterpolateResponse>, ApiError>) {
+	match result {
+		Ok(response) => metrics.add_output_points(response.0.output_points as u64),
+		Err(_) => metrics.record_interpolate_error(),
+	}
+}
+
+/// The core JSON-request handling: validate, lift to `BigDecimal` points, derive
+/// the range, then delegate to [`run_interpolation`].
 async fn interpolate_inner(request: InterpolateRequest) -> Result<Json<InterpolateResponse>, ApiError> {
 	if request.points.is_empty() {
 		return Err(ApiError::bad_request("`points` must not be empty"));
@@ -228,12 +235,17 @@ async fn interpolate_inner(request: InterpolateRequest) -> Result<Json<Interpola
 
 	let start = request.start.unwrap_or_else(|| points.iter().map(|p| p.timestamp).min().unwrap_or_else(Utc::now));
 	let end = request.end.unwrap_or_else(|| points.iter().map(|p| p.timestamp).max().unwrap_or_else(Utc::now));
+
+	run_interpolation(points, start, end, request.spline.into(), request.resolution.into(), input_points).await
+}
+
+/// Run the engine over a prepared point set and shape the response. Shared by
+/// the JSON and ILP entry points so both produce identical result envelopes.
+async fn run_interpolation(mut points: Vec<Point>, start: DateTime<Utc>, end: DateTime<Utc>, spline: Spline, resolution: Resolution, input_points: usize) -> Result<Json<InterpolateResponse>, ApiError> {
 	if end < start {
 		return Err(ApiError::bad_request("`end` must not be before `start`"));
 	}
 
-	let spline: Spline = request.spline.into();
-	let resolution: Resolution = request.resolution.into();
 	let spline_label = spline.to_string();
 	let resolution_label = format!("{resolution:?}");
 
@@ -242,6 +254,107 @@ async fn interpolate_inner(request: InterpolateRequest) -> Result<Json<Interpola
 	let points: Vec<OutputPoint> = output.iter().map(|p| OutputPoint { timestamp: p.timestamp, value: p.value.to_f64().unwrap_or_default() }).collect();
 
 	Ok(Json(InterpolateResponse { spline: spline_label, resolution: resolution_label, output_points: points.len(), input_points, points }))
+}
+
+/// Query parameters for the ILP interpolation endpoint.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IlpParams {
+	/// Numeric field to project each line-protocol record onto (required).
+	pub field: String,
+	/// Timestamp precision token (`ns`/`us`/`ms`/`s`); defaults to nanoseconds
+	/// (ILP's own default).
+	#[serde(default)]
+	pub precision: Option<String>,
+	/// Spline token (`linear`/`quadratic`/`cubic`); defaults to cubic. Polynomial
+	/// is only reachable via the JSON endpoint (it needs structured parameters).
+	#[serde(default)]
+	pub spline: Option<String>,
+	/// Resolution token (`seconds`..`years`); defaults to minutes.
+	#[serde(default)]
+	pub resolution: Option<String>,
+}
+
+/// Interpolate an `InfluxDB` Line Protocol payload onto a regular grid.
+///
+/// Handles `POST /api/v1/interpolate/ilp`: parses the body as ILP (the wire
+/// format TSBS / `InfluxDB` / `QuestDB` speak), projects the chosen numeric
+/// field into a series, and interpolates it.
+///
+/// The payload is the request body (`text/plain`); the field, precision, spline,
+/// and resolution are query parameters. The series range is the data's own
+/// timestamp span. Parsing uses the shared, vendor-neutral `dsp-line-protocol`
+/// crate, so the server and the benchmark harness accept the exact same dialect.
+///
+/// # Errors
+///
+/// Returns [`ApiError::BadRequest`] for an unknown precision/spline/resolution
+/// token, a malformed payload, fewer than two usable points, or a zero-span
+/// series, and [`ApiError::Internal`] if the engine fails.
+pub async fn interpolate_ilp(State(metrics): State<SharedMetrics>, Query(params): Query<IlpParams>, body: String) -> Result<Json<InterpolateResponse>, ApiError> {
+	metrics.record_interpolate_request();
+	let result = interpolate_ilp_inner(&params, &body).await;
+	record_outcome(&metrics, &result);
+	result
+}
+
+async fn interpolate_ilp_inner(params: &IlpParams, body: &str) -> Result<Json<InterpolateResponse>, ApiError> {
+	let precision = parse_precision_token(params.precision.as_deref())?;
+	let spline = parse_spline_token(params.spline.as_deref())?;
+	let resolution = parse_resolution_token(params.resolution.as_deref())?;
+
+	let points = dsp_line_protocol::parse_points(body, &params.field, precision).map_err(|err| ApiError::bad_request(err.to_string()))?;
+
+	// `parse_points` returns points sorted ascending by timestamp; the engine
+	// needs at least two distinct instants to interpolate between.
+	if points.len() < 2 {
+		return Err(ApiError::bad_request(format!("need at least two points carrying field `{}` with a timestamp, found {}", params.field, points.len())));
+	}
+	let start = points.first().map_or_else(Utc::now, |p| p.timestamp);
+	let end = points.last().map_or_else(Utc::now, |p| p.timestamp);
+	if end <= start {
+		return Err(ApiError::bad_request("the line-protocol series spans zero time"));
+	}
+
+	let input_points = points.len();
+	run_interpolation(points, start, end, spline, resolution, input_points).await
+}
+
+/// Map an optional precision token to [`TimestampPrecision`] (default ns).
+fn parse_precision_token(token: Option<&str>) -> Result<TimestampPrecision, ApiError> {
+	match token.map(str::to_ascii_lowercase).as_deref() {
+		None | Some("ns" | "nanoseconds" | "nanos") => Ok(TimestampPrecision::Nanoseconds),
+		Some("us" | "µs" | "microseconds" | "micros") => Ok(TimestampPrecision::Microseconds),
+		Some("ms" | "milliseconds" | "millis") => Ok(TimestampPrecision::Milliseconds),
+		Some("s" | "sec" | "secs" | "seconds") => Ok(TimestampPrecision::Seconds),
+		Some(other) => Err(ApiError::bad_request(format!("unknown precision `{other}` (use ns/us/ms/s)"))),
+	}
+}
+
+/// Map an optional spline token to [`Spline`] (default cubic).
+fn parse_spline_token(token: Option<&str>) -> Result<Spline, ApiError> {
+	match token.map(str::to_ascii_lowercase).as_deref() {
+		Some("linear") => Ok(Spline::Linear),
+		Some("quadratic") => Ok(Spline::Quadratic),
+		None | Some("cubic") => Ok(Spline::Cubic),
+		Some(other) => Err(ApiError::bad_request(format!("unknown spline `{other}` (use linear/quadratic/cubic; polynomial via the JSON endpoint)"))),
+	}
+}
+
+/// Map an optional resolution token to [`Resolution`] (default minutes).
+fn parse_resolution_token(token: Option<&str>) -> Result<Resolution, ApiError> {
+	match token.map(str::to_ascii_lowercase).as_deref() {
+		Some("nanoseconds") => Ok(Resolution::Nanoseconds),
+		Some("microseconds") => Ok(Resolution::Microseconds),
+		Some("milliseconds") => Ok(Resolution::Milliseconds),
+		Some("seconds") => Ok(Resolution::Seconds),
+		None | Some("minutes") => Ok(Resolution::Minutes),
+		Some("hours") => Ok(Resolution::Hours),
+		Some("days") => Ok(Resolution::Days),
+		Some("weeks") => Ok(Resolution::Weeks),
+		Some("months") => Ok(Resolution::Months),
+		Some("years") => Ok(Resolution::Years),
+		Some(other) => Err(ApiError::bad_request(format!("unknown resolution `{other}`"))),
+	}
 }
 
 #[cfg(test)]
@@ -337,5 +450,59 @@ mod tests {
 	fn resolution_spec_maps_to_engine() {
 		assert!(matches!(Resolution::from(ResolutionSpec::default()), Resolution::Minutes));
 		assert!(matches!(Resolution::from(ResolutionSpec::Hours), Resolution::Hours));
+	}
+
+	async fn post_text(uri: &str, body: &str) -> (StatusCode, serde_json::Value) {
+		let response = app().oneshot(Request::builder().method("POST").uri(uri).header("content-type", "text/plain").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+		let status = response.status();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let value = serde_json::from_slice(&bytes).unwrap();
+		(status, value)
+	}
+
+	#[tokio::test]
+	async fn ilp_endpoint_interpolates_a_line_protocol_payload() {
+		// Two cpu rows a minute apart (seconds precision); linear fill on a 10s grid.
+		let payload = "cpu,host=a load=0 1000000000\ncpu,host=a load=60 1000000060\n";
+		let (status, body) = post_text("/api/v1/interpolate/ilp?field=load&precision=s&spline=linear&resolution=seconds", payload).await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["spline"], "Linear");
+		assert_eq!(body["input_points"], 2);
+		assert!(body["output_points"].as_u64().unwrap() >= 2);
+		for p in body["points"].as_array().unwrap() {
+			let v = p["value"].as_f64().unwrap();
+			assert!((0.0..=60.0).contains(&v), "value {v} out of [0,60]");
+		}
+	}
+
+	#[tokio::test]
+	async fn ilp_endpoint_rejects_too_few_points() {
+		let payload = "cpu,host=a load=1 1000000000\n";
+		let (status, body) = post_text("/api/v1/interpolate/ilp?field=load&precision=s", payload).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST);
+		assert!(body["error"].as_str().unwrap().contains("at least two"));
+	}
+
+	#[tokio::test]
+	async fn ilp_endpoint_rejects_unknown_spline_token() {
+		let payload = "cpu load=1 1\ncpu load=2 2\n";
+		let (status, body) = post_text("/api/v1/interpolate/ilp?field=load&spline=bogus", payload).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST);
+		assert!(body["error"].as_str().unwrap().contains("unknown spline"));
+	}
+
+	#[tokio::test]
+	async fn ilp_endpoint_rejects_malformed_payload() {
+		let (status, body) = post_text("/api/v1/interpolate/ilp?field=load", "this is not line protocol\n").await;
+		assert_eq!(status, StatusCode::BAD_REQUEST);
+		// A parse error carries a line number.
+		assert!(body["error"].as_str().unwrap().contains("line 1"));
+	}
+
+	#[test]
+	fn precision_token_parsing() {
+		assert!(matches!(parse_precision_token(None), Ok(TimestampPrecision::Nanoseconds)));
+		assert!(matches!(parse_precision_token(Some("MS")), Ok(TimestampPrecision::Milliseconds)));
+		assert!(parse_precision_token(Some("fortnights")).is_err());
 	}
 }
