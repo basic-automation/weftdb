@@ -28,7 +28,12 @@
 
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 
-use axum::{routing::get, Json, Router};
+pub mod interpolate;
+
+use axum::{
+	routing::{get, post}, Json, Router
+};
+pub use interpolate::{interpolate, InterpolateRequest, InterpolateResponse};
 use serde::Serialize;
 
 /// The server's package version, surfaced in probe responses so a deployed
@@ -76,7 +81,7 @@ impl Default for ReadyResponse {
 /// Build the application router. This is the single source of truth for the
 /// service's route table; the binary and the tests both go through it.
 pub fn app() -> Router {
-	Router::new().route("/health", get(health)).route("/ready", get(ready))
+	Router::new().route("/health", get(health)).route("/ready", get(ready)).route("/api/v1/interpolate", post(interpolate))
 }
 
 /// Liveness probe: the process is up and can serve a request.
