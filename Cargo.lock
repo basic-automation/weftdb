@@ -1190,6 +1190,7 @@ dependencies = [
  "axum",
  "bigdecimal",
  "chrono",
+ "dsp-line-protocol",
  "serde",
  "serde_json",
  "splimes",
