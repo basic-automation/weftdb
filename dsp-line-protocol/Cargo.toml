@@ -1,0 +1,14 @@
+[package]
+name = "dsp-line-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "Vendor-neutral InfluxDB Line Protocol (ILP) format parser for DSP — turns ILP text into neutral records / splimes::Points. No InfluxDB client, no network, no vendor dependency."
+
+[lib]
+name = "dsp_line_protocol"
+path = "src/lib.rs"
+
+[dependencies]
+bigdecimal = { workspace = true }
+chrono = { workspace = true }
+splimes = { workspace = true }
