@@ -16,12 +16,14 @@
 //! which point this endpoint gains a precision-preserving value representation.
 
 use axum::{
-	http::StatusCode, response::{IntoResponse, Response}, Json
+	extract::State, http::StatusCode, response::{IntoResponse, Response}, Json
 };
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use splimes::{Point, Resolution, Spline};
+
+use crate::metrics::SharedMetrics;
 
 /// One input sample on the wire.
 #[derive(Debug, Clone, Deserialize)]
@@ -193,11 +195,26 @@ impl IntoResponse for ApiError {
 /// Handle `POST /api/v1/interpolate`: reconstruct an irregular series onto a
 /// regular output grid using DSP's interpolation engine.
 ///
+/// Records request / error / output-point counters on [`SharedMetrics`] around
+/// the core work, so `/metrics` reflects the engine load this endpoint drives.
+///
 /// # Errors
 ///
 /// Returns [`ApiError::BadRequest`] for an empty point set, a non-finite value,
 /// or an inverted range, and [`ApiError::Internal`] if the engine fails.
-pub async fn interpolate(Json(request): Json<InterpolateRequest>) -> Result<Json<InterpolateResponse>, ApiError> {
+pub async fn interpolate(State(metrics): State<SharedMetrics>, Json(request): Json<InterpolateRequest>) -> Result<Json<InterpolateResponse>, ApiError> {
+	metrics.record_interpolate_request();
+	let result = interpolate_inner(request).await;
+	match &result {
+		Ok(response) => metrics.add_output_points(response.0.output_points as u64),
+		Err(_) => metrics.record_interpolate_error(),
+	}
+	result
+}
+
+/// The core interpolation work, free of metrics so the counting wrapper stays
+/// trivial and the error paths read cleanly.
+async fn interpolate_inner(request: InterpolateRequest) -> Result<Json<InterpolateResponse>, ApiError> {
 	if request.points.is_empty() {
 		return Err(ApiError::bad_request("`points` must not be empty"));
 	}

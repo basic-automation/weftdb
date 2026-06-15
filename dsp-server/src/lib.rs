@@ -29,11 +29,13 @@
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 
 pub mod interpolate;
+pub mod metrics;
 
 use axum::{
 	routing::{get, post}, Json, Router
 };
 pub use interpolate::{interpolate, InterpolateRequest, InterpolateResponse};
+pub use metrics::{Metrics, MetricsSnapshot, SharedMetrics};
 use serde::Serialize;
 
 /// The server's package version, surfaced in probe responses so a deployed
@@ -78,10 +80,17 @@ impl Default for ReadyResponse {
 	}
 }
 
-/// Build the application router. This is the single source of truth for the
-/// service's route table; the binary and the tests both go through it.
+/// Build the application router with a fresh metrics registry. This is the
+/// single source of truth for the service's route table; the binary and the
+/// tests both go through it.
 pub fn app() -> Router {
-	Router::new().route("/health", get(health)).route("/ready", get(ready)).route("/api/v1/interpolate", post(interpolate))
+	app_with_metrics(SharedMetrics::default())
+}
+
+/// Build the application router over a caller-supplied [`SharedMetrics`], so a
+/// test (or an embedding host) can observe the counters the handlers update.
+pub fn app_with_metrics(metrics: SharedMetrics) -> Router {
+	Router::new().route("/health", get(health)).route("/ready", get(ready)).route("/metrics", get(metrics::metrics)).route("/api/v1/interpolate", post(interpolate)).with_state(metrics)
 }
 
 /// Liveness probe: the process is up and can serve a request.
@@ -140,5 +149,36 @@ mod tests {
 		assert_eq!(HealthResponse::default().status, "ok");
 		assert!(ReadyResponse::default().ready);
 		assert_eq!(HealthResponse::default().service, ReadyResponse::default().service);
+	}
+
+	#[tokio::test]
+	async fn metrics_endpoint_renders_prometheus() {
+		let response = app().oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		let content_type = response.headers().get("content-type").unwrap().to_str().unwrap().to_string();
+		assert!(content_type.starts_with("text/plain"));
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let text = String::from_utf8(bytes.to_vec()).unwrap();
+		assert!(text.contains("dsp_interpolate_requests_total"));
+	}
+
+	#[tokio::test]
+	async fn interpolate_increments_shared_metrics() {
+		let metrics = SharedMetrics::default();
+		let router = app_with_metrics(metrics.clone());
+		let body = serde_json::json!({
+			"spline": "linear",
+			"resolution": "seconds",
+			"points": [
+				{ "timestamp": "1970-01-01T00:00:00Z", "value": 0.0 },
+				{ "timestamp": "1970-01-01T00:00:10Z", "value": 10.0 },
+			],
+		});
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/interpolate").header("content-type", "application/json").body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		let snap = metrics.snapshot();
+		assert_eq!(snap.interpolate.requests, 1);
+		assert_eq!(snap.interpolate.errors, 0);
+		assert!(snap.interpolate.output_points >= 2);
 	}
 }
