@@ -29,6 +29,7 @@ The bind address defaults to `127.0.0.1:8080`; override it with `DSP_SERVER_ADDR
 | `GET /metrics` | Prometheus text exposition of the server's counters. |
 | `POST /api/v1/interpolate` | Interpolate a JSON point set onto a regular grid. |
 | `POST /api/v1/interpolate/ilp` | Interpolate an InfluxDB Line Protocol payload. |
+| `POST /api/v1/interpolate/point` | Evaluate the reconstructed signal at a single instant (interpolated vs extrapolated). |
 | `POST /api/v1/downsample` | Reduce a JSON point set into grid-aligned aggregate buckets. |
 | `POST /api/v1/downsample/ilp` | Reduce an InfluxDB Line Protocol payload into buckets. |
 
@@ -81,6 +82,31 @@ printf 'cpu,host=a load=0 1000000000\ncpu,host=a load=60 1000000060\n' | \
 
 A malformed payload, an unknown token, fewer than two usable points, or a
 zero-span series returns `400` with a `{"error": "..."}` body.
+
+### `POST /api/v1/interpolate/point`
+
+Single-instant lookup: evaluate the reconstructed signal at one timestamp. The
+response labels the value **`interpolated`** (the instant lies within the
+observed `[min, max]` span) or **`extrapolated`** (outside it), so a caller never
+silently treats an out-of-range reconstruction as an observed value.
+
+```sh
+curl -s -X POST http://127.0.0.1:8080/api/v1/interpolate/point \
+  -H 'content-type: application/json' \
+  -d '{
+        "spline": "linear",
+        "instant": "1970-01-01T00:00:30Z",
+        "points": [
+          { "timestamp": "1970-01-01T00:00:00Z", "value": 0.0 },
+          { "timestamp": "1970-01-01T00:01:00Z", "value": 60.0 }
+        ]
+      }'
+# {"spline":"Linear","instant":"1970-01-01T00:00:30Z","input_points":2,"value":30.0,"kind":"interpolated"}
+```
+
+- `spline` — as the range endpoint (`linear` | `quadratic` | `cubic` (default) | polynomial).
+- `instant` (required) — the RFC 3339 timestamp to evaluate at.
+- `points` — non-empty `{timestamp, value}` array.
 
 ### `POST /api/v1/downsample`
 
