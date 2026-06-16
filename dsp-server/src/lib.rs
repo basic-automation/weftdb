@@ -28,13 +28,15 @@
 
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 
+pub mod downsample;
 pub mod interpolate;
 pub mod metrics;
 
 use axum::{
 	routing::{get, post}, Json, Router
 };
-pub use interpolate::{interpolate, interpolate_ilp, InterpolateRequest, InterpolateResponse};
+pub use downsample::{downsample, downsample_ilp, Aggregation, DownsampleRequest, DownsampleResponse};
+pub use interpolate::{interpolate, interpolate_ilp, interpolate_point, InterpolateRequest, InterpolateResponse, PointKind, PointRequest, PointResponse};
 pub use metrics::{Metrics, MetricsSnapshot, SharedMetrics};
 use serde::Serialize;
 
@@ -90,7 +92,7 @@ pub fn app() -> Router {
 /// Build the application router over a caller-supplied [`SharedMetrics`], so a
 /// test (or an embedding host) can observe the counters the handlers update.
 pub fn app_with_metrics(metrics: SharedMetrics) -> Router {
-	Router::new().route("/health", get(health)).route("/ready", get(ready)).route("/metrics", get(metrics::metrics)).route("/api/v1/interpolate", post(interpolate)).route("/api/v1/interpolate/ilp", post(interpolate_ilp)).with_state(metrics)
+	Router::new().route("/health", get(health)).route("/ready", get(ready)).route("/metrics", get(metrics::metrics)).route("/api/v1/interpolate", post(interpolate)).route("/api/v1/interpolate/ilp", post(interpolate_ilp)).route("/api/v1/interpolate/point", post(interpolate_point)).route("/api/v1/downsample", post(downsample)).route("/api/v1/downsample/ilp", post(downsample_ilp)).with_state(metrics)
 }
 
 /// Liveness probe: the process is up and can serve a request.
