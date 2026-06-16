@@ -192,9 +192,11 @@ wins."*
 > **Status (started).** The `dsp-server` crate (axum) now exists with the API
 > skeleton (`/health`, `/ready`), the flagship `POST /api/v1/interpolate` over
 > the `splimes` engine, the InfluxDB-Line-Protocol ingest endpoint
-> `POST /api/v1/interpolate/ilp`, and a Prometheus `/metrics` surface. Still to
-> do: DB/subject/aspect management, range/point/downsample queries, schema &
-> physical-type definition, Arrow/Parquet, and OpenTelemetry.
+> `POST /api/v1/interpolate/ilp`, the **downsample/aggregation query**
+> (`POST /api/v1/downsample` + `…/ilp` — min/max/avg/sum/first/last over
+> epoch-grid-aligned buckets, reductions in `BigDecimal`), and a Prometheus
+> `/metrics` surface. Still to do: DB/subject/aspect management, range/point
+> queries, schema & physical-type definition, Arrow/Parquet, and OpenTelemetry.
 
 A commercial DB can't lead with an embedded Rust API + TUI. Build an `axum` server:
 create DB / subject / aspect; define schema/physical type; batch ingest; range query;
