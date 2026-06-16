@@ -320,7 +320,7 @@ async fn interpolate_ilp_inner(params: &IlpParams, body: &str) -> Result<Json<In
 }
 
 /// Map an optional precision token to [`TimestampPrecision`] (default ns).
-fn parse_precision_token(token: Option<&str>) -> Result<TimestampPrecision, ApiError> {
+pub(crate) fn parse_precision_token(token: Option<&str>) -> Result<TimestampPrecision, ApiError> {
 	match token.map(str::to_ascii_lowercase).as_deref() {
 		None | Some("ns" | "nanoseconds" | "nanos") => Ok(TimestampPrecision::Nanoseconds),
 		Some("us" | "µs" | "microseconds" | "micros") => Ok(TimestampPrecision::Microseconds),
@@ -341,7 +341,7 @@ fn parse_spline_token(token: Option<&str>) -> Result<Spline, ApiError> {
 }
 
 /// Map an optional resolution token to [`Resolution`] (default minutes).
-fn parse_resolution_token(token: Option<&str>) -> Result<Resolution, ApiError> {
+pub(crate) fn parse_resolution_token(token: Option<&str>) -> Result<Resolution, ApiError> {
 	match token.map(str::to_ascii_lowercase).as_deref() {
 		Some("nanoseconds") => Ok(Resolution::Nanoseconds),
 		Some("microseconds") => Ok(Resolution::Microseconds),

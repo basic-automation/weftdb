@@ -32,7 +32,7 @@ use axum::{extract::State, Json};
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-use splimes::{Resolution, SECONDS_IN_DAY, SECONDS_IN_HOUR, SECONDS_IN_MINUTE, SECONDS_IN_MONTH, SECONDS_IN_WEEK, SECONDS_IN_YEAR};
+use splimes::{Point, Resolution, SECONDS_IN_DAY, SECONDS_IN_HOUR, SECONDS_IN_MINUTE, SECONDS_IN_MONTH, SECONDS_IN_WEEK, SECONDS_IN_YEAR};
 
 use crate::{
 	interpolate::{ApiError, InputPoint, ResolutionSpec}, metrics::SharedMetrics
@@ -144,53 +144,144 @@ pub async fn downsample(State(metrics): State<SharedMetrics>, Json(request): Jso
 /// Default reductions when the caller does not name any.
 const DEFAULT_AGGREGATIONS: [Aggregation; 3] = [Aggregation::Min, Aggregation::Max, Aggregation::Avg];
 
-/// The core reduction: validate, sort, window, then fold contiguous same-bucket
-/// runs into aggregates. Synchronous — no engine call is needed.
+/// The JSON path: validate, lift to `BigDecimal` points, derive the window, then
+/// delegate to [`run_downsample`]. Synchronous — no engine call is needed.
 fn downsample_inner(request: DownsampleRequest) -> Result<Json<DownsampleResponse>, ApiError> {
-	if request.points.is_empty() {
+	let DownsampleRequest { resolution, aggregations, start, end, points: input } = request;
+	if input.is_empty() {
 		return Err(ApiError::BadRequest("`points` must not be empty".to_string()));
 	}
 
-	let resolution: Resolution = request.resolution.into();
-	let aggregations = if request.aggregations.is_empty() { DEFAULT_AGGREGATIONS.to_vec() } else { request.aggregations.clone() };
+	let resolution: Resolution = resolution.into();
+	let aggregations = if aggregations.is_empty() { DEFAULT_AGGREGATIONS.to_vec() } else { aggregations };
 
-	let mut points = request.points;
+	let mut points: Vec<Point> = Vec::with_capacity(input.len());
+	for sample in &input {
+		let value = BigDecimal::from_f64(sample.value).ok_or_else(|| ApiError::BadRequest("a point value is not a finite number".to_string()))?;
+		points.push(Point::new(sample.timestamp, value));
+	}
 	points.sort_by_key(|p| p.timestamp);
-	let start = request.start.unwrap_or_else(|| points.first().map_or_else(Utc::now, |p| p.timestamp));
-	let end = request.end.unwrap_or_else(|| points.last().map_or_else(Utc::now, |p| p.timestamp));
+	let start = start.unwrap_or_else(|| points.first().map_or_else(Utc::now, |p| p.timestamp));
+	let end = end.unwrap_or_else(|| points.last().map_or_else(Utc::now, |p| p.timestamp));
+
+	run_downsample(&points, start, end, resolution, &aggregations)
+}
+
+/// Run the bucketed reduction over a prepared, ascending-sorted point set and
+/// shape the response. Shared by the JSON and ILP entry points so both produce
+/// identical result envelopes.
+///
+/// Sorted timestamps make same-bucket samples contiguous, so a single pass over
+/// the windowed series folds each bucket without a hash map.
+fn run_downsample(points: &[Point], start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Json<DownsampleResponse>, ApiError> {
 	if end < start {
 		return Err(ApiError::BadRequest("`end` must not be before `start`".to_string()));
 	}
 
-	// Sorted timestamps make same-bucket samples contiguous, so a single pass
-	// over the windowed series folds each bucket without a hash map.
 	let mut series: Vec<DownsampleBucket> = Vec::new();
 	let mut input_points = 0usize;
 	let mut current: Option<(i64, BucketAcc)> = None;
-	for point in &points {
+	for point in points {
 		if point.timestamp < start || point.timestamp > end {
 			continue;
 		}
-		let value = BigDecimal::from_f64(point.value).ok_or_else(|| ApiError::BadRequest("a point value is not a finite number".to_string()))?;
 		let base = resolution.to_base(&point.timestamp).map_err(|err| ApiError::Internal(err.to_string()))?;
 		input_points += 1;
 		match &mut current {
-			Some((cur_base, acc)) if *cur_base == base => acc.push(value),
+			Some((cur_base, acc)) if *cur_base == base => acc.push(point.value.clone()),
 			_ => {
 				if let Some((cur_base, acc)) = current.take() {
-					series.push(acc.finish(resolution, cur_base, &aggregations)?);
+					series.push(acc.finish(resolution, cur_base, aggregations)?);
 				}
 				let mut acc = BucketAcc::default();
-				acc.push(value);
+				acc.push(point.value.clone());
 				current = Some((base, acc));
 			}
 		}
 	}
 	if let Some((cur_base, acc)) = current.take() {
-		series.push(acc.finish(resolution, cur_base, &aggregations)?);
+		series.push(acc.finish(resolution, cur_base, aggregations)?);
 	}
 
 	Ok(Json(DownsampleResponse { resolution: resolution.to_string(), aggregations: aggregations.iter().map(|a| a.as_str().to_string()).collect(), input_points, buckets: series.len(), series }))
+}
+
+/// Query parameters for the ILP downsample endpoint.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DownsampleIlpParams {
+	/// Numeric field to project each line-protocol record onto (required).
+	pub field: String,
+	/// Timestamp precision token (`ns`/`us`/`ms`/`s`); defaults to nanoseconds.
+	#[serde(default)]
+	pub precision: Option<String>,
+	/// Resolution token (`seconds`..`years`); defaults to minutes.
+	#[serde(default)]
+	pub resolution: Option<String>,
+	/// Comma-separated reductions (e.g. `min,max,avg`); defaults to `min,max,avg`.
+	#[serde(default)]
+	pub agg: Option<String>,
+}
+
+/// Downsample an `InfluxDB` Line Protocol payload into grid-aligned buckets.
+///
+/// Handles `POST /api/v1/downsample/ilp`: parses the body as ILP (the wire format
+/// TSBS / `InfluxDB` / `QuestDB` speak), projects the chosen numeric field into a
+/// series, and reduces it. The payload is the request body (`text/plain`); the
+/// field, precision, resolution, and aggregation list are query parameters. The
+/// window is the data's own timestamp span. Parsing uses the shared, vendor-
+/// neutral `dsp-line-protocol` crate so the server and the benchmark harness
+/// accept the exact same dialect.
+///
+/// # Errors
+///
+/// Returns [`ApiError::BadRequest`] for an unknown precision/resolution/aggregation
+/// token, a malformed payload, or fewer than one usable point, and
+/// [`ApiError::Internal`] if a timestamp cannot be mapped onto the grid.
+pub async fn downsample_ilp(State(metrics): State<SharedMetrics>, axum::extract::Query(params): axum::extract::Query<DownsampleIlpParams>, body: String) -> Result<Json<DownsampleResponse>, ApiError> {
+	metrics.record_downsample_request();
+	let result = downsample_ilp_inner(&params, &body);
+	match &result {
+		Ok(response) => metrics.add_downsample_buckets(response.0.buckets as u64),
+		Err(_) => metrics.record_downsample_error(),
+	}
+	result
+}
+
+fn downsample_ilp_inner(params: &DownsampleIlpParams, body: &str) -> Result<Json<DownsampleResponse>, ApiError> {
+	let precision = crate::interpolate::parse_precision_token(params.precision.as_deref())?;
+	let resolution = crate::interpolate::parse_resolution_token(params.resolution.as_deref())?;
+	let aggregations = parse_aggregations(params.agg.as_deref())?;
+
+	// `parse_points` returns points sorted ascending by timestamp.
+	let points = dsp_line_protocol::parse_points(body, &params.field, precision).map_err(|err| ApiError::BadRequest(err.to_string()))?;
+	if points.is_empty() {
+		return Err(ApiError::BadRequest(format!("no points carry field `{}` with a timestamp", params.field)));
+	}
+	let start = points.first().map_or_else(Utc::now, |p| p.timestamp);
+	let end = points.last().map_or_else(Utc::now, |p| p.timestamp);
+
+	run_downsample(&points, start, end, resolution, &aggregations)
+}
+
+/// Parse a comma-separated aggregation list (default `[min, max, avg]`).
+fn parse_aggregations(token: Option<&str>) -> Result<Vec<Aggregation>, ApiError> {
+	let Some(token) = token.map(str::trim).filter(|t| !t.is_empty()) else {
+		return Ok(DEFAULT_AGGREGATIONS.to_vec());
+	};
+	token.split(',').map(str::trim).filter(|t| !t.is_empty()).map(parse_aggregation_token).collect()
+}
+
+/// Map a single aggregation token to [`Aggregation`].
+fn parse_aggregation_token(token: &str) -> Result<Aggregation, ApiError> {
+	match token.to_ascii_lowercase().as_str() {
+		"min" => Ok(Aggregation::Min),
+		"max" => Ok(Aggregation::Max),
+		"avg" => Ok(Aggregation::Avg),
+		"sum" => Ok(Aggregation::Sum),
+		"first" => Ok(Aggregation::First),
+		"last" => Ok(Aggregation::Last),
+		other => Err(ApiError::BadRequest(format!("unknown aggregation `{other}` (use min/max/avg/sum/first/last)"))),
+	}
 }
 
 /// Running aggregate state for one bucket, accumulated in `BigDecimal` so sums
@@ -401,5 +492,67 @@ mod tests {
 		assert_eq!(Aggregation::Min.as_str(), "min");
 		assert_eq!(Aggregation::Avg.as_str(), "avg");
 		assert_eq!(Aggregation::Last.as_str(), "last");
+	}
+
+	#[test]
+	fn aggregation_list_parsing() {
+		assert_eq!(parse_aggregations(None).unwrap(), DEFAULT_AGGREGATIONS.to_vec());
+		assert_eq!(parse_aggregations(Some("  ")).unwrap(), DEFAULT_AGGREGATIONS.to_vec());
+		assert_eq!(parse_aggregations(Some("min,SUM, last")).unwrap(), vec![Aggregation::Min, Aggregation::Sum, Aggregation::Last]);
+		assert!(parse_aggregations(Some("min,bogus")).is_err());
+	}
+
+	async fn post_text(uri: &str, body: &str) -> (StatusCode, serde_json::Value) {
+		let response = app().oneshot(Request::builder().method("POST").uri(uri).header("content-type", "text/plain").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+		let status = response.status();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let value = serde_json::from_slice(&bytes).unwrap();
+		(status, value)
+	}
+
+	#[tokio::test]
+	async fn ilp_endpoint_downsamples_a_line_protocol_payload() {
+		// Three cpu rows in one minute and one in the next (seconds precision).
+		// 1000000020 is minute-aligned (divisible by 60), so the first three rows
+		// share a minute bucket and the +60s row opens the next.
+		let payload = "cpu,host=a load=0 1000000020\ncpu,host=a load=10 1000000040\ncpu,host=a load=20 1000000060\ncpu,host=a load=50 1000000080\n";
+		let (status, body) = post_text("/api/v1/downsample/ilp?field=load&precision=s&resolution=minutes&agg=min,max,avg", payload).await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["resolution"], "minutes");
+		assert_eq!(body["input_points"], 4);
+		assert_eq!(body["buckets"], 2);
+		let first = &body["series"][0];
+		assert_eq!(first["count"], 3);
+		assert_eq!(first["aggregations"]["min"], 0.0);
+		assert_eq!(first["aggregations"]["max"], 20.0);
+		assert_eq!(first["aggregations"]["avg"], 10.0);
+		let second = &body["series"][1];
+		assert_eq!(second["count"], 1);
+		assert_eq!(second["aggregations"]["avg"], 50.0);
+	}
+
+	#[tokio::test]
+	async fn ilp_endpoint_defaults_aggregations() {
+		let payload = "cpu load=1 1\ncpu load=3 2\n";
+		let (status, body) = post_text("/api/v1/downsample/ilp?field=load&precision=s", payload).await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["aggregations"], serde_json::json!(["min", "max", "avg"]));
+	}
+
+	#[tokio::test]
+	async fn ilp_endpoint_rejects_unknown_aggregation() {
+		let payload = "cpu load=1 1\ncpu load=2 2\n";
+		let (status, body) = post_text("/api/v1/downsample/ilp?field=load&agg=median", payload).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST);
+		assert!(body["error"].as_str().unwrap().contains("unknown aggregation"));
+	}
+
+	#[tokio::test]
+	async fn ilp_endpoint_rejects_missing_field() {
+		// No record carries field `temp`, so the projected series is empty.
+		let payload = "cpu load=1 1\ncpu load=2 2\n";
+		let (status, body) = post_text("/api/v1/downsample/ilp?field=temp&precision=s", payload).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST);
+		assert!(body["error"].as_str().unwrap().contains("no points"));
 	}
 }
