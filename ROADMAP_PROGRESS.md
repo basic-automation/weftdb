@@ -1058,3 +1058,105 @@ it needs no new dependency tree; OR begin **Arrow/Parquet** bench-report output
 own increment. Either advances the public API / interchange surface.
 
 **PR:** https://github.com/physics515/DSP/pull/15
+
+---
+
+## 2026-06-16 — Phase 2 continued: dsp-server query/response surface (5 increments)
+
+Followed the prior run's explicit "next step": continue Phase 2 on `dsp-server`
+with the downsample/aggregation query, since it needs no new dependency tree.
+Landed five bounded, additive increments that fill out the server's query and
+response surface — all pure-Rust, no new deps, vendor-neutral — then verified
+every new endpoint against a live bound server.
+
+**Item:** roadmap Phase 2 (benchmark-grade server/API): downsample query, point
+query, and the raw/interpolated/extrapolated response distinction (Phase-2
+acceptance nuance + backlog item B-tags, synthetic-point marking).
+
+**Increment 1 — `POST /api/v1/downsample`** (commit `b084e2b`)
+- New `dsp-server/src/downsample.rs`: reduce a JSON series into epoch-grid-
+  aligned time buckets with a per-bucket aggregate (min/max/avg/sum/first/last)
+  + count. Buckets align via the engine's own `Resolution::to_base` index;
+  `bucket_start` is its overflow-checked inverse. Reductions accumulate in
+  `BigDecimal` (no float drift); only the final wire value narrows to f64.
+  Single-pass fold over the sorted, range-windowed series. Defaults to
+  [min,max,avg]. `metrics.rs` gains per-endpoint `DownsampleMetrics` (3 new
+  Prometheus counters); `lib.rs` registers the route. Tests: +7 (26 lib).
+
+**Increment 2 — `POST /api/v1/downsample/ilp`** (commit `ba65595`)
+- ILP variant mirroring the interpolate JSON/ILP pair. Extracted the fold core
+  into `run_downsample(points, start, end, resolution, aggregations)` over
+  `splimes::Point`s, shared by both entry points (identical envelope). ILP
+  payload as text/plain body; field/precision/resolution as query params and
+  `agg=min,max,avg` comma-separated (`parse_aggregations`). Reuses the shared
+  `dsp-line-protocol` parser; `parse_precision_token`/`parse_resolution_token`
+  made `pub(crate)`. Tests: +5 (31 lib).
+
+**Increment 3 — README + ROADMAP docs** (commit `1653df2`)
+- Documented both downsample endpoints (curl examples, params, bucketing
+  semantics, new counters) and recorded the downsample query as landed on the
+  ROADMAP Phase-2 status note. Docs only.
+
+**Increment 4 — `POST /api/v1/interpolate/point`** (commit `f66503c`)
+- Single-instant lookup: evaluates the fitted spline at one instant by
+  interpolating a minimal 1ns-wide grid at the instant and reading back the
+  value there (the spline value at the instant is independent of the rest of
+  the grid; `auto_interpolate` rejects a zero-span range, hence the +1ns end).
+  A `ValueKind` enum labelled the result interpolated vs extrapolated. README +
+  ROADMAP updated. Tests: +4 (35 lib).
+
+**Increment 5 — per-point provenance marking** (commit `948012f`)
+- Delivered the Phase-2 synthetic-point marking nuance (B-tags): unified the
+  kind enum into `PointKind { Raw, Interpolated, Extrapolated }` (replacing the
+  point-only `ValueKind`) + a shared `classify` helper. `OutputPoint` gains a
+  `kind` field; `run_interpolation` captures input timestamps + observed span
+  before the engine consumes the points and marks each grid point (raw when it
+  coincides with an observation, extrapolated outside the span, else
+  interpolated). The point endpoint reuses the classifier, so a lookup landing
+  on an observation now reports `raw`. Additive, back-compatible. Tests: +1 net
+  (36 lib).
+
+**Build/test/clippy (real, nightly `rustc 1.98.0-nightly (cb46fbb8c 2026-06-08)`):**
+- `cargo build --workspace` — GREEN (confirmed at baseline and at end).
+- `cargo test -p dsp-server` — **36 lib pass** (was 19 at the start of the
+  night; +17 across the five increments).
+- `cargo clippy -p dsp-server --all-targets` — **0 warnings** under
+  `#![warn(clippy::pedantic, clippy::nursery, clippy::all)]`; every lint hit
+  (unnecessary_sort_by, too_long_first_doc_paragraph ×2, needless_pass_by_value)
+  was fixed structurally, never with `#[allow]`. The 4 pre-existing `splimes`
+  `sort_by_key` warnings in untouched files remain.
+- `cargo fmt -p dsp-server` — clean (hard tabs, project rustfmt).
+- **Live end-to-end verified** against a bound server (`127.0.0.1:18099`):
+  point knot → `raw` (value 60), point past-range → `extrapolated` (value 120),
+  point midpoint → `interpolated` (value 30); range provenance → first/last
+  `raw`, interior `interpolated`, 61 points; downsample JSON + ILP → correct
+  2-bucket aggregates; `/metrics` reflects the `dsp_downsample_*` counters.
+- Scope note: tests scoped to the touched `dsp-server` crate; the change is
+  confined to that one leaf crate (+ docs), and the full workspace **build** is
+  green. Did not run the full (heavy wgpu/GPU/turso) `cargo test --workspace`
+  to stay in the night's budget — no other crate was touched.
+
+**Done vs open:** DONE — the `dsp-server` query/response surface now covers the
+downsample/aggregation query (JSON + ILP), the single-instant point query, and
+the raw/interpolated/extrapolated provenance distinction across both the range
+and point responses. OPEN (Phase 2 remainder) — raw range/stored queries and
+DB/subject/aspect management (need a stored-data model), schema & physical-type
+definition, Arrow/Parquet import-export, OpenTelemetry, Python/Rust SDKs. Also
+still open from prior runs: the external-engine **DuckDB adapter**, the other
+competitor adapters, the **Parquet** bench-report format, the rest of the
+hardware block, and the standalone methodology document.
+
+**STOP REASON:** natural-arc — five coherent increments completed the
+query/response arc on `dsp-server` (downsample JSON → downsample ILP → docs →
+point query → provenance marking), above the 2–4 bar. A clean stopping point:
+the next Phase-2 slices each pull a fresh concern onto this PR — stored range
+queries need a measurement-data model, and Arrow/Parquet needs the `arrow`/
+`parquet` dependency tree — so each is better started on its own PR.
+
+**Next step (tomorrow):** continue Phase 2. Best next slice = begin the
+**Arrow/Parquet interchange** as its own increment (`dsp-bench --parquet`
+bench-report output, or a `dsp-server` Arrow response encoding), deliberately
+adding the `arrow`/`parquet` deps as their own increment; OR start the
+**stored-data / DB-subject-aspect model** that the raw range/point *storage*
+queries (as opposed to the stateless compute endpoints landed so far) require —
+the first slice toward Storage v2's control-plane catalog.
