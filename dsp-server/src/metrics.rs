@@ -27,6 +27,8 @@ pub type SharedMetrics = Arc<Metrics>;
 pub struct Metrics {
 	/// Counters for `POST /api/v1/interpolate`.
 	pub interpolate: InterpolateMetrics,
+	/// Counters for `POST /api/v1/downsample`.
+	pub downsample: DownsampleMetrics,
 }
 
 /// Counters for the interpolation endpoint.
@@ -37,11 +39,21 @@ pub struct InterpolateMetrics {
 	output_points: AtomicU64,
 }
 
+/// Counters for the downsample endpoint.
+#[derive(Debug, Default)]
+pub struct DownsampleMetrics {
+	requests: AtomicU64,
+	errors: AtomicU64,
+	output_buckets: AtomicU64,
+}
+
 /// A point-in-time read of [`Metrics`], convenient for assertions and rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetricsSnapshot {
 	/// Interpolation-endpoint counters.
 	pub interpolate: InterpolateSnapshot,
+	/// Downsample-endpoint counters.
+	pub downsample: DownsampleSnapshot,
 }
 
 /// A point-in-time read of [`InterpolateMetrics`].
@@ -53,6 +65,17 @@ pub struct InterpolateSnapshot {
 	pub errors: u64,
 	/// Total interpolated output points served across all successful requests.
 	pub output_points: u64,
+}
+
+/// A point-in-time read of [`DownsampleMetrics`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DownsampleSnapshot {
+	/// Total downsample requests received (including failures).
+	pub requests: u64,
+	/// Downsample requests that returned an error.
+	pub errors: u64,
+	/// Total non-empty buckets served across all successful requests.
+	pub output_buckets: u64,
 }
 
 impl Metrics {
@@ -71,10 +94,25 @@ impl Metrics {
 		self.interpolate.output_points.fetch_add(count, Ordering::Relaxed);
 	}
 
+	/// Count a downsample request (record on entry, before validation).
+	pub fn record_downsample_request(&self) {
+		self.downsample.requests.fetch_add(1, Ordering::Relaxed);
+	}
+
+	/// Count a downsample request that failed.
+	pub fn record_downsample_error(&self) {
+		self.downsample.errors.fetch_add(1, Ordering::Relaxed);
+	}
+
+	/// Add to the running total of downsample buckets served.
+	pub fn add_downsample_buckets(&self, count: u64) {
+		self.downsample.output_buckets.fetch_add(count, Ordering::Relaxed);
+	}
+
 	/// Take a consistent-enough snapshot of all counters.
 	#[must_use]
 	pub fn snapshot(&self) -> MetricsSnapshot {
-		MetricsSnapshot { interpolate: InterpolateSnapshot { requests: self.interpolate.requests.load(Ordering::Relaxed), errors: self.interpolate.errors.load(Ordering::Relaxed), output_points: self.interpolate.output_points.load(Ordering::Relaxed) } }
+		MetricsSnapshot { interpolate: InterpolateSnapshot { requests: self.interpolate.requests.load(Ordering::Relaxed), errors: self.interpolate.errors.load(Ordering::Relaxed), output_points: self.interpolate.output_points.load(Ordering::Relaxed) }, downsample: DownsampleSnapshot { requests: self.downsample.requests.load(Ordering::Relaxed), errors: self.downsample.errors.load(Ordering::Relaxed), output_buckets: self.downsample.output_buckets.load(Ordering::Relaxed) } }
 	}
 
 	/// Render the counters in the Prometheus text exposition format (v0.0.4).
@@ -83,7 +121,7 @@ impl Metrics {
 		use std::fmt::Write as _;
 		let snap = self.snapshot();
 		let mut out = String::with_capacity(512);
-		let counters = [("dsp_interpolate_requests_total", "Total interpolation requests received.", snap.interpolate.requests), ("dsp_interpolate_errors_total", "Interpolation requests that returned an error.", snap.interpolate.errors), ("dsp_interpolate_output_points_total", "Total interpolated output points served.", snap.interpolate.output_points)];
+		let counters = [("dsp_interpolate_requests_total", "Total interpolation requests received.", snap.interpolate.requests), ("dsp_interpolate_errors_total", "Interpolation requests that returned an error.", snap.interpolate.errors), ("dsp_interpolate_output_points_total", "Total interpolated output points served.", snap.interpolate.output_points), ("dsp_downsample_requests_total", "Total downsample requests received.", snap.downsample.requests), ("dsp_downsample_errors_total", "Downsample requests that returned an error.", snap.downsample.errors), ("dsp_downsample_output_buckets_total", "Total downsample buckets served.", snap.downsample.output_buckets)];
 		for (name, help, value) in counters {
 			// `writeln!` into a String is infallible.
 			let _ = writeln!(out, "# HELP {name} {help}");
@@ -129,6 +167,8 @@ mod tests {
 		assert!(text.contains("dsp_interpolate_requests_total 1"));
 		assert!(text.contains("dsp_interpolate_output_points_total 5"));
 		// No value line is left dangling without a preceding TYPE line.
-		assert_eq!(text.matches("# TYPE ").count(), 3);
+		assert_eq!(text.matches("# TYPE ").count(), 6);
+		// The downsample counters are exposed too.
+		assert!(text.contains("# TYPE dsp_downsample_requests_total counter"));
 	}
 }

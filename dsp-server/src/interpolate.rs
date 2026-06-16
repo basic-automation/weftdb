@@ -42,6 +42,39 @@ pub struct OutputPoint {
 	pub timestamp: DateTime<Utc>,
 	/// Interpolated value (narrowed from the engine's `BigDecimal`).
 	pub value: f64,
+	/// Provenance of this value: `raw` (the grid point coincides with an input
+	/// observation), `interpolated` (within the observed span), or `extrapolated`
+	/// (outside it).
+	pub kind: PointKind,
+}
+
+/// Provenance of a reconstructed value.
+///
+/// Lets a caller never silently treat a synthetic point as an observed one (the
+/// Phase-2 raw/interpolated/extrapolated distinction — backlog item B-tags,
+/// synthetic-point marking).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PointKind {
+	/// The output timestamp coincides with an input observation.
+	Raw,
+	/// The timestamp lies within `[min_ts, max_ts]` of the inputs (and is not raw).
+	Interpolated,
+	/// The timestamp lies outside the observed span.
+	Extrapolated,
+}
+
+/// Classify an output timestamp against the input observations: `Raw` if it
+/// coincides with an input, else `Extrapolated` when outside the observed span,
+/// else `Interpolated`.
+fn classify(timestamp: DateTime<Utc>, input_timestamps: &std::collections::HashSet<DateTime<Utc>>, min_ts: Option<DateTime<Utc>>, max_ts: Option<DateTime<Utc>>) -> PointKind {
+	if input_timestamps.contains(&timestamp) {
+		return PointKind::Raw;
+	}
+	match (min_ts, max_ts) {
+		(Some(lo), Some(hi)) if timestamp < lo || timestamp > hi => PointKind::Extrapolated,
+		_ => PointKind::Interpolated,
+	}
 }
 
 /// Spline method selector. Mirrors [`splimes::Spline`] but with stable,
@@ -249,11 +282,95 @@ async fn run_interpolation(mut points: Vec<Point>, start: DateTime<Utc>, end: Da
 	let spline_label = spline.to_string();
 	let resolution_label = format!("{resolution:?}");
 
+	// Capture input provenance before the engine consumes the points, so each
+	// output grid point can be marked raw / interpolated / extrapolated.
+	let input_timestamps: std::collections::HashSet<DateTime<Utc>> = points.iter().map(|p| p.timestamp).collect();
+	let min_ts = points.iter().map(|p| p.timestamp).min();
+	let max_ts = points.iter().map(|p| p.timestamp).max();
+
 	let output = splimes::auto_interpolate(&mut points, start, end, resolution, spline).await.map_err(|err| ApiError::internal(err.to_string()))?;
 
-	let points: Vec<OutputPoint> = output.iter().map(|p| OutputPoint { timestamp: p.timestamp, value: p.value.to_f64().unwrap_or_default() }).collect();
+	let points: Vec<OutputPoint> = output.iter().map(|p| OutputPoint { timestamp: p.timestamp, value: p.value.to_f64().unwrap_or_default(), kind: classify(p.timestamp, &input_timestamps, min_ts, max_ts) }).collect();
 
 	Ok(Json(InterpolateResponse { spline: spline_label, resolution: resolution_label, output_points: points.len(), input_points, points }))
+}
+
+/// Request body for `POST /api/v1/interpolate/point`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PointRequest {
+	/// Spline method (default cubic).
+	#[serde(default)]
+	pub spline: SplineSpec,
+	/// The single instant to evaluate the reconstructed signal at.
+	pub instant: DateTime<Utc>,
+	/// Input samples (must be non-empty).
+	pub points: Vec<InputPoint>,
+}
+
+/// Response body for `POST /api/v1/interpolate/point`.
+#[derive(Debug, Clone, Serialize)]
+pub struct PointResponse {
+	/// Spline method actually used (`Display` form).
+	pub spline: String,
+	/// The instant evaluated, echoed back.
+	pub instant: DateTime<Utc>,
+	/// Number of input samples accepted.
+	pub input_points: usize,
+	/// The reconstructed value at the instant (narrowed from `BigDecimal`).
+	pub value: f64,
+	/// Whether the value is raw (coincides with an input), interpolated
+	/// (in-range), or extrapolated (out-of-range).
+	pub kind: PointKind,
+}
+
+/// Handle `POST /api/v1/interpolate/point`: evaluate the reconstructed signal at
+/// a single instant (point query / single-instant lookup), labelling the result
+/// interpolated vs extrapolated.
+///
+/// # Errors
+///
+/// Returns [`ApiError::BadRequest`] for an empty point set or a non-finite value,
+/// and [`ApiError::Internal`] if the engine fails.
+pub async fn interpolate_point(State(metrics): State<SharedMetrics>, Json(request): Json<PointRequest>) -> Result<Json<PointResponse>, ApiError> {
+	metrics.record_interpolate_request();
+	let result = interpolate_point_inner(request).await;
+	match &result {
+		Ok(_) => metrics.add_output_points(1),
+		Err(_) => metrics.record_interpolate_error(),
+	}
+	result
+}
+
+async fn interpolate_point_inner(request: PointRequest) -> Result<Json<PointResponse>, ApiError> {
+	let PointRequest { spline, instant, points: input } = request;
+	if input.is_empty() {
+		return Err(ApiError::bad_request("`points` must not be empty"));
+	}
+
+	let mut points: Vec<Point> = Vec::with_capacity(input.len());
+	for sample in &input {
+		let value = BigDecimal::from_f64(sample.value).ok_or_else(|| ApiError::bad_request("a point value is not a finite number"))?;
+		points.push(Point::new(sample.timestamp, value));
+	}
+
+	let input_timestamps: std::collections::HashSet<DateTime<Utc>> = points.iter().map(|p| p.timestamp).collect();
+	let min_ts = points.iter().map(|p| p.timestamp).min();
+	let max_ts = points.iter().map(|p| p.timestamp).max();
+	let kind = classify(instant, &input_timestamps, min_ts, max_ts);
+
+	let spline: Spline = spline.into();
+	let spline_label = spline.to_string();
+
+	// Evaluate the fitted spline at the single instant: the spline's value at
+	// `instant` is independent of the rest of the output grid, so we interpolate a
+	// minimal nanosecond-wide grid that begins at the instant and read the value
+	// back at the instant itself (the first grid point). `auto_interpolate`
+	// rejects a zero-span range, hence the `+1ns` end.
+	let end = instant + Resolution::Nanoseconds.to_step();
+	let output = splimes::auto_interpolate(&mut points, instant, end, Resolution::Nanoseconds, spline).await.map_err(|err| ApiError::internal(err.to_string()))?;
+	let value = output.first().ok_or_else(|| ApiError::internal("interpolation produced no value at the instant"))?.value.to_f64().unwrap_or_default();
+
+	Ok(Json(PointResponse { spline: spline_label, instant, input_points: input.len(), value, kind }))
 }
 
 /// Query parameters for the ILP interpolation endpoint.
@@ -320,7 +437,7 @@ async fn interpolate_ilp_inner(params: &IlpParams, body: &str) -> Result<Json<In
 }
 
 /// Map an optional precision token to [`TimestampPrecision`] (default ns).
-fn parse_precision_token(token: Option<&str>) -> Result<TimestampPrecision, ApiError> {
+pub(crate) fn parse_precision_token(token: Option<&str>) -> Result<TimestampPrecision, ApiError> {
 	match token.map(str::to_ascii_lowercase).as_deref() {
 		None | Some("ns" | "nanoseconds" | "nanos") => Ok(TimestampPrecision::Nanoseconds),
 		Some("us" | "µs" | "microseconds" | "micros") => Ok(TimestampPrecision::Microseconds),
@@ -341,7 +458,7 @@ fn parse_spline_token(token: Option<&str>) -> Result<Spline, ApiError> {
 }
 
 /// Map an optional resolution token to [`Resolution`] (default minutes).
-fn parse_resolution_token(token: Option<&str>) -> Result<Resolution, ApiError> {
+pub(crate) fn parse_resolution_token(token: Option<&str>) -> Result<Resolution, ApiError> {
 	match token.map(str::to_ascii_lowercase).as_deref() {
 		Some("nanoseconds") => Ok(Resolution::Nanoseconds),
 		Some("microseconds") => Ok(Resolution::Microseconds),
@@ -404,6 +521,34 @@ mod tests {
 			let v = p["value"].as_f64().unwrap();
 			assert!((0.0..=60.0).contains(&v), "value {v} out of [0,60]");
 		}
+	}
+
+	#[tokio::test]
+	async fn range_points_carry_provenance() {
+		// On a 10s grid the endpoints t=0 and t=60 coincide with inputs (raw); the
+		// interior grid points are synthetic (interpolated). Nothing is out of range
+		// because the grid spans exactly the input range.
+		let body = serde_json::json!({
+			"spline": "linear",
+			"resolution": "seconds",
+			"points": [
+				{ "timestamp": ts(0), "value": 0.0 },
+				{ "timestamp": ts(60), "value": 60.0 },
+			],
+		});
+		let (status, body) = post_json("/api/v1/interpolate", body).await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		let pts = body["points"].as_array().unwrap();
+		let first = &pts[0];
+		assert_eq!(first["timestamp"], "1970-01-01T00:00:00Z");
+		assert_eq!(first["kind"], "raw");
+		let last = pts.last().unwrap();
+		assert_eq!(last["timestamp"], "1970-01-01T00:01:00Z");
+		assert_eq!(last["kind"], "raw");
+		// An interior synthetic point is interpolated.
+		assert!(pts.iter().any(|p| p["kind"] == "interpolated"));
+		// No point is extrapolated (the grid stays within the input span).
+		assert!(!pts.iter().any(|p| p["kind"] == "extrapolated"));
 	}
 
 	#[tokio::test]
@@ -504,5 +649,69 @@ mod tests {
 		assert!(matches!(parse_precision_token(None), Ok(TimestampPrecision::Nanoseconds)));
 		assert!(matches!(parse_precision_token(Some("MS")), Ok(TimestampPrecision::Milliseconds)));
 		assert!(parse_precision_token(Some("fortnights")).is_err());
+	}
+
+	#[tokio::test]
+	async fn point_query_interpolates_at_an_instant() {
+		// Linear 0→60 over a minute; the value at the 30s midpoint is 30, in-range.
+		let body = serde_json::json!({
+			"spline": "linear",
+			"instant": ts(30),
+			"points": [
+				{ "timestamp": ts(0), "value": 0.0 },
+				{ "timestamp": ts(60), "value": 60.0 },
+			],
+		});
+		let (status, body) = post_json("/api/v1/interpolate/point", body).await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["spline"], "Linear");
+		assert_eq!(body["input_points"], 2);
+		assert_eq!(body["kind"], "interpolated");
+		let v = body["value"].as_f64().unwrap();
+		assert!((v - 30.0).abs() < 1e-6, "value {v} != 30");
+	}
+
+	#[tokio::test]
+	async fn point_query_passes_through_a_knot() {
+		// Evaluating exactly at an input timestamp returns that input's value and
+		// is marked `raw` (it coincides with an observation, not a synthetic point).
+		let body = serde_json::json!({
+			"spline": "linear",
+			"instant": ts(60),
+			"points": [
+				{ "timestamp": ts(0), "value": 0.0 },
+				{ "timestamp": ts(60), "value": 60.0 },
+			],
+		});
+		let (status, body) = post_json("/api/v1/interpolate/point", body).await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["kind"], "raw");
+		let v = body["value"].as_f64().unwrap();
+		assert!((v - 60.0).abs() < 1e-6, "value {v} != 60");
+	}
+
+	#[tokio::test]
+	async fn point_query_flags_extrapolation() {
+		// An instant past the last sample is labelled extrapolated.
+		let body = serde_json::json!({
+			"spline": "linear",
+			"instant": ts(120),
+			"points": [
+				{ "timestamp": ts(0), "value": 0.0 },
+				{ "timestamp": ts(60), "value": 60.0 },
+			],
+		});
+		let (status, body) = post_json("/api/v1/interpolate/point", body).await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["kind"], "extrapolated");
+		assert!(body["value"].as_f64().is_some());
+	}
+
+	#[tokio::test]
+	async fn point_query_empty_points_is_bad_request() {
+		let body = serde_json::json!({ "instant": ts(0), "points": [] });
+		let (status, body) = post_json("/api/v1/interpolate/point", body).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST);
+		assert!(body["error"].as_str().unwrap().contains("points"));
 	}
 }
