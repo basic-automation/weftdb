@@ -36,7 +36,7 @@ use axum::{
 	routing::{get, post}, Json, Router
 };
 pub use downsample::{downsample, downsample_ilp, Aggregation, DownsampleRequest, DownsampleResponse};
-pub use interpolate::{interpolate, interpolate_ilp, interpolate_point, InterpolateRequest, InterpolateResponse, PointRequest, PointResponse, ValueKind};
+pub use interpolate::{interpolate, interpolate_ilp, interpolate_point, InterpolateRequest, InterpolateResponse, PointKind, PointRequest, PointResponse};
 pub use metrics::{Metrics, MetricsSnapshot, SharedMetrics};
 use serde::Serialize;
 

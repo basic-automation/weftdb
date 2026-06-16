@@ -58,7 +58,10 @@ curl -s -X POST http://127.0.0.1:8080/api/v1/interpolate \
 - `points` — non-empty `{timestamp, value}` array.
 
 The response carries the spline/resolution used, the input/output point counts,
-and the interpolated `points`.
+and the interpolated `points`. Each output point carries a `kind` marking its
+provenance — `raw` (the grid point coincides with an input observation),
+`interpolated` (synthetic, within the observed span), or `extrapolated` (outside
+it) — so a consumer never silently treats a synthetic value as an observed one.
 
 ### `POST /api/v1/interpolate/ilp`
 
@@ -86,9 +89,10 @@ zero-span series returns `400` with a `{"error": "..."}` body.
 ### `POST /api/v1/interpolate/point`
 
 Single-instant lookup: evaluate the reconstructed signal at one timestamp. The
-response labels the value **`interpolated`** (the instant lies within the
-observed `[min, max]` span) or **`extrapolated`** (outside it), so a caller never
-silently treats an out-of-range reconstruction as an observed value.
+response labels the value **`raw`** (the instant coincides with an input
+observation), **`interpolated`** (within the observed `[min, max]` span), or
+**`extrapolated`** (outside it), so a caller never silently treats a synthetic
+reconstruction as an observed value.
 
 ```sh
 curl -s -X POST http://127.0.0.1:8080/api/v1/interpolate/point \
