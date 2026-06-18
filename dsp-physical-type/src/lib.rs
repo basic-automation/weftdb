@@ -22,17 +22,22 @@
 //!
 //! ## Shape
 //!
-//! - [`PhysicalType`] — the schema-declared encoding (this slice: [`F64`],
-//!   [`ScaledI64`], [`BigDecimalText`]; the remaining encodings named in Phase
-//!   4.1 — `F32`, `ScaledI128`, `Decimal128` — land in following slices).
+//! - [`PhysicalType`] — the schema-declared encoding. All six named in Phase
+//!   4.1 are present: [`F64`], [`F32`], [`ScaledI64`], [`ScaledI128`],
+//!   [`Decimal128`], [`BigDecimalText`].
 //! - [`PhysicalValue`] — one value held in its encoded physical form.
 //! - [`PhysicalType::encode`] — `BigDecimal` -> [`Encoded`] (`PhysicalValue` +
 //!   [`Exactness`]).
 //! - [`PhysicalValue::to_logical`] — the always-available inverse, reconstructing
 //!   the `BigDecimal` the encoding represents.
+//! - [`PhysicalType::profile`] — declarative per-encoding metadata
+//!   ([`PhysicalProfile`]: storage width, lossless/hot-path eligibility).
 //!
 //! [`F64`]: PhysicalType::F64
+//! [`F32`]: PhysicalType::F32
 //! [`ScaledI64`]: PhysicalType::ScaledI64
+//! [`ScaledI128`]: PhysicalType::ScaledI128
+//! [`Decimal128`]: PhysicalType::Decimal128
 //! [`BigDecimalText`]: PhysicalType::BigDecimalText
 //!
 //! ## Vendor-neutrality
@@ -242,7 +247,47 @@ fn measure(original: &BigDecimal, decoded: &BigDecimal) -> Exactness {
 	}
 }
 
+/// Declarative metadata for a [`PhysicalType`].
+///
+/// This realizes the "each declaring storage encoding, eligibility, exactness
+/// guarantees" sentence of roadmap Phase 4.1 as data a schema, planner, or
+/// benchmark report can consume without re-deriving it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhysicalProfile {
+	/// The encoding's stable identifier (see [`PhysicalType::name`]).
+	pub name: &'static str,
+	/// Fixed per-value storage width in bytes for DSP's in-memory/columnar
+	/// representation, or `None` for the variable-width
+	/// [`BigDecimalText`](PhysicalType::BigDecimalText). (For
+	/// [`Decimal128`](PhysicalType::Decimal128) this counts the 16-byte mantissa
+	/// plus its 8-byte per-value scale, not IEEE-754 decimal128's packed 16.)
+	pub fixed_width_bytes: Option<usize>,
+	/// `true` only when the encoding reconstructs **every** finite value exactly
+	/// (i.e. [`BigDecimalText`](PhysicalType::BigDecimalText)). The fixed-width
+	/// encodings are exact only within their range/scale and otherwise report
+	/// [`Exactness::Lossy`].
+	pub always_lossless: bool,
+	/// `true` when values can live on the SIMD/GPU/columnar hot path as a
+	/// fixed-width column — every encoding except the variable-width
+	/// [`BigDecimalText`](PhysicalType::BigDecimalText), which must go through
+	/// `BigDecimal`.
+	pub hot_path_eligible: bool,
+}
+
 impl PhysicalType {
+	/// The declarative [`PhysicalProfile`] for this encoding.
+	#[must_use]
+	pub const fn profile(self) -> PhysicalProfile {
+		let fixed_width_bytes = match self {
+			Self::F32 => Some(4),
+			Self::F64 | Self::ScaledI64 { .. } => Some(8),
+			Self::ScaledI128 { .. } => Some(16),
+			Self::Decimal128 => Some(24),
+			Self::BigDecimalText => None,
+		};
+		PhysicalProfile { name: self.name(), fixed_width_bytes, always_lossless: matches!(self, Self::BigDecimalText), hot_path_eligible: fixed_width_bytes.is_some() }
+	}
+
 	/// Encode a logical `BigDecimal` into this physical type, reporting the
 	/// [`Exactness`] of the conversion.
 	///
@@ -502,6 +547,25 @@ mod tests {
 		let enc = PhysicalType::Decimal128.encode(&v).expect("encodes");
 		assert!(enc.exactness.is_exact());
 		assert_eq!(enc.value.to_logical(), v);
+	}
+
+	#[test]
+	fn profiles_describe_each_encoding() {
+		let f64 = PhysicalType::F64.profile();
+		assert_eq!(f64.fixed_width_bytes, Some(8));
+		assert!(f64.hot_path_eligible);
+		assert!(!f64.always_lossless);
+
+		assert_eq!(PhysicalType::F32.profile().fixed_width_bytes, Some(4));
+		assert_eq!(PhysicalType::ScaledI64 { scale: 2 }.profile().fixed_width_bytes, Some(8));
+		assert_eq!(PhysicalType::ScaledI128 { scale: 2 }.profile().fixed_width_bytes, Some(16));
+		assert_eq!(PhysicalType::Decimal128.profile().fixed_width_bytes, Some(24));
+
+		let text = PhysicalType::BigDecimalText.profile();
+		assert_eq!(text.fixed_width_bytes, None);
+		assert!(!text.hot_path_eligible, "text cannot live on the fixed-width hot path");
+		assert!(text.always_lossless, "text is the only universally lossless encoding");
+		assert_eq!(text.name, "bigdecimal_text");
 	}
 
 	#[test]
