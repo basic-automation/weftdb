@@ -1272,3 +1272,5 @@ the existing v1–v4 fixtures), turning the new crate into a measurable
 north-star-metric outcome. Alternatively begin **4.2 timestamp semantics**
 (integer-epoch encoding + delta/delta-of-delta) as a sibling encoding module, or
 take the Phase-2 stored-data model the server query endpoints still need.
+
+**PR:** https://github.com/physics515/DSP/pull/17
