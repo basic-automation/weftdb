@@ -9,5 +9,5 @@ name = "dsp_physical_type"
 path = "src/lib.rs"
 
 [dependencies]
-bigdecimal = { workspace = true }
+bigdecimal = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
