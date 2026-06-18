@@ -1183,6 +1183,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsp-physical-type"
+version = "0.1.0"
+dependencies = [
+ "bigdecimal",
+ "serde",
+]
+
+[[package]]
 name = "dsp-server"
 version = "0.1.0"
 dependencies = [
