@@ -1162,3 +1162,115 @@ queries (as opposed to the stateless compute endpoints landed so far) require �
 the first slice toward Storage v2's control-plane catalog.
 
 **PR:** https://github.com/physics515/DSP/pull/16
+
+---
+
+## 2026-06-18 — Phase 4.1: dsp-physical-type crate, 0→1 (5 increments)
+
+Took a fresh roadmap track. The prior two nights completed the Phase-2
+`dsp-server` query/response arc and explicitly flagged the next slices
+(Arrow/Parquet deps; stored-data model) as separate concerns for their own
+PRs. Rather than half-build one of those, started the next-highest not-started
+foundational item: **physical numeric encodings** (Updated priority order #5;
+Phase 4.1; Immediate Next Action #8) — entirely absent before tonight. Built it
+from scratch as a new vendor-neutral crate through five bounded, additive,
+all-green increments.
+
+**Item:** roadmap Phase 4.1 (physical numeric encodings) / Immediate Next
+Action #8. New crate `dsp-physical-type` (only `bigdecimal` + `serde`; wired
+into the workspace as a member and a workspace dependency).
+
+**Increment 1 — new crate + first three encodings** (commit `bae75c3`)
+- `dsp-physical-type/{Cargo.toml,src/lib.rs}`. `PhysicalType` {`F64`,
+  `ScaledI64{scale}`, `BigDecimalText`}; `PhysicalValue`; `PhysicalType::encode`
+  -> `Encoded` (value + `Exactness`); `PhysicalValue::to_logical` inverse.
+  The hard-constraint-#4 rule is enforced at the type level: encode always
+  reports `Exact` or `Lossy{abs_error}` — a `BigDecimal -> f64` that drops
+  digits is a *reported* loss, never silent. `EncodeError::{Overflow,
+  NotFinite}` for unrepresentable values. Workspace root `Cargo.toml` +
+  `Cargo.lock` updated. Tests: 9.
+
+**Increment 2 — remaining three encodings** (commit `260f52b`)
+- Added `F32`, `ScaledI128{scale}`, `Decimal128` to `PhysicalType`/
+  `PhysicalValue`/`encode`/`to_logical`/`name`. Decimal128 = 128-bit mantissa
+  with a per-value scale, fit via a digit-shedding `fit_i128` loop
+  (round-half-away-from-zero `round_div_10`); it never errors, only sheds
+  low-order digits (reported Lossy). Completes the six encodings Phase 4.1
+  names. Tests: +7 (16).
+
+**Increment 3 — declarative PhysicalProfile** (commit `7a1806a`)
+- `PhysicalType::profile()` -> `PhysicalProfile { name, fixed_width_bytes,
+  always_lossless, hot_path_eligible }` — the "each declaring storage encoding,
+  eligibility, exactness guarantees" sentence of 4.1 as consumable data (F32=4,
+  F64/ScaledI64=8, ScaledI128=16, Decimal128=24, text=variable; text is the only
+  universally lossless / non-hot-path encoding). Refreshed the stale module-doc.
+  Tests: +1 (17).
+
+**Increment 4 — columnar batch encoding** (commit `c72d6df`)
+- New `src/column.rs`: `encode_column(physical_type, &[BigDecimal]) ->
+  Result<ColumnEncoding, ColumnEncodeError>` — one-pass, all-or-nothing on
+  representability (first Overflow/NotFinite fails with its index; a segment
+  can't mix encodings), lossy-but-representable values tallied into
+  `lossy_count` + `max_abs_error`. `ColumnEncoding` exposes `is_exact`,
+  `len`/`is_empty`, `decode`, and `estimated_bytes` (len*width, or summed string
+  bytes for text) — the value-column term of bytes/point for Storage v2 and
+  DSP-Bench. Enabled the bigdecimal `serde` feature (ColumnEncoding is
+  Serialize/Deserialize). Tests: +5 (22).
+
+**Increment 5 — advisory recommend_encoding** (commit `65db9f1`)
+- `recommend_encoding(values, max_abs_error) -> ColumnEncoding`: the narrowest
+  hot-path encoding holding a whole column within a tolerance (F32 4B -> F64 8B
+  -> ScaledI64 8B at the column's minimal exact scale -> ScaledI128 16B ->
+  Decimal128 24B -> BigDecimalText backstop). The roadmap's "fastest *safe*
+  physical encoding" intent as an advisory — schema still declares; this informs
+  tooling/ingest/bench. Tests: +5 (27).
+
+**Docs** (commit `28efcaf`) — ROADMAP.md: Phase 4.1 marked started with what
+shipped + what remains; Immediate Next Action #8 marked ✅ (delivered and
+exceeded).
+
+**Build/test/clippy (real, nightly `rustc 1.98.0-nightly (cb46fbb8c 2026-06-08)`):**
+- `cargo build --workspace` — GREEN at baseline and at end (the new member
+  builds into the workspace; nothing else regressed).
+- `cargo test -p dsp-physical-type` — **27 lib pass**, 0 failed (grew 9 -> 16 ->
+  17 -> 22 -> 27 across the five increments; round-trip + exactness +
+  overflow/not-finite + column aggregation + recommendation behaviour).
+- `cargo clippy -p dsp-physical-type --all-targets` — **0 warnings** under
+  `#![warn(clippy::pedantic, clippy::nursery, clippy::all)]`. Every lint hit
+  (too_long_first_doc_paragraph, const-fn len/is_empty, cmp_owned) was fixed
+  structurally — no `#[allow]`.
+- `cargo fmt -p dsp-physical-type` — clean (hard tabs, project rustfmt).
+- Scope note: the change is one new isolated leaf crate (+ root Cargo wiring +
+  ROADMAP docs); no existing crate's source was touched, and the full workspace
+  **build** is green. Did not run the full (heavy wgpu/GPU/turso) `cargo test
+  --workspace` to stay in the night's budget — no other crate was modified.
+
+**Done vs open:** DONE — Immediate Next Action #8; all six Phase-4.1
+`PhysicalType` encodings with explicit never-silent exactness, profile
+metadata, columnar batch encode + bytes estimate, and advisory selection.
+OPEN (Phase 4 remainder) — schema-level per-aspect encoding *declaration*;
+wiring `estimated_bytes`/`recommend_encoding` into the DSP-Bench bytes/point
+report (a schema v6 bump); timestamp semantics (4.2); the columnar segment
+store itself (4.3); data skipping (4.4); Arrow arrays (4.5). Also still open
+from prior runs: Phase-2 stored range/DB-subject-aspect model, Arrow/Parquet
+interchange, OpenTelemetry; the external-engine DuckDB adapter and other
+competitor adapters; the standalone methodology document.
+
+**STOP REASON:** natural-arc — five coherent increments built the entire
+Phase-4.1 physical-encoding foundation from nothing (crate -> all six encodings
+-> profile metadata -> columnar batch -> advisory selection), above the 2–4
+bar. The next step (surfacing bytes/point in the bench report) is a cross-crate
+schema-versioned change (dsp-bench schema v5 -> v6 with back-compat tests) — a
+distinct concern better started on its own PR than half-built onto this one, the
+same discipline the prior two runs applied.
+
+**Next step (tomorrow):** continue Phase 4. Best next slice = wire
+`dsp-physical-type` into the **DSP-Bench bytes/point report** — call
+`recommend_encoding`/`estimated_bytes` over a generated dataset's values and add
+a `storage` block to `BenchResult` (schema v6, with a back-compat test mirroring
+the existing v1–v4 fixtures), turning the new crate into a measurable
+north-star-metric outcome. Alternatively begin **4.2 timestamp semantics**
+(integer-epoch encoding + delta/delta-of-delta) as a sibling encoding module, or
+take the Phase-2 stored-data model the server query endpoints still need.
+
+**PR:** https://github.com/physics515/DSP/pull/17
