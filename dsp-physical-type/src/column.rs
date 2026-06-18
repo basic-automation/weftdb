@@ -131,6 +131,48 @@ pub fn encode_column(physical_type: PhysicalType, values: &[BigDecimal]) -> Resu
 	Ok(ColumnEncoding { physical_type, values: out, lossy_count, max_abs_error })
 }
 
+/// The number of fractional decimal digits needed to hold every value exactly —
+/// the minimal shared `scale` for a `ScaledI*` encoding of the column.
+fn max_fractional_digits(values: &[BigDecimal]) -> u8 {
+	values.iter()
+		.map(|v| {
+			let (_mantissa, exponent) = v.normalized().as_bigint_and_exponent();
+			u8::try_from(exponent.max(0)).unwrap_or(u8::MAX)
+		})
+		.max()
+		.unwrap_or(0)
+}
+
+/// **Advisory** encoding selection: the narrowest hot-path [`PhysicalType`] that
+/// encodes this whole column within `max_abs_error`.
+///
+/// This implements the roadmap's "execute each series in the fastest *safe*
+/// physical encoding" intent (hard constraint #4) as a recommendation: schema
+/// still *declares* the encoding, but tooling, ingest heuristics, and bench
+/// reports want a principled suggestion plus the realized bytes/point. Candidates
+/// are tried cheapest-first — `F32` (4 B), `F64` (8 B), `ScaledI64` (8 B) at the
+/// column's minimal exact scale, `ScaledI128` (16 B), `Decimal128` (24 B) — and
+/// the first whose [`ColumnEncoding::max_abs_error`] is within the tolerance
+/// wins. [`PhysicalType::BigDecimalText`] is the always-exact backstop, so a
+/// result is guaranteed (an empty column trivially picks the cheapest, `F32`).
+///
+/// Returns the chosen [`ColumnEncoding`] directly — both the decision and the
+/// encoded column — so the caller need not re-encode.
+#[must_use]
+pub fn recommend_encoding(values: &[BigDecimal], max_abs_error: &BigDecimal) -> ColumnEncoding {
+	let scale = max_fractional_digits(values);
+	let candidates = [PhysicalType::F32, PhysicalType::F64, PhysicalType::ScaledI64 { scale }, PhysicalType::ScaledI128 { scale }, PhysicalType::Decimal128, PhysicalType::BigDecimalText];
+	for physical_type in candidates {
+		if let Ok(encoding) = encode_column(physical_type, values) {
+			if &encoding.max_abs_error <= max_abs_error {
+				return encoding;
+			}
+		}
+	}
+	// Unreachable: BigDecimalText always encodes exactly (error 0 <= tolerance).
+	encode_column(PhysicalType::BigDecimalText, values).unwrap_or_else(|_| ColumnEncoding { physical_type: PhysicalType::BigDecimalText, values: Vec::new(), lossy_count: 0, max_abs_error: BigDecimal::from(0) })
+}
+
 #[cfg(test)]
 mod tests {
 	use std::str::FromStr;
@@ -191,5 +233,56 @@ mod tests {
 		assert!(enc.is_exact());
 		assert!(enc.is_empty());
 		assert_eq!(enc.estimated_bytes(), 0);
+	}
+
+	#[test]
+	fn recommend_prefers_cheapest_exact_for_small_integers() {
+		// 1, 2, 3 are all exact in binary32 — the cheapest hot-path encoding wins.
+		let values = col(&["1", "2", "3"]);
+		let rec = recommend_encoding(&values, &BigDecimal::from(0));
+		assert_eq!(rec.physical_type, PhysicalType::F32);
+		assert!(rec.is_exact());
+	}
+
+	#[test]
+	fn recommend_falls_to_scaled_int_when_floats_are_lossy() {
+		// 0.1/0.2/0.3 are not binary-exact, so an exact requirement skips F32/F64
+		// and lands on ScaledI64 at the column's minimal scale (1).
+		let values = col(&["0.1", "0.2", "0.3"]);
+		let rec = recommend_encoding(&values, &BigDecimal::from(0));
+		assert_eq!(rec.physical_type, PhysicalType::ScaledI64 { scale: 1 });
+		assert!(rec.is_exact());
+		assert_eq!(rec.decode(), values);
+	}
+
+	#[test]
+	fn recommend_uses_a_lossy_float_within_tolerance() {
+		// With a generous tolerance the same column takes the cheapest encoding
+		// that fits — lossy F32.
+		let values = col(&["0.1", "0.2", "0.3"]);
+		let rec = recommend_encoding(&values, &BigDecimal::from_str("0.01").unwrap());
+		assert_eq!(rec.physical_type, PhysicalType::F32);
+		assert!(!rec.is_exact());
+	}
+
+	#[test]
+	fn recommend_backstops_to_text_for_exact_high_precision() {
+		// A 40-digit value with a fractional part: ScaledI128 overflows,
+		// Decimal128 is lossy, so an exact requirement falls to BigDecimalText.
+		let mut whole = String::from("1");
+		whole.push_str(&"0".repeat(39));
+		let big = format!("{whole}.5");
+		let values = col(&[&big]);
+		let rec = recommend_encoding(&values, &BigDecimal::from(0));
+		assert_eq!(rec.physical_type, PhysicalType::BigDecimalText);
+		assert!(rec.is_exact());
+		assert_eq!(rec.decode(), values);
+	}
+
+	#[test]
+	fn recommend_on_empty_column_picks_cheapest() {
+		let rec = recommend_encoding(&[], &BigDecimal::from(0));
+		assert_eq!(rec.physical_type, PhysicalType::F32);
+		assert!(rec.is_empty());
 	}
 }
