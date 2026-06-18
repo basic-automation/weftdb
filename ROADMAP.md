@@ -232,7 +232,15 @@ JSON").
 - **4.1 Physical numeric encodings** (per aspect): `F32`, `F64`, `ScaledI64`,
   `ScaledI128`, `Decimal128`, `BigDecimalText` — each declaring storage encoding,
   compression/GPU/interpolation eligibility, exactness guarantees, conversion
-  behavior.
+  behavior. *(Started — the vendor-neutral **`dsp-physical-type`** crate ships
+  all six `PhysicalType` encodings with `encode`/`to_logical` and an explicit
+  `Exactness` (Exact / Lossy-with-residual / never-silent) per hard constraint
+  #4; a declarative `PhysicalProfile` (storage width, lossless/hot-path
+  eligibility); a columnar `encode_column` aggregating exactness + estimating
+  bytes/point; and an advisory `recommend_encoding` (fastest-safe selection
+  within a tolerance). `BigDecimal` stays the logical type. Still to do here:
+  schema-level declaration of per-aspect encodings + wiring into the bench
+  bytes/point report and Storage v2 segments.)*
 - **4.2 Timestamp semantics:** integer epoch internally (ns/µs as needed), explicit
   tz + leap-second policy, monotonic ordering; delta / delta-of-delta / bit-pack / RLE.
 - **4.3 Columnar segment store** (`AspectStorageMode::{LibSqlRows, SegmentedColumnar,
@@ -659,7 +667,18 @@ redistributed. *For commercial trust, be more transparent than competitors.*
    min/max/mean/stddev and seeded **bootstrap confidence intervals**
    (`LatencyStats::bootstrap_cis`, wired into `run_profile` →
    `BenchResult.latency_ci`) landed in `dsp-bench/src/stats.rs`.)*
-8. Add physical value types for at least `F64`, `ScaledI64`, `BigDecimalText`.
+8. ✅ Add physical value types for at least `F64`, `ScaledI64`,
+   `BigDecimalText`. *(Delivered and exceeded: the vendor-neutral
+   **`dsp-physical-type`** crate ships all six Phase-4.1 `PhysicalType`
+   encodings — `F64`, `F32`, `ScaledI64`, `ScaledI128`, `Decimal128`,
+   `BigDecimalText` — each with `encode` reporting an explicit `Exactness`
+   (Exact / Lossy-with-residual-error / never-silent, per hard constraint #4),
+   an always-available `to_logical` inverse, a declarative `PhysicalProfile`
+   (storage width + lossless/hot-path eligibility), a columnar `encode_column`
+   (aggregate exactness + `estimated_bytes` for bytes/point), and an advisory
+   `recommend_encoding` that picks the narrowest hot-path encoding within an
+   error tolerance. `BigDecimal` remains the logical/API type. 27 tests; 0
+   clippy warnings under pedantic+nursery.)*
 9. Prototype columnar segment reads for one aspect type.
 10. Publish a methodology document **before** any performance claim.
 
