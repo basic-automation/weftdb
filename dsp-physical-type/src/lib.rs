@@ -61,6 +61,11 @@ pub enum PhysicalType {
 	/// floating point (e.g. `0.5`, `2.25`); `0.1` and most decimal fractions
 	/// encode `Lossy`.
 	F64,
+	/// IEEE-754 binary32. Four bytes — half the width (and memory bandwidth) of
+	/// [`F64`](Self::F64), the cheapest GPU-upload path — at the cost of ~7
+	/// significant decimal digits. Exact only for binary-representable values
+	/// within that precision; `NotFinite` above the binary32 range (~3.4e38).
+	F32,
 	/// Fixed-point: the value is stored as a signed 64-bit mantissa interpreted
 	/// as `mantissa * 10^(-scale)`. Exact for any value whose magnitude fits an
 	/// `i64` once shifted by `scale` decimal places and which has no more than
@@ -70,6 +75,21 @@ pub enum PhysicalType {
 		/// Number of fractional decimal digits the mantissa carries.
 		scale: u8,
 	},
+	/// Fixed-point with a 128-bit mantissa: `mantissa * 10^(-scale)`. The wide
+	/// sibling of [`ScaledI64`](Self::ScaledI64) for aspects whose shifted
+	/// magnitude exceeds `i64` (~9.2e18) — high-precision financial or
+	/// scientific values — while staying integer-exact within `scale`.
+	ScaledI128 {
+		/// Number of fractional decimal digits the mantissa carries.
+		scale: u8,
+	},
+	/// Decimal floating point with a 128-bit mantissa and a **per-value** scale:
+	/// `mantissa * 10^(-scale)`. Unlike the fixed-scale `ScaledI*` encodings the
+	/// exponent rides with each value, so it represents any `BigDecimal` whose
+	/// significant digits fit `i128` (up to 38 digits) exactly, across a wide
+	/// dynamic range — values too large simply lose low-order digits (reported
+	/// `Lossy`), never erroring.
+	Decimal128,
 	/// Lossless decimal text — the verbatim plain-string form of the
 	/// `BigDecimal`. Always [`Exactness::Exact`] for every finite value, at the
 	/// cost of variable width and parse-on-read. The escape hatch for aspects
@@ -87,12 +107,29 @@ pub enum PhysicalValue {
 	/// An [`PhysicalType::F64`]-encoded value. Invariant: always finite (encode
 	/// rejects non-finite results).
 	F64(f64),
+	/// An [`PhysicalType::F32`]-encoded value. Invariant: always finite.
+	F32(f32),
 	/// A [`PhysicalType::ScaledI64`]-encoded value: `mantissa * 10^(-scale)`.
 	ScaledI64 {
 		/// The fixed-point mantissa.
 		mantissa: i64,
 		/// The fractional-digit scale shared by the aspect.
 		scale: u8,
+	},
+	/// A [`PhysicalType::ScaledI128`]-encoded value: `mantissa * 10^(-scale)`.
+	ScaledI128 {
+		/// The 128-bit fixed-point mantissa.
+		mantissa: i128,
+		/// The fractional-digit scale shared by the aspect.
+		scale: u8,
+	},
+	/// A [`PhysicalType::Decimal128`]-encoded value: `mantissa * 10^(-scale)`
+	/// with a per-value `scale`.
+	Decimal128 {
+		/// The 128-bit significand.
+		mantissa: i128,
+		/// This value's own base-10 scale (negative for magnitudes above 1).
+		scale: i64,
 	},
 	/// A [`PhysicalType::BigDecimalText`]-encoded value: the plain-string decimal.
 	BigDecimalText(String),
@@ -169,6 +206,27 @@ fn pow10(n: u8) -> BigDecimal {
 	BigDecimal::from(mantissa)
 }
 
+/// Divide a `BigInt` by 10, rounding half away from zero — one step of the
+/// digit-shedding loop that fits a mantissa into `i128` for
+/// [`PhysicalType::Decimal128`].
+fn round_div_10(n: &BigInt) -> BigInt {
+	let bias = if n.sign() == Sign::Minus { BigInt::from(-5) } else { BigInt::from(5) };
+	(n + bias) / BigInt::from(10)
+}
+
+/// Reduce `(mantissa, scale)` (value = `mantissa * 10^(-scale)`) until the
+/// mantissa fits `i128`, shedding one low-order digit per step. Returns the
+/// fitted `(i128, scale)`; exactness is decided by the caller via [`measure`].
+fn fit_i128(mut mantissa: BigInt, mut scale: i64) -> (i128, i64) {
+	loop {
+		if let Some(m) = mantissa.to_i128() {
+			return (m, scale);
+		}
+		mantissa = round_div_10(&mantissa);
+		scale -= 1;
+	}
+}
+
 /// Classify the loss between an original value and its reconstruction.
 ///
 /// Zero-ness is decided on the difference's integer mantissa sign, which is
@@ -191,11 +249,13 @@ impl PhysicalType {
 	/// # Errors
 	///
 	/// Returns [`EncodeError::Overflow`] if the value does not fit a
-	/// [`ScaledI64`](Self::ScaledI64) mantissa, or [`EncodeError::NotFinite`] if
-	/// it has no finite [`F64`](Self::F64) representation. Lossy-but-representable
-	/// conversions are **not** errors — they succeed with
-	/// [`Exactness::Lossy`] so the caller decides whether the residual is
-	/// acceptable.
+	/// [`ScaledI64`](Self::ScaledI64) / [`ScaledI128`](Self::ScaledI128)
+	/// mantissa, or [`EncodeError::NotFinite`] if it has no finite
+	/// [`F64`](Self::F64) / [`F32`](Self::F32) representation. The
+	/// [`Decimal128`](Self::Decimal128) and [`BigDecimalText`](Self::BigDecimalText)
+	/// encodings never error. Lossy-but-representable conversions are **not**
+	/// errors — they succeed with [`Exactness::Lossy`] so the caller decides
+	/// whether the residual is acceptable.
 	pub fn encode(self, value: &BigDecimal) -> Result<Encoded, EncodeError> {
 		match self {
 			Self::F64 => {
@@ -204,10 +264,30 @@ impl PhysicalType {
 				let exactness = measure(value, &pv.to_logical());
 				Ok(Encoded { value: pv, exactness })
 			}
+			Self::F32 => {
+				let f = value.to_f32().filter(|f| f.is_finite()).ok_or(EncodeError::NotFinite)?;
+				let pv = PhysicalValue::F32(f);
+				let exactness = measure(value, &pv.to_logical());
+				Ok(Encoded { value: pv, exactness })
+			}
 			Self::ScaledI64 { scale } => {
 				let shifted = (value * pow10(scale)).round(0);
 				let mantissa = shifted.to_i64().ok_or(EncodeError::Overflow)?;
 				let pv = PhysicalValue::ScaledI64 { mantissa, scale };
+				let exactness = measure(value, &pv.to_logical());
+				Ok(Encoded { value: pv, exactness })
+			}
+			Self::ScaledI128 { scale } => {
+				let shifted = (value * pow10(scale)).round(0);
+				let mantissa = shifted.to_i128().ok_or(EncodeError::Overflow)?;
+				let pv = PhysicalValue::ScaledI128 { mantissa, scale };
+				let exactness = measure(value, &pv.to_logical());
+				Ok(Encoded { value: pv, exactness })
+			}
+			Self::Decimal128 => {
+				let (bigint, scale) = value.as_bigint_and_exponent();
+				let (mantissa, scale) = fit_i128(bigint, scale);
+				let pv = PhysicalValue::Decimal128 { mantissa, scale };
 				let exactness = measure(value, &pv.to_logical());
 				Ok(Encoded { value: pv, exactness })
 			}
@@ -224,7 +304,10 @@ impl PhysicalType {
 	pub const fn name(self) -> &'static str {
 		match self {
 			Self::F64 => "f64",
+			Self::F32 => "f32",
 			Self::ScaledI64 { .. } => "scaled_i64",
+			Self::ScaledI128 { .. } => "scaled_i128",
+			Self::Decimal128 => "decimal128",
 			Self::BigDecimalText => "bigdecimal_text",
 		}
 	}
@@ -241,7 +324,10 @@ impl PhysicalValue {
 	pub fn to_logical(&self) -> BigDecimal {
 		match self {
 			Self::F64(f) => BigDecimal::from_f64(*f).unwrap_or_default(),
+			Self::F32(f) => BigDecimal::from_f32(*f).unwrap_or_default(),
 			Self::ScaledI64 { mantissa, scale } => BigDecimal::new(BigInt::from(*mantissa), i64::from(*scale)),
+			Self::ScaledI128 { mantissa, scale } => BigDecimal::new(BigInt::from(*mantissa), i64::from(*scale)),
+			Self::Decimal128 { mantissa, scale } => BigDecimal::new(BigInt::from(*mantissa), *scale),
 			Self::BigDecimalText(s) => s.parse().unwrap_or_default(),
 		}
 	}
@@ -341,9 +427,90 @@ mod tests {
 	}
 
 	#[test]
+	fn f32_exact_and_lossy() {
+		// 0.5 is exact in binary32; 0.1 is not.
+		let exact = PhysicalType::F32.encode(&bd("0.5")).expect("encodes");
+		assert!(exact.exactness.is_exact());
+		assert_eq!(exact.value, PhysicalValue::F32(0.5));
+
+		let lossy = PhysicalType::F32.encode(&bd("0.1")).expect("encodes");
+		assert!(!lossy.exactness.is_exact(), "0.1 is not exact in binary32");
+		// f32 loses more than f64, so the error is larger than the f64 case
+		// but still small in absolute terms.
+		assert!(lossy.exactness.abs_error() < bd("0.0001"));
+	}
+
+	#[test]
+	fn f32_not_finite_above_range() {
+		// ~1e40 exceeds the binary32 range (~3.4e38) but is fine for f64.
+		let mut s = String::from("1");
+		s.push_str(&"0".repeat(40));
+		let v = bd(&s);
+		assert_eq!(PhysicalType::F32.encode(&v), Err(EncodeError::NotFinite));
+		assert!(PhysicalType::F64.encode(&v).is_ok(), "f64 still holds 1e40");
+	}
+
+	#[test]
+	fn scaled_i128_holds_values_beyond_i64() {
+		// 10^25 shifted by scale 2 = 10^27, far past i64 but inside i128.
+		let mut s = String::from("1");
+		s.push_str(&"0".repeat(25));
+		let v = bd(&s);
+		assert_eq!(PhysicalType::ScaledI64 { scale: 2 }.encode(&v), Err(EncodeError::Overflow));
+		let enc = PhysicalType::ScaledI128 { scale: 2 }.encode(&v).expect("encodes");
+		assert!(enc.exactness.is_exact());
+		assert_eq!(enc.value.to_logical(), v);
+	}
+
+	#[test]
+	fn scaled_i128_overflow_reported() {
+		// 10^40 shifted by scale 2 overflows even i128 (~1.7 * 10^38).
+		let mut s = String::from("1");
+		s.push_str(&"0".repeat(40));
+		let v = bd(&s);
+		assert_eq!(PhysicalType::ScaledI128 { scale: 2 }.encode(&v), Err(EncodeError::Overflow));
+	}
+
+	#[test]
+	fn decimal128_exact_within_38_digits() {
+		// A 30-digit decimal with a fractional part — fits i128 (38 digits) exactly.
+		let v = bd("123456789012345678901234.567890");
+		let enc = PhysicalType::Decimal128.encode(&v).expect("encodes");
+		assert!(enc.exactness.is_exact(), "30 significant digits fit i128");
+		assert_eq!(enc.value.to_logical(), v);
+	}
+
+	#[test]
+	fn decimal128_lossy_but_never_errors_beyond_38_digits() {
+		// 50 significant digits cannot fit i128: low-order digits are shed,
+		// reported Lossy, and the call still succeeds.
+		let v = bd("12345678901234567890123456789012345678901234567890");
+		let enc = PhysicalType::Decimal128.encode(&v).expect("never errors");
+		match enc.exactness {
+			Exactness::Lossy { abs_error } => assert!(abs_error > bd("0")),
+			Exactness::Exact => panic!("50 digits cannot be exact in i128"),
+		}
+		// The reconstruction stays the same order of magnitude as the original.
+		let decoded = enc.value.to_logical();
+		assert!(decoded > bd("1e49") && decoded < bd("1.3e49"), "magnitude preserved: {decoded}");
+	}
+
+	#[test]
+	fn decimal128_large_magnitude_round_trips() {
+		// A whole number above i64 round-trips exactly via the per-value scale.
+		let v = bd("9223372036854775808000"); // (i64::MAX + 1) * 1000
+		let enc = PhysicalType::Decimal128.encode(&v).expect("encodes");
+		assert!(enc.exactness.is_exact());
+		assert_eq!(enc.value.to_logical(), v);
+	}
+
+	#[test]
 	fn names_are_stable() {
 		assert_eq!(PhysicalType::F64.name(), "f64");
+		assert_eq!(PhysicalType::F32.name(), "f32");
 		assert_eq!(PhysicalType::ScaledI64 { scale: 3 }.name(), "scaled_i64");
+		assert_eq!(PhysicalType::ScaledI128 { scale: 3 }.name(), "scaled_i128");
+		assert_eq!(PhysicalType::Decimal128.name(), "decimal128");
 		assert_eq!(PhysicalType::BigDecimalText.name(), "bigdecimal_text");
 	}
 }
