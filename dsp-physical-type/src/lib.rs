@@ -57,7 +57,7 @@ pub mod column;
 use bigdecimal::{
 	num_bigint::{BigInt, Sign}, BigDecimal, FromPrimitive, ToPrimitive
 };
-pub use column::{encode_column, ColumnEncodeError, ColumnEncoding};
+pub use column::{encode_column, recommend_encoding, ColumnEncodeError, ColumnEncoding};
 use serde::{Deserialize, Serialize};
 
 /// A schema-declared physical encoding for an aspect's numeric values.
