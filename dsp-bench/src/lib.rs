@@ -126,12 +126,15 @@ pub async fn run_profile<A: SystemAdapter + ?Sized>(adapter: &A, profile: &Inter
 	// alignment fail — either way accuracy is simply absent, never fatal.
 	let accuracy = accuracy::synthetic_ground_truth(profile).ok().and_then(|truth| AccuracyMetrics::from_aligned(&last_output, &truth).ok());
 
-	// North-star storage term: estimate bytes/point of the *stored* value column
-	// under the narrowest lossless physical encoding (tolerance 0 — any loss would
-	// be reported, never silent). The input dataset is the data on disk; the
-	// interpolated output is computed on read, not stored.
+	// North-star storage term: estimate total bytes/point of the *stored* point
+	// columns — value under the narrowest lossless physical encoding (tolerance 0,
+	// so any loss would be reported, never silent) and timestamp under lossless
+	// delta-of-delta + varint coding. The input dataset is the data on disk; the
+	// interpolated output is computed on read, not stored. Timestamps are stored
+	// as microsecond epochs (the declared unit).
 	let stored_values: Vec<bigdecimal::BigDecimal> = dataset.iter().map(|p| p.value.clone()).collect();
-	let storage = Some(StorageEstimate::from_values(&stored_values, &bigdecimal::BigDecimal::from(0)));
+	let stored_timestamps: Vec<i64> = dataset.iter().map(|p| p.timestamp.timestamp_micros()).collect();
+	let storage = Some(StorageEstimate::from_columns(&stored_values, &stored_timestamps, dsp_physical_type::TimeUnit::Micros, &bigdecimal::BigDecimal::from(0)));
 
 	let latency = LatencyStats::from_samples(&samples_ns);
 	// Bootstrap CIs for the latency distribution (fair-protocol Phase 1.1). The
