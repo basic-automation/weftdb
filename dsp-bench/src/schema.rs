@@ -124,8 +124,9 @@ impl TimingBreakdown {
 ///   byte footprint, the realized bytes/point, and the exactness achieved within
 ///   the requested bound (per hard constraint #4 any loss is reported via
 ///   `lossy_count` / `max_abs_error`, never silent);
-/// - the **timestamp** column is delta-of-delta + zig-zag-varint encoded
-///   ([`encode_delta_of_delta`]) — lossless, and near-free for a regular series;
+/// - the **timestamp** column is delta-of-delta encoded
+///   ([`encode_delta_of_delta`]) then packed with the cheaper of zig-zag-varint
+///   or RLE — lossless, and near-free for a regular series;
 /// - [`total_bytes_per_point`](Self::total_bytes_per_point) sums the two, the
 ///   headline north-star figure.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -151,7 +152,9 @@ pub struct StorageEstimate {
 	/// Epoch unit the timestamp column was encoded in (e.g. `micros`).
 	#[serde(default)]
 	pub timestamp_unit: String,
-	/// Timestamp-column encoding (currently always `delta_of_delta`).
+	/// Timestamp-column encoding chosen: `delta_of_delta`, or
+	/// `delta_of_delta_rle` when run-length coding the second differences is
+	/// cheaper (regular series).
 	#[serde(default)]
 	pub timestamp_encoding: String,
 	/// Estimated byte footprint of the timestamp column (anchor + varint stream),
@@ -193,10 +196,23 @@ impl StorageEstimate {
 		let value_count = enc.len();
 		let bytes_per_point = per_point(estimated_value_bytes, value_count);
 
-		let timestamp_bytes = if timestamps.is_empty() { 0 } else { encode_delta_of_delta(timestamps, unit).estimated_bytes() };
+		// Encode the timestamp column delta-of-delta, then pick the cheaper of plain
+		// varint vs RLE-of-second-differences (RLE wins big on regular series, loses
+		// on non-repeating ones) — recording which scheme the reported size used.
+		let (timestamp_bytes, timestamp_encoding) = if timestamps.is_empty() {
+			(0, "delta_of_delta")
+		} else {
+			let dod = encode_delta_of_delta(timestamps, unit);
+			let (plain, rle) = (dod.estimated_bytes(), dod.rle_estimated_bytes());
+			if rle < plain {
+				(rle, "delta_of_delta_rle")
+			} else {
+				(plain, "delta_of_delta")
+			}
+		};
 		let timestamp_bytes_per_point = per_point(timestamp_bytes, timestamps.len());
 
-		Self { physical_type: enc.physical_type.name().to_string(), value_count, estimated_value_bytes, bytes_per_point, is_exact: enc.is_exact(), lossy_count: enc.lossy_count, max_abs_error: enc.max_abs_error.to_string(), tolerance: tolerance.to_string(), timestamp_unit: unit.name().to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes, timestamp_bytes_per_point, total_bytes_per_point: bytes_per_point + timestamp_bytes_per_point }
+		Self { physical_type: enc.physical_type.name().to_string(), value_count, estimated_value_bytes, bytes_per_point, is_exact: enc.is_exact(), lossy_count: enc.lossy_count, max_abs_error: enc.max_abs_error.to_string(), tolerance: tolerance.to_string(), timestamp_unit: unit.name().to_string(), timestamp_encoding: timestamp_encoding.to_string(), timestamp_bytes, timestamp_bytes_per_point, total_bytes_per_point: bytes_per_point + timestamp_bytes_per_point }
 	}
 }
 
@@ -426,20 +442,19 @@ mod tests {
 	}
 
 	#[test]
-	fn from_columns_adds_a_lossless_delta_of_delta_timestamp_cost() {
-		// A regular microsecond series delta-of-deltas to near-zero, so its packed
-		// cost is the 8-byte anchor + a 1-byte first delta + (n-2) one-byte zeros —
-		// far below a raw 8 bytes/point — and `total_bytes_per_point` sums it with
-		// the value column.
+	fn from_columns_picks_rle_for_a_regular_timestamp_series() {
+		// A regular microsecond series delta-of-deltas to a run of zeros, so the
+		// cheaper RLE codec wins and is recorded; its cost is the 8-byte anchor + a
+		// 1-byte first delta + a single (0, 3) run (value 1B + count 1B) = 11 —
+		// below the plain-varint 12 and far below a raw 8 bytes/point.
 		use std::str::FromStr;
 		let values: Vec<BigDecimal> = ["0.1", "0.2", "0.3", "0.4", "0.5"].iter().map(|s| BigDecimal::from_str(s).unwrap()).collect();
 		let timestamps: Vec<i64> = (0..5).map(|i| 1_000 + i * 10).collect();
 		let est = StorageEstimate::from_columns(&values, &timestamps, TimeUnit::Micros, &BigDecimal::from(0));
 		assert_eq!(est.timestamp_unit, "micros");
-		assert_eq!(est.timestamp_encoding, "delta_of_delta");
-		// anchor(8) + first_delta(1) + 3 zero second-differences(1 each) = 12.
-		assert_eq!(est.timestamp_bytes, 12);
-		assert!((est.timestamp_bytes_per_point - 12.0 / 5.0).abs() < f64::EPSILON);
+		assert_eq!(est.timestamp_encoding, "delta_of_delta_rle");
+		assert_eq!(est.timestamp_bytes, 11);
+		assert!((est.timestamp_bytes_per_point - 11.0 / 5.0).abs() < f64::EPSILON);
 		assert!((est.total_bytes_per_point - (est.bytes_per_point + est.timestamp_bytes_per_point)).abs() < f64::EPSILON);
 		// The timestamp column is far cheaper than storing raw 8-byte epochs.
 		assert!(est.timestamp_bytes_per_point < 8.0);
