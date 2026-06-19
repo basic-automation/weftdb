@@ -238,11 +238,22 @@ JSON").
   #4; a declarative `PhysicalProfile` (storage width, lossless/hot-path
   eligibility); a columnar `encode_column` aggregating exactness + estimating
   bytes/point; and an advisory `recommend_encoding` (fastest-safe selection
-  within a tolerance). `BigDecimal` stays the logical type. Still to do here:
-  schema-level declaration of per-aspect encodings + wiring into the bench
-  bytes/point report and Storage v2 segments.)*
+  within a tolerance). `BigDecimal` stays the logical type. **Bench wiring
+  landed:** DSP-Bench's `BenchResult` now carries a `StorageEstimate` block
+  (schema v6) — `recommend_encoding` over the stored value column plus the
+  timestamp column (4.2 below) gives a measured **total bytes/point**
+  (`StorageEstimate::from_columns`), the north-star cost term, surfaced in the
+  HTML report (`enc` / `val B/pt` / `tot B/pt`). Still to do here: schema-level
+  *declaration* of per-aspect encodings + Storage v2 segments.)*
 - **4.2 Timestamp semantics:** integer epoch internally (ns/µs as needed), explicit
   tz + leap-second policy, monotonic ordering; delta / delta-of-delta / bit-pack / RLE.
+  *(Started — `dsp-physical-type::timestamp` ships lossless **delta** and
+  **delta-of-delta** transforms over `i64` epochs (`TimeUnit` = seconds/millis/
+  micros/nanos), wrapping-safe round trips, a zig-zag + LEB128 varint byte
+  estimate, and **RLE** of the second-difference stream with a `best_estimated_bytes`
+  selector (varint vs RLE, whichever is smaller). A regular 1000-point column
+  packs to ~12 bytes total. The bench timestamp bytes/point uses this. Still to
+  do: bit-packing, explicit tz + leap-second policy, monotonic-order enforcement.)*
 - **4.3 Columnar segment store** (`AspectStorageMode::{LibSqlRows, SegmentedColumnar,
   Hybrid}`): append-friendly, immutable-after-seal, compactable, checksummed,
   page-indexed, random-access. Layout: `catalog.db` + per-aspect `metadata.db`,
