@@ -232,7 +232,7 @@ pub fn default_html_filename(profile: &str, adapter: &str) -> String {
 const HTML_STYLE: &str = "body{font-family:system-ui,sans-serif;margin:2rem;color:#1a1a1a}h1{font-size:1.4rem}.meta{color:#555;font-size:.9rem}table{border-collapse:collapse;margin-top:1rem;font-size:.9rem}th,td{border:1px solid #ccc;padding:.3rem .6rem;text-align:right}th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}thead{background:#f0f0f0}tr.best{background:#e7f7e7;font-weight:600}";
 
 /// Table header cells for [`BenchReport::to_html`], matching [`result_row_html`].
-const HTML_HEAD_CELLS: &str = "<th>adapter</th><th>shape</th><th>in</th><th>out</th><th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>mean ms</th><th>pts/s</th><th>correct</th><th>rmse</th><th>mae</th><th>max</th><th>bias</th>";
+const HTML_HEAD_CELLS: &str = "<th>adapter</th><th>shape</th><th>in</th><th>out</th><th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>mean ms</th><th>pts/s</th><th>correct</th><th>rmse</th><th>mae</th><th>max</th><th>bias</th><th>enc</th><th>B/pt</th>";
 
 /// Nanoseconds rendered as fractional milliseconds for display.
 #[allow(clippy::cast_precision_loss)]
@@ -275,8 +275,12 @@ fn result_row_html(r: &BenchResult, is_best: bool) -> String {
 	// Accuracy is present only for a synthetic profile; otherwise the four cells
 	// are em-dashes so the column stays aligned.
 	let accuracy = r.accuracy.map_or_else(|| "<td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td>".to_string(), |a| format!("<td>{:.4}</td><td>{:.4}</td><td>{:.4}</td><td>{:+.4}</td>", a.rmse, a.mae, a.max_abs_error, a.bias));
+	// Storage is present once `run_profile` estimates it; older artifacts and
+	// callers that omit it render two em-dashes so the columns stay aligned. The
+	// encoding name carries a lossy marker (`*`) so a non-exact pick is visible.
+	let storage = r.storage.as_ref().map_or_else(|| "<td>&mdash;</td><td>&mdash;</td>".to_string(), |s| format!("<td>{}{}</td><td>{:.2}</td>", escape_html(&s.physical_type), if s.is_exact { "" } else { "*" }, s.bytes_per_point));
 	let cls = if is_best { " class=\"best\"" } else { "" };
-	format!("<tr{cls}><td>{adapter}</td><td>{shape}</td><td>{in_pts}</td><td>{out_pts}</td><td>{p50:.3}</td><td>{p95:.3}</td><td>{p99:.3}</td><td>{mean:.3}</td><td>{tput:.0}</td><td>{correctness}</td>{accuracy}</tr>\n", in_pts = r.dataset.input_points, out_pts = r.dataset.output_points, p50 = ms(l.p50_ns), p95 = ms(l.p95_ns), p99 = ms(l.p99_ns), mean = ms(l.mean_ns), tput = r.throughput_points_per_sec)
+	format!("<tr{cls}><td>{adapter}</td><td>{shape}</td><td>{in_pts}</td><td>{out_pts}</td><td>{p50:.3}</td><td>{p95:.3}</td><td>{p99:.3}</td><td>{mean:.3}</td><td>{tput:.0}</td><td>{correctness}</td>{accuracy}{storage}</tr>\n", in_pts = r.dataset.input_points, out_pts = r.dataset.output_points, p50 = ms(l.p50_ns), p95 = ms(l.p95_ns), p99 = ms(l.p99_ns), mean = ms(l.mean_ns), tput = r.throughput_points_per_sec)
 }
 
 /// Escape the five HTML-significant characters so caller-supplied strings (adapter
@@ -479,6 +483,31 @@ mod tests {
 		// With no accuracy anywhere, no row is marked.
 		let plain = BenchReport::with_results(metadata(), vec![sample_result("dsp", true)]);
 		assert_eq!(plain.to_html().matches("class=\"best\"").count(), 0, "no accuracy -> no best row");
+	}
+
+	#[test]
+	fn to_html_renders_storage_columns_when_present_and_dashes_when_absent() {
+		// A result carrying a storage estimate must render its encoding name and
+		// bytes/point; a result without one (the sample default) shows em-dashes so
+		// the columns stay aligned. The header always carries the two storage cells.
+		let mut with_storage = sample_result("dsp", true);
+		with_storage.storage = Some(crate::schema::StorageEstimate { physical_type: "scaled_i64".to_string(), value_count: 200, estimated_value_bytes: 1600, bytes_per_point: 8.0, is_exact: true, lossy_count: 0, max_abs_error: "0".to_string(), tolerance: "0".to_string() });
+		let report = BenchReport::with_results(metadata(), vec![with_storage, sample_result("baseline-linear", true)]);
+		let html = report.to_html();
+		assert!(html.contains("<th>enc</th><th>B/pt</th>"), "header must carry storage columns: {html}");
+		assert!(html.contains("<td>scaled_i64</td><td>8.00</td>"), "storage cells must render: {html}");
+		// The storage-less row keeps the columns aligned with em-dashes.
+		assert!(html.contains("<td>&mdash;</td><td>&mdash;</td></tr>"), "absent storage must render dashes: {html}");
+	}
+
+	#[test]
+	fn to_html_marks_a_lossy_storage_encoding() {
+		// A non-exact encoding pick is flagged with a trailing `*` so a lossy storage
+		// choice is visible at a glance in the table.
+		let mut r = sample_result("dsp", true);
+		r.storage = Some(crate::schema::StorageEstimate { physical_type: "f64".to_string(), value_count: 10, estimated_value_bytes: 80, bytes_per_point: 8.0, is_exact: false, lossy_count: 3, max_abs_error: "0.0001".to_string(), tolerance: "0.001".to_string() });
+		let html = BenchReport::with_results(metadata(), vec![r]).to_html();
+		assert!(html.contains("<td>f64*</td><td>8.00</td>"), "lossy encoding must be flagged: {html}");
 	}
 
 	#[test]
