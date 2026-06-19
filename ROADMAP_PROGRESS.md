@@ -1274,3 +1274,121 @@ north-star-metric outcome. Alternatively begin **4.2 timestamp semantics**
 take the Phase-2 stored-data model the server query endpoints still need.
 
 **PR:** https://github.com/physics515/DSP/pull/17
+
+---
+
+## 2026-06-19 — Phase 4.1/4.2: bytes/point bench wiring + timestamp codecs (6 increments)
+
+Continued Phase 4 from where 2026-06-18 stopped. The prior run built the
+`dsp-physical-type` Phase-4.1 value encodings and logged the next step as
+*"wire `dsp-physical-type` into the DSP-Bench bytes/point report"*. Took exactly
+that, then drove it to a complete north-star-metric arc: the bench now reports a
+**total bytes/point** over both stored columns (value + timestamp), backed by
+real codecs — including the Phase-4.2 timestamp delta/delta-of-delta/RLE layer
+built this run.
+
+**Items:** roadmap Phase 4.1 (bench bytes/point wiring — the logged next step)
+and Phase 4.2 (timestamp semantics, 0→started). Crates touched: `dsp-bench`
+(schema v6 storage block + report rendering) and `dsp-physical-type` (new
+`timestamp` module).
+
+**Increment 1 — value bytes/point in BenchResult, schema v6** (commit `ccf26f5`)
+- `dsp-bench/src/schema.rs`: new `StorageEstimate` block on `BenchResult`
+  (`#[serde(default, skip_serializing_if)]`, schema v5→v6). `from_values` runs
+  `recommend_encoding` over the stored value column → chosen encoding, value
+  bytes, bytes/point, exactness (`lossy_count`/`max_abs_error`) within a
+  tolerance. `run_profile` estimates the input dataset (the stored data) at
+  tolerance 0 (narrowest lossless). Added `dsp-physical-type` dep. Back-compat
+  test (v5-without-storage parses) + omitted-when-absent test. Tests: +3.
+
+**Increment 2 — render storage in the HTML report** (commit `0edbc8b`)
+- `dsp-bench/src/report.rs`: `enc` + `B/pt` columns (later widened in inc 4);
+  a non-exact pick flagged with `*`; em-dashes when absent; encoding name
+  escaped. Tests: +2.
+
+**Increment 3 — Phase 4.2 timestamp delta / delta-of-delta codecs** (commit `f876aba`)
+- New `dsp-physical-type/src/timestamp.rs`: `TimeUnit` (seconds/millis/micros/
+  nanos); `encode_delta`/`decode_delta` and `encode_delta_of_delta`/
+  `decode_delta_of_delta` — lossless `i64`-epoch difference transforms, wrapping
+  arithmetic so `i64::MIN`/`i64::MAX` round-trip without panic; `zigzag_varint_len`/
+  `zigzag_varint_bytes` byte estimate; `estimated_bytes()` on each column. Tests: +9.
+
+**Increment 4 — total bytes/point (value + timestamp)** (commit `733a99e`)
+- `StorageEstimate` gains the timestamp half (`timestamp_unit`,
+  `timestamp_encoding`, `timestamp_bytes`, `timestamp_bytes_per_point`,
+  `total_bytes_per_point`). New `from_columns(values, timestamps, unit,
+  tolerance)` encodes the timestamp column delta-of-delta; `from_values` delegates
+  with no timestamps. `run_profile` feeds the dataset's µs-epoch timestamps. Report
+  widened to `enc` / `val B/pt` / `tot B/pt`. Tests: +1. `cargo build --workspace`
+  green.
+
+**Increment 5 — RLE for the delta-of-delta stream** (commit `3c39029`)
+- `dsp-physical-type/src/timestamp.rs`: `rle_encode`/`rle_decode` (lossless
+  `(value, run_length)` runs), `uvarint_len`, `rle_varint_bytes`, and
+  `DeltaOfDeltaColumn::rle_estimated_bytes()` + `best_estimated_bytes()` (min of
+  varint vs RLE). A regular 1000-point column's 998 zero second-differences
+  collapse to one run → ~12 bytes total. Tests: +4.
+
+**Increment 6 — bench uses the RLE-aware best timestamp cost** (commit `e663990`)
+- `from_columns` now picks the cheaper of plain-varint vs RLE and records which
+  (`delta_of_delta` / `delta_of_delta_rle`); the regular-series test reflects RLE
+  (11 timestamp bytes for a 5-point µs series). Refreshed stale docs.
+
+**Docs** (commit `7df5c8d`) — ROADMAP.md: Phase 4.1 bench-wiring landed; Phase
+4.2 marked started with shipped codecs + what remains (bit-packing, tz/leap
+policy, monotonic enforcement).
+
+**Build/test/clippy (real, nightly `rustc 1.98.0-nightly (cb46fbb8c 2026-06-08)`):**
+- `cargo build --workspace` — GREEN (verified at inc 4 after the cross-crate
+  StorageEstimate API change; nothing else regressed).
+- `cargo test -p dsp-physical-type` — **40 lib pass**, 0 failed (27 → 36 → 40
+  across inc 3 and 5).
+- `cargo test -p dsp-bench` — **86 lib + 20 integration pass**, 0 failed (run
+  `--test-threads=1` for the final clean count; see PRE-EXISTING FLAKE below).
+- `cargo clippy` (both crates, `--all-targets`) — **0 new warnings** under
+  pedantic+nursery. Two lints hit and fixed structurally (manual `div_ceil`;
+  too-long first doc paragraph) — no `#[allow]`. The only warnings emitted are 4
+  pre-existing `sort_by_key` suggestions in `splimes` (untouched).
+- `cargo fmt` — clean (hard tabs, project rustfmt).
+
+**PRE-EXISTING FLAKE (not introduced this run, flagged for follow-up):**
+`cargo test -p dsp-bench` under full default parallelism (~16 threads) aborts
+with a single ~20 GB allocation failure (exit `0xc0000409`). Verified on `main`
+@ `b8884ee`: crashes 3/3 parallel runs; passes 100% serially and was passing
+once by luck. It is load-dependent (sometimes trips even at `--test-threads=4`).
+Root cause is a memory-hungry path (suspect splimes interpolation / bigdecimal)
+multiplied across concurrent `run_profile` tests, not the schema work here. All
+this run's verification used `--test-threads=1`/`4` to get honest counts. Filed
+as a background task for a dedicated fix (cap concurrency or root-cause the
+allocation).
+
+**Done vs open:** DONE — last run's logged next step (bench bytes/point wiring),
+now a complete value+timestamp **total bytes/point** with real value
+(`recommend_encoding`) and timestamp (delta/DoD/RLE) codecs, surfaced in the
+report; Phase 4.2 timestamp codecs 0→started. OPEN (Phase 4 remainder) —
+schema-level per-aspect encoding *declaration*; 4.2 bit-packing + tz/leap-second
+policy + monotonic-order enforcement; **4.3 columnar segment store** (the next
+big concern — deliberately not started here); 4.4 data skipping; 4.5 Arrow
+arrays. Also still open from prior runs: Phase-2 stored range / DB-subject-aspect
+model, Arrow/Parquet interchange, OpenTelemetry; external-engine DuckDB +
+competitor adapters; the standalone methodology document.
+
+**STOP REASON:** natural-arc — six coherent increments completed the entire
+bytes/point story (value encoding in the bench → render → timestamp codecs →
+total value+timestamp → RLE → RLE-aware bench), above the 2–4 bar. The next step
+(Phase 4.3 columnar segment store) is a multi-increment concern with its own
+on-disk format and is better started on a fresh PR than half-built onto this one
+— the same discipline prior runs applied. Cutoff not reached (~03:30); stopping
+on arc completeness, not the clock.
+
+**Next step (tomorrow):** begin **Phase 4.3 columnar segment store** — the first
+slice = an in-memory `.dspseg`-shaped segment type holding the typed value column
+(`dsp-physical-type` encoding) + the delta/DoD/RLE timestamp column + per-segment
+min/max ts/value and row/null counts, with `encode`/`decode` round-trip and a
+`bytes_per_point` that matches the bench `StorageEstimate` — turning the advisory
+estimate into an actual stored segment. Alternatively, the schema-level per-aspect
+**encoding declaration** (`AspectSchema { value: PhysicalType, value_tolerance,
+timestamp_unit }`) that both Storage v2 and the bench would consume, or 4.2
+bit-packing as a sibling codec.
+
+**PR:** https://github.com/physics515/DSP/pull/18

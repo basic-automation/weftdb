@@ -12,6 +12,8 @@
 //! `SCHEMA_VERSION` is bumped whenever the on-disk JSON shape changes so old
 //! result artifacts remain interpretable.
 
+use bigdecimal::BigDecimal;
+use dsp_physical_type::{encode_delta_of_delta, recommend_encoding, TimeUnit};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -24,9 +26,10 @@ use crate::{
 /// v3 added the `timing` field (end-to-end span breakdown). v4 added the optional
 /// `accuracy` field (reconstruction-quality metrics vs a known ground truth). v5
 /// added the optional `dataset.signal_shape` field (which synthetic ground-truth
-/// curve was generated). All are `#[serde(default)]`, so older artifacts still
-/// deserialize.
-pub const SCHEMA_VERSION: u32 = 5;
+/// curve was generated). v6 added the optional `storage` field (north-star
+/// bytes/point under the fastest-safe physical encoding). All are
+/// `#[serde(default)]`, so older artifacts still deserialize.
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// Metadata describing the dataset a result was measured against.
 ///
@@ -108,6 +111,122 @@ impl TimingBreakdown {
 	}
 }
 
+/// Storage-cost estimate for a result's stored columns — value **and**
+/// timestamp — under the fastest-safe encodings.
+///
+/// DSP's north star is *dollars per billion interpolated points at a p95 target*;
+/// storage **bytes per point** is the cost term that rests on, and a stored point
+/// is a `(timestamp, value)` pair, so an honest figure must account for both
+/// columns. This block turns that into a measured benchmark outcome:
+///
+/// - the **value** column is run through the vendor-neutral `dsp-physical-type`
+///   advisory selector ([`recommend_encoding`]) — which encoding was chosen, its
+///   byte footprint, the realized bytes/point, and the exactness achieved within
+///   the requested bound (per hard constraint #4 any loss is reported via
+///   `lossy_count` / `max_abs_error`, never silent);
+/// - the **timestamp** column is delta-of-delta encoded
+///   ([`encode_delta_of_delta`]) then packed with the cheaper of zig-zag-varint
+///   or RLE — lossless, and near-free for a regular series;
+/// - [`total_bytes_per_point`](Self::total_bytes_per_point) sums the two, the
+///   headline north-star figure.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StorageEstimate {
+	/// Name of the value physical encoding selected (e.g. `scaled_i64`, `f64`).
+	pub physical_type: String,
+	/// Number of values in the stored column.
+	pub value_count: usize,
+	/// Estimated byte footprint of the value column under that encoding.
+	pub estimated_value_bytes: usize,
+	/// Realized value-column storage cost: `estimated_value_bytes / value_count`
+	/// (0 for an empty column).
+	pub bytes_per_point: f64,
+	/// Whether every value reconstructs exactly under the chosen encoding.
+	pub is_exact: bool,
+	/// How many values encoded lossily (0 ⇒ the column is exact).
+	pub lossy_count: usize,
+	/// Worst per-value absolute reconstruction error, as a decimal string (`"0"`
+	/// when exact). A string keeps arbitrary precision out of the `f64` trap.
+	pub max_abs_error: String,
+	/// Error tolerance the encoding was selected against, as a decimal string.
+	pub tolerance: String,
+	/// Epoch unit the timestamp column was encoded in (e.g. `micros`).
+	#[serde(default)]
+	pub timestamp_unit: String,
+	/// Timestamp-column encoding chosen: `delta_of_delta`, or
+	/// `delta_of_delta_rle` when run-length coding the second differences is
+	/// cheaper (regular series).
+	#[serde(default)]
+	pub timestamp_encoding: String,
+	/// Estimated byte footprint of the timestamp column (anchor + varint stream),
+	/// 0 when no timestamps were supplied.
+	#[serde(default)]
+	pub timestamp_bytes: usize,
+	/// Realized timestamp-column storage cost in bytes/point (0 for an empty
+	/// column).
+	#[serde(default)]
+	pub timestamp_bytes_per_point: f64,
+	/// The headline north-star figure: value + timestamp bytes/point.
+	#[serde(default)]
+	pub total_bytes_per_point: f64,
+}
+
+impl StorageEstimate {
+	/// Estimate the stored value-column cost of `values` only (no timestamp
+	/// column), under the narrowest hot-path encoding within `tolerance`.
+	///
+	/// A `tolerance` of zero selects the narrowest *lossless* encoding. The
+	/// timestamp fields are left empty / zero and `total_bytes_per_point` equals
+	/// the value `bytes_per_point`; use [`from_columns`](Self::from_columns) for a
+	/// complete `(timestamp, value)` figure.
+	#[must_use]
+	pub fn from_values(values: &[BigDecimal], tolerance: &BigDecimal) -> Self {
+		Self::from_columns(values, &[], TimeUnit::Micros, tolerance)
+	}
+
+	/// Estimate the full stored-point cost: the value column under the
+	/// fastest-safe encoding plus the `timestamps` column under lossless
+	/// delta-of-delta + varint coding.
+	///
+	/// `timestamps` are integer epochs in `unit`. An empty `timestamps` slice
+	/// contributes zero timestamp bytes (the value-only case).
+	#[must_use]
+	pub fn from_columns(values: &[BigDecimal], timestamps: &[i64], unit: TimeUnit, tolerance: &BigDecimal) -> Self {
+		let enc = recommend_encoding(values, tolerance);
+		let estimated_value_bytes = enc.estimated_bytes();
+		let value_count = enc.len();
+		let bytes_per_point = per_point(estimated_value_bytes, value_count);
+
+		// Encode the timestamp column delta-of-delta, then pick the cheaper of plain
+		// varint vs RLE-of-second-differences (RLE wins big on regular series, loses
+		// on non-repeating ones) — recording which scheme the reported size used.
+		let (timestamp_bytes, timestamp_encoding) = if timestamps.is_empty() {
+			(0, "delta_of_delta")
+		} else {
+			let dod = encode_delta_of_delta(timestamps, unit);
+			let (plain, rle) = (dod.estimated_bytes(), dod.rle_estimated_bytes());
+			if rle < plain {
+				(rle, "delta_of_delta_rle")
+			} else {
+				(plain, "delta_of_delta")
+			}
+		};
+		let timestamp_bytes_per_point = per_point(timestamp_bytes, timestamps.len());
+
+		Self { physical_type: enc.physical_type.name().to_string(), value_count, estimated_value_bytes, bytes_per_point, is_exact: enc.is_exact(), lossy_count: enc.lossy_count, max_abs_error: enc.max_abs_error.to_string(), tolerance: tolerance.to_string(), timestamp_unit: unit.name().to_string(), timestamp_encoding: timestamp_encoding.to_string(), timestamp_bytes, timestamp_bytes_per_point, total_bytes_per_point: bytes_per_point + timestamp_bytes_per_point }
+	}
+}
+
+/// `bytes / count` as a rate, or `0.0` for an empty column.
+#[must_use]
+fn per_point(bytes: usize, count: usize) -> f64 {
+	if count == 0 {
+		return 0.0;
+	}
+	#[allow(clippy::cast_precision_loss)]
+	let (bytes, count) = (bytes as f64, count as f64);
+	bytes / count
+}
+
 /// A single DSP-Bench result: one workload, one adapter, one profile, N reps.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchResult {
@@ -147,6 +266,13 @@ pub struct BenchResult {
 	/// absent.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub accuracy: Option<AccuracyMetrics>,
+	/// Storage-cost estimate for the stored value column (north-star
+	/// bytes/point). `Some` once computed by `run_profile`; `None` for pre-v6
+	/// artifacts and any caller that omits it. `#[serde(default)]` +
+	/// `skip_serializing_if` keep old artifacts parsing and omit the key when
+	/// absent.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub storage: Option<StorageEstimate>,
 }
 
 impl BenchResult {
@@ -164,7 +290,7 @@ mod tests {
 
 	fn sample_result() -> BenchResult {
 		let samples = [100, 200, 300];
-		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "dsp".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: Some(SignalShape::MultiSine) }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true }, accuracy: Some(AccuracyMetrics { count: 1000, rmse: 1.5, mae: 1.1, max_abs_error: 4.2, bias: -0.3 }) }
+		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "dsp".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: Some(SignalShape::MultiSine) }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true }, accuracy: Some(AccuracyMetrics { count: 1000, rmse: 1.5, mae: 1.1, max_abs_error: 4.2, bias: -0.3 }), storage: Some(StorageEstimate { physical_type: "scaled_i64".to_string(), value_count: 200, estimated_value_bytes: 1600, bytes_per_point: 8.0, is_exact: true, lossy_count: 0, max_abs_error: "0".to_string(), tolerance: "0".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 208, timestamp_bytes_per_point: 1.04, total_bytes_per_point: 9.04 }) }
 	}
 
 	#[test]
@@ -259,6 +385,79 @@ mod tests {
 		let parsed: BenchResult = serde_json::from_str(v4).expect("v4 artifact must still parse");
 		assert!(parsed.dataset.signal_shape.is_none(), "a pre-v5 artifact carries no signal shape");
 		assert!(parsed.is_publishable());
+	}
+
+	#[test]
+	fn v5_artifact_without_storage_still_deserializes() {
+		// A v5 artifact carries signal_shape + accuracy but no `storage` key; serde's
+		// default must fill `None` rather than failing the parse.
+		let v5 = r#"{
+			"schema_version": 5,
+			"profile": "interpolation-heavy-irregular",
+			"adapter": "dsp",
+			"workload": "upsample_interpolate",
+			"reps": 3,
+			"dataset": { "input_points": 200, "output_points": 1000, "irregular": true, "missingness_fraction": 0.2, "seed": 7, "signal_shape": "multisine" },
+			"latency": { "count": 3, "min_ns": 100, "max_ns": 300, "mean_ns": 200, "stddev_ns": 82, "p50_ns": 200, "p95_ns": 300, "p99_ns": 300 },
+			"throughput_points_per_sec": 5000000.0,
+			"correctness": { "output_count_ok": true, "expected_output_points": 1000, "actual_output_points": 1000, "values_finite": true }
+		}"#;
+		let parsed: BenchResult = serde_json::from_str(v5).expect("v5 artifact must still parse");
+		assert!(parsed.storage.is_none(), "a pre-v6 artifact carries no storage estimate");
+		assert!(parsed.is_publishable());
+	}
+
+	#[test]
+	fn storage_is_omitted_from_json_when_absent() {
+		// A caller may omit the storage estimate; `skip_serializing_if` must keep the
+		// key out of the artifact entirely rather than emit `"storage": null`.
+		let mut result = sample_result();
+		result.storage = None;
+		let json = serde_json::to_string(&result).expect("serialize");
+		assert!(!json.contains("storage"), "absent storage must be omitted, got: {json}");
+		let back: BenchResult = serde_json::from_str(&json).expect("deserialize");
+		assert!(back.storage.is_none());
+	}
+
+	#[test]
+	fn storage_estimate_lossless_scaled_int_for_decimal_tenths() {
+		// 0.1 / 0.2 / 0.3 are *not* exactly representable in binary float, so with
+		// tolerance 0 the advisor skips F32/F64 and picks an exact 8-byte ScaledI64
+		// (scale 1) — a genuine lossless bytes/point, not the text backstop.
+		use std::str::FromStr;
+		let values: Vec<BigDecimal> = ["0.1", "0.2", "0.3", "0.4"].iter().map(|s| BigDecimal::from_str(s).unwrap()).collect();
+		let est = StorageEstimate::from_values(&values, &BigDecimal::from(0));
+		assert_eq!(est.physical_type, "scaled_i64");
+		assert!(est.is_exact);
+		assert_eq!(est.lossy_count, 0);
+		assert_eq!(est.value_count, 4);
+		assert_eq!(est.estimated_value_bytes, 4 * 8);
+		assert!((est.bytes_per_point - 8.0).abs() < f64::EPSILON);
+		assert_eq!(est.max_abs_error, "0");
+		assert_eq!(est.tolerance, "0");
+		// `from_values` supplies no timestamps, so the total equals the value cost.
+		assert_eq!(est.timestamp_bytes, 0);
+		assert!((est.timestamp_bytes_per_point - 0.0).abs() < f64::EPSILON);
+		assert!((est.total_bytes_per_point - est.bytes_per_point).abs() < f64::EPSILON);
+	}
+
+	#[test]
+	fn from_columns_picks_rle_for_a_regular_timestamp_series() {
+		// A regular microsecond series delta-of-deltas to a run of zeros, so the
+		// cheaper RLE codec wins and is recorded; its cost is the 8-byte anchor + a
+		// 1-byte first delta + a single (0, 3) run (value 1B + count 1B) = 11 —
+		// below the plain-varint 12 and far below a raw 8 bytes/point.
+		use std::str::FromStr;
+		let values: Vec<BigDecimal> = ["0.1", "0.2", "0.3", "0.4", "0.5"].iter().map(|s| BigDecimal::from_str(s).unwrap()).collect();
+		let timestamps: Vec<i64> = (0..5).map(|i| 1_000 + i * 10).collect();
+		let est = StorageEstimate::from_columns(&values, &timestamps, TimeUnit::Micros, &BigDecimal::from(0));
+		assert_eq!(est.timestamp_unit, "micros");
+		assert_eq!(est.timestamp_encoding, "delta_of_delta_rle");
+		assert_eq!(est.timestamp_bytes, 11);
+		assert!((est.timestamp_bytes_per_point - 11.0 / 5.0).abs() < f64::EPSILON);
+		assert!((est.total_bytes_per_point - (est.bytes_per_point + est.timestamp_bytes_per_point)).abs() < f64::EPSILON);
+		// The timestamp column is far cheaper than storing raw 8-byte epochs.
+		assert!(est.timestamp_bytes_per_point < 8.0);
 	}
 
 	#[test]
