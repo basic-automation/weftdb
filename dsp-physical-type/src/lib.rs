@@ -35,6 +35,9 @@
 //! - [`column`] — batch [`encode_column`] of a whole column under one encoding,
 //!   aggregating exactness and estimating storage bytes (Storage-v2 / bytes-per-
 //!   point prep).
+//! - [`timestamp`] — Phase 4.2 integer-epoch timestamp codecs: lossless
+//!   delta / delta-of-delta transforms ([`encode_delta`], [`encode_delta_of_delta`])
+//!   plus a zig-zag + varint byte estimate, the timestamp half of bytes/point.
 //!
 //! [`F64`]: PhysicalType::F64
 //! [`F32`]: PhysicalType::F32
@@ -53,12 +56,14 @@
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 
 pub mod column;
+pub mod timestamp;
 
 use bigdecimal::{
 	num_bigint::{BigInt, Sign}, BigDecimal, FromPrimitive, ToPrimitive
 };
 pub use column::{encode_column, recommend_encoding, ColumnEncodeError, ColumnEncoding};
 use serde::{Deserialize, Serialize};
+pub use timestamp::{decode_delta, decode_delta_of_delta, encode_delta, encode_delta_of_delta, zigzag_varint_bytes, zigzag_varint_len, DeltaColumn, DeltaOfDeltaColumn, TimeUnit};
 
 /// A schema-declared physical encoding for an aspect's numeric values.
 ///
