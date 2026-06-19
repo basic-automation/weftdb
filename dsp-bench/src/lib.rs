@@ -58,7 +58,7 @@ use bigdecimal::ToPrimitive;
 use splimes::generate_target_times;
 
 pub use crate::{
-	accuracy::{synthetic_ground_truth, AccuracyError, AccuracyMetrics}, adapter::SystemAdapter, baseline_adapter::BaselineLinearAdapter, dsp_adapter::DspAdapter, forward_fill_adapter::ForwardFillAdapter, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError, SignalShape, SyntheticParams}, report::{BenchReport, RunMetadata}, schema::{BenchResult, CorrectnessReport, DatasetMeta, TimingBreakdown, SCHEMA_VERSION}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}
+	accuracy::{synthetic_ground_truth, AccuracyError, AccuracyMetrics}, adapter::SystemAdapter, baseline_adapter::BaselineLinearAdapter, dsp_adapter::DspAdapter, forward_fill_adapter::ForwardFillAdapter, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError, SignalShape, SyntheticParams}, report::{BenchReport, RunMetadata}, schema::{BenchResult, CorrectnessReport, DatasetMeta, StorageEstimate, TimingBreakdown, SCHEMA_VERSION}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}
 };
 
 /// Workload class label recorded for the interpolation profile.
@@ -126,6 +126,13 @@ pub async fn run_profile<A: SystemAdapter + ?Sized>(adapter: &A, profile: &Inter
 	// alignment fail — either way accuracy is simply absent, never fatal.
 	let accuracy = accuracy::synthetic_ground_truth(profile).ok().and_then(|truth| AccuracyMetrics::from_aligned(&last_output, &truth).ok());
 
+	// North-star storage term: estimate bytes/point of the *stored* value column
+	// under the narrowest lossless physical encoding (tolerance 0 — any loss would
+	// be reported, never silent). The input dataset is the data on disk; the
+	// interpolated output is computed on read, not stored.
+	let stored_values: Vec<bigdecimal::BigDecimal> = dataset.iter().map(|p| p.value.clone()).collect();
+	let storage = Some(StorageEstimate::from_values(&stored_values, &bigdecimal::BigDecimal::from(0)));
+
 	let latency = LatencyStats::from_samples(&samples_ns);
 	// Bootstrap CIs for the latency distribution (fair-protocol Phase 1.1). The
 	// resampling seed is derived from the dataset seed so the interval is
@@ -141,7 +148,7 @@ pub async fn run_profile<A: SystemAdapter + ?Sized>(adapter: &A, profile: &Inter
 		0.0
 	};
 
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: adapter.name().to_string(), workload: WORKLOAD_UPSAMPLE_INTERPOLATE.to_string(), reps, dataset: DatasetMeta { input_points, output_points: actual_output_points, irregular: true, missingness_fraction: profile.missingness_fraction, seed: profile.seed, signal_shape: profile.ground_truth_shape() }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: adapter.name().to_string(), workload: WORKLOAD_UPSAMPLE_INTERPOLATE.to_string(), reps, dataset: DatasetMeta { input_points, output_points: actual_output_points, irregular: true, missingness_fraction: profile.missingness_fraction, seed: profile.seed, signal_shape: profile.ground_truth_shape() }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy, storage })
 }
 
 /// Measure reconstruction *accuracy*: run `adapter` once over `profile` and score
