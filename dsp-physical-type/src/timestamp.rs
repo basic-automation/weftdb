@@ -189,6 +189,56 @@ pub fn zigzag_varint_bytes(values: &[i64]) -> usize {
 	values.iter().map(|&v| zigzag_varint_len(v)).sum()
 }
 
+/// Number of bytes an unsigned `u64` occupies under plain LEB128 varint coding
+/// (`1..=10`). Used for run lengths, which are never negative so need no zig-zag.
+#[must_use]
+pub const fn uvarint_len(value: u64) -> usize {
+	let mut bits = 64 - value.leading_zeros();
+	if bits == 0 {
+		bits = 1;
+	}
+	bits.div_ceil(7) as usize
+}
+
+/// Run-length-encode a value stream into `(value, run_length)` pairs.
+///
+/// The companion codec to delta-of-delta: a regular series' second differences
+/// are a long run of zeros, which RLE collapses to a single `(0, n)` pair. Exact
+/// inverse is [`rle_decode`]. An empty input yields no runs.
+#[must_use]
+pub fn rle_encode(values: &[i64]) -> Vec<(i64, usize)> {
+	let mut runs: Vec<(i64, usize)> = Vec::new();
+	for &v in values {
+		match runs.last_mut() {
+			Some((val, count)) if *val == v => *count += 1,
+			_ => runs.push((v, 1)),
+		}
+	}
+	runs
+}
+
+/// Reconstruct the value stream from its run-length encoding. Exact inverse of
+/// [`rle_encode`].
+#[must_use]
+pub fn rle_decode(runs: &[(i64, usize)]) -> Vec<i64> {
+	let mut out = Vec::with_capacity(runs.iter().map(|(_, c)| *c).sum());
+	for &(value, count) in runs {
+		out.extend(std::iter::repeat_n(value, count));
+	}
+	out
+}
+
+/// Estimated packed footprint of an RLE stream.
+///
+/// Each run costs a zig-zag-varint value plus an unsigned-varint run length. For
+/// a long zero run this is a few bytes regardless of length — the saving
+/// delta-of-delta sets up and RLE realizes.
+#[must_use]
+pub fn rle_varint_bytes(runs: &[(i64, usize)]) -> usize {
+	#[allow(clippy::cast_possible_truncation)]
+	runs.iter().map(|&(value, count)| zigzag_varint_len(value) + uvarint_len(count as u64)).sum()
+}
+
 impl DeltaColumn {
 	/// Estimated packed size: the anchor (a full 8-byte `i64`) plus the
 	/// varint-coded delta stream.
@@ -218,6 +268,26 @@ impl DeltaOfDeltaColumn {
 	#[must_use]
 	pub fn estimated_bytes(&self) -> usize {
 		8 + self.first_delta.map_or(0, zigzag_varint_len) + zigzag_varint_bytes(&self.dods)
+	}
+
+	/// Estimated packed size with the second-difference stream **run-length
+	/// encoded** instead of plain-varint coded: anchor + first delta + RLE runs.
+	///
+	/// For a regular or piecewise-regular series the second differences collapse
+	/// to a handful of runs, so this is far below [`estimated_bytes`](Self::estimated_bytes);
+	/// for a noisy series with few repeats it can be larger (two varints per run),
+	/// which is why [`best_estimated_bytes`](Self::best_estimated_bytes) picks the
+	/// smaller of the two.
+	#[must_use]
+	pub fn rle_estimated_bytes(&self) -> usize {
+		8 + self.first_delta.map_or(0, zigzag_varint_len) + rle_varint_bytes(&rle_encode(&self.dods))
+	}
+
+	/// The smaller of the plain-varint and RLE-of-second-differences estimates —
+	/// the realistic stored size once the cheaper of the two codecs is chosen.
+	#[must_use]
+	pub fn best_estimated_bytes(&self) -> usize {
+		self.estimated_bytes().min(self.rle_estimated_bytes())
 	}
 
 	/// Number of epoch values this column reconstructs to.
@@ -320,6 +390,55 @@ mod tests {
 					 // The largest magnitudes take the full 10 bytes.
 		assert_eq!(zigzag_varint_len(i64::MAX), 10);
 		assert_eq!(zigzag_varint_len(i64::MIN), 10);
+	}
+
+	#[test]
+	fn rle_round_trips_and_collapses_runs() {
+		let values = vec![0, 0, 0, 5, 5, -1, 0, 0];
+		let runs = rle_encode(&values);
+		assert_eq!(runs, vec![(0, 3), (5, 2), (-1, 1), (0, 2)]);
+		assert_eq!(rle_decode(&runs), values);
+		// Empty in, empty out.
+		assert!(rle_encode(&[]).is_empty());
+		assert!(rle_decode(&[]).is_empty());
+	}
+
+	#[test]
+	fn uvarint_len_matches_known_boundaries() {
+		assert_eq!(uvarint_len(0), 1);
+		assert_eq!(uvarint_len(127), 1);
+		assert_eq!(uvarint_len(128), 2);
+		assert_eq!(uvarint_len(u64::MAX), 10);
+	}
+
+	#[test]
+	fn rle_crushes_a_regular_series_second_differences() {
+		// 1000 regular points -> 998 zero second-differences -> a single RLE run.
+		let values: Vec<i64> = (0..1_000).map(|i| 1_000 + i * 10).collect();
+		let dod = encode_delta_of_delta(&values, TimeUnit::Millis);
+		// RLE: anchor(8) + first_delta(1) + one run (value 0 -> 1 byte, count 998 ->
+		// 2 bytes) = 12.
+		assert_eq!(dod.rle_estimated_bytes(), 8 + 1 + (1 + 2));
+		// And it beats plain varint (8 + 1 + 998) decisively, so `best` takes RLE.
+		assert!(dod.rle_estimated_bytes() < dod.estimated_bytes());
+		assert_eq!(dod.best_estimated_bytes(), dod.rle_estimated_bytes());
+	}
+
+	#[test]
+	fn best_estimate_falls_back_to_varint_when_runs_do_not_repeat() {
+		// Strictly increasing gaps make every second difference distinct (1,2,3,…),
+		// so RLE spends two varints per length-1 run and loses to plain varint;
+		// `best` must take the smaller plain estimate.
+		let mut values = vec![0_i64];
+		let mut acc = 0_i64;
+		for gap in [1, 2, 4, 7, 11, 16, 22, 29, 37] {
+			acc += gap;
+			values.push(acc);
+		}
+		let dod = encode_delta_of_delta(&values, TimeUnit::Seconds);
+		assert_eq!(dod.dods, vec![1, 2, 3, 4, 5, 6, 7, 8]); // all distinct
+		assert!(dod.rle_estimated_bytes() > dod.estimated_bytes(), "RLE must lose on a non-repeating stream");
+		assert_eq!(dod.best_estimated_bytes(), dod.estimated_bytes());
 	}
 
 	#[test]

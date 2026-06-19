@@ -63,7 +63,7 @@ use bigdecimal::{
 };
 pub use column::{encode_column, recommend_encoding, ColumnEncodeError, ColumnEncoding};
 use serde::{Deserialize, Serialize};
-pub use timestamp::{decode_delta, decode_delta_of_delta, encode_delta, encode_delta_of_delta, zigzag_varint_bytes, zigzag_varint_len, DeltaColumn, DeltaOfDeltaColumn, TimeUnit};
+pub use timestamp::{decode_delta, decode_delta_of_delta, encode_delta, encode_delta_of_delta, rle_decode, rle_encode, rle_varint_bytes, uvarint_len, zigzag_varint_bytes, zigzag_varint_len, DeltaColumn, DeltaOfDeltaColumn, TimeUnit};
 
 /// A schema-declared physical encoding for an aspect's numeric values.
 ///
