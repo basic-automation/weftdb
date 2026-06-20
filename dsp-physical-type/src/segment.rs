@@ -229,6 +229,62 @@ impl Segment {
 	pub fn decode(&self) -> (Vec<i64>, Vec<BigDecimal>) {
 		(self.decode_timestamps(), self.decode_values())
 	}
+
+	/// The inclusive `(min, max)` timestamp span this segment covers, or [`None`]
+	/// when empty. The coarse index a time-range query prunes against.
+	#[must_use]
+	pub const fn time_range(&self) -> Option<(i64, i64)> {
+		match (self.stats.min_ts, self.stats.max_ts) {
+			(Some(lo), Some(hi)) => Some((lo, hi)),
+			_ => None,
+		}
+	}
+
+	/// The inclusive `(min, max)` value span this segment covers, or [`None`] when
+	/// empty.
+	#[must_use]
+	pub fn value_range(&self) -> Option<(BigDecimal, BigDecimal)> {
+		match (&self.stats.min_value, &self.stats.max_value) {
+			(Some(lo), Some(hi)) => Some((lo.clone(), hi.clone())),
+			_ => None,
+		}
+	}
+
+	/// **Data skipping** (roadmap Phase 4.4): whether this segment *may* hold any
+	/// row whose timestamp falls in the inclusive query range `[start, end]`.
+	///
+	/// Returns `false` only when the segment can be **safely skipped** — its
+	/// `[min_ts, max_ts]` span is disjoint from `[start, end]`, so no row inside it
+	/// can match (an empty segment is always skippable). A `true` result is
+	/// *necessary, not sufficient*: the span overlaps, so the segment must be read,
+	/// but the rows within it still need the exact predicate applied.
+	#[must_use]
+	pub const fn overlaps_time(&self, start: i64, end: i64) -> bool {
+		match self.time_range() {
+			Some((lo, hi)) => lo <= end && start <= hi,
+			None => false,
+		}
+	}
+
+	/// Data-skipping shorthand for a single-instant lookup: whether `ts` lies
+	/// within `[min_ts, max_ts]`. A `false` result means the segment cannot hold
+	/// that timestamp; `true` means it might (subject to the exact column scan).
+	#[must_use]
+	pub const fn contains_timestamp(&self, ts: i64) -> bool {
+		self.overlaps_time(ts, ts)
+	}
+
+	/// **Data skipping** on the value column: whether this segment *may* hold any
+	/// value in the inclusive range `[lo, hi]`.
+	///
+	/// Returns `false` only when `[min_value, max_value]` is disjoint from
+	/// `[lo, hi]` (or the segment is empty) — the safe-to-skip case. As with
+	/// [`overlaps_time`](Self::overlaps_time), `true` is necessary but not
+	/// sufficient.
+	#[must_use]
+	pub fn may_contain_value(&self, lo: &BigDecimal, hi: &BigDecimal) -> bool {
+		self.value_range().is_some_and(|(min, max)| &min <= hi && lo <= &max)
+	}
 }
 
 #[cfg(test)]
@@ -332,5 +388,51 @@ mod tests {
 		let back: Segment = serde_json::from_str(&json).expect("deserializes");
 		assert_eq!(seg, back);
 		assert_eq!(back.decode(), (timestamps, values));
+	}
+
+	#[test]
+	fn time_range_pruning_skips_disjoint_segments() {
+		// Segment spans timestamps [100, 140].
+		let timestamps: Vec<i64> = (0..5).map(|i| 100 + i * 10).collect();
+		let values = col(&["1.0", "2.0", "3.0", "4.0", "5.0"]);
+		let seg = Segment::build(&timestamps, &values, TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		assert_eq!(seg.time_range(), Some((100, 140)));
+		// Overlapping queries must be read.
+		assert!(seg.overlaps_time(120, 130), "fully inside");
+		assert!(seg.overlaps_time(0, 100), "touches the low edge");
+		assert!(seg.overlaps_time(140, 999), "touches the high edge");
+		assert!(seg.overlaps_time(0, 999), "superset");
+		// Disjoint queries are safely skipped.
+		assert!(!seg.overlaps_time(0, 99), "entirely before");
+		assert!(!seg.overlaps_time(141, 200), "entirely after");
+		// Single-instant lookups.
+		assert!(seg.contains_timestamp(100));
+		assert!(seg.contains_timestamp(135));
+		assert!(!seg.contains_timestamp(99));
+		assert!(!seg.contains_timestamp(141));
+	}
+
+	#[test]
+	fn value_range_pruning_skips_disjoint_segments() {
+		let timestamps: Vec<i64> = (0..4).collect();
+		let values = col(&["10.0", "25.0", "5.0", "18.0"]); // span [5, 25]
+		let seg = Segment::build(&timestamps, &values, TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		assert_eq!(seg.value_range(), Some((BigDecimal::from_str("5.0").unwrap(), BigDecimal::from_str("25.0").unwrap())));
+		assert!(seg.may_contain_value(&BigDecimal::from(0), &BigDecimal::from(7)), "overlaps low end");
+		assert!(seg.may_contain_value(&BigDecimal::from(20), &BigDecimal::from(100)), "overlaps high end");
+		assert!(seg.may_contain_value(&BigDecimal::from(12), &BigDecimal::from(13)), "inside");
+		assert!(!seg.may_contain_value(&BigDecimal::from(26), &BigDecimal::from(100)), "above the span");
+		assert!(!seg.may_contain_value(&BigDecimal::from(0), &BigDecimal::from(4)), "below the span");
+	}
+
+	#[test]
+	fn empty_segment_prunes_to_nothing() {
+		let seg = Segment::build(&[], &[], TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		assert_eq!(seg.time_range(), None);
+		assert_eq!(seg.value_range(), None);
+		// An empty segment can be skipped for every query.
+		assert!(!seg.overlaps_time(i64::MIN, i64::MAX));
+		assert!(!seg.contains_timestamp(0));
+		assert!(!seg.may_contain_value(&BigDecimal::from(0), &BigDecimal::from(0)));
 	}
 }
