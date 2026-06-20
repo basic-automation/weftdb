@@ -295,6 +295,21 @@ impl Segment {
 	}
 }
 
+/// **Data skipping over a set of segments** (roadmap Phase 4.4).
+///
+/// Returns the indices of the segments in `segments` that *may* hold a row in the
+/// inclusive time range `[start, end]` — i.e. the ones a query must actually scan.
+///
+/// Every index **not** returned is a segment safely skipped without touching its
+/// columns (its span is disjoint from the query, or it is empty). This is the
+/// realistic query-time win the per-segment min/max stats exist for: a long-lived
+/// aspect is a sequence of sealed segments, and a bounded range query reads only
+/// the few that overlap. Order-independent — segments need not be sorted.
+#[must_use]
+pub fn prune_by_time(segments: &[Segment], start: i64, end: i64) -> Vec<usize> {
+	segments.iter().enumerate().filter(|(_, s)| s.overlaps_time(start, end)).map(|(i, _)| i).collect()
+}
+
 #[cfg(test)]
 mod tests {
 	use std::str::FromStr;
@@ -431,6 +446,35 @@ mod tests {
 		assert!(seg.may_contain_value(&BigDecimal::from(12), &BigDecimal::from(13)), "inside");
 		assert!(!seg.may_contain_value(&BigDecimal::from(26), &BigDecimal::from(100)), "above the span");
 		assert!(!seg.may_contain_value(&BigDecimal::from(0), &BigDecimal::from(4)), "below the span");
+	}
+
+	#[test]
+	fn prune_by_time_selects_only_overlapping_segments() {
+		// Three sealed segments covering [0,90], [100,190], [200,290].
+		let seg = |base: i64| {
+			let ts: Vec<i64> = (0..10).map(|i| base + i * 10).collect();
+			let vs: Vec<BigDecimal> = (0..10).map(BigDecimal::from).collect();
+			Segment::build(&ts, &vs, TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds")
+		};
+		let segments = vec![seg(0), seg(100), seg(200)];
+		// A query inside the middle segment scans only it.
+		assert_eq!(prune_by_time(&segments, 120, 150), vec![1]);
+		// A query straddling the first two scans both, skips the third.
+		assert_eq!(prune_by_time(&segments, 50, 150), vec![0, 1]);
+		// A query covering everything scans all three.
+		assert_eq!(prune_by_time(&segments, 0, 290), vec![0, 1, 2]);
+		// A query in a gap between segments scans none.
+		assert_eq!(prune_by_time(&segments, 91, 99), Vec::<usize>::new());
+		// A query past the end scans none.
+		assert_eq!(prune_by_time(&segments, 1_000, 2_000), Vec::<usize>::new());
+	}
+
+	#[test]
+	fn prune_by_time_handles_empty_inputs() {
+		assert!(prune_by_time(&[], 0, 100).is_empty());
+		let empty_seg = Segment::build(&[], &[], TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		// An empty segment is always skipped.
+		assert!(prune_by_time(std::slice::from_ref(&empty_seg), i64::MIN, i64::MAX).is_empty());
 	}
 
 	#[test]
