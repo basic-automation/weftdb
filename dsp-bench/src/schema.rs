@@ -196,19 +196,16 @@ impl StorageEstimate {
 		let value_count = enc.len();
 		let bytes_per_point = per_point(estimated_value_bytes, value_count);
 
-		// Encode the timestamp column delta-of-delta, then pick the cheaper of plain
-		// varint vs RLE-of-second-differences (RLE wins big on regular series, loses
-		// on non-repeating ones) — recording which scheme the reported size used.
+		// Encode the timestamp column delta-of-delta, then let `dsp-physical-type`
+		// pick the cheaper of plain varint vs RLE-of-second-differences (RLE wins
+		// big on regular series, loses on non-repeating ones) — the same single
+		// source of truth a stored `Segment` uses, so the advisory bench estimate
+		// and a realized segment never disagree on size or codec label.
 		let (timestamp_bytes, timestamp_encoding) = if timestamps.is_empty() {
 			(0, "delta_of_delta")
 		} else {
 			let dod = encode_delta_of_delta(timestamps, unit);
-			let (plain, rle) = (dod.estimated_bytes(), dod.rle_estimated_bytes());
-			if rle < plain {
-				(rle, "delta_of_delta_rle")
-			} else {
-				(plain, "delta_of_delta")
-			}
+			(dod.best_estimated_bytes(), dod.best_encoding_name())
 		};
 		let timestamp_bytes_per_point = per_point(timestamp_bytes, timestamps.len());
 
@@ -458,6 +455,25 @@ mod tests {
 		assert!((est.total_bytes_per_point - (est.bytes_per_point + est.timestamp_bytes_per_point)).abs() < f64::EPSILON);
 		// The timestamp column is far cheaper than storing raw 8-byte epochs.
 		assert!(est.timestamp_bytes_per_point < 8.0);
+	}
+
+	#[test]
+	fn storage_estimate_agrees_with_a_real_segment() {
+		// The advisory bench estimate and a realized Storage-v2 `Segment` must report
+		// the same stored cost for the same data — they share `dsp-physical-type`'s
+		// column estimators and codec selector, so this guards against drift.
+		use std::str::FromStr;
+		let values: Vec<BigDecimal> = ["1.5", "2.25", "3.75", "10.0", "0.5", "7.125"].iter().map(|s| BigDecimal::from_str(s).unwrap()).collect();
+		let timestamps: Vec<i64> = (0..6).map(|i| 2_000 + i * 25).collect();
+		let tolerance = BigDecimal::from(0);
+		let est = StorageEstimate::from_columns(&values, &timestamps, TimeUnit::Micros, &tolerance);
+		let seg = dsp_physical_type::Segment::build(&timestamps, &values, TimeUnit::Micros, &tolerance).expect("segment builds");
+		assert_eq!(est.physical_type, seg.physical_type().name());
+		assert_eq!(est.estimated_value_bytes, seg.value_bytes());
+		assert_eq!(est.timestamp_bytes, seg.timestamp_bytes());
+		assert_eq!(est.timestamp_encoding, seg.timestamp_encoding_name());
+		assert_eq!(est.value_count, seg.row_count());
+		assert!((est.total_bytes_per_point - seg.bytes_per_point()).abs() < f64::EPSILON, "bench {} vs segment {}", est.total_bytes_per_point, seg.bytes_per_point());
 	}
 
 	#[test]
