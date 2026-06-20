@@ -290,6 +290,20 @@ impl DeltaOfDeltaColumn {
 		self.estimated_bytes().min(self.rle_estimated_bytes())
 	}
 
+	/// The stable name of the codec [`best_estimated_bytes`](Self::best_estimated_bytes)
+	/// selects: `"delta_of_delta_rle"` when run-length coding the second
+	/// differences is strictly cheaper (a regular or piecewise-regular series),
+	/// else `"delta_of_delta"`. The single source of truth for the codec label so
+	/// the segment store and the bench report never disagree on which won.
+	#[must_use]
+	pub fn best_encoding_name(&self) -> &'static str {
+		if self.rle_estimated_bytes() < self.estimated_bytes() {
+			"delta_of_delta_rle"
+		} else {
+			"delta_of_delta"
+		}
+	}
+
 	/// Number of epoch values this column reconstructs to.
 	#[must_use]
 	pub const fn len(&self) -> usize {
@@ -422,6 +436,25 @@ mod tests {
 		// And it beats plain varint (8 + 1 + 998) decisively, so `best` takes RLE.
 		assert!(dod.rle_estimated_bytes() < dod.estimated_bytes());
 		assert_eq!(dod.best_estimated_bytes(), dod.rle_estimated_bytes());
+	}
+
+	#[test]
+	fn best_encoding_name_tracks_the_chosen_codec() {
+		// Regular series -> RLE wins -> labelled rle.
+		let regular: Vec<i64> = (0..1_000).map(|i| 1_000 + i * 10).collect();
+		let dod = encode_delta_of_delta(&regular, TimeUnit::Millis);
+		assert_eq!(dod.best_encoding_name(), "delta_of_delta_rle");
+		assert_eq!(dod.best_estimated_bytes(), dod.rle_estimated_bytes());
+		// Non-repeating second differences -> plain varint wins -> labelled plain.
+		let mut values = vec![0_i64];
+		let mut acc = 0_i64;
+		for gap in [1, 2, 4, 7, 11, 16] {
+			acc += gap;
+			values.push(acc);
+		}
+		let dod = encode_delta_of_delta(&values, TimeUnit::Seconds);
+		assert_eq!(dod.best_encoding_name(), "delta_of_delta");
+		assert_eq!(dod.best_estimated_bytes(), dod.estimated_bytes());
 	}
 
 	#[test]

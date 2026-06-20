@@ -262,7 +262,24 @@ JSON").
   per-page stats, checksums, version. Arrow-compatible memory internally; Parquet
   import/export from day one — a custom `.dspseg` is justified only for
   interpolation/random-access performance.
+  *(Started — `dsp-physical-type::segment` ships the in-memory shape of a
+  `.dspseg`: a `Segment` binding the Phase-4.1 typed value column
+  (`ColumnEncoding`) and the Phase-4.2 delta-of-delta/RLE timestamp column
+  (`DeltaOfDeltaColumn`) with per-segment min/max ts, min/max value, row count,
+  and a format `version`, plus an exact `decode` round trip. Its
+  `bytes_per_point` shares `dsp-physical-type`'s column estimators with the
+  DSP-Bench `StorageEstimate` (single codec source of truth via
+  `best_encoding_name`), so the advisory bench estimate and a realized segment
+  cannot drift. Still to do: a quality/null column, the hand-rolled **paged**
+  on-disk `.dspseg` layout (page offsets / per-page stats / checksums) — a naive
+  serde-of-the-struct frame is *not* the target — the catalog/metadata/index DBs,
+  and Arrow/Parquet interchange.)*
 - **4.4 Data skipping** (time/value/tag/quality pruning, page skipping).
+  *(Started — segment-level pruning on `dsp-physical-type::Segment`:
+  `overlaps_time`/`contains_timestamp` and `may_contain_value` (conservative —
+  `false` only when safe to skip), plus `prune_by_time` selecting exactly the
+  overlapping segments out of a set. Still to do: tag/quality pruning and
+  intra-segment page skipping, which depend on the 4.3 paged layout.)*
 - **4.5 Arrow-compatible arrays** (eases Python/Flight/DataFusion/Parquet).
 - **4.6 Correctness semantics:** out-of-order/late data, dedup, upsert, idempotent
   batch ingest, clock skew, precision, tz parsing, leap seconds, query consistency
