@@ -167,6 +167,14 @@ impl Segment {
 		self.timestamps.unit
 	}
 
+	/// The name of the timestamp codec chosen for this segment
+	/// (`delta_of_delta` or `delta_of_delta_rle`); see
+	/// [`DeltaOfDeltaColumn::best_encoding_name`].
+	#[must_use]
+	pub fn timestamp_encoding_name(&self) -> &'static str {
+		self.timestamps.best_encoding_name()
+	}
+
 	/// Estimated stored bytes of the value column (see
 	/// [`ColumnEncoding::estimated_bytes`]).
 	#[must_use]
