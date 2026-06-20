@@ -11,3 +11,6 @@ path = "src/lib.rs"
 [dependencies]
 bigdecimal = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
