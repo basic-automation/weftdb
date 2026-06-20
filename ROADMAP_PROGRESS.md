@@ -1392,3 +1392,124 @@ timestamp_unit }`) that both Storage v2 and the bench would consume, or 4.2
 bit-packing as a sibling codec.
 
 **PR:** https://github.com/physics515/DSP/pull/18
+
+---
+
+## 2026-06-20 — Phase 4.3/4.4: in-memory columnar segment + data skipping (6 increments)
+
+Began **Phase 4.3 (columnar segment store)** exactly as the 2026-06-19 run logged
+for "next step" — the first slice = an in-memory `.dspseg`-shaped segment type —
+then carried it into **Phase 4.4 (data skipping)**, which the per-segment stats
+exist to enable. The night built the entire in-memory segment + set-pruning
+foundation: a `Segment` binding the Phase-4.1 value column and the Phase-4.2
+timestamp column, per-segment min/max/count/ordering stats, a `bytes_per_point`
+proven equal to the DSP-Bench `StorageEstimate`, and conservative time/value
+pruning over both a single segment and a set of segments.
+
+**Items:** roadmap Phase 4.3 (0→started) and Phase 4.4 (0→started), with seeds of
+4.2 (monotonic-order) and 4.6 (out-of-order detection). Crates touched:
+`dsp-physical-type` (new `segment` module + a `timestamp` codec-name helper) and
+`dsp-bench` (`StorageEstimate` now shares the segment's codec selector).
+
+**Increment 1 — in-memory typed columnar `Segment`** (commit `61169cf`)
+- New `dsp-physical-type/src/segment.rs`: `Segment` / `SegmentStats` /
+  `SegmentError` + `SEGMENT_FORMAT_VERSION`, re-exported from the crate root.
+  `Segment::build(timestamps, values, unit, value_tolerance)` validates equal
+  column heights, encodes the value column via `recommend_encoding` and the
+  timestamp column via `encode_delta_of_delta`, and computes min/max ts, min/max
+  value, and row count in one pass. Exact `decode`/`decode_timestamps`/
+  `decode_values` round trip; the segment carries `row_count` so it resolves the
+  empty-vs-lone-anchor ambiguity the timestamp codec documents. `bytes_per_point`
+  sums the same value/timestamp column estimators the bench uses. serde
+  round-trip (serde_json dev-dep). Tests: +8 (40→48 lib).
+
+**Increment 2 — segment data-skipping predicates** (commit `c9bdc4b`)
+- `time_range`/`value_range`, `overlaps_time`/`contains_timestamp`,
+  `may_contain_value` — conservative pruning (`false` only when safe to skip).
+  Tests: +3 (48→51).
+
+**Increment 3 — one shared codec choice across bench + segment** (commit `bca9d75`)
+- `dsp-physical-type`: `DeltaOfDeltaColumn::best_encoding_name()` and
+  `Segment::timestamp_encoding_name()`. `dsp-bench`: `StorageEstimate::from_columns`
+  now calls `best_estimated_bytes()`/`best_encoding_name()` instead of re-deriving
+  the plain-vs-RLE choice inline (behaviour identical). New cross-crate test
+  `storage_estimate_agrees_with_a_real_segment` asserts the bench estimate and a
+  real `Segment` agree on physical type, value bytes, timestamp bytes, codec
+  label, row count, and total bytes/point. Tests: dsp-physical-type +1 (51→52),
+  dsp-bench lib +1 (86→87).
+
+**Increment 4 — multi-segment time pruning** (commit `fc9ee9d`)
+- `prune_by_time(segments, start, end) -> Vec<usize>`: the indices a range query
+  must scan; everything else is skipped. Tests: +2 (52→54).
+
+**Increment 5 — segment time-ordering awareness** (commit `a8c844b`)
+- `SegmentStats.time_sorted` (computed in `build`) + `Segment::is_time_sorted()`:
+  true admits intra-segment binary search, false flags out-of-order ingest (Phase
+  4.6). Tests: +1 (54→55).
+
+**Increment 6 — value-column multi-segment pruning** (commit `f315495`)
+- `prune_by_value(segments, lo, hi) -> Vec<usize>`, the value mirror of
+  `prune_by_time`. Tests: +1 (55→56).
+
+**Docs** (commit `008c105`) — ROADMAP.md: Phase 4.3 and 4.4 marked started with
+what shipped and what remains (paged on-disk layout, null column, tag/quality +
+page skipping).
+
+**Reverted mid-run (honesty):** an attempt at increment-4-as-`.dspseg`-binary-frame
+(`to_bytes`/`from_bytes` via `bincode`) was backed out: `bincode` cannot
+round-trip `BigDecimal` (it requires `serde::Deserializer::deserialize_any`,
+which non-self-describing formats reject). This confirmed that a naive
+serde-of-the-whole-struct frame is the *wrong* target anyway — Phase 4.3 wants a
+hand-rolled paged columnar layout — so the slice was replaced with the
+multi-segment time pruning above. No trace of the reverted attempt remains in the
+tree (verified `git diff` clean before proceeding).
+
+**Build/test/clippy (real, nightly toolchain):**
+- `cargo build --workspace` — GREEN (verified after each cross-crate change:
+  inc 1, 3, 5, 6).
+- `cargo test -p dsp-physical-type` — **56 lib pass**, 0 failed (40→56 across the
+  six increments).
+- `cargo test -p dsp-bench` — **87 lib + 20 integration pass**, 0 failed (run
+  `--test-threads=1` for honest counts; the pre-existing parallel-allocation
+  flake documented on 2026-06-19 is unchanged and was avoided, not introduced).
+- `cargo clippy -p dsp-physical-type -p dsp-bench --all-targets` — **0 new
+  warnings** under pedantic+nursery. Three lints hit and fixed structurally
+  (redundant closure / cast-precision in a test; `derive_partial_eq_without_eq`
+  on `SegmentStats`; markdown lazy-continuation + too-long-first-paragraph in
+  docs) — no `#[allow]`. The only remaining warnings are the 4 pre-existing
+  `splimes` `sort_by_key` lints (untouched crate).
+- `cargo fmt` — clean (hard tabs, project rustfmt).
+
+**Done vs open:** DONE — the in-memory Phase-4.3 `Segment` (typed value + DoD/RLE
+timestamp columns, per-segment stats, bench-aligned bytes/point, exact
+round trip) and the Phase-4.4 data-skipping primitives (single-segment time/value
+predicates + `prune_by_time`/`prune_by_value` over a set), plus time-ordering
+awareness. OPEN (Phase 4 remainder) — the hand-rolled **paged on-disk `.dspseg`
+layout** (page offsets / per-page stats / checksums; *not* a naive serde frame),
+a quality/null column, tag/quality + intra-segment page skipping, the
+catalog/metadata/segment-index DBs, Arrow/Parquet interchange, and schema-level
+per-aspect encoding *declaration*. Still open from prior runs: Phase-2 stored
+range / DB-subject-aspect model, OpenTelemetry; external-engine DuckDB +
+competitor adapters; the standalone methodology document.
+
+**STOP REASON:** natural-arc — six coherent increments built the entire
+in-memory segment + data-skipping foundation (Segment → predicates → bench
+unification → multi-segment time prune → ordering → value prune), above the 2–4
+bar. The next concern (the paged on-disk `.dspseg` format) is a multi-increment
+design slice with its own page/checksum layout, and this run empirically
+confirmed the naive serde-frame shortcut is the wrong approach — so it is better
+started on a fresh PR than half-built onto this one. Cutoff not reached (~03:15);
+stopping on arc completeness, not the clock.
+
+**Next step (tomorrow):** begin the **paged on-disk `.dspseg` layout** — a
+hand-rolled binary frame for `Segment` with a fixed header (magic + version +
+row/null counts + min/max ts/value + codec tags), the packed value and timestamp
+column byte streams, and a trailing CRC checksum, with a versioned
+`write_to`/`read_from` round trip and a corruption-detection test. Avoid `bincode`
+(no `BigDecimal` support) — encode the columns' primitive byte streams directly,
+keeping `BigDecimalText` values as length-prefixed UTF-8. Alternatively, the
+schema-level per-aspect **encoding declaration** (`AspectSchema { value:
+PhysicalType, value_tolerance, timestamp_unit }`) that both Storage v2 and the
+bench would consume.
+
+**PR:** _(opened below)_
