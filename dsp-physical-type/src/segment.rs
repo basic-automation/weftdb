@@ -329,6 +329,17 @@ pub fn prune_by_time(segments: &[Segment], start: i64, end: i64) -> Vec<usize> {
 	segments.iter().enumerate().filter(|(_, s)| s.overlaps_time(start, end)).map(|(i, _)| i).collect()
 }
 
+/// **Value data skipping over a set of segments** (roadmap Phase 4.4).
+///
+/// The value-column mirror of [`prune_by_time`]: returns the indices of the
+/// segments whose `[min_value, max_value]` span may intersect the inclusive range
+/// `[lo, hi]` — the ones a value-predicate query must scan. Every other segment
+/// is safely skipped on its min/max stats alone. Order-independent.
+#[must_use]
+pub fn prune_by_value(segments: &[Segment], lo: &BigDecimal, hi: &BigDecimal) -> Vec<usize> {
+	segments.iter().enumerate().filter(|(_, s)| s.may_contain_value(lo, hi)).map(|(i, _)| i).collect()
+}
+
 #[cfg(test)]
 mod tests {
 	use std::str::FromStr;
@@ -500,6 +511,22 @@ mod tests {
 		assert_eq!(prune_by_time(&segments, 91, 99), Vec::<usize>::new());
 		// A query past the end scans none.
 		assert_eq!(prune_by_time(&segments, 1_000, 2_000), Vec::<usize>::new());
+	}
+
+	#[test]
+	fn prune_by_value_selects_only_overlapping_segments() {
+		// Segments with disjoint value spans: [0,9], [100,109], [200,209].
+		let seg = |base: i64| {
+			let ts: Vec<i64> = (0..10).collect();
+			let vs: Vec<BigDecimal> = (0..10).map(|i| BigDecimal::from(base + i)).collect();
+			Segment::build(&ts, &vs, TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds")
+		};
+		let segments = vec![seg(0), seg(100), seg(200)];
+		assert_eq!(prune_by_value(&segments, &BigDecimal::from(102), &BigDecimal::from(108)), vec![1]);
+		assert_eq!(prune_by_value(&segments, &BigDecimal::from(5), &BigDecimal::from(105)), vec![0, 1]);
+		assert_eq!(prune_by_value(&segments, &BigDecimal::from(0), &BigDecimal::from(209)), vec![0, 1, 2]);
+		// A range in a value gap scans none.
+		assert_eq!(prune_by_value(&segments, &BigDecimal::from(50), &BigDecimal::from(60)), Vec::<usize>::new());
 	}
 
 	#[test]
