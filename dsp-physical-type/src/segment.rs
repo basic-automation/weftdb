@@ -82,6 +82,14 @@ pub struct SegmentStats {
 	/// Number of null/absent values. Always `0` in this slice (segments are built
 	/// from a dense column); a dedicated quality column lands in a later slice.
 	pub null_count: usize,
+	/// Whether the timestamps are monotonic non-decreasing (`ts[i] <= ts[i+1]`).
+	///
+	/// `true` for the in-order common case (and vacuously for an empty or
+	/// single-row segment). A `false` value flags **out-of-order ingest** (Phase
+	/// 4.6) and tells a reader it cannot binary-search within the segment for a
+	/// point lookup — it must scan linearly. Computed once at
+	/// [`build`](Segment::build).
+	pub time_sorted: bool,
 	/// Smallest timestamp in the segment, or [`None`] when empty.
 	pub min_ts: Option<i64>,
 	/// Largest timestamp in the segment, or [`None`] when empty.
@@ -132,7 +140,8 @@ impl Segment {
 		}
 		let value_col = recommend_encoding(values, value_tolerance);
 		let ts_col = encode_delta_of_delta(timestamps, unit);
-		let stats = SegmentStats { row_count: values.len(), null_count: 0, min_ts: timestamps.iter().copied().min(), max_ts: timestamps.iter().copied().max(), min_value: values.iter().min().cloned(), max_value: values.iter().max().cloned() };
+		let time_sorted = timestamps.windows(2).all(|w| w[0] <= w[1]);
+		let stats = SegmentStats { row_count: values.len(), null_count: 0, time_sorted, min_ts: timestamps.iter().copied().min(), max_ts: timestamps.iter().copied().max(), min_value: values.iter().min().cloned(), max_value: values.iter().max().cloned() };
 		Ok(Self { version: SEGMENT_FORMAT_VERSION, values: value_col, timestamps: ts_col, stats })
 	}
 
@@ -173,6 +182,16 @@ impl Segment {
 	#[must_use]
 	pub fn timestamp_encoding_name(&self) -> &'static str {
 		self.timestamps.best_encoding_name()
+	}
+
+	/// Whether this segment's timestamps are monotonic non-decreasing.
+	///
+	/// `true` admits intra-segment binary search for a point lookup; `false`
+	/// signals out-of-order ingest (Phase 4.6) and forces a linear scan. See
+	/// [`SegmentStats::time_sorted`].
+	#[must_use]
+	pub const fn is_time_sorted(&self) -> bool {
+		self.stats.time_sorted
 	}
 
 	/// Estimated stored bytes of the value column (see
@@ -346,6 +365,20 @@ mod tests {
 		assert_eq!(seg.stats.max_ts, Some(50));
 		assert_eq!(seg.stats.min_value, Some(BigDecimal::from_str("1.0").unwrap()));
 		assert_eq!(seg.stats.max_value, Some(BigDecimal::from_str("9.0").unwrap()));
+	}
+
+	#[test]
+	fn time_sorted_flag_reflects_ordering() {
+		// In-order (and equal-timestamp) series are monotonic.
+		let sorted = Segment::build(&[10, 10, 20, 30], &col(&["1.0", "2.0", "3.0", "4.0"]), TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		assert!(sorted.is_time_sorted());
+		assert!(sorted.stats.time_sorted);
+		// A single dip breaks monotonicity → out-of-order.
+		let unsorted = Segment::build(&[10, 30, 20, 40], &col(&["1.0", "2.0", "3.0", "4.0"]), TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		assert!(!unsorted.is_time_sorted());
+		// Empty and single-row segments are vacuously sorted.
+		assert!(Segment::build(&[], &[], TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds").is_time_sorted());
+		assert!(Segment::build(&[5], &col(&["1.0"]), TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds").is_time_sorted());
 	}
 
 	#[test]
