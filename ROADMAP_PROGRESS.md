@@ -1734,4 +1734,4 @@ wire **quality pruning** (Phase 4.4): skip an all-null segment (or page) for a
 value-predicate query using the now-real `null_count` / `NullMask`, and add a
 present-row count over a time window.
 
-**PR:** _(opened at wrap; URL appended below)_
+**PR:** https://github.com/physics515/DSP/pull/21
