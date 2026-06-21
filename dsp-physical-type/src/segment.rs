@@ -257,6 +257,27 @@ impl Segment {
 		(self.decode_timestamps(), self.decode_values())
 	}
 
+	/// Seal this segment to its on-disk `.dspseg` byte frame (magic + header +
+	/// column blocks + trailing CRC-32). See [`crate::dspseg::write_segment`].
+	///
+	/// Exact inverse of [`Segment::read_from`].
+	#[must_use]
+	pub fn write_to(&self) -> Vec<u8> {
+		crate::dspseg::write_segment(self)
+	}
+
+	/// Read a segment back from a `.dspseg` byte frame, verifying its checksum.
+	///
+	/// Exact inverse of [`Segment::write_to`]. See [`crate::dspseg::read_segment`].
+	///
+	/// # Errors
+	///
+	/// Propagates [`crate::dspseg::DspSegError`] for a corrupt, truncated, or
+	/// unrecognised frame (checksum mismatch, bad magic, unsupported version, …).
+	pub fn read_from(bytes: &[u8]) -> Result<Self, crate::dspseg::DspSegError> {
+		crate::dspseg::read_segment(bytes)
+	}
+
 	/// The inclusive `(min, max)` timestamp span this segment covers, or [`None`]
 	/// when empty. The coarse index a time-range query prunes against.
 	#[must_use]
