@@ -629,6 +629,138 @@ pub fn read_timestamp_column(r: &mut ByteReader) -> Result<DeltaOfDeltaColumn, D
 	Ok(DeltaOfDeltaColumn { first, first_delta, dods, unit })
 }
 
+// ---------------------------------------------------------------------------
+// Segment frame (Phase 4.3, slice 4)
+//
+// The full `.dspseg` frame ties the pieces together: a magic prefix and format
+// version, the per-segment header (the stats a reader prunes against — row/null
+// counts, time-sorted flag, min/max ts and value), the value-column block, the
+// timestamp-column block, and a trailing CRC-32 over everything before it. A
+// single flipped byte anywhere in the body changes the checksum, so corruption is
+// caught on read rather than silently misinterpreted.
+// ---------------------------------------------------------------------------
+
+use crate::{segment::SegmentStats, Segment, SEGMENT_FORMAT_VERSION};
+
+/// The magic prefix every `.dspseg` frame starts with.
+const MAGIC: &[u8; 7] = b"DSPSEG\0";
+
+/// Write an optional `i64` stat: a presence flag byte, then the fixed-width value.
+fn put_opt_i64(w: &mut ByteWriter, value: Option<i64>) {
+	match value {
+		Some(v) => {
+			w.put_u8(1);
+			w.put_i64_le(v);
+		}
+		None => w.put_u8(0),
+	}
+}
+
+/// Read an optional `i64` stat.
+fn read_opt_i64(r: &mut ByteReader) -> Result<Option<i64>, DspSegError> {
+	match r.read_u8()? {
+		0 => Ok(None),
+		_ => Ok(Some(r.read_i64_le()?)),
+	}
+}
+
+/// Write an optional `BigDecimal` stat as a presence flag + decimal text.
+fn put_opt_decimal(w: &mut ByteWriter, value: Option<&BigDecimal>) {
+	match value {
+		Some(v) => {
+			w.put_u8(1);
+			w.put_str(&v.to_plain_string());
+		}
+		None => w.put_u8(0),
+	}
+}
+
+/// Read an optional `BigDecimal` stat.
+fn read_opt_decimal(r: &mut ByteReader) -> Result<Option<BigDecimal>, DspSegError> {
+	match r.read_u8()? {
+		0 => Ok(None),
+		_ => Ok(Some(read_decimal(r)?)),
+	}
+}
+
+/// Encode a [`Segment`] into a complete, self-describing, checksummed `.dspseg`
+/// byte frame.
+///
+/// The inverse is [`read_segment`]; the round trip is exact (every field —
+/// including the header stats — is written, so the reconstructed segment compares
+/// equal to the original).
+#[must_use]
+pub fn write_segment(seg: &Segment) -> Vec<u8> {
+	let mut w = ByteWriter::with_capacity(64 + seg.total_bytes());
+	w.put_raw(MAGIC);
+	w.put_u16_le(seg.version);
+	// Header (stats).
+	w.put_uvarint(seg.stats.row_count as u64);
+	w.put_uvarint(seg.stats.null_count as u64);
+	w.put_u8(u8::from(seg.stats.time_sorted));
+	put_opt_i64(&mut w, seg.stats.min_ts);
+	put_opt_i64(&mut w, seg.stats.max_ts);
+	put_opt_decimal(&mut w, seg.stats.min_value.as_ref());
+	put_opt_decimal(&mut w, seg.stats.max_value.as_ref());
+	// Column blocks.
+	write_value_column(&mut w, &seg.values);
+	write_timestamp_column(&mut w, &seg.timestamps);
+	// Trailing CRC-32 over the whole body so far.
+	let checksum = crc32(w.as_slice());
+	w.put_u32_le(checksum);
+	w.into_vec()
+}
+
+/// Decode a [`Segment`] from a `.dspseg` byte frame — the exact inverse of
+/// [`write_segment`].
+///
+/// The trailing CRC-32 is verified against the body **before** any field is
+/// parsed, so a corrupt or truncated frame fails fast with
+/// [`DspSegError::ChecksumMismatch`] rather than being misread.
+///
+/// # Errors
+///
+/// - [`DspSegError::UnexpectedEof`] if the frame is too short to hold a checksum.
+/// - [`DspSegError::ChecksumMismatch`] if the stored CRC does not match the body.
+/// - [`DspSegError::BadMagic`] / [`DspSegError::UnsupportedVersion`] for a frame
+///   this reader does not recognise.
+/// - [`DspSegError::TrailingBytes`] if bytes remain after a complete frame.
+/// - the column/stat read errors ([`DspSegError::InvalidTag`],
+///   [`DspSegError::InvalidDecimal`], …) on a malformed body.
+pub fn read_segment(bytes: &[u8]) -> Result<Segment, DspSegError> {
+	if bytes.len() < 4 {
+		return Err(DspSegError::UnexpectedEof { needed: 4, remaining: bytes.len() });
+	}
+	let (body, crc_bytes) = bytes.split_at(bytes.len() - 4);
+	let stored = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+	let computed = crc32(body);
+	if stored != computed {
+		return Err(DspSegError::ChecksumMismatch { stored, computed });
+	}
+	let mut r = ByteReader::new(body);
+	if r.take(MAGIC.len())? != MAGIC {
+		return Err(DspSegError::BadMagic);
+	}
+	let version = r.read_u16_le()?;
+	if version != SEGMENT_FORMAT_VERSION {
+		return Err(DspSegError::UnsupportedVersion { found: version });
+	}
+	let row_count = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+	let null_count = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+	let time_sorted = r.read_u8()? != 0;
+	let min_ts = read_opt_i64(&mut r)?;
+	let max_ts = read_opt_i64(&mut r)?;
+	let min_value = read_opt_decimal(&mut r)?;
+	let max_value = read_opt_decimal(&mut r)?;
+	let values = read_value_column(&mut r)?;
+	let timestamps = read_timestamp_column(&mut r)?;
+	if !r.is_empty() {
+		return Err(DspSegError::TrailingBytes { remaining: r.remaining() });
+	}
+	let stats = SegmentStats { row_count, null_count, time_sorted, min_ts, max_ts, min_value, max_value };
+	Ok(Segment { version, values, timestamps, stats })
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -832,5 +964,93 @@ mod tests {
 		let bytes = [7_u8]; // tag 7 is not a time unit
 		let mut r = ByteReader::new(&bytes);
 		assert_eq!(read_timestamp_column(&mut r), Err(DspSegError::InvalidTag { kind: "time_unit", value: 7 }));
+	}
+
+	/// Build a segment, seal it to a `.dspseg` frame, read it back, and assert exact
+	/// recovery of the segment and its decoded columns.
+	fn assert_segment_frame_round_trips(timestamps: &[i64], values: &[BigDecimal], unit: TimeUnit, tolerance: &BigDecimal) {
+		let seg = Segment::build(timestamps, values, unit, tolerance).expect("builds");
+		let bytes = write_segment(&seg);
+		assert!(bytes.starts_with(MAGIC), "frame must carry the magic prefix");
+		let back = read_segment(&bytes).expect("reads");
+		assert_eq!(back, seg, "segment frame must round-trip exactly");
+		assert_eq!(back.decode(), seg.decode());
+		// And via the ergonomic Segment methods.
+		assert_eq!(Segment::read_from(&seg.write_to()).expect("reads"), seg);
+	}
+
+	#[test]
+	fn segment_frame_round_trips_across_shapes() {
+		// Regular series, lossless.
+		let ts: Vec<i64> = (0..200).map(|i| 1_000 + i * 10).collect();
+		let vs: Vec<BigDecimal> = (0..200).map(BigDecimal::from).collect();
+		assert_segment_frame_round_trips(&ts, &vs, TimeUnit::Millis, &BigDecimal::from(0));
+		// Irregular timestamps + scaled-decimal values.
+		assert_segment_frame_round_trips(&[30, 10, 50, 20], &col(&["3.50", "1.25", "9.75", "2.00"]), TimeUnit::Seconds, &BigDecimal::from(0));
+		// Lossy F32 within tolerance (non-exact value column).
+		assert_segment_frame_round_trips(&[0, 1, 2], &col(&["0.1", "0.2", "0.3"]), TimeUnit::Micros, &BigDecimal::from_str("0.01").unwrap());
+		// High-precision text-backed values.
+		assert_segment_frame_round_trips(&[100, 200], &col(&["123456789012345678901234567890.5", "-0.000000000001"]), TimeUnit::Nanos, &BigDecimal::from(0));
+		// Single point and empty.
+		assert_segment_frame_round_trips(&[42], &col(&["7.5"]), TimeUnit::Seconds, &BigDecimal::from(0));
+		assert_segment_frame_round_trips(&[], &[], TimeUnit::Seconds, &BigDecimal::from(0));
+	}
+
+	#[test]
+	fn corrupt_frame_is_detected_by_checksum() {
+		let seg = Segment::build(&[10, 20, 30, 40], &col(&["1.0", "2.0", "3.0", "4.0"]), TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		let good = write_segment(&seg);
+		// Flipping any single body byte trips the CRC.
+		for i in [MAGIC.len() + 2, good.len() / 2, good.len() - 5] {
+			let mut bad = good.clone();
+			bad[i] ^= 0xFF;
+			match read_segment(&bad) {
+				Err(DspSegError::ChecksumMismatch { .. }) => {}
+				other => panic!("byte {i} flip must be a checksum mismatch, got {other:?}"),
+			}
+		}
+		// Corrupting the trailing checksum itself is also caught.
+		let mut bad_crc = good;
+		let last = bad_crc.len() - 1;
+		bad_crc[last] ^= 0x01;
+		assert!(matches!(read_segment(&bad_crc), Err(DspSegError::ChecksumMismatch { .. })));
+	}
+
+	#[test]
+	fn bad_magic_and_short_frames_are_rejected() {
+		// Too short to even hold a checksum.
+		assert_eq!(read_segment(&[0, 1, 2]), Err(DspSegError::UnexpectedEof { needed: 4, remaining: 3 }));
+		// A correctly-checksummed frame whose body is 7 wrong-magic bytes: the CRC
+		// gate passes, then the magic check rejects it.
+		let mut bad = b"NOTSEG!".to_vec(); // 7 bytes, wrong magic
+		bad.extend_from_slice(&crc32(&bad).to_le_bytes());
+		assert_eq!(read_segment(&bad), Err(DspSegError::BadMagic));
+	}
+
+	#[test]
+	fn unsupported_version_is_rejected() {
+		let seg = Segment::build(&[1, 2], &col(&["1.0", "2.0"]), TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		let mut bytes = write_segment(&seg);
+		// Bump the version field (just after the 7-byte magic) and re-checksum so the
+		// frame is valid except for the version.
+		let vpos = MAGIC.len();
+		bytes[vpos] = bytes[vpos].wrapping_add(1);
+		let body_len = bytes.len() - 4;
+		let new_crc = crc32(&bytes[..body_len]).to_le_bytes();
+		bytes[body_len..].copy_from_slice(&new_crc);
+		assert_eq!(read_segment(&bytes), Err(DspSegError::UnsupportedVersion { found: SEGMENT_FORMAT_VERSION + 1 }));
+	}
+
+	#[test]
+	fn realized_frame_decodes_to_the_original_data() {
+		// End-to-end: raw data -> segment -> bytes -> segment -> raw data.
+		let ts: Vec<i64> = (0..500).map(|i| 1_600_000_000 + i * 60).collect();
+		let vs: Vec<BigDecimal> = (0..500).map(|i| BigDecimal::from_str(&format!("{}.{:03}", i, (i * 7) % 1000)).unwrap()).collect();
+		let seg = Segment::build(&ts, &vs, TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		let back = Segment::read_from(&seg.write_to()).expect("reads");
+		let (rts, rvs) = back.decode();
+		assert_eq!(rts, ts);
+		assert_eq!(rvs, vs);
+		assert!(back.is_exact());
 	}
 }

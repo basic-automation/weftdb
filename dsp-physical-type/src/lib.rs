@@ -70,7 +70,7 @@ use bigdecimal::{
 	num_bigint::{BigInt, Sign}, BigDecimal, FromPrimitive, ToPrimitive
 };
 pub use column::{encode_column, recommend_encoding, ColumnEncodeError, ColumnEncoding};
-pub use dspseg::{crc32, ByteReader, ByteWriter, DspSegError};
+pub use dspseg::{crc32, read_segment, write_segment, ByteReader, ByteWriter, DspSegError};
 pub use segment::{prune_by_time, prune_by_value, Segment, SegmentError, SegmentStats, SEGMENT_FORMAT_VERSION};
 use serde::{Deserialize, Serialize};
 pub use timestamp::{decode_delta, decode_delta_of_delta, encode_delta, encode_delta_of_delta, rle_decode, rle_encode, rle_varint_bytes, uvarint_len, zigzag_varint_bytes, zigzag_varint_len, DeltaColumn, DeltaOfDeltaColumn, TimeUnit};
