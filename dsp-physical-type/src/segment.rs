@@ -100,6 +100,17 @@ pub struct SegmentStats {
 	pub max_value: Option<BigDecimal>,
 }
 
+impl SegmentStats {
+	/// Compute the per-segment statistics from the raw parallel columns in a single
+	/// pass. Shared by [`Segment::build`] and the schema-declared
+	/// [`AspectSchema::seal`](crate::schema::AspectSchema::seal) so both produce
+	/// identical stats. Assumes the columns are equal height (the caller checks).
+	pub(crate) fn from_columns(timestamps: &[i64], values: &[BigDecimal]) -> Self {
+		let time_sorted = timestamps.windows(2).all(|w| w[0] <= w[1]);
+		Self { row_count: values.len(), null_count: 0, time_sorted, min_ts: timestamps.iter().copied().min(), max_ts: timestamps.iter().copied().max(), min_value: values.iter().min().cloned(), max_value: values.iter().max().cloned() }
+	}
+}
+
 /// An in-memory typed columnar segment: a timestamp column, a value column, and
 /// the statistics binding them.
 ///
@@ -140,8 +151,7 @@ impl Segment {
 		}
 		let value_col = recommend_encoding(values, value_tolerance);
 		let ts_col = encode_delta_of_delta(timestamps, unit);
-		let time_sorted = timestamps.windows(2).all(|w| w[0] <= w[1]);
-		let stats = SegmentStats { row_count: values.len(), null_count: 0, time_sorted, min_ts: timestamps.iter().copied().min(), max_ts: timestamps.iter().copied().max(), min_value: values.iter().min().cloned(), max_value: values.iter().max().cloned() };
+		let stats = SegmentStats::from_columns(timestamps, values);
 		Ok(Self { version: SEGMENT_FORMAT_VERSION, values: value_col, timestamps: ts_col, stats })
 	}
 
