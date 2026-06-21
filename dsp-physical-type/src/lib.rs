@@ -67,6 +67,7 @@
 
 pub mod column;
 pub mod dspseg;
+pub mod nulls;
 pub mod schema;
 pub mod segment;
 pub mod timestamp;
@@ -76,6 +77,7 @@ use bigdecimal::{
 };
 pub use column::{encode_column, recommend_encoding, ColumnEncodeError, ColumnEncoding};
 pub use dspseg::{crc32, read_segment, write_segment, ByteReader, ByteWriter, DspSegError};
+pub use nulls::{NullMask, NullMaskError};
 pub use schema::{AspectSchema, SealError};
 pub use segment::{prune_by_time, prune_by_value, Segment, SegmentError, SegmentStats, SEGMENT_FORMAT_VERSION};
 use serde::{Deserialize, Serialize};
