@@ -444,7 +444,9 @@ use std::str::FromStr;
 
 use bigdecimal::BigDecimal;
 
-use crate::{ColumnEncoding, PhysicalType, PhysicalValue};
+use crate::{
+	timestamp::{DeltaOfDeltaColumn, TimeUnit}, ColumnEncoding, PhysicalType, PhysicalValue
+};
 
 const TAG_F64: u8 = 0;
 const TAG_F32: u8 = 1;
@@ -547,6 +549,84 @@ pub fn read_value_column(r: &mut ByteReader) -> Result<ColumnEncoding, DspSegErr
 		values.push(read_physical_value(r, physical_type)?);
 	}
 	Ok(ColumnEncoding { physical_type, values, lossy_count, max_abs_error })
+}
+
+// ---------------------------------------------------------------------------
+// Timestamp-column codec (Phase 4.3, slice 3)
+//
+// The on-disk byte block for a `DeltaOfDeltaColumn`: a one-byte time-unit tag,
+// the full-width `i64` anchor, an optional first delta (a presence flag then a
+// signed varint), and the second-difference stream as a varint count + zig-zag
+// varints. Plain delta-of-delta is written here; run-length coding of the second
+// differences (the cheaper codec for a regular series, already chosen by
+// `best_encoding_name` for the bytes/point estimate) is a later compression slice
+// — this layer is exact and lossless either way.
+// ---------------------------------------------------------------------------
+
+const TIME_UNIT_SECONDS: u8 = 0;
+const TIME_UNIT_MILLIS: u8 = 1;
+const TIME_UNIT_MICROS: u8 = 2;
+const TIME_UNIT_NANOS: u8 = 3;
+
+/// The stable one-byte on-disk tag for a [`TimeUnit`].
+const fn time_unit_tag(unit: TimeUnit) -> u8 {
+	match unit {
+		TimeUnit::Seconds => TIME_UNIT_SECONDS,
+		TimeUnit::Millis => TIME_UNIT_MILLIS,
+		TimeUnit::Micros => TIME_UNIT_MICROS,
+		TimeUnit::Nanos => TIME_UNIT_NANOS,
+	}
+}
+
+/// Recover a [`TimeUnit`] from its on-disk tag.
+const fn time_unit_from_tag(tag: u8) -> Result<TimeUnit, DspSegError> {
+	match tag {
+		TIME_UNIT_SECONDS => Ok(TimeUnit::Seconds),
+		TIME_UNIT_MILLIS => Ok(TimeUnit::Millis),
+		TIME_UNIT_MICROS => Ok(TimeUnit::Micros),
+		TIME_UNIT_NANOS => Ok(TimeUnit::Nanos),
+		other => Err(DspSegError::InvalidTag { kind: "time_unit", value: other }),
+	}
+}
+
+/// Write a [`DeltaOfDeltaColumn`] as a `.dspseg` timestamp-column block.
+pub fn write_timestamp_column(w: &mut ByteWriter, col: &DeltaOfDeltaColumn) {
+	w.put_u8(time_unit_tag(col.unit));
+	w.put_i64_le(col.first);
+	match col.first_delta {
+		Some(delta) => {
+			w.put_u8(1);
+			w.put_svarint(delta);
+		}
+		None => w.put_u8(0),
+	}
+	w.put_uvarint(col.dods.len() as u64);
+	for &dod in &col.dods {
+		w.put_svarint(dod);
+	}
+}
+
+/// Read a [`DeltaOfDeltaColumn`] from a `.dspseg` timestamp-column block — the exact
+/// inverse of [`write_timestamp_column`].
+///
+/// # Errors
+///
+/// [`DspSegError::InvalidTag`] for an unrecognised time-unit tag, or
+/// [`DspSegError::UnexpectedEof`] / [`DspSegError::VarintTooLong`] on a short or
+/// malformed stream.
+pub fn read_timestamp_column(r: &mut ByteReader) -> Result<DeltaOfDeltaColumn, DspSegError> {
+	let unit = time_unit_from_tag(r.read_u8()?)?;
+	let first = r.read_i64_le()?;
+	let first_delta = match r.read_u8()? {
+		0 => None,
+		_ => Some(r.read_svarint()?),
+	};
+	let count = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+	let mut dods = Vec::with_capacity(count);
+	for _ in 0..count {
+		dods.push(r.read_svarint()?);
+	}
+	Ok(DeltaOfDeltaColumn { first, first_delta, dods, unit })
 }
 
 #[cfg(test)]
@@ -710,5 +790,47 @@ mod tests {
 		let bytes = [99_u8, 0, 0]; // tag 99 is not a physical type
 		let mut r = ByteReader::new(&bytes);
 		assert_eq!(read_value_column(&mut r), Err(DspSegError::InvalidTag { kind: "physical_type", value: 99 }));
+	}
+
+	/// Round-trip a timestamp column through the codec, asserting the column and its
+	/// decoded epochs both recover exactly.
+	fn assert_ts_col_round_trips(values: &[i64], unit: TimeUnit) {
+		use crate::{decode_delta_of_delta, encode_delta_of_delta};
+		let enc = encode_delta_of_delta(values, unit);
+		let mut w = ByteWriter::new();
+		write_timestamp_column(&mut w, &enc);
+		let bytes = w.into_vec();
+		let mut r = ByteReader::new(&bytes);
+		let back = read_timestamp_column(&mut r).expect("reads");
+		assert!(r.is_empty(), "timestamp codec must consume its whole block");
+		assert_eq!(back, enc);
+		assert_eq!(decode_delta_of_delta(&back), if values.is_empty() { vec![0] } else { values.to_vec() });
+	}
+
+	#[test]
+	fn timestamp_column_round_trips_regular_and_irregular() {
+		// Perfectly regular (all-zero second differences).
+		assert_ts_col_round_trips(&(0..1_000).map(|i| 1_000 + i * 10).collect::<Vec<_>>(), TimeUnit::Millis);
+		// Irregular gaps.
+		assert_ts_col_round_trips(&[5, 9, 12, 100, 101, 102, 50], TimeUnit::Micros);
+		// Each unit tag round-trips.
+		assert_ts_col_round_trips(&[1, 2, 3], TimeUnit::Seconds);
+		assert_ts_col_round_trips(&[10, 20], TimeUnit::Nanos);
+	}
+
+	#[test]
+	fn timestamp_column_round_trips_edge_sizes() {
+		// Single point (first_delta None) and empty.
+		assert_ts_col_round_trips(&[42], TimeUnit::Seconds);
+		assert_ts_col_round_trips(&[], TimeUnit::Seconds);
+		// Extreme values exercise the wrapping arithmetic and full-width varints.
+		assert_ts_col_round_trips(&[i64::MIN, i64::MAX, 0, i64::MIN], TimeUnit::Nanos);
+	}
+
+	#[test]
+	fn unknown_time_unit_tag_is_rejected() {
+		let bytes = [7_u8]; // tag 7 is not a time unit
+		let mut r = ByteReader::new(&bytes);
+		assert_eq!(read_timestamp_column(&mut r), Err(DspSegError::InvalidTag { kind: "time_unit", value: 7 }));
 	}
 }
