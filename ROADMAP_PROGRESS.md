@@ -1513,3 +1513,119 @@ PhysicalType, value_tolerance, timestamp_unit }`) that both Storage v2 and the
 bench would consume.
 
 **PR:** https://github.com/physics515/DSP/pull/19
+
+---
+
+## 2026-06-21 — Phase 4.3 on-disk `.dspseg` frame + 4.1 schema declaration (6 increments)
+
+Took the 2026-06-20 run's logged next step verbatim — the **hand-rolled paged
+on-disk `.dspseg` layout** — and built it end to end across four slices
+(primitives → value codec → timestamp codec → framed segment + corruption
+detection), then landed the named alternative next step, the **schema-level
+per-aspect encoding declaration** (`AspectSchema`), and recorded both state
+changes in ROADMAP.md. All in one crate (`dsp-physical-type`); the workspace
+stayed green throughout.
+
+**Items:** roadmap Phase 4.3 (on-disk `.dspseg` frame: started → shipped, single-block)
+and Phase 4.1 (schema-level encoding declaration: still-to-do → shipped). Crate
+touched: `dsp-physical-type` only (new `dspseg` + `schema` modules; a
+behaviour-preserving `SegmentStats::from_columns` refactor of `Segment::build`).
+
+**Increment 1 — `.dspseg` byte primitives + CRC-32** (commit `2864051`)
+- New `dsp-physical-type/src/dspseg.rs`: `ByteWriter`/`ByteReader` (checked
+  little-endian fixed-width ints, LEB128 unsigned varints, zig-zag signed
+  varints, length-prefixed byte/UTF-8 blocks) + IEEE `crc32` (const-built
+  table, verified against the `123456789 → 0xCBF43926` vector) + a recoverable
+  `DspSegError`. Varint widths match the crate's existing `uvarint_len` /
+  `zigzag_varint_len` estimators by construction. Tests: +8 (56 → 64 lib).
+
+**Increment 2 — value-column codec** (commit `f32dd97`)
+- `write_value_column` / `read_value_column` for `ColumnEncoding`: a
+  physical-type tag (+ shared scale for `ScaledI*`), value count, lossy
+  bookkeeping (`lossy_count` + `max_abs_error` as decimal text), then packed
+  per-value payloads — IEEE byte patterns (`F64`/`F32`), zig-zag varint mantissa
+  (`ScaledI64`), full-width `i128` (`ScaledI128`/`Decimal128`), length-prefixed
+  UTF-8 (`BigDecimalText`). New `DspSegError::InvalidDecimal`; added
+  `put/read` i128/f64/f32 helpers. Tests: +5 (64 → 69).
+
+**Increment 3 — timestamp-column codec** (commit `667fc9b`)
+- `write_timestamp_column` / `read_timestamp_column` for `DeltaOfDeltaColumn`:
+  time-unit tag, `i64` anchor, optional first delta, varint-counted zig-zag
+  second-difference stream. Plain delta-of-delta on disk (RLE-on-disk is a
+  later compression slice; lossless either way). New
+  `DspSegError::InvalidTag { kind: "time_unit", .. }`. Tests: +3 (69 → 72).
+
+**Increment 4 — framed segment + corruption detection** (commit `a43bee1`)
+- `write_segment` / `read_segment` (+ `Segment::write_to` / `read_from`): a
+  `DSPSEG\0` magic, format version, per-segment stats header (the data-skipping
+  inputs), the two column blocks, and a trailing CRC-32 verified against the
+  body **before** parse. Bad magic, unsupported version, and trailing bytes are
+  distinct errors. Tests: +5 (72 → 77) — round-trips across shapes
+  (regular/irregular/lossy-F32/high-precision-text/single/empty), a corruption
+  test flipping body bytes *and* the CRC (each a `ChecksumMismatch`), and an
+  end-to-end 500-point raw→bytes→raw check.
+
+**Increment 5 — schema-declared aspect encoding + seal** (commit `e39b65e`)
+- New `dsp-physical-type/src/schema.rs`: `AspectSchema { value, value_tolerance,
+  timestamp_unit }` + `seal` builds a `Segment` under the *declared* encoding
+  (vs `build`'s advisory `recommend_encoding`), erroring rather than silently
+  downcasting — `SealError::Encode` (unrepresentable value, with index) /
+  `SealError::ToleranceExceeded` (declared encoding loses more than permitted),
+  enforcing hard constraint #4. Shares `SegmentStats::from_columns` with
+  `build` (behaviour-preserving refactor). Tests: +8 (77 → 85).
+
+**Increment 6 — docs** (commit `3e5be02`) — ROADMAP.md Phase 4.1 (schema
+declaration shipped) and Phase 4.3 (on-disk `.dspseg` frame shipped, single-block;
+remaining = quality/null column, intra-frame page subdivision, catalog DBs,
+Arrow/Parquet).
+
+**Build/test/clippy (real, nightly `rustc 1.98.0-nightly cb46fbb8c`):**
+- `cargo build --workspace` — GREEN (verified after each cross-crate-visible
+  change: inc 1, 4, 5).
+- `cargo test -p dsp-physical-type` — **85 lib pass**, 0 failed (56 → 85 across
+  the run).
+- `cargo test -p dsp-bench` (single-threaded, honest counts) — **87 lib + 20
+  integration pass**, 0 failed (unchanged; consumes the crate, not modified).
+- `cargo test -p dsp-line-protocol` — **11 pass**, 0 failed (unchanged).
+- `cargo clippy -p dsp-physical-type --all-targets` — **0 new warnings** under
+  pedantic+nursery. Lints hit and fixed structurally (no `#[allow]`):
+  `missing_const_for_fn` ×3 (`ByteWriter::len/is_empty`, `time_unit_from_tag`),
+  `missing_panics_doc` ×3 (rewrote i128/f64/f32 reads with explicit indexing,
+  matching the existing `read_i64_le`), `cmp_owned` ×2 (bound the zero),
+  `redundant_clone` ×1. The only remaining workspace warnings are the 4
+  pre-existing `splimes` `sort_by_key` lints (untouched crate).
+- `cargo fmt` — clean (hard tabs, project rustfmt).
+
+**Done vs open:** DONE — the complete in-memory→on-disk path for a sealed
+segment: `Segment` (prior runs) now serialises to a versioned, checksummed
+`.dspseg` byte frame and reads back exactly with corruption detection, and an
+`AspectSchema` declares + enforces the per-aspect physical encoding. OPEN
+(Phase 4 remainder) — a quality/null column (then `null_count` becomes real and
+the frame version bumps); **intra-frame page subdivision** (per-page
+offsets/stats — the frame is single-block today; segment-level stats + checksum
+are present, page granularity is the next slice); the catalog/metadata/segment-
+index DBs; Arrow/Parquet interchange; and the Storage v2 store wiring that
+consumes `AspectSchema`. Still open from prior runs: Phase-2 stored range /
+DB-subject-aspect model, OpenTelemetry; external-engine DuckDB + competitor
+adapters; the standalone methodology document.
+
+**STOP REASON:** natural-arc — six coherent increments built the entire on-disk
+`.dspseg` frame (primitives → value codec → timestamp codec → framed segment +
+corruption detection) plus the schema-declared encoding path and the docs, above
+the 2–4 bar. Cutoff not reached (~03:15); stopping on arc completeness. The next
+concern (intra-frame **page** subdivision with per-page offsets/stats, and the
+quality/null column with its format-version bump) is a multi-increment design
+slice with its own layout decisions, better started on a fresh PR than half-built
+onto this one.
+
+**Next step (tomorrow):** add the **quality/null column** to `Segment` + the
+`.dspseg` frame — a third column (a presence bitmap or RLE null-run stream)
+making `null_count` real, bumping `SEGMENT_FORMAT_VERSION` and adding a header
+field, with seal/build accepting `Option<BigDecimal>` values and the frame
+round-tripping nulls. Alternatively, begin **intra-frame page subdivision**:
+split a sealed segment's columns into fixed-row pages, each with its own
+min/max ts/value stats and a per-page offset table in the header, so a range
+query skips pages within a segment (the Phase-4.4 intra-segment page-skipping
+the single-block frame defers).
+
+**PR:** (opened below)
