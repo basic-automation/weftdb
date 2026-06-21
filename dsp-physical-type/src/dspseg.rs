@@ -76,6 +76,9 @@ pub enum DspSegError {
 		/// How many bytes remained unread.
 		remaining: usize,
 	},
+	/// The quality-column block was internally inconsistent (a bitmap whose length
+	/// or clear-bit count disagrees with the header's row/null counts).
+	InvalidNullMask(crate::nulls::NullMaskError),
 }
 
 impl std::fmt::Display for DspSegError {
@@ -90,11 +93,19 @@ impl std::fmt::Display for DspSegError {
 			Self::InvalidTag { kind, value } => write!(f, "invalid {kind} tag byte {value:#04x}"),
 			Self::ChecksumMismatch { stored, computed } => write!(f, "segment checksum mismatch: stored {stored:#010x}, computed {computed:#010x}"),
 			Self::TrailingBytes { remaining } => write!(f, "{remaining} trailing bytes after segment frame"),
+			Self::InvalidNullMask(source) => write!(f, "invalid quality column: {source}"),
 		}
 	}
 }
 
-impl std::error::Error for DspSegError {}
+impl std::error::Error for DspSegError {
+	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+		match self {
+			Self::InvalidNullMask(source) => Some(source),
+			_ => None,
+		}
+	}
+}
 
 /// Build the IEEE CRC-32 lookup table at compile time (reversed polynomial
 /// `0xEDB8_8320`, the zlib/PNG variant).
@@ -640,10 +651,36 @@ pub fn read_timestamp_column(r: &mut ByteReader) -> Result<DeltaOfDeltaColumn, D
 // caught on read rather than silently misinterpreted.
 // ---------------------------------------------------------------------------
 
-use crate::{segment::SegmentStats, Segment, SEGMENT_FORMAT_VERSION};
+use crate::{nulls::NullMask, segment::SegmentStats, Segment, SEGMENT_FORMAT_VERSION};
 
 /// The magic prefix every `.dspseg` frame starts with.
 const MAGIC: &[u8; 7] = b"DSPSEG\0";
+
+/// Write the quality-column block: a presence flag, then (for a sparse column)
+/// the length-prefixed presence bitmap. A dense column writes a single `0` byte —
+/// the row/null counts are already in the header, so a dense segment's quality
+/// column costs exactly one byte on disk and zero in the bytes/point estimate.
+fn write_null_column(w: &mut ByteWriter, nulls: &NullMask) {
+	match nulls.bitmap_bytes() {
+		None => w.put_u8(0),
+		Some(bytes) => {
+			w.put_u8(1);
+			w.put_bytes(bytes);
+		}
+	}
+}
+
+/// Read the quality-column block back into a [`NullMask`], validating it against
+/// the header's `row_count` / `null_count` (a corrupt bitmap length or clear-bit
+/// count is rejected, not trusted).
+fn read_null_column(r: &mut ByteReader, row_count: usize, null_count: usize) -> Result<NullMask, DspSegError> {
+	let bits = match r.read_u8()? {
+		0 => None,
+		1 => Some(r.read_bytes()?.to_vec()),
+		value => return Err(DspSegError::InvalidTag { kind: "null_column", value }),
+	};
+	NullMask::from_raw(row_count, null_count, bits).map_err(DspSegError::InvalidNullMask)
+}
 
 /// Write an optional `i64` stat: a presence flag byte, then the fixed-width value.
 fn put_opt_i64(w: &mut ByteWriter, value: Option<i64>) {
@@ -705,6 +742,7 @@ pub fn write_segment(seg: &Segment) -> Vec<u8> {
 	// Column blocks.
 	write_value_column(&mut w, &seg.values);
 	write_timestamp_column(&mut w, &seg.timestamps);
+	write_null_column(&mut w, &seg.nulls);
 	// Trailing CRC-32 over the whole body so far.
 	let checksum = crc32(w.as_slice());
 	w.put_u32_le(checksum);
@@ -754,11 +792,12 @@ pub fn read_segment(bytes: &[u8]) -> Result<Segment, DspSegError> {
 	let max_value = read_opt_decimal(&mut r)?;
 	let values = read_value_column(&mut r)?;
 	let timestamps = read_timestamp_column(&mut r)?;
+	let nulls = read_null_column(&mut r, row_count, null_count)?;
 	if !r.is_empty() {
 		return Err(DspSegError::TrailingBytes { remaining: r.remaining() });
 	}
 	let stats = SegmentStats { row_count, null_count, time_sorted, min_ts, max_ts, min_value, max_value };
-	Ok(Segment { version, values, timestamps, stats })
+	Ok(Segment { version, values, timestamps, nulls, stats })
 }
 
 #[cfg(test)]
@@ -994,6 +1033,47 @@ mod tests {
 		// Single point and empty.
 		assert_segment_frame_round_trips(&[42], &col(&["7.5"]), TimeUnit::Seconds, &BigDecimal::from(0));
 		assert_segment_frame_round_trips(&[], &[], TimeUnit::Seconds, &BigDecimal::from(0));
+	}
+
+	#[test]
+	fn nullable_segment_frame_round_trips() {
+		let ncol = |lits: &[Option<&str>]| -> Vec<Option<BigDecimal>> { lits.iter().map(|o| o.map(|s| BigDecimal::from_str(s).expect("parses"))).collect() };
+		let assert_nullable_round_trips = |timestamps: &[i64], values: &[Option<BigDecimal>]| {
+			let seg = Segment::build_nullable(timestamps, values, TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+			let bytes = write_segment(&seg);
+			let back = read_segment(&bytes).expect("reads");
+			assert_eq!(back, seg, "nullable segment frame must round-trip exactly (mask included)");
+			assert_eq!(back.decode_nullable(), seg.decode_nullable());
+			assert_eq!(back.null_count(), seg.null_count());
+		};
+		// Interior gaps.
+		assert_nullable_round_trips(&[10, 20, 30, 40, 50], &ncol(&[Some("1.5"), None, Some("3.5"), None, Some("5.5")]));
+		// Leading and trailing nulls, multi-byte bitmap (9 rows ⇒ 2 bytes).
+		assert_nullable_round_trips(&(0..9).collect::<Vec<_>>(), &ncol(&[None, Some("1"), Some("2"), Some("3"), None, Some("5"), Some("6"), Some("7"), None]));
+		// Every row null — an empty value column with a full-clear mask.
+		assert_nullable_round_trips(&[1, 2, 3], &ncol(&[None, None, None]));
+		// A fully-present nullable build seals to the dense frame and still round-trips.
+		assert_nullable_round_trips(&[100, 110, 120], &ncol(&[Some("1.0"), Some("2.0"), Some("3.0")]));
+	}
+
+	#[test]
+	fn corrupt_null_mask_block_is_rejected() {
+		// Build a sparse segment, then corrupt the declared null count in the header
+		// so it disagrees with the bitmap the frame carries. The CRC is recomputed so
+		// the integrity gate passes and the null-mask validation fires instead.
+		let ncol = |lits: &[Option<&str>]| -> Vec<Option<BigDecimal>> { lits.iter().map(|o| o.map(|s| BigDecimal::from_str(s).expect("parses"))).collect() };
+		let seg = Segment::build_nullable(&[1, 2, 3, 4], &ncol(&[Some("1.0"), None, Some("3.0"), None]), TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		let bytes = write_segment(&seg);
+		// Header layout: MAGIC (7) + version (2) + row_count uvarint + null_count uvarint.
+		// row_count = 4 and null_count = 2 are both single-byte varints; null_count is
+		// the 10th byte (index 9 + 1 for row_count = index 10).
+		let null_count_idx = MAGIC.len() + 2 + 1;
+		let body_len = bytes.len() - 4;
+		let mut bad = bytes;
+		bad[null_count_idx] = 1; // claim 1 null where the bitmap encodes 2
+		let new_crc = crc32(&bad[..body_len]);
+		bad[body_len..].copy_from_slice(&new_crc.to_le_bytes());
+		assert_eq!(read_segment(&bad), Err(DspSegError::InvalidNullMask(crate::nulls::NullMaskError::NullCountMismatch { declared: 1, actual: 2 })));
 	}
 
 	#[test]

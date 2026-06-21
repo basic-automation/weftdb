@@ -32,7 +32,7 @@
 use bigdecimal::BigDecimal;
 
 use crate::{
-	column::{encode_column, ColumnEncodeError}, segment::SegmentStats, timestamp::{encode_delta_of_delta, TimeUnit}, PhysicalType, Segment, SEGMENT_FORMAT_VERSION
+	column::{encode_column, ColumnEncodeError}, nulls::NullMask, segment::SegmentStats, timestamp::{encode_delta_of_delta, TimeUnit}, PhysicalType, Segment, SEGMENT_FORMAT_VERSION
 };
 
 /// A per-aspect declaration of how that aspect's values and timestamps are stored.
@@ -130,7 +130,7 @@ impl AspectSchema {
 		}
 		let ts_col = encode_delta_of_delta(timestamps, self.timestamp_unit);
 		let stats = SegmentStats::from_columns(timestamps, values);
-		Ok(Segment { version: SEGMENT_FORMAT_VERSION, values: value_col, timestamps: ts_col, stats })
+		Ok(Segment { version: SEGMENT_FORMAT_VERSION, values: value_col, timestamps: ts_col, nulls: NullMask::all_present(values.len()), stats })
 	}
 }
 
