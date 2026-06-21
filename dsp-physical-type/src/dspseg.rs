@@ -45,6 +45,9 @@ pub enum DspSegError {
 	VarintTooLong,
 	/// A length-prefixed UTF-8 block held bytes that are not valid UTF-8.
 	InvalidUtf8,
+	/// A stored `BigDecimal` text block (a value or a min/max stat) did not parse as
+	/// a decimal — a corrupt or misframed stream.
+	InvalidDecimal,
 	/// The frame did not start with the expected `.dspseg` magic bytes.
 	BadMagic,
 	/// The frame's format version is not one this reader understands.
@@ -81,6 +84,7 @@ impl std::fmt::Display for DspSegError {
 			Self::UnexpectedEof { needed, remaining } => write!(f, "unexpected end of segment stream: needed {needed} bytes, {remaining} remaining"),
 			Self::VarintTooLong => f.write_str("malformed varint: did not terminate within 10 bytes"),
 			Self::InvalidUtf8 => f.write_str("length-prefixed block is not valid UTF-8"),
+			Self::InvalidDecimal => f.write_str("stored decimal text did not parse"),
 			Self::BadMagic => f.write_str("not a .dspseg frame: bad magic bytes"),
 			Self::UnsupportedVersion { found } => write!(f, "unsupported .dspseg format version {found}"),
 			Self::InvalidTag { kind, value } => write!(f, "invalid {kind} tag byte {value:#04x}"),
@@ -199,6 +203,22 @@ impl ByteWriter {
 	/// Append an `i64` little-endian (fixed 8 bytes) — used for the segment anchor,
 	/// where a full-width value is expected.
 	pub fn put_i64_le(&mut self, value: i64) {
+		self.buf.extend_from_slice(&value.to_le_bytes());
+	}
+
+	/// Append an `i128` little-endian (fixed 16 bytes) — a `ScaledI128` /
+	/// `Decimal128` mantissa, where the full width is needed.
+	pub fn put_i128_le(&mut self, value: i128) {
+		self.buf.extend_from_slice(&value.to_le_bytes());
+	}
+
+	/// Append an `f64` little-endian (its IEEE-754 byte pattern, 8 bytes).
+	pub fn put_f64_le(&mut self, value: f64) {
+		self.buf.extend_from_slice(&value.to_le_bytes());
+	}
+
+	/// Append an `f32` little-endian (its IEEE-754 byte pattern, 4 bytes).
+	pub fn put_f32_le(&mut self, value: f32) {
 		self.buf.extend_from_slice(&value.to_le_bytes());
 	}
 
@@ -321,6 +341,36 @@ impl<'a> ByteReader<'a> {
 		Ok(i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
 	}
 
+	/// Read a little-endian fixed-width `i128`.
+	///
+	/// # Errors
+	///
+	/// [`DspSegError::UnexpectedEof`] if fewer than 16 bytes remain.
+	pub fn read_i128_le(&mut self) -> Result<i128, DspSegError> {
+		let b = self.take(16)?;
+		Ok(i128::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]))
+	}
+
+	/// Read a little-endian `f64` (IEEE-754 byte pattern).
+	///
+	/// # Errors
+	///
+	/// [`DspSegError::UnexpectedEof`] if fewer than 8 bytes remain.
+	pub fn read_f64_le(&mut self) -> Result<f64, DspSegError> {
+		let b = self.take(8)?;
+		Ok(f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+	}
+
+	/// Read a little-endian `f32` (IEEE-754 byte pattern).
+	///
+	/// # Errors
+	///
+	/// [`DspSegError::UnexpectedEof`] if fewer than 4 bytes remain.
+	pub fn read_f32_le(&mut self) -> Result<f32, DspSegError> {
+		let b = self.take(4)?;
+		Ok(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+	}
+
 	/// Read an LEB128 unsigned varint.
 	///
 	/// # Errors
@@ -377,6 +427,126 @@ impl<'a> ByteReader<'a> {
 		let bytes = self.read_bytes()?;
 		std::str::from_utf8(bytes).map_err(|_| DspSegError::InvalidUtf8)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Value-column codec (Phase 4.3, slice 2)
+//
+// The on-disk byte block for a `ColumnEncoding`: a one-byte physical-type tag
+// (carrying the shared `scale` for the `ScaledI*` encodings), the value count,
+// the lossy bookkeeping (`lossy_count` + `max_abs_error` as decimal text), then
+// the packed per-value payloads. The reader dispatches the per-value shape on the
+// header tag, so the column invariant (every value matches `physical_type`) is
+// what makes write and read agree.
+// ---------------------------------------------------------------------------
+
+use std::str::FromStr;
+
+use bigdecimal::BigDecimal;
+
+use crate::{ColumnEncoding, PhysicalType, PhysicalValue};
+
+const TAG_F64: u8 = 0;
+const TAG_F32: u8 = 1;
+const TAG_SCALED_I64: u8 = 2;
+const TAG_SCALED_I128: u8 = 3;
+const TAG_DECIMAL128: u8 = 4;
+const TAG_BIGDECIMAL_TEXT: u8 = 5;
+
+/// The stable one-byte on-disk tag for a [`PhysicalType`].
+const fn physical_type_tag(pt: PhysicalType) -> u8 {
+	match pt {
+		PhysicalType::F64 => TAG_F64,
+		PhysicalType::F32 => TAG_F32,
+		PhysicalType::ScaledI64 { .. } => TAG_SCALED_I64,
+		PhysicalType::ScaledI128 { .. } => TAG_SCALED_I128,
+		PhysicalType::Decimal128 => TAG_DECIMAL128,
+		PhysicalType::BigDecimalText => TAG_BIGDECIMAL_TEXT,
+	}
+}
+
+/// Write one physical value's payload (the variant is recovered from the column's
+/// header tag, so only the data is written here).
+fn write_physical_value(w: &mut ByteWriter, value: &PhysicalValue) {
+	match value {
+		PhysicalValue::F64(f) => w.put_f64_le(*f),
+		PhysicalValue::F32(f) => w.put_f32_le(*f),
+		PhysicalValue::ScaledI64 { mantissa, .. } => w.put_svarint(*mantissa),
+		PhysicalValue::ScaledI128 { mantissa, .. } => w.put_i128_le(*mantissa),
+		PhysicalValue::Decimal128 { mantissa, scale } => {
+			w.put_i128_le(*mantissa);
+			w.put_svarint(*scale);
+		}
+		PhysicalValue::BigDecimalText(s) => w.put_str(s),
+	}
+}
+
+/// Read one physical value's payload for a column of the given `physical_type`.
+fn read_physical_value(r: &mut ByteReader, physical_type: PhysicalType) -> Result<PhysicalValue, DspSegError> {
+	Ok(match physical_type {
+		PhysicalType::F64 => PhysicalValue::F64(r.read_f64_le()?),
+		PhysicalType::F32 => PhysicalValue::F32(r.read_f32_le()?),
+		PhysicalType::ScaledI64 { scale } => PhysicalValue::ScaledI64 { mantissa: r.read_svarint()?, scale },
+		PhysicalType::ScaledI128 { scale } => PhysicalValue::ScaledI128 { mantissa: r.read_i128_le()?, scale },
+		PhysicalType::Decimal128 => PhysicalValue::Decimal128 { mantissa: r.read_i128_le()?, scale: r.read_svarint()? },
+		PhysicalType::BigDecimalText => PhysicalValue::BigDecimalText(r.read_str()?.to_owned()),
+	})
+}
+
+/// Parse a stored decimal-text block back into a [`BigDecimal`].
+fn read_decimal(r: &mut ByteReader) -> Result<BigDecimal, DspSegError> {
+	BigDecimal::from_str(r.read_str()?).map_err(|_| DspSegError::InvalidDecimal)
+}
+
+/// Write a [`ColumnEncoding`] as a `.dspseg` value-column block.
+///
+/// The mantissa/payload encoding is chosen per physical type: IEEE byte patterns
+/// for the floats, a zig-zag varint mantissa for `ScaledI64` (small mantissas cost
+/// one byte), full-width `i128` for the wide integer encodings, and length-prefixed
+/// UTF-8 for `BigDecimalText`. The shared `scale` of a `ScaledI*` column rides in
+/// the header tag, not per value.
+pub fn write_value_column(w: &mut ByteWriter, col: &ColumnEncoding) {
+	w.put_u8(physical_type_tag(col.physical_type));
+	match col.physical_type {
+		PhysicalType::ScaledI64 { scale } | PhysicalType::ScaledI128 { scale } => w.put_u8(scale),
+		_ => {}
+	}
+	w.put_uvarint(col.values.len() as u64);
+	w.put_uvarint(col.lossy_count as u64);
+	w.put_str(&col.max_abs_error.to_plain_string());
+	for value in &col.values {
+		write_physical_value(w, value);
+	}
+}
+
+/// Read a [`ColumnEncoding`] from a `.dspseg` value-column block — the exact
+/// inverse of [`write_value_column`].
+///
+/// # Errors
+///
+/// [`DspSegError::InvalidTag`] for an unrecognised physical-type tag,
+/// [`DspSegError::InvalidDecimal`] if the stored `max_abs_error` does not parse,
+/// or [`DspSegError::UnexpectedEof`] / [`DspSegError::VarintTooLong`] on a short or
+/// malformed stream.
+pub fn read_value_column(r: &mut ByteReader) -> Result<ColumnEncoding, DspSegError> {
+	let tag = r.read_u8()?;
+	let physical_type = match tag {
+		TAG_F64 => PhysicalType::F64,
+		TAG_F32 => PhysicalType::F32,
+		TAG_SCALED_I64 => PhysicalType::ScaledI64 { scale: r.read_u8()? },
+		TAG_SCALED_I128 => PhysicalType::ScaledI128 { scale: r.read_u8()? },
+		TAG_DECIMAL128 => PhysicalType::Decimal128,
+		TAG_BIGDECIMAL_TEXT => PhysicalType::BigDecimalText,
+		other => return Err(DspSegError::InvalidTag { kind: "physical_type", value: other }),
+	};
+	let count = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+	let lossy_count = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+	let max_abs_error = read_decimal(r)?;
+	let mut values = Vec::with_capacity(count);
+	for _ in 0..count {
+		values.push(read_physical_value(r, physical_type)?);
+	}
+	Ok(ColumnEncoding { physical_type, values, lossy_count, max_abs_error })
 }
 
 #[cfg(test)]
@@ -477,5 +647,68 @@ mod tests {
 		let bytes = w.into_vec();
 		let mut r = ByteReader::new(&bytes);
 		assert_eq!(r.read_str(), Err(DspSegError::InvalidUtf8));
+	}
+
+	fn col(lits: &[&str]) -> Vec<BigDecimal> {
+		lits.iter().map(|s| BigDecimal::from_str(s).expect("parses")).collect()
+	}
+
+	/// Round-trip a column through the value-column codec and assert exact recovery
+	/// (both the encoding struct and its decoded logical values).
+	fn assert_value_col_round_trips(enc: &ColumnEncoding) {
+		let mut w = ByteWriter::new();
+		write_value_column(&mut w, enc);
+		let bytes = w.into_vec();
+		let mut r = ByteReader::new(&bytes);
+		let back = read_value_column(&mut r).expect("reads");
+		assert!(r.is_empty(), "value-column codec must consume its whole block");
+		assert_eq!(&back, enc, "{:?} column must round-trip", enc.physical_type);
+		assert_eq!(back.decode(), enc.decode());
+	}
+
+	#[test]
+	fn value_column_round_trips_every_encoding() {
+		use crate::encode_column;
+		// One column per physical type, each within that encoding's exact range.
+		assert_value_col_round_trips(&encode_column(PhysicalType::F64, &col(&["0.5", "2.25", "-128.0"])).unwrap());
+		assert_value_col_round_trips(&encode_column(PhysicalType::F32, &col(&["0.5", "-0.25", "16.0"])).unwrap());
+		assert_value_col_round_trips(&encode_column(PhysicalType::ScaledI64 { scale: 2 }, &col(&["1.25", "-3.75", "0.00"])).unwrap());
+		assert_value_col_round_trips(&encode_column(PhysicalType::ScaledI128 { scale: 4 }, &col(&["1234567890.1234", "-9.0001"])).unwrap());
+		assert_value_col_round_trips(&encode_column(PhysicalType::Decimal128, &col(&["123456789012345678901234.567890", "-1.5", "0"])).unwrap());
+		assert_value_col_round_trips(&encode_column(PhysicalType::BigDecimalText, &col(&["1.5", "12345.6789", "-0.000001"])).unwrap());
+	}
+
+	#[test]
+	fn value_column_preserves_lossy_bookkeeping() {
+		use crate::encode_column;
+		// 0.1/0.3 are not binary-exact: the column is lossy and carries a positive
+		// max error that must survive the round trip.
+		let enc = encode_column(PhysicalType::F64, &col(&["0.5", "0.1", "0.3"])).unwrap();
+		assert!(!enc.is_exact());
+		let zero = BigDecimal::from(0);
+		assert!(enc.max_abs_error > zero);
+		assert_value_col_round_trips(&enc);
+	}
+
+	#[test]
+	fn value_column_recommend_encoding_round_trips() {
+		// The realistic path: let recommend_encoding pick, then seal/read it back.
+		let values: Vec<BigDecimal> = (0..50).map(|i| BigDecimal::from_str(&format!("{i}.{:02}", i % 100)).unwrap()).collect();
+		let enc = crate::recommend_encoding(&values, &BigDecimal::from(0));
+		assert_value_col_round_trips(&enc);
+	}
+
+	#[test]
+	fn empty_value_column_round_trips() {
+		use crate::encode_column;
+		assert_value_col_round_trips(&encode_column(PhysicalType::F64, &[]).unwrap());
+		assert_value_col_round_trips(&encode_column(PhysicalType::BigDecimalText, &[]).unwrap());
+	}
+
+	#[test]
+	fn unknown_physical_type_tag_is_rejected() {
+		let bytes = [99_u8, 0, 0]; // tag 99 is not a physical type
+		let mut r = ByteReader::new(&bytes);
+		assert_eq!(read_value_column(&mut r), Err(DspSegError::InvalidTag { kind: "physical_type", value: 99 }));
 	}
 }
