@@ -41,6 +41,9 @@
 //! - [`segment`] — Phase 4.3 in-memory typed columnar [`Segment`]: a value
 //!   column, a timestamp column, and per-segment min/max/count stats, with an
 //!   exact encode/decode round trip and a `bytes_per_point` matching the bench.
+//! - [`dspseg`] — Phase 4.3 on-disk `.dspseg` framing: the hand-rolled, versioned,
+//!   CRC-checked byte layout a [`Segment`] seals to (byte primitives + column and
+//!   frame codecs).
 //!
 //! [`F64`]: PhysicalType::F64
 //! [`F32`]: PhysicalType::F32
@@ -59,6 +62,7 @@
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 
 pub mod column;
+pub mod dspseg;
 pub mod segment;
 pub mod timestamp;
 
@@ -66,6 +70,7 @@ use bigdecimal::{
 	num_bigint::{BigInt, Sign}, BigDecimal, FromPrimitive, ToPrimitive
 };
 pub use column::{encode_column, recommend_encoding, ColumnEncodeError, ColumnEncoding};
+pub use dspseg::{crc32, ByteReader, ByteWriter, DspSegError};
 pub use segment::{prune_by_time, prune_by_value, Segment, SegmentError, SegmentStats, SEGMENT_FORMAT_VERSION};
 use serde::{Deserialize, Serialize};
 pub use timestamp::{decode_delta, decode_delta_of_delta, encode_delta, encode_delta_of_delta, rle_decode, rle_encode, rle_varint_bytes, uvarint_len, zigzag_varint_bytes, zigzag_varint_len, DeltaColumn, DeltaOfDeltaColumn, TimeUnit};
