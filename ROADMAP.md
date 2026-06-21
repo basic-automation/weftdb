@@ -243,8 +243,15 @@ JSON").
   (schema v6) — `recommend_encoding` over the stored value column plus the
   timestamp column (4.2 below) gives a measured **total bytes/point**
   (`StorageEstimate::from_columns`), the north-star cost term, surfaced in the
-  HTML report (`enc` / `val B/pt` / `tot B/pt`). Still to do here: schema-level
-  *declaration* of per-aspect encodings + Storage v2 segments.)*
+  HTML report (`enc` / `val B/pt` / `tot B/pt`). **Schema-level declaration
+  landed:** `dsp-physical-type::schema::AspectSchema` declares, per aspect, the
+  `PhysicalType`, its permitted per-value error bound, and the timestamp
+  `TimeUnit`; `AspectSchema::seal` builds a segment under the *declared*
+  encoding (vs `Segment::build`'s advisory `recommend_encoding`) and **errors**
+  rather than silently downcasting — `SealError::Encode` for an unrepresentable
+  value, `SealError::ToleranceExceeded` when the declared encoding would lose
+  more precision than the schema permits (hard constraint #4, enforced). Still
+  to do here: the Storage v2 segment store wiring that consumes the declaration.)*
 - **4.2 Timestamp semantics:** integer epoch internally (ns/µs as needed), explicit
   tz + leap-second policy, monotonic ordering; delta / delta-of-delta / bit-pack / RLE.
   *(Started — `dsp-physical-type::timestamp` ships lossless **delta** and
@@ -270,10 +277,22 @@ JSON").
   `bytes_per_point` shares `dsp-physical-type`'s column estimators with the
   DSP-Bench `StorageEstimate` (single codec source of truth via
   `best_encoding_name`), so the advisory bench estimate and a realized segment
-  cannot drift. Still to do: a quality/null column, the hand-rolled **paged**
-  on-disk `.dspseg` layout (page offsets / per-page stats / checksums) — a naive
-  serde-of-the-struct frame is *not* the target — the catalog/metadata/index DBs,
-  and Arrow/Parquet interchange.)*
+  cannot drift. **On-disk `.dspseg` frame landed:** the
+  `dsp-physical-type::dspseg` module ships the hand-rolled, versioned,
+  checksummed binary layout a `Segment` seals to — byte primitives (checked
+  little-endian ints, LEB128 / zig-zag varints, length-prefixed UTF-8) + an
+  IEEE CRC-32, a value-column codec (IEEE byte patterns / varint mantissa /
+  `i128` / length-prefixed text per `PhysicalType`), a timestamp-column codec
+  (delta-of-delta + varints), and the framed segment (`write_segment` /
+  `read_segment`, `Segment::write_to` / `read_from`): a `DSPSEG\0` magic, the
+  format version, the per-segment stats header (the data-skipping inputs),
+  the two column blocks, and a trailing CRC verified **before** parse so a
+  corrupt/truncated frame fails fast rather than being misread. Decidedly
+  *not* a `bincode`/serde blob (which cannot round-trip `BigDecimal`). Still to
+  do: a quality/null column; intra-frame **page** subdivision with per-page
+  offsets/stats (the frame is currently single-block — segment-level stats and
+  checksum are there, page-level granularity is the next slice); the
+  catalog/metadata/index DBs; and Arrow/Parquet interchange.)*
 - **4.4 Data skipping** (time/value/tag/quality pruning, page skipping).
   *(Started — segment-level pruning on `dsp-physical-type::Segment`:
   `overlaps_time`/`contains_timestamp` and `may_contain_value` (conservative —
