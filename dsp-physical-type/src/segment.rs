@@ -26,17 +26,22 @@
 //!   reports and the realized cost of an actual stored segment are the same
 //!   number, by construction (both call the same column byte estimators).
 //!
-//! Not yet here, and called out so the gap is honest: a separate quality/null
-//! column (so `null_count` is currently always zero — a segment is built from a
-//! dense `(timestamp, value)` column), page-level subdivision and per-page stats,
-//! checksums, and the on-disk framing/serialization of the `.dspseg` file itself.
-//! Those are the next Phase-4.3/4.4 slices.
+//! A separate **quality/null column** now lands too: [`Segment::build_nullable`]
+//! takes a `&[Option<BigDecimal>]` value column, stores only the present values
+//! densely, and records which rows are present in a [`NullMask`] so
+//! [`Segment::decode_nullable`] reconstructs the gaps — making `null_count` real
+//! (the dense [`Segment::build`] path is the all-present special case, costing no
+//! mask bytes).
+//!
+//! Not yet here, and called out so the gap is honest: page-level subdivision and
+//! per-page stats (the frame is single-block), tag/quality *pruning*, and the
+//! catalog/metadata/index DBs. Those are the next Phase-4.3/4.4 slices.
 
 use bigdecimal::BigDecimal;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-	column::{recommend_encoding, ColumnEncoding}, timestamp::{decode_delta_of_delta, encode_delta_of_delta, DeltaOfDeltaColumn, TimeUnit}
+	column::{recommend_encoding, ColumnEncoding}, nulls::NullMask, timestamp::{decode_delta_of_delta, encode_delta_of_delta, DeltaOfDeltaColumn, TimeUnit}
 };
 
 /// The on-disk/in-memory format version of a [`Segment`].
@@ -44,7 +49,11 @@ use crate::{
 /// Bumped whenever the segment layout changes in a way that a reader must branch
 /// on. A sealed `.dspseg` carries this so future Storage v2 code can refuse or
 /// migrate an incompatible segment rather than misread it.
-pub const SEGMENT_FORMAT_VERSION: u16 = 1;
+///
+/// - **v1** — dense `(timestamp, value)` columns only (no quality column).
+/// - **v2** — adds the [`NullMask`] quality column block, so a segment can carry
+///   null/absent rows ([`Segment::build_nullable`]).
+pub const SEGMENT_FORMAT_VERSION: u16 = 2;
 
 /// Why a [`Segment`] could not be built from its input columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,12 +84,14 @@ impl std::error::Error for SegmentError {}
 /// `min`/`max` are [`None`] only for an empty segment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SegmentStats {
-	/// Number of rows (one value per timestamp). The authoritative height — the
-	/// timestamp column alone cannot distinguish an empty column from a
-	/// single-anchor one, so the segment records the count explicitly.
+	/// Number of rows, present and null alike (the timestamp column is dense — one
+	/// timestamp per row). The authoritative height — the timestamp column alone
+	/// cannot distinguish an empty column from a single-anchor one, so the segment
+	/// records the count explicitly.
 	pub row_count: usize,
-	/// Number of null/absent values. Always `0` in this slice (segments are built
-	/// from a dense column); a dedicated quality column lands in a later slice.
+	/// Number of null/absent values (rows with a timestamp but no value). Zero for
+	/// a dense segment built with [`Segment::build`]; populated from the
+	/// [`NullMask`] for one built with [`Segment::build_nullable`].
 	pub null_count: usize,
 	/// Whether the timestamps are monotonic non-decreasing (`ts[i] <= ts[i+1]`).
 	///
@@ -101,13 +112,22 @@ pub struct SegmentStats {
 }
 
 impl SegmentStats {
-	/// Compute the per-segment statistics from the raw parallel columns in a single
-	/// pass. Shared by [`Segment::build`] and the schema-declared
+	/// Compute the per-segment statistics for a **dense** column (no nulls) in a
+	/// single pass. Shared by [`Segment::build`] and the schema-declared
 	/// [`AspectSchema::seal`](crate::schema::AspectSchema::seal) so both produce
 	/// identical stats. Assumes the columns are equal height (the caller checks).
 	pub(crate) fn from_columns(timestamps: &[i64], values: &[BigDecimal]) -> Self {
+		Self::from_columns_nullable(timestamps, values, 0)
+	}
+
+	/// Compute the per-segment statistics for a column with `null_count` absent
+	/// rows. `timestamps` is the dense per-row timestamp column (every row, present
+	/// or null); `present_values` holds only the non-null values (its length is the
+	/// row count minus `null_count`). Min/max value are over the present values
+	/// only — a null contributes a timestamp but no value to the range.
+	pub(crate) fn from_columns_nullable(timestamps: &[i64], present_values: &[BigDecimal], null_count: usize) -> Self {
 		let time_sorted = timestamps.windows(2).all(|w| w[0] <= w[1]);
-		Self { row_count: values.len(), null_count: 0, time_sorted, min_ts: timestamps.iter().copied().min(), max_ts: timestamps.iter().copied().max(), min_value: values.iter().min().cloned(), max_value: values.iter().max().cloned() }
+		Self { row_count: timestamps.len(), null_count, time_sorted, min_ts: timestamps.iter().copied().min(), max_ts: timestamps.iter().copied().max(), min_value: present_values.iter().min().cloned(), max_value: present_values.iter().max().cloned() }
 	}
 }
 
@@ -123,10 +143,15 @@ impl SegmentStats {
 pub struct Segment {
 	/// The segment layout version ([`SEGMENT_FORMAT_VERSION`] at build time).
 	pub version: u16,
-	/// The typed, physically-encoded value column.
+	/// The typed, physically-encoded value column — **present values only** (a null
+	/// row contributes nothing here; see [`nulls`](Self::nulls)).
 	pub values: ColumnEncoding,
-	/// The integer-epoch timestamp column (delta-of-delta transform).
+	/// The integer-epoch timestamp column (delta-of-delta transform), dense over
+	/// every row (present or null).
 	pub timestamps: DeltaOfDeltaColumn,
+	/// The quality column: which rows carry a value vs a null. Fully dense (no
+	/// stored bytes) for a segment built with [`Segment::build`].
+	pub nulls: NullMask,
 	/// Per-segment summary statistics.
 	pub stats: SegmentStats,
 }
@@ -152,7 +177,38 @@ impl Segment {
 		let value_col = recommend_encoding(values, value_tolerance);
 		let ts_col = encode_delta_of_delta(timestamps, unit);
 		let stats = SegmentStats::from_columns(timestamps, values);
-		Ok(Self { version: SEGMENT_FORMAT_VERSION, values: value_col, timestamps: ts_col, stats })
+		Ok(Self { version: SEGMENT_FORMAT_VERSION, values: value_col, timestamps: ts_col, nulls: NullMask::all_present(values.len()), stats })
+	}
+
+	/// Build a segment from a dense timestamp column and a **nullable** value
+	/// column — the Phase-4.3 quality-column path.
+	///
+	/// Every row has a timestamp; a `None` value marks a null/absent row. The
+	/// present (non-null) values are encoded densely by [`recommend_encoding`]
+	/// (the value column never stores a null), and a [`NullMask`] records which
+	/// rows are present so [`decode_nullable`](Segment::decode_nullable) can
+	/// interleave the values back with `None`s. A fully-present input produces a
+	/// segment byte-for-byte equivalent to [`build`](Segment::build) (the mask is
+	/// dense, costing nothing).
+	///
+	/// `min_value`/`max_value` in the stats are over the present values only.
+	///
+	/// # Errors
+	///
+	/// Returns [`SegmentError::LengthMismatch`] if `timestamps` and `values` differ
+	/// in length. As with [`build`](Segment::build), the encoding itself never
+	/// fails (the text encoding is the always-exact backstop).
+	pub fn build_nullable(timestamps: &[i64], values: &[Option<BigDecimal>], unit: TimeUnit, value_tolerance: &BigDecimal) -> Result<Self, SegmentError> {
+		if timestamps.len() != values.len() {
+			return Err(SegmentError::LengthMismatch { timestamps: timestamps.len(), values: values.len() });
+		}
+		let present: Vec<bool> = values.iter().map(Option::is_some).collect();
+		let nulls = NullMask::from_presence(&present);
+		let present_values: Vec<BigDecimal> = values.iter().flatten().cloned().collect();
+		let value_col = recommend_encoding(&present_values, value_tolerance);
+		let ts_col = encode_delta_of_delta(timestamps, unit);
+		let stats = SegmentStats::from_columns_nullable(timestamps, &present_values, nulls.null_count());
+		Ok(Self { version: SEGMENT_FORMAT_VERSION, values: value_col, timestamps: ts_col, nulls, stats })
 	}
 
 	/// Number of rows in the segment.
@@ -219,10 +275,32 @@ impl Segment {
 		self.timestamps.best_estimated_bytes()
 	}
 
-	/// Total estimated stored bytes: value column plus timestamp column.
+	/// Estimated stored bytes of the quality column: zero for a dense segment,
+	/// otherwise the packed presence bitmap (`ceil(row_count / 8)` bytes). See
+	/// [`NullMask::estimated_bytes`].
+	#[must_use]
+	pub fn null_bytes(&self) -> usize {
+		self.nulls.estimated_bytes()
+	}
+
+	/// Number of null/absent rows in the segment.
+	#[must_use]
+	pub const fn null_count(&self) -> usize {
+		self.stats.null_count
+	}
+
+	/// `true` iff the segment carries at least one null/absent row.
+	#[must_use]
+	pub const fn has_nulls(&self) -> bool {
+		self.stats.null_count > 0
+	}
+
+	/// Total estimated stored bytes: value column plus timestamp column plus the
+	/// quality column (zero bytes for a dense segment, so this equals
+	/// `value_bytes + timestamp_bytes` in the common case).
 	#[must_use]
 	pub fn total_bytes(&self) -> usize {
-		self.value_bytes() + self.timestamp_bytes()
+		self.value_bytes() + self.timestamp_bytes() + self.null_bytes()
 	}
 
 	/// Storage cost in **bytes per point** — the north-star term. Equal to the
@@ -255,16 +333,50 @@ impl Segment {
 		decode_delta_of_delta(&self.timestamps)
 	}
 
-	/// Reconstruct the logical value column.
+	/// Reconstruct the **present** logical values, densely.
+	///
+	/// For a dense segment this is the whole value column. For a nullable one it is
+	/// only the non-null values (its length is [`row_count`](Segment::row_count)
+	/// minus [`null_count`](Segment::null_count)); use
+	/// [`decode_nullable`](Segment::decode_nullable) to recover them aligned to
+	/// their timestamps with `None` in the gaps.
 	#[must_use]
 	pub fn decode_values(&self) -> Vec<BigDecimal> {
 		self.values.decode()
 	}
 
-	/// Reconstruct both logical columns as parallel vectors.
+	/// Reconstruct both logical columns as parallel vectors, **assuming a dense
+	/// segment** (one value per timestamp). For a segment that may carry nulls,
+	/// prefer [`decode_nullable`](Segment::decode_nullable), whose value vector
+	/// aligns to the timestamps. On a nullable segment the value vector this
+	/// returns is shorter than the timestamps (the present values only).
 	#[must_use]
 	pub fn decode(&self) -> (Vec<i64>, Vec<BigDecimal>) {
 		(self.decode_timestamps(), self.decode_values())
+	}
+
+	/// Reconstruct both logical columns, the value column aligned to the
+	/// timestamps with `None` at every null/absent row — the exact inverse of
+	/// [`build_nullable`](Segment::build_nullable).
+	///
+	/// The value vector always has the same length as the timestamp vector
+	/// ([`row_count`](Segment::row_count)). For a dense segment every entry is
+	/// `Some`.
+	#[must_use]
+	pub fn decode_nullable(&self) -> (Vec<i64>, Vec<Option<BigDecimal>>) {
+		let timestamps = self.decode_timestamps();
+		let present = self.values.decode();
+		let mut values = Vec::with_capacity(self.stats.row_count);
+		let mut next = 0;
+		for row in 0..self.stats.row_count {
+			if self.nulls.is_present(row) {
+				values.push(present.get(next).cloned());
+				next += 1;
+			} else {
+				values.push(None);
+			}
+		}
+		(timestamps, values)
 	}
 
 	/// Seal this segment to its on-disk `.dspseg` byte frame (magic + header +
@@ -566,6 +678,89 @@ mod tests {
 		let empty_seg = Segment::build(&[], &[], TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
 		// An empty segment is always skipped.
 		assert!(prune_by_time(std::slice::from_ref(&empty_seg), i64::MIN, i64::MAX).is_empty());
+	}
+
+	fn ncol(lits: &[Option<&str>]) -> Vec<Option<BigDecimal>> {
+		lits.iter().map(|o| o.map(|s| BigDecimal::from_str(s).expect("parses"))).collect()
+	}
+
+	#[test]
+	fn nullable_segment_round_trips_with_gaps() {
+		// Five rows, two of them null (rows 1 and 3).
+		let timestamps = vec![10_i64, 20, 30, 40, 50];
+		let values = ncol(&[Some("1.5"), None, Some("3.5"), None, Some("5.5")]);
+		let seg = Segment::build_nullable(&timestamps, &values, TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		assert_eq!(seg.version, SEGMENT_FORMAT_VERSION);
+		assert_eq!(seg.row_count(), 5);
+		assert_eq!(seg.null_count(), 2);
+		assert!(seg.has_nulls());
+		// The value column holds only the three present values.
+		assert_eq!(seg.values.len(), 3);
+		assert_eq!(seg.decode_values(), col(&["1.5", "3.5", "5.5"]));
+		// decode_nullable realigns them to the timestamps with None in the gaps.
+		let (ts, vs) = seg.decode_nullable();
+		assert_eq!(ts, timestamps);
+		assert_eq!(vs, values);
+	}
+
+	#[test]
+	fn nullable_stats_cover_present_values_only() {
+		let timestamps = vec![1_i64, 2, 3, 4];
+		// Present values 9.0 and 2.0; the nulls do not enter min/max.
+		let values = ncol(&[Some("9.0"), None, Some("2.0"), None]);
+		let seg = Segment::build_nullable(&timestamps, &values, TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		assert_eq!(seg.stats.null_count, 2);
+		assert_eq!(seg.stats.min_value, Some(BigDecimal::from_str("2.0").unwrap()));
+		assert_eq!(seg.stats.max_value, Some(BigDecimal::from_str("9.0").unwrap()));
+		// Timestamps are dense — all four rows count toward the span.
+		assert_eq!(seg.stats.min_ts, Some(1));
+		assert_eq!(seg.stats.max_ts, Some(4));
+	}
+
+	#[test]
+	fn fully_present_nullable_matches_dense_build() {
+		let timestamps = vec![100_i64, 110, 120];
+		let dense = col(&["1.0", "2.0", "3.0"]);
+		let nullable = ncol(&[Some("1.0"), Some("2.0"), Some("3.0")]);
+		let a = Segment::build(&timestamps, &dense, TimeUnit::Millis, &BigDecimal::from(0)).expect("builds");
+		let b = Segment::build_nullable(&timestamps, &nullable, TimeUnit::Millis, &BigDecimal::from(0)).expect("builds");
+		// A no-null nullable build is byte-for-byte the dense segment.
+		assert_eq!(a, b);
+		assert!(!b.has_nulls());
+		assert_eq!(b.null_bytes(), 0, "a dense quality column costs nothing");
+	}
+
+	#[test]
+	fn all_null_segment_has_an_empty_value_column() {
+		let timestamps = vec![1_i64, 2, 3];
+		let values: Vec<Option<BigDecimal>> = vec![None, None, None];
+		let seg = Segment::build_nullable(&timestamps, &values, TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		assert_eq!(seg.row_count(), 3);
+		assert_eq!(seg.null_count(), 3);
+		assert!(seg.values.is_empty(), "no present values ⇒ empty value column");
+		assert_eq!(seg.stats.min_value, None);
+		let (ts, vs) = seg.decode_nullable();
+		assert_eq!(ts, timestamps);
+		assert_eq!(vs, values);
+	}
+
+	#[test]
+	fn nullable_length_mismatch_is_rejected() {
+		let timestamps = vec![1_i64, 2, 3];
+		let values = ncol(&[Some("1.0"), None]);
+		let err = Segment::build_nullable(&timestamps, &values, TimeUnit::Seconds, &BigDecimal::from(0)).expect_err("mismatch");
+		assert_eq!(err, SegmentError::LengthMismatch { timestamps: 3, values: 2 });
+	}
+
+	#[test]
+	fn nullable_total_bytes_includes_the_quality_column() {
+		let timestamps: Vec<i64> = (0..16).collect();
+		// One null ⇒ a sparse mask of ceil(16/8) = 2 bytes.
+		let mut values: Vec<Option<BigDecimal>> = (0..16).map(|i| Some(BigDecimal::from(i))).collect();
+		values[7] = None;
+		let seg = Segment::build_nullable(&timestamps, &values, TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		assert_eq!(seg.null_bytes(), 2);
+		assert_eq!(seg.total_bytes(), seg.value_bytes() + seg.timestamp_bytes() + seg.null_bytes());
 	}
 
 	#[test]
