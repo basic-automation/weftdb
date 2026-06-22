@@ -295,6 +295,46 @@ impl Segment {
 		self.stats.null_count > 0
 	}
 
+	/// Number of present (non-null) rows in the segment — the height of the value
+	/// column. Equal to `row_count - null_count`.
+	#[must_use]
+	pub const fn present_count(&self) -> usize {
+		self.stats.row_count - self.stats.null_count
+	}
+
+	/// `true` iff the segment holds rows but **every** value is null — a segment
+	/// that carries timestamps and quality information but no measurements.
+	///
+	/// Such a segment can be skipped entirely by any query that needs an actual
+	/// value (interpolation, value predicates, aggregation over values): it
+	/// contributes only `None`s. Its `[min_value, max_value]` span is already
+	/// [`None`] (so [`may_contain_value`](Self::may_contain_value) and
+	/// [`prune_by_value`] skip it), but a *time*-range value query needs this
+	/// explicit check — the time span overlaps even though there is nothing to read.
+	/// An empty segment is **not** all-null (it has no rows at all).
+	#[must_use]
+	pub const fn is_all_null(&self) -> bool {
+		self.stats.row_count > 0 && self.stats.null_count == self.stats.row_count
+	}
+
+	/// **Quality data skipping** (roadmap Phase 4.4): the number of **present**
+	/// (non-null) rows whose timestamp falls in the inclusive range `[start, end]`.
+	///
+	/// This is the value-bearing population a range query over this segment will
+	/// actually materialize — a window can overlap the segment's time span yet
+	/// touch only null rows, in which case this returns `0` and the caller can skip
+	/// the value column. Returns `0` immediately when the query is disjoint from the
+	/// segment's time span (the [`overlaps_time`](Self::overlaps_time) fast path);
+	/// otherwise it decodes the timestamp column once and walks the quality mask.
+	#[must_use]
+	pub fn present_count_in_range(&self, start: i64, end: i64) -> usize {
+		if !self.overlaps_time(start, end) {
+			return 0;
+		}
+		let timestamps = self.decode_timestamps();
+		timestamps.iter().enumerate().filter(|&(row, &ts)| start <= ts && ts <= end && self.nulls.is_present(row)).count()
+	}
+
 	/// Total estimated stored bytes: value column plus timestamp column plus the
 	/// quality column (zero bytes for a dense segment, so this equals
 	/// `value_bytes + timestamp_bytes` in the common case).
@@ -481,6 +521,27 @@ pub fn prune_by_time(segments: &[Segment], start: i64, end: i64) -> Vec<usize> {
 #[must_use]
 pub fn prune_by_value(segments: &[Segment], lo: &BigDecimal, hi: &BigDecimal) -> Vec<usize> {
 	segments.iter().enumerate().filter(|(_, s)| s.may_contain_value(lo, hi)).map(|(i, _)| i).collect()
+}
+
+/// **Quality-aware time pruning over a set of segments** (roadmap Phase 4.4).
+///
+/// Like [`prune_by_time`], but for a query that needs actual **values** in the
+/// inclusive range `[start, end]` (interpolation, value aggregation, gap fill).
+/// Returns the indices of segments that both overlap the time range **and** carry
+/// at least one present (non-null) value inside it — the ones that will yield a
+/// measurement. A segment that overlaps the window but holds only null rows there
+/// (in particular a fully [`all-null`](Segment::is_all_null) segment) is skipped:
+/// scanning it would materialize nothing but `None`s.
+///
+/// This is strictly more selective than [`prune_by_time`] — every returned index
+/// is also returned by `prune_by_time`, never the reverse. It decodes the
+/// timestamp column of the time-overlapping segments to test the mask, so it is
+/// heavier than the min/max-only [`prune_by_time`]; use it when the per-segment
+/// decode is cheaper than reading value columns that turn out to be all null.
+/// Order-independent.
+#[must_use]
+pub fn prune_present_by_time(segments: &[Segment], start: i64, end: i64) -> Vec<usize> {
+	segments.iter().enumerate().filter(|(_, s)| s.present_count_in_range(start, end) > 0).map(|(i, _)| i).collect()
 }
 
 #[cfg(test)]
@@ -761,6 +822,69 @@ mod tests {
 		let seg = Segment::build_nullable(&timestamps, &values, TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
 		assert_eq!(seg.null_bytes(), 2);
 		assert_eq!(seg.total_bytes(), seg.value_bytes() + seg.timestamp_bytes() + seg.null_bytes());
+	}
+
+	#[test]
+	fn present_count_and_all_null_classify_the_quality_column() {
+		// A dense segment: every row present, none null.
+		let dense = Segment::build(&[1_i64, 2, 3], &col(&["1.0", "2.0", "3.0"]), TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		assert_eq!(dense.present_count(), 3);
+		assert!(!dense.is_all_null());
+		// A partly-null segment: present_count excludes the nulls.
+		let partial = Segment::build_nullable(&[1_i64, 2, 3, 4], &ncol(&[Some("1.0"), None, Some("3.0"), None]), TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		assert_eq!(partial.present_count(), 2);
+		assert!(!partial.is_all_null());
+		// An all-null segment: no present rows, classified all-null.
+		let all_null = Segment::build_nullable(&[1_i64, 2, 3], &ncol(&[None, None, None]), TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		assert_eq!(all_null.present_count(), 0);
+		assert!(all_null.is_all_null());
+		// An empty segment is not all-null — it has no rows at all.
+		let empty = Segment::build(&[], &[], TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		assert_eq!(empty.present_count(), 0);
+		assert!(!empty.is_all_null());
+	}
+
+	#[test]
+	fn present_count_in_range_counts_only_present_rows_in_window() {
+		// Rows at ts 10..=50; rows 1 (ts 20) and 3 (ts 40) are null.
+		let timestamps = vec![10_i64, 20, 30, 40, 50];
+		let values = ncol(&[Some("1.0"), None, Some("3.0"), None, Some("5.0")]);
+		let seg = Segment::build_nullable(&timestamps, &values, TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		// Whole span: three present values.
+		assert_eq!(seg.present_count_in_range(0, 100), 3);
+		// A window covering only the two null rows yields nothing.
+		assert_eq!(seg.present_count_in_range(20, 40), 1, "ts 30 is the only present row in [20,40]");
+		assert_eq!(seg.present_count_in_range(20, 20), 0, "ts 20 is null");
+		assert_eq!(seg.present_count_in_range(40, 40), 0, "ts 40 is null");
+		// A disjoint window short-circuits to zero.
+		assert_eq!(seg.present_count_in_range(60, 90), 0);
+		// Edge inclusivity.
+		assert_eq!(seg.present_count_in_range(50, 50), 1, "ts 50 present, inclusive high edge");
+		assert_eq!(seg.present_count_in_range(10, 10), 1, "ts 10 present, inclusive low edge");
+	}
+
+	#[test]
+	fn prune_present_by_time_skips_all_null_and_disjoint_segments() {
+		// Three segments over [0,40], [100,140], [200,240]. The middle is all-null.
+		let dense = |base: i64| {
+			let ts: Vec<i64> = (0..5).map(|i| base + i * 10).collect();
+			let vs: Vec<BigDecimal> = (0..5).map(BigDecimal::from).collect();
+			Segment::build(&ts, &vs, TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds")
+		};
+		let all_null = {
+			let ts: Vec<i64> = (0..5).map(|i| 100 + i * 10).collect();
+			let vs: Vec<Option<BigDecimal>> = vec![None; 5];
+			Segment::build_nullable(&ts, &vs, TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds")
+		};
+		let segments = vec![dense(0), all_null, dense(200)];
+		// A query spanning all three: plain time pruning keeps the all-null middle,
+		// quality-aware pruning drops it.
+		assert_eq!(prune_by_time(&segments, 0, 240), vec![0, 1, 2]);
+		assert_eq!(prune_present_by_time(&segments, 0, 240), vec![0, 2]);
+		// A query entirely inside the all-null segment yields nothing to read.
+		assert_eq!(prune_present_by_time(&segments, 110, 130), Vec::<usize>::new());
+		// Quality-aware pruning is a subset of plain time pruning here.
+		assert_eq!(prune_present_by_time(&segments, 0, 40), vec![0]);
 	}
 
 	#[test]
