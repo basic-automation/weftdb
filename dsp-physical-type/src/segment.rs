@@ -66,12 +66,17 @@ pub enum SegmentError {
 		/// Number of values supplied.
 		values: usize,
 	},
+	/// A paged build was asked for a page height of zero rows — a page must hold at
+	/// least one row, so the rows cannot be partitioned. See
+	/// [`PagedSegment::build`](crate::page::PagedSegment::build).
+	EmptyPageSize,
 }
 
 impl std::fmt::Display for SegmentError {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
 			Self::LengthMismatch { timestamps, values } => write!(f, "segment column height mismatch: {timestamps} timestamps vs {values} values"),
+			Self::EmptyPageSize => write!(f, "paged segment page height must be at least one row, got zero"),
 		}
 	}
 }
