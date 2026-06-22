@@ -125,6 +125,33 @@ impl Page {
 		}
 	}
 
+	/// Number of present (non-null) rows in the page — equal to
+	/// `row_count - null_count`.
+	#[must_use]
+	pub const fn present_count(&self) -> usize {
+		self.stats.row_count - self.stats.null_count
+	}
+
+	/// `true` iff the page holds rows but **every** value is null — a page a
+	/// value-bearing query can skip entirely (it yields only `None`s).
+	#[must_use]
+	pub const fn is_all_null(&self) -> bool {
+		self.stats.row_count > 0 && self.stats.null_count == self.stats.row_count
+	}
+
+	/// The number of **present** (non-null) rows whose timestamp falls in the
+	/// inclusive range `[start, end]` — the value-bearing population a window
+	/// actually materializes from this page (Phase-4.4 quality data skipping).
+	/// Short-circuits to `0` on a disjoint window before decoding.
+	#[must_use]
+	pub fn present_count_in_range(&self, start: i64, end: i64) -> usize {
+		if !self.overlaps_time(start, end) {
+			return 0;
+		}
+		let timestamps = self.decode_timestamps();
+		timestamps.iter().enumerate().filter(|&(row, &ts)| start <= ts && ts <= end && self.nulls.is_present(row)).count()
+	}
+
 	/// Estimated stored bytes of the page's three columns (value + timestamp +
 	/// quality), on the same estimators a [`Segment`] uses.
 	#[must_use]
@@ -294,6 +321,33 @@ impl PagedSegment {
 	#[must_use]
 	pub fn prune_pages_by_time(&self, start: i64, end: i64) -> Vec<usize> {
 		self.pages.iter().enumerate().filter(|(_, p)| p.overlaps_time(start, end)).map(|(i, _)| i).collect()
+	}
+
+	/// **Quality-aware intra-segment page skipping** (roadmap Phase 4.4): the
+	/// indices of the pages that both overlap `[start, end]` **and** carry at least
+	/// one present (non-null) value inside it — the only pages a value-bearing query
+	/// (interpolation, value aggregation, gap fill) will get a measurement from.
+	///
+	/// The page-level analogue of
+	/// [`prune_present_by_time`](crate::prune_present_by_time): strictly more
+	/// selective than [`prune_pages_by_time`](Self::prune_pages_by_time) — it also
+	/// drops a page that overlaps the window but holds only nulls there (in
+	/// particular a fully [`all-null`](Page::is_all_null) page). Heavier than the
+	/// min/max-only [`prune_pages_by_time`] (it decodes the overlapping pages'
+	/// timestamp columns to test the mask), so reach for it when skipping an all-null
+	/// page's value column is worth that decode.
+	#[must_use]
+	pub fn prune_present_pages_by_time(&self, start: i64, end: i64) -> Vec<usize> {
+		self.pages.iter().enumerate().filter(|(_, p)| p.present_count_in_range(start, end) > 0).map(|(i, _)| i).collect()
+	}
+
+	/// The number of **present** (non-null) rows across the whole segment whose
+	/// timestamp falls in the inclusive range `[start, end]` — summed over the pages
+	/// that overlap the window (non-overlapping pages contribute `0` without
+	/// decoding). The value-bearing population a windowed query materializes.
+	#[must_use]
+	pub fn present_count_in_range(&self, start: i64, end: i64) -> usize {
+		self.pages.iter().map(|p| p.present_count_in_range(start, end)).sum()
 	}
 
 	/// Reconstruct **all** rows as parallel `(timestamps, values)` vectors with a
@@ -510,6 +564,49 @@ mod tests {
 		assert_eq!(paged.page_count(), 1);
 		assert_eq!(paged.total_bytes(), single.total_bytes());
 		assert!((paged.bytes_per_point() - single.bytes_per_point()).abs() < f64::EPSILON);
+	}
+
+	#[test]
+	fn page_present_count_and_all_null_classify_the_quality_column() {
+		// A paged segment, 4 rows per page; page 1 is entirely null.
+		let timestamps: Vec<i64> = (0..12).map(|i| i * 10).collect();
+		let values = ncol(&[Some("0"), Some("1"), Some("2"), Some("3"), None, None, None, None, Some("8"), Some("9"), None, Some("11")]);
+		let seg = PagedSegment::build_nullable(&timestamps, &values, TimeUnit::Seconds, &BigDecimal::from(0), 4).expect("builds");
+		assert_eq!(seg.page_count(), 3);
+		assert_eq!(seg.pages[0].present_count(), 4);
+		assert!(!seg.pages[0].is_all_null());
+		assert!(seg.pages[1].is_all_null(), "page 1 is entirely null");
+		assert_eq!(seg.pages[1].present_count(), 0);
+		assert_eq!(seg.pages[2].present_count(), 3);
+		assert!(!seg.pages[2].is_all_null());
+	}
+
+	#[test]
+	fn prune_present_pages_skips_all_null_pages() {
+		// Pages [0,30], [40,70] (all-null), [80,110].
+		let timestamps: Vec<i64> = (0..12).map(|i| i * 10).collect();
+		let values = ncol(&[Some("0"), Some("1"), Some("2"), Some("3"), None, None, None, None, Some("8"), Some("9"), Some("10"), Some("11")]);
+		let seg = PagedSegment::build_nullable(&timestamps, &values, TimeUnit::Seconds, &BigDecimal::from(0), 4).expect("builds");
+		// Plain page pruning keeps the all-null middle page; quality-aware drops it.
+		assert_eq!(seg.prune_pages_by_time(0, 110), vec![0, 1, 2]);
+		assert_eq!(seg.prune_present_pages_by_time(0, 110), vec![0, 2]);
+		// A window entirely inside the all-null page yields nothing to read.
+		assert_eq!(seg.prune_present_pages_by_time(45, 65), Vec::<usize>::new());
+		// Quality-aware pruning is a subset of plain pruning.
+		assert_eq!(seg.prune_present_pages_by_time(0, 30), vec![0]);
+	}
+
+	#[test]
+	fn present_count_in_range_sums_across_pages() {
+		let timestamps: Vec<i64> = (0..12).map(|i| i * 10).collect();
+		let values = ncol(&[Some("0"), None, Some("2"), Some("3"), None, None, None, None, Some("8"), Some("9"), None, Some("11")]);
+		let seg = PagedSegment::build_nullable(&timestamps, &values, TimeUnit::Seconds, &BigDecimal::from(0), 4).expect("builds");
+		// Whole span: present values at ts 0,20,30,80,90,110 ⇒ 6.
+		assert_eq!(seg.present_count_in_range(i64::MIN, i64::MAX), 6);
+		// Window [20, 90] spans pages 0 (20,30), 1 (none), 2 (80,90) ⇒ 4.
+		assert_eq!(seg.present_count_in_range(20, 90), 4);
+		// A window inside the all-null page is zero.
+		assert_eq!(seg.present_count_in_range(40, 70), 0);
 	}
 
 	#[test]
