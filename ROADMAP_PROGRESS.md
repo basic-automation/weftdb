@@ -1735,3 +1735,125 @@ value-predicate query using the now-real `null_count` / `NullMask`, and add a
 present-row count over a time window.
 
 **PR:** https://github.com/physics515/DSP/pull/21
+
+---
+
+## 2026-06-22 — Phase 4.3/4.4 intra-segment paging + quality skipping, end to end (7 increments)
+
+Took the 2026-06-21 run 2's logged next step — **intra-frame page subdivision**
+(plus its alternative, **quality pruning**) — and built the entire intra-segment
+paging + quality-data-skipping story across six code increments plus a docs
+increment. All in one crate (`dsp-physical-type`); the workspace stayed green
+throughout, and every commit left a correct, round-trippable artifact (the
+in-memory model and the on-disk frame landed in adjacent commits, so no commit
+shipped a paged segment that could not seal/read).
+
+**Items:** Phase 4.4 (data skipping: quality + intra-segment page skipping →
+shipped), Phase 4.3 (intra-frame page subdivision with per-page stats/offsets →
+shipped), Phase 4.1/4.3 (schema-declared paged seal). Crate touched:
+`dsp-physical-type` only (new `page` module; `segment`, `dspseg`, `schema`, `lib`
+extended).
+
+**Increment 1 — quality-aware time pruning** (commit `7a280ae`)
+- `segment.rs`: building on the now-real `NullMask`, added
+  `Segment::present_count` / `is_all_null` / `present_count_in_range` and the
+  free `prune_present_by_time` — skip segments that overlap a window but hold
+  only nulls there (strictly more selective than `prune_by_time`). Tests: +3
+  (110 → 113 lib).
+
+**Increment 2 — intra-segment page subdivision, in-memory** (commit `03e8c00`)
+- New `page.rs`: `Page` (one fixed-height row block — value column,
+  delta-of-delta timestamp column, `NullMask`, and its own `SegmentStats`) and
+  `PagedSegment` (partitions rows into pages of `rows_per_page`, segment-level
+  rollup). `prune_pages_by_time` + `read_time_range` decode ONLY the overlapping
+  pages (skipped pages' columns never reconstructed); `decode_nullable`
+  concatenates exactly. `bytes_per_point` on the same ruler as
+  `Segment::bytes_per_point` (coincide exactly at one page). New
+  `SegmentError::EmptyPageSize`. `PAGED_SEGMENT_FORMAT_VERSION = 3`. In-memory
+  only; serde round-trips. Tests: +12 (113 → 125 lib).
+
+**Increment 3 — on-disk `.dspseg` v3 paged frame** (commit `a873b6b`)
+- `dspseg.rs`: `write_paged_segment` / `read_paged_segment` (+ `PagedSegment::
+  write_to` / `read_from`). Frame = magic + version 3 + `rows_per_page` +
+  segment-level stats + a **per-page index table** (each page's full stats AND
+  its column-block byte length) + concatenated pure-column page blocks + CRC
+  verified before parse. The index lets a reader prune pages on min/max ts/value
+  without touching a column byte, and seek straight to a page; each page block is
+  bounded to its indexed length (under/overfull → `TrailingBytes`). Paged and
+  single-block readers reject each other's frames as `UnsupportedVersion`.
+  Refactor: extracted `write_segment_stats` / `read_segment_stats` (one stats
+  wire shape, shared by both layouts). Tests: +4 (125 → 129 lib).
+
+**Increment 4 — page-level quality pruning** (commit `d39469b`)
+- `page.rs`: `Page::present_count` / `is_all_null` / `present_count_in_range`
+  and `PagedSegment::prune_present_pages_by_time` / `present_count_in_range` —
+  the page-level analogue of increment 1's segment pruning (skip all-null pages
+  for a value query). Tests: +3 (129 → 132 lib).
+
+**Increment 5 — docs** (commit `2292579`) — ROADMAP.md Phase 4.3 (page
+subdivision still-to-do → shipped) and 4.4 (quality + page skipping shipped;
+remaining: tag pruning, blocked on per-measurement tags not existing).
+
+**Increment 6 — schema-declared paged seal** (commit `5deb3fb`)
+- `schema.rs`: `AspectSchema::seal_paged` builds a `PagedSegment` under the
+  *declared* `PhysicalType` (hard constraint #4 — the enforcing counterpart of
+  `PagedSegment::build`'s advisory pick), tolerance gated PER PAGE, `Encode`
+  index remapped to the global row. New `SealError::EmptyPageSize`. Tests: +6
+  (132 → 138 lib).
+
+**Increment 7 — schema-declared nullable paged seal** (commit `1eb8851`)
+- `schema.rs`: `AspectSchema::seal_paged_nullable` — the quality-column
+  counterpart of `seal_paged`. Per-page declaration over present values, double
+  index remap (past page nulls, then past prior pages) to the global row.
+  Tests: +4 (138 → 142 lib). (A docs touch folding `seal_paged` into the ROADMAP
+  4.3 note rides with the wrap commit.)
+
+**Build/test/clippy (real, nightly `rustc 1.98.0-nightly cb46fbb8c`):**
+- `cargo build --workspace` — GREEN (verified after each cross-crate-visible
+  change; `dsp-bench` consumes the crate and stayed green throughout).
+- `cargo test -p dsp-physical-type` — **142 lib pass**, 0 failed (110 → 142
+  across the run: +3 +12 +4 +3 +6 +4). Doc-tests: 0 (none defined).
+- `cargo clippy -p dsp-physical-type --all-targets` — **0 warnings** under
+  pedantic+nursery (no `#[allow]`). Two lints hit and fixed structurally during
+  increment 2: `too_long_first_doc_paragraph` (split a const's doc) and
+  `similar_names` (`all_ts`/`all_vs` → a single tuple binding).
+- `cargo fmt -p dsp-physical-type --check` — clean (hard tabs, project rustfmt).
+- Workspace clippy unchanged: only the pre-existing untouched warnings
+  (`splimes`/`database`/`database_orchestration` `sort_by_key`/significant-Drop)
+  — none in the touched crate.
+
+**Done vs open:** DONE — the complete intra-segment paging + quality-skipping
+arc: `PagedSegment` with fixed-height pages and per-page stats, an on-disk v3
+`.dspseg` frame with a per-page index (prune + seek without reading columns),
+quality pruning at both segment and page level, and the schema-declared paged
+seal (dense + nullable) enforcing the declared encoding per page (hard
+constraint #4). OPEN (Phase 4 remainder) — the **catalog/metadata/segment-index
+DBs** (libSQL control plane wiring, a fresh arc touching `database`);
+**Arrow/Parquet interchange** (new dep, fresh arc); **tag pruning** (Phase 4.4,
+blocked on per-measurement tags / backlog B-tags not existing); the Storage v2
+store wiring that consumes `AspectSchema`. Still open from prior runs: Phase-2
+stored range / DB-subject-aspect model, OpenTelemetry; external-engine DuckDB +
+competitor adapters; the standalone methodology document.
+
+**STOP REASON:** natural-arc — seven increments (six code + docs) built the
+entire intra-segment paging + quality-data-skipping story (the run's logged
+primary next step AND its alternative) from a standalone in-memory model through
+the on-disk frame to the schema-declared seal, well above the 2-4 bar. The next
+concern — the **catalog/metadata/segment-index control-plane DBs** (libSQL,
+touching the `database` crate) and **Arrow/Parquet interchange** (a new
+dependency) — is a fresh multi-increment arc in a different area, better started
+on a fresh PR than half-built onto this one.
+
+**Next step (tomorrow):** begin the **catalog/metadata/segment-index DBs** — the
+libSQL control-plane layer that *consumes* the sealed `.dspseg` segments: a
+`segment_index` recording each sealed segment's `(min_ts, max_ts, min_value,
+max_value, row_count, null_count, byte length, path)` so a range query prunes
+segments via the control plane (turning the in-memory `prune_by_time` into a
+catalog lookup) before opening any `.dspseg`. Keep it vendor-neutral and in the
+control plane only (hard constraint #3 — libSQL is catalog/metadata, the
+`.dspseg` segments own the measurement hot path). Alternatively, begin
+**Arrow-compatible array export** (Phase 4.5) from a `Segment`/`PagedSegment`'s
+typed columns (eases Python/Flight/DataFusion/Parquet) — assess the `arrow` dep's
+vendor-neutrality first.
+
+**PR:** _(opened at wrap — see below)_
