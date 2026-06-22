@@ -79,7 +79,7 @@ pub use column::{encode_column, recommend_encoding, ColumnEncodeError, ColumnEnc
 pub use dspseg::{crc32, read_segment, write_segment, ByteReader, ByteWriter, DspSegError};
 pub use nulls::{NullMask, NullMaskError};
 pub use schema::{AspectSchema, SealError};
-pub use segment::{prune_by_time, prune_by_value, Segment, SegmentError, SegmentStats, SEGMENT_FORMAT_VERSION};
+pub use segment::{prune_by_time, prune_by_value, prune_present_by_time, Segment, SegmentError, SegmentStats, SEGMENT_FORMAT_VERSION};
 use serde::{Deserialize, Serialize};
 pub use timestamp::{decode_delta, decode_delta_of_delta, encode_delta, encode_delta_of_delta, rle_decode, rle_encode, rle_varint_bytes, uvarint_len, zigzag_varint_bytes, zigzag_varint_len, DeltaColumn, DeltaOfDeltaColumn, TimeUnit};
 
