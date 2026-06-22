@@ -81,7 +81,7 @@ use bigdecimal::{
 	num_bigint::{BigInt, Sign}, BigDecimal, FromPrimitive, ToPrimitive
 };
 pub use column::{encode_column, recommend_encoding, ColumnEncodeError, ColumnEncoding};
-pub use dspseg::{crc32, read_segment, write_segment, ByteReader, ByteWriter, DspSegError};
+pub use dspseg::{crc32, read_paged_segment, read_segment, write_paged_segment, write_segment, ByteReader, ByteWriter, DspSegError};
 pub use nulls::{NullMask, NullMaskError};
 pub use page::{Page, PagedSegment, DEFAULT_ROWS_PER_PAGE, PAGED_SEGMENT_FORMAT_VERSION};
 pub use schema::{AspectSchema, SealError};
