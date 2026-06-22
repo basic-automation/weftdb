@@ -41,6 +41,10 @@
 //! - [`segment`] — Phase 4.3 in-memory typed columnar [`Segment`]: a value
 //!   column, a timestamp column, and per-segment min/max/count stats, with an
 //!   exact encode/decode round trip and a `bytes_per_point` matching the bench.
+//! - [`page`] — Phase 4.3/4.4 intra-segment paging: [`PagedSegment`] splits a
+//!   segment's rows into fixed-height [`Page`]s, each with its own min/max ts/value
+//!   stats, so a range query skips pages *within* a segment
+//!   ([`PagedSegment::prune_pages_by_time`] / [`PagedSegment::read_time_range`]).
 //! - [`dspseg`] — Phase 4.3 on-disk `.dspseg` framing: the hand-rolled, versioned,
 //!   CRC-checked byte layout a [`Segment`] seals to (byte primitives + column and
 //!   frame codecs).
@@ -68,6 +72,7 @@
 pub mod column;
 pub mod dspseg;
 pub mod nulls;
+pub mod page;
 pub mod schema;
 pub mod segment;
 pub mod timestamp;
@@ -76,10 +81,11 @@ use bigdecimal::{
 	num_bigint::{BigInt, Sign}, BigDecimal, FromPrimitive, ToPrimitive
 };
 pub use column::{encode_column, recommend_encoding, ColumnEncodeError, ColumnEncoding};
-pub use dspseg::{crc32, read_segment, write_segment, ByteReader, ByteWriter, DspSegError};
+pub use dspseg::{crc32, read_paged_segment, read_segment, write_paged_segment, write_segment, ByteReader, ByteWriter, DspSegError};
 pub use nulls::{NullMask, NullMaskError};
+pub use page::{Page, PagedSegment, DEFAULT_ROWS_PER_PAGE, PAGED_SEGMENT_FORMAT_VERSION};
 pub use schema::{AspectSchema, SealError};
-pub use segment::{prune_by_time, prune_by_value, Segment, SegmentError, SegmentStats, SEGMENT_FORMAT_VERSION};
+pub use segment::{prune_by_time, prune_by_value, prune_present_by_time, Segment, SegmentError, SegmentStats, SEGMENT_FORMAT_VERSION};
 use serde::{Deserialize, Serialize};
 pub use timestamp::{decode_delta, decode_delta_of_delta, encode_delta, encode_delta_of_delta, rle_decode, rle_encode, rle_varint_bytes, uvarint_len, zigzag_varint_bytes, zigzag_varint_len, DeltaColumn, DeltaOfDeltaColumn, TimeUnit};
 

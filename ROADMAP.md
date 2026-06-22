@@ -300,16 +300,46 @@ JSON").
   header row/null counts on read (`DspSegError::InvalidNullMask`) after the CRC
   gate. `AspectSchema::seal_nullable` declares + enforces the encoding over the
   present values (remapping an `Encode` error's index back to the original row,
-  nulls included). Still to do: intra-frame **page** subdivision with per-page
-  offsets/stats (the frame is currently single-block — segment-level stats and
-  checksum are there, page-level granularity is the next slice); the
-  catalog/metadata/index DBs; and Arrow/Parquet interchange.)*
+  nulls included). **Intra-frame page subdivision landed:** the
+  `dsp-physical-type::page` module ships a `Page` (one fixed-height block of
+  rows — a value column, a delta-of-delta timestamp column, a `NullMask`, and
+  its **own** min/max ts/value stats) and a `PagedSegment` that partitions an
+  aspect's rows into pages of `rows_per_page` (last page may be shorter), each
+  independently encoded, with a segment-level stats rollup. Its on-disk frame is
+  a **separate format version 3** (`write_paged_segment` / `read_paged_segment`,
+  `PagedSegment::write_to` / `read_from`, distinct from the single-block v2 — the
+  two readers reject each other's frames as `UnsupportedVersion`): magic +
+  version + `rows_per_page` + segment-level stats + a **per-page index table**
+  (each page's full stats *and* its column-block byte length) + the concatenated
+  pure-column page blocks + a trailing CRC verified before parse. The per-page
+  index means a reader prunes pages on their min/max ts/value **without touching
+  a column byte**, and the block lengths let it **seek** straight to a wanted
+  page's bytes; each page block is bounded to its indexed length on read (a page
+  that doesn't fill its block is rejected as `TrailingBytes`). **Schema-declared
+  paged seal landed:** `AspectSchema::seal_paged` / `seal_paged_nullable` build a
+  `PagedSegment` under the *declared* `PhysicalType` (the hard-constraint-#4
+  counterpart of `PagedSegment::build`'s advisory `recommend_encoding`),
+  enforcing the tolerance bound **per page** and remapping an `Encode` error's
+  index to the global row (past page nulls and prior pages) — so paged storage
+  carries the same no-silent-downcast guarantee single-block `seal` does. Still
+  to do here: the catalog/metadata/segment-index DBs; and Arrow/Parquet
+  interchange.)*
 - **4.4 Data skipping** (time/value/tag/quality pruning, page skipping).
   *(Started — segment-level pruning on `dsp-physical-type::Segment`:
   `overlaps_time`/`contains_timestamp` and `may_contain_value` (conservative —
-  `false` only when safe to skip), plus `prune_by_time` selecting exactly the
-  overlapping segments out of a set. Still to do: tag/quality pruning and
-  intra-segment page skipping, which depend on the 4.3 paged layout.)*
+  `false` only when safe to skip), plus `prune_by_time`/`prune_by_value`
+  selecting exactly the overlapping segments out of a set. **Quality pruning
+  landed:** with the `NullMask` quality column now real, `Segment::is_all_null`
+  / `present_count` / `present_count_in_range` and the free `prune_present_by_time`
+  skip segments that overlap a window but hold only nulls there — strictly more
+  selective than `prune_by_time` (a value-bearing query gets nothing from an
+  all-null segment). **Intra-segment page skipping landed:** on the Phase-4.3
+  `PagedSegment`, `prune_pages_by_time` selects the pages overlapping a window
+  and `read_time_range` decodes **only** those pages (the columns of skipped
+  pages are never reconstructed); `prune_present_pages_by_time` /
+  `present_count_in_range` add the quality-aware page-level mirror (skip all-null
+  pages too). Still to do: **tag** pruning (per-measurement tags/labels — backlog
+  B-tags — do not exist yet, so tag-based skipping has nothing to prune on).)*
 - **4.5 Arrow-compatible arrays** (eases Python/Flight/DataFusion/Parquet).
 - **4.6 Correctness semantics:** out-of-order/late data, dedup, upsert, idempotent
   batch ingest, clock skew, precision, tz parsing, leap seconds, query consistency

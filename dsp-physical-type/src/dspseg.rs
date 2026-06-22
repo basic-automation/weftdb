@@ -651,7 +651,9 @@ pub fn read_timestamp_column(r: &mut ByteReader) -> Result<DeltaOfDeltaColumn, D
 // caught on read rather than silently misinterpreted.
 // ---------------------------------------------------------------------------
 
-use crate::{nulls::NullMask, segment::SegmentStats, Segment, SEGMENT_FORMAT_VERSION};
+use crate::{
+	nulls::NullMask, page::{Page, PagedSegment, PAGED_SEGMENT_FORMAT_VERSION}, segment::SegmentStats, Segment, SEGMENT_FORMAT_VERSION
+};
 
 /// The magic prefix every `.dspseg` frame starts with.
 const MAGIC: &[u8; 7] = b"DSPSEG\0";
@@ -720,6 +722,33 @@ fn read_opt_decimal(r: &mut ByteReader) -> Result<Option<BigDecimal>, DspSegErro
 	}
 }
 
+/// Write a [`SegmentStats`] header block: row/null counts, the time-sorted flag,
+/// and the optional min/max ts/value stats — the data-skipping inputs a reader
+/// prunes against. Shared by the single-block frame's header and each entry of the
+/// paged frame's per-page index, so both layouts encode stats identically.
+fn write_segment_stats(w: &mut ByteWriter, stats: &SegmentStats) {
+	w.put_uvarint(stats.row_count as u64);
+	w.put_uvarint(stats.null_count as u64);
+	w.put_u8(u8::from(stats.time_sorted));
+	put_opt_i64(w, stats.min_ts);
+	put_opt_i64(w, stats.max_ts);
+	put_opt_decimal(w, stats.min_value.as_ref());
+	put_opt_decimal(w, stats.max_value.as_ref());
+}
+
+/// Read a [`SegmentStats`] header block — the exact inverse of
+/// [`write_segment_stats`].
+fn read_segment_stats(r: &mut ByteReader) -> Result<SegmentStats, DspSegError> {
+	let row_count = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+	let null_count = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+	let time_sorted = r.read_u8()? != 0;
+	let min_ts = read_opt_i64(r)?;
+	let max_ts = read_opt_i64(r)?;
+	let min_value = read_opt_decimal(r)?;
+	let max_value = read_opt_decimal(r)?;
+	Ok(SegmentStats { row_count, null_count, time_sorted, min_ts, max_ts, min_value, max_value })
+}
+
 /// Encode a [`Segment`] into a complete, self-describing, checksummed `.dspseg`
 /// byte frame.
 ///
@@ -732,13 +761,7 @@ pub fn write_segment(seg: &Segment) -> Vec<u8> {
 	w.put_raw(MAGIC);
 	w.put_u16_le(seg.version);
 	// Header (stats).
-	w.put_uvarint(seg.stats.row_count as u64);
-	w.put_uvarint(seg.stats.null_count as u64);
-	w.put_u8(u8::from(seg.stats.time_sorted));
-	put_opt_i64(&mut w, seg.stats.min_ts);
-	put_opt_i64(&mut w, seg.stats.max_ts);
-	put_opt_decimal(&mut w, seg.stats.min_value.as_ref());
-	put_opt_decimal(&mut w, seg.stats.max_value.as_ref());
+	write_segment_stats(&mut w, &seg.stats);
 	// Column blocks.
 	write_value_column(&mut w, &seg.values);
 	write_timestamp_column(&mut w, &seg.timestamps);
@@ -783,21 +806,140 @@ pub fn read_segment(bytes: &[u8]) -> Result<Segment, DspSegError> {
 	if version != SEGMENT_FORMAT_VERSION {
 		return Err(DspSegError::UnsupportedVersion { found: version });
 	}
-	let row_count = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
-	let null_count = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
-	let time_sorted = r.read_u8()? != 0;
-	let min_ts = read_opt_i64(&mut r)?;
-	let max_ts = read_opt_i64(&mut r)?;
-	let min_value = read_opt_decimal(&mut r)?;
-	let max_value = read_opt_decimal(&mut r)?;
+	let stats = read_segment_stats(&mut r)?;
 	let values = read_value_column(&mut r)?;
 	let timestamps = read_timestamp_column(&mut r)?;
-	let nulls = read_null_column(&mut r, row_count, null_count)?;
+	let nulls = read_null_column(&mut r, stats.row_count, stats.null_count)?;
 	if !r.is_empty() {
 		return Err(DspSegError::TrailingBytes { remaining: r.remaining() });
 	}
-	let stats = SegmentStats { row_count, null_count, time_sorted, min_ts, max_ts, min_value, max_value };
 	Ok(Segment { version, values, timestamps, nulls, stats })
+}
+
+// ---------------------------------------------------------------------------
+// Paged segment frame (Phase 4.3/4.4, the intra-segment paging slice)
+//
+// A `PagedSegment` seals to its own framed layout (format version 3), distinct
+// from the single-block segment frame above:
+//
+//   MAGIC | version=3 | rows_per_page | <segment-level stats>
+//   | page_count | <per-page index: stats + block_len, page_count times>
+//   | <page data blocks, concatenated> | CRC-32
+//
+// The per-page index carries each page's full stats (row/null counts, min/max
+// ts/value) AND the byte length of its column block. Two properties fall out:
+//   - a reader can PRUNE pages on their min/max ts/value without touching a
+//     single column byte (Phase-4.4 intra-segment page skipping on disk), and
+//   - the block lengths let it SEEK straight to a wanted page's bytes, skipping
+//     the blocks before it — the on-disk realization of `read_time_range`.
+// Each page block is pure columns (value + timestamp + quality); the page's stats
+// live in the index, so they are written exactly once, mirroring how the
+// single-block frame keeps stats in its header.
+// ---------------------------------------------------------------------------
+
+/// Encode a [`PagedSegment`] into a complete, self-describing, checksummed
+/// `.dspseg` byte frame (format version 3).
+///
+/// The inverse is [`read_paged_segment`]; the round trip is exact. The frame's
+/// per-page index lets a reader prune and seek to individual pages without
+/// decoding the whole segment (see the module comment above).
+#[must_use]
+pub fn write_paged_segment(seg: &PagedSegment) -> Vec<u8> {
+	// Encode each page's column block first so the index can carry its byte length.
+	let page_blocks: Vec<Vec<u8>> = seg
+		.pages
+		.iter()
+		.map(|page| {
+			let mut pw = ByteWriter::with_capacity(page.total_bytes() + 16);
+			write_value_column(&mut pw, &page.values);
+			write_timestamp_column(&mut pw, &page.timestamps);
+			write_null_column(&mut pw, &page.nulls);
+			pw.into_vec()
+		})
+		.collect();
+	let body_estimate: usize = page_blocks.iter().map(Vec::len).sum::<usize>() + 64 + seg.pages.len() * 32;
+	let mut w = ByteWriter::with_capacity(body_estimate);
+	w.put_raw(MAGIC);
+	w.put_u16_le(seg.version);
+	w.put_uvarint(seg.rows_per_page as u64);
+	// Segment-level rollup stats.
+	write_segment_stats(&mut w, &seg.stats);
+	// Per-page index: each page's stats + its block length.
+	w.put_uvarint(seg.pages.len() as u64);
+	for (page, block) in seg.pages.iter().zip(&page_blocks) {
+		write_segment_stats(&mut w, &page.stats);
+		w.put_uvarint(block.len() as u64);
+	}
+	// Page data blocks, concatenated in page order.
+	for block in &page_blocks {
+		w.put_raw(block);
+	}
+	// Trailing CRC-32 over the whole body.
+	let checksum = crc32(w.as_slice());
+	w.put_u32_le(checksum);
+	w.into_vec()
+}
+
+/// Decode a [`PagedSegment`] from a `.dspseg` byte frame — the exact inverse of
+/// [`write_paged_segment`].
+///
+/// As with [`read_segment`], the trailing CRC-32 is verified against the body
+/// **before** any field is parsed, so a corrupt or truncated frame fails fast with
+/// [`DspSegError::ChecksumMismatch`]. Each page's column block is bounded to its
+/// indexed byte length, so a page that does not exactly fill its block is rejected
+/// ([`DspSegError::TrailingBytes`]).
+///
+/// # Errors
+///
+/// The same family as [`read_segment`]: [`DspSegError::UnexpectedEof`],
+/// [`DspSegError::ChecksumMismatch`], [`DspSegError::BadMagic`],
+/// [`DspSegError::UnsupportedVersion`] (when the version is not the paged version),
+/// [`DspSegError::TrailingBytes`], and the per-column read errors.
+pub fn read_paged_segment(bytes: &[u8]) -> Result<PagedSegment, DspSegError> {
+	if bytes.len() < 4 {
+		return Err(DspSegError::UnexpectedEof { needed: 4, remaining: bytes.len() });
+	}
+	let (body, crc_bytes) = bytes.split_at(bytes.len() - 4);
+	let stored = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+	let computed = crc32(body);
+	if stored != computed {
+		return Err(DspSegError::ChecksumMismatch { stored, computed });
+	}
+	let mut r = ByteReader::new(body);
+	if r.take(MAGIC.len())? != MAGIC {
+		return Err(DspSegError::BadMagic);
+	}
+	let version = r.read_u16_le()?;
+	if version != PAGED_SEGMENT_FORMAT_VERSION {
+		return Err(DspSegError::UnsupportedVersion { found: version });
+	}
+	let rows_per_page = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+	let stats = read_segment_stats(&mut r)?;
+	let page_count = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+	// Read the index: each page's stats and the length of its column block.
+	let mut index: Vec<(SegmentStats, usize)> = Vec::with_capacity(page_count);
+	for _ in 0..page_count {
+		let page_stats = read_segment_stats(&mut r)?;
+		let block_len = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+		index.push((page_stats, block_len));
+	}
+	// Read each page's column block, bounded to its indexed length.
+	let mut pages = Vec::with_capacity(page_count);
+	for (page_stats, block_len) in index {
+		let block = r.take(block_len)?;
+		let mut pr = ByteReader::new(block);
+		let values = read_value_column(&mut pr)?;
+		let timestamps = read_timestamp_column(&mut pr)?;
+		let nulls = read_null_column(&mut pr, page_stats.row_count, page_stats.null_count)?;
+		if !pr.is_empty() {
+			return Err(DspSegError::TrailingBytes { remaining: pr.remaining() });
+		}
+		pages.push(Page { values, timestamps, nulls, stats: page_stats });
+	}
+	if !r.is_empty() {
+		return Err(DspSegError::TrailingBytes { remaining: r.remaining() });
+	}
+	Ok(PagedSegment { version, rows_per_page, pages, stats })
 }
 
 #[cfg(test)]
@@ -1132,5 +1274,76 @@ mod tests {
 		assert_eq!(rts, ts);
 		assert_eq!(rvs, vs);
 		assert!(back.is_exact());
+	}
+
+	#[test]
+	fn paged_segment_frame_round_trips_across_shapes() {
+		use crate::PagedSegment;
+		let ncol = |lits: &[Option<&str>]| -> Vec<Option<BigDecimal>> { lits.iter().map(|o| o.map(|s| BigDecimal::from_str(s).expect("parses"))).collect() };
+		// Multi-page regular series, lossless.
+		let ts: Vec<i64> = (0..500).map(|i| 1_600_000_000 + i * 60).collect();
+		let vs: Vec<BigDecimal> = (0..500).map(BigDecimal::from).collect();
+		let seg = PagedSegment::build(&ts, &vs, TimeUnit::Seconds, &BigDecimal::from(0), 64).expect("builds");
+		assert!(seg.page_count() > 1);
+		let bytes = write_paged_segment(&seg);
+		assert!(bytes.starts_with(MAGIC), "paged frame carries the magic prefix");
+		let back = read_paged_segment(&bytes).expect("reads");
+		assert_eq!(back, seg, "paged frame must round-trip exactly");
+		assert_eq!(back.decode_nullable(), seg.decode_nullable());
+		// Via the ergonomic methods.
+		assert_eq!(PagedSegment::read_from(&seg.write_to()).expect("reads"), seg);
+		// Nullable, multi-page, with gaps spanning page boundaries.
+		let nts: Vec<i64> = (0..20).collect();
+		let nvs = ncol(&[Some("1"), None, Some("3"), Some("4"), None, Some("6"), Some("7"), Some("8"), None, Some("10"), Some("11"), None, Some("13"), Some("14"), Some("15"), None, Some("17"), Some("18"), Some("19"), None]);
+		let nseg = PagedSegment::build_nullable(&nts, &nvs, TimeUnit::Millis, &BigDecimal::from(0), 7).expect("builds");
+		let nback = PagedSegment::read_from(&nseg.write_to()).expect("reads");
+		assert_eq!(nback, nseg);
+		assert_eq!(nback.null_count(), nseg.null_count());
+		// Single page and empty.
+		let one = PagedSegment::build(&[42], &col(&["7.5"]), TimeUnit::Seconds, &BigDecimal::from(0), 1_000).expect("builds");
+		assert_eq!(PagedSegment::read_from(&one.write_to()).expect("reads"), one);
+		let empty = PagedSegment::build(&[], &[], TimeUnit::Seconds, &BigDecimal::from(0), 64).expect("builds");
+		assert_eq!(PagedSegment::read_from(&empty.write_to()).expect("reads"), empty);
+	}
+
+	#[test]
+	fn paged_frame_preserves_per_page_pruning_after_read() {
+		use crate::PagedSegment;
+		// 12 rows, 4 per page ⇒ pages spanning [0,30], [40,70], [80,110].
+		let ts: Vec<i64> = (0..12).map(|i| i * 10).collect();
+		let vs: Vec<BigDecimal> = (0..12).map(BigDecimal::from).collect();
+		let seg = PagedSegment::build(&ts, &vs, TimeUnit::Seconds, &BigDecimal::from(0), 4).expect("builds");
+		let back = PagedSegment::read_from(&seg.write_to()).expect("reads");
+		// The per-page index survives the round trip, so pruning works on the reread.
+		assert_eq!(back.prune_pages_by_time(45, 65), vec![1]);
+		assert_eq!(back.read_time_range(35, 75).0, vec![40, 50, 60, 70]);
+	}
+
+	#[test]
+	fn paged_frame_rejects_wrong_version() {
+		use crate::PagedSegment;
+		// A paged frame fed to the single-block reader is an unsupported version, and
+		// vice versa — the two layouts carry distinct format versions.
+		let paged = PagedSegment::build(&[1, 2, 3], &col(&["1.0", "2.0", "3.0"]), TimeUnit::Seconds, &BigDecimal::from(0), 2).expect("builds");
+		let paged_bytes = paged.write_to();
+		assert_eq!(read_segment(&paged_bytes), Err(DspSegError::UnsupportedVersion { found: PAGED_SEGMENT_FORMAT_VERSION }));
+		let single = Segment::build(&[1, 2, 3], &col(&["1.0", "2.0", "3.0"]), TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		let single_bytes = single.write_to();
+		assert_eq!(read_paged_segment(&single_bytes), Err(DspSegError::UnsupportedVersion { found: SEGMENT_FORMAT_VERSION }));
+	}
+
+	#[test]
+	fn corrupt_paged_frame_is_detected_by_checksum() {
+		use crate::PagedSegment;
+		let seg = PagedSegment::build(&(0..20).collect::<Vec<_>>(), &(0..20).map(BigDecimal::from).collect::<Vec<_>>(), TimeUnit::Seconds, &BigDecimal::from(0), 8).expect("builds");
+		let good = write_paged_segment(&seg);
+		for i in [MAGIC.len() + 2, good.len() / 2, good.len() - 5] {
+			let mut bad = good.clone();
+			bad[i] ^= 0xFF;
+			match read_paged_segment(&bad) {
+				Err(DspSegError::ChecksumMismatch { .. }) => {}
+				other => panic!("byte {i} flip must be a checksum mismatch, got {other:?}"),
+			}
+		}
 	}
 }
