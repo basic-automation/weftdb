@@ -315,8 +315,15 @@ JSON").
   index means a reader prunes pages on their min/max ts/value **without touching
   a column byte**, and the block lengths let it **seek** straight to a wanted
   page's bytes; each page block is bounded to its indexed length on read (a page
-  that doesn't fill its block is rejected as `TrailingBytes`). Still to do here:
-  the catalog/metadata/segment-index DBs; and Arrow/Parquet interchange.)*
+  that doesn't fill its block is rejected as `TrailingBytes`). **Schema-declared
+  paged seal landed:** `AspectSchema::seal_paged` / `seal_paged_nullable` build a
+  `PagedSegment` under the *declared* `PhysicalType` (the hard-constraint-#4
+  counterpart of `PagedSegment::build`'s advisory `recommend_encoding`),
+  enforcing the tolerance bound **per page** and remapping an `Encode` error's
+  index to the global row (past page nulls and prior pages) — so paged storage
+  carries the same no-silent-downcast guarantee single-block `seal` does. Still
+  to do here: the catalog/metadata/segment-index DBs; and Arrow/Parquet
+  interchange.)*
 - **4.4 Data skipping** (time/value/tag/quality pruning, page skipping).
   *(Started — segment-level pruning on `dsp-physical-type::Segment`:
   `overlaps_time`/`contains_timestamp` and `may_contain_value` (conservative —
