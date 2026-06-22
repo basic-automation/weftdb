@@ -311,6 +311,29 @@ impl PagedSegment {
 		(timestamps, values)
 	}
 
+	/// Seal this paged segment to its on-disk `.dspseg` byte frame (format version
+	/// 3): magic + header + per-page index + page blocks + trailing CRC-32. See
+	/// [`crate::dspseg::write_paged_segment`].
+	///
+	/// Exact inverse of [`PagedSegment::read_from`].
+	#[must_use]
+	pub fn write_to(&self) -> Vec<u8> {
+		crate::dspseg::write_paged_segment(self)
+	}
+
+	/// Read a paged segment back from a `.dspseg` byte frame, verifying its checksum.
+	///
+	/// Exact inverse of [`PagedSegment::write_to`]. See
+	/// [`crate::dspseg::read_paged_segment`].
+	///
+	/// # Errors
+	///
+	/// Propagates [`crate::dspseg::DspSegError`] for a corrupt, truncated, or
+	/// unrecognised frame (checksum mismatch, bad magic, wrong/unsupported version).
+	pub fn read_from(bytes: &[u8]) -> Result<Self, crate::dspseg::DspSegError> {
+		crate::dspseg::read_paged_segment(bytes)
+	}
+
 	/// Decode only the rows whose timestamp falls in the inclusive range
 	/// `[start, end]`, **skipping pages** that do not overlap it (the realized
 	/// page-skipping read). Returns parallel `(timestamps, values)` vectors with a
