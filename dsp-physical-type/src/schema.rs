@@ -223,6 +223,66 @@ impl AspectSchema {
 		let stats = SegmentStats::from_columns(timestamps, values);
 		Ok(Page { values: value_col, timestamps: ts_col, nulls: NullMask::all_present(values.len()), stats })
 	}
+
+	/// Seal a **nullable** batch into a paged [`PagedSegment`] under this schema's
+	/// declared encoding — the quality-column counterpart of
+	/// [`seal_paged`](AspectSchema::seal_paged), as
+	/// [`seal_nullable`](AspectSchema::seal_nullable) is to
+	/// [`seal`](AspectSchema::seal).
+	///
+	/// Each page stores its present (non-null) values densely under the declared
+	/// encoding with its own [`NullMask`]; the declaration is enforced over the
+	/// present values per page. A fully-present batch seals identically to
+	/// [`seal_paged`](AspectSchema::seal_paged).
+	///
+	/// # Errors
+	///
+	/// - [`SealError::LengthMismatch`] if the columns differ in height.
+	/// - [`SealError::EmptyPageSize`] if `rows_per_page` is zero.
+	/// - [`SealError::Encode`] if a present value is unrepresentable — its
+	///   [`index`](ColumnEncodeError::index) is the **global** row in the caller's
+	///   input (the present-value position remapped past this page's nulls, then past
+	///   the pages before it), nulls included.
+	/// - [`SealError::ToleranceExceeded`] if any page's worst error over its present
+	///   values exceeds the declared bound (per page, failing on the first).
+	pub fn seal_paged_nullable(&self, timestamps: &[i64], values: &[Option<BigDecimal>], rows_per_page: usize) -> Result<PagedSegment, SealError> {
+		if timestamps.len() != values.len() {
+			return Err(SealError::LengthMismatch { timestamps: timestamps.len(), values: values.len() });
+		}
+		if rows_per_page == 0 {
+			return Err(SealError::EmptyPageSize);
+		}
+		let mut pages = Vec::with_capacity(timestamps.len().div_ceil(rows_per_page));
+		let mut base = 0;
+		for (ts_chunk, vs_chunk) in timestamps.chunks(rows_per_page).zip(values.chunks(rows_per_page)) {
+			pages.push(self.seal_page_nullable(base, ts_chunk, vs_chunk)?);
+			base += ts_chunk.len();
+		}
+		let present_values: Vec<BigDecimal> = values.iter().flatten().cloned().collect();
+		let null_count = values.iter().filter(|v| v.is_none()).count();
+		let stats = SegmentStats::from_columns_nullable(timestamps, &present_values, null_count);
+		Ok(PagedSegment { version: PAGED_SEGMENT_FORMAT_VERSION, rows_per_page, pages, stats })
+	}
+
+	/// Seal one nullable page's worth of rows under the declared encoding. An
+	/// [`Encode`](SealError::Encode) error's index is remapped first past this page's
+	/// nulls ([`remap_present_index`]) to the page-local row, then by `base` to the
+	/// global row.
+	fn seal_page_nullable(&self, base: usize, timestamps: &[i64], values: &[Option<BigDecimal>]) -> Result<Page, SealError> {
+		let present: Vec<bool> = values.iter().map(Option::is_some).collect();
+		let nulls = NullMask::from_presence(&present);
+		let present_values: Vec<BigDecimal> = values.iter().flatten().cloned().collect();
+		let value_col = encode_column(self.value, &present_values).map_err(|e| {
+			let local = remap_present_index(e, &present);
+			SealError::Encode(ColumnEncodeError { index: base + local.index, source: local.source })
+		})?;
+		if value_col.max_abs_error > self.value_tolerance {
+			return Err(SealError::ToleranceExceeded { max_abs_error: value_col.max_abs_error, tolerance: self.value_tolerance.clone() });
+		}
+		let ts_col = encode_delta_of_delta(timestamps, self.timestamp_unit);
+		let stats = SegmentStats::from_columns_nullable(timestamps, &present_values, nulls.null_count());
+		Ok(Page { values: value_col, timestamps: ts_col, nulls, stats })
+	}
 }
 
 /// Remap a [`ColumnEncodeError`] raised over the compacted present-values column
@@ -467,5 +527,56 @@ mod tests {
 		let seg = schema.seal_paged(&[], &[], 64).expect("seals");
 		assert!(seg.is_empty());
 		assert_eq!(seg.page_count(), 0);
+	}
+
+	#[test]
+	fn seal_paged_nullable_enforces_declaration_over_present_values_per_page() {
+		// Declared ScaledI64 scale 2; nulls scattered across page boundaries.
+		let schema = AspectSchema::new(PhysicalType::ScaledI64 { scale: 2 }, BigDecimal::from(0), TimeUnit::Seconds);
+		let ts: Vec<i64> = (0..8).map(|i| i * 10).collect();
+		let vs = ncol(&[Some("1.25"), None, Some("3.50"), Some("4.75"), None, None, Some("7.00"), Some("8.25")]);
+		let seg = schema.seal_paged_nullable(&ts, &vs, 4).expect("seals");
+		assert_eq!(seg.page_count(), 2);
+		assert_eq!(seg.null_count(), 3);
+		for page in &seg.pages {
+			assert_eq!(page.values.physical_type, PhysicalType::ScaledI64 { scale: 2 });
+		}
+		// Exact round trip through the on-disk frame, gaps included.
+		let back = PagedSegment::read_from(&seg.write_to()).expect("reads");
+		assert_eq!(back, seg);
+		assert_eq!(back.decode_nullable(), (ts, vs));
+	}
+
+	#[test]
+	fn seal_paged_nullable_matches_seal_paged_when_fully_present() {
+		let schema = AspectSchema::new(PhysicalType::ScaledI64 { scale: 0 }, BigDecimal::from(0), TimeUnit::Millis);
+		let ts: Vec<i64> = (0..7).collect();
+		let dense = col(&["1", "2", "3", "4", "5", "6", "7"]);
+		let nullable = ncol(&[Some("1"), Some("2"), Some("3"), Some("4"), Some("5"), Some("6"), Some("7")]);
+		assert_eq!(schema.seal_paged(&ts, &dense, 3).expect("seals"), schema.seal_paged_nullable(&ts, &nullable, 3).expect("seals"));
+	}
+
+	#[test]
+	fn seal_paged_nullable_remaps_encode_index_past_nulls_and_pages() {
+		// 10^30 overflows ScaledI64. Page size 3. Global rows: 0=v,1=null,2=v | 3=v,4=null,5=huge.
+		// In page 2 (base 3) huge is original row 5; present-index within the page is 1
+		// (row 4 is null). The error must report global row 5.
+		let mut huge = String::from("1");
+		huge.push_str(&"0".repeat(30));
+		let schema = AspectSchema::new(PhysicalType::ScaledI64 { scale: 0 }, BigDecimal::from(0), TimeUnit::Seconds);
+		let ts: Vec<i64> = (0..6).collect();
+		let vs = ncol(&[Some("1"), None, Some("3"), Some("4"), None, Some(&huge)]);
+		let err = schema.seal_paged_nullable(&ts, &vs, 3).expect_err("overflows");
+		match err {
+			SealError::Encode(e) => assert_eq!(e.index, 5, "global row past the page's null and the prior page"),
+			other => panic!("expected Encode, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn seal_paged_nullable_zero_size_and_mismatch_are_rejected() {
+		let schema = AspectSchema::new(PhysicalType::F64, BigDecimal::from(0), TimeUnit::Seconds);
+		assert_eq!(schema.seal_paged_nullable(&[1], &ncol(&[Some("1.0")]), 0).expect_err("zero"), SealError::EmptyPageSize);
+		assert_eq!(schema.seal_paged_nullable(&[1, 2, 3], &ncol(&[Some("1.0"), None]), 4).expect_err("mismatch"), SealError::LengthMismatch { timestamps: 3, values: 2 });
 	}
 }
