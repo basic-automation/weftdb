@@ -1856,4 +1856,4 @@ control plane only (hard constraint #3 — libSQL is catalog/metadata, the
 typed columns (eases Python/Flight/DataFusion/Parquet) — assess the `arrow` dep's
 vendor-neutrality first.
 
-**PR:** _(opened at wrap — see below)_
+**PR:** https://github.com/physics515/DSP/pull/22
