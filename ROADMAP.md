@@ -288,8 +288,19 @@ JSON").
   format version, the per-segment stats header (the data-skipping inputs),
   the two column blocks, and a trailing CRC verified **before** parse so a
   corrupt/truncated frame fails fast rather than being misread. Decidedly
-  *not* a `bincode`/serde blob (which cannot round-trip `BigDecimal`). Still to
-  do: a quality/null column; intra-frame **page** subdivision with per-page
+  *not* a `bincode`/serde blob (which cannot round-trip `BigDecimal`).
+  **Quality/null column landed:** the `dsp-physical-type::nulls` module ships a
+  `NullMask` (per-row presence bitmap, LSB-first, `ceil(n/8)` bytes — a fully
+  dense column stores zero mask bytes, so a non-nullable segment's bytes/point
+  is unchanged); `Segment::build_nullable` takes a `&[Option<BigDecimal>]` value
+  column, stores only the present values densely, and `decode_nullable`
+  reconstructs the gaps as `None` — making `null_count` real. The `.dspseg`
+  frame bumped to **format version 2**: a quality-column block (presence flag +
+  length-prefixed bitmap) after the timestamp column, validated against the
+  header row/null counts on read (`DspSegError::InvalidNullMask`) after the CRC
+  gate. `AspectSchema::seal_nullable` declares + enforces the encoding over the
+  present values (remapping an `Encode` error's index back to the original row,
+  nulls included). Still to do: intra-frame **page** subdivision with per-page
   offsets/stats (the frame is currently single-block — segment-level stats and
   checksum are there, page-level granularity is the next slice); the
   catalog/metadata/index DBs; and Arrow/Parquet interchange.)*

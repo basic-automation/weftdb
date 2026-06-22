@@ -32,7 +32,7 @@
 use bigdecimal::BigDecimal;
 
 use crate::{
-	column::{encode_column, ColumnEncodeError}, segment::SegmentStats, timestamp::{encode_delta_of_delta, TimeUnit}, PhysicalType, Segment, SEGMENT_FORMAT_VERSION
+	column::{encode_column, ColumnEncodeError}, nulls::NullMask, segment::SegmentStats, timestamp::{encode_delta_of_delta, TimeUnit}, PhysicalType, Segment, SEGMENT_FORMAT_VERSION
 };
 
 /// A per-aspect declaration of how that aspect's values and timestamps are stored.
@@ -130,8 +130,50 @@ impl AspectSchema {
 		}
 		let ts_col = encode_delta_of_delta(timestamps, self.timestamp_unit);
 		let stats = SegmentStats::from_columns(timestamps, values);
-		Ok(Segment { version: SEGMENT_FORMAT_VERSION, values: value_col, timestamps: ts_col, stats })
+		Ok(Segment { version: SEGMENT_FORMAT_VERSION, values: value_col, timestamps: ts_col, nulls: NullMask::all_present(values.len()), stats })
 	}
+
+	/// Seal a **nullable** batch — a dense timestamp column and a
+	/// `&[Option<BigDecimal>]` value column — into a [`Segment`] under this schema's
+	/// declared encoding (the Phase-4.3 quality-column seal).
+	///
+	/// The declaration is enforced exactly as in [`seal`](AspectSchema::seal), but
+	/// over the **present** (non-null) values only: a `None` row contributes a
+	/// timestamp and a cleared bit in the [`NullMask`], never a value to encode. A
+	/// fully-present batch produces the same segment as [`seal`](AspectSchema::seal).
+	///
+	/// # Errors
+	///
+	/// - [`SealError::LengthMismatch`] if the columns differ in height.
+	/// - [`SealError::Encode`] if a present value is unrepresentable under the
+	///   declared encoding. Its [`index`](ColumnEncodeError::index) is the **original
+	///   row index** (remapped from the compacted present-values position), so it
+	///   points at the offending row in the caller's input, nulls included.
+	/// - [`SealError::ToleranceExceeded`] if the declared encoding represents every
+	///   present value but loses more precision than the schema permits.
+	pub fn seal_nullable(&self, timestamps: &[i64], values: &[Option<BigDecimal>]) -> Result<Segment, SealError> {
+		if timestamps.len() != values.len() {
+			return Err(SealError::LengthMismatch { timestamps: timestamps.len(), values: values.len() });
+		}
+		let present: Vec<bool> = values.iter().map(Option::is_some).collect();
+		let nulls = NullMask::from_presence(&present);
+		let present_values: Vec<BigDecimal> = values.iter().flatten().cloned().collect();
+		let value_col = encode_column(self.value, &present_values).map_err(|e| SealError::Encode(remap_present_index(e, &present)))?;
+		if value_col.max_abs_error > self.value_tolerance {
+			return Err(SealError::ToleranceExceeded { max_abs_error: value_col.max_abs_error, tolerance: self.value_tolerance.clone() });
+		}
+		let ts_col = encode_delta_of_delta(timestamps, self.timestamp_unit);
+		let stats = SegmentStats::from_columns_nullable(timestamps, &present_values, nulls.null_count());
+		Ok(Segment { version: SEGMENT_FORMAT_VERSION, values: value_col, timestamps: ts_col, nulls, stats })
+	}
+}
+
+/// Remap a [`ColumnEncodeError`] raised over the compacted present-values column
+/// back to the original row index in the caller's nullable input, by finding the
+/// `present_index`-th present row.
+fn remap_present_index(err: ColumnEncodeError, present: &[bool]) -> ColumnEncodeError {
+	let original_row = present.iter().enumerate().filter(|(_, &p)| p).nth(err.index).map_or(present.len(), |(row, _)| row);
+	ColumnEncodeError { index: original_row, source: err.source }
 }
 
 #[cfg(test)]
@@ -234,5 +276,65 @@ mod tests {
 		let seg = schema.seal(&[], &[]).expect("seals");
 		assert!(seg.is_empty());
 		assert_eq!(seg.row_count(), 0);
+	}
+
+	fn ncol(lits: &[Option<&str>]) -> Vec<Option<BigDecimal>> {
+		lits.iter().map(|o| o.map(|s| BigDecimal::from_str(s).expect("parses"))).collect()
+	}
+
+	#[test]
+	fn seal_nullable_enforces_the_declaration_over_present_values() {
+		// Declared ScaledI64 at scale 2, lossless for the present 2-decimal values.
+		let schema = AspectSchema::new(PhysicalType::ScaledI64 { scale: 2 }, BigDecimal::from(0), TimeUnit::Seconds);
+		let ts = vec![10_i64, 20, 30, 40, 50];
+		let vs = ncol(&[Some("1.25"), None, Some("-3.75"), None, Some("0.00")]);
+		let seg = schema.seal_nullable(&ts, &vs).expect("seals");
+		assert_eq!(seg.physical_type(), PhysicalType::ScaledI64 { scale: 2 });
+		assert_eq!(seg.null_count(), 2);
+		assert!(seg.is_exact());
+		// The frame round-trips the declared, nullable segment exactly.
+		let back = Segment::read_from(&seg.write_to()).expect("reads");
+		assert_eq!(back, seg);
+		assert_eq!(back.decode_nullable(), (ts, vs));
+	}
+
+	#[test]
+	fn seal_nullable_matches_dense_seal_when_fully_present() {
+		let schema = AspectSchema::new(PhysicalType::ScaledI64 { scale: 0 }, BigDecimal::from(0), TimeUnit::Millis);
+		let ts = vec![1_i64, 2, 3];
+		let dense = col(&["1", "2", "3"]);
+		let nullable = ncol(&[Some("1"), Some("2"), Some("3")]);
+		assert_eq!(schema.seal(&ts, &dense).expect("seals"), schema.seal_nullable(&ts, &nullable).expect("seals"));
+	}
+
+	#[test]
+	fn seal_nullable_rejects_a_lossy_present_value() {
+		// A zero-tolerance F64 declaration refuses a non-binary-exact present value,
+		// nulls notwithstanding.
+		let schema = AspectSchema::new(PhysicalType::F64, BigDecimal::from(0), TimeUnit::Seconds);
+		let err = schema.seal_nullable(&[1, 2, 3], &ncol(&[Some("0.5"), None, Some("0.1")])).expect_err("rejects lossy");
+		assert!(matches!(err, SealError::ToleranceExceeded { .. }));
+	}
+
+	#[test]
+	fn seal_nullable_remaps_encode_index_past_nulls() {
+		// 10^30 overflows ScaledI64. It sits at original row 3, but at present-index 1
+		// (row 1 is null). The error must report the original row, not the compacted one.
+		let mut huge = String::from("1");
+		huge.push_str(&"0".repeat(30));
+		let schema = AspectSchema::new(PhysicalType::ScaledI64 { scale: 0 }, BigDecimal::from(0), TimeUnit::Seconds);
+		let vs = ncol(&[Some("1.0"), None, None, Some(&huge)]);
+		let err = schema.seal_nullable(&[0, 1, 2, 3], &vs).expect_err("overflows");
+		match err {
+			SealError::Encode(e) => assert_eq!(e.index, 3, "index is the original row, past the two nulls"),
+			other => panic!("expected Encode, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn seal_nullable_length_mismatch_is_rejected() {
+		let schema = AspectSchema::new(PhysicalType::F64, BigDecimal::from(0), TimeUnit::Seconds);
+		let err = schema.seal_nullable(&[1, 2, 3], &ncol(&[Some("1.0"), None])).expect_err("mismatch");
+		assert_eq!(err, SealError::LengthMismatch { timestamps: 3, values: 2 });
 	}
 }

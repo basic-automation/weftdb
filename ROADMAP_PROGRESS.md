@@ -1629,3 +1629,109 @@ query skips pages within a segment (the Phase-4.4 intra-segment page-skipping
 the single-block frame defers).
 
 **PR:** https://github.com/physics515/DSP/pull/20
+
+---
+
+## 2026-06-21 (run 2) — Phase 4.3 quality/null column, end to end (4 increments)
+
+Took the 2026-06-21 run's logged **primary** next step verbatim — the
+**quality/null column** — and built it end to end across three code slices
+(standalone `NullMask` → segment + on-disk frame → schema-declared seal) plus a
+docs slice. This makes `SegmentStats::null_count` *real*: it has been hard-zero
+since the dense `(timestamp, value)` segment shipped, because a segment had no
+way to represent a row that carries a timestamp but no value. All in one crate
+(`dsp-physical-type`); the workspace stayed green throughout, and each commit
+left a correct frame (the in-memory model and on-disk framing landed together,
+so no commit shipped a nullable segment that could not round-trip).
+
+**Items:** roadmap Phase 4.3 (quality/null column: still-to-do → shipped) with a
+`.dspseg` format-version bump (1 → 2) and a Phase-4.1 touch (`seal_nullable`
+extends the schema-declared encoding path to nullable columns). Crate touched:
+`dsp-physical-type` only (new `nulls` module; `segment`, `dspseg`, `schema`,
+`lib` extended).
+
+**Increment 1 — `NullMask` quality column, in-memory** (commit `b5694ab`)
+- New `dsp-physical-type/src/nulls.rs`: `NullMask` — a per-row presence bitmap
+  (LSB-first, `ceil(row_count/8)` bytes) recording which rows carry a value vs a
+  null. A fully dense column stores **no** bytes (`bits = None`), so a
+  non-nullable segment's bytes/point is unchanged. `from_raw` is the frame-reader
+  entry point and validates an untrusted frame's parts (bitmap length must be
+  `ceil(n/8)`; declared null count must match the clear bits) → `NullMaskError`.
+  Standalone, no segment coupling. Tests: +12 (85 → 97 lib).
+
+**Increment 2 — nullable segment + `.dspseg` quality column** (commit `94f0916`)
+- `segment.rs`: `Segment` gains a `nulls: NullMask` field; `build_nullable`
+  (`&[Option<BigDecimal>]` → present values stored densely + a mask),
+  `decode_nullable` (realigns present values to timestamps with `None` in the
+  gaps — exact inverse), `null_count`/`has_nulls`/`null_bytes` accessors
+  (`null_bytes` joins `total_bytes`; zero for dense, so dense bytes/point still
+  equals the DSP-Bench StorageEstimate by construction).
+  `SegmentStats::from_columns_nullable` computes min/max over present values
+  only; dense `from_columns` is the `null_count = 0` case. A fully-present
+  `build_nullable` is byte-for-byte the dense `build`.
+- `dspseg.rs`: `SEGMENT_FORMAT_VERSION` 1 → 2; a quality-column block (presence
+  flag + length-prefixed LSB-first bitmap) after the timestamp column, read back
+  through `NullMask::from_raw` and validated against the header row/null counts —
+  a corrupt mask is the new `DspSegError::InvalidNullMask` (with `Error::source`
+  chained), checked after the CRC gate. `schema.rs` `seal` carries an
+  all-present mask. Tests: +8 (97 → 105 lib).
+
+**Increment 3 — schema-declared nullable seal** (commit `69e29e4`)
+- `schema.rs`: `AspectSchema::seal_nullable` seals a nullable batch under the
+  *declared* `PhysicalType`, enforcing the declaration (hard constraint #4 — no
+  silent downcast) over the present values only. `SealError::Encode` is remapped
+  (`remap_present_index`) so an unrepresentable present value reports its
+  **original** row index, not the compacted present-values position. A
+  fully-present batch seals identically to dense `seal`. Tests: +5 (105 → 110 lib).
+
+**Increment 4 — docs** (commit `b3a90ed`) — ROADMAP.md Phase 4.3: quality/null
+column moved from "still to do" to shipped (NullMask, build_nullable/
+decode_nullable, frame v2 quality block, seal_nullable); remaining 4.3 work
+(intra-frame page subdivision, catalog/metadata/index DBs, Arrow/Parquet)
+restated.
+
+**Build/test/clippy (real, nightly `rustc 1.98.0-nightly cb46fbb8c`):**
+- `cargo build --workspace` — GREEN (verified after each cross-crate-visible
+  change).
+- `cargo test -p dsp-physical-type` — **110 lib pass**, 0 failed (85 → 110
+  across the run: +12 nulls, +8 segment/frame, +5 schema).
+- `cargo test -p dsp-bench` — **87 lib + 20 integration pass**, 0 failed
+  (unchanged; consumes the crate, `Segment`'s new public field did not break it).
+- `cargo clippy -p dsp-physical-type --all-targets` — **0 warnings** under
+  pedantic+nursery (no `#[allow]`). Lints hit and fixed structurally:
+  `option_if_let_else` then `unnecessary_map_or` → `Option::is_none_or`;
+  `useless_vec` in a test. Workspace clippy shows only the pre-existing untouched
+  warnings (`splimes` 4× `sort_by_key`; `database`/`database_orchestration`
+  significant-Drop/sort_by_key) — none in the touched or consumer crates.
+- `cargo fmt -p dsp-physical-type --check` — clean (hard tabs, project rustfmt).
+
+**Done vs open:** DONE — the Phase-4.3 quality/null column end to end: a
+`Segment` can carry null rows in memory, seal them to a versioned/checksummed
+`.dspseg` frame and read them back exactly (with corrupt-mask detection), and an
+`AspectSchema` declares + enforces the encoding for nullable columns. `null_count`
+is now real. OPEN (Phase 4 remainder) — **intra-frame page subdivision** (per-page
+offsets/stats; the frame is single-block, segment-level stats + checksum present,
+page granularity is the next slice); **quality/tag pruning** (Phase 4.4 — the
+mask now exists; pruning on it is not yet wired); the catalog/metadata/segment-
+index DBs; Arrow/Parquet interchange; and the Storage v2 store wiring that
+consumes `AspectSchema`. Still open from prior runs: Phase-2 stored range /
+DB-subject-aspect model, OpenTelemetry; external-engine DuckDB + competitor
+adapters; the standalone methodology document.
+
+**STOP REASON:** natural-arc — four coherent increments built the entire
+quality/null column (the run's logged primary next step) from a standalone type
+through the segment + on-disk frame to the schema seal, plus docs, at the top of
+the 2–4 bar. The next concern (intra-frame **page** subdivision with per-page
+offsets/stats, its own multi-increment layout-design slice) is better started on
+a fresh PR than half-built onto this one.
+
+**Next step (tomorrow):** begin **intra-frame page subdivision** (Phase 4.3/4.4):
+split a sealed segment's columns into fixed-row pages, each with its own
+min/max ts/value stats and a per-page offset table in the `.dspseg` header, so a
+range query skips pages *within* a segment (the intra-segment page-skipping the
+single-block frame defers) — bumping `SEGMENT_FORMAT_VERSION` to 3. Alternatively,
+wire **quality pruning** (Phase 4.4): skip an all-null segment (or page) for a
+value-predicate query using the now-real `null_count` / `NullMask`, and add a
+present-row count over a time window.
+
+**PR:** https://github.com/physics515/DSP/pull/21
