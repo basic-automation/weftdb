@@ -255,6 +255,41 @@ impl SegmentStore {
 	pub async fn segment_count(&self, aspect: &str) -> Result<usize> {
 		self.index.count(aspect).await
 	}
+
+	/// Realized storage accounting for `aspect` — the north-star **bytes/point** term
+	/// (priority #1 in the commercial thesis) measured over the segments actually on
+	/// disk, plus the segment/row counts and the covered time span.
+	///
+	/// Computed from the resident [`SegmentIndex`](dsp_physical_type::SegmentIndex)
+	/// (the descriptors' recorded framed byte lengths and row counts), so it reflects
+	/// the realized `.dspseg` files including their header/index/checksum overhead,
+	/// not an advisory column estimate. No segment file is opened.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure.
+	pub async fn aspect_stats(&self, aspect: &str) -> Result<AspectStorageStats> {
+		let index = self.index.load_index(aspect).await?;
+		Ok(AspectStorageStats { segment_count: index.len(), total_rows: index.total_rows(), total_bytes: index.total_bytes(), bytes_per_point: index.bytes_per_point(), time_range: index.time_range() })
+	}
+}
+
+/// Realized storage accounting for one aspect's sealed segments, surfaced by
+/// [`SegmentStore::aspect_stats`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct AspectStorageStats {
+	/// Number of sealed segments recorded for the aspect.
+	pub segment_count: usize,
+	/// Total rows (present and null) across every segment.
+	pub total_rows: u64,
+	/// Total realized on-disk bytes across every `.dspseg` frame.
+	pub total_bytes: u64,
+	/// The north-star cost term: realized framed bytes per stored point. Zero when
+	/// the aspect holds no rows.
+	pub bytes_per_point: f64,
+	/// The inclusive `(min, max)` timestamp span covered by the aspect, or [`None`]
+	/// when it holds no non-empty segment.
+	pub time_range: Option<(i64, i64)>,
 }
 
 #[cfg(test)]
@@ -442,5 +477,35 @@ mod tests {
 		assert_eq!(allts.len(), 15);
 		assert!(gts.is_empty());
 		assert!(gvs.is_empty());
+	}
+
+	#[tokio::test]
+	async fn aspect_stats_report_realized_storage() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		// Two sealed segments, 5 rows each, over [0,40] and [100,140].
+		let mut expected_bytes = 0_u64;
+		for base in [0_i64, 100] {
+			let ts: Vec<i64> = (0..5).map(|i| base + i * 10).collect();
+			let vs: Vec<BigDecimal> = (0..5).map(|i| BigDecimal::from(base + i)).collect();
+			let d = store.seal("a", &schema(), &ts, &vs).await.expect("seals");
+			expected_bytes += d.byte_len;
+		}
+		let stats = store.aspect_stats("a").await.expect("stats");
+		// An empty aspect reports zeroes.
+		let empty = store.aspect_stats("none").await.expect("stats");
+		drop(store);
+		assert_eq!(stats.segment_count, 2);
+		assert_eq!(stats.total_rows, 10);
+		assert_eq!(stats.total_bytes, expected_bytes);
+		assert_eq!(stats.time_range, Some((0, 140)));
+		#[allow(clippy::cast_precision_loss)]
+		let expected_bpp = expected_bytes as f64 / 10.0;
+		assert!((stats.bytes_per_point - expected_bpp).abs() < f64::EPSILON);
+		// Empty aspect.
+		assert_eq!(empty.segment_count, 0);
+		assert_eq!(empty.total_rows, 0);
+		assert_eq!(empty.time_range, None);
+		assert!((empty.bytes_per_point - 0.0).abs() < f64::EPSILON);
 	}
 }
