@@ -1,4 +1,5 @@
 pub use aspect::{Aspect, AspectId};
+pub use aspect_catalog::AspectCatalog;
 pub use batches::{
 	batched_measurements::{analysis::Analysis, batched_distance::BatchDistance, BatchedMeasurement}, Batch, BatchId, BatchMetatdata, Batches
 };
@@ -28,6 +29,7 @@ pub use transaction::{Transaction, TxId};
 pub use trend::Trend;
 
 pub mod aspect;
+pub mod aspect_catalog;
 pub mod batches;
 pub mod cache;
 pub mod compression;
