@@ -1857,3 +1857,141 @@ typed columns (eases Python/Flight/DataFusion/Parquet) — assess the `arrow` de
 vendor-neutrality first.
 
 **PR:** https://github.com/physics515/DSP/pull/22
+
+## 2026-06-23 — Phase 4.3/4.4 segment-index control plane + on-disk store (8 increments)
+
+Took the 2026-06-22 run's logged next step — **the catalog/metadata/
+segment-index DBs (libSQL control plane that consumes the sealed `.dspseg`
+segments)** — and built the whole arc: from the vendor-neutral resident index
+model, through the libSQL persistence, to the filesystem store that closes the
+Storage v2 loop (seal to disk + pruned read), then paged frames, value pruning,
+storage accounting, and the schema-declaration catalog. Two crates touched:
+`dsp-physical-type` (new `catalog` module) and `database` (new `segment_index`,
+`segment_store`, `aspect_catalog` modules; `dsp-physical-type` added as a dep).
+The workspace stayed green throughout; every commit left a correct, tested
+artifact.
+
+**Items:** Phase 4.3 (catalog/metadata/segment-index DBs + Storage v2 store
+wiring → shipped), Phase 4.4 (data skipping realized end-to-end on disk:
+time/value/page pruning over stored segments). Immediate Next Action #9
+(columnar segment reads for one aspect type → done).
+
+**Increment 1 — segment-index catalog model** (commit `7945d0c`,
+`dsp-physical-type`)
+- New `catalog` module: `SegmentDescriptor` (one index row per sealed segment —
+  min/max ts/value, row/null counts, byte length, path, encoding/version),
+  derived directly from a sealed `Segment`/`PagedSegment` (`of_segment` /
+  `of_paged_segment`) so it cannot disagree with the segment; mirrors the
+  segment's pruning surface. `SegmentIndex` (ordered descriptor set) prunes by
+  time/value/quality over descriptors alone, plus total-rows/bytes/bpp/span
+  accounting and `IntoIterator`. Value bounds stay `BigDecimal`. serde
+  round-trips. Tests: +10 (142 → 152 lib).
+
+**Increment 2 — libSQL segment_index control plane** (commit `2ddbfbd`,
+`database`)
+- New `SegmentIndexStore`: opens/creates `segment_index.db` (MVCC, no
+  AUTOINCREMENT), `segment_index` table keyed `(aspect, id)` with a covering
+  `(aspect, min_ts, max_ts)` index. `insert` (MVCC `BEGIN CONCURRENT`,
+  `INSERT OR REPLACE`) persists a descriptor — `BigDecimal` bounds as plain
+  text, `PhysicalType`/`TimeUnit` as JSON (faithful `ScaledI64 { scale }`).
+  `prune_by_time` runs the data-skipping `WHERE` over the indexed integer
+  columns; `all`/`load_index` rebuild the resident `SegmentIndex`; `count`.
+  Control-plane only — metadata, never measurements. Tests: +7 async.
+
+**Increment 3 — on-disk SegmentStore closes the loop** (commit `ad26f14`,
+`database`)
+- New `SegmentStore`: `open(root)` lays out `segments/` + `segment_index.db`;
+  `seal`/`seal_nullable` encode under an `AspectSchema` (no silent downcast —
+  a tolerance-exceeding/unrepresentable value fails the seal, recording
+  nothing), write the `.dspseg` frame to `segments/<aspect>-<id>.dspseg`, and
+  record the descriptor (realized byte length + path). `read_time_range` prunes
+  the index by time first, opens **only** the surviving files, filters to the
+  window. Added `SegmentIndexStore::next_id` (monotonic per aspect, survives
+  reopen). Tests: +7 (next_id + 6 store).
+
+**Increment 4 — paged segments end-to-end** (commit `d6030d5`, `database`)
+- `seal_paged`/`seal_paged_nullable` write format-v3 paged frames;
+  `read_time_range` dispatches on the recorded `format_version` — a paged frame
+  decodes through `PagedSegment::read_time_range` (skips pages *within* the
+  file), a single-block frame whole. A store can mix both under one aspect.
+  Tests: +2.
+
+**Increment 5 — value-pruned read** (commit `356381e`, `database`)
+- `read_value_range`: prunes by value span via the resident `SegmentIndex`
+  (the `BigDecimal` bounds have no SQL ordering), opens only surviving files,
+  filters rows to present-and-in-range. Factored a frame-version-aware
+  `decode_all`. Tests: +1.
+
+**Increment 6 — aspect storage accounting** (commit `569b41b`, `database`)
+- `aspect_stats` → `AspectStorageStats` (segment/row counts, realized total
+  bytes, north-star **bytes/point**, time span) from the resident index — the
+  realized framed cost (header/index/checksum included), no file opened.
+  Tests: +1.
+
+**Increment 7 — docs** (commit `fff5320`) — ROADMAP.md Phase 4.3 note (catalog/
+segment-index DBs + Storage v2 store wiring: still-to-do → shipped, remaining =
+catalog.db DB/subject/aspect registry + Arrow/Parquet) and Immediate Next
+Action #9 (columnar segment reads → done).
+
+**Increment 8 — libSQL aspect-schema catalog** (commit `54b3dea`, `database`)
+- New `AspectCatalog`: registers each aspect's declared `AspectSchema`
+  (physical type + tolerance + timestamp unit) keyed `(database, subject,
+  aspect)` — `declare` (idempotent), `get` (reconstructed schema or None),
+  `list_aspects`. `PhysicalType`/`TimeUnit` as JSON, tolerance as plain text.
+  Begins the catalog/metadata registry beside the segment index. Tests: +4
+  async.
+
+**Build/test/clippy (real, nightly `rustc 1.98.0-nightly cb46fbb8c`):**
+- `cargo build --workspace` — GREEN (verified after each increment;
+  `dsp-bench`/`database_orchestration`/`dsp-tui` all rebuilt clean).
+- `cargo test -p dsp-physical-type` — **152 lib pass**, 0 failed (142 → 152,
+  +10 from the catalog module). Doc-tests: 0.
+- `SKIP_SLOW_TESTS=1 cargo test -p database --lib` — **43 lib pass**, 0 failed
+  (21 pre-existing + 22 new: segment_index 8, segment_store 10, aspect_catalog
+  4). SKIP_SLOW_TESTS set to keep the heavy turso/interpolation integration
+  tests out of the night's budget; the new modules' own tests are
+  self-contained (in-memory libSQL + tempfile, no skip) and all ran.
+- Clippy — **0 warnings** in every new file (`catalog.rs`, `segment_index.rs`,
+  `segment_store.rs`, `aspect_catalog.rs`) under each crate's lints; the
+  `significant_drop_tightening` nursery lint that the new turso-DB-holding test
+  bindings triggered was fixed structurally (extract results → `drop(store)` →
+  assert), never with `#[allow]`. dsp-physical-type clean under
+  pedantic+nursery. Pre-existing untouched crate warnings (splimes
+  `sort_by_key`, database `significant Drop` in unrelated modules) unchanged.
+- `rustfmt` (project `rustfmt.toml`, hard tabs) — clean on every touched file.
+  Note: `cargo fmt -p database` would reformat large amounts of pre-existing
+  fmt drift in untouched files, so touched files were formatted individually
+  with `rustfmt` and the unrelated churn reverted — only intended files staged.
+
+**Done vs open:** DONE — the segment-index control plane (resident
+`SegmentIndex` model + libSQL `SegmentIndexStore` with SQL time pruning), the
+on-disk `SegmentStore` that seals single-block and paged `.dspseg` segments and
+reads them back through time/value pruning + intra-file page skipping, realized
+bytes/point accounting, and the aspect-schema `AspectCatalog`. The Storage v2
+store wiring that consumes the `AspectSchema` declaration (the prior run's named
+open item) is shipped. OPEN (Phase 4 remainder) — the **catalog.db DB/subject/
+aspect registry** (the hierarchy *above* the aspect-schema catalog: register
+databases/subjects, not just schemas); **Arrow/Parquet interchange** (Phase 4.5,
+new `arrow` dep — assess vendor-neutrality first); **tag** pruning (4.4, blocked
+on per-measurement tags / B-tags not existing); wiring the `AspectCatalog` into
+`SegmentStore` so reads look the schema up rather than taking it as a param.
+Still open from prior runs: Phase-2 stored range / DB-subject-aspect API,
+OpenTelemetry; external-engine DuckDB + competitor adapters; the standalone
+methodology document.
+
+**STOP REASON:** natural-arc — eight increments (seven code + docs) built the
+entire segment-index control plane + on-disk Storage v2 store + schema catalog,
+well above the 2–4 bar. The next concerns — the **catalog.db DB/subject/aspect
+registry** and **Arrow/Parquet interchange** (a new dependency) — are fresh
+multi-increment arcs in adjacent areas, better started on a fresh PR than
+half-built onto this one.
+
+**Next step (tomorrow):** wire the `AspectCatalog` into `SegmentStore` (look the
+declared `AspectSchema` up by `(database, subject, aspect)` rather than passing
+it on every `seal`/read) and add the **catalog.db DB/subject/aspect registry**
+above it — register databases and subjects (not just aspect schemas), so the
+control plane has the full `catalog.db` hierarchy the roadmap layout names
+(`catalog.db` + per-aspect `metadata.db` + `segment_index.db`). Keep it
+vendor-neutral and control-plane only (hard constraint #3). Alternatively, begin
+**Arrow-compatible array export** (Phase 4.5) from a `Segment`/`PagedSegment`'s
+typed columns — assess the `arrow` dep's vendor-neutrality first.
