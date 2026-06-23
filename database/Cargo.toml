@@ -25,6 +25,7 @@ pollster = { workspace = true }
 fastrand = { workspace = true }
 futures = { workspace = true }
 splimes = { workspace = true }
+dsp-physical-type = { workspace = true }
 csv = { workspace = true }
 once_cell = { workspace = true }
 dirs = { workspace = true }
