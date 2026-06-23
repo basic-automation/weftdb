@@ -206,6 +206,24 @@ impl SegmentIndexStore {
 		Ok(usize::try_from(n).unwrap_or(0))
 	}
 
+	/// The next unused segment `id` for `aspect`: one past the current maximum, or
+	/// `0` when the aspect has no segments yet. The id a fresh seal should claim so
+	/// segment ids stay monotonic within an aspect.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure.
+	pub async fn next_id(&self, aspect: &str) -> Result<u64> {
+		let conn = self.db.connect()?;
+		let mut rows = conn.query("SELECT MAX(id) FROM segment_index WHERE aspect = ?", turso::params![aspect.to_string()]).await?;
+		let row = rows.next().await?.ok_or_else(|| anyhow::anyhow!("MAX returned no row"))?;
+		// MAX over no rows is SQL NULL → start at 0; otherwise one past the maximum.
+		match row.get_value(0)? {
+			Value::Integer(max) => Ok(u64::try_from(max).unwrap_or(0).saturating_add(1)),
+			_ => Ok(0),
+		}
+	}
+
 	/// Decode a result set (the full descriptor column list, in the fixed order the
 	/// queries select) into [`SegmentDescriptor`]s.
 	async fn collect(mut rows: turso::Rows) -> Result<Vec<SegmentDescriptor>> {
@@ -392,5 +410,24 @@ mod tests {
 		drop(store);
 		assert_eq!(count, 1);
 		assert!(pruned.is_empty());
+	}
+
+	#[tokio::test]
+	async fn next_id_is_monotonic_per_aspect() {
+		let store = SegmentIndexStore::open_in_memory().await.expect("opens");
+		let (seg, len) = sealed(0);
+		// An empty aspect starts at 0.
+		let first = store.next_id("a").await.expect("next_id");
+		store.insert("a", &SegmentDescriptor::of_segment(first, "a0.dspseg", len, &seg)).await.expect("inserts");
+		// After inserting id 0, the next is 1; a different aspect is independent.
+		let second = store.next_id("a").await.expect("next_id");
+		let other = store.next_id("b").await.expect("next_id");
+		store.insert("a", &SegmentDescriptor::of_segment(second, "a1.dspseg", len, &seg)).await.expect("inserts");
+		let third = store.next_id("a").await.expect("next_id");
+		drop(store);
+		assert_eq!(first, 0);
+		assert_eq!(second, 1);
+		assert_eq!(third, 2);
+		assert_eq!(other, 0, "a fresh aspect starts at 0");
 	}
 }
