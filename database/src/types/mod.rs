@@ -1,4 +1,5 @@
 pub use aspect::{Aspect, AspectId};
+pub use aspect_catalog::AspectCatalog;
 pub use batches::{
 	batched_measurements::{analysis::Analysis, batched_distance::BatchDistance, BatchedMeasurement}, Batch, BatchId, BatchMetatdata, Batches
 };
@@ -20,12 +21,15 @@ pub use occurrence::Occurrence;
 pub use pattern::{Pattern, PatternID};
 pub use pipeline::{DetectorMetadata, DetectorType, PipelineConfig, PipelineState};
 pub use relative::Relative;
+pub use segment_index::SegmentIndexStore;
+pub use segment_store::{AspectStorageStats, SegmentStore};
 pub use signal::{Distance, ErrVal, Signal, SignalType, Signals};
 pub use subject::{Subject, SubjectId};
 pub use transaction::{Transaction, TxId};
 pub use trend::Trend;
 
 pub mod aspect;
+pub mod aspect_catalog;
 pub mod batches;
 pub mod cache;
 pub mod compression;
@@ -42,6 +46,8 @@ pub mod occurrence;
 pub mod pattern;
 pub mod pipeline;
 pub mod relative;
+pub mod segment_index;
+pub mod segment_store;
 pub mod signal;
 pub mod subject;
 pub mod transaction;

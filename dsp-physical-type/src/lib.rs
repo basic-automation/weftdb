@@ -52,6 +52,11 @@
 //!   the physical value encoding, its error bound, and the timestamp unit;
 //!   [`AspectSchema::seal`] builds a [`Segment`] under the declared encoding,
 //!   erroring rather than silently downcasting past the declared tolerance.
+//! - [`catalog`] — Phase 4.3 control-plane index: a [`SegmentDescriptor`] per
+//!   sealed segment (min/max ts/value, row/null counts, byte length, path) and a
+//!   [`SegmentIndex`] that prunes a query to the segments it must open
+//!   ([`SegmentIndex::prune_by_time`]) without reading a `.dspseg` byte — the
+//!   resident shape of the libSQL `segment_index` the next slice persists.
 //!
 //! [`F64`]: PhysicalType::F64
 //! [`F32`]: PhysicalType::F32
@@ -69,6 +74,7 @@
 
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 
+pub mod catalog;
 pub mod column;
 pub mod dspseg;
 pub mod nulls;
@@ -80,6 +86,7 @@ pub mod timestamp;
 use bigdecimal::{
 	num_bigint::{BigInt, Sign}, BigDecimal, FromPrimitive, ToPrimitive
 };
+pub use catalog::{SegmentDescriptor, SegmentIndex};
 pub use column::{encode_column, recommend_encoding, ColumnEncodeError, ColumnEncoding};
 pub use dspseg::{crc32, read_paged_segment, read_segment, write_paged_segment, write_segment, ByteReader, ByteWriter, DspSegError};
 pub use nulls::{NullMask, NullMaskError};
