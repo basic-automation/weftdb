@@ -22,14 +22,16 @@
 //! Boundary (hard constraint #3): the control plane holds *metadata* (the index DB);
 //! the measurement bytes live in the `.dspseg` files DSP owns. libSQL never stores a
 //! measurement. This slice seals single-block segments via
-//! [`AspectSchema::seal`]; paged segments and the catalog/`metadata.db` registry are
-//! later slices.
+//! [`AspectSchema::seal`] **and** paged segments via
+//! [`AspectSchema::seal_paged`] — the read path dispatches on the recorded frame
+//! version, so a paged segment skips pages *within* the file too. The
+//! catalog/`metadata.db` registry is a later slice.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use bigdecimal::BigDecimal;
-use dsp_physical_type::{AspectSchema, Segment, SegmentDescriptor};
+use dsp_physical_type::{AspectSchema, PagedSegment, Segment, SegmentDescriptor, PAGED_SEGMENT_FORMAT_VERSION};
 
 use crate::SegmentIndexStore;
 
@@ -107,18 +109,59 @@ impl SegmentStore {
 		self.persist(aspect, &segment).await
 	}
 
+	/// Seal a dense batch into a **paged** `.dspseg` segment (intra-segment page
+	/// subdivision) and record it. Rows are partitioned into pages of `rows_per_page`,
+	/// each independently encoded with its own min/max stats, so a later
+	/// [`read_time_range`](SegmentStore::read_time_range) skips pages *within* the
+	/// file, not just whole files.
+	///
+	/// # Errors
+	///
+	/// As [`seal`](SegmentStore::seal), plus a [`dsp_physical_type::SealError::EmptyPageSize`]
+	/// if `rows_per_page` is zero.
+	pub async fn seal_paged(&self, aspect: &str, schema: &AspectSchema, timestamps: &[i64], values: &[BigDecimal], rows_per_page: usize) -> Result<SegmentDescriptor> {
+		let segment = schema.seal_paged(timestamps, values, rows_per_page).map_err(|e| anyhow::anyhow!("paged seal failed: {e}"))?;
+		self.persist_paged(aspect, &segment).await
+	}
+
+	/// Seal a **nullable** batch into a paged `.dspseg` segment and record it — the
+	/// quality-column paged seal.
+	///
+	/// # Errors
+	///
+	/// As [`seal_paged`](SegmentStore::seal_paged).
+	pub async fn seal_paged_nullable(&self, aspect: &str, schema: &AspectSchema, timestamps: &[i64], values: &[Option<BigDecimal>], rows_per_page: usize) -> Result<SegmentDescriptor> {
+		let segment = schema.seal_paged_nullable(timestamps, values, rows_per_page).map_err(|e| anyhow::anyhow!("paged seal failed: {e}"))?;
+		self.persist_paged(aspect, &segment).await
+	}
+
 	/// Write a freshly sealed segment to disk and record its descriptor. Shared by
 	/// the dense and nullable seal paths.
 	async fn persist(&self, aspect: &str, segment: &Segment) -> Result<SegmentDescriptor> {
 		let id = self.index.next_id(aspect).await?;
 		let bytes = segment.write_to();
-		let file_name = format!("{aspect}-{id}.dspseg");
-		let path = self.root.join("segments").join(&file_name);
+		let path = self.segment_path(aspect, id);
 		tokio::fs::write(&path, &bytes).await.with_context(|| format!("writing segment {}", path.display()))?;
-		let byte_len = bytes.len() as u64;
-		let descriptor = SegmentDescriptor::of_segment(id, path.to_string_lossy().into_owned(), byte_len, segment);
+		let descriptor = SegmentDescriptor::of_segment(id, path.to_string_lossy().into_owned(), bytes.len() as u64, segment);
 		self.index.insert(aspect, &descriptor).await?;
 		Ok(descriptor)
+	}
+
+	/// Write a freshly sealed **paged** segment to disk (format-version-3 frame) and
+	/// record its descriptor. The paged analogue of [`persist`](SegmentStore::persist).
+	async fn persist_paged(&self, aspect: &str, segment: &PagedSegment) -> Result<SegmentDescriptor> {
+		let id = self.index.next_id(aspect).await?;
+		let bytes = segment.write_to();
+		let path = self.segment_path(aspect, id);
+		tokio::fs::write(&path, &bytes).await.with_context(|| format!("writing segment {}", path.display()))?;
+		let descriptor = SegmentDescriptor::of_paged_segment(id, path.to_string_lossy().into_owned(), bytes.len() as u64, segment);
+		self.index.insert(aspect, &descriptor).await?;
+		Ok(descriptor)
+	}
+
+	/// The on-disk path a freshly sealed segment of the given `aspect`/`id` takes.
+	fn segment_path(&self, aspect: &str, id: u64) -> PathBuf {
+		self.root.join("segments").join(format!("{aspect}-{id}.dspseg"))
 	}
 
 	/// Read every row of `aspect` whose timestamp falls in the inclusive range
@@ -139,8 +182,15 @@ impl SegmentStore {
 		let mut values = Vec::new();
 		for descriptor in &descriptors {
 			let bytes = tokio::fs::read(&descriptor.path).await.with_context(|| format!("reading segment {}", descriptor.path))?;
-			let segment = Segment::read_from(&bytes).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?;
-			let (ts, vs) = segment.decode_nullable();
+			// A paged frame (v3) decodes through PagedSegment::read_time_range, which
+			// skips pages *within* the file; a single-block frame decodes whole.
+			let (ts, vs) = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION {
+				let segment = PagedSegment::read_from(&bytes).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?;
+				segment.read_time_range(start, end)
+			} else {
+				let segment = Segment::read_from(&bytes).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?;
+				segment.decode_nullable()
+			};
 			for (t, v) in ts.into_iter().zip(vs) {
 				if start <= t && t <= end {
 					timestamps.push(t);
@@ -282,5 +332,45 @@ mod tests {
 		assert_eq!(count, 1);
 		assert_eq!(ts, vec![0, 10]);
 		assert_eq!(d.id, 1);
+	}
+
+	#[tokio::test]
+	async fn paged_seal_reads_back_with_page_skipping() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		// 12 rows at ts 0,10,..,110; 4 rows/page ⇒ pages [0,30],[40,70],[80,110].
+		let ts: Vec<i64> = (0..12).map(|i| i * 10).collect();
+		let vs: Vec<BigDecimal> = (0..12).map(BigDecimal::from).collect();
+		let descriptor = store.seal_paged("a", &schema(), &ts, &vs, 4).await.expect("seals paged");
+		// The descriptor records the paged frame version.
+		assert_eq!(descriptor.format_version, PAGED_SEGMENT_FORMAT_VERSION);
+		// A window inside the middle page returns only its rows (other pages skipped).
+		let (wts, wvs) = store.read_time_range("a", 45, 65).await.expect("reads");
+		// The whole span decodes to every row.
+		let (allts, _) = store.read_time_range("a", i64::MIN, i64::MAX).await.expect("reads");
+		drop(store);
+		assert_eq!(wts, vec![50, 60]);
+		assert_eq!(wvs, vec![Some(bd("5")), Some(bd("6"))]);
+		assert_eq!(allts, ts);
+	}
+
+	#[tokio::test]
+	async fn single_and_paged_segments_read_together() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		// A single-block segment over [0,40] and a paged one over [100,140].
+		store.seal("a", &schema(), &[0_i64, 10, 20, 30, 40], &(0..5).map(BigDecimal::from).collect::<Vec<_>>()).await.expect("seals single");
+		let pts: Vec<i64> = (0..5).map(|i| 100 + i * 10).collect();
+		let pvs: Vec<BigDecimal> = (0..5).map(|i| bd(&format!("{}", 100 + i))).collect();
+		let paged = store.seal_paged("a", &schema(), &pts, &pvs, 2).await.expect("seals paged");
+		// The two frames carry different versions but the same aspect read path.
+		assert_eq!(paged.format_version, PAGED_SEGMENT_FORMAT_VERSION);
+		let count = store.segment_count("a").await.expect("counts");
+		// A window straddling both segments returns rows from each, despite the
+		// different on-disk frames.
+		let (ts, _) = store.read_time_range("a", 30, 110).await.expect("reads");
+		drop(store);
+		assert_eq!(count, 2);
+		assert_eq!(ts, vec![30, 40, 100, 110]);
 	}
 }
