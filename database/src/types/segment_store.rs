@@ -201,6 +201,52 @@ impl SegmentStore {
 		Ok((timestamps, values))
 	}
 
+	/// Read every present row of `aspect` whose **value** falls in the inclusive range
+	/// `[lo, hi]`, **opening only the segment files whose value span overlaps it**.
+	///
+	/// The value column has no SQL ordering (the `BigDecimal` bounds are stored as
+	/// text), so the pruning runs through the resident
+	/// [`SegmentIndex`](dsp_physical_type::SegmentIndex): it is loaded from the
+	/// control plane and pruned by value, and only the surviving descriptors' files
+	/// are opened. Within each opened segment the rows are filtered to those whose
+	/// value is present and in `[lo, hi]`. Returns parallel `(timestamps, values)`
+	/// vectors, in segment-seal then in-segment order.
+	///
+	/// # Errors
+	///
+	/// Propagates a libSQL read failure, a filesystem read error, or a
+	/// [`dsp_physical_type::dspseg::DspSegError`] for a corrupt/unreadable `.dspseg`.
+	pub async fn read_value_range(&self, aspect: &str, lo: &BigDecimal, hi: &BigDecimal) -> Result<(Vec<i64>, Vec<BigDecimal>)> {
+		let index = self.index.load_index(aspect).await?;
+		let mut timestamps = Vec::new();
+		let mut values = Vec::new();
+		for descriptor in index.prune_by_value(lo, hi) {
+			let (ts, vs) = self.decode_all(descriptor).await?;
+			for (t, v) in ts.into_iter().zip(vs) {
+				if let Some(value) = v {
+					if lo <= &value && &value <= hi {
+						timestamps.push(t);
+						values.push(value);
+					}
+				}
+			}
+		}
+		Ok((timestamps, values))
+	}
+
+	/// Read and fully decode one segment file (frame-version aware), returning all
+	/// rows aligned `(timestamps, values)` with `None` at every null row.
+	async fn decode_all(&self, descriptor: &SegmentDescriptor) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>)> {
+		let bytes = tokio::fs::read(&descriptor.path).await.with_context(|| format!("reading segment {}", descriptor.path))?;
+		if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION {
+			let segment = PagedSegment::read_from(&bytes).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?;
+			Ok(segment.decode_nullable())
+		} else {
+			let segment = Segment::read_from(&bytes).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?;
+			Ok(segment.decode_nullable())
+		}
+	}
+
 	/// Number of sealed segments recorded for `aspect`.
 	///
 	/// # Errors
@@ -372,5 +418,29 @@ mod tests {
 		drop(store);
 		assert_eq!(count, 2);
 		assert_eq!(ts, vec![30, 40, 100, 110]);
+	}
+
+	#[tokio::test]
+	async fn read_value_range_prunes_by_value_span() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		// Three segments with disjoint value spans [0,4], [100,104], [200,204].
+		for base in [0_i64, 100, 200] {
+			let ts: Vec<i64> = (0..5).map(|i| base + i * 10).collect();
+			let vs: Vec<BigDecimal> = (0..5).map(|i| BigDecimal::from(base + i)).collect();
+			store.seal("a", &schema(), &ts, &vs).await.expect("seals");
+		}
+		// A value window inside the middle segment returns only its in-range rows.
+		let (ts, vs) = store.read_value_range("a", &bd("101"), &bd("103")).await.expect("reads");
+		// A window covering everything returns all rows.
+		let (allts, _) = store.read_value_range("a", &bd("0"), &bd("204")).await.expect("reads");
+		// A window in a value gap returns nothing.
+		let (gts, gvs) = store.read_value_range("a", &bd("50"), &bd("60")).await.expect("reads");
+		drop(store);
+		assert_eq!(vs, vec![bd("101"), bd("102"), bd("103")]);
+		assert_eq!(ts, vec![110, 120, 130]);
+		assert_eq!(allts.len(), 15);
+		assert!(gts.is_empty());
+		assert!(gvs.is_empty());
 	}
 }
