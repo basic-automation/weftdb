@@ -996,6 +996,7 @@ dependencies = [
  "criterion",
  "csv",
  "dirs",
+ "dsp-physical-type",
  "fake",
  "fastrand",
  "flume",
