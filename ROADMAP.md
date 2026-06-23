@@ -321,9 +321,27 @@ JSON").
   counterpart of `PagedSegment::build`'s advisory `recommend_encoding`),
   enforcing the tolerance bound **per page** and remapping an `Encode` error's
   index to the global row (past page nulls and prior pages) — so paged storage
-  carries the same no-silent-downcast guarantee single-block `seal` does. Still
-  to do here: the catalog/metadata/segment-index DBs; and Arrow/Parquet
-  interchange.)*
+  carries the same no-silent-downcast guarantee single-block `seal` does.
+  **Segment-index control plane + on-disk store landed:** the vendor-neutral
+  `dsp-physical-type::catalog` ships a `SegmentDescriptor` (one index row per
+  sealed segment — min/max ts/value, row/null counts, byte length, path,
+  encoding) derived directly from a sealed `Segment`/`PagedSegment`, and a
+  resident `SegmentIndex` that prunes a query to the segments it must open
+  (`prune_by_time`/`prune_by_value`/`prune_present_by_time`) without reading a
+  `.dspseg` byte. `database::SegmentIndexStore` persists those descriptors in the
+  libSQL control plane (hard constraint #3 — metadata only, never measurements)
+  and answers a time-range query with a SQL `WHERE` over the indexed integer
+  min/max-ts columns (the `BigDecimal` bounds round-trip as plain text and the
+  `PhysicalType`/`TimeUnit` as JSON, no silent downcast even in the catalog).
+  `database::SegmentStore` closes the loop against the filesystem: it seals a
+  batch under an `AspectSchema` to `segments/<aspect>-<id>.dspseg` (single-block
+  *and* paged frames), records the descriptor, and reads back by pruning the
+  index first then opening **only** the surviving files — `read_time_range`
+  (frame-version aware, paged frames skip pages within the file too),
+  `read_value_range` (resident-index value pruning), and an `aspect_stats`
+  surfacing the realized north-star bytes/point. Still to do here: the
+  catalog/`metadata.db` registry (the DB/subject/aspect catalog above the
+  segment index); and Arrow/Parquet interchange.)*
 - **4.4 Data skipping** (time/value/tag/quality pruning, page skipping).
   *(Started — segment-level pruning on `dsp-physical-type::Segment`:
   `overlaps_time`/`contains_timestamp` and `may_contain_value` (conservative —
@@ -767,7 +785,13 @@ redistributed. *For commercial trust, be more transparent than competitors.*
    `recommend_encoding` that picks the narrowest hot-path encoding within an
    error tolerance. `BigDecimal` remains the logical/API type. 27 tests; 0
    clippy warnings under pedantic+nursery.)*
-9. Prototype columnar segment reads for one aspect type.
+9. ✅ Prototype columnar segment reads for one aspect type. *(Delivered:
+   `database::SegmentStore` seals an aspect's batches to typed columnar
+   `.dspseg` files (single-block and paged) and reads them back through the
+   libSQL `SegmentIndexStore` — `read_time_range` prunes segments by time in
+   SQL and opens only the overlapping files (paged frames skip pages within a
+   file too), `read_value_range` prunes by value via the resident
+   `SegmentIndex`. See Phase 4.3.)*
 10. Publish a methodology document **before** any performance claim.
 
 > The key commercial move is not adding features — it is making DSP's performance
