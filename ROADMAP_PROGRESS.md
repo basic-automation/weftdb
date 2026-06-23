@@ -1995,3 +1995,5 @@ control plane has the full `catalog.db` hierarchy the roadmap layout names
 vendor-neutral and control-plane only (hard constraint #3). Alternatively, begin
 **Arrow-compatible array export** (Phase 4.5) from a `Segment`/`PagedSegment`'s
 typed columns — assess the `arrow` dep's vendor-neutrality first.
+
+**PR:** https://github.com/physics515/DSP/pull/23
