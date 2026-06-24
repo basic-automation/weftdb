@@ -2087,4 +2087,4 @@ beside `segment_index.db`), or begin **Arrow-compatible array export** (Phase 4.
 a `Segment`/`PagedSegment`'s typed columns — assess the `arrow` dep's vendor-neutrality
 first (it must not couple the core to a vendor; hard constraint #2).
 
-**PR:** _(opened at end of run — see below)_
+**PR:** https://github.com/physics515/DSP/pull/24
