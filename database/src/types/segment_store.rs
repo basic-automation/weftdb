@@ -33,7 +33,7 @@ use anyhow::{Context, Result};
 use bigdecimal::BigDecimal;
 use dsp_physical_type::{AspectSchema, PagedSegment, Segment, SegmentDescriptor, PAGED_SEGMENT_FORMAT_VERSION};
 
-use crate::{AspectCatalog, SegmentIndexStore};
+use crate::{AspectCatalog, CatalogStore, SegmentIndexStore};
 
 /// The `(database, subject)` namespace a [`SegmentStore`] opened with the plain
 /// [`open`](SegmentStore::open) constructor declares its aspect schemas under.
@@ -56,6 +56,10 @@ pub struct SegmentStore {
 	/// The libSQL aspect-schema catalog (`root/aspect_catalog.db`) — the declared
 	/// [`AspectSchema`] for each aspect, so a seal need not be handed the schema.
 	catalog: AspectCatalog,
+	/// The libSQL DB/subject registry (`root/catalog.db`) — the hierarchy above the
+	/// aspect schemas. The store registers its own `(database, subject)` here on open,
+	/// so the control plane can enumerate what a root holds.
+	registry: CatalogStore,
 	/// The database namespace this store's aspect schemas are declared under.
 	database: String,
 	/// The subject namespace this store's aspect schemas are declared under. A store
@@ -100,7 +104,13 @@ impl SegmentStore {
 		let index = SegmentIndexStore::open(&index_path.to_string_lossy()).await?;
 		let catalog_path = root.join("aspect_catalog.db");
 		let catalog = AspectCatalog::open(&catalog_path.to_string_lossy()).await?;
-		Ok(Self { root, index, catalog, database: database.to_string(), subject: subject.to_string() })
+		let registry_path = root.join("catalog.db");
+		let registry = CatalogStore::open(&registry_path.to_string_lossy()).await?;
+		// Record this store's place in the hierarchy so the control plane can enumerate
+		// the databases/subjects a root holds (idempotent).
+		registry.register_database(database).await?;
+		registry.register_subject(database, subject).await?;
+		Ok(Self { root, index, catalog, registry, database: database.to_string(), subject: subject.to_string() })
 	}
 
 	/// The control-plane index backing this store, for pruning/accounting queries
@@ -115,6 +125,24 @@ impl SegmentStore {
 	#[must_use]
 	pub const fn catalog(&self) -> &AspectCatalog {
 		&self.catalog
+	}
+
+	/// The DB/subject registry backing this store, for enumerating the databases and
+	/// subjects a root holds ([`list_databases`](CatalogStore::list_databases),
+	/// [`list_subjects`](CatalogStore::list_subjects)).
+	#[must_use]
+	pub const fn registry(&self) -> &CatalogStore {
+		&self.registry
+	}
+
+	/// The aspects [`declare`](SegmentStore::declare)d in this store's
+	/// `(database, subject)` scope, in name order.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure.
+	pub async fn list_declared_aspects(&self) -> Result<Vec<String>> {
+		self.catalog.list_aspects(&self.database, &self.subject).await
 	}
 
 	/// Declare `aspect`'s [`AspectSchema`] in this store's catalog, so later
@@ -632,6 +660,36 @@ mod tests {
 		drop(reopened);
 		assert_eq!(got, Some(declared));
 		assert_eq!(descriptor.row_count, 2);
+	}
+
+	#[tokio::test]
+	async fn open_registers_its_database_and_subject() {
+		let dir = TempDir::new().expect("tempdir");
+		// Two scoped stores over one root populate the shared catalog.db hierarchy.
+		let market = SegmentStore::open_scoped(dir.path(), "market", "BTCUSD").await.expect("opens");
+		let _iot = SegmentStore::open_scoped(dir.path(), "iot", "sensor-7").await.expect("opens");
+		// Re-opening the same scope is idempotent — no duplicate rows.
+		let _again = SegmentStore::open_scoped(dir.path(), "market", "BTCUSD").await.expect("opens");
+		let dbs = market.registry().list_databases().await.expect("lists");
+		let market_subjects = market.registry().list_subjects("market").await.expect("lists");
+		drop(market);
+		assert_eq!(dbs, vec!["iot".to_string(), "market".to_string()]);
+		assert_eq!(market_subjects, vec!["BTCUSD".to_string()]);
+	}
+
+	#[tokio::test]
+	async fn list_declared_aspects_scopes_to_the_store() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open_scoped(dir.path(), "d", "s").await.expect("opens");
+		store.declare("temp", &schema()).await.expect("declares");
+		store.declare("humidity", &schema()).await.expect("declares");
+		// A sibling subject's declaration is not listed here.
+		let sibling = SegmentStore::open_scoped(dir.path(), "d", "other").await.expect("opens");
+		sibling.declare("pressure", &schema()).await.expect("declares");
+		let aspects = store.list_declared_aspects().await.expect("lists");
+		drop(store);
+		drop(sibling);
+		assert_eq!(aspects, vec!["humidity".to_string(), "temp".to_string()]);
 	}
 
 	#[tokio::test]
