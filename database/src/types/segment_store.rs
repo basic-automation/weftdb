@@ -33,7 +33,13 @@ use anyhow::{Context, Result};
 use bigdecimal::BigDecimal;
 use dsp_physical_type::{AspectSchema, PagedSegment, Segment, SegmentDescriptor, PAGED_SEGMENT_FORMAT_VERSION};
 
-use crate::SegmentIndexStore;
+use crate::{AspectCatalog, SegmentIndexStore};
+
+/// The `(database, subject)` namespace a [`SegmentStore`] opened with the plain
+/// [`open`](SegmentStore::open) constructor declares its aspect schemas under.
+const DEFAULT_DATABASE: &str = "default";
+/// See [`DEFAULT_DATABASE`].
+const DEFAULT_SUBJECT: &str = "default";
 
 /// A filesystem-backed store of sealed `.dspseg` segments with a libSQL segment
 /// index over them.
@@ -47,24 +53,54 @@ pub struct SegmentStore {
 	root: PathBuf,
 	/// The libSQL segment index (`root/segment_index.db`).
 	index: SegmentIndexStore,
+	/// The libSQL aspect-schema catalog (`root/aspect_catalog.db`) — the declared
+	/// [`AspectSchema`] for each aspect, so a seal need not be handed the schema.
+	catalog: AspectCatalog,
+	/// The database namespace this store's aspect schemas are declared under.
+	database: String,
+	/// The subject namespace this store's aspect schemas are declared under. A store
+	/// is scoped to one subject, so its flat aspect keys (which name the `.dspseg`
+	/// files and index rows) are unique within it.
+	subject: String,
 }
 
 impl SegmentStore {
-	/// Open (creating if absent) a segment store rooted at `root`: ensures
-	/// `root/segments/` exists and opens the `root/segment_index.db` control-plane
-	/// index.
+	/// Open (creating if absent) a segment store rooted at `root` under the `default`
+	/// database/subject namespace: ensures `root/segments/` exists and opens the
+	/// `root/segment_index.db` and `root/aspect_catalog.db` control-plane DBs.
+	///
+	/// Use [`open_scoped`](SegmentStore::open_scoped) to place the store's declared
+	/// schemas under a named `(database, subject)` instead.
 	///
 	/// # Errors
 	///
 	/// Propagates a filesystem error creating the layout, or any libSQL failure
-	/// opening the index.
+	/// opening the index or catalog.
 	pub async fn open(root: impl AsRef<Path>) -> Result<Self> {
+		Self::open_scoped(root, DEFAULT_DATABASE, DEFAULT_SUBJECT).await
+	}
+
+	/// Open (creating if absent) a segment store rooted at `root` whose declared aspect
+	/// schemas live under the `(database, subject)` namespace.
+	///
+	/// The segment files and index rows are keyed by the flat aspect name, which is
+	/// unique within one subject; the aspect-schema catalog records the full
+	/// `(database, subject, aspect)` triple so a reopened store recovers the encoding
+	/// it sealed under.
+	///
+	/// # Errors
+	///
+	/// Propagates a filesystem error creating the layout, or any libSQL failure
+	/// opening the index or catalog.
+	pub async fn open_scoped(root: impl AsRef<Path>, database: &str, subject: &str) -> Result<Self> {
 		let root = root.as_ref().to_path_buf();
 		let segments_dir = root.join("segments");
 		tokio::fs::create_dir_all(&segments_dir).await.with_context(|| format!("creating segments dir {}", segments_dir.display()))?;
 		let index_path = root.join("segment_index.db");
 		let index = SegmentIndexStore::open(&index_path.to_string_lossy()).await?;
-		Ok(Self { root, index })
+		let catalog_path = root.join("aspect_catalog.db");
+		let catalog = AspectCatalog::open(&catalog_path.to_string_lossy()).await?;
+		Ok(Self { root, index, catalog, database: database.to_string(), subject: subject.to_string() })
 	}
 
 	/// The control-plane index backing this store, for pruning/accounting queries
@@ -73,6 +109,76 @@ impl SegmentStore {
 	#[must_use]
 	pub const fn index(&self) -> &SegmentIndexStore {
 		&self.index
+	}
+
+	/// The aspect-schema catalog backing this store.
+	#[must_use]
+	pub const fn catalog(&self) -> &AspectCatalog {
+		&self.catalog
+	}
+
+	/// Declare `aspect`'s [`AspectSchema`] in this store's catalog, so later
+	/// [`seal_declared`](SegmentStore::seal_declared) calls need not be handed the
+	/// schema. Idempotent on the aspect (a re-declaration overwrites).
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL write failure.
+	pub async fn declare(&self, aspect: &str, schema: &AspectSchema) -> Result<()> {
+		self.catalog.declare(&self.database, &self.subject, aspect, schema).await
+	}
+
+	/// The declared [`AspectSchema`] for `aspect`, or [`None`] if it has not been
+	/// [`declare`](SegmentStore::declare)d in this store.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure.
+	pub async fn schema_for(&self, aspect: &str) -> Result<Option<AspectSchema>> {
+		self.catalog.get(&self.database, &self.subject, aspect).await
+	}
+
+	/// The declared schema for `aspect`, or an error naming the aspect if it has not
+	/// been declared.
+	async fn require_schema(&self, aspect: &str) -> Result<AspectSchema> {
+		self.schema_for(aspect).await?.ok_or_else(|| anyhow::anyhow!("aspect {aspect:?} has no declared schema in {}/{}", self.database, self.subject))
+	}
+
+	/// Seal a dense `(timestamp, value)` batch under `aspect`'s **declared** schema —
+	/// the catalog-backed counterpart of [`seal`](SegmentStore::seal) that looks the
+	/// encoding up rather than taking it as a parameter.
+	///
+	/// # Errors
+	///
+	/// Returns an error if `aspect` has no declared schema; otherwise as
+	/// [`seal`](SegmentStore::seal).
+	pub async fn seal_declared(&self, aspect: &str, timestamps: &[i64], values: &[BigDecimal]) -> Result<SegmentDescriptor> {
+		let schema = self.require_schema(aspect).await?;
+		self.seal(aspect, &schema, timestamps, values).await
+	}
+
+	/// Seal a **nullable** batch under `aspect`'s declared schema — the catalog-backed
+	/// counterpart of [`seal_nullable`](SegmentStore::seal_nullable).
+	///
+	/// # Errors
+	///
+	/// Returns an error if `aspect` has no declared schema; otherwise as
+	/// [`seal_nullable`](SegmentStore::seal_nullable).
+	pub async fn seal_declared_nullable(&self, aspect: &str, timestamps: &[i64], values: &[Option<BigDecimal>]) -> Result<SegmentDescriptor> {
+		let schema = self.require_schema(aspect).await?;
+		self.seal_nullable(aspect, &schema, timestamps, values).await
+	}
+
+	/// Seal a dense batch into a **paged** segment under `aspect`'s declared schema —
+	/// the catalog-backed counterpart of [`seal_paged`](SegmentStore::seal_paged).
+	///
+	/// # Errors
+	///
+	/// Returns an error if `aspect` has no declared schema; otherwise as
+	/// [`seal_paged`](SegmentStore::seal_paged).
+	pub async fn seal_declared_paged(&self, aspect: &str, timestamps: &[i64], values: &[BigDecimal], rows_per_page: usize) -> Result<SegmentDescriptor> {
+		let schema = self.require_schema(aspect).await?;
+		self.seal_paged(aspect, &schema, timestamps, values, rows_per_page).await
 	}
 
 	/// Seal a dense `(timestamp, value)` batch into a `.dspseg` file under `aspect`'s
@@ -477,6 +583,71 @@ mod tests {
 		assert_eq!(allts.len(), 15);
 		assert!(gts.is_empty());
 		assert!(gvs.is_empty());
+	}
+
+	#[tokio::test]
+	async fn declared_schema_seals_without_passing_it() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		// Declare the aspect's schema once, then seal without re-supplying it.
+		store.declare("temp", &schema()).await.expect("declares");
+		let ts = vec![0_i64, 10, 20];
+		let vs = vec![bd("1.5"), bd("2.5"), bd("3.5")];
+		let descriptor = store.seal_declared("temp", &ts, &vs).await.expect("seals");
+		let (rt, rv) = store.read_time_range("temp", 0, 100).await.expect("reads");
+		let got = store.schema_for("temp").await.expect("looks up");
+		drop(store);
+		assert_eq!(descriptor.row_count, 3);
+		assert_eq!(rt, ts);
+		assert_eq!(rv, vec![Some(bd("1.5")), Some(bd("2.5")), Some(bd("3.5"))]);
+		assert_eq!(got, Some(schema()));
+	}
+
+	#[tokio::test]
+	async fn seal_declared_without_declaration_fails() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		// No declaration ⇒ the catalog-backed seal must refuse and record nothing.
+		let err = store.seal_declared("temp", &[0_i64], &[bd("1")]).await;
+		let count = store.segment_count("temp").await.expect("counts");
+		let missing = store.schema_for("temp").await.expect("looks up");
+		drop(store);
+		assert!(err.is_err(), "an undeclared aspect cannot be sealed by lookup");
+		assert_eq!(count, 0, "the refused seal records nothing");
+		assert_eq!(missing, None);
+	}
+
+	#[tokio::test]
+	async fn declared_schema_survives_reopen() {
+		let dir = TempDir::new().expect("tempdir");
+		let declared = AspectSchema::new(PhysicalType::ScaledI64 { scale: 2 }, bd("0.005"), TimeUnit::Millis);
+		let first = SegmentStore::open_scoped(dir.path(), "market", "BTCUSD").await.expect("opens");
+		first.declare("price", &declared).await.expect("declares");
+		drop(first);
+		// A reopened store under the same scope recovers the encoding it sealed under,
+		// and can seal by lookup.
+		let reopened = SegmentStore::open_scoped(dir.path(), "market", "BTCUSD").await.expect("reopens");
+		let got = reopened.schema_for("price").await.expect("looks up");
+		let descriptor = reopened.seal_declared("price", &[0_i64, 1000], &[bd("100.25"), bd("100.50")]).await.expect("seals");
+		drop(reopened);
+		assert_eq!(got, Some(declared));
+		assert_eq!(descriptor.row_count, 2);
+	}
+
+	#[tokio::test]
+	async fn scopes_isolate_declarations() {
+		let dir = TempDir::new().expect("tempdir");
+		// Two stores over the same root but different subjects share the catalog DB;
+		// a declaration under one subject is invisible to the other.
+		let a = SegmentStore::open_scoped(dir.path(), "d", "subject-a").await.expect("opens");
+		a.declare("temp", &schema()).await.expect("declares");
+		let b = SegmentStore::open_scoped(dir.path(), "d", "subject-b").await.expect("opens");
+		let seen_by_b = b.schema_for("temp").await.expect("looks up");
+		let seen_by_a = a.schema_for("temp").await.expect("looks up");
+		drop(a);
+		drop(b);
+		assert_eq!(seen_by_a, Some(schema()));
+		assert_eq!(seen_by_b, None, "a sibling subject does not see the declaration");
 	}
 
 	#[tokio::test]
