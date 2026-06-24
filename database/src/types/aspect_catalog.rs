@@ -132,6 +132,26 @@ impl AspectCatalog {
 		}
 		Ok(out)
 	}
+
+	/// Every declared `(database, subject, aspect)` triple in the catalog, ordered by
+	/// database, then subject, then aspect — a flat enumeration of the whole catalog
+	/// for control-plane introspection or registry recovery.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure.
+	pub async fn list_all(&self) -> Result<Vec<(String, String, String)>> {
+		let conn = self.db.connect()?;
+		let mut rows = conn.query("SELECT database, subject, aspect FROM aspect_schema ORDER BY database, subject, aspect", turso::params![]).await?;
+		let mut out = Vec::new();
+		while let Some(row) = rows.next().await? {
+			let (Value::Text(database), Value::Text(subject), Value::Text(aspect)) = (row.get_value(0)?, row.get_value(1)?, row.get_value(2)?) else {
+				continue;
+			};
+			out.push((database, subject, aspect));
+		}
+		Ok(out)
+	}
 }
 
 #[cfg(test)]
@@ -171,6 +191,28 @@ mod tests {
 		let got = catalog.get("d", "s", "a").await.expect("reads");
 		drop(catalog);
 		assert_eq!(got, Some(AspectSchema::new(PhysicalType::F32, bd("0.01"), TimeUnit::Millis)));
+	}
+
+	#[tokio::test]
+	async fn list_all_enumerates_every_declaration_ordered() {
+		let catalog = AspectCatalog::open_in_memory().await.expect("opens");
+		let f64 = AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds);
+		// Declared out of order across two databases and subjects.
+		catalog.declare("market", "ETHUSD", "price", &f64).await.expect("declares");
+		catalog.declare("iot", "sensor-7", "temp", &f64).await.expect("declares");
+		catalog.declare("market", "BTCUSD", "volume", &f64).await.expect("declares");
+		catalog.declare("market", "BTCUSD", "price", &f64).await.expect("declares");
+		let all = catalog.list_all().await.expect("lists");
+		drop(catalog);
+		assert_eq!(all, vec![("iot".to_string(), "sensor-7".to_string(), "temp".to_string()), ("market".to_string(), "BTCUSD".to_string(), "price".to_string()), ("market".to_string(), "BTCUSD".to_string(), "volume".to_string()), ("market".to_string(), "ETHUSD".to_string(), "price".to_string()),]);
+	}
+
+	#[tokio::test]
+	async fn list_all_is_empty_for_a_fresh_catalog() {
+		let catalog = AspectCatalog::open_in_memory().await.expect("opens");
+		let all = catalog.list_all().await.expect("lists");
+		drop(catalog);
+		assert!(all.is_empty());
 	}
 
 	#[tokio::test]

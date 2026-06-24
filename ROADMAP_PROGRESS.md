@@ -1997,3 +1997,94 @@ vendor-neutral and control-plane only (hard constraint #3). Alternatively, begin
 typed columns — assess the `arrow` dep's vendor-neutrality first.
 
 **PR:** https://github.com/physics515/DSP/pull/23
+
+---
+
+## 2026-06-24 — catalog.db hierarchy + schema-aware SegmentStore (Phase 4.3, 4 increments)
+
+- **Item:** Phase 4.3 (Storage v2 control plane). The prior run (#23) shipped the
+  segment-index control plane, the on-disk `SegmentStore`, and the `AspectCatalog`
+  aspect-schema registry; its named next step was to wire `AspectCatalog` into the
+  store and add the `catalog.db` DB/subject/aspect registry above it. This run did
+  both, then tied the pieces together and rounded out catalog introspection.
+
+**Increment 1 — catalog.db DB/subject registry** (commit `d38fb3e`, `database`)
+- New `database::CatalogStore` (`database/src/types/catalog.rs`): the libSQL
+  registry for the upper two levels of the `catalog.db` hierarchy — `databases`
+  (one row per name) and `subjects` (`(database, subject)`). Registration is
+  idempotent (`INSERT OR IGNORE`); `register_subject` refuses a subject whose
+  database is not registered (no dangling hierarchy); `remove_database` cascades to
+  its subjects. Same MVCC write path as the rest of the control plane
+  (`BEGIN CONCURRENT`, no AUTOINCREMENT). Control-plane metadata only (hard
+  constraint #3). Wired into `types/mod.rs`. Tests: +7.
+
+**Increment 2 — wire AspectCatalog into SegmentStore** (commit `05f76da`, `database`)
+- `SegmentStore` now owns an `AspectCatalog` (`root/aspect_catalog.db`) and a
+  `(database, subject)` scope. `open` keeps its signature (scopes under
+  `default`/`default`); `open_scoped(root, database, subject)` names the namespace.
+  `declare(aspect, schema)` / `schema_for(aspect)` delegate to the catalog;
+  `seal_declared` / `seal_declared_nullable` / `seal_declared_paged` look the
+  declared schema up and seal under it — an undeclared aspect is refused (records
+  nothing), never guessed. Segment files/index rows stay keyed by the flat aspect
+  name (unique within one subject → filename-safe); the catalog carries the full
+  triple so a reopened store recovers its encoding. No silent downcast — the
+  declared schema still drives the seal. Tests: +4 (segment_store 10 → 14).
+
+**Increment 3 — register SegmentStore scope in catalog.db** (commit `f98f650`, `database`)
+- `SegmentStore` also opens `root/catalog.db` (a `CatalogStore`) and registers its
+  own `(database, subject)` on open (idempotent), so the control plane can
+  enumerate what a root holds. `registry()` exposes the `CatalogStore`;
+  `list_declared_aspects()` lists the aspects declared in the store's own scope.
+  The store is now self-describing across the full `catalog.db` hierarchy. Tests:
+  +2 (segment_store 14 → 16).
+
+**Increment 4 — AspectCatalog full-catalog enumeration** (commit `811a568`, `database`)
+- `AspectCatalog::list_all()` → every declared `(database, subject, aspect)` triple,
+  ordered by database/subject/aspect — a flat enumeration of the whole catalog for
+  control-plane introspection or registry recovery (vs `list_aspects`, scoped to one
+  subject). Tests: +2.
+
+**Build/test/clippy (real, nightly `rustc 1.98.0-nightly cb46fbb8c`):**
+- `cargo build --workspace` — GREEN (57s; `dsp-physical-type`, `database`,
+  `dsp-bench`, `dsp-tui`, `database_orchestration` all rebuilt clean after the
+  `database` changes).
+- `SKIP_SLOW_TESTS=1 cargo test -p database --lib` — **58 lib pass**, 0 failed
+  (43 → 58, +15 this run: catalog 7, segment_store +6, aspect_catalog +2).
+  SKIP_SLOW_TESTS set to keep the heavy turso/interpolation integration tests
+  (`tests/db_tests.rs`) out of the night's budget; every new module's tests are
+  self-contained (in-memory libSQL + tempfile, no skip) and all ran.
+- Clippy — **0 warnings** in every touched file (`catalog.rs`, `segment_store.rs`,
+  `aspect_catalog.rs`) under the crate's pedantic+nursery lints; the new
+  turso-DB-holding test bindings follow the established
+  `significant_drop_tightening` pattern (extract results → `drop(store)` → assert),
+  no `#[allow]`. Pre-existing untouched warnings (splimes `sort_by_key`, database
+  `significant Drop` in unrelated batch/database modules) unchanged.
+- `rustfmt` (project `rustfmt.toml`, hard tabs) — clean on every touched file
+  (formatted individually to avoid the pre-existing fmt drift `cargo fmt -p database`
+  would churn in untouched files).
+
+**Done vs open:** DONE — the `catalog.db` DB/subject registry (`CatalogStore`), the
+schema-aware `SegmentStore` (owns `AspectCatalog` + `CatalogStore`, scoped, seals by
+lookup, self-registers), and full-catalog enumeration (`AspectCatalog::list_all`).
+The prior run's two named next steps (wire AspectCatalog into the store; add the
+DB/subject registry above it) are both shipped, plus the wiring that ties them
+together. OPEN (Phase 4 remainder) — the per-aspect `metadata.db` (segment-set
+metadata beside the segment index, the last named layer of the `catalog.db` +
+`metadata.db` + `segments/` + `segment_index.db` layout); **Arrow/Parquet
+interchange** (Phase 4.5, new `arrow` dep — assess vendor-neutrality first); **tag**
+pruning (4.4, blocked on per-measurement tags / B-tags not existing). Still open from
+prior runs: Phase-2 stored range / DB-subject-aspect HTTP API, OpenTelemetry;
+external-engine DuckDB + competitor adapters; the standalone methodology document.
+
+**STOP REASON:** natural-arc — four increments completed the `catalog.db` control-plane
+hierarchy and made the `SegmentStore` schema-aware and self-describing, squarely the
+prior run's named next step, at the top of the 2–4 bar. The remaining Phase-4 concerns
+(per-aspect `metadata.db`; Arrow/Parquet interchange, a new dependency) are fresh
+multi-increment arcs better started on a clean PR.
+
+**Next step (tomorrow):** add the per-aspect `metadata.db` layer (segment-set metadata
+beside `segment_index.db`), or begin **Arrow-compatible array export** (Phase 4.5) from
+a `Segment`/`PagedSegment`'s typed columns — assess the `arrow` dep's vendor-neutrality
+first (it must not couple the core to a vendor; hard constraint #2).
+
+**PR:** https://github.com/physics515/DSP/pull/24
