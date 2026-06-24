@@ -339,9 +339,22 @@ JSON").
   index first then opening **only** the surviving files — `read_time_range`
   (frame-version aware, paged frames skip pages within the file too),
   `read_value_range` (resident-index value pruning), and an `aspect_stats`
-  surfacing the realized north-star bytes/point. Still to do here: the
-  catalog/`metadata.db` registry (the DB/subject/aspect catalog above the
-  segment index); and Arrow/Parquet interchange.)*
+  surfacing the realized north-star bytes/point. **catalog.db hierarchy +
+  schema-aware store landed:** `database::CatalogStore` registers the upper two
+  levels of the `catalog.db` hierarchy — `databases` (one row per name) and
+  `subjects` (`(database, subject)`, refusing a subject whose database is not
+  registered, cascading on `remove_database`); `database::AspectCatalog`
+  (already shipped) carries the per-aspect `AspectSchema`, now with a
+  `list_all` flat enumeration of every declared `(database, subject, aspect)`
+  for introspection/recovery. `SegmentStore` is now **schema-aware**: it owns an
+  `AspectCatalog` + `CatalogStore` and a `(database, subject)` scope
+  (`open_scoped`), registers itself in `catalog.db` on open, and seals by
+  lookup — `declare(aspect, schema)` once, then
+  `seal_declared`/`seal_declared_nullable`/`seal_declared_paged` without
+  re-supplying the schema (an undeclared aspect is refused, not guessed); a
+  reopened store recovers the encoding it sealed under. Still to do here: the
+  per-aspect `metadata.db` (segment-set metadata beside the segment index); and
+  Arrow/Parquet interchange.)*
 - **4.4 Data skipping** (time/value/tag/quality pruning, page skipping).
   *(Started — segment-level pruning on `dsp-physical-type::Segment`:
   `overlaps_time`/`contains_timestamp` and `may_contain_value` (conservative —
