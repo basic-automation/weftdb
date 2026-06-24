@@ -4,6 +4,7 @@ pub use batches::{
 	batched_measurements::{analysis::Analysis, batched_distance::BatchDistance, BatchedMeasurement}, Batch, BatchId, BatchMetatdata, Batches
 };
 pub use cache::{AnalysisResult, Cacheable, Connection, DatabaseCache};
+pub use catalog::CatalogStore;
 pub use compression::{
 	AggressivenessScaling, CompressionConfig, CompressionPhase, CompressionProgress, CompressionResult, CompressionSummary, DetailedCompressionSummary, DirtyRegion, LastCompressionInfo, ProgressCallback, SizeBasedCompressionConfig, TierCompressionResult, TimeBasedCompressionConfig,
 };
@@ -32,6 +33,7 @@ pub mod aspect;
 pub mod aspect_catalog;
 pub mod batches;
 pub mod cache;
+pub mod catalog;
 pub mod compression;
 pub mod correlation;
 pub mod database;
