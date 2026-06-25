@@ -2088,3 +2088,105 @@ a `Segment`/`PagedSegment`'s typed columns — assess the `arrow` dep's vendor-n
 first (it must not couple the core to a vendor; hard constraint #2).
 
 **PR:** https://github.com/physics515/DSP/pull/24
+
+---
+
+## 2026-06-25 — per-aspect metadata.db: build, wire, recover, aggregate (Phase 4.3, 4 increments)
+
+- **Item:** Phase 4.3 (Storage v2 control plane). The prior run (#24) made the
+  `SegmentStore` schema-aware and self-describing across the `catalog.db` hierarchy;
+  its named next step was the per-aspect `metadata.db` — the last unbuilt layer of the
+  `catalog.db` + `metadata.db` + `segments/` + `segment_index.db` layout. This run
+  built that layer end-to-end and rounded it out (recovery + a store-wide aggregate).
+
+**Increment 1 — per-aspect metadata.db store** (commit `c0fa6c6`, `database`)
+- New `database::AspectMetadataStore` (`database/src/types/metadata.rs`): the libSQL
+  `metadata.db` materializing one segment-set rollup row per aspect. `AspectMetadata`
+  carries segment count, total rows, total nulls, total framed bytes, and the
+  aspect-wide min/max timestamp *and* value spans. Two derivations that must agree:
+  `from_index` (authoritative, idempotent — re-derived from a `SegmentIndex`) and
+  `folded` (O(1) incremental — one fresh seal extended in, the `record_seal` path);
+  `bytes_per_point` exposes the north-star cost term. Control-plane only (hard
+  constraint #3); `BigDecimal` bounds round-trip as plain text (hard constraint #4);
+  same MVCC write path (`BEGIN CONCURRENT`, no AUTOINCREMENT). Wired into
+  `types/mod.rs`. Tests: +8.
+
+**Increment 2 — wire metadata.db into SegmentStore** (commit `c2c024d`, `database`)
+- `SegmentStore` now owns an `AspectMetadataStore` (`root/metadata.db`). Every seal
+  (single-block/paged, dense/nullable) folds the fresh descriptor into the aspect's
+  rollup via `record_seal`, right after the index insert, so the rollup stays in
+  lockstep with the segments on disk. New `aspect_metadata(aspect)` reads that rollup
+  as a single O(1) `metadata.db` row — the same aspect-wide summary as `aspect_stats`
+  (which scans the whole resident index), plus the value span the scan does not carry.
+  A `metadata()` accessor exposes the store. Tests: +2 (one asserts the materialized
+  rollup agrees field-for-field with `aspect_stats` across mixed single/paged seals;
+  one that it persists across reopen and folds the next seal forward).
+
+**Increment 3 — authoritative rebuild from the index** (commit `8463d15`, `database`)
+- The recovery path: `SegmentStore::rebuild_aspect_metadata(aspect)` /
+  `rebuild_all_metadata()` recompute the rollup from the durable segment index (the
+  source of truth) via `AspectMetadata::from_index`, so a row that got out of step (a
+  crash between index insert and fold, a re-seal of an id, a lost/stale metadata.db)
+  can always be reconciled. The aspect set comes from the new
+  `SegmentIndexStore::list_aspects()` (SELECT DISTINCT, name order). Tests: +3
+  (list_aspects distinct/ordered/empty; clobber-then-rebuild matches `aspect_stats`;
+  wipe-the-whole-rollup-DB then recover every aspect from the index).
+
+**Increment 4 — store-wide aggregate** (commit `75db39a`, `database`)
+- `SegmentStore::store_stats()` -> `StoreStorageStats`: sums every aspect's rollup
+  into the subject-wide north-star bytes/point plus rolled-up segment/row/null counts
+  and the union of the aspects' time spans — one O(1) read per aspect, no segment file
+  opened. The value span is deliberately omitted (a min/max across aspects of
+  unrelated physical meaning is not a useful number). Exported from `types/mod.rs`.
+  Tests: +1 (two-aspect sum, byte total vs per-aspect rollups, union time span,
+  store-wide bytes/point, empty-store zero case).
+
+**Build/test/clippy (real, nightly toolchain):**
+- `cargo build --workspace` — GREEN after every increment (last full build ~16s
+  incremental; `database`, `dsp-tui`, `database_orchestration` all rebuilt clean —
+  the SegmentStore changes are additive to its public API).
+- `SKIP_SLOW_TESTS=1 cargo test -p database --lib` — **72 lib pass**, 0 failed
+  (58 → 72, +14 this run: metadata 8, segment_store +5, segment_index +1).
+  SKIP_SLOW_TESTS set to keep the heavy turso/interpolation integration tests
+  (`tests/db_tests.rs`) out of the night's budget; every new test is self-contained
+  (in-memory libSQL + tempfile, no skip) and all ran.
+- Clippy — **0 warnings** in every touched file (`metadata.rs`, `segment_store.rs`,
+  `segment_index.rs`, `types/mod.rs`) under the crate's pedantic+nursery lints. Fixed
+  two clippy findings in the new code directly, no `#[allow]`: a `doc_lazy_continuation`
+  (a `+`-led wrapped line in the module doc read as a markdown bullet — reworded) and
+  a `derive_partial_eq_without_eq` on `AspectMetadata` (added `Eq`). Pre-existing
+  untouched warnings (splimes `sort_by_key`; database `significant Drop` in unrelated
+  batch/database modules) unchanged.
+- `rustfmt` — clean on every touched file. NOTE: running `rustfmt` on `types/mod.rs`
+  recurses into the modules it declares and churns the pre-existing fmt drift across
+  the whole crate (the hazard prior runs flagged); reverted that churn and hand-edited
+  `mod.rs`'s few additions in the surrounding style. `metadata.rs` (no `mod`
+  declarations) was formatted in isolation safely.
+
+**Done vs open:** DONE — the per-aspect `metadata.db` layer end-to-end: the
+`AspectMetadataStore`, its wiring into every `SegmentStore` seal, the O(1)
+`aspect_metadata` read, the authoritative `rebuild_*` recovery path, and the
+store-wide `store_stats` aggregate. This completes the `catalog.db` + `metadata.db` +
+`segments/` + `segment_index.db` hierarchy the roadmap layout names — all four layers
+now exist. ROADMAP.md item 4.3's status note updated to record it. OPEN (Phase 4
+remainder) — **Arrow/Parquet interchange** (Phase 4.5, new `arrow` dep — assess
+vendor-neutrality first, hard constraint #2); **tag** pruning (4.4, blocked on
+per-measurement tags / B-tags not existing). Still open from prior runs: Phase-2
+stored range / DB-subject-aspect HTTP API, OpenTelemetry; external-engine DuckDB +
+competitor adapters; the standalone methodology document.
+
+**STOP REASON:** natural-arc — four increments (top of the 2–4 bar) completed the
+per-aspect `metadata.db` layer, the prior run's named next step, and finished the
+four-layer `catalog.db` hierarchy. The next Phase-4 concern (Arrow/Parquet
+interchange) is a fresh multi-increment arc that pulls in a new dependency needing a
+vendor-neutrality assessment — squarely the kind of arc prior runs deferred to a clean
+PR rather than half-build onto this one.
+
+**Next step (tomorrow):** begin **Arrow-compatible array export** (Phase 4.5) from a
+`Segment`/`PagedSegment`'s typed columns. FIRST assess the `arrow` crate's
+vendor-neutrality (it must not couple the core to a vendor; hard constraint #2) — if
+acceptable, scope the first slice to a zero-copy-ish export of one column type to an
+Arrow array with a round-trip test, then build out. Alternatively, pick up the
+Phase-2 stored-range / DB-subject-aspect HTTP API on `dsp-server` (no new core dep).
+
+**PR:** (filled in after creation)
