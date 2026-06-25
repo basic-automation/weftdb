@@ -18,6 +18,7 @@ pub use event::{Event, EventID, EventName, Events, Manifestation, ManifestationI
 pub use input_measurement::InputMeasurement;
 pub use measurement::{Measurement, MeasurementId};
 pub use measurement_vector::MeasurementVector;
+pub use metadata::{AspectMetadata, AspectMetadataStore};
 pub use occurrence::Occurrence;
 pub use pattern::{Pattern, PatternID};
 pub use pipeline::{DetectorMetadata, DetectorType, PipelineConfig, PipelineState};
@@ -44,6 +45,7 @@ pub mod event;
 pub mod input_measurement;
 pub mod measurement;
 pub mod measurement_vector;
+pub mod metadata;
 pub mod occurrence;
 pub mod pattern;
 pub mod pipeline;
