@@ -352,8 +352,21 @@ JSON").
   lookup — `declare(aspect, schema)` once, then
   `seal_declared`/`seal_declared_nullable`/`seal_declared_paged` without
   re-supplying the schema (an undeclared aspect is refused, not guessed); a
-  reopened store recovers the encoding it sealed under. Still to do here: the
-  per-aspect `metadata.db` (segment-set metadata beside the segment index); and
+  reopened store recovers the encoding it sealed under. **Per-aspect
+  `metadata.db` landed** (the last unbuilt layer of the `catalog.db` +
+  `metadata.db` + `segments/` + `segment_index.db` layout):
+  `database::AspectMetadataStore` materializes one segment-set rollup row per
+  aspect (`AspectMetadata` — segment/row/null counts, total framed bytes, and
+  the aspect-wide min/max ts *and* value spans), so the aspect-wide summary
+  `SegmentStore::aspect_stats` computes by scanning the whole resident index is
+  now an O(1) `metadata.db` read (`SegmentStore::aspect_metadata`). The rollup is
+  folded forward one descriptor per seal (`record_seal`) but always
+  re-derivable from the durable segment index (`AspectMetadata::from_index`):
+  `SegmentStore::rebuild_aspect_metadata` / `rebuild_all_metadata` reconcile a
+  diverged or lost rollup against the index (the source of truth), enumerated via
+  the new `SegmentIndexStore::list_aspects`. `SegmentStore::store_stats` sums the
+  rollups into the subject-wide north-star bytes/point (`StoreStorageStats`),
+  control-plane only and without opening a segment. Still to do here:
   Arrow/Parquet interchange.)*
 - **4.4 Data skipping** (time/value/tag/quality pruning, page skipping).
   *(Started — segment-level pruning on `dsp-physical-type::Segment`:
