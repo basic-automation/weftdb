@@ -436,6 +436,47 @@ impl SegmentStore {
 	pub async fn aspect_metadata(&self, aspect: &str) -> Result<AspectMetadata> {
 		Ok(self.metadata.get(aspect).await?.unwrap_or_default())
 	}
+
+	/// Re-derive `aspect`'s materialized `metadata.db` rollup from the durable segment
+	/// index and write it back, returning the reconciled rollup — the **authoritative**
+	/// recovery path.
+	///
+	/// Where each seal folds one descriptor forward (O(1), but assumes it never sees the
+	/// same segment twice), this recomputes the rollup from scratch via
+	/// [`AspectMetadata::from_index`] over the whole index, so it is correct regardless
+	/// of how the row got out of step (a crash between the index insert and the rollup
+	/// fold, a re-seal of an id, a metadata.db restored from an older snapshot). The
+	/// segment index is the source of truth; this makes the rollup match it.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read or write failure.
+	pub async fn rebuild_aspect_metadata(&self, aspect: &str) -> Result<AspectMetadata> {
+		let index = self.index.load_index(aspect).await?;
+		let meta = AspectMetadata::from_index(&index);
+		self.metadata.put(aspect, &meta).await?;
+		Ok(meta)
+	}
+
+	/// Re-derive **every** aspect's rollup from the durable segment index, returning the
+	/// number of aspects reconciled. Rebuilds the whole `metadata.db` from the index —
+	/// the recovery path for a lost or stale rollup DB beside an intact index.
+	///
+	/// The aspect set comes from the index itself
+	/// ([`SegmentIndexStore::list_aspects`]), so it reconciles exactly the aspects that
+	/// have segments.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read or write failure.
+	pub async fn rebuild_all_metadata(&self) -> Result<usize> {
+		let aspects = self.index.list_aspects().await?;
+		let count = aspects.len();
+		for aspect in aspects {
+			self.rebuild_aspect_metadata(&aspect).await?;
+		}
+		Ok(count)
+	}
 }
 
 /// Realized storage accounting for one aspect's sealed segments, surfaced by
@@ -792,6 +833,54 @@ mod tests {
 		assert_eq!(meta.total_rows, 11);
 		assert_eq!(meta.value_range, Some((bd("0"), bd("105"))));
 		assert_eq!(empty, AspectMetadata::default());
+	}
+
+	#[tokio::test]
+	async fn rebuild_reconciles_a_diverged_rollup() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		// Seal three segments, then corrupt the rollup directly behind the store's back.
+		for base in [0_i64, 100, 200] {
+			let ts: Vec<i64> = (0..5).map(|i| base + i * 10).collect();
+			let vs: Vec<BigDecimal> = (0..5).map(|i| BigDecimal::from(base + i)).collect();
+			store.seal("a", &schema(), &ts, &vs).await.expect("seals");
+		}
+		// Force a wrong rollup, then remove another aspect's row entirely.
+		store.metadata().put("a", &AspectMetadata { segment_count: 99, total_rows: 1, total_nulls: 7, total_bytes: 3, time_range: Some((-5, -1)), value_range: Some((bd("-9"), bd("-8"))) }).await.expect("clobbers");
+		let diverged = store.aspect_metadata("a").await.expect("metadata");
+		// Rebuilding from the durable index restores the truth.
+		let reconciled = store.rebuild_aspect_metadata("a").await.expect("rebuilds");
+		let stats = store.aspect_stats("a").await.expect("stats");
+		drop(store);
+		assert_eq!(diverged.segment_count, 99, "the rollup was clobbered");
+		assert_eq!(reconciled.segment_count, 3);
+		assert_eq!(reconciled.total_rows, stats.total_rows);
+		assert_eq!(reconciled.total_bytes, stats.total_bytes);
+		assert_eq!(reconciled.time_range, Some((0, 240)));
+		assert_eq!(reconciled.value_range, Some((bd("0"), bd("204"))));
+	}
+
+	#[tokio::test]
+	async fn rebuild_all_recovers_every_aspect_from_the_index() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.seal("temp", &schema(), &[0_i64, 10], &[bd("1"), bd("2")]).await.expect("seals");
+		store.seal("humidity", &schema(), &[0_i64, 10, 20], &[bd("5"), bd("6"), bd("7")]).await.expect("seals");
+		// Wipe the whole rollup DB, as if metadata.db were lost beside an intact index.
+		store.metadata().remove("temp").await.expect("removes");
+		store.metadata().remove("humidity").await.expect("removes");
+		let before = store.metadata().list_aspects().await.expect("lists");
+		let rebuilt = store.rebuild_all_metadata().await.expect("rebuilds");
+		let after = store.metadata().list_aspects().await.expect("lists");
+		let temp = store.aspect_metadata("temp").await.expect("metadata");
+		let humidity = store.aspect_metadata("humidity").await.expect("metadata");
+		drop(store);
+		assert!(before.is_empty(), "the rollup DB was wiped");
+		assert_eq!(rebuilt, 2, "both aspects reconciled from the index");
+		assert_eq!(after, vec!["humidity".to_string(), "temp".to_string()]);
+		assert_eq!(temp.total_rows, 2);
+		assert_eq!(humidity.total_rows, 3);
+		assert_eq!(humidity.value_range, Some((bd("5"), bd("7"))));
 	}
 
 	#[tokio::test]
