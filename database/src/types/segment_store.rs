@@ -33,7 +33,7 @@ use anyhow::{Context, Result};
 use bigdecimal::BigDecimal;
 use dsp_physical_type::{AspectSchema, PagedSegment, Segment, SegmentDescriptor, PAGED_SEGMENT_FORMAT_VERSION};
 
-use crate::{AspectCatalog, CatalogStore, SegmentIndexStore};
+use crate::{AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, SegmentIndexStore};
 
 /// The `(database, subject)` namespace a [`SegmentStore`] opened with the plain
 /// [`open`](SegmentStore::open) constructor declares its aspect schemas under.
@@ -53,6 +53,10 @@ pub struct SegmentStore {
 	root: PathBuf,
 	/// The libSQL segment index (`root/segment_index.db`).
 	index: SegmentIndexStore,
+	/// The libSQL per-aspect segment-set rollup (`root/metadata.db`) — one
+	/// materialized [`AspectMetadata`] row per aspect, folded forward on every seal,
+	/// so the aspect-wide summary is an O(1) read rather than a full index scan.
+	metadata: AspectMetadataStore,
 	/// The libSQL aspect-schema catalog (`root/aspect_catalog.db`) — the declared
 	/// [`AspectSchema`] for each aspect, so a seal need not be handed the schema.
 	catalog: AspectCatalog,
@@ -102,6 +106,8 @@ impl SegmentStore {
 		tokio::fs::create_dir_all(&segments_dir).await.with_context(|| format!("creating segments dir {}", segments_dir.display()))?;
 		let index_path = root.join("segment_index.db");
 		let index = SegmentIndexStore::open(&index_path.to_string_lossy()).await?;
+		let metadata_path = root.join("metadata.db");
+		let metadata = AspectMetadataStore::open(&metadata_path.to_string_lossy()).await?;
 		let catalog_path = root.join("aspect_catalog.db");
 		let catalog = AspectCatalog::open(&catalog_path.to_string_lossy()).await?;
 		let registry_path = root.join("catalog.db");
@@ -110,7 +116,7 @@ impl SegmentStore {
 		// the databases/subjects a root holds (idempotent).
 		registry.register_database(database).await?;
 		registry.register_subject(database, subject).await?;
-		Ok(Self { root, index, catalog, registry, database: database.to_string(), subject: subject.to_string() })
+		Ok(Self { root, index, metadata, catalog, registry, database: database.to_string(), subject: subject.to_string() })
 	}
 
 	/// The control-plane index backing this store, for pruning/accounting queries
@@ -125,6 +131,14 @@ impl SegmentStore {
 	#[must_use]
 	pub const fn catalog(&self) -> &AspectCatalog {
 		&self.catalog
+	}
+
+	/// The per-aspect segment-set rollup store backing this store, for the materialized
+	/// aspect-wide summary ([`get`](AspectMetadataStore::get),
+	/// [`list_aspects`](AspectMetadataStore::list_aspects)).
+	#[must_use]
+	pub const fn metadata(&self) -> &AspectMetadataStore {
+		&self.metadata
 	}
 
 	/// The DB/subject registry backing this store, for enumerating the databases and
@@ -278,6 +292,7 @@ impl SegmentStore {
 		tokio::fs::write(&path, &bytes).await.with_context(|| format!("writing segment {}", path.display()))?;
 		let descriptor = SegmentDescriptor::of_segment(id, path.to_string_lossy().into_owned(), bytes.len() as u64, segment);
 		self.index.insert(aspect, &descriptor).await?;
+		self.metadata.record_seal(aspect, &descriptor).await?;
 		Ok(descriptor)
 	}
 
@@ -290,6 +305,7 @@ impl SegmentStore {
 		tokio::fs::write(&path, &bytes).await.with_context(|| format!("writing segment {}", path.display()))?;
 		let descriptor = SegmentDescriptor::of_paged_segment(id, path.to_string_lossy().into_owned(), bytes.len() as u64, segment);
 		self.index.insert(aspect, &descriptor).await?;
+		self.metadata.record_seal(aspect, &descriptor).await?;
 		Ok(descriptor)
 	}
 
@@ -405,6 +421,20 @@ impl SegmentStore {
 	pub async fn aspect_stats(&self, aspect: &str) -> Result<AspectStorageStats> {
 		let index = self.index.load_index(aspect).await?;
 		Ok(AspectStorageStats { segment_count: index.len(), total_rows: index.total_rows(), total_bytes: index.total_bytes(), bytes_per_point: index.bytes_per_point(), time_range: index.time_range() })
+	}
+
+	/// The **materialized** segment-set rollup for `aspect` — the same aspect-wide
+	/// summary as [`aspect_stats`](SegmentStore::aspect_stats), but read as a single
+	/// `metadata.db` row (O(1)) rather than scanning the whole segment index. An aspect
+	/// with no sealed segments yields the empty rollup
+	/// ([`AspectMetadata::default`]). The rollup also carries the aspect-wide value
+	/// span, which the per-segment-scan stats do not.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure.
+	pub async fn aspect_metadata(&self, aspect: &str) -> Result<AspectMetadata> {
+		Ok(self.metadata.get(aspect).await?.unwrap_or_default())
 	}
 }
 
@@ -736,5 +766,51 @@ mod tests {
 		assert_eq!(empty.total_rows, 0);
 		assert_eq!(empty.time_range, None);
 		assert!((empty.bytes_per_point - 0.0).abs() < f64::EPSILON);
+	}
+
+	#[tokio::test]
+	async fn aspect_metadata_matches_aspect_stats() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		// A single-block and a paged segment over disjoint windows.
+		store.seal("a", &schema(), &[0_i64, 10, 20, 30, 40], &(0..5).map(BigDecimal::from).collect::<Vec<_>>()).await.expect("seals single");
+		let pts: Vec<i64> = (0..6).map(|i| 100 + i * 10).collect();
+		let pvs: Vec<BigDecimal> = (0..6).map(|i| BigDecimal::from(100 + i)).collect();
+		store.seal_paged("a", &schema(), &pts, &pvs, 2).await.expect("seals paged");
+		let stats = store.aspect_stats("a").await.expect("stats");
+		let meta = store.aspect_metadata("a").await.expect("metadata");
+		// An aspect with no segments yields the empty rollup.
+		let empty = store.aspect_metadata("none").await.expect("metadata");
+		drop(store);
+		// The materialized rollup agrees with the scan-derived stats on every shared field.
+		assert_eq!(meta.segment_count, stats.segment_count);
+		assert_eq!(meta.total_rows, stats.total_rows);
+		assert_eq!(meta.total_bytes, stats.total_bytes);
+		assert_eq!(meta.time_range, stats.time_range);
+		assert!((meta.bytes_per_point() - stats.bytes_per_point).abs() < f64::EPSILON);
+		// And it additionally carries the aspect-wide value span.
+		assert_eq!(meta.total_rows, 11);
+		assert_eq!(meta.value_range, Some((bd("0"), bd("105"))));
+		assert_eq!(empty, AspectMetadata::default());
+	}
+
+	#[tokio::test]
+	async fn aspect_metadata_survives_reopen() {
+		let dir = TempDir::new().expect("tempdir");
+		let first = SegmentStore::open(dir.path()).await.expect("opens");
+		first.seal("a", &schema(), &[0_i64, 10], &[bd("1"), bd("2")]).await.expect("seals");
+		let recorded = first.aspect_metadata("a").await.expect("metadata");
+		drop(first);
+		// A reopened store reads the persisted rollup, then folds the next seal forward.
+		let reopened = SegmentStore::open(dir.path()).await.expect("reopens");
+		let before = reopened.aspect_metadata("a").await.expect("metadata");
+		reopened.seal("a", &schema(), &[20_i64, 30], &[bd("3"), bd("4")]).await.expect("seals");
+		let after = reopened.aspect_metadata("a").await.expect("metadata");
+		drop(reopened);
+		assert_eq!(before, recorded, "the rollup persists across reopen");
+		assert_eq!(after.segment_count, 2);
+		assert_eq!(after.total_rows, 4);
+		assert_eq!(after.time_range, Some((0, 30)));
+		assert_eq!(after.value_range, Some((bd("1"), bd("4"))));
 	}
 }
