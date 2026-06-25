@@ -477,6 +477,73 @@ impl SegmentStore {
 		}
 		Ok(count)
 	}
+
+	/// Aggregate every aspect's materialized rollup into one **store-wide** summary —
+	/// the subject-wide north-star **bytes/point** (priority #1 in the commercial
+	/// thesis) across all of this store's aspects, plus the rolled-up segment/row/null
+	/// counts and the union of the aspects' time spans.
+	///
+	/// Built from the per-aspect `metadata.db` rows (one O(1) read per aspect), so it
+	/// never opens a segment file or scans the segment index. The value span is
+	/// deliberately omitted — a min/max across aspects of unrelated physical meaning
+	/// would not be a useful number.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure.
+	pub async fn store_stats(&self) -> Result<StoreStorageStats> {
+		let aspects = self.metadata.list_aspects().await?;
+		let mut stats = StoreStorageStats { aspect_count: aspects.len(), ..StoreStorageStats::default() };
+		for aspect in &aspects {
+			let meta = self.metadata.get(aspect).await?.unwrap_or_default();
+			stats.segment_count += meta.segment_count;
+			stats.total_rows += meta.total_rows;
+			stats.total_nulls += meta.total_nulls;
+			stats.total_bytes += meta.total_bytes;
+			if let Some((lo, hi)) = meta.time_range {
+				stats.time_range = Some(match stats.time_range {
+					Some((slo, shi)) => (slo.min(lo), shi.max(hi)),
+					None => (lo, hi),
+				});
+			}
+		}
+		Ok(stats)
+	}
+}
+
+/// A store-wide aggregate over every aspect's materialized rollup, surfaced by
+/// [`SegmentStore::store_stats`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoreStorageStats {
+	/// Number of aspects with a materialized rollup in this store.
+	pub aspect_count: usize,
+	/// Total sealed segments across every aspect.
+	pub segment_count: usize,
+	/// Total rows (present and null) across every aspect.
+	pub total_rows: u64,
+	/// Total null rows across every aspect.
+	pub total_nulls: u64,
+	/// Total realized on-disk bytes across every aspect's `.dspseg` frames.
+	pub total_bytes: u64,
+	/// The inclusive `(min, max)` timestamp span the union of all aspects covers, or
+	/// [`None`] when the store holds no non-empty segment.
+	pub time_range: Option<(i64, i64)>,
+}
+
+impl StoreStorageStats {
+	/// The store-wide cost term: total framed bytes over total rows across every aspect.
+	/// Zero when the store holds no rows.
+	#[must_use]
+	pub fn bytes_per_point(&self) -> f64 {
+		if self.total_rows == 0 {
+			return 0.0;
+		}
+		#[allow(clippy::cast_precision_loss)]
+		let n = self.total_rows as f64;
+		#[allow(clippy::cast_precision_loss)]
+		let total = self.total_bytes as f64;
+		total / n
+	}
 }
 
 /// Realized storage accounting for one aspect's sealed segments, surfaced by
@@ -833,6 +900,37 @@ mod tests {
 		assert_eq!(meta.total_rows, 11);
 		assert_eq!(meta.value_range, Some((bd("0"), bd("105"))));
 		assert_eq!(empty, AspectMetadata::default());
+	}
+
+	#[tokio::test]
+	async fn store_stats_aggregate_every_aspect() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		// Aspect "temp": 2 rows over [0,10]; aspect "humidity": 3 rows over [100,120].
+		store.seal("temp", &schema(), &[0_i64, 10], &[bd("1"), bd("2")]).await.expect("seals");
+		store.seal("humidity", &schema(), &[100_i64, 110, 120], &[bd("5"), bd("6"), bd("7")]).await.expect("seals");
+		let stats = store.store_stats().await.expect("store stats");
+		// The per-aspect rollups it sums.
+		let temp = store.aspect_metadata("temp").await.expect("metadata");
+		let humidity = store.aspect_metadata("humidity").await.expect("metadata");
+		// An empty store aggregates to zeroes.
+		let empty_dir = TempDir::new().expect("tempdir");
+		let empty_store = SegmentStore::open(empty_dir.path()).await.expect("opens");
+		let empty = empty_store.store_stats().await.expect("store stats");
+		drop(store);
+		drop(empty_store);
+		assert_eq!(stats.aspect_count, 2);
+		assert_eq!(stats.segment_count, 2);
+		assert_eq!(stats.total_rows, 5);
+		assert_eq!(stats.total_bytes, temp.total_bytes + humidity.total_bytes);
+		// The time span is the union across aspects.
+		assert_eq!(stats.time_range, Some((0, 120)));
+		#[allow(clippy::cast_precision_loss)]
+		let expected_bpp = stats.total_bytes as f64 / 5.0;
+		assert!((stats.bytes_per_point() - expected_bpp).abs() < f64::EPSILON);
+		// Empty store.
+		assert_eq!(empty, StoreStorageStats::default());
+		assert!((empty.bytes_per_point() - 0.0).abs() < f64::EPSILON);
 	}
 
 	#[tokio::test]
