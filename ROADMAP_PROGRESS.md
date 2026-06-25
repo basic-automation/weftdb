@@ -2189,4 +2189,4 @@ acceptable, scope the first slice to a zero-copy-ish export of one column type t
 Arrow array with a round-trip test, then build out. Alternatively, pick up the
 Phase-2 stored-range / DB-subject-aspect HTTP API on `dsp-server` (no new core dep).
 
-**PR:** (filled in after creation)
+**PR:** https://github.com/physics515/DSP/pull/25
