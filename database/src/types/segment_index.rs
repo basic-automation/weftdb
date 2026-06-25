@@ -193,6 +193,25 @@ impl SegmentIndexStore {
 		Ok(index)
 	}
 
+	/// Every aspect with at least one indexed segment, in name order — the
+	/// authoritative list of what the index actually holds (e.g. for rebuilding the
+	/// per-aspect `metadata.db` rollups from the durable index).
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure.
+	pub async fn list_aspects(&self) -> Result<Vec<String>> {
+		let conn = self.db.connect()?;
+		let mut rows = conn.query("SELECT DISTINCT aspect FROM segment_index ORDER BY aspect", turso::params![]).await?;
+		let mut out = Vec::new();
+		while let Some(row) = rows.next().await? {
+			if let Value::Text(s) = row.get_value(0)? {
+				out.push(s);
+			}
+		}
+		Ok(out)
+	}
+
 	/// Number of segments indexed under `aspect`.
 	///
 	/// # Errors
@@ -410,6 +429,24 @@ mod tests {
 		drop(store);
 		assert_eq!(count, 1);
 		assert!(pruned.is_empty());
+	}
+
+	#[tokio::test]
+	async fn list_aspects_enumerates_distinct_aspects_in_order() {
+		let store = SegmentIndexStore::open_in_memory().await.expect("opens");
+		let (seg, len) = sealed(0);
+		// Two aspects, one with multiple segments — list_aspects deduplicates.
+		store.insert("temp", &SegmentDescriptor::of_segment(0, "t0.dspseg", len, &seg)).await.expect("inserts");
+		store.insert("temp", &SegmentDescriptor::of_segment(1, "t1.dspseg", len, &seg)).await.expect("inserts");
+		store.insert("humidity", &SegmentDescriptor::of_segment(0, "h0.dspseg", len, &seg)).await.expect("inserts");
+		let aspects = store.list_aspects().await.expect("lists");
+		// An empty index lists nothing.
+		let empty = SegmentIndexStore::open_in_memory().await.expect("opens");
+		let none = empty.list_aspects().await.expect("lists");
+		drop(store);
+		drop(empty);
+		assert_eq!(aspects, vec!["humidity".to_string(), "temp".to_string()]);
+		assert!(none.is_empty());
 	}
 
 	#[tokio::test]
