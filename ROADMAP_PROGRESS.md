@@ -2190,3 +2190,124 @@ Arrow array with a round-trip test, then build out. Alternatively, pick up the
 Phase-2 stored-range / DB-subject-aspect HTTP API on `dsp-server` (no new core dep).
 
 **PR:** https://github.com/physics515/DSP/pull/25
+
+---
+
+## 2026-06-26 — Arrow interchange for typed columnar segments (Phase 4.5, 4 increments)
+
+- **Item:** Phase 4.5 (*Arrow-compatible arrays — eases Python/Flight/DataFusion/
+  Parquet*; Phase 4.3 also names *Arrow-compatible memory internally*). The prior
+  run (#25) finished the `catalog.db` + `metadata.db` + `segments/` +
+  `segment_index.db` hierarchy and named Arrow export as the next step, FIRST
+  assessing the `arrow` dependency's vendor-neutrality. This run did that
+  assessment and built the interchange.
+
+**Vendor-neutrality verdict (recorded, since it gated the work):** Apache Arrow is
+an **open, vendor-neutral in-memory interchange standard** (Apache Software
+Foundation), not a vendor product and not a storage backend. Converting a segment
+to a `RecordBatch` is interchange, not storage — it does **not** make Arrow the
+measurement store (hard constraint #3 untouched: `.dspseg` still owns the hot
+path) and introduces **no** vendor-specific connector into the core (hard
+constraint #2 untouched). The roadmap itself names "Parquet import/export from day
+one" and "Arrow-compatible arrays/memory" as explicit goals. To keep the sizeable
+`arrow-*` dependency tree out of the lean hot-path crates, the conversion lives in
+a **new leaf crate `dsp-arrow`** that depends on `dsp-physical-type` and never the
+reverse — the heavy dep never reaches `splimes`/`database`/`dsp-physical-type`.
+
+**Increment 1 — crate scaffold + lossless text RecordBatch** (commit `802eb97`)
+- New `dsp-arrow` crate, wired into the root workspace (member +
+  `arrow-array`/`arrow-schema` 59 workspace deps). `segment_to_record_batch`
+  emits a two-column batch — non-null `timestamp: Int64` + nullable `value: Utf8`
+  (each present value's plain decimal text, Arrow validity for null rows), with
+  the segment's `TimeUnit`/physical-encoding/value-form/version in the
+  self-describing schema metadata. `record_batch_to_columns` /
+  `segment_from_record_batch` invert it. Decimal text is the always-exact form, so
+  no value loses a digit crossing into Arrow (hard constraint #4). `ConvertError`
+  reports missing/wrong-typed columns, missing/unknown time-unit metadata, and
+  unparseable cells. Tests: 8 (incl. 60-digit lossless survival + 3 error paths).
+
+**Increment 2 — typed Float64/Float32 fast path** (commit `38d66ec`)
+- `segment_to_record_batch_typed` emits the natural fixed-width Arrow array when
+  the physical encoding has one: `F64 -> Float64`, `F32 -> Float32` (the SIMD/GPU
+  layout DataFusion/pandas/Flight expect; half the bytes of text for F32). The
+  numeric path is exact, not a second downcast — an F64 segment already stores
+  f64, so `to_f64` reproduces the stored bits. Other encodings fall back to the
+  lossless text column. `record_batch_to_columns` now dispatches on the value
+  column's actual Arrow type, so either export form round-trips. Refactored the
+  shared assembly into `build_record_batch`. Tests: +4 (12 total).
+
+**Increment 3 — PagedSegment interchange** (commit `2c6f286`)
+- `paged_segment_to_record_batches` emits one lossless batch per page (the
+  Arrow-idiomatic stream, preserving the Phase-4.4 page-skipping structure);
+  `paged_segment_to_record_batch` collapses to a single batch;
+  `record_batches_to_columns` + `paged_segment_from_record_batches` invert them
+  (re-partitioning into pages of a caller-given `rows_per_page`). Errors on an
+  empty batch slice (no metadata to recover the unit). Tests: +3 (15 total).
+
+**Increment 4 — exact Decimal128 fast path** (commit `6192f35`)
+- The fixed-scale `ScaledI64{scale}` / `ScaledI128{scale}` encodings now emit an
+  **exact** Arrow `Decimal128(38, scale)` value column — a proper typed numeric
+  column with zero float rounding (each value's mantissa at its scale is an exact
+  integer). `record_batch_to_columns` reconstructs `mantissa * 10^(-scale)`
+  exactly. The per-value-scale `Decimal128` and variable-width `BigDecimalText`
+  still fall back to text (one Arrow Decimal128 column needs one shared scale);
+  `try_decimal128_array` also falls back if any value overflows i128/precision, so
+  the export is never wrong. Completes the typed numeric story across float and
+  fixed-point encodings. Tests: +3 (18 total).
+
+**Build/test/clippy (real, nightly toolchain `rustc 1.98.0-nightly`):**
+- `cargo build --workspace` — GREEN after every increment (baseline cold build
+  2m08s; arrow sub-crates added ~9s one-time, incrementals 1-3s). New crate only;
+  the rest of the workspace is unaffected (additive change).
+- `SKIP_SLOW_TESTS=1 cargo test --workspace --lib` — per-crate: database **72**,
+  database_orchestration **17**, **dsp-arrow 18** (this run, 0 -> 18),
+  dsp-bench **87**, dsp-line-protocol **11**, dsp-physical-type **152**,
+  dsp-server **5**, dsp-tui **7**, splimes **23** — all pass, 0 failed.
+  SKIP_SLOW_TESTS set to keep the heavy turso/interpolation integration suites
+  (`tests/*.rs`) out of the night's budget; the touched crate (`dsp-arrow`) has no
+  slow-gated tests, so all 18 ran.
+- splimes NOTE (honesty): the 4 GPU interpolation lib tests (linear/quadratic/
+  cubic/polynomial) FAIL when the default test harness runs them **in parallel**
+  (GPU-device contention) but PASS individually and PASS as a set under
+  `--test-threads=1` (23/23). This is a pre-existing test-harness concurrency
+  artifact, **not** a regression from this run — `dsp-arrow` is a brand-new leaf
+  crate that splimes does not depend on and cannot affect. Counted splimes as
+  23/23 on the serial run.
+- Clippy — **0 warnings** in `dsp-arrow` under the crate's pedantic+nursery lints
+  across all four increments. Fixed several findings in the new code directly, no
+  `#[allow]`: `from_iter_instead_of_collect`, `missing_panics_doc` (added Panics
+  sections for the documented-impossible `RecordBatch::try_new`), `doc_markdown`
+  (`DataFusion` backticks x2), `similar_names` (`all_ts`/`all_vs` ->
+  `timestamps`/`values`), `too_long_first_doc_paragraph`. Pre-existing untouched
+  warnings elsewhere unchanged.
+- `rustfmt` — clean on `dsp-arrow/src/lib.rs` every increment (single-file crate,
+  no cross-module `mod` declarations, so formatting it in isolation is safe — the
+  whole-crate-churn hazard prior runs flagged does not apply here).
+
+**Done vs open:** DONE — the Arrow interchange for `Segment` and `PagedSegment`:
+the lossless text round trip, the typed Float64/Float32/Decimal128 fast paths (with
+text fallback), and the per-page + collapsed paged exports, all reversible. ROADMAP
+item 4.5 status note updated to record it. OPEN (Phase 4 remainder) — **Parquet**
+import/export (a heavier `parquet` dep — assess before adding); a **`database`-side
+glue** that reads a stored aspect time-range straight into a `RecordBatch` (kept
+OUTSIDE the core to preserve the dep boundary — needs a home crate that depends on
+both `database` and `dsp-arrow`, e.g. `dsp-server`/`dsp-bench`); **tag** pruning
+(4.4, blocked on per-measurement tags / B-tags not existing). Still open from prior
+runs: Phase-2 stored range / DB-subject-aspect HTTP API, OpenTelemetry;
+external-engine DuckDB + competitor adapters; the standalone methodology document.
+
+**STOP REASON:** natural-arc — four increments (top of the 2-4 bar) delivered the
+complete typed Arrow interchange story for both segment shapes, the prior run's
+named next step (after its gating vendor-neutrality assessment). A fifth increment
+(the `database` -> `RecordBatch` glue, or Parquet) either pulls the heavy dep into
+the core crate (the boundary I deliberately preserved) or pulls in a fresh heavy
+dependency — both are clean-PR arcs, not half-builds onto this one.
+
+**Next step (tomorrow):** either (a) add the `database` -> Arrow glue in a consumer
+crate (`dsp-server` or `dsp-bench`, which may take the `dsp-arrow` dep) so a stored
+aspect range exports to a `RecordBatch` without arrow touching the core; or (b)
+begin Parquet import/export from a `RecordBatch` (assess the `parquet` crate's
+weight/licensing first — it pulls compression codecs); or (c) pick up the Phase-2
+stored-range / DB-subject-aspect HTTP API on `dsp-server` (no new core dep).
+
+**PR:** _(opened below)_
