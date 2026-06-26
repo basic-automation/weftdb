@@ -58,7 +58,7 @@ use std::{collections::HashMap, sync::Arc};
 use arrow_array::{Array, ArrayRef, Float32Array, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
-use dsp_physical_type::{PhysicalType, Segment, SegmentError, TimeUnit};
+use dsp_physical_type::{Page, PagedSegment, PhysicalType, Segment, SegmentError, TimeUnit};
 
 /// Name of the timestamp column in an exported [`RecordBatch`].
 pub const TIMESTAMP_COLUMN: &str = "timestamp";
@@ -200,28 +200,35 @@ pub fn segment_to_record_batch_typed(seg: &Segment) -> RecordBatch {
 	}
 }
 
-/// Assemble the two-column batch from a prepared value array, recording the
-/// self-describing schema metadata. Shared by the text and typed export paths.
+/// Assemble the two-column batch from a prepared value array, reading the
+/// self-describing schema metadata off a [`Segment`]. Shared by the text and typed
+/// segment-export paths.
+fn assemble_batch(seg: &Segment, timestamps: &[i64], val_array: ArrayRef, value_encoding: &str) -> RecordBatch {
+	build_record_batch(seg.time_unit(), seg.physical_type().name(), seg.version, timestamps, val_array, value_encoding)
+}
+
+/// Assemble the two-column batch from explicit metadata fields and a prepared
+/// value array — the shared core under both the [`Segment`] and [`Page`] export
+/// paths.
 ///
 /// # Panics
 ///
-/// Never in practice: the timestamp and value arrays are both built from the
-/// segment's single row count, so the internal [`RecordBatch::try_new`] cannot see
-/// a column-length mismatch. A panic here would mean a bug in this crate, not bad
-/// input.
-fn assemble_batch(seg: &Segment, timestamps: &[i64], val_array: ArrayRef, value_encoding: &str) -> RecordBatch {
+/// Never in practice: the timestamp and value arrays are both built from the same
+/// row count, so the internal [`RecordBatch::try_new`] cannot see a column-length
+/// mismatch. A panic here would mean a bug in this crate, not bad input.
+fn build_record_batch(unit: TimeUnit, physical_type_name: &str, version: u16, timestamps: &[i64], val_array: ArrayRef, value_encoding: &str) -> RecordBatch {
 	let ts_array = Int64Array::from_iter_values(timestamps.iter().copied());
 	let value_type = val_array.data_type().clone();
 
 	let mut metadata = HashMap::new();
-	metadata.insert(META_TIME_UNIT.to_string(), seg.time_unit().name().to_string());
-	metadata.insert(META_PHYSICAL_TYPE.to_string(), seg.physical_type().name().to_string());
+	metadata.insert(META_TIME_UNIT.to_string(), unit.name().to_string());
+	metadata.insert(META_PHYSICAL_TYPE.to_string(), physical_type_name.to_string());
 	metadata.insert(META_VALUE_ENCODING.to_string(), value_encoding.to_string());
-	metadata.insert(META_FORMAT_VERSION.to_string(), seg.version.to_string());
+	metadata.insert(META_FORMAT_VERSION.to_string(), version.to_string());
 
 	let schema = Schema::new_with_metadata(vec![Field::new(TIMESTAMP_COLUMN, DataType::Int64, false), Field::new(VALUE_COLUMN, value_type, true)], metadata);
 
-	RecordBatch::try_new(Arc::new(schema), vec![Arc::new(ts_array), val_array]).expect("timestamp and value columns share the segment row count")
+	RecordBatch::try_new(Arc::new(schema), vec![Arc::new(ts_array), val_array]).expect("timestamp and value columns share the row count")
 }
 
 /// Read an exported [`RecordBatch`] back into DSP's logical columns.
@@ -286,10 +293,99 @@ pub fn record_batch_to_columns(batch: &RecordBatch) -> Result<(Vec<i64>, Vec<Opt
 /// unrecognized, a column is malformed (see [`record_batch_to_columns`]), or the
 /// reconstructed columns cannot form a segment.
 pub fn segment_from_record_batch(batch: &RecordBatch, value_tolerance: &BigDecimal) -> Result<Segment, ConvertError> {
-	let unit_name = batch.schema_ref().metadata().get(META_TIME_UNIT).ok_or(ConvertError::MissingMetadata(META_TIME_UNIT))?.clone();
-	let unit = time_unit_from_name(&unit_name).ok_or(ConvertError::UnknownTimeUnit(unit_name))?;
+	let unit = unit_from_metadata(batch)?;
 	let (timestamps, values) = record_batch_to_columns(batch)?;
 	Ok(Segment::build_nullable(&timestamps, &values, unit, value_tolerance)?)
+}
+
+/// Read and validate the [`TimeUnit`] recorded in a batch's schema metadata.
+fn unit_from_metadata(batch: &RecordBatch) -> Result<TimeUnit, ConvertError> {
+	let unit_name = batch.schema_ref().metadata().get(META_TIME_UNIT).ok_or(ConvertError::MissingMetadata(META_TIME_UNIT))?;
+	time_unit_from_name(unit_name).ok_or_else(|| ConvertError::UnknownTimeUnit(unit_name.clone()))
+}
+
+/// Export a [`PagedSegment`] as a **stream of Arrow [`RecordBatch`]es, one per
+/// page** — the Arrow-idiomatic representation of a paged column.
+///
+/// Each page becomes one lossless two-column batch (`timestamp: Int64`,
+/// `value: Utf8`) carrying the page's own [`TimeUnit`] and physical-encoding name
+/// in its schema metadata. Preserving the page boundary keeps the Phase-4.4
+/// page-skipping structure visible to a consumer: it can prune a page on its
+/// stats and never materialize the others. An empty paged segment (no pages)
+/// yields an empty vector.
+///
+/// To collapse the whole segment into a single batch instead, use
+/// [`paged_segment_to_record_batch`].
+#[must_use]
+pub fn paged_segment_to_record_batches(seg: &PagedSegment) -> Vec<RecordBatch> {
+	seg.pages.iter().map(|page| page_to_record_batch(page, seg.version)).collect()
+}
+
+/// Export a [`PagedSegment`] as a **single** lossless Arrow [`RecordBatch`],
+/// collapsing every page into one two-column batch.
+///
+/// Convenient when a consumer wants the whole aspect at once and does not need the
+/// page boundaries (e.g. a one-shot `pyarrow` hand-off). Page-level pruning is lost
+/// in this form; use [`paged_segment_to_record_batches`] to keep it. The segment's
+/// shared [`TimeUnit`] is taken from its first page; an empty segment produces an
+/// empty `seconds`-unit batch.
+#[must_use]
+pub fn paged_segment_to_record_batch(seg: &PagedSegment) -> RecordBatch {
+	let (timestamps, values) = seg.decode_nullable();
+	let unit = seg.pages.first().map_or(TimeUnit::Seconds, |p| p.timestamps.unit);
+	let physical_type_name = seg.pages.first().map_or(PhysicalType::BigDecimalText.name(), |p| p.values.physical_type.name());
+	let val_array: ArrayRef = Arc::new(values.iter().map(|opt| opt.as_ref().map(BigDecimal::to_plain_string)).collect::<StringArray>());
+	build_record_batch(unit, physical_type_name, seg.version, &timestamps, val_array, VALUE_ENCODING_TEXT)
+}
+
+/// Build a lossless per-page batch from a [`Page`] and the owning segment's
+/// format version.
+fn page_to_record_batch(page: &Page, version: u16) -> RecordBatch {
+	let (timestamps, values) = page.decode_nullable();
+	let val_array: ArrayRef = Arc::new(values.iter().map(|opt| opt.as_ref().map(BigDecimal::to_plain_string)).collect::<StringArray>());
+	build_record_batch(page.timestamps.unit, page.values.physical_type.name(), version, &timestamps, val_array, VALUE_ENCODING_TEXT)
+}
+
+/// Concatenate a stream of exported [`RecordBatch`]es back into one pair of DSP
+/// logical columns, in order.
+///
+/// The inverse of [`paged_segment_to_record_batches`] at the column level: each
+/// batch is read with [`record_batch_to_columns`] and appended. Batches may mix
+/// the text and typed value forms (the per-batch dispatch handles each).
+///
+/// # Errors
+///
+/// Propagates any [`ConvertError`] from reading an individual batch.
+pub fn record_batches_to_columns(batches: &[RecordBatch]) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>), ConvertError> {
+	let mut timestamps = Vec::new();
+	let mut values = Vec::new();
+	for batch in batches {
+		let (ts, vs) = record_batch_to_columns(batch)?;
+		timestamps.extend(ts);
+		values.extend(vs);
+	}
+	Ok((timestamps, values))
+}
+
+/// Rebuild a [`PagedSegment`] from a stream of exported per-page [`RecordBatch`]es.
+///
+/// Recovers the shared [`TimeUnit`] from the first batch's metadata, concatenates
+/// the pages' columns via [`record_batches_to_columns`], and re-partitions them
+/// into pages of `rows_per_page` under `value_tolerance`. The page boundaries of
+/// the result depend on `rows_per_page`, not on how the input batches were chunked
+/// — so this round-trips [`paged_segment_to_record_batches`] when given the
+/// original segment's [`rows_per_page`](PagedSegment::rows_per_page).
+///
+/// # Errors
+///
+/// Returns [`ConvertError::MissingMetadata`] if `batches` is empty (no batch to
+/// read the [`TimeUnit`] from — build an empty segment directly instead), or any
+/// error from reading a batch or rebuilding the segment.
+pub fn paged_segment_from_record_batches(batches: &[RecordBatch], value_tolerance: &BigDecimal, rows_per_page: usize) -> Result<PagedSegment, ConvertError> {
+	let first = batches.first().ok_or(ConvertError::MissingMetadata(META_TIME_UNIT))?;
+	let unit = unit_from_metadata(first)?;
+	let (timestamps, values) = record_batches_to_columns(batches)?;
+	Ok(PagedSegment::build_nullable(&timestamps, &values, unit, value_tolerance, rows_per_page)?)
 }
 
 #[cfg(test)]
@@ -468,5 +564,54 @@ mod tests {
 		let back = segment_from_record_batch(&batch, &bd("0")).expect("rebuilds");
 		assert!(back.is_exact());
 		assert_eq!(back.decode_values(), values);
+	}
+
+	#[test]
+	fn paged_segment_exports_one_batch_per_page_and_round_trips() {
+		// 10 rows in pages of 4 ⇒ 3 pages (4 + 4 + 2).
+		let timestamps: Vec<i64> = (0..10).map(|i| 1_000 + i * 10).collect();
+		let values: Vec<BigDecimal> = (0..10).map(BigDecimal::from).collect();
+		let paged = PagedSegment::build(&timestamps, &values, TimeUnit::Micros, &bd("0"), 4).expect("builds");
+		assert_eq!(paged.page_count(), 3);
+
+		let batches = paged_segment_to_record_batches(&paged);
+		assert_eq!(batches.len(), 3);
+		assert_eq!(batches[0].num_rows(), 4);
+		assert_eq!(batches[2].num_rows(), 2);
+		// Each batch carries the shared time unit in its metadata.
+		assert_eq!(batches[1].schema_ref().metadata().get(META_TIME_UNIT).map(String::as_str), Some("micros"));
+
+		// Concatenating the page batches recovers the full columns in order.
+		let (ts, vs) = record_batches_to_columns(&batches).expect("reads back");
+		assert_eq!(ts, timestamps);
+		assert_eq!(vs, values.iter().cloned().map(Some).collect::<Vec<_>>());
+
+		// Rebuilding with the original page height reproduces the paged segment.
+		let rebuilt = paged_segment_from_record_batches(&batches, &bd("0"), 4).expect("rebuilds");
+		assert_eq!(rebuilt.page_count(), 3);
+		assert_eq!(rebuilt.decode_nullable(), paged.decode_nullable());
+	}
+
+	#[test]
+	fn paged_segment_collapses_to_a_single_batch() {
+		let timestamps: Vec<i64> = (0..7).collect();
+		let values = ncol(&[Some("1.0"), None, Some("3.0"), Some("4.0"), None, Some("6.0"), Some("7.0")]);
+		let paged = PagedSegment::build_nullable(&timestamps, &values, TimeUnit::Seconds, &bd("0"), 3).expect("builds");
+		assert_eq!(paged.page_count(), 3);
+
+		let batch = paged_segment_to_record_batch(&paged);
+		assert_eq!(batch.num_rows(), 7);
+		let (ts, vs) = record_batch_to_columns(&batch).expect("reads back");
+		assert_eq!(ts, timestamps);
+		assert_eq!(vs, values);
+	}
+
+	#[test]
+	fn empty_paged_segment_yields_no_batches() {
+		let paged = PagedSegment::build(&[], &[], TimeUnit::Seconds, &bd("0"), 4).expect("builds");
+		assert_eq!(paged.page_count(), 0);
+		assert!(paged_segment_to_record_batches(&paged).is_empty());
+		// Rebuilding from no batches cannot recover the unit, so it is an error.
+		assert_eq!(paged_segment_from_record_batches(&[], &bd("0"), 4), Err(ConvertError::MissingMetadata(META_TIME_UNIT)));
 	}
 }
