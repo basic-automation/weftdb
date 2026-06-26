@@ -55,10 +55,10 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{Array, ArrayRef, Float32Array, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use bigdecimal::BigDecimal;
-use dsp_physical_type::{Segment, SegmentError, TimeUnit};
+use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
+use dsp_physical_type::{PhysicalType, Segment, SegmentError, TimeUnit};
 
 /// Name of the timestamp column in an exported [`RecordBatch`].
 pub const TIMESTAMP_COLUMN: &str = "timestamp";
@@ -76,8 +76,16 @@ pub const META_VALUE_ENCODING: &str = "dsp:value_encoding";
 /// Schema-metadata key carrying the segment's format version.
 pub const META_FORMAT_VERSION: &str = "dsp:format_version";
 
-/// The value-column wire form this slice produces: lossless plain decimal text.
+/// Value-column wire form: lossless plain decimal text (Arrow `Utf8`). The
+/// fallback for any encoding without a natural fixed-width Arrow array, and the
+/// always-exact form.
 pub const VALUE_ENCODING_TEXT: &str = "text";
+/// Value-column wire form: IEEE-754 binary64 (Arrow `Float64`) — the typed fast
+/// path for an [`PhysicalType::F64`](dsp_physical_type::PhysicalType::F64) segment.
+pub const VALUE_ENCODING_F64: &str = "f64";
+/// Value-column wire form: IEEE-754 binary32 (Arrow `Float32`) — the typed fast
+/// path for an [`PhysicalType::F32`](dsp_physical_type::PhysicalType::F32) segment.
+pub const VALUE_ENCODING_F32: &str = "f32";
 
 /// Why a [`RecordBatch`] could not be converted back into DSP columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,21 +163,65 @@ fn time_unit_from_name(name: &str) -> Option<TimeUnit> {
 #[must_use]
 pub fn segment_to_record_batch(seg: &Segment) -> RecordBatch {
 	let (timestamps, values) = seg.decode_nullable();
+	let val_array: ArrayRef = Arc::new(values.iter().map(|opt| opt.as_ref().map(BigDecimal::to_plain_string)).collect::<StringArray>());
+	assemble_batch(seg, &timestamps, val_array, VALUE_ENCODING_TEXT)
+}
+
+/// Convert a sealed [`Segment`] into an Arrow [`RecordBatch`] using the **typed
+/// numeric fast path** when the segment's physical encoding has a natural
+/// fixed-width Arrow array.
+///
+/// An [`F64`](PhysicalType::F64) segment emits an Arrow `Float64` value column and
+/// an [`F32`](PhysicalType::F32) segment an Arrow `Float32` column — the layout
+/// SIMD/GPU consumers (`DataFusion`, `pandas`, Flight) expect, half the bytes of
+/// decimal text for F32. Every other encoding (the scaled-integer / decimal /
+/// text types, whose faithful Arrow form is a uniform-scale `Decimal128` a later
+/// slice will add) falls back to the lossless [`segment_to_record_batch`] text
+/// column, so the export is always correct, just not always the narrowest.
+///
+/// The schema metadata records which form was chosen
+/// ([`META_VALUE_ENCODING`] = `f64` / `f32` / `text`) so
+/// [`record_batch_to_columns`] reads it back without guessing. The numeric path is
+/// exact: an F64 segment already *stores* its values as `f64`, so emitting them as
+/// Arrow `Float64` reproduces the stored bits — no second downcast.
+#[must_use]
+pub fn segment_to_record_batch_typed(seg: &Segment) -> RecordBatch {
+	let (timestamps, values) = seg.decode_nullable();
+	match seg.physical_type() {
+		PhysicalType::F64 => {
+			let val_array: ArrayRef = Arc::new(values.iter().map(|opt| opt.as_ref().and_then(BigDecimal::to_f64)).collect::<Float64Array>());
+			assemble_batch(seg, &timestamps, val_array, VALUE_ENCODING_F64)
+		}
+		PhysicalType::F32 => {
+			let val_array: ArrayRef = Arc::new(values.iter().map(|opt| opt.as_ref().and_then(BigDecimal::to_f32)).collect::<Float32Array>());
+			assemble_batch(seg, &timestamps, val_array, VALUE_ENCODING_F32)
+		}
+		_ => segment_to_record_batch(seg),
+	}
+}
+
+/// Assemble the two-column batch from a prepared value array, recording the
+/// self-describing schema metadata. Shared by the text and typed export paths.
+///
+/// # Panics
+///
+/// Never in practice: the timestamp and value arrays are both built from the
+/// segment's single row count, so the internal [`RecordBatch::try_new`] cannot see
+/// a column-length mismatch. A panic here would mean a bug in this crate, not bad
+/// input.
+fn assemble_batch(seg: &Segment, timestamps: &[i64], val_array: ArrayRef, value_encoding: &str) -> RecordBatch {
 	let ts_array = Int64Array::from_iter_values(timestamps.iter().copied());
-	let val_array: StringArray = values.iter().map(|opt| opt.as_ref().map(BigDecimal::to_plain_string)).collect();
+	let value_type = val_array.data_type().clone();
 
 	let mut metadata = HashMap::new();
 	metadata.insert(META_TIME_UNIT.to_string(), seg.time_unit().name().to_string());
 	metadata.insert(META_PHYSICAL_TYPE.to_string(), seg.physical_type().name().to_string());
-	metadata.insert(META_VALUE_ENCODING.to_string(), VALUE_ENCODING_TEXT.to_string());
+	metadata.insert(META_VALUE_ENCODING.to_string(), value_encoding.to_string());
 	metadata.insert(META_FORMAT_VERSION.to_string(), seg.version.to_string());
 
-	let schema = Schema::new_with_metadata(vec![Field::new(TIMESTAMP_COLUMN, DataType::Int64, false), Field::new(VALUE_COLUMN, DataType::Utf8, true)], metadata);
+	let schema = Schema::new_with_metadata(vec![Field::new(TIMESTAMP_COLUMN, DataType::Int64, false), Field::new(VALUE_COLUMN, value_type, true)], metadata);
 
-	// Both columns are built from the same row count, so the only way `try_new`
-	// can fail is a programming error in this function — surface it as a panic
-	// rather than threading an impossible error through the signature.
-	RecordBatch::try_new(Arc::new(schema), vec![Arc::new(ts_array), Arc::new(val_array)]).expect("timestamp and value columns share the segment row count")
+	RecordBatch::try_new(Arc::new(schema), vec![Arc::new(ts_array), val_array]).expect("timestamp and value columns share the segment row count")
 }
 
 /// Read an exported [`RecordBatch`] back into DSP's logical columns.
@@ -178,27 +230,45 @@ pub fn segment_to_record_batch(seg: &Segment) -> RecordBatch {
 /// [`None`] at every Arrow-null (absent) row — the inverse shape of
 /// [`Segment::decode_nullable`].
 ///
+/// Handles both export forms: a `Utf8` value column ([`segment_to_record_batch`])
+/// is parsed from decimal text, a `Float64` / `Float32` column
+/// ([`segment_to_record_batch_typed`]) is lifted back to `BigDecimal`. Dispatch is
+/// on the column's actual Arrow type, so a batch produced by either path round
+/// trips.
+///
 /// # Errors
 ///
-/// Returns a [`ConvertError`] if a required column is missing or has the wrong
-/// Arrow type, or if a value cell does not parse as a `BigDecimal`.
+/// Returns a [`ConvertError`] if a required column is missing, the value column is
+/// an Arrow type this crate does not emit, or a text cell does not parse as a
+/// `BigDecimal`.
 pub fn record_batch_to_columns(batch: &RecordBatch) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>), ConvertError> {
 	let ts_col = batch.column_by_name(TIMESTAMP_COLUMN).ok_or(ConvertError::MissingColumn(TIMESTAMP_COLUMN))?;
 	let ts_array = ts_col.as_any().downcast_ref::<Int64Array>().ok_or(ConvertError::WrongType { column: TIMESTAMP_COLUMN, expected: "Int64" })?;
-	let val_col = batch.column_by_name(VALUE_COLUMN).ok_or(ConvertError::MissingColumn(VALUE_COLUMN))?;
-	let val_array = val_col.as_any().downcast_ref::<StringArray>().ok_or(ConvertError::WrongType { column: VALUE_COLUMN, expected: "Utf8" })?;
-
 	let timestamps: Vec<i64> = ts_array.values().to_vec();
-	let mut values = Vec::with_capacity(val_array.len());
-	for cell in val_array {
-		match cell {
-			Some(text) => {
-				let parsed = text.parse::<BigDecimal>().map_err(|_| ConvertError::BadValue(text.to_string()))?;
-				values.push(Some(parsed));
+
+	let val_col = batch.column_by_name(VALUE_COLUMN).ok_or(ConvertError::MissingColumn(VALUE_COLUMN))?;
+	let values = match val_col.data_type() {
+		DataType::Utf8 => {
+			let val_array = val_col.as_any().downcast_ref::<StringArray>().ok_or(ConvertError::WrongType { column: VALUE_COLUMN, expected: "Utf8" })?;
+			let mut out = Vec::with_capacity(val_array.len());
+			for cell in val_array {
+				match cell {
+					Some(text) => out.push(Some(text.parse::<BigDecimal>().map_err(|_| ConvertError::BadValue(text.to_string()))?)),
+					None => out.push(None),
+				}
 			}
-			None => values.push(None),
+			out
 		}
-	}
+		DataType::Float64 => {
+			let val_array = val_col.as_any().downcast_ref::<Float64Array>().ok_or(ConvertError::WrongType { column: VALUE_COLUMN, expected: "Float64" })?;
+			val_array.iter().map(|cell| cell.and_then(BigDecimal::from_f64)).collect()
+		}
+		DataType::Float32 => {
+			let val_array = val_col.as_any().downcast_ref::<Float32Array>().ok_or(ConvertError::WrongType { column: VALUE_COLUMN, expected: "Float32" })?;
+			val_array.iter().map(|cell| cell.and_then(BigDecimal::from_f32)).collect()
+		}
+		_ => return Err(ConvertError::WrongType { column: VALUE_COLUMN, expected: "Utf8, Float64, or Float32" }),
+	};
 	Ok((timestamps, values))
 }
 
@@ -225,6 +295,8 @@ pub fn segment_from_record_batch(batch: &RecordBatch, value_tolerance: &BigDecim
 #[cfg(test)]
 mod tests {
 	use std::str::FromStr;
+
+	use dsp_physical_type::AspectSchema;
 
 	use super::*;
 
@@ -330,5 +402,71 @@ mod tests {
 		let schema = Schema::new(vec![Field::new(TIMESTAMP_COLUMN, DataType::Int64, false), Field::new(VALUE_COLUMN, DataType::Utf8, true)]);
 		let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(ts), Arc::new(vals)]).expect("constructs");
 		assert_eq!(record_batch_to_columns(&batch), Err(ConvertError::BadValue("not-a-number".to_string())));
+	}
+
+	#[test]
+	fn f64_segment_uses_arrow_float64_and_round_trips() {
+		// Values exact in binary64, sealed under a declared F64 encoding.
+		let timestamps = vec![1_i64, 2, 3, 4];
+		let values = col(&["0.5", "2.25", "-0.25", "128"]);
+		let seg = AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds).seal(&timestamps, &values).expect("seals");
+		assert_eq!(seg.physical_type(), PhysicalType::F64);
+
+		let batch = segment_to_record_batch_typed(&seg);
+		// The value column is a real Arrow Float64, not text.
+		assert_eq!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), &DataType::Float64);
+		assert_eq!(batch.schema_ref().metadata().get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_F64));
+
+		let (ts, vs) = record_batch_to_columns(&batch).expect("reads back");
+		assert_eq!(ts, timestamps);
+		assert_eq!(vs, values.into_iter().map(Some).collect::<Vec<_>>());
+	}
+
+	#[test]
+	fn f32_segment_uses_arrow_float32_and_round_trips() {
+		let timestamps = vec![10_i64, 20, 30];
+		let values = col(&["0.5", "0.25", "-4"]);
+		let seg = AspectSchema::new(PhysicalType::F32, bd("0"), TimeUnit::Millis).seal(&timestamps, &values).expect("seals");
+		assert_eq!(seg.physical_type(), PhysicalType::F32);
+
+		let batch = segment_to_record_batch_typed(&seg);
+		assert_eq!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), &DataType::Float32);
+		assert_eq!(batch.schema_ref().metadata().get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_F32));
+
+		let back = segment_from_record_batch(&batch, &bd("0")).expect("rebuilds");
+		assert_eq!(back.decode(), (timestamps, values));
+	}
+
+	#[test]
+	fn typed_export_preserves_nulls_in_the_float_column() {
+		let timestamps = vec![1_i64, 2, 3, 4, 5];
+		let values = ncol(&[Some("0.5"), None, Some("2.25"), None, Some("-8")]);
+		let seg = AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds).seal_nullable(&timestamps, &values).expect("seals");
+
+		let batch = segment_to_record_batch_typed(&seg);
+		let val_array = batch.column_by_name(VALUE_COLUMN).unwrap().as_any().downcast_ref::<Float64Array>().unwrap();
+		assert_eq!(val_array.null_count(), 2);
+		assert!(val_array.is_null(1) && val_array.is_null(3));
+
+		let (ts, vs) = record_batch_to_columns(&batch).expect("reads back");
+		assert_eq!(ts, timestamps);
+		assert_eq!(vs, values);
+	}
+
+	#[test]
+	fn typed_export_falls_back_to_text_for_non_float_encodings() {
+		// A 60-digit value can only be held losslessly by the text encoding, so the
+		// typed path must fall back to Utf8 rather than downcast it to a float.
+		let timestamps = vec![1_i64, 2];
+		let values = col(&["123456789012345678901234567890.123456789012345678901234567890", "1"]);
+		let seg = Segment::build(&timestamps, &values, TimeUnit::Nanos, &bd("0")).expect("builds");
+		assert_eq!(seg.physical_type(), PhysicalType::BigDecimalText);
+
+		let batch = segment_to_record_batch_typed(&seg);
+		assert_eq!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), &DataType::Utf8);
+		assert_eq!(batch.schema_ref().metadata().get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_TEXT));
+		let back = segment_from_record_batch(&batch, &bd("0")).expect("rebuilds");
+		assert!(back.is_exact());
+		assert_eq!(back.decode_values(), values);
 	}
 }
