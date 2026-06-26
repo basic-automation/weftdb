@@ -2310,4 +2310,4 @@ begin Parquet import/export from a `RecordBatch` (assess the `parquet` crate's
 weight/licensing first — it pulls compression codecs); or (c) pick up the Phase-2
 stored-range / DB-subject-aspect HTTP API on `dsp-server` (no new core dep).
 
-**PR:** _(opened below)_
+**PR:** https://github.com/physics515/DSP/pull/26
