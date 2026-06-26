@@ -55,9 +55,9 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use arrow_array::{Array, ArrayRef, Float32Array, Float64Array, Int64Array, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema};
-use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
+use arrow_array::{Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow_schema::{DataType, Field, Schema, DECIMAL128_MAX_PRECISION};
+use bigdecimal::{num_bigint::BigInt, BigDecimal, FromPrimitive, ToPrimitive};
 use dsp_physical_type::{Page, PagedSegment, PhysicalType, Segment, SegmentError, TimeUnit};
 
 /// Name of the timestamp column in an exported [`RecordBatch`].
@@ -86,6 +86,12 @@ pub const VALUE_ENCODING_F64: &str = "f64";
 /// Value-column wire form: IEEE-754 binary32 (Arrow `Float32`) — the typed fast
 /// path for an [`PhysicalType::F32`](dsp_physical_type::PhysicalType::F32) segment.
 pub const VALUE_ENCODING_F32: &str = "f32";
+/// Value-column wire form: fixed-scale Arrow `Decimal128`.
+///
+/// The typed, **exact** fast path for the fixed-scale
+/// [`ScaledI64`](dsp_physical_type::PhysicalType::ScaledI64) /
+/// [`ScaledI128`](dsp_physical_type::PhysicalType::ScaledI128) encodings.
+pub const VALUE_ENCODING_DECIMAL128: &str = "decimal128";
 
 /// Why a [`RecordBatch`] could not be converted back into DSP columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,10 +180,15 @@ pub fn segment_to_record_batch(seg: &Segment) -> RecordBatch {
 /// An [`F64`](PhysicalType::F64) segment emits an Arrow `Float64` value column and
 /// an [`F32`](PhysicalType::F32) segment an Arrow `Float32` column — the layout
 /// SIMD/GPU consumers (`DataFusion`, `pandas`, Flight) expect, half the bytes of
-/// decimal text for F32. Every other encoding (the scaled-integer / decimal /
-/// text types, whose faithful Arrow form is a uniform-scale `Decimal128` a later
-/// slice will add) falls back to the lossless [`segment_to_record_batch`] text
-/// column, so the export is always correct, just not always the narrowest.
+/// decimal text for F32. The fixed-scale
+/// [`ScaledI64`](PhysicalType::ScaledI64) / [`ScaledI128`](PhysicalType::ScaledI128)
+/// encodings emit an **exact** Arrow `Decimal128` column at the encoding's scale —
+/// no float rounding at all. The per-value-scale
+/// [`Decimal128`](PhysicalType::Decimal128) and the variable-width
+/// [`BigDecimalText`](PhysicalType::BigDecimalText) fall back to the lossless
+/// [`segment_to_record_batch`] text column (a single Arrow `Decimal128` column
+/// needs one shared scale, which the per-value encoding does not have), so the
+/// export is always correct, just not always the narrowest.
 ///
 /// The schema metadata records which form was chosen
 /// ([`META_VALUE_ENCODING`] = `f64` / `f32` / `text`) so
@@ -196,8 +207,33 @@ pub fn segment_to_record_batch_typed(seg: &Segment) -> RecordBatch {
 			let val_array: ArrayRef = Arc::new(values.iter().map(|opt| opt.as_ref().and_then(BigDecimal::to_f32)).collect::<Float32Array>());
 			assemble_batch(seg, &timestamps, val_array, VALUE_ENCODING_F32)
 		}
+		PhysicalType::ScaledI64 { scale } | PhysicalType::ScaledI128 { scale } => {
+			// Exact: every value carries at most `scale` fractional digits, so its
+			// mantissa at that scale is an exact integer. If any value somehow
+			// overflows `i128` or the Arrow precision bound, fall back to text rather
+			// than emit a wrong number.
+			try_decimal128_array(&values, scale).map_or_else(|| segment_to_record_batch(seg), |val_array| assemble_batch(seg, &timestamps, val_array, VALUE_ENCODING_DECIMAL128))
+		}
 		_ => segment_to_record_batch(seg),
 	}
+}
+
+/// Build an exact Arrow `Decimal128` array for a fixed-scale value column, or
+/// [`None`] if any present value cannot be represented exactly at that scale
+/// within `i128` and the Arrow precision bound (signalling the caller to fall back
+/// to the lossless text form).
+fn try_decimal128_array(values: &[Option<BigDecimal>], scale: u8) -> Option<ArrayRef> {
+	let scale_i64 = i64::from(scale);
+	let mut mantissas: Vec<Option<i128>> = Vec::with_capacity(values.len());
+	for opt in values {
+		match opt {
+			Some(bd) => mantissas.push(Some(bd.clone().with_scale(scale_i64).into_bigint_and_exponent().0.to_i128()?)),
+			None => mantissas.push(None),
+		}
+	}
+	let scale_i8 = i8::try_from(scale).ok()?;
+	let array = Decimal128Array::from(mantissas).with_precision_and_scale(DECIMAL128_MAX_PRECISION, scale_i8).ok()?;
+	Some(Arc::new(array))
 }
 
 /// Assemble the two-column batch from a prepared value array, reading the
@@ -274,7 +310,14 @@ pub fn record_batch_to_columns(batch: &RecordBatch) -> Result<(Vec<i64>, Vec<Opt
 			let val_array = val_col.as_any().downcast_ref::<Float32Array>().ok_or(ConvertError::WrongType { column: VALUE_COLUMN, expected: "Float32" })?;
 			val_array.iter().map(|cell| cell.and_then(BigDecimal::from_f32)).collect()
 		}
-		_ => return Err(ConvertError::WrongType { column: VALUE_COLUMN, expected: "Utf8, Float64, or Float32" }),
+		DataType::Decimal128(_precision, scale) => {
+			let val_array = val_col.as_any().downcast_ref::<Decimal128Array>().ok_or(ConvertError::WrongType { column: VALUE_COLUMN, expected: "Decimal128" })?;
+			let scale_i64 = i64::from(*scale);
+			// Exact inverse of the export: mantissa * 10^(-scale) reconstructs the
+			// BigDecimal with no loss.
+			val_array.iter().map(|cell| cell.map(|mantissa| BigDecimal::new(BigInt::from(mantissa), scale_i64))).collect()
+		}
+		_ => return Err(ConvertError::WrongType { column: VALUE_COLUMN, expected: "Utf8, Float64, Float32, or Decimal128" }),
 	};
 	Ok((timestamps, values))
 }
@@ -564,6 +607,58 @@ mod tests {
 		let back = segment_from_record_batch(&batch, &bd("0")).expect("rebuilds");
 		assert!(back.is_exact());
 		assert_eq!(back.decode_values(), values);
+	}
+
+	#[test]
+	fn scaled_i64_segment_uses_arrow_decimal128_exactly() {
+		// Two-decimal-place values, sealed under a declared ScaledI64{scale:2}.
+		let timestamps = vec![1_i64, 2, 3, 4];
+		let values = col(&["12.34", "0.05", "-7.50", "1000.00"]);
+		let seg = AspectSchema::new(PhysicalType::ScaledI64 { scale: 2 }, bd("0"), TimeUnit::Seconds).seal(&timestamps, &values).expect("seals");
+		assert_eq!(seg.physical_type(), PhysicalType::ScaledI64 { scale: 2 });
+
+		let batch = segment_to_record_batch_typed(&seg);
+		// The value column is an exact Arrow Decimal128 at scale 2.
+		assert_eq!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), &DataType::Decimal128(DECIMAL128_MAX_PRECISION, 2));
+		assert_eq!(batch.schema_ref().metadata().get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_DECIMAL128));
+
+		let (ts, vs) = record_batch_to_columns(&batch).expect("reads back");
+		assert_eq!(ts, timestamps);
+		// Values reconstruct exactly — no float rounding.
+		let got: Vec<BigDecimal> = vs.into_iter().map(|o| o.expect("present")).collect();
+		for (g, e) in got.iter().zip(values.iter()) {
+			assert_eq!(g, e, "decimal128 round trip is exact");
+		}
+	}
+
+	#[test]
+	fn scaled_i128_segment_round_trips_through_decimal128() {
+		// A value beyond i64 once shifted, exact at scale 2 → ScaledI128.
+		let big = "92233720368547758080.00"; // ~ (i64::MAX) * 10, two decimals
+		let timestamps = vec![1_i64, 2];
+		let values = col(&[big, "0.25"]);
+		let seg = AspectSchema::new(PhysicalType::ScaledI128 { scale: 2 }, bd("0"), TimeUnit::Micros).seal(&timestamps, &values).expect("seals");
+		assert_eq!(seg.physical_type(), PhysicalType::ScaledI128 { scale: 2 });
+
+		let batch = segment_to_record_batch_typed(&seg);
+		assert!(matches!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), DataType::Decimal128(_, 2)));
+		let back = segment_from_record_batch(&batch, &bd("0")).expect("rebuilds");
+		assert!(back.is_exact());
+		assert_eq!(back.decode_values(), values);
+	}
+
+	#[test]
+	fn decimal128_path_preserves_nulls() {
+		let timestamps = vec![1_i64, 2, 3];
+		let values = ncol(&[Some("1.25"), None, Some("9.99")]);
+		let seg = AspectSchema::new(PhysicalType::ScaledI64 { scale: 2 }, bd("0"), TimeUnit::Seconds).seal_nullable(&timestamps, &values).expect("seals");
+
+		let batch = segment_to_record_batch_typed(&seg);
+		let val_array = batch.column_by_name(VALUE_COLUMN).unwrap().as_any().downcast_ref::<Decimal128Array>().unwrap();
+		assert_eq!(val_array.null_count(), 1);
+		assert!(val_array.is_null(1));
+		let (_ts, vs) = record_batch_to_columns(&batch).expect("reads back");
+		assert_eq!(vs, values);
 	}
 
 	#[test]
