@@ -210,8 +210,39 @@ pub fn segment_to_record_batch(seg: &Segment) -> RecordBatch {
 #[must_use]
 pub fn columns_to_record_batch(unit: TimeUnit, timestamps: &[i64], values: &[Option<BigDecimal>]) -> RecordBatch {
 	assert_eq!(timestamps.len(), values.len(), "timestamp and value columns must share a row count");
-	let val_array: ArrayRef = Arc::new(values.iter().map(|opt| opt.as_ref().map(BigDecimal::to_plain_string)).collect::<StringArray>());
-	build_record_batch(unit, PhysicalType::BigDecimalText.name(), LOGICAL_EXPORT_VERSION, timestamps, val_array, VALUE_ENCODING_TEXT)
+	let (val_array, value_encoding) = text_value_array(values);
+	build_record_batch(unit, PhysicalType::BigDecimalText.name(), LOGICAL_EXPORT_VERSION, timestamps, val_array, value_encoding)
+}
+
+/// Build a self-describing Arrow [`RecordBatch`] from DSP's logical columns using
+/// the **typed numeric fast path** for a given physical encoding.
+///
+/// The column-level counterpart of [`segment_to_record_batch_typed`].
+/// Where [`columns_to_record_batch`] always emits the lossless decimal-text value
+/// column, this emits the natural fixed-width Arrow array for `physical_type` when
+/// one exists: [`F64`](PhysicalType::F64) → `Float64`, [`F32`](PhysicalType::F32) →
+/// `Float32`, and the fixed-scale [`ScaledI64`](PhysicalType::ScaledI64) /
+/// [`ScaledI128`](PhysicalType::ScaledI128) → an **exact** `Decimal128`. Any other
+/// encoding (and any fixed-scale value that overflows the Arrow precision bound)
+/// falls back to the lossless text column, so the export is always correct.
+///
+/// This is the form a typed stored-range read uses: an aspect declares **one**
+/// physical encoding for all its segments
+/// ([`AspectSchema::value`](dsp_physical_type::AspectSchema)), so the whole logical
+/// range shares it and a single typed Arrow column is well-defined. The numeric
+/// path is exact, not a second downcast — values stored under `F64` already *are*
+/// `f64`. [`record_batch_to_columns`] reads either form back by dispatching on the
+/// value column's Arrow type.
+///
+/// # Panics
+///
+/// Panics if `timestamps` and `values` differ in length (see
+/// [`columns_to_record_batch`]).
+#[must_use]
+pub fn columns_to_record_batch_typed(unit: TimeUnit, physical_type: PhysicalType, timestamps: &[i64], values: &[Option<BigDecimal>]) -> RecordBatch {
+	assert_eq!(timestamps.len(), values.len(), "timestamp and value columns must share a row count");
+	let (val_array, value_encoding) = typed_value_array(physical_type, values);
+	build_record_batch(unit, physical_type.name(), LOGICAL_EXPORT_VERSION, timestamps, val_array, value_encoding)
 }
 
 /// Convert a sealed [`Segment`] into an Arrow [`RecordBatch`] using the **typed
@@ -239,24 +270,39 @@ pub fn columns_to_record_batch(unit: TimeUnit, timestamps: &[i64], values: &[Opt
 #[must_use]
 pub fn segment_to_record_batch_typed(seg: &Segment) -> RecordBatch {
 	let (timestamps, values) = seg.decode_nullable();
-	match seg.physical_type() {
-		PhysicalType::F64 => {
-			let val_array: ArrayRef = Arc::new(values.iter().map(|opt| opt.as_ref().and_then(BigDecimal::to_f64)).collect::<Float64Array>());
-			assemble_batch(seg, &timestamps, val_array, VALUE_ENCODING_F64)
-		}
-		PhysicalType::F32 => {
-			let val_array: ArrayRef = Arc::new(values.iter().map(|opt| opt.as_ref().and_then(BigDecimal::to_f32)).collect::<Float32Array>());
-			assemble_batch(seg, &timestamps, val_array, VALUE_ENCODING_F32)
-		}
-		PhysicalType::ScaledI64 { scale } | PhysicalType::ScaledI128 { scale } => {
-			// Exact: every value carries at most `scale` fractional digits, so its
-			// mantissa at that scale is an exact integer. If any value somehow
-			// overflows `i128` or the Arrow precision bound, fall back to text rather
-			// than emit a wrong number.
-			try_decimal128_array(&values, scale).map_or_else(|| segment_to_record_batch(seg), |val_array| assemble_batch(seg, &timestamps, val_array, VALUE_ENCODING_DECIMAL128))
-		}
-		_ => segment_to_record_batch(seg),
+	let (val_array, value_encoding) = typed_value_array(seg.physical_type(), &values);
+	assemble_batch(seg, &timestamps, val_array, value_encoding)
+}
+
+/// Build the **typed** Arrow value array for a value column under a given physical
+/// encoding, returning the array and the [`META_VALUE_ENCODING`] tag describing it.
+///
+/// [`F64`](PhysicalType::F64) → `Float64`, [`F32`](PhysicalType::F32) → `Float32`,
+/// and the fixed-scale [`ScaledI64`](PhysicalType::ScaledI64) /
+/// [`ScaledI128`](PhysicalType::ScaledI128) → an **exact** `Decimal128` at the
+/// encoding's scale. Any other encoding — and any fixed-scale column that overflows
+/// `i128`/the Arrow precision bound — falls back to the always-correct lossless
+/// text array ([`text_value_array`]) rather than emit a wrong number.
+///
+/// Shared by [`segment_to_record_batch_typed`] (driven by a sealed segment's
+/// encoding) and [`columns_to_record_batch_typed`] (driven by an aspect's declared
+/// schema encoding), so both produce identical typed columns.
+fn typed_value_array(physical_type: PhysicalType, values: &[Option<BigDecimal>]) -> (ArrayRef, &'static str) {
+	match physical_type {
+		PhysicalType::F64 => (Arc::new(values.iter().map(|opt| opt.as_ref().and_then(BigDecimal::to_f64)).collect::<Float64Array>()), VALUE_ENCODING_F64),
+		PhysicalType::F32 => (Arc::new(values.iter().map(|opt| opt.as_ref().and_then(BigDecimal::to_f32)).collect::<Float32Array>()), VALUE_ENCODING_F32),
+		// Exact: every value carries at most `scale` fractional digits, so its mantissa
+		// at that scale is an exact integer. On overflow, fall back to lossless text.
+		PhysicalType::ScaledI64 { scale } | PhysicalType::ScaledI128 { scale } => try_decimal128_array(values, scale).map_or_else(|| text_value_array(values), |arr| (arr, VALUE_ENCODING_DECIMAL128)),
+		_ => text_value_array(values),
 	}
+}
+
+/// Build the lossless plain-decimal-text Arrow value array (Arrow `Utf8`, validity
+/// marking absent rows) and its [`VALUE_ENCODING_TEXT`] tag — the always-exact
+/// fallback for any encoding without a natural fixed-width Arrow array.
+fn text_value_array(values: &[Option<BigDecimal>]) -> (ArrayRef, &'static str) {
+	(Arc::new(values.iter().map(|opt| opt.as_ref().map(BigDecimal::to_plain_string)).collect::<StringArray>()), VALUE_ENCODING_TEXT)
 }
 
 /// Build an exact Arrow `Decimal128` array for a fixed-scale value column, or
@@ -805,5 +851,63 @@ mod tests {
 	#[should_panic(expected = "share a row count")]
 	fn logical_columns_reject_mismatched_lengths() {
 		let _ = columns_to_record_batch(TimeUnit::Seconds, &[1_i64, 2], &[Some(bd("1.0"))]);
+	}
+
+	#[test]
+	fn typed_logical_columns_emit_float64_and_round_trip() {
+		let timestamps = vec![1_i64, 2, 3, 4];
+		let values = ncol(&[Some("0.5"), None, Some("2.25"), Some("-8")]);
+		let batch = columns_to_record_batch_typed(TimeUnit::Seconds, PhysicalType::F64, &timestamps, &values);
+
+		assert_eq!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), &DataType::Float64);
+		assert_eq!(batch.schema_ref().metadata().get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_F64));
+		// Physical type recorded is the declared one, version is the logical sentinel.
+		assert_eq!(batch.schema_ref().metadata().get(META_FORMAT_VERSION).map(String::as_str), Some(&LOGICAL_EXPORT_VERSION.to_string()[..]));
+
+		let (ts, vs) = record_batch_to_columns(&batch).expect("reads back");
+		assert_eq!(ts, timestamps);
+		assert_eq!(vs, values);
+	}
+
+	#[test]
+	fn typed_logical_columns_emit_exact_decimal128() {
+		let timestamps = vec![1_i64, 2, 3];
+		let values = ncol(&[Some("12.34"), None, Some("-7.50")]);
+		let batch = columns_to_record_batch_typed(TimeUnit::Millis, PhysicalType::ScaledI64 { scale: 2 }, &timestamps, &values);
+
+		assert_eq!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), &DataType::Decimal128(DECIMAL128_MAX_PRECISION, 2));
+		let (_ts, vs) = record_batch_to_columns(&batch).expect("reads back");
+		// Exact reconstruction — no float rounding.
+		assert_eq!(vs, values);
+	}
+
+	#[test]
+	fn typed_logical_columns_fall_back_to_text_for_variable_encoding() {
+		// BigDecimalText has no fixed-width Arrow array → the typed path stays text.
+		let timestamps = vec![1_i64, 2];
+		let values = vec![Some(bd("123456789012345678901234567890.123")), Some(bd("1"))];
+		let batch = columns_to_record_batch_typed(TimeUnit::Nanos, PhysicalType::BigDecimalText, &timestamps, &values);
+
+		assert_eq!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), &DataType::Utf8);
+		assert_eq!(batch.schema_ref().metadata().get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_TEXT));
+		let (_ts, vs) = record_batch_to_columns(&batch).expect("reads back");
+		assert_eq!(vs, values);
+	}
+
+	#[test]
+	fn typed_logical_columns_match_segment_typed_export() {
+		// The column-level typed path and the segment-level typed path must agree.
+		let timestamps = vec![1_i64, 2, 3, 4];
+		let values = col(&["0.5", "2.25", "-0.25", "128"]);
+		let seg = AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds).seal(&timestamps, &values).expect("seals");
+
+		let from_segment = segment_to_record_batch_typed(&seg);
+		let nullable: Vec<Option<BigDecimal>> = values.into_iter().map(Some).collect();
+		let from_columns = columns_to_record_batch_typed(TimeUnit::Seconds, PhysicalType::F64, &timestamps, &nullable);
+
+		// Same value column type and same decoded contents (metadata version differs:
+		// a real segment version vs the logical sentinel).
+		assert_eq!(from_segment.column_by_name(VALUE_COLUMN).unwrap().data_type(), from_columns.column_by_name(VALUE_COLUMN).unwrap().data_type());
+		assert_eq!(record_batch_to_columns(&from_segment).unwrap(), record_batch_to_columns(&from_columns).unwrap());
 	}
 }
