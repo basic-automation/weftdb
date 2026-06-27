@@ -51,7 +51,7 @@ use anyhow::{Context, Result};
 use arrow_array::RecordBatch;
 use bigdecimal::BigDecimal;
 use database::SegmentStore;
-use dsp_physical_type::TimeUnit;
+use dsp_physical_type::{AspectSchema, TimeUnit};
 
 /// Read the rows of `aspect` whose timestamp falls in the inclusive `[start, end]`
 /// window and return them as a single lossless Arrow [`RecordBatch`].
@@ -73,6 +73,31 @@ pub async fn read_time_range_to_record_batch(store: &SegmentStore, aspect: &str,
 	let unit = aspect_time_unit(store, aspect).await?;
 	let (timestamps, values) = store.read_time_range(aspect, start, end).await?;
 	Ok(dsp_arrow::columns_to_record_batch(unit, &timestamps, &values))
+}
+
+/// Read the rows of `aspect` in the inclusive `[start, end]` window and return them
+/// as a single Arrow [`RecordBatch`] using the **typed numeric fast path** for the
+/// aspect's declared physical encoding.
+///
+/// Identical to [`read_time_range_to_record_batch`] except for the value column's
+/// Arrow form: because an aspect declares **one** physical encoding for all its
+/// segments ([`AspectSchema::value`](dsp_physical_type::AspectSchema)), the whole
+/// logical range shares it, so a single typed Arrow column is well-defined. An
+/// [`F64`](dsp_physical_type::PhysicalType::F64) aspect yields a `Float64` column,
+/// a fixed-scale [`ScaledI64`](dsp_physical_type::PhysicalType::ScaledI64) /
+/// [`ScaledI128`](dsp_physical_type::PhysicalType::ScaledI128) aspect an **exact**
+/// `Decimal128` column — the layout `DataFusion`/`pandas`/Flight consume directly.
+/// Any other encoding falls back to the lossless decimal-text column, so the export
+/// is always correct.
+///
+/// # Errors
+///
+/// As [`read_time_range_to_record_batch`]: undeclared aspect, or an underlying
+/// time-range read failure.
+pub async fn read_time_range_to_record_batch_typed(store: &SegmentStore, aspect: &str, start: i64, end: i64) -> Result<RecordBatch> {
+	let schema = aspect_schema(store, aspect).await?;
+	let (timestamps, values) = store.read_time_range(aspect, start, end).await?;
+	Ok(dsp_arrow::columns_to_record_batch_typed(schema.timestamp_unit, schema.value, &timestamps, &values))
 }
 
 /// Read the present rows of `aspect` whose **value** falls in the inclusive
@@ -102,8 +127,14 @@ pub async fn read_value_range_to_record_batch(store: &SegmentStore, aspect: &str
 /// Resolve the declared timestamp [`TimeUnit`] for `aspect`, erroring if the aspect
 /// was never declared in the store (its unit would otherwise be a guess).
 async fn aspect_time_unit(store: &SegmentStore, aspect: &str) -> Result<TimeUnit> {
-	let schema = store.schema_for(aspect).await?.with_context(|| format!("aspect `{aspect}` has no declared schema in the segment store"))?;
-	Ok(schema.timestamp_unit)
+	Ok(aspect_schema(store, aspect).await?.timestamp_unit)
+}
+
+/// Resolve the full declared [`AspectSchema`](dsp_physical_type::AspectSchema) for
+/// `aspect` (its physical encoding and timestamp unit), erroring if the aspect was
+/// never declared in the store.
+async fn aspect_schema(store: &SegmentStore, aspect: &str) -> Result<AspectSchema> {
+	store.schema_for(aspect).await?.with_context(|| format!("aspect `{aspect}` has no declared schema in the segment store"))
 }
 
 #[cfg(test)]
@@ -158,6 +189,29 @@ mod tests {
 		let (ts, vs) = record_batch_to_columns(&batch).expect("reads back");
 		assert_eq!(ts, vec![1, 2, 3, 4, 5, 6]);
 		assert_eq!(vs, (1..=6).map(|v| Some(BigDecimal::from(v))).collect::<Vec<_>>());
+	}
+
+	#[tokio::test]
+	async fn typed_time_range_read_emits_a_float64_column() {
+		use arrow_array::{Array, Float64Array};
+		use dsp_arrow::{META_VALUE_ENCODING, VALUE_ENCODING_F64};
+
+		let (_dir, store) = store_with_aspect(TimeUnit::Seconds, PhysicalType::F64).await;
+		let timestamps = vec![1_i64, 2, 3, 4];
+		let values = vec![bd("0.5"), bd("2.25"), bd("-0.25"), bd("128")];
+		store.seal_declared("price", &timestamps, &values).await.expect("seals");
+
+		let batch = read_time_range_to_record_batch_typed(&store, "price", 1, 4).await.expect("exports");
+		// A real Arrow Float64 column (downcast succeeds), not text, and the metadata
+		// says so.
+		assert_eq!(batch.schema_ref().metadata().get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_F64));
+		let floats = batch.column_by_name(VALUE_COLUMN).unwrap().as_any().downcast_ref::<Float64Array>().expect("value column is Float64");
+		assert_eq!(floats.values(), &[0.5, 2.25, -0.25, 128.0]);
+
+		// And it still round-trips back to the logical columns.
+		let (ts, vs) = record_batch_to_columns(&batch).expect("reads back");
+		assert_eq!(ts, timestamps);
+		assert_eq!(vs, values.into_iter().map(Some).collect::<Vec<_>>());
 	}
 
 	#[tokio::test]
