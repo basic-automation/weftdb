@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["database", "database_orchestration", "splimes", "dsp-tui", "dsp-bench", "dsp-server", "dsp-line-protocol", "dsp-physical-type", "dsp-arrow"]
+members = ["database", "database_orchestration", "splimes", "dsp-tui", "dsp-bench", "dsp-server", "dsp-line-protocol", "dsp-physical-type", "dsp-arrow", "dsp-arrow-store"]
 # Predecessor repositories archived under legacy/ (history preserved); not part of the active build.
 exclude = ["legacy"]
 
