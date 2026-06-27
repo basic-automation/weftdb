@@ -124,6 +124,43 @@ pub async fn read_value_range_to_record_batch(store: &SegmentStore, aspect: &str
 	Ok(dsp_arrow::columns_to_record_batch(unit, &timestamps, &values))
 }
 
+/// Read the `[start, end]` window of `aspect` and return it as **Arrow IPC stream
+/// bytes**.
+///
+/// This is the portable wire form ready to drop into an HTTP response body, an
+/// Arrow Flight payload, or a `.arrow` file on disk — the capstone of the
+/// storage → Arrow path: it takes the typed time-range read
+/// ([`read_time_range_to_record_batch_typed`]) and serializes the resulting batch
+/// with [`dsp_arrow::write_ipc_stream`]. The stream is self-describing (the
+/// time-unit and physical-encoding metadata travel in its schema), so a consumer
+/// recovers the columns with [`dsp_arrow::read_ipc_stream`] +
+/// [`dsp_arrow::record_batches_to_columns`] and nothing else. An empty window still
+/// yields a valid single-batch stream (zero rows), not an error.
+///
+/// # Errors
+///
+/// As [`read_time_range_to_record_batch_typed`] (undeclared aspect, or a read
+/// failure), plus a [`dsp_arrow::ConvertError`] if IPC serialization fails.
+pub async fn read_time_range_to_ipc_bytes(store: &SegmentStore, aspect: &str, start: i64, end: i64) -> Result<Vec<u8>> {
+	let batch = read_time_range_to_record_batch_typed(store, aspect, start, end).await?;
+	Ok(dsp_arrow::write_ipc_stream(std::slice::from_ref(&batch))?)
+}
+
+/// Read the present rows of `aspect` whose value falls in `[lo, hi]` and return them
+/// as **Arrow IPC stream bytes** (see [`read_time_range_to_ipc_bytes`]).
+///
+/// Serializes the lossless value-range batch
+/// ([`read_value_range_to_record_batch`]).
+///
+/// # Errors
+///
+/// As [`read_value_range_to_record_batch`], plus a [`dsp_arrow::ConvertError`] if
+/// IPC serialization fails.
+pub async fn read_value_range_to_ipc_bytes(store: &SegmentStore, aspect: &str, lo: &BigDecimal, hi: &BigDecimal) -> Result<Vec<u8>> {
+	let batch = read_value_range_to_record_batch(store, aspect, lo, hi).await?;
+	Ok(dsp_arrow::write_ipc_stream(std::slice::from_ref(&batch))?)
+}
+
 /// Resolve the declared timestamp [`TimeUnit`] for `aspect`, erroring if the aspect
 /// was never declared in the store (its unit would otherwise be a guess).
 async fn aspect_time_unit(store: &SegmentStore, aspect: &str) -> Result<TimeUnit> {
@@ -248,5 +285,51 @@ mod tests {
 		assert_eq!(batch.num_rows(), 0);
 		// Still self-describing.
 		assert_eq!(batch.schema_ref().metadata().get(META_TIME_UNIT).map(String::as_str), Some("seconds"));
+	}
+
+	#[tokio::test]
+	async fn time_range_to_ipc_bytes_round_trips_through_the_wire_form() {
+		use dsp_arrow::{read_ipc_stream, record_batches_to_columns};
+
+		let (_dir, store) = store_with_aspect(TimeUnit::Seconds, PhysicalType::F64).await;
+		let timestamps = vec![1_i64, 2, 3, 4, 5];
+		let values = vec![bd("0.5"), bd("1.5"), bd("2.5"), bd("3.5"), bd("4.5")];
+		store.seal_declared("price", &timestamps, &values).await.expect("seals");
+
+		// Storage → Arrow → IPC stream bytes, the portable wire form.
+		let bytes = read_time_range_to_ipc_bytes(&store, "price", 2, 4).await.expect("serializes");
+		assert!(!bytes.is_empty());
+
+		// A consumer with only dsp-arrow recovers the columns from the bytes.
+		let batches = read_ipc_stream(&bytes).expect("reads stream");
+		let (ts, vs) = record_batches_to_columns(&batches).expect("reads back columns");
+		assert_eq!(ts, vec![2, 3, 4]);
+		assert_eq!(vs, vec![Some(bd("1.5")), Some(bd("2.5")), Some(bd("3.5"))]);
+	}
+
+	#[tokio::test]
+	async fn value_range_to_ipc_bytes_round_trips() {
+		use dsp_arrow::{read_ipc_stream, record_batches_to_columns};
+
+		let (_dir, store) = store_with_aspect(TimeUnit::Millis, PhysicalType::BigDecimalText).await;
+		store.seal_declared("price", &[1_i64, 2, 3, 4], &[bd("10"), bd("20"), bd("30"), bd("40")]).await.expect("seals");
+
+		let bytes = read_value_range_to_ipc_bytes(&store, "price", &bd("15"), &bd("35")).await.expect("serializes");
+		let batches = read_ipc_stream(&bytes).expect("reads stream");
+		let (_ts, vs) = record_batches_to_columns(&batches).expect("reads back columns");
+		assert_eq!(vs, vec![Some(bd("20")), Some(bd("30"))]);
+	}
+
+	#[tokio::test]
+	async fn empty_window_to_ipc_bytes_is_a_valid_zero_row_stream() {
+		use dsp_arrow::read_ipc_stream;
+
+		let (_dir, store) = store_with_aspect(TimeUnit::Seconds, PhysicalType::F64).await;
+		store.seal_declared("price", &[10_i64, 20], &[bd("1"), bd("2")]).await.expect("seals");
+		// A window past every stored point still serializes to a valid one-batch stream.
+		let bytes = read_time_range_to_ipc_bytes(&store, "price", 1_000, 2_000).await.expect("serializes");
+		let batches = read_ipc_stream(&bytes).expect("reads stream");
+		assert_eq!(batches.len(), 1);
+		assert_eq!(batches[0].num_rows(), 0);
 	}
 }
