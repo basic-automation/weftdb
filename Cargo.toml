@@ -41,6 +41,7 @@ dsp-physical-type = { path = "./dsp-physical-type" }
 dsp-arrow = { path = "./dsp-arrow" }
 arrow-array = "59"
 arrow-schema = "59"
+arrow-ipc = "59"
 csv = "1"
 indexmap = "2"
 serial_test = { version = "3", default-features = false, features = ["async"] }

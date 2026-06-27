@@ -56,6 +56,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_schema::{DataType, Field, Schema, DECIMAL128_MAX_PRECISION};
 use bigdecimal::{num_bigint::BigInt, BigDecimal, FromPrimitive, ToPrimitive};
 use dsp_physical_type::{Page, PagedSegment, PhysicalType, Segment, SegmentError, TimeUnit};
@@ -124,6 +125,10 @@ pub enum ConvertError {
 	BadValue(String),
 	/// The two columns disagreed on height, or re-sealing the segment failed.
 	Segment(SegmentError),
+	/// Reading or writing the Arrow IPC stream failed (carries the Arrow message).
+	Ipc(String),
+	/// An IPC write was asked for an empty batch set — there is no schema to write.
+	EmptyBatchSet,
 }
 
 impl std::fmt::Display for ConvertError {
@@ -135,6 +140,8 @@ impl std::fmt::Display for ConvertError {
 			Self::UnknownTimeUnit(s) => write!(f, "unrecognized time unit `{s}` in schema metadata"),
 			Self::BadValue(s) => write!(f, "value cell `{s}` does not parse as a decimal"),
 			Self::Segment(e) => write!(f, "could not rebuild segment from columns: {e}"),
+			Self::Ipc(e) => write!(f, "arrow IPC stream error: {e}"),
+			Self::EmptyBatchSet => write!(f, "cannot write an Arrow IPC stream from zero batches (no schema)"),
 		}
 	}
 }
@@ -516,6 +523,53 @@ pub fn paged_segment_from_record_batches(batches: &[RecordBatch], value_toleranc
 	let unit = unit_from_metadata(first)?;
 	let (timestamps, values) = record_batches_to_columns(batches)?;
 	Ok(PagedSegment::build_nullable(&timestamps, &values, unit, value_tolerance, rows_per_page)?)
+}
+
+/// Serialize one or more [`RecordBatch`]es into the **Arrow IPC stream** wire format
+/// — the standard byte representation an HTTP body, an Arrow Flight payload, or a
+/// `.arrow` file carries.
+///
+/// All batches must share the schema of the first (they do when they come from the
+/// same export — every page batch of a [`PagedSegment`] carries identical schema
+/// metadata). The self-describing schema (including DSP's [`META_TIME_UNIT`] and
+/// physical-encoding metadata) is written once at the head of the stream, so
+/// [`read_ipc_stream`] reconstructs the batches — and DSP's columns from them —
+/// with no out-of-band information.
+///
+/// # Errors
+///
+/// Returns [`ConvertError::EmptyBatchSet`] if `batches` is empty (no schema to
+/// write), or [`ConvertError::Ipc`] if the Arrow writer fails.
+pub fn write_ipc_stream(batches: &[RecordBatch]) -> Result<Vec<u8>, ConvertError> {
+	let schema = batches.first().ok_or(ConvertError::EmptyBatchSet)?.schema();
+	let mut buf = Vec::new();
+	let mut writer = StreamWriter::try_new(&mut buf, &schema).map_err(|e| ConvertError::Ipc(e.to_string()))?;
+	for batch in batches {
+		writer.write(batch).map_err(|e| ConvertError::Ipc(e.to_string()))?;
+	}
+	writer.finish().map_err(|e| ConvertError::Ipc(e.to_string()))?;
+	drop(writer);
+	Ok(buf)
+}
+
+/// Deserialize an **Arrow IPC stream** (as written by [`write_ipc_stream`]) back
+/// into its [`RecordBatch`]es, in order.
+///
+/// The inverse of [`write_ipc_stream`]. Feed the result to
+/// [`record_batch_to_columns`] / [`record_batches_to_columns`] (or
+/// [`segment_from_record_batch`]) to recover DSP's columns.
+///
+/// # Errors
+///
+/// Returns [`ConvertError::Ipc`] if the bytes are not a valid Arrow IPC stream or a
+/// batch fails to decode.
+pub fn read_ipc_stream(bytes: &[u8]) -> Result<Vec<RecordBatch>, ConvertError> {
+	let reader = StreamReader::try_new(std::io::Cursor::new(bytes), None).map_err(|e| ConvertError::Ipc(e.to_string()))?;
+	let mut batches = Vec::new();
+	for batch in reader {
+		batches.push(batch.map_err(|e| ConvertError::Ipc(e.to_string()))?);
+	}
+	Ok(batches)
 }
 
 #[cfg(test)]
@@ -909,5 +963,51 @@ mod tests {
 		// a real segment version vs the logical sentinel).
 		assert_eq!(from_segment.column_by_name(VALUE_COLUMN).unwrap().data_type(), from_columns.column_by_name(VALUE_COLUMN).unwrap().data_type());
 		assert_eq!(record_batch_to_columns(&from_segment).unwrap(), record_batch_to_columns(&from_columns).unwrap());
+	}
+
+	#[test]
+	fn ipc_stream_round_trips_a_single_batch() {
+		let timestamps = vec![1_i64, 2, 3];
+		let values = ncol(&[Some("1.5"), None, Some("3.5")]);
+		let batch = columns_to_record_batch(TimeUnit::Millis, &timestamps, &values);
+
+		let bytes = write_ipc_stream(std::slice::from_ref(&batch)).expect("writes");
+		assert!(!bytes.is_empty());
+		let back = read_ipc_stream(&bytes).expect("reads");
+		assert_eq!(back.len(), 1);
+
+		// The self-describing metadata survives the stream.
+		assert_eq!(back[0].schema_ref().metadata().get(META_TIME_UNIT).map(String::as_str), Some("millis"));
+		let (ts, vs) = record_batch_to_columns(&back[0]).expect("reads back columns");
+		assert_eq!(ts, timestamps);
+		assert_eq!(vs, values);
+	}
+
+	#[test]
+	fn ipc_stream_round_trips_typed_and_paged_batches() {
+		// A multi-page export: each page batch shares one schema, so they stream together.
+		let timestamps: Vec<i64> = (0..10).map(|i| 100 + i).collect();
+		let values: Vec<BigDecimal> = (0..10).map(BigDecimal::from).collect();
+		let paged = PagedSegment::build(&timestamps, &values, TimeUnit::Seconds, &bd("0"), 4).expect("builds");
+		let batches = paged_segment_to_record_batches(&paged);
+		assert_eq!(batches.len(), 3);
+
+		let bytes = write_ipc_stream(&batches).expect("writes");
+		let back = read_ipc_stream(&bytes).expect("reads");
+		assert_eq!(back.len(), 3);
+		let (ts, vs) = record_batches_to_columns(&back).expect("reads back columns");
+		assert_eq!(ts, timestamps);
+		assert_eq!(vs, values.into_iter().map(Some).collect::<Vec<_>>());
+	}
+
+	#[test]
+	fn ipc_write_rejects_an_empty_batch_set() {
+		assert_eq!(write_ipc_stream(&[]), Err(ConvertError::EmptyBatchSet));
+	}
+
+	#[test]
+	fn ipc_read_rejects_garbage_bytes() {
+		let err = read_ipc_stream(b"not an arrow stream").expect_err("must error");
+		assert!(matches!(err, ConvertError::Ipc(_)), "got: {err}");
 	}
 }
