@@ -56,6 +56,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_schema::{DataType, Field, Schema, DECIMAL128_MAX_PRECISION};
 use bigdecimal::{num_bigint::BigInt, BigDecimal, FromPrimitive, ToPrimitive};
 use dsp_physical_type::{Page, PagedSegment, PhysicalType, Segment, SegmentError, TimeUnit};
@@ -93,6 +94,17 @@ pub const VALUE_ENCODING_F32: &str = "f32";
 /// [`ScaledI128`](dsp_physical_type::PhysicalType::ScaledI128) encodings.
 pub const VALUE_ENCODING_DECIMAL128: &str = "decimal128";
 
+/// Format-version sentinel written into [`META_FORMAT_VERSION`] for a batch built
+/// from **logical columns** rather than a single sealed segment.
+///
+/// A time- or value-range read of the segment store
+/// ([`columns_to_record_batch`]) can span many `.dspseg` segments of differing
+/// format versions and physical encodings, so no single
+/// [`SEGMENT_FORMAT_VERSION`](dsp_physical_type::Segment::version) applies. `0`
+/// marks the batch as a logical-column export (the lossless decimal-text form),
+/// distinct from any real on-disk segment version (which start at 1).
+pub const LOGICAL_EXPORT_VERSION: u16 = 0;
+
 /// Why a [`RecordBatch`] could not be converted back into DSP columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConvertError {
@@ -113,6 +125,10 @@ pub enum ConvertError {
 	BadValue(String),
 	/// The two columns disagreed on height, or re-sealing the segment failed.
 	Segment(SegmentError),
+	/// Reading or writing the Arrow IPC stream failed (carries the Arrow message).
+	Ipc(String),
+	/// An IPC write was asked for an empty batch set — there is no schema to write.
+	EmptyBatchSet,
 }
 
 impl std::fmt::Display for ConvertError {
@@ -124,6 +140,8 @@ impl std::fmt::Display for ConvertError {
 			Self::UnknownTimeUnit(s) => write!(f, "unrecognized time unit `{s}` in schema metadata"),
 			Self::BadValue(s) => write!(f, "value cell `{s}` does not parse as a decimal"),
 			Self::Segment(e) => write!(f, "could not rebuild segment from columns: {e}"),
+			Self::Ipc(e) => write!(f, "arrow IPC stream error: {e}"),
+			Self::EmptyBatchSet => write!(f, "cannot write an Arrow IPC stream from zero batches (no schema)"),
 		}
 	}
 }
@@ -173,6 +191,67 @@ pub fn segment_to_record_batch(seg: &Segment) -> RecordBatch {
 	assemble_batch(seg, &timestamps, val_array, VALUE_ENCODING_TEXT)
 }
 
+/// Build a self-describing, lossless Arrow [`RecordBatch`] directly from DSP's
+/// **logical columns** — a dense `timestamp: Int64` column and a value column
+/// aligned to it, with [`None`] at each absent row.
+///
+/// This is the column-level entry point used when the source is *not* a single
+/// sealed [`Segment`] but a logical read that may have crossed several segments —
+/// for example a time- or value-range read of the segment store, whose result is
+/// exactly a `(Vec<i64>, Vec<Option<BigDecimal>>)`. It emits the same two-column
+/// shape as [`segment_to_record_batch`] (non-null `timestamp: Int64`, nullable
+/// `value: Utf8` plain decimal text), so [`record_batch_to_columns`] reads it back
+/// unchanged.
+///
+/// Because the columns may span multiple physical encodings, the metadata records
+/// the lossless logical view rather than any one segment's: the physical-type name
+/// is [`PhysicalType::BigDecimalText`] (the value column *is* decimal text) and the
+/// format version is [`LOGICAL_EXPORT_VERSION`]. The conversion is lossless — no
+/// value loses a digit crossing into Arrow (hard constraint #4).
+///
+/// # Panics
+///
+/// Panics if `timestamps` and `values` differ in length: the two Arrow columns
+/// must share a row count. Callers pass columns that are already aligned (the
+/// segment-store readers always do), so this signals a caller bug, not bad data.
+#[must_use]
+pub fn columns_to_record_batch(unit: TimeUnit, timestamps: &[i64], values: &[Option<BigDecimal>]) -> RecordBatch {
+	assert_eq!(timestamps.len(), values.len(), "timestamp and value columns must share a row count");
+	let (val_array, value_encoding) = text_value_array(values);
+	build_record_batch(unit, PhysicalType::BigDecimalText.name(), LOGICAL_EXPORT_VERSION, timestamps, val_array, value_encoding)
+}
+
+/// Build a self-describing Arrow [`RecordBatch`] from DSP's logical columns using
+/// the **typed numeric fast path** for a given physical encoding.
+///
+/// The column-level counterpart of [`segment_to_record_batch_typed`].
+/// Where [`columns_to_record_batch`] always emits the lossless decimal-text value
+/// column, this emits the natural fixed-width Arrow array for `physical_type` when
+/// one exists: [`F64`](PhysicalType::F64) → `Float64`, [`F32`](PhysicalType::F32) →
+/// `Float32`, and the fixed-scale [`ScaledI64`](PhysicalType::ScaledI64) /
+/// [`ScaledI128`](PhysicalType::ScaledI128) → an **exact** `Decimal128`. Any other
+/// encoding (and any fixed-scale value that overflows the Arrow precision bound)
+/// falls back to the lossless text column, so the export is always correct.
+///
+/// This is the form a typed stored-range read uses: an aspect declares **one**
+/// physical encoding for all its segments
+/// ([`AspectSchema::value`](dsp_physical_type::AspectSchema)), so the whole logical
+/// range shares it and a single typed Arrow column is well-defined. The numeric
+/// path is exact, not a second downcast — values stored under `F64` already *are*
+/// `f64`. [`record_batch_to_columns`] reads either form back by dispatching on the
+/// value column's Arrow type.
+///
+/// # Panics
+///
+/// Panics if `timestamps` and `values` differ in length (see
+/// [`columns_to_record_batch`]).
+#[must_use]
+pub fn columns_to_record_batch_typed(unit: TimeUnit, physical_type: PhysicalType, timestamps: &[i64], values: &[Option<BigDecimal>]) -> RecordBatch {
+	assert_eq!(timestamps.len(), values.len(), "timestamp and value columns must share a row count");
+	let (val_array, value_encoding) = typed_value_array(physical_type, values);
+	build_record_batch(unit, physical_type.name(), LOGICAL_EXPORT_VERSION, timestamps, val_array, value_encoding)
+}
+
 /// Convert a sealed [`Segment`] into an Arrow [`RecordBatch`] using the **typed
 /// numeric fast path** when the segment's physical encoding has a natural
 /// fixed-width Arrow array.
@@ -198,24 +277,39 @@ pub fn segment_to_record_batch(seg: &Segment) -> RecordBatch {
 #[must_use]
 pub fn segment_to_record_batch_typed(seg: &Segment) -> RecordBatch {
 	let (timestamps, values) = seg.decode_nullable();
-	match seg.physical_type() {
-		PhysicalType::F64 => {
-			let val_array: ArrayRef = Arc::new(values.iter().map(|opt| opt.as_ref().and_then(BigDecimal::to_f64)).collect::<Float64Array>());
-			assemble_batch(seg, &timestamps, val_array, VALUE_ENCODING_F64)
-		}
-		PhysicalType::F32 => {
-			let val_array: ArrayRef = Arc::new(values.iter().map(|opt| opt.as_ref().and_then(BigDecimal::to_f32)).collect::<Float32Array>());
-			assemble_batch(seg, &timestamps, val_array, VALUE_ENCODING_F32)
-		}
-		PhysicalType::ScaledI64 { scale } | PhysicalType::ScaledI128 { scale } => {
-			// Exact: every value carries at most `scale` fractional digits, so its
-			// mantissa at that scale is an exact integer. If any value somehow
-			// overflows `i128` or the Arrow precision bound, fall back to text rather
-			// than emit a wrong number.
-			try_decimal128_array(&values, scale).map_or_else(|| segment_to_record_batch(seg), |val_array| assemble_batch(seg, &timestamps, val_array, VALUE_ENCODING_DECIMAL128))
-		}
-		_ => segment_to_record_batch(seg),
+	let (val_array, value_encoding) = typed_value_array(seg.physical_type(), &values);
+	assemble_batch(seg, &timestamps, val_array, value_encoding)
+}
+
+/// Build the **typed** Arrow value array for a value column under a given physical
+/// encoding, returning the array and the [`META_VALUE_ENCODING`] tag describing it.
+///
+/// [`F64`](PhysicalType::F64) → `Float64`, [`F32`](PhysicalType::F32) → `Float32`,
+/// and the fixed-scale [`ScaledI64`](PhysicalType::ScaledI64) /
+/// [`ScaledI128`](PhysicalType::ScaledI128) → an **exact** `Decimal128` at the
+/// encoding's scale. Any other encoding — and any fixed-scale column that overflows
+/// `i128`/the Arrow precision bound — falls back to the always-correct lossless
+/// text array ([`text_value_array`]) rather than emit a wrong number.
+///
+/// Shared by [`segment_to_record_batch_typed`] (driven by a sealed segment's
+/// encoding) and [`columns_to_record_batch_typed`] (driven by an aspect's declared
+/// schema encoding), so both produce identical typed columns.
+fn typed_value_array(physical_type: PhysicalType, values: &[Option<BigDecimal>]) -> (ArrayRef, &'static str) {
+	match physical_type {
+		PhysicalType::F64 => (Arc::new(values.iter().map(|opt| opt.as_ref().and_then(BigDecimal::to_f64)).collect::<Float64Array>()), VALUE_ENCODING_F64),
+		PhysicalType::F32 => (Arc::new(values.iter().map(|opt| opt.as_ref().and_then(BigDecimal::to_f32)).collect::<Float32Array>()), VALUE_ENCODING_F32),
+		// Exact: every value carries at most `scale` fractional digits, so its mantissa
+		// at that scale is an exact integer. On overflow, fall back to lossless text.
+		PhysicalType::ScaledI64 { scale } | PhysicalType::ScaledI128 { scale } => try_decimal128_array(values, scale).map_or_else(|| text_value_array(values), |arr| (arr, VALUE_ENCODING_DECIMAL128)),
+		_ => text_value_array(values),
 	}
+}
+
+/// Build the lossless plain-decimal-text Arrow value array (Arrow `Utf8`, validity
+/// marking absent rows) and its [`VALUE_ENCODING_TEXT`] tag — the always-exact
+/// fallback for any encoding without a natural fixed-width Arrow array.
+fn text_value_array(values: &[Option<BigDecimal>]) -> (ArrayRef, &'static str) {
+	(Arc::new(values.iter().map(|opt| opt.as_ref().map(BigDecimal::to_plain_string)).collect::<StringArray>()), VALUE_ENCODING_TEXT)
 }
 
 /// Build an exact Arrow `Decimal128` array for a fixed-scale value column, or
@@ -429,6 +523,53 @@ pub fn paged_segment_from_record_batches(batches: &[RecordBatch], value_toleranc
 	let unit = unit_from_metadata(first)?;
 	let (timestamps, values) = record_batches_to_columns(batches)?;
 	Ok(PagedSegment::build_nullable(&timestamps, &values, unit, value_tolerance, rows_per_page)?)
+}
+
+/// Serialize one or more [`RecordBatch`]es into the **Arrow IPC stream** wire format
+/// — the standard byte representation an HTTP body, an Arrow Flight payload, or a
+/// `.arrow` file carries.
+///
+/// All batches must share the schema of the first (they do when they come from the
+/// same export — every page batch of a [`PagedSegment`] carries identical schema
+/// metadata). The self-describing schema (including DSP's [`META_TIME_UNIT`] and
+/// physical-encoding metadata) is written once at the head of the stream, so
+/// [`read_ipc_stream`] reconstructs the batches — and DSP's columns from them —
+/// with no out-of-band information.
+///
+/// # Errors
+///
+/// Returns [`ConvertError::EmptyBatchSet`] if `batches` is empty (no schema to
+/// write), or [`ConvertError::Ipc`] if the Arrow writer fails.
+pub fn write_ipc_stream(batches: &[RecordBatch]) -> Result<Vec<u8>, ConvertError> {
+	let schema = batches.first().ok_or(ConvertError::EmptyBatchSet)?.schema();
+	let mut buf = Vec::new();
+	let mut writer = StreamWriter::try_new(&mut buf, &schema).map_err(|e| ConvertError::Ipc(e.to_string()))?;
+	for batch in batches {
+		writer.write(batch).map_err(|e| ConvertError::Ipc(e.to_string()))?;
+	}
+	writer.finish().map_err(|e| ConvertError::Ipc(e.to_string()))?;
+	drop(writer);
+	Ok(buf)
+}
+
+/// Deserialize an **Arrow IPC stream** (as written by [`write_ipc_stream`]) back
+/// into its [`RecordBatch`]es, in order.
+///
+/// The inverse of [`write_ipc_stream`]. Feed the result to
+/// [`record_batch_to_columns`] / [`record_batches_to_columns`] (or
+/// [`segment_from_record_batch`]) to recover DSP's columns.
+///
+/// # Errors
+///
+/// Returns [`ConvertError::Ipc`] if the bytes are not a valid Arrow IPC stream or a
+/// batch fails to decode.
+pub fn read_ipc_stream(bytes: &[u8]) -> Result<Vec<RecordBatch>, ConvertError> {
+	let reader = StreamReader::try_new(std::io::Cursor::new(bytes), None).map_err(|e| ConvertError::Ipc(e.to_string()))?;
+	let mut batches = Vec::new();
+	for batch in reader {
+		batches.push(batch.map_err(|e| ConvertError::Ipc(e.to_string()))?);
+	}
+	Ok(batches)
 }
 
 #[cfg(test)]
@@ -708,5 +849,165 @@ mod tests {
 		assert!(paged_segment_to_record_batches(&paged).is_empty());
 		// Rebuilding from no batches cannot recover the unit, so it is an error.
 		assert_eq!(paged_segment_from_record_batches(&[], &bd("0"), 4), Err(ConvertError::MissingMetadata(META_TIME_UNIT)));
+	}
+
+	#[test]
+	fn logical_columns_round_trip_through_arrow() {
+		// The shape a segment-store time-range read returns: a dense timestamp
+		// column and a nullable value column that may have crossed several segments.
+		let timestamps = vec![100_i64, 110, 120, 130, 140];
+		let values = ncol(&[Some("1.5"), None, Some("3.5"), Some("4.0"), None]);
+		let batch = columns_to_record_batch(TimeUnit::Millis, &timestamps, &values);
+
+		assert_eq!(batch.num_columns(), 2);
+		assert_eq!(batch.num_rows(), 5);
+		// Lossless text form, with the two gaps as Arrow validity bits.
+		assert_eq!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), &DataType::Utf8);
+		let val_array = batch.column_by_name(VALUE_COLUMN).unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+		assert_eq!(val_array.null_count(), 2);
+
+		let (ts, vs) = record_batch_to_columns(&batch).expect("reads back");
+		assert_eq!(ts, timestamps);
+		assert_eq!(vs, values);
+	}
+
+	#[test]
+	fn logical_columns_metadata_marks_the_logical_export() {
+		let batch = columns_to_record_batch(TimeUnit::Nanos, &[1_i64], &[Some(bd("2.5"))]);
+		let md = batch.schema_ref().metadata();
+		assert_eq!(md.get(META_TIME_UNIT).map(String::as_str), Some("nanos"));
+		assert_eq!(md.get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_TEXT));
+		// Physical type is the lossless logical text form, version is the sentinel.
+		assert_eq!(md.get(META_PHYSICAL_TYPE).map(String::as_str), Some(PhysicalType::BigDecimalText.name()));
+		assert_eq!(md.get(META_FORMAT_VERSION).map(String::as_str), Some(&LOGICAL_EXPORT_VERSION.to_string()[..]));
+	}
+
+	#[test]
+	fn logical_columns_high_precision_is_lossless() {
+		// Crossing into Arrow as text keeps every digit, even past f64/i128 range.
+		let huge = "123456789012345678901234567890.123456789012345678901234567890";
+		let timestamps = vec![1_i64, 2];
+		let values = vec![Some(bd(huge)), Some(bd("-0.000000000000000000000000000001"))];
+		let batch = columns_to_record_batch(TimeUnit::Nanos, &timestamps, &values);
+		let (_ts, vs) = record_batch_to_columns(&batch).expect("reads back");
+		assert_eq!(vs, values);
+	}
+
+	#[test]
+	fn logical_columns_empty_is_a_zero_row_batch() {
+		let batch = columns_to_record_batch(TimeUnit::Seconds, &[], &[]);
+		assert_eq!(batch.num_rows(), 0);
+		let (ts, vs) = record_batch_to_columns(&batch).expect("reads back");
+		assert!(ts.is_empty() && vs.is_empty());
+	}
+
+	#[test]
+	#[should_panic(expected = "share a row count")]
+	fn logical_columns_reject_mismatched_lengths() {
+		let _ = columns_to_record_batch(TimeUnit::Seconds, &[1_i64, 2], &[Some(bd("1.0"))]);
+	}
+
+	#[test]
+	fn typed_logical_columns_emit_float64_and_round_trip() {
+		let timestamps = vec![1_i64, 2, 3, 4];
+		let values = ncol(&[Some("0.5"), None, Some("2.25"), Some("-8")]);
+		let batch = columns_to_record_batch_typed(TimeUnit::Seconds, PhysicalType::F64, &timestamps, &values);
+
+		assert_eq!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), &DataType::Float64);
+		assert_eq!(batch.schema_ref().metadata().get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_F64));
+		// Physical type recorded is the declared one, version is the logical sentinel.
+		assert_eq!(batch.schema_ref().metadata().get(META_FORMAT_VERSION).map(String::as_str), Some(&LOGICAL_EXPORT_VERSION.to_string()[..]));
+
+		let (ts, vs) = record_batch_to_columns(&batch).expect("reads back");
+		assert_eq!(ts, timestamps);
+		assert_eq!(vs, values);
+	}
+
+	#[test]
+	fn typed_logical_columns_emit_exact_decimal128() {
+		let timestamps = vec![1_i64, 2, 3];
+		let values = ncol(&[Some("12.34"), None, Some("-7.50")]);
+		let batch = columns_to_record_batch_typed(TimeUnit::Millis, PhysicalType::ScaledI64 { scale: 2 }, &timestamps, &values);
+
+		assert_eq!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), &DataType::Decimal128(DECIMAL128_MAX_PRECISION, 2));
+		let (_ts, vs) = record_batch_to_columns(&batch).expect("reads back");
+		// Exact reconstruction — no float rounding.
+		assert_eq!(vs, values);
+	}
+
+	#[test]
+	fn typed_logical_columns_fall_back_to_text_for_variable_encoding() {
+		// BigDecimalText has no fixed-width Arrow array → the typed path stays text.
+		let timestamps = vec![1_i64, 2];
+		let values = vec![Some(bd("123456789012345678901234567890.123")), Some(bd("1"))];
+		let batch = columns_to_record_batch_typed(TimeUnit::Nanos, PhysicalType::BigDecimalText, &timestamps, &values);
+
+		assert_eq!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), &DataType::Utf8);
+		assert_eq!(batch.schema_ref().metadata().get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_TEXT));
+		let (_ts, vs) = record_batch_to_columns(&batch).expect("reads back");
+		assert_eq!(vs, values);
+	}
+
+	#[test]
+	fn typed_logical_columns_match_segment_typed_export() {
+		// The column-level typed path and the segment-level typed path must agree.
+		let timestamps = vec![1_i64, 2, 3, 4];
+		let values = col(&["0.5", "2.25", "-0.25", "128"]);
+		let seg = AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds).seal(&timestamps, &values).expect("seals");
+
+		let from_segment = segment_to_record_batch_typed(&seg);
+		let nullable: Vec<Option<BigDecimal>> = values.into_iter().map(Some).collect();
+		let from_columns = columns_to_record_batch_typed(TimeUnit::Seconds, PhysicalType::F64, &timestamps, &nullable);
+
+		// Same value column type and same decoded contents (metadata version differs:
+		// a real segment version vs the logical sentinel).
+		assert_eq!(from_segment.column_by_name(VALUE_COLUMN).unwrap().data_type(), from_columns.column_by_name(VALUE_COLUMN).unwrap().data_type());
+		assert_eq!(record_batch_to_columns(&from_segment).unwrap(), record_batch_to_columns(&from_columns).unwrap());
+	}
+
+	#[test]
+	fn ipc_stream_round_trips_a_single_batch() {
+		let timestamps = vec![1_i64, 2, 3];
+		let values = ncol(&[Some("1.5"), None, Some("3.5")]);
+		let batch = columns_to_record_batch(TimeUnit::Millis, &timestamps, &values);
+
+		let bytes = write_ipc_stream(std::slice::from_ref(&batch)).expect("writes");
+		assert!(!bytes.is_empty());
+		let back = read_ipc_stream(&bytes).expect("reads");
+		assert_eq!(back.len(), 1);
+
+		// The self-describing metadata survives the stream.
+		assert_eq!(back[0].schema_ref().metadata().get(META_TIME_UNIT).map(String::as_str), Some("millis"));
+		let (ts, vs) = record_batch_to_columns(&back[0]).expect("reads back columns");
+		assert_eq!(ts, timestamps);
+		assert_eq!(vs, values);
+	}
+
+	#[test]
+	fn ipc_stream_round_trips_typed_and_paged_batches() {
+		// A multi-page export: each page batch shares one schema, so they stream together.
+		let timestamps: Vec<i64> = (0..10).map(|i| 100 + i).collect();
+		let values: Vec<BigDecimal> = (0..10).map(BigDecimal::from).collect();
+		let paged = PagedSegment::build(&timestamps, &values, TimeUnit::Seconds, &bd("0"), 4).expect("builds");
+		let batches = paged_segment_to_record_batches(&paged);
+		assert_eq!(batches.len(), 3);
+
+		let bytes = write_ipc_stream(&batches).expect("writes");
+		let back = read_ipc_stream(&bytes).expect("reads");
+		assert_eq!(back.len(), 3);
+		let (ts, vs) = record_batches_to_columns(&back).expect("reads back columns");
+		assert_eq!(ts, timestamps);
+		assert_eq!(vs, values.into_iter().map(Some).collect::<Vec<_>>());
+	}
+
+	#[test]
+	fn ipc_write_rejects_an_empty_batch_set() {
+		assert_eq!(write_ipc_stream(&[]), Err(ConvertError::EmptyBatchSet));
+	}
+
+	#[test]
+	fn ipc_read_rejects_garbage_bytes() {
+		let err = read_ipc_stream(b"not an arrow stream").expect_err("must error");
+		assert!(matches!(err, ConvertError::Ipc(_)), "got: {err}");
 	}
 }

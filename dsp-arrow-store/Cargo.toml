@@ -1,0 +1,21 @@
+[package]
+name = "dsp-arrow-store"
+version = "0.1.0"
+edition = "2021"
+description = "Bridge: read a stored DSP aspect range straight into an Arrow RecordBatch — the home crate that may depend on both `database` and `dsp-arrow` so neither heavy dependency reaches the lean hot-path core (hard constraints #2/#3)."
+
+[lib]
+name = "dsp_arrow_store"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+arrow-array = { workspace = true }
+bigdecimal = { workspace = true }
+database = { path = "../database" }  # Reference the local workspace member directly
+dsp-arrow = { workspace = true }
+dsp-physical-type = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

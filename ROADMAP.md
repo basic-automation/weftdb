@@ -408,10 +408,27 @@ JSON").
   stream, preserving the Phase-4.4 page-skipping structure),
   `paged_segment_to_record_batch` collapses to one, and
   `record_batches_to_columns` / `paged_segment_from_record_batches` invert them.
-  18 tests; 0 clippy warnings under pedantic+nursery. Still to do: Parquet
-  import/export, and a `database`-side glue that reads a stored aspect range
-  straight into a `RecordBatch` (kept outside the core to preserve the dep
-  boundary).)*
+  **Logical-column + stored-range interchange landed:**
+  `dsp_arrow::columns_to_record_batch` / `columns_to_record_batch_typed` build a
+  batch directly from logical `(Vec<i64>, Vec<Option<BigDecimal>>)` columns (the
+  shape a stored read returns, possibly spanning several segments) — the typed
+  form emits the natural `Float64`/`Float32`/exact-`Decimal128` column for the
+  aspect's single declared encoding, text otherwise. A new leaf bridge crate
+  **`dsp-arrow-store`** (depends on *both* `database` and `dsp-arrow`, so the
+  heavy `arrow-*` tree never reaches the core — `database`/`splimes`/
+  `dsp-physical-type` stay arrow-free) reads a stored aspect range straight into
+  a `RecordBatch`: `read_time_range_to_record_batch[_typed]` and
+  `read_value_range_to_record_batch` (recovering the declared `TimeUnit`/encoding
+  from the aspect schema). And the **Arrow IPC wire format** ships:
+  `dsp_arrow::write_ipc_stream` / `read_ipc_stream` serialize a batch set to/from
+  the self-describing IPC stream bytes, and `dsp-arrow-store`'s
+  `read_time_range_to_ipc_bytes` / `read_value_range_to_ipc_bytes` take a stored
+  read all the way to portable bytes ready for an HTTP body / Arrow Flight / a
+  `.arrow` file. 31 `dsp-arrow` + 9 `dsp-arrow-store` tests; 0 clippy warnings
+  under pedantic+nursery. Still to do: Parquet import/export (a heavier
+  `parquet` dep — assess weight/licensing first), and a Phase-2 `dsp-server`
+  HTTP endpoint exposing the IPC-bytes export (needs the server's single-state
+  router to gain a `SegmentStore` — its own slice).)*
 - **4.6 Correctness semantics:** out-of-order/late data, dedup, upsert, idempotent
   batch ingest, clock skew, precision, tz parsing, leap seconds, query consistency
   during compaction, read-your-writes, snapshot isolation.

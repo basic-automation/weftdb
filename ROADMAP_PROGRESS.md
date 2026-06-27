@@ -2311,3 +2311,116 @@ weight/licensing first — it pulls compression codecs); or (c) pick up the Phas
 stored-range / DB-subject-aspect HTTP API on `dsp-server` (no new core dep).
 
 **PR:** https://github.com/physics515/DSP/pull/26
+
+## 2026-06-27 — Storage→Arrow bridge + Arrow IPC wire format (Phase 4.5, 5 increments)
+
+- **Item:** Phase 4.5 (*Arrow-compatible arrays*). The 2026-06-26 run landed the
+  `Segment`/`PagedSegment` Arrow interchange and named the next step: a
+  `database`-side glue reading a stored aspect range into a `RecordBatch`, kept
+  OUTSIDE the core to preserve the dep boundary. This run built that glue plus
+  the column-level and wire-format layers around it — a complete storage → Arrow
+  → portable-bytes arc.
+
+**Increment 1 — `columns_to_record_batch` logical-column export** (commit `0e69a7e`)
+- `dsp-arrow`: a column-level entry point building a lossless Arrow batch
+  (`timestamp: Int64` + nullable `value: Utf8` decimal text) directly from
+  logical `(Vec<i64>, Vec<Option<BigDecimal>>)` columns — the shape a stored
+  read returns, which may span several `.dspseg` segments of differing
+  encodings, so no single `Segment::version` applies. New `LOGICAL_EXPORT_VERSION`
+  sentinel (0) marks the metadata; physical-type recorded as `BigDecimalText`
+  (the column IS decimal text). Lossless (hard constraint #4). Tests +5 (18→23).
+
+**Increment 2 — `dsp-arrow-store` bridge crate** (commit `2cdd303`)
+- New leaf crate depending on BOTH `database` and `dsp-arrow` — the home crate
+  the prior run's notes called for, so the heavy `arrow-*` tree never reaches the
+  lean core (`database`/`splimes`/`dsp-physical-type` stay arrow-free; `dsp-arrow`
+  still never depends on `database`). `read_time_range_to_record_batch` /
+  `read_value_range_to_record_batch` read a stored aspect range (segment-/value-
+  pruned) straight into one logical Arrow batch, recovering the declared
+  `TimeUnit` from the aspect schema (undeclared aspect → error, not a guess).
+  Wired into the root workspace. Tests: 5 (time-range window, two-segment
+  collapse, value-range band, undeclared-aspect error, empty window).
+
+**Increment 3 — typed logical-column export + typed stored read** (commit `cc9cc1b`)
+- `dsp-arrow`: extracted `typed_value_array` / `text_value_array` from
+  `segment_to_record_batch_typed` (behaviour identical), then
+  `columns_to_record_batch_typed(unit, physical_type, …)` — the column-level
+  typed fast path: F64→Float64, F32→Float32, fixed-scale ScaledI64/ScaledI128→
+  exact Decimal128, text fallback otherwise. Tests +4 (23→27).
+- `dsp-arrow-store`: `read_time_range_to_record_batch_typed` fetches the aspect's
+  one declared encoding (well-defined across all its segments) and exports the
+  typed Arrow column DataFusion/pandas/Flight consume directly. Test +1 (5→6).
+
+**Increment 4 — Arrow IPC stream (de)serialization** (commit `c1f785e`)
+- `dsp-arrow`: `write_ipc_stream(&[RecordBatch]) -> Vec<u8>` /
+  `read_ipc_stream(&[u8]) -> Vec<RecordBatch>` — the standard Arrow IPC stream
+  wire form (self-describing schema written once at the head). `arrow-ipc 59`
+  added to the workspace + `dsp-arrow` only (default features — no lz4/zstd
+  codecs), keeping all arrow deps inside the `dsp-arrow` boundary. New
+  `ConvertError::{Ipc, EmptyBatchSet}`. Tests +4 (27→31) — single-batch +
+  metadata survival, multi-page stream, empty-set rejection, garbage-bytes
+  rejection.
+
+**Increment 5 — stored-range → Arrow IPC bytes (capstone)** (commit `af65dd1`)
+- `dsp-arrow-store`: `read_time_range_to_ipc_bytes` (typed) /
+  `read_value_range_to_ipc_bytes` (lossless) take a stored read all the way to
+  portable IPC stream bytes — ready for an HTTP body, an Arrow Flight payload, or
+  a `.arrow` file. A consumer holding only `dsp-arrow` recovers the columns with
+  `read_ipc_stream` + `record_batches_to_columns`. No new deps (composes the
+  existing typed export + IPC layer). Empty window → valid zero-row stream, not
+  an error. Tests +3 (6→9).
+
+**Build/test/clippy (real, nightly toolchain):**
+- `cargo build --workspace` — GREEN (final full build 14.7s incremental; both new
+  crates compile; `arrow-ipc` is the only new dep, pulled into `dsp-arrow` only).
+- `SKIP_SLOW_TESTS=1 cargo test --workspace --lib -- --test-threads=1` — ALL
+  PASS, 0 failed: database **72**, database_orchestration **17**, **dsp-arrow 31**
+  (this run 18→31), **dsp-arrow-store 9** (this run 0→9), dsp-bench **87**,
+  dsp-line-protocol **11**, dsp-physical-type **152**, dsp-server **36**,
+  dsp-tui **7**, splimes **23**. Total **445** lib tests, 0 failed. Ran serially
+  (`--test-threads=1`): splimes passes 23/23 serially, confirming the prior run's
+  GPU-parallel-contention note is a test-harness artifact, not a regression (the
+  new crates do not touch splimes). SKIP_SLOW_TESTS set to keep the heavy
+  turso/interpolation integration suites (`tests/*.rs`) out of the night's
+  budget; both new crates' tests are lib tests, all ran.
+- Clippy — **0 warnings** in `dsp-arrow` and `dsp-arrow-store` under each crate's
+  pedantic+nursery lints, every increment. Fixed directly, no `#[allow]`:
+  `too_long_first_doc_paragraph` (x2, split first paragraphs),
+  `significant_drop_tightening` (explicit `drop(store)` in a test). Pre-existing
+  untouched warnings elsewhere (`database` 126, `splimes` 4) unchanged — not from
+  this run.
+- `rustfmt` — clean on both touched crates every increment.
+
+**Done vs open:** DONE — the full storage → Arrow → wire-bytes path:
+`columns_to_record_batch[_typed]` (logical-column export), the `dsp-arrow-store`
+bridge (`read_time_range_to_record_batch[_typed]` /
+`read_value_range_to_record_batch`), the Arrow IPC wire format
+(`write_ipc_stream` / `read_ipc_stream`), and the stored-range→bytes capstone
+(`read_*_to_ipc_bytes`). ROADMAP 4.5 status note updated. OPEN (Phase 4/2
+remainder): **Parquet** import/export (heavier `parquet` dep — assess
+weight/licensing first, it pulls compression codecs); a **Phase-2 `dsp-server`
+HTTP endpoint** exposing the IPC-bytes export (needs the server's single-state
+`SharedMetrics` router to gain a `SegmentStore` + a store-root config + a
+content-type — its own slice, deliberately not started late tonight to avoid a
+half-built state refactor); **tag** pruning (4.4, blocked on B-tags not
+existing). Still open from prior runs: Phase-2 stored-range/DB-subject-aspect
+HTTP API, OpenTelemetry; external-engine DuckDB + competitor adapters; the
+standalone methodology document.
+
+**STOP REASON:** natural-arc — five increments (above the 2–4 bar) delivered a
+complete, coherent storage→Arrow→portable-bytes arc, all green. The two workable
+remaining items are clean separate arcs, not quick adds: Parquet pulls a fresh
+heavy dependency (flagged for assessment), and the HTTP endpoint requires a
+`dsp-server` state refactor (its router is single-state today) + `SegmentStore`
+lifecycle design. Forcing either at ~03:20 risks a half-built increment against
+the honesty contract; better as tomorrow's dedicated slice.
+
+**Next step (tomorrow):** (a) the Phase-2 `dsp-server` HTTP endpoint — extend the
+router state from `SharedMetrics` to carry a `SegmentStore` (or a combined
+state), add a configured store root, and serve `read_time_range_to_ipc_bytes`
+behind e.g. `GET /api/v1/.../range?start&end` with
+`application/vnd.apache.arrow.stream`; or (b) assess the `parquet` crate
+(weight/licensing/codecs) and add Parquet import/export from a `RecordBatch` in
+`dsp-arrow`.
+
+**PR:** https://github.com/physics515/DSP/pull/27
