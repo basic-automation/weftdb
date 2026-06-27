@@ -1,0 +1,198 @@
+//! # dsp-arrow-store
+//!
+//! The bridge that reads a **stored** DSP aspect range straight into an Apache
+//! Arrow [`RecordBatch`] — joining the on-disk Storage v2 segment store
+//! ([`database::SegmentStore`], roadmap **Phase 4.3**) to the Arrow interchange
+//! ([`dsp_arrow`], roadmap **Phase 4.5**).
+//!
+//! ## Why this is its own crate
+//!
+//! Both halves are deliberately kept apart in the workspace:
+//!
+//! - `database` is a **hot-path core** crate (hard constraint #2/#3) and must stay
+//!   lean — the heavy `arrow-*` dependency tree may not reach it.
+//! - `dsp-arrow` depends only on `dsp-physical-type` and *never* the reverse, so it
+//!   cannot reach back into `database` to read stored segments.
+//!
+//! So the glue lives **here**, in a leaf crate that may depend on *both* — exactly
+//! the home the Phase-4.5 notes called for ("a `database`-side glue that reads a
+//! stored aspect range straight into a `RecordBatch`, kept OUTSIDE the core to
+//! preserve the dep boundary"). Nothing depends on this crate, so the `arrow-*`
+//! tree stays out of `database`/`splimes`/`dsp-physical-type`.
+//!
+//! ## Vendor-neutrality (hard constraints #2 and #3)
+//!
+//! Arrow is an open, vendor-neutral interchange standard, not a storage backend:
+//! the measurement bytes still live in DSP's own `.dspseg` segments
+//! ([`database::SegmentStore`] reads them), and this crate only *re-expresses* a
+//! read result in Arrow's in-memory shape. No vendor connector enters the core.
+//!
+//! ## What this slice covers
+//!
+//! Two reads, each returning a self-describing, **lossless** Arrow batch:
+//!
+//! - [`read_time_range_to_record_batch`] — the segment-pruned time-range read
+//!   ([`SegmentStore::read_time_range`](database::SegmentStore::read_time_range)),
+//!   re-expressed as a `timestamp: Int64` + nullable `value: Utf8` batch.
+//! - [`read_value_range_to_record_batch`] — the value-pruned read
+//!   ([`SegmentStore::read_value_range`](database::SegmentStore::read_value_range)),
+//!   likewise.
+//!
+//! Both recover the aspect's declared [`TimeUnit`](dsp_physical_type::TimeUnit)
+//! from its schema so the batch carries the right time-unit metadata, and both go
+//! through [`dsp_arrow::columns_to_record_batch`], so the value column is the
+//! always-exact decimal-text form — no value loses a digit crossing into Arrow
+//! (hard constraint #4). A range that spans several `.dspseg` segments of
+//! differing physical encodings collapses cleanly into one logical Arrow batch.
+
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
+use anyhow::{Context, Result};
+use arrow_array::RecordBatch;
+use bigdecimal::BigDecimal;
+use database::SegmentStore;
+use dsp_physical_type::TimeUnit;
+
+/// Read the rows of `aspect` whose timestamp falls in the inclusive `[start, end]`
+/// window and return them as a single lossless Arrow [`RecordBatch`].
+///
+/// The read itself is the segment-pruned
+/// [`SegmentStore::read_time_range`](database::SegmentStore::read_time_range) — the
+/// libSQL index prunes to the overlapping `.dspseg` files before any segment byte
+/// is touched, and a paged frame skips pages within the file too. The resulting
+/// logical columns (which may have crossed several segments) are converted with
+/// [`dsp_arrow::columns_to_record_batch`], tagged with the aspect's declared
+/// [`TimeUnit`].
+///
+/// # Errors
+///
+/// Returns an error if `aspect` has no declared schema in the store (so its
+/// timestamp unit is unknown), or if the underlying time-range read fails (libSQL
+/// prune, filesystem read, or a corrupt `.dspseg` frame).
+pub async fn read_time_range_to_record_batch(store: &SegmentStore, aspect: &str, start: i64, end: i64) -> Result<RecordBatch> {
+	let unit = aspect_time_unit(store, aspect).await?;
+	let (timestamps, values) = store.read_time_range(aspect, start, end).await?;
+	Ok(dsp_arrow::columns_to_record_batch(unit, &timestamps, &values))
+}
+
+/// Read the present rows of `aspect` whose **value** falls in the inclusive
+/// `[lo, hi]` range and return them as a single lossless Arrow [`RecordBatch`].
+///
+/// The read is the value-pruned
+/// [`SegmentStore::read_value_range`](database::SegmentStore::read_value_range)
+/// (only segments whose value span overlaps `[lo, hi]` are opened). Its present
+/// values are re-expressed as the nullable Arrow value column (every row is
+/// present here, so no Arrow null is emitted) with the aspect's declared
+/// [`TimeUnit`].
+///
+/// # Errors
+///
+/// Returns an error if `aspect` has no declared schema in the store, or if the
+/// underlying value-range read fails (libSQL read, filesystem read, or a corrupt
+/// `.dspseg` frame).
+pub async fn read_value_range_to_record_batch(store: &SegmentStore, aspect: &str, lo: &BigDecimal, hi: &BigDecimal) -> Result<RecordBatch> {
+	let unit = aspect_time_unit(store, aspect).await?;
+	let (timestamps, values) = store.read_value_range(aspect, lo, hi).await?;
+	// read_value_range returns only present values; lift them into the nullable
+	// shape columns_to_record_batch expects.
+	let values: Vec<Option<BigDecimal>> = values.into_iter().map(Some).collect();
+	Ok(dsp_arrow::columns_to_record_batch(unit, &timestamps, &values))
+}
+
+/// Resolve the declared timestamp [`TimeUnit`] for `aspect`, erroring if the aspect
+/// was never declared in the store (its unit would otherwise be a guess).
+async fn aspect_time_unit(store: &SegmentStore, aspect: &str) -> Result<TimeUnit> {
+	let schema = store.schema_for(aspect).await?.with_context(|| format!("aspect `{aspect}` has no declared schema in the segment store"))?;
+	Ok(schema.timestamp_unit)
+}
+
+#[cfg(test)]
+mod tests {
+	use std::str::FromStr;
+
+	use bigdecimal::BigDecimal;
+	use database::SegmentStore;
+	use dsp_arrow::{record_batch_to_columns, META_TIME_UNIT, VALUE_COLUMN};
+	use dsp_physical_type::{AspectSchema, PhysicalType, TimeUnit};
+	use tempfile::TempDir;
+
+	use super::*;
+
+	fn bd(s: &str) -> BigDecimal {
+		BigDecimal::from_str(s).expect("test literal parses")
+	}
+
+	async fn store_with_aspect(unit: TimeUnit, physical: PhysicalType) -> (TempDir, SegmentStore) {
+		let dir = TempDir::new().expect("temp dir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens store");
+		store.declare("price", &AspectSchema::new(physical, bd("0"), unit)).await.expect("declares aspect");
+		(dir, store)
+	}
+
+	#[tokio::test]
+	async fn time_range_read_exports_a_lossless_batch() {
+		let (_dir, store) = store_with_aspect(TimeUnit::Seconds, PhysicalType::BigDecimalText).await;
+		let timestamps = vec![100_i64, 110, 120, 130, 140];
+		let values = vec![bd("1.5"), bd("2.5"), bd("3.5"), bd("4.5"), bd("5.5")];
+		store.seal_declared("price", &timestamps, &values).await.expect("seals");
+
+		// A window that excludes the first and last point.
+		let batch = read_time_range_to_record_batch(&store, "price", 110, 130).await.expect("exports");
+		assert_eq!(batch.num_rows(), 3);
+		assert_eq!(batch.schema_ref().metadata().get(META_TIME_UNIT).map(String::as_str), Some("seconds"));
+
+		let (ts, vs) = record_batch_to_columns(&batch).expect("reads back");
+		assert_eq!(ts, vec![110, 120, 130]);
+		assert_eq!(vs, vec![Some(bd("2.5")), Some(bd("3.5")), Some(bd("4.5"))]);
+	}
+
+	#[tokio::test]
+	async fn time_range_read_spanning_two_segments_collapses_to_one_batch() {
+		let (_dir, store) = store_with_aspect(TimeUnit::Millis, PhysicalType::F64).await;
+		// Two separately sealed segments → the read crosses both.
+		store.seal_declared("price", &[1_i64, 2, 3], &[bd("1"), bd("2"), bd("3")]).await.expect("seals seg 1");
+		store.seal_declared("price", &[4_i64, 5, 6], &[bd("4"), bd("5"), bd("6")]).await.expect("seals seg 2");
+
+		let batch = read_time_range_to_record_batch(&store, "price", 1, 6).await.expect("exports");
+		assert_eq!(batch.num_rows(), 6);
+		let (ts, vs) = record_batch_to_columns(&batch).expect("reads back");
+		assert_eq!(ts, vec![1, 2, 3, 4, 5, 6]);
+		assert_eq!(vs, (1..=6).map(|v| Some(BigDecimal::from(v))).collect::<Vec<_>>());
+	}
+
+	#[tokio::test]
+	async fn value_range_read_exports_only_in_band_rows() {
+		let (_dir, store) = store_with_aspect(TimeUnit::Micros, PhysicalType::BigDecimalText).await;
+		let timestamps = vec![1_i64, 2, 3, 4, 5];
+		let values = vec![bd("10"), bd("20"), bd("30"), bd("40"), bd("50")];
+		store.seal_declared("price", &timestamps, &values).await.expect("seals");
+
+		let batch = read_value_range_to_record_batch(&store, "price", &bd("20"), &bd("40")).await.expect("exports");
+		assert_eq!(batch.num_rows(), 3);
+		// Every exported row is present — no Arrow nulls in a value-range read.
+		assert_eq!(batch.column_by_name(VALUE_COLUMN).unwrap().null_count(), 0);
+		let (_ts, vs) = record_batch_to_columns(&batch).expect("reads back");
+		assert_eq!(vs, vec![Some(bd("20")), Some(bd("30")), Some(bd("40"))]);
+	}
+
+	#[tokio::test]
+	async fn undeclared_aspect_is_an_error() {
+		let dir = TempDir::new().expect("temp dir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens store");
+		// Never declare any aspect: the read cannot know the timestamp unit.
+		let err = read_time_range_to_record_batch(&store, "never_declared", 0, 100).await.expect_err("must error");
+		drop(store);
+		assert!(err.to_string().contains("no declared schema"), "got: {err}");
+	}
+
+	#[tokio::test]
+	async fn empty_window_exports_a_zero_row_batch() {
+		let (_dir, store) = store_with_aspect(TimeUnit::Seconds, PhysicalType::BigDecimalText).await;
+		store.seal_declared("price", &[10_i64, 20], &[bd("1"), bd("2")]).await.expect("seals");
+		// A window past every stored point.
+		let batch = read_time_range_to_record_batch(&store, "price", 1_000, 2_000).await.expect("exports");
+		assert_eq!(batch.num_rows(), 0);
+		// Still self-describing.
+		assert_eq!(batch.schema_ref().metadata().get(META_TIME_UNIT).map(String::as_str), Some("seconds"));
+	}
+}
