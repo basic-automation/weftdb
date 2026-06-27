@@ -93,6 +93,17 @@ pub const VALUE_ENCODING_F32: &str = "f32";
 /// [`ScaledI128`](dsp_physical_type::PhysicalType::ScaledI128) encodings.
 pub const VALUE_ENCODING_DECIMAL128: &str = "decimal128";
 
+/// Format-version sentinel written into [`META_FORMAT_VERSION`] for a batch built
+/// from **logical columns** rather than a single sealed segment.
+///
+/// A time- or value-range read of the segment store
+/// ([`columns_to_record_batch`]) can span many `.dspseg` segments of differing
+/// format versions and physical encodings, so no single
+/// [`SEGMENT_FORMAT_VERSION`](dsp_physical_type::Segment::version) applies. `0`
+/// marks the batch as a logical-column export (the lossless decimal-text form),
+/// distinct from any real on-disk segment version (which start at 1).
+pub const LOGICAL_EXPORT_VERSION: u16 = 0;
+
 /// Why a [`RecordBatch`] could not be converted back into DSP columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConvertError {
@@ -171,6 +182,36 @@ pub fn segment_to_record_batch(seg: &Segment) -> RecordBatch {
 	let (timestamps, values) = seg.decode_nullable();
 	let val_array: ArrayRef = Arc::new(values.iter().map(|opt| opt.as_ref().map(BigDecimal::to_plain_string)).collect::<StringArray>());
 	assemble_batch(seg, &timestamps, val_array, VALUE_ENCODING_TEXT)
+}
+
+/// Build a self-describing, lossless Arrow [`RecordBatch`] directly from DSP's
+/// **logical columns** — a dense `timestamp: Int64` column and a value column
+/// aligned to it, with [`None`] at each absent row.
+///
+/// This is the column-level entry point used when the source is *not* a single
+/// sealed [`Segment`] but a logical read that may have crossed several segments —
+/// for example a time- or value-range read of the segment store, whose result is
+/// exactly a `(Vec<i64>, Vec<Option<BigDecimal>>)`. It emits the same two-column
+/// shape as [`segment_to_record_batch`] (non-null `timestamp: Int64`, nullable
+/// `value: Utf8` plain decimal text), so [`record_batch_to_columns`] reads it back
+/// unchanged.
+///
+/// Because the columns may span multiple physical encodings, the metadata records
+/// the lossless logical view rather than any one segment's: the physical-type name
+/// is [`PhysicalType::BigDecimalText`] (the value column *is* decimal text) and the
+/// format version is [`LOGICAL_EXPORT_VERSION`]. The conversion is lossless — no
+/// value loses a digit crossing into Arrow (hard constraint #4).
+///
+/// # Panics
+///
+/// Panics if `timestamps` and `values` differ in length: the two Arrow columns
+/// must share a row count. Callers pass columns that are already aligned (the
+/// segment-store readers always do), so this signals a caller bug, not bad data.
+#[must_use]
+pub fn columns_to_record_batch(unit: TimeUnit, timestamps: &[i64], values: &[Option<BigDecimal>]) -> RecordBatch {
+	assert_eq!(timestamps.len(), values.len(), "timestamp and value columns must share a row count");
+	let val_array: ArrayRef = Arc::new(values.iter().map(|opt| opt.as_ref().map(BigDecimal::to_plain_string)).collect::<StringArray>());
+	build_record_batch(unit, PhysicalType::BigDecimalText.name(), LOGICAL_EXPORT_VERSION, timestamps, val_array, VALUE_ENCODING_TEXT)
 }
 
 /// Convert a sealed [`Segment`] into an Arrow [`RecordBatch`] using the **typed
@@ -708,5 +749,61 @@ mod tests {
 		assert!(paged_segment_to_record_batches(&paged).is_empty());
 		// Rebuilding from no batches cannot recover the unit, so it is an error.
 		assert_eq!(paged_segment_from_record_batches(&[], &bd("0"), 4), Err(ConvertError::MissingMetadata(META_TIME_UNIT)));
+	}
+
+	#[test]
+	fn logical_columns_round_trip_through_arrow() {
+		// The shape a segment-store time-range read returns: a dense timestamp
+		// column and a nullable value column that may have crossed several segments.
+		let timestamps = vec![100_i64, 110, 120, 130, 140];
+		let values = ncol(&[Some("1.5"), None, Some("3.5"), Some("4.0"), None]);
+		let batch = columns_to_record_batch(TimeUnit::Millis, &timestamps, &values);
+
+		assert_eq!(batch.num_columns(), 2);
+		assert_eq!(batch.num_rows(), 5);
+		// Lossless text form, with the two gaps as Arrow validity bits.
+		assert_eq!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), &DataType::Utf8);
+		let val_array = batch.column_by_name(VALUE_COLUMN).unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+		assert_eq!(val_array.null_count(), 2);
+
+		let (ts, vs) = record_batch_to_columns(&batch).expect("reads back");
+		assert_eq!(ts, timestamps);
+		assert_eq!(vs, values);
+	}
+
+	#[test]
+	fn logical_columns_metadata_marks_the_logical_export() {
+		let batch = columns_to_record_batch(TimeUnit::Nanos, &[1_i64], &[Some(bd("2.5"))]);
+		let md = batch.schema_ref().metadata();
+		assert_eq!(md.get(META_TIME_UNIT).map(String::as_str), Some("nanos"));
+		assert_eq!(md.get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_TEXT));
+		// Physical type is the lossless logical text form, version is the sentinel.
+		assert_eq!(md.get(META_PHYSICAL_TYPE).map(String::as_str), Some(PhysicalType::BigDecimalText.name()));
+		assert_eq!(md.get(META_FORMAT_VERSION).map(String::as_str), Some(&LOGICAL_EXPORT_VERSION.to_string()[..]));
+	}
+
+	#[test]
+	fn logical_columns_high_precision_is_lossless() {
+		// Crossing into Arrow as text keeps every digit, even past f64/i128 range.
+		let huge = "123456789012345678901234567890.123456789012345678901234567890";
+		let timestamps = vec![1_i64, 2];
+		let values = vec![Some(bd(huge)), Some(bd("-0.000000000000000000000000000001"))];
+		let batch = columns_to_record_batch(TimeUnit::Nanos, &timestamps, &values);
+		let (_ts, vs) = record_batch_to_columns(&batch).expect("reads back");
+		assert_eq!(vs, values);
+	}
+
+	#[test]
+	fn logical_columns_empty_is_a_zero_row_batch() {
+		let batch = columns_to_record_batch(TimeUnit::Seconds, &[], &[]);
+		assert_eq!(batch.num_rows(), 0);
+		let (ts, vs) = record_batch_to_columns(&batch).expect("reads back");
+		assert!(ts.is_empty() && vs.is_empty());
+	}
+
+	#[test]
+	#[should_panic(expected = "share a row count")]
+	fn logical_columns_reject_mismatched_lengths() {
+		let _ = columns_to_record_batch(TimeUnit::Seconds, &[1_i64, 2], &[Some(bd("1.0"))]);
 	}
 }
