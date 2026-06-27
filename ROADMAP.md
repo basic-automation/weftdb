@@ -385,6 +385,33 @@ JSON").
   pages too). Still to do: **tag** pruning (per-measurement tags/labels — backlog
   B-tags — do not exist yet, so tag-based skipping has nothing to prune on).)*
 - **4.5 Arrow-compatible arrays** (eases Python/Flight/DataFusion/Parquet).
+  *(Started — the vendor-neutral **`dsp-arrow`** crate ships the Apache Arrow
+  interchange for a sealed `dsp-physical-type` `Segment`/`PagedSegment`, kept in
+  its own leaf crate (depends on `dsp-physical-type`, never the reverse) so the
+  heavy `arrow-*` dependency never reaches the hot-path core. Apache Arrow is an
+  open in-memory interchange standard — not a storage backend (hard constraint #3
+  untouched: `.dspseg` still owns the hot path) and not a vendor connector (hard
+  constraint #2 untouched). `segment_to_record_batch` emits a lossless two-column
+  batch — `timestamp: Int64` + `value: Utf8` (plain decimal text, Arrow validity
+  for nulls) — with the segment's `TimeUnit`/physical-encoding/version in the
+  self-describing schema metadata; `record_batch_to_columns` /
+  `segment_from_record_batch` invert it. A **typed numeric fast path**
+  (`segment_to_record_batch_typed`) emits the natural Arrow array per physical
+  encoding: `F64 -> Float64`, `F32 -> Float32`, and the fixed-scale
+  `ScaledI64`/`ScaledI128 -> Decimal128` **exactly** (no float rounding), with the
+  per-value-scale `Decimal128` and variable-width `BigDecimalText` falling back to
+  the always-correct text column. The reader dispatches on the value column's
+  actual Arrow type, so either form round-trips, honoring hard constraint #4 (no
+  silent downcast — text and Decimal128 paths are exact, the float path reproduces
+  the already-stored f64/f32 bits). **`PagedSegment` interchange** ships too:
+  `paged_segment_to_record_batches` emits one batch per page (the Arrow-idiomatic
+  stream, preserving the Phase-4.4 page-skipping structure),
+  `paged_segment_to_record_batch` collapses to one, and
+  `record_batches_to_columns` / `paged_segment_from_record_batches` invert them.
+  18 tests; 0 clippy warnings under pedantic+nursery. Still to do: Parquet
+  import/export, and a `database`-side glue that reads a stored aspect range
+  straight into a `RecordBatch` (kept outside the core to preserve the dep
+  boundary).)*
 - **4.6 Correctness semantics:** out-of-order/late data, dedup, upsert, idempotent
   batch ingest, clock skew, precision, tz parsing, leap seconds, query consistency
   during compaction, read-your-writes, snapshot isolation.
