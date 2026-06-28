@@ -149,6 +149,141 @@ pub async fn storage_value_range(State(state): State<AppState>, Path(aspect): Pa
 	Ok(arrow_stream_response(result.map_err(|err| classify_read_error(&err))?))
 }
 
+/// One declared aspect's identity in the [`AspectListResponse`].
+#[derive(Debug, Clone, Serialize)]
+pub struct AspectInfo {
+	/// The aspect name (unique within the store's `(database, subject)` scope).
+	pub name: String,
+	/// The declared physical encoding token (e.g. `"f64"`, `"scaled_i64"`).
+	pub physical_type: &'static str,
+	/// The declared per-value error tolerance (decimal text — `"0"` for an exact
+	/// encoding).
+	pub value_tolerance: String,
+	/// The declared timestamp unit token (e.g. `"seconds"`, `"millis"`).
+	pub timestamp_unit: &'static str,
+}
+
+/// Response body for `GET /api/v1/storage/aspects`.
+#[derive(Debug, Clone, Serialize)]
+pub struct AspectListResponse {
+	/// The declared aspects, in store order.
+	pub aspects: Vec<AspectInfo>,
+}
+
+/// Response body for `GET /api/v1/storage/{aspect}/stats` — the materialized
+/// segment-set rollup, including the north-star storage cost in bytes per point.
+#[derive(Debug, Clone, Serialize)]
+pub struct AspectStatsResponse {
+	/// The aspect this rollup describes.
+	pub aspect: String,
+	/// Number of sealed segments.
+	pub segment_count: usize,
+	/// Total rows (present and null) across every segment.
+	pub total_rows: u64,
+	/// Total null rows across every segment.
+	pub total_nulls: u64,
+	/// Total realized on-disk bytes across every `.dspseg` frame.
+	pub total_bytes: u64,
+	/// The north-star cost term: total framed bytes over total rows (0 when empty).
+	pub bytes_per_point: f64,
+	/// Inclusive `[min, max]` timestamp span, or `null` when the aspect holds no
+	/// non-empty segment.
+	pub time_range: Option<[i64; 2]>,
+	/// Inclusive `[min, max]` value span as decimal text, or `null` when the aspect
+	/// holds no value-bearing segment.
+	pub value_range: Option<[String; 2]>,
+}
+
+/// Response body for `GET /api/v1/storage/stats` — the store-wide aggregate.
+#[derive(Debug, Clone, Serialize)]
+pub struct StoreStatsResponse {
+	/// Number of aspects with a materialized rollup.
+	pub aspect_count: usize,
+	/// Total sealed segments across every aspect.
+	pub segment_count: usize,
+	/// Total rows (present and null) across every aspect.
+	pub total_rows: u64,
+	/// Total null rows across every aspect.
+	pub total_nulls: u64,
+	/// Total realized on-disk bytes across every aspect's `.dspseg` frames.
+	pub total_bytes: u64,
+	/// The store-wide north-star cost term: total framed bytes over total rows.
+	pub bytes_per_point: f64,
+	/// Inclusive `[min, max]` timestamp span across the union of aspects, or `null`.
+	pub time_range: Option<[i64; 2]>,
+}
+
+/// Collect the declared aspects and their schemas into the response DTO. Kept as a
+/// free async fn taking `&SegmentStore` so the handler can drop the store handle
+/// before building its response.
+async fn collect_aspects(store: &database::SegmentStore) -> anyhow::Result<Vec<AspectInfo>> {
+	let names = store.list_declared_aspects().await?;
+	let mut aspects = Vec::with_capacity(names.len());
+	for name in names {
+		if let Some(schema) = store.schema_for(&name).await? {
+			aspects.push(AspectInfo { name, physical_type: schema.value.name(), value_tolerance: schema.value_tolerance.to_string(), timestamp_unit: schema.timestamp_unit.name() });
+		}
+	}
+	Ok(aspects)
+}
+
+/// Handle `GET /api/v1/storage/aspects`: list the store's declared aspects and the
+/// physical encoding / timestamp unit each was declared under.
+///
+/// # Errors
+///
+/// [`StorageError::Unconfigured`] when no store is attached, or
+/// [`StorageError::Internal`] on a control-plane read failure.
+pub async fn storage_aspects(State(state): State<AppState>) -> Result<Json<AspectListResponse>, StorageError> {
+	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	drop(state);
+	let result = collect_aspects(&store).await;
+	drop(store);
+	let aspects = result.map_err(|err| StorageError::Internal(err.to_string()))?;
+	Ok(Json(AspectListResponse { aspects }))
+}
+
+/// Handle `GET /api/v1/storage/{aspect}/stats`.
+///
+/// Returns the aspect's materialized segment-set rollup, including the north-star
+/// bytes/point. An aspect with no sealed segments reports the empty rollup (all
+/// zeros), not an error.
+///
+/// # Errors
+///
+/// [`StorageError::Unconfigured`] when no store is attached, or
+/// [`StorageError::Internal`] on a control-plane read failure.
+pub async fn storage_aspect_stats(State(state): State<AppState>, Path(aspect): Path<String>) -> Result<Json<AspectStatsResponse>, StorageError> {
+	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	drop(state);
+	let result = store.aspect_metadata(&aspect).await;
+	drop(store);
+	let meta = result.map_err(|err| StorageError::Internal(err.to_string()))?;
+	// Read the borrowing accessor and the Copy fields before moving `value_range` out.
+	let bytes_per_point = meta.bytes_per_point();
+	let time_range = meta.time_range.map(Into::into);
+	let value_range = meta.value_range.map(|(lo, hi)| [lo.to_string(), hi.to_string()]);
+	Ok(Json(AspectStatsResponse { aspect, segment_count: meta.segment_count, total_rows: meta.total_rows, total_nulls: meta.total_nulls, total_bytes: meta.total_bytes, bytes_per_point, time_range, value_range }))
+}
+
+/// Handle `GET /api/v1/storage/stats`: the store-wide aggregate over every aspect's
+/// rollup — the subject-wide north-star bytes/point.
+///
+/// # Errors
+///
+/// [`StorageError::Unconfigured`] when no store is attached, or
+/// [`StorageError::Internal`] on a control-plane read failure.
+pub async fn storage_stats(State(state): State<AppState>) -> Result<Json<StoreStatsResponse>, StorageError> {
+	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	drop(state);
+	let result = store.store_stats().await;
+	drop(store);
+	let summary = result.map_err(|err| StorageError::Internal(err.to_string()))?;
+	let bytes_per_point = summary.bytes_per_point();
+	let time_range = summary.time_range.map(Into::into);
+	Ok(Json(StoreStatsResponse { aspect_count: summary.aspect_count, segment_count: summary.segment_count, total_rows: summary.total_rows, total_nulls: summary.total_nulls, total_bytes: summary.total_bytes, bytes_per_point, time_range }))
+}
+
 #[cfg(test)]
 mod tests {
 	use std::{str::FromStr, sync::Arc};
@@ -251,6 +386,59 @@ mod tests {
 		// A router with no configured store (the default) answers 503.
 		let router = app_with_state(AppState::new());
 		let response = router.oneshot(Request::builder().uri("/api/v1/storage/price/range?start=0&end=100").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+	}
+
+	/// Fetch and parse a JSON GET response from a router.
+	async fn get_json(router: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+		let response = router.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+		let status = response.status();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		(status, serde_json::from_slice(&bytes).unwrap())
+	}
+
+	#[tokio::test]
+	async fn aspects_lists_the_declared_aspect_with_its_schema() {
+		let (_dir, router) = router_with_sealed_price().await;
+		let (status, body) = get_json(router, "/api/v1/storage/aspects").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		let aspects = body["aspects"].as_array().unwrap();
+		assert_eq!(aspects.len(), 1);
+		assert_eq!(aspects[0]["name"], "price");
+		assert_eq!(aspects[0]["physical_type"], "f64");
+		assert_eq!(aspects[0]["timestamp_unit"], "seconds");
+	}
+
+	#[tokio::test]
+	async fn aspect_stats_reports_rows_span_and_bytes_per_point() {
+		let (_dir, router) = router_with_sealed_price().await;
+		let (status, body) = get_json(router, "/api/v1/storage/price/stats").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["aspect"], "price");
+		assert!(body["segment_count"].as_u64().unwrap() >= 1);
+		assert_eq!(body["total_rows"], 5);
+		// Five points were sealed across [100, 140].
+		assert_eq!(body["time_range"][0], 100);
+		assert_eq!(body["time_range"][1], 140);
+		// The north-star cost term is a positive, finite bytes/point.
+		let bpp = body["bytes_per_point"].as_f64().unwrap();
+		assert!(bpp > 0.0 && bpp.is_finite(), "bytes_per_point = {bpp}");
+	}
+
+	#[tokio::test]
+	async fn store_stats_aggregates_over_aspects() {
+		let (_dir, router) = router_with_sealed_price().await;
+		let (status, body) = get_json(router, "/api/v1/storage/stats").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["aspect_count"], 1);
+		assert_eq!(body["total_rows"], 5);
+		assert!(body["bytes_per_point"].as_f64().unwrap() > 0.0);
+	}
+
+	#[tokio::test]
+	async fn stats_without_store_is_unavailable() {
+		let router = app_with_state(AppState::new());
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/stats").body(Body::empty()).unwrap()).await.unwrap();
 		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 	}
 }
