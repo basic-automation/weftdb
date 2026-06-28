@@ -2424,3 +2424,115 @@ behind e.g. `GET /api/v1/.../range?start&end` with
 `dsp-arrow`.
 
 **PR:** https://github.com/physics515/DSP/pull/27
+
+## 2026-06-28 — dsp-server stored-range query surface (Phase 2, 5 increments)
+
+- **Item:** Phase 2 (*benchmark-grade server/API*) — the **stored-range / raw
+  range query** surface, the item the 2026-06-27 run named as tomorrow's slice
+  (option (a): "extend the router state from `SharedMetrics` to carry a
+  `SegmentStore`… serve `read_time_range_to_ipc_bytes`"). This run built that end
+  to end: the state refactor, the Arrow IPC range/value endpoints, the binary
+  wiring + readiness, the introspection/bytes-per-point stats, and a JSON
+  (non-Arrow) range read. Five increments, one coherent arc.
+
+**Increment 1 — combined `AppState` via `FromRef`** (commit `e759ddd`)
+- New `dsp-server/src/state.rs`: `AppState { metrics: SharedMetrics, store:
+  Option<Arc<database::SegmentStore>> }` plus `FromRef<AppState> for
+  SharedMetrics`, so every existing handler keeps extracting
+  `State<SharedMetrics>` unchanged — only the new storage handlers extract the
+  whole state. `app()`/`app_with_metrics` now route through a new
+  `app_with_state(AppState)`. The store is optional (no root → stateless API as
+  before). Added the `database` path dep. Tests +2 (36→38).
+
+**Increment 2 — stored-range Arrow IPC endpoints** (commit `4603b81`)
+- New `dsp-server/src/storage.rs`: `GET /api/v1/storage/{aspect}/range?start&end`
+  and `…/value-range?lo&hi` stream Apache Arrow IPC bytes
+  (`application/vnd.apache.arrow.stream`) via
+  `dsp_arrow_store::read_time_range_to_ipc_bytes` /
+  `read_value_range_to_ipc_bytes` (value bounds parsed as `BigDecimal`, no float
+  round-trip). `StorageError` maps causes: no store → 503, undeclared aspect →
+  404, unparseable bound → 400, read/serialize → 500. The heavy `arrow-*` tree
+  reaches the server only transitively through the `dsp-arrow-store` bridge — the
+  hot-path core stays arrow-free (hard constraints #2/#3). Added the
+  `dsp-arrow-store` path dep. Tests +6 (38→44).
+
+**Increment 3 — store-root wiring + readiness reflection** (commit `a8e3a21`)
+- `main.rs` opens a `SegmentStore` from `DSP_SEGMENT_STORE_ROOT` (else stateless;
+  mode logged at start). `GET /ready` now extracts the `AppState` and reports
+  `segment_store: bool` so an operator can confirm the storage endpoints are live
+  from a plain probe. Tests +1 (44→45).
+
+**Increment 4 — introspection + north-star bytes/point stats** (commit `f117c48`)
+- Read-only JSON: `GET /api/v1/storage/aspects` (declared aspects + physical
+  encoding + timestamp unit), `…/storage/{aspect}/stats` (the materialized
+  `metadata.db` rollup — segment/row/null counts, framed bytes, ts/value spans,
+  and **`bytes_per_point`**, the commercial-thesis north-star cost term, the O(1)
+  `aspect_metadata` read), and `…/storage/stats` (store-wide aggregate via
+  `store_stats`). Pure control-plane reads — no segment file opened (hard
+  constraint #3). Tests +4 (45→49).
+
+**Increment 5 — JSON stored-range read** (commit `c751e0e`)
+- `GET /api/v1/storage/{aspect}/points?start&end` — the non-Arrow counterpart of
+  the range read (backlog B-rest, the REST/JSON tier): `{ aspect, time_unit,
+  count, points: [{ timestamp, value }] }` from `SegmentStore::read_time_range`,
+  values as lossless decimal text (null rows → JSON `null`), tagged with the
+  aspect's declared timestamp unit. Undeclared aspect → 404. Tests +3 (49→52).
+
+**Build/test/clippy (real, nightly toolchain `rustc 1.98.0-nightly`):**
+- `cargo build --workspace` — GREEN (full build 1m00s; the only new crate deps
+  are `database`/`dsp-arrow-store` pulled into `dsp-server`).
+- `SKIP_SLOW_TESTS=1 cargo test --workspace --lib -- --test-threads=1` — all lib
+  suites pass: database **72**, database_orchestration **17**, dsp-arrow **31**,
+  dsp-arrow-store **9**, dsp-bench **87**, dsp-line-protocol **11**,
+  dsp-physical-type **152**, **dsp-server 52** (this run 36→52, +16),
+  dsp-tui **7**, splimes **23**. Total **461** lib tests. SKIP_SLOW_TESTS set to
+  keep the heavy turso/interpolation integration suites (`tests/*.rs`) out of the
+  night's budget; all five increments' tests are dsp-server lib tests and all ran.
+- **One flaky failure, NOT a regression:** in the combined serial run
+  `splimes::tests::quadratic::test_quadratic_interpolation` failed at
+  `quadratic.rs:111` — a **GPU** CPU-vs-GPU cosine-similarity assertion, sensitive
+  to GPU contention (this box had other GPU processes live: `laurelane.exe`,
+  `cargo-tauri.exe`). Re-running `cargo test -p splimes --lib --test-threads=1`
+  in isolation passed **23/23**. This run touched **only** `dsp-server`
+  (`git diff --stat` since `c070b40`: Cargo.lock + the 5 dsp-server files, 799
+  insertions) — splimes/GPU are untouched, so the flake cannot stem from this
+  work.
+- Clippy — **0 warnings** in `dsp-server` under its pedantic+nursery lints, every
+  increment. Fixed directly, no `#[allow]`: `significant_drop_tightening` (the
+  `Arc<SegmentStore>` significant-`Drop` handle — resolved by dropping it right
+  after the by-ref read in handlers, and by keeping the bare store's last use at a
+  helper's tail expression in tests), `const fn` promotions, several
+  `too_long_first_doc_paragraph` splits, `similar_names` (`stats`→`summary` vs
+  `state`), and `tuple_array_conversions` (`(i64,i64)` → `[i64;2]` via
+  `Into::into`). Pre-existing untouched warnings elsewhere (`database` 126,
+  `splimes` 4) unchanged.
+
+**Done vs open:** DONE — the full Phase-2 stored-range query surface on
+`dsp-server`: the `AppState`/`FromRef` refactor, two **Arrow IPC** reads
+(range + value-range), the **JSON** range read (`/points`), three
+**introspection/stats** endpoints exposing the north-star **bytes/point**, the
+`DSP_SEGMENT_STORE_ROOT` wiring, and `/ready` reflecting the store. ROADMAP
+Phase-2 status note + Phase-4.5 "still to do" updated (the IPC-bytes HTTP export
+the prior run flagged is now shipped). OPEN (Phase 2/4 remainder): DB/subject/
+aspect **management** over HTTP (create/declare — currently the store is
+populated only in-process); **Parquet** import/export (heavier `parquet` dep —
+assess weight/licensing first, it pulls compression codecs); **OpenTelemetry**;
+**tag** pruning (4.4, blocked on B-tags); the external-engine **DuckDB** +
+competitor adapters; the standalone **methodology** document.
+
+**STOP REASON:** natural-arc — five green increments (above the 2–4 bar)
+delivered a complete, coherent stored-range query surface end to end. The
+workable remaining items are clean separate arcs, not quick adds: Parquet pulls a
+fresh heavy dependency (flagged for assessment), HTTP catalog management is its
+own write-path slice, and the DuckDB adapter needs a vendor dep + Windows
+build assessment. Better as dedicated slices than forced on at ~03:35 against the
+honesty contract.
+
+**Next step (tomorrow):** (a) **HTTP catalog management** — `POST` endpoints to
+create a database/subject and `declare` an aspect's schema/physical-type over
+HTTP, so a client can populate the store the new read endpoints serve (closes the
+"DB/subject/aspect management" + "schema & physical-type definition" Phase-2
+gaps); or (b) assess the `parquet` crate (weight/licensing/codecs) and add
+Parquet import/export from a `RecordBatch` in `dsp-arrow`.
+
+**PR:** https://github.com/physics515/DSP/pull/28
