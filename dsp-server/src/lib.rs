@@ -71,18 +71,22 @@ impl Default for HealthResponse {
 /// Response body for the readiness probe (`GET /ready`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReadyResponse {
-	/// `true` once the service can accept traffic. Unconditional today; gains
-	/// real dependency checks as the control plane and segment store are wired in.
+	/// `true` once the service can accept traffic. The stateless API is always
+	/// ready; this gains further dependency checks as more of the control plane is
+	/// wired in.
 	pub ready: bool,
 	/// Logical service name ([`SERVICE`]).
 	pub service: &'static str,
 	/// Running build version ([`VERSION`]).
 	pub version: &'static str,
+	/// Whether a segment store is configured — i.e. the storage-query endpoints
+	/// (`/api/v1/storage/...`) are live rather than answering `503`.
+	pub segment_store: bool,
 }
 
 impl Default for ReadyResponse {
 	fn default() -> Self {
-		Self { ready: true, service: SERVICE, version: VERSION }
+		Self { ready: true, service: SERVICE, version: VERSION, segment_store: false }
 	}
 }
 
@@ -115,9 +119,11 @@ async fn health() -> Json<HealthResponse> {
 	Json(HealthResponse::default())
 }
 
-/// Readiness probe: the service is ready to accept traffic.
-async fn ready() -> Json<ReadyResponse> {
-	Json(ReadyResponse::default())
+/// Readiness probe: the service is ready to accept traffic. Reports whether a
+/// segment store is configured so an operator can confirm the storage endpoints
+/// are live.
+async fn ready(axum::extract::State(state): axum::extract::State<AppState>) -> Json<ReadyResponse> {
+	Json(ReadyResponse { segment_store: state.store().is_some(), ..ReadyResponse::default() })
 }
 
 #[cfg(test)]
@@ -153,6 +159,27 @@ mod tests {
 		assert_eq!(body["ready"], true);
 		assert_eq!(body["service"], SERVICE);
 		assert_eq!(body["version"], VERSION);
+		// The default router has no segment store, so the storage endpoints are off.
+		assert_eq!(body["segment_store"], false);
+	}
+
+	#[tokio::test]
+	async fn ready_reports_a_configured_segment_store() {
+		use std::sync::Arc;
+
+		use database::SegmentStore;
+		use tempfile::TempDir;
+
+		let dir = TempDir::new().unwrap();
+		// Construct the store inline so the significant-`Drop` `SegmentStore` is never
+		// bound on its own (avoids the drop-tightening lint).
+		let router = app_with_state(AppState::new().with_store(Arc::new(SegmentStore::open(dir.path()).await.unwrap())));
+		let response = router.oneshot(Request::builder().uri("/ready").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		// With a store attached, readiness advertises the storage endpoints as live.
+		assert_eq!(body["segment_store"], true);
 	}
 
 	#[tokio::test]
