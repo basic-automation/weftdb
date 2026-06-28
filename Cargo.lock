@@ -196,10 +196,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrow-ipc"
+version = "59.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e57ee4d470eab1a021bc4b63fa2b2c15d572892bf227b0a982d3b755a6c662b5"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-data",
+ "arrow-schema",
+ "arrow-select",
+ "flatbuffers",
+]
+
+[[package]]
 name = "arrow-schema"
 version = "59.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "80b3e786a0dd9103acd583a6fb486dbf2f3268466cc0bd571dcf34cef231c1f1"
+
+[[package]]
+name = "arrow-select"
+version = "59.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "067a67e0361f6c31f4a7248759f36ca4ca71b187a941ed4d49da1c7d3d4db624"
+dependencies = [
+ "ahash",
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-data",
+ "arrow-schema",
+ "num-traits",
+]
 
 [[package]]
 name = "ash"
@@ -1231,9 +1259,24 @@ name = "dsp-arrow"
 version = "0.1.0"
 dependencies = [
  "arrow-array",
+ "arrow-ipc",
  "arrow-schema",
  "bigdecimal",
  "dsp-physical-type",
+]
+
+[[package]]
+name = "dsp-arrow-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "bigdecimal",
+ "database",
+ "dsp-arrow",
+ "dsp-physical-type",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -1281,10 +1324,15 @@ dependencies = [
  "axum",
  "bigdecimal",
  "chrono",
+ "database",
+ "dsp-arrow",
+ "dsp-arrow-store",
  "dsp-line-protocol",
+ "dsp-physical-type",
  "serde",
  "serde_json",
  "splimes",
+ "tempfile",
  "tokio",
  "tower",
 ]
@@ -1489,6 +1537,16 @@ name = "fixedbitset"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ce7134b9999ecaf8bcd65542e436736ef32ddca1b3e06094cb6ec5755203b80"
+
+[[package]]
+name = "flatbuffers"
+version = "25.12.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "35f6839d7b3b98adde531effaf34f0c2badc6f4735d26fe74709d8e513a96ef3"
+dependencies = [
+ "bitflags 2.13.0",
+ "rustc_version",
+]
 
 [[package]]
 name = "flume"

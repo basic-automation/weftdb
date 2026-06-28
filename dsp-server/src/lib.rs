@@ -31,6 +31,8 @@
 pub mod downsample;
 pub mod interpolate;
 pub mod metrics;
+pub mod state;
+pub mod storage;
 
 use axum::{
 	routing::{get, post}, Json, Router
@@ -39,6 +41,8 @@ pub use downsample::{downsample, downsample_ilp, Aggregation, DownsampleRequest,
 pub use interpolate::{interpolate, interpolate_ilp, interpolate_point, InterpolateRequest, InterpolateResponse, PointKind, PointRequest, PointResponse};
 pub use metrics::{Metrics, MetricsSnapshot, SharedMetrics};
 use serde::Serialize;
+pub use state::AppState;
+pub use storage::{storage_aspect_stats, storage_aspects, storage_stats, storage_time_range, storage_time_range_json, storage_value_range, AspectInfo, AspectListResponse, AspectStatsResponse, StorageError, StoredPoint, StoredRangeResponse, StoreStatsResponse, TimeRangeParams, ValueRangeParams};
 
 /// The server's package version, surfaced in probe responses so a deployed
 /// instance is identifiable from a plain `curl`.
@@ -67,32 +71,47 @@ impl Default for HealthResponse {
 /// Response body for the readiness probe (`GET /ready`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReadyResponse {
-	/// `true` once the service can accept traffic. Unconditional today; gains
-	/// real dependency checks as the control plane and segment store are wired in.
+	/// `true` once the service can accept traffic. The stateless API is always
+	/// ready; this gains further dependency checks as more of the control plane is
+	/// wired in.
 	pub ready: bool,
 	/// Logical service name ([`SERVICE`]).
 	pub service: &'static str,
 	/// Running build version ([`VERSION`]).
 	pub version: &'static str,
+	/// Whether a segment store is configured — i.e. the storage-query endpoints
+	/// (`/api/v1/storage/...`) are live rather than answering `503`.
+	pub segment_store: bool,
 }
 
 impl Default for ReadyResponse {
 	fn default() -> Self {
-		Self { ready: true, service: SERVICE, version: VERSION }
+		Self { ready: true, service: SERVICE, version: VERSION, segment_store: false }
 	}
 }
 
-/// Build the application router with a fresh metrics registry. This is the
-/// single source of truth for the service's route table; the binary and the
-/// tests both go through it.
+/// Build the application router with a fresh metrics registry and no segment
+/// store. This is the single source of truth for the service's route table; the
+/// binary and the tests both go through it.
 pub fn app() -> Router {
-	app_with_metrics(SharedMetrics::default())
+	app_with_state(AppState::new())
 }
 
-/// Build the application router over a caller-supplied [`SharedMetrics`], so a
-/// test (or an embedding host) can observe the counters the handlers update.
+/// Build the application router over a caller-supplied [`SharedMetrics`].
+///
+/// Lets a test (or an embedding host) observe the counters the handlers update.
+/// No segment store is attached (the storage endpoints answer `503`).
 pub fn app_with_metrics(metrics: SharedMetrics) -> Router {
-	Router::new().route("/health", get(health)).route("/ready", get(ready)).route("/metrics", get(metrics::metrics)).route("/api/v1/interpolate", post(interpolate)).route("/api/v1/interpolate/ilp", post(interpolate_ilp)).route("/api/v1/interpolate/point", post(interpolate_point)).route("/api/v1/downsample", post(downsample)).route("/api/v1/downsample/ilp", post(downsample_ilp)).with_state(metrics)
+	app_with_state(AppState::with_metrics(metrics))
+}
+
+/// Build the application router over a fully-formed [`AppState`].
+///
+/// This is the single place routes are registered. The state carries the metrics
+/// handle (projected to the capability handlers via [`axum::extract::FromRef`])
+/// and an optional segment store backing the storage-query endpoints.
+pub fn app_with_state(state: AppState) -> Router {
+	Router::new().route("/health", get(health)).route("/ready", get(ready)).route("/metrics", get(metrics::metrics)).route("/api/v1/interpolate", post(interpolate)).route("/api/v1/interpolate/ilp", post(interpolate_ilp)).route("/api/v1/interpolate/point", post(interpolate_point)).route("/api/v1/downsample", post(downsample)).route("/api/v1/downsample/ilp", post(downsample_ilp)).route("/api/v1/storage/aspects", get(storage_aspects)).route("/api/v1/storage/stats", get(storage_stats)).route("/api/v1/storage/{aspect}/range", get(storage_time_range)).route("/api/v1/storage/{aspect}/points", get(storage_time_range_json)).route("/api/v1/storage/{aspect}/value-range", get(storage_value_range)).route("/api/v1/storage/{aspect}/stats", get(storage_aspect_stats)).with_state(state)
 }
 
 /// Liveness probe: the process is up and can serve a request.
@@ -100,9 +119,11 @@ async fn health() -> Json<HealthResponse> {
 	Json(HealthResponse::default())
 }
 
-/// Readiness probe: the service is ready to accept traffic.
-async fn ready() -> Json<ReadyResponse> {
-	Json(ReadyResponse::default())
+/// Readiness probe: the service is ready to accept traffic. Reports whether a
+/// segment store is configured so an operator can confirm the storage endpoints
+/// are live.
+async fn ready(axum::extract::State(state): axum::extract::State<AppState>) -> Json<ReadyResponse> {
+	Json(ReadyResponse { segment_store: state.store().is_some(), ..ReadyResponse::default() })
 }
 
 #[cfg(test)]
@@ -138,6 +159,27 @@ mod tests {
 		assert_eq!(body["ready"], true);
 		assert_eq!(body["service"], SERVICE);
 		assert_eq!(body["version"], VERSION);
+		// The default router has no segment store, so the storage endpoints are off.
+		assert_eq!(body["segment_store"], false);
+	}
+
+	#[tokio::test]
+	async fn ready_reports_a_configured_segment_store() {
+		use std::sync::Arc;
+
+		use database::SegmentStore;
+		use tempfile::TempDir;
+
+		let dir = TempDir::new().unwrap();
+		// Construct the store inline so the significant-`Drop` `SegmentStore` is never
+		// bound on its own (avoids the drop-tightening lint).
+		let router = app_with_state(AppState::new().with_store(Arc::new(SegmentStore::open(dir.path()).await.unwrap())));
+		let response = router.oneshot(Request::builder().uri("/ready").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		// With a store attached, readiness advertises the storage endpoints as live.
+		assert_eq!(body["segment_store"], true);
 	}
 
 	#[tokio::test]
