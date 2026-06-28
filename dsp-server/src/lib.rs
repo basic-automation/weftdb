@@ -31,6 +31,7 @@
 pub mod downsample;
 pub mod interpolate;
 pub mod metrics;
+pub mod state;
 
 use axum::{
 	routing::{get, post}, Json, Router
@@ -39,6 +40,7 @@ pub use downsample::{downsample, downsample_ilp, Aggregation, DownsampleRequest,
 pub use interpolate::{interpolate, interpolate_ilp, interpolate_point, InterpolateRequest, InterpolateResponse, PointKind, PointRequest, PointResponse};
 pub use metrics::{Metrics, MetricsSnapshot, SharedMetrics};
 use serde::Serialize;
+pub use state::AppState;
 
 /// The server's package version, surfaced in probe responses so a deployed
 /// instance is identifiable from a plain `curl`.
@@ -82,17 +84,28 @@ impl Default for ReadyResponse {
 	}
 }
 
-/// Build the application router with a fresh metrics registry. This is the
-/// single source of truth for the service's route table; the binary and the
-/// tests both go through it.
+/// Build the application router with a fresh metrics registry and no segment
+/// store. This is the single source of truth for the service's route table; the
+/// binary and the tests both go through it.
 pub fn app() -> Router {
-	app_with_metrics(SharedMetrics::default())
+	app_with_state(AppState::new())
 }
 
-/// Build the application router over a caller-supplied [`SharedMetrics`], so a
-/// test (or an embedding host) can observe the counters the handlers update.
+/// Build the application router over a caller-supplied [`SharedMetrics`].
+///
+/// Lets a test (or an embedding host) observe the counters the handlers update.
+/// No segment store is attached (the storage endpoints answer `503`).
 pub fn app_with_metrics(metrics: SharedMetrics) -> Router {
-	Router::new().route("/health", get(health)).route("/ready", get(ready)).route("/metrics", get(metrics::metrics)).route("/api/v1/interpolate", post(interpolate)).route("/api/v1/interpolate/ilp", post(interpolate_ilp)).route("/api/v1/interpolate/point", post(interpolate_point)).route("/api/v1/downsample", post(downsample)).route("/api/v1/downsample/ilp", post(downsample_ilp)).with_state(metrics)
+	app_with_state(AppState::with_metrics(metrics))
+}
+
+/// Build the application router over a fully-formed [`AppState`].
+///
+/// This is the single place routes are registered. The state carries the metrics
+/// handle (projected to the capability handlers via [`axum::extract::FromRef`])
+/// and an optional segment store backing the storage-query endpoints.
+pub fn app_with_state(state: AppState) -> Router {
+	Router::new().route("/health", get(health)).route("/ready", get(ready)).route("/metrics", get(metrics::metrics)).route("/api/v1/interpolate", post(interpolate)).route("/api/v1/interpolate/ilp", post(interpolate_ilp)).route("/api/v1/interpolate/point", post(interpolate_point)).route("/api/v1/downsample", post(downsample)).route("/api/v1/downsample/ilp", post(downsample_ilp)).with_state(state)
 }
 
 /// Liveness probe: the process is up and can serve a request.
