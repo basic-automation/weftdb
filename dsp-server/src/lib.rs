@@ -42,7 +42,7 @@ pub use interpolate::{interpolate, interpolate_ilp, interpolate_point, Interpola
 pub use metrics::{Metrics, MetricsSnapshot, SharedMetrics};
 use serde::Serialize;
 pub use state::AppState;
-pub use storage::{storage_aspect_stats, storage_aspects, storage_stats, storage_time_range, storage_value_range, AspectInfo, AspectListResponse, AspectStatsResponse, StorageError, StoreStatsResponse, TimeRangeParams, ValueRangeParams};
+pub use storage::{storage_aspect_stats, storage_aspects, storage_stats, storage_time_range, storage_time_range_json, storage_value_range, AspectInfo, AspectListResponse, AspectStatsResponse, StorageError, StoredPoint, StoredRangeResponse, StoreStatsResponse, TimeRangeParams, ValueRangeParams};
 
 /// The server's package version, surfaced in probe responses so a deployed
 /// instance is identifiable from a plain `curl`.
@@ -111,7 +111,7 @@ pub fn app_with_metrics(metrics: SharedMetrics) -> Router {
 /// handle (projected to the capability handlers via [`axum::extract::FromRef`])
 /// and an optional segment store backing the storage-query endpoints.
 pub fn app_with_state(state: AppState) -> Router {
-	Router::new().route("/health", get(health)).route("/ready", get(ready)).route("/metrics", get(metrics::metrics)).route("/api/v1/interpolate", post(interpolate)).route("/api/v1/interpolate/ilp", post(interpolate_ilp)).route("/api/v1/interpolate/point", post(interpolate_point)).route("/api/v1/downsample", post(downsample)).route("/api/v1/downsample/ilp", post(downsample_ilp)).route("/api/v1/storage/aspects", get(storage_aspects)).route("/api/v1/storage/stats", get(storage_stats)).route("/api/v1/storage/{aspect}/range", get(storage_time_range)).route("/api/v1/storage/{aspect}/value-range", get(storage_value_range)).route("/api/v1/storage/{aspect}/stats", get(storage_aspect_stats)).with_state(state)
+	Router::new().route("/health", get(health)).route("/ready", get(ready)).route("/metrics", get(metrics::metrics)).route("/api/v1/interpolate", post(interpolate)).route("/api/v1/interpolate/ilp", post(interpolate_ilp)).route("/api/v1/interpolate/point", post(interpolate_point)).route("/api/v1/downsample", post(downsample)).route("/api/v1/downsample/ilp", post(downsample_ilp)).route("/api/v1/storage/aspects", get(storage_aspects)).route("/api/v1/storage/stats", get(storage_stats)).route("/api/v1/storage/{aspect}/range", get(storage_time_range)).route("/api/v1/storage/{aspect}/points", get(storage_time_range_json)).route("/api/v1/storage/{aspect}/value-range", get(storage_value_range)).route("/api/v1/storage/{aspect}/stats", get(storage_aspect_stats)).with_state(state)
 }
 
 /// Liveness probe: the process is up and can serve a request.
