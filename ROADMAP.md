@@ -198,8 +198,21 @@ wins."*
 > point query** (`POST /api/v1/interpolate/point` — evaluates the reconstructed
 > signal at one instant and labels it interpolated vs extrapolated, the Phase-2
 > raw/interpolated/extrapolated distinction), and a Prometheus `/metrics`
-> surface. Still to do: DB/subject/aspect management, raw range/stored queries,
-> schema & physical-type definition, Arrow/Parquet, and OpenTelemetry.
+> surface. **Stored-range query surface landed (2026-06-28):** the router state
+> grew from a bare `SharedMetrics` to a combined `AppState` (metrics +
+> `Option<Arc<database::SegmentStore>>`, the latter projected to the legacy
+> handlers via `FromRef`), the binary opens a store from
+> `DSP_SEGMENT_STORE_ROOT` (else the storage endpoints answer `503`, and
+> `GET /ready` reports `segment_store`), and five storage endpoints read the
+> on-disk Storage v2 segments: `GET …/storage/{aspect}/range` and
+> `…/value-range` stream **Arrow IPC** bytes
+> (`application/vnd.apache.arrow.stream`, via the `dsp-arrow-store` bridge so the
+> `arrow-*` tree never reaches the lean core), `…/storage/{aspect}/points` is the
+> lossless JSON (non-Arrow) range read, and `…/storage/aspects` /
+> `…/storage/{aspect}/stats` / `…/storage/stats` expose the declared schemas and
+> the materialized **bytes/point** rollups (the north-star cost term over HTTP).
+> Still to do: DB/subject/aspect **management** (create/declare over HTTP),
+> Parquet, and OpenTelemetry.
 
 A commercial DB can't lead with an embedded Rust API + TUI. Build an `axum` server:
 create DB / subject / aspect; define schema/physical type; batch ingest; range query;
@@ -425,10 +438,12 @@ JSON").
   `read_time_range_to_ipc_bytes` / `read_value_range_to_ipc_bytes` take a stored
   read all the way to portable bytes ready for an HTTP body / Arrow Flight / a
   `.arrow` file. 31 `dsp-arrow` + 9 `dsp-arrow-store` tests; 0 clippy warnings
-  under pedantic+nursery. Still to do: Parquet import/export (a heavier
-  `parquet` dep — assess weight/licensing first), and a Phase-2 `dsp-server`
-  HTTP endpoint exposing the IPC-bytes export (needs the server's single-state
-  router to gain a `SegmentStore` — its own slice).)*
+  under pedantic+nursery. **The Phase-2 `dsp-server` HTTP endpoint exposing the
+  IPC-bytes export landed (2026-06-28)** — `GET /api/v1/storage/{aspect}/range`
+  and `…/value-range` serve `read_time_range_to_ipc_bytes` /
+  `read_value_range_to_ipc_bytes` as `application/vnd.apache.arrow.stream` once a
+  `SegmentStore` is configured (see the Phase-2 status note). Still to do: Parquet
+  import/export (a heavier `parquet` dep — assess weight/licensing first).)*
 - **4.6 Correctness semantics:** out-of-order/late data, dedup, upsert, idempotent
   batch ingest, clock skew, precision, tz parsing, leap seconds, query consistency
   during compaction, read-your-writes, snapshot isolation.
