@@ -2534,3 +2534,5 @@ HTTP, so a client can populate the store the new read endpoints serve (closes th
 "DB/subject/aspect management" + "schema & physical-type definition" Phase-2
 gaps); or (b) assess the `parquet` crate (weight/licensing/codecs) and add
 Parquet import/export from a `RecordBatch` in `dsp-arrow`.
+
+**PR:** https://github.com/physics515/DSP/pull/28
