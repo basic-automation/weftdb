@@ -149,6 +149,58 @@ pub async fn storage_value_range(State(state): State<AppState>, Path(aspect): Pa
 	Ok(arrow_stream_response(result.map_err(|err| classify_read_error(&err))?))
 }
 
+/// One stored row in the JSON range response: an integer timestamp and its value
+/// as lossless decimal text, or `null` for a null row.
+#[derive(Debug, Clone, Serialize)]
+pub struct StoredPoint {
+	/// Row timestamp (epoch integer in the aspect's declared unit).
+	pub timestamp: i64,
+	/// The stored value as decimal text, or `null` for a null row. Decimal text
+	/// keeps every digit (no float round-trip — hard constraint #4).
+	pub value: Option<String>,
+}
+
+/// Response body for `GET /api/v1/storage/{aspect}/points` — the JSON (non-Arrow)
+/// stored-range read.
+#[derive(Debug, Clone, Serialize)]
+pub struct StoredRangeResponse {
+	/// The aspect read.
+	pub aspect: String,
+	/// The aspect's declared timestamp unit token (e.g. `"seconds"`), so a consumer
+	/// can interpret the integer timestamps.
+	pub time_unit: &'static str,
+	/// Number of rows returned.
+	pub count: usize,
+	/// The rows in the window, in segment-seal then in-segment order.
+	pub points: Vec<StoredPoint>,
+}
+
+/// Handle `GET /api/v1/storage/{aspect}/points?start&end`.
+///
+/// The JSON counterpart of the Arrow [`storage_time_range`] read, for clients that
+/// do not speak Arrow IPC: returns the rows of `aspect` in the inclusive
+/// `[start, end]` window as a lossless decimal-text point list, tagged with the
+/// aspect's declared timestamp unit.
+///
+/// # Errors
+///
+/// [`StorageError::Unconfigured`] when no store is attached,
+/// [`StorageError::NotFound`] when the aspect is undeclared (its timestamp unit is
+/// unknown), and [`StorageError::Internal`] on a read failure.
+pub async fn storage_time_range_json(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<TimeRangeParams>) -> Result<Json<StoredRangeResponse>, StorageError> {
+	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	drop(state);
+	let schema = store.schema_for(&aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?;
+	let Some(schema) = schema else {
+		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
+	};
+	let result = store.read_time_range(&aspect, params.start, params.end).await;
+	drop(store);
+	let (timestamps, values) = result.map_err(|err| classify_read_error(&err))?;
+	let points: Vec<StoredPoint> = timestamps.into_iter().zip(values).map(|(timestamp, value)| StoredPoint { timestamp, value: value.map(|v| v.to_string()) }).collect();
+	Ok(Json(StoredRangeResponse { aspect, time_unit: schema.timestamp_unit.name(), count: points.len(), points }))
+}
+
 /// One declared aspect's identity in the [`AspectListResponse`].
 #[derive(Debug, Clone, Serialize)]
 pub struct AspectInfo {
@@ -440,5 +492,38 @@ mod tests {
 		let router = app_with_state(AppState::new());
 		let response = router.oneshot(Request::builder().uri("/api/v1/storage/stats").body(Body::empty()).unwrap()).await.unwrap();
 		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+	}
+
+	#[tokio::test]
+	async fn points_endpoint_returns_lossless_json_rows() {
+		let (_dir, router) = router_with_sealed_price().await;
+		let (status, body) = get_json(router, "/api/v1/storage/price/points?start=110&end=130").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["aspect"], "price");
+		assert_eq!(body["time_unit"], "seconds");
+		assert_eq!(body["count"], 3);
+		let points = body["points"].as_array().unwrap();
+		assert_eq!(points.len(), 3);
+		assert_eq!(points[0]["timestamp"], 110);
+		// Values are lossless decimal text, not floats.
+		assert_eq!(points[0]["value"], "2.5");
+		assert_eq!(points[1]["value"], "3.5");
+		assert_eq!(points[2]["value"], "4.5");
+	}
+
+	#[tokio::test]
+	async fn points_endpoint_undeclared_aspect_is_not_found() {
+		let (_dir, router) = router_with_sealed_price().await;
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/never_declared/points?start=0&end=100").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::NOT_FOUND);
+	}
+
+	#[tokio::test]
+	async fn points_endpoint_empty_window_returns_zero_rows() {
+		let (_dir, router) = router_with_sealed_price().await;
+		let (status, body) = get_json(router, "/api/v1/storage/price/points?start=1000&end=2000").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["count"], 0);
+		assert!(body["points"].as_array().unwrap().is_empty());
 	}
 }
