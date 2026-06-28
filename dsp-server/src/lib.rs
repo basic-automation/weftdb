@@ -32,6 +32,7 @@ pub mod downsample;
 pub mod interpolate;
 pub mod metrics;
 pub mod state;
+pub mod storage;
 
 use axum::{
 	routing::{get, post}, Json, Router
@@ -41,6 +42,7 @@ pub use interpolate::{interpolate, interpolate_ilp, interpolate_point, Interpola
 pub use metrics::{Metrics, MetricsSnapshot, SharedMetrics};
 use serde::Serialize;
 pub use state::AppState;
+pub use storage::{storage_time_range, storage_value_range, StorageError, TimeRangeParams, ValueRangeParams};
 
 /// The server's package version, surfaced in probe responses so a deployed
 /// instance is identifiable from a plain `curl`.
@@ -105,7 +107,7 @@ pub fn app_with_metrics(metrics: SharedMetrics) -> Router {
 /// handle (projected to the capability handlers via [`axum::extract::FromRef`])
 /// and an optional segment store backing the storage-query endpoints.
 pub fn app_with_state(state: AppState) -> Router {
-	Router::new().route("/health", get(health)).route("/ready", get(ready)).route("/metrics", get(metrics::metrics)).route("/api/v1/interpolate", post(interpolate)).route("/api/v1/interpolate/ilp", post(interpolate_ilp)).route("/api/v1/interpolate/point", post(interpolate_point)).route("/api/v1/downsample", post(downsample)).route("/api/v1/downsample/ilp", post(downsample_ilp)).with_state(state)
+	Router::new().route("/health", get(health)).route("/ready", get(ready)).route("/metrics", get(metrics::metrics)).route("/api/v1/interpolate", post(interpolate)).route("/api/v1/interpolate/ilp", post(interpolate_ilp)).route("/api/v1/interpolate/point", post(interpolate_point)).route("/api/v1/downsample", post(downsample)).route("/api/v1/downsample/ilp", post(downsample_ilp)).route("/api/v1/storage/{aspect}/range", get(storage_time_range)).route("/api/v1/storage/{aspect}/value-range", get(storage_value_range)).with_state(state)
 }
 
 /// Liveness probe: the process is up and can serve a request.
