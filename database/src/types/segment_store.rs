@@ -149,6 +149,22 @@ impl SegmentStore {
 		&self.registry
 	}
 
+	/// The database namespace this store's aspect schemas are declared under (the
+	/// upper half of its `(database, subject)` scope — fixed at
+	/// [`open_scoped`](SegmentStore::open_scoped), `default` for
+	/// [`open`](SegmentStore::open)).
+	#[must_use]
+	pub fn database(&self) -> &str {
+		&self.database
+	}
+
+	/// The subject namespace this store's aspect schemas are declared under (the
+	/// lower half of its `(database, subject)` scope).
+	#[must_use]
+	pub fn subject(&self) -> &str {
+		&self.subject
+	}
+
 	/// The aspects [`declare`](SegmentStore::declare)d in this store's
 	/// `(database, subject)` scope, in name order.
 	///
