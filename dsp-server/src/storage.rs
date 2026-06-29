@@ -374,18 +374,85 @@ pub async fn storage_time_range_json(State(state): State<AppState>, Path(aspect)
 	drop(store);
 	let (timestamps, values) = result.map_err(|err| classify_read_error(&err))?;
 	let total = timestamps.len();
-	// Resolve the page size: explicit `limit` wins over the `take` alias.
-	let page_size = params.limit.or(params.take);
-	// `page` (1-based) derives the offset and supersedes an explicit `offset`;
-	// without a page size it falls back to page 1 (offset 0).
-	let offset = params.page.map_or_else(|| params.offset.unwrap_or(0), |page| page_size.map_or(0, |size| page.saturating_sub(1).saturating_mul(size)));
+	let (offset, page_size, page) = resolve_pagination(params.offset, params.limit, params.take, params.page);
 	// Paginate: skip `offset` rows of the window, take at most `page_size`.
 	let paginated = timestamps.into_iter().zip(values).skip(offset);
 	let points: Vec<StoredPoint> = match page_size {
 		Some(size) => paginated.take(size).map(|(timestamp, value)| StoredPoint { timestamp, value: value.map(|v| v.to_string()) }).collect(),
 		None => paginated.map(|(timestamp, value)| StoredPoint { timestamp, value: value.map(|v| v.to_string()) }).collect(),
 	};
-	let page = params.page.map(|page| page.max(1));
+	Ok(Json(StoredRangeResponse { aspect, time_unit: schema.timestamp_unit.name(), total, count: points.len(), offset, limit: page_size, page, points }))
+}
+
+/// Resolve the declarative B-rest pagination params shared by the JSON range reads
+/// into `(offset, page_size, page_echo)`.
+///
+/// The page size is `limit` if present else the `take` alias. `page` (1-based)
+/// derives the offset (`(page - 1) * page_size`) and supersedes an explicit
+/// `offset`; a `page` without a page size falls back to page 1 (offset 0). The
+/// returned `page_echo` is the served 1-based page (only for a page-based request).
+fn resolve_pagination(offset: Option<usize>, limit: Option<usize>, take: Option<usize>, page: Option<usize>) -> (usize, Option<usize>, Option<usize>) {
+	let page_size = limit.or(take);
+	let offset = page.map_or_else(|| offset.unwrap_or(0), |page| page_size.map_or(0, |size| page.saturating_sub(1).saturating_mul(size)));
+	(offset, page_size, page.map(|page| page.max(1)))
+}
+
+/// Query parameters for the JSON value-range read: the inclusive `[lo, hi]` value
+/// band (as decimal text) plus the same declarative B-rest pagination as the time
+/// read.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ValuePointsParams {
+	/// Inclusive lower value bound (decimal text).
+	pub lo: String,
+	/// Inclusive upper value bound (decimal text).
+	pub hi: String,
+	/// Skip this many leading rows before returning (default 0).
+	#[serde(default)]
+	pub offset: Option<usize>,
+	/// Return at most this many rows (default: all remaining after `offset`).
+	#[serde(default)]
+	pub limit: Option<usize>,
+	/// Declarative alias for `limit` (the page size). `limit` wins if both are given.
+	#[serde(default)]
+	pub take: Option<usize>,
+	/// 1-based page number; with a page size it derives the offset.
+	#[serde(default)]
+	pub page: Option<usize>,
+}
+
+/// Handle `GET /api/v1/storage/{aspect}/value-points?lo&hi&offset&limit&take&page`.
+///
+/// The JSON counterpart of the Arrow [`storage_value_range`] read, for clients that
+/// do not speak Arrow IPC: returns the **present** rows of `aspect` whose value
+/// falls in the inclusive `[lo, hi]` band as a lossless decimal-text point list,
+/// tagged with the aspect's declared timestamp unit. Value-range reads return only
+/// present rows, so every row carries a value. Pagination matches the time read
+/// (B-rest `offset`/`limit`/`take`/`page`).
+///
+/// # Errors
+///
+/// [`StorageError::Unconfigured`] (no store), [`StorageError::NotFound`] (aspect
+/// undeclared), [`StorageError::BadRequest`] when a value bound does not parse as a
+/// decimal, and [`StorageError::Internal`] on a read failure.
+pub async fn storage_value_range_json(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<ValuePointsParams>) -> Result<Json<StoredRangeResponse>, StorageError> {
+	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	drop(state);
+	let lo: BigDecimal = params.lo.parse().map_err(|_| StorageError::BadRequest(format!("`lo` is not a decimal: {:?}", params.lo)))?;
+	let hi: BigDecimal = params.hi.parse().map_err(|_| StorageError::BadRequest(format!("`hi` is not a decimal: {:?}", params.hi)))?;
+	let schema = store.schema_for(&aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?;
+	let Some(schema) = schema else {
+		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
+	};
+	let result = store.read_value_range(&aspect, &lo, &hi).await;
+	drop(store);
+	let (timestamps, values) = result.map_err(|err| classify_read_error(&err))?;
+	let total = timestamps.len();
+	let (offset, page_size, page) = resolve_pagination(params.offset, params.limit, params.take, params.page);
+	let paginated = timestamps.into_iter().zip(values).skip(offset);
+	let points: Vec<StoredPoint> = match page_size {
+		Some(size) => paginated.take(size).map(|(timestamp, value)| StoredPoint { timestamp, value: Some(value.to_string()) }).collect(),
+		None => paginated.map(|(timestamp, value)| StoredPoint { timestamp, value: Some(value.to_string()) }).collect(),
+	};
 	Ok(Json(StoredRangeResponse { aspect, time_unit: schema.timestamp_unit.name(), total, count: points.len(), offset, limit: page_size, page, points }))
 }
 
@@ -1058,5 +1125,51 @@ mod tests {
 		assert_eq!(body["count"], 5);
 		assert_eq!(body["page"], 5);
 		assert!(body.get("limit").is_none());
+	}
+
+	#[tokio::test]
+	async fn value_points_returns_only_in_band_rows_as_json() {
+		let (_dir, router) = router_with_sealed_price().await;
+		// price values are 1.5..5.5 at ts 100..140; band [2.5, 4.5] keeps three rows.
+		let (status, body) = get_json(router, "/api/v1/storage/price/value-points?lo=2.5&hi=4.5").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["aspect"], "price");
+		assert_eq!(body["time_unit"], "seconds");
+		assert_eq!(body["total"], 3);
+		assert_eq!(body["count"], 3);
+		let points = body["points"].as_array().unwrap();
+		assert_eq!(points[0]["timestamp"], 110);
+		assert_eq!(points[0]["value"], "2.5");
+		assert_eq!(points[2]["value"], "4.5");
+	}
+
+	#[tokio::test]
+	async fn value_points_paginates_with_take_and_page() {
+		let (_dir, router) = router_with_sealed_price().await;
+		// Whole band [1.5, 5.5] = 5 rows; page 2 of size 2 -> ts 120, 130.
+		let (status, body) = get_json(router, "/api/v1/storage/price/value-points?lo=1.5&hi=5.5&take=2&page=2").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["total"], 5);
+		assert_eq!(body["count"], 2);
+		assert_eq!(body["offset"], 2);
+		assert_eq!(body["limit"], 2);
+		assert_eq!(body["page"], 2);
+		let points = body["points"].as_array().unwrap();
+		assert_eq!(points[0]["timestamp"], 120);
+		assert_eq!(points[1]["timestamp"], 130);
+	}
+
+	#[tokio::test]
+	async fn value_points_unparseable_bound_is_bad_request() {
+		let (_dir, router) = router_with_sealed_price().await;
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/price/value-points?lo=abc&hi=5").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+	}
+
+	#[tokio::test]
+	async fn value_points_undeclared_aspect_is_not_found() {
+		let (_dir, router) = router_with_sealed_price().await;
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/never_declared/value-points?lo=0&hi=100").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::NOT_FOUND);
 	}
 }
