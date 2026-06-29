@@ -58,6 +58,8 @@ use std::{collections::HashMap, sync::Arc};
 use arrow_array::{Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_schema::{DataType, Field, Schema, DECIMAL128_MAX_PRECISION};
+use bytes::Bytes;
+use parquet::arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ArrowWriter};
 use bigdecimal::{num_bigint::BigInt, BigDecimal, FromPrimitive, ToPrimitive};
 use dsp_physical_type::{Page, PagedSegment, PhysicalType, Segment, SegmentError, TimeUnit};
 
@@ -127,8 +129,11 @@ pub enum ConvertError {
 	Segment(SegmentError),
 	/// Reading or writing the Arrow IPC stream failed (carries the Arrow message).
 	Ipc(String),
-	/// An IPC write was asked for an empty batch set — there is no schema to write.
+	/// An IPC or Parquet write was asked for an empty batch set — there is no
+	/// schema to write.
 	EmptyBatchSet,
+	/// Reading or writing the Parquet file failed (carries the Parquet message).
+	Parquet(String),
 }
 
 impl std::fmt::Display for ConvertError {
@@ -141,7 +146,8 @@ impl std::fmt::Display for ConvertError {
 			Self::BadValue(s) => write!(f, "value cell `{s}` does not parse as a decimal"),
 			Self::Segment(e) => write!(f, "could not rebuild segment from columns: {e}"),
 			Self::Ipc(e) => write!(f, "arrow IPC stream error: {e}"),
-			Self::EmptyBatchSet => write!(f, "cannot write an Arrow IPC stream from zero batches (no schema)"),
+			Self::EmptyBatchSet => write!(f, "cannot write from zero batches (no schema)"),
+			Self::Parquet(e) => write!(f, "parquet error: {e}"),
 		}
 	}
 }
@@ -568,6 +574,64 @@ pub fn read_ipc_stream(bytes: &[u8]) -> Result<Vec<RecordBatch>, ConvertError> {
 	let mut batches = Vec::new();
 	for batch in reader {
 		batches.push(batch.map_err(|e| ConvertError::Ipc(e.to_string()))?);
+	}
+	Ok(batches)
+}
+
+/// Serialize one or more [`RecordBatch`]es into an Apache **Parquet** file's bytes.
+///
+/// Parquet is the columnar on-disk interchange format the wider ecosystem
+/// (`DuckDB`, Spark, pandas/`Polars`, the `InfluxDB`-3 FDAP stack) reads natively.
+/// Like [`write_ipc_stream`], the batches must share the schema of the first; the
+/// self-describing Arrow schema — including DSP's [`META_TIME_UNIT`] and
+/// physical-encoding metadata — is embedded in the Parquet file (Parquet preserves
+/// Arrow schema metadata), so [`read_parquet`] reconstructs the batches, and DSP's
+/// columns from them, with no out-of-band information. The writer is configured
+/// **without compression** (the `parquet` dependency is pulled with
+/// `default-features = false` so no compression-codec C libraries reach the build);
+/// values stay losslessly encoded — the typed-numeric path's exact `Decimal128`
+/// and the text path are byte-faithful exactly as in the IPC export.
+///
+/// # Errors
+///
+/// Returns [`ConvertError::EmptyBatchSet`] if `batches` is empty (no schema to
+/// write), or [`ConvertError::Parquet`] if the Parquet writer fails.
+pub fn write_parquet(batches: &[RecordBatch]) -> Result<Vec<u8>, ConvertError> {
+	let schema = batches.first().ok_or(ConvertError::EmptyBatchSet)?.schema();
+	let mut buf = Vec::new();
+	let mut writer = ArrowWriter::try_new(&mut buf, schema, None).map_err(|e| ConvertError::Parquet(e.to_string()))?;
+	for batch in batches {
+		writer.write(batch).map_err(|e| ConvertError::Parquet(e.to_string()))?;
+	}
+	writer.close().map_err(|e| ConvertError::Parquet(e.to_string()))?;
+	Ok(buf)
+}
+
+/// Deserialize an Apache **Parquet** file (as written by [`write_parquet`]) back
+/// into its [`RecordBatch`]es, in row-group order.
+///
+/// The inverse of [`write_parquet`]. Feed the result to
+/// [`record_batch_to_columns`] / [`record_batches_to_columns`] (or
+/// [`segment_from_record_batch`]) to recover DSP's columns.
+///
+/// # Errors
+///
+/// Returns [`ConvertError::Parquet`] if the bytes are not a valid Parquet file or a
+/// batch fails to decode.
+pub fn read_parquet(bytes: &[u8]) -> Result<Vec<RecordBatch>, ConvertError> {
+	// The builder needs an owned `ChunkReader`; `bytes::Bytes` (re-exported by the
+	// `parquet` crate) implements it, so copy the borrowed slice into one.
+	let input = Bytes::copy_from_slice(bytes);
+	let builder = ParquetRecordBatchReaderBuilder::try_new(input).map_err(|e| ConvertError::Parquet(e.to_string()))?;
+	// The builder restores the embedded Arrow schema (with DSP's schema metadata);
+	// re-attach it to each decoded batch so the self-describing metadata survives.
+	let schema = builder.schema().clone();
+	let reader = builder.build().map_err(|e| ConvertError::Parquet(e.to_string()))?;
+	let mut batches = Vec::new();
+	for batch in reader {
+		let batch = batch.map_err(|e| ConvertError::Parquet(e.to_string()))?;
+		let batch = RecordBatch::try_new(schema.clone(), batch.columns().to_vec()).map_err(|e| ConvertError::Parquet(e.to_string()))?;
+		batches.push(batch);
 	}
 	Ok(batches)
 }
@@ -1009,5 +1073,66 @@ mod tests {
 	fn ipc_read_rejects_garbage_bytes() {
 		let err = read_ipc_stream(b"not an arrow stream").expect_err("must error");
 		assert!(matches!(err, ConvertError::Ipc(_)), "got: {err}");
+	}
+
+	#[test]
+	fn parquet_round_trips_a_single_batch() {
+		let timestamps = vec![1_i64, 2, 3];
+		let values = ncol(&[Some("1.5"), None, Some("3.5")]);
+		let batch = columns_to_record_batch(TimeUnit::Millis, &timestamps, &values);
+
+		let bytes = write_parquet(std::slice::from_ref(&batch)).expect("writes");
+		// Parquet files start with the "PAR1" magic.
+		assert_eq!(&bytes[..4], b"PAR1");
+		let back = read_parquet(&bytes).expect("reads");
+		assert_eq!(back.len(), 1);
+
+		// The self-describing Arrow metadata survives the Parquet file.
+		assert_eq!(back[0].schema_ref().metadata().get(META_TIME_UNIT).map(String::as_str), Some("millis"));
+		let (ts, vs) = record_batch_to_columns(&back[0]).expect("reads back columns");
+		assert_eq!(ts, timestamps);
+		assert_eq!(vs, values);
+	}
+
+	#[test]
+	fn parquet_preserves_exact_decimal128_values() {
+		// The typed exact-Decimal128 path must stay byte-faithful through Parquet.
+		let timestamps = vec![1_i64, 2, 3];
+		let values = ncol(&[Some("12.34"), None, Some("-7.50")]);
+		let batch = columns_to_record_batch_typed(TimeUnit::Millis, PhysicalType::ScaledI64 { scale: 2 }, &timestamps, &values);
+
+		let bytes = write_parquet(std::slice::from_ref(&batch)).expect("writes");
+		let back = read_parquet(&bytes).expect("reads");
+		assert_eq!(back[0].column_by_name(VALUE_COLUMN).unwrap().data_type(), &DataType::Decimal128(DECIMAL128_MAX_PRECISION, 2));
+		let (_ts, vs) = record_batch_to_columns(&back[0]).expect("reads back");
+		// Exact reconstruction — no float rounding.
+		assert_eq!(vs, values);
+	}
+
+	#[test]
+	fn parquet_round_trips_paged_batches_into_columns() {
+		// A multi-page export writes several row groups into one Parquet file.
+		let timestamps: Vec<i64> = (0..10).map(|i| 100 + i).collect();
+		let values: Vec<BigDecimal> = (0..10).map(BigDecimal::from).collect();
+		let paged = PagedSegment::build(&timestamps, &values, TimeUnit::Seconds, &bd("0"), 4).expect("builds");
+		let batches = paged_segment_to_record_batches(&paged);
+		assert_eq!(batches.len(), 3);
+
+		let bytes = write_parquet(&batches).expect("writes");
+		let back = read_parquet(&bytes).expect("reads");
+		let (ts, vs) = record_batches_to_columns(&back).expect("reads back columns");
+		assert_eq!(ts, timestamps);
+		assert_eq!(vs, values.into_iter().map(Some).collect::<Vec<_>>());
+	}
+
+	#[test]
+	fn parquet_write_rejects_an_empty_batch_set() {
+		assert_eq!(write_parquet(&[]), Err(ConvertError::EmptyBatchSet));
+	}
+
+	#[test]
+	fn parquet_read_rejects_garbage_bytes() {
+		let err = read_parquet(b"not a parquet file").expect_err("must error");
+		assert!(matches!(err, ConvertError::Parquet(_)), "got: {err}");
 	}
 }

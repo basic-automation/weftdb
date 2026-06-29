@@ -13,4 +13,6 @@ dsp-physical-type = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-ipc = { workspace = true }
+parquet = { workspace = true }
+bytes = { workspace = true }
 bigdecimal = { workspace = true }
