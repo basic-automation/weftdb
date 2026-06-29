@@ -38,6 +38,9 @@ use crate::state::AppState;
 /// The Arrow IPC stream content type, per the Apache Arrow conventions.
 const ARROW_STREAM_CONTENT_TYPE: &str = "application/vnd.apache.arrow.stream";
 
+/// The Apache Parquet file content type.
+const PARQUET_CONTENT_TYPE: &str = "application/vnd.apache.parquet";
+
 /// Query parameters for the time-range read.
 ///
 /// An inclusive `[start, end]` window of integer epoch timestamps **in the
@@ -111,6 +114,11 @@ fn arrow_stream_response(bytes: Vec<u8>) -> Response {
 	([(header::CONTENT_TYPE, ARROW_STREAM_CONTENT_TYPE)], Body::from(bytes)).into_response()
 }
 
+/// Build the `200 OK` Parquet-file response from the serialized bytes.
+fn parquet_response(bytes: Vec<u8>) -> Response {
+	([(header::CONTENT_TYPE, PARQUET_CONTENT_TYPE)], Body::from(bytes)).into_response()
+}
+
 /// Handle `GET /api/v1/storage/{aspect}/range?start&end`.
 ///
 /// Reads the rows of `aspect` in the inclusive `[start, end]` timestamp window and
@@ -147,6 +155,45 @@ pub async fn storage_value_range(State(state): State<AppState>, Path(aspect): Pa
 	let result = dsp_arrow_store::read_value_range_to_ipc_bytes(&store, &aspect, &lo, &hi).await;
 	drop(store);
 	Ok(arrow_stream_response(result.map_err(|err| classify_read_error(&err))?))
+}
+
+/// Handle `GET /api/v1/storage/{aspect}/range.parquet?start&end`.
+///
+/// The Parquet counterpart of [`storage_time_range`]: reads the rows of `aspect`
+/// in the inclusive `[start, end]` timestamp window and serves them as an Apache
+/// Parquet file (typed value column for the aspect's declared encoding), ready to
+/// load straight into `DuckDB`/pandas/`Polars`.
+///
+/// # Errors
+///
+/// As [`storage_time_range`] (unconfigured store, undeclared aspect, or a
+/// read/serialization failure).
+pub async fn storage_time_range_parquet(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<TimeRangeParams>) -> Result<Response, StorageError> {
+	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	drop(state);
+	let result = dsp_arrow_store::read_time_range_to_parquet_bytes(&store, &aspect, params.start, params.end).await;
+	drop(store);
+	Ok(parquet_response(result.map_err(|err| classify_read_error(&err))?))
+}
+
+/// Handle `GET /api/v1/storage/{aspect}/value-range.parquet?lo&hi`.
+///
+/// The Parquet counterpart of [`storage_value_range`]: reads the present rows of
+/// `aspect` whose value falls in the inclusive `[lo, hi]` band and serves them as
+/// an Apache Parquet file (lossless decimal-text value column).
+///
+/// # Errors
+///
+/// As [`storage_value_range`], including [`StorageError::BadRequest`] when a value
+/// bound does not parse as a decimal.
+pub async fn storage_value_range_parquet(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<ValueRangeParams>) -> Result<Response, StorageError> {
+	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	drop(state);
+	let lo: BigDecimal = params.lo.parse().map_err(|_| StorageError::BadRequest(format!("`lo` is not a decimal: {:?}", params.lo)))?;
+	let hi: BigDecimal = params.hi.parse().map_err(|_| StorageError::BadRequest(format!("`hi` is not a decimal: {:?}", params.hi)))?;
+	let result = dsp_arrow_store::read_value_range_to_parquet_bytes(&store, &aspect, &lo, &hi).await;
+	drop(store);
+	Ok(parquet_response(result.map_err(|err| classify_read_error(&err))?))
 }
 
 /// One stored row in the JSON range response: an integer timestamp and its value
@@ -549,6 +596,42 @@ mod tests {
 		let batches = read_ipc_stream(&bytes).expect("reads stream");
 		let (_ts, vs) = record_batches_to_columns(&batches).expect("reads back columns");
 		assert_eq!(vs, vec![Some(bd("2.5")), Some(bd("3.5")), Some(bd("4.5"))]);
+	}
+
+	#[tokio::test]
+	async fn time_range_serves_a_parquet_file() {
+		use dsp_arrow::read_parquet;
+		let (_dir, router) = router_with_sealed_price().await;
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/price/range.parquet?start=110&end=130").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		assert_eq!(response.headers().get("content-type").unwrap(), "application/vnd.apache.parquet");
+
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		assert_eq!(&bytes[..4], b"PAR1");
+		let batches = read_parquet(&bytes).expect("reads parquet");
+		let (ts, vs) = record_batches_to_columns(&batches).expect("reads back columns");
+		assert_eq!(ts, vec![110, 120, 130]);
+		assert_eq!(vs, vec![Some(bd("2.5")), Some(bd("3.5")), Some(bd("4.5"))]);
+	}
+
+	#[tokio::test]
+	async fn value_range_serves_a_parquet_file() {
+		use dsp_arrow::read_parquet;
+		let (_dir, router) = router_with_sealed_price().await;
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/price/value-range.parquet?lo=2.5&hi=4.5").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		assert_eq!(response.headers().get("content-type").unwrap(), "application/vnd.apache.parquet");
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let batches = read_parquet(&bytes).expect("reads parquet");
+		let (_ts, vs) = record_batches_to_columns(&batches).expect("reads back columns");
+		assert_eq!(vs, vec![Some(bd("2.5")), Some(bd("3.5")), Some(bd("4.5"))]);
+	}
+
+	#[tokio::test]
+	async fn parquet_export_without_store_is_unavailable() {
+		let router = app_with_state(AppState::new());
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/price/range.parquet?start=0&end=100").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 	}
 
 	#[tokio::test]

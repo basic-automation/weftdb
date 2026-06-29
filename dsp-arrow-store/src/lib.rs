@@ -161,6 +161,42 @@ pub async fn read_value_range_to_ipc_bytes(store: &SegmentStore, aspect: &str, l
 	Ok(dsp_arrow::write_ipc_stream(std::slice::from_ref(&batch))?)
 }
 
+/// Read the rows of `aspect` in the inclusive `[start, end]` time window and return
+/// them as an Apache **Parquet** file's bytes.
+///
+/// The Parquet counterpart of [`read_time_range_to_ipc_bytes`]: it takes the same
+/// typed time-range read ([`read_time_range_to_record_batch_typed`]) and serializes
+/// the batch with [`dsp_arrow::write_parquet`]. The file is self-describing (the
+/// time-unit and physical-encoding metadata travel in the embedded Arrow schema),
+/// so a consumer recovers the columns with [`dsp_arrow::read_parquet`] +
+/// [`dsp_arrow::record_batches_to_columns`] and nothing else — or loads it straight
+/// into `DuckDB`/pandas/`Polars`. An empty window still yields a valid zero-row
+/// Parquet file, not an error.
+///
+/// # Errors
+///
+/// As [`read_time_range_to_record_batch_typed`] (undeclared aspect, or a read
+/// failure), plus a [`dsp_arrow::ConvertError`] if Parquet serialization fails.
+pub async fn read_time_range_to_parquet_bytes(store: &SegmentStore, aspect: &str, start: i64, end: i64) -> Result<Vec<u8>> {
+	let batch = read_time_range_to_record_batch_typed(store, aspect, start, end).await?;
+	Ok(dsp_arrow::write_parquet(std::slice::from_ref(&batch))?)
+}
+
+/// Read the present rows of `aspect` whose value falls in `[lo, hi]` and return them
+/// as an Apache **Parquet** file's bytes (see [`read_time_range_to_parquet_bytes`]).
+///
+/// Serializes the lossless value-range batch
+/// ([`read_value_range_to_record_batch`]).
+///
+/// # Errors
+///
+/// As [`read_value_range_to_record_batch`], plus a [`dsp_arrow::ConvertError`] if
+/// Parquet serialization fails.
+pub async fn read_value_range_to_parquet_bytes(store: &SegmentStore, aspect: &str, lo: &BigDecimal, hi: &BigDecimal) -> Result<Vec<u8>> {
+	let batch = read_value_range_to_record_batch(store, aspect, lo, hi).await?;
+	Ok(dsp_arrow::write_parquet(std::slice::from_ref(&batch))?)
+}
+
 /// Resolve the declared timestamp [`TimeUnit`] for `aspect`, erroring if the aspect
 /// was never declared in the store (its unit would otherwise be a guess).
 async fn aspect_time_unit(store: &SegmentStore, aspect: &str) -> Result<TimeUnit> {
@@ -331,5 +367,50 @@ mod tests {
 		let batches = read_ipc_stream(&bytes).expect("reads stream");
 		assert_eq!(batches.len(), 1);
 		assert_eq!(batches[0].num_rows(), 0);
+	}
+
+	#[tokio::test]
+	async fn time_range_to_parquet_bytes_round_trips_through_the_file_form() {
+		use dsp_arrow::{read_parquet, record_batches_to_columns};
+
+		let (_dir, store) = store_with_aspect(TimeUnit::Seconds, PhysicalType::F64).await;
+		let timestamps = vec![1_i64, 2, 3, 4, 5];
+		let values = vec![bd("0.5"), bd("1.5"), bd("2.5"), bd("3.5"), bd("4.5")];
+		store.seal_declared("price", &timestamps, &values).await.expect("seals");
+
+		// Storage → Arrow → Parquet file bytes, the portable on-disk form.
+		let bytes = read_time_range_to_parquet_bytes(&store, "price", 2, 4).await.expect("serializes");
+		assert_eq!(&bytes[..4], b"PAR1");
+
+		// A consumer with only dsp-arrow recovers the columns from the file.
+		let batches = read_parquet(&bytes).expect("reads parquet");
+		let (ts, vs) = record_batches_to_columns(&batches).expect("reads back columns");
+		assert_eq!(ts, vec![2, 3, 4]);
+		assert_eq!(vs, vec![Some(bd("1.5")), Some(bd("2.5")), Some(bd("3.5"))]);
+	}
+
+	#[tokio::test]
+	async fn value_range_to_parquet_bytes_round_trips() {
+		use dsp_arrow::{read_parquet, record_batches_to_columns};
+
+		let (_dir, store) = store_with_aspect(TimeUnit::Millis, PhysicalType::BigDecimalText).await;
+		store.seal_declared("price", &[1_i64, 2, 3, 4], &[bd("10"), bd("20"), bd("30"), bd("40")]).await.expect("seals");
+
+		let bytes = read_value_range_to_parquet_bytes(&store, "price", &bd("15"), &bd("35")).await.expect("serializes");
+		let batches = read_parquet(&bytes).expect("reads parquet");
+		let (_ts, vs) = record_batches_to_columns(&batches).expect("reads back columns");
+		assert_eq!(vs, vec![Some(bd("20")), Some(bd("30"))]);
+	}
+
+	#[tokio::test]
+	async fn empty_window_to_parquet_bytes_is_a_valid_zero_row_file() {
+		use dsp_arrow::read_parquet;
+
+		let (_dir, store) = store_with_aspect(TimeUnit::Seconds, PhysicalType::F64).await;
+		store.seal_declared("price", &[10_i64, 20], &[bd("1"), bd("2")]).await.expect("seals");
+		let bytes = read_time_range_to_parquet_bytes(&store, "price", 1_000, 2_000).await.expect("serializes");
+		let batches = read_parquet(&bytes).expect("reads parquet");
+		let rows: usize = batches.iter().map(arrow_array::RecordBatch::num_rows).sum();
+		assert_eq!(rows, 0);
 	}
 }
