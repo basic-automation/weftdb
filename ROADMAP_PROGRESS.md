@@ -2651,3 +2651,5 @@ from a `RecordBatch` in `dsp-arrow` + a `…/storage/{aspect}/parquet` export
 endpoint; or (b) the external-engine **DuckDB** adapter for DSP-Bench (the first
 real-database baseline beside DSP + the two portable in-process baselines) —
 assess the DuckDB Rust crate's Windows build first.
+
+**PR:** https://github.com/physics515/DSP/pull/29
