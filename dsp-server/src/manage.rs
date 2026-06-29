@@ -30,9 +30,11 @@
 //! downcast).
 
 use axum::{
-	extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json
+	extract::{Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json
 };
 use bigdecimal::BigDecimal;
+use chrono::{DateTime, Utc};
+use dsp_line_protocol::TimestampPrecision;
 use dsp_physical_type::{AspectSchema, PhysicalType, SegmentDescriptor, TimeUnit};
 use serde::{Deserialize, Serialize};
 
@@ -281,6 +283,113 @@ fn present_values(values: &[Option<BigDecimal>]) -> Vec<BigDecimal> {
 	values.iter().map(|value| value.clone().unwrap_or_default()).collect()
 }
 
+/// Query parameters for the ILP ingest endpoint: which field to seal, the wire
+/// timestamp precision, and an optional page height.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IlpIngestParams {
+	/// The line-protocol field key whose numeric values are sealed (one aspect ==
+	/// one field).
+	pub field: String,
+	/// The wire timestamp precision token (`ns`/`us`/`ms`/`s`, default `ns`) —
+	/// how the integer timestamps **in the payload** are interpreted. The stored
+	/// epochs are then rescaled to the aspect's declared [`TimeUnit`].
+	#[serde(default)]
+	pub precision: Option<String>,
+	/// Optional page height — seal a paged segment of this many rows per page.
+	#[serde(default)]
+	pub rows_per_page: Option<usize>,
+}
+
+/// Map the optional ILP precision token to a [`TimestampPrecision`] (default
+/// nanoseconds), mirroring the interpolation ILP endpoint's accepted tokens.
+///
+/// # Errors
+///
+/// Returns a message naming the unknown token.
+fn parse_ilp_precision(token: Option<&str>) -> Result<TimestampPrecision, String> {
+	match token {
+		None | Some("ns" | "nanoseconds" | "nanos") => Ok(TimestampPrecision::Nanoseconds),
+		Some("us" | "µs" | "microseconds" | "micros") => Ok(TimestampPrecision::Microseconds),
+		Some("ms" | "milliseconds" | "millis") => Ok(TimestampPrecision::Milliseconds),
+		Some("s" | "sec" | "secs" | "seconds") => Ok(TimestampPrecision::Seconds),
+		Some(other) => Err(format!("unknown precision token {other:?} (expected ns, us, ms, or s)")),
+	}
+}
+
+/// Project an absolute instant onto the integer epoch the store keeps for `unit`.
+///
+/// The line-protocol parser yields an absolute [`DateTime<Utc>`]; the store keeps
+/// integer epochs in the aspect's **declared** unit, so the wire precision and the
+/// stored resolution can differ (an `ns`-precision payload sealed into a
+/// seconds-resolution aspect, say). Returns [`None`] only for the nanosecond unit
+/// when the instant falls outside the `i64`-nanosecond range (before 1677 or after
+/// 2262).
+fn epoch_in_unit(instant: DateTime<Utc>, unit: TimeUnit) -> Option<i64> {
+	match unit {
+		TimeUnit::Seconds => Some(instant.timestamp()),
+		TimeUnit::Millis => Some(instant.timestamp_millis()),
+		TimeUnit::Micros => Some(instant.timestamp_micros()),
+		TimeUnit::Nanos => instant.timestamp_nanos_opt(),
+	}
+}
+
+/// Handle `POST /api/v1/storage/{aspect}/ilp`: parse an InfluxDB-Line-Protocol
+/// payload (the wire format TSBS / `InfluxDB` / `QuestDB` speak) and seal the chosen
+/// field's values into `aspect`'s declared schema.
+///
+/// The payload is the request body (`text/plain`); `field`, `precision`, and
+/// `rows_per_page` are query parameters. The parser is the shared, vendor-neutral
+/// `dsp-line-protocol` crate, so the storage ingest path and the interpolation ILP
+/// path accept the exact same dialect. Each point's absolute instant is rescaled to
+/// the aspect's declared [`TimeUnit`] before sealing. ILP fields are always present,
+/// so this is a dense seal.
+///
+/// # Errors
+///
+/// [`StorageError::Unconfigured`] (no store), [`StorageError::NotFound`] (aspect
+/// undeclared), [`StorageError::BadRequest`] (unknown precision token, malformed
+/// payload, no points carrying the field, a timestamp outside the declared unit's
+/// range, or values unrepresentable under the declared encoding/tolerance), and
+/// [`StorageError::Internal`] on a filesystem/control-plane failure.
+pub async fn ingest_ilp(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<IlpIngestParams>, body: String) -> Result<Response, StorageError> {
+	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	drop(state);
+	let precision = parse_ilp_precision(params.precision.as_deref()).map_err(StorageError::BadRequest)?;
+	let Some(schema) = store.schema_for(&aspect).await.map_err(|err| StorageError::Internal(err.to_string()))? else {
+		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
+	};
+	let points = dsp_line_protocol::parse_points(&body, &params.field, precision).map_err(|err| StorageError::BadRequest(err.to_string()))?;
+	if points.is_empty() {
+		return Err(StorageError::BadRequest(format!("no points carrying field `{}` with a timestamp in the payload", params.field)));
+	}
+
+	let mut timestamps = Vec::with_capacity(points.len());
+	let mut values = Vec::with_capacity(points.len());
+	for point in points {
+		let epoch = epoch_in_unit(point.timestamp, schema.timestamp_unit).ok_or_else(|| StorageError::BadRequest(format!("timestamp {} is outside the range of the declared `{}` unit", point.timestamp, schema.timestamp_unit.name())))?;
+		timestamps.push(epoch);
+		values.push(point.value);
+	}
+
+	let descriptor = match params.rows_per_page {
+		Some(rows_per_page) => store.seal_paged(&aspect, &schema, &timestamps, &values, rows_per_page).await,
+		None => store.seal(&aspect, &schema, &timestamps, &values).await,
+	};
+	drop(store);
+	let descriptor = descriptor.map_err(|err| classify_seal_error(&err))?;
+	let response = IngestResponse {
+		aspect,
+		segment_id: descriptor.id,
+		format_version: descriptor.format_version,
+		row_count: descriptor.row_count,
+		null_count: descriptor.null_count,
+		byte_len: descriptor.byte_len,
+		min_ts: descriptor.min_ts,
+		max_ts: descriptor.max_ts,
+	};
+	Ok((StatusCode::CREATED, Json(response)).into_response())
+}
+
 #[cfg(test)]
 mod tests {
 	use std::sync::Arc;
@@ -502,5 +611,93 @@ mod tests {
 		let body = serde_json::json!({ "points": [{ "timestamp": 1, "value": "1" }] });
 		let (status, _body) = post_json(router, "/api/v1/storage/price/points", &body).await;
 		assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+	}
+
+	/// POST a `text/plain` ILP payload to `uri`, returning status and parsed JSON.
+	async fn post_text(router: axum::Router, uri: &str, body: &str) -> (StatusCode, serde_json::Value) {
+		let response = router.oneshot(Request::builder().method("POST").uri(uri).header("content-type", "text/plain").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+		let status = response.status();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		(status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+	}
+
+	#[tokio::test]
+	async fn ilp_ingest_seals_the_chosen_field() {
+		let dir = TempDir::new().unwrap();
+		// Declare `temp` as F64 / seconds, then ingest an ILP payload at second precision.
+		let router = router_with_declared_temp(&dir).await;
+		let payload = "weather,loc=a temp=1.5 100\nweather,loc=a temp=2.5 110\nweather,loc=a temp=3.5 120\n";
+		let (status, body) = post_text(router, "/api/v1/storage/temp/ilp?field=temp&precision=s", payload).await;
+		assert_eq!(status, StatusCode::CREATED, "body: {body}");
+		assert_eq!(body["aspect"], "temp");
+		assert_eq!(body["row_count"], 3);
+		assert_eq!(body["null_count"], 0);
+		assert_eq!(body["min_ts"], 100);
+		assert_eq!(body["max_ts"], 120);
+
+		// Read it back through the JSON range endpoint.
+		let router = router_with_declared_temp_reopened(&dir).await;
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/temp/points?start=100&end=120").body(Body::empty()).unwrap()).await.unwrap();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let read: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		assert_eq!(read["count"], 3);
+		assert_eq!(read["points"][0]["value"], "1.5");
+	}
+
+	/// Declare `temp` (F64, seconds) in a fresh store under `dir`.
+	async fn router_with_declared_temp(dir: &TempDir) -> axum::Router {
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens store"));
+		store.declare("temp", &dsp_physical_type::AspectSchema::new(dsp_physical_type::PhysicalType::F64, "0".parse().unwrap(), dsp_physical_type::TimeUnit::Seconds)).await.expect("declares");
+		app_with_state(AppState::new().with_store(store))
+	}
+
+	/// Reopen a router over the store dir for reading back ILP-sealed data.
+	async fn router_with_declared_temp_reopened(dir: &TempDir) -> axum::Router {
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("reopens store"));
+		app_with_state(AppState::new().with_store(store))
+	}
+
+	#[tokio::test]
+	async fn ilp_ingest_into_undeclared_aspect_is_not_found() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_empty_store(&dir).await;
+		let (status, _body) = post_text(router, "/api/v1/storage/ghost/ilp?field=temp&precision=s", "weather temp=1 100\n").await;
+		assert_eq!(status, StatusCode::NOT_FOUND);
+	}
+
+	#[tokio::test]
+	async fn ilp_ingest_unknown_precision_is_bad_request() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_temp(&dir).await;
+		let (status, body) = post_text(router, "/api/v1/storage/temp/ilp?field=temp&precision=fortnights", "weather temp=1 100\n").await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+		assert!(body["error"].as_str().unwrap().contains("unknown precision"));
+	}
+
+	#[tokio::test]
+	async fn ilp_ingest_missing_field_is_bad_request() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_temp(&dir).await;
+		// The payload carries `humidity`, but we ask for `temp`: no usable points.
+		let (status, body) = post_text(router, "/api/v1/storage/temp/ilp?field=temp&precision=s", "weather humidity=50 100\n").await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+		assert!(body["error"].as_str().unwrap().contains("no points carrying field"));
+	}
+
+	#[tokio::test]
+	async fn ilp_ingest_without_store_is_unavailable() {
+		let router = app_with_state(AppState::new());
+		let (status, _body) = post_text(router, "/api/v1/storage/temp/ilp?field=temp", "weather temp=1 100\n").await;
+		assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+	}
+
+	#[test]
+	fn epoch_in_unit_rescales_to_the_declared_unit() {
+		use chrono::TimeZone;
+		let instant = chrono::Utc.timestamp_opt(100, 0).single().expect("valid instant");
+		assert_eq!(super::epoch_in_unit(instant, dsp_physical_type::TimeUnit::Seconds), Some(100));
+		assert_eq!(super::epoch_in_unit(instant, dsp_physical_type::TimeUnit::Millis), Some(100_000));
+		assert_eq!(super::epoch_in_unit(instant, dsp_physical_type::TimeUnit::Micros), Some(100_000_000));
+		assert_eq!(super::epoch_in_unit(instant, dsp_physical_type::TimeUnit::Nanos), Some(100_000_000_000));
 	}
 }
