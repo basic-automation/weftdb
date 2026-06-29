@@ -51,7 +51,7 @@ use anyhow::{Context, Result};
 use arrow_array::RecordBatch;
 use bigdecimal::BigDecimal;
 use database::SegmentStore;
-use dsp_physical_type::{AspectSchema, TimeUnit};
+use dsp_physical_type::{AspectSchema, SegmentDescriptor, TimeUnit};
 
 /// Read the rows of `aspect` whose timestamp falls in the inclusive `[start, end]`
 /// window and return them as a single lossless Arrow [`RecordBatch`].
@@ -195,6 +195,46 @@ pub async fn read_time_range_to_parquet_bytes(store: &SegmentStore, aspect: &str
 pub async fn read_value_range_to_parquet_bytes(store: &SegmentStore, aspect: &str, lo: &BigDecimal, hi: &BigDecimal) -> Result<Vec<u8>> {
 	let batch = read_value_range_to_record_batch(store, aspect, lo, hi).await?;
 	Ok(dsp_arrow::write_parquet(std::slice::from_ref(&batch))?)
+}
+
+/// Ingest an Apache **Parquet** file's bytes into `aspect`'s declared schema,
+/// sealing one new segment, and return its descriptor.
+///
+/// The write-side inverse of [`read_time_range_to_parquet_bytes`] and the Parquet
+/// counterpart of the server's JSON / ILP ingest paths: it decodes the file with
+/// [`dsp_arrow::read_parquet`], recovers the logical `(timestamp, value)` columns
+/// with [`dsp_arrow::record_batches_to_columns`], and seals them into the store
+/// under the aspect's **declared** encoding — so the no-silent-downcast guarantee
+/// (hard constraint #4) holds: a value unrepresentable within the declared
+/// tolerance is rejected by the seal, never downcast. A batch carrying any null
+/// value seals through the nullable (quality-mask) path; `rows_per_page` selects a
+/// paged frame.
+///
+/// # Errors
+///
+/// Returns an error if `aspect` has no declared schema in the store (the message
+/// contains `no declared schema`, so a caller can map it to `404`), if the bytes
+/// are not a valid Parquet file or carry no DSP columns (a
+/// [`dsp_arrow::ConvertError`]), or if the seal fails (an unrepresentable value, or
+/// a filesystem/control-plane failure).
+pub async fn ingest_parquet_into_aspect(store: &SegmentStore, aspect: &str, bytes: &[u8], rows_per_page: Option<usize>) -> Result<SegmentDescriptor> {
+	let schema = aspect_schema(store, aspect).await?;
+	let batches = dsp_arrow::read_parquet(bytes)?;
+	let (timestamps, values) = dsp_arrow::record_batches_to_columns(&batches)?;
+	let any_null = values.iter().any(Option::is_none);
+	let descriptor = match (rows_per_page, any_null) {
+		(Some(rows_per_page), true) => store.seal_paged_nullable(aspect, &schema, &timestamps, &values, rows_per_page).await?,
+		(Some(rows_per_page), false) => store.seal_paged(aspect, &schema, &timestamps, &present_values(&values), rows_per_page).await?,
+		(None, true) => store.seal_nullable(aspect, &schema, &timestamps, &values).await?,
+		(None, false) => store.seal(aspect, &schema, &timestamps, &present_values(&values)).await?,
+	};
+	Ok(descriptor)
+}
+
+/// Unwrap an all-present value column to the dense `BigDecimal` slice the dense seal
+/// paths take. Only called when the caller has verified no value is `None`.
+fn present_values(values: &[Option<BigDecimal>]) -> Vec<BigDecimal> {
+	values.iter().map(|value| value.clone().unwrap_or_default()).collect()
 }
 
 /// Resolve the declared timestamp [`TimeUnit`] for `aspect`, erroring if the aspect
@@ -412,5 +452,45 @@ mod tests {
 		let batches = read_parquet(&bytes).expect("reads parquet");
 		let rows: usize = batches.iter().map(arrow_array::RecordBatch::num_rows).sum();
 		assert_eq!(rows, 0);
+	}
+
+	#[tokio::test]
+	async fn parquet_ingest_seals_a_batch_the_read_returns() {
+		use dsp_arrow::{columns_to_record_batch_typed, write_parquet};
+
+		let (_dir, store) = store_with_aspect(TimeUnit::Seconds, PhysicalType::F64).await;
+		// Build a Parquet file the way an external producer would, then ingest it.
+		let timestamps = vec![100_i64, 110, 120];
+		let values = vec![Some(bd("1.5")), Some(bd("2.5")), Some(bd("3.5"))];
+		let batch = columns_to_record_batch_typed(TimeUnit::Seconds, PhysicalType::F64, &timestamps, &values);
+		let bytes = write_parquet(std::slice::from_ref(&batch)).expect("writes");
+
+		let descriptor = ingest_parquet_into_aspect(&store, "price", &bytes, None).await.expect("ingests");
+		assert_eq!(descriptor.row_count, 3);
+		assert_eq!(descriptor.null_count, 0);
+
+		// The read surface returns exactly what was ingested.
+		let back = read_time_range_to_record_batch(&store, "price", 100, 120).await.expect("reads");
+		let (ts, vs) = record_batch_to_columns(&back).expect("reads back");
+		assert_eq!(ts, timestamps);
+		assert_eq!(vs, values);
+	}
+
+	#[tokio::test]
+	async fn parquet_ingest_into_undeclared_aspect_errors_with_no_declared_schema() {
+		use dsp_arrow::{columns_to_record_batch, write_parquet};
+
+		let (_dir, store) = store_with_aspect(TimeUnit::Seconds, PhysicalType::F64).await;
+		let batch = columns_to_record_batch(TimeUnit::Seconds, &[1_i64], &[Some(bd("1"))]);
+		let bytes = write_parquet(std::slice::from_ref(&batch)).expect("writes");
+		let err = ingest_parquet_into_aspect(&store, "never_declared", &bytes, None).await.expect_err("must error");
+		assert!(err.to_string().contains("no declared schema"), "got: {err}");
+	}
+
+	#[tokio::test]
+	async fn parquet_ingest_rejects_garbage_bytes() {
+		let (_dir, store) = store_with_aspect(TimeUnit::Seconds, PhysicalType::F64).await;
+		let err = ingest_parquet_into_aspect(&store, "price", b"not a parquet file", None).await.expect_err("must error");
+		assert!(err.to_string().contains("parquet"), "got: {err}");
 	}
 }
