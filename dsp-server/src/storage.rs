@@ -168,6 +168,13 @@ pub struct StoredPoint {
 /// order); `limit` caps how many are returned. Both are applied after the
 /// (page-pruned) read, so a paginated request still only opens the segments the
 /// window overlaps.
+///
+/// Two declarative aliases mirror the legacy `DSM-Database` REST surface:
+/// `take` is an alias for `limit` (the page size — `limit` wins if both are
+/// given), and `page` is a **1-based** page number that derives the offset from
+/// the page size (`offset = (page - 1) * page_size`). When `page` is present it
+/// supersedes any explicit `offset`; a `page` without a page size falls back to
+/// page 1 (offset 0).
 #[derive(Debug, Clone, Deserialize)]
 pub struct PointsRangeParams {
 	/// Inclusive window start (epoch integer in the aspect's declared unit).
@@ -180,6 +187,14 @@ pub struct PointsRangeParams {
 	/// Return at most this many rows (default: all remaining after `offset`).
 	#[serde(default)]
 	pub limit: Option<usize>,
+	/// Declarative alias for `limit` (the page size). `limit` takes precedence if
+	/// both are supplied.
+	#[serde(default)]
+	pub take: Option<usize>,
+	/// 1-based page number. With a page size (`limit`/`take`) it derives the
+	/// offset and supersedes `offset`.
+	#[serde(default)]
+	pub page: Option<usize>,
 }
 
 /// Response body for `GET /api/v1/storage/{aspect}/points` — the JSON (non-Arrow)
@@ -198,17 +213,27 @@ pub struct StoredRangeResponse {
 	pub count: usize,
 	/// The number of leading rows skipped (the applied `offset`, 0 if none).
 	pub offset: usize,
+	/// The effective page size applied (the resolved `limit`/`take`); absent when
+	/// the read was unbounded.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub limit: Option<usize>,
+	/// The 1-based page number served, present only for a page-based request
+	/// (`page` supplied).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub page: Option<usize>,
 	/// The rows in this page, in segment-seal then in-segment order.
 	pub points: Vec<StoredPoint>,
 }
 
-/// Handle `GET /api/v1/storage/{aspect}/points?start&end&offset&limit`.
+/// Handle `GET /api/v1/storage/{aspect}/points?start&end&offset&limit&take&page`.
 ///
 /// The JSON counterpart of the Arrow [`storage_time_range`] read, for clients that
 /// do not speak Arrow IPC: returns the rows of `aspect` in the inclusive
 /// `[start, end]` window as a lossless decimal-text point list, tagged with the
 /// aspect's declared timestamp unit. Optional `offset`/`limit` paginate the window
-/// (backlog B-rest), with `total` reporting the pre-pagination row count.
+/// (backlog B-rest), with the declarative `take` (alias for `limit`) and `page`
+/// (1-based, derives the offset) aliases also accepted; `total` reports the
+/// pre-pagination row count.
 ///
 /// # Errors
 ///
@@ -226,14 +251,19 @@ pub async fn storage_time_range_json(State(state): State<AppState>, Path(aspect)
 	drop(store);
 	let (timestamps, values) = result.map_err(|err| classify_read_error(&err))?;
 	let total = timestamps.len();
-	let offset = params.offset.unwrap_or(0);
-	// Paginate: skip `offset` rows of the window, take at most `limit`.
+	// Resolve the page size: explicit `limit` wins over the `take` alias.
+	let page_size = params.limit.or(params.take);
+	// `page` (1-based) derives the offset and supersedes an explicit `offset`;
+	// without a page size it falls back to page 1 (offset 0).
+	let offset = params.page.map_or_else(|| params.offset.unwrap_or(0), |page| page_size.map_or(0, |size| page.saturating_sub(1).saturating_mul(size)));
+	// Paginate: skip `offset` rows of the window, take at most `page_size`.
 	let paginated = timestamps.into_iter().zip(values).skip(offset);
-	let points: Vec<StoredPoint> = match params.limit {
-		Some(limit) => paginated.take(limit).map(|(timestamp, value)| StoredPoint { timestamp, value: value.map(|v| v.to_string()) }).collect(),
+	let points: Vec<StoredPoint> = match page_size {
+		Some(size) => paginated.take(size).map(|(timestamp, value)| StoredPoint { timestamp, value: value.map(|v| v.to_string()) }).collect(),
 		None => paginated.map(|(timestamp, value)| StoredPoint { timestamp, value: value.map(|v| v.to_string()) }).collect(),
 	};
-	Ok(Json(StoredRangeResponse { aspect, time_unit: schema.timestamp_unit.name(), total, count: points.len(), offset, points }))
+	let page = params.page.map(|page| page.max(1));
+	Ok(Json(StoredRangeResponse { aspect, time_unit: schema.timestamp_unit.name(), total, count: points.len(), offset, limit: page_size, page, points }))
 }
 
 /// One declared aspect's identity in the [`AspectListResponse`].
@@ -721,5 +751,75 @@ mod tests {
 		assert_eq!(body["total"], 5);
 		assert_eq!(body["count"], 5);
 		assert_eq!(body["offset"], 0);
+		// Unbounded read omits the `limit`/`page` echoes.
+		assert!(body.get("limit").is_none());
+		assert!(body.get("page").is_none());
+	}
+
+	#[tokio::test]
+	async fn points_take_alias_is_an_alias_for_limit() {
+		let (_dir, router) = router_with_sealed_price().await;
+		// `take=2` with no `limit` behaves like `limit=2`.
+		let (status, body) = get_json(router, "/api/v1/storage/price/points?start=100&end=140&take=2").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["total"], 5);
+		assert_eq!(body["count"], 2);
+		assert_eq!(body["offset"], 0);
+		assert_eq!(body["limit"], 2);
+		// `take` alone is not page-based, so no `page` echo.
+		assert!(body.get("page").is_none());
+		let points = body["points"].as_array().unwrap();
+		assert_eq!(points[0]["timestamp"], 100);
+		assert_eq!(points[1]["timestamp"], 110);
+	}
+
+	#[tokio::test]
+	async fn points_limit_wins_over_take_alias() {
+		let (_dir, router) = router_with_sealed_price().await;
+		// When both are given, `limit` takes precedence over `take`.
+		let (status, body) = get_json(router, "/api/v1/storage/price/points?start=100&end=140&limit=1&take=4").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["count"], 1);
+		assert_eq!(body["limit"], 1);
+	}
+
+	#[tokio::test]
+	async fn points_page_derives_offset_from_page_size() {
+		let (_dir, router) = router_with_sealed_price().await;
+		// page 2 with size 2 -> offset (2-1)*2 = 2: rows ts 120, 130.
+		let (status, body) = get_json(router, "/api/v1/storage/price/points?start=100&end=140&page=2&take=2").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["total"], 5);
+		assert_eq!(body["count"], 2);
+		assert_eq!(body["offset"], 2);
+		assert_eq!(body["limit"], 2);
+		assert_eq!(body["page"], 2);
+		let points = body["points"].as_array().unwrap();
+		assert_eq!(points[0]["timestamp"], 120);
+		assert_eq!(points[1]["timestamp"], 130);
+	}
+
+	#[tokio::test]
+	async fn points_page_supersedes_explicit_offset() {
+		let (_dir, router) = router_with_sealed_price().await;
+		// `page=1` forces offset 0 even though `offset=3` is also supplied.
+		let (status, body) = get_json(router, "/api/v1/storage/price/points?start=100&end=140&page=1&limit=2&offset=3").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["offset"], 0);
+		assert_eq!(body["page"], 1);
+		let points = body["points"].as_array().unwrap();
+		assert_eq!(points[0]["timestamp"], 100);
+	}
+
+	#[tokio::test]
+	async fn points_page_without_page_size_falls_back_to_page_one() {
+		let (_dir, router) = router_with_sealed_price().await;
+		// `page` with no `limit`/`take` -> offset 0, whole window returned.
+		let (status, body) = get_json(router, "/api/v1/storage/price/points?start=100&end=140&page=5").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["offset"], 0);
+		assert_eq!(body["count"], 5);
+		assert_eq!(body["page"], 5);
+		assert!(body.get("limit").is_none());
 	}
 }
