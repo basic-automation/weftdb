@@ -220,15 +220,28 @@ fn classify_seal_error(err: &anyhow::Error) -> StorageError {
 /// values unrepresentable under the declared encoding/tolerance), and
 /// [`StorageError::Internal`] on a filesystem/control-plane failure.
 pub async fn ingest_points(State(state): State<AppState>, Path(aspect): Path<String>, Json(request): Json<IngestRequest>) -> Result<Response, StorageError> {
-	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	let metrics = state.metrics().clone();
+	metrics.record_ingest_request();
+	let store = state.store().cloned().ok_or_else(|| { metrics.record_ingest_error(); StorageError::Unconfigured })?;
 	drop(state);
+	let result = ingest_points_inner(&store, &metrics, &aspect, request).await;
+	drop(store);
+	if result.is_err() {
+		metrics.record_ingest_error();
+	}
+	result
+}
+
+/// The body of [`ingest_points`], split out so the handler can record an error
+/// metric for any failure path uniformly.
+async fn ingest_points_inner(store: &database::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, request: IngestRequest) -> Result<Response, StorageError> {
 	if request.points.is_empty() {
 		return Err(StorageError::BadRequest("no points to ingest (`points` is empty)".to_string()));
 	}
 	// An undeclared aspect is a clean 404 (its encoding is unknown) rather than the
 	// seal's generic error; fetching the schema here also lets the nullable/paged
 	// seal variants take it directly.
-	let Some(schema) = store.schema_for(&aspect).await.map_err(|err| StorageError::Internal(err.to_string()))? else {
+	let Some(schema) = store.schema_for(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))? else {
 		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
 
@@ -249,11 +262,10 @@ pub async fn ingest_points(State(state): State<AppState>, Path(aspect): Path<Str
 		}
 	}
 
-	let descriptor = seal_batch(&store, &aspect, &schema, &timestamps, &values, any_null, request.rows_per_page).await;
-	drop(store);
-	let descriptor = descriptor.map_err(|err| classify_seal_error(&err))?;
+	let descriptor = seal_batch(store, aspect, &schema, &timestamps, &values, any_null, request.rows_per_page).await.map_err(|err| classify_seal_error(&err))?;
+	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
 	let response = IngestResponse {
-		aspect,
+		aspect: aspect.to_string(),
 		segment_id: descriptor.id,
 		format_version: descriptor.format_version,
 		row_count: descriptor.row_count,
@@ -352,13 +364,26 @@ fn epoch_in_unit(instant: DateTime<Utc>, unit: TimeUnit) -> Option<i64> {
 /// range, or values unrepresentable under the declared encoding/tolerance), and
 /// [`StorageError::Internal`] on a filesystem/control-plane failure.
 pub async fn ingest_ilp(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<IlpIngestParams>, body: String) -> Result<Response, StorageError> {
-	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	let metrics = state.metrics().clone();
+	metrics.record_ingest_request();
+	let store = state.store().cloned().ok_or_else(|| { metrics.record_ingest_error(); StorageError::Unconfigured })?;
 	drop(state);
+	let result = ingest_ilp_inner(&store, &metrics, &aspect, &params, &body).await;
+	drop(store);
+	if result.is_err() {
+		metrics.record_ingest_error();
+	}
+	result
+}
+
+/// The body of [`ingest_ilp`], split out so the handler records an error metric for
+/// any failure path uniformly.
+async fn ingest_ilp_inner(store: &database::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, params: &IlpIngestParams, body: &str) -> Result<Response, StorageError> {
 	let precision = parse_ilp_precision(params.precision.as_deref()).map_err(StorageError::BadRequest)?;
-	let Some(schema) = store.schema_for(&aspect).await.map_err(|err| StorageError::Internal(err.to_string()))? else {
+	let Some(schema) = store.schema_for(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))? else {
 		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
-	let points = dsp_line_protocol::parse_points(&body, &params.field, precision).map_err(|err| StorageError::BadRequest(err.to_string()))?;
+	let points = dsp_line_protocol::parse_points(body, &params.field, precision).map_err(|err| StorageError::BadRequest(err.to_string()))?;
 	if points.is_empty() {
 		return Err(StorageError::BadRequest(format!("no points carrying field `{}` with a timestamp in the payload", params.field)));
 	}
@@ -372,13 +397,13 @@ pub async fn ingest_ilp(State(state): State<AppState>, Path(aspect): Path<String
 	}
 
 	let descriptor = match params.rows_per_page {
-		Some(rows_per_page) => store.seal_paged(&aspect, &schema, &timestamps, &values, rows_per_page).await,
-		None => store.seal(&aspect, &schema, &timestamps, &values).await,
-	};
-	drop(store);
-	let descriptor = descriptor.map_err(|err| classify_seal_error(&err))?;
+		Some(rows_per_page) => store.seal_paged(aspect, &schema, &timestamps, &values, rows_per_page).await,
+		None => store.seal(aspect, &schema, &timestamps, &values).await,
+	}
+	.map_err(|err| classify_seal_error(&err))?;
+	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
 	let response = IngestResponse {
-		aspect,
+		aspect: aspect.to_string(),
 		segment_id: descriptor.id,
 		format_version: descriptor.format_version,
 		row_count: descriptor.row_count,
@@ -689,6 +714,51 @@ mod tests {
 		let router = app_with_state(AppState::new());
 		let (status, _body) = post_text(router, "/api/v1/storage/temp/ilp?field=temp", "weather temp=1 100\n").await;
 		assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+	}
+
+	#[tokio::test]
+	async fn ingest_increments_shared_ingest_metrics() {
+		use crate::SharedMetrics;
+
+		let dir = TempDir::new().unwrap();
+		let metrics = SharedMetrics::default();
+		// Build state carrying both an observable metrics handle and a declared store.
+		let store = Arc::new(SegmentStore::open(dir.path()).await.unwrap());
+		store.declare("price", &dsp_physical_type::AspectSchema::new(dsp_physical_type::PhysicalType::F64, "0".parse().unwrap(), dsp_physical_type::TimeUnit::Seconds)).await.unwrap();
+		let router = app_with_state(AppState::with_metrics(metrics.clone()).with_store(store));
+
+		// A good ingest of three rows.
+		let body = serde_json::json!({ "points": [
+			{ "timestamp": 1, "value": "1" },
+			{ "timestamp": 2, "value": "2" },
+			{ "timestamp": 3, "value": "3" },
+		] });
+		let (status, _body) = post_json(router, "/api/v1/storage/price/points", &body).await;
+		assert_eq!(status, StatusCode::CREATED);
+
+		let snap = metrics.snapshot();
+		assert_eq!(snap.ingest.requests, 1);
+		assert_eq!(snap.ingest.errors, 0);
+		assert_eq!(snap.ingest.rows_sealed, 3);
+		assert_eq!(snap.ingest.segments_sealed, 1);
+	}
+
+	#[tokio::test]
+	async fn failed_ingest_increments_error_metric() {
+		use crate::SharedMetrics;
+
+		let dir = TempDir::new().unwrap();
+		let metrics = SharedMetrics::default();
+		let store = Arc::new(SegmentStore::open(dir.path()).await.unwrap());
+		// No aspect declared -> the ingest 404s and must count one request + one error.
+		let router = app_with_state(AppState::with_metrics(metrics.clone()).with_store(store));
+		let body = serde_json::json!({ "points": [{ "timestamp": 1, "value": "1" }] });
+		let (status, _body) = post_json(router, "/api/v1/storage/ghost/points", &body).await;
+		assert_eq!(status, StatusCode::NOT_FOUND);
+		let snap = metrics.snapshot();
+		assert_eq!(snap.ingest.requests, 1);
+		assert_eq!(snap.ingest.errors, 1);
+		assert_eq!(snap.ingest.rows_sealed, 0);
 	}
 
 	#[test]

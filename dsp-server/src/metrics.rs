@@ -29,6 +29,8 @@ pub struct Metrics {
 	pub interpolate: InterpolateMetrics,
 	/// Counters for `POST /api/v1/downsample`.
 	pub downsample: DownsampleMetrics,
+	/// Counters for the storage-ingest endpoints (`…/points`, `…/ilp`).
+	pub ingest: IngestMetrics,
 }
 
 /// Counters for the interpolation endpoint.
@@ -47,6 +49,15 @@ pub struct DownsampleMetrics {
 	output_buckets: AtomicU64,
 }
 
+/// Counters for the storage-ingest endpoints (batch JSON + ILP seal).
+#[derive(Debug, Default)]
+pub struct IngestMetrics {
+	requests: AtomicU64,
+	errors: AtomicU64,
+	rows_sealed: AtomicU64,
+	segments_sealed: AtomicU64,
+}
+
 /// A point-in-time read of [`Metrics`], convenient for assertions and rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetricsSnapshot {
@@ -54,6 +65,8 @@ pub struct MetricsSnapshot {
 	pub interpolate: InterpolateSnapshot,
 	/// Downsample-endpoint counters.
 	pub downsample: DownsampleSnapshot,
+	/// Storage-ingest counters.
+	pub ingest: IngestSnapshot,
 }
 
 /// A point-in-time read of [`InterpolateMetrics`].
@@ -76,6 +89,19 @@ pub struct DownsampleSnapshot {
 	pub errors: u64,
 	/// Total non-empty buckets served across all successful requests.
 	pub output_buckets: u64,
+}
+
+/// A point-in-time read of [`IngestMetrics`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IngestSnapshot {
+	/// Total storage-ingest requests received (including failures).
+	pub requests: u64,
+	/// Storage-ingest requests that returned an error.
+	pub errors: u64,
+	/// Total rows sealed across all successful ingests (present and null).
+	pub rows_sealed: u64,
+	/// Total segments sealed across all successful ingests.
+	pub segments_sealed: u64,
 }
 
 impl Metrics {
@@ -109,10 +135,26 @@ impl Metrics {
 		self.downsample.output_buckets.fetch_add(count, Ordering::Relaxed);
 	}
 
+	/// Count a storage-ingest request (record on entry, before validation).
+	pub fn record_ingest_request(&self) {
+		self.ingest.requests.fetch_add(1, Ordering::Relaxed);
+	}
+
+	/// Count a storage-ingest request that failed.
+	pub fn record_ingest_error(&self) {
+		self.ingest.errors.fetch_add(1, Ordering::Relaxed);
+	}
+
+	/// Record a successful seal: add its row count and count the one segment.
+	pub fn record_ingest_seal(&self, rows: u64) {
+		self.ingest.rows_sealed.fetch_add(rows, Ordering::Relaxed);
+		self.ingest.segments_sealed.fetch_add(1, Ordering::Relaxed);
+	}
+
 	/// Take a consistent-enough snapshot of all counters.
 	#[must_use]
 	pub fn snapshot(&self) -> MetricsSnapshot {
-		MetricsSnapshot { interpolate: InterpolateSnapshot { requests: self.interpolate.requests.load(Ordering::Relaxed), errors: self.interpolate.errors.load(Ordering::Relaxed), output_points: self.interpolate.output_points.load(Ordering::Relaxed) }, downsample: DownsampleSnapshot { requests: self.downsample.requests.load(Ordering::Relaxed), errors: self.downsample.errors.load(Ordering::Relaxed), output_buckets: self.downsample.output_buckets.load(Ordering::Relaxed) } }
+		MetricsSnapshot { interpolate: InterpolateSnapshot { requests: self.interpolate.requests.load(Ordering::Relaxed), errors: self.interpolate.errors.load(Ordering::Relaxed), output_points: self.interpolate.output_points.load(Ordering::Relaxed) }, downsample: DownsampleSnapshot { requests: self.downsample.requests.load(Ordering::Relaxed), errors: self.downsample.errors.load(Ordering::Relaxed), output_buckets: self.downsample.output_buckets.load(Ordering::Relaxed) }, ingest: IngestSnapshot { requests: self.ingest.requests.load(Ordering::Relaxed), errors: self.ingest.errors.load(Ordering::Relaxed), rows_sealed: self.ingest.rows_sealed.load(Ordering::Relaxed), segments_sealed: self.ingest.segments_sealed.load(Ordering::Relaxed) } }
 	}
 
 	/// Render the counters in the Prometheus text exposition format (v0.0.4).
@@ -121,7 +163,7 @@ impl Metrics {
 		use std::fmt::Write as _;
 		let snap = self.snapshot();
 		let mut out = String::with_capacity(512);
-		let counters = [("dsp_interpolate_requests_total", "Total interpolation requests received.", snap.interpolate.requests), ("dsp_interpolate_errors_total", "Interpolation requests that returned an error.", snap.interpolate.errors), ("dsp_interpolate_output_points_total", "Total interpolated output points served.", snap.interpolate.output_points), ("dsp_downsample_requests_total", "Total downsample requests received.", snap.downsample.requests), ("dsp_downsample_errors_total", "Downsample requests that returned an error.", snap.downsample.errors), ("dsp_downsample_output_buckets_total", "Total downsample buckets served.", snap.downsample.output_buckets)];
+		let counters = [("dsp_interpolate_requests_total", "Total interpolation requests received.", snap.interpolate.requests), ("dsp_interpolate_errors_total", "Interpolation requests that returned an error.", snap.interpolate.errors), ("dsp_interpolate_output_points_total", "Total interpolated output points served.", snap.interpolate.output_points), ("dsp_downsample_requests_total", "Total downsample requests received.", snap.downsample.requests), ("dsp_downsample_errors_total", "Downsample requests that returned an error.", snap.downsample.errors), ("dsp_downsample_output_buckets_total", "Total downsample buckets served.", snap.downsample.output_buckets), ("dsp_ingest_requests_total", "Total storage-ingest requests received.", snap.ingest.requests), ("dsp_ingest_errors_total", "Storage-ingest requests that returned an error.", snap.ingest.errors), ("dsp_ingest_rows_sealed_total", "Total rows sealed across all storage ingests.", snap.ingest.rows_sealed), ("dsp_ingest_segments_sealed_total", "Total segments sealed across all storage ingests.", snap.ingest.segments_sealed)];
 		for (name, help, value) in counters {
 			// `writeln!` into a String is infallible.
 			let _ = writeln!(out, "# HELP {name} {help}");
@@ -167,8 +209,25 @@ mod tests {
 		assert!(text.contains("dsp_interpolate_requests_total 1"));
 		assert!(text.contains("dsp_interpolate_output_points_total 5"));
 		// No value line is left dangling without a preceding TYPE line.
-		assert_eq!(text.matches("# TYPE ").count(), 6);
+		assert_eq!(text.matches("# TYPE ").count(), 10);
 		// The downsample counters are exposed too.
 		assert!(text.contains("# TYPE dsp_downsample_requests_total counter"));
+		// And the storage-ingest counters.
+		assert!(text.contains("# TYPE dsp_ingest_rows_sealed_total counter"));
+	}
+
+	#[test]
+	fn ingest_counters_accumulate() {
+		let m = Metrics::default();
+		m.record_ingest_request();
+		m.record_ingest_request();
+		m.record_ingest_error();
+		m.record_ingest_seal(5);
+		m.record_ingest_seal(3);
+		let snap = m.snapshot();
+		assert_eq!(snap.ingest.requests, 2);
+		assert_eq!(snap.ingest.errors, 1);
+		assert_eq!(snap.ingest.rows_sealed, 8);
+		assert_eq!(snap.ingest.segments_sealed, 2);
 	}
 }
