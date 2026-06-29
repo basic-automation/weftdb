@@ -160,6 +160,28 @@ pub struct StoredPoint {
 	pub value: Option<String>,
 }
 
+/// Query parameters for the JSON points read: the inclusive `[start, end]` window
+/// plus optional **pagination** (backlog B-rest — declarative `take`/`page` query
+/// params over the REST facade).
+///
+/// `offset` skips that many rows of the window (in segment-seal then in-segment
+/// order); `limit` caps how many are returned. Both are applied after the
+/// (page-pruned) read, so a paginated request still only opens the segments the
+/// window overlaps.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PointsRangeParams {
+	/// Inclusive window start (epoch integer in the aspect's declared unit).
+	pub start: i64,
+	/// Inclusive window end (epoch integer in the aspect's declared unit).
+	pub end: i64,
+	/// Skip this many leading rows of the window before returning (default 0).
+	#[serde(default)]
+	pub offset: Option<usize>,
+	/// Return at most this many rows (default: all remaining after `offset`).
+	#[serde(default)]
+	pub limit: Option<usize>,
+}
+
 /// Response body for `GET /api/v1/storage/{aspect}/points` — the JSON (non-Arrow)
 /// stored-range read.
 #[derive(Debug, Clone, Serialize)]
@@ -169,25 +191,31 @@ pub struct StoredRangeResponse {
 	/// The aspect's declared timestamp unit token (e.g. `"seconds"`), so a consumer
 	/// can interpret the integer timestamps.
 	pub time_unit: &'static str,
-	/// Number of rows returned.
+	/// Total rows in the window **before** pagination — the count a client pages
+	/// through (so it knows whether more pages remain).
+	pub total: usize,
+	/// Number of rows returned in this page (after `offset`/`limit`).
 	pub count: usize,
-	/// The rows in the window, in segment-seal then in-segment order.
+	/// The number of leading rows skipped (the applied `offset`, 0 if none).
+	pub offset: usize,
+	/// The rows in this page, in segment-seal then in-segment order.
 	pub points: Vec<StoredPoint>,
 }
 
-/// Handle `GET /api/v1/storage/{aspect}/points?start&end`.
+/// Handle `GET /api/v1/storage/{aspect}/points?start&end&offset&limit`.
 ///
 /// The JSON counterpart of the Arrow [`storage_time_range`] read, for clients that
 /// do not speak Arrow IPC: returns the rows of `aspect` in the inclusive
 /// `[start, end]` window as a lossless decimal-text point list, tagged with the
-/// aspect's declared timestamp unit.
+/// aspect's declared timestamp unit. Optional `offset`/`limit` paginate the window
+/// (backlog B-rest), with `total` reporting the pre-pagination row count.
 ///
 /// # Errors
 ///
 /// [`StorageError::Unconfigured`] when no store is attached,
 /// [`StorageError::NotFound`] when the aspect is undeclared (its timestamp unit is
 /// unknown), and [`StorageError::Internal`] on a read failure.
-pub async fn storage_time_range_json(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<TimeRangeParams>) -> Result<Json<StoredRangeResponse>, StorageError> {
+pub async fn storage_time_range_json(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<PointsRangeParams>) -> Result<Json<StoredRangeResponse>, StorageError> {
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	drop(state);
 	let schema = store.schema_for(&aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?;
@@ -197,8 +225,15 @@ pub async fn storage_time_range_json(State(state): State<AppState>, Path(aspect)
 	let result = store.read_time_range(&aspect, params.start, params.end).await;
 	drop(store);
 	let (timestamps, values) = result.map_err(|err| classify_read_error(&err))?;
-	let points: Vec<StoredPoint> = timestamps.into_iter().zip(values).map(|(timestamp, value)| StoredPoint { timestamp, value: value.map(|v| v.to_string()) }).collect();
-	Ok(Json(StoredRangeResponse { aspect, time_unit: schema.timestamp_unit.name(), count: points.len(), points }))
+	let total = timestamps.len();
+	let offset = params.offset.unwrap_or(0);
+	// Paginate: skip `offset` rows of the window, take at most `limit`.
+	let paginated = timestamps.into_iter().zip(values).skip(offset);
+	let points: Vec<StoredPoint> = match params.limit {
+		Some(limit) => paginated.take(limit).map(|(timestamp, value)| StoredPoint { timestamp, value: value.map(|v| v.to_string()) }).collect(),
+		None => paginated.map(|(timestamp, value)| StoredPoint { timestamp, value: value.map(|v| v.to_string()) }).collect(),
+	};
+	Ok(Json(StoredRangeResponse { aspect, time_unit: schema.timestamp_unit.name(), total, count: points.len(), offset, points }))
 }
 
 /// One declared aspect's identity in the [`AspectListResponse`].
@@ -265,6 +300,61 @@ pub struct StoreStatsResponse {
 	pub time_range: Option<[i64; 2]>,
 }
 
+/// One registered database in the [`CatalogResponse`]: its name and the subjects
+/// registered under it.
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogDatabase {
+	/// The database name.
+	pub name: String,
+	/// The subjects registered under this database, in name order.
+	pub subjects: Vec<String>,
+}
+
+/// Response body for `GET /api/v1/storage/catalog` — the control-plane hierarchy
+/// the configured store sits in.
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogResponse {
+	/// The database namespace this server's store is **scoped** to (its declares /
+	/// seals / reads all happen here).
+	pub database: String,
+	/// The subject namespace this server's store is scoped to.
+	pub subject: String,
+	/// Every database registered in the store's `catalog.db`, each with its
+	/// subjects — the full hierarchy a root holds, not just the active scope.
+	pub databases: Vec<CatalogDatabase>,
+}
+
+/// Collect the registered `(database, subject)` hierarchy from a store's registry.
+/// Kept as a free async fn taking `&SegmentStore` so the handler can drop the store
+/// handle before building its response.
+async fn collect_catalog(store: &database::SegmentStore) -> anyhow::Result<Vec<CatalogDatabase>> {
+	let database_names = store.registry().list_databases().await?;
+	let mut databases = Vec::with_capacity(database_names.len());
+	for name in database_names {
+		let subjects = store.registry().list_subjects(&name).await?;
+		databases.push(CatalogDatabase { name, subjects });
+	}
+	Ok(databases)
+}
+
+/// Handle `GET /api/v1/storage/catalog`: report the database/subject scope the
+/// configured store is bound to, plus the full registered DB/subject hierarchy.
+///
+/// # Errors
+///
+/// [`StorageError::Unconfigured`] when no store is attached, or
+/// [`StorageError::Internal`] on a control-plane read failure.
+pub async fn storage_catalog(State(state): State<AppState>) -> Result<Json<CatalogResponse>, StorageError> {
+	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	drop(state);
+	let scope_database = store.database().to_string();
+	let scope_subject = store.subject().to_string();
+	let result = collect_catalog(&store).await;
+	drop(store);
+	let databases = result.map_err(|err| StorageError::Internal(err.to_string()))?;
+	Ok(Json(CatalogResponse { database: scope_database, subject: scope_subject, databases }))
+}
+
 /// Collect the declared aspects and their schemas into the response DTO. Kept as a
 /// free async fn taking `&SegmentStore` so the handler can drop the store handle
 /// before building its response.
@@ -293,6 +383,36 @@ pub async fn storage_aspects(State(state): State<AppState>) -> Result<Json<Aspec
 	drop(store);
 	let aspects = result.map_err(|err| StorageError::Internal(err.to_string()))?;
 	Ok(Json(AspectListResponse { aspects }))
+}
+
+/// Response body for `GET /api/v1/storage/{aspect}/schema` — a single aspect's
+/// declared schema (the read counterpart of the `POST …/aspects` declaration).
+#[derive(Debug, Clone, Serialize)]
+pub struct AspectSchemaResponse {
+	/// The declared aspect and its physical encoding / tolerance / timestamp unit.
+	pub aspect: AspectInfo,
+}
+
+/// Handle `GET /api/v1/storage/{aspect}/schema`: return one aspect's declared
+/// schema, the single-aspect read counterpart of `GET …/aspects` (which lists all)
+/// and of the `POST …/aspects` declaration.
+///
+/// # Errors
+///
+/// [`StorageError::Unconfigured`] when no store is attached,
+/// [`StorageError::NotFound`] when the aspect is undeclared, and
+/// [`StorageError::Internal`] on a control-plane read failure.
+pub async fn storage_aspect_schema(State(state): State<AppState>, Path(aspect): Path<String>) -> Result<Json<AspectSchemaResponse>, StorageError> {
+	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	drop(state);
+	let result = store.schema_for(&aspect).await;
+	drop(store);
+	let schema = result.map_err(|err| StorageError::Internal(err.to_string()))?;
+	let Some(schema) = schema else {
+		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
+	};
+	let aspect = AspectInfo { name: aspect, physical_type: schema.value.name(), value_tolerance: schema.value_tolerance.to_string(), timestamp_unit: schema.timestamp_unit.name() };
+	Ok(Json(AspectSchemaResponse { aspect }))
 }
 
 /// Handle `GET /api/v1/storage/{aspect}/stats`.
@@ -525,5 +645,81 @@ mod tests {
 		assert_eq!(status, StatusCode::OK, "body: {body}");
 		assert_eq!(body["count"], 0);
 		assert!(body["points"].as_array().unwrap().is_empty());
+	}
+
+	#[tokio::test]
+	async fn catalog_reports_scope_and_registered_hierarchy() {
+		let (_dir, router) = router_with_sealed_price().await;
+		let (status, body) = get_json(router, "/api/v1/storage/catalog").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		// A store opened with `SegmentStore::open` is scoped to default/default.
+		assert_eq!(body["database"], "default");
+		assert_eq!(body["subject"], "default");
+		let databases = body["databases"].as_array().unwrap();
+		assert!(databases.iter().any(|d| d["name"] == "default" && d["subjects"].as_array().unwrap().iter().any(|s| s == "default")));
+	}
+
+	#[tokio::test]
+	async fn catalog_without_store_is_unavailable() {
+		let router = app_with_state(AppState::new());
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/catalog").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+	}
+
+	#[tokio::test]
+	async fn aspect_schema_returns_one_declared_aspect() {
+		let (_dir, router) = router_with_sealed_price().await;
+		let (status, body) = get_json(router, "/api/v1/storage/price/schema").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["aspect"]["name"], "price");
+		assert_eq!(body["aspect"]["physical_type"], "f64");
+		assert_eq!(body["aspect"]["timestamp_unit"], "seconds");
+		assert_eq!(body["aspect"]["value_tolerance"], "0");
+	}
+
+	#[tokio::test]
+	async fn aspect_schema_undeclared_is_not_found() {
+		let (_dir, router) = router_with_sealed_price().await;
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/never_declared/schema").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::NOT_FOUND);
+	}
+
+	#[tokio::test]
+	async fn points_pagination_offset_and_limit_page_the_window() {
+		// The sealed `price` aspect holds five rows at ts 100..=140.
+		let (_dir, router) = router_with_sealed_price().await;
+		// Page: skip 1, take 2 over the full window.
+		let (status, body) = get_json(router, "/api/v1/storage/price/points?start=100&end=140&offset=1&limit=2").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		// `total` is the whole window (5); this page returns 2 starting at offset 1.
+		assert_eq!(body["total"], 5);
+		assert_eq!(body["count"], 2);
+		assert_eq!(body["offset"], 1);
+		let points = body["points"].as_array().unwrap();
+		assert_eq!(points.len(), 2);
+		// Offset 1 skips ts 100; the page is ts 110, 120.
+		assert_eq!(points[0]["timestamp"], 110);
+		assert_eq!(points[1]["timestamp"], 120);
+	}
+
+	#[tokio::test]
+	async fn points_pagination_offset_past_end_returns_empty_page() {
+		let (_dir, router) = router_with_sealed_price().await;
+		let (status, body) = get_json(router, "/api/v1/storage/price/points?start=100&end=140&offset=100").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["total"], 5);
+		assert_eq!(body["count"], 0);
+		assert!(body["points"].as_array().unwrap().is_empty());
+	}
+
+	#[tokio::test]
+	async fn points_without_pagination_returns_whole_window() {
+		let (_dir, router) = router_with_sealed_price().await;
+		let (status, body) = get_json(router, "/api/v1/storage/price/points?start=100&end=140").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		// No offset/limit -> total == count, offset 0.
+		assert_eq!(body["total"], 5);
+		assert_eq!(body["count"], 5);
+		assert_eq!(body["offset"], 0);
 	}
 }
