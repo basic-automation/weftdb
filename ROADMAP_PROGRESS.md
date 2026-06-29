@@ -2536,3 +2536,118 @@ gaps); or (b) assess the `parquet` crate (weight/licensing/codecs) and add
 Parquet import/export from a `RecordBatch` in `dsp-arrow`.
 
 **PR:** https://github.com/physics515/DSP/pull/28
+
+## 2026-06-28 (run 2) — dsp-server HTTP catalog management + ingest (Phase 2, 7 increments)
+
+- **Item:** Phase 2 (*benchmark-grade server/API*) — the **write path** the
+  2026-06-28 run named as tomorrow's slice (option (a): "HTTP catalog
+  management — POST endpoints to create a database/subject and `declare` an
+  aspect's schema over HTTP, so a client can populate the store the new read
+  endpoints serve"). This run built that and the natural arc around it: declare,
+  JSON batch ingest, ILP ingest, catalog introspection, ingest metrics,
+  single-aspect schema read, and points pagination. Seven green increments, one
+  coherent management+observability arc on `dsp-server`. Same-day rerun branch
+  `routine/dsp-2026-06-28-2` (PR #28 from the first run merged to `main` first).
+
+**Increment 1 — HTTP aspect declaration** (commit `d593825`)
+- New `dsp-server/src/manage.rs`: `POST /api/v1/storage/aspects` declares an
+  aspect's `AspectSchema` (physical encoding + value tolerance + timestamp unit)
+  in the configured `SegmentStore`. `parse_physical_type`/`parse_time_unit`
+  invert the read surface's stable wire tokens; `scaled_i64`/`scaled_i128`
+  require a `scale`, `value_tolerance` defaults to exact (`"0"`). 201 + the
+  stored schema in the read surface's `AspectInfo` shape; POST verb on the
+  existing `/aspects` path. `dsp-physical-type` promoted dev-dep -> regular dep.
+  Tests +6 (dsp-server lib 52 -> 58).
+
+**Increment 2 — HTTP batch ingest** (commit `a691892`)
+- `POST /api/v1/storage/{aspect}/points`: seals a JSON batch into a declared
+  aspect. Splits into dense ts column + Option value column, dispatches the
+  right seal (nullable vs dense, paged via `rows_per_page` vs single-block).
+  Undeclared -> 404; a value unrepresentable under the declared
+  encoding/tolerance -> 400 (hard constraint #4, no silent downcast). 201 + the
+  sealed descriptor summary. Tests +8 (58 -> 66).
+
+**Increment 3 — ILP storage ingest** (commit `9004f22`)
+- `POST /api/v1/storage/{aspect}/ilp`: parses an InfluxDB-Line-Protocol payload
+  (shared vendor-neutral `dsp-line-protocol`, same dialect as the interpolation
+  ILP endpoint) and seals the chosen field. `epoch_in_unit` rescales each parsed
+  absolute instant to the aspect's declared `TimeUnit` (wire precision and stored
+  resolution may differ); a nanosecond instant outside i64 range -> 400. Tests +6
+  (66 -> 72).
+
+**Increment 4 — catalog scope introspection** (commit `49ed55f`)
+- `GET /api/v1/storage/catalog` reports the store's `(database, subject)` scope +
+  the full registered DB/subject hierarchy. New `SegmentStore::database()` /
+  `subject()` accessors (database crate, 16 lines) expose the previously-private
+  scope. Pure control-plane read. Tests +2 (72 -> 74).
+
+**Increment 5 — storage-ingest metrics** (commit `f975436`)
+- New `IngestMetrics` group (requests/errors/rows_sealed/segments_sealed) ->
+  four `dsp_ingest_*_total` Prometheus counters. `ingest_points`/`ingest_ilp`
+  refactored to handler + `*_inner` body so every failure path records exactly
+  one request + one error, a success records rows + one segment (`u64::try_from`,
+  no lossy cast). Phase-3 instrumentation. Tests +3 (74 -> 77).
+
+**Increment 6 — single-aspect schema read** (commit `5565b8a`)
+- `GET /api/v1/storage/{aspect}/schema` returns one aspect's declared schema (the
+  single-aspect counterpart of list/declare). Undeclared -> 404. Tests +2
+  (77 -> 79).
+
+**Increment 7 — points pagination (B-rest)** (commit `c3cc3aa`)
+- `offset`/`limit` query params on the JSON `…/points` read (backlog B-rest
+  take/page pagination); applied after the page-pruned read so only overlapping
+  segments are opened. Response gains `total` (pre-pagination count) + `offset`;
+  no params -> total == count (back-compatible). Tests +3 (79 -> 82).
+
+**Build/test/clippy (real, nightly toolchain `rustc 1.98.0-nightly`):**
+- `cargo build --workspace` — GREEN (full build 1m06s after inc4; final
+  incremental build 18s). Only new crate dep this run: `dsp-physical-type`
+  promoted to a regular dep of `dsp-server` (already in the workspace).
+- `SKIP_SLOW_TESTS=1 cargo test --workspace --lib -- --test-threads=1` (run after
+  inc4) — all lib suites pass, **0 failed**: database **72**,
+  database_orchestration **17**, dsp-arrow **31**, dsp-arrow-store **9**,
+  dsp-bench **87**, dsp-line-protocol **11**, dsp-physical-type **152**,
+  dsp-server **74** at that point, dsp-tui **7**, splimes **23**. Increments 5-7
+  added dsp-server-only tests; `cargo test -p dsp-server --lib` after inc7 =
+  **82** (this run 52 -> 82, **+30**), 0 failed. Workspace lib total with the
+  final dsp-server count: **491**. **No GPU flake this run** — splimes passed
+  23/23 in the serial workspace run (unlike the first 2026-06-28 run; this run
+  touched only `dsp-server` + 16 lines of `database`, no splimes/GPU code).
+  SKIP_SLOW_TESTS kept the heavy turso/interpolation integration suites
+  (`tests/*.rs`) out of the night's budget; every increment's tests are
+  dsp-server lib tests and all ran.
+- Clippy — **0 warnings** in `dsp-server` under its pedantic+nursery lints, every
+  increment, and 0 new warnings in the `database` `segment_store.rs` accessors.
+  Fixed directly, no `#[allow]`: `too_long_first_doc_paragraph` (manage.rs module
+  doc), and the row-count cast routed through `u64::try_from` rather than `as`.
+  Pre-existing untouched warnings elsewhere (`database` 126, `splimes` 4)
+  unchanged.
+
+**Done vs open:** DONE — the full Phase-2 HTTP catalog-management + ingest
+surface on `dsp-server`: declare an aspect (`POST …/aspects`), ingest a JSON
+batch (`POST …/{aspect}/points`) or an ILP payload (`POST …/{aspect}/ilp`),
+introspect the catalog scope (`GET …/catalog`) and a single aspect's schema
+(`GET …/{aspect}/schema`), `offset`/`limit` pagination on the JSON read
+(B-rest), and Prometheus ingest counters. A client can now declare + populate
+the store entirely over HTTP, then read it back through the existing GET
+surface. ROADMAP Phase-2 status note + B-rest backlog row (🔴/🟡 -> 🟡) updated.
+OPEN (Phase 2/4 remainder): **Parquet** import/export (heavier `parquet` dep —
+assess weight/licensing/codecs first); **OpenTelemetry**; the external-engine
+**DuckDB** + competitor adapters; **tag** pruning (4.4, blocked on B-tags);
+the standalone **methodology** document; richer B-rest aliases (`take`/`page`/
+`interpolation`) + cursor paging.
+
+**STOP REASON:** natural-arc — seven green increments (well above the 2-4 bar)
+delivered a complete, coherent HTTP catalog-management + ingest + observability
+surface end to end. The workable remaining items are each their own arc, not
+quick adds: Parquet pulls a fresh heavy dependency (flagged for assessment),
+OpenTelemetry is a larger instrumentation slice, and the DuckDB adapter needs a
+vendor dep + Windows build assessment. Better as dedicated slices than forced on
+late against the honesty contract.
+
+**Next step (tomorrow):** (a) assess the `parquet` crate (weight / licensing /
+which compression codecs it pulls) and, if acceptable, add Parquet import/export
+from a `RecordBatch` in `dsp-arrow` + a `…/storage/{aspect}/parquet` export
+endpoint; or (b) the external-engine **DuckDB** adapter for DSP-Bench (the first
+real-database baseline beside DSP + the two portable in-process baselines) —
+assess the DuckDB Rust crate's Windows build first.
