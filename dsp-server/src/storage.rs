@@ -350,6 +350,36 @@ pub async fn storage_aspects(State(state): State<AppState>) -> Result<Json<Aspec
 	Ok(Json(AspectListResponse { aspects }))
 }
 
+/// Response body for `GET /api/v1/storage/{aspect}/schema` — a single aspect's
+/// declared schema (the read counterpart of the `POST …/aspects` declaration).
+#[derive(Debug, Clone, Serialize)]
+pub struct AspectSchemaResponse {
+	/// The declared aspect and its physical encoding / tolerance / timestamp unit.
+	pub aspect: AspectInfo,
+}
+
+/// Handle `GET /api/v1/storage/{aspect}/schema`: return one aspect's declared
+/// schema, the single-aspect read counterpart of `GET …/aspects` (which lists all)
+/// and of the `POST …/aspects` declaration.
+///
+/// # Errors
+///
+/// [`StorageError::Unconfigured`] when no store is attached,
+/// [`StorageError::NotFound`] when the aspect is undeclared, and
+/// [`StorageError::Internal`] on a control-plane read failure.
+pub async fn storage_aspect_schema(State(state): State<AppState>, Path(aspect): Path<String>) -> Result<Json<AspectSchemaResponse>, StorageError> {
+	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	drop(state);
+	let result = store.schema_for(&aspect).await;
+	drop(store);
+	let schema = result.map_err(|err| StorageError::Internal(err.to_string()))?;
+	let Some(schema) = schema else {
+		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
+	};
+	let aspect = AspectInfo { name: aspect, physical_type: schema.value.name(), value_tolerance: schema.value_tolerance.to_string(), timestamp_unit: schema.timestamp_unit.name() };
+	Ok(Json(AspectSchemaResponse { aspect }))
+}
+
 /// Handle `GET /api/v1/storage/{aspect}/stats`.
 ///
 /// Returns the aspect's materialized segment-set rollup, including the north-star
@@ -599,5 +629,23 @@ mod tests {
 		let router = app_with_state(AppState::new());
 		let response = router.oneshot(Request::builder().uri("/api/v1/storage/catalog").body(Body::empty()).unwrap()).await.unwrap();
 		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+	}
+
+	#[tokio::test]
+	async fn aspect_schema_returns_one_declared_aspect() {
+		let (_dir, router) = router_with_sealed_price().await;
+		let (status, body) = get_json(router, "/api/v1/storage/price/schema").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["aspect"]["name"], "price");
+		assert_eq!(body["aspect"]["physical_type"], "f64");
+		assert_eq!(body["aspect"]["timestamp_unit"], "seconds");
+		assert_eq!(body["aspect"]["value_tolerance"], "0");
+	}
+
+	#[tokio::test]
+	async fn aspect_schema_undeclared_is_not_found() {
+		let (_dir, router) = router_with_sealed_price().await;
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/never_declared/schema").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::NOT_FOUND);
 	}
 }
