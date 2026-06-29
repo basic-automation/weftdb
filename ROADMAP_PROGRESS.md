@@ -2761,4 +2761,4 @@ flagship `POST /api/v1/interpolate` endpoint (decide whether to promote
 `dsp-arrow` to a regular dsp-server dep or route a new bridge through
 `dsp-arrow-store`).
 
-**PR:** (opening now)
+**PR:** https://github.com/physics515/DSP/pull/30
