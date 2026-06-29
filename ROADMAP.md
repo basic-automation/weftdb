@@ -211,8 +211,24 @@ wins."*
 > lossless JSON (non-Arrow) range read, and `…/storage/aspects` /
 > `…/storage/{aspect}/stats` / `…/storage/stats` expose the declared schemas and
 > the materialized **bytes/point** rollups (the north-star cost term over HTTP).
-> Still to do: DB/subject/aspect **management** (create/declare over HTTP),
-> Parquet, and OpenTelemetry.
+> **HTTP catalog management + ingest landed (2026-06-28, run 2):** the write
+> path that populates the store the read endpoints serve — `POST
+> …/storage/aspects` **declares** an aspect's schema (physical encoding +
+> value tolerance + timestamp unit, the wire tokens inverting the read
+> surface's), `POST …/storage/{aspect}/points` **ingests** a JSON batch
+> (dense or nullable, single-block or paged via `rows_per_page`), `POST
+> …/storage/{aspect}/ilp` ingests an **InfluxDB-Line-Protocol** payload into
+> a declared aspect (rescaling each parsed instant to the aspect's declared
+> `TimeUnit`, the storage counterpart of the interpolation ILP endpoint), and
+> `GET …/storage/catalog` reports the store's `(database, subject)` scope +
+> the registered hierarchy. The no-silent-downcast guarantee holds end to end:
+> a value unrepresentable under the declared encoding/tolerance is rejected
+> `400`, never downcast (hard constraint #4). `GET …/storage/{aspect}/schema`
+> reads one aspect's declared schema (the single-aspect counterpart of the
+> list/declare), the JSON `…/points` read grew **`offset`/`limit` pagination**
+> (backlog B-rest — `total`/`count`/`offset` in the body), and the ingest
+> endpoints are instrumented (`dsp_ingest_*_total` Prometheus counters —
+> requests/errors/rows/segments). Still to do: Parquet and OpenTelemetry.
 
 A commercial DB can't lead with an embedded Rust API + TUI. Build an `axum` server:
 create DB / subject / aspect; define schema/physical type; batch ingest; range query;
@@ -576,7 +592,7 @@ Status: 🔴 absent · 🟡 partial/verify · 🟢 exists, enhance · ✅ done.
 | B-tags | **Per-measurement tags/labels** (incl. `interpolated=true`/provenance) — `measurement.rs` has none. | 🔴 | 2/4 | `DSM-Database`, `DSM-Measurement` |
 | B-conn | **Vendor-neutral connector trait + registry** (core). | 🔴 | 2/7 | `dsm-source`, `dsm-asset` |
 | B-ilp | **InfluxDB Line Protocol ingest** (and ILP/Influx **interop** connector, separate crate — *not* a storage swap). | 🟡 | 2 | `dsm-influxdb`, `dsm-batch` |
-| B-rest | **REST facade** + **declarative query-params** (`range`/`take`/`count`/`page`/`interpolation`) + **pagination**. | 🔴/🟡 | 2 | `DSM-Database` |
+| B-rest | **REST facade** + **declarative query-params** (`range`/`take`/`count`/`page`/`interpolation`) + **pagination**. *(🟡 partial: `dsp-server` serves range (`start`/`end`) + **pagination** (`offset`/`limit` + `total`/`count`) on `…/points`; `take`/`page`/`interpolation` aliases + cursor paging still to do.)* | 🟡 | 2 | `DSM-Database` |
 | B-poll | **Scheduled polling daemon** (per-source interval) + **B-retry** at-least-once retry buffer + **B-register** runtime source registration. | 🔴 | 7 | `DSM-Input-Module` |
 | B-interp | **Interpolate-on-read, single-instant lookup, out-of-range extrapolation.** | ✅ | 5 | `splimes` / `database` (already implemented) |
 | B-analysis | **Per-point analysis model** (signed neighbor distance, slope-segmented trends, max-normalized relative vectors) — verify `Trend`/`Relative`/`MeasurementVector`/`Analysis` are wired end-to-end. | 🟡 | 4/9 | `dataset_management`, `DSM-Measurement` |
