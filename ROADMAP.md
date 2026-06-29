@@ -228,7 +228,18 @@ wins."*
 > list/declare), the JSON `…/points` read grew **`offset`/`limit` pagination**
 > (backlog B-rest — `total`/`count`/`offset` in the body), and the ingest
 > endpoints are instrumented (`dsp_ingest_*_total` Prometheus counters —
-> requests/errors/rows/segments). Still to do: Parquet and OpenTelemetry.
+> requests/errors/rows/segments). **Parquet interchange + B-rest aliases +
+> JSON value-range landed (2026-06-29):** the JSON `…/points` read gained the
+> declarative `take` (alias for `limit`) and `page` (1-based) B-rest aliases;
+> **Parquet** export/import ships end to end — `GET …/storage/{aspect}/range.parquet`
+> and `…/value-range.parquet` serve a stored window as an Apache Parquet file
+> (`application/vnd.apache.parquet`, via the `dsp-arrow`/`dsp-arrow-store` bridge,
+> so the `parquet`/`arrow-*` tree never reaches the lean core), and `POST
+> …/storage/{aspect}/parquet` ingests a Parquet file back into a declared aspect
+> (decode + seal in `dsp-arrow-store`, same `dsp_ingest_*` counters + no-silent-
+> downcast guarantee as the JSON/ILP ingest); and `GET …/storage/{aspect}/value-points`
+> is the JSON counterpart of the Arrow value-range read (lossless decimal-text
+> rows in a `[lo, hi]` band, same B-rest pagination). Still to do: OpenTelemetry.
 
 A commercial DB can't lead with an embedded Rust API + TUI. Build an `axum` server:
 create DB / subject / aspect; define schema/physical type; batch ingest; range query;
@@ -458,8 +469,20 @@ JSON").
   IPC-bytes export landed (2026-06-28)** — `GET /api/v1/storage/{aspect}/range`
   and `…/value-range` serve `read_time_range_to_ipc_bytes` /
   `read_value_range_to_ipc_bytes` as `application/vnd.apache.arrow.stream` once a
-  `SegmentStore` is configured (see the Phase-2 status note). Still to do: Parquet
-  import/export (a heavier `parquet` dep — assess weight/licensing first).)*
+  `SegmentStore` is configured (see the Phase-2 status note). **Parquet
+  import/export landed (2026-06-29):** `dsp_arrow::write_parquet` / `read_parquet`
+  serialize a `RecordBatch` set to/from an Apache Parquet file (embedding the
+  self-describing Arrow schema so DSP's time-unit/encoding metadata survives), the
+  `parquet` dep pulled with `default-features = false, features = ["arrow"]` so no
+  compression-codec C libraries reach the build (only 2 new crates resolve);
+  `dsp-arrow-store` takes a stored read all the way to Parquet bytes
+  (`read_time_range_to_parquet_bytes` / `read_value_range_to_parquet_bytes`) and
+  ingests a Parquet file back into a declared aspect
+  (`ingest_parquet_into_aspect`, sealing under the declared encoding); and the
+  `dsp-server` `…/range.parquet` / `…/value-range.parquet` / `POST …/parquet`
+  endpoints expose all three over HTTP. The typed exact-`Decimal128` and text
+  paths stay byte-faithful (hard constraint #4). Phase-4.5 Arrow/Parquet
+  interchange is now complete.)*
 - **4.6 Correctness semantics:** out-of-order/late data, dedup, upsert, idempotent
   batch ingest, clock skew, precision, tz parsing, leap seconds, query consistency
   during compaction, read-your-writes, snapshot isolation.
@@ -592,7 +615,7 @@ Status: 🔴 absent · 🟡 partial/verify · 🟢 exists, enhance · ✅ done.
 | B-tags | **Per-measurement tags/labels** (incl. `interpolated=true`/provenance) — `measurement.rs` has none. | 🔴 | 2/4 | `DSM-Database`, `DSM-Measurement` |
 | B-conn | **Vendor-neutral connector trait + registry** (core). | 🔴 | 2/7 | `dsm-source`, `dsm-asset` |
 | B-ilp | **InfluxDB Line Protocol ingest** (and ILP/Influx **interop** connector, separate crate — *not* a storage swap). | 🟡 | 2 | `dsm-influxdb`, `dsm-batch` |
-| B-rest | **REST facade** + **declarative query-params** (`range`/`take`/`count`/`page`/`interpolation`) + **pagination**. *(🟡 partial: `dsp-server` serves range (`start`/`end`) + **pagination** (`offset`/`limit` + `total`/`count`) on `…/points`; `take`/`page`/`interpolation` aliases + cursor paging still to do.)* | 🟡 | 2 | `DSM-Database` |
+| B-rest | **REST facade** + **declarative query-params** (`range`/`take`/`count`/`page`/`interpolation`) + **pagination**. *(🟡 partial: `dsp-server` serves range (`start`/`end`) + **pagination** (`offset`/`limit`/`take`/`page` + `total`/`count`) on `…/points` **and** `…/value-points` (JSON value-range read); `interpolation` alias + cursor paging still to do.)* | 🟡 | 2 | `DSM-Database` |
 | B-poll | **Scheduled polling daemon** (per-source interval) + **B-retry** at-least-once retry buffer + **B-register** runtime source registration. | 🔴 | 7 | `DSM-Input-Module` |
 | B-interp | **Interpolate-on-read, single-instant lookup, out-of-range extrapolation.** | ✅ | 5 | `splimes` / `database` (already implemented) |
 | B-analysis | **Per-point analysis model** (signed neighbor distance, slope-segmented trends, max-normalized relative vectors) — verify `Trend`/`Relative`/`MeasurementVector`/`Analysis` are wired end-to-end. | 🟡 | 4/9 | `dataset_management`, `DSM-Measurement` |

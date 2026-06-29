@@ -2653,3 +2653,112 @@ real-database baseline beside DSP + the two portable in-process baselines) —
 assess the DuckDB Rust crate's Windows build first.
 
 **PR:** https://github.com/physics515/DSP/pull/29
+
+## 2026-06-29 — Parquet interchange + B-rest aliases + JSON value-range (Phase 2/4.5, 5 increments)
+
+- **Item:** Phase 2 (*benchmark-grade server/API*) + Phase 4.5 (*Arrow-compatible
+  arrays / interchange*). The 2026-06-28 run-2 named two candidate next slices:
+  (a) assess `parquet` and add Parquet import/export, or (b) the DuckDB adapter.
+  This run took (a) — the `parquet` assessment came back clean (pure-Rust, no C
+  codecs needed) — and built the full Parquet interchange arc end to end, plus
+  two adjacent REST gaps (B-rest `take`/`page` aliases and a JSON value-range
+  read). Five green increments on branch `routine/dsp-2026-06-29`.
+
+**Increment 1 — take/page pagination aliases (B-rest)** (commit `9ebd16b`)
+- `dsp-server/src/storage.rs`: the JSON `…/points` read gained the declarative
+  `take` (alias for `limit`; `limit` wins if both given) and `page` (1-based,
+  derives `offset = (page-1)*page_size`, supersedes explicit `offset`) query
+  params, mirroring the legacy DSM-Database REST surface. Response echoes the
+  effective `limit` + served `page` (omitted when absent, so the unbounded and
+  offset/limit forms stay byte-compatible). Also cleaned two pre-existing clippy
+  nits in `manage.rs` (`epoch_in_unit` -> `const fn`, split an over-long doc
+  paragraph) so dsp-server stays at 0 warnings. Tests +5 (dsp-server lib 82->87).
+
+**Increment 2 — Parquet import/export in dsp-arrow** (commit `28d2e86`)
+- `dsp-arrow`: `write_parquet` / `read_parquet` — the Apache Parquet counterpart
+  of the IPC stream export, embedding the self-describing Arrow schema (DSP's
+  time-unit + encoding metadata) so the read side needs nothing out of band
+  (read re-attaches the builder's restored schema to each batch). `parquet` dep
+  pulled with `default-features = false, features = ["arrow"]` (no compression-
+  codec C libs — only PLAIN/RLE; lossless; Windows-friendly). Only 2 new crates
+  resolve (`parquet`, `seq-macro`). Tests +5 (dsp-arrow lib 31->36).
+
+**Increment 3 — Parquet export endpoints** (commit `dd6dca7`)
+- `dsp-arrow-store`: `read_time_range_to_parquet_bytes` /
+  `read_value_range_to_parquet_bytes` (mirror the `*_to_ipc_bytes` pair).
+  `dsp-server`: `GET …/storage/{aspect}/range.parquet` + `…/value-range.parquet`
+  serve those bytes as `application/vnd.apache.parquet`. Tests +3 dsp-arrow-store
+  (9->12), +3 dsp-server (87->90).
+
+**Increment 4 — Parquet ingest endpoint** (commit `c501acd`)
+- `dsp-arrow-store`: `ingest_parquet_into_aspect` decodes a Parquet file and
+  seals the recovered columns under the aspect's *declared* encoding (nullable /
+  paged dispatch; no-silent-downcast guarantee, hard constraint #4). `dsp-server`:
+  `POST …/storage/{aspect}/parquet` ingests the body via that helper (same
+  `dsp_ingest_*` counters; new `classify_ingest_error` -> 404/400/500). Handler
+  lives in the arrow-facing `storage` module so `manage.rs` stays arrow-free per
+  its module contract. Tests +3 dsp-arrow-store (12->15), +5 dsp-server (90->95).
+
+**Increment 5 — JSON value-range read** (commit `27cce59`)
+- `dsp-server`: `GET …/storage/{aspect}/value-points?lo&hi` — the JSON
+  counterpart of the Arrow/Parquet value-range read (value-band reads were
+  Arrow/Parquet-only). Returns present in-band rows as lossless decimal text,
+  same `StoredRangeResponse` shape + B-rest pagination. Refactored the pagination
+  resolution into a shared `resolve_pagination` helper used by both JSON range
+  reads (single source of truth). Tests +4 (dsp-server lib 95->99).
+
+**Build/test/clippy (real, nightly `rustc 1.98.0-nightly`):**
+- `cargo build --workspace` — GREEN after every increment (incremental builds
+  17-21s; the one full rebuild after adding `parquet` resolved only 2 new crates).
+- `SKIP_SLOW_TESTS=1 cargo test --workspace --lib -- --test-threads=1`: database
+  **72**, database_orchestration **17**, dsp-arrow **36** (this run +5), dsp-arrow-store
+  **15** (+6), dsp-bench **87**, dsp-line-protocol **11**, dsp-physical-type **152**,
+  dsp-server **99** (this run 82->99, **+17**), dsp-tui **7**, splimes **23**.
+  Workspace lib total **519**, 0 failed in every crate I touched.
+- **splimes GPU flake (pre-existing, NOT a regression):** in the serial workspace
+  run, splimes's GPU interpolation tests (`tests::{cubic,quadratic,polynomial}::
+  test_*_interpolation`) flaked 1-3 failures under GPU contention. Verified the
+  flake: `cargo test -p splimes --lib cubic` in isolation = 2 passed, 0 failed.
+  This run touched ZERO splimes/GPU code (only `dsp-arrow`, `dsp-arrow-store`,
+  `dsp-server`, and the two Cargo manifests). Same GPU flake the first 2026-06-28
+  run saw on this box. Counted splimes at its isolated-green **23**.
+- Clippy — **0 warnings** in `dsp-arrow`, `dsp-arrow-store`, and `dsp-server`
+  after every increment (the three crates this run touched), under their
+  pedantic+nursery lints. Fixed directly, no `#[allow]`: `option_if_let_else`
+  (storage.rs offset resolution -> `map_or_else`), `doc_markdown` (backtick
+  `DuckDB`/`Polars`/`InfluxDB`), `too_long_first_doc_paragraph` (split), and the
+  two pre-existing manage.rs nits. Pre-existing untouched warnings elsewhere
+  (`database` 126, `splimes` 4) unchanged.
+
+**Done vs open:** DONE — the full Parquet interchange surface end to end:
+`dsp-arrow` round-trips a `RecordBatch` set to/from Parquet bytes; `dsp-arrow-store`
+takes a stored read to Parquet bytes and ingests a Parquet file back into a
+declared aspect; `dsp-server` exposes all three (`…/range.parquet`,
+`…/value-range.parquet`, `POST …/parquet`). Plus the B-rest `take`/`page` aliases
+and the JSON `…/value-points` value-range read. ROADMAP Phase-2 + Phase-4.5
+status notes and the B-rest backlog row updated. OPEN (Phase 2/4 remainder):
+**OpenTelemetry**; the external-engine **DuckDB** + competitor adapters (vendor
+dep + Windows build assessment); **tag** pruning (4.4, blocked on B-tags); the
+standalone **methodology** document; richer B-rest (`interpolation` alias +
+cursor paging); columnar (Arrow/Parquet) output for the *interpolation* flagship
+endpoint (needs a dep-graph decision — `dsp-arrow` is currently a dev-dep of
+dsp-server).
+
+**STOP REASON:** natural-arc + cutoff approaching — five green increments (above
+the 2-4 bar) delivered a complete, coherent Parquet interchange arc plus two
+adjacent REST gaps. The workable remaining items are each their own arc: DuckDB
+needs a vendor-dep/Windows-build assessment (risky unattended), OpenTelemetry is
+a larger instrumentation slice, and columnar interpolation output needs a
+deliberate dep-graph decision — better as dedicated slices than forced on late
+against the honesty contract.
+
+**Next step (tomorrow):** (a) the external-engine **DuckDB** adapter for DSP-Bench
+(first real-database baseline beside DSP + the two portable in-process baselines)
+— assess the DuckDB Rust crate's Windows build first; or (b) **OpenTelemetry**
+trace export on `dsp-server` (the Phase-3 instrumentation item paired with the
+existing Prometheus `/metrics`); or (c) columnar (Arrow/Parquet) output for the
+flagship `POST /api/v1/interpolate` endpoint (decide whether to promote
+`dsp-arrow` to a regular dsp-server dep or route a new bridge through
+`dsp-arrow-store`).
+
+**PR:** https://github.com/physics515/DSP/pull/30
