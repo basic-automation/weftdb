@@ -336,7 +336,7 @@ fn parse_ilp_precision(token: Option<&str>) -> Result<TimestampPrecision, String
 /// seconds-resolution aspect, say). Returns [`None`] only for the nanosecond unit
 /// when the instant falls outside the `i64`-nanosecond range (before 1677 or after
 /// 2262).
-fn epoch_in_unit(instant: DateTime<Utc>, unit: TimeUnit) -> Option<i64> {
+const fn epoch_in_unit(instant: DateTime<Utc>, unit: TimeUnit) -> Option<i64> {
 	match unit {
 		TimeUnit::Seconds => Some(instant.timestamp()),
 		TimeUnit::Millis => Some(instant.timestamp_millis()),
@@ -345,9 +345,11 @@ fn epoch_in_unit(instant: DateTime<Utc>, unit: TimeUnit) -> Option<i64> {
 	}
 }
 
-/// Handle `POST /api/v1/storage/{aspect}/ilp`: parse an InfluxDB-Line-Protocol
-/// payload (the wire format TSBS / `InfluxDB` / `QuestDB` speak) and seal the chosen
-/// field's values into `aspect`'s declared schema.
+/// Handle `POST /api/v1/storage/{aspect}/ilp`.
+///
+/// Parses an InfluxDB-Line-Protocol payload (the wire format TSBS / `InfluxDB` /
+/// `QuestDB` speak) and seals the chosen field's values into `aspect`'s declared
+/// schema.
 ///
 /// The payload is the request body (`text/plain`); `field`, `precision`, and
 /// `rows_per_page` are query parameters. The parser is the shared, vendor-neutral
