@@ -265,6 +265,61 @@ pub struct StoreStatsResponse {
 	pub time_range: Option<[i64; 2]>,
 }
 
+/// One registered database in the [`CatalogResponse`]: its name and the subjects
+/// registered under it.
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogDatabase {
+	/// The database name.
+	pub name: String,
+	/// The subjects registered under this database, in name order.
+	pub subjects: Vec<String>,
+}
+
+/// Response body for `GET /api/v1/storage/catalog` — the control-plane hierarchy
+/// the configured store sits in.
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogResponse {
+	/// The database namespace this server's store is **scoped** to (its declares /
+	/// seals / reads all happen here).
+	pub database: String,
+	/// The subject namespace this server's store is scoped to.
+	pub subject: String,
+	/// Every database registered in the store's `catalog.db`, each with its
+	/// subjects — the full hierarchy a root holds, not just the active scope.
+	pub databases: Vec<CatalogDatabase>,
+}
+
+/// Collect the registered `(database, subject)` hierarchy from a store's registry.
+/// Kept as a free async fn taking `&SegmentStore` so the handler can drop the store
+/// handle before building its response.
+async fn collect_catalog(store: &database::SegmentStore) -> anyhow::Result<Vec<CatalogDatabase>> {
+	let database_names = store.registry().list_databases().await?;
+	let mut databases = Vec::with_capacity(database_names.len());
+	for name in database_names {
+		let subjects = store.registry().list_subjects(&name).await?;
+		databases.push(CatalogDatabase { name, subjects });
+	}
+	Ok(databases)
+}
+
+/// Handle `GET /api/v1/storage/catalog`: report the database/subject scope the
+/// configured store is bound to, plus the full registered DB/subject hierarchy.
+///
+/// # Errors
+///
+/// [`StorageError::Unconfigured`] when no store is attached, or
+/// [`StorageError::Internal`] on a control-plane read failure.
+pub async fn storage_catalog(State(state): State<AppState>) -> Result<Json<CatalogResponse>, StorageError> {
+	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	drop(state);
+	let scope_database = store.database().to_string();
+	let scope_subject = store.subject().to_string();
+	let result = collect_catalog(&store).await;
+	drop(store);
+	let databases = result.map_err(|err| StorageError::Internal(err.to_string()))?;
+	Ok(Json(CatalogResponse { database: scope_database, subject: scope_subject, databases }))
+}
+
 /// Collect the declared aspects and their schemas into the response DTO. Kept as a
 /// free async fn taking `&SegmentStore` so the handler can drop the store handle
 /// before building its response.
@@ -525,5 +580,24 @@ mod tests {
 		assert_eq!(status, StatusCode::OK, "body: {body}");
 		assert_eq!(body["count"], 0);
 		assert!(body["points"].as_array().unwrap().is_empty());
+	}
+
+	#[tokio::test]
+	async fn catalog_reports_scope_and_registered_hierarchy() {
+		let (_dir, router) = router_with_sealed_price().await;
+		let (status, body) = get_json(router, "/api/v1/storage/catalog").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		// A store opened with `SegmentStore::open` is scoped to default/default.
+		assert_eq!(body["database"], "default");
+		assert_eq!(body["subject"], "default");
+		let databases = body["databases"].as_array().unwrap();
+		assert!(databases.iter().any(|d| d["name"] == "default" && d["subjects"].as_array().unwrap().iter().any(|s| s == "default")));
+	}
+
+	#[tokio::test]
+	async fn catalog_without_store_is_unavailable() {
+		let router = app_with_state(AppState::new());
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/catalog").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 	}
 }
