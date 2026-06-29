@@ -28,15 +28,18 @@
 //! to read), and any other read failure is a `500`.
 
 use axum::{
-	body::Body, extract::{Path, Query, State}, http::{header, StatusCode}, response::{IntoResponse, Response}, Json
+	body::{Body, Bytes}, extract::{Path, Query, State}, http::{header, StatusCode}, response::{IntoResponse, Response}, Json
 };
 use bigdecimal::BigDecimal;
 use serde::{Deserialize, Serialize};
 
-use crate::state::AppState;
+use crate::{manage::IngestResponse, state::AppState};
 
 /// The Arrow IPC stream content type, per the Apache Arrow conventions.
 const ARROW_STREAM_CONTENT_TYPE: &str = "application/vnd.apache.arrow.stream";
+
+/// The Apache Parquet file content type.
+const PARQUET_CONTENT_TYPE: &str = "application/vnd.apache.parquet";
 
 /// Query parameters for the time-range read.
 ///
@@ -111,6 +114,11 @@ fn arrow_stream_response(bytes: Vec<u8>) -> Response {
 	([(header::CONTENT_TYPE, ARROW_STREAM_CONTENT_TYPE)], Body::from(bytes)).into_response()
 }
 
+/// Build the `200 OK` Parquet-file response from the serialized bytes.
+fn parquet_response(bytes: Vec<u8>) -> Response {
+	([(header::CONTENT_TYPE, PARQUET_CONTENT_TYPE)], Body::from(bytes)).into_response()
+}
+
 /// Handle `GET /api/v1/storage/{aspect}/range?start&end`.
 ///
 /// Reads the rows of `aspect` in the inclusive `[start, end]` timestamp window and
@@ -149,6 +157,121 @@ pub async fn storage_value_range(State(state): State<AppState>, Path(aspect): Pa
 	Ok(arrow_stream_response(result.map_err(|err| classify_read_error(&err))?))
 }
 
+/// Handle `GET /api/v1/storage/{aspect}/range.parquet?start&end`.
+///
+/// The Parquet counterpart of [`storage_time_range`]: reads the rows of `aspect`
+/// in the inclusive `[start, end]` timestamp window and serves them as an Apache
+/// Parquet file (typed value column for the aspect's declared encoding), ready to
+/// load straight into `DuckDB`/pandas/`Polars`.
+///
+/// # Errors
+///
+/// As [`storage_time_range`] (unconfigured store, undeclared aspect, or a
+/// read/serialization failure).
+pub async fn storage_time_range_parquet(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<TimeRangeParams>) -> Result<Response, StorageError> {
+	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	drop(state);
+	let result = dsp_arrow_store::read_time_range_to_parquet_bytes(&store, &aspect, params.start, params.end).await;
+	drop(store);
+	Ok(parquet_response(result.map_err(|err| classify_read_error(&err))?))
+}
+
+/// Handle `GET /api/v1/storage/{aspect}/value-range.parquet?lo&hi`.
+///
+/// The Parquet counterpart of [`storage_value_range`]: reads the present rows of
+/// `aspect` whose value falls in the inclusive `[lo, hi]` band and serves them as
+/// an Apache Parquet file (lossless decimal-text value column).
+///
+/// # Errors
+///
+/// As [`storage_value_range`], including [`StorageError::BadRequest`] when a value
+/// bound does not parse as a decimal.
+pub async fn storage_value_range_parquet(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<ValueRangeParams>) -> Result<Response, StorageError> {
+	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	drop(state);
+	let lo: BigDecimal = params.lo.parse().map_err(|_| StorageError::BadRequest(format!("`lo` is not a decimal: {:?}", params.lo)))?;
+	let hi: BigDecimal = params.hi.parse().map_err(|_| StorageError::BadRequest(format!("`hi` is not a decimal: {:?}", params.hi)))?;
+	let result = dsp_arrow_store::read_value_range_to_parquet_bytes(&store, &aspect, &lo, &hi).await;
+	drop(store);
+	Ok(parquet_response(result.map_err(|err| classify_read_error(&err))?))
+}
+
+/// Query parameters for the Parquet ingest endpoint: an optional page height.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ParquetIngestParams {
+	/// Optional page height — seal a paged segment of this many rows per page.
+	#[serde(default)]
+	pub rows_per_page: Option<usize>,
+}
+
+/// Classify a Parquet-ingest error: an undeclared aspect is a `404`; a malformed
+/// Parquet body, a batch missing DSP's columns, or a value unrepresentable under the
+/// declared encoding/tolerance (hard constraint #4) are client-data problems →
+/// `400`; anything else (filesystem, libSQL) is a `500`.
+fn classify_ingest_error(err: &anyhow::Error) -> StorageError {
+	let message = err.to_string();
+	if message.contains("no declared schema") {
+		StorageError::NotFound(message)
+	} else if message.contains("seal failed") || message.contains("paged seal failed") || message.contains("parquet error") || message.contains("is missing the") || message.contains("expected Arrow") || message.contains("required metadata") || message.contains("unrecognized time unit") || message.contains("does not parse") {
+		StorageError::BadRequest(message)
+	} else {
+		StorageError::Internal(message)
+	}
+}
+
+/// Handle `POST /api/v1/storage/{aspect}/parquet?rows_per_page`.
+///
+/// The write-side counterpart of the Parquet range export and the Parquet sibling
+/// of the JSON / ILP ingest endpoints: ingests an Apache Parquet file (the request
+/// body, `application/vnd.apache.parquet`) into `aspect`'s declared schema, sealing
+/// one new segment. The decode + seal lives in `dsp-arrow-store` (so the heavy
+/// `arrow-*` tree stays off the lean core); the no-silent-downcast guarantee holds
+/// — a value unrepresentable under the declared encoding/tolerance is rejected
+/// `400`, never downcast. Returns `201 Created` with the sealed segment's descriptor.
+///
+/// # Errors
+///
+/// [`StorageError::Unconfigured`] (no store), [`StorageError::NotFound`] (aspect
+/// undeclared), [`StorageError::BadRequest`] (empty/malformed Parquet body or values
+/// unrepresentable under the declared encoding/tolerance), and
+/// [`StorageError::Internal`] on a filesystem/control-plane failure.
+pub async fn storage_ingest_parquet(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<ParquetIngestParams>, body: Bytes) -> Result<Response, StorageError> {
+	let metrics = state.metrics().clone();
+	metrics.record_ingest_request();
+	let store = state.store().cloned().ok_or_else(|| {
+		metrics.record_ingest_error();
+		StorageError::Unconfigured
+	})?;
+	drop(state);
+	let result = storage_ingest_parquet_inner(&store, &metrics, &aspect, params.rows_per_page, &body).await;
+	drop(store);
+	if result.is_err() {
+		metrics.record_ingest_error();
+	}
+	result
+}
+
+/// The body of [`storage_ingest_parquet`], split out so the handler records an error
+/// metric for any failure path uniformly.
+async fn storage_ingest_parquet_inner(store: &database::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, rows_per_page: Option<usize>, body: &Bytes) -> Result<Response, StorageError> {
+	if body.is_empty() {
+		return Err(StorageError::BadRequest("empty Parquet body".to_string()));
+	}
+	let descriptor = dsp_arrow_store::ingest_parquet_into_aspect(store, aspect, body, rows_per_page).await.map_err(|err| classify_ingest_error(&err))?;
+	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
+	let response = IngestResponse {
+		aspect: aspect.to_string(),
+		segment_id: descriptor.id,
+		format_version: descriptor.format_version,
+		row_count: descriptor.row_count,
+		null_count: descriptor.null_count,
+		byte_len: descriptor.byte_len,
+		min_ts: descriptor.min_ts,
+		max_ts: descriptor.max_ts,
+	};
+	Ok((StatusCode::CREATED, Json(response)).into_response())
+}
+
 /// One stored row in the JSON range response: an integer timestamp and its value
 /// as lossless decimal text, or `null` for a null row.
 #[derive(Debug, Clone, Serialize)]
@@ -168,6 +291,13 @@ pub struct StoredPoint {
 /// order); `limit` caps how many are returned. Both are applied after the
 /// (page-pruned) read, so a paginated request still only opens the segments the
 /// window overlaps.
+///
+/// Two declarative aliases mirror the legacy `DSM-Database` REST surface:
+/// `take` is an alias for `limit` (the page size — `limit` wins if both are
+/// given), and `page` is a **1-based** page number that derives the offset from
+/// the page size (`offset = (page - 1) * page_size`). When `page` is present it
+/// supersedes any explicit `offset`; a `page` without a page size falls back to
+/// page 1 (offset 0).
 #[derive(Debug, Clone, Deserialize)]
 pub struct PointsRangeParams {
 	/// Inclusive window start (epoch integer in the aspect's declared unit).
@@ -180,6 +310,14 @@ pub struct PointsRangeParams {
 	/// Return at most this many rows (default: all remaining after `offset`).
 	#[serde(default)]
 	pub limit: Option<usize>,
+	/// Declarative alias for `limit` (the page size). `limit` takes precedence if
+	/// both are supplied.
+	#[serde(default)]
+	pub take: Option<usize>,
+	/// 1-based page number. With a page size (`limit`/`take`) it derives the
+	/// offset and supersedes `offset`.
+	#[serde(default)]
+	pub page: Option<usize>,
 }
 
 /// Response body for `GET /api/v1/storage/{aspect}/points` — the JSON (non-Arrow)
@@ -198,17 +336,27 @@ pub struct StoredRangeResponse {
 	pub count: usize,
 	/// The number of leading rows skipped (the applied `offset`, 0 if none).
 	pub offset: usize,
+	/// The effective page size applied (the resolved `limit`/`take`); absent when
+	/// the read was unbounded.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub limit: Option<usize>,
+	/// The 1-based page number served, present only for a page-based request
+	/// (`page` supplied).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub page: Option<usize>,
 	/// The rows in this page, in segment-seal then in-segment order.
 	pub points: Vec<StoredPoint>,
 }
 
-/// Handle `GET /api/v1/storage/{aspect}/points?start&end&offset&limit`.
+/// Handle `GET /api/v1/storage/{aspect}/points?start&end&offset&limit&take&page`.
 ///
 /// The JSON counterpart of the Arrow [`storage_time_range`] read, for clients that
 /// do not speak Arrow IPC: returns the rows of `aspect` in the inclusive
 /// `[start, end]` window as a lossless decimal-text point list, tagged with the
 /// aspect's declared timestamp unit. Optional `offset`/`limit` paginate the window
-/// (backlog B-rest), with `total` reporting the pre-pagination row count.
+/// (backlog B-rest), with the declarative `take` (alias for `limit`) and `page`
+/// (1-based, derives the offset) aliases also accepted; `total` reports the
+/// pre-pagination row count.
 ///
 /// # Errors
 ///
@@ -226,14 +374,86 @@ pub async fn storage_time_range_json(State(state): State<AppState>, Path(aspect)
 	drop(store);
 	let (timestamps, values) = result.map_err(|err| classify_read_error(&err))?;
 	let total = timestamps.len();
-	let offset = params.offset.unwrap_or(0);
-	// Paginate: skip `offset` rows of the window, take at most `limit`.
+	let (offset, page_size, page) = resolve_pagination(params.offset, params.limit, params.take, params.page);
+	// Paginate: skip `offset` rows of the window, take at most `page_size`.
 	let paginated = timestamps.into_iter().zip(values).skip(offset);
-	let points: Vec<StoredPoint> = match params.limit {
-		Some(limit) => paginated.take(limit).map(|(timestamp, value)| StoredPoint { timestamp, value: value.map(|v| v.to_string()) }).collect(),
+	let points: Vec<StoredPoint> = match page_size {
+		Some(size) => paginated.take(size).map(|(timestamp, value)| StoredPoint { timestamp, value: value.map(|v| v.to_string()) }).collect(),
 		None => paginated.map(|(timestamp, value)| StoredPoint { timestamp, value: value.map(|v| v.to_string()) }).collect(),
 	};
-	Ok(Json(StoredRangeResponse { aspect, time_unit: schema.timestamp_unit.name(), total, count: points.len(), offset, points }))
+	Ok(Json(StoredRangeResponse { aspect, time_unit: schema.timestamp_unit.name(), total, count: points.len(), offset, limit: page_size, page, points }))
+}
+
+/// Resolve the declarative B-rest pagination params shared by the JSON range reads
+/// into `(offset, page_size, page_echo)`.
+///
+/// The page size is `limit` if present else the `take` alias. `page` (1-based)
+/// derives the offset (`(page - 1) * page_size`) and supersedes an explicit
+/// `offset`; a `page` without a page size falls back to page 1 (offset 0). The
+/// returned `page_echo` is the served 1-based page (only for a page-based request).
+fn resolve_pagination(offset: Option<usize>, limit: Option<usize>, take: Option<usize>, page: Option<usize>) -> (usize, Option<usize>, Option<usize>) {
+	let page_size = limit.or(take);
+	let offset = page.map_or_else(|| offset.unwrap_or(0), |page| page_size.map_or(0, |size| page.saturating_sub(1).saturating_mul(size)));
+	(offset, page_size, page.map(|page| page.max(1)))
+}
+
+/// Query parameters for the JSON value-range read: the inclusive `[lo, hi]` value
+/// band (as decimal text) plus the same declarative B-rest pagination as the time
+/// read.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ValuePointsParams {
+	/// Inclusive lower value bound (decimal text).
+	pub lo: String,
+	/// Inclusive upper value bound (decimal text).
+	pub hi: String,
+	/// Skip this many leading rows before returning (default 0).
+	#[serde(default)]
+	pub offset: Option<usize>,
+	/// Return at most this many rows (default: all remaining after `offset`).
+	#[serde(default)]
+	pub limit: Option<usize>,
+	/// Declarative alias for `limit` (the page size). `limit` wins if both are given.
+	#[serde(default)]
+	pub take: Option<usize>,
+	/// 1-based page number; with a page size it derives the offset.
+	#[serde(default)]
+	pub page: Option<usize>,
+}
+
+/// Handle `GET /api/v1/storage/{aspect}/value-points?lo&hi&offset&limit&take&page`.
+///
+/// The JSON counterpart of the Arrow [`storage_value_range`] read, for clients that
+/// do not speak Arrow IPC: returns the **present** rows of `aspect` whose value
+/// falls in the inclusive `[lo, hi]` band as a lossless decimal-text point list,
+/// tagged with the aspect's declared timestamp unit. Value-range reads return only
+/// present rows, so every row carries a value. Pagination matches the time read
+/// (B-rest `offset`/`limit`/`take`/`page`).
+///
+/// # Errors
+///
+/// [`StorageError::Unconfigured`] (no store), [`StorageError::NotFound`] (aspect
+/// undeclared), [`StorageError::BadRequest`] when a value bound does not parse as a
+/// decimal, and [`StorageError::Internal`] on a read failure.
+pub async fn storage_value_range_json(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<ValuePointsParams>) -> Result<Json<StoredRangeResponse>, StorageError> {
+	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	drop(state);
+	let lo: BigDecimal = params.lo.parse().map_err(|_| StorageError::BadRequest(format!("`lo` is not a decimal: {:?}", params.lo)))?;
+	let hi: BigDecimal = params.hi.parse().map_err(|_| StorageError::BadRequest(format!("`hi` is not a decimal: {:?}", params.hi)))?;
+	let schema = store.schema_for(&aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?;
+	let Some(schema) = schema else {
+		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
+	};
+	let result = store.read_value_range(&aspect, &lo, &hi).await;
+	drop(store);
+	let (timestamps, values) = result.map_err(|err| classify_read_error(&err))?;
+	let total = timestamps.len();
+	let (offset, page_size, page) = resolve_pagination(params.offset, params.limit, params.take, params.page);
+	let paginated = timestamps.into_iter().zip(values).skip(offset);
+	let points: Vec<StoredPoint> = match page_size {
+		Some(size) => paginated.take(size).map(|(timestamp, value)| StoredPoint { timestamp, value: Some(value.to_string()) }).collect(),
+		None => paginated.map(|(timestamp, value)| StoredPoint { timestamp, value: Some(value.to_string()) }).collect(),
+	};
+	Ok(Json(StoredRangeResponse { aspect, time_unit: schema.timestamp_unit.name(), total, count: points.len(), offset, limit: page_size, page, points }))
 }
 
 /// One declared aspect's identity in the [`AspectListResponse`].
@@ -522,6 +742,120 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn time_range_serves_a_parquet_file() {
+		use dsp_arrow::read_parquet;
+		let (_dir, router) = router_with_sealed_price().await;
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/price/range.parquet?start=110&end=130").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		assert_eq!(response.headers().get("content-type").unwrap(), "application/vnd.apache.parquet");
+
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		assert_eq!(&bytes[..4], b"PAR1");
+		let batches = read_parquet(&bytes).expect("reads parquet");
+		let (ts, vs) = record_batches_to_columns(&batches).expect("reads back columns");
+		assert_eq!(ts, vec![110, 120, 130]);
+		assert_eq!(vs, vec![Some(bd("2.5")), Some(bd("3.5")), Some(bd("4.5"))]);
+	}
+
+	#[tokio::test]
+	async fn value_range_serves_a_parquet_file() {
+		use dsp_arrow::read_parquet;
+		let (_dir, router) = router_with_sealed_price().await;
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/price/value-range.parquet?lo=2.5&hi=4.5").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		assert_eq!(response.headers().get("content-type").unwrap(), "application/vnd.apache.parquet");
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let batches = read_parquet(&bytes).expect("reads parquet");
+		let (_ts, vs) = record_batches_to_columns(&batches).expect("reads back columns");
+		assert_eq!(vs, vec![Some(bd("2.5")), Some(bd("3.5")), Some(bd("4.5"))]);
+	}
+
+	#[tokio::test]
+	async fn parquet_export_without_store_is_unavailable() {
+		let router = app_with_state(AppState::new());
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/price/range.parquet?start=0&end=100").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+	}
+
+	/// Build a router over a store with `price` declared (F64, seconds) but no rows
+	/// sealed — the starting point for an ingest test.
+	async fn router_with_declared_empty_price(dir: &TempDir) -> axum::Router {
+		let store = SegmentStore::open(dir.path()).await.expect("opens store");
+		store.declare("price", &AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds)).await.expect("declares aspect");
+		app_with_state(AppState::new().with_store(Arc::new(store)))
+	}
+
+	/// Build a Parquet file body carrying the given columns under an F64/seconds
+	/// schema, the way an external producer would.
+	fn price_parquet_body(timestamps: &[i64], values: &[Option<BigDecimal>]) -> Vec<u8> {
+		use dsp_arrow::{columns_to_record_batch_typed, write_parquet};
+		let batch = columns_to_record_batch_typed(TimeUnit::Seconds, PhysicalType::F64, timestamps, values);
+		write_parquet(std::slice::from_ref(&batch)).expect("writes parquet")
+	}
+
+	async fn post_parquet(router: axum::Router, uri: &str, body: Vec<u8>) -> (StatusCode, serde_json::Value) {
+		let response = router.oneshot(Request::builder().method("POST").uri(uri).body(Body::from(body)).unwrap()).await.unwrap();
+		let status = response.status();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+		(status, json)
+	}
+
+	#[tokio::test]
+	async fn parquet_ingest_seals_a_batch_the_read_surface_returns() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_empty_price(&dir).await;
+		let body = price_parquet_body(&[100, 110, 120], &[Some(bd("1.5")), Some(bd("2.5")), Some(bd("3.5"))]);
+		let (status, json) = post_parquet(router, "/api/v1/storage/price/parquet", body).await;
+		assert_eq!(status, StatusCode::CREATED, "body: {json}");
+		assert_eq!(json["aspect"], "price");
+		assert_eq!(json["row_count"], 3);
+		assert_eq!(json["null_count"], 0);
+		assert_eq!(json["min_ts"], 100);
+		assert_eq!(json["max_ts"], 120);
+
+		// Reopen and read back through the JSON points surface.
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("reopens"));
+		let router = app_with_state(AppState::new().with_store(store));
+		let (status, read) = get_json(router, "/api/v1/storage/price/points?start=100&end=120").await;
+		assert_eq!(status, StatusCode::OK);
+		assert_eq!(read["count"], 3);
+		assert_eq!(read["points"][1]["value"], "2.5");
+	}
+
+	#[tokio::test]
+	async fn parquet_ingest_into_undeclared_aspect_is_not_found() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_empty_price(&dir).await;
+		let body = price_parquet_body(&[1], &[Some(bd("1"))]);
+		let (status, _json) = post_parquet(router, "/api/v1/storage/never_declared/parquet", body).await;
+		assert_eq!(status, StatusCode::NOT_FOUND);
+	}
+
+	#[tokio::test]
+	async fn parquet_ingest_rejects_a_garbage_body() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_empty_price(&dir).await;
+		let (status, _json) = post_parquet(router, "/api/v1/storage/price/parquet", b"not a parquet file".to_vec()).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST);
+	}
+
+	#[tokio::test]
+	async fn parquet_ingest_empty_body_is_bad_request() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_empty_price(&dir).await;
+		let (status, _json) = post_parquet(router, "/api/v1/storage/price/parquet", Vec::new()).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST);
+	}
+
+	#[tokio::test]
+	async fn parquet_ingest_without_store_is_unavailable() {
+		let router = app_with_state(AppState::new());
+		let (status, _json) = post_parquet(router, "/api/v1/storage/price/parquet", price_parquet_body(&[1], &[Some(bd("1"))])).await;
+		assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+	}
+
+	#[tokio::test]
 	async fn empty_window_is_a_valid_zero_row_stream() {
 		let (_dir, router) = router_with_sealed_price().await;
 		// A window past every stored point still streams a valid one-batch stream.
@@ -721,5 +1055,121 @@ mod tests {
 		assert_eq!(body["total"], 5);
 		assert_eq!(body["count"], 5);
 		assert_eq!(body["offset"], 0);
+		// Unbounded read omits the `limit`/`page` echoes.
+		assert!(body.get("limit").is_none());
+		assert!(body.get("page").is_none());
+	}
+
+	#[tokio::test]
+	async fn points_take_alias_is_an_alias_for_limit() {
+		let (_dir, router) = router_with_sealed_price().await;
+		// `take=2` with no `limit` behaves like `limit=2`.
+		let (status, body) = get_json(router, "/api/v1/storage/price/points?start=100&end=140&take=2").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["total"], 5);
+		assert_eq!(body["count"], 2);
+		assert_eq!(body["offset"], 0);
+		assert_eq!(body["limit"], 2);
+		// `take` alone is not page-based, so no `page` echo.
+		assert!(body.get("page").is_none());
+		let points = body["points"].as_array().unwrap();
+		assert_eq!(points[0]["timestamp"], 100);
+		assert_eq!(points[1]["timestamp"], 110);
+	}
+
+	#[tokio::test]
+	async fn points_limit_wins_over_take_alias() {
+		let (_dir, router) = router_with_sealed_price().await;
+		// When both are given, `limit` takes precedence over `take`.
+		let (status, body) = get_json(router, "/api/v1/storage/price/points?start=100&end=140&limit=1&take=4").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["count"], 1);
+		assert_eq!(body["limit"], 1);
+	}
+
+	#[tokio::test]
+	async fn points_page_derives_offset_from_page_size() {
+		let (_dir, router) = router_with_sealed_price().await;
+		// page 2 with size 2 -> offset (2-1)*2 = 2: rows ts 120, 130.
+		let (status, body) = get_json(router, "/api/v1/storage/price/points?start=100&end=140&page=2&take=2").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["total"], 5);
+		assert_eq!(body["count"], 2);
+		assert_eq!(body["offset"], 2);
+		assert_eq!(body["limit"], 2);
+		assert_eq!(body["page"], 2);
+		let points = body["points"].as_array().unwrap();
+		assert_eq!(points[0]["timestamp"], 120);
+		assert_eq!(points[1]["timestamp"], 130);
+	}
+
+	#[tokio::test]
+	async fn points_page_supersedes_explicit_offset() {
+		let (_dir, router) = router_with_sealed_price().await;
+		// `page=1` forces offset 0 even though `offset=3` is also supplied.
+		let (status, body) = get_json(router, "/api/v1/storage/price/points?start=100&end=140&page=1&limit=2&offset=3").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["offset"], 0);
+		assert_eq!(body["page"], 1);
+		let points = body["points"].as_array().unwrap();
+		assert_eq!(points[0]["timestamp"], 100);
+	}
+
+	#[tokio::test]
+	async fn points_page_without_page_size_falls_back_to_page_one() {
+		let (_dir, router) = router_with_sealed_price().await;
+		// `page` with no `limit`/`take` -> offset 0, whole window returned.
+		let (status, body) = get_json(router, "/api/v1/storage/price/points?start=100&end=140&page=5").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["offset"], 0);
+		assert_eq!(body["count"], 5);
+		assert_eq!(body["page"], 5);
+		assert!(body.get("limit").is_none());
+	}
+
+	#[tokio::test]
+	async fn value_points_returns_only_in_band_rows_as_json() {
+		let (_dir, router) = router_with_sealed_price().await;
+		// price values are 1.5..5.5 at ts 100..140; band [2.5, 4.5] keeps three rows.
+		let (status, body) = get_json(router, "/api/v1/storage/price/value-points?lo=2.5&hi=4.5").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["aspect"], "price");
+		assert_eq!(body["time_unit"], "seconds");
+		assert_eq!(body["total"], 3);
+		assert_eq!(body["count"], 3);
+		let points = body["points"].as_array().unwrap();
+		assert_eq!(points[0]["timestamp"], 110);
+		assert_eq!(points[0]["value"], "2.5");
+		assert_eq!(points[2]["value"], "4.5");
+	}
+
+	#[tokio::test]
+	async fn value_points_paginates_with_take_and_page() {
+		let (_dir, router) = router_with_sealed_price().await;
+		// Whole band [1.5, 5.5] = 5 rows; page 2 of size 2 -> ts 120, 130.
+		let (status, body) = get_json(router, "/api/v1/storage/price/value-points?lo=1.5&hi=5.5&take=2&page=2").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["total"], 5);
+		assert_eq!(body["count"], 2);
+		assert_eq!(body["offset"], 2);
+		assert_eq!(body["limit"], 2);
+		assert_eq!(body["page"], 2);
+		let points = body["points"].as_array().unwrap();
+		assert_eq!(points[0]["timestamp"], 120);
+		assert_eq!(points[1]["timestamp"], 130);
+	}
+
+	#[tokio::test]
+	async fn value_points_unparseable_bound_is_bad_request() {
+		let (_dir, router) = router_with_sealed_price().await;
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/price/value-points?lo=abc&hi=5").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+	}
+
+	#[tokio::test]
+	async fn value_points_undeclared_aspect_is_not_found() {
+		let (_dir, router) = router_with_sealed_price().await;
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/never_declared/value-points?lo=0&hi=100").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::NOT_FOUND);
 	}
 }
