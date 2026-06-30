@@ -2853,4 +2853,4 @@ route a new bridge through `dsp-arrow-store`); or (c) the external-engine
 **DuckDB** adapter for DSP-Bench (assess the DuckDB Rust crate's Windows build
 first).
 
-**PR:** (filled in after push)
+**PR:** https://github.com/physics515/DSP/pull/31
