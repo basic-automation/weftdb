@@ -28,7 +28,9 @@
 
 use std::collections::BTreeMap;
 
-use axum::{extract::State, Json};
+use axum::{
+	extract::State, http::header, response::{IntoResponse, Response}, Json
+};
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -204,6 +206,61 @@ fn run_downsample(points: &[Point], start: DateTime<Utc>, end: DateTime<Utc>, re
 	}
 
 	Ok(Json(DownsampleResponse { resolution: resolution.to_string(), aggregations: aggregations.iter().map(|a| a.as_str().to_string()).collect(), input_points, buckets: series.len(), series }))
+}
+
+/// Render a [`DownsampleResponse`] as a `timestamp,count,<agg>…` CSV document.
+///
+/// The CSV counterpart of the JSON downsample response, completing the CSV
+/// output surface beside the interpolate and storage range exports. The columns
+/// are `timestamp` (RFC 3339, grid-aligned bucket start), `count`, then one
+/// column per requested reduction **in request order**; each value is the same
+/// wire `f64` the JSON body carries. Only non-empty buckets are emitted (matching
+/// the JSON), and an emitted bucket always carries every requested reduction, so
+/// no value cell is ever blank. None of the columns can contain a comma, so no
+/// field escaping is required.
+fn downsample_response_to_csv(response: &DownsampleResponse) -> Response {
+	use std::fmt::Write as _;
+	let mut out = String::from("timestamp,count");
+	for agg in &response.aggregations {
+		out.push(',');
+		out.push_str(agg);
+	}
+	out.push('\n');
+	for bucket in &response.series {
+		let _ = write!(out, "{},{}", bucket.timestamp.to_rfc3339(), bucket.count);
+		for agg in &response.aggregations {
+			match bucket.aggregations.get(agg) {
+				Some(value) => {
+					let _ = write!(out, ",{value}");
+				}
+				None => out.push(','),
+			}
+		}
+		out.push('\n');
+	}
+	([(header::CONTENT_TYPE, "text/csv; charset=utf-8")], out).into_response()
+}
+
+/// Handle `POST /api/v1/downsample/csv`: the CSV-output sibling of [`downsample`].
+///
+/// Takes the identical JSON request body and runs the identical bucketed reduction,
+/// then serves the reduced series as a `timestamp,count,<agg>…` CSV document
+/// (`text/csv; charset=utf-8`) instead of JSON — the downsample counterpart of
+/// `POST /api/v1/interpolate/csv` and the storage CSV range exports.
+///
+/// # Errors
+///
+/// As [`downsample`]: [`ApiError::BadRequest`] for an empty point set, a non-finite
+/// value, or an inverted range, and [`ApiError::Internal`] if a timestamp cannot be
+/// mapped onto the resolution grid.
+pub async fn downsample_csv(State(metrics): State<SharedMetrics>, Json(request): Json<DownsampleRequest>) -> Result<Response, ApiError> {
+	metrics.record_downsample_request();
+	let result = downsample_inner(request);
+	match &result {
+		Ok(response) => metrics.add_downsample_buckets(response.0.buckets as u64),
+		Err(_) => metrics.record_downsample_error(),
+	}
+	Ok(downsample_response_to_csv(&result?.0))
 }
 
 /// Query parameters for the ILP downsample endpoint.
@@ -554,5 +611,47 @@ mod tests {
 		let (status, body) = post_text("/api/v1/downsample/ilp?field=temp&precision=s", payload).await;
 		assert_eq!(status, StatusCode::BAD_REQUEST);
 		assert!(body["error"].as_str().unwrap().contains("no points"));
+	}
+
+	/// POST a JSON body and return `(status, content-type, text body)`.
+	async fn post_json_for_text(uri: &str, body: serde_json::Value) -> (StatusCode, String, String) {
+		let response = app().oneshot(Request::builder().method("POST").uri(uri).header("content-type", "application/json").body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap()).await.unwrap();
+		let status = response.status();
+		let content_type = response.headers().get("content-type").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		(status, content_type, String::from_utf8(bytes.to_vec()).unwrap())
+	}
+
+	#[tokio::test]
+	async fn downsample_csv_serves_bucketed_rows() {
+		// Three samples in minute 0 (0,10,20) and two in minute 1 (30,50).
+		let body = serde_json::json!({
+			"resolution": "minutes",
+			"aggregations": ["min", "max", "avg"],
+			"points": [
+				{ "timestamp": ts(0), "value": 0.0 },
+				{ "timestamp": ts(20), "value": 10.0 },
+				{ "timestamp": ts(40), "value": 20.0 },
+				{ "timestamp": ts(60), "value": 30.0 },
+				{ "timestamp": ts(90), "value": 50.0 },
+			],
+		});
+		let (status, content_type, text) = post_json_for_text("/api/v1/downsample/csv", body).await;
+		assert_eq!(status, StatusCode::OK, "body: {text}");
+		assert_eq!(content_type, "text/csv; charset=utf-8");
+		let lines: Vec<&str> = text.lines().collect();
+		// Header carries the requested reductions in request order.
+		assert_eq!(lines[0], "timestamp,count,min,max,avg");
+		// Minute-0 bucket: count 3, min 0, max 20, avg 10.
+		assert_eq!(lines[1], "1970-01-01T00:00:00+00:00,3,0,20,10");
+		// Minute-1 bucket: count 2, min 30, max 50, avg 40.
+		assert_eq!(lines[2], "1970-01-01T00:01:00+00:00,2,30,50,40");
+		assert_eq!(lines.len(), 3);
+	}
+
+	#[tokio::test]
+	async fn downsample_csv_empty_points_is_bad_request() {
+		let (status, _content_type, text) = post_json_for_text("/api/v1/downsample/csv", serde_json::json!({ "points": [] })).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {text}");
 	}
 }

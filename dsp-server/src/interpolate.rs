@@ -16,7 +16,7 @@
 //! which point this endpoint gains a precision-preserving value representation.
 
 use axum::{
-	extract::{Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json
+	extract::{Query, State}, http::{header, StatusCode}, response::{IntoResponse, Response}, Json
 };
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use chrono::{DateTime, Utc};
@@ -293,6 +293,55 @@ async fn run_interpolation(mut points: Vec<Point>, start: DateTime<Utc>, end: Da
 	let points: Vec<OutputPoint> = output.iter().map(|p| OutputPoint { timestamp: p.timestamp, value: p.value.to_f64().unwrap_or_default(), kind: classify(p.timestamp, &input_timestamps, min_ts, max_ts) }).collect();
 
 	Ok(Json(InterpolateResponse { spline: spline_label, resolution: resolution_label, output_points: points.len(), input_points, points }))
+}
+
+/// The stable lowercase CSV token for a point's provenance (matches the JSON
+/// `kind` serialization).
+const fn kind_token(kind: PointKind) -> &'static str {
+	match kind {
+		PointKind::Raw => "raw",
+		PointKind::Interpolated => "interpolated",
+		PointKind::Extrapolated => "extrapolated",
+	}
+}
+
+/// Render an [`InterpolateResponse`] as a `timestamp,value,kind` CSV document.
+///
+/// The CSV counterpart of the JSON interpolate response, for a client that wants
+/// the reconstructed series straight into a spreadsheet / `DuckDB` / pandas without
+/// parsing JSON. The timestamp is RFC 3339, the value is the same `f64` the JSON
+/// body carries (the documented wire-numeric boundary of this endpoint — Storage v2
+/// physical types replace it with a lossless representation later), and `kind` is
+/// the raw/interpolated/extrapolated provenance token. None of the three columns
+/// can contain a comma, so no field escaping is required.
+fn interpolate_response_to_csv(response: &InterpolateResponse) -> Response {
+	use std::fmt::Write as _;
+	let mut out = String::from("timestamp,value,kind\n");
+	for point in &response.points {
+		let _ = writeln!(out, "{},{},{}", point.timestamp.to_rfc3339(), point.value, kind_token(point.kind));
+	}
+	([(header::CONTENT_TYPE, "text/csv; charset=utf-8")], out).into_response()
+}
+
+/// Handle `POST /api/v1/interpolate/csv`: the CSV-output sibling of
+/// [`interpolate`].
+///
+/// Takes the identical JSON request body and runs the identical engine path, then
+/// serves the reconstructed series as a `timestamp,value,kind` CSV document
+/// (`text/csv; charset=utf-8`) instead of JSON — the output-format counterpart of
+/// the storage CSV range exports, so a benchmark or client can pull an interpolated
+/// series in the same universal format.
+///
+/// # Errors
+///
+/// As [`interpolate`]: [`ApiError::BadRequest`] for an empty point set, a
+/// non-finite value, or an inverted range, and [`ApiError::Internal`] on an engine
+/// failure.
+pub async fn interpolate_csv(State(metrics): State<SharedMetrics>, Json(request): Json<InterpolateRequest>) -> Result<Response, ApiError> {
+	metrics.record_interpolate_request();
+	let result = interpolate_inner(request).await;
+	record_outcome(&metrics, &result);
+	Ok(interpolate_response_to_csv(&result?.0))
 }
 
 /// Request body for `POST /api/v1/interpolate/point`.
@@ -713,5 +762,52 @@ mod tests {
 		let (status, body) = post_json("/api/v1/interpolate/point", body).await;
 		assert_eq!(status, StatusCode::BAD_REQUEST);
 		assert!(body["error"].as_str().unwrap().contains("points"));
+	}
+
+	/// POST a JSON body and return `(status, content-type, text body)`.
+	async fn post_json_for_text(uri: &str, body: serde_json::Value) -> (StatusCode, String, String) {
+		let response = app().oneshot(Request::builder().method("POST").uri(uri).header("content-type", "application/json").body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap()).await.unwrap();
+		let status = response.status();
+		let content_type = response.headers().get("content-type").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		(status, content_type, String::from_utf8(bytes.to_vec()).unwrap())
+	}
+
+	#[tokio::test]
+	async fn interpolate_csv_serves_a_timestamped_series() {
+		// Linear 0->60 over a minute on a 10s grid; the CSV carries the raw endpoints
+		// and the interpolated interior, with a header row.
+		let body = serde_json::json!({
+			"spline": "linear",
+			"resolution": "seconds",
+			"points": [
+				{ "timestamp": ts(0), "value": 0.0 },
+				{ "timestamp": ts(60), "value": 60.0 },
+			],
+		});
+		let (status, content_type, text) = post_json_for_text("/api/v1/interpolate/csv", body).await;
+		assert_eq!(status, StatusCode::OK, "body: {text}");
+		assert_eq!(content_type, "text/csv; charset=utf-8");
+		let lines: Vec<&str> = text.lines().collect();
+		assert_eq!(lines[0], "timestamp,value,kind");
+		// The first row is the raw observation at t=0.
+		assert!(lines[1].starts_with("1970-01-01T00:00:00+00:00,0,raw"), "row: {}", lines[1]);
+		// Some interior row is interpolated.
+		assert!(lines.iter().any(|l| l.contains(",interpolated")));
+		// The closing observation at t=60 is raw.
+		assert!(lines.last().unwrap().contains(",raw"));
+	}
+
+	#[tokio::test]
+	async fn interpolate_csv_empty_points_is_bad_request() {
+		let (status, _content_type, text) = post_json_for_text("/api/v1/interpolate/csv", serde_json::json!({ "points": [] })).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {text}");
+	}
+
+	#[test]
+	fn kind_token_maps_each_provenance() {
+		assert_eq!(kind_token(PointKind::Raw), "raw");
+		assert_eq!(kind_token(PointKind::Interpolated), "interpolated");
+		assert_eq!(kind_token(PointKind::Extrapolated), "extrapolated");
 	}
 }

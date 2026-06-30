@@ -41,6 +41,9 @@ const ARROW_STREAM_CONTENT_TYPE: &str = "application/vnd.apache.arrow.stream";
 /// The Apache Parquet file content type.
 const PARQUET_CONTENT_TYPE: &str = "application/vnd.apache.parquet";
 
+/// The CSV content type (RFC 4180), UTF-8.
+const CSV_CONTENT_TYPE: &str = "text/csv; charset=utf-8";
+
 /// Query parameters for the time-range read.
 ///
 /// An inclusive `[start, end]` window of integer epoch timestamps **in the
@@ -117,6 +120,95 @@ fn arrow_stream_response(bytes: Vec<u8>) -> Response {
 /// Build the `200 OK` Parquet-file response from the serialized bytes.
 fn parquet_response(bytes: Vec<u8>) -> Response {
 	([(header::CONTENT_TYPE, PARQUET_CONTENT_TYPE)], Body::from(bytes)).into_response()
+}
+
+/// Build the `200 OK` CSV response from the rendered document.
+fn csv_response(body: String) -> Response {
+	([(header::CONTENT_TYPE, CSV_CONTENT_TYPE)], body).into_response()
+}
+
+/// Render `(timestamp, value)` rows as a two-column CSV document with a
+/// `timestamp,value` header.
+///
+/// This is the universal, dependency-free interchange beside the typed
+/// Arrow/Parquet exports: any spreadsheet, `DuckDB` `read_csv`, or pandas
+/// `read_csv` consumes it. A null value is an empty field; present values are
+/// lossless decimal text (the same no-float-round-trip guarantee the JSON read
+/// gives — hard constraint #4). The two columns are a plain integer and a
+/// `BigDecimal` `Display` form, neither of which can contain a comma, quote, or
+/// newline, so no RFC-4180 field escaping is ever required (which is exactly why
+/// hand-rolling the writer is safe here).
+fn render_csv<I>(rows: I) -> String
+where
+	I: IntoIterator<Item = (i64, Option<BigDecimal>)>,
+{
+	use std::fmt::Write as _;
+	let mut out = String::from("timestamp,value\n");
+	for (timestamp, value) in rows {
+		match value {
+			Some(value) => {
+				let _ = writeln!(out, "{timestamp},{value}");
+			}
+			None => {
+				let _ = writeln!(out, "{timestamp},");
+			}
+		}
+	}
+	out
+}
+
+/// Resolve an aspect's declared schema or map its absence to a clean `404` (the
+/// CSV reads go straight to the store rather than through the bridge, so they
+/// reproduce the bridge's not-found semantics explicitly).
+async fn require_schema(store: &database::SegmentStore, aspect: &str) -> Result<dsp_physical_type::AspectSchema, StorageError> {
+	let schema = store.schema_for(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?;
+	schema.ok_or_else(|| StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")))
+}
+
+/// Handle `GET /api/v1/storage/{aspect}/range.csv?start&end`.
+///
+/// The CSV counterpart of [`storage_time_range`] / [`storage_time_range_json`]:
+/// reads the rows of `aspect` in the inclusive `[start, end]` timestamp window and
+/// serves them as a `timestamp,value` CSV document (lossless decimal-text values,
+/// empty field for a null row) — the lowest-common-denominator interchange a design
+/// partner can load into a spreadsheet, `DuckDB`, or pandas without speaking Arrow.
+///
+/// # Errors
+///
+/// [`StorageError::Unconfigured`] when no store is attached,
+/// [`StorageError::NotFound`] when the aspect is undeclared, and
+/// [`StorageError::Internal`] on a read failure.
+pub async fn storage_time_range_csv(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<TimeRangeParams>) -> Result<Response, StorageError> {
+	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	drop(state);
+	require_schema(&store, &aspect).await?;
+	let result = store.read_time_range(&aspect, params.start, params.end).await;
+	drop(store);
+	let (timestamps, values) = result.map_err(|err| classify_read_error(&err))?;
+	Ok(csv_response(render_csv(timestamps.into_iter().zip(values))))
+}
+
+/// Handle `GET /api/v1/storage/{aspect}/value-range.csv?lo&hi`.
+///
+/// The CSV counterpart of [`storage_value_range`] / [`storage_value_range_json`]:
+/// reads the present rows of `aspect` whose value falls in the inclusive `[lo, hi]`
+/// band and serves them as a `timestamp,value` CSV document. Value-range reads
+/// return only present rows, so every value field is populated.
+///
+/// # Errors
+///
+/// As [`storage_time_range_csv`], plus [`StorageError::BadRequest`] when a value
+/// bound does not parse as a decimal.
+pub async fn storage_value_range_csv(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<ValueRangeParams>) -> Result<Response, StorageError> {
+	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	drop(state);
+	let lo: BigDecimal = params.lo.parse().map_err(|_| StorageError::BadRequest(format!("`lo` is not a decimal: {:?}", params.lo)))?;
+	let hi: BigDecimal = params.hi.parse().map_err(|_| StorageError::BadRequest(format!("`hi` is not a decimal: {:?}", params.hi)))?;
+	require_schema(&store, &aspect).await?;
+	let result = store.read_value_range(&aspect, &lo, &hi).await;
+	drop(store);
+	let (timestamps, values) = result.map_err(|err| classify_read_error(&err))?;
+	Ok(csv_response(render_csv(timestamps.into_iter().zip(values.into_iter().map(Some)))))
 }
 
 /// Handle `GET /api/v1/storage/{aspect}/range?start&end`.
@@ -1171,5 +1263,86 @@ mod tests {
 		let (_dir, router) = router_with_sealed_price().await;
 		let response = router.oneshot(Request::builder().uri("/api/v1/storage/never_declared/value-points?lo=0&hi=100").body(Body::empty()).unwrap()).await.unwrap();
 		assert_eq!(response.status(), StatusCode::NOT_FOUND);
+	}
+
+	/// Fetch a GET response and return `(status, content-type, body text)`.
+	async fn get_text(router: axum::Router, uri: &str) -> (StatusCode, String, String) {
+		let response = router.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+		let status = response.status();
+		let content_type = response.headers().get("content-type").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		(status, content_type, String::from_utf8(bytes.to_vec()).unwrap())
+	}
+
+	#[tokio::test]
+	async fn time_range_serves_a_csv_document() {
+		let (_dir, router) = router_with_sealed_price().await;
+		let (status, content_type, body) = get_text(router, "/api/v1/storage/price/range.csv?start=110&end=130").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(content_type, "text/csv; charset=utf-8");
+		// Header row plus the three in-window rows, lossless decimal text.
+		assert_eq!(body, "timestamp,value\n110,2.5\n120,3.5\n130,4.5\n");
+	}
+
+	#[tokio::test]
+	async fn value_range_serves_a_csv_document() {
+		let (_dir, router) = router_with_sealed_price().await;
+		let (status, _content_type, body) = get_text(router, "/api/v1/storage/price/value-range.csv?lo=2.5&hi=4.5").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body, "timestamp,value\n110,2.5\n120,3.5\n130,4.5\n");
+	}
+
+	#[tokio::test]
+	async fn time_range_csv_empty_window_is_header_only() {
+		let (_dir, router) = router_with_sealed_price().await;
+		let (status, _content_type, body) = get_text(router, "/api/v1/storage/price/range.csv?start=1000&end=2000").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		// No rows in the window -> just the header.
+		assert_eq!(body, "timestamp,value\n");
+	}
+
+	/// Open a store under `dir`, declare `price` (F64, seconds), seal one *nullable*
+	/// batch (middle row null), and hand back the ready store. Mirrors
+	/// [`sealed_price_store`]'s tail-`Arc::new` shape so the significant-`Drop`
+	/// `SegmentStore` never trips the drop-tightening lint.
+	async fn sealed_nullable_price_store(dir: &TempDir) -> Arc<SegmentStore> {
+		let schema = AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds);
+		let store = SegmentStore::open(dir.path()).await.expect("opens store");
+		store.declare("price", &schema).await.expect("declares aspect");
+		store.seal_nullable("price", &schema, &[100_i64, 110, 120], &[Some(bd("1.5")), None, Some(bd("3.5"))]).await.expect("seals nullable");
+		Arc::new(store)
+	}
+
+	#[tokio::test]
+	async fn time_range_csv_renders_null_rows_as_empty_fields() {
+		// A nullable seal lets us confirm a null value is an empty CSV field. Inline the
+		// store into `with_store` (no intermediate binding) so the significant-`Drop`
+		// handle never trips the drop-tightening lint.
+		let dir = TempDir::new().unwrap();
+		let router = app_with_state(AppState::new().with_store(sealed_nullable_price_store(&dir).await));
+		let (status, _content_type, body) = get_text(router, "/api/v1/storage/price/range.csv?start=100&end=120").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body, "timestamp,value\n100,1.5\n110,\n120,3.5\n");
+	}
+
+	#[tokio::test]
+	async fn csv_export_undeclared_aspect_is_not_found() {
+		let (_dir, router) = router_with_sealed_price().await;
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/never_declared/range.csv?start=0&end=100").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::NOT_FOUND);
+	}
+
+	#[tokio::test]
+	async fn csv_export_without_store_is_unavailable() {
+		let router = app_with_state(AppState::new());
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/price/range.csv?start=0&end=100").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+	}
+
+	#[tokio::test]
+	async fn value_range_csv_unparseable_bound_is_bad_request() {
+		let (_dir, router) = router_with_sealed_price().await;
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/price/value-range.csv?lo=abc&hi=10").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 	}
 }

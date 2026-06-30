@@ -295,6 +295,123 @@ fn present_values(values: &[Option<BigDecimal>]) -> Vec<BigDecimal> {
 	values.iter().map(|value| value.clone().unwrap_or_default()).collect()
 }
 
+/// Query parameters for the CSV ingest endpoint: an optional page height.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CsvIngestParams {
+	/// Optional page height — seal a paged segment of this many rows per page.
+	#[serde(default)]
+	pub rows_per_page: Option<usize>,
+}
+
+/// The dense columns parsed from a CSV ingest body: aligned timestamp and
+/// `Option`-value vectors plus whether any value is null (selecting the
+/// nullable seal path).
+struct ParsedCsv {
+	/// Row timestamps in caller order (epoch integers in the aspect's declared unit).
+	timestamps: Vec<i64>,
+	/// Per-row values, `None` for a null (empty) field.
+	values: Vec<Option<BigDecimal>>,
+	/// Whether any value is null (selects the quality-mask seal path).
+	any_null: bool,
+}
+
+/// Parse a `timestamp,value` CSV body into dense timestamp + `Option`-value columns.
+///
+/// The inverse of the [`storage`](crate::storage) CSV export: each non-blank line
+/// is `integer-epoch,decimal-text`, an **empty** value field is a null row, and an
+/// optional leading `timestamp,value` header line is skipped. Values are parsed
+/// losslessly as `BigDecimal` (no float round-trip — hard constraint #4). Only the
+/// first comma splits the line, so a value never needs quoting (it is plain decimal
+/// text), matching the export's no-escaping guarantee.
+///
+/// # Errors
+///
+/// [`StorageError::BadRequest`] for a line without a comma, a non-integer
+/// timestamp, an unparseable value, or an empty body (no data rows).
+fn parse_csv_points(body: &str) -> Result<ParsedCsv, StorageError> {
+	let mut timestamps = Vec::new();
+	let mut values = Vec::new();
+	let mut any_null = false;
+	for (index, raw) in body.lines().enumerate() {
+		let line = raw.trim();
+		if line.is_empty() {
+			continue;
+		}
+		let (ts_text, value_text) = line.split_once(',').ok_or_else(|| StorageError::BadRequest(format!("CSV line {} has no comma separator: {raw:?}", index + 1)))?;
+		let ts_text = ts_text.trim();
+		let value_text = value_text.trim();
+		// Skip an optional leading header row (`timestamp,value`).
+		if timestamps.is_empty() && ts_text.eq_ignore_ascii_case("timestamp") {
+			continue;
+		}
+		let timestamp: i64 = ts_text.parse().map_err(|_| StorageError::BadRequest(format!("CSV line {}: timestamp {ts_text:?} is not an integer", index + 1)))?;
+		if value_text.is_empty() {
+			any_null = true;
+			values.push(None);
+		} else {
+			let parsed: BigDecimal = value_text.parse().map_err(|_| StorageError::BadRequest(format!("CSV line {}: value {value_text:?} is not a decimal", index + 1)))?;
+			values.push(Some(parsed));
+		}
+		timestamps.push(timestamp);
+	}
+	if timestamps.is_empty() {
+		return Err(StorageError::BadRequest("no CSV rows to ingest".to_string()));
+	}
+	Ok(ParsedCsv { timestamps, values, any_null })
+}
+
+/// Handle `POST /api/v1/storage/{aspect}/csv?rows_per_page`.
+///
+/// The CSV counterpart of the JSON / ILP / Parquet ingest endpoints and the
+/// write-side of the [`storage`](crate::storage) CSV export: parses a
+/// `timestamp,value` CSV body (the request body, `text/csv` or `text/plain`) and
+/// seals it into `aspect`'s declared schema. An empty value field seals a null row
+/// (through the quality-mask path); `rows_per_page` selects a paged frame. The same
+/// no-silent-downcast guarantee holds — a value unrepresentable under the declared
+/// encoding/tolerance is rejected `400`, never downcast (hard constraint #4).
+///
+/// # Errors
+///
+/// [`StorageError::Unconfigured`] (no store), [`StorageError::NotFound`] (aspect
+/// undeclared), [`StorageError::BadRequest`] (malformed CSV, empty body, or values
+/// unrepresentable under the declared encoding/tolerance), and
+/// [`StorageError::Internal`] on a filesystem/control-plane failure.
+pub async fn ingest_csv(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<CsvIngestParams>, body: String) -> Result<Response, StorageError> {
+	let metrics = state.metrics().clone();
+	metrics.record_ingest_request();
+	let store = state.store().cloned().ok_or_else(|| { metrics.record_ingest_error(); StorageError::Unconfigured })?;
+	drop(state);
+	let result = ingest_csv_inner(&store, &metrics, &aspect, params.rows_per_page, &body).await;
+	drop(store);
+	if result.is_err() {
+		metrics.record_ingest_error();
+	}
+	result
+}
+
+/// The body of [`ingest_csv`], split out so the handler records an error metric for
+/// any failure path uniformly. Shares [`seal_batch`] / [`classify_seal_error`] with
+/// the JSON ingest path, so a CSV-sealed batch is byte-identical to a JSON-sealed one.
+async fn ingest_csv_inner(store: &database::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, rows_per_page: Option<usize>, body: &str) -> Result<Response, StorageError> {
+	let Some(schema) = store.schema_for(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))? else {
+		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
+	};
+	let ParsedCsv { timestamps, values, any_null } = parse_csv_points(body)?;
+	let descriptor = seal_batch(store, aspect, &schema, &timestamps, &values, any_null, rows_per_page).await.map_err(|err| classify_seal_error(&err))?;
+	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
+	let response = IngestResponse {
+		aspect: aspect.to_string(),
+		segment_id: descriptor.id,
+		format_version: descriptor.format_version,
+		row_count: descriptor.row_count,
+		null_count: descriptor.null_count,
+		byte_len: descriptor.byte_len,
+		min_ts: descriptor.min_ts,
+		max_ts: descriptor.max_ts,
+	};
+	Ok((StatusCode::CREATED, Json(response)).into_response())
+}
+
 /// Query parameters for the ILP ingest endpoint: which field to seal, the wire
 /// timestamp precision, and an optional page height.
 #[derive(Debug, Clone, Deserialize)]
@@ -716,6 +833,109 @@ mod tests {
 		let router = app_with_state(AppState::new());
 		let (status, _body) = post_text(router, "/api/v1/storage/temp/ilp?field=temp", "weather temp=1 100\n").await;
 		assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+	}
+
+	#[tokio::test]
+	async fn csv_ingest_round_trips_through_the_read_surface() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_price(&dir).await;
+		// A header row plus three data rows, the exact shape the CSV export emits.
+		let csv = "timestamp,value\n100,1.5\n110,2.5\n120,3.5\n";
+		let (status, body) = post_text(router, "/api/v1/storage/price/csv", csv).await;
+		assert_eq!(status, StatusCode::CREATED, "body: {body}");
+		assert_eq!(body["aspect"], "price");
+		assert_eq!(body["row_count"], 3);
+		assert_eq!(body["null_count"], 0);
+		assert_eq!(body["min_ts"], 100);
+		assert_eq!(body["max_ts"], 120);
+
+		// The read surface returns exactly what the CSV body carried.
+		let router = router_with_declared_price_reopened(&dir).await;
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/price/points?start=100&end=120").body(Body::empty()).unwrap()).await.unwrap();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let read: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		assert_eq!(read["count"], 3);
+		assert_eq!(read["points"][1]["value"], "2.5");
+	}
+
+	#[tokio::test]
+	async fn csv_ingest_accepts_a_headerless_body() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_price(&dir).await;
+		let (status, body) = post_text(router, "/api/v1/storage/price/csv", "100,1.5\n110,2.5\n").await;
+		assert_eq!(status, StatusCode::CREATED, "body: {body}");
+		assert_eq!(body["row_count"], 2);
+	}
+
+	#[tokio::test]
+	async fn csv_ingest_empty_value_field_seals_a_null_row() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_price(&dir).await;
+		let (status, body) = post_text(router, "/api/v1/storage/price/csv", "100,1.5\n110,\n120,3.5\n").await;
+		assert_eq!(status, StatusCode::CREATED, "body: {body}");
+		assert_eq!(body["row_count"], 3);
+		assert_eq!(body["null_count"], 1);
+	}
+
+	#[tokio::test]
+	async fn csv_ingest_rows_per_page_seals_a_paged_frame() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_price(&dir).await;
+		let (status, body) = post_text(router, "/api/v1/storage/price/csv?rows_per_page=2", "100,1.5\n110,2.5\n120,3.5\n130,4.5\n").await;
+		assert_eq!(status, StatusCode::CREATED, "body: {body}");
+		// Paged frames carry the paged format version (3).
+		assert_eq!(body["format_version"], 3);
+		assert_eq!(body["row_count"], 4);
+	}
+
+	#[tokio::test]
+	async fn csv_ingest_line_without_comma_is_bad_request() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_price(&dir).await;
+		let (status, body) = post_text(router, "/api/v1/storage/price/csv", "100 1.5\n").await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+		assert!(body["error"].as_str().unwrap().contains("no comma separator"));
+	}
+
+	#[tokio::test]
+	async fn csv_ingest_non_integer_timestamp_is_bad_request() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_price(&dir).await;
+		let (status, body) = post_text(router, "/api/v1/storage/price/csv", "not-a-ts,1.5\n").await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+		assert!(body["error"].as_str().unwrap().contains("is not an integer"));
+	}
+
+	#[tokio::test]
+	async fn csv_ingest_empty_body_is_bad_request() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_price(&dir).await;
+		let (status, body) = post_text(router, "/api/v1/storage/price/csv", "\n  \n").await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+		assert!(body["error"].as_str().unwrap().contains("no CSV rows"));
+	}
+
+	#[tokio::test]
+	async fn csv_ingest_into_undeclared_aspect_is_not_found() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_empty_store(&dir).await;
+		let (status, _body) = post_text(router, "/api/v1/storage/ghost/csv", "100,1.5\n").await;
+		assert_eq!(status, StatusCode::NOT_FOUND);
+	}
+
+	#[tokio::test]
+	async fn csv_ingest_without_store_is_unavailable() {
+		let router = app_with_state(AppState::new());
+		let (status, _body) = post_text(router, "/api/v1/storage/price/csv", "100,1.5\n").await;
+		assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+	}
+
+	#[test]
+	fn parse_csv_points_reads_header_nulls_and_values() {
+		let parsed = super::parse_csv_points("timestamp,value\n100,1.5\n110,\n120,3.5\n").expect("parses");
+		assert_eq!(parsed.timestamps, vec![100, 110, 120]);
+		assert_eq!(parsed.values, vec![Some("1.5".parse().unwrap()), None, Some("3.5".parse().unwrap())]);
+		assert!(parsed.any_null);
 	}
 
 	#[tokio::test]
