@@ -239,7 +239,20 @@ wins."*
 > (decode + seal in `dsp-arrow-store`, same `dsp_ingest_*` counters + no-silent-
 > downcast guarantee as the JSON/ILP ingest); and `GET …/storage/{aspect}/value-points`
 > is the JSON counterpart of the Arrow value-range read (lossless decimal-text
-> rows in a `[lo, hi]` band, same B-rest pagination). Still to do: OpenTelemetry.
+> rows in a `[lo, hi]` band, same B-rest pagination). **CSV interchange landed
+> (2026-06-30):** the lowest-common-denominator text format now rounds-trips end
+> to end — stored-range CSV **export** (`GET …/storage/{aspect}/range.csv` and
+> `…/value-range.csv`, `text/csv; charset=utf-8`, lossless decimal-text values,
+> empty field for a null row) and CSV **ingest** (`POST …/storage/{aspect}/csv` —
+> parses `timestamp,value` rows, skips an optional header, empty field = null,
+> reusing the JSON seal path so a CSV-sealed batch is byte-identical and carries
+> the same no-silent-downcast guarantee + `dsp_ingest_*` counters); plus CSV
+> **output** on the two compute endpoints — `POST …/interpolate/csv`
+> (`timestamp,value,kind`) and `POST …/downsample/csv` (`timestamp,count,<agg>…`),
+> each reusing its JSON core. All hand-rolled (no new dependency): the columns are
+> integers / `BigDecimal` `Display` / RFC-3339 timestamps, none of which can
+> contain a comma, so no RFC-4180 escaping is ever required. Still to do:
+> OpenTelemetry.
 
 A commercial DB can't lead with an embedded Rust API + TUI. Build an `axum` server:
 create DB / subject / aspect; define schema/physical type; batch ingest; range query;

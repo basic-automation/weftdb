@@ -2762,3 +2762,95 @@ flagship `POST /api/v1/interpolate` endpoint (decide whether to promote
 `dsp-arrow-store`).
 
 **PR:** https://github.com/physics515/DSP/pull/30
+
+## 2026-06-30 — CSV interchange end to end (Phase 2, 4 increments)
+
+- **Item:** Phase 2 (*benchmark-grade server/API*) — the interchange surface.
+  Prior runs delivered JSON, ILP, Arrow IPC, and Parquet in/out; the roadmap's
+  "Keep, but narrow: connector abstraction (start with ILP, CSV, Parquet, HTTP)"
+  still listed CSV as undelivered. This run built the **CSV** interchange arc end
+  to end: storage export, storage ingest, and CSV output on both compute
+  endpoints. Four green increments on branch `routine/dsp-2026-06-30`, all in
+  `dsp-server` (no other crate touched; the hot-path core stays untouched).
+  Hand-rolled throughout — **no new dependency** — which is safe because the only
+  columns are plain integers, `BigDecimal` `Display`, and RFC-3339 timestamps,
+  none of which can contain a comma/quote/newline, so RFC-4180 field escaping is
+  never required.
+
+**Increment 1 — CSV export endpoints** (commit `e17fb2e`)
+- `dsp-server/src/storage.rs`: `GET …/storage/{aspect}/range.csv?start&end` and
+  `…/value-range.csv?lo&hi` serve a stored window as a `timestamp,value` CSV
+  document (`text/csv; charset=utf-8`). `render_csv` writes lossless decimal-text
+  values (hard constraint #4); a null row is an empty value field. Reads go
+  straight to `database::SegmentStore` (no `arrow-*` on this path); a new
+  `require_schema` reproduces the bridge's clean 404 for an undeclared aspect.
+  Tests +7 (dsp-server lib 99->106).
+
+**Increment 2 — CSV ingest endpoint** (commit `146e82b`)
+- `dsp-server/src/manage.rs`: `POST …/storage/{aspect}/csv?rows_per_page` parses
+  a `timestamp,value` body into a `ParsedCsv` struct (optional header skipped,
+  empty value field = null row) and seals it via the **shared** `seal_batch` /
+  `classify_seal_error` used by the JSON path — so a CSV-sealed batch is
+  byte-identical to a JSON-sealed one, with the same no-silent-downcast guarantee
+  and `dsp_ingest_*` counters. Tests +10 (106->116). Resolved a `type_complexity`
+  clippy nit with the `ParsedCsv` struct rather than an `#[allow]`.
+
+**Increment 3 — CSV output for the interpolate flagship** (commit `20a63ca`)
+- `dsp-server/src/interpolate.rs`: `POST …/interpolate/csv` — identical JSON
+  request body and engine path (reuses `interpolate_inner` + `record_outcome`),
+  but serves the reconstructed series as `timestamp,value,kind` CSV instead of
+  JSON. `kind_token` matches the JSON provenance serialization. Tests +3
+  (116->119).
+
+**Increment 4 — CSV output for the downsample endpoint** (commit `b570ac2`)
+- `dsp-server/src/downsample.rs`: `POST …/downsample/csv` — reuses
+  `downsample_inner` + metrics accounting, serves the reduced series as
+  `timestamp,count,<agg>…` CSV (one column per requested reduction in request
+  order; only non-empty buckets, every cell populated). Tests +2 (119->121).
+
+**Build/test/clippy (real, nightly `rustc`):**
+- `cargo build --workspace` — GREEN after every increment (incremental builds
+  ~8-15s; one full dep rebuild 1m37s with no new crates).
+- `SKIP_SLOW_TESTS=1 cargo test --workspace --lib -- --test-threads=1`: database
+  **72**, database_orchestration **17**, dsp-arrow **36**, dsp-arrow-store **15**,
+  dsp-bench **87**, dsp-line-protocol **11**, dsp-physical-type **152**,
+  dsp-server **121** (this run 99->121, **+22**), dsp-tui **7**, splimes **23**.
+  Workspace lib total **541**, 0 failed. (The splimes GPU tests did **not** flake
+  this run under the serial run — all 23 passed; prior runs saw a GPU-contention
+  flake on this box. This run touched zero splimes/GPU code.)
+- Clippy — **0 new warnings** in `dsp-server` (the only crate touched) under its
+  lib pedantic+nursery lints, verified per file under `--all-targets`. The
+  pre-existing test-helper `significant_drop_tightening` warnings (5 in manage.rs,
+  2 in storage.rs) are unchanged and untouched; the `type_complexity` nit my CSV
+  parser introduced was fixed directly with a struct. Pre-existing untouched
+  warnings elsewhere (`database`, `splimes`) unchanged — no splimes/database code
+  was touched.
+
+**Done vs open:** DONE — the full CSV interchange surface end to end: stored-range
+CSV export (`…/range.csv`, `…/value-range.csv`), CSV ingest (`POST …/csv`), and
+CSV output on both compute endpoints (`…/interpolate/csv`, `…/downsample/csv`).
+ROADMAP Phase-2 status note updated. OPEN (Phase 2/4 remainder): **OpenTelemetry**
+trace export; the external-engine **DuckDB** + competitor adapters (vendor dep +
+Windows build assessment — risky unattended); **tag** pruning (4.4, blocked on
+B-tags); the standalone **methodology** document; richer B-rest (`interpolation`
+alias + cursor paging); columnar (Arrow/Parquet) output for the *interpolation*
+flagship endpoint (needs a dep-graph decision — `dsp-arrow` is a dev-dep of
+dsp-server today).
+
+**STOP REASON:** natural-arc complete — four green increments (top of the 2-4
+bar) deliver a coherent, round-trippable CSV interchange arc. The remaining
+workable items are each their own arc with a gating decision: DuckDB needs a
+vendor-dep/Windows-build assessment (risky unattended), OpenTelemetry is a larger
+instrumentation slice, and columnar interpolation output needs a deliberate
+dep-graph decision — better as dedicated slices than forced on late against the
+honesty contract.
+
+**Next step (tomorrow):** (a) **OpenTelemetry** trace export on `dsp-server` (the
+Phase-3 instrumentation item paired with the existing Prometheus `/metrics`); or
+(b) columnar (Arrow/Parquet) output for the flagship `POST /api/v1/interpolate`
+endpoint (decide whether to promote `dsp-arrow` to a regular dsp-server dep or
+route a new bridge through `dsp-arrow-store`); or (c) the external-engine
+**DuckDB** adapter for DSP-Bench (assess the DuckDB Rust crate's Windows build
+first).
+
+**PR:** https://github.com/physics515/DSP/pull/31
