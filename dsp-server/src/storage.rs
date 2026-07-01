@@ -585,6 +585,11 @@ pub struct AspectStatsResponse {
 	pub total_bytes: u64,
 	/// The north-star cost term: total framed bytes over total rows (0 when empty).
 	pub bytes_per_point: f64,
+	/// The number of sealed segments whose timestamps are not monotonic
+	/// non-decreasing — an order-health signal (a growing count predicts rising
+	/// read-scan cost, since an out-of-order segment cannot be binary-searched). Zero
+	/// when every segment admits ordered access.
+	pub unsorted_segments: usize,
 	/// Inclusive `[min, max]` timestamp span, or `null` when the aspect holds no
 	/// non-empty segment.
 	pub time_range: Option<[i64; 2]>,
@@ -747,7 +752,7 @@ pub async fn storage_aspect_stats(State(state): State<AppState>, Path(aspect): P
 	let bytes_per_point = meta.bytes_per_point();
 	let time_range = meta.time_range.map(Into::into);
 	let value_range = meta.value_range.map(|(lo, hi)| [lo.to_string(), hi.to_string()]);
-	Ok(Json(AspectStatsResponse { aspect, segment_count: meta.segment_count, total_rows: meta.total_rows, total_nulls: meta.total_nulls, total_bytes: meta.total_bytes, bytes_per_point, time_range, value_range }))
+	Ok(Json(AspectStatsResponse { aspect, segment_count: meta.segment_count, total_rows: meta.total_rows, total_nulls: meta.total_nulls, total_bytes: meta.total_bytes, bytes_per_point, unsorted_segments: meta.unsorted_segments, time_range, value_range }))
 }
 
 /// Handle `GET /api/v1/storage/stats`: the store-wide aggregate over every aspect's
@@ -1021,6 +1026,24 @@ mod tests {
 		// The north-star cost term is a positive, finite bytes/point.
 		let bpp = body["bytes_per_point"].as_f64().unwrap();
 		assert!(bpp > 0.0 && bpp.is_finite(), "bytes_per_point = {bpp}");
+		// The sole sealed segment is in order, so the order-health signal is clean.
+		assert_eq!(body["unsorted_segments"], 0);
+	}
+
+	#[tokio::test]
+	async fn aspect_stats_reports_unsorted_segments_after_an_out_of_order_seal() {
+		let dir = TempDir::new().expect("temp dir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens store");
+		store.declare("price", &AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds)).await.expect("declares");
+		// One ordered segment, then one whose timestamps step backwards.
+		store.seal_declared("price", &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("ordered");
+		store.seal_declared("price", &[100_i64, 130, 110], &[bd("4"), bd("5"), bd("6")]).await.expect("out of order");
+		let router = app_with_state(AppState::new().with_store(Arc::new(store)));
+		let (status, body) = get_json(router, "/api/v1/storage/price/stats").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["segment_count"], 2);
+		// The rollup fold path (record_seal) surfaced the out-of-order segment at the endpoint.
+		assert_eq!(body["unsorted_segments"], 1, "body: {body}");
 	}
 
 	#[tokio::test]

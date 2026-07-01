@@ -49,6 +49,11 @@ pub struct AspectMetadata {
 	pub total_nulls: u64,
 	/// Total realized on-disk bytes across every `.dspseg` frame.
 	pub total_bytes: u64,
+	/// The number of sealed segments whose timestamps are **not** monotonic
+	/// non-decreasing — the aspect's order-health signal (an out-of-order segment
+	/// forces a linear scan on a point lookup; roadmap Phase 4.6). Zero when every
+	/// segment admits ordered access.
+	pub unsorted_segments: usize,
 	/// The inclusive `(min, max)` timestamp span the aspect covers, or [`None`] when it
 	/// holds no non-empty segment.
 	pub time_range: Option<(i64, i64)>,
@@ -63,7 +68,7 @@ impl AspectMetadata {
 	/// same rollup, so re-deriving after any change keeps the materialized row exact.
 	#[must_use]
 	pub fn from_index(index: &SegmentIndex) -> Self {
-		let mut meta = Self { segment_count: index.len(), total_rows: index.total_rows(), total_bytes: index.total_bytes(), time_range: index.time_range(), ..Self::default() };
+		let mut meta = Self { segment_count: index.len(), total_rows: index.total_rows(), total_bytes: index.total_bytes(), unsorted_segments: index.unsorted_count(), time_range: index.time_range(), ..Self::default() };
 		meta.total_nulls = index.iter().map(|d| d.null_count as u64).sum();
 		meta.value_range = value_span(index.iter());
 		meta
@@ -82,6 +87,7 @@ impl AspectMetadata {
 		self.total_rows += descriptor.row_count as u64;
 		self.total_nulls += descriptor.null_count as u64;
 		self.total_bytes += descriptor.byte_len;
+		self.unsorted_segments += usize::from(!descriptor.time_sorted);
 		if let Some((lo, hi)) = descriptor.time_range() {
 			self.time_range = Some(match self.time_range {
 				Some((slo, shi)) => (slo.min(lo), shi.max(hi)),
@@ -158,6 +164,7 @@ impl AspectMetadataStore {
 				total_rows INTEGER NOT NULL,
 				total_nulls INTEGER NOT NULL,
 				total_bytes INTEGER NOT NULL,
+				unsorted_segments INTEGER NOT NULL DEFAULT 0,
 				min_ts INTEGER,
 				max_ts INTEGER,
 				min_value TEXT,
@@ -167,6 +174,10 @@ impl AspectMetadataStore {
 			turso::params![],
 		)
 		.await?;
+		// Migrate a pre-existing metadata.db created before the order-health column:
+		// CREATE TABLE IF NOT EXISTS above is a no-op on it, so add the column here.
+		// A duplicate-column error (fresh table already has it) is expected and ignored.
+		conn.execute("ALTER TABLE aspect_metadata ADD COLUMN unsorted_segments INTEGER NOT NULL DEFAULT 0", turso::params![]).await.ok();
 		Ok(Self { db })
 	}
 
@@ -195,9 +206,9 @@ impl AspectMetadataStore {
 		let res = conn
 			.execute(
 				"INSERT OR REPLACE INTO aspect_metadata
-				(aspect, segment_count, total_rows, total_nulls, total_bytes, min_ts, max_ts, min_value, max_value)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-				turso::params![aspect.to_string(), i64::try_from(meta.segment_count).unwrap_or(i64::MAX), i64::try_from(meta.total_rows).unwrap_or(i64::MAX), i64::try_from(meta.total_nulls).unwrap_or(i64::MAX), i64::try_from(meta.total_bytes).unwrap_or(i64::MAX), min_ts, max_ts, min_value, max_value],
+				(aspect, segment_count, total_rows, total_nulls, total_bytes, unsorted_segments, min_ts, max_ts, min_value, max_value)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+				turso::params![aspect.to_string(), i64::try_from(meta.segment_count).unwrap_or(i64::MAX), i64::try_from(meta.total_rows).unwrap_or(i64::MAX), i64::try_from(meta.total_nulls).unwrap_or(i64::MAX), i64::try_from(meta.total_bytes).unwrap_or(i64::MAX), i64::try_from(meta.unsorted_segments).unwrap_or(i64::MAX), min_ts, max_ts, min_value, max_value],
 			)
 			.await;
 		match res {
@@ -235,7 +246,7 @@ impl AspectMetadataStore {
 		let conn = self.db.connect()?;
 		let mut rows = conn
 			.query(
-				"SELECT segment_count, total_rows, total_nulls, total_bytes, min_ts, max_ts, min_value, max_value
+				"SELECT segment_count, total_rows, total_nulls, total_bytes, min_ts, max_ts, min_value, max_value, unsorted_segments
 				FROM aspect_metadata WHERE aspect = ?",
 				turso::params![aspect.to_string()],
 			)
@@ -302,7 +313,8 @@ impl AspectMetadataStore {
 			(Some(lo), Some(hi)) => Some((lo, hi)),
 			_ => None,
 		};
-		Ok(AspectMetadata { segment_count, total_rows, total_nulls, total_bytes, time_range, value_range })
+		let unsorted_segments = usize::try_from(*row.get_value(8)?.as_integer().unwrap_or(&0)).unwrap_or(0);
+		Ok(AspectMetadata { segment_count, total_rows, total_nulls, total_bytes, unsorted_segments, time_range, value_range })
 	}
 
 	/// Read a nullable integer column, distinguishing SQL `NULL` from `0`.
@@ -344,7 +356,7 @@ mod tests {
 	#[tokio::test]
 	async fn put_then_get_round_trips() {
 		let store = AspectMetadataStore::open_in_memory().await.expect("opens");
-		let meta = AspectMetadata { segment_count: 2, total_rows: 20, total_nulls: 3, total_bytes: 256, time_range: Some((0, 190)), value_range: Some((bd("0"), bd("19.5"))) };
+		let meta = AspectMetadata { segment_count: 2, total_rows: 20, total_nulls: 3, total_bytes: 256, unsorted_segments: 1, time_range: Some((0, 190)), value_range: Some((bd("0"), bd("19.5"))) };
 		store.put("temp", &meta).await.expect("puts");
 		let got = store.get("temp").await.expect("gets");
 		let missing = store.get("absent").await.expect("gets");
@@ -463,7 +475,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn bytes_per_point_over_rows() {
-		let meta = AspectMetadata { segment_count: 1, total_rows: 10, total_nulls: 0, total_bytes: 250, time_range: Some((0, 90)), value_range: Some((bd("0"), bd("9"))) };
+		let meta = AspectMetadata { segment_count: 1, total_rows: 10, total_nulls: 0, total_bytes: 250, unsorted_segments: 0, time_range: Some((0, 90)), value_range: Some((bd("0"), bd("9"))) };
 		let empty = AspectMetadata::default();
 		assert!((meta.bytes_per_point() - 25.0).abs() < f64::EPSILON);
 		assert!((empty.bytes_per_point() - 0.0).abs() < f64::EPSILON);
