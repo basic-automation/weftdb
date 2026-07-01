@@ -53,7 +53,11 @@ use crate::{
 /// - **v1** — dense `(timestamp, value)` columns only (no quality column).
 /// - **v2** — adds the [`NullMask`] quality column block, so a segment can carry
 ///   null/absent rows ([`Segment::build_nullable`]).
-pub const SEGMENT_FORMAT_VERSION: u16 = 2;
+/// - **v3** — the timestamp-column block gains a self-describing codec selector
+///   so a regular / small-jitter series' second differences store fixed-width
+///   bit-packed instead of one-byte-per-value varint (realizing the bytes/point
+///   saving, not just estimating it).
+pub const SEGMENT_FORMAT_VERSION: u16 = 3;
 
 /// Why a [`Segment`] could not be built from its input columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,8 +276,8 @@ impl Segment {
 		self.values.estimated_bytes()
 	}
 
-	/// Estimated stored bytes of the timestamp column, taking the cheaper of
-	/// plain-varint or RLE second differences (see
+	/// Estimated stored bytes of the timestamp column, taking the cheapest of
+	/// plain-varint, RLE, or bit-packed second differences (see
 	/// [`DeltaOfDeltaColumn::best_estimated_bytes`]).
 	#[must_use]
 	pub fn timestamp_bytes(&self) -> usize {
