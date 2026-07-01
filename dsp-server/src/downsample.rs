@@ -265,6 +265,37 @@ fn response_columns(response: &DownsampleResponse) -> (Vec<i64>, Vec<i64>, Vec<V
 	(timestamps, counts, agg_columns)
 }
 
+/// Render a [`DownsampleResponse`] as an **Arrow IPC stream**
+/// (`application/vnd.apache.arrow.stream`).
+///
+/// Shared by the JSON and ILP Arrow handlers so both emit the identical
+/// self-describing reduction-table batch. All `arrow-*` knowledge stays inside
+/// `dsp-arrow`; this hands it only primitive columns.
+///
+/// # Errors
+///
+/// Returns [`ApiError::Internal`] if the Arrow encoding fails.
+fn downsample_response_to_arrow(response: &DownsampleResponse) -> Result<Response, ApiError> {
+	let (timestamps, counts, agg_columns) = response_columns(response);
+	let names: Vec<&str> = response.aggregations.iter().map(String::as_str).collect();
+	let bytes = dsp_arrow::reduction_table_to_ipc_bytes(dsp_physical_type::TimeUnit::Nanos, &timestamps, &counts, &names, &agg_columns).map_err(|err| ApiError::Internal(err.to_string()))?;
+	Ok(([(header::CONTENT_TYPE, ARROW_STREAM_CONTENT_TYPE)], bytes).into_response())
+}
+
+/// Render a [`DownsampleResponse`] as an **Apache Parquet** file
+/// (`application/vnd.apache.parquet`). The Parquet counterpart of
+/// [`downsample_response_to_arrow`], shared by the JSON and ILP handlers.
+///
+/// # Errors
+///
+/// Returns [`ApiError::Internal`] if the Parquet encoding fails.
+fn downsample_response_to_parquet(response: &DownsampleResponse) -> Result<Response, ApiError> {
+	let (timestamps, counts, agg_columns) = response_columns(response);
+	let names: Vec<&str> = response.aggregations.iter().map(String::as_str).collect();
+	let bytes = dsp_arrow::reduction_table_to_parquet_bytes(dsp_physical_type::TimeUnit::Nanos, &timestamps, &counts, &names, &agg_columns).map_err(|err| ApiError::Internal(err.to_string()))?;
+	Ok(([(header::CONTENT_TYPE, PARQUET_CONTENT_TYPE)], bytes).into_response())
+}
+
 /// Handle `POST /api/v1/downsample/arrow`: the Arrow-IPC-output sibling of
 /// [`downsample`].
 ///
@@ -288,11 +319,7 @@ pub async fn downsample_arrow(State(metrics): State<SharedMetrics>, Json(request
 		Ok(response) => metrics.add_downsample_buckets(response.0.buckets as u64),
 		Err(_) => metrics.record_downsample_error(),
 	}
-	let response = result?.0;
-	let (timestamps, counts, agg_columns) = response_columns(&response);
-	let names: Vec<&str> = response.aggregations.iter().map(String::as_str).collect();
-	let bytes = dsp_arrow::reduction_table_to_ipc_bytes(dsp_physical_type::TimeUnit::Nanos, &timestamps, &counts, &names, &agg_columns).map_err(|err| ApiError::Internal(err.to_string()))?;
-	Ok(([(header::CONTENT_TYPE, ARROW_STREAM_CONTENT_TYPE)], bytes).into_response())
+	downsample_response_to_arrow(&result?.0)
 }
 
 /// Handle `POST /api/v1/downsample/parquet`: the Parquet-output sibling of
@@ -316,11 +343,7 @@ pub async fn downsample_parquet(State(metrics): State<SharedMetrics>, Json(reque
 		Ok(response) => metrics.add_downsample_buckets(response.0.buckets as u64),
 		Err(_) => metrics.record_downsample_error(),
 	}
-	let response = result?.0;
-	let (timestamps, counts, agg_columns) = response_columns(&response);
-	let names: Vec<&str> = response.aggregations.iter().map(String::as_str).collect();
-	let bytes = dsp_arrow::reduction_table_to_parquet_bytes(dsp_physical_type::TimeUnit::Nanos, &timestamps, &counts, &names, &agg_columns).map_err(|err| ApiError::Internal(err.to_string()))?;
-	Ok(([(header::CONTENT_TYPE, PARQUET_CONTENT_TYPE)], bytes).into_response())
+	downsample_response_to_parquet(&result?.0)
 }
 
 /// Handle `POST /api/v1/downsample/csv`: the CSV-output sibling of [`downsample`].
@@ -384,6 +407,65 @@ pub async fn downsample_ilp(State(metrics): State<SharedMetrics>, axum::extract:
 		Err(_) => metrics.record_downsample_error(),
 	}
 	result
+}
+
+/// Account a finished ILP-downsample outcome on [`SharedMetrics`] identically to the
+/// JSON path, so every output-format sibling reports the same counters.
+fn record_downsample_outcome(metrics: &SharedMetrics, result: &Result<Json<DownsampleResponse>, ApiError>) {
+	match result {
+		Ok(response) => metrics.add_downsample_buckets(response.0.buckets as u64),
+		Err(_) => metrics.record_downsample_error(),
+	}
+}
+
+/// Handle `POST /api/v1/downsample/ilp/csv`: the CSV-output sibling of
+/// [`downsample_ilp`].
+///
+/// Identical ILP parsing, projection, and reduction as [`downsample_ilp`], but
+/// serves the reduced series as a `timestamp,count,<agg>…` CSV document. Rounds the
+/// ILP downsample path out to the same output-format set the JSON path offers
+/// (JSON / CSV / Arrow / Parquet).
+///
+/// # Errors
+///
+/// As [`downsample_ilp`].
+pub async fn downsample_ilp_csv(State(metrics): State<SharedMetrics>, axum::extract::Query(params): axum::extract::Query<DownsampleIlpParams>, body: String) -> Result<Response, ApiError> {
+	metrics.record_downsample_request();
+	let result = downsample_ilp_inner(&params, &body);
+	record_downsample_outcome(&metrics, &result);
+	Ok(downsample_response_to_csv(&result?.0))
+}
+
+/// Handle `POST /api/v1/downsample/ilp/arrow`: the Arrow-IPC-output sibling of
+/// [`downsample_ilp`].
+///
+/// Identical ILP path as [`downsample_ilp`], serving the reduced series as an
+/// **Arrow IPC stream** (`application/vnd.apache.arrow.stream`).
+///
+/// # Errors
+///
+/// As [`downsample_ilp`], plus [`ApiError::Internal`] on an Arrow-encoding failure.
+pub async fn downsample_ilp_arrow(State(metrics): State<SharedMetrics>, axum::extract::Query(params): axum::extract::Query<DownsampleIlpParams>, body: String) -> Result<Response, ApiError> {
+	metrics.record_downsample_request();
+	let result = downsample_ilp_inner(&params, &body);
+	record_downsample_outcome(&metrics, &result);
+	downsample_response_to_arrow(&result?.0)
+}
+
+/// Handle `POST /api/v1/downsample/ilp/parquet`: the Parquet-output sibling of
+/// [`downsample_ilp`].
+///
+/// Identical ILP path as [`downsample_ilp`], serving the reduced series as an
+/// **Apache Parquet** file (`application/vnd.apache.parquet`).
+///
+/// # Errors
+///
+/// As [`downsample_ilp`], plus [`ApiError::Internal`] on a Parquet-encoding failure.
+pub async fn downsample_ilp_parquet(State(metrics): State<SharedMetrics>, axum::extract::Query(params): axum::extract::Query<DownsampleIlpParams>, body: String) -> Result<Response, ApiError> {
+	metrics.record_downsample_request();
+	let result = downsample_ilp_inner(&params, &body);
+	record_downsample_outcome(&metrics, &result);
+	downsample_response_to_parquet(&result?.0)
 }
 
 fn downsample_ilp_inner(params: &DownsampleIlpParams, body: &str) -> Result<Json<DownsampleResponse>, ApiError> {
@@ -794,6 +876,56 @@ mod tests {
 	#[tokio::test]
 	async fn downsample_arrow_empty_points_is_bad_request() {
 		let (status, _content_type, _bytes) = post_json_for_bytes("/api/v1/downsample/arrow", serde_json::json!({ "points": [] })).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST);
+	}
+
+	/// POST a text (ILP) body and return `(status, content-type, raw bytes)`.
+	async fn post_text_for_bytes(uri: &str, body: &str) -> (StatusCode, String, Vec<u8>) {
+		let response = app().oneshot(Request::builder().method("POST").uri(uri).header("content-type", "text/plain").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+		let status = response.status();
+		let content_type = response.headers().get("content-type").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		(status, content_type, bytes.to_vec())
+	}
+
+	// Three cpu rows sharing minute bucket 1000000020 and one opening the next.
+	const ILP_BUCKETS: &str = "cpu,host=a load=0 1000000020\ncpu,host=a load=10 1000000040\ncpu,host=a load=20 1000000060\ncpu,host=a load=50 1000000080\n";
+
+	#[tokio::test]
+	async fn downsample_ilp_csv_serves_bucketed_rows() {
+		let (status, content_type, bytes) = post_text_for_bytes("/api/v1/downsample/ilp/csv?field=load&precision=s&resolution=minutes&agg=min,max,avg", ILP_BUCKETS).await;
+		assert_eq!(status, StatusCode::OK);
+		assert_eq!(content_type, "text/csv; charset=utf-8");
+		let text = String::from_utf8(bytes).unwrap();
+		assert_eq!(text.lines().next(), Some("timestamp,count,min,max,avg"));
+	}
+
+	#[tokio::test]
+	async fn downsample_ilp_arrow_serves_a_reduction_table() {
+		let (status, content_type, bytes) = post_text_for_bytes("/api/v1/downsample/ilp/arrow?field=load&precision=s&resolution=minutes&agg=min,max,avg", ILP_BUCKETS).await;
+		assert_eq!(status, StatusCode::OK);
+		assert_eq!(content_type, "application/vnd.apache.arrow.stream");
+		let batches = dsp_arrow::read_ipc_stream(&bytes).expect("valid arrow ipc");
+		let (unit, _ts, counts, aggs) = dsp_arrow::reduction_table_from_record_batch(&batches[0]).expect("reads back");
+		assert_eq!(unit, dsp_physical_type::TimeUnit::Nanos);
+		assert_eq!(counts, vec![3, 1]);
+		assert_eq!(aggs[0], ("min".to_string(), vec![0.0, 50.0]));
+	}
+
+	#[tokio::test]
+	async fn downsample_ilp_parquet_serves_a_file() {
+		let (status, content_type, bytes) = post_text_for_bytes("/api/v1/downsample/ilp/parquet?field=load&precision=s&resolution=minutes", ILP_BUCKETS).await;
+		assert_eq!(status, StatusCode::OK);
+		assert_eq!(content_type, "application/vnd.apache.parquet");
+		assert_eq!(&bytes[..4], b"PAR1");
+		let batches = dsp_arrow::read_parquet(&bytes).expect("valid parquet");
+		let (_unit, _ts, counts, _aggs) = dsp_arrow::reduction_table_from_record_batch(&batches[0]).expect("reads back");
+		assert_eq!(counts, vec![3, 1]);
+	}
+
+	#[tokio::test]
+	async fn downsample_ilp_arrow_rejects_missing_field() {
+		let (status, _content_type, _bytes) = post_text_for_bytes("/api/v1/downsample/ilp/arrow?field=temp&precision=s", ILP_BUCKETS).await;
 		assert_eq!(status, StatusCode::BAD_REQUEST);
 	}
 }
