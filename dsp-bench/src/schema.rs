@@ -152,9 +152,10 @@ pub struct StorageEstimate {
 	/// Epoch unit the timestamp column was encoded in (e.g. `micros`).
 	#[serde(default)]
 	pub timestamp_unit: String,
-	/// Timestamp-column encoding chosen: `delta_of_delta`, or
-	/// `delta_of_delta_rle` when run-length coding the second differences is
-	/// cheaper (regular series).
+	/// Timestamp-column encoding chosen: `delta_of_delta`, `delta_of_delta_rle`
+	/// when run-length coding the second differences is cheaper (long identical
+	/// runs), or `delta_of_delta_bitpack` when fixed-width bit-packing is cheapest
+	/// (a regular or small-jitter series).
 	#[serde(default)]
 	pub timestamp_encoding: String,
 	/// Estimated byte footprint of the timestamp column (anchor + varint stream),
@@ -439,19 +440,20 @@ mod tests {
 	}
 
 	#[test]
-	fn from_columns_picks_rle_for_a_regular_timestamp_series() {
+	fn from_columns_picks_bitpack_for_a_regular_timestamp_series() {
 		// A regular microsecond series delta-of-deltas to a run of zeros, so the
-		// cheaper RLE codec wins and is recorded; its cost is the 8-byte anchor + a
-		// 1-byte first delta + a single (0, 3) run (value 1B + count 1B) = 11 —
-		// below the plain-varint 12 and far below a raw 8 bytes/point.
+		// cheapest codec — fixed-width bit-packing at width 0 — wins and is recorded;
+		// its cost is the 8-byte anchor + a 1-byte first delta + a 1-byte width
+		// header = 10, below the RLE 11 and plain-varint 12, and far below raw 8
+		// bytes/point.
 		use std::str::FromStr;
 		let values: Vec<BigDecimal> = ["0.1", "0.2", "0.3", "0.4", "0.5"].iter().map(|s| BigDecimal::from_str(s).unwrap()).collect();
 		let timestamps: Vec<i64> = (0..5).map(|i| 1_000 + i * 10).collect();
 		let est = StorageEstimate::from_columns(&values, &timestamps, TimeUnit::Micros, &BigDecimal::from(0));
 		assert_eq!(est.timestamp_unit, "micros");
-		assert_eq!(est.timestamp_encoding, "delta_of_delta_rle");
-		assert_eq!(est.timestamp_bytes, 11);
-		assert!((est.timestamp_bytes_per_point - 11.0 / 5.0).abs() < f64::EPSILON);
+		assert_eq!(est.timestamp_encoding, "delta_of_delta_bitpack");
+		assert_eq!(est.timestamp_bytes, 10);
+		assert!((est.timestamp_bytes_per_point - 10.0 / 5.0).abs() < f64::EPSILON);
 		assert!((est.total_bytes_per_point - (est.bytes_per_point + est.timestamp_bytes_per_point)).abs() < f64::EPSILON);
 		// The timestamp column is far cheaper than storing raw 8-byte epochs.
 		assert!(est.timestamp_bytes_per_point < 8.0);
