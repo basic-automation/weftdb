@@ -237,9 +237,12 @@ impl IntoResponse for ApiError {
 /// Returns [`ApiError::BadRequest`] for an empty point set, a non-finite value,
 /// or an inverted range, and [`ApiError::Internal`] if the engine fails.
 pub async fn interpolate(State(metrics): State<SharedMetrics>, Json(request): Json<InterpolateRequest>) -> Result<Json<InterpolateResponse>, ApiError> {
+	let start = std::time::Instant::now();
 	metrics.record_interpolate_request();
 	let result = interpolate_inner(request).await;
 	record_outcome(&metrics, &result);
+	// Latency of every request — success and error alike — feeds the p95 target.
+	metrics.observe_interpolate_latency(start.elapsed());
 	result
 }
 
@@ -556,9 +559,12 @@ pub struct IlpParams {
 /// token, a malformed payload, fewer than two usable points, or a zero-span
 /// series, and [`ApiError::Internal`] if the engine fails.
 pub async fn interpolate_ilp(State(metrics): State<SharedMetrics>, Query(params): Query<IlpParams>, body: String) -> Result<Json<InterpolateResponse>, ApiError> {
+	let start = std::time::Instant::now();
 	metrics.record_interpolate_request();
 	let result = interpolate_ilp_inner(&params, &body).await;
 	record_outcome(&metrics, &result);
+	// The ILP path is what a TSBS-style harness drives — its latency feeds p95 too.
+	metrics.observe_interpolate_latency(start.elapsed());
 	result
 }
 
@@ -818,6 +824,21 @@ mod tests {
 			let v = p["value"].as_f64().unwrap();
 			assert!((0.0..=60.0).contains(&v), "value {v} out of [0,60]");
 		}
+	}
+
+	#[tokio::test]
+	async fn ilp_endpoint_observes_latency() {
+		use axum::body::Body;
+		use tower::ServiceExt;
+
+		let metrics = crate::SharedMetrics::default();
+		let router = crate::app_with_metrics(metrics.clone());
+		let payload = "cpu,host=a load=0 1000000000\ncpu,host=a load=60 1000000060\n";
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/interpolate/ilp?field=load&precision=s&spline=linear&resolution=seconds").header("content-type", "text/plain").body(Body::from(payload)).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		// The ILP path feeds the same interpolate latency histogram as the JSON path.
+		let snap = metrics.interpolate_latency.snapshot();
+		assert_eq!(snap.count, 1);
 	}
 
 	#[tokio::test]

@@ -224,11 +224,15 @@ pub async fn ingest_points(State(state): State<AppState>, Path(aspect): Path<Str
 	metrics.record_ingest_request();
 	let store = state.store().cloned().ok_or_else(|| { metrics.record_ingest_error(); StorageError::Unconfigured })?;
 	drop(state);
+	// Time the seal path (not the store-unconfigured fast-fail above): this is the
+	// ingest side of the north-star "predictable p95/p99 under ingest + query".
+	let start = std::time::Instant::now();
 	let result = ingest_points_inner(&store, &metrics, &aspect, request).await;
 	drop(store);
 	if result.is_err() {
 		metrics.record_ingest_error();
 	}
+	metrics.observe_ingest_latency(start.elapsed());
 	result
 }
 
@@ -381,11 +385,13 @@ pub async fn ingest_csv(State(state): State<AppState>, Path(aspect): Path<String
 	metrics.record_ingest_request();
 	let store = state.store().cloned().ok_or_else(|| { metrics.record_ingest_error(); StorageError::Unconfigured })?;
 	drop(state);
+	let start = std::time::Instant::now();
 	let result = ingest_csv_inner(&store, &metrics, &aspect, params.rows_per_page, &body).await;
 	drop(store);
 	if result.is_err() {
 		metrics.record_ingest_error();
 	}
+	metrics.observe_ingest_latency(start.elapsed());
 	result
 }
 
@@ -487,11 +493,13 @@ pub async fn ingest_ilp(State(state): State<AppState>, Path(aspect): Path<String
 	metrics.record_ingest_request();
 	let store = state.store().cloned().ok_or_else(|| { metrics.record_ingest_error(); StorageError::Unconfigured })?;
 	drop(state);
+	let start = std::time::Instant::now();
 	let result = ingest_ilp_inner(&store, &metrics, &aspect, &params, &body).await;
 	drop(store);
 	if result.is_err() {
 		metrics.record_ingest_error();
 	}
+	metrics.observe_ingest_latency(start.elapsed());
 	result
 }
 
@@ -963,6 +971,8 @@ mod tests {
 		assert_eq!(snap.ingest.errors, 0);
 		assert_eq!(snap.ingest.rows_sealed, 3);
 		assert_eq!(snap.ingest.segments_sealed, 1);
+		// The seal path fed the ingest latency histogram (one observation).
+		assert_eq!(metrics.ingest_latency.snapshot().count, 1);
 	}
 
 	#[tokio::test]
