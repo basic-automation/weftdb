@@ -41,9 +41,9 @@ pub struct Metrics {
 	pub downsample: DownsampleMetrics,
 	/// Counters for the storage-ingest endpoints (`…/points`, `…/ilp`).
 	pub ingest: IngestMetrics,
-	/// End-to-end request-handling latency for `POST /api/v1/interpolate`.
+	/// End-to-end latency for the interpolate endpoints (JSON + ILP).
 	pub interpolate_latency: LatencyHistogram,
-	/// End-to-end request-handling latency for `POST /api/v1/downsample`.
+	/// End-to-end latency for the downsample endpoints (JSON + ILP).
 	pub downsample_latency: LatencyHistogram,
 }
 
@@ -326,8 +326,8 @@ impl Metrics {
 			let _ = writeln!(out, "{name} {value}");
 		}
 		// Latency histograms — the p95/p99 surface for the north-star target.
-		self.interpolate_latency.render_prometheus(&mut out, "dsp_interpolate_duration_seconds", "End-to-end handling latency for POST /api/v1/interpolate.");
-		self.downsample_latency.render_prometheus(&mut out, "dsp_downsample_duration_seconds", "End-to-end handling latency for POST /api/v1/downsample.");
+		self.interpolate_latency.render_prometheus(&mut out, "dsp_interpolate_duration_seconds", "End-to-end handling latency for the interpolate endpoints (POST /api/v1/interpolate and /interpolate/ilp).");
+		self.downsample_latency.render_prometheus(&mut out, "dsp_downsample_duration_seconds", "End-to-end handling latency for the downsample endpoints (POST /api/v1/downsample and /downsample/ilp).");
 		out
 	}
 }

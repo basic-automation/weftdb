@@ -403,12 +403,15 @@ pub struct DownsampleIlpParams {
 /// token, a malformed payload, or fewer than one usable point, and
 /// [`ApiError::Internal`] if a timestamp cannot be mapped onto the grid.
 pub async fn downsample_ilp(State(metrics): State<SharedMetrics>, axum::extract::Query(params): axum::extract::Query<DownsampleIlpParams>, body: String) -> Result<Json<DownsampleResponse>, ApiError> {
+	let start = std::time::Instant::now();
 	metrics.record_downsample_request();
 	let result = downsample_ilp_inner(&params, &body);
 	match &result {
 		Ok(response) => metrics.add_downsample_buckets(response.0.buckets as u64),
 		Err(_) => metrics.record_downsample_error(),
 	}
+	// The ILP path is what a TSBS-style harness drives — its latency feeds p95 too.
+	metrics.observe_downsample_latency(start.elapsed());
 	result
 }
 
