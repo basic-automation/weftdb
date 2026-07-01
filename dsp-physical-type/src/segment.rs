@@ -248,7 +248,7 @@ impl Segment {
 	}
 
 	/// The name of the timestamp codec chosen for this segment
-	/// (`delta_of_delta` or `delta_of_delta_rle`); see
+	/// (`delta_of_delta`, `delta_of_delta_rle`, or `delta_of_delta_bitpack`); see
 	/// [`DeltaOfDeltaColumn::best_encoding_name`].
 	#[must_use]
 	pub fn timestamp_encoding_name(&self) -> &'static str {
