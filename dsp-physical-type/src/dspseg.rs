@@ -567,17 +567,25 @@ pub fn read_value_column(r: &mut ByteReader) -> Result<ColumnEncoding, DspSegErr
 //
 // The on-disk byte block for a `DeltaOfDeltaColumn`: a one-byte time-unit tag,
 // the full-width `i64` anchor, an optional first delta (a presence flag then a
-// signed varint), and the second-difference stream as a varint count + zig-zag
-// varints. Plain delta-of-delta is written here; run-length coding of the second
-// differences (the cheaper codec for a regular series, already chosen by
+// signed varint), the second-difference count (varint), then a codec selector
+// byte and the coded stream — either per-value zig-zag varints (`TS_CODEC_VARINT`)
+// or fixed-width bit-packing (`TS_CODEC_BITPACK`: a width byte + packed bits),
+// whichever is smaller for this stream. Run-length coding of the second
+// differences (the cheaper codec for a long constant run, chosen by
 // `best_encoding_name` for the bytes/point estimate) is a later compression slice
-// — this layer is exact and lossless either way.
+// — every codec here is exact and lossless.
 // ---------------------------------------------------------------------------
 
 const TIME_UNIT_SECONDS: u8 = 0;
 const TIME_UNIT_MILLIS: u8 = 1;
 const TIME_UNIT_MICROS: u8 = 2;
 const TIME_UNIT_NANOS: u8 = 3;
+
+/// Timestamp second-difference codec tags (the self-describing selector byte in a
+/// v3+ timestamp block).
+const TS_CODEC_VARINT: u8 = 0;
+/// Fixed-width bit-packing: a width byte then `ceil(count * width / 8)` data bytes.
+const TS_CODEC_BITPACK: u8 = 1;
 
 /// The stable one-byte on-disk tag for a [`TimeUnit`].
 const fn time_unit_tag(unit: TimeUnit) -> u8 {
@@ -601,6 +609,13 @@ const fn time_unit_from_tag(tag: u8) -> Result<TimeUnit, DspSegError> {
 }
 
 /// Write a [`DeltaOfDeltaColumn`] as a `.dspseg` timestamp-column block.
+///
+/// The second-difference stream is written under whichever of two codecs is
+/// smaller for it — fixed-width **bit-packing** (a regular or small-jitter series,
+/// where the differences fit in a few bits) or per-value **varint** — selected by
+/// a self-describing codec byte so the reader dispatches without re-deriving the
+/// choice. This realizes the bytes/point saving the estimate projects (Phase 4.2),
+/// not just reports it.
 pub fn write_timestamp_column(w: &mut ByteWriter, col: &DeltaOfDeltaColumn) {
 	w.put_u8(time_unit_tag(col.unit));
 	w.put_i64_le(col.first);
@@ -612,8 +627,18 @@ pub fn write_timestamp_column(w: &mut ByteWriter, col: &DeltaOfDeltaColumn) {
 		None => w.put_u8(0),
 	}
 	w.put_uvarint(col.dods.len() as u64);
-	for &dod in &col.dods {
-		w.put_svarint(dod);
+	if crate::timestamp::bitpack_bytes(&col.dods) < crate::timestamp::zigzag_varint_bytes(&col.dods) {
+		let (width, packed) = crate::timestamp::bitpack_encode(&col.dods);
+		w.put_u8(TS_CODEC_BITPACK);
+		// Width is 0..=64 by construction, so the conversion never saturates.
+		w.put_u8(u8::try_from(width).unwrap_or(64));
+		// Raw (no length prefix): the reader derives the length from count * width.
+		w.put_raw(&packed);
+	} else {
+		w.put_u8(TS_CODEC_VARINT);
+		for &dod in &col.dods {
+			w.put_svarint(dod);
+		}
 	}
 }
 
@@ -622,7 +647,7 @@ pub fn write_timestamp_column(w: &mut ByteWriter, col: &DeltaOfDeltaColumn) {
 ///
 /// # Errors
 ///
-/// [`DspSegError::InvalidTag`] for an unrecognised time-unit tag, or
+/// [`DspSegError::InvalidTag`] for an unrecognised time-unit or codec tag, or
 /// [`DspSegError::UnexpectedEof`] / [`DspSegError::VarintTooLong`] on a short or
 /// malformed stream.
 pub fn read_timestamp_column(r: &mut ByteReader) -> Result<DeltaOfDeltaColumn, DspSegError> {
@@ -633,10 +658,22 @@ pub fn read_timestamp_column(r: &mut ByteReader) -> Result<DeltaOfDeltaColumn, D
 		_ => Some(r.read_svarint()?),
 	};
 	let count = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
-	let mut dods = Vec::with_capacity(count);
-	for _ in 0..count {
-		dods.push(r.read_svarint()?);
-	}
+	let dods = match r.read_u8()? {
+		TS_CODEC_VARINT => {
+			let mut dods = Vec::with_capacity(count);
+			for _ in 0..count {
+				dods.push(r.read_svarint()?);
+			}
+			dods
+		}
+		TS_CODEC_BITPACK => {
+			let width = u32::from(r.read_u8()?);
+			let data_len = (count * width as usize).div_ceil(8);
+			let bytes = r.take(data_len)?;
+			crate::timestamp::bitpack_decode(width, bytes, count)
+		}
+		other => return Err(DspSegError::InvalidTag { kind: "timestamp_codec", value: other }),
+	};
 	Ok(DeltaOfDeltaColumn { first, first_delta, dods, unit })
 }
 
@@ -1145,6 +1182,32 @@ mod tests {
 		let bytes = [7_u8]; // tag 7 is not a time unit
 		let mut r = ByteReader::new(&bytes);
 		assert_eq!(read_timestamp_column(&mut r), Err(DspSegError::InvalidTag { kind: "time_unit", value: 7 }));
+	}
+
+	#[test]
+	fn regular_series_timestamp_block_bit_packs_on_disk() {
+		use crate::encode_delta_of_delta;
+		// A regular 1000-point series: second differences are all zero, so the writer
+		// picks bit-packing (width 0). The on-disk block is a handful of bytes — far
+		// below the ~1000 a per-value varint stream would spend — and still round-trips.
+		let values: Vec<i64> = (0..1_000).map(|i| 1_000 + i * 10).collect();
+		let enc = encode_delta_of_delta(&values, TimeUnit::Millis);
+		let mut w = ByteWriter::new();
+		write_timestamp_column(&mut w, &enc);
+		let bytes = w.into_vec();
+		// unit(1) + anchor(8) + first_delta flag(1)+svarint(1) + count varint(2) +
+		// codec byte(1) + width byte(1) + 0 data bytes = 15.
+		assert!(bytes.len() < 20, "regular series must bit-pack tiny: {} bytes", bytes.len());
+		let mut r = ByteReader::new(&bytes);
+		assert_eq!(read_timestamp_column(&mut r).expect("reads"), enc);
+	}
+
+	#[test]
+	fn unknown_timestamp_codec_tag_is_rejected() {
+		// unit=seconds(0), anchor i64=0 (8 bytes), first_delta flag=0, count=0, codec=99.
+		let bytes = [0_u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 99];
+		let mut r = ByteReader::new(&bytes);
+		assert_eq!(read_timestamp_column(&mut r), Err(DspSegError::InvalidTag { kind: "timestamp_codec", value: 99 }));
 	}
 
 	/// Build a segment, seal it to a `.dspseg` frame, read it back, and assert exact
