@@ -134,6 +134,12 @@ InfluxDB; full SQL/Postgres vs TimescaleDB; finance-tick dominance vs kdb+).
 TimescaleDB/IoTDB/DuckDB/kdb+?"; 3–5 design partners with interpolation-heavy
 workloads identified; willingness-to-pay hypotheses documented.
 
+**Items:**
+- [x] Public performance thesis + first benchmark-claim list *(the [Commercial thesis](#commercial-thesis--positioning) section)*
+- [x] Define what DSP is **not** chasing first
+- [ ] Identify 3–5 design partners with interpolation-heavy workloads
+- [ ] Document willingness-to-pay hypotheses
+
 ### Phase 1 — Build `DSP-Bench` · 4–8 wks · *Highest priority*
 
 A `dsp-bench` workspace that is both an internal engineering suite and a
@@ -186,6 +192,22 @@ methodology before numbers; no hard-coded shortcuts; run customer-supplied workl
 benchmark code separate from engine code; correctness validation gates every number.
 README policy line: *"DSP benchmarks guide real engineering decisions, not synthetic
 wins."*
+
+**Items:**
+- [x] `dsp-bench` first-class workspace member (builds + tests green)
+- [x] First workload profile: `interpolation-heavy-irregular` (seeded, reproducible generator)
+- [x] DSP adapter over the vendor-neutral `SystemAdapter` trait (drives `splimes`)
+- [x] Portable baselines — linear (fair-protocol class C) + forward-fill (class B)
+- [x] Accuracy scoring vs analytic ground truth (RMSE/MAE/max-error/bias)
+- [x] Shape-selectable synthetic truth (`MultiSine`/`Sawtooth`/`Step`/`DampedSine`)
+- [x] Latency stats — p50/p95/p99 + min/max/mean/stddev + bootstrap CIs
+- [x] Harness-level timing breakdown (`BenchResult.timing`)
+- [x] JSON report output
+- [ ] External-engine adapters — DuckDB, ClickHouse, InfluxDB 3, QuestDB, TimescaleDB (+ IoTDB)
+- [ ] Full TSBS-compatible comparison harness (ILP parser shipped; harness pending)
+- [ ] Fair-protocol depth — ≥10 reps, cold/warm/hot/post-restart separation, saturation curves, seeded query mixes, failure tests
+- [ ] Report surfaces beyond JSON — Parquet / HTML / Grafana dashboards
+- [ ] Anti-Goodhart: publish negative results + DSP-losing workloads
 
 ### Phase 2 — Benchmark-grade server/API · 3–6 wks · *Very high*
 
@@ -292,6 +314,22 @@ secondary (demos/debugging); API responses distinguish raw / interpolated /
 extrapolated / compressed / reconstructed values *(this also delivers the
 synthetic-point marking nuance — see backlog item B-tags)*.
 
+**Items:**
+- [x] `axum` server skeleton — `/health`, `/ready`, Prometheus `/metrics`
+- [x] Flagship `POST /api/v1/interpolate` over the `splimes` engine
+- [x] InfluxDB-Line-Protocol ingest — `POST /api/v1/interpolate/ilp`
+- [x] Downsample/aggregation query — `POST /api/v1/downsample` (+ `…/ilp`)
+- [x] Single-instant point query — `POST /api/v1/interpolate/point` (raw/interpolated/extrapolated labelling)
+- [x] Stored-range read surface — Arrow IPC `…/storage/{aspect}/range` + `…/value-range`, JSON `…/points`, `…/storage/aspects`/`…/stats` (bytes/point)
+- [x] HTTP catalog management + ingest — declare aspect schema; JSON/ILP/Parquet/CSV batch ingest; `…/storage/catalog`; no-silent-downcast enforced (`400` on unrepresentable)
+- [x] B-rest pagination — `offset`/`limit`/`take`/`page` + `total`/`count` on `…/points` and `…/value-points`
+- [x] Parquet interchange — `…/range.parquet` / `…/value-range.parquet` export + `POST …/parquet` ingest
+- [x] CSV interchange — stored-range export/ingest + compute-endpoint CSV output
+- [x] Columnar output for compute endpoints — Arrow IPC + Parquet for `interpolate`/`downsample` (+ every ILP sibling)
+- [ ] OpenTelemetry trace export (paired with Prometheus `/metrics`)
+- [ ] Python SDK → Rust SDK → Arrow Flight / Flight SQL → SQL surface / DataFusion (later)
+- [ ] Grafana → Prometheus remote write/read (if monitoring) → R/Arrow workflows
+
 ### Phase 3 — Instrument everything · 2–4 wks · *Very high*
 
 Before optimizing, make bottlenecks visible. Tracing spans for: request parse · auth
@@ -304,9 +342,16 @@ serialization. Expose `/metrics`, `/debug/profile/current`, `/bench/runs/:id`,
 went (e.g. "52% value parsing, 18% segment read, 15% GPU transfer, 8% kernel, 7%
 JSON").
 
+**Items:**
+- [x] Prometheus `/metrics` surface
+- [x] Harness-level timing breakdown (dataset-gen + adapter + whole-run spans)
+- [ ] Full tracing spans across ingest → GPU → serialization (parse · decode · BigDecimal/encoding convert · WAL append · libSQL write · segment write · commit · index update · range read · page skip · cache hit/miss · decompression · CPU interp · GPU upload/queue/kernel/readback · serialize)
+- [ ] `Statement::n_change()` write accounting (Turso 0.6) in ingest/instrumentation spans
+- [ ] Debug/profile endpoints — `/debug/profile/current`, `/bench/runs/:id`
+
 ### Phase 4 — Hot path: physical types & Storage v2 · 8–12 wks · *High*
 
-- **4.1 Physical numeric encodings** (per aspect): `F32`, `F64`, `ScaledI64`,
+- [x] **4.1 Physical numeric encodings** (per aspect): `F32`, `F64`, `ScaledI64`,
   `ScaledI128`, `Decimal128`, `BigDecimalText` — each declaring storage encoding,
   compression/GPU/interpolation eligibility, exactness guarantees, conversion
   behavior. *(Started — the vendor-neutral **`dsp-physical-type`** crate ships
@@ -329,7 +374,7 @@ JSON").
   value, `SealError::ToleranceExceeded` when the declared encoding would lose
   more precision than the schema permits (hard constraint #4, enforced). Still
   to do here: the Storage v2 segment store wiring that consumes the declaration.)*
-- **4.2 Timestamp semantics:** integer epoch internally (ns/µs as needed), explicit
+- [ ] **4.2 Timestamp semantics:** integer epoch internally (ns/µs as needed), explicit
   tz + leap-second policy, monotonic ordering; delta / delta-of-delta / bit-pack / RLE.
   *(Started — `dsp-physical-type::timestamp` ships lossless **delta** and
   **delta-of-delta** transforms over `i64` epochs (`TimeUnit` = seconds/millis/
@@ -338,7 +383,7 @@ JSON").
   selector (varint vs RLE, whichever is smaller). A regular 1000-point column
   packs to ~12 bytes total. The bench timestamp bytes/point uses this. Still to
   do: bit-packing, explicit tz + leap-second policy, monotonic-order enforcement.)*
-- **4.3 Columnar segment store** (`AspectStorageMode::{LibSqlRows, SegmentedColumnar,
+- [x] **4.3 Columnar segment store** (`AspectStorageMode::{LibSqlRows, SegmentedColumnar,
   Hybrid}`): append-friendly, immutable-after-seal, compactable, checksummed,
   page-indexed, random-access. Layout: `catalog.db` + per-aspect `metadata.db`,
   `segments/*.dspseg`, `segment_index.db`. Per-segment: timestamp/value/quality
@@ -445,7 +490,7 @@ JSON").
   rollups into the subject-wide north-star bytes/point (`StoreStorageStats`),
   control-plane only and without opening a segment. Still to do here:
   Arrow/Parquet interchange.)*
-- **4.4 Data skipping** (time/value/tag/quality pruning, page skipping).
+- [ ] **4.4 Data skipping** (time/value/tag/quality pruning, page skipping).
   *(Started — segment-level pruning on `dsp-physical-type::Segment`:
   `overlaps_time`/`contains_timestamp` and `may_contain_value` (conservative —
   `false` only when safe to skip), plus `prune_by_time`/`prune_by_value`
@@ -461,7 +506,7 @@ JSON").
   `present_count_in_range` add the quality-aware page-level mirror (skip all-null
   pages too). Still to do: **tag** pruning (per-measurement tags/labels — backlog
   B-tags — do not exist yet, so tag-based skipping has nothing to prune on).)*
-- **4.5 Arrow-compatible arrays** (eases Python/Flight/DataFusion/Parquet).
+- [x] **4.5 Arrow-compatible arrays** (eases Python/Flight/DataFusion/Parquet).
   *(Started — the vendor-neutral **`dsp-arrow`** crate ships the Apache Arrow
   interchange for a sealed `dsp-physical-type` `Segment`/`PagedSegment`, kept in
   its own leaf crate (depends on `dsp-physical-type`, never the reverse) so the
@@ -520,7 +565,7 @@ JSON").
   endpoints expose all three over HTTP. The typed exact-`Decimal128` and text
   paths stay byte-faithful (hard constraint #4). Phase-4.5 Arrow/Parquet
   interchange is now complete.)*
-- **4.6 Correctness semantics:** out-of-order/late data, dedup, upsert, idempotent
+- [ ] **4.6 Correctness semantics:** out-of-order/late data, dedup, upsert, idempotent
   batch ingest, clock skew, precision, tz parsing, leap seconds, query consistency
   during compaction, read-your-writes, snapshot isolation.
 
@@ -546,6 +591,18 @@ defer multi-GPU until single-GPU wins are proven. GPU benchmarks must be **end-t
 (storage read → decode → filter → Decimal convert → transfer → queue wait → kernel →
 readback → serialize); a kernel-only speedup is not commercially credible.
 
+**Items:**
+- [x] Interpolation/extrapolation capability — linear/quadratic/cubic/polynomial on CPU, SIMD, and GPU (`Outputs::analyze_range`/`analyze_point`)
+- [x] GPU infra Phases 1–4 — buffer pool, staging buffers, async-handle scaffold, config presets *(see [GPU detail](#gpu-acceleration-detail))*
+- [ ] 5.1 Command batching
+- [ ] 5.2 True async GPU handles (non-blocking; CPU parse/read overlaps GPU)
+- [ ] 5.3 CPU/GPU overlap (chunked read → decode → upload → kernel → stream output)
+- [ ] 5.4 Hardware auto-tuning (calibrate CPU/GPU throughput, transfer cost, break-even sizes; auto-select)
+- [ ] 5.5 GPU economics (cloud cost, CPU-only fallback, utilization/contention/cold-start, NVIDIA/AMD/Intel/Apple portability)
+- [ ] 5.6 wgpu/WGSL portability & determinism (conformance matrix, numerical drift, published tolerances)
+- [ ] 5.7 Multi-GPU *(deferred until single-GPU wins are proven)*
+- [ ] End-to-end GPU interpolation benchmark (storage read → … → API serialization, with p95)
+
 **Acceptance:** publishable claim like *"on hardware X, DSP produces Y M interpolated
 points/sec for irregular cubic interpolation including storage read, decode, GPU
 transfer, kernel, readback, and API serialization, p95 = Z."* (See
@@ -554,18 +611,18 @@ transfer, kernel, readback, and API serialization, p95 = Z."* (See
 
 ### Phase 6 — Compression v2 · 8–12 wks · *High*
 
-- **6.1 Lossless typed codecs:** timestamp delta/delta-of-delta; scaled-int bit
+- [ ] **6.1 Lossless typed codecs:** timestamp delta/delta-of-delta; scaled-int bit
   packing; RLE for regular intervals; Gorilla/Chimp-style f64; ALP-inspired
   vectorized f64; Decimal128/scaled-int codecs; **block-level random access**.
   *(Check codec patents/licenses before embedding.)*
-- **6.2 Model-based compression** (leverages DSP's spline DNA, NeaTS-like): piecewise
+- [ ] **6.2 Model-based compression** (leverages DSP's spline DNA, NeaTS-like): piecewise
   linear / spline / polynomial / nonlinear approximation with bounded residuals;
   lossless-residual option; lossy with max-error guarantee; extrema-preserving mode.
-- **6.3 Late/compressed-domain execution:** min/max/count from metadata; predicate
+- [ ] **6.3 Late/compressed-domain execution:** min/max/count from metadata; predicate
   eval before decompression; interpolate directly from model segments; event
   detection over compressed summaries; CPU filter before GPU transfer. (More practical
   near-term than GPU-initiated storage IO.)
-- **6.4 Quality benchmarks:** bytes/point, compress/decompress throughput, random-
+- [ ] **6.4 Quality benchmarks:** bytes/point, compress/decompress throughput, random-
   access + range latency, interpolation-after-compression, RMSE/MAE/max-error/bias,
   extrema preservation, event-detection stability, forecasting impact.
 
@@ -574,18 +631,18 @@ detection within Y% and improving historical query latency by Z."*
 
 ### Phase 7 — Online perf, durability, correctness · 6–10 wks · *High for beta*
 
-- **7.1 Online ingest:** scheduled polling daemon, runtime source registration, retry
+- [ ] **7.1 Online ingest:** scheduled polling daemon, runtime source registration, retry
   buffer, backpressure, idempotency ledger, at-least-once, dedup/upsert, late-arrival
   policy. *(Maps backlog items B-poll, B-retry, B-register, B-dedup.)*
-- **7.2 WAL & crash consistency:** WAL design, segment-seal protocol, atomic catalog
+- [ ] **7.2 WAL & crash consistency:** WAL design, segment-seal protocol, atomic catalog
   updates, recovery, partial-write handling, fsync policy, durability modes.
-- **7.3 Corruption detection:** segment/page checksums, catalog checks, startup
+- [ ] **7.3 Corruption detection:** segment/page checksums, catalog checks, startup
   verification, repair tooling.
-- **7.4 Backup/restore:** online backup, PITR if feasible, verification, drills,
+- [ ] **7.4 Backup/restore:** online backup, PITR if feasible, verification, drills,
   documented RPO/RTO.
-- **7.5 Compaction:** scheduling, query consistency during compaction, resource
+- [ ] **7.5 Compaction:** scheduling, query consistency during compaction, resource
   limits, metrics, cancellation, priority.
-- **7.6 Quotas/limits:** tenant/disk/memory/request-size/query-timeout/GPU-memory.
+- [ ] **7.6 Quotas/limits:** tenant/disk/memory/request-size/query-timeout/GPU-memory.
 
 **Acceptance:** a 24-hour run sustains continuous ingest + concurrent interpolation +
 range scans + compression + compaction + late arrivals + simulated failures + restart/
@@ -605,6 +662,14 @@ codec licenses, customer-data handling, trademark use).
 **Acceptance:** a design partner can deploy DSP, ingest, run DSP-Bench, inspect
 metrics, recover from a restart, and file useful support tickets.
 
+**Items:**
+- [ ] Security — TLS, API keys/token auth, basic RBAC, service accounts, secrets, encryption at rest, audit logs, vuln process
+- [ ] Compliance readiness — SOC 2, HIPAA (where targeted), GDPR delete/export, retention, tenant isolation
+- [ ] Packaging — static binaries, Docker, Compose, Helm (later), systemd, config schema, migration/upgrade/rollback
+- [ ] Observability — Prometheus, Grafana, OTel, structured logs, bench dashboard, query profiles
+- [ ] SDKs — Rust → Python → TypeScript → R/Arrow
+- [ ] Licensing/legal — open-core vs commercial, comparative-benchmark terms, kdb+ restrictions, dependency + codec licenses, customer-data handling, trademark use
+
 ### Phase 9 — Analytics premium · after benchmark foundation · *Medium*
 
 Keep the pattern/event/signal roadmap but don't let it block the benchmark-first
@@ -615,6 +680,14 @@ correlation/signal benchmarking → per-stage audit trail. *(Maps backlog Themes
 temporal point processes, forecasting export, embedding search over shape summaries)
 are **future integrations, not the first identity** — do not prematurely rebrand as a
 vector DB.
+
+**Items:**
+- [ ] Sliding windows → overlapping windows → event-centered windows
+- [ ] Resample-before-compare
+- [ ] Pattern dedup → occurrence-distance constraints
+- [ ] Correlation / signal benchmarking
+- [ ] Per-stage audit trail
+- [ ] *(Future)* ML/AI — self-supervised event prediction, causal anomaly detection, temporal point processes, forecasting export, embedding search over shape summaries
 
 **Commercial tiers:** *DSP Core* (storage/query/interpolation/compression/benchmarks)
 · *DSP Accelerated* (GPU) · *DSP Analytics* (pattern/event/signal) · *DSP Enterprise*
@@ -645,25 +718,24 @@ core engine wins.
 ## Predecessor-derived backlog
 
 The concrete items mined from the 15 archived repos, **re-mapped to the phases above**.
-Status: 🔴 absent · 🟡 partial/verify · 🟢 exists, enhance · ✅ done.
+A checked box = shipped; an unchecked box carries its residual status inline
+(`partial`/`absent`/`verify`).
 
-| ID | Item | Status | Phase | Source |
-|----|------|--------|-------|--------|
-| B-tags | **Per-measurement tags/labels** (incl. `interpolated=true`/provenance) — `measurement.rs` has none. | 🔴 | 2/4 | `DSM-Database`, `DSM-Measurement` |
-| B-conn | **Vendor-neutral connector trait + registry** (core). | 🔴 | 2/7 | `dsm-source`, `dsm-asset` |
-| B-ilp | **InfluxDB Line Protocol ingest** (and ILP/Influx **interop** connector, separate crate — *not* a storage swap). | 🟡 | 2 | `dsm-influxdb`, `dsm-batch` |
-| B-rest | **REST facade** + **declarative query-params** (`range`/`take`/`count`/`page`/`interpolation`) + **pagination**. *(🟡 partial: `dsp-server` serves range (`start`/`end`) + **pagination** (`offset`/`limit`/`take`/`page` + `total`/`count`) on `…/points` **and** `…/value-points` (JSON value-range read); `interpolation` alias + cursor paging still to do.)* | 🟡 | 2 | `DSM-Database` |
-| B-poll | **Scheduled polling daemon** (per-source interval) + **B-retry** at-least-once retry buffer + **B-register** runtime source registration. | 🔴 | 7 | `DSM-Input-Module` |
-| B-interp | **Interpolate-on-read, single-instant lookup, out-of-range extrapolation.** | ✅ | 5 | `splimes` / `database` (already implemented) |
-| B-analysis | **Per-point analysis model** (signed neighbor distance, slope-segmented trends, max-normalized relative vectors) — verify `Trend`/`Relative`/`MeasurementVector`/`Analysis` are wired end-to-end. | 🟡 | 4/9 | `dataset_management`, `DSM-Measurement` |
-| B-object | **Schemaless object/annotation store** beside numeric aspects. | 🔴 | 4 | `DSM-Database` |
-| B-windows | **Sliding/overlapping + event-centered windows**; **multi-resolution horizon fan-out**; **min-density validation**; **config-driven batching policy**. | 🔴/🟡 | 9 | `dsm-batch`, `DSM-Batcher` |
-| B-dedup | **Event-UUID idempotency ledger** + delete-after-success queue. | 🟡 | 7 | `dsm-batch`, `DSM-Batcher` |
-| B-sim | **Full variability-metric matrix** (`static`/`absolute_static`/`percentage`/`absolute_percentage` × `Max`/`Avg`/`Sum`); **fixed-point dictionary dedup**; **occurrence-distance constraint**; **resample-before-compare** (wire to `splimes`). | 🟡 | 9 | `DSM-Pattern` |
-| B-precision | **`BigDecimal` math audit** (no float drift in pattern coords); **improved `simplify`** (local-extrema). | 🟡 | 4/6 | `DSM-Batch-v2` |
-| B-resilience | **Write retry (backoff+jitter)** + **size-tiered write selector**; **interpolation window extension** (±N steps). | 🟡 | 4/7 | `legacy/database` |
-| B-msgpack | **MessagePack** for queued artifacts (vs JSON). | 🔴 | 6 | `dsm-batch` |
-| B-snapshot | **Pipeline state-snapshot audit trail** (before/after JSON per stage). | 🔴 | 3/9 | `DSM-Log`, `DSM-Batch-v2` |
+- [ ] **B-tags** *(Phase 2/4 · absent)* — Per-measurement tags/labels (incl. `interpolated=true`/provenance); `measurement.rs` has none. *(src: `DSM-Database`, `DSM-Measurement`)*
+- [ ] **B-conn** *(Phase 2/7 · absent)* — Vendor-neutral connector trait + registry (core). *(src: `dsm-source`, `dsm-asset`)*
+- [ ] **B-ilp** *(Phase 2 · partial)* — InfluxDB Line Protocol ingest shipped (parser + endpoints); the ILP/Influx **interop** connector crate (not a storage swap) is still to do. *(src: `dsm-influxdb`, `dsm-batch`)*
+- [ ] **B-rest** *(Phase 2 · partial)* — REST facade + declarative query-params + pagination. `dsp-server` serves range (`start`/`end`) + pagination (`offset`/`limit`/`take`/`page` + `total`/`count`) on `…/points` **and** `…/value-points`; `interpolation` alias + cursor paging still to do. *(src: `DSM-Database`)*
+- [ ] **B-poll / B-retry / B-register** *(Phase 7 · absent)* — Scheduled polling daemon (per-source interval) + at-least-once retry buffer + runtime source registration. *(src: `DSM-Input-Module`)*
+- [x] **B-interp** *(Phase 5)* — Interpolate-on-read, single-instant lookup, out-of-range extrapolation. *(src: `splimes`/`database` — implemented)*
+- [ ] **B-analysis** *(Phase 4/9 · verify)* — Per-point analysis model (signed neighbor distance, slope-segmented trends, max-normalized relative vectors); verify `Trend`/`Relative`/`MeasurementVector`/`Analysis` wired end-to-end. *(src: `dataset_management`, `DSM-Measurement`)*
+- [ ] **B-object** *(Phase 4 · absent)* — Schemaless object/annotation store beside numeric aspects. *(src: `DSM-Database`)*
+- [ ] **B-windows** *(Phase 9 · absent/partial)* — Sliding/overlapping + event-centered windows; multi-resolution horizon fan-out; min-density validation; config-driven batching policy. *(src: `dsm-batch`, `DSM-Batcher`)*
+- [ ] **B-dedup** *(Phase 7 · partial)* — Event-UUID idempotency ledger + delete-after-success queue. *(src: `dsm-batch`, `DSM-Batcher`)*
+- [ ] **B-sim** *(Phase 9 · partial)* — Full variability-metric matrix (`static`/`absolute_static`/`percentage`/`absolute_percentage` × `Max`/`Avg`/`Sum`); fixed-point dictionary dedup; occurrence-distance constraint; resample-before-compare (wire to `splimes`). *(src: `DSM-Pattern`)*
+- [ ] **B-precision** *(Phase 4/6 · partial)* — `BigDecimal` math audit (no float drift in pattern coords); improved `simplify` (local-extrema). *(src: `DSM-Batch-v2`)*
+- [ ] **B-resilience** *(Phase 4/7 · partial)* — Write retry (backoff+jitter) + size-tiered write selector; interpolation window extension (±N steps). *(src: `legacy/database`)*
+- [ ] **B-msgpack** *(Phase 6 · absent)* — MessagePack for queued artifacts (vs JSON). *(src: `dsm-batch`)*
+- [ ] **B-snapshot** *(Phase 3/9 · absent)* — Pipeline state-snapshot audit trail (before/after JSON per stage). *(src: `DSM-Log`, `DSM-Batch-v2`)*
 
 ### Archived source map
 
@@ -882,12 +954,12 @@ redistributed. *For commercial trust, be more transparent than competitors.*
 
 ## Immediate next actions
 
-1. ✅ Create `dsp-bench` as a first-class workspace member. *(Scaffold landed:
+- [x] Create `dsp-bench` as a first-class workspace member. *(Scaffold landed:
    library crate wired into the workspace, builds + tests green.)*
-2. ✅ Define the first benchmark profile: `interpolation-heavy-irregular`.
+- [x] Define the first benchmark profile: `interpolation-heavy-irregular`.
    *(Seeded, reproducible dataset generator + workload profile in
    `dsp-bench/src/profile.rs`.)*
-3. 🟡 Add DSP and DuckDB adapters. *(DSP adapter implemented against the
+- [ ] Add DSP and DuckDB adapters. *(DSP adapter implemented against the
    vendor-neutral `SystemAdapter` trait, driving `splimes::auto_interpolate`. Two
    portable in-process baselines now stand beside it: **`BaselineLinearAdapter`**
    (`dsp-bench/src/baseline_adapter.rs`) — the fair-protocol class-(C) client-side
@@ -910,8 +982,8 @@ redistributed. *For commercial trust, be more transparent than competitors.*
    but on the `sawtooth` the portable linear baseline out-accuracies the cubic
    (which overshoots the sharp discontinuities) — surfaced, not hidden. The
    external-engine DuckDB adapter — a real database baseline — is still to do.)*
-4. Add ClickHouse, InfluxDB 3, QuestDB, TimescaleDB adapters.
-5. ✅ Implement InfluxDB Line Protocol ingest. *(ILP **format parser** lives in
+- [ ] Add ClickHouse, InfluxDB 3, QuestDB, TimescaleDB adapters.
+- [x] Implement InfluxDB Line Protocol ingest. *(ILP **format parser** lives in
    the shared, vendor-neutral **`dsp-line-protocol`** crate (extracted from
    `dsp-bench` so the harness and the server speak one dialect): `parse` →
    `LineRecord`s and `parse_points` → sorted `splimes::Point`s for a chosen
@@ -925,16 +997,16 @@ redistributed. *For commercial trust, be more transparent than competitors.*
    **`dsp-server`** crate ingests an ILP payload (body = `text/plain`,
    field/precision/spline/resolution as query params) and interpolates it
    through the shared engine path — the Phase-2 server-side ILP ingest endpoint.)*
-6. 🟡 Add end-to-end timing spans. *(Harness-level spans landed:
+- [ ] Add end-to-end timing spans. *(Harness-level spans landed:
    `TimingBreakdown` in `dsp-bench/src/schema.rs` records dataset-generation
    cost, the summed measured adapter calls, and the whole-run span, wired into
    `run_profile` → `BenchResult.timing` (schema v3, back-compatible). Deeper
    per-pipeline-stage spans belong to the instrumentation track.)*
-7. ✅ Add p50/p95/p99 + confidence-interval reporting. *(p50/p95/p99 +
+- [x] Add p50/p95/p99 + confidence-interval reporting. *(p50/p95/p99 +
    min/max/mean/stddev and seeded **bootstrap confidence intervals**
    (`LatencyStats::bootstrap_cis`, wired into `run_profile` →
    `BenchResult.latency_ci`) landed in `dsp-bench/src/stats.rs`.)*
-8. ✅ Add physical value types for at least `F64`, `ScaledI64`,
+- [x] Add physical value types for at least `F64`, `ScaledI64`,
    `BigDecimalText`. *(Delivered and exceeded: the vendor-neutral
    **`dsp-physical-type`** crate ships all six Phase-4.1 `PhysicalType`
    encodings — `F64`, `F32`, `ScaledI64`, `ScaledI128`, `Decimal128`,
@@ -946,14 +1018,14 @@ redistributed. *For commercial trust, be more transparent than competitors.*
    `recommend_encoding` that picks the narrowest hot-path encoding within an
    error tolerance. `BigDecimal` remains the logical/API type. 27 tests; 0
    clippy warnings under pedantic+nursery.)*
-9. ✅ Prototype columnar segment reads for one aspect type. *(Delivered:
+- [x] Prototype columnar segment reads for one aspect type. *(Delivered:
    `database::SegmentStore` seals an aspect's batches to typed columnar
    `.dspseg` files (single-block and paged) and reads them back through the
    libSQL `SegmentIndexStore` — `read_time_range` prunes segments by time in
    SQL and opens only the overlapping files (paged frames skip pages within a
    file too), `read_value_range` prunes by value via the resident
    `SegmentIndex`. See Phase 4.3.)*
-10. Publish a methodology document **before** any performance claim.
+- [ ] Publish a methodology document **before** any performance claim.
 
 > The key commercial move is not adding features — it is making DSP's performance
 > claims measurable, reproducible, and valuable to a specific buyer. If DSP can
