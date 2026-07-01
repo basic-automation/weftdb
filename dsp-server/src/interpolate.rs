@@ -348,6 +348,35 @@ fn response_columns(response: &InterpolateResponse) -> (Vec<i64>, Vec<f64>, Vec<
 	(timestamps, values, kinds)
 }
 
+/// Render an [`InterpolateResponse`] as an **Arrow IPC stream**
+/// (`application/vnd.apache.arrow.stream`).
+///
+/// Shared by the JSON and ILP Arrow handlers so both emit the identical
+/// self-describing `timestamp`/`value`/`kind` batch. All `arrow-*` knowledge stays
+/// inside `dsp-arrow`; this hands it only primitive columns.
+///
+/// # Errors
+///
+/// Returns [`ApiError::Internal`] if the Arrow encoding fails.
+fn interpolate_response_to_arrow(response: &InterpolateResponse) -> Result<Response, ApiError> {
+	let (timestamps, values, kinds) = response_columns(response);
+	let bytes = dsp_arrow::reconstructed_series_to_ipc_bytes(dsp_physical_type::TimeUnit::Nanos, &timestamps, &values, &kinds).map_err(|err| ApiError::internal(err.to_string()))?;
+	Ok(([(header::CONTENT_TYPE, ARROW_STREAM_CONTENT_TYPE)], bytes).into_response())
+}
+
+/// Render an [`InterpolateResponse`] as an **Apache Parquet** file
+/// (`application/vnd.apache.parquet`). The Parquet counterpart of
+/// [`interpolate_response_to_arrow`], shared by the JSON and ILP handlers.
+///
+/// # Errors
+///
+/// Returns [`ApiError::Internal`] if the Parquet encoding fails.
+fn interpolate_response_to_parquet(response: &InterpolateResponse) -> Result<Response, ApiError> {
+	let (timestamps, values, kinds) = response_columns(response);
+	let bytes = dsp_arrow::reconstructed_series_to_parquet_bytes(dsp_physical_type::TimeUnit::Nanos, &timestamps, &values, &kinds).map_err(|err| ApiError::internal(err.to_string()))?;
+	Ok(([(header::CONTENT_TYPE, PARQUET_CONTENT_TYPE)], bytes).into_response())
+}
+
 /// Handle `POST /api/v1/interpolate/arrow`: the Arrow-IPC-output sibling of
 /// [`interpolate`].
 ///
@@ -368,10 +397,7 @@ pub async fn interpolate_arrow(State(metrics): State<SharedMetrics>, Json(reques
 	metrics.record_interpolate_request();
 	let result = interpolate_inner(request).await;
 	record_outcome(&metrics, &result);
-	let response = result?.0;
-	let (timestamps, values, kinds) = response_columns(&response);
-	let bytes = dsp_arrow::reconstructed_series_to_ipc_bytes(dsp_physical_type::TimeUnit::Nanos, &timestamps, &values, &kinds).map_err(|err| ApiError::internal(err.to_string()))?;
-	Ok(([(header::CONTENT_TYPE, ARROW_STREAM_CONTENT_TYPE)], bytes).into_response())
+	interpolate_response_to_arrow(&result?.0)
 }
 
 /// Handle `POST /api/v1/interpolate/parquet`: the Parquet-output sibling of
@@ -393,10 +419,7 @@ pub async fn interpolate_parquet(State(metrics): State<SharedMetrics>, Json(requ
 	metrics.record_interpolate_request();
 	let result = interpolate_inner(request).await;
 	record_outcome(&metrics, &result);
-	let response = result?.0;
-	let (timestamps, values, kinds) = response_columns(&response);
-	let bytes = dsp_arrow::reconstructed_series_to_parquet_bytes(dsp_physical_type::TimeUnit::Nanos, &timestamps, &values, &kinds).map_err(|err| ApiError::internal(err.to_string()))?;
-	Ok(([(header::CONTENT_TYPE, PARQUET_CONTENT_TYPE)], bytes).into_response())
+	interpolate_response_to_parquet(&result?.0)
 }
 
 /// Handle `POST /api/v1/interpolate/csv`: the CSV-output sibling of
@@ -537,6 +560,58 @@ pub async fn interpolate_ilp(State(metrics): State<SharedMetrics>, Query(params)
 	let result = interpolate_ilp_inner(&params, &body).await;
 	record_outcome(&metrics, &result);
 	result
+}
+
+/// Handle `POST /api/v1/interpolate/ilp/csv`: the CSV-output sibling of
+/// [`interpolate_ilp`].
+///
+/// Identical ILP parsing, projection, and engine path as [`interpolate_ilp`], but
+/// serves the reconstructed series as a `timestamp,value,kind` CSV document. Rounds
+/// the ILP compute path out to the same output-format set the JSON path offers
+/// (JSON / CSV / Arrow / Parquet), so a TSBS-style harness feeding line protocol can
+/// pull results in any of them.
+///
+/// # Errors
+///
+/// As [`interpolate_ilp`].
+pub async fn interpolate_ilp_csv(State(metrics): State<SharedMetrics>, Query(params): Query<IlpParams>, body: String) -> Result<Response, ApiError> {
+	metrics.record_interpolate_request();
+	let result = interpolate_ilp_inner(&params, &body).await;
+	record_outcome(&metrics, &result);
+	Ok(interpolate_response_to_csv(&result?.0))
+}
+
+/// Handle `POST /api/v1/interpolate/ilp/arrow`: the Arrow-IPC-output sibling of
+/// [`interpolate_ilp`].
+///
+/// Identical ILP path as [`interpolate_ilp`], serving the reconstructed series as an
+/// **Arrow IPC stream** (`application/vnd.apache.arrow.stream`). The line-protocol
+/// on-ramp to columnar interpolation output.
+///
+/// # Errors
+///
+/// As [`interpolate_ilp`], plus [`ApiError::Internal`] on an Arrow-encoding failure.
+pub async fn interpolate_ilp_arrow(State(metrics): State<SharedMetrics>, Query(params): Query<IlpParams>, body: String) -> Result<Response, ApiError> {
+	metrics.record_interpolate_request();
+	let result = interpolate_ilp_inner(&params, &body).await;
+	record_outcome(&metrics, &result);
+	interpolate_response_to_arrow(&result?.0)
+}
+
+/// Handle `POST /api/v1/interpolate/ilp/parquet`: the Parquet-output sibling of
+/// [`interpolate_ilp`].
+///
+/// Identical ILP path as [`interpolate_ilp`], serving the reconstructed series as an
+/// **Apache Parquet** file (`application/vnd.apache.parquet`).
+///
+/// # Errors
+///
+/// As [`interpolate_ilp`], plus [`ApiError::Internal`] on a Parquet-encoding failure.
+pub async fn interpolate_ilp_parquet(State(metrics): State<SharedMetrics>, Query(params): Query<IlpParams>, body: String) -> Result<Response, ApiError> {
+	metrics.record_interpolate_request();
+	let result = interpolate_ilp_inner(&params, &body).await;
+	record_outcome(&metrics, &result);
+	interpolate_response_to_parquet(&result?.0)
 }
 
 async fn interpolate_ilp_inner(params: &IlpParams, body: &str) -> Result<Json<InterpolateResponse>, ApiError> {
@@ -950,6 +1025,60 @@ mod tests {
 	#[tokio::test]
 	async fn interpolate_arrow_empty_points_is_bad_request() {
 		let (status, _content_type, _bytes) = post_json_for_bytes("/api/v1/interpolate/arrow", serde_json::json!({ "points": [] })).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST);
+	}
+
+	/// POST a text (ILP) body and return `(status, content-type, raw bytes)`.
+	async fn post_text_for_bytes(uri: &str, body: &str) -> (StatusCode, String, Vec<u8>) {
+		let response = app().oneshot(Request::builder().method("POST").uri(uri).header("content-type", "text/plain").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+		let status = response.status();
+		let content_type = response.headers().get("content-type").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		(status, content_type, bytes.to_vec())
+	}
+
+	const ILP_RAMP: &str = "cpu,host=a load=0 1000000000\ncpu,host=a load=60 1000000060\n";
+
+	#[tokio::test]
+	async fn interpolate_ilp_csv_serves_a_series() {
+		let (status, content_type, bytes) = post_text_for_bytes("/api/v1/interpolate/ilp/csv?field=load&precision=s&spline=linear&resolution=seconds", ILP_RAMP).await;
+		assert_eq!(status, StatusCode::OK);
+		assert_eq!(content_type, "text/csv; charset=utf-8");
+		let text = String::from_utf8(bytes).unwrap();
+		assert_eq!(text.lines().next(), Some("timestamp,value,kind"));
+		assert!(text.contains(",raw"));
+	}
+
+	#[tokio::test]
+	async fn interpolate_ilp_arrow_serves_a_batch() {
+		let (status, content_type, bytes) = post_text_for_bytes("/api/v1/interpolate/ilp/arrow?field=load&precision=s&spline=linear&resolution=seconds", ILP_RAMP).await;
+		assert_eq!(status, StatusCode::OK);
+		assert_eq!(content_type, "application/vnd.apache.arrow.stream");
+		let batches = dsp_arrow::read_ipc_stream(&bytes).expect("valid arrow ipc");
+		let (unit, timestamps, values, kinds) = dsp_arrow::reconstructed_series_from_record_batch(&batches[0]).expect("reads back");
+		assert_eq!(unit, dsp_physical_type::TimeUnit::Nanos);
+		assert_eq!(timestamps.len(), values.len());
+		assert_eq!(kinds.first().map(String::as_str), Some("raw"));
+		for v in &values {
+			assert!((0.0..=60.0).contains(v), "value {v} out of [0,60]");
+		}
+	}
+
+	#[tokio::test]
+	async fn interpolate_ilp_parquet_serves_a_file() {
+		let (status, content_type, bytes) = post_text_for_bytes("/api/v1/interpolate/ilp/parquet?field=load&precision=s&spline=linear&resolution=seconds", ILP_RAMP).await;
+		assert_eq!(status, StatusCode::OK);
+		assert_eq!(content_type, "application/vnd.apache.parquet");
+		assert_eq!(&bytes[..4], b"PAR1");
+		let batches = dsp_arrow::read_parquet(&bytes).expect("valid parquet");
+		let (_unit, timestamps, _values, kinds) = dsp_arrow::reconstructed_series_from_record_batch(&batches[0]).expect("reads back");
+		assert!(!timestamps.is_empty());
+		assert_eq!(kinds.first().map(String::as_str), Some("raw"));
+	}
+
+	#[tokio::test]
+	async fn interpolate_ilp_arrow_rejects_too_few_points() {
+		let (status, _content_type, _bytes) = post_text_for_bytes("/api/v1/interpolate/ilp/arrow?field=load&precision=s", "cpu load=1 1000000000\n").await;
 		assert_eq!(status, StatusCode::BAD_REQUEST);
 	}
 }
