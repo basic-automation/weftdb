@@ -516,6 +516,7 @@ impl SegmentStore {
 			stats.total_rows += meta.total_rows;
 			stats.total_nulls += meta.total_nulls;
 			stats.total_bytes += meta.total_bytes;
+			stats.unsorted_segments += meta.unsorted_segments;
 			if let Some((lo, hi)) = meta.time_range {
 				stats.time_range = Some(match stats.time_range {
 					Some((slo, shi)) => (slo.min(lo), shi.max(hi)),
@@ -541,6 +542,10 @@ pub struct StoreStorageStats {
 	pub total_nulls: u64,
 	/// Total realized on-disk bytes across every aspect's `.dspseg` frames.
 	pub total_bytes: u64,
+	/// Total out-of-order segments across every aspect — the store-wide order-health
+	/// signal (see [`AspectStorageStats::unsorted_segments`]). Zero when every sealed
+	/// segment in the store admits ordered access.
+	pub unsorted_segments: usize,
 	/// The inclusive `(min, max)` timestamp span the union of all aspects covers, or
 	/// [`None`] when the store holds no non-empty segment.
 	pub time_range: Option<(i64, i64)>,
@@ -967,9 +972,29 @@ mod tests {
 		#[allow(clippy::cast_precision_loss)]
 		let expected_bpp = stats.total_bytes as f64 / 5.0;
 		assert!((stats.bytes_per_point() - expected_bpp).abs() < f64::EPSILON);
+		// Both aspects sealed in order, so the store-wide order-health count is clean,
+		// and it equals the sum of the per-aspect rollups.
+		assert_eq!(stats.unsorted_segments, 0);
+		assert_eq!(stats.unsorted_segments, temp.unsorted_segments + humidity.unsorted_segments);
 		// Empty store.
 		assert_eq!(empty, StoreStorageStats::default());
+		assert_eq!(empty.unsorted_segments, 0);
 		assert!((empty.bytes_per_point() - 0.0).abs() < f64::EPSILON);
+	}
+
+	#[tokio::test]
+	async fn store_stats_sums_out_of_order_segments_across_aspects() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		// "a": one ordered + one out-of-order; "b": one out-of-order. Store-wide total = 2.
+		store.seal("a", &schema(), &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("ordered");
+		store.seal("a", &schema(), &[100_i64, 130, 110], &[bd("4"), bd("5"), bd("6")]).await.expect("ooo");
+		store.seal("b", &schema(), &[0_i64, 40, 20], &[bd("7"), bd("8"), bd("9")]).await.expect("ooo");
+		let stats = store.store_stats().await.expect("store stats");
+		drop(store);
+		assert_eq!(stats.aspect_count, 2);
+		assert_eq!(stats.segment_count, 3);
+		assert_eq!(stats.unsorted_segments, 2);
 	}
 
 	#[tokio::test]

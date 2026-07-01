@@ -613,6 +613,9 @@ pub struct StoreStatsResponse {
 	pub total_bytes: u64,
 	/// The store-wide north-star cost term: total framed bytes over total rows.
 	pub bytes_per_point: f64,
+	/// Total out-of-order segments across every aspect — the store-wide order-health
+	/// signal (0 when every sealed segment admits ordered access).
+	pub unsorted_segments: usize,
 	/// Inclusive `[min, max]` timestamp span across the union of aspects, or `null`.
 	pub time_range: Option<[i64; 2]>,
 }
@@ -770,7 +773,7 @@ pub async fn storage_stats(State(state): State<AppState>) -> Result<Json<StoreSt
 	let summary = result.map_err(|err| StorageError::Internal(err.to_string()))?;
 	let bytes_per_point = summary.bytes_per_point();
 	let time_range = summary.time_range.map(Into::into);
-	Ok(Json(StoreStatsResponse { aspect_count: summary.aspect_count, segment_count: summary.segment_count, total_rows: summary.total_rows, total_nulls: summary.total_nulls, total_bytes: summary.total_bytes, bytes_per_point, time_range }))
+	Ok(Json(StoreStatsResponse { aspect_count: summary.aspect_count, segment_count: summary.segment_count, total_rows: summary.total_rows, total_nulls: summary.total_nulls, total_bytes: summary.total_bytes, bytes_per_point, unsorted_segments: summary.unsorted_segments, time_range }))
 }
 
 #[cfg(test)]
@@ -1054,6 +1057,8 @@ mod tests {
 		assert_eq!(body["aspect_count"], 1);
 		assert_eq!(body["total_rows"], 5);
 		assert!(body["bytes_per_point"].as_f64().unwrap() > 0.0);
+		// The store's sole segment is in order — store-wide order health is clean.
+		assert_eq!(body["unsorted_segments"], 0);
 	}
 
 	#[tokio::test]
