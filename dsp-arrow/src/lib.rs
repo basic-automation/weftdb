@@ -67,6 +67,15 @@ use dsp_physical_type::{Page, PagedSegment, PhysicalType, Segment, SegmentError,
 pub const TIMESTAMP_COLUMN: &str = "timestamp";
 /// Name of the value column in an exported [`RecordBatch`].
 pub const VALUE_COLUMN: &str = "value";
+/// Name of the provenance column in a **reconstructed-series** batch.
+///
+/// Built by [`reconstructed_series_to_record_batch`]; each cell is `raw` /
+/// `interpolated` / `extrapolated`, so a consumer never silently treats a
+/// synthetic point as an observed one (backlog item B-tags).
+pub const SERIES_KIND_COLUMN: &str = "kind";
+/// Name of the bucket-sample-count column in a **reduction-table** batch
+/// ([`reduction_table_to_record_batch`]).
+pub const REDUCTION_COUNT_COLUMN: &str = "count";
 
 /// Schema-metadata key carrying the segment's [`TimeUnit`] name.
 pub const META_TIME_UNIT: &str = "dsp:time_unit";
@@ -95,6 +104,16 @@ pub const VALUE_ENCODING_F32: &str = "f32";
 /// [`ScaledI64`](dsp_physical_type::PhysicalType::ScaledI64) /
 /// [`ScaledI128`](dsp_physical_type::PhysicalType::ScaledI128) encodings.
 pub const VALUE_ENCODING_DECIMAL128: &str = "decimal128";
+
+/// The columns recovered from a reconstructed-series batch by
+/// [`reconstructed_series_from_record_batch`]: `(time unit, timestamps, values,
+/// provenance kinds)`.
+pub type ReconstructedSeries = (TimeUnit, Vec<i64>, Vec<f64>, Vec<String>);
+
+/// The columns recovered from a reduction-table batch by
+/// [`reduction_table_from_record_batch`]: `(time unit, bucket timestamps, per-bucket
+/// counts, named reduction columns)`.
+pub type ReductionTable = (TimeUnit, Vec<i64>, Vec<i64>, Vec<(String, Vec<f64>)>);
 
 /// Format-version sentinel written into [`META_FORMAT_VERSION`] for a batch built
 /// from **logical columns** rather than a single sealed segment.
@@ -636,6 +655,220 @@ pub fn read_parquet(bytes: &[u8]) -> Result<Vec<RecordBatch>, ConvertError> {
 	Ok(batches)
 }
 
+/// Build a self-describing Arrow [`RecordBatch`] from a **reconstructed
+/// interpolation series** — the output of DSP's flagship interpolate-on-read path,
+/// not a stored segment.
+///
+/// Where [`columns_to_record_batch`] and [`segment_to_record_batch`] export the
+/// two-column *stored* shape (`timestamp` + `value`), a reconstructed series also
+/// carries per-point **provenance**, so this emits **three** non-null columns:
+///
+/// - `timestamp: Int64` — the output-grid epochs in `unit`.
+/// - `value: Float64` — the reconstructed value. The interpolate endpoint's
+///   documented wire-numeric boundary is `f64` (DSP's logical `BigDecimal` is
+///   widened/narrowed at the HTTP edge, not here), so `Float64` is the exact,
+///   honest column type for this surface — no false-precision claim, and no silent
+///   downcast of a stored `BigDecimal` (there is none to downcast; the value is
+///   already `f64` at this boundary).
+/// - `kind: Utf8` — the `raw` / `interpolated` / `extrapolated` provenance token,
+///   so a Parquet/Arrow consumer can distinguish an observed point from a synthetic
+///   one (backlog item B-tags).
+///
+/// The schema metadata records the [`TimeUnit`], the value wire form
+/// ([`VALUE_ENCODING_F64`]), and [`LOGICAL_EXPORT_VERSION`] (this is a logical
+/// export, not an on-disk segment), so [`reconstructed_series_from_record_batch`]
+/// reads it back without out-of-band information.
+///
+/// # Panics
+///
+/// Panics if the three columns do not share a row count — a caller bug, since the
+/// interpolate output produces the three columns together.
+#[must_use]
+pub fn reconstructed_series_to_record_batch(unit: TimeUnit, timestamps: &[i64], values: &[f64], kinds: &[&str]) -> RecordBatch {
+	assert_eq!(timestamps.len(), values.len(), "timestamp and value columns must share a row count");
+	assert_eq!(timestamps.len(), kinds.len(), "timestamp and kind columns must share a row count");
+
+	let ts_array = Int64Array::from_iter_values(timestamps.iter().copied());
+	let val_array = Float64Array::from_iter_values(values.iter().copied());
+	let kind_array = StringArray::from(kinds.to_vec());
+
+	let mut metadata = HashMap::new();
+	metadata.insert(META_TIME_UNIT.to_string(), unit.name().to_string());
+	metadata.insert(META_PHYSICAL_TYPE.to_string(), PhysicalType::F64.name().to_string());
+	metadata.insert(META_VALUE_ENCODING.to_string(), VALUE_ENCODING_F64.to_string());
+	metadata.insert(META_FORMAT_VERSION.to_string(), LOGICAL_EXPORT_VERSION.to_string());
+
+	let schema = Schema::new_with_metadata(
+		vec![
+			Field::new(TIMESTAMP_COLUMN, DataType::Int64, false),
+			Field::new(VALUE_COLUMN, DataType::Float64, false),
+			Field::new(SERIES_KIND_COLUMN, DataType::Utf8, false),
+		],
+		metadata,
+	);
+
+	RecordBatch::try_new(Arc::new(schema), vec![Arc::new(ts_array), Arc::new(val_array), Arc::new(kind_array)]).expect("timestamp, value, and kind columns share the row count")
+}
+
+/// Serialize a reconstructed interpolation series straight to **Arrow IPC stream**
+/// bytes (`application/vnd.apache.arrow.stream`).
+///
+/// The one-call bridge the `dsp-server` interpolate endpoint uses: it holds only
+/// primitive columns and receives portable bytes, so no `arrow-*` type crosses into
+/// the server crate. Builds the batch with [`reconstructed_series_to_record_batch`]
+/// and writes it with [`write_ipc_stream`].
+///
+/// # Errors
+///
+/// Propagates any [`ConvertError`] from [`write_ipc_stream`] (an Arrow IPC failure).
+pub fn reconstructed_series_to_ipc_bytes(unit: TimeUnit, timestamps: &[i64], values: &[f64], kinds: &[&str]) -> Result<Vec<u8>, ConvertError> {
+	write_ipc_stream(&[reconstructed_series_to_record_batch(unit, timestamps, values, kinds)])
+}
+
+/// Serialize a reconstructed interpolation series straight to **Apache Parquet**
+/// file bytes (`application/vnd.apache.parquet`).
+///
+/// The Parquet counterpart of [`reconstructed_series_to_ipc_bytes`]. Builds the
+/// batch with [`reconstructed_series_to_record_batch`] and writes it with
+/// [`write_parquet`]; the self-describing Arrow schema (time unit, value encoding)
+/// is embedded in the file.
+///
+/// # Errors
+///
+/// Propagates any [`ConvertError`] from [`write_parquet`] (a Parquet failure).
+pub fn reconstructed_series_to_parquet_bytes(unit: TimeUnit, timestamps: &[i64], values: &[f64], kinds: &[&str]) -> Result<Vec<u8>, ConvertError> {
+	write_parquet(&[reconstructed_series_to_record_batch(unit, timestamps, values, kinds)])
+}
+
+/// Read a reconstructed-series batch (as built by
+/// [`reconstructed_series_to_record_batch`]) back into its columns:
+/// `(TimeUnit, timestamps, values, kinds)`.
+///
+/// The inverse used to validate the round trip. Recovers the [`TimeUnit`] from the
+/// schema metadata and the three columns by name and Arrow type.
+///
+/// # Errors
+///
+/// Returns a [`ConvertError`] if the time-unit metadata is missing/unrecognized or
+/// a column is absent or has the wrong Arrow type.
+pub fn reconstructed_series_from_record_batch(batch: &RecordBatch) -> Result<ReconstructedSeries, ConvertError> {
+	let unit = unit_from_metadata(batch)?;
+
+	let ts_col = batch.column_by_name(TIMESTAMP_COLUMN).ok_or(ConvertError::MissingColumn(TIMESTAMP_COLUMN))?;
+	let ts_array = ts_col.as_any().downcast_ref::<Int64Array>().ok_or(ConvertError::WrongType { column: TIMESTAMP_COLUMN, expected: "Int64" })?;
+	let timestamps: Vec<i64> = ts_array.values().to_vec();
+
+	let val_col = batch.column_by_name(VALUE_COLUMN).ok_or(ConvertError::MissingColumn(VALUE_COLUMN))?;
+	let val_array = val_col.as_any().downcast_ref::<Float64Array>().ok_or(ConvertError::WrongType { column: VALUE_COLUMN, expected: "Float64" })?;
+	let values: Vec<f64> = val_array.values().to_vec();
+
+	let kind_col = batch.column_by_name(SERIES_KIND_COLUMN).ok_or(ConvertError::MissingColumn(SERIES_KIND_COLUMN))?;
+	let kind_array = kind_col.as_any().downcast_ref::<StringArray>().ok_or(ConvertError::WrongType { column: SERIES_KIND_COLUMN, expected: "Utf8" })?;
+	let kinds: Vec<String> = kind_array.iter().map(|cell| cell.unwrap_or_default().to_string()).collect();
+
+	Ok((unit, timestamps, values, kinds))
+}
+
+/// Build a self-describing Arrow [`RecordBatch`] for a **reduction table** — the
+/// output of DSP's downsample/aggregation path.
+///
+/// A downsample reduces a series into grid-aligned buckets, reporting a per-bucket
+/// sample count and one value per requested reduction (min/max/avg/sum/first/last).
+/// This is the natural columnar shape for that: a non-null `timestamp: Int64`
+/// (bucket start), a non-null `count: Int64` (samples in the bucket), then one
+/// non-null `Float64` column per named reduction, **in the given order**.
+///
+/// As with [`reconstructed_series_to_record_batch`], the reduction values are `f64`
+/// because that is the downsample endpoint's documented wire-numeric boundary (the
+/// reductions run in `BigDecimal` and are narrowed only at the HTTP edge). The
+/// schema metadata records the [`TimeUnit`], the value wire form
+/// ([`VALUE_ENCODING_F64`]), and [`LOGICAL_EXPORT_VERSION`].
+///
+/// # Panics
+///
+/// Panics if any column's length differs from the timestamp column's, or if
+/// `agg_names` and `agg_columns` differ in length — a caller bug, since the
+/// downsample response produces the columns together.
+#[must_use]
+pub fn reduction_table_to_record_batch(unit: TimeUnit, timestamps: &[i64], counts: &[i64], agg_names: &[&str], agg_columns: &[Vec<f64>]) -> RecordBatch {
+	assert_eq!(timestamps.len(), counts.len(), "timestamp and count columns must share a row count");
+	assert_eq!(agg_names.len(), agg_columns.len(), "each reduction column must have a name");
+
+	let mut fields = vec![Field::new(TIMESTAMP_COLUMN, DataType::Int64, false), Field::new(REDUCTION_COUNT_COLUMN, DataType::Int64, false)];
+	let mut arrays: Vec<ArrayRef> = vec![Arc::new(Int64Array::from_iter_values(timestamps.iter().copied())), Arc::new(Int64Array::from_iter_values(counts.iter().copied()))];
+	for (name, column) in agg_names.iter().zip(agg_columns) {
+		assert_eq!(column.len(), timestamps.len(), "each reduction column must share the row count");
+		fields.push(Field::new(*name, DataType::Float64, false));
+		arrays.push(Arc::new(Float64Array::from_iter_values(column.iter().copied())));
+	}
+
+	let mut metadata = HashMap::new();
+	metadata.insert(META_TIME_UNIT.to_string(), unit.name().to_string());
+	metadata.insert(META_PHYSICAL_TYPE.to_string(), PhysicalType::F64.name().to_string());
+	metadata.insert(META_VALUE_ENCODING.to_string(), VALUE_ENCODING_F64.to_string());
+	metadata.insert(META_FORMAT_VERSION.to_string(), LOGICAL_EXPORT_VERSION.to_string());
+
+	let schema = Schema::new_with_metadata(fields, metadata);
+	RecordBatch::try_new(Arc::new(schema), arrays).expect("all columns share the row count")
+}
+
+/// Serialize a reduction table straight to **Arrow IPC stream** bytes
+/// (`application/vnd.apache.arrow.stream`).
+///
+/// The one-call bridge the `dsp-server` downsample endpoint uses, mirroring
+/// [`reconstructed_series_to_ipc_bytes`]: primitive columns in, portable bytes out,
+/// no `arrow-*` type crossing into the server crate.
+///
+/// # Errors
+///
+/// Propagates any [`ConvertError`] from [`write_ipc_stream`].
+pub fn reduction_table_to_ipc_bytes(unit: TimeUnit, timestamps: &[i64], counts: &[i64], agg_names: &[&str], agg_columns: &[Vec<f64>]) -> Result<Vec<u8>, ConvertError> {
+	write_ipc_stream(&[reduction_table_to_record_batch(unit, timestamps, counts, agg_names, agg_columns)])
+}
+
+/// Serialize a reduction table straight to **Apache Parquet** file bytes
+/// (`application/vnd.apache.parquet`).
+///
+/// The Parquet counterpart of [`reduction_table_to_ipc_bytes`].
+///
+/// # Errors
+///
+/// Propagates any [`ConvertError`] from [`write_parquet`].
+pub fn reduction_table_to_parquet_bytes(unit: TimeUnit, timestamps: &[i64], counts: &[i64], agg_names: &[&str], agg_columns: &[Vec<f64>]) -> Result<Vec<u8>, ConvertError> {
+	write_parquet(&[reduction_table_to_record_batch(unit, timestamps, counts, agg_names, agg_columns)])
+}
+
+/// Read a reduction-table batch (as built by [`reduction_table_to_record_batch`])
+/// back into its columns: `(TimeUnit, timestamps, counts, named reductions)`.
+///
+/// The inverse used to validate the round trip. The reduction columns are every
+/// `Float64` column other than `timestamp`/`count`, in schema order.
+///
+/// # Errors
+///
+/// Returns a [`ConvertError`] if the time-unit metadata is missing/unrecognized or
+/// the `timestamp`/`count` columns are absent or have the wrong Arrow type.
+pub fn reduction_table_from_record_batch(batch: &RecordBatch) -> Result<ReductionTable, ConvertError> {
+	let unit = unit_from_metadata(batch)?;
+
+	let ts_col = batch.column_by_name(TIMESTAMP_COLUMN).ok_or(ConvertError::MissingColumn(TIMESTAMP_COLUMN))?;
+	let timestamps = ts_col.as_any().downcast_ref::<Int64Array>().ok_or(ConvertError::WrongType { column: TIMESTAMP_COLUMN, expected: "Int64" })?.values().to_vec();
+
+	let count_col = batch.column_by_name(REDUCTION_COUNT_COLUMN).ok_or(ConvertError::MissingColumn(REDUCTION_COUNT_COLUMN))?;
+	let counts = count_col.as_any().downcast_ref::<Int64Array>().ok_or(ConvertError::WrongType { column: REDUCTION_COUNT_COLUMN, expected: "Int64" })?.values().to_vec();
+
+	let mut aggregations = Vec::new();
+	for (idx, field) in batch.schema_ref().fields().iter().enumerate() {
+		if field.name() == TIMESTAMP_COLUMN || field.name() == REDUCTION_COUNT_COLUMN {
+			continue;
+		}
+		let column = batch.column(idx).as_any().downcast_ref::<Float64Array>().ok_or(ConvertError::WrongType { column: "reduction", expected: "Float64" })?;
+		aggregations.push((field.name().clone(), column.values().to_vec()));
+	}
+
+	Ok((unit, timestamps, counts, aggregations))
+}
+
 #[cfg(test)]
 mod tests {
 	use std::str::FromStr;
@@ -1134,5 +1367,124 @@ mod tests {
 	fn parquet_read_rejects_garbage_bytes() {
 		let err = read_parquet(b"not a parquet file").expect_err("must error");
 		assert!(matches!(err, ConvertError::Parquet(_)), "got: {err}");
+	}
+
+	#[test]
+	fn reconstructed_series_batch_has_three_typed_columns() {
+		let timestamps = [0_i64, 60, 120];
+		let values = [0.0_f64, 30.0, 60.0];
+		let kinds = ["raw", "interpolated", "raw"];
+		let batch = reconstructed_series_to_record_batch(TimeUnit::Seconds, &timestamps, &values, &kinds);
+
+		assert_eq!(batch.num_columns(), 3);
+		assert_eq!(batch.num_rows(), 3);
+		assert_eq!(batch.schema_ref().field(0).name(), TIMESTAMP_COLUMN);
+		assert_eq!(batch.schema_ref().field(0).data_type(), &DataType::Int64);
+		assert_eq!(batch.schema_ref().field(1).name(), VALUE_COLUMN);
+		assert_eq!(batch.schema_ref().field(1).data_type(), &DataType::Float64);
+		assert_eq!(batch.schema_ref().field(2).name(), SERIES_KIND_COLUMN);
+		assert_eq!(batch.schema_ref().field(2).data_type(), &DataType::Utf8);
+
+		let md = batch.schema_ref().metadata();
+		assert_eq!(md.get(META_TIME_UNIT).map(String::as_str), Some("seconds"));
+		assert_eq!(md.get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_F64));
+		assert_eq!(md.get(META_FORMAT_VERSION).map(String::as_str), Some(&LOGICAL_EXPORT_VERSION.to_string()[..]));
+	}
+
+	#[test]
+	fn reconstructed_series_round_trips_through_ipc() {
+		let timestamps = [1_000_i64, 1_010, 1_020];
+		let values = [1.5_f64, 2.25, 3.0];
+		let kinds = ["raw", "interpolated", "extrapolated"];
+		let bytes = reconstructed_series_to_ipc_bytes(TimeUnit::Millis, &timestamps, &values, &kinds).expect("writes ipc");
+
+		let batches = read_ipc_stream(&bytes).expect("reads ipc");
+		assert_eq!(batches.len(), 1);
+		let (unit, ts, vs, ks) = reconstructed_series_from_record_batch(&batches[0]).expect("reads back");
+		assert_eq!(unit, TimeUnit::Millis);
+		assert_eq!(ts, timestamps.to_vec());
+		assert_eq!(vs, values.to_vec());
+		assert_eq!(ks, vec!["raw", "interpolated", "extrapolated"]);
+	}
+
+	#[test]
+	fn reconstructed_series_round_trips_through_parquet() {
+		let timestamps = [0_i64, 1, 2, 3];
+		let values = [10.0_f64, 20.0, 30.0, 40.0];
+		let kinds = ["raw", "interpolated", "interpolated", "raw"];
+		let bytes = reconstructed_series_to_parquet_bytes(TimeUnit::Nanos, &timestamps, &values, &kinds).expect("writes parquet");
+		assert_eq!(&bytes[..4], b"PAR1");
+
+		let batches = read_parquet(&bytes).expect("reads parquet");
+		let (unit, ts, vs, ks) = reconstructed_series_from_record_batch(&batches[0]).expect("reads back");
+		assert_eq!(unit, TimeUnit::Nanos);
+		assert_eq!(ts, timestamps.to_vec());
+		assert_eq!(vs, values.to_vec());
+		assert_eq!(ks, vec!["raw", "interpolated", "interpolated", "raw"]);
+	}
+
+	#[test]
+	#[should_panic(expected = "kind columns must share a row count")]
+	fn reconstructed_series_rejects_ragged_columns() {
+		let _ = reconstructed_series_to_record_batch(TimeUnit::Seconds, &[0, 1], &[0.0, 1.0], &["raw"]);
+	}
+
+	#[test]
+	fn reduction_table_batch_lays_out_timestamp_count_and_reductions() {
+		let timestamps = [0_i64, 60];
+		let counts = [3_i64, 2];
+		let names = ["min", "max", "avg"];
+		let columns = vec![vec![0.0_f64, 30.0], vec![20.0, 50.0], vec![10.0, 40.0]];
+		let batch = reduction_table_to_record_batch(TimeUnit::Seconds, &timestamps, &counts, &names, &columns);
+
+		assert_eq!(batch.num_columns(), 5);
+		assert_eq!(batch.num_rows(), 2);
+		assert_eq!(batch.schema_ref().field(0).name(), TIMESTAMP_COLUMN);
+		assert_eq!(batch.schema_ref().field(1).name(), REDUCTION_COUNT_COLUMN);
+		assert_eq!(batch.schema_ref().field(1).data_type(), &DataType::Int64);
+		assert_eq!(batch.schema_ref().field(2).name(), "min");
+		assert_eq!(batch.schema_ref().field(2).data_type(), &DataType::Float64);
+		assert_eq!(batch.schema_ref().field(4).name(), "avg");
+	}
+
+	#[test]
+	fn reduction_table_round_trips_through_ipc() {
+		let timestamps = [0_i64, 60];
+		let counts = [3_i64, 2];
+		let names = ["min", "sum"];
+		let columns = vec![vec![0.0_f64, 30.0], vec![30.0, 80.0]];
+		let bytes = reduction_table_to_ipc_bytes(TimeUnit::Seconds, &timestamps, &counts, &names, &columns).expect("writes ipc");
+
+		let batches = read_ipc_stream(&bytes).expect("reads ipc");
+		let (unit, ts, cs, aggs) = reduction_table_from_record_batch(&batches[0]).expect("reads back");
+		assert_eq!(unit, TimeUnit::Seconds);
+		assert_eq!(ts, timestamps.to_vec());
+		assert_eq!(cs, counts.to_vec());
+		assert_eq!(aggs.len(), 2);
+		assert_eq!(aggs[0], ("min".to_string(), vec![0.0, 30.0]));
+		assert_eq!(aggs[1], ("sum".to_string(), vec![30.0, 80.0]));
+	}
+
+	#[test]
+	fn reduction_table_round_trips_through_parquet() {
+		let timestamps = [0_i64, 60];
+		let counts = [1_i64, 1];
+		let names = ["avg"];
+		let columns = vec![vec![5.0_f64, 7.5]];
+		let bytes = reduction_table_to_parquet_bytes(TimeUnit::Millis, &timestamps, &counts, &names, &columns).expect("writes parquet");
+		assert_eq!(&bytes[..4], b"PAR1");
+
+		let batches = read_parquet(&bytes).expect("reads parquet");
+		let (unit, ts, cs, aggs) = reduction_table_from_record_batch(&batches[0]).expect("reads back");
+		assert_eq!(unit, TimeUnit::Millis);
+		assert_eq!(ts, timestamps.to_vec());
+		assert_eq!(cs, counts.to_vec());
+		assert_eq!(aggs, vec![("avg".to_string(), vec![5.0, 7.5])]);
+	}
+
+	#[test]
+	#[should_panic(expected = "each reduction column must share the row count")]
+	fn reduction_table_rejects_ragged_reduction_column() {
+		let _ = reduction_table_to_record_batch(TimeUnit::Seconds, &[0, 60], &[1, 1], &["min"], &[vec![0.0]]);
 	}
 }

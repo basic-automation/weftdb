@@ -2854,3 +2854,118 @@ route a new bridge through `dsp-arrow-store`); or (c) the external-engine
 first).
 
 **PR:** https://github.com/physics515/DSP/pull/31
+
+## 2026-07-01 — Columnar (Arrow/Parquet) output for the compute endpoints (Phase 2, 5 increments)
+
+- **Item:** Phase 2 (*benchmark-grade server/API*) — the interchange surface,
+  compute side. Prior runs delivered JSON, ILP, Arrow IPC, Parquet, and CSV for
+  the **storage** (stored-range) reads, and JSON + CSV for the two **compute**
+  endpoints (`interpolate`, `downsample`). The last run's next-step (b) named the
+  gap: columnar (Arrow/Parquet) output for the flagship interpolate endpoint,
+  pending a dep-graph decision. This run made that decision and built the whole
+  compute-side columnar arc: Arrow IPC + Parquet on both compute endpoints, then
+  CSV/Arrow/Parquet on both their ILP siblings — so the compute interchange matrix
+  (JSON / CSV / Arrow / Parquet) is now complete and symmetric. Five green
+  increments on branch `routine/dsp-2026-07-01`, touching only `dsp-arrow` and
+  `dsp-server` (the lean hot-path core untouched).
+
+**Dependency decision (the gate the last run flagged):** promote `dsp-arrow` from
+a dev-dep to a **regular** dep of `dsp-server`. Zero-cost and constraint-safe:
+`dsp-arrow-store` (already a regular dep, backing the storage Arrow/Parquet
+endpoints) transitively pulls `dsp-arrow`, so the `arrow-*` tree was already in
+`dsp-server`'s graph; and `dsp-server` is an application binary, not the lean
+hot-path core (`splimes`/`database`/`dsp-physical-type`/`dsp-tui`) the arrow
+constraint protects. All Arrow knowledge stays inside `dsp-arrow`: the server
+hands it primitive columns and receives portable bytes, so no `arrow-*` type
+appears in any `dsp-server` signature.
+
+**Increment 1 — reconstructed-series interchange in `dsp-arrow`** (commit `41389e0`)
+- `dsp-arrow/src/lib.rs`: a three-column interchange for a reconstructed
+  interpolation series (distinct from the two-column stored-segment shape):
+  `timestamp: Int64` + `value: Float64` + `kind: Utf8` (raw/interpolated/
+  extrapolated provenance — backlog B-tags travels with the data).
+  `reconstructed_series_to_record_batch` + `_to_ipc_bytes` / `_to_parquet_bytes`
+  (portable-bytes bridges) + `_from_record_batch` inverse. Value column is
+  `Float64` because the interpolate endpoint's documented wire-numeric boundary is
+  f64 — the honest, exact column type (no false precision, no silent downcast).
+  Tests +4 (dsp-arrow 36 -> 40).
+
+**Increment 2 — Arrow/Parquet output for the interpolate flagship** (commit `81377ab`)
+- `dsp-server/{Cargo.toml,src/interpolate.rs,src/lib.rs}`: promote `dsp-arrow` to a
+  regular dep; `POST /api/v1/interpolate/arrow`
+  (`application/vnd.apache.arrow.stream`) and `…/interpolate/parquet`
+  (`application/vnd.apache.parquet`). A private `response_columns` helper decomposes
+  the `InterpolateResponse` into primitive columns. Tests +3 (dsp-server 121 -> 124).
+
+**Increment 3 — Arrow/Parquet output for the downsample endpoint** (commit `d21bc02`)
+- `dsp-arrow/src/lib.rs`: a general **reduction-table** interchange (a downsample
+  result is a wider table): `timestamp: Int64` + `count: Int64` + one `Float64`
+  column per named reduction, in request order (`reduction_table_to_record_batch`
+  + `_to_ipc_bytes` / `_to_parquet_bytes` + `_from_record_batch`). Tests +4
+  (dsp-arrow 40 -> 44).
+- `dsp-server/{src/downsample.rs,src/lib.rs}`: `POST /api/v1/downsample/arrow` and
+  `…/downsample/parquet`. Tests +3 (dsp-server 124 -> 127).
+
+**Increment 4 — CSV/Arrow/Parquet output for the interpolate ILP path** (commit `11561c9`)
+- `dsp-server/{src/interpolate.rs,src/lib.rs}`: `POST /api/v1/interpolate/ilp/csv`,
+  `…/ilp/arrow`, `…/ilp/parquet` — each reuses `interpolate_ilp_inner` then renders
+  in the requested format, so a TSBS-style harness feeding InfluxDB Line Protocol
+  pulls interpolated results in any of the four formats. Factored the Arrow/Parquet
+  rendering into shared `interpolate_response_to_arrow` / `_to_parquet` helpers used
+  by both the JSON and ILP handlers. Tests +4 (dsp-server 127 -> 131).
+
+**Increment 5 — CSV/Arrow/Parquet output for the downsample ILP path** (commit pending)
+- `dsp-server/{src/downsample.rs,src/lib.rs}`: `POST /api/v1/downsample/ilp/csv`,
+  `…/ilp/arrow`, `…/ilp/parquet`, completing the symmetry (both compute endpoints ×
+  both JSON/ILP request forms × all four output formats). Factored
+  `downsample_response_to_arrow` / `_to_parquet` shared helpers + a
+  `record_downsample_outcome` metrics helper. Tests +4 (dsp-server 131 -> 135).
+
+**Build/test/clippy (real, nightly `rustc`):**
+- `cargo build --workspace` — GREEN (final full build exit 0; incremental builds
+  ~9-15s throughout).
+- `SKIP_SLOW_TESTS=1 cargo test --workspace --lib -- --test-threads=1`: database
+  **72**, database_orchestration **17**, dsp-arrow **44** (this run 36->44, **+8**),
+  dsp-arrow-store **15**, dsp-bench **87**, dsp-line-protocol **11**,
+  dsp-physical-type **152**, dsp-server **135** (this run 121->135, **+14**),
+  dsp-tui **7**, splimes **23**. Workspace lib total **563**, 0 failed (was 541 last
+  run, **+22**). Full integration/doc test suites were not run this session
+  (`SKIP_SLOW_TESTS` honored to protect the window); no integration-test files were
+  touched — all new code is unit-tested in-crate via the axum router.
+- Clippy — **0 new warnings** in `dsp-arrow` and `dsp-server` (the only crates
+  touched) under their lib pedantic+nursery lints; verified after forced recompile
+  per file. Two warnings my `dsp-arrow` code first introduced (a too-long first doc
+  paragraph and a complex tuple return type) were fixed directly (shorter doc +
+  `ReconstructedSeries` / `ReductionTable` type aliases), not `#[allow]`-ed. The
+  pre-existing dsp-server test-helper `significant_drop_tightening` warnings (5 in
+  manage.rs, 2 in storage.rs) are unchanged and untouched; pre-existing warnings in
+  the untouched `database`/`splimes` crates are unchanged.
+
+**Done vs open:** DONE — the complete compute-side columnar interchange: Arrow IPC
++ Parquet on `POST /interpolate` and `/downsample`, and CSV/Arrow/Parquet on both
+their `…/ilp` siblings, plus the two new `dsp-arrow` interchange shapes
+(reconstructed-series, reduction-table). The compute interchange matrix (JSON /
+CSV / Arrow / Parquet) is now complete and symmetric with the storage side.
+ROADMAP Phase-2 status note updated. OPEN (Phase 2/4 remainder): **OpenTelemetry**
+trace export (the paired Phase-3 instrumentation item beside Prometheus
+`/metrics`); the external-engine **DuckDB** + competitor adapters (vendor dep +
+Windows build assessment — risky unattended); **tag** pruning (4.4, blocked on
+B-tags); the standalone **methodology** document; richer B-rest (`interpolation`
+alias + cursor paging).
+
+**STOP REASON:** natural-arc complete — five green increments (above the 2-4 bar)
+deliver a coherent, complete compute-side columnar-interchange arc with a clean,
+principled dep-graph decision at its root. The remaining workable items are each
+their own dedicated slice: DuckDB needs a vendor-dep/Windows-build assessment
+(risky unattended), OpenTelemetry is a larger instrumentation slice, and the
+B-tags-gated items are blocked — better as deliberate slices than forced on late
+against the honesty contract.
+
+**Next step (tomorrow):** (a) **OpenTelemetry** trace export on `dsp-server` (the
+Phase-3 instrumentation item paired with the existing Prometheus `/metrics`); or
+(b) the external-engine **DuckDB** adapter for DSP-Bench — assess the `duckdb` Rust
+crate's Windows/C++ build behind a feature flag *first* (back it out and log the
+finding if it does not build cleanly); or (c) richer B-rest (`interpolation` query
+alias + cursor paging on the stored-range reads).
+
+**PR:** https://github.com/physics515/DSP/pull/32
