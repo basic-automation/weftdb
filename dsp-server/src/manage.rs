@@ -196,6 +196,12 @@ pub struct IngestResponse {
 	pub min_ts: Option<i64>,
 	/// Largest timestamp in the sealed segment, or `null` if it was empty.
 	pub max_ts: Option<i64>,
+	/// Whether the sealed segment's timestamps are monotonic non-decreasing. `false`
+	/// flags out-of-order data that a point lookup must linear-scan (Phase 4.6) — a
+	/// client ingesting without `require_sorted` can watch this to know whether its
+	/// batch stored in ordered form. Always `true` for a batch accepted under
+	/// `require_sorted`.
+	pub time_sorted: bool,
 }
 
 /// Classify a seal error: an encode/tolerance failure is a client-data problem
@@ -302,6 +308,7 @@ async fn ingest_points_inner(store: &database::SegmentStore, metrics: &crate::me
 		byte_len: descriptor.byte_len,
 		min_ts: descriptor.min_ts,
 		max_ts: descriptor.max_ts,
+		time_sorted: descriptor.time_sorted,
 	};
 	Ok((StatusCode::CREATED, Json(response)).into_response())
 }
@@ -444,6 +451,7 @@ async fn ingest_csv_inner(store: &database::SegmentStore, metrics: &crate::metri
 		byte_len: descriptor.byte_len,
 		min_ts: descriptor.min_ts,
 		max_ts: descriptor.max_ts,
+		time_sorted: descriptor.time_sorted,
 	};
 	Ok((StatusCode::CREATED, Json(response)).into_response())
 }
@@ -574,6 +582,7 @@ async fn ingest_ilp_inner(store: &database::SegmentStore, metrics: &crate::metri
 		byte_len: descriptor.byte_len,
 		min_ts: descriptor.min_ts,
 		max_ts: descriptor.max_ts,
+		time_sorted: descriptor.time_sorted,
 	};
 	Ok((StatusCode::CREATED, Json(response)).into_response())
 }
@@ -699,6 +708,7 @@ mod tests {
 		assert_eq!(body["null_count"], 0);
 		assert_eq!(body["min_ts"], 100);
 		assert_eq!(body["max_ts"], 120);
+		assert_eq!(body["time_sorted"], true, "an ordered batch seals sorted");
 		assert!(body["byte_len"].as_u64().unwrap() > 0);
 
 		// The read surface returns exactly what was sealed.
@@ -823,6 +833,8 @@ mod tests {
 		let (status, body) = post_json(router, "/api/v1/storage/price/points", &ok).await;
 		assert_eq!(status, StatusCode::CREATED, "body: {body}");
 		assert_eq!(body["row_count"], 2);
+		// The accepted out-of-order batch is honestly reported as unsorted.
+		assert_eq!(body["time_sorted"], false, "an out-of-order batch reports time_sorted=false");
 	}
 
 	#[tokio::test]
