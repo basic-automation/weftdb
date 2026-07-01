@@ -239,6 +239,96 @@ pub fn rle_varint_bytes(runs: &[(i64, usize)]) -> usize {
 	runs.iter().map(|&(value, count)| zigzag_varint_len(value) + uvarint_len(count as u64)).sum()
 }
 
+/// Zig-zag a signed `i64` into an unsigned `u64` (`0,-1,1,-2 -> 0,1,2,3`), so
+/// small-magnitude negatives stay numerically small. Inverse of [`unzigzag`].
+#[must_use]
+#[allow(clippy::cast_sign_loss)] // the bit pattern is exactly the zig-zag mapping.
+const fn zigzag(value: i64) -> u64 {
+	((value << 1) ^ (value >> 63)) as u64
+}
+
+/// Invert [`zigzag`], recovering the original signed `i64` from its zig-zag code.
+#[must_use]
+#[allow(clippy::cast_possible_wrap)] // `z >> 1` fits `i64`; the XOR restores the sign.
+const fn unzigzag(z: u64) -> i64 {
+	((z >> 1) as i64) ^ -((z & 1) as i64)
+}
+
+/// The fixed bit width needed to hold every value of a difference stream once
+/// zig-zag-coded — i.e. the bits of the largest-magnitude second difference.
+///
+/// `0` for an empty or all-zero stream (nothing but zeros to store); at most
+/// `64`. This is the width [`bitpack_encode`] packs every value to, and the term
+/// that makes bit-packing beat varint's one-byte-per-value floor for a regular
+/// or small-jitter series (differences of a few bits each).
+#[must_use]
+pub fn bitpack_width(values: &[i64]) -> u32 {
+	values.iter().map(|&v| 64 - zigzag(v).leading_zeros()).max().unwrap_or(0)
+}
+
+/// Estimated packed footprint of a difference stream under fixed-width
+/// bit-packing: a one-byte width header plus `ceil(n * width / 8)` data bytes.
+///
+/// Like the plain-varint and RLE estimates, this omits the externally-known row
+/// count (the segment stats header carries it), so the three are comparable. For
+/// a stream of `n` differences each fitting in `w` bits this is `1 + n*w/8`
+/// bytes — well under varint's `n`-byte floor whenever `w < 8`.
+#[must_use]
+pub fn bitpack_bytes(values: &[i64]) -> usize {
+	let width = bitpack_width(values) as usize;
+	1 + (values.len() * width).div_ceil(8)
+}
+
+/// Fixed-width bit-pack a difference stream.
+///
+/// Returns the chosen `width` (bits per value, from [`bitpack_width`]) and the
+/// packed byte buffer (values written LSB-first, back to back). A `width` of `0`
+/// packs an all-zero stream to no data bytes. Exact inverse is [`bitpack_decode`].
+#[must_use]
+pub fn bitpack_encode(values: &[i64]) -> (u32, Vec<u8>) {
+	let width = bitpack_width(values);
+	if width == 0 {
+		return (0, Vec::new());
+	}
+	let w = width as usize;
+	let mut out = vec![0_u8; (values.len() * w).div_ceil(8)];
+	let mut bit = 0_usize;
+	for &v in values {
+		let zz = zigzag(v);
+		for b in 0..w {
+			if (zz >> b) & 1 == 1 {
+				out[(bit + b) / 8] |= 1 << ((bit + b) % 8);
+			}
+		}
+		bit += w;
+	}
+	(width, out)
+}
+
+/// Reconstruct `count` differences from a fixed-width bit-packed buffer. Exact
+/// inverse of [`bitpack_encode`]; a `width` of `0` yields `count` zeros.
+#[must_use]
+pub fn bitpack_decode(width: u32, bytes: &[u8], count: usize) -> Vec<i64> {
+	if width == 0 {
+		return vec![0; count];
+	}
+	let w = width as usize;
+	let mut out = Vec::with_capacity(count);
+	let mut bit = 0_usize;
+	for _ in 0..count {
+		let mut zz = 0_u64;
+		for b in 0..w {
+			let idx = bit + b;
+			if bytes.get(idx / 8).is_some_and(|byte| (byte >> (idx % 8)) & 1 == 1) {
+				zz |= 1 << b;
+			}
+		}
+		out.push(unzigzag(zz));
+		bit += w;
+	}
+	out
+}
+
 impl DeltaColumn {
 	/// Estimated packed size: the anchor (a full 8-byte `i64`) plus the
 	/// varint-coded delta stream.
@@ -283,21 +373,42 @@ impl DeltaOfDeltaColumn {
 		8 + self.first_delta.map_or(0, zigzag_varint_len) + rle_varint_bytes(&rle_encode(&self.dods))
 	}
 
-	/// The smaller of the plain-varint and RLE-of-second-differences estimates —
-	/// the realistic stored size once the cheaper of the two codecs is chosen.
+	/// Estimated packed size with the second-difference stream **fixed-width
+	/// bit-packed** instead of varint- or RLE-coded: anchor + first delta +
+	/// [`bitpack_bytes`] over the second differences.
+	///
+	/// This is the cheapest of the three for a regular or small-jitter series,
+	/// where every second difference fits in a handful of bits and varint's
+	/// one-byte-per-value floor (and RLE's two-varints-per-run) both dominate; a
+	/// noisy wide-magnitude stream forces a large width and it loses, which is why
+	/// [`best_estimated_bytes`](Self::best_estimated_bytes) takes the minimum.
+	#[must_use]
+	pub fn bitpack_estimated_bytes(&self) -> usize {
+		8 + self.first_delta.map_or(0, zigzag_varint_len) + bitpack_bytes(&self.dods)
+	}
+
+	/// The smallest of the plain-varint, RLE, and bit-packed second-difference
+	/// estimates — the realistic stored size once the cheapest codec is chosen.
 	#[must_use]
 	pub fn best_estimated_bytes(&self) -> usize {
-		self.estimated_bytes().min(self.rle_estimated_bytes())
+		self.estimated_bytes().min(self.rle_estimated_bytes()).min(self.bitpack_estimated_bytes())
 	}
 
 	/// The stable name of the codec [`best_estimated_bytes`](Self::best_estimated_bytes)
-	/// selects: `"delta_of_delta_rle"` when run-length coding the second
-	/// differences is strictly cheaper (a regular or piecewise-regular series),
-	/// else `"delta_of_delta"`. The single source of truth for the codec label so
-	/// the segment store and the bench report never disagree on which won.
+	/// selects: `"delta_of_delta_bitpack"` when fixed-width bit-packing is the
+	/// strict winner (a regular or small-jitter series), `"delta_of_delta_rle"`
+	/// when run-length coding is cheapest (long identical runs), else
+	/// `"delta_of_delta"`. The single source of truth for the codec label so the
+	/// segment store and the bench report never disagree on which won. Ties favour
+	/// the simpler codec (plain > rle > bitpack) for a stable label.
 	#[must_use]
 	pub fn best_encoding_name(&self) -> &'static str {
-		if self.rle_estimated_bytes() < self.estimated_bytes() {
+		let plain = self.estimated_bytes();
+		let rle = self.rle_estimated_bytes();
+		let bitpack = self.bitpack_estimated_bytes();
+		if bitpack < plain && bitpack < rle {
+			"delta_of_delta_bitpack"
+		} else if rle < plain {
 			"delta_of_delta_rle"
 		} else {
 			"delta_of_delta"
@@ -426,51 +537,110 @@ mod tests {
 	}
 
 	#[test]
-	fn rle_crushes_a_regular_series_second_differences() {
-		// 1000 regular points -> 998 zero second-differences -> a single RLE run.
+	fn bitpack_crushes_a_regular_series_second_differences() {
+		// 1000 regular points -> 998 zero second-differences.
 		let values: Vec<i64> = (0..1_000).map(|i| 1_000 + i * 10).collect();
 		let dod = encode_delta_of_delta(&values, TimeUnit::Millis);
-		// RLE: anchor(8) + first_delta(1) + one run (value 0 -> 1 byte, count 998 ->
-		// 2 bytes) = 12.
+		// RLE collapses the zero run to anchor(8) + first_delta(1) + one run
+		// (value 0 -> 1 byte, count 998 -> 2 bytes) = 12, itself far below plain
+		// varint (8 + 1 + 998).
 		assert_eq!(dod.rle_estimated_bytes(), 8 + 1 + (1 + 2));
-		// And it beats plain varint (8 + 1 + 998) decisively, so `best` takes RLE.
 		assert!(dod.rle_estimated_bytes() < dod.estimated_bytes());
+		// But bit-packing an all-zero stream is width 0 -> no data bytes ->
+		// anchor(8) + first_delta(1) + width header(1) = 10, one below RLE, so
+		// `best` takes bit-packing.
+		assert_eq!(dod.bitpack_estimated_bytes(), 8 + 1 + 1);
+		assert!(dod.bitpack_estimated_bytes() < dod.rle_estimated_bytes());
+		assert_eq!(dod.best_estimated_bytes(), dod.bitpack_estimated_bytes());
+	}
+
+	#[test]
+	fn rle_wins_a_long_nonzero_constant_run() {
+		// A constant nonzero acceleration: deltas grow by a fixed 5 each step, so the
+		// second differences are a long run of 5s. RLE collapses the run to two
+		// varints; bit-packing still pays ~4 bits per value, and plain varint one
+		// byte per value — so RLE is the strict winner and the chosen label.
+		let mut values = vec![0_i64, 1];
+		let mut delta = 1_i64;
+		for _ in 0..200 {
+			delta += 5;
+			let next = values.last().unwrap() + delta;
+			values.push(next);
+		}
+		let dod = encode_delta_of_delta(&values, TimeUnit::Seconds);
+		assert!(dod.dods.iter().all(|&d| d == 5), "second differences are a constant run of 5");
+		assert!(dod.rle_estimated_bytes() < dod.bitpack_estimated_bytes());
+		assert!(dod.rle_estimated_bytes() < dod.estimated_bytes());
+		assert_eq!(dod.best_encoding_name(), "delta_of_delta_rle");
 		assert_eq!(dod.best_estimated_bytes(), dod.rle_estimated_bytes());
 	}
 
 	#[test]
 	fn best_encoding_name_tracks_the_chosen_codec() {
-		// Regular series -> RLE wins -> labelled rle.
+		// Regular series -> all-zero dods -> bit-packing (width 0) wins -> labelled bitpack.
 		let regular: Vec<i64> = (0..1_000).map(|i| 1_000 + i * 10).collect();
 		let dod = encode_delta_of_delta(&regular, TimeUnit::Millis);
-		assert_eq!(dod.best_encoding_name(), "delta_of_delta_rle");
-		assert_eq!(dod.best_estimated_bytes(), dod.rle_estimated_bytes());
-		// Non-repeating second differences -> plain varint wins -> labelled plain.
-		let mut values = vec![0_i64];
-		let mut acc = 0_i64;
-		for gap in [1, 2, 4, 7, 11, 16] {
-			acc += gap;
-			values.push(acc);
-		}
+		assert_eq!(dod.best_encoding_name(), "delta_of_delta_bitpack");
+		assert_eq!(dod.best_estimated_bytes(), dod.bitpack_estimated_bytes());
+		// A few small distinct second differences plus one wide-magnitude outlier:
+		// per-value varint adapts (small values stay 1 byte, the outlier ~5), while a
+		// fixed-width bit-pack must widen every value to the outlier's bits and RLE
+		// spends two varints per length-1 run -> plain varint wins, labelled plain.
+		// dods here are [1, 2, 3, 1_000_000_000].
+		let values = vec![0_i64, 1, 3, 7, 14, 21 + 1_000_000_000];
 		let dod = encode_delta_of_delta(&values, TimeUnit::Seconds);
+		assert_eq!(dod.dods, vec![1, 2, 3, 1_000_000_000]);
+		assert!(dod.estimated_bytes() < dod.rle_estimated_bytes());
+		assert!(dod.estimated_bytes() < dod.bitpack_estimated_bytes());
 		assert_eq!(dod.best_encoding_name(), "delta_of_delta");
 		assert_eq!(dod.best_estimated_bytes(), dod.estimated_bytes());
 	}
 
 	#[test]
-	fn best_estimate_falls_back_to_varint_when_runs_do_not_repeat() {
-		// Strictly increasing gaps make every second difference distinct (1,2,3,…),
-		// so RLE spends two varints per length-1 run and loses to plain varint;
-		// `best` must take the smaller plain estimate.
-		let mut values = vec![0_i64];
-		let mut acc = 0_i64;
-		for gap in [1, 2, 4, 7, 11, 16, 22, 29, 37] {
-			acc += gap;
-			values.push(acc);
-		}
+	fn bitpack_round_trips_and_beats_varint_on_small_jitter() {
+		// A regular series with small clock jitter: second differences stay within a
+		// few bits, so fixed-width bit-packing crushes varint's one-byte floor.
+		let dods: Vec<i64> = [0, 1, -1, 2, -2, 1, 0, -1, 1, 0].to_vec();
+		let (width, packed) = bitpack_encode(&dods);
+		assert_eq!(bitpack_decode(width, &packed, dods.len()), dods, "round trip must be exact");
+		// zig-zag of {-2..=2} is {0..=4} -> 3 bits each; 10 values -> ceil(30/8)=4
+		// data bytes + 1 width header = 5, vs 10 one-byte varints.
+		assert_eq!(width, 3);
+		assert_eq!(bitpack_bytes(&dods), 1 + 4);
+		assert!(bitpack_bytes(&dods) < zigzag_varint_bytes(&dods));
+	}
+
+	#[test]
+	fn bitpack_handles_all_zero_and_empty_streams() {
+		assert_eq!(bitpack_width(&[]), 0);
+		assert_eq!(bitpack_width(&[0, 0, 0]), 0);
+		let (w, packed) = bitpack_encode(&[0, 0, 0]);
+		assert_eq!(w, 0);
+		assert!(packed.is_empty());
+		assert_eq!(bitpack_decode(0, &[], 3), vec![0, 0, 0]);
+		// An all-zero stream packs to just the width header byte.
+		assert_eq!(bitpack_bytes(&[0, 0, 0]), 1);
+	}
+
+	#[test]
+	fn bitpack_round_trips_a_wide_magnitude_stream() {
+		// Large magnitudes force a wide width but must still round-trip exactly.
+		let dods = [i64::MIN, -1, 0, 1, i64::MAX, 123_456_789, -987_654_321];
+		let (width, packed) = bitpack_encode(&dods);
+		assert_eq!(width, 64, "i64::MIN zig-zags to u64::MAX -> 64 bits");
+		assert_eq!(bitpack_decode(width, &packed, dods.len()), dods);
+	}
+
+	#[test]
+	fn best_estimate_falls_back_to_varint_on_a_wide_non_repeating_stream() {
+		// Distinct second differences (so RLE spends two varints per length-1 run and
+		// loses) plus one wide-magnitude outlier (so a fixed-width bit-pack must widen
+		// every value and loses too): per-value varint is the strict winner.
+		let values = vec![0_i64, 1, 3, 7, 14, 21 + 1_000_000_000];
 		let dod = encode_delta_of_delta(&values, TimeUnit::Seconds);
-		assert_eq!(dod.dods, vec![1, 2, 3, 4, 5, 6, 7, 8]); // all distinct
+		assert_eq!(dod.dods, vec![1, 2, 3, 1_000_000_000]);
 		assert!(dod.rle_estimated_bytes() > dod.estimated_bytes(), "RLE must lose on a non-repeating stream");
+		assert!(dod.bitpack_estimated_bytes() > dod.estimated_bytes(), "bit-packing must lose on a wide-magnitude stream");
 		assert_eq!(dod.best_estimated_bytes(), dod.estimated_bytes());
 	}
 
