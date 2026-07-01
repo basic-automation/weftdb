@@ -241,6 +241,88 @@ fn downsample_response_to_csv(response: &DownsampleResponse) -> Response {
 	([(header::CONTENT_TYPE, "text/csv; charset=utf-8")], out).into_response()
 }
 
+/// The Arrow IPC stream content type, per the Apache Arrow conventions.
+const ARROW_STREAM_CONTENT_TYPE: &str = "application/vnd.apache.arrow.stream";
+
+/// The Apache Parquet file content type.
+const PARQUET_CONTENT_TYPE: &str = "application/vnd.apache.parquet";
+
+/// Decompose a [`DownsampleResponse`] into the primitive columns the reduction-table
+/// Arrow/Parquet interchange consumes: nanosecond bucket epochs, per-bucket counts,
+/// and one `f64` column per requested reduction (in request order).
+///
+/// Kept private and primitive-typed so no `arrow-*` type appears in this module's
+/// signatures — all Arrow knowledge stays inside `dsp-arrow`.
+fn response_columns(response: &DownsampleResponse) -> (Vec<i64>, Vec<i64>, Vec<Vec<f64>>) {
+	let mut timestamps = Vec::with_capacity(response.series.len());
+	let mut counts = Vec::with_capacity(response.series.len());
+	for bucket in &response.series {
+		timestamps.push(bucket.timestamp.timestamp_nanos_opt().unwrap_or_default());
+		counts.push(i64::try_from(bucket.count).unwrap_or(i64::MAX));
+	}
+	// Every emitted bucket carries every requested reduction, so each column is dense.
+	let agg_columns: Vec<Vec<f64>> = response.aggregations.iter().map(|name| response.series.iter().map(|bucket| bucket.aggregations.get(name).copied().unwrap_or_default()).collect()).collect();
+	(timestamps, counts, agg_columns)
+}
+
+/// Handle `POST /api/v1/downsample/arrow`: the Arrow-IPC-output sibling of
+/// [`downsample`].
+///
+/// Takes the identical JSON request body and runs the identical bucketed reduction,
+/// then serves the reduced series as an **Arrow IPC stream**
+/// (`application/vnd.apache.arrow.stream`) — a self-describing columnar batch with a
+/// `timestamp` column, a `count` column, and one `Float64` column per requested
+/// reduction. The columnar counterpart of `POST /api/v1/downsample/csv` and the
+/// mirror of the interpolate Arrow output; the heavy `arrow-*` conversion lives
+/// entirely in `dsp-arrow`.
+///
+/// # Errors
+///
+/// As [`downsample`]: [`ApiError::BadRequest`] for an empty point set, a non-finite
+/// value, or an inverted range, and [`ApiError::Internal`] on a grid-mapping or
+/// Arrow-encoding failure.
+pub async fn downsample_arrow(State(metrics): State<SharedMetrics>, Json(request): Json<DownsampleRequest>) -> Result<Response, ApiError> {
+	metrics.record_downsample_request();
+	let result = downsample_inner(request);
+	match &result {
+		Ok(response) => metrics.add_downsample_buckets(response.0.buckets as u64),
+		Err(_) => metrics.record_downsample_error(),
+	}
+	let response = result?.0;
+	let (timestamps, counts, agg_columns) = response_columns(&response);
+	let names: Vec<&str> = response.aggregations.iter().map(String::as_str).collect();
+	let bytes = dsp_arrow::reduction_table_to_ipc_bytes(dsp_physical_type::TimeUnit::Nanos, &timestamps, &counts, &names, &agg_columns).map_err(|err| ApiError::Internal(err.to_string()))?;
+	Ok(([(header::CONTENT_TYPE, ARROW_STREAM_CONTENT_TYPE)], bytes).into_response())
+}
+
+/// Handle `POST /api/v1/downsample/parquet`: the Parquet-output sibling of
+/// [`downsample`].
+///
+/// Identical request body and reduction as [`downsample`], but serves the reduced
+/// series as an **Apache Parquet** file (`application/vnd.apache.parquet`) — the
+/// on-disk columnar interchange `DuckDB`, Spark, pandas/`Polars`, and the
+/// `InfluxDB`-3 FDAP stack read natively. The Parquet counterpart of
+/// [`downsample_arrow`].
+///
+/// # Errors
+///
+/// As [`downsample`]: [`ApiError::BadRequest`] for an empty point set, a non-finite
+/// value, or an inverted range, and [`ApiError::Internal`] on a grid-mapping or
+/// Parquet-encoding failure.
+pub async fn downsample_parquet(State(metrics): State<SharedMetrics>, Json(request): Json<DownsampleRequest>) -> Result<Response, ApiError> {
+	metrics.record_downsample_request();
+	let result = downsample_inner(request);
+	match &result {
+		Ok(response) => metrics.add_downsample_buckets(response.0.buckets as u64),
+		Err(_) => metrics.record_downsample_error(),
+	}
+	let response = result?.0;
+	let (timestamps, counts, agg_columns) = response_columns(&response);
+	let names: Vec<&str> = response.aggregations.iter().map(String::as_str).collect();
+	let bytes = dsp_arrow::reduction_table_to_parquet_bytes(dsp_physical_type::TimeUnit::Nanos, &timestamps, &counts, &names, &agg_columns).map_err(|err| ApiError::Internal(err.to_string()))?;
+	Ok(([(header::CONTENT_TYPE, PARQUET_CONTENT_TYPE)], bytes).into_response())
+}
+
 /// Handle `POST /api/v1/downsample/csv`: the CSV-output sibling of [`downsample`].
 ///
 /// Takes the identical JSON request body and runs the identical bucketed reduction,
@@ -653,5 +735,65 @@ mod tests {
 	async fn downsample_csv_empty_points_is_bad_request() {
 		let (status, _content_type, text) = post_json_for_text("/api/v1/downsample/csv", serde_json::json!({ "points": [] })).await;
 		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {text}");
+	}
+
+	/// POST a JSON body and return `(status, content-type, raw bytes)`.
+	async fn post_json_for_bytes(uri: &str, body: serde_json::Value) -> (StatusCode, String, Vec<u8>) {
+		let response = app().oneshot(Request::builder().method("POST").uri(uri).header("content-type", "application/json").body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap()).await.unwrap();
+		let status = response.status();
+		let content_type = response.headers().get("content-type").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		(status, content_type, bytes.to_vec())
+	}
+
+	fn two_bucket_body() -> serde_json::Value {
+		// Three samples in minute 0 (0,10,20) and two in minute 1 (30,50).
+		serde_json::json!({
+			"resolution": "minutes",
+			"aggregations": ["min", "max", "avg"],
+			"points": [
+				{ "timestamp": ts(0), "value": 0.0 },
+				{ "timestamp": ts(20), "value": 10.0 },
+				{ "timestamp": ts(40), "value": 20.0 },
+				{ "timestamp": ts(60), "value": 30.0 },
+				{ "timestamp": ts(90), "value": 50.0 },
+			],
+		})
+	}
+
+	#[tokio::test]
+	async fn downsample_arrow_serves_a_reduction_table_batch() {
+		let (status, content_type, bytes) = post_json_for_bytes("/api/v1/downsample/arrow", two_bucket_body()).await;
+		assert_eq!(status, StatusCode::OK);
+		assert_eq!(content_type, "application/vnd.apache.arrow.stream");
+
+		let batches = dsp_arrow::read_ipc_stream(&bytes).expect("valid arrow ipc");
+		let (unit, timestamps, counts, aggs) = dsp_arrow::reduction_table_from_record_batch(&batches[0]).expect("reads back");
+		assert_eq!(unit, dsp_physical_type::TimeUnit::Nanos);
+		assert_eq!(timestamps.len(), 2);
+		assert_eq!(counts, vec![3, 2]);
+		// Reductions preserve request order and per-bucket values.
+		assert_eq!(aggs[0], ("min".to_string(), vec![0.0, 30.0]));
+		assert_eq!(aggs[1], ("max".to_string(), vec![20.0, 50.0]));
+		assert_eq!(aggs[2], ("avg".to_string(), vec![10.0, 40.0]));
+	}
+
+	#[tokio::test]
+	async fn downsample_parquet_serves_a_parquet_file() {
+		let (status, content_type, bytes) = post_json_for_bytes("/api/v1/downsample/parquet", two_bucket_body()).await;
+		assert_eq!(status, StatusCode::OK);
+		assert_eq!(content_type, "application/vnd.apache.parquet");
+		assert_eq!(&bytes[..4], b"PAR1");
+
+		let batches = dsp_arrow::read_parquet(&bytes).expect("valid parquet");
+		let (_unit, _timestamps, counts, aggs) = dsp_arrow::reduction_table_from_record_batch(&batches[0]).expect("reads back");
+		assert_eq!(counts, vec![3, 2]);
+		assert_eq!(aggs[2], ("avg".to_string(), vec![10.0, 40.0]));
+	}
+
+	#[tokio::test]
+	async fn downsample_arrow_empty_points_is_bad_request() {
+		let (status, _content_type, _bytes) = post_json_for_bytes("/api/v1/downsample/arrow", serde_json::json!({ "points": [] })).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST);
 	}
 }

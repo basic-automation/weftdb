@@ -251,8 +251,32 @@ wins."*
 > (`timestamp,value,kind`) and `POST …/downsample/csv` (`timestamp,count,<agg>…`),
 > each reusing its JSON core. All hand-rolled (no new dependency): the columns are
 > integers / `BigDecimal` `Display` / RFC-3339 timestamps, none of which can
-> contain a comma, so no RFC-4180 escaping is ever required. Still to do:
-> OpenTelemetry.
+> contain a comma, so no RFC-4180 escaping is ever required. **Columnar
+> (Arrow IPC + Parquet) output for the compute endpoints landed (2026-07-01):**
+> the flagship `POST …/interpolate` and `POST …/downsample` now serve their
+> results as an **Arrow IPC stream** (`…/interpolate/arrow`, `…/downsample/arrow`,
+> `application/vnd.apache.arrow.stream`) and an **Apache Parquet** file
+> (`…/interpolate/parquet`, `…/downsample/parquet`,
+> `application/vnd.apache.parquet`), and every ILP compute sibling gained the same
+> output-format set (`…/interpolate/ilp/{csv,arrow,parquet}`,
+> `…/downsample/ilp/{csv,arrow,parquet}`) — so a TSBS-style harness feeding line
+> protocol pulls interpolated or reduced results in JSON / CSV / Arrow / Parquet.
+> `dsp-arrow` grew a **reconstructed-series** interchange (a three-column
+> `timestamp: Int64` / `value: Float64` / `kind: Utf8` batch — the
+> raw/interpolated/extrapolated provenance travels with the data, backlog B-tags)
+> and a general **reduction-table** interchange (`timestamp` + `count` + one
+> `Float64` column per requested reduction), each with `*_to_ipc_bytes` /
+> `*_to_parquet_bytes` bridges returning portable bytes, so no `arrow-*` type ever
+> crosses into `dsp-server`. The value columns are `f64` — the compute endpoints'
+> documented wire-numeric boundary (the logical `BigDecimal` is narrowed only at
+> the HTTP edge), the exact and honest column type, no false precision.
+> **Dependency decision:** `dsp-arrow` is promoted from a dev-dep to a regular dep
+> of `dsp-server` — a zero-cost, constraint-safe move (`dsp-arrow-store`, already a
+> regular dep, transitively pulls `dsp-arrow`, so the `arrow-*` tree was already in
+> the server's graph; and `dsp-server` is an application binary, not the lean
+> hot-path core the arrow constraint protects). Still to do: OpenTelemetry; CSV
+> output for the *storage* stored-range reads already exists, but the compute
+> interchange matrix is now complete.
 
 A commercial DB can't lead with an embedded Rust API + TUI. Build an `axum` server:
 create DB / subject / aspect; define schema/physical type; batch ingest; range query;
