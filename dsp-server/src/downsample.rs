@@ -134,12 +134,15 @@ pub struct DownsampleResponse {
 /// or an inverted range, and [`ApiError::Internal`] if a timestamp cannot be
 /// mapped onto the resolution grid.
 pub async fn downsample(State(metrics): State<SharedMetrics>, Json(request): Json<DownsampleRequest>) -> Result<Json<DownsampleResponse>, ApiError> {
+	let start = std::time::Instant::now();
 	metrics.record_downsample_request();
 	let result = downsample_inner(request);
 	match &result {
 		Ok(response) => metrics.add_downsample_buckets(response.0.buckets as u64),
 		Err(_) => metrics.record_downsample_error(),
 	}
+	// Latency of every request — success and error alike — feeds the p95 target.
+	metrics.observe_downsample_latency(start.elapsed());
 	result
 }
 

@@ -237,9 +237,12 @@ impl IntoResponse for ApiError {
 /// Returns [`ApiError::BadRequest`] for an empty point set, a non-finite value,
 /// or an inverted range, and [`ApiError::Internal`] if the engine fails.
 pub async fn interpolate(State(metrics): State<SharedMetrics>, Json(request): Json<InterpolateRequest>) -> Result<Json<InterpolateResponse>, ApiError> {
+	let start = std::time::Instant::now();
 	metrics.record_interpolate_request();
 	let result = interpolate_inner(request).await;
 	record_outcome(&metrics, &result);
+	// Latency of every request — success and error alike — feeds the p95 target.
+	metrics.observe_interpolate_latency(start.elapsed());
 	result
 }
 
