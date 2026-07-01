@@ -436,7 +436,7 @@ impl SegmentStore {
 	/// Propagates any libSQL read failure.
 	pub async fn aspect_stats(&self, aspect: &str) -> Result<AspectStorageStats> {
 		let index = self.index.load_index(aspect).await?;
-		Ok(AspectStorageStats { segment_count: index.len(), total_rows: index.total_rows(), total_bytes: index.total_bytes(), bytes_per_point: index.bytes_per_point(), time_range: index.time_range() })
+		Ok(AspectStorageStats { segment_count: index.len(), total_rows: index.total_rows(), total_bytes: index.total_bytes(), bytes_per_point: index.bytes_per_point(), time_range: index.time_range(), unsorted_segments: index.unsorted_count() })
 	}
 
 	/// The **materialized** segment-set rollup for `aspect` — the same aspect-wide
@@ -578,6 +578,12 @@ pub struct AspectStorageStats {
 	/// The inclusive `(min, max)` timestamp span covered by the aspect, or [`None`]
 	/// when it holds no non-empty segment.
 	pub time_range: Option<(i64, i64)>,
+	/// The number of sealed segments whose timestamps are **not** monotonic
+	/// non-decreasing — an order-health signal (an out-of-order segment forces a
+	/// linear scan on a point lookup; roadmap Phase 4.6). Zero when every segment
+	/// admits ordered access, which a `require_sorted` ingest keeps true by
+	/// construction. See [`SegmentIndex::unsorted_count`](dsp_physical_type::SegmentIndex::unsorted_count).
+	pub unsorted_segments: usize,
 }
 
 #[cfg(test)]
@@ -882,6 +888,8 @@ mod tests {
 		assert_eq!(stats.total_rows, 10);
 		assert_eq!(stats.total_bytes, expected_bytes);
 		assert_eq!(stats.time_range, Some((0, 140)));
+		// Both seals were in order, so the aspect is fully sorted.
+		assert_eq!(stats.unsorted_segments, 0);
 		#[allow(clippy::cast_precision_loss)]
 		let expected_bpp = expected_bytes as f64 / 10.0;
 		assert!((stats.bytes_per_point - expected_bpp).abs() < f64::EPSILON);
@@ -889,7 +897,22 @@ mod tests {
 		assert_eq!(empty.segment_count, 0);
 		assert_eq!(empty.total_rows, 0);
 		assert_eq!(empty.time_range, None);
+		assert_eq!(empty.unsorted_segments, 0);
 		assert!((empty.bytes_per_point - 0.0).abs() < f64::EPSILON);
+	}
+
+	#[tokio::test]
+	async fn aspect_stats_counts_out_of_order_segments() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		// One ordered seal, then one whose timestamps step backwards.
+		store.seal("a", &schema(), &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("ordered");
+		assert_eq!(store.aspect_stats("a").await.expect("stats").unsorted_segments, 0);
+		store.seal("a", &schema(), &[100_i64, 130, 110], &[bd("4"), bd("5"), bd("6")]).await.expect("out of order");
+		let stats = store.aspect_stats("a").await.expect("stats");
+		drop(store);
+		assert_eq!(stats.segment_count, 2);
+		assert_eq!(stats.unsorted_segments, 1, "one of the two segments is out of order");
 	}
 
 	#[tokio::test]
