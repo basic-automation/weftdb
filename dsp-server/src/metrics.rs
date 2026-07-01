@@ -45,6 +45,9 @@ pub struct Metrics {
 	pub interpolate_latency: LatencyHistogram,
 	/// End-to-end latency for the downsample endpoints (JSON + ILP).
 	pub downsample_latency: LatencyHistogram,
+	/// Seal-path latency for the storage-ingest endpoints (JSON / CSV / ILP) —
+	/// the ingest side of the "predictable p95/p99 under ingest + query" claim.
+	pub ingest_latency: LatencyHistogram,
 }
 
 /// A cumulative, fixed-bucket latency histogram rendered in the Prometheus
@@ -306,6 +309,11 @@ impl Metrics {
 		self.downsample_latency.observe(elapsed);
 	}
 
+	/// Record the seal-path latency of one storage-ingest request.
+	pub fn observe_ingest_latency(&self, elapsed: Duration) {
+		self.ingest_latency.observe(elapsed);
+	}
+
 	/// Take a consistent-enough snapshot of all counters.
 	#[must_use]
 	pub fn snapshot(&self) -> MetricsSnapshot {
@@ -328,6 +336,7 @@ impl Metrics {
 		// Latency histograms — the p95/p99 surface for the north-star target.
 		self.interpolate_latency.render_prometheus(&mut out, "dsp_interpolate_duration_seconds", "End-to-end handling latency for the interpolate endpoints (POST /api/v1/interpolate and /interpolate/ilp).");
 		self.downsample_latency.render_prometheus(&mut out, "dsp_downsample_duration_seconds", "End-to-end handling latency for the downsample endpoints (POST /api/v1/downsample and /downsample/ilp).");
+		self.ingest_latency.render_prometheus(&mut out, "dsp_ingest_duration_seconds", "Seal-path latency for the storage-ingest endpoints (JSON / CSV / ILP).");
 		out
 	}
 }
@@ -390,6 +399,21 @@ pub struct DownsampleProfile {
 	pub latency_seconds: LatencyProfile,
 }
 
+/// Storage-ingest counters plus the seal-path latency quantiles.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct IngestProfile {
+	/// Total storage-ingest requests (including failures).
+	pub requests: u64,
+	/// Storage-ingest requests that returned an error.
+	pub errors: u64,
+	/// Total rows sealed across all successful ingests.
+	pub rows_sealed: u64,
+	/// Total segments sealed across all successful ingests.
+	pub segments_sealed: u64,
+	/// Seal-path latency quantiles for the storage-ingest endpoints.
+	pub latency_seconds: LatencyProfile,
+}
+
 /// The whole-server profile snapshot served at `GET /debug/profile/current`.
 ///
 /// Roadmap Phase 3: a benchmark harness reads the live p95 target straight out
@@ -404,8 +428,8 @@ pub struct ProfileReport {
 	pub interpolate: InterpolateProfile,
 	/// Downsample-endpoint counters + latency quantiles.
 	pub downsample: DownsampleProfile,
-	/// Storage-ingest counters (no latency histogram yet).
-	pub ingest: IngestSnapshot,
+	/// Storage-ingest counters + seal-path latency quantiles.
+	pub ingest: IngestProfile,
 }
 
 impl Metrics {
@@ -414,7 +438,7 @@ impl Metrics {
 	#[must_use]
 	pub fn profile(&self) -> ProfileReport {
 		let snap = self.snapshot();
-		ProfileReport { service: crate::SERVICE, version: crate::VERSION, interpolate: InterpolateProfile { requests: snap.interpolate.requests, errors: snap.interpolate.errors, output_points: snap.interpolate.output_points, latency_seconds: LatencyProfile::from_snapshot(&self.interpolate_latency.snapshot()) }, downsample: DownsampleProfile { requests: snap.downsample.requests, errors: snap.downsample.errors, output_buckets: snap.downsample.output_buckets, latency_seconds: LatencyProfile::from_snapshot(&self.downsample_latency.snapshot()) }, ingest: snap.ingest }
+		ProfileReport { service: crate::SERVICE, version: crate::VERSION, interpolate: InterpolateProfile { requests: snap.interpolate.requests, errors: snap.interpolate.errors, output_points: snap.interpolate.output_points, latency_seconds: LatencyProfile::from_snapshot(&self.interpolate_latency.snapshot()) }, downsample: DownsampleProfile { requests: snap.downsample.requests, errors: snap.downsample.errors, output_buckets: snap.downsample.output_buckets, latency_seconds: LatencyProfile::from_snapshot(&self.downsample_latency.snapshot()) }, ingest: IngestProfile { requests: snap.ingest.requests, errors: snap.ingest.errors, rows_sealed: snap.ingest.rows_sealed, segments_sealed: snap.ingest.segments_sealed, latency_seconds: LatencyProfile::from_snapshot(&self.ingest_latency.snapshot()) } }
 	}
 }
 
@@ -454,8 +478,8 @@ mod tests {
 		assert!(text.contains("dsp_interpolate_requests_total 1"));
 		assert!(text.contains("dsp_interpolate_output_points_total 5"));
 		// No value line is left dangling without a preceding TYPE line: 10
-		// counters + the 2 latency histograms.
-		assert_eq!(text.matches("# TYPE ").count(), 12);
+		// counters + the 3 latency histograms.
+		assert_eq!(text.matches("# TYPE ").count(), 13);
 		// The downsample counters are exposed too.
 		assert!(text.contains("# TYPE dsp_downsample_requests_total counter"));
 		// And the storage-ingest counters.
