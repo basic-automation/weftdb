@@ -537,9 +537,22 @@ pub struct IlpParams {
 	/// is only reachable via the JSON endpoint (it needs structured parameters).
 	#[serde(default)]
 	pub spline: Option<String>,
+	/// Alias for [`spline`](IlpParams::spline) (B-rest) — accepts the same tokens, so
+	/// a client speaking the `interpolation=…` vocabulary of other TSDBs reaches the
+	/// same method. `spline` takes precedence when both are supplied.
+	#[serde(default)]
+	pub interpolation: Option<String>,
 	/// Resolution token (`seconds`..`years`); defaults to minutes.
 	#[serde(default)]
 	pub resolution: Option<String>,
+}
+
+impl IlpParams {
+	/// The effective spline token: the canonical `spline` when present, else the
+	/// `interpolation` alias (both default to cubic downstream).
+	fn spline_token(&self) -> Option<&str> {
+		self.spline.as_deref().or(self.interpolation.as_deref())
+	}
 }
 
 /// Interpolate an `InfluxDB` Line Protocol payload onto a regular grid.
@@ -622,7 +635,7 @@ pub async fn interpolate_ilp_parquet(State(metrics): State<SharedMetrics>, Query
 
 async fn interpolate_ilp_inner(params: &IlpParams, body: &str) -> Result<Json<InterpolateResponse>, ApiError> {
 	let precision = parse_precision_token(params.precision.as_deref())?;
-	let spline = parse_spline_token(params.spline.as_deref())?;
+	let spline = parse_spline_token(params.spline_token())?;
 	let resolution = parse_resolution_token(params.resolution.as_deref())?;
 
 	let points = dsp_line_protocol::parse_points(body, &params.field, precision).map_err(|err| ApiError::bad_request(err.to_string()))?;
@@ -824,6 +837,32 @@ mod tests {
 			let v = p["value"].as_f64().unwrap();
 			assert!((0.0..=60.0).contains(&v), "value {v} out of [0,60]");
 		}
+	}
+
+	#[tokio::test]
+	async fn ilp_endpoint_accepts_the_interpolation_alias() {
+		// `interpolation=` is the B-rest alias for `spline=` — same tokens, same result.
+		let payload = "cpu,host=a load=0 1000000000\ncpu,host=a load=60 1000000060\n";
+		let (status, body) = post_text("/api/v1/interpolate/ilp?field=load&precision=s&interpolation=linear&resolution=seconds", payload).await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["spline"], "Linear");
+	}
+
+	#[tokio::test]
+	async fn ilp_endpoint_spline_takes_precedence_over_the_alias() {
+		// When both are given, the canonical `spline` wins over `interpolation`.
+		let payload = "cpu,host=a load=0 1000000000\ncpu,host=a load=60 1000000060\n";
+		let (status, body) = post_text("/api/v1/interpolate/ilp?field=load&precision=s&spline=quadratic&interpolation=linear", payload).await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["spline"], "Quadratic");
+	}
+
+	#[tokio::test]
+	async fn ilp_endpoint_rejects_an_unknown_interpolation_alias() {
+		let payload = "cpu,host=a load=0 1000000000\ncpu,host=a load=60 1000000060\n";
+		let (status, body) = post_text("/api/v1/interpolate/ilp?field=load&precision=s&interpolation=sinc", payload).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+		assert!(body["error"].as_str().unwrap().contains("unknown spline"));
 	}
 
 	#[tokio::test]
