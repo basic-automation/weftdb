@@ -983,7 +983,7 @@ mod tests {
 			store.seal("a", &schema(), &ts, &vs).await.expect("seals");
 		}
 		// Force a wrong rollup, then remove another aspect's row entirely.
-		store.metadata().put("a", &AspectMetadata { segment_count: 99, total_rows: 1, total_nulls: 7, total_bytes: 3, time_range: Some((-5, -1)), value_range: Some((bd("-9"), bd("-8"))) }).await.expect("clobbers");
+		store.metadata().put("a", &AspectMetadata { segment_count: 99, total_rows: 1, total_nulls: 7, total_bytes: 3, unsorted_segments: 42, time_range: Some((-5, -1)), value_range: Some((bd("-9"), bd("-8"))) }).await.expect("clobbers");
 		let diverged = store.aspect_metadata("a").await.expect("metadata");
 		// Rebuilding from the durable index restores the truth.
 		let reconciled = store.rebuild_aspect_metadata("a").await.expect("rebuilds");
@@ -995,6 +995,11 @@ mod tests {
 		assert_eq!(reconciled.total_bytes, stats.total_bytes);
 		assert_eq!(reconciled.time_range, Some((0, 240)));
 		assert_eq!(reconciled.value_range, Some((bd("0"), bd("204"))));
+		// The clobbered order-health count (42) is corrected back to the truth (0 —
+		// all three seals were in order), matching the index-derived stats.
+		assert_eq!(diverged.unsorted_segments, 42, "the clobber wrote a wrong order count");
+		assert_eq!(reconciled.unsorted_segments, stats.unsorted_segments);
+		assert_eq!(reconciled.unsorted_segments, 0);
 	}
 
 	#[tokio::test]
