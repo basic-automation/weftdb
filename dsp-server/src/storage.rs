@@ -364,6 +364,7 @@ async fn storage_ingest_parquet_inner(store: &database::SegmentStore, metrics: &
 		byte_len: descriptor.byte_len,
 		min_ts: descriptor.min_ts,
 		max_ts: descriptor.max_ts,
+		time_sorted: descriptor.time_sorted,
 	};
 	Ok((StatusCode::CREATED, Json(response)).into_response())
 }
