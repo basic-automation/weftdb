@@ -18,7 +18,8 @@ use std::{
 	}, time::Duration
 };
 
-use axum::{extract::State, http::header, response::IntoResponse};
+use axum::{extract::State, http::header, response::IntoResponse, Json};
+use serde::Serialize;
 
 /// Shared, cheaply-cloneable handle to the server's metrics.
 pub type SharedMetrics = Arc<Metrics>;
@@ -143,6 +144,37 @@ impl LatencyHistogramSnapshot {
 	pub fn sum_seconds(&self) -> f64 {
 		self.sum_micros as f64 / 1_000_000.0
 	}
+
+	/// Estimate the `q`-quantile (`0.0..=1.0`) latency in seconds from the
+	/// bucket counts, using Prometheus `histogram_quantile` semantics: locate the
+	/// bucket the rank falls in and linearly interpolate between its lower and
+	/// upper bounds. Returns `None` when there are no observations; a rank landing
+	/// in the open-ended `+Inf` bucket is clamped to the largest finite bound
+	/// (the histogram cannot resolve a value beyond its last edge).
+	#[must_use]
+	#[allow(clippy::cast_precision_loss)] // counts < 2^53 in any realistic run; f64 is exact there.
+	pub fn quantile(&self, q: f64) -> Option<f64> {
+		if self.count == 0 {
+			return None;
+		}
+		let rank = q.clamp(0.0, 1.0) * self.count as f64;
+		let mut cum_prev = 0_u64;
+		let mut lower = 0.0_f64;
+		for (&bound, &in_bucket) in LATENCY_BUCKETS_SECS.iter().zip(self.buckets.iter()) {
+			let cum = cum_prev + in_bucket;
+			if cum as f64 >= rank {
+				if in_bucket == 0 {
+					return Some(bound);
+				}
+				let frac = (rank - cum_prev as f64) / in_bucket as f64;
+				return Some((bound - lower).mul_add(frac, lower));
+			}
+			cum_prev = cum;
+			lower = bound;
+		}
+		// Rank falls in the `+Inf` bucket — clamp to the largest finite edge.
+		LATENCY_BUCKETS_SECS.last().copied()
+	}
 }
 
 /// Counters for the interpolation endpoint.
@@ -204,7 +236,7 @@ pub struct DownsampleSnapshot {
 }
 
 /// A point-in-time read of [`IngestMetrics`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct IngestSnapshot {
 	/// Total storage-ingest requests received (including failures).
 	pub requests: u64,
@@ -305,6 +337,93 @@ pub async fn metrics(State(state): State<SharedMetrics>) -> impl IntoResponse {
 	([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], state.render_prometheus())
 }
 
+/// The estimated latency quantiles for one endpoint, in seconds.
+///
+/// The machine-readable form of the north-star p95/p99 target a benchmark
+/// harness reads without standing up a Prometheus server. Quantiles are `None`
+/// before the first request.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct LatencyProfile {
+	/// Total observed requests (the histogram's `_count`).
+	pub count: u64,
+	/// Summed observed latency in seconds (the histogram's `_sum`).
+	pub sum_seconds: f64,
+	/// Estimated median (p50) latency in seconds.
+	pub p50_seconds: Option<f64>,
+	/// Estimated p95 latency in seconds — the governing SLO term.
+	pub p95_seconds: Option<f64>,
+	/// Estimated p99 latency in seconds.
+	pub p99_seconds: Option<f64>,
+}
+
+impl LatencyProfile {
+	/// Derive the profile (count, sum, p50/p95/p99) from a histogram snapshot.
+	#[must_use]
+	pub fn from_snapshot(s: &LatencyHistogramSnapshot) -> Self {
+		Self { count: s.count, sum_seconds: s.sum_seconds(), p50_seconds: s.quantile(0.50), p95_seconds: s.quantile(0.95), p99_seconds: s.quantile(0.99) }
+	}
+}
+
+/// Per-endpoint counters plus latency quantiles for the interpolation endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct InterpolateProfile {
+	/// Total interpolation requests (including failures).
+	pub requests: u64,
+	/// Interpolation requests that returned an error.
+	pub errors: u64,
+	/// Total interpolated output points served.
+	pub output_points: u64,
+	/// End-to-end latency quantiles for `POST /api/v1/interpolate`.
+	pub latency_seconds: LatencyProfile,
+}
+
+/// Per-endpoint counters plus latency quantiles for the downsample endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct DownsampleProfile {
+	/// Total downsample requests (including failures).
+	pub requests: u64,
+	/// Downsample requests that returned an error.
+	pub errors: u64,
+	/// Total non-empty buckets served.
+	pub output_buckets: u64,
+	/// End-to-end latency quantiles for `POST /api/v1/downsample`.
+	pub latency_seconds: LatencyProfile,
+}
+
+/// The whole-server profile snapshot served at `GET /debug/profile/current`.
+///
+/// Roadmap Phase 3: a benchmark harness reads the live p95 target straight out
+/// of this JSON — no Prometheus/Grafana rule required.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct ProfileReport {
+	/// Logical service name.
+	pub service: &'static str,
+	/// Running build version.
+	pub version: &'static str,
+	/// Interpolation-endpoint counters + latency quantiles.
+	pub interpolate: InterpolateProfile,
+	/// Downsample-endpoint counters + latency quantiles.
+	pub downsample: DownsampleProfile,
+	/// Storage-ingest counters (no latency histogram yet).
+	pub ingest: IngestSnapshot,
+}
+
+impl Metrics {
+	/// Build the whole-server [`ProfileReport`]: the counter snapshot plus the
+	/// estimated p50/p95/p99 latency for each instrumented compute endpoint.
+	#[must_use]
+	pub fn profile(&self) -> ProfileReport {
+		let snap = self.snapshot();
+		ProfileReport { service: crate::SERVICE, version: crate::VERSION, interpolate: InterpolateProfile { requests: snap.interpolate.requests, errors: snap.interpolate.errors, output_points: snap.interpolate.output_points, latency_seconds: LatencyProfile::from_snapshot(&self.interpolate_latency.snapshot()) }, downsample: DownsampleProfile { requests: snap.downsample.requests, errors: snap.downsample.errors, output_buckets: snap.downsample.output_buckets, latency_seconds: LatencyProfile::from_snapshot(&self.downsample_latency.snapshot()) }, ingest: snap.ingest }
+	}
+}
+
+/// Handle `GET /debug/profile/current`: the live counter + latency-quantile
+/// snapshot as JSON, so a benchmark run can read the p95 target directly.
+pub async fn profile_current(State(state): State<SharedMetrics>) -> Json<ProfileReport> {
+	Json(state.profile())
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -378,6 +497,57 @@ mod tests {
 		// The downsample histogram is exposed even with no observations.
 		assert!(text.contains("# TYPE dsp_downsample_duration_seconds histogram"));
 		assert!(text.contains("dsp_downsample_duration_seconds_count 0"));
+	}
+
+	#[test]
+	fn latency_quantile_interpolates_within_the_bucket() {
+		let h = LatencyHistogram::default();
+		// No observations → no quantile.
+		assert_eq!(h.snapshot().quantile(0.95), None);
+		// 100 observations all at ~3 ms → land in the le=0.005 bucket (index 3,
+		// lower edge 0.0025). Every quantile interpolates inside [0.0025, 0.005].
+		for _ in 0..100 {
+			h.observe(Duration::from_micros(3_000));
+		}
+		let snap = h.snapshot();
+		let p95 = snap.quantile(0.95).unwrap();
+		assert!((0.0025..=0.005).contains(&p95), "p95 was {p95}");
+		let p50 = snap.quantile(0.50).unwrap();
+		assert!((0.0025..=0.005).contains(&p50), "p50 was {p50}");
+	}
+
+	#[test]
+	fn latency_quantile_clamps_to_the_last_finite_bound_on_overflow() {
+		let h = LatencyHistogram::default();
+		// A 10 s observation exceeds the largest finite bound (2.5) → +Inf; the
+		// quantile can only be resolved to that last finite edge.
+		h.observe(Duration::from_secs(10));
+		assert_eq!(h.snapshot().quantile(0.99), Some(2.5));
+	}
+
+	#[test]
+	fn profile_reports_counts_and_quantiles() {
+		let m = Metrics::default();
+		m.record_interpolate_request();
+		m.add_output_points(21);
+		m.observe_interpolate_latency(Duration::from_micros(3_000));
+		m.record_downsample_request();
+		m.add_downsample_buckets(2);
+		m.observe_downsample_latency(Duration::from_micros(70));
+		m.record_ingest_seal(5);
+		let p = m.profile();
+		assert_eq!(p.service, crate::SERVICE);
+		assert_eq!(p.interpolate.requests, 1);
+		assert_eq!(p.interpolate.output_points, 21);
+		assert_eq!(p.interpolate.latency_seconds.count, 1);
+		assert!(p.interpolate.latency_seconds.p95_seconds.is_some());
+		assert_eq!(p.downsample.output_buckets, 2);
+		assert_eq!(p.ingest.rows_sealed, 5);
+		assert_eq!(p.ingest.segments_sealed, 1);
+		// Serializes to an object carrying the nested latency block.
+		let json = serde_json::to_value(p).unwrap();
+		assert!(json["interpolate"]["latency_seconds"]["p95_seconds"].is_number());
+		assert_eq!(json["service"], crate::SERVICE);
 	}
 
 	#[test]
