@@ -47,11 +47,11 @@
 
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use arrow_array::RecordBatch;
 use bigdecimal::BigDecimal;
 use database::SegmentStore;
-use dsp_physical_type::{AspectSchema, SegmentDescriptor, TimeUnit};
+use dsp_physical_type::{first_order_violation, AspectSchema, SegmentDescriptor, TimeUnit};
 
 /// Read the rows of `aspect` whose timestamp falls in the inclusive `[start, end]`
 /// window and return them as a single lossless Arrow [`RecordBatch`].
@@ -210,17 +210,29 @@ pub async fn read_value_range_to_parquet_bytes(store: &SegmentStore, aspect: &st
 /// value seals through the nullable (quality-mask) path; `rows_per_page` selects a
 /// paged frame.
 ///
+/// When `require_sorted` is set, a batch whose decoded timestamps are not monotonic
+/// non-decreasing is rejected (before any seal) — the Parquet counterpart of the
+/// `require_sorted` flag on the JSON / CSV / ILP ingest paths, so all four ingest
+/// formats enforce order consistently. `false` (the default) accepts out-of-order
+/// data for the Phase-4.6 reconciliation path.
+///
 /// # Errors
 ///
 /// Returns an error if `aspect` has no declared schema in the store (the message
 /// contains `no declared schema`, so a caller can map it to `404`), if the bytes
 /// are not a valid Parquet file or carry no DSP columns (a
-/// [`dsp_arrow::ConvertError`]), or if the seal fails (an unrepresentable value, or
-/// a filesystem/control-plane failure).
-pub async fn ingest_parquet_into_aspect(store: &SegmentStore, aspect: &str, bytes: &[u8], rows_per_page: Option<usize>) -> Result<SegmentDescriptor> {
+/// [`dsp_arrow::ConvertError`]), if `require_sorted` is set and the timestamps step
+/// backwards (the message contains `out-of-order timestamp`, mapped to `400`), or if
+/// the seal fails (an unrepresentable value, or a filesystem/control-plane failure).
+pub async fn ingest_parquet_into_aspect(store: &SegmentStore, aspect: &str, bytes: &[u8], rows_per_page: Option<usize>, require_sorted: bool) -> Result<SegmentDescriptor> {
 	let schema = aspect_schema(store, aspect).await?;
 	let batches = dsp_arrow::read_parquet(bytes)?;
 	let (timestamps, values) = dsp_arrow::record_batches_to_columns(&batches)?;
+	if require_sorted {
+		if let Some((index, previous, current)) = first_order_violation(&timestamps) {
+			bail!("out-of-order timestamp at row {index}: {current} < previous {previous} (require_sorted was set)");
+		}
+	}
 	let any_null = values.iter().any(Option::is_none);
 	let descriptor = match (rows_per_page, any_null) {
 		(Some(rows_per_page), true) => store.seal_paged_nullable(aspect, &schema, &timestamps, &values, rows_per_page).await?,
@@ -465,7 +477,7 @@ mod tests {
 		let batch = columns_to_record_batch_typed(TimeUnit::Seconds, PhysicalType::F64, &timestamps, &values);
 		let bytes = write_parquet(std::slice::from_ref(&batch)).expect("writes");
 
-		let descriptor = ingest_parquet_into_aspect(&store, "price", &bytes, None).await.expect("ingests");
+		let descriptor = ingest_parquet_into_aspect(&store, "price", &bytes, None, false).await.expect("ingests");
 		assert_eq!(descriptor.row_count, 3);
 		assert_eq!(descriptor.null_count, 0);
 
@@ -477,20 +489,41 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn parquet_ingest_require_sorted_rejects_out_of_order() {
+		use dsp_arrow::{columns_to_record_batch_typed, write_parquet};
+
+		let (_dir, store) = store_with_aspect(TimeUnit::Seconds, PhysicalType::F64).await;
+		// A Parquet batch whose timestamps step backwards at row 1 (90 < 100).
+		let timestamps = vec![100_i64, 90, 120];
+		let values = vec![Some(bd("1.5")), Some(bd("2.5")), Some(bd("3.5"))];
+		let batch = columns_to_record_batch_typed(TimeUnit::Seconds, PhysicalType::F64, &timestamps, &values);
+		let bytes = write_parquet(std::slice::from_ref(&batch)).expect("writes");
+
+		// require_sorted rejects it before any seal, naming the offending row...
+		let err = ingest_parquet_into_aspect(&store, "price", &bytes, None, true).await.expect_err("out of order");
+		assert!(err.to_string().contains("out-of-order timestamp at row 1"), "got: {err}");
+		// ...and nothing was sealed (the store is still empty for this aspect).
+		assert_eq!(store.segment_count("price").await.expect("count"), 0);
+		// The same batch ingests fine when order is not required.
+		let descriptor = ingest_parquet_into_aspect(&store, "price", &bytes, None, false).await.expect("ingests");
+		assert_eq!(descriptor.row_count, 3);
+	}
+
+	#[tokio::test]
 	async fn parquet_ingest_into_undeclared_aspect_errors_with_no_declared_schema() {
 		use dsp_arrow::{columns_to_record_batch, write_parquet};
 
 		let (_dir, store) = store_with_aspect(TimeUnit::Seconds, PhysicalType::F64).await;
 		let batch = columns_to_record_batch(TimeUnit::Seconds, &[1_i64], &[Some(bd("1"))]);
 		let bytes = write_parquet(std::slice::from_ref(&batch)).expect("writes");
-		let err = ingest_parquet_into_aspect(&store, "never_declared", &bytes, None).await.expect_err("must error");
+		let err = ingest_parquet_into_aspect(&store, "never_declared", &bytes, None, false).await.expect_err("must error");
 		assert!(err.to_string().contains("no declared schema"), "got: {err}");
 	}
 
 	#[tokio::test]
 	async fn parquet_ingest_rejects_garbage_bytes() {
 		let (_dir, store) = store_with_aspect(TimeUnit::Seconds, PhysicalType::F64).await;
-		let err = ingest_parquet_into_aspect(&store, "price", b"not a parquet file", None).await.expect_err("must error");
+		let err = ingest_parquet_into_aspect(&store, "price", b"not a parquet file", None, false).await.expect_err("must error");
 		assert!(err.to_string().contains("parquet"), "got: {err}");
 	}
 }

@@ -294,6 +294,10 @@ pub struct ParquetIngestParams {
 	/// Optional page height — seal a paged segment of this many rows per page.
 	#[serde(default)]
 	pub rows_per_page: Option<usize>,
+	/// When `true`, reject an out-of-order batch (`400`) instead of sealing it — the
+	/// Parquet counterpart of the JSON/CSV/ILP `require_sorted` flag.
+	#[serde(default)]
+	pub require_sorted: bool,
 }
 
 /// Classify a Parquet-ingest error: an undeclared aspect is a `404`; a malformed
@@ -304,7 +308,7 @@ fn classify_ingest_error(err: &anyhow::Error) -> StorageError {
 	let message = err.to_string();
 	if message.contains("no declared schema") {
 		StorageError::NotFound(message)
-	} else if message.contains("seal failed") || message.contains("paged seal failed") || message.contains("parquet error") || message.contains("is missing the") || message.contains("expected Arrow") || message.contains("required metadata") || message.contains("unrecognized time unit") || message.contains("does not parse") {
+	} else if message.contains("seal failed") || message.contains("paged seal failed") || message.contains("parquet error") || message.contains("is missing the") || message.contains("expected Arrow") || message.contains("required metadata") || message.contains("unrecognized time unit") || message.contains("does not parse") || message.contains("out-of-order timestamp") {
 		StorageError::BadRequest(message)
 	} else {
 		StorageError::Internal(message)
@@ -335,7 +339,7 @@ pub async fn storage_ingest_parquet(State(state): State<AppState>, Path(aspect):
 		StorageError::Unconfigured
 	})?;
 	drop(state);
-	let result = storage_ingest_parquet_inner(&store, &metrics, &aspect, params.rows_per_page, &body).await;
+	let result = storage_ingest_parquet_inner(&store, &metrics, &aspect, params.rows_per_page, params.require_sorted, &body).await;
 	drop(store);
 	if result.is_err() {
 		metrics.record_ingest_error();
@@ -345,11 +349,11 @@ pub async fn storage_ingest_parquet(State(state): State<AppState>, Path(aspect):
 
 /// The body of [`storage_ingest_parquet`], split out so the handler records an error
 /// metric for any failure path uniformly.
-async fn storage_ingest_parquet_inner(store: &database::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, rows_per_page: Option<usize>, body: &Bytes) -> Result<Response, StorageError> {
+async fn storage_ingest_parquet_inner(store: &database::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, rows_per_page: Option<usize>, require_sorted: bool, body: &Bytes) -> Result<Response, StorageError> {
 	if body.is_empty() {
 		return Err(StorageError::BadRequest("empty Parquet body".to_string()));
 	}
-	let descriptor = dsp_arrow_store::ingest_parquet_into_aspect(store, aspect, body, rows_per_page).await.map_err(|err| classify_ingest_error(&err))?;
+	let descriptor = dsp_arrow_store::ingest_parquet_into_aspect(store, aspect, body, rows_per_page, require_sorted).await.map_err(|err| classify_ingest_error(&err))?;
 	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
 	let response = IngestResponse {
 		aspect: aspect.to_string(),
@@ -1031,6 +1035,34 @@ mod tests {
 		assert!(bpp > 0.0 && bpp.is_finite(), "bytes_per_point = {bpp}");
 		// The sole sealed segment is in order, so the order-health signal is clean.
 		assert_eq!(body["unsorted_segments"], 0);
+	}
+
+	#[tokio::test]
+	async fn parquet_ingest_require_sorted_rejects_out_of_order() {
+		use dsp_arrow::{columns_to_record_batch_typed, write_parquet};
+
+		let dir = TempDir::new().expect("temp dir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens store");
+		store.declare("price", &AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds)).await.expect("declares");
+		let router = app_with_state(AppState::new().with_store(Arc::new(store)));
+		// An out-of-order Parquet batch (row 1: 90 < 100).
+		let batch = columns_to_record_batch_typed(TimeUnit::Seconds, PhysicalType::F64, &[100_i64, 90, 120], &[Some(bd("1")), Some(bd("2")), Some(bd("3"))]);
+		let bytes = write_parquet(std::slice::from_ref(&batch)).expect("writes parquet");
+
+		let post = |uri: &'static str| {
+			let router = router.clone();
+			let body = bytes.clone();
+			async move { router.oneshot(Request::builder().method("POST").uri(uri).header("content-type", "application/vnd.apache.parquet").body(Body::from(body)).unwrap()).await.unwrap() }
+		};
+		// require_sorted -> 400 with the offending row.
+		let rejected = post("/api/v1/storage/price/parquet?require_sorted=true").await;
+		assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+		let msg = axum::body::to_bytes(rejected.into_body(), usize::MAX).await.unwrap();
+		let msg: serde_json::Value = serde_json::from_slice(&msg).unwrap();
+		assert!(msg["error"].as_str().unwrap().contains("out-of-order timestamp"), "body: {msg}");
+		// Default (no flag) -> 201.
+		let accepted = post("/api/v1/storage/price/parquet").await;
+		assert_eq!(accepted.status(), StatusCode::CREATED);
 	}
 
 	#[tokio::test]
