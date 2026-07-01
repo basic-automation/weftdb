@@ -2968,4 +2968,4 @@ crate's Windows/C++ build behind a feature flag *first* (back it out and log the
 finding if it does not build cleanly); or (c) richer B-rest (`interpolation` query
 alias + cursor paging on the stored-range reads).
 
-**PR:** (to be filled after `gh pr create`)
+**PR:** https://github.com/physics515/DSP/pull/32
