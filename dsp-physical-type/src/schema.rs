@@ -78,6 +78,17 @@ pub enum SealError {
 	/// A paged seal ([`AspectSchema::seal_paged`]) was asked for a page height of
 	/// zero rows — the rows cannot be partitioned.
 	EmptyPageSize,
+	/// An order-enforcing seal ([`AspectSchema::seal_sorted`]) was given timestamps
+	/// that step backwards — reported at the first offending row (its timestamp is
+	/// strictly less than its predecessor's). Equal adjacent timestamps are accepted.
+	OutOfOrder {
+		/// The row whose timestamp broke monotonic non-decreasing order.
+		index: usize,
+		/// The preceding row's timestamp.
+		previous: i64,
+		/// This row's (smaller) timestamp.
+		current: i64,
+	},
 }
 
 impl std::fmt::Display for SealError {
@@ -87,6 +98,7 @@ impl std::fmt::Display for SealError {
 			Self::Encode(e) => write!(f, "schema seal: {e}"),
 			Self::ToleranceExceeded { max_abs_error, tolerance } => write!(f, "declared encoding exceeds tolerance: worst error {max_abs_error} > bound {tolerance}"),
 			Self::EmptyPageSize => write!(f, "schema paged seal: page height must be at least one row, got zero"),
+			Self::OutOfOrder { index, previous, current } => write!(f, "schema seal: out-of-order timestamp at row {index}: {current} < previous {previous}"),
 		}
 	}
 }
@@ -135,6 +147,33 @@ impl AspectSchema {
 		let ts_col = encode_delta_of_delta(timestamps, self.timestamp_unit);
 		let stats = SegmentStats::from_columns(timestamps, values);
 		Ok(Segment { version: SEGMENT_FORMAT_VERSION, values: value_col, timestamps: ts_col, nulls: NullMask::all_present(values.len()), stats })
+	}
+
+	/// Seal a batch under this schema **while enforcing monotonic non-decreasing
+	/// timestamps** (roadmap Phase 4.2 order enforcement).
+	///
+	/// Identical to [`seal`](AspectSchema::seal) except a batch whose timestamps
+	/// step backwards is rejected with [`SealError::OutOfOrder`] at the first
+	/// offending row, before any encoding work — the declared-write counterpart of
+	/// [`Segment::build_sorted`]. Order is checked first among the value gates so a
+	/// height mismatch still reports [`SealError::LengthMismatch`]; equal adjacent
+	/// timestamps are accepted.
+	///
+	/// # Errors
+	///
+	/// - [`SealError::LengthMismatch`] if the columns differ in height.
+	/// - [`SealError::OutOfOrder`] at the first row whose timestamp is strictly less
+	///   than its predecessor's.
+	/// - [`SealError::Encode`] / [`SealError::ToleranceExceeded`] exactly as
+	///   [`seal`](AspectSchema::seal) reports them.
+	pub fn seal_sorted(&self, timestamps: &[i64], values: &[BigDecimal]) -> Result<Segment, SealError> {
+		if timestamps.len() != values.len() {
+			return Err(SealError::LengthMismatch { timestamps: timestamps.len(), values: values.len() });
+		}
+		if let Some((index, previous, current)) = crate::timestamp::first_order_violation(timestamps) {
+			return Err(SealError::OutOfOrder { index, previous, current });
+		}
+		self.seal(timestamps, values)
 	}
 
 	/// Seal a **nullable** batch — a dense timestamp column and a
@@ -209,6 +248,36 @@ impl AspectSchema {
 		}
 		let stats = SegmentStats::from_columns(timestamps, values);
 		Ok(PagedSegment { version: PAGED_SEGMENT_FORMAT_VERSION, rows_per_page, pages, stats })
+	}
+
+	/// Seal a batch into a paged [`PagedSegment`] **while enforcing monotonic
+	/// non-decreasing timestamps** (roadmap Phase 4.2 order enforcement) — the paged
+	/// counterpart of [`seal_sorted`](AspectSchema::seal_sorted).
+	///
+	/// Order is checked over the **whole** timestamp column, so a backwards step that
+	/// straddles a page boundary is caught too; the row index in
+	/// [`SealError::OutOfOrder`] is global. Otherwise identical to
+	/// [`seal_paged`](AspectSchema::seal_paged). Gate priority: length mismatch, then
+	/// zero page size, then order, then the per-page encoding gates.
+	///
+	/// # Errors
+	///
+	/// - [`SealError::LengthMismatch`] if the columns differ in height.
+	/// - [`SealError::EmptyPageSize`] if `rows_per_page` is zero.
+	/// - [`SealError::OutOfOrder`] at the first globally backwards timestamp.
+	/// - [`SealError::Encode`] / [`SealError::ToleranceExceeded`] exactly as
+	///   [`seal_paged`](AspectSchema::seal_paged) reports them.
+	pub fn seal_paged_sorted(&self, timestamps: &[i64], values: &[BigDecimal], rows_per_page: usize) -> Result<PagedSegment, SealError> {
+		if timestamps.len() != values.len() {
+			return Err(SealError::LengthMismatch { timestamps: timestamps.len(), values: values.len() });
+		}
+		if rows_per_page == 0 {
+			return Err(SealError::EmptyPageSize);
+		}
+		if let Some((index, previous, current)) = crate::timestamp::first_order_violation(timestamps) {
+			return Err(SealError::OutOfOrder { index, previous, current });
+		}
+		self.seal_paged(timestamps, values, rows_per_page)
 	}
 
 	/// Seal one dense page's worth of rows under the declared encoding, remapping an
@@ -369,6 +438,20 @@ mod tests {
 	}
 
 	#[test]
+	fn seal_sorted_enforces_order_but_seals_like_seal_when_ordered() {
+		let schema = AspectSchema::new(PhysicalType::F64, BigDecimal::from(0), TimeUnit::Seconds);
+		// Ordered batch: identical result to `seal`.
+		let ok = schema.seal_sorted(&[0, 1, 2], &col(&["0.5", "0.25", "0.75"])).expect("ordered seals");
+		assert_eq!(ok, schema.seal(&[0, 1, 2], &col(&["0.5", "0.25", "0.75"])).expect("seals"));
+		// A backwards timestamp is rejected before any encoding work (row 2: 5 -> 3).
+		let err = schema.seal_sorted(&[0, 5, 3], &col(&["0.5", "0.25", "0.75"])).expect_err("out of order");
+		assert_eq!(err, SealError::OutOfOrder { index: 2, previous: 5, current: 3 });
+		// Height mismatch still takes priority over the order check.
+		let mismatch = schema.seal_sorted(&[0, 5, 3], &col(&["0.5", "0.25"])).expect_err("mismatch first");
+		assert_eq!(mismatch, SealError::LengthMismatch { timestamps: 3, values: 2 });
+	}
+
+	#[test]
 	fn length_mismatch_is_rejected() {
 		let schema = AspectSchema::new(PhysicalType::F64, BigDecimal::from(0), TimeUnit::Seconds);
 		let err = schema.seal(&[1, 2, 3], &col(&["1.0", "2.0"])).expect_err("mismatch");
@@ -472,6 +555,22 @@ mod tests {
 		// And it survives the on-disk frame.
 		let back = PagedSegment::read_from(&seg.write_to()).expect("reads");
 		assert_eq!(back, seg);
+	}
+
+	#[test]
+	fn seal_paged_sorted_catches_a_cross_page_boundary_regression() {
+		let schema = AspectSchema::new(PhysicalType::ScaledI64 { scale: 0 }, BigDecimal::from(0), TimeUnit::Seconds);
+		let vs = col(&["1", "2", "3", "4", "5", "6"]);
+		// Ordered batch: identical to `seal_paged`.
+		let ok = schema.seal_paged_sorted(&[0, 1, 2, 3, 4, 5], &vs, 2).expect("ordered");
+		assert_eq!(ok, schema.seal_paged(&[0, 1, 2, 3, 4, 5], &vs, 2).expect("seals"));
+		// Row 4 (page 3, size 2) steps back below row 3 — a regression straddling the
+		// page boundary must still be caught, with the *global* row index.
+		let err = schema.seal_paged_sorted(&[0, 1, 2, 3, 1, 5], &vs, 2).expect_err("out of order");
+		assert_eq!(err, SealError::OutOfOrder { index: 4, previous: 3, current: 1 });
+		// Length and zero-page-size gates still take priority over the order check.
+		assert_eq!(schema.seal_paged_sorted(&[0, 5, 1], &col(&["1", "2"]), 2).expect_err("mismatch"), SealError::LengthMismatch { timestamps: 3, values: 2 });
+		assert_eq!(schema.seal_paged_sorted(&[0, 5, 1], &col(&["1", "2", "3"]), 0).expect_err("zero page"), SealError::EmptyPageSize);
 	}
 
 	#[test]

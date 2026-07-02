@@ -294,6 +294,10 @@ pub struct ParquetIngestParams {
 	/// Optional page height — seal a paged segment of this many rows per page.
 	#[serde(default)]
 	pub rows_per_page: Option<usize>,
+	/// When `true`, reject an out-of-order batch (`400`) instead of sealing it — the
+	/// Parquet counterpart of the JSON/CSV/ILP `require_sorted` flag.
+	#[serde(default)]
+	pub require_sorted: bool,
 }
 
 /// Classify a Parquet-ingest error: an undeclared aspect is a `404`; a malformed
@@ -304,7 +308,7 @@ fn classify_ingest_error(err: &anyhow::Error) -> StorageError {
 	let message = err.to_string();
 	if message.contains("no declared schema") {
 		StorageError::NotFound(message)
-	} else if message.contains("seal failed") || message.contains("paged seal failed") || message.contains("parquet error") || message.contains("is missing the") || message.contains("expected Arrow") || message.contains("required metadata") || message.contains("unrecognized time unit") || message.contains("does not parse") {
+	} else if message.contains("seal failed") || message.contains("paged seal failed") || message.contains("parquet error") || message.contains("is missing the") || message.contains("expected Arrow") || message.contains("required metadata") || message.contains("unrecognized time unit") || message.contains("does not parse") || message.contains("out-of-order timestamp") {
 		StorageError::BadRequest(message)
 	} else {
 		StorageError::Internal(message)
@@ -335,7 +339,7 @@ pub async fn storage_ingest_parquet(State(state): State<AppState>, Path(aspect):
 		StorageError::Unconfigured
 	})?;
 	drop(state);
-	let result = storage_ingest_parquet_inner(&store, &metrics, &aspect, params.rows_per_page, &body).await;
+	let result = storage_ingest_parquet_inner(&store, &metrics, &aspect, params.rows_per_page, params.require_sorted, &body).await;
 	drop(store);
 	if result.is_err() {
 		metrics.record_ingest_error();
@@ -345,11 +349,11 @@ pub async fn storage_ingest_parquet(State(state): State<AppState>, Path(aspect):
 
 /// The body of [`storage_ingest_parquet`], split out so the handler records an error
 /// metric for any failure path uniformly.
-async fn storage_ingest_parquet_inner(store: &database::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, rows_per_page: Option<usize>, body: &Bytes) -> Result<Response, StorageError> {
+async fn storage_ingest_parquet_inner(store: &database::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, rows_per_page: Option<usize>, require_sorted: bool, body: &Bytes) -> Result<Response, StorageError> {
 	if body.is_empty() {
 		return Err(StorageError::BadRequest("empty Parquet body".to_string()));
 	}
-	let descriptor = dsp_arrow_store::ingest_parquet_into_aspect(store, aspect, body, rows_per_page).await.map_err(|err| classify_ingest_error(&err))?;
+	let descriptor = dsp_arrow_store::ingest_parquet_into_aspect(store, aspect, body, rows_per_page, require_sorted).await.map_err(|err| classify_ingest_error(&err))?;
 	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
 	let response = IngestResponse {
 		aspect: aspect.to_string(),
@@ -360,6 +364,7 @@ async fn storage_ingest_parquet_inner(store: &database::SegmentStore, metrics: &
 		byte_len: descriptor.byte_len,
 		min_ts: descriptor.min_ts,
 		max_ts: descriptor.max_ts,
+		time_sorted: descriptor.time_sorted,
 	};
 	Ok((StatusCode::CREATED, Json(response)).into_response())
 }
@@ -585,6 +590,11 @@ pub struct AspectStatsResponse {
 	pub total_bytes: u64,
 	/// The north-star cost term: total framed bytes over total rows (0 when empty).
 	pub bytes_per_point: f64,
+	/// The number of sealed segments whose timestamps are not monotonic
+	/// non-decreasing — an order-health signal (a growing count predicts rising
+	/// read-scan cost, since an out-of-order segment cannot be binary-searched). Zero
+	/// when every segment admits ordered access.
+	pub unsorted_segments: usize,
 	/// Inclusive `[min, max]` timestamp span, or `null` when the aspect holds no
 	/// non-empty segment.
 	pub time_range: Option<[i64; 2]>,
@@ -608,6 +618,9 @@ pub struct StoreStatsResponse {
 	pub total_bytes: u64,
 	/// The store-wide north-star cost term: total framed bytes over total rows.
 	pub bytes_per_point: f64,
+	/// Total out-of-order segments across every aspect — the store-wide order-health
+	/// signal (0 when every sealed segment admits ordered access).
+	pub unsorted_segments: usize,
 	/// Inclusive `[min, max]` timestamp span across the union of aspects, or `null`.
 	pub time_range: Option<[i64; 2]>,
 }
@@ -747,7 +760,7 @@ pub async fn storage_aspect_stats(State(state): State<AppState>, Path(aspect): P
 	let bytes_per_point = meta.bytes_per_point();
 	let time_range = meta.time_range.map(Into::into);
 	let value_range = meta.value_range.map(|(lo, hi)| [lo.to_string(), hi.to_string()]);
-	Ok(Json(AspectStatsResponse { aspect, segment_count: meta.segment_count, total_rows: meta.total_rows, total_nulls: meta.total_nulls, total_bytes: meta.total_bytes, bytes_per_point, time_range, value_range }))
+	Ok(Json(AspectStatsResponse { aspect, segment_count: meta.segment_count, total_rows: meta.total_rows, total_nulls: meta.total_nulls, total_bytes: meta.total_bytes, bytes_per_point, unsorted_segments: meta.unsorted_segments, time_range, value_range }))
 }
 
 /// Handle `GET /api/v1/storage/stats`: the store-wide aggregate over every aspect's
@@ -765,7 +778,7 @@ pub async fn storage_stats(State(state): State<AppState>) -> Result<Json<StoreSt
 	let summary = result.map_err(|err| StorageError::Internal(err.to_string()))?;
 	let bytes_per_point = summary.bytes_per_point();
 	let time_range = summary.time_range.map(Into::into);
-	Ok(Json(StoreStatsResponse { aspect_count: summary.aspect_count, segment_count: summary.segment_count, total_rows: summary.total_rows, total_nulls: summary.total_nulls, total_bytes: summary.total_bytes, bytes_per_point, time_range }))
+	Ok(Json(StoreStatsResponse { aspect_count: summary.aspect_count, segment_count: summary.segment_count, total_rows: summary.total_rows, total_nulls: summary.total_nulls, total_bytes: summary.total_bytes, bytes_per_point, unsorted_segments: summary.unsorted_segments, time_range }))
 }
 
 #[cfg(test)]
@@ -1021,6 +1034,52 @@ mod tests {
 		// The north-star cost term is a positive, finite bytes/point.
 		let bpp = body["bytes_per_point"].as_f64().unwrap();
 		assert!(bpp > 0.0 && bpp.is_finite(), "bytes_per_point = {bpp}");
+		// The sole sealed segment is in order, so the order-health signal is clean.
+		assert_eq!(body["unsorted_segments"], 0);
+	}
+
+	#[tokio::test]
+	async fn parquet_ingest_require_sorted_rejects_out_of_order() {
+		use dsp_arrow::{columns_to_record_batch_typed, write_parquet};
+
+		let dir = TempDir::new().expect("temp dir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens store");
+		store.declare("price", &AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds)).await.expect("declares");
+		let router = app_with_state(AppState::new().with_store(Arc::new(store)));
+		// An out-of-order Parquet batch (row 1: 90 < 100).
+		let batch = columns_to_record_batch_typed(TimeUnit::Seconds, PhysicalType::F64, &[100_i64, 90, 120], &[Some(bd("1")), Some(bd("2")), Some(bd("3"))]);
+		let bytes = write_parquet(std::slice::from_ref(&batch)).expect("writes parquet");
+
+		let post = |uri: &'static str| {
+			let router = router.clone();
+			let body = bytes.clone();
+			async move { router.oneshot(Request::builder().method("POST").uri(uri).header("content-type", "application/vnd.apache.parquet").body(Body::from(body)).unwrap()).await.unwrap() }
+		};
+		// require_sorted -> 400 with the offending row.
+		let rejected = post("/api/v1/storage/price/parquet?require_sorted=true").await;
+		assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+		let msg = axum::body::to_bytes(rejected.into_body(), usize::MAX).await.unwrap();
+		let msg: serde_json::Value = serde_json::from_slice(&msg).unwrap();
+		assert!(msg["error"].as_str().unwrap().contains("out-of-order timestamp"), "body: {msg}");
+		// Default (no flag) -> 201.
+		let accepted = post("/api/v1/storage/price/parquet").await;
+		assert_eq!(accepted.status(), StatusCode::CREATED);
+	}
+
+	#[tokio::test]
+	async fn aspect_stats_reports_unsorted_segments_after_an_out_of_order_seal() {
+		let dir = TempDir::new().expect("temp dir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens store");
+		store.declare("price", &AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds)).await.expect("declares");
+		// One ordered segment, then one whose timestamps step backwards.
+		store.seal_declared("price", &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("ordered");
+		store.seal_declared("price", &[100_i64, 130, 110], &[bd("4"), bd("5"), bd("6")]).await.expect("out of order");
+		let router = app_with_state(AppState::new().with_store(Arc::new(store)));
+		let (status, body) = get_json(router, "/api/v1/storage/price/stats").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["segment_count"], 2);
+		// The rollup fold path (record_seal) surfaced the out-of-order segment at the endpoint.
+		assert_eq!(body["unsorted_segments"], 1, "body: {body}");
 	}
 
 	#[tokio::test]
@@ -1031,6 +1090,8 @@ mod tests {
 		assert_eq!(body["aspect_count"], 1);
 		assert_eq!(body["total_rows"], 5);
 		assert!(body["bytes_per_point"].as_f64().unwrap() > 0.0);
+		// The store's sole segment is in order — store-wide order health is clean.
+		assert_eq!(body["unsorted_segments"], 0);
 	}
 
 	#[tokio::test]

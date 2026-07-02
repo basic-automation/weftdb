@@ -159,6 +159,26 @@ pub fn decode_delta_of_delta(col: &DeltaOfDeltaColumn) -> Vec<i64> {
 	out
 }
 
+/// The first out-of-order position in an epoch column, if any.
+///
+/// Scans for the first index `i` where `timestamps[i] < timestamps[i-1]` — a
+/// genuine backwards step that breaks monotonic **non-decreasing** order — and
+/// returns `(i, previous, current)` for it. Equal neighbours are in order (a
+/// duplicate timestamp is not a violation, matching
+/// [`SegmentStats::time_sorted`](crate::segment::SegmentStats::time_sorted), which
+/// admits `ts[i] == ts[i-1]`). Returns [`None`] for an empty, single-row, or fully
+/// ordered column.
+///
+/// This is the primitive behind the order-enforcing build/seal paths
+/// ([`Segment::build_sorted`](crate::segment::Segment::build_sorted),
+/// [`AspectSchema::seal_sorted`](crate::schema::AspectSchema::seal_sorted)): they
+/// reject a batch at its first backwards step instead of silently storing it with
+/// `time_sorted = false`.
+#[must_use]
+pub fn first_order_violation(timestamps: &[i64]) -> Option<(usize, i64, i64)> {
+	timestamps.windows(2).position(|w| w[1] < w[0]).map(|i| (i + 1, timestamps[i], timestamps[i + 1]))
+}
+
 /// Number of bytes a single `i64` occupies under zig-zag + LEB128 varint coding.
 ///
 /// Zig-zag maps a signed value to an unsigned one so small-magnitude negatives
@@ -440,6 +460,18 @@ mod tests {
 	fn time_unit_names_are_stable() {
 		assert_eq!(TimeUnit::Seconds.name(), "seconds");
 		assert_eq!(TimeUnit::Nanos.name(), "nanos");
+	}
+
+	#[test]
+	fn first_order_violation_finds_the_first_backwards_step() {
+		// Fully ordered (with a duplicate — equal neighbours are in order) -> None.
+		assert_eq!(first_order_violation(&[10, 10, 20, 20, 30]), None);
+		// Empty / single-row are vacuously ordered.
+		assert_eq!(first_order_violation(&[]), None);
+		assert_eq!(first_order_violation(&[42]), None);
+		// First backwards step is at row 3 (30 -> 25), reported even though a later
+		// pair (50 -> 40) also regresses.
+		assert_eq!(first_order_violation(&[10, 20, 30, 25, 50, 40]), Some((3, 30, 25)));
 	}
 
 	#[test]

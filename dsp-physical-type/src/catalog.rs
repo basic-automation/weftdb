@@ -261,6 +261,19 @@ impl SegmentIndex {
 		self.descriptors.iter().map(|d| d.byte_len).sum()
 	}
 
+	/// The number of indexed segments whose timestamps are **not** monotonic
+	/// non-decreasing ([`SegmentDescriptor::time_sorted`] is `false`).
+	///
+	/// An order-health signal for read planning and operators: an out-of-order
+	/// segment cannot be binary-searched for a point lookup and forces a linear scan
+	/// (roadmap Phase 4.6), so a growing count predicts rising read-scan cost. Zero
+	/// means every segment admits ordered access. A caller enforcing order at ingest
+	/// (`require_sorted`) keeps this at zero by construction.
+	#[must_use]
+	pub fn unsorted_count(&self) -> usize {
+		self.descriptors.iter().filter(|d| !d.time_sorted).count()
+	}
+
 	/// Aspect-wide storage cost in **bytes per point**: the total framed bytes over
 	/// the total rows. Zero when the index holds no rows.
 	#[must_use]
@@ -506,6 +519,31 @@ mod tests {
 		#[allow(clippy::cast_precision_loss)]
 		let expected_bpp = expected_bytes as f64 / 30.0;
 		assert!((index.bytes_per_point() - expected_bpp).abs() < f64::EPSILON);
+	}
+
+	/// A sealed single-block segment whose timestamps step backwards (so
+	/// `time_sorted` is `false`), over `base..` then a dip.
+	fn sealed_unsorted(base: i64) -> (Segment, u64) {
+		let ts = vec![base, base + 30, base + 10, base + 40];
+		let vs: Vec<BigDecimal> = (0..4).map(BigDecimal::from).collect();
+		let seg = Segment::build(&ts, &vs, TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		assert!(!seg.is_time_sorted(), "fixture must be out-of-order");
+		let len = seg.write_to().len() as u64;
+		(seg, len)
+	}
+
+	#[test]
+	fn index_counts_unsorted_segments() {
+		let mut index = SegmentIndex::new();
+		assert_eq!(index.unsorted_count(), 0);
+		// Two sorted, one unsorted.
+		let (a, la) = sealed(0);
+		index.push(SegmentDescriptor::of_segment(0, "a.dspseg", la, &a));
+		let (b, lb) = sealed_unsorted(100);
+		index.push(SegmentDescriptor::of_segment(1, "b.dspseg", lb, &b));
+		let (c, lc) = sealed(200);
+		index.push(SegmentDescriptor::of_segment(2, "c.dspseg", lc, &c));
+		assert_eq!(index.unsorted_count(), 1);
 	}
 
 	#[test]
