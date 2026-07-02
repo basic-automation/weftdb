@@ -141,6 +141,57 @@ pub async fn declare_aspect(State(state): State<AppState>, Json(request): Json<D
 	Ok((StatusCode::CREATED, Json(DeclareAspectResponse { aspect })).into_response())
 }
 
+/// Response body for `POST /api/v1/storage/{aspect}/reconcile` — the outcome of an
+/// out-of-order reconciliation pass.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReconcileResponse {
+	/// The aspect reconciled.
+	pub aspect: String,
+	/// Number of out-of-order segments rewritten sorted by this call (0 when the
+	/// aspect was already fully ordered).
+	pub reconciled: usize,
+	/// The order-health count *after* the pass — zero once every segment admits
+	/// ordered (binary-search) access.
+	pub unsorted_segments: usize,
+}
+
+/// Handle `POST /api/v1/storage/{aspect}/reconcile`: rewrite every out-of-order
+/// segment of `aspect` into a time-sorted one (roadmap Phase 4.6).
+///
+/// This is the operator trigger for the reconciliation pass the
+/// `unsorted_segments` order-health signal motivates.
+/// Delegates to [`SegmentStore::reconcile_aspect`](database::SegmentStore::reconcile_aspect)
+/// — each out-of-order segment is stable-sorted by timestamp and re-sealed in place
+/// at its own id, so afterward point lookups over the aspect binary-search and
+/// `unsorted_segments` is zero. Returns `200 OK` with the number rewritten and the
+/// post-pass order-health count.
+///
+/// # Errors
+///
+/// [`StorageError::Unconfigured`] when no store is attached,
+/// [`StorageError::NotFound`] when the aspect is undeclared, and
+/// [`StorageError::Internal`] on a read/seal/control-plane failure.
+pub async fn reconcile_aspect(State(state): State<AppState>, Path(aspect): Path<String>) -> Result<Response, StorageError> {
+	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	drop(state);
+	let result = reconcile_aspect_inner(&store, &aspect).await;
+	drop(store);
+	result
+}
+
+/// The body of [`reconcile_aspect`], split out so the significant-`Drop`
+/// [`SegmentStore`](database::SegmentStore) handle is dropped in the caller after
+/// the last use rather than held across the response construction.
+async fn reconcile_aspect_inner(store: &database::SegmentStore, aspect: &str) -> Result<Response, StorageError> {
+	// Undeclared aspect → 404 (mirrors the read surface's not-found semantics).
+	if store.schema_for(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?.is_none() {
+		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
+	}
+	let reconciled = store.reconcile_aspect(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?;
+	let unsorted_segments = store.aspect_stats(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?.unsorted_segments;
+	Ok((StatusCode::OK, Json(ReconcileResponse { aspect: aspect.to_string(), reconciled, unsorted_segments })).into_response())
+}
+
 /// One point in an ingest batch: an integer epoch timestamp (in the aspect's
 /// declared [`TimeUnit`]) and its value as lossless decimal text, or `null` for an
 /// absent/null row.
@@ -690,6 +741,62 @@ mod tests {
 		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens store"));
 		store.declare("price", &dsp_physical_type::AspectSchema::new(dsp_physical_type::PhysicalType::F64, "0".parse().unwrap(), dsp_physical_type::TimeUnit::Seconds)).await.expect("declares");
 		app_with_state(AppState::new().with_store(store))
+	}
+
+	#[tokio::test]
+	async fn reconcile_endpoint_orders_an_out_of_order_aspect() {
+		let dir = TempDir::new().unwrap();
+		// Ingest an out-of-order batch (no require_sorted) — it seals unsorted.
+		let router = router_with_declared_price(&dir).await;
+		let ooo = serde_json::json!({ "points": [
+			{ "timestamp": 100, "value": "1.5" },
+			{ "timestamp": 130, "value": "4.5" },
+			{ "timestamp": 110, "value": "2.5" },
+		] });
+		let (status, body) = post_json(router, "/api/v1/storage/price/points", &ooo).await;
+		assert_eq!(status, StatusCode::CREATED, "body: {body}");
+		assert_eq!(body["time_sorted"], false, "an out-of-order batch seals unsorted");
+
+		// Before reconciliation the aspect reports one out-of-order segment.
+		let router = router_with_declared_price_reopened(&dir).await;
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/price/stats").body(Body::empty()).unwrap()).await.unwrap();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let before: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		assert_eq!(before["unsorted_segments"], 1);
+
+		// Reconcile via the endpoint: one segment rewritten, order-health now clean.
+		let router = router_with_declared_price_reopened(&dir).await;
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/price/reconcile").body(Body::empty()).unwrap()).await.unwrap();
+		let status = response.status();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		assert_eq!(status, StatusCode::OK, "body: {json}");
+		assert_eq!(json["aspect"], "price");
+		assert_eq!(json["reconciled"], 1);
+		assert_eq!(json["unsorted_segments"], 0);
+
+		// The rows read back in timestamp order after reconciliation.
+		let router = router_with_declared_price_reopened(&dir).await;
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/price/points?start=0&end=1000").body(Body::empty()).unwrap()).await.unwrap();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let read: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		let timestamps: Vec<i64> = read["points"].as_array().unwrap().iter().map(|p| p["timestamp"].as_i64().unwrap()).collect();
+		assert_eq!(timestamps, vec![100, 110, 130]);
+	}
+
+	#[tokio::test]
+	async fn reconcile_undeclared_aspect_is_not_found() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_empty_store(&dir).await;
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/never_declared/reconcile").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::NOT_FOUND);
+	}
+
+	#[tokio::test]
+	async fn reconcile_without_store_is_unavailable() {
+		let router = app_with_state(AppState::new());
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/price/reconcile").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 	}
 
 	#[tokio::test]

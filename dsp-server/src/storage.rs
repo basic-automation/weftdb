@@ -553,6 +553,61 @@ pub async fn storage_value_range_json(State(state): State<AppState>, Path(aspect
 	Ok(Json(StoredRangeResponse { aspect, time_unit: schema.timestamp_unit.name(), total, count: points.len(), offset, limit: page_size, page, points }))
 }
 
+/// Query parameters for the single-instant point lookup: the instant `t` to read
+/// (an epoch integer in the aspect's declared `TimeUnit`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct PointParams {
+	/// The instant to look up (epoch integer in the aspect's declared unit).
+	pub t: i64,
+}
+
+/// Response body for `GET /api/v1/storage/{aspect}/at` — a single-instant point
+/// lookup against the stored segments.
+#[derive(Debug, Clone, Serialize)]
+pub struct StoredPointResponse {
+	/// The aspect read.
+	pub aspect: String,
+	/// The aspect's declared timestamp unit token (e.g. `"seconds"`), so a consumer
+	/// can interpret the integer timestamp.
+	pub time_unit: &'static str,
+	/// The instant queried (echoed back, epoch integer in the declared unit).
+	pub timestamp: i64,
+	/// The present value at `timestamp` as lossless decimal text, or `null` when no
+	/// present row carries it (no row at the instant, or the row(s) there are null).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub value: Option<String>,
+	/// Whether a present value was found at the instant — `false` distinguishes a
+	/// genuine miss from a present-but-serialization-omitted `value`.
+	pub found: bool,
+}
+
+/// Handle `GET /api/v1/storage/{aspect}/at?t=<epoch>`.
+///
+/// The single-instant counterpart of the range reads (roadmap Phase 4.6
+/// read-planner): returns the present value of `aspect` at exactly timestamp `t`,
+/// or a `found: false` miss. The store prunes the segment index to the files whose
+/// span covers `t`, opens only those, and resolves the instant with each segment's
+/// persisted order signal — a `time_sorted` segment binary-searches, an
+/// out-of-order one linear-scans (see
+/// [`SegmentStore::read_point`](database::SegmentStore::read_point)). Values are
+/// lossless decimal text (no float round-trip — hard constraint #4).
+///
+/// # Errors
+///
+/// [`StorageError::Unconfigured`] when no store is attached,
+/// [`StorageError::NotFound`] when the aspect is undeclared (its timestamp unit is
+/// unknown), and [`StorageError::Internal`] on a read failure.
+pub async fn storage_point(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<PointParams>) -> Result<Json<StoredPointResponse>, StorageError> {
+	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	drop(state);
+	let schema = require_schema(&store, &aspect).await?;
+	let result = store.read_point(&aspect, params.t).await;
+	drop(store);
+	let value = result.map_err(|err| classify_read_error(&err))?;
+	let found = value.is_some();
+	Ok(Json(StoredPointResponse { aspect, time_unit: schema.timestamp_unit.name(), timestamp: params.t, value: value.map(|v| v.to_string()), found }))
+}
+
 /// One declared aspect's identity in the [`AspectListResponse`].
 #[derive(Debug, Clone, Serialize)]
 pub struct AspectInfo {
@@ -844,6 +899,44 @@ mod tests {
 		let batches = read_ipc_stream(&bytes).expect("reads stream");
 		let (_ts, vs) = record_batches_to_columns(&batches).expect("reads back columns");
 		assert_eq!(vs, vec![Some(bd("2.5")), Some(bd("3.5")), Some(bd("4.5"))]);
+	}
+
+	#[tokio::test]
+	async fn point_lookup_returns_the_value_at_an_exact_instant() {
+		let (_dir, router) = router_with_sealed_price().await;
+		// A hit at a stored grid point.
+		let (status, body) = get_json(router, "/api/v1/storage/price/at?t=120").await;
+		assert_eq!(status, StatusCode::OK);
+		assert_eq!(body["aspect"], "price");
+		assert_eq!(body["time_unit"], "seconds");
+		assert_eq!(body["timestamp"], 120);
+		assert_eq!(body["value"], "3.5");
+		assert_eq!(body["found"], true);
+	}
+
+	#[tokio::test]
+	async fn point_lookup_off_grid_instant_is_a_miss() {
+		let (_dir, router) = router_with_sealed_price().await;
+		// An instant between stored points: found=false, and value is omitted.
+		let (status, body) = get_json(router, "/api/v1/storage/price/at?t=125").await;
+		assert_eq!(status, StatusCode::OK);
+		assert_eq!(body["found"], false);
+		assert_eq!(body["timestamp"], 125);
+		assert!(body.get("value").is_none() || body["value"].is_null(), "a miss omits the value: {body}");
+	}
+
+	#[tokio::test]
+	async fn point_lookup_undeclared_aspect_is_not_found() {
+		let (_dir, router) = router_with_sealed_price().await;
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/never_declared/at?t=100").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::NOT_FOUND);
+	}
+
+	#[tokio::test]
+	async fn point_lookup_without_store_is_unavailable() {
+		let router = app_with_state(AppState::new());
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/price/at?t=100").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 	}
 
 	#[tokio::test]

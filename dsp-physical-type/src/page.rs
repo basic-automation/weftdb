@@ -191,6 +191,21 @@ impl Page {
 		}
 		(timestamps, values)
 	}
+
+	/// **Point lookup** within this page (roadmap Phase 4.6): the present value at
+	/// exactly timestamp `t`, or [`None`]. The page-level mirror of
+	/// [`Segment::value_at`](crate::Segment::value_at) — a disjoint `t` is rejected
+	/// by [`overlaps_time`](Self::overlaps_time) before decoding, and the surviving
+	/// columns are searched by binary search when the page is time-sorted and by a
+	/// linear scan otherwise.
+	#[must_use]
+	pub fn value_at(&self, t: i64) -> Option<BigDecimal> {
+		if !self.overlaps_time(t, t) {
+			return None;
+		}
+		let (timestamps, values) = self.decode_nullable();
+		crate::segment::point_lookup(&timestamps, &values, self.stats.time_sorted, t)
+	}
 }
 
 /// A segment subdivided into fixed-height [`Page`]s for intra-segment data
@@ -414,6 +429,21 @@ impl PagedSegment {
 		}
 		(timestamps, values)
 	}
+
+	/// **Point lookup** across the paged segment (roadmap Phase 4.6): the present
+	/// value at exactly timestamp `t`, or [`None`].
+	///
+	/// Prunes to the pages whose `[min_ts, max_ts]` spans `t`
+	/// ([`prune_pages_by_time`](Self::prune_pages_by_time) with `start == end`) and
+	/// does a per-page [`Page::value_at`] on each survivor, so a `t` in an
+	/// inter-page gap decodes nothing. The first present hit, in page then row
+	/// order, wins. Each page decides binary search vs linear scan from its own
+	/// recorded order, so a sorted page inside the segment is still searched in
+	/// log-time even when a sibling page is out of order.
+	#[must_use]
+	pub fn value_at(&self, t: i64) -> Option<BigDecimal> {
+		self.prune_pages_by_time(t, t).into_iter().find_map(|page_idx| self.pages[page_idx].value_at(t))
+	}
 }
 
 #[cfg(test)]
@@ -448,6 +478,40 @@ mod tests {
 		assert_eq!(seg.pages[2].time_range(), Some((180, 190)));
 		// Segment-level rollup spans the whole thing.
 		assert_eq!(seg.time_range(), Some((100, 190)));
+	}
+
+	#[test]
+	fn value_at_looks_up_across_pages_and_skips_gaps() {
+		// 12 rows at ts 0,10,..,110; 4 per page ⇒ pages [0,30], [40,70], [80,110].
+		let timestamps: Vec<i64> = (0..12).map(|i| i * 10).collect();
+		let values: Vec<BigDecimal> = (0..12).map(BigDecimal::from).collect();
+		let seg = PagedSegment::build(&timestamps, &values, TimeUnit::Seconds, &BigDecimal::from(0), 4).expect("builds");
+		// A hit in each of the three pages.
+		assert_eq!(seg.value_at(0), Some(BigDecimal::from(0)));
+		assert_eq!(seg.value_at(50), Some(BigDecimal::from(5)));
+		assert_eq!(seg.value_at(110), Some(BigDecimal::from(11)));
+		// An off-grid instant inside a page's span, and one outside every page.
+		assert_eq!(seg.value_at(45), None);
+		assert_eq!(seg.value_at(200), None);
+		// Every stored instant round-trips through the point lookup.
+		for (i, &t) in timestamps.iter().enumerate() {
+			assert_eq!(seg.value_at(t), Some(BigDecimal::from(i as i64)), "miss at {t}");
+		}
+	}
+
+	#[test]
+	fn value_at_handles_nulls_and_out_of_order_pages() {
+		// A null row and a page whose timestamps dip out of order.
+		let ts = vec![0_i64, 10, 20, 30, 50, 40];
+		let vs = ncol(&[Some("0"), None, Some("2"), Some("3"), Some("5"), Some("4")]);
+		let seg = PagedSegment::build_nullable(&ts, &vs, TimeUnit::Seconds, &BigDecimal::from(0), 3).expect("builds");
+		// Page 1 (rows 3..6: ts 30,50,40) is out of order, so it is linear-scanned.
+		assert!(!seg.pages[1].stats.time_sorted, "second page must be out of order");
+		assert_eq!(seg.value_at(40), Some(BigDecimal::from(4)));
+		assert_eq!(seg.value_at(50), Some(BigDecimal::from(5)));
+		// The null row yields no present value.
+		assert_eq!(seg.value_at(10), None);
+		assert_eq!(seg.value_at(0), Some(BigDecimal::from(0)));
 	}
 
 	#[test]

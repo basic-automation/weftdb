@@ -347,6 +347,16 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   out-of-order batch rather than sealing it), and the per-aspect/store rollups carry
   an `unsorted_segments` count so out-of-order data is visible before it costs a
   point-lookup scan.
+- **Order-signal read planner** — a single-instant point lookup
+  (`SegmentStore::read_point`, `Segment::value_at`/`PagedSegment::value_at`) prunes
+  the index to the segments spanning the instant and resolves each with its
+  persisted `time_sorted` flag: a sorted segment is **binary-searched**, an
+  out-of-order one linear-scanned (the only sound search on unsorted timestamps).
+- **Out-of-order reconciliation** — `SegmentStore::reconcile_segment`/`reconcile_aspect`
+  rewrite an out-of-order segment into a sorted one in place (stable sort by
+  timestamp, re-sealed at the same id, frame kind preserved), so it drops out of the
+  `unsorted_segments` count and its point lookups binary-search. (First slice — a
+  per-segment sort; the cross-segment staging-window merge is on the roadmap.)
 - **Null/quality column** — a per-row presence bitmap (zero bytes for fully dense
   columns) makes gaps real: present values are stored densely and reconstructed
   as `None` on read.
@@ -463,6 +473,8 @@ under the declared encoding/tolerance is rejected `400`.
 | `GET …/range.parquet` · `…/value-range.parquet` | The same windows as **Parquet** files. |
 | `GET …/range.csv` · `…/value-range.csv` | The same windows as **CSV** (lossless decimal-text values; empty field = null). |
 | `GET /api/v1/storage/{aspect}/points` · `…/value-points` | Lossless JSON reads with declarative pagination — `offset`/`limit` (+ `take` and 1-based `page` aliases), with `total`/`count`/`offset` in the body. |
+| `GET /api/v1/storage/{aspect}/at?t=` | **Single-instant point lookup**: the present value at exactly `t` (lossless decimal text) or a `found:false` miss. An **order-signal-driven read planner** resolves each candidate segment with its persisted `time_sorted` flag — binary search on a sorted segment, linear scan only on an out-of-order one — after pruning the index to the files spanning `t`. |
+| `POST /api/v1/storage/{aspect}/reconcile` | **Out-of-order reconciliation pass**: rewrite every out-of-order segment of the aspect into a time-sorted one in place (stable sort by timestamp, re-sealed at its own id, frame kind preserved). Returns the number rewritten and the post-pass `unsorted_segments` (0 once every segment admits binary-search access). The order-health count is the trigger. |
 | `GET /api/v1/storage/{aspect}/stats` · `…/storage/stats` | Materialized per-aspect and store-wide rollups, including the realized **bytes/point** (the north-star cost term) and an `unsorted_segments` order-health count (segments that would force a linear scan on a point lookup) — served from the control plane without opening a segment. |
 
 ### Metrics

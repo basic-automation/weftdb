@@ -555,6 +555,30 @@ impl Segment {
 		self.overlaps_time(ts, ts)
 	}
 
+	/// **Point lookup** (roadmap Phase 4.6 read-planner): the present value at
+	/// exactly timestamp `t`, or [`None`] when no present row carries it.
+	///
+	/// The order signal picks the search. `t` outside `[min_ts, max_ts]` is
+	/// rejected by the [`contains_timestamp`](Self::contains_timestamp) fast path
+	/// without decoding. Otherwise the columns are decoded once and the matching
+	/// row is found by **binary search** when the segment is
+	/// [`time_sorted`](Self::is_time_sorted) (persisted per-segment; recovered by
+	/// [`read_from`](Self::read_from)) and by a **linear scan** when it is
+	/// out-of-order — a scan is the only correct search on unsorted timestamps.
+	/// Both paths return the same answer; the flag only chooses the cheaper one.
+	///
+	/// When several rows share timestamp `t` (only possible in an out-of-order or
+	/// duplicate-timestamp segment) the first **present** one, in row order, wins;
+	/// a run of `t` whose values are all null yields [`None`].
+	#[must_use]
+	pub fn value_at(&self, t: i64) -> Option<BigDecimal> {
+		if !self.contains_timestamp(t) {
+			return None;
+		}
+		let (timestamps, values) = self.decode_nullable();
+		point_lookup(&timestamps, &values, self.is_time_sorted(), t)
+	}
+
 	/// **Data skipping** on the value column: whether this segment *may* hold any
 	/// value in the inclusive range `[lo, hi]`.
 	///
@@ -565,6 +589,33 @@ impl Segment {
 	#[must_use]
 	pub fn may_contain_value(&self, lo: &BigDecimal, hi: &BigDecimal) -> bool {
 		self.value_range().is_some_and(|(min, max)| &min <= hi && lo <= &max)
+	}
+}
+
+/// Point lookup over already-decoded, timestamp-aligned columns: the first
+/// **present** value whose timestamp equals `t`, or [`None`] when no present row
+/// carries `t`. Shared by [`Segment::value_at`] and
+/// [`Page::value_at`](crate::page::Page::value_at) (roadmap Phase 4.6).
+///
+/// When `sorted` is `true` the timestamps are known monotonic non-decreasing, so
+/// the run of rows equal to `t` is located by [`slice::partition_point`] (binary
+/// search) and only that run is walked for the first present value; when it is
+/// `false` every row is scanned, the only correct search on unsorted data. The
+/// two branches are observationally identical — `sorted` must reflect the
+/// segment's recorded [`SegmentStats::time_sorted`] so the cheaper search is only
+/// taken when it is sound.
+pub(crate) fn point_lookup(timestamps: &[i64], values: &[Option<BigDecimal>], sorted: bool, t: i64) -> Option<BigDecimal> {
+	if sorted {
+		let mut row = timestamps.partition_point(|&x| x < t);
+		while row < timestamps.len() && timestamps[row] == t {
+			if let Some(v) = &values[row] {
+				return Some(v.clone());
+			}
+			row += 1;
+		}
+		None
+	} else {
+		timestamps.iter().zip(values).find_map(|(&ts, v)| if ts == t { v.clone() } else { None })
 	}
 }
 
@@ -665,6 +716,63 @@ mod tests {
 		// Empty and single-row segments are vacuously sorted.
 		assert!(Segment::build(&[], &[], TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds").is_time_sorted());
 		assert!(Segment::build(&[5], &col(&["1.0"]), TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds").is_time_sorted());
+	}
+
+	#[test]
+	fn value_at_binary_searches_a_sorted_segment() {
+		let seg = Segment::build(&[10, 20, 30, 40, 50], &col(&["1.5", "2.5", "3.5", "4.5", "5.5"]), TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		assert!(seg.is_time_sorted());
+		// An exact hit at each grid point.
+		assert_eq!(seg.value_at(10), Some(BigDecimal::from_str("1.5").unwrap()));
+		assert_eq!(seg.value_at(30), Some(BigDecimal::from_str("3.5").unwrap()));
+		assert_eq!(seg.value_at(50), Some(BigDecimal::from_str("5.5").unwrap()));
+		// Off-grid instants inside and outside the span are misses.
+		assert_eq!(seg.value_at(25), None);
+		assert_eq!(seg.value_at(5), None);
+		assert_eq!(seg.value_at(60), None);
+	}
+
+	#[test]
+	fn value_at_linear_scans_an_unsorted_segment() {
+		// A dip makes the segment out-of-order, so the lookup must scan.
+		let seg = Segment::build(&[10, 40, 20, 30], &col(&["1.0", "4.0", "2.0", "3.0"]), TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		assert!(!seg.is_time_sorted());
+		assert_eq!(seg.value_at(40), Some(BigDecimal::from_str("4.0").unwrap()));
+		assert_eq!(seg.value_at(20), Some(BigDecimal::from_str("2.0").unwrap()));
+		assert_eq!(seg.value_at(25), None);
+		// The same rows sorted give the same answers — the flag only picks the search.
+		let sorted = Segment::build(&[10, 20, 30, 40], &col(&["1.0", "2.0", "3.0", "4.0"]), TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		for t in [10, 20, 30, 40, 25] {
+			assert_eq!(seg.value_at(t), sorted.value_at(t), "sorted and unsorted disagree at {t}");
+		}
+	}
+
+	#[test]
+	fn value_at_skips_null_rows() {
+		// A null at ts=20 yields None there; the surrounding present rows still hit.
+		let ts = vec![10_i64, 20, 30];
+		let vs = vec![Some(BigDecimal::from_str("1.5").unwrap()), None, Some(BigDecimal::from_str("3.5").unwrap())];
+		let seg = Segment::build_nullable(&ts, &vs, TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		assert_eq!(seg.value_at(10), Some(BigDecimal::from_str("1.5").unwrap()));
+		assert_eq!(seg.value_at(20), None, "a null row has no present value");
+		assert_eq!(seg.value_at(30), Some(BigDecimal::from_str("3.5").unwrap()));
+	}
+
+	#[test]
+	fn value_at_returns_first_present_of_a_duplicate_run() {
+		// Duplicate timestamps: the first present value in row order wins, even when
+		// the first row of the run is null.
+		let ts = vec![10_i64, 20, 20, 20, 30];
+		let vs = vec![Some(BigDecimal::from_str("1.0").unwrap()), None, Some(BigDecimal::from_str("2.2").unwrap()), Some(BigDecimal::from_str("2.9").unwrap()), Some(BigDecimal::from_str("3.0").unwrap())];
+		let seg = Segment::build_nullable(&ts, &vs, TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		assert!(seg.is_time_sorted(), "equal timestamps are monotonic");
+		assert_eq!(seg.value_at(20), Some(BigDecimal::from_str("2.2").unwrap()));
+	}
+
+	#[test]
+	fn value_at_on_empty_segment_is_none() {
+		let seg = Segment::build(&[], &[], TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		assert_eq!(seg.value_at(0), None);
 	}
 
 	#[test]
