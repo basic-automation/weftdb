@@ -185,6 +185,8 @@ marking nuance — backlog item B-tags)*.
 - [x] Downsample/aggregation query — `POST /api/v1/downsample` (+ `…/ilp`; `BigDecimal` reductions, epoch-grid-aligned buckets)
 - [x] Single-instant point query — `POST /api/v1/interpolate/point` (raw/interpolated/extrapolated labelling)
 - [x] Stored-range read surface — Arrow IPC `…/storage/{aspect}/range` + `…/value-range`, JSON `…/points` + `…/value-points`, `…/storage/aspects` / `…/{aspect}/schema` / `…/stats` (bytes/point)
+- [x] Single-instant read surface — `GET …/storage/{aspect}/at?t=` point lookup (order-signal-driven read planner: binary search on a sorted segment, linear scan on an out-of-order one)
+- [x] Storage maintenance — `POST …/storage/{aspect}/reconcile` (in-place out-of-order reconciliation pass; Phase 4.6)
 - [x] HTTP catalog management + ingest — declare aspect schema; JSON/ILP/Parquet/CSV batch ingest; `…/storage/catalog`; no-silent-downcast enforced (`400` on unrepresentable); `dsp_ingest_*` counters
 - [x] B-rest pagination — `offset`/`limit`/`take`/`page` + `total`/`count` on `…/points` and `…/value-points`
 - [x] Parquet interchange — `…/range.parquet` / `…/value-range.parquet` export + `POST …/parquet` ingest
@@ -227,7 +229,7 @@ DSP-Bench shows ingest/scan/compression gains; correctness tests cover late + OO
   - [x] Fixed-width bit-packing codec — **realized on disk**: the `.dspseg` timestamp block writes a self-describing codec selector (bit-pack vs varint second differences), so the bytes/point saving is stored, not just estimated (segment format v3, paged v4)
   - [x] Monotonic-order enforcement — `first_order_violation` primitive; opt-in `Segment::build_sorted`/`build_nullable_sorted`, `AspectSchema::seal_sorted`/`seal_paged_sorted` (`SegmentError`/`SealError::OutOfOrder`); exposed at the API as `require_sorted` on **all four** ingest formats (JSON/CSV/ILP/Parquet); observability via `SegmentStats::time_sorted` → per-segment index → `unsorted_segments` in aspect/store stats + `time_sorted` on every ingest response
   - [ ] Explicit tz + leap-second policy
-  - [ ] Out-of-order **reconciliation** (Phase 4.6) — enforcement/detection shipped; the merge path is the open work (see 4.6)
+  - [ ] Out-of-order **reconciliation** (Phase 4.6) — enforcement/detection + a first in-place per-segment reconciliation slice shipped; the cross-segment staging-window merge is the open work (see 4.6)
 - [x] **4.3 Columnar segment store** — in-memory `Segment`/`PagedSegment`; versioned
   CRC-checksummed `.dspseg` frames (v1 single-block, v2 null/quality column, v3 paged
   with per-page index); `AspectSchema::seal_paged[_nullable]` (per-page tolerance
@@ -250,13 +252,28 @@ DSP-Bench shows ingest/scan/compression gains; correctness tests cover late + OO
   during compaction, read-your-writes, snapshot isolation
   - [x] Out-of-order **detection + enforcement** (shipped in 4.2): `require_sorted`
     rejects OOO batches; `unsorted_segments` counts segments needing reconciliation
-  - [ ] Out-of-order **reconciliation** — adopt a QuestDB-O3-style staging model:
-    append until a batch arrives out of order, sort a bounded in-memory staging
-    window ("commit lag"), then reconcile-merge the sorted window into the persisted
-    segments at commit. The new `unsorted_segments` signal is the natural trigger for
-    a background merge/compaction pass. *(src: https://questdb.com/glossary/out-of-order-ingestion/)*
-  - [ ] Read-planner: use the persisted per-segment `time_sorted` to binary-search a
+  - [x] Out-of-order **reconciliation — in-place per-segment sort** (first slice):
+    `SegmentStore::reconcile_segment`/`reconcile_aspect` stable-sort an out-of-order
+    segment's rows by timestamp and re-seal them sorted at the same id/file (frame
+    kind preserved), dropping it out of `unsorted_segments` so a point lookup over it
+    binary-searches; exposed at the API as `POST /storage/{aspect}/reconcile`
+  - [ ] Out-of-order **reconciliation — cross-segment staging-window merge** (the
+    remaining work): rather than rewriting a whole out-of-order segment, adopt
+    QuestDB's split-not-rewrite model — when late data lands in an existing window,
+    **split** the affected segment and merge only the small suffix, then **squash**
+    the accumulated splits at commit / once the split count crosses a threshold. Keep
+    segments small to bound write amplification. *(src: partition split fires past
+    `cairo.o3.partition.split.min.size`=50MB and squashes past
+    `cairo.o3.last.partition.max.splits`=20 — https://questdb.com/docs/concepts/partitions/)*
+  - [ ] **Threshold-triggered background reconciliation**: use the `unsorted_segments`
+    count as the QuestDB-`max.splits`-style trigger for an automatic background
+    reconcile/compaction pass (rather than only the manual `POST …/reconcile`), with a
+    configurable threshold and a metric for passes run. *(src: automatic squash past a
+    split threshold — https://questdb.com/docs/concepts/partitions/)*
+  - [x] Read-planner: use the persisted per-segment `time_sorted` to binary-search a
     point lookup on a sorted segment and linear-scan only an out-of-order one
+    (`Segment::value_at`/`PagedSegment::value_at`/`SegmentStore::read_point`; exposed
+    as `GET /storage/{aspect}/at`)
 
 ### Phase 5 — GPU interpolation flagship · *High (parallel w/ Phase 4)*
 
@@ -538,6 +555,10 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 - [ ] Add ClickHouse, InfluxDB 3, QuestDB, TimescaleDB adapters
 - [x] Implement InfluxDB Line Protocol ingest (shared `dsp-line-protocol` crate; bench + server wired end-to-end)
 - [ ] Add end-to-end timing spans *(harness-level spans shipped; per-pipeline-stage spans = Phase 3 tracing item)*
+- [ ] **Next slice — cross-segment out-of-order merge (Phase 4.6):** the in-place
+  per-segment reconciliation + read-planner point lookup shipped; the remaining work
+  is QuestDB's split-not-rewrite merge and a threshold-triggered background
+  reconcile keyed on `unsorted_segments` (see Phase 4.6)
 - [x] Add p50/p95/p99 + confidence-interval reporting
 - [x] Add physical value types (`F64`, `ScaledI64`, `BigDecimalText` + three more)
 - [x] Prototype columnar segment reads for one aspect type (`database::SegmentStore`)
