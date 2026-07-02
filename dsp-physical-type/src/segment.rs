@@ -53,7 +53,11 @@ use crate::{
 /// - **v1** — dense `(timestamp, value)` columns only (no quality column).
 /// - **v2** — adds the [`NullMask`] quality column block, so a segment can carry
 ///   null/absent rows ([`Segment::build_nullable`]).
-pub const SEGMENT_FORMAT_VERSION: u16 = 2;
+/// - **v3** — the timestamp-column block gains a self-describing codec selector
+///   so a regular / small-jitter series' second differences store fixed-width
+///   bit-packed instead of one-byte-per-value varint (realizing the bytes/point
+///   saving, not just estimating it).
+pub const SEGMENT_FORMAT_VERSION: u16 = 3;
 
 /// Why a [`Segment`] could not be built from its input columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +74,18 @@ pub enum SegmentError {
 	/// least one row, so the rows cannot be partitioned. See
 	/// [`PagedSegment::build`](crate::page::PagedSegment::build).
 	EmptyPageSize,
+	/// An order-enforcing build ([`Segment::build_sorted`] /
+	/// [`Segment::build_nullable_sorted`]) was given timestamps that step backwards.
+	/// Reported at the first offending row (its timestamp is strictly less than its
+	/// predecessor's); equal adjacent timestamps are accepted.
+	OutOfOrder {
+		/// The row whose timestamp broke monotonic non-decreasing order.
+		index: usize,
+		/// The preceding row's timestamp.
+		previous: i64,
+		/// This row's (smaller) timestamp.
+		current: i64,
+	},
 }
 
 impl std::fmt::Display for SegmentError {
@@ -77,6 +93,7 @@ impl std::fmt::Display for SegmentError {
 		match self {
 			Self::LengthMismatch { timestamps, values } => write!(f, "segment column height mismatch: {timestamps} timestamps vs {values} values"),
 			Self::EmptyPageSize => write!(f, "paged segment page height must be at least one row, got zero"),
+			Self::OutOfOrder { index, previous, current } => write!(f, "out-of-order timestamp at row {index}: {current} < previous {previous}"),
 		}
 	}
 }
@@ -216,6 +233,55 @@ impl Segment {
 		Ok(Self { version: SEGMENT_FORMAT_VERSION, values: value_col, timestamps: ts_col, nulls, stats })
 	}
 
+	/// Build a segment, **enforcing monotonic non-decreasing timestamps** (roadmap
+	/// Phase 4.2 order enforcement).
+	///
+	/// Identical to [`build`](Self::build) except it rejects a batch whose
+	/// timestamps step backwards — returning [`SegmentError::OutOfOrder`] at the
+	/// first offending row instead of storing an out-of-order segment
+	/// (`time_sorted = false`). Use this on an ingest path that guarantees ordered
+	/// appends; use [`build`](Self::build) when out-of-order data is expected and
+	/// reconciled downstream (Phase 4.6). Equal adjacent timestamps are accepted (a
+	/// repeated instant is in order).
+	///
+	/// # Errors
+	///
+	/// [`SegmentError::LengthMismatch`] if the columns differ in height (checked
+	/// first), or [`SegmentError::OutOfOrder`] at the first row whose timestamp is
+	/// strictly less than its predecessor's.
+	pub fn build_sorted(timestamps: &[i64], values: &[BigDecimal], unit: TimeUnit, value_tolerance: &BigDecimal) -> Result<Self, SegmentError> {
+		Self::check_order(timestamps, values.len())?;
+		Self::build(timestamps, values, unit, value_tolerance)
+	}
+
+	/// The nullable-column counterpart to [`build_sorted`](Self::build_sorted):
+	/// build a nullable segment ([`build_nullable`](Self::build_nullable)) while
+	/// enforcing monotonic non-decreasing timestamps. The order check is over the
+	/// dense timestamp column (every row, present or null).
+	///
+	/// # Errors
+	///
+	/// [`SegmentError::LengthMismatch`] if the columns differ in height (checked
+	/// first), or [`SegmentError::OutOfOrder`] at the first backwards timestamp.
+	pub fn build_nullable_sorted(timestamps: &[i64], values: &[Option<BigDecimal>], unit: TimeUnit, value_tolerance: &BigDecimal) -> Result<Self, SegmentError> {
+		Self::check_order(timestamps, values.len())?;
+		Self::build_nullable(timestamps, values, unit, value_tolerance)
+	}
+
+	/// Length-then-order gate shared by the `_sorted` builders: reject a height
+	/// mismatch first (consistent error priority with the permissive builders),
+	/// then the first backwards timestamp via
+	/// [`first_order_violation`](crate::timestamp::first_order_violation).
+	fn check_order(timestamps: &[i64], values_len: usize) -> Result<(), SegmentError> {
+		if timestamps.len() != values_len {
+			return Err(SegmentError::LengthMismatch { timestamps: timestamps.len(), values: values_len });
+		}
+		if let Some((index, previous, current)) = crate::timestamp::first_order_violation(timestamps) {
+			return Err(SegmentError::OutOfOrder { index, previous, current });
+		}
+		Ok(())
+	}
+
 	/// Number of rows in the segment.
 	#[must_use]
 	pub const fn row_count(&self) -> usize {
@@ -272,8 +338,8 @@ impl Segment {
 		self.values.estimated_bytes()
 	}
 
-	/// Estimated stored bytes of the timestamp column, taking the cheaper of
-	/// plain-varint or RLE second differences (see
+	/// Estimated stored bytes of the timestamp column, taking the cheapest of
+	/// plain-varint, RLE, or bit-packed second differences (see
 	/// [`DeltaOfDeltaColumn::best_estimated_bytes`]).
 	#[must_use]
 	pub fn timestamp_bytes(&self) -> usize {
@@ -607,6 +673,40 @@ mod tests {
 		let values = col(&["1.0", "2.0"]);
 		let err = Segment::build(&timestamps, &values, TimeUnit::Millis, &BigDecimal::from(0)).expect_err("mismatched heights");
 		assert_eq!(err, SegmentError::LengthMismatch { timestamps: 3, values: 2 });
+	}
+
+	#[test]
+	fn build_sorted_accepts_ordered_and_rejects_backwards() {
+		let zero = BigDecimal::from(0);
+		// Ordered (with an equal-timestamp duplicate) seals like `build` does.
+		let ok = Segment::build_sorted(&[10, 10, 20, 30], &col(&["1.0", "2.0", "3.0", "4.0"]), TimeUnit::Seconds, &zero).expect("ordered builds");
+		assert!(ok.is_time_sorted());
+		assert_eq!(ok, Segment::build(&[10, 10, 20, 30], &col(&["1.0", "2.0", "3.0", "4.0"]), TimeUnit::Seconds, &zero).expect("builds"));
+		// A backwards step is rejected at the first offending row (row 2: 20 -> 15).
+		let err = Segment::build_sorted(&[10, 20, 15, 30], &col(&["1.0", "2.0", "3.0", "4.0"]), TimeUnit::Seconds, &zero).expect_err("out of order");
+		assert_eq!(err, SegmentError::OutOfOrder { index: 2, previous: 20, current: 15 });
+		// Empty and single-row batches are vacuously ordered.
+		assert!(Segment::build_sorted(&[], &[], TimeUnit::Seconds, &zero).is_ok());
+		assert!(Segment::build_sorted(&[5], &col(&["1.0"]), TimeUnit::Seconds, &zero).is_ok());
+	}
+
+	#[test]
+	fn build_sorted_reports_length_mismatch_before_order() {
+		// A height mismatch takes priority over an order violation.
+		let err = Segment::build_sorted(&[10, 5, 20], &col(&["1.0", "2.0"]), TimeUnit::Millis, &BigDecimal::from(0)).expect_err("mismatch first");
+		assert_eq!(err, SegmentError::LengthMismatch { timestamps: 3, values: 2 });
+	}
+
+	#[test]
+	fn build_nullable_sorted_enforces_order_over_the_dense_column() {
+		let zero = BigDecimal::from(0);
+		let vals = vec![Some(BigDecimal::from(1)), None, Some(BigDecimal::from(3))];
+		// Dense timestamps ordered -> ok, and equal to the permissive nullable build.
+		let ok = Segment::build_nullable_sorted(&[10, 20, 30], &vals, TimeUnit::Seconds, &zero).expect("ordered");
+		assert_eq!(ok, Segment::build_nullable(&[10, 20, 30], &vals, TimeUnit::Seconds, &zero).expect("builds"));
+		// The order check spans the null row too (row 1's timestamp regresses).
+		let err = Segment::build_nullable_sorted(&[10, 5, 30], &vals, TimeUnit::Seconds, &zero).expect_err("out of order");
+		assert_eq!(err, SegmentError::OutOfOrder { index: 1, previous: 10, current: 5 });
 	}
 
 	#[test]

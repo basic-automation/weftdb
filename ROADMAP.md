@@ -192,7 +192,8 @@ marking nuance — backlog item B-tags)*.
 - [x] Columnar output for compute endpoints — Arrow IPC + Parquet for `interpolate`/`downsample` (+ every ILP sibling); `dsp-arrow` reconstructed-series + reduction-table interchange
 - [x] Prometheus latency histograms — compute endpoints, ILP compute path, and the storage-ingest seal path
 - [ ] OpenTelemetry trace export (paired with Prometheus `/metrics`)
-- [ ] B-rest residue — cursor paging + `interpolation` query-param alias
+- [x] B-rest residue — `interpolation` query-param alias for `spline` on the ILP compute endpoints (`spline` wins when both given)
+- [ ] B-rest residue — cursor paging (stable forward-iteration token) on `…/points` / `…/value-points`
 - [ ] Python SDK → Rust SDK → Arrow Flight / Flight SQL → SQL surface / DataFusion (later)
 - [ ] Grafana → Prometheus remote write/read (if monitoring) → R/Arrow workflows
 
@@ -223,9 +224,10 @@ DSP-Bench shows ingest/scan/compression gains; correctness tests cover late + OO
   (`AspectSchema::seal`, `SealError::{Encode,ToleranceExceeded}`)
 - **4.2 Timestamp semantics**
   - [x] Integer-epoch `TimeUnit` (s/ms/µs/ns) with lossless delta + delta-of-delta transforms, zig-zag + LEB128 varint estimate, RLE, and `best_estimated_bytes` selector
-  - [x] Fixed-width bit-packing codec
+  - [x] Fixed-width bit-packing codec — **realized on disk**: the `.dspseg` timestamp block writes a self-describing codec selector (bit-pack vs varint second differences), so the bytes/point saving is stored, not just estimated (segment format v3, paged v4)
+  - [x] Monotonic-order enforcement — `first_order_violation` primitive; opt-in `Segment::build_sorted`/`build_nullable_sorted`, `AspectSchema::seal_sorted`/`seal_paged_sorted` (`SegmentError`/`SealError::OutOfOrder`); exposed at the API as `require_sorted` on **all four** ingest formats (JSON/CSV/ILP/Parquet); observability via `SegmentStats::time_sorted` → per-segment index → `unsorted_segments` in aspect/store stats + `time_sorted` on every ingest response
   - [ ] Explicit tz + leap-second policy
-  - [ ] Monotonic-order enforcement
+  - [ ] Out-of-order **reconciliation** (Phase 4.6) — enforcement/detection shipped; the merge path is the open work (see 4.6)
 - [x] **4.3 Columnar segment store** — in-memory `Segment`/`PagedSegment`; versioned
   CRC-checksummed `.dspseg` frames (v1 single-block, v2 null/quality column, v3 paged
   with per-page index); `AspectSchema::seal_paged[_nullable]` (per-page tolerance
@@ -246,6 +248,15 @@ DSP-Bench shows ingest/scan/compression gains; correctness tests cover late + OO
 - [ ] **4.6 Correctness semantics** — out-of-order/late data, dedup, upsert, idempotent
   batch ingest, clock skew, precision, tz parsing, leap seconds, query consistency
   during compaction, read-your-writes, snapshot isolation
+  - [x] Out-of-order **detection + enforcement** (shipped in 4.2): `require_sorted`
+    rejects OOO batches; `unsorted_segments` counts segments needing reconciliation
+  - [ ] Out-of-order **reconciliation** — adopt a QuestDB-O3-style staging model:
+    append until a batch arrives out of order, sort a bounded in-memory staging
+    window ("commit lag"), then reconcile-merge the sorted window into the persisted
+    segments at commit. The new `unsorted_segments` signal is the natural trigger for
+    a background merge/compaction pass. *(src: https://questdb.com/glossary/out-of-order-ingestion/)*
+  - [ ] Read-planner: use the persisted per-segment `time_sorted` to binary-search a
+    point lookup on a sorted segment and linear-scan only an out-of-order one
 
 ### Phase 5 — GPU interpolation flagship · *High (parallel w/ Phase 4)*
 
@@ -277,10 +288,20 @@ transfer, kernel, readback, and API serialization, p95 = Z."*
 **Acceptance:** honest claim like *"this mode cuts storage by X while preserving event
 detection within Y% and improving historical query latency by Z."*
 
-- [ ] **6.1 Lossless typed codecs** — timestamp delta/delta-of-delta *(shipped in 4.2)*;
-  scaled-int bit packing; RLE for regular intervals; Gorilla/Chimp-style f64;
-  ALP-inspired vectorized f64; Decimal128/scaled-int codecs; **block-level random
-  access**. *(Check codec patents/licenses before embedding.)*
+- [ ] **6.1 Lossless typed codecs** — timestamp delta/delta-of-delta + **fixed-width
+  bit-packing** *(both shipped in 4.2, realized on disk)*; scaled-int bit packing;
+  RLE for regular intervals; Gorilla/Chimp-style f64; ALP-inspired vectorized f64;
+  Decimal128/scaled-int codecs; **block-level random access**. *(Check codec
+  patents/licenses before embedding.)*
+  - [ ] Evaluate a **Gorilla-style variable-length** second-difference encoding
+    (bucketed bit-lengths: 1 bit for the common 0-delta-of-delta regular case, wider
+    buckets for jitter) as a complement to the shipped fixed-width bit-packing —
+    fixed-width pays the max width for every value in a block, so a small-jitter
+    stream with rare large deltas may compress better under a per-value bucketed
+    scheme or **dynamic (per-block adaptive) bit packing**. Benchmark both on the
+    bytes/point metric before adopting. *(src: Gorilla, VLDB'15; "Lossless Data
+    Compression for Time-Series Sensor Data Based on Dynamic Bit Packing", Sensors
+    2023 — https://www.mdpi.com/1424-8220/23/20/8575)*
 - [ ] **6.2 Model-based compression** (leverages DSP's spline DNA, NeaTS-like) — piecewise
   linear / spline / polynomial / nonlinear approximation with bounded residuals;
   lossless-residual option; lossy with max-error guarantee; extrema-preserving mode
@@ -372,7 +393,7 @@ A checked box = shipped; an unchecked box carries its residual status inline
 - [ ] **B-tags** *(Phase 2/4 · absent)* — Per-measurement tags/labels (incl. `interpolated=true`/provenance); `measurement.rs` has none. *(src: `DSM-Database`, `DSM-Measurement`)*
 - [ ] **B-conn** *(Phase 2/7 · absent)* — Vendor-neutral connector trait + registry (core). *(src: `dsm-source`, `dsm-asset`)*
 - [ ] **B-ilp** *(Phase 2 · partial)* — ILP ingest shipped (parser + endpoints); the ILP/Influx **interop** connector crate (not a storage swap) is still to do. *(src: `dsm-influxdb`, `dsm-batch`)*
-- [ ] **B-rest** *(Phase 2 · partial)* — REST facade + declarative query-params + pagination shipped (`offset`/`limit`/`take`/`page` + `total`/`count` on `…/points` and `…/value-points`); `interpolation` alias + cursor paging still to do. *(src: `DSM-Database`)*
+- [ ] **B-rest** *(Phase 2 · partial)* — REST facade + declarative query-params + pagination shipped (`offset`/`limit`/`take`/`page` + `total`/`count` on `…/points` and `…/value-points`); the `interpolation` query-param alias shipped; **cursor paging** still to do. *(src: `DSM-Database`)*
 - [ ] **B-poll / B-retry / B-register** *(Phase 7 · absent)* — Scheduled polling daemon (per-source interval) + at-least-once retry buffer + runtime source registration. *(src: `DSM-Input-Module`)*
 - [x] **B-interp** *(Phase 5)* — Interpolate-on-read, single-instant lookup, out-of-range extrapolation. *(src: `splimes`/`database`)*
 - [ ] **B-analysis** *(Phase 4/9 · verify)* — Per-point analysis model (signed neighbor distance, slope-segmented trends, max-normalized relative vectors); verify `Trend`/`Relative`/`MeasurementVector`/`Analysis` wired end-to-end. *(src: `dataset_management`, `DSM-Measurement`)*

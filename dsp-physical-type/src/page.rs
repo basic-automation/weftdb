@@ -43,7 +43,10 @@ use crate::{
 ///
 /// - **v3** — first paged layout: fixed-height pages, each with its own min/max
 ///   ts/value stats and quality column, plus a segment-level rollup.
-pub const PAGED_SEGMENT_FORMAT_VERSION: u16 = 3;
+/// - **v4** — each page's timestamp block gains the self-describing codec selector
+///   (fixed-width bit-packing vs varint second differences); see
+///   [`SEGMENT_FORMAT_VERSION`](crate::SEGMENT_FORMAT_VERSION) v3.
+pub const PAGED_SEGMENT_FORMAT_VERSION: u16 = 4;
 
 /// The default page height when a caller does not specify one.
 ///

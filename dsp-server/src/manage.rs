@@ -35,7 +35,7 @@ use axum::{
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use dsp_line_protocol::TimestampPrecision;
-use dsp_physical_type::{AspectSchema, PhysicalType, SegmentDescriptor, TimeUnit};
+use dsp_physical_type::{first_order_violation, AspectSchema, PhysicalType, SegmentDescriptor, TimeUnit};
 use serde::{Deserialize, Serialize};
 
 use crate::{state::AppState, storage::{AspectInfo, StorageError}};
@@ -168,6 +168,12 @@ pub struct IngestRequest {
 	/// per page (the last page may be shorter).
 	#[serde(default)]
 	pub rows_per_page: Option<usize>,
+	/// When `true`, reject the batch (`400`) if its timestamps are not monotonic
+	/// non-decreasing, instead of sealing an out-of-order segment. Defaults to
+	/// `false` (out-of-order data is accepted and flagged for the Phase-4.6
+	/// reconciliation path). Equal adjacent timestamps are in order.
+	#[serde(default)]
+	pub require_sorted: bool,
 }
 
 /// Response body for a successful ingest: the sealed segment's descriptor summary,
@@ -178,7 +184,7 @@ pub struct IngestResponse {
 	pub aspect: String,
 	/// The id assigned to the new segment (monotonic within the aspect).
 	pub segment_id: u64,
-	/// The `.dspseg` frame format version sealed (2 single-block, 3 paged).
+	/// The `.dspseg` frame format version sealed (3 single-block, 4 paged).
 	pub format_version: u16,
 	/// Total rows sealed (present and null).
 	pub row_count: usize,
@@ -190,6 +196,12 @@ pub struct IngestResponse {
 	pub min_ts: Option<i64>,
 	/// Largest timestamp in the sealed segment, or `null` if it was empty.
 	pub max_ts: Option<i64>,
+	/// Whether the sealed segment's timestamps are monotonic non-decreasing. `false`
+	/// flags out-of-order data that a point lookup must linear-scan (Phase 4.6) — a
+	/// client ingesting without `require_sorted` can watch this to know whether its
+	/// batch stored in ordered form. Always `true` for a batch accepted under
+	/// `require_sorted`.
+	pub time_sorted: bool,
 }
 
 /// Classify a seal error: an encode/tolerance failure is a client-data problem
@@ -203,6 +215,24 @@ fn classify_seal_error(err: &anyhow::Error) -> StorageError {
 	} else {
 		StorageError::Internal(message)
 	}
+}
+
+/// Enforce monotonic non-decreasing timestamps when a request opts in
+/// (`require_sorted`) — the API surface of the Phase-4.2 order enforcement
+/// ([`dsp_physical_type::first_order_violation`] / `AspectSchema::seal_sorted`).
+///
+/// A client ingesting an append-only stream can demand the server reject an
+/// out-of-order batch (which would otherwise seal an unsortable segment that forces
+/// linear scans on read) rather than silently store it. Returns
+/// [`StorageError::BadRequest`] naming the first backwards row; a `false` flag (the
+/// default) is a no-op so the permissive path is unchanged.
+fn enforce_order_if_required(require_sorted: bool, timestamps: &[i64]) -> Result<(), StorageError> {
+	if require_sorted {
+		if let Some((index, previous, current)) = first_order_violation(timestamps) {
+			return Err(StorageError::BadRequest(format!("out-of-order timestamp at row {index}: {current} < previous {previous} (require_sorted was set)")));
+		}
+	}
+	Ok(())
 }
 
 /// Handle `POST /api/v1/storage/{aspect}/points`: seal a batch of points into
@@ -266,6 +296,7 @@ async fn ingest_points_inner(store: &database::SegmentStore, metrics: &crate::me
 		}
 	}
 
+	enforce_order_if_required(request.require_sorted, &timestamps)?;
 	let descriptor = seal_batch(store, aspect, &schema, &timestamps, &values, any_null, request.rows_per_page).await.map_err(|err| classify_seal_error(&err))?;
 	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
 	let response = IngestResponse {
@@ -277,6 +308,7 @@ async fn ingest_points_inner(store: &database::SegmentStore, metrics: &crate::me
 		byte_len: descriptor.byte_len,
 		min_ts: descriptor.min_ts,
 		max_ts: descriptor.max_ts,
+		time_sorted: descriptor.time_sorted,
 	};
 	Ok((StatusCode::CREATED, Json(response)).into_response())
 }
@@ -305,6 +337,10 @@ pub struct CsvIngestParams {
 	/// Optional page height — seal a paged segment of this many rows per page.
 	#[serde(default)]
 	pub rows_per_page: Option<usize>,
+	/// When `true`, reject an out-of-order batch (`400`) instead of sealing it; see
+	/// [`IngestRequest::require_sorted`].
+	#[serde(default)]
+	pub require_sorted: bool,
 }
 
 /// The dense columns parsed from a CSV ingest body: aligned timestamp and
@@ -386,7 +422,7 @@ pub async fn ingest_csv(State(state): State<AppState>, Path(aspect): Path<String
 	let store = state.store().cloned().ok_or_else(|| { metrics.record_ingest_error(); StorageError::Unconfigured })?;
 	drop(state);
 	let start = std::time::Instant::now();
-	let result = ingest_csv_inner(&store, &metrics, &aspect, params.rows_per_page, &body).await;
+	let result = ingest_csv_inner(&store, &metrics, &aspect, params.rows_per_page, params.require_sorted, &body).await;
 	drop(store);
 	if result.is_err() {
 		metrics.record_ingest_error();
@@ -398,11 +434,12 @@ pub async fn ingest_csv(State(state): State<AppState>, Path(aspect): Path<String
 /// The body of [`ingest_csv`], split out so the handler records an error metric for
 /// any failure path uniformly. Shares [`seal_batch`] / [`classify_seal_error`] with
 /// the JSON ingest path, so a CSV-sealed batch is byte-identical to a JSON-sealed one.
-async fn ingest_csv_inner(store: &database::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, rows_per_page: Option<usize>, body: &str) -> Result<Response, StorageError> {
+async fn ingest_csv_inner(store: &database::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, rows_per_page: Option<usize>, require_sorted: bool, body: &str) -> Result<Response, StorageError> {
 	let Some(schema) = store.schema_for(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))? else {
 		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
 	let ParsedCsv { timestamps, values, any_null } = parse_csv_points(body)?;
+	enforce_order_if_required(require_sorted, &timestamps)?;
 	let descriptor = seal_batch(store, aspect, &schema, &timestamps, &values, any_null, rows_per_page).await.map_err(|err| classify_seal_error(&err))?;
 	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
 	let response = IngestResponse {
@@ -414,6 +451,7 @@ async fn ingest_csv_inner(store: &database::SegmentStore, metrics: &crate::metri
 		byte_len: descriptor.byte_len,
 		min_ts: descriptor.min_ts,
 		max_ts: descriptor.max_ts,
+		time_sorted: descriptor.time_sorted,
 	};
 	Ok((StatusCode::CREATED, Json(response)).into_response())
 }
@@ -433,6 +471,11 @@ pub struct IlpIngestParams {
 	/// Optional page height — seal a paged segment of this many rows per page.
 	#[serde(default)]
 	pub rows_per_page: Option<usize>,
+	/// When `true`, reject an out-of-order batch (`400`) instead of sealing it; see
+	/// [`IngestRequest::require_sorted`]. Order is checked on the epochs after they
+	/// are rescaled to the aspect's declared unit.
+	#[serde(default)]
+	pub require_sorted: bool,
 }
 
 /// Map the optional ILP precision token to a [`TimestampPrecision`] (default
@@ -523,6 +566,7 @@ async fn ingest_ilp_inner(store: &database::SegmentStore, metrics: &crate::metri
 		values.push(point.value);
 	}
 
+	enforce_order_if_required(params.require_sorted, &timestamps)?;
 	let descriptor = match params.rows_per_page {
 		Some(rows_per_page) => store.seal_paged(aspect, &schema, &timestamps, &values, rows_per_page).await,
 		None => store.seal(aspect, &schema, &timestamps, &values).await,
@@ -538,6 +582,7 @@ async fn ingest_ilp_inner(store: &database::SegmentStore, metrics: &crate::metri
 		byte_len: descriptor.byte_len,
 		min_ts: descriptor.min_ts,
 		max_ts: descriptor.max_ts,
+		time_sorted: descriptor.time_sorted,
 	};
 	Ok((StatusCode::CREATED, Json(response)).into_response())
 }
@@ -663,6 +708,7 @@ mod tests {
 		assert_eq!(body["null_count"], 0);
 		assert_eq!(body["min_ts"], 100);
 		assert_eq!(body["max_ts"], 120);
+		assert_eq!(body["time_sorted"], true, "an ordered batch seals sorted");
 		assert!(body["byte_len"].as_u64().unwrap() > 0);
 
 		// The read surface returns exactly what was sealed.
@@ -708,8 +754,8 @@ mod tests {
 		] });
 		let (status, body) = post_json(router, "/api/v1/storage/price/points", &body).await;
 		assert_eq!(status, StatusCode::CREATED, "body: {body}");
-		// Paged frames carry the paged format version (3), distinct from single-block (2).
-		assert_eq!(body["format_version"], 3);
+		// Paged frames carry the paged format version (4), distinct from single-block (3).
+		assert_eq!(body["format_version"], 4);
 		assert_eq!(body["row_count"], 4);
 	}
 
@@ -763,6 +809,72 @@ mod tests {
 		let body = serde_json::json!({ "points": [{ "timestamp": 1, "value": "1" }] });
 		let (status, _body) = post_json(router, "/api/v1/storage/price/points", &body).await;
 		assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+	}
+
+	#[tokio::test]
+	async fn ingest_require_sorted_rejects_out_of_order_but_default_accepts() {
+		let dir = TempDir::new().unwrap();
+		// require_sorted: a backwards timestamp (row 1: 90 < 100) is a 400 naming the row.
+		let router = router_with_declared_price(&dir).await;
+		let body = serde_json::json!({ "require_sorted": true, "points": [
+			{ "timestamp": 100, "value": "1.5" },
+			{ "timestamp": 90, "value": "2.5" },
+		] });
+		let (status, body) = post_json(router, "/api/v1/storage/price/points", &body).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+		assert!(body["error"].as_str().unwrap().contains("out-of-order timestamp at row 1"), "body: {body}");
+
+		// The same batch without the flag is accepted (out-of-order data is legal by default).
+		let router = router_with_declared_price_reopened(&dir).await;
+		let ok = serde_json::json!({ "points": [
+			{ "timestamp": 100, "value": "1.5" },
+			{ "timestamp": 90, "value": "2.5" },
+		] });
+		let (status, body) = post_json(router, "/api/v1/storage/price/points", &ok).await;
+		assert_eq!(status, StatusCode::CREATED, "body: {body}");
+		assert_eq!(body["row_count"], 2);
+		// The accepted out-of-order batch is honestly reported as unsorted.
+		assert_eq!(body["time_sorted"], false, "an out-of-order batch reports time_sorted=false");
+	}
+
+	#[tokio::test]
+	async fn ingest_require_sorted_admits_equal_and_ascending() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_price(&dir).await;
+		// Equal adjacent timestamps are in order; ascending is fine.
+		let body = serde_json::json!({ "require_sorted": true, "points": [
+			{ "timestamp": 100, "value": "1.5" },
+			{ "timestamp": 100, "value": "2.5" },
+			{ "timestamp": 110, "value": "3.5" },
+		] });
+		let (status, body) = post_json(router, "/api/v1/storage/price/points", &body).await;
+		assert_eq!(status, StatusCode::CREATED, "body: {body}");
+		assert_eq!(body["row_count"], 3);
+	}
+
+	#[tokio::test]
+	async fn csv_ingest_require_sorted_rejects_out_of_order() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_price(&dir).await;
+		let (status, body) = post_text(router, "/api/v1/storage/price/csv?require_sorted=true", "100,1.5\n90,2.5\n").await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+		assert!(body["error"].as_str().unwrap().contains("out-of-order timestamp"), "body: {body}");
+	}
+
+	#[tokio::test]
+	async fn ilp_ingest_require_sorted_passes_because_the_parser_pre_sorts() {
+		// The `dsp-line-protocol` parser returns points sorted by timestamp, so an
+		// out-of-order *payload* still seals an in-order segment — `require_sorted`
+		// therefore accepts it. This locks in that interaction (order enforcement on
+		// the ILP path is a guard against a future non-sorting parser, not a rejection
+		// of a shuffled payload).
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_temp(&dir).await;
+		let payload = "weather temp=1.5 100\nweather temp=2.5 90\n";
+		let (status, body) = post_text(router, "/api/v1/storage/temp/ilp?field=temp&precision=s&require_sorted=true", payload).await;
+		assert_eq!(status, StatusCode::CREATED, "body: {body}");
+		assert_eq!(body["min_ts"], 90);
+		assert_eq!(body["max_ts"], 100);
 	}
 
 	/// POST a `text/plain` ILP payload to `uri`, returning status and parsed JSON.
@@ -891,8 +1003,8 @@ mod tests {
 		let router = router_with_declared_price(&dir).await;
 		let (status, body) = post_text(router, "/api/v1/storage/price/csv?rows_per_page=2", "100,1.5\n110,2.5\n120,3.5\n130,4.5\n").await;
 		assert_eq!(status, StatusCode::CREATED, "body: {body}");
-		// Paged frames carry the paged format version (3).
-		assert_eq!(body["format_version"], 3);
+		// Paged frames carry the paged format version (4).
+		assert_eq!(body["format_version"], 4);
 		assert_eq!(body["row_count"], 4);
 	}
 

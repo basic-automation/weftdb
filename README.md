@@ -336,6 +336,17 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   delta-of-delta timestamp column with min/max timestamp/value stats, row/null
   counts, and a format version. The on-disk frame is hand-rolled, versioned, and
   **CRC-32-verified before parse**, so a corrupt or truncated file fails fast.
+- **Bit-packed timestamps** — the timestamp block writes its second-difference
+  stream under whichever codec is smaller (fixed-width **bit-packing** vs per-value
+  zig-zag varint), chosen by a self-describing selector byte the reader dispatches
+  on. A regular series packs to a handful of bytes on disk (a 1000-point regular
+  block stores in <20 bytes), so the bytes/point saving is *realized*, not just
+  estimated.
+- **Order semantics** — every segment records whether its timestamps are monotonic
+  (`time_sorted`). Ingest can *enforce* order (`require_sorted` rejects an
+  out-of-order batch rather than sealing it), and the per-aspect/store rollups carry
+  an `unsorted_segments` count so out-of-order data is visible before it costs a
+  point-lookup scan.
 - **Null/quality column** — a per-row presence bitmap (zero bytes for fully dense
   columns) makes gaps real: present values are stored densely and reconstructed
   as `None` on read.
@@ -405,7 +416,7 @@ CSV, Arrow IPC, or Parquet**:
 | `POST /api/v1/interpolate` | Reconstruct an irregular series onto a regular grid (`spline` = `linear` \| `quadratic` \| `cubic` \| polynomial; `resolution` = `nanoseconds`..`years`). Every output point carries a `kind` — `raw` / `interpolated` / `extrapolated`. |
 | `POST /api/v1/interpolate/point` | Evaluate the reconstructed signal at a single instant, labelled raw/interpolated/extrapolated. |
 | `POST /api/v1/downsample` | Reduce samples into epoch-grid-aligned buckets (`min`/`max`/`avg`/`sum`/`first`/`last`; reductions computed in `BigDecimal`). Only non-empty buckets are emitted. |
-| `POST /api/v1/{interpolate,downsample}/ilp` | The same, fed an ILP `text/plain` body (the TSBS/InfluxDB/QuestDB wire format); `field`, `precision` (`ns`/`us`/`ms`/`s`), and the compute knobs are query parameters. |
+| `POST /api/v1/{interpolate,downsample}/ilp` | The same, fed an ILP `text/plain` body (the TSBS/InfluxDB/QuestDB wire format); `field`, `precision` (`ns`/`us`/`ms`/`s`), and the compute knobs are query parameters. `interpolation=` is accepted as an alias for `spline=` (the canonical `spline` wins if both are given). |
 | `POST /api/v1/{interpolate,downsample}/{csv,arrow,parquet}` and `…/ilp/{csv,arrow,parquet}` | The same computations with CSV (`text/csv`), Arrow IPC stream, or Parquet output — so a harness feeding line protocol pulls results in any of the four formats. |
 
 ```sh
@@ -446,13 +457,13 @@ under the declared encoding/tolerance is rejected `400`.
 |----------|---------|
 | `POST /api/v1/storage/aspects` | **Declare** an aspect's schema — physical encoding, value tolerance, timestamp unit. |
 | `GET /api/v1/storage/aspects` · `…/{aspect}/schema` · `…/catalog` | List declared schemas; read one aspect's schema; report the store's `(database, subject)` scope + registered hierarchy. |
-| `POST /api/v1/storage/{aspect}/points` | Ingest a JSON batch (dense or nullable; single-block or paged via `rows_per_page`). |
-| `POST /api/v1/storage/{aspect}/{ilp,parquet,csv}` | Ingest an ILP payload, a Parquet file, or CSV rows into a declared aspect — all sealing through the same schema-enforced path. |
+| `POST /api/v1/storage/{aspect}/points` | Ingest a JSON batch (dense or nullable; single-block or paged via `rows_per_page`). Set `require_sorted` to reject an out-of-order batch (`400`, naming the first backwards row) instead of sealing it. Every ingest response reports `time_sorted` (whether the sealed segment stored in monotonic order). |
+| `POST /api/v1/storage/{aspect}/{ilp,parquet,csv}` | Ingest an ILP payload, a Parquet file, or CSV rows into a declared aspect — all sealing through the same schema-enforced path, and all honouring `require_sorted` (query param) + reporting `time_sorted`. |
 | `GET /api/v1/storage/{aspect}/range` · `…/value-range` | Stream a stored time window / value band as **Arrow IPC** (`application/vnd.apache.arrow.stream`). |
 | `GET …/range.parquet` · `…/value-range.parquet` | The same windows as **Parquet** files. |
 | `GET …/range.csv` · `…/value-range.csv` | The same windows as **CSV** (lossless decimal-text values; empty field = null). |
 | `GET /api/v1/storage/{aspect}/points` · `…/value-points` | Lossless JSON reads with declarative pagination — `offset`/`limit` (+ `take` and 1-based `page` aliases), with `total`/`count`/`offset` in the body. |
-| `GET /api/v1/storage/{aspect}/stats` · `…/storage/stats` | Materialized per-aspect and store-wide rollups, including the realized **bytes/point** (the north-star cost term) — served from the control plane without opening a segment. |
+| `GET /api/v1/storage/{aspect}/stats` · `…/storage/stats` | Materialized per-aspect and store-wide rollups, including the realized **bytes/point** (the north-star cost term) and an `unsorted_segments` order-health count (segments that would force a linear scan on a point lookup) — served from the control plane without opening a segment. |
 
 ### Metrics
 
