@@ -405,6 +405,94 @@ impl SegmentStore {
 		Ok(found)
 	}
 
+	/// **Out-of-order reconciliation** (roadmap Phase 4.6): rewrite a single
+	/// out-of-order segment into a time-sorted one, in place at its own id.
+	///
+	/// The first bounded slice of the QuestDB-O3-style reconciliation path — a
+	/// per-segment sort rather than the full staging-window cross-segment merge. It
+	/// reads segment `id`, stable-sorts its rows by timestamp (equal timestamps keep
+	/// their original order, so [`read_point`](SegmentStore::read_point)'s
+	/// first-present-of-a-run answer is preserved), and re-seals the sorted rows
+	/// under the aspect's declared schema to the **same id and file** (the index's
+	/// `INSERT OR REPLACE` on `(aspect, id)` swaps the descriptor, the deterministic
+	/// path overwrites the frame). The reconciled segment is `time_sorted`, so it
+	/// drops out of the `unsorted_segments` order-health count and a point lookup over
+	/// it binary-searches. The frame kind is preserved (a paged segment re-seals
+	/// paged at its own page height). The materialized rollup is rebuilt from the
+	/// index afterward (a reconcile is not a fresh seal, so it must not fold forward).
+	///
+	/// Returns `true` when a rewrite happened, `false` when the segment was already
+	/// sorted (a no-op).
+	///
+	/// # Errors
+	///
+	/// Returns an error if `aspect` has no declared schema or no segment `id`;
+	/// propagates a filesystem/read error, a re-seal failure, or a libSQL failure.
+	pub async fn reconcile_segment(&self, aspect: &str, id: u64) -> Result<bool> {
+		let descriptor = self.index.all(aspect).await?.into_iter().find(|d| d.id == id).ok_or_else(|| anyhow::anyhow!("aspect {aspect:?} has no segment {id}"))?;
+		if descriptor.time_sorted {
+			return Ok(false);
+		}
+		let schema = self.require_schema(aspect).await?;
+		let bytes = tokio::fs::read(&descriptor.path).await.with_context(|| format!("reading segment {}", descriptor.path))?;
+		let paged = descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION;
+		let (rows_per_page, timestamps, values) = if paged {
+			let segment = PagedSegment::read_from(&bytes).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?;
+			let rows_per_page = segment.rows_per_page;
+			let (ts, vs) = segment.decode_nullable();
+			(Some(rows_per_page), ts, vs)
+		} else {
+			let segment = Segment::read_from(&bytes).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?;
+			let (ts, vs) = segment.decode_nullable();
+			(None, ts, vs)
+		};
+		// Stable sort by timestamp — equal timestamps keep their ingest order.
+		let mut rows: Vec<(i64, Option<BigDecimal>)> = timestamps.into_iter().zip(values).collect();
+		rows.sort_by_key(|(t, _)| *t);
+		let (sorted_ts, sorted_vs): (Vec<i64>, Vec<Option<BigDecimal>>) = rows.into_iter().unzip();
+		// Re-seal the sorted rows in the original frame kind, to the same id/file.
+		let path = self.segment_path(aspect, id);
+		let new_descriptor = if let Some(rows_per_page) = rows_per_page {
+			let segment = schema.seal_paged_nullable(&sorted_ts, &sorted_vs, rows_per_page).map_err(|e| anyhow::anyhow!("re-seal failed: {e}"))?;
+			let new_bytes = segment.write_to();
+			tokio::fs::write(&path, &new_bytes).await.with_context(|| format!("writing reconciled segment {}", path.display()))?;
+			SegmentDescriptor::of_paged_segment(id, path.to_string_lossy().into_owned(), new_bytes.len() as u64, &segment)
+		} else {
+			let segment = schema.seal_nullable(&sorted_ts, &sorted_vs).map_err(|e| anyhow::anyhow!("re-seal failed: {e}"))?;
+			let new_bytes = segment.write_to();
+			tokio::fs::write(&path, &new_bytes).await.with_context(|| format!("writing reconciled segment {}", path.display()))?;
+			SegmentDescriptor::of_segment(id, path.to_string_lossy().into_owned(), new_bytes.len() as u64, &segment)
+		};
+		self.index.insert(aspect, &new_descriptor).await?;
+		// A reconcile replaces a segment rather than adding one, so the O(1) fold would
+		// double-count — recompute the rollup from the durable index instead.
+		self.rebuild_aspect_metadata(aspect).await?;
+		Ok(true)
+	}
+
+	/// **Reconcile every out-of-order segment** of `aspect` (roadmap Phase 4.6),
+	/// returning the number rewritten. The natural trigger is a non-zero
+	/// [`unsorted_segments`](AspectStorageStats::unsorted_segments) — after this call
+	/// it is zero and every point lookup over the aspect binary-searches.
+	///
+	/// Each out-of-order segment is reconciled in place by
+	/// [`reconcile_segment`](SegmentStore::reconcile_segment); already-sorted segments
+	/// are skipped. Segments are visited in seal-id order.
+	///
+	/// # Errors
+	///
+	/// As [`reconcile_segment`](SegmentStore::reconcile_segment).
+	pub async fn reconcile_aspect(&self, aspect: &str) -> Result<usize> {
+		let unsorted_ids: Vec<u64> = self.index.all(aspect).await?.into_iter().filter(|d| !d.time_sorted).map(|d| d.id).collect();
+		let mut reconciled = 0;
+		for id in unsorted_ids {
+			if self.reconcile_segment(aspect, id).await? {
+				reconciled += 1;
+			}
+		}
+		Ok(reconciled)
+	}
+
 	/// Read every present row of `aspect` whose **value** falls in the inclusive range
 	/// `[lo, hi]`, **opening only the segment files whose value span overlaps it**.
 	///
@@ -864,6 +952,68 @@ mod tests {
 		assert_eq!(paged_hit, Some(bd("5")));
 		assert_eq!(ooo_hit, Some(bd("202")));
 		assert_eq!(miss, None);
+	}
+
+	#[tokio::test]
+	async fn reconcile_sorts_an_out_of_order_segment_in_place() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		// One out-of-order segment.
+		let d = store.seal("a", &schema(), &[100_i64, 130, 110, 120], &[bd("1"), bd("4"), bd("2"), bd("3")]).await.expect("seals ooo");
+		assert_eq!(store.aspect_stats("a").await.expect("stats").unsorted_segments, 1);
+		// The point lookup answers correctly even before reconciliation (linear scan).
+		assert_eq!(store.read_point("a", 110).await.expect("reads"), Some(bd("2")));
+		// Reconcile: the segment is rewritten sorted at the same id.
+		let changed = store.reconcile_segment("a", d.id).await.expect("reconciles");
+		let stats = store.aspect_stats("a").await.expect("stats");
+		// The rows are unchanged in content, now in timestamp order, and still found.
+		let (ts, vs) = store.read_time_range("a", 0, 1000).await.expect("reads");
+		let still = store.read_point("a", 110).await.expect("reads");
+		// A second reconcile is a no-op.
+		let again = store.reconcile_segment("a", d.id).await.expect("reconciles");
+		drop(store);
+		assert!(changed, "an out-of-order segment is rewritten");
+		assert_eq!(stats.segment_count, 1, "reconcile replaces, it does not add a segment");
+		assert_eq!(stats.unsorted_segments, 0, "the segment is now sorted");
+		assert_eq!(ts, vec![100, 110, 120, 130]);
+		assert_eq!(vs, vec![Some(bd("1")), Some(bd("2")), Some(bd("3")), Some(bd("4"))]);
+		assert_eq!(still, Some(bd("2")));
+		assert!(!again, "a sorted segment reconciles to a no-op");
+	}
+
+	#[tokio::test]
+	async fn reconcile_aspect_clears_the_unsorted_count() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		// One ordered, two out-of-order (one of them paged), plus a nullable row.
+		store.seal("a", &schema(), &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("ordered");
+		store.seal("a", &schema(), &[100_i64, 130, 110], &[bd("4"), bd("5"), bd("6")]).await.expect("ooo single");
+		store.seal_paged_nullable("a", &schema(), &[200_i64, 240, 210, 230], &[Some(bd("7")), None, Some(bd("9")), Some(bd("8"))], 2).await.expect("ooo paged");
+		assert_eq!(store.aspect_stats("a").await.expect("stats").unsorted_segments, 2);
+		let reconciled = store.reconcile_aspect("a").await.expect("reconciles");
+		let stats = store.aspect_stats("a").await.expect("stats");
+		// The paged segment stayed paged and sorted; its rows read back in order.
+		let (ts, vs) = store.read_time_range("a", 200, 240).await.expect("reads");
+		let null_hit = store.read_point("a", 240).await.expect("reads");
+		drop(store);
+		assert_eq!(reconciled, 2, "both out-of-order segments were rewritten");
+		assert_eq!(stats.segment_count, 3, "reconcile replaces in place");
+		assert_eq!(stats.unsorted_segments, 0);
+		assert_eq!(ts, vec![200, 210, 230, 240]);
+		assert_eq!(vs, vec![Some(bd("7")), Some(bd("9")), Some(bd("8")), None]);
+		assert_eq!(null_hit, None, "the null row stays null after reconciliation");
+	}
+
+	#[tokio::test]
+	async fn reconcile_missing_segment_errors() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		let err = store.reconcile_segment("a", 7).await;
+		drop(store);
+		assert!(err.is_err(), "reconciling an absent segment id is an error");
 	}
 
 	#[tokio::test]
