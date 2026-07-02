@@ -367,6 +367,44 @@ impl SegmentStore {
 		Ok((timestamps, values))
 	}
 
+	/// **Point lookup** (roadmap Phase 4.6 read-planner): the present value of
+	/// `aspect` at exactly timestamp `t`, or [`None`] when no present row carries it.
+	///
+	/// The index is pruned by time first — a point lookup is
+	/// [`prune_by_time`](SegmentIndexStore::prune_by_time) with `start == end == t`,
+	/// so only the `.dspseg` files whose `[min_ts, max_ts]` spans `t` are opened. Each
+	/// opened segment resolves the instant with its own persisted per-segment order
+	/// signal: a `time_sorted` segment binary-searches the timestamp column, an
+	/// out-of-order one linear-scans it (see
+	/// [`Segment::value_at`](dsp_physical_type::Segment::value_at)). Candidates are
+	/// pruned in seal-id order, so when overlapping segments each carry a present
+	/// value at `t` the most recently sealed one wins (last-writer-wins) — the natural
+	/// read-your-writes answer once out-of-order reconciliation (Phase 4.6) can leave
+	/// two segments spanning one instant.
+	///
+	/// # Errors
+	///
+	/// Propagates a libSQL prune failure, a filesystem read error, or a
+	/// [`dsp_physical_type::dspseg::DspSegError`] for a corrupt/unreadable `.dspseg`.
+	pub async fn read_point(&self, aspect: &str, t: i64) -> Result<Option<BigDecimal>> {
+		let descriptors = self.index.prune_by_time(aspect, t, t).await?;
+		let mut found = None;
+		for descriptor in &descriptors {
+			let bytes = tokio::fs::read(&descriptor.path).await.with_context(|| format!("reading segment {}", descriptor.path))?;
+			let hit = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION {
+				let segment = PagedSegment::read_from(&bytes).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?;
+				segment.value_at(t)
+			} else {
+				let segment = Segment::read_from(&bytes).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?;
+				segment.value_at(t)
+			};
+			if hit.is_some() {
+				found = hit;
+			}
+		}
+		Ok(found)
+	}
+
 	/// Read every present row of `aspect` whose **value** falls in the inclusive range
 	/// `[lo, hi]`, **opening only the segment files whose value span overlaps it**.
 	///
@@ -776,6 +814,71 @@ mod tests {
 		assert_eq!(allts.len(), 15);
 		assert!(gts.is_empty());
 		assert!(gvs.is_empty());
+	}
+
+	#[tokio::test]
+	async fn read_point_finds_the_value_at_an_exact_instant() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		// Two disjoint sealed segments over [0,40] and [100,140].
+		for base in [0_i64, 100] {
+			let ts: Vec<i64> = (0..5).map(|i| base + i * 10).collect();
+			let vs: Vec<BigDecimal> = (0..5).map(|i| BigDecimal::from(base + i)).collect();
+			store.seal("a", &schema(), &ts, &vs).await.expect("seals");
+		}
+		// A hit in each segment; the index prunes to the one file that spans the instant.
+		let hit_first = store.read_point("a", 20).await.expect("reads");
+		let hit_second = store.read_point("a", 120).await.expect("reads");
+		// An off-grid instant inside a segment span, one in the inter-segment gap, and
+		// one past the aspect entirely — all misses.
+		let off_grid = store.read_point("a", 25).await.expect("reads");
+		let in_gap = store.read_point("a", 70).await.expect("reads");
+		let beyond = store.read_point("a", 500).await.expect("reads");
+		// An undeclared/empty aspect is a clean miss.
+		let empty = store.read_point("none", 0).await.expect("reads");
+		drop(store);
+		assert_eq!(hit_first, Some(bd("2")));
+		assert_eq!(hit_second, Some(bd("102")));
+		assert_eq!(off_grid, None);
+		assert_eq!(in_gap, None);
+		assert_eq!(beyond, None);
+		assert_eq!(empty, None);
+	}
+
+	#[tokio::test]
+	async fn read_point_reads_paged_and_out_of_order_segments() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		// A paged segment over [0,110] (page skipping applies to the point lookup).
+		let pts: Vec<i64> = (0..12).map(|i| i * 10).collect();
+		let pvs: Vec<BigDecimal> = (0..12).map(BigDecimal::from).collect();
+		store.seal_paged("a", &schema(), &pts, &pvs, 4).await.expect("seals paged");
+		// An out-of-order single-block segment over [200,240] (forces a linear scan).
+		store.seal("a", &schema(), &[200_i64, 230, 210, 240, 220], &(0..5).map(|i| bd(&format!("{}", 200 + i))).collect::<Vec<_>>()).await.expect("seals ooo");
+		let unsorted = store.aspect_stats("a").await.expect("stats").unsorted_segments;
+		let paged_hit = store.read_point("a", 50).await.expect("reads");
+		let ooo_hit = store.read_point("a", 210).await.expect("reads");
+		let miss = store.read_point("a", 205).await.expect("reads");
+		drop(store);
+		assert_eq!(unsorted, 1, "the second segment is out of order");
+		assert_eq!(paged_hit, Some(bd("5")));
+		assert_eq!(ooo_hit, Some(bd("202")));
+		assert_eq!(miss, None);
+	}
+
+	#[tokio::test]
+	async fn read_point_last_writer_wins_across_overlapping_segments() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		// Two segments both spanning ts=20 with different values there; the later seal wins.
+		store.seal("a", &schema(), &[10_i64, 20, 30], &[bd("1"), bd("2"), bd("3")]).await.expect("first");
+		store.seal("a", &schema(), &[20_i64, 40], &[bd("99"), bd("4")]).await.expect("second");
+		let at_20 = store.read_point("a", 20).await.expect("reads");
+		// A value only the first segment carries is still found.
+		let at_10 = store.read_point("a", 10).await.expect("reads");
+		drop(store);
+		assert_eq!(at_20, Some(bd("99")), "the more recently sealed segment wins at the shared instant");
+		assert_eq!(at_10, Some(bd("1")));
 	}
 
 	#[tokio::test]
