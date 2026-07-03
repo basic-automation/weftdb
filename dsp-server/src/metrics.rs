@@ -41,6 +41,8 @@ pub struct Metrics {
 	pub downsample: DownsampleMetrics,
 	/// Counters for the storage-ingest endpoints (`…/points`, `…/ilp`).
 	pub ingest: IngestMetrics,
+	/// Counters for the out-of-order reconciliation pass (`…/reconcile`).
+	pub reconcile: ReconcileMetrics,
 	/// End-to-end latency for the interpolate endpoints (JSON + ILP).
 	pub interpolate_latency: LatencyHistogram,
 	/// End-to-end latency for the downsample endpoints (JSON + ILP).
@@ -205,6 +207,18 @@ pub struct IngestMetrics {
 	segments_sealed: AtomicU64,
 }
 
+/// Counters for the out-of-order reconciliation pass (`POST …/{aspect}/reconcile`).
+///
+/// The observability side of the Phase-4.6 threshold-triggered reconcile: a
+/// background trigger keyed on `unsorted_segments` needs its firing rate and the
+/// write amplification it drives to be countable, so an operator can tune the
+/// threshold against how often a pass actually runs and how much it rewrites.
+#[derive(Debug, Default)]
+pub struct ReconcileMetrics {
+	passes: AtomicU64,
+	segments_reconciled: AtomicU64,
+}
+
 /// A point-in-time read of [`Metrics`], convenient for assertions and rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetricsSnapshot {
@@ -214,6 +228,8 @@ pub struct MetricsSnapshot {
 	pub downsample: DownsampleSnapshot,
 	/// Storage-ingest counters.
 	pub ingest: IngestSnapshot,
+	/// Reconciliation-pass counters.
+	pub reconcile: ReconcileSnapshot,
 }
 
 /// A point-in-time read of [`InterpolateMetrics`].
@@ -249,6 +265,16 @@ pub struct IngestSnapshot {
 	pub rows_sealed: u64,
 	/// Total segments sealed across all successful ingests.
 	pub segments_sealed: u64,
+}
+
+/// A point-in-time read of [`ReconcileMetrics`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ReconcileSnapshot {
+	/// Reconciliation passes that actually ran (rewrote the backlog). A
+	/// threshold-gated call that held below its threshold is **not** counted.
+	pub passes: u64,
+	/// Total out-of-order segments rewritten sorted across all passes.
+	pub segments_reconciled: u64,
 }
 
 impl Metrics {
@@ -298,6 +324,24 @@ impl Metrics {
 		self.ingest.segments_sealed.fetch_add(1, Ordering::Relaxed);
 	}
 
+	/// Record one reconciliation pass that actually ran, adding the number of
+	/// out-of-order segments it rewrote. A threshold-gated call that held below its
+	/// threshold must not call this — only a pass that did work is counted.
+	pub fn record_reconcile_pass(&self, segments_reconciled: u64) {
+		self.reconcile.passes.fetch_add(1, Ordering::Relaxed);
+		self.reconcile.segments_reconciled.fetch_add(segments_reconciled, Ordering::Relaxed);
+	}
+
+	/// Record one background sweep's reconciliations (roadmap Phase 4.6 daemon):
+	/// each reconciled aspect is one pass (consistent with
+	/// [`record_reconcile_pass`](Metrics::record_reconcile_pass), which reconciles a
+	/// single aspect), plus the segments those passes rewrote. A sweep that
+	/// reconciled nothing records nothing, so a quiet daemon never bumps the counter.
+	pub fn record_reconcile_sweep(&self, aspects_reconciled: u64, segments_reconciled: u64) {
+		self.reconcile.passes.fetch_add(aspects_reconciled, Ordering::Relaxed);
+		self.reconcile.segments_reconciled.fetch_add(segments_reconciled, Ordering::Relaxed);
+	}
+
 	/// Record the end-to-end handling latency of one interpolation request
 	/// (success or error alike — latency of failures is part of the SLO).
 	pub fn observe_interpolate_latency(&self, elapsed: Duration) {
@@ -317,7 +361,7 @@ impl Metrics {
 	/// Take a consistent-enough snapshot of all counters.
 	#[must_use]
 	pub fn snapshot(&self) -> MetricsSnapshot {
-		MetricsSnapshot { interpolate: InterpolateSnapshot { requests: self.interpolate.requests.load(Ordering::Relaxed), errors: self.interpolate.errors.load(Ordering::Relaxed), output_points: self.interpolate.output_points.load(Ordering::Relaxed) }, downsample: DownsampleSnapshot { requests: self.downsample.requests.load(Ordering::Relaxed), errors: self.downsample.errors.load(Ordering::Relaxed), output_buckets: self.downsample.output_buckets.load(Ordering::Relaxed) }, ingest: IngestSnapshot { requests: self.ingest.requests.load(Ordering::Relaxed), errors: self.ingest.errors.load(Ordering::Relaxed), rows_sealed: self.ingest.rows_sealed.load(Ordering::Relaxed), segments_sealed: self.ingest.segments_sealed.load(Ordering::Relaxed) } }
+		MetricsSnapshot { interpolate: InterpolateSnapshot { requests: self.interpolate.requests.load(Ordering::Relaxed), errors: self.interpolate.errors.load(Ordering::Relaxed), output_points: self.interpolate.output_points.load(Ordering::Relaxed) }, downsample: DownsampleSnapshot { requests: self.downsample.requests.load(Ordering::Relaxed), errors: self.downsample.errors.load(Ordering::Relaxed), output_buckets: self.downsample.output_buckets.load(Ordering::Relaxed) }, ingest: IngestSnapshot { requests: self.ingest.requests.load(Ordering::Relaxed), errors: self.ingest.errors.load(Ordering::Relaxed), rows_sealed: self.ingest.rows_sealed.load(Ordering::Relaxed), segments_sealed: self.ingest.segments_sealed.load(Ordering::Relaxed) }, reconcile: ReconcileSnapshot { passes: self.reconcile.passes.load(Ordering::Relaxed), segments_reconciled: self.reconcile.segments_reconciled.load(Ordering::Relaxed) } }
 	}
 
 	/// Render the counters in the Prometheus text exposition format (v0.0.4).
@@ -326,7 +370,7 @@ impl Metrics {
 		use std::fmt::Write as _;
 		let snap = self.snapshot();
 		let mut out = String::with_capacity(512);
-		let counters = [("dsp_interpolate_requests_total", "Total interpolation requests received.", snap.interpolate.requests), ("dsp_interpolate_errors_total", "Interpolation requests that returned an error.", snap.interpolate.errors), ("dsp_interpolate_output_points_total", "Total interpolated output points served.", snap.interpolate.output_points), ("dsp_downsample_requests_total", "Total downsample requests received.", snap.downsample.requests), ("dsp_downsample_errors_total", "Downsample requests that returned an error.", snap.downsample.errors), ("dsp_downsample_output_buckets_total", "Total downsample buckets served.", snap.downsample.output_buckets), ("dsp_ingest_requests_total", "Total storage-ingest requests received.", snap.ingest.requests), ("dsp_ingest_errors_total", "Storage-ingest requests that returned an error.", snap.ingest.errors), ("dsp_ingest_rows_sealed_total", "Total rows sealed across all storage ingests.", snap.ingest.rows_sealed), ("dsp_ingest_segments_sealed_total", "Total segments sealed across all storage ingests.", snap.ingest.segments_sealed)];
+		let counters = [("dsp_interpolate_requests_total", "Total interpolation requests received.", snap.interpolate.requests), ("dsp_interpolate_errors_total", "Interpolation requests that returned an error.", snap.interpolate.errors), ("dsp_interpolate_output_points_total", "Total interpolated output points served.", snap.interpolate.output_points), ("dsp_downsample_requests_total", "Total downsample requests received.", snap.downsample.requests), ("dsp_downsample_errors_total", "Downsample requests that returned an error.", snap.downsample.errors), ("dsp_downsample_output_buckets_total", "Total downsample buckets served.", snap.downsample.output_buckets), ("dsp_ingest_requests_total", "Total storage-ingest requests received.", snap.ingest.requests), ("dsp_ingest_errors_total", "Storage-ingest requests that returned an error.", snap.ingest.errors), ("dsp_ingest_rows_sealed_total", "Total rows sealed across all storage ingests.", snap.ingest.rows_sealed), ("dsp_ingest_segments_sealed_total", "Total segments sealed across all storage ingests.", snap.ingest.segments_sealed), ("dsp_reconcile_passes_total", "Out-of-order reconciliation passes that actually ran (threshold-gated holds excluded).", snap.reconcile.passes), ("dsp_reconcile_segments_reconciled_total", "Total out-of-order segments rewritten sorted across all reconciliation passes.", snap.reconcile.segments_reconciled)];
 		for (name, help, value) in counters {
 			// `writeln!` into a String is infallible.
 			let _ = writeln!(out, "# HELP {name} {help}");
@@ -471,19 +515,24 @@ mod tests {
 		let m = Metrics::default();
 		m.record_interpolate_request();
 		m.add_output_points(5);
+		m.record_reconcile_pass(3);
 		let text = m.render_prometheus();
 		// Every counter carries HELP, TYPE, and a value line.
 		assert!(text.contains("# HELP dsp_interpolate_requests_total"));
 		assert!(text.contains("# TYPE dsp_interpolate_requests_total counter"));
 		assert!(text.contains("dsp_interpolate_requests_total 1"));
 		assert!(text.contains("dsp_interpolate_output_points_total 5"));
-		// No value line is left dangling without a preceding TYPE line: 10
+		// No value line is left dangling without a preceding TYPE line: 12
 		// counters + the 3 latency histograms.
-		assert_eq!(text.matches("# TYPE ").count(), 13);
+		assert_eq!(text.matches("# TYPE ").count(), 15);
 		// The downsample counters are exposed too.
 		assert!(text.contains("# TYPE dsp_downsample_requests_total counter"));
 		// And the storage-ingest counters.
 		assert!(text.contains("# TYPE dsp_ingest_rows_sealed_total counter"));
+		// And the reconciliation-pass counters (one pass, three segments rewritten).
+		assert!(text.contains("# TYPE dsp_reconcile_passes_total counter"));
+		assert!(text.contains("dsp_reconcile_passes_total 1"));
+		assert!(text.contains("dsp_reconcile_segments_reconciled_total 3"));
 	}
 
 	#[test]
