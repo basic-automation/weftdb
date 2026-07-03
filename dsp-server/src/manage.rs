@@ -222,6 +222,60 @@ async fn reconcile_aspect_inner(store: &database::SegmentStore, aspect: &str, th
 	Ok((StatusCode::OK, Json(ReconcileResponse { aspect: aspect.to_string(), triggered, reconciled, unsorted_segments })).into_response())
 }
 
+/// Response body for `POST /api/v1/storage/reconcile` — the outcome of a store-wide
+/// threshold reconciliation sweep across every declared aspect.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReconcileStoreResponse {
+	/// The order-health backlog threshold applied (an absent `?threshold=` defaults
+	/// to 1 — reconcile any aspect with at least one out-of-order segment).
+	pub threshold: usize,
+	/// Number of declared aspects the sweep visited.
+	pub aspects_scanned: usize,
+	/// Number of aspects whose backlog met the threshold and were reconciled.
+	pub aspects_reconciled: usize,
+	/// Total out-of-order segments rewritten sorted across the sweep.
+	pub segments_reconciled: usize,
+	/// The store-wide order-health count *after* the sweep — zero once every segment
+	/// in the store admits ordered (binary-search) access.
+	pub unsorted_segments: usize,
+}
+
+/// Handle `POST /api/v1/storage/reconcile`: sweep **every** declared aspect,
+/// reconciling those whose out-of-order backlog is at or above `?threshold=N`
+/// (roadmap Phase 4.6).
+///
+/// The manual, store-wide operator counterpart to the per-aspect
+/// [`reconcile_aspect`] endpoint and the background reconcile daemon — the same
+/// [`SegmentStore::reconcile_all_over_threshold`](database::SegmentStore::reconcile_all_over_threshold)
+/// sweep, on demand. An absent `threshold` defaults to 1 (reconcile any aspect with
+/// out-of-order data). Each aspect actually reconciled is counted in
+/// `dsp_reconcile_passes_total`, exactly like the per-aspect trigger and the daemon.
+///
+/// # Errors
+///
+/// [`StorageError::Unconfigured`] when no store is attached, and
+/// [`StorageError::Internal`] on a read/seal/control-plane failure.
+pub async fn reconcile_store(State(state): State<AppState>, Query(params): Query<ReconcileParams>) -> Result<Response, StorageError> {
+	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	let metrics = state.metrics().clone();
+	drop(state);
+	let result = reconcile_store_inner(&store, params.threshold, &metrics).await;
+	drop(store);
+	result
+}
+
+/// The body of [`reconcile_store`], split out so the significant-`Drop`
+/// [`SegmentStore`](database::SegmentStore) handle is dropped in the caller.
+async fn reconcile_store_inner(store: &database::SegmentStore, threshold: Option<usize>, metrics: &crate::metrics::SharedMetrics) -> Result<Response, StorageError> {
+	let threshold = threshold.unwrap_or(1).max(1);
+	let sweep = store.reconcile_all_over_threshold(threshold).await.map_err(|err| StorageError::Internal(err.to_string()))?;
+	if sweep.aspects_reconciled > 0 {
+		metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_reconciled).unwrap_or(u64::MAX));
+	}
+	let unsorted_segments = store.store_stats().await.map_err(|err| StorageError::Internal(err.to_string()))?.unsorted_segments;
+	Ok((StatusCode::OK, Json(ReconcileStoreResponse { threshold, aspects_scanned: sweep.aspects_scanned, aspects_reconciled: sweep.aspects_reconciled, segments_reconciled: sweep.segments_reconciled, unsorted_segments })).into_response())
+}
+
 /// One point in an ingest batch: an integer epoch timestamp (in the aspect's
 /// declared [`TimeUnit`]) and its value as lossless decimal text, or `null` for an
 /// absent/null row.
@@ -844,6 +898,39 @@ mod tests {
 		assert_eq!(fired["triggered"], true, "at the threshold the pass runs");
 		assert_eq!(fired["reconciled"], 1);
 		assert_eq!(fired["unsorted_segments"], 0);
+	}
+
+	#[tokio::test]
+	async fn reconcile_store_endpoint_sweeps_every_aspect() {
+		let dir = TempDir::new().unwrap();
+		let sc = dsp_physical_type::AspectSchema::new(dsp_physical_type::PhysicalType::F64, "0".parse().unwrap(), dsp_physical_type::TimeUnit::Seconds);
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+		store.declare("a", &sc).await.expect("declares a");
+		store.declare("b", &sc).await.expect("declares b");
+		// One out-of-order segment in each aspect.
+		store.seal("a", &sc, &[100_i64, 130, 110], &["1".parse().unwrap(), "3".parse().unwrap(), "2".parse().unwrap()]).await.expect("seal a");
+		store.seal("b", &sc, &[200_i64, 240, 210], &["4".parse().unwrap(), "6".parse().unwrap(), "5".parse().unwrap()]).await.expect("seal b");
+
+		// Store-wide sweep with no threshold (defaults to 1): both aspects reconciled.
+		let router = app_with_state(AppState::new().with_store(store.clone()));
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/reconcile").body(Body::empty()).unwrap()).await.unwrap();
+		let status = response.status();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		drop(store);
+		assert_eq!(status, StatusCode::OK, "body: {json}");
+		assert_eq!(json["threshold"], 1);
+		assert_eq!(json["aspects_scanned"], 2);
+		assert_eq!(json["aspects_reconciled"], 2);
+		assert_eq!(json["segments_reconciled"], 2);
+		assert_eq!(json["unsorted_segments"], 0);
+	}
+
+	#[tokio::test]
+	async fn reconcile_store_without_store_is_unavailable() {
+		let router = app_with_state(AppState::new());
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/reconcile").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 	}
 
 	#[tokio::test]
