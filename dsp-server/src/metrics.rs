@@ -332,6 +332,16 @@ impl Metrics {
 		self.reconcile.segments_reconciled.fetch_add(segments_reconciled, Ordering::Relaxed);
 	}
 
+	/// Record one background sweep's reconciliations (roadmap Phase 4.6 daemon):
+	/// each reconciled aspect is one pass (consistent with
+	/// [`record_reconcile_pass`](Metrics::record_reconcile_pass), which reconciles a
+	/// single aspect), plus the segments those passes rewrote. A sweep that
+	/// reconciled nothing records nothing, so a quiet daemon never bumps the counter.
+	pub fn record_reconcile_sweep(&self, aspects_reconciled: u64, segments_reconciled: u64) {
+		self.reconcile.passes.fetch_add(aspects_reconciled, Ordering::Relaxed);
+		self.reconcile.segments_reconciled.fetch_add(segments_reconciled, Ordering::Relaxed);
+	}
+
 	/// Record the end-to-end handling latency of one interpolation request
 	/// (success or error alike — latency of failures is part of the SLO).
 	pub fn observe_interpolate_latency(&self, elapsed: Duration) {
