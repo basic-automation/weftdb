@@ -531,6 +531,34 @@ impl SegmentStore {
 		Ok(Some(self.reconcile_aspect(aspect).await?))
 	}
 
+	/// **Store-wide threshold sweep** (roadmap Phase 4.6): apply the
+	/// [`reconcile_aspect_if_unsorted_exceeds`](SegmentStore::reconcile_aspect_if_unsorted_exceeds)
+	/// trigger to **every** declared aspect, reconciling only those whose out-of-order
+	/// backlog is at or above `threshold`.
+	///
+	/// This is the tick an automatic background reconcile daemon calls: on a timer it
+	/// sweeps the store's aspects, pays the rewrite only for the ones over threshold,
+	/// and leaves the rest untouched. Aspects are visited in declared-name order; a
+	/// `threshold` of 0 clamps to 1 (as for the single-aspect trigger). Returns a
+	/// [`ReconcileSweep`] summary — how many aspects were scanned, how many fired, and
+	/// the total segments rewritten — the numbers a daemon logs and exports per tick.
+	///
+	/// # Errors
+	///
+	/// As [`reconcile_aspect_if_unsorted_exceeds`](SegmentStore::reconcile_aspect_if_unsorted_exceeds);
+	/// also propagates the aspect-list read.
+	pub async fn reconcile_all_over_threshold(&self, threshold: usize) -> Result<ReconcileSweep> {
+		let aspects = self.list_declared_aspects().await?;
+		let mut sweep = ReconcileSweep { aspects_scanned: aspects.len(), ..ReconcileSweep::default() };
+		for aspect in &aspects {
+			if let Some(reconciled) = self.reconcile_aspect_if_unsorted_exceeds(aspect, threshold).await? {
+				sweep.aspects_reconciled += 1;
+				sweep.segments_reconciled += reconciled;
+			}
+		}
+		Ok(sweep)
+	}
+
 	/// Read every present row of `aspect` whose **value** falls in the inclusive range
 	/// `[lo, hi]`, **opening only the segment files whose value span overlaps it**.
 	///
@@ -690,6 +718,20 @@ impl SegmentStore {
 		}
 		Ok(stats)
 	}
+}
+
+/// The outcome of a store-wide threshold reconcile sweep, returned by
+/// [`SegmentStore::reconcile_all_over_threshold`] — the per-tick numbers an
+/// automatic background reconcile daemon logs and exports.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReconcileSweep {
+	/// Number of declared aspects the sweep visited.
+	pub aspects_scanned: usize,
+	/// Number of aspects whose backlog was at or above the threshold and were
+	/// therefore reconciled this sweep.
+	pub aspects_reconciled: usize,
+	/// Total out-of-order segments rewritten sorted across every reconciled aspect.
+	pub segments_reconciled: usize,
 }
 
 /// A store-wide aggregate over every aspect's materialized rollup, surfaced by
@@ -1082,6 +1124,35 @@ mod tests {
 		drop(store);
 		assert_eq!(fired, Some(1), "clamped threshold 1 fires on the single out-of-order segment");
 		assert_eq!(after, 0);
+	}
+
+	#[tokio::test]
+	async fn threshold_sweep_reconciles_only_aspects_over_the_threshold() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares a");
+		store.declare("b", &schema()).await.expect("declares b");
+		// aspect a: two out-of-order segments (backlog 2).
+		store.seal("a", &schema(), &[100_i64, 130, 110], &[bd("1"), bd("3"), bd("2")]).await.expect("a ooo1");
+		store.seal("a", &schema(), &[200_i64, 240, 210], &[bd("4"), bd("6"), bd("5")]).await.expect("a ooo2");
+		// aspect b: one out-of-order segment (backlog 1).
+		store.seal("b", &schema(), &[100_i64, 130, 110], &[bd("7"), bd("9"), bd("8")]).await.expect("b ooo1");
+		// Sweep at threshold 2: only aspect a fires; b holds below the threshold.
+		let sweep = store.reconcile_all_over_threshold(2).await.expect("sweeps");
+		let a_after = store.aspect_stats("a").await.expect("stats a").unsorted_segments;
+		let b_after = store.aspect_stats("b").await.expect("stats b").unsorted_segments;
+		// A second sweep at threshold 1 now clears b too.
+		let sweep2 = store.reconcile_all_over_threshold(1).await.expect("sweeps again");
+		let b_final = store.aspect_stats("b").await.expect("stats b").unsorted_segments;
+		drop(store);
+		assert_eq!(sweep.aspects_scanned, 2);
+		assert_eq!(sweep.aspects_reconciled, 1, "only aspect a is over threshold 2");
+		assert_eq!(sweep.segments_reconciled, 2, "both of a's out-of-order segments rewritten");
+		assert_eq!(a_after, 0, "a is reconciled");
+		assert_eq!(b_after, 1, "b held below threshold 2");
+		assert_eq!(sweep2.aspects_reconciled, 1, "the second sweep fires on b");
+		assert_eq!(sweep2.segments_reconciled, 1);
+		assert_eq!(b_final, 0, "b is reconciled by the threshold-1 sweep");
 	}
 
 	#[tokio::test]
