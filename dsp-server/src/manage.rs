@@ -141,14 +141,30 @@ pub async fn declare_aspect(State(state): State<AppState>, Json(request): Json<D
 	Ok((StatusCode::CREATED, Json(DeclareAspectResponse { aspect })).into_response())
 }
 
+/// Query parameters for `POST /api/v1/storage/{aspect}/reconcile`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ReconcileParams {
+	/// Optional order-health trigger threshold (roadmap Phase 4.6). When present,
+	/// the pass runs **only** if the aspect's `unsorted_segments` backlog is at or
+	/// above this many — the QuestDB-style split-count squash trigger, so a caller
+	/// can poll cheaply and pay the rewrite only once the backlog is worth it. A
+	/// value of 0 clamps to 1. When absent, the pass runs unconditionally (the
+	/// original operator-trigger behaviour).
+	pub threshold: Option<usize>,
+}
+
 /// Response body for `POST /api/v1/storage/{aspect}/reconcile` — the outcome of an
 /// out-of-order reconciliation pass.
 #[derive(Debug, Clone, Serialize)]
 pub struct ReconcileResponse {
 	/// The aspect reconciled.
 	pub aspect: String,
+	/// Whether the pass actually ran. Always `true` for an unconditional call;
+	/// `false` when a `threshold` was given and the backlog held below it (nothing
+	/// read or rewritten).
+	pub triggered: bool,
 	/// Number of out-of-order segments rewritten sorted by this call (0 when the
-	/// aspect was already fully ordered).
+	/// aspect was already fully ordered, or when the pass did not trigger).
 	pub reconciled: usize,
 	/// The order-health count *after* the pass — zero once every segment admits
 	/// ordered (binary-search) access.
@@ -159,22 +175,27 @@ pub struct ReconcileResponse {
 /// segment of `aspect` into a time-sorted one (roadmap Phase 4.6).
 ///
 /// This is the operator trigger for the reconciliation pass the
-/// `unsorted_segments` order-health signal motivates.
-/// Delegates to [`SegmentStore::reconcile_aspect`](database::SegmentStore::reconcile_aspect)
-/// — each out-of-order segment is stable-sorted by timestamp and re-sealed in place
-/// at its own id, so afterward point lookups over the aspect binary-search and
-/// `unsorted_segments` is zero. Returns `200 OK` with the number rewritten and the
-/// post-pass order-health count.
+/// `unsorted_segments` order-health signal motivates. With no `threshold` query
+/// param it delegates to [`SegmentStore::reconcile_aspect`](database::SegmentStore::reconcile_aspect)
+/// unconditionally; with `?threshold=N` it delegates to the threshold-gated
+/// [`reconcile_aspect_if_unsorted_exceeds`](database::SegmentStore::reconcile_aspect_if_unsorted_exceeds),
+/// so the rewrite runs only when the backlog is at or above `N`. Either way each
+/// out-of-order segment is stable-sorted by timestamp and re-sealed in place at its
+/// own id, so afterward point lookups over the aspect binary-search. A pass that
+/// actually runs is counted in `dsp_reconcile_passes_total` (holds below the
+/// threshold are not). Returns `200 OK` with whether it triggered, the number
+/// rewritten, and the post-pass order-health count.
 ///
 /// # Errors
 ///
 /// [`StorageError::Unconfigured`] when no store is attached,
 /// [`StorageError::NotFound`] when the aspect is undeclared, and
 /// [`StorageError::Internal`] on a read/seal/control-plane failure.
-pub async fn reconcile_aspect(State(state): State<AppState>, Path(aspect): Path<String>) -> Result<Response, StorageError> {
+pub async fn reconcile_aspect(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<ReconcileParams>) -> Result<Response, StorageError> {
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	let metrics = state.metrics().clone();
 	drop(state);
-	let result = reconcile_aspect_inner(&store, &aspect).await;
+	let result = reconcile_aspect_inner(&store, &aspect, params.threshold, &metrics).await;
 	drop(store);
 	result
 }
@@ -182,14 +203,23 @@ pub async fn reconcile_aspect(State(state): State<AppState>, Path(aspect): Path<
 /// The body of [`reconcile_aspect`], split out so the significant-`Drop`
 /// [`SegmentStore`](database::SegmentStore) handle is dropped in the caller after
 /// the last use rather than held across the response construction.
-async fn reconcile_aspect_inner(store: &database::SegmentStore, aspect: &str) -> Result<Response, StorageError> {
+async fn reconcile_aspect_inner(store: &database::SegmentStore, aspect: &str, threshold: Option<usize>, metrics: &crate::metrics::SharedMetrics) -> Result<Response, StorageError> {
 	// Undeclared aspect → 404 (mirrors the read surface's not-found semantics).
 	if store.schema_for(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?.is_none() {
 		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	}
-	let reconciled = store.reconcile_aspect(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?;
+	// `Some(threshold)` → gate the pass on the backlog; `None` → run unconditionally.
+	// A gated call that holds below its threshold is `None` (not triggered) and is
+	// deliberately not counted as a pass in the metric.
+	let (triggered, reconciled) = match threshold {
+		Some(threshold) => store.reconcile_aspect_if_unsorted_exceeds(aspect, threshold).await.map_err(|err| StorageError::Internal(err.to_string()))?.map_or((false, 0), |reconciled| (true, reconciled)),
+		None => (true, store.reconcile_aspect(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?),
+	};
+	if triggered {
+		metrics.record_reconcile_pass(u64::try_from(reconciled).unwrap_or(u64::MAX));
+	}
 	let unsorted_segments = store.aspect_stats(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?.unsorted_segments;
-	Ok((StatusCode::OK, Json(ReconcileResponse { aspect: aspect.to_string(), reconciled, unsorted_segments })).into_response())
+	Ok((StatusCode::OK, Json(ReconcileResponse { aspect: aspect.to_string(), triggered, reconciled, unsorted_segments })).into_response())
 }
 
 /// One point in an ingest batch: an integer epoch timestamp (in the aspect's
@@ -782,6 +812,38 @@ mod tests {
 		let read: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 		let timestamps: Vec<i64> = read["points"].as_array().unwrap().iter().map(|p| p["timestamp"].as_i64().unwrap()).collect();
 		assert_eq!(timestamps, vec![100, 110, 130]);
+	}
+
+	#[tokio::test]
+	async fn reconcile_endpoint_threshold_gates_the_pass() {
+		let dir = TempDir::new().unwrap();
+		// Ingest one out-of-order batch — the backlog is a single unsorted segment.
+		let router = router_with_declared_price(&dir).await;
+		let ooo = serde_json::json!({ "points": [
+			{ "timestamp": 100, "value": "1.5" },
+			{ "timestamp": 130, "value": "4.5" },
+			{ "timestamp": 110, "value": "2.5" },
+		] });
+		let (status, _body) = post_json(router, "/api/v1/storage/price/points", &ooo).await;
+		assert_eq!(status, StatusCode::CREATED);
+
+		// threshold=2 is not met by a backlog of 1: the pass holds, nothing rewritten.
+		let router = router_with_declared_price_reopened(&dir).await;
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/price/reconcile?threshold=2").body(Body::empty()).unwrap()).await.unwrap();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let held: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		assert_eq!(held["triggered"], false, "below the threshold the pass does not run");
+		assert_eq!(held["reconciled"], 0);
+		assert_eq!(held["unsorted_segments"], 1, "the backlog is left out of order");
+
+		// threshold=1 is met: the pass fires and clears the backlog.
+		let router = router_with_declared_price_reopened(&dir).await;
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/price/reconcile?threshold=1").body(Body::empty()).unwrap()).await.unwrap();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let fired: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		assert_eq!(fired["triggered"], true, "at the threshold the pass runs");
+		assert_eq!(fired["reconciled"], 1);
+		assert_eq!(fired["unsorted_segments"], 0);
 	}
 
 	#[tokio::test]
