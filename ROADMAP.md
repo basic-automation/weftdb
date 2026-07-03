@@ -262,14 +262,28 @@ DSP-Bench shows ingest/scan/compression gains; correctness tests cover late + OO
     QuestDB's split-not-rewrite model — when late data lands in an existing window,
     **split** the affected segment and merge only the small suffix, then **squash**
     the accumulated splits at commit / once the split count crosses a threshold. Keep
-    segments small to bound write amplification. *(src: partition split fires past
-    `cairo.o3.partition.split.min.size`=50MB and squashes past
+    segments small to bound write amplification. Port QuestDB's **size-based split
+    decision**: split only when the existing segment *prefix* is larger than the new
+    data plus its suffix **and** the prefix exceeds a min-size threshold — below that
+    a full in-place rewrite (already shipped) is cheaper than the split bookkeeping.
+    *(src: split fires when "the existing partition prefix is larger than the new data
+    plus suffix" past `cairo.o3.partition.split.min.size`=50MB, and squashes past
     `cairo.o3.last.partition.max.splits`=20 — https://questdb.com/docs/concepts/partitions/)*
-  - [ ] **Threshold-triggered background reconciliation**: use the `unsorted_segments`
-    count as the QuestDB-`max.splits`-style trigger for an automatic background
-    reconcile/compaction pass (rather than only the manual `POST …/reconcile`), with a
-    configurable threshold and a metric for passes run. *(src: automatic squash past a
-    split threshold — https://questdb.com/docs/concepts/partitions/)*
+  - [x] **Threshold-triggered background reconciliation**: the `unsorted_segments`
+    count drives a QuestDB-`max.splits`-style trigger for an automatic background
+    reconcile pass (single-aspect `reconcile_aspect_if_unsorted_exceeds` + store-wide
+    `reconcile_all_over_threshold` sweep), exposed as the `?threshold=N` gate on
+    `POST …/{aspect}/reconcile`, a manual store-wide `POST …/storage/reconcile`, and
+    a timer daemon (`DSP_RECONCILE_INTERVAL_SECS`/`DSP_RECONCILE_THRESHOLD`) with the
+    `dsp_reconcile_passes_total`/`dsp_reconcile_segments_reconciled_total` metrics
+  - [ ] **Hot/cold split in the background reconcile**: QuestDB squashes *non-active*
+    partitions at every commit but defers the *active* (hot-tail) partition until the
+    split threshold; DSP's daemon currently keys purely on the per-aspect
+    `unsorted_segments` count. Refine it to always reconcile sealed/cold segments and
+    defer only the most-recent segment of an aspect until its backlog crosses the
+    threshold, so the hot tail is not rewritten on every tick. *(src: non-active
+    squashed each commit, active squashed past the split threshold —
+    https://questdb.com/docs/concepts/partitions/)*
   - [x] Read-planner: use the persisted per-segment `time_sorted` to binary-search a
     point lookup on a sorted segment and linear-scan only an out-of-order one
     (`Segment::value_at`/`PagedSegment::value_at`/`SegmentStore::read_point`; exposed
@@ -556,9 +570,17 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 - [x] Implement InfluxDB Line Protocol ingest (shared `dsp-line-protocol` crate; bench + server wired end-to-end)
 - [ ] Add end-to-end timing spans *(harness-level spans shipped; per-pipeline-stage spans = Phase 3 tracing item)*
 - [ ] **Next slice — cross-segment out-of-order merge (Phase 4.6):** the in-place
-  per-segment reconciliation + read-planner point lookup shipped; the remaining work
-  is QuestDB's split-not-rewrite merge and a threshold-triggered background
-  reconcile keyed on `unsorted_segments` (see Phase 4.6)
+  per-segment reconciliation, the read-planner point lookup, and the
+  threshold-triggered background reconcile (endpoint gate + store-wide sweep + timer
+  daemon + metrics) have all shipped; the remaining work is QuestDB's split-not-rewrite
+  merge — split the affected segment on a **size-based** decision (existing prefix >
+  new data + suffix, above a min-size threshold) and merge only the small suffix,
+  then squash accumulated splits past a threshold (see Phase 4.6)
+- [ ] **Follow-on — hot/cold split in the background reconcile (Phase 4.6):** the
+  daemon keys purely on the per-aspect `unsorted_segments` count; refine it to always
+  reconcile sealed/cold segments and defer only an aspect's hot-tail segment until its
+  backlog crosses the threshold, so the most-recent segment is not rewritten each tick
+  *(src: https://questdb.com/docs/concepts/partitions/)*
 - [x] Add p50/p95/p99 + confidence-interval reporting
 - [x] Add physical value types (`F64`, `ScaledI64`, `BigDecimalText` + three more)
 - [x] Prototype columnar segment reads for one aspect type (`database::SegmentStore`)
