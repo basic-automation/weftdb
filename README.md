@@ -357,6 +357,14 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   timestamp, re-sealed at the same id, frame kind preserved), so it drops out of the
   `unsorted_segments` count and its point lookups binary-search. (First slice — a
   per-segment sort; the cross-segment staging-window merge is on the roadmap.)
+- **Threshold-triggered reconciliation** — the `unsorted_segments` backlog drives a
+  QuestDB-style trigger so the rewrite is paid only once out-of-order data is worth
+  compacting, never on every late row: `reconcile_aspect_if_unsorted_exceeds` gates a
+  single-aspect pass on the backlog, `reconcile_all_over_threshold` sweeps every
+  declared aspect over the threshold, and a background timer daemon
+  (`DSP_RECONCILE_INTERVAL_SECS` / `DSP_RECONCILE_THRESHOLD`) runs the sweep
+  unattended. A threshold of 0 clamps to 1 (any out-of-order segment). Passes and the
+  segments they rewrite are counted in `dsp_reconcile_*` metrics.
 - **Null/quality column** — a per-row presence bitmap (zero bytes for fully dense
   columns) makes gaps real: present values are stored densely and reconstructed
   as `None` on read.
@@ -474,15 +482,18 @@ under the declared encoding/tolerance is rejected `400`.
 | `GET …/range.csv` · `…/value-range.csv` | The same windows as **CSV** (lossless decimal-text values; empty field = null). |
 | `GET /api/v1/storage/{aspect}/points` · `…/value-points` | Lossless JSON reads with declarative pagination — `offset`/`limit` (+ `take` and 1-based `page` aliases), with `total`/`count`/`offset` in the body. |
 | `GET /api/v1/storage/{aspect}/at?t=` | **Single-instant point lookup**: the present value at exactly `t` (lossless decimal text) or a `found:false` miss. An **order-signal-driven read planner** resolves each candidate segment with its persisted `time_sorted` flag — binary search on a sorted segment, linear scan only on an out-of-order one — after pruning the index to the files spanning `t`. |
-| `POST /api/v1/storage/{aspect}/reconcile` | **Out-of-order reconciliation pass**: rewrite every out-of-order segment of the aspect into a time-sorted one in place (stable sort by timestamp, re-sealed at its own id, frame kind preserved). Returns the number rewritten and the post-pass `unsorted_segments` (0 once every segment admits binary-search access). The order-health count is the trigger. |
+| `POST /api/v1/storage/{aspect}/reconcile` | **Out-of-order reconciliation pass**: rewrite every out-of-order segment of the aspect into a time-sorted one in place (stable sort by timestamp, re-sealed at its own id, frame kind preserved). Returns whether it `triggered`, the number rewritten, and the post-pass `unsorted_segments`. An optional `?threshold=N` gates the pass on the order-health backlog (QuestDB-style split-count trigger) — it runs only when `unsorted_segments >= N`; without it the pass runs unconditionally. |
+| `POST /api/v1/storage/reconcile` | **Store-wide reconciliation sweep**: run the threshold trigger across every declared aspect, reconciling those whose `unsorted_segments` backlog is at or above `?threshold=N` (absent → 1). Returns `aspects_scanned` / `aspects_reconciled` / `segments_reconciled` and the post-sweep store-wide `unsorted_segments`. The manual, on-demand counterpart to the background reconcile daemon (`DSP_RECONCILE_INTERVAL_SECS` / `DSP_RECONCILE_THRESHOLD`). |
 | `GET /api/v1/storage/{aspect}/stats` · `…/storage/stats` | Materialized per-aspect and store-wide rollups, including the realized **bytes/point** (the north-star cost term) and an `unsorted_segments` order-health count (segments that would force a linear scan on a point lookup) — served from the control plane without opening a segment. |
 
 ### Metrics
 
 `GET /metrics` renders Prometheus text exposition (v0.0.4): shared
 `dsp_interpolate_*` / `dsp_downsample_*` counters across each endpoint family,
-`dsp_ingest_*` counters (requests/errors/rows/segments) on the ingest paths, and
-latency histograms over the compute and seal paths.
+`dsp_ingest_*` counters (requests/errors/rows/segments) on the ingest paths,
+`dsp_reconcile_*` counters (`_passes_total` / `_segments_reconciled_total`) over the
+out-of-order reconciliation passes (manual, store-wide, and the background daemon —
+threshold-held calls excluded), and latency histograms over the compute and seal paths.
 `GET /debug/profile/current` serves the same timing data as a live p50/p95/p99
 snapshot.
 
