@@ -158,6 +158,14 @@ pub struct ReconcileParams {
 	/// all-or-nothing threshold sweep. The response carries the cold/hot rewrite split.
 	#[serde(default)]
 	pub hot_cold: bool,
+	/// When `true`, run the **cross-segment overlap merge** (roadmap Phase 4.6):
+	/// collapse each group of time-overlapping segments into one (newer-wins),
+	/// resolving late data that re-entered an already-covered window. Takes precedence
+	/// over `hot_cold`/`threshold` (a distinct axis from intra-segment disorder);
+	/// `reconciled` in the response is then the number of segments merged away. Only
+	/// meaningful on the per-aspect endpoint.
+	#[serde(default)]
+	pub overlaps: bool,
 }
 
 /// Response body for `POST /api/v1/storage/{aspect}/reconcile` — the outcome of an
@@ -179,9 +187,12 @@ pub struct ReconcileResponse {
 	pub cold_reconciled: usize,
 	/// Hot-tail segments rewritten (hot/cold mode only; 0 in threshold mode).
 	pub hot_reconciled: usize,
-	/// The order-health count *after* the pass — zero once every segment admits
-	/// ordered (binary-search) access.
+	/// The intra-segment order-health count *after* the pass — zero once every segment
+	/// admits ordered (binary-search) access.
 	pub unsorted_segments: usize,
+	/// The cross-segment overlap count *after* the pass — zero once no two segments'
+	/// time windows intersect (the `overlaps` mode drives this to zero by merging).
+	pub overlapping_segments: usize,
 }
 
 /// Handle `POST /api/v1/storage/{aspect}/reconcile`: rewrite every out-of-order
@@ -208,7 +219,7 @@ pub async fn reconcile_aspect(State(state): State<AppState>, Path(aspect): Path<
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	let metrics = state.metrics().clone();
 	drop(state);
-	let result = reconcile_aspect_inner(&store, &aspect, params.threshold, params.hot_cold, &metrics).await;
+	let result = reconcile_aspect_inner(&store, &aspect, params.threshold, params.hot_cold, params.overlaps, &metrics).await;
 	drop(store);
 	result
 }
@@ -216,17 +227,22 @@ pub async fn reconcile_aspect(State(state): State<AppState>, Path(aspect): Path<
 /// The body of [`reconcile_aspect`], split out so the significant-`Drop`
 /// [`SegmentStore`](database::SegmentStore) handle is dropped in the caller after
 /// the last use rather than held across the response construction.
-async fn reconcile_aspect_inner(store: &database::SegmentStore, aspect: &str, threshold: Option<usize>, hot_cold: bool, metrics: &crate::metrics::SharedMetrics) -> Result<Response, StorageError> {
+async fn reconcile_aspect_inner(store: &database::SegmentStore, aspect: &str, threshold: Option<usize>, hot_cold: bool, overlaps: bool, metrics: &crate::metrics::SharedMetrics) -> Result<Response, StorageError> {
 	// Undeclared aspect → 404 (mirrors the read surface's not-found semantics).
 	if store.schema_for(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?.is_none() {
 		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	}
-	// hot/cold mode always reconciles the cold segments (so the pass always runs),
-	// deferring only the hot tail until the backlog reaches the threshold. threshold
-	// mode is all-or-nothing: `Some(threshold)` gates the whole pass; `None` runs it
-	// unconditionally. A gated threshold-mode call that holds is `false` (not
-	// triggered) and is deliberately not counted as a pass in the metric.
-	let (mode, triggered, reconciled, cold_reconciled, hot_reconciled) = if hot_cold {
+	// Three modes, in precedence order:
+	// - overlaps: merge cross-segment time-overlap groups (a distinct axis from the
+	//   intra-segment sort — `reconciled` is the number of segments merged away).
+	// - hot/cold: always reconcile cold segments (the pass always runs), deferring the
+	//   hot tail until the backlog reaches the threshold.
+	// - threshold: all-or-nothing — `Some(threshold)` gates the whole pass, `None` runs
+	//   it unconditionally; a gated call that holds is `false` (not a counted pass).
+	let (mode, triggered, reconciled, cold_reconciled, hot_reconciled) = if overlaps {
+		let removed = store.reconcile_overlaps(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?;
+		("overlaps", true, removed, 0, 0)
+	} else if hot_cold {
 		let outcome = store.reconcile_aspect_hot_cold(aspect, threshold.unwrap_or(1)).await.map_err(|err| StorageError::Internal(err.to_string()))?;
 		("hot_cold", true, outcome.total(), outcome.cold_reconciled, outcome.hot_reconciled)
 	} else {
@@ -236,19 +252,16 @@ async fn reconcile_aspect_inner(store: &database::SegmentStore, aspect: &str, th
 		};
 		("threshold", triggered, reconciled, 0, 0)
 	};
-	match (hot_cold, triggered, reconciled) {
-		// hot/cold: record a pass only when it actually rewrote something (matches the
-		// background daemon / store-wide sweep semantics).
-		(true, _, n) if n > 0 => metrics.record_reconcile_pass(u64::try_from(n).unwrap_or(u64::MAX)),
-		(true, _, _) => {},
-		// threshold: a *triggered* pass is recorded even if it rewrote nothing (an
-		// already-ordered aspect), preserving the prior per-aspect metric behaviour; a
-		// pass held below its threshold records nothing.
-		(false, true, n) => metrics.record_reconcile_pass(u64::try_from(n).unwrap_or(u64::MAX)),
-		(false, false, _) => {},
+	match (mode, triggered, reconciled) {
+		// overlaps / hot/cold: record a pass only when it actually changed something
+		// (matches the background daemon / store-wide sweep semantics).
+		("threshold", true, n) => metrics.record_reconcile_pass(u64::try_from(n).unwrap_or(u64::MAX)),
+		("threshold", false, _) => {},
+		(_, _, n) if n > 0 => metrics.record_reconcile_pass(u64::try_from(n).unwrap_or(u64::MAX)),
+		(_, _, _) => {},
 	}
-	let unsorted_segments = store.aspect_stats(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?.unsorted_segments;
-	Ok((StatusCode::OK, Json(ReconcileResponse { aspect: aspect.to_string(), mode, triggered, reconciled, cold_reconciled, hot_reconciled, unsorted_segments })).into_response())
+	let stats = store.aspect_stats(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?;
+	Ok((StatusCode::OK, Json(ReconcileResponse { aspect: aspect.to_string(), mode, triggered, reconciled, cold_reconciled, hot_reconciled, unsorted_segments: stats.unsorted_segments, overlapping_segments: stats.overlapping_segments })).into_response())
 }
 
 /// Response body for `POST /api/v1/storage/reconcile` — the outcome of a store-wide
@@ -1034,6 +1047,30 @@ mod tests {
 		assert_eq!(json["hot_reconciled"], 0, "the hot tail is deferred below threshold 3");
 		assert_eq!(json["reconciled"], 1);
 		assert_eq!(json["unsorted_segments"], 1, "the hot tail remains out of order");
+	}
+
+	#[tokio::test]
+	async fn reconcile_aspect_endpoint_overlaps_merges_overlapping_segments() {
+		let dir = TempDir::new().unwrap();
+		let sc = dsp_physical_type::AspectSchema::new(dsp_physical_type::PhysicalType::F64, "0".parse().unwrap(), dsp_physical_type::TimeUnit::Seconds);
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+		store.declare("a", &sc).await.expect("declares a");
+		// Two internally-sorted but time-overlapping segments ([0,20] and [10,30]).
+		store.seal("a", &sc, &[0_i64, 10, 20], &["1".parse().unwrap(), "2".parse().unwrap(), "3".parse().unwrap()]).await.expect("older");
+		store.seal("a", &sc, &[10_i64, 20, 30], &["4".parse().unwrap(), "5".parse().unwrap(), "6".parse().unwrap()]).await.expect("newer");
+
+		let router = app_with_state(AppState::new().with_store(store.clone()));
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/a/reconcile?overlaps=true").body(Body::empty()).unwrap()).await.unwrap();
+		let status = response.status();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		let segments_after = store.segment_count("a").await.unwrap();
+		drop(store);
+		assert_eq!(status, StatusCode::OK, "body: {json}");
+		assert_eq!(json["mode"], "overlaps");
+		assert_eq!(json["reconciled"], 1, "one segment merged away");
+		assert_eq!(json["overlapping_segments"], 0, "no cross-segment overlap remains");
+		assert_eq!(segments_after, 1, "the overlapping pair collapsed to one segment");
 	}
 
 	#[tokio::test]
