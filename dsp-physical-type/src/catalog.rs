@@ -274,6 +274,64 @@ impl SegmentIndex {
 		self.descriptors.iter().filter(|d| !d.time_sorted).count()
 	}
 
+	/// The indexed segments whose time span **overlaps at least one other segment's**
+	/// span — the **cross-segment** out-of-order signal (roadmap Phase 4.6),
+	/// complementing the *intra*-segment [`unsorted_count`](SegmentIndex::unsorted_count).
+	///
+	/// A segment can be perfectly sorted internally (so it never appears in
+	/// `unsorted_count`) yet still cover a time range that a later-sealed segment
+	/// re-enters — late data landing inside an already-covered window. Those
+	/// overlapping segments are exactly the cross-segment reconciliation candidates:
+	/// the split-not-rewrite merge (see [`SplitPolicy`](crate::SplitPolicy)) operates
+	/// on a segment whose window a late batch overlaps. This returns the involved
+	/// descriptors in **index (seal) order**.
+	///
+	/// Two segments overlap when their inclusive `[min_ts, max_ts]` spans intersect.
+	/// Empty segments (no time span) never overlap. Runs in `O(n log n)`: sort the
+	/// spans by `min_ts`, then a segment is involved iff it starts at or before an
+	/// earlier segment's end (`overlaps a predecessor`) or the next-starting segment
+	/// begins at or before its end (`is overlapped by a successor`).
+	#[must_use]
+	pub fn overlapping_segments(&self) -> Vec<&SegmentDescriptor> {
+		// (original index, min_ts, max_ts) for every non-empty segment.
+		let mut spans: Vec<(usize, i64, i64)> = self.descriptors.iter().enumerate().filter_map(|(i, d)| d.time_range().map(|(lo, hi)| (i, lo, hi))).collect();
+		if spans.len() < 2 {
+			return Vec::new();
+		}
+		spans.sort_by(|a, b| (a.1, a.2).cmp(&(b.1, b.2)));
+		let mut flagged = vec![false; spans.len()];
+		// Overlaps a predecessor: this span starts at or before the running max end.
+		let mut running_max_hi = i64::MIN;
+		for (k, &(_, lo, hi)) in spans.iter().enumerate() {
+			if k > 0 && lo <= running_max_hi {
+				flagged[k] = true;
+			}
+			if hi > running_max_hi {
+				running_max_hi = hi;
+			}
+		}
+		// Overlapped by a successor: the next-starting span (smallest later min_ts)
+		// begins at or before this span's end.
+		for (k, w) in spans.windows(2).enumerate() {
+			if w[1].1 <= w[0].2 {
+				flagged[k] = true;
+			}
+		}
+		// Emit the involved descriptors in original index order.
+		let mut positions: Vec<usize> = spans.iter().zip(&flagged).filter_map(|(&(orig, _, _), &f)| f.then_some(orig)).collect();
+		positions.sort_unstable();
+		positions.into_iter().map(|i| &self.descriptors[i]).collect()
+	}
+
+	/// The number of indexed segments that overlap at least one other in time — the
+	/// count form of [`overlapping_segments`](SegmentIndex::overlapping_segments), the
+	/// cross-segment order-health signal. Zero when every segment covers a disjoint
+	/// time window.
+	#[must_use]
+	pub fn overlapping_count(&self) -> usize {
+		self.overlapping_segments().len()
+	}
+
 	/// Aspect-wide storage cost in **bytes per point**: the total framed bytes over
 	/// the total rows. Zero when the index holds no rows.
 	#[must_use]
@@ -544,6 +602,49 @@ mod tests {
 		let (c, lc) = sealed(200);
 		index.push(SegmentDescriptor::of_segment(2, "c.dspseg", lc, &c));
 		assert_eq!(index.unsorted_count(), 1);
+	}
+
+	#[test]
+	fn index_detects_cross_segment_overlap() {
+		let mut index = SegmentIndex::new();
+		// An empty index and a single segment have nothing to overlap.
+		assert_eq!(index.overlapping_count(), 0);
+		let (only, len) = sealed(0);
+		index.push(SegmentDescriptor::of_segment(0, "only.dspseg", len, &only));
+		assert_eq!(index.overlapping_count(), 0, "a lone segment overlaps nothing");
+		// Grow to three disjoint windows [0,90] [100,190] [200,290] — no cross overlap.
+		for (i, base) in [(1_u64, 100_i64), (2, 200)] {
+			let (seg, len) = sealed(base);
+			index.push(SegmentDescriptor::of_segment(i, format!("s{i}.dspseg"), len, &seg));
+		}
+		assert_eq!(index.overlapping_count(), 0, "disjoint windows: no cross-segment overlap");
+		// A late segment [50,140] re-enters the windows of segment 0 [0,90] and 1 [100,190].
+		let (late, len) = sealed(50);
+		index.push(SegmentDescriptor::of_segment(3, "late.dspseg", len, &late));
+		let ids: Vec<u64> = index.overlapping_segments().iter().map(|d| d.id).collect();
+		assert_eq!(index.overlapping_count(), 3);
+		assert_eq!(ids, vec![0, 1, 3], "segments 0, 1 and the late 3 overlap, returned in index order");
+	}
+
+	#[test]
+	fn index_overlap_counts_boundary_touch_and_containment() {
+		let mut index = SegmentIndex::new();
+		// [0,90] and [90,180] share the instant 90 — an inclusive-range overlap.
+		let (a, la) = sealed(0);
+		index.push(SegmentDescriptor::of_segment(0, "a.dspseg", la, &a));
+		let (b, lb) = sealed(90);
+		index.push(SegmentDescriptor::of_segment(1, "b.dspseg", lb, &b));
+		assert_eq!(index.overlapping_count(), 2, "touching at a shared timestamp counts as overlap");
+		// A wide segment [0,290] added last contains both disjoint neighbours downstream.
+		let mut wide = SegmentIndex::new();
+		let ts: Vec<i64> = (0..30).map(|i| i * 10).collect();
+		let vs: Vec<BigDecimal> = (0..30).map(BigDecimal::from).collect();
+		let w = Segment::build(&ts, &vs, TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		let (n1, l1) = sealed(500);
+		wide.push(SegmentDescriptor::of_segment(0, "n1.dspseg", l1, &n1));
+		wide.push(SegmentDescriptor::of_segment(1, "wide.dspseg", w.write_to().len() as u64, &w));
+		// [500,590] and [0,290] are disjoint → no overlap.
+		assert_eq!(wide.overlapping_count(), 0);
 	}
 
 	#[test]
