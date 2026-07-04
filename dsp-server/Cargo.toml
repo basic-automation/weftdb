@@ -26,6 +26,8 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 splimes = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }  # per-request engine spans on the compute path (Phase 3 instrumentation)
+tracing-subscriber = { workspace = true }  # RUST_LOG-driven span/event subscriber (env-filter from the workspace dep)
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }

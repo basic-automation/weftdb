@@ -46,6 +46,7 @@ const RECONCILE_OVERLAPS_ENV: &str = "DSP_RECONCILE_OVERLAPS";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+	init_tracing();
 	let addr: SocketAddr = std::env::var("DSP_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string()).parse()?;
 
 	let state = build_state().await?;
@@ -57,6 +58,17 @@ async fn main() -> anyhow::Result<()> {
 
 	axum::serve(listener, app_with_state(state)).await?;
 	Ok(())
+}
+
+/// Install the process-wide tracing subscriber (roadmap Phase 3): a `fmt` layer
+/// filtered by `RUST_LOG` (defaulting to `info`) that logs **span close** events, so
+/// each compute-path span (`interpolate.engine`, `downsample.reduce`) prints its
+/// recorded fields and its busy/idle duration on completion — the "where did the time
+/// go" signal Phase 3 targets. `try_init` is a no-op when a subscriber is already
+/// installed, so this never panics.
+fn init_tracing() {
+	let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+	let _ = tracing_subscriber::fmt().with_env_filter(filter).with_target(false).with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE).try_init();
 }
 
 /// Start the background reconcile daemon (roadmap Phase 4.6) when a store is
