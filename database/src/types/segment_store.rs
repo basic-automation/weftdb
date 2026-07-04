@@ -711,7 +711,7 @@ impl SegmentStore {
 	/// Propagates any libSQL read failure.
 	pub async fn aspect_stats(&self, aspect: &str) -> Result<AspectStorageStats> {
 		let index = self.index.load_index(aspect).await?;
-		Ok(AspectStorageStats { segment_count: index.len(), total_rows: index.total_rows(), total_bytes: index.total_bytes(), bytes_per_point: index.bytes_per_point(), time_range: index.time_range(), unsorted_segments: index.unsorted_count() })
+		Ok(AspectStorageStats { segment_count: index.len(), total_rows: index.total_rows(), total_bytes: index.total_bytes(), bytes_per_point: index.bytes_per_point(), time_range: index.time_range(), unsorted_segments: index.unsorted_count(), overlapping_segments: index.overlapping_count() })
 	}
 
 	/// The **materialized** segment-set rollup for `aspect` — the same aspect-wide
@@ -922,6 +922,14 @@ pub struct AspectStorageStats {
 	/// admits ordered access, which a `require_sorted` ingest keeps true by
 	/// construction. See [`SegmentIndex::unsorted_count`](dsp_physical_type::SegmentIndex::unsorted_count).
 	pub unsorted_segments: usize,
+	/// The number of sealed segments whose time span **overlaps at least one other
+	/// segment's** — the *cross-segment* order-health signal (roadmap Phase 4.6),
+	/// distinct from [`unsorted_segments`](AspectStorageStats::unsorted_segments)
+	/// (which counts *intra*-segment disorder). A non-zero count means late data
+	/// re-entered an already-covered window, so a point lookup may have to consult
+	/// more than one segment; these are the cross-segment reconciliation candidates.
+	/// See [`SegmentIndex::overlapping_count`](dsp_physical_type::SegmentIndex::overlapping_count).
+	pub overlapping_segments: usize,
 }
 
 #[cfg(test)]
@@ -1531,6 +1539,20 @@ mod tests {
 		drop(store);
 		assert_eq!(stats.segment_count, 2);
 		assert_eq!(stats.unsorted_segments, 1, "one of the two segments is out of order");
+		assert_eq!(stats.overlapping_segments, 0, "the two segments cover disjoint windows");
+	}
+
+	#[tokio::test]
+	async fn aspect_stats_counts_cross_segment_overlap() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		// Two internally-sorted segments whose time windows overlap: [0,20] and [10,30].
+		store.seal("a", &schema(), &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("first");
+		store.seal("a", &schema(), &[10_i64, 20, 30], &[bd("4"), bd("5"), bd("6")]).await.expect("overlapping");
+		let stats = store.aspect_stats("a").await.expect("stats");
+		drop(store);
+		assert_eq!(stats.unsorted_segments, 0, "both segments are internally sorted");
+		assert_eq!(stats.overlapping_segments, 2, "their time windows overlap (late data re-entered a window)");
 	}
 
 	#[tokio::test]
