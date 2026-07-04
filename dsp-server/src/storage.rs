@@ -650,6 +650,12 @@ pub struct AspectStatsResponse {
 	/// read-scan cost, since an out-of-order segment cannot be binary-searched). Zero
 	/// when every segment admits ordered access.
 	pub unsorted_segments: usize,
+	/// The number of sealed segments whose time window overlaps at least one other
+	/// segment's — the *cross-segment* order-health signal (roadmap Phase 4.6),
+	/// distinct from `unsorted_segments` (intra-segment disorder). Non-zero means late
+	/// data re-entered an already-covered window; these are the cross-segment
+	/// reconciliation candidates. Computed by an index scan (not the O(1) rollup).
+	pub overlapping_segments: usize,
 	/// Inclusive `[min, max]` timestamp span, or `null` when the aspect holds no
 	/// non-empty segment.
 	pub time_range: Option<[i64; 2]>,
@@ -808,14 +814,19 @@ pub async fn storage_aspect_schema(State(state): State<AppState>, Path(aspect): 
 pub async fn storage_aspect_stats(State(state): State<AppState>, Path(aspect): Path<String>) -> Result<Json<AspectStatsResponse>, StorageError> {
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	drop(state);
-	let result = store.aspect_metadata(&aspect).await;
+	// The O(1) rollup carries every field except the cross-segment overlap count,
+	// which has no incremental fold — a second, index-scanning `aspect_stats` supplies
+	// it (this is an operator stats endpoint, not the measurement hot path).
+	let meta_result = store.aspect_metadata(&aspect).await;
+	let overlap_result = store.aspect_stats(&aspect).await;
 	drop(store);
-	let meta = result.map_err(|err| StorageError::Internal(err.to_string()))?;
+	let meta = meta_result.map_err(|err| StorageError::Internal(err.to_string()))?;
+	let overlapping_segments = overlap_result.map_err(|err| StorageError::Internal(err.to_string()))?.overlapping_segments;
 	// Read the borrowing accessor and the Copy fields before moving `value_range` out.
 	let bytes_per_point = meta.bytes_per_point();
 	let time_range = meta.time_range.map(Into::into);
 	let value_range = meta.value_range.map(|(lo, hi)| [lo.to_string(), hi.to_string()]);
-	Ok(Json(AspectStatsResponse { aspect, segment_count: meta.segment_count, total_rows: meta.total_rows, total_nulls: meta.total_nulls, total_bytes: meta.total_bytes, bytes_per_point, unsorted_segments: meta.unsorted_segments, time_range, value_range }))
+	Ok(Json(AspectStatsResponse { aspect, segment_count: meta.segment_count, total_rows: meta.total_rows, total_nulls: meta.total_nulls, total_bytes: meta.total_bytes, bytes_per_point, unsorted_segments: meta.unsorted_segments, overlapping_segments, time_range, value_range }))
 }
 
 /// Handle `GET /api/v1/storage/stats`: the store-wide aggregate over every aspect's
@@ -1173,6 +1184,24 @@ mod tests {
 		assert_eq!(body["segment_count"], 2);
 		// The rollup fold path (record_seal) surfaced the out-of-order segment at the endpoint.
 		assert_eq!(body["unsorted_segments"], 1, "body: {body}");
+		// The two segments cover disjoint windows, so there is no cross-segment overlap.
+		assert_eq!(body["overlapping_segments"], 0, "body: {body}");
+	}
+
+	#[tokio::test]
+	async fn aspect_stats_reports_cross_segment_overlap() {
+		let dir = TempDir::new().expect("temp dir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens store");
+		store.declare("price", &AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds)).await.expect("declares");
+		// Two internally-sorted segments whose time windows overlap ([0,20] and [10,30]).
+		store.seal_declared("price", &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("first");
+		store.seal_declared("price", &[10_i64, 20, 30], &[bd("4"), bd("5"), bd("6")]).await.expect("overlapping");
+		let router = app_with_state(AppState::new().with_store(Arc::new(store)));
+		let (status, body) = get_json(router, "/api/v1/storage/price/stats").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		// Both segments are internally sorted, but their windows overlap.
+		assert_eq!(body["unsorted_segments"], 0, "body: {body}");
+		assert_eq!(body["overlapping_segments"], 2, "body: {body}");
 	}
 
 	#[tokio::test]
