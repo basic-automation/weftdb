@@ -127,6 +127,53 @@ pub fn split_index(existing_ts: &[i64], late_min: i64) -> usize {
 	existing_ts.partition_point(|&t| t < late_min)
 }
 
+/// Merge two timestamp-ordered row sequences into one, **newer-wins on a shared
+/// timestamp** (roadmap Phase 4.6 — the merge step of the split-not-rewrite path).
+///
+/// `older` and `newer` are each **non-decreasing by timestamp** (as sealed sorted
+/// segments are); `older` is the earlier-sealed data and `newer` the later batch that
+/// re-entered its window. The result is a single non-decreasing sequence in which, at
+/// any timestamp carried by **both** sides, every `newer` row supersedes every `older`
+/// row (upsert / last-writer-wins) — matching the answer
+/// [`SegmentStore::read_point`](../../database/index.html) gives across overlapping
+/// segments, where the most-recently-sealed segment wins. Rows at a timestamp unique
+/// to one side are kept as-is, including a within-side run of equal timestamps.
+///
+/// Runs in `O(len(older) + len(newer))` via a two-pointer merge. When the inputs do
+/// not overlap in time this is a plain concatenation in timestamp order.
+#[must_use]
+pub fn merge_newer_wins<V: Clone>(older: &[(i64, V)], newer: &[(i64, V)]) -> Vec<(i64, V)> {
+	let mut out: Vec<(i64, V)> = Vec::with_capacity(older.len() + newer.len());
+	let (mut i, mut j) = (0_usize, 0_usize);
+	while i < older.len() && j < newer.len() {
+		match older[i].0.cmp(&newer[j].0) {
+			std::cmp::Ordering::Less => {
+				out.push(older[i].clone());
+				i += 1;
+			},
+			std::cmp::Ordering::Greater => {
+				out.push(newer[j].clone());
+				j += 1;
+			},
+			std::cmp::Ordering::Equal => {
+				// Shared instant: newer supersedes older. Drop the whole older run at
+				// this timestamp and emit the whole newer run.
+				let t = older[i].0;
+				while i < older.len() && older[i].0 == t {
+					i += 1;
+				}
+				while j < newer.len() && newer[j].0 == t {
+					out.push(newer[j].clone());
+					j += 1;
+				}
+			},
+		}
+	}
+	out.extend_from_slice(&older[i..]);
+	out.extend_from_slice(&newer[j..]);
+	out
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -173,6 +220,38 @@ mod tests {
 		assert_eq!(policy.decide(10 * 1024 * 1024, 1, 1), SplitDecision::FullRewrite);
 		// A 60 MiB prefix clears the floor and dominates → split.
 		assert_eq!(policy.decide(60 * 1024 * 1024, 1024, 1024), SplitDecision::Split);
+	}
+
+	#[test]
+	fn merge_newer_wins_supersedes_shared_timestamps() {
+		// Disjoint tails concatenate in order.
+		let older = [(10_i64, "a"), (20, "b")];
+		let newer = [(30_i64, "c"), (40, "d")];
+		assert_eq!(merge_newer_wins(&older, &newer), vec![(10, "a"), (20, "b"), (30, "c"), (40, "d")]);
+		// Overlap at 20 and 30: newer wins those instants, older's 10 and newer's 40 survive.
+		let older = [(10_i64, "a"), (20, "old20"), (30, "old30")];
+		let newer = [(20_i64, "new20"), (30, "new30"), (40, "d")];
+		assert_eq!(merge_newer_wins(&older, &newer), vec![(10, "a"), (20, "new20"), (30, "new30"), (40, "d")]);
+	}
+
+	#[test]
+	fn merge_newer_wins_handles_equal_timestamp_runs() {
+		// Older has a run at 20; newer replaces the whole run with its own row at 20.
+		let older = [(20_i64, "o1"), (20, "o2"), (30, "o3")];
+		let newer = [(20_i64, "n1"), (40, "n2")];
+		assert_eq!(merge_newer_wins(&older, &newer), vec![(20, "n1"), (30, "o3"), (40, "n2")]);
+		// A run unique to one side is preserved intact.
+		let older = [(10_i64, "a")];
+		let newer = [(20_i64, "b1"), (20, "b2")];
+		assert_eq!(merge_newer_wins(&older, &newer), vec![(10, "a"), (20, "b1"), (20, "b2")]);
+	}
+
+	#[test]
+	fn merge_newer_wins_with_empty_sides() {
+		let rows = [(1_i64, "x"), (2, "y")];
+		assert_eq!(merge_newer_wins::<&str>(&[], &rows), rows.to_vec());
+		assert_eq!(merge_newer_wins::<&str>(&rows, &[]), rows.to_vec());
+		assert_eq!(merge_newer_wins::<&str>(&[], &[]), Vec::<(i64, &str)>::new());
 	}
 
 	#[test]

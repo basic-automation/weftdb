@@ -94,7 +94,7 @@ pub use nulls::{NullMask, NullMaskError};
 pub use page::{Page, PagedSegment, DEFAULT_ROWS_PER_PAGE, PAGED_SEGMENT_FORMAT_VERSION};
 pub use schema::{AspectSchema, SealError};
 pub use segment::{prune_by_time, prune_by_value, prune_present_by_time, Segment, SegmentError, SegmentStats, SEGMENT_FORMAT_VERSION};
-pub use split::{split_index, SplitDecision, SplitPolicy};
+pub use split::{merge_newer_wins, split_index, SplitDecision, SplitPolicy};
 use serde::{Deserialize, Serialize};
 pub use timestamp::{bitpack_bytes, bitpack_decode, bitpack_encode, bitpack_width, decode_delta, decode_delta_of_delta, encode_delta, encode_delta_of_delta, first_order_violation, rle_decode, rle_encode, rle_varint_bytes, uvarint_len, zigzag_varint_bytes, zigzag_varint_len, DeltaColumn, DeltaOfDeltaColumn, TimeUnit};
 
