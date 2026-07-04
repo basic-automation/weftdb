@@ -132,6 +132,34 @@ impl SegmentIndexStore {
 		}
 	}
 
+	/// Remove the descriptor for segment `id` under `aspect` from the index, returning
+	/// `true` when a row was deleted and `false` when none matched.
+	///
+	/// The control-plane half of dropping a segment (roadmap Phase 4.6 cross-segment
+	/// merge): the caller removes the `.dspseg` file; this removes its catalog row so a
+	/// pruned read never opens the now-absent file. Since ids are handed out as
+	/// `MAX(id) + 1` ([`next_id`](SegmentIndexStore::next_id)), deleting a segment can
+	/// free an id below the maximum without risking reuse of a still-live one.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL write failure.
+	pub async fn delete(&self, aspect: &str, id: u64) -> Result<bool> {
+		let conn = self.db.connect()?;
+		conn.execute("BEGIN CONCURRENT", turso::params![]).await?;
+		let res = conn.execute("DELETE FROM segment_index WHERE aspect = ? AND id = ?", turso::params![aspect.to_string(), i64::try_from(id).unwrap_or(i64::MAX)]).await;
+		match res {
+			Ok(changed) => {
+				conn.execute("COMMIT", turso::params![]).await?;
+				Ok(changed > 0)
+			},
+			Err(e) => {
+				conn.execute("ROLLBACK", turso::params![]).await.ok();
+				bail!("segment_index delete failed: {e}")
+			},
+		}
+	}
+
 	/// **Data skipping at the control plane** (roadmap Phase 4.4): the descriptors
 	/// for `aspect` whose segments may hold a row in the inclusive time range
 	/// `[start, end]` — the ones a query must open. The pruning runs as a SQL
@@ -376,6 +404,27 @@ mod tests {
 		drop(store);
 		assert_eq!(all.len(), 1, "same (aspect, id) replaces, not duplicates");
 		assert_eq!(all[0].path, "new.dspseg");
+	}
+
+	#[tokio::test]
+	async fn delete_removes_a_row_and_reports_whether_it_matched() {
+		let store = SegmentIndexStore::open_in_memory().await.expect("opens");
+		let (seg, len) = sealed(0);
+		store.insert("a", &SegmentDescriptor::of_segment(0, "s0.dspseg", len, &seg)).await.expect("inserts 0");
+		store.insert("a", &SegmentDescriptor::of_segment(1, "s1.dspseg", len, &seg)).await.expect("inserts 1");
+		// Deleting an existing id removes exactly that row and reports true.
+		assert!(store.delete("a", 0).await.expect("deletes"), "an existing id is deleted");
+		let remaining = store.all("a").await.expect("reads");
+		// Deleting an absent id is a false no-op.
+		let missed = store.delete("a", 7).await.expect("no-op delete");
+		// After deleting the max id, next_id still hands out a free id past the new max.
+		store.insert("a", &SegmentDescriptor::of_segment(1, "s1.dspseg", len, &seg)).await.expect("keeps 1");
+		let next = store.next_id("a").await.expect("next id");
+		drop(store);
+		assert_eq!(remaining.len(), 1);
+		assert_eq!(remaining[0].id, 1, "only segment 1 survives");
+		assert!(!missed, "deleting an absent id reports false");
+		assert_eq!(next, 2, "next_id is one past the surviving max");
 	}
 
 	#[tokio::test]

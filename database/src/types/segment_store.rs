@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use bigdecimal::BigDecimal;
-use dsp_physical_type::{AspectSchema, PagedSegment, Segment, SegmentDescriptor, PAGED_SEGMENT_FORMAT_VERSION};
+use dsp_physical_type::{merge_newer_wins, AspectSchema, PagedSegment, Segment, SegmentDescriptor, PAGED_SEGMENT_FORMAT_VERSION};
 
 use crate::{AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, SegmentIndexStore};
 
@@ -640,6 +640,103 @@ impl SegmentStore {
 			}
 		}
 		Ok(sweep)
+	}
+
+	/// **Cross-segment out-of-order merge** (roadmap Phase 4.6): collapse every group
+	/// of time-**overlapping** segments of `aspect` into a single time-sorted segment,
+	/// resolving late data that re-entered an already-covered window.
+	///
+	/// Where [`reconcile_segment`](SegmentStore::reconcile_segment) fixes *intra*-segment
+	/// disorder (the [`unsorted_segments`](AspectStorageStats::unsorted_segments) signal),
+	/// this fixes *cross*-segment overlap (the
+	/// [`overlapping_segments`](AspectStorageStats::overlapping_segments) signal): two
+	/// internally-sorted segments whose windows intersect. Each connected component of
+	/// overlapping segments (transitive time overlap) is merged into one segment at the
+	/// component's **lowest id** and the other members are dropped (index row + file),
+	/// so afterwards [`SegmentIndex::overlapping_count`](dsp_physical_type::SegmentIndex::overlapping_count)
+	/// is zero and a point/range read over the merged window opens a single segment.
+	///
+	/// **Merge semantics — newer wins (upsert).** Members are folded in ascending seal
+	/// id (oldest → newest) with [`merge_newer_wins`], so at any timestamp two members
+	/// share, the more-recently-sealed value supersedes the older one — the same
+	/// last-writer-wins answer [`read_point`](SegmentStore::read_point) already gives
+	/// across overlapping segments. This *dedups* cross-segment duplicate timestamps
+	/// (a range read no longer returns the superseded row), which is the intended
+	/// reconciliation/upsert behaviour. Rows at a timestamp carried by only one member
+	/// — including that member's own internal duplicates — are preserved.
+	///
+	/// The merged rows are re-sealed as a single-block segment under the aspect's
+	/// declared schema (a paged member is compacted to single-block; choosing a paged
+	/// output for a large merge is a follow-on). Non-overlapping segments are left
+	/// untouched. The materialized rollup is rebuilt from the durable index afterward.
+	///
+	/// Returns the number of segments **removed** by merging — the sum over components
+	/// of `(members − 1)`; zero when no two segments overlap (a no-op).
+	///
+	/// # Errors
+	///
+	/// Returns an error if `aspect` has no declared schema; propagates a filesystem
+	/// read/write error, a decode/re-seal failure, or a libSQL failure.
+	pub async fn reconcile_overlaps(&self, aspect: &str) -> Result<usize> {
+		let descriptors = self.index.all(aspect).await?;
+		// Components of transitively time-overlapping segments: sort spans by (min_ts,
+		// max_ts), sweep, and start a new component whenever a span begins after the
+		// running max end of the current one.
+		let mut spans: Vec<(u64, i64, i64)> = descriptors.iter().filter_map(|d| d.time_range().map(|(lo, hi)| (d.id, lo, hi))).collect();
+		spans.sort_by_key(|&(_, lo, hi)| (lo, hi));
+		let mut components: Vec<Vec<u64>> = Vec::new();
+		let mut running_max_hi = i64::MIN;
+		for (id, lo, hi) in spans {
+			match components.last_mut() {
+				Some(component) if lo <= running_max_hi => {
+					component.push(id);
+					running_max_hi = running_max_hi.max(hi);
+				},
+				_ => {
+					components.push(vec![id]);
+					running_max_hi = hi;
+				},
+			}
+		}
+		let schema = self.require_schema(aspect).await?;
+		let mut removed = 0;
+		for mut component in components {
+			if component.len() < 2 {
+				continue;
+			}
+			// Fold members oldest → newest so the most-recently-sealed value wins a tie.
+			component.sort_unstable();
+			let mut merged: Vec<(i64, Option<BigDecimal>)> = Vec::new();
+			for &id in &component {
+				let descriptor = descriptors.iter().find(|d| d.id == id).ok_or_else(|| anyhow::anyhow!("aspect {aspect:?} lost segment {id} mid-merge"))?;
+				let (ts, vs) = self.decode_all(descriptor).await?;
+				let mut rows: Vec<(i64, Option<BigDecimal>)> = ts.into_iter().zip(vs).collect();
+				// Each member may be internally out of order; sort before merging.
+				rows.sort_by_key(|(t, _)| *t);
+				merged = merge_newer_wins(&merged, &rows);
+			}
+			let (sorted_ts, sorted_vs): (Vec<i64>, Vec<Option<BigDecimal>>) = merged.into_iter().unzip();
+			// Seal the merged rows into the component's lowest id, in place.
+			let target = component[0];
+			let path = self.segment_path(aspect, target);
+			let segment = schema.seal_nullable(&sorted_ts, &sorted_vs).map_err(|e| anyhow::anyhow!("merge re-seal failed: {e}"))?;
+			let new_bytes = segment.write_to();
+			tokio::fs::write(&path, &new_bytes).await.with_context(|| format!("writing merged segment {}", path.display()))?;
+			let new_descriptor = SegmentDescriptor::of_segment(target, path.to_string_lossy().into_owned(), new_bytes.len() as u64, &segment);
+			self.index.insert(aspect, &new_descriptor).await?;
+			// Drop the other members: control-plane row then the file.
+			for &id in component.iter().skip(1) {
+				self.index.delete(aspect, id).await?;
+				let victim = self.segment_path(aspect, id);
+				tokio::fs::remove_file(&victim).await.with_context(|| format!("removing merged-away segment {}", victim.display()))?;
+				removed += 1;
+			}
+		}
+		if removed > 0 {
+			// A merge changed the segment set; recompute the rollup from the durable index.
+			self.rebuild_aspect_metadata(aspect).await?;
+		}
+		Ok(removed)
 	}
 
 	/// Read every present row of `aspect` whose **value** falls in the inclusive range
@@ -1398,6 +1495,89 @@ mod tests {
 		assert_eq!(sweep.segments_reconciled(), 2);
 		assert_eq!(a_after, 0, "a fully reconciled");
 		assert_eq!(b_after, 1, "b's lone hot tail is deferred below the threshold");
+	}
+
+	#[tokio::test]
+	async fn reconcile_overlaps_merges_a_pair_newer_wins() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		// Two internally-sorted segments whose windows overlap at 10 and 20.
+		store.seal("a", &schema(), &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("older");
+		store.seal("a", &schema(), &[10_i64, 20, 30], &[bd("4"), bd("5"), bd("6")]).await.expect("newer");
+		assert_eq!(store.aspect_stats("a").await.expect("stats").overlapping_segments, 2);
+		let removed = store.reconcile_overlaps("a").await.expect("merges");
+		let stats = store.aspect_stats("a").await.expect("stats");
+		// The two segments are now one; the overlap is gone and the merged rows are sorted.
+		let (ts, vs) = store.read_time_range("a", 0, 1000).await.expect("reads");
+		let hit10 = store.read_point("a", 10).await.expect("reads");
+		drop(store);
+		assert_eq!(removed, 1, "one segment was merged away");
+		assert_eq!(stats.segment_count, 1);
+		assert_eq!(stats.overlapping_segments, 0, "no cross-segment overlap remains");
+		assert_eq!(stats.unsorted_segments, 0);
+		// Newer wins at the shared instants 10 and 20; unique instants 0 and 30 survive.
+		assert_eq!(ts, vec![0, 10, 20, 30]);
+		assert_eq!(vs, vec![Some(bd("1")), Some(bd("4")), Some(bd("5")), Some(bd("6"))]);
+		assert_eq!(hit10, Some(bd("4")), "the newer value supersedes the older at 10");
+	}
+
+	#[tokio::test]
+	async fn reconcile_overlaps_merges_a_transitive_chain() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		// A [0,20], B [10,30], C [25,40] — A–B overlap, B–C overlap, so all one component.
+		store.seal("a", &schema(), &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("A");
+		store.seal("a", &schema(), &[10_i64, 20, 30], &[bd("4"), bd("5"), bd("6")]).await.expect("B");
+		store.seal("a", &schema(), &[25_i64, 30, 40], &[bd("7"), bd("8"), bd("9")]).await.expect("C");
+		let removed = store.reconcile_overlaps("a").await.expect("merges");
+		let stats = store.aspect_stats("a").await.expect("stats");
+		let (ts, _vs) = store.read_time_range("a", 0, 1000).await.expect("reads");
+		let hit30 = store.read_point("a", 30).await.expect("reads");
+		drop(store);
+		assert_eq!(removed, 2, "three segments collapse to one");
+		assert_eq!(stats.segment_count, 1);
+		assert_eq!(stats.overlapping_segments, 0);
+		// Distinct timestamps across the chain: 0,10,20,25,30,40 (10,20 from B win; 30 from C wins).
+		assert_eq!(ts, vec![0, 10, 20, 25, 30, 40]);
+		// C = [25→7, 30→8, 40→9], so C's value at 30 is 8; it supersedes B's 30→6.
+		assert_eq!(hit30, Some(bd("8")), "C (newest) wins at 30");
+	}
+
+	#[tokio::test]
+	async fn reconcile_overlaps_leaves_disjoint_segments_untouched() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		// Two disjoint windows plus one overlapping pair.
+		store.seal("a", &schema(), &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("disjoint");
+		store.seal("a", &schema(), &[100_i64, 110, 120], &[bd("4"), bd("5"), bd("6")]).await.expect("pair lo");
+		store.seal("a", &schema(), &[110_i64, 120, 130], &[bd("7"), bd("8"), bd("9")]).await.expect("pair hi");
+		assert_eq!(store.aspect_stats("a").await.expect("stats").overlapping_segments, 2, "only the [100,120]/[110,130] pair overlaps");
+		let removed = store.reconcile_overlaps("a").await.expect("merges");
+		let stats = store.aspect_stats("a").await.expect("stats");
+		// The disjoint segment survives; the overlapping pair merges to one → 2 segments.
+		let (ts0, _) = store.read_time_range("a", 0, 50).await.expect("reads disjoint");
+		drop(store);
+		assert_eq!(removed, 1, "only the overlapping pair merged");
+		assert_eq!(stats.segment_count, 2);
+		assert_eq!(stats.overlapping_segments, 0);
+		assert_eq!(ts0, vec![0, 10, 20], "the disjoint segment is unchanged");
+	}
+
+	#[tokio::test]
+	async fn reconcile_overlaps_is_a_noop_without_overlap() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		store.seal("a", &schema(), &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("s0");
+		store.seal("a", &schema(), &[100_i64, 110, 120], &[bd("4"), bd("5"), bd("6")]).await.expect("s1");
+		let removed = store.reconcile_overlaps("a").await.expect("no-op");
+		let count = store.segment_count("a").await.expect("count");
+		drop(store);
+		assert_eq!(removed, 0, "disjoint segments need no merge");
+		assert_eq!(count, 2);
 	}
 
 	#[tokio::test]
