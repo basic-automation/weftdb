@@ -559,6 +559,89 @@ impl SegmentStore {
 		Ok(sweep)
 	}
 
+	/// **Hot/cold threshold reconciliation** (roadmap Phase 4.6): reconcile an aspect's
+	/// out-of-order segments the way `QuestDB` squashes partitions — **cold** (sealed,
+	/// no-longer-appended) segments are rewritten on every pass, while the **hot tail**
+	/// (the most-recently sealed segment, still the append target) is deferred until the
+	/// aspect's out-of-order backlog reaches `threshold`.
+	///
+	/// The plain [`reconcile_aspect_if_unsorted_exceeds`](SegmentStore::reconcile_aspect_if_unsorted_exceeds)
+	/// gate is all-or-nothing: below the threshold it leaves *every* out-of-order
+	/// segment alone, so a cold segment that will never be appended again waits behind
+	/// the hot tail's split budget. That over-defers — a cold segment's rewrite is a
+	/// one-time cost that a later append cannot undo, so paying it eagerly is strictly
+	/// cheaper than carrying its linear-scan point-lookup cost. Only the hot tail is
+	/// worth deferring: rewriting the actively-growing segment on every tick would
+	/// rewrite the same bytes repeatedly. This method reconciles the cold segments
+	/// unconditionally and gates only the hot tail on the backlog, matching `QuestDB`'s
+	/// "squash non-active partitions each commit, defer the active partition until the
+	/// split threshold" policy. *(src: <https://questdb.com/docs/concepts/partitions/>)*
+	///
+	/// The **hot tail** is the segment with the largest id — ids are assigned
+	/// monotonically on seal, so the newest is the append target. An already-sorted hot
+	/// tail needs no rewrite regardless. The backlog is the aspect's out-of-order
+	/// segment count observed at entry (before any rewrite this pass), so the hot-tail
+	/// decision does not shift as cold segments drop out of the count.
+	///
+	/// `threshold` is clamped to 1 (as for the plain trigger). Returns a
+	/// [`HotColdReconcile`] splitting the rewrite count into cold vs hot.
+	///
+	/// # Errors
+	///
+	/// As [`reconcile_segment`](SegmentStore::reconcile_segment); also propagates the
+	/// index read behind the segment list.
+	pub async fn reconcile_aspect_hot_cold(&self, aspect: &str, threshold: usize) -> Result<HotColdReconcile> {
+		let threshold = threshold.max(1);
+		let descriptors = self.index.all(aspect).await?;
+		let hot_tail_id = descriptors.iter().map(|d| d.id).max();
+		let unsorted: Vec<u64> = descriptors.iter().filter(|d| !d.time_sorted).map(|d| d.id).collect();
+		let hot_fires = unsorted.len() >= threshold;
+		let mut out = HotColdReconcile::default();
+		for id in unsorted {
+			if Some(id) == hot_tail_id {
+				// The hot tail is deferred until the backlog reaches the threshold.
+				if hot_fires && self.reconcile_segment(aspect, id).await? {
+					out.hot_reconciled += 1;
+				}
+			} else if self.reconcile_segment(aspect, id).await? {
+				// A cold segment is always worth reconciling.
+				out.cold_reconciled += 1;
+			}
+		}
+		Ok(out)
+	}
+
+	/// **Store-wide hot/cold reconcile sweep** (roadmap Phase 4.6): apply
+	/// [`reconcile_aspect_hot_cold`](SegmentStore::reconcile_aspect_hot_cold) to **every**
+	/// declared aspect — eagerly reconciling each aspect's cold segments while deferring
+	/// its hot tail until that aspect's own backlog reaches `threshold`.
+	///
+	/// This is the hot/cold analogue of
+	/// [`reconcile_all_over_threshold`](SegmentStore::reconcile_all_over_threshold): the
+	/// tick a background daemon calls when it wants cold segments cleaned up on every
+	/// sweep without rewriting each aspect's actively-appended tail on every tick.
+	/// Aspects are visited in declared-name order; a `threshold` of 0 clamps to 1.
+	/// Returns a [`HotColdSweep`] — aspects scanned, aspects that rewrote at least one
+	/// segment, and the cold/hot rewrite split — the numbers a daemon logs and exports.
+	///
+	/// # Errors
+	///
+	/// As [`reconcile_aspect_hot_cold`](SegmentStore::reconcile_aspect_hot_cold); also
+	/// propagates the aspect-list read.
+	pub async fn reconcile_all_hot_cold(&self, threshold: usize) -> Result<HotColdSweep> {
+		let aspects = self.list_declared_aspects().await?;
+		let mut sweep = HotColdSweep { aspects_scanned: aspects.len(), ..HotColdSweep::default() };
+		for aspect in &aspects {
+			let outcome = self.reconcile_aspect_hot_cold(aspect, threshold).await?;
+			if outcome.total() > 0 {
+				sweep.aspects_reconciled += 1;
+				sweep.cold_reconciled += outcome.cold_reconciled;
+				sweep.hot_reconciled += outcome.hot_reconciled;
+			}
+		}
+		Ok(sweep)
+	}
+
 	/// Read every present row of `aspect` whose **value** falls in the inclusive range
 	/// `[lo, hi]`, **opening only the segment files whose value span overlaps it**.
 	///
@@ -732,6 +815,50 @@ pub struct ReconcileSweep {
 	pub aspects_reconciled: usize,
 	/// Total out-of-order segments rewritten sorted across every reconciled aspect.
 	pub segments_reconciled: usize,
+}
+
+/// The cold-vs-hot split of a hot/cold reconcile pass over one aspect, returned by
+/// [`SegmentStore::reconcile_aspect_hot_cold`]. A cold segment (any out-of-order
+/// segment that is not the aspect's most-recently-sealed one) is always reconciled;
+/// the hot tail is reconciled only when the aspect's backlog reached the threshold.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HotColdReconcile {
+	/// Cold (non-hot-tail) out-of-order segments rewritten sorted — always paid.
+	pub cold_reconciled: usize,
+	/// Hot-tail segments rewritten this pass (0 or 1 for a single aspect): non-zero
+	/// only when the backlog reached the threshold and the tail was out of order.
+	pub hot_reconciled: usize,
+}
+
+impl HotColdReconcile {
+	/// Total segments rewritten this pass — cold plus hot.
+	#[must_use]
+	pub const fn total(&self) -> usize {
+		self.cold_reconciled + self.hot_reconciled
+	}
+}
+
+/// The outcome of a store-wide hot/cold reconcile sweep, returned by
+/// [`SegmentStore::reconcile_all_hot_cold`] — the per-tick numbers a background
+/// reconcile daemon in hot/cold mode logs and exports.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HotColdSweep {
+	/// Number of declared aspects the sweep visited.
+	pub aspects_scanned: usize,
+	/// Number of aspects that rewrote at least one segment (cold or hot) this sweep.
+	pub aspects_reconciled: usize,
+	/// Total cold segments rewritten across every aspect.
+	pub cold_reconciled: usize,
+	/// Total hot-tail segments rewritten across every aspect.
+	pub hot_reconciled: usize,
+}
+
+impl HotColdSweep {
+	/// Total segments rewritten across the sweep — cold plus hot.
+	#[must_use]
+	pub const fn segments_reconciled(&self) -> usize {
+		self.cold_reconciled + self.hot_reconciled
+	}
 }
 
 /// A store-wide aggregate over every aspect's materialized rollup, surfaced by
@@ -1153,6 +1280,90 @@ mod tests {
 		assert_eq!(sweep2.aspects_reconciled, 1, "the second sweep fires on b");
 		assert_eq!(sweep2.segments_reconciled, 1);
 		assert_eq!(b_final, 0, "b is reconciled by the threshold-1 sweep");
+	}
+
+	#[tokio::test]
+	async fn hot_cold_reconciles_cold_segments_but_defers_the_hot_tail() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		// Two out-of-order segments: id 0 (cold) and id 1 (the hot tail).
+		store.seal("a", &schema(), &[100_i64, 130, 110], &[bd("1"), bd("3"), bd("2")]).await.expect("cold ooo");
+		store.seal("a", &schema(), &[200_i64, 240, 210], &[bd("4"), bd("6"), bd("5")]).await.expect("hot ooo");
+		assert_eq!(store.aspect_stats("a").await.expect("stats").unsorted_segments, 2);
+		// Threshold 3 is above the backlog of 2: the cold segment is reconciled anyway,
+		// the hot tail is deferred.
+		let outcome = store.reconcile_aspect_hot_cold("a", 3).await.expect("reconciles");
+		let after = store.aspect_stats("a").await.expect("stats").unsorted_segments;
+		// The cold segment now binary-searches; the hot tail still linear-scans but reads correctly.
+		let cold_hit = store.read_point("a", 110).await.expect("reads");
+		let hot_hit = store.read_point("a", 210).await.expect("reads");
+		drop(store);
+		assert_eq!(outcome.cold_reconciled, 1, "the cold segment is reconciled below threshold");
+		assert_eq!(outcome.hot_reconciled, 0, "the hot tail is deferred below threshold");
+		assert_eq!(outcome.total(), 1);
+		assert_eq!(after, 1, "only the hot tail remains out of order");
+		assert_eq!(cold_hit, Some(bd("2")));
+		assert_eq!(hot_hit, Some(bd("5")));
+	}
+
+	#[tokio::test]
+	async fn hot_cold_reconciles_the_hot_tail_once_the_backlog_reaches_threshold() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		store.seal("a", &schema(), &[100_i64, 130, 110], &[bd("1"), bd("3"), bd("2")]).await.expect("cold ooo");
+		store.seal("a", &schema(), &[200_i64, 240, 210], &[bd("4"), bd("6"), bd("5")]).await.expect("hot ooo");
+		// Threshold 2 == the backlog: the hot tail fires alongside the cold segment.
+		let outcome = store.reconcile_aspect_hot_cold("a", 2).await.expect("reconciles");
+		let after = store.aspect_stats("a").await.expect("stats").unsorted_segments;
+		drop(store);
+		assert_eq!(outcome.cold_reconciled, 1);
+		assert_eq!(outcome.hot_reconciled, 1, "the hot tail fires at the threshold");
+		assert_eq!(after, 0, "the whole aspect is now ordered");
+	}
+
+	#[tokio::test]
+	async fn hot_cold_leaves_a_sorted_hot_tail_alone() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		// Cold out-of-order segment, then a sorted hot tail.
+		store.seal("a", &schema(), &[100_i64, 130, 110], &[bd("1"), bd("3"), bd("2")]).await.expect("cold ooo");
+		store.seal("a", &schema(), &[200_i64, 210, 220], &[bd("4"), bd("5"), bd("6")]).await.expect("sorted tail");
+		// Even at threshold 1 (which would fire on the backlog of 1) the sorted tail is a no-op.
+		let outcome = store.reconcile_aspect_hot_cold("a", 1).await.expect("reconciles");
+		let after = store.aspect_stats("a").await.expect("stats").unsorted_segments;
+		drop(store);
+		assert_eq!(outcome.cold_reconciled, 1, "the cold segment is reconciled");
+		assert_eq!(outcome.hot_reconciled, 0, "a sorted hot tail needs no rewrite");
+		assert_eq!(after, 0);
+	}
+
+	#[tokio::test]
+	async fn hot_cold_sweep_defers_hot_tails_below_threshold_across_aspects() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares a");
+		store.declare("b", &schema()).await.expect("declares b");
+		// aspect a: cold + hot out-of-order (backlog 2). aspect b: a lone out-of-order
+		// segment — which is itself the hot tail (backlog 1).
+		store.seal("a", &schema(), &[100_i64, 130, 110], &[bd("1"), bd("3"), bd("2")]).await.expect("a cold");
+		store.seal("a", &schema(), &[200_i64, 240, 210], &[bd("4"), bd("6"), bd("5")]).await.expect("a hot");
+		store.seal("b", &schema(), &[100_i64, 130, 110], &[bd("7"), bd("9"), bd("8")]).await.expect("b hot only");
+		// Sweep at threshold 2: a's cold segment is reconciled, a's hot tail fires (backlog 2);
+		// b's only segment is its hot tail and stays deferred (backlog 1 < 2).
+		let sweep = store.reconcile_all_hot_cold(2).await.expect("sweeps");
+		let a_after = store.aspect_stats("a").await.expect("stats a").unsorted_segments;
+		let b_after = store.aspect_stats("b").await.expect("stats b").unsorted_segments;
+		drop(store);
+		assert_eq!(sweep.aspects_scanned, 2);
+		assert_eq!(sweep.aspects_reconciled, 1, "only a rewrote a segment");
+		assert_eq!(sweep.cold_reconciled, 1, "a's cold segment");
+		assert_eq!(sweep.hot_reconciled, 1, "a's hot tail at threshold 2");
+		assert_eq!(sweep.segments_reconciled(), 2);
+		assert_eq!(a_after, 0, "a fully reconciled");
+		assert_eq!(b_after, 1, "b's lone hot tail is deferred below the threshold");
 	}
 
 	#[tokio::test]
