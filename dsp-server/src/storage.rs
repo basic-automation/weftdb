@@ -682,6 +682,10 @@ pub struct StoreStatsResponse {
 	/// Total out-of-order segments across every aspect — the store-wide order-health
 	/// signal (0 when every sealed segment admits ordered access).
 	pub unsorted_segments: usize,
+	/// Total segments across every aspect whose time window overlaps another segment
+	/// in the same aspect — the store-wide *cross-segment* order-health signal (roadmap
+	/// Phase 4.6). Computed by an index scan per aspect (not the O(1) rollup).
+	pub overlapping_segments: usize,
 	/// Inclusive `[min, max]` timestamp span across the union of aspects, or `null`.
 	pub time_range: Option<[i64; 2]>,
 }
@@ -839,12 +843,16 @@ pub async fn storage_aspect_stats(State(state): State<AppState>, Path(aspect): P
 pub async fn storage_stats(State(state): State<AppState>) -> Result<Json<StoreStatsResponse>, StorageError> {
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	drop(state);
+	// The O(1) rollup carries every field except the cross-segment overlap total,
+	// which has no incremental fold — a separate index-scanning aggregate supplies it.
 	let result = store.store_stats().await;
+	let overlap_result = store.store_overlapping_segments().await;
 	drop(store);
 	let summary = result.map_err(|err| StorageError::Internal(err.to_string()))?;
+	let overlapping_segments = overlap_result.map_err(|err| StorageError::Internal(err.to_string()))?;
 	let bytes_per_point = summary.bytes_per_point();
 	let time_range = summary.time_range.map(Into::into);
-	Ok(Json(StoreStatsResponse { aspect_count: summary.aspect_count, segment_count: summary.segment_count, total_rows: summary.total_rows, total_nulls: summary.total_nulls, total_bytes: summary.total_bytes, bytes_per_point, unsorted_segments: summary.unsorted_segments, time_range }))
+	Ok(Json(StoreStatsResponse { aspect_count: summary.aspect_count, segment_count: summary.segment_count, total_rows: summary.total_rows, total_nulls: summary.total_nulls, total_bytes: summary.total_bytes, bytes_per_point, unsorted_segments: summary.unsorted_segments, overlapping_segments, time_range }))
 }
 
 #[cfg(test)]
@@ -1214,6 +1222,8 @@ mod tests {
 		assert!(body["bytes_per_point"].as_f64().unwrap() > 0.0);
 		// The store's sole segment is in order — store-wide order health is clean.
 		assert_eq!(body["unsorted_segments"], 0);
+		// A single segment overlaps nothing.
+		assert_eq!(body["overlapping_segments"], 0);
 	}
 
 	#[tokio::test]
