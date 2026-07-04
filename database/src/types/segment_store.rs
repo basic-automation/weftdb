@@ -739,6 +739,33 @@ impl SegmentStore {
 		Ok(removed)
 	}
 
+	/// **Store-wide cross-segment overlap merge** (roadmap Phase 4.6): apply
+	/// [`reconcile_overlaps`](SegmentStore::reconcile_overlaps) to **every** declared
+	/// aspect, merging each aspect's time-overlap groups.
+	///
+	/// The store-wide counterpart to the per-aspect merge — the tick a background
+	/// daemon calls to keep cross-segment overlap from accumulating store-wide. Aspects
+	/// are visited in declared-name order. Returns an [`OverlapSweep`] — how many
+	/// aspects were scanned, how many actually merged anything, and the total segments
+	/// removed — the numbers a daemon logs and exports.
+	///
+	/// # Errors
+	///
+	/// As [`reconcile_overlaps`](SegmentStore::reconcile_overlaps); also propagates the
+	/// aspect-list read.
+	pub async fn reconcile_all_overlaps(&self) -> Result<OverlapSweep> {
+		let aspects = self.list_declared_aspects().await?;
+		let mut sweep = OverlapSweep { aspects_scanned: aspects.len(), ..OverlapSweep::default() };
+		for aspect in &aspects {
+			let removed = self.reconcile_overlaps(aspect).await?;
+			if removed > 0 {
+				sweep.aspects_reconciled += 1;
+				sweep.segments_removed += removed;
+			}
+		}
+		Ok(sweep)
+	}
+
 	/// Read every present row of `aspect` whose **value** falls in the inclusive range
 	/// `[lo, hi]`, **opening only the segment files whose value span overlaps it**.
 	///
@@ -982,6 +1009,20 @@ impl HotColdSweep {
 	pub const fn segments_reconciled(&self) -> usize {
 		self.cold_reconciled + self.hot_reconciled
 	}
+}
+
+/// The outcome of a store-wide cross-segment overlap merge sweep, returned by
+/// [`SegmentStore::reconcile_all_overlaps`] — the per-tick numbers a background
+/// reconcile daemon in overlaps mode logs and exports.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OverlapSweep {
+	/// Number of declared aspects the sweep visited.
+	pub aspects_scanned: usize,
+	/// Number of aspects that merged at least one overlap group this sweep.
+	pub aspects_reconciled: usize,
+	/// Total segments removed by merging across every aspect (sum of per-component
+	/// `members − 1`).
+	pub segments_removed: usize,
 }
 
 /// A store-wide aggregate over every aspect's materialized rollup, surfaced by
@@ -1564,6 +1605,28 @@ mod tests {
 		assert_eq!(stats.segment_count, 2);
 		assert_eq!(stats.overlapping_segments, 0);
 		assert_eq!(ts0, vec![0, 10, 20], "the disjoint segment is unchanged");
+	}
+
+	#[tokio::test]
+	async fn reconcile_all_overlaps_sweeps_every_aspect() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares a");
+		store.declare("b", &schema()).await.expect("declares b");
+		// a: an overlapping pair. b: disjoint segments.
+		store.seal("a", &schema(), &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("a older");
+		store.seal("a", &schema(), &[10_i64, 20, 30], &[bd("4"), bd("5"), bd("6")]).await.expect("a newer");
+		store.seal("b", &schema(), &[0_i64, 10, 20], &[bd("7"), bd("8"), bd("9")]).await.expect("b lo");
+		store.seal("b", &schema(), &[100_i64, 110, 120], &[bd("1"), bd("2"), bd("3")]).await.expect("b hi");
+		let sweep = store.reconcile_all_overlaps().await.expect("sweeps");
+		let a_after = store.aspect_stats("a").await.expect("stats a").overlapping_segments;
+		let b_after = store.aspect_stats("b").await.expect("stats b").overlapping_segments;
+		drop(store);
+		assert_eq!(sweep.aspects_scanned, 2);
+		assert_eq!(sweep.aspects_reconciled, 1, "only a had an overlap to merge");
+		assert_eq!(sweep.segments_removed, 1);
+		assert_eq!(a_after, 0);
+		assert_eq!(b_after, 0, "b never overlapped");
 	}
 
 	#[tokio::test]
