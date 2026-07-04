@@ -32,6 +32,12 @@ const RECONCILE_INTERVAL_ENV: &str = "DSP_RECONCILE_INTERVAL_SECS";
 /// (defaults to 1 — reconcile any aspect with at least one out-of-order segment).
 const RECONCILE_THRESHOLD_ENV: &str = "DSP_RECONCILE_THRESHOLD";
 
+/// Environment variable selecting **hot/cold** sweep mode: when truthy
+/// (`1`/`true`/`yes`/`on`, case-insensitive), the daemon reconciles every aspect's
+/// cold segments on each tick and defers only the hot tail until the backlog reaches
+/// the threshold. Unset or falsey keeps the all-or-nothing threshold sweep.
+const RECONCILE_HOT_COLD_ENV: &str = "DSP_RECONCILE_HOT_COLD";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
 	let addr: SocketAddr = std::env::var("DSP_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string()).parse()?;
@@ -71,10 +77,12 @@ fn spawn_reconcile_daemon_if_configured(state: &AppState) -> anyhow::Result<()> 
 		Ok(raw) => raw.parse().map_err(|e| anyhow::anyhow!("{RECONCILE_THRESHOLD_ENV}={raw:?} is not a non-negative integer: {e}"))?,
 		Err(_) => 1,
 	};
-	let config = ReconcileDaemonConfig { interval: Duration::from_secs(interval_secs), threshold };
+	let hot_cold = std::env::var(RECONCILE_HOT_COLD_ENV).map(|raw| matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")).unwrap_or(false);
+	let config = ReconcileDaemonConfig { interval: Duration::from_secs(interval_secs), threshold, hot_cold };
 	// The daemon runs detached for the process lifetime; its handle is dropped on purpose.
 	drop(spawn_reconcile_daemon(Arc::clone(store), state.metrics().clone(), config));
-	println!("reconcile daemon: enabled (every {interval_secs}s, threshold {threshold} out-of-order segment(s))");
+	let mode = if hot_cold { "hot/cold" } else { "threshold" };
+	println!("reconcile daemon: enabled ({mode} mode, every {interval_secs}s, threshold {threshold} out-of-order segment(s))");
 	Ok(())
 }
 
