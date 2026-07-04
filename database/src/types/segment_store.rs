@@ -801,6 +801,32 @@ impl SegmentStore {
 		}
 		Ok(stats)
 	}
+
+	/// **Store-wide cross-segment overlap count** (roadmap Phase 4.6): the total
+	/// number of segments across every aspect whose time window overlaps another
+	/// segment *in the same aspect* — the store-wide form of
+	/// [`AspectStorageStats::overlapping_segments`](AspectStorageStats::overlapping_segments).
+	///
+	/// Unlike [`store_stats`](SegmentStore::store_stats) — which reads O(1)
+	/// per-aspect rollups — a cross-segment property has no incremental fold, so this
+	/// **scans each aspect's segment index** ([`SegmentIndex::overlapping_count`](dsp_physical_type::SegmentIndex::overlapping_count))
+	/// and sums the results. It is a deliberately separate call so `store_stats` keeps
+	/// its no-scan guarantee; a caller pays the scan only when it wants this signal.
+	/// Overlaps are always within an aspect (segments of different aspects never share
+	/// a measurement stream), so the store-wide total is the plain sum of per-aspect
+	/// counts.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure (the aspect list or a per-aspect index load).
+	pub async fn store_overlapping_segments(&self) -> Result<usize> {
+		let aspects = self.metadata.list_aspects().await?;
+		let mut total = 0;
+		for aspect in &aspects {
+			total += self.index.load_index(aspect).await?.overlapping_count();
+		}
+		Ok(total)
+	}
 }
 
 /// The outcome of a store-wide threshold reconcile sweep, returned by
@@ -1630,6 +1656,24 @@ mod tests {
 		assert_eq!(stats.aspect_count, 2);
 		assert_eq!(stats.segment_count, 3);
 		assert_eq!(stats.unsorted_segments, 2);
+	}
+
+	#[tokio::test]
+	async fn store_overlapping_segments_sums_across_aspects() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		// "a": two internally-sorted but time-overlapping segments ([0,20], [10,30]) → 2.
+		store.seal("a", &schema(), &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("a first");
+		store.seal("a", &schema(), &[10_i64, 20, 30], &[bd("4"), bd("5"), bd("6")]).await.expect("a overlap");
+		// "b": two disjoint windows ([0,20], [100,120]) → 0.
+		store.seal("b", &schema(), &[0_i64, 10, 20], &[bd("7"), bd("8"), bd("9")]).await.expect("b first");
+		store.seal("b", &schema(), &[100_i64, 110, 120], &[bd("1"), bd("2"), bd("3")]).await.expect("b disjoint");
+		let total = store.store_overlapping_segments().await.expect("overlap total");
+		// store_stats stays O(1) and is unaffected.
+		let stats = store.store_stats().await.expect("store stats");
+		drop(store);
+		assert_eq!(total, 2, "only aspect a's two segments overlap; b's are disjoint");
+		assert_eq!(stats.unsorted_segments, 0, "every segment is internally sorted");
 	}
 
 	#[tokio::test]
