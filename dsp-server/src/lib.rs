@@ -43,7 +43,7 @@ pub use downsample::{downsample, downsample_arrow, downsample_csv, downsample_il
 pub use interpolate::{interpolate, interpolate_arrow, interpolate_csv, interpolate_ilp, interpolate_ilp_arrow, interpolate_ilp_csv, interpolate_ilp_parquet, interpolate_parquet, interpolate_point, InterpolateRequest, InterpolateResponse, PointKind, PointRequest, PointResponse};
 pub use manage::{declare_aspect, ingest_csv, ingest_ilp, ingest_points, reconcile_aspect, reconcile_store, CsvIngestParams, DeclareAspectRequest, DeclareAspectResponse, IlpIngestParams, IngestPoint, IngestRequest, IngestResponse, ReconcileResponse, ReconcileStoreResponse};
 pub use metrics::{DownsampleProfile, IngestProfile, InterpolateProfile, LatencyHistogram, LatencyHistogramSnapshot, LatencyProfile, Metrics, MetricsSnapshot, ProfileReport, SharedMetrics};
-pub use reconcile_daemon::{reconcile_tick, reconcile_tick_hot_cold, spawn_reconcile_daemon, ReconcileDaemonConfig};
+pub use reconcile_daemon::{reconcile_tick, reconcile_tick_hot_cold, reconcile_tick_overlaps, spawn_reconcile_daemon, ReconcileDaemonConfig};
 use serde::Serialize;
 pub use state::AppState;
 pub use storage::{storage_aspect_schema, storage_aspect_stats, storage_aspects, storage_catalog, storage_ingest_parquet, storage_point, storage_stats, storage_time_range, storage_time_range_csv, storage_time_range_json, storage_time_range_parquet, storage_value_range, storage_value_range_csv, storage_value_range_json, storage_value_range_parquet, AspectInfo, AspectListResponse, AspectSchemaResponse, AspectStatsResponse, CatalogDatabase, CatalogResponse, ParquetIngestParams, PointParams, StorageError, StoredPoint, StoredPointResponse, StoredRangeResponse, StoreStatsResponse, TimeRangeParams, ValuePointsParams, ValueRangeParams};

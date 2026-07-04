@@ -38,6 +38,12 @@ const RECONCILE_THRESHOLD_ENV: &str = "DSP_RECONCILE_THRESHOLD";
 /// the threshold. Unset or falsey keeps the all-or-nothing threshold sweep.
 const RECONCILE_HOT_COLD_ENV: &str = "DSP_RECONCILE_HOT_COLD";
 
+/// Environment variable enabling the background **cross-segment overlap merge**: when
+/// truthy (`1`/`true`/`yes`/`on`), each daemon tick also merges time-overlapping
+/// segment groups (late data that re-entered an already-covered window). Independent
+/// of the intra-segment mode.
+const RECONCILE_OVERLAPS_ENV: &str = "DSP_RECONCILE_OVERLAPS";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
 	let addr: SocketAddr = std::env::var("DSP_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string()).parse()?;
@@ -77,12 +83,15 @@ fn spawn_reconcile_daemon_if_configured(state: &AppState) -> anyhow::Result<()> 
 		Ok(raw) => raw.parse().map_err(|e| anyhow::anyhow!("{RECONCILE_THRESHOLD_ENV}={raw:?} is not a non-negative integer: {e}"))?,
 		Err(_) => 1,
 	};
-	let hot_cold = std::env::var(RECONCILE_HOT_COLD_ENV).map(|raw| matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")).unwrap_or(false);
-	let config = ReconcileDaemonConfig { interval: Duration::from_secs(interval_secs), threshold, hot_cold };
+	let truthy = |var: &str| std::env::var(var).map(|raw| matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")).unwrap_or(false);
+	let hot_cold = truthy(RECONCILE_HOT_COLD_ENV);
+	let overlaps = truthy(RECONCILE_OVERLAPS_ENV);
+	let config = ReconcileDaemonConfig { interval: Duration::from_secs(interval_secs), threshold, hot_cold, overlaps };
 	// The daemon runs detached for the process lifetime; its handle is dropped on purpose.
 	drop(spawn_reconcile_daemon(Arc::clone(store), state.metrics().clone(), config));
 	let mode = if hot_cold { "hot/cold" } else { "threshold" };
-	println!("reconcile daemon: enabled ({mode} mode, every {interval_secs}s, threshold {threshold} out-of-order segment(s))");
+	let overlap_note = if overlaps { " + overlap merge" } else { "" };
+	println!("reconcile daemon: enabled ({mode} mode{overlap_note}, every {interval_secs}s, threshold {threshold} out-of-order segment(s))");
 	Ok(())
 }
 

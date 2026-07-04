@@ -20,7 +20,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use database::{HotColdSweep, ReconcileSweep, SegmentStore};
+use database::{HotColdSweep, OverlapSweep, ReconcileSweep, SegmentStore};
 
 use crate::metrics::SharedMetrics;
 
@@ -40,6 +40,11 @@ pub struct ReconcileDaemonConfig {
 	/// When `false`, use the all-or-nothing threshold sweep (the original
 	/// [`reconcile_tick`] behaviour).
 	pub hot_cold: bool,
+	/// When `true`, each tick **also** runs a store-wide cross-segment overlap merge
+	/// ([`reconcile_tick_overlaps`] / [`SegmentStore::reconcile_all_overlaps`](database::SegmentStore::reconcile_all_overlaps))
+	/// after the intra-segment sweep, so late data that re-entered an already-covered
+	/// window is merged in the background too. Independent of `hot_cold`/`threshold`.
+	pub overlaps: bool,
 }
 
 /// Run one reconcile tick.
@@ -89,6 +94,28 @@ pub async fn reconcile_tick_hot_cold(store: &SegmentStore, metrics: &SharedMetri
 	Ok(sweep)
 }
 
+/// Run one **cross-segment overlap** merge tick.
+///
+/// Sweeps every aspect through
+/// [`SegmentStore::reconcile_all_overlaps`](database::SegmentStore::reconcile_all_overlaps),
+/// merging each aspect's time-overlap groups into single segments. Records the
+/// reconciled aspects and total segments removed in `metrics` (a merge is a pass,
+/// exactly like an intra-segment reconcile), and returns the [`OverlapSweep`]. A sweep
+/// that merged nothing records nothing.
+///
+/// # Errors
+///
+/// Propagates a failure from
+/// [`SegmentStore::reconcile_all_overlaps`](database::SegmentStore::reconcile_all_overlaps)
+/// (a control-plane read, a segment read/write, or a re-seal failure).
+pub async fn reconcile_tick_overlaps(store: &SegmentStore, metrics: &SharedMetrics) -> anyhow::Result<OverlapSweep> {
+	let sweep = store.reconcile_all_overlaps().await?;
+	if sweep.aspects_reconciled > 0 {
+		metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_removed).unwrap_or(u64::MAX));
+	}
+	Ok(sweep)
+}
+
 /// Spawn the background reconcile daemon on `config.interval`.
 ///
 /// Returns the task handle; dropping it leaves the daemon running detached for the
@@ -121,6 +148,16 @@ pub fn spawn_reconcile_daemon(store: Arc<SegmentStore>, metrics: SharedMetrics, 
 					},
 					Ok(_) => {},
 					Err(err) => eprintln!("reconcile daemon: sweep failed: {err}"),
+				}
+			}
+			// Optionally also merge cross-segment overlaps this tick (an independent axis).
+			if config.overlaps {
+				match reconcile_tick_overlaps(&store, &metrics).await {
+					Ok(sweep) if sweep.aspects_reconciled > 0 => {
+						println!("reconcile daemon (overlaps): scanned {} aspect(s), merged {} aspect(s) / removed {} segment(s)", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_removed);
+					},
+					Ok(_) => {},
+					Err(err) => eprintln!("reconcile daemon: overlap sweep failed: {err}"),
 				}
 			}
 		}
@@ -207,5 +244,31 @@ mod tests {
 		drop(store);
 		assert_eq!(quiet.aspects_reconciled, 0);
 		assert_eq!(snap2.reconcile.passes, 1, "the deferred hot tail did not bump the pass counter");
+	}
+
+	#[tokio::test]
+	async fn overlaps_tick_merges_overlapping_segments_and_records_metrics() {
+		let dir = TempDir::new().unwrap();
+		let store = SegmentStore::open(dir.path()).await.unwrap();
+		store.declare("a", &schema()).await.unwrap();
+		// aspect a: two internally-sorted but time-overlapping segments.
+		store.seal("a", &schema(), &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.unwrap();
+		store.seal("a", &schema(), &[10_i64, 20, 30], &[bd("4"), bd("5"), bd("6")]).await.unwrap();
+		let metrics: SharedMetrics = Arc::new(Metrics::default());
+
+		let sweep = reconcile_tick_overlaps(&store, &metrics).await.unwrap();
+		let snap = metrics.snapshot();
+		assert_eq!(sweep.aspects_reconciled, 1);
+		assert_eq!(sweep.segments_removed, 1, "the overlapping pair merged to one");
+		assert_eq!(snap.reconcile.passes, 1, "one aspect merged = one pass");
+		assert_eq!(snap.reconcile.segments_reconciled, 1);
+		assert_eq!(store.aspect_stats("a").await.unwrap().overlapping_segments, 0);
+
+		// A second tick has nothing to merge and records nothing.
+		let quiet = reconcile_tick_overlaps(&store, &metrics).await.unwrap();
+		let snap2 = metrics.snapshot();
+		drop(store);
+		assert_eq!(quiet.aspects_reconciled, 0);
+		assert_eq!(snap2.reconcile.passes, 1, "the quiet overlap tick did not bump the pass counter");
 	}
 }
