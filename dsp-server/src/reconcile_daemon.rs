@@ -45,6 +45,12 @@ pub struct ReconcileDaemonConfig {
 	/// after the intra-segment sweep, so late data that re-entered an already-covered
 	/// window is merged in the background too. Independent of `hot_cold`/`threshold`.
 	pub overlaps: bool,
+	/// Optional split-not-rewrite floor in **bytes** for the overlap merge (roadmap
+	/// Phase 4.6). When `Some` and `overlaps` is set, each overlap tick runs under a
+	/// [`SplitPolicy`](dsp_physical_type::SplitPolicy) with this floor, so an aspect's
+	/// dominant cold prefix is split off rather than fully rewritten. When `None`, the
+	/// merge uses the default 50 MiB floor (small components always full-rewrite).
+	pub split_min_bytes: Option<u64>,
 }
 
 /// Run one reconcile tick.
@@ -116,6 +122,28 @@ pub async fn reconcile_tick_overlaps(store: &SegmentStore, metrics: &SharedMetri
 	Ok(sweep)
 }
 
+/// Run one **cross-segment overlap** merge tick under an explicit split floor
+/// (roadmap Phase 4.6 — the split-not-rewrite path).
+///
+/// As [`reconcile_tick_overlaps`],
+/// but each aspect's merge runs through
+/// [`SegmentStore::reconcile_all_overlaps_with_policy`](database::SegmentStore::reconcile_all_overlaps_with_policy)
+/// under `SplitPolicy::new(min_split_bytes)`, so a dominant cold prefix is split off
+/// rather than fully rewritten. Records and returns exactly as
+/// [`reconcile_tick_overlaps`].
+///
+/// # Errors
+///
+/// Propagates a failure from
+/// [`SegmentStore::reconcile_all_overlaps_with_policy`](database::SegmentStore::reconcile_all_overlaps_with_policy).
+pub async fn reconcile_tick_overlaps_with_policy(store: &SegmentStore, metrics: &SharedMetrics, min_split_bytes: u64) -> anyhow::Result<OverlapSweep> {
+	let sweep = store.reconcile_all_overlaps_with_policy(dsp_physical_type::SplitPolicy::new(min_split_bytes)).await?;
+	if sweep.aspects_reconciled > 0 {
+		metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_removed).unwrap_or(u64::MAX));
+	}
+	Ok(sweep)
+}
+
 /// Spawn the background reconcile daemon on `config.interval`.
 ///
 /// Returns the task handle; dropping it leaves the daemon running detached for the
@@ -151,8 +179,14 @@ pub fn spawn_reconcile_daemon(store: Arc<SegmentStore>, metrics: SharedMetrics, 
 				}
 			}
 			// Optionally also merge cross-segment overlaps this tick (an independent axis).
+			// With a split floor configured, split dominant cold prefixes rather than
+			// fully rewriting each component.
 			if config.overlaps {
-				match reconcile_tick_overlaps(&store, &metrics).await {
+				let tick = match config.split_min_bytes {
+					Some(min) => reconcile_tick_overlaps_with_policy(&store, &metrics, min).await,
+					None => reconcile_tick_overlaps(&store, &metrics).await,
+				};
+				match tick {
 					Ok(sweep) if sweep.aspects_reconciled > 0 => {
 						println!("reconcile daemon (overlaps): scanned {} aspect(s), merged {} aspect(s) / removed {} segment(s)", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_removed);
 					},
@@ -270,5 +304,29 @@ mod tests {
 		drop(store);
 		assert_eq!(quiet.aspects_reconciled, 0);
 		assert_eq!(snap2.reconcile.passes, 1, "the quiet overlap tick did not bump the pass counter");
+	}
+
+	#[tokio::test]
+	async fn overlaps_tick_with_policy_splits_a_dominant_cold_prefix() {
+		let dir = TempDir::new().unwrap();
+		let store = SegmentStore::open(dir.path()).await.unwrap();
+		store.declare("a", &schema()).await.unwrap();
+		// A long cold base [0..100] + a small late tail re-entering only its end.
+		let base_ts: Vec<i64> = (0..=10).map(|i| i * 10).collect();
+		let base_vs: Vec<BigDecimal> = (0..=10).map(BigDecimal::from).collect();
+		store.seal("a", &schema(), &base_ts, &base_vs).await.unwrap();
+		store.seal("a", &schema(), &[90_i64, 100, 110], &[bd("900"), bd("1000"), bd("1100")]).await.unwrap();
+		let metrics: SharedMetrics = Arc::new(Metrics::default());
+
+		// A tiny floor splits the cold prefix off (2 segments) instead of one full rewrite.
+		let sweep = reconcile_tick_overlaps_with_policy(&store, &metrics, 1).await.unwrap();
+		let snap = metrics.snapshot();
+		let stats = store.aspect_stats("a").await.unwrap();
+		drop(store);
+		assert_eq!(sweep.aspects_reconciled, 1, "the overlapping aspect was reconciled");
+		assert_eq!(sweep.segments_removed, 0, "a two-member split removes no segment net");
+		assert_eq!(snap.reconcile.passes, 1, "a split is still a pass");
+		assert_eq!(stats.segment_count, 2, "cold prefix split off from the hot suffix");
+		assert_eq!(stats.overlapping_segments, 0);
 	}
 }
