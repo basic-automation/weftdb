@@ -32,8 +32,21 @@ const RECONCILE_INTERVAL_ENV: &str = "DSP_RECONCILE_INTERVAL_SECS";
 /// (defaults to 1 — reconcile any aspect with at least one out-of-order segment).
 const RECONCILE_THRESHOLD_ENV: &str = "DSP_RECONCILE_THRESHOLD";
 
+/// Environment variable selecting **hot/cold** sweep mode: when truthy
+/// (`1`/`true`/`yes`/`on`, case-insensitive), the daemon reconciles every aspect's
+/// cold segments on each tick and defers only the hot tail until the backlog reaches
+/// the threshold. Unset or falsey keeps the all-or-nothing threshold sweep.
+const RECONCILE_HOT_COLD_ENV: &str = "DSP_RECONCILE_HOT_COLD";
+
+/// Environment variable enabling the background **cross-segment overlap merge**: when
+/// truthy (`1`/`true`/`yes`/`on`), each daemon tick also merges time-overlapping
+/// segment groups (late data that re-entered an already-covered window). Independent
+/// of the intra-segment mode.
+const RECONCILE_OVERLAPS_ENV: &str = "DSP_RECONCILE_OVERLAPS";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+	init_tracing();
 	let addr: SocketAddr = std::env::var("DSP_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string()).parse()?;
 
 	let state = build_state().await?;
@@ -45,6 +58,17 @@ async fn main() -> anyhow::Result<()> {
 
 	axum::serve(listener, app_with_state(state)).await?;
 	Ok(())
+}
+
+/// Install the process-wide tracing subscriber (roadmap Phase 3): a `fmt` layer
+/// filtered by `RUST_LOG` (defaulting to `info`) that logs **span close** events, so
+/// each compute-path span (`interpolate.engine`, `downsample.reduce`) prints its
+/// recorded fields and its busy/idle duration on completion — the "where did the time
+/// go" signal Phase 3 targets. `try_init` is a no-op when a subscriber is already
+/// installed, so this never panics.
+fn init_tracing() {
+	let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+	let _ = tracing_subscriber::fmt().with_env_filter(filter).with_target(false).with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE).try_init();
 }
 
 /// Start the background reconcile daemon (roadmap Phase 4.6) when a store is
@@ -71,10 +95,15 @@ fn spawn_reconcile_daemon_if_configured(state: &AppState) -> anyhow::Result<()> 
 		Ok(raw) => raw.parse().map_err(|e| anyhow::anyhow!("{RECONCILE_THRESHOLD_ENV}={raw:?} is not a non-negative integer: {e}"))?,
 		Err(_) => 1,
 	};
-	let config = ReconcileDaemonConfig { interval: Duration::from_secs(interval_secs), threshold };
+	let truthy = |var: &str| std::env::var(var).map(|raw| matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")).unwrap_or(false);
+	let hot_cold = truthy(RECONCILE_HOT_COLD_ENV);
+	let overlaps = truthy(RECONCILE_OVERLAPS_ENV);
+	let config = ReconcileDaemonConfig { interval: Duration::from_secs(interval_secs), threshold, hot_cold, overlaps };
 	// The daemon runs detached for the process lifetime; its handle is dropped on purpose.
 	drop(spawn_reconcile_daemon(Arc::clone(store), state.metrics().clone(), config));
-	println!("reconcile daemon: enabled (every {interval_secs}s, threshold {threshold} out-of-order segment(s))");
+	let mode = if hot_cold { "hot/cold" } else { "threshold" };
+	let overlap_note = if overlaps { " + overlap merge" } else { "" };
+	println!("reconcile daemon: enabled ({mode} mode{overlap_note}, every {interval_secs}s, threshold {threshold} out-of-order segment(s))");
 	Ok(())
 }
 

@@ -352,11 +352,10 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   the index to the segments spanning the instant and resolves each with its
   persisted `time_sorted` flag: a sorted segment is **binary-searched**, an
   out-of-order one linear-scanned (the only sound search on unsorted timestamps).
-- **Out-of-order reconciliation** — `SegmentStore::reconcile_segment`/`reconcile_aspect`
+- **Intra-segment reconciliation** — `SegmentStore::reconcile_segment`/`reconcile_aspect`
   rewrite an out-of-order segment into a sorted one in place (stable sort by
   timestamp, re-sealed at the same id, frame kind preserved), so it drops out of the
-  `unsorted_segments` count and its point lookups binary-search. (First slice — a
-  per-segment sort; the cross-segment staging-window merge is on the roadmap.)
+  `unsorted_segments` count and its point lookups binary-search.
 - **Threshold-triggered reconciliation** — the `unsorted_segments` backlog drives a
   QuestDB-style trigger so the rewrite is paid only once out-of-order data is worth
   compacting, never on every late row: `reconcile_aspect_if_unsorted_exceeds` gates a
@@ -365,6 +364,26 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   (`DSP_RECONCILE_INTERVAL_SECS` / `DSP_RECONCILE_THRESHOLD`) runs the sweep
   unattended. A threshold of 0 clamps to 1 (any out-of-order segment). Passes and the
   segments they rewrite are counted in `dsp_reconcile_*` metrics.
+- **Hot/cold reconciliation** — `reconcile_aspect_hot_cold`/`reconcile_all_hot_cold`
+  reconcile every *cold* (sealed) out-of-order segment on each pass but defer the
+  *hot tail* (the most-recently-sealed segment) until the backlog reaches the
+  threshold, so the actively-appended segment is not rewritten on every tick —
+  QuestDB's "squash non-active partitions each commit, defer the active one" policy.
+  Enabled on the daemon with `DSP_RECONCILE_HOT_COLD` and on the reconcile endpoints
+  with `?hot_cold=true`.
+- **Cross-segment overlap signal** — a *sorted* segment whose time window a
+  later-sealed segment re-enters (late data landing in an already-covered window) is
+  not counted by `unsorted_segments`; `SegmentIndex::overlapping_count` reports these
+  time-**overlapping** segments as a distinct `overlapping_segments` order-health
+  count in the per-aspect and store-wide rollups.
+- **Cross-segment overlap merge** — `SegmentStore::reconcile_overlaps`/`reconcile_all_overlaps`
+  collapse each connected group of time-overlapping segments into one time-sorted
+  segment, folding members oldest→newest with **newer-wins** (last-writer-wins /
+  upsert) dedup on shared timestamps — the same answer a point lookup already gives
+  across overlaps, and QuestDB's `DEDUP UPSERT` "last write wins on the designated
+  timestamp" semantics. Drives `overlapping_segments` to zero; exposed on the reconcile
+  endpoints with `?overlaps=true` and as a background daemon sweep
+  (`DSP_RECONCILE_OVERLAPS`).
 - **Null/quality column** — a per-row presence bitmap (zero bytes for fully dense
   columns) makes gaps real: present values are stored densely and reconstructed
   as `None` on read.
@@ -482,9 +501,9 @@ under the declared encoding/tolerance is rejected `400`.
 | `GET …/range.csv` · `…/value-range.csv` | The same windows as **CSV** (lossless decimal-text values; empty field = null). |
 | `GET /api/v1/storage/{aspect}/points` · `…/value-points` | Lossless JSON reads with declarative pagination — `offset`/`limit` (+ `take` and 1-based `page` aliases), with `total`/`count`/`offset` in the body. |
 | `GET /api/v1/storage/{aspect}/at?t=` | **Single-instant point lookup**: the present value at exactly `t` (lossless decimal text) or a `found:false` miss. An **order-signal-driven read planner** resolves each candidate segment with its persisted `time_sorted` flag — binary search on a sorted segment, linear scan only on an out-of-order one — after pruning the index to the files spanning `t`. |
-| `POST /api/v1/storage/{aspect}/reconcile` | **Out-of-order reconciliation pass**: rewrite every out-of-order segment of the aspect into a time-sorted one in place (stable sort by timestamp, re-sealed at its own id, frame kind preserved). Returns whether it `triggered`, the number rewritten, and the post-pass `unsorted_segments`. An optional `?threshold=N` gates the pass on the order-health backlog (QuestDB-style split-count trigger) — it runs only when `unsorted_segments >= N`; without it the pass runs unconditionally. |
-| `POST /api/v1/storage/reconcile` | **Store-wide reconciliation sweep**: run the threshold trigger across every declared aspect, reconciling those whose `unsorted_segments` backlog is at or above `?threshold=N` (absent → 1). Returns `aspects_scanned` / `aspects_reconciled` / `segments_reconciled` and the post-sweep store-wide `unsorted_segments`. The manual, on-demand counterpart to the background reconcile daemon (`DSP_RECONCILE_INTERVAL_SECS` / `DSP_RECONCILE_THRESHOLD`). |
-| `GET /api/v1/storage/{aspect}/stats` · `…/storage/stats` | Materialized per-aspect and store-wide rollups, including the realized **bytes/point** (the north-star cost term) and an `unsorted_segments` order-health count (segments that would force a linear scan on a point lookup) — served from the control plane without opening a segment. |
+| `POST /api/v1/storage/{aspect}/reconcile` | **Reconciliation pass** (`mode` in the response). Default (intra-segment): rewrite every out-of-order segment of the aspect into a time-sorted one in place. `?threshold=N` gates it on `unsorted_segments >= N` (QuestDB-style split-count trigger). `?hot_cold=true` reconciles cold segments but defers the hot tail until the backlog reaches the threshold. `?overlaps=true` instead runs the **cross-segment overlap merge** (newer-wins) — `reconciled` is then the number of segments merged away. Returns `triggered`/`reconciled`/`cold_reconciled`/`hot_reconciled` and the post-pass `unsorted_segments` + `overlapping_segments`. |
+| `POST /api/v1/storage/reconcile` | **Store-wide reconciliation sweep** across every declared aspect: threshold (default), `?hot_cold=true`, or `?overlaps=true` (as above). Returns `mode`, `aspects_scanned` / `aspects_reconciled` / `segments_reconciled` (+ cold/hot split) and the post-sweep store-wide `unsorted_segments` + `overlapping_segments`. The manual counterpart to the background reconcile daemon (`DSP_RECONCILE_INTERVAL_SECS` / `DSP_RECONCILE_THRESHOLD` / `DSP_RECONCILE_HOT_COLD` / `DSP_RECONCILE_OVERLAPS`). |
+| `GET /api/v1/storage/{aspect}/stats` · `…/storage/stats` | Materialized per-aspect and store-wide rollups, including the realized **bytes/point** (the north-star cost term), an `unsorted_segments` order-health count (segments that would force a linear scan on a point lookup), and an `overlapping_segments` count (time-overlapping segments — the cross-segment order-health signal, computed by an index scan). Rollup fields are served from the control plane without opening a segment. |
 
 ### Metrics
 
@@ -639,7 +658,11 @@ DSP is configured primarily through environment variables:
 | `TEST_DATA_DIR` | `database` | Highest-priority override for the database root (used by the test suite). | unset |
 | `DSP_SERVER_ADDR` | `dsp-server` | HTTP bind address. | `127.0.0.1:8080` |
 | `DSP_SEGMENT_STORE_ROOT` | `dsp-server` | Root of the Storage v2 segment store; enables the `/storage` endpoints. | unset (storage endpoints answer `503`) |
-| `RUST_LOG` | all | [`tracing`](https://docs.rs/tracing) filter. | `dsp_tui=debug,database=debug,info` |
+| `DSP_RECONCILE_INTERVAL_SECS` | `dsp-server` | Background reconcile daemon sweep interval in seconds; `0`/unset disables it. | unset (disabled) |
+| `DSP_RECONCILE_THRESHOLD` | `dsp-server` | `unsorted_segments` backlog an aspect must reach before the daemon reconciles it. | `1` |
+| `DSP_RECONCILE_HOT_COLD` | `dsp-server` | Truthy → the daemon reconciles cold segments each tick and defers the hot tail until the threshold. | unset (all-or-nothing) |
+| `DSP_RECONCILE_OVERLAPS` | `dsp-server` | Truthy → each daemon tick also merges cross-segment time-overlap groups. | unset (disabled) |
+| `RUST_LOG` | all | [`tracing`](https://docs.rs/tracing) filter. On `dsp-server` it drives the compute-path spans (`interpolate.engine`, `downsample.reduce`, with busy/idle timing). | `dsp_tui=debug,database=debug,info` |
 | `SKIP_SLOW_TESTS` | tests | Set to `1` to skip long-running tests. | unset |
 
 The database root directory is resolved in this order:

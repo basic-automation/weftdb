@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use bigdecimal::BigDecimal;
-use dsp_physical_type::{AspectSchema, PagedSegment, Segment, SegmentDescriptor, PAGED_SEGMENT_FORMAT_VERSION};
+use dsp_physical_type::{merge_newer_wins, AspectSchema, PagedSegment, Segment, SegmentDescriptor, PAGED_SEGMENT_FORMAT_VERSION};
 
 use crate::{AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, SegmentIndexStore};
 
@@ -559,6 +559,213 @@ impl SegmentStore {
 		Ok(sweep)
 	}
 
+	/// **Hot/cold threshold reconciliation** (roadmap Phase 4.6): reconcile an aspect's
+	/// out-of-order segments the way `QuestDB` squashes partitions — **cold** (sealed,
+	/// no-longer-appended) segments are rewritten on every pass, while the **hot tail**
+	/// (the most-recently sealed segment, still the append target) is deferred until the
+	/// aspect's out-of-order backlog reaches `threshold`.
+	///
+	/// The plain [`reconcile_aspect_if_unsorted_exceeds`](SegmentStore::reconcile_aspect_if_unsorted_exceeds)
+	/// gate is all-or-nothing: below the threshold it leaves *every* out-of-order
+	/// segment alone, so a cold segment that will never be appended again waits behind
+	/// the hot tail's split budget. That over-defers — a cold segment's rewrite is a
+	/// one-time cost that a later append cannot undo, so paying it eagerly is strictly
+	/// cheaper than carrying its linear-scan point-lookup cost. Only the hot tail is
+	/// worth deferring: rewriting the actively-growing segment on every tick would
+	/// rewrite the same bytes repeatedly. This method reconciles the cold segments
+	/// unconditionally and gates only the hot tail on the backlog, matching `QuestDB`'s
+	/// "squash non-active partitions each commit, defer the active partition until the
+	/// split threshold" policy. *(src: <https://questdb.com/docs/concepts/partitions/>)*
+	///
+	/// The **hot tail** is the segment with the largest id — ids are assigned
+	/// monotonically on seal, so the newest is the append target. An already-sorted hot
+	/// tail needs no rewrite regardless. The backlog is the aspect's out-of-order
+	/// segment count observed at entry (before any rewrite this pass), so the hot-tail
+	/// decision does not shift as cold segments drop out of the count.
+	///
+	/// `threshold` is clamped to 1 (as for the plain trigger). Returns a
+	/// [`HotColdReconcile`] splitting the rewrite count into cold vs hot.
+	///
+	/// # Errors
+	///
+	/// As [`reconcile_segment`](SegmentStore::reconcile_segment); also propagates the
+	/// index read behind the segment list.
+	pub async fn reconcile_aspect_hot_cold(&self, aspect: &str, threshold: usize) -> Result<HotColdReconcile> {
+		let threshold = threshold.max(1);
+		let descriptors = self.index.all(aspect).await?;
+		let hot_tail_id = descriptors.iter().map(|d| d.id).max();
+		let unsorted: Vec<u64> = descriptors.iter().filter(|d| !d.time_sorted).map(|d| d.id).collect();
+		let hot_fires = unsorted.len() >= threshold;
+		let mut out = HotColdReconcile::default();
+		for id in unsorted {
+			if Some(id) == hot_tail_id {
+				// The hot tail is deferred until the backlog reaches the threshold.
+				if hot_fires && self.reconcile_segment(aspect, id).await? {
+					out.hot_reconciled += 1;
+				}
+			} else if self.reconcile_segment(aspect, id).await? {
+				// A cold segment is always worth reconciling.
+				out.cold_reconciled += 1;
+			}
+		}
+		Ok(out)
+	}
+
+	/// **Store-wide hot/cold reconcile sweep** (roadmap Phase 4.6): apply
+	/// [`reconcile_aspect_hot_cold`](SegmentStore::reconcile_aspect_hot_cold) to **every**
+	/// declared aspect — eagerly reconciling each aspect's cold segments while deferring
+	/// its hot tail until that aspect's own backlog reaches `threshold`.
+	///
+	/// This is the hot/cold analogue of
+	/// [`reconcile_all_over_threshold`](SegmentStore::reconcile_all_over_threshold): the
+	/// tick a background daemon calls when it wants cold segments cleaned up on every
+	/// sweep without rewriting each aspect's actively-appended tail on every tick.
+	/// Aspects are visited in declared-name order; a `threshold` of 0 clamps to 1.
+	/// Returns a [`HotColdSweep`] — aspects scanned, aspects that rewrote at least one
+	/// segment, and the cold/hot rewrite split — the numbers a daemon logs and exports.
+	///
+	/// # Errors
+	///
+	/// As [`reconcile_aspect_hot_cold`](SegmentStore::reconcile_aspect_hot_cold); also
+	/// propagates the aspect-list read.
+	pub async fn reconcile_all_hot_cold(&self, threshold: usize) -> Result<HotColdSweep> {
+		let aspects = self.list_declared_aspects().await?;
+		let mut sweep = HotColdSweep { aspects_scanned: aspects.len(), ..HotColdSweep::default() };
+		for aspect in &aspects {
+			let outcome = self.reconcile_aspect_hot_cold(aspect, threshold).await?;
+			if outcome.total() > 0 {
+				sweep.aspects_reconciled += 1;
+				sweep.cold_reconciled += outcome.cold_reconciled;
+				sweep.hot_reconciled += outcome.hot_reconciled;
+			}
+		}
+		Ok(sweep)
+	}
+
+	/// **Cross-segment out-of-order merge** (roadmap Phase 4.6): collapse every group
+	/// of time-**overlapping** segments of `aspect` into a single time-sorted segment,
+	/// resolving late data that re-entered an already-covered window.
+	///
+	/// Where [`reconcile_segment`](SegmentStore::reconcile_segment) fixes *intra*-segment
+	/// disorder (the [`unsorted_segments`](AspectStorageStats::unsorted_segments) signal),
+	/// this fixes *cross*-segment overlap (the
+	/// [`overlapping_segments`](AspectStorageStats::overlapping_segments) signal): two
+	/// internally-sorted segments whose windows intersect. Each connected component of
+	/// overlapping segments (transitive time overlap) is merged into one segment at the
+	/// component's **lowest id** and the other members are dropped (index row + file),
+	/// so afterwards [`SegmentIndex::overlapping_count`](dsp_physical_type::SegmentIndex::overlapping_count)
+	/// is zero and a point/range read over the merged window opens a single segment.
+	///
+	/// **Merge semantics — newer wins (upsert).** Members are folded in ascending seal
+	/// id (oldest → newest) with [`merge_newer_wins`], so at any timestamp two members
+	/// share, the more-recently-sealed value supersedes the older one — the same
+	/// last-writer-wins answer [`read_point`](SegmentStore::read_point) already gives
+	/// across overlapping segments. This *dedups* cross-segment duplicate timestamps
+	/// (a range read no longer returns the superseded row), which is the intended
+	/// reconciliation/upsert behaviour. Rows at a timestamp carried by only one member
+	/// — including that member's own internal duplicates — are preserved.
+	///
+	/// The merged rows are re-sealed as a single-block segment under the aspect's
+	/// declared schema (a paged member is compacted to single-block; choosing a paged
+	/// output for a large merge is a follow-on). Non-overlapping segments are left
+	/// untouched. The materialized rollup is rebuilt from the durable index afterward.
+	///
+	/// Returns the number of segments **removed** by merging — the sum over components
+	/// of `(members − 1)`; zero when no two segments overlap (a no-op).
+	///
+	/// # Errors
+	///
+	/// Returns an error if `aspect` has no declared schema; propagates a filesystem
+	/// read/write error, a decode/re-seal failure, or a libSQL failure.
+	pub async fn reconcile_overlaps(&self, aspect: &str) -> Result<usize> {
+		let descriptors = self.index.all(aspect).await?;
+		// Components of transitively time-overlapping segments: sort spans by (min_ts,
+		// max_ts), sweep, and start a new component whenever a span begins after the
+		// running max end of the current one.
+		let mut spans: Vec<(u64, i64, i64)> = descriptors.iter().filter_map(|d| d.time_range().map(|(lo, hi)| (d.id, lo, hi))).collect();
+		spans.sort_by_key(|&(_, lo, hi)| (lo, hi));
+		let mut components: Vec<Vec<u64>> = Vec::new();
+		let mut running_max_hi = i64::MIN;
+		for (id, lo, hi) in spans {
+			match components.last_mut() {
+				Some(component) if lo <= running_max_hi => {
+					component.push(id);
+					running_max_hi = running_max_hi.max(hi);
+				},
+				_ => {
+					components.push(vec![id]);
+					running_max_hi = hi;
+				},
+			}
+		}
+		let schema = self.require_schema(aspect).await?;
+		let mut removed = 0;
+		for mut component in components {
+			if component.len() < 2 {
+				continue;
+			}
+			// Fold members oldest → newest so the most-recently-sealed value wins a tie.
+			component.sort_unstable();
+			let mut merged: Vec<(i64, Option<BigDecimal>)> = Vec::new();
+			for &id in &component {
+				let descriptor = descriptors.iter().find(|d| d.id == id).ok_or_else(|| anyhow::anyhow!("aspect {aspect:?} lost segment {id} mid-merge"))?;
+				let (ts, vs) = self.decode_all(descriptor).await?;
+				let mut rows: Vec<(i64, Option<BigDecimal>)> = ts.into_iter().zip(vs).collect();
+				// Each member may be internally out of order; sort before merging.
+				rows.sort_by_key(|(t, _)| *t);
+				merged = merge_newer_wins(&merged, &rows);
+			}
+			let (sorted_ts, sorted_vs): (Vec<i64>, Vec<Option<BigDecimal>>) = merged.into_iter().unzip();
+			// Seal the merged rows into the component's lowest id, in place.
+			let target = component[0];
+			let path = self.segment_path(aspect, target);
+			let segment = schema.seal_nullable(&sorted_ts, &sorted_vs).map_err(|e| anyhow::anyhow!("merge re-seal failed: {e}"))?;
+			let new_bytes = segment.write_to();
+			tokio::fs::write(&path, &new_bytes).await.with_context(|| format!("writing merged segment {}", path.display()))?;
+			let new_descriptor = SegmentDescriptor::of_segment(target, path.to_string_lossy().into_owned(), new_bytes.len() as u64, &segment);
+			self.index.insert(aspect, &new_descriptor).await?;
+			// Drop the other members: control-plane row then the file.
+			for &id in component.iter().skip(1) {
+				self.index.delete(aspect, id).await?;
+				let victim = self.segment_path(aspect, id);
+				tokio::fs::remove_file(&victim).await.with_context(|| format!("removing merged-away segment {}", victim.display()))?;
+				removed += 1;
+			}
+		}
+		if removed > 0 {
+			// A merge changed the segment set; recompute the rollup from the durable index.
+			self.rebuild_aspect_metadata(aspect).await?;
+		}
+		Ok(removed)
+	}
+
+	/// **Store-wide cross-segment overlap merge** (roadmap Phase 4.6): apply
+	/// [`reconcile_overlaps`](SegmentStore::reconcile_overlaps) to **every** declared
+	/// aspect, merging each aspect's time-overlap groups.
+	///
+	/// The store-wide counterpart to the per-aspect merge — the tick a background
+	/// daemon calls to keep cross-segment overlap from accumulating store-wide. Aspects
+	/// are visited in declared-name order. Returns an [`OverlapSweep`] — how many
+	/// aspects were scanned, how many actually merged anything, and the total segments
+	/// removed — the numbers a daemon logs and exports.
+	///
+	/// # Errors
+	///
+	/// As [`reconcile_overlaps`](SegmentStore::reconcile_overlaps); also propagates the
+	/// aspect-list read.
+	pub async fn reconcile_all_overlaps(&self) -> Result<OverlapSweep> {
+		let aspects = self.list_declared_aspects().await?;
+		let mut sweep = OverlapSweep { aspects_scanned: aspects.len(), ..OverlapSweep::default() };
+		for aspect in &aspects {
+			let removed = self.reconcile_overlaps(aspect).await?;
+			if removed > 0 {
+				sweep.aspects_reconciled += 1;
+				sweep.segments_removed += removed;
+			}
+		}
+		Ok(sweep)
+	}
+
 	/// Read every present row of `aspect` whose **value** falls in the inclusive range
 	/// `[lo, hi]`, **opening only the segment files whose value span overlaps it**.
 	///
@@ -628,7 +835,7 @@ impl SegmentStore {
 	/// Propagates any libSQL read failure.
 	pub async fn aspect_stats(&self, aspect: &str) -> Result<AspectStorageStats> {
 		let index = self.index.load_index(aspect).await?;
-		Ok(AspectStorageStats { segment_count: index.len(), total_rows: index.total_rows(), total_bytes: index.total_bytes(), bytes_per_point: index.bytes_per_point(), time_range: index.time_range(), unsorted_segments: index.unsorted_count() })
+		Ok(AspectStorageStats { segment_count: index.len(), total_rows: index.total_rows(), total_bytes: index.total_bytes(), bytes_per_point: index.bytes_per_point(), time_range: index.time_range(), unsorted_segments: index.unsorted_count(), overlapping_segments: index.overlapping_count() })
 	}
 
 	/// The **materialized** segment-set rollup for `aspect` — the same aspect-wide
@@ -718,6 +925,32 @@ impl SegmentStore {
 		}
 		Ok(stats)
 	}
+
+	/// **Store-wide cross-segment overlap count** (roadmap Phase 4.6): the total
+	/// number of segments across every aspect whose time window overlaps another
+	/// segment *in the same aspect* — the store-wide form of
+	/// [`AspectStorageStats::overlapping_segments`](AspectStorageStats::overlapping_segments).
+	///
+	/// Unlike [`store_stats`](SegmentStore::store_stats) — which reads O(1)
+	/// per-aspect rollups — a cross-segment property has no incremental fold, so this
+	/// **scans each aspect's segment index** ([`SegmentIndex::overlapping_count`](dsp_physical_type::SegmentIndex::overlapping_count))
+	/// and sums the results. It is a deliberately separate call so `store_stats` keeps
+	/// its no-scan guarantee; a caller pays the scan only when it wants this signal.
+	/// Overlaps are always within an aspect (segments of different aspects never share
+	/// a measurement stream), so the store-wide total is the plain sum of per-aspect
+	/// counts.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure (the aspect list or a per-aspect index load).
+	pub async fn store_overlapping_segments(&self) -> Result<usize> {
+		let aspects = self.metadata.list_aspects().await?;
+		let mut total = 0;
+		for aspect in &aspects {
+			total += self.index.load_index(aspect).await?.overlapping_count();
+		}
+		Ok(total)
+	}
 }
 
 /// The outcome of a store-wide threshold reconcile sweep, returned by
@@ -732,6 +965,64 @@ pub struct ReconcileSweep {
 	pub aspects_reconciled: usize,
 	/// Total out-of-order segments rewritten sorted across every reconciled aspect.
 	pub segments_reconciled: usize,
+}
+
+/// The cold-vs-hot split of a hot/cold reconcile pass over one aspect, returned by
+/// [`SegmentStore::reconcile_aspect_hot_cold`]. A cold segment (any out-of-order
+/// segment that is not the aspect's most-recently-sealed one) is always reconciled;
+/// the hot tail is reconciled only when the aspect's backlog reached the threshold.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HotColdReconcile {
+	/// Cold (non-hot-tail) out-of-order segments rewritten sorted — always paid.
+	pub cold_reconciled: usize,
+	/// Hot-tail segments rewritten this pass (0 or 1 for a single aspect): non-zero
+	/// only when the backlog reached the threshold and the tail was out of order.
+	pub hot_reconciled: usize,
+}
+
+impl HotColdReconcile {
+	/// Total segments rewritten this pass — cold plus hot.
+	#[must_use]
+	pub const fn total(&self) -> usize {
+		self.cold_reconciled + self.hot_reconciled
+	}
+}
+
+/// The outcome of a store-wide hot/cold reconcile sweep, returned by
+/// [`SegmentStore::reconcile_all_hot_cold`] — the per-tick numbers a background
+/// reconcile daemon in hot/cold mode logs and exports.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HotColdSweep {
+	/// Number of declared aspects the sweep visited.
+	pub aspects_scanned: usize,
+	/// Number of aspects that rewrote at least one segment (cold or hot) this sweep.
+	pub aspects_reconciled: usize,
+	/// Total cold segments rewritten across every aspect.
+	pub cold_reconciled: usize,
+	/// Total hot-tail segments rewritten across every aspect.
+	pub hot_reconciled: usize,
+}
+
+impl HotColdSweep {
+	/// Total segments rewritten across the sweep — cold plus hot.
+	#[must_use]
+	pub const fn segments_reconciled(&self) -> usize {
+		self.cold_reconciled + self.hot_reconciled
+	}
+}
+
+/// The outcome of a store-wide cross-segment overlap merge sweep, returned by
+/// [`SegmentStore::reconcile_all_overlaps`] — the per-tick numbers a background
+/// reconcile daemon in overlaps mode logs and exports.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OverlapSweep {
+	/// Number of declared aspects the sweep visited.
+	pub aspects_scanned: usize,
+	/// Number of aspects that merged at least one overlap group this sweep.
+	pub aspects_reconciled: usize,
+	/// Total segments removed by merging across every aspect (sum of per-component
+	/// `members − 1`).
+	pub segments_removed: usize,
 }
 
 /// A store-wide aggregate over every aspect's materialized rollup, surfaced by
@@ -795,6 +1086,14 @@ pub struct AspectStorageStats {
 	/// admits ordered access, which a `require_sorted` ingest keeps true by
 	/// construction. See [`SegmentIndex::unsorted_count`](dsp_physical_type::SegmentIndex::unsorted_count).
 	pub unsorted_segments: usize,
+	/// The number of sealed segments whose time span **overlaps at least one other
+	/// segment's** — the *cross-segment* order-health signal (roadmap Phase 4.6),
+	/// distinct from [`unsorted_segments`](AspectStorageStats::unsorted_segments)
+	/// (which counts *intra*-segment disorder). A non-zero count means late data
+	/// re-entered an already-covered window, so a point lookup may have to consult
+	/// more than one segment; these are the cross-segment reconciliation candidates.
+	/// See [`SegmentIndex::overlapping_count`](dsp_physical_type::SegmentIndex::overlapping_count).
+	pub overlapping_segments: usize,
 }
 
 #[cfg(test)]
@@ -1156,6 +1455,195 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn hot_cold_reconciles_cold_segments_but_defers_the_hot_tail() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		// Two out-of-order segments: id 0 (cold) and id 1 (the hot tail).
+		store.seal("a", &schema(), &[100_i64, 130, 110], &[bd("1"), bd("3"), bd("2")]).await.expect("cold ooo");
+		store.seal("a", &schema(), &[200_i64, 240, 210], &[bd("4"), bd("6"), bd("5")]).await.expect("hot ooo");
+		assert_eq!(store.aspect_stats("a").await.expect("stats").unsorted_segments, 2);
+		// Threshold 3 is above the backlog of 2: the cold segment is reconciled anyway,
+		// the hot tail is deferred.
+		let outcome = store.reconcile_aspect_hot_cold("a", 3).await.expect("reconciles");
+		let after = store.aspect_stats("a").await.expect("stats").unsorted_segments;
+		// The cold segment now binary-searches; the hot tail still linear-scans but reads correctly.
+		let cold_hit = store.read_point("a", 110).await.expect("reads");
+		let hot_hit = store.read_point("a", 210).await.expect("reads");
+		drop(store);
+		assert_eq!(outcome.cold_reconciled, 1, "the cold segment is reconciled below threshold");
+		assert_eq!(outcome.hot_reconciled, 0, "the hot tail is deferred below threshold");
+		assert_eq!(outcome.total(), 1);
+		assert_eq!(after, 1, "only the hot tail remains out of order");
+		assert_eq!(cold_hit, Some(bd("2")));
+		assert_eq!(hot_hit, Some(bd("5")));
+	}
+
+	#[tokio::test]
+	async fn hot_cold_reconciles_the_hot_tail_once_the_backlog_reaches_threshold() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		store.seal("a", &schema(), &[100_i64, 130, 110], &[bd("1"), bd("3"), bd("2")]).await.expect("cold ooo");
+		store.seal("a", &schema(), &[200_i64, 240, 210], &[bd("4"), bd("6"), bd("5")]).await.expect("hot ooo");
+		// Threshold 2 == the backlog: the hot tail fires alongside the cold segment.
+		let outcome = store.reconcile_aspect_hot_cold("a", 2).await.expect("reconciles");
+		let after = store.aspect_stats("a").await.expect("stats").unsorted_segments;
+		drop(store);
+		assert_eq!(outcome.cold_reconciled, 1);
+		assert_eq!(outcome.hot_reconciled, 1, "the hot tail fires at the threshold");
+		assert_eq!(after, 0, "the whole aspect is now ordered");
+	}
+
+	#[tokio::test]
+	async fn hot_cold_leaves_a_sorted_hot_tail_alone() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		// Cold out-of-order segment, then a sorted hot tail.
+		store.seal("a", &schema(), &[100_i64, 130, 110], &[bd("1"), bd("3"), bd("2")]).await.expect("cold ooo");
+		store.seal("a", &schema(), &[200_i64, 210, 220], &[bd("4"), bd("5"), bd("6")]).await.expect("sorted tail");
+		// Even at threshold 1 (which would fire on the backlog of 1) the sorted tail is a no-op.
+		let outcome = store.reconcile_aspect_hot_cold("a", 1).await.expect("reconciles");
+		let after = store.aspect_stats("a").await.expect("stats").unsorted_segments;
+		drop(store);
+		assert_eq!(outcome.cold_reconciled, 1, "the cold segment is reconciled");
+		assert_eq!(outcome.hot_reconciled, 0, "a sorted hot tail needs no rewrite");
+		assert_eq!(after, 0);
+	}
+
+	#[tokio::test]
+	async fn hot_cold_sweep_defers_hot_tails_below_threshold_across_aspects() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares a");
+		store.declare("b", &schema()).await.expect("declares b");
+		// aspect a: cold + hot out-of-order (backlog 2). aspect b: a lone out-of-order
+		// segment — which is itself the hot tail (backlog 1).
+		store.seal("a", &schema(), &[100_i64, 130, 110], &[bd("1"), bd("3"), bd("2")]).await.expect("a cold");
+		store.seal("a", &schema(), &[200_i64, 240, 210], &[bd("4"), bd("6"), bd("5")]).await.expect("a hot");
+		store.seal("b", &schema(), &[100_i64, 130, 110], &[bd("7"), bd("9"), bd("8")]).await.expect("b hot only");
+		// Sweep at threshold 2: a's cold segment is reconciled, a's hot tail fires (backlog 2);
+		// b's only segment is its hot tail and stays deferred (backlog 1 < 2).
+		let sweep = store.reconcile_all_hot_cold(2).await.expect("sweeps");
+		let a_after = store.aspect_stats("a").await.expect("stats a").unsorted_segments;
+		let b_after = store.aspect_stats("b").await.expect("stats b").unsorted_segments;
+		drop(store);
+		assert_eq!(sweep.aspects_scanned, 2);
+		assert_eq!(sweep.aspects_reconciled, 1, "only a rewrote a segment");
+		assert_eq!(sweep.cold_reconciled, 1, "a's cold segment");
+		assert_eq!(sweep.hot_reconciled, 1, "a's hot tail at threshold 2");
+		assert_eq!(sweep.segments_reconciled(), 2);
+		assert_eq!(a_after, 0, "a fully reconciled");
+		assert_eq!(b_after, 1, "b's lone hot tail is deferred below the threshold");
+	}
+
+	#[tokio::test]
+	async fn reconcile_overlaps_merges_a_pair_newer_wins() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		// Two internally-sorted segments whose windows overlap at 10 and 20.
+		store.seal("a", &schema(), &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("older");
+		store.seal("a", &schema(), &[10_i64, 20, 30], &[bd("4"), bd("5"), bd("6")]).await.expect("newer");
+		assert_eq!(store.aspect_stats("a").await.expect("stats").overlapping_segments, 2);
+		let removed = store.reconcile_overlaps("a").await.expect("merges");
+		let stats = store.aspect_stats("a").await.expect("stats");
+		// The two segments are now one; the overlap is gone and the merged rows are sorted.
+		let (ts, vs) = store.read_time_range("a", 0, 1000).await.expect("reads");
+		let hit10 = store.read_point("a", 10).await.expect("reads");
+		drop(store);
+		assert_eq!(removed, 1, "one segment was merged away");
+		assert_eq!(stats.segment_count, 1);
+		assert_eq!(stats.overlapping_segments, 0, "no cross-segment overlap remains");
+		assert_eq!(stats.unsorted_segments, 0);
+		// Newer wins at the shared instants 10 and 20; unique instants 0 and 30 survive.
+		assert_eq!(ts, vec![0, 10, 20, 30]);
+		assert_eq!(vs, vec![Some(bd("1")), Some(bd("4")), Some(bd("5")), Some(bd("6"))]);
+		assert_eq!(hit10, Some(bd("4")), "the newer value supersedes the older at 10");
+	}
+
+	#[tokio::test]
+	async fn reconcile_overlaps_merges_a_transitive_chain() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		// A [0,20], B [10,30], C [25,40] — A–B overlap, B–C overlap, so all one component.
+		store.seal("a", &schema(), &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("A");
+		store.seal("a", &schema(), &[10_i64, 20, 30], &[bd("4"), bd("5"), bd("6")]).await.expect("B");
+		store.seal("a", &schema(), &[25_i64, 30, 40], &[bd("7"), bd("8"), bd("9")]).await.expect("C");
+		let removed = store.reconcile_overlaps("a").await.expect("merges");
+		let stats = store.aspect_stats("a").await.expect("stats");
+		let (ts, _vs) = store.read_time_range("a", 0, 1000).await.expect("reads");
+		let hit30 = store.read_point("a", 30).await.expect("reads");
+		drop(store);
+		assert_eq!(removed, 2, "three segments collapse to one");
+		assert_eq!(stats.segment_count, 1);
+		assert_eq!(stats.overlapping_segments, 0);
+		// Distinct timestamps across the chain: 0,10,20,25,30,40 (10,20 from B win; 30 from C wins).
+		assert_eq!(ts, vec![0, 10, 20, 25, 30, 40]);
+		// C = [25→7, 30→8, 40→9], so C's value at 30 is 8; it supersedes B's 30→6.
+		assert_eq!(hit30, Some(bd("8")), "C (newest) wins at 30");
+	}
+
+	#[tokio::test]
+	async fn reconcile_overlaps_leaves_disjoint_segments_untouched() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		// Two disjoint windows plus one overlapping pair.
+		store.seal("a", &schema(), &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("disjoint");
+		store.seal("a", &schema(), &[100_i64, 110, 120], &[bd("4"), bd("5"), bd("6")]).await.expect("pair lo");
+		store.seal("a", &schema(), &[110_i64, 120, 130], &[bd("7"), bd("8"), bd("9")]).await.expect("pair hi");
+		assert_eq!(store.aspect_stats("a").await.expect("stats").overlapping_segments, 2, "only the [100,120]/[110,130] pair overlaps");
+		let removed = store.reconcile_overlaps("a").await.expect("merges");
+		let stats = store.aspect_stats("a").await.expect("stats");
+		// The disjoint segment survives; the overlapping pair merges to one → 2 segments.
+		let (ts0, _) = store.read_time_range("a", 0, 50).await.expect("reads disjoint");
+		drop(store);
+		assert_eq!(removed, 1, "only the overlapping pair merged");
+		assert_eq!(stats.segment_count, 2);
+		assert_eq!(stats.overlapping_segments, 0);
+		assert_eq!(ts0, vec![0, 10, 20], "the disjoint segment is unchanged");
+	}
+
+	#[tokio::test]
+	async fn reconcile_all_overlaps_sweeps_every_aspect() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares a");
+		store.declare("b", &schema()).await.expect("declares b");
+		// a: an overlapping pair. b: disjoint segments.
+		store.seal("a", &schema(), &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("a older");
+		store.seal("a", &schema(), &[10_i64, 20, 30], &[bd("4"), bd("5"), bd("6")]).await.expect("a newer");
+		store.seal("b", &schema(), &[0_i64, 10, 20], &[bd("7"), bd("8"), bd("9")]).await.expect("b lo");
+		store.seal("b", &schema(), &[100_i64, 110, 120], &[bd("1"), bd("2"), bd("3")]).await.expect("b hi");
+		let sweep = store.reconcile_all_overlaps().await.expect("sweeps");
+		let a_after = store.aspect_stats("a").await.expect("stats a").overlapping_segments;
+		let b_after = store.aspect_stats("b").await.expect("stats b").overlapping_segments;
+		drop(store);
+		assert_eq!(sweep.aspects_scanned, 2);
+		assert_eq!(sweep.aspects_reconciled, 1, "only a had an overlap to merge");
+		assert_eq!(sweep.segments_removed, 1);
+		assert_eq!(a_after, 0);
+		assert_eq!(b_after, 0, "b never overlapped");
+	}
+
+	#[tokio::test]
+	async fn reconcile_overlaps_is_a_noop_without_overlap() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		store.seal("a", &schema(), &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("s0");
+		store.seal("a", &schema(), &[100_i64, 110, 120], &[bd("4"), bd("5"), bd("6")]).await.expect("s1");
+		let removed = store.reconcile_overlaps("a").await.expect("no-op");
+		let count = store.segment_count("a").await.expect("count");
+		drop(store);
+		assert_eq!(removed, 0, "disjoint segments need no merge");
+		assert_eq!(count, 2);
+	}
+
+	#[tokio::test]
 	async fn reconcile_missing_segment_errors() {
 		let dir = TempDir::new().expect("tempdir");
 		let store = SegmentStore::open(dir.path()).await.expect("opens");
@@ -1320,6 +1808,20 @@ mod tests {
 		drop(store);
 		assert_eq!(stats.segment_count, 2);
 		assert_eq!(stats.unsorted_segments, 1, "one of the two segments is out of order");
+		assert_eq!(stats.overlapping_segments, 0, "the two segments cover disjoint windows");
+	}
+
+	#[tokio::test]
+	async fn aspect_stats_counts_cross_segment_overlap() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		// Two internally-sorted segments whose time windows overlap: [0,20] and [10,30].
+		store.seal("a", &schema(), &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("first");
+		store.seal("a", &schema(), &[10_i64, 20, 30], &[bd("4"), bd("5"), bd("6")]).await.expect("overlapping");
+		let stats = store.aspect_stats("a").await.expect("stats");
+		drop(store);
+		assert_eq!(stats.unsorted_segments, 0, "both segments are internally sorted");
+		assert_eq!(stats.overlapping_segments, 2, "their time windows overlap (late data re-entered a window)");
 	}
 
 	#[tokio::test]
@@ -1397,6 +1899,24 @@ mod tests {
 		assert_eq!(stats.aspect_count, 2);
 		assert_eq!(stats.segment_count, 3);
 		assert_eq!(stats.unsorted_segments, 2);
+	}
+
+	#[tokio::test]
+	async fn store_overlapping_segments_sums_across_aspects() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		// "a": two internally-sorted but time-overlapping segments ([0,20], [10,30]) → 2.
+		store.seal("a", &schema(), &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("a first");
+		store.seal("a", &schema(), &[10_i64, 20, 30], &[bd("4"), bd("5"), bd("6")]).await.expect("a overlap");
+		// "b": two disjoint windows ([0,20], [100,120]) → 0.
+		store.seal("b", &schema(), &[0_i64, 10, 20], &[bd("7"), bd("8"), bd("9")]).await.expect("b first");
+		store.seal("b", &schema(), &[100_i64, 110, 120], &[bd("1"), bd("2"), bd("3")]).await.expect("b disjoint");
+		let total = store.store_overlapping_segments().await.expect("overlap total");
+		// store_stats stays O(1) and is unaffected.
+		let stats = store.store_stats().await.expect("store stats");
+		drop(store);
+		assert_eq!(total, 2, "only aspect a's two segments overlap; b's are disjoint");
+		assert_eq!(stats.unsorted_segments, 0, "every segment is internally sorted");
 	}
 
 	#[tokio::test]

@@ -209,7 +209,9 @@ transfer, 8% kernel, 7% JSON").
 - [x] Harness-level timing breakdown (dataset-gen + adapter + whole-run spans)
 - [x] Latency histograms over the compute + seal paths (`/metrics`)
 - [x] `/debug/profile/current` — live p50/p95/p99 latency snapshot
-- [ ] Full tracing spans across ingest → GPU → serialization (request parse · auth · ILP/CSV/Arrow decode · value parse · `BigDecimal` conversion · physical-encoding conversion · timestamp normalization · WAL append · libSQL write · segment write · commit · index update · range read · page skip · cache hit/miss · decompression · CPU interp · GPU upload/queue/kernel/readback · serialize)
+- [x] Tracing foundation — a `RUST_LOG`-driven `fmt` subscriber (span-CLOSE events, busy/idle timing) with per-request engine spans on the flagship compute path: `interpolate.engine` (input/output points, spline, resolution) and `downsample.reduce` (candidate/in-window points, buckets, resolution)
+- [ ] Full tracing spans across ingest → GPU → serialization — per-stage **child** spans under the request span (request parse · auth · ILP/CSV/Arrow decode · value parse · `BigDecimal` conversion · physical-encoding conversion · timestamp normalization · WAL append · libSQL write · segment write · commit · index update · range read · page skip · cache hit/miss · decompression · CPU interp · GPU upload/queue/kernel/readback · serialize)
+- [ ] **OTLP trace export** (pairs with the Prometheus `/metrics` surface): add a `tower-http` `TraceLayer` request span (+ `x-request-id`) and an `opentelemetry-otlp` exporter (grpc-tonic, ports 4317/4318) behind an env-gated endpoint; evaluate the `axum-tracing-opentelemetry` crate for the axum+tracing+otel wiring. *(src: https://crates.io/crates/axum-tracing-opentelemetry, https://oneuptime.com/blog/post/2026-02-06-instrument-rust-axum-opentelemetry/view)*
 - [ ] `Statement::n_change()` write accounting (Turso 0.6) in ingest/instrumentation spans
 - [ ] `/bench/runs/:id` endpoint
 
@@ -229,7 +231,7 @@ DSP-Bench shows ingest/scan/compression gains; correctness tests cover late + OO
   - [x] Fixed-width bit-packing codec — **realized on disk**: the `.dspseg` timestamp block writes a self-describing codec selector (bit-pack vs varint second differences), so the bytes/point saving is stored, not just estimated (segment format v3, paged v4)
   - [x] Monotonic-order enforcement — `first_order_violation` primitive; opt-in `Segment::build_sorted`/`build_nullable_sorted`, `AspectSchema::seal_sorted`/`seal_paged_sorted` (`SegmentError`/`SealError::OutOfOrder`); exposed at the API as `require_sorted` on **all four** ingest formats (JSON/CSV/ILP/Parquet); observability via `SegmentStats::time_sorted` → per-segment index → `unsorted_segments` in aspect/store stats + `time_sorted` on every ingest response
   - [ ] Explicit tz + leap-second policy
-  - [ ] Out-of-order **reconciliation** (Phase 4.6) — enforcement/detection + a first in-place per-segment reconciliation slice shipped; the cross-segment staging-window merge is the open work (see 4.6)
+  - [x] Out-of-order **reconciliation** (Phase 4.6) — enforcement/detection, in-place per-segment reconciliation, threshold + hot/cold background sweeps, and the **cross-segment overlap merge** (newer-wins dedup) all shipped; the split-not-rewrite optimization + composite upsert keys are the residue (see 4.6)
 - [x] **4.3 Columnar segment store** — in-memory `Segment`/`PagedSegment`; versioned
   CRC-checksummed `.dspseg` frames (v1 single-block, v2 null/quality column, v3 paged
   with per-page index); `AspectSchema::seal_paged[_nullable]` (per-page tolerance
@@ -257,18 +259,32 @@ DSP-Bench shows ingest/scan/compression gains; correctness tests cover late + OO
     segment's rows by timestamp and re-seal them sorted at the same id/file (frame
     kind preserved), dropping it out of `unsorted_segments` so a point lookup over it
     binary-searches; exposed at the API as `POST /storage/{aspect}/reconcile`
-  - [ ] Out-of-order **reconciliation — cross-segment staging-window merge** (the
-    remaining work): rather than rewriting a whole out-of-order segment, adopt
-    QuestDB's split-not-rewrite model — when late data lands in an existing window,
-    **split** the affected segment and merge only the small suffix, then **squash**
-    the accumulated splits at commit / once the split count crosses a threshold. Keep
-    segments small to bound write amplification. Port QuestDB's **size-based split
-    decision**: split only when the existing segment *prefix* is larger than the new
-    data plus its suffix **and** the prefix exceeds a min-size threshold — below that
-    a full in-place rewrite (already shipped) is cheaper than the split bookkeeping.
-    *(src: split fires when "the existing partition prefix is larger than the new data
-    plus suffix" past `cairo.o3.partition.split.min.size`=50MB, and squashes past
-    `cairo.o3.last.partition.max.splits`=20 — https://questdb.com/docs/concepts/partitions/)*
+  - [x] Out-of-order **reconciliation — cross-segment merge** (baseline): detect
+    time-overlapping segments (`SegmentIndex::overlapping_count`/`overlapping_segments`)
+    and collapse each connected overlap component into one time-sorted segment with
+    **newer-wins** (last-writer-wins / upsert) dedup on shared timestamps
+    (`merge_newer_wins` + `SegmentStore::reconcile_overlaps`/`reconcile_all_overlaps`,
+    `SegmentIndexStore::delete`); exposed at the API as `?overlaps=true` on the
+    per-aspect and store-wide reconcile endpoints and as a background daemon sweep
+    (`DSP_RECONCILE_OVERLAPS`). This matches QuestDB's DEDUP UPSERT "last write wins on
+    the designated timestamp" semantics. *(src: last-write-wins dedup on designated
+    timestamp + upsert keys — https://questdb.com/docs/concepts/deduplication/)*
+  - [ ] Out-of-order **reconciliation — split-not-rewrite optimization** (the residue):
+    `reconcile_overlaps` currently fully rewrites each overlap component; wire the
+    shipped `SplitPolicy::decide` (size-based: split only when the untouched prefix is
+    larger than new+suffix **and** above a min-size floor) into it so a large cold
+    prefix is kept untouched and only the small suffix is merged, then **squash**
+    accumulated splits past a threshold. Keep segments small to bound write
+    amplification (QuestDB resorts the recent tail but splits far-apart O3 to reduce
+    write-amp). *(src: split past `cairo.o3.partition.split.min.size`=50MB, squash past
+    `cairo.o3.last.partition.max.splits`=20; small partitions reduce O3 write-amp —
+    https://questdb.com/docs/concepts/partitions/)*
+  - [ ] Out-of-order **reconciliation — configurable upsert keys + skip-identical**:
+    the merge dedups on the timestamp alone (newer wins); add optional composite
+    dedup/upsert keys (timestamp + declared columns) and a skip-write when the newer
+    row is byte-identical to the older, matching QuestDB's `DEDUP UPSERT KEYS`. Blocked
+    on B-tags (per-measurement columns/tags don't exist yet). *(src: composite
+    UPSERT KEYS, identical-row skip — https://questdb.com/docs/concepts/deduplication/)*
   - [x] **Threshold-triggered background reconciliation**: the `unsorted_segments`
     count drives a QuestDB-`max.splits`-style trigger for an automatic background
     reconcile pass (single-aspect `reconcile_aspect_if_unsorted_exceeds` + store-wide
@@ -276,13 +292,13 @@ DSP-Bench shows ingest/scan/compression gains; correctness tests cover late + OO
     `POST …/{aspect}/reconcile`, a manual store-wide `POST …/storage/reconcile`, and
     a timer daemon (`DSP_RECONCILE_INTERVAL_SECS`/`DSP_RECONCILE_THRESHOLD`) with the
     `dsp_reconcile_passes_total`/`dsp_reconcile_segments_reconciled_total` metrics
-  - [ ] **Hot/cold split in the background reconcile**: QuestDB squashes *non-active*
-    partitions at every commit but defers the *active* (hot-tail) partition until the
-    split threshold; DSP's daemon currently keys purely on the per-aspect
-    `unsorted_segments` count. Refine it to always reconcile sealed/cold segments and
-    defer only the most-recent segment of an aspect until its backlog crosses the
-    threshold, so the hot tail is not rewritten on every tick. *(src: non-active
-    squashed each commit, active squashed past the split threshold —
+  - [x] **Hot/cold split in the background reconcile**: cold (non-hot-tail) segments
+    are reconciled every pass and only the hot tail (most-recently-sealed) is deferred
+    until the backlog reaches the threshold — `SegmentStore::reconcile_aspect_hot_cold`/
+    `reconcile_all_hot_cold`, wired through the reconcile daemon (`DSP_RECONCILE_HOT_COLD`)
+    and the `?hot_cold=true` reconcile endpoints; matches QuestDB's "squash non-active
+    partitions each commit, defer the active partition until the split threshold".
+    *(src: non-active squashed each commit, active squashed past the split threshold —
     https://questdb.com/docs/concepts/partitions/)*
   - [x] Read-planner: use the persisted per-segment `time_sorted` to binary-search a
     point lookup on a sorted segment and linear-scan only an out-of-order one
@@ -569,18 +585,23 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 - [ ] Add ClickHouse, InfluxDB 3, QuestDB, TimescaleDB adapters
 - [x] Implement InfluxDB Line Protocol ingest (shared `dsp-line-protocol` crate; bench + server wired end-to-end)
 - [ ] Add end-to-end timing spans *(harness-level spans shipped; per-pipeline-stage spans = Phase 3 tracing item)*
-- [ ] **Next slice — cross-segment out-of-order merge (Phase 4.6):** the in-place
-  per-segment reconciliation, the read-planner point lookup, and the
-  threshold-triggered background reconcile (endpoint gate + store-wide sweep + timer
-  daemon + metrics) have all shipped; the remaining work is QuestDB's split-not-rewrite
-  merge — split the affected segment on a **size-based** decision (existing prefix >
-  new data + suffix, above a min-size threshold) and merge only the small suffix,
-  then squash accumulated splits past a threshold (see Phase 4.6)
-- [ ] **Follow-on — hot/cold split in the background reconcile (Phase 4.6):** the
-  daemon keys purely on the per-aspect `unsorted_segments` count; refine it to always
-  reconcile sealed/cold segments and defer only an aspect's hot-tail segment until its
-  backlog crosses the threshold, so the most-recent segment is not rewritten each tick
-  *(src: https://questdb.com/docs/concepts/partitions/)*
+- [x] **Cross-segment out-of-order merge (Phase 4.6):** shipped — overlap detection
+  (`SegmentIndex::overlapping_count`, surfaced in per-aspect + store-wide stats),
+  the `merge_newer_wins` kernel, `SegmentStore::reconcile_overlaps`/`reconcile_all_overlaps`
+  (+ `SegmentIndexStore::delete`), the `?overlaps=true` reconcile endpoints, and the
+  `DSP_RECONCILE_OVERLAPS` background daemon sweep
+- [x] **Hot/cold split in the background reconcile (Phase 4.6):** shipped —
+  `reconcile_aspect_hot_cold`/`reconcile_all_hot_cold`, `?hot_cold=true` endpoints,
+  `DSP_RECONCILE_HOT_COLD` daemon mode
+- [ ] **Next slice — split-not-rewrite optimization (Phase 4.6):** wire the shipped
+  `SplitPolicy::decide` into `reconcile_overlaps` so a large cold prefix is kept
+  untouched and only the small suffix is merged, then squash accumulated splits past a
+  threshold (the `SplitPolicy` primitive + `split_index` are shipped and tested but not
+  yet consumed by the merge) *(src: https://questdb.com/docs/concepts/partitions/)*
+- [ ] **Next slice — per-stage tracing child spans (Phase 3):** the compute-path
+  request spans (`interpolate.engine`, `downsample.reduce`) shipped; add child spans
+  for value parse / `BigDecimal` convert / serialize under them, then the OTLP export
+  (see Phase 3) *(src: https://crates.io/crates/axum-tracing-opentelemetry)*
 - [x] Add p50/p95/p99 + confidence-interval reporting
 - [x] Add physical value types (`F64`, `ScaledI64`, `BigDecimalText` + three more)
 - [x] Prototype columnar segment reads for one aspect type (`database::SegmentStore`)
