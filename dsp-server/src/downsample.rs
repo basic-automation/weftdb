@@ -178,6 +178,12 @@ fn downsample_inner(request: DownsampleRequest) -> Result<Json<DownsampleRespons
 ///
 /// Sorted timestamps make same-bucket samples contiguous, so a single pass over
 /// the windowed series folds each bucket without a hash map.
+///
+/// Traced as the `downsample.reduce` span (roadmap Phase 3): records the candidate
+/// point count and resolution at entry and the in-window point count and produced
+/// bucket count on completion, so a `RUST_LOG`-enabled run sees the reduction pass's
+/// fan-in and fan-out.
+#[tracing::instrument(name = "downsample.reduce", skip_all, fields(candidate_points = points.len(), resolution = ?resolution, input_points = tracing::field::Empty, buckets = tracing::field::Empty))]
 fn run_downsample(points: &[Point], start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Json<DownsampleResponse>, ApiError> {
 	if end < start {
 		return Err(ApiError::BadRequest("`end` must not be before `start`".to_string()));
@@ -208,6 +214,9 @@ fn run_downsample(points: &[Point], start: DateTime<Utc>, end: DateTime<Utc>, re
 		series.push(acc.finish(resolution, cur_base, aggregations)?);
 	}
 
+	let span = tracing::Span::current();
+	span.record("input_points", input_points);
+	span.record("buckets", series.len());
 	Ok(Json(DownsampleResponse { resolution: resolution.to_string(), aggregations: aggregations.iter().map(|a| a.as_str().to_string()).collect(), input_points, buckets: series.len(), series }))
 }
 

@@ -277,6 +277,13 @@ async fn interpolate_inner(request: InterpolateRequest) -> Result<Json<Interpola
 
 /// Run the engine over a prepared point set and shape the response. Shared by
 /// the JSON and ILP entry points so both produce identical result envelopes.
+///
+/// Traced as the `interpolate.engine` span (roadmap Phase 3): it records the input
+/// point count, spline, and resolution at entry and the produced output-point count
+/// on completion, so a `RUST_LOG`-enabled run attributes the dominant compute cost of
+/// an interpolate request to the engine call. Per-stage child spans (value parse,
+/// serialize) are the next slice.
+#[tracing::instrument(name = "interpolate.engine", skip_all, fields(input_points = input_points, spline = %spline, resolution = ?resolution, output_points = tracing::field::Empty))]
 async fn run_interpolation(mut points: Vec<Point>, start: DateTime<Utc>, end: DateTime<Utc>, spline: Spline, resolution: Resolution, input_points: usize) -> Result<Json<InterpolateResponse>, ApiError> {
 	if end < start {
 		return Err(ApiError::bad_request("`end` must not be before `start`"));
@@ -295,6 +302,7 @@ async fn run_interpolation(mut points: Vec<Point>, start: DateTime<Utc>, end: Da
 
 	let points: Vec<OutputPoint> = output.iter().map(|p| OutputPoint { timestamp: p.timestamp, value: p.value.to_f64().unwrap_or_default(), kind: classify(p.timestamp, &input_timestamps, min_ts, max_ts) }).collect();
 
+	tracing::Span::current().record("output_points", points.len());
 	Ok(Json(InterpolateResponse { spline: spline_label, resolution: resolution_label, output_points: points.len(), input_points, points }))
 }
 
