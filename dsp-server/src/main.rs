@@ -62,9 +62,12 @@ async fn main() -> anyhow::Result<()> {
 
 /// Install the process-wide tracing subscriber (roadmap Phase 3): a `fmt` layer
 /// filtered by `RUST_LOG` (defaulting to `info`) that logs **span close** events, so
-/// each compute-path span (`interpolate.engine`, `downsample.reduce`) prints its
-/// recorded fields and its busy/idle duration on completion — the "where did the time
-/// go" signal Phase 3 targets. `try_init` is a no-op when a subscriber is already
+/// each compute-path span prints its recorded fields and its busy/idle duration on
+/// completion — the "where did the time go" signal Phase 3 targets. The compute paths
+/// are decomposed into per-stage child spans: `interpolate.parse` (f64 → `BigDecimal`
+/// lift) · `interpolate.compute` (spline kernel) · `interpolate.serialize`
+/// (`BigDecimal` → wire-f64 + provenance) under `interpolate.engine`; and
+/// `downsample.parse` beside `downsample.reduce`. `try_init` is a no-op when a subscriber is already
 /// installed, so this never panics.
 fn init_tracing() {
 	let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
