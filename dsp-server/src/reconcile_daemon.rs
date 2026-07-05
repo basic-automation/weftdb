@@ -20,7 +20,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use database::{HotColdSweep, OverlapSweep, ReconcileSweep, SegmentStore};
+use database::{HotColdSweep, OverlapSweep, ReconcileSweep, SegmentStore, SquashSweep};
 
 use crate::metrics::SharedMetrics;
 
@@ -51,6 +51,12 @@ pub struct ReconcileDaemonConfig {
 	/// dominant cold prefix is split off rather than fully rewritten. When `None`, the
 	/// merge uses the default 50 MiB floor (small components always full-rewrite).
 	pub split_min_bytes: Option<u64>,
+	/// Optional segment-count cap (roadmap Phase 4.6). When `Some`, each tick **also**
+	/// squashes every aspect whose segment count exceeds it into one segment
+	/// ([`reconcile_tick_squash`] / [`SegmentStore::squash_all_over_threshold`](database::SegmentStore::squash_all_over_threshold)),
+	/// bounding the fragmentation repeated split carve-offs create. When `None`, no
+	/// squash runs. Independent of `overlaps`/`hot_cold`/`threshold`.
+	pub squash_max_segments: Option<usize>,
 }
 
 /// Run one reconcile tick.
@@ -144,6 +150,29 @@ pub async fn reconcile_tick_overlaps_with_policy(store: &SegmentStore, metrics: 
 	Ok(sweep)
 }
 
+/// Run one **squash** tick (roadmap Phase 4.6 — the squash half of the
+/// split-not-rewrite path).
+///
+/// Sweeps every aspect through
+/// [`SegmentStore::squash_all_over_threshold`](database::SegmentStore::squash_all_over_threshold),
+/// folding each aspect whose segment count exceeds `max_segments` into one segment —
+/// the bound on the fragmentation repeated split carve-offs create. Records the
+/// squashed aspects and removed segments in `metrics` (a squash is a pass, like a
+/// reconcile), and returns the [`SquashSweep`]. A sweep that squashed nothing records
+/// nothing.
+///
+/// # Errors
+///
+/// Propagates a failure from
+/// [`SegmentStore::squash_all_over_threshold`](database::SegmentStore::squash_all_over_threshold).
+pub async fn reconcile_tick_squash(store: &SegmentStore, metrics: &SharedMetrics, max_segments: usize) -> anyhow::Result<SquashSweep> {
+	let sweep = store.squash_all_over_threshold(max_segments).await?;
+	if sweep.aspects_squashed > 0 {
+		metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_squashed).unwrap_or(u64::MAX), u64::try_from(sweep.segments_removed).unwrap_or(u64::MAX));
+	}
+	Ok(sweep)
+}
+
 /// Spawn the background reconcile daemon on `config.interval`.
 ///
 /// Returns the task handle; dropping it leaves the daemon running detached for the
@@ -192,6 +221,17 @@ pub fn spawn_reconcile_daemon(store: Arc<SegmentStore>, metrics: SharedMetrics, 
 					},
 					Ok(_) => {},
 					Err(err) => eprintln!("reconcile daemon: overlap sweep failed: {err}"),
+				}
+			}
+			// Optionally cap split-path fragmentation by squashing over-threshold aspects
+			// (runs after the overlap merge, which is what accumulates the split segments).
+			if let Some(max_segments) = config.squash_max_segments {
+				match reconcile_tick_squash(&store, &metrics, max_segments).await {
+					Ok(sweep) if sweep.aspects_squashed > 0 => {
+						println!("reconcile daemon (squash): scanned {} aspect(s), squashed {} aspect(s) / removed {} segment(s)", sweep.aspects_scanned, sweep.aspects_squashed, sweep.segments_removed);
+					},
+					Ok(_) => {},
+					Err(err) => eprintln!("reconcile daemon: squash sweep failed: {err}"),
 				}
 			}
 		}
@@ -328,5 +368,34 @@ mod tests {
 		assert_eq!(snap.reconcile.passes, 1, "a split is still a pass");
 		assert_eq!(stats.segment_count, 2, "cold prefix split off from the hot suffix");
 		assert_eq!(stats.overlapping_segments, 0);
+	}
+
+	#[tokio::test]
+	async fn squash_tick_folds_over_threshold_aspects_and_records_metrics() {
+		let dir = TempDir::new().unwrap();
+		let store = SegmentStore::open(dir.path()).await.unwrap();
+		store.declare("a", &schema()).await.unwrap();
+		// Three disjoint segments (over a cap of 2).
+		store.seal("a", &schema(), &[0_i64, 10], &[bd("0"), bd("1")]).await.unwrap();
+		store.seal("a", &schema(), &[20_i64, 30], &[bd("2"), bd("3")]).await.unwrap();
+		store.seal("a", &schema(), &[40_i64, 50], &[bd("4"), bd("5")]).await.unwrap();
+		let metrics: SharedMetrics = Arc::new(Metrics::default());
+
+		let sweep = reconcile_tick_squash(&store, &metrics, 2).await.unwrap();
+		let snap = metrics.snapshot();
+		let count = store.segment_count("a").await.unwrap();
+		drop(store);
+		assert_eq!(sweep.aspects_squashed, 1);
+		assert_eq!(sweep.segments_removed, 2, "3 segments squashed to 1");
+		assert_eq!(snap.reconcile.passes, 1, "a squash is a pass");
+		assert_eq!(count, 1);
+
+		// A second tick at the same cap finds one segment (<= 2) and records nothing.
+		let store = SegmentStore::open(dir.path()).await.unwrap();
+		let quiet = reconcile_tick_squash(&store, &metrics, 2).await.unwrap();
+		let snap2 = metrics.snapshot();
+		drop(store);
+		assert_eq!(quiet.aspects_squashed, 0);
+		assert_eq!(snap2.reconcile.passes, 1, "the quiet squash tick did not bump the pass counter");
 	}
 }

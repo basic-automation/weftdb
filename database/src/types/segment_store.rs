@@ -1044,6 +1044,33 @@ impl SegmentStore {
 		Ok(Some(self.squash_aspect(aspect).await?))
 	}
 
+	/// **Store-wide threshold squash** (roadmap Phase 4.6): apply the
+	/// [`squash_aspect_if_exceeds`](SegmentStore::squash_aspect_if_exceeds) trigger to
+	/// **every** declared aspect, squashing only those whose segment count exceeds
+	/// `max_segments`.
+	///
+	/// The tick a background squash daemon calls to cap split-path fragmentation
+	/// store-wide: on a timer it sweeps the aspects, pays the squash only for the ones
+	/// over the cap, and leaves the rest untouched. Aspects are visited in declared-name
+	/// order; a `max_segments` of 0 clamps to 1. Returns a [`SquashSweep`] — how many
+	/// aspects were scanned, how many were squashed, and the total segments removed.
+	///
+	/// # Errors
+	///
+	/// As [`squash_aspect_if_exceeds`](SegmentStore::squash_aspect_if_exceeds); also
+	/// propagates the aspect-list read.
+	pub async fn squash_all_over_threshold(&self, max_segments: usize) -> Result<SquashSweep> {
+		let aspects = self.list_declared_aspects().await?;
+		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
+		for aspect in &aspects {
+			if let Some(removed) = self.squash_aspect_if_exceeds(aspect, max_segments).await? {
+				sweep.aspects_squashed += 1;
+				sweep.segments_removed += removed;
+			}
+		}
+		Ok(sweep)
+	}
+
 	/// Read every present row of `aspect` whose **value** falls in the inclusive range
 	/// `[lo, hi]`, **opening only the segment files whose value span overlaps it**.
 	///
@@ -1300,6 +1327,21 @@ pub struct OverlapSweep {
 	pub aspects_reconciled: usize,
 	/// Total segments removed by merging across every aspect (sum of per-component
 	/// `members − 1`).
+	pub segments_removed: usize,
+}
+
+/// The outcome of a store-wide squash sweep, returned by
+/// [`SegmentStore::squash_all_over_threshold`] — the per-tick numbers a background
+/// squash daemon logs and exports.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SquashSweep {
+	/// Number of declared aspects the sweep visited.
+	pub aspects_scanned: usize,
+	/// Number of aspects that were squashed this sweep (their segment count exceeded the
+	/// threshold).
+	pub aspects_squashed: usize,
+	/// Total segments removed by squashing across every aspect (sum of per-aspect
+	/// `count − 1`).
 	pub segments_removed: usize,
 }
 
@@ -2129,6 +2171,28 @@ mod tests {
 		assert_eq!(ts, vec![0, 10, 20, 30, 40, 50, 60, 70], "every row preserved in order");
 		assert_eq!(vs.len(), 8);
 		assert_eq!(hit, Some(bd("5")));
+	}
+
+	#[tokio::test]
+	async fn squash_all_over_threshold_sweeps_only_aspects_over_the_cap() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares a");
+		store.declare("b", &schema()).await.expect("declares b");
+		// a: 3 disjoint segments (over a cap of 2). b: 1 segment (under).
+		store.seal("a", &schema(), &[0_i64, 10], &[bd("0"), bd("1")]).await.expect("a0");
+		store.seal("a", &schema(), &[20_i64, 30], &[bd("2"), bd("3")]).await.expect("a1");
+		store.seal("a", &schema(), &[40_i64, 50], &[bd("4"), bd("5")]).await.expect("a2");
+		store.seal("b", &schema(), &[0_i64, 10], &[bd("7"), bd("8")]).await.expect("b0");
+		let sweep = store.squash_all_over_threshold(2).await.expect("sweeps");
+		let a_count = store.segment_count("a").await.expect("a count");
+		let b_count = store.segment_count("b").await.expect("b count");
+		drop(store);
+		assert_eq!(sweep.aspects_scanned, 2);
+		assert_eq!(sweep.aspects_squashed, 1, "only a exceeded the cap of 2");
+		assert_eq!(sweep.segments_removed, 2, "a's 3 segments squashed to 1");
+		assert_eq!(a_count, 1);
+		assert_eq!(b_count, 1, "b was under the cap and untouched");
 	}
 
 	#[tokio::test]
