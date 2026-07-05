@@ -372,6 +372,64 @@ async fn reconcile_store_inner(store: &database::SegmentStore, threshold: Option
 	Ok((StatusCode::OK, Json(ReconcileStoreResponse { threshold, mode, aspects_scanned, aspects_reconciled, segments_reconciled, cold_reconciled, hot_reconciled, unsorted_segments, overlapping_segments })).into_response())
 }
 
+/// Query parameters for `POST /api/v1/storage/{aspect}/squash`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SquashParams {
+	/// Optional segment-count cap (roadmap Phase 4.6): squash **only** when the aspect
+	/// has more than this many segments — the `QuestDB`-`max.splits`-style trigger that
+	/// bounds split-path fragmentation. A value of 0 clamps to 1. When absent, the
+	/// squash runs unconditionally.
+	pub max_segments: Option<usize>,
+}
+
+/// Response body for `POST /api/v1/storage/{aspect}/squash` — the outcome of a
+/// segment squash pass.
+#[derive(Debug, Clone, Serialize)]
+pub struct SquashResponse {
+	/// The aspect squashed.
+	pub aspect: String,
+	/// Whether the squash actually ran. `false` only when a `max_segments` cap was
+	/// given and the aspect's segment count held at or below it (nothing rewritten).
+	pub triggered: bool,
+	/// Number of segments removed by folding the aspect into one (0 when it already had
+	/// fewer than two segments, or the pass did not trigger).
+	pub removed: usize,
+	/// The aspect's segment count *after* the pass — 1 once a squash has folded it.
+	pub segment_count: usize,
+}
+
+/// Handle `POST /api/v1/storage/{aspect}/squash`: fold an aspect's segments into one
+/// (roadmap Phase 4.6 — the squash half of the split-not-rewrite path).
+///
+/// With no `max_segments` query param it squashes unconditionally
+/// ([`SegmentStore::squash_aspect`](database::SegmentStore::squash_aspect)); with
+/// `?max_segments=N` it delegates to the threshold-gated
+/// [`squash_aspect_if_exceeds`](database::SegmentStore::squash_aspect_if_exceeds), so
+/// the rewrite runs only when the segment count exceeds `N` — the trigger that bounds
+/// the fragmentation repeated split carve-offs create. Returns `200 OK` with whether
+/// it triggered, how many segments it removed, and the post-pass segment count.
+///
+/// # Errors
+///
+/// [`StorageError::Unconfigured`] when no store is attached,
+/// [`StorageError::NotFound`] when the aspect is undeclared, and
+/// [`StorageError::Internal`] on a read/seal/control-plane failure.
+pub async fn squash_aspect(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<SquashParams>) -> Result<Response, StorageError> {
+	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	drop(state);
+	// Undeclared aspect → 404 (mirrors the reconcile/read surfaces).
+	if store.schema_for(&aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?.is_none() {
+		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
+	}
+	let (triggered, removed) = match params.max_segments {
+		Some(max) => store.squash_aspect_if_exceeds(&aspect, max).await.map_err(|err| StorageError::Internal(err.to_string()))?.map_or((false, 0), |removed| (true, removed)),
+		None => (true, store.squash_aspect(&aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?),
+	};
+	let segment_count = store.segment_count(&aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?;
+	drop(store);
+	Ok((StatusCode::OK, Json(SquashResponse { aspect, triggered, removed, segment_count })).into_response())
+}
+
 /// One point in an ingest batch: an integer epoch timestamp (in the aspect's
 /// declared [`TimeUnit`]) and its value as lossless decimal text, or `null` for an
 /// absent/null row.
@@ -1182,6 +1240,59 @@ mod tests {
 		assert_eq!(json["mode"], "overlaps");
 		assert_eq!(json["overlapping_segments"], 0, "the two halves are disjoint");
 		assert_eq!(segments_after, 2, "cold prefix split off from the hot suffix (vs 1 under the default floor)");
+	}
+
+	#[tokio::test]
+	async fn squash_endpoint_folds_segments_into_one() {
+		let dir = TempDir::new().unwrap();
+		let sc = dsp_physical_type::AspectSchema::new(dsp_physical_type::PhysicalType::F64, "0".parse().unwrap(), dsp_physical_type::TimeUnit::Seconds);
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+		store.declare("a", &sc).await.expect("declares a");
+		// Three time-disjoint segments (as repeated split carve-offs leave behind).
+		store.seal("a", &sc, &[0_i64, 10], &["0".parse().unwrap(), "1".parse().unwrap()]).await.expect("s0");
+		store.seal("a", &sc, &[20_i64, 30], &["2".parse().unwrap(), "3".parse().unwrap()]).await.expect("s1");
+		store.seal("a", &sc, &[40_i64, 50], &["4".parse().unwrap(), "5".parse().unwrap()]).await.expect("s2");
+
+		let router = app_with_state(AppState::new().with_store(store.clone()));
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/a/squash").body(Body::empty()).unwrap()).await.unwrap();
+		let status = response.status();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		let count_after = store.segment_count("a").await.unwrap();
+		drop(store);
+		assert_eq!(status, StatusCode::OK, "body: {json}");
+		assert_eq!(json["triggered"], true);
+		assert_eq!(json["removed"], 2, "three segments folded to one");
+		assert_eq!(json["segment_count"], 1);
+		assert_eq!(count_after, 1);
+	}
+
+	#[tokio::test]
+	async fn squash_endpoint_max_segments_gates_the_pass() {
+		let dir = TempDir::new().unwrap();
+		let sc = dsp_physical_type::AspectSchema::new(dsp_physical_type::PhysicalType::F64, "0".parse().unwrap(), dsp_physical_type::TimeUnit::Seconds);
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+		store.declare("a", &sc).await.expect("declares a");
+		store.seal("a", &sc, &[0_i64, 10], &["0".parse().unwrap(), "1".parse().unwrap()]).await.expect("s0");
+		store.seal("a", &sc, &[20_i64, 30], &["2".parse().unwrap(), "3".parse().unwrap()]).await.expect("s1");
+
+		// Cap 5 → holds (2 segments not > 5).
+		let router = app_with_state(AppState::new().with_store(store.clone()));
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/a/squash?max_segments=5").body(Body::empty()).unwrap()).await.unwrap();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		assert_eq!(json["triggered"], false, "held below the cap");
+		assert_eq!(json["removed"], 0);
+		assert_eq!(json["segment_count"], 2, "nothing rewritten");
+		drop(store);
+	}
+
+	#[tokio::test]
+	async fn squash_undeclared_aspect_is_not_found() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_empty_store(&dir).await;
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/never_declared/squash").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::NOT_FOUND);
 	}
 
 	#[tokio::test]
