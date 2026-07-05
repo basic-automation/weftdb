@@ -51,6 +51,12 @@ const RECONCILE_OVERLAPS_ENV: &str = "DSP_RECONCILE_OVERLAPS";
 /// unset, the merge uses the default 50 MiB floor.
 const RECONCILE_SPLIT_MIN_BYTES_ENV: &str = "DSP_RECONCILE_SPLIT_MIN_BYTES";
 
+/// Environment variable naming the segment-count cap for the daemon's squash pass
+/// (roadmap Phase 4.6). When set, each tick also squashes every aspect whose segment
+/// count exceeds it into one segment, bounding split-path fragmentation. When unset,
+/// no squash runs.
+const RECONCILE_MAX_SPLITS_ENV: &str = "DSP_RECONCILE_MAX_SPLITS";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
 	init_tracing();
@@ -112,7 +118,11 @@ fn spawn_reconcile_daemon_if_configured(state: &AppState) -> anyhow::Result<()> 
 		Ok(raw) => Some(raw.parse().map_err(|e| anyhow::anyhow!("{RECONCILE_SPLIT_MIN_BYTES_ENV}={raw:?} is not a non-negative integer: {e}"))?),
 		Err(_) => None,
 	};
-	let config = ReconcileDaemonConfig { interval: Duration::from_secs(interval_secs), threshold, hot_cold, overlaps, split_min_bytes };
+	let squash_max_segments: Option<usize> = match std::env::var(RECONCILE_MAX_SPLITS_ENV) {
+		Ok(raw) => Some(raw.parse().map_err(|e| anyhow::anyhow!("{RECONCILE_MAX_SPLITS_ENV}={raw:?} is not a non-negative integer: {e}"))?),
+		Err(_) => None,
+	};
+	let config = ReconcileDaemonConfig { interval: Duration::from_secs(interval_secs), threshold, hot_cold, overlaps, split_min_bytes, squash_max_segments };
 	// The daemon runs detached for the process lifetime; its handle is dropped on purpose.
 	drop(spawn_reconcile_daemon(Arc::clone(store), state.metrics().clone(), config));
 	let mode = if hot_cold { "hot/cold" } else { "threshold" };
@@ -121,7 +131,8 @@ fn spawn_reconcile_daemon_if_configured(state: &AppState) -> anyhow::Result<()> 
 		(true, None) => " + overlap merge".to_string(),
 		(false, _) => String::new(),
 	};
-	println!("reconcile daemon: enabled ({mode} mode{overlap_note}, every {interval_secs}s, threshold {threshold} out-of-order segment(s))");
+	let squash_note = squash_max_segments.map_or_else(String::new, |max| format!(" + squash (max {max} segment(s))"));
+	println!("reconcile daemon: enabled ({mode} mode{overlap_note}{squash_note}, every {interval_secs}s, threshold {threshold} out-of-order segment(s))");
 	Ok(())
 }
 
