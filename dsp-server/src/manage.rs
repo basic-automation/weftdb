@@ -37,6 +37,7 @@ use chrono::{DateTime, Utc};
 use dsp_line_protocol::TimestampPrecision;
 use dsp_physical_type::{first_order_violation, AspectSchema, PhysicalType, SegmentDescriptor, TimeUnit};
 use serde::{Deserialize, Serialize};
+use tracing::Instrument as _;
 
 use crate::{state::AppState, storage::{AspectInfo, StorageError}};
 
@@ -568,25 +569,36 @@ async fn ingest_points_inner(store: &database::SegmentStore, metrics: &crate::me
 		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
 
-	let mut timestamps = Vec::with_capacity(request.points.len());
-	let mut values = Vec::with_capacity(request.points.len());
+	let point_count = request.points.len();
+	let mut timestamps = Vec::with_capacity(point_count);
+	let mut values = Vec::with_capacity(point_count);
 	let mut any_null = false;
-	for point in &request.points {
-		timestamps.push(point.timestamp);
-		match &point.value {
-			None => {
-				any_null = true;
-				values.push(None);
-			}
-			Some(text) => {
-				let parsed: BigDecimal = text.parse().map_err(|_| StorageError::BadRequest(format!("value {text:?} (at timestamp {}) is not a decimal", point.timestamp)))?;
-				values.push(Some(parsed));
+	// `storage.ingest.parse` child span (roadmap Phase 3 — the write-path analogue of
+	// the compute-path parse span): the decimal-text → `BigDecimal` value lift of the
+	// batch, timed apart from the seal so a `RUST_LOG` run attributes ingest value
+	// parsing separately from the segment write.
+	{
+		let _parse = tracing::info_span!("storage.ingest.parse", point_count).entered();
+		for point in &request.points {
+			timestamps.push(point.timestamp);
+			match &point.value {
+				None => {
+					any_null = true;
+					values.push(None);
+				}
+				Some(text) => {
+					let parsed: BigDecimal = text.parse().map_err(|_| StorageError::BadRequest(format!("value {text:?} (at timestamp {}) is not a decimal", point.timestamp)))?;
+					values.push(Some(parsed));
+				}
 			}
 		}
 	}
 
 	enforce_order_if_required(request.require_sorted, &timestamps)?;
-	let descriptor = seal_batch(store, aspect, &schema, &timestamps, &values, any_null, request.rows_per_page).await.map_err(|err| classify_seal_error(&err))?;
+	// `storage.ingest.seal` child span (roadmap Phase 3): the typed-column encode +
+	// `.dspseg` write + control-plane index update — the write stage timed apart from
+	// value parsing.
+	let descriptor = seal_batch(store, aspect, &schema, &timestamps, &values, any_null, request.rows_per_page).instrument(tracing::info_span!("storage.ingest.seal", point_count, any_null)).await.map_err(|err| classify_seal_error(&err))?;
 	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
 	let response = IngestResponse {
 		aspect: aspect.to_string(),
