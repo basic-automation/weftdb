@@ -349,6 +349,55 @@ pub fn bitpack_decode(width: u32, bytes: &[u8], count: usize) -> Vec<i64> {
 	out
 }
 
+/// Bit cost of one second-difference value under a **Gorilla-style variable-length**
+/// scheme (roadmap Phase 6.1 — evaluation of a per-value bucketed codec as a
+/// complement to fixed-width bit-packing).
+///
+/// Where [`bitpack_width`] pays the max width for *every* value in a block, Gorilla's
+/// timestamp scheme pays per value by magnitude bucket, so the common regular case (a
+/// zero delta-of-delta) costs a single bit and only genuine jitter pays more:
+///
+/// - `0` → 1 bit (control `0`) — the regular-interval case;
+/// - `[-63, 64]` → 9 bits (control `10` + 7);
+/// - `[-255, 256]` → 12 bits (control `110` + 9);
+/// - `[-2047, 2048]` → 16 bits (control `1110` + 12);
+/// - otherwise → 68 bits (control `1111` + a full 64-bit value).
+///
+/// The Gorilla paper's final bucket is 32 bits (it assumes deltas fit 32 bits); this
+/// uses 64 so the estimate stays a valid upper bound for an arbitrary `i64` timestamp
+/// delta. Estimation only — no bitstream is produced. *(src: Gorilla, VLDB'15 —
+/// bucketed delta-of-delta timestamp coding.)*
+#[must_use]
+pub const fn gorilla_dod_bits(dod: i64) -> usize {
+	if dod == 0 {
+		1
+	} else if dod >= -63 && dod <= 64 {
+		2 + 7
+	} else if dod >= -255 && dod <= 256 {
+		3 + 9
+	} else if dod >= -2047 && dod <= 2048 {
+		4 + 12
+	} else {
+		4 + 64
+	}
+}
+
+/// Estimated byte footprint of a second-difference stream under the Gorilla-style
+/// variable-length scheme: the summed [`gorilla_dod_bits`] over every value, rounded
+/// up to whole bytes.
+///
+/// Comparable with [`bitpack_bytes`] / [`zigzag_varint_bytes`] / [`rle_varint_bytes`]
+/// (all omit the externally-known row count). The win over fixed-width bit-packing
+/// shows on a **small-jitter** stream — mostly-zero second differences with rare large
+/// spikes — where bit-packing must widen every value to the spike's width while
+/// Gorilla pays one bit for each of the many zeros; on a *perfectly* regular stream
+/// bit-packing's zero-width case (one header byte, no data) still wins.
+#[must_use]
+pub fn gorilla_bytes(dods: &[i64]) -> usize {
+	let bits: usize = dods.iter().map(|&d| gorilla_dod_bits(d)).sum();
+	bits.div_ceil(8)
+}
+
 impl DeltaColumn {
 	/// Estimated packed size: the anchor (a full 8-byte `i64`) plus the
 	/// varint-coded delta stream.
@@ -405,6 +454,23 @@ impl DeltaOfDeltaColumn {
 	#[must_use]
 	pub fn bitpack_estimated_bytes(&self) -> usize {
 		8 + self.first_delta.map_or(0, zigzag_varint_len) + bitpack_bytes(&self.dods)
+	}
+
+	/// Estimated packed size with the second-difference stream coded under the
+	/// **Gorilla-style variable-length** scheme ([`gorilla_bytes`]): anchor + first
+	/// delta + bucketed-bit stream (roadmap Phase 6.1).
+	///
+	/// **Advisory / evaluation only** — this is *not* folded into
+	/// [`best_estimated_bytes`](Self::best_estimated_bytes) or the realized on-disk
+	/// codec selector (which remains varint-vs-bit-pack), so no segment ever claims a
+	/// codec it cannot write. It exists to weigh the Gorilla footprint against the
+	/// shipped codecs on the bytes/point metric before adopting a per-value bucketed
+	/// on-disk codec: it beats [`bitpack_estimated_bytes`](Self::bitpack_estimated_bytes)
+	/// on a small-jitter stream (rare large spikes among mostly-zero second
+	/// differences), and loses to it on a perfectly regular one.
+	#[must_use]
+	pub fn gorilla_estimated_bytes(&self) -> usize {
+		8 + self.first_delta.map_or(0, zigzag_varint_len) + gorilla_bytes(&self.dods)
 	}
 
 	/// The smallest of the plain-varint, RLE, and bit-packed second-difference
@@ -584,6 +650,54 @@ mod tests {
 		assert_eq!(dod.bitpack_estimated_bytes(), 8 + 1 + 1);
 		assert!(dod.bitpack_estimated_bytes() < dod.rle_estimated_bytes());
 		assert_eq!(dod.best_estimated_bytes(), dod.bitpack_estimated_bytes());
+	}
+
+	#[test]
+	fn gorilla_dod_bits_match_the_paper_buckets() {
+		assert_eq!(gorilla_dod_bits(0), 1);
+		assert_eq!(gorilla_dod_bits(64), 9);
+		assert_eq!(gorilla_dod_bits(-63), 9);
+		assert_eq!(gorilla_dod_bits(65), 12);
+		assert_eq!(gorilla_dod_bits(256), 12);
+		assert_eq!(gorilla_dod_bits(257), 16);
+		assert_eq!(gorilla_dod_bits(2048), 16);
+		assert_eq!(gorilla_dod_bits(2049), 68);
+		assert_eq!(gorilla_dod_bits(-1_000_000), 68);
+	}
+
+	#[test]
+	fn gorilla_beats_bitpack_on_small_jitter_with_rare_spikes() {
+		// 64 mostly-regular points with two large isolated gaps: the second-difference
+		// stream is almost all zeros with a few big spikes. Fixed-width bit-packing must
+		// widen every value to the spike's width; the Gorilla-style codec pays a single
+		// bit for each of the many zero second differences — the roadmap-6.1 hypothesis.
+		let mut ts = Vec::with_capacity(64);
+		let mut t = 0_i64;
+		for i in 0..64 {
+			t += 1_000;
+			if i == 20 || i == 44 {
+				t += 50_000; // an irregular gap
+			}
+			ts.push(t);
+		}
+		let dod = encode_delta_of_delta(&ts, TimeUnit::Millis);
+		// Measured on this stream: gorilla 52 B vs fixed-width bit-pack 143 B (the
+		// roadmap-6.1 comparison). The shipped RLE codec (32 B here) still wins on these
+		// *isolated* spikes, though — gorilla's unique advantage is scattered single
+		// jitter, where RLE cannot form runs (filed as a ROADMAP follow-up).
+		assert!(dod.gorilla_estimated_bytes() < dod.bitpack_estimated_bytes(), "gorilla {} should beat bit-pack {} on a spiky stream", dod.gorilla_estimated_bytes(), dod.bitpack_estimated_bytes());
+	}
+
+	#[test]
+	fn bitpack_still_wins_a_perfectly_regular_stream_over_gorilla() {
+		// All-zero second differences: bit-pack's zero-width case (one header byte, no
+		// data) beats Gorilla's one-bit-per-value, so Gorilla is a complement, not a
+		// replacement — and the realized selector, which excludes the advisory Gorilla
+		// estimate, still picks bit-packing.
+		let values: Vec<i64> = (0..1_000).map(|i| 1_000 + i * 10).collect();
+		let dod = encode_delta_of_delta(&values, TimeUnit::Millis);
+		assert!(dod.bitpack_estimated_bytes() <= dod.gorilla_estimated_bytes());
+		assert_eq!(dod.best_estimated_bytes(), dod.bitpack_estimated_bytes(), "the gorilla estimate is advisory and does not change the realized selector");
 	}
 
 	#[test]
