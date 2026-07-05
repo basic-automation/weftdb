@@ -166,6 +166,14 @@ pub struct ReconcileParams {
 	/// meaningful on the per-aspect endpoint.
 	#[serde(default)]
 	pub overlaps: bool,
+	/// Split-not-rewrite floor in **bytes** for the overlap merge (roadmap Phase 4.6),
+	/// paired with `overlaps=true`. When present, an overlap component whose cold prefix
+	/// clears this many bytes *and* outweighs its hot suffix is **split** — the cold
+	/// prefix carved into its own segment and only the hot suffix merged — instead of
+	/// fully rewritten, so later late arrivals never rewrite the cold prefix again. When
+	/// absent, the merge uses `SplitPolicy::questdb_default()` (a 50 MiB floor), under
+	/// which small components always full-rewrite. Ignored unless `overlaps` is set.
+	pub split_min_bytes: Option<u64>,
 }
 
 /// Response body for `POST /api/v1/storage/{aspect}/reconcile` — the outcome of an
@@ -219,7 +227,7 @@ pub async fn reconcile_aspect(State(state): State<AppState>, Path(aspect): Path<
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	let metrics = state.metrics().clone();
 	drop(state);
-	let result = reconcile_aspect_inner(&store, &aspect, params.threshold, params.hot_cold, params.overlaps, &metrics).await;
+	let result = reconcile_aspect_inner(&store, &aspect, params.threshold, params.hot_cold, params.overlaps, params.split_min_bytes, &metrics).await;
 	drop(store);
 	result
 }
@@ -227,7 +235,7 @@ pub async fn reconcile_aspect(State(state): State<AppState>, Path(aspect): Path<
 /// The body of [`reconcile_aspect`], split out so the significant-`Drop`
 /// [`SegmentStore`](database::SegmentStore) handle is dropped in the caller after
 /// the last use rather than held across the response construction.
-async fn reconcile_aspect_inner(store: &database::SegmentStore, aspect: &str, threshold: Option<usize>, hot_cold: bool, overlaps: bool, metrics: &crate::metrics::SharedMetrics) -> Result<Response, StorageError> {
+async fn reconcile_aspect_inner(store: &database::SegmentStore, aspect: &str, threshold: Option<usize>, hot_cold: bool, overlaps: bool, split_min_bytes: Option<u64>, metrics: &crate::metrics::SharedMetrics) -> Result<Response, StorageError> {
 	// Undeclared aspect → 404 (mirrors the read surface's not-found semantics).
 	if store.schema_for(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?.is_none() {
 		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
@@ -240,7 +248,12 @@ async fn reconcile_aspect_inner(store: &database::SegmentStore, aspect: &str, th
 	// - threshold: all-or-nothing — `Some(threshold)` gates the whole pass, `None` runs
 	//   it unconditionally; a gated call that holds is `false` (not a counted pass).
 	let (mode, triggered, reconciled, cold_reconciled, hot_reconciled) = if overlaps {
-		let removed = store.reconcile_overlaps(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?;
+		// `split_min_bytes` selects the split-not-rewrite floor; absent → the default
+		// 50 MiB QuestDB floor (small components always full-rewrite).
+		let removed = match split_min_bytes {
+			Some(min) => store.reconcile_overlaps_with_policy(aspect, dsp_physical_type::SplitPolicy::new(min)).await.map_err(|err| StorageError::Internal(err.to_string()))?,
+			None => store.reconcile_overlaps(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?,
+		};
 		("overlaps", true, removed, 0, 0)
 	} else if hot_cold {
 		let outcome = store.reconcile_aspect_hot_cold(aspect, threshold.unwrap_or(1)).await.map_err(|err| StorageError::Internal(err.to_string()))?;
@@ -1113,6 +1126,32 @@ mod tests {
 		assert_eq!(json["reconciled"], 1, "one segment merged away");
 		assert_eq!(json["overlapping_segments"], 0, "no cross-segment overlap remains");
 		assert_eq!(segments_after, 1, "the overlapping pair collapsed to one segment");
+	}
+
+	#[tokio::test]
+	async fn reconcile_aspect_endpoint_split_min_bytes_carves_the_cold_prefix() {
+		let dir = TempDir::new().unwrap();
+		let sc = dsp_physical_type::AspectSchema::new(dsp_physical_type::PhysicalType::F64, "0".parse().unwrap(), dsp_physical_type::TimeUnit::Seconds);
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+		store.declare("a", &sc).await.expect("declares a");
+		// A long cold base [0..100] plus a small late tail [90,100,110] that re-enters it.
+		let base_ts: Vec<i64> = (0..=10).map(|i| i * 10).collect();
+		let base_vs: Vec<bigdecimal::BigDecimal> = (0..=10).map(|i| i.to_string().parse().unwrap()).collect();
+		store.seal("a", &sc, &base_ts, &base_vs).await.expect("base");
+		store.seal("a", &sc, &[90_i64, 100, 110], &["900".parse().unwrap(), "1000".parse().unwrap(), "1100".parse().unwrap()]).await.expect("late");
+
+		let router = app_with_state(AppState::new().with_store(store.clone()));
+		// A tiny split floor forces the dominant cold prefix to split off.
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/a/reconcile?overlaps=true&split_min_bytes=1").body(Body::empty()).unwrap()).await.unwrap();
+		let status = response.status();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		let segments_after = store.segment_count("a").await.unwrap();
+		drop(store);
+		assert_eq!(status, StatusCode::OK, "body: {json}");
+		assert_eq!(json["mode"], "overlaps");
+		assert_eq!(json["overlapping_segments"], 0, "the two halves are disjoint");
+		assert_eq!(segments_after, 2, "cold prefix split off from the hot suffix (vs 1 under the default floor)");
 	}
 
 	#[tokio::test]
