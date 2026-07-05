@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use bigdecimal::BigDecimal;
-use dsp_physical_type::{merge_newer_wins, AspectSchema, PagedSegment, Segment, SegmentDescriptor, PAGED_SEGMENT_FORMAT_VERSION};
+use dsp_physical_type::{merge_newer_wins, split_index, AspectSchema, PagedSegment, Segment, SegmentDescriptor, PAGED_SEGMENT_FORMAT_VERSION};
 
 use crate::{AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, SegmentIndexStore};
 
@@ -468,6 +468,103 @@ impl SegmentStore {
 		// double-count — recompute the rollup from the durable index instead.
 		self.rebuild_aspect_metadata(aspect).await?;
 		Ok(true)
+	}
+
+	/// Re-seal a nullable `(timestamps, values)` batch into the `.dspseg` file for
+	/// `aspect`/`id`, in the frame kind selected by `rows_per_page` (`Some` → paged,
+	/// `None` → single-block), recording the new descriptor in the control-plane index.
+	///
+	/// The write-half shared by the split path: [`reconcile_segment`] inlines the same
+	/// logic against a single id, this one targets an arbitrary id so a split can write
+	/// its prefix and suffix through one code path. It does **not** touch the
+	/// materialized rollup — a caller that changes the segment set rebuilds it once at
+	/// the end.
+	async fn reseal_nullable_at(&self, aspect: &str, schema: &AspectSchema, id: u64, timestamps: &[i64], values: &[Option<BigDecimal>], rows_per_page: Option<usize>) -> Result<SegmentDescriptor> {
+		let path = self.segment_path(aspect, id);
+		let descriptor = if let Some(rows_per_page) = rows_per_page {
+			let segment = schema.seal_paged_nullable(timestamps, values, rows_per_page).map_err(|e| anyhow::anyhow!("split re-seal failed: {e}"))?;
+			let new_bytes = segment.write_to();
+			tokio::fs::write(&path, &new_bytes).await.with_context(|| format!("writing split segment {}", path.display()))?;
+			SegmentDescriptor::of_paged_segment(id, path.to_string_lossy().into_owned(), new_bytes.len() as u64, &segment)
+		} else {
+			let segment = schema.seal_nullable(timestamps, values).map_err(|e| anyhow::anyhow!("split re-seal failed: {e}"))?;
+			let new_bytes = segment.write_to();
+			tokio::fs::write(&path, &new_bytes).await.with_context(|| format!("writing split segment {}", path.display()))?;
+			SegmentDescriptor::of_segment(id, path.to_string_lossy().into_owned(), new_bytes.len() as u64, &segment)
+		};
+		self.index.insert(aspect, &descriptor).await?;
+		Ok(descriptor)
+	}
+
+	/// **Split a sorted segment at a timestamp boundary** (roadmap Phase 4.6 — the
+	/// physical mechanism of the split-not-rewrite reconciliation path).
+	///
+	/// Partitions segment `id` of `aspect` at `boundary` into a **prefix** (rows with
+	/// timestamp strictly `< boundary`, kept at the original `id`) and a **suffix**
+	/// (rows at or after `boundary`, moved to a freshly-allocated segment id), following
+	/// the [`split_index`](dsp_physical_type::split_index) partition point. Because the
+	/// input is time-sorted, the prefix's every timestamp is `< boundary ≤` the suffix's
+	/// every timestamp, so the two results are internally sorted **and disjoint in time**
+	/// — the split adds no cross-segment overlap, and a point/range read still opens
+	/// exactly one of them for any instant. Both keep the input's frame kind (a paged
+	/// segment splits into two paged segments at its own page height).
+	///
+	/// This is the primitive `QuestDB`'s partition split is built on: once a large cold
+	/// prefix is carved into its own segment, later late-data merges touch only the hot
+	/// suffix and never rewrite the cold prefix again, bounding write amplification over
+	/// the segment's lifetime. Wiring [`SplitPolicy::decide`](dsp_physical_type::SplitPolicy)
+	/// into [`reconcile_overlaps`](SegmentStore::reconcile_overlaps) to *choose* a split
+	/// over a full rewrite is the next slice; this slice ships the mechanism it calls.
+	///
+	/// The suffix segment is written **before** the prefix is rewritten, so a crash
+	/// mid-split can at worst leave the suffix rows duplicated in the not-yet-shrunk
+	/// prefix (a cross-segment overlap [`reconcile_overlaps`] repairs), never lost.
+	///
+	/// Returns `Some(suffix_id)` — the new segment's id — when a split happened, or
+	/// `None` when the split was degenerate (`boundary` falls before the first or after
+	/// the last row, so every row lands on one side and there is nothing to carve). A
+	/// degenerate split writes nothing.
+	///
+	/// # Errors
+	///
+	/// Returns an error if `aspect` has no declared schema or no segment `id`, if `id`
+	/// is **not time-sorted** (split requires a sorted segment — reconcile it first, so
+	/// the [`split_index`] precondition holds), or propagates a filesystem/decode/re-seal/
+	/// libSQL failure.
+	pub async fn split_segment(&self, aspect: &str, id: u64, boundary: i64) -> Result<Option<u64>> {
+		let descriptor = self.index.all(aspect).await?.into_iter().find(|d| d.id == id).ok_or_else(|| anyhow::anyhow!("aspect {aspect:?} has no segment {id}"))?;
+		if !descriptor.time_sorted {
+			return Err(anyhow::anyhow!("segment {id} of aspect {aspect:?} is out of order; reconcile it before splitting"));
+		}
+		let schema = self.require_schema(aspect).await?;
+		// Read once, capturing the paged page height so each half re-seals in kind.
+		let bytes = tokio::fs::read(&descriptor.path).await.with_context(|| format!("reading segment {}", descriptor.path))?;
+		let (rows_per_page, timestamps, values) = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION {
+			let segment = PagedSegment::read_from(&bytes).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?;
+			let rows_per_page = segment.rows_per_page;
+			let (ts, vs) = segment.decode_nullable();
+			(Some(rows_per_page), ts, vs)
+		} else {
+			let segment = Segment::read_from(&bytes).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?;
+			let (ts, vs) = segment.decode_nullable();
+			(None, ts, vs)
+		};
+		let k = split_index(&timestamps, boundary);
+		if k == 0 || k == timestamps.len() {
+			// Every row is on one side — nothing to carve.
+			return Ok(None);
+		}
+		let (prefix_ts, suffix_ts) = timestamps.split_at(k);
+		let (prefix_vs, suffix_vs) = values.split_at(k);
+		// Suffix first (new id), then rewrite the prefix in place: a crash between the
+		// two duplicates rows rather than dropping them.
+		let suffix_id = self.index.next_id(aspect).await?;
+		self.reseal_nullable_at(aspect, &schema, suffix_id, suffix_ts, suffix_vs, rows_per_page).await?;
+		self.reseal_nullable_at(aspect, &schema, id, prefix_ts, prefix_vs, rows_per_page).await?;
+		// A split turns one segment into two; the O(1) rollup fold would miscount, so
+		// rebuild it from the durable index.
+		self.rebuild_aspect_metadata(aspect).await?;
+		Ok(Some(suffix_id))
 	}
 
 	/// **Reconcile every out-of-order segment** of `aspect` (roadmap Phase 4.6),
@@ -1359,6 +1456,95 @@ mod tests {
 		assert_eq!(vs, vec![Some(bd("1")), Some(bd("2")), Some(bd("3")), Some(bd("4"))]);
 		assert_eq!(still, Some(bd("2")));
 		assert!(!again, "a sorted segment reconciles to a no-op");
+	}
+
+	#[tokio::test]
+	async fn split_segment_carves_a_prefix_and_suffix() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		// One sorted single-block segment over [10,50].
+		let d = store.seal("a", &schema(), &[10_i64, 20, 30, 40, 50], &[bd("1"), bd("2"), bd("3"), bd("4"), bd("5")]).await.expect("seals");
+		// Split at 35: prefix [10,20,30] stays at d.id, suffix [40,50] to a new id.
+		let suffix_id = store.split_segment("a", d.id, 35).await.expect("splits").expect("a real split");
+		let stats = store.aspect_stats("a").await.expect("stats");
+		// Every row survives, in order, split across the two disjoint segments.
+		let (ts, vs) = store.read_time_range("a", 0, 1000).await.expect("reads");
+		let prefix_hit = store.read_point("a", 20).await.expect("reads");
+		let suffix_hit = store.read_point("a", 40).await.expect("reads");
+		drop(store);
+		assert_ne!(suffix_id, d.id, "the suffix takes a fresh id");
+		assert_eq!(stats.segment_count, 2, "a split turns one segment into two");
+		assert_eq!(stats.unsorted_segments, 0, "both halves are internally sorted");
+		assert_eq!(stats.overlapping_segments, 0, "prefix < boundary <= suffix — disjoint in time");
+		assert_eq!(stats.total_rows, 5, "no row is lost or duplicated");
+		assert_eq!(ts, vec![10, 20, 30, 40, 50]);
+		assert_eq!(vs, vec![Some(bd("1")), Some(bd("2")), Some(bd("3")), Some(bd("4")), Some(bd("5"))]);
+		assert_eq!(prefix_hit, Some(bd("2")));
+		assert_eq!(suffix_hit, Some(bd("4")));
+	}
+
+	#[tokio::test]
+	async fn split_segment_is_a_noop_at_the_edges() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		let d = store.seal("a", &schema(), &[10_i64, 20, 30], &[bd("1"), bd("2"), bd("3")]).await.expect("seals");
+		// Boundary before the first row and after the last row both leave every row on
+		// one side — nothing to carve.
+		let before = store.split_segment("a", d.id, 5).await.expect("splits");
+		let after = store.split_segment("a", d.id, 100).await.expect("splits");
+		// A boundary equal to the first timestamp is at-or-after it → whole segment is the
+		// suffix → still degenerate.
+		let at_first = store.split_segment("a", d.id, 10).await.expect("splits");
+		let count = store.segment_count("a").await.expect("counts");
+		drop(store);
+		assert_eq!(before, None);
+		assert_eq!(after, None);
+		assert_eq!(at_first, None);
+		assert_eq!(count, 1, "a degenerate split writes no new segment");
+	}
+
+	#[tokio::test]
+	async fn split_segment_rejects_an_out_of_order_segment() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		// An out-of-order segment violates split_index's sorted precondition.
+		let d = store.seal("a", &schema(), &[30_i64, 10, 20], &[bd("3"), bd("1"), bd("2")]).await.expect("seals ooo");
+		let err = store.split_segment("a", d.id, 15).await.expect_err("out-of-order split is rejected");
+		let count = store.segment_count("a").await.expect("counts");
+		drop(store);
+		assert!(err.to_string().contains("out of order"), "the error names the cause: {err}");
+		assert_eq!(count, 1, "a rejected split leaves the store untouched");
+	}
+
+	#[tokio::test]
+	async fn split_segment_preserves_a_paged_nullable_frame() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		// A paged, nullable, sorted segment over [0,70] at page height 3 (a null at 30).
+		let ts: Vec<i64> = (0..8).map(|i| i * 10).collect();
+		let vs: Vec<Option<BigDecimal>> = (0..8).map(|i| if i == 3 { None } else { Some(BigDecimal::from(i)) }).collect();
+		let d = store.seal_paged_nullable("a", &schema(), &ts, &vs, 3).await.expect("seals paged nullable");
+		let suffix_id = store.split_segment("a", d.id, 35).await.expect("splits").expect("a real split");
+		let stats = store.aspect_stats("a").await.expect("stats");
+		let (rts, rvs) = store.read_time_range("a", 0, 1000).await.expect("reads");
+		let null_hit = store.read_point("a", 30).await.expect("reads");
+		let suffix_hit = store.read_point("a", 40).await.expect("reads");
+		// Both halves keep the paged frame version (they re-seal at the source page height).
+		let prefix_bytes = std::fs::read(dir.path().join("segments").join(format!("a-{}.dspseg", d.id))).expect("prefix file");
+		let suffix_bytes = std::fs::read(dir.path().join("segments").join(format!("a-{suffix_id}.dspseg"))).expect("suffix file");
+		drop(store);
+		assert_eq!(stats.segment_count, 2);
+		assert_eq!(stats.total_rows, 8, "the null row is preserved across the split");
+		assert_eq!(rts, ts);
+		assert_eq!(rvs, vs);
+		assert_eq!(null_hit, None, "the null at 30 stays null (present-bit cleared)");
+		assert_eq!(suffix_hit, Some(bd("4")));
+		assert!(PagedSegment::read_from(&prefix_bytes).is_ok(), "prefix keeps the paged frame");
+		assert!(PagedSegment::read_from(&suffix_bytes).is_ok(), "suffix keeps the paged frame");
 	}
 
 	#[tokio::test]
