@@ -334,17 +334,22 @@ pub async fn reconcile_store(State(state): State<AppState>, Query(params): Query
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	let metrics = state.metrics().clone();
 	drop(state);
-	let result = reconcile_store_inner(&store, params.threshold, params.hot_cold, params.overlaps, &metrics).await;
+	let result = reconcile_store_inner(&store, params.threshold, params.hot_cold, params.overlaps, params.split_min_bytes, &metrics).await;
 	drop(store);
 	result
 }
 
 /// The body of [`reconcile_store`], split out so the significant-`Drop`
 /// [`SegmentStore`](database::SegmentStore) handle is dropped in the caller.
-async fn reconcile_store_inner(store: &database::SegmentStore, threshold: Option<usize>, hot_cold: bool, overlaps: bool, metrics: &crate::metrics::SharedMetrics) -> Result<Response, StorageError> {
+async fn reconcile_store_inner(store: &database::SegmentStore, threshold: Option<usize>, hot_cold: bool, overlaps: bool, split_min_bytes: Option<u64>, metrics: &crate::metrics::SharedMetrics) -> Result<Response, StorageError> {
 	let threshold = threshold.unwrap_or(1).max(1);
 	let (mode, aspects_scanned, aspects_reconciled, segments_reconciled, cold_reconciled, hot_reconciled) = if overlaps {
-		let sweep = store.reconcile_all_overlaps().await.map_err(|err| StorageError::Internal(err.to_string()))?;
+		// `split_min_bytes` selects the store-wide split-not-rewrite floor; absent → the
+		// default 50 MiB floor (every aspect's small components full-rewrite).
+		let sweep = match split_min_bytes {
+			Some(min) => store.reconcile_all_overlaps_with_policy(dsp_physical_type::SplitPolicy::new(min)).await.map_err(|err| StorageError::Internal(err.to_string()))?,
+			None => store.reconcile_all_overlaps().await.map_err(|err| StorageError::Internal(err.to_string()))?,
+		};
 		if sweep.aspects_reconciled > 0 {
 			metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_removed).unwrap_or(u64::MAX));
 		}
@@ -1042,6 +1047,31 @@ mod tests {
 		assert_eq!(json["aspects_reconciled"], 1, "only a had an overlap to merge");
 		assert_eq!(json["segments_reconciled"], 1, "one segment merged away");
 		assert_eq!(json["overlapping_segments"], 0, "no cross-segment overlap remains store-wide");
+	}
+
+	#[tokio::test]
+	async fn reconcile_store_endpoint_split_min_bytes_carves_cold_prefixes() {
+		let dir = TempDir::new().unwrap();
+		let sc = dsp_physical_type::AspectSchema::new(dsp_physical_type::PhysicalType::F64, "0".parse().unwrap(), dsp_physical_type::TimeUnit::Seconds);
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+		store.declare("a", &sc).await.expect("declares a");
+		// A dominant cold base + a small late tail that re-enters it.
+		let base_ts: Vec<i64> = (0..=10).map(|i| i * 10).collect();
+		let base_vs: Vec<bigdecimal::BigDecimal> = (0..=10).map(|i| i.to_string().parse().unwrap()).collect();
+		store.seal("a", &sc, &base_ts, &base_vs).await.expect("base");
+		store.seal("a", &sc, &[90_i64, 100, 110], &["900".parse().unwrap(), "1000".parse().unwrap(), "1100".parse().unwrap()]).await.expect("late");
+
+		let router = app_with_state(AppState::new().with_store(store.clone()));
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/reconcile?overlaps=true&split_min_bytes=1").body(Body::empty()).unwrap()).await.unwrap();
+		let status = response.status();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		let segments_after = store.segment_count("a").await.unwrap();
+		drop(store);
+		assert_eq!(status, StatusCode::OK, "body: {json}");
+		assert_eq!(json["aspects_reconciled"], 1, "a carried overlap and was split");
+		assert_eq!(json["overlapping_segments"], 0);
+		assert_eq!(segments_after, 2, "the store-wide split carved the cold prefix off (vs 1 under the default floor)");
 	}
 
 	#[tokio::test]

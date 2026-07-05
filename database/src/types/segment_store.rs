@@ -934,6 +934,39 @@ impl SegmentStore {
 		Ok(sweep)
 	}
 
+	/// **Store-wide overlap merge with an explicit split policy** (roadmap Phase 4.6 —
+	/// the split-not-rewrite path). As [`reconcile_all_overlaps`](SegmentStore::reconcile_all_overlaps),
+	/// but every aspect's merge runs under `policy` via
+	/// [`reconcile_overlaps_with_policy`](SegmentStore::reconcile_overlaps_with_policy),
+	/// so a dominant cold prefix is split off rather than fully rewritten.
+	///
+	/// An aspect is counted as reconciled when it **carried cross-segment overlap**
+	/// before the pass (its [`overlapping_segments`](AspectStorageStats::overlapping_segments)
+	/// was non-zero — exactly the aspects the merge acts on), rather than by the net
+	/// removed count: a two-member split changes the layout while leaving the segment
+	/// count unchanged, so a `removed > 0` test would miss it. `segments_removed` remains
+	/// the honest **net** reduction (zero for a pure split). For the full-rewrite path
+	/// (the default 50 MiB floor) this counts identically to
+	/// [`reconcile_all_overlaps`](SegmentStore::reconcile_all_overlaps), since there
+	/// overlap-present ⟺ a segment is removed.
+	///
+	/// # Errors
+	///
+	/// As [`reconcile_all_overlaps`](SegmentStore::reconcile_all_overlaps).
+	pub async fn reconcile_all_overlaps_with_policy(&self, policy: SplitPolicy) -> Result<OverlapSweep> {
+		let aspects = self.list_declared_aspects().await?;
+		let mut sweep = OverlapSweep { aspects_scanned: aspects.len(), ..OverlapSweep::default() };
+		for aspect in &aspects {
+			let had_overlap = self.index.load_index(aspect).await?.overlapping_count() > 0;
+			let removed = self.reconcile_overlaps_with_policy(aspect, policy).await?;
+			if had_overlap {
+				sweep.aspects_reconciled += 1;
+				sweep.segments_removed += removed;
+			}
+		}
+		Ok(sweep)
+	}
+
 	/// Read every present row of `aspect` whose **value** falls in the inclusive range
 	/// `[lo, hi]`, **opening only the segment files whose value span overlaps it**.
 	///
@@ -1969,6 +2002,32 @@ mod tests {
 		assert_eq!(sweep.segments_removed, 1);
 		assert_eq!(a_after, 0);
 		assert_eq!(b_after, 0, "b never overlapped");
+	}
+
+	#[tokio::test]
+	async fn reconcile_all_overlaps_with_policy_splits_and_counts_by_overlap() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares a");
+		store.declare("b", &schema()).await.expect("declares b");
+		// a: a dominant cold prefix + late tail (splits under a tiny floor, net removed 0).
+		let base_ts: Vec<i64> = (0..=10).map(|i| i * 10).collect();
+		let base_vs: Vec<BigDecimal> = (0..=10).map(BigDecimal::from).collect();
+		store.seal("a", &schema(), &base_ts, &base_vs).await.expect("a base");
+		store.seal("a", &schema(), &[90_i64, 100, 110], &[bd("900"), bd("1000"), bd("1100")]).await.expect("a late");
+		// b: no overlap.
+		store.seal("b", &schema(), &[0_i64, 10], &[bd("7"), bd("8")]).await.expect("b lo");
+		store.seal("b", &schema(), &[100_i64, 110], &[bd("1"), bd("2")]).await.expect("b hi");
+		let sweep = store.reconcile_all_overlaps_with_policy(SplitPolicy::new(1)).await.expect("sweeps");
+		let a_stats = store.aspect_stats("a").await.expect("stats a");
+		drop(store);
+		// a is counted as reconciled even though its split left the segment count
+		// unchanged (net removed 0) — counting keys on the pre-pass overlap.
+		assert_eq!(sweep.aspects_scanned, 2);
+		assert_eq!(sweep.aspects_reconciled, 1, "only a carried overlap");
+		assert_eq!(sweep.segments_removed, 0, "a two-member split removes no segment net");
+		assert_eq!(a_stats.segment_count, 2, "a split into cold prefix + hot suffix");
+		assert_eq!(a_stats.overlapping_segments, 0);
 	}
 
 	#[tokio::test]
