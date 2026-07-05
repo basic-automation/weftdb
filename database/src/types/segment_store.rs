@@ -967,6 +967,83 @@ impl SegmentStore {
 		Ok(sweep)
 	}
 
+	/// **Squash all of an aspect's segments into one** (roadmap Phase 4.6 — the squash
+	/// half of the split-not-rewrite path).
+	///
+	/// Repeated late arrivals under the split path accumulate small time-disjoint
+	/// segments (a growing pile of carved-off cold prefixes). Left unchecked that
+	/// fragments an aspect and multiplies the per-segment read/prune overhead. Squash is
+	/// the QuestDB-style bound on that fragmentation: it folds **every** segment of
+	/// `aspect` — in ascending seal id, [`merge_newer_wins`] so any residual shared
+	/// timestamp still resolves last-writer-wins — into a single time-sorted single-block
+	/// segment at the lowest id, dropping the rest. After it, the aspect is one segment
+	/// with no cross-segment overlap. The natural trigger is a segment count past a
+	/// threshold (see [`squash_aspect_if_exceeds`](SegmentStore::squash_aspect_if_exceeds));
+	/// squashing trades the split path's low write amplification for a low segment count,
+	/// so it is meant to fire rarely, not every commit.
+	///
+	/// Returns the number of segments removed (`count − 1`); zero when the aspect has
+	/// fewer than two segments (nothing to squash).
+	///
+	/// # Errors
+	///
+	/// Returns an error if `aspect` has no declared schema; propagates a filesystem
+	/// read/write error, a decode/re-seal failure, or a libSQL failure.
+	pub async fn squash_aspect(&self, aspect: &str) -> Result<usize> {
+		let descriptors = self.index.all(aspect).await?;
+		if descriptors.len() < 2 {
+			return Ok(0);
+		}
+		let schema = self.require_schema(aspect).await?;
+		let mut ids: Vec<u64> = descriptors.iter().map(|d| d.id).collect();
+		ids.sort_unstable();
+		// Fold oldest → newest so the most-recently-sealed value wins any residual tie.
+		let mut merged: Vec<(i64, Option<BigDecimal>)> = Vec::new();
+		for &id in &ids {
+			let descriptor = descriptors.iter().find(|d| d.id == id).ok_or_else(|| anyhow::anyhow!("aspect {aspect:?} lost segment {id} mid-squash"))?;
+			let (ts, vs) = self.decode_all(descriptor).await?;
+			let mut rows: Vec<(i64, Option<BigDecimal>)> = ts.into_iter().zip(vs).collect();
+			rows.sort_by_key(|(t, _)| *t);
+			merged = merge_newer_wins(&merged, &rows);
+		}
+		let (all_ts, all_vs): (Vec<i64>, Vec<Option<BigDecimal>>) = merged.into_iter().unzip();
+		let target = ids[0];
+		self.reseal_nullable_at(aspect, &schema, target, &all_ts, &all_vs, None).await?;
+		for &id in ids.iter().skip(1) {
+			self.index.delete(aspect, id).await?;
+			let victim = self.segment_path(aspect, id);
+			tokio::fs::remove_file(&victim).await.with_context(|| format!("removing squashed-away segment {}", victim.display()))?;
+		}
+		self.rebuild_aspect_metadata(aspect).await?;
+		Ok(ids.len() - 1)
+	}
+
+	/// **Threshold-triggered squash** (roadmap Phase 4.6): run
+	/// [`squash_aspect`](SegmentStore::squash_aspect) **only** when `aspect` has more than
+	/// `max_segments` segments, otherwise leave it untouched.
+	///
+	/// The trigger a background compaction pass keys on to cap split-path fragmentation,
+	/// modeled on `QuestDB`'s `cairo.o3.last.partition.max.splits` squash threshold: below
+	/// the cap the fragmentation is cheap enough to tolerate, so the squash's write cost
+	/// is not yet worth paying; above it the read/prune overhead of many segments
+	/// dominates and a squash fires. A `max_segments` of 0 clamps to 1 (an aspect can
+	/// never squash below a single segment).
+	///
+	/// Returns `Some(removed)` when the squash fired (the count was `> max_segments`) and
+	/// `None` when it held. The count is read from the durable index, so a caller can
+	/// poll cheaply and pay the rewrite only when it fires.
+	///
+	/// # Errors
+	///
+	/// As [`squash_aspect`](SegmentStore::squash_aspect); also propagates the segment-count read.
+	pub async fn squash_aspect_if_exceeds(&self, aspect: &str, max_segments: usize) -> Result<Option<usize>> {
+		let max_segments = max_segments.max(1);
+		if self.index.count(aspect).await? <= max_segments {
+			return Ok(None);
+		}
+		Ok(Some(self.squash_aspect(aspect).await?))
+	}
+
 	/// Read every present row of `aspect` whose **value** falls in the inclusive range
 	/// `[lo, hi]`, **opening only the segment files whose value span overlaps it**.
 	///
@@ -2028,6 +2105,60 @@ mod tests {
 		assert_eq!(sweep.segments_removed, 0, "a two-member split removes no segment net");
 		assert_eq!(a_stats.segment_count, 2, "a split into cold prefix + hot suffix");
 		assert_eq!(a_stats.overlapping_segments, 0);
+	}
+
+	#[tokio::test]
+	async fn squash_folds_disjoint_segments_into_one() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		// Four time-disjoint segments (as repeated split carve-offs would leave).
+		store.seal("a", &schema(), &[0_i64, 10], &[bd("0"), bd("1")]).await.expect("s0");
+		store.seal("a", &schema(), &[20_i64, 30], &[bd("2"), bd("3")]).await.expect("s1");
+		store.seal("a", &schema(), &[40_i64, 50], &[bd("4"), bd("5")]).await.expect("s2");
+		store.seal("a", &schema(), &[60_i64, 70], &[bd("6"), bd("7")]).await.expect("s3");
+		let removed = store.squash_aspect("a").await.expect("squashes");
+		let stats = store.aspect_stats("a").await.expect("stats");
+		let (ts, vs) = store.read_time_range("a", 0, 1000).await.expect("reads");
+		let hit = store.read_point("a", 50).await.expect("reads");
+		drop(store);
+		assert_eq!(removed, 3, "four segments squashed to one");
+		assert_eq!(stats.segment_count, 1);
+		assert_eq!(stats.unsorted_segments, 0);
+		assert_eq!(stats.overlapping_segments, 0);
+		assert_eq!(ts, vec![0, 10, 20, 30, 40, 50, 60, 70], "every row preserved in order");
+		assert_eq!(vs.len(), 8);
+		assert_eq!(hit, Some(bd("5")));
+	}
+
+	#[tokio::test]
+	async fn squash_is_a_noop_below_two_segments() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		store.seal("a", &schema(), &[0_i64, 10], &[bd("0"), bd("1")]).await.expect("s0");
+		let removed = store.squash_aspect("a").await.expect("no-op");
+		drop(store);
+		assert_eq!(removed, 0, "a single segment has nothing to squash");
+	}
+
+	#[tokio::test]
+	async fn squash_if_exceeds_gates_on_the_segment_count() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		store.seal("a", &schema(), &[0_i64, 10], &[bd("0"), bd("1")]).await.expect("s0");
+		store.seal("a", &schema(), &[20_i64, 30], &[bd("2"), bd("3")]).await.expect("s1");
+		store.seal("a", &schema(), &[40_i64, 50], &[bd("4"), bd("5")]).await.expect("s2");
+		// Three segments, cap 3 → holds (count is not > 3).
+		let held = store.squash_aspect_if_exceeds("a", 3).await.expect("gate");
+		// Cap 2 → fires (3 > 2), squashing to one.
+		let fired = store.squash_aspect_if_exceeds("a", 2).await.expect("gate");
+		let count = store.segment_count("a").await.expect("count");
+		drop(store);
+		assert_eq!(held, None, "at or below the cap the squash holds");
+		assert_eq!(fired, Some(2), "above the cap it squashes 3 → 1 (2 removed)");
+		assert_eq!(count, 1);
 	}
 
 	#[tokio::test]
