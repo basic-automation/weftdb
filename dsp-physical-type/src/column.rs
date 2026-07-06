@@ -75,6 +75,39 @@ impl ColumnEncoding {
 		)
 	}
 
+	/// The **realized** on-disk payload size in bytes — the exact number of bytes the
+	/// `.dspseg` value block writes for these values (the codec each variant uses in
+	/// `dspseg::write_physical_value`), excluding the column header.
+	///
+	/// This differs from [`estimated_bytes`](Self::estimated_bytes), which reports the
+	/// naive fixed-width figure (`len * width`). For a `ScaledI64` column the mantissas
+	/// are written as zig-zag varints, so small-magnitude values cost one byte rather
+	/// than eight — [`estimated_bytes`](Self::estimated_bytes) over-reports the stored
+	/// size (it *undersells* DSP's realized bytes/point). This method is the accurate
+	/// figure, matching what a sealed segment actually occupies:
+	///
+	/// - `F64` → 8, `F32` → 4, `ScaledI128` → 16 (fixed width, so it agrees with the
+	///   naive estimate);
+    /// - `ScaledI64` → the zig-zag-varint width of each mantissa (1..=10 bytes);
+	/// - `Decimal128` → 16 for the significand + the zig-zag-varint width of the
+	///   per-value scale;
+	/// - `BigDecimalText` → the UTF-8 length plus its unsigned-varint length prefix.
+	#[must_use]
+	pub fn serialized_bytes(&self) -> usize {
+		use crate::timestamp::{uvarint_len, zigzag_varint_len};
+		self.values
+			.iter()
+			.map(|v| match v {
+				PhysicalValue::F64(_) => 8,
+				PhysicalValue::F32(_) => 4,
+				PhysicalValue::ScaledI64 { mantissa, .. } => zigzag_varint_len(*mantissa),
+				PhysicalValue::ScaledI128 { .. } => 16,
+				PhysicalValue::Decimal128 { scale, .. } => 16 + zigzag_varint_len(*scale),
+				PhysicalValue::BigDecimalText(s) => uvarint_len(s.len() as u64) + s.len(),
+			})
+			.sum()
+	}
+
 	/// Reconstruct the logical `BigDecimal` column.
 	#[must_use]
 	pub fn decode(&self) -> Vec<BigDecimal> {
