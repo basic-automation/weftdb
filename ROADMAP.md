@@ -193,7 +193,7 @@ marking nuance — backlog item B-tags)*.
 - [x] CSV interchange — stored-range export/ingest + compute-endpoint CSV output
 - [x] Columnar output for compute endpoints — Arrow IPC + Parquet for `interpolate`/`downsample` (+ every ILP sibling); `dsp-arrow` reconstructed-series + reduction-table interchange
 - [x] Prometheus latency histograms — compute endpoints, ILP compute path, and the storage-ingest seal path
-- [ ] OpenTelemetry trace export (paired with Prometheus `/metrics`)
+- [x] OpenTelemetry trace export (paired with Prometheus `/metrics`) — env-gated OTLP/gRPC exporter beside the `fmt` subscriber (delivery to a live collector = a runtime follow-up)
 - [x] B-rest residue — `interpolation` query-param alias for `spline` on the ILP compute endpoints (`spline` wins when both given)
 - [x] B-rest residue — cursor paging (stable forward-iteration token) on `…/points` / `…/value-points`: an opaque `next_cursor` (hex position token over the deterministic read order) + `?cursor=` (supersedes `offset`/`page`, malformed → 400); a client follows `next_cursor` until absent
 - [ ] Python SDK → Rust SDK → Arrow Flight / Flight SQL → SQL surface / DataFusion (later)
@@ -211,8 +211,22 @@ transfer, 8% kernel, 7% JSON").
 - [x] `/debug/profile/current` — live p50/p95/p99 latency snapshot
 - [x] Tracing foundation — a `RUST_LOG`-driven `fmt` subscriber (span-CLOSE events, busy/idle timing) with per-request engine spans on the flagship compute path: `interpolate.engine` (input/output points, spline, resolution) and `downsample.reduce` (candidate/in-window points, buckets, resolution)
 - [x] Per-request **root span** + per-stage child spans (partial coverage of ingest → serialization): a `request{method,path,request_id}` span (via `axum::middleware::from_fn`, `x-request-id` in/out) that every stage span nests under — `interpolate.parse`/`interpolate.compute`/`interpolate.serialize` under `interpolate.engine`, `downsample.parse` beside `downsample.reduce`, and `storage.ingest.parse`/`storage.ingest.seal` on the write path (the seal span surfaces the nested Turso `connect_with_encryption` control-plane spans)
-- [ ] Remaining per-stage spans — auth · ILP/CSV/Arrow decode · physical-encoding conversion · timestamp normalization · WAL append · explicit libSQL write · commit · index update · range read · page skip · cache hit/miss · decompression · CPU interp · GPU upload/queue/kernel/readback
-- [ ] **OTLP trace export** (pairs with `/metrics`): attach an `opentelemetry-otlp` exporter to the **shipped** `request` root span. Dep constellation (July 2026): `opentelemetry` 0.32 + `opentelemetry_sdk` 0.32 (`rt-tokio`) + `opentelemetry-otlp` 0.32 (`grpc-tonic`) + `tracing-opentelemetry` 0.33; env-gate on `OTEL_EXPORTER_OTLP_ENDPOINT` (default `http://localhost:4317`), build an `SdkTracerProvider` (batch exporter + service-resource attrs) and add a `tracing_opentelemetry` layer beside the `fmt` subscriber. The `tower-http` `TraceLayer` is now optional — the `from_fn` request span already gives the parent + `x-request-id`. *(src: https://oneuptime.com/blog/post/2026-02-06-instrument-rust-axum-opentelemetry/view · https://github.com/damienpontifex/rust-axum-opentelemetry-otlp)*
+- [x] Per-stage spans on the **storage read path** (`storage.{range,value_range,point}.read`
+  + `.serialize`, uniform `format` dimension over JSON/CSV/Arrow/Parquet), the **ingest
+  decode paths** (`storage.ingest.parse`/`normalize`/`seal` for ILP + CSV + JSON), and
+  the **reconcile daemon** (`reconcile.tick{kind,...,aspects,segments}` on all five tick
+  kinds) — all runtime-verified against the running binary
+- [ ] Remaining per-stage spans — auth · Arrow decode on ingest · WAL append · explicit libSQL write · commit · index update · page skip · cache hit/miss · decompression · CPU interp · GPU upload/queue/kernel/readback
+- [x] **OTLP trace export** (pairs with `/metrics`): shipped — env-gated on
+  `OTEL_EXPORTER_OTLP_ENDPOINT`, an OTLP/gRPC `SdkTracerProvider` (batch exporter +
+  `dsp-server` service resource) with a `tracing_opentelemetry` layer beside the `fmt`
+  subscriber; the shipped request/stage spans export to a collector. Dep constellation
+  confirmed current on crates.io (May 2026): `opentelemetry` 0.32 + `opentelemetry_sdk`
+  0.32 (`rt-tokio`) + `opentelemetry-otlp` 0.32 (`grpc-tonic`, builds protoc-free) +
+  `tracing-opentelemetry` 0.33. A misconfigured/absent collector does not block startup.
+- [ ] **OTLP collector verification (needs runtime):** stand up an OTel Collector /
+  Jaeger / Tempo and assert a `request` trace with its nested stage spans actually
+  lands — export delivery was not exercised this run (no collector on the box).
 - [ ] `Statement::n_change()` write accounting (Turso 0.6) in ingest/instrumentation spans
 - [ ] `/bench/runs/:id` endpoint
 
@@ -339,10 +353,14 @@ transfer, kernel, readback, and API serialization, p95 = Z."*
 detection within Y% and improving historical query latency by Z."*
 
 - [ ] **6.1 Lossless typed codecs** — timestamp delta/delta-of-delta + **fixed-width
-  bit-packing** *(both shipped in 4.2, realized on disk)*; scaled-int bit packing;
-  RLE for regular intervals; Gorilla/Chimp-style f64; ALP-inspired vectorized f64;
-  Decimal128/scaled-int codecs; **block-level random access**. *(Check codec
-  patents/licenses before embedding.)*
+  bit-packing** + **RLE** + **Gorilla variable-length** *(all four realized on disk in
+  the `.dspseg` timestamp block, chosen per-stream by `best_encoding_name`)*; scaled-int
+  bit packing; Chimp-style f64; ALP-inspired vectorized f64; Decimal128/scaled-int
+  codecs; **block-level random access**. *(Check codec patents/licenses before embedding.)*
+  - [x] **Gorilla + RLE realized on disk** — the timestamp block now carries four
+    codecs (varint/bit-pack/RLE/Gorilla) chosen by the single-source-of-truth
+    `best_encoding_name`, so the reported codec always matches the bytes written; the
+    Gorilla win shows in the dsp-bench bytes/point.
   - [x] **Evaluated** a Gorilla-style variable-length second-difference estimate
     (`gorilla_dod_bits`/`gorilla_bytes`/`DeltaOfDeltaColumn::gorilla_estimated_bytes` —
     advisory only, NOT wired into the realized varint-vs-bit-pack selector). Measured
@@ -352,13 +370,29 @@ detection within Y% and improving historical query latency by Z."*
     spikes**. Gorilla's unique advantage is therefore *scattered single* jitter (RLE
     can't form runs, bit-pack pays max width for the many near-zero values). *(src:
     Gorilla, VLDB'15)*
-  - [ ] **Adopt-or-drop decision for the Gorilla codec:** benchmark gorilla vs
-    varint/RLE/bit-pack on a **scattered-single-jitter** corpus (its predicted win
-    regime); if it wins there, add a per-block on-disk codec selector option (currently
-    the `.dspseg` block picks only bit-pack-vs-varint) and fold `gorilla_estimated_bytes`
-    into `best_estimated_bytes`/`best_encoding_name`; else drop the estimate. Also
-    evaluate **dynamic (per-block adaptive) bit packing** as the simpler alternative.
-    *(src: "Dynamic Bit Packing", Sensors 2023 — https://www.mdpi.com/1424-8220/23/20/8575)*
+  - [x] **Adopt-or-drop decision for the Gorilla codec: ADOPTED.** Benchmarked gorilla
+    vs varint/RLE/bit-pack on a scattered-single-jitter corpus: gorilla is the strict
+    winner in its regime (e.g. 368 B vs the best shipped codec's 508 B, ~28% smaller,
+    on a 1000-pt base with an isolated jitter every 16th interval within its ±2048
+    bucket), with an honest loss boundary past ±2048 (falls to the 68-bit bucket).
+    Realized as a full lossless codec (`encode_gorilla_dods`/`decode_gorilla_dods`),
+    wired into the `.dspseg` block (`TS_CODEC_GORILLA`) + folded into
+    `best_estimated_bytes`/`best_encoding_name`, and surfaced in the dsp-bench
+    StorageEstimate. RLE was also realized on disk (`TS_CODEC_RLE`) in the same arc,
+    closing its estimate/disk divergence. *(src: Gorilla, VLDB'15)*
+  - [ ] Evaluate **dynamic (per-block adaptive) bit packing** as a simpler complement to
+    the fixed-width bit-pack codec. *(src: "Dynamic Bit Packing", Sensors 2023 —
+    https://www.mdpi.com/1424-8220/23/20/8575)*
+  - [ ] **Value-column realized-bytes accuracy (discovered divergence):** the `.dspseg`
+    value block writes `ScaledI64` mantissas as zig-zag varints (small values ≈1 byte),
+    but `ColumnEncoding::estimated_bytes` reports the naive `len*8` — so the bench +
+    segment stats **over-report** ScaledI64 bytes/point (underselling DSP). A realize-
+    accurate `ColumnEncoding::serialized_bytes()` + `Segment::serialized_value_bytes()`
+    + `StorageEstimate.realized_value_bytes` (v7) now expose the true figure additively.
+    **Owner decision needed:** whether to flip the headline `estimated_bytes` /
+    `value_bytes` / `total_bytes_per_point` to the realized figure — a semantic change to
+    a metric consumed in ~37 places / ~33 test assertions. Also add a scaled-int
+    **bit-pack** value codec as an on-disk alternative to the per-value varint.
   - [ ] **f64 value-column codec (distinct from the timestamp DoD codec):** prototype a
     **Chimp128**-style XOR codec — XOR each value against the best of the previous 128
     values (the one giving the most trailing zeros) rather than only the immediate
@@ -624,21 +658,25 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   `downsample.parse` beside `downsample.reduce`, `storage.ingest.parse`/`storage.ingest.seal`
   on the write path, and a per-request root span (`request{method,path,request_id}` +
   `x-request-id`) they all nest under
-- [ ] **Next slice — OTLP trace export (Phase 3):** attach an `opentelemetry-otlp`
-  exporter to the shipped `request` root span. Concrete dep constellation (July 2026):
-  `opentelemetry` 0.32 + `opentelemetry_sdk` 0.32 (`rt-tokio`) + `opentelemetry-otlp`
-  0.32 (`grpc-tonic`) + `tracing-opentelemetry` 0.33, env-gated on
-  `OTEL_EXPORTER_OTLP_ENDPOINT` (default `http://localhost:4317`); build an
-  `SdkTracerProvider` with a batch exporter + service-resource attrs and add a
-  `tracing_opentelemetry` layer beside the shipped `fmt` subscriber. *(src:
-  https://oneuptime.com/blog/post/2026-02-06-instrument-rust-axum-opentelemetry/view ·
-  https://github.com/damienpontifex/rust-axum-opentelemetry-otlp)*
+- [x] **OTLP trace export (Phase 3):** shipped — env-gated OTLP/gRPC `SdkTracerProvider`
+  (batch exporter + `dsp-server` resource) + `tracing_opentelemetry` layer beside the
+  `fmt` subscriber; deps `opentelemetry`/`opentelemetry_sdk`/`opentelemetry-otlp` 0.32 +
+  `tracing-opentelemetry` 0.33 (build protoc-free). Runtime-verified boot both with and
+  without `OTEL_EXPORTER_OTLP_ENDPOINT`.
+- [ ] **Next slice — OTLP collector verification:** run a collector (Jaeger/Tempo/OTel
+  Collector) and confirm a `request` trace with its nested stage spans lands (delivery
+  was not exercised this run — no collector on the box).
 - [x] **Cursor paging (Phase 2 B-rest):** shipped — opaque `next_cursor`/`?cursor=`
   forward-iteration token on `…/points` + `…/value-points`
-- [ ] **Next slice — Gorilla-codec adopt-or-drop (Phase 6.1):** the advisory Gorilla DoD
-  estimate shipped; benchmark it on a scattered-single-jitter corpus (its predicted win
-  regime, where RLE can't form runs) and either wire a per-block on-disk codec option +
-  fold it into `best_estimated_bytes`, or drop it — see the Phase 6.1 sub-items
+- [x] **Gorilla-codec adopt-or-drop (Phase 6.1): ADOPTED + realized.** Benchmarked on a
+  scattered-single-jitter corpus (~28% below the best shipped codec in its ±2048 regime,
+  honest loss past it); realized as a lossless codec, wired into the `.dspseg` block +
+  `best_estimated_bytes`/`best_encoding_name`, and surfaced in dsp-bench. RLE realized on
+  disk in the same arc.
+- [ ] **Next slice — value-column realized bytes (Phase 4/6):** `serialized_bytes()` now
+  exposes the true on-disk value-column size (varint-coded ScaledI64 realizes below the
+  naive `len*8` `estimated_bytes`); decide whether to flip the headline `estimated_bytes`
+  to realized (broad: ~37 callers) and add a scaled-int bit-pack value codec.
 - [x] Add p50/p95/p99 + confidence-interval reporting
 - [x] Add physical value types (`F64`, `ScaledI64`, `BigDecimalText` + three more)
 - [x] Prototype columnar segment reads for one aspect type (`database::SegmentStore`)
