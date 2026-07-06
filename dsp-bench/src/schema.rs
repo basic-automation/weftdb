@@ -125,8 +125,9 @@ impl TimingBreakdown {
 ///   the requested bound (per hard constraint #4 any loss is reported via
 ///   `lossy_count` / `max_abs_error`, never silent);
 /// - the **timestamp** column is delta-of-delta encoded
-///   ([`encode_delta_of_delta`]) then packed with the cheaper of zig-zag-varint
-///   or RLE — lossless, and near-free for a regular series;
+///   ([`encode_delta_of_delta`]) then packed with the cheapest of zig-zag-varint,
+///   RLE, fixed-width bit-packing, or the Gorilla variable-length codec — lossless,
+///   and near-free for a regular series;
 /// - [`total_bytes_per_point`](Self::total_bytes_per_point) sums the two, the
 ///   headline north-star figure.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -154,8 +155,10 @@ pub struct StorageEstimate {
 	pub timestamp_unit: String,
 	/// Timestamp-column encoding chosen: `delta_of_delta`, `delta_of_delta_rle`
 	/// when run-length coding the second differences is cheaper (long identical
-	/// runs), or `delta_of_delta_bitpack` when fixed-width bit-packing is cheapest
-	/// (a regular or small-jitter series).
+	/// runs), `delta_of_delta_bitpack` when fixed-width bit-packing is cheapest
+	/// (a regular or small-jitter series), or `delta_of_delta_gorilla` when the
+	/// Gorilla variable-length codec wins (scattered single jitter, where RLE cannot
+	/// form runs).
 	#[serde(default)]
 	pub timestamp_encoding: String,
 	/// Estimated byte footprint of the timestamp column (anchor + varint stream),
@@ -198,10 +201,12 @@ impl StorageEstimate {
 		let bytes_per_point = per_point(estimated_value_bytes, value_count);
 
 		// Encode the timestamp column delta-of-delta, then let `dsp-physical-type`
-		// pick the cheaper of plain varint vs RLE-of-second-differences (RLE wins
-		// big on regular series, loses on non-repeating ones) — the same single
-		// source of truth a stored `Segment` uses, so the advisory bench estimate
-		// and a realized segment never disagree on size or codec label.
+		// pick the cheapest of plain varint, RLE-of-second-differences, fixed-width
+		// bit-packing, or the Gorilla variable-length codec (each wins a different
+		// regime: RLE on regular runs, bit-pack on small jitter, Gorilla on scattered
+		// single jitter) — the same single source of truth a stored `Segment` uses,
+		// so the advisory bench estimate and a realized segment never disagree on
+		// size or codec label.
 		let (timestamp_bytes, timestamp_encoding) = if timestamps.is_empty() {
 			(0, "delta_of_delta")
 		} else {
@@ -457,6 +462,33 @@ mod tests {
 		assert!((est.total_bytes_per_point - (est.bytes_per_point + est.timestamp_bytes_per_point)).abs() < f64::EPSILON);
 		// The timestamp column is far cheaper than storing raw 8-byte epochs.
 		assert!(est.timestamp_bytes_per_point < 8.0);
+	}
+
+	#[test]
+	fn from_columns_surfaces_gorilla_for_scattered_single_jitter() {
+		// The governing rule: a shipped codec advance must show a benchmarked outcome.
+		// A regular 1000us base with an isolated jitter every 16th interval (within
+		// Gorilla's +/-2048 bucket) is Gorilla's win regime — the bench estimate must
+		// name it and cost it below the bit-packed alternative, and must agree with a
+		// realized on-disk Segment (proving the win is realized, not just projected).
+		use std::str::FromStr;
+		let mut timestamps = Vec::with_capacity(1000);
+		let mut t = 0_i64;
+		for i in 0..1000 {
+			t += if i % 16 == 15 { 1_000 + 1_500 } else { 1_000 };
+			timestamps.push(t);
+		}
+		let values: Vec<BigDecimal> = (0..1000).map(|i| BigDecimal::from_str(&format!("{}.5", i % 7)).unwrap()).collect();
+		let tolerance = BigDecimal::from(0);
+		let est = StorageEstimate::from_columns(&values, &timestamps, TimeUnit::Micros, &tolerance);
+		assert_eq!(est.timestamp_encoding, "delta_of_delta_gorilla", "scattered jitter must surface the Gorilla codec in the bench");
+		// It agrees with a realized segment written through the .dspseg codec.
+		let seg = dsp_physical_type::Segment::build(&timestamps, &values, TimeUnit::Micros, &tolerance).expect("segment builds");
+		assert_eq!(est.timestamp_encoding, seg.timestamp_encoding_name());
+		assert_eq!(est.timestamp_bytes, seg.timestamp_bytes());
+		// Gorilla beats what a fixed-width bit-pack of the same column would cost.
+		let dod = encode_delta_of_delta(&timestamps, TimeUnit::Micros);
+		assert!(est.timestamp_bytes < dod.bitpack_estimated_bytes(), "gorilla {} must beat bit-pack {}", est.timestamp_bytes, dod.bitpack_estimated_bytes());
 	}
 
 	#[test]
