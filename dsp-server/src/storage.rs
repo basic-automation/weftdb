@@ -32,6 +32,7 @@ use axum::{
 };
 use bigdecimal::BigDecimal;
 use serde::{Deserialize, Serialize};
+use tracing::Instrument as _;
 
 use crate::{manage::IngestResponse, state::AppState};
 
@@ -479,17 +480,20 @@ pub async fn storage_time_range_json(State(state): State<AppState>, Path(aspect)
 	let Some(schema) = schema else {
 		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
-	let result = store.read_time_range(&aspect, params.start, params.end).await;
+	let result = store.read_time_range(&aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end)).await;
 	drop(store);
 	let (timestamps, values) = result.map_err(|err| classify_read_error(&err))?;
 	let total = timestamps.len();
 	let (offset, page_size, page) = resolve_pagination_with_cursor(params.offset, params.limit, params.take, params.page, params.cursor.as_deref())?;
-	// Paginate: skip `offset` rows of the window, take at most `page_size`.
-	let paginated = timestamps.into_iter().zip(values).skip(offset);
-	let points: Vec<StoredPoint> = match page_size {
-		Some(size) => paginated.take(size).map(|(timestamp, value)| StoredPoint { timestamp, value: value.map(|v| v.to_string()) }).collect(),
-		None => paginated.map(|(timestamp, value)| StoredPoint { timestamp, value: value.map(|v| v.to_string()) }).collect(),
-	};
+	// Paginate + stringify under a serialize span: skip `offset` rows of the window,
+	// take at most `page_size`.
+	let points: Vec<StoredPoint> = tracing::info_span!("storage.range.serialize", total, offset).in_scope(|| {
+		let paginated = timestamps.into_iter().zip(values).skip(offset);
+		match page_size {
+			Some(size) => paginated.take(size).map(|(timestamp, value)| StoredPoint { timestamp, value: value.map(|v| v.to_string()) }).collect(),
+			None => paginated.map(|(timestamp, value)| StoredPoint { timestamp, value: value.map(|v| v.to_string()) }).collect(),
+		}
+	});
 	let next_cursor = next_cursor(offset, points.len(), total);
 	Ok(Json(StoredRangeResponse { aspect, time_unit: schema.timestamp_unit.name(), total, count: points.len(), offset, limit: page_size, page, next_cursor, points }))
 }
@@ -595,16 +599,18 @@ pub async fn storage_value_range_json(State(state): State<AppState>, Path(aspect
 	let Some(schema) = schema else {
 		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
-	let result = store.read_value_range(&aspect, &lo, &hi).await;
+	let result = store.read_value_range(&aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi)).await;
 	drop(store);
 	let (timestamps, values) = result.map_err(|err| classify_read_error(&err))?;
 	let total = timestamps.len();
 	let (offset, page_size, page) = resolve_pagination_with_cursor(params.offset, params.limit, params.take, params.page, params.cursor.as_deref())?;
-	let paginated = timestamps.into_iter().zip(values).skip(offset);
-	let points: Vec<StoredPoint> = match page_size {
-		Some(size) => paginated.take(size).map(|(timestamp, value)| StoredPoint { timestamp, value: Some(value.to_string()) }).collect(),
-		None => paginated.map(|(timestamp, value)| StoredPoint { timestamp, value: Some(value.to_string()) }).collect(),
-	};
+	let points: Vec<StoredPoint> = tracing::info_span!("storage.value_range.serialize", total, offset).in_scope(|| {
+		let paginated = timestamps.into_iter().zip(values).skip(offset);
+		match page_size {
+			Some(size) => paginated.take(size).map(|(timestamp, value)| StoredPoint { timestamp, value: Some(value.to_string()) }).collect(),
+			None => paginated.map(|(timestamp, value)| StoredPoint { timestamp, value: Some(value.to_string()) }).collect(),
+		}
+	});
 	let next_cursor = next_cursor(offset, points.len(), total);
 	Ok(Json(StoredRangeResponse { aspect, time_unit: schema.timestamp_unit.name(), total, count: points.len(), offset, limit: page_size, page, next_cursor, points }))
 }
@@ -657,7 +663,7 @@ pub async fn storage_point(State(state): State<AppState>, Path(aspect): Path<Str
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	drop(state);
 	let schema = require_schema(&store, &aspect).await?;
-	let result = store.read_point(&aspect, params.t).await;
+	let result = store.read_point(&aspect, params.t).instrument(tracing::info_span!("storage.point.read", %aspect, t = params.t)).await;
 	drop(store);
 	let value = result.map_err(|err| classify_read_error(&err))?;
 	let found = value.is_some();
