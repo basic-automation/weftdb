@@ -1155,6 +1155,40 @@ mod tests {
 	}
 
 	#[test]
+	fn serialized_bytes_matches_the_realized_value_payload() {
+		use crate::encode_column;
+		// serialized_bytes() must equal the exact bytes write_physical_value emits for
+		// the values (the payload, excluding the column header) — for every physical
+		// type. This is the realize-accurate figure estimated_bytes() does not give.
+		let cases = [
+			encode_column(PhysicalType::F64, &col(&["0.5", "2.25", "-128.0"])).unwrap(),
+			encode_column(PhysicalType::F32, &col(&["0.5", "-0.25", "16.0"])).unwrap(),
+			encode_column(PhysicalType::ScaledI64 { scale: 2 }, &col(&["1.25", "-3.75", "0.00", "5000.00"])).unwrap(),
+			encode_column(PhysicalType::ScaledI128 { scale: 4 }, &col(&["1234567890.1234", "-9.0001"])).unwrap(),
+			encode_column(PhysicalType::Decimal128, &col(&["123456789012345678901234.567890", "-1.5", "0"])).unwrap(),
+			encode_column(PhysicalType::BigDecimalText, &col(&["1.5", "12345.6789", "-0.000001"])).unwrap(),
+		];
+		for enc in &cases {
+			let mut w = ByteWriter::new();
+			for value in &enc.values {
+				write_physical_value(&mut w, value);
+			}
+			assert_eq!(w.into_vec().len(), enc.serialized_bytes(), "{:?} payload must match serialized_bytes()", enc.physical_type);
+		}
+	}
+
+	#[test]
+	fn scaled_i64_serialized_bytes_beats_the_naive_fixed_width_estimate() {
+		use crate::encode_column;
+		// Small ScaledI64 mantissas are varint-coded to ~1 byte each, so the realized
+		// payload is far below the naive len*8 estimate — the divergence estimated_bytes()
+		// currently over-reports (underselling DSP's bytes/point).
+		let enc = encode_column(PhysicalType::ScaledI64 { scale: 2 }, &col(&["0.01", "0.02", "0.03", "0.05", "0.08"])).unwrap();
+		assert!(enc.serialized_bytes() < enc.estimated_bytes(), "realized {} must beat naive {}", enc.serialized_bytes(), enc.estimated_bytes());
+		assert_eq!(enc.estimated_bytes(), enc.values.len() * 8, "the naive estimate is len*8 for ScaledI64");
+	}
+
+	#[test]
 	fn value_column_preserves_lossy_bookkeeping() {
 		use crate::encode_column;
 		// 0.1/0.3 are not binary-exact: the column is lossy and carries a positive
