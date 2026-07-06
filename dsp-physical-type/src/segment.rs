@@ -338,6 +338,15 @@ impl Segment {
 		self.values.estimated_bytes()
 	}
 
+	/// **Realized** stored bytes of the value column — the exact on-disk payload the
+	/// `.dspseg` frame writes (see [`ColumnEncoding::serialized_bytes`]). For a
+	/// `ScaledI64` column this is below [`value_bytes`](Self::value_bytes) (varint
+	/// mantissas), so it is the accurate bytes/point figure.
+	#[must_use]
+	pub fn serialized_value_bytes(&self) -> usize {
+		self.values.serialized_bytes()
+	}
+
 	/// Estimated stored bytes of the timestamp column, taking the cheapest of
 	/// plain-varint, RLE, or bit-packed second differences (see
 	/// [`DeltaOfDeltaColumn::best_estimated_bytes`]).
