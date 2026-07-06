@@ -193,9 +193,9 @@ marking nuance — backlog item B-tags)*.
 - [x] CSV interchange — stored-range export/ingest + compute-endpoint CSV output
 - [x] Columnar output for compute endpoints — Arrow IPC + Parquet for `interpolate`/`downsample` (+ every ILP sibling); `dsp-arrow` reconstructed-series + reduction-table interchange
 - [x] Prometheus latency histograms — compute endpoints, ILP compute path, and the storage-ingest seal path
-- [ ] OpenTelemetry trace export (paired with Prometheus `/metrics`)
+- [x] OpenTelemetry trace export (paired with Prometheus `/metrics`) — env-gated OTLP/gRPC exporter beside the `fmt` subscriber (delivery to a live collector = a runtime follow-up)
 - [x] B-rest residue — `interpolation` query-param alias for `spline` on the ILP compute endpoints (`spline` wins when both given)
-- [ ] B-rest residue — cursor paging (stable forward-iteration token) on `…/points` / `…/value-points`
+- [x] B-rest residue — cursor paging (stable forward-iteration token) on `…/points` / `…/value-points`: an opaque `next_cursor` (hex position token over the deterministic read order) + `?cursor=` (supersedes `offset`/`page`, malformed → 400); a client follows `next_cursor` until absent
 - [ ] Python SDK → Rust SDK → Arrow Flight / Flight SQL → SQL surface / DataFusion (later)
 - [ ] Grafana → Prometheus remote write/read (if monitoring) → R/Arrow workflows
 
@@ -210,8 +210,23 @@ transfer, 8% kernel, 7% JSON").
 - [x] Latency histograms over the compute + seal paths (`/metrics`)
 - [x] `/debug/profile/current` — live p50/p95/p99 latency snapshot
 - [x] Tracing foundation — a `RUST_LOG`-driven `fmt` subscriber (span-CLOSE events, busy/idle timing) with per-request engine spans on the flagship compute path: `interpolate.engine` (input/output points, spline, resolution) and `downsample.reduce` (candidate/in-window points, buckets, resolution)
-- [ ] Full tracing spans across ingest → GPU → serialization — per-stage **child** spans under the request span (request parse · auth · ILP/CSV/Arrow decode · value parse · `BigDecimal` conversion · physical-encoding conversion · timestamp normalization · WAL append · libSQL write · segment write · commit · index update · range read · page skip · cache hit/miss · decompression · CPU interp · GPU upload/queue/kernel/readback · serialize)
-- [ ] **OTLP trace export** (pairs with the Prometheus `/metrics` surface): add a `tower-http` `TraceLayer` request span (+ `x-request-id`) and an `opentelemetry-otlp` exporter (grpc-tonic, ports 4317/4318) behind an env-gated endpoint; evaluate the `axum-tracing-opentelemetry` crate for the axum+tracing+otel wiring. *(src: https://crates.io/crates/axum-tracing-opentelemetry, https://oneuptime.com/blog/post/2026-02-06-instrument-rust-axum-opentelemetry/view)*
+- [x] Per-request **root span** + per-stage child spans (partial coverage of ingest → serialization): a `request{method,path,request_id}` span (via `axum::middleware::from_fn`, `x-request-id` in/out) that every stage span nests under — `interpolate.parse`/`interpolate.compute`/`interpolate.serialize` under `interpolate.engine`, `downsample.parse` beside `downsample.reduce`, and `storage.ingest.parse`/`storage.ingest.seal` on the write path (the seal span surfaces the nested Turso `connect_with_encryption` control-plane spans)
+- [x] Per-stage spans on the **storage read path** (`storage.{range,value_range,point}.read`
+  + `.serialize`, uniform `format` dimension over JSON/CSV/Arrow/Parquet), the **ingest
+  decode paths** (`storage.ingest.parse`/`normalize`/`seal` for ILP + CSV + JSON), and
+  the **reconcile daemon** (`reconcile.tick{kind,...,aspects,segments}` on all five tick
+  kinds) — all runtime-verified against the running binary
+- [ ] Remaining per-stage spans — auth · Arrow decode on ingest · WAL append · explicit libSQL write · commit · index update · page skip · cache hit/miss · decompression · CPU interp · GPU upload/queue/kernel/readback
+- [x] **OTLP trace export** (pairs with `/metrics`): shipped — env-gated on
+  `OTEL_EXPORTER_OTLP_ENDPOINT`, an OTLP/gRPC `SdkTracerProvider` (batch exporter +
+  `dsp-server` service resource) with a `tracing_opentelemetry` layer beside the `fmt`
+  subscriber; the shipped request/stage spans export to a collector. Dep constellation
+  confirmed current on crates.io (May 2026): `opentelemetry` 0.32 + `opentelemetry_sdk`
+  0.32 (`rt-tokio`) + `opentelemetry-otlp` 0.32 (`grpc-tonic`, builds protoc-free) +
+  `tracing-opentelemetry` 0.33. A misconfigured/absent collector does not block startup.
+- [ ] **OTLP collector verification (needs runtime):** stand up an OTel Collector /
+  Jaeger / Tempo and assert a `request` trace with its nested stage spans actually
+  lands — export delivery was not exercised this run (no collector on the box).
 - [ ] `Statement::n_change()` write accounting (Turso 0.6) in ingest/instrumentation spans
 - [ ] `/bench/runs/:id` endpoint
 
@@ -269,16 +284,18 @@ DSP-Bench shows ingest/scan/compression gains; correctness tests cover late + OO
     (`DSP_RECONCILE_OVERLAPS`). This matches QuestDB's DEDUP UPSERT "last write wins on
     the designated timestamp" semantics. *(src: last-write-wins dedup on designated
     timestamp + upsert keys — https://questdb.com/docs/concepts/deduplication/)*
-  - [ ] Out-of-order **reconciliation — split-not-rewrite optimization** (the residue):
-    `reconcile_overlaps` currently fully rewrites each overlap component; wire the
-    shipped `SplitPolicy::decide` (size-based: split only when the untouched prefix is
-    larger than new+suffix **and** above a min-size floor) into it so a large cold
-    prefix is kept untouched and only the small suffix is merged, then **squash**
-    accumulated splits past a threshold. Keep segments small to bound write
-    amplification (QuestDB resorts the recent tail but splits far-apart O3 to reduce
-    write-amp). *(src: split past `cairo.o3.partition.split.min.size`=50MB, squash past
-    `cairo.o3.last.partition.max.splits`=20; small partitions reduce O3 write-amp —
-    https://questdb.com/docs/concepts/partitions/)*
+  - [x] Out-of-order **reconciliation — split-not-rewrite optimization**: shipped.
+    `SegmentStore::split_segment` carves a sorted segment into a cold prefix (kept id) +
+    hot suffix (new id) via `split_index`; `reconcile_overlaps_with_policy` consumes
+    `SplitPolicy::decide` so an overlap component whose cold prefix clears the floor and
+    outweighs its hot suffix is split rather than fully rewritten (default
+    `reconcile_overlaps` keeps the QuestDB 50 MiB floor, so production behaviour is
+    unchanged); exposed as `?split_min_bytes=` on the per-aspect + store-wide reconcile
+    endpoints and the `DSP_RECONCILE_SPLIT_MIN_BYTES` daemon env. The **squash** half is
+    shipped too — `squash_aspect`/`squash_aspect_if_exceeds` (QuestDB-`max.splits`-style
+    trigger) + `squash_all_over_threshold`, `POST …/{aspect}/squash?max_segments=`, and
+    the `DSP_RECONCILE_MAX_SPLITS` daemon env fold over-fragmented aspects back to one
+    segment. *(src: https://questdb.com/docs/concepts/partitions/)*
   - [ ] Out-of-order **reconciliation — configurable upsert keys + skip-identical**:
     the merge dedups on the timestamp alone (newer wins); add optional composite
     dedup/upsert keys (timestamp + declared columns) and a skip-write when the newer
@@ -336,19 +353,55 @@ transfer, kernel, readback, and API serialization, p95 = Z."*
 detection within Y% and improving historical query latency by Z."*
 
 - [ ] **6.1 Lossless typed codecs** — timestamp delta/delta-of-delta + **fixed-width
-  bit-packing** *(both shipped in 4.2, realized on disk)*; scaled-int bit packing;
-  RLE for regular intervals; Gorilla/Chimp-style f64; ALP-inspired vectorized f64;
-  Decimal128/scaled-int codecs; **block-level random access**. *(Check codec
-  patents/licenses before embedding.)*
-  - [ ] Evaluate a **Gorilla-style variable-length** second-difference encoding
-    (bucketed bit-lengths: 1 bit for the common 0-delta-of-delta regular case, wider
-    buckets for jitter) as a complement to the shipped fixed-width bit-packing —
-    fixed-width pays the max width for every value in a block, so a small-jitter
-    stream with rare large deltas may compress better under a per-value bucketed
-    scheme or **dynamic (per-block adaptive) bit packing**. Benchmark both on the
-    bytes/point metric before adopting. *(src: Gorilla, VLDB'15; "Lossless Data
-    Compression for Time-Series Sensor Data Based on Dynamic Bit Packing", Sensors
-    2023 — https://www.mdpi.com/1424-8220/23/20/8575)*
+  bit-packing** + **RLE** + **Gorilla variable-length** *(all four realized on disk in
+  the `.dspseg` timestamp block, chosen per-stream by `best_encoding_name`)*; scaled-int
+  bit packing; Chimp-style f64; ALP-inspired vectorized f64; Decimal128/scaled-int
+  codecs; **block-level random access**. *(Check codec patents/licenses before embedding.)*
+  - [x] **Gorilla + RLE realized on disk** — the timestamp block now carries four
+    codecs (varint/bit-pack/RLE/Gorilla) chosen by the single-source-of-truth
+    `best_encoding_name`, so the reported codec always matches the bytes written; the
+    Gorilla win shows in the dsp-bench bytes/point.
+  - [x] **Evaluated** a Gorilla-style variable-length second-difference estimate
+    (`gorilla_dod_bits`/`gorilla_bytes`/`DeltaOfDeltaColumn::gorilla_estimated_bytes` —
+    advisory only, NOT wired into the realized varint-vs-bit-pack selector). Measured
+    finding: on a 64-point mostly-regular stream with two isolated 50k-gap spikes,
+    gorilla=52 B beats fixed-width bit-pack=143 B (the roadmap hypothesis holds vs
+    bit-pack), but the **already-shipped RLE codec (32 B here) wins on isolated
+    spikes**. Gorilla's unique advantage is therefore *scattered single* jitter (RLE
+    can't form runs, bit-pack pays max width for the many near-zero values). *(src:
+    Gorilla, VLDB'15)*
+  - [x] **Adopt-or-drop decision for the Gorilla codec: ADOPTED.** Benchmarked gorilla
+    vs varint/RLE/bit-pack on a scattered-single-jitter corpus: gorilla is the strict
+    winner in its regime (e.g. 368 B vs the best shipped codec's 508 B, ~28% smaller,
+    on a 1000-pt base with an isolated jitter every 16th interval within its ±2048
+    bucket), with an honest loss boundary past ±2048 (falls to the 68-bit bucket).
+    Realized as a full lossless codec (`encode_gorilla_dods`/`decode_gorilla_dods`),
+    wired into the `.dspseg` block (`TS_CODEC_GORILLA`) + folded into
+    `best_estimated_bytes`/`best_encoding_name`, and surfaced in the dsp-bench
+    StorageEstimate. RLE was also realized on disk (`TS_CODEC_RLE`) in the same arc,
+    closing its estimate/disk divergence. *(src: Gorilla, VLDB'15)*
+  - [ ] Evaluate **dynamic (per-block adaptive) bit packing** as a simpler complement to
+    the fixed-width bit-pack codec. *(src: "Dynamic Bit Packing", Sensors 2023 —
+    https://www.mdpi.com/1424-8220/23/20/8575)*
+  - [ ] **Value-column realized-bytes accuracy (discovered divergence):** the `.dspseg`
+    value block writes `ScaledI64` mantissas as zig-zag varints (small values ≈1 byte),
+    but `ColumnEncoding::estimated_bytes` reports the naive `len*8` — so the bench +
+    segment stats **over-report** ScaledI64 bytes/point (underselling DSP). A realize-
+    accurate `ColumnEncoding::serialized_bytes()` + `Segment::serialized_value_bytes()`
+    + `StorageEstimate.realized_value_bytes` (v7) now expose the true figure additively.
+    **Owner decision needed:** whether to flip the headline `estimated_bytes` /
+    `value_bytes` / `total_bytes_per_point` to the realized figure — a semantic change to
+    a metric consumed in ~37 places / ~33 test assertions. Also add a scaled-int
+    **bit-pack** value codec as an on-disk alternative to the per-value varint.
+  - [ ] **f64 value-column codec (distinct from the timestamp DoD codec):** prototype a
+    **Chimp128**-style XOR codec — XOR each value against the best of the previous 128
+    values (the one giving the most trailing zeros) rather than only the immediate
+    predecessor (Gorilla/Chimp), since ~95% of adjacent XORs have ≤5 trailing zeros.
+    Benchmark it against Gorilla/Elf/ALP on the `dsp-bench` bytes/point + throughput
+    metrics using the FCBench / 2025-VLDB-eval methodology before adopting. *(src: Chimp,
+    VLDB'22 — https://www.vldb.org/pvldb/vol15/p3058-liakos.pdf · comprehensive eval,
+    VLDB'25 — https://www.vldb.org/pvldb/vol18/p4396-hishida.pdf · FCBench —
+    https://arxiv.org/pdf/2312.10301)*
 - [ ] **6.2 Model-based compression** (leverages DSP's spline DNA, NeaTS-like) — piecewise
   linear / spline / polynomial / nonlinear approximation with bounded residuals;
   lossless-residual option; lossy with max-error guarantee; extrema-preserving mode
@@ -440,7 +493,7 @@ A checked box = shipped; an unchecked box carries its residual status inline
 - [ ] **B-tags** *(Phase 2/4 · absent)* — Per-measurement tags/labels (incl. `interpolated=true`/provenance); `measurement.rs` has none. *(src: `DSM-Database`, `DSM-Measurement`)*
 - [ ] **B-conn** *(Phase 2/7 · absent)* — Vendor-neutral connector trait + registry (core). *(src: `dsm-source`, `dsm-asset`)*
 - [ ] **B-ilp** *(Phase 2 · partial)* — ILP ingest shipped (parser + endpoints); the ILP/Influx **interop** connector crate (not a storage swap) is still to do. *(src: `dsm-influxdb`, `dsm-batch`)*
-- [ ] **B-rest** *(Phase 2 · partial)* — REST facade + declarative query-params + pagination shipped (`offset`/`limit`/`take`/`page` + `total`/`count` on `…/points` and `…/value-points`); the `interpolation` query-param alias shipped; **cursor paging** still to do. *(src: `DSM-Database`)*
+- [ ] **B-rest** *(Phase 2 · partial)* — REST facade + declarative query-params + pagination shipped (`offset`/`limit`/`take`/`page` + `total`/`count` **and now an opaque `next_cursor`/`?cursor=` forward-iteration token** on `…/points` and `…/value-points`); the `interpolation` query-param alias shipped. Residue: cursor tokens are position-over-read-order (stable while the window is unchanged), not a row-identity keyset — a keyset cursor resilient to concurrent inserts is the next refinement. *(src: `DSM-Database`)*
 - [ ] **B-poll / B-retry / B-register** *(Phase 7 · absent)* — Scheduled polling daemon (per-source interval) + at-least-once retry buffer + runtime source registration. *(src: `DSM-Input-Module`)*
 - [x] **B-interp** *(Phase 5)* — Interpolate-on-read, single-instant lookup, out-of-range extrapolation. *(src: `splimes`/`database`)*
 - [ ] **B-analysis** *(Phase 4/9 · verify)* — Per-point analysis model (signed neighbor distance, slope-segmented trends, max-normalized relative vectors); verify `Trend`/`Relative`/`MeasurementVector`/`Analysis` wired end-to-end. *(src: `dataset_management`, `DSM-Measurement`)*
@@ -593,15 +646,37 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 - [x] **Hot/cold split in the background reconcile (Phase 4.6):** shipped —
   `reconcile_aspect_hot_cold`/`reconcile_all_hot_cold`, `?hot_cold=true` endpoints,
   `DSP_RECONCILE_HOT_COLD` daemon mode
-- [ ] **Next slice — split-not-rewrite optimization (Phase 4.6):** wire the shipped
-  `SplitPolicy::decide` into `reconcile_overlaps` so a large cold prefix is kept
-  untouched and only the small suffix is merged, then squash accumulated splits past a
-  threshold (the `SplitPolicy` primitive + `split_index` are shipped and tested but not
-  yet consumed by the merge) *(src: https://questdb.com/docs/concepts/partitions/)*
-- [ ] **Next slice — per-stage tracing child spans (Phase 3):** the compute-path
-  request spans (`interpolate.engine`, `downsample.reduce`) shipped; add child spans
-  for value parse / `BigDecimal` convert / serialize under them, then the OTLP export
-  (see Phase 3) *(src: https://crates.io/crates/axum-tracing-opentelemetry)*
+- [x] **Split-not-rewrite optimization (Phase 4.6):** shipped — `split_segment`
+  primitive, `reconcile_overlaps_with_policy` (consumes `SplitPolicy::decide`; default
+  `reconcile_overlaps` keeps the 50 MiB floor), the `?split_min_bytes=` query param on
+  the per-aspect and store-wide reconcile endpoints, and the `DSP_RECONCILE_SPLIT_MIN_BYTES`
+  daemon env; plus the **squash** half — `squash_aspect`/`squash_aspect_if_exceeds`/
+  `squash_all_over_threshold`, `POST …/{aspect}/squash?max_segments=`, and the
+  `DSP_RECONCILE_MAX_SPLITS` daemon env *(src: https://questdb.com/docs/concepts/partitions/)*
+- [x] **Per-stage tracing child spans (Phase 3):** shipped — `interpolate.parse`/
+  `interpolate.compute`/`interpolate.serialize` under `interpolate.engine`,
+  `downsample.parse` beside `downsample.reduce`, `storage.ingest.parse`/`storage.ingest.seal`
+  on the write path, and a per-request root span (`request{method,path,request_id}` +
+  `x-request-id`) they all nest under
+- [x] **OTLP trace export (Phase 3):** shipped — env-gated OTLP/gRPC `SdkTracerProvider`
+  (batch exporter + `dsp-server` resource) + `tracing_opentelemetry` layer beside the
+  `fmt` subscriber; deps `opentelemetry`/`opentelemetry_sdk`/`opentelemetry-otlp` 0.32 +
+  `tracing-opentelemetry` 0.33 (build protoc-free). Runtime-verified boot both with and
+  without `OTEL_EXPORTER_OTLP_ENDPOINT`.
+- [ ] **Next slice — OTLP collector verification:** run a collector (Jaeger/Tempo/OTel
+  Collector) and confirm a `request` trace with its nested stage spans lands (delivery
+  was not exercised this run — no collector on the box).
+- [x] **Cursor paging (Phase 2 B-rest):** shipped — opaque `next_cursor`/`?cursor=`
+  forward-iteration token on `…/points` + `…/value-points`
+- [x] **Gorilla-codec adopt-or-drop (Phase 6.1): ADOPTED + realized.** Benchmarked on a
+  scattered-single-jitter corpus (~28% below the best shipped codec in its ±2048 regime,
+  honest loss past it); realized as a lossless codec, wired into the `.dspseg` block +
+  `best_estimated_bytes`/`best_encoding_name`, and surfaced in dsp-bench. RLE realized on
+  disk in the same arc.
+- [ ] **Next slice — value-column realized bytes (Phase 4/6):** `serialized_bytes()` now
+  exposes the true on-disk value-column size (varint-coded ScaledI64 realizes below the
+  naive `len*8` `estimated_bytes`); decide whether to flip the headline `estimated_bytes`
+  to realized (broad: ~37 callers) and add a scaled-int bit-pack value codec.
 - [x] Add p50/p95/p99 + confidence-interval reporting
 - [x] Add physical value types (`F64`, `ScaledI64`, `BigDecimalText` + three more)
 - [x] Prototype columnar segment reads for one aspect type (`database::SegmentStore`)

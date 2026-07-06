@@ -37,6 +37,7 @@ use chrono::{DateTime, Utc};
 use dsp_line_protocol::TimestampPrecision;
 use dsp_physical_type::{first_order_violation, AspectSchema, PhysicalType, SegmentDescriptor, TimeUnit};
 use serde::{Deserialize, Serialize};
+use tracing::Instrument as _;
 
 use crate::{state::AppState, storage::{AspectInfo, StorageError}};
 
@@ -166,6 +167,14 @@ pub struct ReconcileParams {
 	/// meaningful on the per-aspect endpoint.
 	#[serde(default)]
 	pub overlaps: bool,
+	/// Split-not-rewrite floor in **bytes** for the overlap merge (roadmap Phase 4.6),
+	/// paired with `overlaps=true`. When present, an overlap component whose cold prefix
+	/// clears this many bytes *and* outweighs its hot suffix is **split** — the cold
+	/// prefix carved into its own segment and only the hot suffix merged — instead of
+	/// fully rewritten, so later late arrivals never rewrite the cold prefix again. When
+	/// absent, the merge uses `SplitPolicy::questdb_default()` (a 50 MiB floor), under
+	/// which small components always full-rewrite. Ignored unless `overlaps` is set.
+	pub split_min_bytes: Option<u64>,
 }
 
 /// Response body for `POST /api/v1/storage/{aspect}/reconcile` — the outcome of an
@@ -219,7 +228,7 @@ pub async fn reconcile_aspect(State(state): State<AppState>, Path(aspect): Path<
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	let metrics = state.metrics().clone();
 	drop(state);
-	let result = reconcile_aspect_inner(&store, &aspect, params.threshold, params.hot_cold, params.overlaps, &metrics).await;
+	let result = reconcile_aspect_inner(&store, &aspect, params.threshold, params.hot_cold, params.overlaps, params.split_min_bytes, &metrics).await;
 	drop(store);
 	result
 }
@@ -227,7 +236,7 @@ pub async fn reconcile_aspect(State(state): State<AppState>, Path(aspect): Path<
 /// The body of [`reconcile_aspect`], split out so the significant-`Drop`
 /// [`SegmentStore`](database::SegmentStore) handle is dropped in the caller after
 /// the last use rather than held across the response construction.
-async fn reconcile_aspect_inner(store: &database::SegmentStore, aspect: &str, threshold: Option<usize>, hot_cold: bool, overlaps: bool, metrics: &crate::metrics::SharedMetrics) -> Result<Response, StorageError> {
+async fn reconcile_aspect_inner(store: &database::SegmentStore, aspect: &str, threshold: Option<usize>, hot_cold: bool, overlaps: bool, split_min_bytes: Option<u64>, metrics: &crate::metrics::SharedMetrics) -> Result<Response, StorageError> {
 	// Undeclared aspect → 404 (mirrors the read surface's not-found semantics).
 	if store.schema_for(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?.is_none() {
 		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
@@ -240,7 +249,12 @@ async fn reconcile_aspect_inner(store: &database::SegmentStore, aspect: &str, th
 	// - threshold: all-or-nothing — `Some(threshold)` gates the whole pass, `None` runs
 	//   it unconditionally; a gated call that holds is `false` (not a counted pass).
 	let (mode, triggered, reconciled, cold_reconciled, hot_reconciled) = if overlaps {
-		let removed = store.reconcile_overlaps(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?;
+		// `split_min_bytes` selects the split-not-rewrite floor; absent → the default
+		// 50 MiB QuestDB floor (small components always full-rewrite).
+		let removed = match split_min_bytes {
+			Some(min) => store.reconcile_overlaps_with_policy(aspect, dsp_physical_type::SplitPolicy::new(min)).await.map_err(|err| StorageError::Internal(err.to_string()))?,
+			None => store.reconcile_overlaps(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?,
+		};
 		("overlaps", true, removed, 0, 0)
 	} else if hot_cold {
 		let outcome = store.reconcile_aspect_hot_cold(aspect, threshold.unwrap_or(1)).await.map_err(|err| StorageError::Internal(err.to_string()))?;
@@ -321,17 +335,22 @@ pub async fn reconcile_store(State(state): State<AppState>, Query(params): Query
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	let metrics = state.metrics().clone();
 	drop(state);
-	let result = reconcile_store_inner(&store, params.threshold, params.hot_cold, params.overlaps, &metrics).await;
+	let result = reconcile_store_inner(&store, params.threshold, params.hot_cold, params.overlaps, params.split_min_bytes, &metrics).await;
 	drop(store);
 	result
 }
 
 /// The body of [`reconcile_store`], split out so the significant-`Drop`
 /// [`SegmentStore`](database::SegmentStore) handle is dropped in the caller.
-async fn reconcile_store_inner(store: &database::SegmentStore, threshold: Option<usize>, hot_cold: bool, overlaps: bool, metrics: &crate::metrics::SharedMetrics) -> Result<Response, StorageError> {
+async fn reconcile_store_inner(store: &database::SegmentStore, threshold: Option<usize>, hot_cold: bool, overlaps: bool, split_min_bytes: Option<u64>, metrics: &crate::metrics::SharedMetrics) -> Result<Response, StorageError> {
 	let threshold = threshold.unwrap_or(1).max(1);
 	let (mode, aspects_scanned, aspects_reconciled, segments_reconciled, cold_reconciled, hot_reconciled) = if overlaps {
-		let sweep = store.reconcile_all_overlaps().await.map_err(|err| StorageError::Internal(err.to_string()))?;
+		// `split_min_bytes` selects the store-wide split-not-rewrite floor; absent → the
+		// default 50 MiB floor (every aspect's small components full-rewrite).
+		let sweep = match split_min_bytes {
+			Some(min) => store.reconcile_all_overlaps_with_policy(dsp_physical_type::SplitPolicy::new(min)).await.map_err(|err| StorageError::Internal(err.to_string()))?,
+			None => store.reconcile_all_overlaps().await.map_err(|err| StorageError::Internal(err.to_string()))?,
+		};
 		if sweep.aspects_reconciled > 0 {
 			metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_removed).unwrap_or(u64::MAX));
 		}
@@ -352,6 +371,64 @@ async fn reconcile_store_inner(store: &database::SegmentStore, threshold: Option
 	let unsorted_segments = store.store_stats().await.map_err(|err| StorageError::Internal(err.to_string()))?.unsorted_segments;
 	let overlapping_segments = store.store_overlapping_segments().await.map_err(|err| StorageError::Internal(err.to_string()))?;
 	Ok((StatusCode::OK, Json(ReconcileStoreResponse { threshold, mode, aspects_scanned, aspects_reconciled, segments_reconciled, cold_reconciled, hot_reconciled, unsorted_segments, overlapping_segments })).into_response())
+}
+
+/// Query parameters for `POST /api/v1/storage/{aspect}/squash`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SquashParams {
+	/// Optional segment-count cap (roadmap Phase 4.6): squash **only** when the aspect
+	/// has more than this many segments — the `QuestDB`-`max.splits`-style trigger that
+	/// bounds split-path fragmentation. A value of 0 clamps to 1. When absent, the
+	/// squash runs unconditionally.
+	pub max_segments: Option<usize>,
+}
+
+/// Response body for `POST /api/v1/storage/{aspect}/squash` — the outcome of a
+/// segment squash pass.
+#[derive(Debug, Clone, Serialize)]
+pub struct SquashResponse {
+	/// The aspect squashed.
+	pub aspect: String,
+	/// Whether the squash actually ran. `false` only when a `max_segments` cap was
+	/// given and the aspect's segment count held at or below it (nothing rewritten).
+	pub triggered: bool,
+	/// Number of segments removed by folding the aspect into one (0 when it already had
+	/// fewer than two segments, or the pass did not trigger).
+	pub removed: usize,
+	/// The aspect's segment count *after* the pass — 1 once a squash has folded it.
+	pub segment_count: usize,
+}
+
+/// Handle `POST /api/v1/storage/{aspect}/squash`: fold an aspect's segments into one
+/// (roadmap Phase 4.6 — the squash half of the split-not-rewrite path).
+///
+/// With no `max_segments` query param it squashes unconditionally
+/// ([`SegmentStore::squash_aspect`](database::SegmentStore::squash_aspect)); with
+/// `?max_segments=N` it delegates to the threshold-gated
+/// [`squash_aspect_if_exceeds`](database::SegmentStore::squash_aspect_if_exceeds), so
+/// the rewrite runs only when the segment count exceeds `N` — the trigger that bounds
+/// the fragmentation repeated split carve-offs create. Returns `200 OK` with whether
+/// it triggered, how many segments it removed, and the post-pass segment count.
+///
+/// # Errors
+///
+/// [`StorageError::Unconfigured`] when no store is attached,
+/// [`StorageError::NotFound`] when the aspect is undeclared, and
+/// [`StorageError::Internal`] on a read/seal/control-plane failure.
+pub async fn squash_aspect(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<SquashParams>) -> Result<Response, StorageError> {
+	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	drop(state);
+	// Undeclared aspect → 404 (mirrors the reconcile/read surfaces).
+	if store.schema_for(&aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?.is_none() {
+		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
+	}
+	let (triggered, removed) = match params.max_segments {
+		Some(max) => store.squash_aspect_if_exceeds(&aspect, max).await.map_err(|err| StorageError::Internal(err.to_string()))?.map_or((false, 0), |removed| (true, removed)),
+		None => (true, store.squash_aspect(&aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?),
+	};
+	let segment_count = store.segment_count(&aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?;
+	drop(store);
+	Ok((StatusCode::OK, Json(SquashResponse { aspect, triggered, removed, segment_count })).into_response())
 }
 
 /// One point in an ingest batch: an integer epoch timestamp (in the aspect's
@@ -492,25 +569,36 @@ async fn ingest_points_inner(store: &database::SegmentStore, metrics: &crate::me
 		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
 
-	let mut timestamps = Vec::with_capacity(request.points.len());
-	let mut values = Vec::with_capacity(request.points.len());
+	let point_count = request.points.len();
+	let mut timestamps = Vec::with_capacity(point_count);
+	let mut values = Vec::with_capacity(point_count);
 	let mut any_null = false;
-	for point in &request.points {
-		timestamps.push(point.timestamp);
-		match &point.value {
-			None => {
-				any_null = true;
-				values.push(None);
-			}
-			Some(text) => {
-				let parsed: BigDecimal = text.parse().map_err(|_| StorageError::BadRequest(format!("value {text:?} (at timestamp {}) is not a decimal", point.timestamp)))?;
-				values.push(Some(parsed));
+	// `storage.ingest.parse` child span (roadmap Phase 3 — the write-path analogue of
+	// the compute-path parse span): the decimal-text → `BigDecimal` value lift of the
+	// batch, timed apart from the seal so a `RUST_LOG` run attributes ingest value
+	// parsing separately from the segment write.
+	{
+		let _parse = tracing::info_span!("storage.ingest.parse", point_count, format = "json").entered();
+		for point in &request.points {
+			timestamps.push(point.timestamp);
+			match &point.value {
+				None => {
+					any_null = true;
+					values.push(None);
+				}
+				Some(text) => {
+					let parsed: BigDecimal = text.parse().map_err(|_| StorageError::BadRequest(format!("value {text:?} (at timestamp {}) is not a decimal", point.timestamp)))?;
+					values.push(Some(parsed));
+				}
 			}
 		}
 	}
 
 	enforce_order_if_required(request.require_sorted, &timestamps)?;
-	let descriptor = seal_batch(store, aspect, &schema, &timestamps, &values, any_null, request.rows_per_page).await.map_err(|err| classify_seal_error(&err))?;
+	// `storage.ingest.seal` child span (roadmap Phase 3): the typed-column encode +
+	// `.dspseg` write + control-plane index update — the write stage timed apart from
+	// value parsing.
+	let descriptor = seal_batch(store, aspect, &schema, &timestamps, &values, any_null, request.rows_per_page).instrument(tracing::info_span!("storage.ingest.seal", point_count, any_null, format = "json")).await.map_err(|err| classify_seal_error(&err))?;
 	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
 	let response = IngestResponse {
 		aspect: aspect.to_string(),
@@ -651,9 +739,12 @@ async fn ingest_csv_inner(store: &database::SegmentStore, metrics: &crate::metri
 	let Some(schema) = store.schema_for(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))? else {
 		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
-	let ParsedCsv { timestamps, values, any_null } = parse_csv_points(body)?;
+	// `storage.ingest.parse` decode span (roadmap Phase 3): the CSV text → typed
+	// `(timestamp, value)` columns, timed apart from the seal.
+	let ParsedCsv { timestamps, values, any_null } = tracing::info_span!("storage.ingest.parse", format = "csv").in_scope(|| parse_csv_points(body))?;
 	enforce_order_if_required(require_sorted, &timestamps)?;
-	let descriptor = seal_batch(store, aspect, &schema, &timestamps, &values, any_null, rows_per_page).await.map_err(|err| classify_seal_error(&err))?;
+	let point_count = timestamps.len();
+	let descriptor = seal_batch(store, aspect, &schema, &timestamps, &values, any_null, rows_per_page).instrument(tracing::info_span!("storage.ingest.seal", point_count, any_null, format = "csv")).await.map_err(|err| classify_seal_error(&err))?;
 	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
 	let response = IngestResponse {
 		aspect: aspect.to_string(),
@@ -766,23 +857,34 @@ async fn ingest_ilp_inner(store: &database::SegmentStore, metrics: &crate::metri
 	let Some(schema) = store.schema_for(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))? else {
 		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
-	let points = dsp_line_protocol::parse_points(body, &params.field, precision).map_err(|err| StorageError::BadRequest(err.to_string()))?;
+	// `storage.ingest.parse` decode span (roadmap Phase 3): the line-protocol text →
+	// typed points, timed apart from the timestamp normalization and the seal.
+	let points = tracing::info_span!("storage.ingest.parse", format = "ilp", field = %params.field).in_scope(|| dsp_line_protocol::parse_points(body, &params.field, precision)).map_err(|err| StorageError::BadRequest(err.to_string()))?;
 	if points.is_empty() {
 		return Err(StorageError::BadRequest(format!("no points carrying field `{}` with a timestamp in the payload", params.field)));
 	}
 
-	let mut timestamps = Vec::with_capacity(points.len());
-	let mut values = Vec::with_capacity(points.len());
-	for point in points {
-		let epoch = epoch_in_unit(point.timestamp, schema.timestamp_unit).ok_or_else(|| StorageError::BadRequest(format!("timestamp {} is outside the range of the declared `{}` unit", point.timestamp, schema.timestamp_unit.name())))?;
-		timestamps.push(epoch);
-		values.push(point.value);
-	}
+	// `storage.ingest.normalize` span (roadmap Phase 3): rescale each wire epoch to the
+	// aspect's declared `TimeUnit` — the timestamp-normalization stage, distinct from
+	// the wire decode above.
+	let (timestamps, values) = {
+		let _normalize = tracing::info_span!("storage.ingest.normalize", point_count = points.len(), unit = %schema.timestamp_unit.name()).entered();
+		let mut timestamps = Vec::with_capacity(points.len());
+		let mut values = Vec::with_capacity(points.len());
+		for point in points {
+			let epoch = epoch_in_unit(point.timestamp, schema.timestamp_unit).ok_or_else(|| StorageError::BadRequest(format!("timestamp {} is outside the range of the declared `{}` unit", point.timestamp, schema.timestamp_unit.name())))?;
+			timestamps.push(epoch);
+			values.push(point.value);
+		}
+		(timestamps, values)
+	};
 
 	enforce_order_if_required(params.require_sorted, &timestamps)?;
+	let point_count = timestamps.len();
+	let seal_span = tracing::info_span!("storage.ingest.seal", point_count, format = "ilp");
 	let descriptor = match params.rows_per_page {
-		Some(rows_per_page) => store.seal_paged(aspect, &schema, &timestamps, &values, rows_per_page).await,
-		None => store.seal(aspect, &schema, &timestamps, &values).await,
+		Some(rows_per_page) => store.seal_paged(aspect, &schema, &timestamps, &values, rows_per_page).instrument(seal_span).await,
+		None => store.seal(aspect, &schema, &timestamps, &values).instrument(seal_span).await,
 	}
 	.map_err(|err| classify_seal_error(&err))?;
 	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
@@ -1032,6 +1134,31 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn reconcile_store_endpoint_split_min_bytes_carves_cold_prefixes() {
+		let dir = TempDir::new().unwrap();
+		let sc = dsp_physical_type::AspectSchema::new(dsp_physical_type::PhysicalType::F64, "0".parse().unwrap(), dsp_physical_type::TimeUnit::Seconds);
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+		store.declare("a", &sc).await.expect("declares a");
+		// A dominant cold base + a small late tail that re-enters it.
+		let base_ts: Vec<i64> = (0..=10).map(|i| i * 10).collect();
+		let base_vs: Vec<bigdecimal::BigDecimal> = (0..=10).map(|i| i.to_string().parse().unwrap()).collect();
+		store.seal("a", &sc, &base_ts, &base_vs).await.expect("base");
+		store.seal("a", &sc, &[90_i64, 100, 110], &["900".parse().unwrap(), "1000".parse().unwrap(), "1100".parse().unwrap()]).await.expect("late");
+
+		let router = app_with_state(AppState::new().with_store(store.clone()));
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/reconcile?overlaps=true&split_min_bytes=1").body(Body::empty()).unwrap()).await.unwrap();
+		let status = response.status();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		let segments_after = store.segment_count("a").await.unwrap();
+		drop(store);
+		assert_eq!(status, StatusCode::OK, "body: {json}");
+		assert_eq!(json["aspects_reconciled"], 1, "a carried overlap and was split");
+		assert_eq!(json["overlapping_segments"], 0);
+		assert_eq!(segments_after, 2, "the store-wide split carved the cold prefix off (vs 1 under the default floor)");
+	}
+
+	#[tokio::test]
 	async fn reconcile_store_endpoint_hot_cold_defers_hot_tails() {
 		let dir = TempDir::new().unwrap();
 		let sc = dsp_physical_type::AspectSchema::new(dsp_physical_type::PhysicalType::F64, "0".parse().unwrap(), dsp_physical_type::TimeUnit::Seconds);
@@ -1113,6 +1240,85 @@ mod tests {
 		assert_eq!(json["reconciled"], 1, "one segment merged away");
 		assert_eq!(json["overlapping_segments"], 0, "no cross-segment overlap remains");
 		assert_eq!(segments_after, 1, "the overlapping pair collapsed to one segment");
+	}
+
+	#[tokio::test]
+	async fn reconcile_aspect_endpoint_split_min_bytes_carves_the_cold_prefix() {
+		let dir = TempDir::new().unwrap();
+		let sc = dsp_physical_type::AspectSchema::new(dsp_physical_type::PhysicalType::F64, "0".parse().unwrap(), dsp_physical_type::TimeUnit::Seconds);
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+		store.declare("a", &sc).await.expect("declares a");
+		// A long cold base [0..100] plus a small late tail [90,100,110] that re-enters it.
+		let base_ts: Vec<i64> = (0..=10).map(|i| i * 10).collect();
+		let base_vs: Vec<bigdecimal::BigDecimal> = (0..=10).map(|i| i.to_string().parse().unwrap()).collect();
+		store.seal("a", &sc, &base_ts, &base_vs).await.expect("base");
+		store.seal("a", &sc, &[90_i64, 100, 110], &["900".parse().unwrap(), "1000".parse().unwrap(), "1100".parse().unwrap()]).await.expect("late");
+
+		let router = app_with_state(AppState::new().with_store(store.clone()));
+		// A tiny split floor forces the dominant cold prefix to split off.
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/a/reconcile?overlaps=true&split_min_bytes=1").body(Body::empty()).unwrap()).await.unwrap();
+		let status = response.status();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		let segments_after = store.segment_count("a").await.unwrap();
+		drop(store);
+		assert_eq!(status, StatusCode::OK, "body: {json}");
+		assert_eq!(json["mode"], "overlaps");
+		assert_eq!(json["overlapping_segments"], 0, "the two halves are disjoint");
+		assert_eq!(segments_after, 2, "cold prefix split off from the hot suffix (vs 1 under the default floor)");
+	}
+
+	#[tokio::test]
+	async fn squash_endpoint_folds_segments_into_one() {
+		let dir = TempDir::new().unwrap();
+		let sc = dsp_physical_type::AspectSchema::new(dsp_physical_type::PhysicalType::F64, "0".parse().unwrap(), dsp_physical_type::TimeUnit::Seconds);
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+		store.declare("a", &sc).await.expect("declares a");
+		// Three time-disjoint segments (as repeated split carve-offs leave behind).
+		store.seal("a", &sc, &[0_i64, 10], &["0".parse().unwrap(), "1".parse().unwrap()]).await.expect("s0");
+		store.seal("a", &sc, &[20_i64, 30], &["2".parse().unwrap(), "3".parse().unwrap()]).await.expect("s1");
+		store.seal("a", &sc, &[40_i64, 50], &["4".parse().unwrap(), "5".parse().unwrap()]).await.expect("s2");
+
+		let router = app_with_state(AppState::new().with_store(store.clone()));
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/a/squash").body(Body::empty()).unwrap()).await.unwrap();
+		let status = response.status();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		let count_after = store.segment_count("a").await.unwrap();
+		drop(store);
+		assert_eq!(status, StatusCode::OK, "body: {json}");
+		assert_eq!(json["triggered"], true);
+		assert_eq!(json["removed"], 2, "three segments folded to one");
+		assert_eq!(json["segment_count"], 1);
+		assert_eq!(count_after, 1);
+	}
+
+	#[tokio::test]
+	async fn squash_endpoint_max_segments_gates_the_pass() {
+		let dir = TempDir::new().unwrap();
+		let sc = dsp_physical_type::AspectSchema::new(dsp_physical_type::PhysicalType::F64, "0".parse().unwrap(), dsp_physical_type::TimeUnit::Seconds);
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+		store.declare("a", &sc).await.expect("declares a");
+		store.seal("a", &sc, &[0_i64, 10], &["0".parse().unwrap(), "1".parse().unwrap()]).await.expect("s0");
+		store.seal("a", &sc, &[20_i64, 30], &["2".parse().unwrap(), "3".parse().unwrap()]).await.expect("s1");
+
+		// Cap 5 → holds (2 segments not > 5).
+		let router = app_with_state(AppState::new().with_store(store.clone()));
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/a/squash?max_segments=5").body(Body::empty()).unwrap()).await.unwrap();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		assert_eq!(json["triggered"], false, "held below the cap");
+		assert_eq!(json["removed"], 0);
+		assert_eq!(json["segment_count"], 2, "nothing rewritten");
+		drop(store);
+	}
+
+	#[tokio::test]
+	async fn squash_undeclared_aspect_is_not_found() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_empty_store(&dir).await;
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/never_declared/squash").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::NOT_FOUND);
 	}
 
 	#[tokio::test]

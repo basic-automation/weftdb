@@ -50,6 +50,10 @@ serial_test = { version = "3", default-features = false, features = ["async"] }
 tracing = "0"
 tracing-core = "0"
 tracing-subscriber = { version = "0", features = ["env-filter"] }
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
+tracing-opentelemetry = "0.33"
 once_cell = "1"
 md5 = "0"
 rand_chacha = "0.9"

@@ -32,6 +32,7 @@ use axum::{
 };
 use bigdecimal::BigDecimal;
 use serde::{Deserialize, Serialize};
+use tracing::Instrument as _;
 
 use crate::{manage::IngestResponse, state::AppState};
 
@@ -182,7 +183,7 @@ pub async fn storage_time_range_csv(State(state): State<AppState>, Path(aspect):
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	drop(state);
 	require_schema(&store, &aspect).await?;
-	let result = store.read_time_range(&aspect, params.start, params.end).await;
+	let result = store.read_time_range(&aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "csv")).await;
 	drop(store);
 	let (timestamps, values) = result.map_err(|err| classify_read_error(&err))?;
 	Ok(csv_response(render_csv(timestamps.into_iter().zip(values))))
@@ -205,7 +206,7 @@ pub async fn storage_value_range_csv(State(state): State<AppState>, Path(aspect)
 	let lo: BigDecimal = params.lo.parse().map_err(|_| StorageError::BadRequest(format!("`lo` is not a decimal: {:?}", params.lo)))?;
 	let hi: BigDecimal = params.hi.parse().map_err(|_| StorageError::BadRequest(format!("`hi` is not a decimal: {:?}", params.hi)))?;
 	require_schema(&store, &aspect).await?;
-	let result = store.read_value_range(&aspect, &lo, &hi).await;
+	let result = store.read_value_range(&aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "csv")).await;
 	drop(store);
 	let (timestamps, values) = result.map_err(|err| classify_read_error(&err))?;
 	Ok(csv_response(render_csv(timestamps.into_iter().zip(values.into_iter().map(Some)))))
@@ -225,7 +226,9 @@ pub async fn storage_value_range_csv(State(state): State<AppState>, Path(aspect)
 pub async fn storage_time_range(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<TimeRangeParams>) -> Result<Response, StorageError> {
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	drop(state);
-	let result = dsp_arrow_store::read_time_range_to_ipc_bytes(&store, &aspect, params.start, params.end).await;
+	// The columnar read + Arrow encode are fused in the arrow-store call, so one span
+	// covers both stages of this format's hot path.
+	let result = dsp_arrow_store::read_time_range_to_ipc_bytes(&store, &aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "arrow")).await;
 	drop(store);
 	Ok(arrow_stream_response(result.map_err(|err| classify_read_error(&err))?))
 }
@@ -244,7 +247,7 @@ pub async fn storage_value_range(State(state): State<AppState>, Path(aspect): Pa
 	drop(state);
 	let lo: BigDecimal = params.lo.parse().map_err(|_| StorageError::BadRequest(format!("`lo` is not a decimal: {:?}", params.lo)))?;
 	let hi: BigDecimal = params.hi.parse().map_err(|_| StorageError::BadRequest(format!("`hi` is not a decimal: {:?}", params.hi)))?;
-	let result = dsp_arrow_store::read_value_range_to_ipc_bytes(&store, &aspect, &lo, &hi).await;
+	let result = dsp_arrow_store::read_value_range_to_ipc_bytes(&store, &aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "arrow")).await;
 	drop(store);
 	Ok(arrow_stream_response(result.map_err(|err| classify_read_error(&err))?))
 }
@@ -263,7 +266,7 @@ pub async fn storage_value_range(State(state): State<AppState>, Path(aspect): Pa
 pub async fn storage_time_range_parquet(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<TimeRangeParams>) -> Result<Response, StorageError> {
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	drop(state);
-	let result = dsp_arrow_store::read_time_range_to_parquet_bytes(&store, &aspect, params.start, params.end).await;
+	let result = dsp_arrow_store::read_time_range_to_parquet_bytes(&store, &aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "parquet")).await;
 	drop(store);
 	Ok(parquet_response(result.map_err(|err| classify_read_error(&err))?))
 }
@@ -283,7 +286,7 @@ pub async fn storage_value_range_parquet(State(state): State<AppState>, Path(asp
 	drop(state);
 	let lo: BigDecimal = params.lo.parse().map_err(|_| StorageError::BadRequest(format!("`lo` is not a decimal: {:?}", params.lo)))?;
 	let hi: BigDecimal = params.hi.parse().map_err(|_| StorageError::BadRequest(format!("`hi` is not a decimal: {:?}", params.hi)))?;
-	let result = dsp_arrow_store::read_value_range_to_parquet_bytes(&store, &aspect, &lo, &hi).await;
+	let result = dsp_arrow_store::read_value_range_to_parquet_bytes(&store, &aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "parquet")).await;
 	drop(store);
 	Ok(parquet_response(result.map_err(|err| classify_read_error(&err))?))
 }
@@ -415,6 +418,11 @@ pub struct PointsRangeParams {
 	/// offset and supersedes `offset`.
 	#[serde(default)]
 	pub page: Option<usize>,
+	/// Opaque forward-iteration cursor (from a prior response's `next_cursor`). When
+	/// present it supersedes `offset`/`page` as the start position; a malformed token
+	/// is a `400`.
+	#[serde(default)]
+	pub cursor: Option<String>,
 }
 
 /// Response body for `GET /api/v1/storage/{aspect}/points` — the JSON (non-Arrow)
@@ -441,6 +449,11 @@ pub struct StoredRangeResponse {
 	/// (`page` supplied).
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub page: Option<usize>,
+	/// Opaque forward-iteration cursor for the **next** page (roadmap B-rest): present
+	/// when more rows remain past this page, absent at the end of the window. A client
+	/// pages by re-issuing the request with `?cursor=<next_cursor>` until it is absent.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub next_cursor: Option<String>,
 	/// The rows in this page, in segment-seal then in-segment order.
 	pub points: Vec<StoredPoint>,
 }
@@ -453,7 +466,9 @@ pub struct StoredRangeResponse {
 /// aspect's declared timestamp unit. Optional `offset`/`limit` paginate the window
 /// (backlog B-rest), with the declarative `take` (alias for `limit`) and `page`
 /// (1-based, derives the offset) aliases also accepted; `total` reports the
-/// pre-pagination row count.
+/// pre-pagination row count. For stable forward iteration a client follows the
+/// opaque `next_cursor` (re-issuing with `?cursor=…` until it is absent) instead of
+/// managing offsets; a cursor supersedes `offset`/`page`.
 ///
 /// # Errors
 ///
@@ -467,18 +482,22 @@ pub async fn storage_time_range_json(State(state): State<AppState>, Path(aspect)
 	let Some(schema) = schema else {
 		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
-	let result = store.read_time_range(&aspect, params.start, params.end).await;
+	let result = store.read_time_range(&aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "json")).await;
 	drop(store);
 	let (timestamps, values) = result.map_err(|err| classify_read_error(&err))?;
 	let total = timestamps.len();
-	let (offset, page_size, page) = resolve_pagination(params.offset, params.limit, params.take, params.page);
-	// Paginate: skip `offset` rows of the window, take at most `page_size`.
-	let paginated = timestamps.into_iter().zip(values).skip(offset);
-	let points: Vec<StoredPoint> = match page_size {
-		Some(size) => paginated.take(size).map(|(timestamp, value)| StoredPoint { timestamp, value: value.map(|v| v.to_string()) }).collect(),
-		None => paginated.map(|(timestamp, value)| StoredPoint { timestamp, value: value.map(|v| v.to_string()) }).collect(),
-	};
-	Ok(Json(StoredRangeResponse { aspect, time_unit: schema.timestamp_unit.name(), total, count: points.len(), offset, limit: page_size, page, points }))
+	let (offset, page_size, page) = resolve_pagination_with_cursor(params.offset, params.limit, params.take, params.page, params.cursor.as_deref())?;
+	// Paginate + stringify under a serialize span: skip `offset` rows of the window,
+	// take at most `page_size`.
+	let points: Vec<StoredPoint> = tracing::info_span!("storage.range.serialize", total, offset).in_scope(|| {
+		let paginated = timestamps.into_iter().zip(values).skip(offset);
+		match page_size {
+			Some(size) => paginated.take(size).map(|(timestamp, value)| StoredPoint { timestamp, value: value.map(|v| v.to_string()) }).collect(),
+			None => paginated.map(|(timestamp, value)| StoredPoint { timestamp, value: value.map(|v| v.to_string()) }).collect(),
+		}
+	});
+	let next_cursor = next_cursor(offset, points.len(), total);
+	Ok(Json(StoredRangeResponse { aspect, time_unit: schema.timestamp_unit.name(), total, count: points.len(), offset, limit: page_size, page, next_cursor, points }))
 }
 
 /// Resolve the declarative B-rest pagination params shared by the JSON range reads
@@ -492,6 +511,44 @@ fn resolve_pagination(offset: Option<usize>, limit: Option<usize>, take: Option<
 	let page_size = limit.or(take);
 	let offset = page.map_or_else(|| offset.unwrap_or(0), |page| page_size.map_or(0, |size| page.saturating_sub(1).saturating_mul(size)));
 	(offset, page_size, page.map(|page| page.max(1)))
+}
+
+/// Encode a forward-iteration position — a row offset in the deterministic read order
+/// — as an opaque **cursor** token (roadmap B-rest): the fixed-width hex of the
+/// offset. Paired with [`decode_cursor`]. A client following `next_cursor` never
+/// computes offsets itself; the token is stable while the window's rows are unchanged.
+fn encode_cursor(offset: usize) -> String {
+	format!("{offset:016x}")
+}
+
+/// Decode a [`encode_cursor`] token back to a row offset, or `None` when it is
+/// malformed (a handler surfaces that as a `400`).
+fn decode_cursor(token: &str) -> Option<usize> {
+	usize::from_str_radix(token.trim(), 16).ok()
+}
+
+/// Resolve the effective start offset and the `page`/`next_cursor` echoes from the
+/// declarative pagination params plus an optional forward-iteration `cursor`.
+///
+/// A present `cursor` supersedes `offset`/`page` (it *is* the resolved start position,
+/// so the `page` echo is cleared); a malformed `cursor` is a `400`. Returns the
+/// `(offset, page_size, page_echo)` triple that drives the slice.
+fn resolve_pagination_with_cursor(offset: Option<usize>, limit: Option<usize>, take: Option<usize>, page: Option<usize>, cursor: Option<&str>) -> Result<(usize, Option<usize>, Option<usize>), StorageError> {
+	let (offset, page_size, page) = resolve_pagination(offset, limit, take, page);
+	match cursor {
+		Some(token) => {
+			let cursor_offset = decode_cursor(token).ok_or_else(|| StorageError::BadRequest(format!("`cursor` is not a valid token: {token:?}")))?;
+			Ok((cursor_offset, page_size, None))
+		},
+		None => Ok((offset, page_size, page)),
+	}
+}
+
+/// The forward-iteration cursor for the *next* page: `Some(token)` when rows remain
+/// past the one just served (`start + count < total`), `None` at the end of the
+/// window (so a client stops when `next_cursor` is absent).
+fn next_cursor(start: usize, count: usize, total: usize) -> Option<String> {
+	(start + count < total).then(|| encode_cursor(start + count))
 }
 
 /// Query parameters for the JSON value-range read: the inclusive `[lo, hi]` value
@@ -515,6 +572,10 @@ pub struct ValuePointsParams {
 	/// 1-based page number; with a page size it derives the offset.
 	#[serde(default)]
 	pub page: Option<usize>,
+	/// Opaque forward-iteration cursor (from a prior response's `next_cursor`);
+	/// supersedes `offset`/`page`, malformed → `400`.
+	#[serde(default)]
+	pub cursor: Option<String>,
 }
 
 /// Handle `GET /api/v1/storage/{aspect}/value-points?lo&hi&offset&limit&take&page`.
@@ -540,17 +601,20 @@ pub async fn storage_value_range_json(State(state): State<AppState>, Path(aspect
 	let Some(schema) = schema else {
 		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
-	let result = store.read_value_range(&aspect, &lo, &hi).await;
+	let result = store.read_value_range(&aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "json")).await;
 	drop(store);
 	let (timestamps, values) = result.map_err(|err| classify_read_error(&err))?;
 	let total = timestamps.len();
-	let (offset, page_size, page) = resolve_pagination(params.offset, params.limit, params.take, params.page);
-	let paginated = timestamps.into_iter().zip(values).skip(offset);
-	let points: Vec<StoredPoint> = match page_size {
-		Some(size) => paginated.take(size).map(|(timestamp, value)| StoredPoint { timestamp, value: Some(value.to_string()) }).collect(),
-		None => paginated.map(|(timestamp, value)| StoredPoint { timestamp, value: Some(value.to_string()) }).collect(),
-	};
-	Ok(Json(StoredRangeResponse { aspect, time_unit: schema.timestamp_unit.name(), total, count: points.len(), offset, limit: page_size, page, points }))
+	let (offset, page_size, page) = resolve_pagination_with_cursor(params.offset, params.limit, params.take, params.page, params.cursor.as_deref())?;
+	let points: Vec<StoredPoint> = tracing::info_span!("storage.value_range.serialize", total, offset).in_scope(|| {
+		let paginated = timestamps.into_iter().zip(values).skip(offset);
+		match page_size {
+			Some(size) => paginated.take(size).map(|(timestamp, value)| StoredPoint { timestamp, value: Some(value.to_string()) }).collect(),
+			None => paginated.map(|(timestamp, value)| StoredPoint { timestamp, value: Some(value.to_string()) }).collect(),
+		}
+	});
+	let next_cursor = next_cursor(offset, points.len(), total);
+	Ok(Json(StoredRangeResponse { aspect, time_unit: schema.timestamp_unit.name(), total, count: points.len(), offset, limit: page_size, page, next_cursor, points }))
 }
 
 /// Query parameters for the single-instant point lookup: the instant `t` to read
@@ -601,7 +665,7 @@ pub async fn storage_point(State(state): State<AppState>, Path(aspect): Path<Str
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	drop(state);
 	let schema = require_schema(&store, &aspect).await?;
-	let result = store.read_point(&aspect, params.t).await;
+	let result = store.read_point(&aspect, params.t).instrument(tracing::info_span!("storage.point.read", %aspect, t = params.t)).await;
 	drop(store);
 	let value = result.map_err(|err| classify_read_error(&err))?;
 	let found = value.is_some();
@@ -1319,6 +1383,54 @@ mod tests {
 		// Offset 1 skips ts 100; the page is ts 110, 120.
 		assert_eq!(points[0]["timestamp"], 110);
 		assert_eq!(points[1]["timestamp"], 120);
+	}
+
+	#[tokio::test]
+	async fn points_cursor_iterates_the_window_forward() {
+		// The sealed `price` aspect holds five rows at ts 100..=140.
+		let (_dir, router) = router_with_sealed_price().await;
+		let mut seen: Vec<i64> = Vec::new();
+		let mut uri = "/api/v1/storage/price/points?start=100&end=140&limit=2".to_string();
+		let mut pages = 0;
+		loop {
+			pages += 1;
+			assert!(pages <= 6, "cursor iteration did not terminate");
+			let (status, body) = get_json(router.clone(), &uri).await;
+			assert_eq!(status, StatusCode::OK, "body: {body}");
+			for p in body["points"].as_array().unwrap() {
+				seen.push(p["timestamp"].as_i64().unwrap());
+			}
+			match body.get("next_cursor").and_then(serde_json::Value::as_str) {
+				Some(cursor) => uri = format!("/api/v1/storage/price/points?start=100&end=140&limit=2&cursor={cursor}"),
+				None => break,
+			}
+		}
+		// Three pages of 2/2/1 walk every row exactly once, in read order; no next_cursor
+		// on the final page.
+		assert_eq!(seen, vec![100, 110, 120, 130, 140]);
+		assert_eq!(pages, 3);
+	}
+
+	#[tokio::test]
+	async fn points_cursor_supersedes_offset_and_clears_page_echo() {
+		let (_dir, router) = router_with_sealed_price().await;
+		// cursor=0000000000000003 (offset 3) with an explicit offset=1 that it overrides.
+		let (status, body) = get_json(router, "/api/v1/storage/price/points?start=100&end=140&limit=2&offset=1&cursor=0000000000000003").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["offset"], 3, "the cursor position supersedes the explicit offset");
+		assert!(body.get("page").is_none(), "a cursor read clears the page echo");
+		let points = body["points"].as_array().unwrap();
+		assert_eq!(points.len(), 2, "rows 130 and 140 remain from offset 3");
+		assert_eq!(points[0]["timestamp"], 130);
+		assert_eq!(points[1]["timestamp"], 140);
+		assert!(body.get("next_cursor").is_none(), "offset 3 + 2 rows = 5 = total → end of window");
+	}
+
+	#[tokio::test]
+	async fn points_malformed_cursor_is_a_bad_request() {
+		let (_dir, router) = router_with_sealed_price().await;
+		let (status, _body) = get_json(router, "/api/v1/storage/price/points?start=100&end=140&cursor=zzzz").await;
+		assert_eq!(status, StatusCode::BAD_REQUEST);
 	}
 
 	#[tokio::test]

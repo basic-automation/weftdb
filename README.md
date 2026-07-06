@@ -326,9 +326,14 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   **bytes/point** (the north-star cost term) before anything is written.
 - **Timestamp codecs** — integer-epoch timestamps (`TimeUnit` =
   seconds/millis/micros/nanos) with lossless **delta** and **delta-of-delta**
-  transforms, zig-zag + LEB128 varints, **RLE** of the second-difference stream,
-  and a **fixed-width bit-packing** codec, with a smallest-wins selector. A
-  regular 1000-point column packs to ~12 bytes total.
+  transforms and **four** interchangeable second-difference codecs — per-value
+  zig-zag + LEB128 **varint**, **RLE**, **fixed-width bit-packing**, and a
+  **Gorilla-style variable-length** codec — chosen per column by a smallest-wins
+  selector. Each wins a different regime: bit-packing on regular/small-jitter series,
+  RLE on long constant runs, Gorilla on **scattered single jitter** (isolated moderate
+  spikes among regular intervals, where RLE cannot form runs and bit-packing must widen
+  every value — so Gorilla is materially smaller there). A regular 1000-point column
+  packs to ~12 bytes total.
 
 ### Segment store (`.dspseg` + `database::SegmentStore`)
 
@@ -336,12 +341,13 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   delta-of-delta timestamp column with min/max timestamp/value stats, row/null
   counts, and a format version. The on-disk frame is hand-rolled, versioned, and
   **CRC-32-verified before parse**, so a corrupt or truncated file fails fast.
-- **Bit-packed timestamps** — the timestamp block writes its second-difference
-  stream under whichever codec is smaller (fixed-width **bit-packing** vs per-value
-  zig-zag varint), chosen by a self-describing selector byte the reader dispatches
-  on. A regular series packs to a handful of bytes on disk (a 1000-point regular
-  block stores in <20 bytes), so the bytes/point saving is *realized*, not just
-  estimated.
+- **Multi-codec timestamps** — the timestamp block writes its second-difference
+  stream under whichever of **four** codecs is smallest — fixed-width **bit-packing**,
+  per-value zig-zag **varint**, **RLE**, or **Gorilla** variable-length — chosen by a
+  self-describing selector byte the reader dispatches on, routed through the single
+  source of truth so the reported codec name always matches the bytes on disk. A
+  regular series packs to a handful of bytes on disk (a 1000-point regular block stores
+  in <20 bytes), so the bytes/point saving is *realized*, not just estimated.
 - **Order semantics** — every segment records whether its timestamps are monotonic
   (`time_sorted`). Ingest can *enforce* order (`require_sorted` rejects an
   out-of-order batch rather than sealing it), and the per-aspect/store rollups carry
@@ -384,6 +390,21 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   timestamp" semantics. Drives `overlapping_segments` to zero; exposed on the reconcile
   endpoints with `?overlaps=true` and as a background daemon sweep
   (`DSP_RECONCILE_OVERLAPS`).
+- **Split-not-rewrite merge** — `SegmentStore::split_segment` carves a sorted segment
+  at a boundary into a cold prefix (kept id) + hot suffix (new id), and
+  `reconcile_overlaps_with_policy` consults a size-based `SplitPolicy`: when an overlap
+  component's cold prefix clears a byte floor **and** outweighs its hot suffix, only the
+  suffix is merged and the large cold prefix is left untouched, so later late arrivals
+  re-entering the hot window never rewrite it — QuestDB's partition-split write-amp
+  bound. The default `reconcile_overlaps` keeps QuestDB's 50 MiB floor (small components
+  full-rewrite); a floor is selectable with `?split_min_bytes=` on the per-aspect and
+  store-wide reconcile endpoints and `DSP_RECONCILE_SPLIT_MIN_BYTES` on the daemon.
+- **Squash** — `SegmentStore::squash_aspect`/`squash_aspect_if_exceeds`/
+  `squash_all_over_threshold` fold an aspect's segments back into one (newer-wins),
+  bounding the fragmentation repeated split carve-offs create — QuestDB's
+  `max.splits` squash trigger. Exposed as `POST …/{aspect}/squash?max_segments=` and on
+  the daemon with `DSP_RECONCILE_MAX_SPLITS` (squash aspects over the cap each tick,
+  after the overlap merge that accumulates the splits).
 - **Null/quality column** — a per-row presence bitmap (zero bytes for fully dense
   columns) makes gaps real: present values are stored densely and reconstructed
   as `None` on read.
@@ -499,10 +520,11 @@ under the declared encoding/tolerance is rejected `400`.
 | `GET /api/v1/storage/{aspect}/range` · `…/value-range` | Stream a stored time window / value band as **Arrow IPC** (`application/vnd.apache.arrow.stream`). |
 | `GET …/range.parquet` · `…/value-range.parquet` | The same windows as **Parquet** files. |
 | `GET …/range.csv` · `…/value-range.csv` | The same windows as **CSV** (lossless decimal-text values; empty field = null). |
-| `GET /api/v1/storage/{aspect}/points` · `…/value-points` | Lossless JSON reads with declarative pagination — `offset`/`limit` (+ `take` and 1-based `page` aliases), with `total`/`count`/`offset` in the body. |
+| `GET /api/v1/storage/{aspect}/points` · `…/value-points` | Lossless JSON reads with declarative pagination — `offset`/`limit` (+ `take` and 1-based `page` aliases), with `total`/`count`/`offset` in the body. For stable forward iteration the body also carries an opaque **`next_cursor`** while rows remain; a client re-issues with `?cursor=<token>` (supersedes `offset`/`page`; malformed → `400`) until it is absent. |
 | `GET /api/v1/storage/{aspect}/at?t=` | **Single-instant point lookup**: the present value at exactly `t` (lossless decimal text) or a `found:false` miss. An **order-signal-driven read planner** resolves each candidate segment with its persisted `time_sorted` flag — binary search on a sorted segment, linear scan only on an out-of-order one — after pruning the index to the files spanning `t`. |
-| `POST /api/v1/storage/{aspect}/reconcile` | **Reconciliation pass** (`mode` in the response). Default (intra-segment): rewrite every out-of-order segment of the aspect into a time-sorted one in place. `?threshold=N` gates it on `unsorted_segments >= N` (QuestDB-style split-count trigger). `?hot_cold=true` reconciles cold segments but defers the hot tail until the backlog reaches the threshold. `?overlaps=true` instead runs the **cross-segment overlap merge** (newer-wins) — `reconciled` is then the number of segments merged away. Returns `triggered`/`reconciled`/`cold_reconciled`/`hot_reconciled` and the post-pass `unsorted_segments` + `overlapping_segments`. |
-| `POST /api/v1/storage/reconcile` | **Store-wide reconciliation sweep** across every declared aspect: threshold (default), `?hot_cold=true`, or `?overlaps=true` (as above). Returns `mode`, `aspects_scanned` / `aspects_reconciled` / `segments_reconciled` (+ cold/hot split) and the post-sweep store-wide `unsorted_segments` + `overlapping_segments`. The manual counterpart to the background reconcile daemon (`DSP_RECONCILE_INTERVAL_SECS` / `DSP_RECONCILE_THRESHOLD` / `DSP_RECONCILE_HOT_COLD` / `DSP_RECONCILE_OVERLAPS`). |
+| `POST /api/v1/storage/{aspect}/reconcile` | **Reconciliation pass** (`mode` in the response). Default (intra-segment): rewrite every out-of-order segment of the aspect into a time-sorted one in place. `?threshold=N` gates it on `unsorted_segments >= N` (QuestDB-style split-count trigger). `?hot_cold=true` reconciles cold segments but defers the hot tail until the backlog reaches the threshold. `?overlaps=true` instead runs the **cross-segment overlap merge** (newer-wins) — `reconciled` is then the number of segments merged away, and `?split_min_bytes=N` makes that merge **split-not-rewrite** (carve off a dominant cold prefix instead of rewriting the whole component). Returns `triggered`/`reconciled`/`cold_reconciled`/`hot_reconciled` and the post-pass `unsorted_segments` + `overlapping_segments`. |
+| `POST /api/v1/storage/{aspect}/squash` | **Squash** the aspect's segments into one (newer-wins), bounding split-path fragmentation. `?max_segments=N` gates it (squash only when the count exceeds `N`). Returns `triggered`/`removed`/`segment_count`. |
+| `POST /api/v1/storage/reconcile` | **Store-wide reconciliation sweep** across every declared aspect: threshold (default), `?hot_cold=true`, or `?overlaps=true` (+ `?split_min_bytes=N` for split-not-rewrite). Returns `mode`, `aspects_scanned` / `aspects_reconciled` / `segments_reconciled` (+ cold/hot split) and the post-sweep store-wide `unsorted_segments` + `overlapping_segments`. The manual counterpart to the background reconcile daemon (`DSP_RECONCILE_INTERVAL_SECS` / `DSP_RECONCILE_THRESHOLD` / `DSP_RECONCILE_HOT_COLD` / `DSP_RECONCILE_OVERLAPS` / `DSP_RECONCILE_SPLIT_MIN_BYTES` / `DSP_RECONCILE_MAX_SPLITS`). |
 | `GET /api/v1/storage/{aspect}/stats` · `…/storage/stats` | Materialized per-aspect and store-wide rollups, including the realized **bytes/point** (the north-star cost term), an `unsorted_segments` order-health count (segments that would force a linear scan on a point lookup), and an `overlapping_segments` count (time-overlapping segments — the cross-segment order-health signal, computed by an index scan). Rollup fields are served from the control plane without opening a segment. |
 
 ### Metrics
@@ -662,7 +684,10 @@ DSP is configured primarily through environment variables:
 | `DSP_RECONCILE_THRESHOLD` | `dsp-server` | `unsorted_segments` backlog an aspect must reach before the daemon reconciles it. | `1` |
 | `DSP_RECONCILE_HOT_COLD` | `dsp-server` | Truthy → the daemon reconciles cold segments each tick and defers the hot tail until the threshold. | unset (all-or-nothing) |
 | `DSP_RECONCILE_OVERLAPS` | `dsp-server` | Truthy → each daemon tick also merges cross-segment time-overlap groups. | unset (disabled) |
-| `RUST_LOG` | all | [`tracing`](https://docs.rs/tracing) filter. On `dsp-server` it drives the compute-path spans (`interpolate.engine`, `downsample.reduce`, with busy/idle timing). | `dsp_tui=debug,database=debug,info` |
+| `DSP_RECONCILE_SPLIT_MIN_BYTES` | `dsp-server` | Split-not-rewrite floor (bytes) for the daemon's overlap merge; a dominant cold prefix clearing it is split off rather than rewritten. | unset (default 50 MiB floor → full-rewrite) |
+| `DSP_RECONCILE_MAX_SPLITS` | `dsp-server` | Segment-count cap; each tick also squashes every aspect over it into one segment (bounds split-path fragmentation). | unset (no squash) |
+| `RUST_LOG` | all | [`tracing`](https://docs.rs/tracing) filter. On `dsp-server` it drives a per-request root span (`request{method,path,request_id}`, echoed as `x-request-id`) that every per-stage span nests under, each with busy/idle timing: the compute paths (`interpolate.parse`/`compute`/`serialize` under `interpolate.engine`, `downsample.parse`/`reduce`); the **storage read** paths (`storage.{range,value_range,point}.read` + `.serialize`, with a `format` field over JSON/CSV/Arrow/Parquet); the **ingest** paths (`storage.ingest.parse`/`normalize`/`seal` for ILP/CSV/JSON); and the background **reconcile daemon** (`reconcile.tick{kind,…,aspects,segments}`). | `dsp_tui=debug,database=debug,info` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `dsp-server` | When set (e.g. `http://localhost:4317`), export tracing spans to an OpenTelemetry collector over **OTLP/gRPC** in addition to the `RUST_LOG` `fmt` output. Unset → no exporter, no network dependency; a misconfigured/absent collector never blocks startup. | unset (export disabled) |
 | `SKIP_SLOW_TESTS` | tests | Set to `1` to skip long-running tests. | unset |
 
 The database root directory is resolved in this order:

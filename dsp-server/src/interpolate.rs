@@ -23,6 +23,7 @@ use chrono::{DateTime, Utc};
 use dsp_line_protocol::TimestampPrecision;
 use serde::{Deserialize, Serialize};
 use splimes::{Point, Resolution, Spline};
+use tracing::Instrument as _;
 
 use crate::metrics::SharedMetrics;
 
@@ -263,10 +264,16 @@ async fn interpolate_inner(request: InterpolateRequest) -> Result<Json<Interpola
 	}
 
 	let input_points = request.points.len();
+	// `interpolate.parse` child span (roadmap Phase 3): the f64 → `BigDecimal` value
+	// lift of every input sample, timed apart from the engine call so a `RUST_LOG` run
+	// attributes value-conversion cost separately from the kernel.
 	let mut points: Vec<Point> = Vec::with_capacity(input_points);
-	for sample in &request.points {
-		let value = BigDecimal::from_f64(sample.value).ok_or_else(|| ApiError::bad_request("a point value is not a finite number"))?;
-		points.push(Point::new(sample.timestamp, value));
+	{
+		let _parse = tracing::info_span!("interpolate.parse", input_points).entered();
+		for sample in &request.points {
+			let value = BigDecimal::from_f64(sample.value).ok_or_else(|| ApiError::bad_request("a point value is not a finite number"))?;
+			points.push(Point::new(sample.timestamp, value));
+		}
 	}
 
 	let start = request.start.unwrap_or_else(|| points.iter().map(|p| p.timestamp).min().unwrap_or_else(Utc::now));
@@ -281,8 +288,10 @@ async fn interpolate_inner(request: InterpolateRequest) -> Result<Json<Interpola
 /// Traced as the `interpolate.engine` span (roadmap Phase 3): it records the input
 /// point count, spline, and resolution at entry and the produced output-point count
 /// on completion, so a `RUST_LOG`-enabled run attributes the dominant compute cost of
-/// an interpolate request to the engine call. Per-stage child spans (value parse,
-/// serialize) are the next slice.
+/// an interpolate request to the engine call. Decomposed into `interpolate.compute`
+/// (the spline kernel) and `interpolate.serialize` (the `BigDecimal` → wire-f64 +
+/// provenance shaping) child spans; the f64 → `BigDecimal` input lift is timed by the
+/// sibling `interpolate.parse` span in [`interpolate_inner`].
 #[tracing::instrument(name = "interpolate.engine", skip_all, fields(input_points = input_points, spline = %spline, resolution = ?resolution, output_points = tracing::field::Empty))]
 async fn run_interpolation(mut points: Vec<Point>, start: DateTime<Utc>, end: DateTime<Utc>, spline: Spline, resolution: Resolution, input_points: usize) -> Result<Json<InterpolateResponse>, ApiError> {
 	if end < start {
@@ -298,9 +307,15 @@ async fn run_interpolation(mut points: Vec<Point>, start: DateTime<Utc>, end: Da
 	let min_ts = points.iter().map(|p| p.timestamp).min();
 	let max_ts = points.iter().map(|p| p.timestamp).max();
 
-	let output = splimes::auto_interpolate(&mut points, start, end, resolution, spline).await.map_err(|err| ApiError::internal(err.to_string()))?;
+	// `interpolate.compute` child span (roadmap Phase 3): the spline engine kernel
+	// itself, isolated from the surrounding provenance capture and result shaping so
+	// the dominant compute cost is attributable on its own.
+	let output = splimes::auto_interpolate(&mut points, start, end, resolution, spline).instrument(tracing::info_span!("interpolate.compute")).await.map_err(|err| ApiError::internal(err.to_string()))?;
 
-	let points: Vec<OutputPoint> = output.iter().map(|p| OutputPoint { timestamp: p.timestamp, value: p.value.to_f64().unwrap_or_default(), kind: classify(p.timestamp, &input_timestamps, min_ts, max_ts) }).collect();
+	// `interpolate.serialize` child span (roadmap Phase 3): the `BigDecimal` → wire-f64
+	// conversion and raw/interpolated/extrapolated provenance marking of every output
+	// grid point — the result-shaping stage timed apart from the kernel.
+	let points: Vec<OutputPoint> = tracing::info_span!("interpolate.serialize", output_points = output.len()).in_scope(|| output.iter().map(|p| OutputPoint { timestamp: p.timestamp, value: p.value.to_f64().unwrap_or_default(), kind: classify(p.timestamp, &input_timestamps, min_ts, max_ts) }).collect());
 
 	tracing::Span::current().record("output_points", points.len());
 	Ok(Json(InterpolateResponse { spline: spline_label, resolution: resolution_label, output_points: points.len(), input_points, points }))

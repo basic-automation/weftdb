@@ -20,7 +20,8 @@
 
 use std::{sync::Arc, time::Duration};
 
-use database::{HotColdSweep, OverlapSweep, ReconcileSweep, SegmentStore};
+use database::{HotColdSweep, OverlapSweep, ReconcileSweep, SegmentStore, SquashSweep};
+use tracing::Instrument as _;
 
 use crate::metrics::SharedMetrics;
 
@@ -45,6 +46,18 @@ pub struct ReconcileDaemonConfig {
 	/// after the intra-segment sweep, so late data that re-entered an already-covered
 	/// window is merged in the background too. Independent of `hot_cold`/`threshold`.
 	pub overlaps: bool,
+	/// Optional split-not-rewrite floor in **bytes** for the overlap merge (roadmap
+	/// Phase 4.6). When `Some` and `overlaps` is set, each overlap tick runs under a
+	/// [`SplitPolicy`](dsp_physical_type::SplitPolicy) with this floor, so an aspect's
+	/// dominant cold prefix is split off rather than fully rewritten. When `None`, the
+	/// merge uses the default 50 MiB floor (small components always full-rewrite).
+	pub split_min_bytes: Option<u64>,
+	/// Optional segment-count cap (roadmap Phase 4.6). When `Some`, each tick **also**
+	/// squashes every aspect whose segment count exceeds it into one segment
+	/// ([`reconcile_tick_squash`] / [`SegmentStore::squash_all_over_threshold`](database::SegmentStore::squash_all_over_threshold)),
+	/// bounding the fragmentation repeated split carve-offs create. When `None`, no
+	/// squash runs. Independent of `overlaps`/`hot_cold`/`threshold`.
+	pub squash_max_segments: Option<usize>,
 }
 
 /// Run one reconcile tick.
@@ -63,7 +76,10 @@ pub struct ReconcileDaemonConfig {
 /// [`SegmentStore::reconcile_all_over_threshold`](database::SegmentStore::reconcile_all_over_threshold)
 /// (a control-plane read, a segment read, or a re-seal failure).
 pub async fn reconcile_tick(store: &SegmentStore, metrics: &SharedMetrics, threshold: usize) -> anyhow::Result<ReconcileSweep> {
-	let sweep = store.reconcile_all_over_threshold(threshold).await?;
+	let span = tracing::info_span!("reconcile.tick", kind = "threshold", threshold, aspects = tracing::field::Empty, segments = tracing::field::Empty);
+	let sweep = store.reconcile_all_over_threshold(threshold).instrument(span.clone()).await?;
+	span.record("aspects", sweep.aspects_reconciled);
+	span.record("segments", sweep.segments_reconciled);
 	if sweep.aspects_reconciled > 0 {
 		metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_reconciled).unwrap_or(u64::MAX));
 	}
@@ -87,7 +103,10 @@ pub async fn reconcile_tick(store: &SegmentStore, metrics: &SharedMetrics, thres
 /// [`SegmentStore::reconcile_all_hot_cold`](database::SegmentStore::reconcile_all_hot_cold)
 /// (a control-plane read, a segment read, or a re-seal failure).
 pub async fn reconcile_tick_hot_cold(store: &SegmentStore, metrics: &SharedMetrics, threshold: usize) -> anyhow::Result<HotColdSweep> {
-	let sweep = store.reconcile_all_hot_cold(threshold).await?;
+	let span = tracing::info_span!("reconcile.tick", kind = "hot_cold", threshold, aspects = tracing::field::Empty, segments = tracing::field::Empty);
+	let sweep = store.reconcile_all_hot_cold(threshold).instrument(span.clone()).await?;
+	span.record("aspects", sweep.aspects_reconciled);
+	span.record("segments", sweep.segments_reconciled());
 	if sweep.aspects_reconciled > 0 {
 		metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_reconciled()).unwrap_or(u64::MAX));
 	}
@@ -109,9 +128,63 @@ pub async fn reconcile_tick_hot_cold(store: &SegmentStore, metrics: &SharedMetri
 /// [`SegmentStore::reconcile_all_overlaps`](database::SegmentStore::reconcile_all_overlaps)
 /// (a control-plane read, a segment read/write, or a re-seal failure).
 pub async fn reconcile_tick_overlaps(store: &SegmentStore, metrics: &SharedMetrics) -> anyhow::Result<OverlapSweep> {
-	let sweep = store.reconcile_all_overlaps().await?;
+	let span = tracing::info_span!("reconcile.tick", kind = "overlaps", aspects = tracing::field::Empty, segments = tracing::field::Empty);
+	let sweep = store.reconcile_all_overlaps().instrument(span.clone()).await?;
+	span.record("aspects", sweep.aspects_reconciled);
+	span.record("segments", sweep.segments_removed);
 	if sweep.aspects_reconciled > 0 {
 		metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_removed).unwrap_or(u64::MAX));
+	}
+	Ok(sweep)
+}
+
+/// Run one **cross-segment overlap** merge tick under an explicit split floor
+/// (roadmap Phase 4.6 — the split-not-rewrite path).
+///
+/// As [`reconcile_tick_overlaps`],
+/// but each aspect's merge runs through
+/// [`SegmentStore::reconcile_all_overlaps_with_policy`](database::SegmentStore::reconcile_all_overlaps_with_policy)
+/// under `SplitPolicy::new(min_split_bytes)`, so a dominant cold prefix is split off
+/// rather than fully rewritten. Records and returns exactly as
+/// [`reconcile_tick_overlaps`].
+///
+/// # Errors
+///
+/// Propagates a failure from
+/// [`SegmentStore::reconcile_all_overlaps_with_policy`](database::SegmentStore::reconcile_all_overlaps_with_policy).
+pub async fn reconcile_tick_overlaps_with_policy(store: &SegmentStore, metrics: &SharedMetrics, min_split_bytes: u64) -> anyhow::Result<OverlapSweep> {
+	let span = tracing::info_span!("reconcile.tick", kind = "overlaps_split", min_split_bytes, aspects = tracing::field::Empty, segments = tracing::field::Empty);
+	let sweep = store.reconcile_all_overlaps_with_policy(dsp_physical_type::SplitPolicy::new(min_split_bytes)).instrument(span.clone()).await?;
+	span.record("aspects", sweep.aspects_reconciled);
+	span.record("segments", sweep.segments_removed);
+	if sweep.aspects_reconciled > 0 {
+		metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_removed).unwrap_or(u64::MAX));
+	}
+	Ok(sweep)
+}
+
+/// Run one **squash** tick (roadmap Phase 4.6 — the squash half of the
+/// split-not-rewrite path).
+///
+/// Sweeps every aspect through
+/// [`SegmentStore::squash_all_over_threshold`](database::SegmentStore::squash_all_over_threshold),
+/// folding each aspect whose segment count exceeds `max_segments` into one segment —
+/// the bound on the fragmentation repeated split carve-offs create. Records the
+/// squashed aspects and removed segments in `metrics` (a squash is a pass, like a
+/// reconcile), and returns the [`SquashSweep`]. A sweep that squashed nothing records
+/// nothing.
+///
+/// # Errors
+///
+/// Propagates a failure from
+/// [`SegmentStore::squash_all_over_threshold`](database::SegmentStore::squash_all_over_threshold).
+pub async fn reconcile_tick_squash(store: &SegmentStore, metrics: &SharedMetrics, max_segments: usize) -> anyhow::Result<SquashSweep> {
+	let span = tracing::info_span!("reconcile.tick", kind = "squash", max_segments, aspects = tracing::field::Empty, segments = tracing::field::Empty);
+	let sweep = store.squash_all_over_threshold(max_segments).instrument(span.clone()).await?;
+	span.record("aspects", sweep.aspects_squashed);
+	span.record("segments", sweep.segments_removed);
+	if sweep.aspects_squashed > 0 {
+		metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_squashed).unwrap_or(u64::MAX), u64::try_from(sweep.segments_removed).unwrap_or(u64::MAX));
 	}
 	Ok(sweep)
 }
@@ -151,13 +224,30 @@ pub fn spawn_reconcile_daemon(store: Arc<SegmentStore>, metrics: SharedMetrics, 
 				}
 			}
 			// Optionally also merge cross-segment overlaps this tick (an independent axis).
+			// With a split floor configured, split dominant cold prefixes rather than
+			// fully rewriting each component.
 			if config.overlaps {
-				match reconcile_tick_overlaps(&store, &metrics).await {
+				let tick = match config.split_min_bytes {
+					Some(min) => reconcile_tick_overlaps_with_policy(&store, &metrics, min).await,
+					None => reconcile_tick_overlaps(&store, &metrics).await,
+				};
+				match tick {
 					Ok(sweep) if sweep.aspects_reconciled > 0 => {
 						println!("reconcile daemon (overlaps): scanned {} aspect(s), merged {} aspect(s) / removed {} segment(s)", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_removed);
 					},
 					Ok(_) => {},
 					Err(err) => eprintln!("reconcile daemon: overlap sweep failed: {err}"),
+				}
+			}
+			// Optionally cap split-path fragmentation by squashing over-threshold aspects
+			// (runs after the overlap merge, which is what accumulates the split segments).
+			if let Some(max_segments) = config.squash_max_segments {
+				match reconcile_tick_squash(&store, &metrics, max_segments).await {
+					Ok(sweep) if sweep.aspects_squashed > 0 => {
+						println!("reconcile daemon (squash): scanned {} aspect(s), squashed {} aspect(s) / removed {} segment(s)", sweep.aspects_scanned, sweep.aspects_squashed, sweep.segments_removed);
+					},
+					Ok(_) => {},
+					Err(err) => eprintln!("reconcile daemon: squash sweep failed: {err}"),
 				}
 			}
 		}
@@ -270,5 +360,58 @@ mod tests {
 		drop(store);
 		assert_eq!(quiet.aspects_reconciled, 0);
 		assert_eq!(snap2.reconcile.passes, 1, "the quiet overlap tick did not bump the pass counter");
+	}
+
+	#[tokio::test]
+	async fn overlaps_tick_with_policy_splits_a_dominant_cold_prefix() {
+		let dir = TempDir::new().unwrap();
+		let store = SegmentStore::open(dir.path()).await.unwrap();
+		store.declare("a", &schema()).await.unwrap();
+		// A long cold base [0..100] + a small late tail re-entering only its end.
+		let base_ts: Vec<i64> = (0..=10).map(|i| i * 10).collect();
+		let base_vs: Vec<BigDecimal> = (0..=10).map(BigDecimal::from).collect();
+		store.seal("a", &schema(), &base_ts, &base_vs).await.unwrap();
+		store.seal("a", &schema(), &[90_i64, 100, 110], &[bd("900"), bd("1000"), bd("1100")]).await.unwrap();
+		let metrics: SharedMetrics = Arc::new(Metrics::default());
+
+		// A tiny floor splits the cold prefix off (2 segments) instead of one full rewrite.
+		let sweep = reconcile_tick_overlaps_with_policy(&store, &metrics, 1).await.unwrap();
+		let snap = metrics.snapshot();
+		let stats = store.aspect_stats("a").await.unwrap();
+		drop(store);
+		assert_eq!(sweep.aspects_reconciled, 1, "the overlapping aspect was reconciled");
+		assert_eq!(sweep.segments_removed, 0, "a two-member split removes no segment net");
+		assert_eq!(snap.reconcile.passes, 1, "a split is still a pass");
+		assert_eq!(stats.segment_count, 2, "cold prefix split off from the hot suffix");
+		assert_eq!(stats.overlapping_segments, 0);
+	}
+
+	#[tokio::test]
+	async fn squash_tick_folds_over_threshold_aspects_and_records_metrics() {
+		let dir = TempDir::new().unwrap();
+		let store = SegmentStore::open(dir.path()).await.unwrap();
+		store.declare("a", &schema()).await.unwrap();
+		// Three disjoint segments (over a cap of 2).
+		store.seal("a", &schema(), &[0_i64, 10], &[bd("0"), bd("1")]).await.unwrap();
+		store.seal("a", &schema(), &[20_i64, 30], &[bd("2"), bd("3")]).await.unwrap();
+		store.seal("a", &schema(), &[40_i64, 50], &[bd("4"), bd("5")]).await.unwrap();
+		let metrics: SharedMetrics = Arc::new(Metrics::default());
+
+		let sweep = reconcile_tick_squash(&store, &metrics, 2).await.unwrap();
+		let snap = metrics.snapshot();
+		let count = store.segment_count("a").await.unwrap();
+		drop(store);
+		assert_eq!(sweep.aspects_squashed, 1);
+		assert_eq!(sweep.segments_removed, 2, "3 segments squashed to 1");
+		assert_eq!(snap.reconcile.passes, 1, "a squash is a pass");
+		assert_eq!(count, 1);
+
+		// A second tick at the same cap finds one segment (<= 2) and records nothing.
+		let store = SegmentStore::open(dir.path()).await.unwrap();
+		let quiet = reconcile_tick_squash(&store, &metrics, 2).await.unwrap();
+		let snap2 = metrics.snapshot();
+		drop(store);
+		assert_eq!(quiet.aspects_squashed, 0);
+		assert_eq!(snap2.reconcile.passes, 1, "the quiet squash tick did not bump the pass counter");
 	}
 }

@@ -349,6 +349,169 @@ pub fn bitpack_decode(width: u32, bytes: &[u8], count: usize) -> Vec<i64> {
 	out
 }
 
+/// Bit cost of one second-difference value under a **Gorilla-style variable-length**
+/// scheme (roadmap Phase 6.1 — evaluation of a per-value bucketed codec as a
+/// complement to fixed-width bit-packing).
+///
+/// Where [`bitpack_width`] pays the max width for *every* value in a block, Gorilla's
+/// timestamp scheme pays per value by magnitude bucket, so the common regular case (a
+/// zero delta-of-delta) costs a single bit and only genuine jitter pays more:
+///
+/// - `0` → 1 bit (control `0`) — the regular-interval case;
+/// - `[-63, 64]` → 9 bits (control `10` + 7);
+/// - `[-255, 256]` → 12 bits (control `110` + 9);
+/// - `[-2047, 2048]` → 16 bits (control `1110` + 12);
+/// - otherwise → 68 bits (control `1111` + a full 64-bit value).
+///
+/// The Gorilla paper's final bucket is 32 bits (it assumes deltas fit 32 bits); this
+/// uses 64 so the estimate stays a valid upper bound for an arbitrary `i64` timestamp
+/// delta. Estimation only — no bitstream is produced. *(src: Gorilla, VLDB'15 —
+/// bucketed delta-of-delta timestamp coding.)*
+#[must_use]
+pub const fn gorilla_dod_bits(dod: i64) -> usize {
+	if dod == 0 {
+		1
+	} else if dod >= -63 && dod <= 64 {
+		2 + 7
+	} else if dod >= -255 && dod <= 256 {
+		3 + 9
+	} else if dod >= -2047 && dod <= 2048 {
+		4 + 12
+	} else {
+		4 + 64
+	}
+}
+
+/// Estimated byte footprint of a second-difference stream under the Gorilla-style
+/// variable-length scheme: the summed [`gorilla_dod_bits`] over every value, rounded
+/// up to whole bytes.
+///
+/// Comparable with [`bitpack_bytes`] / [`zigzag_varint_bytes`] / [`rle_varint_bytes`]
+/// (all omit the externally-known row count). The win over fixed-width bit-packing
+/// shows on a **small-jitter** stream — mostly-zero second differences with rare large
+/// spikes — where bit-packing must widen every value to the spike's width while
+/// Gorilla pays one bit for each of the many zeros; on a *perfectly* regular stream
+/// bit-packing's zero-width case (one header byte, no data) still wins.
+#[must_use]
+pub fn gorilla_bytes(dods: &[i64]) -> usize {
+	let bits: usize = dods.iter().map(|&d| gorilla_dod_bits(d)).sum();
+	bits.div_ceil(8)
+}
+
+/// Write `n` low bits of `value` LSB-first at bit cursor `*bit` into a pre-sized
+/// buffer, advancing the cursor. Same bit order as [`bitpack_encode`], so the two
+/// codecs share a decode convention.
+fn gorilla_put_bits(out: &mut [u8], bit: &mut usize, value: u64, n: usize) {
+	for b in 0..n {
+		if (value >> b) & 1 == 1 {
+			out[(*bit + b) / 8] |= 1 << ((*bit + b) % 8);
+		}
+	}
+	*bit += n;
+}
+
+/// Read `n` bits LSB-first from `bytes` at bit cursor `*bit`, advancing the cursor.
+/// Bits past the buffer read as `0` (the exact inverse of [`gorilla_put_bits`] over a
+/// buffer sized to the written bit count). Inverse convention of [`bitpack_decode`].
+fn gorilla_get_bits(bytes: &[u8], bit: &mut usize, n: usize) -> u64 {
+	let mut v = 0_u64;
+	for b in 0..n {
+		let idx = *bit + b;
+		if bytes.get(idx / 8).is_some_and(|byte| (byte >> (idx % 8)) & 1 == 1) {
+			v |= 1 << b;
+		}
+	}
+	*bit += n;
+	v
+}
+
+/// Encode a second-difference stream under the **Gorilla-style variable-length**
+/// timestamp codec (roadmap Phase 6.1) — the realized inverse of the advisory
+/// [`gorilla_bytes`] estimate.
+///
+/// Each value is written LSB-first as a unary control prefix naming its magnitude
+/// bucket followed by an offset-binary payload of the bucket's width, exactly matching
+/// the bit budget [`gorilla_dod_bits`] charges:
+///
+/// - `0` (1 bit) — a zero second difference (the regular-interval case);
+/// - `10` + 7-bit offset for `[-63, 64]`;
+/// - `110` + 9-bit offset for `[-255, 256]`;
+/// - `1110` + 12-bit offset for `[-2047, 2048]`;
+/// - `1111` + a full 64-bit two's-complement word otherwise.
+///
+/// The offset payload is `dod + (2^(w-1) - 1)` in `w` bits (offset binary), which maps
+/// each bucket's `2^w` values onto `0..2^w` losslessly. The emitted length equals the
+/// [`gorilla_bytes`] estimate for the stream, so the size the selector weighs is the
+/// size actually stored. Exact inverse: [`decode_gorilla_dods`]. *(src: Gorilla,
+/// VLDB'15.)*
+#[must_use]
+#[allow(clippy::cast_sign_loss)] // offset-binary payload is non-negative by construction; the D bucket stores the raw two's-complement bit pattern.
+pub fn encode_gorilla_dods(dods: &[i64]) -> Vec<u8> {
+	let total_bits: usize = dods.iter().map(|&d| gorilla_dod_bits(d)).sum();
+	let mut out = vec![0_u8; total_bits.div_ceil(8)];
+	let mut bit = 0_usize;
+	for &dod in dods {
+		let (ones, width) = gorilla_control(dod);
+		for _ in 0..ones {
+			gorilla_put_bits(&mut out, &mut bit, 1, 1);
+		}
+		if ones < 4 {
+			gorilla_put_bits(&mut out, &mut bit, 0, 1);
+		}
+		if width == 64 {
+			gorilla_put_bits(&mut out, &mut bit, dod as u64, 64);
+		} else if width > 0 {
+			let bias = (1_i64 << (width - 1)) - 1;
+			gorilla_put_bits(&mut out, &mut bit, (dod + bias) as u64, width as usize);
+		}
+	}
+	out
+}
+
+/// The `(unary-ones, payload-width)` control pair for one second difference under the
+/// Gorilla codec: `(0, 0)` zero · `(1, 7)` · `(2, 9)` · `(3, 12)` · `(4, 64)`. Kept in
+/// lock-step with [`gorilla_dod_bits`]'s bucket boundaries.
+const fn gorilla_control(dod: i64) -> (u32, u32) {
+	if dod == 0 {
+		(0, 0)
+	} else if dod >= -63 && dod <= 64 {
+		(1, 7)
+	} else if dod >= -255 && dod <= 256 {
+		(2, 9)
+	} else if dod >= -2047 && dod <= 2048 {
+		(3, 12)
+	} else {
+		(4, 64)
+	}
+}
+
+/// Reconstruct `count` second differences from a [`encode_gorilla_dods`] buffer.
+///
+/// Reads each value's unary control prefix (consecutive `1`s up to four, terminated by
+/// a `0` for the first four classes) then its offset-binary payload, undoing the
+/// `+ (2^(w-1) - 1)` bias. Exact inverse of [`encode_gorilla_dods`].
+#[must_use]
+#[allow(clippy::cast_possible_wrap)] // each payload is < 2^12 (or the D bucket's exact 64-bit round-trip), so the i64 cast never wraps meaningfully.
+pub fn decode_gorilla_dods(bytes: &[u8], count: usize) -> Vec<i64> {
+	let mut out = Vec::with_capacity(count);
+	let mut bit = 0_usize;
+	for _ in 0..count {
+		let mut ones = 0_u32;
+		while ones < 4 && gorilla_get_bits(bytes, &mut bit, 1) == 1 {
+			ones += 1;
+		}
+		let dod = match ones {
+			0 => 0,
+			1 => gorilla_get_bits(bytes, &mut bit, 7) as i64 - ((1_i64 << 6) - 1),
+			2 => gorilla_get_bits(bytes, &mut bit, 9) as i64 - ((1_i64 << 8) - 1),
+			3 => gorilla_get_bits(bytes, &mut bit, 12) as i64 - ((1_i64 << 11) - 1),
+			_ => gorilla_get_bits(bytes, &mut bit, 64) as i64,
+		};
+		out.push(dod);
+	}
+	out
+}
+
 impl DeltaColumn {
 	/// Estimated packed size: the anchor (a full 8-byte `i64`) plus the
 	/// varint-coded delta stream.
@@ -407,26 +570,50 @@ impl DeltaOfDeltaColumn {
 		8 + self.first_delta.map_or(0, zigzag_varint_len) + bitpack_bytes(&self.dods)
 	}
 
-	/// The smallest of the plain-varint, RLE, and bit-packed second-difference
+	/// Estimated packed size with the second-difference stream coded under the
+	/// **Gorilla-style variable-length** scheme ([`gorilla_bytes`]): anchor + first
+	/// delta + bucketed-bit stream (roadmap Phase 6.1).
+	///
+	/// Now **realized on disk** (roadmap Phase 6.1): the `.dspseg` timestamp block
+	/// carries a Gorilla codec option ([`encode_gorilla_dods`]) and this estimate is
+	/// folded into [`best_estimated_bytes`](Self::best_estimated_bytes) /
+	/// [`best_encoding_name`](Self::best_encoding_name), so a segment whose scattered
+	/// jitter Gorilla codes smallest stores — and reports — the Gorilla size. Because
+	/// [`encode_gorilla_dods`] emits exactly [`gorilla_bytes`] the estimate is the size
+	/// on disk (the block's small self-describing length prefix aside), never a codec
+	/// the writer cannot produce. Gorilla wins on a small-jitter stream (rare spikes
+	/// among mostly-zero second differences, where RLE cannot form runs) and loses on a
+	/// perfectly regular one — so it is a *candidate* the min-selector weighs.
+	#[must_use]
+	pub fn gorilla_estimated_bytes(&self) -> usize {
+		8 + self.first_delta.map_or(0, zigzag_varint_len) + gorilla_bytes(&self.dods)
+	}
+
+	/// The smallest of the plain-varint, RLE, bit-packed, and Gorilla second-difference
 	/// estimates — the realistic stored size once the cheapest codec is chosen.
 	#[must_use]
 	pub fn best_estimated_bytes(&self) -> usize {
-		self.estimated_bytes().min(self.rle_estimated_bytes()).min(self.bitpack_estimated_bytes())
+		self.estimated_bytes().min(self.rle_estimated_bytes()).min(self.bitpack_estimated_bytes()).min(self.gorilla_estimated_bytes())
 	}
 
 	/// The stable name of the codec [`best_estimated_bytes`](Self::best_estimated_bytes)
-	/// selects: `"delta_of_delta_bitpack"` when fixed-width bit-packing is the
-	/// strict winner (a regular or small-jitter series), `"delta_of_delta_rle"`
-	/// when run-length coding is cheapest (long identical runs), else
-	/// `"delta_of_delta"`. The single source of truth for the codec label so the
-	/// segment store and the bench report never disagree on which won. Ties favour
-	/// the simpler codec (plain > rle > bitpack) for a stable label.
+	/// selects: `"delta_of_delta_gorilla"` when the Gorilla variable-length scheme is
+	/// the strict winner (scattered single jitter), `"delta_of_delta_bitpack"` when
+	/// fixed-width bit-packing wins (a regular or small-jitter series),
+	/// `"delta_of_delta_rle"` when run-length coding is cheapest (long identical runs),
+	/// else `"delta_of_delta"`. The single source of truth for the codec label so the
+	/// segment store and the bench report never disagree on which won — the `.dspseg`
+	/// writer routes through this name. Ties favour the simpler codec (plain > rle >
+	/// bitpack > gorilla) for a stable label.
 	#[must_use]
 	pub fn best_encoding_name(&self) -> &'static str {
 		let plain = self.estimated_bytes();
 		let rle = self.rle_estimated_bytes();
 		let bitpack = self.bitpack_estimated_bytes();
-		if bitpack < plain && bitpack < rle {
+		let gorilla = self.gorilla_estimated_bytes();
+		if gorilla < plain && gorilla < rle && gorilla < bitpack {
+			"delta_of_delta_gorilla"
+		} else if bitpack < plain && bitpack < rle {
 			"delta_of_delta_bitpack"
 		} else if rle < plain {
 			"delta_of_delta_rle"
@@ -584,6 +771,130 @@ mod tests {
 		assert_eq!(dod.bitpack_estimated_bytes(), 8 + 1 + 1);
 		assert!(dod.bitpack_estimated_bytes() < dod.rle_estimated_bytes());
 		assert_eq!(dod.best_estimated_bytes(), dod.bitpack_estimated_bytes());
+	}
+
+	#[test]
+	fn gorilla_dod_bits_match_the_paper_buckets() {
+		assert_eq!(gorilla_dod_bits(0), 1);
+		assert_eq!(gorilla_dod_bits(64), 9);
+		assert_eq!(gorilla_dod_bits(-63), 9);
+		assert_eq!(gorilla_dod_bits(65), 12);
+		assert_eq!(gorilla_dod_bits(256), 12);
+		assert_eq!(gorilla_dod_bits(257), 16);
+		assert_eq!(gorilla_dod_bits(2048), 16);
+		assert_eq!(gorilla_dod_bits(2049), 68);
+		assert_eq!(gorilla_dod_bits(-1_000_000), 68);
+	}
+
+	#[test]
+	fn gorilla_beats_bitpack_on_small_jitter_with_rare_spikes() {
+		// 64 mostly-regular points with two large isolated gaps: the second-difference
+		// stream is almost all zeros with a few big spikes. Fixed-width bit-packing must
+		// widen every value to the spike's width; the Gorilla-style codec pays a single
+		// bit for each of the many zero second differences — the roadmap-6.1 hypothesis.
+		let mut ts = Vec::with_capacity(64);
+		let mut t = 0_i64;
+		for i in 0..64 {
+			t += 1_000;
+			if i == 20 || i == 44 {
+				t += 50_000; // an irregular gap
+			}
+			ts.push(t);
+		}
+		let dod = encode_delta_of_delta(&ts, TimeUnit::Millis);
+		// Measured on this stream: gorilla 52 B vs fixed-width bit-pack 143 B (the
+		// roadmap-6.1 comparison). The shipped RLE codec (32 B here) still wins on these
+		// *isolated* spikes, though — gorilla's unique advantage is scattered single
+		// jitter, where RLE cannot form runs (filed as a ROADMAP follow-up).
+		assert!(dod.gorilla_estimated_bytes() < dod.bitpack_estimated_bytes(), "gorilla {} should beat bit-pack {} on a spiky stream", dod.gorilla_estimated_bytes(), dod.bitpack_estimated_bytes());
+	}
+
+	#[test]
+	fn gorilla_codec_round_trips_every_bucket() {
+		// One value drawn from each control class (zero / 7 / 9 / 12 / 64-bit), plus the
+		// inclusive bucket boundaries, plus a full-width extreme — the realized codec
+		// must be an exact inverse across all of them.
+		let dods = vec![0_i64, 1, -1, 64, -63, 65, 256, -255, 257, 2048, -2047, 2049, -2048, i64::MAX, i64::MIN, 1_000_000, -1_000_000];
+		let bytes = encode_gorilla_dods(&dods);
+		assert_eq!(bytes.len(), gorilla_bytes(&dods), "the realized codec length equals the gorilla_bytes estimate");
+		assert_eq!(decode_gorilla_dods(&bytes, dods.len()), dods, "gorilla codec is lossless across every bucket");
+	}
+
+	#[test]
+	fn gorilla_codec_realized_length_matches_the_estimate_on_real_columns() {
+		// The whole point of adopting the codec: the advisory gorilla_estimated_bytes the
+		// selector would weigh is the size actually written, not a fiction. Check it over
+		// several stream shapes (regular, scattered jitter, spiky, wide-magnitude).
+		let regular: Vec<i64> = (0..500).map(|i| 1_000 + i * 10).collect();
+		let mut jitter = Vec::with_capacity(500);
+		let mut mono = Vec::with_capacity(500);
+		let mut t = 0_i64;
+		let mut m = 0_i64;
+		for i in 0..500 {
+			t += if i % 8 == 7 { 2_500 } else { 1_000 };
+			jitter.push(t);
+			m += 1_000 + (i as i64 % 300);
+			mono.push(m);
+		}
+		for series in [&regular, &jitter, &mono] {
+			let dod = encode_delta_of_delta(series, TimeUnit::Millis);
+			let realized = encode_gorilla_dods(&dod.dods);
+			assert_eq!(realized.len(), gorilla_bytes(&dod.dods), "realized == estimate for the dod stream");
+			assert_eq!(decode_gorilla_dods(&realized, dod.dods.len()), dod.dods, "the stream reconstructs exactly");
+		}
+	}
+
+	#[test]
+	fn gorilla_wins_scattered_single_jitter_within_its_bucket() {
+		// The roadmap-6.1 predicted win regime: a regular 1000ms base where every 16th
+		// interval carries an isolated moderate jitter (fits the +/-2048 bucket). RLE
+		// cannot form runs across the scattered spikes and bit-packing must widen every
+		// value to the spike's width, so Gorilla — one bit per regular value, a bounded
+		// bucket per spike — is the strict winner. Measured here: gorilla 368 B vs the
+		// best shipped codec (RLE) 508 B, ~28% smaller. The realized codec matches.
+		let mut ts = Vec::with_capacity(1000);
+		let mut t = 0_i64;
+		for i in 0..1000 {
+			t += if i % 16 == 15 { 1_000 + 1_500 } else { 1_000 };
+			ts.push(t);
+		}
+		let dod = encode_delta_of_delta(&ts, TimeUnit::Millis);
+		let g = dod.gorilla_estimated_bytes();
+		let best_non_gorilla = dod.estimated_bytes().min(dod.rle_estimated_bytes()).min(dod.bitpack_estimated_bytes());
+		assert!(g < best_non_gorilla, "gorilla {g} should beat the best non-gorilla codec {best_non_gorilla} in its regime");
+		// Now that gorilla is folded in, it IS the overall best here and drives the label.
+		assert_eq!(dod.best_estimated_bytes(), g, "gorilla is the folded-in overall best in its regime");
+		assert_eq!(dod.best_encoding_name(), "delta_of_delta_gorilla");
+		assert_eq!(encode_gorilla_dods(&dod.dods).len(), gorilla_bytes(&dod.dods), "the win is realized, not merely estimated");
+	}
+
+	#[test]
+	fn gorilla_loses_when_jitter_exceeds_its_widest_bucket() {
+		// The honest loss boundary: a jitter of 3000ms produces second differences of
+		// +/-3000, past Gorilla's +/-2048 bucket, so each spike falls to the 68-bit
+		// fallback and Gorilla blows past varint/RLE/bit-pack. This is why gorilla stays
+		// a *candidate* the min-selector weighs, never an unconditional choice.
+		let mut ts = Vec::with_capacity(1000);
+		let mut t = 0_i64;
+		for i in 0..1000 {
+			t += if i % 4 == 3 { 1_000 + 3_000 } else { 1_000 };
+			ts.push(t);
+		}
+		let dod = encode_delta_of_delta(&ts, TimeUnit::Millis);
+		assert!(dod.gorilla_estimated_bytes() > dod.best_estimated_bytes(), "gorilla must lose past its widest bucket, so the min-selector picks another codec and never routes to gorilla");
+		assert_ne!(dod.best_encoding_name(), "delta_of_delta_gorilla", "past its bucket, gorilla is not chosen");
+	}
+
+	#[test]
+	fn bitpack_still_wins_a_perfectly_regular_stream_over_gorilla() {
+		// All-zero second differences: bit-pack's zero-width case (one header byte, no
+		// data) beats Gorilla's one-bit-per-value, so Gorilla is a complement, not a
+		// replacement — and the realized selector, which excludes the advisory Gorilla
+		// estimate, still picks bit-packing.
+		let values: Vec<i64> = (0..1_000).map(|i| 1_000 + i * 10).collect();
+		let dod = encode_delta_of_delta(&values, TimeUnit::Millis);
+		assert!(dod.bitpack_estimated_bytes() <= dod.gorilla_estimated_bytes());
+		assert_eq!(dod.best_estimated_bytes(), dod.bitpack_estimated_bytes(), "the gorilla estimate is advisory and does not change the realized selector");
 	}
 
 	#[test]
