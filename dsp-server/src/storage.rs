@@ -183,7 +183,7 @@ pub async fn storage_time_range_csv(State(state): State<AppState>, Path(aspect):
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	drop(state);
 	require_schema(&store, &aspect).await?;
-	let result = store.read_time_range(&aspect, params.start, params.end).await;
+	let result = store.read_time_range(&aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "csv")).await;
 	drop(store);
 	let (timestamps, values) = result.map_err(|err| classify_read_error(&err))?;
 	Ok(csv_response(render_csv(timestamps.into_iter().zip(values))))
@@ -206,7 +206,7 @@ pub async fn storage_value_range_csv(State(state): State<AppState>, Path(aspect)
 	let lo: BigDecimal = params.lo.parse().map_err(|_| StorageError::BadRequest(format!("`lo` is not a decimal: {:?}", params.lo)))?;
 	let hi: BigDecimal = params.hi.parse().map_err(|_| StorageError::BadRequest(format!("`hi` is not a decimal: {:?}", params.hi)))?;
 	require_schema(&store, &aspect).await?;
-	let result = store.read_value_range(&aspect, &lo, &hi).await;
+	let result = store.read_value_range(&aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "csv")).await;
 	drop(store);
 	let (timestamps, values) = result.map_err(|err| classify_read_error(&err))?;
 	Ok(csv_response(render_csv(timestamps.into_iter().zip(values.into_iter().map(Some)))))
@@ -226,7 +226,9 @@ pub async fn storage_value_range_csv(State(state): State<AppState>, Path(aspect)
 pub async fn storage_time_range(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<TimeRangeParams>) -> Result<Response, StorageError> {
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	drop(state);
-	let result = dsp_arrow_store::read_time_range_to_ipc_bytes(&store, &aspect, params.start, params.end).await;
+	// The columnar read + Arrow encode are fused in the arrow-store call, so one span
+	// covers both stages of this format's hot path.
+	let result = dsp_arrow_store::read_time_range_to_ipc_bytes(&store, &aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "arrow")).await;
 	drop(store);
 	Ok(arrow_stream_response(result.map_err(|err| classify_read_error(&err))?))
 }
@@ -245,7 +247,7 @@ pub async fn storage_value_range(State(state): State<AppState>, Path(aspect): Pa
 	drop(state);
 	let lo: BigDecimal = params.lo.parse().map_err(|_| StorageError::BadRequest(format!("`lo` is not a decimal: {:?}", params.lo)))?;
 	let hi: BigDecimal = params.hi.parse().map_err(|_| StorageError::BadRequest(format!("`hi` is not a decimal: {:?}", params.hi)))?;
-	let result = dsp_arrow_store::read_value_range_to_ipc_bytes(&store, &aspect, &lo, &hi).await;
+	let result = dsp_arrow_store::read_value_range_to_ipc_bytes(&store, &aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "arrow")).await;
 	drop(store);
 	Ok(arrow_stream_response(result.map_err(|err| classify_read_error(&err))?))
 }
@@ -264,7 +266,7 @@ pub async fn storage_value_range(State(state): State<AppState>, Path(aspect): Pa
 pub async fn storage_time_range_parquet(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<TimeRangeParams>) -> Result<Response, StorageError> {
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	drop(state);
-	let result = dsp_arrow_store::read_time_range_to_parquet_bytes(&store, &aspect, params.start, params.end).await;
+	let result = dsp_arrow_store::read_time_range_to_parquet_bytes(&store, &aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "parquet")).await;
 	drop(store);
 	Ok(parquet_response(result.map_err(|err| classify_read_error(&err))?))
 }
@@ -284,7 +286,7 @@ pub async fn storage_value_range_parquet(State(state): State<AppState>, Path(asp
 	drop(state);
 	let lo: BigDecimal = params.lo.parse().map_err(|_| StorageError::BadRequest(format!("`lo` is not a decimal: {:?}", params.lo)))?;
 	let hi: BigDecimal = params.hi.parse().map_err(|_| StorageError::BadRequest(format!("`hi` is not a decimal: {:?}", params.hi)))?;
-	let result = dsp_arrow_store::read_value_range_to_parquet_bytes(&store, &aspect, &lo, &hi).await;
+	let result = dsp_arrow_store::read_value_range_to_parquet_bytes(&store, &aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "parquet")).await;
 	drop(store);
 	Ok(parquet_response(result.map_err(|err| classify_read_error(&err))?))
 }
@@ -480,7 +482,7 @@ pub async fn storage_time_range_json(State(state): State<AppState>, Path(aspect)
 	let Some(schema) = schema else {
 		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
-	let result = store.read_time_range(&aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end)).await;
+	let result = store.read_time_range(&aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "json")).await;
 	drop(store);
 	let (timestamps, values) = result.map_err(|err| classify_read_error(&err))?;
 	let total = timestamps.len();
@@ -599,7 +601,7 @@ pub async fn storage_value_range_json(State(state): State<AppState>, Path(aspect
 	let Some(schema) = schema else {
 		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
-	let result = store.read_value_range(&aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi)).await;
+	let result = store.read_value_range(&aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "json")).await;
 	drop(store);
 	let (timestamps, values) = result.map_err(|err| classify_read_error(&err))?;
 	let total = timestamps.len();
