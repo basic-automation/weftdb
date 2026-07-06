@@ -21,6 +21,7 @@
 use std::{sync::Arc, time::Duration};
 
 use database::{HotColdSweep, OverlapSweep, ReconcileSweep, SegmentStore, SquashSweep};
+use tracing::Instrument as _;
 
 use crate::metrics::SharedMetrics;
 
@@ -75,7 +76,10 @@ pub struct ReconcileDaemonConfig {
 /// [`SegmentStore::reconcile_all_over_threshold`](database::SegmentStore::reconcile_all_over_threshold)
 /// (a control-plane read, a segment read, or a re-seal failure).
 pub async fn reconcile_tick(store: &SegmentStore, metrics: &SharedMetrics, threshold: usize) -> anyhow::Result<ReconcileSweep> {
-	let sweep = store.reconcile_all_over_threshold(threshold).await?;
+	let span = tracing::info_span!("reconcile.tick", kind = "threshold", threshold, aspects = tracing::field::Empty, segments = tracing::field::Empty);
+	let sweep = store.reconcile_all_over_threshold(threshold).instrument(span.clone()).await?;
+	span.record("aspects", sweep.aspects_reconciled);
+	span.record("segments", sweep.segments_reconciled);
 	if sweep.aspects_reconciled > 0 {
 		metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_reconciled).unwrap_or(u64::MAX));
 	}
@@ -99,7 +103,10 @@ pub async fn reconcile_tick(store: &SegmentStore, metrics: &SharedMetrics, thres
 /// [`SegmentStore::reconcile_all_hot_cold`](database::SegmentStore::reconcile_all_hot_cold)
 /// (a control-plane read, a segment read, or a re-seal failure).
 pub async fn reconcile_tick_hot_cold(store: &SegmentStore, metrics: &SharedMetrics, threshold: usize) -> anyhow::Result<HotColdSweep> {
-	let sweep = store.reconcile_all_hot_cold(threshold).await?;
+	let span = tracing::info_span!("reconcile.tick", kind = "hot_cold", threshold, aspects = tracing::field::Empty, segments = tracing::field::Empty);
+	let sweep = store.reconcile_all_hot_cold(threshold).instrument(span.clone()).await?;
+	span.record("aspects", sweep.aspects_reconciled);
+	span.record("segments", sweep.segments_reconciled());
 	if sweep.aspects_reconciled > 0 {
 		metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_reconciled()).unwrap_or(u64::MAX));
 	}
@@ -121,7 +128,10 @@ pub async fn reconcile_tick_hot_cold(store: &SegmentStore, metrics: &SharedMetri
 /// [`SegmentStore::reconcile_all_overlaps`](database::SegmentStore::reconcile_all_overlaps)
 /// (a control-plane read, a segment read/write, or a re-seal failure).
 pub async fn reconcile_tick_overlaps(store: &SegmentStore, metrics: &SharedMetrics) -> anyhow::Result<OverlapSweep> {
-	let sweep = store.reconcile_all_overlaps().await?;
+	let span = tracing::info_span!("reconcile.tick", kind = "overlaps", aspects = tracing::field::Empty, segments = tracing::field::Empty);
+	let sweep = store.reconcile_all_overlaps().instrument(span.clone()).await?;
+	span.record("aspects", sweep.aspects_reconciled);
+	span.record("segments", sweep.segments_removed);
 	if sweep.aspects_reconciled > 0 {
 		metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_removed).unwrap_or(u64::MAX));
 	}
@@ -143,7 +153,10 @@ pub async fn reconcile_tick_overlaps(store: &SegmentStore, metrics: &SharedMetri
 /// Propagates a failure from
 /// [`SegmentStore::reconcile_all_overlaps_with_policy`](database::SegmentStore::reconcile_all_overlaps_with_policy).
 pub async fn reconcile_tick_overlaps_with_policy(store: &SegmentStore, metrics: &SharedMetrics, min_split_bytes: u64) -> anyhow::Result<OverlapSweep> {
-	let sweep = store.reconcile_all_overlaps_with_policy(dsp_physical_type::SplitPolicy::new(min_split_bytes)).await?;
+	let span = tracing::info_span!("reconcile.tick", kind = "overlaps_split", min_split_bytes, aspects = tracing::field::Empty, segments = tracing::field::Empty);
+	let sweep = store.reconcile_all_overlaps_with_policy(dsp_physical_type::SplitPolicy::new(min_split_bytes)).instrument(span.clone()).await?;
+	span.record("aspects", sweep.aspects_reconciled);
+	span.record("segments", sweep.segments_removed);
 	if sweep.aspects_reconciled > 0 {
 		metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_removed).unwrap_or(u64::MAX));
 	}
@@ -166,7 +179,10 @@ pub async fn reconcile_tick_overlaps_with_policy(store: &SegmentStore, metrics: 
 /// Propagates a failure from
 /// [`SegmentStore::squash_all_over_threshold`](database::SegmentStore::squash_all_over_threshold).
 pub async fn reconcile_tick_squash(store: &SegmentStore, metrics: &SharedMetrics, max_segments: usize) -> anyhow::Result<SquashSweep> {
-	let sweep = store.squash_all_over_threshold(max_segments).await?;
+	let span = tracing::info_span!("reconcile.tick", kind = "squash", max_segments, aspects = tracing::field::Empty, segments = tracing::field::Empty);
+	let sweep = store.squash_all_over_threshold(max_segments).instrument(span.clone()).await?;
+	span.record("aspects", sweep.aspects_squashed);
+	span.record("segments", sweep.segments_removed);
 	if sweep.aspects_squashed > 0 {
 		metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_squashed).unwrap_or(u64::MAX), u64::try_from(sweep.segments_removed).unwrap_or(u64::MAX));
 	}
