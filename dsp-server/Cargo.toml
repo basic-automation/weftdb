@@ -28,6 +28,10 @@ splimes = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }  # per-request engine spans on the compute path (Phase 3 instrumentation)
 tracing-subscriber = { workspace = true }  # RUST_LOG-driven span/event subscriber (env-filter from the workspace dep)
+opentelemetry = { workspace = true }  # OTLP trace export (Phase 3) — env-gated on OTEL_EXPORTER_OTLP_ENDPOINT
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }

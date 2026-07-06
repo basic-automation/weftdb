@@ -57,9 +57,18 @@ const RECONCILE_SPLIT_MIN_BYTES_ENV: &str = "DSP_RECONCILE_SPLIT_MIN_BYTES";
 /// no squash runs.
 const RECONCILE_MAX_SPLITS_ENV: &str = "DSP_RECONCILE_MAX_SPLITS";
 
+/// Environment variable naming the OTLP collector endpoint. When set (e.g.
+/// `http://localhost:4317`), `dsp-server` exports its tracing spans to that collector
+/// over OTLP/gRPC in addition to the `fmt` log subscriber (roadmap Phase 3). Unset
+/// leaves tracing on the `fmt` path alone — no exporter, no network dependency.
+const OTEL_ENDPOINT_ENV: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-	init_tracing();
+	// The OTLP provider (when configured) is held for the process lifetime: dropping it
+	// early would tear down the batch span processor and stop export. It is shut down on
+	// a clean exit to flush any buffered spans.
+	let otel_provider = init_tracing();
 	let addr: SocketAddr = std::env::var("DSP_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string()).parse()?;
 
 	let state = build_state().await?;
@@ -69,22 +78,69 @@ async fn main() -> anyhow::Result<()> {
 	let local = listener.local_addr()?;
 	println!("{SERVICE} v{VERSION} listening on http://{local}");
 
-	axum::serve(listener, app_with_state(state)).await?;
+	let serve_result = axum::serve(listener, app_with_state(state)).await;
+	if let Some(provider) = otel_provider {
+		// Best-effort flush of buffered spans on shutdown.
+		let _ = provider.shutdown();
+	}
+	serve_result?;
 	Ok(())
 }
 
 /// Install the process-wide tracing subscriber (roadmap Phase 3): a `fmt` layer
 /// filtered by `RUST_LOG` (defaulting to `info`) that logs **span close** events, so
-/// each compute-path span prints its recorded fields and its busy/idle duration on
-/// completion — the "where did the time go" signal Phase 3 targets. The compute paths
-/// are decomposed into per-stage child spans: `interpolate.parse` (f64 → `BigDecimal`
-/// lift) · `interpolate.compute` (spline kernel) · `interpolate.serialize`
-/// (`BigDecimal` → wire-f64 + provenance) under `interpolate.engine`; and
-/// `downsample.parse` beside `downsample.reduce`. `try_init` is a no-op when a subscriber is already
-/// installed, so this never panics.
-fn init_tracing() {
+/// each span prints its recorded fields and its busy/idle duration on completion — the
+/// "where did the time go" signal Phase 3 targets. All the request/compute/storage/
+/// ingest/reconcile spans nest under the per-request `request` root.
+///
+/// When `OTEL_EXPORTER_OTLP_ENDPOINT` is set, an **OTLP/gRPC exporter** is attached
+/// beside the `fmt` layer (the same shipped spans are exported to a collector like
+/// Jaeger/Tempo/an OTel Collector) and the returned [`SdkTracerProvider`] is handed to
+/// the caller to hold for the process lifetime and shut down on exit. When it is unset
+/// there is no exporter and no network dependency — tracing stays on the `fmt` path.
+///
+/// `try_init` is a no-op when a subscriber is already installed, so this never panics.
+fn init_tracing() -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
+	use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _, Layer as _};
+
 	let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-	let _ = tracing_subscriber::fmt().with_env_filter(filter).with_target(false).with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE).try_init();
+	let fmt_layer = tracing_subscriber::fmt::layer().with_target(false).with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE);
+
+	let (otel_layer, provider) = match build_otlp_provider() {
+		Some(provider) => {
+			use opentelemetry::trace::TracerProvider as _;
+			let tracer = provider.tracer(SERVICE);
+			(Some(tracing_opentelemetry::layer().with_tracer(tracer).boxed()), Some(provider))
+		}
+		None => (None, None),
+	};
+
+	let _ = tracing_subscriber::registry().with(filter).with(fmt_layer).with(otel_layer).try_init();
+	if provider.is_some() {
+		println!("otlp trace export: enabled (exporting spans to {})", std::env::var(OTEL_ENDPOINT_ENV).unwrap_or_default());
+	}
+	provider
+}
+
+/// Build an OTLP tracer provider when `OTEL_EXPORTER_OTLP_ENDPOINT` is set (roadmap
+/// Phase 3): an OTLP/gRPC `SpanExporter` at that endpoint, fed by a batch span
+/// processor, tagged with the `dsp-server` service resource. Returns `None` when the
+/// env var is unset (export disabled) or the exporter cannot be built (logged, then
+/// tracing falls back to the `fmt`-only path — a misconfigured collector must not stop
+/// the server from starting).
+fn build_otlp_provider() -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
+	use opentelemetry_otlp::WithExportConfig as _;
+
+	let endpoint = std::env::var(OTEL_ENDPOINT_ENV).ok()?;
+	let exporter = match opentelemetry_otlp::SpanExporter::builder().with_tonic().with_endpoint(&endpoint).build() {
+		Ok(exporter) => exporter,
+		Err(err) => {
+			eprintln!("otlp trace export: disabled — could not build the OTLP exporter for {endpoint:?}: {err}");
+			return None;
+		}
+	};
+	let resource = opentelemetry_sdk::Resource::builder().with_service_name(SERVICE).build();
+	Some(opentelemetry_sdk::trace::SdkTracerProvider::builder().with_batch_exporter(exporter).with_resource(resource).build())
 }
 
 /// Start the background reconcile daemon (roadmap Phase 4.6) when a store is

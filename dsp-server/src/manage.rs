@@ -578,7 +578,7 @@ async fn ingest_points_inner(store: &database::SegmentStore, metrics: &crate::me
 	// batch, timed apart from the seal so a `RUST_LOG` run attributes ingest value
 	// parsing separately from the segment write.
 	{
-		let _parse = tracing::info_span!("storage.ingest.parse", point_count).entered();
+		let _parse = tracing::info_span!("storage.ingest.parse", point_count, format = "json").entered();
 		for point in &request.points {
 			timestamps.push(point.timestamp);
 			match &point.value {
@@ -598,7 +598,7 @@ async fn ingest_points_inner(store: &database::SegmentStore, metrics: &crate::me
 	// `storage.ingest.seal` child span (roadmap Phase 3): the typed-column encode +
 	// `.dspseg` write + control-plane index update — the write stage timed apart from
 	// value parsing.
-	let descriptor = seal_batch(store, aspect, &schema, &timestamps, &values, any_null, request.rows_per_page).instrument(tracing::info_span!("storage.ingest.seal", point_count, any_null)).await.map_err(|err| classify_seal_error(&err))?;
+	let descriptor = seal_batch(store, aspect, &schema, &timestamps, &values, any_null, request.rows_per_page).instrument(tracing::info_span!("storage.ingest.seal", point_count, any_null, format = "json")).await.map_err(|err| classify_seal_error(&err))?;
 	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
 	let response = IngestResponse {
 		aspect: aspect.to_string(),
@@ -739,9 +739,12 @@ async fn ingest_csv_inner(store: &database::SegmentStore, metrics: &crate::metri
 	let Some(schema) = store.schema_for(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))? else {
 		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
-	let ParsedCsv { timestamps, values, any_null } = parse_csv_points(body)?;
+	// `storage.ingest.parse` decode span (roadmap Phase 3): the CSV text → typed
+	// `(timestamp, value)` columns, timed apart from the seal.
+	let ParsedCsv { timestamps, values, any_null } = tracing::info_span!("storage.ingest.parse", format = "csv").in_scope(|| parse_csv_points(body))?;
 	enforce_order_if_required(require_sorted, &timestamps)?;
-	let descriptor = seal_batch(store, aspect, &schema, &timestamps, &values, any_null, rows_per_page).await.map_err(|err| classify_seal_error(&err))?;
+	let point_count = timestamps.len();
+	let descriptor = seal_batch(store, aspect, &schema, &timestamps, &values, any_null, rows_per_page).instrument(tracing::info_span!("storage.ingest.seal", point_count, any_null, format = "csv")).await.map_err(|err| classify_seal_error(&err))?;
 	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
 	let response = IngestResponse {
 		aspect: aspect.to_string(),
@@ -854,23 +857,34 @@ async fn ingest_ilp_inner(store: &database::SegmentStore, metrics: &crate::metri
 	let Some(schema) = store.schema_for(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))? else {
 		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
-	let points = dsp_line_protocol::parse_points(body, &params.field, precision).map_err(|err| StorageError::BadRequest(err.to_string()))?;
+	// `storage.ingest.parse` decode span (roadmap Phase 3): the line-protocol text →
+	// typed points, timed apart from the timestamp normalization and the seal.
+	let points = tracing::info_span!("storage.ingest.parse", format = "ilp", field = %params.field).in_scope(|| dsp_line_protocol::parse_points(body, &params.field, precision)).map_err(|err| StorageError::BadRequest(err.to_string()))?;
 	if points.is_empty() {
 		return Err(StorageError::BadRequest(format!("no points carrying field `{}` with a timestamp in the payload", params.field)));
 	}
 
-	let mut timestamps = Vec::with_capacity(points.len());
-	let mut values = Vec::with_capacity(points.len());
-	for point in points {
-		let epoch = epoch_in_unit(point.timestamp, schema.timestamp_unit).ok_or_else(|| StorageError::BadRequest(format!("timestamp {} is outside the range of the declared `{}` unit", point.timestamp, schema.timestamp_unit.name())))?;
-		timestamps.push(epoch);
-		values.push(point.value);
-	}
+	// `storage.ingest.normalize` span (roadmap Phase 3): rescale each wire epoch to the
+	// aspect's declared `TimeUnit` — the timestamp-normalization stage, distinct from
+	// the wire decode above.
+	let (timestamps, values) = {
+		let _normalize = tracing::info_span!("storage.ingest.normalize", point_count = points.len(), unit = %schema.timestamp_unit.name()).entered();
+		let mut timestamps = Vec::with_capacity(points.len());
+		let mut values = Vec::with_capacity(points.len());
+		for point in points {
+			let epoch = epoch_in_unit(point.timestamp, schema.timestamp_unit).ok_or_else(|| StorageError::BadRequest(format!("timestamp {} is outside the range of the declared `{}` unit", point.timestamp, schema.timestamp_unit.name())))?;
+			timestamps.push(epoch);
+			values.push(point.value);
+		}
+		(timestamps, values)
+	};
 
 	enforce_order_if_required(params.require_sorted, &timestamps)?;
+	let point_count = timestamps.len();
+	let seal_span = tracing::info_span!("storage.ingest.seal", point_count, format = "ilp");
 	let descriptor = match params.rows_per_page {
-		Some(rows_per_page) => store.seal_paged(aspect, &schema, &timestamps, &values, rows_per_page).await,
-		None => store.seal(aspect, &schema, &timestamps, &values).await,
+		Some(rows_per_page) => store.seal_paged(aspect, &schema, &timestamps, &values, rows_per_page).instrument(seal_span).await,
+		None => store.seal(aspect, &schema, &timestamps, &values).instrument(seal_span).await,
 	}
 	.map_err(|err| classify_seal_error(&err))?;
 	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
