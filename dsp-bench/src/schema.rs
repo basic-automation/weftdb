@@ -27,9 +27,11 @@ use crate::{
 /// `accuracy` field (reconstruction-quality metrics vs a known ground truth). v5
 /// added the optional `dataset.signal_shape` field (which synthetic ground-truth
 /// curve was generated). v6 added the optional `storage` field (north-star
-/// bytes/point under the fastest-safe physical encoding). All are
-/// `#[serde(default)]`, so older artifacts still deserialize.
-pub const SCHEMA_VERSION: u32 = 6;
+/// bytes/point under the fastest-safe physical encoding). v7 added
+/// `storage.realized_value_bytes` (the exact on-disk value payload, below the naive
+/// `estimated_value_bytes` for varint-coded encodings). All are `#[serde(default)]`,
+/// so older artifacts still deserialize.
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Metadata describing the dataset a result was measured against.
 ///
@@ -125,8 +127,9 @@ impl TimingBreakdown {
 ///   the requested bound (per hard constraint #4 any loss is reported via
 ///   `lossy_count` / `max_abs_error`, never silent);
 /// - the **timestamp** column is delta-of-delta encoded
-///   ([`encode_delta_of_delta`]) then packed with the cheaper of zig-zag-varint
-///   or RLE — lossless, and near-free for a regular series;
+///   ([`encode_delta_of_delta`]) then packed with the cheapest of zig-zag-varint,
+///   RLE, fixed-width bit-packing, or the Gorilla variable-length codec — lossless,
+///   and near-free for a regular series;
 /// - [`total_bytes_per_point`](Self::total_bytes_per_point) sums the two, the
 ///   headline north-star figure.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -135,8 +138,17 @@ pub struct StorageEstimate {
 	pub physical_type: String,
 	/// Number of values in the stored column.
 	pub value_count: usize,
-	/// Estimated byte footprint of the value column under that encoding.
+	/// Estimated byte footprint of the value column under that encoding (the naive
+	/// fixed-width `count * width` figure).
 	pub estimated_value_bytes: usize,
+	/// **Realized** on-disk byte footprint of the value column — the exact payload a
+	/// sealed `.dspseg` frame writes (matches
+	/// [`ColumnEncoding::serialized_bytes`](dsp_physical_type::ColumnEncoding::serialized_bytes)).
+	/// For a varint-coded encoding (e.g. `scaled_i64` with small mantissas) this is
+	/// below [`estimated_value_bytes`](Self::estimated_value_bytes) — the accurate
+	/// bytes/point the naive estimate over-reports. Defaults to `0` on a pre-v7 artifact.
+	#[serde(default)]
+	pub realized_value_bytes: usize,
 	/// Realized value-column storage cost: `estimated_value_bytes / value_count`
 	/// (0 for an empty column).
 	pub bytes_per_point: f64,
@@ -154,8 +166,10 @@ pub struct StorageEstimate {
 	pub timestamp_unit: String,
 	/// Timestamp-column encoding chosen: `delta_of_delta`, `delta_of_delta_rle`
 	/// when run-length coding the second differences is cheaper (long identical
-	/// runs), or `delta_of_delta_bitpack` when fixed-width bit-packing is cheapest
-	/// (a regular or small-jitter series).
+	/// runs), `delta_of_delta_bitpack` when fixed-width bit-packing is cheapest
+	/// (a regular or small-jitter series), or `delta_of_delta_gorilla` when the
+	/// Gorilla variable-length codec wins (scattered single jitter, where RLE cannot
+	/// form runs).
 	#[serde(default)]
 	pub timestamp_encoding: String,
 	/// Estimated byte footprint of the timestamp column (anchor + varint stream),
@@ -194,14 +208,17 @@ impl StorageEstimate {
 	pub fn from_columns(values: &[BigDecimal], timestamps: &[i64], unit: TimeUnit, tolerance: &BigDecimal) -> Self {
 		let enc = recommend_encoding(values, tolerance);
 		let estimated_value_bytes = enc.estimated_bytes();
+		let realized_value_bytes = enc.serialized_bytes();
 		let value_count = enc.len();
 		let bytes_per_point = per_point(estimated_value_bytes, value_count);
 
 		// Encode the timestamp column delta-of-delta, then let `dsp-physical-type`
-		// pick the cheaper of plain varint vs RLE-of-second-differences (RLE wins
-		// big on regular series, loses on non-repeating ones) — the same single
-		// source of truth a stored `Segment` uses, so the advisory bench estimate
-		// and a realized segment never disagree on size or codec label.
+		// pick the cheapest of plain varint, RLE-of-second-differences, fixed-width
+		// bit-packing, or the Gorilla variable-length codec (each wins a different
+		// regime: RLE on regular runs, bit-pack on small jitter, Gorilla on scattered
+		// single jitter) — the same single source of truth a stored `Segment` uses,
+		// so the advisory bench estimate and a realized segment never disagree on
+		// size or codec label.
 		let (timestamp_bytes, timestamp_encoding) = if timestamps.is_empty() {
 			(0, "delta_of_delta")
 		} else {
@@ -210,7 +227,7 @@ impl StorageEstimate {
 		};
 		let timestamp_bytes_per_point = per_point(timestamp_bytes, timestamps.len());
 
-		Self { physical_type: enc.physical_type.name().to_string(), value_count, estimated_value_bytes, bytes_per_point, is_exact: enc.is_exact(), lossy_count: enc.lossy_count, max_abs_error: enc.max_abs_error.to_string(), tolerance: tolerance.to_string(), timestamp_unit: unit.name().to_string(), timestamp_encoding: timestamp_encoding.to_string(), timestamp_bytes, timestamp_bytes_per_point, total_bytes_per_point: bytes_per_point + timestamp_bytes_per_point }
+		Self { physical_type: enc.physical_type.name().to_string(), value_count, estimated_value_bytes, realized_value_bytes, bytes_per_point, is_exact: enc.is_exact(), lossy_count: enc.lossy_count, max_abs_error: enc.max_abs_error.to_string(), tolerance: tolerance.to_string(), timestamp_unit: unit.name().to_string(), timestamp_encoding: timestamp_encoding.to_string(), timestamp_bytes, timestamp_bytes_per_point, total_bytes_per_point: bytes_per_point + timestamp_bytes_per_point }
 	}
 }
 
@@ -288,7 +305,7 @@ mod tests {
 
 	fn sample_result() -> BenchResult {
 		let samples = [100, 200, 300];
-		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "dsp".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: Some(SignalShape::MultiSine) }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true }, accuracy: Some(AccuracyMetrics { count: 1000, rmse: 1.5, mae: 1.1, max_abs_error: 4.2, bias: -0.3 }), storage: Some(StorageEstimate { physical_type: "scaled_i64".to_string(), value_count: 200, estimated_value_bytes: 1600, bytes_per_point: 8.0, is_exact: true, lossy_count: 0, max_abs_error: "0".to_string(), tolerance: "0".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 208, timestamp_bytes_per_point: 1.04, total_bytes_per_point: 9.04 }) }
+		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "dsp".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: Some(SignalShape::MultiSine) }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true }, accuracy: Some(AccuracyMetrics { count: 1000, rmse: 1.5, mae: 1.1, max_abs_error: 4.2, bias: -0.3 }), storage: Some(StorageEstimate { physical_type: "scaled_i64".to_string(), value_count: 200, estimated_value_bytes: 1600, realized_value_bytes: 420, bytes_per_point: 8.0, is_exact: true, lossy_count: 0, max_abs_error: "0".to_string(), tolerance: "0".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 208, timestamp_bytes_per_point: 1.04, total_bytes_per_point: 9.04 }) }
 	}
 
 	#[test]
@@ -457,6 +474,49 @@ mod tests {
 		assert!((est.total_bytes_per_point - (est.bytes_per_point + est.timestamp_bytes_per_point)).abs() < f64::EPSILON);
 		// The timestamp column is far cheaper than storing raw 8-byte epochs.
 		assert!(est.timestamp_bytes_per_point < 8.0);
+	}
+
+	#[test]
+	fn realized_value_bytes_agrees_with_the_segment_and_beats_the_naive_estimate() {
+		// The realized on-disk value payload the bench now reports must match a sealed
+		// Segment, and for a small-mantissa scaled_i64 column it is below the naive
+		// estimated_value_bytes (varint mantissas) — the accurate bytes/point figure.
+		use std::str::FromStr;
+		let values: Vec<BigDecimal> = ["0.01", "0.02", "0.03", "0.05", "0.08", "0.13"].iter().map(|s| BigDecimal::from_str(s).unwrap()).collect();
+		let timestamps: Vec<i64> = (0..6).map(|i| 1_000 + i * 10).collect();
+		let tolerance = BigDecimal::from(0);
+		let est = StorageEstimate::from_columns(&values, &timestamps, TimeUnit::Micros, &tolerance);
+		assert_eq!(est.physical_type, "scaled_i64", "small tenths pick scaled_i64");
+		let seg = dsp_physical_type::Segment::build(&timestamps, &values, TimeUnit::Micros, &tolerance).expect("segment builds");
+		assert_eq!(est.realized_value_bytes, seg.serialized_value_bytes(), "bench realized bytes must match the sealed segment");
+		assert!(est.realized_value_bytes < est.estimated_value_bytes, "varint mantissas realize below the naive {} estimate", est.estimated_value_bytes);
+	}
+
+	#[test]
+	fn from_columns_surfaces_gorilla_for_scattered_single_jitter() {
+		// The governing rule: a shipped codec advance must show a benchmarked outcome.
+		// A regular 1000us base with an isolated jitter every 16th interval (within
+		// Gorilla's +/-2048 bucket) is Gorilla's win regime — the bench estimate must
+		// name it and cost it below the bit-packed alternative, and must agree with a
+		// realized on-disk Segment (proving the win is realized, not just projected).
+		use std::str::FromStr;
+		let mut timestamps = Vec::with_capacity(1000);
+		let mut t = 0_i64;
+		for i in 0..1000 {
+			t += if i % 16 == 15 { 1_000 + 1_500 } else { 1_000 };
+			timestamps.push(t);
+		}
+		let values: Vec<BigDecimal> = (0..1000).map(|i| BigDecimal::from_str(&format!("{}.5", i % 7)).unwrap()).collect();
+		let tolerance = BigDecimal::from(0);
+		let est = StorageEstimate::from_columns(&values, &timestamps, TimeUnit::Micros, &tolerance);
+		assert_eq!(est.timestamp_encoding, "delta_of_delta_gorilla", "scattered jitter must surface the Gorilla codec in the bench");
+		// It agrees with a realized segment written through the .dspseg codec.
+		let seg = dsp_physical_type::Segment::build(&timestamps, &values, TimeUnit::Micros, &tolerance).expect("segment builds");
+		assert_eq!(est.timestamp_encoding, seg.timestamp_encoding_name());
+		assert_eq!(est.timestamp_bytes, seg.timestamp_bytes());
+		// Gorilla beats what a fixed-width bit-pack of the same column would cost.
+		let dod = encode_delta_of_delta(&timestamps, TimeUnit::Micros);
+		assert!(est.timestamp_bytes < dod.bitpack_estimated_bytes(), "gorilla {} must beat bit-pack {}", est.timestamp_bytes, dod.bitpack_estimated_bytes());
 	}
 
 	#[test]

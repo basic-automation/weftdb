@@ -568,12 +568,14 @@ pub fn read_value_column(r: &mut ByteReader) -> Result<ColumnEncoding, DspSegErr
 // The on-disk byte block for a `DeltaOfDeltaColumn`: a one-byte time-unit tag,
 // the full-width `i64` anchor, an optional first delta (a presence flag then a
 // signed varint), the second-difference count (varint), then a codec selector
-// byte and the coded stream — either per-value zig-zag varints (`TS_CODEC_VARINT`)
-// or fixed-width bit-packing (`TS_CODEC_BITPACK`: a width byte + packed bits),
-// whichever is smaller for this stream. Run-length coding of the second
-// differences (the cheaper codec for a long constant run, chosen by
-// `best_encoding_name` for the bytes/point estimate) is a later compression slice
-// — every codec here is exact and lossless.
+// byte and the coded stream. Four codecs are realized, one chosen per stream by
+// `best_encoding_name` (the single source of truth): per-value zig-zag varints
+// (`TS_CODEC_VARINT`), fixed-width bit-packing (`TS_CODEC_BITPACK`: a width byte +
+// packed bits), Gorilla variable-length (`TS_CODEC_GORILLA`: a length-prefixed
+// bucketed bitstream, for scattered jitter), and run-length coding
+// (`TS_CODEC_RLE`: a run count + `(value, length)` pairs, for long constant runs).
+// Every codec is exact and lossless, so the reported codec name always matches the
+// bytes on disk.
 // ---------------------------------------------------------------------------
 
 const TIME_UNIT_SECONDS: u8 = 0;
@@ -586,6 +588,14 @@ const TIME_UNIT_NANOS: u8 = 3;
 const TS_CODEC_VARINT: u8 = 0;
 /// Fixed-width bit-packing: a width byte then `ceil(count * width / 8)` data bytes.
 const TS_CODEC_BITPACK: u8 = 1;
+/// Gorilla-style variable-length coding (roadmap Phase 6.1): a length-prefixed
+/// [`crate::timestamp::encode_gorilla_dods`] bitstream. Chosen for scattered single
+/// jitter, where every value is a bounded bucket and RLE cannot form runs.
+const TS_CODEC_GORILLA: u8 = 2;
+/// Run-length coding of the second differences (roadmap Phase 6.1): a run count then
+/// `(svarint value, uvarint length)` pairs. Chosen for a long constant run (a
+/// piecewise-regular series), where a handful of runs beat every per-value codec.
+const TS_CODEC_RLE: u8 = 3;
 
 /// The stable one-byte on-disk tag for a [`TimeUnit`].
 const fn time_unit_tag(unit: TimeUnit) -> u8 {
@@ -610,12 +620,15 @@ const fn time_unit_from_tag(tag: u8) -> Result<TimeUnit, DspSegError> {
 
 /// Write a [`DeltaOfDeltaColumn`] as a `.dspseg` timestamp-column block.
 ///
-/// The second-difference stream is written under whichever of two codecs is
-/// smaller for it — fixed-width **bit-packing** (a regular or small-jitter series,
-/// where the differences fit in a few bits) or per-value **varint** — selected by
-/// a self-describing codec byte so the reader dispatches without re-deriving the
-/// choice. This realizes the bytes/point saving the estimate projects (Phase 4.2),
-/// not just reports it.
+/// The second-difference stream is written under whichever codec is smallest for it —
+/// **Gorilla** variable-length (scattered single jitter), **RLE** (long constant runs),
+/// fixed-width **bit-packing** (a regular or small-jitter series), or per-value
+/// **varint** — selected by a self-describing codec byte so the reader dispatches
+/// without re-deriving the choice. The codec is chosen by routing through
+/// [`DeltaOfDeltaColumn::best_encoding_name`], the single source of truth, so the
+/// segment's reported codec name always matches the bytes actually written. Every
+/// codec is exact and lossless, and each realizes the bytes/point saving the estimate
+/// projects, not just reports it.
 pub fn write_timestamp_column(w: &mut ByteWriter, col: &DeltaOfDeltaColumn) {
 	w.put_u8(time_unit_tag(col.unit));
 	w.put_i64_le(col.first);
@@ -627,17 +640,36 @@ pub fn write_timestamp_column(w: &mut ByteWriter, col: &DeltaOfDeltaColumn) {
 		None => w.put_u8(0),
 	}
 	w.put_uvarint(col.dods.len() as u64);
-	if crate::timestamp::bitpack_bytes(&col.dods) < crate::timestamp::zigzag_varint_bytes(&col.dods) {
-		let (width, packed) = crate::timestamp::bitpack_encode(&col.dods);
-		w.put_u8(TS_CODEC_BITPACK);
-		// Width is 0..=64 by construction, so the conversion never saturates.
-		w.put_u8(u8::try_from(width).unwrap_or(64));
-		// Raw (no length prefix): the reader derives the length from count * width.
-		w.put_raw(&packed);
-	} else {
-		w.put_u8(TS_CODEC_VARINT);
-		for &dod in &col.dods {
-			w.put_svarint(dod);
+	match col.best_encoding_name() {
+		"delta_of_delta_gorilla" => {
+			w.put_u8(TS_CODEC_GORILLA);
+			// Length-prefixed: a Gorilla stream's length is not derivable from the
+			// count (variable per value), so the block carries it explicitly.
+			w.put_bytes(&crate::timestamp::encode_gorilla_dods(&col.dods));
+		}
+		"delta_of_delta_rle" => {
+			let runs = crate::timestamp::rle_encode(&col.dods);
+			w.put_u8(TS_CODEC_RLE);
+			w.put_uvarint(runs.len() as u64);
+			for (value, count) in runs {
+				w.put_svarint(value);
+				w.put_uvarint(count as u64);
+			}
+		}
+		"delta_of_delta_bitpack" => {
+			let (width, packed) = crate::timestamp::bitpack_encode(&col.dods);
+			w.put_u8(TS_CODEC_BITPACK);
+			// Width is 0..=64 by construction, so the conversion never saturates.
+			w.put_u8(u8::try_from(width).unwrap_or(64));
+			// Raw (no length prefix): the reader derives the length from count * width.
+			w.put_raw(&packed);
+		}
+		// "delta_of_delta" — per-value zig-zag varint, the general fallback.
+		_ => {
+			w.put_u8(TS_CODEC_VARINT);
+			for &dod in &col.dods {
+				w.put_svarint(dod);
+			}
 		}
 	}
 }
@@ -671,6 +703,20 @@ pub fn read_timestamp_column(r: &mut ByteReader) -> Result<DeltaOfDeltaColumn, D
 			let data_len = (count * width as usize).div_ceil(8);
 			let bytes = r.take(data_len)?;
 			crate::timestamp::bitpack_decode(width, bytes, count)
+		}
+		TS_CODEC_GORILLA => {
+			let bytes = r.read_bytes()?;
+			crate::timestamp::decode_gorilla_dods(bytes, count)
+		}
+		TS_CODEC_RLE => {
+			let run_count = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+			let mut runs = Vec::with_capacity(run_count);
+			for _ in 0..run_count {
+				let value = r.read_svarint()?;
+				let run_len = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+				runs.push((value, run_len));
+			}
+			crate::timestamp::rle_decode(&runs)
 		}
 		other => return Err(DspSegError::InvalidTag { kind: "timestamp_codec", value: other }),
 	};
@@ -1109,6 +1155,40 @@ mod tests {
 	}
 
 	#[test]
+	fn serialized_bytes_matches_the_realized_value_payload() {
+		use crate::encode_column;
+		// serialized_bytes() must equal the exact bytes write_physical_value emits for
+		// the values (the payload, excluding the column header) — for every physical
+		// type. This is the realize-accurate figure estimated_bytes() does not give.
+		let cases = [
+			encode_column(PhysicalType::F64, &col(&["0.5", "2.25", "-128.0"])).unwrap(),
+			encode_column(PhysicalType::F32, &col(&["0.5", "-0.25", "16.0"])).unwrap(),
+			encode_column(PhysicalType::ScaledI64 { scale: 2 }, &col(&["1.25", "-3.75", "0.00", "5000.00"])).unwrap(),
+			encode_column(PhysicalType::ScaledI128 { scale: 4 }, &col(&["1234567890.1234", "-9.0001"])).unwrap(),
+			encode_column(PhysicalType::Decimal128, &col(&["123456789012345678901234.567890", "-1.5", "0"])).unwrap(),
+			encode_column(PhysicalType::BigDecimalText, &col(&["1.5", "12345.6789", "-0.000001"])).unwrap(),
+		];
+		for enc in &cases {
+			let mut w = ByteWriter::new();
+			for value in &enc.values {
+				write_physical_value(&mut w, value);
+			}
+			assert_eq!(w.into_vec().len(), enc.serialized_bytes(), "{:?} payload must match serialized_bytes()", enc.physical_type);
+		}
+	}
+
+	#[test]
+	fn scaled_i64_serialized_bytes_beats_the_naive_fixed_width_estimate() {
+		use crate::encode_column;
+		// Small ScaledI64 mantissas are varint-coded to ~1 byte each, so the realized
+		// payload is far below the naive len*8 estimate — the divergence estimated_bytes()
+		// currently over-reports (underselling DSP's bytes/point).
+		let enc = encode_column(PhysicalType::ScaledI64 { scale: 2 }, &col(&["0.01", "0.02", "0.03", "0.05", "0.08"])).unwrap();
+		assert!(enc.serialized_bytes() < enc.estimated_bytes(), "realized {} must beat naive {}", enc.serialized_bytes(), enc.estimated_bytes());
+		assert_eq!(enc.estimated_bytes(), enc.values.len() * 8, "the naive estimate is len*8 for ScaledI64");
+	}
+
+	#[test]
 	fn value_column_preserves_lossy_bookkeeping() {
 		use crate::encode_column;
 		// 0.1/0.3 are not binary-exact: the column is lossy and carries a positive
@@ -1200,6 +1280,77 @@ mod tests {
 		assert!(bytes.len() < 20, "regular series must bit-pack tiny: {} bytes", bytes.len());
 		let mut r = ByteReader::new(&bytes);
 		assert_eq!(read_timestamp_column(&mut r).expect("reads"), enc);
+	}
+
+	#[test]
+	fn scattered_single_jitter_timestamp_block_uses_gorilla_on_disk() {
+		use crate::{encode_delta_of_delta, timestamp::zigzag_varint_bytes};
+		// The roadmap-6.1 regime: a regular 1000ms base where every 16th interval carries
+		// an isolated moderate jitter within Gorilla's +/-2048 bucket. best_encoding_name
+		// picks Gorilla, so the writer stores it, and the block round-trips losslessly and
+		// is far below a per-value varint stream.
+		let mut ts = Vec::with_capacity(1000);
+		let mut t = 0_i64;
+		for i in 0..1000 {
+			t += if i % 16 == 15 { 1_000 + 1_500 } else { 1_000 };
+			ts.push(t);
+		}
+		let enc = encode_delta_of_delta(&ts, TimeUnit::Millis);
+		assert_eq!(enc.best_encoding_name(), "delta_of_delta_gorilla", "scattered jitter must route to the Gorilla codec");
+		let mut w = ByteWriter::new();
+		write_timestamp_column(&mut w, &enc);
+		let bytes = w.into_vec();
+		// The Gorilla codec byte sits right after the count varint. unit(1)+anchor(8)+
+		// first_delta flag(1)+svarint + count varint; the flag byte is 1, so the codec
+		// tag is the byte after the first_delta svarint + count varint — assert the block
+		// beats varint decisively and round-trips instead of hunting the exact offset.
+		assert!(bytes.len() < zigzag_varint_bytes(&enc.dods), "Gorilla block {} must beat the {}-byte varint stream", bytes.len(), zigzag_varint_bytes(&enc.dods));
+		let mut r = ByteReader::new(&bytes);
+		let back = read_timestamp_column(&mut r).expect("reads");
+		assert!(r.is_empty(), "the Gorilla block must be fully consumed");
+		assert_eq!(back, enc);
+		assert_eq!(crate::decode_delta_of_delta(&back), ts, "epochs recover exactly through the Gorilla codec");
+	}
+
+	#[test]
+	fn gorilla_timestamp_block_round_trips_via_the_shared_helper() {
+		// Route scattered jitter through the whole-block-consumption helper too.
+		let mut ts = Vec::with_capacity(320);
+		let mut t = 0_i64;
+		for i in 0..320 {
+			t += if i % 10 == 9 { 1_000 + 800 } else { 1_000 };
+			ts.push(t);
+		}
+		assert_ts_col_round_trips(&ts, TimeUnit::Millis);
+	}
+
+	#[test]
+	fn constant_run_timestamp_block_uses_rle_on_disk() {
+		use crate::encode_delta_of_delta;
+		// A constant nonzero acceleration: deltas grow by a fixed step, so the second
+		// differences are one long run. best_encoding_name picks RLE, so the writer now
+		// *realizes* it on disk (previously it fell back to bit-pack/varint while still
+		// reporting "delta_of_delta_rle" — the divergence this slice closes). The block
+		// round-trips exactly and the on-disk codec matches the reported name.
+		let mut values = vec![0_i64, 1];
+		let mut delta = 1_i64;
+		for _ in 0..300 {
+			delta += 5;
+			let next = values.last().unwrap() + delta;
+			values.push(next);
+		}
+		let enc = encode_delta_of_delta(&values, TimeUnit::Seconds);
+		assert_eq!(enc.best_encoding_name(), "delta_of_delta_rle", "a long constant run must route to RLE");
+		let mut w = ByteWriter::new();
+		write_timestamp_column(&mut w, &enc);
+		let bytes = w.into_vec();
+		// A single run collapses to a few bytes — far below a per-value stream.
+		assert!(bytes.len() < 40, "RLE block must be tiny for one run: {} bytes", bytes.len());
+		let mut r = ByteReader::new(&bytes);
+		let back = read_timestamp_column(&mut r).expect("reads");
+		assert!(r.is_empty(), "the RLE block must be fully consumed");
+		assert_eq!(back, enc);
+		assert_eq!(crate::decode_delta_of_delta(&back), values, "epochs recover exactly through the RLE codec");
 	}
 
 	#[test]
