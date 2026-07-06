@@ -574,39 +574,46 @@ impl DeltaOfDeltaColumn {
 	/// **Gorilla-style variable-length** scheme ([`gorilla_bytes`]): anchor + first
 	/// delta + bucketed-bit stream (roadmap Phase 6.1).
 	///
-	/// **Advisory / evaluation only** — this is *not* folded into
-	/// [`best_estimated_bytes`](Self::best_estimated_bytes) or the realized on-disk
-	/// codec selector (which remains varint-vs-bit-pack), so no segment ever claims a
-	/// codec it cannot write. It exists to weigh the Gorilla footprint against the
-	/// shipped codecs on the bytes/point metric before adopting a per-value bucketed
-	/// on-disk codec: it beats [`bitpack_estimated_bytes`](Self::bitpack_estimated_bytes)
-	/// on a small-jitter stream (rare large spikes among mostly-zero second
-	/// differences), and loses to it on a perfectly regular one.
+	/// Now **realized on disk** (roadmap Phase 6.1): the `.dspseg` timestamp block
+	/// carries a Gorilla codec option ([`encode_gorilla_dods`]) and this estimate is
+	/// folded into [`best_estimated_bytes`](Self::best_estimated_bytes) /
+	/// [`best_encoding_name`](Self::best_encoding_name), so a segment whose scattered
+	/// jitter Gorilla codes smallest stores — and reports — the Gorilla size. Because
+	/// [`encode_gorilla_dods`] emits exactly [`gorilla_bytes`] the estimate is the size
+	/// on disk (the block's small self-describing length prefix aside), never a codec
+	/// the writer cannot produce. Gorilla wins on a small-jitter stream (rare spikes
+	/// among mostly-zero second differences, where RLE cannot form runs) and loses on a
+	/// perfectly regular one — so it is a *candidate* the min-selector weighs.
 	#[must_use]
 	pub fn gorilla_estimated_bytes(&self) -> usize {
 		8 + self.first_delta.map_or(0, zigzag_varint_len) + gorilla_bytes(&self.dods)
 	}
 
-	/// The smallest of the plain-varint, RLE, and bit-packed second-difference
+	/// The smallest of the plain-varint, RLE, bit-packed, and Gorilla second-difference
 	/// estimates — the realistic stored size once the cheapest codec is chosen.
 	#[must_use]
 	pub fn best_estimated_bytes(&self) -> usize {
-		self.estimated_bytes().min(self.rle_estimated_bytes()).min(self.bitpack_estimated_bytes())
+		self.estimated_bytes().min(self.rle_estimated_bytes()).min(self.bitpack_estimated_bytes()).min(self.gorilla_estimated_bytes())
 	}
 
 	/// The stable name of the codec [`best_estimated_bytes`](Self::best_estimated_bytes)
-	/// selects: `"delta_of_delta_bitpack"` when fixed-width bit-packing is the
-	/// strict winner (a regular or small-jitter series), `"delta_of_delta_rle"`
-	/// when run-length coding is cheapest (long identical runs), else
-	/// `"delta_of_delta"`. The single source of truth for the codec label so the
-	/// segment store and the bench report never disagree on which won. Ties favour
-	/// the simpler codec (plain > rle > bitpack) for a stable label.
+	/// selects: `"delta_of_delta_gorilla"` when the Gorilla variable-length scheme is
+	/// the strict winner (scattered single jitter), `"delta_of_delta_bitpack"` when
+	/// fixed-width bit-packing wins (a regular or small-jitter series),
+	/// `"delta_of_delta_rle"` when run-length coding is cheapest (long identical runs),
+	/// else `"delta_of_delta"`. The single source of truth for the codec label so the
+	/// segment store and the bench report never disagree on which won — the `.dspseg`
+	/// writer routes through this name. Ties favour the simpler codec (plain > rle >
+	/// bitpack > gorilla) for a stable label.
 	#[must_use]
 	pub fn best_encoding_name(&self) -> &'static str {
 		let plain = self.estimated_bytes();
 		let rle = self.rle_estimated_bytes();
 		let bitpack = self.bitpack_estimated_bytes();
-		if bitpack < plain && bitpack < rle {
+		let gorilla = self.gorilla_estimated_bytes();
+		if gorilla < plain && gorilla < rle && gorilla < bitpack {
+			"delta_of_delta_gorilla"
+		} else if bitpack < plain && bitpack < rle {
 			"delta_of_delta_bitpack"
 		} else if rle < plain {
 			"delta_of_delta_rle"
@@ -853,7 +860,11 @@ mod tests {
 		}
 		let dod = encode_delta_of_delta(&ts, TimeUnit::Millis);
 		let g = dod.gorilla_estimated_bytes();
-		assert!(g < dod.best_estimated_bytes(), "gorilla {g} should beat the best shipped codec {} in its regime", dod.best_estimated_bytes());
+		let best_non_gorilla = dod.estimated_bytes().min(dod.rle_estimated_bytes()).min(dod.bitpack_estimated_bytes());
+		assert!(g < best_non_gorilla, "gorilla {g} should beat the best non-gorilla codec {best_non_gorilla} in its regime");
+		// Now that gorilla is folded in, it IS the overall best here and drives the label.
+		assert_eq!(dod.best_estimated_bytes(), g, "gorilla is the folded-in overall best in its regime");
+		assert_eq!(dod.best_encoding_name(), "delta_of_delta_gorilla");
 		assert_eq!(encode_gorilla_dods(&dod.dods).len(), gorilla_bytes(&dod.dods), "the win is realized, not merely estimated");
 	}
 
@@ -870,7 +881,8 @@ mod tests {
 			ts.push(t);
 		}
 		let dod = encode_delta_of_delta(&ts, TimeUnit::Millis);
-		assert!(dod.gorilla_estimated_bytes() > dod.best_estimated_bytes(), "gorilla must lose past its widest bucket, and best_estimated_bytes (which excludes it) is unaffected");
+		assert!(dod.gorilla_estimated_bytes() > dod.best_estimated_bytes(), "gorilla must lose past its widest bucket, so the min-selector picks another codec and never routes to gorilla");
+		assert_ne!(dod.best_encoding_name(), "delta_of_delta_gorilla", "past its bucket, gorilla is not chosen");
 	}
 
 	#[test]
