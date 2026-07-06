@@ -160,12 +160,18 @@ fn downsample_inner(request: DownsampleRequest) -> Result<Json<DownsampleRespons
 	let resolution: Resolution = resolution.into();
 	let aggregations = if aggregations.is_empty() { DEFAULT_AGGREGATIONS.to_vec() } else { aggregations };
 
+	// `downsample.parse` child span (roadmap Phase 3): the f64 → `BigDecimal` value lift
+	// and timestamp sort of the input, timed apart from the `downsample.reduce` fold so a
+	// `RUST_LOG` run attributes value-conversion cost separately from the reduction.
 	let mut points: Vec<Point> = Vec::with_capacity(input.len());
-	for sample in &input {
-		let value = BigDecimal::from_f64(sample.value).ok_or_else(|| ApiError::BadRequest("a point value is not a finite number".to_string()))?;
-		points.push(Point::new(sample.timestamp, value));
+	{
+		let _parse = tracing::info_span!("downsample.parse", candidate_points = input.len()).entered();
+		for sample in &input {
+			let value = BigDecimal::from_f64(sample.value).ok_or_else(|| ApiError::BadRequest("a point value is not a finite number".to_string()))?;
+			points.push(Point::new(sample.timestamp, value));
+		}
+		points.sort_by_key(|p| p.timestamp);
 	}
-	points.sort_by_key(|p| p.timestamp);
 	let start = start.unwrap_or_else(|| points.first().map_or_else(Utc::now, |p| p.timestamp));
 	let end = end.unwrap_or_else(|| points.last().map_or_else(Utc::now, |p| p.timestamp));
 

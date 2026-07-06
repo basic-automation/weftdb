@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use bigdecimal::BigDecimal;
-use dsp_physical_type::{merge_newer_wins, AspectSchema, PagedSegment, Segment, SegmentDescriptor, PAGED_SEGMENT_FORMAT_VERSION};
+use dsp_physical_type::{merge_newer_wins, split_index, AspectSchema, PagedSegment, Segment, SegmentDescriptor, SplitDecision, SplitPolicy, PAGED_SEGMENT_FORMAT_VERSION};
 
 use crate::{AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, SegmentIndexStore};
 
@@ -470,6 +470,103 @@ impl SegmentStore {
 		Ok(true)
 	}
 
+	/// Re-seal a nullable `(timestamps, values)` batch into the `.dspseg` file for
+	/// `aspect`/`id`, in the frame kind selected by `rows_per_page` (`Some` → paged,
+	/// `None` → single-block), recording the new descriptor in the control-plane index.
+	///
+	/// The write-half shared by the split path: [`reconcile_segment`] inlines the same
+	/// logic against a single id, this one targets an arbitrary id so a split can write
+	/// its prefix and suffix through one code path. It does **not** touch the
+	/// materialized rollup — a caller that changes the segment set rebuilds it once at
+	/// the end.
+	async fn reseal_nullable_at(&self, aspect: &str, schema: &AspectSchema, id: u64, timestamps: &[i64], values: &[Option<BigDecimal>], rows_per_page: Option<usize>) -> Result<SegmentDescriptor> {
+		let path = self.segment_path(aspect, id);
+		let descriptor = if let Some(rows_per_page) = rows_per_page {
+			let segment = schema.seal_paged_nullable(timestamps, values, rows_per_page).map_err(|e| anyhow::anyhow!("split re-seal failed: {e}"))?;
+			let new_bytes = segment.write_to();
+			tokio::fs::write(&path, &new_bytes).await.with_context(|| format!("writing split segment {}", path.display()))?;
+			SegmentDescriptor::of_paged_segment(id, path.to_string_lossy().into_owned(), new_bytes.len() as u64, &segment)
+		} else {
+			let segment = schema.seal_nullable(timestamps, values).map_err(|e| anyhow::anyhow!("split re-seal failed: {e}"))?;
+			let new_bytes = segment.write_to();
+			tokio::fs::write(&path, &new_bytes).await.with_context(|| format!("writing split segment {}", path.display()))?;
+			SegmentDescriptor::of_segment(id, path.to_string_lossy().into_owned(), new_bytes.len() as u64, &segment)
+		};
+		self.index.insert(aspect, &descriptor).await?;
+		Ok(descriptor)
+	}
+
+	/// **Split a sorted segment at a timestamp boundary** (roadmap Phase 4.6 — the
+	/// physical mechanism of the split-not-rewrite reconciliation path).
+	///
+	/// Partitions segment `id` of `aspect` at `boundary` into a **prefix** (rows with
+	/// timestamp strictly `< boundary`, kept at the original `id`) and a **suffix**
+	/// (rows at or after `boundary`, moved to a freshly-allocated segment id), following
+	/// the [`split_index`](dsp_physical_type::split_index) partition point. Because the
+	/// input is time-sorted, the prefix's every timestamp is `< boundary ≤` the suffix's
+	/// every timestamp, so the two results are internally sorted **and disjoint in time**
+	/// — the split adds no cross-segment overlap, and a point/range read still opens
+	/// exactly one of them for any instant. Both keep the input's frame kind (a paged
+	/// segment splits into two paged segments at its own page height).
+	///
+	/// This is the primitive `QuestDB`'s partition split is built on: once a large cold
+	/// prefix is carved into its own segment, later late-data merges touch only the hot
+	/// suffix and never rewrite the cold prefix again, bounding write amplification over
+	/// the segment's lifetime. Wiring [`SplitPolicy::decide`](dsp_physical_type::SplitPolicy)
+	/// into [`reconcile_overlaps`](SegmentStore::reconcile_overlaps) to *choose* a split
+	/// over a full rewrite is the next slice; this slice ships the mechanism it calls.
+	///
+	/// The suffix segment is written **before** the prefix is rewritten, so a crash
+	/// mid-split can at worst leave the suffix rows duplicated in the not-yet-shrunk
+	/// prefix (a cross-segment overlap [`reconcile_overlaps`] repairs), never lost.
+	///
+	/// Returns `Some(suffix_id)` — the new segment's id — when a split happened, or
+	/// `None` when the split was degenerate (`boundary` falls before the first or after
+	/// the last row, so every row lands on one side and there is nothing to carve). A
+	/// degenerate split writes nothing.
+	///
+	/// # Errors
+	///
+	/// Returns an error if `aspect` has no declared schema or no segment `id`, if `id`
+	/// is **not time-sorted** (split requires a sorted segment — reconcile it first, so
+	/// the [`split_index`] precondition holds), or propagates a filesystem/decode/re-seal/
+	/// libSQL failure.
+	pub async fn split_segment(&self, aspect: &str, id: u64, boundary: i64) -> Result<Option<u64>> {
+		let descriptor = self.index.all(aspect).await?.into_iter().find(|d| d.id == id).ok_or_else(|| anyhow::anyhow!("aspect {aspect:?} has no segment {id}"))?;
+		if !descriptor.time_sorted {
+			return Err(anyhow::anyhow!("segment {id} of aspect {aspect:?} is out of order; reconcile it before splitting"));
+		}
+		let schema = self.require_schema(aspect).await?;
+		// Read once, capturing the paged page height so each half re-seals in kind.
+		let bytes = tokio::fs::read(&descriptor.path).await.with_context(|| format!("reading segment {}", descriptor.path))?;
+		let (rows_per_page, timestamps, values) = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION {
+			let segment = PagedSegment::read_from(&bytes).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?;
+			let rows_per_page = segment.rows_per_page;
+			let (ts, vs) = segment.decode_nullable();
+			(Some(rows_per_page), ts, vs)
+		} else {
+			let segment = Segment::read_from(&bytes).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?;
+			let (ts, vs) = segment.decode_nullable();
+			(None, ts, vs)
+		};
+		let k = split_index(&timestamps, boundary);
+		if k == 0 || k == timestamps.len() {
+			// Every row is on one side — nothing to carve.
+			return Ok(None);
+		}
+		let (prefix_ts, suffix_ts) = timestamps.split_at(k);
+		let (prefix_vs, suffix_vs) = values.split_at(k);
+		// Suffix first (new id), then rewrite the prefix in place: a crash between the
+		// two duplicates rows rather than dropping them.
+		let suffix_id = self.index.next_id(aspect).await?;
+		self.reseal_nullable_at(aspect, &schema, suffix_id, suffix_ts, suffix_vs, rows_per_page).await?;
+		self.reseal_nullable_at(aspect, &schema, id, prefix_ts, prefix_vs, rows_per_page).await?;
+		// A split turns one segment into two; the O(1) rollup fold would miscount, so
+		// rebuild it from the durable index.
+		self.rebuild_aspect_metadata(aspect).await?;
+		Ok(Some(suffix_id))
+	}
+
 	/// **Reconcile every out-of-order segment** of `aspect` (roadmap Phase 4.6),
 	/// returning the number rewritten. The natural trigger is a non-zero
 	/// [`unsorted_segments`](AspectStorageStats::unsorted_segments) — after this call
@@ -665,19 +762,62 @@ impl SegmentStore {
 	/// reconciliation/upsert behaviour. Rows at a timestamp carried by only one member
 	/// — including that member's own internal duplicates — are preserved.
 	///
-	/// The merged rows are re-sealed as a single-block segment under the aspect's
-	/// declared schema (a paged member is compacted to single-block; choosing a paged
-	/// output for a large merge is a follow-on). Non-overlapping segments are left
-	/// untouched. The materialized rollup is rebuilt from the durable index afterward.
+	/// Each overlap component is either fully rewritten into one single-block segment
+	/// (a paged member is compacted to single-block) or, when a large **cold prefix**
+	/// dominates, **split** (per [`SplitPolicy`]) into an untouched-going-forward prefix
+	/// segment plus a merged hot-suffix segment — see
+	/// [`reconcile_overlaps_with_policy`](SegmentStore::reconcile_overlaps_with_policy).
+	/// Non-overlapping segments are left untouched. The materialized rollup is rebuilt
+	/// from the durable index afterward. This entry point uses
+	/// [`SplitPolicy::questdb_default`] (a 50 MiB split floor), so components of small
+	/// segments always take the full-rewrite path.
 	///
-	/// Returns the number of segments **removed** by merging — the sum over components
-	/// of `(members − 1)`; zero when no two segments overlap (a no-op).
+	/// Returns the net reduction in segment count across all components — `members − 1`
+	/// per fully-rewritten component and `members − 2` per split one (a split keeps two
+	/// segments); zero when no two segments overlap (a no-op).
 	///
 	/// # Errors
 	///
 	/// Returns an error if `aspect` has no declared schema; propagates a filesystem
 	/// read/write error, a decode/re-seal failure, or a libSQL failure.
 	pub async fn reconcile_overlaps(&self, aspect: &str) -> Result<usize> {
+		self.reconcile_overlaps_with_policy(aspect, SplitPolicy::questdb_default()).await
+	}
+
+	/// **Cross-segment overlap merge with an explicit split policy** (roadmap Phase 4.6
+	/// — the split-not-rewrite path). As [`reconcile_overlaps`](SegmentStore::reconcile_overlaps),
+	/// but `policy` governs whether each overlap component is fully rewritten or split.
+	///
+	/// **Merge semantics — newer wins (upsert).** Every component's members are folded
+	/// oldest → newest with [`merge_newer_wins`], so at any shared timestamp the
+	/// more-recently-sealed value supersedes the older one (dedup / last-writer-wins),
+	/// exactly as [`reconcile_overlaps`](SegmentStore::reconcile_overlaps) documents. The
+	/// *logical* result is identical regardless of `policy`; only the on-disk layout
+	/// differs.
+	///
+	/// **Split-not-rewrite.** A component's **cold prefix** is the run of merged rows
+	/// before its second-earliest member starts — those timestamps are carried by a
+	/// single member, so they saw no cross-segment overlap and need no merge. When that
+	/// prefix both clears the policy's [`min_split_bytes`](SplitPolicy::min_split_bytes)
+	/// floor and outweighs the hot suffix ([`SplitPolicy::decide`] → [`Split`](SplitDecision::Split)),
+	/// the component is laid out as **two** segments — the cold prefix re-sealed at the
+	/// lowest id and the merged hot suffix at a fresh id — instead of one. The two are
+	/// disjoint in time (prefix < boundary ≤ suffix), so [`overlapping_count`](dsp_physical_type::SegmentIndex::overlapping_count)
+	/// still lands at zero, and a **later** late arrival that re-enters only the hot
+	/// window forms an overlap component with the suffix alone: the cold prefix is never
+	/// pulled back in and never rewritten again, bounding write amplification over the
+	/// series' lifetime the way `QuestDB`'s partition split does. *(This pass still reads
+	/// and rewrites the prefix once to carve it; the saving is amortized over subsequent
+	/// reconciles — <https://questdb.com/docs/concepts/partitions/>)*
+	///
+	/// Byte sizes for the decision are estimated from the component's on-disk bytes and
+	/// row counts (uniform per-row encoding), with the merged tail treated as new data
+	/// via `decide(prefix, suffix, 0)`.
+	///
+	/// # Errors
+	///
+	/// As [`reconcile_overlaps`](SegmentStore::reconcile_overlaps).
+	pub async fn reconcile_overlaps_with_policy(&self, aspect: &str, policy: SplitPolicy) -> Result<usize> {
 		let descriptors = self.index.all(aspect).await?;
 		// Components of transitively time-overlapping segments: sort spans by (min_ts,
 		// max_ts), sweep, and start a new component whenever a span begins after the
@@ -700,40 +840,68 @@ impl SegmentStore {
 		}
 		let schema = self.require_schema(aspect).await?;
 		let mut removed = 0;
+		let mut changed = false;
 		for mut component in components {
 			if component.len() < 2 {
 				continue;
 			}
+			changed = true;
 			// Fold members oldest → newest so the most-recently-sealed value wins a tie.
 			component.sort_unstable();
 			let mut merged: Vec<(i64, Option<BigDecimal>)> = Vec::new();
+			let mut component_bytes = 0_u64;
+			let mut component_rows = 0_usize;
+			// The second-earliest member start: rows before it are the cold prefix (carried
+			// by one member, no cross-segment overlap). `starts` is never empty — every
+			// component member has a time range (components are built from `time_range`).
+			let mut starts: Vec<i64> = Vec::with_capacity(component.len());
 			for &id in &component {
 				let descriptor = descriptors.iter().find(|d| d.id == id).ok_or_else(|| anyhow::anyhow!("aspect {aspect:?} lost segment {id} mid-merge"))?;
+				component_bytes += descriptor.byte_len;
+				component_rows += descriptor.row_count;
+				if let Some((lo, _)) = descriptor.time_range() {
+					starts.push(lo);
+				}
 				let (ts, vs) = self.decode_all(descriptor).await?;
 				let mut rows: Vec<(i64, Option<BigDecimal>)> = ts.into_iter().zip(vs).collect();
 				// Each member may be internally out of order; sort before merging.
 				rows.sort_by_key(|(t, _)| *t);
 				merged = merge_newer_wins(&merged, &rows);
 			}
-			let (sorted_ts, sorted_vs): (Vec<i64>, Vec<Option<BigDecimal>>) = merged.into_iter().unzip();
-			// Seal the merged rows into the component's lowest id, in place.
+			starts.sort_unstable();
+			let cold_boundary = starts.get(1).copied().unwrap_or(i64::MIN);
+			let (all_ts, all_vs): (Vec<i64>, Vec<Option<BigDecimal>>) = merged.into_iter().unzip();
+			// The cold prefix: merged rows strictly before the second member's start.
+			let prefix_len = all_ts.partition_point(|&t| t < cold_boundary);
+			// Estimate prefix/suffix bytes from the component's uniform per-row size.
+			let bytes_per_row = if component_rows > 0 { component_bytes / component_rows as u64 } else { 0 };
+			let prefix_bytes = bytes_per_row.saturating_mul(prefix_len as u64);
+			let suffix_bytes = bytes_per_row.saturating_mul((all_ts.len() - prefix_len) as u64);
+			let split = prefix_len > 0 && prefix_len < all_ts.len() && policy.decide(prefix_bytes, suffix_bytes, 0) == SplitDecision::Split;
 			let target = component[0];
-			let path = self.segment_path(aspect, target);
-			let segment = schema.seal_nullable(&sorted_ts, &sorted_vs).map_err(|e| anyhow::anyhow!("merge re-seal failed: {e}"))?;
-			let new_bytes = segment.write_to();
-			tokio::fs::write(&path, &new_bytes).await.with_context(|| format!("writing merged segment {}", path.display()))?;
-			let new_descriptor = SegmentDescriptor::of_segment(target, path.to_string_lossy().into_owned(), new_bytes.len() as u64, &segment);
-			self.index.insert(aspect, &new_descriptor).await?;
+			if split {
+				// Carve the cold prefix into the lowest id and the hot suffix into a fresh
+				// id; the two are disjoint so no cross-segment overlap remains. Write the
+				// suffix first so a crash duplicates rather than drops rows.
+				let suffix_id = self.index.next_id(aspect).await?;
+				self.reseal_nullable_at(aspect, &schema, suffix_id, &all_ts[prefix_len..], &all_vs[prefix_len..], None).await?;
+				self.reseal_nullable_at(aspect, &schema, target, &all_ts[..prefix_len], &all_vs[..prefix_len], None).await?;
+			} else {
+				// Full rewrite: the whole merged component into the lowest id.
+				self.reseal_nullable_at(aspect, &schema, target, &all_ts, &all_vs, None).await?;
+			}
 			// Drop the other members: control-plane row then the file.
 			for &id in component.iter().skip(1) {
 				self.index.delete(aspect, id).await?;
 				let victim = self.segment_path(aspect, id);
 				tokio::fs::remove_file(&victim).await.with_context(|| format!("removing merged-away segment {}", victim.display()))?;
-				removed += 1;
 			}
+			// Net segment reduction: a full rewrite keeps 1, a split keeps 2 (so a
+			// two-member split reduces the count by zero while still changing the set).
+			removed += component.len() - if split { 2 } else { 1 };
 		}
-		if removed > 0 {
-			// A merge changed the segment set; recompute the rollup from the durable index.
+		if changed {
+			// A merge/split changed the segment set; recompute the rollup from the index.
 			self.rebuild_aspect_metadata(aspect).await?;
 		}
 		Ok(removed)
@@ -760,6 +928,143 @@ impl SegmentStore {
 			let removed = self.reconcile_overlaps(aspect).await?;
 			if removed > 0 {
 				sweep.aspects_reconciled += 1;
+				sweep.segments_removed += removed;
+			}
+		}
+		Ok(sweep)
+	}
+
+	/// **Store-wide overlap merge with an explicit split policy** (roadmap Phase 4.6 —
+	/// the split-not-rewrite path). As [`reconcile_all_overlaps`](SegmentStore::reconcile_all_overlaps),
+	/// but every aspect's merge runs under `policy` via
+	/// [`reconcile_overlaps_with_policy`](SegmentStore::reconcile_overlaps_with_policy),
+	/// so a dominant cold prefix is split off rather than fully rewritten.
+	///
+	/// An aspect is counted as reconciled when it **carried cross-segment overlap**
+	/// before the pass (its [`overlapping_segments`](AspectStorageStats::overlapping_segments)
+	/// was non-zero — exactly the aspects the merge acts on), rather than by the net
+	/// removed count: a two-member split changes the layout while leaving the segment
+	/// count unchanged, so a `removed > 0` test would miss it. `segments_removed` remains
+	/// the honest **net** reduction (zero for a pure split). For the full-rewrite path
+	/// (the default 50 MiB floor) this counts identically to
+	/// [`reconcile_all_overlaps`](SegmentStore::reconcile_all_overlaps), since there
+	/// overlap-present ⟺ a segment is removed.
+	///
+	/// # Errors
+	///
+	/// As [`reconcile_all_overlaps`](SegmentStore::reconcile_all_overlaps).
+	pub async fn reconcile_all_overlaps_with_policy(&self, policy: SplitPolicy) -> Result<OverlapSweep> {
+		let aspects = self.list_declared_aspects().await?;
+		let mut sweep = OverlapSweep { aspects_scanned: aspects.len(), ..OverlapSweep::default() };
+		for aspect in &aspects {
+			let had_overlap = self.index.load_index(aspect).await?.overlapping_count() > 0;
+			let removed = self.reconcile_overlaps_with_policy(aspect, policy).await?;
+			if had_overlap {
+				sweep.aspects_reconciled += 1;
+				sweep.segments_removed += removed;
+			}
+		}
+		Ok(sweep)
+	}
+
+	/// **Squash all of an aspect's segments into one** (roadmap Phase 4.6 — the squash
+	/// half of the split-not-rewrite path).
+	///
+	/// Repeated late arrivals under the split path accumulate small time-disjoint
+	/// segments (a growing pile of carved-off cold prefixes). Left unchecked that
+	/// fragments an aspect and multiplies the per-segment read/prune overhead. Squash is
+	/// the QuestDB-style bound on that fragmentation: it folds **every** segment of
+	/// `aspect` — in ascending seal id, [`merge_newer_wins`] so any residual shared
+	/// timestamp still resolves last-writer-wins — into a single time-sorted single-block
+	/// segment at the lowest id, dropping the rest. After it, the aspect is one segment
+	/// with no cross-segment overlap. The natural trigger is a segment count past a
+	/// threshold (see [`squash_aspect_if_exceeds`](SegmentStore::squash_aspect_if_exceeds));
+	/// squashing trades the split path's low write amplification for a low segment count,
+	/// so it is meant to fire rarely, not every commit.
+	///
+	/// Returns the number of segments removed (`count − 1`); zero when the aspect has
+	/// fewer than two segments (nothing to squash).
+	///
+	/// # Errors
+	///
+	/// Returns an error if `aspect` has no declared schema; propagates a filesystem
+	/// read/write error, a decode/re-seal failure, or a libSQL failure.
+	pub async fn squash_aspect(&self, aspect: &str) -> Result<usize> {
+		let descriptors = self.index.all(aspect).await?;
+		if descriptors.len() < 2 {
+			return Ok(0);
+		}
+		let schema = self.require_schema(aspect).await?;
+		let mut ids: Vec<u64> = descriptors.iter().map(|d| d.id).collect();
+		ids.sort_unstable();
+		// Fold oldest → newest so the most-recently-sealed value wins any residual tie.
+		let mut merged: Vec<(i64, Option<BigDecimal>)> = Vec::new();
+		for &id in &ids {
+			let descriptor = descriptors.iter().find(|d| d.id == id).ok_or_else(|| anyhow::anyhow!("aspect {aspect:?} lost segment {id} mid-squash"))?;
+			let (ts, vs) = self.decode_all(descriptor).await?;
+			let mut rows: Vec<(i64, Option<BigDecimal>)> = ts.into_iter().zip(vs).collect();
+			rows.sort_by_key(|(t, _)| *t);
+			merged = merge_newer_wins(&merged, &rows);
+		}
+		let (all_ts, all_vs): (Vec<i64>, Vec<Option<BigDecimal>>) = merged.into_iter().unzip();
+		let target = ids[0];
+		self.reseal_nullable_at(aspect, &schema, target, &all_ts, &all_vs, None).await?;
+		for &id in ids.iter().skip(1) {
+			self.index.delete(aspect, id).await?;
+			let victim = self.segment_path(aspect, id);
+			tokio::fs::remove_file(&victim).await.with_context(|| format!("removing squashed-away segment {}", victim.display()))?;
+		}
+		self.rebuild_aspect_metadata(aspect).await?;
+		Ok(ids.len() - 1)
+	}
+
+	/// **Threshold-triggered squash** (roadmap Phase 4.6): run
+	/// [`squash_aspect`](SegmentStore::squash_aspect) **only** when `aspect` has more than
+	/// `max_segments` segments, otherwise leave it untouched.
+	///
+	/// The trigger a background compaction pass keys on to cap split-path fragmentation,
+	/// modeled on `QuestDB`'s `cairo.o3.last.partition.max.splits` squash threshold: below
+	/// the cap the fragmentation is cheap enough to tolerate, so the squash's write cost
+	/// is not yet worth paying; above it the read/prune overhead of many segments
+	/// dominates and a squash fires. A `max_segments` of 0 clamps to 1 (an aspect can
+	/// never squash below a single segment).
+	///
+	/// Returns `Some(removed)` when the squash fired (the count was `> max_segments`) and
+	/// `None` when it held. The count is read from the durable index, so a caller can
+	/// poll cheaply and pay the rewrite only when it fires.
+	///
+	/// # Errors
+	///
+	/// As [`squash_aspect`](SegmentStore::squash_aspect); also propagates the segment-count read.
+	pub async fn squash_aspect_if_exceeds(&self, aspect: &str, max_segments: usize) -> Result<Option<usize>> {
+		let max_segments = max_segments.max(1);
+		if self.index.count(aspect).await? <= max_segments {
+			return Ok(None);
+		}
+		Ok(Some(self.squash_aspect(aspect).await?))
+	}
+
+	/// **Store-wide threshold squash** (roadmap Phase 4.6): apply the
+	/// [`squash_aspect_if_exceeds`](SegmentStore::squash_aspect_if_exceeds) trigger to
+	/// **every** declared aspect, squashing only those whose segment count exceeds
+	/// `max_segments`.
+	///
+	/// The tick a background squash daemon calls to cap split-path fragmentation
+	/// store-wide: on a timer it sweeps the aspects, pays the squash only for the ones
+	/// over the cap, and leaves the rest untouched. Aspects are visited in declared-name
+	/// order; a `max_segments` of 0 clamps to 1. Returns a [`SquashSweep`] — how many
+	/// aspects were scanned, how many were squashed, and the total segments removed.
+	///
+	/// # Errors
+	///
+	/// As [`squash_aspect_if_exceeds`](SegmentStore::squash_aspect_if_exceeds); also
+	/// propagates the aspect-list read.
+	pub async fn squash_all_over_threshold(&self, max_segments: usize) -> Result<SquashSweep> {
+		let aspects = self.list_declared_aspects().await?;
+		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
+		for aspect in &aspects {
+			if let Some(removed) = self.squash_aspect_if_exceeds(aspect, max_segments).await? {
+				sweep.aspects_squashed += 1;
 				sweep.segments_removed += removed;
 			}
 		}
@@ -1022,6 +1327,21 @@ pub struct OverlapSweep {
 	pub aspects_reconciled: usize,
 	/// Total segments removed by merging across every aspect (sum of per-component
 	/// `members − 1`).
+	pub segments_removed: usize,
+}
+
+/// The outcome of a store-wide squash sweep, returned by
+/// [`SegmentStore::squash_all_over_threshold`] — the per-tick numbers a background
+/// squash daemon logs and exports.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SquashSweep {
+	/// Number of declared aspects the sweep visited.
+	pub aspects_scanned: usize,
+	/// Number of aspects that were squashed this sweep (their segment count exceeded the
+	/// threshold).
+	pub aspects_squashed: usize,
+	/// Total segments removed by squashing across every aspect (sum of per-aspect
+	/// `count − 1`).
 	pub segments_removed: usize,
 }
 
@@ -1362,6 +1682,95 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn split_segment_carves_a_prefix_and_suffix() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		// One sorted single-block segment over [10,50].
+		let d = store.seal("a", &schema(), &[10_i64, 20, 30, 40, 50], &[bd("1"), bd("2"), bd("3"), bd("4"), bd("5")]).await.expect("seals");
+		// Split at 35: prefix [10,20,30] stays at d.id, suffix [40,50] to a new id.
+		let suffix_id = store.split_segment("a", d.id, 35).await.expect("splits").expect("a real split");
+		let stats = store.aspect_stats("a").await.expect("stats");
+		// Every row survives, in order, split across the two disjoint segments.
+		let (ts, vs) = store.read_time_range("a", 0, 1000).await.expect("reads");
+		let prefix_hit = store.read_point("a", 20).await.expect("reads");
+		let suffix_hit = store.read_point("a", 40).await.expect("reads");
+		drop(store);
+		assert_ne!(suffix_id, d.id, "the suffix takes a fresh id");
+		assert_eq!(stats.segment_count, 2, "a split turns one segment into two");
+		assert_eq!(stats.unsorted_segments, 0, "both halves are internally sorted");
+		assert_eq!(stats.overlapping_segments, 0, "prefix < boundary <= suffix — disjoint in time");
+		assert_eq!(stats.total_rows, 5, "no row is lost or duplicated");
+		assert_eq!(ts, vec![10, 20, 30, 40, 50]);
+		assert_eq!(vs, vec![Some(bd("1")), Some(bd("2")), Some(bd("3")), Some(bd("4")), Some(bd("5"))]);
+		assert_eq!(prefix_hit, Some(bd("2")));
+		assert_eq!(suffix_hit, Some(bd("4")));
+	}
+
+	#[tokio::test]
+	async fn split_segment_is_a_noop_at_the_edges() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		let d = store.seal("a", &schema(), &[10_i64, 20, 30], &[bd("1"), bd("2"), bd("3")]).await.expect("seals");
+		// Boundary before the first row and after the last row both leave every row on
+		// one side — nothing to carve.
+		let before = store.split_segment("a", d.id, 5).await.expect("splits");
+		let after = store.split_segment("a", d.id, 100).await.expect("splits");
+		// A boundary equal to the first timestamp is at-or-after it → whole segment is the
+		// suffix → still degenerate.
+		let at_first = store.split_segment("a", d.id, 10).await.expect("splits");
+		let count = store.segment_count("a").await.expect("counts");
+		drop(store);
+		assert_eq!(before, None);
+		assert_eq!(after, None);
+		assert_eq!(at_first, None);
+		assert_eq!(count, 1, "a degenerate split writes no new segment");
+	}
+
+	#[tokio::test]
+	async fn split_segment_rejects_an_out_of_order_segment() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		// An out-of-order segment violates split_index's sorted precondition.
+		let d = store.seal("a", &schema(), &[30_i64, 10, 20], &[bd("3"), bd("1"), bd("2")]).await.expect("seals ooo");
+		let err = store.split_segment("a", d.id, 15).await.expect_err("out-of-order split is rejected");
+		let count = store.segment_count("a").await.expect("counts");
+		drop(store);
+		assert!(err.to_string().contains("out of order"), "the error names the cause: {err}");
+		assert_eq!(count, 1, "a rejected split leaves the store untouched");
+	}
+
+	#[tokio::test]
+	async fn split_segment_preserves_a_paged_nullable_frame() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		// A paged, nullable, sorted segment over [0,70] at page height 3 (a null at 30).
+		let ts: Vec<i64> = (0..8).map(|i| i * 10).collect();
+		let vs: Vec<Option<BigDecimal>> = (0..8).map(|i| if i == 3 { None } else { Some(BigDecimal::from(i)) }).collect();
+		let d = store.seal_paged_nullable("a", &schema(), &ts, &vs, 3).await.expect("seals paged nullable");
+		let suffix_id = store.split_segment("a", d.id, 35).await.expect("splits").expect("a real split");
+		let stats = store.aspect_stats("a").await.expect("stats");
+		let (rts, rvs) = store.read_time_range("a", 0, 1000).await.expect("reads");
+		let null_hit = store.read_point("a", 30).await.expect("reads");
+		let suffix_hit = store.read_point("a", 40).await.expect("reads");
+		// Both halves keep the paged frame version (they re-seal at the source page height).
+		let prefix_bytes = std::fs::read(dir.path().join("segments").join(format!("a-{}.dspseg", d.id))).expect("prefix file");
+		let suffix_bytes = std::fs::read(dir.path().join("segments").join(format!("a-{suffix_id}.dspseg"))).expect("suffix file");
+		drop(store);
+		assert_eq!(stats.segment_count, 2);
+		assert_eq!(stats.total_rows, 8, "the null row is preserved across the split");
+		assert_eq!(rts, ts);
+		assert_eq!(rvs, vs);
+		assert_eq!(null_hit, None, "the null at 30 stays null (present-bit cleared)");
+		assert_eq!(suffix_hit, Some(bd("4")));
+		assert!(PagedSegment::read_from(&prefix_bytes).is_ok(), "prefix keeps the paged frame");
+		assert!(PagedSegment::read_from(&suffix_bytes).is_ok(), "suffix keeps the paged frame");
+	}
+
+	#[tokio::test]
 	async fn reconcile_aspect_clears_the_unsorted_count() {
 		let dir = TempDir::new().expect("tempdir");
 		let store = SegmentStore::open(dir.path()).await.expect("opens");
@@ -1564,6 +1973,91 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn reconcile_overlaps_splits_a_dominant_cold_prefix() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		// A long cold base [0..100] and a small late batch [90,100,110] that re-enters
+		// only its tail (newer wins at 90 and 100).
+		let base_ts: Vec<i64> = (0..=10).map(|i| i * 10).collect();
+		let base_vs: Vec<BigDecimal> = (0..=10).map(BigDecimal::from).collect();
+		store.seal("a", &schema(), &base_ts, &base_vs).await.expect("base");
+		store.seal("a", &schema(), &[90_i64, 100, 110], &[bd("900"), bd("1000"), bd("1100")]).await.expect("late");
+		assert_eq!(store.aspect_stats("a").await.expect("stats").overlapping_segments, 2);
+		// A tiny-floor policy makes the dominant cold prefix ([0..80], 9 rows) split off
+		// from the hot suffix ([90,100,110], 3 rows) rather than a full rewrite.
+		let removed = store.reconcile_overlaps_with_policy("a", SplitPolicy::new(1)).await.expect("splits");
+		let stats = store.aspect_stats("a").await.expect("stats");
+		let (ts, vs) = store.read_time_range("a", 0, 1000).await.expect("reads");
+		let cold_hit = store.read_point("a", 50).await.expect("reads");
+		let hot_hit = store.read_point("a", 90).await.expect("reads");
+		drop(store);
+		assert_eq!(removed, 0, "a two-member split keeps two segments — net count unchanged");
+		assert_eq!(stats.segment_count, 2, "cold prefix + hot suffix");
+		assert_eq!(stats.overlapping_segments, 0, "the two halves are disjoint in time");
+		assert_eq!(stats.unsorted_segments, 0);
+		assert_eq!(stats.total_rows, 12, "9 cold + 3 hot, deduped on the shared 90/100");
+		// The logical data matches a full merge: newer wins at 90 and 100.
+		assert_eq!(ts, vec![0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110]);
+		assert_eq!(vs.last(), Some(&Some(bd("1100"))));
+		assert_eq!(cold_hit, Some(bd("5")), "cold prefix value preserved");
+		assert_eq!(hot_hit, Some(bd("900")), "newer wins in the hot suffix at 90");
+	}
+
+	#[tokio::test]
+	async fn split_reconcile_leaves_the_cold_prefix_untouched_on_a_later_merge() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		let base_ts: Vec<i64> = (0..=10).map(|i| i * 10).collect();
+		let base_vs: Vec<BigDecimal> = (0..=10).map(BigDecimal::from).collect();
+		store.seal("a", &schema(), &base_ts, &base_vs).await.expect("base");
+		store.seal("a", &schema(), &[90_i64, 100, 110], &[bd("900"), bd("1000"), bd("1100")]).await.expect("late");
+		// First reconcile splits: cold prefix [0..80] stays at id 0, hot suffix gets a new id.
+		store.reconcile_overlaps_with_policy("a", SplitPolicy::new(1)).await.expect("splits");
+		// The cold-prefix segment on disk after the split (id 0).
+		let cold_path = dir.path().join("segments").join("a-0.dspseg");
+		let cold_before = std::fs::read(&cold_path).expect("cold prefix file");
+		// A second late arrival re-enters only the hot window [90,110]; it must NOT pull
+		// the cold prefix back in.
+		store.seal("a", &schema(), &[105_i64, 115], &[bd("1050"), bd("1150")]).await.expect("later late");
+		let removed = store.reconcile_overlaps_with_policy("a", SplitPolicy::new(1)).await.expect("merges the hot tail");
+		let stats = store.aspect_stats("a").await.expect("stats");
+		let (ts, _vs) = store.read_time_range("a", 0, 1000).await.expect("reads");
+		let cold_after = std::fs::read(&cold_path).expect("cold prefix file still present");
+		let cold_hit = store.read_point("a", 50).await.expect("reads");
+		drop(store);
+		// The cold prefix file is byte-identical — it was never rewritten by the second
+		// reconcile (the amortized split-not-rewrite win).
+		assert_eq!(cold_before, cold_after, "the cold prefix is untouched by the later merge");
+		assert_eq!(stats.overlapping_segments, 0, "no overlap remains after the second reconcile");
+		assert_eq!(cold_hit, Some(bd("5")), "cold data intact");
+		// Every distinct timestamp survives across both reconciles (110 superseded by the
+		// second batch is still present; 105 and 115 are new).
+		assert_eq!(ts, vec![0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 105, 110, 115]);
+		let _ = removed;
+	}
+
+	#[tokio::test]
+	async fn reconcile_overlaps_default_policy_full_rewrites_small_segments() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		// The same cold-base + late-tail shape, but under the default 50 MiB split floor
+		// these tiny segments never clear it → a single fully-rewritten segment.
+		let base_ts: Vec<i64> = (0..=10).map(|i| i * 10).collect();
+		let base_vs: Vec<BigDecimal> = (0..=10).map(BigDecimal::from).collect();
+		store.seal("a", &schema(), &base_ts, &base_vs).await.expect("base");
+		store.seal("a", &schema(), &[90_i64, 100, 110], &[bd("900"), bd("1000"), bd("1100")]).await.expect("late");
+		let removed = store.reconcile_overlaps("a").await.expect("merges");
+		let stats = store.aspect_stats("a").await.expect("stats");
+		drop(store);
+		assert_eq!(removed, 1, "default policy full-rewrites: one segment merged away");
+		assert_eq!(stats.segment_count, 1, "no split under the 50 MiB floor");
+		assert_eq!(stats.overlapping_segments, 0);
+	}
+
+	#[tokio::test]
 	async fn reconcile_overlaps_merges_a_transitive_chain() {
 		let dir = TempDir::new().expect("tempdir");
 		let store = SegmentStore::open(dir.path()).await.expect("opens");
@@ -1627,6 +2121,108 @@ mod tests {
 		assert_eq!(sweep.segments_removed, 1);
 		assert_eq!(a_after, 0);
 		assert_eq!(b_after, 0, "b never overlapped");
+	}
+
+	#[tokio::test]
+	async fn reconcile_all_overlaps_with_policy_splits_and_counts_by_overlap() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares a");
+		store.declare("b", &schema()).await.expect("declares b");
+		// a: a dominant cold prefix + late tail (splits under a tiny floor, net removed 0).
+		let base_ts: Vec<i64> = (0..=10).map(|i| i * 10).collect();
+		let base_vs: Vec<BigDecimal> = (0..=10).map(BigDecimal::from).collect();
+		store.seal("a", &schema(), &base_ts, &base_vs).await.expect("a base");
+		store.seal("a", &schema(), &[90_i64, 100, 110], &[bd("900"), bd("1000"), bd("1100")]).await.expect("a late");
+		// b: no overlap.
+		store.seal("b", &schema(), &[0_i64, 10], &[bd("7"), bd("8")]).await.expect("b lo");
+		store.seal("b", &schema(), &[100_i64, 110], &[bd("1"), bd("2")]).await.expect("b hi");
+		let sweep = store.reconcile_all_overlaps_with_policy(SplitPolicy::new(1)).await.expect("sweeps");
+		let a_stats = store.aspect_stats("a").await.expect("stats a");
+		drop(store);
+		// a is counted as reconciled even though its split left the segment count
+		// unchanged (net removed 0) — counting keys on the pre-pass overlap.
+		assert_eq!(sweep.aspects_scanned, 2);
+		assert_eq!(sweep.aspects_reconciled, 1, "only a carried overlap");
+		assert_eq!(sweep.segments_removed, 0, "a two-member split removes no segment net");
+		assert_eq!(a_stats.segment_count, 2, "a split into cold prefix + hot suffix");
+		assert_eq!(a_stats.overlapping_segments, 0);
+	}
+
+	#[tokio::test]
+	async fn squash_folds_disjoint_segments_into_one() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		// Four time-disjoint segments (as repeated split carve-offs would leave).
+		store.seal("a", &schema(), &[0_i64, 10], &[bd("0"), bd("1")]).await.expect("s0");
+		store.seal("a", &schema(), &[20_i64, 30], &[bd("2"), bd("3")]).await.expect("s1");
+		store.seal("a", &schema(), &[40_i64, 50], &[bd("4"), bd("5")]).await.expect("s2");
+		store.seal("a", &schema(), &[60_i64, 70], &[bd("6"), bd("7")]).await.expect("s3");
+		let removed = store.squash_aspect("a").await.expect("squashes");
+		let stats = store.aspect_stats("a").await.expect("stats");
+		let (ts, vs) = store.read_time_range("a", 0, 1000).await.expect("reads");
+		let hit = store.read_point("a", 50).await.expect("reads");
+		drop(store);
+		assert_eq!(removed, 3, "four segments squashed to one");
+		assert_eq!(stats.segment_count, 1);
+		assert_eq!(stats.unsorted_segments, 0);
+		assert_eq!(stats.overlapping_segments, 0);
+		assert_eq!(ts, vec![0, 10, 20, 30, 40, 50, 60, 70], "every row preserved in order");
+		assert_eq!(vs.len(), 8);
+		assert_eq!(hit, Some(bd("5")));
+	}
+
+	#[tokio::test]
+	async fn squash_all_over_threshold_sweeps_only_aspects_over_the_cap() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares a");
+		store.declare("b", &schema()).await.expect("declares b");
+		// a: 3 disjoint segments (over a cap of 2). b: 1 segment (under).
+		store.seal("a", &schema(), &[0_i64, 10], &[bd("0"), bd("1")]).await.expect("a0");
+		store.seal("a", &schema(), &[20_i64, 30], &[bd("2"), bd("3")]).await.expect("a1");
+		store.seal("a", &schema(), &[40_i64, 50], &[bd("4"), bd("5")]).await.expect("a2");
+		store.seal("b", &schema(), &[0_i64, 10], &[bd("7"), bd("8")]).await.expect("b0");
+		let sweep = store.squash_all_over_threshold(2).await.expect("sweeps");
+		let a_count = store.segment_count("a").await.expect("a count");
+		let b_count = store.segment_count("b").await.expect("b count");
+		drop(store);
+		assert_eq!(sweep.aspects_scanned, 2);
+		assert_eq!(sweep.aspects_squashed, 1, "only a exceeded the cap of 2");
+		assert_eq!(sweep.segments_removed, 2, "a's 3 segments squashed to 1");
+		assert_eq!(a_count, 1);
+		assert_eq!(b_count, 1, "b was under the cap and untouched");
+	}
+
+	#[tokio::test]
+	async fn squash_is_a_noop_below_two_segments() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		store.seal("a", &schema(), &[0_i64, 10], &[bd("0"), bd("1")]).await.expect("s0");
+		let removed = store.squash_aspect("a").await.expect("no-op");
+		drop(store);
+		assert_eq!(removed, 0, "a single segment has nothing to squash");
+	}
+
+	#[tokio::test]
+	async fn squash_if_exceeds_gates_on_the_segment_count() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		store.seal("a", &schema(), &[0_i64, 10], &[bd("0"), bd("1")]).await.expect("s0");
+		store.seal("a", &schema(), &[20_i64, 30], &[bd("2"), bd("3")]).await.expect("s1");
+		store.seal("a", &schema(), &[40_i64, 50], &[bd("4"), bd("5")]).await.expect("s2");
+		// Three segments, cap 3 → holds (count is not > 3).
+		let held = store.squash_aspect_if_exceeds("a", 3).await.expect("gate");
+		// Cap 2 → fires (3 > 2), squashing to one.
+		let fired = store.squash_aspect_if_exceeds("a", 2).await.expect("gate");
+		let count = store.segment_count("a").await.expect("count");
+		drop(store);
+		assert_eq!(held, None, "at or below the cap the squash holds");
+		assert_eq!(fired, Some(2), "above the cap it squashes 3 → 1 (2 removed)");
+		assert_eq!(count, 1);
 	}
 
 	#[tokio::test]

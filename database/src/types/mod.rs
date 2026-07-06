@@ -24,7 +24,7 @@ pub use pattern::{Pattern, PatternID};
 pub use pipeline::{DetectorMetadata, DetectorType, PipelineConfig, PipelineState};
 pub use relative::Relative;
 pub use segment_index::SegmentIndexStore;
-pub use segment_store::{AspectStorageStats, HotColdReconcile, HotColdSweep, OverlapSweep, ReconcileSweep, SegmentStore, StoreStorageStats};
+pub use segment_store::{AspectStorageStats, HotColdReconcile, HotColdSweep, OverlapSweep, ReconcileSweep, SegmentStore, SquashSweep, StoreStorageStats};
 pub use signal::{Distance, ErrVal, Signal, SignalType, Signals};
 pub use subject::{Subject, SubjectId};
 pub use transaction::{Transaction, TxId};
