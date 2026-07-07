@@ -108,6 +108,75 @@ impl ColumnEncoding {
 			.sum()
 	}
 
+	/// The `ScaledI64` mantissas of this column, in input order — `None` for any
+	/// other physical type.
+	///
+	/// Bit-packing the value column is only defined for the scaled-integer encoding,
+	/// whose payload is a homogeneous signed-`i64` stream (the floats are IEEE byte
+	/// patterns, the wide integers are full-width, `BigDecimalText` is UTF-8). A
+	/// `ScaledI64` column is guaranteed to hold only `ScaledI64` values, so the map
+	/// is total.
+	#[must_use]
+	pub fn scaled_i64_mantissas(&self) -> Option<Vec<i64>> {
+		if !matches!(self.physical_type, PhysicalType::ScaledI64 { .. }) {
+			return None;
+		}
+		Some(
+			self.values
+				.iter()
+				.map(|v| match v {
+					PhysicalValue::ScaledI64 { mantissa, .. } => *mantissa,
+					// Unreachable: a ScaledI64 column holds only ScaledI64 values.
+					_ => 0,
+				})
+				.collect(),
+		)
+	}
+
+	/// The realized footprint in bytes of the **fixed-width bit-packed** value codec
+	/// for a `ScaledI64` column — a one-byte width selector plus the packed mantissa
+	/// stream ([`crate::timestamp::bitpack_bytes`], which already counts the width
+	/// byte). `None` for any other physical type (bit-packing is only defined for the
+	/// scaled-integer payload).
+	///
+	/// This is the value-column analogue of the timestamp bit-pack codec: a regular
+	/// or small-jitter scaled-integer series (mantissas differing by only a few bits)
+	/// packs to `~len * width / 8` bytes, well under the per-value zig-zag varint's
+	/// one-byte-per-value floor that [`serialized_bytes`](Self::serialized_bytes)
+	/// reports. Compare the two to pick the smaller codec per column.
+	#[must_use]
+	pub fn bitpack_value_bytes(&self) -> Option<usize> {
+		self.scaled_i64_mantissas().map(|m| crate::timestamp::bitpack_bytes(&m))
+	}
+
+	/// The smallest realized value-codec footprint for this column — the figure a
+	/// per-column codec selector *would* write once the bit-pack codec is realized on
+	/// disk. For a `ScaledI64` column this is `min(varint, bit-pack)`; for every
+	/// other physical type it is exactly [`serialized_bytes`](Self::serialized_bytes)
+	/// (the only codec defined for that payload).
+	///
+	/// Advisory today (the `.dspseg` value block still writes the per-value varint):
+	/// this is the estimate half of the codec, mirroring how the Gorilla timestamp
+	/// codec first landed its `gorilla_bytes` estimate before the on-disk selector.
+	#[must_use]
+	pub fn best_serialized_bytes(&self) -> usize {
+		let varint = self.serialized_bytes();
+		self.bitpack_value_bytes().map_or(varint, |bitpack| bitpack.min(varint))
+	}
+
+	/// The name of the value codec [`best_serialized_bytes`](Self::best_serialized_bytes)
+	/// would select — `"scaled_bitpack"` when bit-packing is strictly smaller than the
+	/// per-value varint for a `ScaledI64` column, otherwise `"varint"` (the general
+	/// per-value payload, and the only codec for the non-scaled types). Ties keep the
+	/// varint codec (no random-access penalty for equal bytes).
+	#[must_use]
+	pub fn best_value_codec(&self) -> &'static str {
+		match self.bitpack_value_bytes() {
+			Some(bitpack) if bitpack < self.serialized_bytes() => "scaled_bitpack",
+			_ => "varint",
+		}
+	}
+
 	/// Reconstruct the logical `BigDecimal` column.
 	#[must_use]
 	pub fn decode(&self) -> Vec<BigDecimal> {
@@ -317,5 +386,63 @@ mod tests {
 		let rec = recommend_encoding(&[], &BigDecimal::from(0));
 		assert_eq!(rec.physical_type, PhysicalType::F32);
 		assert!(rec.is_empty());
+	}
+
+	#[test]
+	fn scaled_i64_mantissas_only_for_scaled_columns() {
+		let values = col(&["1.25", "2.50", "-3.75"]);
+		let scaled = encode_column(PhysicalType::ScaledI64 { scale: 2 }, &values).expect("encodes");
+		// scale 2 ⇒ mantissas are the values * 100.
+		assert_eq!(scaled.scaled_i64_mantissas(), Some(vec![125, 250, -375]));
+		// Any other physical type has no bit-packable mantissa stream.
+		let floats = encode_column(PhysicalType::F64, &values).expect("encodes");
+		assert_eq!(floats.scaled_i64_mantissas(), None);
+		assert_eq!(floats.bitpack_value_bytes(), None);
+		// …so its best codec is the varint payload unchanged.
+		assert_eq!(floats.best_serialized_bytes(), floats.serialized_bytes());
+		assert_eq!(floats.best_value_codec(), "varint");
+	}
+
+	#[test]
+	fn bitpack_value_codec_beats_varint_on_a_regular_scaled_stream() {
+		// A long, slowly-rising scaled-int series: every mantissa is small-magnitude
+		// (a few bits), so fixed-width bit-packing crushes the one-byte-per-value
+		// varint floor. Values 0.00, 0.01, … 0.63 → mantissas 0..=63 (≤ 7 bits).
+		let lits: Vec<String> = (0..64).map(|i| format!("{}.{:02}", i / 100, i % 100)).collect();
+		let refs: Vec<&str> = lits.iter().map(String::as_str).collect();
+		let values = col(&refs);
+		let enc = encode_column(PhysicalType::ScaledI64 { scale: 2 }, &values).expect("encodes");
+		let varint = enc.serialized_bytes();
+		let bitpack = enc.bitpack_value_bytes().expect("scaled column bit-packs");
+		assert!(bitpack < varint, "bit-pack {bitpack} must beat varint {varint} on a small-mantissa stream");
+		assert_eq!(enc.best_serialized_bytes(), bitpack);
+		assert_eq!(enc.best_value_codec(), "scaled_bitpack");
+	}
+
+	#[test]
+	fn bitpack_value_codec_loses_to_varint_on_wide_sparse_mantissas() {
+		// A column of large-magnitude mantissas: fixed-width bit-packing must pay the
+		// widest value's bit-width for every row, so the per-value varint (which sizes
+		// each value independently) wins. The selector must fall back to varint.
+		let values = col(&["1", "1000000000", "2"]);
+		let enc = encode_column(PhysicalType::ScaledI64 { scale: 0 }, &values).expect("encodes");
+		let varint = enc.serialized_bytes();
+		let bitpack = enc.bitpack_value_bytes().expect("scaled column bit-packs");
+		assert!(bitpack > varint, "wide-sparse bit-pack {bitpack} must lose to varint {varint}");
+		assert_eq!(enc.best_serialized_bytes(), varint);
+		assert_eq!(enc.best_value_codec(), "varint");
+	}
+
+	#[test]
+	fn bitpack_value_codec_round_trips_the_mantissas() {
+		// The realized codec reuses the timestamp bit-pack primitives over the value
+		// column's mantissa stream — prove that round-trip is exact before the on-disk
+		// wiring depends on it.
+		use crate::timestamp::{bitpack_decode, bitpack_encode};
+		let values = col(&["1.25", "2.50", "-3.75", "0.00", "12.34"]);
+		let enc = encode_column(PhysicalType::ScaledI64 { scale: 2 }, &values).expect("encodes");
+		let mantissas = enc.scaled_i64_mantissas().expect("scaled column");
+		let (width, packed) = bitpack_encode(&mantissas);
+		assert_eq!(bitpack_decode(width, &packed, mantissas.len()), mantissas);
 	}
 }

@@ -326,14 +326,22 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   **bytes/point** (the north-star cost term) before anything is written.
 - **Timestamp codecs** — integer-epoch timestamps (`TimeUnit` =
   seconds/millis/micros/nanos) with lossless **delta** and **delta-of-delta**
-  transforms and **four** interchangeable second-difference codecs — per-value
-  zig-zag + LEB128 **varint**, **RLE**, **fixed-width bit-packing**, and a
-  **Gorilla-style variable-length** codec — chosen per column by a smallest-wins
-  selector. Each wins a different regime: bit-packing on regular/small-jitter series,
-  RLE on long constant runs, Gorilla on **scattered single jitter** (isolated moderate
-  spikes among regular intervals, where RLE cannot form runs and bit-packing must widen
-  every value — so Gorilla is materially smaller there). A regular 1000-point column
-  packs to ~12 bytes total.
+  transforms and **five** interchangeable second-difference codecs — per-value
+  zig-zag + LEB128 **varint**, **RLE**, **fixed-width bit-packing**, a
+  **Gorilla-style variable-length** codec, and **per-block adaptive (dynamic)
+  bit-packing** — chosen per column by a smallest-wins selector. Each wins a different
+  regime: bit-packing on regular/small-jitter series, RLE on long constant runs, Gorilla
+  on **scattered single jitter** (isolated moderate spikes among regular intervals, where
+  RLE cannot form runs and bit-packing must widen every value), and per-block adaptive
+  bit-packing on a **mixed-magnitude** stream (a contiguous wide region among narrow runs,
+  where a single global width overpays — 184 B vs 384–961 B for the other codecs on a
+  256-value mixed corpus). A regular 1000-point column packs to ~12 bytes total.
+- **Value-column codecs** — a value column is stored under its schema-declared physical
+  encoding, and a **`ScaledI64`** column additionally chooses between a per-value zig-zag
+  **varint** and **fixed-width bit-packing** of its mantissas via a self-describing
+  selector byte — bit-packing a regular scaled series (e.g. a 2-decimal price ramp) to
+  **37% below** the varint (76% below the naive `len * 8` estimate). The realized figure
+  is reported as `StorageEstimate.realized_value_bytes` / `value_codec`.
 
 ### Segment store (`.dspseg` + `database::SegmentStore`)
 
@@ -342,12 +350,15 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   counts, and a format version. The on-disk frame is hand-rolled, versioned, and
   **CRC-32-verified before parse**, so a corrupt or truncated file fails fast.
 - **Multi-codec timestamps** — the timestamp block writes its second-difference
-  stream under whichever of **four** codecs is smallest — fixed-width **bit-packing**,
-  per-value zig-zag **varint**, **RLE**, or **Gorilla** variable-length — chosen by a
-  self-describing selector byte the reader dispatches on, routed through the single
-  source of truth so the reported codec name always matches the bytes on disk. A
-  regular series packs to a handful of bytes on disk (a 1000-point regular block stores
-  in <20 bytes), so the bytes/point saving is *realized*, not just estimated.
+  stream under whichever of **five** codecs is smallest — fixed-width **bit-packing**,
+  per-value zig-zag **varint**, **RLE**, **Gorilla** variable-length, or **per-block
+  adaptive (dynamic) bit-packing** — chosen by a self-describing selector byte the reader
+  dispatches on, routed through the single source of truth so the reported codec name
+  always matches the bytes on disk. A regular series packs to a handful of bytes on disk
+  (a 1000-point regular block stores in <20 bytes), so the bytes/point saving is
+  *realized*, not just estimated. The **value block** carries its own codec selector too,
+  so a `ScaledI64` column bit-packs its mantissas on disk when that is smaller than the
+  per-value varint.
 - **Order semantics** — every segment records whether its timestamps are monotonic
   (`time_sorted`). Ingest can *enforce* order (`require_sorted` rejects an
   out-of-order batch rather than sealing it), and the per-aspect/store rollups carry
@@ -686,7 +697,7 @@ DSP is configured primarily through environment variables:
 | `DSP_RECONCILE_OVERLAPS` | `dsp-server` | Truthy → each daemon tick also merges cross-segment time-overlap groups. | unset (disabled) |
 | `DSP_RECONCILE_SPLIT_MIN_BYTES` | `dsp-server` | Split-not-rewrite floor (bytes) for the daemon's overlap merge; a dominant cold prefix clearing it is split off rather than rewritten. | unset (default 50 MiB floor → full-rewrite) |
 | `DSP_RECONCILE_MAX_SPLITS` | `dsp-server` | Segment-count cap; each tick also squashes every aspect over it into one segment (bounds split-path fragmentation). | unset (no squash) |
-| `RUST_LOG` | all | [`tracing`](https://docs.rs/tracing) filter. On `dsp-server` it drives a per-request root span (`request{method,path,request_id}`, echoed as `x-request-id`) that every per-stage span nests under, each with busy/idle timing: the compute paths (`interpolate.parse`/`compute`/`serialize` under `interpolate.engine`, `downsample.parse`/`reduce`); the **storage read** paths (`storage.{range,value_range,point}.read` + `.serialize`, with a `format` field over JSON/CSV/Arrow/Parquet); the **ingest** paths (`storage.ingest.parse`/`normalize`/`seal` for ILP/CSV/JSON); and the background **reconcile daemon** (`reconcile.tick{kind,…,aspects,segments}`). | `dsp_tui=debug,database=debug,info` |
+| `RUST_LOG` | all | [`tracing`](https://docs.rs/tracing) filter. On `dsp-server` it drives a per-request root span (`request{method,path,request_id}`, echoed as `x-request-id`) that every per-stage span nests under, each with busy/idle timing: the compute paths (`interpolate.parse`/`compute`/`serialize` under `interpolate.engine`, `downsample.parse`/`reduce`); the **storage read** paths (`storage.{range,value_range,point}.read` + `.serialize`, with a `format` field over JSON/CSV/Arrow/Parquet); the **ingest** paths (`storage.ingest.parse`/`normalize`/`seal` for ILP/CSV/JSON, and `storage.ingest.parquet` for the Parquet decode+seal); and the background **reconcile daemon** (`reconcile.tick{kind,…,aspects,segments}`). | `dsp_tui=debug,database=debug,info` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `dsp-server` | When set (e.g. `http://localhost:4317`), export tracing spans to an OpenTelemetry collector over **OTLP/gRPC** in addition to the `RUST_LOG` `fmt` output. Unset → no exporter, no network dependency; a misconfigured/absent collector never blocks startup. | unset (export disabled) |
 | `SKIP_SLOW_TESTS` | tests | Set to `1` to skip long-running tests. | unset |
 

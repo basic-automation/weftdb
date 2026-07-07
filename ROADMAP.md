@@ -216,7 +216,8 @@ transfer, 8% kernel, 7% JSON").
   decode paths** (`storage.ingest.parse`/`normalize`/`seal` for ILP + CSV + JSON), and
   the **reconcile daemon** (`reconcile.tick{kind,...,aspects,segments}` on all five tick
   kinds) — all runtime-verified against the running binary
-- [ ] Remaining per-stage spans — auth · Arrow decode on ingest · WAL append · explicit libSQL write · commit · index update · page skip · cache hit/miss · decompression · CPU interp · GPU upload/queue/kernel/readback
+- [x] Arrow/Parquet decode on ingest — `storage.ingest.parquet` stage span (byte length + sort guard + `format="parquet"`), nesting under the request root span; runtime-verified against the running binary
+- [ ] Remaining per-stage spans — auth · WAL append · explicit libSQL write · commit · index update · page skip · cache hit/miss · decompression · CPU interp · GPU upload/queue/kernel/readback
 - [x] **OTLP trace export** (pairs with `/metrics`): shipped — env-gated on
   `OTEL_EXPORTER_OTLP_ENDPOINT`, an OTLP/gRPC `SdkTracerProvider` (batch exporter +
   `dsp-server` service resource) with a `tracing_opentelemetry` layer beside the `fmt`
@@ -353,10 +354,12 @@ transfer, kernel, readback, and API serialization, p95 = Z."*
 detection within Y% and improving historical query latency by Z."*
 
 - [ ] **6.1 Lossless typed codecs** — timestamp delta/delta-of-delta + **fixed-width
-  bit-packing** + **RLE** + **Gorilla variable-length** *(all four realized on disk in
-  the `.dspseg` timestamp block, chosen per-stream by `best_encoding_name`)*; scaled-int
-  bit packing; Chimp-style f64; ALP-inspired vectorized f64; Decimal128/scaled-int
-  codecs; **block-level random access**. *(Check codec patents/licenses before embedding.)*
+  bit-packing** + **RLE** + **Gorilla variable-length** + **per-block adaptive
+  bit-packing** *(all five realized on disk in the `.dspseg` timestamp block, chosen
+  per-stream by `best_encoding_name`)*; **scaled-int value bit-packing** *(realized on
+  disk in the value block)*; Chimp-style f64; ALP-inspired vectorized f64;
+  Decimal128/scaled-int codecs; **block-level random access**. *(Check codec
+  patents/licenses before embedding.)*
   - [x] **Gorilla + RLE realized on disk** — the timestamp block now carries four
     codecs (varint/bit-pack/RLE/Gorilla) chosen by the single-source-of-truth
     `best_encoding_name`, so the reported codec always matches the bytes written; the
@@ -380,19 +383,52 @@ detection within Y% and improving historical query latency by Z."*
     `best_estimated_bytes`/`best_encoding_name`, and surfaced in the dsp-bench
     StorageEstimate. RLE was also realized on disk (`TS_CODEC_RLE`) in the same arc,
     closing its estimate/disk divergence. *(src: Gorilla, VLDB'15)*
-  - [ ] Evaluate **dynamic (per-block adaptive) bit packing** as a simpler complement to
-    the fixed-width bit-pack codec. *(src: "Dynamic Bit Packing", Sensors 2023 —
-    https://www.mdpi.com/1424-8220/23/20/8575)*
-  - [ ] **Value-column realized-bytes accuracy (discovered divergence):** the `.dspseg`
-    value block writes `ScaledI64` mantissas as zig-zag varints (small values ≈1 byte),
-    but `ColumnEncoding::estimated_bytes` reports the naive `len*8` — so the bench +
-    segment stats **over-report** ScaledI64 bytes/point (underselling DSP). A realize-
-    accurate `ColumnEncoding::serialized_bytes()` + `Segment::serialized_value_bytes()`
-    + `StorageEstimate.realized_value_bytes` (v7) now expose the true figure additively.
-    **Owner decision needed:** whether to flip the headline `estimated_bytes` /
-    `value_bytes` / `total_bytes_per_point` to the realized figure — a semantic change to
-    a metric consumed in ~37 places / ~33 test assertions. Also add a scaled-int
-    **bit-pack** value codec as an on-disk alternative to the per-value varint.
+  - [x] **Evaluated + ADOPTED dynamic (per-block adaptive) bit packing.** Measured on a
+    256-value mixed-magnitude second-difference stream (one contiguous 32-wide window of
+    ~30-bit values among ±1 narrow jitter, block=64): blocked=184 B is the strict winner —
+    global bit-pack 961 B, varint 384 B, Gorilla 450 B, RLE 640 B (81% below global, 52%
+    below the next-best shipped codec). Realized as the fifth timestamp codec
+    (`blocked_bitpack_encode`/`decode`, `TS_CODEC_BLOCKED`, `BLOCKED_BITPACK_BLOCK=64`),
+    folded into `best_estimated_bytes`/`best_encoding_name` (`delta_of_delta_blocked`),
+    and round-trip- + runtime-verified. A single-block stream ties global bit-pack, so the
+    selector keeps the simpler label there. *(src: "Dynamic Bit Packing", Sensors 2023 —
+    https://www.mdpi.com/1424-8220/23/20/8575 · Sprintz per-block bit-packing, ACM TODS'18
+    — https://arxiv.org/abs/1808.02515)*
+  - [ ] **Next slice — Frame-of-Reference (FOR) per-block reference before bit-packing:**
+    the global + blocked bit-pack codecs zig-zag the raw value/delta, so a block of large
+    but *clustered* values still pays the full magnitude's width. Subtracting each block's
+    min (a FOR reference, one extra svarint/block) narrows the packed width to the block's
+    *range*, not its magnitude — the standard FastLanes/ALP move. Prototype `for_bitpack`
+    beside the blocked codec and benchmark on a clustered-offset corpus before adopting.
+    *(src: Lemire, FOR+delta — https://lemire.me/blog/2012/02/08/effective-compression-using-frame-of-reference-and-delta-coding/
+    · ALP FastLanes FOR, SIGMOD'24 — https://dl.acm.org/doi/10.1145/3626717)*
+  - [ ] **Sprintz-style FIRE predictor + zero-RLE (value + timestamp columns):** the
+    realized per-block bit-pack is exactly Sprintz's bit-packing stage; add a Sprintz
+    FIRE-style online integer forecaster to shrink residuals before packing and a
+    run-length pass over the resulting zeros. Canonical low-resource IoT time-series
+    compressor; benchmark the residual-bytes win on a real irregular corpus. *(src:
+    Sprintz, ACM TODS'18 — https://arxiv.org/abs/1808.02515)*
+  - [x] **Scaled-int value bit-pack codec — realized on disk.** The `.dspseg` value block
+    now carries a self-describing codec selector (`VAL_CODEC_VARINT`/`VAL_CODEC_BITPACK`);
+    a `ScaledI64` column whose mantissas fixed-width bit-pack below the per-value varint
+    stores bit-packed (chosen via `ColumnEncoding::best_value_codec`), and the realized
+    figure flows through `Segment::serialized_value_bytes()` +
+    `StorageEstimate.realized_value_bytes`/`value_codec` (schema v8). Measured on a 480-pt
+    exact 2-decimal ramp: bit-pack 901 B vs the prior varint 1440 B (37.4% smaller, 76.5%
+    below the naive `len*8` estimate). Runtime-verified: a sealed `scaled_i64` aspect reads
+    `bytes_per_point=2.13` through `/storage/{aspect}/stats`. *(validated by ALP's
+    decimal→integer PseudoDecimal path, SIGMOD'24 — https://dl.acm.org/doi/10.1145/3626717)*
+  - [ ] **Value-column realized-bytes accuracy (owner decision still open):** a realize-
+    accurate `ColumnEncoding::serialized_bytes()`/`best_serialized_bytes()` +
+    `Segment::serialized_value_bytes()` + `StorageEstimate.realized_value_bytes` (v7/v8)
+    expose the true figure additively, and the value block now *realizes* the smaller codec
+    on disk. **Owner decision needed:** whether to flip the headline `estimated_bytes` /
+    `value_bytes` / `total_bytes_per_point` (and the bench HTML `val B/pt`) to the realized
+    figure — a semantic change to a metric consumed in ~37 places / ~33 test assertions.
+  - [ ] **Per-block adaptive bit-pack for the VALUE column too:** the timestamp column now
+    has the blocked codec but the value column only has global bit-pack; extend
+    `blocked_bitpack_encode`/`decode` (already generic over `&[i64]`) to a third value
+    codec (`VAL_CODEC_BLOCKED`) for a `ScaledI64` column with mixed-magnitude mantissas.
   - [ ] **f64 value-column codec (distinct from the timestamp DoD codec):** prototype a
     **Chimp128**-style XOR codec — XOR each value against the best of the previous 128
     values (the one giving the most trailing zeros) rather than only the immediate
@@ -673,10 +709,32 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   honest loss past it); realized as a lossless codec, wired into the `.dspseg` block +
   `best_estimated_bytes`/`best_encoding_name`, and surfaced in dsp-bench. RLE realized on
   disk in the same arc.
-- [ ] **Next slice — value-column realized bytes (Phase 4/6):** `serialized_bytes()` now
-  exposes the true on-disk value-column size (varint-coded ScaledI64 realizes below the
-  naive `len*8` `estimated_bytes`); decide whether to flip the headline `estimated_bytes`
-  to realized (broad: ~37 callers) and add a scaled-int bit-pack value codec.
+- [x] **Scaled-int value bit-pack codec (Phase 4/6): shipped + realized on disk.** The
+  value block carries a `VAL_CODEC_VARINT`/`VAL_CODEC_BITPACK` selector; a `ScaledI64`
+  column bit-packs when smaller (`best_value_codec`), surfaced via
+  `StorageEstimate.realized_value_bytes`/`value_codec` (schema v8). Measured 37.4% below
+  varint on a 480-pt 2-decimal ramp; runtime `bytes_per_point=2.13` via `/…/stats`.
+- [x] **Per-block adaptive (dynamic) bit-pack timestamp codec (Phase 6.1): shipped.** The
+  fifth `.dspseg` timestamp codec (`TS_CODEC_BLOCKED`), strict winner on mixed-magnitude
+  streams (184 B vs 384–961 B for the other codecs on the eval corpus).
+- [x] **`storage.ingest.parquet` stage span (Phase 3): shipped.** Closes the
+  Arrow-decode-on-ingest tracing gap; runtime-verified nesting under the request root span
+  (`byte_len`, `require_sorted`, `format="parquet"`).
+- [ ] **Next slice — FOR (frame-of-reference) before bit-packing (Phase 6.1):** subtract a
+  per-block min/reference so clustered high-magnitude values pack to the block *range*, not
+  magnitude (the FastLanes/ALP move); prototype `for_bitpack` beside the blocked codec.
+  *(src: ALP SIGMOD'24 — https://dl.acm.org/doi/10.1145/3626717 · Lemire FOR+delta —
+  https://lemire.me/blog/2012/02/08/effective-compression-using-frame-of-reference-and-delta-coding/)*
+- [ ] **Owner decision — flip the headline bytes/point to the realized figure (Phase 4/6):**
+  the value block now realizes the smaller codec on disk, but `estimated_bytes` /
+  `bytes_per_point` / the bench HTML `val B/pt` still report the naive `len*8`; deciding to
+  flip is a semantic change across ~37 callers / ~33 assertions (owner's call).
+- [ ] **Discovered — dsp-bench parallel-test OOM (needs repro):** the full `cargo test -p
+  dsp-bench` intermittently aborts with `memory allocation of ~13 GB failed` under
+  concurrent memory pressure; `--lib` alone and `--test-threads=1` pass deterministically
+  (89+20/0), so it is environmental (heavy parallel build+test load), not a logic bug in
+  the tree. Investigate whether a specific bench/integration test transiently over-allocates
+  when interleaved; cap its parallelism or size if so.
 - [x] Add p50/p95/p99 + confidence-interval reporting
 - [x] Add physical value types (`F64`, `ScaledI64`, `BigDecimalText` + three more)
 - [x] Prototype columnar segment reads for one aspect type (`database::SegmentStore`)
