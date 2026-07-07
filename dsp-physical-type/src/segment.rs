@@ -60,7 +60,9 @@ use crate::{
 /// - **v4** — the value-column block gains a self-describing codec selector so a
 ///   `ScaledI64` column whose mantissas pack smaller stores fixed-width bit-packed
 ///   instead of per-value zig-zag varint (the value-column analogue of v3).
-pub const SEGMENT_FORMAT_VERSION: u16 = 4;
+/// - **v5** — the timestamp-column block gains a fifth codec option, per-block adaptive
+///   (dynamic) bit-packing, chosen for a mixed-magnitude second-difference stream.
+pub const SEGMENT_FORMAT_VERSION: u16 = 5;
 
 /// Why a [`Segment`] could not be built from its input columns.
 #[derive(Debug, Clone, PartialEq, Eq)]

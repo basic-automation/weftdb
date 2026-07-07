@@ -349,6 +349,16 @@ pub fn bitpack_decode(width: u32, bytes: &[u8], count: usize) -> Vec<i64> {
 	out
 }
 
+/// The fixed block size the realized dynamic bit-pack codec partitions a
+/// second-difference stream into.
+///
+/// 64 amortizes the one-byte per-block width header (≈1.6% overhead on a full block)
+/// while still adapting width at a page-ish granularity, so a contiguous wide region
+/// is confined to the few blocks it spans instead of widening the whole column. The
+/// value rides in the `.dspseg` block (a uvarint), so it can change without breaking
+/// old frames.
+pub const BLOCKED_BITPACK_BLOCK: usize = 64;
+
 /// Estimated footprint of a **per-block adaptive** (dynamic) bit-packing of a
 /// difference stream.
 ///
@@ -358,13 +368,14 @@ pub fn bitpack_decode(width: u32, bytes: &[u8], count: usize) -> Vec<i64> {
 /// width header plus `ceil(len * width / 8)` data bytes; the block size is fixed (only
 /// the final block is short, derivable from the count), so no per-block length is stored.
 ///
-/// Roadmap Phase 6.1 evaluation of "dynamic bit packing" as a simpler complement to
-/// the fixed-width codec: the trade is `num_blocks - 1` extra width-header bytes in
-/// exchange for narrower data on every block that does not contain the widest value.
-/// The global-width [`bitpack_bytes`] is the `block >= len` case. Estimation only — no
-/// bitstream is produced; comparable with [`bitpack_bytes`] / [`gorilla_bytes`] /
-/// [`zigzag_varint_bytes`] (all omit the externally-known row count). *(src: "Dynamic
-/// Bit Packing", Sensors 2023 — <https://www.mdpi.com/1424-8220/23/20/8575>)*
+/// Roadmap Phase 6.1 "dynamic bit packing" — realized on disk (the `.dspseg` timestamp
+/// block carries a blocked codec option, [`blocked_bitpack_encode`]) and folded into
+/// [`DeltaOfDeltaColumn::best_estimated_bytes`]. The trade is `num_blocks - 1` extra
+/// width-header bytes in exchange for narrower data on every block that does not
+/// contain the widest value. The global-width [`bitpack_bytes`] is the `block >= len`
+/// case; comparable with [`bitpack_bytes`] / [`gorilla_bytes`] / [`zigzag_varint_bytes`]
+/// (all omit the externally-known row count and the block's self-describing prefix).
+/// *(src: "Dynamic Bit Packing", Sensors 2023 — <https://www.mdpi.com/1424-8220/23/20/8575>)*
 #[must_use]
 pub fn blocked_bitpack_bytes(values: &[i64], block: usize) -> usize {
 	if values.is_empty() {
@@ -372,6 +383,49 @@ pub fn blocked_bitpack_bytes(values: &[i64], block: usize) -> usize {
 	}
 	let block = block.max(1);
 	values.chunks(block).map(|chunk| 1 + (chunk.len() * bitpack_width(chunk) as usize).div_ceil(8)).sum()
+}
+
+/// Per-block adaptive bit-pack encode of a difference stream: the concatenation, block
+/// by block, of a one-byte width header and that block's [`bitpack_encode`] payload.
+///
+/// The emitted length is exactly the [`blocked_bitpack_bytes`] estimate for the same
+/// `(values, block)`. Exact inverse is [`blocked_bitpack_decode`] given the same
+/// `block` and value count. An empty input yields an empty buffer.
+#[must_use]
+pub fn blocked_bitpack_encode(values: &[i64], block: usize) -> Vec<u8> {
+	let block = block.max(1);
+	let mut out = Vec::new();
+	for chunk in values.chunks(block) {
+		let (width, packed) = bitpack_encode(chunk);
+		// Width is 0..=64 by construction, so the conversion never saturates.
+		out.push(u8::try_from(width).unwrap_or(64));
+		out.extend_from_slice(&packed);
+	}
+	out
+}
+
+/// Reconstruct `count` differences from a per-block adaptive bit-pack buffer.
+///
+/// Exact inverse of [`blocked_bitpack_encode`] given the same `block` and `count`;
+/// bytes past the buffer read as `0` (a truncated block yields zeros rather than
+/// panicking).
+#[must_use]
+pub fn blocked_bitpack_decode(bytes: &[u8], block: usize, count: usize) -> Vec<i64> {
+	let block = block.max(1);
+	let mut out = Vec::with_capacity(count);
+	let mut pos = 0_usize;
+	let mut remaining = count;
+	while remaining > 0 {
+		let block_len = remaining.min(block);
+		let width = u32::from(bytes.get(pos).copied().unwrap_or(0));
+		pos += 1;
+		let data_len = (block_len * width as usize).div_ceil(8);
+		let chunk = bytes.get(pos..pos + data_len).unwrap_or(&[]);
+		pos += data_len;
+		out.extend(bitpack_decode(width, chunk, block_len));
+		remaining -= block_len;
+	}
+	out
 }
 
 /// Bit cost of one second-difference value under a **Gorilla-style variable-length**
@@ -614,29 +668,54 @@ impl DeltaOfDeltaColumn {
 		8 + self.first_delta.map_or(0, zigzag_varint_len) + gorilla_bytes(&self.dods)
 	}
 
-	/// The smallest of the plain-varint, RLE, bit-packed, and Gorilla second-difference
-	/// estimates — the realistic stored size once the cheapest codec is chosen.
+	/// Estimated packed size with the second-difference stream coded under the
+	/// **per-block adaptive (dynamic) bit-pack** scheme
+	/// ([`blocked_bitpack_bytes`] at [`BLOCKED_BITPACK_BLOCK`]): anchor + first delta +
+	/// the per-block stream.
+	///
+	/// Realized on disk (roadmap Phase 6.1): the `.dspseg` timestamp block carries a
+	/// blocked codec option and this estimate is folded into
+	/// [`best_estimated_bytes`](Self::best_estimated_bytes) /
+	/// [`best_encoding_name`](Self::best_encoding_name). It wins the **mixed-magnitude**
+	/// regime — a contiguous wide region among narrow runs — where global bit-packing
+	/// widens the whole column, RLE finds no runs, and Gorilla pays its full bucket per
+	/// wide value; it ties global bit-packing on a stream of one block (`≤`
+	/// [`BLOCKED_BITPACK_BLOCK`]), so the min-selector keeps the simpler `bitpack` label
+	/// there.
+	#[must_use]
+	pub fn blocked_estimated_bytes(&self) -> usize {
+		8 + self.first_delta.map_or(0, zigzag_varint_len) + blocked_bitpack_bytes(&self.dods, BLOCKED_BITPACK_BLOCK)
+	}
+
+	/// The smallest of the plain-varint, RLE, bit-packed, Gorilla, and per-block adaptive
+	/// bit-pack second-difference estimates — the realistic stored size once the cheapest
+	/// codec is chosen.
 	#[must_use]
 	pub fn best_estimated_bytes(&self) -> usize {
-		self.estimated_bytes().min(self.rle_estimated_bytes()).min(self.bitpack_estimated_bytes()).min(self.gorilla_estimated_bytes())
+		self.estimated_bytes().min(self.rle_estimated_bytes()).min(self.bitpack_estimated_bytes()).min(self.gorilla_estimated_bytes()).min(self.blocked_estimated_bytes())
 	}
 
 	/// The stable name of the codec [`best_estimated_bytes`](Self::best_estimated_bytes)
-	/// selects: `"delta_of_delta_gorilla"` when the Gorilla variable-length scheme is
-	/// the strict winner (scattered single jitter), `"delta_of_delta_bitpack"` when
-	/// fixed-width bit-packing wins (a regular or small-jitter series),
-	/// `"delta_of_delta_rle"` when run-length coding is cheapest (long identical runs),
-	/// else `"delta_of_delta"`. The single source of truth for the codec label so the
-	/// segment store and the bench report never disagree on which won — the `.dspseg`
-	/// writer routes through this name. Ties favour the simpler codec (plain > rle >
-	/// bitpack > gorilla) for a stable label.
+	/// selects: `"delta_of_delta_blocked"` when per-block adaptive bit-packing is the
+	/// strict winner (a mixed-magnitude stream — a contiguous wide region among narrow
+	/// runs), `"delta_of_delta_gorilla"` when the Gorilla variable-length scheme wins
+	/// (scattered single jitter), `"delta_of_delta_bitpack"` when fixed-width bit-packing
+	/// wins (a regular or small-jitter series), `"delta_of_delta_rle"` when run-length
+	/// coding is cheapest (long identical runs), else `"delta_of_delta"`. The single
+	/// source of truth for the codec label so the segment store and the bench report
+	/// never disagree on which won — the `.dspseg` writer routes through this name. Ties
+	/// favour the simpler codec (plain > rle > bitpack > gorilla > blocked) for a stable
+	/// label — in particular a single-block stream ties `bitpack`, which keeps the label.
 	#[must_use]
 	pub fn best_encoding_name(&self) -> &'static str {
 		let plain = self.estimated_bytes();
 		let rle = self.rle_estimated_bytes();
 		let bitpack = self.bitpack_estimated_bytes();
 		let gorilla = self.gorilla_estimated_bytes();
-		if gorilla < plain && gorilla < rle && gorilla < bitpack {
+		let blocked = self.blocked_estimated_bytes();
+		if blocked < plain && blocked < rle && blocked < bitpack && blocked < gorilla {
+			"delta_of_delta_blocked"
+		} else if gorilla < plain && gorilla < rle && gorilla < bitpack {
 			"delta_of_delta_gorilla"
 		} else if bitpack < plain && bitpack < rle {
 			"delta_of_delta_bitpack"
@@ -1025,6 +1104,44 @@ mod tests {
 		assert_eq!(blocked_bitpack_bytes(&[0; 20], 8), 3); // ceil(20/8) = 3 blocks
 		// A zero block size is clamped to 1 (one header byte per value), never a panic.
 		assert_eq!(blocked_bitpack_bytes(&[0, 0, 0], 0), 3);
+	}
+
+	#[test]
+	fn blocked_bitpack_encode_round_trips_and_matches_the_byte_estimate() {
+		// Mixed-magnitude stream; encode length must equal blocked_bitpack_bytes and the
+		// decode must be exact for several block sizes and awkward tail lengths.
+		let vals: Vec<i64> = (0..130).map(|i| if (40..56).contains(&i) { 1_000_000 + i } else { (i % 7) - 3 }).collect();
+		for block in [1_usize, 7, 16, 64, 130, 1000] {
+			let bytes = blocked_bitpack_encode(&vals, block);
+			assert_eq!(bytes.len(), blocked_bitpack_bytes(&vals, block), "encoded length must equal the estimate (block={block})");
+			assert_eq!(blocked_bitpack_decode(&bytes, block, vals.len()), vals, "round trip must be exact (block={block})");
+		}
+		// Empty stream encodes to nothing and decodes to nothing.
+		assert!(blocked_bitpack_encode(&[], 64).is_empty());
+		assert_eq!(blocked_bitpack_decode(&[], 64, 0), Vec::<i64>::new());
+	}
+
+	/// A DoD column whose second differences are mostly narrow ±1 jitter with one
+	/// contiguous wide window (blocks 96..128 fall inside a single 64-wide block) — the
+	/// mixed-magnitude regime where per-block adaptive bit-packing is the strict winner.
+	fn mixed_magnitude_dod_column() -> DeltaOfDeltaColumn {
+		let dods: Vec<i64> = (0..256).map(|i| if (96..128).contains(&i) { 500_000_000 + i } else { (i % 3) - 1 }).collect();
+		DeltaOfDeltaColumn { first: 1_000, first_delta: Some(1_000), dods, unit: TimeUnit::Millis }
+	}
+
+	#[test]
+	fn best_encoding_picks_blocked_on_a_mixed_magnitude_stream() {
+		// A multi-block stream with a contiguous wide window: per-block adaptive
+		// bit-packing is the strict winner, so best_encoding_name selects it and
+		// best_estimated_bytes equals the blocked estimate.
+		let dod = mixed_magnitude_dod_column();
+		assert_eq!(dod.best_encoding_name(), "delta_of_delta_blocked", "mixed-magnitude dods pick the blocked codec");
+		assert_eq!(dod.best_estimated_bytes(), dod.blocked_estimated_bytes());
+		assert!(dod.blocked_estimated_bytes() < dod.bitpack_estimated_bytes(), "blocked must beat global bit-pack here");
+		// A single-block stream ties global bit-packing, which keeps the simpler label.
+		let regular: Vec<i64> = (0..40).map(|i| 1_000 + i * 10).collect();
+		let small = encode_delta_of_delta(&regular, TimeUnit::Millis);
+		assert_ne!(small.best_encoding_name(), "delta_of_delta_blocked", "a single-block stream must not pick blocked");
 	}
 
 	#[test]
