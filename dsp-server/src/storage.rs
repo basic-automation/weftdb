@@ -356,7 +356,12 @@ async fn storage_ingest_parquet_inner(store: &database::SegmentStore, metrics: &
 	if body.is_empty() {
 		return Err(StorageError::BadRequest("empty Parquet body".to_string()));
 	}
-	let descriptor = dsp_arrow_store::ingest_parquet_into_aspect(store, aspect, body, rows_per_page, require_sorted).await.map_err(|err| classify_ingest_error(&err))?;
+	// `storage.ingest.parquet` stage span (roadmap Phase 3 — the Arrow-decode-on-ingest
+	// analogue of the JSON/CSV/ILP `storage.ingest.parse`+`seal` spans). The arrow-store
+	// ingest is atomic (Parquet decode → typed-column seal in one call) and the leaf
+	// `dsp-arrow-store` stays tracing-free by design, so decode+seal ride one span here,
+	// carrying the request's byte length and the sort-guard flag.
+	let descriptor = dsp_arrow_store::ingest_parquet_into_aspect(store, aspect, body, rows_per_page, require_sorted).instrument(tracing::info_span!("storage.ingest.parquet", %aspect, byte_len = body.len(), require_sorted, format = "parquet")).await.map_err(|err| classify_ingest_error(&err))?;
 	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
 	let response = IngestResponse {
 		aspect: aspect.to_string(),
