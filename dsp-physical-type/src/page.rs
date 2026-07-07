@@ -49,7 +49,9 @@ use crate::{
 /// - **v5** — each page's value block gains its own self-describing codec selector
 ///   (fixed-width bit-packing vs per-value varint for a `ScaledI64` column); see
 ///   [`SEGMENT_FORMAT_VERSION`](crate::SEGMENT_FORMAT_VERSION) v4.
-pub const PAGED_SEGMENT_FORMAT_VERSION: u16 = 5;
+/// - **v6** — each page's timestamp block gains the per-block adaptive (dynamic)
+///   bit-pack codec option; see [`SEGMENT_FORMAT_VERSION`](crate::SEGMENT_FORMAT_VERSION) v5.
+pub const PAGED_SEGMENT_FORMAT_VERSION: u16 = 6;
 
 /// The default page height when a caller does not specify one.
 ///

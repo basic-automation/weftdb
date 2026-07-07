@@ -642,6 +642,11 @@ const TS_CODEC_GORILLA: u8 = 2;
 /// `(svarint value, uvarint length)` pairs. Chosen for a long constant run (a
 /// piecewise-regular series), where a handful of runs beat every per-value codec.
 const TS_CODEC_RLE: u8 = 3;
+/// Per-block adaptive (dynamic) bit-packing (roadmap Phase 6.1): a uvarint block size
+/// then a length-prefixed [`crate::timestamp::blocked_bitpack_encode`] stream. Chosen
+/// for a mixed-magnitude stream — a contiguous wide region among narrow runs — where a
+/// single global width overpays and RLE/Gorilla do not fit.
+const TS_CODEC_BLOCKED: u8 = 4;
 
 /// The stable one-byte on-disk tag for a [`TimeUnit`].
 const fn time_unit_tag(unit: TimeUnit) -> u8 {
@@ -702,6 +707,15 @@ pub fn write_timestamp_column(w: &mut ByteWriter, col: &DeltaOfDeltaColumn) {
 				w.put_uvarint(count as u64);
 			}
 		}
+		"delta_of_delta_blocked" => {
+			let block = crate::timestamp::BLOCKED_BITPACK_BLOCK;
+			w.put_u8(TS_CODEC_BLOCKED);
+			w.put_uvarint(block as u64);
+			// Length-prefixed: per-block widths vary, so the block boundaries are not
+			// derivable from the count alone without walking the stream — the prefix lets
+			// the reader bound it in one step (as the Gorilla block does).
+			w.put_bytes(&crate::timestamp::blocked_bitpack_encode(&col.dods, block));
+		}
 		"delta_of_delta_bitpack" => {
 			let (width, packed) = crate::timestamp::bitpack_encode(&col.dods);
 			w.put_u8(TS_CODEC_BITPACK);
@@ -753,6 +767,11 @@ pub fn read_timestamp_column(r: &mut ByteReader) -> Result<DeltaOfDeltaColumn, D
 		TS_CODEC_GORILLA => {
 			let bytes = r.read_bytes()?;
 			crate::timestamp::decode_gorilla_dods(bytes, count)
+		}
+		TS_CODEC_BLOCKED => {
+			let block = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+			let bytes = r.read_bytes()?;
+			crate::timestamp::blocked_bitpack_decode(bytes, block, count)
 		}
 		TS_CODEC_RLE => {
 			let run_count = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
@@ -1420,6 +1439,29 @@ mod tests {
 		assert!(r.is_empty(), "the Gorilla block must be fully consumed");
 		assert_eq!(back, enc);
 		assert_eq!(crate::decode_delta_of_delta(&back), ts, "epochs recover exactly through the Gorilla codec");
+	}
+
+	#[test]
+	fn mixed_magnitude_timestamp_block_uses_blocked_on_disk() {
+		use crate::{timestamp::bitpack_bytes, DeltaOfDeltaColumn};
+		// The roadmap-6.1 dynamic-bit-packing regime: a second-difference stream that is
+		// mostly narrow ±1 jitter with one contiguous wide window (inside a single 64-wide
+		// block). best_encoding_name picks the per-block adaptive codec, so the writer
+		// stores it; the block round-trips losslessly and beats the single global-width
+		// bit-pack decisively. Build the column directly so the dods carry the intended
+		// shape (a level shift in epochs would only spike the dods at its edges).
+		let dods: Vec<i64> = (0..256).map(|i| if (96..128).contains(&i) { 500_000_000 + i } else { (i % 3) - 1 }).collect();
+		let enc = DeltaOfDeltaColumn { first: 1_000, first_delta: Some(1_000), dods, unit: TimeUnit::Millis };
+		assert_eq!(enc.best_encoding_name(), "delta_of_delta_blocked", "a mixed-magnitude window must route to the blocked codec");
+		let mut w = ByteWriter::new();
+		write_timestamp_column(&mut w, &enc);
+		let bytes = w.into_vec();
+		assert!(bytes.len() < 8 + bitpack_bytes(&enc.dods), "blocked block {} must beat the global bit-pack {}", bytes.len(), 8 + bitpack_bytes(&enc.dods));
+		let mut r = ByteReader::new(&bytes);
+		let back = read_timestamp_column(&mut r).expect("reads");
+		assert!(r.is_empty(), "the blocked block must be fully consumed");
+		assert_eq!(back, enc, "the blocked timestamp block must round-trip exactly");
+		assert_eq!(crate::decode_delta_of_delta(&back), crate::decode_delta_of_delta(&enc), "epochs recover exactly through the blocked codec");
 	}
 
 	#[test]
