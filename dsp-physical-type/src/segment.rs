@@ -342,12 +342,14 @@ impl Segment {
 	}
 
 	/// **Realized** stored bytes of the value column — the exact on-disk payload the
-	/// `.dspseg` frame writes (see [`ColumnEncoding::serialized_bytes`]). For a
-	/// `ScaledI64` column this is below [`value_bytes`](Self::value_bytes) (varint
-	/// mantissas), so it is the accurate bytes/point figure.
+	/// `.dspseg` frame writes under the codec it actually selects (see
+	/// [`ColumnEncoding::best_serialized_bytes`]). For a `ScaledI64` column this is the
+	/// smaller of the per-value varint and the fixed-width bit-pack codec, so it is
+	/// below [`value_bytes`](Self::value_bytes) (the naive fixed-width estimate) — the
+	/// accurate bytes/point figure.
 	#[must_use]
 	pub fn serialized_value_bytes(&self) -> usize {
-		self.values.serialized_bytes()
+		self.values.best_serialized_bytes()
 	}
 
 	/// Estimated stored bytes of the timestamp column, taking the cheapest of
