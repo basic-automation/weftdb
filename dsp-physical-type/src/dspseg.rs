@@ -511,13 +511,30 @@ fn read_decimal(r: &mut ByteReader) -> Result<BigDecimal, DspSegError> {
 	BigDecimal::from_str(r.read_str()?).map_err(|_| DspSegError::InvalidDecimal)
 }
 
+/// Value-column codec selector (self-describing byte in a v4+ value block).
+///
+/// [`VAL_CODEC_VARINT`] is the general per-value payload (the codec every physical
+/// type can use); [`VAL_CODEC_BITPACK`] is the fixed-width bit-packed mantissa
+/// stream, defined only for a `ScaledI64` column and written only when it is
+/// strictly smaller than the varint (a regular/small-jitter scaled series).
+const VAL_CODEC_VARINT: u8 = 0;
+/// Fixed-width bit-packing of a `ScaledI64` column's mantissas: a width byte then
+/// `ceil(count * width / 8)` packed data bytes (LSB-first, zig-zag coded).
+const VAL_CODEC_BITPACK: u8 = 1;
+
 /// Write a [`ColumnEncoding`] as a `.dspseg` value-column block.
 ///
-/// The mantissa/payload encoding is chosen per physical type: IEEE byte patterns
-/// for the floats, a zig-zag varint mantissa for `ScaledI64` (small mantissas cost
-/// one byte), full-width `i128` for the wide integer encodings, and length-prefixed
-/// UTF-8 for `BigDecimalText`. The shared `scale` of a `ScaledI*` column rides in
-/// the header tag, not per value.
+/// After the header (physical-type tag, optional `ScaledI*` scale, count, lossy
+/// count, `max_abs_error`) the block carries a self-describing codec byte, then the
+/// coded payload. Two codecs are realized: the general per-value payload
+/// ([`VAL_CODEC_VARINT`] — IEEE byte patterns for the floats, a zig-zag varint
+/// mantissa for `ScaledI64`, full-width `i128` for the wide integers, length-prefixed
+/// UTF-8 for `BigDecimalText`), and fixed-width **bit-packing** of a `ScaledI64`
+/// column's mantissas ([`VAL_CODEC_BITPACK`]). The codec is chosen through
+/// [`ColumnEncoding::best_value_codec`], the single source of truth, so a `ScaledI64`
+/// column whose mantissas pack smaller than the varint realizes that saving on disk
+/// (a regular scaled series), while every other column keeps the per-value payload.
+/// Both codecs are exact and lossless.
 pub fn write_value_column(w: &mut ByteWriter, col: &ColumnEncoding) {
 	w.put_u8(physical_type_tag(col.physical_type));
 	match col.physical_type {
@@ -527,8 +544,21 @@ pub fn write_value_column(w: &mut ByteWriter, col: &ColumnEncoding) {
 	w.put_uvarint(col.values.len() as u64);
 	w.put_uvarint(col.lossy_count as u64);
 	w.put_str(&col.max_abs_error.to_plain_string());
-	for value in &col.values {
-		write_physical_value(w, value);
+	if col.best_value_codec() == "scaled_bitpack" {
+		// A ScaledI64 column whose mantissas bit-pack below the varint (guaranteed by
+		// best_value_codec — so scaled_i64_mantissas is Some).
+		let mantissas = col.scaled_i64_mantissas().unwrap_or_default();
+		let (width, packed) = crate::timestamp::bitpack_encode(&mantissas);
+		w.put_u8(VAL_CODEC_BITPACK);
+		// Width is 0..=64 by construction, so the conversion never saturates.
+		w.put_u8(u8::try_from(width).unwrap_or(64));
+		// Raw (no length prefix): the reader derives the length from count * width.
+		w.put_raw(&packed);
+	} else {
+		w.put_u8(VAL_CODEC_VARINT);
+		for value in &col.values {
+			write_physical_value(w, value);
+		}
 	}
 }
 
@@ -537,9 +567,10 @@ pub fn write_value_column(w: &mut ByteWriter, col: &ColumnEncoding) {
 ///
 /// # Errors
 ///
-/// [`DspSegError::InvalidTag`] for an unrecognised physical-type tag,
-/// [`DspSegError::InvalidDecimal`] if the stored `max_abs_error` does not parse,
-/// or [`DspSegError::UnexpectedEof`] / [`DspSegError::VarintTooLong`] on a short or
+/// [`DspSegError::InvalidTag`] for an unrecognised physical-type tag, an
+/// unrecognised value-codec byte, or a bit-pack codec on a non-`ScaledI64` column;
+/// [`DspSegError::InvalidDecimal`] if the stored `max_abs_error` does not parse; or
+/// [`DspSegError::UnexpectedEof`] / [`DspSegError::VarintTooLong`] on a short or
 /// malformed stream.
 pub fn read_value_column(r: &mut ByteReader) -> Result<ColumnEncoding, DspSegError> {
 	let tag = r.read_u8()?;
@@ -555,10 +586,25 @@ pub fn read_value_column(r: &mut ByteReader) -> Result<ColumnEncoding, DspSegErr
 	let count = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
 	let lossy_count = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
 	let max_abs_error = read_decimal(r)?;
-	let mut values = Vec::with_capacity(count);
-	for _ in 0..count {
-		values.push(read_physical_value(r, physical_type)?);
-	}
+	let values = match r.read_u8()? {
+		VAL_CODEC_VARINT => {
+			let mut values = Vec::with_capacity(count);
+			for _ in 0..count {
+				values.push(read_physical_value(r, physical_type)?);
+			}
+			values
+		}
+		VAL_CODEC_BITPACK => {
+			let PhysicalType::ScaledI64 { scale } = physical_type else {
+				return Err(DspSegError::InvalidTag { kind: "value_codec_bitpack_type", value: tag });
+			};
+			let width = u32::from(r.read_u8()?);
+			let data_len = (count * width as usize).div_ceil(8);
+			let bytes = r.take(data_len)?;
+			crate::timestamp::bitpack_decode(width, bytes, count).into_iter().map(|mantissa| PhysicalValue::ScaledI64 { mantissa, scale }).collect()
+		}
+		other => return Err(DspSegError::InvalidTag { kind: "value_codec", value: other }),
+	};
 	Ok(ColumnEncoding { physical_type, values, lossy_count, max_abs_error })
 }
 
@@ -596,6 +642,11 @@ const TS_CODEC_GORILLA: u8 = 2;
 /// `(svarint value, uvarint length)` pairs. Chosen for a long constant run (a
 /// piecewise-regular series), where a handful of runs beat every per-value codec.
 const TS_CODEC_RLE: u8 = 3;
+/// Per-block adaptive (dynamic) bit-packing (roadmap Phase 6.1): a uvarint block size
+/// then a length-prefixed [`crate::timestamp::blocked_bitpack_encode`] stream. Chosen
+/// for a mixed-magnitude stream — a contiguous wide region among narrow runs — where a
+/// single global width overpays and RLE/Gorilla do not fit.
+const TS_CODEC_BLOCKED: u8 = 4;
 
 /// The stable one-byte on-disk tag for a [`TimeUnit`].
 const fn time_unit_tag(unit: TimeUnit) -> u8 {
@@ -656,6 +707,15 @@ pub fn write_timestamp_column(w: &mut ByteWriter, col: &DeltaOfDeltaColumn) {
 				w.put_uvarint(count as u64);
 			}
 		}
+		"delta_of_delta_blocked" => {
+			let block = crate::timestamp::BLOCKED_BITPACK_BLOCK;
+			w.put_u8(TS_CODEC_BLOCKED);
+			w.put_uvarint(block as u64);
+			// Length-prefixed: per-block widths vary, so the block boundaries are not
+			// derivable from the count alone without walking the stream — the prefix lets
+			// the reader bound it in one step (as the Gorilla block does).
+			w.put_bytes(&crate::timestamp::blocked_bitpack_encode(&col.dods, block));
+		}
 		"delta_of_delta_bitpack" => {
 			let (width, packed) = crate::timestamp::bitpack_encode(&col.dods);
 			w.put_u8(TS_CODEC_BITPACK);
@@ -707,6 +767,11 @@ pub fn read_timestamp_column(r: &mut ByteReader) -> Result<DeltaOfDeltaColumn, D
 		TS_CODEC_GORILLA => {
 			let bytes = r.read_bytes()?;
 			crate::timestamp::decode_gorilla_dods(bytes, count)
+		}
+		TS_CODEC_BLOCKED => {
+			let block = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+			let bytes = r.read_bytes()?;
+			crate::timestamp::blocked_bitpack_decode(bytes, block, count)
 		}
 		TS_CODEC_RLE => {
 			let run_count = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
@@ -1155,6 +1220,70 @@ mod tests {
 	}
 
 	#[test]
+	fn value_column_realizes_bitpack_on_a_regular_scaled_stream() {
+		use crate::encode_column;
+		// 0.00..0.63 scaled by 100 → mantissas 0..=63 (≤ 7 bits): fixed-width
+		// bit-packing beats the one-byte-per-value varint floor, so the block selects
+		// the bit-pack codec on disk.
+		let lits: Vec<String> = (0..64).map(|i| format!("0.{i:02}")).collect();
+		let refs: Vec<&str> = lits.iter().map(String::as_str).collect();
+		let enc = encode_column(PhysicalType::ScaledI64 { scale: 2 }, &col(&refs)).unwrap();
+		assert_eq!(enc.best_value_codec(), "scaled_bitpack");
+		assert!(enc.bitpack_value_bytes().unwrap() < enc.serialized_bytes());
+		// It round-trips exactly through the realized `.dspseg` value block…
+		assert_value_col_round_trips(&enc);
+		// …and the realized block is strictly smaller than the same column written
+		// under the varint codec (identical header, so the payloads decide).
+		let mut w = ByteWriter::new();
+		write_value_column(&mut w, &enc);
+		let realized = w.into_vec().len();
+		let mut vw = ByteWriter::new();
+		vw.put_u8(physical_type_tag(enc.physical_type));
+		if let PhysicalType::ScaledI64 { scale } = enc.physical_type {
+			vw.put_u8(scale);
+		}
+		vw.put_uvarint(enc.values.len() as u64);
+		vw.put_uvarint(enc.lossy_count as u64);
+		vw.put_str(&enc.max_abs_error.to_plain_string());
+		vw.put_u8(VAL_CODEC_VARINT);
+		for value in &enc.values {
+			write_physical_value(&mut vw, value);
+		}
+		assert!(realized < vw.into_vec().len(), "realized bit-pack block {realized} must beat the varint block");
+	}
+
+	#[test]
+	fn bitpack_codec_on_a_non_scaled_column_is_rejected() {
+		// A hand-crafted F64 value block that claims the bit-pack codec must be
+		// refused, not misread — bit-packing is only defined for a ScaledI64 payload.
+		let mut w = ByteWriter::new();
+		w.put_u8(TAG_F64);
+		w.put_uvarint(1); // count
+		w.put_uvarint(0); // lossy_count
+		w.put_str("0"); // max_abs_error
+		w.put_u8(VAL_CODEC_BITPACK);
+		w.put_u8(1); // width
+		w.put_raw(&[0]); // one packed byte
+		let bytes = w.into_vec();
+		let mut r = ByteReader::new(&bytes);
+		assert_eq!(read_value_column(&mut r), Err(DspSegError::InvalidTag { kind: "value_codec_bitpack_type", value: TAG_F64 }));
+	}
+
+	#[test]
+	fn segment_frame_round_trips_a_bitpacked_scaled_column() {
+		// A regular scaled-int series that seals to the bit-pack value codec must
+		// round-trip through the full framed segment (header, CRC, v4 layout).
+		let ts: Vec<i64> = (0..64).map(|i| 1_000 + i * 5).collect();
+		let vs: Vec<BigDecimal> = (0..64).map(|i| BigDecimal::from_str(&format!("0.{i:02}")).unwrap()).collect();
+		let seg = Segment::build(&ts, &vs, TimeUnit::Millis, &BigDecimal::from(0)).expect("builds");
+		assert_eq!(seg.values.best_value_codec(), "scaled_bitpack", "regular scaled stream must pick bit-pack");
+		let bytes = write_segment(&seg);
+		let back = read_segment(&bytes).expect("reads");
+		assert_eq!(back, seg, "bit-packed segment frame must round-trip exactly");
+		assert_eq!(back.version, SEGMENT_FORMAT_VERSION);
+	}
+
+	#[test]
 	fn serialized_bytes_matches_the_realized_value_payload() {
 		use crate::encode_column;
 		// serialized_bytes() must equal the exact bytes write_physical_value emits for
@@ -1310,6 +1439,29 @@ mod tests {
 		assert!(r.is_empty(), "the Gorilla block must be fully consumed");
 		assert_eq!(back, enc);
 		assert_eq!(crate::decode_delta_of_delta(&back), ts, "epochs recover exactly through the Gorilla codec");
+	}
+
+	#[test]
+	fn mixed_magnitude_timestamp_block_uses_blocked_on_disk() {
+		use crate::{timestamp::bitpack_bytes, DeltaOfDeltaColumn};
+		// The roadmap-6.1 dynamic-bit-packing regime: a second-difference stream that is
+		// mostly narrow ±1 jitter with one contiguous wide window (inside a single 64-wide
+		// block). best_encoding_name picks the per-block adaptive codec, so the writer
+		// stores it; the block round-trips losslessly and beats the single global-width
+		// bit-pack decisively. Build the column directly so the dods carry the intended
+		// shape (a level shift in epochs would only spike the dods at its edges).
+		let dods: Vec<i64> = (0..256).map(|i| if (96..128).contains(&i) { 500_000_000 + i } else { (i % 3) - 1 }).collect();
+		let enc = DeltaOfDeltaColumn { first: 1_000, first_delta: Some(1_000), dods, unit: TimeUnit::Millis };
+		assert_eq!(enc.best_encoding_name(), "delta_of_delta_blocked", "a mixed-magnitude window must route to the blocked codec");
+		let mut w = ByteWriter::new();
+		write_timestamp_column(&mut w, &enc);
+		let bytes = w.into_vec();
+		assert!(bytes.len() < 8 + bitpack_bytes(&enc.dods), "blocked block {} must beat the global bit-pack {}", bytes.len(), 8 + bitpack_bytes(&enc.dods));
+		let mut r = ByteReader::new(&bytes);
+		let back = read_timestamp_column(&mut r).expect("reads");
+		assert!(r.is_empty(), "the blocked block must be fully consumed");
+		assert_eq!(back, enc, "the blocked timestamp block must round-trip exactly");
+		assert_eq!(crate::decode_delta_of_delta(&back), crate::decode_delta_of_delta(&enc), "epochs recover exactly through the blocked codec");
 	}
 
 	#[test]
