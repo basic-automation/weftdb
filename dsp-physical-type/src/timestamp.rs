@@ -349,6 +349,31 @@ pub fn bitpack_decode(width: u32, bytes: &[u8], count: usize) -> Vec<i64> {
 	out
 }
 
+/// Estimated footprint of a **per-block adaptive** (dynamic) bit-packing of a
+/// difference stream.
+///
+/// The values are split into fixed-size blocks of `block`, and each block is packed
+/// at *its own* width, so a low-magnitude run does not pay for a distant wide spike
+/// the way a single global [`bitpack_bytes`] width does. Each block costs a one-byte
+/// width header plus `ceil(len * width / 8)` data bytes; the block size is fixed (only
+/// the final block is short, derivable from the count), so no per-block length is stored.
+///
+/// Roadmap Phase 6.1 evaluation of "dynamic bit packing" as a simpler complement to
+/// the fixed-width codec: the trade is `num_blocks - 1` extra width-header bytes in
+/// exchange for narrower data on every block that does not contain the widest value.
+/// The global-width [`bitpack_bytes`] is the `block >= len` case. Estimation only — no
+/// bitstream is produced; comparable with [`bitpack_bytes`] / [`gorilla_bytes`] /
+/// [`zigzag_varint_bytes`] (all omit the externally-known row count). *(src: "Dynamic
+/// Bit Packing", Sensors 2023 — <https://www.mdpi.com/1424-8220/23/20/8575>)*
+#[must_use]
+pub fn blocked_bitpack_bytes(values: &[i64], block: usize) -> usize {
+	if values.is_empty() {
+		return 0;
+	}
+	let block = block.max(1);
+	values.chunks(block).map(|chunk| 1 + (chunk.len() * bitpack_width(chunk) as usize).div_ceil(8)).sum()
+}
+
 /// Bit cost of one second-difference value under a **Gorilla-style variable-length**
 /// scheme (roadmap Phase 6.1 — evaluation of a per-value bucketed codec as a
 /// complement to fixed-width bit-packing).
@@ -951,6 +976,55 @@ mod tests {
 		assert_eq!(width, 3);
 		assert_eq!(bitpack_bytes(&dods), 1 + 4);
 		assert!(bitpack_bytes(&dods) < zigzag_varint_bytes(&dods));
+	}
+
+	#[test]
+	fn blocked_bitpack_matches_global_on_a_uniform_stream() {
+		// When every value shares one width, per-block packing only adds header bytes,
+		// so a single global width is at least as good — the eval must not overclaim.
+		let dods: Vec<i64> = (0..128).map(|i| (i % 5) - 2).collect(); // all within 3 bits
+		// One block spanning everything == the global bitpack figure exactly.
+		assert_eq!(blocked_bitpack_bytes(&dods, dods.len()), bitpack_bytes(&dods));
+		assert_eq!(blocked_bitpack_bytes(&dods, 1_000_000), bitpack_bytes(&dods));
+		// Splitting a uniform-width stream only adds width-header bytes.
+		assert!(blocked_bitpack_bytes(&dods, 16) >= bitpack_bytes(&dods));
+	}
+
+	#[test]
+	fn blocked_bitpack_beats_every_shipped_codec_on_a_mixed_magnitude_stream() {
+		// Phase 6.1 eval finding: a stream with a contiguous WIDE region among otherwise
+		// NARROW runs is the regime where per-block adaptive bit-packing wins — global
+		// bit-packing must widen every value to the spike width, RLE finds no runs (the
+		// values differ), the varint pays multi-byte on every wide value, and Gorilla
+		// pays its 68-bit bucket per wide value plus a control prefix on every narrow one.
+		let mut dods: Vec<i64> = Vec::new();
+		for i in 0..256 {
+			// One 32-wide window of large values; the rest is small ±1 jitter.
+			dods.push(if (96..128).contains(&i) { 500_000_000 + i64::from(i) } else { i64::from(i % 3) - 1 });
+		}
+		let block = 32;
+		let blocked = blocked_bitpack_bytes(&dods, block);
+		let global = bitpack_bytes(&dods);
+		let varint = zigzag_varint_bytes(&dods);
+		let gorilla = gorilla_bytes(&dods);
+		let rle = rle_varint_bytes(&rle_encode(&dods));
+		// Adaptive bit-packing is the strict winner in this regime.
+		assert!(blocked < global, "blocked {blocked} must beat global bit-pack {global}");
+		assert!(blocked < varint, "blocked {blocked} must beat varint {varint}");
+		assert!(blocked < gorilla, "blocked {blocked} must beat gorilla {gorilla}");
+		assert!(blocked < rle, "blocked {blocked} must beat rle {rle}");
+		// The saving over global bit-packing is large (global pays the ~30-bit spike
+		// width for all 256 values; blocked pays it only for the one wide block).
+		assert!(blocked * 3 < global, "blocked {blocked} should be well under a third of global {global}");
+	}
+
+	#[test]
+	fn blocked_bitpack_handles_all_zero_and_empty_streams() {
+		assert_eq!(blocked_bitpack_bytes(&[], 8), 0);
+		// An all-zero stream packs each block to just its width header byte.
+		assert_eq!(blocked_bitpack_bytes(&[0; 20], 8), 3); // ceil(20/8) = 3 blocks
+		// A zero block size is clamped to 1 (one header byte per value), never a panic.
+		assert_eq!(blocked_bitpack_bytes(&[0, 0, 0], 0), 3);
 	}
 
 	#[test]
