@@ -521,20 +521,27 @@ const VAL_CODEC_VARINT: u8 = 0;
 /// Fixed-width bit-packing of a `ScaledI64` column's mantissas: a width byte then
 /// `ceil(count * width / 8)` packed data bytes (LSB-first, zig-zag coded).
 const VAL_CODEC_BITPACK: u8 = 1;
+/// Per-block adaptive (blocked) bit-packing of a `ScaledI64` column's mantissas: a
+/// block-size uvarint then a length-prefixed [`crate::timestamp::blocked_bitpack_encode`]
+/// stream (each block carries its own one-byte width header). Written only when strictly
+/// smallest — a mixed-magnitude mantissa column where a global width over-pays.
+const VAL_CODEC_BLOCKED: u8 = 2;
 
 /// Write a [`ColumnEncoding`] as a `.dspseg` value-column block.
 ///
 /// After the header (physical-type tag, optional `ScaledI*` scale, count, lossy
 /// count, `max_abs_error`) the block carries a self-describing codec byte, then the
-/// coded payload. Two codecs are realized: the general per-value payload
+/// coded payload. Three codecs are realized: the general per-value payload
 /// ([`VAL_CODEC_VARINT`] — IEEE byte patterns for the floats, a zig-zag varint
 /// mantissa for `ScaledI64`, full-width `i128` for the wide integers, length-prefixed
-/// UTF-8 for `BigDecimalText`), and fixed-width **bit-packing** of a `ScaledI64`
-/// column's mantissas ([`VAL_CODEC_BITPACK`]). The codec is chosen through
-/// [`ColumnEncoding::best_value_codec`], the single source of truth, so a `ScaledI64`
-/// column whose mantissas pack smaller than the varint realizes that saving on disk
-/// (a regular scaled series), while every other column keeps the per-value payload.
-/// Both codecs are exact and lossless.
+/// UTF-8 for `BigDecimalText`), fixed-width **bit-packing** of a `ScaledI64` column's
+/// mantissas ([`VAL_CODEC_BITPACK`], a regular/small-jitter scaled series), and
+/// **per-block adaptive bit-packing** of a `ScaledI64` column's mantissas
+/// ([`VAL_CODEC_BLOCKED`], a mixed-magnitude scaled series where a global width
+/// over-pays). The codec is chosen through [`ColumnEncoding::best_value_codec`], the
+/// single source of truth, so each `ScaledI64` column realizes the smallest of the three
+/// on disk while every other column keeps the per-value payload. All three codecs are
+/// exact and lossless.
 pub fn write_value_column(w: &mut ByteWriter, col: &ColumnEncoding) {
 	w.put_u8(physical_type_tag(col.physical_type));
 	match col.physical_type {
@@ -544,20 +551,37 @@ pub fn write_value_column(w: &mut ByteWriter, col: &ColumnEncoding) {
 	w.put_uvarint(col.values.len() as u64);
 	w.put_uvarint(col.lossy_count as u64);
 	w.put_str(&col.max_abs_error.to_plain_string());
-	if col.best_value_codec() == "scaled_bitpack" {
-		// A ScaledI64 column whose mantissas bit-pack below the varint (guaranteed by
-		// best_value_codec — so scaled_i64_mantissas is Some).
-		let mantissas = col.scaled_i64_mantissas().unwrap_or_default();
-		let (width, packed) = crate::timestamp::bitpack_encode(&mantissas);
-		w.put_u8(VAL_CODEC_BITPACK);
-		// Width is 0..=64 by construction, so the conversion never saturates.
-		w.put_u8(u8::try_from(width).unwrap_or(64));
-		// Raw (no length prefix): the reader derives the length from count * width.
-		w.put_raw(&packed);
-	} else {
-		w.put_u8(VAL_CODEC_VARINT);
-		for value in &col.values {
-			write_physical_value(w, value);
+	match col.best_value_codec() {
+		"scaled_blocked" => {
+			// A ScaledI64 column whose mantissas per-block adaptive bit-pack below both the
+			// varint and the global bit-pack (guaranteed by best_value_codec — so
+			// scaled_i64_mantissas is Some).
+			let mantissas = col.scaled_i64_mantissas().unwrap_or_default();
+			let block = crate::timestamp::BLOCKED_BITPACK_BLOCK;
+			w.put_u8(VAL_CODEC_BLOCKED);
+			w.put_uvarint(block as u64);
+			// Length-prefixed: per-block widths vary, so the boundaries are not derivable
+			// from count alone — the prefix bounds the payload in one step (as the timestamp
+			// blocked block does).
+			w.put_bytes(&crate::timestamp::blocked_bitpack_encode(&mantissas, block));
+		}
+		"scaled_bitpack" => {
+			// A ScaledI64 column whose mantissas bit-pack below the varint (guaranteed by
+			// best_value_codec — so scaled_i64_mantissas is Some).
+			let mantissas = col.scaled_i64_mantissas().unwrap_or_default();
+			let (width, packed) = crate::timestamp::bitpack_encode(&mantissas);
+			w.put_u8(VAL_CODEC_BITPACK);
+			// Width is 0..=64 by construction, so the conversion never saturates.
+			w.put_u8(u8::try_from(width).unwrap_or(64));
+			// Raw (no length prefix): the reader derives the length from count * width.
+			w.put_raw(&packed);
+		}
+		// "varint" — the general per-value payload, and the only codec for non-scaled types.
+		_ => {
+			w.put_u8(VAL_CODEC_VARINT);
+			for value in &col.values {
+				write_physical_value(w, value);
+			}
 		}
 	}
 }
@@ -602,6 +626,14 @@ pub fn read_value_column(r: &mut ByteReader) -> Result<ColumnEncoding, DspSegErr
 			let data_len = (count * width as usize).div_ceil(8);
 			let bytes = r.take(data_len)?;
 			crate::timestamp::bitpack_decode(width, bytes, count).into_iter().map(|mantissa| PhysicalValue::ScaledI64 { mantissa, scale }).collect()
+		}
+		VAL_CODEC_BLOCKED => {
+			let PhysicalType::ScaledI64 { scale } = physical_type else {
+				return Err(DspSegError::InvalidTag { kind: "value_codec_blocked_type", value: tag });
+			};
+			let block = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+			let bytes = r.read_bytes()?;
+			crate::timestamp::blocked_bitpack_decode(bytes, block, count).into_iter().map(|mantissa| PhysicalValue::ScaledI64 { mantissa, scale }).collect()
 		}
 		other => return Err(DspSegError::InvalidTag { kind: "value_codec", value: other }),
 	};
@@ -1267,6 +1299,78 @@ mod tests {
 		let bytes = w.into_vec();
 		let mut r = ByteReader::new(&bytes);
 		assert_eq!(read_value_column(&mut r), Err(DspSegError::InvalidTag { kind: "value_codec_bitpack_type", value: TAG_F64 }));
+	}
+
+	/// A scaled-int column whose mantissas mix a quiet region with a contiguous burst of
+	/// large values — per-block adaptive bit-packing is the strict winner (global width
+	/// over-pays), so the block selects the blocked codec on disk.
+	fn mixed_magnitude_scaled_column() -> ColumnEncoding {
+		use crate::encode_column;
+		let lits: Vec<String> = (0..192).map(|i| if (64..128).contains(&i) { format!("{}", 1_000_000_000_i64 + i) } else { format!("{}", i % 5) }).collect();
+		let refs: Vec<&str> = lits.iter().map(String::as_str).collect();
+		encode_column(PhysicalType::ScaledI64 { scale: 0 }, &col(&refs)).unwrap()
+	}
+
+	#[test]
+	fn value_column_realizes_blocked_on_a_mixed_magnitude_scaled_stream() {
+		let enc = mixed_magnitude_scaled_column();
+		assert_eq!(enc.best_value_codec(), "scaled_blocked", "mixed-magnitude scaled stream must pick the blocked codec");
+		assert!(enc.blocked_value_bytes().unwrap() < enc.bitpack_value_bytes().unwrap(), "blocked must beat global bit-pack");
+		// Round-trips exactly through the realized `.dspseg` value block…
+		assert_value_col_round_trips(&enc);
+		// …and the realized blocked block is strictly smaller than the same column written
+		// under the global bit-pack codec (identical header, so the payloads decide).
+		let mut w = ByteWriter::new();
+		write_value_column(&mut w, &enc);
+		let realized = w.into_vec().len();
+		let mantissas = enc.scaled_i64_mantissas().unwrap();
+		let (width, packed) = crate::timestamp::bitpack_encode(&mantissas);
+		let mut bw = ByteWriter::new();
+		bw.put_u8(physical_type_tag(enc.physical_type));
+		if let PhysicalType::ScaledI64 { scale } = enc.physical_type {
+			bw.put_u8(scale);
+		}
+		bw.put_uvarint(enc.values.len() as u64);
+		bw.put_uvarint(enc.lossy_count as u64);
+		bw.put_str(&enc.max_abs_error.to_plain_string());
+		bw.put_u8(VAL_CODEC_BITPACK);
+		bw.put_u8(u8::try_from(width).unwrap_or(64));
+		bw.put_raw(&packed);
+		assert!(realized < bw.into_vec().len(), "realized blocked block {realized} must beat the global bit-pack block");
+	}
+
+	#[test]
+	fn blocked_codec_on_a_non_scaled_column_is_rejected() {
+		// A hand-crafted F64 value block that claims the blocked codec must be refused —
+		// per-block bit-packing is only defined for a ScaledI64 payload.
+		let mut w = ByteWriter::new();
+		w.put_u8(TAG_F64);
+		w.put_uvarint(1); // count
+		w.put_uvarint(0); // lossy_count
+		w.put_str("0"); // max_abs_error
+		w.put_u8(VAL_CODEC_BLOCKED);
+		w.put_uvarint(64); // block size
+		w.put_bytes(&[0, 0]); // a length-prefixed (bogus) payload
+		let bytes = w.into_vec();
+		let mut r = ByteReader::new(&bytes);
+		assert_eq!(read_value_column(&mut r), Err(DspSegError::InvalidTag { kind: "value_codec_blocked_type", value: TAG_F64 }));
+	}
+
+	#[test]
+	fn segment_frame_round_trips_a_blocked_scaled_column() {
+		// A mixed-magnitude scaled-int series that seals to the blocked value codec must
+		// round-trip through the full framed segment (header, CRC, v4 layout). Two-decimal
+		// values force the ScaledI64 encoding (F64 cannot represent 0.01 exactly), and the
+		// burst (a full 64-wide block near 1e7) gives the mixed magnitude that lets per-block
+		// bit-packing beat both the varint and the global bit-pack.
+		let ts: Vec<i64> = (0..192).map(|i| 1_000 + i * 5).collect();
+		let vs: Vec<BigDecimal> = (0..192).map(|i| BigDecimal::from_str(&if (64..128).contains(&i) { format!("{}.01", 10_000_000 + i) } else { format!("0.0{}", i % 5) }).unwrap()).collect();
+		let seg = Segment::build(&ts, &vs, TimeUnit::Millis, &BigDecimal::from(0)).expect("builds");
+		assert_eq!(seg.values.best_value_codec(), "scaled_blocked", "mixed-magnitude scaled stream must pick the blocked codec");
+		let bytes = write_segment(&seg);
+		let back = read_segment(&bytes).expect("reads");
+		assert_eq!(back, seg, "blocked segment frame must round-trip exactly");
+		assert_eq!(back.version, SEGMENT_FORMAT_VERSION);
 	}
 
 	#[test]
