@@ -160,11 +160,12 @@ impl Page {
 		timestamps.iter().enumerate().filter(|&(row, &ts)| start <= ts && ts <= end && self.nulls.is_present(row)).count()
 	}
 
-	/// Estimated stored bytes of the page's three columns (value + timestamp +
-	/// quality), on the same estimators a [`Segment`] uses.
+	/// **Realized** stored bytes of the page's three columns (value + timestamp +
+	/// quality), on the same estimators a [`Segment`] uses — the codec each column
+	/// actually writes.
 	#[must_use]
 	pub fn total_bytes(&self) -> usize {
-		self.values.estimated_bytes() + self.timestamps.best_estimated_bytes() + self.nulls.estimated_bytes()
+		self.values.best_serialized_bytes() + self.timestamps.best_estimated_bytes() + self.nulls.estimated_bytes()
 	}
 
 	/// Reconstruct the page's logical timestamp column (empty when the page is
