@@ -337,11 +337,23 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   where a single global width overpays — 184 B vs 384–961 B for the other codecs on a
   256-value mixed corpus). A regular 1000-point column packs to ~12 bytes total.
 - **Value-column codecs** — a value column is stored under its schema-declared physical
-  encoding, and a **`ScaledI64`** column additionally chooses between a per-value zig-zag
-  **varint** and **fixed-width bit-packing** of its mantissas via a self-describing
-  selector byte — bit-packing a regular scaled series (e.g. a 2-decimal price ramp) to
-  **37% below** the varint (76% below the naive `len * 8` estimate). The realized figure
-  is reported as `StorageEstimate.realized_value_bytes` / `value_codec`.
+  encoding, and a **`ScaledI64`** column additionally chooses, via a self-describing
+  selector byte, between a per-value zig-zag **varint**, **fixed-width bit-packing** of its
+  mantissas, and **per-block adaptive (blocked) bit-packing** — bit-packing a regular scaled
+  series (e.g. a 2-decimal price ramp) to **37% below** the varint (76% below the naive
+  `len * 8` estimate), and the blocked codec confining a wide burst to the blocks it spans
+  on a **mixed-magnitude** column (a quiet region + a wide run) where a single global width
+  would over-pay. The codec is chosen only when strictly smallest, so a regular column is
+  byte-for-byte unchanged; the realized figure is reported as
+  `StorageEstimate.realized_value_bytes` / `value_codec`.
+- **Advisory Frame-of-Reference (FOR) estimate** — for both the timestamp and value columns
+  the bench also measures a **FOR** per-block estimate (subtract each block's minimum, pack
+  the *unsigned* residual to the block's range) — the standard FastLanes/ALP move, which
+  collapses values **clustered at a high base** (a sensor reading near a fixed offset: a
+  value column of mantissas near 1e9 estimates **88% below** the realized bit-pack). It is
+  surfaced as `StorageEstimate.advisory_for_value_bytes` for adopt-or-drop analysis and is
+  *advisory only* — the realized on-disk codec and every headline bytes/point figure are
+  unchanged.
 
 ### Segment store (`.dspseg` + `database::SegmentStore`)
 
@@ -357,8 +369,8 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   always matches the bytes on disk. A regular series packs to a handful of bytes on disk
   (a 1000-point regular block stores in <20 bytes), so the bytes/point saving is
   *realized*, not just estimated. The **value block** carries its own codec selector too,
-  so a `ScaledI64` column bit-packs its mantissas on disk when that is smaller than the
-  per-value varint.
+  so a `ScaledI64` column stores its mantissas under whichever of **varint**, **fixed-width
+  bit-packing**, or **per-block adaptive (blocked) bit-packing** is smallest on disk.
 - **Order semantics** — every segment records whether its timestamps are monotonic
   (`time_sorted`). Ingest can *enforce* order (`require_sorted` rejects an
   out-of-order batch rather than sealing it), and the per-aspect/store rollups carry
