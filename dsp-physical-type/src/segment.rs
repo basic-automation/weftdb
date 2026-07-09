@@ -336,19 +336,30 @@ impl Segment {
 		self.stats.time_sorted
 	}
 
-	/// Estimated stored bytes of the value column (see
-	/// [`ColumnEncoding::estimated_bytes`]).
+	/// **Realized** stored bytes of the value column — the exact on-disk payload the
+	/// `.dspseg` frame writes under the codec it actually selects (see
+	/// [`ColumnEncoding::best_serialized_bytes`]). The headline figure (owner
+	/// sign-off, Phase 4/6): [`total_bytes`](Self::total_bytes) and
+	/// [`bytes_per_point`](Self::bytes_per_point) build on it. The naive fixed-width
+	/// figure this replaced remains available as
+	/// [`logical_value_bytes`](Self::logical_value_bytes).
 	#[must_use]
 	pub fn value_bytes(&self) -> usize {
+		self.values.best_serialized_bytes()
+	}
+
+	/// The naive **logical** (uncompressed fixed-width) size of the value column —
+	/// `count * width` (see [`ColumnEncoding::estimated_bytes`]). The pre-flip headline
+	/// figure, retained as the comparison baseline: `value_bytes / logical_value_bytes`
+	/// reads as the value column's realized compression ratio.
+	#[must_use]
+	pub fn logical_value_bytes(&self) -> usize {
 		self.values.estimated_bytes()
 	}
 
-	/// **Realized** stored bytes of the value column — the exact on-disk payload the
-	/// `.dspseg` frame writes under the codec it actually selects (see
-	/// [`ColumnEncoding::best_serialized_bytes`]). For a `ScaledI64` column this is the
-	/// smaller of the per-value varint and the fixed-width bit-pack codec, so it is
-	/// below [`value_bytes`](Self::value_bytes) (the naive fixed-width estimate) — the
-	/// accurate bytes/point figure.
+	/// **Realized** stored bytes of the value column — an alias of
+	/// [`value_bytes`](Self::value_bytes), kept for the schema-v7/v8 call sites that
+	/// adopted the realized figure before the headline flipped to it.
 	#[must_use]
 	pub fn serialized_value_bytes(&self) -> usize {
 		self.values.best_serialized_bytes()
@@ -422,9 +433,10 @@ impl Segment {
 		timestamps.iter().enumerate().filter(|&(row, &ts)| start <= ts && ts <= end && self.nulls.is_present(row)).count()
 	}
 
-	/// Total estimated stored bytes: value column plus timestamp column plus the
+	/// Total **realized** stored bytes: value column plus timestamp column plus the
 	/// quality column (zero bytes for a dense segment, so this equals
-	/// `value_bytes + timestamp_bytes` in the common case).
+	/// `value_bytes + timestamp_bytes` in the common case). Both columns report the
+	/// codec actually written, so this is the honest on-disk payload figure.
 	#[must_use]
 	pub fn total_bytes(&self) -> usize {
 		self.value_bytes() + self.timestamp_bytes() + self.null_bytes()
