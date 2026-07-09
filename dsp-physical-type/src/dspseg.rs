@@ -526,22 +526,30 @@ const VAL_CODEC_BITPACK: u8 = 1;
 /// stream (each block carries its own one-byte width header). Written only when strictly
 /// smallest — a mixed-magnitude mantissa column where a global width over-pays.
 const VAL_CODEC_BLOCKED: u8 = 2;
+/// Per-block Frame-of-Reference packing of a `ScaledI64` column's mantissas: a block-size
+/// uvarint then a length-prefixed [`crate::timestamp::for_bitpack_encode`] stream (each
+/// block carries a zig-zag-varint reference — its minimum — then the *unsigned* residuals
+/// packed at the block's range width). Written only when strictly smallest — mantissas
+/// clustered at a high base, or any all-non-negative stream where the unsigned residual
+/// beats zig-zag's sign bit.
+const VAL_CODEC_FOR: u8 = 3;
 
 /// Write a [`ColumnEncoding`] as a `.dspseg` value-column block.
 ///
 /// After the header (physical-type tag, optional `ScaledI*` scale, count, lossy
 /// count, `max_abs_error`) the block carries a self-describing codec byte, then the
-/// coded payload. Three codecs are realized: the general per-value payload
+/// coded payload. Four codecs are realized: the general per-value payload
 /// ([`VAL_CODEC_VARINT`] — IEEE byte patterns for the floats, a zig-zag varint
 /// mantissa for `ScaledI64`, full-width `i128` for the wide integers, length-prefixed
 /// UTF-8 for `BigDecimalText`), fixed-width **bit-packing** of a `ScaledI64` column's
-/// mantissas ([`VAL_CODEC_BITPACK`], a regular/small-jitter scaled series), and
-/// **per-block adaptive bit-packing** of a `ScaledI64` column's mantissas
-/// ([`VAL_CODEC_BLOCKED`], a mixed-magnitude scaled series where a global width
-/// over-pays). The codec is chosen through [`ColumnEncoding::best_value_codec`], the
-/// single source of truth, so each `ScaledI64` column realizes the smallest of the three
-/// on disk while every other column keeps the per-value payload. All three codecs are
-/// exact and lossless.
+/// mantissas ([`VAL_CODEC_BITPACK`], a regular/small-jitter scaled series),
+/// **per-block adaptive bit-packing** ([`VAL_CODEC_BLOCKED`], a mixed-magnitude scaled
+/// series where a global width over-pays), and **per-block Frame-of-Reference** packing
+/// ([`VAL_CODEC_FOR`], mantissas clustered at a high base or all-non-negative). The
+/// codec is chosen through [`ColumnEncoding::best_value_codec`], the single source of
+/// truth, so each `ScaledI64` column realizes the smallest of the four on disk while
+/// every other column keeps the per-value payload. All four codecs are exact and
+/// lossless.
 pub fn write_value_column(w: &mut ByteWriter, col: &ColumnEncoding) {
 	w.put_u8(physical_type_tag(col.physical_type));
 	match col.physical_type {
@@ -552,6 +560,18 @@ pub fn write_value_column(w: &mut ByteWriter, col: &ColumnEncoding) {
 	w.put_uvarint(col.lossy_count as u64);
 	w.put_str(&col.max_abs_error.to_plain_string());
 	match col.best_value_codec() {
+		"scaled_for" => {
+			// A ScaledI64 column whose mantissas FOR-pack below the varint, the global
+			// bit-pack, and the blocked codec (guaranteed by best_value_codec — so
+			// scaled_i64_mantissas is Some).
+			let mantissas = col.scaled_i64_mantissas().unwrap_or_default();
+			let block = crate::timestamp::BLOCKED_BITPACK_BLOCK;
+			w.put_u8(VAL_CODEC_FOR);
+			w.put_uvarint(block as u64);
+			// Length-prefixed: per-block references and widths vary, so the boundaries are
+			// not derivable from count alone (as the blocked block).
+			w.put_bytes(&crate::timestamp::for_bitpack_encode(&mantissas, block));
+		}
 		"scaled_blocked" => {
 			// A ScaledI64 column whose mantissas per-block adaptive bit-pack below both the
 			// varint and the global bit-pack (guaranteed by best_value_codec — so
@@ -634,6 +654,14 @@ pub fn read_value_column(r: &mut ByteReader) -> Result<ColumnEncoding, DspSegErr
 			let block = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
 			let bytes = r.read_bytes()?;
 			crate::timestamp::blocked_bitpack_decode(bytes, block, count).into_iter().map(|mantissa| PhysicalValue::ScaledI64 { mantissa, scale }).collect()
+		}
+		VAL_CODEC_FOR => {
+			let PhysicalType::ScaledI64 { scale } = physical_type else {
+				return Err(DspSegError::InvalidTag { kind: "value_codec_for_type", value: tag });
+			};
+			let block = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+			let bytes = r.read_bytes()?;
+			crate::timestamp::for_bitpack_decode(bytes, block, count).into_iter().map(|mantissa| PhysicalValue::ScaledI64 { mantissa, scale }).collect()
 		}
 		other => return Err(DspSegError::InvalidTag { kind: "value_codec", value: other }),
 	};
@@ -1254,12 +1282,12 @@ mod tests {
 	#[test]
 	fn value_column_realizes_bitpack_on_a_regular_scaled_stream() {
 		use crate::encode_column;
-		// 0.00..0.63 scaled by 100 → mantissas 0..=63 (≤ 7 bits): fixed-width
-		// bit-packing beats the one-byte-per-value varint floor, so the block selects
-		// the bit-pack codec on disk.
-		let lits: Vec<String> = (0..64).map(|i| format!("0.{i:02}")).collect();
-		let refs: Vec<&str> = lits.iter().map(String::as_str).collect();
-		let enc = encode_column(PhysicalType::ScaledI64 { scale: 2 }, &col(&refs)).unwrap();
+		// -0.32..0.31 scaled by 100 → mantissas -32..=31 (≤ 6 zig-zag bits, symmetric
+		// around zero so a FOR reference buys nothing): fixed-width bit-packing beats
+		// the one-byte-per-value varint floor, so the block selects the bit-pack codec
+		// on disk.
+		let values: Vec<BigDecimal> = (0..64).map(|i| BigDecimal::new((i - 32).into(), 2)).collect();
+		let enc = encode_column(PhysicalType::ScaledI64 { scale: 2 }, &values).unwrap();
 		assert_eq!(enc.best_value_codec(), "scaled_bitpack");
 		assert!(enc.bitpack_value_bytes().unwrap() < enc.serialized_bytes());
 		// It round-trips exactly through the realized `.dspseg` value block…
@@ -1301,12 +1329,14 @@ mod tests {
 		assert_eq!(read_value_column(&mut r), Err(DspSegError::InvalidTag { kind: "value_codec_bitpack_type", value: TAG_F64 }));
 	}
 
-	/// A scaled-int column whose mantissas mix a quiet region with a contiguous burst of
-	/// large values — per-block adaptive bit-packing is the strict winner (global width
-	/// over-pays), so the block selects the blocked codec on disk.
+	/// A scaled-int column whose mantissas mix a quiet zero-straddling region with a
+	/// contiguous sign-alternating burst of large values — per-block adaptive bit-packing
+	/// is the strict winner (global width over-pays, a FOR reference is wasted on data
+	/// whose per-block residual range equals its zig-zag magnitude), so the block selects
+	/// the blocked codec on disk.
 	fn mixed_magnitude_scaled_column() -> ColumnEncoding {
 		use crate::encode_column;
-		let lits: Vec<String> = (0..192).map(|i| if (64..128).contains(&i) { format!("{}", 1_000_000_000_i64 + i) } else { format!("{}", i % 5) }).collect();
+		let lits: Vec<String> = (0..192).map(|i| if (64..128).contains(&i) { format!("{}", (1_000_000_000_i64 + i) * if i % 2 == 0 { 1 } else { -1 }) } else { format!("{}", (i % 5) - 2) }).collect();
 		let refs: Vec<&str> = lits.iter().map(String::as_str).collect();
 		encode_column(PhysicalType::ScaledI64 { scale: 0 }, &col(&refs)).unwrap()
 	}
@@ -1340,6 +1370,74 @@ mod tests {
 	}
 
 	#[test]
+	fn value_column_realizes_for_on_a_clustered_high_base_stream() {
+		use crate::encode_column;
+		// Mantissas clustered near 1e9 with a small jitter — the FOR codec subtracts each
+		// block's minimum and packs only the jitter, so it is the strict winner and the
+		// block selects the FOR codec on disk.
+		let lits: Vec<String> = (0..192).map(|i| format!("{}", 1_000_000_000_i64 + (i % 7))).collect();
+		let refs: Vec<&str> = lits.iter().map(String::as_str).collect();
+		let enc = encode_column(PhysicalType::ScaledI64 { scale: 0 }, &col(&refs)).unwrap();
+		assert_eq!(enc.best_value_codec(), "scaled_for", "clustered high-base scaled stream must pick the FOR codec");
+		assert!(enc.for_value_bytes().unwrap() < enc.blocked_value_bytes().unwrap(), "FOR must beat blocked");
+		// Round-trips exactly through the realized `.dspseg` value block…
+		assert_value_col_round_trips(&enc);
+		// …and the realized FOR block is strictly smaller than the same column written
+		// under the blocked codec (identical header, so the payloads decide).
+		let mut w = ByteWriter::new();
+		write_value_column(&mut w, &enc);
+		let realized = w.into_vec().len();
+		let mantissas = enc.scaled_i64_mantissas().unwrap();
+		let block = crate::timestamp::BLOCKED_BITPACK_BLOCK;
+		let mut bw = ByteWriter::new();
+		bw.put_u8(physical_type_tag(enc.physical_type));
+		if let PhysicalType::ScaledI64 { scale } = enc.physical_type {
+			bw.put_u8(scale);
+		}
+		bw.put_uvarint(enc.values.len() as u64);
+		bw.put_uvarint(enc.lossy_count as u64);
+		bw.put_str(&enc.max_abs_error.to_plain_string());
+		bw.put_u8(VAL_CODEC_BLOCKED);
+		bw.put_uvarint(block as u64);
+		bw.put_bytes(&crate::timestamp::blocked_bitpack_encode(&mantissas, block));
+		assert!(realized < bw.into_vec().len(), "realized FOR block {realized} must beat the blocked block");
+	}
+
+	#[test]
+	fn for_codec_on_a_non_scaled_column_is_rejected() {
+		// A hand-crafted F64 value block that claims the FOR codec must be refused —
+		// Frame-of-Reference packing is only defined for a ScaledI64 payload.
+		let mut w = ByteWriter::new();
+		w.put_u8(TAG_F64);
+		w.put_uvarint(1); // count
+		w.put_uvarint(0); // lossy_count
+		w.put_str("0"); // max_abs_error
+		w.put_u8(VAL_CODEC_FOR);
+		w.put_uvarint(64); // block size
+		w.put_bytes(&[0, 0]); // a length-prefixed (bogus) payload
+		let bytes = w.into_vec();
+		let mut r = ByteReader::new(&bytes);
+		assert_eq!(read_value_column(&mut r), Err(DspSegError::InvalidTag { kind: "value_codec_for_type", value: TAG_F64 }));
+	}
+
+	#[test]
+	fn segment_frame_round_trips_a_for_scaled_column() {
+		// A clustered-high-base scaled-int series that seals to the FOR value codec must
+		// round-trip through the full framed segment (header, CRC, v4 layout). Two-decimal
+		// values force the ScaledI64 encoding; a fixed 1e7 integer part with a small
+		// fractional jitter gives mantissas clustered near 1e9 where FOR is the strict
+		// winner.
+		let ts: Vec<i64> = (0..192).map(|i| 1_000 + i * 5).collect();
+		let vs: Vec<BigDecimal> = (0..192).map(|i| BigDecimal::from_str(&format!("10000000.0{}", i % 7)).unwrap()).collect();
+		let seg = Segment::build(&ts, &vs, TimeUnit::Millis, &BigDecimal::from(0)).expect("builds");
+		assert_eq!(seg.values.best_value_codec(), "scaled_for", "clustered high-base scaled stream must pick the FOR codec");
+		let bytes = write_segment(&seg);
+		let back = read_segment(&bytes).expect("reads");
+		assert_eq!(back, seg, "FOR segment frame must round-trip exactly");
+		assert_eq!(back.version, SEGMENT_FORMAT_VERSION);
+	}
+
+	#[test]
 	fn blocked_codec_on_a_non_scaled_column_is_rejected() {
 		// A hand-crafted F64 value block that claims the blocked codec must be refused —
 		// per-block bit-packing is only defined for a ScaledI64 payload.
@@ -1360,11 +1458,18 @@ mod tests {
 	fn segment_frame_round_trips_a_blocked_scaled_column() {
 		// A mixed-magnitude scaled-int series that seals to the blocked value codec must
 		// round-trip through the full framed segment (header, CRC, v4 layout). Two-decimal
-		// values force the ScaledI64 encoding (F64 cannot represent 0.01 exactly), and the
-		// burst (a full 64-wide block near 1e7) gives the mixed magnitude that lets per-block
-		// bit-packing beat both the varint and the global bit-pack.
+		// values force the ScaledI64 encoding (F64 cannot represent 0.01 exactly); the
+		// quiet region straddles zero symmetrically and the burst (a full 64-wide block
+		// near ±1e7) alternates sign, so each block's FOR residual range equals its
+		// zig-zag magnitude — per-block bit-packing beats the varint, the global
+		// bit-pack, and FOR (whose per-block reference is wasted here).
 		let ts: Vec<i64> = (0..192).map(|i| 1_000 + i * 5).collect();
-		let vs: Vec<BigDecimal> = (0..192).map(|i| BigDecimal::from_str(&if (64..128).contains(&i) { format!("{}.01", 10_000_000 + i) } else { format!("0.0{}", i % 5) }).unwrap()).collect();
+		let vs: Vec<BigDecimal> = (0..192)
+			.map(|i| {
+				let mantissa: i64 = if (64..128).contains(&i) { ((10_000_000 + i) * 100 + 1) * if i % 2 == 0 { 1 } else { -1 } } else { (i % 5) - 2 };
+				BigDecimal::new(mantissa.into(), 2)
+			})
+			.collect();
 		let seg = Segment::build(&ts, &vs, TimeUnit::Millis, &BigDecimal::from(0)).expect("builds");
 		assert_eq!(seg.values.best_value_codec(), "scaled_blocked", "mixed-magnitude scaled stream must pick the blocked codec");
 		let bytes = write_segment(&seg);
@@ -1375,10 +1480,12 @@ mod tests {
 
 	#[test]
 	fn segment_frame_round_trips_a_bitpacked_scaled_column() {
-		// A regular scaled-int series that seals to the bit-pack value codec must
-		// round-trip through the full framed segment (header, CRC, v4 layout).
+		// A regular zero-symmetric scaled-int series that seals to the bit-pack value
+		// codec must round-trip through the full framed segment (header, CRC, v4
+		// layout). Symmetric mantissas keep FOR from strictly winning (its residual
+		// width equals zig-zag's, so the reference varint loses the tie).
 		let ts: Vec<i64> = (0..64).map(|i| 1_000 + i * 5).collect();
-		let vs: Vec<BigDecimal> = (0..64).map(|i| BigDecimal::from_str(&format!("0.{i:02}")).unwrap()).collect();
+		let vs: Vec<BigDecimal> = (0..64).map(|i| BigDecimal::new((i - 32).into(), 2)).collect();
 		let seg = Segment::build(&ts, &vs, TimeUnit::Millis, &BigDecimal::from(0)).expect("builds");
 		assert_eq!(seg.values.best_value_codec(), "scaled_bitpack", "regular scaled stream must pick bit-pack");
 		let bytes = write_segment(&seg);

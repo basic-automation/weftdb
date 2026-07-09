@@ -34,9 +34,16 @@ use crate::{
 /// smaller of the per-value varint and the fixed-width bit-pack for a `ScaledI64`
 /// column) and added `storage.value_codec` (which value codec that was). v9 added
 /// `storage.advisory_for_value_bytes` (the advisory Frame-of-Reference estimate — the
-/// *potential* saving of adopting the FOR value codec, not the realized figure). All are
-/// `#[serde(default)]`, so older artifacts still deserialize.
-pub const SCHEMA_VERSION: u32 = 9;
+/// *potential* saving of adopting the FOR value codec, not the realized figure). v10
+/// **flipped the headline** (owner sign-off): `storage.bytes_per_point` (and therefore
+/// `total_bytes_per_point`) now derives from `realized_value_bytes` — the codec the
+/// segment actually writes — instead of the naive fixed-width `estimated_value_bytes`,
+/// which is retained as the comparison baseline; the FOR codec was adopted for the value
+/// column (`value_codec` may now be `scaled_for`), so the now-redundant
+/// `advisory_for_value_bytes` field was dropped. Pre-v10 `bytes_per_point` figures are
+/// NOT comparable with v10+ (the old headline over-reported the stored size). All
+/// optional fields are `#[serde(default)]`, so older artifacts still deserialize.
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// Metadata describing the dataset a result was measured against.
 ///
@@ -143,40 +150,31 @@ pub struct StorageEstimate {
 	pub physical_type: String,
 	/// Number of values in the stored column.
 	pub value_count: usize,
-	/// Estimated byte footprint of the value column under that encoding (the naive
-	/// fixed-width `count * width` figure).
+	/// The naive **logical** (uncompressed fixed-width) byte footprint of the value
+	/// column under that encoding (`count * width`). The pre-v10 headline, retained as
+	/// the comparison baseline: `realized_value_bytes / estimated_value_bytes` reads as
+	/// the value column's realized compression ratio.
 	pub estimated_value_bytes: usize,
 	/// **Realized** on-disk byte footprint of the value column — the exact payload a
 	/// sealed `.dspseg` frame writes under the codec it actually selects (matches
 	/// [`ColumnEncoding::best_serialized_bytes`](dsp_physical_type::ColumnEncoding::best_serialized_bytes)).
-	/// For a `scaled_i64` column this is the smaller of the per-value varint and the
-	/// fixed-width bit-pack (see [`value_codec`](Self::value_codec)), always below
-	/// [`estimated_value_bytes`](Self::estimated_value_bytes) — the accurate bytes/point
-	/// the naive estimate over-reports. Defaults to `0` on a pre-v7 artifact.
+	/// For a `scaled_i64` column this is the smallest of the per-value varint, the
+	/// fixed-width bit-pack, the per-block adaptive bit-pack, and the per-block
+	/// Frame-of-Reference codec (see [`value_codec`](Self::value_codec)). The headline
+	/// [`bytes_per_point`](Self::bytes_per_point) derives from this figure (v10).
+	/// Defaults to `0` on a pre-v7 artifact.
 	#[serde(default)]
 	pub realized_value_bytes: usize,
 	/// Which value codec [`realized_value_bytes`](Self::realized_value_bytes) reflects:
-	/// `varint` (the general per-value payload) or `scaled_bitpack` (fixed-width
-	/// bit-packing of a `ScaledI64` column's mantissas, chosen when strictly smaller).
-	/// Empty on a pre-v8 artifact.
+	/// `varint` (the general per-value payload), `scaled_bitpack` (fixed-width
+	/// bit-packing of a `ScaledI64` column's mantissas), `scaled_blocked` (per-block
+	/// adaptive bit-packing), or `scaled_for` (per-block Frame-of-Reference packing) —
+	/// each chosen only when strictly smallest. Empty on a pre-v8 artifact.
 	#[serde(default)]
 	pub value_codec: String,
-	/// **Advisory** Frame-of-Reference (FOR) value-column footprint in bytes — the
-	/// per-block reference-subtracted estimate
-	/// ([`ColumnEncoding::for_value_bytes`](dsp_physical_type::ColumnEncoding::for_value_bytes))
-	/// for a `ScaledI64` column, `None` for any other physical type or a pre-v9 artifact.
-	///
-	/// FOR is **not** the realized codec — [`realized_value_bytes`](Self::realized_value_bytes)
-	/// and [`value_codec`](Self::value_codec) still report what the segment actually seals.
-	/// This surfaces the *potential* saving of adopting FOR (which subtracts each block's
-	/// minimum and packs the unsigned residual, so it collapses mantissas clustered at a
-	/// high base — a sensor reading near a fixed offset) so the adopt-or-drop decision is
-	/// driven by real benchmark numbers rather than a guess. Compare against
-	/// `realized_value_bytes` to read the saving.
-	#[serde(default)]
-	pub advisory_for_value_bytes: Option<usize>,
-	/// Realized value-column storage cost: `estimated_value_bytes / value_count`
-	/// (0 for an empty column).
+	/// **Realized** value-column storage cost: `realized_value_bytes / value_count`
+	/// (0 for an empty column). Flipped from the naive `estimated_value_bytes` basis in
+	/// v10 — pre-v10 figures are not comparable.
 	pub bytes_per_point: f64,
 	/// Whether every value reconstructs exactly under the chosen encoding.
 	pub is_exact: bool,
@@ -236,9 +234,10 @@ impl StorageEstimate {
 		let estimated_value_bytes = enc.estimated_bytes();
 		let realized_value_bytes = enc.best_serialized_bytes();
 		let value_codec = enc.best_value_codec().to_string();
-		let advisory_for_value_bytes = enc.for_value_bytes();
 		let value_count = enc.len();
-		let bytes_per_point = per_point(estimated_value_bytes, value_count);
+		// The headline derives from the realized figure (v10): the codec the segment
+		// actually writes, not the naive fixed-width estimate.
+		let bytes_per_point = per_point(realized_value_bytes, value_count);
 
 		// Encode the timestamp column delta-of-delta, then let `dsp-physical-type`
 		// pick the cheapest of plain varint, RLE-of-second-differences, fixed-width
@@ -255,7 +254,7 @@ impl StorageEstimate {
 		};
 		let timestamp_bytes_per_point = per_point(timestamp_bytes, timestamps.len());
 
-		Self { physical_type: enc.physical_type.name().to_string(), value_count, estimated_value_bytes, realized_value_bytes, value_codec, advisory_for_value_bytes, bytes_per_point, is_exact: enc.is_exact(), lossy_count: enc.lossy_count, max_abs_error: enc.max_abs_error.to_string(), tolerance: tolerance.to_string(), timestamp_unit: unit.name().to_string(), timestamp_encoding: timestamp_encoding.to_string(), timestamp_bytes, timestamp_bytes_per_point, total_bytes_per_point: bytes_per_point + timestamp_bytes_per_point }
+		Self { physical_type: enc.physical_type.name().to_string(), value_count, estimated_value_bytes, realized_value_bytes, value_codec, bytes_per_point, is_exact: enc.is_exact(), lossy_count: enc.lossy_count, max_abs_error: enc.max_abs_error.to_string(), tolerance: tolerance.to_string(), timestamp_unit: unit.name().to_string(), timestamp_encoding: timestamp_encoding.to_string(), timestamp_bytes, timestamp_bytes_per_point, total_bytes_per_point: bytes_per_point + timestamp_bytes_per_point }
 	}
 }
 
@@ -333,7 +332,7 @@ mod tests {
 
 	fn sample_result() -> BenchResult {
 		let samples = [100, 200, 300];
-		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "dsp".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: Some(SignalShape::MultiSine) }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true }, accuracy: Some(AccuracyMetrics { count: 1000, rmse: 1.5, mae: 1.1, max_abs_error: 4.2, bias: -0.3 }), storage: Some(StorageEstimate { physical_type: "scaled_i64".to_string(), value_count: 200, estimated_value_bytes: 1600, realized_value_bytes: 420, value_codec: "varint".to_string(), advisory_for_value_bytes: None, bytes_per_point: 8.0, is_exact: true, lossy_count: 0, max_abs_error: "0".to_string(), tolerance: "0".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 208, timestamp_bytes_per_point: 1.04, total_bytes_per_point: 9.04 }) }
+		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "dsp".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: Some(SignalShape::MultiSine) }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true }, accuracy: Some(AccuracyMetrics { count: 1000, rmse: 1.5, mae: 1.1, max_abs_error: 4.2, bias: -0.3 }), storage: Some(StorageEstimate { physical_type: "scaled_i64".to_string(), value_count: 200, estimated_value_bytes: 1600, realized_value_bytes: 420, value_codec: "varint".to_string(), bytes_per_point: 2.1, is_exact: true, lossy_count: 0, max_abs_error: "0".to_string(), tolerance: "0".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 208, timestamp_bytes_per_point: 1.04, total_bytes_per_point: 3.14 }) }
 	}
 
 	#[test]
@@ -474,8 +473,14 @@ mod tests {
 		assert!(est.is_exact);
 		assert_eq!(est.lossy_count, 0);
 		assert_eq!(est.value_count, 4);
+		// The naive fixed-width baseline is retained; the headline derives from the
+		// realized codec (v10), which packs these tiny mantissas well below 8 B each.
 		assert_eq!(est.estimated_value_bytes, 4 * 8);
-		assert!((est.bytes_per_point - 8.0).abs() < f64::EPSILON);
+		assert!(est.realized_value_bytes < est.estimated_value_bytes);
+		#[allow(clippy::cast_precision_loss)]
+		let expected_bpp = est.realized_value_bytes as f64 / 4.0;
+		assert!((est.bytes_per_point - expected_bpp).abs() < f64::EPSILON, "headline {} must be the realized rate {expected_bpp}", est.bytes_per_point);
+		assert!(est.bytes_per_point < 8.0, "realized bytes/point must undercut the naive 8 B/pt");
 		assert_eq!(est.max_abs_error, "0");
 		assert_eq!(est.tolerance, "0");
 		// `from_values` supplies no timestamps, so the total equals the value cost.
@@ -524,13 +529,12 @@ mod tests {
 	}
 
 	#[test]
-	fn advisory_for_estimate_is_surfaced_for_a_clustered_high_base_scaled_column() {
-		// The bench surfaces the ADVISORY Frame-of-Reference saving (the potential of adopting
-		// the FOR value codec) without changing the realized figure — the governing rule wants
-		// the adopt-or-drop decision driven by benchmark numbers. A column clustered at a high
-		// base (near 1e6) is FOR's win regime: the advisory FOR bytes must be present and far
-		// below the realized (blocked/bit-pack) figure, while realized_value_bytes / value_codec
-		// still report what the segment actually seals.
+	fn for_codec_is_realized_and_headlined_for_a_clustered_high_base_scaled_column() {
+		// FOR is ADOPTED (owner sign-off): on its win regime — a column clustered at a
+		// high base (near 1e6) — the bench must name `scaled_for` as the realized codec,
+		// the realized figure must agree with a sealed segment, and the headline
+		// bytes/point must derive from it (v10 flip), far below the naive fixed-width
+		// estimate the pre-v10 headline reported.
 		use std::str::FromStr;
 		// Two-decimal values near 1e6 force the ScaledI64 encoding (a `.01` is not exactly
 		// representable in f32/f64) and cluster the mantissas at a high base (~1e8).
@@ -538,11 +542,15 @@ mod tests {
 		let tolerance = BigDecimal::from(0);
 		let est = StorageEstimate::from_values(&values, &tolerance);
 		assert_eq!(est.physical_type, "scaled_i64", "clustered high-base decimals pick scaled_i64");
-		let advisory = est.advisory_for_value_bytes.expect("a scaled column reports the FOR advisory");
-		assert!(advisory < est.realized_value_bytes, "advisory FOR {advisory} must beat the realized {} on a clustered high base", est.realized_value_bytes);
-		// The realized figure is unchanged — FOR is advisory, not adopted.
+		assert_eq!(est.value_codec, "scaled_for", "clustered high-base mantissas realize the FOR codec");
 		let seg = dsp_physical_type::Segment::build(&(0..128).map(|i| 1_000 + i).collect::<Vec<_>>(), &values, TimeUnit::Micros, &tolerance).expect("segment builds");
-		assert_eq!(est.realized_value_bytes, seg.serialized_value_bytes(), "realized bytes unchanged by the advisory FOR field");
+		assert_eq!(est.realized_value_bytes, seg.serialized_value_bytes(), "bench realized bytes must match the sealed segment");
+		// The headline derives from the realized figure and sits far below the naive
+		// fixed-width baseline (mantissas near 1e8 pack to a few residual bits each).
+		#[allow(clippy::cast_precision_loss)]
+		let expected_bpp = est.realized_value_bytes as f64 / est.value_count as f64;
+		assert!((est.bytes_per_point - expected_bpp).abs() < f64::EPSILON, "headline {} must be the realized rate {expected_bpp}", est.bytes_per_point);
+		assert!(est.realized_value_bytes * 4 < est.estimated_value_bytes, "realized {} must be well below the naive {} baseline", est.realized_value_bytes, est.estimated_value_bytes);
 	}
 
 	#[test]
@@ -584,7 +592,8 @@ mod tests {
 		let est = StorageEstimate::from_columns(&values, &timestamps, TimeUnit::Micros, &tolerance);
 		let seg = dsp_physical_type::Segment::build(&timestamps, &values, TimeUnit::Micros, &tolerance).expect("segment builds");
 		assert_eq!(est.physical_type, seg.physical_type().name());
-		assert_eq!(est.estimated_value_bytes, seg.value_bytes());
+		assert_eq!(est.estimated_value_bytes, seg.logical_value_bytes());
+		assert_eq!(est.realized_value_bytes, seg.value_bytes(), "both headline figures are the realized payload");
 		assert_eq!(est.timestamp_bytes, seg.timestamp_bytes());
 		assert_eq!(est.timestamp_encoding, seg.timestamp_encoding_name());
 		assert_eq!(est.value_count, seg.row_count());
