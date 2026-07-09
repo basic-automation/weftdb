@@ -394,14 +394,27 @@ detection within Y% and improving historical query latency by Z."*
     selector keeps the simpler label there. *(src: "Dynamic Bit Packing", Sensors 2023 —
     https://www.mdpi.com/1424-8220/23/20/8575 · Sprintz per-block bit-packing, ACM TODS'18
     — https://arxiv.org/abs/1808.02515)*
-  - [ ] **Next slice — Frame-of-Reference (FOR) per-block reference before bit-packing:**
-    the global + blocked bit-pack codecs zig-zag the raw value/delta, so a block of large
-    but *clustered* values still pays the full magnitude's width. Subtracting each block's
-    min (a FOR reference, one extra svarint/block) narrows the packed width to the block's
-    *range*, not its magnitude — the standard FastLanes/ALP move. Prototype `for_bitpack`
-    beside the blocked codec and benchmark on a clustered-offset corpus before adopting.
-    *(src: Lemire, FOR+delta — https://lemire.me/blog/2012/02/08/effective-compression-using-frame-of-reference-and-delta-coding/
+  - [x] **Frame-of-Reference (FOR) per-block codec — prototyped + benchmarked (advisory).**
+    `for_bitpack_bytes`/`encode`/`decode` beside the blocked codec: each block emits a
+    zig-zag-varint reference (the block minimum) then the *unsigned* residuals (`v - min`)
+    bit-packed at the block's *range* width, not its magnitude. Exposed as
+    `DeltaOfDeltaColumn::for_estimated_bytes` (timestamp) and `ColumnEncoding::for_value_bytes`
+    (value), and surfaced in the bench as `StorageEstimate.advisory_for_value_bytes` (schema
+    v9). Benchmarked: timestamp dods on a clustered-offset corpus FOR=135 B vs per-block
+    bit-pack 748 B (82% smaller); value mantissas clustered near 1e9 FOR=90 B vs blocked
+    747 B / bit-pack 745 B / varint 960 B (88% smaller). *(src: Lemire, FOR+delta —
+    https://lemire.me/blog/2012/02/08/effective-compression-using-frame-of-reference-and-delta-coding/
     · ALP FastLanes FOR, SIGMOD'24 — https://dl.acm.org/doi/10.1145/3626717)*
+  - [ ] **FOR adopt-or-drop — OWNER DECISION (the metric-flip zone).** FOR is advisory only:
+    NOT wired into `best_encoding_name`/`best_value_codec` or the `.dspseg` writer. Because
+    FOR packs the residual *unsigned*, it beats zig-zag global/blocked bit-packing on *any*
+    all-non-negative column (a 6-bit residual vs zig-zag's 7-bit width for `0..=63`), so
+    adopting it would newly select `scaled_for` for a large fraction of columns and flip the
+    realized `value_codec` / bytes-per-point — the same headline-metric semantic change
+    already flagged in "Value-column realized-bytes accuracy" below. Decide adoption
+    (timestamp: FOR rarely wins — dods are small/near-zero, so *recommend keep-advisory-or-drop
+    for timestamps*; value: FOR wins the common clustered-high-base sensor regime, so the
+    stronger adopt candidate) together with the bytes/point-flip sign-off.
   - [ ] **Sprintz-style FIRE predictor + zero-RLE (value + timestamp columns):** the
     realized per-block bit-pack is exactly Sprintz's bit-packing stage; add a Sprintz
     FIRE-style online integer forecaster to shrink residuals before packing and a
@@ -425,10 +438,16 @@ detection within Y% and improving historical query latency by Z."*
     on disk. **Owner decision needed:** whether to flip the headline `estimated_bytes` /
     `value_bytes` / `total_bytes_per_point` (and the bench HTML `val B/pt`) to the realized
     figure — a semantic change to a metric consumed in ~37 places / ~33 test assertions.
-  - [ ] **Per-block adaptive bit-pack for the VALUE column too:** the timestamp column now
-    has the blocked codec but the value column only has global bit-pack; extend
-    `blocked_bitpack_encode`/`decode` (already generic over `&[i64]`) to a third value
-    codec (`VAL_CODEC_BLOCKED`) for a `ScaledI64` column with mixed-magnitude mantissas.
+  - [x] **Per-block adaptive bit-pack for the VALUE column — realized on disk.** The
+    `.dspseg` value block carries `VAL_CODEC_BLOCKED` (block-size uvarint + length-prefixed
+    `blocked_bitpack_encode` stream), reusing the generic blocked primitives over the
+    mantissa stream. `ColumnEncoding::blocked_value_bytes` folds into
+    `best_serialized_bytes`/`best_value_codec` (`scaled_blocked`), chosen only when strictly
+    smallest so regular/uniform columns are byte-for-byte unchanged; a non-`ScaledI64`
+    payload is rejected (`value_codec_blocked_type`). Wins the mixed-magnitude regime (a
+    quiet region + a wide burst straddling zero, where a global width over-pays and a FOR
+    reference is wasted). Round-trip- + framed-segment-verified. *(src: "Dynamic Bit Packing",
+    Sensors 2023 — https://www.mdpi.com/1424-8220/23/20/8575)*
   - [ ] **f64 value-column codec (distinct from the timestamp DoD codec):** prototype a
     **Chimp128**-style XOR codec — XOR each value against the best of the previous 128
     values (the one giving the most trailing zeros) rather than only the immediate
@@ -438,6 +457,33 @@ detection within Y% and improving historical query latency by Z."*
     VLDB'22 — https://www.vldb.org/pvldb/vol15/p3058-liakos.pdf · comprehensive eval,
     VLDB'25 — https://www.vldb.org/pvldb/vol18/p4396-hishida.pdf · FCBench —
     https://arxiv.org/pdf/2312.10301)*
+  - [ ] **FastLanes "Unified Transposed Layout" for the bit-pack codecs (decode-speed
+    slice):** DSP's global/blocked/FOR bit-packers pack scalar LSB-first, so decode is a
+    per-value bit loop. FastLanes reorders values into a *transposed* layout targeting a
+    virtual 1024-bit SIMD register, decoding >100 B integers/sec with scalar (auto-vectorized)
+    code — the layout that makes lightweight codecs cheap enough to always leave data
+    compressed. Prototype the 1024-value transposed bit-unpack for the realized `ScaledI64`
+    value codec and benchmark decode throughput (bytes/point is unchanged; this is a
+    decode-latency win that also unlocks a future GPU-unpack path). *(src: FastLanes
+    Compression Layout, VLDB'23 — https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf)*
+  - [ ] **Cascading (recursive) codec composition — FOR→delta→bit-pack chains:** DSP's value
+    codecs are single-level (one of varint/bit-pack/blocked/FOR). FastLanes and Vortex apply
+    codecs *recursively* (e.g. FOR reference, then delta, then bit-pack the residual), which
+    is exactly the FOR-then-blocked-bit-pack cascade the advisory FOR estimate points at.
+    Design a small codec-chain descriptor in the `.dspseg` value block so a column can carry
+    a composed pipeline instead of a single tag, and benchmark FOR+bit-pack vs each alone.
+    *(src: Vortex cascading compression — https://vortex.dev/ · FastLanes codec chains, VLDB'23
+    — https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf)*
+  - [ ] **Evaluate Vortex as a columnar interchange + benchmark reference (Phase 1/4):** Vortex
+    (Rust, Arrow-compatible, BtrBlocks-based cascading compression, ALP/FastLanes/FSST
+    encodings) reports ~100–200× faster random access and 2–10× faster scans than Parquet+zstd
+    at similar ratio, with a GPU-decompression roadmap — directly on DSP's random-access +
+    GPU-decode + interpolation-native wedge. Assess (a) `vortex-*` crates as an *interchange*
+    target beside `dsp-arrow`/Parquet (out-of-core, per the vendor-neutral boundary), and (b)
+    Vortex as a `dsp-bench` external-format baseline for the storage/compressed-query workloads.
+    *(src: Vortex at Spice.ai, 2025 —
+    https://spice.ai/blog/vortex-at-spice-ai-the-columnar-format-for-data-intensive-workloads
+    · https://vortex.dev/)*
 - [ ] **6.2 Model-based compression** (leverages DSP's spline DNA, NeaTS-like) — piecewise
   linear / spline / polynomial / nonlinear approximation with bounded residuals;
   lossless-residual option; lossy with max-error guarantee; extrema-preserving mode
@@ -720,11 +766,31 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 - [x] **`storage.ingest.parquet` stage span (Phase 3): shipped.** Closes the
   Arrow-decode-on-ingest tracing gap; runtime-verified nesting under the request root span
   (`byte_len`, `require_sorted`, `format="parquet"`).
-- [ ] **Next slice — FOR (frame-of-reference) before bit-packing (Phase 6.1):** subtract a
-  per-block min/reference so clustered high-magnitude values pack to the block *range*, not
-  magnitude (the FastLanes/ALP move); prototype `for_bitpack` beside the blocked codec.
-  *(src: ALP SIGMOD'24 — https://dl.acm.org/doi/10.1145/3626717 · Lemire FOR+delta —
-  https://lemire.me/blog/2012/02/08/effective-compression-using-frame-of-reference-and-delta-coding/)*
+- [x] **FOR (frame-of-reference) before bit-packing (Phase 6.1): prototyped + benchmarked
+  (advisory).** `for_bitpack_*` beside the blocked codec (per-block reference, unsigned
+  residual packed to the block *range*): `for_estimated_bytes` (timestamp),
+  `for_value_bytes` (value), surfaced in the bench as
+  `StorageEstimate.advisory_for_value_bytes` (schema v9). Measured 82% below per-block
+  bit-pack on clustered timestamp dods, 88% below on value mantissas clustered near 1e9.
+- [x] **Per-block adaptive (blocked) VALUE codec (Phase 6.1): shipped + realized on disk.**
+  `VAL_CODEC_BLOCKED` selected via `best_value_codec` (`scaled_blocked`), strict winner on
+  a mixed-magnitude / zero-straddling mantissa column; regular columns byte-for-byte
+  unchanged. Round-trip- + framed-segment-verified.
+- [ ] **Next slice — FOR adopt-or-drop (Phase 6.1, OWNER-GATED):** FOR is advisory; adopting
+  it (wiring `scaled_for`/a timestamp FOR codec into the selectors + `.dspseg`) flips the
+  realized codec / bytes-per-point of most non-negative columns (FOR packs unsigned, beating
+  zig-zag bit-pack broadly) — decide together with the headline-bytes/point flip below. Value
+  column is the strong adopt candidate (clustered-high-base sensor regime); timestamps rarely
+  win (small dods) → recommend keep-advisory/drop for timestamps.
+- [ ] **Next slice — FastLanes transposed bit-unpack (Phase 6.1, decode-speed):** prototype a
+  1024-value transposed layout for the realized `ScaledI64` bit-pack so decode auto-vectorizes
+  (>100 B ints/sec); bytes/point unchanged, a decode-latency win that also opens a GPU-unpack
+  path. *(src: FastLanes, VLDB'23 — https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf)*
+- [ ] **Next slice — evaluate Vortex as interchange + bench baseline (Phase 1/4):** Rust,
+  Arrow-compatible, cascading ALP/FastLanes/FSST codecs, ~100–200× faster random access than
+  Parquet+zstd, GPU-decode roadmap — on DSP's random-access + GPU + interpolation wedge.
+  *(src: https://vortex.dev/ ·
+  https://spice.ai/blog/vortex-at-spice-ai-the-columnar-format-for-data-intensive-workloads)*
 - [ ] **Owner decision — flip the headline bytes/point to the realized figure (Phase 4/6):**
   the value block now realizes the smaller codec on disk, but `estimated_bytes` /
   `bytes_per_point` / the bench HTML `val B/pt` still report the naive `len*8`; deciding to

@@ -1405,8 +1405,8 @@ mod tests {
 		] });
 		let (status, body) = post_json(router, "/api/v1/storage/price/points", &body).await;
 		assert_eq!(status, StatusCode::CREATED, "body: {body}");
-		// Paged frames carry the paged format version (4), distinct from single-block (3).
-		assert_eq!(body["format_version"], 4);
+		// Paged frames carry the paged format version, distinct from a single-block frame.
+		assert_eq!(body["format_version"], dsp_physical_type::PAGED_SEGMENT_FORMAT_VERSION);
 		assert_eq!(body["row_count"], 4);
 	}
 
@@ -1654,8 +1654,8 @@ mod tests {
 		let router = router_with_declared_price(&dir).await;
 		let (status, body) = post_text(router, "/api/v1/storage/price/csv?rows_per_page=2", "100,1.5\n110,2.5\n120,3.5\n130,4.5\n").await;
 		assert_eq!(status, StatusCode::CREATED, "body: {body}");
-		// Paged frames carry the paged format version (4).
-		assert_eq!(body["format_version"], 4);
+		// Paged frames carry the paged format version, distinct from a single-block frame.
+		assert_eq!(body["format_version"], dsp_physical_type::PAGED_SEGMENT_FORMAT_VERSION);
 		assert_eq!(body["row_count"], 4);
 	}
 
