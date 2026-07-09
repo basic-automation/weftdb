@@ -225,9 +225,13 @@ transfer, 8% kernel, 7% JSON").
   confirmed current on crates.io (May 2026): `opentelemetry` 0.32 + `opentelemetry_sdk`
   0.32 (`rt-tokio`) + `opentelemetry-otlp` 0.32 (`grpc-tonic`, builds protoc-free) +
   `tracing-opentelemetry` 0.33. A misconfigured/absent collector does not block startup.
-- [ ] **OTLP collector verification (needs runtime):** stand up an OTel Collector /
-  Jaeger / Tempo and assert a `request` trace with its nested stage spans actually
-  lands — export delivery was not exercised this run (no collector on the box).
+- [x] **OTLP collector verification: delivery verified.** A Jaeger all-in-one collector
+  (docker `jaeger`, OTLP/gRPC :4317, query API/UI :16686, `--restart unless-stopped`)
+  now runs on the dev box; `scripts/verify-otlp.sh` boots `dsp-server` against it,
+  drives a declare/ingest/read cycle, and asserts via the Jaeger query API that
+  `request` root spans land with their nested stage spans
+  (`storage.ingest.parse`/`seal`, `storage.range.read`/`serialize` observed nesting
+  correctly). Re-runnable headlessly; the script (re)starts the container if absent.
 - [ ] `Statement::n_change()` write accounting (Turso 0.6) in ingest/instrumentation spans
 - [ ] `/bench/runs/:id` endpoint
 
@@ -745,9 +749,9 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   `fmt` subscriber; deps `opentelemetry`/`opentelemetry_sdk`/`opentelemetry-otlp` 0.32 +
   `tracing-opentelemetry` 0.33 (build protoc-free). Runtime-verified boot both with and
   without `OTEL_EXPORTER_OTLP_ENDPOINT`.
-- [ ] **Next slice — OTLP collector verification:** run a collector (Jaeger/Tempo/OTel
-  Collector) and confirm a `request` trace with its nested stage spans lands (delivery
-  was not exercised this run — no collector on the box).
+- [x] **OTLP collector verification: shipped.** Local Jaeger collector (docker,
+  auto-restart) + `scripts/verify-otlp.sh` — asserts `request` root spans with nested
+  storage stage spans land via the Jaeger query API; re-runnable headlessly.
 - [x] **Cursor paging (Phase 2 B-rest):** shipped — opaque `next_cursor`/`?cursor=`
   forward-iteration token on `…/points` + `…/value-points`
 - [x] **Gorilla-codec adopt-or-drop (Phase 6.1): ADOPTED + realized.** Benchmarked on a
