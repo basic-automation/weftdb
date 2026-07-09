@@ -149,31 +149,84 @@ impl ColumnEncoding {
 		self.scaled_i64_mantissas().map(|m| crate::timestamp::bitpack_bytes(&m))
 	}
 
-	/// The smallest realized value-codec footprint for this column — the figure a
-	/// per-column codec selector *would* write once the bit-pack codec is realized on
-	/// disk. For a `ScaledI64` column this is `min(varint, bit-pack)`; for every
-	/// other physical type it is exactly [`serialized_bytes`](Self::serialized_bytes)
-	/// (the only codec defined for that payload).
+	/// The realized footprint in bytes of the **per-block adaptive (blocked) bit-packed**
+	/// value codec for a `ScaledI64` column — the per-block width-header + packed stream
+	/// of [`crate::timestamp::blocked_bitpack_bytes`] at
+	/// [`crate::timestamp::BLOCKED_BITPACK_BLOCK`]. `None` for any other physical type.
 	///
-	/// Advisory today (the `.dspseg` value block still writes the per-value varint):
-	/// this is the estimate half of the codec, mirroring how the Gorilla timestamp
-	/// codec first landed its `gorilla_bytes` estimate before the on-disk selector.
+	/// The value-column analogue of the timestamp per-block adaptive codec: where the
+	/// single-width [`bitpack_value_bytes`](Self::bitpack_value_bytes) pays the column's
+	/// widest mantissa for *every* value, this pays each block's own width, so a column
+	/// mixing a quiet low-magnitude region with a burst of large mantissas packs the wide
+	/// values into only the few blocks they span instead of widening the whole column.
+	/// Compare all three (varint / global bit-pack / blocked) to pick the smallest.
+	#[must_use]
+	pub fn blocked_value_bytes(&self) -> Option<usize> {
+		self.scaled_i64_mantissas().map(|m| crate::timestamp::blocked_bitpack_bytes(&m, crate::timestamp::BLOCKED_BITPACK_BLOCK))
+	}
+
+	/// The footprint in bytes of the **Frame-of-Reference (FOR) per-block** value codec for
+	/// a `ScaledI64` column — the per-block reference-subtracted stream of
+	/// [`crate::timestamp::for_bitpack_bytes`] at [`crate::timestamp::BLOCKED_BITPACK_BLOCK`].
+	/// `None` for any other physical type.
+	///
+	/// **Advisory only** (roadmap Phase 6.1 "FOR before bit-packing"), exactly like the FOR
+	/// timestamp estimate: exposed and benchmarked, but **not** folded into
+	/// [`best_value_codec`](Self::best_value_codec) or the `.dspseg` writer this run. Where
+	/// [`blocked_value_bytes`](Self::blocked_value_bytes) zig-zags each mantissa and pays the
+	/// block's *magnitude* width, FOR subtracts each block's minimum and packs the *unsigned*
+	/// residual, so it pays only the block's *range* — the dominant regime for real value
+	/// columns (mantissas clustered at a high base: a sensor reading near a fixed offset).
+	///
+	/// Adopt-or-drop is a deliberate **owner decision** left as a next slice: because FOR
+	/// packs the residual unsigned, it beats zig-zag global/blocked bit-packing on *any*
+	/// all-non-negative column (a 6-bit residual vs zig-zag's 7-bit width for `0..=63`), so
+	/// wiring it into the selector would flip the realized `value_codec` / bytes-per-point of
+	/// a large fraction of columns — the same headline-metric semantic change already flagged
+	/// for owner sign-off. Kept advisory so this run ships the measurement, not the flip.
+	#[must_use]
+	pub fn for_value_bytes(&self) -> Option<usize> {
+		self.scaled_i64_mantissas().map(|m| crate::timestamp::for_bitpack_bytes(&m, crate::timestamp::BLOCKED_BITPACK_BLOCK))
+	}
+
+	/// The smallest realized value-codec footprint for this column — the figure the
+	/// per-column codec selector writes on disk. For a `ScaledI64` column this is
+	/// `min(varint, global bit-pack, per-block adaptive bit-pack)`; for every other
+	/// physical type it is exactly [`serialized_bytes`](Self::serialized_bytes) (the only
+	/// codec defined for that payload).
+	///
+	/// The varint and global-bit-pack codecs are realized on disk; the per-block adaptive
+	/// codec is realized on disk too (chosen only when strictly smallest — a
+	/// mixed-magnitude mantissa column).
 	#[must_use]
 	pub fn best_serialized_bytes(&self) -> usize {
 		let varint = self.serialized_bytes();
-		self.bitpack_value_bytes().map_or(varint, |bitpack| bitpack.min(varint))
+		let bitpack = self.bitpack_value_bytes().unwrap_or(varint);
+		let blocked = self.blocked_value_bytes().unwrap_or(varint);
+		varint.min(bitpack).min(blocked)
 	}
 
 	/// The name of the value codec [`best_serialized_bytes`](Self::best_serialized_bytes)
-	/// would select — `"scaled_bitpack"` when bit-packing is strictly smaller than the
-	/// per-value varint for a `ScaledI64` column, otherwise `"varint"` (the general
-	/// per-value payload, and the only codec for the non-scaled types). Ties keep the
-	/// varint codec (no random-access penalty for equal bytes).
+	/// selects — `"scaled_blocked"` when per-block adaptive bit-packing is strictly
+	/// smallest for a `ScaledI64` column (a mixed-magnitude mantissa stream),
+	/// `"scaled_bitpack"` when global bit-packing is strictly smaller than the per-value
+	/// varint, otherwise `"varint"` (the general per-value payload, and the only codec for
+	/// the non-scaled types). Ties keep the simpler codec (`varint` > `scaled_bitpack` >
+	/// `scaled_blocked`), so a uniform/single-block scaled series keeps the `scaled_bitpack`
+	/// label. The single source of truth the `.dspseg` writer routes through.
 	#[must_use]
 	pub fn best_value_codec(&self) -> &'static str {
-		match self.bitpack_value_bytes() {
-			Some(bitpack) if bitpack < self.serialized_bytes() => "scaled_bitpack",
-			_ => "varint",
+		let varint = self.serialized_bytes();
+		let Some(bitpack) = self.bitpack_value_bytes() else {
+			return "varint";
+		};
+		let blocked = self.blocked_value_bytes().unwrap_or(varint);
+		if blocked < varint && blocked < bitpack {
+			"scaled_blocked"
+		} else if bitpack < varint {
+			"scaled_bitpack"
+		} else {
+			"varint"
 		}
 	}
 
@@ -444,5 +497,71 @@ mod tests {
 		let mantissas = enc.scaled_i64_mantissas().expect("scaled column");
 		let (width, packed) = bitpack_encode(&mantissas);
 		assert_eq!(bitpack_decode(width, &packed, mantissas.len()), mantissas);
+	}
+
+	#[test]
+	fn blocked_value_codec_beats_bitpack_on_a_mixed_magnitude_scaled_stream() {
+		// A scaled-int column mixing a long quiet low-magnitude region with one contiguous
+		// burst of large mantissas: global bit-packing must pay the burst's ~30-bit width
+		// for every row, but per-block adaptive bit-packing confines the wide width to the
+		// few blocks the burst spans. The blocked codec must be the strict winner.
+		let lits: Vec<String> = (0..192)
+			.map(|i| if (64..128).contains(&i) { format!("{}", 1_000_000_000_i64 + i) } else { format!("{}", i % 5) })
+			.collect();
+		let refs: Vec<&str> = lits.iter().map(String::as_str).collect();
+		let values = col(&refs);
+		let enc = encode_column(PhysicalType::ScaledI64 { scale: 0 }, &values).expect("encodes");
+		let varint = enc.serialized_bytes();
+		let bitpack = enc.bitpack_value_bytes().expect("scaled column bit-packs");
+		let blocked = enc.blocked_value_bytes().expect("scaled column blocks");
+		assert!(blocked < bitpack, "blocked {blocked} must beat global bit-pack {bitpack}");
+		assert!(blocked < varint, "blocked {blocked} must beat varint {varint}");
+		assert_eq!(enc.best_serialized_bytes(), blocked);
+		assert_eq!(enc.best_value_codec(), "scaled_blocked");
+	}
+
+	#[test]
+	fn blocked_value_codec_ties_bitpack_on_a_uniform_stream_keeping_the_simpler_label() {
+		// A uniform small-mantissa ramp: every block packs to the same width, so blocked
+		// cannot beat global bit-pack — the selector keeps the simpler `scaled_bitpack`
+		// label (blocked wins only on genuine mixed magnitude).
+		let lits: Vec<String> = (0..64).map(|i| format!("{}.{:02}", i / 100, i % 100)).collect();
+		let refs: Vec<&str> = lits.iter().map(String::as_str).collect();
+		let enc = encode_column(PhysicalType::ScaledI64 { scale: 2 }, &col(&refs)).expect("encodes");
+		let bitpack = enc.bitpack_value_bytes().expect("scaled column bit-packs");
+		let blocked = enc.blocked_value_bytes().expect("scaled column blocks");
+		assert!(blocked >= bitpack, "blocked {blocked} must not beat global bit-pack {bitpack} on a uniform stream");
+		assert_eq!(enc.best_value_codec(), "scaled_bitpack");
+	}
+
+	#[test]
+	fn for_value_estimate_beats_blocked_on_a_clustered_high_base_but_stays_advisory() {
+		// A scaled-int column whose mantissas are all clustered at a high base (near 1e9 with
+		// a small ±jitter) — the common real-sensor regime. Global and per-block bit-packing
+		// both zig-zag the ~1e9 magnitude for every value; the FOR estimate subtracts each
+		// block's ~1e9 minimum and packs only the jitter's few bits + one reference varint per
+		// block. FOR must be the strict advisory winner.
+		let lits: Vec<String> = (0..192).map(|i| format!("{}", 1_000_000_000_i64 + (i % 7))).collect();
+		let refs: Vec<&str> = lits.iter().map(String::as_str).collect();
+		let enc = encode_column(PhysicalType::ScaledI64 { scale: 0 }, &col(&refs)).expect("encodes");
+		let bitpack = enc.bitpack_value_bytes().expect("scaled column bit-packs");
+		let blocked = enc.blocked_value_bytes().expect("scaled column blocks");
+		let for_bytes = enc.for_value_bytes().expect("scaled column FORs");
+		// Measured: for=90 B vs blocked=747 B / bitpack=745 B / varint=960 B — an 88%
+		// reduction, the FOR-before-bit-packing win on clustered-high-base mantissas.
+		assert!(for_bytes < blocked, "FOR {for_bytes} must beat blocked {blocked} on a clustered high base");
+		assert!(for_bytes * 3 < blocked, "FOR {for_bytes} should be well under a third of blocked {blocked}");
+		// …but FOR is ADVISORY: the on-disk selector still ignores it, so a clustered-high-base
+		// column seals under blocked/bit-pack, not a (not-yet-realized) FOR codec. This proves
+		// the measurement is exposed without flipping the realized bytes-per-point metric.
+		assert_ne!(enc.best_value_codec(), "scaled_for");
+		assert_eq!(enc.best_serialized_bytes(), enc.blocked_value_bytes().unwrap().min(bitpack).min(enc.serialized_bytes()));
+	}
+
+	#[test]
+	fn for_value_estimate_is_none_for_non_scaled_columns() {
+		// FOR, like the other scaled codecs, is defined only for a ScaledI64 mantissa stream.
+		let floats = encode_column(PhysicalType::F64, &col(&["0.5", "1.5"])).expect("encodes");
+		assert_eq!(floats.for_value_bytes(), None);
 	}
 }
