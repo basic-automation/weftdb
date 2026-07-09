@@ -428,6 +428,169 @@ pub fn blocked_bitpack_decode(bytes: &[u8], block: usize, count: usize) -> Vec<i
 	out
 }
 
+/// The unsigned residual of `v` against a block reference `min` — `v - min` computed
+/// in the two's-complement `u64` domain, which is the exact difference whenever
+/// `v >= min` (always true for a block's own minimum) and up to `2^64 - 1`. Inverse:
+/// [`for_reconstruct`]. Kept in `u64` (not `i128`) so the packed width is the block's
+/// *range*, never its magnitude.
+#[must_use]
+#[allow(clippy::cast_sign_loss)] // the bit pattern is the wrapping difference; exact for v >= min.
+const fn for_residual(v: i64, min: i64) -> u64 {
+	(v as u64).wrapping_sub(min as u64)
+}
+
+/// Reconstruct a value from its block reference `min` and unsigned residual `r` —
+/// the exact inverse of [`for_residual`] (`min + r` in the wrapping `u64` domain).
+#[must_use]
+#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)] // undoes the wrapping subtraction; round-trips exactly.
+const fn for_reconstruct(min: i64, r: u64) -> i64 {
+	(min as u64).wrapping_add(r) as i64
+}
+
+/// Append `value` to `out` as an unsigned LEB128 varint (a standalone mirror of
+/// [`ByteWriter::put_uvarint`](crate::dspseg) so the FOR prototype needs no `dspseg`
+/// writer). Used for the per-block reference; exactly [`zigzag_varint_len`] bytes for a
+/// zig-zag-coded reference.
+fn for_push_uvarint(out: &mut Vec<u8>, mut value: u64) {
+	loop {
+		#[allow(clippy::cast_possible_truncation)] // masked to the low 7 bits.
+		let mut byte = (value & 0x7F) as u8;
+		value >>= 7;
+		if value != 0 {
+			byte |= 0x80;
+		}
+		out.push(byte);
+		if value == 0 {
+			break;
+		}
+	}
+}
+
+/// Read an unsigned LEB128 varint at `*pos`, advancing `*pos` past it; a stream that
+/// ends mid-varint reads the missing high bytes as terminator zeros (a truncated block
+/// yields zeros rather than panicking). Inverse of [`for_push_uvarint`].
+fn for_read_uvarint(bytes: &[u8], pos: &mut usize) -> u64 {
+	let mut result = 0_u64;
+	let mut shift = 0_u32;
+	loop {
+		let byte = bytes.get(*pos).copied().unwrap_or(0);
+		*pos += 1;
+		result |= u64::from(byte & 0x7F) << shift;
+		if byte & 0x80 == 0 || shift >= 63 {
+			return result;
+		}
+		shift += 7;
+	}
+}
+
+/// Estimated footprint of a **Frame-of-Reference (FOR) per-block** bit-packing of a
+/// difference stream (roadmap Phase 6.1 — the FastLanes/ALP move: subtract a per-block
+/// reference before bit-packing).
+///
+/// Where the per-block adaptive [`blocked_bitpack_bytes`] zig-zags each value and pays
+/// the block's *magnitude* width, FOR subtracts each block's minimum first, so the
+/// packed width covers only the block's *range*. A block of large but tightly clustered
+/// values (e.g. `1_000_000 ± 4`) drops from ~21 bits to ~3, at the cost of one reference
+/// varint per block. Each block costs `zigzag_varint_len(min)` reference bytes + a
+/// one-byte width header + `ceil(len * width / 8)` data bytes; the block size is fixed
+/// (only the final block is short, derivable from the count).
+///
+/// **Prototype — advisory only**, exactly like the initial Gorilla evaluation: exposed
+/// via [`DeltaOfDeltaColumn::for_estimated_bytes`] and benchmarked against the shipped
+/// codecs, but **not** yet wired into [`DeltaOfDeltaColumn::best_estimated_bytes`] or the
+/// `.dspseg` writer (that is the adopt-or-drop slice). Comparable with the other
+/// estimates (all omit the externally-known row count). *(src: Lemire, FOR+delta —
+/// <https://lemire.me/blog/2012/02/08/effective-compression-using-frame-of-reference-and-delta-coding/>
+/// · ALP `FastLanes` FOR, SIGMOD'24 — <https://dl.acm.org/doi/10.1145/3626717>)*
+#[must_use]
+pub fn for_bitpack_bytes(values: &[i64], block: usize) -> usize {
+	if values.is_empty() {
+		return 0;
+	}
+	let block = block.max(1);
+	values.chunks(block)
+		.map(|chunk| {
+			let min = chunk.iter().copied().min().unwrap_or(0);
+			let width = chunk.iter().map(|&v| 64 - for_residual(v, min).leading_zeros()).max().unwrap_or(0) as usize;
+			zigzag_varint_len(min) + 1 + (chunk.len() * width).div_ceil(8)
+		})
+		.sum()
+}
+
+/// Frame-of-Reference per-block encode of a difference stream.
+///
+/// The concatenation, block by block, of a zig-zag-varint reference (the block minimum),
+/// a one-byte width header, and the unsigned residuals (`v - min`) bit-packed at that
+/// width, LSB-first.
+///
+/// The emitted length is exactly the [`for_bitpack_bytes`] estimate for the same
+/// `(values, block)`. Exact inverse is [`for_bitpack_decode`] given the same `block` and
+/// value count. An empty input yields an empty buffer.
+#[must_use]
+pub fn for_bitpack_encode(values: &[i64], block: usize) -> Vec<u8> {
+	let block = block.max(1);
+	let mut out = Vec::new();
+	for chunk in values.chunks(block) {
+		let min = chunk.iter().copied().min().unwrap_or(0);
+		for_push_uvarint(&mut out, zigzag(min));
+		let residuals: Vec<u64> = chunk.iter().map(|&v| for_residual(v, min)).collect();
+		let width = residuals.iter().map(|&r| 64 - r.leading_zeros()).max().unwrap_or(0) as usize;
+		// Width is 0..=64 by construction, so the conversion never saturates.
+		out.push(u8::try_from(width).unwrap_or(64));
+		if width == 0 {
+			continue;
+		}
+		let start = out.len();
+		out.resize(start + (chunk.len() * width).div_ceil(8), 0);
+		let mut bit = 0_usize;
+		for &r in &residuals {
+			for b in 0..width {
+				if (r >> b) & 1 == 1 {
+					out[start + (bit + b) / 8] |= 1 << ((bit + b) % 8);
+				}
+			}
+			bit += width;
+		}
+	}
+	out
+}
+
+/// Reconstruct `count` differences from a Frame-of-Reference per-block buffer.
+///
+/// Exact inverse of [`for_bitpack_encode`] given the same `block` and `count`; bytes
+/// past the buffer read as `0` (a truncated block yields the reference value rather than
+/// panicking).
+#[must_use]
+pub fn for_bitpack_decode(bytes: &[u8], block: usize, count: usize) -> Vec<i64> {
+	let block = block.max(1);
+	let mut out = Vec::with_capacity(count);
+	let mut pos = 0_usize;
+	let mut remaining = count;
+	while remaining > 0 {
+		let block_len = remaining.min(block);
+		let min = unzigzag(for_read_uvarint(bytes, &mut pos));
+		let width = usize::from(bytes.get(pos).copied().unwrap_or(0));
+		pos += 1;
+		let data_len = (block_len * width).div_ceil(8);
+		let data = bytes.get(pos..pos + data_len).unwrap_or(&[]);
+		pos += data_len;
+		let mut bit = 0_usize;
+		for _ in 0..block_len {
+			let mut r = 0_u64;
+			for b in 0..width {
+				let idx = bit + b;
+				if data.get(idx / 8).is_some_and(|byte| (byte >> (idx % 8)) & 1 == 1) {
+					r |= 1 << b;
+				}
+			}
+			out.push(for_reconstruct(min, r));
+			bit += width;
+		}
+		remaining -= block_len;
+	}
+	out
+}
+
 /// Bit cost of one second-difference value under a **Gorilla-style variable-length**
 /// scheme (roadmap Phase 6.1 — evaluation of a per-value bucketed codec as a
 /// complement to fixed-width bit-packing).
@@ -685,6 +848,26 @@ impl DeltaOfDeltaColumn {
 	#[must_use]
 	pub fn blocked_estimated_bytes(&self) -> usize {
 		8 + self.first_delta.map_or(0, zigzag_varint_len) + blocked_bitpack_bytes(&self.dods, BLOCKED_BITPACK_BLOCK)
+	}
+
+	/// Estimated packed size with the second-difference stream coded under the
+	/// **Frame-of-Reference (FOR) per-block** scheme ([`for_bitpack_bytes`] at
+	/// [`BLOCKED_BITPACK_BLOCK`]): anchor + first delta + the per-block reference-subtracted
+	/// stream.
+	///
+	/// **Prototype — advisory only** (roadmap Phase 6.1 "FOR before bit-packing"): FOR
+	/// subtracts each block's minimum before packing, so a block of large but tightly
+	/// *clustered* second differences packs to the block's range rather than its magnitude,
+	/// at the cost of one reference varint per block. It is the natural complement to the
+	/// per-block adaptive [`blocked_estimated_bytes`](Self::blocked_estimated_bytes), which
+	/// still zig-zags the raw value. Not yet folded into
+	/// [`best_estimated_bytes`](Self::best_estimated_bytes) or the `.dspseg` writer — the
+	/// adopt-or-drop decision is a follow-up slice, benchmarked on a clustered-offset corpus
+	/// first (see the `for_bitpack_*` tests). *(src: Lemire FOR+delta · ALP `FastLanes` FOR,
+	/// SIGMOD'24 — <https://dl.acm.org/doi/10.1145/3626717>)*
+	#[must_use]
+	pub fn for_estimated_bytes(&self) -> usize {
+		8 + self.first_delta.map_or(0, zigzag_varint_len) + for_bitpack_bytes(&self.dods, BLOCKED_BITPACK_BLOCK)
 	}
 
 	/// The smallest of the plain-varint, RLE, bit-packed, Gorilla, and per-block adaptive
@@ -1119,6 +1302,77 @@ mod tests {
 		// Empty stream encodes to nothing and decodes to nothing.
 		assert!(blocked_bitpack_encode(&[], 64).is_empty());
 		assert_eq!(blocked_bitpack_decode(&[], 64, 0), Vec::<i64>::new());
+	}
+
+	#[test]
+	fn for_bitpack_encode_round_trips_and_matches_the_byte_estimate() {
+		// A stream mixing tightly-clustered high-magnitude blocks (near ±1e9, the FOR
+		// win case), narrow jitter, and negatives — encode length must equal the estimate
+		// and decode must be exact for several block sizes and awkward tail lengths.
+		let vals: Vec<i64> = (0..130).map(|i| if (40..72).contains(&i) { 1_000_000_000 + (i % 5) } else { (i % 7) - 3 }).collect();
+		for block in [1_usize, 7, 16, 64, 130, 1000] {
+			let bytes = for_bitpack_encode(&vals, block);
+			assert_eq!(bytes.len(), for_bitpack_bytes(&vals, block), "encoded length must equal the estimate (block={block})");
+			assert_eq!(for_bitpack_decode(&bytes, block, vals.len()), vals, "round trip must be exact (block={block})");
+		}
+		// A stream straddling the full i64 range still round-trips (wrapping residuals).
+		let extremes = [i64::MIN, 0, i64::MAX, -1, 1, i64::MIN + 1];
+		let enc = for_bitpack_encode(&extremes, 4);
+		assert_eq!(enc.len(), for_bitpack_bytes(&extremes, 4));
+		assert_eq!(for_bitpack_decode(&enc, 4, extremes.len()), extremes);
+		// Empty stream encodes to nothing and decodes to nothing.
+		assert!(for_bitpack_encode(&[], 64).is_empty());
+		assert_eq!(for_bitpack_decode(&[], 64, 0), Vec::<i64>::new());
+	}
+
+	#[test]
+	fn for_bitpack_handles_all_zero_and_empty_streams() {
+		assert_eq!(for_bitpack_bytes(&[], 8), 0);
+		// An all-zero stream: each block costs a 1-byte zero reference varint + 1-byte
+		// width header (width 0, no data bytes). ceil(20/8) = 3 blocks -> 6 bytes.
+		assert_eq!(for_bitpack_bytes(&[0; 20], 8), 6);
+		// A zero block size is clamped to 1, never a panic.
+		assert_eq!(for_bitpack_bytes(&[0, 0, 0], 0), 6);
+	}
+
+	#[test]
+	fn for_bitpack_beats_blocked_on_a_clustered_offset_stream() {
+		// A clustered-offset second-difference corpus: every block is a run of large but
+		// *tightly clustered* values (a per-block base near ±1e6 with a ±3 wiggle). Plain
+		// per-block bit-packing zig-zags the raw value and pays the ~21-bit magnitude width;
+		// FOR subtracts each block's min and pays only the ~3-bit range + one reference
+		// varint. This is the regime the FOR slice targets.
+		let block = 32;
+		let dods: Vec<i64> = (0..256).map(|i| {
+			let base = 1_000_000 * (1 + (i / block) as i64); // steps each block
+			base + (i % 7) as i64 - 3 // ±3 wiggle within the block
+		}).collect();
+		let for_bytes = for_bitpack_bytes(&dods, block);
+		let blocked = blocked_bitpack_bytes(&dods, block);
+		let global = bitpack_bytes(&dods);
+		let varint = zigzag_varint_bytes(&dods);
+		// FOR is the strict winner in this regime — it must beat the shipped codecs.
+		// Measured: for=135 B vs blocked=748 B (global bit-pack 769 B, varint 992 B) —
+		// an 82% reduction over the best shipped codec on this clustered-offset corpus.
+		assert!(for_bytes < blocked, "FOR {for_bytes} must beat per-block bit-pack {blocked}");
+		assert!(for_bytes < global, "FOR {for_bytes} must beat global bit-pack {global}");
+		assert!(for_bytes < varint, "FOR {for_bytes} must beat varint {varint}");
+		// The saving over per-block bit-packing is large (blocked pays ~21 bits/value;
+		// FOR pays ~3 bits/value + one reference varint per 32-value block).
+		assert!(for_bytes * 2 < blocked, "FOR {for_bytes} should be well under half of per-block bit-pack {blocked}");
+	}
+
+	#[test]
+	fn for_estimated_bytes_is_advisory_and_ties_blocked_on_small_offsets() {
+		// On a stream whose blocks have near-zero base (no clustering to exploit), FOR's
+		// per-block reference varint is pure overhead, so it must not be smaller than the
+		// per-block adaptive estimate — confirming it is a complement, not a free win, and
+		// justifying leaving it out of the min-selector for now.
+		let col = DeltaOfDeltaColumn { first: 0, first_delta: Some(1), dods: (0..200).map(|i| (i % 5) - 2).collect(), unit: TimeUnit::Millis };
+		assert!(col.for_estimated_bytes() >= col.blocked_estimated_bytes(), "FOR {} must not beat blocked {} on a small-offset stream", col.for_estimated_bytes(), col.blocked_estimated_bytes());
+		// best_estimated_bytes stays the min of the five *shipped* codecs — FOR advisory,
+		// not folded in — so it never exceeds any single shipped estimate.
+		assert!(col.best_estimated_bytes() <= col.blocked_estimated_bytes());
 	}
 
 	/// A DoD column whose second differences are mostly narrow ±1 jitter with one
