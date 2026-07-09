@@ -405,16 +405,18 @@ detection within Y% and improving historical query latency by Z."*
     747 B / bit-pack 745 B / varint 960 B (88% smaller). *(src: Lemire, FOR+delta —
     https://lemire.me/blog/2012/02/08/effective-compression-using-frame-of-reference-and-delta-coding/
     · ALP FastLanes FOR, SIGMOD'24 — https://dl.acm.org/doi/10.1145/3626717)*
-  - [ ] **FOR adopt-or-drop — OWNER DECISION (the metric-flip zone).** FOR is advisory only:
-    NOT wired into `best_encoding_name`/`best_value_codec` or the `.dspseg` writer. Because
-    FOR packs the residual *unsigned*, it beats zig-zag global/blocked bit-packing on *any*
-    all-non-negative column (a 6-bit residual vs zig-zag's 7-bit width for `0..=63`), so
-    adopting it would newly select `scaled_for` for a large fraction of columns and flip the
-    realized `value_codec` / bytes-per-point — the same headline-metric semantic change
-    already flagged in "Value-column realized-bytes accuracy" below. Decide adoption
-    (timestamp: FOR rarely wins — dods are small/near-zero, so *recommend keep-advisory-or-drop
-    for timestamps*; value: FOR wins the common clustered-high-base sensor regime, so the
-    stronger adopt candidate) together with the bytes/point-flip sign-off.
+  - [x] **FOR adopt-or-drop — DECIDED (owner sign-off): ADOPTED for the value column,
+    timestamps stay advisory.** `VAL_CODEC_FOR` is the fourth realized `.dspseg` value
+    codec, folded into `best_serialized_bytes`/`best_value_codec` (`scaled_for`, chosen
+    only when strictly smallest; ties keep the simpler codec); a non-`ScaledI64` payload
+    is rejected (`value_codec_for_type`). Because FOR packs the residual *unsigned* it
+    beats zig-zag bit-packing on *any* all-non-negative column — an accepted, genuine
+    win, decided together with the headline bytes/point flip below so the metric broke
+    once, not twice. The bitpack/blocked-regime tests moved to zero-straddling fixtures
+    (their genuine regime). Timestamp FOR stays advisory-only (`for_estimated_bytes`):
+    dods are small/near-zero so FOR rarely wins there; the advisory number remains as
+    the tripwire if a real corpus ever contradicts that. Round-trip- +
+    framed-segment-verified.
   - [ ] **Sprintz-style FIRE predictor + zero-RLE (value + timestamp columns):** the
     realized per-block bit-pack is exactly Sprintz's bit-packing stage; add a Sprintz
     FIRE-style online integer forecaster to shrink residuals before packing and a
@@ -431,13 +433,16 @@ detection within Y% and improving historical query latency by Z."*
     below the naive `len*8` estimate). Runtime-verified: a sealed `scaled_i64` aspect reads
     `bytes_per_point=2.13` through `/storage/{aspect}/stats`. *(validated by ALP's
     decimal→integer PseudoDecimal path, SIGMOD'24 — https://dl.acm.org/doi/10.1145/3626717)*
-  - [ ] **Value-column realized-bytes accuracy (owner decision still open):** a realize-
-    accurate `ColumnEncoding::serialized_bytes()`/`best_serialized_bytes()` +
-    `Segment::serialized_value_bytes()` + `StorageEstimate.realized_value_bytes` (v7/v8)
-    expose the true figure additively, and the value block now *realizes* the smaller codec
-    on disk. **Owner decision needed:** whether to flip the headline `estimated_bytes` /
-    `value_bytes` / `total_bytes_per_point` (and the bench HTML `val B/pt`) to the realized
-    figure — a semantic change to a metric consumed in ~37 places / ~33 test assertions.
+  - [x] **Value-column realized-bytes accuracy — headline FLIPPED (owner sign-off,
+    bench schema v10).** `Segment::value_bytes()`/`total_bytes()`/`bytes_per_point()`,
+    `Page::total_bytes()`, and `StorageEstimate.bytes_per_point`/`total_bytes_per_point`
+    (and the bench HTML `val B/pt`) now report the **realized** figure — the codec each
+    column actually writes. The naive fixed-width figure is retained as the comparison
+    baseline (`Segment::logical_value_bytes()` / `StorageEstimate.estimated_value_bytes`),
+    so `realized / logical` reads as the value column's compression ratio. Pre-v10
+    bytes/point artifacts are NOT comparable (the old headline reported the uncompressed
+    size and oversold storage cost); the now-redundant `advisory_for_value_bytes` field
+    was dropped in the same bump.
   - [x] **Per-block adaptive bit-pack for the VALUE column — realized on disk.** The
     `.dspseg` value block carries `VAL_CODEC_BLOCKED` (block-size uvarint + length-prefixed
     `blocked_bitpack_encode` stream), reusing the generic blocked primitives over the
@@ -776,12 +781,10 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   `VAL_CODEC_BLOCKED` selected via `best_value_codec` (`scaled_blocked`), strict winner on
   a mixed-magnitude / zero-straddling mantissa column; regular columns byte-for-byte
   unchanged. Round-trip- + framed-segment-verified.
-- [ ] **Next slice — FOR adopt-or-drop (Phase 6.1, OWNER-GATED):** FOR is advisory; adopting
-  it (wiring `scaled_for`/a timestamp FOR codec into the selectors + `.dspseg`) flips the
-  realized codec / bytes-per-point of most non-negative columns (FOR packs unsigned, beating
-  zig-zag bit-pack broadly) — decide together with the headline-bytes/point flip below. Value
-  column is the strong adopt candidate (clustered-high-base sensor regime); timestamps rarely
-  win (small dods) → recommend keep-advisory/drop for timestamps.
+- [x] **FOR adopt-or-drop (Phase 6.1): DECIDED — ADOPTED for the value column (owner
+  sign-off).** `VAL_CODEC_FOR` realized as the fourth `.dspseg` value codec
+  (`scaled_for`, strict-win selection); timestamps stay advisory (small dods, FOR
+  rarely wins). Decided together with the headline flip below — one metric break.
 - [ ] **Next slice — FastLanes transposed bit-unpack (Phase 6.1, decode-speed):** prototype a
   1024-value transposed layout for the realized `ScaledI64` bit-pack so decode auto-vectorizes
   (>100 B ints/sec); bytes/point unchanged, a decode-latency win that also opens a GPU-unpack
@@ -791,10 +794,12 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   Parquet+zstd, GPU-decode roadmap — on DSP's random-access + GPU + interpolation wedge.
   *(src: https://vortex.dev/ ·
   https://spice.ai/blog/vortex-at-spice-ai-the-columnar-format-for-data-intensive-workloads)*
-- [ ] **Owner decision — flip the headline bytes/point to the realized figure (Phase 4/6):**
-  the value block now realizes the smaller codec on disk, but `estimated_bytes` /
-  `bytes_per_point` / the bench HTML `val B/pt` still report the naive `len*8`; deciding to
-  flip is a semantic change across ~37 callers / ~33 assertions (owner's call).
+- [x] **Headline bytes/point FLIPPED to the realized figure (Phase 4/6, owner sign-off,
+  bench schema v10):** `Segment::value_bytes`/`total_bytes`/`bytes_per_point`,
+  `Page::total_bytes`, `StorageEstimate.bytes_per_point`/`total_bytes_per_point`, and
+  the bench HTML `val B/pt` now report the codec actually written; the naive `len*8`
+  figure is retained as `logical_value_bytes`/`estimated_value_bytes` (the compression
+  baseline). Pre-v10 bytes/point artifacts are not comparable.
 - [ ] **Discovered — dsp-bench parallel-test OOM (needs repro):** the full `cargo test -p
   dsp-bench` intermittently aborts with `memory allocation of ~13 GB failed` under
   concurrent memory pressure; `--lib` alone and `--test-threads=1` pass deterministically
