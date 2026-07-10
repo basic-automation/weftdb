@@ -457,14 +457,45 @@ detection within Y% and improving historical query latency by Z."*
     quiet region + a wide burst straddling zero, where a global width over-pays and a FOR
     reference is wasted). Round-trip- + framed-segment-verified. *(src: "Dynamic Bit Packing",
     Sensors 2023 — https://www.mdpi.com/1424-8220/23/20/8575)*
-  - [ ] **f64 value-column codec (distinct from the timestamp DoD codec):** prototype a
-    **Chimp128**-style XOR codec — XOR each value against the best of the previous 128
-    values (the one giving the most trailing zeros) rather than only the immediate
-    predecessor (Gorilla/Chimp), since ~95% of adjacent XORs have ≤5 trailing zeros.
-    Benchmark it against Gorilla/Elf/ALP on the `dsp-bench` bytes/point + throughput
-    metrics using the FCBench / 2025-VLDB-eval methodology before adopting. *(src: Chimp,
-    VLDB'22 — https://www.vldb.org/pvldb/vol15/p3058-liakos.pdf · comprehensive eval,
-    VLDB'25 — https://www.vldb.org/pvldb/vol18/p4396-hishida.pdf · FCBench —
+  - [x] **f64 value-column codec — Gorilla + Chimp XOR codecs + best-of selector (advisory).**
+    The `F64` value column had no compression (raw 8 B/value IEEE pattern). Shipped in
+    `dsp-physical-type::floatcodec`: `xor_f64_*` (Gorilla — XOR vs the immediate predecessor,
+    store only the meaningful bits between the leading/trailing zeros) and `chimp_f64_*`
+    (single-predecessor Chimp — 2-bit flags, a 3-bit leading-zero class, trailing-zero trim),
+    both bit-exact for every f64 (NaN/±inf/subnormal/signed-zero, XORs `to_bits`); a
+    `best_f64_codec` selector over {raw, gorilla, chimp} (never worse than raw); the
+    `ColumnEncoding` advisory methods (`gorilla_f64_bytes`/`best_f64_bytes`/`best_f64_codec`);
+    and the `dsp-bench` `StorageEstimate.advisory_best_f64_bytes`/`advisory_best_f64_codec`
+    (schema v12) surfacing the best f64 saving on a lossy-tolerance run (measured Gorilla
+    ~45% below raw on a stable-exponent column near 1000). **Advisory only** — no f64 codec is
+    on disk yet. Honest finding: single-predecessor Chimp is *not* a universal win over
+    Gorilla (Gorilla's reuse-window path re-uses a repeated long-trailing window that Chimp's
+    trim path must re-header, and Chimp's leading-class rounding writes extra bits) — the
+    decisive win needs the 128-value window below. *(src: Gorilla, VLDB'15
+    https://www.vldb.org/pvldb/vol8/p1816-teller.pdf · Chimp, VLDB'22
+    https://www.vldb.org/pvldb/vol15/p3058-liakos.pdf)*
+  - [ ] **Faithful Chimp128 (128-value reference window) — the next f64 slice:** XOR each value
+    against the best of the previous 128 (most trailing zeros), not the immediate predecessor.
+    The single-predecessor Chimp shipped above does not spend an index; Chimp128's decisive
+    win comes from a **lookup table keyed on the last 14 trailing bits → the most-recent ring
+    index with that pattern**, so the reference is found in O(1) and named cheaply — implement
+    that table + the 2-bit-flag/4-way serialization faithfully (a naive always-7-bit-index
+    variant loses to depth-1 Chimp, confirmed this run). Benchmark on `dsp-bench` bytes/point.
+    *(src: Chimp128 algorithm — https://www.vldb.org/pvldb/vol15/p3058-liakos.pdf · duckdb
+    Chimp128 impl notes — https://github.com/duckdb/duckdb/pull/4878)*
+  - [ ] **Elf (erasing-based) f64 codec — likely beats Chimp128:** Elf erases the last few
+    mantissa bits (skilfully, losslessly recoverable) *before* XOR so the XOR carries many
+    trailing zeros — reported **14% smaller than Gorilla and 24% smaller than Chimp128** on
+    time-series data (43% / 21% on non-time-series). Given DSP's f64 columns, evaluate Elf as
+    the f64 codec to adopt rather than Chimp128. *(src: Elf, VLDB'23 —
+    https://www.vldb.org/pvldb/vol16/p1763-li.pdf · impl —
+    https://github.com/Spatio-Temporal-Lab/elf)*
+  - [ ] **f64-codec adopt-or-drop decision + on-disk realization:** once Chimp128/Elf are
+    benchmarked against the shipped Gorilla/Chimp, pick the winner, realize it as a
+    `VAL_CODEC_*` in the `.dspseg` value block, and flip `best_f64_codec`/the bench headline —
+    using the FCBench / VLDB'25 comprehensive-eval methodology (bytes/point AND decode
+    throughput, not bytes alone). *(src: comprehensive eval, VLDB'25 —
+    https://www.vldb.org/pvldb/vol18/p4396-hishida.pdf · FCBench —
     https://arxiv.org/pdf/2312.10301)*
   - [ ] **FastLanes "Unified Transposed Layout" for the bit-pack codecs (decode-speed
     slice):** DSP's global/blocked/FOR bit-packers pack scalar LSB-first, so decode is a
@@ -804,12 +835,24 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   the bench HTML `val B/pt` now report the codec actually written; the naive `len*8`
   figure is retained as `logical_value_bytes`/`estimated_value_bytes` (the compression
   baseline). Pre-v10 bytes/point artifacts are not comparable.
-- [ ] **Discovered — dsp-bench parallel-test OOM (needs repro):** the full `cargo test -p
-  dsp-bench` intermittently aborts with `memory allocation of ~13 GB failed` under
-  concurrent memory pressure; `--lib` alone and `--test-threads=1` pass deterministically
-  (89+20/0), so it is environmental (heavy parallel build+test load), not a logic bug in
-  the tree. Investigate whether a specific bench/integration test transiently over-allocates
-  when interleaved; cap its parallelism or size if so.
+- [x] **dsp-bench parallel-test OOM — ROOT-CAUSED + FIXED (it was a logic bug, not
+  environmental).** A full-backtrace capture pinned the ~28 GB allocation to
+  `splimes::helpers::generate_target_times::TargetTimesIterator::next_impl`, which sized the
+  per-batch `Vec<DateTime<Utc>>` from *free system memory* (`available_memory / point_size /
+  2`) instead of from the number of timestamps to produce — a tens-of-GiB speculative
+  `Vec::with_capacity` per call. Single-threaded one such allocation succeeds when RAM is
+  idle (only ever filled to the tiny real grid, then dropped), which is why `--test-threads=1`
+  masked it; under the default parallel harness many interpolation tests call it at once and
+  the summed over-allocation aborts the process. Fixed by capping the batch by
+  `remaining_points()` (the timestamps left) and `MAX_BATCH_POINTS` (1 << 20); the previously
+  reliable crash is gone (`cargo test -p dsp-bench --lib` now passes 92/0 on repeated parallel
+  runs). The sibling sizers in `optimizations/mod.rs` + `gpu/mod.rs` were already bounded by
+  the real work — no change needed there.
+- [x] **f64 value-column codecs (Phase 6.1): Gorilla + Chimp XOR + best-of selector (advisory),
+  bench-surfaced (schema v12).** See the Phase 6.1 f64-codec item; single-predecessor Chimp is
+  not a universal win over Gorilla (honest finding), so the next slices are faithful Chimp128
+  (14-bit-trailing-hash reference window) and Elf (erasing-based, ~14%/24% below Gorilla/Chimp128
+  per VLDB'23) before an adopt-or-drop + on-disk realization.
 - [x] Add p50/p95/p99 + confidence-interval reporting
 - [x] Add physical value types (`F64`, `ScaledI64`, `BigDecimalText` + three more)
 - [x] Prototype columnar segment reads for one aspect type (`database::SegmentStore`)
