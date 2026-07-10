@@ -347,6 +347,41 @@ pub fn chimp_f64_bytes(values: &[f64]) -> usize {
 	chimp_f64_encode(values).len()
 }
 
+/// The name of the smallest available `f64` value codec for `values` and its byte
+/// footprint — the choice a codec selector would make.
+///
+/// Candidates are the two XOR codecs ([`xor_f64_bytes`] Gorilla, [`chimp_f64_bytes`]
+/// Chimp) and the uncompressed `raw` baseline (`8 * len`, what an `F64` `.dspseg` block
+/// writes today). `raw` is a genuine candidate, not just a comparison point: on adversarial
+/// data (every XOR spanning the full width) both XOR codecs *exceed* raw by their flag
+/// overhead, and a real selector must never pick a codec larger than storing the bytes
+/// plainly. Ties resolve to the simpler codec (`raw` > `gorilla` > `chimp`), so an
+/// incompressible column keeps the plain layout.
+///
+/// This is the "benchmark the codecs and pick the winner" step the roadmap requires before
+/// adopting an f64 value codec on disk. **Advisory** — no f64 codec is realized in the
+/// `.dspseg` writer yet.
+#[must_use]
+pub fn best_f64_codec(values: &[f64]) -> (&'static str, usize) {
+	let raw = values.len() * 8;
+	let gorilla = xor_f64_bytes(values);
+	let chimp = chimp_f64_bytes(values);
+	if chimp < raw && chimp < gorilla {
+		("chimp", chimp)
+	} else if gorilla < raw {
+		("gorilla", gorilla)
+	} else {
+		("raw", raw)
+	}
+}
+
+/// The byte footprint of the smallest available `f64` value codec for `values` — the
+/// second element of [`best_f64_codec`]. Never exceeds the raw `8 * len`.
+#[must_use]
+pub fn best_f64_bytes(values: &[f64]) -> usize {
+	best_f64_codec(values).1
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -483,6 +518,51 @@ mod tests {
 		assert!(chimp < raw && gorilla < raw, "both beat raw {raw}: chimp {chimp}, gorilla {gorilla}");
 		let margin = gorilla.max(chimp) - gorilla.min(chimp);
 		assert!(margin * 50 < raw, "chimp {chimp} and gorilla {gorilla} stay within ~2% on a smooth ramp");
+	}
+
+	#[test]
+	fn best_f64_selector_picks_the_true_min_and_never_exceeds_raw() {
+		// The selector must equal the smallest of {raw, gorilla, chimp} on every corpus, and
+		// its label must name that codec.
+		let ramp: Vec<f64> = (0..128).map(|i| 500.0 + f64::from(i) * 0.01).collect();
+		let walk_seed_state = 0x1234_5678_9abc_def0_u64;
+		let mut s = walk_seed_state;
+		let mut x = 42.0;
+		let mut walk = Vec::with_capacity(200);
+		for _ in 0..200 {
+			s ^= s >> 12;
+			s ^= s << 25;
+			s ^= s >> 27;
+			x += ((s >> 40) as f64 / (1_u64 << 24) as f64) - 0.5;
+			walk.push(x);
+		}
+		for series in [&ramp, &walk] {
+			let raw = series.len() * 8;
+			let (name, bytes) = best_f64_codec(series);
+			let expected = raw.min(xor_f64_bytes(series)).min(chimp_f64_bytes(series));
+			assert_eq!(bytes, expected, "selector must pick the true min");
+			assert_eq!(bytes, best_f64_bytes(series));
+			assert!(bytes <= raw, "best {bytes} must never exceed raw {raw}");
+			let claimed = match name {
+				"gorilla" => xor_f64_bytes(series),
+				"chimp" => chimp_f64_bytes(series),
+				_ => raw,
+			};
+			assert_eq!(claimed, bytes, "label {name} must match the chosen size");
+		}
+	}
+
+	#[test]
+	fn best_f64_selector_falls_back_to_raw_on_incompressible_data() {
+		// Adversarial: every consecutive pattern XORs to the full 64-bit width, so both XOR
+		// codecs pay their flag overhead on top of 64 bits/value and *exceed* raw. The
+		// selector must fall back to the plain layout rather than pick a codec bigger than raw.
+		let values: Vec<f64> = (0..64).map(|i| f64::from_bits(if i % 2 == 0 { 0x0000_0000_0000_0000 } else { 0xFFFF_FFFF_FFFF_FFFF })).collect();
+		let raw = values.len() * 8;
+		let (name, bytes) = best_f64_codec(&values);
+		assert_eq!(name, "raw", "incompressible data must fall back to raw");
+		assert_eq!(bytes, raw);
+		assert!(xor_f64_bytes(&values) > raw && chimp_f64_bytes(&values) > raw, "both XOR codecs must exceed raw here");
 	}
 
 	#[test]
