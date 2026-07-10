@@ -91,7 +91,7 @@ use bigdecimal::{
 pub use catalog::{SegmentDescriptor, SegmentIndex};
 pub use column::{encode_column, recommend_encoding, ColumnEncodeError, ColumnEncoding};
 pub use dspseg::{crc32, read_paged_segment, read_segment, write_paged_segment, write_segment, ByteReader, ByteWriter, DspSegError};
-pub use floatcodec::{chimp_f64_bytes, chimp_f64_decode, chimp_f64_encode, xor_f64_bytes, xor_f64_decode, xor_f64_encode};
+pub use floatcodec::{best_f64_bytes, best_f64_codec, chimp_f64_bytes, chimp_f64_decode, chimp_f64_encode, xor_f64_bytes, xor_f64_decode, xor_f64_encode};
 pub use nulls::{NullMask, NullMaskError};
 pub use page::{Page, PagedSegment, DEFAULT_ROWS_PER_PAGE, PAGED_SEGMENT_FORMAT_VERSION};
 pub use schema::{AspectSchema, SealError};
