@@ -188,6 +188,68 @@ impl ColumnEncoding {
 		self.scaled_i64_mantissas().map(|m| crate::timestamp::for_bitpack_bytes(&m, crate::timestamp::BLOCKED_BITPACK_BLOCK))
 	}
 
+	/// The raw `f64` values of this column, in input order — `None` for any other
+	/// physical type.
+	///
+	/// The Gorilla XOR codec is defined only for the IEEE-754 `F64` payload (the scaled
+	/// codecs target the integer mantissa stream, `BigDecimalText` is UTF-8). An `F64`
+	/// column is guaranteed to hold only `F64` values, so the map is total.
+	#[must_use]
+	pub fn f64_values(&self) -> Option<Vec<f64>> {
+		if !matches!(self.physical_type, PhysicalType::F64) {
+			return None;
+		}
+		Some(
+			self.values
+				.iter()
+				.map(|v| match v {
+					PhysicalValue::F64(f) => *f,
+					// Unreachable: an F64 column holds only F64 values.
+					_ => 0.0,
+				})
+				.collect(),
+		)
+	}
+
+	/// The realized footprint in bytes of the **Gorilla XOR** value codec for an `F64`
+	/// column — [`crate::floatcodec::xor_f64_bytes`]. `None` for any other physical type
+	/// (XOR compression is defined only for the raw IEEE-754 payload).
+	///
+	/// The `F64` analogue of the scaled-integer bit-pack codecs, and the one compression
+	/// path for a *lossy* value column: where [`serialized_bytes`](Self::serialized_bytes)
+	/// pays a flat 8 B for every float, the XOR codec stores only the meaningful bits
+	/// between a value and its predecessor — a repeated value costs one bit, a
+	/// slowly-varying series a handful. **Advisory only** (roadmap Phase 6.1): surfaced
+	/// here and benchmarked against the raw `8 * len`, but not yet wired into the
+	/// `.dspseg` writer or a codec selector (that is the adopt-or-drop slice, mirroring
+	/// how the Gorilla-timestamp and FOR codecs were introduced advisory-first).
+	#[must_use]
+	pub fn gorilla_f64_bytes(&self) -> Option<usize> {
+		self.f64_values().map(|f| crate::floatcodec::xor_f64_bytes(&f))
+	}
+
+	/// The footprint in bytes of the **smallest available** `f64` value codec for an `F64`
+	/// column — [`crate::floatcodec::best_f64_bytes`], the min of the Gorilla XOR, Chimp
+	/// XOR, and uncompressed `raw` baseline. `None` for any other physical type.
+	///
+	/// Where [`gorilla_f64_bytes`](Self::gorilla_f64_bytes) reports one codec, this reports
+	/// what a selector would actually pick — never worse than the raw `8 * value_count` an
+	/// `F64` block writes today. This is the figure a future on-disk f64 codec would realize;
+	/// the paired [`best_f64_codec`](Self::best_f64_codec) names which codec wins. **Advisory**
+	/// (roadmap Phase 6.1) — not yet wired into the `.dspseg` writer.
+	#[must_use]
+	pub fn best_f64_bytes(&self) -> Option<usize> {
+		self.f64_values().map(|f| crate::floatcodec::best_f64_bytes(&f))
+	}
+
+	/// The name of the codec [`best_f64_bytes`](Self::best_f64_bytes) selects for an `F64`
+	/// column — `"chimp"`, `"gorilla"`, or `"raw"` (see
+	/// [`crate::floatcodec::best_f64_codec`]). `None` for any other physical type.
+	#[must_use]
+	pub fn best_f64_codec(&self) -> Option<&'static str> {
+		self.f64_values().map(|f| crate::floatcodec::best_f64_codec(&f).0)
+	}
+
 	/// The smallest realized value-codec footprint for this column — the figure the
 	/// per-column codec selector writes on disk. For a `ScaledI64` column this is
 	/// `min(varint, global bit-pack, per-block adaptive bit-pack, per-block FOR)`; for
@@ -584,5 +646,51 @@ mod tests {
 		// FOR, like the other scaled codecs, is defined only for a ScaledI64 mantissa stream.
 		let floats = encode_column(PhysicalType::F64, &col(&["0.5", "1.5"])).expect("encodes");
 		assert_eq!(floats.for_value_bytes(), None);
+	}
+
+	#[test]
+	fn gorilla_f64_estimate_beats_raw_on_a_stable_exponent_float_column() {
+		// A stable-exponent f64 series the recommender lands on F64 (a sensor drifting around
+		// a fixed base near 1000): consecutive IEEE patterns share sign/exponent/high mantissa
+		// bits, so the XOR codec undercuts the flat 8 B/value the varint payload writes. (A
+		// zero-crossing signal would sweep exponents and Gorilla could not help — an honest
+		// regime boundary, so the fixture stays in the regime where the win is real.)
+		let lits: Vec<String> = (0..256).map(|i| format!("{:.9}", 1000.0 + f64::from(i) * 0.001)).collect();
+		let refs: Vec<&str> = lits.iter().map(String::as_str).collect();
+		let enc = encode_column(PhysicalType::F64, &col(&refs)).expect("encodes");
+		let raw = enc.serialized_bytes();
+		let gorilla = enc.gorilla_f64_bytes().expect("f64 column XOR-codes");
+		assert_eq!(raw, 256 * 8, "raw F64 payload is 8 B/value");
+		assert!(gorilla < raw, "gorilla {gorilla} must beat raw {raw} on a smooth f64 column");
+		// The advisory method decodes back to the exact column via the floatcodec.
+		let decoded = crate::floatcodec::xor_f64_decode(&crate::floatcodec::xor_f64_encode(&enc.f64_values().unwrap()), enc.len());
+		assert_eq!(decoded, enc.f64_values().unwrap());
+	}
+
+	#[test]
+	fn best_f64_advisory_selects_a_codec_no_worse_than_raw() {
+		// The best-of advisory over an F64 column never exceeds the raw payload and names the
+		// winning codec.
+		let lits: Vec<String> = (0..256).map(|i| format!("{:.9}", 1000.0 + f64::from(i) * 0.001)).collect();
+		let refs: Vec<&str> = lits.iter().map(String::as_str).collect();
+		let enc = encode_column(PhysicalType::F64, &col(&refs)).expect("encodes");
+		let best = enc.best_f64_bytes().expect("f64 column has a best codec");
+		assert!(best <= enc.serialized_bytes(), "best {best} must not exceed raw {}", enc.serialized_bytes());
+		assert!(best <= enc.gorilla_f64_bytes().unwrap(), "best must not exceed the gorilla-only figure");
+		let name = enc.best_f64_codec().expect("f64 column names a codec");
+		assert!(matches!(name, "gorilla" | "chimp" | "raw"), "codec name {name} must be a known f64 codec");
+		// A scaled column has no f64 codec at all.
+		let scaled = encode_column(PhysicalType::ScaledI64 { scale: 2 }, &col(&["1.25", "2.50"])).expect("encodes");
+		assert_eq!(scaled.best_f64_bytes(), None);
+		assert_eq!(scaled.best_f64_codec(), None);
+	}
+
+	#[test]
+	fn gorilla_f64_estimate_is_none_for_non_f64_columns() {
+		// The XOR codec is defined only for the raw IEEE-754 payload — a scaled-integer
+		// column has no f64 stream to XOR.
+		let scaled = encode_column(PhysicalType::ScaledI64 { scale: 2 }, &col(&["1.25", "2.50"])).expect("encodes");
+		assert_eq!(scaled.f64_values(), None);
+		assert_eq!(scaled.gorilla_f64_bytes(), None);
 	}
 }
