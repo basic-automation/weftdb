@@ -491,7 +491,7 @@ mod tests {
 		// bytes/point; a result without one (the sample default) shows em-dashes so
 		// the columns stay aligned. The header always carries the two storage cells.
 		let mut with_storage = sample_result("dsp", true);
-		with_storage.storage = Some(crate::schema::StorageEstimate { physical_type: "scaled_i64".to_string(), value_count: 200, estimated_value_bytes: 1600, realized_value_bytes: 420, value_codec: "varint".to_string(), bytes_per_point: 2.1, is_exact: true, lossy_count: 0, max_abs_error: "0".to_string(), tolerance: "0".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 208, timestamp_bytes_per_point: 1.04, total_bytes_per_point: 3.14 });
+		with_storage.storage = Some(crate::schema::StorageEstimate { physical_type: "scaled_i64".to_string(), value_count: 200, estimated_value_bytes: 1600, realized_value_bytes: 420, value_codec: "varint".to_string(), bytes_per_point: 2.1, is_exact: true, lossy_count: 0, max_abs_error: "0".to_string(), tolerance: "0".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 208, timestamp_bytes_per_point: 1.04, total_bytes_per_point: 3.14, advisory_gorilla_f64_bytes: None });
 		let report = BenchReport::with_results(metadata(), vec![with_storage, sample_result("baseline-linear", true)]);
 		let html = report.to_html();
 		assert!(html.contains("<th>enc</th><th>val B/pt</th><th>tot B/pt</th>"), "header must carry storage columns: {html}");
@@ -507,7 +507,7 @@ mod tests {
 		// A non-exact encoding pick is flagged with a trailing `*` so a lossy storage
 		// choice is visible at a glance in the table.
 		let mut r = sample_result("dsp", true);
-		r.storage = Some(crate::schema::StorageEstimate { physical_type: "f64".to_string(), value_count: 10, estimated_value_bytes: 80, realized_value_bytes: 80, value_codec: "varint".to_string(), bytes_per_point: 8.0, is_exact: false, lossy_count: 3, max_abs_error: "0.0001".to_string(), tolerance: "0.001".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 12, timestamp_bytes_per_point: 1.2, total_bytes_per_point: 9.2 });
+		r.storage = Some(crate::schema::StorageEstimate { physical_type: "f64".to_string(), value_count: 10, estimated_value_bytes: 80, realized_value_bytes: 80, value_codec: "varint".to_string(), bytes_per_point: 8.0, is_exact: false, lossy_count: 3, max_abs_error: "0.0001".to_string(), tolerance: "0.001".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 12, timestamp_bytes_per_point: 1.2, total_bytes_per_point: 9.2, advisory_gorilla_f64_bytes: Some(64) });
 		let html = BenchReport::with_results(metadata(), vec![r]).to_html();
 		assert!(html.contains("<td>f64*</td><td>8.00</td><td>9.20</td>"), "lossy encoding must be flagged: {html}");
 	}
