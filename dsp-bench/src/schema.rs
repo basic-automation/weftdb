@@ -45,9 +45,13 @@ use crate::{
 /// `storage.advisory_gorilla_f64_bytes` (the advisory Gorilla XOR estimate for an `F64`
 /// value column — the *potential* saving of adopting the f64 XOR codec, `None` for any
 /// non-`F64` encoding; not the realized figure, since the f64 codec is not yet on disk,
-/// exactly as `advisory_for_value_bytes` surfaced FOR before it was adopted). All
-/// optional fields are `#[serde(default)]`, so older artifacts still deserialize.
-pub const SCHEMA_VERSION: u32 = 11;
+/// exactly as `advisory_for_value_bytes` surfaced FOR before it was adopted). v12
+/// generalized that advisory from Gorilla-only to the **best-of** {raw, gorilla, chimp}
+/// f64 codecs — the field became `storage.advisory_best_f64_bytes` and gained a companion
+/// `storage.advisory_best_f64_codec` (which of the three wins) — so the benchmark surfaces
+/// the *best* available f64 saving, the figure an adopt decision needs. All optional fields
+/// are `#[serde(default)]`, so older artifacts still deserialize.
+pub const SCHEMA_VERSION: u32 = 12;
 
 /// Metadata describing the dataset a result was measured against.
 ///
@@ -211,19 +215,26 @@ pub struct StorageEstimate {
 	/// The headline north-star figure: value + timestamp bytes/point.
 	#[serde(default)]
 	pub total_bytes_per_point: f64,
-	/// **Advisory** Gorilla-XOR footprint of the value column when the selected encoding
-	/// is `F64` — the *potential* saving of adopting the f64 XOR value codec
-	/// ([`ColumnEncoding::gorilla_f64_bytes`](dsp_physical_type::ColumnEncoding::gorilla_f64_bytes)),
-	/// `None` for any non-`F64` encoding. An `F64` value column has no realized
-	/// compression today (its `.dspseg` payload is the raw 8 B/value IEEE pattern, so
-	/// [`realized_value_bytes`](Self::realized_value_bytes) is `8 * value_count`); this
-	/// field reports what the Gorilla XOR codec *would* store, so a lossy-tolerance
-	/// benchmark surfaces the f64-compression opportunity. Advisory only — the codec is
-	/// not yet wired into the `.dspseg` writer (the adopt-or-drop slice, gated on a
-	/// Chimp/Elf/ALP comparison), mirroring how `advisory_for_value_bytes` surfaced FOR
-	/// at v9 before it was adopted. `None` on a pre-v11 artifact.
+	/// **Advisory** best-of f64 codec footprint of the value column when the selected
+	/// encoding is `F64` — the *potential* saving of adopting an f64 value codec, the
+	/// smallest of the Gorilla XOR, Chimp XOR, and uncompressed `raw` candidates
+	/// ([`ColumnEncoding::best_f64_bytes`](dsp_physical_type::ColumnEncoding::best_f64_bytes)),
+	/// `None` for any non-`F64` encoding. An `F64` value column has no realized compression
+	/// today (its `.dspseg` payload is the raw 8 B/value IEEE pattern, so
+	/// [`realized_value_bytes`](Self::realized_value_bytes) is `8 * value_count`); this field
+	/// reports what the best available f64 codec *would* store, so a lossy-tolerance
+	/// benchmark surfaces the f64-compression opportunity. Advisory only — no f64 codec is
+	/// wired into the `.dspseg` writer yet (the adopt-or-drop slice, gated on the Chimp128 /
+	/// Elf / ALP comparison), mirroring how `advisory_for_value_bytes` surfaced FOR at v9
+	/// before it was adopted. `None` on a pre-v11 artifact.
 	#[serde(default)]
-	pub advisory_gorilla_f64_bytes: Option<usize>,
+	pub advisory_best_f64_bytes: Option<usize>,
+	/// Which f64 codec [`advisory_best_f64_bytes`](Self::advisory_best_f64_bytes) reflects —
+	/// `"gorilla"`, `"chimp"`, or `"raw"` (the plain layout, when the column is
+	/// incompressible and both XOR codecs would exceed it). `None` for any non-`F64`
+	/// encoding or a pre-v12 artifact.
+	#[serde(default)]
+	pub advisory_best_f64_codec: Option<String>,
 }
 
 impl StorageEstimate {
@@ -271,12 +282,13 @@ impl StorageEstimate {
 		};
 		let timestamp_bytes_per_point = per_point(timestamp_bytes, timestamps.len());
 
-		// Advisory: for an F64 column, what the (not-yet-realized) Gorilla XOR value codec
-		// would store — the potential f64-compression saving. `None` for every other
-		// encoding (the scaled/text payloads are not XOR-compressible).
-		let advisory_gorilla_f64_bytes = enc.gorilla_f64_bytes();
+		// Advisory: for an F64 column, what the (not-yet-realized) best-of f64 codec would
+		// store and which codec that is — the potential f64-compression saving. `None` for
+		// every other encoding (the scaled/text payloads are not XOR-compressible).
+		let advisory_best_f64_bytes = enc.best_f64_bytes();
+		let advisory_best_f64_codec = enc.best_f64_codec().map(str::to_string);
 
-		Self { physical_type: enc.physical_type.name().to_string(), value_count, estimated_value_bytes, realized_value_bytes, value_codec, bytes_per_point, is_exact: enc.is_exact(), lossy_count: enc.lossy_count, max_abs_error: enc.max_abs_error.to_string(), tolerance: tolerance.to_string(), timestamp_unit: unit.name().to_string(), timestamp_encoding: timestamp_encoding.to_string(), timestamp_bytes, timestamp_bytes_per_point, total_bytes_per_point: bytes_per_point + timestamp_bytes_per_point, advisory_gorilla_f64_bytes }
+		Self { physical_type: enc.physical_type.name().to_string(), value_count, estimated_value_bytes, realized_value_bytes, value_codec, bytes_per_point, is_exact: enc.is_exact(), lossy_count: enc.lossy_count, max_abs_error: enc.max_abs_error.to_string(), tolerance: tolerance.to_string(), timestamp_unit: unit.name().to_string(), timestamp_encoding: timestamp_encoding.to_string(), timestamp_bytes, timestamp_bytes_per_point, total_bytes_per_point: bytes_per_point + timestamp_bytes_per_point, advisory_best_f64_bytes, advisory_best_f64_codec }
 	}
 }
 
@@ -354,7 +366,7 @@ mod tests {
 
 	fn sample_result() -> BenchResult {
 		let samples = [100, 200, 300];
-		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "dsp".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: Some(SignalShape::MultiSine) }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true }, accuracy: Some(AccuracyMetrics { count: 1000, rmse: 1.5, mae: 1.1, max_abs_error: 4.2, bias: -0.3 }), storage: Some(StorageEstimate { physical_type: "scaled_i64".to_string(), value_count: 200, estimated_value_bytes: 1600, realized_value_bytes: 420, value_codec: "varint".to_string(), bytes_per_point: 2.1, is_exact: true, lossy_count: 0, max_abs_error: "0".to_string(), tolerance: "0".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 208, timestamp_bytes_per_point: 1.04, total_bytes_per_point: 3.14, advisory_gorilla_f64_bytes: None }) }
+		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "dsp".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: Some(SignalShape::MultiSine) }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true }, accuracy: Some(AccuracyMetrics { count: 1000, rmse: 1.5, mae: 1.1, max_abs_error: 4.2, bias: -0.3 }), storage: Some(StorageEstimate { physical_type: "scaled_i64".to_string(), value_count: 200, estimated_value_bytes: 1600, realized_value_bytes: 420, value_codec: "varint".to_string(), bytes_per_point: 2.1, is_exact: true, lossy_count: 0, max_abs_error: "0".to_string(), tolerance: "0".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 208, timestamp_bytes_per_point: 1.04, total_bytes_per_point: 3.14, advisory_best_f64_bytes: None, advisory_best_f64_codec: None }) }
 	}
 
 	#[test]
@@ -623,11 +635,11 @@ mod tests {
 	}
 
 	#[test]
-	fn advisory_gorilla_f64_surfaces_on_a_lossy_f64_column() {
+	fn advisory_best_f64_surfaces_on_a_lossy_f64_column() {
 		// A stable-exponent series (near 1000, varying in the 7th decimal) benchmarked
 		// under a tolerance that F32's ~6e-5 resolution near 1000 cannot meet but F64 can
 		// lands on the lossy F64 encoding. That column has no realized compression today
-		// (raw 8 B/value), but the advisory Gorilla figure surfaces the f64-compression
+		// (raw 8 B/value), but the advisory best-of figure surfaces the f64-compression
 		// opportunity — the benchmark artifact backing a future adopt decision.
 		use std::str::FromStr;
 		let values: Vec<BigDecimal> = (0..256).map(|i| BigDecimal::from_str(&format!("1000.0000{i:03}")).unwrap()).collect();
@@ -636,14 +648,16 @@ mod tests {
 		let est = StorageEstimate::from_values(&values, &tolerance);
 		assert_eq!(est.physical_type, "f64", "a tolerance below F32's resolution but above F64's picks the lossy F64 encoding");
 		assert_eq!(est.realized_value_bytes, 256 * 8, "F64 has no realized compression: raw 8 B/value");
-		let advisory = est.advisory_gorilla_f64_bytes.expect("F64 column carries the advisory Gorilla figure");
-		// Measured: advisory Gorilla 1125 B vs raw 2048 B — a ~45% saving on this
-		// stable-exponent f64 column, the opportunity a future adopt-or-drop slice weighs.
-		assert!(advisory < est.realized_value_bytes, "advisory Gorilla {advisory} must undercut the raw {} on a stable-exponent series", est.realized_value_bytes);
+		let advisory = est.advisory_best_f64_bytes.expect("F64 column carries the advisory best-of figure");
+		// The best-of advisory undercuts the raw 2048 B on this stable-exponent column
+		// (Gorilla wins ~45%), and its codec label names the winner.
+		assert!(advisory < est.realized_value_bytes, "advisory best-of {advisory} must undercut the raw {} on a stable-exponent series", est.realized_value_bytes);
+		let codec = est.advisory_best_f64_codec.as_deref().expect("F64 column names its best codec");
+		assert!(matches!(codec, "gorilla" | "chimp" | "raw"), "advisory codec {codec} must be a known f64 codec");
 	}
 
 	#[test]
-	fn advisory_gorilla_f64_is_absent_for_a_scaled_column() {
+	fn advisory_best_f64_is_absent_for_a_scaled_column() {
 		// The advisory is defined only for the raw IEEE-754 payload — an exact
 		// decimal column that lands on ScaledI64 carries no f64 XOR figure.
 		use std::str::FromStr;
@@ -652,7 +666,8 @@ mod tests {
 		let values: Vec<BigDecimal> = ["0.1", "0.2", "0.3"].iter().map(|s| BigDecimal::from_str(s).unwrap()).collect();
 		let est = StorageEstimate::from_values(&values, &BigDecimal::from(0));
 		assert_eq!(est.physical_type, "scaled_i64");
-		assert_eq!(est.advisory_gorilla_f64_bytes, None);
+		assert_eq!(est.advisory_best_f64_bytes, None);
+		assert_eq!(est.advisory_best_f64_codec, None);
 	}
 
 	#[test]
