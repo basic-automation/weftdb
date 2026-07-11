@@ -49,9 +49,12 @@ use crate::{
 /// generalized that advisory from Gorilla-only to the **best-of** {raw, gorilla, chimp}
 /// f64 codecs — the field became `storage.advisory_best_f64_bytes` and gained a companion
 /// `storage.advisory_best_f64_codec` (which of the three wins) — so the benchmark surfaces
-/// the *best* available f64 saving, the figure an adopt decision needs. All optional fields
-/// are `#[serde(default)]`, so older artifacts still deserialize.
-pub const SCHEMA_VERSION: u32 = 12;
+/// the *best* available f64 saving, the figure an adopt decision needs. v13 added the faithful
+/// **Chimp128** (128-value reference window) f64 codec to that best-of, so
+/// `advisory_best_f64_codec` may now report `"chimp128"` (the JSON shape is unchanged — the
+/// candidate set widened). All optional fields are `#[serde(default)]`, so older artifacts
+/// still deserialize.
+pub const SCHEMA_VERSION: u32 = 13;
 
 /// Metadata describing the dataset a result was measured against.
 ///
@@ -217,7 +220,7 @@ pub struct StorageEstimate {
 	pub total_bytes_per_point: f64,
 	/// **Advisory** best-of f64 codec footprint of the value column when the selected
 	/// encoding is `F64` — the *potential* saving of adopting an f64 value codec, the
-	/// smallest of the Gorilla XOR, Chimp XOR, and uncompressed `raw` candidates
+	/// smallest of the Gorilla XOR, Chimp XOR, Chimp128, and uncompressed `raw` candidates
 	/// ([`ColumnEncoding::best_f64_bytes`](dsp_physical_type::ColumnEncoding::best_f64_bytes)),
 	/// `None` for any non-`F64` encoding. An `F64` value column has no realized compression
 	/// today (its `.dspseg` payload is the raw 8 B/value IEEE pattern, so
@@ -230,8 +233,8 @@ pub struct StorageEstimate {
 	#[serde(default)]
 	pub advisory_best_f64_bytes: Option<usize>,
 	/// Which f64 codec [`advisory_best_f64_bytes`](Self::advisory_best_f64_bytes) reflects —
-	/// `"gorilla"`, `"chimp"`, or `"raw"` (the plain layout, when the column is
-	/// incompressible and both XOR codecs would exceed it). `None` for any non-`F64`
+	/// `"gorilla"`, `"chimp"`, `"chimp128"`, or `"raw"` (the plain layout, when the column is
+	/// incompressible and every XOR codec would exceed it). `None` for any non-`F64`
 	/// encoding or a pre-v12 artifact.
 	#[serde(default)]
 	pub advisory_best_f64_codec: Option<String>,
@@ -653,7 +656,7 @@ mod tests {
 		// (Gorilla wins ~45%), and its codec label names the winner.
 		assert!(advisory < est.realized_value_bytes, "advisory best-of {advisory} must undercut the raw {} on a stable-exponent series", est.realized_value_bytes);
 		let codec = est.advisory_best_f64_codec.as_deref().expect("F64 column names its best codec");
-		assert!(matches!(codec, "gorilla" | "chimp" | "raw"), "advisory codec {codec} must be a known f64 codec");
+		assert!(matches!(codec, "gorilla" | "chimp" | "chimp128" | "raw"), "advisory codec {codec} must be a known f64 codec");
 	}
 
 	#[test]
