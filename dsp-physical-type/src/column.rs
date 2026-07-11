@@ -243,7 +243,7 @@ impl ColumnEncoding {
 	}
 
 	/// The name of the codec [`best_f64_bytes`](Self::best_f64_bytes) selects for an `F64`
-	/// column — `"chimp"`, `"gorilla"`, or `"raw"` (see
+	/// column — `"chimp128"`, `"chimp"`, `"gorilla"`, or `"raw"` (see
 	/// [`crate::floatcodec::best_f64_codec`]). `None` for any other physical type.
 	#[must_use]
 	pub fn best_f64_codec(&self) -> Option<&'static str> {
@@ -678,7 +678,7 @@ mod tests {
 		assert!(best <= enc.serialized_bytes(), "best {best} must not exceed raw {}", enc.serialized_bytes());
 		assert!(best <= enc.gorilla_f64_bytes().unwrap(), "best must not exceed the gorilla-only figure");
 		let name = enc.best_f64_codec().expect("f64 column names a codec");
-		assert!(matches!(name, "gorilla" | "chimp" | "raw"), "codec name {name} must be a known f64 codec");
+		assert!(matches!(name, "gorilla" | "chimp" | "chimp128" | "raw"), "codec name {name} must be a known f64 codec");
 		// A scaled column has no f64 codec at all.
 		let scaled = encode_column(PhysicalType::ScaledI64 { scale: 2 }, &col(&["1.25", "2.50"])).expect("encodes");
 		assert_eq!(scaled.best_f64_bytes(), None);
