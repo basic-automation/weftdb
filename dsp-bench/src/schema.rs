@@ -13,7 +13,7 @@
 //! result artifacts remain interpretable.
 
 use bigdecimal::BigDecimal;
-use dsp_physical_type::{encode_delta_of_delta, recommend_encoding, TimeUnit};
+use dsp_physical_type::{encode_delta_of_delta, fire_estimated_bytes, recommend_encoding, TimeUnit};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -52,9 +52,11 @@ use crate::{
 /// the *best* available f64 saving, the figure an adopt decision needs. v13 added the faithful
 /// **Chimp128** (128-value reference window) f64 codec to that best-of, so
 /// `advisory_best_f64_codec` may now report `"chimp128"` (the JSON shape is unchanged — the
-/// candidate set widened). All optional fields are `#[serde(default)]`, so older artifacts
-/// still deserialize.
-pub const SCHEMA_VERSION: u32 = 13;
+/// candidate set widened). v14 added `storage.advisory_fire_timestamp_bytes` — the Sprintz FIRE
+/// forecaster's footprint on the timestamp column, the potential saving of a learned-coefficient
+/// predictor over the realized delta-of-delta. All optional fields are `#[serde(default)]`, so
+/// older artifacts still deserialize.
+pub const SCHEMA_VERSION: u32 = 14;
 
 /// Metadata describing the dataset a result was measured against.
 ///
@@ -238,6 +240,17 @@ pub struct StorageEstimate {
 	/// encoding or a pre-v12 artifact.
 	#[serde(default)]
 	pub advisory_best_f64_codec: Option<String>,
+	/// **Advisory** footprint of the timestamp column under the **Sprintz FIRE** forecaster
+	/// ([`fire_estimated_bytes`]) — the *potential* saving of a FIRE predictor over the realized
+	/// delta-of-delta [`timestamp_bytes`](Self::timestamp_bytes). FIRE generalizes
+	/// delta-of-delta with a learned fractional coefficient, so on an irregular timestamp column
+	/// whose interval drifts (rather than jumps) it can undercut the fixed second-difference
+	/// predictor; when it cannot, this figure simply matches or exceeds `timestamp_bytes` — an
+	/// honest, benchmark-visible answer to "does FIRE help this corpus?". `None` when no
+	/// timestamps were supplied or on a pre-v14 artifact. Advisory only — FIRE is not wired into
+	/// any on-disk selector.
+	#[serde(default)]
+	pub advisory_fire_timestamp_bytes: Option<usize>,
 }
 
 impl StorageEstimate {
@@ -284,6 +297,9 @@ impl StorageEstimate {
 			(dod.best_estimated_bytes(), dod.best_encoding_name())
 		};
 		let timestamp_bytes_per_point = per_point(timestamp_bytes, timestamps.len());
+		// Advisory: the FIRE forecaster's footprint on the same timestamp column — the potential
+		// saving of a learned-coefficient predictor over the realized delta-of-delta best.
+		let advisory_fire_timestamp_bytes = (!timestamps.is_empty()).then(|| fire_estimated_bytes(timestamps));
 
 		// Advisory: for an F64 column, what the (not-yet-realized) best-of f64 codec would
 		// store and which codec that is — the potential f64-compression saving. `None` for
@@ -291,7 +307,7 @@ impl StorageEstimate {
 		let advisory_best_f64_bytes = enc.best_f64_bytes();
 		let advisory_best_f64_codec = enc.best_f64_codec().map(str::to_string);
 
-		Self { physical_type: enc.physical_type.name().to_string(), value_count, estimated_value_bytes, realized_value_bytes, value_codec, bytes_per_point, is_exact: enc.is_exact(), lossy_count: enc.lossy_count, max_abs_error: enc.max_abs_error.to_string(), tolerance: tolerance.to_string(), timestamp_unit: unit.name().to_string(), timestamp_encoding: timestamp_encoding.to_string(), timestamp_bytes, timestamp_bytes_per_point, total_bytes_per_point: bytes_per_point + timestamp_bytes_per_point, advisory_best_f64_bytes, advisory_best_f64_codec }
+		Self { physical_type: enc.physical_type.name().to_string(), value_count, estimated_value_bytes, realized_value_bytes, value_codec, bytes_per_point, is_exact: enc.is_exact(), lossy_count: enc.lossy_count, max_abs_error: enc.max_abs_error.to_string(), tolerance: tolerance.to_string(), timestamp_unit: unit.name().to_string(), timestamp_encoding: timestamp_encoding.to_string(), timestamp_bytes, timestamp_bytes_per_point, total_bytes_per_point: bytes_per_point + timestamp_bytes_per_point, advisory_best_f64_bytes, advisory_best_f64_codec, advisory_fire_timestamp_bytes }
 	}
 }
 
@@ -369,7 +385,7 @@ mod tests {
 
 	fn sample_result() -> BenchResult {
 		let samples = [100, 200, 300];
-		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "dsp".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: Some(SignalShape::MultiSine) }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true }, accuracy: Some(AccuracyMetrics { count: 1000, rmse: 1.5, mae: 1.1, max_abs_error: 4.2, bias: -0.3 }), storage: Some(StorageEstimate { physical_type: "scaled_i64".to_string(), value_count: 200, estimated_value_bytes: 1600, realized_value_bytes: 420, value_codec: "varint".to_string(), bytes_per_point: 2.1, is_exact: true, lossy_count: 0, max_abs_error: "0".to_string(), tolerance: "0".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 208, timestamp_bytes_per_point: 1.04, total_bytes_per_point: 3.14, advisory_best_f64_bytes: None, advisory_best_f64_codec: None }) }
+		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "dsp".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: Some(SignalShape::MultiSine) }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true }, accuracy: Some(AccuracyMetrics { count: 1000, rmse: 1.5, mae: 1.1, max_abs_error: 4.2, bias: -0.3 }), storage: Some(StorageEstimate { physical_type: "scaled_i64".to_string(), value_count: 200, estimated_value_bytes: 1600, realized_value_bytes: 420, value_codec: "varint".to_string(), bytes_per_point: 2.1, is_exact: true, lossy_count: 0, max_abs_error: "0".to_string(), tolerance: "0".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 208, timestamp_bytes_per_point: 1.04, total_bytes_per_point: 3.14, advisory_best_f64_bytes: None, advisory_best_f64_codec: None, advisory_fire_timestamp_bytes: Some(180) }) }
 	}
 
 	#[test]
@@ -544,6 +560,33 @@ mod tests {
 		assert!((est.total_bytes_per_point - (est.bytes_per_point + est.timestamp_bytes_per_point)).abs() < f64::EPSILON);
 		// The timestamp column is far cheaper than storing raw 8-byte epochs.
 		assert!(est.timestamp_bytes_per_point < 8.0);
+	}
+
+	#[test]
+	fn advisory_fire_timestamp_surfaces_and_beats_dod_on_a_drifting_interval() {
+		// The FIRE advisory answers "does a learned-coefficient predictor help this timestamp
+		// column?" on a real corpus. A geometric-velocity interval (the interval itself decays
+		// like the increment-3 corpus) is FIRE's regime: it undercuts the realized
+		// delta-of-delta figure. `from_values` (no timestamps) carries no FIRE advisory.
+		use std::str::FromStr;
+		let values: Vec<BigDecimal> = (0..400).map(|i| BigDecimal::from_str(&format!("{}.5", i % 7)).unwrap()).collect();
+		let mut timestamps = Vec::with_capacity(400);
+		let mut t = 0_i64;
+		let mut v = 0_i64;
+		for i in 0..400_i64 {
+			if i % 40 == 0 {
+				v += 4_000_000;
+			}
+			v = v * 7 / 8;
+			t += v + 1; // strictly increasing epochs
+			timestamps.push(t);
+		}
+		let est = StorageEstimate::from_columns(&values, &timestamps, TimeUnit::Micros, &BigDecimal::from(0));
+		let fire = est.advisory_fire_timestamp_bytes.expect("a timestamp column carries the FIRE advisory");
+		assert!(fire < est.timestamp_bytes, "FIRE advisory {fire} must undercut the realized dod {} on a drifting interval", est.timestamp_bytes);
+		// No timestamps → no FIRE advisory.
+		let no_ts = StorageEstimate::from_values(&values, &BigDecimal::from(0));
+		assert_eq!(no_ts.advisory_fire_timestamp_bytes, None);
 	}
 
 	#[test]
