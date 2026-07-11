@@ -347,32 +347,324 @@ pub fn chimp_f64_bytes(values: &[f64]) -> usize {
 	chimp_f64_encode(values).len()
 }
 
+/// Chimp128's reference-window size — each value XORs against the best of the previous
+/// `PREVIOUS_VALUES` samples (not only the immediate predecessor), so a value that revisits
+/// an earlier level compresses against *that* level rather than its unrelated neighbour.
+const PREVIOUS_VALUES: usize = 128;
+/// `log2(PREVIOUS_VALUES)` — the bit width of the ring-slot index a windowed reference writes.
+const PREVIOUS_VALUES_LOG2: u32 = 7;
+/// The trailing-zero threshold: a windowed reference is taken only when its XOR carries *more*
+/// than this many trailing zeros. Set to `6 + log2(PREVIOUS_VALUES)`, so the hash key — the low
+/// `THRESHOLD + 1` bits of the value — *guarantees* any hit clears it (two values sharing that
+/// many low bits XOR to at least `THRESHOLD + 1` trailing zeros). *(src: Chimp128, VLDB'22 —
+/// <https://www.vldb.org/pvldb/vol15/p3058-liakos.pdf>)*
+const CHIMP128_THRESHOLD: u32 = 6 + PREVIOUS_VALUES_LOG2;
+
+/// Encode an `f64` column with the **faithful Chimp128** scheme (the 128-value reference
+/// window, the roadmap's next f64 slice above single-predecessor [`chimp_f64_encode`]).
+///
+/// Where Gorilla and depth-1 Chimp XOR each value only against its immediate predecessor,
+/// Chimp128 keeps a ring of the previous [`PREVIOUS_VALUES`] samples and a lookup table keyed
+/// on the low `CHIMP128_THRESHOLD + 1` bits → the ring index of the most recent value with that
+/// low-bit pattern. When that reference's XOR clears [`CHIMP128_THRESHOLD`] trailing zeros the
+/// value compresses against it (naming the slot in `log2(128) = 7` bits); otherwise it falls
+/// back to the immediate predecessor. This is the win the single-predecessor codecs cannot
+/// reach: a signal that oscillates over a small set of levels XORs each sample against the
+/// *same* earlier level instead of its unrelated neighbour.
+///
+/// Four 2-bit flags, packed so the flag falls out of the payload's high bits (no separate flag
+/// write for the windowed cases):
+/// - `00` — the value equals a windowed reference (XOR `== 0`): a 7-bit ring slot (the top two
+///   bits of the 9-bit field are `0`, giving the `00` flag).
+/// - `01` — a windowed reference with a long trailing run: `512·(128 + slot) + 64·leadClass +
+///   significant` in 18 bits (the `128 + slot` top bit supplies the `01`), then the trimmed
+///   `significant` meaningful bits.
+/// - `10` — the immediate predecessor, reusing the previous leading class: the `64 - leading`
+///   low bits.
+/// - `11` — the immediate predecessor, a new leading class: a 3-bit class + the `64 - leading`
+///   low bits.
+///
+/// Bit-exact for every `f64` (it XORs the raw [`f64::to_bits`] pattern — `NaN`, `±inf`,
+/// subnormals, both signed zeros). Exact inverse: [`chimp128_f64_decode`] with the same value
+/// count. **Advisory only** (roadmap Phase 6.1); benchmarked against Gorilla / depth-1 Chimp
+/// before an adopt-or-drop decision realizes a winner on disk. *(src: Chimp128 algorithm —
+/// <https://www.vldb.org/pvldb/vol15/p3058-liakos.pdf> · `DuckDB` Chimp128 impl notes —
+/// <https://github.com/duckdb/duckdb/pull/4878>)*
+#[must_use]
+pub fn chimp128_f64_encode(values: &[f64]) -> Vec<u8> {
+	let mut w = BitWriter::new();
+	let Some((&first, rest)) = values.split_first() else {
+		return Vec::new();
+	};
+	let first_bits = first.to_bits();
+	w.put_bits(first_bits, 64);
+	let mut ring = [0_u64; PREVIOUS_VALUES];
+	ring[0] = first_bits;
+	// Hash: low `CHIMP128_THRESHOLD + 1` bits of a value → the absolute index it was last
+	// stored at (`usize::MAX` marks an empty slot).
+	let mask = (1_u64 << (CHIMP128_THRESHOLD + 1)) - 1;
+	let mut indices = vec![usize::MAX; 1_usize << (CHIMP128_THRESHOLD + 1)];
+	indices[usize::try_from(first_bits & mask).unwrap_or(0)] = 0;
+	// Sentinel: no leading class yet, so the first non-zero XOR cannot take flag `10`.
+	let mut stored_leading = u32::MAX;
+	// `count` is the absolute index of the value being written (1-based; index 0 is the header).
+	for (count, &value) in (1_usize..).zip(rest) {
+		let bits = value.to_bits();
+		let key = usize::try_from(bits & mask).unwrap_or(0);
+		let imm_slot = (count - 1) % PREVIOUS_VALUES;
+		// Prefer a windowed reference whose XOR clears the trailing threshold; else the
+		// immediate predecessor. The `count - cand < PREVIOUS_VALUES` guard keeps the ring
+		// slot unambiguous (the value at `cand % 128` has not been overwritten yet).
+		let cand = indices[key];
+		let windowed = cand != usize::MAX && count - cand < PREVIOUS_VALUES && (bits ^ ring[cand % PREVIOUS_VALUES]).trailing_zeros() > CHIMP128_THRESHOLD;
+		let ref_slot = if windowed { cand % PREVIOUS_VALUES } else { imm_slot };
+		let xor = bits ^ ring[ref_slot];
+		let trailing = xor.trailing_zeros();
+		if xor == 0 {
+			// flag `00` + the 7-bit ring slot (top two of the 9-bit field are 0).
+			w.put_bits(ref_slot as u64, 2 + PREVIOUS_VALUES_LOG2);
+			stored_leading = u32::MAX;
+		} else {
+			let (lead_code, leading) = chimp_leading_class(xor.leading_zeros());
+			if windowed {
+				// flag `01`, packed so the leading `01` falls out of `(128 + slot)`'s top bit.
+				// `significant` is 1..=50 here (trailing > 13), so 6 bits hold it directly.
+				let significant = 64 - leading - trailing;
+				let packed = 512 * (PREVIOUS_VALUES as u64 + ref_slot as u64) + 64 * lead_code + u64::from(significant);
+				w.put_bits(packed, 2 + PREVIOUS_VALUES_LOG2 + 3 + 6);
+				w.put_bits(xor >> trailing, significant);
+				stored_leading = u32::MAX;
+			} else if leading == stored_leading {
+				// flag `10` — reuse the leading class, immediate predecessor.
+				w.put_bits(0b10, 2);
+				w.put_bits(xor, 64 - leading);
+			} else {
+				// flag `11` — new leading class, immediate predecessor.
+				w.put_bits(0b11, 2);
+				w.put_bits(lead_code, 3);
+				w.put_bits(xor, 64 - leading);
+				stored_leading = leading;
+			}
+		}
+		ring[count % PREVIOUS_VALUES] = bits;
+		indices[key] = count;
+	}
+	w.into_bytes()
+}
+
+/// Reconstruct `count` `f64` values from a [`chimp128_f64_encode`] buffer.
+///
+/// Bit-exact for every input. A `count` of `0` yields an empty vector; a truncated buffer
+/// decodes trailing values as if the missing bits were zero rather than panicking. The decoder
+/// maintains the identical 128-value ring, so a windowed reference (`00`/`01`) reads the same
+/// slot the encoder named.
+#[must_use]
+pub fn chimp128_f64_decode(bytes: &[u8], count: usize) -> Vec<f64> {
+	if count == 0 {
+		return Vec::new();
+	}
+	let mut r = BitReader::new(bytes);
+	let first_bits = r.get_bits(64);
+	let mut ring = [0_u64; PREVIOUS_VALUES];
+	ring[0] = first_bits;
+	let mut out = Vec::with_capacity(count);
+	out.push(f64::from_bits(first_bits));
+	let mut stored_leading = 0_u32;
+	// `stored` is the absolute index of the value being decoded (1-based; index 0 is the header).
+	for stored in 1..count {
+		let flag = r.get_bits(2);
+		let bits = match flag {
+			0b00 => {
+				// Windowed reference, value unchanged: the 7-bit ring slot.
+				let slot = usize::try_from(r.get_bits(PREVIOUS_VALUES_LOG2)).unwrap_or(0);
+				ring[slot]
+			}
+			0b01 => {
+				// Windowed reference, long trailing run: slot, leading class, significant length.
+				let slot = usize::try_from(r.get_bits(PREVIOUS_VALUES_LOG2)).unwrap_or(0);
+				let lead_code = usize::try_from(r.get_bits(3)).unwrap_or(0);
+				let leading = CHIMP_LEADING_REPR[lead_code & 7];
+				let significant = u32::try_from(r.get_bits(6)).unwrap_or(0);
+				let trailing = 64 - leading - significant;
+				let meaningful = r.get_bits(significant);
+				// `stored_leading` is intentionally left unchanged: the encoder resets it to a
+				// sentinel after a windowed reference, so it never emits flag `10` (which reads
+				// `stored_leading`) before the next flag `11` re-establishes a real class.
+				ring[slot] ^ (meaningful << trailing)
+			}
+			0b10 => {
+				// Immediate predecessor, reuse leading class.
+				let xor = r.get_bits(64 - stored_leading);
+				ring[(stored - 1) % PREVIOUS_VALUES] ^ xor
+			}
+			_ => {
+				// Immediate predecessor, new leading class.
+				let lead_code = usize::try_from(r.get_bits(3)).unwrap_or(0);
+				stored_leading = CHIMP_LEADING_REPR[lead_code & 7];
+				let xor = r.get_bits(64 - stored_leading);
+				ring[(stored - 1) % PREVIOUS_VALUES] ^ xor
+			}
+		};
+		ring[stored % PREVIOUS_VALUES] = bits;
+		out.push(f64::from_bits(bits));
+	}
+	out
+}
+
+/// The realized byte footprint of [`chimp128_f64_encode`] for `values`. Comparable against
+/// the raw `8 * len`, the Gorilla baseline [`xor_f64_bytes`], and depth-1 [`chimp_f64_bytes`].
+#[must_use]
+pub fn chimp128_f64_bytes(values: &[f64]) -> usize {
+	chimp128_f64_encode(values).len()
+}
+
+/// The number of fractional decimal digits in `v`'s shortest round-trip representation —
+/// `Some(0)` for an integer-valued double, `None` for a non-finite value.
+///
+/// Rust's `{}` formatter prints an `f64` in its shortest round-tripping *decimal* form (never
+/// scientific notation), so the digit count after the point is well defined. This drives the
+/// Elf erasing codec's decimal grid.
+fn decimal_places(v: f64) -> Option<u32> {
+	if !v.is_finite() {
+		return None;
+	}
+	let s = format!("{v}");
+	match s.split_once('.') {
+		Some((_, frac)) => u32::try_from(frac.len()).ok(),
+		None => Some(0),
+	}
+}
+
+/// Restore an erased value to the column's decimal grid: round `x` to `alpha` decimal places.
+///
+/// This is the exact function the [`elf_f64_encode`] erasing loop verifies against, so decode
+/// reproduces every value bit-for-bit — losslessness holds by construction regardless of the
+/// float rounding in the multiply/round/divide.
+fn elf_restore(x: f64, p: f64) -> f64 {
+	(x * p).round() / p
+}
+
+/// Encode an `f64` column with an **Elf-style erasing** codec (roadmap Phase 6.1).
+///
+/// The f64 slice above [`chimp128_f64_encode`]: losslessly zero each value's low,
+/// decimally-insignificant mantissa bits *before* XOR-compressing, so the XOR stream carries
+/// long trailing-zero runs.
+///
+/// Elf's insight (VLDB'23): a double printed to its shortest decimal keeps far more mantissa
+/// bits than the decimal needs, and those low bits are noise that wrecks XOR compression. This
+/// codec shares one **decimal grid** across the column — `alpha`, the maximum fractional-digit
+/// count over all values — and for each value zeroes the largest run of low mantissa bits whose
+/// result still rounds back to the original ([`elf_restore`]). The erased stream is then handed
+/// to the [`chimp128_f64_encode`] backend; the header is a single `alpha` byte, so the metadata
+/// overhead is one byte per column (not per value).
+///
+/// Returns `None` when the codec is **not applicable** — any non-finite value, an implausibly
+/// large `alpha`, or a value that `elf_restore` cannot reproduce even with zero erasing (a float
+/// rounding edge). A `None` column simply is not an Elf candidate; when `Some`, the codec is
+/// bit-exact for every value. **Advisory only** — this is the "evaluate Elf" slice: it reuses the
+/// column-shared-grid, greedy-verified-erase design (faithful bit-level erase per the paper's
+/// closed-form is the residue) and is benchmarked against the XOR codecs before any adopt
+/// decision; nothing is on disk. *(src: Elf, VLDB'23 —
+/// <https://www.vldb.org/pvldb/vol16/p1763-li.pdf>)*
+#[must_use]
+pub fn elf_f64_encode(values: &[f64]) -> Option<Vec<u8>> {
+	if values.is_empty() {
+		return Some(Vec::new());
+	}
+	// Column-shared decimal grid: the widest fractional-digit count over all values.
+	let mut alpha = 0_u32;
+	for &v in values {
+		alpha = alpha.max(decimal_places(v)?);
+	}
+	// f64 shortest reprs never exceed ~17 fractional digits; a larger alpha would overflow the
+	// grid scale, so treat it as not-applicable rather than risk a lossy restore.
+	if alpha > 17 {
+		return None;
+	}
+	let p = 10_f64.powi(i32::try_from(alpha).unwrap_or(0));
+	let mut stored = Vec::with_capacity(values.len());
+	for &v in values {
+		let bits = v.to_bits();
+		// Zero erasing must already reproduce the value; otherwise the grid cannot represent it
+		// losslessly and the codec is not applicable to this column.
+		if elf_restore(f64::from_bits(bits), p).to_bits() != bits {
+			return None;
+		}
+		// Greedily keep the most-erased pattern (largest low-bit run) that still restores exactly.
+		let mut best = bits;
+		for e in 1..=52_u32 {
+			let candidate = (bits >> e) << e;
+			if elf_restore(f64::from_bits(candidate), p).to_bits() == bits {
+				best = candidate;
+			}
+		}
+		stored.push(f64::from_bits(best));
+	}
+	let mut out = Vec::with_capacity(1 + stored.len());
+	out.push(u8::try_from(alpha).unwrap_or(0));
+	out.extend_from_slice(&chimp128_f64_encode(&stored));
+	Some(out)
+}
+
+/// Reconstruct `count` `f64` values from an [`elf_f64_encode`] buffer.
+///
+/// Bit-exact for every value the encoder accepted (the erasing loop verified each against
+/// [`elf_restore`]). A `count` of `0` yields an empty vector; a truncated buffer decodes
+/// trailing values as if the missing bits were zero rather than panicking.
+#[must_use]
+pub fn elf_f64_decode(bytes: &[u8], count: usize) -> Vec<f64> {
+	if count == 0 {
+		return Vec::new();
+	}
+	let alpha = bytes.first().copied().unwrap_or(0);
+	let p = 10_f64.powi(i32::from(alpha));
+	let stored = chimp128_f64_decode(bytes.get(1..).unwrap_or(&[]), count);
+	stored.into_iter().map(|s| elf_restore(s, p)).collect()
+}
+
+/// The realized byte footprint of [`elf_f64_encode`] for `values`, or `None` when the Elf codec
+/// is not applicable to the column. Comparable against the raw `8 * len` and the XOR codecs.
+#[must_use]
+pub fn elf_f64_bytes(values: &[f64]) -> Option<usize> {
+	elf_f64_encode(values).map(|b| b.len())
+}
+
 /// The name of the smallest available `f64` value codec for `values` and its byte
 /// footprint — the choice a codec selector would make.
 ///
-/// Candidates are the two XOR codecs ([`xor_f64_bytes`] Gorilla, [`chimp_f64_bytes`]
-/// Chimp) and the uncompressed `raw` baseline (`8 * len`, what an `F64` `.dspseg` block
-/// writes today). `raw` is a genuine candidate, not just a comparison point: on adversarial
-/// data (every XOR spanning the full width) both XOR codecs *exceed* raw by their flag
-/// overhead, and a real selector must never pick a codec larger than storing the bytes
-/// plainly. Ties resolve to the simpler codec (`raw` > `gorilla` > `chimp`), so an
-/// incompressible column keeps the plain layout.
+/// Candidates are the three XOR codecs ([`xor_f64_bytes`] Gorilla, [`chimp_f64_bytes`]
+/// depth-1 Chimp, [`chimp128_f64_bytes`] Chimp128) and the uncompressed `raw` baseline
+/// (`8 * len`, what an `F64` `.dspseg` block writes today). `raw` is a genuine candidate, not
+/// just a comparison point: on adversarial data (every XOR spanning the full width) the XOR
+/// codecs *exceed* raw by their flag overhead, and a real selector must never pick a codec
+/// larger than storing the bytes plainly. Ties resolve to the simpler codec
+/// (`raw` > `gorilla` > `chimp` > `chimp128`), so a more complex codec wins only when
+/// strictly smaller and an incompressible column keeps the plain layout.
 ///
 /// This is the "benchmark the codecs and pick the winner" step the roadmap requires before
 /// adopting an f64 value codec on disk. **Advisory** — no f64 codec is realized in the
 /// `.dspseg` writer yet.
 #[must_use]
 pub fn best_f64_codec(values: &[f64]) -> (&'static str, usize) {
-	let raw = values.len() * 8;
 	let gorilla = xor_f64_bytes(values);
 	let chimp = chimp_f64_bytes(values);
-	if chimp < raw && chimp < gorilla {
-		("chimp", chimp)
-	} else if gorilla < raw {
-		("gorilla", gorilla)
-	} else {
-		("raw", raw)
+	let chimp128 = chimp128_f64_bytes(values);
+	// Tie-break toward the simpler codec: only replace the incumbent on a strict improvement.
+	let mut name = "raw";
+	let mut best = values.len() * 8;
+	if gorilla < best {
+		name = "gorilla";
+		best = gorilla;
 	}
+	if chimp < best {
+		name = "chimp";
+		best = chimp;
+	}
+	if chimp128 < best {
+		name = "chimp128";
+		best = chimp128;
+	}
+	(name, best)
 }
 
 /// The byte footprint of the smallest available `f64` value codec for `values` — the
@@ -394,8 +686,8 @@ mod tests {
 		}
 	}
 
-	/// Every fixture exercises *both* f64 codecs — the Gorilla baseline and the Chimp-style
-	/// variant must each round-trip bit-exactly.
+	/// Every fixture exercises *all three* f64 codecs — the Gorilla baseline, the depth-1
+	/// Chimp variant, and faithful Chimp128 must each round-trip bit-exactly.
 	fn round_trips(values: &[f64]) {
 		let g = xor_f64_encode(values);
 		assert_bit_exact(values, &xor_f64_decode(&g, values.len()), "gorilla");
@@ -403,6 +695,9 @@ mod tests {
 		let c = chimp_f64_encode(values);
 		assert_bit_exact(values, &chimp_f64_decode(&c, values.len()), "chimp");
 		assert_eq!(chimp_f64_bytes(values), c.len());
+		let c128 = chimp128_f64_encode(values);
+		assert_bit_exact(values, &chimp128_f64_decode(&c128, values.len()), "chimp128");
+		assert_eq!(chimp128_f64_bytes(values), c128.len());
 	}
 
 	#[test]
@@ -539,13 +834,14 @@ mod tests {
 		for series in [&ramp, &walk] {
 			let raw = series.len() * 8;
 			let (name, bytes) = best_f64_codec(series);
-			let expected = raw.min(xor_f64_bytes(series)).min(chimp_f64_bytes(series));
+			let expected = raw.min(xor_f64_bytes(series)).min(chimp_f64_bytes(series)).min(chimp128_f64_bytes(series));
 			assert_eq!(bytes, expected, "selector must pick the true min");
 			assert_eq!(bytes, best_f64_bytes(series));
 			assert!(bytes <= raw, "best {bytes} must never exceed raw {raw}");
 			let claimed = match name {
 				"gorilla" => xor_f64_bytes(series),
 				"chimp" => chimp_f64_bytes(series),
+				"chimp128" => chimp128_f64_bytes(series),
 				_ => raw,
 			};
 			assert_eq!(claimed, bytes, "label {name} must match the chosen size");
@@ -554,15 +850,120 @@ mod tests {
 
 	#[test]
 	fn best_f64_selector_falls_back_to_raw_on_incompressible_data() {
-		// Adversarial: every consecutive pattern XORs to the full 64-bit width, so both XOR
-		// codecs pay their flag overhead on top of 64 bits/value and *exceed* raw. The
-		// selector must fall back to the plain layout rather than pick a codec bigger than raw.
-		let values: Vec<f64> = (0..64).map(|i| f64::from_bits(if i % 2 == 0 { 0x0000_0000_0000_0000 } else { 0xFFFF_FFFF_FFFF_FFFF })).collect();
+		// Adversarial: 64 distinct pseudo-random 64-bit patterns. No value repeats (so no
+		// windowed flag-00 shortcut) and every XOR spans most of the width, so all three XOR
+		// codecs pay their flag overhead on top of ~64 bits/value and *exceed* raw. The selector
+		// must fall back to the plain layout rather than pick a codec bigger than raw.
+		let mut s = 0x9E37_79B9_7F4A_7C15_u64;
+		let values: Vec<f64> = (0..64)
+			.map(|_| {
+				s ^= s << 13;
+				s ^= s >> 7;
+				s ^= s << 17;
+				f64::from_bits(s)
+			})
+			.collect();
 		let raw = values.len() * 8;
 		let (name, bytes) = best_f64_codec(&values);
 		assert_eq!(name, "raw", "incompressible data must fall back to raw");
 		assert_eq!(bytes, raw);
-		assert!(xor_f64_bytes(&values) > raw && chimp_f64_bytes(&values) > raw, "both XOR codecs must exceed raw here");
+		assert!(xor_f64_bytes(&values) > raw && chimp_f64_bytes(&values) > raw && chimp128_f64_bytes(&values) > raw, "all three XOR codecs must exceed raw on incompressible data");
+	}
+
+	#[test]
+	fn chimp128_beats_depth1_codecs_on_a_revisiting_signal() {
+		// Chimp128's decisive regime, unreachable by the single-predecessor codecs: a signal
+		// that cycles over a small set of exact levels with period 4. Each sample's immediate
+		// predecessor is an unrelated level (Gorilla/depth-1 Chimp must XOR against it, paying a
+		// wide meaningful window), but the value exactly four steps back is identical — so the
+		// 128-value reference window finds it (flag `00`, ~9 bits). The levels carry full
+		// mantissas so their low 14 bits differ, keying each to its own ring slot in the hash
+		// (a "nice" value like 1.5 has zero low mantissa bits and would collide — real sensor
+		// levels do not).
+		let cycle = [12.345_678_9_f64, 78.901_234_5, 34.567_890_1, 90.123_456_7];
+		let values: Vec<f64> = (0..256).map(|i| cycle[i % 4]).collect();
+		round_trips(&values);
+		let raw = values.len() * 8;
+		let gorilla = xor_f64_bytes(&values);
+		let chimp = chimp_f64_bytes(&values);
+		let chimp128 = chimp128_f64_bytes(&values);
+		assert!(chimp128 < gorilla, "chimp128 {chimp128} must beat gorilla {gorilla} on a revisiting signal");
+		assert!(chimp128 < chimp, "chimp128 {chimp128} must beat depth-1 chimp {chimp} on a revisiting signal");
+		assert!(chimp128 < raw, "chimp128 {chimp128} must beat raw {raw}");
+		// The selector picks it when it is the strict winner.
+		assert_eq!(best_f64_codec(&values).0, "chimp128", "selector must name chimp128 on its winning regime");
+	}
+
+	#[test]
+	fn chimp128_windowed_flag01_path_round_trips() {
+		// A revisiting signal where each level drifts by a tiny high-mantissa step every cycle,
+		// so the four-back reference XORs to a *nonzero* value with a long trailing-zero run —
+		// exercising the windowed flag-`01` trim branch (not just the exact-repeat flag `00`).
+		let bases = [0x4000_0000_0000_0000_u64, 0x4010_0000_0000_0000, 0x4020_0000_0000_0000, 0x4030_0000_0000_0000];
+		let values: Vec<f64> = (0..256).map(|i| f64::from_bits(bases[i % 4] + ((i as u64 / 4) << 44))).collect();
+		round_trips(&values);
+	}
+
+	#[test]
+	fn chimp128_ring_wraps_past_128_values() {
+		// A series longer than the 128-value window with a long-period revisit (period 96 < 128)
+		// verifies the ring buffer and the `count - cand < PREVIOUS_VALUES` window guard across a
+		// wrap: references older than 128 must be rejected, fresher ones honoured.
+		let values: Vec<f64> = (0..400).map(|i| f64::from(i % 96) * 2.5 + 10.0).collect();
+		round_trips(&values);
+	}
+
+	/// Elf must round-trip bit-exactly on every column it accepts.
+	fn elf_round_trips(values: &[f64]) {
+		let encoded = elf_f64_encode(values).expect("elf accepts this column");
+		let decoded = elf_f64_decode(&encoded, values.len());
+		assert_bit_exact(values, &decoded, "elf");
+		assert_eq!(elf_f64_bytes(values), Some(encoded.len()));
+	}
+
+	#[test]
+	fn elf_round_trips_a_two_decimal_sensor_stream() {
+		// A realistic 2-decimal sensor stream (the Elf regime): each reading needs only two
+		// decimal places, so ~30 low mantissa bits are decimal noise Elf can erase losslessly.
+		// Built as integer/100 so every value is exactly on the 2-decimal grid (accumulating
+		// `i * 0.01` would drift off it and print with spurious extra digits).
+		let values: Vec<f64> = (0..256).map(|i| f64::from(2000 + i) / 100.0).collect();
+		elf_round_trips(&values);
+	}
+
+	#[test]
+	fn elf_beats_the_xor_codecs_on_low_precision_decimals() {
+		// Elf's decisive regime: distinct values carrying only a few significant decimals but
+		// full mantissas. Because they never exactly repeat, Chimp128's reference window cannot
+		// shortcut them — but erasing the decimally-insignificant low bits gives the backend long
+		// trailing-zero XOR runs, so Elf undercuts every raw-mantissa XOR codec.
+		let values: Vec<f64> = (0..256).map(|i| f64::from(10000 + i) / 100.0).collect();
+		elf_round_trips(&values);
+		let raw = values.len() * 8;
+		let elf = elf_f64_bytes(&values).expect("elf applies to a 2-decimal column");
+		let chimp128 = chimp128_f64_bytes(&values);
+		let gorilla = xor_f64_bytes(&values);
+		assert!(elf < raw, "elf {elf} must beat raw {raw}");
+		assert!(elf < chimp128, "elf {elf} must beat chimp128 {chimp128} by erasing decimal noise");
+		assert!(elf < gorilla, "elf {elf} must beat gorilla {gorilla} by erasing decimal noise");
+	}
+
+	#[test]
+	fn elf_is_not_applicable_to_non_finite_values() {
+		// A column with a non-finite value has no decimal grid, so Elf declines rather than
+		// risk a lossy restore — the advisory simply is not a candidate there.
+		let values = [1.0, f64::NAN, 2.0];
+		assert_eq!(elf_f64_encode(&values), None);
+		assert_eq!(elf_f64_bytes(&values), None);
+	}
+
+	#[test]
+	fn elf_round_trips_integers_and_the_empty_column() {
+		// Integer-valued doubles (alpha = 0) restore as identity; the empty column is trivially
+		// applicable.
+		assert_eq!(elf_f64_encode(&[]), Some(Vec::new()));
+		let ints: Vec<f64> = (0..64).map(|i| f64::from(i) * 3.0).collect();
+		elf_round_trips(&ints);
 	}
 
 	#[test]
