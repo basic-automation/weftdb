@@ -188,6 +188,44 @@ impl ColumnEncoding {
 		self.scaled_i64_mantissas().map(|m| crate::timestamp::for_bitpack_bytes(&m, crate::timestamp::BLOCKED_BITPACK_BLOCK))
 	}
 
+	/// The advisory footprint of a **cascade** codec on a `ScaledI64` column: delta-transform
+	/// the mantissas (first differences), *then* pack the differences with the smallest of the
+	/// varint / bit-pack / per-block bit-pack / FOR / run-length codecs. `None` for any other
+	/// physical type.
+	///
+	/// The shipped value codecs ([`best_value_codec`](Self::best_value_codec)) are all
+	/// *single-level* — they pack the raw mantissas. A monotonically **trending** column (a
+	/// counter, a monotone sensor) defeats them: FOR pays the whole run's range, bit-packing
+	/// pays the widest mantissa. The delta transform turns that trend into a near-constant
+	/// difference stream, which the same packers (or RLE, on a constant delta) then crush. This
+	/// is the first slice of the roadmap's cascading-codec item (FOR→delta→bit-pack chains):
+	/// an **advisory** estimate over the same first-difference transform as [`crate::encode_delta`]
+	/// and the shipped packers — not a `.dspseg` codec (a composed on-disk pipeline is the
+	/// residue). The
+	/// first mantissa is the varint anchor; a single-value column has only that anchor.
+	/// *(src: Vortex / `FastLanes` cascading compression — <https://vortex.dev/>)*
+	#[must_use]
+	pub fn delta_cascade_bytes(&self) -> Option<usize> {
+		use crate::timestamp::{bitpack_bytes, blocked_bitpack_bytes, for_bitpack_bytes, rle_encode, rle_varint_bytes, zigzag_varint_bytes, zigzag_varint_len, BLOCKED_BITPACK_BLOCK};
+		let mantissas = self.scaled_i64_mantissas()?;
+		let Some((&first, rest)) = mantissas.split_first() else {
+			return Some(0);
+		};
+		let anchor = zigzag_varint_len(first);
+		if rest.is_empty() {
+			return Some(anchor);
+		}
+		// First differences (the delta transform), wrapping so an extreme swing never panics.
+		let mut deltas = Vec::with_capacity(rest.len());
+		let mut prev = first;
+		for &m in rest {
+			deltas.push(m.wrapping_sub(prev));
+			prev = m;
+		}
+		let packed = zigzag_varint_bytes(&deltas).min(bitpack_bytes(&deltas)).min(blocked_bitpack_bytes(&deltas, BLOCKED_BITPACK_BLOCK)).min(for_bitpack_bytes(&deltas, BLOCKED_BITPACK_BLOCK)).min(rle_varint_bytes(&rle_encode(&deltas)));
+		Some(anchor + packed)
+	}
+
 	/// The raw `f64` values of this column, in input order — `None` for any other
 	/// physical type.
 	///
@@ -646,6 +684,44 @@ mod tests {
 		// FOR, like the other scaled codecs, is defined only for a ScaledI64 mantissa stream.
 		let floats = encode_column(PhysicalType::F64, &col(&["0.5", "1.5"])).expect("encodes");
 		assert_eq!(floats.for_value_bytes(), None);
+	}
+
+	#[test]
+	fn delta_cascade_beats_the_single_level_codecs_on_a_trending_column() {
+		// A monotonically trending mantissa column (a counter climbing by ~7 per step from a
+		// high base) defeats every single-level codec: FOR pays the whole run's range, bit-pack
+		// pays the widest mantissa. The delta cascade turns the trend into a near-constant
+		// difference stream that RLE/bit-pack then crush — the cascading-codec win.
+		let lits: Vec<String> = (0..256).map(|i| format!("{}", 5_000_000_000_i64 + i64::from(i) * 7)).collect();
+		let refs: Vec<&str> = lits.iter().map(String::as_str).collect();
+		let enc = encode_column(PhysicalType::ScaledI64 { scale: 0 }, &col(&refs)).expect("encodes");
+		let cascade = enc.delta_cascade_bytes().expect("scaled column cascades");
+		let single_level = enc.best_serialized_bytes();
+		assert!(cascade < single_level, "delta cascade {cascade} must beat the best single-level codec {single_level} on a trend");
+		// Round-trip: the first-difference transform the estimate measures is losslessly
+		// invertible (cumulative sum from the anchor recovers every mantissa).
+		let mantissas = enc.scaled_i64_mantissas().unwrap();
+		let mut deltas = Vec::new();
+		let mut prev = mantissas[0];
+		for &m in &mantissas[1..] {
+			deltas.push(m.wrapping_sub(prev));
+			prev = m;
+		}
+		let mut recon = vec![mantissas[0]];
+		for &d in &deltas {
+			let next = recon.last().unwrap().wrapping_add(d);
+			recon.push(next);
+		}
+		assert_eq!(recon, mantissas, "the delta transform must round-trip the mantissas");
+	}
+
+	#[test]
+	fn delta_cascade_is_none_for_non_scaled_and_trivial_for_short_columns() {
+		// Defined only for a ScaledI64 mantissa stream; a single value costs just its varint anchor.
+		let floats = encode_column(PhysicalType::F64, &col(&["0.5", "1.5"])).expect("encodes");
+		assert_eq!(floats.delta_cascade_bytes(), None);
+		let one = encode_column(PhysicalType::ScaledI64 { scale: 0 }, &col(&["42"])).expect("encodes");
+		assert_eq!(one.delta_cascade_bytes(), Some(crate::timestamp::zigzag_varint_len(42)));
 	}
 
 	#[test]
