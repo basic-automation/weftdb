@@ -754,6 +754,119 @@ pub fn decode_gorilla_dods(bytes: &[u8], count: usize) -> Vec<i64> {
 	out
 }
 
+/// The fixed-point scale of the FIRE predictor's learned coefficient: the coefficient
+/// `alpha` ranges over `0..=2^FIRE_SHIFT`, representing a slope multiplier in `[0, 1]`.
+/// At `alpha = 2^FIRE_SHIFT` the predictor is exactly delta-of-delta; at `alpha = 0` it is a
+/// plain delta. FIRE adapts between the two per stream.
+const FIRE_SHIFT: i64 = 8;
+/// The upper clamp for the FIRE coefficient — `2^FIRE_SHIFT`, i.e. a multiplier of `1.0`.
+const FIRE_ALPHA_MAX: i64 = 1 << FIRE_SHIFT;
+
+/// Apply the **Sprintz FIRE** (Fast Integer `REgression`) forecaster to an integer stream,
+/// returning the residual stream of the same length.
+///
+/// FIRE generalizes delta-of-delta: instead of the fixed second-difference predictor
+/// `x[i-1] + (x[i-1] - x[i-2])`, it predicts `x[i-1] + alpha·(x[i-1] - x[i-2])` with a learned
+/// fixed-point coefficient `alpha` ([`FIRE_SHIFT`]-scaled), adapted online by a sign-sign LMS
+/// step (`alpha += sign(err)·sign(prev_delta)`, clamped to `[0, 2^FIRE_SHIFT]`). This tracks
+/// the *fractional* slope a mean-reverting or damped series wants — where delta-of-delta
+/// (`alpha = 1`) over-predicts and a plain delta (`alpha = 0`) under-predicts — so residuals
+/// shrink and bit-pack tighter.
+///
+/// The residual layout mirrors [`encode_delta_of_delta`] so the estimate is directly
+/// comparable: `res[0]` is the anchor value verbatim, `res[1]` (if present) is the first
+/// delta, and `res[2..]` are the FIRE prediction residuals. All arithmetic is wrapping `i64`,
+/// so the exact inverse [`fire_reconstruct`] round-trips every stream regardless of overflow.
+/// Advisory (roadmap Phase 6.1) — a benchmarkable estimate, not wired into any on-disk selector.
+/// *(src: Sprintz, ACM TODS'18 — <https://arxiv.org/abs/1808.02515>)*
+#[must_use]
+pub fn fire_residuals(values: &[i64]) -> Vec<i64> {
+	let mut res = Vec::with_capacity(values.len());
+	let Some((&first, rest)) = values.split_first() else {
+		return res;
+	};
+	res.push(first);
+	let Some((&second, tail)) = rest.split_first() else {
+		return res;
+	};
+	res.push(second.wrapping_sub(first));
+	// Start at delta-of-delta (alpha = 1.0); the sign-sign LMS pulls it toward the stream's
+	// true fractional slope.
+	let mut alpha = FIRE_ALPHA_MAX;
+	let mut prev2 = first;
+	let mut prev1 = second;
+	for &value in tail {
+		let delta_prev = prev1.wrapping_sub(prev2);
+		let scaled = alpha.wrapping_mul(delta_prev) >> FIRE_SHIFT;
+		let pred = prev1.wrapping_add(scaled);
+		let err = value.wrapping_sub(pred);
+		res.push(err);
+		// Sign-sign LMS: nudge alpha ±1 toward reducing the error, given the delta's sign.
+		alpha = (alpha + err.signum() * delta_prev.signum()).clamp(0, FIRE_ALPHA_MAX);
+		prev2 = prev1;
+		prev1 = value;
+	}
+	res
+}
+
+/// Reconstruct the original integer stream from a [`fire_residuals`] output — the exact
+/// inverse, mirroring the forecaster's deterministic wrapping `i64` arithmetic.
+#[must_use]
+pub fn fire_reconstruct(residuals: &[i64]) -> Vec<i64> {
+	let mut out = Vec::with_capacity(residuals.len());
+	let Some((&first, rest)) = residuals.split_first() else {
+		return out;
+	};
+	out.push(first);
+	let Some((&first_delta, tail)) = rest.split_first() else {
+		return out;
+	};
+	let second = first.wrapping_add(first_delta);
+	out.push(second);
+	let mut alpha = FIRE_ALPHA_MAX;
+	let mut prev2 = first;
+	let mut prev1 = second;
+	for &err in tail {
+		let delta_prev = prev1.wrapping_sub(prev2);
+		let scaled = alpha.wrapping_mul(delta_prev) >> FIRE_SHIFT;
+		let pred = prev1.wrapping_add(scaled);
+		let value = pred.wrapping_add(err);
+		out.push(value);
+		alpha = (alpha + err.signum() * delta_prev.signum()).clamp(0, FIRE_ALPHA_MAX);
+		prev2 = prev1;
+		prev1 = value;
+	}
+	out
+}
+
+/// The estimated packed footprint of the FIRE-forecast stream.
+///
+/// The anchor (a full 8-byte `i64`) + the first delta (varint) + the smallest of the varint /
+/// global bit-pack / per-block bit-pack codecs over the FIRE residual tail.
+///
+/// Structured exactly like [`DeltaOfDeltaColumn::best_estimated_bytes`] (anchor + first delta +
+/// packed second-order stream) so the two are directly comparable — FIRE wins when its adaptive
+/// coefficient yields a smaller residual tail than the fixed delta-of-delta predictor. Advisory
+/// only. *(src: Sprintz, ACM TODS'18 — <https://arxiv.org/abs/1808.02515>)*
+#[must_use]
+pub fn fire_estimated_bytes(values: &[i64]) -> usize {
+	let residuals = fire_residuals(values);
+	let anchor = 8;
+	match residuals.split_at_checked(2) {
+		Some((head, tail)) => {
+			let first_delta = zigzag_varint_len(head[1]);
+			let packed = zigzag_varint_bytes(tail).min(bitpack_bytes(tail)).min(blocked_bitpack_bytes(tail, BLOCKED_BITPACK_BLOCK));
+			anchor + first_delta + packed
+		}
+		// 0 or 1 values: the anchor (and the first delta if present) is the whole cost.
+		None => match residuals.as_slice() {
+			[] => 0,
+			[_] => anchor,
+			_ => anchor + zigzag_varint_len(residuals[1]),
+		},
+	}
+}
+
 impl DeltaColumn {
 	/// Estimated packed size: the anchor (a full 8-byte `i64`) plus the
 	/// varint-coded delta stream.
@@ -934,6 +1047,62 @@ mod tests {
 	fn time_unit_names_are_stable() {
 		assert_eq!(TimeUnit::Seconds.name(), "seconds");
 		assert_eq!(TimeUnit::Nanos.name(), "nanos");
+	}
+
+	/// Every FIRE fixture must round-trip exactly (the predictor is a deterministic wrapping
+	/// bijection).
+	fn fire_round_trips(values: &[i64]) {
+		let res = fire_residuals(values);
+		assert_eq!(res.len(), values.len(), "residual stream keeps the length");
+		assert_eq!(fire_reconstruct(&res), values, "FIRE must reconstruct the exact stream");
+	}
+
+	#[test]
+	fn fire_round_trips_across_shapes() {
+		fire_round_trips(&[]);
+		fire_round_trips(&[42]);
+		fire_round_trips(&[10, 25]);
+		// Regular, accelerating, mean-reverting, and a stream with large magnitudes near i64
+		// bounds (exercises the wrapping arithmetic).
+		fire_round_trips(&[100, 110, 120, 130, 140]);
+		fire_round_trips(&(0..200).map(|i| i * i).collect::<Vec<_>>());
+		fire_round_trips(&[0, 5, 2, 6, 3, 7, 4, 8, 5, 9]);
+		fire_round_trips(&[i64::MIN, i64::MAX, 0, i64::MIN + 1, i64::MAX - 3]);
+	}
+
+	#[test]
+	fn fire_matches_delta_of_delta_when_the_coefficient_stays_at_one() {
+		// FIRE starts at alpha = 1.0, which IS the delta-of-delta predictor. On a perfectly
+		// linear ramp every FIRE residual past the first delta is zero (dod = 0), and the
+		// coefficient never needs to move — so FIRE degenerates to delta-of-delta exactly.
+		let ramp: Vec<i64> = (0..128).map(|i| 1_000 + i * 7).collect();
+		let res = fire_residuals(&ramp);
+		assert!(res[2..].iter().all(|&r| r == 0), "a linear ramp gives all-zero FIRE residuals");
+		fire_round_trips(&ramp);
+	}
+
+	#[test]
+	fn fire_beats_delta_of_delta_on_a_geometric_velocity_stream() {
+		// FIRE's regime: a stream whose velocity decays geometrically (v[i] ≈ 7/8·v[i-1]), so the
+		// optimal predictor coefficient is a stable *fraction* (~7/8), not 1. Delta-of-delta's
+		// fixed alpha = 1 leaves a residual of -1/8·v[i-1] that grows with the velocity, while
+		// FIRE's learned coefficient converges near 7/8 and drives the residual toward zero.
+		// Periodic velocity impulses sustain the decay across the stream.
+		let mut values = Vec::with_capacity(400);
+		let mut x = 0_i64;
+		let mut v = 0_i64;
+		for i in 0..400_i64 {
+			if i % 40 == 0 {
+				v += 4_000_000;
+			}
+			v = v * 7 / 8;
+			x += v;
+			values.push(x);
+		}
+		fire_round_trips(&values);
+		let dod = encode_delta_of_delta(&values, TimeUnit::Nanos).best_estimated_bytes();
+		let fire = fire_estimated_bytes(&values);
+		assert!(fire < dod, "FIRE {fire} must beat delta-of-delta {dod} on a geometric-velocity stream");
 	}
 
 	#[test]
