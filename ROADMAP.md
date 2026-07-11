@@ -421,12 +421,29 @@ detection within Y% and improving historical query latency by Z."*
     dods are small/near-zero so FOR rarely wins there; the advisory number remains as
     the tripwire if a real corpus ever contradicts that. Round-trip- +
     framed-segment-verified.
-  - [ ] **Sprintz-style FIRE predictor + zero-RLE (value + timestamp columns):** the
-    realized per-block bit-pack is exactly Sprintz's bit-packing stage; add a Sprintz
-    FIRE-style online integer forecaster to shrink residuals before packing and a
-    run-length pass over the resulting zeros. Canonical low-resource IoT time-series
-    compressor; benchmark the residual-bytes win on a real irregular corpus. *(src:
-    Sprintz, ACM TODS'18 — https://arxiv.org/abs/1808.02515)*
+  - [x] **Sprintz-style FIRE predictor + zero-RLE (advisory):** shipped as advisory
+    estimates. `timestamp::fire_residuals`/`fire_reconstruct`/`fire_estimated_bytes` — FIRE
+    (Fast Integer REgression) generalizes delta-of-delta with a learned fixed-point
+    coefficient (sign-sign LMS, `FIRE_SHIFT`=8) adapted online, verified-lossless by the
+    deterministic wrapping-i64 encoder/decoder mirror; the estimate takes the best of
+    {varint, bit-pack, blocked bit-pack, **RLE**} over the residual tail (the zero/run-length
+    half). Surfaced in the bench as `StorageEstimate.advisory_fire_timestamp_bytes` (schema
+    v14) so the FIRE-vs-dod question is answered on the *real* timestamp corpus. Measured
+    54.8% below dod on a constructed geometric-velocity stream. *(src: Sprintz, ACM TODS'18 —
+    https://arxiv.org/abs/1808.02515)*
+  - [ ] **FIRE adopt-or-drop — gate on a REAL-corpus win, do not assume one.** Honest
+    upstream finding: the Sprintz authors themselves and a fresh comparative study report
+    FIRE's improvement over plain delta is *marginal* on real data (the study omits FIRE for
+    that reason). So the constructed 54.8% win is not evidence to adopt — use the shipped
+    `advisory_fire_timestamp_bytes` to check whether FIRE actually beats dod on DSP's real
+    irregular timestamp corpora before wiring it into any on-disk selector; drop it if it does
+    not. *(src: "Lossless Compression of Time Series Data: A Comparative Study", 2025 —
+    https://arxiv.org/html/2510.07015v1 · Sprintz §FIRE — https://arxiv.org/abs/1808.02515)*
+  - [ ] **Evaluate Pcodec as an integer/f64 codec + bench baseline:** the 2025 comparative
+    study finds **Sprintz and Pcodec** give the best ratio/throughput trade-off for integer
+    time-series (Sprintz at Snappy/LZ4 speeds). Pcodec is Rust, columnar, and directly on
+    DSP's scaled-int + f64 hot path — assess it as a codec and as a `dsp-bench` external-format
+    baseline beside Vortex. *(src: https://arxiv.org/html/2510.07015v1)*
   - [x] **Scaled-int value bit-pack codec — realized on disk.** The `.dspseg` value block
     now carries a self-describing codec selector (`VAL_CODEC_VARINT`/`VAL_CODEC_BITPACK`);
     a `ScaledI64` column whose mantissas fixed-width bit-pack below the per-value varint
@@ -474,29 +491,44 @@ detection within Y% and improving historical query latency by Z."*
     decisive win needs the 128-value window below. *(src: Gorilla, VLDB'15
     https://www.vldb.org/pvldb/vol8/p1816-teller.pdf · Chimp, VLDB'22
     https://www.vldb.org/pvldb/vol15/p3058-liakos.pdf)*
-  - [ ] **Faithful Chimp128 (128-value reference window) — the next f64 slice:** XOR each value
-    against the best of the previous 128 (most trailing zeros), not the immediate predecessor.
-    The single-predecessor Chimp shipped above does not spend an index; Chimp128's decisive
-    win comes from a **lookup table keyed on the last 14 trailing bits → the most-recent ring
-    index with that pattern**, so the reference is found in O(1) and named cheaply — implement
-    that table + the 2-bit-flag/4-way serialization faithfully (a naive always-7-bit-index
-    variant loses to depth-1 Chimp, confirmed this run). Benchmark on `dsp-bench` bytes/point.
-    *(src: Chimp128 algorithm — https://www.vldb.org/pvldb/vol15/p3058-liakos.pdf · duckdb
-    Chimp128 impl notes — https://github.com/duckdb/duckdb/pull/4878)*
-  - [ ] **Elf (erasing-based) f64 codec — likely beats Chimp128:** Elf erases the last few
-    mantissa bits (skilfully, losslessly recoverable) *before* XOR so the XOR carries many
-    trailing zeros — reported **14% smaller than Gorilla and 24% smaller than Chimp128** on
-    time-series data (43% / 21% on non-time-series). Given DSP's f64 columns, evaluate Elf as
-    the f64 codec to adopt rather than Chimp128. *(src: Elf, VLDB'23 —
-    https://www.vldb.org/pvldb/vol16/p1763-li.pdf · impl —
-    https://github.com/Spatio-Temporal-Lab/elf)*
-  - [ ] **f64-codec adopt-or-drop decision + on-disk realization:** once Chimp128/Elf are
-    benchmarked against the shipped Gorilla/Chimp, pick the winner, realize it as a
-    `VAL_CODEC_*` in the `.dspseg` value block, and flip `best_f64_codec`/the bench headline —
-    using the FCBench / VLDB'25 comprehensive-eval methodology (bytes/point AND decode
-    throughput, not bytes alone). *(src: comprehensive eval, VLDB'25 —
-    https://www.vldb.org/pvldb/vol18/p4396-hishida.pdf · FCBench —
+  - [x] **Faithful Chimp128 (128-value reference window) — shipped.**
+    `floatcodec::chimp128_f64_encode`/`decode`/`bytes`: a 128-value ring + a lookup table keyed
+    on the low 14 bits → the most-recent ring index with that pattern (reference found in O(1),
+    the trailing-zero threshold guaranteed by the hash), with the 2-bit-flag/4-way serialization
+    faithful (flag packed into the payload's high bits). Bit-exact for every f64; folded into
+    `best_f64_codec` (chosen when strictly smallest) so it flows to the bench
+    `advisory_best_f64_codec`. Measured 82.8% below Gorilla on a period-4 revisiting signal (the
+    regime the single-predecessor codecs cannot reach). *(src: Chimp128 —
+    https://www.vldb.org/pvldb/vol15/p3058-liakos.pdf · duckdb notes —
+    https://github.com/duckdb/duckdb/pull/4878)*
+  - [x] **Elf (erasing-based) f64 codec — shipped (conservative advisory variant).**
+    `floatcodec::elf_f64_encode`/`decode`/`bytes`: a column-shared decimal grid (`alpha` = max
+    fractional digits, one header byte) + a greedy erase that keeps the most-erased low-bit
+    pattern whose `round(·,alpha)` restore reproduces the exact value — verified-lossless by
+    construction — then the Chimp128 backend. Measured 6.7% below Chimp128 on distinct 2-decimal
+    drift. Residue: the **faithful bit-level closed-form erase**, which upstream reports at **12%
+    below Chimp128 / 47% below Chimp** on time-series (my column-grid variant leaves bits on the
+    table). *(src: Elf, VLDB'23 — https://www.vldb.org/pvldb/vol16/p1763-li.pdf · adaptive Elf,
+    arXiv'23 — https://arxiv.org/pdf/2308.11915)*
+  - [ ] **f64-codec adopt: target ALP, not Chimp128/Elf — the state of the art.** Upstream
+    evidence (this run's research): **ALP replaced Chimp128 + Patas in DuckDB**, decodes ~2.6
+    doubles/CPU-cycle, and beats *both* Chimp128 and Elf on compression ratio **and** speed on
+    almost every dataset (Elf/Chimp128 only win where repeated values dominate and precision is
+    highly variable — ALP's `ALPrd` sub-scheme is the fallback there). So the f64 adopt-or-drop
+    should benchmark **ALP** (with the `ALPrd` outlier path) against the shipped
+    Gorilla/Chimp/Chimp128 and the advisory Elf, pick ALP unless a repeated-heavy corpus says
+    otherwise, then realize it as a `VAL_CODEC_*` and flip `best_f64_codec`/the bench headline —
+    **owner sign-off, as with FOR** (it is a headline change). Judge by bytes/point AND decode
+    throughput (FCBench / VLDB'25 methodology). *(src: ALP, SIGMOD'24 —
+    https://dl.acm.org/doi/10.1145/3626717 · DuckDB ALP — https://duckdb.org/library/alp/ ·
+    comprehensive eval, VLDB'25 — https://www.vldb.org/pvldb/vol18/p4396-hishida.pdf · FCBench —
     https://arxiv.org/pdf/2312.10301)*
+  - [ ] **GPU-decode ALP — on DSP's GPU + compression wedge:** a Nov-2025 paper presents a
+    high-throughput **GPU** framework for adaptive lossless f64 compression (ALP-style). Once an
+    ALP-class codec is on disk, a GPU-unpack path pairs directly with DSP's GPU interpolation
+    flagship (decompress-on-device, no host round-trip). Evaluate after the CPU ALP adopt lands.
+    *(src: "A High-Throughput GPU Framework for Adaptive Lossless Compression of Floating-Point
+    Data", arXiv 2511.04140 — https://arxiv.org/pdf/2511.04140)*
   - [ ] **FastLanes "Unified Transposed Layout" for the bit-pack codecs (decode-speed
     slice):** DSP's global/blocked/FOR bit-packers pack scalar LSB-first, so decode is a
     per-value bit loop. FastLanes reorders values into a *transposed* layout targeting a
@@ -508,12 +540,15 @@ detection within Y% and improving historical query latency by Z."*
     Compression Layout, VLDB'23 — https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf)*
   - [ ] **Cascading (recursive) codec composition — FOR→delta→bit-pack chains:** DSP's value
     codecs are single-level (one of varint/bit-pack/blocked/FOR). FastLanes and Vortex apply
-    codecs *recursively* (e.g. FOR reference, then delta, then bit-pack the residual), which
-    is exactly the FOR-then-blocked-bit-pack cascade the advisory FOR estimate points at.
-    Design a small codec-chain descriptor in the `.dspseg` value block so a column can carry
-    a composed pipeline instead of a single tag, and benchmark FOR+bit-pack vs each alone.
-    *(src: Vortex cascading compression — https://vortex.dev/ · FastLanes codec chains, VLDB'23
-    — https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf)*
+    codecs *recursively* (e.g. FOR reference, then delta, then bit-pack the residual). **First
+    slice shipped** as the advisory `ColumnEncoding::delta_cascade_bytes` (delta-transform the
+    mantissas, then best-of {varint, bit-pack, blocked, FOR, RLE} over the differences) — a
+    monotone-trend column that defeats every single-level codec (FOR pays the run's range) drops
+    97.4% (8 B vs 312 B on a 256-pt +7 trend, the trend collapsing to a constant RLE run).
+    Residue: a **codec-chain descriptor in the `.dspseg` value block** so a column carries a
+    composed pipeline (delta+FOR+bit-pack) instead of a single tag, benchmarked FOR+bit-pack vs
+    each alone. *(src: Vortex cascading compression — https://vortex.dev/ · FastLanes codec
+    chains, VLDB'23 — https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf)*
   - [ ] **Evaluate Vortex as a columnar interchange + benchmark reference (Phase 1/4):** Vortex
     (Rust, Arrow-compatible, BtrBlocks-based cascading compression, ALP/FastLanes/FSST
     encodings) reports ~100–200× faster random access and 2–10× faster scans than Parquet+zstd
@@ -848,11 +883,24 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   reliable crash is gone (`cargo test -p dsp-bench --lib` now passes 92/0 on repeated parallel
   runs). The sibling sizers in `optimizations/mod.rs` + `gpu/mod.rs` were already bounded by
   the real work — no change needed there.
-- [x] **f64 value-column codecs (Phase 6.1): Gorilla + Chimp XOR + best-of selector (advisory),
-  bench-surfaced (schema v12).** See the Phase 6.1 f64-codec item; single-predecessor Chimp is
-  not a universal win over Gorilla (honest finding), so the next slices are faithful Chimp128
-  (14-bit-trailing-hash reference window) and Elf (erasing-based, ~14%/24% below Gorilla/Chimp128
-  per VLDB'23) before an adopt-or-drop + on-disk realization.
+- [x] **f64 value-column codecs (Phase 6.1): Gorilla + Chimp + Chimp128 + Elf-style, best-of
+  selector (advisory), bench-surfaced (schema v13).** Faithful **Chimp128** (14-bit-trailing-hash
+  128-value reference window) shipped + folded into `best_f64_codec` (82.8% below Gorilla on a
+  revisiting signal); **Elf-style** erasing codec shipped as a verified-lossless conservative
+  advisory (6.7% below Chimp128 on 2-decimal drift; faithful bit-level erase is the residue). See
+  the Phase 6.1 f64-codec block. **Adopt target is ALP** (replaced Chimp128 in DuckDB, beats both
+  Chimp128 and Elf on ratio+speed) — the adopt-or-drop + on-disk realization is owner-gated (a
+  headline change, as FOR was).
+- [x] **Sprintz FIRE forecaster + zero-RLE (Phase 6.1): shipped advisory + bench-surfaced (schema
+  v14).** `fire_residuals`/`fire_reconstruct`/`fire_estimated_bytes` (learned-coefficient
+  delta-of-delta generalization, verified-lossless) with the RLE zero-run half; surfaced as
+  `StorageEstimate.advisory_fire_timestamp_bytes`. 54.8% below dod on a constructed
+  geometric-velocity stream — but FIRE is *marginal on real data* (upstream + the 2025 comparative
+  study), so adoption is gated on the bench advisory showing a real win.
+- [x] **Cascading codec composition (Phase 6.1): first slice shipped.**
+  `ColumnEncoding::delta_cascade_bytes` (advisory delta→best-packer); 97.4% below the best
+  single-level codec on a monotone-trend column. Residue: an on-disk `.dspseg` codec-chain
+  descriptor.
 - [x] Add p50/p95/p99 + confidence-interval reporting
 - [x] Add physical value types (`F64`, `ScaledI64`, `BigDecimalText` + three more)
 - [x] Prototype columnar segment reads for one aspect type (`database::SegmentStore`)
