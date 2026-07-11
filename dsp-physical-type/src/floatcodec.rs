@@ -518,6 +518,117 @@ pub fn chimp128_f64_bytes(values: &[f64]) -> usize {
 	chimp128_f64_encode(values).len()
 }
 
+/// The number of fractional decimal digits in `v`'s shortest round-trip representation —
+/// `Some(0)` for an integer-valued double, `None` for a non-finite value.
+///
+/// Rust's `{}` formatter prints an `f64` in its shortest round-tripping *decimal* form (never
+/// scientific notation), so the digit count after the point is well defined. This drives the
+/// Elf erasing codec's decimal grid.
+fn decimal_places(v: f64) -> Option<u32> {
+	if !v.is_finite() {
+		return None;
+	}
+	let s = format!("{v}");
+	match s.split_once('.') {
+		Some((_, frac)) => u32::try_from(frac.len()).ok(),
+		None => Some(0),
+	}
+}
+
+/// Restore an erased value to the column's decimal grid: round `x` to `alpha` decimal places.
+///
+/// This is the exact function the [`elf_f64_encode`] erasing loop verifies against, so decode
+/// reproduces every value bit-for-bit — losslessness holds by construction regardless of the
+/// float rounding in the multiply/round/divide.
+fn elf_restore(x: f64, p: f64) -> f64 {
+	(x * p).round() / p
+}
+
+/// Encode an `f64` column with an **Elf-style erasing** codec (roadmap Phase 6.1).
+///
+/// The f64 slice above [`chimp128_f64_encode`]: losslessly zero each value's low,
+/// decimally-insignificant mantissa bits *before* XOR-compressing, so the XOR stream carries
+/// long trailing-zero runs.
+///
+/// Elf's insight (VLDB'23): a double printed to its shortest decimal keeps far more mantissa
+/// bits than the decimal needs, and those low bits are noise that wrecks XOR compression. This
+/// codec shares one **decimal grid** across the column — `alpha`, the maximum fractional-digit
+/// count over all values — and for each value zeroes the largest run of low mantissa bits whose
+/// result still rounds back to the original ([`elf_restore`]). The erased stream is then handed
+/// to the [`chimp128_f64_encode`] backend; the header is a single `alpha` byte, so the metadata
+/// overhead is one byte per column (not per value).
+///
+/// Returns `None` when the codec is **not applicable** — any non-finite value, an implausibly
+/// large `alpha`, or a value that `elf_restore` cannot reproduce even with zero erasing (a float
+/// rounding edge). A `None` column simply is not an Elf candidate; when `Some`, the codec is
+/// bit-exact for every value. **Advisory only** — this is the "evaluate Elf" slice: it reuses the
+/// column-shared-grid, greedy-verified-erase design (faithful bit-level erase per the paper's
+/// closed-form is the residue) and is benchmarked against the XOR codecs before any adopt
+/// decision; nothing is on disk. *(src: Elf, VLDB'23 —
+/// <https://www.vldb.org/pvldb/vol16/p1763-li.pdf>)*
+#[must_use]
+pub fn elf_f64_encode(values: &[f64]) -> Option<Vec<u8>> {
+	if values.is_empty() {
+		return Some(Vec::new());
+	}
+	// Column-shared decimal grid: the widest fractional-digit count over all values.
+	let mut alpha = 0_u32;
+	for &v in values {
+		alpha = alpha.max(decimal_places(v)?);
+	}
+	// f64 shortest reprs never exceed ~17 fractional digits; a larger alpha would overflow the
+	// grid scale, so treat it as not-applicable rather than risk a lossy restore.
+	if alpha > 17 {
+		return None;
+	}
+	let p = 10_f64.powi(i32::try_from(alpha).unwrap_or(0));
+	let mut stored = Vec::with_capacity(values.len());
+	for &v in values {
+		let bits = v.to_bits();
+		// Zero erasing must already reproduce the value; otherwise the grid cannot represent it
+		// losslessly and the codec is not applicable to this column.
+		if elf_restore(f64::from_bits(bits), p).to_bits() != bits {
+			return None;
+		}
+		// Greedily keep the most-erased pattern (largest low-bit run) that still restores exactly.
+		let mut best = bits;
+		for e in 1..=52_u32 {
+			let candidate = (bits >> e) << e;
+			if elf_restore(f64::from_bits(candidate), p).to_bits() == bits {
+				best = candidate;
+			}
+		}
+		stored.push(f64::from_bits(best));
+	}
+	let mut out = Vec::with_capacity(1 + stored.len());
+	out.push(u8::try_from(alpha).unwrap_or(0));
+	out.extend_from_slice(&chimp128_f64_encode(&stored));
+	Some(out)
+}
+
+/// Reconstruct `count` `f64` values from an [`elf_f64_encode`] buffer.
+///
+/// Bit-exact for every value the encoder accepted (the erasing loop verified each against
+/// [`elf_restore`]). A `count` of `0` yields an empty vector; a truncated buffer decodes
+/// trailing values as if the missing bits were zero rather than panicking.
+#[must_use]
+pub fn elf_f64_decode(bytes: &[u8], count: usize) -> Vec<f64> {
+	if count == 0 {
+		return Vec::new();
+	}
+	let alpha = bytes.first().copied().unwrap_or(0);
+	let p = 10_f64.powi(i32::from(alpha));
+	let stored = chimp128_f64_decode(bytes.get(1..).unwrap_or(&[]), count);
+	stored.into_iter().map(|s| elf_restore(s, p)).collect()
+}
+
+/// The realized byte footprint of [`elf_f64_encode`] for `values`, or `None` when the Elf codec
+/// is not applicable to the column. Comparable against the raw `8 * len` and the XOR codecs.
+#[must_use]
+pub fn elf_f64_bytes(values: &[f64]) -> Option<usize> {
+	elf_f64_encode(values).map(|b| b.len())
+}
+
 /// The name of the smallest available `f64` value codec for `values` and its byte
 /// footprint — the choice a codec selector would make.
 ///
@@ -800,6 +911,59 @@ mod tests {
 		// wrap: references older than 128 must be rejected, fresher ones honoured.
 		let values: Vec<f64> = (0..400).map(|i| f64::from(i % 96) * 2.5 + 10.0).collect();
 		round_trips(&values);
+	}
+
+	/// Elf must round-trip bit-exactly on every column it accepts.
+	fn elf_round_trips(values: &[f64]) {
+		let encoded = elf_f64_encode(values).expect("elf accepts this column");
+		let decoded = elf_f64_decode(&encoded, values.len());
+		assert_bit_exact(values, &decoded, "elf");
+		assert_eq!(elf_f64_bytes(values), Some(encoded.len()));
+	}
+
+	#[test]
+	fn elf_round_trips_a_two_decimal_sensor_stream() {
+		// A realistic 2-decimal sensor stream (the Elf regime): each reading needs only two
+		// decimal places, so ~30 low mantissa bits are decimal noise Elf can erase losslessly.
+		// Built as integer/100 so every value is exactly on the 2-decimal grid (accumulating
+		// `i * 0.01` would drift off it and print with spurious extra digits).
+		let values: Vec<f64> = (0..256).map(|i| f64::from(2000 + i) / 100.0).collect();
+		elf_round_trips(&values);
+	}
+
+	#[test]
+	fn elf_beats_the_xor_codecs_on_low_precision_decimals() {
+		// Elf's decisive regime: distinct values carrying only a few significant decimals but
+		// full mantissas. Because they never exactly repeat, Chimp128's reference window cannot
+		// shortcut them — but erasing the decimally-insignificant low bits gives the backend long
+		// trailing-zero XOR runs, so Elf undercuts every raw-mantissa XOR codec.
+		let values: Vec<f64> = (0..256).map(|i| f64::from(10000 + i) / 100.0).collect();
+		elf_round_trips(&values);
+		let raw = values.len() * 8;
+		let elf = elf_f64_bytes(&values).expect("elf applies to a 2-decimal column");
+		let chimp128 = chimp128_f64_bytes(&values);
+		let gorilla = xor_f64_bytes(&values);
+		assert!(elf < raw, "elf {elf} must beat raw {raw}");
+		assert!(elf < chimp128, "elf {elf} must beat chimp128 {chimp128} by erasing decimal noise");
+		assert!(elf < gorilla, "elf {elf} must beat gorilla {gorilla} by erasing decimal noise");
+	}
+
+	#[test]
+	fn elf_is_not_applicable_to_non_finite_values() {
+		// A column with a non-finite value has no decimal grid, so Elf declines rather than
+		// risk a lossy restore — the advisory simply is not a candidate there.
+		let values = [1.0, f64::NAN, 2.0];
+		assert_eq!(elf_f64_encode(&values), None);
+		assert_eq!(elf_f64_bytes(&values), None);
+	}
+
+	#[test]
+	fn elf_round_trips_integers_and_the_empty_column() {
+		// Integer-valued doubles (alpha = 0) restore as identity; the empty column is trivially
+		// applicable.
+		assert_eq!(elf_f64_encode(&[]), Some(Vec::new()));
+		let ints: Vec<f64> = (0..64).map(|i| f64::from(i) * 3.0).collect();
+		elf_round_trips(&ints);
 	}
 
 	#[test]
