@@ -600,7 +600,13 @@ What it does today:
   proving the latency distribution times only the adapter call, never setup.
 - **Storage estimate** — each result carries a `StorageEstimate` (recommended
   encoding + value/timestamp/total **bytes/point**) computed by
-  `dsp-physical-type` over the actual columns.
+  `dsp-physical-type` over the actual columns. It also surfaces **advisory
+  potential-saving** estimates for codecs not yet realized on disk: the best-of
+  f64 value codec (Gorilla / Chimp / **Chimp128** XOR, `advisory_best_f64_bytes` /
+  `_codec`) for a lossy `F64` column, and the **Sprintz FIRE** forecaster's
+  footprint on the timestamp column (`advisory_fire_timestamp_bytes`) — each a
+  *what-if* number the adopt-or-drop decision reads, never a realized headline
+  claim.
 - **Reports** — a `BenchReport` JSON artifact (run metadata + a best-effort
   hardware probe: CPU model, cores, RAM) under `reports/json/`, plus a
   self-contained **HTML** view (`--html`) with the most-accurate row highlighted.
