@@ -842,7 +842,10 @@ pub fn fire_reconstruct(residuals: &[i64]) -> Vec<i64> {
 /// The estimated packed footprint of the FIRE-forecast stream.
 ///
 /// The anchor (a full 8-byte `i64`) + the first delta (varint) + the smallest of the varint /
-/// global bit-pack / per-block bit-pack codecs over the FIRE residual tail.
+/// global bit-pack / per-block bit-pack / **run-length** codecs over the FIRE residual tail. The
+/// RLE candidate is the second half of the Sprintz slice — a run-length pass over the residuals,
+/// which on a stable stream FIRE forecasts to a long run of zeros (a whole tail collapses to a
+/// couple of RLE runs, far below what any bit-packer can reach).
 ///
 /// Structured exactly like [`DeltaOfDeltaColumn::best_estimated_bytes`] (anchor + first delta +
 /// packed second-order stream) so the two are directly comparable — FIRE wins when its adaptive
@@ -855,7 +858,8 @@ pub fn fire_estimated_bytes(values: &[i64]) -> usize {
 	match residuals.split_at_checked(2) {
 		Some((head, tail)) => {
 			let first_delta = zigzag_varint_len(head[1]);
-			let packed = zigzag_varint_bytes(tail).min(bitpack_bytes(tail)).min(blocked_bitpack_bytes(tail, BLOCKED_BITPACK_BLOCK));
+			let rle = rle_varint_bytes(&rle_encode(tail));
+			let packed = zigzag_varint_bytes(tail).min(bitpack_bytes(tail)).min(blocked_bitpack_bytes(tail, BLOCKED_BITPACK_BLOCK)).min(rle);
 			anchor + first_delta + packed
 		}
 		// 0 or 1 values: the anchor (and the first delta if present) is the whole cost.
@@ -1103,6 +1107,25 @@ mod tests {
 		let dod = encode_delta_of_delta(&values, TimeUnit::Nanos).best_estimated_bytes();
 		let fire = fire_estimated_bytes(&values);
 		assert!(fire < dod, "FIRE {fire} must beat delta-of-delta {dod} on a geometric-velocity stream");
+	}
+
+	#[test]
+	fn fire_rle_pass_collapses_a_constant_residual_run() {
+		// Constant acceleration (x = i²) makes FIRE (alpha pinned at 1.0, = delta-of-delta)
+		// produce a constant residual run of 2. The run-length pass — the second half of the
+		// Sprintz slice — collapses that run to a couple of RLE entries, far below the bit-packed
+		// width×count the residuals would otherwise cost, so the FIRE estimate stays fair against
+		// delta-of-delta (which already runs RLE) instead of losing to it.
+		let values: Vec<i64> = (0..400).map(|i| i * i).collect();
+		fire_round_trips(&values);
+		let residuals = fire_residuals(&values);
+		let tail = &residuals[2..];
+		assert!(tail.iter().all(|&r| r == 2), "constant acceleration gives a constant FIRE residual run");
+		let bitpack_only = 8 + zigzag_varint_len(residuals[1]) + bitpack_bytes(tail);
+		let fire = fire_estimated_bytes(&values);
+		assert!(fire * 4 < bitpack_only, "FIRE+RLE {fire} must crush the bitpack-only {bitpack_only} on a constant residual run");
+		let dod = encode_delta_of_delta(&values, TimeUnit::Nanos).best_estimated_bytes();
+		assert!(fire <= dod, "FIRE+RLE {fire} must not exceed delta-of-delta {dod} on constant acceleration");
 	}
 
 	#[test]
