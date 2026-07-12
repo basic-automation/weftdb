@@ -89,7 +89,7 @@ use bigdecimal::{
 	num_bigint::{BigInt, Sign}, BigDecimal, FromPrimitive, ToPrimitive
 };
 pub use catalog::{SegmentDescriptor, SegmentIndex};
-pub use column::{encode_column, recommend_encoding, ColumnEncodeError, ColumnEncoding};
+pub use column::{encode_column, recommend_encoding, CascadeInner, ColumnEncodeError, ColumnEncoding, DeltaCascadePlan};
 pub use dspseg::{crc32, read_paged_segment, read_segment, write_paged_segment, write_segment, ByteReader, ByteWriter, DspSegError};
 pub use floatcodec::{best_f64_bytes, best_f64_codec, chimp128_f64_bytes, chimp128_f64_decode, chimp128_f64_encode, chimp_f64_bytes, chimp_f64_decode, chimp_f64_encode, elf_f64_bytes, elf_f64_decode, elf_f64_encode, xor_f64_bytes, xor_f64_decode, xor_f64_encode};
 pub use nulls::{NullMask, NullMaskError};

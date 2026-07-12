@@ -456,7 +456,7 @@ use std::str::FromStr;
 use bigdecimal::BigDecimal;
 
 use crate::{
-	timestamp::{DeltaOfDeltaColumn, TimeUnit}, ColumnEncoding, PhysicalType, PhysicalValue
+	timestamp::{DeltaOfDeltaColumn, TimeUnit}, CascadeInner, ColumnEncoding, PhysicalType, PhysicalValue
 };
 
 const TAG_F64: u8 = 0;
@@ -533,6 +533,21 @@ const VAL_CODEC_BLOCKED: u8 = 2;
 /// clustered at a high base, or any all-non-negative stream where the unsigned residual
 /// beats zig-zag's sign bit.
 const VAL_CODEC_FOR: u8 = 3;
+/// **Delta cascade** — the first two-level (composed) codec: a zig-zag-varint anchor (the
+/// first mantissa), a one-byte inner-codec descriptor, then the first-difference stream packed
+/// by that inner codec. Written only when strictly smallest — a trending `ScaledI64` column
+/// (counter, monotone sensor) whose magnitude/range every single-level codec pays for, but
+/// whose first differences collapse to a constant the inner packer crushes. The inner codec
+/// descriptor names one of the five [`CascadeInner`] packers over the delta stream.
+const VAL_CODEC_DELTA_CASCADE: u8 = 4;
+
+/// Cascade inner-codec descriptors — the second stage applied to the delta stream. They map
+/// 1:1 to [`CascadeInner`] and mirror the top-level timestamp/value codec framings.
+const CASCADE_INNER_VARINT: u8 = 0;
+const CASCADE_INNER_BITPACK: u8 = 1;
+const CASCADE_INNER_BLOCKED: u8 = 2;
+const CASCADE_INNER_FOR: u8 = 3;
+const CASCADE_INNER_RLE: u8 = 4;
 
 /// Write a [`ColumnEncoding`] as a `.dspseg` value-column block.
 ///
@@ -551,6 +566,29 @@ const VAL_CODEC_FOR: u8 = 3;
 /// every other column keeps the per-value payload. All four codecs are exact and
 /// lossless.
 pub fn write_value_column(w: &mut ByteWriter, col: &ColumnEncoding) {
+	write_value_column_selected(w, col, col.best_value_codec());
+}
+
+/// Write a [`ColumnEncoding`] as a `.dspseg` value block **with the two-level delta cascade
+/// allowed** (the fifth codec, [`VAL_CODEC_DELTA_CASCADE`]).
+///
+/// Identical to [`write_value_column`] except the codec is chosen through
+/// [`ColumnEncoding::best_value_codec_cascading`], so a trending `ScaledI64` column whose
+/// first differences pack below every single-level codec is stored as a delta cascade. The
+/// block is read back by the ordinary [`read_value_column`] (the cascade decode is
+/// unconditional), so a cascade-sealed segment round-trips through the normal read path.
+///
+/// This is **opt-in**: the cascade is a broad realized-bytes change (it beats FOR on FOR's
+/// own clustered fixtures), so folding it into the default seal is owner-gated. Callers that
+/// want it request it explicitly.
+pub fn write_value_column_cascading(w: &mut ByteWriter, col: &ColumnEncoding) {
+	write_value_column_selected(w, col, col.best_value_codec_cascading());
+}
+
+/// Shared value-block writer: emit the header then the payload for the named `codec` (the
+/// output of one of the [`ColumnEncoding`] selectors). Separating the selector from the
+/// serialization lets the default and cascading writers share one exact encoder.
+fn write_value_column_selected(w: &mut ByteWriter, col: &ColumnEncoding, codec: &str) {
 	w.put_u8(physical_type_tag(col.physical_type));
 	match col.physical_type {
 		PhysicalType::ScaledI64 { scale } | PhysicalType::ScaledI128 { scale } => w.put_u8(scale),
@@ -559,7 +597,55 @@ pub fn write_value_column(w: &mut ByteWriter, col: &ColumnEncoding) {
 	w.put_uvarint(col.values.len() as u64);
 	w.put_uvarint(col.lossy_count as u64);
 	w.put_str(&col.max_abs_error.to_plain_string());
-	match col.best_value_codec() {
+	match codec {
+		"scaled_delta_cascade" => {
+			// A trending ScaledI64 column whose first differences pack (via an inner codec)
+			// below every single-level codec (guaranteed by best_value_codec — so
+			// delta_cascade_plan is Some over a scaled mantissa stream).
+			let plan = col.delta_cascade_plan().unwrap_or(crate::DeltaCascadePlan { anchor: 0, deltas: Vec::new(), inner: CascadeInner::Varint, bytes: 0 });
+			w.put_u8(VAL_CODEC_DELTA_CASCADE);
+			w.put_svarint(plan.anchor);
+			match plan.inner {
+				CascadeInner::Bitpack => {
+					let (width, packed) = crate::timestamp::bitpack_encode(&plan.deltas);
+					w.put_u8(CASCADE_INNER_BITPACK);
+					// Width is 0..=64 by construction, so the conversion never saturates.
+					w.put_u8(u8::try_from(width).unwrap_or(64));
+					// Raw (no length prefix): the reader derives the length from (count-1) * width.
+					w.put_raw(&packed);
+				}
+				CascadeInner::Blocked => {
+					let block = crate::timestamp::BLOCKED_BITPACK_BLOCK;
+					w.put_u8(CASCADE_INNER_BLOCKED);
+					w.put_uvarint(block as u64);
+					// Length-prefixed: per-block widths vary (as the top-level blocked block).
+					w.put_bytes(&crate::timestamp::blocked_bitpack_encode(&plan.deltas, block));
+				}
+				CascadeInner::For => {
+					let block = crate::timestamp::BLOCKED_BITPACK_BLOCK;
+					w.put_u8(CASCADE_INNER_FOR);
+					w.put_uvarint(block as u64);
+					// Length-prefixed: per-block references + widths vary (as the top-level FOR block).
+					w.put_bytes(&crate::timestamp::for_bitpack_encode(&plan.deltas, block));
+				}
+				CascadeInner::Rle => {
+					let runs = crate::timestamp::rle_encode(&plan.deltas);
+					w.put_u8(CASCADE_INNER_RLE);
+					w.put_uvarint(runs.len() as u64);
+					for (value, run_len) in runs {
+						w.put_svarint(value);
+						w.put_uvarint(run_len as u64);
+					}
+				}
+				CascadeInner::Varint => {
+					w.put_u8(CASCADE_INNER_VARINT);
+					// Raw (no length prefix): the reader decodes exactly (count-1) svarints.
+					for &delta in &plan.deltas {
+						w.put_svarint(delta);
+					}
+				}
+			}
+		}
 		"scaled_for" => {
 			// A ScaledI64 column whose mantissas FOR-pack below the varint, the global
 			// bit-pack, and the blocked codec (guaranteed by best_value_codec — so
@@ -663,9 +749,76 @@ pub fn read_value_column(r: &mut ByteReader) -> Result<ColumnEncoding, DspSegErr
 			let bytes = r.read_bytes()?;
 			crate::timestamp::for_bitpack_decode(bytes, block, count).into_iter().map(|mantissa| PhysicalValue::ScaledI64 { mantissa, scale }).collect()
 		}
+		VAL_CODEC_DELTA_CASCADE => read_cascade_value_column(r, physical_type, tag, count)?,
 		other => return Err(DspSegError::InvalidTag { kind: "value_codec", value: other }),
 	};
 	Ok(ColumnEncoding { physical_type, values, lossy_count, max_abs_error })
+}
+
+/// Decode a [`VAL_CODEC_DELTA_CASCADE`] value block into its `ScaledI64` values — the
+/// anchor (first mantissa) plus the inner-coded first-difference deltas, cumulatively summed.
+///
+/// Split out of [`read_value_column`] so each stays within one screen. The five inner
+/// descriptors mirror the top-level `ScaledI64` codecs over the delta stream.
+///
+/// # Errors
+///
+/// [`DspSegError::InvalidTag`] for a cascade block on a non-`ScaledI64` column or an
+/// unrecognised inner descriptor; [`DspSegError::UnexpectedEof`] / [`DspSegError::VarintTooLong`]
+/// on a short or malformed stream.
+fn read_cascade_value_column(r: &mut ByteReader, physical_type: PhysicalType, tag: u8, count: usize) -> Result<Vec<PhysicalValue>, DspSegError> {
+	let PhysicalType::ScaledI64 { scale } = physical_type else {
+		return Err(DspSegError::InvalidTag { kind: "value_codec_delta_cascade_type", value: tag });
+	};
+	let anchor = r.read_svarint()?;
+	let delta_count = count.saturating_sub(1);
+	let deltas = match r.read_u8()? {
+		CASCADE_INNER_VARINT => {
+			let mut deltas = Vec::with_capacity(delta_count);
+			for _ in 0..delta_count {
+				deltas.push(r.read_svarint()?);
+			}
+			deltas
+		}
+		CASCADE_INNER_BITPACK => {
+			let width = u32::from(r.read_u8()?);
+			let data_len = (delta_count * width as usize).div_ceil(8);
+			let bytes = r.take(data_len)?;
+			crate::timestamp::bitpack_decode(width, bytes, delta_count)
+		}
+		CASCADE_INNER_BLOCKED => {
+			let block = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+			let bytes = r.read_bytes()?;
+			crate::timestamp::blocked_bitpack_decode(bytes, block, delta_count)
+		}
+		CASCADE_INNER_FOR => {
+			let block = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+			let bytes = r.read_bytes()?;
+			crate::timestamp::for_bitpack_decode(bytes, block, delta_count)
+		}
+		CASCADE_INNER_RLE => {
+			let run_count = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+			let mut runs = Vec::with_capacity(run_count);
+			for _ in 0..run_count {
+				let value = r.read_svarint()?;
+				let run_len = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+				runs.push((value, run_len));
+			}
+			crate::timestamp::rle_decode(&runs)
+		}
+		other => return Err(DspSegError::InvalidTag { kind: "value_codec_cascade_inner", value: other }),
+	};
+	// Reconstruct: the anchor is the first mantissa, each delta the wrapping step to the next.
+	let mut values = Vec::with_capacity(count);
+	if count > 0 {
+		let mut mantissa = anchor;
+		values.push(PhysicalValue::ScaledI64 { mantissa, scale });
+		for &delta in &deltas {
+			mantissa = mantissa.wrapping_add(delta);
+			values.push(PhysicalValue::ScaledI64 { mantissa, scale });
+		}
+	}
+	Ok(values)
 }
 
 // ---------------------------------------------------------------------------
@@ -1435,6 +1588,134 @@ mod tests {
 		let back = read_segment(&bytes).expect("reads");
 		assert_eq!(back, seg, "FOR segment frame must round-trip exactly");
 		assert_eq!(back.version, SEGMENT_FORMAT_VERSION);
+	}
+
+	/// Round-trip a column through the **opt-in cascading** value-column writer and the
+	/// ordinary reader, asserting exact recovery — the cascade decode is unconditional, so a
+	/// cascade-sealed block reads back through the normal path.
+	fn assert_cascading_value_col_round_trips(enc: &ColumnEncoding) {
+		let mut w = ByteWriter::new();
+		write_value_column_cascading(&mut w, enc);
+		let bytes = w.into_vec();
+		let mut r = ByteReader::new(&bytes);
+		let back = read_value_column(&mut r).expect("reads");
+		assert!(r.is_empty(), "cascade value-column block must be fully consumed");
+		assert_eq!(&back, enc, "cascade column must round-trip exactly");
+		assert_eq!(back.decode(), enc.decode());
+	}
+
+	#[test]
+	fn cascade_value_block_round_trips_a_constant_trend_via_rle_inner() {
+		// A pure constant trend (+7/step): the delta stream is 255 sevens, which the RLE inner
+		// codec collapses to one run — the cascading writer selects the cascade and the block
+		// round-trips through the ordinary reader.
+		let lits: Vec<String> = (0..256).map(|i| format!("{}", 5_000_000_000_i64 + i64::from(i) * 7)).collect();
+		let refs: Vec<&str> = lits.iter().map(String::as_str).collect();
+		let enc = crate::encode_column(PhysicalType::ScaledI64 { scale: 0 }, &col(&refs)).expect("encodes");
+		assert_eq!(enc.best_value_codec_cascading(), "scaled_delta_cascade");
+		assert_eq!(enc.delta_cascade_plan().unwrap().inner, CascadeInner::Rle, "a constant delta stream selects the RLE inner codec");
+		assert_cascading_value_col_round_trips(&enc);
+	}
+
+	#[test]
+	fn cascade_value_block_round_trips_a_jittery_trend_via_for_inner() {
+		// A near-constant trend (+7 with a small +0..2 jitter): RLE can no longer form one run,
+		// but each block's first differences share a tight range, so the FOR inner codec (block
+		// minimum + narrow residual) wins — exercising the cascade's FOR inner branch on disk.
+		let lits: Vec<String> = {
+			let mut acc = 9_000_000_000_i64;
+			(0..256)
+				.map(|i| {
+					let s = format!("{acc}");
+					acc += 7 + i64::from(i % 3);
+					s
+				})
+				.collect()
+		};
+		let refs: Vec<&str> = lits.iter().map(String::as_str).collect();
+		let enc = crate::encode_column(PhysicalType::ScaledI64 { scale: 0 }, &col(&refs)).expect("encodes");
+		assert_eq!(enc.best_value_codec_cascading(), "scaled_delta_cascade");
+		assert_eq!(enc.delta_cascade_plan().unwrap().inner, CascadeInner::For, "a jittery trend selects the FOR inner codec");
+		assert_cascading_value_col_round_trips(&enc);
+	}
+
+	#[test]
+	fn cascade_inner_bitpack_and_varint_read_arms_round_trip_hand_crafted_blocks() {
+		// Directly exercise the bitpack and varint inner-codec read arms (which a natural
+		// corpus rarely selects over FOR/RLE) by hand-writing a cascade block for each and
+		// asserting the mantissas reconstruct via the anchor + cumulative-sum.
+		let scale = 2_u8;
+		let anchor = 100_i64;
+		let deltas = [3_i64, -1, 4, -1, 5, -9, 2, 6];
+		let count = deltas.len() + 1;
+		// Expected mantissas: cumulative sum from the anchor.
+		let mut expected = vec![PhysicalValue::ScaledI64 { mantissa: anchor, scale }];
+		let mut m = anchor;
+		for &d in &deltas {
+			m += d;
+			expected.push(PhysicalValue::ScaledI64 { mantissa: m, scale });
+		}
+		for inner in [CASCADE_INNER_BITPACK, CASCADE_INNER_VARINT] {
+			let mut w = ByteWriter::new();
+			w.put_u8(TAG_SCALED_I64);
+			w.put_u8(scale);
+			w.put_uvarint(count as u64);
+			w.put_uvarint(0); // lossy_count
+			w.put_str("0"); // max_abs_error
+			w.put_u8(VAL_CODEC_DELTA_CASCADE);
+			w.put_svarint(anchor);
+			w.put_u8(inner);
+			if inner == CASCADE_INNER_BITPACK {
+				let (width, packed) = crate::timestamp::bitpack_encode(&deltas);
+				w.put_u8(u8::try_from(width).unwrap());
+				w.put_raw(&packed);
+			} else {
+				for &d in &deltas {
+					w.put_svarint(d);
+				}
+			}
+			let bytes = w.into_vec();
+			let mut r = ByteReader::new(&bytes);
+			let back = read_value_column(&mut r).expect("reads");
+			assert!(r.is_empty(), "cascade block must be fully consumed (inner={inner})");
+			assert_eq!(back.values, expected, "inner={inner} must reconstruct the mantissas");
+		}
+	}
+
+	#[test]
+	fn cascade_codec_on_a_non_scaled_column_is_rejected() {
+		// A hand-crafted F64 value block claiming the delta cascade must be refused — the
+		// cascade is only defined over a ScaledI64 mantissa stream.
+		let mut w = ByteWriter::new();
+		w.put_u8(TAG_F64);
+		w.put_uvarint(2); // count
+		w.put_uvarint(0); // lossy_count
+		w.put_str("0"); // max_abs_error
+		w.put_u8(VAL_CODEC_DELTA_CASCADE);
+		w.put_svarint(0); // anchor
+		w.put_u8(CASCADE_INNER_VARINT);
+		w.put_svarint(1); // one delta
+		let bytes = w.into_vec();
+		let mut r = ByteReader::new(&bytes);
+		assert_eq!(read_value_column(&mut r), Err(DspSegError::InvalidTag { kind: "value_codec_delta_cascade_type", value: TAG_F64 }));
+	}
+
+	#[test]
+	fn cascade_with_an_unknown_inner_descriptor_is_rejected() {
+		// A ScaledI64 cascade block whose inner descriptor byte is not one of the five known
+		// packers must error rather than mis-decode.
+		let mut w = ByteWriter::new();
+		w.put_u8(TAG_SCALED_I64);
+		w.put_u8(0); // scale
+		w.put_uvarint(2); // count
+		w.put_uvarint(0); // lossy_count
+		w.put_str("0"); // max_abs_error
+		w.put_u8(VAL_CODEC_DELTA_CASCADE);
+		w.put_svarint(0); // anchor
+		w.put_u8(99); // unknown inner descriptor
+		let bytes = w.into_vec();
+		let mut r = ByteReader::new(&bytes);
+		assert_eq!(read_value_column(&mut r), Err(DspSegError::InvalidTag { kind: "value_codec_cascade_inner", value: 99 }));
 	}
 
 	#[test]
