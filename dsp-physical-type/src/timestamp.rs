@@ -428,6 +428,126 @@ pub fn blocked_bitpack_decode(bytes: &[u8], block: usize, count: usize) -> Vec<i
 	out
 }
 
+/// The tile size the transposed bit-unpack codec ([`transpose_bitpack_encode`])
+/// partitions a stream into.
+///
+/// The `FastLanes` "unified transposed layout" targets a virtual 1024-lane SIMD register,
+/// so a 1024-value tile lets each bit-plane of a full tile land on a 128-byte (16×`u64`)
+/// word-aligned boundary; only the final short tile is unaligned. *(src: `FastLanes`
+/// Compression Layout, VLDB'23 — <https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf>)*
+pub const TRANSPOSE_TILE: usize = 1024;
+
+/// Estimated footprint of a **transposed** per-tile bit-packing of a difference stream:
+/// a one-byte width header plus `width * ceil(len / 8)` plane bytes per tile.
+///
+/// The bit budget is identical to [`blocked_bitpack_bytes`] at the same tile size for any
+/// tile whose length is a multiple of 8 (every full 1024-lane tile is) — the transpose is a
+/// *permutation* of the same bits, not a different code. A short trailing tile whose length
+/// is not a multiple of 8 costs at most `width - 1` extra bytes because each bit-plane rounds
+/// up to a whole byte independently (vs the single global round-up of the linear layout). The
+/// point of the layout is **decode speed**, not size: see [`transpose_bitpack_decode`].
+#[must_use]
+pub fn transpose_bitpack_bytes(values: &[i64], tile: usize) -> usize {
+	if values.is_empty() {
+		return 0;
+	}
+	let tile = tile.max(1);
+	values.chunks(tile).map(|chunk| 1 + bitpack_width(chunk) as usize * chunk.len().div_ceil(8)).sum()
+}
+
+/// Transposed per-tile bit-pack encode of a difference stream (the `FastLanes` layout).
+///
+/// Each tile emits a one-byte width header then `width` **bit-planes**: plane `b` is the
+/// `ceil(len / 8)` bytes holding bit `b` of every lane in the tile (lane `l` at bit `l` of
+/// byte `l / 8`). This is the transpose of the linear [`bitpack_encode`] layout, where a
+/// value's `width` bits are contiguous; here a value's bits are scattered one per plane, and
+/// a plane gathers one bit from every value.
+///
+/// Why: the transpose makes the **high bit-planes of a small-magnitude stream empty**, so
+/// [`transpose_bitpack_decode`] skips them wholesale (an all-zero plane word contributes
+/// nothing), where the scalar per-value [`bitpack_decode`] pays for every bit of every value
+/// regardless. Exact inverse is [`transpose_bitpack_decode`] given the same `tile` and count;
+/// an empty input yields an empty buffer. The emitted length is exactly
+/// [`transpose_bitpack_bytes`] for the same `(values, tile)`.
+#[must_use]
+pub fn transpose_bitpack_encode(values: &[i64], tile: usize) -> Vec<u8> {
+	let tile = tile.max(1);
+	let mut out = Vec::new();
+	for chunk in values.chunks(tile) {
+		let width = bitpack_width(chunk) as usize;
+		// Width is 0..=64 by construction, so the conversion never saturates.
+		out.push(u8::try_from(width).unwrap_or(64));
+		if width == 0 {
+			continue;
+		}
+		let plane_bytes = chunk.len().div_ceil(8);
+		let start = out.len();
+		out.resize(start + width * plane_bytes, 0);
+		for (lane, &v) in chunk.iter().enumerate() {
+			let zz = zigzag(v);
+			let byte = lane / 8;
+			let mask = 1_u8 << (lane % 8);
+			for b in 0..width {
+				if (zz >> b) & 1 == 1 {
+					out[start + b * plane_bytes + byte] |= mask;
+				}
+			}
+		}
+	}
+	out
+}
+
+/// Reconstruct `count` differences from a transposed per-tile bit-pack buffer.
+///
+/// Exact inverse of [`transpose_bitpack_encode`] given the same `tile` and `count`. The
+/// decode reads each bit-plane as `u64` words and distributes only the **set** bits of each
+/// word to their lanes (`w &= w - 1` walks set bits), so an all-zero plane word costs a
+/// single compare and a sparse one costs only its population — the decode-latency win over
+/// the scalar [`bitpack_decode`], which loops every bit of every value. Bytes past the buffer
+/// read as `0` (a truncated tile yields zeros rather than panicking).
+#[must_use]
+pub fn transpose_bitpack_decode(bytes: &[u8], tile: usize, count: usize) -> Vec<i64> {
+	let tile = tile.max(1);
+	let mut out = Vec::with_capacity(count);
+	let mut pos = 0_usize;
+	let mut remaining = count;
+	while remaining > 0 {
+		let len = remaining.min(tile);
+		let width = usize::from(bytes.get(pos).copied().unwrap_or(0));
+		pos += 1;
+		if width == 0 {
+			out.resize(out.len() + len, 0);
+			remaining -= len;
+			continue;
+		}
+		let plane_bytes = len.div_ceil(8);
+		let mut acc = vec![0_u64; len];
+		for b in 0..width {
+			let plane_start = pos + b * plane_bytes;
+			let plane = bytes.get(plane_start..plane_start + plane_bytes).unwrap_or(&[]);
+			for (g, group) in plane.chunks(8).enumerate() {
+				let mut word = 0_u64;
+				for (i, &byte) in group.iter().enumerate() {
+					word |= u64::from(byte) << (i * 8);
+				}
+				let base = g * 64;
+				let mut set = word;
+				while set != 0 {
+					let k = set.trailing_zeros() as usize;
+					if base + k < len {
+						acc[base + k] |= 1_u64 << b;
+					}
+					set &= set - 1;
+				}
+			}
+		}
+		pos += width * plane_bytes;
+		out.extend(acc.iter().map(|&a| unzigzag(a)));
+		remaining -= len;
+	}
+	out
+}
+
 /// The unsigned residual of `v` against a block reference `min` — `v - min` computed
 /// in the two's-complement `u64` domain, which is the exact difference whenever
 /// `v >= min` (always true for a block's own minimum) and up to `2^64 - 1`. Inverse:
@@ -1637,5 +1757,50 @@ mod tests {
 		// And delta encoding of the same regular series: 8 + 999 one-byte deltas.
 		let d = encode_delta(&values, TimeUnit::Millis);
 		assert_eq!(d.estimated_bytes(), 8 + 999);
+	}
+
+	#[test]
+	fn transpose_bitpack_round_trips_and_agrees_with_the_scalar_decoder() {
+		// The transposed layout is a permutation of the scalar bit-pack's bits: for every
+		// tile and awkward tail length, the transposed decode must reproduce the exact
+		// input, and — where the footprints coincide (tile length a multiple of 8) — it
+		// must produce the same values the linear per-block decode does over the same tiles.
+		let vals: Vec<i64> = (0..333).map(|i| if (40..56).contains(&i) { 1_000_000 + i } else { (i % 11) - 5 }).collect();
+		for tile in [1_usize, 7, 8, 16, 64, 333, 1024] {
+			let bytes = transpose_bitpack_encode(&vals, tile);
+			assert_eq!(bytes.len(), transpose_bitpack_bytes(&vals, tile), "encoded length must equal the estimate (tile={tile})");
+			assert_eq!(transpose_bitpack_decode(&bytes, tile, vals.len()), vals, "round trip must be exact (tile={tile})");
+		}
+		// A stream straddling the full i64 range still round-trips (zig-zag to 64-bit width).
+		let extremes = [i64::MIN, 0, i64::MAX, -1, 1, i64::MIN + 1, 123_456_789, -987_654_321];
+		let enc = transpose_bitpack_encode(&extremes, 4);
+		assert_eq!(enc.len(), transpose_bitpack_bytes(&extremes, 4));
+		assert_eq!(transpose_bitpack_decode(&enc, 4, extremes.len()), extremes);
+		// Empty stream encodes to nothing and decodes to nothing.
+		assert!(transpose_bitpack_encode(&[], 64).is_empty());
+		assert_eq!(transpose_bitpack_decode(&[], 64, 0), Vec::<i64>::new());
+	}
+
+	#[test]
+	fn transpose_bitpack_footprint_matches_the_linear_layout_on_aligned_tiles() {
+		// The transpose is the same bit budget as the linear per-block layout for any tile
+		// whose length is a multiple of 8 — a full 1024-lane tile always is, so a stream
+		// sized to whole tiles is byte-for-byte the same size (the win is decode speed, not
+		// size). Values kept small so every tile shares a modest width.
+		let vals: Vec<i64> = (0..2048).map(|i| (i % 9) - 4).collect();
+		assert_eq!(transpose_bitpack_bytes(&vals, TRANSPOSE_TILE), blocked_bitpack_bytes(&vals, TRANSPOSE_TILE), "aligned tiles must match the linear per-block footprint");
+	}
+
+	#[test]
+	fn transpose_bitpack_handles_all_zero_and_empty_streams() {
+		assert_eq!(transpose_bitpack_bytes(&[], 8), 0);
+		// An all-zero stream: each tile costs a single width-header byte (width 0, no planes).
+		// ceil(20/8) = 3 tiles at tile=8 -> 3 header bytes.
+		assert_eq!(transpose_bitpack_bytes(&[0; 20], 8), 3);
+		let enc = transpose_bitpack_encode(&[0; 20], 8);
+		assert_eq!(enc.len(), 3);
+		assert_eq!(transpose_bitpack_decode(&enc, 8, 20), vec![0_i64; 20]);
+		// A zero tile size is clamped to 1, never a panic.
+		assert_eq!(transpose_bitpack_bytes(&[0, 0, 0], 0), 3);
 	}
 }
