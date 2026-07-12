@@ -821,6 +821,63 @@ fn read_cascade_value_column(r: &mut ByteReader, physical_type: PhysicalType, ta
 	Ok(values)
 }
 
+/// **Random-access single-value read** from a `.dspseg` value-column block: the
+/// [`PhysicalValue`] at `index`, or `None` when `index` is past the column.
+///
+/// For the two per-block `ScaledI64` codecs ([`VAL_CODEC_BLOCKED`], [`VAL_CODEC_FOR`]) this
+/// reads only the block covering `index` — skipping the earlier blocks by their headers via
+/// [`crate::timestamp::blocked_bitpack_decode_range`] /
+/// [`crate::timestamp::for_bitpack_decode_range`] — instead of materializing the whole column;
+/// the point-lookup lever the block-level random-access primitives exist for (roadmap Phase
+/// 6.1). Every other codec falls back to a full [`read_value_column`] then an index, which is
+/// always correct (and cheap for the fixed-width / per-value payloads). The result equals
+/// `read_value_column(bytes).values.get(index).cloned()`.
+///
+/// # Errors
+///
+/// Propagates the same [`DspSegError`]s as [`read_value_column`] (a malformed header, an
+/// unrecognised tag/codec, or a short stream).
+pub fn read_value_at(bytes: &[u8], index: usize) -> Result<Option<PhysicalValue>, DspSegError> {
+	let mut r = ByteReader::new(bytes);
+	let tag = r.read_u8()?;
+	let physical_type = match tag {
+		TAG_F64 => PhysicalType::F64,
+		TAG_F32 => PhysicalType::F32,
+		TAG_SCALED_I64 => PhysicalType::ScaledI64 { scale: r.read_u8()? },
+		TAG_SCALED_I128 => PhysicalType::ScaledI128 { scale: r.read_u8()? },
+		TAG_DECIMAL128 => PhysicalType::Decimal128,
+		TAG_BIGDECIMAL_TEXT => PhysicalType::BigDecimalText,
+		other => return Err(DspSegError::InvalidTag { kind: "physical_type", value: other }),
+	};
+	let count = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+	let _lossy_count = r.read_uvarint()?;
+	let _max_abs_error = read_decimal(&mut r)?;
+	if index >= count {
+		return Ok(None);
+	}
+	match r.read_u8()? {
+		VAL_CODEC_BLOCKED => {
+			let PhysicalType::ScaledI64 { scale } = physical_type else {
+				return Err(DspSegError::InvalidTag { kind: "value_codec_blocked_type", value: tag });
+			};
+			let block = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+			let data = r.read_bytes()?;
+			Ok(crate::timestamp::blocked_bitpack_decode_range(data, block, count, index, 1).first().map(|&mantissa| PhysicalValue::ScaledI64 { mantissa, scale }))
+		}
+		VAL_CODEC_FOR => {
+			let PhysicalType::ScaledI64 { scale } = physical_type else {
+				return Err(DspSegError::InvalidTag { kind: "value_codec_for_type", value: tag });
+			};
+			let block = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+			let data = r.read_bytes()?;
+			Ok(crate::timestamp::for_bitpack_decode_range(data, block, count, index, 1).first().map(|&mantissa| PhysicalValue::ScaledI64 { mantissa, scale }))
+		}
+		// Fixed-width / per-value / cascade payloads: a full decode then index (correct
+		// everywhere; the per-block skip only helps the two block codecs above).
+		_ => Ok(read_value_column(&mut ByteReader::new(bytes))?.values.get(index).cloned()),
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Timestamp-column codec (Phase 4.3, slice 3)
 //
@@ -1680,6 +1737,48 @@ mod tests {
 			assert!(r.is_empty(), "cascade block must be fully consumed (inner={inner})");
 			assert_eq!(back.values, expected, "inner={inner} must reconstruct the mantissas");
 		}
+	}
+
+	#[test]
+	fn read_value_at_matches_the_full_decode_across_every_codec() {
+		// The random-access single-value read must equal the full-decode value at each index,
+		// for every value codec (the two per-block codecs take the fast block-skip path; the
+		// rest fall back to a full decode + index). Out-of-range indices return None.
+		let scale2 = PhysicalType::ScaledI64 { scale: 2 };
+		// A regular small ramp (bitpack), a mixed-magnitude column (blocked), a clustered high
+		// base (FOR), a wide-sparse column (varint), and an F64 column (fixed-width fallback).
+		let bitpack_col = crate::encode_column(scale2, &(0..80).map(|i| BigDecimal::new((i - 40).into(), 2)).collect::<Vec<_>>()).unwrap();
+		let blocked_lits: Vec<String> = (0..192).map(|i| if (64..128).contains(&i) { format!("{}", ((10_000_000 + i) * 100 + 1) * if i % 2 == 0 { 1 } else { -1 }) } else { format!("{}", (i % 5) - 2) }).collect();
+		let blocked_col = crate::encode_column(PhysicalType::ScaledI64 { scale: 0 }, &col(&blocked_lits.iter().map(String::as_str).collect::<Vec<_>>())).unwrap();
+		let for_lits: Vec<String> = (0..192).map(|i| format!("10000000.0{}", i % 7)).collect();
+		let for_col = crate::encode_column(scale2, &col(&for_lits.iter().map(String::as_str).collect::<Vec<_>>())).unwrap();
+		let varint_col = crate::encode_column(PhysicalType::ScaledI64 { scale: 0 }, &col(&["1", "1000000000", "2", "3"])).unwrap();
+		let f64_col = crate::encode_column(PhysicalType::F64, &col(&["0.5", "1.5", "2.5", "3.5", "4.5"])).unwrap();
+
+		for enc in [&bitpack_col, &blocked_col, &for_col, &varint_col, &f64_col] {
+			let mut w = ByteWriter::new();
+			write_value_column(&mut w, enc);
+			let bytes = w.into_vec();
+			let full = read_value_column(&mut ByteReader::new(&bytes)).expect("reads");
+			for i in [0_usize, 1, enc.len() / 2, enc.len().saturating_sub(1)] {
+				assert_eq!(read_value_at(&bytes, i).expect("reads"), full.values.get(i).cloned(), "codec {} index {i}", enc.best_value_codec());
+			}
+			assert_eq!(read_value_at(&bytes, enc.len()).expect("reads"), None, "out-of-range index must be None ({})", enc.best_value_codec());
+		}
+
+		// The opt-in cascade path too: a trending column sealed with the cascading writer must
+		// random-access-read the same values the full cascade decode yields.
+		let trend_lits: Vec<String> = (0..256).map(|i| format!("{}", 5_000_000_000_i64 + i64::from(i) * 7)).collect();
+		let trend = crate::encode_column(PhysicalType::ScaledI64 { scale: 0 }, &col(&trend_lits.iter().map(String::as_str).collect::<Vec<_>>())).unwrap();
+		let mut w = ByteWriter::new();
+		write_value_column_cascading(&mut w, &trend);
+		let bytes = w.into_vec();
+		let full = read_value_column(&mut ByteReader::new(&bytes)).expect("reads");
+		assert_eq!(full.best_value_codec_cascading(), "scaled_delta_cascade");
+		for i in [0_usize, 1, 128, 255] {
+			assert_eq!(read_value_at(&bytes, i).expect("reads"), full.values.get(i).cloned(), "cascade index {i}");
+		}
+		assert_eq!(read_value_at(&bytes, 256).expect("reads"), None);
 	}
 
 	#[test]
