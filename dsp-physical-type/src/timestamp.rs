@@ -428,6 +428,48 @@ pub fn blocked_bitpack_decode(bytes: &[u8], block: usize, count: usize) -> Vec<i
 	out
 }
 
+/// **Block-level random access:** decode only the `len` differences at global index `start`
+/// from a per-block adaptive bit-pack buffer.
+///
+/// The blocks before `start` are skipped by reading their one-byte width headers (and
+/// computing each block's data length) rather than decoding their data. This is the
+/// random-access primitive over the realized blocked value/timestamp codec
+/// ([`blocked_bitpack_encode`]): a read planner can fetch a sub-range — or a single point
+/// (`len == 1`) — at the cost of walking block headers to the start block plus decoding only the
+/// blocks the range overlaps, instead of materializing the whole column. The result equals
+/// `blocked_bitpack_decode(bytes, block, count)[start..start+len]` (clamped to `count`). A
+/// `start >= count` or `len == 0` yields an empty vector. Roadmap Phase 6.1 "block-level random
+/// access". *(src: `FastLanes` per-block layout, VLDB'23 —
+/// <https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf>)*
+#[must_use]
+pub fn blocked_bitpack_decode_range(bytes: &[u8], block: usize, count: usize, start: usize, len: usize) -> Vec<i64> {
+	let block = block.max(1);
+	let end = start.saturating_add(len).min(count);
+	if start >= end {
+		return Vec::new();
+	}
+	let mut out = Vec::with_capacity(end - start);
+	let mut pos = 0_usize;
+	let mut idx = 0_usize;
+	while idx < end {
+		let block_len = block.min(count - idx);
+		let width = u32::from(bytes.get(pos).copied().unwrap_or(0));
+		pos += 1;
+		let data_len = (block_len * width as usize).div_ceil(8);
+		// Decode this block only if the requested range overlaps [idx, idx + block_len).
+		if idx + block_len > start {
+			let chunk = bytes.get(pos..pos + data_len).unwrap_or(&[]);
+			let decoded = bitpack_decode(width, chunk, block_len);
+			let lo = start.saturating_sub(idx);
+			let hi = (end - idx).min(block_len);
+			out.extend_from_slice(&decoded[lo..hi]);
+		}
+		pos += data_len;
+		idx += block_len;
+	}
+	out
+}
+
 /// The tile size the transposed bit-unpack codec ([`transpose_bitpack_encode`])
 /// partitions a stream into.
 ///
@@ -707,6 +749,54 @@ pub fn for_bitpack_decode(bytes: &[u8], block: usize, count: usize) -> Vec<i64> 
 			bit += width;
 		}
 		remaining -= block_len;
+	}
+	out
+}
+
+/// **Block-level random access:** decode only the `len` differences at global index `start`
+/// from a Frame-of-Reference per-block buffer.
+///
+/// The blocks before `start` are skipped by reading their reference varint + width header (and
+/// computing each block's data length) rather than unpacking their residuals. The FOR analogue
+/// of [`blocked_bitpack_decode_range`]: the random-access primitive over the
+/// realized FOR value codec ([`for_bitpack_encode`]). The result equals
+/// `for_bitpack_decode(bytes, block, count)[start..start+len]` (clamped to `count`); a
+/// `start >= count` or `len == 0` yields an empty vector. Roadmap Phase 6.1 "block-level random
+/// access".
+#[must_use]
+pub fn for_bitpack_decode_range(bytes: &[u8], block: usize, count: usize, start: usize, len: usize) -> Vec<i64> {
+	let block = block.max(1);
+	let end = start.saturating_add(len).min(count);
+	if start >= end {
+		return Vec::new();
+	}
+	let mut out = Vec::with_capacity(end - start);
+	let mut pos = 0_usize;
+	let mut idx = 0_usize;
+	while idx < end {
+		let block_len = block.min(count - idx);
+		let min = unzigzag(for_read_uvarint(bytes, &mut pos));
+		let width = usize::from(bytes.get(pos).copied().unwrap_or(0));
+		pos += 1;
+		let data_len = (block_len * width).div_ceil(8);
+		if idx + block_len > start {
+			let data = bytes.get(pos..pos + data_len).unwrap_or(&[]);
+			let lo = start.saturating_sub(idx);
+			let hi = (end - idx).min(block_len);
+			for row in lo..hi {
+				let mut r = 0_u64;
+				let bit = row * width;
+				for b in 0..width {
+					let bit_idx = bit + b;
+					if data.get(bit_idx / 8).is_some_and(|byte| (byte >> (bit_idx % 8)) & 1 == 1) {
+						r |= 1 << b;
+					}
+				}
+				out.push(for_reconstruct(min, r));
+			}
+		}
+		pos += data_len;
+		idx += block_len;
 	}
 	out
 }
@@ -1635,6 +1725,33 @@ mod tests {
 		// Empty stream encodes to nothing and decodes to nothing.
 		assert!(for_bitpack_encode(&[], 64).is_empty());
 		assert_eq!(for_bitpack_decode(&[], 64, 0), Vec::<i64>::new());
+	}
+
+	#[test]
+	fn blocked_and_for_range_decode_match_the_full_decode_slice() {
+		// Block-level random access must equal the corresponding slice of a full decode for
+		// every (start, len) window, across block sizes and codecs — a single point (len 1),
+		// a sub-range spanning blocks, the whole column, and out-of-range windows.
+		let vals: Vec<i64> = (0..300).map(|i| if (40..104).contains(&i) { 1_000_000_000 + i } else { (i % 13) - 6 }).collect();
+		let n = vals.len();
+		for block in [1_usize, 7, 16, 64, 300] {
+			let blocked = blocked_bitpack_encode(&vals, block);
+			let for_bytes = for_bitpack_encode(&vals, block);
+			let full_blocked = blocked_bitpack_decode(&blocked, block, n);
+			let full_for = for_bitpack_decode(&for_bytes, block, n);
+			assert_eq!(full_blocked, vals, "blocked full decode sanity (block={block})");
+			assert_eq!(full_for, vals, "FOR full decode sanity (block={block})");
+			for start in [0_usize, 1, 39, 40, 63, 100, 299] {
+				for len in [0_usize, 1, 5, 64, 130, 400] {
+					let want: Vec<i64> = full_blocked.iter().copied().skip(start).take(len.min(n.saturating_sub(start))).collect();
+					assert_eq!(blocked_bitpack_decode_range(&blocked, block, n, start, len), want, "blocked range (block={block}, start={start}, len={len})");
+					assert_eq!(for_bitpack_decode_range(&for_bytes, block, n, start, len), want, "FOR range (block={block}, start={start}, len={len})");
+				}
+			}
+			// A start at or past the end yields nothing.
+			assert!(blocked_bitpack_decode_range(&blocked, block, n, n, 10).is_empty());
+			assert!(for_bitpack_decode_range(&for_bytes, block, n, n + 5, 10).is_empty());
+		}
 	}
 
 	#[test]
