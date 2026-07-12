@@ -362,7 +362,8 @@ detection within Y% and improving historical query latency by Z."*
   bit-packing** *(all five realized on disk in the `.dspseg` timestamp block, chosen
   per-stream by `best_encoding_name`)*; **scaled-int value bit-packing** *(realized on
   disk in the value block)*; Chimp-style f64; ALP-inspired vectorized f64;
-  Decimal128/scaled-int codecs; **block-level random access**. *(Check codec
+  Decimal128/scaled-int codecs; **block-level random access** *(shipped —
+  `blocked`/`for_bitpack_decode_range` + `dspseg::read_value_at`)*. *(Check codec
   patents/licenses before embedding.)*
   - [x] **Gorilla + RLE realized on disk** — the timestamp block now carries four
     codecs (varint/bit-pack/RLE/Gorilla) chosen by the single-source-of-truth
@@ -529,26 +530,31 @@ detection within Y% and improving historical query latency by Z."*
     flagship (decompress-on-device, no host round-trip). Evaluate after the CPU ALP adopt lands.
     *(src: "A High-Throughput GPU Framework for Adaptive Lossless Compression of Floating-Point
     Data", arXiv 2511.04140 — https://arxiv.org/pdf/2511.04140)*
-  - [ ] **FastLanes "Unified Transposed Layout" for the bit-pack codecs (decode-speed
-    slice):** DSP's global/blocked/FOR bit-packers pack scalar LSB-first, so decode is a
-    per-value bit loop. FastLanes reorders values into a *transposed* layout targeting a
-    virtual 1024-bit SIMD register, decoding >100 B integers/sec with scalar (auto-vectorized)
-    code — the layout that makes lightweight codecs cheap enough to always leave data
-    compressed. Prototype the 1024-value transposed bit-unpack for the realized `ScaledI64`
-    value codec and benchmark decode throughput (bytes/point is unchanged; this is a
-    decode-latency win that also unlocks a future GPU-unpack path). *(src: FastLanes
-    Compression Layout, VLDB'23 — https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf)*
-  - [ ] **Cascading (recursive) codec composition — FOR→delta→bit-pack chains:** DSP's value
-    codecs are single-level (one of varint/bit-pack/blocked/FOR). FastLanes and Vortex apply
-    codecs *recursively* (e.g. FOR reference, then delta, then bit-pack the residual). **First
-    slice shipped** as the advisory `ColumnEncoding::delta_cascade_bytes` (delta-transform the
-    mantissas, then best-of {varint, bit-pack, blocked, FOR, RLE} over the differences) — a
-    monotone-trend column that defeats every single-level codec (FOR pays the run's range) drops
-    97.4% (8 B vs 312 B on a 256-pt +7 trend, the trend collapsing to a constant RLE run).
-    Residue: a **codec-chain descriptor in the `.dspseg` value block** so a column carries a
-    composed pipeline (delta+FOR+bit-pack) instead of a single tag, benchmarked FOR+bit-pack vs
-    each alone. *(src: Vortex cascading compression — https://vortex.dev/ · FastLanes codec
-    chains, VLDB'23 — https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf)*
+  - [x] **FastLanes "Unified Transposed Layout" for the bit-pack codecs (decode-speed
+    slice): shipped (prototype).** `TRANSPOSE_TILE`/`transpose_bitpack_bytes`/`_encode`/`_decode`
+    — a per-tile bit-plane-major layout whose decoder reads `u64` words and walks only the *set*
+    bits (`w &= w-1`), so the empty high bit-planes of a small-magnitude stream are skipped
+    wholesale (where the scalar per-value loop pays every bit of every value). Byte footprint is a
+    permutation of the linear per-block layout (identical on aligned tiles). Measured (release,
+    `benches/bitunpack.rs`, 1 Mi small-magnitude stream): **~238 Melem/s vs ~41.6 Melem/s** for the
+    linear per-block decode at the same footprint — **~5.7× decode speedup**, bytes/point unchanged.
+    Residue: realize it as the stored blocked layout behind a format-version bump + reader dispatch,
+    and measure the *end-to-end* read win (decode is often bandwidth-bound —
+    https://arxiv.org/pdf/2606.22423). *(src: FastLanes Compression Layout, VLDB'23 —
+    https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf)*
+  - [x] **Cascading (recursive) codec composition — delta→best-packer chain: advisory + on disk.**
+    DSP's other value codecs are single-level (one of varint/bit-pack/blocked/FOR); this is the
+    first *recursive* codec. Shipped as the advisory `ColumnEncoding::delta_cascade_bytes`/
+    `delta_cascade_plan` (delta-transform the mantissas, then best-of {varint, bit-pack, blocked,
+    FOR, RLE} over the differences — a monotone-trend column that defeats every single-level codec
+    drops 97.4%, the trend collapsing to a constant RLE run) **and** the on-disk codec-chain
+    descriptor `VAL_CODEC_DELTA_CASCADE` in the `.dspseg` value block (anchor + inner-codec
+    descriptor + inner-coded deltas), written by `write_value_column_cascading` and read by the
+    ordinary `read_value_column`. **Opt-in** (the cascade beats FOR on FOR's own fixtures → a broad
+    realized-bytes change; default-adoption is owner-gated). *(src: Vortex cascading compression —
+    https://vortex.dev/ · cascading-with-BtrBlocks —
+    https://spiraldb.com/post/cascading-compression-with-btrblocks · FastLanes codec chains,
+    VLDB'23 — https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf)*
   - [ ] **Evaluate Vortex as a columnar interchange + benchmark reference (Phase 1/4):** Vortex
     (Rust, Arrow-compatible, BtrBlocks-based cascading compression, ALP/FastLanes/FSST
     encodings) reports ~100–200× faster random access and 2–10× faster scans than Parquet+zstd
@@ -855,15 +861,36 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   sign-off).** `VAL_CODEC_FOR` realized as the fourth `.dspseg` value codec
   (`scaled_for`, strict-win selection); timestamps stay advisory (small dods, FOR
   rarely wins). Decided together with the headline flip below — one metric break.
-- [ ] **Next slice — FastLanes transposed bit-unpack (Phase 6.1, decode-speed):** prototype a
-  1024-value transposed layout for the realized `ScaledI64` bit-pack so decode auto-vectorizes
-  (>100 B ints/sec); bytes/point unchanged, a decode-latency win that also opens a GPU-unpack
-  path. *(src: FastLanes, VLDB'23 — https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf)*
+- [x] **FastLanes transposed bit-unpack (Phase 6.1, decode-speed): shipped (prototype).**
+  `TRANSPOSE_TILE`/`transpose_bitpack_bytes`/`_encode`/`_decode` — a per-tile bit-plane-major
+  layout whose decoder reads `u64` words and walks only the *set* bits (`w &= w-1`), so the empty
+  high bit-planes of a small-magnitude stream are skipped wholesale. Byte footprint identical to
+  the linear per-block layout (a bit permutation). Measured (release, criterion `benches/bitunpack.rs`):
+  transposed **~238 Melem/s (4.40 ms)** vs linear per-block **~41.6 Melem/s (25.2 ms)** at the same
+  footprint — **~5.7× decode speedup**, bytes/point unchanged. *(src: FastLanes, VLDB'23 —
+  https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf)*
+- [ ] **Next slice — realize the transposed layout on disk (Phase 6.1, decode-speed residue):**
+  the transposed decode is a proven ~5.7× win but is a prototype on no read path. Realize it as
+  the stored layout for the blocked value/timestamp codec (identical bytes on aligned tiles) behind
+  a segment-format-version bump with reader dispatch (old version → linear decode, new → transposed),
+  and benchmark the end-to-end read-decode win. Note the **decode-throughput-is-often-bandwidth-bound**
+  caveat before claiming an end-to-end win — measure, don't assume. *(src: FastLanes, VLDB'23 —
+  https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf · "When Is a Columnar Scan Bandwidth-Bound? A
+  Decode-Throughput Law", 2026 — https://arxiv.org/pdf/2606.22423)*
 - [ ] **Next slice — evaluate Vortex as interchange + bench baseline (Phase 1/4):** Rust,
-  Arrow-compatible, cascading ALP/FastLanes/FSST codecs, ~100–200× faster random access than
-  Parquet+zstd, GPU-decode roadmap — on DSP's random-access + GPU + interpolation wedge.
-  *(src: https://vortex.dev/ ·
-  https://spice.ai/blog/vortex-at-spice-ai-the-columnar-format-for-data-intensive-workloads)*
+  Arrow-compatible, cascading ALP/FastLanes/FSST codecs, **~100× faster random access + 10–25×
+  faster decode than Parquet+zstd at ~same ratio (TPC-H SF10, 38% smaller)**, GPU-SIMT decode by
+  design — directly on DSP's random-access + GPU + interpolation wedge, and Vortex now an LF AI &
+  Data incubation project (stable enough to depend on). Vortex's own guidance — cascading wins on
+  "auto-incrementing IDs, sensor readings with bounded variation" — independently validates DSP's
+  just-shipped delta-cascade value codec. *(src: https://vortex.dev/ ·
+  https://spice.ai/learn/vortex · cascading-with-BtrBlocks —
+  https://spiraldb.com/post/cascading-compression-with-btrblocks)*
+- [ ] **Evaluate the FastLanes *File Format* (not just the layout) as a bench baseline (Phase 1):**
+  the 2025 FastLanes file-format paper extends the transposed layout to a full format; assess it
+  beside Vortex/Parquet as a `dsp-bench` external-format baseline for the storage/compressed-query
+  workloads. *(src: "The FastLanes File Format", 2025 —
+  https://www.researchgate.net/publication/395278946_The_FastLanes_File_Format)*
 - [x] **Headline bytes/point FLIPPED to the realized figure (Phase 4/6, owner sign-off,
   bench schema v10):** `Segment::value_bytes`/`total_bytes`/`bytes_per_point`,
   `Page::total_bytes`, `StorageEstimate.bytes_per_point`/`total_bytes_per_point`, and
@@ -897,10 +924,32 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   `StorageEstimate.advisory_fire_timestamp_bytes`. 54.8% below dod on a constructed
   geometric-velocity stream — but FIRE is *marginal on real data* (upstream + the 2025 comparative
   study), so adoption is gated on the bench advisory showing a real win.
-- [x] **Cascading codec composition (Phase 6.1): first slice shipped.**
-  `ColumnEncoding::delta_cascade_bytes` (advisory delta→best-packer); 97.4% below the best
-  single-level codec on a monotone-trend column. Residue: an on-disk `.dspseg` codec-chain
-  descriptor.
+- [x] **Cascading codec composition (Phase 6.1): advisory + on-disk descriptor shipped.**
+  `ColumnEncoding::delta_cascade_bytes`/`delta_cascade_plan` (delta→best inner packer over
+  {varint,bit-pack,blocked,FOR,RLE}; 97.4% below the best single-level codec on a monotone-trend
+  column) **and** the on-disk `.dspseg` codec-chain descriptor `VAL_CODEC_DELTA_CASCADE` (anchor +
+  inner-codec descriptor + inner-coded deltas; `write_value_column_cascading` /
+  `best_value_codec_cascading`, decoded by the ordinary `read_value_column`). Surfaced as
+  `StorageEstimate.advisory_delta_cascade_value_bytes` (bench schema v15). Kept **opt-in** — the
+  cascade beats FOR on FOR's own clustered fixtures, i.e. a broad realized-bytes change of the FOR
+  class, so the default selector is unchanged. *(Vortex's own guidance independently confirms the
+  regime — cascading wins on auto-incrementing IDs + bounded-variation sensors:
+  https://spiraldb.com/post/cascading-compression-with-btrblocks)*
+- [ ] **Cascade adopt-or-drop into the DEFAULT selector — owner-gated (headline change, as FOR/ALP):**
+  fold the delta cascade into `best_value_codec`/`best_serialized_bytes` so trending value columns
+  realize it by default (bench schema bump; pre-adoption bytes/point not comparable on trending
+  columns). Broad win — needs owner sign-off, then flip and re-baseline the headline once.
+- [x] **Block-level random access (Phase 6.1): shipped.** `blocked_bitpack_decode_range` /
+  `for_bitpack_decode_range` decode only the blocks overlapping a `[start, len)` window (skipping
+  earlier blocks by their headers), and `dspseg::read_value_at(bytes, index)` reads one value
+  straight from a `.dspseg` value block — the per-block codecs take the block-skip fast path, the
+  rest fall back to a full decode + index. The point-lookup / late-materialization lever, matching
+  Vortex's finer-grained in-segment access. *(src:
+  https://spice.ai/learn/vortex)*
+- [ ] **Next slice — wire `read_value_at` into the segment/API point-read path (Phase 4/6):** the
+  streaming single-value read exists at the codec layer; wire it into a disk-streaming point read
+  (below `Segment` materialization) so `GET …/storage/{aspect}/at` can random-access a value without
+  decoding the whole segment, and benchmark point-lookup latency vs the full-decode path.
 - [x] Add p50/p95/p99 + confidence-interval reporting
 - [x] Add physical value types (`F64`, `ScaledI64`, `BigDecimalText` + three more)
 - [x] Prototype columnar segment reads for one aspect type (`database::SegmentStore`)
