@@ -794,6 +794,14 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 
 ## Immediate next actions
 
+- [ ] **NEXT (capstone of the 2026-07-13 read-path arc) — `dsp-bench` `point_lookup` workload:**
+  the point/range streaming read (single/paged/batch/closed-form, all benchmarked at the codec
+  layer) now needs a customer-facing harness workload. Add a parallel `run_point_lookup` runner + a
+  storage-backed adapter path (seal a `Segment` from the profile dataset, drive
+  `read_point`/`read_points`) + a `point_lookup` profile (regular + irregular datasets), measuring
+  p50/p95/p99 latency — the `run` path is deeply interpolation-shaped, so this is a parallel runner,
+  not an extension. Foundation for the cross-engine point-lookup comparison vs ClickHouse
+  ASOF/QuestDB, and the evidence for the *When DSP beats general TSDBs* point-lookup positioning.
 - [x] Create `dsp-bench` as a first-class workspace member
 - [x] Define the first benchmark profile: `interpolation-heavy-irregular`
 - [x] DSP adapter + portable baselines (linear class-C, forward-fill class-B) + accuracy scoring + shape-selectable ground truth
