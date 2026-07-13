@@ -367,8 +367,10 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   wires this up to the framed single-block segment — it skips the value block by its framing,
   decodes only the timestamps to find the row, and unpacks the one covering value block — so a
   point lookup **never materializes the value column** on a per-block codec (equal to a full
-  decode + `value_at` for every frame; the non-block codecs fall back to that). Measured **~59×
-  faster** point lookup on a 100k-row FOR segment (222 µs vs 13.2 ms), identical bytes on disk
+  decode + `value_at` for every frame; the non-block codecs fall back to that). `read_paged_segment_point`
+  does the same for a paged frame, first pruning pages on their indexed min/max timestamp so only
+  the surviving page is touched. Measured **~59× faster** point lookup on a 100k-row FOR segment
+  (222 µs vs 13.2 ms), identical bytes on disk
   ([`dsp-physical-type/benches/pointread.rs`](dsp-physical-type/benches/pointread.rs)).
 - **Realized headline bytes/point** — every headline bytes/point figure
   (`Segment::bytes_per_point`, `StorageEstimate.bytes_per_point` /
@@ -404,9 +406,10 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   (`SegmentStore::read_point`) prunes the index to the segments spanning the instant
   and resolves each with its persisted `time_sorted` flag: a sorted segment is
   **binary-searched**, an out-of-order one linear-scanned (the only sound search on
-  unsorted timestamps). A single-block segment resolves through the **streaming
-  point read** (`dspseg::read_segment_point`, below) — no value-column materialization
-  on a per-block codec; a paged segment decodes the surviving page (`PagedSegment::value_at`).
+  unsorted timestamps). Both frame kinds resolve through the **streaming point read**
+  (`dspseg::read_segment_point` / `read_paged_segment_point`, below) — no value-column
+  materialization on a per-block codec, and a paged frame **prunes pages on their indexed
+  min/max timestamp without decoding a column byte** before touching the one surviving page.
 - **Intra-segment reconciliation** — `SegmentStore::reconcile_segment`/`reconcile_aspect`
   rewrite an out-of-order segment into a sorted one in place (stable sort by
   timestamp, re-sealed at the same id, frame kind preserved), so it drops out of the
