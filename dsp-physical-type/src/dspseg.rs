@@ -1248,55 +1248,44 @@ pub fn read_paged_segment_points(bytes: &[u8], ts: &[i64]) -> Result<Vec<Option<
 	Ok(out)
 }
 
-/// **Windowed range read** from a single-block `.dspseg` frame — the rows in `[start, end]`.
-///
-/// Returns the `(timestamp, value)` rows whose timestamp falls in the inclusive `[start, end]`
-/// window, aligned and in row order — exactly `read_segment(bytes)?.decode_nullable()` filtered to
-/// `[start, end]`.
+/// **Windowed range read over one column section** — the `(timestamp, value)` rows of a `section`
+/// (value + timestamp + quality columns) whose timestamp falls in the inclusive `[start, end]`
+/// window, aligned and in row order. The shared core of the single-block and paged range reads.
 ///
 /// For a **regular (constant-stride) sorted column with a random-access value codec** the window is
-/// resolved *without materializing the whole segment*: the row range `[lo, hi]` is computed in
-/// closed form from the stride (`ts[i] = first + i*step`), the timestamps are generated directly,
-/// and only the present values inside the window are unpacked via [`read_value_at`] (one block per
-/// present row) — so a selective range over a large regular block-coded segment decodes ~`window`
-/// values, not all of them. Any other shape (irregular timestamps, a per-value/cascade value codec,
-/// an out-of-order segment) falls back to a full [`read_segment`] decode then a filter, which is
-/// always correct. Roadmap Phase 4/6 (the range-read analogue of the streaming point read).
-///
-/// # Errors
-///
-/// Propagates the same [`DspSegError`]s as [`read_segment`].
-pub fn read_segment_range(bytes: &[u8], start: i64, end: i64) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>), DspSegError> {
-	if bytes.len() < 4 {
-		return Err(DspSegError::UnexpectedEof { needed: 4, remaining: bytes.len() });
-	}
-	let (body, crc_bytes) = bytes.split_at(bytes.len() - 4);
-	let stored = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
-	let computed = crc32(body);
-	if stored != computed {
-		return Err(DspSegError::ChecksumMismatch { stored, computed });
-	}
-	let mut r = ByteReader::new(body);
-	if r.take(MAGIC.len())? != MAGIC {
-		return Err(DspSegError::BadMagic);
-	}
-	let version = r.read_u16_le()?;
-	if version != SEGMENT_FORMAT_VERSION {
-		return Err(DspSegError::UnsupportedVersion { found: version });
-	}
-	let stats = read_segment_stats(&mut r)?;
-	// A full decode + filter — the always-correct answer, and the fallback for every shape the
-	// closed-form window below does not cover.
-	let full_filtered = || -> Result<(Vec<i64>, Vec<Option<BigDecimal>>), DspSegError> {
-		let (ts, vs) = read_segment(bytes)?.decode_nullable();
-		Ok(ts.into_iter().zip(vs).filter(|(t, _)| start <= *t && *t <= end).unzip())
-	};
-	// Coarse span bail — a window disjoint from the segment yields nothing.
+/// resolved without materializing the whole section: the row range `[lo, hi]` is computed in closed
+/// form from the stride (`ts[i] = first + i*step`), the timestamps are generated directly, and only
+/// the present values inside the window are unpacked via [`read_value_at`] (one block per present
+/// row). Any other shape (irregular timestamps, a per-value/cascade value codec, an out-of-order
+/// segment) fully decodes the section and filters, which is always correct.
+fn read_range_from_section(section: &[u8], stats: &SegmentStats, start: i64, end: i64) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>), DspSegError> {
+	// Coarse span bail — a window disjoint from the section yields nothing.
 	let (Some(min_ts), Some(max_ts)) = (stats.min_ts, stats.max_ts) else { return Ok((Vec::new(), Vec::new())) };
 	if end < min_ts || start > max_ts {
 		return Ok((Vec::new(), Vec::new()));
 	}
-	let section = &body[r.pos..];
+	// A full decode of the section then a filter — the always-correct fallback for every shape the
+	// closed-form window below does not cover.
+	let full_filtered = || -> Result<(Vec<i64>, Vec<Option<BigDecimal>>), DspSegError> {
+		let mut fr = ByteReader::new(section);
+		let col = read_value_column(&mut fr)?;
+		let ts_col = read_timestamp_column(&mut fr)?;
+		let timestamps = crate::timestamp::decode_delta_of_delta(&ts_col);
+		let nulls = read_null_column(&mut fr, stats.row_count, stats.null_count)?;
+		let (mut out_times, mut out_values) = (Vec::new(), Vec::new());
+		let mut dense = 0;
+		for (row, &t) in timestamps.iter().enumerate() {
+			let present = nulls.is_present(row);
+			if start <= t && t <= end {
+				out_times.push(t);
+				out_values.push(if present { col.values.get(dense).cloned().map(|pv| pv.to_logical()) } else { None });
+			}
+			if present {
+				dense += 1;
+			}
+		}
+		Ok((out_times, out_values))
+	};
 	// The closed-form fast path needs a random-access value codec (per-present-row read) and a
 	// sorted, constant-stride timestamp column.
 	if !value_block_has_random_access_codec(section) {
@@ -1306,8 +1295,6 @@ pub fn read_segment_range(bytes: &[u8], start: i64, end: i64) -> Result<(Vec<i64
 	skip_random_access_value_column(&mut sr)?;
 	let ts_col = read_timestamp_column(&mut sr)?;
 	let nulls = read_null_column(&mut sr, stats.row_count, stats.null_count)?;
-	// The closed form is exact only for a sorted, strictly-increasing (constant positive stride)
-	// column; anything else falls back to the full decode.
 	let stride = if stats.time_sorted { ts_col.arithmetic_stride().filter(|&(_, step)| step > 0) } else { None };
 	let Some((first, step)) = stride else {
 		return full_filtered();
@@ -1342,6 +1329,97 @@ pub fn read_segment_range(bytes: &[u8], start: i64, end: i64) -> Result<(Vec<i64
 		} else {
 			values.push(None);
 		}
+	}
+	Ok((timestamps, values))
+}
+
+/// **Windowed range read** from a single-block `.dspseg` frame — the rows in `[start, end]`.
+///
+/// Returns the `(timestamp, value)` rows whose timestamp falls in the inclusive `[start, end]`
+/// window, aligned and in row order — exactly `read_segment(bytes)?.decode_nullable()` filtered to
+/// `[start, end]`. A **regular block-coded segment** resolves the window in closed form and unpacks
+/// only its present values (see [`read_range_from_section`]); any other shape full-decodes + filters.
+/// Roadmap Phase 4/6 (the range-read analogue of the streaming point read).
+///
+/// # Errors
+///
+/// Propagates the same [`DspSegError`]s as [`read_segment`].
+pub fn read_segment_range(bytes: &[u8], start: i64, end: i64) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>), DspSegError> {
+	if bytes.len() < 4 {
+		return Err(DspSegError::UnexpectedEof { needed: 4, remaining: bytes.len() });
+	}
+	let (body, crc_bytes) = bytes.split_at(bytes.len() - 4);
+	let stored = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+	let computed = crc32(body);
+	if stored != computed {
+		return Err(DspSegError::ChecksumMismatch { stored, computed });
+	}
+	let mut r = ByteReader::new(body);
+	if r.take(MAGIC.len())? != MAGIC {
+		return Err(DspSegError::BadMagic);
+	}
+	let version = r.read_u16_le()?;
+	if version != SEGMENT_FORMAT_VERSION {
+		return Err(DspSegError::UnsupportedVersion { found: version });
+	}
+	let stats = read_segment_stats(&mut r)?;
+	read_range_from_section(&body[r.pos..], &stats, start, end)
+}
+
+/// **Windowed range read** from a **paged** `.dspseg` frame — the rows in `[start, end]`.
+///
+/// The per-page index is parsed once, so pages whose `[min_ts, max_ts]` is disjoint from the window
+/// are skipped without decoding a column byte (on-disk page skipping, as [`read_paged_segment`]'s
+/// range read); each surviving page is windowed through the shared [`read_range_from_section`] (a
+/// regular page resolves its sub-window in closed form). Rows are concatenated in page order.
+/// Equal to `read_paged_segment(bytes)?.read_time_range(start, end)`.
+///
+/// # Errors
+///
+/// Propagates the same [`DspSegError`]s as [`read_paged_segment`].
+pub fn read_paged_segment_range(bytes: &[u8], start: i64, end: i64) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>), DspSegError> {
+	if bytes.len() < 4 {
+		return Err(DspSegError::UnexpectedEof { needed: 4, remaining: bytes.len() });
+	}
+	let (body, crc_bytes) = bytes.split_at(bytes.len() - 4);
+	let stored = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+	let computed = crc32(body);
+	if stored != computed {
+		return Err(DspSegError::ChecksumMismatch { stored, computed });
+	}
+	let mut r = ByteReader::new(body);
+	if r.take(MAGIC.len())? != MAGIC {
+		return Err(DspSegError::BadMagic);
+	}
+	let version = r.read_u16_le()?;
+	if version != PAGED_SEGMENT_FORMAT_VERSION {
+		return Err(DspSegError::UnsupportedVersion { found: version });
+	}
+	let _rows_per_page = r.read_uvarint()?;
+	let seg_stats = read_segment_stats(&mut r)?;
+	let (mut timestamps, mut values) = (Vec::new(), Vec::new());
+	// Coarse bail on the whole segment span.
+	match (seg_stats.min_ts, seg_stats.max_ts) {
+		(Some(lo), Some(hi)) if end >= lo && start <= hi => {}
+		_ => return Ok((timestamps, values)),
+	}
+	let page_count = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+	let mut index: Vec<(SegmentStats, usize)> = Vec::with_capacity(page_count);
+	for _ in 0..page_count {
+		let page_stats = read_segment_stats(&mut r)?;
+		let block_len = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+		index.push((page_stats, block_len));
+	}
+	let mut block_start = r.pos;
+	for (page_stats, block_len) in index {
+		let overlaps = matches!((page_stats.min_ts, page_stats.max_ts), (Some(lo), Some(hi)) if end >= lo && start <= hi);
+		if overlaps {
+			let section = body.get(block_start..block_start + block_len).ok_or_else(|| DspSegError::UnexpectedEof { needed: block_len, remaining: body.len().saturating_sub(block_start) })?;
+			let (pt, pv) = read_range_from_section(section, &page_stats, start, end)?;
+			timestamps.extend(pt);
+			values.extend(pv);
+		}
+		block_start += block_len;
 	}
 	Ok((timestamps, values))
 }
@@ -2440,6 +2518,16 @@ mod tests {
 				let expected: (Vec<i64>, Vec<Option<BigDecimal>>) = all_ts.iter().zip(&all_vs).filter(|(t, _)| start <= **t && **t <= end).map(|(&t, v)| (t, v.clone())).unzip();
 				assert_eq!((rt, rv), expected, "codec {} window [{start},{end}]", seg.values.best_value_codec());
 			}
+		}
+
+		// Paged variant: a multi-page regular FOR frame — read_paged_segment_range must equal
+		// PagedSegment::read_time_range for every window (page skipping + per-page closed-form).
+		let paged = PagedSegment::build(&regular_ts, &for_vals, TimeUnit::Millis, &BigDecimal::from(0), 64).expect("builds");
+		let paged_bytes = paged.write_to();
+		let (lo, hi) = (regular_ts[0], regular_ts[299]);
+		for (start, end) in [(lo, hi), (lo + 615, hi - 615), (lo - 100, lo - 1), (hi + 1, hi + 100), (lo + 655, lo + 655), (lo + 656, lo + 657)] {
+			let (rt, rv) = read_paged_segment_range(&paged_bytes, start, end).expect("reads");
+			assert_eq!((rt, rv), paged.read_time_range(start, end), "paged window [{start},{end}]");
 		}
 	}
 

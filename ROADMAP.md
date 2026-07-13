@@ -1059,8 +1059,12 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   irregular/f64/out-of-order across full-span, interior on/off-grid, single-point, empty, and
   out-of-range windows). Runtime-verified against the live `GET …/points?start=&end=` endpoint.
   Benchmarked (`benches/pointread.rs`, a 100-row window over a 100k-row FOR frame): **629.40 µs
-  windowed vs 12.651 ms full decode + filter — ~20× faster.** Residue: extend the closed-form window
-  to paged frames (per-page).
+  windowed vs 12.651 ms full decode + filter — ~20× faster.** Extended to **paged** frames too:
+  `read_paged_segment_range` skips whole pages disjoint from the window (on-disk page skipping) and
+  windows each surviving page through the shared `read_range_from_section` (single-block + paged now
+  share one range-read core, mirroring the point-read arc); wired into `SegmentStore::read_time_range`'s
+  paged branch, equal to `PagedSegment::read_time_range`, runtime-verified against the live endpoint on
+  a 5-page frame.
 - [x] Add p50/p95/p99 + confidence-interval reporting
 - [x] Add physical value types (`F64`, `ScaledI64`, `BigDecimalText` + three more)
 - [x] Prototype columnar segment reads for one aspect type (`database::SegmentStore`)

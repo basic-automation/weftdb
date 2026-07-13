@@ -350,13 +350,13 @@ impl SegmentStore {
 			let bytes = tokio::fs::read(&descriptor.path).await.with_context(|| format!("reading segment {}", descriptor.path))?;
 			// A paged frame (v3) decodes through PagedSegment::read_time_range, which
 			// skips pages *within* the file; a single-block frame decodes whole.
+			// Windowed read: a regular block-coded frame decodes only the row window (closed-form
+			// index range + per-present-row value read) — the paged variant additionally skips whole
+			// pages disjoint from the window — instead of the whole segment; any other shape falls
+			// back to a full decode. Already filtered to `[start, end]`.
 			let (ts, vs) = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION {
-				let segment = PagedSegment::read_from(&bytes).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?;
-				segment.read_time_range(start, end)
+				dsp_physical_type::dspseg::read_paged_segment_range(&bytes, start, end).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?
 			} else {
-				// Windowed read: for a regular block-coded segment this decodes only the row window
-				// (closed-form index range + per-present-row value read), not the whole segment; any
-				// other shape falls back to a full decode. Already filtered to `[start, end]`.
 				dsp_physical_type::dspseg::read_segment_range(&bytes, start, end).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?
 			};
 			for (t, v) in ts.into_iter().zip(vs) {
