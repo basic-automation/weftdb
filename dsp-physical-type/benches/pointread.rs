@@ -17,7 +17,7 @@ use std::hint::black_box;
 
 use bigdecimal::BigDecimal;
 use criterion::{criterion_group, criterion_main, Criterion};
-use dsp_physical_type::{dspseg::{read_paged_segment_point, read_segment_point}, timestamp::TimeUnit, PagedSegment, Segment};
+use dsp_physical_type::{dspseg::{read_paged_segment_point, read_segment_point, read_segment_points}, timestamp::TimeUnit, PagedSegment, Segment};
 
 /// The FOR-packing corpus values: a high base (`10000000`) with a tiny 2-decimal wobble
 /// (`.00`..`.96`) that f64 cannot represent exactly, so `recommend_encoding` selects `ScaledI64`
@@ -91,5 +91,37 @@ fn bench_paged_point_read(c: &mut Criterion) {
 	group.finish();
 }
 
-criterion_group!(benches, bench_point_read, bench_paged_point_read);
+fn bench_batch_point_read(c: &mut Criterion) {
+	let n = 100_000;
+	let segment = build_segment(n);
+	let bytes = segment.write_to();
+
+	// 64 instants spread across the segment — all present grid points.
+	let instants: Vec<i64> = (0..64).map(|k| 1_000 + (k * (n as i64 / 64)) * 10).collect();
+
+	// Correctness guard: the batch equals the per-instant reads.
+	let batch = read_segment_points(&bytes, &instants).expect("reads");
+	let singles: Vec<_> = instants.iter().map(|&t| read_segment_point(&bytes, t).expect("reads")).collect();
+	assert_eq!(batch, singles, "batch read must equal the per-instant reads");
+	assert!(batch.iter().all(Option::is_some), "every queried instant must be present");
+
+	let mut group = c.benchmark_group("segment_batch_point_lookup_100k_x64");
+
+	// N single reads: each re-reads the frame and re-decodes the timestamp column.
+	group.bench_function("n_single_reads", |b| {
+		b.iter(|| {
+			let mut out = Vec::with_capacity(instants.len());
+			for &t in &instants {
+				out.push(read_segment_point(black_box(&bytes), black_box(t)).expect("reads"));
+			}
+			black_box(out)
+		})
+	});
+	// One batch read: the timestamp column is decoded once for all 64 instants.
+	group.bench_function("one_batch_read", |b| b.iter(|| black_box(read_segment_points(black_box(&bytes), black_box(&instants)).expect("reads"))));
+
+	group.finish();
+}
+
+criterion_group!(benches, bench_point_read, bench_paged_point_read, bench_batch_point_read);
 criterion_main!(benches);
