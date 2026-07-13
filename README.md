@@ -414,7 +414,9 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   min/max timestamp without decoding a column byte** before touching the one surviving page.
   `SegmentStore::read_points` resolves a **batch** of instants in one pass — the index is pruned
   once and each segment's timestamp column decoded once for the whole batch, so `N` instants
-  sharing a segment cost one decode, not `N`.
+  sharing a segment cost one decode, not `N` (**~27× faster** for 64 instants on a 100k-row FOR
+  frame — 521 µs vs 13.9 ms,
+  [`dsp-physical-type/benches/pointread.rs`](dsp-physical-type/benches/pointread.rs)).
 - **Intra-segment reconciliation** — `SegmentStore::reconcile_segment`/`reconcile_aspect`
   rewrite an out-of-order segment into a sorted one in place (stable sort by
   timestamp, re-sealed at the same id, frame kind preserved), so it drops out of the

@@ -474,7 +474,7 @@ pub struct IngestResponse {
 	pub aspect: String,
 	/// The id assigned to the new segment (monotonic within the aspect).
 	pub segment_id: u64,
-	/// The `.dspseg` frame format version sealed (3 single-block, 4 paged).
+	/// The `.dspseg` frame format version sealed (5 single-block, 6 paged).
 	pub format_version: u16,
 	/// Total rows sealed (present and null).
 	pub row_count: usize,
