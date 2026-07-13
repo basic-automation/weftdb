@@ -677,6 +677,63 @@ pub async fn storage_point(State(state): State<AppState>, Path(aspect): Path<Str
 	Ok(Json(StoredPointResponse { aspect, time_unit: schema.timestamp_unit.name(), timestamp: params.t, value: value.map(|v| v.to_string()), found }))
 }
 
+/// Query parameters for the batch point lookup: a comma-separated list of instants.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MultiPointParams {
+	/// Comma-separated epoch integers in the aspect's declared unit (e.g. `1000,2000,3000`).
+	pub t: String,
+}
+
+/// One instant's result in a [`StoredPointsResponse`], echoed in the query order.
+#[derive(Debug, Clone, Serialize)]
+pub struct StoredPointEntry {
+	/// The instant queried (epoch integer in the declared unit).
+	pub timestamp: i64,
+	/// The present value as lossless decimal text, or omitted on a miss.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub value: Option<String>,
+	/// Whether a present value was found at the instant.
+	pub found: bool,
+}
+
+/// Response body for `GET /api/v1/storage/{aspect}/at-multi` — a batch point lookup, one
+/// entry per queried instant in query order.
+#[derive(Debug, Clone, Serialize)]
+pub struct StoredPointsResponse {
+	/// The aspect read.
+	pub aspect: String,
+	/// The aspect's declared timestamp unit token (e.g. `"seconds"`).
+	pub time_unit: &'static str,
+	/// One result per queried instant, aligned to the `t` list.
+	pub points: Vec<StoredPointEntry>,
+}
+
+/// Handle `GET /api/v1/storage/{aspect}/at-multi?t=<epoch>,<epoch>,…`.
+///
+/// The batch counterpart of [`storage_point`] (roadmap Phase 4/6): resolves many instants in
+/// one pass through [`SegmentStore::read_points`](database::SegmentStore::read_points), which
+/// prunes the index once by the batch's whole span and decodes each surviving segment's
+/// timestamp column once for the whole batch. Results are returned in the query order (an
+/// instant may repeat). Values are lossless decimal text.
+///
+/// # Errors
+///
+/// [`StorageError::Unconfigured`] when no store is attached, [`StorageError::NotFound`] when
+/// the aspect is undeclared, [`StorageError::BadRequest`] when the `t` list has a non-integer
+/// entry, and [`StorageError::Internal`] on a read failure.
+pub async fn storage_points(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<MultiPointParams>) -> Result<Json<StoredPointsResponse>, StorageError> {
+	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	drop(state);
+	let schema = require_schema(&store, &aspect).await?;
+	// Parse the comma-separated instants; a non-integer (or otherwise malformed) entry is a 400.
+	let ts: Vec<i64> = params.t.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::parse::<i64>).collect::<Result<_, _>>().map_err(|e| StorageError::BadRequest(format!("invalid `t` list {:?}: {e}", params.t)))?;
+	let result = store.read_points(&aspect, &ts).instrument(tracing::info_span!("storage.points.read", %aspect, count = ts.len())).await;
+	drop(store);
+	let values = result.map_err(|err| classify_read_error(&err))?;
+	let points = ts.iter().zip(values).map(|(&timestamp, v)| StoredPointEntry { timestamp, found: v.is_some(), value: v.map(|v| v.to_string()) }).collect();
+	Ok(Json(StoredPointsResponse { aspect, time_unit: schema.timestamp_unit.name(), points }))
+}
+
 /// One declared aspect's identity in the [`AspectListResponse`].
 #[derive(Debug, Clone, Serialize)]
 pub struct AspectInfo {
@@ -1025,6 +1082,34 @@ mod tests {
 		let router = app_with_state(AppState::new());
 		let response = router.oneshot(Request::builder().uri("/api/v1/storage/price/at?t=100").body(Body::empty()).unwrap()).await.unwrap();
 		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+	}
+
+	#[tokio::test]
+	async fn multi_point_lookup_returns_values_in_query_order() {
+		let (_dir, router) = router_with_sealed_price().await;
+		// A scrambled batch: hits, an off-grid miss (125), a repeat (120), and out-of-range (500).
+		let (status, body) = get_json(router, "/api/v1/storage/price/at-multi?t=120,100,125,120,500,140").await;
+		assert_eq!(status, StatusCode::OK);
+		assert_eq!(body["aspect"], "price");
+		assert_eq!(body["time_unit"], "seconds");
+		let points = body["points"].as_array().expect("points array");
+		assert_eq!(points.len(), 6);
+		assert_eq!(points[0]["timestamp"], 120);
+		assert_eq!(points[0]["value"], "3.5");
+		assert_eq!(points[0]["found"], true);
+		assert_eq!(points[1]["value"], "1.5"); // t=100
+		assert_eq!(points[2]["found"], false); // t=125 off-grid
+		assert!(points[2].get("value").is_none() || points[2]["value"].is_null());
+		assert_eq!(points[3]["value"], "3.5"); // t=120 repeat
+		assert_eq!(points[4]["found"], false); // t=500 out of range
+		assert_eq!(points[5]["value"], "5.5"); // t=140
+	}
+
+	#[tokio::test]
+	async fn multi_point_lookup_rejects_a_non_integer_instant() {
+		let (_dir, router) = router_with_sealed_price().await;
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/price/at-multi?t=100,abc").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 	}
 
 	#[tokio::test]
