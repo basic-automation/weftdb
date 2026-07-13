@@ -897,11 +897,37 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   just-shipped delta-cascade value codec. *(src: https://vortex.dev/ ·
   https://spice.ai/learn/vortex · cascading-with-BtrBlocks —
   https://spiraldb.com/post/cascading-compression-with-btrblocks)*
-- [ ] **Evaluate the FastLanes *File Format* (not just the layout) as a bench baseline (Phase 1):**
-  the 2025 FastLanes file-format paper extends the transposed layout to a full format; assess it
-  beside Vortex/Parquet as a `dsp-bench` external-format baseline for the storage/compressed-query
-  workloads. *(src: "The FastLanes File Format", 2025 —
-  https://www.researchgate.net/publication/395278946_The_FastLanes_File_Format)*
+- [ ] **Evaluate the FastLanes *File Format* (not just the layout) as a bench baseline + a
+  random-access reference (Phase 1/4):** the FastLanes file-format paper (VLDB'25, 18(11):4629)
+  extends the transposed layout to a full format whose headline API is **"flexible support for
+  partial decompression… fine-grained access at the level of small batches rather than rowgroups"**
+  — the closest external analog to DSP's just-shipped block-level random access + streaming point
+  read. Assess it beside Vortex/Parquet as a `dsp-bench` external-format baseline for the
+  storage/compressed-query **and point-lookup** workloads, and as the reference design for the
+  transposed-on-disk realization. *(src: "The FastLanes File Format", VLDB'25 —
+  https://www.vldb.org/pvldb/vol18/p4629-afroozeh.pdf · CWI impl — https://github.com/cwida/fastlanes)*
+- [ ] **Point-lookup positioning — DSP's block-random-access read is a genuine columnar mitigation
+  (Phase 0/1):** the 2026 competitive reviews name point lookups as *the* columnar weakness ("a
+  column store opens ~50 column files to materialise one row; a row store walks one B-tree path" →
+  "skip a columnar DB when point lookups are the main access pattern"). DSP's streaming point read
+  (never materializes the value column; `O(1)` closed-form row for a regular timestamp column)
+  mitigates exactly this — add a `dsp-bench` **point_lookup** workload and benchmark DSP's
+  `read_point`/`read_points` vs ClickHouse ASOF/point + QuestDB, then fold the result into the
+  *When DSP beats general TSDBs* honesty page. *(src:
+  https://clickhouse.com/resources/engineering/when-to-use-columnar-database ·
+  https://questdb.com/blog/clickhouse-vs-questdb-comparison/)*
+- [ ] **GPU-decode the `.dspseg` transposed layout rather than adopting a new format (Phase 5/6):**
+  a 2026 study ("Do GPUs Really Need New Tabular File Formats?", arXiv 2602.17335) finds existing
+  formats (Parquet, **FastLanes**) can be *rewritten/optimized* for competitive GPU performance
+  rather than needing purpose-built formats — evidence to GPU-decode DSP's own transposed `.dspseg`
+  layout (the `transpose_bitpack_decode_range` prototype) on-device, pairing with the GPU
+  interpolation flagship, instead of importing a new columnar format. *(src:
+  https://arxiv.org/pdf/2602.17335)*
+- [ ] **Correlation-aware column compression as a post-B-tags codec direction (Phase 6):** Corra
+  (arXiv 2403.17229) and FastLanes' multi-column compression (MCC) exploit *inter-column*
+  correlation for extra ratio — only relevant once DSP has multiple value columns / per-measurement
+  tags (B-tags), so park it behind that, but note it as the multi-column codec frontier. *(src:
+  https://arxiv.org/pdf/2403.17229)*
 - [x] **Headline bytes/point FLIPPED to the realized figure (Phase 4/6, owner sign-off,
   bench schema v10):** `Segment::value_bytes`/`total_bytes`/`bytes_per_point`,
   `Page::total_bytes`, `StorageEstimate.bytes_per_point`/`total_bytes_per_point`, and
@@ -1020,6 +1046,20 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   stream to binary-search. Add per-block timestamp checkpoints (a sparse `(block → reconstructed ts,
   running delta)` index, a format bump) so a binary search reconstructs only the blocks it probes,
   making the irregular sorted point lookup sublinear too; benchmark vs the current whole-column decode.
+- [x] **Windowed range read — decode only the row window for a regular block-coded segment (Phase
+  4/6): shipped.** `dspseg::read_segment_range(bytes, start, end)` returns the `[start, end]` rows;
+  for a **regular (constant-stride) sorted column with a random-access value codec** it computes the
+  row window `[lo, hi]` in closed form (no timestamp materialization), generates the window
+  timestamps directly, and unpacks **only the present values inside the window** via `read_value_at`
+  (one block per present row) — so a selective range over a large regular block-coded segment decodes
+  ~`window` values, not all of them; the sparse case walks the dense-rank window. Any other shape
+  (irregular, per-value/cascade value codec, out-of-order) falls back to a full decode + filter.
+  `SegmentStore::read_time_range`'s single-block branch now takes it (paged already page-prunes).
+  Equal to `decode_nullable()` filtered to the window for every frame (unit-tested regular/sparse/
+  irregular/f64/out-of-order across full-span, interior on/off-grid, single-point, empty, and
+  out-of-range windows). Runtime-verified against the live `GET …/points?start=&end=` endpoint.
+  Residue: benchmark the windowed vs full-decode range read; extend the closed-form window to paged
+  frames (per-page).
 - [x] Add p50/p95/p99 + confidence-interval reporting
 - [x] Add physical value types (`F64`, `ScaledI64`, `BigDecimalText` + three more)
 - [x] Prototype columnar segment reads for one aspect type (`database::SegmentStore`)
