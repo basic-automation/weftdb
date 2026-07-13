@@ -406,6 +406,48 @@ impl SegmentStore {
 		Ok(found)
 	}
 
+	/// **Batch point lookup** (roadmap Phase 4/6): the present value of `aspect` at each
+	/// instant in `ts`, returned aligned to `ts` (`None` where no present row carries it).
+	///
+	/// The batch analogue of [`read_point`](SegmentStore::read_point): the index is pruned
+	/// **once** by the batch's whole `[min(ts), max(ts)]` span, and each surviving segment is
+	/// opened **once** and its timestamp column decoded **once** for the whole batch (via the
+	/// streaming [`read_segment_points`](dsp_physical_type::dspseg::read_segment_points) /
+	/// [`read_paged_segment_points`](dsp_physical_type::dspseg::read_paged_segment_points)), so
+	/// looking up `N` instants that share segments pays one file read + one timestamp decode per
+	/// segment rather than `N`. As with `read_point`, candidates are merged in seal-id order so
+	/// the most recently sealed present value wins per instant (last-writer-wins). An empty `ts`
+	/// yields an empty vector without touching the index.
+	///
+	/// # Errors
+	///
+	/// Propagates a libSQL prune failure, a filesystem read error, or a
+	/// [`dsp_physical_type::dspseg::DspSegError`] for a corrupt/unreadable `.dspseg`.
+	pub async fn read_points(&self, aspect: &str, ts: &[i64]) -> Result<Vec<Option<BigDecimal>>> {
+		if ts.is_empty() {
+			return Ok(Vec::new());
+		}
+		// Prune the index once by the batch's whole span (safe: every instant lies within it).
+		let (lo, hi) = ts.iter().fold((i64::MAX, i64::MIN), |(lo, hi), &t| (lo.min(t), hi.max(t)));
+		let descriptors = self.index.prune_by_time(aspect, lo, hi).await?;
+		let mut found = vec![None; ts.len()];
+		for descriptor in &descriptors {
+			let bytes = tokio::fs::read(&descriptor.path).await.with_context(|| format!("reading segment {}", descriptor.path))?;
+			let hits = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION {
+				dsp_physical_type::dspseg::read_paged_segment_points(&bytes, ts).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?
+			} else {
+				dsp_physical_type::dspseg::read_segment_points(&bytes, ts).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?
+			};
+			// Later (higher seal-id) segments override earlier ones per instant — last-writer-wins.
+			for (slot, hit) in found.iter_mut().zip(hits) {
+				if hit.is_some() {
+					*slot = hit;
+				}
+			}
+		}
+		Ok(found)
+	}
+
 	/// **Out-of-order reconciliation** (roadmap Phase 4.6): rewrite a single
 	/// out-of-order segment into a time-sorted one, in place at its own id.
 	///
@@ -1631,6 +1673,31 @@ mod tests {
 		assert_eq!(in_gap, None);
 		assert_eq!(beyond, None);
 		assert_eq!(empty, None);
+	}
+
+	#[tokio::test]
+	async fn read_points_matches_per_instant_and_batches_across_segments() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		// Two disjoint sealed segments over [0,40] and [100,140] (as read_point's test).
+		for base in [0_i64, 100] {
+			let ts: Vec<i64> = (0..5).map(|i| base + i * 10).collect();
+			let vs: Vec<BigDecimal> = (0..5).map(|i| BigDecimal::from(base + i)).collect();
+			store.seal("a", &schema(), &ts, &vs).await.expect("seals");
+		}
+		// A scrambled batch spanning both segments, with a repeat, off-grid/gap/out-of-range misses.
+		let batch = [120_i64, 20, 25, 70, 120, 500, 0, 140];
+		let got = store.read_points("a", &batch).await.expect("reads");
+		assert_eq!(got.len(), batch.len());
+		// Each slot equals the single-instant read at that instant.
+		for (k, &t) in batch.iter().enumerate() {
+			assert_eq!(got[k], store.read_point("a", t).await.expect("reads"), "batch slot {k} (t={t})");
+		}
+		// Spot-check the values: 20 -> 2, 120 -> 102, 0 -> 0, 140 -> 104; misses are None.
+		assert_eq!(got, vec![Some(bd("102")), Some(bd("2")), None, None, Some(bd("102")), None, Some(bd("0")), Some(bd("104"))]);
+		// An empty batch and an undeclared aspect are clean.
+		assert!(store.read_points("a", &[]).await.expect("reads").is_empty());
+		assert_eq!(store.read_points("none", &[0, 1]).await.expect("reads"), vec![None, None]);
 	}
 
 	#[tokio::test]

@@ -984,6 +984,20 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   because `PagedSegment::value_at` already prunes pages before materializing values; the streaming
   read additionally skips the surviving page's value-column decode). Runtime-verified against the
   live endpoint on a 5-page FOR frame (format_version 6).
+- [x] **Batch point lookup — amortize the timestamp decode across many instants (Phase 4/6):
+  shipped.** `dspseg::read_segment_points`/`read_paged_segment_points(bytes, &[t])` and
+  `SegmentStore::read_points(aspect, &[t])` resolve many instants in one pass: the index is pruned
+  once by the batch's whole span, each surviving segment/page is opened + its timestamp column
+  decoded **once** for the whole batch (paged pages still skip when no unresolved instant falls in
+  their span), and results are returned aligned to the query slice with per-instant last-writer-wins
+  across segments. So `N` instants sharing a segment pay one file read + one timestamp decode, not
+  `N`. Equal to the per-instant `read_point` for every slot (unit-tested single-block + paged +
+  cross-segment). Refactored `read_point_from_section` into a batch `read_points_from_section` the
+  single-instant path delegates to.
+- [ ] **Next slice — expose batch point lookup at the API (Phase 2/4):** wire `SegmentStore::read_points`
+  to a multi-instant read endpoint (e.g. `GET …/storage/{aspect}/at?t=…&t=…` or a small POST body of
+  instants) returning a `found`/`value` per instant, and runtime-verify it; benchmark the batch vs
+  N single `read_point` calls to quantify the amortized-decode win.
 - [ ] **Next slice — block-random-access timestamp search for the sorted point lookup (Phase 4/6):**
   the streaming point read no longer decodes the value column, but it still decodes the *whole*
   timestamp column to binary-search for the row — the remaining `O(n)` cost. Make the timestamp
