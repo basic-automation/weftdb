@@ -360,10 +360,11 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   (`StorageEstimate.advisory_delta_cascade_value_bytes`, schema v15). It is **opt-in** — the
   cascade beats even FOR broadly, so folding it into the default selector is a headline change
   held for owner sign-off; the default codec choice is unchanged.
-- **Block-level random access** — the per-block value codecs support decoding a single value
+- **Block-level random access** — the fixed-layout value codecs support decoding a single value
   (or a sub-range) without materializing the whole column: `dspseg::read_value_at(bytes, i)`
   reads only the block covering row `i` (skipping earlier blocks by their headers) for the
-  blocked/FOR codecs, the point-lookup / late-materialization lever. `dspseg::read_segment_point(bytes, t)`
+  blocked/FOR codecs, and reads bit `i * width` directly for the fixed-width bit-pack codec — the
+  point-lookup / late-materialization lever. `dspseg::read_segment_point(bytes, t)`
   wires this up to the framed single-block segment — it skips the value block by its framing,
   decodes only the timestamps to find the row, and unpacks the one covering value block — so a
   point lookup **never materializes the value column** on a per-block codec (equal to a full

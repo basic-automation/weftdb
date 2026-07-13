@@ -325,6 +325,32 @@ pub fn bitpack_encode(values: &[i64]) -> (u32, Vec<u8>) {
 	(width, out)
 }
 
+/// **Random access:** the single value at `index` in a fixed-width bit-packed buffer, without
+/// decoding the values before it.
+///
+/// Because every value occupies exactly `width` bits, value `index` lives at bit `index * width`
+/// — an `O(width)` read, versus the `O(index * width)` a full [`bitpack_decode`] pays to reach
+/// it. The point-lookup primitive over the realized fixed-width value/timestamp bit-pack codec
+/// (the constant-width sibling of [`blocked_bitpack_decode_range`]). Equals
+/// `bitpack_decode(width, bytes, index + 1)[index]`; a `width` of `0` yields `0`. Bits past the
+/// buffer read as `0`.
+#[must_use]
+pub fn bitpack_decode_at(width: u32, bytes: &[u8], index: usize) -> i64 {
+	if width == 0 {
+		return 0;
+	}
+	let w = width as usize;
+	let bit = index * w;
+	let mut zz = 0_u64;
+	for b in 0..w {
+		let idx = bit + b;
+		if bytes.get(idx / 8).is_some_and(|byte| (byte >> (idx % 8)) & 1 == 1) {
+			zz |= 1 << b;
+		}
+	}
+	unzigzag(zz)
+}
+
 /// Reconstruct `count` differences from a fixed-width bit-packed buffer. Exact
 /// inverse of [`bitpack_encode`]; a `width` of `0` yields `count` zeros.
 #[must_use]
@@ -1694,6 +1720,20 @@ mod tests {
 		assert_eq!(width, 3);
 		assert_eq!(bitpack_bytes(&dods), 1 + 4);
 		assert!(bitpack_bytes(&dods) < zigzag_varint_bytes(&dods));
+	}
+
+	#[test]
+	fn bitpack_decode_at_matches_the_full_decode() {
+		// Random access to a single value must equal the full decode at that index, for every
+		// index and a range of widths (including the width-0 all-equal stream and the i64 extremes
+		// that force the 64-bit width).
+		for vals in [vec![0_i64; 6], (0..40).map(|i| (i % 13) - 6).collect::<Vec<_>>(), vec![i64::MIN, i64::MAX, 0, -1, 1, 123_456_789, -987_654_321]] {
+			let (width, packed) = bitpack_encode(&vals);
+			let full = bitpack_decode(width, &packed, vals.len());
+			for i in 0..vals.len() {
+				assert_eq!(bitpack_decode_at(width, &packed, i), full[i], "width={width} index={i}");
+			}
+		}
 	}
 
 	#[test]
