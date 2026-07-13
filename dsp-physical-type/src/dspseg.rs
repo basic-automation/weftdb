@@ -934,13 +934,22 @@ fn skip_random_access_value_column(r: &mut ByteReader) -> Result<(), DspSegError
 	Ok(())
 }
 
+/// The **dense value index** of logical `row` — the count of present rows before it. The value
+/// column stores only present values, so this is the offset [`read_value_at`] / a decoded
+/// present-value vector is indexed by. `O(1)` for a dense column (no nulls before it).
+fn dense_rank(nulls: &NullMask, row: usize) -> usize {
+	if nulls.null_count() == 0 {
+		row
+	} else {
+		(0..row).filter(|&i| nulls.is_present(i)).count()
+	}
+}
+
 /// Locate the **dense value index** of the first *present* row whose timestamp equals `t`, or
 /// [`None`] when no present row carries `t` — the shared core of the streaming point read
 /// (mirrors [`crate::segment::point_lookup`] + the dense-rank mapping [`Segment::decode_nullable`]
 /// uses). A time-sorted column binary-searches the run of `t` for its first present row; an
-/// out-of-order column linear-scans (the only sound search on unsorted timestamps). The dense
-/// index is the count of present rows before that row — the value column stores only present
-/// values, so this is the offset [`read_value_at`] / a decoded present-value vector is indexed by.
+/// out-of-order column linear-scans (the only sound search on unsorted timestamps).
 fn locate_present_dense_index(timestamps: &[i64], nulls: &NullMask, sorted: bool, t: i64) -> Option<usize> {
 	let row = if sorted {
 		let mut row = timestamps.partition_point(|&x| x < t);
@@ -956,7 +965,7 @@ fn locate_present_dense_index(timestamps: &[i64], nulls: &NullMask, sorted: bool
 	} else {
 		timestamps.iter().enumerate().find_map(|(i, &ts)| (ts == t && nulls.is_present(i)).then_some(i))?
 	};
-	Some(if nulls.null_count() == 0 { row } else { (0..row).filter(|&i| nulls.is_present(i)).count() })
+	Some(dense_rank(nulls, row))
 }
 
 /// **Streaming batch point read over one column section** — a `section` positioned at its value
@@ -988,14 +997,37 @@ fn read_points_from_section(section: &[u8], stats: &SegmentStats, ts: &[i64]) ->
 		Some(read_value_column(&mut r)?.values)
 	};
 	let ts_col = read_timestamp_column(&mut r)?;
-	let timestamps = crate::timestamp::decode_delta_of_delta(&ts_col);
 	let nulls = read_null_column(&mut r, stats.row_count, stats.null_count)?;
+	// **Regular-column fast path:** a time-sorted constant-stride column resolves each instant's
+	// row in closed form (`(t - first) / step`), skipping the whole delta-of-delta reconstruction +
+	// binary search. `time_sorted` guarantees `step > 0` and no wrap-around, so the index is unique
+	// and exact. An irregular (or out-of-order) column decodes the timestamps and binary/linear
+	// searches as before.
+	let stride = if stats.time_sorted { ts_col.arithmetic_stride().filter(|&(_, step)| step > 0) } else { None };
+	let timestamps = if stride.is_none() { Some(crate::timestamp::decode_delta_of_delta(&ts_col)) } else { None };
 	for (slot, &t) in out.iter_mut().zip(ts) {
 		if t < min_ts || t > max_ts {
 			continue;
 		}
-		let Some(dense_index) = locate_present_dense_index(&timestamps, &nulls, stats.time_sorted, t) else {
-			continue;
+		let dense_index = if let Some((first, step)) = stride {
+			// Closed form: the row whose timestamp is exactly `t`, if `t` lands on the grid.
+			let diff = t.wrapping_sub(first);
+			if diff % step != 0 {
+				continue;
+			}
+			let quotient = diff / step;
+			// `try_from` rejects a negative index; then bound it, guard against wrapping by
+			// reconstructing, and require the row present.
+			let Ok(row) = usize::try_from(quotient) else { continue };
+			if row >= stats.row_count || first.wrapping_add(quotient.wrapping_mul(step)) != t || !nulls.is_present(row) {
+				continue;
+			}
+			dense_rank(&nulls, row)
+		} else {
+			let Some(idx) = locate_present_dense_index(timestamps.as_ref().expect("decoded when irregular"), &nulls, stats.time_sorted, t) else {
+				continue;
+			};
+			idx
 		};
 		let value = match &present_values {
 			// Fast path: random-access the single covering block straight from the section bytes.

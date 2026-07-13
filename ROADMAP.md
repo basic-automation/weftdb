@@ -1002,12 +1002,24 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   binary: a scrambled batch (repeat + off-grid miss + out-of-range) returns the correct per-instant
   values in order and matches the single `/at`. Amortization benchmarked at the codec layer (~27×
   for 64 instants, see the batch-read item above).
-- [ ] **Next slice — block-random-access timestamp search for the sorted point lookup (Phase 4/6):**
-  the streaming point read no longer decodes the value column, but it still decodes the *whole*
-  timestamp column to binary-search for the row — the remaining `O(n)` cost. Make the timestamp
-  lookup block-random-access too (a binary search that reconstructs only the delta-of-delta blocks
-  it probes) so a sorted point lookup is fully sublinear, and benchmark it vs the current
-  whole-timestamp decode.
+- [x] **Closed-form timestamp lookup for regular (constant-stride) columns (Phase 4/6): shipped.**
+  The remaining `O(n)` cost of the streaming point read was the whole-timestamp decode + binary
+  search. For a **regular series** (the common IoT/finance case) that is now `O(1)`:
+  `DeltaOfDeltaColumn::arithmetic_stride()` detects a constant stride (first difference defined, all
+  second differences zero → `ts[i] = first + i*step`), and `read_points_from_section` resolves each
+  instant's row in closed form (`(t - first) / step`, gated on `time_sorted` so `step > 0` and no
+  wrap-around) — **no timestamp materialization at all**. An irregular or out-of-order column decodes
+  + binary/linear-searches as before. Benchmarked (`benches/pointread.rs`, 100k-row point lookup):
+  **regular closed-form 191.53 µs vs irregular decode+search 1.3353 ms — ~7× faster** (and the
+  single-block streaming point lookup dropped to 192 µs / ~62× vs the 11.9 ms full decode). Validated
+  for equality against `value_at` by the existing point-read tests (whose regular fixtures now take
+  the closed-form path, the duplicate/irregular ones the fallback) + a dedicated `arithmetic_stride`
+  test.
+- [ ] **Next slice — block-random-access timestamp search for *irregular* sorted columns (Phase 4/6):**
+  the regular case is closed-form; an irregular sorted column still decodes the *whole* delta-of-delta
+  stream to binary-search. Add per-block timestamp checkpoints (a sparse `(block → reconstructed ts,
+  running delta)` index, a format bump) so a binary search reconstructs only the blocks it probes,
+  making the irregular sorted point lookup sublinear too; benchmark vs the current whole-column decode.
 - [x] Add p50/p95/p99 + confidence-interval reporting
 - [x] Add physical value types (`F64`, `ScaledI64`, `BigDecimalText` + three more)
 - [x] Prototype columnar segment reads for one aspect type (`database::SegmentStore`)

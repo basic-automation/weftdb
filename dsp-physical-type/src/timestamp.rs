@@ -1185,6 +1185,26 @@ impl DeltaColumn {
 }
 
 impl DeltaOfDeltaColumn {
+	/// The `(first, step)` of a **constant-stride (arithmetic) column** — a regular series where
+	/// every consecutive gap is identical — or [`None`] when the timestamps are irregular.
+	///
+	/// A column is arithmetic iff its first difference is defined and **every second difference is
+	/// zero** (a constant gap of `step`), so the `i`-th timestamp is exactly `first + i * step`.
+	/// This is the closed form a point lookup uses to find the row for an instant in `O(1)` instead
+	/// of reconstructing (and binary-searching) the whole timestamp column — the common case for
+	/// regularly-sampled `IoT` / finance series (roadmap Phase 4/6, block-random-access timestamp
+	/// search). A single-point or empty column has no defined stride and returns `None` (its lookup
+	/// is trivial anyway). `step` may be any non-zero sign here; callers that need monotonic
+	/// uniqueness (a point lookup) additionally require the segment's `time_sorted` signal, which
+	/// implies `step > 0`.
+	#[must_use]
+	pub fn arithmetic_stride(&self) -> Option<(i64, i64)> {
+		match self.first_delta {
+			Some(step) if step != 0 && self.dods.iter().all(|&d| d == 0) => Some((self.first, step)),
+			_ => None,
+		}
+	}
+
 	/// Estimated packed size: the anchor (8-byte `i64`), the first delta
 	/// (varint), and the varint-coded second-difference stream.
 	#[must_use]
@@ -1464,6 +1484,24 @@ mod tests {
 		let values = vec![5, 9, 12, 100, 101, 102, 50];
 		let enc = encode_delta_of_delta(&values, TimeUnit::Micros);
 		assert_eq!(decode_delta_of_delta(&enc), values);
+	}
+
+	#[test]
+	fn arithmetic_stride_detects_regular_columns() {
+		// A constant-stride column reports its (first, step); the closed form must reproduce it.
+		let regular: Vec<i64> = (0..64).map(|i| 1_000 + i * 7).collect();
+		let (first, step) = encode_delta_of_delta(&regular, TimeUnit::Millis).arithmetic_stride().expect("regular");
+		assert_eq!((first, step), (1_000, 7));
+		for (i, &v) in regular.iter().enumerate() {
+			assert_eq!(first + i as i64 * step, v);
+		}
+		// A decreasing regular column reports a negative step (callers gate on time_sorted).
+		assert_eq!(encode_delta_of_delta(&[100, 90, 80, 70], TimeUnit::Seconds).arithmetic_stride(), Some((100, -10)));
+		// Irregular gaps, a single spike, all-equal (step 0), single-point, and empty are not arithmetic.
+		assert_eq!(encode_delta_of_delta(&[0, 10, 20, 25, 35], TimeUnit::Seconds).arithmetic_stride(), None);
+		assert_eq!(encode_delta_of_delta(&[5, 5, 5, 5], TimeUnit::Seconds).arithmetic_stride(), None);
+		assert_eq!(encode_delta_of_delta(&[42], TimeUnit::Seconds).arithmetic_stride(), None);
+		assert_eq!(encode_delta_of_delta(&[], TimeUnit::Seconds).arithmetic_stride(), None);
 	}
 
 	#[test]

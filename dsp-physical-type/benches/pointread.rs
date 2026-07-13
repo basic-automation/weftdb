@@ -123,5 +123,38 @@ fn bench_batch_point_read(c: &mut Criterion) {
 	group.finish();
 }
 
-criterion_group!(benches, bench_point_read, bench_paged_point_read, bench_batch_point_read);
+fn bench_regular_vs_irregular(c: &mut Criterion) {
+	let n = 100_000;
+	// A regular (constant-stride) FOR segment — the point read resolves the row in closed form.
+	let regular = build_segment(n);
+	let regular_bytes = regular.write_to();
+	// An irregular segment (a deterministic pseudo-random jitter on each gap) — the point read must
+	// reconstruct + binary-search the timestamp column.
+	let mut ts = Vec::with_capacity(n);
+	let mut cur = 1_000_i64;
+	for i in 0..n {
+		let mut x = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+		x ^= x >> 29;
+		cur += 1 + i64::from((x % 20) as u32); // strictly increasing, irregular gaps
+		ts.push(cur);
+	}
+	let vs: Vec<BigDecimal> = (0..n).map(|i| format!("10000000.{:02}", i % 97).parse().expect("parses")).collect();
+	let irregular = Segment::build_sorted(&ts, &vs, TimeUnit::Millis, &BigDecimal::from(0)).expect("builds");
+	let irregular_bytes = irregular.write_to();
+
+	// Look up the mid instant of each (both present, both interior).
+	let t_regular = 1_000 + (n as i64 / 2) * 10;
+	let t_irregular = ts[n / 2];
+	assert!(read_segment_point(&regular_bytes, t_regular).expect("reads").is_some());
+	assert!(read_segment_point(&irregular_bytes, t_irregular).expect("reads").is_some());
+
+	let mut group = c.benchmark_group("point_lookup_timestamp_100k");
+	// Regular: closed-form index, no timestamp materialization.
+	group.bench_function("regular_closed_form", |b| b.iter(|| black_box(read_segment_point(black_box(&regular_bytes), black_box(t_regular)).expect("reads"))));
+	// Irregular: full delta-of-delta decode + binary search.
+	group.bench_function("irregular_decode_search", |b| b.iter(|| black_box(read_segment_point(black_box(&irregular_bytes), black_box(t_irregular)).expect("reads"))));
+	group.finish();
+}
+
+criterion_group!(benches, bench_point_read, bench_paged_point_read, bench_batch_point_read, bench_regular_vs_irregular);
 criterion_main!(benches);
