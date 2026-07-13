@@ -17,7 +17,7 @@ use std::hint::black_box;
 
 use bigdecimal::BigDecimal;
 use criterion::{criterion_group, criterion_main, Criterion};
-use dsp_physical_type::{dspseg::{read_paged_segment_point, read_segment_point, read_segment_points}, timestamp::TimeUnit, PagedSegment, Segment};
+use dsp_physical_type::{dspseg::{read_paged_segment_point, read_segment, read_segment_point, read_segment_points, read_segment_range}, timestamp::TimeUnit, PagedSegment, Segment};
 
 /// The FOR-packing corpus values: a high base (`10000000`) with a tiny 2-decimal wobble
 /// (`.00`..`.96`) that f64 cannot represent exactly, so `recommend_encoding` selects `ScaledI64`
@@ -156,5 +156,35 @@ fn bench_regular_vs_irregular(c: &mut Criterion) {
 	group.finish();
 }
 
-criterion_group!(benches, bench_point_read, bench_paged_point_read, bench_batch_point_read, bench_regular_vs_irregular);
+fn bench_range_read(c: &mut Criterion) {
+	let n = 100_000;
+	let segment = build_segment(n); // regular ts, FOR value codec
+	let bytes = segment.write_to();
+
+	// A selective 100-row window in the middle of a 100k-row segment.
+	let start = 1_000 + (n as i64 / 2) * 10;
+	let end = start + 99 * 10;
+
+	// Correctness guard: the windowed read equals the full decode + filter.
+	let (wt, wv) = read_segment_range(&bytes, start, end).expect("reads");
+	let (ft, fv) = read_segment(&bytes).expect("reads").decode_nullable();
+	let expected: (Vec<i64>, Vec<Option<BigDecimal>>) = ft.into_iter().zip(fv).filter(|(t, _)| start <= *t && *t <= end).unzip();
+	assert_eq!((wt.clone(), wv.clone()), expected, "windowed range read must equal the full decode + filter");
+	assert_eq!(wt.len(), 100, "the window must be 100 rows");
+
+	let mut group = c.benchmark_group("range_read_100k_window100");
+	// Full decode then filter — decodes all 100k values.
+	group.bench_function("full_decode_filter", |b| {
+		b.iter(|| {
+			let (t, v) = read_segment(black_box(&bytes)).expect("reads").decode_nullable();
+			let out: (Vec<i64>, Vec<Option<BigDecimal>>) = t.into_iter().zip(v).filter(|(t, _)| start <= *t && *t <= end).unzip();
+			black_box(out)
+		})
+	});
+	// Windowed read — closed-form row window, unpacks only the ~100 values inside it.
+	group.bench_function("windowed_read", |b| b.iter(|| black_box(read_segment_range(black_box(&bytes), black_box(start), black_box(end)).expect("reads"))));
+	group.finish();
+}
+
+criterion_group!(benches, bench_point_read, bench_paged_point_read, bench_batch_point_read, bench_regular_vs_irregular, bench_range_read);
 criterion_main!(benches);
