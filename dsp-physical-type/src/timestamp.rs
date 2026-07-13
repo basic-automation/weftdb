@@ -539,6 +539,42 @@ pub fn transpose_bitpack_encode(values: &[i64], tile: usize) -> Vec<u8> {
 	out
 }
 
+/// Decode one transposed tile's `len` lanes from its `width` bit-planes (the `plane_bytes =
+/// ceil(len / 8)` bytes per plane starting at `planes`). Shared by [`transpose_bitpack_decode`]
+/// and [`transpose_bitpack_decode_range`].
+///
+/// Reads each plane as `u64` words and distributes only the **set** bits of each word to their
+/// lanes (`w &= w - 1` walks set bits), so an all-zero plane word costs a single compare — the
+/// decode-latency win. A `width` of 0 (a constant tile) yields `len` zeros; bytes past `planes`
+/// read as 0 (a truncated tile yields zeros rather than panicking).
+fn transpose_tile_decode(planes: &[u8], width: usize, len: usize) -> Vec<i64> {
+	if width == 0 {
+		return vec![0; len];
+	}
+	let plane_bytes = len.div_ceil(8);
+	let mut acc = vec![0_u64; len];
+	for b in 0..width {
+		let plane_start = b * plane_bytes;
+		let plane = planes.get(plane_start..plane_start + plane_bytes).unwrap_or(&[]);
+		for (g, group) in plane.chunks(8).enumerate() {
+			let mut word = 0_u64;
+			for (i, &byte) in group.iter().enumerate() {
+				word |= u64::from(byte) << (i * 8);
+			}
+			let base = g * 64;
+			let mut set = word;
+			while set != 0 {
+				let k = set.trailing_zeros() as usize;
+				if base + k < len {
+					acc[base + k] |= 1_u64 << b;
+				}
+				set &= set - 1;
+			}
+		}
+	}
+	acc.iter().map(|&a| unzigzag(a)).collect()
+}
+
 /// Reconstruct `count` differences from a transposed per-tile bit-pack buffer.
 ///
 /// Exact inverse of [`transpose_bitpack_encode`] given the same `tile` and `count`. The
@@ -557,35 +593,53 @@ pub fn transpose_bitpack_decode(bytes: &[u8], tile: usize, count: usize) -> Vec<
 		let len = remaining.min(tile);
 		let width = usize::from(bytes.get(pos).copied().unwrap_or(0));
 		pos += 1;
-		if width == 0 {
-			out.resize(out.len() + len, 0);
-			remaining -= len;
-			continue;
-		}
 		let plane_bytes = len.div_ceil(8);
-		let mut acc = vec![0_u64; len];
-		for b in 0..width {
-			let plane_start = pos + b * plane_bytes;
-			let plane = bytes.get(plane_start..plane_start + plane_bytes).unwrap_or(&[]);
-			for (g, group) in plane.chunks(8).enumerate() {
-				let mut word = 0_u64;
-				for (i, &byte) in group.iter().enumerate() {
-					word |= u64::from(byte) << (i * 8);
-				}
-				let base = g * 64;
-				let mut set = word;
-				while set != 0 {
-					let k = set.trailing_zeros() as usize;
-					if base + k < len {
-						acc[base + k] |= 1_u64 << b;
-					}
-					set &= set - 1;
-				}
-			}
-		}
-		pos += width * plane_bytes;
-		out.extend(acc.iter().map(|&a| unzigzag(a)));
+		let data_len = width * plane_bytes;
+		let planes = bytes.get(pos..pos + data_len).unwrap_or(&[]);
+		out.extend(transpose_tile_decode(planes, width, len));
+		pos += data_len;
 		remaining -= len;
+	}
+	out
+}
+
+/// **Tile-level random access:** decode only the `len` differences at global index `start` from
+/// a transposed per-tile bit-pack buffer.
+///
+/// The tiles before `start` are skipped by reading their one-byte width headers (and computing
+/// each tile's plane-byte length) rather than decoding their planes — the transposed mirror of
+/// [`blocked_bitpack_decode_range`]. This is the random-access primitive the transposed layout
+/// needs to serve a point lookup or sub-range without materializing the whole column (so the
+/// layout can back a block-random-access value/timestamp codec without regressing the streaming
+/// point read). The result equals `transpose_bitpack_decode(bytes, tile, count)[start..start+len]`
+/// (clamped to `count`); a `start >= count` or `len == 0` yields an empty vector. Roadmap Phase
+/// 6.1 "realize the transposed layout on disk". *(src: `FastLanes` Compression Layout, VLDB'23 —
+/// <https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf>)*
+#[must_use]
+pub fn transpose_bitpack_decode_range(bytes: &[u8], tile: usize, count: usize, start: usize, len: usize) -> Vec<i64> {
+	let tile = tile.max(1);
+	let end = start.saturating_add(len).min(count);
+	if start >= end {
+		return Vec::new();
+	}
+	let mut out = Vec::with_capacity(end - start);
+	let mut pos = 0_usize;
+	let mut idx = 0_usize;
+	while idx < end {
+		let tile_len = tile.min(count - idx);
+		let width = usize::from(bytes.get(pos).copied().unwrap_or(0));
+		pos += 1;
+		let data_len = width * tile_len.div_ceil(8);
+		// Decode this tile only if the requested range overlaps [idx, idx + tile_len).
+		if idx + tile_len > start {
+			let planes = bytes.get(pos..pos + data_len).unwrap_or(&[]);
+			let decoded = transpose_tile_decode(planes, width, tile_len);
+			let lo = start.saturating_sub(idx);
+			let hi = (end - idx).min(tile_len);
+			out.extend_from_slice(&decoded[lo..hi]);
+		}
+		pos += data_len;
+		idx += tile_len;
 	}
 	out
 }
@@ -1919,5 +1973,25 @@ mod tests {
 		assert_eq!(transpose_bitpack_decode(&enc, 8, 20), vec![0_i64; 20]);
 		// A zero tile size is clamped to 1, never a panic.
 		assert_eq!(transpose_bitpack_bytes(&[0, 0, 0], 0), 3);
+	}
+
+	#[test]
+	fn transpose_bitpack_decode_range_matches_the_full_decode() {
+		// Tile-level random access must equal the full decode sliced to [start, start+len) for
+		// every tile size and window — including single-value reads, windows straddling tile
+		// boundaries, all-zero (width-0) tiles, and out-of-range/empty requests.
+		let vals: Vec<i64> = (0..333).map(|i| if (40..56).contains(&i) { 1_000_000 + i } else { (i % 11) - 5 }).collect();
+		for tile in [1_usize, 7, 8, 16, 64, 128, 333, 1024] {
+			let bytes = transpose_bitpack_encode(&vals, tile);
+			let full = transpose_bitpack_decode(&bytes, tile, vals.len());
+			for (start, len) in [(0_usize, 1_usize), (0, vals.len()), (50, 1), (7, 20), (tile.saturating_sub(1), 3), (tile, 5), (200, 133), (330, 10), (vals.len(), 4), (10, 0)] {
+				let end = (start + len).min(vals.len());
+				let expected = if start >= end { Vec::new() } else { full[start..end].to_vec() };
+				assert_eq!(transpose_bitpack_decode_range(&bytes, tile, vals.len(), start, len), expected, "tile={tile} start={start} len={len}");
+			}
+		}
+		// An all-zero (width-0) multi-tile stream random-accesses to zeros.
+		let zeros = transpose_bitpack_encode(&[0; 40], 8);
+		assert_eq!(transpose_bitpack_decode_range(&zeros, 8, 40, 33, 5), vec![0_i64; 5]);
 	}
 }

@@ -869,12 +869,23 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   transposed **~238 Melem/s (4.40 ms)** vs linear per-block **~41.6 Melem/s (25.2 ms)** at the same
   footprint — **~5.7× decode speedup**, bytes/point unchanged. *(src: FastLanes, VLDB'23 —
   https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf)*
-- [ ] **Next slice — realize the transposed layout on disk (Phase 6.1, decode-speed residue):**
-  the transposed decode is a proven ~5.7× win but is a prototype on no read path. Realize it as
-  the stored layout for the blocked value/timestamp codec (identical bytes on aligned tiles) behind
-  a segment-format-version bump with reader dispatch (old version → linear decode, new → transposed),
-  and benchmark the end-to-end read-decode win. Note the **decode-throughput-is-often-bandwidth-bound**
-  caveat before claiming an end-to-end win — measure, don't assume. *(src: FastLanes, VLDB'23 —
+- [x] **Transposed-layout tile-level random access (Phase 6.1, decode-speed residue — first
+  slice): shipped.** `timestamp::transpose_bitpack_decode_range(bytes, tile, count, start, len)`
+  decodes only the `len` values at `start`, skipping earlier tiles by their width headers — the
+  transposed mirror of `blocked_bitpack_decode_range`. This is the prerequisite the on-disk
+  realization needs: without it, storing the transposed layout as a value codec would regress the
+  just-shipped streaming point read (which requires a block-random-access value decode). Shared the
+  per-tile decode with the full `transpose_bitpack_decode` via a `transpose_tile_decode` helper;
+  the range decode equals the full decode sliced to `[start, start+len)` (round-trip-tested across
+  tile sizes, single-value/boundary-straddling windows, width-0 tiles, and out-of-range requests).
+- [ ] **Next slice — realize the transposed layout on disk (Phase 6.1, decode-speed residue):** the
+  tile-random-access decoder now exists, so wire the transposed layout as a realized value/timestamp
+  codec (a new `VAL_CODEC_*`/`TS_CODEC_*` tag with reader dispatch; **note the transposed footprint
+  differs from the block=64 codec — tile=1024, and a short tail costs up to `width-1` extra bytes —
+  so it needs its own size function + selector entry, it is not a drop-in re-encoding of the blocked
+  bytes**), have `read_value_at` use `transpose_bitpack_decode_range` on it, and benchmark the
+  **end-to-end** read-decode win. Note the **decode-throughput-is-often-bandwidth-bound** caveat
+  before claiming an end-to-end win — measure, don't assume. *(src: FastLanes, VLDB'23 —
   https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf · "When Is a Columnar Scan Bandwidth-Bound? A
   Decode-Throughput Law", 2026 — https://arxiv.org/pdf/2606.22423)*
 - [ ] **Next slice — evaluate Vortex as interchange + bench baseline (Phase 1/4):** Rust,
