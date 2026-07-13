@@ -964,8 +964,12 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   `read_point_from_section` (the block-skip value read applies within the page too), matching
   `PagedSegment::value_at`'s first-present-page semantics. The paged branch of
   `SegmentStore::read_point` (which powers `GET …/storage/{aspect}/at` for paged frames) now takes
-  it. Refactored the single-block reader onto the same section helper so both share one code path;
-  runtime-verified against the live endpoint on a 5-page FOR frame.
+  it. Refactored the single-block reader onto the same section helper so both share one code path.
+  Benchmarked (`benches/pointread.rs`, 100k-row FOR frame, 4096 rows/page ≈ 25 pages): **168.99 µs
+  vs 1.2471 ms full paged decode — ~7.4× faster** (a smaller multiple than the single-block ~53×
+  because `PagedSegment::value_at` already prunes pages before materializing values; the streaming
+  read additionally skips the surviving page's value-column decode). Runtime-verified against the
+  live endpoint on a 5-page FOR frame (format_version 6).
 - [ ] **Next slice — block-random-access timestamp search for the sorted point lookup (Phase 4/6):**
   the streaming point read no longer decodes the value column, but it still decodes the *whole*
   timestamp column to binary-search for the row — the remaining `O(n)` cost. Make the timestamp

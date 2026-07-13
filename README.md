@@ -369,8 +369,9 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   point lookup **never materializes the value column** on a per-block codec (equal to a full
   decode + `value_at` for every frame; the non-block codecs fall back to that). `read_paged_segment_point`
   does the same for a paged frame, first pruning pages on their indexed min/max timestamp so only
-  the surviving page is touched. Measured **~59× faster** point lookup on a 100k-row FOR segment
-  (222 µs vs 13.2 ms), identical bytes on disk
+  the surviving page is touched. Measured **~53× faster** point lookup on a 100k-row single-block
+  FOR segment (220 µs vs 11.6 ms) and **~7.4× faster** on the paged frame (169 µs vs 1.25 ms),
+  identical bytes on disk
   ([`dsp-physical-type/benches/pointread.rs`](dsp-physical-type/benches/pointread.rs)).
 - **Realized headline bytes/point** — every headline bytes/point figure
   (`Segment::bytes_per_point`, `StorageEstimate.bytes_per_point` /

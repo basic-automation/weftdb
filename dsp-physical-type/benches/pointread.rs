@@ -17,17 +17,27 @@ use std::hint::black_box;
 
 use bigdecimal::BigDecimal;
 use criterion::{criterion_group, criterion_main, Criterion};
-use dsp_physical_type::{dspseg::read_segment_point, timestamp::TimeUnit, Segment};
+use dsp_physical_type::{dspseg::{read_paged_segment_point, read_segment_point}, timestamp::TimeUnit, PagedSegment, Segment};
 
-/// A large sorted `ScaledI64` segment whose value column FOR-packs: a high base (`10000000`)
-/// with a tiny 2-decimal wobble (`.00`..`.96`) that f64 cannot represent exactly, so
-/// `recommend_encoding` selects `ScaledI64` and the clustered mantissas pick `VAL_CODEC_FOR`.
-fn build_segment(n: usize) -> Segment {
+/// The FOR-packing corpus values: a high base (`10000000`) with a tiny 2-decimal wobble
+/// (`.00`..`.96`) that f64 cannot represent exactly, so `recommend_encoding` selects `ScaledI64`
+/// and the clustered mantissas pick `VAL_CODEC_FOR` (the block-skip fast path).
+fn corpus(n: usize) -> (Vec<i64>, Vec<BigDecimal>) {
 	let timestamps: Vec<i64> = (0..n as i64).map(|i| 1_000 + i * 10).collect();
-	let values: Vec<BigDecimal> = (0..n)
-		.map(|i| format!("10000000.{:02}", i % 97).parse().expect("literal parses"))
-		.collect();
+	let values: Vec<BigDecimal> = (0..n).map(|i| format!("10000000.{:02}", i % 97).parse().expect("literal parses")).collect();
+	(timestamps, values)
+}
+
+/// A large sorted single-block `ScaledI64`/FOR segment.
+fn build_segment(n: usize) -> Segment {
+	let (timestamps, values) = corpus(n);
 	Segment::build_sorted(&timestamps, &values, TimeUnit::Millis, &BigDecimal::from(0)).expect("builds")
+}
+
+/// The same corpus sealed as a paged frame (`rows_per_page` pages of FOR-packed values).
+fn build_paged_segment(n: usize, rows_per_page: usize) -> PagedSegment {
+	let (timestamps, values) = corpus(n);
+	PagedSegment::build(&timestamps, &values, TimeUnit::Millis, &BigDecimal::from(0), rows_per_page).expect("builds")
 }
 
 fn bench_point_read(c: &mut Criterion) {
@@ -55,5 +65,31 @@ fn bench_point_read(c: &mut Criterion) {
 	group.finish();
 }
 
-criterion_group!(benches, bench_point_read);
+fn bench_paged_point_read(c: &mut Criterion) {
+	let n = 100_000;
+	let rows_per_page = 4_096; // ~25 pages
+	let segment = build_paged_segment(n, rows_per_page);
+	assert!(matches!(segment.pages[0].values.best_value_codec(), "scaled_for" | "scaled_blocked"), "a page must pick a per-block codec so the streaming read takes the fast path");
+	let bytes = segment.write_to();
+
+	// A mid-segment timestamp (present) — lands in an interior page.
+	let t = 1_000 + (n as i64 / 2) * 10;
+
+	// Correctness guard: the streaming paged read must equal the full paged decode + value_at.
+	let streaming = read_paged_segment_point(&bytes, t).expect("reads");
+	let full = PagedSegment::read_from(&bytes).expect("reads").value_at(t);
+	assert_eq!(streaming, full, "streaming paged point read must equal the full-decode value_at");
+	assert!(streaming.is_some(), "the queried timestamp must be present");
+
+	let mut group = c.benchmark_group("paged_segment_point_lookup_100k");
+
+	// The old read path: decode every page (all value + timestamp columns), then prune + search.
+	group.bench_function("full_decode_value_at", |b| b.iter(|| black_box(PagedSegment::read_from(black_box(&bytes)).expect("reads").value_at(black_box(t)))));
+	// The streaming read: prune pages on the index, decode only the surviving page's columns.
+	group.bench_function("streaming_point", |b| b.iter(|| black_box(read_paged_segment_point(black_box(&bytes), black_box(t)).expect("reads"))));
+
+	group.finish();
+}
+
+criterion_group!(benches, bench_point_read, bench_paged_point_read);
 criterion_main!(benches);
