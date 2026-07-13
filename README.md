@@ -370,10 +370,12 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   point lookup **never materializes the value column** on a per-block codec (equal to a full
   decode + `value_at` for every frame; the non-block codecs fall back to that). `read_paged_segment_point`
   does the same for a paged frame, first pruning pages on their indexed min/max timestamp so only
-  the surviving page is touched. Measured **~53× faster** point lookup on a 100k-row single-block
-  FOR segment (220 µs vs 11.6 ms) and **~7.4× faster** on the paged frame (169 µs vs 1.25 ms),
-  identical bytes on disk
-  ([`dsp-physical-type/benches/pointread.rs`](dsp-physical-type/benches/pointread.rs)).
+  the surviving page is touched. A **regular (constant-stride) timestamp column** is resolved in
+  closed form — `ts[i] = first + i*step`, so the row for an instant is `O(1)` with no timestamp
+  materialization at all. Measured **~62× faster** point lookup on a 100k-row single-block FOR
+  segment (192 µs vs 11.9 ms) and **~7.1× faster** on the paged frame (169 µs vs 1.20 ms), with the
+  closed-form timestamp path a further **~7×** over an irregular column (192 µs vs 1.34 ms), identical
+  bytes on disk ([`dsp-physical-type/benches/pointread.rs`](dsp-physical-type/benches/pointread.rs)).
 - **Realized headline bytes/point** — every headline bytes/point figure
   (`Segment::bytes_per_point`, `StorageEstimate.bytes_per_point` /
   `total_bytes_per_point`, the bench HTML `val B/pt`) reports the codec **actually
@@ -415,7 +417,7 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   `SegmentStore::read_points` resolves a **batch** of instants in one pass — the index is pruned
   once and each segment's timestamp column decoded once for the whole batch, so `N` instants
   sharing a segment cost one decode, not `N` (**~27× faster** for 64 instants on a 100k-row FOR
-  frame — 521 µs vs 13.9 ms,
+  frame — 452 µs vs 12.2 ms,
   [`dsp-physical-type/benches/pointread.rs`](dsp-physical-type/benches/pointread.rs)).
 - **Intra-segment reconciliation** — `SegmentStore::reconcile_segment`/`reconcile_aspect`
   rewrite an out-of-order segment into a sorted one in place (stable sort by
