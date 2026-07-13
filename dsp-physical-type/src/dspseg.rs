@@ -1248,6 +1248,104 @@ pub fn read_paged_segment_points(bytes: &[u8], ts: &[i64]) -> Result<Vec<Option<
 	Ok(out)
 }
 
+/// **Windowed range read** from a single-block `.dspseg` frame — the rows in `[start, end]`.
+///
+/// Returns the `(timestamp, value)` rows whose timestamp falls in the inclusive `[start, end]`
+/// window, aligned and in row order — exactly `read_segment(bytes)?.decode_nullable()` filtered to
+/// `[start, end]`.
+///
+/// For a **regular (constant-stride) sorted column with a random-access value codec** the window is
+/// resolved *without materializing the whole segment*: the row range `[lo, hi]` is computed in
+/// closed form from the stride (`ts[i] = first + i*step`), the timestamps are generated directly,
+/// and only the present values inside the window are unpacked via [`read_value_at`] (one block per
+/// present row) — so a selective range over a large regular block-coded segment decodes ~`window`
+/// values, not all of them. Any other shape (irregular timestamps, a per-value/cascade value codec,
+/// an out-of-order segment) falls back to a full [`read_segment`] decode then a filter, which is
+/// always correct. Roadmap Phase 4/6 (the range-read analogue of the streaming point read).
+///
+/// # Errors
+///
+/// Propagates the same [`DspSegError`]s as [`read_segment`].
+pub fn read_segment_range(bytes: &[u8], start: i64, end: i64) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>), DspSegError> {
+	if bytes.len() < 4 {
+		return Err(DspSegError::UnexpectedEof { needed: 4, remaining: bytes.len() });
+	}
+	let (body, crc_bytes) = bytes.split_at(bytes.len() - 4);
+	let stored = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+	let computed = crc32(body);
+	if stored != computed {
+		return Err(DspSegError::ChecksumMismatch { stored, computed });
+	}
+	let mut r = ByteReader::new(body);
+	if r.take(MAGIC.len())? != MAGIC {
+		return Err(DspSegError::BadMagic);
+	}
+	let version = r.read_u16_le()?;
+	if version != SEGMENT_FORMAT_VERSION {
+		return Err(DspSegError::UnsupportedVersion { found: version });
+	}
+	let stats = read_segment_stats(&mut r)?;
+	// A full decode + filter — the always-correct answer, and the fallback for every shape the
+	// closed-form window below does not cover.
+	let full_filtered = || -> Result<(Vec<i64>, Vec<Option<BigDecimal>>), DspSegError> {
+		let (ts, vs) = read_segment(bytes)?.decode_nullable();
+		Ok(ts.into_iter().zip(vs).filter(|(t, _)| start <= *t && *t <= end).unzip())
+	};
+	// Coarse span bail — a window disjoint from the segment yields nothing.
+	let (Some(min_ts), Some(max_ts)) = (stats.min_ts, stats.max_ts) else { return Ok((Vec::new(), Vec::new())) };
+	if end < min_ts || start > max_ts {
+		return Ok((Vec::new(), Vec::new()));
+	}
+	let section = &body[r.pos..];
+	// The closed-form fast path needs a random-access value codec (per-present-row read) and a
+	// sorted, constant-stride timestamp column.
+	if !value_block_has_random_access_codec(section) {
+		return full_filtered();
+	}
+	let mut sr = ByteReader::new(section);
+	skip_random_access_value_column(&mut sr)?;
+	let ts_col = read_timestamp_column(&mut sr)?;
+	let nulls = read_null_column(&mut sr, stats.row_count, stats.null_count)?;
+	// The closed form is exact only for a sorted, strictly-increasing (constant positive stride)
+	// column; anything else falls back to the full decode.
+	let stride = if stats.time_sorted { ts_col.arithmetic_stride().filter(|&(_, step)| step > 0) } else { None };
+	let Some((first, step)) = stride else {
+		return full_filtered();
+	};
+	// Closed-form row window: lo = first row with ts >= start, hi = last row with ts <= end.
+	let step128 = i128::from(step);
+	let start_off = i128::from(start) - i128::from(first);
+	let lo: usize = if start_off <= 0 {
+		0
+	} else {
+		let (q, rem) = (start_off / step128, start_off % step128);
+		usize::try_from(if rem == 0 { q } else { q + 1 }).unwrap_or(usize::MAX)
+	};
+	let end_off = i128::from(end) - i128::from(first);
+	if end_off < 0 {
+		return Ok((Vec::new(), Vec::new()));
+	}
+	let hi = usize::try_from(end_off / step128).unwrap_or(usize::MAX).min(stats.row_count - 1);
+	if lo > hi {
+		return Ok((Vec::new(), Vec::new()));
+	}
+	// Generate the window: timestamps in closed form, present values one block at a time.
+	let mut timestamps = Vec::with_capacity(hi - lo + 1);
+	let mut values = Vec::with_capacity(hi - lo + 1);
+	let mut dense = dense_rank(&nulls, lo);
+	for row in lo..=hi {
+		let offset = i64::try_from(row).unwrap_or(i64::MAX);
+		timestamps.push(first.wrapping_add(offset.wrapping_mul(step)));
+		if nulls.is_present(row) {
+			values.push(read_value_at(section, dense)?.map(|pv| pv.to_logical()));
+			dense += 1;
+		} else {
+			values.push(None);
+		}
+	}
+	Ok((timestamps, values))
+}
+
 // ---------------------------------------------------------------------------
 // Timestamp-column codec (Phase 4.3, slice 3)
 //
@@ -2300,6 +2398,49 @@ mod tests {
 		// An empty query slice is answered with an empty vector, touching nothing.
 		assert!(read_segment_points(&single_bytes, &[]).expect("reads").is_empty());
 		assert!(read_paged_segment_points(&paged_bytes, &[]).expect("reads").is_empty());
+	}
+
+	#[test]
+	fn read_segment_range_matches_the_full_decode_filter() {
+		// The windowed range read must equal `decode_nullable()` filtered to [start, end] for every
+		// window — the regular/random-access-codec segments take the closed-form fast path, the
+		// irregular / non-block-codec / out-of-order ones the full-decode fallback.
+		let scaled2 = |m: i64| -> String {
+			let (sign, a) = (if m < 0 { "-" } else { "" }, m.abs());
+			format!("{sign}{}.{:02}", a / 100, a % 100)
+		};
+		// Regular + FOR value codec (fast path).
+		let for_lits: Vec<String> = (0..300).map(|i| format!("10000000.{:02}", i % 97)).collect();
+		let for_vals = col(&for_lits.iter().map(String::as_str).collect::<Vec<_>>());
+		let regular_ts: Vec<i64> = (0..300).map(|i| 1_000 + i64::from(i) * 10).collect();
+		let regular = Segment::build_sorted(&regular_ts, &for_vals, TimeUnit::Millis, &BigDecimal::from(0)).expect("builds");
+		assert_eq!(regular.values.best_value_codec(), "scaled_for");
+		// Regular + nulls (sparse fast path exercises the dense-rank window).
+		let mut null_vals: Vec<Option<BigDecimal>> = for_vals.iter().cloned().map(Some).collect();
+		for &row in &[3_usize, 4, 128, 250] {
+			null_vals[row] = None;
+		}
+		let regular_null = Segment::build_nullable_sorted(&regular_ts, &null_vals, TimeUnit::Millis, &BigDecimal::from(0)).expect("builds");
+		// Irregular monotonic (fallback: block codec but non-constant stride).
+		let irr_lits: Vec<String> = (0..64).map(|i| scaled2((i * 37) % 81 - 40)).collect();
+		let irregular = Segment::build_sorted(&[0_i64, 5, 6, 20, 21, 40, 100, 101].iter().chain((200..256).collect::<Vec<_>>().iter()).copied().collect::<Vec<_>>(), &col(&irr_lits.iter().map(String::as_str).collect::<Vec<_>>()), TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		// F64 (non-random-access value codec → fallback), regular timestamps.
+		let f64_seg = Segment::build(&[10_i64, 20, 30, 40, 50], &col(&["0.5", "1.5", "2.5", "3.5", "4.5"]), TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		// Out-of-order (fallback).
+		let unsorted = Segment::build(&[40_i64, 10, 30, 20], &col(&["4", "1", "3", "2"]), TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+
+		for seg in [&regular, &regular_null, &irregular, &f64_seg, &unsorted] {
+			let bytes = seg.write_to();
+			let (all_ts, all_vs) = seg.decode_nullable();
+			let (lo, hi) = (all_ts.iter().min().copied().unwrap_or(0), all_ts.iter().max().copied().unwrap_or(0));
+			// Windows: full span, an interior sub-window (on- and off-grid ends), single-point,
+			// empty (gap), and fully out of range on both sides.
+			for (start, end) in [(lo, hi), (lo + 15, hi - 15), (lo - 100, lo - 1), (hi + 1, hi + 100), (lo + 105, lo + 105), (lo + 106, lo + 107)] {
+				let (rt, rv) = read_segment_range(&bytes, start, end).expect("reads");
+				let expected: (Vec<i64>, Vec<Option<BigDecimal>>) = all_ts.iter().zip(&all_vs).filter(|(t, _)| start <= **t && **t <= end).map(|(&t, v)| (t, v.clone())).unzip();
+				assert_eq!((rt, rv), expected, "codec {} window [{start},{end}]", seg.values.best_value_codec());
+			}
+		}
 	}
 
 	#[test]

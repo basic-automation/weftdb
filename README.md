@@ -475,7 +475,10 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   straight to the pages it needs.
 - **Data skipping** — segment-level and page-level pruning by time, by value
   band, and by **quality** (segments/pages that overlap a window but hold only
-  nulls there are skipped).
+  nulls there are skipped). A **range read over a regular (constant-stride)
+  block-coded segment** goes further — `read_segment_range` computes the row
+  window in closed form and unpacks only the present values inside it, so a
+  selective range decodes ~`window` values, not the whole segment.
 - **Control plane** — `SegmentIndexStore` persists one descriptor per sealed
   segment in libSQL and answers range queries with SQL pruning;
   `CatalogStore`/`AspectCatalog` register the database → subject → aspect

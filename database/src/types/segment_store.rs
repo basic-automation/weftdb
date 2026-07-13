@@ -354,8 +354,10 @@ impl SegmentStore {
 				let segment = PagedSegment::read_from(&bytes).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?;
 				segment.read_time_range(start, end)
 			} else {
-				let segment = Segment::read_from(&bytes).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?;
-				segment.decode_nullable()
+				// Windowed read: for a regular block-coded segment this decodes only the row window
+				// (closed-form index range + per-present-row value read), not the whole segment; any
+				// other shape falls back to a full decode. Already filtered to `[start, end]`.
+				dsp_physical_type::dspseg::read_segment_range(&bytes, start, end).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?
 			};
 			for (t, v) in ts.into_iter().zip(vs) {
 				if start <= t && t <= end {
