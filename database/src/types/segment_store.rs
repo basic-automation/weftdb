@@ -395,8 +395,10 @@ impl SegmentStore {
 				let segment = PagedSegment::read_from(&bytes).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?;
 				segment.value_at(t)
 			} else {
-				let segment = Segment::read_from(&bytes).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?;
-				segment.value_at(t)
+				// Streaming single-value read: skips the value-column decode for a per-block
+				// codec, unpacking only the block covering `t` (roadmap Phase 4/6). Equal to
+				// `Segment::read_from(&bytes)?.value_at(t)` for every single-block frame.
+				dsp_physical_type::dspseg::read_segment_point(&bytes, t).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?
 			};
 			if hit.is_some() {
 				found = hit;

@@ -363,7 +363,13 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
 - **Block-level random access** — the per-block value codecs support decoding a single value
   (or a sub-range) without materializing the whole column: `dspseg::read_value_at(bytes, i)`
   reads only the block covering row `i` (skipping earlier blocks by their headers) for the
-  blocked/FOR codecs, the point-lookup / late-materialization lever.
+  blocked/FOR codecs, the point-lookup / late-materialization lever. `dspseg::read_segment_point(bytes, t)`
+  wires this up to the framed single-block segment — it skips the value block by its framing,
+  decodes only the timestamps to find the row, and unpacks the one covering value block — so a
+  point lookup **never materializes the value column** on a per-block codec (equal to a full
+  decode + `value_at` for every frame; the non-block codecs fall back to that). Measured **~59×
+  faster** point lookup on a 100k-row FOR segment (222 µs vs 13.2 ms), identical bytes on disk
+  ([`dsp-physical-type/benches/pointread.rs`](dsp-physical-type/benches/pointread.rs)).
 - **Realized headline bytes/point** — every headline bytes/point figure
   (`Segment::bytes_per_point`, `StorageEstimate.bytes_per_point` /
   `total_bytes_per_point`, the bench HTML `val B/pt`) reports the codec **actually
@@ -395,10 +401,12 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   an `unsorted_segments` count so out-of-order data is visible before it costs a
   point-lookup scan.
 - **Order-signal read planner** — a single-instant point lookup
-  (`SegmentStore::read_point`, `Segment::value_at`/`PagedSegment::value_at`) prunes
-  the index to the segments spanning the instant and resolves each with its
-  persisted `time_sorted` flag: a sorted segment is **binary-searched**, an
-  out-of-order one linear-scanned (the only sound search on unsorted timestamps).
+  (`SegmentStore::read_point`) prunes the index to the segments spanning the instant
+  and resolves each with its persisted `time_sorted` flag: a sorted segment is
+  **binary-searched**, an out-of-order one linear-scanned (the only sound search on
+  unsorted timestamps). A single-block segment resolves through the **streaming
+  point read** (`dspseg::read_segment_point`, below) — no value-column materialization
+  on a per-block codec; a paged segment decodes the surviving page (`PagedSegment::value_at`).
 - **Intra-segment reconciliation** — `SegmentStore::reconcile_segment`/`reconcile_aspect`
   rewrite an out-of-order segment into a sorted one in place (stable sort by
   timestamp, re-sealed at the same id, frame kind preserved), so it drops out of the
