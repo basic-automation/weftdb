@@ -478,7 +478,9 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   nulls there are skipped). A **range read over a regular (constant-stride)
   block-coded segment** goes further — `read_segment_range` computes the row
   window in closed form and unpacks only the present values inside it, so a
-  selective range decodes ~`window` values, not the whole segment.
+  selective range decodes ~`window` values, not the whole segment (**~20× faster**
+  for a 100-row window over a 100k-row FOR frame — 629 µs vs 12.7 ms,
+  [`dsp-physical-type/benches/pointread.rs`](dsp-physical-type/benches/pointread.rs)).
 - **Control plane** — `SegmentIndexStore` persists one descriptor per sealed
   segment in libSQL and answers range queries with SQL pruning;
   `CatalogStore`/`AspectCatalog` register the database → subject → aspect
