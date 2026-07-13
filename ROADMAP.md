@@ -994,10 +994,13 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   `N`. Equal to the per-instant `read_point` for every slot (unit-tested single-block + paged +
   cross-segment). Refactored `read_point_from_section` into a batch `read_points_from_section` the
   single-instant path delegates to.
-- [ ] **Next slice — expose batch point lookup at the API (Phase 2/4):** wire `SegmentStore::read_points`
-  to a multi-instant read endpoint (e.g. `GET …/storage/{aspect}/at?t=…&t=…` or a small POST body of
-  instants) returning a `found`/`value` per instant, and runtime-verify it; benchmark the batch vs
-  N single `read_point` calls to quantify the amortized-decode win.
+- [x] **Batch point lookup exposed at the API (Phase 2/4): shipped.**
+  `GET /api/v1/storage/{aspect}/at-multi?t=<epoch>,<epoch>,…` resolves a comma-separated list of
+  instants through `SegmentStore::read_points`, returning `{aspect, time_unit, points:[{timestamp,
+  value, found}]}` in query order (a non-integer entry → `400`). Runtime-verified against the live
+  binary: a scrambled batch (repeat + off-grid miss + out-of-range) returns the correct per-instant
+  values in order and matches the single `/at`. Residue: benchmark the batch vs N single `read_point`
+  calls to quantify the amortized-decode win.
 - [ ] **Next slice — block-random-access timestamp search for the sorted point lookup (Phase 4/6):**
   the streaming point read no longer decodes the value column, but it still decodes the *whole*
   timestamp column to binary-search for the row — the remaining `O(n)` cost. Make the timestamp
