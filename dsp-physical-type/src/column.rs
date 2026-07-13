@@ -206,14 +206,31 @@ impl ColumnEncoding {
 	/// *(src: Vortex / `FastLanes` cascading compression — <https://vortex.dev/>)*
 	#[must_use]
 	pub fn delta_cascade_bytes(&self) -> Option<usize> {
+		self.delta_cascade_plan().map(|p| p.bytes)
+	}
+
+	/// The concrete plan a delta-cascade codec would realize on this `ScaledI64` column —
+	/// the varint **anchor** (the first mantissa), the first-difference **delta** stream, the
+	/// **inner** packer that packs the deltas smallest, and the resulting framing-excluded
+	/// **byte** footprint (matching the [`delta_cascade_bytes`](Self::delta_cascade_bytes)
+	/// convention). `None` for any other physical type.
+	///
+	/// This is the single source of truth the `.dspseg` cascade writer routes through, so the
+	/// bytes the estimate reports are exactly the bytes the on-disk `VAL_CODEC_DELTA_CASCADE`
+	/// block writes (modulo the outer codec-selector byte, excluded like every other codec's
+	/// estimate). The inner packer is chosen as the smallest of the same five codecs
+	/// [`best_value_codec`](Self::best_value_codec) ranges over — `varint` / `bitpack` /
+	/// `blocked` / `for` / `rle` — with ties broken toward the simpler codec (the slice order).
+	#[must_use]
+	pub fn delta_cascade_plan(&self) -> Option<DeltaCascadePlan> {
 		use crate::timestamp::{bitpack_bytes, blocked_bitpack_bytes, for_bitpack_bytes, rle_encode, rle_varint_bytes, zigzag_varint_bytes, zigzag_varint_len, BLOCKED_BITPACK_BLOCK};
 		let mantissas = self.scaled_i64_mantissas()?;
 		let Some((&first, rest)) = mantissas.split_first() else {
-			return Some(0);
+			return Some(DeltaCascadePlan { anchor: 0, deltas: Vec::new(), inner: CascadeInner::Varint, bytes: 0 });
 		};
 		let anchor = zigzag_varint_len(first);
 		if rest.is_empty() {
-			return Some(anchor);
+			return Some(DeltaCascadePlan { anchor: first, deltas: Vec::new(), inner: CascadeInner::Varint, bytes: anchor });
 		}
 		// First differences (the delta transform), wrapping so an extreme swing never panics.
 		let mut deltas = Vec::with_capacity(rest.len());
@@ -222,8 +239,10 @@ impl ColumnEncoding {
 			deltas.push(m.wrapping_sub(prev));
 			prev = m;
 		}
-		let packed = zigzag_varint_bytes(&deltas).min(bitpack_bytes(&deltas)).min(blocked_bitpack_bytes(&deltas, BLOCKED_BITPACK_BLOCK)).min(for_bitpack_bytes(&deltas, BLOCKED_BITPACK_BLOCK)).min(rle_varint_bytes(&rle_encode(&deltas)));
-		Some(anchor + packed)
+		// Candidates in slice order (simplest first) — `min_by_key` keeps the first on ties.
+		let candidates = [(CascadeInner::Varint, zigzag_varint_bytes(&deltas)), (CascadeInner::Bitpack, bitpack_bytes(&deltas)), (CascadeInner::Blocked, blocked_bitpack_bytes(&deltas, BLOCKED_BITPACK_BLOCK)), (CascadeInner::For, for_bitpack_bytes(&deltas, BLOCKED_BITPACK_BLOCK)), (CascadeInner::Rle, rle_varint_bytes(&rle_encode(&deltas)))];
+		let (inner, packed) = candidates.into_iter().min_by_key(|&(_, b)| b).unwrap_or((CascadeInner::Varint, 0));
+		Some(DeltaCascadePlan { anchor: first, deltas, inner, bytes: anchor + packed })
 	}
 
 	/// The raw `f64` values of this column, in input order — `None` for any other
@@ -307,6 +326,21 @@ impl ColumnEncoding {
 		varint.min(bitpack).min(blocked).min(for_)
 	}
 
+	/// The smallest realized value-codec footprint when the two-level **delta cascade** is
+	/// also allowed — `min(best_serialized_bytes, delta_cascade_bytes)` for a `ScaledI64`
+	/// column, else [`best_serialized_bytes`](Self::best_serialized_bytes).
+	///
+	/// This is what the on-disk cascade path ([`crate::dspseg::write_value_column_cascading`])
+	/// realizes. The cascade is a **broad** headline-metric change — it beats even the FOR
+	/// codec on FOR's own clustered fixtures, so adopting it into the *default*
+	/// [`best_value_codec`](Self::best_value_codec) is owner-gated (like the FOR/ALP headline
+	/// flips). Until then it is opt-in and surfaced advisory-first, and the default selector is
+	/// unchanged.
+	#[must_use]
+	pub fn best_serialized_bytes_cascading(&self) -> usize {
+		self.delta_cascade_bytes().map_or_else(|| self.best_serialized_bytes(), |cascade| self.best_serialized_bytes().min(cascade))
+	}
+
 	/// The name of the value codec [`best_serialized_bytes`](Self::best_serialized_bytes)
 	/// selects — `"scaled_for"` when per-block Frame-of-Reference packing is strictly
 	/// smallest for a `ScaledI64` column (clustered or all-non-negative mantissas),
@@ -337,11 +371,68 @@ impl ColumnEncoding {
 		}
 	}
 
+	/// The value codec [`best_serialized_bytes_cascading`](Self::best_serialized_bytes_cascading)
+	/// selects — `"scaled_delta_cascade"` when the two-level delta cascade is strictly smaller
+	/// than every single-level codec (a trending `ScaledI64` column), otherwise exactly
+	/// [`best_value_codec`](Self::best_value_codec).
+	///
+	/// This is the selector the opt-in on-disk cascade writer
+	/// ([`crate::dspseg::write_value_column_cascading`]) routes through. It is **not** the
+	/// default: the cascade is a broad realized-bytes change (it beats FOR on FOR's own
+	/// clustered fixtures), so wiring it into the default is owner-gated. Ties keep the simpler
+	/// single-level codec (the cascade must strictly win).
+	#[must_use]
+	pub fn best_value_codec_cascading(&self) -> &'static str {
+		let single = self.best_value_codec();
+		match self.delta_cascade_bytes() {
+			Some(cascade) if cascade < self.best_serialized_bytes() => "scaled_delta_cascade",
+			_ => single,
+		}
+	}
+
 	/// Reconstruct the logical `BigDecimal` column.
 	#[must_use]
 	pub fn decode(&self) -> Vec<BigDecimal> {
 		self.values.iter().map(PhysicalValue::to_logical).collect()
 	}
+}
+
+/// The inner packer a [`DeltaCascadePlan`] applies to its delta stream — the second stage
+/// of the two-level cascade.
+///
+/// Each maps to a `.dspseg` cascade-inner descriptor byte and reuses the crate's existing
+/// lossless packers over the first-difference stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CascadeInner {
+	/// Per-delta zig-zag varints (the general fallback).
+	Varint,
+	/// Fixed-width bit-packing of the deltas.
+	Bitpack,
+	/// Per-block adaptive (blocked) bit-packing of the deltas.
+	Blocked,
+	/// Per-block Frame-of-Reference packing of the deltas (a constant trend → zero-residual blocks).
+	For,
+	/// Run-length coding of the deltas (a constant trend → one long run).
+	Rle,
+}
+
+/// The concrete realization of a delta-cascade codec on a `ScaledI64` column.
+///
+/// Carries the varint anchor (the first mantissa), the first-difference delta stream, the
+/// chosen inner packer, and the framing-excluded byte footprint. Produced by
+/// [`ColumnEncoding::delta_cascade_plan`]; consumed by the `.dspseg` cascade writer so the
+/// estimate and the on-disk bytes are one and the same.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaCascadePlan {
+	/// The first mantissa — the cascade's cumulative-sum anchor.
+	pub anchor: i64,
+	/// The first differences of the remaining mantissas (`len == column len - 1`).
+	pub deltas: Vec<i64>,
+	/// The packer that stores [`deltas`](Self::deltas) smallest.
+	pub inner: CascadeInner,
+	/// The anchor-plus-packed-deltas footprint (excludes the outer codec-selector byte, as
+	/// every other value-codec estimate does).
+	pub bytes: usize,
 }
 
 /// A value at a known position in a column could not be encoded.
@@ -713,6 +804,43 @@ mod tests {
 			recon.push(next);
 		}
 		assert_eq!(recon, mantissas, "the delta transform must round-trip the mantissas");
+	}
+
+	#[test]
+	fn cascading_selector_picks_the_cascade_on_a_trend_but_not_the_default_selector() {
+		// A monotone counter (high base, +7/step): the default selector still picks a
+		// single-level codec (FOR pays the whole run's range), while the cascading selector
+		// picks the delta cascade — the opt-in path — because the first differences collapse
+		// to a constant the inner packer crushes. The default is deliberately unchanged.
+		let lits: Vec<String> = (0..256).map(|i| format!("{}", 5_000_000_000_i64 + i64::from(i) * 7)).collect();
+		let refs: Vec<&str> = lits.iter().map(String::as_str).collect();
+		let enc = encode_column(PhysicalType::ScaledI64 { scale: 0 }, &col(&refs)).expect("encodes");
+		assert_ne!(enc.best_value_codec(), "scaled_delta_cascade", "the default selector must not adopt the cascade");
+		assert_eq!(enc.best_value_codec_cascading(), "scaled_delta_cascade", "the opt-in selector picks the cascade on a trend");
+		assert!(enc.best_serialized_bytes_cascading() < enc.best_serialized_bytes(), "the cascade must strictly beat the best single-level codec here");
+		assert_eq!(enc.best_serialized_bytes_cascading(), enc.delta_cascade_bytes().unwrap());
+		// The plan the writer routes through: a varint anchor + a constant (+7) delta stream
+		// the inner packer stores tiny; the plan bytes equal the advisory estimate.
+		let plan = enc.delta_cascade_plan().expect("scaled column plans");
+		assert_eq!(plan.anchor, 5_000_000_000);
+		assert_eq!(plan.deltas, vec![7_i64; 255]);
+		assert_eq!(plan.bytes, enc.delta_cascade_bytes().unwrap());
+	}
+
+	#[test]
+	fn cascading_selector_falls_back_to_the_single_level_codec_off_trend() {
+		// A non-trending small-jitter column (no monotone run for the delta transform to
+		// exploit): the cascading selector must agree with the default — the cascade is not a
+		// free win, only a trend win.
+		let values: Vec<BigDecimal> = (0..64).map(|i| BigDecimal::new((if i % 2 == 0 { 5 } else { -5 }).into(), 2)).collect();
+		let enc = encode_column(PhysicalType::ScaledI64 { scale: 2 }, &values).expect("encodes");
+		assert_eq!(enc.best_value_codec_cascading(), enc.best_value_codec(), "off-trend the cascade must not be selected");
+		assert_ne!(enc.best_value_codec_cascading(), "scaled_delta_cascade");
+		// A non-scaled column has no cascade plan at all.
+		let floats = encode_column(PhysicalType::F64, &col(&["0.5", "1.5"])).expect("encodes");
+		assert_eq!(floats.delta_cascade_plan(), None);
+		assert_eq!(floats.best_value_codec_cascading(), "varint");
+		assert_eq!(floats.best_serialized_bytes_cascading(), floats.best_serialized_bytes());
 	}
 
 	#[test]

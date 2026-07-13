@@ -54,9 +54,15 @@ use crate::{
 /// `advisory_best_f64_codec` may now report `"chimp128"` (the JSON shape is unchanged — the
 /// candidate set widened). v14 added `storage.advisory_fire_timestamp_bytes` — the Sprintz FIRE
 /// forecaster's footprint on the timestamp column, the potential saving of a learned-coefficient
-/// predictor over the realized delta-of-delta. All optional fields are `#[serde(default)]`, so
-/// older artifacts still deserialize.
-pub const SCHEMA_VERSION: u32 = 14;
+/// predictor over the realized delta-of-delta. v15 added `storage.advisory_delta_cascade_value_bytes`
+/// — the footprint of the two-level **delta cascade** value codec (delta transform → best inner
+/// packer) when it beats the realized single-level codec, the potential saving of adopting the
+/// cascade on a trending value column. The cascade is realized on disk
+/// (`dspseg::write_value_column_cascading` / `VAL_CODEC_DELTA_CASCADE`) but is a broad
+/// realized-bytes change, so it is opt-in and surfaced advisory-first (like FOR/f64 before
+/// adoption); the default `value_codec` is unchanged. All optional fields are `#[serde(default)]`,
+/// so older artifacts still deserialize.
+pub const SCHEMA_VERSION: u32 = 15;
 
 /// Metadata describing the dataset a result was measured against.
 ///
@@ -251,6 +257,19 @@ pub struct StorageEstimate {
 	/// any on-disk selector.
 	#[serde(default)]
 	pub advisory_fire_timestamp_bytes: Option<usize>,
+	/// **Advisory** footprint of the value column under the two-level **delta cascade** codec
+	/// (first-difference transform, then the smallest of the varint / bit-pack / blocked / FOR /
+	/// RLE inner packers over the differences) — the *potential* saving over the realized
+	/// single-level [`realized_value_bytes`](Self::realized_value_bytes) on a **trending**
+	/// `ScaledI64` column (a counter or monotone sensor whose magnitude every single-level codec
+	/// pays for, but whose differences collapse to a constant the inner packer crushes). `Some`
+	/// only when the cascade strictly beats the realized codec (so a positive number always means
+	/// "the cascade would help this corpus"); `None` for a non-scaled encoding, an off-trend
+	/// column where it does not help, or a pre-v15 artifact. Advisory: the cascade is realized on
+	/// disk but opt-in (a broad realized-bytes change is owner-gated), so it is not folded into
+	/// `value_codec` yet.
+	#[serde(default)]
+	pub advisory_delta_cascade_value_bytes: Option<usize>,
 }
 
 impl StorageEstimate {
@@ -306,8 +325,11 @@ impl StorageEstimate {
 		// every other encoding (the scaled/text payloads are not XOR-compressible).
 		let advisory_best_f64_bytes = enc.best_f64_bytes();
 		let advisory_best_f64_codec = enc.best_f64_codec().map(str::to_string);
+		// Advisory: the two-level delta-cascade footprint, surfaced only when it strictly beats
+		// the realized single-level codec (so it answers "would the cascade help this corpus?").
+		let advisory_delta_cascade_value_bytes = enc.delta_cascade_bytes().filter(|&cascade| cascade < realized_value_bytes);
 
-		Self { physical_type: enc.physical_type.name().to_string(), value_count, estimated_value_bytes, realized_value_bytes, value_codec, bytes_per_point, is_exact: enc.is_exact(), lossy_count: enc.lossy_count, max_abs_error: enc.max_abs_error.to_string(), tolerance: tolerance.to_string(), timestamp_unit: unit.name().to_string(), timestamp_encoding: timestamp_encoding.to_string(), timestamp_bytes, timestamp_bytes_per_point, total_bytes_per_point: bytes_per_point + timestamp_bytes_per_point, advisory_best_f64_bytes, advisory_best_f64_codec, advisory_fire_timestamp_bytes }
+		Self { physical_type: enc.physical_type.name().to_string(), value_count, estimated_value_bytes, realized_value_bytes, value_codec, bytes_per_point, is_exact: enc.is_exact(), lossy_count: enc.lossy_count, max_abs_error: enc.max_abs_error.to_string(), tolerance: tolerance.to_string(), timestamp_unit: unit.name().to_string(), timestamp_encoding: timestamp_encoding.to_string(), timestamp_bytes, timestamp_bytes_per_point, total_bytes_per_point: bytes_per_point + timestamp_bytes_per_point, advisory_best_f64_bytes, advisory_best_f64_codec, advisory_fire_timestamp_bytes, advisory_delta_cascade_value_bytes }
 	}
 }
 
@@ -385,7 +407,7 @@ mod tests {
 
 	fn sample_result() -> BenchResult {
 		let samples = [100, 200, 300];
-		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "dsp".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: Some(SignalShape::MultiSine) }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true }, accuracy: Some(AccuracyMetrics { count: 1000, rmse: 1.5, mae: 1.1, max_abs_error: 4.2, bias: -0.3 }), storage: Some(StorageEstimate { physical_type: "scaled_i64".to_string(), value_count: 200, estimated_value_bytes: 1600, realized_value_bytes: 420, value_codec: "varint".to_string(), bytes_per_point: 2.1, is_exact: true, lossy_count: 0, max_abs_error: "0".to_string(), tolerance: "0".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 208, timestamp_bytes_per_point: 1.04, total_bytes_per_point: 3.14, advisory_best_f64_bytes: None, advisory_best_f64_codec: None, advisory_fire_timestamp_bytes: Some(180) }) }
+		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "dsp".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: Some(SignalShape::MultiSine) }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true }, accuracy: Some(AccuracyMetrics { count: 1000, rmse: 1.5, mae: 1.1, max_abs_error: 4.2, bias: -0.3 }), storage: Some(StorageEstimate { physical_type: "scaled_i64".to_string(), value_count: 200, estimated_value_bytes: 1600, realized_value_bytes: 420, value_codec: "varint".to_string(), bytes_per_point: 2.1, is_exact: true, lossy_count: 0, max_abs_error: "0".to_string(), tolerance: "0".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 208, timestamp_bytes_per_point: 1.04, total_bytes_per_point: 3.14, advisory_best_f64_bytes: None, advisory_best_f64_codec: None, advisory_fire_timestamp_bytes: Some(180), advisory_delta_cascade_value_bytes: None }) }
 	}
 
 	#[test]
@@ -587,6 +609,26 @@ mod tests {
 		// No timestamps → no FIRE advisory.
 		let no_ts = StorageEstimate::from_values(&values, &BigDecimal::from(0));
 		assert_eq!(no_ts.advisory_fire_timestamp_bytes, None);
+	}
+
+	#[test]
+	fn advisory_delta_cascade_surfaces_on_a_trend_and_is_absent_off_trend() {
+		// The cascade advisory answers "would the two-level delta cascade help this value
+		// column?" on the real corpus. A monotone counter (high base, +7/step exact integers)
+		// is its regime: the differences collapse to a constant, so the cascade strictly beats
+		// the realized single-level codec and the advisory is Some(smaller).
+		use std::str::FromStr;
+		// Two-decimal values (F32/F64 cannot represent them exactly at tolerance 0, so the
+		// recommender lands on ScaledI64) whose mantissa is a monotone +7 counter from a high base.
+		let trending: Vec<BigDecimal> = (0..400).map(|i| BigDecimal::new((5_000_000_000_i64 + i64::from(i) * 7).into(), 2)).collect();
+		let est = StorageEstimate::from_columns(&trending, &[], TimeUnit::Micros, &BigDecimal::from(0));
+		assert_eq!(est.physical_type, "scaled_i64", "two-decimal counter picks scaled_i64");
+		let cascade = est.advisory_delta_cascade_value_bytes.expect("a trending column carries the cascade advisory");
+		assert!(cascade < est.realized_value_bytes, "cascade advisory {cascade} must beat the realized single-level {} on a trend", est.realized_value_bytes);
+		// An off-trend small-jitter column: the cascade does not help, so the advisory is None.
+		let jitter: Vec<BigDecimal> = (0..400).map(|i| BigDecimal::from_str(&format!("{}.5", i % 7)).unwrap()).collect();
+		let flat = StorageEstimate::from_columns(&jitter, &[], TimeUnit::Micros, &BigDecimal::from(0));
+		assert_eq!(flat.advisory_delta_cascade_value_bytes, None, "off-trend column must carry no cascade advisory");
 	}
 
 	#[test]

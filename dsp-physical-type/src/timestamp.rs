@@ -428,6 +428,168 @@ pub fn blocked_bitpack_decode(bytes: &[u8], block: usize, count: usize) -> Vec<i
 	out
 }
 
+/// **Block-level random access:** decode only the `len` differences at global index `start`
+/// from a per-block adaptive bit-pack buffer.
+///
+/// The blocks before `start` are skipped by reading their one-byte width headers (and
+/// computing each block's data length) rather than decoding their data. This is the
+/// random-access primitive over the realized blocked value/timestamp codec
+/// ([`blocked_bitpack_encode`]): a read planner can fetch a sub-range — or a single point
+/// (`len == 1`) — at the cost of walking block headers to the start block plus decoding only the
+/// blocks the range overlaps, instead of materializing the whole column. The result equals
+/// `blocked_bitpack_decode(bytes, block, count)[start..start+len]` (clamped to `count`). A
+/// `start >= count` or `len == 0` yields an empty vector. Roadmap Phase 6.1 "block-level random
+/// access". *(src: `FastLanes` per-block layout, VLDB'23 —
+/// <https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf>)*
+#[must_use]
+pub fn blocked_bitpack_decode_range(bytes: &[u8], block: usize, count: usize, start: usize, len: usize) -> Vec<i64> {
+	let block = block.max(1);
+	let end = start.saturating_add(len).min(count);
+	if start >= end {
+		return Vec::new();
+	}
+	let mut out = Vec::with_capacity(end - start);
+	let mut pos = 0_usize;
+	let mut idx = 0_usize;
+	while idx < end {
+		let block_len = block.min(count - idx);
+		let width = u32::from(bytes.get(pos).copied().unwrap_or(0));
+		pos += 1;
+		let data_len = (block_len * width as usize).div_ceil(8);
+		// Decode this block only if the requested range overlaps [idx, idx + block_len).
+		if idx + block_len > start {
+			let chunk = bytes.get(pos..pos + data_len).unwrap_or(&[]);
+			let decoded = bitpack_decode(width, chunk, block_len);
+			let lo = start.saturating_sub(idx);
+			let hi = (end - idx).min(block_len);
+			out.extend_from_slice(&decoded[lo..hi]);
+		}
+		pos += data_len;
+		idx += block_len;
+	}
+	out
+}
+
+/// The tile size the transposed bit-unpack codec ([`transpose_bitpack_encode`])
+/// partitions a stream into.
+///
+/// The `FastLanes` "unified transposed layout" targets a virtual 1024-lane SIMD register,
+/// so a 1024-value tile lets each bit-plane of a full tile land on a 128-byte (16×`u64`)
+/// word-aligned boundary; only the final short tile is unaligned. *(src: `FastLanes`
+/// Compression Layout, VLDB'23 — <https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf>)*
+pub const TRANSPOSE_TILE: usize = 1024;
+
+/// Estimated footprint of a **transposed** per-tile bit-packing of a difference stream:
+/// a one-byte width header plus `width * ceil(len / 8)` plane bytes per tile.
+///
+/// The bit budget is identical to [`blocked_bitpack_bytes`] at the same tile size for any
+/// tile whose length is a multiple of 8 (every full 1024-lane tile is) — the transpose is a
+/// *permutation* of the same bits, not a different code. A short trailing tile whose length
+/// is not a multiple of 8 costs at most `width - 1` extra bytes because each bit-plane rounds
+/// up to a whole byte independently (vs the single global round-up of the linear layout). The
+/// point of the layout is **decode speed**, not size: see [`transpose_bitpack_decode`].
+#[must_use]
+pub fn transpose_bitpack_bytes(values: &[i64], tile: usize) -> usize {
+	if values.is_empty() {
+		return 0;
+	}
+	let tile = tile.max(1);
+	values.chunks(tile).map(|chunk| 1 + bitpack_width(chunk) as usize * chunk.len().div_ceil(8)).sum()
+}
+
+/// Transposed per-tile bit-pack encode of a difference stream (the `FastLanes` layout).
+///
+/// Each tile emits a one-byte width header then `width` **bit-planes**: plane `b` is the
+/// `ceil(len / 8)` bytes holding bit `b` of every lane in the tile (lane `l` at bit `l` of
+/// byte `l / 8`). This is the transpose of the linear [`bitpack_encode`] layout, where a
+/// value's `width` bits are contiguous; here a value's bits are scattered one per plane, and
+/// a plane gathers one bit from every value.
+///
+/// Why: the transpose makes the **high bit-planes of a small-magnitude stream empty**, so
+/// [`transpose_bitpack_decode`] skips them wholesale (an all-zero plane word contributes
+/// nothing), where the scalar per-value [`bitpack_decode`] pays for every bit of every value
+/// regardless. Exact inverse is [`transpose_bitpack_decode`] given the same `tile` and count;
+/// an empty input yields an empty buffer. The emitted length is exactly
+/// [`transpose_bitpack_bytes`] for the same `(values, tile)`.
+#[must_use]
+pub fn transpose_bitpack_encode(values: &[i64], tile: usize) -> Vec<u8> {
+	let tile = tile.max(1);
+	let mut out = Vec::new();
+	for chunk in values.chunks(tile) {
+		let width = bitpack_width(chunk) as usize;
+		// Width is 0..=64 by construction, so the conversion never saturates.
+		out.push(u8::try_from(width).unwrap_or(64));
+		if width == 0 {
+			continue;
+		}
+		let plane_bytes = chunk.len().div_ceil(8);
+		let start = out.len();
+		out.resize(start + width * plane_bytes, 0);
+		for (lane, &v) in chunk.iter().enumerate() {
+			let zz = zigzag(v);
+			let byte = lane / 8;
+			let mask = 1_u8 << (lane % 8);
+			for b in 0..width {
+				if (zz >> b) & 1 == 1 {
+					out[start + b * plane_bytes + byte] |= mask;
+				}
+			}
+		}
+	}
+	out
+}
+
+/// Reconstruct `count` differences from a transposed per-tile bit-pack buffer.
+///
+/// Exact inverse of [`transpose_bitpack_encode`] given the same `tile` and `count`. The
+/// decode reads each bit-plane as `u64` words and distributes only the **set** bits of each
+/// word to their lanes (`w &= w - 1` walks set bits), so an all-zero plane word costs a
+/// single compare and a sparse one costs only its population — the decode-latency win over
+/// the scalar [`bitpack_decode`], which loops every bit of every value. Bytes past the buffer
+/// read as `0` (a truncated tile yields zeros rather than panicking).
+#[must_use]
+pub fn transpose_bitpack_decode(bytes: &[u8], tile: usize, count: usize) -> Vec<i64> {
+	let tile = tile.max(1);
+	let mut out = Vec::with_capacity(count);
+	let mut pos = 0_usize;
+	let mut remaining = count;
+	while remaining > 0 {
+		let len = remaining.min(tile);
+		let width = usize::from(bytes.get(pos).copied().unwrap_or(0));
+		pos += 1;
+		if width == 0 {
+			out.resize(out.len() + len, 0);
+			remaining -= len;
+			continue;
+		}
+		let plane_bytes = len.div_ceil(8);
+		let mut acc = vec![0_u64; len];
+		for b in 0..width {
+			let plane_start = pos + b * plane_bytes;
+			let plane = bytes.get(plane_start..plane_start + plane_bytes).unwrap_or(&[]);
+			for (g, group) in plane.chunks(8).enumerate() {
+				let mut word = 0_u64;
+				for (i, &byte) in group.iter().enumerate() {
+					word |= u64::from(byte) << (i * 8);
+				}
+				let base = g * 64;
+				let mut set = word;
+				while set != 0 {
+					let k = set.trailing_zeros() as usize;
+					if base + k < len {
+						acc[base + k] |= 1_u64 << b;
+					}
+					set &= set - 1;
+				}
+			}
+		}
+		pos += width * plane_bytes;
+		out.extend(acc.iter().map(|&a| unzigzag(a)));
+		remaining -= len;
+	}
+	out
+}
+
 /// The unsigned residual of `v` against a block reference `min` — `v - min` computed
 /// in the two's-complement `u64` domain, which is the exact difference whenever
 /// `v >= min` (always true for a block's own minimum) and up to `2^64 - 1`. Inverse:
@@ -587,6 +749,54 @@ pub fn for_bitpack_decode(bytes: &[u8], block: usize, count: usize) -> Vec<i64> 
 			bit += width;
 		}
 		remaining -= block_len;
+	}
+	out
+}
+
+/// **Block-level random access:** decode only the `len` differences at global index `start`
+/// from a Frame-of-Reference per-block buffer.
+///
+/// The blocks before `start` are skipped by reading their reference varint + width header (and
+/// computing each block's data length) rather than unpacking their residuals. The FOR analogue
+/// of [`blocked_bitpack_decode_range`]: the random-access primitive over the
+/// realized FOR value codec ([`for_bitpack_encode`]). The result equals
+/// `for_bitpack_decode(bytes, block, count)[start..start+len]` (clamped to `count`); a
+/// `start >= count` or `len == 0` yields an empty vector. Roadmap Phase 6.1 "block-level random
+/// access".
+#[must_use]
+pub fn for_bitpack_decode_range(bytes: &[u8], block: usize, count: usize, start: usize, len: usize) -> Vec<i64> {
+	let block = block.max(1);
+	let end = start.saturating_add(len).min(count);
+	if start >= end {
+		return Vec::new();
+	}
+	let mut out = Vec::with_capacity(end - start);
+	let mut pos = 0_usize;
+	let mut idx = 0_usize;
+	while idx < end {
+		let block_len = block.min(count - idx);
+		let min = unzigzag(for_read_uvarint(bytes, &mut pos));
+		let width = usize::from(bytes.get(pos).copied().unwrap_or(0));
+		pos += 1;
+		let data_len = (block_len * width).div_ceil(8);
+		if idx + block_len > start {
+			let data = bytes.get(pos..pos + data_len).unwrap_or(&[]);
+			let lo = start.saturating_sub(idx);
+			let hi = (end - idx).min(block_len);
+			for row in lo..hi {
+				let mut r = 0_u64;
+				let bit = row * width;
+				for b in 0..width {
+					let bit_idx = bit + b;
+					if data.get(bit_idx / 8).is_some_and(|byte| (byte >> (bit_idx % 8)) & 1 == 1) {
+						r |= 1 << b;
+					}
+				}
+				out.push(for_reconstruct(min, r));
+			}
+		}
+		pos += data_len;
+		idx += block_len;
 	}
 	out
 }
@@ -1518,6 +1728,33 @@ mod tests {
 	}
 
 	#[test]
+	fn blocked_and_for_range_decode_match_the_full_decode_slice() {
+		// Block-level random access must equal the corresponding slice of a full decode for
+		// every (start, len) window, across block sizes and codecs — a single point (len 1),
+		// a sub-range spanning blocks, the whole column, and out-of-range windows.
+		let vals: Vec<i64> = (0..300).map(|i| if (40..104).contains(&i) { 1_000_000_000 + i } else { (i % 13) - 6 }).collect();
+		let n = vals.len();
+		for block in [1_usize, 7, 16, 64, 300] {
+			let blocked = blocked_bitpack_encode(&vals, block);
+			let for_bytes = for_bitpack_encode(&vals, block);
+			let full_blocked = blocked_bitpack_decode(&blocked, block, n);
+			let full_for = for_bitpack_decode(&for_bytes, block, n);
+			assert_eq!(full_blocked, vals, "blocked full decode sanity (block={block})");
+			assert_eq!(full_for, vals, "FOR full decode sanity (block={block})");
+			for start in [0_usize, 1, 39, 40, 63, 100, 299] {
+				for len in [0_usize, 1, 5, 64, 130, 400] {
+					let want: Vec<i64> = full_blocked.iter().copied().skip(start).take(len.min(n.saturating_sub(start))).collect();
+					assert_eq!(blocked_bitpack_decode_range(&blocked, block, n, start, len), want, "blocked range (block={block}, start={start}, len={len})");
+					assert_eq!(for_bitpack_decode_range(&for_bytes, block, n, start, len), want, "FOR range (block={block}, start={start}, len={len})");
+				}
+			}
+			// A start at or past the end yields nothing.
+			assert!(blocked_bitpack_decode_range(&blocked, block, n, n, 10).is_empty());
+			assert!(for_bitpack_decode_range(&for_bytes, block, n, n + 5, 10).is_empty());
+		}
+	}
+
+	#[test]
 	fn for_bitpack_handles_all_zero_and_empty_streams() {
 		assert_eq!(for_bitpack_bytes(&[], 8), 0);
 		// An all-zero stream: each block costs a 1-byte zero reference varint + 1-byte
@@ -1637,5 +1874,50 @@ mod tests {
 		// And delta encoding of the same regular series: 8 + 999 one-byte deltas.
 		let d = encode_delta(&values, TimeUnit::Millis);
 		assert_eq!(d.estimated_bytes(), 8 + 999);
+	}
+
+	#[test]
+	fn transpose_bitpack_round_trips_and_agrees_with_the_scalar_decoder() {
+		// The transposed layout is a permutation of the scalar bit-pack's bits: for every
+		// tile and awkward tail length, the transposed decode must reproduce the exact
+		// input, and — where the footprints coincide (tile length a multiple of 8) — it
+		// must produce the same values the linear per-block decode does over the same tiles.
+		let vals: Vec<i64> = (0..333).map(|i| if (40..56).contains(&i) { 1_000_000 + i } else { (i % 11) - 5 }).collect();
+		for tile in [1_usize, 7, 8, 16, 64, 333, 1024] {
+			let bytes = transpose_bitpack_encode(&vals, tile);
+			assert_eq!(bytes.len(), transpose_bitpack_bytes(&vals, tile), "encoded length must equal the estimate (tile={tile})");
+			assert_eq!(transpose_bitpack_decode(&bytes, tile, vals.len()), vals, "round trip must be exact (tile={tile})");
+		}
+		// A stream straddling the full i64 range still round-trips (zig-zag to 64-bit width).
+		let extremes = [i64::MIN, 0, i64::MAX, -1, 1, i64::MIN + 1, 123_456_789, -987_654_321];
+		let enc = transpose_bitpack_encode(&extremes, 4);
+		assert_eq!(enc.len(), transpose_bitpack_bytes(&extremes, 4));
+		assert_eq!(transpose_bitpack_decode(&enc, 4, extremes.len()), extremes);
+		// Empty stream encodes to nothing and decodes to nothing.
+		assert!(transpose_bitpack_encode(&[], 64).is_empty());
+		assert_eq!(transpose_bitpack_decode(&[], 64, 0), Vec::<i64>::new());
+	}
+
+	#[test]
+	fn transpose_bitpack_footprint_matches_the_linear_layout_on_aligned_tiles() {
+		// The transpose is the same bit budget as the linear per-block layout for any tile
+		// whose length is a multiple of 8 — a full 1024-lane tile always is, so a stream
+		// sized to whole tiles is byte-for-byte the same size (the win is decode speed, not
+		// size). Values kept small so every tile shares a modest width.
+		let vals: Vec<i64> = (0..2048).map(|i| (i % 9) - 4).collect();
+		assert_eq!(transpose_bitpack_bytes(&vals, TRANSPOSE_TILE), blocked_bitpack_bytes(&vals, TRANSPOSE_TILE), "aligned tiles must match the linear per-block footprint");
+	}
+
+	#[test]
+	fn transpose_bitpack_handles_all_zero_and_empty_streams() {
+		assert_eq!(transpose_bitpack_bytes(&[], 8), 0);
+		// An all-zero stream: each tile costs a single width-header byte (width 0, no planes).
+		// ceil(20/8) = 3 tiles at tile=8 -> 3 header bytes.
+		assert_eq!(transpose_bitpack_bytes(&[0; 20], 8), 3);
+		let enc = transpose_bitpack_encode(&[0; 20], 8);
+		assert_eq!(enc.len(), 3);
+		assert_eq!(transpose_bitpack_decode(&enc, 8, 20), vec![0_i64; 20]);
+		// A zero tile size is clamped to 1, never a panic.
+		assert_eq!(transpose_bitpack_bytes(&[0, 0, 0], 0), 3);
 	}
 }

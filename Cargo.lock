@@ -1325,6 +1325,7 @@ name = "dsp-physical-type"
 version = "0.1.0"
 dependencies = [
  "bigdecimal",
+ "criterion",
  "serde",
  "serde_json",
 ]
