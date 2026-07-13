@@ -391,13 +391,12 @@ impl SegmentStore {
 		let mut found = None;
 		for descriptor in &descriptors {
 			let bytes = tokio::fs::read(&descriptor.path).await.with_context(|| format!("reading segment {}", descriptor.path))?;
+			// Streaming single-value read: prunes/skips the pages and value-column blocks a point
+			// lookup does not touch, unpacking only the one block covering `t` on a per-block codec
+			// (roadmap Phase 4/6). Equal to `…read_from(&bytes)?.value_at(t)` for every frame.
 			let hit = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION {
-				let segment = PagedSegment::read_from(&bytes).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?;
-				segment.value_at(t)
+				dsp_physical_type::dspseg::read_paged_segment_point(&bytes, t).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?
 			} else {
-				// Streaming single-value read: skips the value-column decode for a per-block
-				// codec, unpacking only the block covering `t` (roadmap Phase 4/6). Equal to
-				// `Segment::read_from(&bytes)?.value_at(t)` for every single-block frame.
 				dsp_physical_type::dspseg::read_segment_point(&bytes, t).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?
 			};
 			if hit.is_some() {

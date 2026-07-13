@@ -957,12 +957,21 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   now takes this path for single-block segments. Benchmarked (`benches/pointread.rs`, criterion,
   100k-row sorted FOR segment): **222.65 µs vs 13.196 ms full-decode — ~59× faster point lookup,
   identical bytes on disk.**
-- [ ] **Next slice — extend the streaming point read to paged segments + block-random-access
-  timestamp search (Phase 4/6):** `read_segment_point` covers single-block frames only (the paged
-  branch of `read_point` still full-decodes the surviving page via `PagedSegment::value_at`); wire
-  the same block-skip value read into the paged frame (per-page value block), and — the remaining
-  `O(n)` cost — make the *timestamp* lookup block-random-access too (a binary search that decodes
-  only the delta-of-delta blocks it probes) so a sorted point lookup is fully sublinear.
+- [x] **Streaming point read extended to paged segments (Phase 4/6): shipped.**
+  `dspseg::read_paged_segment_point(bytes, t)` parses the per-page index (stats + block length)
+  and **prunes pages on their indexed min/max ts without decoding a column byte** (on-disk
+  intra-segment page skipping), then resolves the surviving page through the shared
+  `read_point_from_section` (the block-skip value read applies within the page too), matching
+  `PagedSegment::value_at`'s first-present-page semantics. The paged branch of
+  `SegmentStore::read_point` (which powers `GET …/storage/{aspect}/at` for paged frames) now takes
+  it. Refactored the single-block reader onto the same section helper so both share one code path;
+  runtime-verified against the live endpoint on a 5-page FOR frame.
+- [ ] **Next slice — block-random-access timestamp search for the sorted point lookup (Phase 4/6):**
+  the streaming point read no longer decodes the value column, but it still decodes the *whole*
+  timestamp column to binary-search for the row — the remaining `O(n)` cost. Make the timestamp
+  lookup block-random-access too (a binary search that reconstructs only the delta-of-delta blocks
+  it probes) so a sorted point lookup is fully sublinear, and benchmark it vs the current
+  whole-timestamp decode.
 - [x] Add p50/p95/p99 + confidence-interval reporting
 - [x] Add physical value types (`F64`, `ScaledI64`, `BigDecimalText` + three more)
 - [x] Prototype columnar segment reads for one aspect type (`database::SegmentStore`)
