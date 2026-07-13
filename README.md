@@ -360,10 +360,22 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   (`StorageEstimate.advisory_delta_cascade_value_bytes`, schema v15). It is **opt-in** — the
   cascade beats even FOR broadly, so folding it into the default selector is a headline change
   held for owner sign-off; the default codec choice is unchanged.
-- **Block-level random access** — the per-block value codecs support decoding a single value
+- **Block-level random access** — the fixed-layout value codecs support decoding a single value
   (or a sub-range) without materializing the whole column: `dspseg::read_value_at(bytes, i)`
   reads only the block covering row `i` (skipping earlier blocks by their headers) for the
-  blocked/FOR codecs, the point-lookup / late-materialization lever.
+  blocked/FOR codecs, and reads bit `i * width` directly for the fixed-width bit-pack codec — the
+  point-lookup / late-materialization lever. `dspseg::read_segment_point(bytes, t)`
+  wires this up to the framed single-block segment — it skips the value block by its framing,
+  decodes only the timestamps to find the row, and unpacks the one covering value block — so a
+  point lookup **never materializes the value column** on a per-block codec (equal to a full
+  decode + `value_at` for every frame; the non-block codecs fall back to that). `read_paged_segment_point`
+  does the same for a paged frame, first pruning pages on their indexed min/max timestamp so only
+  the surviving page is touched. A **regular (constant-stride) timestamp column** is resolved in
+  closed form — `ts[i] = first + i*step`, so the row for an instant is `O(1)` with no timestamp
+  materialization at all. Measured **~62× faster** point lookup on a 100k-row single-block FOR
+  segment (192 µs vs 11.9 ms) and **~7.1× faster** on the paged frame (169 µs vs 1.20 ms), with the
+  closed-form timestamp path a further **~7×** over an irregular column (192 µs vs 1.34 ms), identical
+  bytes on disk ([`dsp-physical-type/benches/pointread.rs`](dsp-physical-type/benches/pointread.rs)).
 - **Realized headline bytes/point** — every headline bytes/point figure
   (`Segment::bytes_per_point`, `StorageEstimate.bytes_per_point` /
   `total_bytes_per_point`, the bench HTML `val B/pt`) reports the codec **actually
@@ -395,10 +407,18 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   an `unsorted_segments` count so out-of-order data is visible before it costs a
   point-lookup scan.
 - **Order-signal read planner** — a single-instant point lookup
-  (`SegmentStore::read_point`, `Segment::value_at`/`PagedSegment::value_at`) prunes
-  the index to the segments spanning the instant and resolves each with its
-  persisted `time_sorted` flag: a sorted segment is **binary-searched**, an
-  out-of-order one linear-scanned (the only sound search on unsorted timestamps).
+  (`SegmentStore::read_point`) prunes the index to the segments spanning the instant
+  and resolves each with its persisted `time_sorted` flag: a sorted segment is
+  **binary-searched**, an out-of-order one linear-scanned (the only sound search on
+  unsorted timestamps). Both frame kinds resolve through the **streaming point read**
+  (`dspseg::read_segment_point` / `read_paged_segment_point`, below) — no value-column
+  materialization on a per-block codec, and a paged frame **prunes pages on their indexed
+  min/max timestamp without decoding a column byte** before touching the one surviving page.
+  `SegmentStore::read_points` resolves a **batch** of instants in one pass — the index is pruned
+  once and each segment's timestamp column decoded once for the whole batch, so `N` instants
+  sharing a segment cost one decode, not `N` (**~27× faster** for 64 instants on a 100k-row FOR
+  frame — 452 µs vs 12.2 ms,
+  [`dsp-physical-type/benches/pointread.rs`](dsp-physical-type/benches/pointread.rs)).
 - **Intra-segment reconciliation** — `SegmentStore::reconcile_segment`/`reconcile_aspect`
   rewrite an out-of-order segment into a sorted one in place (stable sort by
   timestamp, re-sealed at the same id, frame kind preserved), so it drops out of the
@@ -455,7 +475,12 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   straight to the pages it needs.
 - **Data skipping** — segment-level and page-level pruning by time, by value
   band, and by **quality** (segments/pages that overlap a window but hold only
-  nulls there are skipped).
+  nulls there are skipped). A **range read over a regular (constant-stride)
+  block-coded segment** goes further — `read_segment_range` computes the row
+  window in closed form and unpacks only the present values inside it, so a
+  selective range decodes ~`window` values, not the whole segment (**~20× faster**
+  for a 100-row window over a 100k-row FOR frame — 629 µs vs 12.7 ms,
+  [`dsp-physical-type/benches/pointread.rs`](dsp-physical-type/benches/pointread.rs)).
 - **Control plane** — `SegmentIndexStore` persists one descriptor per sealed
   segment in libSQL and answers range queries with SQL pruning;
   `CatalogStore`/`AspectCatalog` register the database → subject → aspect
@@ -563,6 +588,7 @@ under the declared encoding/tolerance is rejected `400`.
 | `GET …/range.csv` · `…/value-range.csv` | The same windows as **CSV** (lossless decimal-text values; empty field = null). |
 | `GET /api/v1/storage/{aspect}/points` · `…/value-points` | Lossless JSON reads with declarative pagination — `offset`/`limit` (+ `take` and 1-based `page` aliases), with `total`/`count`/`offset` in the body. For stable forward iteration the body also carries an opaque **`next_cursor`** while rows remain; a client re-issues with `?cursor=<token>` (supersedes `offset`/`page`; malformed → `400`) until it is absent. |
 | `GET /api/v1/storage/{aspect}/at?t=` | **Single-instant point lookup**: the present value at exactly `t` (lossless decimal text) or a `found:false` miss. An **order-signal-driven read planner** resolves each candidate segment with its persisted `time_sorted` flag — binary search on a sorted segment, linear scan only on an out-of-order one — after pruning the index to the files spanning `t`. |
+| `GET /api/v1/storage/{aspect}/at-multi?t=,,` | **Batch point lookup**: a comma-separated list of instants resolved in one pass (`points:[{timestamp,value,found}]` in query order). The index is pruned once by the batch's whole span and each segment's timestamp column decoded once for the whole batch, so `N` instants sharing a segment cost one decode, not `N`. |
 | `POST /api/v1/storage/{aspect}/reconcile` | **Reconciliation pass** (`mode` in the response). Default (intra-segment): rewrite every out-of-order segment of the aspect into a time-sorted one in place. `?threshold=N` gates it on `unsorted_segments >= N` (QuestDB-style split-count trigger). `?hot_cold=true` reconciles cold segments but defers the hot tail until the backlog reaches the threshold. `?overlaps=true` instead runs the **cross-segment overlap merge** (newer-wins) — `reconciled` is then the number of segments merged away, and `?split_min_bytes=N` makes that merge **split-not-rewrite** (carve off a dominant cold prefix instead of rewriting the whole component). Returns `triggered`/`reconciled`/`cold_reconciled`/`hot_reconciled` and the post-pass `unsorted_segments` + `overlapping_segments`. |
 | `POST /api/v1/storage/{aspect}/squash` | **Squash** the aspect's segments into one (newer-wins), bounding split-path fragmentation. `?max_segments=N` gates it (squash only when the count exceeds `N`). Returns `triggered`/`removed`/`segment_count`. |
 | `POST /api/v1/storage/reconcile` | **Store-wide reconciliation sweep** across every declared aspect: threshold (default), `?hot_cold=true`, or `?overlaps=true` (+ `?split_min_bytes=N` for split-not-rewrite). Returns `mode`, `aspects_scanned` / `aspects_reconciled` / `segments_reconciled` (+ cold/hot split) and the post-sweep store-wide `unsorted_segments` + `overlapping_segments`. The manual counterpart to the background reconcile daemon (`DSP_RECONCILE_INTERVAL_SECS` / `DSP_RECONCILE_THRESHOLD` / `DSP_RECONCILE_HOT_COLD` / `DSP_RECONCILE_OVERLAPS` / `DSP_RECONCILE_SPLIT_MIN_BYTES` / `DSP_RECONCILE_MAX_SPLITS`). |

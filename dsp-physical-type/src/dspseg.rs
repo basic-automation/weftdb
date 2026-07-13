@@ -872,10 +872,556 @@ pub fn read_value_at(bytes: &[u8], index: usize) -> Result<Option<PhysicalValue>
 			let data = r.read_bytes()?;
 			Ok(crate::timestamp::for_bitpack_decode_range(data, block, count, index, 1).first().map(|&mantissa| PhysicalValue::ScaledI64 { mantissa, scale }))
 		}
-		// Fixed-width / per-value / cascade payloads: a full decode then index (correct
-		// everywhere; the per-block skip only helps the two block codecs above).
+		VAL_CODEC_BITPACK => {
+			let PhysicalType::ScaledI64 { scale } = physical_type else {
+				return Err(DspSegError::InvalidTag { kind: "value_codec_bitpack_type", value: tag });
+			};
+			// Fixed global width → the value at `index` lives at bit `index * width`, an O(width)
+			// read of the raw `count * width`-bit stream (no length prefix, as scaled_bitpack emits).
+			let width = u32::from(r.read_u8()?);
+			let data_len = (count * width as usize).div_ceil(8);
+			let data = r.take(data_len)?;
+			Ok(Some(PhysicalValue::ScaledI64 { mantissa: crate::timestamp::bitpack_decode_at(width, data, index), scale }))
+		}
+		// Per-value / cascade payloads: a full decode then index (correct everywhere; the
+		// random-access skip only helps the three fixed-layout codecs above).
 		_ => Ok(read_value_column(&mut ByteReader::new(bytes))?.values.get(index).cloned()),
 	}
+}
+
+/// Whether a value block (a `section` positioned at its physical-type tag) uses one of the three
+/// fixed-layout `ScaledI64` codecs ([`VAL_CODEC_BLOCKED`] / [`VAL_CODEC_FOR`] /
+/// [`VAL_CODEC_BITPACK`]) that [`read_value_at`] can random-access. Peeks the header + codec byte
+/// on a throwaway reader without consuming the caller's cursor. `false` (including on a
+/// short/malformed header) routes the caller to the always-correct full-decode fallback.
+fn value_block_has_random_access_codec(section: &[u8]) -> bool {
+	let mut r = ByteReader::new(section);
+	let Ok(tag) = r.read_u8() else { return false };
+	// Skip the optional scale byte the two scaled types carry.
+	if matches!(tag, TAG_SCALED_I64 | TAG_SCALED_I128) && r.read_u8().is_err() {
+		return false;
+	}
+	// count, lossy_count, max_abs_error, then the codec selector.
+	if r.read_uvarint().is_err() || r.read_uvarint().is_err() || read_decimal(&mut r).is_err() {
+		return false;
+	}
+	// These codecs are only defined over ScaledI64; the read paths assert it too.
+	matches!((tag, r.read_u8()), (TAG_SCALED_I64, Ok(VAL_CODEC_BLOCKED | VAL_CODEC_FOR | VAL_CODEC_BITPACK)))
+}
+
+/// Advance `r` past a value block known to use a random-access codec ([`VAL_CODEC_BLOCKED`] /
+/// [`VAL_CODEC_FOR`] / [`VAL_CODEC_BITPACK`]) — the header, the codec byte, and the coded stream —
+/// leaving `r` at the following (timestamp) block. Only called after
+/// [`value_block_has_random_access_codec`] confirmed the fast path, so the framing is exactly what
+/// [`write_value_column_selected`] emits for `scaled_blocked`/`scaled_for`/`scaled_bitpack`.
+fn skip_random_access_value_column(r: &mut ByteReader) -> Result<(), DspSegError> {
+	let tag = r.read_u8()?;
+	if matches!(tag, TAG_SCALED_I64 | TAG_SCALED_I128) {
+		r.read_u8()?; // scale
+	}
+	let count = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+	r.read_uvarint()?; // lossy_count
+	read_decimal(r)?; // max_abs_error
+	if r.read_u8()? == VAL_CODEC_BITPACK {
+		// The fixed-width codec writes a width byte then a raw (unprefixed) count*width-bit stream.
+		let width = usize::from(r.read_u8()?);
+		r.take((count * width).div_ceil(8))?;
+	} else {
+		// The two per-block codecs write a block-size uvarint then a length-prefixed stream.
+		r.read_uvarint()?; // block size
+		r.read_bytes()?; // length-prefixed coded stream
+	}
+	Ok(())
+}
+
+/// The **dense value index** of logical `row` — the count of present rows before it. The value
+/// column stores only present values, so this is the offset [`read_value_at`] / a decoded
+/// present-value vector is indexed by. `O(1)` for a dense column (no nulls before it).
+fn dense_rank(nulls: &NullMask, row: usize) -> usize {
+	if nulls.null_count() == 0 {
+		row
+	} else {
+		(0..row).filter(|&i| nulls.is_present(i)).count()
+	}
+}
+
+/// Locate the **dense value index** of the first *present* row whose timestamp equals `t`, or
+/// [`None`] when no present row carries `t` — the shared core of the streaming point read
+/// (mirrors [`crate::segment::point_lookup`] + the dense-rank mapping [`Segment::decode_nullable`]
+/// uses). A time-sorted column binary-searches the run of `t` for its first present row; an
+/// out-of-order column linear-scans (the only sound search on unsorted timestamps).
+fn locate_present_dense_index(timestamps: &[i64], nulls: &NullMask, sorted: bool, t: i64) -> Option<usize> {
+	let row = if sorted {
+		let mut row = timestamps.partition_point(|&x| x < t);
+		loop {
+			if row >= timestamps.len() || timestamps[row] != t {
+				return None;
+			}
+			if nulls.is_present(row) {
+				break row;
+			}
+			row += 1;
+		}
+	} else {
+		timestamps.iter().enumerate().find_map(|(i, &ts)| (ts == t && nulls.is_present(i)).then_some(i))?
+	};
+	Some(dense_rank(nulls, row))
+}
+
+/// **Streaming batch point read over one column section** — a `section` positioned at its value
+/// block (value + timestamp + quality columns, exactly a single-block frame's column region or one
+/// paged-frame page block), resolving each `ts[k]` to the first present value at that instant
+/// (matching [`Segment::value_at`] / [`crate::page::Page::value_at`]), aligned to `ts`.
+///
+/// The whole point of batching: the timestamp column + quality mask (and, on the fallback codec,
+/// the value column) are decoded **once** and reused for every requested instant — a lookup of `N`
+/// instants in one segment pays one timestamp decode, not `N`. On a per-block value codec the value
+/// block is skipped by its framing and each covering block unpacked via [`read_value_at`]; every
+/// other codec decodes the value column whole and indexes it. A section with no rows (or no `ts` in
+/// its coarse span) is answered all-`None` without decoding a column byte.
+fn read_points_from_section(section: &[u8], stats: &SegmentStats, ts: &[i64]) -> Result<Vec<Option<BigDecimal>>, DspSegError> {
+	let mut out = vec![None; ts.len()];
+	// Coarse span bail — decode nothing unless some requested instant falls inside the segment.
+	let (Some(min_ts), Some(max_ts)) = (stats.min_ts, stats.max_ts) else { return Ok(out) };
+	if !ts.iter().any(|&t| min_ts <= t && t <= max_ts) {
+		return Ok(out);
+	}
+	let fast = value_block_has_random_access_codec(section);
+	let mut r = ByteReader::new(section);
+	// Advance past the value block to the timestamp block: skip it on the fast path (keeping the
+	// values on disk), fully decode it on the fallback (keeping the present values in hand).
+	let present_values = if fast {
+		skip_random_access_value_column(&mut r)?;
+		None
+	} else {
+		Some(read_value_column(&mut r)?.values)
+	};
+	let ts_col = read_timestamp_column(&mut r)?;
+	let nulls = read_null_column(&mut r, stats.row_count, stats.null_count)?;
+	// **Regular-column fast path:** a time-sorted constant-stride column resolves each instant's
+	// row in closed form (`(t - first) / step`), skipping the whole delta-of-delta reconstruction +
+	// binary search. `time_sorted` guarantees `step > 0` and no wrap-around, so the index is unique
+	// and exact. An irregular (or out-of-order) column decodes the timestamps and binary/linear
+	// searches as before.
+	let stride = if stats.time_sorted { ts_col.arithmetic_stride().filter(|&(_, step)| step > 0) } else { None };
+	let timestamps = if stride.is_none() { Some(crate::timestamp::decode_delta_of_delta(&ts_col)) } else { None };
+	for (slot, &t) in out.iter_mut().zip(ts) {
+		if t < min_ts || t > max_ts {
+			continue;
+		}
+		let dense_index = if let Some((first, step)) = stride {
+			// Closed form: the row whose timestamp is exactly `t`, if `t` lands on the grid.
+			let diff = t.wrapping_sub(first);
+			if diff % step != 0 {
+				continue;
+			}
+			let quotient = diff / step;
+			// `try_from` rejects a negative index; then bound it, guard against wrapping by
+			// reconstructing, and require the row present.
+			let Ok(row) = usize::try_from(quotient) else { continue };
+			if row >= stats.row_count || first.wrapping_add(quotient.wrapping_mul(step)) != t || !nulls.is_present(row) {
+				continue;
+			}
+			dense_rank(&nulls, row)
+		} else {
+			let Some(idx) = locate_present_dense_index(timestamps.as_ref().expect("decoded when irregular"), &nulls, stats.time_sorted, t) else {
+				continue;
+			};
+			idx
+		};
+		let value = match &present_values {
+			// Fast path: random-access the single covering block straight from the section bytes.
+			None => read_value_at(section, dense_index)?,
+			// Fallback: index the already-decoded present values.
+			Some(values) => values.get(dense_index).cloned(),
+		};
+		*slot = value.map(|pv| pv.to_logical());
+	}
+	Ok(out)
+}
+
+/// **Streaming point read over one column section** — the single-instant case of
+/// [`read_points_from_section`]. See it for the value-block-skip mechanics.
+fn read_point_from_section(section: &[u8], stats: &SegmentStats, t: i64) -> Result<Option<BigDecimal>, DspSegError> {
+	Ok(read_points_from_section(section, stats, &[t])?.pop().flatten())
+}
+
+/// **Streaming single-value point read** from a single-block `.dspseg` frame — exactly
+/// [`Segment::value_at`]'s answer, **without materializing the value column**.
+///
+/// The first *present* value whose timestamp equals `t`, read via the per-block random-access
+/// codecs ([`VAL_CODEC_BLOCKED`] / [`VAL_CODEC_FOR`]) when the value block uses one; every other
+/// codec falls back to a full value-column decode + index. Either way the result equals
+/// `read_segment(bytes)?.value_at(t)` for every single-block frame. This is the point-lookup
+/// lever the block-level random-access primitives (and [`read_value_at`]) exist for, wired one
+/// level up to the framed segment (roadmap Phase 4/6). See [`read_point_from_section`].
+///
+/// # Errors
+///
+/// Propagates the same [`DspSegError`]s as [`read_segment`] (checksum mismatch, bad magic,
+/// unsupported version — this reader is single-block-only, so a paged frame is a version error —
+/// or a malformed column/stat body).
+pub fn read_segment_point(bytes: &[u8], t: i64) -> Result<Option<BigDecimal>, DspSegError> {
+	// Verify the trailing CRC over the body before trusting any field (as read_segment does).
+	if bytes.len() < 4 {
+		return Err(DspSegError::UnexpectedEof { needed: 4, remaining: bytes.len() });
+	}
+	let (body, crc_bytes) = bytes.split_at(bytes.len() - 4);
+	let stored = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+	let computed = crc32(body);
+	if stored != computed {
+		return Err(DspSegError::ChecksumMismatch { stored, computed });
+	}
+	let mut r = ByteReader::new(body);
+	if r.take(MAGIC.len())? != MAGIC {
+		return Err(DspSegError::BadMagic);
+	}
+	let version = r.read_u16_le()?;
+	if version != SEGMENT_FORMAT_VERSION {
+		return Err(DspSegError::UnsupportedVersion { found: version });
+	}
+	let stats = read_segment_stats(&mut r)?;
+	// The value block begins at the current offset; the column region runs from here to the CRC.
+	read_point_from_section(&body[r.pos..], &stats, t)
+}
+
+/// **Streaming single-value point read** from a **paged** `.dspseg` frame — exactly
+/// [`PagedSegment::value_at`]'s answer, without materializing the pages a point lookup skips.
+///
+/// The per-page index (each page's stats + block byte length) is parsed first, so pages whose
+/// `[min_ts, max_ts]` cannot contain `t` are pruned *without decoding a single column byte*
+/// (on-disk intra-segment page skipping). Each surviving page — in page order, so the first
+/// present value wins, matching [`PagedSegment::value_at`]'s `find_map` — is resolved by the
+/// shared [`read_point_from_section`] over just that page's block (the block-skip value read
+/// applies within the page too). For a time-sorted paged segment at most one page survives, so
+/// a point lookup reads one page's timestamp column and one value block regardless of segment
+/// size.
+///
+/// # Errors
+///
+/// Propagates the same [`DspSegError`]s as [`read_paged_segment`] (checksum mismatch, bad magic,
+/// unsupported version — this reader is paged-only — or a malformed index/column body).
+pub fn read_paged_segment_point(bytes: &[u8], t: i64) -> Result<Option<BigDecimal>, DspSegError> {
+	if bytes.len() < 4 {
+		return Err(DspSegError::UnexpectedEof { needed: 4, remaining: bytes.len() });
+	}
+	let (body, crc_bytes) = bytes.split_at(bytes.len() - 4);
+	let stored = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+	let computed = crc32(body);
+	if stored != computed {
+		return Err(DspSegError::ChecksumMismatch { stored, computed });
+	}
+	let mut r = ByteReader::new(body);
+	if r.take(MAGIC.len())? != MAGIC {
+		return Err(DspSegError::BadMagic);
+	}
+	let version = r.read_u16_le()?;
+	if version != PAGED_SEGMENT_FORMAT_VERSION {
+		return Err(DspSegError::UnsupportedVersion { found: version });
+	}
+	let _rows_per_page = r.read_uvarint()?;
+	let seg_stats = read_segment_stats(&mut r)?;
+	// Coarse bail on the whole segment's span before touching the index.
+	match (seg_stats.min_ts, seg_stats.max_ts) {
+		(Some(lo), Some(hi)) if lo <= t && t <= hi => {}
+		_ => return Ok(None),
+	}
+	let page_count = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+	// Parse the per-page index (stats + block length); the page data blocks follow it, so track
+	// the running byte offset of each block within `body`.
+	let mut index: Vec<(SegmentStats, usize)> = Vec::with_capacity(page_count);
+	for _ in 0..page_count {
+		let page_stats = read_segment_stats(&mut r)?;
+		let block_len = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+		index.push((page_stats, block_len));
+	}
+	let mut block_start = r.pos;
+	for (page_stats, block_len) in index {
+		let contains = matches!((page_stats.min_ts, page_stats.max_ts), (Some(lo), Some(hi)) if lo <= t && t <= hi);
+		if contains {
+			// Bound the section to this page's block so read_value_at cannot read past it.
+			let section = body.get(block_start..block_start + block_len).ok_or_else(|| DspSegError::UnexpectedEof { needed: block_len, remaining: body.len().saturating_sub(block_start) })?;
+			if let Some(value) = read_point_from_section(section, &page_stats, t)? {
+				return Ok(Some(value));
+			}
+		}
+		block_start += block_len;
+	}
+	Ok(None)
+}
+
+/// **Streaming batch point read** from a single-block `.dspseg` frame — [`read_segment_point`] for
+/// many instants at once, returning one value per `ts[k]` (aligned to `ts`).
+///
+/// The frame is read once and its timestamp column decoded once for the whole batch (a value-block
+/// skip per instant on a random-access codec), so `N` instants cost one timestamp decode rather
+/// than `N`. Each element equals `read_segment_point(bytes, ts[k])`.
+///
+/// # Errors
+///
+/// Propagates the same [`DspSegError`]s as [`read_segment`].
+pub fn read_segment_points(bytes: &[u8], ts: &[i64]) -> Result<Vec<Option<BigDecimal>>, DspSegError> {
+	if bytes.len() < 4 {
+		return Err(DspSegError::UnexpectedEof { needed: 4, remaining: bytes.len() });
+	}
+	let (body, crc_bytes) = bytes.split_at(bytes.len() - 4);
+	let stored = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+	let computed = crc32(body);
+	if stored != computed {
+		return Err(DspSegError::ChecksumMismatch { stored, computed });
+	}
+	let mut r = ByteReader::new(body);
+	if r.take(MAGIC.len())? != MAGIC {
+		return Err(DspSegError::BadMagic);
+	}
+	let version = r.read_u16_le()?;
+	if version != SEGMENT_FORMAT_VERSION {
+		return Err(DspSegError::UnsupportedVersion { found: version });
+	}
+	let stats = read_segment_stats(&mut r)?;
+	read_points_from_section(&body[r.pos..], &stats, ts)
+}
+
+/// **Streaming batch point read** from a **paged** `.dspseg` frame — [`read_paged_segment_point`]
+/// for many instants at once, returning one value per `ts[k]` (aligned to `ts`).
+///
+/// The per-page index is parsed once; each page is decoded **at most once** for the whole batch,
+/// and only when some still-unresolved instant falls in its span (on-disk page skipping preserved).
+/// An instant takes the first page (in page order) that yields a present value, matching
+/// [`PagedSegment::value_at`]. Each element equals `read_paged_segment_point(bytes, ts[k])`.
+///
+/// # Errors
+///
+/// Propagates the same [`DspSegError`]s as [`read_paged_segment`].
+pub fn read_paged_segment_points(bytes: &[u8], ts: &[i64]) -> Result<Vec<Option<BigDecimal>>, DspSegError> {
+	let mut out = vec![None; ts.len()];
+	if bytes.len() < 4 {
+		return Err(DspSegError::UnexpectedEof { needed: 4, remaining: bytes.len() });
+	}
+	let (body, crc_bytes) = bytes.split_at(bytes.len() - 4);
+	let stored = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+	let computed = crc32(body);
+	if stored != computed {
+		return Err(DspSegError::ChecksumMismatch { stored, computed });
+	}
+	let mut r = ByteReader::new(body);
+	if r.take(MAGIC.len())? != MAGIC {
+		return Err(DspSegError::BadMagic);
+	}
+	let version = r.read_u16_le()?;
+	if version != PAGED_SEGMENT_FORMAT_VERSION {
+		return Err(DspSegError::UnsupportedVersion { found: version });
+	}
+	let _rows_per_page = r.read_uvarint()?;
+	let seg_stats = read_segment_stats(&mut r)?;
+	let (Some(seg_lo), Some(seg_hi)) = (seg_stats.min_ts, seg_stats.max_ts) else { return Ok(out) };
+	if !ts.iter().any(|&t| seg_lo <= t && t <= seg_hi) {
+		return Ok(out);
+	}
+	let page_count = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+	let mut index: Vec<(SegmentStats, usize)> = Vec::with_capacity(page_count);
+	for _ in 0..page_count {
+		let page_stats = read_segment_stats(&mut r)?;
+		let block_len = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+		index.push((page_stats, block_len));
+	}
+	let mut resolved = vec![false; ts.len()];
+	let mut block_start = r.pos;
+	for (page_stats, block_len) in index {
+		let (Some(page_lo), Some(page_hi)) = (page_stats.min_ts, page_stats.max_ts) else {
+			block_start += block_len;
+			continue;
+		};
+		// Decode the page only if some still-unresolved instant falls in its span (page skipping).
+		if ts.iter().enumerate().any(|(k, &t)| !resolved[k] && page_lo <= t && t <= page_hi) {
+			let section = body.get(block_start..block_start + block_len).ok_or_else(|| DspSegError::UnexpectedEof { needed: block_len, remaining: body.len().saturating_sub(block_start) })?;
+			let hits = read_points_from_section(section, &page_stats, ts)?;
+			for ((slot, resolved), hit) in out.iter_mut().zip(resolved.iter_mut()).zip(hits) {
+				if !*resolved && hit.is_some() {
+					*slot = hit;
+					*resolved = true;
+				}
+			}
+		}
+		block_start += block_len;
+	}
+	Ok(out)
+}
+
+/// **Windowed range read over one column section** — the `(timestamp, value)` rows of a `section`
+/// (value + timestamp + quality columns) whose timestamp falls in the inclusive `[start, end]`
+/// window, aligned and in row order. The shared core of the single-block and paged range reads.
+///
+/// For a **regular (constant-stride) sorted column with a random-access value codec** the window is
+/// resolved without materializing the whole section: the row range `[lo, hi]` is computed in closed
+/// form from the stride (`ts[i] = first + i*step`), the timestamps are generated directly, and only
+/// the present values inside the window are unpacked via [`read_value_at`] (one block per present
+/// row). Any other shape (irregular timestamps, a per-value/cascade value codec, an out-of-order
+/// segment) fully decodes the section and filters, which is always correct.
+fn read_range_from_section(section: &[u8], stats: &SegmentStats, start: i64, end: i64) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>), DspSegError> {
+	// Coarse span bail — a window disjoint from the section yields nothing.
+	let (Some(min_ts), Some(max_ts)) = (stats.min_ts, stats.max_ts) else { return Ok((Vec::new(), Vec::new())) };
+	if end < min_ts || start > max_ts {
+		return Ok((Vec::new(), Vec::new()));
+	}
+	// A full decode of the section then a filter — the always-correct fallback for every shape the
+	// closed-form window below does not cover.
+	let full_filtered = || -> Result<(Vec<i64>, Vec<Option<BigDecimal>>), DspSegError> {
+		let mut fr = ByteReader::new(section);
+		let col = read_value_column(&mut fr)?;
+		let ts_col = read_timestamp_column(&mut fr)?;
+		let timestamps = crate::timestamp::decode_delta_of_delta(&ts_col);
+		let nulls = read_null_column(&mut fr, stats.row_count, stats.null_count)?;
+		let (mut out_times, mut out_values) = (Vec::new(), Vec::new());
+		let mut dense = 0;
+		for (row, &t) in timestamps.iter().enumerate() {
+			let present = nulls.is_present(row);
+			if start <= t && t <= end {
+				out_times.push(t);
+				out_values.push(if present { col.values.get(dense).cloned().map(|pv| pv.to_logical()) } else { None });
+			}
+			if present {
+				dense += 1;
+			}
+		}
+		Ok((out_times, out_values))
+	};
+	// The closed-form fast path needs a random-access value codec (per-present-row read) and a
+	// sorted, constant-stride timestamp column.
+	if !value_block_has_random_access_codec(section) {
+		return full_filtered();
+	}
+	let mut sr = ByteReader::new(section);
+	skip_random_access_value_column(&mut sr)?;
+	let ts_col = read_timestamp_column(&mut sr)?;
+	let nulls = read_null_column(&mut sr, stats.row_count, stats.null_count)?;
+	let stride = if stats.time_sorted { ts_col.arithmetic_stride().filter(|&(_, step)| step > 0) } else { None };
+	let Some((first, step)) = stride else {
+		return full_filtered();
+	};
+	// Closed-form row window: lo = first row with ts >= start, hi = last row with ts <= end.
+	let step128 = i128::from(step);
+	let start_off = i128::from(start) - i128::from(first);
+	let lo: usize = if start_off <= 0 {
+		0
+	} else {
+		let (q, rem) = (start_off / step128, start_off % step128);
+		usize::try_from(if rem == 0 { q } else { q + 1 }).unwrap_or(usize::MAX)
+	};
+	let end_off = i128::from(end) - i128::from(first);
+	if end_off < 0 {
+		return Ok((Vec::new(), Vec::new()));
+	}
+	let hi = usize::try_from(end_off / step128).unwrap_or(usize::MAX).min(stats.row_count - 1);
+	if lo > hi {
+		return Ok((Vec::new(), Vec::new()));
+	}
+	// Generate the window: timestamps in closed form, present values one block at a time.
+	let mut timestamps = Vec::with_capacity(hi - lo + 1);
+	let mut values = Vec::with_capacity(hi - lo + 1);
+	let mut dense = dense_rank(&nulls, lo);
+	for row in lo..=hi {
+		let offset = i64::try_from(row).unwrap_or(i64::MAX);
+		timestamps.push(first.wrapping_add(offset.wrapping_mul(step)));
+		if nulls.is_present(row) {
+			values.push(read_value_at(section, dense)?.map(|pv| pv.to_logical()));
+			dense += 1;
+		} else {
+			values.push(None);
+		}
+	}
+	Ok((timestamps, values))
+}
+
+/// **Windowed range read** from a single-block `.dspseg` frame — the rows in `[start, end]`.
+///
+/// Returns the `(timestamp, value)` rows whose timestamp falls in the inclusive `[start, end]`
+/// window, aligned and in row order — exactly `read_segment(bytes)?.decode_nullable()` filtered to
+/// `[start, end]`. A **regular block-coded segment** resolves the window in closed form and unpacks
+/// only its present values (see [`read_range_from_section`]); any other shape full-decodes + filters.
+/// Roadmap Phase 4/6 (the range-read analogue of the streaming point read).
+///
+/// # Errors
+///
+/// Propagates the same [`DspSegError`]s as [`read_segment`].
+pub fn read_segment_range(bytes: &[u8], start: i64, end: i64) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>), DspSegError> {
+	if bytes.len() < 4 {
+		return Err(DspSegError::UnexpectedEof { needed: 4, remaining: bytes.len() });
+	}
+	let (body, crc_bytes) = bytes.split_at(bytes.len() - 4);
+	let stored = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+	let computed = crc32(body);
+	if stored != computed {
+		return Err(DspSegError::ChecksumMismatch { stored, computed });
+	}
+	let mut r = ByteReader::new(body);
+	if r.take(MAGIC.len())? != MAGIC {
+		return Err(DspSegError::BadMagic);
+	}
+	let version = r.read_u16_le()?;
+	if version != SEGMENT_FORMAT_VERSION {
+		return Err(DspSegError::UnsupportedVersion { found: version });
+	}
+	let stats = read_segment_stats(&mut r)?;
+	read_range_from_section(&body[r.pos..], &stats, start, end)
+}
+
+/// **Windowed range read** from a **paged** `.dspseg` frame — the rows in `[start, end]`.
+///
+/// The per-page index is parsed once, so pages whose `[min_ts, max_ts]` is disjoint from the window
+/// are skipped without decoding a column byte (on-disk page skipping, as [`read_paged_segment`]'s
+/// range read); each surviving page is windowed through the shared [`read_range_from_section`] (a
+/// regular page resolves its sub-window in closed form). Rows are concatenated in page order.
+/// Equal to `read_paged_segment(bytes)?.read_time_range(start, end)`.
+///
+/// # Errors
+///
+/// Propagates the same [`DspSegError`]s as [`read_paged_segment`].
+pub fn read_paged_segment_range(bytes: &[u8], start: i64, end: i64) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>), DspSegError> {
+	if bytes.len() < 4 {
+		return Err(DspSegError::UnexpectedEof { needed: 4, remaining: bytes.len() });
+	}
+	let (body, crc_bytes) = bytes.split_at(bytes.len() - 4);
+	let stored = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+	let computed = crc32(body);
+	if stored != computed {
+		return Err(DspSegError::ChecksumMismatch { stored, computed });
+	}
+	let mut r = ByteReader::new(body);
+	if r.take(MAGIC.len())? != MAGIC {
+		return Err(DspSegError::BadMagic);
+	}
+	let version = r.read_u16_le()?;
+	if version != PAGED_SEGMENT_FORMAT_VERSION {
+		return Err(DspSegError::UnsupportedVersion { found: version });
+	}
+	let _rows_per_page = r.read_uvarint()?;
+	let seg_stats = read_segment_stats(&mut r)?;
+	let (mut timestamps, mut values) = (Vec::new(), Vec::new());
+	// Coarse bail on the whole segment span.
+	match (seg_stats.min_ts, seg_stats.max_ts) {
+		(Some(lo), Some(hi)) if end >= lo && start <= hi => {}
+		_ => return Ok((timestamps, values)),
+	}
+	let page_count = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+	let mut index: Vec<(SegmentStats, usize)> = Vec::with_capacity(page_count);
+	for _ in 0..page_count {
+		let page_stats = read_segment_stats(&mut r)?;
+		let block_len = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+		index.push((page_stats, block_len));
+	}
+	let mut block_start = r.pos;
+	for (page_stats, block_len) in index {
+		let overlaps = matches!((page_stats.min_ts, page_stats.max_ts), (Some(lo), Some(hi)) if end >= lo && start <= hi);
+		if overlaps {
+			let section = body.get(block_start..block_start + block_len).ok_or_else(|| DspSegError::UnexpectedEof { needed: block_len, remaining: body.len().saturating_sub(block_start) })?;
+			let (pt, pv) = read_range_from_section(section, &page_stats, start, end)?;
+			timestamps.extend(pt);
+			values.extend(pv);
+		}
+		block_start += block_len;
+	}
+	Ok((timestamps, values))
 }
 
 // ---------------------------------------------------------------------------
@@ -1779,6 +2325,210 @@ mod tests {
 			assert_eq!(read_value_at(&bytes, i).expect("reads"), full.values.get(i).cloned(), "cascade index {i}");
 		}
 		assert_eq!(read_value_at(&bytes, 256).expect("reads"), None);
+	}
+
+	#[test]
+	fn read_segment_point_matches_value_at_across_codecs() {
+		// The streaming point read must equal Segment::value_at for every single-block frame: the
+		// two per-block value codecs take the block-skip fast path, the rest fall back to the full
+		// decode. Cover present / absent-in-range / out-of-range / duplicate-run / null-row
+		// lookups, sorted and out-of-order.
+
+		// A mixed-magnitude scaled column → the blocked value codec (fast path). Reinterpreting the
+		// winning-blocked mantissas at scale 2 keeps the exact mantissa distribution (so the codec
+		// choice is unchanged) while making the values f64-inexact, so recommend_encoding rejects
+		// f64 and selects ScaledI64 (a plain-integer column would encode f64-exact and never reach
+		// the block codecs): a wide zero-straddling burst among near-zero values picks blocked.
+		let scaled2 = |m: i64| -> String {
+			let (sign, a) = (if m < 0 { "-" } else { "" }, m.abs());
+			format!("{sign}{}.{:02}", a / 100, a % 100)
+		};
+		let blocked_lits: Vec<String> = (0..192).map(|i| scaled2(if (64..128).contains(&i) { ((10_000_000 + i) * 100 + 1) * if i % 2 == 0 { 1 } else { -1 } } else { (i % 5) - 2 })).collect();
+		let blocked_vals = col(&blocked_lits.iter().map(String::as_str).collect::<Vec<_>>());
+		let blocked_ts: Vec<i64> = (0..192).map(|i| i64::from(i) * 10).collect();
+		let blocked = Segment::build_sorted(&blocked_ts, &blocked_vals, TimeUnit::Millis, &BigDecimal::from(0)).expect("builds");
+		assert_eq!(blocked.values.best_value_codec(), "scaled_blocked");
+
+		// A clustered-high-base scaled column → the FOR value codec (fast path).
+		let for_lits: Vec<String> = (0..192).map(|i| format!("10000000.0{}", i % 7)).collect();
+		let for_vals = col(&for_lits.iter().map(String::as_str).collect::<Vec<_>>());
+		let for_ts: Vec<i64> = (0..192).map(|i| 1_000 + i64::from(i) * 3).collect();
+		let for_seg = Segment::build_sorted(&for_ts, &for_vals, TimeUnit::Micros, &BigDecimal::from(0)).expect("builds");
+		assert_eq!(for_seg.values.best_value_codec(), "scaled_for");
+
+		// A small-magnitude scaled column that cycles the *full* range within every block →
+		// fixed-width bit-pack (fast path): a global width already fits every mantissa and no block
+		// has a tighter range, so per-block/FOR headers only cost more. (37 is coprime with 81, so
+		// each 64-wide block spans the whole ±40 spread; scale 2 so build selects ScaledI64.)
+		let bitpack_lits: Vec<String> = (0..192).map(|i| scaled2((i * 37) % 81 - 40)).collect();
+		let bitpack_vals = col(&bitpack_lits.iter().map(String::as_str).collect::<Vec<_>>());
+		let bitpack_ts: Vec<i64> = (0..192).map(|i| 5_000 + i64::from(i) * 2).collect();
+		let bitpack = Segment::build_sorted(&bitpack_ts, &bitpack_vals, TimeUnit::Millis, &BigDecimal::from(0)).expect("builds");
+		assert_eq!(bitpack.values.best_value_codec(), "scaled_bitpack");
+
+		// A wide-sparse column → varint (fallback path); and an out-of-order variant (linear scan).
+		let varint = Segment::build(&[10, 20, 30, 40], &col(&["1", "1000000000", "2", "3"]), TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		let unsorted = Segment::build(&[40, 10, 30, 20], &col(&["4", "1", "3", "2"]), TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		assert!(!unsorted.is_time_sorted());
+
+		// An F64 column → fixed-width fallback.
+		let f64_seg = Segment::build(&[5, 15, 25], &col(&["0.5", "1.5", "2.5"]), TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+
+		for seg in [&blocked, &for_seg, &bitpack, &varint, &unsorted, &f64_seg] {
+			let bytes = seg.write_to();
+			let (timestamps, _) = seg.decode_nullable();
+			// Query every stored timestamp plus around/outside the span — the streaming read must
+			// agree with value_at at each.
+			let mut queries: Vec<i64> = timestamps.clone();
+			if let (Some(&lo), Some(&hi)) = (timestamps.iter().min(), timestamps.iter().max()) {
+				queries.extend([lo - 1, hi + 1, lo + 1]); // out-of-range low/high and an interior miss
+			}
+			queries.extend([i64::MIN, i64::MAX]);
+			for &t in &queries {
+				assert_eq!(read_segment_point(&bytes, t).expect("reads"), seg.value_at(t), "codec {} at t={t}", seg.values.best_value_codec());
+			}
+		}
+
+		// A nullable sorted blocked segment with a duplicate timestamp whose first row is null: the
+		// dense-rank mapping (the value column stores only present values) + first-present-of-a-run
+		// must still match value_at.
+		let mut null_vals: Vec<Option<BigDecimal>> = blocked_vals.iter().cloned().map(Some).collect();
+		for &row in &[150_usize, 160, 170] {
+			null_vals[row] = None; // null only tail rows (after the burst's dense range) so its
+			                       // 64-wide block stays aligned and keeps picking a block codec
+		}
+		let mut null_ts = blocked_ts.clone();
+		null_ts[151] = null_ts[150]; // rows 150 (null) & 151 (present) now share a timestamp
+		let nullable = Segment::build_nullable_sorted(&null_ts, &null_vals, TimeUnit::Millis, &BigDecimal::from(0)).expect("builds");
+		// A block codec keeps the fast path exercised through the null/dense-rank mapping.
+		assert!(matches!(nullable.values.best_value_codec(), "scaled_blocked" | "scaled_for"), "present values still pick a per-block codec, got {}", nullable.values.best_value_codec());
+		let bytes = nullable.write_to();
+		let (timestamps, _) = nullable.decode_nullable();
+		for &t in timestamps.iter().chain(&[null_ts[0] - 5, null_ts[191] + 5]) {
+			assert_eq!(read_segment_point(&bytes, t).expect("reads"), nullable.value_at(t), "nullable blocked at t={t}");
+		}
+	}
+
+	#[test]
+	fn read_paged_segment_point_matches_value_at() {
+		// The paged streaming point read must equal PagedSegment::value_at for every frame: pages
+		// are pruned on their indexed min/max ts, and the surviving page's value block takes the
+		// same block-skip fast path. Cover a multi-page FOR segment (dense and nullable, including
+		// a duplicate timestamp straddling a page boundary), across present / miss / out-of-range.
+		let for_lits: Vec<String> = (0..300).map(|i| format!("10000000.{:02}", i % 97)).collect();
+		let for_vals = col(&for_lits.iter().map(String::as_str).collect::<Vec<_>>());
+		let for_ts: Vec<i64> = (0..300).map(|i| 1_000 + i64::from(i) * 10).collect();
+
+		let dense = PagedSegment::build(&for_ts, &for_vals, TimeUnit::Millis, &BigDecimal::from(0), 64).expect("builds");
+		assert!(dense.page_count() >= 4, "the corpus must span several pages");
+		assert!(matches!(dense.pages[0].values.best_value_codec(), "scaled_for" | "scaled_blocked"), "a page must pick a per-block codec so the fast path is exercised");
+
+		// A nullable variant: null a couple of rows, and give rows 128/129 (a page boundary at
+		// rows_per_page=64: page 2 starts at row 128) a shared timestamp with the first present.
+		let mut null_vals: Vec<Option<BigDecimal>> = for_vals.iter().cloned().map(Some).collect();
+		null_vals[128] = None;
+		null_vals[200] = None;
+		let mut null_ts = for_ts.clone();
+		null_ts[129] = null_ts[128]; // rows 128 (null) & 129 (present) share a timestamp at a page edge
+		let nullable = PagedSegment::build_nullable(&null_ts, &null_vals, TimeUnit::Millis, &BigDecimal::from(0), 64).expect("builds");
+
+		for seg in [&dense, &nullable] {
+			let bytes = seg.write_to();
+			let (timestamps, _) = seg.decode_nullable();
+			let mut queries: Vec<i64> = timestamps.clone();
+			if let (Some(&lo), Some(&hi)) = (timestamps.iter().min(), timestamps.iter().max()) {
+				queries.extend([lo - 1, hi + 1, lo + 5]); // out-of-range low/high and an interior miss
+			}
+			queries.extend([i64::MIN, i64::MAX]);
+			for &t in &queries {
+				assert_eq!(read_paged_segment_point(&bytes, t).expect("reads"), seg.value_at(t), "paged at t={t}");
+			}
+		}
+	}
+
+	#[test]
+	fn batch_point_reads_match_the_per_instant_reads() {
+		// The batch readers must return, per instant, exactly what the single-instant readers do —
+		// including duplicate instants, misses, and out-of-range, in a scrambled order (the result
+		// is aligned to the query slice, not sorted).
+		let for_lits: Vec<String> = (0..300).map(|i| format!("10000000.{:02}", i % 97)).collect();
+		let for_vals = col(&for_lits.iter().map(String::as_str).collect::<Vec<_>>());
+		let for_ts: Vec<i64> = (0..300).map(|i| 1_000 + i64::from(i) * 10).collect();
+		let single = Segment::build_sorted(&for_ts, &for_vals, TimeUnit::Millis, &BigDecimal::from(0)).expect("builds");
+		let paged = PagedSegment::build(&for_ts, &for_vals, TimeUnit::Millis, &BigDecimal::from(0), 64).expect("builds");
+
+		// A scrambled batch: present instants, a repeat, an interior miss, and both out-of-range ends.
+		let batch: Vec<i64> = vec![2500, 1000, 3990, 2500, 2505, 0, 9_999_999, 1_500, 1_505];
+
+		let single_bytes = single.write_to();
+		let seg_batch = read_segment_points(&single_bytes, &batch).expect("reads");
+		assert_eq!(seg_batch.len(), batch.len());
+		for (k, &t) in batch.iter().enumerate() {
+			assert_eq!(seg_batch[k], read_segment_point(&single_bytes, t).expect("reads"), "single-block batch slot {k} (t={t})");
+		}
+
+		let paged_bytes = paged.write_to();
+		let paged_batch = read_paged_segment_points(&paged_bytes, &batch).expect("reads");
+		assert_eq!(paged_batch.len(), batch.len());
+		for (k, &t) in batch.iter().enumerate() {
+			assert_eq!(paged_batch[k], read_paged_segment_point(&paged_bytes, t).expect("reads"), "paged batch slot {k} (t={t})");
+		}
+		// An empty query slice is answered with an empty vector, touching nothing.
+		assert!(read_segment_points(&single_bytes, &[]).expect("reads").is_empty());
+		assert!(read_paged_segment_points(&paged_bytes, &[]).expect("reads").is_empty());
+	}
+
+	#[test]
+	fn read_segment_range_matches_the_full_decode_filter() {
+		// The windowed range read must equal `decode_nullable()` filtered to [start, end] for every
+		// window — the regular/random-access-codec segments take the closed-form fast path, the
+		// irregular / non-block-codec / out-of-order ones the full-decode fallback.
+		let scaled2 = |m: i64| -> String {
+			let (sign, a) = (if m < 0 { "-" } else { "" }, m.abs());
+			format!("{sign}{}.{:02}", a / 100, a % 100)
+		};
+		// Regular + FOR value codec (fast path).
+		let for_lits: Vec<String> = (0..300).map(|i| format!("10000000.{:02}", i % 97)).collect();
+		let for_vals = col(&for_lits.iter().map(String::as_str).collect::<Vec<_>>());
+		let regular_ts: Vec<i64> = (0..300).map(|i| 1_000 + i64::from(i) * 10).collect();
+		let regular = Segment::build_sorted(&regular_ts, &for_vals, TimeUnit::Millis, &BigDecimal::from(0)).expect("builds");
+		assert_eq!(regular.values.best_value_codec(), "scaled_for");
+		// Regular + nulls (sparse fast path exercises the dense-rank window).
+		let mut null_vals: Vec<Option<BigDecimal>> = for_vals.iter().cloned().map(Some).collect();
+		for &row in &[3_usize, 4, 128, 250] {
+			null_vals[row] = None;
+		}
+		let regular_null = Segment::build_nullable_sorted(&regular_ts, &null_vals, TimeUnit::Millis, &BigDecimal::from(0)).expect("builds");
+		// Irregular monotonic (fallback: block codec but non-constant stride).
+		let irr_lits: Vec<String> = (0..64).map(|i| scaled2((i * 37) % 81 - 40)).collect();
+		let irregular = Segment::build_sorted(&[0_i64, 5, 6, 20, 21, 40, 100, 101].iter().chain((200..256).collect::<Vec<_>>().iter()).copied().collect::<Vec<_>>(), &col(&irr_lits.iter().map(String::as_str).collect::<Vec<_>>()), TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		// F64 (non-random-access value codec → fallback), regular timestamps.
+		let f64_seg = Segment::build(&[10_i64, 20, 30, 40, 50], &col(&["0.5", "1.5", "2.5", "3.5", "4.5"]), TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		// Out-of-order (fallback).
+		let unsorted = Segment::build(&[40_i64, 10, 30, 20], &col(&["4", "1", "3", "2"]), TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+
+		for seg in [&regular, &regular_null, &irregular, &f64_seg, &unsorted] {
+			let bytes = seg.write_to();
+			let (all_ts, all_vs) = seg.decode_nullable();
+			let (lo, hi) = (all_ts.iter().min().copied().unwrap_or(0), all_ts.iter().max().copied().unwrap_or(0));
+			// Windows: full span, an interior sub-window (on- and off-grid ends), single-point,
+			// empty (gap), and fully out of range on both sides.
+			for (start, end) in [(lo, hi), (lo + 15, hi - 15), (lo - 100, lo - 1), (hi + 1, hi + 100), (lo + 105, lo + 105), (lo + 106, lo + 107)] {
+				let (rt, rv) = read_segment_range(&bytes, start, end).expect("reads");
+				let expected: (Vec<i64>, Vec<Option<BigDecimal>>) = all_ts.iter().zip(&all_vs).filter(|(t, _)| start <= **t && **t <= end).map(|(&t, v)| (t, v.clone())).unzip();
+				assert_eq!((rt, rv), expected, "codec {} window [{start},{end}]", seg.values.best_value_codec());
+			}
+		}
+
+		// Paged variant: a multi-page regular FOR frame — read_paged_segment_range must equal
+		// PagedSegment::read_time_range for every window (page skipping + per-page closed-form).
+		let paged = PagedSegment::build(&regular_ts, &for_vals, TimeUnit::Millis, &BigDecimal::from(0), 64).expect("builds");
+		let paged_bytes = paged.write_to();
+		let (lo, hi) = (regular_ts[0], regular_ts[299]);
+		for (start, end) in [(lo, hi), (lo + 615, hi - 615), (lo - 100, lo - 1), (hi + 1, hi + 100), (lo + 655, lo + 655), (lo + 656, lo + 657)] {
+			let (rt, rv) = read_paged_segment_range(&paged_bytes, start, end).expect("reads");
+			assert_eq!((rt, rv), paged.read_time_range(start, end), "paged window [{start},{end}]");
+		}
 	}
 
 	#[test]

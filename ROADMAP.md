@@ -794,6 +794,14 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 
 ## Immediate next actions
 
+- [ ] **NEXT (capstone of the 2026-07-13 read-path arc) — `dsp-bench` `point_lookup` workload:**
+  the point/range streaming read (single/paged/batch/closed-form, all benchmarked at the codec
+  layer) now needs a customer-facing harness workload. Add a parallel `run_point_lookup` runner + a
+  storage-backed adapter path (seal a `Segment` from the profile dataset, drive
+  `read_point`/`read_points`) + a `point_lookup` profile (regular + irregular datasets), measuring
+  p50/p95/p99 latency — the `run` path is deeply interpolation-shaped, so this is a parallel runner,
+  not an extension. Foundation for the cross-engine point-lookup comparison vs ClickHouse
+  ASOF/QuestDB, and the evidence for the *When DSP beats general TSDBs* point-lookup positioning.
 - [x] Create `dsp-bench` as a first-class workspace member
 - [x] Define the first benchmark profile: `interpolation-heavy-irregular`
 - [x] DSP adapter + portable baselines (linear class-C, forward-fill class-B) + accuracy scoring + shape-selectable ground truth
@@ -869,12 +877,23 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   transposed **~238 Melem/s (4.40 ms)** vs linear per-block **~41.6 Melem/s (25.2 ms)** at the same
   footprint — **~5.7× decode speedup**, bytes/point unchanged. *(src: FastLanes, VLDB'23 —
   https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf)*
-- [ ] **Next slice — realize the transposed layout on disk (Phase 6.1, decode-speed residue):**
-  the transposed decode is a proven ~5.7× win but is a prototype on no read path. Realize it as
-  the stored layout for the blocked value/timestamp codec (identical bytes on aligned tiles) behind
-  a segment-format-version bump with reader dispatch (old version → linear decode, new → transposed),
-  and benchmark the end-to-end read-decode win. Note the **decode-throughput-is-often-bandwidth-bound**
-  caveat before claiming an end-to-end win — measure, don't assume. *(src: FastLanes, VLDB'23 —
+- [x] **Transposed-layout tile-level random access (Phase 6.1, decode-speed residue — first
+  slice): shipped.** `timestamp::transpose_bitpack_decode_range(bytes, tile, count, start, len)`
+  decodes only the `len` values at `start`, skipping earlier tiles by their width headers — the
+  transposed mirror of `blocked_bitpack_decode_range`. This is the prerequisite the on-disk
+  realization needs: without it, storing the transposed layout as a value codec would regress the
+  just-shipped streaming point read (which requires a block-random-access value decode). Shared the
+  per-tile decode with the full `transpose_bitpack_decode` via a `transpose_tile_decode` helper;
+  the range decode equals the full decode sliced to `[start, start+len)` (round-trip-tested across
+  tile sizes, single-value/boundary-straddling windows, width-0 tiles, and out-of-range requests).
+- [ ] **Next slice — realize the transposed layout on disk (Phase 6.1, decode-speed residue):** the
+  tile-random-access decoder now exists, so wire the transposed layout as a realized value/timestamp
+  codec (a new `VAL_CODEC_*`/`TS_CODEC_*` tag with reader dispatch; **note the transposed footprint
+  differs from the block=64 codec — tile=1024, and a short tail costs up to `width-1` extra bytes —
+  so it needs its own size function + selector entry, it is not a drop-in re-encoding of the blocked
+  bytes**), have `read_value_at` use `transpose_bitpack_decode_range` on it, and benchmark the
+  **end-to-end** read-decode win. Note the **decode-throughput-is-often-bandwidth-bound** caveat
+  before claiming an end-to-end win — measure, don't assume. *(src: FastLanes, VLDB'23 —
   https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf · "When Is a Columnar Scan Bandwidth-Bound? A
   Decode-Throughput Law", 2026 — https://arxiv.org/pdf/2606.22423)*
 - [ ] **Next slice — evaluate Vortex as interchange + bench baseline (Phase 1/4):** Rust,
@@ -886,11 +905,37 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   just-shipped delta-cascade value codec. *(src: https://vortex.dev/ ·
   https://spice.ai/learn/vortex · cascading-with-BtrBlocks —
   https://spiraldb.com/post/cascading-compression-with-btrblocks)*
-- [ ] **Evaluate the FastLanes *File Format* (not just the layout) as a bench baseline (Phase 1):**
-  the 2025 FastLanes file-format paper extends the transposed layout to a full format; assess it
-  beside Vortex/Parquet as a `dsp-bench` external-format baseline for the storage/compressed-query
-  workloads. *(src: "The FastLanes File Format", 2025 —
-  https://www.researchgate.net/publication/395278946_The_FastLanes_File_Format)*
+- [ ] **Evaluate the FastLanes *File Format* (not just the layout) as a bench baseline + a
+  random-access reference (Phase 1/4):** the FastLanes file-format paper (VLDB'25, 18(11):4629)
+  extends the transposed layout to a full format whose headline API is **"flexible support for
+  partial decompression… fine-grained access at the level of small batches rather than rowgroups"**
+  — the closest external analog to DSP's just-shipped block-level random access + streaming point
+  read. Assess it beside Vortex/Parquet as a `dsp-bench` external-format baseline for the
+  storage/compressed-query **and point-lookup** workloads, and as the reference design for the
+  transposed-on-disk realization. *(src: "The FastLanes File Format", VLDB'25 —
+  https://www.vldb.org/pvldb/vol18/p4629-afroozeh.pdf · CWI impl — https://github.com/cwida/fastlanes)*
+- [ ] **Point-lookup positioning — DSP's block-random-access read is a genuine columnar mitigation
+  (Phase 0/1):** the 2026 competitive reviews name point lookups as *the* columnar weakness ("a
+  column store opens ~50 column files to materialise one row; a row store walks one B-tree path" →
+  "skip a columnar DB when point lookups are the main access pattern"). DSP's streaming point read
+  (never materializes the value column; `O(1)` closed-form row for a regular timestamp column)
+  mitigates exactly this — add a `dsp-bench` **point_lookup** workload and benchmark DSP's
+  `read_point`/`read_points` vs ClickHouse ASOF/point + QuestDB, then fold the result into the
+  *When DSP beats general TSDBs* honesty page. *(src:
+  https://clickhouse.com/resources/engineering/when-to-use-columnar-database ·
+  https://questdb.com/blog/clickhouse-vs-questdb-comparison/)*
+- [ ] **GPU-decode the `.dspseg` transposed layout rather than adopting a new format (Phase 5/6):**
+  a 2026 study ("Do GPUs Really Need New Tabular File Formats?", arXiv 2602.17335) finds existing
+  formats (Parquet, **FastLanes**) can be *rewritten/optimized* for competitive GPU performance
+  rather than needing purpose-built formats — evidence to GPU-decode DSP's own transposed `.dspseg`
+  layout (the `transpose_bitpack_decode_range` prototype) on-device, pairing with the GPU
+  interpolation flagship, instead of importing a new columnar format. *(src:
+  https://arxiv.org/pdf/2602.17335)*
+- [ ] **Correlation-aware column compression as a post-B-tags codec direction (Phase 6):** Corra
+  (arXiv 2403.17229) and FastLanes' multi-column compression (MCC) exploit *inter-column*
+  correlation for extra ratio — only relevant once DSP has multiple value columns / per-measurement
+  tags (B-tags), so park it behind that, but note it as the multi-column codec frontier. *(src:
+  https://arxiv.org/pdf/2403.17229)*
 - [x] **Headline bytes/point FLIPPED to the realized figure (Phase 4/6, owner sign-off,
   bench schema v10):** `Segment::value_bytes`/`total_bytes`/`bytes_per_point`,
   `Page::total_bytes`, `StorageEstimate.bytes_per_point`/`total_bytes_per_point`, and
@@ -942,14 +987,92 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 - [x] **Block-level random access (Phase 6.1): shipped.** `blocked_bitpack_decode_range` /
   `for_bitpack_decode_range` decode only the blocks overlapping a `[start, len)` window (skipping
   earlier blocks by their headers), and `dspseg::read_value_at(bytes, index)` reads one value
-  straight from a `.dspseg` value block — the per-block codecs take the block-skip fast path, the
-  rest fall back to a full decode + index. The point-lookup / late-materialization lever, matching
-  Vortex's finer-grained in-segment access. *(src:
-  https://spice.ai/learn/vortex)*
-- [ ] **Next slice — wire `read_value_at` into the segment/API point-read path (Phase 4/6):** the
-  streaming single-value read exists at the codec layer; wire it into a disk-streaming point read
-  (below `Segment` materialization) so `GET …/storage/{aspect}/at` can random-access a value without
-  decoding the whole segment, and benchmark point-lookup latency vs the full-decode path.
+  straight from a `.dspseg` value block — **all three fixed-layout `ScaledI64` value codecs take a
+  random-access fast path**: the two per-block codecs (`VAL_CODEC_BLOCKED`/`VAL_CODEC_FOR`) via the
+  block-skip range decoders, and the fixed-width `VAL_CODEC_BITPACK` via `bitpack_decode_at` (the
+  value at `index` lives at bit `index * width`, an `O(width)` read); the per-value/cascade payloads
+  fall back to a full decode + index. The streaming point read (`read_point_from_section`, single &
+  paged) skips the value block for any of the three. The point-lookup / late-materialization lever,
+  matching Vortex's finer-grained in-segment access. *(src: https://spice.ai/learn/vortex)*
+- [x] **Streaming single-value point read wired into the segment/API point-read path (Phase 4/6):
+  shipped.** `dspseg::read_segment_point(bytes, t)` reads the first present value at `t` from a
+  single-block `.dspseg` frame **without materializing the value column**: on a per-block value
+  codec (`VAL_CODEC_FOR` / `VAL_CODEC_BLOCKED`) it skips the value block by its self-describing
+  framing, decodes only the timestamp block to locate the row (binary-search sorted, linear-scan
+  out-of-order), maps the logical row to its dense present-rank, and unpacks the *one* covering
+  value block via `read_value_at`; every other codec falls back to `read_segment` + `value_at`
+  (equal for every frame). `SegmentStore::read_point` (which powers `GET …/storage/{aspect}/at`)
+  now takes this path for single-block segments. Benchmarked (`benches/pointread.rs`, criterion,
+  100k-row sorted FOR segment): **222.65 µs vs 13.196 ms full-decode — ~59× faster point lookup,
+  identical bytes on disk.**
+- [x] **Streaming point read extended to paged segments (Phase 4/6): shipped.**
+  `dspseg::read_paged_segment_point(bytes, t)` parses the per-page index (stats + block length)
+  and **prunes pages on their indexed min/max ts without decoding a column byte** (on-disk
+  intra-segment page skipping), then resolves the surviving page through the shared
+  `read_point_from_section` (the block-skip value read applies within the page too), matching
+  `PagedSegment::value_at`'s first-present-page semantics. The paged branch of
+  `SegmentStore::read_point` (which powers `GET …/storage/{aspect}/at` for paged frames) now takes
+  it. Refactored the single-block reader onto the same section helper so both share one code path.
+  Benchmarked (`benches/pointread.rs`, 100k-row FOR frame, 4096 rows/page ≈ 25 pages): **168.99 µs
+  vs 1.2471 ms full paged decode — ~7.4× faster** (a smaller multiple than the single-block ~53×
+  because `PagedSegment::value_at` already prunes pages before materializing values; the streaming
+  read additionally skips the surviving page's value-column decode). Runtime-verified against the
+  live endpoint on a 5-page FOR frame (format_version 6).
+- [x] **Batch point lookup — amortize the timestamp decode across many instants (Phase 4/6):
+  shipped.** `dspseg::read_segment_points`/`read_paged_segment_points(bytes, &[t])` and
+  `SegmentStore::read_points(aspect, &[t])` resolve many instants in one pass: the index is pruned
+  once by the batch's whole span, each surviving segment/page is opened + its timestamp column
+  decoded **once** for the whole batch (paged pages still skip when no unresolved instant falls in
+  their span), and results are returned aligned to the query slice with per-instant last-writer-wins
+  across segments. So `N` instants sharing a segment pay one file read + one timestamp decode, not
+  `N`. Equal to the per-instant `read_point` for every slot (unit-tested single-block + paged +
+  cross-segment). Refactored `read_point_from_section` into a batch `read_points_from_section` the
+  single-instant path delegates to. Benchmarked (`benches/pointread.rs`, 64 instants on a 100k-row
+  FOR frame): **520.65 µs for one batch read vs 13.902 ms for 64 single reads — ~27× faster.**
+- [x] **Batch point lookup exposed at the API (Phase 2/4): shipped.**
+  `GET /api/v1/storage/{aspect}/at-multi?t=<epoch>,<epoch>,…` resolves a comma-separated list of
+  instants through `SegmentStore::read_points`, returning `{aspect, time_unit, points:[{timestamp,
+  value, found}]}` in query order (a non-integer entry → `400`). Runtime-verified against the live
+  binary: a scrambled batch (repeat + off-grid miss + out-of-range) returns the correct per-instant
+  values in order and matches the single `/at`. Amortization benchmarked at the codec layer (~27×
+  for 64 instants, see the batch-read item above).
+- [x] **Closed-form timestamp lookup for regular (constant-stride) columns (Phase 4/6): shipped.**
+  The remaining `O(n)` cost of the streaming point read was the whole-timestamp decode + binary
+  search. For a **regular series** (the common IoT/finance case) that is now `O(1)`:
+  `DeltaOfDeltaColumn::arithmetic_stride()` detects a constant stride (first difference defined, all
+  second differences zero → `ts[i] = first + i*step`), and `read_points_from_section` resolves each
+  instant's row in closed form (`(t - first) / step`, gated on `time_sorted` so `step > 0` and no
+  wrap-around) — **no timestamp materialization at all**. An irregular or out-of-order column decodes
+  + binary/linear-searches as before. Benchmarked (`benches/pointread.rs`, 100k-row point lookup):
+  **regular closed-form 191.53 µs vs irregular decode+search 1.3353 ms — ~7× faster** (and the
+  single-block streaming point lookup dropped to 192 µs / ~62× vs the 11.9 ms full decode). Validated
+  for equality against `value_at` by the existing point-read tests (whose regular fixtures now take
+  the closed-form path, the duplicate/irregular ones the fallback) + a dedicated `arithmetic_stride`
+  test.
+- [ ] **Next slice — block-random-access timestamp search for *irregular* sorted columns (Phase 4/6):**
+  the regular case is closed-form; an irregular sorted column still decodes the *whole* delta-of-delta
+  stream to binary-search. Add per-block timestamp checkpoints (a sparse `(block → reconstructed ts,
+  running delta)` index, a format bump) so a binary search reconstructs only the blocks it probes,
+  making the irregular sorted point lookup sublinear too; benchmark vs the current whole-column decode.
+- [x] **Windowed range read — decode only the row window for a regular block-coded segment (Phase
+  4/6): shipped.** `dspseg::read_segment_range(bytes, start, end)` returns the `[start, end]` rows;
+  for a **regular (constant-stride) sorted column with a random-access value codec** it computes the
+  row window `[lo, hi]` in closed form (no timestamp materialization), generates the window
+  timestamps directly, and unpacks **only the present values inside the window** via `read_value_at`
+  (one block per present row) — so a selective range over a large regular block-coded segment decodes
+  ~`window` values, not all of them; the sparse case walks the dense-rank window. Any other shape
+  (irregular, per-value/cascade value codec, out-of-order) falls back to a full decode + filter.
+  `SegmentStore::read_time_range`'s single-block branch now takes it (paged already page-prunes).
+  Equal to `decode_nullable()` filtered to the window for every frame (unit-tested regular/sparse/
+  irregular/f64/out-of-order across full-span, interior on/off-grid, single-point, empty, and
+  out-of-range windows). Runtime-verified against the live `GET …/points?start=&end=` endpoint.
+  Benchmarked (`benches/pointread.rs`, a 100-row window over a 100k-row FOR frame): **629.40 µs
+  windowed vs 12.651 ms full decode + filter — ~20× faster.** Extended to **paged** frames too:
+  `read_paged_segment_range` skips whole pages disjoint from the window (on-disk page skipping) and
+  windows each surviving page through the shared `read_range_from_section` (single-block + paged now
+  share one range-read core, mirroring the point-read arc); wired into `SegmentStore::read_time_range`'s
+  paged branch, equal to `PagedSegment::read_time_range`, runtime-verified against the live endpoint on
+  a 5-page frame.
 - [x] Add p50/p95/p99 + confidence-interval reporting
 - [x] Add physical value types (`F64`, `ScaledI64`, `BigDecimalText` + three more)
 - [x] Prototype columnar segment reads for one aspect type (`database::SegmentStore`)
