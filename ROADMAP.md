@@ -946,10 +946,23 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   rest fall back to a full decode + index. The point-lookup / late-materialization lever, matching
   Vortex's finer-grained in-segment access. *(src:
   https://spice.ai/learn/vortex)*
-- [ ] **Next slice — wire `read_value_at` into the segment/API point-read path (Phase 4/6):** the
-  streaming single-value read exists at the codec layer; wire it into a disk-streaming point read
-  (below `Segment` materialization) so `GET …/storage/{aspect}/at` can random-access a value without
-  decoding the whole segment, and benchmark point-lookup latency vs the full-decode path.
+- [x] **Streaming single-value point read wired into the segment/API point-read path (Phase 4/6):
+  shipped.** `dspseg::read_segment_point(bytes, t)` reads the first present value at `t` from a
+  single-block `.dspseg` frame **without materializing the value column**: on a per-block value
+  codec (`VAL_CODEC_FOR` / `VAL_CODEC_BLOCKED`) it skips the value block by its self-describing
+  framing, decodes only the timestamp block to locate the row (binary-search sorted, linear-scan
+  out-of-order), maps the logical row to its dense present-rank, and unpacks the *one* covering
+  value block via `read_value_at`; every other codec falls back to `read_segment` + `value_at`
+  (equal for every frame). `SegmentStore::read_point` (which powers `GET …/storage/{aspect}/at`)
+  now takes this path for single-block segments. Benchmarked (`benches/pointread.rs`, criterion,
+  100k-row sorted FOR segment): **222.65 µs vs 13.196 ms full-decode — ~59× faster point lookup,
+  identical bytes on disk.**
+- [ ] **Next slice — extend the streaming point read to paged segments + block-random-access
+  timestamp search (Phase 4/6):** `read_segment_point` covers single-block frames only (the paged
+  branch of `read_point` still full-decodes the surviving page via `PagedSegment::value_at`); wire
+  the same block-skip value read into the paged frame (per-page value block), and — the remaining
+  `O(n)` cost — make the *timestamp* lookup block-random-access too (a binary search that decodes
+  only the delta-of-delta blocks it probes) so a sorted point lookup is fully sublinear.
 - [x] Add p50/p95/p99 + confidence-interval reporting
 - [x] Add physical value types (`F64`, `ScaledI64`, `BigDecimalText` + three more)
 - [x] Prototype columnar segment reads for one aspect type (`database::SegmentStore`)

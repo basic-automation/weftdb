@@ -878,6 +878,117 @@ pub fn read_value_at(bytes: &[u8], index: usize) -> Result<Option<PhysicalValue>
 	}
 }
 
+/// **Streaming single-value point read** from a single-block `.dspseg` frame — exactly
+/// [`Segment::value_at`]'s answer, **without materializing the value column**.
+///
+/// The first *present* value whose timestamp equals `t`, read via the per-block
+/// random-access codecs ([`VAL_CODEC_BLOCKED`] / [`VAL_CODEC_FOR`]) when the value block uses
+/// one.
+///
+/// This is the point-lookup lever the block-level random-access primitives (and
+/// [`read_value_at`]) exist for, wired one level up to the framed segment (roadmap Phase
+/// 4/6). On the fast path the value block is *skipped* by its self-describing framing (never
+/// decoded), the timestamp block + quality mask are decoded to locate the row carrying `t`,
+/// and only the single covering value block is unpacked via [`read_value_at`] — instead of
+/// decoding every value in the segment (the `O(1)` blocks the point lookup touches versus the
+/// `O(n)` full column decode). The timestamp column is still decoded whole (delta-of-delta is
+/// inherently sequential), so the win is the avoided value-column decode; a block-random-access
+/// timestamp search is a later slice.
+///
+/// When the value codec has no block-skip fast path (a per-value, fixed-width, or cascade
+/// payload — where [`read_value_at`] itself decodes the whole column, so streaming buys
+/// nothing) it defers to [`read_segment`] + [`Segment::value_at`]. Either way the result equals
+/// `read_segment(bytes)?.value_at(t)` for every single-block frame.
+///
+/// # Errors
+///
+/// Propagates the same [`DspSegError`]s as [`read_segment`] (checksum mismatch, bad magic,
+/// unsupported version — this reader is single-block-only, so a paged frame is a version
+/// error — or a malformed column/stat body).
+pub fn read_segment_point(bytes: &[u8], t: i64) -> Result<Option<BigDecimal>, DspSegError> {
+	// Verify the trailing CRC over the body before trusting any field (as read_segment does).
+	if bytes.len() < 4 {
+		return Err(DspSegError::UnexpectedEof { needed: 4, remaining: bytes.len() });
+	}
+	let (body, crc_bytes) = bytes.split_at(bytes.len() - 4);
+	let stored = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+	let computed = crc32(body);
+	if stored != computed {
+		return Err(DspSegError::ChecksumMismatch { stored, computed });
+	}
+	let mut r = ByteReader::new(body);
+	if r.take(MAGIC.len())? != MAGIC {
+		return Err(DspSegError::BadMagic);
+	}
+	let version = r.read_u16_le()?;
+	if version != SEGMENT_FORMAT_VERSION {
+		return Err(DspSegError::UnsupportedVersion { found: version });
+	}
+	let stats = read_segment_stats(&mut r)?;
+	// Coarse time bail (Segment::value_at's contains_timestamp) — a lookup outside the
+	// segment's span touches no column bytes at all.
+	match (stats.min_ts, stats.max_ts) {
+		(Some(lo), Some(hi)) if lo <= t && t <= hi => {}
+		_ => return Ok(None),
+	}
+	// The value block begins at the current offset (a prefix of `bytes`, so the position is a
+	// valid index into `bytes`); remember it so read_value_at can re-parse from here.
+	let value_block_start = r.pos;
+	// Parse the value-block framing far enough to learn its codec and advance to the timestamp
+	// block — WITHOUT decoding the values.
+	let tag = r.read_u8()?;
+	let physical_type = match tag {
+		TAG_F64 => PhysicalType::F64,
+		TAG_F32 => PhysicalType::F32,
+		TAG_SCALED_I64 => PhysicalType::ScaledI64 { scale: r.read_u8()? },
+		TAG_SCALED_I128 => PhysicalType::ScaledI128 { scale: r.read_u8()? },
+		TAG_DECIMAL128 => PhysicalType::Decimal128,
+		TAG_BIGDECIMAL_TEXT => PhysicalType::BigDecimalText,
+		other => return Err(DspSegError::InvalidTag { kind: "physical_type", value: other }),
+	};
+	let _count = r.read_uvarint()?;
+	let _lossy_count = r.read_uvarint()?;
+	let _max_abs_error = read_decimal(&mut r)?;
+	let codec = r.read_u8()?;
+	// Only the two per-block ScaledI64 codecs support a block-skip single-value read; every
+	// other payload is decoded whole by read_value_at anyway, so streaming it buys nothing —
+	// defer to the full reader, whose value_at is the reference answer.
+	if !(matches!(physical_type, PhysicalType::ScaledI64 { .. }) && (codec == VAL_CODEC_BLOCKED || codec == VAL_CODEC_FOR)) {
+		return Ok(read_segment(bytes)?.value_at(t));
+	}
+	// Skip the block payload to reach the timestamp block: a uvarint block size then the
+	// length-prefixed coded stream (as write_value_column_selected emits for scaled_blocked/for).
+	let _block = r.read_uvarint()?;
+	let _data = r.read_bytes()?;
+	// r now sits at the timestamp block — decode it (+ the quality mask that follows).
+	let ts_col = read_timestamp_column(&mut r)?;
+	let timestamps = crate::timestamp::decode_delta_of_delta(&ts_col);
+	let nulls = read_null_column(&mut r, stats.row_count, stats.null_count)?;
+	// Locate the first present row whose timestamp == t (point_lookup's semantics): a binary
+	// search over a time-sorted segment, a linear scan over an out-of-order one.
+	let row = if stats.time_sorted {
+		let mut row = timestamps.partition_point(|&x| x < t);
+		loop {
+			if row >= timestamps.len() || timestamps[row] != t {
+				return Ok(None);
+			}
+			if nulls.is_present(row) {
+				break row;
+			}
+			row += 1;
+		}
+	} else {
+		match timestamps.iter().enumerate().find(|&(i, &ts)| ts == t && nulls.is_present(i)) {
+			Some((i, _)) => i,
+			None => return Ok(None),
+		}
+	};
+	// The value column stores only present values, so map the logical row to its dense rank,
+	// then random-access that one value from its covering block.
+	let dense_index = if stats.null_count == 0 { row } else { (0..row).filter(|&i| nulls.is_present(i)).count() };
+	Ok(read_value_at(&bytes[value_block_start..], dense_index)?.map(|pv| pv.to_logical()))
+}
+
 // ---------------------------------------------------------------------------
 // Timestamp-column codec (Phase 4.3, slice 3)
 //
@@ -1779,6 +1890,78 @@ mod tests {
 			assert_eq!(read_value_at(&bytes, i).expect("reads"), full.values.get(i).cloned(), "cascade index {i}");
 		}
 		assert_eq!(read_value_at(&bytes, 256).expect("reads"), None);
+	}
+
+	#[test]
+	fn read_segment_point_matches_value_at_across_codecs() {
+		// The streaming point read must equal Segment::value_at for every single-block frame: the
+		// two per-block value codecs take the block-skip fast path, the rest fall back to the full
+		// decode. Cover present / absent-in-range / out-of-range / duplicate-run / null-row
+		// lookups, sorted and out-of-order.
+
+		// A mixed-magnitude scaled column → the blocked value codec (fast path). Reinterpreting the
+		// winning-blocked mantissas at scale 2 keeps the exact mantissa distribution (so the codec
+		// choice is unchanged) while making the values f64-inexact, so recommend_encoding rejects
+		// f64 and selects ScaledI64 (a plain-integer column would encode f64-exact and never reach
+		// the block codecs): a wide zero-straddling burst among near-zero values picks blocked.
+		let scaled2 = |m: i64| -> String {
+			let (sign, a) = (if m < 0 { "-" } else { "" }, m.abs());
+			format!("{sign}{}.{:02}", a / 100, a % 100)
+		};
+		let blocked_lits: Vec<String> = (0..192).map(|i| scaled2(if (64..128).contains(&i) { ((10_000_000 + i) * 100 + 1) * if i % 2 == 0 { 1 } else { -1 } } else { (i % 5) - 2 })).collect();
+		let blocked_vals = col(&blocked_lits.iter().map(String::as_str).collect::<Vec<_>>());
+		let blocked_ts: Vec<i64> = (0..192).map(|i| i64::from(i) * 10).collect();
+		let blocked = Segment::build_sorted(&blocked_ts, &blocked_vals, TimeUnit::Millis, &BigDecimal::from(0)).expect("builds");
+		assert_eq!(blocked.values.best_value_codec(), "scaled_blocked");
+
+		// A clustered-high-base scaled column → the FOR value codec (fast path).
+		let for_lits: Vec<String> = (0..192).map(|i| format!("10000000.0{}", i % 7)).collect();
+		let for_vals = col(&for_lits.iter().map(String::as_str).collect::<Vec<_>>());
+		let for_ts: Vec<i64> = (0..192).map(|i| 1_000 + i64::from(i) * 3).collect();
+		let for_seg = Segment::build_sorted(&for_ts, &for_vals, TimeUnit::Micros, &BigDecimal::from(0)).expect("builds");
+		assert_eq!(for_seg.values.best_value_codec(), "scaled_for");
+
+		// A wide-sparse column → varint (fallback path); and an out-of-order variant (linear scan).
+		let varint = Segment::build(&[10, 20, 30, 40], &col(&["1", "1000000000", "2", "3"]), TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		let unsorted = Segment::build(&[40, 10, 30, 20], &col(&["4", "1", "3", "2"]), TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		assert!(!unsorted.is_time_sorted());
+
+		// An F64 column → fixed-width fallback.
+		let f64_seg = Segment::build(&[5, 15, 25], &col(&["0.5", "1.5", "2.5"]), TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+
+		for seg in [&blocked, &for_seg, &varint, &unsorted, &f64_seg] {
+			let bytes = seg.write_to();
+			let (timestamps, _) = seg.decode_nullable();
+			// Query every stored timestamp plus around/outside the span — the streaming read must
+			// agree with value_at at each.
+			let mut queries: Vec<i64> = timestamps.clone();
+			if let (Some(&lo), Some(&hi)) = (timestamps.iter().min(), timestamps.iter().max()) {
+				queries.extend([lo - 1, hi + 1, lo + 1]); // out-of-range low/high and an interior miss
+			}
+			queries.extend([i64::MIN, i64::MAX]);
+			for &t in &queries {
+				assert_eq!(read_segment_point(&bytes, t).expect("reads"), seg.value_at(t), "codec {} at t={t}", seg.values.best_value_codec());
+			}
+		}
+
+		// A nullable sorted blocked segment with a duplicate timestamp whose first row is null: the
+		// dense-rank mapping (the value column stores only present values) + first-present-of-a-run
+		// must still match value_at.
+		let mut null_vals: Vec<Option<BigDecimal>> = blocked_vals.iter().cloned().map(Some).collect();
+		for &row in &[150_usize, 160, 170] {
+			null_vals[row] = None; // null only tail rows (after the burst's dense range) so its
+			                       // 64-wide block stays aligned and keeps picking a block codec
+		}
+		let mut null_ts = blocked_ts.clone();
+		null_ts[151] = null_ts[150]; // rows 150 (null) & 151 (present) now share a timestamp
+		let nullable = Segment::build_nullable_sorted(&null_ts, &null_vals, TimeUnit::Millis, &BigDecimal::from(0)).expect("builds");
+		// A block codec keeps the fast path exercised through the null/dense-rank mapping.
+		assert!(matches!(nullable.values.best_value_codec(), "scaled_blocked" | "scaled_for"), "present values still pick a per-block codec, got {}", nullable.values.best_value_codec());
+		let bytes = nullable.write_to();
+		let (timestamps, _) = nullable.decode_nullable();
+		for &t in timestamps.iter().chain(&[null_ts[0] - 5, null_ts[191] + 5]) {
+			assert_eq!(read_segment_point(&bytes, t).expect("reads"), nullable.value_at(t), "nullable blocked at t={t}");
+		}
 	}
 
 	#[test]
