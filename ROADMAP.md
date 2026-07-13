@@ -953,10 +953,13 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 - [x] **Block-level random access (Phase 6.1): shipped.** `blocked_bitpack_decode_range` /
   `for_bitpack_decode_range` decode only the blocks overlapping a `[start, len)` window (skipping
   earlier blocks by their headers), and `dspseg::read_value_at(bytes, index)` reads one value
-  straight from a `.dspseg` value block — the per-block codecs take the block-skip fast path, the
-  rest fall back to a full decode + index. The point-lookup / late-materialization lever, matching
-  Vortex's finer-grained in-segment access. *(src:
-  https://spice.ai/learn/vortex)*
+  straight from a `.dspseg` value block — **all three fixed-layout `ScaledI64` value codecs take a
+  random-access fast path**: the two per-block codecs (`VAL_CODEC_BLOCKED`/`VAL_CODEC_FOR`) via the
+  block-skip range decoders, and the fixed-width `VAL_CODEC_BITPACK` via `bitpack_decode_at` (the
+  value at `index` lives at bit `index * width`, an `O(width)` read); the per-value/cascade payloads
+  fall back to a full decode + index. The streaming point read (`read_point_from_section`, single &
+  paged) skips the value block for any of the three. The point-lookup / late-materialization lever,
+  matching Vortex's finer-grained in-segment access. *(src: https://spice.ai/learn/vortex)*
 - [x] **Streaming single-value point read wired into the segment/API point-read path (Phase 4/6):
   shipped.** `dspseg::read_segment_point(bytes, t)` reads the first present value at `t` from a
   single-block `.dspseg` frame **without materializing the value column**: on a per-block value

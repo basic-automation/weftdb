@@ -872,18 +872,29 @@ pub fn read_value_at(bytes: &[u8], index: usize) -> Result<Option<PhysicalValue>
 			let data = r.read_bytes()?;
 			Ok(crate::timestamp::for_bitpack_decode_range(data, block, count, index, 1).first().map(|&mantissa| PhysicalValue::ScaledI64 { mantissa, scale }))
 		}
-		// Fixed-width / per-value / cascade payloads: a full decode then index (correct
-		// everywhere; the per-block skip only helps the two block codecs above).
+		VAL_CODEC_BITPACK => {
+			let PhysicalType::ScaledI64 { scale } = physical_type else {
+				return Err(DspSegError::InvalidTag { kind: "value_codec_bitpack_type", value: tag });
+			};
+			// Fixed global width → the value at `index` lives at bit `index * width`, an O(width)
+			// read of the raw `count * width`-bit stream (no length prefix, as scaled_bitpack emits).
+			let width = u32::from(r.read_u8()?);
+			let data_len = (count * width as usize).div_ceil(8);
+			let data = r.take(data_len)?;
+			Ok(Some(PhysicalValue::ScaledI64 { mantissa: crate::timestamp::bitpack_decode_at(width, data, index), scale }))
+		}
+		// Per-value / cascade payloads: a full decode then index (correct everywhere; the
+		// random-access skip only helps the three fixed-layout codecs above).
 		_ => Ok(read_value_column(&mut ByteReader::new(bytes))?.values.get(index).cloned()),
 	}
 }
 
-/// Whether a value block (a `section` positioned at its physical-type tag) uses one of the two
-/// per-block `ScaledI64` codecs ([`VAL_CODEC_BLOCKED`] / [`VAL_CODEC_FOR`]) that support a
-/// block-skip single-value read. Peeks the header + codec byte on a throwaway reader without
-/// consuming the caller's cursor. `false` (including on a short/malformed header) routes the
-/// caller to the always-correct full-decode fallback.
-fn value_block_has_block_codec(section: &[u8]) -> bool {
+/// Whether a value block (a `section` positioned at its physical-type tag) uses one of the three
+/// fixed-layout `ScaledI64` codecs ([`VAL_CODEC_BLOCKED`] / [`VAL_CODEC_FOR`] /
+/// [`VAL_CODEC_BITPACK`]) that [`read_value_at`] can random-access. Peeks the header + codec byte
+/// on a throwaway reader without consuming the caller's cursor. `false` (including on a
+/// short/malformed header) routes the caller to the always-correct full-decode fallback.
+fn value_block_has_random_access_codec(section: &[u8]) -> bool {
 	let mut r = ByteReader::new(section);
 	let Ok(tag) = r.read_u8() else { return false };
 	// Skip the optional scale byte the two scaled types carry.
@@ -894,26 +905,32 @@ fn value_block_has_block_codec(section: &[u8]) -> bool {
 	if r.read_uvarint().is_err() || r.read_uvarint().is_err() || read_decimal(&mut r).is_err() {
 		return false;
 	}
-	// A block codec is only defined over ScaledI64; the FOR/blocked read paths assert it too.
-	matches!((tag, r.read_u8()), (TAG_SCALED_I64, Ok(VAL_CODEC_BLOCKED | VAL_CODEC_FOR)))
+	// These codecs are only defined over ScaledI64; the read paths assert it too.
+	matches!((tag, r.read_u8()), (TAG_SCALED_I64, Ok(VAL_CODEC_BLOCKED | VAL_CODEC_FOR | VAL_CODEC_BITPACK)))
 }
 
-/// Advance `r` past a value block known to use a per-block codec ([`VAL_CODEC_BLOCKED`] /
-/// [`VAL_CODEC_FOR`]) — the header, the codec byte, the block-size uvarint, and the
-/// length-prefixed coded stream — leaving `r` at the following (timestamp) block. Only called
-/// after [`value_block_has_block_codec`] confirmed the fast path, so the framing is exactly
-/// what [`write_value_column_selected`] emits for `scaled_blocked`/`scaled_for`.
-fn skip_block_value_column(r: &mut ByteReader) -> Result<(), DspSegError> {
+/// Advance `r` past a value block known to use a random-access codec ([`VAL_CODEC_BLOCKED`] /
+/// [`VAL_CODEC_FOR`] / [`VAL_CODEC_BITPACK`]) — the header, the codec byte, and the coded stream —
+/// leaving `r` at the following (timestamp) block. Only called after
+/// [`value_block_has_random_access_codec`] confirmed the fast path, so the framing is exactly what
+/// [`write_value_column_selected`] emits for `scaled_blocked`/`scaled_for`/`scaled_bitpack`.
+fn skip_random_access_value_column(r: &mut ByteReader) -> Result<(), DspSegError> {
 	let tag = r.read_u8()?;
 	if matches!(tag, TAG_SCALED_I64 | TAG_SCALED_I128) {
 		r.read_u8()?; // scale
 	}
-	r.read_uvarint()?; // count
+	let count = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
 	r.read_uvarint()?; // lossy_count
 	read_decimal(r)?; // max_abs_error
-	r.read_u8()?; // codec byte
-	r.read_uvarint()?; // block size
-	r.read_bytes()?; // length-prefixed coded stream
+	if r.read_u8()? == VAL_CODEC_BITPACK {
+		// The fixed-width codec writes a width byte then a raw (unprefixed) count*width-bit stream.
+		let width = usize::from(r.read_u8()?);
+		r.take((count * width).div_ceil(8))?;
+	} else {
+		// The two per-block codecs write a block-size uvarint then a length-prefixed stream.
+		r.read_uvarint()?; // block size
+		r.read_bytes()?; // length-prefixed coded stream
+	}
 	Ok(())
 }
 
@@ -960,12 +977,12 @@ fn read_point_from_section(section: &[u8], stats: &SegmentStats, t: i64) -> Resu
 		(Some(lo), Some(hi)) if lo <= t && t <= hi => {}
 		_ => return Ok(None),
 	}
-	let fast = value_block_has_block_codec(section);
+	let fast = value_block_has_random_access_codec(section);
 	let mut r = ByteReader::new(section);
 	// Advance past the value block to the timestamp block: skip it on the fast path (keeping the
 	// values on disk), fully decode it on the fallback (keeping the present values in hand).
 	let present_values = if fast {
-		skip_block_value_column(&mut r)?;
+		skip_random_access_value_column(&mut r)?;
 		None
 	} else {
 		Some(read_value_column(&mut r)?.values)
@@ -2021,6 +2038,16 @@ mod tests {
 		let for_seg = Segment::build_sorted(&for_ts, &for_vals, TimeUnit::Micros, &BigDecimal::from(0)).expect("builds");
 		assert_eq!(for_seg.values.best_value_codec(), "scaled_for");
 
+		// A small-magnitude scaled column that cycles the *full* range within every block →
+		// fixed-width bit-pack (fast path): a global width already fits every mantissa and no block
+		// has a tighter range, so per-block/FOR headers only cost more. (37 is coprime with 81, so
+		// each 64-wide block spans the whole ±40 spread; scale 2 so build selects ScaledI64.)
+		let bitpack_lits: Vec<String> = (0..192).map(|i| scaled2((i * 37) % 81 - 40)).collect();
+		let bitpack_vals = col(&bitpack_lits.iter().map(String::as_str).collect::<Vec<_>>());
+		let bitpack_ts: Vec<i64> = (0..192).map(|i| 5_000 + i64::from(i) * 2).collect();
+		let bitpack = Segment::build_sorted(&bitpack_ts, &bitpack_vals, TimeUnit::Millis, &BigDecimal::from(0)).expect("builds");
+		assert_eq!(bitpack.values.best_value_codec(), "scaled_bitpack");
+
 		// A wide-sparse column → varint (fallback path); and an out-of-order variant (linear scan).
 		let varint = Segment::build(&[10, 20, 30, 40], &col(&["1", "1000000000", "2", "3"]), TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
 		let unsorted = Segment::build(&[40, 10, 30, 20], &col(&["4", "1", "3", "2"]), TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
@@ -2029,7 +2056,7 @@ mod tests {
 		// An F64 column → fixed-width fallback.
 		let f64_seg = Segment::build(&[5, 15, 25], &col(&["0.5", "1.5", "2.5"]), TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
 
-		for seg in [&blocked, &for_seg, &varint, &unsorted, &f64_seg] {
+		for seg in [&blocked, &for_seg, &bitpack, &varint, &unsorted, &f64_seg] {
 			let bytes = seg.write_to();
 			let (timestamps, _) = seg.decode_nullable();
 			// Query every stored timestamp plus around/outside the span — the streaming read must
