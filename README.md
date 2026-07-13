@@ -351,6 +351,19 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   `StorageEstimate.realized_value_bytes` / `value_codec`. The timestamp column keeps an
   *advisory* FOR estimate (`for_estimated_bytes`) — second differences are near-zero, so
   FOR rarely wins there.
+- **Two-level delta cascade (opt-in)** — a **trending** `ScaledI64` column (a counter or
+  monotone sensor whose magnitude every single-level codec pays for) is additionally
+  compressible by a *cascade*: delta-transform the mantissas, then pack the differences with
+  the smallest inner packer (varint / bit-pack / blocked / FOR / RLE). It is realized on disk
+  as the `VAL_CODEC_DELTA_CASCADE` codec-chain descriptor (`write_value_column_cascading`,
+  read back by the ordinary reader) and surfaced advisory-first in the bench
+  (`StorageEstimate.advisory_delta_cascade_value_bytes`, schema v15). It is **opt-in** — the
+  cascade beats even FOR broadly, so folding it into the default selector is a headline change
+  held for owner sign-off; the default codec choice is unchanged.
+- **Block-level random access** — the per-block value codecs support decoding a single value
+  (or a sub-range) without materializing the whole column: `dspseg::read_value_at(bytes, i)`
+  reads only the block covering row `i` (skipping earlier blocks by their headers) for the
+  blocked/FOR codecs, the point-lookup / late-materialization lever.
 - **Realized headline bytes/point** — every headline bytes/point figure
   (`Segment::bytes_per_point`, `StorageEstimate.bytes_per_point` /
   `total_bytes_per_point`, the bench HTML `val B/pt`) reports the codec **actually
