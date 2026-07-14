@@ -75,6 +75,27 @@ impl Aggregation {
 		}
 	}
 
+	/// Parse a reduction from its wire token (case-insensitive), the inverse of
+	/// [`as_str`](Self::as_str). Accepts `median` as an alias for `p50`. Returns `None`
+	/// for an unknown token. Shared so every surface (HTTP query params, the bench CLI)
+	/// parses the same set the reduction supports.
+	#[must_use]
+	pub fn from_token(token: &str) -> Option<Self> {
+		match token.trim().to_ascii_lowercase().as_str() {
+			"min" => Some(Self::Min),
+			"max" => Some(Self::Max),
+			"avg" => Some(Self::Avg),
+			"sum" => Some(Self::Sum),
+			"first" => Some(Self::First),
+			"last" => Some(Self::Last),
+			"p50" | "median" => Some(Self::P50),
+			"p90" => Some(Self::P90),
+			"p95" => Some(Self::P95),
+			"p99" => Some(Self::P99),
+			_ => None,
+		}
+	}
+
 	/// The percentile rank in `1..=100` this reduction selects, or `None` for the
 	/// non-percentile reductions.
 	#[must_use]
@@ -381,6 +402,16 @@ mod tests {
 		let buckets = reduce(&points, Resolution::Minutes, None, None, &[Aggregation::P50]).expect("reduces");
 		use std::str::FromStr;
 		assert_eq!(buckets[0].values.get("p50").unwrap(), &BigDecimal::from_str("2.2").unwrap(), "p50 of 1.1/2.2/3.3 is exactly 2.2");
+	}
+
+	#[test]
+	fn from_token_round_trips_as_str_and_rejects_unknown() {
+		for agg in [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::P50, Aggregation::P90, Aggregation::P95, Aggregation::P99] {
+			assert_eq!(Aggregation::from_token(agg.as_str()), Some(agg), "{} must round-trip", agg.as_str());
+		}
+		assert_eq!(Aggregation::from_token("MEDIAN"), Some(Aggregation::P50), "median is a case-insensitive p50 alias");
+		assert_eq!(Aggregation::from_token(" avg "), Some(Aggregation::Avg), "surrounding whitespace is trimmed");
+		assert_eq!(Aggregation::from_token("bogus"), None, "an unknown token is rejected");
 	}
 
 	#[test]
