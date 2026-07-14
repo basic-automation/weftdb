@@ -232,7 +232,7 @@ pub fn default_html_filename(profile: &str, adapter: &str) -> String {
 const HTML_STYLE: &str = "body{font-family:system-ui,sans-serif;margin:2rem;color:#1a1a1a}h1{font-size:1.4rem}.meta{color:#555;font-size:.9rem}table{border-collapse:collapse;margin-top:1rem;font-size:.9rem}th,td{border:1px solid #ccc;padding:.3rem .6rem;text-align:right}th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}thead{background:#f0f0f0}tr.best{background:#e7f7e7;font-weight:600}";
 
 /// Table header cells for [`BenchReport::to_html`], matching [`result_row_html`].
-const HTML_HEAD_CELLS: &str = "<th>adapter</th><th>shape</th><th>in</th><th>out</th><th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>mean ms</th><th>pts/s</th><th>correct</th><th>rmse</th><th>mae</th><th>max</th><th>bias</th><th>enc</th><th>val B/pt</th><th>tot B/pt</th>";
+const HTML_HEAD_CELLS: &str = "<th>adapter</th><th>workload</th><th>shape</th><th>in</th><th>out</th><th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>mean ms</th><th>pts/s</th><th>correct</th><th>rmse</th><th>mae</th><th>max</th><th>bias</th><th>enc</th><th>val B/pt</th><th>tot B/pt</th>";
 
 /// Nanoseconds rendered as fractional milliseconds for display.
 #[allow(clippy::cast_precision_loss)]
@@ -270,6 +270,7 @@ fn hardware_meta_html(m: &RunMetadata) -> String {
 fn result_row_html(r: &BenchResult, is_best: bool) -> String {
 	let l = &r.latency;
 	let adapter = escape_html(&r.adapter);
+	let workload = escape_html(&r.workload);
 	let shape = r.dataset.signal_shape.map_or_else(|| "&mdash;".to_string(), |s| format!("{s:?}"));
 	let correctness = if r.correctness.passed() { "PASS" } else { "FAIL" };
 	// Accuracy is present only for a synthetic profile; otherwise the four cells
@@ -280,7 +281,7 @@ fn result_row_html(r: &BenchResult, is_best: bool) -> String {
 	// encoding name carries a lossy marker (`*`) so a non-exact pick is visible.
 	let storage = r.storage.as_ref().map_or_else(|| "<td>&mdash;</td><td>&mdash;</td><td>&mdash;</td>".to_string(), |s| format!("<td>{}{}</td><td>{:.2}</td><td>{:.2}</td>", escape_html(&s.physical_type), if s.is_exact { "" } else { "*" }, s.bytes_per_point, s.total_bytes_per_point));
 	let cls = if is_best { " class=\"best\"" } else { "" };
-	format!("<tr{cls}><td>{adapter}</td><td>{shape}</td><td>{in_pts}</td><td>{out_pts}</td><td>{p50:.3}</td><td>{p95:.3}</td><td>{p99:.3}</td><td>{mean:.3}</td><td>{tput:.0}</td><td>{correctness}</td>{accuracy}{storage}</tr>\n", in_pts = r.dataset.input_points, out_pts = r.dataset.output_points, p50 = ms(l.p50_ns), p95 = ms(l.p95_ns), p99 = ms(l.p99_ns), mean = ms(l.mean_ns), tput = r.throughput_points_per_sec)
+	format!("<tr{cls}><td>{adapter}</td><td>{workload}</td><td>{shape}</td><td>{in_pts}</td><td>{out_pts}</td><td>{p50:.3}</td><td>{p95:.3}</td><td>{p99:.3}</td><td>{mean:.3}</td><td>{tput:.0}</td><td>{correctness}</td>{accuracy}{storage}</tr>\n", in_pts = r.dataset.input_points, out_pts = r.dataset.output_points, p50 = ms(l.p50_ns), p95 = ms(l.p95_ns), p99 = ms(l.p99_ns), mean = ms(l.mean_ns), tput = r.throughput_points_per_sec)
 }
 
 /// Escape the five HTML-significant characters so caller-supplied strings (adapter
@@ -500,6 +501,20 @@ mod tests {
 		assert!(html.contains("<td>scaled_i64</td><td>2.10</td><td>3.14</td>"), "storage cells must render: {html}");
 		// The storage-less row keeps the columns aligned with em-dashes.
 		assert!(html.contains("<td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>"), "absent storage must render dashes: {html}");
+	}
+
+	#[test]
+	fn to_html_renders_the_workload_column_per_row() {
+		// With three workload types now sharing the report schema, the HTML table must
+		// name each result's workload so a point-lookup report is distinguishable from
+		// an interpolate one at a glance. The header carries the column and each row
+		// renders its own workload.
+		let mut point_lookup = sample_result("dsp", true);
+		point_lookup.workload = "point_lookup".to_string();
+		let report = BenchReport::with_results(metadata(), vec![point_lookup]);
+		let html = report.to_html();
+		assert!(html.contains("<th>adapter</th><th>workload</th>"), "header must carry the workload column: {html}");
+		assert!(html.contains("<td>dsp</td><td>point_lookup</td>"), "row must render its workload: {html}");
 	}
 
 	#[test]
