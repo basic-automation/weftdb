@@ -231,6 +231,14 @@ fn print_summary(report: &BenchReport, out_path: &std::path::Path) {
 		if let Some(a) = &r.accuracy {
 			println!("    accuracy     : rmse={:.4} mae={:.4} max={:.4} bias={:+.4}", a.rmse, a.mae, a.max_abs_error, a.bias);
 		}
+		// Storage is the north-star cost term (and the compression workload's headline):
+		// the realized value codec, the value-column compression ratio (realized /
+		// naive fixed-width), and total bytes/point. Present once the run estimates it.
+		if let Some(s) = &r.storage {
+			#[allow(clippy::cast_precision_loss)]
+			let ratio = if s.estimated_value_bytes > 0 { s.realized_value_bytes as f64 / s.estimated_value_bytes as f64 } else { 1.0 };
+			println!("    storage      : codec={}{} ratio={ratio:.3} val={:.2} total={:.2} B/pt", s.value_codec, if s.is_exact { "" } else { "*" }, s.bytes_per_point, s.total_bytes_per_point);
+		}
 	}
 	// When the run carries accuracy (synthetic mode), name the quality winner so a
 	// comparison report answers "which method recovered the signal best?" at a glance.
