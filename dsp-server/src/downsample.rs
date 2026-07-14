@@ -477,7 +477,8 @@ fn parse_aggregation_token(token: &str) -> Result<Aggregation, ApiError> {
 		"p90" => Ok(Aggregation::P90),
 		"p95" => Ok(Aggregation::P95),
 		"p99" => Ok(Aggregation::P99),
-		other => Err(ApiError::BadRequest(format!("unknown aggregation `{other}` (use min/max/avg/sum/first/last/p50/p90/p95/p99)"))),
+		"twa" => Ok(Aggregation::Twa),
+		other => Err(ApiError::BadRequest(format!("unknown aggregation `{other}` (use min/max/avg/sum/first/last/p50/p90/p95/p99/twa)"))),
 	}
 }
 
