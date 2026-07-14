@@ -473,7 +473,11 @@ fn parse_aggregation_token(token: &str) -> Result<Aggregation, ApiError> {
 		"sum" => Ok(Aggregation::Sum),
 		"first" => Ok(Aggregation::First),
 		"last" => Ok(Aggregation::Last),
-		other => Err(ApiError::BadRequest(format!("unknown aggregation `{other}` (use min/max/avg/sum/first/last)"))),
+		"p50" | "median" => Ok(Aggregation::P50),
+		"p90" => Ok(Aggregation::P90),
+		"p95" => Ok(Aggregation::P95),
+		"p99" => Ok(Aggregation::P99),
+		other => Err(ApiError::BadRequest(format!("unknown aggregation `{other}` (use min/max/avg/sum/first/last/p50/p90/p95/p99)"))),
 	}
 }
 
@@ -664,7 +668,7 @@ mod tests {
 	#[tokio::test]
 	async fn ilp_endpoint_rejects_unknown_aggregation() {
 		let payload = "cpu load=1 1\ncpu load=2 2\n";
-		let (status, body) = post_text("/api/v1/downsample/ilp?field=load&agg=median", payload).await;
+		let (status, body) = post_text("/api/v1/downsample/ilp?field=load&agg=bogus", payload).await;
 		assert_eq!(status, StatusCode::BAD_REQUEST);
 		assert!(body["error"].as_str().unwrap().contains("unknown aggregation"));
 	}

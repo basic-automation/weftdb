@@ -47,6 +47,14 @@ pub enum Aggregation {
 	First,
 	/// Last value in the bucket by ascending timestamp.
 	Last,
+	/// 50th percentile (median) of the bucket, by the nearest-rank method.
+	P50,
+	/// 90th percentile of the bucket, by the nearest-rank method.
+	P90,
+	/// 95th percentile of the bucket, by the nearest-rank method.
+	P95,
+	/// 99th percentile of the bucket, by the nearest-rank method.
+	P99,
 }
 
 impl Aggregation {
@@ -60,10 +68,29 @@ impl Aggregation {
 			Self::Sum => "sum",
 			Self::First => "first",
 			Self::Last => "last",
+			Self::P50 => "p50",
+			Self::P90 => "p90",
+			Self::P95 => "p95",
+			Self::P99 => "p99",
 		}
 	}
 
-	/// Every reduction, in a stable order — the natural set for a full downsample.
+	/// The percentile rank in `1..=100` this reduction selects, or `None` for the
+	/// non-percentile reductions.
+	#[must_use]
+	pub const fn percentile_rank(self) -> Option<u8> {
+		match self {
+			Self::P50 => Some(50),
+			Self::P90 => Some(90),
+			Self::P95 => Some(95),
+			Self::P99 => Some(99),
+			_ => None,
+		}
+	}
+
+	/// Every reduction, in a stable order — the natural set for a full downsample. Kept
+	/// to the six *streaming* reductions (percentiles need the full bucket materialized,
+	/// so they are opt-in rather than part of the default full set).
 	pub const ALL: [Self; 6] = [Self::Min, Self::Max, Self::Avg, Self::Sum, Self::First, Self::Last];
 
 	/// The default reduction set (`min`/`max`/`avg`) applied when a caller requests
@@ -103,8 +130,10 @@ pub enum ReduceError {
 /// Running aggregate state for one bucket, accumulated in [`BigDecimal`] so sums and
 /// averages carry no float drift. `first`/`last` track their value **with** the
 /// timestamp, so the reduction is correct regardless of input order (no pre-sort
-/// required).
-#[derive(Debug, Default)]
+/// required). The full bucket is materialized in `samples` only when a percentile
+/// reduction is requested (they need the sorted set); otherwise it stays empty so the
+/// streaming reductions pay no collection cost.
+#[derive(Debug)]
 struct BucketAcc {
 	count: usize,
 	sum: BigDecimal,
@@ -112,9 +141,17 @@ struct BucketAcc {
 	max: Option<BigDecimal>,
 	first: Option<(DateTime<Utc>, BigDecimal)>,
 	last: Option<(DateTime<Utc>, BigDecimal)>,
+	/// Populated only when `collect` is set (a percentile is requested).
+	samples: Vec<BigDecimal>,
+	collect: bool,
 }
 
 impl BucketAcc {
+	/// A fresh accumulator; `collect` materializes the full bucket for percentiles.
+	fn new(collect: bool) -> Self {
+		Self { count: 0, sum: BigDecimal::from(0), min: None, max: None, first: None, last: None, samples: Vec::new(), collect }
+	}
+
 	/// Fold one `(timestamp, value)` into the bucket.
 	fn push(&mut self, timestamp: DateTime<Utc>, value: BigDecimal) {
 		self.count += 1;
@@ -128,24 +165,36 @@ impl BucketAcc {
 		if self.first.as_ref().is_none_or(|(t, _)| timestamp < *t) {
 			self.first = Some((timestamp, value.clone()));
 		}
+		if self.collect {
+			self.samples.push(value.clone());
+		}
 		if self.last.as_ref().is_none_or(|(t, _)| timestamp >= *t) {
 			self.last = Some((timestamp, value));
 		}
 	}
 
 	/// Materialize the requested reductions and the grid-aligned bucket start.
-	fn finish(self, resolution: Resolution, base: i64, aggregations: &[Aggregation]) -> Result<Bucket, ReduceError> {
+	fn finish(mut self, resolution: Resolution, base: i64, aggregations: &[Aggregation]) -> Result<Bucket, ReduceError> {
 		let timestamp = bucket_start(resolution, base).ok_or(ReduceError::BucketStartOverflow)?;
 		let count = BigDecimal::from(self.count as u64);
+		// Percentiles read from the sorted samples; sort once, lazily, if any is asked.
+		if self.collect {
+			self.samples.sort();
+		}
 		let mut values: BTreeMap<String, BigDecimal> = BTreeMap::new();
 		for &agg in aggregations {
-			let value = match agg {
-				Aggregation::Min => self.min.clone(),
-				Aggregation::Max => self.max.clone(),
-				Aggregation::Sum => Some(self.sum.clone()),
-				Aggregation::Avg => (self.count > 0).then(|| &self.sum / &count),
-				Aggregation::First => self.first.as_ref().map(|(_, v)| v.clone()),
-				Aggregation::Last => self.last.as_ref().map(|(_, v)| v.clone()),
+			let value = if let Some(rank) = agg.percentile_rank() {
+				percentile(&self.samples, rank)
+			} else {
+				match agg {
+					Aggregation::Min => self.min.clone(),
+					Aggregation::Max => self.max.clone(),
+					Aggregation::Sum => Some(self.sum.clone()),
+					Aggregation::Avg => (self.count > 0).then(|| &self.sum / &count),
+					Aggregation::First => self.first.as_ref().map(|(_, v)| v.clone()),
+					Aggregation::Last => self.last.as_ref().map(|(_, v)| v.clone()),
+					Aggregation::P50 | Aggregation::P90 | Aggregation::P95 | Aggregation::P99 => unreachable!("handled by percentile_rank above"),
+				}
 			};
 			if let Some(value) = value {
 				values.insert(agg.as_str().to_string(), value);
@@ -153,6 +202,22 @@ impl BucketAcc {
 		}
 		Ok(Bucket { timestamp, count: self.count, values })
 	}
+}
+
+/// The nearest-rank percentile of a **sorted** `samples` slice: the value at rank
+/// `ceil(rank/100 * n)` (1-based, clamped into range). `None` for an empty slice.
+/// Nearest-rank returns an actual observed value (no interpolation), which keeps the
+/// result exact in [`BigDecimal`].
+fn percentile(samples: &[BigDecimal], rank: u8) -> Option<BigDecimal> {
+	if samples.is_empty() {
+		return None;
+	}
+	// idx = ceil(rank/100 * n) - 1, clamped to [0, n-1]. Integer arithmetic:
+	// ceil(rank * n / 100) = (rank * n + 99) / 100.
+	let n = samples.len();
+	let ordinal = (usize::from(rank) * n).div_ceil(100); // 1-based, >= 1 for rank >= 1
+	let idx = ordinal.saturating_sub(1).min(n - 1);
+	Some(samples[idx].clone())
 }
 
 /// Reduce `points` into grid-aligned buckets at `resolution`.
@@ -170,6 +235,9 @@ impl BucketAcc {
 /// scales past the representable time range.
 pub fn reduce(points: &[Point], resolution: Resolution, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, aggregations: &[Aggregation]) -> Result<Vec<Bucket>, ReduceError> {
 	let aggregations = if aggregations.is_empty() { &Aggregation::DEFAULT[..] } else { aggregations };
+	// Percentiles require the full bucket to be materialized and sorted; the streaming
+	// reductions do not, so only collect when a percentile is actually requested.
+	let collect = aggregations.iter().any(|a| a.percentile_rank().is_some());
 
 	// A BTreeMap keyed by the bucket index yields buckets in ascending index order,
 	// which is ascending time order for a fixed resolution.
@@ -179,7 +247,7 @@ pub fn reduce(points: &[Point], resolution: Resolution, start: Option<DateTime<U
 			continue;
 		}
 		let base = resolution.to_base(&p.timestamp).map_err(|_| ReduceError::TimestampRange)?;
-		buckets.entry(base).or_default().push(p.timestamp, p.value.clone());
+		buckets.entry(base).or_insert_with(|| BucketAcc::new(collect)).push(p.timestamp, p.value.clone());
 	}
 
 	buckets.into_iter().map(|(base, acc)| acc.finish(resolution, base, aggregations)).collect()
@@ -290,6 +358,29 @@ mod tests {
 		assert_eq!(buckets.len(), 1);
 		let keys: Vec<&str> = buckets[0].values.keys().map(String::as_str).collect();
 		assert_eq!(keys, vec!["avg", "max", "min"], "default is min/max/avg (BTreeMap orders the keys)");
+	}
+
+	#[test]
+	fn nearest_rank_percentiles_select_observed_values() {
+		// A single minute-bucket of 1..=10. Nearest-rank: p50 -> idx ceil(.5*10)-1 = 4 -> 5,
+		// p90 -> ceil(.9*10)-1 = 8 -> 9, p95 -> ceil(.95*10)-1 = 9 -> 10, p99 -> 10.
+		let points: Vec<Point> = (1..=10).map(|v| pt(i64::from(v - 1), &v.to_string())).collect();
+		let buckets = reduce(&points, Resolution::Minutes, None, None, &[Aggregation::P50, Aggregation::P90, Aggregation::P95, Aggregation::P99]).expect("reduces");
+		assert_eq!(buckets.len(), 1);
+		let b = &buckets[0];
+		assert!((get(b, Aggregation::P50) - 5.0).abs() < 1e-9, "p50 nearest-rank of 1..10 is 5");
+		assert!((get(b, Aggregation::P90) - 9.0).abs() < 1e-9, "p90 is 9");
+		assert!((get(b, Aggregation::P95) - 10.0).abs() < 1e-9, "p95 is 10");
+		assert!((get(b, Aggregation::P99) - 10.0).abs() < 1e-9, "p99 is 10");
+	}
+
+	#[test]
+	fn percentiles_are_order_independent_and_exact() {
+		// Scrambled input, and a percentile must return an exact observed BigDecimal.
+		let points = vec![pt(2, "3.3"), pt(0, "1.1"), pt(1, "2.2")];
+		let buckets = reduce(&points, Resolution::Minutes, None, None, &[Aggregation::P50]).expect("reduces");
+		use std::str::FromStr;
+		assert_eq!(buckets[0].values.get("p50").unwrap(), &BigDecimal::from_str("2.2").unwrap(), "p50 of 1.1/2.2/3.3 is exactly 2.2");
 	}
 
 	#[test]
