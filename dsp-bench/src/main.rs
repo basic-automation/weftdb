@@ -24,7 +24,7 @@ use std::{path::PathBuf, process::ExitCode};
 
 use chrono::Utc;
 use dsp_bench::{
-	report::{default_filename, default_html_filename}, run_point_lookup, run_profile, BaselineLinearAdapter, BenchReport, BenchResult, DspAdapter, ForwardFillAdapter, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision
+	report::{default_filename, default_html_filename}, run_point_lookup, run_profile, run_range_fetch, BaselineLinearAdapter, BenchReport, BenchResult, DspAdapter, ForwardFillAdapter, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision
 };
 use splimes::{Resolution, Spline};
 
@@ -77,6 +77,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 	if cli.mode == InputMode::PointLookup {
 		return run_point_lookup_workload(&cli);
 	}
+	if cli.mode == InputMode::RangeFetch {
+		return run_range_fetch_workload(&cli);
+	}
 
 	// Build the profile from whichever input mode was selected. Synthetic mode
 	// carries a known analytic ground truth, so its report will also include
@@ -121,10 +124,27 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 /// analytic ground truth (a lookup returns the stored value), so the report carries
 /// no accuracy, only latency, throughput, and the north-star storage estimate.
 fn run_point_lookup_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
-	let profile_name = cli.name.clone().unwrap_or_else(|| if cli.pl_irregular { "point-lookup-irregular".to_string() } else { "point-lookup-regular".to_string() });
-	let params = PointLookupParams { seed: cli.seed, point_count: cli.pl_rows, query_count: cli.pl_queries, regular: !cli.pl_irregular, absent_fraction: cli.pl_absent, mode: cli.pl_mode };
+	let profile_name = cli.name.clone().unwrap_or_else(|| if cli.irregular { "point-lookup-irregular".to_string() } else { "point-lookup-regular".to_string() });
+	let params = PointLookupParams { seed: cli.seed, point_count: cli.pl_rows, query_count: cli.pl_queries, regular: !cli.irregular, absent_fraction: cli.pl_absent, mode: cli.pl_mode };
 	let profile = PointLookupProfile::new(profile_name, params);
 	let result = run_point_lookup(&profile, cli.reps).map_err(|e| anyhow::anyhow!("point-lookup benchmark run failed: {e}"))?;
+	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
+	let report = BenchReport::with_results(metadata, vec![result]);
+	finish(cli, &report)
+}
+
+/// Run the range-fetch workload: build a seeded [`RangeFetchProfile`] from the
+/// range-fetch CLI knobs, seal a columnar segment, time DSP's windowed range read
+/// (`read_segment_range`), and persist the report.
+///
+/// Like the point-lookup workload it is storage-backed with no analytic ground
+/// truth (a range read materializes stored rows), so the report carries latency,
+/// throughput, and the storage estimate but no accuracy.
+fn run_range_fetch_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
+	let profile_name = cli.name.clone().unwrap_or_else(|| if cli.irregular { "range-fetch-irregular".to_string() } else { "range-fetch-regular".to_string() });
+	let params = RangeFetchParams { seed: cli.seed, point_count: cli.rf_rows, window_rows: cli.rf_window, window_count: cli.rf_windows, regular: !cli.irregular };
+	let profile = RangeFetchProfile::new(profile_name, params);
+	let result = run_range_fetch(&profile, cli.reps).map_err(|e| anyhow::anyhow!("range-fetch benchmark run failed: {e}"))?;
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
 	let report = BenchReport::with_results(metadata, vec![result]);
 	finish(cli, &report)
@@ -232,16 +252,23 @@ struct Cli {
 	field: Option<String>,
 	/// Which input mode / workload was selected.
 	mode: InputMode,
+	/// Storage-workload knob (point-lookup / range-fetch): jittered (irregular)
+	/// timestamps instead of a constant-stride regular corpus.
+	irregular: bool,
 	/// Point-lookup mode: rows sealed into the segment (the stored corpus size).
 	pl_rows: usize,
 	/// Point-lookup mode: instants resolved per timed rep (the query batch size).
 	pl_queries: usize,
-	/// Point-lookup mode: jittered (irregular) timestamps instead of constant-stride.
-	pl_irregular: bool,
 	/// Point-lookup mode: fraction of the query batch made deliberately off-grid.
 	pl_absent: f64,
 	/// Point-lookup mode: how the query batch is issued (single reads vs one batch).
 	pl_mode: LookupMode,
+	/// Range-fetch mode: rows sealed into the segment (the stored corpus size).
+	rf_rows: usize,
+	/// Range-fetch mode: rows spanned by each fetched window (the selectivity).
+	rf_window: usize,
+	/// Range-fetch mode: number of windows fetched per timed rep.
+	rf_windows: usize,
 	/// Synthetic generator seed (published for reproducibility).
 	seed: u64,
 	/// Synthetic post-missingness target sample count.
@@ -283,6 +310,8 @@ enum InputMode {
 	Synthetic,
 	/// The storage-backed point-lookup workload (seals a segment, times the read).
 	PointLookup,
+	/// The storage-backed range-fetch workload (seals a segment, times windowed reads).
+	RangeFetch,
 }
 
 /// What the parsed command line asks the program to do.
@@ -312,19 +341,24 @@ impl Cli {
 		// hardcodes a second copy of those constants.
 		let defaults = SyntheticParams::default();
 
-		// Point-lookup knob defaults come from the flagship point-lookup profile so
-		// the CLI never hardcodes a second copy of those constants.
+		// Storage-workload knob defaults come from the flagship profiles so the CLI
+		// never hardcodes a second copy of those constants.
 		let pl_defaults = PointLookupParams::default();
+		let rf_defaults = RangeFetchParams::default();
 
 		let mut input: Option<PathBuf> = None;
 		let mut field: Option<String> = None;
 		let mut synthetic = false;
 		let mut point_lookup = false;
+		let mut range_fetch = false;
+		let mut irregular = false;
 		let mut pl_rows = pl_defaults.point_count;
 		let mut pl_queries = pl_defaults.query_count;
-		let mut pl_irregular = false;
 		let mut pl_absent = pl_defaults.absent_fraction;
 		let mut pl_mode = pl_defaults.mode;
+		let mut rf_rows = rf_defaults.point_count;
+		let mut rf_window = rf_defaults.window_rows;
+		let mut rf_windows = rf_defaults.window_count;
 		let mut seed = defaults.seed;
 		let mut points = defaults.input_points;
 		let mut missingness = defaults.missingness_fraction;
@@ -363,11 +397,15 @@ impl Cli {
 				"-f" | "--field" => field = Some(take_value(&key)?),
 				"-s" | "--synthetic" => synthetic = true,
 				"-p" | "--point-lookup" => point_lookup = true,
+				"-r" | "--range-fetch" => range_fetch = true,
+				"--irregular" | "--pl-irregular" | "--rf-irregular" => irregular = true,
 				"--pl-rows" => pl_rows = parse_points_count(&take_value(&key)?)?,
 				"--pl-queries" => pl_queries = parse_query_count(&take_value(&key)?)?,
-				"--pl-irregular" => pl_irregular = true,
 				"--pl-absent" => pl_absent = parse_fraction(&take_value(&key)?, "pl-absent")?,
 				"--pl-mode" => pl_mode = parse_lookup_mode(&take_value(&key)?)?,
+				"--rf-rows" => rf_rows = parse_points_count(&take_value(&key)?)?,
+				"--rf-window" => rf_window = parse_query_count(&take_value(&key)?)?,
+				"--rf-windows" => rf_windows = parse_query_count(&take_value(&key)?)?,
 				"--seed" => seed = parse_seed(&take_value(&key)?)?,
 				"--points" => points = parse_points_count(&take_value(&key)?)?,
 				"--missingness" => missingness = parse_fraction(&take_value(&key)?, "missingness")?,
@@ -394,51 +432,70 @@ impl Cli {
 		}
 
 		// Exactly one input mode, with every conflicting flag combination rejected.
-		let mode = resolve_input_mode(synthetic, point_lookup, input.as_ref(), field.as_deref(), compare)?;
+		let mode = resolve_input_mode(synthetic, point_lookup, range_fetch, input.as_ref(), field.as_deref())?;
+		// `--compare` runs the interpolation baseline suite; it has no meaning for the
+		// self-sealing storage workloads.
+		if compare {
+			if let Some(flag) = storage_mode_flag(mode) {
+				return Err(format!("`--compare` has no meaning in `{flag}` mode"));
+			}
+		}
 
-		Ok(Command::Run(Box::new(Self { input, field, mode, pl_rows, pl_queries, pl_irregular, pl_absent, pl_mode, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare, html })))
+		Ok(Command::Run(Box::new(Self { input, field, mode, irregular, pl_rows, pl_queries, pl_absent, pl_mode, rf_rows, rf_window, rf_windows, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare, html })))
+	}
+}
+
+/// The flag name for a storage-workload mode (for conflict messages), or `None` for
+/// the interpolation modes.
+const fn storage_mode_flag(mode: InputMode) -> Option<&'static str> {
+	match mode {
+		InputMode::PointLookup => Some("--point-lookup"),
+		InputMode::RangeFetch => Some("--range-fetch"),
+		InputMode::LineProtocol | InputMode::Synthetic => None,
 	}
 }
 
 /// Resolve the mutually-exclusive input-mode flags into a single [`InputMode`],
 /// rejecting every conflicting combination.
 ///
-/// The point-lookup workload seals its own corpus, so it rejects every
-/// interpolation input flag (and `--compare`, which has no point-lookup meaning);
-/// synthetic mode generates its own data, so an input file or `--field` projection
-/// is a conflict; line-protocol mode requires both `--input` and `--field`.
-fn resolve_input_mode(synthetic: bool, point_lookup: bool, input: Option<&PathBuf>, field: Option<&str>, compare: bool) -> Result<InputMode, String> {
-	if point_lookup {
+/// The storage workloads (point-lookup, range-fetch) seal their own corpus, so they
+/// reject every interpolation input flag; synthetic mode generates its own data, so
+/// an input file or `--field` projection is a conflict; line-protocol mode requires
+/// both `--input` and `--field`. (The `--compare` conflict is checked by the caller,
+/// which keeps this to the three mode selectors.)
+fn resolve_input_mode(synthetic: bool, point_lookup: bool, range_fetch: bool, input: Option<&PathBuf>, field: Option<&str>) -> Result<InputMode, String> {
+	if point_lookup && range_fetch {
+		return Err("`--point-lookup` and `--range-fetch` cannot be combined".to_string());
+	}
+	// Both storage workloads share the same rejection set.
+	if let Some(mode_flag) = point_lookup.then_some("--point-lookup").or_else(|| range_fetch.then_some("--range-fetch")) {
 		if synthetic {
-			return Err("`--point-lookup` cannot be combined with `--synthetic`".to_string());
+			return Err(format!("`{mode_flag}` cannot be combined with `--synthetic`"));
 		}
 		if input.is_some() {
-			return Err("`--point-lookup` cannot be combined with an input file".to_string());
+			return Err(format!("`{mode_flag}` cannot be combined with an input file"));
 		}
 		if field.is_some() {
-			return Err("`--field` has no meaning in `--point-lookup` mode".to_string());
+			return Err(format!("`--field` has no meaning in `{mode_flag}` mode"));
 		}
-		if compare {
-			return Err("`--compare` has no meaning in `--point-lookup` mode".to_string());
-		}
-		Ok(InputMode::PointLookup)
-	} else if synthetic {
+		return Ok(if point_lookup { InputMode::PointLookup } else { InputMode::RangeFetch });
+	}
+	if synthetic {
 		if input.is_some() {
 			return Err("`--synthetic` cannot be combined with an input file".to_string());
 		}
 		if field.is_some() {
 			return Err("`--field` has no meaning in `--synthetic` mode".to_string());
 		}
-		Ok(InputMode::Synthetic)
-	} else {
-		if input.is_none() {
-			return Err("missing required `--input <file.lp>` (or pass `--synthetic` / `--point-lookup`)".to_string());
-		}
-		if field.is_none() {
-			return Err("missing required `--field <name>`".to_string());
-		}
-		Ok(InputMode::LineProtocol)
+		return Ok(InputMode::Synthetic);
 	}
+	if input.is_none() {
+		return Err("missing required `--input <file.lp>` (or pass `--synthetic` / `--point-lookup` / `--range-fetch`)".to_string());
+	}
+	if field.is_none() {
+		return Err("missing required `--field <name>`".to_string());
+	}
+	Ok(InputMode::LineProtocol)
 }
 
 /// Parse a timestamp-precision token (`ns`/`us`/`ms`/`s` and long forms).
@@ -575,6 +632,7 @@ USAGE:
     dsp-bench <FILE.lp> --field <NAME> [OPTIONS]
     dsp-bench --synthetic [OPTIONS]
     dsp-bench --point-lookup [POINT-LOOKUP OPTIONS]
+    dsp-bench --range-fetch [RANGE-FETCH OPTIONS]
 
 INPUT MODE (choose one):
     -i, --input <FILE>       Line-protocol input file (.lp / TSBS payload)
@@ -587,15 +645,26 @@ INPUT MODE (choose one):
                              DSP's streaming point read (p50/p95/p99 + bytes/point).
                              No ground truth, so no accuracy — the streaming read is
                              gated against the full-decode value.
+    -r, --range-fetch        Run the storage-backed range-fetch workload: seal a
+                             seeded columnar segment and time DSP's windowed range
+                             read (only the rows in each window are decoded). Gated
+                             against a full decode filtered to the window.
+
+STORAGE-WORKLOAD OPTIONS (with --point-lookup or --range-fetch):
+        --irregular          Jittered timestamps (decode + search/filter) instead of
+                             the constant-stride regular (closed-form) corpus
 
 POINT-LOOKUP OPTIONS (with --point-lookup):
         --pl-rows <N>        Rows sealed into the segment (>=2)     [default: 20000]
         --pl-queries <N>     Instants resolved per rep (>=1)           [default: 128]
-        --pl-irregular       Jittered timestamps (decode + search) instead of the
-                             constant-stride regular (closed-form) corpus
         --pl-absent <F>      Off-grid-miss fraction in [0, 1]          [default: 0.25]
         --pl-mode <M>        Issue mode: single|batch                [default: batch]
                              (batch amortizes the timestamp decode across the batch)
+
+RANGE-FETCH OPTIONS (with --range-fetch):
+        --rf-rows <N>        Rows sealed into the segment (>=2)     [default: 20000]
+        --rf-window <N>      Rows spanned by each fetched window (>=1)  [default: 100]
+        --rf-windows <N>     Windows fetched per rep (>=1)              [default: 32]
 
 SYNTHETIC OPTIONS (with --synthetic):
         --seed <N>           Generator seed, decimal or 0x-hex     [default: flagship]
@@ -690,20 +759,58 @@ mod tests {
 		let pl = PointLookupParams::default();
 		assert_eq!(cli.pl_rows, pl.point_count);
 		assert_eq!(cli.pl_queries, pl.query_count);
-		assert!(!cli.pl_irregular, "regular (closed-form) is the default corpus");
+		assert!(!cli.irregular, "regular (closed-form) is the default corpus");
 		assert!((cli.pl_absent - pl.absent_fraction).abs() < f64::EPSILON);
 		assert_eq!(cli.pl_mode, pl.mode);
 	}
 
 	#[test]
 	fn point_lookup_knobs_parse_including_mode_and_irregular() {
-		let cli = expect_run(&["-p", "--pl-rows", "5000", "--pl-queries", "256", "--pl-irregular", "--pl-absent", "0.5", "--pl-mode", "single"]);
+		let cli = expect_run(&["-p", "--pl-rows", "5000", "--pl-queries", "256", "--irregular", "--pl-absent", "0.5", "--pl-mode", "single"]);
 		assert_eq!(cli.mode, InputMode::PointLookup);
 		assert_eq!(cli.pl_rows, 5_000);
 		assert_eq!(cli.pl_queries, 256);
-		assert!(cli.pl_irregular);
+		assert!(cli.irregular);
 		assert!((cli.pl_absent - 0.5).abs() < 1e-12);
 		assert_eq!(cli.pl_mode, LookupMode::Single, "single mode parsed");
+	}
+
+	#[test]
+	fn range_fetch_mode_needs_no_input_and_carries_knob_defaults() {
+		let cli = expect_run(&["--range-fetch"]);
+		assert_eq!(cli.mode, InputMode::RangeFetch);
+		assert_eq!(cli.input, None);
+		assert_eq!(cli.field, None);
+		let rf = RangeFetchParams::default();
+		assert_eq!(cli.rf_rows, rf.point_count);
+		assert_eq!(cli.rf_window, rf.window_rows);
+		assert_eq!(cli.rf_windows, rf.window_count);
+		assert!(!cli.irregular, "regular is the default corpus");
+	}
+
+	#[test]
+	fn range_fetch_knobs_parse() {
+		let cli = expect_run(&["-r", "--rf-rows", "8000", "--rf-window", "250", "--rf-windows", "48", "--irregular"]);
+		assert_eq!(cli.mode, InputMode::RangeFetch);
+		assert_eq!(cli.rf_rows, 8_000);
+		assert_eq!(cli.rf_window, 250);
+		assert_eq!(cli.rf_windows, 48);
+		assert!(cli.irregular);
+	}
+
+	#[test]
+	fn range_fetch_conflicts_are_rejected() {
+		assert!(run_cli(&["--range-fetch", "--point-lookup"]).unwrap_err().contains("cannot be combined"));
+		assert!(run_cli(&["--range-fetch", "--synthetic"]).unwrap_err().contains("cannot be combined with `--synthetic`"));
+		assert!(run_cli(&["--range-fetch", "--input", "x.lp"]).unwrap_err().contains("cannot be combined with an input file"));
+		assert!(run_cli(&["--range-fetch", "--compare"]).unwrap_err().contains("`--compare` has no meaning"));
+	}
+
+	#[test]
+	fn range_fetch_knob_bounds_are_enforced() {
+		assert!(run_cli(&["-r", "--rf-rows", "1"]).unwrap_err().contains(">= 2"));
+		assert!(run_cli(&["-r", "--rf-window", "0"]).unwrap_err().contains(">= 1"));
+		assert!(run_cli(&["-r", "--rf-windows", "0"]).unwrap_err().contains(">= 1"));
 	}
 
 	#[test]
