@@ -55,6 +55,10 @@ pub enum Aggregation {
 	P95,
 	/// 99th percentile of the bucket, by the nearest-rank method.
 	P99,
+	/// Time-weighted average: each sample weighted by the time until the next sample
+	/// in the bucket (a left-endpoint / LOCF weighting), so irregularly-spaced samples
+	/// contribute in proportion to how long they were in effect.
+	Twa,
 }
 
 impl Aggregation {
@@ -72,6 +76,7 @@ impl Aggregation {
 			Self::P90 => "p90",
 			Self::P95 => "p95",
 			Self::P99 => "p99",
+			Self::Twa => "twa",
 		}
 	}
 
@@ -92,6 +97,7 @@ impl Aggregation {
 			"p90" => Some(Self::P90),
 			"p95" => Some(Self::P95),
 			"p99" => Some(Self::P99),
+			"twa" | "time_weighted_avg" => Some(Self::Twa),
 			_ => None,
 		}
 	}
@@ -107,6 +113,14 @@ impl Aggregation {
 			Self::P99 => Some(99),
 			_ => None,
 		}
+	}
+
+	/// Whether this reduction needs the whole bucket materialized (percentiles need
+	/// the sorted values; [`Self::Twa`] needs the time-ordered samples). The streaming
+	/// reductions do not, so [`reduce`] only collects samples when one of these is asked.
+	#[must_use]
+	pub const fn needs_full_bucket(self) -> bool {
+		self.percentile_rank().is_some() || matches!(self, Self::Twa)
 	}
 
 	/// Every reduction, in a stable order — the natural set for a full downsample. Kept
@@ -162,13 +176,14 @@ struct BucketAcc {
 	max: Option<BigDecimal>,
 	first: Option<(DateTime<Utc>, BigDecimal)>,
 	last: Option<(DateTime<Utc>, BigDecimal)>,
-	/// Populated only when `collect` is set (a percentile is requested).
-	samples: Vec<BigDecimal>,
+	/// `(timestamp, value)` pairs, populated only when `collect` is set (a percentile
+	/// or time-weighted average is requested).
+	samples: Vec<(DateTime<Utc>, BigDecimal)>,
 	collect: bool,
 }
 
 impl BucketAcc {
-	/// A fresh accumulator; `collect` materializes the full bucket for percentiles.
+	/// A fresh accumulator; `collect` materializes the full bucket for percentiles / TWA.
 	fn new(collect: bool) -> Self {
 		Self { count: 0, sum: BigDecimal::from(0), min: None, max: None, first: None, last: None, samples: Vec::new(), collect }
 	}
@@ -187,7 +202,7 @@ impl BucketAcc {
 			self.first = Some((timestamp, value.clone()));
 		}
 		if self.collect {
-			self.samples.push(value.clone());
+			self.samples.push((timestamp, value.clone()));
 		}
 		if self.last.as_ref().is_none_or(|(t, _)| timestamp >= *t) {
 			self.last = Some((timestamp, value));
@@ -195,17 +210,20 @@ impl BucketAcc {
 	}
 
 	/// Materialize the requested reductions and the grid-aligned bucket start.
-	fn finish(mut self, resolution: Resolution, base: i64, aggregations: &[Aggregation]) -> Result<Bucket, ReduceError> {
+	fn finish(self, resolution: Resolution, base: i64, aggregations: &[Aggregation]) -> Result<Bucket, ReduceError> {
 		let timestamp = bucket_start(resolution, base).ok_or(ReduceError::BucketStartOverflow)?;
 		let count = BigDecimal::from(self.count as u64);
-		// Percentiles read from the sorted samples; sort once, lazily, if any is asked.
-		if self.collect {
-			self.samples.sort();
-		}
+		// Percentiles read the values in ascending value order; sort a value-only copy
+		// once, lazily, only if a percentile is requested.
+		let sorted_values: Option<Vec<BigDecimal>> = aggregations.iter().any(|a| a.percentile_rank().is_some()).then(|| {
+			let mut v: Vec<BigDecimal> = self.samples.iter().map(|(_, val)| val.clone()).collect();
+			v.sort();
+			v
+		});
 		let mut values: BTreeMap<String, BigDecimal> = BTreeMap::new();
 		for &agg in aggregations {
 			let value = if let Some(rank) = agg.percentile_rank() {
-				percentile(&self.samples, rank)
+				sorted_values.as_deref().and_then(|s| percentile(s, rank))
 			} else {
 				match agg {
 					Aggregation::Min => self.min.clone(),
@@ -214,6 +232,7 @@ impl BucketAcc {
 					Aggregation::Avg => (self.count > 0).then(|| &self.sum / &count),
 					Aggregation::First => self.first.as_ref().map(|(_, v)| v.clone()),
 					Aggregation::Last => self.last.as_ref().map(|(_, v)| v.clone()),
+					Aggregation::Twa => time_weighted_average(&self.samples),
 					Aggregation::P50 | Aggregation::P90 | Aggregation::P95 | Aggregation::P99 => unreachable!("handled by percentile_rank above"),
 				}
 			};
@@ -223,6 +242,40 @@ impl BucketAcc {
 		}
 		Ok(Bucket { timestamp, count: self.count, values })
 	}
+}
+
+/// The **time-weighted average** of `samples`: each sample weighted by the time until
+/// the next sample in ascending-timestamp order (a left-endpoint / LOCF weighting).
+///
+/// `None` for an empty slice; a single sample is its own value. When every sample
+/// shares one instant (total weight zero), falls back to the unweighted arithmetic
+/// mean. Weights are measured in milliseconds — the unit cancels in the ratio, so it
+/// only bounds sub-millisecond resolution, which a downsample bucket never needs.
+fn time_weighted_average(samples: &[(DateTime<Utc>, BigDecimal)]) -> Option<BigDecimal> {
+	if samples.is_empty() {
+		return None;
+	}
+	if samples.len() == 1 {
+		return Some(samples[0].1.clone());
+	}
+	let mut ordered: Vec<&(DateTime<Utc>, BigDecimal)> = samples.iter().collect();
+	ordered.sort_by_key(|(t, _)| *t);
+	let mut weighted = BigDecimal::from(0);
+	let mut total_ms: i64 = 0;
+	for pair in ordered.windows(2) {
+		let dt = (pair[1].0 - pair[0].0).num_milliseconds().max(0);
+		if dt > 0 {
+			weighted += &pair[0].1 * BigDecimal::from(dt);
+			total_ms += dt;
+		}
+	}
+	if total_ms == 0 {
+		// Degenerate: all samples within one millisecond — no time spread to weight by,
+		// so report the plain arithmetic mean.
+		let sum: BigDecimal = samples.iter().map(|(_, v)| v.clone()).sum();
+		return Some(sum / BigDecimal::from(samples.len() as u64));
+	}
+	Some(weighted / BigDecimal::from(total_ms))
 }
 
 /// The nearest-rank percentile of a **sorted** `samples` slice: the value at rank
@@ -256,9 +309,9 @@ fn percentile(samples: &[BigDecimal], rank: u8) -> Option<BigDecimal> {
 /// scales past the representable time range.
 pub fn reduce(points: &[Point], resolution: Resolution, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, aggregations: &[Aggregation]) -> Result<Vec<Bucket>, ReduceError> {
 	let aggregations = if aggregations.is_empty() { &Aggregation::DEFAULT[..] } else { aggregations };
-	// Percentiles require the full bucket to be materialized and sorted; the streaming
-	// reductions do not, so only collect when a percentile is actually requested.
-	let collect = aggregations.iter().any(|a| a.percentile_rank().is_some());
+	// Percentiles and TWA require the full bucket materialized; the streaming
+	// reductions do not, so only collect when one of those is actually requested.
+	let collect = aggregations.iter().any(|a| a.needs_full_bucket());
 
 	// A BTreeMap keyed by the bucket index yields buckets in ascending index order,
 	// which is ascending time order for a fixed resolution.
@@ -406,12 +459,37 @@ mod tests {
 
 	#[test]
 	fn from_token_round_trips_as_str_and_rejects_unknown() {
-		for agg in [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::P50, Aggregation::P90, Aggregation::P95, Aggregation::P99] {
+		for agg in [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::P50, Aggregation::P90, Aggregation::P95, Aggregation::P99, Aggregation::Twa] {
 			assert_eq!(Aggregation::from_token(agg.as_str()), Some(agg), "{} must round-trip", agg.as_str());
 		}
 		assert_eq!(Aggregation::from_token("MEDIAN"), Some(Aggregation::P50), "median is a case-insensitive p50 alias");
 		assert_eq!(Aggregation::from_token(" avg "), Some(Aggregation::Avg), "surrounding whitespace is trimmed");
 		assert_eq!(Aggregation::from_token("bogus"), None, "an unknown token is rejected");
+	}
+
+	#[test]
+	fn time_weighted_average_weights_by_dwell_time() {
+		// Value 10 held from t=0 to t=30 (30s), value 20 from t=30 to t=60 (30s), value 5
+		// at t=60 (the last sample carries no forward weight). TWA = (10*30 + 20*30)/60 = 15.
+		// The unweighted mean would be (10+20+5)/3 = 11.67, so the weighting is visible.
+		let points = vec![pt(0, "10"), pt(30, "20"), pt(60, "5")];
+		let buckets = reduce(&points, Resolution::Hours, None, None, &[Aggregation::Twa, Aggregation::Avg]).expect("reduces");
+		assert_eq!(buckets.len(), 1, "all three fall in one hour-bucket");
+		assert!((get(&buckets[0], Aggregation::Twa) - 15.0).abs() < 1e-9, "TWA weights 10 and 20 over equal 30s spans -> 15");
+		// Order-independence: scrambling the input yields the same TWA.
+		let scrambled = vec![pt(60, "5"), pt(0, "10"), pt(30, "20")];
+		let b2 = reduce(&scrambled, Resolution::Hours, None, None, &[Aggregation::Twa]).expect("reduces");
+		assert!((get(&b2[0], Aggregation::Twa) - 15.0).abs() < 1e-9, "TWA is order-independent");
+	}
+
+	#[test]
+	fn twa_single_sample_is_the_value_and_same_instant_is_the_mean() {
+		// One sample -> its own value.
+		let one = reduce(&[pt(5, "42")], Resolution::Minutes, None, None, &[Aggregation::Twa]).expect("reduces");
+		assert!((get(&one[0], Aggregation::Twa) - 42.0).abs() < 1e-9);
+		// Two samples at the same instant (zero time spread) -> arithmetic mean.
+		let same = reduce(&[pt(5, "10"), pt(5, "20")], Resolution::Minutes, None, None, &[Aggregation::Twa]).expect("reduces");
+		assert!((get(&same[0], Aggregation::Twa) - 15.0).abs() < 1e-9, "zero spread falls back to the mean");
 	}
 
 	#[test]
