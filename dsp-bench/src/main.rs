@@ -24,7 +24,7 @@ use std::{path::PathBuf, process::ExitCode};
 
 use chrono::Utc;
 use dsp_bench::{
-	report::{default_filename, default_html_filename}, run_compression, run_downsample, run_point_lookup, run_profile, run_range_fetch, BaselineLinearAdapter, BenchReport, BenchResult, CompressionParams, CompressionProfile, DownsampleParams, DownsampleProfile, DspAdapter, ForwardFillAdapter, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision, ValueShape
+	report::{default_filename, default_html_filename}, run_compression, run_downsample, run_point_lookup, run_profile, run_range_fetch, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CompressionParams, CompressionProfile, DownsampleParams, DownsampleProfile, DspAdapter, ForwardFillAdapter, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision, ValueShape
 };
 use splimes::{Resolution, Spline};
 
@@ -176,7 +176,7 @@ fn run_compression_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 /// is that the reduction is total (the bucket counts sum to the input size).
 fn run_downsample_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 	let profile_name = cli.name.clone().unwrap_or_else(|| "downsample".to_string());
-	let params = DownsampleParams { seed: cli.seed, point_count: cli.ds_points, input_stride_secs: cli.ds_stride, bucket_resolution: cli.ds_bucket, ..DownsampleParams::default() };
+	let params = DownsampleParams { seed: cli.seed, point_count: cli.ds_points, input_stride_secs: cli.ds_stride, bucket_resolution: cli.ds_bucket, aggregations: cli.ds_aggs.clone() };
 	let profile = DownsampleProfile::new(profile_name, params);
 	let result = run_downsample(&profile, cli.reps).map_err(|e| anyhow::anyhow!("downsample benchmark run failed: {e}"))?;
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
@@ -304,6 +304,8 @@ struct Cli {
 	ds_stride: i64,
 	/// Downsample mode: bucket resolution the series is reduced to.
 	ds_bucket: Resolution,
+	/// Downsample mode: the reductions computed per bucket.
+	ds_aggs: Vec<Aggregation>,
 	/// Storage-workload knob (point-lookup / range-fetch): jittered (irregular)
 	/// timestamps instead of a constant-stride regular corpus.
 	irregular: bool,
@@ -417,6 +419,7 @@ impl Cli {
 		let mut downsample = false;
 		let (mut comp_rows, mut comp_shape) = (comp_defaults.point_count, comp_defaults.value_shape);
 		let (mut ds_points, mut ds_stride, mut ds_bucket) = (ds_defaults.point_count, ds_defaults.input_stride_secs, ds_defaults.bucket_resolution);
+		let mut ds_aggs = ds_defaults.aggregations;
 		let mut irregular = false;
 		let (mut pl_rows, mut pl_queries, mut pl_absent, mut pl_mode, mut pl_rows_per_page) = (pl_defaults.point_count, pl_defaults.query_count, pl_defaults.absent_fraction, pl_defaults.mode, pl_defaults.rows_per_page);
 		let (mut rf_rows, mut rf_window, mut rf_windows, mut rf_rows_per_page) = (rf_defaults.point_count, rf_defaults.window_rows, rf_defaults.window_count, rf_defaults.rows_per_page);
@@ -466,6 +469,7 @@ impl Cli {
 				"--ds-points" => ds_points = parse_points_count(&take_value(&key)?)?,
 				"--ds-stride" => ds_stride = parse_stride_secs(&take_value(&key)?)?,
 				"--ds-bucket" => ds_bucket = parse_resolution(&take_value(&key)?)?,
+				"--ds-aggs" => ds_aggs = parse_aggregations(&take_value(&key)?)?,
 				"--irregular" | "--pl-irregular" | "--rf-irregular" => irregular = true,
 				"--pl-rows" => pl_rows = parse_points_count(&take_value(&key)?)?,
 				"--pl-queries" => pl_queries = parse_query_count(&take_value(&key)?)?,
@@ -505,7 +509,7 @@ impl Cli {
 		let mode = select_workload_mode(&[(synthetic, InputMode::Synthetic), (point_lookup, InputMode::PointLookup), (range_fetch, InputMode::RangeFetch), (compression, InputMode::Compression), (downsample, InputMode::Downsample)])?;
 		validate_mode(mode, input.as_ref(), field.as_deref(), compare)?;
 
-		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, ds_points, ds_stride, ds_bucket, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare, html })))
+		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, ds_points, ds_stride, ds_bucket, ds_aggs, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare, html })))
 	}
 }
 
@@ -666,6 +670,16 @@ fn parse_rows_per_page(s: &str) -> Result<usize, String> {
 	s.parse::<usize>().map_err(|_| format!("invalid --*-rows-per-page `{s}` (expected a non-negative integer; 0 = single-block)"))
 }
 
+/// Parse a comma-separated list of downsample aggregation tokens (e.g.
+/// `min,max,p99`) into reductions, rejecting an unknown token or an empty list.
+fn parse_aggregations(s: &str) -> Result<Vec<Aggregation>, String> {
+	let aggs: Vec<Aggregation> = s.split(',').map(str::trim).filter(|t| !t.is_empty()).map(|t| Aggregation::from_token(t).ok_or_else(|| format!("invalid --ds-aggs token `{t}` (use min/max/avg/sum/first/last/p50/p90/p95/p99)"))).collect::<Result<_, _>>()?;
+	if aggs.is_empty() {
+		return Err("--ds-aggs must name at least one reduction".to_string());
+	}
+	Ok(aggs)
+}
+
 /// Parse a downsample input-stride value (seconds between samples, `>= 1`).
 fn parse_stride_secs(s: &str) -> Result<i64, String> {
 	let n = s.parse::<i64>().map_err(|_| format!("invalid --ds-stride `{s}` (expected a positive integer of seconds)"))?;
@@ -792,6 +806,9 @@ DOWNSAMPLE OPTIONS (with --downsample):
         --ds-points <N>      Input sample count (>=2)              [default: 60000]
         --ds-stride <N>      Seconds between input samples (>=1)        [default: 1]
         --ds-bucket <R>      Bucket resolution: s|m|h|d|w|mo|y     [default: minutes]
+        --ds-aggs <LIST>     Reductions, comma-separated: min,max,avg,sum,first,
+                             last,p50,p90,p95,p99          [default: min,max,avg,
+                             sum,first,last]
 
 SYNTHETIC OPTIONS (with --synthetic):
         --seed <N>           Generator seed, decimal or 0x-hex     [default: flagship]
@@ -961,6 +978,11 @@ mod tests {
 		assert_eq!(cli.ds_stride, 5);
 		assert_eq!(cli.ds_bucket, Resolution::Hours);
 		assert!(run_cli(&["-d", "--ds-stride", "0"]).unwrap_err().contains("--ds-stride must be >= 1"));
+		// Aggregations parse from a comma list (including percentiles) and reject unknowns.
+		assert_eq!(cli.ds_aggs, Aggregation::ALL.to_vec(), "default is the six streaming reductions");
+		assert_eq!(expect_run(&["-d", "--ds-aggs", "min,max,p99"]).ds_aggs, vec![Aggregation::Min, Aggregation::Max, Aggregation::P99]);
+		assert!(run_cli(&["-d", "--ds-aggs", "min,bogus"]).unwrap_err().contains("invalid --ds-aggs token"));
+		assert!(run_cli(&["-d", "--ds-aggs", " "]).unwrap_err().contains("at least one reduction"));
 		// Conflicts: another mode, an input file, and --compare.
 		assert!(run_cli(&["--downsample", "--compression"]).unwrap_err().contains("only one workload mode"));
 		assert!(run_cli(&["--downsample", "--input", "x.lp"]).unwrap_err().contains("cannot be combined with an input file"));

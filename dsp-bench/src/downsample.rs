@@ -20,7 +20,8 @@ use std::time::Instant;
 
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use dsp_reduce::{reduce, Aggregation, Bucket};
+pub use dsp_reduce::Aggregation;
+use dsp_reduce::{reduce, Bucket};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use splimes::{Point, Resolution};
