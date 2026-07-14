@@ -24,7 +24,7 @@ use std::{path::PathBuf, process::ExitCode};
 
 use chrono::Utc;
 use dsp_bench::{
-	report::{default_filename, default_html_filename}, run_profile, BaselineLinearAdapter, BenchReport, BenchResult, DspAdapter, ForwardFillAdapter, InterpolationProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision
+	report::{default_filename, default_html_filename}, run_point_lookup, run_profile, BaselineLinearAdapter, BenchReport, BenchResult, DspAdapter, ForwardFillAdapter, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision
 };
 use splimes::{Resolution, Spline};
 
@@ -46,7 +46,7 @@ fn main() -> ExitCode {
 			print!("{USAGE}");
 			return ExitCode::SUCCESS;
 		}
-		Command::Run(cli) => cli,
+		Command::Run(cli) => *cli,
 	};
 
 	// A multi-threaded runtime is unnecessary for a single sequential run; a
@@ -68,12 +68,20 @@ fn main() -> ExitCode {
 	}
 }
 
-/// Load the dataset, run the DSP interpolation profile, and persist the report.
+/// Load the dataset, run the selected workload, and persist the report.
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
+	// The point-lookup workload is a parallel path: it seals a columnar segment from
+	// a seeded corpus and times DSP's streaming point read, so it builds its own
+	// report and shares the persist/summarize tail rather than the interpolation
+	// profile plumbing.
+	if cli.mode == InputMode::PointLookup {
+		return run_point_lookup_workload(&cli);
+	}
+
 	// Build the profile from whichever input mode was selected. Synthetic mode
 	// carries a known analytic ground truth, so its report will also include
 	// accuracy metrics; line-protocol mode does not.
-	let profile = if cli.synthetic {
+	let profile = if cli.mode == InputMode::Synthetic {
 		let profile_name = cli.name.clone().unwrap_or_else(|| "interpolation-heavy-irregular".to_string());
 		let params = SyntheticParams { seed: cli.seed, input_points: cli.points, missingness_fraction: cli.missingness, jitter_fraction: cli.jitter, noise_amplitude: cli.noise, signal_shape: cli.shape, spline: cli.spline, resolution: cli.resolution };
 		InterpolationProfile::synthetic(profile_name, params)
@@ -101,10 +109,35 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 	}
 
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
+	let report = BenchReport::with_results(metadata, results);
+	finish(&cli, &report)
+}
+
+/// Run the point-lookup workload: build a seeded [`PointLookupProfile`] from the
+/// point-lookup CLI knobs, seal a columnar segment, time DSP's streaming point read
+/// (`read_segment_point` / `read_segment_points`), and persist the report.
+///
+/// This is the storage-backed sibling of the interpolation path — it has no
+/// analytic ground truth (a lookup returns the stored value), so the report carries
+/// no accuracy, only latency, throughput, and the north-star storage estimate.
+fn run_point_lookup_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
+	let profile_name = cli.name.clone().unwrap_or_else(|| if cli.pl_irregular { "point-lookup-irregular".to_string() } else { "point-lookup-regular".to_string() });
+	let params = PointLookupParams { seed: cli.seed, point_count: cli.pl_rows, query_count: cli.pl_queries, regular: !cli.pl_irregular, absent_fraction: cli.pl_absent, mode: cli.pl_mode };
+	let profile = PointLookupProfile::new(profile_name, params);
+	let result = run_point_lookup(&profile, cli.reps).map_err(|e| anyhow::anyhow!("point-lookup benchmark run failed: {e}"))?;
+	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
+	let report = BenchReport::with_results(metadata, vec![result]);
+	finish(cli, &report)
+}
+
+/// Persist a completed report (JSON, and optionally HTML) and print the summary,
+/// returning the process exit code. Shared by every workload path so a write
+/// failure always surfaces as a non-zero exit and the summary/artifact layout is
+/// identical regardless of workload.
+fn finish(cli: &Cli, report: &BenchReport) -> anyhow::Result<ExitCode> {
 	// The artifact name tags every adapter in the report (e.g. `dsp+baseline-linear`)
 	// so a comparison and a solo run never collide on disk.
-	let adapter_tag = results.iter().map(|r| r.adapter.as_str()).collect::<Vec<_>>().join("+");
-	let report = BenchReport::with_results(metadata, results);
+	let adapter_tag = report.results.iter().map(|r| r.adapter.as_str()).collect::<Vec<_>>().join("+");
 
 	// Persist before printing so a write failure surfaces as a non-zero exit even
 	// if the summary already streamed.
@@ -121,7 +154,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 		None
 	};
 
-	print_summary(&report, &out_path);
+	print_summary(report, &out_path);
 	if let Some(path) = &html_path {
 		println!("  html report  : {}", path.display());
 	}
@@ -197,8 +230,18 @@ struct Cli {
 	input: Option<PathBuf>,
 	/// Numeric field to project onto the interpolated series (line-protocol mode).
 	field: Option<String>,
-	/// Run the seeded synthetic generator instead of reading a file.
-	synthetic: bool,
+	/// Which input mode / workload was selected.
+	mode: InputMode,
+	/// Point-lookup mode: rows sealed into the segment (the stored corpus size).
+	pl_rows: usize,
+	/// Point-lookup mode: instants resolved per timed rep (the query batch size).
+	pl_queries: usize,
+	/// Point-lookup mode: jittered (irregular) timestamps instead of constant-stride.
+	pl_irregular: bool,
+	/// Point-lookup mode: fraction of the query batch made deliberately off-grid.
+	pl_absent: f64,
+	/// Point-lookup mode: how the query batch is issued (single reads vs one batch).
+	pl_mode: LookupMode,
 	/// Synthetic generator seed (published for reproducibility).
 	seed: u64,
 	/// Synthetic post-missingness target sample count.
@@ -230,13 +273,26 @@ struct Cli {
 	html: bool,
 }
 
+/// Which input mode / workload a run drives. Exactly one is selected per
+/// invocation (enforced in [`Cli::from_args`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputMode {
+	/// Interpolate a numeric field from a line-protocol / TSBS file.
+	LineProtocol,
+	/// Interpolate the seeded synthetic generator (carries a known ground truth).
+	Synthetic,
+	/// The storage-backed point-lookup workload (seals a segment, times the read).
+	PointLookup,
+}
+
 /// What the parsed command line asks the program to do.
 #[derive(Debug, Clone, PartialEq)]
 enum Command {
 	/// Print usage and exit successfully.
 	Help,
-	/// Run a benchmark with the given configuration.
-	Run(Cli),
+	/// Run a benchmark with the given configuration. Boxed because [`Cli`] is large
+	/// relative to the unit `Help` variant.
+	Run(Box<Cli>),
 }
 
 impl Cli {
@@ -256,9 +312,19 @@ impl Cli {
 		// hardcodes a second copy of those constants.
 		let defaults = SyntheticParams::default();
 
+		// Point-lookup knob defaults come from the flagship point-lookup profile so
+		// the CLI never hardcodes a second copy of those constants.
+		let pl_defaults = PointLookupParams::default();
+
 		let mut input: Option<PathBuf> = None;
 		let mut field: Option<String> = None;
 		let mut synthetic = false;
+		let mut point_lookup = false;
+		let mut pl_rows = pl_defaults.point_count;
+		let mut pl_queries = pl_defaults.query_count;
+		let mut pl_irregular = false;
+		let mut pl_absent = pl_defaults.absent_fraction;
+		let mut pl_mode = pl_defaults.mode;
 		let mut seed = defaults.seed;
 		let mut points = defaults.input_points;
 		let mut missingness = defaults.missingness_fraction;
@@ -296,6 +362,12 @@ impl Cli {
 				"-i" | "--input" => input = Some(PathBuf::from(take_value(&key)?)),
 				"-f" | "--field" => field = Some(take_value(&key)?),
 				"-s" | "--synthetic" => synthetic = true,
+				"-p" | "--point-lookup" => point_lookup = true,
+				"--pl-rows" => pl_rows = parse_points_count(&take_value(&key)?)?,
+				"--pl-queries" => pl_queries = parse_query_count(&take_value(&key)?)?,
+				"--pl-irregular" => pl_irregular = true,
+				"--pl-absent" => pl_absent = parse_fraction(&take_value(&key)?, "pl-absent")?,
+				"--pl-mode" => pl_mode = parse_lookup_mode(&take_value(&key)?)?,
 				"--seed" => seed = parse_seed(&take_value(&key)?)?,
 				"--points" => points = parse_points_count(&take_value(&key)?)?,
 				"--missingness" => missingness = parse_fraction(&take_value(&key)?, "missingness")?,
@@ -321,26 +393,51 @@ impl Cli {
 			}
 		}
 
-		// Exactly one input mode. Synthetic mode generates its own data, so an input
-		// file (or a `--field` projection) is meaningless and rejected as a conflict;
-		// line-protocol mode requires both `--input` and `--field`.
-		if synthetic {
-			if input.is_some() {
-				return Err("`--synthetic` cannot be combined with an input file".to_string());
-			}
-			if field.is_some() {
-				return Err("`--field` has no meaning in `--synthetic` mode".to_string());
-			}
-		} else {
-			if input.is_none() {
-				return Err("missing required `--input <file.lp>` (or pass `--synthetic`)".to_string());
-			}
-			if field.is_none() {
-				return Err("missing required `--field <name>`".to_string());
-			}
-		}
+		// Exactly one input mode, with every conflicting flag combination rejected.
+		let mode = resolve_input_mode(synthetic, point_lookup, input.as_ref(), field.as_deref(), compare)?;
 
-		Ok(Command::Run(Self { input, field, synthetic, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare, html }))
+		Ok(Command::Run(Box::new(Self { input, field, mode, pl_rows, pl_queries, pl_irregular, pl_absent, pl_mode, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare, html })))
+	}
+}
+
+/// Resolve the mutually-exclusive input-mode flags into a single [`InputMode`],
+/// rejecting every conflicting combination.
+///
+/// The point-lookup workload seals its own corpus, so it rejects every
+/// interpolation input flag (and `--compare`, which has no point-lookup meaning);
+/// synthetic mode generates its own data, so an input file or `--field` projection
+/// is a conflict; line-protocol mode requires both `--input` and `--field`.
+fn resolve_input_mode(synthetic: bool, point_lookup: bool, input: Option<&PathBuf>, field: Option<&str>, compare: bool) -> Result<InputMode, String> {
+	if point_lookup {
+		if synthetic {
+			return Err("`--point-lookup` cannot be combined with `--synthetic`".to_string());
+		}
+		if input.is_some() {
+			return Err("`--point-lookup` cannot be combined with an input file".to_string());
+		}
+		if field.is_some() {
+			return Err("`--field` has no meaning in `--point-lookup` mode".to_string());
+		}
+		if compare {
+			return Err("`--compare` has no meaning in `--point-lookup` mode".to_string());
+		}
+		Ok(InputMode::PointLookup)
+	} else if synthetic {
+		if input.is_some() {
+			return Err("`--synthetic` cannot be combined with an input file".to_string());
+		}
+		if field.is_some() {
+			return Err("`--field` has no meaning in `--synthetic` mode".to_string());
+		}
+		Ok(InputMode::Synthetic)
+	} else {
+		if input.is_none() {
+			return Err("missing required `--input <file.lp>` (or pass `--synthetic` / `--point-lookup`)".to_string());
+		}
+		if field.is_none() {
+			return Err("missing required `--field <name>`".to_string());
+		}
+		Ok(InputMode::LineProtocol)
 	}
 }
 
@@ -419,6 +516,24 @@ fn parse_points_count(s: &str) -> Result<usize, String> {
 	Ok(n)
 }
 
+/// Parse the point-lookup query-batch size, requiring at least one instant.
+fn parse_query_count(s: &str) -> Result<usize, String> {
+	let n = s.parse::<usize>().map_err(|_| format!("invalid --pl-queries `{s}` (expected a positive integer)"))?;
+	if n == 0 {
+		return Err("--pl-queries must be >= 1".to_string());
+	}
+	Ok(n)
+}
+
+/// Parse a point-lookup issue mode token (`single` | `batch`).
+fn parse_lookup_mode(s: &str) -> Result<LookupMode, String> {
+	match s.to_ascii_lowercase().as_str() {
+		"single" | "singles" | "one" => Ok(LookupMode::Single),
+		"batch" | "batched" => Ok(LookupMode::Batch),
+		other => Err(format!("invalid --pl-mode `{other}` (expected single|batch)")),
+	}
+}
+
 /// Parse a fraction in `[0.0, 1.0]` for `--missingness` / `--jitter`.
 fn parse_fraction(s: &str, flag: &str) -> Result<f64, String> {
 	let v = s.parse::<f64>().map_err(|_| format!("invalid --{flag} `{s}` (expected a number in [0, 1])"))?;
@@ -459,6 +574,7 @@ USAGE:
     dsp-bench --input <FILE.lp> --field <NAME> [OPTIONS]
     dsp-bench <FILE.lp> --field <NAME> [OPTIONS]
     dsp-bench --synthetic [OPTIONS]
+    dsp-bench --point-lookup [POINT-LOOKUP OPTIONS]
 
 INPUT MODE (choose one):
     -i, --input <FILE>       Line-protocol input file (.lp / TSBS payload)
@@ -466,6 +582,20 @@ INPUT MODE (choose one):
     -s, --synthetic          Generate a seeded synthetic series instead. Only this
                              mode has a known ground truth, so only it reports
                              accuracy (RMSE/MAE/max-error/bias).
+    -p, --point-lookup       Run the storage-backed point-lookup workload instead of
+                             interpolation: seal a seeded columnar segment and time
+                             DSP's streaming point read (p50/p95/p99 + bytes/point).
+                             No ground truth, so no accuracy — the streaming read is
+                             gated against the full-decode value.
+
+POINT-LOOKUP OPTIONS (with --point-lookup):
+        --pl-rows <N>        Rows sealed into the segment (>=2)     [default: 20000]
+        --pl-queries <N>     Instants resolved per rep (>=1)           [default: 128]
+        --pl-irregular       Jittered timestamps (decode + search) instead of the
+                             constant-stride regular (closed-form) corpus
+        --pl-absent <F>      Off-grid-miss fraction in [0, 1]          [default: 0.25]
+        --pl-mode <M>        Issue mode: single|batch                [default: batch]
+                             (batch amortizes the timestamp decode across the batch)
 
 SYNTHETIC OPTIONS (with --synthetic):
         --seed <N>           Generator seed, decimal or 0x-hex     [default: flagship]
@@ -505,7 +635,7 @@ mod tests {
 
 	fn expect_run(args: &[&str]) -> Cli {
 		match run_cli(args).expect("args should parse") {
-			Command::Run(cli) => cli,
+			Command::Run(cli) => *cli,
 			Command::Help => panic!("expected a run, got help"),
 		}
 	}
@@ -515,7 +645,7 @@ mod tests {
 		let cli = expect_run(&["--input", "data.lp", "--field", "usage"]);
 		assert_eq!(cli.input, Some(PathBuf::from("data.lp")));
 		assert_eq!(cli.field, Some("usage".to_string()));
-		assert!(!cli.synthetic, "synthetic is off unless requested");
+		assert_eq!(cli.mode, InputMode::LineProtocol, "line-protocol is the default mode");
 		assert_eq!(cli.precision, TimestampPrecision::Nanoseconds);
 		assert_eq!(cli.spline, Spline::Cubic);
 		assert_eq!(cli.resolution, Resolution::Seconds);
@@ -528,7 +658,7 @@ mod tests {
 	#[test]
 	fn synthetic_mode_needs_no_input_and_carries_knob_defaults() {
 		let cli = expect_run(&["--synthetic"]);
-		assert!(cli.synthetic);
+		assert_eq!(cli.mode, InputMode::Synthetic);
 		assert_eq!(cli.input, None);
 		assert_eq!(cli.field, None);
 		// Knob defaults mirror the flagship profile.
@@ -543,11 +673,60 @@ mod tests {
 	#[test]
 	fn synthetic_knobs_parse_including_hex_seed() {
 		let cli = expect_run(&["-s", "--seed", "0xBEEF", "--points", "120", "--missingness", "0.1", "--jitter", "0.0"]);
-		assert!(cli.synthetic);
+		assert_eq!(cli.mode, InputMode::Synthetic);
 		assert_eq!(cli.seed, 0xBEEF);
 		assert_eq!(cli.points, 120);
 		assert!((cli.missingness - 0.1).abs() < 1e-12);
 		assert!((cli.jitter - 0.0).abs() < f64::EPSILON);
+	}
+
+	#[test]
+	fn point_lookup_mode_needs_no_input_and_carries_knob_defaults() {
+		let cli = expect_run(&["--point-lookup"]);
+		assert_eq!(cli.mode, InputMode::PointLookup);
+		assert_eq!(cli.input, None);
+		assert_eq!(cli.field, None);
+		// Knob defaults mirror the flagship point-lookup profile.
+		let pl = PointLookupParams::default();
+		assert_eq!(cli.pl_rows, pl.point_count);
+		assert_eq!(cli.pl_queries, pl.query_count);
+		assert!(!cli.pl_irregular, "regular (closed-form) is the default corpus");
+		assert!((cli.pl_absent - pl.absent_fraction).abs() < f64::EPSILON);
+		assert_eq!(cli.pl_mode, pl.mode);
+	}
+
+	#[test]
+	fn point_lookup_knobs_parse_including_mode_and_irregular() {
+		let cli = expect_run(&["-p", "--pl-rows", "5000", "--pl-queries", "256", "--pl-irregular", "--pl-absent", "0.5", "--pl-mode", "single"]);
+		assert_eq!(cli.mode, InputMode::PointLookup);
+		assert_eq!(cli.pl_rows, 5_000);
+		assert_eq!(cli.pl_queries, 256);
+		assert!(cli.pl_irregular);
+		assert!((cli.pl_absent - 0.5).abs() < 1e-12);
+		assert_eq!(cli.pl_mode, LookupMode::Single, "single mode parsed");
+	}
+
+	#[test]
+	fn point_lookup_mode_flag_parses_single_and_batch() {
+		assert_eq!(expect_run(&["-p", "--pl-mode", "single"]).pl_mode, LookupMode::Single);
+		assert_eq!(expect_run(&["-p", "--pl-mode", "batch"]).pl_mode, LookupMode::Batch);
+		assert_eq!(expect_run(&["-p", "--pl-mode=Batch"]).pl_mode, LookupMode::Batch);
+		assert!(run_cli(&["-p", "--pl-mode", "triple"]).unwrap_err().contains("invalid --pl-mode"));
+	}
+
+	#[test]
+	fn point_lookup_conflicts_are_rejected() {
+		assert!(run_cli(&["--point-lookup", "--synthetic"]).unwrap_err().contains("cannot be combined with `--synthetic`"));
+		assert!(run_cli(&["--point-lookup", "--input", "x.lp"]).unwrap_err().contains("cannot be combined with an input file"));
+		assert!(run_cli(&["--point-lookup", "--field", "v"]).unwrap_err().contains("no meaning"));
+		assert!(run_cli(&["--point-lookup", "--compare"]).unwrap_err().contains("`--compare` has no meaning"));
+	}
+
+	#[test]
+	fn point_lookup_knob_bounds_are_enforced() {
+		assert!(run_cli(&["-p", "--pl-rows", "1"]).unwrap_err().contains(">= 2"));
+		assert!(run_cli(&["-p", "--pl-queries", "0"]).unwrap_err().contains(">= 1"));
+		assert!(run_cli(&["-p", "--pl-absent", "1.5"]).unwrap_err().contains("[0, 1]"));
 	}
 
 	#[test]
