@@ -1302,6 +1302,7 @@ dependencies = [
  "chrono",
  "dsp-line-protocol",
  "dsp-physical-type",
+ "dsp-reduce",
  "rand 0.9.4",
  "rand_chacha 0.9.0",
  "serde",
@@ -1328,6 +1329,17 @@ dependencies = [
  "criterion",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "dsp-reduce"
+version = "0.1.0"
+dependencies = [
+ "bigdecimal",
+ "chrono",
+ "serde",
+ "splimes",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

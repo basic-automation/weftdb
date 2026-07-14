@@ -1,0 +1,12 @@
+[package]
+name = "dsp-reduce"
+version = "0.1.0"
+edition = "2021"
+description = "dsp-reduce: vendor-neutral time-series downsampling reductions (min/max/avg/sum/first/last over an epoch-aligned bucket grid, in BigDecimal)."
+
+[dependencies]
+bigdecimal = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+splimes = { workspace = true }
+thiserror = { workspace = true }
