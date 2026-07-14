@@ -24,7 +24,7 @@ use std::{path::PathBuf, process::ExitCode};
 
 use chrono::Utc;
 use dsp_bench::{
-	report::{default_filename, default_html_filename}, run_point_lookup, run_profile, run_range_fetch, BaselineLinearAdapter, BenchReport, BenchResult, DspAdapter, ForwardFillAdapter, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision
+	report::{default_filename, default_html_filename}, run_compression, run_point_lookup, run_profile, run_range_fetch, BaselineLinearAdapter, BenchReport, BenchResult, CompressionParams, CompressionProfile, DspAdapter, ForwardFillAdapter, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision, ValueShape
 };
 use splimes::{Resolution, Spline};
 
@@ -79,6 +79,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 	}
 	if cli.mode == InputMode::RangeFetch {
 		return run_range_fetch_workload(&cli);
+	}
+	if cli.mode == InputMode::Compression {
+		return run_compression_workload(&cli);
 	}
 
 	// Build the profile from whichever input mode was selected. Synthetic mode
@@ -145,6 +148,20 @@ fn run_range_fetch_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 	let params = RangeFetchParams { seed: cli.seed, point_count: cli.rf_rows, window_rows: cli.rf_window, window_count: cli.rf_windows, regular: !cli.irregular, rows_per_page: cli.rf_rows_per_page };
 	let profile = RangeFetchProfile::new(profile_name, params);
 	let result = run_range_fetch(&profile, cli.reps).map_err(|e| anyhow::anyhow!("range-fetch benchmark run failed: {e}"))?;
+	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
+	let report = BenchReport::with_results(metadata, vec![result]);
+	finish(cli, &report)
+}
+
+/// Run the compression workload: build a seeded [`CompressionProfile`] from the
+/// compression CLI knobs, seal a columnar segment, time a full decode, and persist
+/// the report (headline: realized bytes/point + compression ratio + decode
+/// throughput). No analytic ground truth — correctness is an exact decode round-trip.
+fn run_compression_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
+	let profile_name = cli.name.clone().unwrap_or_else(|| format!("compression-{}", cli.comp_shape.as_str()));
+	let params = CompressionParams { seed: cli.seed, point_count: cli.comp_rows, regular: !cli.irregular, value_shape: cli.comp_shape };
+	let profile = CompressionProfile::new(profile_name, params);
+	let result = run_compression(&profile, cli.reps).map_err(|e| anyhow::anyhow!("compression benchmark run failed: {e}"))?;
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
 	let report = BenchReport::with_results(metadata, vec![result]);
 	finish(cli, &report)
@@ -252,6 +269,10 @@ struct Cli {
 	field: Option<String>,
 	/// Which input mode / workload was selected.
 	mode: InputMode,
+	/// Compression mode: rows sealed into the segment (the stored corpus size).
+	comp_rows: usize,
+	/// Compression mode: the value-column shape (which codec regime to exercise).
+	comp_shape: ValueShape,
 	/// Storage-workload knob (point-lookup / range-fetch): jittered (irregular)
 	/// timestamps instead of a constant-stride regular corpus.
 	irregular: bool,
@@ -316,6 +337,8 @@ enum InputMode {
 	PointLookup,
 	/// The storage-backed range-fetch workload (seals a segment, times windowed reads).
 	RangeFetch,
+	/// The storage-backed compression workload (seals a segment, times a full decode).
+	Compression,
 }
 
 /// What the parsed command line asks the program to do.
@@ -349,12 +372,16 @@ impl Cli {
 		// never hardcodes a second copy of those constants.
 		let pl_defaults = PointLookupParams::default();
 		let rf_defaults = RangeFetchParams::default();
+		let comp_defaults = CompressionParams::default();
 
 		let mut input: Option<PathBuf> = None;
 		let mut field: Option<String> = None;
 		let mut synthetic = false;
 		let mut point_lookup = false;
 		let mut range_fetch = false;
+		let mut compression = false;
+		let mut comp_rows = comp_defaults.point_count;
+		let mut comp_shape = comp_defaults.value_shape;
 		let mut irregular = false;
 		let mut pl_rows = pl_defaults.point_count;
 		let mut pl_queries = pl_defaults.query_count;
@@ -404,6 +431,9 @@ impl Cli {
 				"-s" | "--synthetic" => synthetic = true,
 				"-p" | "--point-lookup" => point_lookup = true,
 				"-r" | "--range-fetch" => range_fetch = true,
+				"-z" | "--compression" => compression = true,
+				"--comp-rows" => comp_rows = parse_points_count(&take_value(&key)?)?,
+				"--comp-shape" => comp_shape = parse_value_shape(&take_value(&key)?)?,
 				"--irregular" | "--pl-irregular" | "--rf-irregular" => irregular = true,
 				"--pl-rows" => pl_rows = parse_points_count(&take_value(&key)?)?,
 				"--pl-queries" => pl_queries = parse_query_count(&take_value(&key)?)?,
@@ -439,18 +469,22 @@ impl Cli {
 			}
 		}
 
-		// Exactly one input mode, with every conflicting flag combination rejected.
-		let mode = resolve_input_mode(synthetic, point_lookup, range_fetch, input.as_ref(), field.as_deref())?;
-		// `--compare` runs the interpolation baseline suite; it has no meaning for the
-		// self-sealing storage workloads.
-		if compare {
-			if let Some(flag) = storage_mode_flag(mode) {
-				return Err(format!("`--compare` has no meaning in `{flag}` mode"));
-			}
-		}
+		// Exactly one workload mode may be selected; the rest default to line protocol.
+		let mode = select_workload_mode(&[(synthetic, InputMode::Synthetic), (point_lookup, InputMode::PointLookup), (range_fetch, InputMode::RangeFetch), (compression, InputMode::Compression)])?;
+		validate_mode(mode, input.as_ref(), field.as_deref(), compare)?;
 
-		Ok(Command::Run(Box::new(Self { input, field, mode, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare, html })))
+		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare, html })))
 	}
+}
+
+/// Select the single workload mode from the `(flag_set, mode)` candidates, defaulting
+/// to line protocol when none is set and rejecting more than one.
+fn select_workload_mode(candidates: &[(bool, InputMode)]) -> Result<InputMode, String> {
+	let selected: Vec<InputMode> = candidates.iter().filter(|(set, _)| *set).map(|(_, m)| *m).collect();
+	if selected.len() > 1 {
+		return Err("only one workload mode may be given (--synthetic / --point-lookup / --range-fetch / --compression)".to_string());
+	}
+	Ok(selected.first().copied().unwrap_or(InputMode::LineProtocol))
 }
 
 /// The flag name for a storage-workload mode (for conflict messages), or `None` for
@@ -459,51 +493,53 @@ const fn storage_mode_flag(mode: InputMode) -> Option<&'static str> {
 	match mode {
 		InputMode::PointLookup => Some("--point-lookup"),
 		InputMode::RangeFetch => Some("--range-fetch"),
+		InputMode::Compression => Some("--compression"),
 		InputMode::LineProtocol | InputMode::Synthetic => None,
 	}
 }
 
-/// Resolve the mutually-exclusive input-mode flags into a single [`InputMode`],
-/// rejecting every conflicting combination.
+/// Validate the selected [`InputMode`] against the input flags, rejecting every
+/// conflicting combination.
 ///
-/// The storage workloads (point-lookup, range-fetch) seal their own corpus, so they
-/// reject every interpolation input flag; synthetic mode generates its own data, so
-/// an input file or `--field` projection is a conflict; line-protocol mode requires
-/// both `--input` and `--field`. (The `--compare` conflict is checked by the caller,
-/// which keeps this to the three mode selectors.)
-fn resolve_input_mode(synthetic: bool, point_lookup: bool, range_fetch: bool, input: Option<&PathBuf>, field: Option<&str>) -> Result<InputMode, String> {
-	if point_lookup && range_fetch {
-		return Err("`--point-lookup` and `--range-fetch` cannot be combined".to_string());
-	}
-	// Both storage workloads share the same rejection set.
-	if let Some(mode_flag) = point_lookup.then_some("--point-lookup").or_else(|| range_fetch.then_some("--range-fetch")) {
-		if synthetic {
-			return Err(format!("`{mode_flag}` cannot be combined with `--synthetic`"));
-		}
+/// The storage workloads (point-lookup, range-fetch, compression) seal their own
+/// corpus, so they reject every interpolation input flag (and `--compare`, which has
+/// no meaning for them); synthetic mode generates its own data, so an input file or
+/// `--field` projection is a conflict; line-protocol mode requires both `--input` and
+/// `--field`. The "exactly one workload mode" check is the caller's, which keeps this
+/// free of the mode-selector booleans.
+fn validate_mode(mode: InputMode, input: Option<&PathBuf>, field: Option<&str>, compare: bool) -> Result<(), String> {
+	if let Some(mode_flag) = storage_mode_flag(mode) {
 		if input.is_some() {
 			return Err(format!("`{mode_flag}` cannot be combined with an input file"));
 		}
 		if field.is_some() {
 			return Err(format!("`--field` has no meaning in `{mode_flag}` mode"));
 		}
-		return Ok(if point_lookup { InputMode::PointLookup } else { InputMode::RangeFetch });
-	}
-	if synthetic {
-		if input.is_some() {
-			return Err("`--synthetic` cannot be combined with an input file".to_string());
+		if compare {
+			return Err(format!("`--compare` has no meaning in `{mode_flag}` mode"));
 		}
-		if field.is_some() {
-			return Err("`--field` has no meaning in `--synthetic` mode".to_string());
+		return Ok(());
+	}
+	match mode {
+		InputMode::Synthetic => {
+			if input.is_some() {
+				return Err("`--synthetic` cannot be combined with an input file".to_string());
+			}
+			if field.is_some() {
+				return Err("`--field` has no meaning in `--synthetic` mode".to_string());
+			}
 		}
-		return Ok(InputMode::Synthetic);
+		InputMode::LineProtocol => {
+			if input.is_none() {
+				return Err("missing required `--input <file.lp>` (or pass `--synthetic` / `--point-lookup` / `--range-fetch` / `--compression`)".to_string());
+			}
+			if field.is_none() {
+				return Err("missing required `--field <name>`".to_string());
+			}
+		}
+		InputMode::PointLookup | InputMode::RangeFetch | InputMode::Compression => unreachable!("handled by storage_mode_flag above"),
 	}
-	if input.is_none() {
-		return Err("missing required `--input <file.lp>` (or pass `--synthetic` / `--point-lookup` / `--range-fetch`)".to_string());
-	}
-	if field.is_none() {
-		return Err("missing required `--field <name>`".to_string());
-	}
-	Ok(InputMode::LineProtocol)
+	Ok(())
 }
 
 /// Parse a timestamp-precision token (`ns`/`us`/`ms`/`s` and long forms).
@@ -596,6 +632,16 @@ fn parse_rows_per_page(s: &str) -> Result<usize, String> {
 	s.parse::<usize>().map_err(|_| format!("invalid --*-rows-per-page `{s}` (expected a non-negative integer; 0 = single-block)"))
 }
 
+/// Parse a compression value-shape token (`clustered` | `trending` | `jitter`).
+fn parse_value_shape(s: &str) -> Result<ValueShape, String> {
+	match s.to_ascii_lowercase().as_str() {
+		"clustered" | "cluster" | "for" => Ok(ValueShape::Clustered),
+		"trending" | "trend" | "counter" => Ok(ValueShape::Trending),
+		"jitter" | "jittery" | "noise" => Ok(ValueShape::Jitter),
+		other => Err(format!("invalid --comp-shape `{other}` (expected clustered|trending|jitter)")),
+	}
+}
+
 /// Parse a point-lookup issue mode token (`single` | `batch`).
 fn parse_lookup_mode(s: &str) -> Result<LookupMode, String> {
 	match s.to_ascii_lowercase().as_str() {
@@ -647,6 +693,7 @@ USAGE:
     dsp-bench --synthetic [OPTIONS]
     dsp-bench --point-lookup [POINT-LOOKUP OPTIONS]
     dsp-bench --range-fetch [RANGE-FETCH OPTIONS]
+    dsp-bench --compression [COMPRESSION OPTIONS]
 
 INPUT MODE (choose one):
     -i, --input <FILE>       Line-protocol input file (.lp / TSBS payload)
@@ -663,6 +710,10 @@ INPUT MODE (choose one):
                              seeded columnar segment and time DSP's windowed range
                              read (only the rows in each window are decoded). Gated
                              against a full decode filtered to the window.
+    -z, --compression        Run the storage-backed compression workload: seal a
+                             seeded columnar segment and report realized bytes/point,
+                             the value-column compression ratio, and decode throughput
+                             (time a full decode). Gated on an exact round-trip.
 
 STORAGE-WORKLOAD OPTIONS (with --point-lookup or --range-fetch):
         --irregular          Jittered timestamps (decode + search/filter) instead of
@@ -683,6 +734,11 @@ RANGE-FETCH OPTIONS (with --range-fetch):
         --rf-windows <N>     Windows fetched per rep (>=1)              [default: 32]
         --rf-rows-per-page <N>  Rows/page; 0 = single-block, >0 = paged  [default: 0]
                              (a paged segment exercises the page-skipping range read)
+
+COMPRESSION OPTIONS (with --compression):
+        --comp-rows <N>      Rows sealed into the segment (>=2)     [default: 20000]
+        --comp-shape <S>     Value shape: clustered|trending|jitter
+                             (each exercises a different codec) [default: clustered]
 
 SYNTHETIC OPTIONS (with --synthetic):
         --seed <N>           Generator seed, decimal or 0x-hex     [default: flagship]
@@ -832,10 +888,29 @@ mod tests {
 
 	#[test]
 	fn range_fetch_conflicts_are_rejected() {
-		assert!(run_cli(&["--range-fetch", "--point-lookup"]).unwrap_err().contains("cannot be combined"));
-		assert!(run_cli(&["--range-fetch", "--synthetic"]).unwrap_err().contains("cannot be combined with `--synthetic`"));
+		assert!(run_cli(&["--range-fetch", "--point-lookup"]).unwrap_err().contains("only one workload mode"));
+		assert!(run_cli(&["--range-fetch", "--synthetic"]).unwrap_err().contains("only one workload mode"));
 		assert!(run_cli(&["--range-fetch", "--input", "x.lp"]).unwrap_err().contains("cannot be combined with an input file"));
 		assert!(run_cli(&["--range-fetch", "--compare"]).unwrap_err().contains("`--compare` has no meaning"));
+	}
+
+	#[test]
+	fn compression_mode_parses_with_knob_defaults_and_conflicts_rejected() {
+		let cli = expect_run(&["--compression"]);
+		assert_eq!(cli.mode, InputMode::Compression);
+		let comp = CompressionParams::default();
+		assert_eq!(cli.comp_rows, comp.point_count);
+		assert_eq!(cli.comp_shape, comp.value_shape);
+		// Knobs parse, including every shape alias.
+		let cli = expect_run(&["-z", "--comp-rows", "7000", "--comp-shape", "trending"]);
+		assert_eq!(cli.comp_rows, 7_000);
+		assert_eq!(cli.comp_shape, ValueShape::Trending);
+		assert_eq!(expect_run(&["-z", "--comp-shape", "jitter"]).comp_shape, ValueShape::Jitter);
+		assert!(run_cli(&["-z", "--comp-shape", "triangle"]).unwrap_err().contains("invalid --comp-shape"));
+		// Conflicts: another mode, an input file, and --compare.
+		assert!(run_cli(&["--compression", "--synthetic"]).unwrap_err().contains("only one workload mode"));
+		assert!(run_cli(&["--compression", "--input", "x.lp"]).unwrap_err().contains("cannot be combined with an input file"));
+		assert!(run_cli(&["--compression", "--compare"]).unwrap_err().contains("`--compare` has no meaning"));
 	}
 
 	#[test]
@@ -855,7 +930,7 @@ mod tests {
 
 	#[test]
 	fn point_lookup_conflicts_are_rejected() {
-		assert!(run_cli(&["--point-lookup", "--synthetic"]).unwrap_err().contains("cannot be combined with `--synthetic`"));
+		assert!(run_cli(&["--point-lookup", "--synthetic"]).unwrap_err().contains("only one workload mode"));
 		assert!(run_cli(&["--point-lookup", "--input", "x.lp"]).unwrap_err().contains("cannot be combined with an input file"));
 		assert!(run_cli(&["--point-lookup", "--field", "v"]).unwrap_err().contains("no meaning"));
 		assert!(run_cli(&["--point-lookup", "--compare"]).unwrap_err().contains("`--compare` has no meaning"));

@@ -44,6 +44,7 @@
 pub mod accuracy;
 pub mod adapter;
 pub mod baseline_adapter;
+pub mod compression;
 pub mod dsp_adapter;
 pub mod forward_fill_adapter;
 pub mod line_protocol;
@@ -60,7 +61,7 @@ use bigdecimal::ToPrimitive;
 use splimes::generate_target_times;
 
 pub use crate::{
-	accuracy::{synthetic_ground_truth, AccuracyError, AccuracyMetrics}, adapter::SystemAdapter, baseline_adapter::BaselineLinearAdapter, dsp_adapter::DspAdapter, forward_fill_adapter::ForwardFillAdapter, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, point_lookup::{run_point_lookup, LookupMode, PointLookupParams, PointLookupProfile}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError, SignalShape, SyntheticParams}, range_fetch::{run_range_fetch, RangeFetchParams, RangeFetchProfile}, report::{BenchReport, RunMetadata}, schema::{BenchResult, CorrectnessReport, DatasetMeta, StorageEstimate, TimingBreakdown, SCHEMA_VERSION}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}
+	accuracy::{synthetic_ground_truth, AccuracyError, AccuracyMetrics}, adapter::SystemAdapter, baseline_adapter::BaselineLinearAdapter, compression::{run_compression, CompressionParams, CompressionProfile, ValueShape}, dsp_adapter::DspAdapter, forward_fill_adapter::ForwardFillAdapter, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, point_lookup::{run_point_lookup, LookupMode, PointLookupParams, PointLookupProfile}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError, SignalShape, SyntheticParams}, range_fetch::{run_range_fetch, RangeFetchParams, RangeFetchProfile}, report::{BenchReport, RunMetadata}, schema::{BenchResult, CorrectnessReport, DatasetMeta, StorageEstimate, TimingBreakdown, SCHEMA_VERSION}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}
 };
 
 /// Workload class label recorded for the interpolation profile.
