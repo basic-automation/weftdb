@@ -31,7 +31,7 @@ use std::time::Instant;
 
 use bigdecimal::{BigDecimal, ToPrimitive};
 use dsp_physical_type::{
-	dspseg::{read_segment_point, read_segment_points}, Segment, TimeUnit
+	dspseg::{read_paged_segment_point, read_paged_segment_points, read_segment_point, read_segment_points}, PagedSegment, Segment, TimeUnit
 };
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -93,13 +93,16 @@ pub struct PointLookupParams {
 	pub absent_fraction: f64,
 	/// How the batch is issued (single per-instant reads vs one amortized batch read).
 	pub mode: LookupMode,
+	/// Rows per page when sealing a **paged** segment (exercises the on-disk
+	/// page-pruning read path). `0` seals a single-block segment instead.
+	pub rows_per_page: usize,
 }
 
 impl Default for PointLookupParams {
 	/// The flagship point-lookup knob set: 20 000 regular rows, a 128-instant batch
-	/// read with 25% deliberate misses.
+	/// read with 25% deliberate misses, sealed as a single-block segment.
 	fn default() -> Self {
-		Self { seed: DEFAULT_POINT_LOOKUP_SEED, point_count: 20_000, query_count: 128, regular: true, absent_fraction: 0.25, mode: LookupMode::Batch }
+		Self { seed: DEFAULT_POINT_LOOKUP_SEED, point_count: 20_000, query_count: 128, regular: true, absent_fraction: 0.25, mode: LookupMode::Batch, rows_per_page: 0 }
 	}
 }
 
@@ -138,6 +141,8 @@ pub struct PointLookupProfile {
 	pub absent_fraction: f64,
 	/// How the batch is issued.
 	pub mode: LookupMode,
+	/// Rows per page for a paged segment; `0` seals a single-block segment.
+	pub rows_per_page: usize,
 }
 
 impl PointLookupProfile {
@@ -158,8 +163,8 @@ impl PointLookupProfile {
 	/// Build a point-lookup profile from an explicit [`PointLookupParams`] knob set.
 	#[must_use]
 	pub fn new(name: impl Into<String>, params: PointLookupParams) -> Self {
-		let PointLookupParams { seed, point_count, query_count, regular, absent_fraction, mode } = params;
-		Self { name: name.into(), seed, point_count: point_count.max(2), query_count: query_count.max(1), regular, absent_fraction: absent_fraction.clamp(0.0, 1.0), mode }
+		let PointLookupParams { seed, point_count, query_count, regular, absent_fraction, mode, rows_per_page } = params;
+		Self { name: name.into(), seed, point_count: point_count.max(2), query_count: query_count.max(1), regular, absent_fraction: absent_fraction.clamp(0.0, 1.0), mode, rows_per_page }
 	}
 
 	/// Generate the seeded, sorted `(timestamps, values)` corpus.
@@ -244,13 +249,15 @@ fn span_ns(since: Instant) -> u64 {
 
 /// Resolve every query in `queries` against `bytes` in the requested `mode`.
 ///
-/// `Single` issues one `read_segment_point` per instant; `Batch` issues one
-/// `read_segment_points` for the whole slice. Both return values aligned to
-/// `queries`.
-fn resolve(bytes: &[u8], queries: &[i64], mode: LookupMode) -> anyhow::Result<Vec<Option<BigDecimal>>> {
-	match mode {
-		LookupMode::Single => queries.iter().map(|&t| read_segment_point(bytes, t).map_err(anyhow::Error::from)).collect(),
-		LookupMode::Batch => read_segment_points(bytes, queries).map_err(anyhow::Error::from),
+/// `Single` issues one point read per instant; `Batch` issues one batch read for the
+/// whole slice. `paged` selects the paged-segment readers (page pruning) over the
+/// single-block readers. Both return values aligned to `queries`.
+fn resolve(bytes: &[u8], queries: &[i64], mode: LookupMode, paged: bool) -> anyhow::Result<Vec<Option<BigDecimal>>> {
+	match (mode, paged) {
+		(LookupMode::Single, false) => queries.iter().map(|&t| read_segment_point(bytes, t).map_err(anyhow::Error::from)).collect(),
+		(LookupMode::Batch, false) => read_segment_points(bytes, queries).map_err(anyhow::Error::from),
+		(LookupMode::Single, true) => queries.iter().map(|&t| read_paged_segment_point(bytes, t).map_err(anyhow::Error::from)).collect(),
+		(LookupMode::Batch, true) => read_paged_segment_points(bytes, queries).map_err(anyhow::Error::from),
 	}
 }
 
@@ -279,21 +286,28 @@ pub fn run_point_lookup(profile: &PointLookupProfile, reps: usize) -> anyhow::Re
 
 	let setup_start = Instant::now();
 	let (timestamps, values) = profile.generate();
-	let segment = Segment::build_sorted(&timestamps, &values, SEGMENT_UNIT, &BigDecimal::from(0)).map_err(|e| anyhow::anyhow!("cannot seal point-lookup segment: {e:?}"))?;
-	let bytes = segment.write_to();
 	let queries = profile.queries(&timestamps);
+	let paged = profile.rows_per_page > 0;
+	// Seal the corpus once (single-block or paged) and compute the full-decode ground
+	// truth for the correctness gate from the same in-memory segment. `value_at`
+	// searches the already-decoded segment, so the reference is cheap and independent
+	// of the streaming read path under test.
+	let (bytes, expected): (Vec<u8>, Vec<Option<BigDecimal>>) = if paged {
+		let segment = PagedSegment::build(&timestamps, &values, SEGMENT_UNIT, &BigDecimal::from(0), profile.rows_per_page).map_err(|e| anyhow::anyhow!("cannot seal paged point-lookup segment: {e:?}"))?;
+		let expected = queries.iter().map(|&t| segment.value_at(t)).collect();
+		(segment.write_to(), expected)
+	} else {
+		let segment = Segment::build_sorted(&timestamps, &values, SEGMENT_UNIT, &BigDecimal::from(0)).map_err(|e| anyhow::anyhow!("cannot seal point-lookup segment: {e:?}"))?;
+		let expected = queries.iter().map(|&t| segment.value_at(t)).collect();
+		(segment.write_to(), expected)
+	};
 	let setup_ns = span_ns(setup_start);
-
-	// Ground truth for the correctness gate: the full-decode value at each query.
-	// `value_at` searches the in-memory (already-decoded) segment, so this reference
-	// is cheap and independent of the streaming read path under test.
-	let expected: Vec<Option<BigDecimal>> = queries.iter().map(|&t| segment.value_at(t)).collect();
 
 	let mut samples_ns: Vec<u64> = Vec::with_capacity(reps);
 	let mut last_output: Vec<Option<BigDecimal>> = Vec::new();
 	for _ in 0..reps {
 		let t0 = Instant::now();
-		let output = resolve(&bytes, &queries, profile.mode)?;
+		let output = resolve(&bytes, &queries, profile.mode, paged)?;
 		samples_ns.push(span_ns(t0));
 		last_output = output;
 	}
@@ -417,8 +431,8 @@ mod tests {
 		let segment = Segment::build_sorted(&ts, &vals, SEGMENT_UNIT, &BigDecimal::from(0)).expect("seals");
 		let bytes = segment.write_to();
 		let queries = small(true, LookupMode::Batch).queries(&ts);
-		let single = resolve(&bytes, &queries, LookupMode::Single).expect("single resolves");
-		let batch = resolve(&bytes, &queries, LookupMode::Batch).expect("batch resolves");
+		let single = resolve(&bytes, &queries, LookupMode::Single, false).expect("single resolves");
+		let batch = resolve(&bytes, &queries, LookupMode::Batch, false).expect("batch resolves");
 		assert_eq!(single, batch, "single and batch reads must agree");
 		// And both must equal the full-decode ground truth.
 		let truth: Vec<Option<BigDecimal>> = queries.iter().map(|&t| segment.value_at(t)).collect();
@@ -433,6 +447,21 @@ mod tests {
 		let result = run_point_lookup(&profile, 2).expect("all-absent run succeeds");
 		assert!(result.correctness.passed(), "an all-miss batch must still pass: {:?}", result.correctness);
 		assert!(result.is_publishable());
+	}
+
+	#[test]
+	fn paged_run_passes_correctness_over_the_page_pruning_read_path() {
+		// A paged segment (rows_per_page > 0) drives the paged readers; the streaming
+		// paged read must still equal the full-decode value_at for every instant, on
+		// both corpus shapes and both issue modes.
+		for regular in [true, false] {
+			for mode in [LookupMode::Single, LookupMode::Batch] {
+				let profile = PointLookupProfile::new("pl-paged", PointLookupParams { point_count: 3_000, query_count: 48, regular, mode, rows_per_page: 512, ..PointLookupParams::default() });
+				let result = run_point_lookup(&profile, 2).expect("paged point-lookup run succeeds");
+				assert!(result.correctness.passed(), "paged correctness must pass (regular={regular}, mode={mode:?}): {:?}", result.correctness);
+				assert!(result.is_publishable());
+			}
+		}
 	}
 
 	#[test]

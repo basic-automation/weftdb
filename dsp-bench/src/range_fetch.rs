@@ -20,7 +20,9 @@
 use std::time::Instant;
 
 use bigdecimal::{BigDecimal, ToPrimitive};
-use dsp_physical_type::{dspseg::read_segment_range, Segment, TimeUnit};
+use dsp_physical_type::{
+	dspseg::{read_paged_segment_range, read_segment_range}, PagedSegment, Segment, TimeUnit
+};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
@@ -61,13 +63,17 @@ pub struct RangeFetchParams {
 	/// Constant-stride timestamps (`true` — closed-form window) vs jittered
 	/// strictly-increasing timestamps (`false` — decode + filter).
 	pub regular: bool,
+	/// Rows per page when sealing a **paged** segment (exercises the on-disk
+	/// page-skipping range read). `0` seals a single-block segment instead.
+	pub rows_per_page: usize,
 }
 
 impl Default for RangeFetchParams {
 	/// The flagship range-fetch knob set: a 20 000-row segment, 32 windows of 100
-	/// rows each (a selective range over a large segment — the windowed read's regime).
+	/// rows each (a selective range over a large segment — the windowed read's
+	/// regime), sealed as a single-block segment.
 	fn default() -> Self {
-		Self { seed: DEFAULT_RANGE_FETCH_SEED, point_count: 20_000, window_rows: 100, window_count: 32, regular: true }
+		Self { seed: DEFAULT_RANGE_FETCH_SEED, point_count: 20_000, window_rows: 100, window_count: 32, regular: true, rows_per_page: 0 }
 	}
 }
 
@@ -94,6 +100,8 @@ pub struct RangeFetchProfile {
 	pub window_count: usize,
 	/// Constant-stride (regular) vs jittered (irregular) timestamps.
 	pub regular: bool,
+	/// Rows per page for a paged segment; `0` seals a single-block segment.
+	pub rows_per_page: usize,
 }
 
 impl RangeFetchProfile {
@@ -114,8 +122,8 @@ impl RangeFetchProfile {
 	/// Build a range-fetch profile from an explicit [`RangeFetchParams`] knob set.
 	#[must_use]
 	pub fn new(name: impl Into<String>, params: RangeFetchParams) -> Self {
-		let RangeFetchParams { seed, point_count, window_rows, window_count, regular } = params;
-		Self { name: name.into(), seed, point_count: point_count.max(2), window_rows: window_rows.max(1), window_count: window_count.max(1), regular }
+		let RangeFetchParams { seed, point_count, window_rows, window_count, regular, rows_per_page } = params;
+		Self { name: name.into(), seed, point_count: point_count.max(2), window_rows: window_rows.max(1), window_count: window_count.max(1), regular, rows_per_page }
 	}
 
 	/// Generate the seeded, sorted `(timestamps, values)` corpus (identical shape to
@@ -176,9 +184,10 @@ fn span_ns(since: Instant) -> u64 {
 }
 
 /// Fetch every window in `windows` against `bytes`, returning the per-window
-/// `(timestamps, values)` result.
-fn fetch(bytes: &[u8], windows: &[(i64, i64)]) -> anyhow::Result<Vec<WindowRows>> {
-	windows.iter().map(|&(start, end)| read_segment_range(bytes, start, end).map_err(anyhow::Error::from)).collect()
+/// `(timestamps, values)` result. `paged` selects the paged range reader (on-disk
+/// page skipping) over the single-block one.
+fn fetch(bytes: &[u8], windows: &[(i64, i64)], paged: bool) -> anyhow::Result<Vec<WindowRows>> {
+	windows.iter().map(|&(start, end)| if paged { read_paged_segment_range(bytes, start, end) } else { read_segment_range(bytes, start, end) }.map_err(anyhow::Error::from)).collect()
 }
 
 /// Run a range-fetch profile for `reps` timed repetitions and return a
@@ -202,22 +211,30 @@ pub fn run_range_fetch(profile: &RangeFetchProfile, reps: usize) -> anyhow::Resu
 
 	let setup_start = Instant::now();
 	let (timestamps, values) = profile.generate();
-	let segment = Segment::build_sorted(&timestamps, &values, SEGMENT_UNIT, &BigDecimal::from(0)).map_err(|e| anyhow::anyhow!("cannot seal range-fetch segment: {e:?}"))?;
-	let bytes = segment.write_to();
 	let windows = profile.windows(&timestamps);
+	let paged = profile.rows_per_page > 0;
+	// Seal the corpus once (single-block or paged) and take the full-decode ground
+	// truth from the same in-memory segment. `decode_nullable` reads the
+	// already-decoded segment, so the reference is independent of the windowed read
+	// path under test.
+	let (bytes, all_ts, all_vals) = if paged {
+		let segment = PagedSegment::build(&timestamps, &values, SEGMENT_UNIT, &BigDecimal::from(0), profile.rows_per_page).map_err(|e| anyhow::anyhow!("cannot seal paged range-fetch segment: {e:?}"))?;
+		let (t, v) = segment.decode_nullable();
+		(segment.write_to(), t, v)
+	} else {
+		let segment = Segment::build_sorted(&timestamps, &values, SEGMENT_UNIT, &BigDecimal::from(0)).map_err(|e| anyhow::anyhow!("cannot seal range-fetch segment: {e:?}"))?;
+		let (t, v) = segment.decode_nullable();
+		(segment.write_to(), t, v)
+	};
 	let setup_ns = span_ns(setup_start);
 
-	// Ground truth: a full decode filtered to each window. `decode_nullable` reads the
-	// already-decoded in-memory segment, so this reference is independent of the
-	// windowed read path under test.
-	let (all_ts, all_vals) = segment.decode_nullable();
 	let expected: Vec<WindowRows> = windows.iter().map(|&(start, end)| all_ts.iter().copied().zip(all_vals.iter().cloned()).filter(|(t, _)| start <= *t && *t <= end).unzip()).collect();
 
 	let mut samples_ns: Vec<u64> = Vec::with_capacity(reps);
 	let mut last_output: Vec<WindowRows> = Vec::new();
 	for _ in 0..reps {
 		let t0 = Instant::now();
-		let output = fetch(&bytes, &windows)?;
+		let output = fetch(&bytes, &windows, paged)?;
 		samples_ns.push(span_ns(t0));
 		last_output = output;
 	}
@@ -333,6 +350,19 @@ mod tests {
 				let expected: (Vec<i64>, Vec<Option<BigDecimal>>) = all_ts.iter().copied().zip(all_vals.iter().cloned()).filter(|(t, _)| start <= *t && *t <= end).unzip();
 				assert_eq!((wt, wv), expected, "windowed read must equal full-decode filter (regular={regular})");
 			}
+		}
+	}
+
+	#[test]
+	fn paged_run_passes_correctness_over_the_page_skipping_read_path() {
+		// A paged segment (rows_per_page > 0) drives the paged range reader (on-disk
+		// page skipping); the windowed read must still equal the full-decode-filtered
+		// window on both corpus shapes.
+		for regular in [true, false] {
+			let profile = RangeFetchProfile::new("rf-paged", RangeFetchParams { point_count: 3_000, window_rows: 60, window_count: 12, regular, rows_per_page: 512, ..RangeFetchParams::default() });
+			let result = run_range_fetch(&profile, 2).expect("paged range-fetch run succeeds");
+			assert!(result.correctness.passed(), "paged correctness must pass (regular={regular}): {:?}", result.correctness);
+			assert!(result.is_publishable());
 		}
 	}
 

@@ -125,7 +125,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 /// no accuracy, only latency, throughput, and the north-star storage estimate.
 fn run_point_lookup_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 	let profile_name = cli.name.clone().unwrap_or_else(|| if cli.irregular { "point-lookup-irregular".to_string() } else { "point-lookup-regular".to_string() });
-	let params = PointLookupParams { seed: cli.seed, point_count: cli.pl_rows, query_count: cli.pl_queries, regular: !cli.irregular, absent_fraction: cli.pl_absent, mode: cli.pl_mode };
+	let params = PointLookupParams { seed: cli.seed, point_count: cli.pl_rows, query_count: cli.pl_queries, regular: !cli.irregular, absent_fraction: cli.pl_absent, mode: cli.pl_mode, rows_per_page: cli.pl_rows_per_page };
 	let profile = PointLookupProfile::new(profile_name, params);
 	let result = run_point_lookup(&profile, cli.reps).map_err(|e| anyhow::anyhow!("point-lookup benchmark run failed: {e}"))?;
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
@@ -142,7 +142,7 @@ fn run_point_lookup_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 /// throughput, and the storage estimate but no accuracy.
 fn run_range_fetch_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 	let profile_name = cli.name.clone().unwrap_or_else(|| if cli.irregular { "range-fetch-irregular".to_string() } else { "range-fetch-regular".to_string() });
-	let params = RangeFetchParams { seed: cli.seed, point_count: cli.rf_rows, window_rows: cli.rf_window, window_count: cli.rf_windows, regular: !cli.irregular };
+	let params = RangeFetchParams { seed: cli.seed, point_count: cli.rf_rows, window_rows: cli.rf_window, window_count: cli.rf_windows, regular: !cli.irregular, rows_per_page: cli.rf_rows_per_page };
 	let profile = RangeFetchProfile::new(profile_name, params);
 	let result = run_range_fetch(&profile, cli.reps).map_err(|e| anyhow::anyhow!("range-fetch benchmark run failed: {e}"))?;
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
@@ -263,12 +263,16 @@ struct Cli {
 	pl_absent: f64,
 	/// Point-lookup mode: how the query batch is issued (single reads vs one batch).
 	pl_mode: LookupMode,
+	/// Point-lookup mode: rows per page (`0` = single-block; `>0` = paged segment).
+	pl_rows_per_page: usize,
 	/// Range-fetch mode: rows sealed into the segment (the stored corpus size).
 	rf_rows: usize,
 	/// Range-fetch mode: rows spanned by each fetched window (the selectivity).
 	rf_window: usize,
 	/// Range-fetch mode: number of windows fetched per timed rep.
 	rf_windows: usize,
+	/// Range-fetch mode: rows per page (`0` = single-block; `>0` = paged segment).
+	rf_rows_per_page: usize,
 	/// Synthetic generator seed (published for reproducibility).
 	seed: u64,
 	/// Synthetic post-missingness target sample count.
@@ -356,9 +360,11 @@ impl Cli {
 		let mut pl_queries = pl_defaults.query_count;
 		let mut pl_absent = pl_defaults.absent_fraction;
 		let mut pl_mode = pl_defaults.mode;
+		let mut pl_rows_per_page = pl_defaults.rows_per_page;
 		let mut rf_rows = rf_defaults.point_count;
 		let mut rf_window = rf_defaults.window_rows;
 		let mut rf_windows = rf_defaults.window_count;
+		let mut rf_rows_per_page = rf_defaults.rows_per_page;
 		let mut seed = defaults.seed;
 		let mut points = defaults.input_points;
 		let mut missingness = defaults.missingness_fraction;
@@ -403,9 +409,11 @@ impl Cli {
 				"--pl-queries" => pl_queries = parse_query_count(&take_value(&key)?)?,
 				"--pl-absent" => pl_absent = parse_fraction(&take_value(&key)?, "pl-absent")?,
 				"--pl-mode" => pl_mode = parse_lookup_mode(&take_value(&key)?)?,
+				"--pl-rows-per-page" => pl_rows_per_page = parse_rows_per_page(&take_value(&key)?)?,
 				"--rf-rows" => rf_rows = parse_points_count(&take_value(&key)?)?,
 				"--rf-window" => rf_window = parse_query_count(&take_value(&key)?)?,
 				"--rf-windows" => rf_windows = parse_query_count(&take_value(&key)?)?,
+				"--rf-rows-per-page" => rf_rows_per_page = parse_rows_per_page(&take_value(&key)?)?,
 				"--seed" => seed = parse_seed(&take_value(&key)?)?,
 				"--points" => points = parse_points_count(&take_value(&key)?)?,
 				"--missingness" => missingness = parse_fraction(&take_value(&key)?, "missingness")?,
@@ -441,7 +449,7 @@ impl Cli {
 			}
 		}
 
-		Ok(Command::Run(Box::new(Self { input, field, mode, irregular, pl_rows, pl_queries, pl_absent, pl_mode, rf_rows, rf_window, rf_windows, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare, html })))
+		Ok(Command::Run(Box::new(Self { input, field, mode, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare, html })))
 	}
 }
 
@@ -582,6 +590,12 @@ fn parse_query_count(s: &str) -> Result<usize, String> {
 	Ok(n)
 }
 
+/// Parse a rows-per-page value for the storage workloads. `0` (single-block) is
+/// allowed; any positive count seals a paged segment.
+fn parse_rows_per_page(s: &str) -> Result<usize, String> {
+	s.parse::<usize>().map_err(|_| format!("invalid --*-rows-per-page `{s}` (expected a non-negative integer; 0 = single-block)"))
+}
+
 /// Parse a point-lookup issue mode token (`single` | `batch`).
 fn parse_lookup_mode(s: &str) -> Result<LookupMode, String> {
 	match s.to_ascii_lowercase().as_str() {
@@ -660,11 +674,15 @@ POINT-LOOKUP OPTIONS (with --point-lookup):
         --pl-absent <F>      Off-grid-miss fraction in [0, 1]          [default: 0.25]
         --pl-mode <M>        Issue mode: single|batch                [default: batch]
                              (batch amortizes the timestamp decode across the batch)
+        --pl-rows-per-page <N>  Rows/page; 0 = single-block, >0 = paged  [default: 0]
+                             (a paged segment exercises the page-pruning read path)
 
 RANGE-FETCH OPTIONS (with --range-fetch):
         --rf-rows <N>        Rows sealed into the segment (>=2)     [default: 20000]
         --rf-window <N>      Rows spanned by each fetched window (>=1)  [default: 100]
         --rf-windows <N>     Windows fetched per rep (>=1)              [default: 32]
+        --rf-rows-per-page <N>  Rows/page; 0 = single-block, >0 = paged  [default: 0]
+                             (a paged segment exercises the page-skipping range read)
 
 SYNTHETIC OPTIONS (with --synthetic):
         --seed <N>           Generator seed, decimal or 0x-hex     [default: flagship]
@@ -796,6 +814,20 @@ mod tests {
 		assert_eq!(cli.rf_window, 250);
 		assert_eq!(cli.rf_windows, 48);
 		assert!(cli.irregular);
+	}
+
+	#[test]
+	fn rows_per_page_parses_zero_and_positive_for_both_storage_workloads() {
+		// The default is single-block (0) for both.
+		let pl = PointLookupParams::default();
+		let rf = RangeFetchParams::default();
+		assert_eq!(expect_run(&["-p"]).pl_rows_per_page, pl.rows_per_page);
+		assert_eq!(expect_run(&["-r"]).rf_rows_per_page, rf.rows_per_page);
+		// A positive value seals a paged segment; 0 is explicitly allowed.
+		assert_eq!(expect_run(&["-p", "--pl-rows-per-page", "512"]).pl_rows_per_page, 512);
+		assert_eq!(expect_run(&["-r", "--rf-rows-per-page", "1024"]).rf_rows_per_page, 1_024);
+		assert_eq!(expect_run(&["-p", "--pl-rows-per-page", "0"]).pl_rows_per_page, 0);
+		assert!(run_cli(&["-p", "--pl-rows-per-page", "-1"]).unwrap_err().contains("rows-per-page"));
 	}
 
 	#[test]
