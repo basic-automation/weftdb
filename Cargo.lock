@@ -1355,6 +1355,7 @@ dependencies = [
  "dsp-arrow-store",
  "dsp-line-protocol",
  "dsp-physical-type",
+ "dsp-reduce",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
