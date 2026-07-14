@@ -158,7 +158,8 @@ pattern_pipeline), `datasets/`, `runners/` (local, docker_compose, cloud),
 - [x] CLI runner — `.lp`/TSBS input or `--synthetic` (seed/points/missingness/jitter/noise/shape knobs); non-zero exit on correctness failure
 - [ ] External-engine adapters — DuckDB first, then ClickHouse, InfluxDB 3, QuestDB, TimescaleDB (+ IoTDB)
 - [ ] Full TSBS-compatible comparison harness (ILP parser shipped; harness pending)
-- [ ] Additional workloads — bulk-ingest growth curves (1M→10M→100M→1B), online ingest+query, raw range fetch, point lookup, downsample (min/max/avg/count, OHLC, TWA, percentiles), gap fill, compression, compressed query, analytics pipeline
+- [x] **Storage/read/aggregation workloads shipped (2026-07-14)** — `point_lookup` (streaming point read, single/paged/batch, regular closed-form vs irregular), `range_fetch` (windowed range read), `compression` (realized bytes/point + value-column compression ratio + decode throughput), and `downsample` (the full reduction set: min/max/avg/sum/first/last + **p50/p90/p95/p99 percentiles** + **TWA**). Each is a parallel `run_*` runner over the `.dspseg`/`dsp-reduce` hot path with a correctness gate, p50/p95/p99 latency, and a `--point-lookup`/`--range-fetch`/`--compression`/`--downsample` CLI mode; storage workloads take a `rows_per_page` paged-segment path. OHLC is open/high/low/close = first/max/min/last (already covered by the shipped reductions).
+- [ ] Remaining workloads — bulk-ingest growth curves (1M→10M→100M→1B), online ingest+query, gap fill, compressed query, analytics pipeline
 - [ ] Fair-protocol depth (Phase 1.1) — ≥10 reps for short tests, cold/warm/hot/post-compaction/post-restart separation, saturation curves (batch size, clients, writers, query concurrency, cardinality, dataset size, GPU output size), seeded randomized query mixes (published seeds), failure tests (restart during ingest, crash during compaction, network retry, partial/corrupt segment), independent-reproducibility packaging (versions, SHAs, images, configs, hardware, drivers, command lines, raw artifacts)
 - [ ] Fair interpolation comparisons (Phase 1.2) — report three classes where possible: (A) native in-DB (Timescale gapfill, QuestDB `SAMPLE BY … FILL`, InfluxQL/SQL fill, ClickHouse ASOF/window, DuckDB window fns, IoTDB fns); (B) portable SQL baseline; (C) client-side end-to-end. Don't hide unfavorable results.
 - [ ] Remaining hardware capture — disk, GPU, and driver versions in run metadata
@@ -794,14 +795,40 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 
 ## Immediate next actions
 
-- [ ] **NEXT (capstone of the 2026-07-13 read-path arc) — `dsp-bench` `point_lookup` workload:**
-  the point/range streaming read (single/paged/batch/closed-form, all benchmarked at the codec
-  layer) now needs a customer-facing harness workload. Add a parallel `run_point_lookup` runner + a
-  storage-backed adapter path (seal a `Segment` from the profile dataset, drive
-  `read_point`/`read_points`) + a `point_lookup` profile (regular + irregular datasets), measuring
-  p50/p95/p99 latency — the `run` path is deeply interpolation-shaped, so this is a parallel runner,
-  not an extension. Foundation for the cross-engine point-lookup comparison vs ClickHouse
-  ASOF/QuestDB, and the evidence for the *When DSP beats general TSDBs* point-lookup positioning.
+- [x] **DONE (2026-07-14, capstone of the 2026-07-13 read-path arc) — `dsp-bench` `point_lookup` workload
+  + the full storage/read/aggregation suite:** shipped `run_point_lookup` (parallel runner sealing a
+  `dsp-physical-type` `Segment` and timing `dspseg::read_segment_point`/`read_segment_points`, single &
+  batch, regular closed-form vs irregular, single-block & paged, present + off-grid queries) with a
+  correctness gate vs the full-decode `value_at`, p50/p95/p99 + CIs, and a `--point-lookup` CLI mode.
+  Measured (release, 100k-row FOR segment, 128-instant batch): regular batch p50=749µs / 169k lookups·s⁻¹,
+  irregular batch p50=2.67ms; batch amortizes ~37× over N single reads; closed-form regular ~3.6× the
+  irregular decode+search. Landed alongside the sibling `range_fetch`, `compression`, and `downsample`
+  workloads (see Phase 1 shipped-workloads item) and the shared `dsp-reduce` crate.
+- [x] **NEW — cross-engine point-lookup comparison** is the residue: DSP's own point-lookup is now
+  benchmarked; wiring ClickHouse ASOF / QuestDB behind the same workload (needs the external adapters
+  below) is the next step, and the evidence for the *When DSP beats general TSDBs* point-lookup page.
+- [x] **`dsp-reduce` crate + downsample reduction (2026-07-14):** new vendor-neutral leaf crate
+  (`Aggregation`/`Bucket`/`reduce`, BigDecimal, epoch-grid buckets) that the HTTP `downsample` endpoint
+  was **deduplicated onto** (server no longer carries its own copy) and the `dsp-bench` `downsample`
+  workload drives. Full reduction set: min/max/avg/sum/first/last + nearest-rank **p50/p90/p95/p99** +
+  **TWA** (LOCF dwell-weighting). Runtime-verified against the live `/api/v1/downsample` endpoint.
+- [ ] **NEXT — approximate mergeable quantiles (DDSketch / UDDSketch):** the shipped percentiles are
+  *exact* nearest-rank, which materializes the whole bucket (O(bucket) memory, not mergeable across
+  segments). Add a fully-mergeable **DDSketch** (relative-error bound, Datadog) or **UDDSketch**
+  (fixed-size, constant relative accuracy) sketch aggregation for bounded-memory approximate percentiles
+  on large buckets and streaming/cross-segment merges — the standard TSDB approach for p99 latency
+  monitoring. *(src: DDSketch, PVLDB'19 — https://dl.acm.org/doi/10.14778/3352063.3352135 ·
+  https://arxiv.org/abs/1908.10693 · UDDSketch)*
+- [ ] **NEXT — linear (trapezoidal) TWA method beside the shipped LOCF weighting:** TimescaleDB's
+  time-weighted average offers **two** methods — LOCF (constant until the next sample; what DSP shipped,
+  best for change-only sensors) and **linear** (values interpolated on the line between measurements,
+  best for irregularly-sampled continuous signals). Add the linear/trapezoidal variant (`Σ½(vᵢ+vᵢ₊₁)Δtᵢ /
+  ΣΔtᵢ`) as a selectable method, and evaluate the *last-point-to-bucket-end* weighting option. *(src:
+  https://docs.timescale.com/use-timescale/latest/hyperfunctions/time-weighted-averages/time-weighted-average/
+  · last-point-to-range-end — https://github.com/timescale/timescaledb-toolkit/discussions/697)*
+- [ ] **NEXT — server ILP `parse_aggregation_token` should adopt `dsp_reduce::Aggregation::from_token`:**
+  the shared parser now exists (case-insensitive, `median`/`time_weighted_avg` aliases); the server's ILP
+  query-param path still hand-matches tokens. Fold it onto `from_token` to remove the last duplicate.
 - [x] Create `dsp-bench` as a first-class workspace member
 - [x] Define the first benchmark profile: `interpolation-heavy-irregular`
 - [x] DSP adapter + portable baselines (linear class-C, forward-fill class-B) + accuracy scoring + shape-selectable ground truth
