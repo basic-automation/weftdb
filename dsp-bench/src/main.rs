@@ -24,7 +24,7 @@ use std::{path::PathBuf, process::ExitCode};
 
 use chrono::Utc;
 use dsp_bench::{
-	report::{default_filename, default_html_filename}, run_compression, run_point_lookup, run_profile, run_range_fetch, BaselineLinearAdapter, BenchReport, BenchResult, CompressionParams, CompressionProfile, DspAdapter, ForwardFillAdapter, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision, ValueShape
+	report::{default_filename, default_html_filename}, run_compression, run_downsample, run_point_lookup, run_profile, run_range_fetch, BaselineLinearAdapter, BenchReport, BenchResult, CompressionParams, CompressionProfile, DownsampleParams, DownsampleProfile, DspAdapter, ForwardFillAdapter, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision, ValueShape
 };
 use splimes::{Resolution, Spline};
 
@@ -82,6 +82,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 	}
 	if cli.mode == InputMode::Compression {
 		return run_compression_workload(&cli);
+	}
+	if cli.mode == InputMode::Downsample {
+		return run_downsample_workload(&cli);
 	}
 
 	// Build the profile from whichever input mode was selected. Synthetic mode
@@ -162,6 +165,20 @@ fn run_compression_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 	let params = CompressionParams { seed: cli.seed, point_count: cli.comp_rows, regular: !cli.irregular, value_shape: cli.comp_shape };
 	let profile = CompressionProfile::new(profile_name, params);
 	let result = run_compression(&profile, cli.reps).map_err(|e| anyhow::anyhow!("compression benchmark run failed: {e}"))?;
+	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
+	let report = BenchReport::with_results(metadata, vec![result]);
+	finish(cli, &report)
+}
+
+/// Run the downsample workload: build a seeded [`DownsampleProfile`] from the
+/// downsample CLI knobs, generate a dense series, and time DSP's canonical reduction
+/// (`dsp-reduce`) into grid-aligned buckets. No analytic ground truth — correctness
+/// is that the reduction is total (the bucket counts sum to the input size).
+fn run_downsample_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
+	let profile_name = cli.name.clone().unwrap_or_else(|| "downsample".to_string());
+	let params = DownsampleParams { seed: cli.seed, point_count: cli.ds_points, input_stride_secs: cli.ds_stride, bucket_resolution: cli.ds_bucket, ..DownsampleParams::default() };
+	let profile = DownsampleProfile::new(profile_name, params);
+	let result = run_downsample(&profile, cli.reps).map_err(|e| anyhow::anyhow!("downsample benchmark run failed: {e}"))?;
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
 	let report = BenchReport::with_results(metadata, vec![result]);
 	finish(cli, &report)
@@ -281,6 +298,12 @@ struct Cli {
 	comp_rows: usize,
 	/// Compression mode: the value-column shape (which codec regime to exercise).
 	comp_shape: ValueShape,
+	/// Downsample mode: input sample count.
+	ds_points: usize,
+	/// Downsample mode: input sample spacing, in seconds.
+	ds_stride: i64,
+	/// Downsample mode: bucket resolution the series is reduced to.
+	ds_bucket: Resolution,
 	/// Storage-workload knob (point-lookup / range-fetch): jittered (irregular)
 	/// timestamps instead of a constant-stride regular corpus.
 	irregular: bool,
@@ -347,6 +370,8 @@ enum InputMode {
 	RangeFetch,
 	/// The storage-backed compression workload (seals a segment, times a full decode).
 	Compression,
+	/// The downsample workload (reduces a generated series into grid-aligned buckets).
+	Downsample,
 }
 
 /// What the parsed command line asks the program to do.
@@ -381,6 +406,7 @@ impl Cli {
 		let pl_defaults = PointLookupParams::default();
 		let rf_defaults = RangeFetchParams::default();
 		let comp_defaults = CompressionParams::default();
+		let ds_defaults = DownsampleParams::default();
 
 		let mut input: Option<PathBuf> = None;
 		let mut field: Option<String> = None;
@@ -388,18 +414,12 @@ impl Cli {
 		let mut point_lookup = false;
 		let mut range_fetch = false;
 		let mut compression = false;
-		let mut comp_rows = comp_defaults.point_count;
-		let mut comp_shape = comp_defaults.value_shape;
+		let mut downsample = false;
+		let (mut comp_rows, mut comp_shape) = (comp_defaults.point_count, comp_defaults.value_shape);
+		let (mut ds_points, mut ds_stride, mut ds_bucket) = (ds_defaults.point_count, ds_defaults.input_stride_secs, ds_defaults.bucket_resolution);
 		let mut irregular = false;
-		let mut pl_rows = pl_defaults.point_count;
-		let mut pl_queries = pl_defaults.query_count;
-		let mut pl_absent = pl_defaults.absent_fraction;
-		let mut pl_mode = pl_defaults.mode;
-		let mut pl_rows_per_page = pl_defaults.rows_per_page;
-		let mut rf_rows = rf_defaults.point_count;
-		let mut rf_window = rf_defaults.window_rows;
-		let mut rf_windows = rf_defaults.window_count;
-		let mut rf_rows_per_page = rf_defaults.rows_per_page;
+		let (mut pl_rows, mut pl_queries, mut pl_absent, mut pl_mode, mut pl_rows_per_page) = (pl_defaults.point_count, pl_defaults.query_count, pl_defaults.absent_fraction, pl_defaults.mode, pl_defaults.rows_per_page);
+		let (mut rf_rows, mut rf_window, mut rf_windows, mut rf_rows_per_page) = (rf_defaults.point_count, rf_defaults.window_rows, rf_defaults.window_count, rf_defaults.rows_per_page);
 		let mut seed = defaults.seed;
 		let mut points = defaults.input_points;
 		let mut missingness = defaults.missingness_fraction;
@@ -442,6 +462,10 @@ impl Cli {
 				"-z" | "--compression" => compression = true,
 				"--comp-rows" => comp_rows = parse_points_count(&take_value(&key)?)?,
 				"--comp-shape" => comp_shape = parse_value_shape(&take_value(&key)?)?,
+				"-d" | "--downsample" => downsample = true,
+				"--ds-points" => ds_points = parse_points_count(&take_value(&key)?)?,
+				"--ds-stride" => ds_stride = parse_stride_secs(&take_value(&key)?)?,
+				"--ds-bucket" => ds_bucket = parse_resolution(&take_value(&key)?)?,
 				"--irregular" | "--pl-irregular" | "--rf-irregular" => irregular = true,
 				"--pl-rows" => pl_rows = parse_points_count(&take_value(&key)?)?,
 				"--pl-queries" => pl_queries = parse_query_count(&take_value(&key)?)?,
@@ -478,10 +502,10 @@ impl Cli {
 		}
 
 		// Exactly one workload mode may be selected; the rest default to line protocol.
-		let mode = select_workload_mode(&[(synthetic, InputMode::Synthetic), (point_lookup, InputMode::PointLookup), (range_fetch, InputMode::RangeFetch), (compression, InputMode::Compression)])?;
+		let mode = select_workload_mode(&[(synthetic, InputMode::Synthetic), (point_lookup, InputMode::PointLookup), (range_fetch, InputMode::RangeFetch), (compression, InputMode::Compression), (downsample, InputMode::Downsample)])?;
 		validate_mode(mode, input.as_ref(), field.as_deref(), compare)?;
 
-		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare, html })))
+		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, ds_points, ds_stride, ds_bucket, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare, html })))
 	}
 }
 
@@ -490,18 +514,20 @@ impl Cli {
 fn select_workload_mode(candidates: &[(bool, InputMode)]) -> Result<InputMode, String> {
 	let selected: Vec<InputMode> = candidates.iter().filter(|(set, _)| *set).map(|(_, m)| *m).collect();
 	if selected.len() > 1 {
-		return Err("only one workload mode may be given (--synthetic / --point-lookup / --range-fetch / --compression)".to_string());
+		return Err("only one workload mode may be given (--synthetic / --point-lookup / --range-fetch / --compression / --downsample)".to_string());
 	}
 	Ok(selected.first().copied().unwrap_or(InputMode::LineProtocol))
 }
 
-/// The flag name for a storage-workload mode (for conflict messages), or `None` for
-/// the interpolation modes.
-const fn storage_mode_flag(mode: InputMode) -> Option<&'static str> {
+/// The flag name for a self-generating workload mode — one that produces its own
+/// corpus and so rejects every external-input flag (`--input`/`--field`) and
+/// `--compare` — or `None` for line protocol and synthetic (whose validation differs).
+const fn self_generating_mode_flag(mode: InputMode) -> Option<&'static str> {
 	match mode {
 		InputMode::PointLookup => Some("--point-lookup"),
 		InputMode::RangeFetch => Some("--range-fetch"),
 		InputMode::Compression => Some("--compression"),
+		InputMode::Downsample => Some("--downsample"),
 		InputMode::LineProtocol | InputMode::Synthetic => None,
 	}
 }
@@ -516,7 +542,7 @@ const fn storage_mode_flag(mode: InputMode) -> Option<&'static str> {
 /// `--field`. The "exactly one workload mode" check is the caller's, which keeps this
 /// free of the mode-selector booleans.
 fn validate_mode(mode: InputMode, input: Option<&PathBuf>, field: Option<&str>, compare: bool) -> Result<(), String> {
-	if let Some(mode_flag) = storage_mode_flag(mode) {
+	if let Some(mode_flag) = self_generating_mode_flag(mode) {
 		if input.is_some() {
 			return Err(format!("`{mode_flag}` cannot be combined with an input file"));
 		}
@@ -539,13 +565,13 @@ fn validate_mode(mode: InputMode, input: Option<&PathBuf>, field: Option<&str>, 
 		}
 		InputMode::LineProtocol => {
 			if input.is_none() {
-				return Err("missing required `--input <file.lp>` (or pass `--synthetic` / `--point-lookup` / `--range-fetch` / `--compression`)".to_string());
+				return Err("missing required `--input <file.lp>` (or pass `--synthetic` / `--point-lookup` / `--range-fetch` / `--compression` / `--downsample`)".to_string());
 			}
 			if field.is_none() {
 				return Err("missing required `--field <name>`".to_string());
 			}
 		}
-		InputMode::PointLookup | InputMode::RangeFetch | InputMode::Compression => unreachable!("handled by storage_mode_flag above"),
+		InputMode::PointLookup | InputMode::RangeFetch | InputMode::Compression | InputMode::Downsample => unreachable!("handled by self_generating_mode_flag above"),
 	}
 	Ok(())
 }
@@ -640,6 +666,15 @@ fn parse_rows_per_page(s: &str) -> Result<usize, String> {
 	s.parse::<usize>().map_err(|_| format!("invalid --*-rows-per-page `{s}` (expected a non-negative integer; 0 = single-block)"))
 }
 
+/// Parse a downsample input-stride value (seconds between samples, `>= 1`).
+fn parse_stride_secs(s: &str) -> Result<i64, String> {
+	let n = s.parse::<i64>().map_err(|_| format!("invalid --ds-stride `{s}` (expected a positive integer of seconds)"))?;
+	if n < 1 {
+		return Err("--ds-stride must be >= 1".to_string());
+	}
+	Ok(n)
+}
+
 /// Parse a compression value-shape token (`clustered` | `trending` | `jitter`).
 fn parse_value_shape(s: &str) -> Result<ValueShape, String> {
 	match s.to_ascii_lowercase().as_str() {
@@ -702,6 +737,7 @@ USAGE:
     dsp-bench --point-lookup [POINT-LOOKUP OPTIONS]
     dsp-bench --range-fetch [RANGE-FETCH OPTIONS]
     dsp-bench --compression [COMPRESSION OPTIONS]
+    dsp-bench --downsample [DOWNSAMPLE OPTIONS]
 
 INPUT MODE (choose one):
     -i, --input <FILE>       Line-protocol input file (.lp / TSBS payload)
@@ -722,6 +758,10 @@ INPUT MODE (choose one):
                              seeded columnar segment and report realized bytes/point,
                              the value-column compression ratio, and decode throughput
                              (time a full decode). Gated on an exact round-trip.
+    -d, --downsample         Run the downsample (aggregation) workload: generate a
+                             dense series and time DSP's canonical reduction (min/max/
+                             avg/sum/first/last) into grid-aligned buckets. Gated on
+                             the reduction being total (bucket counts sum to input).
 
 STORAGE-WORKLOAD OPTIONS (with --point-lookup or --range-fetch):
         --irregular          Jittered timestamps (decode + search/filter) instead of
@@ -747,6 +787,11 @@ COMPRESSION OPTIONS (with --compression):
         --comp-rows <N>      Rows sealed into the segment (>=2)     [default: 20000]
         --comp-shape <S>     Value shape: clustered|trending|jitter
                              (each exercises a different codec) [default: clustered]
+
+DOWNSAMPLE OPTIONS (with --downsample):
+        --ds-points <N>      Input sample count (>=2)              [default: 60000]
+        --ds-stride <N>      Seconds between input samples (>=1)        [default: 1]
+        --ds-bucket <R>      Bucket resolution: s|m|h|d|w|mo|y     [default: minutes]
 
 SYNTHETIC OPTIONS (with --synthetic):
         --seed <N>           Generator seed, decimal or 0x-hex     [default: flagship]
@@ -900,6 +945,26 @@ mod tests {
 		assert!(run_cli(&["--range-fetch", "--synthetic"]).unwrap_err().contains("only one workload mode"));
 		assert!(run_cli(&["--range-fetch", "--input", "x.lp"]).unwrap_err().contains("cannot be combined with an input file"));
 		assert!(run_cli(&["--range-fetch", "--compare"]).unwrap_err().contains("`--compare` has no meaning"));
+	}
+
+	#[test]
+	fn downsample_mode_parses_with_knob_defaults_and_conflicts_rejected() {
+		let cli = expect_run(&["--downsample"]);
+		assert_eq!(cli.mode, InputMode::Downsample);
+		let ds = DownsampleParams::default();
+		assert_eq!(cli.ds_points, ds.point_count);
+		assert_eq!(cli.ds_stride, ds.input_stride_secs);
+		assert_eq!(cli.ds_bucket, ds.bucket_resolution);
+		// Knobs parse, including the bucket resolution.
+		let cli = expect_run(&["-d", "--ds-points", "5000", "--ds-stride", "5", "--ds-bucket", "h"]);
+		assert_eq!(cli.ds_points, 5_000);
+		assert_eq!(cli.ds_stride, 5);
+		assert_eq!(cli.ds_bucket, Resolution::Hours);
+		assert!(run_cli(&["-d", "--ds-stride", "0"]).unwrap_err().contains("--ds-stride must be >= 1"));
+		// Conflicts: another mode, an input file, and --compare.
+		assert!(run_cli(&["--downsample", "--compression"]).unwrap_err().contains("only one workload mode"));
+		assert!(run_cli(&["--downsample", "--input", "x.lp"]).unwrap_err().contains("cannot be combined with an input file"));
+		assert!(run_cli(&["--downsample", "--compare"]).unwrap_err().contains("`--compare` has no meaning"));
 	}
 
 	#[test]
