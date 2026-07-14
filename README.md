@@ -61,6 +61,7 @@ up to an HTTP server and an interactive application:
 | [`dsp-physical-type`](dsp-physical-type) | Vendor-neutral physical type system — schema-declared numeric encodings with explicit exactness, timestamp codecs, and the `.dspseg` columnar segment format (single-block and paged). |
 | [`dsp-arrow`](dsp-arrow) / [`dsp-arrow-store`](dsp-arrow-store) | Apache Arrow / Parquet interchange for sealed segments and stored reads, kept in leaf crates so the `arrow-*` dependency tree never reaches the hot-path core. |
 | [`dsp-line-protocol`](dsp-line-protocol) | Dependency-free InfluxDB Line Protocol parser shared by the server and the benchmark harness. |
+| [`dsp-reduce`](dsp-reduce) | Vendor-neutral downsampling reductions — `min`/`max`/`avg`/`sum`/`first`/`last` + nearest-rank `p50`/`p90`/`p95`/`p99` + time-weighted average, over an epoch-aligned bucket grid, computed in `BigDecimal`. Shared by the HTTP `downsample` endpoint and the benchmark harness. |
 | [`dsp-server`](dsp-server) | Benchmark-grade `axum` HTTP API — interpolation, downsampling, storage ingest/query, catalog management, Prometheus metrics, live latency profiles. |
 | [`dsp-bench`](dsp-bench) | Reproducible, correctness-gated benchmark harness — the roadmap's spine; both an internal suite and a customer-runnable diagnostic. |
 | [`dsp-tui`](dsp-tui) | Terminal user interface (Ratatui + Crossterm) for creating databases, importing CSV data, browsing and plotting aspects, and running compression. |
@@ -539,7 +540,7 @@ CSV, Arrow IPC, or Parquet**:
 |----------|---------|
 | `POST /api/v1/interpolate` | Reconstruct an irregular series onto a regular grid (`spline` = `linear` \| `quadratic` \| `cubic` \| polynomial; `resolution` = `nanoseconds`..`years`). Every output point carries a `kind` — `raw` / `interpolated` / `extrapolated`. |
 | `POST /api/v1/interpolate/point` | Evaluate the reconstructed signal at a single instant, labelled raw/interpolated/extrapolated. |
-| `POST /api/v1/downsample` | Reduce samples into epoch-grid-aligned buckets (`min`/`max`/`avg`/`sum`/`first`/`last`; reductions computed in `BigDecimal`). Only non-empty buckets are emitted. |
+| `POST /api/v1/downsample` | Reduce samples into epoch-grid-aligned buckets — `min`/`max`/`avg`/`sum`/`first`/`last`, nearest-rank percentiles `p50`/`p90`/`p95`/`p99`, and `twa` (time-weighted average, LOCF dwell-weighting); all reductions computed in `BigDecimal` by the shared [`dsp-reduce`](dsp-reduce) crate. Only non-empty buckets are emitted. |
 | `POST /api/v1/{interpolate,downsample}/ilp` | The same, fed an ILP `text/plain` body (the TSBS/InfluxDB/QuestDB wire format); `field`, `precision` (`ns`/`us`/`ms`/`s`), and the compute knobs are query parameters. `interpolation=` is accepted as an alias for `spline=` (the canonical `spline` wins if both are given). |
 | `POST /api/v1/{interpolate,downsample}/{csv,arrow,parquet}` and `…/ilp/{csv,arrow,parquet}` | The same computations with CSV (`text/csv`), Arrow IPC stream, or Parquet output — so a harness feeding line protocol pulls results in any of the four formats. |
 
@@ -624,6 +625,20 @@ What it does today:
   (`ChaCha8Rng`, published seed → byte-for-byte reproducible). The underlying
   analytic signal is shape-selectable (`MultiSine` | `Sawtooth` | `Step` |
   `DampedSine`) and doubles as the accuracy ground truth.
+- **Storage, read & aggregation workloads** — beside the flagship interpolation
+  run, four parallel workloads exercise DSP's own hot paths, each with its own
+  correctness gate and p50/p95/p99 latency: **`point_lookup`** (`--point-lookup`)
+  seals a `.dspseg` segment and times the streaming point read
+  (`read_segment_point`/`read_segment_points`, single or batch, single-block or
+  paged via `--pl-rows-per-page`, regular closed-form vs irregular), gated against
+  the full-decode value; **`range_fetch`** (`--range-fetch`) times the windowed
+  range read; **`compression`** (`--compression`) reports realized bytes/point, the
+  value-column compression ratio, and decode throughput, gated on an exact
+  round-trip; and **`downsample`** (`--downsample`) times DSP's canonical
+  [`dsp-reduce`](dsp-reduce) reduction into grid-aligned buckets with a
+  `--ds-aggs` selector over `min`/`max`/`avg`/`sum`/`first`/`last`/`p50`…`p99`/`twa`.
+  The underlying point/range read speedups are quantified at the codec layer in
+  [`dsp-physical-type/benches/pointread.rs`](dsp-physical-type/benches/pointread.rs).
 - **Vendor-neutral adapters** — every system is driven through the
   `SystemAdapter` trait: the DSP reference adapter (`splimes::auto_interpolate`),
   a precision-aware **portable linear baseline** (fair-protocol class C), and a
@@ -661,6 +676,12 @@ cargo run -p dsp-bench -- \
 cargo run -p dsp-bench -- \
     --synthetic --points 300 --noise 0 --shape sawtooth \
     --spline cubic --resolution minutes --reps 5 --compare
+
+# Storage/read/aggregation workloads over DSP's own hot paths:
+cargo run -p dsp-bench -- --point-lookup --pl-rows 100000 --pl-queries 128 --reps 50
+cargo run -p dsp-bench -- --range-fetch --rf-window 100 --rf-windows 32 --reps 30
+cargo run -p dsp-bench -- --compression --comp-shape clustered --reps 20
+cargo run -p dsp-bench -- --downsample --ds-bucket m --ds-aggs min,max,p99,twa --reps 20
 ```
 
 The process exits non-zero when any result's correctness gate fails, so scripted

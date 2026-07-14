@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["database", "database_orchestration", "splimes", "dsp-tui", "dsp-bench", "dsp-server", "dsp-line-protocol", "dsp-physical-type", "dsp-arrow", "dsp-arrow-store"]
+members = ["database", "database_orchestration", "splimes", "dsp-tui", "dsp-bench", "dsp-server", "dsp-line-protocol", "dsp-physical-type", "dsp-arrow", "dsp-arrow-store", "dsp-reduce"]
 # Predecessor repositories archived under legacy/ (history preserved); not part of the active build.
 exclude = ["legacy"]
 
@@ -38,6 +38,7 @@ sysinfo = "0"
 splimes = { path = "./splimes" }
 dsp-line-protocol = { path = "./dsp-line-protocol" }
 dsp-physical-type = { path = "./dsp-physical-type" }
+dsp-reduce = { path = "./dsp-reduce" }
 dsp-arrow = { path = "./dsp-arrow" }
 arrow-array = "59"
 arrow-schema = "59"
