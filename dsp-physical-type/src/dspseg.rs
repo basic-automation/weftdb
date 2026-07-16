@@ -2090,6 +2090,27 @@ pub fn read_segment(bytes: &[u8]) -> Result<Segment, DspSegError> {
 /// decoding the whole segment (see the module comment above).
 #[must_use]
 pub fn write_paged_segment(seg: &PagedSegment) -> Vec<u8> {
+	write_paged_segment_inner(seg, None)
+}
+
+/// Encode a [`PagedSegment`] whose every page carries a **persisted sparse checkpoint index**.
+///
+/// The paged sibling of [`write_segment_checkpointed`], with the same trade and the same
+/// opt-in status.
+///
+/// Read by the ordinary [`read_paged_segment`] (the tag is additive), and
+/// [`read_paged_segment_point`] resolves an instant within a surviving page without
+/// decoding that page's timestamp column. Page pruning still happens first on the indexed
+/// per-page min/max, so this only accelerates the page a probe actually lands in — the
+/// win is therefore bounded by `rows_per_page`, and smaller than the single-block frame's.
+#[must_use]
+pub fn write_paged_segment_checkpointed(seg: &PagedSegment, stride: usize) -> Vec<u8> {
+	write_paged_segment_inner(seg, Some(stride))
+}
+
+/// The shared paged-frame writer: `checkpoint_stride` selects the plain or checkpointed
+/// timestamp block for every page. Everything else about the frame is identical.
+fn write_paged_segment_inner(seg: &PagedSegment, checkpoint_stride: Option<usize>) -> Vec<u8> {
 	// Encode each page's column block first so the index can carry its byte length.
 	let page_blocks: Vec<Vec<u8>> = seg
 		.pages
@@ -2097,7 +2118,10 @@ pub fn write_paged_segment(seg: &PagedSegment) -> Vec<u8> {
 		.map(|page| {
 			let mut pw = ByteWriter::with_capacity(page.total_bytes() + 16);
 			write_value_column(&mut pw, &page.values);
-			write_timestamp_column(&mut pw, &page.timestamps);
+			match checkpoint_stride {
+				Some(stride) => write_timestamp_column_checkpointed(&mut pw, &page.timestamps, stride),
+				None => write_timestamp_column(&mut pw, &page.timestamps),
+			}
 			write_null_column(&mut pw, &page.nulls);
 			pw.into_vec()
 		})
@@ -3360,6 +3384,37 @@ mod tests {
 			}
 			// An all-null run must report absent, not the next run's value.
 			assert_eq!(read_segment_point(&checkpointed, 61).expect("reads"), None, "an all-null duplicate run is absent");
+		}
+	}
+
+	/// The paged sibling: a checkpointed paged frame must read identically to the plain
+	/// paged frame, with page pruning still applying on top.
+	#[test]
+	fn checkpointed_paged_frame_reads_identically_to_the_plain_paged_frame() {
+		let mut t = 5_000_i64;
+		let ts: Vec<i64> = (0..1_000)
+			.map(|i: i64| {
+				t += 1 + (i * 11) % 37;
+				t
+			})
+			.collect();
+		let vs: Vec<BigDecimal> = (0..1_000).map(|i| BigDecimal::from_str(&format!("{}.75", 200 + i % 90)).unwrap()).collect();
+		let seg = PagedSegment::build(&ts, &vs, TimeUnit::Millis, &BigDecimal::from(0), 128).expect("builds");
+		assert!(seg.stats.time_sorted, "fixture must be sorted");
+		assert!(seg.pages.len() > 1, "fixture must actually be paged");
+
+		for stride in [8_usize, 64, 512] {
+			let plain = write_paged_segment(&seg);
+			let checkpointed = write_paged_segment_checkpointed(&seg, stride);
+			assert_eq!(read_paged_segment(&checkpointed).expect("reads"), seg, "stride={stride}: checkpointed paged frame must round-trip");
+			for &probe in &ts {
+				assert_eq!(read_paged_segment_point(&checkpointed, probe).expect("reads"), read_paged_segment_point(&plain, probe).expect("reads"), "stride={stride}: paged point read at {probe} must match");
+			}
+			for probe in [i64::MIN, 0, ts[0] - 1, ts[10] + 1, *ts.last().unwrap() + 1, i64::MAX] {
+				assert_eq!(read_paged_segment_point(&checkpointed, probe).expect("reads"), read_paged_segment_point(&plain, probe).expect("reads"), "stride={stride}: absent paged probe {probe} must match");
+			}
+			let batch: Vec<i64> = vec![ts[0], ts[500], 7, ts[999], ts[137]];
+			assert_eq!(read_paged_segment_points(&checkpointed, &batch).expect("reads"), read_paged_segment_points(&plain, &batch).expect("reads"), "stride={stride}: paged batch read must match");
 		}
 	}
 

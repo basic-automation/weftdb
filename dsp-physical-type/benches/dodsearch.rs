@@ -20,7 +20,7 @@ use std::{hint::black_box, str::FromStr};
 use bigdecimal::BigDecimal;
 use criterion::{criterion_group, criterion_main, Criterion};
 use dsp_physical_type::{
-	dspseg::{read_segment_point, write_segment, write_segment_checkpointed}, timestamp::{decode_delta_of_delta, encode_delta_of_delta, DeltaOfDeltaColumn, TimeUnit}, Segment
+	dspseg::{read_paged_segment_point, read_segment_point, write_paged_segment, write_paged_segment_checkpointed, write_segment, write_segment_checkpointed}, page::PagedSegment, timestamp::{decode_delta_of_delta, encode_delta_of_delta, DeltaOfDeltaColumn, TimeUnit}, Segment
 };
 
 /// A deterministic sorted-irregular epoch column: a base stride of ~1000 ms perturbed by
@@ -123,5 +123,41 @@ fn bench_frame(c: &mut Criterion) {
 	group.finish();
 }
 
-criterion_group!(benches, bench, bench_frame);
+/// The paged sibling. A paged frame already prunes to one page on the indexed min/max, so
+/// the timestamp decode it avoids is bounded by `rows_per_page` — the win should therefore
+/// be real but smaller than the single-block frame's. Measured, not assumed.
+fn bench_paged_frame(c: &mut Criterion) {
+	const N: usize = 100_000;
+	const ROWS_PER_PAGE: usize = 4_096;
+	let ts = corpus(N);
+	let vs: Vec<BigDecimal> = (0..N).map(|i| BigDecimal::from_str(&format!("{}.25", 1_000 + i % 500)).expect("valid")).collect();
+	let seg = PagedSegment::build(&ts, &vs, TimeUnit::Millis, &BigDecimal::from(0), ROWS_PER_PAGE).expect("builds");
+
+	let plain = write_paged_segment(&seg);
+	let probes: Vec<i64> = (0..64).map(|k| ts[k * (N / 64)]).collect();
+
+	let mut group = c.benchmark_group("dspseg_paged_point_read_irregular_100k");
+	group.bench_function("plain_paged_frame", |b| {
+		b.iter(|| {
+			for &t in &probes {
+				black_box(read_paged_segment_point(black_box(&plain), black_box(t)).expect("reads"));
+			}
+		});
+	});
+	for stride in [256_usize, 1024] {
+		let frame = write_paged_segment_checkpointed(&seg, stride);
+		let overhead = (frame.len() as f64 - plain.len() as f64) / plain.len() as f64 * 100.0;
+		println!("checkpointed paged stride={stride}: {} B vs plain {} B ({overhead:+.2}% frame bytes)", frame.len(), plain.len());
+		group.bench_function(format!("checkpointed_paged_frame_stride_{stride}"), |b| {
+			b.iter(|| {
+				for &t in &probes {
+					black_box(read_paged_segment_point(black_box(&frame), black_box(t)).expect("reads"));
+				}
+			});
+		});
+	}
+	group.finish();
+}
+
+criterion_group!(benches, bench, bench_frame, bench_paged_frame);
 criterion_main!(benches);
