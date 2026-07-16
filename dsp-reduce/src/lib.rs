@@ -85,13 +85,14 @@ pub enum Aggregation {
 /// the exact nearest-rank percentiles remain available whenever the approximation is
 /// not acceptable.
 ///
-/// **Rank convention.** The `sketch_p*` reductions use `DdSketch`'s reference rank
-/// (0-based `⌊q·(n-1)⌋`), while the exact `p*` reductions use nearest-rank
-/// (`⌈q·n⌉`). On a large bucket the two agree within [`SKETCH_ALPHA`]; on a *small*
-/// bucket they can select different samples outright (`sketch_p99` of three samples is
-/// the middle one, `p99` the largest). Prefer the exact percentiles for small buckets —
-/// they cost nothing there; the sketch earns its keep when a bucket is too large to
-/// materialize or the result must merge.
+/// **Rank convention.** The `sketch_p*` reductions share the exact `p*` reductions'
+/// nearest-rank convention (1-based ordinal `⌈q·n⌉`), so the two name the **same sample
+/// at every bucket size** and `sketch_p*` is always within [`SKETCH_ALPHA`] of `p*` —
+/// they are substitutable. (`DdSketch`'s reference rank is `⌊q·(n-1)⌋`, which on a small
+/// bucket selects a *different* sample — `p99` of three would be the middle one; DSP
+/// deliberately does not inherit that.) The exact percentiles still cost nothing on a
+/// small bucket; the sketch earns its keep when a bucket is too large to materialize or
+/// the result must merge.
 pub const SKETCH_ALPHA: f64 = 0.01;
 
 /// The bucket budget of the `sketch_p*` reductions, per sign store.
@@ -657,6 +658,23 @@ mod tests {
 		}
 	}
 
+	/// The substitutability guarantee: because the sketch shares the exact percentiles'
+	/// nearest-rank convention, the two name the same sample at **every** bucket size —
+	/// including the tiny buckets where the reference `DDSketch` rank would diverge.
+	#[test]
+	fn sketch_and_exact_percentiles_agree_on_small_buckets() {
+		for n in 1..=12_u32 {
+			let points: Vec<Point> = (1..=n).map(|v| pt(i64::from(v - 1), &v.to_string())).collect();
+			let buckets = reduce(&points, Resolution::Hours, None, None, &[Aggregation::P50, Aggregation::SketchP50, Aggregation::P90, Aggregation::SketchP90, Aggregation::P99, Aggregation::SketchP99]).expect("reduces");
+			let b = &buckets[0];
+			for (exact, approx) in [(Aggregation::P50, Aggregation::SketchP50), (Aggregation::P90, Aggregation::SketchP90), (Aggregation::P99, Aggregation::SketchP99)] {
+				let (e, a) = (get(b, exact), get(b, approx));
+				let rel = (a - e).abs() / e.abs();
+				assert!(rel <= SKETCH_ALPHA, "n={n}: {} ({a}) must name the same sample as {} ({e}) — relative error {rel}", approx.as_str(), exact.as_str());
+			}
+		}
+	}
+
 	#[test]
 	fn sketch_reductions_do_not_materialize_the_bucket() {
 		// The bounded-memory property: asking only for a sketch percentile must not set
@@ -687,12 +705,11 @@ mod tests {
 		let buckets = reduce(&points, Resolution::Hours, None, None, &[Aggregation::SketchP50, Aggregation::SketchP99]).expect("reduces a zero-straddling bucket");
 		assert_eq!(buckets[0].count, 3);
 		assert!(get(&buckets[0], Aggregation::SketchP50).abs() < 1e-9, "median of -50/0/50 is exactly 0 (zero is counted, not approximated)");
-		// Rank-convention divergence, pinned deliberately: the sketch selects rank
-		// floor(q*(n-1)) = floor(1.98) = 1 -> the middle sample (0), while the exact P99
-		// uses nearest-rank ceil(q*n) = 3 -> the top sample (50). On a 3-sample bucket
-		// the two conventions genuinely disagree; they converge as n grows (see
-		// `sketch_percentiles_track_the_exact_percentiles_within_the_bound`, n=1000).
-		assert!(get(&buckets[0], Aggregation::SketchP99).abs() < 1e-9, "sketch p99 of a 3-sample bucket is the middle sample under the DDSketch rank convention");
+		// The sketch uses DSP's nearest-rank convention, so even on a 3-sample bucket it
+		// names the same sample the exact p99 does — the top one. (Under DDSketch's own
+		// floor(q*(n-1)) rank it would have returned the middle sample; DSP deliberately
+		// does not inherit that divergence.)
+		assert!((get(&buckets[0], Aggregation::SketchP99) - 50.0).abs() / 50.0 <= SKETCH_ALPHA, "sketch p99 of -50/0/50 is the top sample, matching the exact p99");
 	}
 
 	#[test]
