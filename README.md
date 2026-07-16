@@ -564,6 +564,16 @@ CSV, Arrow IPC, or Parquet**:
 | `POST /api/v1/{interpolate,downsample}/ilp` | The same, fed an ILP `text/plain` body (the TSBS/InfluxDB/QuestDB wire format); `field`, `precision` (`ns`/`us`/`ms`/`s`), and the compute knobs are query parameters. `interpolation=` is accepted as an alias for `spline=` (the canonical `spline` wins if both are given). |
 | `POST /api/v1/{interpolate,downsample}/{csv,arrow,parquet}` and `…/ilp/{csv,arrow,parquet}` | The same computations with CSV (`text/csv`), Arrow IPC stream, or Parquet output — so a harness feeding line protocol pulls results in any of the four formats. |
 
+**What the reductions cost.** Measured on the shipped harness (500k points, 5 reps, hour buckets,
+correctness PASS throughout — `dsp-bench --downsample --ds-points 500000 --ds-aggs <agg>`):
+
+| reduction | p50 | throughput | note |
+|---|---|---|---|
+| `avg` | 293.1 ms | 1,711,287 points/sec | the streaming baseline — no bucket materialized |
+| `twa` | 426.0 ms | 1,169,431 points/sec | 1.45× the streaming cost: dwell-weighting needs the time-ordered samples |
+| `twa_bucket_end` | 430.7 ms | 1,167,829 points/sec | +1.1% over `twa` — one extra weight, effectively free |
+| `twa_linear` | 538.6 ms | 928,112 points/sec | 1.26× `twa`: an extra `BigDecimal` add + divide per interval for the trapezoidal mean |
+
 **Exact vs sketch percentiles — which to ask for.** The `p50`/`p90`/`p95`/`p99` reductions are
 *exact* nearest-rank: they return an actual observed `BigDecimal` from the bucket, but they
 materialize and sort the whole bucket, and two buckets' results cannot be combined. The
