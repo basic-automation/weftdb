@@ -68,6 +68,16 @@ pub enum Aggregation {
 	/// constant. Best for irregularly-sampled *continuous* signals (temperature, flow);
 	/// [`Twa`](Self::Twa)'s LOCF weighting is best for change-only/step sensors.
 	TwaLinear,
+	/// Time-weighted average by LOCF weighting that additionally carries the bucket's
+	/// **last sample forward to the bucket's end**.
+	///
+	/// [`Twa`](Self::Twa) gives the final sample no weight (it has no successor to
+	/// measure against), which biases a bucket toward its earlier values — a sensor that
+	/// reports `0` at the start and `100` just after it averages near `0`, though it held
+	/// `100` for nearly the whole bucket. Because a bucket's grid end is known, that dwell
+	/// *is* measurable, and this reduction counts it. Only meaningful for LOCF: the linear
+	/// method has no successor value to interpolate toward.
+	TwaBucketEnd,
 	/// Approximate 50th percentile via a mergeable [`DdSketch`] — bounded memory, with
 	/// the relative error bounded by [`SKETCH_ALPHA`].
 	SketchP50,
@@ -122,6 +132,7 @@ impl Aggregation {
 			Self::P99 => "p99",
 			Self::Twa => "twa",
 			Self::TwaLinear => "twa_linear",
+			Self::TwaBucketEnd => "twa_bucket_end",
 			Self::SketchP50 => "sketch_p50",
 			Self::SketchP90 => "sketch_p90",
 			Self::SketchP95 => "sketch_p95",
@@ -148,6 +159,7 @@ impl Aggregation {
 			"p99" => Some(Self::P99),
 			"twa" | "time_weighted_avg" | "twa_locf" => Some(Self::Twa),
 			"twa_linear" | "time_weighted_avg_linear" => Some(Self::TwaLinear),
+			"twa_bucket_end" | "twa_locf_end" => Some(Self::TwaBucketEnd),
 			"sketch_p50" | "sketch_median" => Some(Self::SketchP50),
 			"sketch_p90" => Some(Self::SketchP90),
 			"sketch_p95" => Some(Self::SketchP95),
@@ -192,7 +204,7 @@ impl Aggregation {
 	/// regardless of bucket size. Collecting for them would forfeit the saving.
 	#[must_use]
 	pub const fn needs_full_bucket(self) -> bool {
-		self.percentile_rank().is_some() || matches!(self, Self::Twa | Self::TwaLinear)
+		self.percentile_rank().is_some() || matches!(self, Self::Twa | Self::TwaLinear | Self::TwaBucketEnd)
 	}
 
 	/// Every reduction, in a stable order — the natural set for a full downsample. Kept
@@ -324,8 +336,10 @@ impl BucketAcc {
 					Aggregation::Avg => (self.count > 0).then(|| &self.sum / &count),
 					Aggregation::First => self.first.as_ref().map(|(_, v)| v.clone()),
 					Aggregation::Last => self.last.as_ref().map(|(_, v)| v.clone()),
-					Aggregation::Twa => time_weighted_average(&self.samples, TwaMethod::Locf),
-					Aggregation::TwaLinear => time_weighted_average(&self.samples, TwaMethod::Linear),
+					Aggregation::Twa => time_weighted_average(&self.samples, TwaMethod::Locf, None),
+					Aggregation::TwaLinear => time_weighted_average(&self.samples, TwaMethod::Linear, None),
+					// The grid end of *this* bucket: the start of the next one.
+					Aggregation::TwaBucketEnd => bucket_start(resolution, base.wrapping_add(1)).and_then(|end| time_weighted_average(&self.samples, TwaMethod::Locf, Some(end))),
 					Aggregation::P50 | Aggregation::P90 | Aggregation::P95 | Aggregation::P99 => unreachable!("handled by percentile_rank above"),
 					Aggregation::SketchP50 | Aggregation::SketchP90 | Aggregation::SketchP95 | Aggregation::SketchP99 => unreachable!("handled by sketch_quantile above"),
 				}
@@ -358,17 +372,27 @@ enum TwaMethod {
 /// shares one instant (total weight zero), falls back to the unweighted arithmetic
 /// mean. Weights are measured in milliseconds — the unit cancels in the ratio, so it
 /// only bounds sub-millisecond resolution, which a downsample bucket never needs.
-fn time_weighted_average(samples: &[(DateTime<Utc>, BigDecimal)], method: TwaMethod) -> Option<BigDecimal> {
+fn time_weighted_average(samples: &[(DateTime<Utc>, BigDecimal)], method: TwaMethod, bucket_end: Option<DateTime<Utc>>) -> Option<BigDecimal> {
 	if samples.is_empty() {
 		return None;
 	}
-	if samples.len() == 1 {
+	if samples.len() == 1 && bucket_end.is_none() {
 		return Some(samples[0].1.clone());
 	}
 	let mut ordered: Vec<&(DateTime<Utc>, BigDecimal)> = samples.iter().collect();
 	ordered.sort_by_key(|(t, _)| *t);
 	let mut weighted = BigDecimal::from(0);
 	let mut total_ms: i64 = 0;
+	// The final sample has no successor, so `Twa`/`TwaLinear` give it no weight. When a
+	// `bucket_end` is supplied (`TwaBucketEnd`) its dwell to the grid boundary is known
+	// and counted — LOCF only, since there is no successor value to interpolate toward.
+	if let (Some(end), Some(&&(last_t, ref last_v))) = (bucket_end, ordered.last()) {
+		let dt = (end - last_t).num_milliseconds().max(0);
+		if dt > 0 {
+			weighted += last_v * BigDecimal::from(dt);
+			total_ms += dt;
+		}
+	}
 	for pair in ordered.windows(2) {
 		let dt = (pair[1].0 - pair[0].0).num_milliseconds().max(0);
 		if dt > 0 {
@@ -629,6 +653,35 @@ mod tests {
 		let scrambled = vec![pt(60, "5"), pt(0, "10"), pt(30, "20")];
 		let b = reduce(&scrambled, Resolution::Hours, None, None, &[Aggregation::TwaLinear]).expect("reduces");
 		assert!((get(&b[0], Aggregation::TwaLinear) - 13.75).abs() < 1e-9, "linear TWA sorts by time before weighting");
+	}
+
+	#[test]
+	fn twa_bucket_end_counts_the_last_sample_dwell_to_the_grid_boundary() {
+		// The motivating bias: a change-only sensor reports 0 at 00:00 and 100 at 00:01,
+		// inside a 1-hour bucket. Plain TWA weights 0 over the single minute between the
+		// samples and gives 100 NO weight at all -> 0.0, though the sensor held 100 for 59
+		// of the bucket's 60 minutes. Weighting the last sample to the bucket end gives
+		// (0*60s + 100*3540s)/3600s = 98.333...
+		let points = vec![pt(0, "0"), pt(60, "100")];
+		let buckets = reduce(&points, Resolution::Hours, None, None, &[Aggregation::Twa, Aggregation::TwaBucketEnd, Aggregation::Avg]).expect("reduces");
+		assert_eq!(buckets.len(), 1);
+		let b = &buckets[0];
+		assert!(get(b, Aggregation::Twa).abs() < 1e-9, "plain TWA gives the final sample no weight -> 0");
+		assert!((get(b, Aggregation::TwaBucketEnd) - 98.333_333_333).abs() < 1e-6, "the bucket-end variant counts 100's 59-minute dwell -> ~98.33, got {}", get(b, Aggregation::TwaBucketEnd));
+		assert!((get(b, Aggregation::Avg) - 50.0).abs() < 1e-9, "the unweighted mean ignores dwell entirely -> 50");
+	}
+
+	#[test]
+	fn twa_bucket_end_of_a_single_sample_is_the_value_and_is_order_independent() {
+		// One sample: it holds for the whole bucket, so the answer is its own value —
+		// the same as plain TWA, reached by a different route (a real dwell, not the
+		// single-sample shortcut).
+		let one = reduce(&[pt(5, "42")], Resolution::Minutes, None, None, &[Aggregation::TwaBucketEnd]).expect("reduces");
+		assert!((get(&one[0], Aggregation::TwaBucketEnd) - 42.0).abs() < 1e-9, "a lone sample holds the whole bucket");
+		// A sample exactly on the bucket end boundary of its own bucket cannot happen
+		// (it would land in the next bucket), so the last dwell is always > 0 here.
+		let scrambled = reduce(&[pt(60, "100"), pt(0, "0")], Resolution::Hours, None, None, &[Aggregation::TwaBucketEnd]).expect("reduces");
+		assert!((get(&scrambled[0], Aggregation::TwaBucketEnd) - 98.333_333_333).abs() < 1e-6, "bucket-end TWA sorts by time before weighting");
 	}
 
 	#[test]
