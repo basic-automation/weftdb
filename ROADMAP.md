@@ -870,7 +870,14 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   reduction (counts/sums add, min/max combine, first/last resolve by timestamp, samples concatenate,
   sketches merge) — proven by reducing 600 points in four boundary-straddling chunks, merging in a
   scrambled order, and asserting equality with the single pass across all 13 reductions.
-- [ ] **NEXT — a cross-segment downsample surface (the consumer `PartialReduction` still lacks):**
+- [x] **DONE (2026-07-16) — `PartialReduction` has a consumer + a number.** `dsp-bench --ds-parallel
+  <N>` reduces in N rayon chunks via `reduce_partial` and merges (identical buckets to serial,
+  asserted by test across 2/3/8/64 chunks and 9 reductions). Measured (500k points, `sketch_p99`,
+  5 reps, 16-core, correctness PASS): serial 441.2 ms / 1,134,659 pts·s⁻¹ → **64 chunks 30.1 ms /
+  16,921,104 pts·s⁻¹ = 14.7×**. So mergeability is throughput, not theory — and `sketch_p99` at 64
+  chunks is ~68× the serial exact `p99` (30.1 ms vs 2018.5 ms). This is the evidence for the
+  cross-segment surface below.
+- [ ] **NEXT — a cross-segment downsample surface (the production consumer):**
   the primitive is no longer the blocker, but no DSP surface reduces across segments — the HTTP
   `downsample` endpoint takes points in a request body, so `sketch_p*`'s mergeability and the new
   partial API have no production consumer. Add a stored-data downsample (e.g.

@@ -687,6 +687,10 @@ What it does today:
   round-trip; and **`downsample`** (`--downsample`) times DSP's canonical
   [`dsp-reduce`](dsp-reduce) reduction into grid-aligned buckets with a
   `--ds-aggs` selector over `min`/`max`/`avg`/`sum`/`first`/`last`/`p50`…`p99`/`twa`/`twa_linear`/`twa_bucket_end`/`sketch_p50`…`sketch_p99`.
+  `--ds-parallel <N>` reduces in N chunks via mergeable partial reductions (identical
+  buckets to serial, asserted by test) — measured **14.7× at 64 chunks** on a 16-core box
+  (441.2 ms → 30.1 ms, 1,134,659 → 16,921,104 points/sec, `--ds-aggs sketch_p99`, 500k points,
+  5 reps, correctness PASS).
   The underlying point/range read speedups are quantified at the codec layer in
   [`dsp-physical-type/benches/pointread.rs`](dsp-physical-type/benches/pointread.rs).
 - **Vendor-neutral adapters** — every system is driven through the
