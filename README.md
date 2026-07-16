@@ -61,7 +61,7 @@ up to an HTTP server and an interactive application:
 | [`dsp-physical-type`](dsp-physical-type) | Vendor-neutral physical type system — schema-declared numeric encodings with explicit exactness, timestamp codecs, and the `.dspseg` columnar segment format (single-block and paged). |
 | [`dsp-arrow`](dsp-arrow) / [`dsp-arrow-store`](dsp-arrow-store) | Apache Arrow / Parquet interchange for sealed segments and stored reads, kept in leaf crates so the `arrow-*` dependency tree never reaches the hot-path core. |
 | [`dsp-line-protocol`](dsp-line-protocol) | Dependency-free InfluxDB Line Protocol parser shared by the server and the benchmark harness. |
-| [`dsp-reduce`](dsp-reduce) | Vendor-neutral downsampling reductions — `min`/`max`/`avg`/`sum`/`first`/`last` + nearest-rank `p50`/`p90`/`p95`/`p99` + time-weighted average, over an epoch-aligned bucket grid, computed in `BigDecimal`. Shared by the HTTP `downsample` endpoint and the benchmark harness. |
+| [`dsp-reduce`](dsp-reduce) | Vendor-neutral downsampling reductions, computable over parts and merged (`reduce_partial`/`PartialReduction`, exact for every reduction) — `min`/`max`/`avg`/`sum`/`first`/`last` + nearest-rank `p50`/`p90`/`p95`/`p99` + three time-weighted averages (LOCF, linear/trapezoidal, LOCF-to-bucket-end) + mergeable bounded-error `sketch_p*` percentiles, over an epoch-aligned bucket grid, computed in `BigDecimal`. Shared by the HTTP `downsample` endpoint and the benchmark harness. |
 | [`dsp-server`](dsp-server) | Benchmark-grade `axum` HTTP API — interpolation, downsampling, storage ingest/query, catalog management, Prometheus metrics, live latency profiles. |
 | [`dsp-bench`](dsp-bench) | Reproducible, correctness-gated benchmark harness — the roadmap's spine; both an internal suite and a customer-runnable diagnostic. |
 | [`dsp-tui`](dsp-tui) | Terminal user interface (Ratatui + Crossterm) for creating databases, importing CSV data, browsing and plotting aspects, and running compression. |
@@ -377,6 +377,26 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   segment (192 µs vs 11.9 ms) and **~7.1× faster** on the paged frame (169 µs vs 1.20 ms), with the
   closed-form timestamp path a further **~7×** over an irregular column (192 µs vs 1.34 ms), identical
   bytes on disk ([`dsp-physical-type/benches/pointread.rs`](dsp-physical-type/benches/pointread.rs)).
+- **Checkpointed frames — sublinear point lookup on an *irregular* sorted column** *(opt-in;
+  `write_segment_checkpointed` / `write_paged_segment_checkpointed`)*. The closed form above only
+  serves a *regular* column; an irregular one has no closed form, so a probe had to decode the whole
+  delta-of-delta timestamp stream. A checkpointed frame persists a sparse `(row, timestamp, delta)`
+  index every `stride` rows next to a range-decodable per-block dod stream, so a probe binary-searches
+  the index and decodes **only the blocks it walks** — the timestamp column is never materialized.
+  Measured **~3.45× faster** point reads on a 100k-row sorted-irregular frame (352.94 ms → 102.42 ms
+  for 64 probes) for **+0.41% frame bytes** at stride 1024; a *paged* frame gains only **~1.14×**
+  (68.70 → 60.41 ms), because page pruning already bounds its decode to `rows_per_page`
+  ([`dsp-physical-type/benches/dodsearch.rs`](dsp-physical-type/benches/dodsearch.rs)). The codec tag
+  is **additive** — every previously written frame still reads, with no format-version bump — and a
+  checkpointed frame is byte-for-byte equivalent in behaviour to a plain one on every read.
+  **Opt in** by setting `DSP_SEGMENT_CHECKPOINT_STRIDE` (see the configuration table). The seal path
+  then writes the index only where it genuinely pays, on three counts: the column is **sorted and
+  irregular** (a *regular* one already resolves `O(1)` closed-form, an out-of-order one cannot be
+  binary-searched), it has at least `DSP_SEGMENT_CHECKPOINT_MIN_ROWS` rows, and the **codec override
+  is affordable** — a checkpointed frame must use the range-decodable per-block codec, which costs
+  ~3.5× on a Gorilla-shaped column and ~14× on an RLE-shaped one, so those are refused rather than
+  bloated (`DSP_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD`). It is **off by default**, so an unconfigured
+  store's bytes/point are unchanged; making it the default is an open roadmap decision.
 - **Realized headline bytes/point** — every headline bytes/point figure
   (`Segment::bytes_per_point`, `StorageEstimate.bytes_per_point` /
   `total_bytes_per_point`, the bench HTML `val B/pt`) reports the codec **actually
@@ -540,9 +560,39 @@ CSV, Arrow IPC, or Parquet**:
 |----------|---------|
 | `POST /api/v1/interpolate` | Reconstruct an irregular series onto a regular grid (`spline` = `linear` \| `quadratic` \| `cubic` \| polynomial; `resolution` = `nanoseconds`..`years`). Every output point carries a `kind` — `raw` / `interpolated` / `extrapolated`. |
 | `POST /api/v1/interpolate/point` | Evaluate the reconstructed signal at a single instant, labelled raw/interpolated/extrapolated. |
-| `POST /api/v1/downsample` | Reduce samples into epoch-grid-aligned buckets — `min`/`max`/`avg`/`sum`/`first`/`last`, nearest-rank percentiles `p50`/`p90`/`p95`/`p99`, and `twa` (time-weighted average, LOCF dwell-weighting); all reductions computed in `BigDecimal` by the shared [`dsp-reduce`](dsp-reduce) crate. Only non-empty buckets are emitted. |
+| `POST /api/v1/downsample` | Reduce samples into epoch-grid-aligned buckets — `min`/`max`/`avg`/`sum`/`first`/`last`, nearest-rank percentiles `p50`/`p90`/`p95`/`p99`, the three **time-weighted averages** (`twa`, LOCF dwell-weighting, for change-only sensors; `twa_linear`, trapezoidal `Σ½(vᵢ+vᵢ₊₁)Δtᵢ/ΣΔtᵢ`, for irregularly-sampled continuous signals; `twa_bucket_end`, LOCF that additionally carries the bucket's last sample to its grid end — `twa` gives that sample no weight, so a sensor reporting `0` then `100` a minute into an hour bucket reads `twa`=0 but `twa_bucket_end`=98.33), and the **approximate `sketch_p50`/`p90`/`p95`/`p99`** (see below); all reductions computed in `BigDecimal` by the shared [`dsp-reduce`](dsp-reduce) crate. Aliases: `median`→`p50`, `time_weighted_avg`/`twa_locf`→`twa`, `time_weighted_avg_linear`→`twa_linear`, `twa_locf_end`→`twa_bucket_end`, `sketch_median`→`sketch_p50`. Only non-empty buckets are emitted. |
 | `POST /api/v1/{interpolate,downsample}/ilp` | The same, fed an ILP `text/plain` body (the TSBS/InfluxDB/QuestDB wire format); `field`, `precision` (`ns`/`us`/`ms`/`s`), and the compute knobs are query parameters. `interpolation=` is accepted as an alias for `spline=` (the canonical `spline` wins if both are given). |
 | `POST /api/v1/{interpolate,downsample}/{csv,arrow,parquet}` and `…/ilp/{csv,arrow,parquet}` | The same computations with CSV (`text/csv`), Arrow IPC stream, or Parquet output — so a harness feeding line protocol pulls results in any of the four formats. |
+
+**What the reductions cost.** Measured on the shipped harness (500k points, 5 reps, hour buckets,
+correctness PASS throughout — `dsp-bench --downsample --ds-points 500000 --ds-aggs <agg>`):
+
+| reduction | p50 | throughput | note |
+|---|---|---|---|
+| `avg` | 293.1 ms | 1,711,287 points/sec | the streaming baseline — no bucket materialized |
+| `twa` | 426.0 ms | 1,169,431 points/sec | 1.45× the streaming cost: dwell-weighting needs the time-ordered samples |
+| `twa_bucket_end` | 430.7 ms | 1,167,829 points/sec | +1.1% over `twa` — one extra weight, effectively free |
+| `twa_linear` | 538.6 ms | 928,112 points/sec | 1.26× `twa`: an extra `BigDecimal` add + divide per interval for the trapezoidal mean |
+
+**Exact vs sketch percentiles — which to ask for.** The `p50`/`p90`/`p95`/`p99` reductions are
+*exact* nearest-rank: they return an actual observed `BigDecimal` from the bucket, but they
+materialize and sort the whole bucket, and two buckets' results cannot be combined. The
+`sketch_p50`/`p90`/`p95`/`p99` reductions instead stream every value into a
+[DDSketch](https://dl.acm.org/doi/10.14778/3352063.3352135) — a **1% relative-error** bound
+(`dsp_reduce::SKETCH_ALPHA`), **bounded memory** regardless of bucket size (values fold in as they
+arrive; `SKETCH_MAX_BINS` caps the store absolutely), and an **exactly mergeable** structure, so a
+p99 can be computed over a large or streaming bucket. Measured on the shipped harness (500k points,
+5 reps, correctness PASS): `sketch_p99` runs at **1,075,976 points/sec (p50 = 468.90 ms)** versus
+exact `p99` at **249,169 points/sec (p50 = 2018.53 ms)** — **~4.3× faster**
+(`dsp-bench --downsample --ds-points 500000 --ds-aggs sketch_p99` vs `--ds-aggs p99`).
+
+The approximation is **declared, never silent** — DSP's precision principle. The sketch shares the
+exact percentiles' **nearest-rank convention** (`⌈q·n⌉`), so `sketch_p*` and `p*` name the same
+sample at *every* bucket size and the sketch is always within the 1% bound of the exact answer —
+the two are substitutable. (DDSketch's reference rank is `⌊q·(n-1)⌋`, which on a small bucket picks
+a different sample; DSP deliberately does not inherit that.) The exact percentiles remain the
+default and cost nothing on a small bucket, so prefer them there; reach for a sketch when a bucket
+is too large to materialize or the result must merge.
 
 ```sh
 curl -s -X POST http://127.0.0.1:8080/api/v1/interpolate \
@@ -636,7 +686,11 @@ What it does today:
   value-column compression ratio, and decode throughput, gated on an exact
   round-trip; and **`downsample`** (`--downsample`) times DSP's canonical
   [`dsp-reduce`](dsp-reduce) reduction into grid-aligned buckets with a
-  `--ds-aggs` selector over `min`/`max`/`avg`/`sum`/`first`/`last`/`p50`…`p99`/`twa`.
+  `--ds-aggs` selector over `min`/`max`/`avg`/`sum`/`first`/`last`/`p50`…`p99`/`twa`/`twa_linear`/`twa_bucket_end`/`sketch_p50`…`sketch_p99`.
+  `--ds-parallel <N>` reduces in N chunks via mergeable partial reductions (identical
+  buckets to serial, asserted by test) — measured **14.7× at 64 chunks** on a 16-core box
+  (441.2 ms → 30.1 ms, 1,134,659 → 16,921,104 points/sec, `--ds-aggs sketch_p99`, 500k points,
+  5 reps, correctness PASS).
   The underlying point/range read speedups are quantified at the codec layer in
   [`dsp-physical-type/benches/pointread.rs`](dsp-physical-type/benches/pointread.rs).
 - **Vendor-neutral adapters** — every system is driven through the
@@ -780,6 +834,9 @@ DSP is configured primarily through environment variables:
 | `DSP_RECONCILE_OVERLAPS` | `dsp-server` | Truthy → each daemon tick also merges cross-segment time-overlap groups. | unset (disabled) |
 | `DSP_RECONCILE_SPLIT_MIN_BYTES` | `dsp-server` | Split-not-rewrite floor (bytes) for the daemon's overlap merge; a dominant cold prefix clearing it is split off rather than rewritten. | unset (default 50 MiB floor → full-rewrite) |
 | `DSP_RECONCILE_MAX_SPLITS` | `dsp-server` | Segment-count cap; each tick also squashes every aspect over it into one segment (bounds split-path fragmentation). | unset (no squash) |
+| `DSP_SEGMENT_CHECKPOINT_STRIDE` | `dsp-server` | Rows between entries of the sealed **timestamp checkpoint index** — trades a little size for much faster point lookups on **sorted, irregular** columns (~3.45× single-block; see the checkpointed-frames feature above). Applies only where it pays: sorted + irregular + at least `DSP_SEGMENT_CHECKPOINT_MIN_ROWS` rows. ~1024 is the sweet spot (stride barely moves speed but does move size). | unset (no index; frames byte-for-byte as before) |
+| `DSP_SEGMENT_CHECKPOINT_MIN_ROWS` | `dsp-server` | Row floor below which a segment is never checkpointed (a small column decodes trivially, so an index would be pure cost). | `8192` |
+| `DSP_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD` | `dsp-server` | Ceiling on the timestamp-codec override a checkpointed seal will accept (`blocked / best` bytes; `1.0` = only when free). A checkpointed frame must use the range-decodable per-block codec, which is ~free where that codec already wins but **~3.5× on a Gorilla-shaped and ~14× on an RLE-shaped column** — this refuses those seals rather than silently bloating them. | `1.25` |
 | `RUST_LOG` | all | [`tracing`](https://docs.rs/tracing) filter. On `dsp-server` it drives a per-request root span (`request{method,path,request_id}`, echoed as `x-request-id`) that every per-stage span nests under, each with busy/idle timing: the compute paths (`interpolate.parse`/`compute`/`serialize` under `interpolate.engine`, `downsample.parse`/`reduce`); the **storage read** paths (`storage.{range,value_range,point}.read` + `.serialize`, with a `format` field over JSON/CSV/Arrow/Parquet); the **ingest** paths (`storage.ingest.parse`/`normalize`/`seal` for ILP/CSV/JSON, and `storage.ingest.parquet` for the Parquet decode+seal); and the background **reconcile daemon** (`reconcile.tick{kind,…,aspects,segments}`). | `dsp_tui=debug,database=debug,info` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `dsp-server` | When set (e.g. `http://localhost:4317`), export tracing spans to an OpenTelemetry collector over **OTLP/gRPC** in addition to the `RUST_LOG` `fmt` output. Unset → no exporter, no network dependency; a misconfigured/absent collector never blocks startup. `scripts/verify-otlp.sh` verifies delivery end-to-end against a local Jaeger container (starting one if needed). | unset (export disabled) |
 | `SKIP_SLOW_TESTS` | tests | Set to `1` to skip long-running tests. | unset |

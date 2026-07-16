@@ -527,6 +527,61 @@ impl Segment {
 		crate::dspseg::write_segment(self)
 	}
 
+	/// Seal to a `.dspseg` frame carrying a **persisted checkpoint index** over the
+	/// timestamp column, so a point lookup resumes from the nearest checkpoint instead of
+	/// decoding the whole column. See [`crate::dspseg::write_segment_checkpointed`].
+	///
+	/// Read by the ordinary [`read_from`](Self::read_from) — the codec tag is additive.
+	/// Costs a little size for a large lookup win on the shape
+	/// [`benefits_from_checkpoints`](Self::benefits_from_checkpoints) identifies.
+	#[must_use]
+	pub fn write_to_checkpointed(&self, stride: usize) -> Vec<u8> {
+		crate::dspseg::write_segment_checkpointed(self, stride)
+	}
+
+	/// Whether a checkpoint index would actually help this segment's point lookups.
+	///
+	/// True only for a **sorted, irregular** timestamp column: an out-of-order column
+	/// cannot be binary-searched (the read linear-scans), and a *regular* one already
+	/// resolves in `O(1)` closed form — faster than any index — so checkpointing either
+	/// would only add bytes. A factual predicate about the shape, not a policy: how many
+	/// rows are worth the trade is the caller's call.
+	///
+	/// **Shape alone is not sufficient** — see
+	/// [`checkpoint_codec_overhead`](Self::checkpoint_codec_overhead), which a caller must
+	/// also weigh: a checkpointed frame forces the range-decodable per-block codec, which
+	/// on a Gorilla- or RLE-shaped column costs far more than the index itself.
+	#[must_use]
+	pub fn benefits_from_checkpoints(&self) -> bool {
+		self.stats.time_sorted && self.timestamps.arithmetic_stride().is_none()
+	}
+
+	/// The **size cost of the codec override** a checkpointed frame would pay on this
+	/// segment, as a ratio of the timestamp block it would otherwise write
+	/// (`blocked / best`, so `1.0` = free, `2.0` = double).
+	///
+	/// A checkpointed frame must encode its dods with the per-block codec — the only one
+	/// that range-decodes — rather than the smallest codec available. Measured, that
+	/// override is ~free where the per-block codec already wins (~+1% on bounded jitter)
+	/// but **catastrophic where it does not**: ~3.5× on a Gorilla-shaped scattered-jitter
+	/// column, ~14× on an RLE-shaped long-constant-run column
+	/// (`benches/dodsearch.rs::report_codec_override_cost`). Both of those are *irregular*,
+	/// so [`benefits_from_checkpoints`](Self::benefits_from_checkpoints) alone would happily
+	/// checkpoint them. A caller deciding whether to checkpoint should reject a segment
+	/// whose overhead exceeds what it is willing to pay for faster lookups.
+	///
+	/// `1.0` for a column with no dods (nothing to encode either way).
+	#[must_use]
+	pub fn checkpoint_codec_overhead(&self) -> f64 {
+		let best = self.timestamps.best_estimated_bytes();
+		if best == 0 {
+			return 1.0;
+		}
+		#[allow(clippy::cast_precision_loss)]
+		let ratio = self.timestamps.blocked_estimated_bytes() as f64 / best as f64;
+		ratio
+	}
+
 	/// Read a segment back from a `.dspseg` byte frame, verifying its checksum.
 	///
 	/// Exact inverse of [`Segment::write_to`]. See [`crate::dspseg::read_segment`].
