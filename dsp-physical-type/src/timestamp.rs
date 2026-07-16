@@ -147,13 +147,25 @@ impl DodCheckpoints {
 	/// segment point-read's first-present semantics.
 	#[must_use]
 	pub fn search_sorted(&self, col: &DeltaOfDeltaColumn, target: i64) -> Option<usize> {
+		self.search_sorted_with(col, target, |_| true)
+	}
+
+	/// The first row whose timestamp equals `target` **and** satisfies `accept`, or `None`.
+	///
+	/// The generalization behind [`search_sorted`](Self::search_sorted): a caller that
+	/// must skip rows (e.g. a point read skipping *null* rows across a run of duplicate
+	/// timestamps) supplies the predicate, and the walk continues through the run instead
+	/// of stopping at the first match. Sorted input is the caller's guarantee, as above.
+	#[must_use]
+	pub fn search_sorted_with(&self, col: &DeltaOfDeltaColumn, target: i64, accept: impl Fn(usize) -> bool) -> Option<usize> {
 		if col.first_delta.is_none() {
 			// A single-row column is its anchor.
-			return (col.first == target).then_some(0);
+			return (col.first == target && accept(0)).then_some(0);
 		}
 		// Row 0 is the anchor and the earliest row: on a sorted column it is necessarily
-		// the first occurrence if it matches.
-		if col.first == target {
+		// the first occurrence if it matches and is accepted. If it matches but is
+		// rejected, the walk below resumes from row 1 and continues through the run.
+		if col.first == target && accept(0) {
 			return Some(0);
 		}
 		// Resume from the last checkpoint *strictly below* `target`. Every row at or
@@ -170,15 +182,17 @@ impl DodCheckpoints {
 		} else {
 			self.points[idx - 1]
 		};
-		Self::scan_from(col, start, target)
+		Self::scan_from(col, start, target, accept)
 	}
 
 	/// Reconstruct forward from `from`, returning the first row whose timestamp is
-	/// `target`. Stops as soon as the timestamps pass `target` (the column is sorted).
-	fn scan_from(col: &DeltaOfDeltaColumn, from: DodCheckpoint, target: i64) -> Option<usize> {
+	/// `target` and which `accept`s. Stops as soon as the timestamps pass `target` (the
+	/// column is sorted) — so a rejected row inside a run of duplicates simply advances
+	/// to the next candidate.
+	fn scan_from(col: &DeltaOfDeltaColumn, from: DodCheckpoint, target: i64, accept: impl Fn(usize) -> bool) -> Option<usize> {
 		let (mut row, mut ts, mut delta) = (from.row, from.timestamp, from.delta);
 		loop {
-			if ts == target {
+			if ts == target && accept(row) {
 				return Some(row);
 			}
 			if ts > target {
