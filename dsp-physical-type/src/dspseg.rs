@@ -996,22 +996,22 @@ fn read_points_from_section(section: &[u8], stats: &SegmentStats, ts: &[i64]) ->
 	} else {
 		Some(read_value_column(&mut r)?.values)
 	};
-	let (ts_col, checkpoints) = read_timestamp_column_with_checkpoints(&mut r)?;
+	// **Lazy checkpointed path:** if the frame carries a persisted index over a
+	// range-decodable dod stream *and* the column is sorted (a binary search is
+	// meaningless otherwise), resolve each instant without decoding the timestamp column
+	// at all — neither the codec stream nor the cumulative sum. Only a frame written by
+	// the opt-in `write_segment_checkpointed` takes this branch.
+	let lazy = if stats.time_sorted { read_lazy_checkpointed_ts(&mut r)? } else { None };
+	// Otherwise decode the timestamp column as before.
+	let ts_col = if lazy.is_none() { Some(read_timestamp_column(&mut r)?) } else { None };
 	let nulls = read_null_column(&mut r, stats.row_count, stats.null_count)?;
 	// **Regular-column fast path:** a time-sorted constant-stride column resolves each instant's
 	// row in closed form (`(t - first) / step`), skipping the whole delta-of-delta reconstruction +
 	// binary search. `time_sorted` guarantees `step > 0` and no wrap-around, so the index is unique
 	// and exact. An irregular (or out-of-order) column decodes the timestamps and binary/linear
 	// searches as before.
-	let stride = if stats.time_sorted { ts_col.arithmetic_stride().filter(|&(_, step)| step > 0) } else { None };
-	// **Irregular-column checkpoint path:** when the frame carries a persisted sparse index
-	// and the column is sorted but has no closed form, each instant resumes the
-	// reconstruction from the nearest checkpoint (`O(log(n/stride) + stride)`) instead of
-	// materializing the whole timestamp column. Absent an index (the default writer), or on
-	// an out-of-order column (where a binary search is meaningless), fall back to the full
-	// decode exactly as before.
-	let checkpointed = checkpoints.filter(|_| stride.is_none() && stats.time_sorted);
-	let timestamps = if stride.is_none() && checkpointed.is_none() { Some(crate::timestamp::decode_delta_of_delta(&ts_col)) } else { None };
+	let stride = if stats.time_sorted { ts_col.as_ref().and_then(DeltaOfDeltaColumn::arithmetic_stride).filter(|&(_, step)| step > 0) } else { None };
+	let timestamps = if stride.is_none() { ts_col.as_ref().map(crate::timestamp::decode_delta_of_delta) } else { None };
 	for (slot, &t) in out.iter_mut().zip(ts) {
 		if t < min_ts || t > max_ts {
 			continue;
@@ -1030,10 +1030,11 @@ fn read_points_from_section(section: &[u8], stats: &SegmentStats, ts: &[i64]) ->
 				continue;
 			}
 			dense_rank(&nulls, row)
-		} else if let Some(cps) = checkpointed.as_ref() {
-			// Resume from the nearest checkpoint, skipping null rows across a run of
-			// duplicate timestamps exactly as `locate_present_dense_index` does.
-			let Some(row) = cps.search_sorted_with(&ts_col, t, |row| row < stats.row_count && nulls.is_present(row)) else {
+		} else if let Some(lz) = lazy.as_ref() {
+			// Resume from the nearest checkpoint and range-decode only the dods walked,
+			// skipping null rows across a run of duplicate timestamps exactly as
+			// `locate_present_dense_index` does.
+			let Some(row) = lz.lookup(t, |row| row < stats.row_count && nulls.is_present(row)) else {
 				continue;
 			};
 			dense_rank(&nulls, row)
@@ -1567,6 +1568,7 @@ pub fn write_timestamp_column_checkpointed(w: &mut ByteWriter, col: &DeltaOfDelt
 	w.put_uvarint(col.dods.len() as u64);
 	w.put_u8(TS_CODEC_CHECKPOINTED);
 	w.put_uvarint(checkpoints.stride as u64);
+	// (the index, then a *random-access* inner stream — see below)
 	w.put_uvarint(checkpoints.points.len() as u64);
 	// Delta-encode the index against the previous entry: rows ascend and a checkpointed
 	// column is sorted, so both stay small varints instead of full-width values.
@@ -1578,9 +1580,21 @@ pub fn write_timestamp_column_checkpointed(w: &mut ByteWriter, col: &DeltaOfDelt
 		prev_row = cp.row;
 		prev_ts = cp.timestamp;
 	}
-	// The inner codec-tagged stream — the same selector the plain block uses, so the
-	// dods themselves are encoded identically either way.
-	write_dod_codec(w, col);
+	// The inner stream is **forced to the per-block codec**, not `best_encoding_name`'s
+	// pick. This is the whole point: the index alone only skips the cumulative-sum
+	// reconstruction, which measurement showed is ~1% of a real point read — the *decode*
+	// of the dod stream dominates. `TS_CODEC_BLOCKED` is the codec that can be
+	// range-decoded (`blocked_bitpack_decode_range` skips whole blocks by their width
+	// headers), so a probe touches only the blocks around its checkpoint and the decode
+	// becomes sublinear too. A variable-length codec (varint/Gorilla/RLE) has no block
+	// boundaries to skip to, so it could never deliver that.
+	//
+	// The trade: this may write more bytes than the best codec would (measured alongside
+	// the lookup win in `benches/dodsearch.rs`) — another reason the path is opt-in.
+	let block = crate::timestamp::BLOCKED_BITPACK_BLOCK;
+	w.put_u8(TS_CODEC_BLOCKED);
+	w.put_uvarint(block as u64);
+	w.put_bytes(&crate::timestamp::blocked_bitpack_encode(&col.dods, block));
 }
 
 /// Write the `[codec tag][stream]` body of a second-difference column, choosing the
@@ -1669,6 +1683,112 @@ pub fn read_timestamp_column_with_checkpoints(r: &mut ByteReader) -> Result<(Del
 	let count = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
 	let (dods, checkpoints) = read_dod_codec(r, count)?;
 	Ok((DeltaOfDeltaColumn { first, first_delta, dods, unit }, checkpoints))
+}
+
+/// A checkpointed timestamp block parsed **without decoding the dod stream**: the sparse
+/// index plus a borrowed handle on the undecoded per-block stream, so a probe
+/// range-decodes only the blocks it needs.
+///
+/// This is what makes the checkpoint index actually pay: skipping the cumulative-sum
+/// reconstruction alone is ~1% of a real point read, because the dod *decode* dominates.
+struct LazyCheckpointedTs<'a> {
+	/// The anchor + first delta + unit — everything but the dods.
+	first: i64,
+	first_delta: i64,
+	checkpoints: DodCheckpoints,
+	/// The undecoded `blocked_bitpack_encode` dod stream.
+	dod_bytes: &'a [u8],
+	block: usize,
+	count: usize,
+}
+
+impl LazyCheckpointedTs<'_> {
+	/// The first row whose timestamp is `target` and which `accept`s, resuming from the
+	/// nearest checkpoint and **range-decoding only the dods it walks over** — in chunks,
+	/// so the common case touches one chunk and the whole column is never decoded.
+	///
+	/// Equal to the full-decode search for every frame (asserted by the frame tests).
+	fn lookup(&self, target: i64, accept: impl Fn(usize) -> bool) -> Option<usize> {
+		if self.first == target && accept(0) {
+			return Some(0);
+		}
+		let idx = self.checkpoints.points.partition_point(|c| c.timestamp < target);
+		let start = if idx == 0 { DodCheckpoint { row: 1, timestamp: self.first.wrapping_add(self.first_delta), delta: self.first_delta } } else { self.checkpoints.points[idx - 1] };
+
+		let (mut row, mut ts, mut delta) = (start.row, start.timestamp, start.delta);
+		// Walk forward, pulling the dods in stride-sized chunks. A sorted column means we
+		// stop as soon as the timestamps pass `target`, so this normally decodes one chunk.
+		let chunk = self.checkpoints.stride.max(1);
+		loop {
+			if ts == target && accept(row) {
+				return Some(row);
+			}
+			if ts > target {
+				return None;
+			}
+			// Advancing from row `r` consumes `dods[r - 1]`.
+			let need = row.checked_sub(1)?;
+			if need >= self.count {
+				return None;
+			}
+			let window = crate::timestamp::blocked_bitpack_decode_range(self.dod_bytes, self.block, self.count, need, chunk);
+			if window.is_empty() {
+				return None;
+			}
+			for &dod in &window {
+				delta = delta.wrapping_add(dod);
+				ts = ts.wrapping_add(delta);
+				row += 1;
+				if ts == target && accept(row) {
+					return Some(row);
+				}
+				if ts > target {
+					return None;
+				}
+			}
+		}
+	}
+}
+
+/// Parse a checkpointed timestamp block lazily, or `None` if the block is not
+/// checkpointed (or its inner codec is not range-decodable).
+///
+/// On `Some` the reader is advanced past the whole timestamp block (so the caller reads
+/// the quality column next) **without the dod stream ever being decoded**; on `None` the
+/// reader is left untouched so the caller falls back to the ordinary read.
+fn read_lazy_checkpointed_ts<'a>(r: &mut ByteReader<'a>) -> Result<Option<LazyCheckpointedTs<'a>>, DspSegError> {
+	let mut probe = r.clone();
+	let _unit = time_unit_from_tag(probe.read_u8()?)?;
+	let first = probe.read_i64_le()?;
+	let first_delta = match probe.read_u8()? {
+		0 => return Ok(None),
+		_ => probe.read_svarint()?,
+	};
+	let count = usize::try_from(probe.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+	if probe.read_u8()? != TS_CODEC_CHECKPOINTED {
+		return Ok(None);
+	}
+	let stride = usize::try_from(probe.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+	let entries = usize::try_from(probe.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+	let mut points = Vec::with_capacity(entries);
+	let (mut row, mut timestamp) = (0_usize, 0_i64);
+	for _ in 0..entries {
+		row += usize::try_from(probe.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+		timestamp = timestamp.wrapping_add(probe.read_svarint()?);
+		let delta = probe.read_svarint()?;
+		points.push(DodCheckpoint { row, timestamp, delta });
+	}
+	// Only the per-block codec can be range-decoded; anything else must decode wholesale,
+	// which is the cost this path exists to avoid.
+	if probe.read_u8()? != TS_CODEC_BLOCKED {
+		return Ok(None);
+	}
+	let block = usize::try_from(probe.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+	let dod_bytes = probe.read_bytes()?;
+	let rows = if count == 0 { 1 } else { count + 2 };
+	// Commit: the block parsed cleanly, so hand the caller a reader positioned after it.
+	*r = probe;
+	Ok(Some(LazyCheckpointedTs { first, first_delta, checkpoints: DodCheckpoints { stride: stride.max(1), points, rows }, dod_bytes, block: block.max(1), count }))
 }
 
 /// Read a codec-tagged second-difference stream: the `[codec tag][stream]` body shared
