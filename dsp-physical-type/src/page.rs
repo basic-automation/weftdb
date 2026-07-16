@@ -399,6 +399,43 @@ impl PagedSegment {
 		crate::dspseg::write_paged_segment(self)
 	}
 
+	/// Seal to a `.dspseg` frame whose every page carries a **persisted checkpoint index**.
+	/// See [`crate::dspseg::write_paged_segment_checkpointed`].
+	///
+	/// Read by the ordinary [`read_from`](Self::read_from) — the codec tag is additive.
+	/// Note the paged win is much smaller than the single-block one: page pruning already
+	/// bounds a probe's decode to `rows_per_page`.
+	#[must_use]
+	pub fn write_to_checkpointed(&self, stride: usize) -> Vec<u8> {
+		crate::dspseg::write_paged_segment_checkpointed(self, stride)
+	}
+
+	/// Whether a checkpoint index would help this segment's point lookups: a **sorted**
+	/// segment with at least one **irregular** page (a regular page already resolves in
+	/// `O(1)` closed form, an out-of-order segment cannot be binary-searched). The paged
+	/// analogue of [`Segment::benefits_from_checkpoints`](crate::Segment::benefits_from_checkpoints).
+	#[must_use]
+	pub fn benefits_from_checkpoints(&self) -> bool {
+		self.stats.time_sorted && self.pages.iter().any(|p| p.timestamps.arithmetic_stride().is_none())
+	}
+
+	/// The **size cost of the codec override** a checkpointed frame would pay, as a ratio
+	/// of the timestamp bytes this segment would otherwise write — summed across pages, so
+	/// one pathological page cannot hide behind cheap neighbours. See
+	/// [`Segment::checkpoint_codec_overhead`](crate::Segment::checkpoint_codec_overhead)
+	/// for why a caller must weigh this and not shape alone.
+	#[must_use]
+	pub fn checkpoint_codec_overhead(&self) -> f64 {
+		let best: usize = self.pages.iter().map(|p| p.timestamps.best_estimated_bytes()).sum();
+		if best == 0 {
+			return 1.0;
+		}
+		let blocked: usize = self.pages.iter().map(|p| p.timestamps.blocked_estimated_bytes()).sum();
+		#[allow(clippy::cast_precision_loss)]
+		let ratio = blocked as f64 / best as f64;
+		ratio
+	}
+
 	/// Read a paged segment back from a `.dspseg` byte frame, verifying its checksum.
 	///
 	/// Exact inverse of [`PagedSegment::write_to`]. See

@@ -31,7 +31,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use bigdecimal::BigDecimal;
-use dsp_physical_type::{merge_newer_wins, split_index, AspectSchema, PagedSegment, Segment, SegmentDescriptor, SplitDecision, SplitPolicy, PAGED_SEGMENT_FORMAT_VERSION};
+use chrono::{DateTime, Utc};
+use dsp_physical_type::{merge_newer_wins, split_index, AspectSchema, PagedSegment, Segment, SegmentDescriptor, SplitDecision, SplitPolicy, TimeUnit, PAGED_SEGMENT_FORMAT_VERSION};
+use dsp_reduce::{Aggregation, Bucket, PartialReduction};
+use splimes::{Point, Resolution};
 
 use crate::{AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, SegmentIndexStore};
 
@@ -48,6 +51,92 @@ const DEFAULT_SUBJECT: &str = "default";
 /// `segment_index.db` under the given root); seal batches with
 /// [`seal`](SegmentStore::seal); read a time range with
 /// [`read_time_range`](SegmentStore::read_time_range).
+/// When a freshly sealed segment should carry a **persisted timestamp checkpoint index**.
+///
+/// The index makes a point lookup on a *sorted, irregular* column resume from the nearest
+/// checkpoint instead of decoding the whole timestamp column — measured **~3.45× faster**
+/// on a 100k-row single-block frame for **+0.41% bytes** (`dsp-physical-type`'s
+/// `benches/dodsearch.rs`). It is a **storage-for-latency trade**, so it is **off by
+/// default**: `DISABLED` writes byte-for-byte the frames DSP has always written.
+///
+/// Enable per-deployment with `DSP_SEGMENT_CHECKPOINT_STRIDE` (rows between checkpoints;
+/// ~1024 is the sweet spot — stride barely moves the speed but does move the size) and
+/// optionally `DSP_SEGMENT_CHECKPOINT_MIN_ROWS` (default [`DEFAULT_CHECKPOINT_MIN_ROWS`];
+/// a small segment decodes trivially, so indexing it is pure cost).
+///
+/// Whether making this the *default* is owner-gated — it changes the headline bytes/point.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CheckpointPolicy {
+	/// Rows between checkpoints; `None` disables the index entirely.
+	pub stride: Option<usize>,
+	/// Segments with fewer rows than this are never checkpointed.
+	pub min_rows: usize,
+	/// Ceiling on the timestamp-codec override a checkpointed frame may pay
+	/// (`blocked / best`; `1.0` = only when free). See
+	/// [`DEFAULT_CHECKPOINT_MAX_CODEC_OVERHEAD`].
+	pub max_codec_overhead: f64,
+}
+
+/// Row floor below which a checkpoint index is not worth its bytes.
+pub const DEFAULT_CHECKPOINT_MIN_ROWS: usize = 8_192;
+
+/// Ceiling on the timestamp-codec override ratio a checkpointed seal will accept: `1.25`
+/// (a quarter more timestamp bytes than the best codec would write).
+///
+/// A checkpointed frame must encode its dods with the range-decodable per-block codec
+/// rather than the smallest one. Measured, that override is ~free where the per-block
+/// codec already wins (+1% on bounded jitter) but **~3.5× on a Gorilla-shaped
+/// scattered-jitter column and ~14× on an RLE-shaped long-constant-run column** — and
+/// both of those are *irregular*, so a shape-only test would happily checkpoint them
+/// (`dsp-physical-type`'s `benches/dodsearch.rs::report_codec_override_cost`). Without
+/// this ceiling, enabling `DSP_SEGMENT_CHECKPOINT_STRIDE` would silently bloat exactly
+/// those columns. Override with `DSP_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD`.
+pub const DEFAULT_CHECKPOINT_MAX_CODEC_OVERHEAD: f64 = 1.25;
+
+impl CheckpointPolicy {
+	/// Never write a checkpoint index — the default, and byte-for-byte the historical
+	/// frame layout.
+	pub const DISABLED: Self = Self { stride: None, min_rows: DEFAULT_CHECKPOINT_MIN_ROWS, max_codec_overhead: DEFAULT_CHECKPOINT_MAX_CODEC_OVERHEAD };
+
+	/// Read the policy from the environment: `DSP_SEGMENT_CHECKPOINT_STRIDE` (absent, zero
+	/// or unparseable → [`DISABLED`](Self::DISABLED)), `DSP_SEGMENT_CHECKPOINT_MIN_ROWS`
+	/// (→ [`DEFAULT_CHECKPOINT_MIN_ROWS`]) and `DSP_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD`
+	/// (→ [`DEFAULT_CHECKPOINT_MAX_CODEC_OVERHEAD`]; a non-finite or `< 1.0` value is
+	/// ignored, since a ratio below 1.0 could never be met).
+	#[must_use]
+	pub fn from_env() -> Self {
+		let stride = std::env::var("DSP_SEGMENT_CHECKPOINT_STRIDE").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&s| s > 0);
+		let min_rows = std::env::var("DSP_SEGMENT_CHECKPOINT_MIN_ROWS").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(DEFAULT_CHECKPOINT_MIN_ROWS);
+		let max_codec_overhead = std::env::var("DSP_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|r| r.is_finite() && *r >= 1.0).unwrap_or(DEFAULT_CHECKPOINT_MAX_CODEC_OVERHEAD);
+		Self { stride, min_rows, max_codec_overhead }
+	}
+
+	/// The stride to seal a segment with, or `None` to write the ordinary frame.
+	///
+	/// Three gates, all of which must pass: the policy is enabled, the segment's *shape*
+	/// benefits (`benefits_from_checkpoints` — sorted and irregular) and is big enough,
+	/// and the *codec override* the checkpointed frame would force is affordable
+	/// (`checkpoint_codec_overhead` within [`max_codec_overhead`](Self::max_codec_overhead)).
+	/// The last gate is what stops an irregular-but-Gorilla/RLE-shaped column from being
+	/// silently bloated for a lookup win that is not worth those bytes.
+	#[must_use]
+	pub fn stride_for(self, row_count: usize, benefits: bool, codec_overhead: f64) -> Option<usize> {
+		self.stride.filter(|_| benefits && row_count >= self.min_rows && codec_overhead <= self.max_codec_overhead)
+	}
+}
+
+/// Lift a stored integer epoch in `unit` to an absolute instant — the inverse of the
+/// ingest path's `epoch_in_unit`. `None` if the epoch falls outside the representable
+/// range (only reachable for coarse units at absurd magnitudes).
+const fn instant_from_epoch(epoch: i64, unit: TimeUnit) -> Option<DateTime<Utc>> {
+	match unit {
+		TimeUnit::Seconds => DateTime::<Utc>::from_timestamp(epoch, 0),
+		TimeUnit::Millis => DateTime::<Utc>::from_timestamp_millis(epoch),
+		TimeUnit::Micros => DateTime::<Utc>::from_timestamp_micros(epoch),
+		TimeUnit::Nanos => Some(DateTime::<Utc>::from_timestamp_nanos(epoch)),
+	}
+}
+
 pub struct SegmentStore {
 	/// The store root; sealed frames live in `root/segments/`.
 	root: PathBuf,
@@ -60,6 +149,8 @@ pub struct SegmentStore {
 	/// The libSQL aspect-schema catalog (`root/aspect_catalog.db`) — the declared
 	/// [`AspectSchema`] for each aspect, so a seal need not be handed the schema.
 	catalog: AspectCatalog,
+	/// Whether new seals carry a timestamp checkpoint index (off unless configured).
+	checkpoints: CheckpointPolicy,
 	/// The libSQL DB/subject registry (`root/catalog.db`) — the hierarchy above the
 	/// aspect schemas. The store registers its own `(database, subject)` here on open,
 	/// so the control plane can enumerate what a root holds.
@@ -116,7 +207,23 @@ impl SegmentStore {
 		// the databases/subjects a root holds (idempotent).
 		registry.register_database(database).await?;
 		registry.register_subject(database, subject).await?;
-		Ok(Self { root, index, metadata, catalog, registry, database: database.to_string(), subject: subject.to_string() })
+		let checkpoints = CheckpointPolicy::from_env();
+		Ok(Self { root, index, metadata, catalog, registry, database: database.to_string(), subject: subject.to_string(), checkpoints })
+	}
+
+	/// Override this store's [`CheckpointPolicy`] (the env-read default is
+	/// [`CheckpointPolicy::DISABLED`]), for a caller that wants the timestamp checkpoint
+	/// index without setting an environment variable.
+	#[must_use]
+	pub const fn with_checkpoint_policy(mut self, policy: CheckpointPolicy) -> Self {
+		self.checkpoints = policy;
+		self
+	}
+
+	/// The checkpoint policy new seals are written under.
+	#[must_use]
+	pub const fn checkpoint_policy(&self) -> CheckpointPolicy {
+		self.checkpoints
 	}
 
 	/// The control-plane index backing this store, for pruning/accounting queries
@@ -303,7 +410,13 @@ impl SegmentStore {
 	/// the dense and nullable seal paths.
 	async fn persist(&self, aspect: &str, segment: &Segment) -> Result<SegmentDescriptor> {
 		let id = self.index.next_id(aspect).await?;
-		let bytes = segment.write_to();
+		// Checkpoint the timestamp column only when configured AND the segment's shape
+		// actually benefits (sorted + irregular + big enough) — otherwise write the
+		// historical frame byte-for-byte. Either frame reads identically.
+		let bytes = match self.checkpoints.stride_for(segment.stats.row_count, segment.benefits_from_checkpoints(), segment.checkpoint_codec_overhead()) {
+			Some(stride) => segment.write_to_checkpointed(stride),
+			None => segment.write_to(),
+		};
 		let path = self.segment_path(aspect, id);
 		tokio::fs::write(&path, &bytes).await.with_context(|| format!("writing segment {}", path.display()))?;
 		let descriptor = SegmentDescriptor::of_segment(id, path.to_string_lossy().into_owned(), bytes.len() as u64, segment);
@@ -316,7 +429,12 @@ impl SegmentStore {
 	/// record its descriptor. The paged analogue of [`persist`](SegmentStore::persist).
 	async fn persist_paged(&self, aspect: &str, segment: &PagedSegment) -> Result<SegmentDescriptor> {
 		let id = self.index.next_id(aspect).await?;
-		let bytes = segment.write_to();
+		// As `persist`, though the paged win is far smaller — page pruning already bounds
+		// a probe's decode to `rows_per_page`.
+		let bytes = match self.checkpoints.stride_for(segment.stats.row_count, segment.benefits_from_checkpoints(), segment.checkpoint_codec_overhead()) {
+			Some(stride) => segment.write_to_checkpointed(stride),
+			None => segment.write_to(),
+		};
 		let path = self.segment_path(aspect, id);
 		tokio::fs::write(&path, &bytes).await.with_context(|| format!("writing segment {}", path.display()))?;
 		let descriptor = SegmentDescriptor::of_paged_segment(id, path.to_string_lossy().into_owned(), bytes.len() as u64, segment);
@@ -367,6 +485,57 @@ impl SegmentStore {
 			}
 		}
 		Ok((timestamps, values))
+	}
+
+	/// **Cross-segment downsample** — reduce `aspect`'s `[start, end]` rows into
+	/// grid-aligned buckets **without ever materializing the range**.
+	///
+	/// The distributed shape of [`dsp_reduce::reduce`]: the index is pruned by time, then
+	/// each surviving segment is read, windowed, and folded into its own
+	/// [`PartialReduction`]; the partials are merged and finished once. Only one segment's
+	/// rows are in memory at a time, so a range far larger than RAM still reduces — and
+	/// with a `sketch_p*` aggregation the per-bucket state is bounded too, which is the
+	/// scenario `DdSketch`'s exact mergeability exists for.
+	///
+	/// Identical to reading the whole range and reducing it in one pass (merging is exact
+	/// for every reduction), which is what the test asserts. Timestamps are the aspect's
+	/// declared [`TimeUnit`] epochs, lifted to absolute instants for bucketing.
+	///
+	/// # Errors
+	///
+	/// If `aspect` has no declared schema, if a segment cannot be read or decoded, if a
+	/// stored epoch falls outside the representable instant range, or if the reduction
+	/// fails.
+	pub async fn downsample_range(&self, aspect: &str, start: i64, end: i64, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Vec<Bucket>> {
+		let schema = self.require_schema(aspect).await?;
+		let descriptors = self.index.prune_by_time(aspect, start, end).await?;
+		let mut merged: Option<PartialReduction> = None;
+		for descriptor in &descriptors {
+			let bytes = tokio::fs::read(&descriptor.path).await.with_context(|| format!("reading segment {}", descriptor.path))?;
+			let (ts, vs) = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION {
+				dsp_physical_type::dspseg::read_paged_segment_range(&bytes, start, end).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?
+			} else {
+				dsp_physical_type::dspseg::read_segment_range(&bytes, start, end).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?
+			};
+			// Null rows carry no value to reduce; present rows lift to absolute instants.
+			let mut points: Vec<Point> = Vec::with_capacity(ts.len());
+			for (t, v) in ts.into_iter().zip(vs) {
+				if let Some(value) = v {
+					if start <= t && t <= end {
+						points.push(Point::new(instant_from_epoch(t, schema.timestamp_unit).ok_or_else(|| anyhow::anyhow!("segment {} holds epoch {t} outside the representable instant range", descriptor.path))?, value));
+					}
+				}
+			}
+			if points.is_empty() {
+				continue;
+			}
+			let partial = dsp_reduce::reduce_partial(&points, resolution, None, None, aggregations).map_err(|e| anyhow::anyhow!("reducing segment {}: {e}", descriptor.path))?;
+			match merged.as_mut() {
+				Some(m) => m.merge(partial).map_err(|e| anyhow::anyhow!("merging segment {}: {e}", descriptor.path))?,
+				None => merged = Some(partial),
+			}
+		}
+		merged.map_or_else(|| Ok(Vec::new()), |m| m.finish(resolution, aggregations).map_err(|e| anyhow::anyhow!("finishing downsample of {aspect:?}: {e}")))
 	}
 
 	/// **Point lookup** (roadmap Phase 4.6 read-planner): the present value of
@@ -2656,5 +2825,145 @@ mod tests {
 		assert_eq!(after.total_rows, 4);
 		assert_eq!(after.time_range, Some((0, 30)));
 		assert_eq!(after.value_range, Some((bd("1"), bd("4"))));
+	}
+
+	/// The policy decides on shape + size, and `DISABLED` is the default — the guarantee
+	/// that an unconfigured deployment's bytes are byte-for-byte what they always were.
+	#[test]
+	fn checkpoint_policy_gates_on_shape_size_and_codec_overhead() {
+		assert_eq!(CheckpointPolicy::DISABLED.stride_for(1_000_000, true, 1.0), None, "disabled never checkpoints, whatever the shape");
+		let p = CheckpointPolicy { stride: Some(1024), min_rows: 8_192, max_codec_overhead: 1.25 };
+		assert_eq!(p.stride_for(10_000, true, 1.01), Some(1024), "a large sorted-irregular segment whose override is ~free is checkpointed");
+		assert_eq!(p.stride_for(10_000, false, 1.0), None, "a regular (or out-of-order) segment gains nothing — O(1) closed form already");
+		assert_eq!(p.stride_for(100, true, 1.0), None, "a small segment decodes trivially; the index would be pure cost");
+		// The gate the measured Gorilla/RLE blow-ups demand: irregular is not enough.
+		assert_eq!(p.stride_for(10_000, true, 3.5), None, "a Gorilla-shaped column (3.5x override) is refused despite being irregular");
+		assert_eq!(p.stride_for(10_000, true, 14.0), None, "an RLE-shaped column (14x override) is refused");
+		assert_eq!(p.stride_for(10_000, true, 1.25), Some(1024), "the ceiling is inclusive");
+	}
+
+	/// End-to-end through the real store: an enabled policy changes the bytes on disk and
+	/// nothing else — every read still returns exactly the same data.
+	#[tokio::test]
+	async fn checkpointed_seal_reads_identically_and_only_changes_the_bytes() {
+		// A sorted IRREGULAR column above the row floor — the shape the index is for.
+		let mut t = 0_i64;
+		let ts: Vec<i64> = (0..12_000)
+			.map(|i: i64| {
+				t += 1 + (i * 7) % 29;
+				t
+			})
+			.collect();
+		let vs: Vec<BigDecimal> = (0..12_000).map(|i| bd(&format!("{}", 100 + i % 400))).collect();
+
+		let policy = CheckpointPolicy { stride: Some(1024), min_rows: 8_192, max_codec_overhead: 1.25 };
+		let plain_dir = TempDir::new().expect("tempdir");
+		let plain = SegmentStore::open(plain_dir.path()).await.expect("opens");
+		assert_eq!(plain.checkpoint_policy(), CheckpointPolicy::DISABLED, "the store is unconfigured by default");
+		let plain_desc = plain.seal("temp", &schema(), &ts, &vs).await.expect("seals");
+
+		let cp_dir = TempDir::new().expect("tempdir");
+		let cp = SegmentStore::open(cp_dir.path()).await.expect("opens").with_checkpoint_policy(policy);
+		let cp_desc = cp.seal("temp", &schema(), &ts, &vs).await.expect("seals");
+
+		// The index costs real bytes — the whole trade, asserted rather than assumed.
+		assert!(cp_desc.byte_len > plain_desc.byte_len, "the checkpointed frame is larger ({} vs {})", cp_desc.byte_len, plain_desc.byte_len);
+
+		// ...and buys identical answers: point reads (present + absent) and a range read.
+		for probe in [ts[0], ts[5_000], ts[11_999], ts[3] + 1, -1] {
+			assert_eq!(cp.read_point("temp", probe).await.expect("reads"), plain.read_point("temp", probe).await.expect("reads"), "point read at {probe} must match the plain store");
+		}
+		let batch = vec![ts[10], ts[8_000], 999_999_999, ts[11_000]];
+		assert_eq!(cp.read_points("temp", &batch).await.expect("reads"), plain.read_points("temp", &batch).await.expect("reads"), "batch read must match");
+		assert_eq!(cp.read_time_range("temp", ts[100], ts[200]).await.expect("reads"), plain.read_time_range("temp", ts[100], ts[200]).await.expect("reads"), "range read must match");
+	}
+
+	/// The cross-segment downsample must equal reading the whole range and reducing it in
+	/// one pass — for every reduction, across many segments, including the sketch.
+	#[tokio::test]
+	async fn downsample_range_equals_a_single_pass_over_the_whole_range() {
+		use dsp_reduce::{reduce, Aggregation};
+		use splimes::{Point, Resolution};
+
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		// `downsample_range` reads the declared unit from the catalog to lift epochs.
+		store.declare("temp", &schema()).await.expect("declares");
+		// Eight separate seals => eight segments the reduction must span, with buckets
+		// straddling segment boundaries (each seal covers 90 minutes at hour resolution).
+		let mut all: Vec<Point> = Vec::new();
+		for seg in 0..8_i64 {
+			// The shared test `schema()` declares SECONDS, so the epochs are seconds: one
+			// sample a minute, 90 minutes per seal, straddling hour buckets.
+			let ts: Vec<i64> = (0..90).map(|i| (seg * 90 + i) * 60).collect();
+			let vs: Vec<BigDecimal> = (0..90).map(|i| bd(&format!("{}", (seg * 7 + i) % 53))).collect();
+			for (t, v) in ts.iter().zip(&vs) {
+				all.push(Point::new(DateTime::<Utc>::from_timestamp(*t, 0).expect("instant"), v.clone()));
+			}
+			store.seal("temp", &schema(), &ts, &vs).await.expect("seals");
+		}
+		let aggs = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::P99, Aggregation::Twa, Aggregation::SketchP99];
+
+		let cross = store.downsample_range("temp", i64::MIN, i64::MAX, Resolution::Hours, &aggs).await.expect("downsamples");
+		let single = reduce(&all, Resolution::Hours, None, None, &aggs).expect("reduces");
+		assert!(cross.len() > 1, "the fixture must span several buckets, got {}", cross.len());
+		assert_eq!(cross, single, "a cross-segment downsample must equal the single pass exactly");
+
+		// A window narrows the result and still matches a single pass over the same window.
+		let (w_start, w_end) = (60_i64 * 100, 60_i64 * 300);
+		let windowed = store.downsample_range("temp", w_start, w_end, Resolution::Hours, &aggs).await.expect("downsamples");
+		let expected: Vec<Point> = all.iter().filter(|p| (w_start..=w_end).contains(&p.timestamp.timestamp())).cloned().collect();
+		assert_eq!(windowed, reduce(&expected, Resolution::Hours, None, None, &aggs).expect("reduces"), "a windowed cross-segment downsample must match");
+
+		// An empty window and an undeclared aspect behave sanely.
+		assert!(store.downsample_range("temp", -10_000, -5_000, Resolution::Hours, &aggs).await.expect("downsamples").is_empty(), "a window with no rows yields no buckets");
+		assert!(store.downsample_range("nope", 0, 1, Resolution::Hours, &aggs).await.is_err(), "an undeclared aspect is an error");
+	}
+
+	/// The codec-override gate, end-to-end on a real store: an **irregular** column whose
+	/// timestamps favour RLE must NOT be checkpointed, because forcing the range-decodable
+	/// per-block codec would inflate its timestamp block ~14x for a lookup win not worth
+	/// those bytes. Shape alone would have accepted it.
+	#[tokio::test]
+	async fn an_irregular_but_rle_shaped_column_is_refused_by_the_codec_gate() {
+		// Long constant runs then a jump: irregular (so the shape gate passes), but RLE is
+		// dramatically the best timestamp codec.
+		let ts: Vec<i64> = (0..12_000_i64).map(|i| 1_000_000 + (i / 100) * 5_000).collect();
+		let vs: Vec<BigDecimal> = (0..12_000).map(|i| bd(&format!("{}", i % 300))).collect();
+		let policy = CheckpointPolicy { stride: Some(1024), min_rows: 8_192, max_codec_overhead: 1.25 };
+
+		let plain_dir = TempDir::new().expect("tempdir");
+		let plain = SegmentStore::open(plain_dir.path()).await.expect("opens");
+		let plain_desc = plain.seal("temp", &schema(), &ts, &vs).await.expect("seals");
+
+		let cp_dir = TempDir::new().expect("tempdir");
+		let cp = SegmentStore::open(cp_dir.path()).await.expect("opens").with_checkpoint_policy(policy);
+		let cp_desc = cp.seal("temp", &schema(), &ts, &vs).await.expect("seals");
+
+		assert_eq!(cp_desc.byte_len, plain_desc.byte_len, "an RLE-shaped column must be byte-for-byte identical — the codec gate refused to checkpoint it");
+		// Raising the ceiling lets it through, proving the gate (not the shape) is what refused.
+		let loose_dir = TempDir::new().expect("tempdir");
+		let loose = SegmentStore::open(loose_dir.path()).await.expect("opens").with_checkpoint_policy(CheckpointPolicy { max_codec_overhead: 100.0, ..policy });
+		let loose_desc = loose.seal("temp", &schema(), &ts, &vs).await.expect("seals");
+		assert!(loose_desc.byte_len > plain_desc.byte_len, "with the ceiling lifted the same column IS checkpointed ({} vs {}) — and pays for it", loose_desc.byte_len, plain_desc.byte_len);
+	}
+
+	/// A *regular* column must not be checkpointed even when the policy is on: it already
+	/// resolves O(1) closed-form, so an index would be bytes for nothing.
+	#[tokio::test]
+	async fn a_regular_column_is_never_checkpointed_even_when_enabled() {
+		let ts: Vec<i64> = (0..12_000).map(|i| i * 10).collect();
+		let vs: Vec<BigDecimal> = (0..12_000).map(|i| bd(&format!("{}", i % 500))).collect();
+		let policy = CheckpointPolicy { stride: Some(1024), min_rows: 8_192, max_codec_overhead: 1.25 };
+
+		let plain_dir = TempDir::new().expect("tempdir");
+		let plain = SegmentStore::open(plain_dir.path()).await.expect("opens");
+		let plain_desc = plain.seal("temp", &schema(), &ts, &vs).await.expect("seals");
+
+		let cp_dir = TempDir::new().expect("tempdir");
+		let cp = SegmentStore::open(cp_dir.path()).await.expect("opens").with_checkpoint_policy(policy);
+		let cp_desc = cp.seal("temp", &schema(), &ts, &vs).await.expect("seals");
+
+		assert_eq!(cp_desc.byte_len, plain_desc.byte_len, "a regular column must be byte-for-byte identical — no index written");
 	}
 }
