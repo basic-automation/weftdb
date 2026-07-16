@@ -878,9 +878,13 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   twa=15.0, avg=11.67 on the same series. *(src:
   https://deepwiki.com/timescale/timescaledb-toolkit/3.3.1-time-weighted-averages ·
   https://github.com/timescale/docs/blob/latest/use-timescale/hyperfunctions/time-weighted-average.md)*
-- [ ] **NEXT — TWA residue: the *last-point-to-bucket-end* weighting option.** Both DSP methods give
-  the bucket's last sample no forward weight (it has no successor), so a bucket ending in a long-held
-  value under-weights it. Timescale exposes this as an explicit choice. *(src:
+- [x] **DONE (2026-07-16) — TWA residue: the *last-point-to-bucket-end* weighting.**
+  `Aggregation::TwaBucketEnd` (token `twa_bucket_end`, alias `twa_locf_end`) carries the bucket's
+  last sample forward to its grid end, fixing a bias that is not subtle: a change-only sensor
+  reporting 0 at 00:00 and 100 at 00:01 in an hour bucket gets `twa`=0.0 though it held 100 for 59
+  of 60 minutes; `twa_bucket_end`=98.33. LOCF only (the linear method has no successor value to
+  interpolate toward). Runtime-verified: one request returns twa=0.0 / twa_bucket_end=98.33 /
+  twa_linear=50.0 / avg=50.0. *(src:
   https://github.com/timescale/timescaledb-toolkit/discussions/697)*
 - [x] **DONE (2026-07-16) — server ILP `parse_aggregation_token` adopts
   `dsp_reduce::Aggregation::from_token`:** the last duplicate of the aggregation vocabulary is gone;
