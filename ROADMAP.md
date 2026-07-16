@@ -1152,15 +1152,23 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
      `rows_per_page`, so there is little left to save. The index is mostly a *single-block* lever.
   This is the "decode-throughput is often bandwidth-bound — measure, don't assume" caveat confirmed
   on DSP's own path. *(src: https://arxiv.org/pdf/2606.22423)*
-- [ ] **NEXT — checkpoint index adopt-or-drop into the DEFAULT seal — owner-gated (bytes/point
-  change, as FOR/cascade/ALP):** the win is real (3.45× single-block irregular point read for +0.41%
-  bytes) but **nothing seals checkpointed frames**, so no user reaches it: `write_segment_checkpointed`
-  is opt-in and the `AspectSchema::seal*` paths never call it. To land the benefit, expose an opt-in
-  seal (`seal_checkpointed`, an ingest flag / `DSP_SEGMENT_CHECKPOINT_STRIDE` env) and decide whether
-  a large sorted-irregular segment should checkpoint by default. Default adoption trades bytes/point
-  for lookup latency, so it needs owner sign-off + a headline re-baseline. Suggested policy if
-  adopted: only for `time_sorted && arithmetic_stride().is_none() && rows > ~8k`, stride ≈ 1024
-  (stride barely affects speed but does affect size).
+- [x] **DONE (2026-07-16) — the checkpointed seal is REACHABLE (opt-in).** `CheckpointPolicy`
+  (`database`) reads `DSP_SEGMENT_CHECKPOINT_STRIDE` + `DSP_SEGMENT_CHECKPOINT_MIN_ROWS` (default
+  8192 rows) and applies at `persist`/`persist_paged`, so all six seal entry points inherit it;
+  `SegmentStore::with_checkpoint_policy` overrides it programmatically. It fires only where it pays
+  — `Segment::benefits_from_checkpoints()` (sorted **and** irregular). **Off by default**: an
+  unconfigured store writes byte-for-byte the historical frames. Runtime-verified on the live binary
+  over identical 12k-row sorted-irregular ingests: unset → `total_bytes=19159`
+  (`bytes_per_point=1.5966`), `DSP_SEGMENT_CHECKPOINT_STRIDE=1024` → `19422` (`1.6185`, **+1.37%**),
+  with `…/at` and `…/at-multi` returning byte-identical JSON from both stores.
+- [ ] **NEXT — checkpoint index adopt-or-drop into the DEFAULT policy — owner-gated (bytes/point
+  change, as FOR/cascade/ALP):** the trade is now measurable end-to-end and merely needs a decision:
+  **~3.45× faster irregular single-block point reads for ~+0.4–1.4% bytes** (+1.37% on the 12k-row
+  runtime corpus; +0.41% on the 100k-row bench — the overhead shrinks as the segment grows, since
+  the index is `rows/stride` entries against a growing column). Flip `CheckpointPolicy::from_env`'s
+  default to `stride: Some(1024)` if adopted, then re-baseline the headline once. Suggested policy is
+  already the shipped predicate: `time_sorted && !regular && rows >= 8192`. **Decide with the paged
+  case in mind — paged frames gain only 1.14×, so a paged-heavy deployment may not want it.**
 - [ ] **NEXT — checkpointed frames force `TS_CODEC_BLOCKED`, which may not be the smallest codec:**
   the checkpointed writer overrides `best_encoding_name`'s pick because only the per-block codec is
   range-decodable. On a stream where Gorilla/RLE/varint would win, that costs bytes beyond the index
