@@ -464,22 +464,12 @@ fn parse_aggregations(token: Option<&str>) -> Result<Vec<Aggregation>, ApiError>
 	token.split(',').map(str::trim).filter(|t| !t.is_empty()).map(parse_aggregation_token).collect()
 }
 
-/// Map a single aggregation token to [`Aggregation`].
+/// Map a single aggregation token to [`Aggregation`] via the shared
+/// [`Aggregation::from_token`] parser, so the HTTP surface accepts exactly the token
+/// set the reduction supports (including the `median`/`time_weighted_avg` aliases) and
+/// cannot drift from `dsp-reduce` as reductions are added.
 fn parse_aggregation_token(token: &str) -> Result<Aggregation, ApiError> {
-	match token.to_ascii_lowercase().as_str() {
-		"min" => Ok(Aggregation::Min),
-		"max" => Ok(Aggregation::Max),
-		"avg" => Ok(Aggregation::Avg),
-		"sum" => Ok(Aggregation::Sum),
-		"first" => Ok(Aggregation::First),
-		"last" => Ok(Aggregation::Last),
-		"p50" | "median" => Ok(Aggregation::P50),
-		"p90" => Ok(Aggregation::P90),
-		"p95" => Ok(Aggregation::P95),
-		"p99" => Ok(Aggregation::P99),
-		"twa" => Ok(Aggregation::Twa),
-		other => Err(ApiError::BadRequest(format!("unknown aggregation `{other}` (use min/max/avg/sum/first/last/p50/p90/p95/p99/twa)"))),
-	}
+	Aggregation::from_token(token).ok_or_else(|| ApiError::BadRequest(format!("unknown aggregation `{token}` (use min/max/avg/sum/first/last/p50/p90/p95/p99/twa)")))
 }
 
 #[cfg(test)]
@@ -627,6 +617,18 @@ mod tests {
 		assert_eq!(parse_aggregations(Some("  ")).unwrap(), DEFAULT_AGGREGATIONS.to_vec());
 		assert_eq!(parse_aggregations(Some("min,SUM, last")).unwrap(), vec![Aggregation::Min, Aggregation::Sum, Aggregation::Last]);
 		assert!(parse_aggregations(Some("min,bogus")).is_err());
+	}
+
+	#[test]
+	fn aggregation_tokens_track_the_shared_reduce_parser() {
+		// The HTTP surface parses via `dsp_reduce::Aggregation::from_token`, so every
+		// token the reduction supports is reachable here — including the aliases the
+		// server's own former token match did not carry.
+		for agg in [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::P50, Aggregation::P90, Aggregation::P95, Aggregation::P99, Aggregation::Twa] {
+			assert_eq!(parse_aggregations(Some(agg.as_str())).unwrap(), vec![agg], "{} must parse at the HTTP surface", agg.as_str());
+		}
+		assert_eq!(parse_aggregations(Some("median")).unwrap(), vec![Aggregation::P50], "median aliases p50");
+		assert_eq!(parse_aggregations(Some("time_weighted_avg")).unwrap(), vec![Aggregation::Twa], "time_weighted_avg aliases twa");
 	}
 
 	async fn post_text(uri: &str, body: &str) -> (StatusCode, serde_json::Value) {
