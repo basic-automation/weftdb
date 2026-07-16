@@ -311,6 +311,44 @@ impl BucketAcc {
 		Ok(())
 	}
 
+	/// Fold `other`'s state for the **same bucket** into this one.
+	///
+	/// Every field is mergeable, which is what makes a chunked reduction exact: counts and
+	/// sums add, min/max combine, first/last resolve by timestamp (so chunk order does not
+	/// matter), collected samples concatenate, and the sketches merge — `DdSketch::merge`
+	/// being exact is precisely why the sketch reductions survive this too.
+	fn merge(&mut self, other: Self) -> Result<(), ReduceError> {
+		self.count += other.count;
+		self.sum += other.sum;
+		if let Some(m) = other.min {
+			if self.min.as_ref().is_none_or(|cur| &m < cur) {
+				self.min = Some(m);
+			}
+		}
+		if let Some(m) = other.max {
+			if self.max.as_ref().is_none_or(|cur| &m > cur) {
+				self.max = Some(m);
+			}
+		}
+		if let Some((t, v)) = other.first {
+			if self.first.as_ref().is_none_or(|(cur, _)| t < *cur) {
+				self.first = Some((t, v));
+			}
+		}
+		if let Some((t, v)) = other.last {
+			if self.last.as_ref().is_none_or(|(cur, _)| t >= *cur) {
+				self.last = Some((t, v));
+			}
+		}
+		self.samples.extend(other.samples);
+		match (self.sketch.as_mut(), other.sketch) {
+			(Some(mine), Some(theirs)) => mine.merge(&theirs).map_err(|_| ReduceError::SketchValue)?,
+			(None, Some(theirs)) => self.sketch = Some(theirs),
+			_ => {}
+		}
+		Ok(())
+	}
+
 	/// Materialize the requested reductions and the grid-aligned bucket start.
 	fn finish(self, resolution: Resolution, base: i64, aggregations: &[Aggregation]) -> Result<Bucket, ReduceError> {
 		let timestamp = bucket_start(resolution, base).ok_or(ReduceError::BucketStartOverflow)?;
@@ -445,6 +483,91 @@ fn percentile(samples: &[BigDecimal], rank: u8) -> Option<BigDecimal> {
 /// resolution, or [`ReduceError::BucketStartOverflow`] if a bucket's grid start
 /// scales past the representable time range.
 pub fn reduce(points: &[Point], resolution: Resolution, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, aggregations: &[Aggregation]) -> Result<Vec<Bucket>, ReduceError> {
+	reduce_partial(points, resolution, start, end, aggregations)?.finish(resolution, aggregations)
+}
+
+/// The in-progress state of a reduction over **part** of a series.
+///
+/// A chunk, a segment, one shard of a parallel scan — [`merge`](PartialReduction::merge)
+/// it with the other parts, then [`finish`](PartialReduction::finish) into the same
+/// buckets a single pass over the whole series would produce.
+///
+/// This is what makes a reduction *distributable*. [`reduce`] is just
+/// [`reduce_partial`] + [`finish`](PartialReduction::finish) over one chunk; a caller
+/// holding a series across several segments reduces each independently — in parallel, or
+/// as each segment is read — merges the partials, and finishes once. It is also the
+/// consumer that makes [`DdSketch`]'s exact mergeability pay: a `sketch_p*` over a merged
+/// partial is the same sketch a single pass would have built, so an approximate p99 can be
+/// computed over a series far too large to hold in one bucket.
+///
+/// Merging is exact for **every** reduction, not just the sketches, and independent of
+/// chunk order (`first`/`last` resolve by timestamp).
+#[derive(Debug)]
+pub struct PartialReduction {
+	buckets: BTreeMap<i64, BucketAcc>,
+}
+
+impl PartialReduction {
+	/// Fold `other` into this partial. Buckets present in both are merged; buckets only in
+	/// `other` are adopted.
+	///
+	/// # Errors
+	///
+	/// [`ReduceError::SketchValue`] if two buckets' sketches cannot be merged (they were
+	/// built with different relative accuracies — impossible for partials from
+	/// [`reduce_partial`], which all use [`SKETCH_ALPHA`]).
+	pub fn merge(&mut self, other: Self) -> Result<(), ReduceError> {
+		for (base, acc) in other.buckets {
+			match self.buckets.entry(base) {
+				std::collections::btree_map::Entry::Occupied(mut e) => e.get_mut().merge(acc)?,
+				std::collections::btree_map::Entry::Vacant(e) => {
+					e.insert(acc);
+				}
+			}
+		}
+		Ok(())
+	}
+
+	/// Whether no points landed in this partial.
+	#[must_use]
+	pub fn is_empty(&self) -> bool {
+		self.buckets.is_empty()
+	}
+
+	/// The number of non-empty buckets accumulated so far.
+	#[must_use]
+	pub fn len(&self) -> usize {
+		self.buckets.len()
+	}
+
+	/// Materialize the buckets, ascending by time.
+	///
+	/// `aggregations` must be the set the partial was built with (an empty slice means
+	/// [`Aggregation::DEFAULT`], as in [`reduce`]) — a reduction the partial did not
+	/// collect state for is simply absent from the output rather than wrong.
+	///
+	/// # Errors
+	///
+	/// [`ReduceError::BucketStartOverflow`] if a bucket's grid start scales past the
+	/// representable time range.
+	pub fn finish(self, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Vec<Bucket>, ReduceError> {
+		let aggregations = if aggregations.is_empty() { &Aggregation::DEFAULT[..] } else { aggregations };
+		self.buckets.into_iter().map(|(base, acc)| acc.finish(resolution, base, aggregations)).collect()
+	}
+}
+
+/// Reduce `points` into a mergeable [`PartialReduction`] rather than finished buckets.
+///
+/// The distributable half of [`reduce`]: same bucketing, same filtering, same arithmetic —
+/// see [`reduce`] for those semantics — but the result can be combined with other partials
+/// before being finished. `aggregations` selects what state to accumulate, so pass the same
+/// set you will finish with.
+///
+/// # Errors
+///
+/// As [`reduce`], plus [`ReduceError::SketchValue`] if a `sketch_p*` reduction was asked
+/// for and a value has no finite `f64` image.
+pub fn reduce_partial(points: &[Point], resolution: Resolution, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, aggregations: &[Aggregation]) -> Result<PartialReduction, ReduceError> {
 	let aggregations = if aggregations.is_empty() { &Aggregation::DEFAULT[..] } else { aggregations };
 	// The exact percentiles and TWA require the full bucket materialized; the streaming
 	// reductions do not, so only collect when one of those is actually requested.
@@ -465,7 +588,7 @@ pub fn reduce(points: &[Point], resolution: Resolution, start: Option<DateTime<U
 		buckets.entry(base).or_insert_with(|| BucketAcc::new(collect, sketching.then(DdSketch::with_default_accuracy))).push(p.timestamp, p.value.clone())?;
 	}
 
-	buckets.into_iter().map(|(base, acc)| acc.finish(resolution, base, aggregations)).collect()
+	Ok(PartialReduction { buckets })
 }
 
 /// Reconstruct a bucket's grid-aligned start timestamp from its resolution index.
@@ -774,6 +897,57 @@ mod tests {
 		let got = get(&buckets[0], Aggregation::SketchP50);
 		// Sorted ascending: -100 … -1; rank floor(0.5*99) = 49 -> -51.
 		assert!((got - -51.0).abs() / 51.0 <= SKETCH_ALPHA, "median of -100..-1 is about -51, got {got}");
+	}
+
+	/// The property that makes a reduction distributable: reducing chunks independently
+	/// and merging must equal one pass over the whole series — for **every** reduction,
+	/// including the sketches (whose merge is exact) and the order-sensitive first/last.
+	#[test]
+	fn chunked_partials_merge_to_the_single_pass_result() {
+		let all = [
+			Aggregation::Min,
+			Aggregation::Max,
+			Aggregation::Avg,
+			Aggregation::Sum,
+			Aggregation::First,
+			Aggregation::Last,
+			Aggregation::P50,
+			Aggregation::P99,
+			Aggregation::Twa,
+			Aggregation::TwaLinear,
+			Aggregation::TwaBucketEnd,
+			Aggregation::SketchP50,
+			Aggregation::SketchP99,
+		];
+		// 600 points spanning several hour-buckets, so chunks straddle bucket boundaries.
+		let points: Vec<Point> = (0..600).map(|i| pt(i64::from(i) * 30, &format!("{}.5", (i * 7) % 97))).collect();
+		let whole = reduce(&points, Resolution::Hours, None, None, &all).expect("reduces");
+
+		// Reduce in four chunks — in a *scrambled* merge order, to prove order-independence.
+		let chunks: Vec<&[Point]> = points.chunks(150).collect();
+		let mut partials: Vec<PartialReduction> = chunks.iter().map(|c| reduce_partial(c, Resolution::Hours, None, None, &all).expect("partial")).collect();
+		let mut merged = partials.remove(2);
+		merged.merge(partials.remove(0)).expect("merges");
+		merged.merge(partials.remove(1)).expect("merges");
+		merged.merge(partials.remove(0)).expect("merges");
+		let chunked = merged.finish(Resolution::Hours, &all).expect("finishes");
+
+		assert_eq!(chunked.len(), whole.len(), "same bucket count");
+		assert_eq!(chunked, whole, "a merged chunked reduction must equal the single pass exactly, for every reduction");
+	}
+
+	#[test]
+	fn reduce_partial_is_reduce_before_finishing() {
+		let points = vec![pt(0, "10"), pt(30, "20"), pt(60, "30")];
+		let partial = reduce_partial(&points, Resolution::Minutes, None, None, &[Aggregation::Sum]).expect("partial");
+		assert!(!partial.is_empty());
+		assert_eq!(partial.len(), 2, "two minute-buckets accumulated");
+		assert_eq!(partial.finish(Resolution::Minutes, &[Aggregation::Sum]).expect("finishes"), reduce(&points, Resolution::Minutes, None, None, &[Aggregation::Sum]).expect("reduces"));
+		// An empty partial merges cleanly and finishes to nothing.
+		let mut empty = reduce_partial(&[], Resolution::Minutes, None, None, &[Aggregation::Sum]).expect("partial");
+		assert!(empty.is_empty());
+		empty.merge(reduce_partial(&[], Resolution::Minutes, None, None, &[Aggregation::Sum]).expect("partial")).expect("merges");
+		assert!(empty.finish(Resolution::Minutes, &[Aggregation::Sum]).expect("finishes").is_empty());
 	}
 
 	#[test]
