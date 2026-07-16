@@ -59,6 +59,12 @@ pub enum Aggregation {
 	/// in the bucket (a left-endpoint / LOCF weighting), so irregularly-spaced samples
 	/// contribute in proportion to how long they were in effect.
 	Twa,
+	/// Time-weighted average by the **linear (trapezoidal)** method: each interval
+	/// contributes the mean of its two endpoints, `Σ½(vᵢ+vᵢ₊₁)Δtᵢ / ΣΔtᵢ`, i.e. the
+	/// signal is taken to move along the line between measurements rather than holding
+	/// constant. Best for irregularly-sampled *continuous* signals (temperature, flow);
+	/// [`Twa`](Self::Twa)'s LOCF weighting is best for change-only/step sensors.
+	TwaLinear,
 }
 
 impl Aggregation {
@@ -77,6 +83,7 @@ impl Aggregation {
 			Self::P95 => "p95",
 			Self::P99 => "p99",
 			Self::Twa => "twa",
+			Self::TwaLinear => "twa_linear",
 		}
 	}
 
@@ -97,7 +104,8 @@ impl Aggregation {
 			"p90" => Some(Self::P90),
 			"p95" => Some(Self::P95),
 			"p99" => Some(Self::P99),
-			"twa" | "time_weighted_avg" => Some(Self::Twa),
+			"twa" | "time_weighted_avg" | "twa_locf" => Some(Self::Twa),
+			"twa_linear" | "time_weighted_avg_linear" => Some(Self::TwaLinear),
 			_ => None,
 		}
 	}
@@ -116,11 +124,12 @@ impl Aggregation {
 	}
 
 	/// Whether this reduction needs the whole bucket materialized (percentiles need
-	/// the sorted values; [`Self::Twa`] needs the time-ordered samples). The streaming
-	/// reductions do not, so [`reduce`] only collects samples when one of these is asked.
+	/// the sorted values; the time-weighted averages need the time-ordered samples).
+	/// The streaming reductions do not, so [`reduce`] only collects samples when one of
+	/// these is asked.
 	#[must_use]
 	pub const fn needs_full_bucket(self) -> bool {
-		self.percentile_rank().is_some() || matches!(self, Self::Twa)
+		self.percentile_rank().is_some() || matches!(self, Self::Twa | Self::TwaLinear)
 	}
 
 	/// Every reduction, in a stable order — the natural set for a full downsample. Kept
@@ -232,7 +241,8 @@ impl BucketAcc {
 					Aggregation::Avg => (self.count > 0).then(|| &self.sum / &count),
 					Aggregation::First => self.first.as_ref().map(|(_, v)| v.clone()),
 					Aggregation::Last => self.last.as_ref().map(|(_, v)| v.clone()),
-					Aggregation::Twa => time_weighted_average(&self.samples),
+					Aggregation::Twa => time_weighted_average(&self.samples, TwaMethod::Locf),
+					Aggregation::TwaLinear => time_weighted_average(&self.samples, TwaMethod::Linear),
 					Aggregation::P50 | Aggregation::P90 | Aggregation::P95 | Aggregation::P99 => unreachable!("handled by percentile_rank above"),
 				}
 			};
@@ -244,14 +254,27 @@ impl BucketAcc {
 	}
 }
 
-/// The **time-weighted average** of `samples`: each sample weighted by the time until
-/// the next sample in ascending-timestamp order (a left-endpoint / LOCF weighting).
+/// How a time-weighted average values the span *between* two samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TwaMethod {
+	/// Last-observation-carried-forward: the interval is worth its left endpoint, so
+	/// the signal is a step function that holds until the next sample.
+	Locf,
+	/// Linear/trapezoidal: the interval is worth the mean of its two endpoints, so the
+	/// signal moves along the line between measurements.
+	Linear,
+}
+
+/// The **time-weighted average** of `samples` under `method`: every interval between
+/// consecutive samples (ascending by timestamp) is weighted by its duration, and valued
+/// by `method` — [`TwaMethod::Locf`] takes the left endpoint `vᵢ`, [`TwaMethod::Linear`]
+/// the trapezoidal mean `½(vᵢ+vᵢ₊₁)`. Both reduce to `Σ wᵢ·Δtᵢ / ΣΔtᵢ`.
 ///
 /// `None` for an empty slice; a single sample is its own value. When every sample
 /// shares one instant (total weight zero), falls back to the unweighted arithmetic
 /// mean. Weights are measured in milliseconds — the unit cancels in the ratio, so it
 /// only bounds sub-millisecond resolution, which a downsample bucket never needs.
-fn time_weighted_average(samples: &[(DateTime<Utc>, BigDecimal)]) -> Option<BigDecimal> {
+fn time_weighted_average(samples: &[(DateTime<Utc>, BigDecimal)], method: TwaMethod) -> Option<BigDecimal> {
 	if samples.is_empty() {
 		return None;
 	}
@@ -265,7 +288,13 @@ fn time_weighted_average(samples: &[(DateTime<Utc>, BigDecimal)]) -> Option<BigD
 	for pair in ordered.windows(2) {
 		let dt = (pair[1].0 - pair[0].0).num_milliseconds().max(0);
 		if dt > 0 {
-			weighted += &pair[0].1 * BigDecimal::from(dt);
+			// The interval's representative value: its left endpoint (LOCF) or the mean
+			// of its endpoints (linear/trapezoidal). The ½ stays exact in BigDecimal.
+			let value = match method {
+				TwaMethod::Locf => pair[0].1.clone(),
+				TwaMethod::Linear => (&pair[0].1 + &pair[1].1) / BigDecimal::from(2),
+			};
+			weighted += value * BigDecimal::from(dt);
 			total_ms += dt;
 		}
 	}
@@ -459,11 +488,13 @@ mod tests {
 
 	#[test]
 	fn from_token_round_trips_as_str_and_rejects_unknown() {
-		for agg in [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::P50, Aggregation::P90, Aggregation::P95, Aggregation::P99, Aggregation::Twa] {
+		for agg in [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::P50, Aggregation::P90, Aggregation::P95, Aggregation::P99, Aggregation::Twa, Aggregation::TwaLinear] {
 			assert_eq!(Aggregation::from_token(agg.as_str()), Some(agg), "{} must round-trip", agg.as_str());
 		}
 		assert_eq!(Aggregation::from_token("MEDIAN"), Some(Aggregation::P50), "median is a case-insensitive p50 alias");
 		assert_eq!(Aggregation::from_token(" avg "), Some(Aggregation::Avg), "surrounding whitespace is trimmed");
+		assert_eq!(Aggregation::from_token("twa_locf"), Some(Aggregation::Twa), "twa_locf names the LOCF method explicitly");
+		assert_eq!(Aggregation::from_token("time_weighted_avg_linear"), Some(Aggregation::TwaLinear), "the long-form linear alias parses");
 		assert_eq!(Aggregation::from_token("bogus"), None, "an unknown token is rejected");
 	}
 
@@ -480,6 +511,37 @@ mod tests {
 		let scrambled = vec![pt(60, "5"), pt(0, "10"), pt(30, "20")];
 		let b2 = reduce(&scrambled, Resolution::Hours, None, None, &[Aggregation::Twa]).expect("reduces");
 		assert!((get(&b2[0], Aggregation::Twa) - 15.0).abs() < 1e-9, "TWA is order-independent");
+	}
+
+	#[test]
+	fn linear_twa_uses_the_trapezoidal_endpoint_mean() {
+		// Same fixture as the LOCF test: 10@t=0, 20@t=30, 5@t=60.
+		// Linear: interval [0,30] is worth ½(10+20)=15 over 30s, [30,60] is ½(20+5)=12.5
+		// over 30s -> (15*30 + 12.5*30)/60 = 13.75. LOCF gives 15 on the same input, so
+		// the two methods are genuinely distinct.
+		let points = vec![pt(0, "10"), pt(30, "20"), pt(60, "5")];
+		let buckets = reduce(&points, Resolution::Hours, None, None, &[Aggregation::TwaLinear, Aggregation::Twa]).expect("reduces");
+		assert_eq!(buckets.len(), 1);
+		assert!((get(&buckets[0], Aggregation::TwaLinear) - 13.75).abs() < 1e-9, "linear TWA trapezoidal mean is 13.75");
+		assert!((get(&buckets[0], Aggregation::Twa) - 15.0).abs() < 1e-9, "LOCF TWA is unchanged at 15");
+	}
+
+	#[test]
+	fn linear_twa_of_a_straight_ramp_is_the_midpoint_and_is_exact() {
+		// On a linear ramp the trapezoidal average is exactly the midpoint value,
+		// regardless of how irregularly the ramp is sampled — the property that makes
+		// the linear method right for continuous signals. Ramp v = t over [0, 100],
+		// sampled irregularly; the exact answer is 50.
+		let points = vec![pt(0, "0"), pt(7, "7"), pt(63, "63"), pt(100, "100")];
+		let buckets = reduce(&points, Resolution::Hours, None, None, &[Aggregation::TwaLinear]).expect("reduces");
+		assert_eq!(buckets[0].values.get("twa_linear").unwrap(), &BigDecimal::from_str("50").unwrap(), "trapezoidal average of a straight ramp is exactly its midpoint");
+	}
+
+	#[test]
+	fn linear_twa_is_order_independent() {
+		let scrambled = vec![pt(60, "5"), pt(0, "10"), pt(30, "20")];
+		let b = reduce(&scrambled, Resolution::Hours, None, None, &[Aggregation::TwaLinear]).expect("reduces");
+		assert!((get(&b[0], Aggregation::TwaLinear) - 13.75).abs() < 1e-9, "linear TWA sorts by time before weighting");
 	}
 
 	#[test]
