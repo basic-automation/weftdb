@@ -546,9 +546,40 @@ impl Segment {
 	/// resolves in `O(1)` closed form — faster than any index — so checkpointing either
 	/// would only add bytes. A factual predicate about the shape, not a policy: how many
 	/// rows are worth the trade is the caller's call.
+	///
+	/// **Shape alone is not sufficient** — see
+	/// [`checkpoint_codec_overhead`](Self::checkpoint_codec_overhead), which a caller must
+	/// also weigh: a checkpointed frame forces the range-decodable per-block codec, which
+	/// on a Gorilla- or RLE-shaped column costs far more than the index itself.
 	#[must_use]
 	pub fn benefits_from_checkpoints(&self) -> bool {
 		self.stats.time_sorted && self.timestamps.arithmetic_stride().is_none()
+	}
+
+	/// The **size cost of the codec override** a checkpointed frame would pay on this
+	/// segment, as a ratio of the timestamp block it would otherwise write
+	/// (`blocked / best`, so `1.0` = free, `2.0` = double).
+	///
+	/// A checkpointed frame must encode its dods with the per-block codec — the only one
+	/// that range-decodes — rather than the smallest codec available. Measured, that
+	/// override is ~free where the per-block codec already wins (~+1% on bounded jitter)
+	/// but **catastrophic where it does not**: ~3.5× on a Gorilla-shaped scattered-jitter
+	/// column, ~14× on an RLE-shaped long-constant-run column
+	/// (`benches/dodsearch.rs::report_codec_override_cost`). Both of those are *irregular*,
+	/// so [`benefits_from_checkpoints`](Self::benefits_from_checkpoints) alone would happily
+	/// checkpoint them. A caller deciding whether to checkpoint should reject a segment
+	/// whose overhead exceeds what it is willing to pay for faster lookups.
+	///
+	/// `1.0` for a column with no dods (nothing to encode either way).
+	#[must_use]
+	pub fn checkpoint_codec_overhead(&self) -> f64 {
+		let best = self.timestamps.best_estimated_bytes();
+		if best == 0 {
+			return 1.0;
+		}
+		#[allow(clippy::cast_precision_loss)]
+		let ratio = self.timestamps.blocked_estimated_bytes() as f64 / best as f64;
+		ratio
 	}
 
 	/// Read a segment back from a `.dspseg` byte frame, verifying its checksum.

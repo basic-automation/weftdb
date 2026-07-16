@@ -62,38 +62,63 @@ const DEFAULT_SUBJECT: &str = "default";
 /// a small segment decodes trivially, so indexing it is pure cost).
 ///
 /// Whether making this the *default* is owner-gated — it changes the headline bytes/point.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CheckpointPolicy {
 	/// Rows between checkpoints; `None` disables the index entirely.
 	pub stride: Option<usize>,
 	/// Segments with fewer rows than this are never checkpointed.
 	pub min_rows: usize,
+	/// Ceiling on the timestamp-codec override a checkpointed frame may pay
+	/// (`blocked / best`; `1.0` = only when free). See
+	/// [`DEFAULT_CHECKPOINT_MAX_CODEC_OVERHEAD`].
+	pub max_codec_overhead: f64,
 }
 
 /// Row floor below which a checkpoint index is not worth its bytes.
 pub const DEFAULT_CHECKPOINT_MIN_ROWS: usize = 8_192;
 
+/// Ceiling on the timestamp-codec override ratio a checkpointed seal will accept: `1.25`
+/// (a quarter more timestamp bytes than the best codec would write).
+///
+/// A checkpointed frame must encode its dods with the range-decodable per-block codec
+/// rather than the smallest one. Measured, that override is ~free where the per-block
+/// codec already wins (+1% on bounded jitter) but **~3.5× on a Gorilla-shaped
+/// scattered-jitter column and ~14× on an RLE-shaped long-constant-run column** — and
+/// both of those are *irregular*, so a shape-only test would happily checkpoint them
+/// (`dsp-physical-type`'s `benches/dodsearch.rs::report_codec_override_cost`). Without
+/// this ceiling, enabling `DSP_SEGMENT_CHECKPOINT_STRIDE` would silently bloat exactly
+/// those columns. Override with `DSP_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD`.
+pub const DEFAULT_CHECKPOINT_MAX_CODEC_OVERHEAD: f64 = 1.25;
+
 impl CheckpointPolicy {
 	/// Never write a checkpoint index — the default, and byte-for-byte the historical
 	/// frame layout.
-	pub const DISABLED: Self = Self { stride: None, min_rows: DEFAULT_CHECKPOINT_MIN_ROWS };
+	pub const DISABLED: Self = Self { stride: None, min_rows: DEFAULT_CHECKPOINT_MIN_ROWS, max_codec_overhead: DEFAULT_CHECKPOINT_MAX_CODEC_OVERHEAD };
 
 	/// Read the policy from the environment: `DSP_SEGMENT_CHECKPOINT_STRIDE` (absent, zero
-	/// or unparseable → [`DISABLED`](Self::DISABLED)) and `DSP_SEGMENT_CHECKPOINT_MIN_ROWS`
-	/// (absent or unparseable → [`DEFAULT_CHECKPOINT_MIN_ROWS`]).
+	/// or unparseable → [`DISABLED`](Self::DISABLED)), `DSP_SEGMENT_CHECKPOINT_MIN_ROWS`
+	/// (→ [`DEFAULT_CHECKPOINT_MIN_ROWS`]) and `DSP_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD`
+	/// (→ [`DEFAULT_CHECKPOINT_MAX_CODEC_OVERHEAD`]; a non-finite or `< 1.0` value is
+	/// ignored, since a ratio below 1.0 could never be met).
 	#[must_use]
 	pub fn from_env() -> Self {
 		let stride = std::env::var("DSP_SEGMENT_CHECKPOINT_STRIDE").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&s| s > 0);
 		let min_rows = std::env::var("DSP_SEGMENT_CHECKPOINT_MIN_ROWS").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(DEFAULT_CHECKPOINT_MIN_ROWS);
-		Self { stride, min_rows }
+		let max_codec_overhead = std::env::var("DSP_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|r| r.is_finite() && *r >= 1.0).unwrap_or(DEFAULT_CHECKPOINT_MAX_CODEC_OVERHEAD);
+		Self { stride, min_rows, max_codec_overhead }
 	}
 
-	/// The stride to seal `row_count` rows with, given whether the segment's shape
-	/// actually benefits (see `Segment::benefits_from_checkpoints`), or `None` to write
-	/// the ordinary frame.
+	/// The stride to seal a segment with, or `None` to write the ordinary frame.
+	///
+	/// Three gates, all of which must pass: the policy is enabled, the segment's *shape*
+	/// benefits (`benefits_from_checkpoints` — sorted and irregular) and is big enough,
+	/// and the *codec override* the checkpointed frame would force is affordable
+	/// (`checkpoint_codec_overhead` within [`max_codec_overhead`](Self::max_codec_overhead)).
+	/// The last gate is what stops an irregular-but-Gorilla/RLE-shaped column from being
+	/// silently bloated for a lookup win that is not worth those bytes.
 	#[must_use]
-	pub fn stride_for(self, row_count: usize, benefits: bool) -> Option<usize> {
-		self.stride.filter(|_| benefits && row_count >= self.min_rows)
+	pub fn stride_for(self, row_count: usize, benefits: bool, codec_overhead: f64) -> Option<usize> {
+		self.stride.filter(|_| benefits && row_count >= self.min_rows && codec_overhead <= self.max_codec_overhead)
 	}
 }
 
@@ -373,7 +398,7 @@ impl SegmentStore {
 		// Checkpoint the timestamp column only when configured AND the segment's shape
 		// actually benefits (sorted + irregular + big enough) — otherwise write the
 		// historical frame byte-for-byte. Either frame reads identically.
-		let bytes = match self.checkpoints.stride_for(segment.stats.row_count, segment.benefits_from_checkpoints()) {
+		let bytes = match self.checkpoints.stride_for(segment.stats.row_count, segment.benefits_from_checkpoints(), segment.checkpoint_codec_overhead()) {
 			Some(stride) => segment.write_to_checkpointed(stride),
 			None => segment.write_to(),
 		};
@@ -391,7 +416,7 @@ impl SegmentStore {
 		let id = self.index.next_id(aspect).await?;
 		// As `persist`, though the paged win is far smaller — page pruning already bounds
 		// a probe's decode to `rows_per_page`.
-		let bytes = match self.checkpoints.stride_for(segment.stats.row_count, segment.benefits_from_checkpoints()) {
+		let bytes = match self.checkpoints.stride_for(segment.stats.row_count, segment.benefits_from_checkpoints(), segment.checkpoint_codec_overhead()) {
 			Some(stride) => segment.write_to_checkpointed(stride),
 			None => segment.write_to(),
 		};
@@ -2739,12 +2764,16 @@ mod tests {
 	/// The policy decides on shape + size, and `DISABLED` is the default — the guarantee
 	/// that an unconfigured deployment's bytes are byte-for-byte what they always were.
 	#[test]
-	fn checkpoint_policy_gates_on_shape_and_size() {
-		assert_eq!(CheckpointPolicy::DISABLED.stride_for(1_000_000, true), None, "disabled never checkpoints, whatever the shape");
-		let p = CheckpointPolicy { stride: Some(1024), min_rows: 8_192 };
-		assert_eq!(p.stride_for(10_000, true), Some(1024), "a large sorted-irregular segment is checkpointed");
-		assert_eq!(p.stride_for(10_000, false), None, "a regular (or out-of-order) segment gains nothing — O(1) closed form already");
-		assert_eq!(p.stride_for(100, true), None, "a small segment decodes trivially; the index would be pure cost");
+	fn checkpoint_policy_gates_on_shape_size_and_codec_overhead() {
+		assert_eq!(CheckpointPolicy::DISABLED.stride_for(1_000_000, true, 1.0), None, "disabled never checkpoints, whatever the shape");
+		let p = CheckpointPolicy { stride: Some(1024), min_rows: 8_192, max_codec_overhead: 1.25 };
+		assert_eq!(p.stride_for(10_000, true, 1.01), Some(1024), "a large sorted-irregular segment whose override is ~free is checkpointed");
+		assert_eq!(p.stride_for(10_000, false, 1.0), None, "a regular (or out-of-order) segment gains nothing — O(1) closed form already");
+		assert_eq!(p.stride_for(100, true, 1.0), None, "a small segment decodes trivially; the index would be pure cost");
+		// The gate the measured Gorilla/RLE blow-ups demand: irregular is not enough.
+		assert_eq!(p.stride_for(10_000, true, 3.5), None, "a Gorilla-shaped column (3.5x override) is refused despite being irregular");
+		assert_eq!(p.stride_for(10_000, true, 14.0), None, "an RLE-shaped column (14x override) is refused");
+		assert_eq!(p.stride_for(10_000, true, 1.25), Some(1024), "the ceiling is inclusive");
 	}
 
 	/// End-to-end through the real store: an enabled policy changes the bytes on disk and
@@ -2761,7 +2790,7 @@ mod tests {
 			.collect();
 		let vs: Vec<BigDecimal> = (0..12_000).map(|i| bd(&format!("{}", 100 + i % 400))).collect();
 
-		let policy = CheckpointPolicy { stride: Some(1024), min_rows: 8_192 };
+		let policy = CheckpointPolicy { stride: Some(1024), min_rows: 8_192, max_codec_overhead: 1.25 };
 		let plain_dir = TempDir::new().expect("tempdir");
 		let plain = SegmentStore::open(plain_dir.path()).await.expect("opens");
 		assert_eq!(plain.checkpoint_policy(), CheckpointPolicy::DISABLED, "the store is unconfigured by default");
@@ -2783,13 +2812,41 @@ mod tests {
 		assert_eq!(cp.read_time_range("temp", ts[100], ts[200]).await.expect("reads"), plain.read_time_range("temp", ts[100], ts[200]).await.expect("reads"), "range read must match");
 	}
 
+	/// The codec-override gate, end-to-end on a real store: an **irregular** column whose
+	/// timestamps favour RLE must NOT be checkpointed, because forcing the range-decodable
+	/// per-block codec would inflate its timestamp block ~14x for a lookup win not worth
+	/// those bytes. Shape alone would have accepted it.
+	#[tokio::test]
+	async fn an_irregular_but_rle_shaped_column_is_refused_by_the_codec_gate() {
+		// Long constant runs then a jump: irregular (so the shape gate passes), but RLE is
+		// dramatically the best timestamp codec.
+		let ts: Vec<i64> = (0..12_000_i64).map(|i| 1_000_000 + (i / 100) * 5_000).collect();
+		let vs: Vec<BigDecimal> = (0..12_000).map(|i| bd(&format!("{}", i % 300))).collect();
+		let policy = CheckpointPolicy { stride: Some(1024), min_rows: 8_192, max_codec_overhead: 1.25 };
+
+		let plain_dir = TempDir::new().expect("tempdir");
+		let plain = SegmentStore::open(plain_dir.path()).await.expect("opens");
+		let plain_desc = plain.seal("temp", &schema(), &ts, &vs).await.expect("seals");
+
+		let cp_dir = TempDir::new().expect("tempdir");
+		let cp = SegmentStore::open(cp_dir.path()).await.expect("opens").with_checkpoint_policy(policy);
+		let cp_desc = cp.seal("temp", &schema(), &ts, &vs).await.expect("seals");
+
+		assert_eq!(cp_desc.byte_len, plain_desc.byte_len, "an RLE-shaped column must be byte-for-byte identical — the codec gate refused to checkpoint it");
+		// Raising the ceiling lets it through, proving the gate (not the shape) is what refused.
+		let loose_dir = TempDir::new().expect("tempdir");
+		let loose = SegmentStore::open(loose_dir.path()).await.expect("opens").with_checkpoint_policy(CheckpointPolicy { max_codec_overhead: 100.0, ..policy });
+		let loose_desc = loose.seal("temp", &schema(), &ts, &vs).await.expect("seals");
+		assert!(loose_desc.byte_len > plain_desc.byte_len, "with the ceiling lifted the same column IS checkpointed ({} vs {}) — and pays for it", loose_desc.byte_len, plain_desc.byte_len);
+	}
+
 	/// A *regular* column must not be checkpointed even when the policy is on: it already
 	/// resolves O(1) closed-form, so an index would be bytes for nothing.
 	#[tokio::test]
 	async fn a_regular_column_is_never_checkpointed_even_when_enabled() {
 		let ts: Vec<i64> = (0..12_000).map(|i| i * 10).collect();
 		let vs: Vec<BigDecimal> = (0..12_000).map(|i| bd(&format!("{}", i % 500))).collect();
-		let policy = CheckpointPolicy { stride: Some(1024), min_rows: 8_192 };
+		let policy = CheckpointPolicy { stride: Some(1024), min_rows: 8_192, max_codec_overhead: 1.25 };
 
 		let plain_dir = TempDir::new().expect("tempdir");
 		let plain = SegmentStore::open(plain_dir.path()).await.expect("opens");

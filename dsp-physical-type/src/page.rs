@@ -419,6 +419,23 @@ impl PagedSegment {
 		self.stats.time_sorted && self.pages.iter().any(|p| p.timestamps.arithmetic_stride().is_none())
 	}
 
+	/// The **size cost of the codec override** a checkpointed frame would pay, as a ratio
+	/// of the timestamp bytes this segment would otherwise write — summed across pages, so
+	/// one pathological page cannot hide behind cheap neighbours. See
+	/// [`Segment::checkpoint_codec_overhead`](crate::Segment::checkpoint_codec_overhead)
+	/// for why a caller must weigh this and not shape alone.
+	#[must_use]
+	pub fn checkpoint_codec_overhead(&self) -> f64 {
+		let best: usize = self.pages.iter().map(|p| p.timestamps.best_estimated_bytes()).sum();
+		if best == 0 {
+			return 1.0;
+		}
+		let blocked: usize = self.pages.iter().map(|p| p.timestamps.blocked_estimated_bytes()).sum();
+		#[allow(clippy::cast_precision_loss)]
+		let ratio = blocked as f64 / best as f64;
+		ratio
+	}
+
 	/// Read a paged segment back from a `.dspseg` byte frame, verifying its checksum.
 	///
 	/// Exact inverse of [`PagedSegment::write_to`]. See
