@@ -23,3 +23,7 @@ harness = false
 [[bench]]
 name = "pointread"
 harness = false
+
+[[bench]]
+name = "dodsearch"
+harness = false

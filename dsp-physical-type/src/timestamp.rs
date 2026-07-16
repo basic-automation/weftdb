@@ -92,6 +92,107 @@ pub struct DeltaOfDeltaColumn {
 	pub unit: TimeUnit,
 }
 
+/// One recorded position in a delta-of-delta stream: enough state to resume the
+/// reconstruction at `row` without replaying the stream from the anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DodCheckpoint {
+	/// The row this checkpoint reconstructs.
+	pub row: usize,
+	/// The timestamp at `row`.
+	pub timestamp: i64,
+	/// The first-order delta that produced `row` (`ts[row] - ts[row-1]`) — the state
+	/// needed to advance to `row + 1`.
+	pub delta: i64,
+}
+
+/// A sparse checkpoint index over a delta-of-delta timestamp column.
+///
+/// A delta-of-delta stream is inherently **sequential**: row `r`'s timestamp depends on
+/// every dod before it, so a point lookup on an *irregular* sorted column has to
+/// reconstruct the whole column before it can binary-search — `O(n)` per probe, and the
+/// dominant cost of the streaming point read once the value block is skipped. (A
+/// *regular* column escapes this via the `O(1)` closed form, see
+/// [`DeltaOfDeltaColumn::arithmetic_stride`]; an irregular one has no closed form.)
+///
+/// Checkpointing every `stride`-th row makes the irregular case sublinear: binary-search
+/// the checkpoints for the bracketing pair (`O(log(n/stride))`), then reconstruct
+/// forward from that checkpoint for at most `stride` rows. Lookup becomes
+/// `O(log(n/stride) + stride)` and only `stride` dods are touched instead of `n`.
+///
+/// The index costs `~n/stride` entries. This type is an **in-memory** primitive: the
+/// on-disk realization (a checkpoint block in the `.dspseg` timestamp column behind a
+/// format bump) is the next slice — see ROADMAP.md.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DodCheckpoints {
+	/// Rows between checkpoints.
+	pub stride: usize,
+	/// The recorded positions, ascending by row. Empty for a column of fewer than two
+	/// rows (whose lookup is trivial).
+	pub points: Vec<DodCheckpoint>,
+	/// Total rows in the column the index was built over.
+	pub rows: usize,
+}
+
+impl DodCheckpoints {
+	/// The first row whose timestamp equals `target`, or `None` if absent.
+	///
+	/// Requires a **sorted** (non-decreasing) column — the caller supplies that signal
+	/// (`time_sorted`), exactly as the existing point-read planner does; on an
+	/// out-of-order column the result is unspecified (a binary search is meaningless
+	/// there, and the planner linear-scans instead).
+	///
+	/// Reconstructs at most `stride` rows rather than the whole column. Equal to a full
+	/// [`decode_delta_of_delta`] followed by a search for the first `target`, including
+	/// on duplicate timestamps — the *first* occurrence is returned, matching the
+	/// segment point-read's first-present semantics.
+	#[must_use]
+	pub fn search_sorted(&self, col: &DeltaOfDeltaColumn, target: i64) -> Option<usize> {
+		if col.first_delta.is_none() {
+			// A single-row column is its anchor.
+			return (col.first == target).then_some(0);
+		}
+		// Row 0 is the anchor and the earliest row: on a sorted column it is necessarily
+		// the first occurrence if it matches.
+		if col.first == target {
+			return Some(0);
+		}
+		// Resume from the last checkpoint *strictly below* `target`. Every row at or
+		// before it has `ts <= that checkpoint < target`, so it cannot hold the answer,
+		// and the first `target` encountered walking forward from there is therefore the
+		// **first** occurrence — which is what makes duplicates spanning a checkpoint
+		// boundary fall out correctly rather than needing a walk-back.
+		let idx = self.points.partition_point(|c| c.timestamp < target);
+		let start = if idx == 0 {
+			// No checkpoint is below `target`, so the answer (if any) is at or after row 1
+			// — the first row with a defined delta.
+			let first_delta = col.first_delta?;
+			DodCheckpoint { row: 1, timestamp: col.first.wrapping_add(first_delta), delta: first_delta }
+		} else {
+			self.points[idx - 1]
+		};
+		Self::scan_from(col, start, target)
+	}
+
+	/// Reconstruct forward from `from`, returning the first row whose timestamp is
+	/// `target`. Stops as soon as the timestamps pass `target` (the column is sorted).
+	fn scan_from(col: &DeltaOfDeltaColumn, from: DodCheckpoint, target: i64) -> Option<usize> {
+		let (mut row, mut ts, mut delta) = (from.row, from.timestamp, from.delta);
+		loop {
+			if ts == target {
+				return Some(row);
+			}
+			if ts > target {
+				return None;
+			}
+			// Advancing from row `r` consumes `dods[r - 1]`.
+			let dod = *col.dods.get(row.checked_sub(1)?)?;
+			delta = delta.wrapping_add(dod);
+			ts = ts.wrapping_add(delta);
+			row += 1;
+		}
+	}
+}
+
 /// Delta-encode an epoch column. Lossless; inverse is [`decode_delta`].
 ///
 /// Differences are computed with wrapping arithmetic so an adversarial input
@@ -1205,6 +1306,38 @@ impl DeltaOfDeltaColumn {
 		}
 	}
 
+	/// Build a sparse checkpoint index over this column so a **sorted irregular** column
+	/// can be searched without reconstructing the whole timestamp stream.
+	///
+	/// See [`DodCheckpoints`] for why this is needed and what it costs.
+	///
+	/// `stride` is the number of rows between checkpoints (clamped to `>= 1`); a larger
+	/// stride is a smaller index and a longer forward walk per probe.
+	#[must_use]
+	pub fn checkpoints(&self, stride: usize) -> DodCheckpoints {
+		let stride = stride.max(1);
+		let mut points: Vec<DodCheckpoint> = Vec::new();
+		let Some(first_delta) = self.first_delta else {
+			// Fewer than two rows: the anchor alone, no advanceable state.
+			return DodCheckpoints { stride, points, rows: usize::from(!self.dods.is_empty() || self.first_delta.is_some()).max(1) };
+		};
+		// Row 1 is the first row with a defined delta, so it is the first row we can
+		// advance from; walk the dod stream recording every `stride`-th row.
+		let mut delta = first_delta;
+		let mut ts = self.first.wrapping_add(delta);
+		let mut row = 1_usize;
+		points.push(DodCheckpoint { row, timestamp: ts, delta });
+		for &dod in &self.dods {
+			delta = delta.wrapping_add(dod);
+			ts = ts.wrapping_add(delta);
+			row += 1;
+			if row.is_multiple_of(stride) {
+				points.push(DodCheckpoint { row, timestamp: ts, delta });
+			}
+		}
+		DodCheckpoints { stride, points, rows: row + 1 }
+	}
+
 	/// Estimated packed size: the anchor (8-byte `i64`), the first delta
 	/// (varint), and the varint-coded second-difference stream.
 	#[must_use]
@@ -2051,6 +2184,52 @@ mod tests {
 		assert_eq!(transpose_bitpack_decode(&enc, 8, 20), vec![0_i64; 20]);
 		// A zero tile size is clamped to 1, never a panic.
 		assert_eq!(transpose_bitpack_bytes(&[0, 0, 0], 0), 3);
+	}
+
+	/// The checkpointed search must be *indistinguishable* from decoding the whole column
+	/// and searching it — across shapes (regular, irregular, duplicate-heavy, clustered),
+	/// strides, and every probe including absent/out-of-range ones.
+	#[test]
+	fn checkpointed_search_equals_the_full_decode_search() {
+		let fixtures: Vec<(&str, Vec<i64>)> = vec![
+			("regular", (0..500).map(|i| 1_000 + i * 7).collect()),
+			("irregular", (0..500).map(|i| 1_000 + i * 7 + (i % 13) * (i % 5)).scan(0_i64, |acc, v| { *acc = (*acc).max(v); Some(*acc) }).collect()),
+			("duplicates", (0..500).map(|i| 1_000 + (i / 3) * 10).collect()),
+			("clustered-jumps", (0..500).map(|i| if i < 250 { 1_000 + i } else { 1_000_000 + i * 3 }).collect()),
+			("two-rows", vec![10, 20]),
+			("single-row", vec![42]),
+			("all-equal", vec![7; 50]),
+		];
+		for (name, values) in fixtures {
+			let col = encode_delta_of_delta(&values, TimeUnit::Millis);
+			let decoded = decode_delta_of_delta(&col);
+			assert_eq!(decoded, values, "{name}: fixture must round-trip");
+			for stride in [1_usize, 2, 8, 64, 1000] {
+				let cps = col.checkpoints(stride);
+				// Probe every present value, plus absent ones around the range.
+				let mut probes: Vec<i64> = values.clone();
+				probes.extend([i64::MIN, 0, 999, 1_001, 5_000_001, i64::MAX]);
+				for t in probes {
+					let expected = values.iter().position(|&v| v == t);
+					assert_eq!(cps.search_sorted(&col, t), expected, "{name} stride={stride}: first row with ts={t}");
+				}
+			}
+		}
+	}
+
+	/// The point of the structure: a probe must touch only ~stride rows, not the column.
+	#[test]
+	fn checkpoint_index_is_sparse_and_bounded_by_stride() {
+		let values: Vec<i64> = (0..1_000).map(|i| 1_000 + i * 7 + (i % 3)).collect();
+		let col = encode_delta_of_delta(&values, TimeUnit::Millis);
+		let cps = col.checkpoints(64);
+		assert_eq!(cps.rows, values.len(), "the index knows the column length");
+		// ~1000/64 checkpoints, not 1000.
+		assert!(cps.points.len() <= 1_000 / 64 + 2, "the index is sparse, got {} entries for 1000 rows", cps.points.len());
+		// A stride of 1 checkpoints every advanceable row.
+		assert_eq!(col.checkpoints(1).points.len(), values.len() - 1, "stride=1 records every row from row 1");
+		// A zero stride is clamped, never a panic or a divide-by-zero.
+		assert_eq!(col.checkpoints(0).stride, 1);
 	}
 
 	#[test]
