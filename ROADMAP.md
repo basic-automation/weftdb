@@ -433,14 +433,19 @@ detection within Y% and improving historical query latency by Z."*
     v14) so the FIRE-vs-dod question is answered on the *real* timestamp corpus. Measured
     54.8% below dod on a constructed geometric-velocity stream. *(src: Sprintz, ACM TODS'18 —
     https://arxiv.org/abs/1808.02515)*
-  - [ ] **FIRE adopt-or-drop — gate on a REAL-corpus win, do not assume one.** Honest
-    upstream finding: the Sprintz authors themselves and a fresh comparative study report
-    FIRE's improvement over plain delta is *marginal* on real data (the study omits FIRE for
-    that reason). So the constructed 54.8% win is not evidence to adopt — use the shipped
-    `advisory_fire_timestamp_bytes` to check whether FIRE actually beats dod on DSP's real
-    irregular timestamp corpora before wiring it into any on-disk selector; drop it if it does
-    not. *(src: "Lossless Compression of Time Series Data: A Comparative Study", 2025 —
-    https://arxiv.org/html/2510.07015v1 · Sprintz §FIRE — https://arxiv.org/abs/1808.02515)*
+  - [x] **FIRE adopt-or-drop — DECIDED (2026-07-16): DROPPED.** Measured on the *real* bench
+    corpora exactly as this item demanded, via the shipped `advisory_fire_timestamp_bytes` (8
+    distinct timestamp corpora — jitter 0.0/0.02/0.05/0.15/0.35/0.5/0.8/0.9 × missingness
+    0.1–0.9 × 5 seeds, 50k points each). **FIRE's best real-corpus result is −0.1% (a
+    rounding-level tie) and it LOSES by +24.3% on a regular column** (95,749 B vs the realized
+    77,037 B `delta_of_delta`). The constructed 54.8% win does **not** generalize — precisely
+    what the upstream authors and the 2025 comparative study predicted. Not wired into any
+    on-disk selector. The advisory estimate stays as the tripwire: if a real customer corpus
+    ever contradicts this, the number will say so. (Note: the bench's *shape* knob does not
+    vary timestamps — shape drives values — so shape is not an independent axis here; jitter,
+    missingness and seed are.) *(src: "Lossless Compression of Time Series Data: A Comparative
+    Study", 2025 — https://arxiv.org/html/2510.07015v1 · Sprintz §FIRE —
+    https://arxiv.org/abs/1808.02515)*
   - [ ] **Evaluate Pcodec as an integer/f64 codec + bench baseline:** the 2025 comparative
     study finds **Sprintz and Pcodec** give the best ratio/throughput trade-off for integer
     time-series (Sprintz at Snappy/LZ4 speeds). Pcodec is Rust, columnar, and directly on
@@ -795,6 +800,25 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 
 ## Immediate next actions
 
+- [ ] **BUG (found 2026-07-16) — the `splimes` GPU interpolation tests are FLAKY, and they gate every
+  workspace-wide test claim.** `tests::{cubic,quadratic,polynomial}::tests::test_*_interpolation`
+  intermittently fail their CPU-vs-GPU check with a cosine similarity of ~0 (e.g. `-2.7e-8` against
+  the threshold) — i.e. the GPU result is *garbage*, not merely imprecise. **Confirmed
+  non-deterministic and NOT branch-dependent:** alternating runs of the identical test on the same
+  machine gave branch=pass, main=**fail**, branch=fail, so it reproduces on `main` and is unrelated to
+  any 2026-07-16 change. Either the GPU path has a real race/uninitialized-buffer bug that the
+  similarity check catches ~1 run in 3, or the check itself is unsound; either way a passing run
+  currently proves little about the GPU path. Diagnose before any Phase 5 GPU benchmark claim — a
+  flaky correctness gate cannot backstop a published GPU number.
+- [ ] **BLOCKER (found 2026-07-16) — `cargo test --workspace` cannot complete: rustc ICE on
+  `splimes` `gpu_integration_tests`.** The nightly compiler (`1.99.0-nightly daf2e5e18`,
+  2026-07-13) panics with `error: the compiler unexpectedly panicked` in
+  `[resolver_for_lowering_raw]` while compiling that test target, so the workspace suite aborts and
+  runs must fall back to per-crate testing. Pre-existing and environmental (the repo root already held
+  `rustc-ice-*.txt` dumps from 2026-01-23/26 — this ICE class recurs); unrelated to any source change
+  (`splimes` has no `dsp-*` dependencies). Try a newer/pinned nightly and, if it persists, minimize +
+  file upstream. NB the ICE drops `rustc-ice-*.txt` dumps in the repo root — never commit them.
+
 - [x] **DONE (2026-07-14, capstone of the 2026-07-13 read-path arc) — `dsp-bench` `point_lookup` workload
   + the full storage/read/aggregation suite:** shipped `run_point_lookup` (parallel runner sealing a
   `dsp-physical-type` `Segment` and timing `dspseg::read_segment_point`/`read_segment_points`, single &
@@ -812,23 +836,56 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   was **deduplicated onto** (server no longer carries its own copy) and the `dsp-bench` `downsample`
   workload drives. Full reduction set: min/max/avg/sum/first/last + nearest-rank **p50/p90/p95/p99** +
   **TWA** (LOCF dwell-weighting). Runtime-verified against the live `/api/v1/downsample` endpoint.
-- [ ] **NEXT — approximate mergeable quantiles (DDSketch / UDDSketch):** the shipped percentiles are
-  *exact* nearest-rank, which materializes the whole bucket (O(bucket) memory, not mergeable across
-  segments). Add a fully-mergeable **DDSketch** (relative-error bound, Datadog) or **UDDSketch**
-  (fixed-size, constant relative accuracy) sketch aggregation for bounded-memory approximate percentiles
-  on large buckets and streaming/cross-segment merges — the standard TSDB approach for p99 latency
-  monitoring. *(src: DDSketch, PVLDB'19 — https://dl.acm.org/doi/10.14778/3352063.3352135 ·
-  https://arxiv.org/abs/1908.10693 · UDDSketch)*
-- [ ] **NEXT — linear (trapezoidal) TWA method beside the shipped LOCF weighting:** TimescaleDB's
-  time-weighted average offers **two** methods — LOCF (constant until the next sample; what DSP shipped,
-  best for change-only sensors) and **linear** (values interpolated on the line between measurements,
-  best for irregularly-sampled continuous signals). Add the linear/trapezoidal variant (`Σ½(vᵢ+vᵢ₊₁)Δtᵢ /
-  ΣΔtᵢ`) as a selectable method, and evaluate the *last-point-to-bucket-end* weighting option. *(src:
-  https://docs.timescale.com/use-timescale/latest/hyperfunctions/time-weighted-averages/time-weighted-average/
-  · last-point-to-range-end — https://github.com/timescale/timescaledb-toolkit/discussions/697)*
-- [ ] **NEXT — server ILP `parse_aggregation_token` should adopt `dsp_reduce::Aggregation::from_token`:**
-  the shared parser now exists (case-insensitive, `median`/`time_weighted_avg` aliases); the server's ILP
-  query-param path still hand-matches tokens. Fold it onto `from_token` to remove the last duplicate.
+- [x] **DONE (2026-07-16) — approximate mergeable quantiles (DDSketch):** shipped as
+  `dsp-reduce::sketch::DdSketch` (canonical logarithmic mapping `γ=(1+α)/(1-α)`, mirrored negative
+  store, exactly-counted zeros, `merge`) + the four opt-in `sketch_p50`/`p90`/`p95`/`p99` reductions
+  (`SKETCH_ALPHA` = 1%), reachable on the HTTP downsample endpoint and its ILP siblings. Values
+  **stream** into the per-bucket sketch (`needs_full_bucket` deliberately excludes them), so a bucket
+  costs a bounded number of counters however many samples land in it, and `SKETCH_MAX_BINS` (2048,
+  lowest-bucket collapse) makes that bound *absolute* rather than merely logarithmic in the value
+  range. Benchmarked on the shipped CLI (500k points, 5 reps, correctness PASS): **`sketch_p99`
+  p50=468.90 ms / 1,075,976 pts·s⁻¹ vs exact `p99` p50=2018.53 ms / 249,169 pts·s⁻¹ — ~4.3× faster.**
+  Runtime-verified against the live endpoint: sketch_p50=497.78 vs exact 500.0 (0.44%) and
+  sketch_p99=982.58 vs exact 990.0 (0.75%), both inside the 1% bound.
+- [ ] **NEXT — UDDSketch (uniform guarantee under collapse):** DSP's `max_bins` uses the reference
+  **collapsing-lowest** strategy, which preserves every count/rank but **loses the relative-error
+  bound for quantiles inside collapsed buckets** (for an all-positive column: the low quantiles;
+  p95/p99 are unaffected) and costs exact mergeability between two sketches that collapsed
+  differently. **UDDSketch**'s uniform bucket-collapse keeps accuracy guarantees over the *full*
+  quantile range under collapse — the principled fix if DSP ever needs a tight low-quantile bound on
+  a pathological range. Low priority: `SKETCH_MAX_BINS` spans a ~10¹⁷ dynamic range, so a realistic
+  column never collapses. *(src: collapsing loses the guarantee on collapsed quantiles —
+  https://github.com/DataDog/sketches-java · UDDSketch — https://arxiv.org/abs/2004.08604)*
+- [ ] **NEXT — sketch rank-convention divergence is a documented footgun; consider reconciling:** the
+  `sketch_p*` reductions use DDSketch's reference rank (`⌊q·(n-1)⌋`) while the exact `p*` use
+  nearest-rank (`⌈q·n⌉`). They agree within `SKETCH_ALPHA` on a large bucket but can select different
+  samples outright on a small one (`sketch_p99` of 3 samples is the middle one, `p99` the largest).
+  Documented on `SKETCH_ALPHA` with "prefer the exact percentiles for small buckets"; a follow-up
+  could make the sketch honour nearest-rank so the two are substitutable at every bucket size.
+- [ ] **NEXT — mergeability is shipped but unused:** `DdSketch::merge` is exact (tested bit-for-bit
+  against a single pass), yet nothing merges sketches across segments/buckets — the property that
+  motivated the structure has no consumer. Wire it into a cross-segment downsample (one sketch per
+  segment, merged at the read) so streaming/parallel p99 actually benefits.
+- [x] **DONE (2026-07-16) — linear (trapezoidal) TWA method beside the shipped LOCF weighting:**
+  `Aggregation::TwaLinear` (token `twa_linear`, alias `time_weighted_avg_linear`) computing
+  `Σ½(vᵢ+vᵢ₊₁)Δtᵢ / ΣΔtᵢ`; `time_weighted_average` is generalized over a private
+  `TwaMethod::{Locf,Linear}` so both methods share one duration-weighting core and the same
+  degenerate-case handling. `Twa` gained the explicit `twa_locf` alias. The ½ stays exact in
+  `BigDecimal`. Verified against upstream semantics: LOCF weighs `v₁·Δt`, linear `½(v₁+v₂)·Δt`, and
+  the sensor guidance matches (LOCF for change-only devices, linear for irregularly-sampled
+  continuous signals). Runtime-verified on the live endpoint: one request returns twa_linear=13.75,
+  twa=15.0, avg=11.67 on the same series. *(src:
+  https://deepwiki.com/timescale/timescaledb-toolkit/3.3.1-time-weighted-averages ·
+  https://github.com/timescale/docs/blob/latest/use-timescale/hyperfunctions/time-weighted-average.md)*
+- [ ] **NEXT — TWA residue: the *last-point-to-bucket-end* weighting option.** Both DSP methods give
+  the bucket's last sample no forward weight (it has no successor), so a bucket ending in a long-held
+  value under-weights it. Timescale exposes this as an explicit choice. *(src:
+  https://github.com/timescale/timescaledb-toolkit/discussions/697)*
+- [x] **DONE (2026-07-16) — server ILP `parse_aggregation_token` adopts
+  `dsp_reduce::Aggregation::from_token`:** the last duplicate of the aggregation vocabulary is gone;
+  the HTTP surface consequently gained the `median`/`time_weighted_avg` aliases it had been missing
+  and can no longer drift from the reduction. (The drift was real: `dsp-bench`'s `--ds-aggs` error
+  message had already gone stale, omitting `twa` — fixed in the same pass.)
 - [x] Create `dsp-bench` as a first-class workspace member
 - [x] Define the first benchmark profile: `interpolation-heavy-irregular`
 - [x] DSP adapter + portable baselines (linear class-C, forward-fill class-B) + accuracy scoring + shape-selectable ground truth
@@ -1076,11 +1133,39 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   for equality against `value_at` by the existing point-read tests (whose regular fixtures now take
   the closed-form path, the duplicate/irregular ones the fallback) + a dedicated `arithmetic_stride`
   test.
-- [ ] **Next slice — block-random-access timestamp search for *irregular* sorted columns (Phase 4/6):**
-  the regular case is closed-form; an irregular sorted column still decodes the *whole* delta-of-delta
-  stream to binary-search. Add per-block timestamp checkpoints (a sparse `(block → reconstructed ts,
-  running delta)` index, a format bump) so a binary search reconstructs only the blocks it probes,
-  making the irregular sorted point lookup sublinear too; benchmark vs the current whole-column decode.
+- [x] **DONE (2026-07-16) — block-random-access timestamp search for *irregular* sorted columns
+  (Phase 4/6):** shipped as an **opt-in** on-disk checkpoint index. `DodCheckpoints` /
+  `DeltaOfDeltaColumn::checkpoints(stride)` record `(row, timestamp, delta)` every `stride` rows;
+  `TS_CODEC_CHECKPOINTED` (tag 5) persists that index followed by the inner codec stream —
+  **additive, so no format-version bump and every existing frame still reads**;
+  `write_segment_checkpointed` / `write_paged_segment_checkpointed` write it, and the streaming point
+  read resumes from the nearest checkpoint. Equal to the plain frame for every probe/batch/null-run
+  (tested across strides on single-block + paged frames).
+  **The measured story, in order, because the first answer was wrong:**
+  1. The index *alone* delivered **nothing** end-to-end (355.11 ms plain vs 350–360 ms checkpointed —
+     noise). Skipping the cumulative-sum reconstruction is only ~1% of a real point read.
+  2. Diagnosis: the **dod codec decode** dominates, not the reconstruction. Forcing the inner stream
+     to the range-decodable `TS_CODEC_BLOCKED` and range-decoding only the blocks a probe walks
+     (`blocked_bitpack_decode_range`) fixed the step that actually costs: **352.94 ms → 102.42 ms,
+     ~3.45× faster irregular point read for +0.41% frame bytes** (stride=1024, 100k-row frame).
+  3. Paged frames gain only **1.14×** (68.70 → 60.41 ms): page pruning already bounds the decode to
+     `rows_per_page`, so there is little left to save. The index is mostly a *single-block* lever.
+  This is the "decode-throughput is often bandwidth-bound — measure, don't assume" caveat confirmed
+  on DSP's own path. *(src: https://arxiv.org/pdf/2606.22423)*
+- [ ] **NEXT — checkpoint index adopt-or-drop into the DEFAULT seal — owner-gated (bytes/point
+  change, as FOR/cascade/ALP):** the win is real (3.45× single-block irregular point read for +0.41%
+  bytes) but **nothing seals checkpointed frames**, so no user reaches it: `write_segment_checkpointed`
+  is opt-in and the `AspectSchema::seal*` paths never call it. To land the benefit, expose an opt-in
+  seal (`seal_checkpointed`, an ingest flag / `DSP_SEGMENT_CHECKPOINT_STRIDE` env) and decide whether
+  a large sorted-irregular segment should checkpoint by default. Default adoption trades bytes/point
+  for lookup latency, so it needs owner sign-off + a headline re-baseline. Suggested policy if
+  adopted: only for `time_sorted && arithmetic_stride().is_none() && rows > ~8k`, stride ≈ 1024
+  (stride barely affects speed but does affect size).
+- [ ] **NEXT — checkpointed frames force `TS_CODEC_BLOCKED`, which may not be the smallest codec:**
+  the checkpointed writer overrides `best_encoding_name`'s pick because only the per-block codec is
+  range-decodable. On a stream where Gorilla/RLE/varint would win, that costs bytes beyond the index
+  itself (the measured +0.41% is the *combined* cost on one corpus). Quantify the override's cost
+  across corpora before any default adoption, and consider a random-access-capable Gorilla/RLE.
 - [x] **Windowed range read — decode only the row window for a regular block-coded segment (Phase
   4/6): shipped.** `dspseg::read_segment_range(bytes, start, end)` returns the `[start, end]` rows;
   for a **regular (constant-stride) sorted column with a random-access value codec** it computes the
