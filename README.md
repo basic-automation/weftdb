@@ -61,7 +61,7 @@ up to an HTTP server and an interactive application:
 | [`dsp-physical-type`](dsp-physical-type) | Vendor-neutral physical type system — schema-declared numeric encodings with explicit exactness, timestamp codecs, and the `.dspseg` columnar segment format (single-block and paged). |
 | [`dsp-arrow`](dsp-arrow) / [`dsp-arrow-store`](dsp-arrow-store) | Apache Arrow / Parquet interchange for sealed segments and stored reads, kept in leaf crates so the `arrow-*` dependency tree never reaches the hot-path core. |
 | [`dsp-line-protocol`](dsp-line-protocol) | Dependency-free InfluxDB Line Protocol parser shared by the server and the benchmark harness. |
-| [`dsp-reduce`](dsp-reduce) | Vendor-neutral downsampling reductions — `min`/`max`/`avg`/`sum`/`first`/`last` + nearest-rank `p50`/`p90`/`p95`/`p99` + time-weighted average, over an epoch-aligned bucket grid, computed in `BigDecimal`. Shared by the HTTP `downsample` endpoint and the benchmark harness. |
+| [`dsp-reduce`](dsp-reduce) | Vendor-neutral downsampling reductions — `min`/`max`/`avg`/`sum`/`first`/`last` + nearest-rank `p50`/`p90`/`p95`/`p99` + time-weighted average (LOCF **and** linear/trapezoidal) + mergeable bounded-error `sketch_p*` percentiles, over an epoch-aligned bucket grid, computed in `BigDecimal`. Shared by the HTTP `downsample` endpoint and the benchmark harness. |
 | [`dsp-server`](dsp-server) | Benchmark-grade `axum` HTTP API — interpolation, downsampling, storage ingest/query, catalog management, Prometheus metrics, live latency profiles. |
 | [`dsp-bench`](dsp-bench) | Reproducible, correctness-gated benchmark harness — the roadmap's spine; both an internal suite and a customer-runnable diagnostic. |
 | [`dsp-tui`](dsp-tui) | Terminal user interface (Ratatui + Crossterm) for creating databases, importing CSV data, browsing and plotting aspects, and running compression. |
@@ -377,6 +377,20 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   segment (192 µs vs 11.9 ms) and **~7.1× faster** on the paged frame (169 µs vs 1.20 ms), with the
   closed-form timestamp path a further **~7×** over an irregular column (192 µs vs 1.34 ms), identical
   bytes on disk ([`dsp-physical-type/benches/pointread.rs`](dsp-physical-type/benches/pointread.rs)).
+- **Checkpointed frames — sublinear point lookup on an *irregular* sorted column** *(opt-in;
+  `write_segment_checkpointed` / `write_paged_segment_checkpointed`)*. The closed form above only
+  serves a *regular* column; an irregular one has no closed form, so a probe had to decode the whole
+  delta-of-delta timestamp stream. A checkpointed frame persists a sparse `(row, timestamp, delta)`
+  index every `stride` rows next to a range-decodable per-block dod stream, so a probe binary-searches
+  the index and decodes **only the blocks it walks** — the timestamp column is never materialized.
+  Measured **~3.45× faster** point reads on a 100k-row sorted-irregular frame (352.94 ms → 102.42 ms
+  for 64 probes) for **+0.41% frame bytes** at stride 1024; a *paged* frame gains only **~1.14×**
+  (68.70 → 60.41 ms), because page pruning already bounds its decode to `rows_per_page`
+  ([`dsp-physical-type/benches/dodsearch.rs`](dsp-physical-type/benches/dodsearch.rs)). The codec tag
+  is **additive** — every previously written frame still reads, with no format-version bump — and a
+  checkpointed frame is byte-for-byte equivalent in behaviour to a plain one on every read. Nothing
+  seals checkpointed frames yet (default bytes/point are unchanged); wiring it into the seal path is
+  an owner-gated roadmap decision.
 - **Realized headline bytes/point** — every headline bytes/point figure
   (`Segment::bytes_per_point`, `StorageEstimate.bytes_per_point` /
   `total_bytes_per_point`, the bench HTML `val B/pt`) reports the codec **actually
@@ -540,9 +554,28 @@ CSV, Arrow IPC, or Parquet**:
 |----------|---------|
 | `POST /api/v1/interpolate` | Reconstruct an irregular series onto a regular grid (`spline` = `linear` \| `quadratic` \| `cubic` \| polynomial; `resolution` = `nanoseconds`..`years`). Every output point carries a `kind` — `raw` / `interpolated` / `extrapolated`. |
 | `POST /api/v1/interpolate/point` | Evaluate the reconstructed signal at a single instant, labelled raw/interpolated/extrapolated. |
-| `POST /api/v1/downsample` | Reduce samples into epoch-grid-aligned buckets — `min`/`max`/`avg`/`sum`/`first`/`last`, nearest-rank percentiles `p50`/`p90`/`p95`/`p99`, and `twa` (time-weighted average, LOCF dwell-weighting); all reductions computed in `BigDecimal` by the shared [`dsp-reduce`](dsp-reduce) crate. Only non-empty buckets are emitted. |
+| `POST /api/v1/downsample` | Reduce samples into epoch-grid-aligned buckets — `min`/`max`/`avg`/`sum`/`first`/`last`, nearest-rank percentiles `p50`/`p90`/`p95`/`p99`, the two **time-weighted averages** (`twa`, LOCF dwell-weighting, for change-only sensors; `twa_linear`, trapezoidal `Σ½(vᵢ+vᵢ₊₁)Δtᵢ/ΣΔtᵢ`, for irregularly-sampled continuous signals), and the **approximate `sketch_p50`/`p90`/`p95`/`p99`** (see below); all reductions computed in `BigDecimal` by the shared [`dsp-reduce`](dsp-reduce) crate. Aliases: `median`→`p50`, `time_weighted_avg`/`twa_locf`→`twa`, `time_weighted_avg_linear`→`twa_linear`, `sketch_median`→`sketch_p50`. Only non-empty buckets are emitted. |
 | `POST /api/v1/{interpolate,downsample}/ilp` | The same, fed an ILP `text/plain` body (the TSBS/InfluxDB/QuestDB wire format); `field`, `precision` (`ns`/`us`/`ms`/`s`), and the compute knobs are query parameters. `interpolation=` is accepted as an alias for `spline=` (the canonical `spline` wins if both are given). |
 | `POST /api/v1/{interpolate,downsample}/{csv,arrow,parquet}` and `…/ilp/{csv,arrow,parquet}` | The same computations with CSV (`text/csv`), Arrow IPC stream, or Parquet output — so a harness feeding line protocol pulls results in any of the four formats. |
+
+**Exact vs sketch percentiles — which to ask for.** The `p50`/`p90`/`p95`/`p99` reductions are
+*exact* nearest-rank: they return an actual observed `BigDecimal` from the bucket, but they
+materialize and sort the whole bucket, and two buckets' results cannot be combined. The
+`sketch_p50`/`p90`/`p95`/`p99` reductions instead stream every value into a
+[DDSketch](https://dl.acm.org/doi/10.14778/3352063.3352135) — a **1% relative-error** bound
+(`dsp_reduce::SKETCH_ALPHA`), **bounded memory** regardless of bucket size (values fold in as they
+arrive; `SKETCH_MAX_BINS` caps the store absolutely), and an **exactly mergeable** structure, so a
+p99 can be computed over a large or streaming bucket. Measured on the shipped harness (500k points,
+5 reps, correctness PASS): `sketch_p99` runs at **1,075,976 points/sec (p50 = 468.90 ms)** versus
+exact `p99` at **249,169 points/sec (p50 = 2018.53 ms)** — **~4.3× faster**
+(`dsp-bench --downsample --ds-points 500000 --ds-aggs sketch_p99` vs `--ds-aggs p99`).
+
+The approximation is **declared, never silent** — DSP's precision principle. Two honest caveats:
+the exact percentiles remain the default and cost nothing on a small bucket, so prefer them there;
+and the sketch uses DDSketch's rank convention (`⌊q·(n-1)⌋`) while the exact percentiles use
+nearest-rank (`⌈q·n⌉`), so on a *small* bucket the two can select different samples outright
+(`sketch_p99` of three samples is the middle one, `p99` the largest). They converge within the 1%
+bound as the bucket grows.
 
 ```sh
 curl -s -X POST http://127.0.0.1:8080/api/v1/interpolate \
@@ -636,7 +669,7 @@ What it does today:
   value-column compression ratio, and decode throughput, gated on an exact
   round-trip; and **`downsample`** (`--downsample`) times DSP's canonical
   [`dsp-reduce`](dsp-reduce) reduction into grid-aligned buckets with a
-  `--ds-aggs` selector over `min`/`max`/`avg`/`sum`/`first`/`last`/`p50`…`p99`/`twa`.
+  `--ds-aggs` selector over `min`/`max`/`avg`/`sum`/`first`/`last`/`p50`…`p99`/`twa`/`twa_linear`/`sketch_p50`…`sketch_p99`.
   The underlying point/range read speedups are quantified at the codec layer in
   [`dsp-physical-type/benches/pointread.rs`](dsp-physical-type/benches/pointread.rs).
 - **Vendor-neutral adapters** — every system is driven through the
