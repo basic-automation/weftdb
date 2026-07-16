@@ -389,11 +389,14 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   ([`dsp-physical-type/benches/dodsearch.rs`](dsp-physical-type/benches/dodsearch.rs)). The codec tag
   is **additive** — every previously written frame still reads, with no format-version bump — and a
   checkpointed frame is byte-for-byte equivalent in behaviour to a plain one on every read.
-  **Opt in** by setting `DSP_SEGMENT_CHECKPOINT_STRIDE` (see the configuration table): the seal path
-  then writes the index for any sealed segment whose shape actually benefits — sorted, irregular, and
-  at least `DSP_SEGMENT_CHECKPOINT_MIN_ROWS` rows — since a *regular* column already resolves `O(1)`
-  closed-form and an out-of-order one cannot be binary-searched. It is **off by default**, so an
-  unconfigured store's bytes/point are unchanged; making it the default is an open roadmap decision.
+  **Opt in** by setting `DSP_SEGMENT_CHECKPOINT_STRIDE` (see the configuration table). The seal path
+  then writes the index only where it genuinely pays, on three counts: the column is **sorted and
+  irregular** (a *regular* one already resolves `O(1)` closed-form, an out-of-order one cannot be
+  binary-searched), it has at least `DSP_SEGMENT_CHECKPOINT_MIN_ROWS` rows, and the **codec override
+  is affordable** — a checkpointed frame must use the range-decodable per-block codec, which costs
+  ~3.5× on a Gorilla-shaped column and ~14× on an RLE-shaped one, so those are refused rather than
+  bloated (`DSP_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD`). It is **off by default**, so an unconfigured
+  store's bytes/point are unchanged; making it the default is an open roadmap decision.
 - **Realized headline bytes/point** — every headline bytes/point figure
   (`Segment::bytes_per_point`, `StorageEstimate.bytes_per_point` /
   `total_bytes_per_point`, the bench HTML `val B/pt`) reports the codec **actually
@@ -819,6 +822,7 @@ DSP is configured primarily through environment variables:
 | `DSP_RECONCILE_MAX_SPLITS` | `dsp-server` | Segment-count cap; each tick also squashes every aspect over it into one segment (bounds split-path fragmentation). | unset (no squash) |
 | `DSP_SEGMENT_CHECKPOINT_STRIDE` | `dsp-server` | Rows between entries of the sealed **timestamp checkpoint index** — trades a little size for much faster point lookups on **sorted, irregular** columns (~3.45× single-block; see the checkpointed-frames feature above). Applies only where it pays: sorted + irregular + at least `DSP_SEGMENT_CHECKPOINT_MIN_ROWS` rows. ~1024 is the sweet spot (stride barely moves speed but does move size). | unset (no index; frames byte-for-byte as before) |
 | `DSP_SEGMENT_CHECKPOINT_MIN_ROWS` | `dsp-server` | Row floor below which a segment is never checkpointed (a small column decodes trivially, so an index would be pure cost). | `8192` |
+| `DSP_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD` | `dsp-server` | Ceiling on the timestamp-codec override a checkpointed seal will accept (`blocked / best` bytes; `1.0` = only when free). A checkpointed frame must use the range-decodable per-block codec, which is ~free where that codec already wins but **~3.5× on a Gorilla-shaped and ~14× on an RLE-shaped column** — this refuses those seals rather than silently bloating them. | `1.25` |
 | `RUST_LOG` | all | [`tracing`](https://docs.rs/tracing) filter. On `dsp-server` it drives a per-request root span (`request{method,path,request_id}`, echoed as `x-request-id`) that every per-stage span nests under, each with busy/idle timing: the compute paths (`interpolate.parse`/`compute`/`serialize` under `interpolate.engine`, `downsample.parse`/`reduce`); the **storage read** paths (`storage.{range,value_range,point}.read` + `.serialize`, with a `format` field over JSON/CSV/Arrow/Parquet); the **ingest** paths (`storage.ingest.parse`/`normalize`/`seal` for ILP/CSV/JSON, and `storage.ingest.parquet` for the Parquet decode+seal); and the background **reconcile daemon** (`reconcile.tick{kind,…,aspects,segments}`). | `dsp_tui=debug,database=debug,info` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `dsp-server` | When set (e.g. `http://localhost:4317`), export tracing spans to an OpenTelemetry collector over **OTLP/gRPC** in addition to the `RUST_LOG` `fmt` output. Unset → no exporter, no network dependency; a misconfigured/absent collector never blocks startup. `scripts/verify-otlp.sh` verifies delivery end-to-end against a local Jaeger container (starting one if needed). | unset (export disabled) |
 | `SKIP_SLOW_TESTS` | tests | Set to `1` to skip long-running tests. | unset |

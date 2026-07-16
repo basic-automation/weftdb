@@ -1167,18 +1167,34 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   (`bytes_per_point=1.5966`), `DSP_SEGMENT_CHECKPOINT_STRIDE=1024` → `19422` (`1.6185`, **+1.37%**),
   with `…/at` and `…/at-multi` returning byte-identical JSON from both stores.
 - [ ] **NEXT — checkpoint index adopt-or-drop into the DEFAULT policy — owner-gated (bytes/point
-  change, as FOR/cascade/ALP):** the trade is now measurable end-to-end and merely needs a decision:
-  **~3.45× faster irregular single-block point reads for ~+0.4–1.4% bytes** (+1.37% on the 12k-row
-  runtime corpus; +0.41% on the 100k-row bench — the overhead shrinks as the segment grows, since
-  the index is `rows/stride` entries against a growing column). Flip `CheckpointPolicy::from_env`'s
-  default to `stride: Some(1024)` if adopted, then re-baseline the headline once. Suggested policy is
-  already the shipped predicate: `time_sorted && !regular && rows >= 8192`. **Decide with the paged
-  case in mind — paged frames gain only 1.14×, so a paged-heavy deployment may not want it.**
-- [ ] **NEXT — checkpointed frames force `TS_CODEC_BLOCKED`, which may not be the smallest codec:**
-  the checkpointed writer overrides `best_encoding_name`'s pick because only the per-block codec is
-  range-decodable. On a stream where Gorilla/RLE/varint would win, that costs bytes beyond the index
-  itself (the measured +0.41% is the *combined* cost on one corpus). Quantify the override's cost
-  across corpora before any default adoption, and consider a random-access-capable Gorilla/RLE.
+  change, as FOR/cascade/ALP):** the trade is measured end-to-end and merely needs a decision:
+  **~3.45× faster irregular single-block point reads for ~+0.4–1.4% bytes** on the shapes that now
+  pass the gate (+1.37% on the 12k-row runtime corpus; +0.41% on the 100k-row bench — the index's
+  share shrinks as the segment grows, being `rows/stride` entries against a growing column). Flip
+  `CheckpointPolicy::from_env`'s default to `stride: Some(1024)` if adopted, then re-baseline the
+  headline once. The predicate is already shipped and now correct on all three axes:
+  `time_sorted && !regular && rows >= 8192 && codec_overhead <= 1.25`. Two things to weigh:
+  **paged frames gain only 1.14×** (page pruning already bounds their decode), and the codec gate
+  means **Gorilla/RLE-shaped irregular columns get no win at all** — so the benefit is narrower than
+  "all irregular columns" and depends on a deployment's shape mix.
+- [x] **DONE (2026-07-16) — the `TS_CODEC_BLOCKED` override is QUANTIFIED, and it is NOT small.**
+  Measured per shape on the timestamp block (10k rows,
+  `dsp-physical-type/benches/dodsearch.rs::report_codec_override_cost`): bounded jitter **+1.04%**
+  (blocked already wins) · scattered single jitter **+251%** (gorilla wins) · long constant runs
+  **+1301%** (RLE wins) · regular +1418% (moot — never checkpointed). **The earlier +0.41% frame
+  figure was corpus-specific luck**: the bounded-jitter corpus is the one shape where blocked is
+  already best. The scattered-jitter and constant-run shapes are *irregular*, so the shape-only
+  predicate would have checkpointed them and silently bloated their timestamp block 3.5×/14×.
+  **Fixed**: `Segment::checkpoint_codec_overhead()` (`blocked/best`) + `CheckpointPolicy`'s
+  `max_codec_overhead` ceiling (default 1.25, `DSP_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD`) refuse
+  those seals; proven end-to-end by a test where an RLE-shaped column seals byte-identical to plain
+  and only checkpoints when the ceiling is lifted.
+- [ ] **NEXT — a random-access-capable Gorilla/RLE would widen the checkpoint index's reach:** the
+  codec gate now *refuses* Gorilla/RLE-shaped irregular columns rather than bloating them, so those
+  columns keep the `O(n)` timestamp decode on a point lookup — correct, but they get no win. A
+  block-framed Gorilla (or an RLE with per-run offsets) would let the checkpoint index apply there
+  too, at a fraction of the current override. Only worth it if such corpora prove common — measure
+  the shape mix of a real customer corpus first.
 - [x] **Windowed range read — decode only the row window for a regular block-coded segment (Phase
   4/6): shipped.** `dspseg::read_segment_range(bytes, start, end)` returns the `[start, end]` rows;
   for a **regular (constant-stride) sorted column with a random-access value codec** it computes the
