@@ -856,12 +856,13 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   a pathological range. Low priority: `SKETCH_MAX_BINS` spans a ~10¹⁷ dynamic range, so a realistic
   column never collapses. *(src: collapsing loses the guarantee on collapsed quantiles —
   https://github.com/DataDog/sketches-java · UDDSketch — https://arxiv.org/abs/2004.08604)*
-- [ ] **NEXT — sketch rank-convention divergence is a documented footgun; consider reconciling:** the
-  `sketch_p*` reductions use DDSketch's reference rank (`⌊q·(n-1)⌋`) while the exact `p*` use
-  nearest-rank (`⌈q·n⌉`). They agree within `SKETCH_ALPHA` on a large bucket but can select different
-  samples outright on a small one (`sketch_p99` of 3 samples is the middle one, `p99` the largest).
-  Documented on `SKETCH_ALPHA` with "prefer the exact percentiles for small buckets"; a follow-up
-  could make the sketch honour nearest-rank so the two are substitutable at every bucket size.
+- [x] **DONE (2026-07-16) — sketch rank-convention divergence REMOVED.** `DdSketch::quantile` now
+  ranks by DSP's nearest-rank ordinal (`⌈q·n⌉`, 1-based, clamped) rather than DDSketch's reference
+  `⌊q·(n-1)⌋`, so `sketch_p*` and `p*` name the **same sample at every bucket size** and the sketch
+  is always within `SKETCH_ALPHA` of the exact answer — substitutable, no small-bucket trap.
+  DSP-internal consistency beat matching Datadog's convention. Guarded by
+  `sketch_and_exact_percentiles_agree_on_small_buckets` (n=1..=12 × p50/p90/p99). Runtime-verified:
+  a 3-sample bucket returns `sketch_p99`=49.90 vs exact 50.0 where it previously returned **0.0**.
 - [ ] **NEXT — mergeability is shipped but unused:** `DdSketch::merge` is exact (tested bit-for-bit
   against a single pass), yet nothing merges sketches across segments/buckets — the property that
   motivated the structure has no consumer. Wire it into a cross-segment downsample (one sketch per
