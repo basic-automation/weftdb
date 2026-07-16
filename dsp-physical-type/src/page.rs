@@ -399,6 +399,26 @@ impl PagedSegment {
 		crate::dspseg::write_paged_segment(self)
 	}
 
+	/// Seal to a `.dspseg` frame whose every page carries a **persisted checkpoint index**.
+	/// See [`crate::dspseg::write_paged_segment_checkpointed`].
+	///
+	/// Read by the ordinary [`read_from`](Self::read_from) — the codec tag is additive.
+	/// Note the paged win is much smaller than the single-block one: page pruning already
+	/// bounds a probe's decode to `rows_per_page`.
+	#[must_use]
+	pub fn write_to_checkpointed(&self, stride: usize) -> Vec<u8> {
+		crate::dspseg::write_paged_segment_checkpointed(self, stride)
+	}
+
+	/// Whether a checkpoint index would help this segment's point lookups: a **sorted**
+	/// segment with at least one **irregular** page (a regular page already resolves in
+	/// `O(1)` closed form, an out-of-order segment cannot be binary-searched). The paged
+	/// analogue of [`Segment::benefits_from_checkpoints`](crate::Segment::benefits_from_checkpoints).
+	#[must_use]
+	pub fn benefits_from_checkpoints(&self) -> bool {
+		self.stats.time_sorted && self.pages.iter().any(|p| p.timestamps.arithmetic_stride().is_none())
+	}
+
 	/// Read a paged segment back from a `.dspseg` byte frame, verifying its checksum.
 	///
 	/// Exact inverse of [`PagedSegment::write_to`]. See
