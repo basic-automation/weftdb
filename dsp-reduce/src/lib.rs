@@ -94,6 +94,16 @@ pub enum Aggregation {
 /// materialize or the result must merge.
 pub const SKETCH_ALPHA: f64 = 0.01;
 
+/// The bucket budget of the `sketch_p*` reductions, per sign store.
+///
+/// Makes the reductions' memory bound *absolute* rather than merely logarithmic in the
+/// value range. At [`SKETCH_ALPHA`] this covers a dynamic range of roughly `1.0202^2048`
+/// (~10¹⁷ — sub-nanosecond to astronomical in one bucket), so a realistic column never
+/// reaches it and never collapses; it exists to cap the pathological case rather than to
+/// bite in practice. See [`DdSketch::with_max_bins`] for what collapsing costs when it
+/// does trigger.
+pub const SKETCH_MAX_BINS: usize = 2048;
+
 impl Aggregation {
 	/// The stable wire key this reduction is reported under.
 	#[must_use]
