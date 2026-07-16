@@ -469,7 +469,7 @@ fn parse_aggregations(token: Option<&str>) -> Result<Vec<Aggregation>, ApiError>
 /// set the reduction supports (including the `median`/`time_weighted_avg` aliases) and
 /// cannot drift from `dsp-reduce` as reductions are added.
 fn parse_aggregation_token(token: &str) -> Result<Aggregation, ApiError> {
-	Aggregation::from_token(token).ok_or_else(|| ApiError::BadRequest(format!("unknown aggregation `{token}` (use min/max/avg/sum/first/last/p50/p90/p95/p99/twa/twa_linear)")))
+	Aggregation::from_token(token).ok_or_else(|| ApiError::BadRequest(format!("unknown aggregation `{token}` (use min/max/avg/sum/first/last/p50/p90/p95/p99/twa/twa_linear/sketch_p50/sketch_p90/sketch_p95/sketch_p99)")))
 }
 
 #[cfg(test)]

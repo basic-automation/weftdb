@@ -83,8 +83,22 @@ impl DdSketch {
 		if !(alpha.is_finite() && alpha > 0.0 && alpha < 1.0) {
 			return Err(SketchError::InvalidAccuracy);
 		}
+		Ok(Self::from_alpha(alpha))
+	}
+
+	/// A sketch at the crate's declared [`SKETCH_ALPHA`](crate::SKETCH_ALPHA) accuracy.
+	///
+	/// Infallible: the constant is a valid relative accuracy by construction, so the
+	/// reduction path builds sketches without an unreachable error branch.
+	#[must_use]
+	pub fn with_default_accuracy() -> Self {
+		Self::from_alpha(crate::SKETCH_ALPHA)
+	}
+
+	/// Build the mapping for an already-validated `alpha`.
+	fn from_alpha(alpha: f64) -> Self {
 		let gamma = (1.0 + alpha) / (1.0 - alpha);
-		Ok(Self { alpha, gamma, log_gamma: gamma.ln(), positive: BTreeMap::new(), negative: BTreeMap::new(), zeros: 0, count: 0 })
+		Self { alpha, gamma, log_gamma: gamma.ln(), positive: BTreeMap::new(), negative: BTreeMap::new(), zeros: 0, count: 0 }
 	}
 
 	/// The relative accuracy `α` this sketch guarantees.

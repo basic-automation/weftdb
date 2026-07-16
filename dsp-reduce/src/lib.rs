@@ -68,7 +68,31 @@ pub enum Aggregation {
 	/// constant. Best for irregularly-sampled *continuous* signals (temperature, flow);
 	/// [`Twa`](Self::Twa)'s LOCF weighting is best for change-only/step sensors.
 	TwaLinear,
+	/// Approximate 50th percentile via a mergeable [`DdSketch`] — bounded memory, with
+	/// the relative error bounded by [`SKETCH_ALPHA`].
+	SketchP50,
+	/// Approximate 90th percentile via a mergeable [`DdSketch`].
+	SketchP90,
+	/// Approximate 95th percentile via a mergeable [`DdSketch`].
+	SketchP95,
+	/// Approximate 99th percentile via a mergeable [`DdSketch`].
+	SketchP99,
 }
+
+/// The relative-error bound of the `sketch_p*` reductions: 1%.
+///
+/// The common default for latency monitoring. Declared and fixed rather than silent —
+/// the exact nearest-rank percentiles remain available whenever the approximation is
+/// not acceptable.
+///
+/// **Rank convention.** The `sketch_p*` reductions use `DdSketch`'s reference rank
+/// (0-based `⌊q·(n-1)⌋`), while the exact `p*` reductions use nearest-rank
+/// (`⌈q·n⌉`). On a large bucket the two agree within [`SKETCH_ALPHA`]; on a *small*
+/// bucket they can select different samples outright (`sketch_p99` of three samples is
+/// the middle one, `p99` the largest). Prefer the exact percentiles for small buckets —
+/// they cost nothing there; the sketch earns its keep when a bucket is too large to
+/// materialize or the result must merge.
+pub const SKETCH_ALPHA: f64 = 0.01;
 
 impl Aggregation {
 	/// The stable wire key this reduction is reported under.
@@ -87,6 +111,10 @@ impl Aggregation {
 			Self::P99 => "p99",
 			Self::Twa => "twa",
 			Self::TwaLinear => "twa_linear",
+			Self::SketchP50 => "sketch_p50",
+			Self::SketchP90 => "sketch_p90",
+			Self::SketchP95 => "sketch_p95",
+			Self::SketchP99 => "sketch_p99",
 		}
 	}
 
@@ -109,6 +137,10 @@ impl Aggregation {
 			"p99" => Some(Self::P99),
 			"twa" | "time_weighted_avg" | "twa_locf" => Some(Self::Twa),
 			"twa_linear" | "time_weighted_avg_linear" => Some(Self::TwaLinear),
+			"sketch_p50" | "sketch_median" => Some(Self::SketchP50),
+			"sketch_p90" => Some(Self::SketchP90),
+			"sketch_p95" => Some(Self::SketchP95),
+			"sketch_p99" => Some(Self::SketchP99),
 			_ => None,
 		}
 	}
@@ -126,10 +158,27 @@ impl Aggregation {
 		}
 	}
 
-	/// Whether this reduction needs the whole bucket materialized (percentiles need
-	/// the sorted values; the time-weighted averages need the time-ordered samples).
-	/// The streaming reductions do not, so [`reduce`] only collects samples when one of
-	/// these is asked.
+	/// The quantile this reduction reads from the bucket's [`DdSketch`], or `None` for
+	/// the non-sketch reductions.
+	#[must_use]
+	pub const fn sketch_quantile(self) -> Option<f64> {
+		match self {
+			Self::SketchP50 => Some(0.50),
+			Self::SketchP90 => Some(0.90),
+			Self::SketchP95 => Some(0.95),
+			Self::SketchP99 => Some(0.99),
+			_ => None,
+		}
+	}
+
+	/// Whether this reduction needs the whole bucket materialized (the exact
+	/// nearest-rank percentiles need the sorted values; the time-weighted averages need
+	/// the time-ordered samples). The streaming reductions do not, so [`reduce`] only
+	/// collects samples when one of these is asked.
+	///
+	/// The `sketch_p*` reductions are deliberately **not** here: they fold each value
+	/// into a [`DdSketch`] as it arrives, which is the whole point — bounded memory
+	/// regardless of bucket size. Collecting for them would forfeit the saving.
 	#[must_use]
 	pub const fn needs_full_bucket(self) -> bool {
 		self.percentile_rank().is_some() || matches!(self, Self::Twa | Self::TwaLinear)
@@ -172,6 +221,11 @@ pub enum ReduceError {
 	/// `i64`-second range (a coarse resolution far from the epoch).
 	#[error("a bucket start overflows the representable time range")]
 	BucketStartOverflow,
+	/// A `sketch_p*` reduction was requested but a value has no finite `f64` image, so
+	/// it cannot be mapped into a sketch bucket. Surfaced rather than dropped: silently
+	/// skipping a sample would corrupt the quantile without any signal.
+	#[error("a value cannot be represented in the quantile sketch")]
+	SketchValue,
 }
 
 /// Running aggregate state for one bucket, accumulated in [`BigDecimal`] so sums and
@@ -192,16 +246,25 @@ struct BucketAcc {
 	/// or time-weighted average is requested).
 	samples: Vec<(DateTime<Utc>, BigDecimal)>,
 	collect: bool,
+	/// Present only when a `sketch_p*` reduction is requested; values fold in as they
+	/// arrive, so the bucket's memory stays bounded no matter how many samples land.
+	sketch: Option<DdSketch>,
 }
 
 impl BucketAcc {
-	/// A fresh accumulator; `collect` materializes the full bucket for percentiles / TWA.
-	fn new(collect: bool) -> Self {
-		Self { count: 0, sum: BigDecimal::from(0), min: None, max: None, first: None, last: None, samples: Vec::new(), collect }
+	/// A fresh accumulator; `collect` materializes the full bucket for the exact
+	/// percentiles / TWA, `sketch` streams values into a [`DdSketch`] instead.
+	fn new(collect: bool, sketch: Option<DdSketch>) -> Self {
+		Self { count: 0, sum: BigDecimal::from(0), min: None, max: None, first: None, last: None, samples: Vec::new(), collect, sketch }
 	}
 
 	/// Fold one `(timestamp, value)` into the bucket.
-	fn push(&mut self, timestamp: DateTime<Utc>, value: BigDecimal) {
+	///
+	/// # Errors
+	///
+	/// [`ReduceError::SketchValue`] if a sketch reduction was requested and the value
+	/// has no finite `f64` image (so it cannot be placed in a sketch bucket).
+	fn push(&mut self, timestamp: DateTime<Utc>, value: BigDecimal) -> Result<(), ReduceError> {
 		self.count += 1;
 		self.sum += &value;
 		if self.min.as_ref().is_none_or(|m| &value < m) {
@@ -216,9 +279,13 @@ impl BucketAcc {
 		if self.collect {
 			self.samples.push((timestamp, value.clone()));
 		}
+		if let Some(sketch) = self.sketch.as_mut() {
+			sketch.add_decimal(&value).map_err(|_| ReduceError::SketchValue)?;
+		}
 		if self.last.as_ref().is_none_or(|(t, _)| timestamp >= *t) {
 			self.last = Some((timestamp, value));
 		}
+		Ok(())
 	}
 
 	/// Materialize the requested reductions and the grid-aligned bucket start.
@@ -236,6 +303,8 @@ impl BucketAcc {
 		for &agg in aggregations {
 			let value = if let Some(rank) = agg.percentile_rank() {
 				sorted_values.as_deref().and_then(|s| percentile(s, rank))
+			} else if let Some(q) = agg.sketch_quantile() {
+				self.sketch.as_ref().and_then(|s| s.quantile_decimal(q))
 			} else {
 				match agg {
 					Aggregation::Min => self.min.clone(),
@@ -247,6 +316,7 @@ impl BucketAcc {
 					Aggregation::Twa => time_weighted_average(&self.samples, TwaMethod::Locf),
 					Aggregation::TwaLinear => time_weighted_average(&self.samples, TwaMethod::Linear),
 					Aggregation::P50 | Aggregation::P90 | Aggregation::P95 | Aggregation::P99 => unreachable!("handled by percentile_rank above"),
+					Aggregation::SketchP50 | Aggregation::SketchP90 | Aggregation::SketchP95 | Aggregation::SketchP99 => unreachable!("handled by sketch_quantile above"),
 				}
 			};
 			if let Some(value) = value {
@@ -341,9 +411,11 @@ fn percentile(samples: &[BigDecimal], rank: u8) -> Option<BigDecimal> {
 /// scales past the representable time range.
 pub fn reduce(points: &[Point], resolution: Resolution, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, aggregations: &[Aggregation]) -> Result<Vec<Bucket>, ReduceError> {
 	let aggregations = if aggregations.is_empty() { &Aggregation::DEFAULT[..] } else { aggregations };
-	// Percentiles and TWA require the full bucket materialized; the streaming
+	// The exact percentiles and TWA require the full bucket materialized; the streaming
 	// reductions do not, so only collect when one of those is actually requested.
 	let collect = aggregations.iter().any(|a| a.needs_full_bucket());
+	// A sketch reduction streams into a per-bucket DdSketch instead of collecting.
+	let sketching = aggregations.iter().any(|a| a.sketch_quantile().is_some());
 
 	// A BTreeMap keyed by the bucket index yields buckets in ascending index order,
 	// which is ascending time order for a fixed resolution.
@@ -353,7 +425,9 @@ pub fn reduce(points: &[Point], resolution: Resolution, start: Option<DateTime<U
 			continue;
 		}
 		let base = resolution.to_base(&p.timestamp).map_err(|_| ReduceError::TimestampRange)?;
-		buckets.entry(base).or_insert_with(|| BucketAcc::new(collect)).push(p.timestamp, p.value.clone());
+		// The sketch is built inside the insert closure so a bucket that already exists
+		// does not construct (and immediately drop) one per point.
+		buckets.entry(base).or_insert_with(|| BucketAcc::new(collect, sketching.then(DdSketch::with_default_accuracy))).push(p.timestamp, p.value.clone())?;
 	}
 
 	buckets.into_iter().map(|(base, acc)| acc.finish(resolution, base, aggregations)).collect()
@@ -485,7 +559,6 @@ mod tests {
 		// Scrambled input, and a percentile must return an exact observed BigDecimal.
 		let points = vec![pt(2, "3.3"), pt(0, "1.1"), pt(1, "2.2")];
 		let buckets = reduce(&points, Resolution::Minutes, None, None, &[Aggregation::P50]).expect("reduces");
-		use std::str::FromStr;
 		assert_eq!(buckets[0].values.get("p50").unwrap(), &BigDecimal::from_str("2.2").unwrap(), "p50 of 1.1/2.2/3.3 is exactly 2.2");
 	}
 
@@ -555,6 +628,72 @@ mod tests {
 		// Two samples at the same instant (zero time spread) -> arithmetic mean.
 		let same = reduce(&[pt(5, "10"), pt(5, "20")], Resolution::Minutes, None, None, &[Aggregation::Twa]).expect("reduces");
 		assert!((get(&same[0], Aggregation::Twa) - 15.0).abs() < 1e-9, "zero spread falls back to the mean");
+	}
+
+	#[test]
+	fn sketch_percentiles_track_the_exact_percentiles_within_the_bound() {
+		// The claim that makes the sketch reductions usable: on a real bucket their
+		// answer is within SKETCH_ALPHA of the exact nearest-rank percentile.
+		let points: Vec<Point> = (1..=1000).map(|v| pt(i64::from(v - 1), &v.to_string())).collect();
+		let buckets = reduce(&points, Resolution::Hours, None, None, &[Aggregation::P50, Aggregation::SketchP50, Aggregation::P90, Aggregation::SketchP90, Aggregation::P99, Aggregation::SketchP99]).expect("reduces");
+		assert_eq!(buckets.len(), 1, "all 1000 points fall in one hour-bucket");
+		let b = &buckets[0];
+		for (exact, approx) in [(Aggregation::P50, Aggregation::SketchP50), (Aggregation::P90, Aggregation::SketchP90), (Aggregation::P99, Aggregation::SketchP99)] {
+			let (e, a) = (get(b, exact), get(b, approx));
+			let rel = (a - e).abs() / e.abs();
+			// One bucket of slack: the exact and sketch reductions use different rank
+			// conventions, so on adjacent-integer data they may pick neighbouring samples.
+			assert!(rel <= SKETCH_ALPHA * 2.0, "{} ({a}) must track {} ({e}) within the sketch bound, relative error {rel}", approx.as_str(), exact.as_str());
+		}
+	}
+
+	#[test]
+	fn sketch_reductions_do_not_materialize_the_bucket() {
+		// The bounded-memory property: asking only for a sketch percentile must not set
+		// the collect flag (which is what materializes every sample in the bucket).
+		assert!(!Aggregation::SketchP99.needs_full_bucket(), "a sketch reduction streams — it must not request the full bucket");
+		assert!(Aggregation::P99.needs_full_bucket(), "the exact percentile still needs the bucket");
+		assert!(Aggregation::Twa.needs_full_bucket(), "TWA still needs the time-ordered samples");
+		// And it still produces an answer without collection.
+		let points: Vec<Point> = (1..=100).map(|v| pt(i64::from(v - 1), &v.to_string())).collect();
+		let buckets = reduce(&points, Resolution::Hours, None, None, &[Aggregation::SketchP50]).expect("reduces");
+		assert!(buckets[0].values.contains_key("sketch_p50"), "the streamed sketch still yields a value");
+	}
+
+	#[test]
+	fn sketch_tokens_and_aliases_parse() {
+		for agg in [Aggregation::SketchP50, Aggregation::SketchP90, Aggregation::SketchP95, Aggregation::SketchP99] {
+			assert_eq!(Aggregation::from_token(agg.as_str()), Some(agg), "{} round-trips", agg.as_str());
+		}
+		assert_eq!(Aggregation::from_token("sketch_median"), Some(Aggregation::SketchP50), "sketch_median aliases sketch_p50");
+		assert_eq!(Aggregation::from_token("SKETCH_P99"), Some(Aggregation::SketchP99), "sketch tokens are case-insensitive");
+	}
+
+	#[test]
+	fn sketch_handles_negative_and_zero_buckets() {
+		// A bucket straddling zero must still reduce (the sketch mirrors negatives and
+		// counts zero exactly), rather than erroring or dropping samples.
+		let points = vec![pt(0, "-50"), pt(1, "0"), pt(2, "50")];
+		let buckets = reduce(&points, Resolution::Hours, None, None, &[Aggregation::SketchP50, Aggregation::SketchP99]).expect("reduces a zero-straddling bucket");
+		assert_eq!(buckets[0].count, 3);
+		assert!(get(&buckets[0], Aggregation::SketchP50).abs() < 1e-9, "median of -50/0/50 is exactly 0 (zero is counted, not approximated)");
+		// Rank-convention divergence, pinned deliberately: the sketch selects rank
+		// floor(q*(n-1)) = floor(1.98) = 1 -> the middle sample (0), while the exact P99
+		// uses nearest-rank ceil(q*n) = 3 -> the top sample (50). On a 3-sample bucket
+		// the two conventions genuinely disagree; they converge as n grows (see
+		// `sketch_percentiles_track_the_exact_percentiles_within_the_bound`, n=1000).
+		assert!(get(&buckets[0], Aggregation::SketchP99).abs() < 1e-9, "sketch p99 of a 3-sample bucket is the middle sample under the DDSketch rank convention");
+	}
+
+	#[test]
+	fn sketch_negative_only_bucket_reports_negative_quantiles() {
+		// The mirrored negative store: an all-negative bucket must report negative
+		// quantiles within the bound, not fall back to zero or error.
+		let points: Vec<Point> = (1..=100).map(|v| pt(i64::from(v - 1), &format!("-{v}"))).collect();
+		let buckets = reduce(&points, Resolution::Hours, None, None, &[Aggregation::SketchP50]).expect("reduces");
+		let got = get(&buckets[0], Aggregation::SketchP50);
+		// Sorted ascending: -100 … -1; rank floor(0.5*99) = 49 -> -51.
+		assert!((got - -51.0).abs() / 51.0 <= SKETCH_ALPHA, "median of -100..-1 is about -51, got {got}");
 	}
 
 	#[test]
