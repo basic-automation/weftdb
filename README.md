@@ -573,12 +573,13 @@ p99 can be computed over a large or streaming bucket. Measured on the shipped ha
 exact `p99` at **249,169 points/sec (p50 = 2018.53 ms)** — **~4.3× faster**
 (`dsp-bench --downsample --ds-points 500000 --ds-aggs sketch_p99` vs `--ds-aggs p99`).
 
-The approximation is **declared, never silent** — DSP's precision principle. Two honest caveats:
-the exact percentiles remain the default and cost nothing on a small bucket, so prefer them there;
-and the sketch uses DDSketch's rank convention (`⌊q·(n-1)⌋`) while the exact percentiles use
-nearest-rank (`⌈q·n⌉`), so on a *small* bucket the two can select different samples outright
-(`sketch_p99` of three samples is the middle one, `p99` the largest). They converge within the 1%
-bound as the bucket grows.
+The approximation is **declared, never silent** — DSP's precision principle. The sketch shares the
+exact percentiles' **nearest-rank convention** (`⌈q·n⌉`), so `sketch_p*` and `p*` name the same
+sample at *every* bucket size and the sketch is always within the 1% bound of the exact answer —
+the two are substitutable. (DDSketch's reference rank is `⌊q·(n-1)⌋`, which on a small bucket picks
+a different sample; DSP deliberately does not inherit that.) The exact percentiles remain the
+default and cost nothing on a small bucket, so prefer them there; reach for a sketch when a bucket
+is too large to materialize or the result must merge.
 
 ```sh
 curl -s -X POST http://127.0.0.1:8080/api/v1/interpolate \
