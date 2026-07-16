@@ -21,7 +21,8 @@ use std::time::Instant;
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 pub use dsp_reduce::Aggregation;
-use dsp_reduce::{reduce, Bucket};
+use dsp_reduce::{reduce, reduce_partial, Bucket, PartialReduction};
+use rayon::prelude::*;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use splimes::{Point, Resolution};
@@ -53,13 +54,16 @@ pub struct DownsampleParams {
 	pub bucket_resolution: Resolution,
 	/// Reductions computed per bucket (empty ⇒ [`Aggregation::DEFAULT`]).
 	pub aggregations: Vec<Aggregation>,
+	/// Reduce in this many parallel chunks (`0`/`1` = one serial pass). See
+	/// [`DownsampleProfile::parallel_chunks`].
+	pub parallel_chunks: usize,
 }
 
 impl Default for DownsampleParams {
 	/// The flagship downsample knob set: 60 000 samples at 1-second spacing (~16.7
 	/// hours) reduced to per-minute buckets (~60 samples/bucket), every reduction.
 	fn default() -> Self {
-		Self { seed: DEFAULT_DOWNSAMPLE_SEED, point_count: 60_000, input_stride_secs: 1, bucket_resolution: Resolution::Minutes, aggregations: Aggregation::ALL.to_vec() }
+		Self { parallel_chunks: 1, seed: DEFAULT_DOWNSAMPLE_SEED, point_count: 60_000, input_stride_secs: 1, bucket_resolution: Resolution::Minutes, aggregations: Aggregation::ALL.to_vec() }
 	}
 }
 
@@ -78,6 +82,12 @@ pub struct DownsampleProfile {
 	pub bucket_resolution: Resolution,
 	/// Reductions computed per bucket.
 	pub aggregations: Vec<Aggregation>,
+	/// Reduce the input in this many parallel chunks via `dsp_reduce::reduce_partial` +
+	/// `PartialReduction::merge`, instead of one serial `reduce` pass. `0` or `1` keeps
+	/// the serial path. The merged result is *exactly* the serial one (dsp-reduce proves
+	/// this by test), so this knob measures the cost/benefit of distributing a reduction —
+	/// the shape a cross-segment downsample would take — not a different answer.
+	pub parallel_chunks: usize,
 }
 
 impl DownsampleProfile {
@@ -90,8 +100,8 @@ impl DownsampleProfile {
 	/// Build a downsample profile from an explicit [`DownsampleParams`] knob set.
 	#[must_use]
 	pub fn new(name: impl Into<String>, params: DownsampleParams) -> Self {
-		let DownsampleParams { seed, point_count, input_stride_secs, bucket_resolution, aggregations } = params;
-		Self { name: name.into(), seed, point_count: point_count.max(2), input_stride_secs: input_stride_secs.max(1), bucket_resolution, aggregations }
+		let DownsampleParams { seed, point_count, input_stride_secs, bucket_resolution, aggregations, parallel_chunks } = params;
+		Self { parallel_chunks, name: name.into(), seed, point_count: point_count.max(2), input_stride_secs: input_stride_secs.max(1), bucket_resolution, aggregations }
 	}
 
 	/// The fixed epoch anchor (2020-01-01T00:00:00Z).
@@ -125,6 +135,33 @@ fn span_ns(since: Instant) -> u64 {
 	since.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
+/// Reduce `points` under the profile: one serial [`reduce`] pass, or — when
+/// `parallel_chunks > 1` — a chunked parallel reduction that maps each chunk to a
+/// [`PartialReduction`] and merges them.
+///
+/// Both produce identical buckets; the parallel path exists to measure whether
+/// distributing a reduction actually pays, since that is the shape a cross-segment
+/// downsample (one partial per segment) would take.
+///
+/// # Errors
+///
+/// Propagates any [`dsp_reduce::ReduceError`] from the reduction or the merge.
+fn reduce_points(points: &[Point], profile: &DownsampleProfile) -> Result<Vec<Bucket>, dsp_reduce::ReduceError> {
+	if profile.parallel_chunks <= 1 {
+		return reduce(points, profile.bucket_resolution, None, None, &profile.aggregations);
+	}
+	let chunk = points.len().div_ceil(profile.parallel_chunks).max(1);
+	let partials: Vec<PartialReduction> = points.par_chunks(chunk).map(|c| reduce_partial(c, profile.bucket_resolution, None, None, &profile.aggregations)).collect::<Result<_, _>>()?;
+	let mut merged: Option<PartialReduction> = None;
+	for p in partials {
+		match merged.as_mut() {
+			Some(m) => m.merge(p)?,
+			None => merged = Some(p),
+		}
+	}
+	merged.map_or_else(|| Ok(Vec::new()), |m| m.finish(profile.bucket_resolution, &profile.aggregations))
+}
+
 /// Run a downsample profile for `reps` timed repetitions and return a
 /// fully-populated [`BenchResult`] (workload `downsample`).
 ///
@@ -151,7 +188,7 @@ pub fn run_downsample(profile: &DownsampleProfile, reps: usize) -> anyhow::Resul
 	let mut last_buckets: Vec<Bucket> = Vec::new();
 	for _ in 0..reps {
 		let t0 = Instant::now();
-		let buckets = reduce(&points, profile.bucket_resolution, None, None, &profile.aggregations).map_err(|e| anyhow::anyhow!("downsample reduction failed: {e}"))?;
+		let buckets = reduce_points(&points, profile).map_err(|e| anyhow::anyhow!("downsample reduction failed: {e}"))?;
 		samples_ns.push(span_ns(t0));
 		last_buckets = buckets;
 	}
@@ -188,6 +225,22 @@ pub fn run_downsample(profile: &DownsampleProfile, reps: usize) -> anyhow::Resul
 
 #[cfg(test)]
 mod tests {
+	/// The parallel path must be a pure performance knob: identical buckets, whatever the
+	/// chunk count. If this ever fails, `--ds-parallel` is measuring a different answer.
+	#[test]
+	fn parallel_chunked_reduction_equals_the_serial_one() {
+		use super::{DownsampleParams, DownsampleProfile, reduce_points};
+		let base = DownsampleParams { point_count: 5_000, aggregations: vec![super::Aggregation::Min, super::Aggregation::Max, super::Aggregation::Avg, super::Aggregation::Sum, super::Aggregation::First, super::Aggregation::Last, super::Aggregation::P99, super::Aggregation::Twa, super::Aggregation::SketchP99], ..DownsampleParams::default() };
+		let serial_profile = DownsampleProfile::new("serial", base.clone());
+		let points = serial_profile.generate();
+		let serial = reduce_points(&points, &serial_profile).expect("serial reduces");
+		assert!(!serial.is_empty(), "the fixture must produce buckets");
+		for chunks in [2_usize, 3, 8, 64] {
+			let p = DownsampleProfile::new("parallel", DownsampleParams { parallel_chunks: chunks, ..base.clone() });
+			assert_eq!(reduce_points(&points, &p).expect("parallel reduces"), serial, "chunks={chunks}: the merged reduction must equal the serial one");
+		}
+	}
+
 	use super::*;
 
 	fn small() -> DownsampleProfile {

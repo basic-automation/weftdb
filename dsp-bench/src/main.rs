@@ -176,7 +176,7 @@ fn run_compression_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 /// is that the reduction is total (the bucket counts sum to the input size).
 fn run_downsample_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 	let profile_name = cli.name.clone().unwrap_or_else(|| "downsample".to_string());
-	let params = DownsampleParams { seed: cli.seed, point_count: cli.ds_points, input_stride_secs: cli.ds_stride, bucket_resolution: cli.ds_bucket, aggregations: cli.ds_aggs.clone() };
+	let params = DownsampleParams { seed: cli.seed, point_count: cli.ds_points, input_stride_secs: cli.ds_stride, bucket_resolution: cli.ds_bucket, aggregations: cli.ds_aggs.clone(), parallel_chunks: cli.ds_parallel };
 	let profile = DownsampleProfile::new(profile_name, params);
 	let result = run_downsample(&profile, cli.reps).map_err(|e| anyhow::anyhow!("downsample benchmark run failed: {e}"))?;
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
@@ -306,6 +306,8 @@ struct Cli {
 	ds_bucket: Resolution,
 	/// Downsample mode: the reductions computed per bucket.
 	ds_aggs: Vec<Aggregation>,
+	/// Reduce in this many parallel chunks (partial reductions merged); 1 = serial.
+	ds_parallel: usize,
 	/// Storage-workload knob (point-lookup / range-fetch): jittered (irregular)
 	/// timestamps instead of a constant-stride regular corpus.
 	irregular: bool,
@@ -420,6 +422,7 @@ impl Cli {
 		let (mut comp_rows, mut comp_shape) = (comp_defaults.point_count, comp_defaults.value_shape);
 		let (mut ds_points, mut ds_stride, mut ds_bucket) = (ds_defaults.point_count, ds_defaults.input_stride_secs, ds_defaults.bucket_resolution);
 		let mut ds_aggs = ds_defaults.aggregations;
+		let mut ds_parallel = ds_defaults.parallel_chunks.max(1);
 		let mut irregular = false;
 		let (mut pl_rows, mut pl_queries, mut pl_absent, mut pl_mode, mut pl_rows_per_page) = (pl_defaults.point_count, pl_defaults.query_count, pl_defaults.absent_fraction, pl_defaults.mode, pl_defaults.rows_per_page);
 		let (mut rf_rows, mut rf_window, mut rf_windows, mut rf_rows_per_page) = (rf_defaults.point_count, rf_defaults.window_rows, rf_defaults.window_count, rf_defaults.rows_per_page);
@@ -470,6 +473,7 @@ impl Cli {
 				"--ds-stride" => ds_stride = parse_stride_secs(&take_value(&key)?)?,
 				"--ds-bucket" => ds_bucket = parse_resolution(&take_value(&key)?)?,
 				"--ds-aggs" => ds_aggs = parse_aggregations(&take_value(&key)?)?,
+				"--ds-parallel" => ds_parallel = take_value(&key)?.parse::<usize>().map_err(|_| "--ds-parallel must be a positive integer".to_string())?.max(1),
 				"--irregular" | "--pl-irregular" | "--rf-irregular" => irregular = true,
 				"--pl-rows" => pl_rows = parse_points_count(&take_value(&key)?)?,
 				"--pl-queries" => pl_queries = parse_query_count(&take_value(&key)?)?,
@@ -509,7 +513,7 @@ impl Cli {
 		let mode = select_workload_mode(&[(synthetic, InputMode::Synthetic), (point_lookup, InputMode::PointLookup), (range_fetch, InputMode::RangeFetch), (compression, InputMode::Compression), (downsample, InputMode::Downsample)])?;
 		validate_mode(mode, input.as_ref(), field.as_deref(), compare)?;
 
-		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, ds_points, ds_stride, ds_bucket, ds_aggs, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare, html })))
+		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare, html })))
 	}
 }
 
@@ -804,6 +808,8 @@ COMPRESSION OPTIONS (with --compression):
 
 DOWNSAMPLE OPTIONS (with --downsample):
         --ds-points <N>      Input sample count (>=2)              [default: 60000]
+        --ds-parallel <N>    Reduce in N parallel chunks (partials merged);
+                             the merged result is identical to serial [default: 1]
         --ds-stride <N>      Seconds between input samples (>=1)        [default: 1]
         --ds-bucket <R>      Bucket resolution: s|m|h|d|w|mo|y     [default: minutes]
         --ds-aggs <LIST>     Reductions, comma-separated: min,max,avg,sum,first,
