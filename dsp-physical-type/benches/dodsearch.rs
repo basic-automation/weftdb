@@ -159,5 +159,42 @@ fn bench_paged_frame(c: &mut Criterion) {
 	group.finish();
 }
 
-criterion_group!(benches, bench, bench_frame, bench_paged_frame);
+/// **Size cost of the codec override, across corpus shapes** — not a latency benchmark,
+/// a measurement the owner-gated default-adoption decision needs.
+///
+/// A checkpointed frame forces the inner dod stream to `TS_CODEC_BLOCKED` (the only
+/// range-decodable codec) instead of `best_encoding_name`'s pick. Where the best codec is
+/// something else — Gorilla on scattered jitter, RLE on long constant runs, varint on a
+/// regular column — that override costs bytes *beyond* the checkpoint index itself. The
+/// frame-level `+0.41%` figure is the two costs combined on one corpus; this separates
+/// them per shape, so the trade can be judged on the shapes a deployment actually holds.
+fn report_codec_override_cost(_c: &mut Criterion) {
+	// (name, timestamps) — the shapes DSP's timestamp columns actually take.
+	let mut regular_jitter = 1_000_000_i64;
+	let shapes: Vec<(&str, Vec<i64>)> = vec![
+		("regular (constant stride)", (0..10_000).map(|i| 1_000_000 + i * 1_000).collect()),
+		("irregular (bounded jitter)", corpus(10_000)),
+		(
+			"scattered single jitter",
+			(0..10_000_i64)
+				.map(|i| {
+					regular_jitter += 1_000 + if i % 16 == 0 { 500 } else { 0 };
+					regular_jitter
+				})
+				.collect(),
+		),
+		("long constant runs (RLE regime)", (0..10_000_i64).map(|i| 1_000_000 + (i / 100) * 5_000).collect()),
+	];
+	println!("\n--- checkpointed-frame codec override: forced BLOCKED vs the best codec ---");
+	for (name, values) in shapes {
+		let col = encode_delta_of_delta(&values, TimeUnit::Millis);
+		let best = col.best_estimated_bytes();
+		let blocked = col.blocked_estimated_bytes();
+		let pct = (blocked as f64 - best as f64) / best as f64 * 100.0;
+		println!("{name:32} best={:<8} ({:<24}) blocked={:<8} override {pct:+7.2}%", best, col.best_encoding_name(), blocked);
+	}
+	println!("--- (the checkpoint index itself is extra, ~rows/stride entries) ---\n");
+}
+
+criterion_group!(benches, bench, bench_frame, bench_paged_frame, report_codec_override_cost);
 criterion_main!(benches);
