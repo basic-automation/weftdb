@@ -15,10 +15,13 @@
 //! The corpus is a sorted *irregular* column (a monotone series with varying gaps) —
 //! the shape the closed form cannot serve and the one this index exists for.
 
-use std::hint::black_box;
+use std::{hint::black_box, str::FromStr};
 
+use bigdecimal::BigDecimal;
 use criterion::{criterion_group, criterion_main, Criterion};
-use dsp_physical_type::timestamp::{decode_delta_of_delta, encode_delta_of_delta, DeltaOfDeltaColumn, TimeUnit};
+use dsp_physical_type::{
+	dspseg::{read_segment_point, write_segment, write_segment_checkpointed}, timestamp::{decode_delta_of_delta, encode_delta_of_delta, DeltaOfDeltaColumn, TimeUnit}, Segment
+};
 
 /// A deterministic sorted-irregular epoch column: a base stride of ~1000 ms perturbed by
 /// a reproducible jitter, accumulated so the column is strictly increasing. No RNG dep —
@@ -82,5 +85,43 @@ fn bench(c: &mut Criterion) {
 	group.finish();
 }
 
-criterion_group!(benches, bench);
+/// The end-to-end claim: a real `.dspseg` point read on an irregular sorted frame, plain
+/// vs checkpointed. This is what a caller actually pays — frame parse, value-block skip,
+/// timestamp resolution, value unpack — not just the search step above.
+fn bench_frame(c: &mut Criterion) {
+	const N: usize = 100_000;
+	let ts = corpus(N);
+	let vs: Vec<BigDecimal> = (0..N).map(|i| BigDecimal::from_str(&format!("{}.25", 1_000 + i % 500)).expect("valid")).collect();
+	let seg = Segment::build(&ts, &vs, TimeUnit::Millis, &BigDecimal::from(0)).expect("builds");
+	assert!(seg.stats.time_sorted && seg.timestamps.arithmetic_stride().is_none(), "fixture must be sorted and irregular");
+
+	let plain = write_segment(&seg);
+	let probes: Vec<i64> = (0..64).map(|k| ts[k * (N / 64)]).collect();
+
+	let mut group = c.benchmark_group("dspseg_point_read_irregular_100k");
+	group.bench_function("plain_frame", |b| {
+		b.iter(|| {
+			for &t in &probes {
+				black_box(read_segment_point(black_box(&plain), black_box(t)).expect("reads"));
+			}
+		});
+	});
+	for stride in [64_usize, 256, 1024] {
+		let frame = write_segment_checkpointed(&seg, stride);
+		// Report the storage cost of the index alongside the speed — the trade-off is the
+		// whole reason default adoption is owner-gated.
+		let overhead = (frame.len() as f64 - plain.len() as f64) / plain.len() as f64 * 100.0;
+		println!("checkpointed stride={stride}: {} B vs plain {} B ({overhead:+.2}% frame bytes)", frame.len(), plain.len());
+		group.bench_function(format!("checkpointed_frame_stride_{stride}"), |b| {
+			b.iter(|| {
+				for &t in &probes {
+					black_box(read_segment_point(black_box(&frame), black_box(t)).expect("reads"));
+				}
+			});
+		});
+	}
+	group.finish();
+}
+
+criterion_group!(benches, bench, bench_frame);
 criterion_main!(benches);

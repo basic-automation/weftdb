@@ -456,7 +456,7 @@ use std::str::FromStr;
 use bigdecimal::BigDecimal;
 
 use crate::{
-	timestamp::{DeltaOfDeltaColumn, TimeUnit}, CascadeInner, ColumnEncoding, PhysicalType, PhysicalValue
+	timestamp::{DeltaOfDeltaColumn, DodCheckpoint, DodCheckpoints, TimeUnit}, CascadeInner, ColumnEncoding, PhysicalType, PhysicalValue
 };
 
 const TAG_F64: u8 = 0;
@@ -996,7 +996,7 @@ fn read_points_from_section(section: &[u8], stats: &SegmentStats, ts: &[i64]) ->
 	} else {
 		Some(read_value_column(&mut r)?.values)
 	};
-	let ts_col = read_timestamp_column(&mut r)?;
+	let (ts_col, checkpoints) = read_timestamp_column_with_checkpoints(&mut r)?;
 	let nulls = read_null_column(&mut r, stats.row_count, stats.null_count)?;
 	// **Regular-column fast path:** a time-sorted constant-stride column resolves each instant's
 	// row in closed form (`(t - first) / step`), skipping the whole delta-of-delta reconstruction +
@@ -1004,7 +1004,14 @@ fn read_points_from_section(section: &[u8], stats: &SegmentStats, ts: &[i64]) ->
 	// and exact. An irregular (or out-of-order) column decodes the timestamps and binary/linear
 	// searches as before.
 	let stride = if stats.time_sorted { ts_col.arithmetic_stride().filter(|&(_, step)| step > 0) } else { None };
-	let timestamps = if stride.is_none() { Some(crate::timestamp::decode_delta_of_delta(&ts_col)) } else { None };
+	// **Irregular-column checkpoint path:** when the frame carries a persisted sparse index
+	// and the column is sorted but has no closed form, each instant resumes the
+	// reconstruction from the nearest checkpoint (`O(log(n/stride) + stride)`) instead of
+	// materializing the whole timestamp column. Absent an index (the default writer), or on
+	// an out-of-order column (where a binary search is meaningless), fall back to the full
+	// decode exactly as before.
+	let checkpointed = checkpoints.filter(|_| stride.is_none() && stats.time_sorted);
+	let timestamps = if stride.is_none() && checkpointed.is_none() { Some(crate::timestamp::decode_delta_of_delta(&ts_col)) } else { None };
 	for (slot, &t) in out.iter_mut().zip(ts) {
 		if t < min_ts || t > max_ts {
 			continue;
@@ -1022,6 +1029,13 @@ fn read_points_from_section(section: &[u8], stats: &SegmentStats, ts: &[i64]) ->
 			if row >= stats.row_count || first.wrapping_add(quotient.wrapping_mul(step)) != t || !nulls.is_present(row) {
 				continue;
 			}
+			dense_rank(&nulls, row)
+		} else if let Some(cps) = checkpointed.as_ref() {
+			// Resume from the nearest checkpoint, skipping null rows across a run of
+			// duplicate timestamps exactly as `locate_present_dense_index` does.
+			let Some(row) = cps.search_sorted_with(&ts_col, t, |row| row < stats.row_count && nulls.is_present(row)) else {
+				continue;
+			};
 			dense_rank(&nulls, row)
 		} else {
 			let Some(idx) = locate_present_dense_index(timestamps.as_ref().expect("decoded when irregular"), &nulls, stats.time_sorted, t) else {
@@ -1463,6 +1477,15 @@ const TS_CODEC_RLE: u8 = 3;
 /// for a mixed-magnitude stream — a contiguous wide region among narrow runs — where a
 /// single global width overpays and RLE/Gorilla do not fit.
 const TS_CODEC_BLOCKED: u8 = 4;
+/// **Not a codec — a wrapper** (roadmap Phase 4/6): a persisted sparse
+/// [`DodCheckpoints`] index (stride, entry count, then delta-encoded
+/// `(row, timestamp, delta)` entries) followed by the *inner* codec-tagged stream that
+/// actually holds the dods. It lets a point lookup on an irregular sorted column resume
+/// the reconstruction mid-stream instead of replaying it from the anchor.
+///
+/// Written only by the opt-in [`write_timestamp_column_checkpointed`]; **additive**, so
+/// every frame written before it still reads unchanged (no format-version bump).
+const TS_CODEC_CHECKPOINTED: u8 = 5;
 
 /// The stable one-byte on-disk tag for a [`TimeUnit`].
 const fn time_unit_tag(unit: TimeUnit) -> u8 {
@@ -1507,6 +1530,62 @@ pub fn write_timestamp_column(w: &mut ByteWriter, col: &DeltaOfDeltaColumn) {
 		None => w.put_u8(0),
 	}
 	w.put_uvarint(col.dods.len() as u64);
+	write_dod_codec(w, col);
+}
+
+/// Write a `.dspseg` timestamp-column block **with a persisted sparse checkpoint index**.
+///
+/// Uses [`TS_CODEC_CHECKPOINTED`], so a point lookup on an irregular sorted column can
+/// skip the whole timestamp reconstruction (see [`DodCheckpoints`]).
+///
+/// **Opt-in**, and deliberately so: the index costs bytes the default writer does not
+/// spend, so adopting it by default is a bytes/point (headline) change and is owner-gated
+/// — exactly as the delta-cascade value codec is. Frames written by
+/// [`write_timestamp_column`] are byte-for-byte unchanged, and this codec tag is
+/// **additive**: every previously written frame still reads, so no format-version bump is
+/// needed.
+///
+/// The index is only worth writing for a *sorted, irregular* column of a useful size; a
+/// regular column already resolves in `O(1)` closed form and a tiny column decodes
+/// trivially. When the index would be empty (fewer than two rows), this degrades to the
+/// plain block.
+pub fn write_timestamp_column_checkpointed(w: &mut ByteWriter, col: &DeltaOfDeltaColumn, stride: usize) {
+	let checkpoints = col.checkpoints(stride);
+	if checkpoints.points.is_empty() {
+		write_timestamp_column(w, col);
+		return;
+	}
+	w.put_u8(time_unit_tag(col.unit));
+	w.put_i64_le(col.first);
+	match col.first_delta {
+		Some(delta) => {
+			w.put_u8(1);
+			w.put_svarint(delta);
+		}
+		None => w.put_u8(0),
+	}
+	w.put_uvarint(col.dods.len() as u64);
+	w.put_u8(TS_CODEC_CHECKPOINTED);
+	w.put_uvarint(checkpoints.stride as u64);
+	w.put_uvarint(checkpoints.points.len() as u64);
+	// Delta-encode the index against the previous entry: rows ascend and a checkpointed
+	// column is sorted, so both stay small varints instead of full-width values.
+	let (mut prev_row, mut prev_ts) = (0_usize, 0_i64);
+	for cp in &checkpoints.points {
+		w.put_uvarint((cp.row - prev_row) as u64);
+		w.put_svarint(cp.timestamp.wrapping_sub(prev_ts));
+		w.put_svarint(cp.delta);
+		prev_row = cp.row;
+		prev_ts = cp.timestamp;
+	}
+	// The inner codec-tagged stream — the same selector the plain block uses, so the
+	// dods themselves are encoded identically either way.
+	write_dod_codec(w, col);
+}
+
+/// Write the `[codec tag][stream]` body of a second-difference column, choosing the
+/// codec via [`DeltaOfDeltaColumn::best_encoding_name`].
+fn write_dod_codec(w: &mut ByteWriter, col: &DeltaOfDeltaColumn) {
 	match col.best_encoding_name() {
 		"delta_of_delta_gorilla" => {
 			w.put_u8(TS_CODEC_GORILLA);
@@ -1566,7 +1645,61 @@ pub fn read_timestamp_column(r: &mut ByteReader) -> Result<DeltaOfDeltaColumn, D
 		_ => Some(r.read_svarint()?),
 	};
 	let count = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+	let (dods, _) = read_dod_codec(r, count)?;
+	Ok(DeltaOfDeltaColumn { first, first_delta, dods, unit })
+}
+
+/// Read a [`DeltaOfDeltaColumn`] together with its persisted [`DodCheckpoints`], if the
+/// block carries them (i.e. it was written by [`write_timestamp_column_checkpointed`]).
+///
+/// The exact same bytes [`read_timestamp_column`] accepts — that one simply discards the
+/// index. This is the read the streaming point path uses to skip the timestamp
+/// reconstruction on an irregular sorted column.
+///
+/// # Errors
+///
+/// As [`read_timestamp_column`].
+pub fn read_timestamp_column_with_checkpoints(r: &mut ByteReader) -> Result<(DeltaOfDeltaColumn, Option<DodCheckpoints>), DspSegError> {
+	let unit = time_unit_from_tag(r.read_u8()?)?;
+	let first = r.read_i64_le()?;
+	let first_delta = match r.read_u8()? {
+		0 => None,
+		_ => Some(r.read_svarint()?),
+	};
+	let count = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+	let (dods, checkpoints) = read_dod_codec(r, count)?;
+	Ok((DeltaOfDeltaColumn { first, first_delta, dods, unit }, checkpoints))
+}
+
+/// Read a codec-tagged second-difference stream: the `[codec tag][stream]` body shared
+/// by [`read_timestamp_column`] and the [`TS_CODEC_CHECKPOINTED`] wrapper.
+///
+/// Returns the dods and, for a checkpointed block, the persisted index.
+fn read_dod_codec(r: &mut ByteReader, count: usize) -> Result<(Vec<i64>, Option<DodCheckpoints>), DspSegError> {
 	let dods = match r.read_u8()? {
+		TS_CODEC_CHECKPOINTED => {
+			// A wrapper, not a codec: the sparse index, then the inner codec-tagged stream
+			// that actually holds the dods. One level only — the inner read rejects a
+			// nested wrapper, so a malformed frame cannot recurse.
+			let stride = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+			let entries = usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+			let mut points = Vec::with_capacity(entries);
+			let (mut row, mut timestamp) = (0_usize, 0_i64);
+			for _ in 0..entries {
+				// Rows ascend and timestamps are non-decreasing (a checkpointed column is
+				// sorted), so both delta-encode against the previous entry.
+				row += usize::try_from(r.read_uvarint()?).map_err(|_| DspSegError::VarintTooLong)?;
+				timestamp = timestamp.wrapping_add(r.read_svarint()?);
+				let delta = r.read_svarint()?;
+				points.push(DodCheckpoint { row, timestamp, delta });
+			}
+			let (dods, nested) = read_dod_codec(r, count)?;
+			if nested.is_some() {
+				return Err(DspSegError::InvalidTag { kind: "timestamp_codec", value: TS_CODEC_CHECKPOINTED });
+			}
+			let rows = if count == 0 { usize::from(true) } else { count + 2 };
+			return Ok((dods, Some(DodCheckpoints { stride: stride.max(1), points, rows })));
+		}
 		TS_CODEC_VARINT => {
 			let mut dods = Vec::with_capacity(count);
 			for _ in 0..count {
@@ -1601,7 +1734,7 @@ pub fn read_timestamp_column(r: &mut ByteReader) -> Result<DeltaOfDeltaColumn, D
 		}
 		other => return Err(DspSegError::InvalidTag { kind: "timestamp_codec", value: other }),
 	};
-	Ok(DeltaOfDeltaColumn { first, first_delta, dods, unit })
+	Ok((dods, None))
 }
 
 // ---------------------------------------------------------------------------
@@ -1731,6 +1864,34 @@ pub fn write_segment(seg: &Segment) -> Vec<u8> {
 	write_timestamp_column(&mut w, &seg.timestamps);
 	write_null_column(&mut w, &seg.nulls);
 	// Trailing CRC-32 over the whole body so far.
+	let checksum = crc32(w.as_slice());
+	w.put_u32_le(checksum);
+	w.into_vec()
+}
+
+/// Encode a [`Segment`] into a `.dspseg` frame carrying a **persisted sparse checkpoint
+/// index** over its timestamp column ([`write_timestamp_column_checkpointed`]).
+///
+/// Byte-identical to [`write_segment`] except for the timestamp block, and read by the
+/// ordinary [`read_segment`] — the checkpoint tag is additive, so a frame written either
+/// way reads with no version bump and `read_segment(write_segment_checkpointed(s)) == s`.
+/// What it buys: [`read_segment_point`] resolves an instant on an **irregular sorted**
+/// column by resuming from the nearest checkpoint rather than reconstructing the whole
+/// timestamp column.
+///
+/// **Opt-in.** The index costs bytes, so making it the default is a bytes/point
+/// (headline) change and is owner-gated — see ROADMAP.md. It pays only for a sorted,
+/// irregular column large enough that the lookup dominates: a regular column already has
+/// the `O(1)` closed form, and a small column decodes trivially.
+#[must_use]
+pub fn write_segment_checkpointed(seg: &Segment, stride: usize) -> Vec<u8> {
+	let mut w = ByteWriter::with_capacity(64 + seg.total_bytes());
+	w.put_raw(MAGIC);
+	w.put_u16_le(seg.version);
+	write_segment_stats(&mut w, &seg.stats);
+	write_value_column(&mut w, &seg.values);
+	write_timestamp_column_checkpointed(&mut w, &seg.timestamps, stride);
+	write_null_column(&mut w, &seg.nulls);
 	let checksum = crc32(w.as_slice());
 	w.put_u32_le(checksum);
 	w.into_vec()
@@ -3024,6 +3185,71 @@ mod tests {
 		// The per-page index survives the round trip, so pruning works on the reread.
 		assert_eq!(back.prune_pages_by_time(45, 65), vec![1]);
 		assert_eq!(back.read_time_range(35, 75).0, vec![40, 50, 60, 70]);
+	}
+
+	/// The checkpointed frame must be *indistinguishable* from the plain one on every read
+	/// path — the whole safety claim of an additive codec tag.
+	#[test]
+	fn checkpointed_frame_reads_identically_to_the_plain_frame() {
+		// A sorted IRREGULAR column (varying gaps) — the shape with no closed form, which
+		// is what the checkpoint index exists for.
+		let mut t = 1_000_i64;
+		let ts: Vec<i64> = (0..600)
+			.map(|i: i64| {
+				t += 1 + (i * 7) % 23;
+				t
+			})
+			.collect();
+		let vs: Vec<BigDecimal> = (0..600).map(|i| BigDecimal::from_str(&format!("{}.5", 100 + i % 50)).unwrap()).collect();
+		let seg = Segment::build(&ts, &vs, TimeUnit::Millis, &BigDecimal::from(0)).expect("builds");
+		assert!(seg.stats.time_sorted, "fixture must be sorted");
+		assert!(seg.timestamps.arithmetic_stride().is_none(), "fixture must be irregular (no closed form)");
+
+		for stride in [1_usize, 8, 64, 1024] {
+			let plain = write_segment(&seg);
+			let checkpointed = write_segment_checkpointed(&seg, stride);
+			// 1. The frame round-trips through the ordinary reader (additive tag).
+			assert_eq!(read_segment(&checkpointed).expect("reads"), seg, "stride={stride}: checkpointed frame must round-trip");
+			// 2. Every point lookup agrees with the plain frame — present and absent.
+			for &probe in &ts {
+				assert_eq!(read_segment_point(&checkpointed, probe).expect("reads"), read_segment_point(&plain, probe).expect("reads"), "stride={stride}: point read at {probe} must match the plain frame");
+			}
+			for probe in [i64::MIN, 0, 999, ts[0] - 1, ts[5] + 1, *ts.last().unwrap() + 1, i64::MAX] {
+				assert_eq!(read_segment_point(&checkpointed, probe).expect("reads"), read_segment_point(&plain, probe).expect("reads"), "stride={stride}: absent probe {probe} must match");
+			}
+			// 3. A batch read agrees too.
+			let batch: Vec<i64> = vec![ts[0], ts[299], 12_345_678, ts[599], ts[42]];
+			assert_eq!(read_segment_points(&checkpointed, &batch).expect("reads"), read_segment_points(&plain, &batch).expect("reads"), "stride={stride}: batch read must match");
+		}
+	}
+
+	/// Null rows across duplicate timestamps are the subtle case: the read must skip to the
+	/// first *present* row of the run, exactly as the full-decode path does.
+	#[test]
+	fn checkpointed_frame_skips_nulls_across_duplicate_timestamps() {
+		// Duplicated, irregular timestamps with nulls sprinkled onto the leading rows of
+		// each duplicate run.
+		let ts: Vec<i64> = vec![10, 10, 10, 25, 25, 40, 61, 61, 90];
+		let vs: Vec<Option<BigDecimal>> = vec![None, None, Some(BigDecimal::from(3)), None, Some(BigDecimal::from(5)), Some(BigDecimal::from(6)), None, None, Some(BigDecimal::from(9))];
+		let seg = Segment::build_nullable(&ts, &vs, TimeUnit::Millis, &BigDecimal::from(0)).expect("builds");
+		for stride in [1_usize, 2, 4, 64] {
+			let plain = write_segment(&seg);
+			let checkpointed = write_segment_checkpointed(&seg, stride);
+			for probe in [10_i64, 25, 40, 61, 90, 11, 100] {
+				assert_eq!(read_segment_point(&checkpointed, probe).expect("reads"), read_segment_point(&plain, probe).expect("reads"), "stride={stride}: probe {probe} must resolve to the first present row of its run");
+			}
+			// An all-null run must report absent, not the next run's value.
+			assert_eq!(read_segment_point(&checkpointed, 61).expect("reads"), None, "an all-null duplicate run is absent");
+		}
+	}
+
+	#[test]
+	fn checkpointed_frame_falls_back_for_a_degenerate_column() {
+		// Fewer than two rows: no index is possible, so the writer degrades to the plain
+		// block and the frame is byte-identical.
+		let seg = Segment::build(&[42], &col(&["7"]), TimeUnit::Millis, &BigDecimal::from(0)).expect("builds");
+		assert_eq!(write_segment_checkpointed(&seg, 64), write_segment(&seg), "a single-row column has no index to write");
+		assert_eq!(read_segment_point(&write_segment_checkpointed(&seg, 64), 42).expect("reads"), Some(BigDecimal::from(7)));
 	}
 
 	#[test]
