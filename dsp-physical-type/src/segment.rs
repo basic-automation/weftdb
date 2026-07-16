@@ -527,6 +527,30 @@ impl Segment {
 		crate::dspseg::write_segment(self)
 	}
 
+	/// Seal to a `.dspseg` frame carrying a **persisted checkpoint index** over the
+	/// timestamp column, so a point lookup resumes from the nearest checkpoint instead of
+	/// decoding the whole column. See [`crate::dspseg::write_segment_checkpointed`].
+	///
+	/// Read by the ordinary [`read_from`](Self::read_from) — the codec tag is additive.
+	/// Costs a little size for a large lookup win on the shape
+	/// [`benefits_from_checkpoints`](Self::benefits_from_checkpoints) identifies.
+	#[must_use]
+	pub fn write_to_checkpointed(&self, stride: usize) -> Vec<u8> {
+		crate::dspseg::write_segment_checkpointed(self, stride)
+	}
+
+	/// Whether a checkpoint index would actually help this segment's point lookups.
+	///
+	/// True only for a **sorted, irregular** timestamp column: an out-of-order column
+	/// cannot be binary-searched (the read linear-scans), and a *regular* one already
+	/// resolves in `O(1)` closed form — faster than any index — so checkpointing either
+	/// would only add bytes. A factual predicate about the shape, not a policy: how many
+	/// rows are worth the trade is the caller's call.
+	#[must_use]
+	pub fn benefits_from_checkpoints(&self) -> bool {
+		self.stats.time_sorted && self.timestamps.arithmetic_stride().is_none()
+	}
+
 	/// Read a segment back from a `.dspseg` byte frame, verifying its checksum.
 	///
 	/// Exact inverse of [`Segment::write_to`]. See [`crate::dspseg::read_segment`].

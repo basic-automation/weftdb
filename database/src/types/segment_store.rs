@@ -48,6 +48,55 @@ const DEFAULT_SUBJECT: &str = "default";
 /// `segment_index.db` under the given root); seal batches with
 /// [`seal`](SegmentStore::seal); read a time range with
 /// [`read_time_range`](SegmentStore::read_time_range).
+/// When a freshly sealed segment should carry a **persisted timestamp checkpoint index**.
+///
+/// The index makes a point lookup on a *sorted, irregular* column resume from the nearest
+/// checkpoint instead of decoding the whole timestamp column — measured **~3.45× faster**
+/// on a 100k-row single-block frame for **+0.41% bytes** (`dsp-physical-type`'s
+/// `benches/dodsearch.rs`). It is a **storage-for-latency trade**, so it is **off by
+/// default**: `DISABLED` writes byte-for-byte the frames DSP has always written.
+///
+/// Enable per-deployment with `DSP_SEGMENT_CHECKPOINT_STRIDE` (rows between checkpoints;
+/// ~1024 is the sweet spot — stride barely moves the speed but does move the size) and
+/// optionally `DSP_SEGMENT_CHECKPOINT_MIN_ROWS` (default [`DEFAULT_CHECKPOINT_MIN_ROWS`];
+/// a small segment decodes trivially, so indexing it is pure cost).
+///
+/// Whether making this the *default* is owner-gated — it changes the headline bytes/point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointPolicy {
+	/// Rows between checkpoints; `None` disables the index entirely.
+	pub stride: Option<usize>,
+	/// Segments with fewer rows than this are never checkpointed.
+	pub min_rows: usize,
+}
+
+/// Row floor below which a checkpoint index is not worth its bytes.
+pub const DEFAULT_CHECKPOINT_MIN_ROWS: usize = 8_192;
+
+impl CheckpointPolicy {
+	/// Never write a checkpoint index — the default, and byte-for-byte the historical
+	/// frame layout.
+	pub const DISABLED: Self = Self { stride: None, min_rows: DEFAULT_CHECKPOINT_MIN_ROWS };
+
+	/// Read the policy from the environment: `DSP_SEGMENT_CHECKPOINT_STRIDE` (absent, zero
+	/// or unparseable → [`DISABLED`](Self::DISABLED)) and `DSP_SEGMENT_CHECKPOINT_MIN_ROWS`
+	/// (absent or unparseable → [`DEFAULT_CHECKPOINT_MIN_ROWS`]).
+	#[must_use]
+	pub fn from_env() -> Self {
+		let stride = std::env::var("DSP_SEGMENT_CHECKPOINT_STRIDE").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&s| s > 0);
+		let min_rows = std::env::var("DSP_SEGMENT_CHECKPOINT_MIN_ROWS").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(DEFAULT_CHECKPOINT_MIN_ROWS);
+		Self { stride, min_rows }
+	}
+
+	/// The stride to seal `row_count` rows with, given whether the segment's shape
+	/// actually benefits (see `Segment::benefits_from_checkpoints`), or `None` to write
+	/// the ordinary frame.
+	#[must_use]
+	pub fn stride_for(self, row_count: usize, benefits: bool) -> Option<usize> {
+		self.stride.filter(|_| benefits && row_count >= self.min_rows)
+	}
+}
+
 pub struct SegmentStore {
 	/// The store root; sealed frames live in `root/segments/`.
 	root: PathBuf,
@@ -60,6 +109,8 @@ pub struct SegmentStore {
 	/// The libSQL aspect-schema catalog (`root/aspect_catalog.db`) — the declared
 	/// [`AspectSchema`] for each aspect, so a seal need not be handed the schema.
 	catalog: AspectCatalog,
+	/// Whether new seals carry a timestamp checkpoint index (off unless configured).
+	checkpoints: CheckpointPolicy,
 	/// The libSQL DB/subject registry (`root/catalog.db`) — the hierarchy above the
 	/// aspect schemas. The store registers its own `(database, subject)` here on open,
 	/// so the control plane can enumerate what a root holds.
@@ -116,7 +167,23 @@ impl SegmentStore {
 		// the databases/subjects a root holds (idempotent).
 		registry.register_database(database).await?;
 		registry.register_subject(database, subject).await?;
-		Ok(Self { root, index, metadata, catalog, registry, database: database.to_string(), subject: subject.to_string() })
+		let checkpoints = CheckpointPolicy::from_env();
+		Ok(Self { root, index, metadata, catalog, registry, database: database.to_string(), subject: subject.to_string(), checkpoints })
+	}
+
+	/// Override this store's [`CheckpointPolicy`] (the env-read default is
+	/// [`CheckpointPolicy::DISABLED`]), for a caller that wants the timestamp checkpoint
+	/// index without setting an environment variable.
+	#[must_use]
+	pub const fn with_checkpoint_policy(mut self, policy: CheckpointPolicy) -> Self {
+		self.checkpoints = policy;
+		self
+	}
+
+	/// The checkpoint policy new seals are written under.
+	#[must_use]
+	pub const fn checkpoint_policy(&self) -> CheckpointPolicy {
+		self.checkpoints
 	}
 
 	/// The control-plane index backing this store, for pruning/accounting queries
@@ -303,7 +370,13 @@ impl SegmentStore {
 	/// the dense and nullable seal paths.
 	async fn persist(&self, aspect: &str, segment: &Segment) -> Result<SegmentDescriptor> {
 		let id = self.index.next_id(aspect).await?;
-		let bytes = segment.write_to();
+		// Checkpoint the timestamp column only when configured AND the segment's shape
+		// actually benefits (sorted + irregular + big enough) — otherwise write the
+		// historical frame byte-for-byte. Either frame reads identically.
+		let bytes = match self.checkpoints.stride_for(segment.stats.row_count, segment.benefits_from_checkpoints()) {
+			Some(stride) => segment.write_to_checkpointed(stride),
+			None => segment.write_to(),
+		};
 		let path = self.segment_path(aspect, id);
 		tokio::fs::write(&path, &bytes).await.with_context(|| format!("writing segment {}", path.display()))?;
 		let descriptor = SegmentDescriptor::of_segment(id, path.to_string_lossy().into_owned(), bytes.len() as u64, segment);
@@ -316,7 +389,12 @@ impl SegmentStore {
 	/// record its descriptor. The paged analogue of [`persist`](SegmentStore::persist).
 	async fn persist_paged(&self, aspect: &str, segment: &PagedSegment) -> Result<SegmentDescriptor> {
 		let id = self.index.next_id(aspect).await?;
-		let bytes = segment.write_to();
+		// As `persist`, though the paged win is far smaller — page pruning already bounds
+		// a probe's decode to `rows_per_page`.
+		let bytes = match self.checkpoints.stride_for(segment.stats.row_count, segment.benefits_from_checkpoints()) {
+			Some(stride) => segment.write_to_checkpointed(stride),
+			None => segment.write_to(),
+		};
 		let path = self.segment_path(aspect, id);
 		tokio::fs::write(&path, &bytes).await.with_context(|| format!("writing segment {}", path.display()))?;
 		let descriptor = SegmentDescriptor::of_paged_segment(id, path.to_string_lossy().into_owned(), bytes.len() as u64, segment);
@@ -2656,5 +2734,71 @@ mod tests {
 		assert_eq!(after.total_rows, 4);
 		assert_eq!(after.time_range, Some((0, 30)));
 		assert_eq!(after.value_range, Some((bd("1"), bd("4"))));
+	}
+
+	/// The policy decides on shape + size, and `DISABLED` is the default — the guarantee
+	/// that an unconfigured deployment's bytes are byte-for-byte what they always were.
+	#[test]
+	fn checkpoint_policy_gates_on_shape_and_size() {
+		assert_eq!(CheckpointPolicy::DISABLED.stride_for(1_000_000, true), None, "disabled never checkpoints, whatever the shape");
+		let p = CheckpointPolicy { stride: Some(1024), min_rows: 8_192 };
+		assert_eq!(p.stride_for(10_000, true), Some(1024), "a large sorted-irregular segment is checkpointed");
+		assert_eq!(p.stride_for(10_000, false), None, "a regular (or out-of-order) segment gains nothing — O(1) closed form already");
+		assert_eq!(p.stride_for(100, true), None, "a small segment decodes trivially; the index would be pure cost");
+	}
+
+	/// End-to-end through the real store: an enabled policy changes the bytes on disk and
+	/// nothing else — every read still returns exactly the same data.
+	#[tokio::test]
+	async fn checkpointed_seal_reads_identically_and_only_changes_the_bytes() {
+		// A sorted IRREGULAR column above the row floor — the shape the index is for.
+		let mut t = 0_i64;
+		let ts: Vec<i64> = (0..12_000)
+			.map(|i: i64| {
+				t += 1 + (i * 7) % 29;
+				t
+			})
+			.collect();
+		let vs: Vec<BigDecimal> = (0..12_000).map(|i| bd(&format!("{}", 100 + i % 400))).collect();
+
+		let policy = CheckpointPolicy { stride: Some(1024), min_rows: 8_192 };
+		let plain_dir = TempDir::new().expect("tempdir");
+		let plain = SegmentStore::open(plain_dir.path()).await.expect("opens");
+		assert_eq!(plain.checkpoint_policy(), CheckpointPolicy::DISABLED, "the store is unconfigured by default");
+		let plain_desc = plain.seal("temp", &schema(), &ts, &vs).await.expect("seals");
+
+		let cp_dir = TempDir::new().expect("tempdir");
+		let cp = SegmentStore::open(cp_dir.path()).await.expect("opens").with_checkpoint_policy(policy);
+		let cp_desc = cp.seal("temp", &schema(), &ts, &vs).await.expect("seals");
+
+		// The index costs real bytes — the whole trade, asserted rather than assumed.
+		assert!(cp_desc.byte_len > plain_desc.byte_len, "the checkpointed frame is larger ({} vs {})", cp_desc.byte_len, plain_desc.byte_len);
+
+		// ...and buys identical answers: point reads (present + absent) and a range read.
+		for probe in [ts[0], ts[5_000], ts[11_999], ts[3] + 1, -1] {
+			assert_eq!(cp.read_point("temp", probe).await.expect("reads"), plain.read_point("temp", probe).await.expect("reads"), "point read at {probe} must match the plain store");
+		}
+		let batch = vec![ts[10], ts[8_000], 999_999_999, ts[11_000]];
+		assert_eq!(cp.read_points("temp", &batch).await.expect("reads"), plain.read_points("temp", &batch).await.expect("reads"), "batch read must match");
+		assert_eq!(cp.read_time_range("temp", ts[100], ts[200]).await.expect("reads"), plain.read_time_range("temp", ts[100], ts[200]).await.expect("reads"), "range read must match");
+	}
+
+	/// A *regular* column must not be checkpointed even when the policy is on: it already
+	/// resolves O(1) closed-form, so an index would be bytes for nothing.
+	#[tokio::test]
+	async fn a_regular_column_is_never_checkpointed_even_when_enabled() {
+		let ts: Vec<i64> = (0..12_000).map(|i| i * 10).collect();
+		let vs: Vec<BigDecimal> = (0..12_000).map(|i| bd(&format!("{}", i % 500))).collect();
+		let policy = CheckpointPolicy { stride: Some(1024), min_rows: 8_192 };
+
+		let plain_dir = TempDir::new().expect("tempdir");
+		let plain = SegmentStore::open(plain_dir.path()).await.expect("opens");
+		let plain_desc = plain.seal("temp", &schema(), &ts, &vs).await.expect("seals");
+
+		let cp_dir = TempDir::new().expect("tempdir");
+		let cp = SegmentStore::open(cp_dir.path()).await.expect("opens").with_checkpoint_policy(policy);
+		let cp_desc = cp.seal("temp", &schema(), &ts, &vs).await.expect("seals");
+
+		assert_eq!(cp_desc.byte_len, plain_desc.byte_len, "a regular column must be byte-for-byte identical — no index written");
 	}
 }
