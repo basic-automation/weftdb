@@ -283,44 +283,50 @@ impl DdSketch {
 	///
 	/// `q = 0` is the minimum, `q = 1` the maximum, `q = 0.5` the median.
 	///
-	/// **Rank convention** (the reference `DDSketch` one): the sample selected is the one
-	/// at 0-based rank `⌊q·(n-1)⌋` of the sorted multiset — i.e. the first sample whose
-	/// cumulative count exceeds `q·(n-1)`. The `α` guarantee is relative to *that*
-	/// sample's value; comparing against a differently-ranked sample (say a rounded or
-	/// interpolated one) can exceed `α` on densely-spaced data purely from the rank
-	/// convention, with the mapping itself still exact.
+	/// **Rank convention — DSP's nearest-rank, deliberately not `DDSketch`'s reference
+	/// rank.** The sample selected is the one at 1-based ordinal `⌈q·n⌉` (clamped to
+	/// `1..=n`), which is exactly what the *exact* [`Aggregation`](crate::Aggregation)
+	/// percentiles use. That makes `sketch_p*` and `p*` **substitutable at any bucket
+	/// size**: they name the same sample, and the sketch's answer is then within `α` of
+	/// the exact one. (The reference implementation ranks by `⌊q·(n-1)⌋` instead; on a
+	/// small bucket that selects a *different* sample — `p99` of three samples would be
+	/// the middle one rather than the largest — a divergence not worth inheriting.)
+	///
+	/// The `α` guarantee is relative to that sample's value; comparing against a
+	/// differently-ranked sample can exceed `α` on densely-spaced data purely from the
+	/// rank convention, with the mapping itself still exact.
 	#[must_use]
 	pub fn quantile(&self, q: f64) -> Option<f64> {
 		if self.count == 0 || !(0.0..=1.0).contains(&q) {
 			return None;
 		}
-		// The rank being sought, over the sorted multiset: q·(n-1), as in the reference
-		// implementation. Values sort negative (descending |v|) → zeros → positive.
-		#[allow(clippy::cast_precision_loss)]
-		let target = q * ((self.count - 1) as f64);
+		// Nearest-rank ordinal, matching the exact percentiles: ceil(q*n), 1-based, at
+		// least 1. Integer arithmetic on the numerator keeps it exact for the ranks that
+		// matter (q is a fixed 0.5/0.9/0.95/0.99 here). Values sort negative (descending
+		// |v|) → zeros → positive, so accumulate in that order and take the bucket whose
+		// cumulative count first reaches the ordinal.
+		#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+		let ordinal = ((q * (self.count as f64)).ceil() as u64).clamp(1, self.count);
 		let mut seen: u64 = 0;
 		// Negatives, most-negative first: that is descending bucket index of |v|.
 		for (&i, &c) in self.negative.iter().rev() {
 			seen += c;
-			#[allow(clippy::cast_precision_loss)]
-			if (seen as f64) > target {
+			if seen >= ordinal {
 				return Some(-self.value_of(i));
 			}
 		}
 		seen += self.zeros;
-		#[allow(clippy::cast_precision_loss)]
-		if self.zeros > 0 && (seen as f64) > target {
+		if self.zeros > 0 && seen >= ordinal {
 			return Some(0.0);
 		}
 		for (&i, &c) in &self.positive {
 			seen += c;
-			#[allow(clippy::cast_precision_loss)]
-			if (seen as f64) > target {
+			if seen >= ordinal {
 				return Some(self.value_of(i));
 			}
 		}
-		// Floating-point rank comparison can leave the last sample unclaimed at q = 1;
-		// the maximum is the answer there.
+		// Unreachable for a non-empty sketch (the ordinal is clamped to the count), but
+		// fall back to the maximum rather than None.
 		self.positive.keys().next_back().map(|&i| self.value_of(i)).or_else(|| if self.zeros > 0 { Some(0.0) } else { self.negative.keys().next().map(|&i| -self.value_of(i)) })
 	}
 
@@ -351,12 +357,11 @@ mod tests {
 		let mut sorted = values;
 		sorted.sort_by(f64::total_cmp);
 		for &q in &[0.0, 0.01, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1.0] {
-			// The sketch's documented rank convention: 0-based rank floor(q*(n-1)).
-			// Comparing against a *rounded* rank would pick the neighbouring sample and
-			// fail the bound on this densely-spaced ramp for a reason that has nothing to
-			// do with the sketch's accuracy.
+			// The sketch's rank convention is DSP's nearest-rank — 1-based ordinal
+			// ceil(q*n), clamped — the same sample the exact percentiles name.
 			#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-			let exact = sorted[(q * ((sorted.len() - 1) as f64)).floor() as usize];
+			let ordinal = ((q * (sorted.len() as f64)).ceil() as usize).clamp(1, sorted.len());
+			let exact = sorted[ordinal - 1];
 			let got = s.quantile(q).expect("non-empty");
 			let rel = (got - exact).abs() / exact.abs();
 			assert!(rel <= alpha, "q={q}: got {got}, exact {exact}, relative error {rel} exceeds alpha {alpha}");
