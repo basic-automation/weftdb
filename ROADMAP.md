@@ -863,10 +863,20 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   DSP-internal consistency beat matching Datadog's convention. Guarded by
   `sketch_and_exact_percentiles_agree_on_small_buckets` (n=1..=12 × p50/p90/p99). Runtime-verified:
   a 3-sample bucket returns `sketch_p99`=49.90 vs exact 50.0 where it previously returned **0.0**.
-- [ ] **NEXT — mergeability is shipped but unused:** `DdSketch::merge` is exact (tested bit-for-bit
-  against a single pass), yet nothing merges sketches across segments/buckets — the property that
-  motivated the structure has no consumer. Wire it into a cross-segment downsample (one sketch per
-  segment, merged at the read) so streaming/parallel p99 actually benefits.
+- [x] **DONE (2026-07-16) — the mergeable-reduction primitive exists.** `reduce_partial(...)
+  -> PartialReduction` + `PartialReduction::{merge, finish}`: a reduction can be computed over parts
+  (a chunk, a segment, a parallel shard) and combined. `reduce` is now `reduce_partial` + `finish`,
+  so the single-pass path cannot drift from the distributed one. Merging is exact for **every**
+  reduction (counts/sums add, min/max combine, first/last resolve by timestamp, samples concatenate,
+  sketches merge) — proven by reducing 600 points in four boundary-straddling chunks, merging in a
+  scrambled order, and asserting equality with the single pass across all 13 reductions.
+- [ ] **NEXT — a cross-segment downsample surface (the consumer `PartialReduction` still lacks):**
+  the primitive is no longer the blocker, but no DSP surface reduces across segments — the HTTP
+  `downsample` endpoint takes points in a request body, so `sketch_p*`'s mergeability and the new
+  partial API have no production consumer. Add a stored-data downsample (e.g.
+  `POST /api/v1/storage/{aspect}/downsample?start=&end=&resolution=&agg=`) that reduces each pruned
+  segment into a `PartialReduction` — in parallel — merges, and finishes once. That is the shape
+  where the bounded-memory sketch p99 genuinely pays: a range far too large to materialize.
 - [x] **DONE (2026-07-16) — linear (trapezoidal) TWA method beside the shipped LOCF weighting:**
   `Aggregation::TwaLinear` (token `twa_linear`, alias `time_weighted_avg_linear`) computing
   `Σ½(vᵢ+vᵢ₊₁)Δtᵢ / ΣΔtᵢ`; `time_weighted_average` is generalized over a private
