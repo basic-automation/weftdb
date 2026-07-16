@@ -673,7 +673,7 @@ fn parse_rows_per_page(s: &str) -> Result<usize, String> {
 /// Parse a comma-separated list of downsample aggregation tokens (e.g.
 /// `min,max,p99`) into reductions, rejecting an unknown token or an empty list.
 fn parse_aggregations(s: &str) -> Result<Vec<Aggregation>, String> {
-	let aggs: Vec<Aggregation> = s.split(',').map(str::trim).filter(|t| !t.is_empty()).map(|t| Aggregation::from_token(t).ok_or_else(|| format!("invalid --ds-aggs token `{t}` (use min/max/avg/sum/first/last/p50/p90/p95/p99/twa/twa_linear/sketch_p50/sketch_p90/sketch_p95/sketch_p99)"))).collect::<Result<_, _>>()?;
+	let aggs: Vec<Aggregation> = s.split(',').map(str::trim).filter(|t| !t.is_empty()).map(|t| Aggregation::from_token(t).ok_or_else(|| format!("invalid --ds-aggs token `{t}` (use min/max/avg/sum/first/last/p50/p90/p95/p99/twa/twa_linear/twa_bucket_end/sketch_p50/sketch_p90/sketch_p95/sketch_p99)"))).collect::<Result<_, _>>()?;
 	if aggs.is_empty() {
 		return Err("--ds-aggs must name at least one reduction".to_string());
 	}
