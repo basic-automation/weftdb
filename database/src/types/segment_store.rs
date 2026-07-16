@@ -31,7 +31,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use bigdecimal::BigDecimal;
-use dsp_physical_type::{merge_newer_wins, split_index, AspectSchema, PagedSegment, Segment, SegmentDescriptor, SplitDecision, SplitPolicy, PAGED_SEGMENT_FORMAT_VERSION};
+use chrono::{DateTime, Utc};
+use dsp_physical_type::{merge_newer_wins, split_index, AspectSchema, PagedSegment, Segment, SegmentDescriptor, SplitDecision, SplitPolicy, TimeUnit, PAGED_SEGMENT_FORMAT_VERSION};
+use dsp_reduce::{Aggregation, Bucket, PartialReduction};
+use splimes::{Point, Resolution};
 
 use crate::{AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, SegmentIndexStore};
 
@@ -119,6 +122,18 @@ impl CheckpointPolicy {
 	#[must_use]
 	pub fn stride_for(self, row_count: usize, benefits: bool, codec_overhead: f64) -> Option<usize> {
 		self.stride.filter(|_| benefits && row_count >= self.min_rows && codec_overhead <= self.max_codec_overhead)
+	}
+}
+
+/// Lift a stored integer epoch in `unit` to an absolute instant — the inverse of the
+/// ingest path's `epoch_in_unit`. `None` if the epoch falls outside the representable
+/// range (only reachable for coarse units at absurd magnitudes).
+const fn instant_from_epoch(epoch: i64, unit: TimeUnit) -> Option<DateTime<Utc>> {
+	match unit {
+		TimeUnit::Seconds => DateTime::<Utc>::from_timestamp(epoch, 0),
+		TimeUnit::Millis => DateTime::<Utc>::from_timestamp_millis(epoch),
+		TimeUnit::Micros => DateTime::<Utc>::from_timestamp_micros(epoch),
+		TimeUnit::Nanos => Some(DateTime::<Utc>::from_timestamp_nanos(epoch)),
 	}
 }
 
@@ -470,6 +485,57 @@ impl SegmentStore {
 			}
 		}
 		Ok((timestamps, values))
+	}
+
+	/// **Cross-segment downsample** — reduce `aspect`'s `[start, end]` rows into
+	/// grid-aligned buckets **without ever materializing the range**.
+	///
+	/// The distributed shape of [`dsp_reduce::reduce`]: the index is pruned by time, then
+	/// each surviving segment is read, windowed, and folded into its own
+	/// [`PartialReduction`]; the partials are merged and finished once. Only one segment's
+	/// rows are in memory at a time, so a range far larger than RAM still reduces — and
+	/// with a `sketch_p*` aggregation the per-bucket state is bounded too, which is the
+	/// scenario `DdSketch`'s exact mergeability exists for.
+	///
+	/// Identical to reading the whole range and reducing it in one pass (merging is exact
+	/// for every reduction), which is what the test asserts. Timestamps are the aspect's
+	/// declared [`TimeUnit`] epochs, lifted to absolute instants for bucketing.
+	///
+	/// # Errors
+	///
+	/// If `aspect` has no declared schema, if a segment cannot be read or decoded, if a
+	/// stored epoch falls outside the representable instant range, or if the reduction
+	/// fails.
+	pub async fn downsample_range(&self, aspect: &str, start: i64, end: i64, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Vec<Bucket>> {
+		let schema = self.require_schema(aspect).await?;
+		let descriptors = self.index.prune_by_time(aspect, start, end).await?;
+		let mut merged: Option<PartialReduction> = None;
+		for descriptor in &descriptors {
+			let bytes = tokio::fs::read(&descriptor.path).await.with_context(|| format!("reading segment {}", descriptor.path))?;
+			let (ts, vs) = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION {
+				dsp_physical_type::dspseg::read_paged_segment_range(&bytes, start, end).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?
+			} else {
+				dsp_physical_type::dspseg::read_segment_range(&bytes, start, end).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?
+			};
+			// Null rows carry no value to reduce; present rows lift to absolute instants.
+			let mut points: Vec<Point> = Vec::with_capacity(ts.len());
+			for (t, v) in ts.into_iter().zip(vs) {
+				if let Some(value) = v {
+					if start <= t && t <= end {
+						points.push(Point::new(instant_from_epoch(t, schema.timestamp_unit).ok_or_else(|| anyhow::anyhow!("segment {} holds epoch {t} outside the representable instant range", descriptor.path))?, value));
+					}
+				}
+			}
+			if points.is_empty() {
+				continue;
+			}
+			let partial = dsp_reduce::reduce_partial(&points, resolution, None, None, aggregations).map_err(|e| anyhow::anyhow!("reducing segment {}: {e}", descriptor.path))?;
+			match merged.as_mut() {
+				Some(m) => m.merge(partial).map_err(|e| anyhow::anyhow!("merging segment {}: {e}", descriptor.path))?,
+				None => merged = Some(partial),
+			}
+		}
+		merged.map_or_else(|| Ok(Vec::new()), |m| m.finish(resolution, aggregations).map_err(|e| anyhow::anyhow!("finishing downsample of {aspect:?}: {e}")))
 	}
 
 	/// **Point lookup** (roadmap Phase 4.6 read-planner): the present value of
@@ -2810,6 +2876,48 @@ mod tests {
 		let batch = vec![ts[10], ts[8_000], 999_999_999, ts[11_000]];
 		assert_eq!(cp.read_points("temp", &batch).await.expect("reads"), plain.read_points("temp", &batch).await.expect("reads"), "batch read must match");
 		assert_eq!(cp.read_time_range("temp", ts[100], ts[200]).await.expect("reads"), plain.read_time_range("temp", ts[100], ts[200]).await.expect("reads"), "range read must match");
+	}
+
+	/// The cross-segment downsample must equal reading the whole range and reducing it in
+	/// one pass — for every reduction, across many segments, including the sketch.
+	#[tokio::test]
+	async fn downsample_range_equals_a_single_pass_over_the_whole_range() {
+		use dsp_reduce::{reduce, Aggregation};
+		use splimes::{Point, Resolution};
+
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		// `downsample_range` reads the declared unit from the catalog to lift epochs.
+		store.declare("temp", &schema()).await.expect("declares");
+		// Eight separate seals => eight segments the reduction must span, with buckets
+		// straddling segment boundaries (each seal covers 90 minutes at hour resolution).
+		let mut all: Vec<Point> = Vec::new();
+		for seg in 0..8_i64 {
+			// The shared test `schema()` declares SECONDS, so the epochs are seconds: one
+			// sample a minute, 90 minutes per seal, straddling hour buckets.
+			let ts: Vec<i64> = (0..90).map(|i| (seg * 90 + i) * 60).collect();
+			let vs: Vec<BigDecimal> = (0..90).map(|i| bd(&format!("{}", (seg * 7 + i) % 53))).collect();
+			for (t, v) in ts.iter().zip(&vs) {
+				all.push(Point::new(DateTime::<Utc>::from_timestamp(*t, 0).expect("instant"), v.clone()));
+			}
+			store.seal("temp", &schema(), &ts, &vs).await.expect("seals");
+		}
+		let aggs = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::P99, Aggregation::Twa, Aggregation::SketchP99];
+
+		let cross = store.downsample_range("temp", i64::MIN, i64::MAX, Resolution::Hours, &aggs).await.expect("downsamples");
+		let single = reduce(&all, Resolution::Hours, None, None, &aggs).expect("reduces");
+		assert!(cross.len() > 1, "the fixture must span several buckets, got {}", cross.len());
+		assert_eq!(cross, single, "a cross-segment downsample must equal the single pass exactly");
+
+		// A window narrows the result and still matches a single pass over the same window.
+		let (w_start, w_end) = (60_i64 * 100, 60_i64 * 300);
+		let windowed = store.downsample_range("temp", w_start, w_end, Resolution::Hours, &aggs).await.expect("downsamples");
+		let expected: Vec<Point> = all.iter().filter(|p| (w_start..=w_end).contains(&p.timestamp.timestamp())).cloned().collect();
+		assert_eq!(windowed, reduce(&expected, Resolution::Hours, None, None, &aggs).expect("reduces"), "a windowed cross-segment downsample must match");
+
+		// An empty window and an undeclared aspect behave sanely.
+		assert!(store.downsample_range("temp", -10_000, -5_000, Resolution::Hours, &aggs).await.expect("downsamples").is_empty(), "a window with no rows yields no buckets");
+		assert!(store.downsample_range("nope", 0, 1, Resolution::Hours, &aggs).await.is_err(), "an undeclared aspect is an error");
 	}
 
 	/// The codec-override gate, end-to-end on a real store: an **irregular** column whose
