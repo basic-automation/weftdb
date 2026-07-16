@@ -877,13 +877,23 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   16,921,104 pts·s⁻¹ = 14.7×**. So mergeability is throughput, not theory — and `sketch_p99` at 64
   chunks is ~68× the serial exact `p99` (30.1 ms vs 2018.5 ms). This is the evidence for the
   cross-segment surface below.
-- [ ] **NEXT — a cross-segment downsample surface (the production consumer):**
-  the primitive is no longer the blocker, but no DSP surface reduces across segments — the HTTP
-  `downsample` endpoint takes points in a request body, so `sketch_p*`'s mergeability and the new
-  partial API have no production consumer. Add a stored-data downsample (e.g.
-  `POST /api/v1/storage/{aspect}/downsample?start=&end=&resolution=&agg=`) that reduces each pruned
-  segment into a `PartialReduction` — in parallel — merges, and finishes once. That is the shape
-  where the bounded-memory sketch p99 genuinely pays: a range far too large to materialize.
+- [x] **DONE (2026-07-16) — cross-segment downsample, store layer.** `SegmentStore::downsample_range`
+  prunes the index by time, folds **each surviving segment into its own `PartialReduction`**, merges,
+  and finishes once — so only one segment's rows are ever in memory and a range far larger than RAM
+  reduces; with a `sketch_p*` the per-bucket state is bounded too. Epochs lift through the catalog's
+  declared `TimeUnit`. Proven equal to a single pass over the whole series across 8 segments with
+  boundary-straddling buckets (9 reductions incl. `sketch_p99`), plus windowed/empty/undeclared cases.
+- [ ] **NEXT — expose the cross-segment downsample at the API:**
+  `POST /api/v1/storage/{aspect}/downsample?start=&end=&resolution=&agg=` over
+  `SegmentStore::downsample_range`, with the same columnar output options as the compute endpoints
+  (JSON/CSV/Arrow/Parquet) and a `downsample.range` stage span. The store primitive and its equality
+  test exist; this is the surface that finally puts the bounded-memory `sketch_p*` p99 in front of a
+  user on stored data.
+- [ ] **NEXT — parallelize `downsample_range` across segments:** it folds segments *sequentially*
+  today (correct, and already bounded-memory). `dsp-bench --ds-parallel` measured **14.7×** for the
+  same chunked-partial shape, so reducing the pruned segments concurrently (rayon or `join_all` over
+  the per-segment reduce) should carry most of that to stored data. Measure, don't assume — the
+  per-segment file read may dominate.
 - [x] **DONE (2026-07-16) — linear (trapezoidal) TWA method beside the shipped LOCF weighting:**
   `Aggregation::TwaLinear` (token `twa_linear`, alias `time_weighted_avg_linear`) computing
   `Σ½(vᵢ+vᵢ₊₁)Δtᵢ / ΣΔtᵢ`; `time_weighted_average` is generalized over a private
