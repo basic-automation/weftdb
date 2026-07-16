@@ -1095,6 +1095,7 @@ dependencies = [
  "csv",
  "dirs",
  "dsp-physical-type",
+ "dsp-reduce",
  "fake",
  "fastrand",
  "flume",
