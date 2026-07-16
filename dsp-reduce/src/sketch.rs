@@ -38,6 +38,9 @@ pub enum SketchError {
 	/// The requested relative accuracy was not in the open interval `(0, 1)`.
 	#[error("relative accuracy must be in (0, 1)")]
 	InvalidAccuracy,
+	/// A bucket budget of zero was requested; a sketch needs at least one bucket.
+	#[error("max_bins must be at least 1")]
+	InvalidMaxBins,
 	/// Two sketches with different relative accuracies cannot be merged: the resulting
 	/// bucket boundaries would not share a mapping, so no error bound would hold.
 	#[error("cannot merge sketches with different relative accuracies")]
@@ -68,6 +71,9 @@ pub struct DdSketch {
 	zeros: u64,
 	/// Total samples fed.
 	count: u64,
+	/// Maximum buckets per (positive/negative) store before the lowest are collapsed;
+	/// `None` leaves the sketch unbounded. See [`DdSketch::with_max_bins`].
+	max_bins: Option<usize>,
 }
 
 impl DdSketch {
@@ -86,19 +92,86 @@ impl DdSketch {
 		Ok(Self::from_alpha(alpha))
 	}
 
-	/// A sketch at the crate's declared [`SKETCH_ALPHA`](crate::SKETCH_ALPHA) accuracy.
+	/// A sketch at the crate's declared [`SKETCH_ALPHA`](crate::SKETCH_ALPHA) accuracy and
+	/// [`SKETCH_MAX_BINS`](crate::SKETCH_MAX_BINS) bucket budget — what the `sketch_p*`
+	/// reductions use, so their memory is bounded *absolutely* rather than by the value
+	/// range.
 	///
-	/// Infallible: the constant is a valid relative accuracy by construction, so the
-	/// reduction path builds sketches without an unreachable error branch.
+	/// Infallible: both constants are valid by construction, so the reduction path builds
+	/// sketches without an unreachable error branch.
 	#[must_use]
 	pub fn with_default_accuracy() -> Self {
-		Self::from_alpha(crate::SKETCH_ALPHA)
+		let mut s = Self::from_alpha(crate::SKETCH_ALPHA);
+		s.max_bins = Some(crate::SKETCH_MAX_BINS);
+		s
+	}
+
+	/// A sketch that never exceeds `max_bins` buckets per sign store, collapsing the
+	/// **lowest** buckets together when it would.
+	///
+	/// Without this, memory is bounded only by the *log of the value range* — small for a
+	/// realistic column, but not absolutely bounded: a pathological range (sub-nanosecond
+	/// next to astronomical) still allocates a bucket per magnitude step. `max_bins` makes
+	/// the bound absolute, which is what the reference implementations do.
+	///
+	/// **The guarantee weakens where it collapses, and only there.** A `q`-quantile stays
+	/// `α`-accurate as long as its value still falls in a surviving bucket; collapsed
+	/// (lowest) buckets lose the relative-error bound for the quantiles inside them — for
+	/// an all-positive column that is the *low* quantiles, and p95/p99 (the ones latency
+	/// monitoring actually asks for) are unaffected. This is the documented behaviour of
+	/// the reference `CollapsingLowestDenseStore`, not a DSP quirk; `UDDSketch` is the
+	/// variant that keeps a uniform guarantee under collapse, and is filed as a follow-up.
+	///
+	/// Collapsing also costs **exact mergeability**: two sketches that each collapsed
+	/// different buckets no longer merge to the same sketch a single pass would build.
+	/// [`new`](Self::new) stays unbounded, so a caller that needs exact merges keeps it.
+	///
+	/// # Errors
+	///
+	/// [`SketchError::InvalidAccuracy`] unless `0 < alpha < 1`; [`SketchError::InvalidMaxBins`]
+	/// if `max_bins` is zero.
+	///
+	/// *(src: bucket collapsing loses the guarantee on the collapsed quantiles —
+	/// <https://github.com/DataDog/sketches-java> · `UDDSketch` —
+	/// <https://arxiv.org/abs/2004.08604>)*
+	pub fn with_max_bins(alpha: f64, max_bins: usize) -> Result<Self, SketchError> {
+		if max_bins == 0 {
+			return Err(SketchError::InvalidMaxBins);
+		}
+		let mut s = Self::new(alpha)?;
+		s.max_bins = Some(max_bins);
+		Ok(s)
 	}
 
 	/// Build the mapping for an already-validated `alpha`.
 	fn from_alpha(alpha: f64) -> Self {
 		let gamma = (1.0 + alpha) / (1.0 - alpha);
-		Self { alpha, gamma, log_gamma: gamma.ln(), positive: BTreeMap::new(), negative: BTreeMap::new(), zeros: 0, count: 0 }
+		Self { alpha, gamma, log_gamma: gamma.ln(), positive: BTreeMap::new(), negative: BTreeMap::new(), zeros: 0, count: 0, max_bins: None }
+	}
+
+	/// Collapse `store`'s lowest buckets together until it fits `max_bins`, folding each
+	/// evicted bucket's count into the next-lowest survivor (so the total count — and
+	/// therefore every rank — is preserved; only the *resolution* at the bottom is lost).
+	fn collapse_lowest(store: &mut BTreeMap<i32, u64>, max_bins: usize) {
+		while store.len() > max_bins {
+			let Some((&lowest, _)) = store.iter().next() else { break };
+			let Some(evicted) = store.remove(&lowest) else { break };
+			// Fold into the new lowest; if the store just emptied, put it back.
+			if let Some(next) = store.iter().next().map(|(&k, _)| k) {
+				*store.entry(next).or_insert(0) += evicted;
+			} else {
+				store.insert(lowest, evicted);
+				break;
+			}
+		}
+	}
+
+	/// Enforce `max_bins` on both sign stores.
+	fn enforce_max_bins(&mut self) {
+		if let Some(max) = self.max_bins {
+			Self::collapse_lowest(&mut self.positive, max);
+			Self::collapse_lowest(&mut self.negative, max);
+		}
 	}
 
 	/// The relative accuracy `α` this sketch guarantees.
@@ -163,6 +236,7 @@ impl DdSketch {
 			self.zeros += 1;
 		}
 		self.count += 1;
+		self.enforce_max_bins();
 		Ok(())
 	}
 
@@ -200,6 +274,7 @@ impl DdSketch {
 		}
 		self.zeros += other.zeros;
 		self.count += other.count;
+		self.enforce_max_bins();
 		Ok(())
 	}
 
@@ -386,6 +461,57 @@ mod tests {
 		}
 		assert_eq!(s.count(), 100_000);
 		assert!(s.bucket_count() <= 120, "100k samples over a narrow range stay in a handful of buckets, got {}", s.bucket_count());
+	}
+
+	/// The absolute memory bound: an extreme dynamic range must not outgrow the budget.
+	#[test]
+	fn max_bins_bounds_memory_over_a_pathological_range() {
+		let mut s = DdSketch::with_max_bins(0.01, 16).expect("valid");
+		// 1e-9 .. 1e9 — a range that unbounded would occupy thousands of buckets.
+		for e in -9_i32..=9 {
+			for m in 1..=9 {
+				s.add(f64::from(m) * 10_f64.powi(e)).expect("in range");
+			}
+		}
+		assert!(s.bucket_count() <= 16, "the store must never exceed max_bins, got {}", s.bucket_count());
+		assert_eq!(s.count(), 19 * 9, "collapsing preserves every sample's count");
+		// The top of the distribution keeps its guarantee — collapsing only ate the bottom.
+		let max = s.quantile(1.0).expect("non-empty");
+		assert!((max - 9e9).abs() / 9e9 <= 0.01, "the maximum stays within alpha after collapsing, got {max}");
+	}
+
+	/// Collapsing is not free, and the test says exactly what it costs: ranks survive, the
+	/// low quantiles' relative-error bound does not.
+	#[test]
+	fn collapsing_preserves_ranks_but_not_the_low_quantile_bound() {
+		let (mut bounded, mut exact) = (DdSketch::with_max_bins(0.01, 4).expect("valid"), DdSketch::new(0.01).expect("valid"));
+		for e in 0_i32..8 {
+			bounded.add(10_f64.powi(e)).expect("in range");
+			exact.add(10_f64.powi(e)).expect("in range");
+		}
+		assert!(bounded.bucket_count() <= 4);
+		assert_eq!(bounded.count(), exact.count(), "no sample is lost");
+		// The highest value is in a surviving bucket, so it keeps the bound.
+		assert!((bounded.quantile(1.0).unwrap() - exact.quantile(1.0).unwrap()).abs() < f64::EPSILON, "the max is unaffected by collapsing the bottom");
+		// The lowest is inside a collapsed bucket, so it does NOT — asserted, not hidden.
+		assert!(bounded.quantile(0.0).unwrap() > exact.quantile(0.0).unwrap(), "a collapsed low quantile reads high — the documented cost of max_bins");
+	}
+
+	#[test]
+	fn default_accuracy_sketch_is_bounded_and_rejects_a_zero_budget() {
+		assert_eq!(DdSketch::with_max_bins(0.01, 0).unwrap_err(), SketchError::InvalidMaxBins);
+		// The reduction's sketch carries the budget, so `sketch_p*` memory is absolutely bounded.
+		let mut s = DdSketch::with_default_accuracy();
+		for i in 1..=10_000 {
+			s.add(f64::from(i)).expect("in range");
+		}
+		assert!(s.bucket_count() <= crate::SKETCH_MAX_BINS, "the default sketch respects the budget");
+		// ...and the budget is loose enough that a realistic column never collapses.
+		let exact = (1..=10_000).map(f64::from).collect::<Vec<_>>();
+		let got = s.quantile(0.99).expect("non-empty");
+		#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+		let want = exact[(0.99_f64 * 9_999.0).floor() as usize];
+		assert!((got - want).abs() / want <= 0.01, "no collapse on a realistic range, so p99 keeps alpha");
 	}
 
 	#[test]
