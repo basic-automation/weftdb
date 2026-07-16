@@ -20,9 +20,12 @@
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod sketch;
+
 use std::collections::BTreeMap;
 
 use bigdecimal::BigDecimal;
+pub use sketch::{DdSketch, SketchError};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use splimes::{Point, Resolution, SECONDS_IN_DAY, SECONDS_IN_HOUR, SECONDS_IN_MINUTE, SECONDS_IN_MONTH, SECONDS_IN_WEEK, SECONDS_IN_YEAR};
