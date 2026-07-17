@@ -101,6 +101,20 @@ impl IntoResponse for StorageError {
 	}
 }
 
+/// Carry an [`ApiError`](crate::interpolate::ApiError) from the shared compute-side
+/// parsers/serializers into this module's error type **without collapsing its status
+/// class** — a bad token stays a `400`, an encoding failure stays a `500`. Lets the
+/// storage downsample endpoint reuse the compute endpoint's token parsing and
+/// Arrow/Parquet rendering verbatim.
+impl From<crate::interpolate::ApiError> for StorageError {
+	fn from(err: crate::interpolate::ApiError) -> Self {
+		match err {
+			crate::interpolate::ApiError::BadRequest(message) => Self::BadRequest(message),
+			crate::interpolate::ApiError::Internal(message) => Self::Internal(message),
+		}
+	}
+}
+
 /// Classify a bridge read error: an undeclared aspect (its schema is unknown) is a
 /// `404`, everything else (libSQL prune, filesystem read, corrupt frame, IPC
 /// serialization) is a `500`.
@@ -981,6 +995,122 @@ pub async fn storage_stats(State(state): State<AppState>) -> Result<Json<StoreSt
 	Ok(Json(StoreStatsResponse { aspect_count: summary.aspect_count, segment_count: summary.segment_count, total_rows: summary.total_rows, total_nulls: summary.total_nulls, total_bytes: summary.total_bytes, bytes_per_point, unsorted_segments: summary.unsorted_segments, overlapping_segments, time_range }))
 }
 
+/// Query parameters for the stored-range downsample.
+///
+/// The `[start, end]` window is inclusive and expressed as integer epochs **in the
+/// aspect's declared `TimeUnit`** (as every other stored-range read here), while the
+/// resolution and aggregation list use the same tokens the compute downsample
+/// endpoint accepts.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StorageDownsampleParams {
+	/// Inclusive window start (epoch integer in the aspect's declared unit).
+	/// Defaults to the whole stored history when omitted.
+	#[serde(default)]
+	pub start: Option<i64>,
+	/// Inclusive window end (epoch integer in the aspect's declared unit).
+	/// Defaults to the whole stored history when omitted.
+	#[serde(default)]
+	pub end: Option<i64>,
+	/// Resolution token (`seconds`..`years`); defaults to minutes.
+	#[serde(default)]
+	pub resolution: Option<String>,
+	/// Comma-separated reductions (e.g. `min,max,sketch_p99`); defaults to `min,max,avg`.
+	#[serde(default)]
+	pub agg: Option<String>,
+}
+
+/// Reduce an aspect's **stored** segments over `[start, end]` into grid-aligned
+/// buckets, shared by this endpoint's four output formats.
+///
+/// This is the bounded-memory path: [`database::SegmentStore::downsample_range`]
+/// prunes the segment index by time and folds each surviving segment into its own
+/// mergeable `PartialReduction`, so only one segment's rows are ever resident and a
+/// range far larger than RAM still reduces — and with a `sketch_p*` reduction the
+/// per-bucket state is bounded too. An omitted bound spans the whole stored history.
+///
+/// Traced as `downsample.range` so a `RUST_LOG`/OTLP run attributes the stored
+/// reduction apart from the compute endpoints' `downsample.reduce`.
+async fn storage_downsample_inner(state: AppState, aspect: &str, params: &StorageDownsampleParams) -> Result<crate::downsample::DownsampleResponse, StorageError> {
+	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	drop(state);
+	let resolution = crate::interpolate::parse_resolution_token(params.resolution.as_deref())?;
+	let aggregations = crate::downsample::parse_aggregations(params.agg.as_deref())?;
+	// An undeclared aspect is a 404 before any read work, matching the sibling reads.
+	require_schema(&store, aspect).await?;
+	// An omitted bound means "all of stored history" — the index prune is inclusive,
+	// so the saturating bounds simply select every segment.
+	let start = params.start.unwrap_or(i64::MIN);
+	let end = params.end.unwrap_or(i64::MAX);
+	if end < start {
+		return Err(StorageError::BadRequest(format!("`end` ({end}) must not be before `start` ({start})")));
+	}
+
+	let span = tracing::info_span!("downsample.range", %aspect, start, end, resolution = ?resolution, buckets = tracing::field::Empty);
+	let result = store.downsample_range(aspect, start, end, resolution, &aggregations).instrument(span.clone()).await;
+	drop(store);
+	let buckets = result.map_err(|err| classify_read_error(&err))?;
+	let response = crate::downsample::buckets_to_response(buckets, resolution, &aggregations);
+	span.record("buckets", response.buckets);
+	Ok(response)
+}
+
+/// Handle `GET|POST /api/v1/storage/{aspect}/downsample?start&end&resolution&agg`.
+///
+/// The stored-data counterpart of `POST /api/v1/downsample`: where that endpoint
+/// reduces a series the caller supplies in the request body, this one reduces the
+/// aspect's **persisted** `.dspseg` segments in place — the surface that puts the
+/// bounded-memory cross-segment reduction (including the mergeable `sketch_p*`
+/// percentiles) in front of a client without the client first fetching the range.
+/// Registered on both verbs: it is a read (hence `GET`, as every sibling stored
+/// read) that the roadmap named as a `POST`; it takes no body either way.
+///
+/// # Errors
+///
+/// [`StorageError::Unconfigured`] when no store is attached, [`StorageError::NotFound`]
+/// for an undeclared aspect, [`StorageError::BadRequest`] for an unknown
+/// resolution/aggregation token or an inverted window, and [`StorageError::Internal`]
+/// on a read or reduction failure.
+pub async fn storage_downsample(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<StorageDownsampleParams>) -> Result<Json<crate::downsample::DownsampleResponse>, StorageError> {
+	Ok(Json(storage_downsample_inner(state, &aspect, &params).await?))
+}
+
+/// Handle `GET|POST /api/v1/storage/{aspect}/downsample.csv`: the CSV-output
+/// sibling of [`storage_downsample`], serving the identical reduction as a
+/// `timestamp,count,<agg>…` document.
+///
+/// # Errors
+///
+/// As [`storage_downsample`].
+pub async fn storage_downsample_csv(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<StorageDownsampleParams>) -> Result<Response, StorageError> {
+	let response = storage_downsample_inner(state, &aspect, &params).await?;
+	Ok(crate::downsample::downsample_response_to_csv(&response))
+}
+
+/// Handle `GET|POST /api/v1/storage/{aspect}/downsample.arrow`: the Arrow-IPC-output
+/// sibling of [`storage_downsample`], serving the identical reduction as a
+/// self-describing reduction-table batch.
+///
+/// # Errors
+///
+/// As [`storage_downsample`], plus [`StorageError::Internal`] on an Arrow-encoding
+/// failure.
+pub async fn storage_downsample_arrow(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<StorageDownsampleParams>) -> Result<Response, StorageError> {
+	let response = storage_downsample_inner(state, &aspect, &params).await?;
+	Ok(crate::downsample::downsample_response_to_arrow(&response)?)
+}
+
+/// Handle `GET|POST /api/v1/storage/{aspect}/downsample.parquet`: the Parquet-output
+/// sibling of [`storage_downsample`].
+///
+/// # Errors
+///
+/// As [`storage_downsample`], plus [`StorageError::Internal`] on a Parquet-encoding
+/// failure.
+pub async fn storage_downsample_parquet(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<StorageDownsampleParams>) -> Result<Response, StorageError> {
+	let response = storage_downsample_inner(state, &aspect, &params).await?;
+	Ok(crate::downsample::downsample_response_to_parquet(&response)?)
+}
+
 #[cfg(test)]
 mod tests {
 	use std::{str::FromStr, sync::Arc};
@@ -1739,5 +1869,198 @@ mod tests {
 		let (_dir, router) = router_with_sealed_price().await;
 		let response = router.oneshot(Request::builder().uri("/api/v1/storage/price/value-range.csv?lo=abc&hi=10").body(Body::empty()).unwrap()).await.unwrap();
 		assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+	}
+
+	/// Open a store and seal `load` (F64, seconds) as **three separate segments**, one
+	/// per minute bucket, each carrying values 1..=3 of that minute. Three seals mean
+	/// three `.dspseg` files, so a reduction over the whole span can only be right if it
+	/// actually folds across segments — which is what this endpoint exists to do.
+	async fn sealed_three_segment_load_store(dir: &TempDir) -> Arc<SegmentStore> {
+		let store = SegmentStore::open(dir.path()).await.expect("opens store");
+		store.declare("load", &AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds)).await.expect("declares aspect");
+		for minute in 0..3_i64 {
+			// Minute `m` holds samples at m*60+{0,20,40} with values m*10+{1,2,3}.
+			let ts: Vec<i64> = (0..3).map(|i| minute * 60 + i * 20).collect();
+			let vs: Vec<BigDecimal> = (0..3).map(|i| bd(&format!("{}", minute * 10 + i + 1))).collect();
+			store.seal_declared("load", &ts, &vs).await.expect("seals");
+		}
+		Arc::new(store)
+	}
+
+	async fn router_with_three_segment_load() -> (TempDir, axum::Router) {
+		let dir = TempDir::new().expect("temp dir");
+		let store = sealed_three_segment_load_store(&dir).await;
+		(dir, app_with_state(AppState::new().with_store(store)))
+	}
+
+	#[tokio::test]
+	async fn stored_downsample_reduces_across_segments() {
+		let (_dir, router) = router_with_three_segment_load().await;
+		// Each minute is its own segment AND its own bucket, so a correct answer needs
+		// every segment opened and folded — a single-segment read would lose two buckets.
+		let (status, body) = get_json(router, "/api/v1/storage/load/downsample?resolution=minutes&agg=min,max,sum").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["resolution"], "minutes");
+		assert_eq!(body["buckets"], 3, "one bucket per sealed segment: {body}");
+		assert_eq!(body["input_points"], 9);
+		let series = body["series"].as_array().unwrap();
+		// Minute 0: values 1,2,3 · minute 1: 11,12,13 · minute 2: 21,22,23.
+		assert_eq!(series[0]["timestamp"], "1970-01-01T00:00:00Z");
+		assert_eq!(series[0]["aggregations"]["min"], 1.0);
+		assert_eq!(series[0]["aggregations"]["max"], 3.0);
+		assert_eq!(series[0]["aggregations"]["sum"], 6.0);
+		assert_eq!(series[1]["aggregations"]["min"], 11.0);
+		assert_eq!(series[1]["aggregations"]["sum"], 36.0);
+		assert_eq!(series[2]["aggregations"]["max"], 23.0);
+		assert_eq!(series[2]["aggregations"]["sum"], 66.0);
+	}
+
+	#[tokio::test]
+	async fn stored_downsample_window_prunes_segments() {
+		let (_dir, router) = router_with_three_segment_load().await;
+		// The window covers only minute 1's segment; the other two must be pruned out.
+		let (status, body) = get_json(router, "/api/v1/storage/load/downsample?start=60&end=119&resolution=minutes&agg=sum").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["buckets"], 1);
+		assert_eq!(body["input_points"], 3);
+		assert_eq!(body["series"][0]["aggregations"]["sum"], 36.0);
+	}
+
+	#[tokio::test]
+	async fn stored_downsample_omitted_bounds_span_all_history() {
+		let (_dir, router) = router_with_three_segment_load().await;
+		// No start/end at all — the whole stored history reduces into one hour bucket.
+		let (status, body) = get_json(router, "/api/v1/storage/load/downsample?resolution=hours&agg=sum,first,last").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["buckets"], 1);
+		assert_eq!(body["input_points"], 9);
+		assert_eq!(body["series"][0]["aggregations"]["sum"], 108.0);
+		assert_eq!(body["series"][0]["aggregations"]["first"], 1.0);
+		assert_eq!(body["series"][0]["aggregations"]["last"], 23.0);
+	}
+
+	#[tokio::test]
+	async fn stored_downsample_defaults_to_min_max_avg_minutes() {
+		let (_dir, router) = router_with_three_segment_load().await;
+		let (status, body) = get_json(router, "/api/v1/storage/load/downsample").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["resolution"], "minutes");
+		assert_eq!(body["aggregations"], serde_json::json!(["min", "max", "avg"]));
+		assert_eq!(body["series"][0]["aggregations"]["avg"], 2.0);
+	}
+
+	#[tokio::test]
+	async fn stored_downsample_sketch_percentile_is_reachable() {
+		let (_dir, router) = router_with_three_segment_load().await;
+		// The bounded-memory mergeable reduction is the reason this surface exists: it
+		// must survive the per-segment partial-reduce + merge and stay inside its bound.
+		let (status, body) = get_json(router, "/api/v1/storage/load/downsample?resolution=hours&agg=sketch_p99,p99").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		let aggs = &body["series"][0]["aggregations"];
+		let exact = aggs["p99"].as_f64().unwrap();
+		let sketch = aggs["sketch_p99"].as_f64().unwrap();
+		assert!((exact - 23.0).abs() < 1e-9, "exact p99 of 1..=23 is 23, got {exact}");
+		// SKETCH_ALPHA is 1%, so the sketch must name the same sample within its bound.
+		assert!((sketch - exact).abs() / exact < 0.01, "sketch_p99 {sketch} must be within 1% of exact {exact}");
+	}
+
+	#[tokio::test]
+	async fn stored_downsample_post_matches_get() {
+		// The roadmap named this endpoint a POST; the stored-read family is GET. Both
+		// are registered and must answer identically (it takes no body either way).
+		let (_dir, router) = router_with_three_segment_load().await;
+		let (get_status, get_body) = get_json(router, "/api/v1/storage/load/downsample?resolution=minutes&agg=sum").await;
+		let (_dir2, router2) = router_with_three_segment_load().await;
+		let response = router2.oneshot(Request::builder().method("POST").uri("/api/v1/storage/load/downsample?resolution=minutes&agg=sum").body(Body::empty()).unwrap()).await.unwrap();
+		let post_status = response.status();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let post_body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		assert_eq!(get_status, StatusCode::OK);
+		assert_eq!(post_status, StatusCode::OK);
+		assert_eq!(get_body, post_body, "GET and POST must serve the identical reduction");
+	}
+
+	#[tokio::test]
+	async fn stored_downsample_csv_serves_bucketed_rows() {
+		let (_dir, router) = router_with_three_segment_load().await;
+		let (status, content_type, text) = get_text(router, "/api/v1/storage/load/downsample.csv?resolution=minutes&agg=min,max").await;
+		assert_eq!(status, StatusCode::OK, "body: {text}");
+		assert_eq!(content_type, "text/csv; charset=utf-8");
+		let lines: Vec<&str> = text.lines().collect();
+		assert_eq!(lines[0], "timestamp,count,min,max");
+		assert_eq!(lines[1], "1970-01-01T00:00:00+00:00,3,1,3");
+		assert_eq!(lines[3], "1970-01-01T00:02:00+00:00,3,21,23");
+		assert_eq!(lines.len(), 4);
+	}
+
+	#[tokio::test]
+	async fn stored_downsample_arrow_serves_a_reduction_table() {
+		let (_dir, router) = router_with_three_segment_load().await;
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/load/downsample.arrow?resolution=minutes&agg=min,max").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		assert_eq!(response.headers().get("content-type").unwrap(), "application/vnd.apache.arrow.stream");
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let batches = read_ipc_stream(&bytes).expect("valid arrow ipc");
+		let (unit, _ts, counts, aggs) = dsp_arrow::reduction_table_from_record_batch(&batches[0]).expect("reads back");
+		assert_eq!(unit, TimeUnit::Nanos);
+		assert_eq!(counts, vec![3, 3, 3]);
+		assert_eq!(aggs[0], ("min".to_string(), vec![1.0, 11.0, 21.0]));
+		assert_eq!(aggs[1], ("max".to_string(), vec![3.0, 13.0, 23.0]));
+	}
+
+	#[tokio::test]
+	async fn stored_downsample_parquet_serves_a_file() {
+		let (_dir, router) = router_with_three_segment_load().await;
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/load/downsample.parquet?resolution=minutes&agg=sum").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		assert_eq!(response.headers().get("content-type").unwrap(), "application/vnd.apache.parquet");
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		assert_eq!(&bytes[..4], b"PAR1");
+		let batches = dsp_arrow::read_parquet(&bytes).expect("valid parquet");
+		let (_unit, _ts, counts, aggs) = dsp_arrow::reduction_table_from_record_batch(&batches[0]).expect("reads back");
+		assert_eq!(counts, vec![3, 3, 3]);
+		assert_eq!(aggs[0], ("sum".to_string(), vec![6.0, 36.0, 66.0]));
+	}
+
+	#[tokio::test]
+	async fn stored_downsample_undeclared_aspect_is_not_found() {
+		let (_dir, router) = router_with_three_segment_load().await;
+		let (status, _body) = get_json(router, "/api/v1/storage/never_declared/downsample").await;
+		assert_eq!(status, StatusCode::NOT_FOUND);
+	}
+
+	#[tokio::test]
+	async fn stored_downsample_without_store_is_unavailable() {
+		let router = app_with_state(AppState::new());
+		let (status, _body) = get_json(router, "/api/v1/storage/load/downsample").await;
+		assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+	}
+
+	#[tokio::test]
+	async fn stored_downsample_rejects_bad_tokens_and_inverted_window() {
+		let (_dir, router) = router_with_three_segment_load().await;
+		let (status, body) = get_json(router, "/api/v1/storage/load/downsample?resolution=fortnights").await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+
+		let (_dir, router) = router_with_three_segment_load().await;
+		let (status, body) = get_json(router, "/api/v1/storage/load/downsample?agg=bogus").await;
+		assert_eq!(status, StatusCode::BAD_REQUEST);
+		assert!(body["error"].as_str().unwrap().contains("unknown aggregation"));
+
+		let (_dir, router) = router_with_three_segment_load().await;
+		let (status, body) = get_json(router, "/api/v1/storage/load/downsample?start=200&end=100").await;
+		assert_eq!(status, StatusCode::BAD_REQUEST);
+		assert!(body["error"].as_str().unwrap().contains("end"));
+	}
+
+	#[tokio::test]
+	async fn stored_downsample_empty_window_is_an_empty_series() {
+		let (_dir, router) = router_with_three_segment_load().await;
+		// A window past every sealed segment reduces to nothing — not an error.
+		let (status, body) = get_json(router, "/api/v1/storage/load/downsample?start=100000&end=200000").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["buckets"], 0);
+		assert_eq!(body["input_points"], 0);
+		assert_eq!(body["series"], serde_json::json!([]));
 	}
 }
