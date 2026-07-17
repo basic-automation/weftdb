@@ -66,3 +66,7 @@ harness = false
 name = "cache_performance_benchmarks"
 harness = false
 
+[[bench]]
+name = "downsample_range"
+harness = false
+

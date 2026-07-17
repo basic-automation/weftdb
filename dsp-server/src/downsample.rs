@@ -166,15 +166,29 @@ fn run_downsample(points: &[Point], start: DateTime<Utc>, end: DateTime<Utc>, re
 	}
 
 	let buckets = reduce(points, resolution, Some(start), Some(end), aggregations).map_err(|err| ApiError::Internal(err.to_string()))?;
+	let response = buckets_to_response(buckets, resolution, aggregations);
+
+	let span = tracing::Span::current();
+	span.record("input_points", response.input_points);
+	span.record("buckets", response.buckets);
+	Ok(Json(response))
+}
+
+/// Shape a reduced bucket set into the wire [`DownsampleResponse`].
+///
+/// The single place a `dsp-reduce` [`Bucket`](dsp_reduce::Bucket) becomes an API
+/// response: it narrows each `BigDecimal` reduction to the documented wire `f64`
+/// at the API boundary and derives the reported counts. Shared by the compute
+/// endpoints (which reduce a request-supplied series) and the stored-range
+/// endpoint (which reduces persisted segments via
+/// [`database::SegmentStore::downsample_range`]), so both envelopes are identical
+/// by construction and cannot drift.
+pub(crate) fn buckets_to_response(buckets: Vec<dsp_reduce::Bucket>, resolution: Resolution, aggregations: &[Aggregation]) -> DownsampleResponse {
 	// Every in-window point lands in exactly one bucket, so the bucket counts sum to
 	// the in-window point total the response reports.
 	let input_points: usize = buckets.iter().map(|b| b.count).sum();
 	let series: Vec<DownsampleBucket> = buckets.into_iter().map(|b| DownsampleBucket { timestamp: b.timestamp, count: b.count, aggregations: b.values.into_iter().map(|(name, value)| (name, value.to_f64().unwrap_or_default())).collect() }).collect();
-
-	let span = tracing::Span::current();
-	span.record("input_points", input_points);
-	span.record("buckets", series.len());
-	Ok(Json(DownsampleResponse { resolution: resolution.to_string(), aggregations: aggregations.iter().map(|a| a.as_str().to_string()).collect(), input_points, buckets: series.len(), series }))
+	DownsampleResponse { resolution: resolution.to_string(), aggregations: aggregations.iter().map(|a| a.as_str().to_string()).collect(), input_points, buckets: series.len(), series }
 }
 
 /// Render a [`DownsampleResponse`] as a `timestamp,count,<agg>…` CSV document.
@@ -187,7 +201,7 @@ fn run_downsample(points: &[Point], start: DateTime<Utc>, end: DateTime<Utc>, re
 /// the JSON), and an emitted bucket always carries every requested reduction, so
 /// no value cell is ever blank. None of the columns can contain a comma, so no
 /// field escaping is required.
-fn downsample_response_to_csv(response: &DownsampleResponse) -> Response {
+pub(crate) fn downsample_response_to_csv(response: &DownsampleResponse) -> Response {
 	use std::fmt::Write as _;
 	let mut out = String::from("timestamp,count");
 	for agg in &response.aggregations {
@@ -244,7 +258,7 @@ fn response_columns(response: &DownsampleResponse) -> (Vec<i64>, Vec<i64>, Vec<V
 /// # Errors
 ///
 /// Returns [`ApiError::Internal`] if the Arrow encoding fails.
-fn downsample_response_to_arrow(response: &DownsampleResponse) -> Result<Response, ApiError> {
+pub(crate) fn downsample_response_to_arrow(response: &DownsampleResponse) -> Result<Response, ApiError> {
 	let (timestamps, counts, agg_columns) = response_columns(response);
 	let names: Vec<&str> = response.aggregations.iter().map(String::as_str).collect();
 	let bytes = dsp_arrow::reduction_table_to_ipc_bytes(dsp_physical_type::TimeUnit::Nanos, &timestamps, &counts, &names, &agg_columns).map_err(|err| ApiError::Internal(err.to_string()))?;
@@ -258,7 +272,7 @@ fn downsample_response_to_arrow(response: &DownsampleResponse) -> Result<Respons
 /// # Errors
 ///
 /// Returns [`ApiError::Internal`] if the Parquet encoding fails.
-fn downsample_response_to_parquet(response: &DownsampleResponse) -> Result<Response, ApiError> {
+pub(crate) fn downsample_response_to_parquet(response: &DownsampleResponse) -> Result<Response, ApiError> {
 	let (timestamps, counts, agg_columns) = response_columns(response);
 	let names: Vec<&str> = response.aggregations.iter().map(String::as_str).collect();
 	let bytes = dsp_arrow::reduction_table_to_parquet_bytes(dsp_physical_type::TimeUnit::Nanos, &timestamps, &counts, &names, &agg_columns).map_err(|err| ApiError::Internal(err.to_string()))?;
@@ -457,7 +471,7 @@ fn downsample_ilp_inner(params: &DownsampleIlpParams, body: &str) -> Result<Json
 }
 
 /// Parse a comma-separated aggregation list (default `[min, max, avg]`).
-fn parse_aggregations(token: Option<&str>) -> Result<Vec<Aggregation>, ApiError> {
+pub(crate) fn parse_aggregations(token: Option<&str>) -> Result<Vec<Aggregation>, ApiError> {
 	let Some(token) = token.map(str::trim).filter(|t| !t.is_empty()) else {
 		return Ok(DEFAULT_AGGREGATIONS.to_vec());
 	};
