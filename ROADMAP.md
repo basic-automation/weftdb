@@ -883,17 +883,59 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   reduces; with a `sketch_p*` the per-bucket state is bounded too. Epochs lift through the catalog's
   declared `TimeUnit`. Proven equal to a single pass over the whole series across 8 segments with
   boundary-straddling buckets (9 reductions incl. `sketch_p99`), plus windowed/empty/undeclared cases.
-- [ ] **NEXT — expose the cross-segment downsample at the API:**
-  `POST /api/v1/storage/{aspect}/downsample?start=&end=&resolution=&agg=` over
-  `SegmentStore::downsample_range`, with the same columnar output options as the compute endpoints
-  (JSON/CSV/Arrow/Parquet) and a `downsample.range` stage span. The store primitive and its equality
-  test exist; this is the surface that finally puts the bounded-memory `sketch_p*` p99 in front of a
-  user on stored data.
-- [ ] **NEXT — parallelize `downsample_range` across segments:** it folds segments *sequentially*
-  today (correct, and already bounded-memory). `dsp-bench --ds-parallel` measured **14.7×** for the
-  same chunked-partial shape, so reducing the pruned segments concurrently (rayon or `join_all` over
-  the per-segment reduce) should carry most of that to stored data. Measure, don't assume — the
-  per-segment file read may dominate.
+- [x] **DONE (2026-07-17) — the cross-segment downsample is exposed at the API.**
+  `GET|POST /api/v1/storage/{aspect}/downsample?start=&end=&resolution=&agg=` over
+  `SegmentStore::downsample_range`, with the compute endpoints' full output set
+  (`downsample`/`.csv`/`.arrow`/`.parquet`) and a `downsample.range` stage span nesting under the
+  request root span. Registered on **both verbs** — it is a read (hence GET, as every sibling stored
+  read) that this roadmap named a POST; it takes no body either way and a test asserts the two answer
+  identically. Omitted bounds span all stored history; inverted window / unknown token / undeclared
+  aspect / unconfigured store are 400/400/404/503. The compute and stored paths were **deduplicated
+  onto one envelope** (`buckets_to_response`), so they cannot drift. Runtime-verified against the
+  live binary over three separately-sealed segments (`segment_count=3`): minute buckets sum
+  6/36/66, the hour bucket folds all nine (sum=108, first=1, last=23), `sketch_p99`=22.875 vs exact
+  23.0 (0.54%, inside the 1% bound), and PAR1/Arrow content types confirmed. This is the surface
+  that finally puts the bounded-memory `sketch_p*` p99 in front of a user on stored data.
+- [x] **DONE (2026-07-17) — `downsample_range` reduces its segments concurrently — measured 4.7×.**
+  Each pruned segment's async read + CPU decode/reduce (`segment_partial`) now runs concurrently
+  (`try_join_all`, CPU half on the blocking pool, deterministic descriptor-order merge). Measured
+  (`database/benches/downsample_range.rs`, release, 16-core, 200k rows fixed, serial baseline taken
+  by stashing the change and re-running the identical bench): **4 segments 31.57→10.60 ms (2.98×) ·
+  16 segments 39.88→8.50 ms (4.69×) · 64 segments 61.32→20.16 ms (3.04×)**; `sketch_p99` at 16
+  segments 49.49→9.42 ms (**5.25×**), exact `p99` 49.29→17.51 ms (2.81×). **The roadmap's own caveat
+  was right**: the win does NOT reach `--ds-parallel`'s 14.7× — the per-segment file read is real, so
+  stored data carries roughly a third of the in-memory chunked-partial figure.
+  **A single segment keeps an inline fast path**: the first A/B measured the concurrent version
+  **1.7× SLOWER** on a one-segment corpus (35.7 vs 21.0 ms) — the `spawn_blocking` hand-off bought
+  nothing with no second segment to overlap. One segment is a common shape (a young aspect, a tight
+  window), so it now runs the serial path by construction and cannot regress.
+  *(Caveat recorded honestly: run-to-run variance on this box is ~30%, so no claim rests on the
+  single-segment numbers — only the multi-segment speedups, which sit far outside that band.)*
+- [ ] **NEXT (highest-value follow-on) — materialize per-segment partials at seal time: DSP already
+  owns the primitive that TimescaleDB's continuous aggregates are built on.** This run's research
+  found the two leading engines converging on one design DSP is one step from: TimescaleDB's
+  continuous aggregates **store partial aggregates and finalize them at query time**, keep a
+  **materialization watermark** (pre-computed below it, on-the-fly above it, combined transparently),
+  and refresh **only the affected time buckets** — "historical data that hasn't changed is never
+  touched"; QuestDB gives the same advice for its `SAMPLE BY` ("consider using materialized views to
+  pre-compute aggregates… especially for complex sampling operations on large datasets").
+  **DSP's `PartialReduction` (mergeable, exact for every reduction) IS that partial** — today it is
+  computed fresh on every `downsample_range` call and thrown away. Persisting a segment's partial
+  beside its `.dspseg` at seal time (a sealed segment is immutable, so its partial can never go
+  stale — DSP gets the invariant Timescale needs a refresh policy to maintain) would turn a stored
+  downsample from decode-every-segment into merge-N-partials, i.e. the fixed-resolution case stops
+  reading the value column at all. Slice it as: (1) a per-segment partial sidecar at a declared base
+  resolution, (2) `downsample_range` merging sidecars where the requested resolution is a multiple of
+  the base and falling back to a decode otherwise, (3) the hot-tail/watermark split for unsealed data.
+  Benchmark against this run's 8.50 ms/16-segment baseline. *(src: partials stored + finalized at
+  query time, watermark, only-changed-buckets refresh —
+  https://www.tigerdata.com/learn/continuous-aggregates-timescaledb · pre-compute aggregates for
+  SAMPLE BY — https://questdb.com/docs/query/sql/sample-by/)*
+- [ ] **NEXT — per-segment overhead dominates past ~16 segments:** at a fixed 200k rows, 64 segments
+  is *slower* than 16 in **both** the serial (61.3 vs 39.9 ms) and concurrent (20.2 vs 8.5 ms)
+  versions — the per-segment file read + index + partial-merge cost outgrows the shrinking per-segment
+  reduce. Worth finding where the knee is against real segment sizes, and whether it argues for a
+  compaction/target-segment-size policy (DSP already has `squash_aspect`). Measure before tuning.
 - [x] **DONE (2026-07-16) — linear (trapezoidal) TWA method beside the shipped LOCF weighting:**
   `Aggregation::TwaLinear` (token `twa_linear`, alias `time_weighted_avg_linear`) computing
   `Σ½(vᵢ+vᵢ₊₁)Δtᵢ / ΣΔtᵢ`; `time_weighted_average` is generalized over a private
