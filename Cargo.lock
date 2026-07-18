@@ -1338,6 +1338,7 @@ name = "dsp-reduce"
 version = "0.1.0"
 dependencies = [
  "bigdecimal",
+ "bincode",
  "chrono",
  "serde",
  "splimes",

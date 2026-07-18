@@ -31,6 +31,7 @@
 use std::collections::BTreeMap;
 
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
+use serde::{Deserialize, Serialize};
 
 /// Why a sketch could not be built or fed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -56,7 +57,12 @@ pub enum SketchError {
 /// Feed values with [`add`](Self::add), combine with [`merge`](Self::merge), read with
 /// [`quantile`](Self::quantile). Memory is bounded by the number of distinct occupied
 /// buckets (logarithmic in the value range), not by the sample count.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Serde-serializable so a merged sketch can be persisted (e.g. inside a per-segment
+/// [`PartialReduction`](crate::PartialReduction) sidecar) and reloaded exactly. The cached
+/// `gamma`/`log_gamma` are stored rather than recomputed, so a round-trip reproduces the
+/// mapping bit-for-bit and a deserialized sketch merges with a freshly built one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DdSketch {
 	/// Relative accuracy `α` — the guaranteed relative error bound on every quantile.
 	alpha: f64,
