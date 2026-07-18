@@ -598,6 +598,40 @@ impl SegmentStore {
 		Ok(sidecar.matches(descriptor).then_some(sidecar))
 	}
 
+	/// Delete the partial sidecar for `aspect`/`id`, if one exists. Best-effort by intent —
+	/// a missing sidecar is success, since the caller's aim is only that no stale/orphaned
+	/// `.dspart` is left behind.
+	///
+	/// # Errors
+	///
+	/// Propagates a filesystem error other than "not found".
+	async fn remove_sidecar(&self, aspect: &str, id: u64) -> Result<()> {
+		let path = self.sidecar_path(aspect, id);
+		match tokio::fs::remove_file(&path).await {
+			Ok(()) => Ok(()),
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+			Err(e) => Err(anyhow::Error::new(e).context(format!("removing partial sidecar {}", path.display()))),
+		}
+	}
+
+	/// Keep the partial sidecar consistent with a segment whose bytes were just **rewritten
+	/// in place** (a reconcile sort, a split re-seal): regenerate it from the new rows when
+	/// the policy still wants one (restoring the read acceleration the rewrite would
+	/// otherwise have stranded — the old sidecar's staleness stamp no longer matches), or
+	/// drop any now-stale sidecar when it does not. Purely an accelerator, so a maintenance
+	/// error is logged, never propagated — the reconcile itself must not fail on it.
+	async fn refresh_sidecar_after_rewrite(&self, aspect: &str, descriptor: &SegmentDescriptor, timestamps: Vec<i64>, values: Vec<Option<BigDecimal>>) {
+		let result = if self.partials.base_for(descriptor.row_count).is_some() {
+			// Overwrites any stale sidecar at this id with one matching the new bytes.
+			self.write_partial_sidecar(aspect, descriptor, timestamps, values).await
+		} else {
+			self.remove_sidecar(aspect, descriptor.id).await
+		};
+		if let Err(e) = result {
+			tracing::warn!(aspect, id = descriptor.id, error = %e, "failed to refresh partial sidecar after a segment rewrite; downsample will fall back to a full decode");
+		}
+	}
+
 	/// Read every row of `aspect` whose timestamp falls in the inclusive range
 	/// `[start, end]`, **opening only the segment files that overlap it**.
 	///
@@ -869,6 +903,9 @@ impl SegmentStore {
 			SegmentDescriptor::of_segment(id, path.to_string_lossy().into_owned(), new_bytes.len() as u64, &segment)
 		};
 		self.index.insert(aspect, &new_descriptor).await?;
+		// The rewrite changed the segment's bytes, staling any sidecar — regenerate it from
+		// the reconciled rows (or drop it if the policy no longer wants one).
+		self.refresh_sidecar_after_rewrite(aspect, &new_descriptor, sorted_ts, sorted_vs).await;
 		// A reconcile replaces a segment rather than adding one, so the O(1) fold would
 		// double-count — recompute the rollup from the durable index instead.
 		self.rebuild_aspect_metadata(aspect).await?;
@@ -898,6 +935,8 @@ impl SegmentStore {
 			SegmentDescriptor::of_segment(id, path.to_string_lossy().into_owned(), new_bytes.len() as u64, &segment)
 		};
 		self.index.insert(aspect, &descriptor).await?;
+		// Keep the sidecar consistent with the freshly written bytes at this id.
+		self.refresh_sidecar_after_rewrite(aspect, &descriptor, timestamps.to_vec(), values.to_vec()).await;
 		Ok(descriptor)
 	}
 
@@ -1295,11 +1334,13 @@ impl SegmentStore {
 				// Full rewrite: the whole merged component into the lowest id.
 				self.reseal_nullable_at(aspect, &schema, target, &all_ts, &all_vs, None).await?;
 			}
-			// Drop the other members: control-plane row then the file.
+			// Drop the other members: control-plane row then the file (and its sidecar).
 			for &id in component.iter().skip(1) {
 				self.index.delete(aspect, id).await?;
 				let victim = self.segment_path(aspect, id);
 				tokio::fs::remove_file(&victim).await.with_context(|| format!("removing merged-away segment {}", victim.display()))?;
+				// A merged-away segment's sidecar is now orphaned — drop it too.
+				self.remove_sidecar(aspect, id).await?;
 			}
 			// Net segment reduction: a full rewrite keeps 1, a split keeps 2 (so a
 			// two-member split reduces the count by zero while still changing the set).
@@ -1418,6 +1459,8 @@ impl SegmentStore {
 			self.index.delete(aspect, id).await?;
 			let victim = self.segment_path(aspect, id);
 			tokio::fs::remove_file(&victim).await.with_context(|| format!("removing squashed-away segment {}", victim.display()))?;
+			// The squashed-away segment's sidecar is now orphaned — drop it too.
+			self.remove_sidecar(aspect, id).await?;
 		}
 		self.rebuild_aspect_metadata(aspect).await?;
 		Ok(ids.len() - 1)
@@ -2109,6 +2152,41 @@ mod tests {
 		assert_eq!(vs, vec![Some(bd("1")), Some(bd("2")), Some(bd("3")), Some(bd("4"))]);
 		assert_eq!(still, Some(bd("2")));
 		assert!(!again, "a sorted segment reconciles to a no-op");
+	}
+
+	/// Reconciling a segment rewrites its bytes, which would strand a sidecar built from the
+	/// old bytes (its staleness stamp no longer matches). The rewrite must **regenerate** the
+	/// sidecar so the read acceleration survives — proven by deleting the reconciled frame and
+	/// showing a downsample still serves from the sidecar.
+	#[tokio::test]
+	async fn reconcile_regenerates_the_partial_sidecar() {
+		use dsp_reduce::{reduce, Aggregation};
+		use splimes::{Point, Resolution};
+
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens").with_partial_sidecar_policy(PartialSidecarPolicy::at(Resolution::Hours, 1));
+		store.declare("a", &schema()).await.expect("declares");
+		// Out-of-order rows across two hour buckets (schema is SECONDS): hour 0 = [0,3600),
+		// hour 1 = [3600,7200). Scrambled so reconcile actually rewrites (and re-codecs) it.
+		let ts = vec![3720_i64, 0, 3600, 120, 60, 3660];
+		let vs = vec![bd("6"), bd("1"), bd("4"), bd("3"), bd("2"), bd("5")];
+		let all: Vec<Point> = ts.iter().zip(&vs).map(|(t, v)| Point::new(DateTime::<Utc>::from_timestamp(*t, 0).expect("instant"), v.clone())).collect();
+		let desc = store.seal("a", &schema(), &ts, &vs).await.expect("seals out-of-order");
+		assert!(store.load_partial_sidecar("a", &desc).await.expect("reads").is_some(), "a sidecar is written at seal");
+
+		// Reconcile rewrites the segment sorted at the same id → new bytes → the old sidecar
+		// stamp is stale, so the reconcile must regenerate it.
+		assert!(store.reconcile_segment("a", desc.id).await.expect("reconciles"), "the out-of-order segment is rewritten");
+		let new_desc = store.index().all("a").await.expect("index").into_iter().find(|d| d.id == desc.id).expect("segment still present");
+		assert!(store.load_partial_sidecar("a", &new_desc).await.expect("reads").is_some_and(|s| s.matches(&new_desc)), "the sidecar was regenerated to match the reconciled bytes");
+
+		// The decisive proof: delete the reconciled frame; a downsample must still succeed,
+		// which is only possible if the regenerated sidecar's stamp matches (a stale one
+		// would be rejected, forcing a decode of the now-missing frame).
+		let aggs = [Aggregation::Min, Aggregation::Max, Aggregation::Sum, Aggregation::First, Aggregation::Last];
+		std::fs::remove_file(&new_desc.path).expect("removes the reconciled frame");
+		let served = store.downsample_range("a", i64::MIN, i64::MAX, Resolution::Hours, &aggs).await.expect("serves from the regenerated sidecar");
+		assert_eq!(served, reduce(&all, Resolution::Hours, None, None, &aggs).expect("reduces"), "the regenerated sidecar reproduces the downsample with no frame on disk");
 	}
 
 	#[tokio::test]
