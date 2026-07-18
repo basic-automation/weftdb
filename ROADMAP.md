@@ -911,26 +911,47 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   window), so it now runs the serial path by construction and cannot regress.
   *(Caveat recorded honestly: run-to-run variance on this box is ~30%, so no claim rests on the
   single-segment numbers — only the multi-segment speedups, which sit far outside that band.)*
-- [ ] **NEXT (highest-value follow-on) — materialize per-segment partials at seal time: DSP already
-  owns the primitive that TimescaleDB's continuous aggregates are built on.** This run's research
-  found the two leading engines converging on one design DSP is one step from: TimescaleDB's
-  continuous aggregates **store partial aggregates and finalize them at query time**, keep a
-  **materialization watermark** (pre-computed below it, on-the-fly above it, combined transparently),
-  and refresh **only the affected time buckets** — "historical data that hasn't changed is never
-  touched"; QuestDB gives the same advice for its `SAMPLE BY` ("consider using materialized views to
-  pre-compute aggregates… especially for complex sampling operations on large datasets").
-  **DSP's `PartialReduction` (mergeable, exact for every reduction) IS that partial** — today it is
-  computed fresh on every `downsample_range` call and thrown away. Persisting a segment's partial
-  beside its `.dspseg` at seal time (a sealed segment is immutable, so its partial can never go
-  stale — DSP gets the invariant Timescale needs a refresh policy to maintain) would turn a stored
-  downsample from decode-every-segment into merge-N-partials, i.e. the fixed-resolution case stops
-  reading the value column at all. Slice it as: (1) a per-segment partial sidecar at a declared base
-  resolution, (2) `downsample_range` merging sidecars where the requested resolution is a multiple of
-  the base and falling back to a decode otherwise, (3) the hot-tail/watermark split for unsealed data.
-  Benchmark against this run's 8.50 ms/16-segment baseline. *(src: partials stored + finalized at
-  query time, watermark, only-changed-buckets refresh —
-  https://www.tigerdata.com/learn/continuous-aggregates-timescaledb · pre-compute aggregates for
-  SAMPLE BY — https://questdb.com/docs/query/sql/sample-by/)*
+- [x] **DONE (2026-07-18) — materialize per-segment partials at seal time (the highest-value
+  downsample follow-on): shipped.** DSP's `PartialReduction` (mergeable, exact for every reduction) IS
+  the partial TimescaleDB's continuous aggregates / ClickHouse's `AggregatingMergeTree` store and
+  finalize at query time — and a sealed segment is immutable, so its partial can never go stale (the
+  invariant Timescale needs a refresh policy to maintain, DSP gets for free). Shipped across the arc:
+  - [x] **(1) per-segment `.dspart` sidecar at a declared base resolution** — `dsp-reduce`'s
+    `PartialReduction`/`DdSketch` are serde-serializable; `database`'s `PartialSidecar` frame
+    (magic-prefixed bincode, staleness stamp = segment `(row_count, byte_len)`), `PartialSidecarPolicy`
+    (off by default; `DSP_SEGMENT_PARTIAL_BASE`/`DSP_SEGMENT_PARTIAL_MIN_ROWS`), written at seal for the
+    ten bounded reductions (`Aggregation::is_sidecar_materializable`).
+  - [x] **(2) `downsample_range` merges sidecars in place of a decode** when every requested reduction
+    is materializable, the window covers the segment, and the base serves the resolution — **measured
+    3.2× vs decode** (8.39 ms → 2.60 ms, 16 seg / 200k rows, min/max/avg/sum/first/last + sketch_p99;
+    `database/benches/downsample_range.rs`), proven to skip the value column by deleting every `.dspseg`
+    and re-running the downsample unchanged.
+  - [x] **re-bucketing a fine base to a coarser resolution** — `PartialReduction::rebucket` +
+    `grids_nest` re-key a fine-base partial (e.g. MINUTES) to any coarser nesting resolution
+    (HOURS/DAYS) with no decode, the in-query form of TimescaleDB's hierarchical continuous aggregates.
+  - [x] **sidecar consistency across rewrites** — a reconcile/split/squash regenerates or removes the
+    sidecar so acceleration survives (and no `.dspart` is orphaned).
+- [ ] **NEXT — (3) hot-tail / watermark split for unsealed data + materialized tiers.** Two residues,
+  both grounded in this run's research: (a) a **materialization watermark** (partials for sealed
+  segments below it, on-the-fly reduce for the hot tail above it, combined transparently — Timescale's
+  "historical data that hasn't changed is never touched"); (b) a **hierarchy of materialized tiers**
+  (MINUTE partial → HOUR partial → DAY partial, each built from the tier below, not the raw column) so
+  a very coarse query rolls up from a coarse tier rather than re-keying the finest base every time —
+  the pattern TimescaleDB (continuous aggregates on continuous aggregates) and ClickHouse
+  (`raw→hourly→daily→monthly` via `-State`/`-Merge` combinators, quantile digests stored as states,
+  validating DSP's `sketch_p*`-in-sidecar) both converge on. Benchmark a coarse (DAY) query against
+  the shipped single-base re-key. *(src: hierarchical continuous aggregates —
+  https://docs.tigerdata.com/use-timescale/latest/continuous-aggregates/hierarchical-continuous-aggregates/
+  · ClickHouse AggregatingMergeTree `-State`/`-Merge` + rollup —
+  https://clickhouse.com/docs/engines/table-engines/mergetree-family/aggregatingmergetree ·
+  QuestDB incremental materialized-view refresh (only new data written) —
+  https://questdb.com/docs/concepts/materialized-views/)*
+- [ ] **NEXT — materialize the sidecar at a coarser DEFAULT + adopt sketches:** the sidecar is off by
+  default (opt-in via `DSP_SEGMENT_PARTIAL_BASE`). Decide a sensible default base per the shape mix (a
+  finer base serves more resolutions but costs more `.dspart` bytes and seal CPU for the sketch), and
+  measure the seal-time cost of building the four `sketch_p*` sketches per segment vs the read win —
+  the sidecar's size/CPU is the trade to quantify before flipping any default. Owner-gated like the
+  other default flips.
 - [ ] **NEXT — per-segment overhead dominates past ~16 segments:** at a fixed 200k rows, 64 segments
   is *slower* than 16 in **both** the serial (61.3 vs 39.9 ms) and concurrent (20.2 vs 8.5 ms)
   versions — the per-segment file read + index + partial-merge cost outgrows the shrinking per-segment
