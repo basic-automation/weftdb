@@ -21,7 +21,7 @@ use std::hint::black_box;
 
 use bigdecimal::BigDecimal;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use database::SegmentStore;
+use database::{PartialSidecarPolicy, SegmentStore};
 use dsp_physical_type::{AspectSchema, PhysicalType, TimeUnit};
 use dsp_reduce::Aggregation;
 use splimes::Resolution;
@@ -40,7 +40,16 @@ const STRIDE_SECS: i64 = 1;
 /// corpus is identical for every `segments` value — same timestamps, same values —
 /// so a sweep isolates the segment split, not the data.
 async fn sealed_store(dir: &TempDir, segments: i64) -> SegmentStore {
-	let store = SegmentStore::open(dir.path()).await.expect("opens store");
+	sealed_store_with_policy(dir, segments, None).await
+}
+
+/// As [`sealed_store`], but seal under an optional partial-sidecar `policy` — so a bench
+/// can compare a store that materializes per-segment partials against one that does not.
+async fn sealed_store_with_policy(dir: &TempDir, segments: i64, policy: Option<PartialSidecarPolicy>) -> SegmentStore {
+	let mut store = SegmentStore::open(dir.path()).await.expect("opens store");
+	if let Some(policy) = policy {
+		store = store.with_partial_sidecar_policy(policy);
+	}
 	let schema = AspectSchema::new(PhysicalType::F64, BigDecimal::from(0), TimeUnit::Seconds);
 	store.declare("load", &schema).await.expect("declares aspect");
 	let per_segment = TOTAL_ROWS / segments;
@@ -105,5 +114,34 @@ fn bench_percentiles(c: &mut Criterion) {
 	group.finish();
 }
 
-criterion_group!(benches, bench_segment_count, bench_percentiles);
+/// The payoff of the per-segment partial **sidecar**: a full-history downsample of
+/// materializable reductions at the sidecar's base resolution merges the stored partials
+/// instead of decoding every value column. Two identical 16-segment corpora — one sealed
+/// with an HOUR-base sidecar policy, one without — are downsampled at hour resolution over
+/// all history, so the `sidecar` arm never opens a value column (just reads + merges the
+/// small `.dspart` partials) while the `decode` arm is the shipped read-decode-reduce path.
+/// The reduction set is materializable (the six streaming reductions + `sketch_p99`), which
+/// is the precondition for the sidecar substitution.
+fn bench_sidecar_vs_decode(c: &mut Criterion) {
+	let rt = Runtime::new().expect("tokio runtime");
+	let aggs = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::SketchP99];
+
+	let mut group = c.benchmark_group("downsample_range/sidecar");
+	group.sample_size(10);
+	for (label, policy) in [("decode", None), ("sidecar", Some(PartialSidecarPolicy::at(Resolution::Hours, 1)))] {
+		let dir = TempDir::new().expect("temp dir");
+		let store = rt.block_on(sealed_store_with_policy(&dir, 16, policy));
+		group.bench_function(label, |b| {
+			b.iter(|| {
+				let buckets = rt.block_on(store.downsample_range("load", i64::MIN, i64::MAX, Resolution::Hours, &aggs)).expect("downsamples");
+				black_box(buckets)
+			});
+		});
+		drop(store);
+		drop(dir);
+	}
+	group.finish();
+}
+
+criterion_group!(benches, bench_segment_count, bench_percentiles, bench_sidecar_vs_decode);
 criterion_main!(benches);
