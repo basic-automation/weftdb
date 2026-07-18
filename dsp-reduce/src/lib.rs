@@ -279,7 +279,7 @@ pub enum ReduceError {
 /// caller reduces with only the streaming reductions, leaving `samples` empty and the
 /// per-bucket state constant-sized — the exact-percentile/TWA path is what fills
 /// `samples`, so persisting those is unbounded by design.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct BucketAcc {
 	count: usize,
 	sum: BigDecimal,
@@ -532,7 +532,7 @@ pub fn reduce(points: &[Point], resolution: Resolution, start: Option<DateTime<U
 /// including the [`DdSketch`]), so a deserialized partial merges with a freshly built one
 /// to the same result a single pass would produce — verified by
 /// [`serde_round_trip_preserves_merge_exactness`](tests).
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartialReduction {
 	buckets: BTreeMap<i64, BucketAcc>,
 }

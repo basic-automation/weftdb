@@ -36,7 +36,7 @@ use dsp_physical_type::{merge_newer_wins, split_index, AspectSchema, PagedSegmen
 use dsp_reduce::{Aggregation, Bucket, PartialReduction};
 use splimes::{Point, Resolution};
 
-use crate::{AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, SegmentIndexStore};
+use crate::{AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, PartialSidecar, PartialSidecarPolicy, SegmentIndexStore, SIDECAR_AGGREGATIONS};
 
 /// The `(database, subject)` namespace a [`SegmentStore`] opened with the plain
 /// [`open`](SegmentStore::open) constructor declares its aspect schemas under.
@@ -181,6 +181,9 @@ pub struct SegmentStore {
 	catalog: AspectCatalog,
 	/// Whether new seals carry a timestamp checkpoint index (off unless configured).
 	checkpoints: CheckpointPolicy,
+	/// Whether new seals materialize a per-segment partial-reduction sidecar (off unless
+	/// configured). See [`PartialSidecar`].
+	partials: PartialSidecarPolicy,
 	/// The libSQL DB/subject registry (`root/catalog.db`) — the hierarchy above the
 	/// aspect schemas. The store registers its own `(database, subject)` here on open,
 	/// so the control plane can enumerate what a root holds.
@@ -238,7 +241,8 @@ impl SegmentStore {
 		registry.register_database(database).await?;
 		registry.register_subject(database, subject).await?;
 		let checkpoints = CheckpointPolicy::from_env();
-		Ok(Self { root, index, metadata, catalog, registry, database: database.to_string(), subject: subject.to_string(), checkpoints })
+		let partials = PartialSidecarPolicy::from_env();
+		Ok(Self { root, index, metadata, catalog, registry, database: database.to_string(), subject: subject.to_string(), checkpoints, partials })
 	}
 
 	/// Override this store's [`CheckpointPolicy`] (the env-read default is
@@ -254,6 +258,21 @@ impl SegmentStore {
 	#[must_use]
 	pub const fn checkpoint_policy(&self) -> CheckpointPolicy {
 		self.checkpoints
+	}
+
+	/// Override this store's [`PartialSidecarPolicy`] (the env-read default is
+	/// [`PartialSidecarPolicy::DISABLED`]), for a caller that wants per-segment partial
+	/// sidecars without setting an environment variable.
+	#[must_use]
+	pub const fn with_partial_sidecar_policy(mut self, policy: PartialSidecarPolicy) -> Self {
+		self.partials = policy;
+		self
+	}
+
+	/// The partial-sidecar policy new seals are written under.
+	#[must_use]
+	pub const fn partial_sidecar_policy(&self) -> PartialSidecarPolicy {
+		self.partials
 	}
 
 	/// The control-plane index backing this store, for pruning/accounting queries
@@ -452,6 +471,14 @@ impl SegmentStore {
 		let descriptor = SegmentDescriptor::of_segment(id, path.to_string_lossy().into_owned(), bytes.len() as u64, segment);
 		self.index.insert(aspect, &descriptor).await?;
 		self.metadata.record_seal(aspect, &descriptor).await?;
+		// Per-segment partial sidecar (opt-in) — a pure read accelerator, so decode only
+		// when the policy actually wants one, and never fail the seal on a sidecar error.
+		if self.partials.base_for(segment.stats.row_count).is_some() {
+			let (ts, vs) = segment.decode_nullable();
+			if let Err(e) = self.write_partial_sidecar(aspect, &descriptor, ts, vs).await {
+				tracing::warn!(aspect, id = descriptor.id, error = %e, "failed to write partial sidecar; downsample will fall back to a full decode");
+			}
+		}
 		Ok(descriptor)
 	}
 
@@ -470,12 +497,76 @@ impl SegmentStore {
 		let descriptor = SegmentDescriptor::of_paged_segment(id, path.to_string_lossy().into_owned(), bytes.len() as u64, segment);
 		self.index.insert(aspect, &descriptor).await?;
 		self.metadata.record_seal(aspect, &descriptor).await?;
+		// As `persist`: opt-in per-segment partial sidecar, never failing the seal.
+		if self.partials.base_for(segment.stats.row_count).is_some() {
+			let (ts, vs) = segment.decode_nullable();
+			if let Err(e) = self.write_partial_sidecar(aspect, &descriptor, ts, vs).await {
+				tracing::warn!(aspect, id = descriptor.id, error = %e, "failed to write partial sidecar; downsample will fall back to a full decode");
+			}
+		}
 		Ok(descriptor)
 	}
 
 	/// The on-disk path a freshly sealed segment of the given `aspect`/`id` takes.
 	fn segment_path(&self, aspect: &str, id: u64) -> PathBuf {
 		self.root.join("segments").join(format!("{aspect}-{id}.dspseg"))
+	}
+
+	/// The on-disk path of the partial-reduction sidecar beside an `aspect`/`id` segment
+	/// (`{aspect}-{id}.dspart`, alongside the `.dspseg`).
+	fn sidecar_path(&self, aspect: &str, id: u64) -> PathBuf {
+		self.root.join("segments").join(format!("{aspect}-{id}.dspart"))
+	}
+
+	/// Materialize a per-segment partial-reduction sidecar for a just-sealed segment, when
+	/// the [`PartialSidecarPolicy`] calls for one. Decodes the segment's rows, folds the
+	/// present ones into a [`PartialReduction`] at `base` over [`SIDECAR_AGGREGATIONS`], and
+	/// writes the `.dspart` frame beside the `.dspseg`. A no-op (returns `Ok(())`) when the
+	/// policy is disabled/too-small, the segment has no declared time unit, or it holds no
+	/// present rows.
+	///
+	/// A sidecar is a *pure acceleration*: a failure to write one must never fail the seal,
+	/// so the persist paths call this and log-and-ignore any error rather than propagating.
+	async fn write_partial_sidecar(&self, aspect: &str, descriptor: &SegmentDescriptor, timestamps: Vec<i64>, values: Vec<Option<BigDecimal>>) -> Result<()> {
+		let Some(base) = self.partials.base_for(descriptor.row_count) else { return Ok(()) };
+		let Some(unit) = descriptor.time_unit else { return Ok(()) };
+		let mut points: Vec<Point> = Vec::with_capacity(timestamps.len());
+		for (t, v) in timestamps.into_iter().zip(values) {
+			if let Some(value) = v {
+				points.push(Point::new(instant_from_epoch(t, unit).ok_or_else(|| anyhow::anyhow!("segment {} holds epoch {t} outside the representable instant range", descriptor.path))?, value));
+			}
+		}
+		if points.is_empty() {
+			return Ok(());
+		}
+		let partial = dsp_reduce::reduce_partial(&points, base, None, None, &SIDECAR_AGGREGATIONS).map_err(|e| anyhow::anyhow!("reducing segment {} for its partial sidecar: {e}", descriptor.path))?;
+		let sidecar = PartialSidecar::new(base, descriptor, partial);
+		let bytes = sidecar.to_bytes()?;
+		let path = self.sidecar_path(aspect, descriptor.id);
+		tokio::fs::write(&path, &bytes).await.with_context(|| format!("writing partial sidecar {}", path.display()))?;
+		Ok(())
+	}
+
+	/// Load the partial-reduction sidecar for `descriptor`'s segment, or [`None`] when no
+	/// sidecar exists **or the one on disk is stale** (its staleness stamp does not match
+	/// the live descriptor — a rewritten segment automatically invalidates its old sidecar,
+	/// see [`PartialSidecar::matches`]). A malformed/foreign sidecar is treated as absent
+	/// too, so a downsample is always correct, at worst un-accelerated.
+	///
+	/// # Errors
+	///
+	/// Propagates a filesystem read error other than "not found".
+	pub async fn load_partial_sidecar(&self, aspect: &str, descriptor: &SegmentDescriptor) -> Result<Option<PartialSidecar>> {
+		let path = self.sidecar_path(aspect, descriptor.id);
+		let bytes = match tokio::fs::read(&path).await {
+			Ok(bytes) => bytes,
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+			Err(e) => return Err(anyhow::Error::new(e).context(format!("reading partial sidecar {}", path.display()))),
+		};
+		// A malformed or version-mismatched frame is not an error the caller must handle —
+		// it just means "no usable sidecar", so the read falls back to a full decode.
+		let Ok(sidecar) = PartialSidecar::from_bytes(&bytes) else { return Ok(None) };
+		Ok(sidecar.matches(descriptor).then_some(sidecar))
 	}
 
 	/// Read every row of `aspect` whose timestamp falls in the inclusive range
@@ -2919,6 +3010,51 @@ mod tests {
 		let batch = vec![ts[10], ts[8_000], 999_999_999, ts[11_000]];
 		assert_eq!(cp.read_points("temp", &batch).await.expect("reads"), plain.read_points("temp", &batch).await.expect("reads"), "batch read must match");
 		assert_eq!(cp.read_time_range("temp", ts[100], ts[200]).await.expect("reads"), plain.read_time_range("temp", ts[100], ts[200]).await.expect("reads"), "range read must match");
+	}
+
+	/// End-to-end through the real store: an enabled partial-sidecar policy writes a
+	/// `.dspart` beside each sealed `.dspseg`, the sidecar matches the exact segment bytes,
+	/// and its stored partial finishes to the same buckets a fresh reduction of the
+	/// segment's rows would — the invariant the cross-segment downsample will lean on. An
+	/// unconfigured store writes no sidecar.
+	#[tokio::test]
+	async fn seal_writes_a_matching_partial_sidecar_when_configured() {
+		use dsp_reduce::reduce_partial;
+		use splimes::{Point, Resolution};
+
+		// The shared schema is SECONDS; one sample a minute so the minute-base sidecar has
+		// one bucket per sample and an hour of data spans a handful of base buckets.
+		let ts: Vec<i64> = (0..180).map(|i| i * 60).collect();
+		let vs: Vec<BigDecimal> = (0..180).map(|i| bd(&format!("{}", (i * 13) % 71))).collect();
+		let points: Vec<Point> = ts.iter().zip(&vs).map(|(t, v)| Point::new(DateTime::<Utc>::from_timestamp(*t, 0).expect("instant"), v.clone())).collect();
+
+		// A configured store: base = Minutes, floor = 1 so this small fixture qualifies.
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens").with_partial_sidecar_policy(PartialSidecarPolicy::at(Resolution::Minutes, 1));
+		store.declare("temp", &schema()).await.expect("declares");
+		let descriptor = store.seal("temp", &schema(), &ts, &vs).await.expect("seals");
+
+		let sidecar = store.load_partial_sidecar("temp", &descriptor).await.expect("reads sidecar").expect("a sidecar was written");
+		assert_eq!(sidecar.base, Resolution::Minutes);
+		assert!(sidecar.matches(&descriptor), "the sidecar's stamp matches the sealed segment");
+
+		// The stored partial finishes to exactly what reducing the segment's rows directly
+		// at the base resolution produces — so a downsample can merge it in place of a decode.
+		let expected = reduce_partial(&points, Resolution::Minutes, None, None, &SIDECAR_AGGREGATIONS).expect("partial").finish(Resolution::Minutes, &SIDECAR_AGGREGATIONS).expect("finishes");
+		let got = sidecar.partial.finish(Resolution::Minutes, &SIDECAR_AGGREGATIONS).expect("finishes");
+		assert_eq!(got, expected, "the stored partial equals a fresh reduction of the segment");
+
+		// A stale descriptor (a rewrite would change byte_len) is rejected → falls back.
+		let mut stale = descriptor.clone();
+		stale.byte_len += 1;
+		assert!(store.load_partial_sidecar("temp", &stale).await.expect("reads").is_none(), "a mismatched stamp is treated as no sidecar");
+
+		// An unconfigured store writes nothing beside the segment.
+		let plain_dir = TempDir::new().expect("tempdir");
+		let plain = SegmentStore::open(plain_dir.path()).await.expect("opens");
+		assert_eq!(plain.partial_sidecar_policy(), PartialSidecarPolicy::DISABLED, "off by default");
+		let plain_desc = plain.seal("temp", &schema(), &ts, &vs).await.expect("seals");
+		assert!(plain.load_partial_sidecar("temp", &plain_desc).await.expect("reads").is_none(), "no sidecar without a policy");
 	}
 
 	/// The cross-segment downsample must equal reading the whole range and reducing it in
