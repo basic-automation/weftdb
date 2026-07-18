@@ -207,6 +207,22 @@ impl Aggregation {
 		self.percentile_rank().is_some() || matches!(self, Self::Twa | Self::TwaLinear | Self::TwaBucketEnd)
 	}
 
+	/// Whether this reduction's per-bucket state stays **bounded** — constant-sized
+	/// regardless of how many samples land in the bucket — so it can be materialized into
+	/// a fixed-size persisted partial (a per-segment sidecar) rather than recomputed from
+	/// the value column.
+	///
+	/// The exact inverse of [`needs_full_bucket`](Self::needs_full_bucket): the six
+	/// streaming reductions carry O(1) state (counts/sums/min/max/first/last), the
+	/// `sketch_p*` reductions carry a bounded [`DdSketch`], and both survive a
+	/// [`PartialReduction`] round-trip. The exact percentiles and time-weighted averages
+	/// need the whole bucket materialized, so persisting them would be unbounded — they are
+	/// *not* sidecar-materializable and stay a decode-time reduction.
+	#[must_use]
+	pub const fn is_sidecar_materializable(self) -> bool {
+		!self.needs_full_bucket()
+	}
+
 	/// Every reduction, in a stable order — the natural set for a full downsample. Kept
 	/// to the six *streaming* reductions (percentiles need the full bucket materialized,
 	/// so they are opt-in rather than part of the default full set).
@@ -257,7 +273,13 @@ pub enum ReduceError {
 /// required). The full bucket is materialized in `samples` only when a percentile
 /// reduction is requested (they need the sorted set); otherwise it stays empty so the
 /// streaming reductions pay no collection cost.
-#[derive(Debug)]
+///
+/// Serde-serializable so a [`PartialReduction`] can be persisted whole and reloaded
+/// exactly (the merge property below survives a round-trip). For a *bounded* sidecar a
+/// caller reduces with only the streaming reductions, leaving `samples` empty and the
+/// per-bucket state constant-sized — the exact-percentile/TWA path is what fills
+/// `samples`, so persisting those is unbounded by design.
+#[derive(Debug, Serialize, Deserialize)]
 struct BucketAcc {
 	count: usize,
 	sum: BigDecimal,
@@ -502,7 +524,15 @@ pub fn reduce(points: &[Point], resolution: Resolution, start: Option<DateTime<U
 ///
 /// Merging is exact for **every** reduction, not just the sketches, and independent of
 /// chunk order (`first`/`last` resolve by timestamp).
-#[derive(Debug)]
+///
+/// **Serde-serializable**, which is what lets a segment's partial be *persisted* — a
+/// sealed segment is immutable, so a partial computed over it at seal time can never go
+/// stale, and a later cross-segment downsample can merge the stored partials instead of
+/// re-decoding every value column. A round-trip is exact (every field round-trips,
+/// including the [`DdSketch`]), so a deserialized partial merges with a freshly built one
+/// to the same result a single pass would produce — verified by
+/// [`serde_round_trip_preserves_merge_exactness`](tests).
+#[derive(Debug, Serialize, Deserialize)]
 pub struct PartialReduction {
 	buckets: BTreeMap<i64, BucketAcc>,
 }
@@ -934,6 +964,66 @@ mod tests {
 
 		assert_eq!(chunked.len(), whole.len(), "same bucket count");
 		assert_eq!(chunked, whole, "a merged chunked reduction must equal the single pass exactly, for every reduction");
+	}
+
+	/// The property that makes a [`PartialReduction`] persistable as a per-segment sidecar:
+	/// serializing a partial, reloading it, and merging equals the single pass over the
+	/// whole series — for every reduction, including the order-sensitive first/last and the
+	/// `sketch_p*` whose merge is exact. A stored partial is therefore a drop-in substitute
+	/// for re-decoding the segment, which is the whole point of materializing it at seal.
+	#[test]
+	fn serde_round_trip_preserves_merge_exactness() {
+		let all = [
+			Aggregation::Min,
+			Aggregation::Max,
+			Aggregation::Avg,
+			Aggregation::Sum,
+			Aggregation::First,
+			Aggregation::Last,
+			Aggregation::SketchP50,
+			Aggregation::SketchP99,
+		];
+		// Two "segments" straddling several hour-buckets; each is reduced, serialized, and
+		// only the reloaded partials are merged — the in-memory originals are never touched.
+		let points: Vec<Point> = (0..600).map(|i| pt(i64::from(i) * 30, &format!("{}.25", (i * 13) % 89))).collect();
+		let (seg_a, seg_b) = points.split_at(300);
+		let whole = reduce(&points, Resolution::Hours, None, None, &all).expect("reduces");
+
+		let partial_a = reduce_partial(seg_a, Resolution::Hours, None, None, &all).expect("partial a");
+		let partial_b = reduce_partial(seg_b, Resolution::Hours, None, None, &all).expect("partial b");
+		let bytes_a = bincode::serialize(&partial_a).expect("serializes a");
+		let bytes_b = bincode::serialize(&partial_b).expect("serializes b");
+
+		let mut restored: PartialReduction = bincode::deserialize(&bytes_a).expect("reloads a");
+		let restored_b: PartialReduction = bincode::deserialize(&bytes_b).expect("reloads b");
+		restored.merge(restored_b).expect("merges reloaded partials");
+		let from_sidecars = restored.finish(Resolution::Hours, &all).expect("finishes");
+
+		assert_eq!(from_sidecars, whole, "merging reloaded per-segment partials must equal the single pass, for every reduction");
+	}
+
+	/// A single deserialized partial must equal the original bit-for-bit — the cached
+	/// sketch mapping (`gamma`/`log_gamma`) survives the round-trip, so a reloaded sketch
+	/// still merges with a freshly built one at the same accuracy.
+	#[test]
+	fn serde_round_trip_of_one_partial_is_exact() {
+		let aggs = [Aggregation::Sum, Aggregation::SketchP99];
+		let points: Vec<Point> = (0..200).map(|i| pt(i64::from(i) * 10, &format!("{}.5", (i * 3) % 71))).collect();
+		let original = reduce_partial(&points, Resolution::Minutes, None, None, &aggs).expect("partial");
+		let bytes = bincode::serialize(&original).expect("serializes");
+		let reloaded: PartialReduction = bincode::deserialize(&bytes).expect("reloads");
+		assert_eq!(reloaded.finish(Resolution::Minutes, &aggs).expect("finishes"), original.finish(Resolution::Minutes, &aggs).expect("finishes"), "a reloaded partial finishes to the same buckets");
+	}
+
+	#[test]
+	fn sidecar_materializable_is_the_streaming_and_sketch_reductions() {
+		// The bounded reductions are exactly those safe to persist in a fixed-size sidecar.
+		for a in [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::SketchP50, Aggregation::SketchP99] {
+			assert!(a.is_sidecar_materializable(), "{} carries bounded per-bucket state", a.as_str());
+		}
+		for a in [Aggregation::P50, Aggregation::P99, Aggregation::Twa, Aggregation::TwaLinear, Aggregation::TwaBucketEnd] {
+			assert!(!a.is_sidecar_materializable(), "{} needs the full bucket, so it is not sidecar-materializable", a.as_str());
+		}
 	}
 
 	#[test]
