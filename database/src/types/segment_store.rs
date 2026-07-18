@@ -177,6 +177,25 @@ fn window_covers_segment(descriptor: &SegmentDescriptor, start: i64, end: i64) -
 	descriptor.min_ts.zip(descriptor.max_ts).is_some_and(|(min_ts, max_ts)| start <= min_ts && max_ts <= end)
 }
 
+/// The [`PartialReduction`] a stored `sidecar` can contribute to a downsample at
+/// `resolution`, or `None` when it cannot serve that resolution. Serves it **directly**
+/// when the sidecar's base equals the requested resolution, or **re-keyed** when the base
+/// is finer and its grid nests in the requested one (a coarser roll-up needs no decode —
+/// merging the base buckets that fall in each coarse bucket is exact). Returns `None` when
+/// the requested resolution is finer than the base or the grids do not nest, so the caller
+/// falls back to decoding the segment.
+///
+/// # Errors
+///
+/// Propagates a [`dsp_reduce::ReduceError`] from the re-key (a bucket-start overflow at an
+/// extreme resolution/magnitude).
+fn sidecar_partial_for(sidecar: &PartialSidecar, resolution: Resolution) -> Result<Option<PartialReduction>> {
+	if sidecar.base == resolution {
+		return Ok(Some(sidecar.partial.clone()));
+	}
+	sidecar.partial.rebucket(sidecar.base, resolution).map_err(|e| anyhow::anyhow!("re-keying a partial sidecar from {:?} to {resolution:?}: {e}", sidecar.base))
+}
+
 pub struct SegmentStore {
 	/// The store root; sealed frames live in `root/segments/`.
 	root: PathBuf,
@@ -657,11 +676,13 @@ impl SegmentStore {
 		// one frame — so it keeps the inline path.
 		if descriptors.len() == 1 {
 			let descriptor = &descriptors[0];
-			// The sidecar fast path: no file decode at all when a matching partial serves it.
+			// The sidecar fast path: no file decode at all when a matching partial serves it —
+			// directly when its base equals the requested resolution, or re-keyed when the base
+			// is finer and its grid nests in the requested one.
 			if sidecar_eligible && window_covers_segment(descriptor, start, end) {
 				if let Some(sidecar) = self.load_partial_sidecar(aspect, descriptor).await? {
-					if sidecar.base == resolution {
-						return sidecar.partial.finish(resolution, aggregations).map_err(|e| anyhow::anyhow!("finishing downsample of {aspect:?}: {e}"));
+					if let Some(partial) = sidecar_partial_for(&sidecar, resolution).map_err(|e| anyhow::anyhow!("re-keying the sidecar of {aspect:?}: {e}"))? {
+						return partial.finish(resolution, aggregations).map_err(|e| anyhow::anyhow!("finishing downsample of {aspect:?}: {e}"));
 					}
 				}
 			}
@@ -684,8 +705,8 @@ impl SegmentStore {
 			async move {
 				if sidecar_eligible && window_covers_segment(&descriptor, start, end) {
 					if let Some(sidecar) = self.load_partial_sidecar(aspect, &descriptor).await? {
-						if sidecar.base == resolution {
-							return Ok::<Option<PartialReduction>, anyhow::Error>(Some(sidecar.partial));
+						if let Some(partial) = sidecar_partial_for(&sidecar, resolution).map_err(|e| anyhow::anyhow!("re-keying a sidecar of {aspect:?}: {e}"))? {
+							return Ok::<Option<PartialReduction>, anyhow::Error>(Some(partial));
 						}
 					}
 				}
@@ -3197,6 +3218,45 @@ mod tests {
 		assert!(store.downsample_range("temp", i64::MIN, i64::MAX, Resolution::Minutes, &aggs).await.is_err(), "a non-base resolution must decode, so it fails without frames");
 		// (c) a window cutting inside a segment cannot use the whole-segment partial.
 		assert!(store.downsample_range("temp", 30 * 60, 200 * 60, Resolution::Hours, &aggs).await.is_err(), "a segment-splitting window must decode, so it fails without frames");
+	}
+
+	/// The **re-bucketing** path: a sidecar materialized at a fine base (MINUTES) answers a
+	/// coarser downsample (HOURS) by re-keying its base buckets — again proven by deleting
+	/// every `.dspseg` and showing the coarse answer is unchanged. A resolution FINER than
+	/// the base (seconds) cannot be served and must decode.
+	#[tokio::test]
+	async fn downsample_range_rebuckets_a_fine_base_to_a_coarser_resolution() {
+		use dsp_reduce::{reduce, Aggregation};
+		use splimes::{Point, Resolution};
+
+		let dir = TempDir::new().expect("tempdir");
+		// Sidecars at MINUTE base — finer than the HOUR query, so the roll-up re-keys.
+		let store = SegmentStore::open(dir.path()).await.expect("opens").with_partial_sidecar_policy(PartialSidecarPolicy::at(Resolution::Minutes, 1));
+		store.declare("temp", &schema()).await.expect("declares");
+		let mut all: Vec<Point> = Vec::new();
+		let mut seg_paths: Vec<String> = Vec::new();
+		for seg in 0..6_i64 {
+			let ts: Vec<i64> = (0..120).map(|i| (seg * 120 + i) * 60).collect();
+			let vs: Vec<BigDecimal> = (0..120).map(|i| bd(&format!("{}", (seg * 5 + i) % 47))).collect();
+			for (t, v) in ts.iter().zip(&vs) {
+				all.push(Point::new(DateTime::<Utc>::from_timestamp(*t, 0).expect("instant"), v.clone()));
+			}
+			seg_paths.push(store.seal("temp", &schema(), &ts, &vs).await.expect("seals").path);
+		}
+		let aggs = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::SketchP99];
+
+		// Delete every frame: an HOUR downsample must now come purely from re-keyed MINUTE
+		// sidecars, and still equal a direct HOUR reduction of the data.
+		for path in &seg_paths {
+			std::fs::remove_file(path).expect("removes frame");
+		}
+		let hourly = store.downsample_range("temp", i64::MIN, i64::MAX, Resolution::Hours, &aggs).await.expect("rebuckets from minute sidecars");
+		assert_eq!(hourly, reduce(&all, Resolution::Hours, None, None, &aggs).expect("reduces"), "a minute-base sidecar re-keys to hours without touching a frame");
+
+		// The exact base (MINUTES) is served directly; a FINER resolution (seconds) cannot be
+		// re-keyed from a minute base, so with frames gone it must fail.
+		assert_eq!(store.downsample_range("temp", i64::MIN, i64::MAX, Resolution::Minutes, &aggs).await.expect("serves base"), reduce(&all, Resolution::Minutes, None, None, &aggs).expect("reduces"), "the exact base resolution is served directly");
+		assert!(store.downsample_range("temp", i64::MIN, i64::MAX, Resolution::Seconds, &aggs).await.is_err(), "a resolution finer than the base must decode, so it fails without frames");
 	}
 
 	/// The single-segment **fast path** in isolation: an aspect with exactly one sealed

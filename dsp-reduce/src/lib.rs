@@ -584,6 +584,44 @@ impl PartialReduction {
 		let aggregations = if aggregations.is_empty() { &Aggregation::DEFAULT[..] } else { aggregations };
 		self.buckets.into_iter().map(|(base, acc)| acc.finish(resolution, base, aggregations)).collect()
 	}
+
+	/// Re-key this partial from the `from` resolution it was built at to a **coarser**
+	/// `to` resolution, merging every `from` bucket into the `to` bucket that contains it —
+	/// without re-reading any data. Returns `None` when the grids do not nest
+	/// ([`grids_nest`]), so the caller must reduce at `to` directly.
+	///
+	/// This is what lets one persisted partial (materialized at a fine base resolution)
+	/// answer a downsample at any coarser nesting resolution: because merging is exact, the
+	/// re-keyed partial's per-`to`-bucket state is identical to the state a fresh reduction
+	/// of the same points at `to` would build. It is valid only for the bounded
+	/// streaming/sketch reductions a partial carries — the exact percentiles and TWA need
+	/// the original samples, which a partial does not persist, so those never take this path
+	/// (see [`Aggregation::is_sidecar_materializable`]).
+	///
+	/// # Errors
+	///
+	/// [`ReduceError::BucketStartOverflow`] if a source bucket's grid start overflows, or
+	/// [`ReduceError::SketchValue`] if two merged buckets' sketches are incompatible
+	/// (unreachable for partials built at one [`SKETCH_ALPHA`]).
+	pub fn rebucket(&self, from: Resolution, to: Resolution) -> Result<Option<Self>, ReduceError> {
+		if !grids_nest(from, to) {
+			return Ok(None);
+		}
+		let mut out: BTreeMap<i64, BucketAcc> = BTreeMap::new();
+		for (&base, acc) in &self.buckets {
+			// The source bucket's grid start lands inside exactly one `to` bucket (the grids
+			// nest), so re-keying by that start groups every covered source bucket together.
+			let start = bucket_start(from, base).ok_or(ReduceError::BucketStartOverflow)?;
+			let to_base = to.to_base(&start).map_err(|_| ReduceError::TimestampRange)?;
+			match out.entry(to_base) {
+				std::collections::btree_map::Entry::Occupied(mut e) => e.get_mut().merge(acc.clone())?,
+				std::collections::btree_map::Entry::Vacant(e) => {
+					e.insert(acc.clone());
+				}
+			}
+		}
+		Ok(Some(Self { buckets: out }))
+	}
 }
 
 /// Reduce `points` into a mergeable [`PartialReduction`] rather than finished buckets.
@@ -640,6 +678,42 @@ pub fn bucket_start(resolution: Resolution, base: i64) -> Option<DateTime<Utc>> 
 		Resolution::Years => Duration::seconds(base.checked_mul(SECONDS_IN_YEAR)?),
 	};
 	DateTime::<Utc>::UNIX_EPOCH.checked_add_signed(duration)
+}
+
+/// The bucket width of a resolution in **whole seconds**, or `None` for the sub-second
+/// resolutions (whose [`Resolution::to_base`] keys on nanos/micros/millis, not seconds,
+/// so a seconds-based nesting test does not apply to them).
+///
+/// For every second-and-coarser resolution `to_base` is `timestamp_seconds / step`, so two
+/// such grids nest exactly when one step divides the other — see [`grids_nest`]. DSP fixes
+/// a month at 30 days and a year at 365 days, so those are exact multiples too.
+const fn resolution_step_secs(r: Resolution) -> Option<i64> {
+	match r {
+		Resolution::Seconds => Some(1),
+		Resolution::Minutes => Some(SECONDS_IN_MINUTE),
+		Resolution::Hours => Some(SECONDS_IN_HOUR),
+		Resolution::Days => Some(SECONDS_IN_DAY),
+		Resolution::Weeks => Some(SECONDS_IN_WEEK),
+		Resolution::Months => Some(SECONDS_IN_MONTH),
+		Resolution::Years => Some(SECONDS_IN_YEAR),
+		Resolution::Nanoseconds | Resolution::Microseconds | Resolution::Milliseconds => None,
+	}
+}
+
+/// Whether `from`'s bucket grid nests inside `to`'s.
+///
+/// Every `from` bucket falls entirely within one `to` bucket, so a partial bucketed at
+/// `from` can be re-keyed to `to` without re-reading the data (see
+/// [`PartialReduction::rebucket`]). True exactly when both are second-based resolutions and
+/// `from`'s step divides `to`'s
+/// (so `to` is coarser-or-equal and its boundaries are a subset of `from`'s). Both grids
+/// are anchored at the epoch, so divisibility of the widths is sufficient for alignment.
+#[must_use]
+pub const fn grids_nest(from: Resolution, to: Resolution) -> bool {
+	match (resolution_step_secs(from), resolution_step_secs(to)) {
+		(Some(f), Some(t)) => t % f == 0,
+		_ => false,
+	}
 }
 
 #[cfg(test)]
@@ -1013,6 +1087,43 @@ mod tests {
 		let bytes = bincode::serialize(&original).expect("serializes");
 		let reloaded: PartialReduction = bincode::deserialize(&bytes).expect("reloads");
 		assert_eq!(reloaded.finish(Resolution::Minutes, &aggs).expect("finishes"), original.finish(Resolution::Minutes, &aggs).expect("finishes"), "a reloaded partial finishes to the same buckets");
+	}
+
+	/// Re-keying a partial from a fine base to a coarser nesting resolution equals reducing
+	/// the same points directly at the coarse resolution — the property that lets one
+	/// persisted partial answer every coarser downsample. Checked for every
+	/// materializable reduction, including the sketch.
+	#[test]
+	fn rebucket_from_a_fine_base_equals_a_direct_coarse_reduction() {
+		let aggs = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::SketchP50, Aggregation::SketchP99];
+		// ~10 hours of one-a-minute samples so minute buckets group cleanly into hour ones.
+		let points: Vec<Point> = (0..600).map(|i| pt(i64::from(i) * 60, &format!("{}.5", (i * 11) % 83))).collect();
+
+		let base = reduce_partial(&points, Resolution::Minutes, None, None, &aggs).expect("minute partial");
+		let rebucketed = base.rebucket(Resolution::Minutes, Resolution::Hours).expect("rebuckets").expect("grids nest");
+		let via_rebucket = rebucketed.finish(Resolution::Hours, &aggs).expect("finishes");
+		let direct = reduce(&points, Resolution::Hours, None, None, &aggs).expect("reduces");
+		assert_eq!(via_rebucket, direct, "a minute partial re-keyed to hours equals a direct hour reduction");
+
+		// Two hops nest too: minutes -> days.
+		let to_days = reduce_partial(&points, Resolution::Minutes, None, None, &aggs).expect("partial").rebucket(Resolution::Minutes, Resolution::Days).expect("rebuckets").expect("nest");
+		assert_eq!(to_days.finish(Resolution::Days, &aggs).expect("finishes"), reduce(&points, Resolution::Days, None, None, &aggs).expect("reduces"), "minutes re-key to days too");
+	}
+
+	#[test]
+	fn rebucket_returns_none_when_grids_do_not_nest() {
+		// Weeks do not tile DSP's 30-day month, nor months a 365-day year; a finer target
+		// is not a coarsening at all.
+		assert!(!grids_nest(Resolution::Weeks, Resolution::Months), "weeks do not tile a 30-day month");
+		assert!(!grids_nest(Resolution::Months, Resolution::Years), "months do not tile a 365-day year");
+		assert!(!grids_nest(Resolution::Hours, Resolution::Minutes), "a finer target is not a coarsening");
+		assert!(!grids_nest(Resolution::Seconds, Resolution::Milliseconds), "sub-second targets are excluded");
+		// The nesting cases that DO hold, including the fixed month/year multiples.
+		for (f, t) in [(Resolution::Minutes, Resolution::Hours), (Resolution::Hours, Resolution::Days), (Resolution::Days, Resolution::Weeks), (Resolution::Days, Resolution::Months), (Resolution::Days, Resolution::Years), (Resolution::Seconds, Resolution::Minutes)] {
+			assert!(grids_nest(f, t), "{f:?} nests in {t:?}");
+		}
+		let partial = reduce_partial(&[pt(0, "1"), pt(60, "2")], Resolution::Weeks, None, None, &[Aggregation::Sum]).expect("partial");
+		assert!(partial.rebucket(Resolution::Weeks, Resolution::Months).expect("no error").is_none(), "a non-nesting rebucket yields None, not a wrong answer");
 	}
 
 	#[test]
