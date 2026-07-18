@@ -207,6 +207,22 @@ impl Aggregation {
 		self.percentile_rank().is_some() || matches!(self, Self::Twa | Self::TwaLinear | Self::TwaBucketEnd)
 	}
 
+	/// Whether this reduction's per-bucket state stays **bounded** — constant-sized
+	/// regardless of how many samples land in the bucket — so it can be materialized into
+	/// a fixed-size persisted partial (a per-segment sidecar) rather than recomputed from
+	/// the value column.
+	///
+	/// The exact inverse of [`needs_full_bucket`](Self::needs_full_bucket): the six
+	/// streaming reductions carry O(1) state (counts/sums/min/max/first/last), the
+	/// `sketch_p*` reductions carry a bounded [`DdSketch`], and both survive a
+	/// [`PartialReduction`] round-trip. The exact percentiles and time-weighted averages
+	/// need the whole bucket materialized, so persisting them would be unbounded — they are
+	/// *not* sidecar-materializable and stay a decode-time reduction.
+	#[must_use]
+	pub const fn is_sidecar_materializable(self) -> bool {
+		!self.needs_full_bucket()
+	}
+
 	/// Every reduction, in a stable order — the natural set for a full downsample. Kept
 	/// to the six *streaming* reductions (percentiles need the full bucket materialized,
 	/// so they are opt-in rather than part of the default full set).
@@ -257,7 +273,13 @@ pub enum ReduceError {
 /// required). The full bucket is materialized in `samples` only when a percentile
 /// reduction is requested (they need the sorted set); otherwise it stays empty so the
 /// streaming reductions pay no collection cost.
-#[derive(Debug)]
+///
+/// Serde-serializable so a [`PartialReduction`] can be persisted whole and reloaded
+/// exactly (the merge property below survives a round-trip). For a *bounded* sidecar a
+/// caller reduces with only the streaming reductions, leaving `samples` empty and the
+/// per-bucket state constant-sized — the exact-percentile/TWA path is what fills
+/// `samples`, so persisting those is unbounded by design.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct BucketAcc {
 	count: usize,
 	sum: BigDecimal,
@@ -502,7 +524,15 @@ pub fn reduce(points: &[Point], resolution: Resolution, start: Option<DateTime<U
 ///
 /// Merging is exact for **every** reduction, not just the sketches, and independent of
 /// chunk order (`first`/`last` resolve by timestamp).
-#[derive(Debug)]
+///
+/// **Serde-serializable**, which is what lets a segment's partial be *persisted* — a
+/// sealed segment is immutable, so a partial computed over it at seal time can never go
+/// stale, and a later cross-segment downsample can merge the stored partials instead of
+/// re-decoding every value column. A round-trip is exact (every field round-trips,
+/// including the [`DdSketch`]), so a deserialized partial merges with a freshly built one
+/// to the same result a single pass would produce — verified by
+/// [`serde_round_trip_preserves_merge_exactness`](tests).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartialReduction {
 	buckets: BTreeMap<i64, BucketAcc>,
 }
@@ -553,6 +583,44 @@ impl PartialReduction {
 	pub fn finish(self, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Vec<Bucket>, ReduceError> {
 		let aggregations = if aggregations.is_empty() { &Aggregation::DEFAULT[..] } else { aggregations };
 		self.buckets.into_iter().map(|(base, acc)| acc.finish(resolution, base, aggregations)).collect()
+	}
+
+	/// Re-key this partial from the `from` resolution it was built at to a **coarser**
+	/// `to` resolution, merging every `from` bucket into the `to` bucket that contains it —
+	/// without re-reading any data. Returns `None` when the grids do not nest
+	/// ([`grids_nest`]), so the caller must reduce at `to` directly.
+	///
+	/// This is what lets one persisted partial (materialized at a fine base resolution)
+	/// answer a downsample at any coarser nesting resolution: because merging is exact, the
+	/// re-keyed partial's per-`to`-bucket state is identical to the state a fresh reduction
+	/// of the same points at `to` would build. It is valid only for the bounded
+	/// streaming/sketch reductions a partial carries — the exact percentiles and TWA need
+	/// the original samples, which a partial does not persist, so those never take this path
+	/// (see [`Aggregation::is_sidecar_materializable`]).
+	///
+	/// # Errors
+	///
+	/// [`ReduceError::BucketStartOverflow`] if a source bucket's grid start overflows, or
+	/// [`ReduceError::SketchValue`] if two merged buckets' sketches are incompatible
+	/// (unreachable for partials built at one [`SKETCH_ALPHA`]).
+	pub fn rebucket(&self, from: Resolution, to: Resolution) -> Result<Option<Self>, ReduceError> {
+		if !grids_nest(from, to) {
+			return Ok(None);
+		}
+		let mut out: BTreeMap<i64, BucketAcc> = BTreeMap::new();
+		for (&base, acc) in &self.buckets {
+			// The source bucket's grid start lands inside exactly one `to` bucket (the grids
+			// nest), so re-keying by that start groups every covered source bucket together.
+			let start = bucket_start(from, base).ok_or(ReduceError::BucketStartOverflow)?;
+			let to_base = to.to_base(&start).map_err(|_| ReduceError::TimestampRange)?;
+			match out.entry(to_base) {
+				std::collections::btree_map::Entry::Occupied(mut e) => e.get_mut().merge(acc.clone())?,
+				std::collections::btree_map::Entry::Vacant(e) => {
+					e.insert(acc.clone());
+				}
+			}
+		}
+		Ok(Some(Self { buckets: out }))
 	}
 }
 
@@ -610,6 +678,42 @@ pub fn bucket_start(resolution: Resolution, base: i64) -> Option<DateTime<Utc>> 
 		Resolution::Years => Duration::seconds(base.checked_mul(SECONDS_IN_YEAR)?),
 	};
 	DateTime::<Utc>::UNIX_EPOCH.checked_add_signed(duration)
+}
+
+/// The bucket width of a resolution in **whole seconds**, or `None` for the sub-second
+/// resolutions (whose [`Resolution::to_base`] keys on nanos/micros/millis, not seconds,
+/// so a seconds-based nesting test does not apply to them).
+///
+/// For every second-and-coarser resolution `to_base` is `timestamp_seconds / step`, so two
+/// such grids nest exactly when one step divides the other — see [`grids_nest`]. DSP fixes
+/// a month at 30 days and a year at 365 days, so those are exact multiples too.
+const fn resolution_step_secs(r: Resolution) -> Option<i64> {
+	match r {
+		Resolution::Seconds => Some(1),
+		Resolution::Minutes => Some(SECONDS_IN_MINUTE),
+		Resolution::Hours => Some(SECONDS_IN_HOUR),
+		Resolution::Days => Some(SECONDS_IN_DAY),
+		Resolution::Weeks => Some(SECONDS_IN_WEEK),
+		Resolution::Months => Some(SECONDS_IN_MONTH),
+		Resolution::Years => Some(SECONDS_IN_YEAR),
+		Resolution::Nanoseconds | Resolution::Microseconds | Resolution::Milliseconds => None,
+	}
+}
+
+/// Whether `from`'s bucket grid nests inside `to`'s.
+///
+/// Every `from` bucket falls entirely within one `to` bucket, so a partial bucketed at
+/// `from` can be re-keyed to `to` without re-reading the data (see
+/// [`PartialReduction::rebucket`]). True exactly when both are second-based resolutions and
+/// `from`'s step divides `to`'s
+/// (so `to` is coarser-or-equal and its boundaries are a subset of `from`'s). Both grids
+/// are anchored at the epoch, so divisibility of the widths is sufficient for alignment.
+#[must_use]
+pub const fn grids_nest(from: Resolution, to: Resolution) -> bool {
+	match (resolution_step_secs(from), resolution_step_secs(to)) {
+		(Some(f), Some(t)) => t % f == 0,
+		_ => false,
+	}
 }
 
 #[cfg(test)]
@@ -934,6 +1038,103 @@ mod tests {
 
 		assert_eq!(chunked.len(), whole.len(), "same bucket count");
 		assert_eq!(chunked, whole, "a merged chunked reduction must equal the single pass exactly, for every reduction");
+	}
+
+	/// The property that makes a [`PartialReduction`] persistable as a per-segment sidecar:
+	/// serializing a partial, reloading it, and merging equals the single pass over the
+	/// whole series — for every reduction, including the order-sensitive first/last and the
+	/// `sketch_p*` whose merge is exact. A stored partial is therefore a drop-in substitute
+	/// for re-decoding the segment, which is the whole point of materializing it at seal.
+	#[test]
+	fn serde_round_trip_preserves_merge_exactness() {
+		let all = [
+			Aggregation::Min,
+			Aggregation::Max,
+			Aggregation::Avg,
+			Aggregation::Sum,
+			Aggregation::First,
+			Aggregation::Last,
+			Aggregation::SketchP50,
+			Aggregation::SketchP99,
+		];
+		// Two "segments" straddling several hour-buckets; each is reduced, serialized, and
+		// only the reloaded partials are merged — the in-memory originals are never touched.
+		let points: Vec<Point> = (0..600).map(|i| pt(i64::from(i) * 30, &format!("{}.25", (i * 13) % 89))).collect();
+		let (seg_a, seg_b) = points.split_at(300);
+		let whole = reduce(&points, Resolution::Hours, None, None, &all).expect("reduces");
+
+		let partial_a = reduce_partial(seg_a, Resolution::Hours, None, None, &all).expect("partial a");
+		let partial_b = reduce_partial(seg_b, Resolution::Hours, None, None, &all).expect("partial b");
+		let bytes_a = bincode::serialize(&partial_a).expect("serializes a");
+		let bytes_b = bincode::serialize(&partial_b).expect("serializes b");
+
+		let mut restored: PartialReduction = bincode::deserialize(&bytes_a).expect("reloads a");
+		let restored_b: PartialReduction = bincode::deserialize(&bytes_b).expect("reloads b");
+		restored.merge(restored_b).expect("merges reloaded partials");
+		let from_sidecars = restored.finish(Resolution::Hours, &all).expect("finishes");
+
+		assert_eq!(from_sidecars, whole, "merging reloaded per-segment partials must equal the single pass, for every reduction");
+	}
+
+	/// A single deserialized partial must equal the original bit-for-bit — the cached
+	/// sketch mapping (`gamma`/`log_gamma`) survives the round-trip, so a reloaded sketch
+	/// still merges with a freshly built one at the same accuracy.
+	#[test]
+	fn serde_round_trip_of_one_partial_is_exact() {
+		let aggs = [Aggregation::Sum, Aggregation::SketchP99];
+		let points: Vec<Point> = (0..200).map(|i| pt(i64::from(i) * 10, &format!("{}.5", (i * 3) % 71))).collect();
+		let original = reduce_partial(&points, Resolution::Minutes, None, None, &aggs).expect("partial");
+		let bytes = bincode::serialize(&original).expect("serializes");
+		let reloaded: PartialReduction = bincode::deserialize(&bytes).expect("reloads");
+		assert_eq!(reloaded.finish(Resolution::Minutes, &aggs).expect("finishes"), original.finish(Resolution::Minutes, &aggs).expect("finishes"), "a reloaded partial finishes to the same buckets");
+	}
+
+	/// Re-keying a partial from a fine base to a coarser nesting resolution equals reducing
+	/// the same points directly at the coarse resolution — the property that lets one
+	/// persisted partial answer every coarser downsample. Checked for every
+	/// materializable reduction, including the sketch.
+	#[test]
+	fn rebucket_from_a_fine_base_equals_a_direct_coarse_reduction() {
+		let aggs = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::SketchP50, Aggregation::SketchP99];
+		// ~10 hours of one-a-minute samples so minute buckets group cleanly into hour ones.
+		let points: Vec<Point> = (0..600).map(|i| pt(i64::from(i) * 60, &format!("{}.5", (i * 11) % 83))).collect();
+
+		let base = reduce_partial(&points, Resolution::Minutes, None, None, &aggs).expect("minute partial");
+		let rebucketed = base.rebucket(Resolution::Minutes, Resolution::Hours).expect("rebuckets").expect("grids nest");
+		let via_rebucket = rebucketed.finish(Resolution::Hours, &aggs).expect("finishes");
+		let direct = reduce(&points, Resolution::Hours, None, None, &aggs).expect("reduces");
+		assert_eq!(via_rebucket, direct, "a minute partial re-keyed to hours equals a direct hour reduction");
+
+		// Two hops nest too: minutes -> days.
+		let to_days = reduce_partial(&points, Resolution::Minutes, None, None, &aggs).expect("partial").rebucket(Resolution::Minutes, Resolution::Days).expect("rebuckets").expect("nest");
+		assert_eq!(to_days.finish(Resolution::Days, &aggs).expect("finishes"), reduce(&points, Resolution::Days, None, None, &aggs).expect("reduces"), "minutes re-key to days too");
+	}
+
+	#[test]
+	fn rebucket_returns_none_when_grids_do_not_nest() {
+		// Weeks do not tile DSP's 30-day month, nor months a 365-day year; a finer target
+		// is not a coarsening at all.
+		assert!(!grids_nest(Resolution::Weeks, Resolution::Months), "weeks do not tile a 30-day month");
+		assert!(!grids_nest(Resolution::Months, Resolution::Years), "months do not tile a 365-day year");
+		assert!(!grids_nest(Resolution::Hours, Resolution::Minutes), "a finer target is not a coarsening");
+		assert!(!grids_nest(Resolution::Seconds, Resolution::Milliseconds), "sub-second targets are excluded");
+		// The nesting cases that DO hold, including the fixed month/year multiples.
+		for (f, t) in [(Resolution::Minutes, Resolution::Hours), (Resolution::Hours, Resolution::Days), (Resolution::Days, Resolution::Weeks), (Resolution::Days, Resolution::Months), (Resolution::Days, Resolution::Years), (Resolution::Seconds, Resolution::Minutes)] {
+			assert!(grids_nest(f, t), "{f:?} nests in {t:?}");
+		}
+		let partial = reduce_partial(&[pt(0, "1"), pt(60, "2")], Resolution::Weeks, None, None, &[Aggregation::Sum]).expect("partial");
+		assert!(partial.rebucket(Resolution::Weeks, Resolution::Months).expect("no error").is_none(), "a non-nesting rebucket yields None, not a wrong answer");
+	}
+
+	#[test]
+	fn sidecar_materializable_is_the_streaming_and_sketch_reductions() {
+		// The bounded reductions are exactly those safe to persist in a fixed-size sidecar.
+		for a in [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::SketchP50, Aggregation::SketchP99] {
+			assert!(a.is_sidecar_materializable(), "{} carries bounded per-bucket state", a.as_str());
+		}
+		for a in [Aggregation::P50, Aggregation::P99, Aggregation::Twa, Aggregation::TwaLinear, Aggregation::TwaBucketEnd] {
+			assert!(!a.is_sidecar_materializable(), "{} needs the full bucket, so it is not sidecar-materializable", a.as_str());
+		}
 	}
 
 	#[test]
