@@ -199,22 +199,25 @@ pub async fn reconcile_tick_squash(store: &SegmentStore, metrics: &SharedMetrics
 
 /// Run one **size-targeted compaction** tick (roadmap Phase 4.6).
 ///
-/// Sweeps every aspect through
-/// [`SegmentStore::squash_all_to_target_rows`](database::SegmentStore::squash_all_to_target_rows),
-/// coalescing each aspect's segments toward ~`target_rows` rows per segment (leaving
-/// already-large segments untouched) — the size-aware bound on fragmentation, motivated
-/// by the `downsample_range` knee (one giant segment reads slower than several mid-sized
-/// ones, so [`reconcile_tick_squash`]'s fold-to-one over-corrects). Records the compacted
-/// aspects and removed segments in `metrics` (a compaction is a pass, like a squash), and
-/// returns the [`SquashSweep`]. A sweep that coalesced nothing records nothing.
+/// Sweeps every aspect through the **fragmentation-gated**
+/// [`SegmentStore::squash_all_to_target_rows_if_fragmented`](database::SegmentStore::squash_all_to_target_rows_if_fragmented),
+/// coalescing each *over-fragmented* aspect's segments toward ~`target_rows` rows per segment
+/// (leaving already-well-sized aspects untouched via an O(1) rollup check, no segment-index
+/// scan) — the size-aware bound on fragmentation, motivated by the `downsample_range` knee
+/// (one giant segment reads slower than several mid-sized ones, so [`reconcile_tick_squash`]'s
+/// fold-to-one over-corrects). Records the compacted aspects and removed segments in `metrics`
+/// (a compaction is a pass, like a squash), and returns the [`SquashSweep`]. A sweep that
+/// coalesced nothing records nothing.
 ///
 /// # Errors
 ///
 /// Propagates a failure from
-/// [`SegmentStore::squash_all_to_target_rows`](database::SegmentStore::squash_all_to_target_rows).
+/// [`SegmentStore::squash_all_to_target_rows_if_fragmented`](database::SegmentStore::squash_all_to_target_rows_if_fragmented).
 pub async fn reconcile_tick_compact(store: &SegmentStore, metrics: &SharedMetrics, target_rows: usize) -> anyhow::Result<SquashSweep> {
 	let span = tracing::info_span!("reconcile.tick", kind = "compact", target_rows, aspects = tracing::field::Empty, segments = tracing::field::Empty);
-	let sweep = store.squash_all_to_target_rows(target_rows).instrument(span.clone()).await?;
+	// The gated sweep: a converged aspect costs one O(1) rollup read per tick, not a full
+	// segment-index scan, so the 1s daemon does not churn the control plane on a tidy store.
+	let sweep = store.squash_all_to_target_rows_if_fragmented(target_rows).instrument(span.clone()).await?;
 	span.record("aspects", sweep.aspects_squashed);
 	span.record("segments", sweep.segments_removed);
 	if sweep.aspects_squashed > 0 {

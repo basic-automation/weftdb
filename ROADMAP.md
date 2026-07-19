@@ -1002,12 +1002,18 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   ingested 2-row segments coalesced to two 6-row segments — the daemon path via `/stats` segment_count
   6→2 + the `reconcile.tick kind="compact"` span + `dsp_reconcile_passes_total`, and the endpoint via
   `POST …/compact?target_rows=6` → `{"removed":4,"segment_count":2}` (missing `target_rows` → 400).
-- [ ] **NEXT — fragmentation gate + default target for the compaction daemon:** the compaction currently
-  runs every tick and coalesces whatever is under target. Add a **gate** so a well-sized aspect is never
-  rewritten (only compact an aspect whose segment count materially exceeds `ceil(total_rows / target_rows)`),
-  and pick a sensible **default** target from a real segment-size mix — the 200k-row bench's ~12.5k is
-  corpus- and hardware-specific (the transferable knob is rows-per-segment, but the optimum shifts with
-  decode cost and core count). Owner-gated default.
+- [x] **DONE (2026-07-19) — fragmentation gate for the compaction daemon.**
+  `SegmentStore::squash_aspect_to_target_rows_if_fragmented` reads the **O(1)** per-aspect rollup and
+  runs the compaction only when `segment_count > ⌈total_rows / target_rows⌉` (genuinely over-fragmented),
+  so a converged aspect costs one rollup read per tick, not a full segment-index scan; the daemon tick
+  (`reconcile_tick_compact`) now calls the gated store-wide sweep
+  `squash_all_to_target_rows_if_fragmented`. The ungated `squash_*_to_target_rows` stays as the "force"
+  form the manual `/compact` endpoint uses. (2 new database tests: gate skips a well-sized aspect,
+  gated sweep touches only the fragmented one.)
+- [ ] **NEXT — default target for the compaction daemon:** pick a sensible **default** `DSP_COMPACT_TARGET_ROWS`
+  from a real segment-size mix — the 200k-row bench's ~12.5k is corpus- and hardware-specific (the
+  transferable knob is rows-per-segment, but the optimum shifts with decode cost and core count).
+  Owner-gated default.
 - [x] **DONE (2026-07-16) — linear (trapezoidal) TWA method beside the shipped LOCF weighting:**
   `Aggregation::TwaLinear` (token `twa_linear`, alias `time_weighted_avg_linear`) computing
   `Σ½(vᵢ+vᵢ₊₁)Δtᵢ / ΣΔtᵢ`; `time_weighted_average` is generalized over a private

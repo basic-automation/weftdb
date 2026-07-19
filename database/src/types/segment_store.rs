@@ -1618,6 +1618,65 @@ impl SegmentStore {
 		Ok(sweep)
 	}
 
+	/// **Fragmentation-gated** size-targeted compaction of one aspect (roadmap Phase 4.6).
+	///
+	/// The cheap-first guard the background daemon uses so it does not scan every aspect's
+	/// segment list on every tick. Reads the **O(1)** per-aspect rollup
+	/// ([`AspectMetadataStore`](super::AspectMetadataStore)) for the segment count and total
+	/// rows, computes the minimum segments needed to hold that many rows at `target_rows`
+	/// (`ideal = ⌈total_rows / target_rows⌉`), and runs
+	/// [`squash_aspect_to_target_rows`](SegmentStore::squash_aspect_to_target_rows) **only when
+	/// the aspect carries more segments than that** — i.e. it is genuinely over-fragmented.
+	/// A well-sized aspect returns `None` without ever reading its segment descriptors, so a
+	/// converged aspect costs one control-plane rollup read per tick, not a full index scan.
+	///
+	/// Returns `Some(removed)` when the compaction ran, `None` when the aspect held (already
+	/// as compact as the target allows, unknown, or empty). `target_rows` clamps to 1.
+	///
+	/// # Errors
+	///
+	/// As [`squash_aspect_to_target_rows`](SegmentStore::squash_aspect_to_target_rows); also
+	/// propagates the rollup read.
+	pub async fn squash_aspect_to_target_rows_if_fragmented(&self, aspect: &str, target_rows: usize) -> Result<Option<usize>> {
+		let target_rows = target_rows.max(1);
+		let Some(meta) = self.metadata.get(aspect).await? else { return Ok(None) };
+		// Minimum segments to hold total_rows at the target; a fully-compacted aspect sits at
+		// exactly this count (or below), so more than this means there is fragmentation to fold.
+		let ideal = meta.total_rows.div_ceil(target_rows as u64).max(1);
+		if (meta.segment_count as u64) <= ideal {
+			return Ok(None);
+		}
+		Ok(Some(self.squash_aspect_to_target_rows(aspect, target_rows).await?))
+	}
+
+	/// **Fragmentation-gated store-wide** size-targeted compaction (roadmap Phase 4.6).
+	///
+	/// The tick the background compaction daemon actually calls: applies
+	/// [`squash_aspect_to_target_rows_if_fragmented`](SegmentStore::squash_aspect_to_target_rows_if_fragmented)
+	/// to every declared aspect, so a converged store costs one O(1) rollup read per aspect
+	/// per tick and rewrites nothing. Unlike [`squash_all_to_target_rows`](SegmentStore::squash_all_to_target_rows)
+	/// (which unconditionally scans and coalesces every aspect — the "force" form a manual
+	/// caller wants), this skips aspects already at or below their ideal segment count.
+	/// Returns a [`SquashSweep`].
+	///
+	/// # Errors
+	///
+	/// As [`squash_aspect_to_target_rows_if_fragmented`](SegmentStore::squash_aspect_to_target_rows_if_fragmented);
+	/// also propagates the aspect-list read.
+	pub async fn squash_all_to_target_rows_if_fragmented(&self, target_rows: usize) -> Result<SquashSweep> {
+		let aspects = self.list_declared_aspects().await?;
+		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
+		for aspect in &aspects {
+			if let Some(removed) = self.squash_aspect_to_target_rows_if_fragmented(aspect, target_rows).await? {
+				if removed > 0 {
+					sweep.aspects_squashed += 1;
+					sweep.segments_removed += removed;
+				}
+			}
+		}
+		Ok(sweep)
+	}
+
 	/// Read every present row of `aspect` whose **value** falls in the inclusive range
 	/// `[lo, hi]`, **opening only the segment files whose value span overlaps it**.
 	///
@@ -2896,6 +2955,51 @@ mod tests {
 		assert_eq!(sweep.segments_removed, 3, "a's six segments folded to three (three pairs)");
 		assert_eq!(a_count, 3);
 		assert_eq!(b_count, 1, "a single-segment aspect is untouched");
+	}
+
+	#[tokio::test]
+	async fn fragmentation_gate_skips_well_sized_aspects() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		// Six 2-row segments = 12 rows. Target 6 → ideal ⌈12/6⌉ = 2 segments.
+		for seg in 0..6_i64 {
+			let base = seg * 100;
+			store.seal("a", &schema(), &[base, base + 10], &[bd("1"), bd("2")]).await.expect("seals");
+		}
+		// segment_count 6 > ideal 2 → the gate fires and coalesces toward the target.
+		let first = store.squash_aspect_to_target_rows_if_fragmented("a", 6).await.expect("gated");
+		let after = store.segment_count("a").await.expect("count");
+		// Now 2 segments of 6 rows = the ideal → a second gated call holds without a rescan.
+		let second = store.squash_aspect_to_target_rows_if_fragmented("a", 6).await.expect("gated");
+		drop(store);
+		assert_eq!(first, Some(4), "an over-fragmented aspect coalesces (6 → 2, 4 removed)");
+		assert_eq!(after, 2);
+		assert_eq!(second, None, "a well-sized aspect (at its ideal segment count) is skipped");
+	}
+
+	#[tokio::test]
+	async fn gated_store_sweep_only_touches_fragmented_aspects() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("frag", &schema()).await.expect("declares frag");
+		store.declare("tidy", &schema()).await.expect("declares tidy");
+		// frag: four 2-row segments (8 rows, ideal 2 at target 4 → over-fragmented).
+		for seg in 0..4_i64 {
+			let base = seg * 100;
+			store.seal("frag", &schema(), &[base, base + 10], &[bd("1"), bd("2")]).await.expect("frag seg");
+		}
+		// tidy: one 4-row segment already at its ideal.
+		store.seal("tidy", &schema(), &[0_i64, 1, 2, 3], &[bd("1"), bd("2"), bd("3"), bd("4")]).await.expect("tidy seg");
+		let sweep = store.squash_all_to_target_rows_if_fragmented(4).await.expect("gated sweep");
+		let frag_count = store.segment_count("frag").await.expect("frag count");
+		let tidy_count = store.segment_count("tidy").await.expect("tidy count");
+		drop(store);
+		assert_eq!(sweep.aspects_scanned, 2);
+		assert_eq!(sweep.aspects_squashed, 1, "only the fragmented aspect coalesced");
+		assert_eq!(sweep.segments_removed, 2, "frag's four segments folded to two");
+		assert_eq!(frag_count, 2);
+		assert_eq!(tidy_count, 1, "the tidy aspect was skipped by the gate");
 	}
 
 	#[tokio::test]
