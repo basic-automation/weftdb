@@ -58,6 +58,14 @@ pub struct ReconcileDaemonConfig {
 	/// bounding the fragmentation repeated split carve-offs create. When `None`, no
 	/// squash runs. Independent of `overlaps`/`hot_cold`/`threshold`.
 	pub squash_max_segments: Option<usize>,
+	/// Optional **target segment size in rows** for size-aware compaction (roadmap
+	/// Phase 4.6). When `Some`, each tick **also** coalesces every aspect's segments
+	/// toward ~this many rows per segment
+	/// ([`reconcile_tick_compact`] / [`SegmentStore::squash_all_to_target_rows`](database::SegmentStore::squash_all_to_target_rows)),
+	/// holding fragmentation near the read-optimal size rather than folding to one (which
+	/// `squash_max_segments` does). When `None`, no size-aware compaction runs. Independent
+	/// of the other axes; runs after the squash pass.
+	pub compact_target_rows: Option<usize>,
 }
 
 /// Run one reconcile tick.
@@ -189,6 +197,32 @@ pub async fn reconcile_tick_squash(store: &SegmentStore, metrics: &SharedMetrics
 	Ok(sweep)
 }
 
+/// Run one **size-targeted compaction** tick (roadmap Phase 4.6).
+///
+/// Sweeps every aspect through
+/// [`SegmentStore::squash_all_to_target_rows`](database::SegmentStore::squash_all_to_target_rows),
+/// coalescing each aspect's segments toward ~`target_rows` rows per segment (leaving
+/// already-large segments untouched) — the size-aware bound on fragmentation, motivated
+/// by the `downsample_range` knee (one giant segment reads slower than several mid-sized
+/// ones, so [`reconcile_tick_squash`]'s fold-to-one over-corrects). Records the compacted
+/// aspects and removed segments in `metrics` (a compaction is a pass, like a squash), and
+/// returns the [`SquashSweep`]. A sweep that coalesced nothing records nothing.
+///
+/// # Errors
+///
+/// Propagates a failure from
+/// [`SegmentStore::squash_all_to_target_rows`](database::SegmentStore::squash_all_to_target_rows).
+pub async fn reconcile_tick_compact(store: &SegmentStore, metrics: &SharedMetrics, target_rows: usize) -> anyhow::Result<SquashSweep> {
+	let span = tracing::info_span!("reconcile.tick", kind = "compact", target_rows, aspects = tracing::field::Empty, segments = tracing::field::Empty);
+	let sweep = store.squash_all_to_target_rows(target_rows).instrument(span.clone()).await?;
+	span.record("aspects", sweep.aspects_squashed);
+	span.record("segments", sweep.segments_removed);
+	if sweep.aspects_squashed > 0 {
+		metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_squashed).unwrap_or(u64::MAX), u64::try_from(sweep.segments_removed).unwrap_or(u64::MAX));
+	}
+	Ok(sweep)
+}
+
 /// Spawn the background reconcile daemon on `config.interval`.
 ///
 /// Returns the task handle; dropping it leaves the daemon running detached for the
@@ -248,6 +282,17 @@ pub fn spawn_reconcile_daemon(store: Arc<SegmentStore>, metrics: SharedMetrics, 
 					},
 					Ok(_) => {},
 					Err(err) => eprintln!("reconcile daemon: squash sweep failed: {err}"),
+				}
+			}
+			// Optionally coalesce toward a target segment size (size-aware fragmentation
+			// bound; runs after the squash-to-one pass, an independent axis).
+			if let Some(target_rows) = config.compact_target_rows {
+				match reconcile_tick_compact(&store, &metrics, target_rows).await {
+					Ok(sweep) if sweep.aspects_squashed > 0 => {
+						println!("reconcile daemon (compact): scanned {} aspect(s), compacted {} aspect(s) / removed {} segment(s)", sweep.aspects_scanned, sweep.aspects_squashed, sweep.segments_removed);
+					},
+					Ok(_) => {},
+					Err(err) => eprintln!("reconcile daemon: compaction sweep failed: {err}"),
 				}
 			}
 		}
@@ -413,5 +458,36 @@ mod tests {
 		drop(store);
 		assert_eq!(quiet.aspects_squashed, 0);
 		assert_eq!(snap2.reconcile.passes, 1, "the quiet squash tick did not bump the pass counter");
+	}
+
+	#[tokio::test]
+	async fn compact_tick_coalesces_toward_target_and_records_metrics() {
+		let dir = TempDir::new().unwrap();
+		let store = SegmentStore::open(dir.path()).await.unwrap();
+		store.declare("a", &schema()).await.unwrap();
+		// Four disjoint 2-row segments; target 4 coalesces them in pairs → two segments
+		// (NOT one, unlike the squash tick), holding fragmentation near the target size.
+		store.seal("a", &schema(), &[0_i64, 10], &[bd("0"), bd("1")]).await.unwrap();
+		store.seal("a", &schema(), &[20_i64, 30], &[bd("2"), bd("3")]).await.unwrap();
+		store.seal("a", &schema(), &[40_i64, 50], &[bd("4"), bd("5")]).await.unwrap();
+		store.seal("a", &schema(), &[60_i64, 70], &[bd("6"), bd("7")]).await.unwrap();
+		let metrics: SharedMetrics = Arc::new(Metrics::default());
+
+		let sweep = reconcile_tick_compact(&store, &metrics, 4).await.unwrap();
+		let snap = metrics.snapshot();
+		let count = store.segment_count("a").await.unwrap();
+		drop(store);
+		assert_eq!(sweep.aspects_squashed, 1);
+		assert_eq!(sweep.segments_removed, 2, "four segments coalesced to two (two pairs)");
+		assert_eq!(snap.reconcile.passes, 1, "a compaction is a pass");
+		assert_eq!(count, 2, "held near the target size, not folded to one");
+
+		// A second tick: the two segments are each already at the 4-row target → no-op.
+		let store = SegmentStore::open(dir.path()).await.unwrap();
+		let quiet = reconcile_tick_compact(&store, &metrics, 4).await.unwrap();
+		let snap2 = metrics.snapshot();
+		drop(store);
+		assert_eq!(quiet.aspects_squashed, 0);
+		assert_eq!(snap2.reconcile.passes, 1, "the quiet compaction tick did not bump the pass counter");
 	}
 }
