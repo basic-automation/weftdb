@@ -1503,6 +1503,93 @@ impl SegmentStore {
 		Ok(sweep)
 	}
 
+	/// **Compact an aspect toward a target segment size** (roadmap Phase 4.6 — the
+	/// size-aware counterpart of [`squash_aspect`](SegmentStore::squash_aspect)).
+	///
+	/// [`squash_aspect`](SegmentStore::squash_aspect) folds *every* segment into one, which
+	/// the `downsample_range` segment-count bench showed over-corrects: at a fixed row count
+	/// a single large segment reads **slower** than a handful of mid-sized ones (one
+	/// 200k-row segment measured ~32.8 ms vs ~9.7 ms for sixteen ~12.5k-row segments — a
+	/// single segment offers no cross-segment parallelism and decodes its whole column in
+	/// one shot, while too many segments pay a per-segment fixed cost). This compaction
+	/// instead coalesces **consecutive** (seal-id-ordered) segments into groups whose
+	/// combined row count first reaches `target_rows`, re-sealing each multi-segment group
+	/// into one segment at the group's lowest id and leaving already-large segments
+	/// untouched — folding an over-fragmented aspect toward ~`target_rows`-sized segments
+	/// rather than a single giant one.
+	///
+	/// Grouping is by ascending seal id (≈ time order for append-mostly ingest); each group
+	/// merges oldest→newest via [`merge_newer_wins`] so a residual shared timestamp still
+	/// resolves last-writer-wins, and the merged rows are time-sorted so every resealed
+	/// segment is sorted. A `target_rows` of 0 clamps to 1, so every segment forms its own
+	/// singleton group and the call is a no-op. A single-segment group is never rewritten.
+	///
+	/// Returns the number of segments removed (`Σ (group_len − 1)`); zero when nothing
+	/// coalesced (fewer than two segments, or every segment already ≥ `target_rows`).
+	///
+	/// # Errors
+	///
+	/// As [`squash_aspect`](SegmentStore::squash_aspect).
+	pub async fn squash_aspect_to_target_rows(&self, aspect: &str, target_rows: usize) -> Result<usize> {
+		let target_rows = target_rows.max(1);
+		let descriptors = self.index.all(aspect).await?;
+		if descriptors.len() < 2 {
+			return Ok(0);
+		}
+		let schema = self.require_schema(aspect).await?;
+		let mut ids: Vec<u64> = descriptors.iter().map(|d| d.id).collect();
+		ids.sort_unstable();
+		// Greedily group consecutive ids until a group's cumulative row count first reaches
+		// the target; a trailing partial group is kept as-is. A group that stays a singleton
+		// (a segment already ≥ target, or the lone tail) is skipped below — never rewritten.
+		let mut groups: Vec<Vec<u64>> = Vec::new();
+		let mut group: Vec<u64> = Vec::new();
+		let mut group_rows = 0usize;
+		for &id in &ids {
+			let rows = descriptors.iter().find(|d| d.id == id).map_or(0, |d| d.row_count);
+			group.push(id);
+			group_rows += rows;
+			if group_rows >= target_rows {
+				groups.push(std::mem::take(&mut group));
+				group_rows = 0;
+			}
+		}
+		if !group.is_empty() {
+			groups.push(group);
+		}
+		let mut removed = 0usize;
+		for group in groups {
+			if group.len() < 2 {
+				continue;
+			}
+			// Fold oldest → newest so the most-recently-sealed value wins any residual tie.
+			let mut merged: Vec<(i64, Option<BigDecimal>)> = Vec::new();
+			for &id in &group {
+				let descriptor = descriptors.iter().find(|d| d.id == id).ok_or_else(|| anyhow::anyhow!("aspect {aspect:?} lost segment {id} mid-compaction"))?;
+				let (ts, vs) = self.decode_all(descriptor).await?;
+				let mut rows: Vec<(i64, Option<BigDecimal>)> = ts.into_iter().zip(vs).collect();
+				rows.sort_by_key(|(t, _)| *t);
+				merged = merge_newer_wins(&merged, &rows);
+			}
+			let (all_ts, all_vs): (Vec<i64>, Vec<Option<BigDecimal>>) = merged.into_iter().unzip();
+			let target = group[0];
+			self.reseal_nullable_at(aspect, &schema, target, &all_ts, &all_vs, None).await?;
+			for &id in group.iter().skip(1) {
+				self.index.delete(aspect, id).await?;
+				let victim = self.segment_path(aspect, id);
+				tokio::fs::remove_file(&victim).await.with_context(|| format!("removing compacted-away segment {}", victim.display()))?;
+				self.remove_sidecar(aspect, id).await?;
+				removed += 1;
+			}
+		}
+		// Only the resealed target ids remain of each group; a segment-set change means the
+		// O(1) rollup fold would be wrong, so rebuild it once from the durable index.
+		if removed > 0 {
+			self.rebuild_aspect_metadata(aspect).await?;
+		}
+		Ok(removed)
+	}
+
 	/// Read every present row of `aspect` whose **value** falls in the inclusive range
 	/// `[lo, hi]`, **opening only the segment files whose value span overlaps it**.
 	///
@@ -2715,6 +2802,69 @@ mod tests {
 		assert_eq!(held, None, "at or below the cap the squash holds");
 		assert_eq!(fired, Some(2), "above the cap it squashes 3 → 1 (2 removed)");
 		assert_eq!(count, 1);
+	}
+
+	#[tokio::test]
+	async fn target_rows_compaction_coalesces_toward_the_target_not_to_one() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		// Six time-disjoint 2-row segments; target 4 groups them in pairs (2+2 reaches 4),
+		// so three pairs collapse to three segments — NOT to one, the whole point vs squash.
+		for seg in 0..6_i64 {
+			let base = seg * 100;
+			store.seal("a", &schema(), &[base, base + 10], &[bd(&seg.to_string()), bd(&(seg + 10).to_string())]).await.expect("seals");
+		}
+		let removed = store.squash_aspect_to_target_rows("a", 4).await.expect("compacts");
+		let count = store.segment_count("a").await.expect("count");
+		let (ts, _) = store.read_time_range("a", 0, 10_000).await.expect("reads");
+		let hit = store.read_point("a", 510).await.expect("reads"); // seg 5's second row → value 15
+		drop(store);
+		assert_eq!(removed, 3, "three pairs each drop one segment");
+		assert_eq!(count, 3, "six segments folded toward the target become three, not one");
+		assert_eq!(ts.len(), 12, "every row preserved");
+		assert_eq!(ts, vec![0, 10, 100, 110, 200, 210, 300, 310, 400, 410, 500, 510], "rows stay time-sorted across the compaction");
+		assert_eq!(hit, Some(bd("15")), "a point still resolves after compaction");
+	}
+
+	#[tokio::test]
+	async fn target_rows_compaction_leaves_already_large_segments_untouched() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		// A 4-row segment already at/over target 3 (its own singleton group, untouched) then
+		// two 1-row segments that coalesce into one.
+		store.seal("a", &schema(), &[0_i64, 1, 2, 3], &[bd("0"), bd("1"), bd("2"), bd("3")]).await.expect("big");
+		store.seal("a", &schema(), &[100_i64], &[bd("4")]).await.expect("small0");
+		store.seal("a", &schema(), &[200_i64], &[bd("5")]).await.expect("small1");
+		let removed = store.squash_aspect_to_target_rows("a", 3).await.expect("compacts");
+		let count = store.segment_count("a").await.expect("count");
+		let (ts, _) = store.read_time_range("a", 0, 10_000).await.expect("reads");
+		drop(store);
+		assert_eq!(removed, 1, "only the two small segments merged; the large one was left alone");
+		assert_eq!(count, 2, "the untouched big segment + the merged pair");
+		assert_eq!(ts, vec![0, 1, 2, 3, 100, 200], "all rows preserved");
+	}
+
+	#[tokio::test]
+	async fn target_rows_compaction_is_a_noop_at_zero_and_below_two_segments() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		store.seal("a", &schema(), &[0_i64, 10], &[bd("0"), bd("1")]).await.expect("s0");
+		store.seal("a", &schema(), &[20_i64, 30], &[bd("2"), bd("3")]).await.expect("s1");
+		store.seal("a", &schema(), &[40_i64, 50], &[bd("4"), bd("5")]).await.expect("s2");
+		// target 0 clamps to 1 → every segment closes its own singleton group → no rewrite.
+		let zero = store.squash_aspect_to_target_rows("a", 0).await.expect("no-op");
+		let count_after_zero = store.segment_count("a").await.expect("count");
+		// A single-segment aspect has nothing to coalesce.
+		store.declare("b", &schema()).await.expect("declares b");
+		store.seal("b", &schema(), &[0_i64], &[bd("9")]).await.expect("b0");
+		let one = store.squash_aspect_to_target_rows("b", 1000).await.expect("no-op");
+		drop(store);
+		assert_eq!(zero, 0, "target 0 clamps to 1 and coalesces nothing");
+		assert_eq!(count_after_zero, 3, "the three segments are untouched");
+		assert_eq!(one, 0, "a single segment has nothing to compact");
 	}
 
 	#[tokio::test]
