@@ -57,6 +57,13 @@ const RECONCILE_SPLIT_MIN_BYTES_ENV: &str = "DSP_RECONCILE_SPLIT_MIN_BYTES";
 /// no squash runs.
 const RECONCILE_MAX_SPLITS_ENV: &str = "DSP_RECONCILE_MAX_SPLITS";
 
+/// Environment variable naming the **target segment size in rows** for the daemon's
+/// size-aware compaction pass (roadmap Phase 4.6). When set, each tick also coalesces
+/// every aspect's segments toward ~this many rows per segment (leaving already-large
+/// segments untouched), holding fragmentation near the read-optimal size rather than
+/// folding to one (`DSP_RECONCILE_MAX_SPLITS`). When unset, no size-aware compaction runs.
+const COMPACT_TARGET_ROWS_ENV: &str = "DSP_COMPACT_TARGET_ROWS";
+
 /// Environment variable naming the OTLP collector endpoint. When set (e.g.
 /// `http://localhost:4317`), `dsp-server` exports its tracing spans to that collector
 /// over OTLP/gRPC in addition to the `fmt` log subscriber (roadmap Phase 3). Unset
@@ -178,7 +185,11 @@ fn spawn_reconcile_daemon_if_configured(state: &AppState) -> anyhow::Result<()> 
 		Ok(raw) => Some(raw.parse().map_err(|e| anyhow::anyhow!("{RECONCILE_MAX_SPLITS_ENV}={raw:?} is not a non-negative integer: {e}"))?),
 		Err(_) => None,
 	};
-	let config = ReconcileDaemonConfig { interval: Duration::from_secs(interval_secs), threshold, hot_cold, overlaps, split_min_bytes, squash_max_segments };
+	let compact_target_rows: Option<usize> = match std::env::var(COMPACT_TARGET_ROWS_ENV) {
+		Ok(raw) => Some(raw.parse().map_err(|e| anyhow::anyhow!("{COMPACT_TARGET_ROWS_ENV}={raw:?} is not a non-negative integer: {e}"))?),
+		Err(_) => None,
+	};
+	let config = ReconcileDaemonConfig { interval: Duration::from_secs(interval_secs), threshold, hot_cold, overlaps, split_min_bytes, squash_max_segments, compact_target_rows };
 	// The daemon runs detached for the process lifetime; its handle is dropped on purpose.
 	drop(spawn_reconcile_daemon(Arc::clone(store), state.metrics().clone(), config));
 	let mode = if hot_cold { "hot/cold" } else { "threshold" };
@@ -188,7 +199,8 @@ fn spawn_reconcile_daemon_if_configured(state: &AppState) -> anyhow::Result<()> 
 		(false, _) => String::new(),
 	};
 	let squash_note = squash_max_segments.map_or_else(String::new, |max| format!(" + squash (max {max} segment(s))"));
-	println!("reconcile daemon: enabled ({mode} mode{overlap_note}{squash_note}, every {interval_secs}s, threshold {threshold} out-of-order segment(s))");
+	let compact_note = compact_target_rows.map_or_else(String::new, |target| format!(" + compact (target {target} row(s)/segment)"));
+	println!("reconcile daemon: enabled ({mode} mode{overlap_note}{squash_note}{compact_note}, every {interval_secs}s, threshold {threshold} out-of-order segment(s))");
 	Ok(())
 }
 
