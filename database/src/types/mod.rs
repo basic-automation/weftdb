@@ -24,7 +24,7 @@ pub use pattern::{Pattern, PatternID};
 pub use pipeline::{DetectorMetadata, DetectorType, PipelineConfig, PipelineState};
 pub use relative::Relative;
 pub use segment_index::SegmentIndexStore;
-pub use partial_sidecar::{PartialSidecar, PartialSidecarPolicy, DEFAULT_PARTIAL_SIDECAR_MIN_ROWS, PARTIAL_SIDECAR_VERSION, SIDECAR_AGGREGATIONS};
+pub use partial_sidecar::{PartialSidecar, PartialSidecarPolicy, DEFAULT_PARTIAL_SIDECAR_MIN_ROWS, MAX_SIDECAR_TIERS, PARTIAL_SIDECAR_VERSION, SIDECAR_AGGREGATIONS};
 pub use segment_store::{AspectStorageStats, CheckpointPolicy, DEFAULT_CHECKPOINT_MIN_ROWS, HotColdReconcile, HotColdSweep, OverlapSweep, ReconcileSweep, SegmentStore, SquashSweep, StoreStorageStats};
 pub use signal::{Distance, ErrVal, Signal, SignalType, Signals};
 pub use subject::{Subject, SubjectId};

@@ -177,25 +177,6 @@ fn window_covers_segment(descriptor: &SegmentDescriptor, start: i64, end: i64) -
 	descriptor.min_ts.zip(descriptor.max_ts).is_some_and(|(min_ts, max_ts)| start <= min_ts && max_ts <= end)
 }
 
-/// The [`PartialReduction`] a stored `sidecar` can contribute to a downsample at
-/// `resolution`, or `None` when it cannot serve that resolution. Serves it **directly**
-/// when the sidecar's base equals the requested resolution, or **re-keyed** when the base
-/// is finer and its grid nests in the requested one (a coarser roll-up needs no decode —
-/// merging the base buckets that fall in each coarse bucket is exact). Returns `None` when
-/// the requested resolution is finer than the base or the grids do not nest, so the caller
-/// falls back to decoding the segment.
-///
-/// # Errors
-///
-/// Propagates a [`dsp_reduce::ReduceError`] from the re-key (a bucket-start overflow at an
-/// extreme resolution/magnitude).
-fn sidecar_partial_for(sidecar: &PartialSidecar, resolution: Resolution) -> Result<Option<PartialReduction>> {
-	if sidecar.base == resolution {
-		return Ok(Some(sidecar.partial.clone()));
-	}
-	sidecar.partial.rebucket(sidecar.base, resolution).map_err(|e| anyhow::anyhow!("re-keying a partial sidecar from {:?} to {resolution:?}: {e}", sidecar.base))
-}
-
 pub struct SegmentStore {
 	/// The store root; sealed frames live in `root/segments/`.
 	root: PathBuf,
@@ -569,7 +550,9 @@ impl SegmentStore {
 			return Ok(());
 		}
 		let partial = dsp_reduce::reduce_partial(&points, base, None, None, &SIDECAR_AGGREGATIONS).map_err(|e| anyhow::anyhow!("reducing segment {} for its partial sidecar: {e}", descriptor.path))?;
-		let sidecar = PartialSidecar::new(base, descriptor, partial);
+		// Materialize the coarser rollup tiers the policy declares (each re-keyed from the
+		// tier below), so a coarse downsample folds a coarse tier rather than the whole base.
+		let sidecar = PartialSidecar::materialize(base, descriptor, partial, &self.partials.tiers()).map_err(|e| anyhow::anyhow!("building rollup tiers for segment {}: {e}", descriptor.path))?;
 		let bytes = sidecar.to_bytes()?;
 		let path = self.sidecar_path(aspect, descriptor.id);
 		tokio::fs::write(&path, &bytes).await.with_context(|| format!("writing partial sidecar {}", path.display()))?;
@@ -697,10 +680,11 @@ impl SegmentStore {
 		// A persisted per-segment partial can *substitute* for decoding a segment only when
 		// it can answer this exact query: every requested reduction must be one the sidecar
 		// materializes (the exact percentiles / TWA need the whole bucket, so a query asking
-		// for them decodes), the sidecar's base resolution must equal the requested one (no
-		// re-bucketing yet — a later slice), and the window must cover the whole segment (no
-		// in-window trimming). When all three hold the stored partial IS the segment's
-		// contribution, so the read skips the value-column decode entirely.
+		// for them decodes), one of the sidecar's materialized grids (its base or a coarser
+		// rollup tier) must equal or nest in the requested resolution (`partial_for` picks the
+		// coarsest that does, re-keying from the fewest buckets), and the window must cover the
+		// whole segment (no in-window trimming). When all three hold the stored partial IS the
+		// segment's contribution, so the read skips the value-column decode entirely.
 		let sidecar_eligible = aggregations.iter().all(|a| a.is_sidecar_materializable());
 
 		// A single pruned segment has nothing to overlap with, so the offload below is
@@ -711,11 +695,11 @@ impl SegmentStore {
 		if descriptors.len() == 1 {
 			let descriptor = &descriptors[0];
 			// The sidecar fast path: no file decode at all when a matching partial serves it —
-			// directly when its base equals the requested resolution, or re-keyed when the base
-			// is finer and its grid nests in the requested one.
+			// directly when a materialized grid equals the requested resolution, or re-keyed
+			// from the coarsest tier that nests in it.
 			if sidecar_eligible && window_covers_segment(descriptor, start, end) {
 				if let Some(sidecar) = self.load_partial_sidecar(aspect, descriptor).await? {
-					if let Some(partial) = sidecar_partial_for(&sidecar, resolution).map_err(|e| anyhow::anyhow!("re-keying the sidecar of {aspect:?}: {e}"))? {
+					if let Some(partial) = sidecar.partial_for(resolution).map_err(|e| anyhow::anyhow!("re-keying the sidecar of {aspect:?}: {e}"))? {
 						return partial.finish(resolution, aggregations).map_err(|e| anyhow::anyhow!("finishing downsample of {aspect:?}: {e}"));
 					}
 				}
@@ -739,7 +723,7 @@ impl SegmentStore {
 			async move {
 				if sidecar_eligible && window_covers_segment(&descriptor, start, end) {
 					if let Some(sidecar) = self.load_partial_sidecar(aspect, &descriptor).await? {
-						if let Some(partial) = sidecar_partial_for(&sidecar, resolution).map_err(|e| anyhow::anyhow!("re-keying a sidecar of {aspect:?}: {e}"))? {
+						if let Some(partial) = sidecar.partial_for(resolution).map_err(|e| anyhow::anyhow!("re-keying a sidecar of {aspect:?}: {e}"))? {
 							return Ok::<Option<PartialReduction>, anyhow::Error>(Some(partial));
 						}
 					}
