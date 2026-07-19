@@ -1590,6 +1590,34 @@ impl SegmentStore {
 		Ok(removed)
 	}
 
+	/// **Store-wide size-targeted compaction** (roadmap Phase 4.6): apply
+	/// [`squash_aspect_to_target_rows`](SegmentStore::squash_aspect_to_target_rows) to
+	/// **every** declared aspect, coalescing each toward ~`target_rows`-sized segments.
+	///
+	/// The tick a background compaction daemon calls to hold fragmentation near the
+	/// read-optimal segment size store-wide — the size-aware counterpart of
+	/// [`squash_all_over_threshold`](SegmentStore::squash_all_over_threshold) (which folds
+	/// each over-threshold aspect all the way to one). Aspects are visited in declared-name
+	/// order. Returns a [`SquashSweep`]: how many aspects were scanned, how many actually
+	/// coalesced at least one segment, and the total segments removed.
+	///
+	/// # Errors
+	///
+	/// As [`squash_aspect_to_target_rows`](SegmentStore::squash_aspect_to_target_rows); also
+	/// propagates the aspect-list read.
+	pub async fn squash_all_to_target_rows(&self, target_rows: usize) -> Result<SquashSweep> {
+		let aspects = self.list_declared_aspects().await?;
+		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
+		for aspect in &aspects {
+			let removed = self.squash_aspect_to_target_rows(aspect, target_rows).await?;
+			if removed > 0 {
+				sweep.aspects_squashed += 1;
+				sweep.segments_removed += removed;
+			}
+		}
+		Ok(sweep)
+	}
+
 	/// Read every present row of `aspect` whose **value** falls in the inclusive range
 	/// `[lo, hi]`, **opening only the segment files whose value span overlaps it**.
 	///
@@ -2844,6 +2872,30 @@ mod tests {
 		assert_eq!(removed, 1, "only the two small segments merged; the large one was left alone");
 		assert_eq!(count, 2, "the untouched big segment + the merged pair");
 		assert_eq!(ts, vec![0, 1, 2, 3, 100, 200], "all rows preserved");
+	}
+
+	#[tokio::test]
+	async fn squash_all_to_target_rows_sweeps_every_aspect() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares a");
+		store.declare("b", &schema()).await.expect("declares b");
+		// a: six 2-row segments (fragmented → coalesces in pairs at target 4). b: one 2-row
+		// segment (nothing to coalesce).
+		for seg in 0..6_i64 {
+			let base = seg * 100;
+			store.seal("a", &schema(), &[base, base + 10], &[bd("0"), bd("1")]).await.expect("a seg");
+		}
+		store.seal("b", &schema(), &[0_i64, 10], &[bd("7"), bd("8")]).await.expect("b0");
+		let sweep = store.squash_all_to_target_rows(4).await.expect("sweeps");
+		let a_count = store.segment_count("a").await.expect("a count");
+		let b_count = store.segment_count("b").await.expect("b count");
+		drop(store);
+		assert_eq!(sweep.aspects_scanned, 2);
+		assert_eq!(sweep.aspects_squashed, 1, "only a was fragmented enough to coalesce");
+		assert_eq!(sweep.segments_removed, 3, "a's six segments folded to three (three pairs)");
+		assert_eq!(a_count, 3);
+		assert_eq!(b_count, 1, "a single-segment aspect is untouched");
 	}
 
 	#[tokio::test]
