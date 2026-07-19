@@ -993,13 +993,18 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   segments toward ~`target_rows`-sized segments (not one), leaving already-large segments untouched,
   plus the store-wide `squash_all_to_target_rows` sweep. Reuses the squash machinery (decode +
   `merge_newer_wins` last-writer-wins + reseal + sidecar cleanup).
-- [ ] **NEXT — wire size-targeted compaction into a daemon + a fragmentation trigger:** the store-layer
-  `squash_*_to_target_rows` compaction exists; wire it behind a background daemon + env
-  (`DSP_COMPACT_TARGET_ROWS` beside the reconcile/squash daemons) and add a **fragmentation gate** (only
-  compact an aspect whose segment count materially exceeds `ceil(total_rows / target_rows)`, so a
-  well-sized aspect is never rewritten). Pick a default target from a real segment-size mix, not the
-  200k-row bench's ~12.5k (which is corpus- and hardware-specific — the transferable knob is
-  rows-per-segment, but the optimum shifts with decode cost and core count). Owner-gated default.
+- [x] **DONE (2026-07-19) — size-targeted compaction wired into the reconcile daemon.**
+  `reconcile_tick_compact` + `ReconcileDaemonConfig.compact_target_rows` + the `DSP_COMPACT_TARGET_ROWS`
+  env (beside the reconcile/squash daemon knobs) run `squash_all_to_target_rows` each tick, recording
+  passes in the `dsp_reconcile_*` metrics. **Runtime-verified** against the live binary: six ingested
+  2-row segments coalesced to two 6-row segments (`/stats` segment_count 6→2), the `reconcile.tick
+  kind="compact"` span + daemon log fired, `dsp_reconcile_passes_total` bumped.
+- [ ] **NEXT — fragmentation gate + default target for the compaction daemon:** the compaction currently
+  runs every tick and coalesces whatever is under target. Add a **gate** so a well-sized aspect is never
+  rewritten (only compact an aspect whose segment count materially exceeds `ceil(total_rows / target_rows)`),
+  and pick a sensible **default** target from a real segment-size mix — the 200k-row bench's ~12.5k is
+  corpus- and hardware-specific (the transferable knob is rows-per-segment, but the optimum shifts with
+  decode cost and core count). Owner-gated default.
 - [x] **DONE (2026-07-16) — linear (trapezoidal) TWA method beside the shipped LOCF weighting:**
   `Aggregation::TwaLinear` (token `twa_linear`, alias `time_weighted_avg_linear`) computing
   `Σ½(vᵢ+vᵢ₊₁)Δtᵢ / ΣΔtᵢ`; `time_weighted_average` is generalized over a private
