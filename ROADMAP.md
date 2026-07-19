@@ -993,12 +993,15 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   segments toward ~`target_rows`-sized segments (not one), leaving already-large segments untouched,
   plus the store-wide `squash_all_to_target_rows` sweep. Reuses the squash machinery (decode +
   `merge_newer_wins` last-writer-wins + reseal + sidecar cleanup).
-- [x] **DONE (2026-07-19) — size-targeted compaction wired into the reconcile daemon.**
-  `reconcile_tick_compact` + `ReconcileDaemonConfig.compact_target_rows` + the `DSP_COMPACT_TARGET_ROWS`
-  env (beside the reconcile/squash daemon knobs) run `squash_all_to_target_rows` each tick, recording
-  passes in the `dsp_reconcile_*` metrics. **Runtime-verified** against the live binary: six ingested
-  2-row segments coalesced to two 6-row segments (`/stats` segment_count 6→2), the `reconcile.tick
-  kind="compact"` span + daemon log fired, `dsp_reconcile_passes_total` bumped.
+- [x] **DONE (2026-07-19) — size-targeted compaction wired into the reconcile daemon + a manual
+  endpoint.** `reconcile_tick_compact` + `ReconcileDaemonConfig.compact_target_rows` + the
+  `DSP_COMPACT_TARGET_ROWS` env (beside the reconcile/squash daemon knobs) run
+  `squash_all_to_target_rows` each tick, recording passes in the `dsp_reconcile_*` metrics; the manual
+  `POST /api/v1/storage/{aspect}/compact?target_rows=N` (parallel to `/squash`) runs
+  `squash_aspect_to_target_rows` on demand. **Both runtime-verified** against the live binary: six
+  ingested 2-row segments coalesced to two 6-row segments — the daemon path via `/stats` segment_count
+  6→2 + the `reconcile.tick kind="compact"` span + `dsp_reconcile_passes_total`, and the endpoint via
+  `POST …/compact?target_rows=6` → `{"removed":4,"segment_count":2}` (missing `target_rows` → 400).
 - [ ] **NEXT — fragmentation gate + default target for the compaction daemon:** the compaction currently
   runs every tick and coalesces whatever is under target. Add a **gate** so a well-sized aspect is never
   rewritten (only compact an aspect whose segment count materially exceeds `ceil(total_rows / target_rows)`),
