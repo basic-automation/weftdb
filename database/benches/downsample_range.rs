@@ -72,7 +72,12 @@ fn bench_segment_count(c: &mut Criterion) {
 
 	let mut group = c.benchmark_group("downsample_range/segments");
 	group.sample_size(10);
-	for segments in [1_i64, 4, 16, 64] {
+	// Swept past 64 to locate the per-segment-overhead knee: at a fixed total row count,
+	// more segments means more file reads + index rows + partial merges but fewer rows to
+	// decode per segment, so beyond some count the fixed per-segment cost dominates and
+	// wall-clock climbs. Where that knee sits bears on a target-segment-size / compaction
+	// policy (DSP already has `squash_aspect`).
+	for segments in [1_i64, 4, 16, 64, 128, 256] {
 		// Seal once per segment count — the sweep measures the reduction, not the seal.
 		let dir = TempDir::new().expect("temp dir");
 		let store = rt.block_on(sealed_store(&dir, segments));
