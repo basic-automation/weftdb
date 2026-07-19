@@ -177,25 +177,6 @@ fn window_covers_segment(descriptor: &SegmentDescriptor, start: i64, end: i64) -
 	descriptor.min_ts.zip(descriptor.max_ts).is_some_and(|(min_ts, max_ts)| start <= min_ts && max_ts <= end)
 }
 
-/// The [`PartialReduction`] a stored `sidecar` can contribute to a downsample at
-/// `resolution`, or `None` when it cannot serve that resolution. Serves it **directly**
-/// when the sidecar's base equals the requested resolution, or **re-keyed** when the base
-/// is finer and its grid nests in the requested one (a coarser roll-up needs no decode —
-/// merging the base buckets that fall in each coarse bucket is exact). Returns `None` when
-/// the requested resolution is finer than the base or the grids do not nest, so the caller
-/// falls back to decoding the segment.
-///
-/// # Errors
-///
-/// Propagates a [`dsp_reduce::ReduceError`] from the re-key (a bucket-start overflow at an
-/// extreme resolution/magnitude).
-fn sidecar_partial_for(sidecar: &PartialSidecar, resolution: Resolution) -> Result<Option<PartialReduction>> {
-	if sidecar.base == resolution {
-		return Ok(Some(sidecar.partial.clone()));
-	}
-	sidecar.partial.rebucket(sidecar.base, resolution).map_err(|e| anyhow::anyhow!("re-keying a partial sidecar from {:?} to {resolution:?}: {e}", sidecar.base))
-}
-
 pub struct SegmentStore {
 	/// The store root; sealed frames live in `root/segments/`.
 	root: PathBuf,
@@ -569,7 +550,9 @@ impl SegmentStore {
 			return Ok(());
 		}
 		let partial = dsp_reduce::reduce_partial(&points, base, None, None, &SIDECAR_AGGREGATIONS).map_err(|e| anyhow::anyhow!("reducing segment {} for its partial sidecar: {e}", descriptor.path))?;
-		let sidecar = PartialSidecar::new(base, descriptor, partial);
+		// Materialize the coarser rollup tiers the policy declares (each re-keyed from the
+		// tier below), so a coarse downsample folds a coarse tier rather than the whole base.
+		let sidecar = PartialSidecar::materialize(base, descriptor, partial, &self.partials.tiers()).map_err(|e| anyhow::anyhow!("building rollup tiers for segment {}: {e}", descriptor.path))?;
 		let bytes = sidecar.to_bytes()?;
 		let path = self.sidecar_path(aspect, descriptor.id);
 		tokio::fs::write(&path, &bytes).await.with_context(|| format!("writing partial sidecar {}", path.display()))?;
@@ -697,10 +680,11 @@ impl SegmentStore {
 		// A persisted per-segment partial can *substitute* for decoding a segment only when
 		// it can answer this exact query: every requested reduction must be one the sidecar
 		// materializes (the exact percentiles / TWA need the whole bucket, so a query asking
-		// for them decodes), the sidecar's base resolution must equal the requested one (no
-		// re-bucketing yet — a later slice), and the window must cover the whole segment (no
-		// in-window trimming). When all three hold the stored partial IS the segment's
-		// contribution, so the read skips the value-column decode entirely.
+		// for them decodes), one of the sidecar's materialized grids (its base or a coarser
+		// rollup tier) must equal or nest in the requested resolution (`partial_for` picks the
+		// coarsest that does, re-keying from the fewest buckets), and the window must cover the
+		// whole segment (no in-window trimming). When all three hold the stored partial IS the
+		// segment's contribution, so the read skips the value-column decode entirely.
 		let sidecar_eligible = aggregations.iter().all(|a| a.is_sidecar_materializable());
 
 		// A single pruned segment has nothing to overlap with, so the offload below is
@@ -711,11 +695,11 @@ impl SegmentStore {
 		if descriptors.len() == 1 {
 			let descriptor = &descriptors[0];
 			// The sidecar fast path: no file decode at all when a matching partial serves it —
-			// directly when its base equals the requested resolution, or re-keyed when the base
-			// is finer and its grid nests in the requested one.
+			// directly when a materialized grid equals the requested resolution, or re-keyed
+			// from the coarsest tier that nests in it.
 			if sidecar_eligible && window_covers_segment(descriptor, start, end) {
 				if let Some(sidecar) = self.load_partial_sidecar(aspect, descriptor).await? {
-					if let Some(partial) = sidecar_partial_for(&sidecar, resolution).map_err(|e| anyhow::anyhow!("re-keying the sidecar of {aspect:?}: {e}"))? {
+					if let Some(partial) = sidecar.partial_for(resolution).map_err(|e| anyhow::anyhow!("re-keying the sidecar of {aspect:?}: {e}"))? {
 						return partial.finish(resolution, aggregations).map_err(|e| anyhow::anyhow!("finishing downsample of {aspect:?}: {e}"));
 					}
 				}
@@ -739,7 +723,7 @@ impl SegmentStore {
 			async move {
 				if sidecar_eligible && window_covers_segment(&descriptor, start, end) {
 					if let Some(sidecar) = self.load_partial_sidecar(aspect, &descriptor).await? {
-						if let Some(partial) = sidecar_partial_for(&sidecar, resolution).map_err(|e| anyhow::anyhow!("re-keying a sidecar of {aspect:?}: {e}"))? {
+						if let Some(partial) = sidecar.partial_for(resolution).map_err(|e| anyhow::anyhow!("re-keying a sidecar of {aspect:?}: {e}"))? {
 							return Ok::<Option<PartialReduction>, anyhow::Error>(Some(partial));
 						}
 					}
@@ -1514,6 +1498,180 @@ impl SegmentStore {
 			if let Some(removed) = self.squash_aspect_if_exceeds(aspect, max_segments).await? {
 				sweep.aspects_squashed += 1;
 				sweep.segments_removed += removed;
+			}
+		}
+		Ok(sweep)
+	}
+
+	/// **Compact an aspect toward a target segment size** (roadmap Phase 4.6 — the
+	/// size-aware counterpart of [`squash_aspect`](SegmentStore::squash_aspect)).
+	///
+	/// [`squash_aspect`](SegmentStore::squash_aspect) folds *every* segment into one, which
+	/// the `downsample_range` segment-count bench showed over-corrects: at a fixed row count
+	/// a single large segment reads **slower** than a handful of mid-sized ones (one
+	/// 200k-row segment measured ~32.8 ms vs ~9.7 ms for sixteen ~12.5k-row segments — a
+	/// single segment offers no cross-segment parallelism and decodes its whole column in
+	/// one shot, while too many segments pay a per-segment fixed cost). This compaction
+	/// instead coalesces **consecutive** (seal-id-ordered) segments into groups whose
+	/// combined row count first reaches `target_rows`, re-sealing each multi-segment group
+	/// into one segment at the group's lowest id and leaving already-large segments
+	/// untouched — folding an over-fragmented aspect toward ~`target_rows`-sized segments
+	/// rather than a single giant one.
+	///
+	/// Grouping is by ascending seal id (≈ time order for append-mostly ingest); each group
+	/// merges oldest→newest via [`merge_newer_wins`] so a residual shared timestamp still
+	/// resolves last-writer-wins, and the merged rows are time-sorted so every resealed
+	/// segment is sorted. A `target_rows` of 0 clamps to 1, so every segment forms its own
+	/// singleton group and the call is a no-op. A single-segment group is never rewritten.
+	///
+	/// Returns the number of segments removed (`Σ (group_len − 1)`); zero when nothing
+	/// coalesced (fewer than two segments, or every segment already ≥ `target_rows`).
+	///
+	/// # Errors
+	///
+	/// As [`squash_aspect`](SegmentStore::squash_aspect).
+	pub async fn squash_aspect_to_target_rows(&self, aspect: &str, target_rows: usize) -> Result<usize> {
+		let target_rows = target_rows.max(1);
+		let descriptors = self.index.all(aspect).await?;
+		if descriptors.len() < 2 {
+			return Ok(0);
+		}
+		let schema = self.require_schema(aspect).await?;
+		let mut ids: Vec<u64> = descriptors.iter().map(|d| d.id).collect();
+		ids.sort_unstable();
+		// Greedily group consecutive ids until a group's cumulative row count first reaches
+		// the target; a trailing partial group is kept as-is. A group that stays a singleton
+		// (a segment already ≥ target, or the lone tail) is skipped below — never rewritten.
+		let mut groups: Vec<Vec<u64>> = Vec::new();
+		let mut group: Vec<u64> = Vec::new();
+		let mut group_rows = 0usize;
+		for &id in &ids {
+			let rows = descriptors.iter().find(|d| d.id == id).map_or(0, |d| d.row_count);
+			group.push(id);
+			group_rows += rows;
+			if group_rows >= target_rows {
+				groups.push(std::mem::take(&mut group));
+				group_rows = 0;
+			}
+		}
+		if !group.is_empty() {
+			groups.push(group);
+		}
+		let mut removed = 0usize;
+		for group in groups {
+			if group.len() < 2 {
+				continue;
+			}
+			// Fold oldest → newest so the most-recently-sealed value wins any residual tie.
+			let mut merged: Vec<(i64, Option<BigDecimal>)> = Vec::new();
+			for &id in &group {
+				let descriptor = descriptors.iter().find(|d| d.id == id).ok_or_else(|| anyhow::anyhow!("aspect {aspect:?} lost segment {id} mid-compaction"))?;
+				let (ts, vs) = self.decode_all(descriptor).await?;
+				let mut rows: Vec<(i64, Option<BigDecimal>)> = ts.into_iter().zip(vs).collect();
+				rows.sort_by_key(|(t, _)| *t);
+				merged = merge_newer_wins(&merged, &rows);
+			}
+			let (all_ts, all_vs): (Vec<i64>, Vec<Option<BigDecimal>>) = merged.into_iter().unzip();
+			let target = group[0];
+			self.reseal_nullable_at(aspect, &schema, target, &all_ts, &all_vs, None).await?;
+			for &id in group.iter().skip(1) {
+				self.index.delete(aspect, id).await?;
+				let victim = self.segment_path(aspect, id);
+				tokio::fs::remove_file(&victim).await.with_context(|| format!("removing compacted-away segment {}", victim.display()))?;
+				self.remove_sidecar(aspect, id).await?;
+				removed += 1;
+			}
+		}
+		// Only the resealed target ids remain of each group; a segment-set change means the
+		// O(1) rollup fold would be wrong, so rebuild it once from the durable index.
+		if removed > 0 {
+			self.rebuild_aspect_metadata(aspect).await?;
+		}
+		Ok(removed)
+	}
+
+	/// **Store-wide size-targeted compaction** (roadmap Phase 4.6): apply
+	/// [`squash_aspect_to_target_rows`](SegmentStore::squash_aspect_to_target_rows) to
+	/// **every** declared aspect, coalescing each toward ~`target_rows`-sized segments.
+	///
+	/// The tick a background compaction daemon calls to hold fragmentation near the
+	/// read-optimal segment size store-wide — the size-aware counterpart of
+	/// [`squash_all_over_threshold`](SegmentStore::squash_all_over_threshold) (which folds
+	/// each over-threshold aspect all the way to one). Aspects are visited in declared-name
+	/// order. Returns a [`SquashSweep`]: how many aspects were scanned, how many actually
+	/// coalesced at least one segment, and the total segments removed.
+	///
+	/// # Errors
+	///
+	/// As [`squash_aspect_to_target_rows`](SegmentStore::squash_aspect_to_target_rows); also
+	/// propagates the aspect-list read.
+	pub async fn squash_all_to_target_rows(&self, target_rows: usize) -> Result<SquashSweep> {
+		let aspects = self.list_declared_aspects().await?;
+		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
+		for aspect in &aspects {
+			let removed = self.squash_aspect_to_target_rows(aspect, target_rows).await?;
+			if removed > 0 {
+				sweep.aspects_squashed += 1;
+				sweep.segments_removed += removed;
+			}
+		}
+		Ok(sweep)
+	}
+
+	/// **Fragmentation-gated** size-targeted compaction of one aspect (roadmap Phase 4.6).
+	///
+	/// The cheap-first guard the background daemon uses so it does not scan every aspect's
+	/// segment list on every tick. Reads the **O(1)** per-aspect rollup
+	/// ([`AspectMetadataStore`](super::AspectMetadataStore)) for the segment count and total
+	/// rows, computes the minimum segments needed to hold that many rows at `target_rows`
+	/// (`ideal = ⌈total_rows / target_rows⌉`), and runs
+	/// [`squash_aspect_to_target_rows`](SegmentStore::squash_aspect_to_target_rows) **only when
+	/// the aspect carries more segments than that** — i.e. it is genuinely over-fragmented.
+	/// A well-sized aspect returns `None` without ever reading its segment descriptors, so a
+	/// converged aspect costs one control-plane rollup read per tick, not a full index scan.
+	///
+	/// Returns `Some(removed)` when the compaction ran, `None` when the aspect held (already
+	/// as compact as the target allows, unknown, or empty). `target_rows` clamps to 1.
+	///
+	/// # Errors
+	///
+	/// As [`squash_aspect_to_target_rows`](SegmentStore::squash_aspect_to_target_rows); also
+	/// propagates the rollup read.
+	pub async fn squash_aspect_to_target_rows_if_fragmented(&self, aspect: &str, target_rows: usize) -> Result<Option<usize>> {
+		let target_rows = target_rows.max(1);
+		let Some(meta) = self.metadata.get(aspect).await? else { return Ok(None) };
+		// Minimum segments to hold total_rows at the target; a fully-compacted aspect sits at
+		// exactly this count (or below), so more than this means there is fragmentation to fold.
+		let ideal = meta.total_rows.div_ceil(target_rows as u64).max(1);
+		if (meta.segment_count as u64) <= ideal {
+			return Ok(None);
+		}
+		Ok(Some(self.squash_aspect_to_target_rows(aspect, target_rows).await?))
+	}
+
+	/// **Fragmentation-gated store-wide** size-targeted compaction (roadmap Phase 4.6).
+	///
+	/// The tick the background compaction daemon actually calls: applies
+	/// [`squash_aspect_to_target_rows_if_fragmented`](SegmentStore::squash_aspect_to_target_rows_if_fragmented)
+	/// to every declared aspect, so a converged store costs one O(1) rollup read per aspect
+	/// per tick and rewrites nothing. Unlike [`squash_all_to_target_rows`](SegmentStore::squash_all_to_target_rows)
+	/// (which unconditionally scans and coalesces every aspect — the "force" form a manual
+	/// caller wants), this skips aspects already at or below their ideal segment count.
+	/// Returns a [`SquashSweep`].
+	///
+	/// # Errors
+	///
+	/// As [`squash_aspect_to_target_rows_if_fragmented`](SegmentStore::squash_aspect_to_target_rows_if_fragmented);
+	/// also propagates the aspect-list read.
+	pub async fn squash_all_to_target_rows_if_fragmented(&self, target_rows: usize) -> Result<SquashSweep> {
+		let aspects = self.list_declared_aspects().await?;
+		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
+		for aspect in &aspects {
+			if let Some(removed) = self.squash_aspect_to_target_rows_if_fragmented(aspect, target_rows).await? {
+				if removed > 0 {
+					sweep.aspects_squashed += 1;
+					sweep.segments_removed += removed;
+				}
 			}
 		}
 		Ok(sweep)
@@ -2731,6 +2889,138 @@ mod tests {
 		assert_eq!(held, None, "at or below the cap the squash holds");
 		assert_eq!(fired, Some(2), "above the cap it squashes 3 → 1 (2 removed)");
 		assert_eq!(count, 1);
+	}
+
+	#[tokio::test]
+	async fn target_rows_compaction_coalesces_toward_the_target_not_to_one() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		// Six time-disjoint 2-row segments; target 4 groups them in pairs (2+2 reaches 4),
+		// so three pairs collapse to three segments — NOT to one, the whole point vs squash.
+		for seg in 0..6_i64 {
+			let base = seg * 100;
+			store.seal("a", &schema(), &[base, base + 10], &[bd(&seg.to_string()), bd(&(seg + 10).to_string())]).await.expect("seals");
+		}
+		let removed = store.squash_aspect_to_target_rows("a", 4).await.expect("compacts");
+		let count = store.segment_count("a").await.expect("count");
+		let (ts, _) = store.read_time_range("a", 0, 10_000).await.expect("reads");
+		let hit = store.read_point("a", 510).await.expect("reads"); // seg 5's second row → value 15
+		drop(store);
+		assert_eq!(removed, 3, "three pairs each drop one segment");
+		assert_eq!(count, 3, "six segments folded toward the target become three, not one");
+		assert_eq!(ts.len(), 12, "every row preserved");
+		assert_eq!(ts, vec![0, 10, 100, 110, 200, 210, 300, 310, 400, 410, 500, 510], "rows stay time-sorted across the compaction");
+		assert_eq!(hit, Some(bd("15")), "a point still resolves after compaction");
+	}
+
+	#[tokio::test]
+	async fn target_rows_compaction_leaves_already_large_segments_untouched() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		// A 4-row segment already at/over target 3 (its own singleton group, untouched) then
+		// two 1-row segments that coalesce into one.
+		store.seal("a", &schema(), &[0_i64, 1, 2, 3], &[bd("0"), bd("1"), bd("2"), bd("3")]).await.expect("big");
+		store.seal("a", &schema(), &[100_i64], &[bd("4")]).await.expect("small0");
+		store.seal("a", &schema(), &[200_i64], &[bd("5")]).await.expect("small1");
+		let removed = store.squash_aspect_to_target_rows("a", 3).await.expect("compacts");
+		let count = store.segment_count("a").await.expect("count");
+		let (ts, _) = store.read_time_range("a", 0, 10_000).await.expect("reads");
+		drop(store);
+		assert_eq!(removed, 1, "only the two small segments merged; the large one was left alone");
+		assert_eq!(count, 2, "the untouched big segment + the merged pair");
+		assert_eq!(ts, vec![0, 1, 2, 3, 100, 200], "all rows preserved");
+	}
+
+	#[tokio::test]
+	async fn squash_all_to_target_rows_sweeps_every_aspect() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares a");
+		store.declare("b", &schema()).await.expect("declares b");
+		// a: six 2-row segments (fragmented → coalesces in pairs at target 4). b: one 2-row
+		// segment (nothing to coalesce).
+		for seg in 0..6_i64 {
+			let base = seg * 100;
+			store.seal("a", &schema(), &[base, base + 10], &[bd("0"), bd("1")]).await.expect("a seg");
+		}
+		store.seal("b", &schema(), &[0_i64, 10], &[bd("7"), bd("8")]).await.expect("b0");
+		let sweep = store.squash_all_to_target_rows(4).await.expect("sweeps");
+		let a_count = store.segment_count("a").await.expect("a count");
+		let b_count = store.segment_count("b").await.expect("b count");
+		drop(store);
+		assert_eq!(sweep.aspects_scanned, 2);
+		assert_eq!(sweep.aspects_squashed, 1, "only a was fragmented enough to coalesce");
+		assert_eq!(sweep.segments_removed, 3, "a's six segments folded to three (three pairs)");
+		assert_eq!(a_count, 3);
+		assert_eq!(b_count, 1, "a single-segment aspect is untouched");
+	}
+
+	#[tokio::test]
+	async fn fragmentation_gate_skips_well_sized_aspects() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		// Six 2-row segments = 12 rows. Target 6 → ideal ⌈12/6⌉ = 2 segments.
+		for seg in 0..6_i64 {
+			let base = seg * 100;
+			store.seal("a", &schema(), &[base, base + 10], &[bd("1"), bd("2")]).await.expect("seals");
+		}
+		// segment_count 6 > ideal 2 → the gate fires and coalesces toward the target.
+		let first = store.squash_aspect_to_target_rows_if_fragmented("a", 6).await.expect("gated");
+		let after = store.segment_count("a").await.expect("count");
+		// Now 2 segments of 6 rows = the ideal → a second gated call holds without a rescan.
+		let second = store.squash_aspect_to_target_rows_if_fragmented("a", 6).await.expect("gated");
+		drop(store);
+		assert_eq!(first, Some(4), "an over-fragmented aspect coalesces (6 → 2, 4 removed)");
+		assert_eq!(after, 2);
+		assert_eq!(second, None, "a well-sized aspect (at its ideal segment count) is skipped");
+	}
+
+	#[tokio::test]
+	async fn gated_store_sweep_only_touches_fragmented_aspects() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("frag", &schema()).await.expect("declares frag");
+		store.declare("tidy", &schema()).await.expect("declares tidy");
+		// frag: four 2-row segments (8 rows, ideal 2 at target 4 → over-fragmented).
+		for seg in 0..4_i64 {
+			let base = seg * 100;
+			store.seal("frag", &schema(), &[base, base + 10], &[bd("1"), bd("2")]).await.expect("frag seg");
+		}
+		// tidy: one 4-row segment already at its ideal.
+		store.seal("tidy", &schema(), &[0_i64, 1, 2, 3], &[bd("1"), bd("2"), bd("3"), bd("4")]).await.expect("tidy seg");
+		let sweep = store.squash_all_to_target_rows_if_fragmented(4).await.expect("gated sweep");
+		let frag_count = store.segment_count("frag").await.expect("frag count");
+		let tidy_count = store.segment_count("tidy").await.expect("tidy count");
+		drop(store);
+		assert_eq!(sweep.aspects_scanned, 2);
+		assert_eq!(sweep.aspects_squashed, 1, "only the fragmented aspect coalesced");
+		assert_eq!(sweep.segments_removed, 2, "frag's four segments folded to two");
+		assert_eq!(frag_count, 2);
+		assert_eq!(tidy_count, 1, "the tidy aspect was skipped by the gate");
+	}
+
+	#[tokio::test]
+	async fn target_rows_compaction_is_a_noop_at_zero_and_below_two_segments() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("a", &schema()).await.expect("declares");
+		store.seal("a", &schema(), &[0_i64, 10], &[bd("0"), bd("1")]).await.expect("s0");
+		store.seal("a", &schema(), &[20_i64, 30], &[bd("2"), bd("3")]).await.expect("s1");
+		store.seal("a", &schema(), &[40_i64, 50], &[bd("4"), bd("5")]).await.expect("s2");
+		// target 0 clamps to 1 → every segment closes its own singleton group → no rewrite.
+		let zero = store.squash_aspect_to_target_rows("a", 0).await.expect("no-op");
+		let count_after_zero = store.segment_count("a").await.expect("count");
+		// A single-segment aspect has nothing to coalesce.
+		store.declare("b", &schema()).await.expect("declares b");
+		store.seal("b", &schema(), &[0_i64], &[bd("9")]).await.expect("b0");
+		let one = store.squash_aspect_to_target_rows("b", 1000).await.expect("no-op");
+		drop(store);
+		assert_eq!(zero, 0, "target 0 clamps to 1 and coalesces nothing");
+		assert_eq!(count_after_zero, 3, "the three segments are untouched");
+		assert_eq!(one, 0, "a single segment has nothing to compact");
 	}
 
 	#[tokio::test]

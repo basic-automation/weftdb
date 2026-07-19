@@ -431,6 +431,57 @@ pub async fn squash_aspect(State(state): State<AppState>, Path(aspect): Path<Str
 	Ok((StatusCode::OK, Json(SquashResponse { aspect, triggered, removed, segment_count })).into_response())
 }
 
+/// Query parameters for `POST /api/v1/storage/{aspect}/compact`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CompactParams {
+	/// The target segment size in **rows** (required). The aspect's segments are
+	/// coalesced toward ~this many rows per segment, leaving already-large segments
+	/// untouched — holding fragmentation near the read-optimal size rather than folding
+	/// to one (which `squash` does). Absent → `400`.
+	pub target_rows: Option<usize>,
+}
+
+/// Response body for `POST /api/v1/storage/{aspect}/compact` — the outcome of a
+/// size-targeted compaction pass.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompactResponse {
+	/// The aspect compacted.
+	pub aspect: String,
+	/// Number of segments removed by coalescing groups toward the target size (0 when
+	/// nothing coalesced — fewer than two segments, or every segment already ≥ target).
+	pub removed: usize,
+	/// The aspect's segment count *after* the pass.
+	pub segment_count: usize,
+}
+
+/// Handle `POST /api/v1/storage/{aspect}/compact?target_rows=N`: coalesce an aspect's
+/// segments toward ~`N` rows per segment (roadmap Phase 4.6 — the size-aware
+/// counterpart of `squash`, which folds to one).
+///
+/// The manual counterpart of the `DSP_COMPACT_TARGET_ROWS` daemon pass, delegating to
+/// [`SegmentStore::squash_aspect_to_target_rows`](database::SegmentStore::squash_aspect_to_target_rows).
+/// Returns `200 OK` with how many segments it removed and the post-pass segment count.
+///
+/// # Errors
+///
+/// [`StorageError::Unconfigured`] when no store is attached,
+/// [`StorageError::BadRequest`] when `target_rows` is absent,
+/// [`StorageError::NotFound`] when the aspect is undeclared, and
+/// [`StorageError::Internal`] on a read/seal/control-plane failure.
+pub async fn compact_aspect(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<CompactParams>) -> Result<Response, StorageError> {
+	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	drop(state);
+	let target_rows = params.target_rows.ok_or_else(|| StorageError::BadRequest("compact requires a target_rows query parameter".to_string()))?;
+	// Undeclared aspect → 404 (mirrors the reconcile/squash surfaces).
+	if store.schema_for(&aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?.is_none() {
+		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
+	}
+	let removed = store.squash_aspect_to_target_rows(&aspect, target_rows).await.map_err(|err| StorageError::Internal(err.to_string()))?;
+	let segment_count = store.segment_count(&aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?;
+	drop(store);
+	Ok((StatusCode::OK, Json(CompactResponse { aspect, removed, segment_count })).into_response())
+}
+
 /// One point in an ingest batch: an integer epoch timestamp (in the aspect's
 /// declared [`TimeUnit`]) and its value as lossless decimal text, or `null` for an
 /// absent/null row.
@@ -1105,6 +1156,36 @@ mod tests {
 		assert_eq!(json["segments_reconciled"], 2);
 		assert_eq!(json["unsorted_segments"], 0);
 		assert_eq!(json["overlapping_segments"], 0, "the reconciled segments cover disjoint windows");
+	}
+
+	#[tokio::test]
+	async fn compact_endpoint_coalesces_toward_target_and_requires_the_param() {
+		let dir = TempDir::new().unwrap();
+		let sc = dsp_physical_type::AspectSchema::new(dsp_physical_type::PhysicalType::F64, "0".parse().unwrap(), dsp_physical_type::TimeUnit::Seconds);
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+		store.declare("load", &sc).await.expect("declares");
+		// Six disjoint 2-row segments; target 6 coalesces them in triples → two segments.
+		for seg in 0..6_i64 {
+			let base = seg * 100;
+			store.seal("load", &sc, &[base, base + 10], &["1".parse().unwrap(), "2".parse().unwrap()]).await.expect("seals");
+		}
+
+		// Missing target_rows → 400.
+		let router = app_with_state(AppState::new().with_store(store.clone()));
+		let bad = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/load/compact").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(bad.status(), StatusCode::BAD_REQUEST, "compact needs a target_rows param");
+
+		// target_rows=6 coalesces six 2-row segments → two 6-row segments (4 removed).
+		let router = app_with_state(AppState::new().with_store(store.clone()));
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/load/compact?target_rows=6").body(Body::empty()).unwrap()).await.unwrap();
+		let status = response.status();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		drop(store);
+		assert_eq!(status, StatusCode::OK, "body: {json}");
+		assert_eq!(json["aspect"], "load");
+		assert_eq!(json["removed"], 4, "six segments coalesced to two (two triples)");
+		assert_eq!(json["segment_count"], 2, "held near the target size, not folded to one");
 	}
 
 	#[tokio::test]

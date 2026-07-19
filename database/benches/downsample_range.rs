@@ -72,7 +72,12 @@ fn bench_segment_count(c: &mut Criterion) {
 
 	let mut group = c.benchmark_group("downsample_range/segments");
 	group.sample_size(10);
-	for segments in [1_i64, 4, 16, 64] {
+	// Swept past 64 to locate the per-segment-overhead knee: at a fixed total row count,
+	// more segments means more file reads + index rows + partial merges but fewer rows to
+	// decode per segment, so beyond some count the fixed per-segment cost dominates and
+	// wall-clock climbs. Where that knee sits bears on a target-segment-size / compaction
+	// policy (DSP already has `squash_aspect`).
+	for segments in [1_i64, 4, 16, 64, 128, 256] {
 		// Seal once per segment count — the sweep measures the reduction, not the seal.
 		let dir = TempDir::new().expect("temp dir");
 		let store = rt.block_on(sealed_store(&dir, segments));
@@ -143,5 +148,36 @@ fn bench_sidecar_vs_decode(c: &mut Criterion) {
 	group.finish();
 }
 
-criterion_group!(benches, bench_segment_count, bench_percentiles, bench_sidecar_vs_decode);
+/// The payoff of the **rollup tier hierarchy**: a coarse (DAY) full-history downsample
+/// re-keys from the coarsest materialized tier rather than folding the whole minute base.
+/// Two identical 16-segment corpora, both sidecar-accelerated at a MINUTES base — one with
+/// no coarser tiers (`single_base`), one with `[HOURS, DAYS]` rollup tiers (`tiered`) — are
+/// downsampled at DAY resolution over all history. The `single_base` arm re-keys every
+/// minute bucket in each segment up to days; the `tiered` arm serves the DAY tier directly
+/// (zero re-key). `sketch_p99` is in the set because each merge is a sketch merge, so
+/// folding fewer source buckets is the win this tier hierarchy exists to deliver.
+fn bench_tiered_vs_single_base(c: &mut Criterion) {
+	let rt = Runtime::new().expect("tokio runtime");
+	let aggs = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::SketchP99];
+
+	let mut group = c.benchmark_group("downsample_range/tiers");
+	group.sample_size(10);
+	let single = PartialSidecarPolicy::at(Resolution::Minutes, 1);
+	let tiered = PartialSidecarPolicy::at_tiered(Resolution::Minutes, 1, &[Resolution::Hours, Resolution::Days]);
+	for (label, policy) in [("single_base", single), ("tiered", tiered)] {
+		let dir = TempDir::new().expect("temp dir");
+		let store = rt.block_on(sealed_store_with_policy(&dir, 16, Some(policy)));
+		group.bench_function(label, |b| {
+			b.iter(|| {
+				let buckets = rt.block_on(store.downsample_range("load", i64::MIN, i64::MAX, Resolution::Days, &aggs)).expect("downsamples");
+				black_box(buckets)
+			});
+		});
+		drop(store);
+		drop(dir);
+	}
+	group.finish();
+}
+
+criterion_group!(benches, bench_segment_count, bench_percentiles, bench_sidecar_vs_decode, bench_tiered_vs_single_base);
 criterion_main!(benches);

@@ -931,32 +931,89 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
     (HOURS/DAYS) with no decode, the in-query form of TimescaleDB's hierarchical continuous aggregates.
   - [x] **sidecar consistency across rewrites** — a reconcile/split/squash regenerates or removes the
     sidecar so acceleration survives (and no `.dspart` is orphaned).
-- [ ] **NEXT — (3) hot-tail / watermark split for unsealed data + materialized tiers.** Two residues,
-  both grounded in this run's research: (a) a **materialization watermark** (partials for sealed
-  segments below it, on-the-fly reduce for the hot tail above it, combined transparently — Timescale's
-  "historical data that hasn't changed is never touched"); (b) a **hierarchy of materialized tiers**
-  (MINUTE partial → HOUR partial → DAY partial, each built from the tier below, not the raw column) so
-  a very coarse query rolls up from a coarse tier rather than re-keying the finest base every time —
-  the pattern TimescaleDB (continuous aggregates on continuous aggregates) and ClickHouse
-  (`raw→hourly→daily→monthly` via `-State`/`-Merge` combinators, quantile digests stored as states,
-  validating DSP's `sketch_p*`-in-sidecar) both converge on. Benchmark a coarse (DAY) query against
-  the shipped single-base re-key. *(src: hierarchical continuous aggregates —
+- [x] **DONE (2026-07-19) — (3b) hierarchy of materialized tiers.** The `.dspart` sidecar carries a
+  chain of coarser rollup tiers beside its base partial (`PartialSidecar::rollups`, frame version 2),
+  each re-keyed from the tier below (`build_rollups`, associative + cheaper than from the base), so a
+  coarse downsample re-keys from the coarsest materialized grid that nests in the requested resolution
+  (`PartialSidecar::partial_for`, exact tier = zero re-key) instead of folding the whole fine base — the
+  in-storage analogue of TimescaleDB's continuous-aggregates-on-continuous-aggregates and ClickHouse's
+  `raw→hourly→daily` `-State`/`-Merge` rollups (whose quantile-digest-as-state validates DSP's
+  `sketch_p*`-in-sidecar). Opt-in via `DSP_SEGMENT_PARTIAL_TIERS` (comma-separated fine→coarse,
+  `[Option<Resolution>; MAX_SIDECAR_TIERS=4]`, non-nesting/finer entries skipped); a rewrite
+  regenerates the tiers. **Measured ~1.16×** on a DAY query over a MINUTES base (16 seg / 200k rows,
+  7.30 → 6.30 ms, non-overlapping CIs; `database/benches/downsample_range.rs::bench_tiered_vs_single_base`).
+  Honest: a modest win at this corpus size (~208 minute buckets/segment), growing with the base-bucket
+  count per segment, and the tiered sidecar is a larger read (base + tiers). *(src: hierarchical
+  continuous aggregates —
   https://docs.tigerdata.com/use-timescale/latest/continuous-aggregates/hierarchical-continuous-aggregates/
   · ClickHouse AggregatingMergeTree `-State`/`-Merge` + rollup —
-  https://clickhouse.com/docs/engines/table-engines/mergetree-family/aggregatingmergetree ·
-  QuestDB incremental materialized-view refresh (only new data written) —
-  https://questdb.com/docs/concepts/materialized-views/)*
+  https://clickhouse.com/docs/engines/table-engines/mergetree-family/aggregatingmergetree)*
+- [x] **DONE (2026-07-19) — (3a) materialization watermark: satisfied by construction.** DSP has no
+  "unsealed hot tail" at the store layer — every segment is immutable once sealed — so the watermark
+  reduces to *which sealed segments carry a sidecar*, which `downsample_range` already handles
+  transparently: a segment with a matching sidecar merges its stored partial, one without decodes on the
+  fly, and the two combine in the same pass (the QuestDB/Timescale `materialized_only=false` "combine
+  materialized history with on-the-fly recent data" pattern). No code was needed beyond the existing
+  mixed path. *(src: TimescaleDB real-time vs materialized-only continuous aggregates —
+  https://www.tigerdata.com/learn/continuous-aggregates-timescaledb)*
+- [ ] **NEXT — (3c) materialized tiers, remaining:** the tier chain is opt-in and manually listed.
+  Residues: (i) a sensible **default** tier chain derived from the base (owner-gated, a default-flip like
+  the others); (ii) demonstrate the win *scales* — re-run `bench_tiered_vs_single_base` on a long-span
+  corpus (many base buckets/segment) where the coarse re-key the tier elides is large, to quantify the
+  regime where tiers pay for their extra sidecar bytes.
+- [ ] **Positioning — DSP's `.dspart` sidecar IS the "incremental materialized view", and mergeable
+  DDSketch is its edge (this run's research):** ClickHouse frames the choice as **incremental** MVs
+  (insert-triggered, real-time, `AggregatingMergeTree` storing `-State` partial aggregates merged lazily
+  at query) vs **refreshable** MVs (scheduled full recompute; the fallback for dimension-heavy joins and
+  UPDATE/DELETE sources, and — critically — for *percentiles / distinct counts over wide windows, which
+  incremental MVs handle awkwardly*). DSP's sidecar is exactly the incremental/`AggregatingMergeTree`
+  pattern (immutable-segment partials on disk, merged in `downsample_range`) — and because DSP's partial
+  carries a **mergeable DDSketch**, it serves the wide-window percentile case that ClickHouse names as
+  incremental's weakness. Fold this into the *When DSP beats general TSDBs* honesty page as a concrete
+  wedge, and note the **refreshable** counterpart (a scheduled full re-reduce) becomes relevant only once
+  B-tags bring UPDATE/DELETE-style mutations DSP's immutable segments don't yet have. *(src: ClickHouse
+  incremental vs refreshable materialized views —
+  https://clickhouse.com/docs/materialized-view/refreshable-materialized-view · TimescaleDB real-time vs
+  materialized-only continuous aggregates —
+  https://www.tigerdata.com/learn/continuous-aggregates-timescaledb)*
 - [ ] **NEXT — materialize the sidecar at a coarser DEFAULT + adopt sketches:** the sidecar is off by
   default (opt-in via `DSP_SEGMENT_PARTIAL_BASE`). Decide a sensible default base per the shape mix (a
   finer base serves more resolutions but costs more `.dspart` bytes and seal CPU for the sketch), and
   measure the seal-time cost of building the four `sketch_p*` sketches per segment vs the read win —
   the sidecar's size/CPU is the trade to quantify before flipping any default. Owner-gated like the
   other default flips.
-- [ ] **NEXT — per-segment overhead dominates past ~16 segments:** at a fixed 200k rows, 64 segments
-  is *slower* than 16 in **both** the serial (61.3 vs 39.9 ms) and concurrent (20.2 vs 8.5 ms)
-  versions — the per-segment file read + index + partial-merge cost outgrows the shrinking per-segment
-  reduce. Worth finding where the knee is against real segment sizes, and whether it argues for a
-  compaction/target-segment-size policy (DSP already has `squash_aspect`). Measure before tuning.
+- [x] **DONE (2026-07-19) — per-segment overhead knee measured + a size-targeted compaction shipped.**
+  Swept the `downsample_range` segment count at a fixed 200k rows (`bench_segment_count`, now
+  [1,4,16,64,128,256]): the knee sits at **~16 segments / ~12.5k rows-per-segment** (9.68 ms min);
+  **below** it the single-segment decode dominates (1 seg = 32.8 ms, no cross-segment parallelism),
+  **above** it a ~**0.37 ms/segment** fixed cost (file read + index row + partial merge) dominates and
+  wall-clock grows ~linearly (64=23.8, 128=47.0, 256=94.0 ms). So both extremes are bad and blindly
+  squashing an over-fragmented aspect to *one* over-corrects. Shipped the fix:
+  `SegmentStore::squash_aspect_to_target_rows(target_rows)` coalesces consecutive seal-id-ordered
+  segments toward ~`target_rows`-sized segments (not one), leaving already-large segments untouched,
+  plus the store-wide `squash_all_to_target_rows` sweep. Reuses the squash machinery (decode +
+  `merge_newer_wins` last-writer-wins + reseal + sidecar cleanup).
+- [x] **DONE (2026-07-19) — size-targeted compaction wired into the reconcile daemon + a manual
+  endpoint.** `reconcile_tick_compact` + `ReconcileDaemonConfig.compact_target_rows` + the
+  `DSP_COMPACT_TARGET_ROWS` env (beside the reconcile/squash daemon knobs) run
+  `squash_all_to_target_rows` each tick, recording passes in the `dsp_reconcile_*` metrics; the manual
+  `POST /api/v1/storage/{aspect}/compact?target_rows=N` (parallel to `/squash`) runs
+  `squash_aspect_to_target_rows` on demand. **Both runtime-verified** against the live binary: six
+  ingested 2-row segments coalesced to two 6-row segments — the daemon path via `/stats` segment_count
+  6→2 + the `reconcile.tick kind="compact"` span + `dsp_reconcile_passes_total`, and the endpoint via
+  `POST …/compact?target_rows=6` → `{"removed":4,"segment_count":2}` (missing `target_rows` → 400).
+- [x] **DONE (2026-07-19) — fragmentation gate for the compaction daemon.**
+  `SegmentStore::squash_aspect_to_target_rows_if_fragmented` reads the **O(1)** per-aspect rollup and
+  runs the compaction only when `segment_count > ⌈total_rows / target_rows⌉` (genuinely over-fragmented),
+  so a converged aspect costs one rollup read per tick, not a full segment-index scan; the daemon tick
+  (`reconcile_tick_compact`) now calls the gated store-wide sweep
+  `squash_all_to_target_rows_if_fragmented`. The ungated `squash_*_to_target_rows` stays as the "force"
+  form the manual `/compact` endpoint uses. (2 new database tests: gate skips a well-sized aspect,
+  gated sweep touches only the fragmented one.)
+- [ ] **NEXT — default target for the compaction daemon:** pick a sensible **default** `DSP_COMPACT_TARGET_ROWS`
+  from a real segment-size mix — the 200k-row bench's ~12.5k is corpus- and hardware-specific (the
+  transferable knob is rows-per-segment, but the optimum shifts with decode cost and core count).
+  Owner-gated default.
 - [x] **DONE (2026-07-16) — linear (trapezoidal) TWA method beside the shipped LOCF weighting:**
   `Aggregation::TwaLinear` (token `twa_linear`, alias `time_weighted_avg_linear`) computing
   `Σ½(vᵢ+vᵢ₊₁)Δtᵢ / ΣΔtᵢ`; `time_weighted_average` is generalized over a private
