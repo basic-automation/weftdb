@@ -846,14 +846,29 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   **Verified: `cargo test -p splimes --lib` run 6× consecutively = 27 passed / 0 failed every time**
   (previously ~1 run in 3 failed, and `tests::regression` failed ~2/2). The Phase 5 GPU benchmark
   claims now have a correctness gate that means something.
-- [ ] **BLOCKER (found 2026-07-16) — `cargo test --workspace` cannot complete: rustc ICE on
-  `splimes` `gpu_integration_tests`.** The nightly compiler (`1.99.0-nightly daf2e5e18`,
-  2026-07-13) panics with `error: the compiler unexpectedly panicked` in
-  `[resolver_for_lowering_raw]` while compiling that test target, so the workspace suite aborts and
-  runs must fall back to per-crate testing. Pre-existing and environmental (the repo root already held
-  `rustc-ice-*.txt` dumps from 2026-01-23/26 — this ICE class recurs); unrelated to any source change
-  (`splimes` has no `dsp-*` dependencies). Try a newer/pinned nightly and, if it persists, minimize +
-  file upstream. NB the ICE drops `rustc-ice-*.txt` dumps in the repo root — never commit them.
+- [x] **DONE (2026-07-20) — BLOCKER CLEARED: the `gpu_integration_tests` rustc ICE was an
+  attribute-ORDER bug, fixable in DSP's own source.** The dump names it exactly: `attribute is missing
+  tokens` on the compiler-injected `rustc_test_entrypoint_marker` at
+  `splimes\tests\gpu_integration_tests.rs:6:1: 6:8` — i.e. on `#[test]`. Mechanism: with `#[test]`
+  **outermost**, rustc's builtin harness injects its entrypoint marker and the `#[serial(gpu_tests)]`
+  **proc-macro** attribute then re-emits the item without that marker's token information, and the
+  compiler asserts. The sibling `splimes/src/tests/*.rs` never hit it because they write
+  `#[tokio::test]` (a proc macro) outermost, so the literal `#[test]` is generated last.
+  **Fixed by reordering the two attributes** (`#[serial(gpu_tests)]` above `#[test]`) across all eight
+  tests in the file — no toolchain change, no `allow`, semantics unchanged. Ruled out the parallel
+  frontend as a cause (the ICE reproduces identically under `-Z threads=1`, so it is not the
+  workstation's global `-Z threads=15`). **The 8 tests in that target now compile and pass for the
+  first time (8 passed / 0 failed)**; they had never run.
+- [ ] **NEXT — `cargo test --workspace` now compiles past the ICE but hits `LINK : fatal error
+  LNK1102: out of memory`.** With the ICE cleared the workspace suite gets much further and then dies
+  in `link.exe` while linking several large test executables (`dsp-arrow-store`, `database`'s
+  `db_tests`, `dsp-tui`, `dsp-server`) concurrently; the cascade of `can't find crate` /
+  `no resolution for an import` "ICE"s after it are downstream noise from those failed links, not
+  separate compiler bugs. This is a *resource* limit, not a correctness one — the DSP dependency tree
+  links ~250 rlibs per test binary. Next step: cap link concurrency (`cargo test --workspace -j N`)
+  to find the N this box sustains, and consider `-C link-arg=/OPT:NOREF` or splitting the suite by
+  crate group in whatever CI eventually runs it. NB the earlier ICE dropped `rustc-ice-*.txt` dumps in
+  the repo root — never commit them.
 
 - [x] **DONE (2026-07-14, capstone of the 2026-07-13 read-path arc) — `dsp-bench` `point_lookup` workload
   + the full storage/read/aggregation suite:** shipped `run_point_lookup` (parallel runner sealing a
