@@ -883,17 +883,27 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   from those failed links, not separate compiler bugs. **`cargo test --workspace -j 2` compiles and
   links the entire workspace cleanly** (`Finished test profile in 9m 21s`, zero link errors) — a
   resource limit, not a correctness one (~250 rlibs per test binary).
-- [ ] **NEXT — the remaining workspace-suite blocker is `database`'s `db_tests` target, which does not
-  terminate.** With the ICE and the link OOM both cleared, the suite now *runs*: `database` lib passed
-  **135/0**, then the `tests/db_tests.rs` integration target ran **40+ minutes at ~5 GB RSS without
-  producing a result** and had to be killed. Memory plateaus (~4.4→5.0 GB), so it is grinding rather
-  than leaking without bound. Notably **`SKIP_SLOW_TESTS=1` did not gate it** — either that env var is
-  not honored in this target or the slow cases are not behind it. Next steps: find which test in
-  `db_tests` hangs (run it with `--nocapture --test-threads=1` and a per-test timeout), gate it behind
-  `SKIP_SLOW_TESTS` properly, and only then can a run legitimately quote a single whole-workspace
-  pass/fail number. Until then, per-crate counts remain the honest reporting unit. NB killing a
-  backgrounded `cargo test -p database` orphans `db_tests-*.exe`, which then holds a lock and makes the
-  next build fail — kill the exe too. **Research (2026-07-20) sharpens the fix:** LNK1102
+- [x] **DONE (2026-07-20) — `cargo test --workspace` COMPLETES for the first time: 969 passed, 0
+  failed, 30 ignored across 29 targets.** The last blocker was `database`'s `db_tests`. Isolated it by
+  running the target serially: 14 of its 15 tests finish in seconds and
+  **`test_create_btc_1min_database`** was the entire stall — it bulk-loads the real
+  `datasets/btc_1min.csv` corpus and ran **40+ minutes at ~5 GB RSS** without producing a result
+  (memory plateaus, so it grinds rather than leaks). **`SKIP_SLOW_TESTS` was already the repo's
+  convention for exactly this** (`database_orchestration/src/lib.rs` guards four tests with it) but had
+  never been wired into this target, so `SKIP_SLOW_TESTS=1` silently did nothing here. Added the same
+  guard; the target now runs **15 passed in 53 s** instead of never finishing.
+  **Full verified command: `SKIP_SLOW_TESTS=1 cargo test --workspace -j 2` → EXIT=0, 969 passed / 0
+  failed / 30 ignored, no link errors.** The two flags are both load-bearing on this box: `-j 2` avoids
+  the LNK1102 link OOM, `SKIP_SLOW_TESTS=1` skips the BTC bulk load. A run can now legitimately quote a
+  single whole-workspace number. NB killing a backgrounded `cargo test -p database` orphans
+  `db_tests-*.exe`, which holds a lock and breaks the next build — kill the exe too.
+- [ ] **NEXT — make the BTC bulk-load test runnable rather than merely skippable:**
+  `test_create_btc_1min_database` is now gated, which unblocks the suite but means the CSV ingest path
+  it covers is **not exercised by default**. It is also the one real-corpus ingest test DSP has. Worth
+  (i) profiling why a 1-minute BTC series takes 40+ minutes to load (it is a plausible ingest-path
+  performance finding in its own right, not just a slow test — compare against the `dsp-bench` ingest
+  numbers), and (ii) either shrinking the fixture to a subset that runs in seconds by default or
+  promoting it to a `dsp-bench` workload where a long runtime is expected and measured. **Research (2026-07-20) sharpens the fix:** LNK1102
   is heap exhaustion in `link.exe`, and the standard mitigations are to cut the debug information the
   linker must chew (a `[profile.test] debug = 1` — line tables only — instead of the current full
   `-C debuginfo=2`) and to cap parallel link jobs. Try `debug = 1` on the test profile first; it is a

@@ -449,6 +449,19 @@ async fn test_create_btc_1min_database() -> Result<()> {
 	let filter = EnvFilter::new("debug,turso_core=warn");
 	let _subscriber = tracing_subscriber::fmt().with_env_filter(filter).with_test_writer().try_init();
 
+	// Skip this test if running in CI or if we want fast feedback.
+	// This is the workspace suite's long pole: it bulk-loads the real
+	// `datasets/btc_1min.csv` corpus, and on a cold data dir it runs for 40+ minutes
+	// at ~5 GB RSS, which is why `cargo test --workspace` never terminated. The other
+	// 14 tests in this target finish in seconds. `SKIP_SLOW_TESTS` was already the
+	// repo's convention for exactly this (see `database_orchestration/src/lib.rs`) but
+	// had never been wired up here, so `SKIP_SLOW_TESTS=1` silently did nothing for
+	// this target.
+	if std::env::var("SKIP_SLOW_TESTS").is_ok() {
+		debug!("Skipping test_create_btc_1min_database due to SKIP_SLOW_TESTS environment variable");
+		return Ok(());
+	}
+
 	// This test creates a database with BTC 1-minute data
 	// Note: This requires the CSV file to be present
 	let csv_path = "datasets/btc_1min.csv"; // Correct path when running from database directory
