@@ -875,14 +875,23 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   frontend as a cause (the ICE reproduces identically under `-Z threads=1`, so it is not the
   workstation's global `-Z threads=15`). **The 8 tests in that target now compile and pass for the
   first time (8 passed / 0 failed)**; they had never run.
-- [x] **DONE (2026-07-20) — the LNK1102 link OOM is solved by capping concurrency: `-j 2` links the
-  whole workspace.** With the ICE cleared, the default-parallelism `cargo test --workspace` died in
-  `link.exe` with `LINK : fatal error LNK1102: out of memory` while linking several large test
-  executables at once (`dsp-arrow-store`, `database`'s `db_tests`, `dsp-tui`, `dsp-server`); the
-  cascade of `can't find crate` / `no resolution for an import` "ICE"s after it was downstream noise
-  from those failed links, not separate compiler bugs. **`cargo test --workspace -j 2` compiles and
-  links the entire workspace cleanly** (`Finished test profile in 9m 21s`, zero link errors) — a
-  resource limit, not a correctness one (~250 rlibs per test binary).
+- [x] **DONE (2026-07-20) — the LNK1102 link OOM is FIXED at the root: `[profile.test] debug = 1`.**
+  With the ICE cleared, the default-parallelism `cargo test --workspace` died in `link.exe` with
+  `LINK : fatal error LNK1102: out of memory` while linking several large test executables at once
+  (`dsp-arrow-store`, `database`'s `db_tests`, `dsp-tui`, `dsp-server`); the cascade of
+  `can't find crate` / `no resolution for an import` "ICE"s after it was downstream noise from those
+  failed links, not separate compiler bugs. A resource limit, not a correctness one (~250 rlibs per
+  test binary). Two fixes were measured, and the better one shipped:
+  - `-j 2` works (`Finished test profile in 9m 21s`, zero link errors) but throttles the whole build
+    to 2 jobs on a box configured for 15 — an expensive workaround.
+  - **`[profile.test] debug = 1`** (line tables instead of the full `-C debuginfo=2`) cuts the debug
+    info `link.exe` must hold and **fixes it at FULL parallelism** — verified end-to-end:
+    `SKIP_SLOW_TESTS=1 cargo test --workspace` (no `-j` cap) → EXIT=0, **969 passed / 0 failed / 30
+    ignored across 29 targets, 0 link errors** — byte-identical results to the `-j 2` run. Shipped in
+    the root `Cargo.toml`; the `dev` and `release` profiles are untouched, so ordinary debugging is
+    unaffected and test backtraces keep line numbers. *(src:
+    https://learn.microsoft.com/en-us/previous-versions/troubleshoot/visualstudio/language-compilers/linker-fatal-error-out-of-memory
+    · https://doc.rust-lang.org/cargo/reference/profiles.html#debug)*
 - [x] **DONE (2026-07-20) — `cargo test --workspace` COMPLETES for the first time: 969 passed, 0
   failed, 30 ignored across 29 targets.** The last blocker was `database`'s `db_tests`. Isolated it by
   running the target serially: 14 of its 15 tests finish in seconds and
@@ -892,10 +901,10 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   convention for exactly this** (`database_orchestration/src/lib.rs` guards four tests with it) but had
   never been wired into this target, so `SKIP_SLOW_TESTS=1` silently did nothing here. Added the same
   guard; the target now runs **15 passed in 53 s** instead of never finishing.
-  **Full verified command: `SKIP_SLOW_TESTS=1 cargo test --workspace -j 2` → EXIT=0, 969 passed / 0
-  failed / 30 ignored, no link errors.** The two flags are both load-bearing on this box: `-j 2` avoids
-  the LNK1102 link OOM, `SKIP_SLOW_TESTS=1` skips the BTC bulk load. A run can now legitimately quote a
-  single whole-workspace number. NB killing a backgrounded `cargo test -p database` orphans
+  **Full verified command: `SKIP_SLOW_TESTS=1 cargo test --workspace` → EXIT=0, 969 passed / 0
+  failed / 30 ignored, no link errors.** `SKIP_SLOW_TESTS=1` is the one flag still needed (it skips the
+  BTC bulk load); the link OOM is fixed in-tree by `[profile.test] debug = 1`, so no `-j` cap is
+  required. A run can now legitimately quote a single whole-workspace number. NB killing a backgrounded `cargo test -p database` orphans
   `db_tests-*.exe`, which holds a lock and breaks the next build — kill the exe too.
 - [ ] **NEXT — make the BTC bulk-load test runnable rather than merely skippable:**
   `test_create_btc_1min_database` is now gated, which unblocks the suite but means the CSV ingest path
