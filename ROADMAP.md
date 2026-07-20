@@ -956,11 +956,25 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   materialized history with on-the-fly recent data" pattern). No code was needed beyond the existing
   mixed path. *(src: TimescaleDB real-time vs materialized-only continuous aggregates —
   https://www.tigerdata.com/learn/continuous-aggregates-timescaledb)*
-- [ ] **NEXT — (3c) materialized tiers, remaining:** the tier chain is opt-in and manually listed.
-  Residues: (i) a sensible **default** tier chain derived from the base (owner-gated, a default-flip like
-  the others); (ii) demonstrate the win *scales* — re-run `bench_tiered_vs_single_base` on a long-span
-  corpus (many base buckets/segment) where the coarse re-key the tier elides is large, to quantify the
-  regime where tiers pay for their extra sidecar bytes.
+- [x] **DONE (2026-07-20) — (3c)(ii) the tier win SCALES with base-buckets-per-segment, but sub-linearly.**
+  `bench_tiered_span` (`database/benches/downsample_range.rs`) holds rows (200k) and segments (16) fixed
+  and widens the sample **stride**, so every arm reads the same bytes and merges the same 16 partials —
+  only the base buckets per segment change (~208 → ~3125 → ~12500 at a MINUTES base), isolating the
+  re-key cost a rollup tier elides from the file read and value decode. Measured (release, criterion,
+  DAY query over a MINUTES base + `[HOURS, DAYS]` tiers, 7 reductions incl. `sketch_p99`):
+  **stride 1s → 5.34 vs 4.65 ms (1.15×) · 15s → 40.5 vs 32.0 ms (1.27×) · 60s → 201.3 vs 145.9 ms
+  (1.38×)**. So the 2026-07-19 ~1.16× replicates exactly at its short span, and the win does climb with
+  span — but a **~60× increase in base buckets buys only 1.15× → 1.38×**, so the elided re-key is *not*
+  the dominant cost even at one base bucket per row; the tiered arm's larger sidecar read (base + tiers)
+  eats much of what the re-key saves. Honest caveat: the `single_base/60` sample is noisy
+  ([175, 238] ms CI) against a tight tiered CI ([142, 149] ms) — the CIs are disjoint so the direction is
+  real, but that point estimate is soft.
+- [ ] **NEXT — (3c) materialized tiers, remaining:** (i) a sensible **default** tier chain derived from
+  the base — owner-gated, a default-flip like the others. Now better informed: per (3c)(ii) above the
+  payoff is 1.15–1.38× over the realistic span range, i.e. real but modest, so a default chain should be
+  justified against its extra `.dspart` bytes rather than assumed. (ii) The remaining unmeasured axis is
+  the **sidecar read cost itself** — split the tiered arm's wall-clock into sidecar-read vs re-key to see
+  whether a *shallower* chain (say `[DAYS]` only, no `HOURS`) beats the full chain at coarse queries.
 - [ ] **Positioning — DSP's `.dspart` sidecar IS the "incremental materialized view", and mergeable
   DDSketch is its edge (this run's research):** ClickHouse frames the choice as **incremental** MVs
   (insert-triggered, real-time, `AggregatingMergeTree` storing `-State` partial aggregates merged lazily
