@@ -718,8 +718,24 @@ of them turn Turso into the measurement backend.
   migrated to plain `INTEGER PRIMARY KEY` (still a rowid alias). MVCC concurrent
   writes (`BEGIN CONCURRENT`) remain the basis of the write path.
 - [ ] Lean on production MVCC concurrent writes for concurrent ingest + catalog updates under load *(Phase 7)*
-- [ ] Encryption at rest (AEAD pager) for catalog/metadata/pipeline-state DBs *(Phase 8)*
-- [ ] `VACUUM INTO 'file'` for online, consistent control-plane backup/snapshot *(Phase 7.4)*
+- [ ] Encryption at rest (AEAD pager) for catalog/metadata/pipeline-state DBs *(Phase 8)* —
+  **UNGATED (research 2026-07-20): available on the pinned 0.6.** Turso 0.6.0's notes state
+  encryption for MVCC databases is *fully* supported, with the logical log (`.db-log`) encrypted
+  at rest using the same cipher infrastructure as the pager (per-transaction-frame payload
+  encrypted on write, decrypted on read). No version bump needed to start.
+  *(src: https://turso.tech/blog/turso-0.6.0)*
+- [ ] `VACUUM INTO 'file'` for online, consistent control-plane backup/snapshot *(Phase 7.4)* —
+  **UNGATED (research 2026-07-20): `VACUUM INTO` is STABLE in the pinned 0.6.0** ("writes a
+  compacted copy of the database to a new file"). Only the *in-place* `VACUUM` is experimental
+  (needs `--experimental-vacuum`), and the backup use-case wants `VACUUM INTO` anyway — so the
+  7.4 online-backup MVP can be built today against the pinned version.
+  *(src: https://turso.tech/blog/turso-0.6.0)*
+- [ ] **Evaluate the `turso` 0.7 upgrade (research 2026-07-20):** DSP pins `turso = "0.6"` and
+  locks 0.6.1, but **0.7.0 is published** (confirmed against the registry via `cargo search`, not
+  a blog claim). Assess the delta against the control-plane usage — the `BEGIN CONCURRENT` write
+  path, the no-`AUTOINCREMENT`-under-MVCC constraint, and whether `n_change`/`Statement` APIs
+  moved — before bumping. Low urgency (0.6.1 is working), but the gap should not be allowed to
+  widen silently. *(src: https://crates.io/crates/turso)*
 - [ ] Triggers (`BEFORE/AFTER/INSTEAD OF` + `WHEN`) — enforce catalog invariants, emit audit-log rows on metadata mutations *(Phase 7/8)*
 - [x] `Statement::n_change()` affected-row accounting — shipped on the seal path's two
   control-plane writes (`SegmentIndexStore::insert`, `AspectMetadataStore::put` return the count;
@@ -859,16 +875,41 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   frontend as a cause (the ICE reproduces identically under `-Z threads=1`, so it is not the
   workstation's global `-Z threads=15`). **The 8 tests in that target now compile and pass for the
   first time (8 passed / 0 failed)**; they had never run.
-- [ ] **NEXT — `cargo test --workspace` now compiles past the ICE but hits `LINK : fatal error
-  LNK1102: out of memory`.** With the ICE cleared the workspace suite gets much further and then dies
-  in `link.exe` while linking several large test executables (`dsp-arrow-store`, `database`'s
-  `db_tests`, `dsp-tui`, `dsp-server`) concurrently; the cascade of `can't find crate` /
-  `no resolution for an import` "ICE"s after it are downstream noise from those failed links, not
-  separate compiler bugs. This is a *resource* limit, not a correctness one — the DSP dependency tree
-  links ~250 rlibs per test binary. Next step: cap link concurrency (`cargo test --workspace -j N`)
-  to find the N this box sustains, and consider `-C link-arg=/OPT:NOREF` or splitting the suite by
-  crate group in whatever CI eventually runs it. NB the earlier ICE dropped `rustc-ice-*.txt` dumps in
-  the repo root — never commit them.
+- [x] **DONE (2026-07-20) — the LNK1102 link OOM is solved by capping concurrency: `-j 2` links the
+  whole workspace.** With the ICE cleared, the default-parallelism `cargo test --workspace` died in
+  `link.exe` with `LINK : fatal error LNK1102: out of memory` while linking several large test
+  executables at once (`dsp-arrow-store`, `database`'s `db_tests`, `dsp-tui`, `dsp-server`); the
+  cascade of `can't find crate` / `no resolution for an import` "ICE"s after it was downstream noise
+  from those failed links, not separate compiler bugs. **`cargo test --workspace -j 2` compiles and
+  links the entire workspace cleanly** (`Finished test profile in 9m 21s`, zero link errors) — a
+  resource limit, not a correctness one (~250 rlibs per test binary).
+- [ ] **NEXT — the remaining workspace-suite blocker is `database`'s `db_tests` target, which does not
+  terminate.** With the ICE and the link OOM both cleared, the suite now *runs*: `database` lib passed
+  **135/0**, then the `tests/db_tests.rs` integration target ran **40+ minutes at ~5 GB RSS without
+  producing a result** and had to be killed. Memory plateaus (~4.4→5.0 GB), so it is grinding rather
+  than leaking without bound. Notably **`SKIP_SLOW_TESTS=1` did not gate it** — either that env var is
+  not honored in this target or the slow cases are not behind it. Next steps: find which test in
+  `db_tests` hangs (run it with `--nocapture --test-threads=1` and a per-test timeout), gate it behind
+  `SKIP_SLOW_TESTS` properly, and only then can a run legitimately quote a single whole-workspace
+  pass/fail number. Until then, per-crate counts remain the honest reporting unit. NB killing a
+  backgrounded `cargo test -p database` orphans `db_tests-*.exe`, which then holds a lock and makes the
+  next build fail — kill the exe too. **Research (2026-07-20) sharpens the fix:** LNK1102
+  is heap exhaustion in `link.exe`, and the standard mitigations are to cut the debug information the
+  linker must chew (a `[profile.test] debug = 1` — line tables only — instead of the current full
+  `-C debuginfo=2`) and to cap parallel link jobs. Try `debug = 1` on the test profile first; it is a
+  one-line workspace change and does not touch the dev profile the owner debugs with. *(src:
+  https://learn.microsoft.com/en-us/previous-versions/troubleshoot/visualstudio/language-compilers/linker-fatal-error-out-of-memory
+  · Cargo debug levels — https://doc.rust-lang.org/cargo/reference/profiles.html#debug)*
+  NB the earlier ICE dropped `rustc-ice-*.txt` dumps in the repo root — never commit them.
+- [ ] **Guard the `#[serial]`-above-`#[test]` ordering (research 2026-07-20):** the ICE cleared above is
+  **upstream rust-lang/rust#100263, open since Aug 2022** — same panic string (`attribute is missing
+  tokens`) in the same file (`rustc_ast/src/attr/mod.rs`), same shape (a test-harness attribute plus a
+  proc-macro attribute on one function). So this is not a transient nightly regression that a toolchain
+  bump will fix, and writing `#[test]` above a proc-macro attribute anywhere in the workspace will
+  reintroduce it. Worth (a) a comment at each site — done in `gpu_integration_tests.rs` — and (b)
+  considering a lint/grep in CI. DSP's ordering repro is also a cleaner minimization than the issue's
+  current one (which involves an unimported `test_case`), so it is worth contributing upstream.
+  *(src: https://github.com/rust-lang/rust/issues/100263)*
 
 - [x] **DONE (2026-07-14, capstone of the 2026-07-13 read-path arc) — `dsp-bench` `point_lookup` workload
   + the full storage/read/aggregation suite:** shipped `run_point_lookup` (parallel runner sealing a
