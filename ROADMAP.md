@@ -833,6 +833,23 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 
 ## Immediate next actions
 
+- [ ] **START HERE (filed 2026-07-20 for the next run).** This run cleared the two items that had sat
+  at the top of this list — the "flaky GPU tests" (root-caused: unsound check + degenerate fixtures,
+  not the GPU) and the workspace-suite ICE — and `cargo test --workspace` now completes at
+  **969 passed / 0 failed**. That unblocks the verification floor for everything below. Recommended
+  order for the next run:
+  1. **Cheap + newly ungated:** the Phase 7.4 **online backup MVP over `VACUUM INTO`**, which this
+     run's research confirmed is *stable in the already-pinned Turso 0.6.0* — no version bump, no
+     blocker. A bounded first slice is "snapshot the control-plane DBs to a file + verify the copy
+     opens and matches".
+  2. **Cheap + a plausible real finding:** profile `test_create_btc_1min_database` — a 1-minute BTC
+     series taking **40+ minutes** to bulk-load is suspicious on its face, and if it is an ingest-path
+     problem rather than merely a big fixture, that is a benchmarked customer outcome (the governing
+     rule) hiding in a skipped test.
+  3. **The depth item:** realize the **FastLanes transposed layout on disk** (the tile-random-access
+     decoder already shipped; the residue is a `VAL_CODEC_*`/`TS_CODEC_*` tag + reader dispatch + its
+     own size function, then an *end-to-end* read benchmark — respecting the bandwidth-bound caveat).
+
 - [x] **DONE (2026-07-20) — BUG ROOT-CAUSED + FIXED: the "flaky GPU interpolation tests" were never a
   GPU bug.** The roadmap offered two hypotheses — a real GPU race, or an unsound check. **Both the
   check and the test fixtures were broken; the GPU path is correct.** Three distinct defects, all in
