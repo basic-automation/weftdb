@@ -817,16 +817,35 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 
 ## Immediate next actions
 
-- [ ] **BUG (found 2026-07-16) — the `splimes` GPU interpolation tests are FLAKY, and they gate every
-  workspace-wide test claim.** `tests::{cubic,quadratic,polynomial}::tests::test_*_interpolation`
-  intermittently fail their CPU-vs-GPU check with a cosine similarity of ~0 (e.g. `-2.7e-8` against
-  the threshold) — i.e. the GPU result is *garbage*, not merely imprecise. **Confirmed
-  non-deterministic and NOT branch-dependent:** alternating runs of the identical test on the same
-  machine gave branch=pass, main=**fail**, branch=fail, so it reproduces on `main` and is unrelated to
-  any 2026-07-16 change. Either the GPU path has a real race/uninitialized-buffer bug that the
-  similarity check catches ~1 run in 3, or the check itself is unsound; either way a passing run
-  currently proves little about the GPU path. Diagnose before any Phase 5 GPU benchmark claim — a
-  flaky correctness gate cannot backstop a published GPU number.
+- [x] **DONE (2026-07-20) — BUG ROOT-CAUSED + FIXED: the "flaky GPU interpolation tests" were never a
+  GPU bug.** The roadmap offered two hypotheses — a real GPU race, or an unsound check. **Both the
+  check and the test fixtures were broken; the GPU path is correct.** Three distinct defects, all in
+  test code:
+  1. **The similarity metric was not a cosine similarity.** `linear::tests::pow` computed
+     `v^(2^exponent)` — it squared the *accumulator* each pass — so `pow(v, 2)` returned `v⁴` and every
+     norm was `sqrt(Σv⁴)`. Two *identical* vectors scored ~1e-4 instead of 1.0.
+  2. **`COS_THRESHOLD` had been tuned to the broken metric** (`8e-5`), which made the gate **inert**:
+     it accepted anything short of a ~10,000× error. Fixing `pow` alone exposed a run where CPU-vs-GPU
+     scored **0.377** and the test still reported `ok` — so passing runs had been proving nothing,
+     exactly as suspected.
+  3. **The real source of the flakiness was a degenerate test fixture, not the GPU.** `POINTS` built
+     ten points via `Point::random()`, whose timestamp is drawn from just 61 integer-second buckets
+     (−30..=30) around a per-call `Utc::now()`. Ten draws collide in the same second ~half the time,
+     and because each draw re-reads the clock a collision yields two knots **microseconds apart** — a
+     near-degenerate knot pair whose divided differences divide by a ~1e-6 s gap and blow up. Hence
+     the "garbage" values, and hence the clustering (one shared static → several tests fail in the same
+     process). The **CPU-vs-SIMD** comparison failed on bad draws too (measured 0.337), which is what
+     ruled the GPU out. A sibling instance of the same class: `regression::get_deterministic_points`
+     re-evaluated `Utc::now()` per point *per call* despite its name, handing each backend a
+     differently-drifted grid, so output lengths/timestamps diverged.
+
+  **Fixed** by correcting `pow`, anchoring both fixtures to one base time (values stay random; only
+  the knots are separated), and raising `COS_THRESHOLD` to a **real 0.999**. With the degeneracy gone
+  all four paths agree to ~13 decimal places (CPU-vs-SIMD, CPU-vs-**GPU** and CPU-vs-auto all measured
+  in `[0.9999999999999, 1.0000000000001]`), so the GPU quarantine was removed rather than kept.
+  **Verified: `cargo test -p splimes --lib` run 6× consecutively = 27 passed / 0 failed every time**
+  (previously ~1 run in 3 failed, and `tests::regression` failed ~2/2). The Phase 5 GPU benchmark
+  claims now have a correctness gate that means something.
 - [ ] **BLOCKER (found 2026-07-16) — `cargo test --workspace` cannot complete: rustc ICE on
   `splimes` `gpu_integration_tests`.** The nightly compiler (`1.99.0-nightly daf2e5e18`,
   2026-07-13) panics with `error: the compiler unexpectedly panicked` in
