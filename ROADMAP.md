@@ -218,7 +218,11 @@ transfer, 8% kernel, 7% JSON").
   the **reconcile daemon** (`reconcile.tick{kind,...,aspects,segments}` on all five tick
   kinds) — all runtime-verified against the running binary
 - [x] Arrow/Parquet decode on ingest — `storage.ingest.parquet` stage span (byte length + sort guard + `format="parquet"`), nesting under the request root span; runtime-verified against the running binary
-- [ ] Remaining per-stage spans — auth · WAL append · explicit libSQL write · commit · index update · page skip · cache hit/miss · decompression · CPU interp · GPU upload/queue/kernel/readback
+- [ ] Remaining per-stage spans — auth · WAL append · commit · page skip · cache hit/miss ·
+  decompression · CPU interp · GPU upload/queue/kernel/readback. *(The **explicit libSQL write** +
+  **index update** stages shipped with the `n_change` accounting above:
+  `control_plane.index.insert`/`.delete`/`control_plane.metadata.put`, each carrying
+  `rows_changed`.)*
 - [x] **OTLP trace export** (pairs with `/metrics`): shipped — env-gated on
   `OTEL_EXPORTER_OTLP_ENDPOINT`, an OTLP/gRPC `SdkTracerProvider` (batch exporter +
   `dsp-server` service resource) with a `tracing_opentelemetry` layer beside the `fmt`
@@ -233,7 +237,17 @@ transfer, 8% kernel, 7% JSON").
   `request` root spans land with their nested stage spans
   (`storage.ingest.parse`/`seal`, `storage.range.read`/`serialize` observed nesting
   correctly). Re-runnable headlessly; the script (re)starts the container if absent.
-- [ ] `Statement::n_change()` write accounting (Turso 0.6) in ingest/instrumentation spans
+- [x] **`Statement::n_change()` write accounting (Turso 0.6) in ingest/instrumentation spans** —
+  the two control-plane writes on the seal path now *report* what they changed instead of
+  discarding it: `SegmentIndexStore::insert` and `AspectMetadataStore::put` return libSQL's
+  affected-row count (`Result<u64>`, was `Result<()>`), and each emits a `rows_changed` field on
+  a `control_plane.index.insert{aspect,id}` / `control_plane.metadata.put{aspect}` debug span
+  (`SegmentIndexStore::delete` already consumed the count for its hit/miss bool and now traces it
+  too). Runtime-verified against the live binary: two JSON ingests produced
+  `request{POST …/points,request_id} → storage.ingest.seal{point_count,format} →
+  control_plane.index.insert{id=0,rows_changed=1}` and the sibling `control_plane.metadata.put
+  {rows_changed=1}`, correctly nested. This is the accounting an idempotency ledger needs (7.1)
+  and the "explicit libSQL write" stage span the item below asks for.
 - [ ] `/bench/runs/:id` endpoint
 
 ### Phase 4 — Hot path: physical types & Storage v2 · *High*
@@ -707,7 +721,10 @@ of them turn Turso into the measurement backend.
 - [ ] Encryption at rest (AEAD pager) for catalog/metadata/pipeline-state DBs *(Phase 8)*
 - [ ] `VACUUM INTO 'file'` for online, consistent control-plane backup/snapshot *(Phase 7.4)*
 - [ ] Triggers (`BEFORE/AFTER/INSTEAD OF` + `WHEN`) — enforce catalog invariants, emit audit-log rows on metadata mutations *(Phase 7/8)*
-- [ ] `Statement::n_change()` affected-row accounting for idempotent batch ingest + instrumentation spans *(Phase 3/7)*
+- [x] `Statement::n_change()` affected-row accounting — shipped on the seal path's two
+  control-plane writes (`SegmentIndexStore::insert`, `AspectMetadataStore::put` return the count;
+  `control_plane.*` spans carry `rows_changed`); consuming it for an idempotency *ledger* is the
+  Phase 7.1 residue *(Phase 3/7)*
 - [ ] Dynamic auth tokens as closures — hosted/remote control-plane credential rotation *(Phase 8)*
 - [ ] `UPDATE … FROM`, aggregate `FILTER`, `INDEXED BY`, `NULLS FIRST/LAST` — simplify catalog/metadata queries *(Phase 2/4)*
 - [ ] Evaluate (don't rush): native vector search over pattern/shape **summaries** only *(Phase 9 — never over raw measurements)*; CDC/sync engine for online ingest/replication *(assess once 7.2 is solid)*; custom I/O (`with_io_impl`) / generated columns *(only on concrete need)*
