@@ -592,3 +592,66 @@ async fn test_create_btc_1min_database() -> Result<()> {
 
 	Ok(())
 }
+
+/// Ingest-path profile (roadmap Phase 4 / the `test_create_btc_1min_database`
+/// slow-load investigation): time the **legacy Turso `measurements` row-store** write
+/// path against the **Storage-v2 `.dspseg` columnar seal** for the same synthetic
+/// BTC-like corpus, so the "40+ minutes at ~5 GB RSS" the BTC test documents is
+/// explained with a real number rather than a hunch.
+///
+/// The legacy path (`batch_capture_measurements`) writes each measurement as a Turso
+/// row keyed by a 36-byte UUID text `id` and a 36-byte UUID `dataset_id`, with the
+/// value stored as decimal **text** — and then writes every timestamp *again* into the
+/// `unbatched_measurements` shadow queue (a 2× row-store write). The columnar path seals
+/// the same points into one typed `.dspseg` frame (delta/bit-packed timestamps, a scaled
+/// integer value column). This is the write-amplification the roadmap's storage boundary
+/// (hard-constraint #3: Turso is the control plane, `.dspseg` owns the measurement hot
+/// path) exists to remove.
+///
+/// Gated on `RUN_INGEST_PROFILE` so it never joins the normal suite (like the BTC test it
+/// explains). Run it with, e.g.:
+/// `RUN_INGEST_PROFILE=1 INGEST_PROFILE_N=50000 cargo test -p database --test db_tests ingest_path_profile -- --nocapture`
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn ingest_path_profile_legacy_vs_columnar() -> Result<()> {
+	if std::env::var("RUN_INGEST_PROFILE").is_err() {
+		return Ok(());
+	}
+	let n: usize = std::env::var("INGEST_PROFILE_N").ok().and_then(|s| s.parse().ok()).unwrap_or(50_000);
+
+	// A synthetic BTC-like series: a 1-minute epoch grid, two-decimal prices.
+	let base = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+	let price = |i: usize| format!("{}.{:02}", 20_000 + (i % 5_000), i % 100);
+	let ts_ms: Vec<i64> = (0..n).map(|i| (base + Duration::minutes(i as i64)).timestamp_millis()).collect();
+	let values: Vec<BigDecimal> = (0..n).map(|i| BigDecimal::from_str(&price(i)).unwrap()).collect();
+
+	// --- Legacy Turso row-store path (measurements + unbatched shadow queue) ---
+	let temp = tempfile::tempdir()?;
+	std::env::set_var("TEST_DATA_DIR", temp.path().to_str().unwrap());
+	let db = Database::new(&format!("prof_{}", Uuid::new_v4())).await?;
+	let subject = db.observe_subject("BTCUSD").await?;
+	let aspect = db.track_aspect(&subject.id(), "close", &Resolution::Minutes, None).await?;
+	let measurements: Vec<InputMeasurement> = (0..n).map(|i| InputMeasurement::new(base + Duration::minutes(i as i64), values[i].clone())).collect();
+	let t0 = std::time::Instant::now();
+	db.batch_capture_measurements(aspect.id(), DatasetId::new(), measurements).await?;
+	let legacy = t0.elapsed();
+
+	// --- Storage-v2 columnar seal (one typed .dspseg frame) ---
+	let store = database::SegmentStore::open(temp.path().join("segstore")).await?;
+	let schema = dsp_physical_type::AspectSchema::new(dsp_physical_type::PhysicalType::ScaledI64 { scale: 2 }, BigDecimal::from_str("0").unwrap(), dsp_physical_type::timestamp::TimeUnit::Millis);
+	let t1 = std::time::Instant::now();
+	let descriptor = store.seal("close", &schema, &ts_ms, &values).await?;
+	let columnar = t1.elapsed();
+
+	// Both paths persisted all n rows.
+	assert_eq!(descriptor.row_count as usize, n, "columnar seal wrote every row");
+
+	let legacy_rps = n as f64 / legacy.as_secs_f64();
+	let col_rps = n as f64 / columnar.as_secs_f64();
+	let bytes_per_point = descriptor.byte_len as f64 / n as f64;
+	eprintln!("INGEST PROFILE n={n}:");
+	eprintln!("  legacy Turso row-store : {legacy:?}  ({legacy_rps:.0} rows/s)");
+	eprintln!("  columnar .dspseg seal  : {columnar:?}  ({col_rps:.0} rows/s, {bytes_per_point:.2} B/point framed)");
+	eprintln!("  columnar seal is {:.1}x faster on the write path", col_rps / legacy_rps);
+	Ok(())
+}
