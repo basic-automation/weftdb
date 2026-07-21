@@ -2015,6 +2015,13 @@ impl ControlPlaneBackup {
 	pub fn total_rows(&self) -> i64 {
 		self.reports().iter().map(|r| r.rows).sum()
 	}
+
+	/// Total on-disk size of the four snapshot files in bytes — the whole control-plane
+	/// backup's footprint.
+	#[must_use]
+	pub fn total_bytes(&self) -> u64 {
+		self.reports().iter().map(|r| r.bytes).sum()
+	}
 }
 
 /// A store-wide aggregate over every aspect's materialized rollup, surfaced by
@@ -2153,6 +2160,8 @@ mod tests {
 		assert!(backup.aspect_catalog.rows >= 1, "at least the declared schema");
 		assert!(backup.registry.rows >= 1, "the (database, subject) registration");
 		assert_eq!(backup.total_rows(), backup.reports().iter().map(|r| r.rows).sum::<i64>());
+		assert!(backup.total_bytes() > 0, "the snapshot files have a non-zero footprint");
+		assert_eq!(backup.total_bytes(), backup.reports().iter().map(|r| r.bytes).sum::<u64>());
 
 		// The source stays fully usable after an online backup.
 		let live = store.segment_count("price").await.expect("counts");

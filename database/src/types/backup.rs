@@ -38,6 +38,9 @@ pub struct SnapshotReport {
 	pub tables: usize,
 	/// The total number of rows verified equal across those tables.
 	pub rows: i64,
+	/// The on-disk size of the snapshot file in bytes (the compacted copy `VACUUM INTO`
+	/// wrote) — what an operator needs to size backup storage.
+	pub bytes: u64,
 }
 
 /// True for a `sqlite_master` table name that is engine-internal rather than a real
@@ -149,7 +152,8 @@ pub async fn snapshot_and_verify(src: &turso::Connection, dest: &Path) -> Result
 	drop(dest_conn);
 	drop(dest_db);
 
-	Ok(SnapshotReport { dest: dest.to_path_buf(), tables: src_tables.len(), rows })
+	let bytes = tokio::fs::metadata(dest).await.with_context(|| format!("stat backup copy {}", dest.display()))?.len();
+	Ok(SnapshotReport { dest: dest.to_path_buf(), tables: src_tables.len(), rows, bytes })
 }
 
 #[cfg(test)]
@@ -200,6 +204,8 @@ mod tests {
 		assert_eq!(report.tables, 2);
 		assert_eq!(report.rows, 10, "7 widgets + 3 gadgets");
 		assert!(dest.exists(), "backup file was written");
+		assert_eq!(report.bytes, tokio::fs::metadata(&dest).await.unwrap().len(), "reported bytes match the file");
+		assert!(report.bytes > 0, "a non-empty snapshot");
 
 		// The copy is independently openable and holds the same rows.
 		let copy_db = Builder::new_local(dest.to_str().unwrap()).build().await.unwrap();

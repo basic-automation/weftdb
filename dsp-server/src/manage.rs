@@ -500,6 +500,8 @@ pub struct BackupDbReport {
 	pub tables: usize,
 	/// The number of rows verified in this database's snapshot.
 	pub rows: i64,
+	/// The on-disk size of this snapshot file in bytes.
+	pub bytes: u64,
 }
 
 /// Response body for `POST /api/v1/storage/backup` — the outcome of an online
@@ -513,6 +515,8 @@ pub struct BackupResponse {
 	pub databases: Vec<BackupDbReport>,
 	/// Total rows verified across all four control-plane databases.
 	pub total_rows: i64,
+	/// Total on-disk size of the four snapshot files in bytes.
+	pub total_bytes: u64,
 }
 
 /// Validate a caller-supplied backup `label`: non-empty, only `[A-Za-z0-9._-]`, and
@@ -560,9 +564,9 @@ pub async fn backup_store(State(state): State<AppState>, Query(params): Query<Ba
 	drop(store);
 	let databases = [("segment_index.db", &backup.segment_index), ("metadata.db", &backup.metadata), ("aspect_catalog.db", &backup.aspect_catalog), ("catalog.db", &backup.registry)]
 		.into_iter()
-		.map(|(name, report)| BackupDbReport { name: name.to_string(), tables: report.tables, rows: report.rows })
+		.map(|(name, report)| BackupDbReport { name: name.to_string(), tables: report.tables, rows: report.rows, bytes: report.bytes })
 		.collect();
-	let response = BackupResponse { dir: backup.dir.display().to_string(), databases, total_rows: backup.total_rows() };
+	let response = BackupResponse { dir: backup.dir.display().to_string(), databases, total_rows: backup.total_rows(), total_bytes: backup.total_bytes() };
 	Ok((StatusCode::OK, Json(response)).into_response())
 }
 
@@ -1307,6 +1311,8 @@ mod tests {
 		assert_eq!(status, StatusCode::OK, "body: {json}");
 		assert_eq!(json["databases"].as_array().unwrap().len(), 4, "four control-plane DBs snapshotted");
 		assert!(json["total_rows"].as_i64().unwrap() >= 2, "at least the seal's index + rollup rows");
+		assert!(json["total_bytes"].as_u64().unwrap() > 0, "the snapshot files have a non-zero footprint");
+		assert!(json["databases"][0]["bytes"].as_u64().unwrap() > 0, "each snapshot file reports its size");
 		let backup_dir = dir.path().join("backups").join("nightly");
 		for name in ["segment_index.db", "metadata.db", "aspect_catalog.db", "catalog.db"] {
 			assert!(backup_dir.join(name).exists(), "{name} written to disk");
