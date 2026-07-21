@@ -341,6 +341,34 @@ impl SegmentStore {
 		self.catalog.list_aspects(&self.database, &self.subject).await
 	}
 
+	/// Take an online, consistent snapshot of this store's **four control-plane
+	/// databases** (`segment_index.db`, `metadata.db`, `aspect_catalog.db`, `catalog.db`)
+	/// into `dest_dir`, via Turso's `VACUUM INTO` (roadmap **Phase 7.4**). Each copy is
+	/// reopened and verified to match its source table-for-table before the call returns.
+	///
+	/// The `.dspseg` measurement frames under `segments/` are **not** part of this backup
+	/// — this is the control-plane (catalog/index/metadata) snapshot only, per the storage
+	/// boundary (hard-constraint #3). `dest_dir` is created if absent; each destination
+	/// file must not already exist (`VACUUM INTO` needs a fresh file), so back up into a
+	/// fresh (e.g. timestamped) directory.
+	///
+	/// See [`snapshot_and_verify`](crate::snapshot_and_verify) for the consistency scope
+	/// of the per-file verification (the row-count match assumes a quiescent source).
+	///
+	/// # Errors
+	///
+	/// Propagates a filesystem error creating `dest_dir`, or any per-database backup/verify
+	/// failure (bad/existing destination, libSQL error, or a source/copy mismatch).
+	pub async fn backup_control_plane(&self, dest_dir: impl AsRef<Path>) -> Result<ControlPlaneBackup> {
+		let dir = dest_dir.as_ref().to_path_buf();
+		tokio::fs::create_dir_all(&dir).await.with_context(|| format!("creating backup dir {}", dir.display()))?;
+		let segment_index = self.index.backup_to(&dir.join("segment_index.db")).await.context("backing up segment_index.db")?;
+		let metadata = self.metadata.backup_to(&dir.join("metadata.db")).await.context("backing up metadata.db")?;
+		let aspect_catalog = self.catalog.backup_to(&dir.join("aspect_catalog.db")).await.context("backing up aspect_catalog.db")?;
+		let registry = self.registry.backup_to(&dir.join("catalog.db")).await.context("backing up catalog.db")?;
+		Ok(ControlPlaneBackup { dir, segment_index, metadata, aspect_catalog, registry })
+	}
+
 	/// Declare `aspect`'s [`AspectSchema`] in this store's catalog, so later
 	/// [`seal_declared`](SegmentStore::seal_declared) calls need not be handed the
 	/// schema. Idempotent on the aspect (a re-declaration overwrites).
@@ -1951,6 +1979,36 @@ pub struct SquashSweep {
 	pub segments_removed: usize,
 }
 
+/// The outcome of a [`SegmentStore::backup_control_plane`] run: the verified snapshot of
+/// each of the store's four control-plane databases (roadmap Phase 7.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPlaneBackup {
+	/// The directory the four snapshot files were written to.
+	pub dir: PathBuf,
+	/// Verified snapshot of `segment_index.db` (the per-segment data-skipping index).
+	pub segment_index: crate::SnapshotReport,
+	/// Verified snapshot of `metadata.db` (the per-aspect segment-set rollup).
+	pub metadata: crate::SnapshotReport,
+	/// Verified snapshot of `aspect_catalog.db` (the per-aspect declared schema).
+	pub aspect_catalog: crate::SnapshotReport,
+	/// Verified snapshot of `catalog.db` (the database/subject registry).
+	pub registry: crate::SnapshotReport,
+}
+
+impl ControlPlaneBackup {
+	/// The four snapshot reports, in the order they were taken.
+	#[must_use]
+	pub const fn reports(&self) -> [&crate::SnapshotReport; 4] {
+		[&self.segment_index, &self.metadata, &self.aspect_catalog, &self.registry]
+	}
+
+	/// Total rows verified across all four control-plane databases.
+	#[must_use]
+	pub fn total_rows(&self) -> i64 {
+		self.reports().iter().map(|r| r.rows).sum()
+	}
+}
+
 /// A store-wide aggregate over every aspect's materialized rollup, surfaced by
 /// [`SegmentStore::store_stats`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2059,6 +2117,47 @@ mod tests {
 		let (rt, rv) = Segment::read_from(&on_disk).expect("decodes").decode();
 		assert_eq!(rt, ts);
 		assert_eq!(rv, vs);
+	}
+
+	#[tokio::test]
+	async fn backup_control_plane_snapshots_and_verifies_every_db() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open_scoped(dir.path(), "market", "btc").await.expect("opens");
+		// Declare a schema and seal two aspects, so all four control-plane DBs hold rows:
+		// aspect_catalog (declare), segment_index + metadata (seal), catalog (open registers).
+		store.declare("price", &schema()).await.expect("declares");
+		for aspect in ["price", "volume"] {
+			let ts: Vec<i64> = (0..4).map(|i| 100 + i * 10).collect();
+			let vs: Vec<BigDecimal> = (0..4).map(|i| bd(&format!("{}.5", i + 1))).collect();
+			store.seal(aspect, &schema(), &ts, &vs).await.expect("seals");
+		}
+
+		let backup_dir = dir.path().join("backup-run-1");
+		let backup = store.backup_control_plane(&backup_dir).await.expect("backs up");
+
+		// Every control-plane file was written and each verified a non-empty table set.
+		assert_eq!(backup.dir, backup_dir);
+		for name in ["segment_index.db", "metadata.db", "aspect_catalog.db", "catalog.db"] {
+			assert!(backup_dir.join(name).exists(), "{name} was written");
+		}
+		assert!(backup.segment_index.rows >= 2, "two sealed segments indexed");
+		assert!(backup.metadata.rows >= 2, "two aspect rollups");
+		assert!(backup.aspect_catalog.rows >= 1, "at least the declared schema");
+		assert!(backup.registry.rows >= 1, "the (database, subject) registration");
+		assert_eq!(backup.total_rows(), backup.reports().iter().map(|r| r.rows).sum::<i64>());
+
+		// The source stays fully usable after an online backup.
+		let live = store.segment_count("price").await.expect("counts");
+		assert_eq!(live, 1);
+		drop(store);
+
+		// The snapshot copies reopen as independent stores holding the same data.
+		let restored = SegmentStore::open_scoped(&backup_dir, "market", "btc").await.expect("reopens copy");
+		assert_eq!(restored.segment_count("price").await.expect("counts"), 1);
+		assert_eq!(restored.segment_count("volume").await.expect("counts"), 1);
+		let mut aspects = restored.metadata().list_aspects().await.expect("lists");
+		aspects.sort();
+		assert_eq!(aspects, vec!["price".to_string(), "volume".to_string()]);
 	}
 
 	#[tokio::test]

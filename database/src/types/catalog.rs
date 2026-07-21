@@ -84,6 +84,19 @@ impl CatalogStore {
 		Self::open(":memory:").await
 	}
 
+	/// Snapshot this `catalog.db` to `dest` (a fresh file) via Turso's `VACUUM INTO`,
+	/// verifying the copy opens and its rows match. The online, consistent control-plane
+	/// backup primitive (roadmap Phase 7.4) — see
+	/// [`snapshot_and_verify`](crate::snapshot_and_verify) for the consistency scope.
+	///
+	/// # Errors
+	///
+	/// Propagates a connection failure or any backup/verify failure.
+	pub async fn backup_to(&self, dest: &std::path::Path) -> Result<crate::SnapshotReport> {
+		let conn = self.db.connect()?;
+		crate::types::backup::snapshot_and_verify(&conn, dest).await
+	}
+
 	/// Register a database namespace `name` (idempotent — re-registering an existing
 	/// name is a no-op rather than an error).
 	///
