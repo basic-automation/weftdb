@@ -545,6 +545,7 @@ fn valid_backup_label(label: &str) -> bool {
 /// exists, and [`StorageError::Internal`] on a backup/verify failure.
 pub async fn backup_store(State(state): State<AppState>, Query(params): Query<BackupParams>) -> Result<Response, StorageError> {
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	let metrics = state.metrics().clone();
 	drop(state);
 	let base = std::env::var_os("DSP_BACKUP_DIR").map_or_else(|| store.root().join("backups"), std::path::PathBuf::from);
 	let sub = if let Some(label) = params.label {
@@ -562,6 +563,7 @@ pub async fn backup_store(State(state): State<AppState>, Query(params): Query<Ba
 	}
 	let backup = store.backup_control_plane(&dest).await.map_err(|err| StorageError::Internal(err.to_string()))?;
 	drop(store);
+	metrics.record_backup(backup.total_bytes());
 	let databases = [("segment_index.db", &backup.segment_index), ("metadata.db", &backup.metadata), ("aspect_catalog.db", &backup.aspect_catalog), ("catalog.db", &backup.registry)]
 		.into_iter()
 		.map(|(name, report)| BackupDbReport { name: name.to_string(), tables: report.tables, rows: report.rows, bytes: report.bytes })
@@ -1297,13 +1299,16 @@ mod tests {
 		store.declare("price", &sc).await.expect("declares");
 		store.seal("price", &sc, &[0_i64, 10, 20], &["1".parse().unwrap(), "2".parse().unwrap(), "3".parse().unwrap()]).await.expect("seals");
 
+		// One shared state so the /metrics counter reflects the backup below.
+		let state = AppState::new().with_store(store.clone());
+
 		// A traversal label is rejected before touching disk.
-		let router = app_with_state(AppState::new().with_store(store.clone()));
+		let router = app_with_state(state.clone());
 		let bad = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/backup?label=..").body(Body::empty()).unwrap()).await.unwrap();
 		assert_eq!(bad.status(), StatusCode::BAD_REQUEST, "traversal label rejected");
 
 		// A valid label snapshots all four control-plane DBs under <root>/backups/<label>.
-		let router = app_with_state(AppState::new().with_store(store.clone()));
+		let router = app_with_state(state.clone());
 		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/backup?label=nightly").body(Body::empty()).unwrap()).await.unwrap();
 		let status = response.status();
 		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
@@ -1319,9 +1324,17 @@ mod tests {
 		}
 
 		// Re-using the same label collides with the existing dir → 400 (VACUUM INTO needs a fresh file).
-		let router = app_with_state(AppState::new().with_store(store.clone()));
+		let router = app_with_state(state.clone());
 		let dup = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/backup?label=nightly").body(Body::empty()).unwrap()).await.unwrap();
 		assert_eq!(dup.status(), StatusCode::BAD_REQUEST, "an existing backup dir is rejected");
+
+		// /metrics reflects the one successful snapshot (the failed dup did not bump it).
+		let router = app_with_state(state.clone());
+		let metrics = router.oneshot(Request::builder().method("GET").uri("/metrics").body(Body::empty()).unwrap()).await.unwrap();
+		let mbytes = axum::body::to_bytes(metrics.into_body(), usize::MAX).await.unwrap();
+		let mtext = String::from_utf8(mbytes.to_vec()).unwrap();
+		assert!(mtext.contains("dsp_backup_snapshots_total 1"), "one snapshot recorded; got:\n{mtext}");
+		assert!(mtext.contains("dsp_backup_bytes_written_total"), "bytes-written counter present");
 		drop(store);
 	}
 
