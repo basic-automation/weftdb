@@ -645,6 +645,7 @@ under the declared encoding/tolerance is rejected `400`.
 | `POST /api/v1/storage/{aspect}/squash` | **Squash** the aspect's segments into one (newer-wins), bounding split-path fragmentation. `?max_segments=N` gates it (squash only when the count exceeds `N`). Returns `triggered`/`removed`/`segment_count`. |
 | `POST /api/v1/storage/{aspect}/compact?target_rows=N` | **Size-targeted compaction** — coalesce the aspect's segments toward ~`N` rows per segment (leaving already-large segments untouched), holding fragmentation near the read-optimal size rather than folding to one (which `squash` does). Motivated by the `downsample_range` knee (one giant segment reads slower than several mid-sized ones). `target_rows` is required (absent → `400`). Returns `removed`/`segment_count`. The manual counterpart of the `DSP_COMPACT_TARGET_ROWS` daemon pass. |
 | `POST /api/v1/storage/reconcile` | **Store-wide reconciliation sweep** across every declared aspect: threshold (default), `?hot_cold=true`, or `?overlaps=true` (+ `?split_min_bytes=N` for split-not-rewrite). Returns `mode`, `aspects_scanned` / `aspects_reconciled` / `segments_reconciled` (+ cold/hot split) and the post-sweep store-wide `unsorted_segments` + `overlapping_segments`. The manual counterpart to the background reconcile daemon (`DSP_RECONCILE_INTERVAL_SECS` / `DSP_RECONCILE_THRESHOLD` / `DSP_RECONCILE_HOT_COLD` / `DSP_RECONCILE_OVERLAPS` / `DSP_RECONCILE_SPLIT_MIN_BYTES` / `DSP_RECONCILE_MAX_SPLITS`). |
+| `POST /api/v1/storage/backup` | **Online control-plane backup** (Phase 7.4) — snapshot the store's four control-plane DBs (`segment_index`/`metadata`/`aspect_catalog`/`catalog`) to fresh files via Turso's stable `VACUUM INTO`, verifying each copy's user-table set + row counts match the source before returning. Lands in `<base>/<label>` where `<base>` is `DSP_BACKUP_DIR` or `<store_root>/backups` and `<label>` is a traversal-guarded `?label=` (`[A-Za-z0-9._-]`) or a generated `backup-<unix_millis>`. Returns per-DB `{name, tables, rows, bytes}` + `total_rows`/`total_bytes`. An existing target dir → `400`; no store → `503`. Control plane only — the `.dspseg` measurement frames are not part of this backup (hard-constraint #3). |
 | `GET /api/v1/storage/{aspect}/stats` · `…/storage/stats` | Materialized per-aspect and store-wide rollups, including the realized **bytes/point** (the north-star cost term), an `unsorted_segments` order-health count (segments that would force a linear scan on a point lookup), and an `overlapping_segments` count (time-overlapping segments — the cross-segment order-health signal, computed by an index scan). Rollup fields are served from the control plane without opening a segment. |
 
 ### Metrics
@@ -654,7 +655,9 @@ under the declared encoding/tolerance is rejected `400`.
 `dsp_ingest_*` counters (requests/errors/rows/segments) on the ingest paths,
 `dsp_reconcile_*` counters (`_passes_total` / `_segments_reconciled_total`) over the
 out-of-order reconciliation passes (manual, store-wide, and the background daemon —
-threshold-held calls excluded), and latency histograms over the compute and seal paths.
+threshold-held calls excluded), `dsp_backup_*` counters (`_snapshots_total` /
+`_bytes_written_total`) over the online control-plane backups, and latency histograms
+over the compute and seal paths.
 `GET /debug/profile/current` serves the same timing data as a live p50/p95/p99
 snapshot.
 
