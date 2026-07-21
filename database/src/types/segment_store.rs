@@ -331,6 +331,14 @@ impl SegmentStore {
 		&self.subject
 	}
 
+	/// The store root — the directory holding `segments/` and the four control-plane
+	/// DBs. The natural base for a default [`backup_control_plane`](SegmentStore::backup_control_plane)
+	/// destination.
+	#[must_use]
+	pub fn root(&self) -> &Path {
+		&self.root
+	}
+
 	/// The aspects [`declare`](SegmentStore::declare)d in this store's
 	/// `(database, subject)` scope, in name order.
 	///

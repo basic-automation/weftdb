@@ -482,6 +482,90 @@ pub async fn compact_aspect(State(state): State<AppState>, Path(aspect): Path<St
 	Ok((StatusCode::OK, Json(CompactResponse { aspect, removed, segment_count })).into_response())
 }
 
+/// Query parameters for `POST /api/v1/storage/backup`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BackupParams {
+	/// A subdirectory name for this snapshot under the backup root. Restricted to
+	/// `[A-Za-z0-9._-]` (and not `.`/`..`) so an API caller can never traverse out of
+	/// the backup root. Absent → a `backup-<unix_millis>` name is generated.
+	pub label: Option<String>,
+}
+
+/// One control-plane database's entry in a [`BackupResponse`].
+#[derive(Debug, Clone, Serialize)]
+pub struct BackupDbReport {
+	/// The snapshot file name (e.g. `segment_index.db`).
+	pub name: String,
+	/// The number of user tables whose row counts were verified equal to the source.
+	pub tables: usize,
+	/// The number of rows verified in this database's snapshot.
+	pub rows: i64,
+}
+
+/// Response body for `POST /api/v1/storage/backup` — the outcome of an online
+/// control-plane snapshot.
+#[derive(Debug, Clone, Serialize)]
+pub struct BackupResponse {
+	/// The directory the four snapshot files were written to.
+	pub dir: String,
+	/// Per-database verified snapshot reports (`segment_index`, `metadata`,
+	/// `aspect_catalog`, `catalog`).
+	pub databases: Vec<BackupDbReport>,
+	/// Total rows verified across all four control-plane databases.
+	pub total_rows: i64,
+}
+
+/// Validate a caller-supplied backup `label`: non-empty, only `[A-Za-z0-9._-]`, and
+/// neither `.` nor `..` — so it names a single fresh subdirectory under the backup root
+/// and can never be an absolute path or a `../` traversal.
+fn valid_backup_label(label: &str) -> bool {
+	!label.is_empty() && label != "." && label != ".." && label.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Handle `POST /api/v1/storage/backup`: snapshot the store's four control-plane DBs.
+///
+/// Takes an online, consistent snapshot via Turso's `VACUUM INTO` (roadmap **Phase
+/// 7.4**), verifying each copy before returning.
+///
+/// The snapshot lands in `<base>/<label>`, where `<base>` is `DSP_BACKUP_DIR` if set
+/// else `<store_root>/backups`, and `<label>` is the (validated) `?label=` or a generated
+/// `backup-<unix_millis>`. Each destination file must be fresh (`VACUUM INTO` needs a
+/// non-existing file), so a directory that already exists is rejected. The `.dspseg`
+/// measurement frames are **not** part of this backup — control plane only, per the
+/// storage boundary (hard-constraint #3).
+///
+/// # Errors
+///
+/// [`StorageError::Unconfigured`] when no store is attached,
+/// [`StorageError::BadRequest`] when `label` is malformed or the target dir already
+/// exists, and [`StorageError::Internal`] on a backup/verify failure.
+pub async fn backup_store(State(state): State<AppState>, Query(params): Query<BackupParams>) -> Result<Response, StorageError> {
+	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	drop(state);
+	let base = std::env::var_os("DSP_BACKUP_DIR").map_or_else(|| store.root().join("backups"), std::path::PathBuf::from);
+	let sub = if let Some(label) = params.label {
+		if !valid_backup_label(&label) {
+			return Err(StorageError::BadRequest(format!("invalid backup label `{label}` — use only letters, digits, '.', '_', '-'")));
+		}
+		label
+	} else {
+		let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|err| StorageError::Internal(err.to_string()))?.as_millis();
+		format!("backup-{millis}")
+	};
+	let dest = base.join(&sub);
+	if dest.exists() {
+		return Err(StorageError::BadRequest(format!("backup target already exists: {} (choose a fresh label)", dest.display())));
+	}
+	let backup = store.backup_control_plane(&dest).await.map_err(|err| StorageError::Internal(err.to_string()))?;
+	drop(store);
+	let databases = [("segment_index.db", &backup.segment_index), ("metadata.db", &backup.metadata), ("aspect_catalog.db", &backup.aspect_catalog), ("catalog.db", &backup.registry)]
+		.into_iter()
+		.map(|(name, report)| BackupDbReport { name: name.to_string(), tables: report.tables, rows: report.rows })
+		.collect();
+	let response = BackupResponse { dir: backup.dir.display().to_string(), databases, total_rows: backup.total_rows() };
+	Ok((StatusCode::OK, Json(response)).into_response())
+}
+
 /// One point in an ingest batch: an integer epoch timestamp (in the aspect's
 /// declared [`TimeUnit`]) and its value as lossless decimal text, or `null` for an
 /// absent/null row.
@@ -1186,6 +1270,53 @@ mod tests {
 		assert_eq!(json["aspect"], "load");
 		assert_eq!(json["removed"], 4, "six segments coalesced to two (two triples)");
 		assert_eq!(json["segment_count"], 2, "held near the target size, not folded to one");
+	}
+
+	#[test]
+	fn valid_backup_label_rejects_traversal_and_bad_chars() {
+		use super::valid_backup_label;
+		assert!(valid_backup_label("nightly"));
+		assert!(valid_backup_label("2026-07-21_run.1"));
+		assert!(!valid_backup_label(""));
+		assert!(!valid_backup_label("."));
+		assert!(!valid_backup_label(".."));
+		assert!(!valid_backup_label("a/b"));
+		assert!(!valid_backup_label("a\\b"));
+		assert!(!valid_backup_label("a b"));
+	}
+
+	#[tokio::test]
+	async fn backup_endpoint_snapshots_control_plane_and_guards_label() {
+		let dir = TempDir::new().unwrap();
+		let sc = dsp_physical_type::AspectSchema::new(dsp_physical_type::PhysicalType::F64, "0".parse().unwrap(), dsp_physical_type::TimeUnit::Seconds);
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+		store.declare("price", &sc).await.expect("declares");
+		store.seal("price", &sc, &[0_i64, 10, 20], &["1".parse().unwrap(), "2".parse().unwrap(), "3".parse().unwrap()]).await.expect("seals");
+
+		// A traversal label is rejected before touching disk.
+		let router = app_with_state(AppState::new().with_store(store.clone()));
+		let bad = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/backup?label=..").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(bad.status(), StatusCode::BAD_REQUEST, "traversal label rejected");
+
+		// A valid label snapshots all four control-plane DBs under <root>/backups/<label>.
+		let router = app_with_state(AppState::new().with_store(store.clone()));
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/backup?label=nightly").body(Body::empty()).unwrap()).await.unwrap();
+		let status = response.status();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		assert_eq!(status, StatusCode::OK, "body: {json}");
+		assert_eq!(json["databases"].as_array().unwrap().len(), 4, "four control-plane DBs snapshotted");
+		assert!(json["total_rows"].as_i64().unwrap() >= 2, "at least the seal's index + rollup rows");
+		let backup_dir = dir.path().join("backups").join("nightly");
+		for name in ["segment_index.db", "metadata.db", "aspect_catalog.db", "catalog.db"] {
+			assert!(backup_dir.join(name).exists(), "{name} written to disk");
+		}
+
+		// Re-using the same label collides with the existing dir → 400 (VACUUM INTO needs a fresh file).
+		let router = app_with_state(AppState::new().with_store(store.clone()));
+		let dup = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/backup?label=nightly").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(dup.status(), StatusCode::BAD_REQUEST, "an existing backup dir is rejected");
+		drop(store);
 	}
 
 	#[tokio::test]
