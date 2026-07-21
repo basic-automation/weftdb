@@ -724,12 +724,26 @@ of them turn Turso into the measurement backend.
   at rest using the same cipher infrastructure as the pager (per-transaction-frame payload
   encrypted on write, decrypted on read). No version bump needed to start.
   *(src: https://turso.tech/blog/turso-0.6.0)*
-- [ ] `VACUUM INTO 'file'` for online, consistent control-plane backup/snapshot *(Phase 7.4)* —
-  **UNGATED (research 2026-07-20): `VACUUM INTO` is STABLE in the pinned 0.6.0** ("writes a
-  compacted copy of the database to a new file"). Only the *in-place* `VACUUM` is experimental
-  (needs `--experimental-vacuum`), and the backup use-case wants `VACUUM INTO` anyway — so the
-  7.4 online-backup MVP can be built today against the pinned version.
-  *(src: https://turso.tech/blog/turso-0.6.0)*
+- [x] `VACUUM INTO 'file'` for online, consistent control-plane backup/snapshot *(Phase 7.4)* —
+  **MVP shipped (2026-07-21).** `database::backup` (`vacuum_into` + `snapshot_and_verify`) snapshots a
+  control-plane DB to a fresh file and reopens the copy to verify its user-table set + per-table row
+  counts match the source; each of the four control-plane stores gained a `backup_to`, and
+  `SegmentStore::backup_control_plane(dir)` snapshots all four (segment_index/metadata/aspect_catalog/
+  catalog) into one dir returning a `ControlPlaneBackup` (per-DB reports + `total_rows`/`total_bytes`).
+  Exposed at the API as `POST /api/v1/storage/backup?label=` (label-guarded against traversal;
+  `DSP_BACKUP_DIR`-or-`<root>/backups` base) and observable via `dsp_backup_snapshots_total`/
+  `dsp_backup_bytes_written_total`. Runtime-verified against the live binary. Finding: Turso's MVCC
+  mode adds an internal `__turso_internal_mvcc_meta` table to `sqlite_master`, filtered out of the
+  verified user-table set. *(src: https://turso.tech/blog/turso-0.6.0)*
+- [ ] **Backup 7.4 residue — verification, incrementality, scheduling, scope:** (a) the
+  `snapshot_and_verify` row-count match assumes a **quiescent source** — add a concurrent-write-safe
+  verify (validate the copy's own committed frame, not a fresh source read); (b) an **incremental /
+  WAL-streaming backup** beyond the full `VACUUM INTO` snapshot — Turso streams WAL changes to
+  replicas, so a change-since-last-snapshot backup is the natural next tier
+  (*src: https://turso.tech/blog/turso-0.6.0 · https://dev.to/dataformathub/distributed-sqlite-why-libsql-and-turso-are-the-new-standard-in-2026-58fk*);
+  (c) a **background backup daemon** (`DSP_BACKUP_INTERVAL_SECS`) mirroring the reconcile/compact
+  daemons; (d) optionally fold the `.dspseg` segment frames into a **whole-store** backup manifest
+  (today it is control-plane only, per hard-constraint #3).
 - [ ] **Evaluate the `turso` 0.7 upgrade (research 2026-07-20):** DSP pins `turso = "0.6"` and
   locks 0.6.1, but **0.7.0 is published** (confirmed against the registry via `cargo search`, not
   a blog claim). Assess the delta against the control-plane usage — the `BEGIN CONCURRENT` write
@@ -833,19 +847,28 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 
 ## Immediate next actions
 
-- [ ] **START HERE (filed 2026-07-20 for the next run).** This run cleared the two items that had sat
-  at the top of this list — the "flaky GPU tests" (root-caused: unsound check + degenerate fixtures,
-  not the GPU) and the workspace-suite ICE — and `cargo test --workspace` now completes at
-  **969 passed / 0 failed**. That unblocks the verification floor for everything below. Recommended
-  order for the next run:
-  1. **Cheap + newly ungated:** the Phase 7.4 **online backup MVP over `VACUUM INTO`**, which this
-     run's research confirmed is *stable in the already-pinned Turso 0.6.0* — no version bump, no
-     blocker. A bounded first slice is "snapshot the control-plane DBs to a file + verify the copy
-     opens and matches".
-  2. **Cheap + a plausible real finding:** profile `test_create_btc_1min_database` — a 1-minute BTC
-     series taking **40+ minutes** to bulk-load is suspicious on its face, and if it is an ingest-path
-     problem rather than merely a big fixture, that is a benchmarked customer outcome (the governing
-     rule) hiding in a skipped test.
+- [ ] **START HERE (filed 2026-07-21 for the next run).** The 2026-07-21 run shipped the two cheap
+  items that sat at the top of this list — the **Phase 7.4 online-backup MVP over `VACUUM INTO`** (full
+  feature: library primitive → `POST /storage/backup` endpoint → size reporting → `dsp_backup_*`
+  metrics, runtime-verified) and the **`test_create_btc_1min_database` profile** (root-caused: the
+  legacy Turso ingest path is the offender, and it is **super-linear**). Recommended order for the next
+  run:
+  1. **The benchmarked customer outcome the profile surfaced (highest value):** measurement ingest on
+     the legacy `Database`/`batch_capture_measurements` path is **~4,700 rows/s at N=20k, falling to
+     ~2,100 rows/s at N=40k** (2× rows → ~4.5× time — O(n²)-class), while the Storage-v2 `.dspseg` seal
+     is **linear at ~300–350k rows/s (64–166× faster, 1.71 B/point)**. This is the write-amplification
+     hard-constraint #3 exists to remove. The cheap, high-value slice is to **route measurement bulk
+     ingest through the `.dspseg` SegmentStore seal** (the columnar path) instead of the Turso row store,
+     and re-run the `ingest_path_profile_legacy_vs_columnar` harness on the real `btc_1min.csv` to
+     confirm the win at scale. The upstream cause is textbook: SQLite insert cost grows with the table
+     because every insert maintains each index — mitigations are fewer/larger transactions and deferring
+     index creation; the legacy path does neither and *doubles* the write via the
+     `unbatched_measurements` unique-index shadow queue. *(src:
+     https://www.slingacademy.com/article/optimizing-inserts-and-updates-with-index-management-in-sqlite/
+     · https://medium.com/@JasonWyatt/squeezing-performance-from-sqlite-insertions-971aff98eef2)*
+  2. **Cheap backup follow-ons:** the 7.4 residue filed above — a background backup daemon
+     (`DSP_BACKUP_INTERVAL_SECS`, mirroring the reconcile/compact daemons) and/or the concurrent-write-safe
+     verify. Both are bounded and reuse the shipped primitive.
   3. **The depth item:** realize the **FastLanes transposed layout on disk** (the tile-random-access
      decoder already shipped; the residue is a `VAL_CODEC_*`/`TS_CODEC_*` tag + reader dispatch + its
      own size function, then an *end-to-end* read benchmark — respecting the bandwidth-bound caveat).
