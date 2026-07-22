@@ -46,6 +46,18 @@ async fn sealed_store(dir: &TempDir, segments: i64) -> SegmentStore {
 /// As [`sealed_store`], but seal under an optional partial-sidecar `policy` — so a bench
 /// can compare a store that materializes per-segment partials against one that does not.
 async fn sealed_store_with_policy(dir: &TempDir, segments: i64, policy: Option<PartialSidecarPolicy>) -> SegmentStore {
+	sealed_store_spanning(dir, segments, policy, STRIDE_SECS).await
+}
+
+/// As [`sealed_store_with_policy`], but with the sample `stride_secs` as a parameter — so a
+/// bench can stretch the corpus's *time span* while holding its row count fixed.
+///
+/// The span is what drives the number of **base buckets per segment** a coarse downsample
+/// must re-key when no coarser tier is materialized: at a MINUTES base, a segment covering
+/// `span` seconds carries `min(rows_per_segment, span / 60)` base buckets. Holding rows
+/// constant and widening the stride therefore isolates the *re-key* cost — the exact work a
+/// rollup tier elides — from the file read and value decode, which are unchanged.
+async fn sealed_store_spanning(dir: &TempDir, segments: i64, policy: Option<PartialSidecarPolicy>, stride_secs: i64) -> SegmentStore {
 	let mut store = SegmentStore::open(dir.path()).await.expect("opens store");
 	if let Some(policy) = policy {
 		store = store.with_partial_sidecar_policy(policy);
@@ -54,7 +66,7 @@ async fn sealed_store_with_policy(dir: &TempDir, segments: i64, policy: Option<P
 	store.declare("load", &schema).await.expect("declares aspect");
 	let per_segment = TOTAL_ROWS / segments;
 	for seg in 0..segments {
-		let ts: Vec<i64> = (0..per_segment).map(|i| (seg * per_segment + i) * STRIDE_SECS).collect();
+		let ts: Vec<i64> = (0..per_segment).map(|i| (seg * per_segment + i) * stride_secs).collect();
 		// A bounded sawtooth: enough distinct values for the percentile/sketch
 		// reductions to do real work, cheap to generate.
 		let vs: Vec<BigDecimal> = (0..per_segment).map(|i| BigDecimal::from((seg * per_segment + i) % 997)).collect();
@@ -179,5 +191,40 @@ fn bench_tiered_vs_single_base(c: &mut Criterion) {
 	group.finish();
 }
 
-criterion_group!(benches, bench_segment_count, bench_percentiles, bench_sidecar_vs_decode, bench_tiered_vs_single_base);
+/// Does the rollup-tier win **scale** with the number of base buckets a coarse query would
+/// otherwise re-key? [`bench_tiered_vs_single_base`] measured only ~1.16x, and recorded the
+/// honest caveat that its corpus is short-span (a 1 s stride puts just ~208 minute buckets in
+/// each segment), so the re-key the tier elides is small. This bench is that caveat's test.
+///
+/// The row count and segment count are held fixed while the sample stride widens, so every
+/// arm reads the same bytes and merges the same number of segment partials — only the base
+/// buckets per segment change (~208 → ~3125 → ~12500, saturating at one bucket per row). If
+/// the tier's advantage is the elided re-key, the speedup must climb across this axis; if it
+/// stays flat, the win is a fixed cost and the tiers are not worth their extra sidecar bytes.
+fn bench_tiered_span(c: &mut Criterion) {
+	let rt = Runtime::new().expect("tokio runtime");
+	let aggs = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::SketchP99];
+
+	let mut group = c.benchmark_group("downsample_range/tier_span");
+	group.sample_size(10);
+	for stride in [1_i64, 15, 60] {
+		let single = PartialSidecarPolicy::at(Resolution::Minutes, 1);
+		let tiered = PartialSidecarPolicy::at_tiered(Resolution::Minutes, 1, &[Resolution::Hours, Resolution::Days]);
+		for (label, policy) in [("single_base", single), ("tiered", tiered)] {
+			let dir = TempDir::new().expect("temp dir");
+			let store = rt.block_on(sealed_store_spanning(&dir, 16, Some(policy), stride));
+			group.bench_with_input(BenchmarkId::new(label, stride), &stride, |b, _| {
+				b.iter(|| {
+					let buckets = rt.block_on(store.downsample_range("load", i64::MIN, i64::MAX, Resolution::Days, &aggs)).expect("downsamples");
+					black_box(buckets)
+				});
+			});
+			drop(store);
+			drop(dir);
+		}
+	}
+	group.finish();
+}
+
+criterion_group!(benches, bench_segment_count, bench_percentiles, bench_sidecar_vs_decode, bench_tiered_vs_single_base, bench_tiered_span);
 criterion_main!(benches);
