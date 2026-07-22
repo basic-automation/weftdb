@@ -190,15 +190,23 @@ impl AspectMetadataStore {
 		Self::open(":memory:").await
 	}
 
-	/// Materialize (or overwrite) the rollup for `aspect`.
+	/// Materialize (or overwrite) the rollup for `aspect`, returning the number of
+	/// control-plane rows the write actually affected.
 	///
 	/// `INSERT OR REPLACE` makes the call idempotent on the aspect key, so re-deriving
 	/// the rollup from the segment index and writing it back keeps the row exact.
 	///
+	/// The returned count is libSQL's `Statement::n_change()` — see
+	/// [`SegmentIndexStore::insert`](crate::SegmentIndexStore::insert) for why the write
+	/// path reports it. Also emitted as a `rows_changed` field on a
+	/// `control_plane.metadata.put` debug span.
+	///
 	/// # Errors
 	///
 	/// Propagates any libSQL write failure.
-	pub async fn put(&self, aspect: &str, meta: &AspectMetadata) -> Result<()> {
+	pub async fn put(&self, aspect: &str, meta: &AspectMetadata) -> Result<u64> {
+		let span = tracing::debug_span!("control_plane.metadata.put", aspect, rows_changed = tracing::field::Empty);
+		let _guard = span.enter();
 		let (min_ts, max_ts) = meta.time_range.map_or((Value::Null, Value::Null), |(lo, hi)| (Value::Integer(lo), Value::Integer(hi)));
 		let (min_value, max_value) = meta.value_range.as_ref().map_or((Value::Null, Value::Null), |(lo, hi)| (Value::Text(lo.to_plain_string()), Value::Text(hi.to_plain_string())));
 		let conn = self.db.connect()?;
@@ -212,9 +220,10 @@ impl AspectMetadataStore {
 			)
 			.await;
 		match res {
-			Ok(_) => {
+			Ok(changed) => {
 				conn.execute("COMMIT", turso::params![]).await?;
-				Ok(())
+				span.record("rows_changed", changed);
+				Ok(changed)
 			}
 			Err(e) => {
 				conn.execute("ROLLBACK", turso::params![]).await.ok();
@@ -363,6 +372,26 @@ mod tests {
 		drop(store);
 		assert_eq!(got, Some(meta));
 		assert_eq!(missing, None);
+	}
+
+	/// `put` reports libSQL's affected-row count (`Statement::n_change()`), so the write
+	/// path can tell a real rollup mutation from a no-op. `INSERT OR REPLACE` on the
+	/// aspect key affects exactly one row whether it inserts or overwrites — the count is
+	/// the write's own report, not an inference from whether a row already existed.
+	#[tokio::test]
+	async fn put_reports_its_affected_row_count() {
+		let store = AspectMetadataStore::open_in_memory().await.expect("opens");
+		let meta = AspectMetadata { segment_count: 1, total_rows: 10, total_nulls: 0, total_bytes: 128, unsorted_segments: 0, time_range: Some((0, 90)), value_range: Some((bd("0"), bd("9"))) };
+		let first = store.put("temp", &meta).await.expect("puts");
+		// Overwriting the same aspect key replaces the row rather than adding one.
+		let overwrite = store.put("temp", &meta).await.expect("re-puts");
+		let other = store.put("humidity", &meta).await.expect("puts a second aspect");
+		let rows = store.list_aspects().await.expect("lists").len();
+		drop(store);
+		assert_eq!(first, 1, "a fresh rollup write affects one row");
+		assert_eq!(overwrite, 1, "an INSERT OR REPLACE on the same key still affects one row");
+		assert_eq!(other, 1);
+		assert_eq!(rows, 2, "the overwrite did not add a row");
 	}
 
 	#[tokio::test]

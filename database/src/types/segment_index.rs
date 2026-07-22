@@ -93,15 +93,25 @@ impl SegmentIndexStore {
 		Ok(())
 	}
 
-	/// Record a sealed segment's descriptor under `aspect`.
+	/// Record a sealed segment's descriptor under `aspect`, returning the number of
+	/// control-plane rows the write actually affected.
 	///
 	/// Replaces any existing row with the same `(aspect, id)` (a re-seal of the same
 	/// segment id overwrites), so the call is idempotent on segment identity.
 	///
+	/// The returned count is libSQL's `Statement::n_change()` (roadmap Phase 3 /
+	/// Turso-0.6 adoption: affected-row accounting for idempotent batch ingest +
+	/// instrumentation spans). It is the *write's own* report of what it changed, so a
+	/// caller can distinguish a real catalog mutation from a no-op — the accounting an
+	/// idempotency ledger needs and a seal span should carry. It is also emitted as a
+	/// `rows_changed` field on a `control_plane.index.insert` debug span.
+	///
 	/// # Errors
 	///
 	/// Propagates any libSQL write failure, or a metadata-serialization failure.
-	pub async fn insert(&self, aspect: &str, descriptor: &SegmentDescriptor) -> Result<()> {
+	pub async fn insert(&self, aspect: &str, descriptor: &SegmentDescriptor) -> Result<u64> {
+		let span = tracing::debug_span!("control_plane.index.insert", aspect, id = descriptor.id, rows_changed = tracing::field::Empty);
+		let _guard = span.enter();
 		let conn = self.db.connect()?;
 		conn.execute("BEGIN CONCURRENT", turso::params![]).await?;
 		let physical_type = match &descriptor.physical_type {
@@ -121,9 +131,10 @@ impl SegmentIndexStore {
 			)
 			.await;
 		match res {
-			Ok(_) => {
+			Ok(changed) => {
 				conn.execute("COMMIT", turso::params![]).await?;
-				Ok(())
+				span.record("rows_changed", changed);
+				Ok(changed)
 			}
 			Err(e) => {
 				conn.execute("ROLLBACK", turso::params![]).await.ok();
@@ -145,12 +156,15 @@ impl SegmentIndexStore {
 	///
 	/// Propagates any libSQL write failure.
 	pub async fn delete(&self, aspect: &str, id: u64) -> Result<bool> {
+		let span = tracing::debug_span!("control_plane.index.delete", aspect, id, rows_changed = tracing::field::Empty);
+		let _guard = span.enter();
 		let conn = self.db.connect()?;
 		conn.execute("BEGIN CONCURRENT", turso::params![]).await?;
 		let res = conn.execute("DELETE FROM segment_index WHERE aspect = ? AND id = ?", turso::params![aspect.to_string(), i64::try_from(id).unwrap_or(i64::MAX)]).await;
 		match res {
 			Ok(changed) => {
 				conn.execute("COMMIT", turso::params![]).await?;
+				span.record("rows_changed", changed);
 				Ok(changed > 0)
 			},
 			Err(e) => {
@@ -354,6 +368,29 @@ mod tests {
 		// The descriptor round-trips field-for-field through libSQL.
 		assert_eq!(all[0], d);
 		assert_eq!(count, 1);
+	}
+
+	/// `insert` and `delete` report libSQL's affected-row count (`Statement::n_change()`)
+	/// so a seal can record what the catalog write actually changed rather than assuming
+	/// it changed something. The distinguishing case is the miss: deleting an absent id
+	/// affects zero rows, which is exactly the signal an idempotency ledger needs.
+	#[tokio::test]
+	async fn control_plane_writes_report_their_affected_row_counts() {
+		let store = SegmentIndexStore::open_in_memory().await.expect("opens");
+		let (seg, len) = sealed(100);
+		let d = SegmentDescriptor::of_segment(1, "segments/1.dspseg", len, &seg);
+		let inserted = store.insert("temp", &d).await.expect("inserts");
+		// A re-seal of the same (aspect, id) REPLACEs — still one row affected.
+		let reinserted = store.insert("temp", &d).await.expect("re-inserts");
+		let count_after = store.count("temp").await.expect("counts");
+		let deleted_missing = store.delete("temp", 999).await.expect("deletes a miss");
+		let deleted_hit = store.delete("temp", 1).await.expect("deletes a hit");
+		drop(store);
+		assert_eq!(inserted, 1, "a fresh descriptor write affects one row");
+		assert_eq!(reinserted, 1, "an idempotent re-seal replaces rather than appends");
+		assert_eq!(count_after, 1, "the re-seal did not add a second row");
+		assert!(!deleted_missing, "deleting an absent id affects no rows");
+		assert!(deleted_hit);
 	}
 
 	#[tokio::test]

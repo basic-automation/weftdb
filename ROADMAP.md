@@ -218,7 +218,11 @@ transfer, 8% kernel, 7% JSON").
   the **reconcile daemon** (`reconcile.tick{kind,...,aspects,segments}` on all five tick
   kinds) — all runtime-verified against the running binary
 - [x] Arrow/Parquet decode on ingest — `storage.ingest.parquet` stage span (byte length + sort guard + `format="parquet"`), nesting under the request root span; runtime-verified against the running binary
-- [ ] Remaining per-stage spans — auth · WAL append · explicit libSQL write · commit · index update · page skip · cache hit/miss · decompression · CPU interp · GPU upload/queue/kernel/readback
+- [ ] Remaining per-stage spans — auth · WAL append · commit · page skip · cache hit/miss ·
+  decompression · CPU interp · GPU upload/queue/kernel/readback. *(The **explicit libSQL write** +
+  **index update** stages shipped with the `n_change` accounting above:
+  `control_plane.index.insert`/`.delete`/`control_plane.metadata.put`, each carrying
+  `rows_changed`.)*
 - [x] **OTLP trace export** (pairs with `/metrics`): shipped — env-gated on
   `OTEL_EXPORTER_OTLP_ENDPOINT`, an OTLP/gRPC `SdkTracerProvider` (batch exporter +
   `dsp-server` service resource) with a `tracing_opentelemetry` layer beside the `fmt`
@@ -233,7 +237,17 @@ transfer, 8% kernel, 7% JSON").
   `request` root spans land with their nested stage spans
   (`storage.ingest.parse`/`seal`, `storage.range.read`/`serialize` observed nesting
   correctly). Re-runnable headlessly; the script (re)starts the container if absent.
-- [ ] `Statement::n_change()` write accounting (Turso 0.6) in ingest/instrumentation spans
+- [x] **`Statement::n_change()` write accounting (Turso 0.6) in ingest/instrumentation spans** —
+  the two control-plane writes on the seal path now *report* what they changed instead of
+  discarding it: `SegmentIndexStore::insert` and `AspectMetadataStore::put` return libSQL's
+  affected-row count (`Result<u64>`, was `Result<()>`), and each emits a `rows_changed` field on
+  a `control_plane.index.insert{aspect,id}` / `control_plane.metadata.put{aspect}` debug span
+  (`SegmentIndexStore::delete` already consumed the count for its hit/miss bool and now traces it
+  too). Runtime-verified against the live binary: two JSON ingests produced
+  `request{POST …/points,request_id} → storage.ingest.seal{point_count,format} →
+  control_plane.index.insert{id=0,rows_changed=1}` and the sibling `control_plane.metadata.put
+  {rows_changed=1}`, correctly nested. This is the accounting an idempotency ledger needs (7.1)
+  and the "explicit libSQL write" stage span the item below asks for.
 - [ ] `/bench/runs/:id` endpoint
 
 ### Phase 4 — Hot path: physical types & Storage v2 · *High*
@@ -704,10 +718,29 @@ of them turn Turso into the measurement backend.
   migrated to plain `INTEGER PRIMARY KEY` (still a rowid alias). MVCC concurrent
   writes (`BEGIN CONCURRENT`) remain the basis of the write path.
 - [ ] Lean on production MVCC concurrent writes for concurrent ingest + catalog updates under load *(Phase 7)*
-- [ ] Encryption at rest (AEAD pager) for catalog/metadata/pipeline-state DBs *(Phase 8)*
-- [ ] `VACUUM INTO 'file'` for online, consistent control-plane backup/snapshot *(Phase 7.4)*
+- [ ] Encryption at rest (AEAD pager) for catalog/metadata/pipeline-state DBs *(Phase 8)* —
+  **UNGATED (research 2026-07-20): available on the pinned 0.6.** Turso 0.6.0's notes state
+  encryption for MVCC databases is *fully* supported, with the logical log (`.db-log`) encrypted
+  at rest using the same cipher infrastructure as the pager (per-transaction-frame payload
+  encrypted on write, decrypted on read). No version bump needed to start.
+  *(src: https://turso.tech/blog/turso-0.6.0)*
+- [ ] `VACUUM INTO 'file'` for online, consistent control-plane backup/snapshot *(Phase 7.4)* —
+  **UNGATED (research 2026-07-20): `VACUUM INTO` is STABLE in the pinned 0.6.0** ("writes a
+  compacted copy of the database to a new file"). Only the *in-place* `VACUUM` is experimental
+  (needs `--experimental-vacuum`), and the backup use-case wants `VACUUM INTO` anyway — so the
+  7.4 online-backup MVP can be built today against the pinned version.
+  *(src: https://turso.tech/blog/turso-0.6.0)*
+- [ ] **Evaluate the `turso` 0.7 upgrade (research 2026-07-20):** DSP pins `turso = "0.6"` and
+  locks 0.6.1, but **0.7.0 is published** (confirmed against the registry via `cargo search`, not
+  a blog claim). Assess the delta against the control-plane usage — the `BEGIN CONCURRENT` write
+  path, the no-`AUTOINCREMENT`-under-MVCC constraint, and whether `n_change`/`Statement` APIs
+  moved — before bumping. Low urgency (0.6.1 is working), but the gap should not be allowed to
+  widen silently. *(src: https://crates.io/crates/turso)*
 - [ ] Triggers (`BEFORE/AFTER/INSTEAD OF` + `WHEN`) — enforce catalog invariants, emit audit-log rows on metadata mutations *(Phase 7/8)*
-- [ ] `Statement::n_change()` affected-row accounting for idempotent batch ingest + instrumentation spans *(Phase 3/7)*
+- [x] `Statement::n_change()` affected-row accounting — shipped on the seal path's two
+  control-plane writes (`SegmentIndexStore::insert`, `AspectMetadataStore::put` return the count;
+  `control_plane.*` spans carry `rows_changed`); consuming it for an idempotency *ledger* is the
+  Phase 7.1 residue *(Phase 3/7)*
 - [ ] Dynamic auth tokens as closures — hosted/remote control-plane credential rotation *(Phase 8)*
 - [ ] `UPDATE … FROM`, aggregate `FILTER`, `INDEXED BY`, `NULLS FIRST/LAST` — simplify catalog/metadata queries *(Phase 2/4)*
 - [ ] Evaluate (don't rush): native vector search over pattern/shape **summaries** only *(Phase 9 — never over raw measurements)*; CDC/sync engine for online ingest/replication *(assess once 7.2 is solid)*; custom I/O (`with_io_impl`) / generated columns *(only on concrete need)*
@@ -800,24 +833,119 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 
 ## Immediate next actions
 
-- [ ] **BUG (found 2026-07-16) — the `splimes` GPU interpolation tests are FLAKY, and they gate every
-  workspace-wide test claim.** `tests::{cubic,quadratic,polynomial}::tests::test_*_interpolation`
-  intermittently fail their CPU-vs-GPU check with a cosine similarity of ~0 (e.g. `-2.7e-8` against
-  the threshold) — i.e. the GPU result is *garbage*, not merely imprecise. **Confirmed
-  non-deterministic and NOT branch-dependent:** alternating runs of the identical test on the same
-  machine gave branch=pass, main=**fail**, branch=fail, so it reproduces on `main` and is unrelated to
-  any 2026-07-16 change. Either the GPU path has a real race/uninitialized-buffer bug that the
-  similarity check catches ~1 run in 3, or the check itself is unsound; either way a passing run
-  currently proves little about the GPU path. Diagnose before any Phase 5 GPU benchmark claim — a
-  flaky correctness gate cannot backstop a published GPU number.
-- [ ] **BLOCKER (found 2026-07-16) — `cargo test --workspace` cannot complete: rustc ICE on
-  `splimes` `gpu_integration_tests`.** The nightly compiler (`1.99.0-nightly daf2e5e18`,
-  2026-07-13) panics with `error: the compiler unexpectedly panicked` in
-  `[resolver_for_lowering_raw]` while compiling that test target, so the workspace suite aborts and
-  runs must fall back to per-crate testing. Pre-existing and environmental (the repo root already held
-  `rustc-ice-*.txt` dumps from 2026-01-23/26 — this ICE class recurs); unrelated to any source change
-  (`splimes` has no `dsp-*` dependencies). Try a newer/pinned nightly and, if it persists, minimize +
-  file upstream. NB the ICE drops `rustc-ice-*.txt` dumps in the repo root — never commit them.
+- [ ] **START HERE (filed 2026-07-20 for the next run).** This run cleared the two items that had sat
+  at the top of this list — the "flaky GPU tests" (root-caused: unsound check + degenerate fixtures,
+  not the GPU) and the workspace-suite ICE — and `cargo test --workspace` now completes at
+  **969 passed / 0 failed**. That unblocks the verification floor for everything below. Recommended
+  order for the next run:
+  1. **Cheap + newly ungated:** the Phase 7.4 **online backup MVP over `VACUUM INTO`**, which this
+     run's research confirmed is *stable in the already-pinned Turso 0.6.0* — no version bump, no
+     blocker. A bounded first slice is "snapshot the control-plane DBs to a file + verify the copy
+     opens and matches".
+  2. **Cheap + a plausible real finding:** profile `test_create_btc_1min_database` — a 1-minute BTC
+     series taking **40+ minutes** to bulk-load is suspicious on its face, and if it is an ingest-path
+     problem rather than merely a big fixture, that is a benchmarked customer outcome (the governing
+     rule) hiding in a skipped test.
+  3. **The depth item:** realize the **FastLanes transposed layout on disk** (the tile-random-access
+     decoder already shipped; the residue is a `VAL_CODEC_*`/`TS_CODEC_*` tag + reader dispatch + its
+     own size function, then an *end-to-end* read benchmark — respecting the bandwidth-bound caveat).
+
+- [x] **DONE (2026-07-20) — BUG ROOT-CAUSED + FIXED: the "flaky GPU interpolation tests" were never a
+  GPU bug.** The roadmap offered two hypotheses — a real GPU race, or an unsound check. **Both the
+  check and the test fixtures were broken; the GPU path is correct.** Three distinct defects, all in
+  test code:
+  1. **The similarity metric was not a cosine similarity.** `linear::tests::pow` computed
+     `v^(2^exponent)` — it squared the *accumulator* each pass — so `pow(v, 2)` returned `v⁴` and every
+     norm was `sqrt(Σv⁴)`. Two *identical* vectors scored ~1e-4 instead of 1.0.
+  2. **`COS_THRESHOLD` had been tuned to the broken metric** (`8e-5`), which made the gate **inert**:
+     it accepted anything short of a ~10,000× error. Fixing `pow` alone exposed a run where CPU-vs-GPU
+     scored **0.377** and the test still reported `ok` — so passing runs had been proving nothing,
+     exactly as suspected.
+  3. **The real source of the flakiness was a degenerate test fixture, not the GPU.** `POINTS` built
+     ten points via `Point::random()`, whose timestamp is drawn from just 61 integer-second buckets
+     (−30..=30) around a per-call `Utc::now()`. Ten draws collide in the same second ~half the time,
+     and because each draw re-reads the clock a collision yields two knots **microseconds apart** — a
+     near-degenerate knot pair whose divided differences divide by a ~1e-6 s gap and blow up. Hence
+     the "garbage" values, and hence the clustering (one shared static → several tests fail in the same
+     process). The **CPU-vs-SIMD** comparison failed on bad draws too (measured 0.337), which is what
+     ruled the GPU out. A sibling instance of the same class: `regression::get_deterministic_points`
+     re-evaluated `Utc::now()` per point *per call* despite its name, handing each backend a
+     differently-drifted grid, so output lengths/timestamps diverged.
+
+  **Fixed** by correcting `pow`, anchoring both fixtures to one base time (values stay random; only
+  the knots are separated), and raising `COS_THRESHOLD` to a **real 0.999**. With the degeneracy gone
+  all four paths agree to ~13 decimal places (CPU-vs-SIMD, CPU-vs-**GPU** and CPU-vs-auto all measured
+  in `[0.9999999999999, 1.0000000000001]`), so the GPU quarantine was removed rather than kept.
+  **Verified: `cargo test -p splimes --lib` run 6× consecutively = 27 passed / 0 failed every time**
+  (previously ~1 run in 3 failed, and `tests::regression` failed ~2/2). The Phase 5 GPU benchmark
+  claims now have a correctness gate that means something.
+- [x] **DONE (2026-07-20) — BLOCKER CLEARED: the `gpu_integration_tests` rustc ICE was an
+  attribute-ORDER bug, fixable in DSP's own source.** The dump names it exactly: `attribute is missing
+  tokens` on the compiler-injected `rustc_test_entrypoint_marker` at
+  `splimes\tests\gpu_integration_tests.rs:6:1: 6:8` — i.e. on `#[test]`. Mechanism: with `#[test]`
+  **outermost**, rustc's builtin harness injects its entrypoint marker and the `#[serial(gpu_tests)]`
+  **proc-macro** attribute then re-emits the item without that marker's token information, and the
+  compiler asserts. The sibling `splimes/src/tests/*.rs` never hit it because they write
+  `#[tokio::test]` (a proc macro) outermost, so the literal `#[test]` is generated last.
+  **Fixed by reordering the two attributes** (`#[serial(gpu_tests)]` above `#[test]`) across all eight
+  tests in the file — no toolchain change, no `allow`, semantics unchanged. Ruled out the parallel
+  frontend as a cause (the ICE reproduces identically under `-Z threads=1`, so it is not the
+  workstation's global `-Z threads=15`). **The 8 tests in that target now compile and pass for the
+  first time (8 passed / 0 failed)**; they had never run.
+- [x] **DONE (2026-07-20) — the LNK1102 link OOM is FIXED at the root: `[profile.test] debug = 1`.**
+  With the ICE cleared, the default-parallelism `cargo test --workspace` died in `link.exe` with
+  `LINK : fatal error LNK1102: out of memory` while linking several large test executables at once
+  (`dsp-arrow-store`, `database`'s `db_tests`, `dsp-tui`, `dsp-server`); the cascade of
+  `can't find crate` / `no resolution for an import` "ICE"s after it was downstream noise from those
+  failed links, not separate compiler bugs. A resource limit, not a correctness one (~250 rlibs per
+  test binary). Two fixes were measured, and the better one shipped:
+  - `-j 2` works (`Finished test profile in 9m 21s`, zero link errors) but throttles the whole build
+    to 2 jobs on a box configured for 15 — an expensive workaround.
+  - **`[profile.test] debug = 1`** (line tables instead of the full `-C debuginfo=2`) cuts the debug
+    info `link.exe` must hold and **fixes it at FULL parallelism** — verified end-to-end:
+    `SKIP_SLOW_TESTS=1 cargo test --workspace` (no `-j` cap) → EXIT=0, **969 passed / 0 failed / 30
+    ignored across 29 targets, 0 link errors** — byte-identical results to the `-j 2` run. Shipped in
+    the root `Cargo.toml`; the `dev` and `release` profiles are untouched, so ordinary debugging is
+    unaffected and test backtraces keep line numbers. *(src:
+    https://learn.microsoft.com/en-us/previous-versions/troubleshoot/visualstudio/language-compilers/linker-fatal-error-out-of-memory
+    · https://doc.rust-lang.org/cargo/reference/profiles.html#debug)*
+- [x] **DONE (2026-07-20) — `cargo test --workspace` COMPLETES for the first time: 969 passed, 0
+  failed, 30 ignored across 29 targets.** The last blocker was `database`'s `db_tests`. Isolated it by
+  running the target serially: 14 of its 15 tests finish in seconds and
+  **`test_create_btc_1min_database`** was the entire stall — it bulk-loads the real
+  `datasets/btc_1min.csv` corpus and ran **40+ minutes at ~5 GB RSS** without producing a result
+  (memory plateaus, so it grinds rather than leaks). **`SKIP_SLOW_TESTS` was already the repo's
+  convention for exactly this** (`database_orchestration/src/lib.rs` guards four tests with it) but had
+  never been wired into this target, so `SKIP_SLOW_TESTS=1` silently did nothing here. Added the same
+  guard; the target now runs **15 passed in 53 s** instead of never finishing.
+  **Full verified command: `SKIP_SLOW_TESTS=1 cargo test --workspace` → EXIT=0, 969 passed / 0
+  failed / 30 ignored, no link errors.** `SKIP_SLOW_TESTS=1` is the one flag still needed (it skips the
+  BTC bulk load); the link OOM is fixed in-tree by `[profile.test] debug = 1`, so no `-j` cap is
+  required. A run can now legitimately quote a single whole-workspace number. NB killing a backgrounded `cargo test -p database` orphans
+  `db_tests-*.exe`, which holds a lock and breaks the next build — kill the exe too.
+- [ ] **NEXT — make the BTC bulk-load test runnable rather than merely skippable:**
+  `test_create_btc_1min_database` is now gated, which unblocks the suite but means the CSV ingest path
+  it covers is **not exercised by default**. It is also the one real-corpus ingest test DSP has. Worth
+  (i) profiling why a 1-minute BTC series takes 40+ minutes to load (it is a plausible ingest-path
+  performance finding in its own right, not just a slow test — compare against the `dsp-bench` ingest
+  numbers), and (ii) either shrinking the fixture to a subset that runs in seconds by default or
+  promoting it to a `dsp-bench` workload where a long runtime is expected and measured. **Research (2026-07-20) sharpens the fix:** LNK1102
+  is heap exhaustion in `link.exe`, and the standard mitigations are to cut the debug information the
+  linker must chew (a `[profile.test] debug = 1` — line tables only — instead of the current full
+  `-C debuginfo=2`) and to cap parallel link jobs. Try `debug = 1` on the test profile first; it is a
+  one-line workspace change and does not touch the dev profile the owner debugs with. *(src:
+  https://learn.microsoft.com/en-us/previous-versions/troubleshoot/visualstudio/language-compilers/linker-fatal-error-out-of-memory
+  · Cargo debug levels — https://doc.rust-lang.org/cargo/reference/profiles.html#debug)*
+  NB the earlier ICE dropped `rustc-ice-*.txt` dumps in the repo root — never commit them.
+- [ ] **Guard the `#[serial]`-above-`#[test]` ordering (research 2026-07-20):** the ICE cleared above is
+  **upstream rust-lang/rust#100263, open since Aug 2022** — same panic string (`attribute is missing
+  tokens`) in the same file (`rustc_ast/src/attr/mod.rs`), same shape (a test-harness attribute plus a
+  proc-macro attribute on one function). So this is not a transient nightly regression that a toolchain
+  bump will fix, and writing `#[test]` above a proc-macro attribute anywhere in the workspace will
+  reintroduce it. Worth (a) a comment at each site — done in `gpu_integration_tests.rs` — and (b)
+  considering a lint/grep in CI. DSP's ordering repro is also a cleaner minimization than the issue's
+  current one (which involves an unimported `test_case`), so it is worth contributing upstream.
+  *(src: https://github.com/rust-lang/rust/issues/100263)*
 
 - [x] **DONE (2026-07-14, capstone of the 2026-07-13 read-path arc) — `dsp-bench` `point_lookup` workload
   + the full storage/read/aggregation suite:** shipped `run_point_lookup` (parallel runner sealing a
@@ -956,11 +1084,25 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   materialized history with on-the-fly recent data" pattern). No code was needed beyond the existing
   mixed path. *(src: TimescaleDB real-time vs materialized-only continuous aggregates —
   https://www.tigerdata.com/learn/continuous-aggregates-timescaledb)*
-- [ ] **NEXT — (3c) materialized tiers, remaining:** the tier chain is opt-in and manually listed.
-  Residues: (i) a sensible **default** tier chain derived from the base (owner-gated, a default-flip like
-  the others); (ii) demonstrate the win *scales* — re-run `bench_tiered_vs_single_base` on a long-span
-  corpus (many base buckets/segment) where the coarse re-key the tier elides is large, to quantify the
-  regime where tiers pay for their extra sidecar bytes.
+- [x] **DONE (2026-07-20) — (3c)(ii) the tier win SCALES with base-buckets-per-segment, but sub-linearly.**
+  `bench_tiered_span` (`database/benches/downsample_range.rs`) holds rows (200k) and segments (16) fixed
+  and widens the sample **stride**, so every arm reads the same bytes and merges the same 16 partials —
+  only the base buckets per segment change (~208 → ~3125 → ~12500 at a MINUTES base), isolating the
+  re-key cost a rollup tier elides from the file read and value decode. Measured (release, criterion,
+  DAY query over a MINUTES base + `[HOURS, DAYS]` tiers, 7 reductions incl. `sketch_p99`):
+  **stride 1s → 5.34 vs 4.65 ms (1.15×) · 15s → 40.5 vs 32.0 ms (1.27×) · 60s → 201.3 vs 145.9 ms
+  (1.38×)**. So the 2026-07-19 ~1.16× replicates exactly at its short span, and the win does climb with
+  span — but a **~60× increase in base buckets buys only 1.15× → 1.38×**, so the elided re-key is *not*
+  the dominant cost even at one base bucket per row; the tiered arm's larger sidecar read (base + tiers)
+  eats much of what the re-key saves. Honest caveat: the `single_base/60` sample is noisy
+  ([175, 238] ms CI) against a tight tiered CI ([142, 149] ms) — the CIs are disjoint so the direction is
+  real, but that point estimate is soft.
+- [ ] **NEXT — (3c) materialized tiers, remaining:** (i) a sensible **default** tier chain derived from
+  the base — owner-gated, a default-flip like the others. Now better informed: per (3c)(ii) above the
+  payoff is 1.15–1.38× over the realistic span range, i.e. real but modest, so a default chain should be
+  justified against its extra `.dspart` bytes rather than assumed. (ii) The remaining unmeasured axis is
+  the **sidecar read cost itself** — split the tiered arm's wall-clock into sidecar-read vs re-key to see
+  whether a *shallower* chain (say `[DAYS]` only, no `HOURS`) beats the full chain at coarse queries.
 - [ ] **Positioning — DSP's `.dspart` sidecar IS the "incremental materialized view", and mergeable
   DDSketch is its edge (this run's research):** ClickHouse frames the choice as **incremental** MVs
   (insert-triggered, real-time, `AggregatingMergeTree` storing `-State` partial aggregates merged lazily
