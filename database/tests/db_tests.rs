@@ -611,6 +611,24 @@ async fn test_create_btc_1min_database() -> Result<()> {
 /// Gated on `RUN_INGEST_PROFILE` so it never joins the normal suite (like the BTC test it
 /// explains). Run it with, e.g.:
 /// `RUN_INGEST_PROFILE=1 INGEST_PROFILE_N=50000 cargo test -p database --test db_tests ingest_path_profile -- --nocapture`
+///
+/// # Corpus
+///
+/// By default the corpus is **synthetic** (a 1-minute grid of two-decimal prices). Set
+/// `INGEST_PROFILE_CORPUS=btc` to profile the **real** `database/datasets/btc_1min.csv`
+/// instead — the corpus `test_create_btc_1min_database` actually loads. The two are worth
+/// separating: the synthetic price is `20000 + (i % 5000)` with a `i % 100` fraction,
+/// which is far more regular than real market data, so its realized bytes/point flatters
+/// the columnar codecs. The real corpus is the honest number, and `INGEST_PROFILE_CSV`
+/// points the same path at any other `Timestamp,…,Close,…` CSV.
+///
+/// Set `INGEST_PROFILE_SKIP_LEGACY=1` to profile only the columnar seal — necessary at
+/// large `n`, because the legacy path is super-linear and a million rows through it does
+/// not finish in a sensible time.
+///
+/// `INGEST_PROFILE_SKIP_ROWS=N` discards the first N data rows of a real corpus. Use it:
+/// the BTC file's head is degenerate (see [`read_close_series`]) and measuring
+/// bytes/point there overstates DSP's compression by ~10×.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn ingest_path_profile_legacy_vs_columnar() -> Result<()> {
@@ -618,40 +636,158 @@ async fn ingest_path_profile_legacy_vs_columnar() -> Result<()> {
 		return Ok(());
 	}
 	let n: usize = std::env::var("INGEST_PROFILE_N").ok().and_then(|s| s.parse().ok()).unwrap_or(50_000);
+	let skip_legacy = std::env::var("INGEST_PROFILE_SKIP_LEGACY").is_ok();
 
-	// A synthetic BTC-like series: a 1-minute epoch grid, two-decimal prices.
+	// The corpus: real BTC 1-minute closes when asked for, else the synthetic grid.
+	let real_csv = std::env::var("INGEST_PROFILE_CSV").ok().map(std::path::PathBuf::from).or_else(|| {
+		(std::env::var("INGEST_PROFILE_CORPUS").as_deref() == Ok("btc")).then(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("datasets").join("btc_1min.csv"))
+	});
 	let base = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
-	let price = |i: usize| format!("{}.{:02}", 20_000 + (i % 5_000), i % 100);
-	let ts_ms: Vec<i64> = (0..n).map(|i| (base + Duration::minutes(i as i64)).timestamp_millis()).collect();
-	let values: Vec<BigDecimal> = (0..n).map(|i| BigDecimal::from_str(&price(i)).unwrap()).collect();
+	let skip_rows: usize = std::env::var("INGEST_PROFILE_SKIP_ROWS").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+	let (corpus, ts_ms, values) = match &real_csv {
+		Some(path) => {
+			let (ts, vs) = read_close_series(path, n, skip_rows)?;
+			(format!("real {} (skip {skip_rows})", path.display()), ts, vs)
+		}
+		None => {
+			let price = |i: usize| format!("{}.{:02}", 20_000 + (i % 5_000), i % 100);
+			let ts: Vec<i64> = (0..n).map(|i| (base + Duration::minutes(i as i64)).timestamp_millis()).collect();
+			let vs: Vec<BigDecimal> = (0..n).map(|i| BigDecimal::from_str(&price(i)).unwrap()).collect();
+			("synthetic 1-minute grid".to_string(), ts, vs)
+		}
+	};
+	let n = ts_ms.len();
+	assert!(n > 0, "the corpus yielded no rows");
 
-	// --- Legacy Turso row-store path (measurements + unbatched shadow queue) ---
 	let temp = tempfile::tempdir()?;
 	std::env::set_var("TEST_DATA_DIR", temp.path().to_str().unwrap());
-	let db = Database::new(&format!("prof_{}", Uuid::new_v4())).await?;
-	let subject = db.observe_subject("BTCUSD").await?;
-	let aspect = db.track_aspect(&subject.id(), "close", &Resolution::Minutes, None).await?;
-	let measurements: Vec<InputMeasurement> = (0..n).map(|i| InputMeasurement::new(base + Duration::minutes(i as i64), values[i].clone())).collect();
-	let t0 = std::time::Instant::now();
-	db.batch_capture_measurements(aspect.id(), DatasetId::new(), measurements).await?;
-	let legacy = t0.elapsed();
+
+	// --- Legacy Turso row-store path (measurements + unbatched shadow queue) ---
+	// Skippable: the legacy path is super-linear, so a large real corpus through it does
+	// not finish in a sensible time — which is itself the finding this profile records.
+	let legacy = if skip_legacy {
+		None
+	} else {
+		let db = Database::new(&format!("prof_{}", Uuid::new_v4())).await?;
+		let subject = db.observe_subject("BTCUSD").await?;
+		let aspect = db.track_aspect(&subject.id(), "close", &Resolution::Minutes, None).await?;
+		// The legacy `InputMeasurement` carries a `DateTime`, so the corpus timestamps are
+		// lifted back out of their epoch-millis form rather than re-derived from `base` —
+		// otherwise a real corpus would be timed against synthetic timestamps.
+		let measurements: Vec<InputMeasurement> = ts_ms.iter().zip(&values).map(|(ms, v)| InputMeasurement::new(Utc.timestamp_millis_opt(*ms).single().unwrap_or(base), v.clone())).collect();
+		let t0 = std::time::Instant::now();
+		db.batch_capture_measurements(aspect.id(), DatasetId::new(), measurements).await?;
+		Some(t0.elapsed())
+	};
 
 	// --- Storage-v2 columnar seal (one typed .dspseg frame) ---
+	// The physical encoding is DERIVED from the corpus rather than hardcoded. A fixed
+	// `ScaledI64 { scale: 2 }` happens to fit the synthetic two-decimal prices, but real
+	// BTC closes carry more fractional digits, and the no-silent-downcast rule
+	// (hard-constraint #4) then rejects the seal outright ("worst error 0.00117537 > bound
+	// 0") rather than quietly losing precision. `recommend_encoding` at a zero error bound
+	// picks the cheapest encoding that is EXACT for this column, which is what a schema
+	// author would declare.
 	let store = database::SegmentStore::open(temp.path().join("segstore")).await?;
-	let schema = dsp_physical_type::AspectSchema::new(dsp_physical_type::PhysicalType::ScaledI64 { scale: 2 }, BigDecimal::from_str("0").unwrap(), dsp_physical_type::timestamp::TimeUnit::Millis);
+	let exact = BigDecimal::from_str("0").unwrap();
+	let recommended = dsp_physical_type::recommend_encoding(&values, &exact);
+	assert!(recommended.is_exact(), "the recommended encoding must be exact at a zero error bound");
+	let schema = dsp_physical_type::AspectSchema::new(recommended.physical_type, exact, dsp_physical_type::timestamp::TimeUnit::Millis);
 	let t1 = std::time::Instant::now();
 	let descriptor = store.seal("close", &schema, &ts_ms, &values).await?;
 	let columnar = t1.elapsed();
 
-	// Both paths persisted all n rows.
+	// The columnar path persisted all n rows.
 	assert_eq!(descriptor.row_count as usize, n, "columnar seal wrote every row");
 
-	let legacy_rps = n as f64 / legacy.as_secs_f64();
 	let col_rps = n as f64 / columnar.as_secs_f64();
 	let bytes_per_point = descriptor.byte_len as f64 / n as f64;
-	eprintln!("INGEST PROFILE n={n}:");
-	eprintln!("  legacy Turso row-store : {legacy:?}  ({legacy_rps:.0} rows/s)");
-	eprintln!("  columnar .dspseg seal  : {columnar:?}  ({col_rps:.0} rows/s, {bytes_per_point:.2} B/point framed)");
-	eprintln!("  columnar seal is {:.1}x faster on the write path", col_rps / legacy_rps);
+	eprintln!("INGEST PROFILE n={n} corpus={corpus}:");
+	eprintln!("  derived exact encoding : {:?}", recommended.physical_type);
+	match legacy {
+		Some(legacy) => {
+			let legacy_rps = n as f64 / legacy.as_secs_f64();
+			eprintln!("  legacy Turso row-store : {legacy:?}  ({legacy_rps:.0} rows/s)");
+			eprintln!("  columnar .dspseg seal  : {columnar:?}  ({col_rps:.0} rows/s, {bytes_per_point:.2} B/point framed)");
+			eprintln!("  columnar seal is {:.1}x faster on the write path", col_rps / legacy_rps);
+		}
+		None => {
+			eprintln!("  legacy Turso row-store : SKIPPED (INGEST_PROFILE_SKIP_LEGACY)");
+			eprintln!("  columnar .dspseg seal  : {columnar:?}  ({col_rps:.0} rows/s, {bytes_per_point:.2} B/point framed)");
+		}
+	}
 	Ok(())
+}
+
+/// Convert a decimal epoch-**seconds** string (`"1325412060"` or `"1325412060.25"`) to
+/// epoch millis using integer arithmetic only, or `None` if it does not parse.
+///
+/// The fractional part is read to at most three digits (zero-padded), so `.5` is 500 ms
+/// and `.0` — the whole BTC corpus — is exactly 0. Doing this in integers rather than via
+/// `f64` avoids both the float rounding and the truncating cast that a `(secs * 1000.0)
+/// as i64` would introduce on a column that is exactly representable.
+fn epoch_seconds_to_millis(raw: &str) -> Option<i64> {
+	let (whole, frac) = raw.split_once('.').unwrap_or((raw, ""));
+	let secs: i64 = whole.parse().ok()?;
+	let mut millis_frac = 0i64;
+	for (i, ch) in frac.chars().take(3).enumerate() {
+		let digit = i64::from(ch.to_digit(10)?);
+		millis_frac += digit * 10i64.pow(2 - u32::try_from(i).ok()?);
+	}
+	secs.checked_mul(1000)?.checked_add(if secs < 0 { -millis_frac } else { millis_frac })
+}
+
+/// Read `n` `(epoch_millis, Close)` rows out of a `Timestamp,Open,High,Low,Close,Volume`
+/// CSV, after discarding the first `skip` data rows — the shape of
+/// `database/datasets/btc_1min.csv`, whose `Timestamp` column is fractional epoch
+/// **seconds**.
+///
+/// `skip` exists because **the head of that corpus is degenerate**: its first ~20k rows
+/// are 2012 ticks where the close price holds constant for long runs (4.58 … 6.30), which
+/// the value column's RLE-class codecs compress to almost nothing. Measuring bytes/point
+/// on the first N rows therefore flatters DSP's compression by roughly an order of
+/// magnitude versus a window with real price movement — so a representative storage number
+/// must skip into the corpus. (Throughput is far less sensitive to this than size is.)
+///
+/// Streams the file line by line so a 370 MB corpus does not have to be resident, and
+/// stops as soon as `n` rows are collected. A row whose timestamp or close price will not
+/// parse is skipped rather than failing the profile: the corpus is real data, and one bad
+/// line should not invalidate a throughput measurement.
+///
+/// # Errors
+///
+/// The file cannot be opened or read.
+fn read_close_series(path: &std::path::Path, n: usize, skip: usize) -> Result<(Vec<i64>, Vec<BigDecimal>)> {
+	use std::io::BufRead as _;
+
+	let file = std::fs::File::open(path).with_context(|| format!("opening ingest-profile corpus {}", path.display()))?;
+	let mut reader = std::io::BufReader::with_capacity(1 << 20, file);
+	let mut header = String::new();
+	reader.read_line(&mut header).context("reading the corpus header")?;
+
+	let mut ts_ms = Vec::with_capacity(n.min(1 << 20));
+	let mut values = Vec::with_capacity(n.min(1 << 20));
+	let mut skipped = 0usize;
+	for line in reader.lines() {
+		if ts_ms.len() >= n {
+			break;
+		}
+		let line = line.context("reading a corpus row")?;
+		if skipped < skip {
+			skipped += 1;
+			continue;
+		}
+		let mut cols = line.split(',');
+		let (Some(ts_raw), Some(_open), Some(_high), Some(_low), Some(close)) = (cols.next(), cols.next(), cols.next(), cols.next(), cols.next()) else {
+			continue;
+		};
+		// `Timestamp` is fractional epoch seconds (e.g. `1325412060.0`). Scale to millis in
+		// integer arithmetic — a `f64` round-trip would be a lossy, truncating cast on a
+		// column that is exactly representable as an integer.
+		let Some(millis) = epoch_seconds_to_millis(ts_raw.trim()) else { continue };
+		let Ok(value) = BigDecimal::from_str(close.trim()) else { continue };
+		ts_ms.push(millis);
+		values.push(value);
+	}
+	Ok((ts_ms, values))
 }
