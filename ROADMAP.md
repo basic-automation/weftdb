@@ -620,7 +620,8 @@ recovery, with bounded p99 and no loss beyond the declared durability mode.
   - [x] Background backup daemon (`DSP_BACKUP_INTERVAL_SECS`) with generated-snapshot retention (`DSP_BACKUP_KEEP`)
   - [x] Concurrent-write-safe verification (`VerifyMode::SnapshotOnly`) — the mode an online backup must use
   - [x] **Restore + a backup/restore drill** — `restore_control_plane` puts a snapshot back into a fresh store root, verifying each file at its destination, and refusing both an incomplete backup dir and an existing control plane; a round-trip test reopens the restored store and reads its measurements back
-  - [ ] Expose restore at the API (`POST …/storage/restore`) + a restore drill against the running binary — the primitive has no HTTP surface, so it is the one piece of this arc with no runtime verification
+  - [x] **Restore drill at the API** — `POST /api/v1/storage/restore/drill?label=` rehearses a restore into a throwaway dir, verifies it, reports `restorable`, and cleans up; non-destructive by construction (it cannot touch the live store), runtime-verified against the live binary
+  - [ ] Restoring *into a chosen new root* over HTTP — deliberately not shipped (a deployment decision, not an HTTP call); revisit only if an operator flow actually needs it
   - [ ] Whole-store backup manifest (fold the `.dspseg` frames in beside the control plane) — today a restore into an empty root yields a valid but frame-less store
   - [ ] Document RPO/RTO against the measured snapshot cadence
 - [ ] **7.5 Compaction** — scheduling, query consistency during compaction, resource
@@ -919,9 +920,10 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
      exists to remove. *(src:
      https://www.slingacademy.com/article/optimizing-inserts-and-updates-with-index-management-in-sqlite/
      · https://medium.com/@JasonWyatt/squeezing-performance-from-sqlite-insertions-971aff98eef2)*
-  2. **Expose restore at the API** (`POST …/storage/restore`) — the one piece of the backup arc with no
-     runtime verification, because the primitive has no HTTP surface. Bounded, and it makes the restore
-     drill runnable against the live binary.
+  2. **Backup arc follow-ons (cheap):** the snapshot-cost question (a tick costs seconds on a five-row
+     control plane — measure it properly on a quiet box, then either document the floor or checkpoint
+     the MVCC log before vacuuming) and dropping the empty `.db-log`/`.db-wal` sidecars after verifying.
+     Both are filed with their evidence in the Turso section below.
   3. **The depth item:** realize the **FastLanes transposed layout on disk** (the tile-random-access
      decoder already shipped; the residue is a `VAL_CODEC_*`/`TS_CODEC_*` tag + reader dispatch + its
      own size function, then an *end-to-end* read benchmark — respecting the bandwidth-bound caveat).
