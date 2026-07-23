@@ -28,6 +28,7 @@
 
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 
+pub mod backup_daemon;
 pub mod downsample;
 pub mod interpolate;
 pub mod manage;
@@ -40,6 +41,7 @@ pub mod trace;
 use axum::{
 	middleware, routing::{get, post}, Json, Router
 };
+pub use backup_daemon::{backup_tick, list_generated_backups, prune_generated_backups, spawn_backup_daemon, BackupDaemonConfig};
 pub use downsample::{downsample, downsample_arrow, downsample_csv, downsample_ilp, downsample_ilp_arrow, downsample_ilp_csv, downsample_ilp_parquet, downsample_parquet, Aggregation, DownsampleRequest, DownsampleResponse};
 pub use interpolate::{interpolate, interpolate_arrow, interpolate_csv, interpolate_ilp, interpolate_ilp_arrow, interpolate_ilp_csv, interpolate_ilp_parquet, interpolate_parquet, interpolate_point, InterpolateRequest, InterpolateResponse, PointKind, PointRequest, PointResponse};
 pub use manage::{declare_aspect, ingest_csv, ingest_ilp, ingest_points, reconcile_aspect, reconcile_store, CsvIngestParams, DeclareAspectRequest, DeclareAspectResponse, IlpIngestParams, IngestPoint, IngestRequest, IngestResponse, ReconcileResponse, ReconcileStoreResponse};
