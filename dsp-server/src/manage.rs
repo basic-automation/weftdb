@@ -483,6 +483,81 @@ pub async fn compact_aspect(State(state): State<AppState>, Path(aspect): Path<St
 	Ok((StatusCode::OK, Json(CompactResponse { aspect, removed, segment_count })).into_response())
 }
 
+/// Query parameters for `POST /api/v1/storage/restore/drill`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RestoreDrillParams {
+	/// The backup subdirectory to rehearse restoring, under the same backup root the
+	/// snapshot endpoint writes to. Traversal-guarded exactly like the backup label.
+	pub label: String,
+}
+
+/// Response body for `POST /api/v1/storage/restore/drill` — the outcome of a rehearsed
+/// restore.
+#[derive(Debug, Clone, Serialize)]
+pub struct RestoreDrillResponse {
+	/// The backup directory that was rehearsed.
+	pub label: String,
+	/// Per-database verification of each restored file, read back at its restore
+	/// destination.
+	pub databases: Vec<BackupDbReport>,
+	/// Total rows verified readable across the restored control plane.
+	pub total_rows: i64,
+	/// Total on-disk size of the restored files in bytes.
+	pub total_bytes: u64,
+	/// Always `true` when the call returns `200`: the backup restored and every restored
+	/// database opened and scanned. A failure is reported as a non-`200` instead.
+	pub restorable: bool,
+}
+
+/// Handle `POST /api/v1/storage/restore/drill?label=`: **rehearse** restoring a backup.
+///
+/// The Phase 7.4 drill. Restores the named backup into a throwaway directory, verifies
+/// every restored database at its destination (it opens, and every row of every table
+/// reads), reports what came back, and then deletes the rehearsal copy. The live store is
+/// never touched and nothing is overwritten — the whole point is that an operator can
+/// answer "is my backup actually restorable?" on a running system without risking it.
+///
+/// Restoring *over* a live control plane is deliberately not offered here: the library
+/// primitive refuses to clobber, and choosing a new store root is a deployment decision
+/// (point `DSP_SEGMENT_STORE_ROOT` at the restored copy and restart), not an HTTP call.
+///
+/// # Errors
+///
+/// [`StorageError::Unconfigured`] when no store is attached, [`StorageError::BadRequest`]
+/// when the label is malformed, [`StorageError::NotFound`] when no such backup exists, and
+/// [`StorageError::Internal`] when the backup will not restore or verify — which is a
+/// failed drill, and the answer the caller asked for.
+pub async fn restore_drill(State(state): State<AppState>, Query(params): Query<RestoreDrillParams>) -> Result<Response, StorageError> {
+	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	drop(state);
+	if !valid_backup_label(&params.label) {
+		return Err(StorageError::BadRequest(format!("invalid backup label `{}` — use only letters, digits, '.', '_', '-'", params.label)));
+	}
+	let base = std::env::var_os("DSP_BACKUP_DIR").map_or_else(|| store.root().join("backups"), std::path::PathBuf::from);
+	let backup_dir = base.join(&params.label);
+	if !backup_dir.is_dir() {
+		return Err(StorageError::NotFound(format!("no backup named `{}` under {}", params.label, base.display())));
+	}
+	drop(store);
+
+	// A throwaway destination beside the backups: same volume (so the rehearsal is sized
+	// like the real thing) and never the live store root. Cleaned up on every path,
+	// success or failure.
+	let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|err| StorageError::Internal(err.to_string()))?.as_millis();
+	let target = base.join(format!(".restore-drill-{millis}"));
+	let outcome = database::restore_control_plane(&backup_dir, &target).await;
+	let _ = tokio::fs::remove_dir_all(&target).await;
+	let report = outcome.map_err(|err| StorageError::Internal(format!("restore drill for `{}` FAILED: {err:#}", params.label)))?;
+
+	let databases = report
+		.restored
+		.iter()
+		.map(|r| BackupDbReport { name: r.dest.file_name().map_or_else(|| "?".to_string(), |n| n.to_string_lossy().into_owned()), tables: r.tables, rows: r.rows, bytes: r.bytes })
+		.collect();
+	let response = RestoreDrillResponse { label: params.label, databases, total_rows: report.total_rows(), total_bytes: report.total_bytes(), restorable: true };
+	Ok((StatusCode::OK, Json(response)).into_response())
+}
+
 /// Query parameters for `POST /api/v1/storage/backup`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct BackupParams {
@@ -1390,6 +1465,30 @@ mod tests {
 		let bad_mode = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/backup?label=other&verify=maybe").body(Body::empty()).unwrap()).await.unwrap();
 		assert_eq!(bad_mode.status(), StatusCode::BAD_REQUEST, "unknown verify mode rejected");
 		assert!(!dir.path().join("backups").join("other").exists(), "a rejected request writes nothing");
+
+		// The Phase 7.4 drill over HTTP: rehearse restoring the snapshot we just took,
+		// without touching the live store.
+		let router = app_with_state(state.clone());
+		let drill = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/restore/drill?label=nightly").body(Body::empty()).unwrap()).await.unwrap();
+		let dstatus = drill.status();
+		let dbytes = axum::body::to_bytes(drill.into_body(), usize::MAX).await.unwrap();
+		let djson: serde_json::Value = serde_json::from_slice(&dbytes).unwrap();
+		assert_eq!(dstatus, StatusCode::OK, "body: {djson}");
+		assert_eq!(djson["restorable"], true, "the backup restored and verified");
+		assert_eq!(djson["databases"].as_array().unwrap().len(), 4, "all four control-plane DBs came back");
+		assert!(djson["total_rows"].as_i64().unwrap() >= 2, "rows read back out of the restored copies");
+		// The rehearsal left nothing behind, and the live store is untouched.
+		let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("backups")).unwrap().filter_map(Result::ok).map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with(".restore-drill-")).collect();
+		assert!(leftovers.is_empty(), "the drill cleaned up its rehearsal dir; found {leftovers:?}");
+		assert!(dir.path().join("segment_index.db").exists(), "the live control plane is still in place");
+
+		// An unknown backup is a 404, and a traversal label is a 400.
+		let router = app_with_state(state.clone());
+		let missing = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/restore/drill?label=no-such-backup").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(missing.status(), StatusCode::NOT_FOUND, "drilling a backup that does not exist");
+		let router = app_with_state(state.clone());
+		let traversal = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/restore/drill?label=..").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(traversal.status(), StatusCode::BAD_REQUEST, "traversal label rejected on the drill too");
 		drop(store);
 	}
 
