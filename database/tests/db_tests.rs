@@ -467,7 +467,29 @@ async fn test_create_btc_1min_database() -> Result<()> {
 	let csv_path = "datasets/btc_1min.csv"; // Correct path when running from database directory
 	let db_name = "Crypto".to_string();
 
-	// Create database (will use existing if present)
+	// **Bounded by default.** Loading the whole corpus through the legacy row-store path
+	// takes 40+ minutes at ~5 GB RSS (it is super-linear — see
+	// `ingest_path_profile_legacy_vs_columnar`, which measured 2x rows costing 4.11x the
+	// time on this same corpus). Gating it on `SKIP_SLOW_TESTS` made the workspace suite
+	// terminate, but at the cost of never exercising the real-corpus CSV ingest path at
+	// all. So the default run now loads a **capped prefix** into a **temp data dir**:
+	// bounded, hermetic, and it actually runs. `BTC_TEST_FULL=1` restores the historical
+	// full load into the shared data dir; `BTC_TEST_MAX_ROWS` tunes the cap.
+	let full_load = std::env::var("BTC_TEST_FULL").is_ok();
+	let max_rows: usize = std::env::var("BTC_TEST_MAX_ROWS").ok().and_then(|s| s.parse().ok()).unwrap_or(5_000);
+	// Held for the whole test so the temp dir outlives the database handle.
+	let _bounded_dir = if full_load {
+		None
+	} else {
+		let temp = tempfile::tempdir()?;
+		std::env::set_var("TEST_DATA_DIR", temp.path().to_str().context("temp data dir is not valid UTF-8")?);
+		debug!("Bounded BTC load: {max_rows} rows into a temp data dir at {}", temp.path().display());
+		Some(temp)
+	};
+
+	// Create database (will use existing if present). The bounded run always starts from a
+	// fresh temp dir, so this early-out only ever applies to the full load — which is the
+	// point: the bounded path is exercised on every run rather than short-circuited.
 	let db = if std::path::Path::new(&format!("{}/{db_name}", Database::get_data_dir())).exists() {
 		debug!("Database already exists, test passed");
 		return Ok(());
@@ -525,11 +547,19 @@ async fn test_create_btc_1min_database() -> Result<()> {
 			let mut records = Vec::new();
 
 			for result in rdr.deserialize() {
+				if !full_load && records.len() >= max_rows {
+					break;
+				}
 				let record: BTC1MinRecord = result.context("Failed to deserialize CSV record")?;
 				records.push(record);
 			}
 
 			debug!("Loaded {} records from CSV", records.len());
+			if full_load {
+				assert!(records.len() > max_rows, "the full load should read far more than the bounded cap");
+			} else {
+				assert_eq!(records.len(), max_rows, "the bounded load reads exactly its cap");
+			}
 
 			let all_measurements: Vec<(InputMeasurement, InputMeasurement, InputMeasurement, InputMeasurement, InputMeasurement)> = records
 				.par_iter()
@@ -585,6 +615,11 @@ async fn test_create_btc_1min_database() -> Result<()> {
 
 			let inserted_count = records.len();
 			debug!("Inserted {} BTC 1-minute records", inserted_count);
+
+			// The point of running at all: assert the real-corpus ingest actually landed,
+			// rather than merely not erroring.
+			let earliest = db.get_earliest_measurement(&close_aspect.id()).await?;
+			assert!(earliest.is_some(), "the close aspect has measurements after the load");
 		} else {
 			debug!("Skipping BTC database test - CSV file not found at {}", csv_path);
 		}
