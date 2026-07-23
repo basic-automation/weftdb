@@ -282,6 +282,88 @@ async fn verify_against_source(src: &turso::Connection, dest: &Path) -> Result<S
 	Ok(SnapshotReport { dest: dest.to_path_buf(), tables: src_tables.len(), rows, bytes, mode: VerifyMode::SourceMatch })
 }
 
+/// The four control-plane database file names.
+///
+/// These are what a [`ControlPlaneBackup`](crate::ControlPlaneBackup) writes and what a
+/// store root holds — one source of truth for both directions, so a restore can never
+/// disagree with the backup about what the control plane consists of.
+pub const CONTROL_PLANE_FILES: [&str; 4] = ["segment_index.db", "metadata.db", "aspect_catalog.db", "catalog.db"];
+
+/// What a [`restore_control_plane`] call put back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreReport {
+	/// The store root the control plane was restored into.
+	pub root: PathBuf,
+	/// The per-database verification of each restored file, in [`CONTROL_PLANE_FILES`]
+	/// order — each one reopened at its destination and fully scanned.
+	pub restored: Vec<SnapshotReport>,
+}
+
+impl RestoreReport {
+	/// Total rows verified readable across the restored control plane.
+	#[must_use]
+	pub fn total_rows(&self) -> i64 {
+		self.restored.iter().map(|r| r.rows).sum()
+	}
+
+	/// Total on-disk size of the restored control-plane files in bytes.
+	#[must_use]
+	pub fn total_bytes(&self) -> u64 {
+		self.restored.iter().map(|r| r.bytes).sum()
+	}
+}
+
+/// Restore a control-plane backup directory into a store root (roadmap **Phase 7.4** —
+/// the restore half; a backup that has never been restored is not yet a backup).
+///
+/// Copies each of the [`CONTROL_PLANE_FILES`] from `backup_dir` into `root`, then
+/// **verifies every restored file at its destination** with [`verify_snapshot`] — so the
+/// call only succeeds if the restored control plane actually opens and reads, which is
+/// the drill Phase 7.4 asks for rather than a bare file copy.
+///
+/// Refuses to clobber: if any target file already exists in `root`, nothing is written and
+/// the call fails. Restore into a fresh root (or move the old one aside) — an accidental
+/// restore over a live control plane is exactly the disaster a restore path must not make
+/// easy.
+///
+/// The `.dspseg` measurement frames under `segments/` are **not** part of this (the backup
+/// is control-plane only, per hard-constraint #3): restoring into a root whose `segments/`
+/// still holds the frames reconstitutes a working store, which is the intended
+/// control-plane-corruption recovery. A restore into an empty root yields a valid but
+/// frame-less store whose index rows point at missing files.
+///
+/// # Errors
+///
+/// - `backup_dir` is missing any of the four files.
+/// - Any target file already exists in `root`.
+/// - A copy fails, or any restored file fails verification.
+pub async fn restore_control_plane(backup_dir: &Path, root: &Path) -> Result<RestoreReport> {
+	// Pre-flight both directions before writing anything, so a partial restore cannot
+	// leave a half-populated control plane behind.
+	for name in CONTROL_PLANE_FILES {
+		let src = backup_dir.join(name);
+		if !src.exists() {
+			bail!("backup dir {} is missing {name} — not a complete control-plane backup", backup_dir.display());
+		}
+		let dest = root.join(name);
+		if dest.exists() {
+			bail!("refusing to overwrite an existing control plane: {} already exists (restore into a fresh root)", dest.display());
+		}
+	}
+	tokio::fs::create_dir_all(root).await.with_context(|| format!("creating restore root {}", root.display()))?;
+
+	let mut restored = Vec::with_capacity(CONTROL_PLANE_FILES.len());
+	for name in CONTROL_PLANE_FILES {
+		let src = backup_dir.join(name);
+		let dest = root.join(name);
+		tokio::fs::copy(&src, &dest).await.with_context(|| format!("restoring {} -> {}", src.display(), dest.display()))?;
+		// Verify at the destination, not the source: what matters is that the file the
+		// store will open is readable.
+		restored.push(verify_snapshot(&dest).await.with_context(|| format!("verifying restored {name}"))?);
+	}
+	Ok(RestoreReport { root: root.to_path_buf(), restored })
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
