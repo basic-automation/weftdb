@@ -2155,6 +2155,71 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn backup_then_restore_round_trips_a_working_store() {
+		// The Phase 7.4 drill: back the control plane up, restore it into a fresh root
+		// beside the original's segment frames, and prove the restored store still
+		// answers — a backup that has never been restored is not yet a backup.
+		let dir = TempDir::new().unwrap();
+		let schema = AspectSchema::new(PhysicalType::F64, "0".parse().unwrap(), TimeUnit::Seconds);
+		let root = dir.path().join("live");
+		let store = SegmentStore::open(&root).await.expect("opens");
+		store.declare("price", &schema).await.expect("declares");
+		store.seal("price", &schema, &[0_i64, 10, 20], &["1".parse().unwrap(), "2".parse().unwrap(), "3".parse().unwrap()]).await.expect("seals");
+		let backup_dir = dir.path().join("backup");
+		let backup = store.backup_control_plane_with_verify(&backup_dir, crate::VerifyMode::SnapshotOnly).await.expect("backs up");
+		let live_stats = store.aspect_stats("price").await.expect("live stats");
+		drop(store);
+
+		// Restore into a fresh root, carrying the measurement frames across (the backup is
+		// control-plane only, per hard-constraint #3).
+		let restored_root = dir.path().join("restored");
+		tokio::fs::create_dir_all(restored_root.join("segments")).await.unwrap();
+		let mut frames = tokio::fs::read_dir(root.join("segments")).await.unwrap();
+		while let Some(entry) = frames.next_entry().await.unwrap() {
+			tokio::fs::copy(entry.path(), restored_root.join("segments").join(entry.file_name())).await.unwrap();
+		}
+		let report = crate::restore_control_plane(&backup_dir, &restored_root).await.expect("restores");
+		assert_eq!(report.restored.len(), 4, "all four control-plane DBs restored");
+		assert_eq!(report.total_rows(), backup.total_rows(), "the restored control plane holds the backed-up rows");
+
+		// The restored store opens and still knows the aspect, its schema and its segments.
+		let reopened = SegmentStore::open(&restored_root).await.expect("restored store opens");
+		let aspects = reopened.list_declared_aspects().await.expect("lists aspects");
+		let stats = reopened.aspect_stats("price").await.expect("restored stats");
+		let (times, values) = reopened.read_time_range("price", 0, 20).await.expect("reads back");
+		drop(reopened);
+		assert_eq!(aspects, vec!["price".to_string()], "the declared aspect survived the restore");
+		assert_eq!(stats.segment_count, live_stats.segment_count, "same segment count as the live store");
+		assert_eq!(times, vec![0_i64, 10, 20], "the measurements read back through the restored control plane");
+		assert_eq!(values.into_iter().flatten().count(), 3, "every value materialized from the restored store");
+	}
+
+	#[tokio::test]
+	async fn restore_refuses_to_clobber_an_existing_control_plane() {
+		let dir = TempDir::new().unwrap();
+		let schema = AspectSchema::new(PhysicalType::F64, "0".parse().unwrap(), TimeUnit::Seconds);
+		let root = dir.path().join("live");
+		let store = SegmentStore::open(&root).await.expect("opens");
+		store.declare("price", &schema).await.expect("declares");
+		let backup_dir = dir.path().join("backup");
+		store.backup_control_plane_with_verify(&backup_dir, crate::VerifyMode::SnapshotOnly).await.expect("backs up");
+		drop(store);
+
+		// Restoring back over the live root must refuse rather than half-overwrite it.
+		let err = crate::restore_control_plane(&backup_dir, &root).await.unwrap_err();
+		assert!(err.to_string().contains("refusing to overwrite"), "got: {err}");
+
+		// An incomplete backup dir is refused too, and writes nothing.
+		let partial = dir.path().join("partial");
+		tokio::fs::create_dir_all(&partial).await.unwrap();
+		tokio::fs::copy(backup_dir.join("catalog.db"), partial.join("catalog.db")).await.unwrap();
+		let fresh = dir.path().join("fresh");
+		let err = crate::restore_control_plane(&partial, &fresh).await.unwrap_err();
+		assert!(err.to_string().contains("is missing"), "got: {err}");
+		assert!(!fresh.join("catalog.db").exists(), "a refused restore writes nothing");
+	}
+
+	#[tokio::test]
 	async fn backup_control_plane_snapshots_and_verifies_every_db() {
 		let dir = TempDir::new().expect("tempdir");
 		let store = SegmentStore::open_scoped(dir.path(), "market", "btc").await.expect("opens");
