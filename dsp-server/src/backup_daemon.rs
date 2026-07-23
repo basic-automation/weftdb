@@ -27,7 +27,7 @@ use std::{
 	time::Duration,
 };
 
-use database::{ControlPlaneBackup, SegmentStore};
+use database::{ControlPlaneBackup, SegmentStore, VerifyMode};
 use tracing::Instrument as _;
 
 use crate::metrics::SharedMetrics;
@@ -150,16 +150,23 @@ pub async fn prune_generated_backups(base: &Path, keep: usize) -> anyhow::Result
 /// `dsp_backup_snapshots_total`/`dsp_backup_bytes_written_total` counters the manual
 /// endpoint uses, so an operator sees one backup cadence whichever path took it.
 ///
+/// Verification runs in [`VerifyMode::SnapshotOnly`]: the daemon backs up a **live,
+/// ingesting** store, so a seal committing between a database's vacuum and its
+/// verification would make a source-matching row-count check fail spuriously. The
+/// snapshot-only check never re-reads the source and instead proves the copy opens and
+/// every row of it is readable — the strongest statement available without stopping
+/// writers.
+///
 /// # Errors
 ///
 /// Propagates a clock failure, or any
-/// [`SegmentStore::backup_control_plane`](database::SegmentStore::backup_control_plane)
+/// [`SegmentStore::backup_control_plane_with_verify`](database::SegmentStore::backup_control_plane_with_verify)
 /// backup/verify failure.
 pub async fn backup_tick(store: &SegmentStore, metrics: &SharedMetrics, base: &Path) -> anyhow::Result<ControlPlaneBackup> {
 	let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis();
 	let dest = fresh_dir(base, millis);
-	let span = tracing::info_span!("backup.tick", dir = %dest.display(), rows = tracing::field::Empty, bytes = tracing::field::Empty);
-	let backup = store.backup_control_plane(&dest).instrument(span.clone()).await?;
+	let span = tracing::info_span!("backup.tick", dir = %dest.display(), verify = "snapshot", rows = tracing::field::Empty, bytes = tracing::field::Empty);
+	let backup = store.backup_control_plane_with_verify(&dest, VerifyMode::SnapshotOnly).instrument(span.clone()).await?;
 	span.record("rows", backup.total_rows());
 	span.record("bytes", backup.total_bytes());
 	metrics.record_backup(backup.total_bytes());

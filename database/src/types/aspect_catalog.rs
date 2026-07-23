@@ -77,8 +77,21 @@ impl AspectCatalog {
 	///
 	/// Propagates a connection failure or any backup/verify failure.
 	pub async fn backup_to(&self, dest: &std::path::Path) -> Result<crate::SnapshotReport> {
+		self.backup_to_with(dest, crate::VerifyMode::default()).await
+	}
+
+	/// Snapshot this database to `dest` under an explicit [`VerifyMode`](crate::VerifyMode).
+	///
+	/// [`VerifyMode::SnapshotOnly`](crate::VerifyMode::SnapshotOnly) verifies the copy
+	/// without re-reading the source, so it is the mode an **online** backup (the backup
+	/// daemon) must use while writers are still committing.
+	///
+	/// # Errors
+	///
+	/// Propagates a connection failure or any backup/verify failure.
+	pub async fn backup_to_with(&self, dest: &std::path::Path, mode: crate::VerifyMode) -> Result<crate::SnapshotReport> {
 		let conn = self.db.connect()?;
-		crate::types::backup::snapshot_and_verify(&conn, dest).await
+		crate::types::backup::snapshot_with_verify(&conn, dest, mode).await
 	}
 
 	/// Declare (or re-declare) the schema for `(database, subject, aspect)`.
