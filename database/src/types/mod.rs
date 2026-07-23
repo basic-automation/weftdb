@@ -1,6 +1,6 @@
 pub use aspect::{Aspect, AspectId};
 pub use aspect_catalog::AspectCatalog;
-pub use backup::{count_rows, snapshot_and_verify, user_tables, vacuum_into, SnapshotReport};
+pub use backup::{count_rows, scan_rows, snapshot_and_verify, snapshot_with_verify, user_tables, vacuum_into, verify_snapshot, SnapshotReport, VerifyMode};
 pub use batches::{
 	batched_measurements::{analysis::Analysis, batched_distance::BatchDistance, BatchedMeasurement}, Batch, BatchId, BatchMetatdata, Batches
 };

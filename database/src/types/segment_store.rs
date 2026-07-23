@@ -368,12 +368,32 @@ impl SegmentStore {
 	/// Propagates a filesystem error creating `dest_dir`, or any per-database backup/verify
 	/// failure (bad/existing destination, libSQL error, or a source/copy mismatch).
 	pub async fn backup_control_plane(&self, dest_dir: impl AsRef<Path>) -> Result<ControlPlaneBackup> {
+		self.backup_control_plane_with_verify(dest_dir, crate::VerifyMode::default()).await
+	}
+
+	/// Take the same four-database control-plane snapshot as
+	/// [`backup_control_plane`](SegmentStore::backup_control_plane), under an explicit
+	/// [`VerifyMode`](crate::VerifyMode).
+	///
+	/// [`VerifyMode::SourceMatch`](crate::VerifyMode::SourceMatch) (the default) verifies
+	/// each copy against a fresh source read and assumes a **quiescent** store — the
+	/// maintenance-window shape. [`VerifyMode::SnapshotOnly`](crate::VerifyMode::SnapshotOnly)
+	/// verifies each copy on its own terms and never re-reads the source, so it is the
+	/// mode an **online** backup taken against a live, ingesting store must use: a
+	/// concurrent seal committing between a vacuum and its verification would otherwise
+	/// be reported as a spurious mismatch.
+	///
+	/// # Errors
+	///
+	/// Propagates a filesystem error creating `dest_dir`, or any per-database backup/verify
+	/// failure.
+	pub async fn backup_control_plane_with_verify(&self, dest_dir: impl AsRef<Path>, mode: crate::VerifyMode) -> Result<ControlPlaneBackup> {
 		let dir = dest_dir.as_ref().to_path_buf();
 		tokio::fs::create_dir_all(&dir).await.with_context(|| format!("creating backup dir {}", dir.display()))?;
-		let segment_index = self.index.backup_to(&dir.join("segment_index.db")).await.context("backing up segment_index.db")?;
-		let metadata = self.metadata.backup_to(&dir.join("metadata.db")).await.context("backing up metadata.db")?;
-		let aspect_catalog = self.catalog.backup_to(&dir.join("aspect_catalog.db")).await.context("backing up aspect_catalog.db")?;
-		let registry = self.registry.backup_to(&dir.join("catalog.db")).await.context("backing up catalog.db")?;
+		let segment_index = self.index.backup_to_with(&dir.join("segment_index.db"), mode).await.context("backing up segment_index.db")?;
+		let metadata = self.metadata.backup_to_with(&dir.join("metadata.db"), mode).await.context("backing up metadata.db")?;
+		let aspect_catalog = self.catalog.backup_to_with(&dir.join("aspect_catalog.db"), mode).await.context("backing up aspect_catalog.db")?;
+		let registry = self.registry.backup_to_with(&dir.join("catalog.db"), mode).await.context("backing up catalog.db")?;
 		Ok(ControlPlaneBackup { dir, segment_index, metadata, aspect_catalog, registry })
 	}
 

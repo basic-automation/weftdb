@@ -34,6 +34,7 @@ use axum::{
 };
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
+use database::VerifyMode;
 use dsp_line_protocol::TimestampPrecision;
 use dsp_physical_type::{first_order_violation, AspectSchema, PhysicalType, SegmentDescriptor, TimeUnit};
 use serde::{Deserialize, Serialize};
@@ -489,6 +490,12 @@ pub struct BackupParams {
 	/// `[A-Za-z0-9._-]` (and not `.`/`..`) so an API caller can never traverse out of
 	/// the backup root. Absent → a `backup-<unix_millis>` name is generated.
 	pub label: Option<String>,
+	/// How each snapshot copy is verified: `source` (default) cross-checks it against a
+	/// fresh read of the live control plane — the strongest check, but it assumes a
+	/// **quiescent** store; `snapshot` verifies the copy on its own terms (it opens and
+	/// every row is readable) without re-reading the source, which is what an **online**
+	/// backup taken while ingest continues needs. Anything else → `400`.
+	pub verify: Option<String>,
 }
 
 /// One control-plane database's entry in a [`BackupResponse`].
@@ -517,6 +524,31 @@ pub struct BackupResponse {
 	pub total_rows: i64,
 	/// Total on-disk size of the four snapshot files in bytes.
 	pub total_bytes: u64,
+	/// Which verification was applied (`source` or `snapshot`), so a caller knows what
+	/// `total_rows` proves: equality with the live source, or the copy's own readable
+	/// contents.
+	pub verify: &'static str,
+}
+
+/// Parse the `?verify=` selector into a [`VerifyMode`].
+///
+/// `source` (the default) is the quiescent-store cross-check; `snapshot` is the
+/// concurrent-write-safe copy-only check. Returns `None` for an unknown token so the
+/// caller can answer `400` rather than silently picking a mode.
+fn parse_verify_mode(token: &str) -> Option<VerifyMode> {
+	match token.trim().to_ascii_lowercase().as_str() {
+		"source" | "source_match" | "quiescent" => Some(VerifyMode::SourceMatch),
+		"snapshot" | "snapshot_only" | "online" => Some(VerifyMode::SnapshotOnly),
+		_ => None,
+	}
+}
+
+/// The wire token for a [`VerifyMode`], echoed in [`BackupResponse::verify`].
+const fn verify_token(mode: VerifyMode) -> &'static str {
+	match mode {
+		VerifyMode::SourceMatch => "source",
+		VerifyMode::SnapshotOnly => "snapshot",
+	}
 }
 
 /// Validate a caller-supplied backup `label`: non-empty, only `[A-Za-z0-9._-]`, and
@@ -547,6 +579,10 @@ pub async fn backup_store(State(state): State<AppState>, Query(params): Query<Ba
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	let metrics = state.metrics().clone();
 	drop(state);
+	let mode = match params.verify.as_deref() {
+		Some(token) => parse_verify_mode(token).ok_or_else(|| StorageError::BadRequest(format!("unknown verify mode `{token}` — use `source` (quiescent cross-check) or `snapshot` (concurrent-write-safe copy-only check)")))?,
+		None => VerifyMode::default(),
+	};
 	let base = std::env::var_os("DSP_BACKUP_DIR").map_or_else(|| store.root().join("backups"), std::path::PathBuf::from);
 	let sub = if let Some(label) = params.label {
 		if !valid_backup_label(&label) {
@@ -561,14 +597,14 @@ pub async fn backup_store(State(state): State<AppState>, Query(params): Query<Ba
 	if dest.exists() {
 		return Err(StorageError::BadRequest(format!("backup target already exists: {} (choose a fresh label)", dest.display())));
 	}
-	let backup = store.backup_control_plane(&dest).await.map_err(|err| StorageError::Internal(err.to_string()))?;
+	let backup = store.backup_control_plane_with_verify(&dest, mode).await.map_err(|err| StorageError::Internal(err.to_string()))?;
 	drop(store);
 	metrics.record_backup(backup.total_bytes());
 	let databases = [("segment_index.db", &backup.segment_index), ("metadata.db", &backup.metadata), ("aspect_catalog.db", &backup.aspect_catalog), ("catalog.db", &backup.registry)]
 		.into_iter()
 		.map(|(name, report)| BackupDbReport { name: name.to_string(), tables: report.tables, rows: report.rows, bytes: report.bytes })
 		.collect();
-	let response = BackupResponse { dir: backup.dir.display().to_string(), databases, total_rows: backup.total_rows(), total_bytes: backup.total_bytes() };
+	let response = BackupResponse { dir: backup.dir.display().to_string(), databases, total_rows: backup.total_rows(), total_bytes: backup.total_bytes(), verify: verify_token(mode) };
 	Ok((StatusCode::OK, Json(response)).into_response())
 }
 
@@ -1335,7 +1371,40 @@ mod tests {
 		let mtext = String::from_utf8(mbytes.to_vec()).unwrap();
 		assert!(mtext.contains("dsp_backup_snapshots_total 1"), "one snapshot recorded; got:\n{mtext}");
 		assert!(mtext.contains("dsp_backup_bytes_written_total"), "bytes-written counter present");
+		assert_eq!(json["verify"], "source", "the default verification is the quiescent source cross-check");
+
+		// The concurrent-write-safe mode verifies each copy on its own terms (no source
+		// re-read) and says so in the response — what an online backup needs.
+		let router = app_with_state(state.clone());
+		let online = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/backup?label=online&verify=snapshot").body(Body::empty()).unwrap()).await.unwrap();
+		let ostatus = online.status();
+		let obytes = axum::body::to_bytes(online.into_body(), usize::MAX).await.unwrap();
+		let ojson: serde_json::Value = serde_json::from_slice(&obytes).unwrap();
+		assert_eq!(ostatus, StatusCode::OK, "body: {ojson}");
+		assert_eq!(ojson["verify"], "snapshot", "the response says which check was applied");
+		assert_eq!(ojson["databases"].as_array().unwrap().len(), 4);
+		assert!(ojson["total_rows"].as_i64().unwrap() >= 2, "rows scanned out of the copies themselves");
+
+		// An unknown verify token is a 400 rather than a silent default, and writes nothing.
+		let router = app_with_state(state.clone());
+		let bad_mode = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/backup?label=other&verify=maybe").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(bad_mode.status(), StatusCode::BAD_REQUEST, "unknown verify mode rejected");
+		assert!(!dir.path().join("backups").join("other").exists(), "a rejected request writes nothing");
 		drop(store);
+	}
+
+	#[test]
+	fn verify_mode_tokens_round_trip_and_reject_junk() {
+		use database::VerifyMode;
+
+		use super::{parse_verify_mode, verify_token};
+		assert_eq!(parse_verify_mode("source"), Some(VerifyMode::SourceMatch));
+		assert_eq!(parse_verify_mode("QUIESCENT"), Some(VerifyMode::SourceMatch));
+		assert_eq!(parse_verify_mode(" snapshot "), Some(VerifyMode::SnapshotOnly));
+		assert_eq!(parse_verify_mode("online"), Some(VerifyMode::SnapshotOnly));
+		assert_eq!(parse_verify_mode("yes"), None, "an unknown token must 400, not silently pick a mode");
+		assert_eq!(verify_token(VerifyMode::SourceMatch), "source");
+		assert_eq!(verify_token(VerifyMode::SnapshotOnly), "snapshot");
 	}
 
 	#[tokio::test]
