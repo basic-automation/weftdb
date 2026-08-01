@@ -460,11 +460,18 @@ detection within Y% and improving historical query latency by Z."*
     missingness and seed are.) *(src: "Lossless Compression of Time Series Data: A Comparative
     Study", 2025 — https://arxiv.org/html/2510.07015v1 · Sprintz §FIRE —
     https://arxiv.org/abs/1808.02515)*
-  - [ ] **Evaluate Pcodec as an integer/f64 codec + bench baseline:** the 2025 comparative
-    study finds **Sprintz and Pcodec** give the best ratio/throughput trade-off for integer
-    time-series (Sprintz at Snappy/LZ4 speeds). Pcodec is Rust, columnar, and directly on
-    DSP's scaled-int + f64 hot path — assess it as a codec and as a `dsp-bench` external-format
-    baseline beside Vortex. *(src: https://arxiv.org/html/2510.07015v1)*
+  - [ ] **Evaluate Pcodec as an integer/f64 codec + bench baseline — now with the upstream numbers
+    (research 2026-07-23):** the 2025 comparative study finds **Sprintz and Pcodec** give the best
+    ratio/throughput trade-off for integer time-series (Sprintz at Snappy/LZ4 speeds). Pcodec's own
+    paper reports **29–94% higher compression ratio than other numerical codecs on six real-world
+    columnar datasets, at less compression time, with decompression consistently above 1 GiB/s per
+    thread** — and it is Rust (the `pco` crate, actively maintained), columnar, and aimed squarely at
+    DSP's scaled-int + f64 hot path. That profile makes it a *stronger* first candidate than the
+    Chimp/Elf line for the value column, and a natural `dsp-bench` external-format baseline beside
+    Vortex. Judge it on bytes/point AND decode throughput, and note the corpus caution above — measure
+    it on the real corpus, not the synthetic generator. *(src: Pcodec, arXiv 2502.06112 —
+    https://arxiv.org/abs/2502.06112 · comparative study — https://arxiv.org/html/2510.07015v1 ·
+    https://lib.rs/crates/pco)*
   - [x] **Scaled-int value bit-pack codec — realized on disk.** The `.dspseg` value block
     now carries a self-describing codec selector (`VAL_CODEC_VARINT`/`VAL_CODEC_BITPACK`);
     a `ScaledI64` column whose mantissas fixed-width bit-pack below the per-value varint
@@ -608,8 +615,15 @@ recovery, with bounded p99 and no loss beyond the declared durability mode.
   updates, recovery, partial-write handling, fsync policy, durability modes
 - [ ] **7.3 Corruption detection** — segment/page checksums *(CRC-32 shipped in the
   `.dspseg` frame)*, catalog checks, startup verification, repair tooling
-- [ ] **7.4 Backup/restore** — online backup, PITR if feasible, verification, drills,
-  documented RPO/RTO
+- **7.4 Backup/restore** — online backup, PITR if feasible, verification, drills, documented RPO/RTO
+  - [x] Online control-plane backup over `VACUUM INTO` + per-database verification (see the Turso section below)
+  - [x] Background backup daemon (`DSP_BACKUP_INTERVAL_SECS`) with generated-snapshot retention (`DSP_BACKUP_KEEP`)
+  - [x] Concurrent-write-safe verification (`VerifyMode::SnapshotOnly`) — the mode an online backup must use
+  - [x] **Restore + a backup/restore drill** — `restore_control_plane` puts a snapshot back into a fresh store root, verifying each file at its destination, and refusing both an incomplete backup dir and an existing control plane; a round-trip test reopens the restored store and reads its measurements back
+  - [x] **Restore drill at the API** — `POST /api/v1/storage/restore/drill?label=` rehearses a restore into a throwaway dir, verifies it, reports `restorable`, and cleans up; non-destructive by construction (it cannot touch the live store), runtime-verified against the live binary
+  - [ ] Restoring *into a chosen new root* over HTTP — deliberately not shipped (a deployment decision, not an HTTP call); revisit only if an operator flow actually needs it
+  - [ ] Whole-store backup manifest (fold the `.dspseg` frames in beside the control plane) — today a restore into an empty root yields a valid but frame-less store
+  - [ ] Document RPO/RTO against the measured snapshot cadence
 - [ ] **7.5 Compaction** — scheduling, query consistency during compaction, resource
   limits, metrics, cancellation, priority
 - [ ] **7.6 Quotas/limits** — tenant/disk/memory/request-size/query-timeout/GPU-memory
@@ -724,18 +738,78 @@ of them turn Turso into the measurement backend.
   at rest using the same cipher infrastructure as the pager (per-transaction-frame payload
   encrypted on write, decrypted on read). No version bump needed to start.
   *(src: https://turso.tech/blog/turso-0.6.0)*
-- [ ] `VACUUM INTO 'file'` for online, consistent control-plane backup/snapshot *(Phase 7.4)* —
-  **UNGATED (research 2026-07-20): `VACUUM INTO` is STABLE in the pinned 0.6.0** ("writes a
-  compacted copy of the database to a new file"). Only the *in-place* `VACUUM` is experimental
-  (needs `--experimental-vacuum`), and the backup use-case wants `VACUUM INTO` anyway — so the
-  7.4 online-backup MVP can be built today against the pinned version.
-  *(src: https://turso.tech/blog/turso-0.6.0)*
-- [ ] **Evaluate the `turso` 0.7 upgrade (research 2026-07-20):** DSP pins `turso = "0.6"` and
-  locks 0.6.1, but **0.7.0 is published** (confirmed against the registry via `cargo search`, not
-  a blog claim). Assess the delta against the control-plane usage — the `BEGIN CONCURRENT` write
-  path, the no-`AUTOINCREMENT`-under-MVCC constraint, and whether `n_change`/`Statement` APIs
-  moved — before bumping. Low urgency (0.6.1 is working), but the gap should not be allowed to
-  widen silently. *(src: https://crates.io/crates/turso)*
+- [x] `VACUUM INTO 'file'` for online, consistent control-plane backup/snapshot *(Phase 7.4)* —
+  **MVP shipped (2026-07-21).** `database::backup` (`vacuum_into` + `snapshot_and_verify`) snapshots a
+  control-plane DB to a fresh file and reopens the copy to verify its user-table set + per-table row
+  counts match the source; each of the four control-plane stores gained a `backup_to`, and
+  `SegmentStore::backup_control_plane(dir)` snapshots all four (segment_index/metadata/aspect_catalog/
+  catalog) into one dir returning a `ControlPlaneBackup` (per-DB reports + `total_rows`/`total_bytes`).
+  Exposed at the API as `POST /api/v1/storage/backup?label=` (label-guarded against traversal;
+  `DSP_BACKUP_DIR`-or-`<root>/backups` base) and observable via `dsp_backup_snapshots_total`/
+  `dsp_backup_bytes_written_total`. Runtime-verified against the live binary. Finding: Turso's MVCC
+  mode adds an internal `__turso_internal_mvcc_meta` table to `sqlite_master`, filtered out of the
+  verified user-table set. *(src: https://turso.tech/blog/turso-0.6.0)*
+- [x] **Backup 7.4 residue (a) — concurrent-write-safe verify: shipped (2026-07-23).**
+  `VerifyMode::{SourceMatch, SnapshotOnly}`: `SourceMatch` keeps the quiescent-source row-count
+  cross-check (unchanged default); `SnapshotOnly` never re-reads the source and instead validates the
+  copy's own committed frame — it reopens the snapshot and **fully scans every row of every user
+  table** (`scan_rows`, not `COUNT(*)`, so a truncated copy fails rather than reporting a plausible
+  count). Threaded through all four control-plane stores (`backup_to_with`),
+  `SegmentStore::backup_control_plane_with_verify`, and the endpoint's `?verify=source|snapshot`
+  (unknown token → 400; the response echoes which check ran). **The background daemon uses
+  `SnapshotOnly`**, which is the correctness point: it backs up a live, ingesting control plane, so a
+  seal committing between a vacuum and its verification would otherwise be a spurious mismatch.
+  Runtime-verified with six concurrent ingests in flight during a `verify=snapshot` backup.
+- [x] **Backup 7.4 residue (c) — background backup daemon: shipped (2026-07-23).**
+  `DSP_BACKUP_INTERVAL_SECS` + `DSP_BACKUP_KEEP` beside the reconcile/compact daemons, writing a
+  fresh `backup-<unix_millis>` dir per tick into `DSP_BACKUP_DIR`-or-`<root>/backups` and pruning the
+  oldest **generated** snapshots past the retention bound. Pruning only ever considers
+  `backup-<digits>`, so an operator's `?label=nightly` snapshot is structurally never a candidate,
+  and retention runs only after a *successful* snapshot so a run of failures cannot prune the last
+  good backup away. Runtime-verified: 7 snapshots / 5 prunes with the hand-taken backup surviving all
+  of them.
+- [ ] **Backup 7.4 residue (b) — incremental / WAL-streaming backup** beyond the full `VACUUM INTO`
+  snapshot: Turso streams WAL changes to replicas, so a change-since-last-snapshot backup is the
+  natural next tier, and 0.7 adds explicit **MVCC database syncing** (#7500) worth assessing as the
+  mechanism. Also worth noting from upstream SQLite guidance: `VACUUM INTO` **cannot run inside a
+  transaction** and is not the tool for a hot backup that must not block writers for its whole
+  duration — the **online backup API** (copy pages, re-read any page a writer dirties) is the
+  designed-for-hot-backup alternative if snapshot latency ever becomes the constraint.
+  *(src: https://turso.tech/blog/turso-0.7.0 · https://www.sqlite.org/c3ref/backup_finish.html ·
+  https://dev.to/dataformathub/distributed-sqlite-why-libsql-and-turso-are-the-new-standard-in-2026-58fk)*
+- [ ] **Backup 7.4 residue (d) — whole-store backup manifest**: fold the `.dspseg` segment frames in
+  beside the control plane (today it is control-plane only, per hard-constraint #3), so a restore
+  into an empty root is a complete store rather than a frame-less one.
+- [ ] **Backup cost: a snapshot tick is far slower than the configured interval.** Runtime-observed
+  on a **5-row** control plane: consecutive daemon ticks landed 7–22 s apart at a 2–3 s configured
+  interval, i.e. the four `VACUUM INTO`s dominate and the interval is a floor, not a cadence. Worth
+  measuring properly (it was observed on a box concurrently running cargo builds, so the absolute
+  numbers are soft) and, if it holds, either documenting the floor or checkpointing the MVCC log
+  before the vacuum. A tiny database should not cost seconds to snapshot.
+- [ ] **Snapshot dirs accumulate empty `.db-log`/`.db-wal` sidecars.** Each verified snapshot leaves
+  two **zero-byte** sidecars per database (8 per backup dir), created when the verification reopens
+  the copy. Cosmetic — `total_bytes` is unaffected (measured: reported 77,824 B = the actual
+  directory footprint) — but a backup directory should not be littered; drop them after verifying.
+- [ ] **Evaluate the `turso` 0.7 upgrade — the release notes are now read (research 2026-07-23),
+  and two of the three open questions have answers.** DSP pins `turso = "0.6"` and locks 0.6.1.
+  From the 0.7.0 notes:
+  - **The `AUTOINCREMENT`-under-MVCC constraint is LIFTED upstream.** 0.7 makes `AUTOINCREMENT`
+    behave correctly under concurrent transactions via PostgreSQL-style sequences (#7137), plus a
+    `sequence_watermark()` so CDC consumers cannot skip rows. Hard-constraint #3's "use plain
+    `INTEGER PRIMARY KEY`" note is a **0.6** constraint, not a permanent one. (No action needed —
+    the plain-rowid schemas are fine — but the constraint should not be cited as timeless.)
+  - **A behavioural change to check before bumping: one write statement at a time.** Starting a
+    second write while another is mid-flight now returns busy, and abandoning a half-done write
+    inside an interactive transaction **poisons the transaction** so it refuses to commit a partial
+    statement (#7420). DSP's seal path issues several control-plane writes per ingest — this is the
+    migration risk to test, not `n_change`.
+  - **Wins that matter to the control plane:** MVCC reads under concurrent writes went from
+    `N·log(N)` to a linear merge (#7501); GC of obsolete row versions is decoupled from
+    checkpointing and watermark-driven (#7493); **experimental passive checkpoints** run the
+    write-out without the global lock so `BEGIN CONCURRENT` transactions keep committing (#7583) —
+    directly relevant to the backup-tick cost item above; encrypted MVCC on pluggable storage
+    (#7353); MVCC database syncing (#7500) for the incremental-backup tier.
+  *(src: https://turso.tech/blog/turso-0.7.0 · https://crates.io/crates/turso)*
 - [ ] Triggers (`BEFORE/AFTER/INSTEAD OF` + `WHEN`) — enforce catalog invariants, emit audit-log rows on metadata mutations *(Phase 7/8)*
 - [x] `Statement::n_change()` affected-row accounting — shipped on the seal path's two
   control-plane writes (`SegmentIndexStore::insert`, `AspectMetadataStore::put` return the count;
@@ -833,22 +907,45 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 
 ## Immediate next actions
 
-- [ ] **START HERE (filed 2026-07-20 for the next run).** This run cleared the two items that had sat
-  at the top of this list — the "flaky GPU tests" (root-caused: unsound check + degenerate fixtures,
-  not the GPU) and the workspace-suite ICE — and `cargo test --workspace` now completes at
-  **969 passed / 0 failed**. That unblocks the verification floor for everything below. Recommended
-  order for the next run:
-  1. **Cheap + newly ungated:** the Phase 7.4 **online backup MVP over `VACUUM INTO`**, which this
-     run's research confirmed is *stable in the already-pinned Turso 0.6.0* — no version bump, no
-     blocker. A bounded first slice is "snapshot the control-plane DBs to a file + verify the copy
-     opens and matches".
-  2. **Cheap + a plausible real finding:** profile `test_create_btc_1min_database` — a 1-minute BTC
-     series taking **40+ minutes** to bulk-load is suspicious on its face, and if it is an ingest-path
-     problem rather than merely a big fixture, that is a benchmarked customer outcome (the governing
-     rule) hiding in a skipped test.
+- [ ] **START HERE (filed 2026-07-23 for the next run).** The 2026-07-23 run closed the whole Phase 7.4
+  backup arc (daemon + retention, concurrent-write-safe verify, **restore + drill**) and delivered the
+  real-corpus ingest benchmark the previous run's START-HERE asked for. Recommended order:
+  1. **Route measurement bulk ingest through the `.dspseg` seal — now with the real number behind it
+     (highest value, unchanged).** The benchmark is no longer synthetic: on the **real** `btc_1min.csv`
+     the legacy `batch_capture_measurements` path runs at **2,978 rows/s at n=20k falling to 1,447
+     rows/s at n=40k** — 2× rows costing **4.11×** the time — while the columnar seal is linear and
+     *speeds up* with amortization (**202k → 288k rows/s**), i.e. **67.9× at 20k and 199.3× at 40k**,
+     and seals **1M real rows in 4.57 s (218,963 rows/s, 4.22 B/point)**. The ratio grows with n
+     because the legacy side is super-linear, so this is the write-amplification hard-constraint #3
+     exists to remove. *(src:
+     https://www.slingacademy.com/article/optimizing-inserts-and-updates-with-index-management-in-sqlite/
+     · https://medium.com/@JasonWyatt/squeezing-performance-from-sqlite-insertions-971aff98eef2)*
+  2. **Backup arc follow-ons (cheap):** the snapshot-cost question (a tick costs seconds on a five-row
+     control plane — measure it properly on a quiet box, then either document the floor or checkpoint
+     the MVCC log before vacuuming) and dropping the empty `.db-log`/`.db-wal` sidecars after verifying.
+     Both are filed with their evidence in the Turso section below.
   3. **The depth item:** realize the **FastLanes transposed layout on disk** (the tile-random-access
      decoder already shipped; the residue is a `VAL_CODEC_*`/`TS_CODEC_*` tag + reader dispatch + its
      own size function, then an *end-to-end* read benchmark — respecting the bandwidth-bound caveat).
+
+- [ ] **BENCHMARK HYGIENE — the synthetic ingest corpus flatters DSP, by a lot (measured 2026-07-23).**
+  Running `ingest_path_profile_legacy_vs_columnar` on the real corpus for the first time contradicted
+  the synthetic numbers three ways, all now guarded in the harness but worth carrying as a standing
+  caution for every workload that uses a generator:
+  - **Compression was overstated ~2.5×.** A representative 1M-row real window frames at **4.22
+    B/point** against the synthetic corpus's **1.71 B/point**.
+  - **The head of `btc_1min.csv` is degenerate.** Its first ~20k rows are 2012 ticks holding constant
+    (4.58 … 6.30), which the RLE-class value codecs crush to **0.17 B/point** — a ~25× flattering
+    figure. Any bytes/point number taken from the first N rows of this corpus is not a result; hence
+    the new `INGEST_PROFILE_SKIP_ROWS`. **No README perf claim may cite a head-of-corpus number.**
+  - **The synthetic schema was unrepresentable on real data.** The hardcoded `ScaledI64 { scale: 2 }`
+    fits synthetic two-decimal prices but not real BTC closes: the seal failed with *"declared encoding
+    exceeds tolerance: worst error 0.00117537 > bound 0"* — hard-constraint #4 (no silent downcast)
+    doing its job. The harness now derives an exact encoding via `recommend_encoding`; the 1M-row
+    window needs `ScaledI64 { scale: 8 }` while the 20k/40k windows need only scale 2, so the required
+    scale is *window-dependent* — which is exactly why it must be derived, not declared by a benchmark.
+  - [ ] Audit the other `dsp-bench` workloads' generators for the same class of flattery (the shape
+    knobs are seeded and reproducible, but "reproducible" is not "representative").
 
 - [x] **DONE (2026-07-20) — BUG ROOT-CAUSED + FIXED: the "flaky GPU interpolation tests" were never a
   GPU bug.** The roadmap offered two hypotheses — a real GPU race, or an unsound check. **Both the
@@ -923,13 +1020,23 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   BTC bulk load); the link OOM is fixed in-tree by `[profile.test] debug = 1`, so no `-j` cap is
   required. A run can now legitimately quote a single whole-workspace number. NB killing a backgrounded `cargo test -p database` orphans
   `db_tests-*.exe`, which holds a lock and breaks the next build — kill the exe too.
-- [ ] **NEXT — make the BTC bulk-load test runnable rather than merely skippable:**
-  `test_create_btc_1min_database` is now gated, which unblocks the suite but means the CSV ingest path
-  it covers is **not exercised by default**. It is also the one real-corpus ingest test DSP has. Worth
-  (i) profiling why a 1-minute BTC series takes 40+ minutes to load (it is a plausible ingest-path
-  performance finding in its own right, not just a slow test — compare against the `dsp-bench` ingest
-  numbers), and (ii) either shrinking the fixture to a subset that runs in seconds by default or
-  promoting it to a `dsp-bench` workload where a long runtime is expected and measured. **Research (2026-07-20) sharpens the fix:** LNK1102
+- [x] **DONE (2026-07-23) — the BTC bulk-load test is RUNNABLE, not merely skippable.** Both halves of
+  this item landed: (i) the load was **profiled** and root-caused (the legacy row-store path is
+  super-linear — see the ingest-profile items above), and (ii) the fixture was **bounded** rather than
+  promoted: the default run loads a capped prefix (`BTC_TEST_MAX_ROWS`, default 5,000) into a **temp
+  data dir**, so it is bounded *and* hermetic. The temp dir matters as much as the cap — the test's
+  pre-existing "database already exists, test passed" early-out meant that simply un-gating it would
+  have kept handing a no-op pass to anyone with a populated data dir; a fresh root per run means the
+  ingest path is genuinely exercised every time. `BTC_TEST_FULL=1` restores the historical full load.
+  Also added the assertion the test never had: that the `close` aspect actually holds measurements
+  afterwards (previously it could only fail by erroring). **Measured with `SKIP_SLOW_TESTS` unset:
+  the single test runs in 12.23 s (it previously did not terminate — 40+ min at ~5 GB RSS), and the
+  whole `db_tests` target runs 16 passed / 0 failed in 47.45 s.**
+- [ ] **NEXT — can `SKIP_SLOW_TESTS` be dropped workspace-wide?** `db_tests` no longer needs it (above),
+  but `database_orchestration` still guards four tests behind it, and an unguarded
+  `cargo test --workspace` has **not** been re-timed. Time those four; if they are also boundable, the
+  flag can retire and the suite gets its real coverage back.
+- [ ] **Historical note — the LNK1102 research that produced the `[profile.test] debug = 1` fix:** LNK1102
   is heap exhaustion in `link.exe`, and the standard mitigations are to cut the debug information the
   linker must chew (a `[profile.test] debug = 1` — line tables only — instead of the current full
   `-C debuginfo=2`) and to cap parallel link jobs. Try `debug = 1` on the test profile first; it is a

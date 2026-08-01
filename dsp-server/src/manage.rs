@@ -34,6 +34,7 @@ use axum::{
 };
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
+use database::VerifyMode;
 use dsp_line_protocol::TimestampPrecision;
 use dsp_physical_type::{first_order_violation, AspectSchema, PhysicalType, SegmentDescriptor, TimeUnit};
 use serde::{Deserialize, Serialize};
@@ -480,6 +481,206 @@ pub async fn compact_aspect(State(state): State<AppState>, Path(aspect): Path<St
 	let segment_count = store.segment_count(&aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?;
 	drop(store);
 	Ok((StatusCode::OK, Json(CompactResponse { aspect, removed, segment_count })).into_response())
+}
+
+/// Query parameters for `POST /api/v1/storage/restore/drill`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RestoreDrillParams {
+	/// The backup subdirectory to rehearse restoring, under the same backup root the
+	/// snapshot endpoint writes to. Traversal-guarded exactly like the backup label.
+	pub label: String,
+}
+
+/// Response body for `POST /api/v1/storage/restore/drill` — the outcome of a rehearsed
+/// restore.
+#[derive(Debug, Clone, Serialize)]
+pub struct RestoreDrillResponse {
+	/// The backup directory that was rehearsed.
+	pub label: String,
+	/// Per-database verification of each restored file, read back at its restore
+	/// destination.
+	pub databases: Vec<BackupDbReport>,
+	/// Total rows verified readable across the restored control plane.
+	pub total_rows: i64,
+	/// Total on-disk size of the restored files in bytes.
+	pub total_bytes: u64,
+	/// Always `true` when the call returns `200`: the backup restored and every restored
+	/// database opened and scanned. A failure is reported as a non-`200` instead.
+	pub restorable: bool,
+}
+
+/// Handle `POST /api/v1/storage/restore/drill?label=`: **rehearse** restoring a backup.
+///
+/// The Phase 7.4 drill. Restores the named backup into a throwaway directory, verifies
+/// every restored database at its destination (it opens, and every row of every table
+/// reads), reports what came back, and then deletes the rehearsal copy. The live store is
+/// never touched and nothing is overwritten — the whole point is that an operator can
+/// answer "is my backup actually restorable?" on a running system without risking it.
+///
+/// Restoring *over* a live control plane is deliberately not offered here: the library
+/// primitive refuses to clobber, and choosing a new store root is a deployment decision
+/// (point `DSP_SEGMENT_STORE_ROOT` at the restored copy and restart), not an HTTP call.
+///
+/// # Errors
+///
+/// [`StorageError::Unconfigured`] when no store is attached, [`StorageError::BadRequest`]
+/// when the label is malformed, [`StorageError::NotFound`] when no such backup exists, and
+/// [`StorageError::Internal`] when the backup will not restore or verify — which is a
+/// failed drill, and the answer the caller asked for.
+pub async fn restore_drill(State(state): State<AppState>, Query(params): Query<RestoreDrillParams>) -> Result<Response, StorageError> {
+	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	drop(state);
+	if !valid_backup_label(&params.label) {
+		return Err(StorageError::BadRequest(format!("invalid backup label `{}` — use only letters, digits, '.', '_', '-'", params.label)));
+	}
+	let base = std::env::var_os("DSP_BACKUP_DIR").map_or_else(|| store.root().join("backups"), std::path::PathBuf::from);
+	let backup_dir = base.join(&params.label);
+	if !backup_dir.is_dir() {
+		return Err(StorageError::NotFound(format!("no backup named `{}` under {}", params.label, base.display())));
+	}
+	drop(store);
+
+	// A throwaway destination beside the backups: same volume (so the rehearsal is sized
+	// like the real thing) and never the live store root. Cleaned up on every path,
+	// success or failure.
+	let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|err| StorageError::Internal(err.to_string()))?.as_millis();
+	let target = base.join(format!(".restore-drill-{millis}"));
+	let outcome = database::restore_control_plane(&backup_dir, &target).await;
+	let _ = tokio::fs::remove_dir_all(&target).await;
+	let report = outcome.map_err(|err| StorageError::Internal(format!("restore drill for `{}` FAILED: {err:#}", params.label)))?;
+
+	let databases = report
+		.restored
+		.iter()
+		.map(|r| BackupDbReport { name: r.dest.file_name().map_or_else(|| "?".to_string(), |n| n.to_string_lossy().into_owned()), tables: r.tables, rows: r.rows, bytes: r.bytes })
+		.collect();
+	let response = RestoreDrillResponse { label: params.label, databases, total_rows: report.total_rows(), total_bytes: report.total_bytes(), restorable: true };
+	Ok((StatusCode::OK, Json(response)).into_response())
+}
+
+/// Query parameters for `POST /api/v1/storage/backup`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BackupParams {
+	/// A subdirectory name for this snapshot under the backup root. Restricted to
+	/// `[A-Za-z0-9._-]` (and not `.`/`..`) so an API caller can never traverse out of
+	/// the backup root. Absent → a `backup-<unix_millis>` name is generated.
+	pub label: Option<String>,
+	/// How each snapshot copy is verified: `source` (default) cross-checks it against a
+	/// fresh read of the live control plane — the strongest check, but it assumes a
+	/// **quiescent** store; `snapshot` verifies the copy on its own terms (it opens and
+	/// every row is readable) without re-reading the source, which is what an **online**
+	/// backup taken while ingest continues needs. Anything else → `400`.
+	pub verify: Option<String>,
+}
+
+/// One control-plane database's entry in a [`BackupResponse`].
+#[derive(Debug, Clone, Serialize)]
+pub struct BackupDbReport {
+	/// The snapshot file name (e.g. `segment_index.db`).
+	pub name: String,
+	/// The number of user tables whose row counts were verified equal to the source.
+	pub tables: usize,
+	/// The number of rows verified in this database's snapshot.
+	pub rows: i64,
+	/// The on-disk size of this snapshot file in bytes.
+	pub bytes: u64,
+}
+
+/// Response body for `POST /api/v1/storage/backup` — the outcome of an online
+/// control-plane snapshot.
+#[derive(Debug, Clone, Serialize)]
+pub struct BackupResponse {
+	/// The directory the four snapshot files were written to.
+	pub dir: String,
+	/// Per-database verified snapshot reports (`segment_index`, `metadata`,
+	/// `aspect_catalog`, `catalog`).
+	pub databases: Vec<BackupDbReport>,
+	/// Total rows verified across all four control-plane databases.
+	pub total_rows: i64,
+	/// Total on-disk size of the four snapshot files in bytes.
+	pub total_bytes: u64,
+	/// Which verification was applied (`source` or `snapshot`), so a caller knows what
+	/// `total_rows` proves: equality with the live source, or the copy's own readable
+	/// contents.
+	pub verify: &'static str,
+}
+
+/// Parse the `?verify=` selector into a [`VerifyMode`].
+///
+/// `source` (the default) is the quiescent-store cross-check; `snapshot` is the
+/// concurrent-write-safe copy-only check. Returns `None` for an unknown token so the
+/// caller can answer `400` rather than silently picking a mode.
+fn parse_verify_mode(token: &str) -> Option<VerifyMode> {
+	match token.trim().to_ascii_lowercase().as_str() {
+		"source" | "source_match" | "quiescent" => Some(VerifyMode::SourceMatch),
+		"snapshot" | "snapshot_only" | "online" => Some(VerifyMode::SnapshotOnly),
+		_ => None,
+	}
+}
+
+/// The wire token for a [`VerifyMode`], echoed in [`BackupResponse::verify`].
+const fn verify_token(mode: VerifyMode) -> &'static str {
+	match mode {
+		VerifyMode::SourceMatch => "source",
+		VerifyMode::SnapshotOnly => "snapshot",
+	}
+}
+
+/// Validate a caller-supplied backup `label`: non-empty, only `[A-Za-z0-9._-]`, and
+/// neither `.` nor `..` — so it names a single fresh subdirectory under the backup root
+/// and can never be an absolute path or a `../` traversal.
+fn valid_backup_label(label: &str) -> bool {
+	!label.is_empty() && label != "." && label != ".." && label.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Handle `POST /api/v1/storage/backup`: snapshot the store's four control-plane DBs.
+///
+/// Takes an online, consistent snapshot via Turso's `VACUUM INTO` (roadmap **Phase
+/// 7.4**), verifying each copy before returning.
+///
+/// The snapshot lands in `<base>/<label>`, where `<base>` is `DSP_BACKUP_DIR` if set
+/// else `<store_root>/backups`, and `<label>` is the (validated) `?label=` or a generated
+/// `backup-<unix_millis>`. Each destination file must be fresh (`VACUUM INTO` needs a
+/// non-existing file), so a directory that already exists is rejected. The `.dspseg`
+/// measurement frames are **not** part of this backup — control plane only, per the
+/// storage boundary (hard-constraint #3).
+///
+/// # Errors
+///
+/// [`StorageError::Unconfigured`] when no store is attached,
+/// [`StorageError::BadRequest`] when `label` is malformed or the target dir already
+/// exists, and [`StorageError::Internal`] on a backup/verify failure.
+pub async fn backup_store(State(state): State<AppState>, Query(params): Query<BackupParams>) -> Result<Response, StorageError> {
+	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+	let metrics = state.metrics().clone();
+	drop(state);
+	let mode = match params.verify.as_deref() {
+		Some(token) => parse_verify_mode(token).ok_or_else(|| StorageError::BadRequest(format!("unknown verify mode `{token}` — use `source` (quiescent cross-check) or `snapshot` (concurrent-write-safe copy-only check)")))?,
+		None => VerifyMode::default(),
+	};
+	let base = std::env::var_os("DSP_BACKUP_DIR").map_or_else(|| store.root().join("backups"), std::path::PathBuf::from);
+	let sub = if let Some(label) = params.label {
+		if !valid_backup_label(&label) {
+			return Err(StorageError::BadRequest(format!("invalid backup label `{label}` — use only letters, digits, '.', '_', '-'")));
+		}
+		label
+	} else {
+		let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|err| StorageError::Internal(err.to_string()))?.as_millis();
+		format!("backup-{millis}")
+	};
+	let dest = base.join(&sub);
+	if dest.exists() {
+		return Err(StorageError::BadRequest(format!("backup target already exists: {} (choose a fresh label)", dest.display())));
+	}
+	let backup = store.backup_control_plane_with_verify(&dest, mode).await.map_err(|err| StorageError::Internal(err.to_string()))?;
+	drop(store);
+	metrics.record_backup(backup.total_bytes());
+	let databases = [("segment_index.db", &backup.segment_index), ("metadata.db", &backup.metadata), ("aspect_catalog.db", &backup.aspect_catalog), ("catalog.db", &backup.registry)]
+		.into_iter()
+		.map(|(name, report)| BackupDbReport { name: name.to_string(), tables: report.tables, rows: report.rows, bytes: report.bytes })
+		.collect();
+	let response = BackupResponse { dir: backup.dir.display().to_string(), databases, total_rows: backup.total_rows(), total_bytes: backup.total_bytes(), verify: verify_token(mode) };
+	Ok((StatusCode::OK, Json(response)).into_response())
 }
 
 /// One point in an ingest batch: an integer epoch timestamp (in the aspect's
@@ -1186,6 +1387,123 @@ mod tests {
 		assert_eq!(json["aspect"], "load");
 		assert_eq!(json["removed"], 4, "six segments coalesced to two (two triples)");
 		assert_eq!(json["segment_count"], 2, "held near the target size, not folded to one");
+	}
+
+	#[test]
+	fn valid_backup_label_rejects_traversal_and_bad_chars() {
+		use super::valid_backup_label;
+		assert!(valid_backup_label("nightly"));
+		assert!(valid_backup_label("2026-07-21_run.1"));
+		assert!(!valid_backup_label(""));
+		assert!(!valid_backup_label("."));
+		assert!(!valid_backup_label(".."));
+		assert!(!valid_backup_label("a/b"));
+		assert!(!valid_backup_label("a\\b"));
+		assert!(!valid_backup_label("a b"));
+	}
+
+	#[tokio::test]
+	async fn backup_endpoint_snapshots_control_plane_and_guards_label() {
+		let dir = TempDir::new().unwrap();
+		let sc = dsp_physical_type::AspectSchema::new(dsp_physical_type::PhysicalType::F64, "0".parse().unwrap(), dsp_physical_type::TimeUnit::Seconds);
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+		store.declare("price", &sc).await.expect("declares");
+		store.seal("price", &sc, &[0_i64, 10, 20], &["1".parse().unwrap(), "2".parse().unwrap(), "3".parse().unwrap()]).await.expect("seals");
+
+		// One shared state so the /metrics counter reflects the backup below.
+		let state = AppState::new().with_store(store.clone());
+
+		// A traversal label is rejected before touching disk.
+		let router = app_with_state(state.clone());
+		let bad = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/backup?label=..").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(bad.status(), StatusCode::BAD_REQUEST, "traversal label rejected");
+
+		// A valid label snapshots all four control-plane DBs under <root>/backups/<label>.
+		let router = app_with_state(state.clone());
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/backup?label=nightly").body(Body::empty()).unwrap()).await.unwrap();
+		let status = response.status();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		assert_eq!(status, StatusCode::OK, "body: {json}");
+		assert_eq!(json["databases"].as_array().unwrap().len(), 4, "four control-plane DBs snapshotted");
+		assert!(json["total_rows"].as_i64().unwrap() >= 2, "at least the seal's index + rollup rows");
+		assert!(json["total_bytes"].as_u64().unwrap() > 0, "the snapshot files have a non-zero footprint");
+		assert!(json["databases"][0]["bytes"].as_u64().unwrap() > 0, "each snapshot file reports its size");
+		let backup_dir = dir.path().join("backups").join("nightly");
+		for name in ["segment_index.db", "metadata.db", "aspect_catalog.db", "catalog.db"] {
+			assert!(backup_dir.join(name).exists(), "{name} written to disk");
+		}
+
+		// Re-using the same label collides with the existing dir → 400 (VACUUM INTO needs a fresh file).
+		let router = app_with_state(state.clone());
+		let dup = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/backup?label=nightly").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(dup.status(), StatusCode::BAD_REQUEST, "an existing backup dir is rejected");
+
+		// /metrics reflects the one successful snapshot (the failed dup did not bump it).
+		let router = app_with_state(state.clone());
+		let metrics = router.oneshot(Request::builder().method("GET").uri("/metrics").body(Body::empty()).unwrap()).await.unwrap();
+		let mbytes = axum::body::to_bytes(metrics.into_body(), usize::MAX).await.unwrap();
+		let mtext = String::from_utf8(mbytes.to_vec()).unwrap();
+		assert!(mtext.contains("dsp_backup_snapshots_total 1"), "one snapshot recorded; got:\n{mtext}");
+		assert!(mtext.contains("dsp_backup_bytes_written_total"), "bytes-written counter present");
+		assert_eq!(json["verify"], "source", "the default verification is the quiescent source cross-check");
+
+		// The concurrent-write-safe mode verifies each copy on its own terms (no source
+		// re-read) and says so in the response — what an online backup needs.
+		let router = app_with_state(state.clone());
+		let online = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/backup?label=online&verify=snapshot").body(Body::empty()).unwrap()).await.unwrap();
+		let ostatus = online.status();
+		let obytes = axum::body::to_bytes(online.into_body(), usize::MAX).await.unwrap();
+		let ojson: serde_json::Value = serde_json::from_slice(&obytes).unwrap();
+		assert_eq!(ostatus, StatusCode::OK, "body: {ojson}");
+		assert_eq!(ojson["verify"], "snapshot", "the response says which check was applied");
+		assert_eq!(ojson["databases"].as_array().unwrap().len(), 4);
+		assert!(ojson["total_rows"].as_i64().unwrap() >= 2, "rows scanned out of the copies themselves");
+
+		// An unknown verify token is a 400 rather than a silent default, and writes nothing.
+		let router = app_with_state(state.clone());
+		let bad_mode = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/backup?label=other&verify=maybe").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(bad_mode.status(), StatusCode::BAD_REQUEST, "unknown verify mode rejected");
+		assert!(!dir.path().join("backups").join("other").exists(), "a rejected request writes nothing");
+
+		// The Phase 7.4 drill over HTTP: rehearse restoring the snapshot we just took,
+		// without touching the live store.
+		let router = app_with_state(state.clone());
+		let drill = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/restore/drill?label=nightly").body(Body::empty()).unwrap()).await.unwrap();
+		let dstatus = drill.status();
+		let dbytes = axum::body::to_bytes(drill.into_body(), usize::MAX).await.unwrap();
+		let djson: serde_json::Value = serde_json::from_slice(&dbytes).unwrap();
+		assert_eq!(dstatus, StatusCode::OK, "body: {djson}");
+		assert_eq!(djson["restorable"], true, "the backup restored and verified");
+		assert_eq!(djson["databases"].as_array().unwrap().len(), 4, "all four control-plane DBs came back");
+		assert!(djson["total_rows"].as_i64().unwrap() >= 2, "rows read back out of the restored copies");
+		// The rehearsal left nothing behind, and the live store is untouched.
+		let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("backups")).unwrap().filter_map(Result::ok).map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with(".restore-drill-")).collect();
+		assert!(leftovers.is_empty(), "the drill cleaned up its rehearsal dir; found {leftovers:?}");
+		assert!(dir.path().join("segment_index.db").exists(), "the live control plane is still in place");
+
+		// An unknown backup is a 404, and a traversal label is a 400.
+		let router = app_with_state(state.clone());
+		let missing = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/restore/drill?label=no-such-backup").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(missing.status(), StatusCode::NOT_FOUND, "drilling a backup that does not exist");
+		let router = app_with_state(state.clone());
+		let traversal = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/restore/drill?label=..").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(traversal.status(), StatusCode::BAD_REQUEST, "traversal label rejected on the drill too");
+		drop(store);
+	}
+
+	#[test]
+	fn verify_mode_tokens_round_trip_and_reject_junk() {
+		use database::VerifyMode;
+
+		use super::{parse_verify_mode, verify_token};
+		assert_eq!(parse_verify_mode("source"), Some(VerifyMode::SourceMatch));
+		assert_eq!(parse_verify_mode("QUIESCENT"), Some(VerifyMode::SourceMatch));
+		assert_eq!(parse_verify_mode(" snapshot "), Some(VerifyMode::SnapshotOnly));
+		assert_eq!(parse_verify_mode("online"), Some(VerifyMode::SnapshotOnly));
+		assert_eq!(parse_verify_mode("yes"), None, "an unknown token must 400, not silently pick a mode");
+		assert_eq!(verify_token(VerifyMode::SourceMatch), "source");
+		assert_eq!(verify_token(VerifyMode::SnapshotOnly), "snapshot");
 	}
 
 	#[tokio::test]

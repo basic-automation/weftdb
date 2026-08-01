@@ -645,6 +645,8 @@ under the declared encoding/tolerance is rejected `400`.
 | `POST /api/v1/storage/{aspect}/squash` | **Squash** the aspect's segments into one (newer-wins), bounding split-path fragmentation. `?max_segments=N` gates it (squash only when the count exceeds `N`). Returns `triggered`/`removed`/`segment_count`. |
 | `POST /api/v1/storage/{aspect}/compact?target_rows=N` | **Size-targeted compaction** — coalesce the aspect's segments toward ~`N` rows per segment (leaving already-large segments untouched), holding fragmentation near the read-optimal size rather than folding to one (which `squash` does). Motivated by the `downsample_range` knee (one giant segment reads slower than several mid-sized ones). `target_rows` is required (absent → `400`). Returns `removed`/`segment_count`. The manual counterpart of the `DSP_COMPACT_TARGET_ROWS` daemon pass. |
 | `POST /api/v1/storage/reconcile` | **Store-wide reconciliation sweep** across every declared aspect: threshold (default), `?hot_cold=true`, or `?overlaps=true` (+ `?split_min_bytes=N` for split-not-rewrite). Returns `mode`, `aspects_scanned` / `aspects_reconciled` / `segments_reconciled` (+ cold/hot split) and the post-sweep store-wide `unsorted_segments` + `overlapping_segments`. The manual counterpart to the background reconcile daemon (`DSP_RECONCILE_INTERVAL_SECS` / `DSP_RECONCILE_THRESHOLD` / `DSP_RECONCILE_HOT_COLD` / `DSP_RECONCILE_OVERLAPS` / `DSP_RECONCILE_SPLIT_MIN_BYTES` / `DSP_RECONCILE_MAX_SPLITS`). |
+| `POST /api/v1/storage/backup` | **Online control-plane backup** (Phase 7.4) — snapshot the store's four control-plane DBs (`segment_index`/`metadata`/`aspect_catalog`/`catalog`) to fresh files via Turso's stable `VACUUM INTO`. Lands in `<base>/<label>` where `<base>` is `DSP_BACKUP_DIR` or `<store_root>/backups` and `<label>` is a traversal-guarded `?label=` (`[A-Za-z0-9._-]`) or a generated `backup-<unix_millis>`. **`?verify=source\|snapshot`** picks the verification: `source` (the default) cross-checks each copy's user-table set + row counts against the live control plane — the strongest check, but it assumes a **quiescent** store; `snapshot` verifies each copy on its own terms (it reopens and **fully scans every row of every table**) without re-reading the source, which is what an **online** backup taken while ingest continues needs. An unknown token → `400`. Returns per-DB `{name, tables, rows, bytes}` + `total_rows`/`total_bytes` + the `verify` mode that ran. An existing target dir → `400`; no store → `503`. Control plane only — the `.dspseg` measurement frames are not part of this backup (hard-constraint #3). |
+| `POST /api/v1/storage/restore/drill?label=<backup>` | **Restore drill** (Phase 7.4) — rehearse restoring a backup *on a running server*, so an operator can answer "is my backup actually restorable?" without risking anything. Restores the named backup into a throwaway directory beside the backups, verifies every restored database at its destination (it opens, and every row of every table reads), returns per-DB `{name, tables, rows, bytes}` + `total_rows`/`total_bytes`/`restorable`, then deletes the rehearsal copy. **Non-destructive by construction** — it cannot touch the live store, and restoring *over* a live control plane is deliberately not offered (the library primitive refuses to clobber; pointing `DSP_SEGMENT_STORE_ROOT` at a restored copy is a deployment decision, not an HTTP call). Unknown backup → `404`; traversal label → `400`; a backup that will not restore → `500` carrying the failure, which is a failed drill rather than a server bug. |
 | `GET /api/v1/storage/{aspect}/stats` · `…/storage/stats` | Materialized per-aspect and store-wide rollups, including the realized **bytes/point** (the north-star cost term), an `unsorted_segments` order-health count (segments that would force a linear scan on a point lookup), and an `overlapping_segments` count (time-overlapping segments — the cross-segment order-health signal, computed by an index scan). Rollup fields are served from the control plane without opening a segment. |
 
 ### Metrics
@@ -654,9 +656,51 @@ under the declared encoding/tolerance is rejected `400`.
 `dsp_ingest_*` counters (requests/errors/rows/segments) on the ingest paths,
 `dsp_reconcile_*` counters (`_passes_total` / `_segments_reconciled_total`) over the
 out-of-order reconciliation passes (manual, store-wide, and the background daemon —
-threshold-held calls excluded), and latency histograms over the compute and seal paths.
+threshold-held calls excluded), `dsp_backup_*` counters (`_snapshots_total` /
+`_bytes_written_total`) over the online control-plane backups, and latency histograms
+over the compute and seal paths.
 `GET /debug/profile/current` serves the same timing data as a live p50/p95/p99
 snapshot.
+
+### Backup & restore
+
+The control plane (the catalog, per-aspect schema, segment index and metadata
+rollup databases) has an online backup, two verification modes, an unattended
+daemon, and a restore. Per the storage boundary this covers the **control plane
+only** — the `.dspseg` measurement frames are not part of a snapshot.
+
+- **Online snapshot.** `POST /api/v1/storage/backup` copies all four databases
+  with Turso's `VACUUM INTO` while the store stays fully usable, and verifies
+  every copy before returning (see the endpoint catalog above for the parameters).
+- **Two verifications, because "verified" means different things under load.**
+  `?verify=source` (default) cross-checks each copy against the live control plane
+  — the strongest check, valid while the store is **quiescent**. `?verify=snapshot`
+  never re-reads the source; it reopens each copy and fully scans every row of
+  every table, so it is correct while writers are committing. A snapshot-only
+  backup taken with six concurrent ingests in flight returns `200` with the
+  concurrent seals visible in the copy.
+- **Unattended backups with retention.** Set `DSP_BACKUP_INTERVAL_SECS` to run a
+  background daemon that snapshots into a fresh `backup-<unix_millis>` directory
+  each tick (verifying `snapshot`-only, since it backs up a live store), and
+  `DSP_BACKUP_KEEP` to retain only the newest N. Retention is deliberately narrow:
+  it only ever removes daemon-**generated** `backup-<digits>` directories, so a
+  snapshot you took by hand with `?label=nightly` is never a prune candidate, and
+  it runs only after a *successful* snapshot, so a run of failures cannot prune
+  your last good backup away. Both paths record `dsp_backup_*` metrics.
+- **Restore, with a drill.** `database::restore_control_plane(backup_dir, root)`
+  puts a snapshot back into a store root and verifies each restored file **at its
+  destination** — what matters is that the file the store will open actually
+  reads. It refuses an incomplete backup directory and refuses to overwrite an
+  existing control plane, pre-flighting both across all four files before writing
+  anything, so a rejected restore leaves nothing behind. Restoring beside the
+  original `segments/` frames reconstitutes a working store: the round-trip test
+  reopens the restored root and reads its measurements back.
+- **Drills on a live server.** `POST /api/v1/storage/restore/drill?label=` rehearses
+  a restore of the named backup into a throwaway directory, verifies it, reports
+  `restorable`, and cleans up — non-destructive by construction, so the question
+  "is my backup actually restorable?" can be asked of production. Restoring *over*
+  a live control plane is not offered: that is a deployment decision (point
+  `DSP_SEGMENT_STORE_ROOT` at a restored copy and restart), not an HTTP call.
 
 ---
 
@@ -837,6 +881,10 @@ DSP is configured primarily through environment variables:
 | `DSP_RECONCILE_SPLIT_MIN_BYTES` | `dsp-server` | Split-not-rewrite floor (bytes) for the daemon's overlap merge; a dominant cold prefix clearing it is split off rather than rewritten. | unset (default 50 MiB floor → full-rewrite) |
 | `DSP_RECONCILE_MAX_SPLITS` | `dsp-server` | Segment-count cap; each tick also squashes every aspect over it into one segment (bounds split-path fragmentation). | unset (no squash) |
 | `DSP_COMPACT_TARGET_ROWS` | `dsp-server` | Target segment size in **rows** for the daemon's size-aware compaction pass; each tick coalesces every aspect's segments toward ~this many rows per segment (leaving already-large segments alone), holding fragmentation near the read-optimal size instead of folding to one (`DSP_RECONCILE_MAX_SPLITS`). Motivated by the `downsample_range` knee (one giant segment reads slower than several mid-sized ones). Needs the daemon interval set. | unset (no compaction) |
+| `DSP_BACKUP_DIR` | `dsp-server` | Directory each control-plane backup is written under — shared by the manual `POST …/storage/backup` endpoint and the background backup daemon, so hand-taken and automatic snapshots live together. | `<store_root>/backups` |
+| `DSP_BACKUP_INTERVAL_SECS` | `dsp-server` | Background control-plane backup daemon interval in seconds; `0`/unset disables it. Each tick writes a verified snapshot into a fresh `backup-<unix_millis>` directory, using the concurrent-write-safe `snapshot` verification (it backs up a live store). Needs a segment store configured. | unset (disabled) |
+| `DSP_BACKUP_KEEP` | `dsp-server` | How many **daemon-generated** snapshots to retain; after each successful backup the oldest `backup-<digits>` directories beyond this many are removed. Only generated names are ever pruned — a `?label=`-named snapshot you took by hand is never a candidate. | unset (retain everything) |
+| `BTC_TEST_MAX_ROWS` / `BTC_TEST_FULL` | `database` (tests) | Row cap for the bounded, hermetic default run of `test_create_btc_1min_database` (into a temp data dir), or `BTC_TEST_FULL=1` for the historical whole-corpus load into the shared data dir. | `5000` / unset |
 | `DSP_SEGMENT_CHECKPOINT_STRIDE` | `dsp-server` | Rows between entries of the sealed **timestamp checkpoint index** — trades a little size for much faster point lookups on **sorted, irregular** columns (~3.45× single-block; see the checkpointed-frames feature above). Applies only where it pays: sorted + irregular + at least `DSP_SEGMENT_CHECKPOINT_MIN_ROWS` rows. ~1024 is the sweet spot (stride barely moves speed but does move size). | unset (no index; frames byte-for-byte as before) |
 | `DSP_SEGMENT_CHECKPOINT_MIN_ROWS` | `dsp-server` | Row floor below which a segment is never checkpointed (a small column decodes trivially, so an index would be pure cost). | `8192` |
 | `DSP_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD` | `dsp-server` | Ceiling on the timestamp-codec override a checkpointed seal will accept (`blocked / best` bytes; `1.0` = only when free). A checkpointed frame must use the range-decodable per-block codec, which is ~free where that codec already wins but **~3.5× on a Gorilla-shaped and ~14× on an RLE-shaped column** — this refuses those seals rather than silently bloating them. | `1.25` |

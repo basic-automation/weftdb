@@ -331,6 +331,14 @@ impl SegmentStore {
 		&self.subject
 	}
 
+	/// The store root — the directory holding `segments/` and the four control-plane
+	/// DBs. The natural base for a default [`backup_control_plane`](SegmentStore::backup_control_plane)
+	/// destination.
+	#[must_use]
+	pub fn root(&self) -> &Path {
+		&self.root
+	}
+
 	/// The aspects [`declare`](SegmentStore::declare)d in this store's
 	/// `(database, subject)` scope, in name order.
 	///
@@ -339,6 +347,54 @@ impl SegmentStore {
 	/// Propagates any libSQL read failure.
 	pub async fn list_declared_aspects(&self) -> Result<Vec<String>> {
 		self.catalog.list_aspects(&self.database, &self.subject).await
+	}
+
+	/// Take an online, consistent snapshot of this store's **four control-plane
+	/// databases** (`segment_index.db`, `metadata.db`, `aspect_catalog.db`, `catalog.db`)
+	/// into `dest_dir`, via Turso's `VACUUM INTO` (roadmap **Phase 7.4**). Each copy is
+	/// reopened and verified to match its source table-for-table before the call returns.
+	///
+	/// The `.dspseg` measurement frames under `segments/` are **not** part of this backup
+	/// — this is the control-plane (catalog/index/metadata) snapshot only, per the storage
+	/// boundary (hard-constraint #3). `dest_dir` is created if absent; each destination
+	/// file must not already exist (`VACUUM INTO` needs a fresh file), so back up into a
+	/// fresh (e.g. timestamped) directory.
+	///
+	/// See [`snapshot_and_verify`](crate::snapshot_and_verify) for the consistency scope
+	/// of the per-file verification (the row-count match assumes a quiescent source).
+	///
+	/// # Errors
+	///
+	/// Propagates a filesystem error creating `dest_dir`, or any per-database backup/verify
+	/// failure (bad/existing destination, libSQL error, or a source/copy mismatch).
+	pub async fn backup_control_plane(&self, dest_dir: impl AsRef<Path>) -> Result<ControlPlaneBackup> {
+		self.backup_control_plane_with_verify(dest_dir, crate::VerifyMode::default()).await
+	}
+
+	/// Take the same four-database control-plane snapshot as
+	/// [`backup_control_plane`](SegmentStore::backup_control_plane), under an explicit
+	/// [`VerifyMode`](crate::VerifyMode).
+	///
+	/// [`VerifyMode::SourceMatch`](crate::VerifyMode::SourceMatch) (the default) verifies
+	/// each copy against a fresh source read and assumes a **quiescent** store — the
+	/// maintenance-window shape. [`VerifyMode::SnapshotOnly`](crate::VerifyMode::SnapshotOnly)
+	/// verifies each copy on its own terms and never re-reads the source, so it is the
+	/// mode an **online** backup taken against a live, ingesting store must use: a
+	/// concurrent seal committing between a vacuum and its verification would otherwise
+	/// be reported as a spurious mismatch.
+	///
+	/// # Errors
+	///
+	/// Propagates a filesystem error creating `dest_dir`, or any per-database backup/verify
+	/// failure.
+	pub async fn backup_control_plane_with_verify(&self, dest_dir: impl AsRef<Path>, mode: crate::VerifyMode) -> Result<ControlPlaneBackup> {
+		let dir = dest_dir.as_ref().to_path_buf();
+		tokio::fs::create_dir_all(&dir).await.with_context(|| format!("creating backup dir {}", dir.display()))?;
+		let segment_index = self.index.backup_to_with(&dir.join("segment_index.db"), mode).await.context("backing up segment_index.db")?;
+		let metadata = self.metadata.backup_to_with(&dir.join("metadata.db"), mode).await.context("backing up metadata.db")?;
+		let aspect_catalog = self.catalog.backup_to_with(&dir.join("aspect_catalog.db"), mode).await.context("backing up aspect_catalog.db")?;
+		let registry = self.registry.backup_to_with(&dir.join("catalog.db"), mode).await.context("backing up catalog.db")?;
+		Ok(ControlPlaneBackup { dir, segment_index, metadata, aspect_catalog, registry })
 	}
 
 	/// Declare `aspect`'s [`AspectSchema`] in this store's catalog, so later
@@ -1951,6 +2007,43 @@ pub struct SquashSweep {
 	pub segments_removed: usize,
 }
 
+/// The outcome of a [`SegmentStore::backup_control_plane`] run: the verified snapshot of
+/// each of the store's four control-plane databases (roadmap Phase 7.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPlaneBackup {
+	/// The directory the four snapshot files were written to.
+	pub dir: PathBuf,
+	/// Verified snapshot of `segment_index.db` (the per-segment data-skipping index).
+	pub segment_index: crate::SnapshotReport,
+	/// Verified snapshot of `metadata.db` (the per-aspect segment-set rollup).
+	pub metadata: crate::SnapshotReport,
+	/// Verified snapshot of `aspect_catalog.db` (the per-aspect declared schema).
+	pub aspect_catalog: crate::SnapshotReport,
+	/// Verified snapshot of `catalog.db` (the database/subject registry).
+	pub registry: crate::SnapshotReport,
+}
+
+impl ControlPlaneBackup {
+	/// The four snapshot reports, in the order they were taken.
+	#[must_use]
+	pub const fn reports(&self) -> [&crate::SnapshotReport; 4] {
+		[&self.segment_index, &self.metadata, &self.aspect_catalog, &self.registry]
+	}
+
+	/// Total rows verified across all four control-plane databases.
+	#[must_use]
+	pub fn total_rows(&self) -> i64 {
+		self.reports().iter().map(|r| r.rows).sum()
+	}
+
+	/// Total on-disk size of the four snapshot files in bytes — the whole control-plane
+	/// backup's footprint.
+	#[must_use]
+	pub fn total_bytes(&self) -> u64 {
+		self.reports().iter().map(|r| r.bytes).sum()
+	}
+}
+
 /// A store-wide aggregate over every aspect's materialized rollup, surfaced by
 /// [`SegmentStore::store_stats`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2059,6 +2152,114 @@ mod tests {
 		let (rt, rv) = Segment::read_from(&on_disk).expect("decodes").decode();
 		assert_eq!(rt, ts);
 		assert_eq!(rv, vs);
+	}
+
+	#[tokio::test]
+	async fn backup_then_restore_round_trips_a_working_store() {
+		// The Phase 7.4 drill: back the control plane up, restore it into a fresh root
+		// beside the original's segment frames, and prove the restored store still
+		// answers — a backup that has never been restored is not yet a backup.
+		let dir = TempDir::new().unwrap();
+		let schema = AspectSchema::new(PhysicalType::F64, "0".parse().unwrap(), TimeUnit::Seconds);
+		let root = dir.path().join("live");
+		let store = SegmentStore::open(&root).await.expect("opens");
+		store.declare("price", &schema).await.expect("declares");
+		store.seal("price", &schema, &[0_i64, 10, 20], &["1".parse().unwrap(), "2".parse().unwrap(), "3".parse().unwrap()]).await.expect("seals");
+		let backup_dir = dir.path().join("backup");
+		let backup = store.backup_control_plane_with_verify(&backup_dir, crate::VerifyMode::SnapshotOnly).await.expect("backs up");
+		let live_stats = store.aspect_stats("price").await.expect("live stats");
+		drop(store);
+
+		// Restore into a fresh root, carrying the measurement frames across (the backup is
+		// control-plane only, per hard-constraint #3).
+		let restored_root = dir.path().join("restored");
+		tokio::fs::create_dir_all(restored_root.join("segments")).await.unwrap();
+		let mut frames = tokio::fs::read_dir(root.join("segments")).await.unwrap();
+		while let Some(entry) = frames.next_entry().await.unwrap() {
+			tokio::fs::copy(entry.path(), restored_root.join("segments").join(entry.file_name())).await.unwrap();
+		}
+		let report = crate::restore_control_plane(&backup_dir, &restored_root).await.expect("restores");
+		assert_eq!(report.restored.len(), 4, "all four control-plane DBs restored");
+		assert_eq!(report.total_rows(), backup.total_rows(), "the restored control plane holds the backed-up rows");
+
+		// The restored store opens and still knows the aspect, its schema and its segments.
+		let reopened = SegmentStore::open(&restored_root).await.expect("restored store opens");
+		let aspects = reopened.list_declared_aspects().await.expect("lists aspects");
+		let stats = reopened.aspect_stats("price").await.expect("restored stats");
+		let (times, values) = reopened.read_time_range("price", 0, 20).await.expect("reads back");
+		drop(reopened);
+		assert_eq!(aspects, vec!["price".to_string()], "the declared aspect survived the restore");
+		assert_eq!(stats.segment_count, live_stats.segment_count, "same segment count as the live store");
+		assert_eq!(times, vec![0_i64, 10, 20], "the measurements read back through the restored control plane");
+		assert_eq!(values.into_iter().flatten().count(), 3, "every value materialized from the restored store");
+	}
+
+	#[tokio::test]
+	async fn restore_refuses_to_clobber_an_existing_control_plane() {
+		let dir = TempDir::new().unwrap();
+		let schema = AspectSchema::new(PhysicalType::F64, "0".parse().unwrap(), TimeUnit::Seconds);
+		let root = dir.path().join("live");
+		let store = SegmentStore::open(&root).await.expect("opens");
+		store.declare("price", &schema).await.expect("declares");
+		let backup_dir = dir.path().join("backup");
+		store.backup_control_plane_with_verify(&backup_dir, crate::VerifyMode::SnapshotOnly).await.expect("backs up");
+		drop(store);
+
+		// Restoring back over the live root must refuse rather than half-overwrite it.
+		let err = crate::restore_control_plane(&backup_dir, &root).await.unwrap_err();
+		assert!(err.to_string().contains("refusing to overwrite"), "got: {err}");
+
+		// An incomplete backup dir is refused too, and writes nothing.
+		let partial = dir.path().join("partial");
+		tokio::fs::create_dir_all(&partial).await.unwrap();
+		tokio::fs::copy(backup_dir.join("catalog.db"), partial.join("catalog.db")).await.unwrap();
+		let fresh = dir.path().join("fresh");
+		let err = crate::restore_control_plane(&partial, &fresh).await.unwrap_err();
+		assert!(err.to_string().contains("is missing"), "got: {err}");
+		assert!(!fresh.join("catalog.db").exists(), "a refused restore writes nothing");
+	}
+
+	#[tokio::test]
+	async fn backup_control_plane_snapshots_and_verifies_every_db() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open_scoped(dir.path(), "market", "btc").await.expect("opens");
+		// Declare a schema and seal two aspects, so all four control-plane DBs hold rows:
+		// aspect_catalog (declare), segment_index + metadata (seal), catalog (open registers).
+		store.declare("price", &schema()).await.expect("declares");
+		for aspect in ["price", "volume"] {
+			let ts: Vec<i64> = (0..4).map(|i| 100 + i * 10).collect();
+			let vs: Vec<BigDecimal> = (0..4).map(|i| bd(&format!("{}.5", i + 1))).collect();
+			store.seal(aspect, &schema(), &ts, &vs).await.expect("seals");
+		}
+
+		let backup_dir = dir.path().join("backup-run-1");
+		let backup = store.backup_control_plane(&backup_dir).await.expect("backs up");
+
+		// Every control-plane file was written and each verified a non-empty table set.
+		assert_eq!(backup.dir, backup_dir);
+		for name in ["segment_index.db", "metadata.db", "aspect_catalog.db", "catalog.db"] {
+			assert!(backup_dir.join(name).exists(), "{name} was written");
+		}
+		assert!(backup.segment_index.rows >= 2, "two sealed segments indexed");
+		assert!(backup.metadata.rows >= 2, "two aspect rollups");
+		assert!(backup.aspect_catalog.rows >= 1, "at least the declared schema");
+		assert!(backup.registry.rows >= 1, "the (database, subject) registration");
+		assert_eq!(backup.total_rows(), backup.reports().iter().map(|r| r.rows).sum::<i64>());
+		assert!(backup.total_bytes() > 0, "the snapshot files have a non-zero footprint");
+		assert_eq!(backup.total_bytes(), backup.reports().iter().map(|r| r.bytes).sum::<u64>());
+
+		// The source stays fully usable after an online backup.
+		let live = store.segment_count("price").await.expect("counts");
+		assert_eq!(live, 1);
+		drop(store);
+
+		// The snapshot copies reopen as independent stores holding the same data.
+		let restored = SegmentStore::open_scoped(&backup_dir, "market", "btc").await.expect("reopens copy");
+		assert_eq!(restored.segment_count("price").await.expect("counts"), 1);
+		assert_eq!(restored.segment_count("volume").await.expect("counts"), 1);
+		let mut aspects = restored.metadata().list_aspects().await.expect("lists");
+		aspects.sort();
+		assert_eq!(aspects, vec!["price".to_string(), "volume".to_string()]);
 	}
 
 	#[tokio::test]
