@@ -16,7 +16,7 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use database::SegmentStore;
-use dsp_server::{app_with_state, spawn_reconcile_daemon, AppState, ReconcileDaemonConfig, SERVICE, VERSION};
+use dsp_server::{app_with_state, spawn_backup_daemon, spawn_reconcile_daemon, AppState, BackupDaemonConfig, ReconcileDaemonConfig, SERVICE, VERSION};
 
 /// Default bind address when `DSP_SERVER_ADDR` is unset.
 const DEFAULT_ADDR: &str = "127.0.0.1:8080";
@@ -64,6 +64,23 @@ const RECONCILE_MAX_SPLITS_ENV: &str = "DSP_RECONCILE_MAX_SPLITS";
 /// folding to one (`DSP_RECONCILE_MAX_SPLITS`). When unset, no size-aware compaction runs.
 const COMPACT_TARGET_ROWS_ENV: &str = "DSP_COMPACT_TARGET_ROWS";
 
+/// Environment variable enabling the background **control-plane backup** daemon
+/// (roadmap Phase 7.4): its snapshot interval in seconds. Unset or `0` disables it.
+/// Each tick writes a verified `VACUUM INTO` snapshot of the four control-plane DBs
+/// into a fresh `backup-<unix_millis>` directory.
+const BACKUP_INTERVAL_ENV: &str = "DSP_BACKUP_INTERVAL_SECS";
+
+/// Environment variable naming the directory backups are written under. Shared with
+/// the manual `POST /api/v1/storage/backup` endpoint, so hand-taken and daemon-taken
+/// snapshots live together. Unset → `<store_root>/backups`.
+const BACKUP_DIR_ENV: &str = "DSP_BACKUP_DIR";
+
+/// Environment variable naming how many **daemon-generated** snapshots to retain: after
+/// each successful backup the oldest `backup-<digits>` directories beyond this many are
+/// removed. Unset → retain everything. An operator's own `?label=`-named snapshot is
+/// never a prune candidate.
+const BACKUP_KEEP_ENV: &str = "DSP_BACKUP_KEEP";
+
 /// Environment variable naming the OTLP collector endpoint. When set (e.g.
 /// `http://localhost:4317`), `dsp-server` exports its tracing spans to that collector
 /// over OTLP/gRPC in addition to the `fmt` log subscriber (roadmap Phase 3). Unset
@@ -80,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
 
 	let state = build_state().await?;
 	spawn_reconcile_daemon_if_configured(&state)?;
+	spawn_backup_daemon_if_configured(&state)?;
 
 	let listener = tokio::net::TcpListener::bind(addr).await?;
 	let local = listener.local_addr()?;
@@ -201,6 +219,40 @@ fn spawn_reconcile_daemon_if_configured(state: &AppState) -> anyhow::Result<()> 
 	let squash_note = squash_max_segments.map_or_else(String::new, |max| format!(" + squash (max {max} segment(s))"));
 	let compact_note = compact_target_rows.map_or_else(String::new, |target| format!(" + compact (target {target} row(s)/segment)"));
 	println!("reconcile daemon: enabled ({mode} mode{overlap_note}{squash_note}{compact_note}, every {interval_secs}s, threshold {threshold} out-of-order segment(s))");
+	Ok(())
+}
+
+/// Start the background control-plane backup daemon (roadmap Phase 7.4) when a store is
+/// configured and `DSP_BACKUP_INTERVAL_SECS` names a positive interval.
+///
+/// A no-op when no store is attached (nothing to back up) or the interval is
+/// unset/`0`/unparseable-as-positive. The daemon runs detached for the process lifetime;
+/// its handle is deliberately dropped.
+///
+/// # Errors
+///
+/// Propagates a non-numeric `DSP_BACKUP_INTERVAL_SECS`/`DSP_BACKUP_KEEP` (a malformed
+/// operator config should fail loudly at start rather than silently default).
+fn spawn_backup_daemon_if_configured(state: &AppState) -> anyhow::Result<()> {
+	let Some(store) = state.store() else { return Ok(()) };
+	let interval_secs: u64 = match std::env::var(BACKUP_INTERVAL_ENV) {
+		Ok(raw) => raw.parse().map_err(|e| anyhow::anyhow!("{BACKUP_INTERVAL_ENV}={raw:?} is not a non-negative integer: {e}"))?,
+		Err(_) => 0,
+	};
+	if interval_secs == 0 {
+		return Ok(());
+	}
+	let keep: Option<usize> = match std::env::var(BACKUP_KEEP_ENV) {
+		Ok(raw) => Some(raw.parse().map_err(|e| anyhow::anyhow!("{BACKUP_KEEP_ENV}={raw:?} is not a non-negative integer: {e}"))?),
+		Err(_) => None,
+	};
+	// The same base the manual endpoint resolves, so both paths write to one place.
+	let base = std::env::var_os(BACKUP_DIR_ENV).map_or_else(|| store.root().join("backups"), std::path::PathBuf::from);
+	let config = BackupDaemonConfig { interval: Duration::from_secs(interval_secs), base: base.clone(), keep };
+	// The daemon runs detached for the process lifetime; its handle is dropped on purpose.
+	drop(spawn_backup_daemon(Arc::clone(store), state.metrics().clone(), config));
+	let keep_note = keep.map_or_else(|| " (retaining every snapshot)".to_string(), |n| format!(" (retaining the newest {n} generated snapshot(s))"));
+	println!("backup daemon: enabled (every {interval_secs}s into {}{keep_note})", base.display());
 	Ok(())
 }
 

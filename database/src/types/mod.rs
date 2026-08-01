@@ -1,5 +1,6 @@
 pub use aspect::{Aspect, AspectId};
 pub use aspect_catalog::AspectCatalog;
+pub use backup::{count_rows, restore_control_plane, scan_rows, snapshot_and_verify, snapshot_with_verify, user_tables, vacuum_into, verify_snapshot, RestoreReport, SnapshotReport, VerifyMode, CONTROL_PLANE_FILES};
 pub use batches::{
 	batched_measurements::{analysis::Analysis, batched_distance::BatchDistance, BatchedMeasurement}, Batch, BatchId, BatchMetatdata, Batches
 };
@@ -25,7 +26,7 @@ pub use pipeline::{DetectorMetadata, DetectorType, PipelineConfig, PipelineState
 pub use relative::Relative;
 pub use segment_index::SegmentIndexStore;
 pub use partial_sidecar::{PartialSidecar, PartialSidecarPolicy, DEFAULT_PARTIAL_SIDECAR_MIN_ROWS, MAX_SIDECAR_TIERS, PARTIAL_SIDECAR_VERSION, SIDECAR_AGGREGATIONS};
-pub use segment_store::{AspectStorageStats, CheckpointPolicy, DEFAULT_CHECKPOINT_MIN_ROWS, HotColdReconcile, HotColdSweep, OverlapSweep, ReconcileSweep, SegmentStore, SquashSweep, StoreStorageStats};
+pub use segment_store::{AspectStorageStats, CheckpointPolicy, ControlPlaneBackup, DEFAULT_CHECKPOINT_MIN_ROWS, HotColdReconcile, HotColdSweep, OverlapSweep, ReconcileSweep, SegmentStore, SquashSweep, StoreStorageStats};
 pub use signal::{Distance, ErrVal, Signal, SignalType, Signals};
 pub use subject::{Subject, SubjectId};
 pub use transaction::{Transaction, TxId};
@@ -33,6 +34,7 @@ pub use trend::Trend;
 
 pub mod aspect;
 pub mod aspect_catalog;
+pub mod backup;
 pub mod batches;
 pub mod cache;
 pub mod catalog;
