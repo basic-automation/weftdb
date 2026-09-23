@@ -162,18 +162,57 @@ pub async fn scan_rows(conn: &turso::Connection, table: &str) -> Result<i64> {
 	Ok(count)
 }
 
+/// The sidecar suffixes libSQL/Turso leaves beside a database file once it has been
+/// opened: the WAL (`-wal`) and Turso's MVCC logical log (`-log`). The same two names
+/// the legacy `Database` opener sweeps before reopening a measurement DB.
+const SIDECAR_SUFFIXES: [&str; 2] = ["-wal", "-log"];
+
+/// Remove the **empty** sidecar files Turso leaves beside `db` after a verification
+/// reopens it.
+///
+/// `VACUUM INTO` creates a zero-byte `<db>-wal` beside the copy it writes, and reopening
+/// the snapshot to verify it (which both [`VerifyMode`]s do) adds a zero-byte `<db>-log`
+/// — the journal scaffolding for a database nobody will ever write to. They are pure
+/// litter in a backup directory: the reported `bytes` never counted them, but an operator
+/// listing a control-plane backup should see four files, not twelve.
+///
+/// Only a sidecar whose length is **exactly zero** is removed. A non-empty `-wal`/`-log`
+/// holds frames that have not been checkpointed into the main file — data — and is never
+/// touched, so the sweep is safe by construction rather than by assumption. A sidecar that
+/// does not exist is simply skipped. Returns how many files were removed.
+///
+/// # Errors
+///
+/// An empty sidecar exists and cannot be removed (a filesystem error).
+pub async fn remove_empty_sidecars(db: &Path) -> Result<usize> {
+	let mut removed = 0usize;
+	for suffix in SIDECAR_SUFFIXES {
+		let mut name = db.as_os_str().to_os_string();
+		name.push(suffix);
+		let sidecar = PathBuf::from(name);
+		let Ok(meta) = tokio::fs::metadata(&sidecar).await else { continue };
+		if meta.len() == 0 {
+			tokio::fs::remove_file(&sidecar).await.with_context(|| format!("removing empty sidecar {}", sidecar.display()))?;
+			removed += 1;
+		}
+	}
+	Ok(removed)
+}
+
 /// Verify a snapshot **on its own terms** (the [`VerifyMode::SnapshotOnly`] check):
 /// reopen `dest`, enumerate its user tables, and fully scan each one.
 ///
 /// Reads nothing from the source, so it is correct while writers are committing to the
 /// source — the verification an online/background backup needs. Returns a
-/// [`SnapshotReport`] whose `rows` is the copy's own total.
+/// [`SnapshotReport`] whose `rows` is the copy's own total. The empty `-wal`/`-log`
+/// sidecars the reopen leaves beside the copy are swept afterwards
+/// ([`remove_empty_sidecars`]).
 ///
 /// # Errors
 ///
 /// - The copy will not open or connect.
 /// - Any table cannot be enumerated or fully read (a truncated/corrupt copy).
-/// - The snapshot file cannot be stat'd.
+/// - The snapshot file cannot be stat'd, or an empty sidecar cannot be removed.
 pub async fn verify_snapshot(dest: &Path) -> Result<SnapshotReport> {
 	let dest_db = Builder::new_local(dest.to_str().unwrap_or_default()).build().await.with_context(|| format!("reopening backup copy {}", dest.display()))?;
 	let dest_conn = dest_db.connect().with_context(|| format!("connecting to backup copy {}", dest.display()))?;
@@ -185,6 +224,7 @@ pub async fn verify_snapshot(dest: &Path) -> Result<SnapshotReport> {
 	}
 	drop(dest_conn);
 	drop(dest_db);
+	remove_empty_sidecars(dest).await?;
 
 	let bytes = tokio::fs::metadata(dest).await.with_context(|| format!("stat backup copy {}", dest.display()))?.len();
 	Ok(SnapshotReport { dest: dest.to_path_buf(), tables: tables.len(), rows, bytes, mode: VerifyMode::SnapshotOnly })
@@ -277,6 +317,7 @@ async fn verify_against_source(src: &turso::Connection, dest: &Path) -> Result<S
 	}
 	drop(dest_conn);
 	drop(dest_db);
+	remove_empty_sidecars(dest).await?;
 
 	let bytes = tokio::fs::metadata(dest).await.with_context(|| format!("stat backup copy {}", dest.display()))?.len();
 	Ok(SnapshotReport { dest: dest.to_path_buf(), tables: src_tables.len(), rows, bytes, mode: VerifyMode::SourceMatch })
@@ -475,6 +516,92 @@ mod tests {
 		let bogus = dir.path().join("not-a-db.db");
 		tokio::fs::write(&bogus, b"this is not a libSQL database at all, not even close").await.unwrap();
 		assert!(verify_snapshot(&bogus).await.is_err(), "a non-database file must fail verification");
+	}
+
+	/// The two sidecar paths Turso creates beside `db` on open.
+	fn sidecars(db: &Path) -> [PathBuf; 2] {
+		let mk = |suffix: &str| {
+			let mut name = db.as_os_str().to_os_string();
+			name.push(suffix);
+			PathBuf::from(name)
+		};
+		[mk("-wal"), mk("-log")]
+	}
+
+	#[tokio::test]
+	async fn reopening_a_snapshot_really_does_leave_empty_sidecars() {
+		// The premise of the sweep, pinned so the fix cannot silently become a no-op if
+		// Turso ever changes its sidecar naming: a vacuumed-then-reopened copy has zero-byte
+		// `-wal` / `-log` files beside it. (Measured: `VACUUM INTO` itself already creates
+		// the empty `-wal`; the verifying reopen adds the `-log`. Either way the sweep runs
+		// after verification, so it catches both.)
+		let dir = tempfile::tempdir().unwrap();
+		let conn = seed_db(&dir.path().join("src.db")).await;
+		let dest = dir.path().join("probe.db");
+		vacuum_into(&conn, &dest).await.unwrap();
+		for sidecar in sidecars(&dest).into_iter().filter(|p| p.exists()) {
+			assert_eq!(std::fs::metadata(&sidecar).unwrap().len(), 0, "a sidecar a bare VACUUM INTO creates is empty: {}", sidecar.display());
+		}
+
+		let db = Builder::new_local(dest.to_str().unwrap()).build().await.unwrap();
+		let c = db.connect().unwrap();
+		assert_eq!(count_rows(&c, "widget").await.unwrap(), 7);
+		drop(c);
+		drop(db);
+		let litter: Vec<_> = sidecars(&dest).into_iter().filter(|p| p.exists()).collect();
+		assert!(!litter.is_empty(), "the reopen leaves at least one sidecar — the litter the sweep exists for");
+		for sidecar in &litter {
+			assert_eq!(std::fs::metadata(sidecar).unwrap().len(), 0, "{} is empty", sidecar.display());
+		}
+		assert_eq!(remove_empty_sidecars(&dest).await.unwrap(), litter.len(), "the sweep removes exactly the litter");
+		for sidecar in sidecars(&dest) {
+			assert!(!sidecar.exists(), "{} is gone", sidecar.display());
+		}
+		assert!(dest.exists(), "the snapshot itself is untouched");
+	}
+
+	#[tokio::test]
+	async fn both_verify_modes_leave_no_empty_sidecars_behind() {
+		let dir = tempfile::tempdir().unwrap();
+		let conn = seed_db(&dir.path().join("src.db")).await;
+
+		let snapshot_only = dir.path().join("snapshot_only.db");
+		let report = snapshot_with_verify(&conn, &snapshot_only, VerifyMode::SnapshotOnly).await.unwrap();
+		assert_eq!(report.rows, 10);
+		for sidecar in sidecars(&snapshot_only) {
+			assert!(!sidecar.exists(), "SnapshotOnly left {} behind", sidecar.display());
+		}
+
+		let source_match = dir.path().join("source_match.db");
+		let report = snapshot_with_verify(&conn, &source_match, VerifyMode::SourceMatch).await.unwrap();
+		assert_eq!(report.rows, 10);
+		for sidecar in sidecars(&source_match) {
+			assert!(!sidecar.exists(), "SourceMatch left {} behind", sidecar.display());
+		}
+
+		// The backup directory holds exactly the two snapshots: nothing else was left in it.
+		let mut entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).filter(|n| n != "src.db" && !n.starts_with("src.db-")).collect();
+		entries.sort();
+		assert_eq!(entries, vec!["snapshot_only.db".to_string(), "source_match.db".to_string()]);
+	}
+
+	#[tokio::test]
+	async fn the_sweep_never_removes_a_non_empty_sidecar() {
+		// A `-wal` with bytes in it holds un-checkpointed frames — data. The sweep must
+		// leave it alone even though it sits exactly where litter would.
+		let dir = tempfile::tempdir().unwrap();
+		let db = dir.path().join("live.db");
+		tokio::fs::write(&db, b"main file").await.unwrap();
+		let [wal, log] = sidecars(&db);
+		tokio::fs::write(&wal, b"frames that were never checkpointed").await.unwrap();
+		tokio::fs::write(&log, b"").await.unwrap();
+
+		assert_eq!(remove_empty_sidecars(&db).await.unwrap(), 1, "only the empty one goes");
+		assert!(wal.exists(), "the non-empty WAL survives");
+		assert_eq!(tokio::fs::read(&wal).await.unwrap(), b"frames that were never checkpointed");
+		assert!(!log.exists(), "the empty log is removed");
+		// Idempotent: a second sweep finds nothing to do.
+		assert_eq!(remove_empty_sidecars(&db).await.unwrap(), 0);
 	}
 
 	#[tokio::test]
