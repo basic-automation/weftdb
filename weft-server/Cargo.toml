@@ -1,5 +1,8 @@
 [package]
 name = "weft-server"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
 version = "0.1.0"
 edition = "2021"
 description = "WeftDB server: the benchmark-grade HTTP API surface (Phase 2) — health/readiness, and the ingest/query endpoints Weft-Bench drives WeftDB through."

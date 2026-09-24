@@ -1,8 +1,30 @@
+# Build output
 target
+
+# Local data, datasets and stores (never committed — see README "Configuration")
 database/data
-database/DS_Store
 database/datasets
+*.db
+*.db-wal
+*.db-log
+*.weftseg
+*.weftpart
+
+# Agent/routine scratch output (transient run logs, bench output, server logs)
+scratch
+
+# OS and editor cruft
+.DS_Store
+Thumbs.db
 *-cwd
 *.claude
 nul
-*.txt
+
+# Crash dumps and stray debug captures
+rustc-ice-*.txt
+*_debug.txt
+DETAILED_CHANGES.txt
+
+# Editor workspace settings
+.vscode
+.zed

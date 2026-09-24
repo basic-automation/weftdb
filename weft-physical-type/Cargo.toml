@@ -1,5 +1,8 @@
 [package]
 name = "weft-physical-type"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
 version = "0.1.0"
 edition = "2021"
 description = "Vendor-neutral physical numeric encodings for WeftDB aspects (roadmap Phase 4.1). BigDecimal stays the logical/API value type; each aspect declares a PhysicalType governing how its values are encoded on the hot path. Downcasting is explicit and reports exactness — never a silent BigDecimal -> f64."

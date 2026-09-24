@@ -479,6 +479,28 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 					let actual_data_end = points.iter().map(|p| p.timestamp).max().unwrap_or(chunk_end);
 					let effective_chunk_end = chunk_end.min(actual_data_end);
 
+					// That clamp can COLLAPSE the range. The chunk fetch is inclusive at both
+					// ends, so a chunk whose only visible measurement sits exactly at (or before)
+					// `current_chunk_start` clamps the end back onto the start — and
+					// `auto_interpolate` rejects `start >= end` with "Invalid time range: start
+					// time must be before end time", failing the whole stream. The
+					// `measurements.is_empty()` guard above does not catch this, because the
+					// chunk is not empty; its data is simply all at or behind the start.
+					//
+					// A zero-width window has exactly one sensible answer — the last known value
+					// at the start instant — so emit that and advance, mirroring the empty-chunk
+					// arm above rather than aborting.
+					if effective_chunk_end <= current_chunk_start {
+						// `points` is ordered by timestamp ASC (the fetch query sorts), so the
+						// last element is the newest value at or before the start.
+						let value = points.last().map_or_else(|| BigDecimal::from(0), |p| p.value.clone());
+						let is_last_chunk = chunk_end >= end_time;
+						return Some((
+							Ok(Point { timestamp: current_chunk_start, value }),
+							(chunk_end, None, is_last_chunk)
+						));
+					}
+
 					// Interpolate this chunk
 					match splimes::auto_interpolate(
 						&mut points,

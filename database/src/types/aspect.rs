@@ -1587,6 +1587,32 @@ impl Aspect {
 		Ok(())
 	}
 
+	/// Create a dictionary database's **full** table set, in an exclusive transaction.
+	///
+	/// Turso rejects DDL inside a `BEGIN CONCURRENT` transaction
+	/// (*"DDL statements require an exclusive transaction"*), so every schema-creating path
+	/// must go through `begin_immediate` — the same shape as
+	/// [`ensure_compression_tables`](Self::ensure_compression_tables).
+	///
+	/// This exists because [`set_dictionary_metadata`](crate::Inputs::set_dictionary_metadata)
+	/// needs the schema from outside `impl Aspect`, where
+	/// [`wireframe_dictionary_tables_direct`](Self::wireframe_dictionary_tables_direct) is not
+	/// reachable. Routing through the wireframe rather than re-listing the statements is
+	/// load-bearing: it creates all **seven** tables, including `patterns`,
+	/// `pattern_occurrences` and `pattern_relatives`, which the pattern read/write paths need.
+	///
+	/// `CREATE TABLE IF NOT EXISTS` throughout, so calling it repeatedly is cheap and safe.
+	///
+	/// # Errors
+	///
+	/// Propagates any transaction or DDL failure.
+	pub async fn ensure_dictionary_tables(db: &turso::Database) -> Result<()> {
+		let schema_conn = Database::begin_immediate(db).await?;
+		Self::wireframe_dictionary_tables_direct(&schema_conn).await?;
+		let _ = Database::commit_immediate(&schema_conn).await;
+		Ok(())
+	}
+
 	#[instrument]
 	async fn wireframe_dictionary_tables_direct(conn: &Connection) -> Result<()> {
 		// Note: No PRIMARY KEY on TEXT columns or indexes to support MVCC

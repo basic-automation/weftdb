@@ -22,7 +22,7 @@ Every work item is a `[ ]` (to do) or `[x]` (done) checkbox. Shipped capability 
 here it is only ticked. There is no run log: git history and PRs are the record of
 what happened. The strategic spine merges a peer-reviewed commercial/benchmark
 analysis with the feature backlog distilled from WeftDB's **15 predecessor
-repositories** (archived under [`legacy/`](legacy) with full history).
+repositories**, which are archived outside this repository.
 
 ---
 
@@ -784,18 +784,12 @@ A checked box = shipped; an unchecked box carries its residual status inline
 
 ### Archived source map
 
-| Legacy crate | Mine it for |
-|--------------|-------------|
-| [`legacy/dsm-source`](legacy/dsm-source) · [`legacy/dsm-asset`](legacy/dsm-asset) | Connector trait / `ToAsset` self-describing-target pattern |
-| [`legacy/dsm-influxdb`](legacy/dsm-influxdb) | InfluxDB 2.x client, line protocol, Flux |
-| [`legacy/DSM-Thorchain`](legacy/DSM-Thorchain) | Midgard price client, windowed backfill (external connector only) |
-| [`legacy/DSM-Input-Module`](legacy/DSM-Input-Module) | Per-source scheduling, retry buffer, runtime registration |
-| [`legacy/DSM-Database`](legacy/DSM-Database) | REST surface, tags, object buckets, query params, pagination |
-| [`legacy/DSM-Measurement`](legacy/DSM-Measurement) | Enriched measurement model (raw-vs-processed, per-point analytics) |
-| [`legacy/database`](legacy/database) | Retry+backoff writes, size-tiered batching, window extension, typed errors, TTL/LRU cache |
-| [`legacy/dsm-batch`](legacy/dsm-batch) · [`legacy/DSM-Batch-v2`](legacy/DSM-Batch-v2) · [`legacy/DSM-Batcher`](legacy/DSM-Batcher) | Windows, dedup, horizon→interp mapping, MessagePack, BigDecimal math, multi-horizon fan-out |
-| [`legacy/DSM-Pattern`](legacy/DSM-Pattern) · [`legacy/DSM-Patterner`](legacy/DSM-Patterner) | Variability metrics, fixed-point dedup, occurrence-distance, pipeline semantics |
-| [`legacy/dataset_management`](legacy/dataset_management) · [`legacy/DSM-Log`](legacy/DSM-Log) | Per-point `Analysis` model intent; state-snapshot logging |
+The 15 predecessor repositories are **not part of this repository**. They were removed
+along with their history, so the backlog items above reference them by name only:
+`dsm-source`, `dsm-asset`, `dsm-influxdb`, `DSM-Thorchain`, `DSM-Input-Module`,
+`DSM-Database`, `DSM-Measurement`, `database`, `dsm-batch`, `DSM-Batch-v2`, `DSM-Batcher`,
+`DSM-Pattern`, `DSM-Patterner`, `dataset_management`, `DSM-Log`.
+
 
 ---
 

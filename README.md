@@ -274,8 +274,14 @@ and from resolving regular timestamp columns in closed form.
 
 ### Ingest
 
-Sealing **1M real rows** of a BTC 1-minute corpus into a columnar segment:
+Sealing **1M rows** of a real 1-minute financial series into a columnar segment:
 **4.57 s — 218,963 rows/sec at 4.22 bytes/point.**
+
+That corpus is a local file, **not redistributed with this repository** and not required to
+build or test — the suite skips the tests that use it when it is absent. It is quoted here
+because a *synthetic* generator materially flatters the result: on the same workload the
+generated corpus reports **1.71 bytes/point against the real 4.22**, roughly 2.5× too
+optimistic. Storage numbers measured on generated data are not reported as results.
 
 ### Reductions
 
@@ -597,15 +603,15 @@ use database_orchestration::Pipeline;
 use database::Database;
 use splimes::Spline;
 
-let database = Database::existing("Crypto").await?;
-// ... resolve `aspect_id` for the "open" price aspect of BTCUSD ...
+let database = Database::existing("PlantTelemetry").await?;
+// ... resolve `aspect_id` for the "outlet_pressure" aspect of pump-station-3 ...
 
 let mut pipeline = Pipeline::builder(database.clone(), aspect_id)
     .spline_method(Spline::Linear)
     .batch_size(24)                              // 24-hour batches
     .add_dictionary("daily", "Daily patterns", constraints)
     .with_monthly_increase_detector(0.05)        // 5% monthly increase
-    .with_peak_detector("BTC Price Peaks")
+    .with_peak_detector("Pressure Peaks")
     .build()
     .await?;
 
@@ -691,7 +697,7 @@ on disk, so an aspect's storage is fully self-contained.
 | Concept | Description | Example |
 |---------|-------------|---------|
 | **Database** | Top-level container for all data. | `Crypto`, `my_sensors` |
-| **Subject** | A logical entity being observed. | `BTCUSD`, `temperature_sensor_001` |
+| **Subject** | A logical entity being observed. | `pump-station-3`, `temperature_sensor_001` |
 | **Aspect** | A specific measurement type of a subject, with its own resolution, declared physical encoding, and (optional) compression config. | `open`, `ambient_temp` |
 | **Measurement** | A timestamped, arbitrary-precision value. | `(2024-01-01T12:00Z, 22.5)` |
 
@@ -777,9 +783,15 @@ The GPU path uses [`wgpu`](https://wgpu.rs/) compute shaders with:
   that eliminates unmap/remap overhead.
 - **f64 / f32 precision paths** — automatically chosen by GPU capability.
 - **Pre-warming** — `splimes::prewarm_gpu()` (or the `gpu-eager-init` feature)
-  removes first-call initialization latency; `GpuConfig` presets (`minimal()`,
-  `low_memory()`, `default()`, `high_performance()`) size the pool, staging
-  buffers, and command batch.
+  removes first-call initialization latency. `splimes::prewarm_gpu_with_config()`
+  takes a `GpuConfig` preset (`minimal()`, `low_memory()`, `default()`,
+  `high_performance()`) to size the **buffer pool** and **staging buffers**.
+  The interpolator is a process-wide singleton sized once at initialization, so a
+  configuration must be supplied **before any other GPU use** — if the GPU is
+  already up, the call reports an error rather than silently ignoring it, and
+  `gpu_config_applied()` / `effective_gpu_config()` let you check what is in force.
+  `GpuConfig::max_command_batch_size` is **reserved and currently has no effect**:
+  command batching is not implemented yet (roadmap Phase 5.1).
 
 ```rust,ignore
 use splimes::{auto_interpolate, Resolution, Spline};
@@ -1240,8 +1252,7 @@ WeftDB/
 ├── weft-line-protocol/          # InfluxDB Line Protocol parser (shared dialect)
 ├── weft-server/                 # axum HTTP API server
 ├── weft-bench/                  # benchmark harness (adapters, profiles, reports)
-├── weft-tui/                    # terminal UI binary
-└── legacy/                     # 15 archived predecessor repos (excluded from workspace)
+└── weft-tui/                    # terminal UI binary
 ```
 
 The complete work queue and design constraints live in
@@ -1272,9 +1283,6 @@ are stored with [`BigDecimal`](https://docs.rs/bigdecimal) logical precision,
 interpolation transparently scales from a handful of points to millions across the
 GPU, and the storage layer uses bulk transactions, cached connections, and typed
 columnar segments throughout.
-
-`legacy/` holds the 15 archived predecessor repositories (retained for reference
-and full history, excluded from the workspace).
 
 ---
 

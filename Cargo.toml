@@ -1,8 +1,13 @@
 [workspace]
 resolver = "2"
 members = ["database", "database_orchestration", "splimes", "weft-tui", "weft-bench", "weft-server", "weft-line-protocol", "weft-physical-type", "weft-arrow", "weft-arrow-store", "weft-reduce"]
-# Predecessor repositories archived under legacy/ (history preserved); not part of the active build.
-exclude = ["legacy"]
+
+# Fields every workspace member inherits with `<field>.workspace = true`. Each crate keeps
+# its own version, edition and description.
+[workspace.package]
+license = "MIT"
+authors = ["Justin Icenhour"]
+repository = "https://github.com/physics515/weftdb"
 
 [workspace.dependencies]
 anyhow = "1"

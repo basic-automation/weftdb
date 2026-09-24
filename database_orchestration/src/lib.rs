@@ -382,20 +382,20 @@
 //! async fn main() -> anyhow::Result<()> {
 //!     let database = Database::existing("Crypto").await?;
 //!
-//!     // Find BTCUSD subject
+//!     // Find the pump-station-3 subject
 //!     let subjects = database.list_subjects().await?;
-//!     let btc_subject = subjects.iter()
-//!         .find(|(_, name)| name == "BTCUSD")
+//!     let subject = subjects.iter()
+//!         .find(|(_, name)| name == "pump-station-3")
 //!         .map(|(id, _)| *id)
-//!         .expect("BTCUSD not found");
+//!         .expect("pump-station-3 not found");
 //!
 //!     // Get the "open" price aspect
-//!     let aspects = database.get_subject_aspects(&btc_subject).await?;
+//!     let aspects = database.get_subject_aspects(&subject).await?;
 //!     let open_aspect = aspects.iter()
 //!         .find(|a| a.name() == "open")
 //!         .expect("open aspect not found");
 //!
-//!     // Build pipeline for BTC price analysis
+//!     // Build a pipeline for pressure-series analysis
 //!     let mut pipeline = Pipeline::builder(database.clone(), open_aspect.id())
 //!         .resolution(Resolution::Hours)
 //!         .batch_size(24)  // Daily patterns
@@ -406,7 +406,7 @@
 //!             )])
 //!         ))
 //!         .with_monthly_increase_detector(0.05)
-//!         .with_peak_detector("BTC Price Peaks")
+//!         .with_peak_detector("Pressure Peaks")
 //!         .build()
 //!         .await?;
 //!
@@ -1791,7 +1791,7 @@ mod tests {
 			)
 		);
 
-		let mut pipeline = Pipeline::builder(database.clone(), aspect_id).spline_method(Spline::Linear).batch_size(24).add_dictionary("TestDictionary", "A dictionary for testing purposes", dictionary_constraints).with_monthly_increase_detector(0.05).with_peak_detector("BTC Price Peaks").build().await?;
+		let mut pipeline = Pipeline::builder(database.clone(), aspect_id).spline_method(Spline::Linear).batch_size(24).add_dictionary("TestDictionary", "A dictionary for testing purposes", dictionary_constraints).with_monthly_increase_detector(0.05).with_peak_detector("Pressure Peaks").build().await?;
 
 		tracing::info!(elapsed = ?timer.elapsed(), "Pipeline built");
 		tracing::info!(detector_count = pipeline.detector_count(), "Registered event detectors");

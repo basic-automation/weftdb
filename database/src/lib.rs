@@ -9,7 +9,7 @@
 //! This crate provides a hierarchical data model for organizing time-series data:
 //!
 //! - **Database**: The top-level container that holds all data
-//! - **Subject**: A logical grouping (e.g., a sensor, user, or asset like "BTCUSD")
+//! - **Subject**: A logical grouping (e.g., a sensor, device, or asset like "pump-station-3")
 //! - **Aspect**: A specific measurement type for a subject (e.g., "temperature", "price", "open")
 //! - **Measurement**: Individual timestamped data points with `BigDecimal` precision
 //!

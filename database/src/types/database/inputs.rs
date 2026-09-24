@@ -5,7 +5,7 @@ use crate::{
 		database::{
 			helpers::safe_usize_to_f64, traits::{config::Config, connection::Connection as ConnectionTrait, DatabaseStructure}
 		}, TxId
-	}, AspectId, Batch, BatchId, Correlation, CorrelationID, Database, DatasetId, DictionaryMetadata, Error, Event, EventID, InputMeasurement, Measurement, Pattern, PatternID
+	}, Aspect, AspectId, Batch, BatchId, Correlation, CorrelationID, Database, DatasetId, DictionaryMetadata, Error, Event, EventID, InputMeasurement, Measurement, Pattern, PatternID
 };
 
 #[async_trait::async_trait]
@@ -1022,57 +1022,20 @@ impl Inputs for Database {
 		let db_name = &self.name;
 		let db_path = Self::aspect_dictionaries_db_path(db_name.as_str(), aspect.subject_name(), aspect.name(), dictionary_name);
 		let (db, _was_new) = Self::get_or_create_turso_database(&db_path).await?;
+		// Create the schema FIRST, in an exclusive transaction. Turso rejects DDL inside
+		// `BEGIN CONCURRENT` ("DDL statements require an exclusive transaction"), so the
+		// `CREATE TABLE`s that used to live below — on the concurrent connection — aborted this
+		// function before a single table existed. The half-created database file then defeated
+		// the only recovery path (`Aspect::dictionary` re-wireframes only when the file is
+		// absent, and `get_or_create_turso_database` reports `was_new = false` for anything
+		// already in its connection cache), so the dictionary stayed permanently schema-less and
+		// a later `SELECT ... FROM patterns` failed with "no such table: patterns".
+		//
+		// Routing through the wireframe also fixes a second defect: the inline DDL created only
+		// four of the seven dictionary tables, omitting `patterns`, `pattern_occurrences` and
+		// `pattern_relatives` — so merely swapping the transaction type would not have been enough.
+		Aspect::ensure_dictionary_tables(&db).await?;
 		let conn = Self::begin_concurrent(&db, db_name, Some(self.cache.clone())).await?;
-
-		// Ensure dictionary tables exist (create if not exists)
-		// Note: No PRIMARY KEY on TEXT columns or indexes to support MVCC
-		conn.as_ref()
-			.execute(
-				r"CREATE TABLE IF NOT EXISTS dictionary_metadata (
-			id TEXT NOT NULL,
-			name TEXT NOT NULL,
-			description TEXT,
-			created_at INTEGER NOT NULL
-		)",
-				turso::params![],
-			)
-			.await?;
-
-		conn.as_ref()
-			.execute(
-				r"CREATE TABLE IF NOT EXISTS dictionary_constraints (
-			id INTEGER PRIMARY KEY,
-			dictionary_id TEXT NOT NULL,
-			steps_count INTEGER,
-			steps_interpolation TEXT
-		)",
-				turso::params![],
-			)
-			.await?;
-
-		conn.as_ref()
-			.execute(
-				r"CREATE TABLE IF NOT EXISTS dictionary_variabilities (
-			id INTEGER PRIMARY KEY,
-			dictionary_id TEXT NOT NULL,
-			variability_type TEXT NOT NULL,
-			variability_value TEXT NOT NULL
-		)",
-				turso::params![],
-			)
-			.await?;
-
-		conn.as_ref()
-			.execute(
-				r"CREATE TABLE IF NOT EXISTS dictionary_patterns (
-			id INTEGER PRIMARY KEY,
-			dictionary_id TEXT NOT NULL,
-			pattern_id TEXT NOT NULL,
-			added_at INTEGER NOT NULL
-		)",
-				turso::params![],
-			)
-			.await?;
 
 		// Insert dictionary metadata (no ON CONFLICT since no unique constraint - app handles duplicates)
 		let insert_sql = r"INSERT INTO dictionary_metadata (id, name, description, created_at) VALUES (?, ?, ?, ?)";
