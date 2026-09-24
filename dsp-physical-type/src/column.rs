@@ -188,6 +188,91 @@ impl ColumnEncoding {
 		self.scaled_i64_mantissas().map(|m| crate::timestamp::for_bitpack_bytes(&m, crate::timestamp::BLOCKED_BITPACK_BLOCK))
 	}
 
+	/// The realized footprint in bytes of the **transposed (`FastLanes`-layout) per-tile
+	/// bit-packed** value codec for a `ScaledI64` column —
+	/// [`crate::timestamp::transpose_bitpack_bytes`] at [`crate::timestamp::TRANSPOSE_TILE`].
+	/// `None` for any other physical type.
+	///
+	/// This is primarily a **decode-speed** codec. Its bit budget is the same code as the linear
+	/// bit-pack with the bits permuted, so on a uniform-width column it ties the global
+	/// bit-pack, and a short trailing tile costs up to `width - 1` extra bytes (each bit-plane
+	/// rounds up to a whole byte independently). What it buys is decode latency: the decoder
+	/// reads `u64` plane words and walks only the *set* bits, so the empty high bit-planes of a
+	/// small-magnitude stream are skipped wholesale (measured ~5.7× the linear per-block unpack
+	/// in `benches/bitunpack.rs`).
+	///
+	/// It is **not** strictly larger, though: it adapts its width per 1024-lane *tile* while
+	/// paying one width header per tile, where the blocked codec pays one per 64-value block.
+	/// On a column whose magnitude varies across wide spans it can therefore come in strictly
+	/// under every size-selected codec — which is why
+	/// [`transposed_overhead`](Self::transposed_overhead) can legitimately return a ratio below
+	/// `1.0` and the selector accepts a sub-`1.0` ceiling.
+	///
+	/// It therefore has its **own** size function and its own selector entry
+	/// ([`best_value_codec_transposed`](Self::best_value_codec_transposed)) rather than
+	/// re-using the blocked figure, and is never chosen by the default (size-minimizing)
+	/// [`best_value_codec`](Self::best_value_codec). *(src: `FastLanes` Compression Layout,
+	/// VLDB'23 — <https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf>)*
+	#[must_use]
+	pub fn transposed_value_bytes(&self) -> Option<usize> {
+		self.scaled_i64_mantissas().map(|m| crate::timestamp::transpose_bitpack_bytes(&m, crate::timestamp::TRANSPOSE_TILE))
+	}
+
+	/// The size penalty the transposed codec would pay on this column, as a ratio against the
+	/// smallest size-selected codec (`transposed / best_serialized_bytes`). `None` for a
+	/// non-`ScaledI64` column, and `None` for an empty column (no ratio is meaningful).
+	///
+	/// `1.0` means the transposed layout is free (its bits are a permutation of the winning
+	/// bit-pack's); **below `1.0` it is a strict size win too** (per-tile widths with one header
+	/// per 1024 lanes can beat both the global width and the blocked codec's per-64 headers);
+	/// a large ratio means a *different* codec family won the size race (FOR on a clustered
+	/// column, RLE-shaped data) and the transposed layout would bloat the column to buy its
+	/// decode speed. This is the gate
+	/// [`best_value_codec_transposed`](Self::best_value_codec_transposed) applies — the same
+	/// shape as the timestamp checkpoint index's `max_codec_overhead` ceiling.
+	#[must_use]
+	pub fn transposed_overhead(&self) -> Option<f64> {
+		let transposed = self.transposed_value_bytes()?;
+		let best = self.best_serialized_bytes();
+		if best == 0 {
+			return None;
+		}
+		// Byte counts far below 2^53, so the ratio is exact in practice — the same
+		// statement-scoped exemption `Segment::checkpoint_codec_overhead` takes for its
+		// identical codec-size ratio.
+		#[allow(clippy::cast_precision_loss)]
+		let ratio = transposed as f64 / best as f64;
+		Some(ratio)
+	}
+
+	/// The value codec to write when the **transposed layout is permitted** up to a size
+	/// overhead of `max_overhead` (a ratio against the size-selected codec; `1.0` = only when
+	/// free).
+	///
+	/// Returns `"scaled_transposed"` for a `ScaledI64` column whose
+	/// [`transposed_overhead`](Self::transposed_overhead) is within the ceiling, otherwise
+	/// exactly [`best_value_codec`](Self::best_value_codec). A **sub-`1.0` ceiling is
+	/// meaningful and honoured** — it says "take the transposed layout only where it is also a
+	/// strict size win", which is reachable (see
+	/// [`transposed_overhead`](Self::transposed_overhead)). Only a non-finite or non-positive
+	/// ceiling admits nothing.
+	///
+	/// **Opt-in.** The transposed layout trades bytes for decode latency, so making it the
+	/// default is a headline bytes/point change and is owner-gated (as FOR / the cascade / the
+	/// checkpoint index were). Callers request it explicitly through
+	/// [`FrameOptions`](crate::dspseg::FrameOptions).
+	#[must_use]
+	pub fn best_value_codec_transposed(&self, max_overhead: f64) -> &'static str {
+		let single = self.best_value_codec();
+		if !max_overhead.is_finite() || max_overhead <= 0.0 {
+			return single;
+		}
+		match self.transposed_overhead() {
+			Some(ratio) if ratio <= max_overhead => "scaled_transposed",
+			_ => single,
+		}
+	}
+
 	/// The advisory footprint of a **cascade** codec on a `ScaledI64` column: delta-transform
 	/// the mantissas (first differences), *then* pack the differences with the smallest of the
 	/// varint / bit-pack / per-block bit-pack / FOR / run-length codecs. `None` for any other

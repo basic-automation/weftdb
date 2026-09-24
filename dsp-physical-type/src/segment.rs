@@ -539,6 +539,18 @@ impl Segment {
 		crate::dspseg::write_segment_checkpointed(self, stride)
 	}
 
+	/// Seal to a `.dspseg` frame under explicit [`FrameOptions`](crate::dspseg::FrameOptions)
+	/// — the general form of [`write_to`](Self::write_to) (which is this with
+	/// [`FrameOptions::DEFAULT`](crate::dspseg::FrameOptions::DEFAULT)) and
+	/// [`write_to_checkpointed`](Self::write_to_checkpointed).
+	///
+	/// Both opt-ins are additive codec tags, so any combination is read by the ordinary
+	/// [`read_from`](Self::read_from) with no format-version change.
+	#[must_use]
+	pub fn write_to_with(&self, opts: &crate::dspseg::FrameOptions) -> Vec<u8> {
+		crate::dspseg::write_segment_with(self, opts)
+	}
+
 	/// Whether a checkpoint index would actually help this segment's point lookups.
 	///
 	/// True only for a **sorted, irregular** timestamp column: an out-of-order column

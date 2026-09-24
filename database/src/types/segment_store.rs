@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
-use dsp_physical_type::{merge_newer_wins, split_index, AspectSchema, PagedSegment, Segment, SegmentDescriptor, SplitDecision, SplitPolicy, TimeUnit, PAGED_SEGMENT_FORMAT_VERSION};
+use dsp_physical_type::{merge_newer_wins, split_index, AspectSchema, FrameOptions, PagedSegment, Segment, SegmentDescriptor, SplitDecision, SplitPolicy, TimeUnit, PAGED_SEGMENT_FORMAT_VERSION};
 use dsp_reduce::{Aggregation, Bucket, PartialReduction};
 use splimes::{Point, Resolution};
 
@@ -125,6 +125,45 @@ impl CheckpointPolicy {
 	}
 }
 
+/// When a freshly sealed segment writes its value column in the **transposed
+/// (`FastLanes`-layout) bit-plane-major** codec instead of the size-selected one.
+///
+/// The transposed layout stores the same *code* as the linear bit-pack with its bits permuted,
+/// so it never wins on size — it is a **decode-latency** trade. Its decoder reads `u64` plane
+/// words and walks only the set bits, so a small-magnitude column's empty high bit-planes are
+/// skipped wholesale (measured ~5.7x the linear per-block unpack at the primitive level,
+/// `dsp-physical-type`'s `benches/bitunpack.rs`).
+///
+/// It is therefore **off by default**: `DISABLED` writes byte-for-byte the frames DSP has
+/// always written. Enable per-deployment with `DSP_SEGMENT_TRANSPOSED_MAX_OVERHEAD` — the
+/// ceiling on how much larger the transposed value block may be than the size-selected codec
+/// (`1.0` = only when free; `1.05` = up to 5% larger). A column where a *different* codec
+/// family won the size race (FOR on a clustered column) is refused rather than bloated, the
+/// same shape as [`CheckpointPolicy`]'s `max_codec_overhead` gate.
+///
+/// Whether making this the default is owner-gated — it changes the headline bytes/point.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TransposedPolicy {
+	/// Ceiling on the transposed block's size overhead against the size-selected codec, or
+	/// `None` to never write it.
+	pub max_overhead: Option<f64>,
+}
+
+impl TransposedPolicy {
+	/// Never write the transposed value codec — the default, and byte-for-byte the historical
+	/// frame layout.
+	pub const DISABLED: Self = Self { max_overhead: None };
+
+	/// Read the policy from `DSP_SEGMENT_TRANSPOSED_MAX_OVERHEAD` (absent, unparseable,
+	/// non-finite or non-positive → [`DISABLED`](Self::DISABLED)). A value **below 1.0 is
+	/// meaningful**: it adopts the transposed layout only where it is also a strict size win
+	/// (see [`ColumnEncoding::transposed_overhead`](dsp_physical_type::ColumnEncoding::transposed_overhead)).
+	#[must_use]
+	pub fn from_env() -> Self {
+		Self { max_overhead: std::env::var("DSP_SEGMENT_TRANSPOSED_MAX_OVERHEAD").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|r| r.is_finite() && *r > 0.0) }
+	}
+}
+
 /// Lift a stored integer epoch in `unit` to an absolute instant — the inverse of the
 /// ingest path's `epoch_in_unit`. `None` if the epoch falls outside the representable
 /// range (only reachable for coarse units at absurd magnitudes).
@@ -191,6 +230,9 @@ pub struct SegmentStore {
 	catalog: AspectCatalog,
 	/// Whether new seals carry a timestamp checkpoint index (off unless configured).
 	checkpoints: CheckpointPolicy,
+	/// Whether new seals write the transposed (decode-fast) value codec (off unless
+	/// configured). See [`TransposedPolicy`].
+	transposed: TransposedPolicy,
 	/// Whether new seals materialize a per-segment partial-reduction sidecar (off unless
 	/// configured). See [`PartialSidecar`].
 	partials: PartialSidecarPolicy,
@@ -252,7 +294,8 @@ impl SegmentStore {
 		registry.register_subject(database, subject).await?;
 		let checkpoints = CheckpointPolicy::from_env();
 		let partials = PartialSidecarPolicy::from_env();
-		Ok(Self { root, index, metadata, catalog, registry, database: database.to_string(), subject: subject.to_string(), checkpoints, partials })
+		let transposed = TransposedPolicy::from_env();
+		Ok(Self { root, index, metadata, catalog, registry, database: database.to_string(), subject: subject.to_string(), checkpoints, partials, transposed })
 	}
 
 	/// Override this store's [`CheckpointPolicy`] (the env-read default is
@@ -268,6 +311,29 @@ impl SegmentStore {
 	#[must_use]
 	pub const fn checkpoint_policy(&self) -> CheckpointPolicy {
 		self.checkpoints
+	}
+
+	/// Override this store's [`TransposedPolicy`] (the env-read default is
+	/// [`TransposedPolicy::DISABLED`]), for a caller that wants the decode-fast transposed
+	/// value codec without setting an environment variable.
+	#[must_use]
+	pub const fn with_transposed_policy(mut self, policy: TransposedPolicy) -> Self {
+		self.transposed = policy;
+		self
+	}
+
+	/// The transposed-value-codec policy new seals are written under.
+	#[must_use]
+	pub const fn transposed_policy(&self) -> TransposedPolicy {
+		self.transposed
+	}
+
+	/// The [`FrameOptions`] a fresh seal of a `row_count`-row segment writes under, folding
+	/// this store's checkpoint and transposed policies into the one options value both frame
+	/// writers take. `benefits`/`codec_overhead` are the segment's checkpoint gates (see
+	/// [`CheckpointPolicy::stride_for`]).
+	fn frame_options(&self, row_count: usize, benefits: bool, codec_overhead: f64) -> FrameOptions {
+		FrameOptions { checkpoint_stride: self.checkpoints.stride_for(row_count, benefits, codec_overhead), transposed_max_overhead: self.transposed.max_overhead }
 	}
 
 	/// Override this store's [`PartialSidecarPolicy`] (the env-read default is
@@ -525,13 +591,12 @@ impl SegmentStore {
 	/// the dense and nullable seal paths.
 	async fn persist(&self, aspect: &str, segment: &Segment) -> Result<SegmentDescriptor> {
 		let id = self.index.next_id(aspect).await?;
-		// Checkpoint the timestamp column only when configured AND the segment's shape
-		// actually benefits (sorted + irregular + big enough) — otherwise write the
-		// historical frame byte-for-byte. Either frame reads identically.
-		let bytes = match self.checkpoints.stride_for(segment.stats.row_count, segment.benefits_from_checkpoints(), segment.checkpoint_codec_overhead()) {
-			Some(stride) => segment.write_to_checkpointed(stride),
-			None => segment.write_to(),
-		};
+		// Both opt-in layouts are applied here: the timestamp checkpoint index only when
+		// configured AND the segment's shape actually benefits (sorted + irregular + big
+		// enough), and the transposed value codec only when configured AND within its overhead
+		// ceiling. With neither configured this writes the historical frame byte-for-byte, and
+		// every combination reads identically.
+		let bytes = segment.write_to_with(&self.frame_options(segment.stats.row_count, segment.benefits_from_checkpoints(), segment.checkpoint_codec_overhead()));
 		let path = self.segment_path(aspect, id);
 		tokio::fs::write(&path, &bytes).await.with_context(|| format!("writing segment {}", path.display()))?;
 		let descriptor = SegmentDescriptor::of_segment(id, path.to_string_lossy().into_owned(), bytes.len() as u64, segment);
@@ -552,12 +617,9 @@ impl SegmentStore {
 	/// record its descriptor. The paged analogue of [`persist`](SegmentStore::persist).
 	async fn persist_paged(&self, aspect: &str, segment: &PagedSegment) -> Result<SegmentDescriptor> {
 		let id = self.index.next_id(aspect).await?;
-		// As `persist`, though the paged win is far smaller — page pruning already bounds
-		// a probe's decode to `rows_per_page`.
-		let bytes = match self.checkpoints.stride_for(segment.stats.row_count, segment.benefits_from_checkpoints(), segment.checkpoint_codec_overhead()) {
-			Some(stride) => segment.write_to_checkpointed(stride),
-			None => segment.write_to(),
-		};
+		// As `persist`, though the checkpoint win is far smaller here — page pruning already
+		// bounds a probe's decode to `rows_per_page`.
+		let bytes = segment.write_to_with(&self.frame_options(segment.stats.row_count, segment.benefits_from_checkpoints(), segment.checkpoint_codec_overhead()));
 		let path = self.segment_path(aspect, id);
 		tokio::fs::write(&path, &bytes).await.with_context(|| format!("writing segment {}", path.display()))?;
 		let descriptor = SegmentDescriptor::of_paged_segment(id, path.to_string_lossy().into_owned(), bytes.len() as u64, segment);
@@ -3636,6 +3698,46 @@ mod tests {
 		let batch = vec![ts[10], ts[8_000], 999_999_999, ts[11_000]];
 		assert_eq!(cp.read_points("temp", &batch).await.expect("reads"), plain.read_points("temp", &batch).await.expect("reads"), "batch read must match");
 		assert_eq!(cp.read_time_range("temp", ts[100], ts[200]).await.expect("reads"), plain.read_time_range("temp", ts[100], ts[200]).await.expect("reads"), "range read must match");
+	}
+
+	/// End-to-end through the real store: an enabled [`TransposedPolicy`] seals the value
+	/// column in the transposed (decode-fast) codec, an unconfigured store does not, and both
+	/// stores answer every read identically. The store is the layer that makes the codec
+	/// reachable from a deployment, so this is the test that it is actually wired up.
+	#[tokio::test]
+	async fn transposed_seal_reads_identically_and_only_changes_the_bytes() {
+		use dsp_physical_type::frame_value_codec;
+
+		// A zero-straddling small-magnitude two-decimal column spanning several 1024-lane
+		// tiles: the bit-pack family wins the size race, so the transposed layout is admitted
+		// near parity. Scale 2 keeps it off the F64 fast path.
+		let ts: Vec<i64> = (0..2_500).map(|i| 100 + i * 10).collect();
+		let vs: Vec<BigDecimal> = (0..2_500_i64).map(|i| BigDecimal::new((((i * 37) % 1_001) - 500).into(), 2)).collect();
+		let scaled = AspectSchema::new(PhysicalType::ScaledI64 { scale: 2 }, bd("0"), TimeUnit::Seconds);
+
+		let plain_dir = TempDir::new().expect("tempdir");
+		let plain = SegmentStore::open(plain_dir.path()).await.expect("opens");
+		assert_eq!(plain.transposed_policy(), TransposedPolicy::DISABLED, "the store is unconfigured by default");
+		let plain_desc = plain.seal("temp", &scaled, &ts, &vs).await.expect("seals");
+
+		let tr_dir = TempDir::new().expect("tempdir");
+		let tr = SegmentStore::open(tr_dir.path()).await.expect("opens").with_transposed_policy(TransposedPolicy { max_overhead: Some(1.05) });
+		let tr_desc = tr.seal("temp", &scaled, &ts, &vs).await.expect("seals");
+
+		// The frames really do differ in the codec they realized.
+		let plain_bytes = tokio::fs::read(&plain_desc.path).await.expect("reads plain frame");
+		let tr_bytes = tokio::fs::read(&tr_desc.path).await.expect("reads transposed frame");
+		assert_eq!(frame_value_codec(&tr_bytes).expect("codec"), "scaled_transposed", "the configured store sealed the transposed codec");
+		assert_ne!(frame_value_codec(&plain_bytes).expect("codec"), "scaled_transposed", "the unconfigured store did not");
+
+		// ...and answer identically: point reads (present, off-grid, out-of-range), a batch,
+		// and a range spanning a tile boundary.
+		for probe in [ts[0], ts[1_024], ts[2_499], ts[3] + 1, -1] {
+			assert_eq!(tr.read_point("temp", probe).await.expect("reads"), plain.read_point("temp", probe).await.expect("reads"), "point read at {probe} must match the plain store");
+		}
+		let batch = vec![ts[10], ts[1_023], 999_999_999, ts[2_048]];
+		assert_eq!(tr.read_points("temp", &batch).await.expect("reads"), plain.read_points("temp", &batch).await.expect("reads"), "batch read must match");
+		assert_eq!(tr.read_time_range("temp", ts[1_020], ts[1_030]).await.expect("reads"), plain.read_time_range("temp", ts[1_020], ts[1_030]).await.expect("reads"), "range read across a tile boundary must match");
 	}
 
 	/// End-to-end through the real store: an enabled partial-sidecar policy writes a

@@ -410,6 +410,14 @@ impl PagedSegment {
 		crate::dspseg::write_paged_segment_checkpointed(self, stride)
 	}
 
+	/// Seal to a `.dspseg` frame under explicit [`FrameOptions`](crate::dspseg::FrameOptions)
+	/// — the paged sibling of [`Segment::write_to_with`](crate::Segment::write_to_with). The
+	/// options apply to every page.
+	#[must_use]
+	pub fn write_to_with(&self, opts: &crate::dspseg::FrameOptions) -> Vec<u8> {
+		crate::dspseg::write_paged_segment_with(self, opts)
+	}
+
 	/// Whether a checkpoint index would help this segment's point lookups: a **sorted**
 	/// segment with at least one **irregular** page (a regular page already resolves in
 	/// `O(1)` closed form, an out-of-order segment cannot be binary-searched). The paged
