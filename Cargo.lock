@@ -1094,8 +1094,6 @@ dependencies = [
  "criterion",
  "csv",
  "dirs",
- "dsp-physical-type",
- "dsp-reduce",
  "fake",
  "fastrand",
  "flume",
@@ -1118,6 +1116,8 @@ dependencies = [
  "tracing-subscriber",
  "turso",
  "uuid",
+ "weft-physical-type",
+ "weft-reduce",
  "wgpu",
  "wide",
 ]
@@ -1265,134 +1265,6 @@ name = "downcast-rs"
 version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "117240f60069e65410b3ae1bb213295bd828f707b5bec6596a1afc8793ce0cbc"
-
-[[package]]
-name = "dsp-arrow"
-version = "0.1.0"
-dependencies = [
- "arrow-array",
- "arrow-ipc",
- "arrow-schema",
- "bigdecimal",
- "bytes",
- "dsp-physical-type",
- "parquet",
-]
-
-[[package]]
-name = "dsp-arrow-store"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow-array",
- "bigdecimal",
- "database",
- "dsp-arrow",
- "dsp-physical-type",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "dsp-bench"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bigdecimal",
- "chrono",
- "dsp-line-protocol",
- "dsp-physical-type",
- "dsp-reduce",
- "rand 0.9.4",
- "rand_chacha 0.9.0",
- "rayon",
- "serde",
- "serde_json",
- "splimes",
- "sysinfo",
- "tokio",
-]
-
-[[package]]
-name = "dsp-line-protocol"
-version = "0.1.0"
-dependencies = [
- "bigdecimal",
- "chrono",
- "splimes",
-]
-
-[[package]]
-name = "dsp-physical-type"
-version = "0.1.0"
-dependencies = [
- "bigdecimal",
- "criterion",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "dsp-reduce"
-version = "0.1.0"
-dependencies = [
- "bigdecimal",
- "bincode",
- "chrono",
- "serde",
- "splimes",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "dsp-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "bigdecimal",
- "chrono",
- "database",
- "dsp-arrow",
- "dsp-arrow-store",
- "dsp-line-protocol",
- "dsp-physical-type",
- "dsp-reduce",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "serde",
- "serde_json",
- "splimes",
- "tempfile",
- "tokio",
- "tower",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "dsp-tui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bigdecimal",
- "chrono",
- "crossterm 0.29.0",
- "csv",
- "database",
- "dirs",
- "futures",
- "num-traits",
- "ratatui",
- "splimes",
- "tokio",
- "tracing",
- "tracing-core",
- "tracing-subscriber",
-]
 
 [[package]]
 name = "dtor"
@@ -5573,6 +5445,134 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "weft-arrow"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-schema",
+ "bigdecimal",
+ "bytes",
+ "parquet",
+ "weft-physical-type",
+]
+
+[[package]]
+name = "weft-arrow-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "bigdecimal",
+ "database",
+ "tempfile",
+ "tokio",
+ "weft-arrow",
+ "weft-physical-type",
+]
+
+[[package]]
+name = "weft-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bigdecimal",
+ "chrono",
+ "rand 0.9.4",
+ "rand_chacha 0.9.0",
+ "rayon",
+ "serde",
+ "serde_json",
+ "splimes",
+ "sysinfo",
+ "tokio",
+ "weft-line-protocol",
+ "weft-physical-type",
+ "weft-reduce",
+]
+
+[[package]]
+name = "weft-line-protocol"
+version = "0.1.0"
+dependencies = [
+ "bigdecimal",
+ "chrono",
+ "splimes",
+]
+
+[[package]]
+name = "weft-physical-type"
+version = "0.1.0"
+dependencies = [
+ "bigdecimal",
+ "criterion",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "weft-reduce"
+version = "0.1.0"
+dependencies = [
+ "bigdecimal",
+ "bincode",
+ "chrono",
+ "serde",
+ "splimes",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "weft-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bigdecimal",
+ "chrono",
+ "database",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "serde",
+ "serde_json",
+ "splimes",
+ "tempfile",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "weft-arrow",
+ "weft-arrow-store",
+ "weft-line-protocol",
+ "weft-physical-type",
+ "weft-reduce",
+]
+
+[[package]]
+name = "weft-tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bigdecimal",
+ "chrono",
+ "crossterm 0.29.0",
+ "csv",
+ "database",
+ "dirs",
+ "futures",
+ "num-traits",
+ "ratatui",
+ "splimes",
+ "tokio",
+ "tracing",
+ "tracing-core",
+ "tracing-subscriber",
 ]
 
 [[package]]

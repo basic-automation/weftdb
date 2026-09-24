@@ -18,35 +18,35 @@ static CORRELATIONS_DB_FILENAME: &str = "correlations.db";
 static PIPELINE_DB_FILENAME: &str = "pipeline.db";
 static DICTIONARIES_DB_FOLDERNAME: &str = "dictionaries";
 
-/// Returns the portable, per-user default data directory for DSP databases.
+/// Returns the portable, per-user default data directory for WeftDB databases.
 ///
 /// No hard-coded paths: this resolves to a writable, machine-independent location
 /// for the current user. Resolution order:
-/// 1. `~/.dsp/data` — consistent with the `dsp-tui` home directory (`~/.dsp`).
-/// 2. The platform data directory + `dsp` (e.g. `%APPDATA%\dsp`,
-///    `~/Library/Application Support/dsp`, `~/.local/share/dsp`) when the home
+/// 1. `~/.weftdb/data` — consistent with the `weft-tui` home directory (`~/.weftdb`).
+/// 2. The platform data directory + `weftdb` (e.g. `%APPDATA%\weftdb`,
+///    `~/Library/Application Support/weftdb`, `~/.local/share/weftdb`) when the home
 ///    directory cannot be determined.
-/// 3. A relative `dsp_data` directory as a last resort.
+/// 3. A relative `weftdb_data` directory as a last resort.
 #[must_use]
 pub fn default_data_dir() -> String {
 	dirs::home_dir()
-		.map(|home| home.join(".dsp").join("data"))
-		.or_else(|| dirs::data_dir().map(|data| data.join("dsp")))
-		.unwrap_or_else(|| PathBuf::from("dsp_data"))
+		.map(|home| home.join(".weftdb").join("data"))
+		.or_else(|| dirs::data_dir().map(|data| data.join("weftdb")))
+		.unwrap_or_else(|| PathBuf::from("weftdb_data"))
 		.to_string_lossy()
 		.into_owned()
 }
 
-/// Returns the active data directory for DSP databases.
+/// Returns the active data directory for WeftDB databases.
 ///
 /// Resolution order:
 /// 1. `TEST_DATA_DIR` — explicit override (used by the test suite).
-/// 2. `DSP_DATA_DIR` — shared override, also honored by `dsp-tui` for its logs.
+/// 2. `WEFT_DATA_DIR` — shared override, also honored by `weft-tui` for its logs.
 /// 3. [`default_data_dir`] — the portable per-user default.
 #[must_use]
 pub fn data_dir() -> String {
 	std::env::var("TEST_DATA_DIR")
-		.or_else(|_| std::env::var("DSP_DATA_DIR"))
+		.or_else(|_| std::env::var("WEFT_DATA_DIR"))
 		.unwrap_or_else(|_| default_data_dir())
 }
 

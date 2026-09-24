@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Verify OTLP trace delivery end-to-end: dsp-server -> OTLP/gRPC -> Jaeger.
+# Verify OTLP trace delivery end-to-end: weft-server -> OTLP/gRPC -> Jaeger.
 #
 # Ensures a local Jaeger all-in-one collector is running (starts the `jaeger`
-# docker container if needed), boots dsp-server with OTEL_EXPORTER_OTLP_ENDPOINT
+# docker container if needed), boots weft-server with OTEL_EXPORTER_OTLP_ENDPOINT
 # set, drives a declare/ingest/read cycle against the storage API, then asserts
 # via the Jaeger query API that a `request` root span with nested storage stage
 # spans (`storage.ingest.parse`, `storage.range.read`, ...) actually landed.
@@ -17,7 +17,7 @@ SERVER_ADDR=127.0.0.1:8093
 BASE="http://$SERVER_ADDR/api/v1"
 ASPECT="otel_verify_$$"
 STORE_ROOT="$(mktemp -d)"
-SERVER_LOG="$STORE_ROOT/dsp-server.log"
+SERVER_LOG="$STORE_ROOT/weft-server.log"
 SERVER_PID=""
 
 cleanup() {
@@ -42,21 +42,21 @@ if ! curl -sf -o /dev/null "$JAEGER_UI/api/services"; then
 fi
 echo "collector ready on $JAEGER_UI (OTLP/gRPC on $OTLP_ENDPOINT)"
 
-# --- 2. Boot dsp-server with the exporter enabled -----------------------------
-cargo build -p dsp-server
+# --- 2. Boot weft-server with the exporter enabled -----------------------------
+cargo build -p weft-server
 target_dir=$(cargo metadata --format-version 1 --no-deps |
 	python -c "import json,sys; print(json.load(sys.stdin)['target_directory'])")
 OTEL_EXPORTER_OTLP_ENDPOINT="$OTLP_ENDPOINT" \
-	DSP_SERVER_ADDR="$SERVER_ADDR" \
-	DSP_SEGMENT_STORE_ROOT="$STORE_ROOT/store" \
-	"$target_dir/debug/dsp-server" >"$SERVER_LOG" 2>&1 &
+	WEFT_SERVER_ADDR="$SERVER_ADDR" \
+	WEFT_SEGMENT_STORE_ROOT="$STORE_ROOT/store" \
+	"$target_dir/debug/weft-server" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 for _ in $(seq 1 30); do
 	curl -sf -o /dev/null "http://$SERVER_ADDR/health" && break
 	sleep 1
 done
 curl -sf -o /dev/null "http://$SERVER_ADDR/health" || {
-	echo "FAIL: dsp-server did not become ready" >&2
+	echo "FAIL: weft-server did not become ready" >&2
 	cat "$SERVER_LOG" >&2
 	exit 1
 }
@@ -64,7 +64,7 @@ grep -q "otlp trace export: enabled" "$SERVER_LOG" || {
 	echo "FAIL: server booted without the OTLP exporter" >&2
 	exit 1
 }
-echo "dsp-server up on $SERVER_ADDR with OTLP export enabled"
+echo "weft-server up on $SERVER_ADDR with OTLP export enabled"
 
 # --- 3. Drive traced requests (declare -> ingest -> range read) ---------------
 curl -sf -X POST "$BASE/storage/aspects" -H 'Content-Type: application/json' \
@@ -76,7 +76,7 @@ echo "traced declare/ingest/read cycle complete for aspect $ASPECT"
 
 # --- 4. Assert the trace landed in Jaeger -------------------------------------
 sleep 8 # batch exporter flush interval is ~5s
-curl -s "$JAEGER_UI/api/traces?service=dsp-server&limit=20" | python -c "
+curl -s "$JAEGER_UI/api/traces?service=weft-server&limit=20" | python -c "
 import json, sys
 data = json.load(sys.stdin).get('data') or []
 ok = False
@@ -93,4 +93,4 @@ sys.exit(0 if ok else 1)
 	echo "FAIL: no request trace with nested storage stage spans found in Jaeger" >&2
 	exit 1
 }
-echo "PASS: OTLP delivery verified (dsp-server -> $OTLP_ENDPOINT -> Jaeger)"
+echo "PASS: OTLP delivery verified (weft-server -> $OTLP_ENDPOINT -> Jaeger)"

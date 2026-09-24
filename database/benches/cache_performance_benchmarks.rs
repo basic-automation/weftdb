@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 fn benchmark_cache_miss_vs_hit(c: &mut Criterion) {
 	// Suppress verbose logging during benchmarks
-	std::env::remove_var("DSP_VERBOSE");
+	std::env::remove_var("WEFT_VERBOSE");
 	std::env::remove_var("RUST_LOG");
 
 	let rt = Runtime::new().unwrap();
