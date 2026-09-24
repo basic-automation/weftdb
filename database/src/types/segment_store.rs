@@ -1,26 +1,26 @@
 //! On-disk Storage v2 segment store (roadmap **Phase 4.3**).
 //!
-//! This closes the Phase-4.3 loop. The pieces were in place: `dsp-physical-type`
+//! This closes the Phase-4.3 loop. The pieces were in place: `weft-physical-type`
 //! seals a batch into a typed columnar [`Segment`] under a declared
 //! [`AspectSchema`] (no silent downcast — hard constraint #4), frames it to a
-//! checksummed `.dspseg` byte layout, and describes it with a
+//! checksummed `.weftseg` byte layout, and describes it with a
 //! [`SegmentDescriptor`]; [`SegmentIndexStore`](crate::SegmentIndexStore) persists
 //! those descriptors in the libSQL control plane and prunes a query to the segments
 //! it must open. [`SegmentStore`] wires them together against the filesystem:
 //!
 //! - **seal** ([`SegmentStore::seal`] / [`seal_nullable`](SegmentStore::seal_nullable))
-//!   encodes a batch under the aspect's schema, writes the sealed `.dspseg` frame to
-//!   `segments/<aspect>-<id>.dspseg`, and records its descriptor (with the *realized*
+//!   encodes a batch under the aspect's schema, writes the sealed `.weftseg` frame to
+//!   `segments/<aspect>-<id>.weftseg`, and records its descriptor (with the *realized*
 //!   on-disk byte length and path) in the index — one atomic-feeling operation that
 //!   leaves a measurement segment on disk and a catalog row pointing at it.
 //! - **read** ([`SegmentStore::read_time_range`]) prunes the index by time *first*
-//!   (a SQL `WHERE` over min/max ts — no `.dspseg` touched), then opens **only** the
+//!   (a SQL `WHERE` over min/max ts — no `.weftseg` touched), then opens **only** the
 //!   selected files, decodes them, and keeps the rows inside the window. A bounded
 //!   range query over a long-lived aspect reads a few segment files, not all of them
 //!   — the realized payoff of every per-segment stat the earlier slices built.
 //!
 //! Boundary (hard constraint #3): the control plane holds *metadata* (the index DB);
-//! the measurement bytes live in the `.dspseg` files DSP owns. libSQL never stores a
+//! the measurement bytes live in the `.weftseg` files WeftDB owns. libSQL never stores a
 //! measurement. This slice seals single-block segments via
 //! [`AspectSchema::seal`] **and** paged segments via
 //! [`AspectSchema::seal_paged`] — the read path dispatches on the recorded frame
@@ -32,8 +32,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
-use dsp_physical_type::{merge_newer_wins, split_index, AspectSchema, FrameOptions, PagedSegment, Segment, SegmentDescriptor, SplitDecision, SplitPolicy, TimeUnit, PAGED_SEGMENT_FORMAT_VERSION};
-use dsp_reduce::{Aggregation, Bucket, PartialReduction};
+use weft_physical_type::{merge_newer_wins, split_index, AspectSchema, FrameOptions, PagedSegment, Segment, SegmentDescriptor, SplitDecision, SplitPolicy, TimeUnit, PAGED_SEGMENT_FORMAT_VERSION};
+use weft_reduce::{Aggregation, Bucket, PartialReduction};
 use splimes::{Point, Resolution};
 
 use crate::{AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, PartialSidecar, PartialSidecarPolicy, SegmentIndexStore, SIDECAR_AGGREGATIONS};
@@ -44,7 +44,7 @@ const DEFAULT_DATABASE: &str = "default";
 /// See [`DEFAULT_DATABASE`].
 const DEFAULT_SUBJECT: &str = "default";
 
-/// A filesystem-backed store of sealed `.dspseg` segments with a libSQL segment
+/// A filesystem-backed store of sealed `.weftseg` segments with a libSQL segment
 /// index over them.
 ///
 /// Open one with [`SegmentStore::open`] (it lays out `segments/` and a
@@ -55,13 +55,13 @@ const DEFAULT_SUBJECT: &str = "default";
 ///
 /// The index makes a point lookup on a *sorted, irregular* column resume from the nearest
 /// checkpoint instead of decoding the whole timestamp column — measured **~3.45× faster**
-/// on a 100k-row single-block frame for **+0.41% bytes** (`dsp-physical-type`'s
+/// on a 100k-row single-block frame for **+0.41% bytes** (`weft-physical-type`'s
 /// `benches/dodsearch.rs`). It is a **storage-for-latency trade**, so it is **off by
-/// default**: `DISABLED` writes byte-for-byte the frames DSP has always written.
+/// default**: `DISABLED` writes byte-for-byte the frames WeftDB has always written.
 ///
-/// Enable per-deployment with `DSP_SEGMENT_CHECKPOINT_STRIDE` (rows between checkpoints;
+/// Enable per-deployment with `WEFT_SEGMENT_CHECKPOINT_STRIDE` (rows between checkpoints;
 /// ~1024 is the sweet spot — stride barely moves the speed but does move the size) and
-/// optionally `DSP_SEGMENT_CHECKPOINT_MIN_ROWS` (default [`DEFAULT_CHECKPOINT_MIN_ROWS`];
+/// optionally `WEFT_SEGMENT_CHECKPOINT_MIN_ROWS` (default [`DEFAULT_CHECKPOINT_MIN_ROWS`];
 /// a small segment decodes trivially, so indexing it is pure cost).
 ///
 /// Whether making this the *default* is owner-gated — it changes the headline bytes/point.
@@ -88,9 +88,9 @@ pub const DEFAULT_CHECKPOINT_MIN_ROWS: usize = 8_192;
 /// codec already wins (+1% on bounded jitter) but **~3.5× on a Gorilla-shaped
 /// scattered-jitter column and ~14× on an RLE-shaped long-constant-run column** — and
 /// both of those are *irregular*, so a shape-only test would happily checkpoint them
-/// (`dsp-physical-type`'s `benches/dodsearch.rs::report_codec_override_cost`). Without
-/// this ceiling, enabling `DSP_SEGMENT_CHECKPOINT_STRIDE` would silently bloat exactly
-/// those columns. Override with `DSP_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD`.
+/// (`weft-physical-type`'s `benches/dodsearch.rs::report_codec_override_cost`). Without
+/// this ceiling, enabling `WEFT_SEGMENT_CHECKPOINT_STRIDE` would silently bloat exactly
+/// those columns. Override with `WEFT_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD`.
 pub const DEFAULT_CHECKPOINT_MAX_CODEC_OVERHEAD: f64 = 1.25;
 
 impl CheckpointPolicy {
@@ -98,16 +98,16 @@ impl CheckpointPolicy {
 	/// frame layout.
 	pub const DISABLED: Self = Self { stride: None, min_rows: DEFAULT_CHECKPOINT_MIN_ROWS, max_codec_overhead: DEFAULT_CHECKPOINT_MAX_CODEC_OVERHEAD };
 
-	/// Read the policy from the environment: `DSP_SEGMENT_CHECKPOINT_STRIDE` (absent, zero
-	/// or unparseable → [`DISABLED`](Self::DISABLED)), `DSP_SEGMENT_CHECKPOINT_MIN_ROWS`
-	/// (→ [`DEFAULT_CHECKPOINT_MIN_ROWS`]) and `DSP_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD`
+	/// Read the policy from the environment: `WEFT_SEGMENT_CHECKPOINT_STRIDE` (absent, zero
+	/// or unparseable → [`DISABLED`](Self::DISABLED)), `WEFT_SEGMENT_CHECKPOINT_MIN_ROWS`
+	/// (→ [`DEFAULT_CHECKPOINT_MIN_ROWS`]) and `WEFT_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD`
 	/// (→ [`DEFAULT_CHECKPOINT_MAX_CODEC_OVERHEAD`]; a non-finite or `< 1.0` value is
 	/// ignored, since a ratio below 1.0 could never be met).
 	#[must_use]
 	pub fn from_env() -> Self {
-		let stride = std::env::var("DSP_SEGMENT_CHECKPOINT_STRIDE").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&s| s > 0);
-		let min_rows = std::env::var("DSP_SEGMENT_CHECKPOINT_MIN_ROWS").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(DEFAULT_CHECKPOINT_MIN_ROWS);
-		let max_codec_overhead = std::env::var("DSP_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|r| r.is_finite() && *r >= 1.0).unwrap_or(DEFAULT_CHECKPOINT_MAX_CODEC_OVERHEAD);
+		let stride = std::env::var("WEFT_SEGMENT_CHECKPOINT_STRIDE").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&s| s > 0);
+		let min_rows = std::env::var("WEFT_SEGMENT_CHECKPOINT_MIN_ROWS").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(DEFAULT_CHECKPOINT_MIN_ROWS);
+		let max_codec_overhead = std::env::var("WEFT_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|r| r.is_finite() && *r >= 1.0).unwrap_or(DEFAULT_CHECKPOINT_MAX_CODEC_OVERHEAD);
 		Self { stride, min_rows, max_codec_overhead }
 	}
 
@@ -132,10 +132,10 @@ impl CheckpointPolicy {
 /// so it never wins on size — it is a **decode-latency** trade. Its decoder reads `u64` plane
 /// words and walks only the set bits, so a small-magnitude column's empty high bit-planes are
 /// skipped wholesale (measured ~5.7x the linear per-block unpack at the primitive level,
-/// `dsp-physical-type`'s `benches/bitunpack.rs`).
+/// `weft-physical-type`'s `benches/bitunpack.rs`).
 ///
-/// It is therefore **off by default**: `DISABLED` writes byte-for-byte the frames DSP has
-/// always written. Enable per-deployment with `DSP_SEGMENT_TRANSPOSED_MAX_OVERHEAD` — the
+/// It is therefore **off by default**: `DISABLED` writes byte-for-byte the frames WeftDB has
+/// always written. Enable per-deployment with `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` — the
 /// ceiling on how much larger the transposed value block may be than the size-selected codec
 /// (`1.0` = only when free; `1.05` = up to 5% larger). A column where a *different* codec
 /// family won the size race (FOR on a clustered column) is refused rather than bloated, the
@@ -154,13 +154,13 @@ impl TransposedPolicy {
 	/// frame layout.
 	pub const DISABLED: Self = Self { max_overhead: None };
 
-	/// Read the policy from `DSP_SEGMENT_TRANSPOSED_MAX_OVERHEAD` (absent, unparseable,
+	/// Read the policy from `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` (absent, unparseable,
 	/// non-finite or non-positive → [`DISABLED`](Self::DISABLED)). A value **below 1.0 is
 	/// meaningful**: it adopts the transposed layout only where it is also a strict size win
-	/// (see [`ColumnEncoding::transposed_overhead`](dsp_physical_type::ColumnEncoding::transposed_overhead)).
+	/// (see [`ColumnEncoding::transposed_overhead`](weft_physical_type::ColumnEncoding::transposed_overhead)).
 	#[must_use]
 	pub fn from_env() -> Self {
-		Self { max_overhead: std::env::var("DSP_SEGMENT_TRANSPOSED_MAX_OVERHEAD").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|r| r.is_finite() && *r > 0.0) }
+		Self { max_overhead: std::env::var("WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|r| r.is_finite() && *r > 0.0) }
 	}
 }
 
@@ -186,9 +186,9 @@ const fn instant_from_epoch(epoch: i64, unit: TimeUnit) -> Option<DateTime<Utc>>
 /// no store state and the whole call is `spawn_blocking`-safe.
 fn segment_partial(descriptor: &SegmentDescriptor, bytes: &[u8], start: i64, end: i64, unit: TimeUnit, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Option<PartialReduction>> {
 	let (ts, vs) = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION {
-		dsp_physical_type::dspseg::read_paged_segment_range(bytes, start, end).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?
+		weft_physical_type::weftseg::read_paged_segment_range(bytes, start, end).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?
 	} else {
-		dsp_physical_type::dspseg::read_segment_range(bytes, start, end).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?
+		weft_physical_type::weftseg::read_segment_range(bytes, start, end).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?
 	};
 	// Null rows carry no value to reduce; present rows lift to absolute instants.
 	let mut points: Vec<Point> = Vec::with_capacity(ts.len());
@@ -202,7 +202,7 @@ fn segment_partial(descriptor: &SegmentDescriptor, bytes: &[u8], start: i64, end
 	if points.is_empty() {
 		return Ok(None);
 	}
-	let partial = dsp_reduce::reduce_partial(&points, resolution, None, None, aggregations).map_err(|e| anyhow::anyhow!("reducing segment {}: {e}", descriptor.path))?;
+	let partial = weft_reduce::reduce_partial(&points, resolution, None, None, aggregations).map_err(|e| anyhow::anyhow!("reducing segment {}: {e}", descriptor.path))?;
 	Ok(Some(partial))
 }
 
@@ -243,7 +243,7 @@ pub struct SegmentStore {
 	/// The database namespace this store's aspect schemas are declared under.
 	database: String,
 	/// The subject namespace this store's aspect schemas are declared under. A store
-	/// is scoped to one subject, so its flat aspect keys (which name the `.dspseg`
+	/// is scoped to one subject, so its flat aspect keys (which name the `.weftseg`
 	/// files and index rows) are unique within it.
 	subject: String,
 }
@@ -420,7 +420,7 @@ impl SegmentStore {
 	/// into `dest_dir`, via Turso's `VACUUM INTO` (roadmap **Phase 7.4**). Each copy is
 	/// reopened and verified to match its source table-for-table before the call returns.
 	///
-	/// The `.dspseg` measurement frames under `segments/` are **not** part of this backup
+	/// The `.weftseg` measurement frames under `segments/` are **not** part of this backup
 	/// — this is the control-plane (catalog/index/metadata) snapshot only, per the storage
 	/// boundary (hard-constraint #3). `dest_dir` is created if absent; each destination
 	/// file must not already exist (`VACUUM INTO` needs a fresh file), so back up into a
@@ -527,18 +527,18 @@ impl SegmentStore {
 		self.seal_paged(aspect, &schema, timestamps, values, rows_per_page).await
 	}
 
-	/// Seal a dense `(timestamp, value)` batch into a `.dspseg` file under `aspect`'s
+	/// Seal a dense `(timestamp, value)` batch into a `.weftseg` file under `aspect`'s
 	/// declared `schema` and record it in the index, returning the descriptor.
 	///
 	/// The batch is encoded under exactly the schema's declared
-	/// [`PhysicalType`](dsp_physical_type::PhysicalType): an unrepresentable value or
+	/// [`PhysicalType`](weft_physical_type::PhysicalType): an unrepresentable value or
 	/// one whose error exceeds the schema tolerance fails the seal rather than
 	/// downcasting silently (hard constraint #4). The segment claims the next
 	/// monotonic id for the aspect.
 	///
 	/// # Errors
 	///
-	/// Propagates a [`dsp_physical_type::SealError`] (length mismatch, unrepresentable
+	/// Propagates a [`weft_physical_type::SealError`] (length mismatch, unrepresentable
 	/// value, tolerance exceeded), a filesystem write error, or a libSQL index
 	/// failure.
 	pub async fn seal(&self, aspect: &str, schema: &AspectSchema, timestamps: &[i64], values: &[BigDecimal]) -> Result<SegmentDescriptor> {
@@ -547,7 +547,7 @@ impl SegmentStore {
 	}
 
 	/// Seal a **nullable** batch (a dense timestamp column and a `&[Option<BigDecimal>]`
-	/// value column) into a `.dspseg` file and record it — the quality-column seal.
+	/// value column) into a `.weftseg` file and record it — the quality-column seal.
 	///
 	/// Present values are encoded densely under the declared encoding; `None` rows
 	/// become cleared bits in the segment's quality mask. Enforcement mirrors
@@ -561,7 +561,7 @@ impl SegmentStore {
 		self.persist(aspect, &segment).await
 	}
 
-	/// Seal a dense batch into a **paged** `.dspseg` segment (intra-segment page
+	/// Seal a dense batch into a **paged** `.weftseg` segment (intra-segment page
 	/// subdivision) and record it. Rows are partitioned into pages of `rows_per_page`,
 	/// each independently encoded with its own min/max stats, so a later
 	/// [`read_time_range`](SegmentStore::read_time_range) skips pages *within* the
@@ -569,14 +569,14 @@ impl SegmentStore {
 	///
 	/// # Errors
 	///
-	/// As [`seal`](SegmentStore::seal), plus a [`dsp_physical_type::SealError::EmptyPageSize`]
+	/// As [`seal`](SegmentStore::seal), plus a [`weft_physical_type::SealError::EmptyPageSize`]
 	/// if `rows_per_page` is zero.
 	pub async fn seal_paged(&self, aspect: &str, schema: &AspectSchema, timestamps: &[i64], values: &[BigDecimal], rows_per_page: usize) -> Result<SegmentDescriptor> {
 		let segment = schema.seal_paged(timestamps, values, rows_per_page).map_err(|e| anyhow::anyhow!("paged seal failed: {e}"))?;
 		self.persist_paged(aspect, &segment).await
 	}
 
-	/// Seal a **nullable** batch into a paged `.dspseg` segment and record it — the
+	/// Seal a **nullable** batch into a paged `.weftseg` segment and record it — the
 	/// quality-column paged seal.
 	///
 	/// # Errors
@@ -637,19 +637,19 @@ impl SegmentStore {
 
 	/// The on-disk path a freshly sealed segment of the given `aspect`/`id` takes.
 	fn segment_path(&self, aspect: &str, id: u64) -> PathBuf {
-		self.root.join("segments").join(format!("{aspect}-{id}.dspseg"))
+		self.root.join("segments").join(format!("{aspect}-{id}.weftseg"))
 	}
 
 	/// The on-disk path of the partial-reduction sidecar beside an `aspect`/`id` segment
-	/// (`{aspect}-{id}.dspart`, alongside the `.dspseg`).
+	/// (`{aspect}-{id}.weftpart`, alongside the `.weftseg`).
 	fn sidecar_path(&self, aspect: &str, id: u64) -> PathBuf {
-		self.root.join("segments").join(format!("{aspect}-{id}.dspart"))
+		self.root.join("segments").join(format!("{aspect}-{id}.weftpart"))
 	}
 
 	/// Materialize a per-segment partial-reduction sidecar for a just-sealed segment, when
 	/// the [`PartialSidecarPolicy`] calls for one. Decodes the segment's rows, folds the
 	/// present ones into a [`PartialReduction`] at `base` over [`SIDECAR_AGGREGATIONS`], and
-	/// writes the `.dspart` frame beside the `.dspseg`. A no-op (returns `Ok(())`) when the
+	/// writes the `.weftpart` frame beside the `.weftseg`. A no-op (returns `Ok(())`) when the
 	/// policy is disabled/too-small, the segment has no declared time unit, or it holds no
 	/// present rows.
 	///
@@ -667,7 +667,7 @@ impl SegmentStore {
 		if points.is_empty() {
 			return Ok(());
 		}
-		let partial = dsp_reduce::reduce_partial(&points, base, None, None, &SIDECAR_AGGREGATIONS).map_err(|e| anyhow::anyhow!("reducing segment {} for its partial sidecar: {e}", descriptor.path))?;
+		let partial = weft_reduce::reduce_partial(&points, base, None, None, &SIDECAR_AGGREGATIONS).map_err(|e| anyhow::anyhow!("reducing segment {} for its partial sidecar: {e}", descriptor.path))?;
 		// Materialize the coarser rollup tiers the policy declares (each re-keyed from the
 		// tier below), so a coarse downsample folds a coarse tier rather than the whole base.
 		let sidecar = PartialSidecar::materialize(base, descriptor, partial, &self.partials.tiers()).map_err(|e| anyhow::anyhow!("building rollup tiers for segment {}: {e}", descriptor.path))?;
@@ -701,7 +701,7 @@ impl SegmentStore {
 
 	/// Delete the partial sidecar for `aspect`/`id`, if one exists. Best-effort by intent —
 	/// a missing sidecar is success, since the caller's aim is only that no stale/orphaned
-	/// `.dspart` is left behind.
+	/// `.weftpart` is left behind.
 	///
 	/// # Errors
 	///
@@ -737,14 +737,14 @@ impl SegmentStore {
 	/// `[start, end]`, **opening only the segment files that overlap it**.
 	///
 	/// The index is pruned by time first (a SQL `WHERE` — no file touched for a
-	/// disjoint segment); only the surviving descriptors' `.dspseg` files are opened,
+	/// disjoint segment); only the surviving descriptors' `.weftseg` files are opened,
 	/// decoded, and filtered to the window. Returns parallel `(timestamps, values)`
 	/// vectors with `None` at every null row, in segment-seal then in-segment order.
 	///
 	/// # Errors
 	///
 	/// Propagates a libSQL prune failure, a filesystem read error, or a
-	/// [`dsp_physical_type::dspseg::DspSegError`] for a corrupt/unreadable `.dspseg`.
+	/// [`weft_physical_type::weftseg::WeftSegError`] for a corrupt/unreadable `.weftseg`.
 	pub async fn read_time_range(&self, aspect: &str, start: i64, end: i64) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>)> {
 		let descriptors = self.index.prune_by_time(aspect, start, end).await?;
 		let mut timestamps = Vec::new();
@@ -758,9 +758,9 @@ impl SegmentStore {
 			// pages disjoint from the window — instead of the whole segment; any other shape falls
 			// back to a full decode. Already filtered to `[start, end]`.
 			let (ts, vs) = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION {
-				dsp_physical_type::dspseg::read_paged_segment_range(&bytes, start, end).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?
+				weft_physical_type::weftseg::read_paged_segment_range(&bytes, start, end).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?
 			} else {
-				dsp_physical_type::dspseg::read_segment_range(&bytes, start, end).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?
+				weft_physical_type::weftseg::read_segment_range(&bytes, start, end).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?
 			};
 			for (t, v) in ts.into_iter().zip(vs) {
 				if start <= t && t <= end {
@@ -775,7 +775,7 @@ impl SegmentStore {
 	/// **Cross-segment downsample** — reduce `aspect`'s `[start, end]` rows into
 	/// grid-aligned buckets **without ever materializing the range**.
 	///
-	/// The distributed shape of [`dsp_reduce::reduce`]: the index is pruned by time, then
+	/// The distributed shape of [`weft_reduce::reduce`]: the index is pruned by time, then
 	/// each surviving segment is read, windowed, and folded into its own
 	/// [`PartialReduction`]; the partials are merged and finished once. Only one segment's
 	/// rows are in memory at a time, so a range far larger than RAM still reduces — and
@@ -870,11 +870,11 @@ impl SegmentStore {
 	///
 	/// The index is pruned by time first — a point lookup is
 	/// [`prune_by_time`](SegmentIndexStore::prune_by_time) with `start == end == t`,
-	/// so only the `.dspseg` files whose `[min_ts, max_ts]` spans `t` are opened. Each
+	/// so only the `.weftseg` files whose `[min_ts, max_ts]` spans `t` are opened. Each
 	/// opened segment resolves the instant with its own persisted per-segment order
 	/// signal: a `time_sorted` segment binary-searches the timestamp column, an
 	/// out-of-order one linear-scans it (see
-	/// [`Segment::value_at`](dsp_physical_type::Segment::value_at)). Candidates are
+	/// [`Segment::value_at`](weft_physical_type::Segment::value_at)). Candidates are
 	/// pruned in seal-id order, so when overlapping segments each carry a present
 	/// value at `t` the most recently sealed one wins (last-writer-wins) — the natural
 	/// read-your-writes answer once out-of-order reconciliation (Phase 4.6) can leave
@@ -883,7 +883,7 @@ impl SegmentStore {
 	/// # Errors
 	///
 	/// Propagates a libSQL prune failure, a filesystem read error, or a
-	/// [`dsp_physical_type::dspseg::DspSegError`] for a corrupt/unreadable `.dspseg`.
+	/// [`weft_physical_type::weftseg::WeftSegError`] for a corrupt/unreadable `.weftseg`.
 	pub async fn read_point(&self, aspect: &str, t: i64) -> Result<Option<BigDecimal>> {
 		let descriptors = self.index.prune_by_time(aspect, t, t).await?;
 		let mut found = None;
@@ -893,9 +893,9 @@ impl SegmentStore {
 			// lookup does not touch, unpacking only the one block covering `t` on a per-block codec
 			// (roadmap Phase 4/6). Equal to `…read_from(&bytes)?.value_at(t)` for every frame.
 			let hit = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION {
-				dsp_physical_type::dspseg::read_paged_segment_point(&bytes, t).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?
+				weft_physical_type::weftseg::read_paged_segment_point(&bytes, t).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?
 			} else {
-				dsp_physical_type::dspseg::read_segment_point(&bytes, t).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?
+				weft_physical_type::weftseg::read_segment_point(&bytes, t).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?
 			};
 			if hit.is_some() {
 				found = hit;
@@ -910,8 +910,8 @@ impl SegmentStore {
 	/// The batch analogue of [`read_point`](SegmentStore::read_point): the index is pruned
 	/// **once** by the batch's whole `[min(ts), max(ts)]` span, and each surviving segment is
 	/// opened **once** and its timestamp column decoded **once** for the whole batch (via the
-	/// streaming [`read_segment_points`](dsp_physical_type::dspseg::read_segment_points) /
-	/// [`read_paged_segment_points`](dsp_physical_type::dspseg::read_paged_segment_points)), so
+	/// streaming [`read_segment_points`](weft_physical_type::weftseg::read_segment_points) /
+	/// [`read_paged_segment_points`](weft_physical_type::weftseg::read_paged_segment_points)), so
 	/// looking up `N` instants that share segments pays one file read + one timestamp decode per
 	/// segment rather than `N`. As with `read_point`, candidates are merged in seal-id order so
 	/// the most recently sealed present value wins per instant (last-writer-wins). An empty `ts`
@@ -920,7 +920,7 @@ impl SegmentStore {
 	/// # Errors
 	///
 	/// Propagates a libSQL prune failure, a filesystem read error, or a
-	/// [`dsp_physical_type::dspseg::DspSegError`] for a corrupt/unreadable `.dspseg`.
+	/// [`weft_physical_type::weftseg::WeftSegError`] for a corrupt/unreadable `.weftseg`.
 	pub async fn read_points(&self, aspect: &str, ts: &[i64]) -> Result<Vec<Option<BigDecimal>>> {
 		if ts.is_empty() {
 			return Ok(Vec::new());
@@ -932,9 +932,9 @@ impl SegmentStore {
 		for descriptor in &descriptors {
 			let bytes = tokio::fs::read(&descriptor.path).await.with_context(|| format!("reading segment {}", descriptor.path))?;
 			let hits = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION {
-				dsp_physical_type::dspseg::read_paged_segment_points(&bytes, ts).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?
+				weft_physical_type::weftseg::read_paged_segment_points(&bytes, ts).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?
 			} else {
-				dsp_physical_type::dspseg::read_segment_points(&bytes, ts).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?
+				weft_physical_type::weftseg::read_segment_points(&bytes, ts).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?
 			};
 			// Later (higher seal-id) segments override earlier ones per instant — last-writer-wins.
 			for (slot, hit) in found.iter_mut().zip(hits) {
@@ -1014,7 +1014,7 @@ impl SegmentStore {
 		Ok(true)
 	}
 
-	/// Re-seal a nullable `(timestamps, values)` batch into the `.dspseg` file for
+	/// Re-seal a nullable `(timestamps, values)` batch into the `.weftseg` file for
 	/// `aspect`/`id`, in the frame kind selected by `rows_per_page` (`Some` → paged,
 	/// `None` → single-block), recording the new descriptor in the control-plane index.
 	///
@@ -1048,7 +1048,7 @@ impl SegmentStore {
 	/// Partitions segment `id` of `aspect` at `boundary` into a **prefix** (rows with
 	/// timestamp strictly `< boundary`, kept at the original `id`) and a **suffix**
 	/// (rows at or after `boundary`, moved to a freshly-allocated segment id), following
-	/// the [`split_index`](dsp_physical_type::split_index) partition point. Because the
+	/// the [`split_index`](weft_physical_type::split_index) partition point. Because the
 	/// input is time-sorted, the prefix's every timestamp is `< boundary ≤` the suffix's
 	/// every timestamp, so the two results are internally sorted **and disjoint in time**
 	/// — the split adds no cross-segment overlap, and a point/range read still opens
@@ -1058,7 +1058,7 @@ impl SegmentStore {
 	/// This is the primitive `QuestDB`'s partition split is built on: once a large cold
 	/// prefix is carved into its own segment, later late-data merges touch only the hot
 	/// suffix and never rewrite the cold prefix again, bounding write amplification over
-	/// the segment's lifetime. Wiring [`SplitPolicy::decide`](dsp_physical_type::SplitPolicy)
+	/// the segment's lifetime. Wiring [`SplitPolicy::decide`](weft_physical_type::SplitPolicy)
 	/// into [`reconcile_overlaps`](SegmentStore::reconcile_overlaps) to *choose* a split
 	/// over a full rewrite is the next slice; this slice ships the mechanism it calls.
 	///
@@ -1145,7 +1145,7 @@ impl SegmentStore {
 	/// pass keys on, modeled on the QuestDB-style split-count squash policy — that
 	/// engine does not rewrite on every late row; it accumulates split partitions and squashes only
 	/// once their number crosses `cairo.o3.last.partition.max.splits` (default 20). The
-	/// `unsorted_segments` order-health count is DSP's analogue: below the threshold the
+	/// `unsorted_segments` order-health count is WeftDB's analogue: below the threshold the
 	/// backlog is cheap enough to answer with a per-segment linear scan, so the write
 	/// amplification of a rewrite is not yet worth paying; at or above it the read cost
 	/// dominates and a pass is triggered. *(src: automatic squash past a split
@@ -1296,7 +1296,7 @@ impl SegmentStore {
 	/// internally-sorted segments whose windows intersect. Each connected component of
 	/// overlapping segments (transitive time overlap) is merged into one segment at the
 	/// component's **lowest id** and the other members are dropped (index row + file),
-	/// so afterwards [`SegmentIndex::overlapping_count`](dsp_physical_type::SegmentIndex::overlapping_count)
+	/// so afterwards [`SegmentIndex::overlapping_count`](weft_physical_type::SegmentIndex::overlapping_count)
 	/// is zero and a point/range read over the merged window opens a single segment.
 	///
 	/// **Merge semantics — newer wins (upsert).** Members are folded in ascending seal
@@ -1348,7 +1348,7 @@ impl SegmentStore {
 	/// floor and outweighs the hot suffix ([`SplitPolicy::decide`] → [`Split`](SplitDecision::Split)),
 	/// the component is laid out as **two** segments — the cold prefix re-sealed at the
 	/// lowest id and the merged hot suffix at a fresh id — instead of one. The two are
-	/// disjoint in time (prefix < boundary ≤ suffix), so [`overlapping_count`](dsp_physical_type::SegmentIndex::overlapping_count)
+	/// disjoint in time (prefix < boundary ≤ suffix), so [`overlapping_count`](weft_physical_type::SegmentIndex::overlapping_count)
 	/// still lands at zero, and a **later** late arrival that re-enters only the hot
 	/// window forms an overlap component with the suffix alone: the cold prefix is never
 	/// pulled back in and never rewritten again, bounding write amplification over the
@@ -1800,7 +1800,7 @@ impl SegmentStore {
 	///
 	/// The value column has no SQL ordering (the `BigDecimal` bounds are stored as
 	/// text), so the pruning runs through the resident
-	/// [`SegmentIndex`](dsp_physical_type::SegmentIndex): it is loaded from the
+	/// [`SegmentIndex`](weft_physical_type::SegmentIndex): it is loaded from the
 	/// control plane and pruned by value, and only the surviving descriptors' files
 	/// are opened. Within each opened segment the rows are filtered to those whose
 	/// value is present and in `[lo, hi]`. Returns parallel `(timestamps, values)`
@@ -1809,7 +1809,7 @@ impl SegmentStore {
 	/// # Errors
 	///
 	/// Propagates a libSQL read failure, a filesystem read error, or a
-	/// [`dsp_physical_type::dspseg::DspSegError`] for a corrupt/unreadable `.dspseg`.
+	/// [`weft_physical_type::weftseg::WeftSegError`] for a corrupt/unreadable `.weftseg`.
 	pub async fn read_value_range(&self, aspect: &str, lo: &BigDecimal, hi: &BigDecimal) -> Result<(Vec<i64>, Vec<BigDecimal>)> {
 		let index = self.index.load_index(aspect).await?;
 		let mut timestamps = Vec::new();
@@ -1854,9 +1854,9 @@ impl SegmentStore {
 	/// (priority #1 in the commercial thesis) measured over the segments actually on
 	/// disk, plus the segment/row counts and the covered time span.
 	///
-	/// Computed from the resident [`SegmentIndex`](dsp_physical_type::SegmentIndex)
+	/// Computed from the resident [`SegmentIndex`](weft_physical_type::SegmentIndex)
 	/// (the descriptors' recorded framed byte lengths and row counts), so it reflects
-	/// the realized `.dspseg` files including their header/index/checksum overhead,
+	/// the realized `.weftseg` files including their header/index/checksum overhead,
 	/// not an advisory column estimate. No segment file is opened.
 	///
 	/// # Errors
@@ -1962,7 +1962,7 @@ impl SegmentStore {
 	///
 	/// Unlike [`store_stats`](SegmentStore::store_stats) — which reads O(1)
 	/// per-aspect rollups — a cross-segment property has no incremental fold, so this
-	/// **scans each aspect's segment index** ([`SegmentIndex::overlapping_count`](dsp_physical_type::SegmentIndex::overlapping_count))
+	/// **scans each aspect's segment index** ([`SegmentIndex::overlapping_count`](weft_physical_type::SegmentIndex::overlapping_count))
 	/// and sums the results. It is a deliberately separate call so `store_stats` keeps
 	/// its no-scan guarantee; a caller pays the scan only when it wants this signal.
 	/// Overlaps are always within an aspect (segments of different aspects never share
@@ -2118,7 +2118,7 @@ pub struct StoreStorageStats {
 	pub total_rows: u64,
 	/// Total null rows across every aspect.
 	pub total_nulls: u64,
-	/// Total realized on-disk bytes across every aspect's `.dspseg` frames.
+	/// Total realized on-disk bytes across every aspect's `.weftseg` frames.
 	pub total_bytes: u64,
 	/// Total out-of-order segments across every aspect — the store-wide order-health
 	/// signal (see [`AspectStorageStats::unsorted_segments`]). Zero when every sealed
@@ -2153,7 +2153,7 @@ pub struct AspectStorageStats {
 	pub segment_count: usize,
 	/// Total rows (present and null) across every segment.
 	pub total_rows: u64,
-	/// Total realized on-disk bytes across every `.dspseg` frame.
+	/// Total realized on-disk bytes across every `.weftseg` frame.
 	pub total_bytes: u64,
 	/// The north-star cost term: realized framed bytes per stored point. Zero when
 	/// the aspect holds no rows.
@@ -2165,7 +2165,7 @@ pub struct AspectStorageStats {
 	/// non-decreasing — an order-health signal (an out-of-order segment forces a
 	/// linear scan on a point lookup; roadmap Phase 4.6). Zero when every segment
 	/// admits ordered access, which a `require_sorted` ingest keeps true by
-	/// construction. See [`SegmentIndex::unsorted_count`](dsp_physical_type::SegmentIndex::unsorted_count).
+	/// construction. See [`SegmentIndex::unsorted_count`](weft_physical_type::SegmentIndex::unsorted_count).
 	pub unsorted_segments: usize,
 	/// The number of sealed segments whose time span **overlaps at least one other
 	/// segment's** — the *cross-segment* order-health signal (roadmap Phase 4.6),
@@ -2173,7 +2173,7 @@ pub struct AspectStorageStats {
 	/// (which counts *intra*-segment disorder). A non-zero count means late data
 	/// re-entered an already-covered window, so a point lookup may have to consult
 	/// more than one segment; these are the cross-segment reconciliation candidates.
-	/// See [`SegmentIndex::overlapping_count`](dsp_physical_type::SegmentIndex::overlapping_count).
+	/// See [`SegmentIndex::overlapping_count`](weft_physical_type::SegmentIndex::overlapping_count).
 	pub overlapping_segments: usize,
 }
 
@@ -2181,7 +2181,7 @@ pub struct AspectStorageStats {
 mod tests {
 	use std::str::FromStr;
 
-	use dsp_physical_type::{timestamp::TimeUnit, PhysicalType};
+	use weft_physical_type::{timestamp::TimeUnit, PhysicalType};
 	use tempfile::TempDir;
 
 	use super::*;
@@ -2581,7 +2581,7 @@ mod tests {
 	/// showing a downsample still serves from the sidecar.
 	#[tokio::test]
 	async fn reconcile_regenerates_the_partial_sidecar() {
-		use dsp_reduce::{reduce, Aggregation};
+		use weft_reduce::{reduce, Aggregation};
 		use splimes::{Point, Resolution};
 
 		let dir = TempDir::new().expect("tempdir");
@@ -2686,8 +2686,8 @@ mod tests {
 		let null_hit = store.read_point("a", 30).await.expect("reads");
 		let suffix_hit = store.read_point("a", 40).await.expect("reads");
 		// Both halves keep the paged frame version (they re-seal at the source page height).
-		let prefix_bytes = std::fs::read(dir.path().join("segments").join(format!("a-{}.dspseg", d.id))).expect("prefix file");
-		let suffix_bytes = std::fs::read(dir.path().join("segments").join(format!("a-{suffix_id}.dspseg"))).expect("suffix file");
+		let prefix_bytes = std::fs::read(dir.path().join("segments").join(format!("a-{}.weftseg", d.id))).expect("prefix file");
+		let suffix_bytes = std::fs::read(dir.path().join("segments").join(format!("a-{suffix_id}.weftseg"))).expect("suffix file");
 		drop(store);
 		assert_eq!(stats.segment_count, 2);
 		assert_eq!(stats.total_rows, 8, "the null row is preserved across the split");
@@ -2945,7 +2945,7 @@ mod tests {
 		// First reconcile splits: cold prefix [0..80] stays at id 0, hot suffix gets a new id.
 		store.reconcile_overlaps_with_policy("a", SplitPolicy::new(1)).await.expect("splits");
 		// The cold-prefix segment on disk after the split (id 0).
-		let cold_path = dir.path().join("segments").join("a-0.dspseg");
+		let cold_path = dir.path().join("segments").join("a-0.weftseg");
 		let cold_before = std::fs::read(&cold_path).expect("cold prefix file");
 		// A second late arrival re-enters only the hot window [90,110]; it must NOT pull
 		// the cold prefix back in.
@@ -3706,7 +3706,7 @@ mod tests {
 	/// reachable from a deployment, so this is the test that it is actually wired up.
 	#[tokio::test]
 	async fn transposed_seal_reads_identically_and_only_changes_the_bytes() {
-		use dsp_physical_type::frame_value_codec;
+		use weft_physical_type::frame_value_codec;
 
 		// A zero-straddling small-magnitude two-decimal column spanning several 1024-lane
 		// tiles: the bit-pack family wins the size race, so the transposed layout is admitted
@@ -3741,13 +3741,13 @@ mod tests {
 	}
 
 	/// End-to-end through the real store: an enabled partial-sidecar policy writes a
-	/// `.dspart` beside each sealed `.dspseg`, the sidecar matches the exact segment bytes,
+	/// `.weftpart` beside each sealed `.weftseg`, the sidecar matches the exact segment bytes,
 	/// and its stored partial finishes to the same buckets a fresh reduction of the
 	/// segment's rows would — the invariant the cross-segment downsample will lean on. An
 	/// unconfigured store writes no sidecar.
 	#[tokio::test]
 	async fn seal_writes_a_matching_partial_sidecar_when_configured() {
-		use dsp_reduce::reduce_partial;
+		use weft_reduce::reduce_partial;
 		use splimes::{Point, Resolution};
 
 		// The shared schema is SECONDS; one sample a minute so the minute-base sidecar has
@@ -3789,7 +3789,7 @@ mod tests {
 	/// one pass — for every reduction, across many segments, including the sketch.
 	#[tokio::test]
 	async fn downsample_range_equals_a_single_pass_over_the_whole_range() {
-		use dsp_reduce::{reduce, Aggregation};
+		use weft_reduce::{reduce, Aggregation};
 		use splimes::{Point, Resolution};
 
 		let dir = TempDir::new().expect("tempdir");
@@ -3837,14 +3837,14 @@ mod tests {
 
 	/// The sidecar **consumption** path: with a partial sidecar written per segment at the
 	/// query's resolution, a full-history downsample of materializable reductions merges the
-	/// stored partials instead of decoding — proven by **deleting every `.dspseg`** and
+	/// stored partials instead of decoding — proven by **deleting every `.weftseg`** and
 	/// showing the answer is unchanged (the value column was never read). Fallbacks stay
 	/// correct: a non-materializable reduction (exact `p99`), a resolution other than the
 	/// sidecar base, and a window that cuts inside a segment all decode, so they break once
 	/// the frames are gone.
 	#[tokio::test]
 	async fn downsample_range_serves_materializable_queries_from_sidecars() {
-		use dsp_reduce::{reduce, Aggregation};
+		use weft_reduce::{reduce, Aggregation};
 		use splimes::{Point, Resolution};
 
 		let dir = TempDir::new().expect("tempdir");
@@ -3867,10 +3867,10 @@ mod tests {
 		// Baseline while the frames still exist (multi + single-segment sidecar paths).
 		assert_eq!(store.downsample_range("temp", i64::MIN, i64::MAX, Resolution::Hours, &aggs).await.expect("downsamples"), expected, "the sidecar-served answer matches the single pass while frames exist");
 
-		// Delete every `.dspseg`: the index (libSQL) still prunes, and a sidecar-served
+		// Delete every `.weftseg`: the index (libSQL) still prunes, and a sidecar-served
 		// downsample never opens a frame, so the answer must be unchanged.
 		for path in &seg_paths {
-			std::fs::remove_file(path).expect("removes the .dspseg frame");
+			std::fs::remove_file(path).expect("removes the .weftseg frame");
 		}
 		let served = store.downsample_range("temp", i64::MIN, i64::MAX, Resolution::Hours, &aggs).await.expect("downsamples from sidecars alone");
 		assert_eq!(served, expected, "with every value-column frame deleted, the sidecars alone reproduce the whole downsample");
@@ -3893,11 +3893,11 @@ mod tests {
 
 	/// The **re-bucketing** path: a sidecar materialized at a fine base (MINUTES) answers a
 	/// coarser downsample (HOURS) by re-keying its base buckets — again proven by deleting
-	/// every `.dspseg` and showing the coarse answer is unchanged. A resolution FINER than
+	/// every `.weftseg` and showing the coarse answer is unchanged. A resolution FINER than
 	/// the base (seconds) cannot be served and must decode.
 	#[tokio::test]
 	async fn downsample_range_rebuckets_a_fine_base_to_a_coarser_resolution() {
-		use dsp_reduce::{reduce, Aggregation};
+		use weft_reduce::{reduce, Aggregation};
 		use splimes::{Point, Resolution};
 
 		let dir = TempDir::new().expect("tempdir");
@@ -3935,7 +3935,7 @@ mod tests {
 	/// rather than inferred from the multi-segment equality test above.
 	#[tokio::test]
 	async fn downsample_range_single_segment_equals_a_single_pass() {
-		use dsp_reduce::{reduce, Aggregation};
+		use weft_reduce::{reduce, Aggregation};
 		use splimes::{Point, Resolution};
 
 		let dir = TempDir::new().expect("tempdir");

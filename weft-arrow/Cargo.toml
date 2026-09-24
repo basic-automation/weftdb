@@ -1,0 +1,18 @@
+[package]
+name = "weft-arrow"
+version = "0.1.0"
+edition = "2021"
+description = "Vendor-neutral Apache Arrow interchange for WeftDB's typed columnar segments (roadmap Phase 4.5). Converts a sealed weft-physical-type Segment to an Arrow RecordBatch and back, keeping the heavy arrow dependency out of the core hot-path crates. Apache Arrow is an open in-memory interchange standard, not a storage backend (hard constraint #3 untouched) and not a vendor connector (hard constraint #2 untouched)."
+
+[lib]
+name = "weft_arrow"
+path = "src/lib.rs"
+
+[dependencies]
+weft-physical-type = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-ipc = { workspace = true }
+parquet = { workspace = true }
+bytes = { workspace = true }
+bigdecimal = { workspace = true }

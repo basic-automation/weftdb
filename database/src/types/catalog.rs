@@ -23,7 +23,7 @@
 //! span the full `catalog.db` hierarchy the roadmap layout names.
 //!
 //! Boundary (hard constraint #3): this is **control-plane** metadata only — names and
-//! structure, never a measurement. The measurement bytes live in DSP's own `.dspseg`
+//! structure, never a measurement. The measurement bytes live in WeftDB's own `.weftseg`
 //! segments. It uses the same MVCC write path the rest of the control plane does
 //! (`BEGIN CONCURRENT` for writes).
 

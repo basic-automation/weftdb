@@ -5,11 +5,11 @@
 //! ## What this measures, and why it exists
 //!
 //! The roadmap's paired question for this path was whether reducing the pruned
-//! segments *concurrently* carries the `dsp-bench --ds-parallel` chunked-partial win
+//! segments *concurrently* carries the `weft-bench --ds-parallel` chunked-partial win
 //! (measured 14.7x there) over to **stored** data — with the standing caveat that the
 //! per-segment file read may dominate, so the answer had to be measured rather than
 //! assumed. This bench is that measurement: it seals a fixed corpus into `segments`
-//! separate `.dspseg` files and times the whole `downsample_range` call (index prune →
+//! separate `.weftseg` files and times the whole `downsample_range` call (index prune →
 //! per-segment read + decode + partial reduce → merge → finish).
 //!
 //! The segment *count* is the swept axis at a fixed total row count, so a run reads
@@ -22,8 +22,8 @@ use std::hint::black_box;
 use bigdecimal::BigDecimal;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use database::{PartialSidecarPolicy, SegmentStore};
-use dsp_physical_type::{AspectSchema, PhysicalType, TimeUnit};
-use dsp_reduce::Aggregation;
+use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
+use weft_reduce::Aggregation;
 use splimes::Resolution;
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
@@ -34,7 +34,7 @@ const TOTAL_ROWS: i64 = 200_000;
 /// One sample a second, so an hour resolution buckets ~3600 rows together.
 const STRIDE_SECS: i64 = 1;
 
-/// Seal `TOTAL_ROWS` rows split evenly into `segments` separate `.dspseg` frames.
+/// Seal `TOTAL_ROWS` rows split evenly into `segments` separate `.weftseg` frames.
 ///
 /// Returns the temp dir (which must outlive the store) and the opened store. The
 /// corpus is identical for every `segments` value — same timestamps, same values —
@@ -88,7 +88,7 @@ fn bench_segment_count(c: &mut Criterion) {
 	// more segments means more file reads + index rows + partial merges but fewer rows to
 	// decode per segment, so beyond some count the fixed per-segment cost dominates and
 	// wall-clock climbs. Where that knee sits bears on a target-segment-size / compaction
-	// policy (DSP already has `squash_aspect`).
+	// policy (WeftDB already has `squash_aspect`).
 	for segments in [1_i64, 4, 16, 64, 128, 256] {
 		// Seal once per segment count — the sweep measures the reduction, not the seal.
 		let dir = TempDir::new().expect("temp dir");
@@ -136,7 +136,7 @@ fn bench_percentiles(c: &mut Criterion) {
 /// instead of decoding every value column. Two identical 16-segment corpora — one sealed
 /// with an HOUR-base sidecar policy, one without — are downsampled at hour resolution over
 /// all history, so the `sidecar` arm never opens a value column (just reads + merges the
-/// small `.dspart` partials) while the `decode` arm is the shipped read-decode-reduce path.
+/// small `.weftpart` partials) while the `decode` arm is the shipped read-decode-reduce path.
 /// The reduction set is materializable (the six streaming reductions + `sketch_p99`), which
 /// is the precondition for the sidecar substitution.
 fn bench_sidecar_vs_decode(c: &mut Criterion) {

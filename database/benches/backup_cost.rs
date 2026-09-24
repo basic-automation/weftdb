@@ -1,6 +1,6 @@
 //! Benchmark the **control-plane backup tick** (`SegmentStore::backup_control_plane_with_verify`)
 //! — the four `VACUUM INTO` snapshots plus their verification that the backup daemon
-//! runs every `DSP_BACKUP_INTERVAL_SECS` (roadmap Phase 7.4).
+//! runs every `WEFT_BACKUP_INTERVAL_SECS` (roadmap Phase 7.4).
 //!
 //! ## What this measures, and why it exists
 //!
@@ -19,7 +19,7 @@
 //! its own fresh temp dir — `VACUUM INTO` refuses an existing file — so the setup cost of
 //! creating that dir is excluded from the timing by `iter_batched`.
 //!
-//! ## The filesystem is the variable — set `DSP_BENCH_BACKUP_DIR`
+//! ## The filesystem is the variable — set `WEFT_BENCH_BACKUP_DIR`
 //!
 //! **A default run measures the system temp directory, which on a typical Linux box is
 //! `tmpfs` (RAM) and therefore reports the vacuum's CPU cost with no durability cost at
@@ -28,7 +28,7 @@
 //! from pointing this bench at the volume the store actually lives on:
 //!
 //! ```text
-//! DSP_BENCH_BACKUP_DIR=/srv/dsp/benchtmp cargo bench -p database --bench backup_cost
+//! WEFT_BENCH_BACKUP_DIR=/srv/weftdb/benchtmp cargo bench -p database --bench backup_cost
 //! ```
 //!
 //! Both the populated store and the backup destinations are created under that base, so the
@@ -40,14 +40,14 @@ use std::{hint::black_box, path::PathBuf};
 use bigdecimal::BigDecimal;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use database::{SegmentStore, VerifyMode};
-use dsp_physical_type::{AspectSchema, PhysicalType, TimeUnit};
+use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 
-/// The base directory temp stores/backups are created under: `DSP_BENCH_BACKUP_DIR` when
+/// The base directory temp stores/backups are created under: `WEFT_BENCH_BACKUP_DIR` when
 /// set, else the system temp dir (often `tmpfs` — see the module docs).
 fn base_dir() -> Option<PathBuf> {
-	std::env::var_os("DSP_BENCH_BACKUP_DIR").map(PathBuf::from)
+	std::env::var_os("WEFT_BENCH_BACKUP_DIR").map(PathBuf::from)
 }
 
 /// A fresh temp dir under [`base_dir`], creating the base if it does not exist.
@@ -90,7 +90,7 @@ async fn populated_store(dir: &TempDir, aspects: usize) -> SegmentStore {
 /// the rows copied.
 fn bench_backup_tick(c: &mut Criterion) {
 	let rt = Runtime::new().expect("tokio runtime");
-	eprintln!("backup_cost base dir: {} (set DSP_BENCH_BACKUP_DIR to measure a real volume)", base_dir().map_or_else(|| std::env::temp_dir().display().to_string(), |b| b.display().to_string()));
+	eprintln!("backup_cost base dir: {} (set WEFT_BENCH_BACKUP_DIR to measure a real volume)", base_dir().map_or_else(|| std::env::temp_dir().display().to_string(), |b| b.display().to_string()));
 
 	let mut group = c.benchmark_group("backup/control_plane_tick");
 	group.sample_size(10);

@@ -1,7 +1,7 @@
 //! libSQL per-aspect `metadata.db` (roadmap **Phase 4.3**, segment-set rollup).
 //!
 //! The Storage v2 layout the roadmap names has four pieces: `catalog.db`, a per-aspect
-//! `metadata.db`, the `segments/*.dspseg` files, and `segment_index.db`. Three of those
+//! `metadata.db`, the `segments/*.weftseg` files, and `segment_index.db`. Three of those
 //! four already exist: the
 //! [`CatalogStore`](crate::CatalogStore) (databases/subjects), the
 //! [`AspectCatalog`](crate::AspectCatalog) (per-aspect schema), and the
@@ -20,7 +20,7 @@
 //!
 //! Boundary (hard constraint #3): this is **control-plane** metadata only — counts,
 //! byte totals, and min/max bounds *about* an aspect's segments, never a measurement.
-//! The measurement bytes live in the `.dspseg` files DSP owns. The `BigDecimal` value
+//! The measurement bytes live in the `.weftseg` files WeftDB owns. The `BigDecimal` value
 //! bounds round-trip through their plain-text form (hard constraint #4 — no silent
 //! float downcast, even in the rollup). It uses the same MVCC write path the rest of
 //! the control plane does (`BEGIN CONCURRENT`).
@@ -29,7 +29,7 @@ use std::str::FromStr;
 
 use anyhow::{bail, Result};
 use bigdecimal::BigDecimal;
-use dsp_physical_type::{SegmentDescriptor, SegmentIndex};
+use weft_physical_type::{SegmentDescriptor, SegmentIndex};
 use turso::{Builder, Value};
 
 /// The materialized segment-set rollup for one aspect — the aspect-wide summary the
@@ -47,7 +47,7 @@ pub struct AspectMetadata {
 	pub total_rows: u64,
 	/// Total null rows across every segment.
 	pub total_nulls: u64,
-	/// Total realized on-disk bytes across every `.dspseg` frame.
+	/// Total realized on-disk bytes across every `.weftseg` frame.
 	pub total_bytes: u64,
 	/// The number of sealed segments whose timestamps are **not** monotonic
 	/// non-decreasing — the aspect's order-health signal (an out-of-order segment
@@ -371,7 +371,7 @@ impl AspectMetadataStore {
 
 #[cfg(test)]
 mod tests {
-	use dsp_physical_type::{timestamp::TimeUnit, Segment};
+	use weft_physical_type::{timestamp::TimeUnit, Segment};
 
 	use super::*;
 
@@ -385,7 +385,7 @@ mod tests {
 		let vs: Vec<BigDecimal> = (0..10).map(|i| BigDecimal::from(base + i)).collect();
 		let seg = Segment::build(&ts, &vs, TimeUnit::Seconds, &bd("0")).expect("builds");
 		let len = seg.write_to().len() as u64;
-		(SegmentDescriptor::of_segment(0, "s.dspseg", len, &seg), len)
+		(SegmentDescriptor::of_segment(0, "s.weftseg", len, &seg), len)
 	}
 
 	#[tokio::test]
@@ -472,7 +472,7 @@ mod tests {
 		let ts = vec![10_i64, 20, 30, 40];
 		let vs = vec![Some(bd("1.25")), None, Some(bd("3.75")), None];
 		let seg = Segment::build_nullable(&ts, &vs, TimeUnit::Seconds, &bd("0")).expect("builds");
-		let d = SegmentDescriptor::of_segment(0, "n.dspseg", seg.write_to().len() as u64, &seg);
+		let d = SegmentDescriptor::of_segment(0, "n.weftseg", seg.write_to().len() as u64, &seg);
 		let meta = store.record_seal("a", &d).await.expect("records");
 		let got = store.get("a").await.expect("gets");
 		drop(store);
@@ -486,7 +486,7 @@ mod tests {
 	async fn empty_segment_records_no_bounds() {
 		let store = AspectMetadataStore::open_in_memory().await.expect("opens");
 		let empty = Segment::build(&[], &[], TimeUnit::Seconds, &bd("0")).expect("builds");
-		let d = SegmentDescriptor::of_segment(0, "empty.dspseg", empty.write_to().len() as u64, &empty);
+		let d = SegmentDescriptor::of_segment(0, "empty.weftseg", empty.write_to().len() as u64, &empty);
 		let meta = store.record_seal("a", &d).await.expect("records");
 		let got = store.get("a").await.expect("gets");
 		drop(store);

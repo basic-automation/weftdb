@@ -3,7 +3,7 @@
 //!
 //! Per hard-constraint #3, libSQL/Turso is the **control plane** — the catalog,
 //! per-aspect schema, segment index, and metadata rollup DBs. The measurement hot path
-//! lives in `.dspseg` frames, not here. This module gives the control plane an online,
+//! lives in `.weftseg` frames, not here. This module gives the control plane an online,
 //! consistent snapshot primitive so an operator can back it up without stopping ingest.
 //!
 //! [`VACUUM INTO`](https://turso.tech/blog/turso-0.6.0) is **stable in the pinned Turso
@@ -367,7 +367,7 @@ impl RestoreReport {
 /// restore over a live control plane is exactly the disaster a restore path must not make
 /// easy.
 ///
-/// The `.dspseg` measurement frames under `segments/` are **not** part of this (the backup
+/// The `.weftseg` measurement frames under `segments/` are **not** part of this (the backup
 /// is control-plane only, per hard-constraint #3): restoring into a root whose `segments/`
 /// still holds the frames reconstitutes a working store, which is the intended
 /// control-plane-corruption recovery. A restore into an empty root yields a valid but

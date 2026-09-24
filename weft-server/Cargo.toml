@@ -1,0 +1,41 @@
+[package]
+name = "weft-server"
+version = "0.1.0"
+edition = "2021"
+description = "WeftDB server: the benchmark-grade HTTP API surface (Phase 2) — health/readiness, and the ingest/query endpoints Weft-Bench drives WeftDB through."
+
+[lib]
+name = "weft_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "weft-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+bigdecimal = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+database = { path = "../database" }  # control-plane segment store backing the storage query endpoints
+weft-arrow = { workspace = true }  # reconstructed-series -> Arrow IPC / Parquet bytes for the interpolate endpoint (arrow types stay inside weft-arrow)
+weft-arrow-store = { path = "../weft-arrow-store" }  # stored range -> Arrow IPC bytes (keeps the arrow-* tree off the lean core)
+weft-line-protocol = { workspace = true }
+weft-physical-type = { workspace = true }  # AspectSchema / PhysicalType / TimeUnit for the catalog-management write path
+weft-reduce = { workspace = true }  # canonical downsample reduction (Aggregation / reduce / bucket_start)
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+splimes = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }  # per-request engine spans on the compute path (Phase 3 instrumentation)
+tracing-subscriber = { workspace = true }  # RUST_LOG-driven span/event subscriber (env-filter from the workspace dep)
+opentelemetry = { workspace = true }  # OTLP trace export (Phase 3) — env-gated on OTEL_EXPORTER_OTLP_ENDPOINT
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util", "macros"] }
+tempfile = { workspace = true }

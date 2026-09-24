@@ -1,9 +1,15 @@
-# DSP Roadmap
+# WeftDB Roadmap
 
-> **North star.** DSP becomes a commercial product by making **reproducible
+*New here? [`README.md`](README.md) is the place to start — it covers what WeftDB
+does, how to run it, and where it is and isn't a good fit. This file is the
+engineering work queue: what is planned, in progress, done, and parked. It is
+deliberately unpolished and records negative results and dead ends alongside wins,
+because that is what makes it useful to work from.*
+
+> **North star.** WeftDB becomes a commercial product by making **reproducible
 > performance evidence** the center of the roadmap. The governing metric is
 > **dollars per billion interpolated output points at a specified p95 latency
-> target** — it ties DSP's technical differentiator (interpolation-heavy irregular
+> target** — it ties WeftDB's technical differentiator (interpolation-heavy irregular
 > time-series) to buyer value.
 >
 > **Governing rule:** *no major feature advances unless it improves a benchmarked
@@ -15,7 +21,7 @@ Every work item is a `[ ]` (to do) or `[x]` (done) checkbox. Shipped capability 
 *described* in [`README.md`](README.md) (the consumer-facing features document) —
 here it is only ticked. There is no run log: git history and PRs are the record of
 what happened. The strategic spine merges a peer-reviewed commercial/benchmark
-analysis with the feature backlog distilled from DSP's **15 predecessor
+analysis with the feature backlog distilled from WeftDB's **15 predecessor
 repositories** (archived under [`legacy/`](legacy) with full history).
 
 ---
@@ -38,18 +44,18 @@ repositories** (archived under [`legacy/`](legacy) with full history).
 
 ## Commercial thesis & positioning
 
-**The wrong wedge:** "DSP is a faster general-purpose time-series database." Too hard
+**The wrong wedge:** "WeftDB is a faster general-purpose time-series database." Too hard
 to prove early against ClickHouse, InfluxDB 3, QuestDB, TimescaleDB, IoTDB, DuckDB,
 and kdb+.
 
 **The wedge to take:**
 
-> **DSP is an interpolation-native, precision-aware, GPU-accelerated time-series
+> **WeftDB is an interpolation-native, precision-aware, GPU-accelerated time-series
 > engine for irregular high-value data, with public benchmarks proving superior
 > performance on resampling, gap filling, compression-aware historical analysis, and
 > analytical pipelines.**
 
-**Where DSP wins (focus here):** irregular time-series; interpolation-on-read;
+**Where WeftDB wins (focus here):** irregular time-series; interpolation-on-read;
 upsampling/gap filling; high-precision values; GPU spline execution;
 compression-aware historical analysis; event/pattern pipelines that depend on
 reconstructed signal shape.
@@ -66,7 +72,7 @@ InfluxDB for all TSDB workloads"; "GPU makes every query faster"; "arbitrary
 precision with no performance cost"; "commercially ready because the TUI works";
 "AI-native vector TSDB" before real vector/embedding functionality exists.
 
-- [ ] Ship honesty pages: *When DSP beats general TSDBs* · *When DSP is not the
+- [ ] Ship honesty pages: *When WeftDB beats general TSDBs* · *When WeftDB is not the
   right tool* · *Benchmark methodology* · *Interpolation-accuracy methodology* ·
   *GPU tuning & economics* · *Precision & physical value types*.
 
@@ -74,17 +80,17 @@ precision with no performance cost"; "commercially ready because the TUI works";
 
 ## Guiding principles & hard constraints
 
-1. **Benchmark-gated features.** A feature is "done" only when `DSP-Bench` shows a
+1. **Benchmark-gated features.** A feature is "done" only when `Weft-Bench` shows a
    measured, reproducible, correctness-validated outcome.
-2. **Vendor-neutral connectors (hard constraint).** The DSP codebase defines **only**
+2. **Vendor-neutral connectors (hard constraint).** The WeftDB codebase defines **only**
    a vendor-neutral connector abstraction — ideally a small dedicated crate (e.g.
-   `dsp-connector`) holding the `Source`/`Connector` trait + runtime registry. Every
+   `weft-connector`) holding the `Source`/`Connector` trait + runtime registry. Every
    concrete connector (Thorchain, InfluxDB, CSV, …) lives **outside** the core as its
    own crate that depends on the abstraction, never the reverse. No vendor-specific
-   code/types/deps in `splimes`/`database`/`database_orchestration`/`dsp-tui`.
-   Thorchain is *one of many* sources and must not be coupled to DSP.
+   code/types/deps in `splimes`/`database`/`database_orchestration`/`weft-tui`.
+   Thorchain is *one of many* sources and must not be coupled to WeftDB.
 3. **Storage boundary.** **libSQL/Turso is the control plane** — catalog, metadata,
-   config, pipeline state, transactional control. DSP's own **typed columnar
+   config, pipeline state, transactional control. WeftDB's own **typed columnar
    measurement segments** (Storage v2) own the high-volume measurement hot path.
    External databases like InfluxDB are *integration targets* (source and/or sink)
    reached through connectors — **never** replacement backends. Do not reintroduce
@@ -96,7 +102,7 @@ precision with no performance cost"; "commercially ready because the TUI works";
 5. **Port designs, not legacy code.** Legacy crates are edition-2021, `.unwrap()`-heavy,
    often nightly microservices. Reimplement against current async + typed `Error`
    conventions, libSQL, and `splimes`.
-6. **Honesty / anti-Goodhart.** Publish negative results and workloads where DSP
+6. **Honesty / anti-Goodhart.** Publish negative results and workloads where WeftDB
    loses; methodology before numbers; correctness gates every performance number.
 
 ---
@@ -105,7 +111,7 @@ precision with no performance cost"; "commercially ready because the TUI works";
 
 Priority order:
 
-1. **DSP-Bench** — public, reproducible, competitor-facing, customer-runnable.
+1. **Weft-Bench** — public, reproducible, competitor-facing, customer-runnable.
 2. **Benchmark-grade API** — server mode, InfluxDB Line Protocol, REST, Arrow/Parquet, metrics.
 3. **Instrumentation** — full timing breakdown ingest → GPU → serialization.
 4. **Physical type system** — precision semantics with fast physical encodings.
@@ -122,31 +128,31 @@ Priority order:
 
 ### Phase 0 — Benchmark thesis & buyer wedge · *Immediate*
 
-**Acceptance:** you can answer "why choose DSP over InfluxDB/QuestDB/ClickHouse/
+**Acceptance:** you can answer "why choose WeftDB over InfluxDB/QuestDB/ClickHouse/
 TimescaleDB/IoTDB/DuckDB/kdb+?"; 3–5 design partners with interpolation-heavy
 workloads identified; willingness-to-pay hypotheses documented.
 
 - [x] Public performance thesis + first benchmark-claim list *(the [Commercial thesis](#commercial-thesis--positioning) section)*
-- [x] Define what DSP is **not** chasing first
+- [x] Define what WeftDB is **not** chasing first
 - [ ] Identify 3–5 design partners with interpolation-heavy workloads
 - [ ] Document willingness-to-pay hypotheses
 
-### Phase 1 — Build `DSP-Bench` · *Highest priority*
+### Phase 1 — Build `Weft-Bench` · *Highest priority*
 
-A `dsp-bench` workspace that is both an internal engineering suite and a
+A `weft-bench` workspace that is both an internal engineering suite and a
 public/customer-runnable diagnostic. Model it on SEER/TSM-Bench (result storage,
 dashboards, repeatable config, system adapters, workload profiles) — not ad-hoc
 scripts. Implement **TSBS compatibility** (via InfluxDB Line Protocol) for baseline
-comparisons, but make DSP-Bench the primary suite. Target layout: `adapters/`
-(dsp, clickhouse, influxdb3, questdb, timescaledb, iotdb, duckdb, kdb_optional),
+comparisons, but make Weft-Bench the primary suite. Target layout: `adapters/`
+(weft, clickhouse, influxdb3, questdb, timescaledb, iotdb, duckdb, kdb_optional),
 `workloads/` (ingest, online_ingest_query, range_fetch, point_lookup, downsample,
 upsample_interpolate *(flagship)*, gap_fill, compression, compressed_query,
 pattern_pipeline), `datasets/`, `runners/` (local, docker_compose, cloud),
 `reports/` (json, parquet, html, grafana), `dashboards/`, `docs/`.
 
-- [x] `dsp-bench` first-class workspace member (builds + tests green)
+- [x] `weft-bench` first-class workspace member (builds + tests green)
 - [x] First workload profile: `interpolation-heavy-irregular` (seeded, reproducible generator)
-- [x] DSP adapter over the vendor-neutral `SystemAdapter` trait (drives `splimes`)
+- [x] WeftDB adapter over the vendor-neutral `SystemAdapter` trait (drives `splimes`)
 - [x] Portable baselines — linear (fair-protocol class C) + forward-fill (class B)
 - [x] Accuracy scoring vs analytic ground truth (RMSE/MAE/max-error/bias)
 - [x] Shape-selectable synthetic truth (`MultiSine`/`Sawtooth`/`Step`/`DampedSine`)
@@ -158,24 +164,24 @@ pattern_pipeline), `datasets/`, `runners/` (local, docker_compose, cloud),
 - [x] CLI runner — `.lp`/TSBS input or `--synthetic` (seed/points/missingness/jitter/noise/shape knobs); non-zero exit on correctness failure
 - [ ] External-engine adapters — DuckDB first, then ClickHouse, InfluxDB 3, QuestDB, TimescaleDB (+ IoTDB)
 - [ ] Full TSBS-compatible comparison harness (ILP parser shipped; harness pending)
-- [x] **Storage/read/aggregation workloads shipped (2026-07-14)** — `point_lookup` (streaming point read, single/paged/batch, regular closed-form vs irregular), `range_fetch` (windowed range read), `compression` (realized bytes/point + value-column compression ratio + decode throughput), and `downsample` (the full reduction set: min/max/avg/sum/first/last + **p50/p90/p95/p99 percentiles** + **TWA**). Each is a parallel `run_*` runner over the `.dspseg`/`dsp-reduce` hot path with a correctness gate, p50/p95/p99 latency, and a `--point-lookup`/`--range-fetch`/`--compression`/`--downsample` CLI mode; storage workloads take a `rows_per_page` paged-segment path. OHLC is open/high/low/close = first/max/min/last (already covered by the shipped reductions).
+- [x] **Storage/read/aggregation workloads shipped (2026-07-14)** — `point_lookup` (streaming point read, single/paged/batch, regular closed-form vs irregular), `range_fetch` (windowed range read), `compression` (realized bytes/point + value-column compression ratio + decode throughput), and `downsample` (the full reduction set: min/max/avg/sum/first/last + **p50/p90/p95/p99 percentiles** + **TWA**). Each is a parallel `run_*` runner over the `.weftseg`/`weft-reduce` hot path with a correctness gate, p50/p95/p99 latency, and a `--point-lookup`/`--range-fetch`/`--compression`/`--downsample` CLI mode; storage workloads take a `rows_per_page` paged-segment path. OHLC is open/high/low/close = first/max/min/last (already covered by the shipped reductions).
 - [ ] Remaining workloads — bulk-ingest growth curves (1M→10M→100M→1B), online ingest+query, gap fill, compressed query, analytics pipeline
 - [ ] Fair-protocol depth (Phase 1.1) — ≥10 reps for short tests, cold/warm/hot/post-compaction/post-restart separation, saturation curves (batch size, clients, writers, query concurrency, cardinality, dataset size, GPU output size), seeded randomized query mixes (published seeds), failure tests (restart during ingest, crash during compaction, network retry, partial/corrupt segment), independent-reproducibility packaging (versions, SHAs, images, configs, hardware, drivers, command lines, raw artifacts)
 - [ ] Fair interpolation comparisons (Phase 1.2) — report three classes where possible: (A) native in-DB (Timescale gapfill, QuestDB `SAMPLE BY … FILL`, InfluxQL/SQL fill, ClickHouse ASOF/window, DuckDB window fns, IoTDB fns); (B) portable SQL baseline; (C) client-side end-to-end. Don't hide unfavorable results.
 - [ ] Remaining hardware capture — disk, GPU, and driver versions in run metadata
 - [ ] Report surfaces beyond JSON/HTML — Parquet / Grafana dashboards
-- [ ] Anti-Goodhart (Phase 1.3) — publish negative results + DSP-losing workloads; benchmark code separate from engine code; run customer-supplied workloads; README policy line *("DSP benchmarks guide real engineering decisions, not synthetic wins")* — policy line + the sawtooth negative finding shipped; the publication pipeline is open
+- [ ] Anti-Goodhart (Phase 1.3) — publish negative results + WeftDB-losing workloads; benchmark code separate from engine code; run customer-supplied workloads; README policy line *("WeftDB benchmarks guide real engineering decisions, not synthetic wins")* — policy line + the sawtooth negative finding shipped; the publication pipeline is open
 
 ### Phase 2 — Benchmark-grade server/API · *Very high*
 
-A commercial DB can't lead with an embedded Rust API + TUI. `dsp-server` (axum) is
+A commercial DB can't lead with an embedded Rust API + TUI. `weft-server` (axum) is
 that surface — see README ["HTTP Server"](README.md#http-server) for what ships.
 Interop priority: REST/JSON → ILP → Arrow/Parquet import-export → Prometheus
 metrics → OpenTelemetry → Python SDK → Rust SDK → Arrow Flight/Flight SQL → SQL
 surface / DataFusion (later) → Grafana → Prometheus remote write/read (if
 monitoring) → R/Arrow workflows.
 
-**Acceptance:** DSP-Bench drives DSP entirely through public APIs; the TUI becomes
+**Acceptance:** Weft-Bench drives WeftDB entirely through public APIs; the TUI becomes
 secondary (demos/debugging); API responses distinguish raw / interpolated /
 extrapolated / compressed / reconstructed values *(delivers the synthetic-point
 marking nuance — backlog item B-tags)*.
@@ -188,11 +194,11 @@ marking nuance — backlog item B-tags)*.
 - [x] Stored-range read surface — Arrow IPC `…/storage/{aspect}/range` + `…/value-range`, JSON `…/points` + `…/value-points`, `…/storage/aspects` / `…/{aspect}/schema` / `…/stats` (bytes/point)
 - [x] Single-instant read surface — `GET …/storage/{aspect}/at?t=` point lookup (order-signal-driven read planner: binary search on a sorted segment, linear scan on an out-of-order one)
 - [x] Storage maintenance — `POST …/storage/{aspect}/reconcile` (in-place out-of-order reconciliation pass; Phase 4.6)
-- [x] HTTP catalog management + ingest — declare aspect schema; JSON/ILP/Parquet/CSV batch ingest; `…/storage/catalog`; no-silent-downcast enforced (`400` on unrepresentable); `dsp_ingest_*` counters
+- [x] HTTP catalog management + ingest — declare aspect schema; JSON/ILP/Parquet/CSV batch ingest; `…/storage/catalog`; no-silent-downcast enforced (`400` on unrepresentable); `weft_ingest_*` counters
 - [x] B-rest pagination — `offset`/`limit`/`take`/`page` + `total`/`count` on `…/points` and `…/value-points`
 - [x] Parquet interchange — `…/range.parquet` / `…/value-range.parquet` export + `POST …/parquet` ingest
 - [x] CSV interchange — stored-range export/ingest + compute-endpoint CSV output
-- [x] Columnar output for compute endpoints — Arrow IPC + Parquet for `interpolate`/`downsample` (+ every ILP sibling); `dsp-arrow` reconstructed-series + reduction-table interchange
+- [x] Columnar output for compute endpoints — Arrow IPC + Parquet for `interpolate`/`downsample` (+ every ILP sibling); `weft-arrow` reconstructed-series + reduction-table interchange
 - [x] Prometheus latency histograms — compute endpoints, ILP compute path, and the storage-ingest seal path
 - [x] OpenTelemetry trace export (paired with Prometheus `/metrics`) — env-gated OTLP/gRPC exporter beside the `fmt` subscriber (delivery to a live collector = a runtime follow-up)
 - [x] B-rest residue — `interpolation` query-param alias for `spline` on the ILP compute endpoints (`spline` wins when both given)
@@ -225,14 +231,14 @@ transfer, 8% kernel, 7% JSON").
   `rows_changed`.)*
 - [x] **OTLP trace export** (pairs with `/metrics`): shipped — env-gated on
   `OTEL_EXPORTER_OTLP_ENDPOINT`, an OTLP/gRPC `SdkTracerProvider` (batch exporter +
-  `dsp-server` service resource) with a `tracing_opentelemetry` layer beside the `fmt`
+  `weft-server` service resource) with a `tracing_opentelemetry` layer beside the `fmt`
   subscriber; the shipped request/stage spans export to a collector. Dep constellation
   confirmed current on crates.io (May 2026): `opentelemetry` 0.32 + `opentelemetry_sdk`
   0.32 (`rt-tokio`) + `opentelemetry-otlp` 0.32 (`grpc-tonic`, builds protoc-free) +
   `tracing-opentelemetry` 0.33. A misconfigured/absent collector does not block startup.
 - [x] **OTLP collector verification: delivery verified.** A Jaeger all-in-one collector
   (docker `jaeger`, OTLP/gRPC :4317, query API/UI :16686, `--restart unless-stopped`)
-  now runs on the dev box; `scripts/verify-otlp.sh` boots `dsp-server` against it,
+  now runs on the dev box; `scripts/verify-otlp.sh` boots `weft-server` against it,
   drives a declare/ingest/read cycle, and asserts via the Jaeger query API that
   `request` root spans land with their nested stage spans
   (`storage.ingest.parse`/`seal`, `storage.range.read`/`serialize` observed nesting
@@ -254,21 +260,21 @@ transfer, 8% kernel, 7% JSON").
 
 **Acceptance:** range scans avoid materializing `BigDecimal` unless requested;
 interpolation streams from typed arrays; page/segment pruning visible in debug output;
-DSP-Bench shows ingest/scan/compression gains; correctness tests cover late + OOO data.
+Weft-Bench shows ingest/scan/compression gains; correctness tests cover late + OOO data.
 
-- [x] **4.1 Physical numeric encodings** — `dsp-physical-type`: all six `PhysicalType`s
+- [x] **4.1 Physical numeric encodings** — `weft-physical-type`: all six `PhysicalType`s
   (`F32`/`F64`/`ScaledI64`/`ScaledI128`/`Decimal128`/`BigDecimalText`) with explicit
   `Exactness`, `PhysicalProfile`, columnar `encode_column`, advisory
   `recommend_encoding`, and schema-level declaration + enforced seal
   (`AspectSchema::seal`, `SealError::{Encode,ToleranceExceeded}`)
 - **4.2 Timestamp semantics**
   - [x] Integer-epoch `TimeUnit` (s/ms/µs/ns) with lossless delta + delta-of-delta transforms, zig-zag + LEB128 varint estimate, RLE, and `best_estimated_bytes` selector
-  - [x] Fixed-width bit-packing codec — **realized on disk**: the `.dspseg` timestamp block writes a self-describing codec selector (bit-pack vs varint second differences), so the bytes/point saving is stored, not just estimated (segment format v3, paged v4)
+  - [x] Fixed-width bit-packing codec — **realized on disk**: the `.weftseg` timestamp block writes a self-describing codec selector (bit-pack vs varint second differences), so the bytes/point saving is stored, not just estimated (segment format v3, paged v4)
   - [x] Monotonic-order enforcement — `first_order_violation` primitive; opt-in `Segment::build_sorted`/`build_nullable_sorted`, `AspectSchema::seal_sorted`/`seal_paged_sorted` (`SegmentError`/`SealError::OutOfOrder`); exposed at the API as `require_sorted` on **all four** ingest formats (JSON/CSV/ILP/Parquet); observability via `SegmentStats::time_sorted` → per-segment index → `unsorted_segments` in aspect/store stats + `time_sorted` on every ingest response
   - [ ] Explicit tz + leap-second policy
   - [x] Out-of-order **reconciliation** (Phase 4.6) — enforcement/detection, in-place per-segment reconciliation, threshold + hot/cold background sweeps, and the **cross-segment overlap merge** (newer-wins dedup) all shipped; the split-not-rewrite optimization + composite upsert keys are the residue (see 4.6)
 - [x] **4.3 Columnar segment store** — in-memory `Segment`/`PagedSegment`; versioned
-  CRC-checksummed `.dspseg` frames (v1 single-block, v2 null/quality column, v3 paged
+  CRC-checksummed `.weftseg` frames (v1 single-block, v2 null/quality column, v3 paged
   with per-page index); `AspectSchema::seal_paged[_nullable]` (per-page tolerance
   enforcement, global-row error remap); `SegmentIndex`/`SegmentIndexStore` (libSQL
   control plane); `SegmentStore` (seal + prune-then-open reads + `aspect_stats`);
@@ -280,7 +286,7 @@ DSP-Bench shows ingest/scan/compression gains; correctness tests cover late + OO
   - [x] Quality pruning (`prune_present_by_time`, all-null segment/page skipping)
   - [x] Intra-segment page skipping (`prune_pages_by_time`, decode only surviving pages)
   - [ ] Tag pruning *(blocked on B-tags — per-measurement tags/labels don't exist yet)*
-- [x] **4.5 Arrow-compatible arrays** — `dsp-arrow` + `dsp-arrow-store`: lossless +
+- [x] **4.5 Arrow-compatible arrays** — `weft-arrow` + `weft-arrow-store`: lossless +
   typed-fast-path `RecordBatch` interchange (exact `Decimal128` for scaled ints),
   paged-batch streams, logical-column builders, Arrow IPC stream bytes, Parquet
   import/export; `arrow-*` tree confined to the leaf crates
@@ -301,7 +307,7 @@ DSP-Bench shows ingest/scan/compression gains; correctness tests cover late + OO
     (`merge_newer_wins` + `SegmentStore::reconcile_overlaps`/`reconcile_all_overlaps`,
     `SegmentIndexStore::delete`); exposed at the API as `?overlaps=true` on the
     per-aspect and store-wide reconcile endpoints and as a background daemon sweep
-    (`DSP_RECONCILE_OVERLAPS`). This matches QuestDB's DEDUP UPSERT "last write wins on
+    (`WEFT_RECONCILE_OVERLAPS`). This matches QuestDB's DEDUP UPSERT "last write wins on
     the designated timestamp" semantics. *(src: last-write-wins dedup on designated
     timestamp + upsert keys — https://questdb.com/docs/concepts/deduplication/)*
   - [x] Out-of-order **reconciliation — split-not-rewrite optimization**: shipped.
@@ -311,10 +317,10 @@ DSP-Bench shows ingest/scan/compression gains; correctness tests cover late + OO
     outweighs its hot suffix is split rather than fully rewritten (default
     `reconcile_overlaps` keeps the QuestDB 50 MiB floor, so production behaviour is
     unchanged); exposed as `?split_min_bytes=` on the per-aspect + store-wide reconcile
-    endpoints and the `DSP_RECONCILE_SPLIT_MIN_BYTES` daemon env. The **squash** half is
+    endpoints and the `WEFT_RECONCILE_SPLIT_MIN_BYTES` daemon env. The **squash** half is
     shipped too — `squash_aspect`/`squash_aspect_if_exceeds` (QuestDB-`max.splits`-style
     trigger) + `squash_all_over_threshold`, `POST …/{aspect}/squash?max_segments=`, and
-    the `DSP_RECONCILE_MAX_SPLITS` daemon env fold over-fragmented aspects back to one
+    the `WEFT_RECONCILE_MAX_SPLITS` daemon env fold over-fragmented aspects back to one
     segment. *(src: https://questdb.com/docs/concepts/partitions/)*
   - [ ] Out-of-order **reconciliation — configurable upsert keys + skip-identical**:
     the merge dedups on the timestamp alone (newer wins); add optional composite
@@ -327,12 +333,12 @@ DSP-Bench shows ingest/scan/compression gains; correctness tests cover late + OO
     reconcile pass (single-aspect `reconcile_aspect_if_unsorted_exceeds` + store-wide
     `reconcile_all_over_threshold` sweep), exposed as the `?threshold=N` gate on
     `POST …/{aspect}/reconcile`, a manual store-wide `POST …/storage/reconcile`, and
-    a timer daemon (`DSP_RECONCILE_INTERVAL_SECS`/`DSP_RECONCILE_THRESHOLD`) with the
-    `dsp_reconcile_passes_total`/`dsp_reconcile_segments_reconciled_total` metrics
+    a timer daemon (`WEFT_RECONCILE_INTERVAL_SECS`/`WEFT_RECONCILE_THRESHOLD`) with the
+    `weft_reconcile_passes_total`/`weft_reconcile_segments_reconciled_total` metrics
   - [x] **Hot/cold split in the background reconcile**: cold (non-hot-tail) segments
     are reconciled every pass and only the hot tail (most-recently-sealed) is deferred
     until the backlog reaches the threshold — `SegmentStore::reconcile_aspect_hot_cold`/
-    `reconcile_all_hot_cold`, wired through the reconcile daemon (`DSP_RECONCILE_HOT_COLD`)
+    `reconcile_all_hot_cold`, wired through the reconcile daemon (`WEFT_RECONCILE_HOT_COLD`)
     and the `?hot_cold=true` reconcile endpoints; matches QuestDB's "squash non-active
     partitions each commit, defer the active partition until the split threshold".
     *(src: non-active squashed each commit, active squashed past the split threshold —
@@ -350,7 +356,7 @@ the GPU path *fast end-to-end and economically justified*. GPU benchmarks must b
 wait → kernel → readback → serialize); a kernel-only speedup is not commercially
 credible.
 
-**Acceptance:** publishable claim like *"on hardware X, DSP produces Y M interpolated
+**Acceptance:** publishable claim like *"on hardware X, WeftDB produces Y M interpolated
 points/sec for irregular cubic interpolation including storage read, decode, GPU
 transfer, kernel, readback, and API serialization, p95 = Z."*
 
@@ -374,16 +380,16 @@ detection within Y% and improving historical query latency by Z."*
 
 - [ ] **6.1 Lossless typed codecs** — timestamp delta/delta-of-delta + **fixed-width
   bit-packing** + **RLE** + **Gorilla variable-length** + **per-block adaptive
-  bit-packing** *(all five realized on disk in the `.dspseg` timestamp block, chosen
+  bit-packing** *(all five realized on disk in the `.weftseg` timestamp block, chosen
   per-stream by `best_encoding_name`)*; **scaled-int value bit-packing** *(realized on
   disk in the value block)*; Chimp-style f64; ALP-inspired vectorized f64;
   Decimal128/scaled-int codecs; **block-level random access** *(shipped —
-  `blocked`/`for_bitpack_decode_range` + `dspseg::read_value_at`)*. *(Check codec
+  `blocked`/`for_bitpack_decode_range` + `weftseg::read_value_at`)*. *(Check codec
   patents/licenses before embedding.)*
   - [x] **Gorilla + RLE realized on disk** — the timestamp block now carries four
     codecs (varint/bit-pack/RLE/Gorilla) chosen by the single-source-of-truth
     `best_encoding_name`, so the reported codec always matches the bytes written; the
-    Gorilla win shows in the dsp-bench bytes/point.
+    Gorilla win shows in the weft-bench bytes/point.
   - [x] **Evaluated** a Gorilla-style variable-length second-difference estimate
     (`gorilla_dod_bits`/`gorilla_bytes`/`DeltaOfDeltaColumn::gorilla_estimated_bytes` —
     advisory only, NOT wired into the realized varint-vs-bit-pack selector). Measured
@@ -399,8 +405,8 @@ detection within Y% and improving historical query latency by Z."*
     on a 1000-pt base with an isolated jitter every 16th interval within its ±2048
     bucket), with an honest loss boundary past ±2048 (falls to the 68-bit bucket).
     Realized as a full lossless codec (`encode_gorilla_dods`/`decode_gorilla_dods`),
-    wired into the `.dspseg` block (`TS_CODEC_GORILLA`) + folded into
-    `best_estimated_bytes`/`best_encoding_name`, and surfaced in the dsp-bench
+    wired into the `.weftseg` block (`TS_CODEC_GORILLA`) + folded into
+    `best_estimated_bytes`/`best_encoding_name`, and surfaced in the weft-bench
     StorageEstimate. RLE was also realized on disk (`TS_CODEC_RLE`) in the same arc,
     closing its estimate/disk divergence. *(src: Gorilla, VLDB'15)*
   - [x] **Evaluated + ADOPTED dynamic (per-block adaptive) bit packing.** Measured on a
@@ -426,7 +432,7 @@ detection within Y% and improving historical query latency by Z."*
     https://lemire.me/blog/2012/02/08/effective-compression-using-frame-of-reference-and-delta-coding/
     · ALP FastLanes FOR, SIGMOD'24 — https://dl.acm.org/doi/10.1145/3626717)*
   - [x] **FOR adopt-or-drop — DECIDED (owner sign-off): ADOPTED for the value column,
-    timestamps stay advisory.** `VAL_CODEC_FOR` is the fourth realized `.dspseg` value
+    timestamps stay advisory.** `VAL_CODEC_FOR` is the fourth realized `.weftseg` value
     codec, folded into `best_serialized_bytes`/`best_value_codec` (`scaled_for`, chosen
     only when strictly smallest; ties keep the simpler codec); a non-`ScaledI64` payload
     is rejected (`value_codec_for_type`). Because FOR packs the residual *unsigned* it
@@ -466,8 +472,8 @@ detection within Y% and improving historical query latency by Z."*
     paper reports **29–94% higher compression ratio than other numerical codecs on six real-world
     columnar datasets, at less compression time, with decompression consistently above 1 GiB/s per
     thread** — and it is Rust (the `pco` crate, actively maintained), columnar, and aimed squarely at
-    DSP's scaled-int + f64 hot path. That profile makes it a *stronger* first candidate than the
-    Chimp/Elf line for the value column, and a natural `dsp-bench` external-format baseline beside
+    WeftDB's scaled-int + f64 hot path. That profile makes it a *stronger* first candidate than the
+    Chimp/Elf line for the value column, and a natural `weft-bench` external-format baseline beside
     Vortex. Judge it on bytes/point AND decode throughput, and note the corpus caution above — measure
     it on the real corpus, not the synthetic generator. *(src: Pcodec, arXiv 2502.06112 —
     https://arxiv.org/abs/2502.06112 · comparative study — https://arxiv.org/html/2510.07015v1 ·
@@ -475,26 +481,26 @@ detection within Y% and improving historical query latency by Z."*
     - [ ] **SCOPE CORRECTION (research 2026-09-23): evaluate pco for the COLD TIER and as a
       bytes/point ceiling — not as the hot-path value codec.** Its format gives **page**-granular
       random access with **serial** batch decode inside a page ("Batches within a page must be
-      decompressed serially"), which is architecturally incompatible with DSP's tile-level random
+      decompressed serially"), which is architecturally incompatible with WeftDB's tile-level random
       access; and its decode throughput is ratio-first — 1.4–5.5 GiB/s per thread across its own six
       datasets, one to two orders below FastLanes-class unpacking, with Vortex beating it on 4 of 6.
       Rewrite the item's goal accordingly. *(src: https://arxiv.org/pdf/2502.06112)*
     - [ ] **The real prize in pco may be its MODE DETECTION, not its format.** Its automatic modes
-      map almost exactly onto DSP's regime: `IntMult` ("ms-precise timestamps stored as us") is
-      literally DSP's timestamp column, and `FloatMult` ("prices that are multiples of 0.01") is
-      literally DSP's schema-declared scaled-int value column; with them pco beats the next best
+      map almost exactly onto WeftDB's regime: `IntMult` ("ms-precise timestamps stored as us") is
+      literally WeftDB's timestamp column, and `FloatMult` ("prices that are multiples of 0.01") is
+      literally WeftDB's schema-declared scaled-int value column; with them pco beats the next best
       alternative by +29% to +94% across its datasets. So run the bench **head to head per column** —
       pco `FloatMult` vs the shipped `scaled_for`/`scaled_blocked`, pco `IntMult` vs the shipped
       delta/blocked/Gorilla timestamp codecs — not whole-file sizes. If pco's detection beats
       `best_value_codec` on the real corpus, the actionable outcome is to steal the **heuristic**,
-      which stays inside hard-constraint #4 because DSP's scale is already schema-declared.
+      which stays inside hard-constraint #4 because WeftDB's scale is already schema-declared.
       *(src: https://arxiv.org/pdf/2502.06112)*
-    - [ ] **`pco` is now 1.0 (1.0.3, 2026-08-01) — pin it in `dsp-bench` only**, keeping it out of
+    - [ ] **`pco` is now 1.0 (1.0.3, 2026-08-01) — pin it in `weft-bench` only**, keeping it out of
       the core crates until an adopt decision, per the out-of-core boundary. Build the harness with
       the `bmi1`/`bmi2`/`avx2` target features the crate's docs call for ("improves ... decompression
       speed substantially") or the measured decode throughput will understate pco and produce a false
       adopt-or-drop verdict. *(src: https://lib.rs/crates/pco)*
-  - [x] **Scaled-int value bit-pack codec — realized on disk.** The `.dspseg` value block
+  - [x] **Scaled-int value bit-pack codec — realized on disk.** The `.weftseg` value block
     now carries a self-describing codec selector (`VAL_CODEC_VARINT`/`VAL_CODEC_BITPACK`);
     a `ScaledI64` column whose mantissas fixed-width bit-pack below the per-value varint
     stores bit-packed (chosen via `ColumnEncoding::best_value_codec`), and the realized
@@ -515,7 +521,7 @@ detection within Y% and improving historical query latency by Z."*
     size and oversold storage cost); the now-redundant `advisory_for_value_bytes` field
     was dropped in the same bump.
   - [x] **Per-block adaptive bit-pack for the VALUE column — realized on disk.** The
-    `.dspseg` value block carries `VAL_CODEC_BLOCKED` (block-size uvarint + length-prefixed
+    `.weftseg` value block carries `VAL_CODEC_BLOCKED` (block-size uvarint + length-prefixed
     `blocked_bitpack_encode` stream), reusing the generic blocked primitives over the
     mantissa stream. `ColumnEncoding::blocked_value_bytes` folds into
     `best_serialized_bytes`/`best_value_codec` (`scaled_blocked`), chosen only when strictly
@@ -526,13 +532,13 @@ detection within Y% and improving historical query latency by Z."*
     Sensors 2023 — https://www.mdpi.com/1424-8220/23/20/8575)*
   - [x] **f64 value-column codec — Gorilla + Chimp XOR codecs + best-of selector (advisory).**
     The `F64` value column had no compression (raw 8 B/value IEEE pattern). Shipped in
-    `dsp-physical-type::floatcodec`: `xor_f64_*` (Gorilla — XOR vs the immediate predecessor,
+    `weft-physical-type::floatcodec`: `xor_f64_*` (Gorilla — XOR vs the immediate predecessor,
     store only the meaningful bits between the leading/trailing zeros) and `chimp_f64_*`
     (single-predecessor Chimp — 2-bit flags, a 3-bit leading-zero class, trailing-zero trim),
     both bit-exact for every f64 (NaN/±inf/subnormal/signed-zero, XORs `to_bits`); a
     `best_f64_codec` selector over {raw, gorilla, chimp} (never worse than raw); the
     `ColumnEncoding` advisory methods (`gorilla_f64_bytes`/`best_f64_bytes`/`best_f64_codec`);
-    and the `dsp-bench` `StorageEstimate.advisory_best_f64_bytes`/`advisory_best_f64_codec`
+    and the `weft-bench` `StorageEstimate.advisory_best_f64_bytes`/`advisory_best_f64_codec`
     (schema v12) surfacing the best f64 saving on a lossy-tolerance run (measured Gorilla
     ~45% below raw on a stable-exponent column near 1000). **Advisory only** — no f64 codec is
     on disk yet. Honest finding: single-predecessor Chimp is *not* a universal win over
@@ -580,15 +586,15 @@ detection within Y% and improving historical query latency by Z."*
     `vector_size` elements (**default 1024**). Exceptions are `uint16` positions + exact IEEE-754
     bit patterns, and each exception slot is replaced by a placeholder *before* FOR encoding so the
     integer stream stays branch-free and FOR/bit-packable. Three consequences for `VAL_CODEC_ALP`:
-    (i) the 1024 default vector size is **identical to DSP's `TRANSPOSE_TILE`**, so one tile = one
+    (i) the 1024 default vector size is **identical to WeftDB's `TRANSPOSE_TILE`**, so one tile = one
     ALP vector and tile-level random access survives ALP adoption unchanged; (ii) adopt the
     placeholder-before-FOR trick rather than a bespoke exception scheme; (iii) **`ALP-RD` is NOT in
-    the Parquet spec** (mode 0 = ALP, other modes reserved), so if DSP uses ALPrd for the
-    high-precision fallback, declare it a DSP-private mode id and keep mode 0 byte-compatible.
+    the Parquet spec** (mode 0 = ALP, other modes reserved), so if WeftDB uses ALPrd for the
+    high-precision fallback, declare it a WeftDB-private mode id and keep mode 0 byte-compatible.
     *(src: https://parquet.apache.org/docs/file-format/data-pages/alpencoding/)*
   - [ ] **Use the `alp` crate to get the ALP adopt benchmarked, rather than hand-rolling it first.**
     spiraldb's `alp` 0.0.4 (2026-09-08, Apache-2.0) implements both classic ALP and ALP-RD with
-    `ENCODE_CHUNK_SIZE = 1024` — matching DSP's tile granularity — and an encode/decode API whose
+    `ENCODE_CHUNK_SIZE = 1024` — matching WeftDB's tile granularity — and an encode/decode API whose
     `decode_single`/`decode_slice_inplace` map onto `read_value_at`/`read_value_range`. It is a pure
     codec crate, so it does not cross the control-plane/hot-path boundary. Two cautions to carry:
     `0.0.x` means no semver promise (pin exactly or vendor), and `alp` pins `fastlanes ^0.6` while
@@ -600,7 +606,7 @@ detection within Y% and improving historical query latency by Z."*
     +2.51%/−7.11% — i.e. on a mixed corpus ALP is a modest ratio win bought with decode speed, and
     the exception machinery is what costs. So (i) the adopt-or-drop benchmark must report decode
     throughput beside bytes/point and reject ALP if it regresses the tile decode rate by more than
-    the ratio gain (the same gating FOR and Gorilla got); and (ii) DSP's corpus is a pure f64
+    the ratio gain (the same gating FOR and Gorilla got); and (ii) WeftDB's corpus is a pure f64
     measurement column, not 2,289 mixed columns, so the expected win should be *far* above 4.36% —
     if it is not, that is evidence the shipped scaled-int/FOR/blocked path already serves the value
     column and **declining ALP is a legitimate, publishable outcome**.
@@ -611,7 +617,7 @@ detection within Y% and improving historical query latency by Z."*
     an RTX 4070), against the previously-cited arXiv 2511.04140 framework's 12.32 GB/s — over an
     order of magnitude apart, so the port target should change (caveat, recorded honestly: the two
     are not strictly like-for-like, since G-ALP measures decode into device memory on resident data).
-    Its two design rules bear directly on DSP's frame layout: exception patching must be **fully
+    Its two design rules bear directly on WeftDB's frame layout: exception patching must be **fully
     data-parallel** (a branchy per-thread exception scan "will take longer than the actual decoding
     of the value"), which needs a **lane-partitioned** exception section costing a fixed 0.5 bits per
     value — and that is *not* bolt-on-able to a Parquet-style flat position array without a
@@ -623,9 +629,9 @@ detection within Y% and improving historical query latency by Z."*
     G-ALP measures GPU *filter* throughput **above 100% of device RAM bandwidth** (~215% float /
     ~100% double on an RTX 4070; ~120%/~172% on a V100), because loading data in compressed form
     costs less than the bandwidth it saves, and because a fused kernel avoids "a round-trip of
-    non-compressed data to and from RAM". This turns DSP's "decompress-on-device, no host
+    non-compressed data to and from RAM". This turns WeftDB's "decompress-on-device, no host
     round-trip" assertion into a concrete architectural rule: do **not** add a separate
-    decompress-then-interpolate kernel pair. Add a `dsp-bench` metric reporting GPU interpolation
+    decompress-then-interpolate kernel pair. Add a `weft-bench` metric reporting GPU interpolation
     throughput as a **percentage of device RAM bandwidth** — the figure that makes the fused design's
     win visible and maps onto the $/billion-interpolated-points north star.
     *(src: https://azimafroozeh.org/assets/papers/g-alp.pdf)*
@@ -642,12 +648,12 @@ detection within Y% and improving historical query latency by Z."*
     https://arxiv.org/pdf/2606.22423). *(src: FastLanes Compression Layout, VLDB'23 —
     https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf)*
   - [x] **Cascading (recursive) codec composition — delta→best-packer chain: advisory + on disk.**
-    DSP's other value codecs are single-level (one of varint/bit-pack/blocked/FOR); this is the
+    WeftDB's other value codecs are single-level (one of varint/bit-pack/blocked/FOR); this is the
     first *recursive* codec. Shipped as the advisory `ColumnEncoding::delta_cascade_bytes`/
     `delta_cascade_plan` (delta-transform the mantissas, then best-of {varint, bit-pack, blocked,
     FOR, RLE} over the differences — a monotone-trend column that defeats every single-level codec
     drops 97.4%, the trend collapsing to a constant RLE run) **and** the on-disk codec-chain
-    descriptor `VAL_CODEC_DELTA_CASCADE` in the `.dspseg` value block (anchor + inner-codec
+    descriptor `VAL_CODEC_DELTA_CASCADE` in the `.weftseg` value block (anchor + inner-codec
     descriptor + inner-coded deltas), written by `write_value_column_cascading` and read by the
     ordinary `read_value_column`. **Opt-in** (the cascade beats FOR on FOR's own fixtures → a broad
     realized-bytes change; default-adoption is owner-gated). *(src: Vortex cascading compression —
@@ -657,14 +663,14 @@ detection within Y% and improving historical query latency by Z."*
   - [ ] **Evaluate Vortex as a columnar interchange + benchmark reference (Phase 1/4):** Vortex
     (Rust, Arrow-compatible, BtrBlocks-based cascading compression, ALP/FastLanes/FSST
     encodings) reports ~100–200× faster random access and 2–10× faster scans than Parquet+zstd
-    at similar ratio, with a GPU-decompression roadmap — directly on DSP's random-access +
+    at similar ratio, with a GPU-decompression roadmap — directly on WeftDB's random-access +
     GPU-decode + interpolation-native wedge. Assess (a) `vortex-*` crates as an *interchange*
-    target beside `dsp-arrow`/Parquet (out-of-core, per the vendor-neutral boundary), and (b)
-    Vortex as a `dsp-bench` external-format baseline for the storage/compressed-query workloads.
+    target beside `weft-arrow`/Parquet (out-of-core, per the vendor-neutral boundary), and (b)
+    Vortex as a `weft-bench` external-format baseline for the storage/compressed-query workloads.
     *(src: Vortex at Spice.ai, 2025 —
     https://spice.ai/blog/vortex-at-spice-ai-the-columnar-format-for-data-intensive-workloads
     · https://vortex.dev/)*
-- [ ] **6.2 Model-based compression** (leverages DSP's spline DNA, NeaTS-like) — piecewise
+- [ ] **6.2 Model-based compression** (leverages WeftDB's spline DNA, NeaTS-like) — piecewise
   linear / spline / polynomial / nonlinear approximation with bounded residuals;
   lossless-residual option; lossy with max-error guarantee; extrema-preserving mode
 - [ ] **6.3 Late/compressed-domain execution** — min/max/count from metadata; predicate
@@ -686,15 +692,15 @@ recovery, with bounded p99 and no loss beyond the declared durability mode.
 - [ ] **7.2 WAL & crash consistency** — WAL design, segment-seal protocol, atomic catalog
   updates, recovery, partial-write handling, fsync policy, durability modes
 - [ ] **7.3 Corruption detection** — segment/page checksums *(CRC-32 shipped in the
-  `.dspseg` frame)*, catalog checks, startup verification, repair tooling
+  `.weftseg` frame)*, catalog checks, startup verification, repair tooling
 - **7.4 Backup/restore** — online backup, PITR if feasible, verification, drills, documented RPO/RTO
   - [x] Online control-plane backup over `VACUUM INTO` + per-database verification (see the Turso section below)
-  - [x] Background backup daemon (`DSP_BACKUP_INTERVAL_SECS`) with generated-snapshot retention (`DSP_BACKUP_KEEP`)
+  - [x] Background backup daemon (`WEFT_BACKUP_INTERVAL_SECS`) with generated-snapshot retention (`WEFT_BACKUP_KEEP`)
   - [x] Concurrent-write-safe verification (`VerifyMode::SnapshotOnly`) — the mode an online backup must use
   - [x] **Restore + a backup/restore drill** — `restore_control_plane` puts a snapshot back into a fresh store root, verifying each file at its destination, and refusing both an incomplete backup dir and an existing control plane; a round-trip test reopens the restored store and reads its measurements back
   - [x] **Restore drill at the API** — `POST /api/v1/storage/restore/drill?label=` rehearses a restore into a throwaway dir, verifies it, reports `restorable`, and cleans up; non-destructive by construction (it cannot touch the live store), runtime-verified against the live binary
   - [ ] Restoring *into a chosen new root* over HTTP — deliberately not shipped (a deployment decision, not an HTTP call); revisit only if an operator flow actually needs it
-  - [ ] Whole-store backup manifest (fold the `.dspseg` frames in beside the control plane) — today a restore into an empty root yields a valid but frame-less store
+  - [ ] Whole-store backup manifest (fold the `.weftseg` frames in beside the control plane) — today a restore into an empty root yields a valid but frame-less store
   - [ ] Document RPO/RTO against the measured snapshot cadence
 - [ ] **7.5 Compaction** — scheduling, query consistency during compaction, resource
   limits, metrics, cancellation, priority
@@ -702,7 +708,7 @@ recovery, with bounded p99 and no loss beyond the declared durability mode.
 
 ### Phase 8 — Commercial hardening · *Required for paid beta*
 
-**Acceptance:** a design partner can deploy DSP, ingest, run DSP-Bench, inspect
+**Acceptance:** a design partner can deploy WeftDB, ingest, run Weft-Bench, inspect
 metrics, recover from a restart, and file useful support tickets.
 
 - [ ] Security — TLS, API keys/token auth, basic RBAC, service accounts, secrets, encryption at rest, audit logs, vuln process
@@ -727,15 +733,15 @@ vector DB. *(Maps backlog Themes 5, 6, 8.)*
 - [ ] Per-stage audit trail
 - [ ] *(Future)* ML/AI — self-supervised event prediction, causal anomaly detection, temporal point processes, forecasting export, embedding search over shape summaries
 
-**Commercial tiers:** *DSP Core* (storage/query/interpolation/compression/benchmarks)
-· *DSP Accelerated* (GPU) · *DSP Analytics* (pattern/event/signal) · *DSP Enterprise*
+**Commercial tiers:** *WeftDB Core* (storage/query/interpolation/compression/benchmarks)
+· *WeftDB Accelerated* (GPU) · *WeftDB Analytics* (pattern/event/signal) · *WeftDB Enterprise*
 (security/compliance/support/deployment/benchmark consulting).
 
 ---
 
 ## Updated priority order
 
-**Move up immediately:** 1) DSP-Bench · 2) public API/server · 3) InfluxDB Line
+**Move up immediately:** 1) Weft-Bench · 2) public API/server · 3) InfluxDB Line
 Protocol ingest · 4) Prometheus/OpenTelemetry instrumentation · 5) physical numeric
 encodings · 6) Storage v2 columnar segments · 7) GPU batching + async · 8)
 compression v2 prototypes · 9) online ingest/query benchmarks · 10) correctness/
@@ -795,7 +801,7 @@ A checked box = shipped; an unchecked box carries its residual status inline
 
 ## Control-plane engine: Turso/libSQL 0.6 adoption
 
-DSP pins `turso = "0.6"`. Per hard-constraint #3, Turso/libSQL is the **control
+WeftDB pins `turso = "0.6"`. Per hard-constraint #3, Turso/libSQL is the **control
 plane** only — the features below are evaluated **only** for control-plane use; none
 of them turn Turso into the measurement backend.
 
@@ -817,8 +823,8 @@ of them turn Turso into the measurement backend.
   `SegmentStore::backup_control_plane(dir)` snapshots all four (segment_index/metadata/aspect_catalog/
   catalog) into one dir returning a `ControlPlaneBackup` (per-DB reports + `total_rows`/`total_bytes`).
   Exposed at the API as `POST /api/v1/storage/backup?label=` (label-guarded against traversal;
-  `DSP_BACKUP_DIR`-or-`<root>/backups` base) and observable via `dsp_backup_snapshots_total`/
-  `dsp_backup_bytes_written_total`. Runtime-verified against the live binary. Finding: Turso's MVCC
+  `WEFT_BACKUP_DIR`-or-`<root>/backups` base) and observable via `weft_backup_snapshots_total`/
+  `weft_backup_bytes_written_total`. Runtime-verified against the live binary. Finding: Turso's MVCC
   mode adds an internal `__turso_internal_mvcc_meta` table to `sqlite_master`, filtered out of the
   verified user-table set. *(src: https://turso.tech/blog/turso-0.6.0)*
 - [x] **Backup 7.4 residue (a) — concurrent-write-safe verify: shipped (2026-07-23).**
@@ -833,8 +839,8 @@ of them turn Turso into the measurement backend.
   seal committing between a vacuum and its verification would otherwise be a spurious mismatch.
   Runtime-verified with six concurrent ingests in flight during a `verify=snapshot` backup.
 - [x] **Backup 7.4 residue (c) — background backup daemon: shipped (2026-07-23).**
-  `DSP_BACKUP_INTERVAL_SECS` + `DSP_BACKUP_KEEP` beside the reconcile/compact daemons, writing a
-  fresh `backup-<unix_millis>` dir per tick into `DSP_BACKUP_DIR`-or-`<root>/backups` and pruning the
+  `WEFT_BACKUP_INTERVAL_SECS` + `WEFT_BACKUP_KEEP` beside the reconcile/compact daemons, writing a
+  fresh `backup-<unix_millis>` dir per tick into `WEFT_BACKUP_DIR`-or-`<root>/backups` and pruning the
   oldest **generated** snapshots past the retention bound. Pruning only ever considers
   `backup-<digits>`, so an operator's `?label=nightly` snapshot is structurally never a candidate,
   and retention runs only after a *successful* snapshot so a run of failures cannot prune the last
@@ -849,13 +855,13 @@ of them turn Turso into the measurement backend.
   designed-for-hot-backup alternative if snapshot latency ever becomes the constraint.
   *(src: https://turso.tech/blog/turso-0.7.0 · https://www.sqlite.org/c3ref/backup_finish.html ·
   https://dev.to/dataformathub/distributed-sqlite-why-libsql-and-turso-are-the-new-standard-in-2026-58fk)*
-- [ ] **Backup 7.4 residue (d) — whole-store backup manifest**: fold the `.dspseg` segment frames in
+- [ ] **Backup 7.4 residue (d) — whole-store backup manifest**: fold the `.weftseg` segment frames in
   beside the control plane (today it is control-plane only, per hard-constraint #3), so a restore
   into an empty root is a complete store rather than a frame-less one.
 - [x] **Backup cost: MEASURED (2026-09-23), and the diagnosis on record was wrong.** The symptom is
   confirmed — the interval is a floor, not a cadence — but the cause is **not** the vacuum's work.
   `database/benches/backup_cost.rs` times one whole `backup_control_plane_with_verify` (four
-  `VACUUM INTO`s + verification) and sweeps the aspect count, with `DSP_BENCH_BACKUP_DIR` choosing
+  `VACUUM INTO`s + verification) and sweeps the aspect count, with `WEFT_BENCH_BACKUP_DIR` choosing
   the volume. On **tmpfs**: `snapshot_only` 8.62 ms @1 aspect / 6.18 ms @16 / 16.79 ms @128;
   `source_match` 5.36 / 6.68 / 16.31 ms — single-digit milliseconds, growing with control-plane rows
   (~2.7× from 16→128 aspects), not a fixed per-database floor. On the **btrfs** store volume under
@@ -882,18 +888,18 @@ of them turn Turso into the measurement backend.
   `PRAGMA synchronous` being NORMAL or FULL, and Turso implements that pragma partially (OFF and FULL
   only) — so `synchronous=OFF` on the snapshot connection may collapse the seconds-scale cost. Note
   Turso's own docs describe the sync as unconditional, so the two disagree and only a measurement
-  settles it; a non-crash-safe snapshot may be acceptable since DSP verifies every snapshot and can
+  settles it; a non-crash-safe snapshot may be acceptable since WeftDB verifies every snapshot and can
   re-take it. (ii) Call the SDK's explicit `db.checkpoint()` once at the top of the tick, then take
   the four snapshots, and see whether the per-snapshot TRUNCATE checkpoint gets cheaper for having a
   short WAL — a one-line reordering in the backup daemon if it works. *(src:
   https://sqlite.org/lang_vacuum.html · https://docs.turso.tech/sdk/rust/reference)*
 - [ ] **Backup cost residue (c) — DO NOT reach for Turso's experimental passive checkpoint.** It is
-  a documented data-loss path in exactly DSP's configuration: issue #8076 (filed 2026-07-28, still
+  a documented data-loss path in exactly WeftDB's configuration: issue #8076 (filed 2026-07-28, still
   open at 2026-09-23) reports a TRUNCATE checkpoint discarding acknowledged concurrent commits when
   `experimental_mvcc_passive_checkpoint` is enabled under `journal_mode=experimental_mvcc` — and
   `VACUUM INTO` performs exactly that TRUNCATE checkpoint on every call. A sibling (#8068) panics
   ("MVCC vacuum gate acquired while transactions are still active") instead of returning busy, which
-  would abort `dsp-server` mid-backup. This **supersedes** the passive-checkpoint suggestion in the
+  would abort `weft-server` mid-backup. This **supersedes** the passive-checkpoint suggestion in the
   0.7-upgrade item below. Re-evaluate when #8076 closes. *(src:
   https://github.com/tursodatabase/turso/issues/8076 · https://github.com/tursodatabase/turso/issues/8068)*
 - [ ] **Backup 7.4 residue (b) is UPSTREAM-GATED, not an open design question (research 2026-09-23):**
@@ -911,19 +917,19 @@ of them turn Turso into the measurement backend.
   the origin returns only differing pages (a 500 MB database syncs in ~20 KB), against a live
   database, and its WAL-mode/page-size restrictions were lifted in SQLite 3.50.0 (2025-05-29). Write
   cost then scales with *changed* pages, not database size, which is precisely the btrfs fsync bill
-  DSP measured. Validate two things first: that a Turso-written file is byte-compatible enough for the
+  WeftDB measured. Validate two things first: that a Turso-written file is byte-compatible enough for the
   protocol, and that "replica is read-only during sync" fits the restore-drill flow. *(src:
   https://sqlite.org/rsync.html)*
 - [ ] **Confirm the snapshot verifier does not depend on MVCC-broken pragmas.** Turso issue #4929
   (filed 2026-01-29, still open) reports `PRAGMA page_count` returning 0 and `user_version` /
   `application_id` returning 0 under MVCC — discovered while running the `VACUUM INTO` integration
-  tests. DSP's verifier compares user-table sets and *scans every row*, so it should be unaffected,
+  tests. WeftDB's verifier compares user-table sets and *scans every row*, so it should be unaffected,
   but that is worth asserting explicitly rather than assuming, since a pragma-based check would be
   vacuously passing. *(src: https://github.com/tursodatabase/turso/issues/4929)*
 - [ ] **Evaluate the `turso` 0.7 upgrade — the release notes are now read (research 2026-07-23),
-  and two of the three open questions have answers.** DSP pins `turso = "0.6"` and locks 0.6.1.
+  and two of the three open questions have answers.** WeftDB pins `turso = "0.6"` and locks 0.6.1.
   **Version check (research 2026-09-23): stable is now `0.7.2` (2026-07-30), with `0.8.0-pre.12`
-  out on 2026-09-22 — DSP is two minor versions behind, and 0.8-pre is moving weekly, so part of
+  out on 2026-09-22 — WeftDB is two minor versions behind, and 0.8-pre is moving weekly, so part of
   this decision is whether to wait for 0.8 stable.** Before bumping, audit the `database` crate for
   (a) any place two write statements can be in flight on one connection (now returns busy) and (b)
   any interactive transaction where a statement can be abandoned mid-way (now poisons it) — **the
@@ -939,7 +945,7 @@ of them turn Turso into the measurement backend.
   - **A behavioural change to check before bumping: one write statement at a time.** Starting a
     second write while another is mid-flight now returns busy, and abandoning a half-done write
     inside an interactive transaction **poisons the transaction** so it refuses to commit a partial
-    statement (#7420). DSP's seal path issues several control-plane writes per ingest — this is the
+    statement (#7420). WeftDB's seal path issues several control-plane writes per ingest — this is the
     migration risk to test, not `n_change`.
   - **Wins that matter to the control plane:** MVCC reads under concurrent writes went from
     `N·log(N)` to a linear merge (#7501); GC of obsolete row versions is decoupled from
@@ -966,12 +972,12 @@ hard-constraint #3).
 
 ## Six-month execution plan
 
-- [ ] **Month 1 — Benchmark truth:** external-engine adapters (DSP + DuckDB minimum, then ClickHouse/InfluxDB 3/QuestDB/TimescaleDB); first cross-engine report (no aggressive claims); methodology + anti-Goodhart policy + hardware-reporting template + correctness rules published
+- [ ] **Month 1 — Benchmark truth:** external-engine adapters (WeftDB + DuckDB minimum, then ClickHouse/InfluxDB 3/QuestDB/TimescaleDB); first cross-engine report (no aggressive claims); methodology + anti-Goodhart policy + hardware-reporting template + correctness rules published
 - [ ] **Month 2 — Public API & observability:** OTel; Parquet bench output; cold/warm separation; GPU timing breakdown *(server, REST, ILP, Prometheus, p50/p95/p99 shipped)*
 - [ ] **Months 3–4 — Hot-path optimization:** batch-ingest rewrite; minimized `BigDecimal` hot-loop use; typed-array interpolation streaming; nightly benchmark-regression CI. *Goal: establish whether storage or conversion is the dominant bottleneck.*
 - [ ] **Months 4–5 — GPU flagship:** command batching; true async handles; CPU/GPU overlap; hardware auto-tuning; end-to-end interpolation benchmarks; CPU-only vs GPU cost/performance report; portability/determinism matrix. *Publish only if strong and reproducible.*
 - [ ] **Month 5 — Compression v2 prototype:** scaled-int compression; f64 codec prototype; random-access blocks; model-based prototype; accuracy benchmarks
-- [ ] **Month 6 — Commercial beta:** Docker image; API keys/TLS; backup/restore MVP; Python SDK; Grafana dashboard; benchmark report; customer-runnable DSP-Bench; design-partner onboarding docs. *Goal: a "DSP Performance Preview" for 3–5 partners.*
+- [ ] **Month 6 — Commercial beta:** Docker image; API keys/TLS; backup/restore MVP; Python SDK; Grafana dashboard; benchmark report; customer-runnable Weft-Bench; design-partner onboarding docs. *Goal: a "WeftDB Performance Preview" for 3–5 partners.*
 
 ---
 
@@ -988,7 +994,7 @@ compression, compressed query, analytics pipeline); **metrics** (points/sec,
 bytes/sec, p50/p95/p99/max latency, storage bytes/point, compression ratio + speed,
 random-access latency, GPU upload/kernel/readback, memory, CPU + GPU utilization,
 freshness lag, cost estimate, correctness/error metrics); and a **required honesty
-section** (where DSP wins, where it loses, workloads not tested, known limitations,
+section** (where WeftDB wins, where it loses, workloads not tested, known limitations,
 config caveats, reproduction instructions).
 
 ---
@@ -997,20 +1003,20 @@ config caveats, reproduction instructions).
 
 **Benchmarking research:** *TSM-Bench* (PVLDB'23) and *SEER* (PVLDB'24) →
 macrobenchmarks with realistic data, concurrency, dashboards, reproducibility;
-DSP-Bench should resemble SEER. *SciTS* → growth curves (10M→100M→1B). *TSBS* →
+Weft-Bench should resemble SEER. *SciTS* → growth curves (10M→100M→1B). *TSBS* →
 implement for compatibility (via ILP), not as the primary proof.
 
 **Competitor architecture (don't benchmark stale mental models):** *InfluxDB 3*
 (FDAP stack) — compete where it's less specialized (interpolation-heavy irregular,
 precision, GPU resampling, model compression), not on broad scans. *TimescaleDB
-Hypercore* (hybrid row/columnar) → DSP needs its own hot/cold story. *ClickHouse*
+Hypercore* (hybrid row/columnar) → WeftDB needs its own hot/cold story. *ClickHouse*
 (vectorized OLAP) → don't fight on generic OLAP first. *QuestDB* (ILP, `SAMPLE BY`,
 ASOF) → strong finance/high-ingest comparison. *Apache IoTDB/TsFile* → validates a
 time-series-native columnar file layout. *DuckDB* → excellent CPU-only baseline.
 *kdb+* → optional; **legal review before publishing comparisons.**
 
 **Compression research:** *Chimp* (PVLDB'22), *Elf* (PVLDB'23), *ALP* (SIGMOD'24,
-vectorized), *NeaTS* (ICDE'25, nonlinear + random access — aligns with DSP's spline
+vectorized), *NeaTS* (ICDE'25, nonlinear + random access — aligns with WeftDB's spline
 DNA). Judge compression by *downstream task impact*, not only bytes.
 
 **GPU databases:** the bottleneck is end-to-end data movement (PCIe, capacity,
@@ -1028,12 +1034,12 @@ data; industrial IoT / SCADA; energy / grid monitoring; scientific instrumentati
 robotics / autonomous telemetry; healthcare / wearables (if compliance scope is
 manageable). **Design-partner criteria:** irregular data; large historical ranges;
 production interpolation/gap filling; pain with current TSDB/app-layer workflow;
-measurable latency/cost targets; willing to run DSP-Bench and share anonymized
+measurable latency/cost targets; willing to run Weft-Bench and share anonymized
 results. *Avoid partners who only need generic dashboards.*
 
 **Pricing hypotheses:** open-source core; paid enterprise server; paid GPU
 acceleration; paid advanced compression; paid security/compliance; paid benchmark
-consulting; managed DSP-Bench reports; support subscription. **Validate willingness
+consulting; managed Weft-Bench reports; support subscription. **Validate willingness
 to pay before building expensive distributed features.** Key question: *is
 interpolation performance a budget-owning pain, or merely an engineering annoyance?*
 
@@ -1049,7 +1055,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   follow-ons (sidecar sweep shipped; snapshot cost **measured**, and the diagnosis on record was
   wrong — it is I/O, not vacuum CPU) and landed the depth item (**transposed layout realized on
   disk**, with an honest end-to-end *no-win* result). Recommended order:
-  1. **Route measurement bulk ingest through the `.dspseg` seal — still the highest-value item, and
+  1. **Route measurement bulk ingest through the `.weftseg` seal — still the highest-value item, and
      still not started.** On the **real** `btc_1min.csv` the legacy `batch_capture_measurements` path
      runs at **2,978 rows/s at n=20k falling to 1,447 rows/s at n=40k** — 2× rows costing **4.11×**
      the time — while the columnar seal is linear and *speeds up* with amortization (**202k → 288k
@@ -1060,7 +1066,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
      · https://medium.com/@JasonWyatt/squeezing-performance-from-sqlite-insertions-971aff98eef2)*
   2. **Backup cost residue, now that the cause is known (cheap, and measurable on the shipped
      bench):** run the two A/B experiments — `PRAGMA synchronous=OFF` on the snapshot connection, and
-     an explicit `db.checkpoint()` before the four vacuums — on `DSP_BENCH_BACKUP_DIR` pointed at a
+     an explicit `db.checkpoint()` before the four vacuums — on `WEFT_BENCH_BACKUP_DIR` pointed at a
      real volume on a **quiet** box. Both are filed with their citations in the Turso section. Do
      **not** reach for the experimental passive checkpoint: it is an open data-loss path (#8076).
   3. **The decode-threshold slice (cheap, and the transposed layout's real lever):** make the reader
@@ -1068,20 +1074,20 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
      single-value path in `read_value_at`, and fix the **batch** point read, which still re-decodes a
      tile per instant. Filed with its citation beside the transposed item.
   4. **The depth item is now the f64/ALP arc**, which the 2026-09-23 research substantially
-     retargeted: ALP has a frozen Parquet wire layout whose 1024 vector size matches DSP's tile, the
+     retargeted: ALP has a frozen Parquet wire layout whose 1024 vector size matches WeftDB's tile, the
      `alp` crate makes it benchmarkable without hand-rolling, the acceptance bar should come from
      upstream's own +4.36%/−7.28% ablation (declining is a legitimate outcome), and the GPU target
      should be **G-ALP**, not arXiv 2511.04140 — with the exception layout decided *before* the
      on-disk block is frozen.
 
-- [ ] **POSITIONING ALERT — DSP's precision wedge now has a direct competitor (research 2026-09-23).**
+- [ ] **POSITIONING ALERT — WeftDB's precision wedge now has a direct competitor (research 2026-09-23).**
   QuestDB shipped a native **`DECIMAL(precision, scale)`** in 9.2 (Nov 2025): up to 76 digits,
   auto-sized storage from 1 byte (DECIMAL8) to 32 bytes (DECIMAL256), **no implicit conversion**
   (explicit `CAST` or an `m` literal suffix), at a documented cost of only **~2× DOUBLE**. That is
-  nearly the same shape as DSP's "BigDecimal logical type + schema-declared physical encoding, no
+  nearly the same shape as WeftDB's "BigDecimal logical type + schema-declared physical encoding, no
   silent downcast" pitch, so "precision-aware time-series engine" is no longer a category of one.
-  Two consequences: DSP-Bench needs an **exact-arithmetic arm** (same precision/scale on both sides,
-  e.g. DECIMAL(38,9) equivalent) rather than only decimal-vs-f64 internally, and DSP must be able to
+  Two consequences: Weft-Bench needs an **exact-arithmetic arm** (same precision/scale on both sides,
+  e.g. DECIMAL(38,9) equivalent) rather than only decimal-vs-f64 internally, and WeftDB must be able to
   state **its own decimal-vs-f64 slowdown factor** against QuestDB's published ~2× or the wedge is
   asserted rather than measured. *(src: https://questdb.com/docs/query/datatypes/decimal/)*
 
@@ -1090,8 +1096,8 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   protocol that supersedes both ILP (writes) and PG Wire (reads) and streams **Apache Arrow** record
   batches, reporting 220M rows/s egress. An adapter written against PG Wire would be measuring a
   deprecated path and is trivially attacked as unfair — use QWP/Arrow and record the protocol in the
-  run manifest. Corollary for DSP itself: if the north star is $/billion interpolated **output**
-  points, result serialization is on the critical path, so DSP needs its own Arrow-batch egress or
+  run manifest. Corollary for WeftDB itself: if the north star is $/billion interpolated **output**
+  points, result serialization is on the critical path, so WeftDB needs its own Arrow-batch egress or
   the comparison is apples-to-oranges. (b) **ASOF joins:** QuestDB now has four+ selectable ASOF
   strategies (Fast, Memoized, Light, and Dense added in 9.2), optimizer-chosen but hint-overridable —
   run the arm **twice** (optimizer default and best-hint), publish both, and capture the chosen
@@ -1100,19 +1106,19 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   ClickHouse (1.55× native reads, 2.35× Arrow streaming) and its DECIMAL docs claim wins over
   ClickHouse and DuckDB — current, dated evidence that named comparative publication is normal
   practice here, which de-risks the open legal item below. It also sets the rhetorical bar: vendor
-  comparisons quote a single headline multiplier, so DSP's $/billion-points framing needs one beside
+  comparisons quote a single headline multiplier, so WeftDB's $/billion-points framing needs one beside
   it. *(src: https://questdb.com/blog/questdb-10-release/ · https://questdb.com/blog/questdb-9-2-release/)*
 
-- [ ] **Adopt the TSM-Bench QUERY SPEC (not the repo) as DSP-Bench's external comparison workload.**
+- [ ] **Adopt the TSM-Bench QUERY SPEC (not the repo) as Weft-Bench's external comparison workload.**
   TSM-Bench (PVLDB 16(11), 2023) already defines interpolation as a first-class benchmark query — Q5
   is literally `SELECT time, st_id, <s_list> FROM ts_table WHERE … SAMPLE BY 5s FILL(LINEAR)` — and
   records that **Druid and MonetDB do not support it at all**, and that eXtremeDB "does not support
   interpolation, instead, it fills the surrogate values with zeros". That is **peer-reviewed,
-  citable evidence for DSP's core commercial claim** that interpolation is under-served, far stronger
-  than a vendor blog, and Q5/Q4 are ready-made specs rather than workloads DSP invents for itself.
+  citable evidence for WeftDB's core commercial claim** that interpolation is under-served, far stronger
+  than a vendor blog, and Q5/Q4 are ready-made specs rather than workloads WeftDB invents for itself.
   Its datasets also give an externally-defined scale bar: **D-LONG 518M** points and **D-MULTI 17.2B**
   points — the right order of magnitude for a "$ per billion interpolated points" headline.
-  **Implement the spec inside DSP's own harness; do not depend on the repos** — the academic line is
+  **Implement the spec inside WeftDB's own harness; do not depend on the repos** — the academic line is
   dormant (TSM-Bench last pushed 2025-12-25, 28 stars; SEER last pushed 2024-08-23, 5 stars). For
   TSBS compatibility, target the fork that is actually moving: **questdb/tsbs** (pushed 2026-09-04)
   rather than timescale/tsbs (2026-05-27), and note the divergence in the run manifest — neither is
@@ -1120,7 +1126,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   https://www.vldb.org/pvldb/vol16/p3363-khelifati.pdf · https://api.github.com/repos/questdb/tsbs ·
   https://api.github.com/repos/eXascaleInfolab/seer)*
 
-- [ ] **BENCHMARK HYGIENE — the synthetic ingest corpus flatters DSP, by a lot (measured 2026-07-23).**
+- [ ] **BENCHMARK HYGIENE — the synthetic ingest corpus flatters WeftDB, by a lot (measured 2026-07-23).**
   Running `ingest_path_profile_legacy_vs_columnar` on the real corpus for the first time contradicted
   the synthetic numbers three ways, all now guarded in the harness but worth carrying as a standing
   caution for every workload that uses a generator:
@@ -1136,7 +1142,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
     doing its job. The harness now derives an exact encoding via `recommend_encoding`; the 1M-row
     window needs `ScaledI64 { scale: 8 }` while the 20k/40k windows need only scale 2, so the required
     scale is *window-dependent* — which is exactly why it must be derived, not declared by a benchmark.
-  - [ ] Audit the other `dsp-bench` workloads' generators for the same class of flattery (the shape
+  - [ ] Audit the other `weft-bench` workloads' generators for the same class of flattery (the shape
     knobs are seeded and reproducible, but "reproducible" is not "representative").
 
 - [x] **DONE (2026-07-20) — BUG ROOT-CAUSED + FIXED: the "flaky GPU interpolation tests" were never a
@@ -1169,7 +1175,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   (previously ~1 run in 3 failed, and `tests::regression` failed ~2/2). The Phase 5 GPU benchmark
   claims now have a correctness gate that means something.
 - [x] **DONE (2026-07-20) — BLOCKER CLEARED: the `gpu_integration_tests` rustc ICE was an
-  attribute-ORDER bug, fixable in DSP's own source.** The dump names it exactly: `attribute is missing
+  attribute-ORDER bug, fixable in WeftDB's own source.** The dump names it exactly: `attribute is missing
   tokens` on the compiler-injected `rustc_test_entrypoint_marker` at
   `splimes\tests\gpu_integration_tests.rs:6:1: 6:8` — i.e. on `#[test]`. Mechanism: with `#[test]`
   **outermost**, rustc's builtin harness injects its entrypoint marker and the `#[serial(gpu_tests)]`
@@ -1184,7 +1190,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 - [x] **DONE (2026-07-20) — the LNK1102 link OOM is FIXED at the root: `[profile.test] debug = 1`.**
   With the ICE cleared, the default-parallelism `cargo test --workspace` died in `link.exe` with
   `LINK : fatal error LNK1102: out of memory` while linking several large test executables at once
-  (`dsp-arrow-store`, `database`'s `db_tests`, `dsp-tui`, `dsp-server`); the cascade of
+  (`weft-arrow-store`, `database`'s `db_tests`, `weft-tui`, `weft-server`); the cascade of
   `can't find crate` / `no resolution for an import` "ICE"s after it was downstream noise from those
   failed links, not separate compiler bugs. A resource limit, not a correctness one (~250 rlibs per
   test binary). Two fixes were measured, and the better one shipped:
@@ -1260,29 +1266,29 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   proc-macro attribute on one function). So this is not a transient nightly regression that a toolchain
   bump will fix, and writing `#[test]` above a proc-macro attribute anywhere in the workspace will
   reintroduce it. Worth (a) a comment at each site — done in `gpu_integration_tests.rs` — and (b)
-  considering a lint/grep in CI. DSP's ordering repro is also a cleaner minimization than the issue's
+  considering a lint/grep in CI. WeftDB's ordering repro is also a cleaner minimization than the issue's
   current one (which involves an unimported `test_case`), so it is worth contributing upstream.
   *(src: https://github.com/rust-lang/rust/issues/100263)*
 
-- [x] **DONE (2026-07-14, capstone of the 2026-07-13 read-path arc) — `dsp-bench` `point_lookup` workload
+- [x] **DONE (2026-07-14, capstone of the 2026-07-13 read-path arc) — `weft-bench` `point_lookup` workload
   + the full storage/read/aggregation suite:** shipped `run_point_lookup` (parallel runner sealing a
-  `dsp-physical-type` `Segment` and timing `dspseg::read_segment_point`/`read_segment_points`, single &
+  `weft-physical-type` `Segment` and timing `weftseg::read_segment_point`/`read_segment_points`, single &
   batch, regular closed-form vs irregular, single-block & paged, present + off-grid queries) with a
   correctness gate vs the full-decode `value_at`, p50/p95/p99 + CIs, and a `--point-lookup` CLI mode.
   Measured (release, 100k-row FOR segment, 128-instant batch): regular batch p50=749µs / 169k lookups·s⁻¹,
   irregular batch p50=2.67ms; batch amortizes ~37× over N single reads; closed-form regular ~3.6× the
   irregular decode+search. Landed alongside the sibling `range_fetch`, `compression`, and `downsample`
-  workloads (see Phase 1 shipped-workloads item) and the shared `dsp-reduce` crate.
-- [x] **NEW — cross-engine point-lookup comparison** is the residue: DSP's own point-lookup is now
+  workloads (see Phase 1 shipped-workloads item) and the shared `weft-reduce` crate.
+- [x] **NEW — cross-engine point-lookup comparison** is the residue: WeftDB's own point-lookup is now
   benchmarked; wiring ClickHouse ASOF / QuestDB behind the same workload (needs the external adapters
-  below) is the next step, and the evidence for the *When DSP beats general TSDBs* point-lookup page.
-- [x] **`dsp-reduce` crate + downsample reduction (2026-07-14):** new vendor-neutral leaf crate
+  below) is the next step, and the evidence for the *When WeftDB beats general TSDBs* point-lookup page.
+- [x] **`weft-reduce` crate + downsample reduction (2026-07-14):** new vendor-neutral leaf crate
   (`Aggregation`/`Bucket`/`reduce`, BigDecimal, epoch-grid buckets) that the HTTP `downsample` endpoint
-  was **deduplicated onto** (server no longer carries its own copy) and the `dsp-bench` `downsample`
+  was **deduplicated onto** (server no longer carries its own copy) and the `weft-bench` `downsample`
   workload drives. Full reduction set: min/max/avg/sum/first/last + nearest-rank **p50/p90/p95/p99** +
   **TWA** (LOCF dwell-weighting). Runtime-verified against the live `/api/v1/downsample` endpoint.
 - [x] **DONE (2026-07-16) — approximate mergeable quantiles (DDSketch):** shipped as
-  `dsp-reduce::sketch::DdSketch` (canonical logarithmic mapping `γ=(1+α)/(1-α)`, mirrored negative
+  `weft-reduce::sketch::DdSketch` (canonical logarithmic mapping `γ=(1+α)/(1-α)`, mirrored negative
   store, exactly-counted zeros, `merge`) + the four opt-in `sketch_p50`/`p90`/`p95`/`p99` reductions
   (`SKETCH_ALPHA` = 1%), reachable on the HTTP downsample endpoint and its ILP siblings. Values
   **stream** into the per-bucket sketch (`needs_full_bucket` deliberately excludes them), so a bucket
@@ -1292,20 +1298,20 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   p50=468.90 ms / 1,075,976 pts·s⁻¹ vs exact `p99` p50=2018.53 ms / 249,169 pts·s⁻¹ — ~4.3× faster.**
   Runtime-verified against the live endpoint: sketch_p50=497.78 vs exact 500.0 (0.44%) and
   sketch_p99=982.58 vs exact 990.0 (0.75%), both inside the 1% bound.
-- [ ] **NEXT — UDDSketch (uniform guarantee under collapse):** DSP's `max_bins` uses the reference
+- [ ] **NEXT — UDDSketch (uniform guarantee under collapse):** WeftDB's `max_bins` uses the reference
   **collapsing-lowest** strategy, which preserves every count/rank but **loses the relative-error
   bound for quantiles inside collapsed buckets** (for an all-positive column: the low quantiles;
   p95/p99 are unaffected) and costs exact mergeability between two sketches that collapsed
   differently. **UDDSketch**'s uniform bucket-collapse keeps accuracy guarantees over the *full*
-  quantile range under collapse — the principled fix if DSP ever needs a tight low-quantile bound on
+  quantile range under collapse — the principled fix if WeftDB ever needs a tight low-quantile bound on
   a pathological range. Low priority: `SKETCH_MAX_BINS` spans a ~10¹⁷ dynamic range, so a realistic
   column never collapses. *(src: collapsing loses the guarantee on collapsed quantiles —
   https://github.com/DataDog/sketches-java · UDDSketch — https://arxiv.org/abs/2004.08604)*
 - [x] **DONE (2026-07-16) — sketch rank-convention divergence REMOVED.** `DdSketch::quantile` now
-  ranks by DSP's nearest-rank ordinal (`⌈q·n⌉`, 1-based, clamped) rather than DDSketch's reference
+  ranks by WeftDB's nearest-rank ordinal (`⌈q·n⌉`, 1-based, clamped) rather than DDSketch's reference
   `⌊q·(n-1)⌋`, so `sketch_p*` and `p*` name the **same sample at every bucket size** and the sketch
   is always within `SKETCH_ALPHA` of the exact answer — substitutable, no small-bucket trap.
-  DSP-internal consistency beat matching Datadog's convention. Guarded by
+  WeftDB-internal consistency beat matching Datadog's convention. Guarded by
   `sketch_and_exact_percentiles_agree_on_small_buckets` (n=1..=12 × p50/p90/p99). Runtime-verified:
   a 3-sample bucket returns `sketch_p99`=49.90 vs exact 50.0 where it previously returned **0.0**.
 - [x] **DONE (2026-07-16) — the mergeable-reduction primitive exists.** `reduce_partial(...)
@@ -1315,7 +1321,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   reduction (counts/sums add, min/max combine, first/last resolve by timestamp, samples concatenate,
   sketches merge) — proven by reducing 600 points in four boundary-straddling chunks, merging in a
   scrambled order, and asserting equality with the single pass across all 13 reductions.
-- [x] **DONE (2026-07-16) — `PartialReduction` has a consumer + a number.** `dsp-bench --ds-parallel
+- [x] **DONE (2026-07-16) — `PartialReduction` has a consumer + a number.** `weft-bench --ds-parallel
   <N>` reduces in N rayon chunks via `reduce_partial` and merges (identical buckets to serial,
   asserted by test across 2/3/8/64 chunks and 9 reductions). Measured (500k points, `sketch_p99`,
   5 reps, 16-core, correctness PASS): serial 441.2 ms / 1,134,659 pts·s⁻¹ → **64 chunks 30.1 ms /
@@ -1357,33 +1363,33 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   *(Caveat recorded honestly: run-to-run variance on this box is ~30%, so no claim rests on the
   single-segment numbers — only the multi-segment speedups, which sit far outside that band.)*
 - [x] **DONE (2026-07-18) — materialize per-segment partials at seal time (the highest-value
-  downsample follow-on): shipped.** DSP's `PartialReduction` (mergeable, exact for every reduction) IS
+  downsample follow-on): shipped.** WeftDB's `PartialReduction` (mergeable, exact for every reduction) IS
   the partial TimescaleDB's continuous aggregates / ClickHouse's `AggregatingMergeTree` store and
   finalize at query time — and a sealed segment is immutable, so its partial can never go stale (the
-  invariant Timescale needs a refresh policy to maintain, DSP gets for free). Shipped across the arc:
-  - [x] **(1) per-segment `.dspart` sidecar at a declared base resolution** — `dsp-reduce`'s
+  invariant Timescale needs a refresh policy to maintain, WeftDB gets for free). Shipped across the arc:
+  - [x] **(1) per-segment `.weftpart` sidecar at a declared base resolution** — `weft-reduce`'s
     `PartialReduction`/`DdSketch` are serde-serializable; `database`'s `PartialSidecar` frame
     (magic-prefixed bincode, staleness stamp = segment `(row_count, byte_len)`), `PartialSidecarPolicy`
-    (off by default; `DSP_SEGMENT_PARTIAL_BASE`/`DSP_SEGMENT_PARTIAL_MIN_ROWS`), written at seal for the
+    (off by default; `WEFT_SEGMENT_PARTIAL_BASE`/`WEFT_SEGMENT_PARTIAL_MIN_ROWS`), written at seal for the
     ten bounded reductions (`Aggregation::is_sidecar_materializable`).
   - [x] **(2) `downsample_range` merges sidecars in place of a decode** when every requested reduction
     is materializable, the window covers the segment, and the base serves the resolution — **measured
     3.2× vs decode** (8.39 ms → 2.60 ms, 16 seg / 200k rows, min/max/avg/sum/first/last + sketch_p99;
-    `database/benches/downsample_range.rs`), proven to skip the value column by deleting every `.dspseg`
+    `database/benches/downsample_range.rs`), proven to skip the value column by deleting every `.weftseg`
     and re-running the downsample unchanged.
   - [x] **re-bucketing a fine base to a coarser resolution** — `PartialReduction::rebucket` +
     `grids_nest` re-key a fine-base partial (e.g. MINUTES) to any coarser nesting resolution
     (HOURS/DAYS) with no decode, the in-query form of TimescaleDB's hierarchical continuous aggregates.
   - [x] **sidecar consistency across rewrites** — a reconcile/split/squash regenerates or removes the
-    sidecar so acceleration survives (and no `.dspart` is orphaned).
-- [x] **DONE (2026-07-19) — (3b) hierarchy of materialized tiers.** The `.dspart` sidecar carries a
+    sidecar so acceleration survives (and no `.weftpart` is orphaned).
+- [x] **DONE (2026-07-19) — (3b) hierarchy of materialized tiers.** The `.weftpart` sidecar carries a
   chain of coarser rollup tiers beside its base partial (`PartialSidecar::rollups`, frame version 2),
   each re-keyed from the tier below (`build_rollups`, associative + cheaper than from the base), so a
   coarse downsample re-keys from the coarsest materialized grid that nests in the requested resolution
   (`PartialSidecar::partial_for`, exact tier = zero re-key) instead of folding the whole fine base — the
   in-storage analogue of TimescaleDB's continuous-aggregates-on-continuous-aggregates and ClickHouse's
-  `raw→hourly→daily` `-State`/`-Merge` rollups (whose quantile-digest-as-state validates DSP's
-  `sketch_p*`-in-sidecar). Opt-in via `DSP_SEGMENT_PARTIAL_TIERS` (comma-separated fine→coarse,
+  `raw→hourly→daily` `-State`/`-Merge` rollups (whose quantile-digest-as-state validates WeftDB's
+  `sketch_p*`-in-sidecar). Opt-in via `WEFT_SEGMENT_PARTIAL_TIERS` (comma-separated fine→coarse,
   `[Option<Resolution>; MAX_SIDECAR_TIERS=4]`, non-nesting/finer entries skipped); a rewrite
   regenerates the tiers. **Measured ~1.16×** on a DAY query over a MINUTES base (16 seg / 200k rows,
   7.30 → 6.30 ms, non-overlapping CIs; `database/benches/downsample_range.rs::bench_tiered_vs_single_base`).
@@ -1393,7 +1399,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   https://docs.tigerdata.com/use-timescale/latest/continuous-aggregates/hierarchical-continuous-aggregates/
   · ClickHouse AggregatingMergeTree `-State`/`-Merge` + rollup —
   https://clickhouse.com/docs/engines/table-engines/mergetree-family/aggregatingmergetree)*
-- [x] **DONE (2026-07-19) — (3a) materialization watermark: satisfied by construction.** DSP has no
+- [x] **DONE (2026-07-19) — (3a) materialization watermark: satisfied by construction.** WeftDB has no
   "unsealed hot tail" at the store layer — every segment is immutable once sealed — so the watermark
   reduces to *which sealed segments carry a sidecar*, which `downsample_range` already handles
   transparently: a segment with a matching sidecar merges its stored partial, one without decodes on the
@@ -1417,27 +1423,27 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 - [ ] **NEXT — (3c) materialized tiers, remaining:** (i) a sensible **default** tier chain derived from
   the base — owner-gated, a default-flip like the others. Now better informed: per (3c)(ii) above the
   payoff is 1.15–1.38× over the realistic span range, i.e. real but modest, so a default chain should be
-  justified against its extra `.dspart` bytes rather than assumed. (ii) The remaining unmeasured axis is
+  justified against its extra `.weftpart` bytes rather than assumed. (ii) The remaining unmeasured axis is
   the **sidecar read cost itself** — split the tiered arm's wall-clock into sidecar-read vs re-key to see
   whether a *shallower* chain (say `[DAYS]` only, no `HOURS`) beats the full chain at coarse queries.
-- [ ] **Positioning — DSP's `.dspart` sidecar IS the "incremental materialized view", and mergeable
+- [ ] **Positioning — WeftDB's `.weftpart` sidecar IS the "incremental materialized view", and mergeable
   DDSketch is its edge (this run's research):** ClickHouse frames the choice as **incremental** MVs
   (insert-triggered, real-time, `AggregatingMergeTree` storing `-State` partial aggregates merged lazily
   at query) vs **refreshable** MVs (scheduled full recompute; the fallback for dimension-heavy joins and
   UPDATE/DELETE sources, and — critically — for *percentiles / distinct counts over wide windows, which
-  incremental MVs handle awkwardly*). DSP's sidecar is exactly the incremental/`AggregatingMergeTree`
-  pattern (immutable-segment partials on disk, merged in `downsample_range`) — and because DSP's partial
+  incremental MVs handle awkwardly*). WeftDB's sidecar is exactly the incremental/`AggregatingMergeTree`
+  pattern (immutable-segment partials on disk, merged in `downsample_range`) — and because WeftDB's partial
   carries a **mergeable DDSketch**, it serves the wide-window percentile case that ClickHouse names as
-  incremental's weakness. Fold this into the *When DSP beats general TSDBs* honesty page as a concrete
+  incremental's weakness. Fold this into the *When WeftDB beats general TSDBs* honesty page as a concrete
   wedge, and note the **refreshable** counterpart (a scheduled full re-reduce) becomes relevant only once
-  B-tags bring UPDATE/DELETE-style mutations DSP's immutable segments don't yet have. *(src: ClickHouse
+  B-tags bring UPDATE/DELETE-style mutations WeftDB's immutable segments don't yet have. *(src: ClickHouse
   incremental vs refreshable materialized views —
   https://clickhouse.com/docs/materialized-view/refreshable-materialized-view · TimescaleDB real-time vs
   materialized-only continuous aggregates —
   https://www.tigerdata.com/learn/continuous-aggregates-timescaledb)*
 - [ ] **NEXT — materialize the sidecar at a coarser DEFAULT + adopt sketches:** the sidecar is off by
-  default (opt-in via `DSP_SEGMENT_PARTIAL_BASE`). Decide a sensible default base per the shape mix (a
-  finer base serves more resolutions but costs more `.dspart` bytes and seal CPU for the sketch), and
+  default (opt-in via `WEFT_SEGMENT_PARTIAL_BASE`). Decide a sensible default base per the shape mix (a
+  finer base serves more resolutions but costs more `.weftpart` bytes and seal CPU for the sketch), and
   measure the seal-time cost of building the four `sketch_p*` sketches per segment vs the read win —
   the sidecar's size/CPU is the trade to quantify before flipping any default. Owner-gated like the
   other default flips.
@@ -1454,12 +1460,12 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   `merge_newer_wins` last-writer-wins + reseal + sidecar cleanup).
 - [x] **DONE (2026-07-19) — size-targeted compaction wired into the reconcile daemon + a manual
   endpoint.** `reconcile_tick_compact` + `ReconcileDaemonConfig.compact_target_rows` + the
-  `DSP_COMPACT_TARGET_ROWS` env (beside the reconcile/squash daemon knobs) run
-  `squash_all_to_target_rows` each tick, recording passes in the `dsp_reconcile_*` metrics; the manual
+  `WEFT_COMPACT_TARGET_ROWS` env (beside the reconcile/squash daemon knobs) run
+  `squash_all_to_target_rows` each tick, recording passes in the `weft_reconcile_*` metrics; the manual
   `POST /api/v1/storage/{aspect}/compact?target_rows=N` (parallel to `/squash`) runs
   `squash_aspect_to_target_rows` on demand. **Both runtime-verified** against the live binary: six
   ingested 2-row segments coalesced to two 6-row segments — the daemon path via `/stats` segment_count
-  6→2 + the `reconcile.tick kind="compact"` span + `dsp_reconcile_passes_total`, and the endpoint via
+  6→2 + the `reconcile.tick kind="compact"` span + `weft_reconcile_passes_total`, and the endpoint via
   `POST …/compact?target_rows=6` → `{"removed":4,"segment_count":2}` (missing `target_rows` → 400).
 - [x] **DONE (2026-07-19) — fragmentation gate for the compaction daemon.**
   `SegmentStore::squash_aspect_to_target_rows_if_fragmented` reads the **O(1)** per-aspect rollup and
@@ -1469,7 +1475,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   `squash_all_to_target_rows_if_fragmented`. The ungated `squash_*_to_target_rows` stays as the "force"
   form the manual `/compact` endpoint uses. (2 new database tests: gate skips a well-sized aspect,
   gated sweep touches only the fragmented one.)
-- [ ] **NEXT — default target for the compaction daemon:** pick a sensible **default** `DSP_COMPACT_TARGET_ROWS`
+- [ ] **NEXT — default target for the compaction daemon:** pick a sensible **default** `WEFT_COMPACT_TARGET_ROWS`
   from a real segment-size mix — the 200k-row bench's ~12.5k is corpus- and hardware-specific (the
   transferable knob is rows-per-segment, but the optimum shifts with decode cost and core count).
   Owner-gated default.
@@ -1493,39 +1499,39 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   twa_linear=50.0 / avg=50.0. *(src:
   https://github.com/timescale/timescaledb-toolkit/discussions/697)*
 - [x] **DONE (2026-07-16) — server ILP `parse_aggregation_token` adopts
-  `dsp_reduce::Aggregation::from_token`:** the last duplicate of the aggregation vocabulary is gone;
+  `weft_reduce::Aggregation::from_token`:** the last duplicate of the aggregation vocabulary is gone;
   the HTTP surface consequently gained the `median`/`time_weighted_avg` aliases it had been missing
-  and can no longer drift from the reduction. (The drift was real: `dsp-bench`'s `--ds-aggs` error
+  and can no longer drift from the reduction. (The drift was real: `weft-bench`'s `--ds-aggs` error
   message had already gone stale, omitting `twa` — fixed in the same pass.)
-- [x] Create `dsp-bench` as a first-class workspace member
+- [x] Create `weft-bench` as a first-class workspace member
 - [x] Define the first benchmark profile: `interpolation-heavy-irregular`
-- [x] DSP adapter + portable baselines (linear class-C, forward-fill class-B) + accuracy scoring + shape-selectable ground truth
+- [x] WeftDB adapter + portable baselines (linear class-C, forward-fill class-B) + accuracy scoring + shape-selectable ground truth
 - [ ] Add the **DuckDB** adapter — the first external-engine (real database) baseline
 - [ ] Add ClickHouse, InfluxDB 3, QuestDB, TimescaleDB adapters
-- [x] Implement InfluxDB Line Protocol ingest (shared `dsp-line-protocol` crate; bench + server wired end-to-end)
+- [x] Implement InfluxDB Line Protocol ingest (shared `weft-line-protocol` crate; bench + server wired end-to-end)
 - [ ] Add end-to-end timing spans *(harness-level spans shipped; per-pipeline-stage spans = Phase 3 tracing item)*
 - [x] **Cross-segment out-of-order merge (Phase 4.6):** shipped — overlap detection
   (`SegmentIndex::overlapping_count`, surfaced in per-aspect + store-wide stats),
   the `merge_newer_wins` kernel, `SegmentStore::reconcile_overlaps`/`reconcile_all_overlaps`
   (+ `SegmentIndexStore::delete`), the `?overlaps=true` reconcile endpoints, and the
-  `DSP_RECONCILE_OVERLAPS` background daemon sweep
+  `WEFT_RECONCILE_OVERLAPS` background daemon sweep
 - [x] **Hot/cold split in the background reconcile (Phase 4.6):** shipped —
   `reconcile_aspect_hot_cold`/`reconcile_all_hot_cold`, `?hot_cold=true` endpoints,
-  `DSP_RECONCILE_HOT_COLD` daemon mode
+  `WEFT_RECONCILE_HOT_COLD` daemon mode
 - [x] **Split-not-rewrite optimization (Phase 4.6):** shipped — `split_segment`
   primitive, `reconcile_overlaps_with_policy` (consumes `SplitPolicy::decide`; default
   `reconcile_overlaps` keeps the 50 MiB floor), the `?split_min_bytes=` query param on
-  the per-aspect and store-wide reconcile endpoints, and the `DSP_RECONCILE_SPLIT_MIN_BYTES`
+  the per-aspect and store-wide reconcile endpoints, and the `WEFT_RECONCILE_SPLIT_MIN_BYTES`
   daemon env; plus the **squash** half — `squash_aspect`/`squash_aspect_if_exceeds`/
   `squash_all_over_threshold`, `POST …/{aspect}/squash?max_segments=`, and the
-  `DSP_RECONCILE_MAX_SPLITS` daemon env *(src: https://questdb.com/docs/concepts/partitions/)*
+  `WEFT_RECONCILE_MAX_SPLITS` daemon env *(src: https://questdb.com/docs/concepts/partitions/)*
 - [x] **Per-stage tracing child spans (Phase 3):** shipped — `interpolate.parse`/
   `interpolate.compute`/`interpolate.serialize` under `interpolate.engine`,
   `downsample.parse` beside `downsample.reduce`, `storage.ingest.parse`/`storage.ingest.seal`
   on the write path, and a per-request root span (`request{method,path,request_id}` +
   `x-request-id`) they all nest under
 - [x] **OTLP trace export (Phase 3):** shipped — env-gated OTLP/gRPC `SdkTracerProvider`
-  (batch exporter + `dsp-server` resource) + `tracing_opentelemetry` layer beside the
+  (batch exporter + `weft-server` resource) + `tracing_opentelemetry` layer beside the
   `fmt` subscriber; deps `opentelemetry`/`opentelemetry_sdk`/`opentelemetry-otlp` 0.32 +
   `tracing-opentelemetry` 0.33 (build protoc-free). Runtime-verified boot both with and
   without `OTEL_EXPORTER_OTLP_ENDPOINT`.
@@ -1536,8 +1542,8 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   forward-iteration token on `…/points` + `…/value-points`
 - [x] **Gorilla-codec adopt-or-drop (Phase 6.1): ADOPTED + realized.** Benchmarked on a
   scattered-single-jitter corpus (~28% below the best shipped codec in its ±2048 regime,
-  honest loss past it); realized as a lossless codec, wired into the `.dspseg` block +
-  `best_estimated_bytes`/`best_encoding_name`, and surfaced in dsp-bench. RLE realized on
+  honest loss past it); realized as a lossless codec, wired into the `.weftseg` block +
+  `best_estimated_bytes`/`best_encoding_name`, and surfaced in weft-bench. RLE realized on
   disk in the same arc.
 - [x] **Scaled-int value bit-pack codec (Phase 4/6): shipped + realized on disk.** The
   value block carries a `VAL_CODEC_VARINT`/`VAL_CODEC_BITPACK` selector; a `ScaledI64`
@@ -1545,7 +1551,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   `StorageEstimate.realized_value_bytes`/`value_codec` (schema v8). Measured 37.4% below
   varint on a 480-pt 2-decimal ramp; runtime `bytes_per_point=2.13` via `/…/stats`.
 - [x] **Per-block adaptive (dynamic) bit-pack timestamp codec (Phase 6.1): shipped.** The
-  fifth `.dspseg` timestamp codec (`TS_CODEC_BLOCKED`), strict winner on mixed-magnitude
+  fifth `.weftseg` timestamp codec (`TS_CODEC_BLOCKED`), strict winner on mixed-magnitude
   streams (184 B vs 384–961 B for the other codecs on the eval corpus).
 - [x] **`storage.ingest.parquet` stage span (Phase 3): shipped.** Closes the
   Arrow-decode-on-ingest tracing gap; runtime-verified nesting under the request root span
@@ -1561,7 +1567,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   a mixed-magnitude / zero-straddling mantissa column; regular columns byte-for-byte
   unchanged. Round-trip- + framed-segment-verified.
 - [x] **FOR adopt-or-drop (Phase 6.1): DECIDED — ADOPTED for the value column (owner
-  sign-off).** `VAL_CODEC_FOR` realized as the fourth `.dspseg` value codec
+  sign-off).** `VAL_CODEC_FOR` realized as the fourth `.weftseg` value codec
   (`scaled_for`, strict-win selection); timestamps stay advisory (small dods, FOR
   rarely wins). Decided together with the headline flip below — one metric break.
 - [x] **FastLanes transposed bit-unpack (Phase 6.1, decode-speed): shipped (prototype).**
@@ -1582,21 +1588,21 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   the range decode equals the full decode sliced to `[start, start+len)` (round-trip-tested across
   tile sizes, single-value/boundary-straddling windows, width-0 tiles, and out-of-range requests).
 - [x] **Transposed layout REALIZED on disk (Phase 6.1, decode-speed residue) — shipped 2026-09-23,
-  and the end-to-end answer is an honest NO.** `VAL_CODEC_TRANSPOSED` (tag 5) is the sixth `.dspseg`
+  and the end-to-end answer is an honest NO.** `VAL_CODEC_TRANSPOSED` (tag 5) is the sixth `.weftseg`
   value codec: tile-size uvarint + length-prefixed `transpose_bitpack_encode` stream, with its **own**
   size function (`ColumnEncoding::transposed_value_bytes`) and selector entry
   (`best_value_codec_transposed(max_overhead)`) rather than reusing the blocked figure, full reader
   dispatch (`read_value_column`, `read_value_at` via `transpose_bitpack_decode_range`, and the
   random-access whitelist/skip helpers), and `FrameOptions`/`write_segment_with` +
   `write_paged_segment_with` as the general frame writers. Reachable from a deployment via
-  `TransposedPolicy` / `DSP_SEGMENT_TRANSPOSED_MAX_OVERHEAD`. **Opt-in**, so an unconfigured store
+  `TransposedPolicy` / `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD`. **Opt-in**, so an unconfigured store
   writes byte-for-byte the historical frames.
-  **Measured end-to-end (release, `dsp-physical-type/benches/transposed_read.rs`, 1M-row
+  **Measured end-to-end (release, `weft-physical-type/benches/transposed_read.rs`, 1M-row
   zero-straddling ScaledI64 column):** frame bytes 1,251,057 transposed vs 1,250,076 linear
   (**+0.08%**); full decode **12.98 ms vs 13.39 ms** (CIs overlap — a tie); windowed 1000-row range
   **2.380 ms vs 2.393 ms** (a tie); single point read **2.250 ms vs 2.431 ms** (~1.08×, disjoint CIs).
   **So the ~5.7× kernel-level unpack win does NOT survive the whole read path** — the
-  bandwidth-bound caveat this item carried, confirmed on DSP's own path. The layout is byte-neutral
+  bandwidth-bound caveat this item carried, confirmed on WeftDB's own path. The layout is byte-neutral
   and read-neutral here, which is why it stays opt-in and the default is unchanged.
   *(src: https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf · https://arxiv.org/pdf/2606.22423)*
 - [x] **Windowed value reads no longer re-walk the codec chain per row (found by review of the
@@ -1604,7 +1610,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   every fixed-layout codec locates a value by walking its block/tile headers *from the start of the
   stream* — so an `N`-row window cost `N` walks, and on the 1024-lane transposed layout it decoded a
   whole tile per value (measured ~27× slower than linear, and ~20× slower than the full-decode
-  fallback it was supposed to beat). Fixed by `dspseg::read_value_range(bytes, start, len)`, which
+  fallback it was supposed to beat). Fixed by `weftseg::read_value_range(bytes, start, len)`, which
   does the range decode **once** per codec; this also removes the pre-existing per-row walk for the
   blocked/FOR codecs. Equal to the full decode sliced to the window, tested across every codec and
   window shape.
@@ -1616,7 +1622,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 - [ ] **NEXT — the transposed layout's real lever is a per-tile decode-count threshold, not the
   layout itself (research 2026-09-23).** The `fastlanes` crate's docs state that beyond roughly **10
   values** it is typically faster to unpack a whole tile and index than to unpack values
-  individually. DSP's reader currently always takes the single-value path in `read_value_at` and
+  individually. WeftDB's reader currently always takes the single-value path in `read_value_at` and
   always takes the whole-range path in `read_value_range`; neither adapts. Make the dispatch count
   the requested values falling in a tile and pick accordingly — that is the difference between
   tile-level random access being a win and being a pessimization. The same threshold applies to the
@@ -1628,15 +1634,15 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   they "use the Unified Transposed Layout (UTL) as an option rather than as the default", because
   for Delta schemes it permutes tuple order and restoring that order costs a gather; their escape
   hatch is a **shareable 1024-entry selection vector** that a vectorized engine can apply in front of
-  decoded vectors, with the restore performed only on request. This independently validates DSP's
+  decoded vectors, with the restore performed only on request. This independently validates WeftDB's
   opt-in choice, and names the next slice: expose an **unordered** tile decode beside the ordered one
-  so DSP's order-*insensitive* consumers (Phase 6.3 min/max/count from metadata, predicate eval
+  so WeftDB's order-*insensitive* consumers (Phase 6.3 min/max/count from metadata, predicate eval
   before decompression, CPU filter before GPU transfer) pay no gather at all, while only the ordered
   interpolation path restores. *(src: FastLanes file format, VLDB'25 —
   https://www.vldb.org/pvldb/vol18/p4629-afroozeh.pdf)*
-- [ ] **Cross-check DSP's hand-rolled bit-plane decoder against the `fastlanes` crate (0.7.2,
+- [ ] **Cross-check WeftDB's hand-rolled bit-plane decoder against the `fastlanes` crate (0.7.2,
   2026-09-02, Apache-2.0).** It provides the same 1024-element layout (BitPacking pack/unpack,
-  single-value unpack, transposed Delta/RLE, linear FoR) via LLVM auto-vectorization. If DSP's
+  single-value unpack, transposed Delta/RLE, linear FoR) via LLVM auto-vectorization. If WeftDB's
   decoder is materially slower at the same bit width, that is a bug rather than a design choice —
   a cheap external yardstick for `benches/transposed_read.rs`. *(src: https://lib.rs/crates/fastlanes)*
 - [ ] **Track the FastLanes SPEC, not the CWI reference implementation.** `cwida/fastlanes` is on a
@@ -1647,9 +1653,9 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 - [ ] **Next slice — evaluate Vortex as interchange + bench baseline (Phase 1/4):** Rust,
   Arrow-compatible, cascading ALP/FastLanes/FSST codecs, **~100× faster random access + 10–25×
   faster decode than Parquet+zstd at ~same ratio (TPC-H SF10, 38% smaller)**, GPU-SIMT decode by
-  design — directly on DSP's random-access + GPU + interpolation wedge, and Vortex now an LF AI &
+  design — directly on WeftDB's random-access + GPU + interpolation wedge, and Vortex now an LF AI &
   Data incubation project (stable enough to depend on). Vortex's own guidance — cascading wins on
-  "auto-incrementing IDs, sensor readings with bounded variation" — independently validates DSP's
+  "auto-incrementing IDs, sensor readings with bounded variation" — independently validates WeftDB's
   just-shipped delta-cascade value codec. *(src: https://vortex.dev/ ·
   https://spice.ai/learn/vortex · cascading-with-BtrBlocks —
   https://spiraldb.com/post/cascading-compression-with-btrblocks)*
@@ -1658,65 +1664,65 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
     (all later releases read files written by any version ≥ 0.36.0) though the library API is
     explicitly not, and the project is now an **Incubation Stage project at LF AI & Data** rather
     than a single vendor's — which is what clears hard-constraint #2. Split this item: (a) add
-    Vortex as a `dsp-bench` external-format baseline for the storage + random-access workloads (it
-    shares DSP's cascading/ALP/FastLanes design, so it is the *fair* comparison Parquet is not);
-    (b) scope a `dsp-vortex` interchange crate **outside** the core crates, beside `dsp-arrow`. Pin
+    Vortex as a `weft-bench` external-format baseline for the storage + random-access workloads (it
+    shares WeftDB's cascading/ALP/FastLanes design, so it is the *fair* comparison Parquet is not);
+    (b) scope a `weft-vortex` interchange crate **outside** the core crates, beside `weft-arrow`. Pin
     the version. *(src: https://github.com/vortex-data/vortex)*
   - [ ] **Do NOT take a build dependency on `vortex-gpu`.** Its last publish is 0.56.0
     (2025-11-17) — about ten months and thirty minor versions behind the main line at 0.86.1 — and
     its docs.rs build failed, so there is no published API documentation. Use it **read-only** as a
     reference implementation (it is the only open-source *Rust* rendering of ALP + FastLanes GPU
-    kernels) alongside `cwida/FastLanesGpu-Damon2025`, and keep DSP's GPU path its own.
+    kernels) alongside `cwida/FastLanesGpu-Damon2025`, and keep WeftDB's GPU path its own.
     *(src: https://docs.rs/vortex-gpu)*
 - [ ] **Evaluate the FastLanes *File Format* (not just the layout) as a bench baseline + a
   random-access reference (Phase 1/4):** the FastLanes file-format paper (VLDB'25, 18(11):4629)
   extends the transposed layout to a full format whose headline API is **"flexible support for
   partial decompression… fine-grained access at the level of small batches rather than rowgroups"**
-  — the closest external analog to DSP's just-shipped block-level random access + streaming point
-  read. Assess it beside Vortex/Parquet as a `dsp-bench` external-format baseline for the
+  — the closest external analog to WeftDB's just-shipped block-level random access + streaming point
+  read. Assess it beside Vortex/Parquet as a `weft-bench` external-format baseline for the
   storage/compressed-query **and point-lookup** workloads, and as the reference design for the
   transposed-on-disk realization. *(src: "The FastLanes File Format", VLDB'25 —
   https://www.vldb.org/pvldb/vol18/p4629-afroozeh.pdf · CWI impl — https://github.com/cwida/fastlanes)*
-  - [ ] **It publishes a random-access target DSP can mirror exactly (research 2026-09-23):**
+  - [ ] **It publishes a random-access target WeftDB can mirror exactly (research 2026-09-23):**
     retrieving the first value (`LIMIT 1 OFFSET 0`) across PUBLIC_BI takes FastLanes **0.14053 ms**,
     vs Parquet+Snappy **315.62×** slower, Parquet+Zstd **413.66×**, BtrBlocks **813.57×**, DuckDB
     5.96× — because "block-based compression methods are extremely inefficient for random access, as
-    they require decompressing the entire block to access a single value". Add a `dsp-bench` case
+    they require decompressing the entire block to access a single value". Add a `weft-bench` case
     mirroring it (single cold-frame point read, reported in ms *and* as a multiple of Parquet), so
-    DSP's point-read work has an external yardstick rather than only an internal before/after. It is
+    WeftDB's point-read work has an external yardstick rather than only an internal before/after. It is
     also the argument for **not** adopting a block-based heavyweight codec (zstd over a rowgroup) on
     the measurement hot path even where it would win bytes/point: the north star is a *latency*
     target. *(src: https://www.vldb.org/pvldb/vol18/p4629-afroozeh.pdf)*
   - [ ] **Two honesty corrections from the same paper.** (i) **Encoding is the weak side**:
     FastLanes total encode time on PUBLIC_BI is 81,341 ms vs Parquet+Snappy 5,867 ms (~14× slower),
-    and the authors concede "no effort whatsoever has been made to make it fast". DSP encodes on the
+    and the authors concede "no effort whatsoever has been made to make it fast". WeftDB encodes on the
     *ingest* path, so an exhaustive per-column codec search would do the same damage — adopt the
     paper's own mitigation before growing the candidate set with ALP/cascade: **three-way sampling**
     (vectors at positions 0, 32, 64) reaches >99% of the ratio of searching all 64. (ii) **Ratio
     alone is not the story**: on PUBLIC_BI Parquet+Zstd is within 2% of FastLanes, and on TPC-H it
-    is 15.3% *ahead* — FastLanes' win is the 43–44× decode. So DSP's compression headline must be
+    is 15.3% *ahead* — FastLanes' win is the 43–44× decode. So WeftDB's compression headline must be
     ratio **and** decode throughput jointly, never ratio alone.
     *(src: https://www.vldb.org/pvldb/vol18/p4629-afroozeh.pdf)*
-- [ ] **Point-lookup positioning — DSP's block-random-access read is a genuine columnar mitigation
+- [ ] **Point-lookup positioning — WeftDB's block-random-access read is a genuine columnar mitigation
   (Phase 0/1):** the 2026 competitive reviews name point lookups as *the* columnar weakness ("a
   column store opens ~50 column files to materialise one row; a row store walks one B-tree path" →
-  "skip a columnar DB when point lookups are the main access pattern"). DSP's streaming point read
+  "skip a columnar DB when point lookups are the main access pattern"). WeftDB's streaming point read
   (never materializes the value column; `O(1)` closed-form row for a regular timestamp column)
-  mitigates exactly this — add a `dsp-bench` **point_lookup** workload and benchmark DSP's
+  mitigates exactly this — add a `weft-bench` **point_lookup** workload and benchmark WeftDB's
   `read_point`/`read_points` vs ClickHouse ASOF/point + QuestDB, then fold the result into the
-  *When DSP beats general TSDBs* honesty page. *(src:
+  *When WeftDB beats general TSDBs* honesty page. *(src:
   https://clickhouse.com/resources/engineering/when-to-use-columnar-database ·
   https://questdb.com/blog/clickhouse-vs-questdb-comparison/)*
-- [ ] **GPU-decode the `.dspseg` transposed layout rather than adopting a new format (Phase 5/6):**
+- [ ] **GPU-decode the `.weftseg` transposed layout rather than adopting a new format (Phase 5/6):**
   a 2026 study ("Do GPUs Really Need New Tabular File Formats?", arXiv 2602.17335) finds existing
   formats (Parquet, **FastLanes**) can be *rewritten/optimized* for competitive GPU performance
-  rather than needing purpose-built formats — evidence to GPU-decode DSP's own transposed `.dspseg`
+  rather than needing purpose-built formats — evidence to GPU-decode WeftDB's own transposed `.weftseg`
   layout (the `transpose_bitpack_decode_range` prototype) on-device, pairing with the GPU
   interpolation flagship, instead of importing a new columnar format. *(src:
   https://arxiv.org/pdf/2602.17335)*
 - [ ] **Correlation-aware column compression as a post-B-tags codec direction (Phase 6):** Corra
   (arXiv 2403.17229) and FastLanes' multi-column compression (MCC) exploit *inter-column*
-  correlation for extra ratio — only relevant once DSP has multiple value columns / per-measurement
+  correlation for extra ratio — only relevant once WeftDB has multiple value columns / per-measurement
   tags (B-tags), so park it behind that, but note it as the multi-column codec frontier. *(src:
   https://arxiv.org/pdf/2403.17229)*
 - [x] **Headline bytes/point FLIPPED to the realized figure (Phase 4/6, owner sign-off,
@@ -1725,7 +1731,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   the bench HTML `val B/pt` now report the codec actually written; the naive `len*8`
   figure is retained as `logical_value_bytes`/`estimated_value_bytes` (the compression
   baseline). Pre-v10 bytes/point artifacts are not comparable.
-- [x] **dsp-bench parallel-test OOM — ROOT-CAUSED + FIXED (it was a logic bug, not
+- [x] **weft-bench parallel-test OOM — ROOT-CAUSED + FIXED (it was a logic bug, not
   environmental).** A full-backtrace capture pinned the ~28 GB allocation to
   `splimes::helpers::generate_target_times::TargetTimesIterator::next_impl`, which sized the
   per-batch `Vec<DateTime<Utc>>` from *free system memory* (`available_memory / point_size /
@@ -1735,7 +1741,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   masked it; under the default parallel harness many interpolation tests call it at once and
   the summed over-allocation aborts the process. Fixed by capping the batch by
   `remaining_points()` (the timestamps left) and `MAX_BATCH_POINTS` (1 << 20); the previously
-  reliable crash is gone (`cargo test -p dsp-bench --lib` now passes 92/0 on repeated parallel
+  reliable crash is gone (`cargo test -p weft-bench --lib` now passes 92/0 on repeated parallel
   runs). The sibling sizers in `optimizations/mod.rs` + `gpu/mod.rs` were already bounded by
   the real work — no change needed there.
 - [x] **f64 value-column codecs (Phase 6.1): Gorilla + Chimp + Chimp128 + Elf-style, best-of
@@ -1755,7 +1761,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 - [x] **Cascading codec composition (Phase 6.1): advisory + on-disk descriptor shipped.**
   `ColumnEncoding::delta_cascade_bytes`/`delta_cascade_plan` (delta→best inner packer over
   {varint,bit-pack,blocked,FOR,RLE}; 97.4% below the best single-level codec on a monotone-trend
-  column) **and** the on-disk `.dspseg` codec-chain descriptor `VAL_CODEC_DELTA_CASCADE` (anchor +
+  column) **and** the on-disk `.weftseg` codec-chain descriptor `VAL_CODEC_DELTA_CASCADE` (anchor +
   inner-codec descriptor + inner-coded deltas; `write_value_column_cascading` /
   `best_value_codec_cascading`, decoded by the ordinary `read_value_column`). Surfaced as
   `StorageEstimate.advisory_delta_cascade_value_bytes` (bench schema v15). Kept **opt-in** — the
@@ -1769,8 +1775,8 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   columns). Broad win — needs owner sign-off, then flip and re-baseline the headline once.
 - [x] **Block-level random access (Phase 6.1): shipped.** `blocked_bitpack_decode_range` /
   `for_bitpack_decode_range` decode only the blocks overlapping a `[start, len)` window (skipping
-  earlier blocks by their headers), and `dspseg::read_value_at(bytes, index)` reads one value
-  straight from a `.dspseg` value block — **all three fixed-layout `ScaledI64` value codecs take a
+  earlier blocks by their headers), and `weftseg::read_value_at(bytes, index)` reads one value
+  straight from a `.weftseg` value block — **all three fixed-layout `ScaledI64` value codecs take a
   random-access fast path**: the two per-block codecs (`VAL_CODEC_BLOCKED`/`VAL_CODEC_FOR`) via the
   block-skip range decoders, and the fixed-width `VAL_CODEC_BITPACK` via `bitpack_decode_at` (the
   value at `index` lives at bit `index * width`, an `O(width)` read); the per-value/cascade payloads
@@ -1778,8 +1784,8 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   paged) skips the value block for any of the three. The point-lookup / late-materialization lever,
   matching Vortex's finer-grained in-segment access. *(src: https://spice.ai/learn/vortex)*
 - [x] **Streaming single-value point read wired into the segment/API point-read path (Phase 4/6):
-  shipped.** `dspseg::read_segment_point(bytes, t)` reads the first present value at `t` from a
-  single-block `.dspseg` frame **without materializing the value column**: on a per-block value
+  shipped.** `weftseg::read_segment_point(bytes, t)` reads the first present value at `t` from a
+  single-block `.weftseg` frame **without materializing the value column**: on a per-block value
   codec (`VAL_CODEC_FOR` / `VAL_CODEC_BLOCKED`) it skips the value block by its self-describing
   framing, decodes only the timestamp block to locate the row (binary-search sorted, linear-scan
   out-of-order), maps the logical row to its dense present-rank, and unpacks the *one* covering
@@ -1789,7 +1795,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   100k-row sorted FOR segment): **222.65 µs vs 13.196 ms full-decode — ~59× faster point lookup,
   identical bytes on disk.**
 - [x] **Streaming point read extended to paged segments (Phase 4/6): shipped.**
-  `dspseg::read_paged_segment_point(bytes, t)` parses the per-page index (stats + block length)
+  `weftseg::read_paged_segment_point(bytes, t)` parses the per-page index (stats + block length)
   and **prunes pages on their indexed min/max ts without decoding a column byte** (on-disk
   intra-segment page skipping), then resolves the surviving page through the shared
   `read_point_from_section` (the block-skip value read applies within the page too), matching
@@ -1802,7 +1808,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   read additionally skips the surviving page's value-column decode). Runtime-verified against the
   live endpoint on a 5-page FOR frame (format_version 6).
 - [x] **Batch point lookup — amortize the timestamp decode across many instants (Phase 4/6):
-  shipped.** `dspseg::read_segment_points`/`read_paged_segment_points(bytes, &[t])` and
+  shipped.** `weftseg::read_segment_points`/`read_paged_segment_points(bytes, &[t])` and
   `SegmentStore::read_points(aspect, &[t])` resolve many instants in one pass: the index is pruned
   once by the batch's whole span, each surviving segment/page is opened + its timestamp column
   decoded **once** for the whole batch (paged pages still skip when no unresolved instant falls in
@@ -1850,15 +1856,15 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   3. Paged frames gain only **1.14×** (68.70 → 60.41 ms): page pruning already bounds the decode to
      `rows_per_page`, so there is little left to save. The index is mostly a *single-block* lever.
   This is the "decode-throughput is often bandwidth-bound — measure, don't assume" caveat confirmed
-  on DSP's own path. *(src: https://arxiv.org/pdf/2606.22423)*
+  on WeftDB's own path. *(src: https://arxiv.org/pdf/2606.22423)*
 - [x] **DONE (2026-07-16) — the checkpointed seal is REACHABLE (opt-in).** `CheckpointPolicy`
-  (`database`) reads `DSP_SEGMENT_CHECKPOINT_STRIDE` + `DSP_SEGMENT_CHECKPOINT_MIN_ROWS` (default
+  (`database`) reads `WEFT_SEGMENT_CHECKPOINT_STRIDE` + `WEFT_SEGMENT_CHECKPOINT_MIN_ROWS` (default
   8192 rows) and applies at `persist`/`persist_paged`, so all six seal entry points inherit it;
   `SegmentStore::with_checkpoint_policy` overrides it programmatically. It fires only where it pays
   — `Segment::benefits_from_checkpoints()` (sorted **and** irregular). **Off by default**: an
   unconfigured store writes byte-for-byte the historical frames. Runtime-verified on the live binary
   over identical 12k-row sorted-irregular ingests: unset → `total_bytes=19159`
-  (`bytes_per_point=1.5966`), `DSP_SEGMENT_CHECKPOINT_STRIDE=1024` → `19422` (`1.6185`, **+1.37%**),
+  (`bytes_per_point=1.5966`), `WEFT_SEGMENT_CHECKPOINT_STRIDE=1024` → `19422` (`1.6185`, **+1.37%**),
   with `…/at` and `…/at-multi` returning byte-identical JSON from both stores.
 - [ ] **NEXT — checkpoint index adopt-or-drop into the DEFAULT policy — owner-gated (bytes/point
   change, as FOR/cascade/ALP):** the trade is measured end-to-end and merely needs a decision:
@@ -1873,14 +1879,14 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   "all irregular columns" and depends on a deployment's shape mix.
 - [x] **DONE (2026-07-16) — the `TS_CODEC_BLOCKED` override is QUANTIFIED, and it is NOT small.**
   Measured per shape on the timestamp block (10k rows,
-  `dsp-physical-type/benches/dodsearch.rs::report_codec_override_cost`): bounded jitter **+1.04%**
+  `weft-physical-type/benches/dodsearch.rs::report_codec_override_cost`): bounded jitter **+1.04%**
   (blocked already wins) · scattered single jitter **+251%** (gorilla wins) · long constant runs
   **+1301%** (RLE wins) · regular +1418% (moot — never checkpointed). **The earlier +0.41% frame
   figure was corpus-specific luck**: the bounded-jitter corpus is the one shape where blocked is
   already best. The scattered-jitter and constant-run shapes are *irregular*, so the shape-only
   predicate would have checkpointed them and silently bloated their timestamp block 3.5×/14×.
   **Fixed**: `Segment::checkpoint_codec_overhead()` (`blocked/best`) + `CheckpointPolicy`'s
-  `max_codec_overhead` ceiling (default 1.25, `DSP_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD`) refuse
+  `max_codec_overhead` ceiling (default 1.25, `WEFT_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD`) refuse
   those seals; proven end-to-end by a test where an RLE-shaped column seals byte-identical to plain
   and only checkpoints when the ceiling is lifted.
 - [ ] **NEXT — a random-access-capable Gorilla/RLE would widen the checkpoint index's reach:** the
@@ -1890,7 +1896,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   too, at a fraction of the current override. Only worth it if such corpora prove common — measure
   the shape mix of a real customer corpus first.
 - [x] **Windowed range read — decode only the row window for a regular block-coded segment (Phase
-  4/6): shipped.** `dspseg::read_segment_range(bytes, start, end)` returns the `[start, end]` rows;
+  4/6): shipped.** `weftseg::read_segment_range(bytes, start, end)` returns the `[start, end]` rows;
   for a **regular (constant-stride) sorted column with a random-access value codec** it computes the
   row window `[lo, hi]` in closed form (no timestamp materialization), generates the window
   timestamps directly, and unpacks **only the present values inside the window** via `read_value_at`
@@ -1913,8 +1919,8 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 - [x] Prototype columnar segment reads for one aspect type (`database::SegmentStore`)
 - [ ] Publish a methodology document **before** any performance claim
 
-> The key commercial move is not adding features — it is making DSP's performance
-> claims measurable, reproducible, and valuable to a specific buyer. If DSP can
+> The key commercial move is not adding features — it is making WeftDB's performance
+> claims measurable, reproducible, and valuable to a specific buyer. If WeftDB can
 > credibly show it is faster, cheaper, or more accurate for large-scale interpolation
 > and compression-aware irregular time-series analysis than general-purpose TSDBs, it
 > has a clear path to a commercial product.

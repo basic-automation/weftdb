@@ -1100,7 +1100,7 @@ impl AspectStructure for Aspect {
 
 	#[instrument]
 	async fn new_dictionary(&self, name: &str, description: &str, constraints: &DictionaryConstraints) -> Result<()> {
-		// Extract db_name from path (path is like C:\Users\...\dsp_data\{db_name}\{subject}\{aspect})
+		// Extract db_name from path (path is like C:\Users\...\weft_data\{db_name}\{subject}\{aspect})
 		// Use the parent's parent to get db_name from the aspect path
 		let path = std::path::Path::new(&self.path);
 		let subject_path = path.parent().ok_or_else(|| anyhow::anyhow!("Cannot get subject path from aspect path"))?;
@@ -1165,7 +1165,7 @@ impl AspectStructure for Aspect {
 			}
 		}
 
-		// Extract db_name from path (path is like C:\Users\...\dsp_data\{db_name}\{subject}\{aspect})
+		// Extract db_name from path (path is like C:\Users\...\weft_data\{db_name}\{subject}\{aspect})
 		let path = std::path::Path::new(&self.path);
 		let subject_path = path.parent().ok_or_else(|| anyhow::anyhow!("Cannot get subject path from aspect path"))?;
 		let db_path_parent = subject_path.parent().ok_or_else(|| anyhow::anyhow!("Cannot get db path from subject path"))?;

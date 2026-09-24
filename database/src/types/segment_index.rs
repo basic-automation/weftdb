@@ -1,7 +1,7 @@
 //! libSQL-backed `segment_index` control plane (roadmap **Phase 4.3**).
 //!
-//! Phase 4.3 sealed measurement data into typed columnar `.dspseg` segments and
-//! gave each a [`SegmentDescriptor`](dsp_physical_type::SegmentDescriptor) — the
+//! Phase 4.3 sealed measurement data into typed columnar `.weftseg` segments and
+//! gave each a [`SegmentDescriptor`](weft_physical_type::SegmentDescriptor) — the
 //! resident index row (min/max ts/value, row/null counts, byte length, path) that
 //! lets a query prune segments without opening them. This module makes that index
 //! **durable**: it persists descriptors into a libSQL `segment_index` table and
@@ -9,7 +9,7 @@
 //! columns, returning only the descriptors a query must open.
 //!
 //! This is squarely a **control-plane** component (hard constraint #3): libSQL owns
-//! catalog/metadata; the measurement hot path stays in the `.dspseg` segments. The
+//! catalog/metadata; the measurement hot path stays in the `.weftseg` segments. The
 //! store holds *metadata about* segments — never the measurements themselves. The
 //! `BigDecimal` value bounds round-trip through their plain-text form (hard
 //! constraint #4 — no silent float downcast, even in the catalog), and the
@@ -26,7 +26,7 @@ use std::str::FromStr;
 
 use anyhow::{bail, Result};
 use bigdecimal::BigDecimal;
-use dsp_physical_type::{SegmentDescriptor, SegmentIndex};
+use weft_physical_type::{SegmentDescriptor, SegmentIndex};
 use turso::{Builder, Value};
 
 /// A durable, libSQL-backed index of sealed segments, scoped by aspect.
@@ -173,7 +173,7 @@ impl SegmentIndexStore {
 	/// `true` when a row was deleted and `false` when none matched.
 	///
 	/// The control-plane half of dropping a segment (roadmap Phase 4.6 cross-segment
-	/// merge): the caller removes the `.dspseg` file; this removes its catalog row so a
+	/// merge): the caller removes the `.weftseg` file; this removes its catalog row so a
 	/// pruned read never opens the now-absent file. Since ids are handed out as
 	/// `MAX(id) + 1` ([`next_id`](SegmentIndexStore::next_id)), deleting a segment can
 	/// free an id below the maximum without risking reuse of a still-live one.
@@ -247,7 +247,7 @@ impl SegmentIndexStore {
 	}
 
 	/// Load every descriptor for `aspect` into a resident
-	/// [`SegmentIndex`](dsp_physical_type::SegmentIndex) — the in-memory model whose
+	/// [`SegmentIndex`](weft_physical_type::SegmentIndex) — the in-memory model whose
 	/// value/quality pruning complements this store's SQL time pruning.
 	///
 	/// # Errors
@@ -364,7 +364,7 @@ impl SegmentIndexStore {
 
 #[cfg(test)]
 mod tests {
-	use dsp_physical_type::{timestamp::TimeUnit, Segment};
+	use weft_physical_type::{timestamp::TimeUnit, Segment};
 
 	use super::*;
 
@@ -385,7 +385,7 @@ mod tests {
 	async fn insert_then_read_round_trips_a_descriptor() {
 		let store = SegmentIndexStore::open_in_memory().await.expect("opens");
 		let (seg, len) = sealed(100);
-		let d = SegmentDescriptor::of_segment(1, "segments/1.dspseg", len, &seg);
+		let d = SegmentDescriptor::of_segment(1, "segments/1.weftseg", len, &seg);
 		store.insert("temp", &d).await.expect("inserts");
 		let all = store.all("temp").await.expect("reads");
 		let count = store.count("temp").await.expect("counts");
@@ -404,7 +404,7 @@ mod tests {
 	async fn control_plane_writes_report_their_affected_row_counts() {
 		let store = SegmentIndexStore::open_in_memory().await.expect("opens");
 		let (seg, len) = sealed(100);
-		let d = SegmentDescriptor::of_segment(1, "segments/1.dspseg", len, &seg);
+		let d = SegmentDescriptor::of_segment(1, "segments/1.weftseg", len, &seg);
 		let inserted = store.insert("temp", &d).await.expect("inserts");
 		// A re-seal of the same (aspect, id) REPLACEs — still one row affected.
 		let reinserted = store.insert("temp", &d).await.expect("re-inserts");
@@ -424,7 +424,7 @@ mod tests {
 		let store = SegmentIndexStore::open_in_memory().await.expect("opens");
 		for (i, base) in [0_i64, 100, 200].into_iter().enumerate() {
 			let (seg, len) = sealed(base);
-			let d = SegmentDescriptor::of_segment(i as u64, format!("s{i}.dspseg"), len, &seg);
+			let d = SegmentDescriptor::of_segment(i as u64, format!("s{i}.weftseg"), len, &seg);
 			store.insert("aspect", &d).await.expect("inserts");
 		}
 		let ids = |ds: &[SegmentDescriptor]| ds.iter().map(|d| d.id).collect::<Vec<_>>();
@@ -444,9 +444,9 @@ mod tests {
 	async fn aspects_are_isolated() {
 		let store = SegmentIndexStore::open_in_memory().await.expect("opens");
 		let (seg, len) = sealed(0);
-		store.insert("a", &SegmentDescriptor::of_segment(0, "a0.dspseg", len, &seg)).await.expect("inserts");
-		store.insert("b", &SegmentDescriptor::of_segment(0, "b0.dspseg", len, &seg)).await.expect("inserts");
-		store.insert("b", &SegmentDescriptor::of_segment(1, "b1.dspseg", len, &seg)).await.expect("inserts");
+		store.insert("a", &SegmentDescriptor::of_segment(0, "a0.weftseg", len, &seg)).await.expect("inserts");
+		store.insert("b", &SegmentDescriptor::of_segment(0, "b0.weftseg", len, &seg)).await.expect("inserts");
+		store.insert("b", &SegmentDescriptor::of_segment(1, "b1.weftseg", len, &seg)).await.expect("inserts");
 		let count_a = store.count("a").await.expect("counts");
 		let count_b = store.count("b").await.expect("counts");
 		// Pruning never crosses aspects.
@@ -461,27 +461,27 @@ mod tests {
 	async fn reinsert_same_id_replaces() {
 		let store = SegmentIndexStore::open_in_memory().await.expect("opens");
 		let (seg, len) = sealed(0);
-		store.insert("a", &SegmentDescriptor::of_segment(0, "old.dspseg", len, &seg)).await.expect("inserts");
-		store.insert("a", &SegmentDescriptor::of_segment(0, "new.dspseg", len, &seg)).await.expect("re-inserts");
+		store.insert("a", &SegmentDescriptor::of_segment(0, "old.weftseg", len, &seg)).await.expect("inserts");
+		store.insert("a", &SegmentDescriptor::of_segment(0, "new.weftseg", len, &seg)).await.expect("re-inserts");
 		let all = store.all("a").await.expect("reads");
 		drop(store);
 		assert_eq!(all.len(), 1, "same (aspect, id) replaces, not duplicates");
-		assert_eq!(all[0].path, "new.dspseg");
+		assert_eq!(all[0].path, "new.weftseg");
 	}
 
 	#[tokio::test]
 	async fn delete_removes_a_row_and_reports_whether_it_matched() {
 		let store = SegmentIndexStore::open_in_memory().await.expect("opens");
 		let (seg, len) = sealed(0);
-		store.insert("a", &SegmentDescriptor::of_segment(0, "s0.dspseg", len, &seg)).await.expect("inserts 0");
-		store.insert("a", &SegmentDescriptor::of_segment(1, "s1.dspseg", len, &seg)).await.expect("inserts 1");
+		store.insert("a", &SegmentDescriptor::of_segment(0, "s0.weftseg", len, &seg)).await.expect("inserts 0");
+		store.insert("a", &SegmentDescriptor::of_segment(1, "s1.weftseg", len, &seg)).await.expect("inserts 1");
 		// Deleting an existing id removes exactly that row and reports true.
 		assert!(store.delete("a", 0).await.expect("deletes"), "an existing id is deleted");
 		let remaining = store.all("a").await.expect("reads");
 		// Deleting an absent id is a false no-op.
 		let missed = store.delete("a", 7).await.expect("no-op delete");
 		// After deleting the max id, next_id still hands out a free id past the new max.
-		store.insert("a", &SegmentDescriptor::of_segment(1, "s1.dspseg", len, &seg)).await.expect("keeps 1");
+		store.insert("a", &SegmentDescriptor::of_segment(1, "s1.weftseg", len, &seg)).await.expect("keeps 1");
 		let next = store.next_id("a").await.expect("next id");
 		drop(store);
 		assert_eq!(remaining.len(), 1);
@@ -498,7 +498,7 @@ mod tests {
 		let ts = vec![10_i64, 20, 30, 40];
 		let vs = vec![Some(bd("1.25")), None, Some(bd("3.75")), None];
 		let seg = Segment::build_nullable(&ts, &vs, TimeUnit::Micros, &bd("0")).expect("builds");
-		let d = SegmentDescriptor::of_segment(5, "n.dspseg", seg.write_to().len() as u64, &seg);
+		let d = SegmentDescriptor::of_segment(5, "n.weftseg", seg.write_to().len() as u64, &seg);
 		store.insert("a", &d).await.expect("inserts");
 		let back = store.all("a").await.expect("reads").into_iter().next().expect("one row");
 		drop(store);
@@ -517,7 +517,7 @@ mod tests {
 			let ts: Vec<i64> = (0..10).map(|v| base + v * 10).collect();
 			let vs: Vec<BigDecimal> = (0..10).map(|v| BigDecimal::from(base + v)).collect();
 			let seg = Segment::build(&ts, &vs, TimeUnit::Seconds, &bd("0")).expect("builds");
-			store.insert("a", &SegmentDescriptor::of_segment(i as u64, format!("s{i}.dspseg"), seg.write_to().len() as u64, &seg)).await.expect("inserts");
+			store.insert("a", &SegmentDescriptor::of_segment(i as u64, format!("s{i}.weftseg"), seg.write_to().len() as u64, &seg)).await.expect("inserts");
 		}
 		let index = store.load_index("a").await.expect("loads");
 		drop(store);
@@ -533,7 +533,7 @@ mod tests {
 	async fn empty_segment_never_overlaps() {
 		let store = SegmentIndexStore::open_in_memory().await.expect("opens");
 		let empty = Segment::build(&[], &[], TimeUnit::Seconds, &bd("0")).expect("builds");
-		let d = SegmentDescriptor::of_segment(0, "empty.dspseg", empty.write_to().len() as u64, &empty);
+		let d = SegmentDescriptor::of_segment(0, "empty.weftseg", empty.write_to().len() as u64, &empty);
 		store.insert("a", &d).await.expect("inserts");
 		// Stored, but its NULL span is excluded from every time prune.
 		let count = store.count("a").await.expect("counts");
@@ -548,9 +548,9 @@ mod tests {
 		let store = SegmentIndexStore::open_in_memory().await.expect("opens");
 		let (seg, len) = sealed(0);
 		// Two aspects, one with multiple segments — list_aspects deduplicates.
-		store.insert("temp", &SegmentDescriptor::of_segment(0, "t0.dspseg", len, &seg)).await.expect("inserts");
-		store.insert("temp", &SegmentDescriptor::of_segment(1, "t1.dspseg", len, &seg)).await.expect("inserts");
-		store.insert("humidity", &SegmentDescriptor::of_segment(0, "h0.dspseg", len, &seg)).await.expect("inserts");
+		store.insert("temp", &SegmentDescriptor::of_segment(0, "t0.weftseg", len, &seg)).await.expect("inserts");
+		store.insert("temp", &SegmentDescriptor::of_segment(1, "t1.weftseg", len, &seg)).await.expect("inserts");
+		store.insert("humidity", &SegmentDescriptor::of_segment(0, "h0.weftseg", len, &seg)).await.expect("inserts");
 		let aspects = store.list_aspects().await.expect("lists");
 		// An empty index lists nothing.
 		let empty = SegmentIndexStore::open_in_memory().await.expect("opens");
@@ -567,11 +567,11 @@ mod tests {
 		let (seg, len) = sealed(0);
 		// An empty aspect starts at 0.
 		let first = store.next_id("a").await.expect("next_id");
-		store.insert("a", &SegmentDescriptor::of_segment(first, "a0.dspseg", len, &seg)).await.expect("inserts");
+		store.insert("a", &SegmentDescriptor::of_segment(first, "a0.weftseg", len, &seg)).await.expect("inserts");
 		// After inserting id 0, the next is 1; a different aspect is independent.
 		let second = store.next_id("a").await.expect("next_id");
 		let other = store.next_id("b").await.expect("next_id");
-		store.insert("a", &SegmentDescriptor::of_segment(second, "a1.dspseg", len, &seg)).await.expect("inserts");
+		store.insert("a", &SegmentDescriptor::of_segment(second, "a1.weftseg", len, &seg)).await.expect("inserts");
 		let third = store.next_id("a").await.expect("next_id");
 		drop(store);
 		assert_eq!(first, 0);
