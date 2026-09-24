@@ -361,11 +361,32 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   (`StorageEstimate.advisory_delta_cascade_value_bytes`, schema v15). It is **opt-in** — the
   cascade beats even FOR broadly, so folding it into the default selector is a headline change
   held for owner sign-off; the default codec choice is unchanged.
+- **Transposed (`FastLanes`-layout) value codec (opt-in)** — `VAL_CODEC_TRANSPOSED` stores a
+  `ScaledI64` column's mantissas **bit-plane-major** in 1024-lane tiles, so the decoder reads `u64`
+  plane words and walks only the *set* bits and a small-magnitude column's empty high bit-planes are
+  skipped wholesale. It carries its **own** size function (`transposed_value_bytes`) and selector
+  entry (`best_value_codec_transposed(max_overhead)`) rather than reusing the blocked figure, is
+  random-access capable (so it does not regress the streaming point read), and is requested through
+  `FrameOptions` / `Segment::write_to_with` or, from a deployment, `DSP_SEGMENT_TRANSPOSED_MAX_OVERHEAD`.
+  **Honest result: the kernel-level decode win does not survive the whole read path.** Measured on a
+  1M-row zero-straddling column ([`dsp-physical-type/benches/transposed_read.rs`](dsp-physical-type/benches/transposed_read.rs)):
+  frame bytes **+0.08%** (1,251,057 vs 1,250,076), full decode **12.98 ms vs 13.39 ms** (a tie —
+  confidence intervals overlap), windowed 1000-row range **2.380 ms vs 2.393 ms** (a tie), single
+  point read **2.250 ms vs 2.431 ms** (~1.08×, non-overlapping intervals). So the layout is
+  byte-neutral and read-neutral here; it stays **opt-in** and the default codec choice is unchanged.
+  Note the codec is chosen only when a *strict* size win or within the caller's overhead ceiling —
+  the ceiling may legitimately be set below 1.0, because per-tile widths with one header per 1024
+  lanes can beat both a global width and the blocked codec's one-header-per-64.
 - **Block-level random access** — the fixed-layout value codecs support decoding a single value
   (or a sub-range) without materializing the whole column: `dspseg::read_value_at(bytes, i)`
   reads only the block covering row `i` (skipping earlier blocks by their headers) for the
-  blocked/FOR codecs, and reads bit `i * width` directly for the fixed-width bit-pack codec — the
-  point-lookup / late-materialization lever. `dspseg::read_segment_point(bytes, t)`
+  blocked/FOR codecs, reads bit `i * width` directly for the fixed-width bit-pack codec, and decodes
+  only the covering tile for the transposed codec — the point-lookup / late-materialization lever.
+  `dspseg::read_value_range(bytes, start, len)` is its **windowed** sibling: every fixed-layout codec
+  locates a value by walking its block/tile headers from the start of the stream, so resolving a
+  window one value at a time re-walks that chain per row. The range read does the decode **once**,
+  which is what keeps a windowed read on the 1024-lane transposed layout from costing a whole tile
+  decode per row. `dspseg::read_segment_point(bytes, t)`
   wires this up to the framed single-block segment — it skips the value block by its framing,
   decodes only the timestamps to find the row, and unpacks the one covering value block — so a
   point lookup **never materializes the value column** on a per-block codec (equal to a full
@@ -679,6 +700,24 @@ only** — the `.dspseg` measurement frames are not part of a snapshot.
   every table, so it is correct while writers are committing. A snapshot-only
   backup taken with six concurrent ingests in flight returns `200` with the
   concurrent seals visible in the copy.
+- **A backup directory holds exactly its four databases.** Verifying a snapshot
+  reopens it, which leaves zero-byte `-wal` / `-log` journal sidecars beside the
+  copy; these are swept after every verification, in both modes. Only a sidecar
+  that is *exactly* zero bytes is removed — a non-empty `-wal` holds
+  un-checkpointed frames, which is data, and is never touched.
+- **What a snapshot costs is dominated by the filesystem, not by the vacuum.**
+  Benchmarked in [`database/benches/backup_cost.rs`](database/benches/backup_cost.rs):
+  on `tmpfs` a whole four-database backup-and-verify runs in **8.62 ms** at one
+  aspect, **6.18 ms** at 16 and **16.79 ms** at 128 (snapshot verification;
+  source verification is within noise of those), so the vacuum's own work is
+  milliseconds and scales with control-plane rows rather than being a fixed
+  per-database floor. On a real disk it is orders of magnitude slower — the
+  background daemon's ticks land ~1.0–2.5 s apart at a 2 s configured interval on
+  this project's btrfs volume — because Turso's `VACUUM INTO` fsyncs the
+  destination and runs a TRUNCATE checkpoint before returning. **Set
+  `DSP_BACKUP_INTERVAL_SECS` from what your storage can sustain, not from how
+  much data you have**; point `DSP_BENCH_BACKUP_DIR` at your own volume to
+  measure it.
 - **Unattended backups with retention.** Set `DSP_BACKUP_INTERVAL_SECS` to run a
   background daemon that snapshots into a fresh `backup-<unix_millis>` directory
   each tick (verifying `snapshot`-only, since it backs up a live store), and
@@ -888,6 +927,7 @@ DSP is configured primarily through environment variables:
 | `DSP_SEGMENT_CHECKPOINT_STRIDE` | `dsp-server` | Rows between entries of the sealed **timestamp checkpoint index** — trades a little size for much faster point lookups on **sorted, irregular** columns (~3.45× single-block; see the checkpointed-frames feature above). Applies only where it pays: sorted + irregular + at least `DSP_SEGMENT_CHECKPOINT_MIN_ROWS` rows. ~1024 is the sweet spot (stride barely moves speed but does move size). | unset (no index; frames byte-for-byte as before) |
 | `DSP_SEGMENT_CHECKPOINT_MIN_ROWS` | `dsp-server` | Row floor below which a segment is never checkpointed (a small column decodes trivially, so an index would be pure cost). | `8192` |
 | `DSP_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD` | `dsp-server` | Ceiling on the timestamp-codec override a checkpointed seal will accept (`blocked / best` bytes; `1.0` = only when free). A checkpointed frame must use the range-decodable per-block codec, which is ~free where that codec already wins but **~3.5× on a Gorilla-shaped and ~14× on an RLE-shaped column** — this refuses those seals rather than silently bloating them. | `1.25` |
+| `DSP_SEGMENT_TRANSPOSED_MAX_OVERHEAD` | `dsp-server` | Ceiling on the size overhead the **transposed (`FastLanes`-layout) value codec** may pay against the size-selected codec (`transposed / best` bytes; `1.0` = only when free, and a value **below 1.0 is meaningful** — the transposed layout can be a strict size win, since it pays one width header per 1024-lane tile where the blocked codec pays one per 64 values). Stores the value column bit-plane-major for faster bit-plane-skipping decode. Measured byte- and read-neutral end-to-end on a 1M-row column (see the transposed-codec feature above), so it is off by default. | unset (no transposed codec; frames byte-for-byte as before) |
 | `DSP_SEGMENT_PARTIAL_BASE` | `dsp-server` | Resolution token (`seconds`/`minutes`/`hours`/…) at which each sealed segment materializes a **partial-reduction `.dspart` sidecar** — a stored mergeable partial of the bounded reductions. A stored-range downsample of those reductions then **merges the sidecars instead of decoding the value column** (measured **3.2×**), re-keyed to any coarser nesting resolution. A sealed segment is immutable, so the sidecar never goes stale; a rewrite (reconcile/split/squash) regenerates it. | unset (no sidecar; `downsample_range` decodes as before) |
 | `DSP_SEGMENT_PARTIAL_MIN_ROWS` | `dsp-server` | Row floor below which a segment gets no partial sidecar (a tiny segment's partial saves too little decode to be worth the extra file). | `4096` |
 | `DSP_SEGMENT_PARTIAL_TIERS` | `dsp-server` | Comma-separated fine→coarse rollup resolutions (e.g. `hours,days`) materialized **beside** the `DSP_SEGMENT_PARTIAL_BASE` partial, each re-keyed from the tier below (up to four kept; a finer/non-nesting entry is skipped). A coarse stored-range downsample then folds the coarsest matching tier instead of re-keying the whole fine base (measured **~1.16×** on a DAY query over a MINUTES base). No effect unless `DSP_SEGMENT_PARTIAL_BASE` is set. | unset (base-only sidecar) |
