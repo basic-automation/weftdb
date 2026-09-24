@@ -630,7 +630,7 @@ async fn test_create_btc_1min_database() -> Result<()> {
 
 /// Ingest-path profile (roadmap Phase 4 / the `test_create_btc_1min_database`
 /// slow-load investigation): time the **legacy Turso `measurements` row-store** write
-/// path against the **Storage-v2 `.dspseg` columnar seal** for the same synthetic
+/// path against the **Storage-v2 `.weftseg` columnar seal** for the same synthetic
 /// BTC-like corpus, so the "40+ minutes at ~5 GB RSS" the BTC test documents is
 /// explained with a real number rather than a hunch.
 ///
@@ -638,9 +638,9 @@ async fn test_create_btc_1min_database() -> Result<()> {
 /// row keyed by a 36-byte UUID text `id` and a 36-byte UUID `dataset_id`, with the
 /// value stored as decimal **text** — and then writes every timestamp *again* into the
 /// `unbatched_measurements` shadow queue (a 2× row-store write). The columnar path seals
-/// the same points into one typed `.dspseg` frame (delta/bit-packed timestamps, a scaled
+/// the same points into one typed `.weftseg` frame (delta/bit-packed timestamps, a scaled
 /// integer value column). This is the write-amplification the roadmap's storage boundary
-/// (hard-constraint #3: Turso is the control plane, `.dspseg` owns the measurement hot
+/// (hard-constraint #3: Turso is the control plane, `.weftseg` owns the measurement hot
 /// path) exists to remove.
 ///
 /// Gated on `RUN_INGEST_PROFILE` so it never joins the normal suite (like the BTC test it
@@ -663,7 +663,7 @@ async fn test_create_btc_1min_database() -> Result<()> {
 ///
 /// `INGEST_PROFILE_SKIP_ROWS=N` discards the first N data rows of a real corpus. Use it:
 /// the BTC file's head is degenerate (see [`read_close_series`]) and measuring
-/// bytes/point there overstates DSP's compression by ~10×.
+/// bytes/point there overstates WeftDB's compression by ~10×.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn ingest_path_profile_legacy_vs_columnar() -> Result<()> {
@@ -715,7 +715,7 @@ async fn ingest_path_profile_legacy_vs_columnar() -> Result<()> {
 		Some(t0.elapsed())
 	};
 
-	// --- Storage-v2 columnar seal (one typed .dspseg frame) ---
+	// --- Storage-v2 columnar seal (one typed .weftseg frame) ---
 	// The physical encoding is DERIVED from the corpus rather than hardcoded. A fixed
 	// `ScaledI64 { scale: 2 }` happens to fit the synthetic two-decimal prices, but real
 	// BTC closes carry more fractional digits, and the no-silent-downcast rule
@@ -725,9 +725,9 @@ async fn ingest_path_profile_legacy_vs_columnar() -> Result<()> {
 	// author would declare.
 	let store = database::SegmentStore::open(temp.path().join("segstore")).await?;
 	let exact = BigDecimal::from_str("0").unwrap();
-	let recommended = dsp_physical_type::recommend_encoding(&values, &exact);
+	let recommended = weft_physical_type::recommend_encoding(&values, &exact);
 	assert!(recommended.is_exact(), "the recommended encoding must be exact at a zero error bound");
-	let schema = dsp_physical_type::AspectSchema::new(recommended.physical_type, exact, dsp_physical_type::timestamp::TimeUnit::Millis);
+	let schema = weft_physical_type::AspectSchema::new(recommended.physical_type, exact, weft_physical_type::timestamp::TimeUnit::Millis);
 	let t1 = std::time::Instant::now();
 	let descriptor = store.seal("close", &schema, &ts_ms, &values).await?;
 	let columnar = t1.elapsed();
@@ -743,12 +743,12 @@ async fn ingest_path_profile_legacy_vs_columnar() -> Result<()> {
 		Some(legacy) => {
 			let legacy_rps = n as f64 / legacy.as_secs_f64();
 			eprintln!("  legacy Turso row-store : {legacy:?}  ({legacy_rps:.0} rows/s)");
-			eprintln!("  columnar .dspseg seal  : {columnar:?}  ({col_rps:.0} rows/s, {bytes_per_point:.2} B/point framed)");
+			eprintln!("  columnar .weftseg seal  : {columnar:?}  ({col_rps:.0} rows/s, {bytes_per_point:.2} B/point framed)");
 			eprintln!("  columnar seal is {:.1}x faster on the write path", col_rps / legacy_rps);
 		}
 		None => {
 			eprintln!("  legacy Turso row-store : SKIPPED (INGEST_PROFILE_SKIP_LEGACY)");
-			eprintln!("  columnar .dspseg seal  : {columnar:?}  ({col_rps:.0} rows/s, {bytes_per_point:.2} B/point framed)");
+			eprintln!("  columnar .weftseg seal  : {columnar:?}  ({col_rps:.0} rows/s, {bytes_per_point:.2} B/point framed)");
 		}
 	}
 	Ok(())
@@ -780,7 +780,7 @@ fn epoch_seconds_to_millis(raw: &str) -> Option<i64> {
 /// `skip` exists because **the head of that corpus is degenerate**: its first ~20k rows
 /// are 2012 ticks where the close price holds constant for long runs (4.58 … 6.30), which
 /// the value column's RLE-class codecs compress to almost nothing. Measuring bytes/point
-/// on the first N rows therefore flatters DSP's compression by roughly an order of
+/// on the first N rows therefore flatters WeftDB's compression by roughly an order of
 /// magnitude versus a window with real price movement — so a representative storage number
 /// must skip into the corpus. (Throughput is far less sensitive to this than size is.)
 ///

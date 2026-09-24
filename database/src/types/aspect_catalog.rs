@@ -7,7 +7,7 @@
 //! the timestamp [`TimeUnit`]). With it the store no longer needs the schema passed
 //! in on every read — it looks the aspect's declaration up in the control plane.
 //!
-//! Keyed by `(database, subject, aspect)` — the catalog hierarchy the rest of DSP
+//! Keyed by `(database, subject, aspect)` — the catalog hierarchy the rest of WeftDB
 //! uses (a database holds subjects; a subject holds aspects). This is squarely a
 //! **control-plane** component (hard constraint #3): it holds schema *metadata*, no
 //! measurements. The declaration round-trips faithfully — the `PhysicalType` and
@@ -19,7 +19,7 @@ use std::str::FromStr;
 
 use anyhow::{bail, Result};
 use bigdecimal::BigDecimal;
-use dsp_physical_type::{AspectSchema, PhysicalType, TimeUnit};
+use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
 use turso::{Builder, Value};
 
 /// A durable, libSQL-backed registry of aspect [`AspectSchema`] declarations.
@@ -182,7 +182,7 @@ impl AspectCatalog {
 
 #[cfg(test)]
 mod tests {
-	use dsp_physical_type::TimeUnit;
+	use weft_physical_type::TimeUnit;
 
 	use super::*;
 

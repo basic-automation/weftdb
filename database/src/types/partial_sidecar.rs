@@ -1,15 +1,15 @@
-//! # Per-segment materialized partial reductions — the `.dspart` sidecar
+//! # Per-segment materialized partial reductions — the `.weftpart` sidecar
 //!
 //! A sealed segment is **immutable**, so a [`PartialReduction`] computed over it at seal
 //! time can never go stale — which is exactly what makes it worth persisting. A later
 //! cross-segment downsample ([`SegmentStore::downsample_range`](super::SegmentStore::downsample_range))
 //! can then *merge stored partials* instead of decoding every segment's value column, the
 //! way `TimescaleDB`'s continuous aggregates store partial aggregates and finalize them at
-//! query time — but without a refresh policy, because immutability gives DSP the
+//! query time — but without a refresh policy, because immutability gives WeftDB the
 //! never-stale invariant for free.
 //!
 //! This module is the persistence half: a [`PartialSidecar`] frame written beside each
-//! `.dspseg` file (`{aspect}-{id}.dspart`), holding the segment's mergeable partial at a
+//! `.weftseg` file (`{aspect}-{id}.weftpart`), holding the segment's mergeable partial at a
 //! declared **base resolution** plus a staleness stamp. Only the **bounded** reductions
 //! are materialized (see [`SIDECAR_AGGREGATIONS`]): the six streaming reductions carry
 //! O(1) per-bucket state and the `sketch_p*` reductions carry a bounded [`DdSketch`], so
@@ -29,14 +29,14 @@
 //! <https://www.tigerdata.com/learn/continuous-aggregates-timescaledb>)*
 
 use anyhow::{bail, Context, Result};
-use dsp_physical_type::SegmentDescriptor;
-use dsp_reduce::{grids_nest, Aggregation, PartialReduction, ReduceError};
+use weft_physical_type::SegmentDescriptor;
+use weft_reduce::{grids_nest, Aggregation, PartialReduction, ReduceError};
 use serde::{Deserialize, Serialize};
 use splimes::Resolution;
 
-/// Magic prefix identifying a `.dspart` frame — guards against feeding a foreign or
+/// Magic prefix identifying a `.weftpart` frame — guards against feeding a foreign or
 /// truncated file to [`PartialSidecar::from_bytes`].
-const PARTIAL_SIDECAR_MAGIC: &[u8; 8] = b"DSPART\0\x01";
+const PARTIAL_SIDECAR_MAGIC: &[u8; 8] = b"WEFTPRT\x01";
 
 /// The frame layout version. Bumped if the on-disk shape changes incompatibly; a reader
 /// that sees a newer version treats the sidecar as absent rather than misreading it.
@@ -51,7 +51,7 @@ pub const PARTIAL_SIDECAR_VERSION: u16 = 2;
 /// per-bucket state stays constant-sized ([`Aggregation::is_sidecar_materializable`]).
 ///
 /// The six streaming reductions plus the four `sketch_p*` quantiles. A single
-/// [`DdSketch`](dsp_reduce::DdSketch) per bucket serves all four sketch quantiles, so
+/// [`DdSketch`](weft_reduce::DdSketch) per bucket serves all four sketch quantiles, so
 /// including all four costs no extra state — the partial built from this set can finish
 /// *any* subset of these later. `avg` adds no state of its own (it is `sum / count` at
 /// finish), so it rides along for free.
@@ -117,7 +117,7 @@ pub struct PartialSidecar {
 	pub base: Resolution,
 	/// Total rows in the segment this partial was built from — half the staleness stamp.
 	pub seg_row_count: u64,
-	/// On-disk byte length of the `.dspseg` frame this partial was built from — the other
+	/// On-disk byte length of the `.weftseg` frame this partial was built from — the other
 	/// half of the staleness stamp. Together with `seg_row_count` it pins the sidecar to
 	/// the exact segment bytes.
 	pub seg_byte_len: u64,
@@ -194,7 +194,7 @@ impl PartialSidecar {
 		best.map(|(res, partial)| partial.rebucket(res, resolution)).transpose().map(Option::flatten)
 	}
 
-	/// Serialize to a `.dspart` frame: the magic prefix followed by the bincode body.
+	/// Serialize to a `.weftpart` frame: the magic prefix followed by the bincode body.
 	///
 	/// # Errors
 	///
@@ -207,7 +207,7 @@ impl PartialSidecar {
 		Ok(out)
 	}
 
-	/// Parse a `.dspart` frame, validating the magic prefix and version.
+	/// Parse a `.weftpart` frame, validating the magic prefix and version.
 	///
 	/// # Errors
 	///
@@ -215,7 +215,7 @@ impl PartialSidecar {
 	/// recorded version is not [`PARTIAL_SIDECAR_VERSION`] (a reader never misreads a
 	/// newer/foreign frame — the caller treats the error as "no usable sidecar").
 	pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-		let body = bytes.strip_prefix(PARTIAL_SIDECAR_MAGIC.as_slice()).context("not a .dspart frame (bad magic)")?;
+		let body = bytes.strip_prefix(PARTIAL_SIDECAR_MAGIC.as_slice()).context("not a .weftpart frame (bad magic)")?;
 		let sidecar: Self = bincode::deserialize(body).context("decoding a partial sidecar")?;
 		if sidecar.version != PARTIAL_SIDECAR_VERSION {
 			bail!("partial sidecar version {} is not the supported {PARTIAL_SIDECAR_VERSION}", sidecar.version);
@@ -235,7 +235,7 @@ impl PartialSidecar {
 /// When to write a per-segment partial sidecar.
 ///
 /// Mirrors [`CheckpointPolicy`](super::CheckpointPolicy): **off by default** (opt-in), so
-/// an unconfigured store writes exactly the historical `.dspseg` files and nothing beside
+/// an unconfigured store writes exactly the historical `.weftseg` files and nothing beside
 /// them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartialSidecarPolicy {
@@ -271,18 +271,18 @@ impl PartialSidecarPolicy {
 		Self { base: Some(base), min_rows, tiers: arr }
 	}
 
-	/// Read the policy from the environment: `DSP_SEGMENT_PARTIAL_BASE` (a resolution
+	/// Read the policy from the environment: `WEFT_SEGMENT_PARTIAL_BASE` (a resolution
 	/// token — `seconds`/`minutes`/`hours`/…; absent or unparseable → [`DISABLED`](Self::DISABLED)),
-	/// `DSP_SEGMENT_PARTIAL_MIN_ROWS` (→ [`DEFAULT_PARTIAL_SIDECAR_MIN_ROWS`]), and
-	/// `DSP_SEGMENT_PARTIAL_TIERS` (a comma-separated fine→coarse list of coarser rollup
+	/// `WEFT_SEGMENT_PARTIAL_MIN_ROWS` (→ [`DEFAULT_PARTIAL_SIDECAR_MIN_ROWS`]), and
+	/// `WEFT_SEGMENT_PARTIAL_TIERS` (a comma-separated fine→coarse list of coarser rollup
 	/// resolutions, e.g. `hours,days`; unparseable entries are dropped, the first
 	/// [`MAX_SIDECAR_TIERS`] are kept).
 	#[must_use]
 	pub fn from_env() -> Self {
-		let base = std::env::var("DSP_SEGMENT_PARTIAL_BASE").ok().and_then(|v| v.trim().parse::<Resolution>().ok());
-		let min_rows = std::env::var("DSP_SEGMENT_PARTIAL_MIN_ROWS").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(DEFAULT_PARTIAL_SIDECAR_MIN_ROWS);
+		let base = std::env::var("WEFT_SEGMENT_PARTIAL_BASE").ok().and_then(|v| v.trim().parse::<Resolution>().ok());
+		let min_rows = std::env::var("WEFT_SEGMENT_PARTIAL_MIN_ROWS").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(DEFAULT_PARTIAL_SIDECAR_MIN_ROWS);
 		let mut tiers = [None; MAX_SIDECAR_TIERS];
-		if let Ok(raw) = std::env::var("DSP_SEGMENT_PARTIAL_TIERS") {
+		if let Ok(raw) = std::env::var("WEFT_SEGMENT_PARTIAL_TIERS") {
 			let parsed = raw.split(',').filter_map(|t| t.trim().parse::<Resolution>().ok());
 			for (slot, res) in tiers.iter_mut().zip(parsed) {
 				*slot = Some(res);
@@ -312,7 +312,7 @@ mod tests {
 
 	use bigdecimal::BigDecimal;
 	use chrono::{TimeZone, Utc};
-	use dsp_reduce::reduce_partial;
+	use weft_reduce::reduce_partial;
 	use splimes::Point;
 
 	use super::*;
@@ -322,7 +322,7 @@ mod tests {
 	}
 
 	fn descriptor(row_count: usize, byte_len: u64) -> SegmentDescriptor {
-		SegmentDescriptor { id: 1, path: "x-1.dspseg".to_string(), format_version: 1, physical_type: None, time_unit: None, row_count, null_count: 0, time_sorted: true, min_ts: Some(0), max_ts: Some(100), min_value: None, max_value: None, byte_len }
+		SegmentDescriptor { id: 1, path: "x-1.weftseg".to_string(), format_version: 1, physical_type: None, time_unit: None, row_count, null_count: 0, time_sorted: true, min_ts: Some(0), max_ts: Some(100), min_value: None, max_value: None, byte_len }
 	}
 
 	#[test]
@@ -354,7 +354,7 @@ mod tests {
 
 	#[test]
 	fn from_bytes_rejects_a_foreign_frame() {
-		assert!(PartialSidecar::from_bytes(b"not a dspart frame at all").is_err(), "a bad magic prefix is rejected");
+		assert!(PartialSidecar::from_bytes(b"not a weftpart frame at all").is_err(), "a bad magic prefix is rejected");
 		assert!(PartialSidecar::from_bytes(&[]).is_err(), "an empty buffer is rejected");
 	}
 
