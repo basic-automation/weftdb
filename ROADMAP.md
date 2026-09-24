@@ -472,6 +472,28 @@ detection within Y% and improving historical query latency by Z."*
     it on the real corpus, not the synthetic generator. *(src: Pcodec, arXiv 2502.06112 —
     https://arxiv.org/abs/2502.06112 · comparative study — https://arxiv.org/html/2510.07015v1 ·
     https://lib.rs/crates/pco)*
+    - [ ] **SCOPE CORRECTION (research 2026-09-23): evaluate pco for the COLD TIER and as a
+      bytes/point ceiling — not as the hot-path value codec.** Its format gives **page**-granular
+      random access with **serial** batch decode inside a page ("Batches within a page must be
+      decompressed serially"), which is architecturally incompatible with DSP's tile-level random
+      access; and its decode throughput is ratio-first — 1.4–5.5 GiB/s per thread across its own six
+      datasets, one to two orders below FastLanes-class unpacking, with Vortex beating it on 4 of 6.
+      Rewrite the item's goal accordingly. *(src: https://arxiv.org/pdf/2502.06112)*
+    - [ ] **The real prize in pco may be its MODE DETECTION, not its format.** Its automatic modes
+      map almost exactly onto DSP's regime: `IntMult` ("ms-precise timestamps stored as us") is
+      literally DSP's timestamp column, and `FloatMult` ("prices that are multiples of 0.01") is
+      literally DSP's schema-declared scaled-int value column; with them pco beats the next best
+      alternative by +29% to +94% across its datasets. So run the bench **head to head per column** —
+      pco `FloatMult` vs the shipped `scaled_for`/`scaled_blocked`, pco `IntMult` vs the shipped
+      delta/blocked/Gorilla timestamp codecs — not whole-file sizes. If pco's detection beats
+      `best_value_codec` on the real corpus, the actionable outcome is to steal the **heuristic**,
+      which stays inside hard-constraint #4 because DSP's scale is already schema-declared.
+      *(src: https://arxiv.org/pdf/2502.06112)*
+    - [ ] **`pco` is now 1.0 (1.0.3, 2026-08-01) — pin it in `dsp-bench` only**, keeping it out of
+      the core crates until an adopt decision, per the out-of-core boundary. Build the harness with
+      the `bmi1`/`bmi2`/`avx2` target features the crate's docs call for ("improves ... decompression
+      speed substantially") or the measured decode throughput will understate pco and produce a false
+      adopt-or-drop verdict. *(src: https://lib.rs/crates/pco)*
   - [x] **Scaled-int value bit-pack codec — realized on disk.** The `.dspseg` value block
     now carries a self-describing codec selector (`VAL_CODEC_VARINT`/`VAL_CODEC_BITPACK`);
     a `ScaledI64` column whose mantissas fixed-width bit-pack below the per-value varint
@@ -551,12 +573,62 @@ detection within Y% and improving historical query latency by Z."*
     https://dl.acm.org/doi/10.1145/3626717 · DuckDB ALP — https://duckdb.org/library/alp/ ·
     comprehensive eval, VLDB'25 — https://www.vldb.org/pvldb/vol18/p4396-hishida.pdf · FCBench —
     https://arxiv.org/pdf/2312.10301)*
-  - [ ] **GPU-decode ALP — on DSP's GPU + compression wedge:** a Nov-2025 paper presents a
-    high-throughput **GPU** framework for adaptive lossless f64 compression (ALP-style). Once an
-    ALP-class codec is on disk, a GPU-unpack path pairs directly with DSP's GPU interpolation
-    flagship (decompress-on-device, no host round-trip). Evaluate after the CPU ALP adopt lands.
-    *(src: "A High-Throughput GPU Framework for Adaptive Lossless Compression of Floating-Point
-    Data", arXiv 2511.04140 — https://arxiv.org/pdf/2511.04140)*
+  - [ ] **ALP now has a FROZEN wire layout to mirror — do not invent a container (research
+    2026-09-23).** ALP is a standardized Apache Parquet encoding (`ALP = 10`) in parquet-format
+    2.14.0: a 7-byte header (compression mode, integer encoding, log vector size, total element
+    count), an offset array of `num_vectors` uint32 byte positions, then vectors of up to
+    `vector_size` elements (**default 1024**). Exceptions are `uint16` positions + exact IEEE-754
+    bit patterns, and each exception slot is replaced by a placeholder *before* FOR encoding so the
+    integer stream stays branch-free and FOR/bit-packable. Three consequences for `VAL_CODEC_ALP`:
+    (i) the 1024 default vector size is **identical to DSP's `TRANSPOSE_TILE`**, so one tile = one
+    ALP vector and tile-level random access survives ALP adoption unchanged; (ii) adopt the
+    placeholder-before-FOR trick rather than a bespoke exception scheme; (iii) **`ALP-RD` is NOT in
+    the Parquet spec** (mode 0 = ALP, other modes reserved), so if DSP uses ALPrd for the
+    high-precision fallback, declare it a DSP-private mode id and keep mode 0 byte-compatible.
+    *(src: https://parquet.apache.org/docs/file-format/data-pages/alpencoding/)*
+  - [ ] **Use the `alp` crate to get the ALP adopt benchmarked, rather than hand-rolling it first.**
+    spiraldb's `alp` 0.0.4 (2026-09-08, Apache-2.0) implements both classic ALP and ALP-RD with
+    `ENCODE_CHUNK_SIZE = 1024` — matching DSP's tile granularity — and an encode/decode API whose
+    `decode_single`/`decode_slice_inplace` map onto `read_value_at`/`read_value_range`. It is a pure
+    codec crate, so it does not cross the control-plane/hot-path boundary. Two cautions to carry:
+    `0.0.x` means no semver promise (pin exactly or vendor), and `alp` pins `fastlanes ^0.6` while
+    that crate is at 0.7.2, so a combined dependency pulls two versions unless pinned.
+    *(src: https://docs.rs/alp/latest/alp/)*
+  - [ ] **Set the ALP acceptance bar from upstream's own ablation, and be willing to DECLINE.**
+    FastLanes' per-encoding ablation (VLDB'25, Table 7, PUBLIC_BI) reports ALP at **+4.36%
+    compression ratio for −7.28% decompression speed**, with ALP_RD +0.57%/−2.30% and Patch
+    +2.51%/−7.11% — i.e. on a mixed corpus ALP is a modest ratio win bought with decode speed, and
+    the exception machinery is what costs. So (i) the adopt-or-drop benchmark must report decode
+    throughput beside bytes/point and reject ALP if it regresses the tile decode rate by more than
+    the ratio gain (the same gating FOR and Gorilla got); and (ii) DSP's corpus is a pure f64
+    measurement column, not 2,289 mixed columns, so the expected win should be *far* above 4.36% —
+    if it is not, that is evidence the shipped scaled-int/FOR/blocked path already serves the value
+    column and **declining ALP is a legitimate, publishable outcome**.
+    *(src: https://www.vldb.org/pvldb/vol18/p4629-afroozeh.pdf)*
+  - [ ] **GPU-decode ALP — retarget to G-ALP (DaMoN'25), and decide the exception layout BEFORE the
+    CPU ALP block is frozen on disk.** G-ALP (CWI, open source at `cwida/FastLanesGpu-Damon2025`)
+    reports **324.7 GB/s** decompress-into-RAM for doubles on a V100 (and 463.5 GB/s for floats on
+    an RTX 4070), against the previously-cited arXiv 2511.04140 framework's 12.32 GB/s — over an
+    order of magnitude apart, so the port target should change (caveat, recorded honestly: the two
+    are not strictly like-for-like, since G-ALP measures decode into device memory on resident data).
+    Its two design rules bear directly on DSP's frame layout: exception patching must be **fully
+    data-parallel** (a branchy per-thread exception scan "will take longer than the actual decoding
+    of the value"), which needs a **lane-partitioned** exception section costing a fixed 0.5 bits per
+    value — and that is *not* bolt-on-able to a Parquet-style flat position array without a
+    re-encode. So store the exception section in the G-ALP lane-partitioned form behind a descriptor
+    bit, and expose unpack at **one value per thread** (the paper reports dropping from 32 to 1
+    value/thread "was crucial for achieving high occupancy"). *(src:
+    https://azimafroozeh.org/assets/papers/g-alp.pdf · https://arxiv.org/abs/2511.04140)*
+  - [ ] **Fuse decompression INTO the GPU interpolation kernel — with a number behind the wedge.**
+    G-ALP measures GPU *filter* throughput **above 100% of device RAM bandwidth** (~215% float /
+    ~100% double on an RTX 4070; ~120%/~172% on a V100), because loading data in compressed form
+    costs less than the bandwidth it saves, and because a fused kernel avoids "a round-trip of
+    non-compressed data to and from RAM". This turns DSP's "decompress-on-device, no host
+    round-trip" assertion into a concrete architectural rule: do **not** add a separate
+    decompress-then-interpolate kernel pair. Add a `dsp-bench` metric reporting GPU interpolation
+    throughput as a **percentage of device RAM bandwidth** — the figure that makes the fused design's
+    win visible and maps onto the $/billion-interpolated-points north star.
+    *(src: https://azimafroozeh.org/assets/papers/g-alp.pdf)*
   - [x] **FastLanes "Unified Transposed Layout" for the bit-pack codecs (decode-speed
     slice): shipped (prototype).** `TRANSPOSE_TILE`/`transpose_bitpack_bytes`/`_encode`/`_decode`
     — a per-tile bit-plane-major layout whose decoder reads `u64` words and walks only the *set*
@@ -780,18 +852,84 @@ of them turn Turso into the measurement backend.
 - [ ] **Backup 7.4 residue (d) — whole-store backup manifest**: fold the `.dspseg` segment frames in
   beside the control plane (today it is control-plane only, per hard-constraint #3), so a restore
   into an empty root is a complete store rather than a frame-less one.
-- [ ] **Backup cost: a snapshot tick is far slower than the configured interval.** Runtime-observed
-  on a **5-row** control plane: consecutive daemon ticks landed 7–22 s apart at a 2–3 s configured
-  interval, i.e. the four `VACUUM INTO`s dominate and the interval is a floor, not a cadence. Worth
-  measuring properly (it was observed on a box concurrently running cargo builds, so the absolute
-  numbers are soft) and, if it holds, either documenting the floor or checkpointing the MVCC log
-  before the vacuum. A tiny database should not cost seconds to snapshot.
-- [ ] **Snapshot dirs accumulate empty `.db-log`/`.db-wal` sidecars.** Each verified snapshot leaves
-  two **zero-byte** sidecars per database (8 per backup dir), created when the verification reopens
-  the copy. Cosmetic — `total_bytes` is unaffected (measured: reported 77,824 B = the actual
-  directory footprint) — but a backup directory should not be littered; drop them after verifying.
+- [x] **Backup cost: MEASURED (2026-09-23), and the diagnosis on record was wrong.** The symptom is
+  confirmed — the interval is a floor, not a cadence — but the cause is **not** the vacuum's work.
+  `database/benches/backup_cost.rs` times one whole `backup_control_plane_with_verify` (four
+  `VACUUM INTO`s + verification) and sweeps the aspect count, with `DSP_BENCH_BACKUP_DIR` choosing
+  the volume. On **tmpfs**: `snapshot_only` 8.62 ms @1 aspect / 6.18 ms @16 / 16.79 ms @128;
+  `source_match` 5.36 / 6.68 / 16.31 ms — single-digit milliseconds, growing with control-plane rows
+  (~2.7× from 16→128 aspects), not a fixed per-database floor. On the **btrfs** store volume under
+  heavy load (load avg 84–98) the same call took 39.96 s @1 / 50.05 s @16 — contaminated, not a
+  publishable number, but decisive on direction. Runtime on btrfs at load ~12: daemon ticks landed
+  2987/3493/3531/4100/4498/3140 ms apart at a 2 s interval, i.e. ~1.0–2.5 s per tick (not 7–22 s).
+  **So the cost is filesystem durability + I/O contention, and a fix must aim there.** The residue
+  items below name the specific levers.
+- [x] **Snapshot dirs no longer accumulate empty `.db-log`/`.db-wal` sidecars** —
+  `backup::remove_empty_sidecars` sweeps them after each verification, in both `VerifyMode`s, and
+  removes a sidecar **only** when it is exactly zero bytes (a non-empty `-wal` holds
+  un-checkpointed frames = data, and is never touched). Runtime-verified: a control-plane backup
+  directory now holds exactly its four `.db` files. Finding while pinning the premise: `VACUUM INTO`
+  itself creates the empty `-wal`; the verifying reopen adds the `-log`.
+- [ ] **Backup cost residue (a) — the root cause is documented upstream, and it is per-call
+  fsync + TRUNCATE checkpoint (research 2026-09-23).** Turso's `VACUUM INTO` reference states the
+  destination "is fully synced and a TRUNCATE checkpoint is performed before the statement returns,
+  so the destination is durable without further action" — so a tick pays 4× (full-file write + fsync
+  + WAL truncate-checkpoint). Record this as the attribution rather than re-litigating it, and stop
+  reading the ~1–2.5 s tick drift as daemon scheduling jitter. *(src:
+  https://docs.turso.tech/sql-reference/statements/vacuum)*
+- [ ] **Backup cost residue (b) — two cheap A/B experiments on the shipped bench, in this order.**
+  (i) Upstream SQLite makes the output fsync **conditional** on the *source* database's
+  `PRAGMA synchronous` being NORMAL or FULL, and Turso implements that pragma partially (OFF and FULL
+  only) — so `synchronous=OFF` on the snapshot connection may collapse the seconds-scale cost. Note
+  Turso's own docs describe the sync as unconditional, so the two disagree and only a measurement
+  settles it; a non-crash-safe snapshot may be acceptable since DSP verifies every snapshot and can
+  re-take it. (ii) Call the SDK's explicit `db.checkpoint()` once at the top of the tick, then take
+  the four snapshots, and see whether the per-snapshot TRUNCATE checkpoint gets cheaper for having a
+  short WAL — a one-line reordering in the backup daemon if it works. *(src:
+  https://sqlite.org/lang_vacuum.html · https://docs.turso.tech/sdk/rust/reference)*
+- [ ] **Backup cost residue (c) — DO NOT reach for Turso's experimental passive checkpoint.** It is
+  a documented data-loss path in exactly DSP's configuration: issue #8076 (filed 2026-07-28, still
+  open at 2026-09-23) reports a TRUNCATE checkpoint discarding acknowledged concurrent commits when
+  `experimental_mvcc_passive_checkpoint` is enabled under `journal_mode=experimental_mvcc` — and
+  `VACUUM INTO` performs exactly that TRUNCATE checkpoint on every call. A sibling (#8068) panics
+  ("MVCC vacuum gate acquired while transactions are still active") instead of returning busy, which
+  would abort `dsp-server` mid-backup. This **supersedes** the passive-checkpoint suggestion in the
+  0.7-upgrade item below. Re-evaluate when #8076 closes. *(src:
+  https://github.com/tursodatabase/turso/issues/8076 · https://github.com/tursodatabase/turso/issues/8068)*
+- [ ] **Backup 7.4 residue (b) is UPSTREAM-GATED, not an open design question (research 2026-09-23):**
+  Turso lists `sqlite3_backup_init`/`_step`/`_finish` as **stubs** in COMPAT.md, so the SQLite online
+  backup API (copy pages, re-read pages a writer dirties) does not exist there; and there is no
+  vendor-neutral incremental/WAL-streaming path either — the only incremental mechanisms are the
+  Turso sync engine (a push/pull protocol against a remote) and libSQL's `bottomless` virtual WAL,
+  which requires S3-compatible object storage. So incremental control-plane backup is unavailable
+  without a cloud/object-store dependency, which hard-constraint #2 keeps out of core. Keep
+  `VACUUM INTO` as the only snapshot mechanism and re-check COMPAT.md at each `turso` bump. *(src:
+  https://raw.githubusercontent.com/tursodatabase/turso/main/COMPAT.md ·
+  https://raw.githubusercontent.com/tursodatabase/libsql/main/bottomless/README.md)*
+- [ ] **Backup cost residue (d) — evaluate an `sqlite3_rsync`-style page-delta replica.** It is a
+  documented page-level delta copy for SQLite-format databases: the replica sends per-page hashes and
+  the origin returns only differing pages (a 500 MB database syncs in ~20 KB), against a live
+  database, and its WAL-mode/page-size restrictions were lifted in SQLite 3.50.0 (2025-05-29). Write
+  cost then scales with *changed* pages, not database size, which is precisely the btrfs fsync bill
+  DSP measured. Validate two things first: that a Turso-written file is byte-compatible enough for the
+  protocol, and that "replica is read-only during sync" fits the restore-drill flow. *(src:
+  https://sqlite.org/rsync.html)*
+- [ ] **Confirm the snapshot verifier does not depend on MVCC-broken pragmas.** Turso issue #4929
+  (filed 2026-01-29, still open) reports `PRAGMA page_count` returning 0 and `user_version` /
+  `application_id` returning 0 under MVCC — discovered while running the `VACUUM INTO` integration
+  tests. DSP's verifier compares user-table sets and *scans every row*, so it should be unaffected,
+  but that is worth asserting explicitly rather than assuming, since a pragma-based check would be
+  vacuously passing. *(src: https://github.com/tursodatabase/turso/issues/4929)*
 - [ ] **Evaluate the `turso` 0.7 upgrade — the release notes are now read (research 2026-07-23),
   and two of the three open questions have answers.** DSP pins `turso = "0.6"` and locks 0.6.1.
+  **Version check (research 2026-09-23): stable is now `0.7.2` (2026-07-30), with `0.8.0-pre.12`
+  out on 2026-09-22 — DSP is two minor versions behind, and 0.8-pre is moving weekly, so part of
+  this decision is whether to wait for 0.8 stable.** Before bumping, audit the `database` crate for
+  (a) any place two write statements can be in flight on one connection (now returns busy) and (b)
+  any interactive transaction where a statement can be abandoned mid-way (now poisons it) — **the
+  backup tick running beside a concurrent catalog writer is exactly the shape that trips (a)**.
+  NB the passive-checkpoint win listed below is **superseded** by the data-loss gate filed above
+  (#8076): do not adopt it as part of this bump. *(src: https://crates.io/crates/turso)*
   From the 0.7.0 notes:
   - **The `AUTOINCREMENT`-under-MVCC constraint is LIFTED upstream.** 0.7 makes `AUTOINCREMENT`
     behave correctly under concurrent transactions via PostgreSQL-style sequences (#7137), plus a
@@ -907,26 +1045,80 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 
 ## Immediate next actions
 
-- [ ] **START HERE (filed 2026-07-23 for the next run).** The 2026-07-23 run closed the whole Phase 7.4
-  backup arc (daemon + retention, concurrent-write-safe verify, **restore + drill**) and delivered the
-  real-corpus ingest benchmark the previous run's START-HERE asked for. Recommended order:
-  1. **Route measurement bulk ingest through the `.dspseg` seal — now with the real number behind it
-     (highest value, unchanged).** The benchmark is no longer synthetic: on the **real** `btc_1min.csv`
-     the legacy `batch_capture_measurements` path runs at **2,978 rows/s at n=20k falling to 1,447
-     rows/s at n=40k** — 2× rows costing **4.11×** the time — while the columnar seal is linear and
-     *speeds up* with amortization (**202k → 288k rows/s**), i.e. **67.9× at 20k and 199.3× at 40k**,
-     and seals **1M real rows in 4.57 s (218,963 rows/s, 4.22 B/point)**. The ratio grows with n
-     because the legacy side is super-linear, so this is the write-amplification hard-constraint #3
-     exists to remove. *(src:
+- [ ] **START HERE (filed 2026-09-23 for the next run).** The 2026-09-23 run closed both cheap backup
+  follow-ons (sidecar sweep shipped; snapshot cost **measured**, and the diagnosis on record was
+  wrong — it is I/O, not vacuum CPU) and landed the depth item (**transposed layout realized on
+  disk**, with an honest end-to-end *no-win* result). Recommended order:
+  1. **Route measurement bulk ingest through the `.dspseg` seal — still the highest-value item, and
+     still not started.** On the **real** `btc_1min.csv` the legacy `batch_capture_measurements` path
+     runs at **2,978 rows/s at n=20k falling to 1,447 rows/s at n=40k** — 2× rows costing **4.11×**
+     the time — while the columnar seal is linear and *speeds up* with amortization (**202k → 288k
+     rows/s**), i.e. **67.9× at 20k and 199.3× at 40k**, and seals **1M real rows in 4.57 s (218,963
+     rows/s, 4.22 B/point)**. The ratio grows with n because the legacy side is super-linear, so this
+     is the write-amplification hard-constraint #3 exists to remove. *(src:
      https://www.slingacademy.com/article/optimizing-inserts-and-updates-with-index-management-in-sqlite/
      · https://medium.com/@JasonWyatt/squeezing-performance-from-sqlite-insertions-971aff98eef2)*
-  2. **Backup arc follow-ons (cheap):** the snapshot-cost question (a tick costs seconds on a five-row
-     control plane — measure it properly on a quiet box, then either document the floor or checkpoint
-     the MVCC log before vacuuming) and dropping the empty `.db-log`/`.db-wal` sidecars after verifying.
-     Both are filed with their evidence in the Turso section below.
-  3. **The depth item:** realize the **FastLanes transposed layout on disk** (the tile-random-access
-     decoder already shipped; the residue is a `VAL_CODEC_*`/`TS_CODEC_*` tag + reader dispatch + its
-     own size function, then an *end-to-end* read benchmark — respecting the bandwidth-bound caveat).
+  2. **Backup cost residue, now that the cause is known (cheap, and measurable on the shipped
+     bench):** run the two A/B experiments — `PRAGMA synchronous=OFF` on the snapshot connection, and
+     an explicit `db.checkpoint()` before the four vacuums — on `DSP_BENCH_BACKUP_DIR` pointed at a
+     real volume on a **quiet** box. Both are filed with their citations in the Turso section. Do
+     **not** reach for the experimental passive checkpoint: it is an open data-loss path (#8076).
+  3. **The decode-threshold slice (cheap, and the transposed layout's real lever):** make the reader
+     dispatch on values-requested-per-tile (~10 is upstream's crossover) instead of always taking the
+     single-value path in `read_value_at`, and fix the **batch** point read, which still re-decodes a
+     tile per instant. Filed with its citation beside the transposed item.
+  4. **The depth item is now the f64/ALP arc**, which the 2026-09-23 research substantially
+     retargeted: ALP has a frozen Parquet wire layout whose 1024 vector size matches DSP's tile, the
+     `alp` crate makes it benchmarkable without hand-rolling, the acceptance bar should come from
+     upstream's own +4.36%/−7.28% ablation (declining is a legitimate outcome), and the GPU target
+     should be **G-ALP**, not arXiv 2511.04140 — with the exception layout decided *before* the
+     on-disk block is frozen.
+
+- [ ] **POSITIONING ALERT — DSP's precision wedge now has a direct competitor (research 2026-09-23).**
+  QuestDB shipped a native **`DECIMAL(precision, scale)`** in 9.2 (Nov 2025): up to 76 digits,
+  auto-sized storage from 1 byte (DECIMAL8) to 32 bytes (DECIMAL256), **no implicit conversion**
+  (explicit `CAST` or an `m` literal suffix), at a documented cost of only **~2× DOUBLE**. That is
+  nearly the same shape as DSP's "BigDecimal logical type + schema-declared physical encoding, no
+  silent downcast" pitch, so "precision-aware time-series engine" is no longer a category of one.
+  Two consequences: DSP-Bench needs an **exact-arithmetic arm** (same precision/scale on both sides,
+  e.g. DECIMAL(38,9) equivalent) rather than only decimal-vs-f64 internally, and DSP must be able to
+  state **its own decimal-vs-f64 slowdown factor** against QuestDB's published ~2× or the wedge is
+  asserted rather than measured. *(src: https://questdb.com/docs/query/datatypes/decimal/)*
+
+- [ ] **External-engine adapter fairness — three concrete rules from the 2026 landscape.**
+  (a) **QuestDB egress:** QuestDB 10.0 (2026-08-06) introduced **QWP**, a binary columnar WebSocket
+  protocol that supersedes both ILP (writes) and PG Wire (reads) and streams **Apache Arrow** record
+  batches, reporting 220M rows/s egress. An adapter written against PG Wire would be measuring a
+  deprecated path and is trivially attacked as unfair — use QWP/Arrow and record the protocol in the
+  run manifest. Corollary for DSP itself: if the north star is $/billion interpolated **output**
+  points, result serialization is on the critical path, so DSP needs its own Arrow-batch egress or
+  the comparison is apples-to-oranges. (b) **ASOF joins:** QuestDB now has four+ selectable ASOF
+  strategies (Fast, Memoized, Light, and Dense added in 9.2), optimizer-chosen but hint-overridable —
+  run the arm **twice** (optimizer default and best-hint), publish both, and capture the chosen
+  strategy; the same discipline applies to ClickHouse's hash vs full-sorting-merge ASOF.
+  (c) **Publication precedent:** QuestDB's own 10.0 post publishes named head-to-head numbers against
+  ClickHouse (1.55× native reads, 2.35× Arrow streaming) and its DECIMAL docs claim wins over
+  ClickHouse and DuckDB — current, dated evidence that named comparative publication is normal
+  practice here, which de-risks the open legal item below. It also sets the rhetorical bar: vendor
+  comparisons quote a single headline multiplier, so DSP's $/billion-points framing needs one beside
+  it. *(src: https://questdb.com/blog/questdb-10-release/ · https://questdb.com/blog/questdb-9-2-release/)*
+
+- [ ] **Adopt the TSM-Bench QUERY SPEC (not the repo) as DSP-Bench's external comparison workload.**
+  TSM-Bench (PVLDB 16(11), 2023) already defines interpolation as a first-class benchmark query — Q5
+  is literally `SELECT time, st_id, <s_list> FROM ts_table WHERE … SAMPLE BY 5s FILL(LINEAR)` — and
+  records that **Druid and MonetDB do not support it at all**, and that eXtremeDB "does not support
+  interpolation, instead, it fills the surrogate values with zeros". That is **peer-reviewed,
+  citable evidence for DSP's core commercial claim** that interpolation is under-served, far stronger
+  than a vendor blog, and Q5/Q4 are ready-made specs rather than workloads DSP invents for itself.
+  Its datasets also give an externally-defined scale bar: **D-LONG 518M** points and **D-MULTI 17.2B**
+  points — the right order of magnitude for a "$ per billion interpolated points" headline.
+  **Implement the spec inside DSP's own harness; do not depend on the repos** — the academic line is
+  dormant (TSM-Bench last pushed 2025-12-25, 28 stars; SEER last pushed 2024-08-23, 5 stars). For
+  TSBS compatibility, target the fork that is actually moving: **questdb/tsbs** (pushed 2026-09-04)
+  rather than timescale/tsbs (2026-05-27), and note the divergence in the run manifest — neither is
+  archived, so claiming TSBS is dead would be wrong. *(src:
+  https://www.vldb.org/pvldb/vol16/p3363-khelifati.pdf · https://api.github.com/repos/questdb/tsbs ·
+  https://api.github.com/repos/eXascaleInfolab/seer)*
 
 - [ ] **BENCHMARK HYGIENE — the synthetic ingest corpus flatters DSP, by a lot (measured 2026-07-23).**
   Running `ingest_path_profile_legacy_vs_columnar` on the real corpus for the first time contradicted
@@ -1032,10 +1224,28 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   afterwards (previously it could only fail by erroring). **Measured with `SKIP_SLOW_TESTS` unset:
   the single test runs in 12.23 s (it previously did not terminate — 40+ min at ~5 GB RSS), and the
   whole `db_tests` target runs 16 passed / 0 failed in 47.45 s.**
-- [ ] **NEXT — can `SKIP_SLOW_TESTS` be dropped workspace-wide?** `db_tests` no longer needs it (above),
-  but `database_orchestration` still guards four tests behind it, and an unguarded
-  `cargo test --workspace` has **not** been re-timed. Time those four; if they are also boundable, the
-  flag can retire and the suite gets its real coverage back.
+- [x] **ANSWERED (2026-09-23) — `SKIP_SLOW_TESTS` cannot be dropped workspace-wide yet, and the
+  guard has been hiding three real failures.** Timed `database_orchestration` **unguarded**
+  (`SKIP_SLOW_TESTS` unset): **9 m 58 s wall-clock, 14 passed / 3 FAILED / 17 total**. The seven
+  guarded tests are the whole cost — `test_api` 596.9 s, `test_batch_processing` 596.9 s,
+  `test_pipeline_api_precise` 593.2 s, `test_specific_process_batch` 583.4 s,
+  `test_pipeline_api_with_fake_db` 579.8 s, `test_pipeline_api` 406.6 s, `test_api_precise` 357.2 s
+  — while every other test in the crate finishes in under 8 s. So the flag is doing real work and
+  retiring it would add ~10 minutes to every run.
+- [ ] **The three unguarded `database_orchestration` failures are latent bugs, not flakes — fix them
+  before the guard can retire.** With `SKIP_SLOW_TESTS` unset: `test_api_precise` fails with
+  `Database error: Failed to query patterns: Parse error: no such table: patterns` (preceded by
+  `Failed to store dictionary metadata: DDL statements require an exclusive transaction (use BEGIN
+  instead of BEGIN CONCURRENT)` — i.e. the dictionary's table is never created because its DDL is
+  issued inside a `BEGIN CONCURRENT`, and the failure is then swallowed as a warning);
+  `test_pipeline_api_with_fake_db` and `test_pipeline_api_precise` both fail with
+  `Invalid time range: start time must be before end time`. These are **pre-existing** and unrelated
+  to the 2026-09-23 increments — they have simply never run in CI because the guard hides them. The
+  DDL-under-`BEGIN CONCURRENT` one looks like a genuine control-plane bug rather than a test bug.
+- [ ] **Bound the seven slow `database_orchestration` tests the way `db_tests` was bounded.** Each
+  spends ~6–10 minutes; `test_create_btc_1min_database` was made runnable by capping its row count
+  and using a temp data dir (`BTC_TEST_MAX_ROWS`, default 5,000). The same treatment here would let
+  the flag retire and give the suite its real coverage back.
 - [ ] **Historical note — the LNK1102 research that produced the `[profile.test] debug = 1` fix:** LNK1102
   is heap exhaustion in `link.exe`, and the standard mitigations are to cut the debug information the
   linker must chew (a `[profile.test] debug = 1` — line tables only — instead of the current full
@@ -1371,16 +1581,69 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   per-tile decode with the full `transpose_bitpack_decode` via a `transpose_tile_decode` helper;
   the range decode equals the full decode sliced to `[start, start+len)` (round-trip-tested across
   tile sizes, single-value/boundary-straddling windows, width-0 tiles, and out-of-range requests).
-- [ ] **Next slice — realize the transposed layout on disk (Phase 6.1, decode-speed residue):** the
-  tile-random-access decoder now exists, so wire the transposed layout as a realized value/timestamp
-  codec (a new `VAL_CODEC_*`/`TS_CODEC_*` tag with reader dispatch; **note the transposed footprint
-  differs from the block=64 codec — tile=1024, and a short tail costs up to `width-1` extra bytes —
-  so it needs its own size function + selector entry, it is not a drop-in re-encoding of the blocked
-  bytes**), have `read_value_at` use `transpose_bitpack_decode_range` on it, and benchmark the
-  **end-to-end** read-decode win. Note the **decode-throughput-is-often-bandwidth-bound** caveat
-  before claiming an end-to-end win — measure, don't assume. *(src: FastLanes, VLDB'23 —
-  https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf · "When Is a Columnar Scan Bandwidth-Bound? A
-  Decode-Throughput Law", 2026 — https://arxiv.org/pdf/2606.22423)*
+- [x] **Transposed layout REALIZED on disk (Phase 6.1, decode-speed residue) — shipped 2026-09-23,
+  and the end-to-end answer is an honest NO.** `VAL_CODEC_TRANSPOSED` (tag 5) is the sixth `.dspseg`
+  value codec: tile-size uvarint + length-prefixed `transpose_bitpack_encode` stream, with its **own**
+  size function (`ColumnEncoding::transposed_value_bytes`) and selector entry
+  (`best_value_codec_transposed(max_overhead)`) rather than reusing the blocked figure, full reader
+  dispatch (`read_value_column`, `read_value_at` via `transpose_bitpack_decode_range`, and the
+  random-access whitelist/skip helpers), and `FrameOptions`/`write_segment_with` +
+  `write_paged_segment_with` as the general frame writers. Reachable from a deployment via
+  `TransposedPolicy` / `DSP_SEGMENT_TRANSPOSED_MAX_OVERHEAD`. **Opt-in**, so an unconfigured store
+  writes byte-for-byte the historical frames.
+  **Measured end-to-end (release, `dsp-physical-type/benches/transposed_read.rs`, 1M-row
+  zero-straddling ScaledI64 column):** frame bytes 1,251,057 transposed vs 1,250,076 linear
+  (**+0.08%**); full decode **12.98 ms vs 13.39 ms** (CIs overlap — a tie); windowed 1000-row range
+  **2.380 ms vs 2.393 ms** (a tie); single point read **2.250 ms vs 2.431 ms** (~1.08×, disjoint CIs).
+  **So the ~5.7× kernel-level unpack win does NOT survive the whole read path** — the
+  bandwidth-bound caveat this item carried, confirmed on DSP's own path. The layout is byte-neutral
+  and read-neutral here, which is why it stays opt-in and the default is unchanged.
+  *(src: https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf · https://arxiv.org/pdf/2606.22423)*
+- [x] **Windowed value reads no longer re-walk the codec chain per row (found by review of the
+  above).** `read_range_from_section` resolved a window by calling `read_value_at` once per row, and
+  every fixed-layout codec locates a value by walking its block/tile headers *from the start of the
+  stream* — so an `N`-row window cost `N` walks, and on the 1024-lane transposed layout it decoded a
+  whole tile per value (measured ~27× slower than linear, and ~20× slower than the full-decode
+  fallback it was supposed to beat). Fixed by `dspseg::read_value_range(bytes, start, len)`, which
+  does the range decode **once** per codec; this also removes the pre-existing per-row walk for the
+  blocked/FOR codecs. Equal to the full decode sliced to the window, tested across every codec and
+  window shape.
+- [x] **`read_value_range` cannot panic on a malformed block (found by the same review).** A cascade
+  block whose RLE inner run-lengths sum short decodes to fewer values than its header's `count`, and
+  the fallback arm sliced against that count — a panic inside a fallible public parser. Now slices
+  with `get`, matching `read_value_at`'s existing behaviour; regression-tested with a hand-built
+  short-decoding block.
+- [ ] **NEXT — the transposed layout's real lever is a per-tile decode-count threshold, not the
+  layout itself (research 2026-09-23).** The `fastlanes` crate's docs state that beyond roughly **10
+  values** it is typically faster to unpack a whole tile and index than to unpack values
+  individually. DSP's reader currently always takes the single-value path in `read_value_at` and
+  always takes the whole-range path in `read_value_range`; neither adapts. Make the dispatch count
+  the requested values falling in a tile and pick accordingly — that is the difference between
+  tile-level random access being a win and being a pessimization. The same threshold applies to the
+  **batch point read** (`read_points_from_section`), which still calls `read_value_at` per instant
+  and so re-decodes one tile per instant when several instants share a tile (measured by review:
+  500 same-tile instants ≈ 2.33 ms vs 0.52 ms linear). *(src: https://lib.rs/crates/fastlanes)*
+- [ ] **NEXT — upstream FastLanes does NOT make the transposed layout its default either, and
+  exposes the permutation instead (research 2026-09-23).** The FastLanes *file format* paper states
+  they "use the Unified Transposed Layout (UTL) as an option rather than as the default", because
+  for Delta schemes it permutes tuple order and restoring that order costs a gather; their escape
+  hatch is a **shareable 1024-entry selection vector** that a vectorized engine can apply in front of
+  decoded vectors, with the restore performed only on request. This independently validates DSP's
+  opt-in choice, and names the next slice: expose an **unordered** tile decode beside the ordered one
+  so DSP's order-*insensitive* consumers (Phase 6.3 min/max/count from metadata, predicate eval
+  before decompression, CPU filter before GPU transfer) pay no gather at all, while only the ordered
+  interpolation path restores. *(src: FastLanes file format, VLDB'25 —
+  https://www.vldb.org/pvldb/vol18/p4629-afroozeh.pdf)*
+- [ ] **Cross-check DSP's hand-rolled bit-plane decoder against the `fastlanes` crate (0.7.2,
+  2026-09-02, Apache-2.0).** It provides the same 1024-element layout (BitPacking pack/unpack,
+  single-value unpack, transposed Delta/RLE, linear FoR) via LLVM auto-vectorization. If DSP's
+  decoder is materially slower at the same bit width, that is a bug rather than a design choice —
+  a cheap external yardstick for `benches/transposed_read.rs`. *(src: https://lib.rs/crates/fastlanes)*
+- [ ] **Track the FastLanes SPEC, not the CWI reference implementation.** `cwida/fastlanes` is on a
+  `dev` branch with no tagged release (the paper's v0.1), its Rust bindings are path-only
+  (`fls-rs = { path = "./rust" }`, not a published crate), and its CUDA reader is listed under
+  "Coming Soon". Depend on spiraldb's published crates (`fastlanes`, `alp`) or on nothing; do not
+  vendor the C++ reference. *(src: https://raw.githubusercontent.com/cwida/fastlanes/dev/README.md)*
 - [ ] **Next slice — evaluate Vortex as interchange + bench baseline (Phase 1/4):** Rust,
   Arrow-compatible, cascading ALP/FastLanes/FSST codecs, **~100× faster random access + 10–25×
   faster decode than Parquet+zstd at ~same ratio (TPC-H SF10, 38% smaller)**, GPU-SIMT decode by
@@ -1390,6 +1653,21 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   just-shipped delta-cascade value codec. *(src: https://vortex.dev/ ·
   https://spice.ai/learn/vortex · cascading-with-BtrBlocks —
   https://spiraldb.com/post/cascading-compression-with-btrblocks)*
+  - [ ] **GO on both counts, and the governance question is settled (research 2026-09-23):** the
+    crate is at **0.86.1 (2026-09-11, Apache-2.0)**, the **file format is stable from 0.36.0**
+    (all later releases read files written by any version ≥ 0.36.0) though the library API is
+    explicitly not, and the project is now an **Incubation Stage project at LF AI & Data** rather
+    than a single vendor's — which is what clears hard-constraint #2. Split this item: (a) add
+    Vortex as a `dsp-bench` external-format baseline for the storage + random-access workloads (it
+    shares DSP's cascading/ALP/FastLanes design, so it is the *fair* comparison Parquet is not);
+    (b) scope a `dsp-vortex` interchange crate **outside** the core crates, beside `dsp-arrow`. Pin
+    the version. *(src: https://github.com/vortex-data/vortex)*
+  - [ ] **Do NOT take a build dependency on `vortex-gpu`.** Its last publish is 0.56.0
+    (2025-11-17) — about ten months and thirty minor versions behind the main line at 0.86.1 — and
+    its docs.rs build failed, so there is no published API documentation. Use it **read-only** as a
+    reference implementation (it is the only open-source *Rust* rendering of ALP + FastLanes GPU
+    kernels) alongside `cwida/FastLanesGpu-Damon2025`, and keep DSP's GPU path its own.
+    *(src: https://docs.rs/vortex-gpu)*
 - [ ] **Evaluate the FastLanes *File Format* (not just the layout) as a bench baseline + a
   random-access reference (Phase 1/4):** the FastLanes file-format paper (VLDB'25, 18(11):4629)
   extends the transposed layout to a full format whose headline API is **"flexible support for
@@ -1399,6 +1677,26 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   storage/compressed-query **and point-lookup** workloads, and as the reference design for the
   transposed-on-disk realization. *(src: "The FastLanes File Format", VLDB'25 —
   https://www.vldb.org/pvldb/vol18/p4629-afroozeh.pdf · CWI impl — https://github.com/cwida/fastlanes)*
+  - [ ] **It publishes a random-access target DSP can mirror exactly (research 2026-09-23):**
+    retrieving the first value (`LIMIT 1 OFFSET 0`) across PUBLIC_BI takes FastLanes **0.14053 ms**,
+    vs Parquet+Snappy **315.62×** slower, Parquet+Zstd **413.66×**, BtrBlocks **813.57×**, DuckDB
+    5.96× — because "block-based compression methods are extremely inefficient for random access, as
+    they require decompressing the entire block to access a single value". Add a `dsp-bench` case
+    mirroring it (single cold-frame point read, reported in ms *and* as a multiple of Parquet), so
+    DSP's point-read work has an external yardstick rather than only an internal before/after. It is
+    also the argument for **not** adopting a block-based heavyweight codec (zstd over a rowgroup) on
+    the measurement hot path even where it would win bytes/point: the north star is a *latency*
+    target. *(src: https://www.vldb.org/pvldb/vol18/p4629-afroozeh.pdf)*
+  - [ ] **Two honesty corrections from the same paper.** (i) **Encoding is the weak side**:
+    FastLanes total encode time on PUBLIC_BI is 81,341 ms vs Parquet+Snappy 5,867 ms (~14× slower),
+    and the authors concede "no effort whatsoever has been made to make it fast". DSP encodes on the
+    *ingest* path, so an exhaustive per-column codec search would do the same damage — adopt the
+    paper's own mitigation before growing the candidate set with ALP/cascade: **three-way sampling**
+    (vectors at positions 0, 32, 64) reaches >99% of the ratio of searching all 64. (ii) **Ratio
+    alone is not the story**: on PUBLIC_BI Parquet+Zstd is within 2% of FastLanes, and on TPC-H it
+    is 15.3% *ahead* — FastLanes' win is the 43–44× decode. So DSP's compression headline must be
+    ratio **and** decode throughput jointly, never ratio alone.
+    *(src: https://www.vldb.org/pvldb/vol18/p4629-afroozeh.pdf)*
 - [ ] **Point-lookup positioning — DSP's block-random-access read is a genuine columnar mitigation
   (Phase 0/1):** the 2026 competitive reviews name point lookups as *the* columnar weakness ("a
   column store opens ~50 column files to materialise one row; a row store walks one B-tree path" →
