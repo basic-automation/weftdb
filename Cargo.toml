@@ -7,7 +7,7 @@ members = ["database", "database_orchestration", "splimes", "weft-tui", "weft-be
 [workspace.package]
 license = "MIT"
 authors = ["Justin Icenhour"]
-repository = "https://github.com/physics515/weftdb"
+repository = "https://github.com/basic-automation/weftdb"
 
 [workspace.dependencies]
 anyhow = "1"
