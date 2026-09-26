@@ -1,0 +1,35 @@
+name: Publish to crates.io
+
+# Manual only, on purpose. Publishing is irreversible — a version can be yanked but
+# never replaced — so this never fires automatically from a push or a tag.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Verify only, upload nothing"
+        type: boolean
+        default: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Requires the `crates-io` environment (add the CARGO_REGISTRY_TOKEN secret there,
+    # and required reviewers if you want a second pair of eyes on every release).
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Dry run
+        if: ${{ inputs.dry_run }}
+        run: ./scripts/publish.sh
+
+      - name: Publish
+        if: ${{ !inputs.dry_run }}
+        run: ./scripts/publish.sh --execute
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
