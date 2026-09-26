@@ -67,12 +67,14 @@ impl LatencyStats {
 		#[allow(clippy::cast_precision_loss)]
 		let mean_f = sum as f64 / count as f64;
 		#[allow(clippy::cast_precision_loss)]
-		let variance = sorted.iter()
+		let variance = sorted
+			.iter()
 			.map(|&v| {
 				let d = v as f64 - mean_f;
 				d * d
 			})
-			.sum::<f64>() / count as f64;
+			.sum::<f64>()
+			/ count as f64;
 		#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 		let stddev_ns = variance.sqrt().round() as u64;
 

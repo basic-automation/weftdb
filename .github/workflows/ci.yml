@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # rustfmt.toml uses nightly-only options (imports_granularity, group_imports),
+  # so the style gate is the one job that needs nightly. The crates build on stable.
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - run: cargo +nightly fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Gated on the categories that catch defects. `style`/`pedantic`/`nursery`
+      # have a large pre-existing backlog in this workspace; they are reported by
+      # running clippy locally, not enforced here, so the gate stays honest.
+      #
+      # RUSTFLAGS is cleared for this job on purpose: the workflow-level `-D warnings`
+      # reaches clippy-driver as a rustc flag and would deny *every* clippy lint,
+      # silently turning the category gate below into "deny everything". rustc warnings
+      # are still denied by the build/test and msrv jobs.
+      - run: cargo clippy --workspace --all-targets -- -D clippy::correctness -D clippy::suspicious -D clippy::perf
+        env:
+          RUSTFLAGS: ""
+
+  # The MSRV is a published promise in Cargo.toml (rust-version); prove it still holds.
+  msrv:
+    name: msrv (1.95)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --workspace --all-targets
+      # CI runners have no GPU adapter; the engine falls back to SIMD/parallel CPU.
+      # SKIP_SLOW_TESTS keeps the hosted runners inside a sane wall-clock budget, and
+      # --test-threads is capped because several suites stand up their own segment
+      # stores — at full parallelism a hosted runner gets OOM-killed, which surfaces as
+      # a SIGKILL rather than a test failure.
+      - name: Test
+        run: cargo test --workspace -- --test-threads=4
+        env:
+          SKIP_SLOW_TESTS: 1
+
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build docs (deny broken intra-doc links)
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # Every published crate must package cleanly before a tag is ever cut.
+  package:
+    name: cargo package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo package --workspace --no-verify

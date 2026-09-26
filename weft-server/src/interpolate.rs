@@ -20,10 +20,10 @@ use axum::{
 };
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use chrono::{DateTime, Utc};
-use weft_line_protocol::TimestampPrecision;
 use serde::{Deserialize, Serialize};
 use splimes::{Point, Resolution, Spline};
 use tracing::Instrument as _;
+use weft_line_protocol::TimestampPrecision;
 
 use crate::metrics::SharedMetrics;
 

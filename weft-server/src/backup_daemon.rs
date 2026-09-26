@@ -22,13 +22,11 @@
 //! a detached side task; the router and its handlers are untouched.
 
 use std::{
-	path::{Path, PathBuf},
-	sync::Arc,
-	time::Duration,
+	path::{Path, PathBuf}, sync::Arc, time::Duration
 };
 
-use database::{ControlPlaneBackup, SegmentStore, VerifyMode};
 use tracing::Instrument as _;
+use weftdb::{ControlPlaneBackup, SegmentStore, VerifyMode};
 
 use crate::metrics::SharedMetrics;
 
@@ -69,7 +67,7 @@ fn is_generated_label(name: &str) -> bool {
 /// `VACUUM INTO` needs a non-existing destination file, so a tick must not reuse a
 /// directory. Two ticks inside the same millisecond (or a restart landing on an existing
 /// stamp) are disambiguated with a `-1`, `-2`, … suffix; the suffixed form still matches
-/// [`is_generated_label`] only when the suffix keeps it all-digits, so the plain and
+/// `is_generated_label` only when the suffix keeps it all-digits, so the plain and
 /// suffixed names are both prunable.
 fn fresh_dir(base: &Path, millis: u128) -> PathBuf {
 	let first = base.join(generated_label(millis));
@@ -125,7 +123,7 @@ pub async fn list_generated_backups(base: &Path) -> anyhow::Result<Vec<(u128, Pa
 /// Remove the oldest daemon-generated snapshots under `base` until at most `keep`
 /// remain, returning how many directories were removed.
 ///
-/// Only `backup-<digits>` directories are candidates (see [`is_generated_label`]), so a
+/// Only `backup-<digits>` directories are candidates (see `is_generated_label`), so a
 /// hand-labelled snapshot is never pruned. `keep = 0` removes every generated snapshot.
 ///
 /// # Errors
@@ -160,7 +158,7 @@ pub async fn prune_generated_backups(base: &Path, keep: usize) -> anyhow::Result
 /// # Errors
 ///
 /// Propagates a clock failure, or any
-/// [`SegmentStore::backup_control_plane_with_verify`](database::SegmentStore::backup_control_plane_with_verify)
+/// [`SegmentStore::backup_control_plane_with_verify`](weftdb::SegmentStore::backup_control_plane_with_verify)
 /// backup/verify failure.
 pub async fn backup_tick(store: &SegmentStore, metrics: &SharedMetrics, base: &Path) -> anyhow::Result<ControlPlaneBackup> {
 	let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis();
@@ -199,11 +197,11 @@ pub fn spawn_backup_daemon(store: Arc<SegmentStore>, metrics: SharedMetrics, con
 					if let Some(keep) = config.keep {
 						match prune_generated_backups(&config.base, keep).await {
 							Ok(removed) if removed > 0 => println!("backup daemon: pruned {removed} snapshot(s), keeping the newest {keep}"),
-							Ok(_) => {},
+							Ok(_) => {}
 							Err(err) => eprintln!("backup daemon: prune failed: {err}"),
 						}
 					}
-				},
+				}
 				Err(err) => eprintln!("backup daemon: snapshot failed: {err}"),
 			}
 		}
@@ -215,9 +213,9 @@ mod tests {
 	use std::sync::Arc;
 
 	use bigdecimal::BigDecimal;
-	use database::SegmentStore;
-	use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
 	use tempfile::TempDir;
+	use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
+	use weftdb::SegmentStore;
 
 	use super::*;
 	use crate::metrics::Metrics;

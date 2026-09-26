@@ -20,11 +20,11 @@
 use std::time::Instant;
 
 use bigdecimal::{BigDecimal, ToPrimitive};
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 use weft_physical_type::{
 	weftseg::{read_paged_segment_range, read_segment_range}, PagedSegment, Segment, TimeUnit
 };
-use rand::{Rng, SeedableRng};
-use rand_chacha::ChaCha8Rng;
 
 use crate::{
 	schema::{BenchResult, CorrectnessReport, DatasetMeta, StorageEstimate, TimingBreakdown, SCHEMA_VERSION}, stats::{BootstrapConfig, LatencyStats}
@@ -148,7 +148,8 @@ impl RangeFetchProfile {
 			(0..n).map(|_| {
 				cur += 2 + i64::from(rng.random::<u8>() % 20);
 				cur
-			}).collect()
+			})
+			.collect()
 		};
 		(timestamps, values)
 	}
@@ -169,11 +170,13 @@ impl RangeFetchProfile {
 		let mut rng = ChaCha8Rng::seed_from_u64(self.seed ^ 0x_C0DE_5EED_B20B);
 		let n = timestamps.len();
 		let span = self.window_rows.max(1);
-		(0..self.window_count).map(|_| {
-			let lo = rng.random_range(0..n);
-			let hi = (lo + span - 1).min(n - 1);
-			(timestamps[lo], timestamps[hi])
-		}).collect()
+		(0..self.window_count)
+			.map(|_| {
+				let lo = rng.random_range(0..n);
+				let hi = (lo + span - 1).min(n - 1);
+				(timestamps[lo], timestamps[hi])
+			})
+			.collect()
 	}
 }
 
@@ -267,9 +270,7 @@ pub fn run_range_fetch(profile: &RangeFetchProfile, reps: usize) -> anyhow::Resu
 		0.0
 	};
 
-	Ok(BenchResult {
-		schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_RANGE_FETCH.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: rows_fetched, irregular: !profile.regular, missingness_fraction: 0.0, seed: profile.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage
-	})
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_RANGE_FETCH.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: rows_fetched, irregular: !profile.regular, missingness_fraction: 0.0, seed: profile.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage })
 }
 
 #[cfg(test)]

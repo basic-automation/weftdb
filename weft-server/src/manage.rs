@@ -4,7 +4,7 @@
 //! These are the write-path counterpart of the read-only
 //! [`storage`](crate::storage) surface. Until now the segment store could only be
 //! populated **in-process** (a test or an
-//! embedding host called [`SegmentStore::declare`](database::SegmentStore::declare)
+//! embedding host called [`SegmentStore::declare`](weftdb::SegmentStore::declare)
 //! / `seal_declared` directly); the read endpoints served whatever was already on
 //! disk. These handlers let an HTTP client declare an aspect's schema and ingest a
 //! batch of points, so a client can populate the store the
@@ -14,7 +14,7 @@
 //!
 //! ## Scope
 //!
-//! A configured [`SegmentStore`](database::SegmentStore) is opened against one
+//! A configured [`SegmentStore`](weftdb::SegmentStore) is opened against one
 //! `(database, subject)` namespace (the binary's `WEFT_SEGMENT_STORE_ROOT` wiring),
 //! so these endpoints manage **aspects** within that scope — the unit a client
 //! actually declares a schema for and seals batches into. The DB/subject hierarchy
@@ -34,13 +34,15 @@ use axum::{
 };
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
-use database::VerifyMode;
-use weft_line_protocol::TimestampPrecision;
-use weft_physical_type::{first_order_violation, AspectSchema, PhysicalType, SegmentDescriptor, TimeUnit};
 use serde::{Deserialize, Serialize};
 use tracing::Instrument as _;
+use weft_line_protocol::TimestampPrecision;
+use weft_physical_type::{first_order_violation, AspectSchema, PhysicalType, SegmentDescriptor, TimeUnit};
+use weftdb::VerifyMode;
 
-use crate::{state::AppState, storage::{AspectInfo, StorageError}};
+use crate::{
+	state::AppState, storage::{AspectInfo, StorageError}
+};
 
 /// Parse a [`PhysicalType`] from its stable wire token (the inverse of
 /// [`PhysicalType::name`]) plus an optional `scale`.
@@ -210,9 +212,9 @@ pub struct ReconcileResponse {
 ///
 /// This is the operator trigger for the reconciliation pass the
 /// `unsorted_segments` order-health signal motivates. With no `threshold` query
-/// param it delegates to [`SegmentStore::reconcile_aspect`](database::SegmentStore::reconcile_aspect)
+/// param it delegates to [`SegmentStore::reconcile_aspect`](weftdb::SegmentStore::reconcile_aspect)
 /// unconditionally; with `?threshold=N` it delegates to the threshold-gated
-/// [`reconcile_aspect_if_unsorted_exceeds`](database::SegmentStore::reconcile_aspect_if_unsorted_exceeds),
+/// [`reconcile_aspect_if_unsorted_exceeds`](weftdb::SegmentStore::reconcile_aspect_if_unsorted_exceeds),
 /// so the rewrite runs only when the backlog is at or above `N`. Either way each
 /// out-of-order segment is stable-sorted by timestamp and re-sealed in place at its
 /// own id, so afterward point lookups over the aspect binary-search. A pass that
@@ -235,9 +237,9 @@ pub async fn reconcile_aspect(State(state): State<AppState>, Path(aspect): Path<
 }
 
 /// The body of [`reconcile_aspect`], split out so the significant-`Drop`
-/// [`SegmentStore`](database::SegmentStore) handle is dropped in the caller after
+/// [`SegmentStore`](weftdb::SegmentStore) handle is dropped in the caller after
 /// the last use rather than held across the response construction.
-async fn reconcile_aspect_inner(store: &database::SegmentStore, aspect: &str, threshold: Option<usize>, hot_cold: bool, overlaps: bool, split_min_bytes: Option<u64>, metrics: &crate::metrics::SharedMetrics) -> Result<Response, StorageError> {
+async fn reconcile_aspect_inner(store: &weftdb::SegmentStore, aspect: &str, threshold: Option<usize>, hot_cold: bool, overlaps: bool, split_min_bytes: Option<u64>, metrics: &crate::metrics::SharedMetrics) -> Result<Response, StorageError> {
 	// Undeclared aspect → 404 (mirrors the read surface's not-found semantics).
 	if store.schema_for(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?.is_none() {
 		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
@@ -271,9 +273,9 @@ async fn reconcile_aspect_inner(store: &database::SegmentStore, aspect: &str, th
 		// overlaps / hot/cold: record a pass only when it actually changed something
 		// (matches the background daemon / store-wide sweep semantics).
 		("threshold", true, n) => metrics.record_reconcile_pass(u64::try_from(n).unwrap_or(u64::MAX)),
-		("threshold", false, _) => {},
+		("threshold", false, _) => {}
 		(_, _, n) if n > 0 => metrics.record_reconcile_pass(u64::try_from(n).unwrap_or(u64::MAX)),
-		(_, _, _) => {},
+		(_, _, _) => {}
 	}
 	let stats = store.aspect_stats(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?;
 	Ok((StatusCode::OK, Json(ReconcileResponse { aspect: aspect.to_string(), mode, triggered, reconciled, cold_reconciled, hot_reconciled, unsorted_segments: stats.unsorted_segments, overlapping_segments: stats.overlapping_segments })).into_response())
@@ -313,18 +315,18 @@ pub struct ReconcileStoreResponse {
 ///
 /// The manual, store-wide operator counterpart to the per-aspect
 /// [`reconcile_aspect`] endpoint and the background reconcile daemon — the same
-/// [`SegmentStore::reconcile_all_over_threshold`](database::SegmentStore::reconcile_all_over_threshold)
+/// [`SegmentStore::reconcile_all_over_threshold`](weftdb::SegmentStore::reconcile_all_over_threshold)
 /// sweep, on demand. An absent `threshold` defaults to 1 (reconcile any aspect with
 /// out-of-order data). Each aspect actually reconciled is counted in
 /// `weft_reconcile_passes_total`, exactly like the per-aspect trigger and the daemon.
 ///
 /// With `?hot_cold=true` it instead runs the
-/// [`SegmentStore::reconcile_all_hot_cold`](database::SegmentStore::reconcile_all_hot_cold)
+/// [`SegmentStore::reconcile_all_hot_cold`](weftdb::SegmentStore::reconcile_all_hot_cold)
 /// sweep: every aspect's cold segments are reconciled unconditionally and only the
 /// hot tail is gated on the threshold. The response then carries the cold/hot split.
 ///
 /// With `?overlaps=true` it runs the store-wide cross-segment overlap merge
-/// ([`SegmentStore::reconcile_all_overlaps`](database::SegmentStore::reconcile_all_overlaps)),
+/// ([`SegmentStore::reconcile_all_overlaps`](weftdb::SegmentStore::reconcile_all_overlaps)),
 /// merging each aspect's time-overlap groups; `segments_reconciled` is then the number
 /// of segments merged away. `overlaps` takes precedence over `hot_cold`/`threshold`.
 ///
@@ -342,8 +344,8 @@ pub async fn reconcile_store(State(state): State<AppState>, Query(params): Query
 }
 
 /// The body of [`reconcile_store`], split out so the significant-`Drop`
-/// [`SegmentStore`](database::SegmentStore) handle is dropped in the caller.
-async fn reconcile_store_inner(store: &database::SegmentStore, threshold: Option<usize>, hot_cold: bool, overlaps: bool, split_min_bytes: Option<u64>, metrics: &crate::metrics::SharedMetrics) -> Result<Response, StorageError> {
+/// [`SegmentStore`](weftdb::SegmentStore) handle is dropped in the caller.
+async fn reconcile_store_inner(store: &weftdb::SegmentStore, threshold: Option<usize>, hot_cold: bool, overlaps: bool, split_min_bytes: Option<u64>, metrics: &crate::metrics::SharedMetrics) -> Result<Response, StorageError> {
 	let threshold = threshold.unwrap_or(1).max(1);
 	let (mode, aspects_scanned, aspects_reconciled, segments_reconciled, cold_reconciled, hot_reconciled) = if overlaps {
 		// `split_min_bytes` selects the store-wide split-not-rewrite floor; absent → the
@@ -404,9 +406,9 @@ pub struct SquashResponse {
 /// (roadmap Phase 4.6 — the squash half of the split-not-rewrite path).
 ///
 /// With no `max_segments` query param it squashes unconditionally
-/// ([`SegmentStore::squash_aspect`](database::SegmentStore::squash_aspect)); with
+/// ([`SegmentStore::squash_aspect`](weftdb::SegmentStore::squash_aspect)); with
 /// `?max_segments=N` it delegates to the threshold-gated
-/// [`squash_aspect_if_exceeds`](database::SegmentStore::squash_aspect_if_exceeds), so
+/// [`squash_aspect_if_exceeds`](weftdb::SegmentStore::squash_aspect_if_exceeds), so
 /// the rewrite runs only when the segment count exceeds `N` — the trigger that bounds
 /// the fragmentation repeated split carve-offs create. Returns `200 OK` with whether
 /// it triggered, how many segments it removed, and the post-pass segment count.
@@ -460,7 +462,7 @@ pub struct CompactResponse {
 /// counterpart of `squash`, which folds to one).
 ///
 /// The manual counterpart of the `WEFT_COMPACT_TARGET_ROWS` daemon pass, delegating to
-/// [`SegmentStore::squash_aspect_to_target_rows`](database::SegmentStore::squash_aspect_to_target_rows).
+/// [`SegmentStore::squash_aspect_to_target_rows`](weftdb::SegmentStore::squash_aspect_to_target_rows).
 /// Returns `200 OK` with how many segments it removed and the post-pass segment count.
 ///
 /// # Errors
@@ -545,15 +547,11 @@ pub async fn restore_drill(State(state): State<AppState>, Query(params): Query<R
 	// success or failure.
 	let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|err| StorageError::Internal(err.to_string()))?.as_millis();
 	let target = base.join(format!(".restore-drill-{millis}"));
-	let outcome = database::restore_control_plane(&backup_dir, &target).await;
+	let outcome = weftdb::restore_control_plane(&backup_dir, &target).await;
 	let _ = tokio::fs::remove_dir_all(&target).await;
 	let report = outcome.map_err(|err| StorageError::Internal(format!("restore drill for `{}` FAILED: {err:#}", params.label)))?;
 
-	let databases = report
-		.restored
-		.iter()
-		.map(|r| BackupDbReport { name: r.dest.file_name().map_or_else(|| "?".to_string(), |n| n.to_string_lossy().into_owned()), tables: r.tables, rows: r.rows, bytes: r.bytes })
-		.collect();
+	let databases = report.restored.iter().map(|r| BackupDbReport { name: r.dest.file_name().map_or_else(|| "?".to_string(), |n| n.to_string_lossy().into_owned()), tables: r.tables, rows: r.rows, bytes: r.bytes }).collect();
 	let response = RestoreDrillResponse { label: params.label, databases, total_rows: report.total_rows(), total_bytes: report.total_bytes(), restorable: true };
 	Ok((StatusCode::OK, Json(response)).into_response())
 }
@@ -675,10 +673,7 @@ pub async fn backup_store(State(state): State<AppState>, Query(params): Query<Ba
 	let backup = store.backup_control_plane_with_verify(&dest, mode).await.map_err(|err| StorageError::Internal(err.to_string()))?;
 	drop(store);
 	metrics.record_backup(backup.total_bytes());
-	let databases = [("segment_index.db", &backup.segment_index), ("metadata.db", &backup.metadata), ("aspect_catalog.db", &backup.aspect_catalog), ("catalog.db", &backup.registry)]
-		.into_iter()
-		.map(|(name, report)| BackupDbReport { name: name.to_string(), tables: report.tables, rows: report.rows, bytes: report.bytes })
-		.collect();
+	let databases = [("segment_index.db", &backup.segment_index), ("metadata.db", &backup.metadata), ("aspect_catalog.db", &backup.aspect_catalog), ("catalog.db", &backup.registry)].into_iter().map(|(name, report)| BackupDbReport { name: name.to_string(), tables: report.tables, rows: report.rows, bytes: report.bytes }).collect();
 	let response = BackupResponse { dir: backup.dir.display().to_string(), databases, total_rows: backup.total_rows(), total_bytes: backup.total_bytes(), verify: verify_token(mode) };
 	Ok((StatusCode::OK, Json(response)).into_response())
 }
@@ -794,7 +789,10 @@ fn enforce_order_if_required(require_sorted: bool, timestamps: &[i64]) -> Result
 pub async fn ingest_points(State(state): State<AppState>, Path(aspect): Path<String>, Json(request): Json<IngestRequest>) -> Result<Response, StorageError> {
 	let metrics = state.metrics().clone();
 	metrics.record_ingest_request();
-	let store = state.store().cloned().ok_or_else(|| { metrics.record_ingest_error(); StorageError::Unconfigured })?;
+	let store = state.store().cloned().ok_or_else(|| {
+		metrics.record_ingest_error();
+		StorageError::Unconfigured
+	})?;
 	drop(state);
 	// Time the seal path (not the store-unconfigured fast-fail above): this is the
 	// ingest side of the north-star "predictable p95/p99 under ingest + query".
@@ -810,7 +808,7 @@ pub async fn ingest_points(State(state): State<AppState>, Path(aspect): Path<Str
 
 /// The body of [`ingest_points`], split out so the handler can record an error
 /// metric for any failure path uniformly.
-async fn ingest_points_inner(store: &database::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, request: IngestRequest) -> Result<Response, StorageError> {
+async fn ingest_points_inner(store: &weftdb::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, request: IngestRequest) -> Result<Response, StorageError> {
 	if request.points.is_empty() {
 		return Err(StorageError::BadRequest("no points to ingest (`points` is empty)".to_string()));
 	}
@@ -852,24 +850,14 @@ async fn ingest_points_inner(store: &database::SegmentStore, metrics: &crate::me
 	// value parsing.
 	let descriptor = seal_batch(store, aspect, &schema, &timestamps, &values, any_null, request.rows_per_page).instrument(tracing::info_span!("storage.ingest.seal", point_count, any_null, format = "json")).await.map_err(|err| classify_seal_error(&err))?;
 	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
-	let response = IngestResponse {
-		aspect: aspect.to_string(),
-		segment_id: descriptor.id,
-		format_version: descriptor.format_version,
-		row_count: descriptor.row_count,
-		null_count: descriptor.null_count,
-		byte_len: descriptor.byte_len,
-		min_ts: descriptor.min_ts,
-		max_ts: descriptor.max_ts,
-		time_sorted: descriptor.time_sorted,
-	};
+	let response = IngestResponse { aspect: aspect.to_string(), segment_id: descriptor.id, format_version: descriptor.format_version, row_count: descriptor.row_count, null_count: descriptor.null_count, byte_len: descriptor.byte_len, min_ts: descriptor.min_ts, max_ts: descriptor.max_ts, time_sorted: descriptor.time_sorted };
 	Ok((StatusCode::CREATED, Json(response)).into_response())
 }
 
 /// Dispatch the right seal path for the batch: nullable vs dense × paged vs
 /// single-block. Kept as a free async fn taking `&SegmentStore` so the handler can
 /// drop its store handle before building the response.
-async fn seal_batch(store: &database::SegmentStore, aspect: &str, schema: &AspectSchema, timestamps: &[i64], values: &[Option<BigDecimal>], any_null: bool, rows_per_page: Option<usize>) -> anyhow::Result<SegmentDescriptor> {
+async fn seal_batch(store: &weftdb::SegmentStore, aspect: &str, schema: &AspectSchema, timestamps: &[i64], values: &[Option<BigDecimal>], any_null: bool, rows_per_page: Option<usize>) -> anyhow::Result<SegmentDescriptor> {
 	match (rows_per_page, any_null) {
 		(Some(rows_per_page), true) => store.seal_paged_nullable(aspect, schema, timestamps, values, rows_per_page).await,
 		(Some(rows_per_page), false) => store.seal_paged(aspect, schema, timestamps, &present_values(values), rows_per_page).await,
@@ -972,7 +960,10 @@ fn parse_csv_points(body: &str) -> Result<ParsedCsv, StorageError> {
 pub async fn ingest_csv(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<CsvIngestParams>, body: String) -> Result<Response, StorageError> {
 	let metrics = state.metrics().clone();
 	metrics.record_ingest_request();
-	let store = state.store().cloned().ok_or_else(|| { metrics.record_ingest_error(); StorageError::Unconfigured })?;
+	let store = state.store().cloned().ok_or_else(|| {
+		metrics.record_ingest_error();
+		StorageError::Unconfigured
+	})?;
 	drop(state);
 	let start = std::time::Instant::now();
 	let result = ingest_csv_inner(&store, &metrics, &aspect, params.rows_per_page, params.require_sorted, &body).await;
@@ -987,7 +978,7 @@ pub async fn ingest_csv(State(state): State<AppState>, Path(aspect): Path<String
 /// The body of [`ingest_csv`], split out so the handler records an error metric for
 /// any failure path uniformly. Shares [`seal_batch`] / [`classify_seal_error`] with
 /// the JSON ingest path, so a CSV-sealed batch is byte-identical to a JSON-sealed one.
-async fn ingest_csv_inner(store: &database::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, rows_per_page: Option<usize>, require_sorted: bool, body: &str) -> Result<Response, StorageError> {
+async fn ingest_csv_inner(store: &weftdb::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, rows_per_page: Option<usize>, require_sorted: bool, body: &str) -> Result<Response, StorageError> {
 	let Some(schema) = store.schema_for(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))? else {
 		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
@@ -998,17 +989,7 @@ async fn ingest_csv_inner(store: &database::SegmentStore, metrics: &crate::metri
 	let point_count = timestamps.len();
 	let descriptor = seal_batch(store, aspect, &schema, &timestamps, &values, any_null, rows_per_page).instrument(tracing::info_span!("storage.ingest.seal", point_count, any_null, format = "csv")).await.map_err(|err| classify_seal_error(&err))?;
 	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
-	let response = IngestResponse {
-		aspect: aspect.to_string(),
-		segment_id: descriptor.id,
-		format_version: descriptor.format_version,
-		row_count: descriptor.row_count,
-		null_count: descriptor.null_count,
-		byte_len: descriptor.byte_len,
-		min_ts: descriptor.min_ts,
-		max_ts: descriptor.max_ts,
-		time_sorted: descriptor.time_sorted,
-	};
+	let response = IngestResponse { aspect: aspect.to_string(), segment_id: descriptor.id, format_version: descriptor.format_version, row_count: descriptor.row_count, null_count: descriptor.null_count, byte_len: descriptor.byte_len, min_ts: descriptor.min_ts, max_ts: descriptor.max_ts, time_sorted: descriptor.time_sorted };
 	Ok((StatusCode::CREATED, Json(response)).into_response())
 }
 
@@ -1090,7 +1071,10 @@ const fn epoch_in_unit(instant: DateTime<Utc>, unit: TimeUnit) -> Option<i64> {
 pub async fn ingest_ilp(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<IlpIngestParams>, body: String) -> Result<Response, StorageError> {
 	let metrics = state.metrics().clone();
 	metrics.record_ingest_request();
-	let store = state.store().cloned().ok_or_else(|| { metrics.record_ingest_error(); StorageError::Unconfigured })?;
+	let store = state.store().cloned().ok_or_else(|| {
+		metrics.record_ingest_error();
+		StorageError::Unconfigured
+	})?;
 	drop(state);
 	let start = std::time::Instant::now();
 	let result = ingest_ilp_inner(&store, &metrics, &aspect, &params, &body).await;
@@ -1104,7 +1088,7 @@ pub async fn ingest_ilp(State(state): State<AppState>, Path(aspect): Path<String
 
 /// The body of [`ingest_ilp`], split out so the handler records an error metric for
 /// any failure path uniformly.
-async fn ingest_ilp_inner(store: &database::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, params: &IlpIngestParams, body: &str) -> Result<Response, StorageError> {
+async fn ingest_ilp_inner(store: &weftdb::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, params: &IlpIngestParams, body: &str) -> Result<Response, StorageError> {
 	let precision = parse_ilp_precision(params.precision.as_deref()).map_err(StorageError::BadRequest)?;
 	let Some(schema) = store.schema_for(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))? else {
 		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
@@ -1140,17 +1124,7 @@ async fn ingest_ilp_inner(store: &database::SegmentStore, metrics: &crate::metri
 	}
 	.map_err(|err| classify_seal_error(&err))?;
 	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
-	let response = IngestResponse {
-		aspect: aspect.to_string(),
-		segment_id: descriptor.id,
-		format_version: descriptor.format_version,
-		row_count: descriptor.row_count,
-		null_count: descriptor.null_count,
-		byte_len: descriptor.byte_len,
-		min_ts: descriptor.min_ts,
-		max_ts: descriptor.max_ts,
-		time_sorted: descriptor.time_sorted,
-	};
+	let response = IngestResponse { aspect: aspect.to_string(), segment_id: descriptor.id, format_version: descriptor.format_version, row_count: descriptor.row_count, null_count: descriptor.null_count, byte_len: descriptor.byte_len, min_ts: descriptor.min_ts, max_ts: descriptor.max_ts, time_sorted: descriptor.time_sorted };
 	Ok((StatusCode::CREATED, Json(response)).into_response())
 }
 
@@ -1161,9 +1135,9 @@ mod tests {
 	use axum::{
 		body::Body, http::{Request, StatusCode}
 	};
-	use database::SegmentStore;
 	use tempfile::TempDir;
 	use tower::ServiceExt;
+	use weftdb::SegmentStore;
 
 	use crate::{app_with_state, AppState};
 
@@ -1494,7 +1468,7 @@ mod tests {
 
 	#[test]
 	fn verify_mode_tokens_round_trip_and_reject_junk() {
-		use database::VerifyMode;
+		use weftdb::VerifyMode;
 
 		use super::{parse_verify_mode, verify_token};
 		assert_eq!(parse_verify_mode("source"), Some(VerifyMode::SourceMatch));

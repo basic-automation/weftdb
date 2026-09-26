@@ -21,9 +21,9 @@
 use std::time::Instant;
 
 use bigdecimal::{BigDecimal, ToPrimitive};
-use weft_physical_type::{weftseg::read_segment, Segment, TimeUnit};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use weft_physical_type::{weftseg::read_segment, Segment, TimeUnit};
 
 use crate::{
 	schema::{BenchResult, CorrectnessReport, DatasetMeta, StorageEstimate, TimingBreakdown, SCHEMA_VERSION}, stats::{BootstrapConfig, LatencyStats}
@@ -156,7 +156,8 @@ impl CompressionProfile {
 			(0..n).map(|_| {
 				cur += 2 + i64::from(rng.random::<u8>() % 20);
 				cur
-			}).collect()
+			})
+			.collect()
 		};
 		(timestamps, values)
 	}
@@ -232,9 +233,7 @@ pub fn run_compression(profile: &CompressionProfile, reps: usize) -> anyhow::Res
 		0.0
 	};
 
-	Ok(BenchResult {
-		schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_COMPRESSION.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: dec_ts.len(), irregular: !profile.regular, missingness_fraction: 0.0, seed: profile.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage
-	})
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_COMPRESSION.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: dec_ts.len(), irregular: !profile.regular, missingness_fraction: 0.0, seed: profile.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage })
 }
 
 #[cfg(test)]

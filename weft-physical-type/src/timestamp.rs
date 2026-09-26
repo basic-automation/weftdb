@@ -1172,7 +1172,7 @@ const FIRE_ALPHA_MAX: i64 = 1 << FIRE_SHIFT;
 ///
 /// FIRE generalizes delta-of-delta: instead of the fixed second-difference predictor
 /// `x[i-1] + (x[i-1] - x[i-2])`, it predicts `x[i-1] + alpha·(x[i-1] - x[i-2])` with a learned
-/// fixed-point coefficient `alpha` ([`FIRE_SHIFT`]-scaled), adapted online by a sign-sign LMS
+/// fixed-point coefficient `alpha` (`FIRE_SHIFT`-scaled), adapted online by a sign-sign LMS
 /// step (`alpha += sign(err)·sign(prev_delta)`, clamped to `[0, 2^FIRE_SHIFT]`). This tracks
 /// the *fractional* slope a mean-reverting or damped series wants — where delta-of-delta
 /// (`alpha = 1`) over-predicts and a plain delta (`alpha = 0`) under-predicts — so residuals
@@ -1685,7 +1685,7 @@ mod tests {
 		assert_eq!(zigzag_varint_len(64), 2); // zz = 128, needs 8 bits
 		assert_eq!(zigzag_varint_len(-64), 1); // zz = 127, fits 7 bits
 		assert_eq!(zigzag_varint_len(-65), 2); // zz = 129
-					 // The largest magnitudes take the full 10 bytes.
+						       // The largest magnitudes take the full 10 bytes.
 		assert_eq!(zigzag_varint_len(i64::MAX), 10);
 		assert_eq!(zigzag_varint_len(i64::MIN), 10);
 	}
@@ -1926,7 +1926,7 @@ mod tests {
 		// When every value shares one width, per-block packing only adds header bytes,
 		// so a single global width is at least as good — the eval must not overclaim.
 		let dods: Vec<i64> = (0..128).map(|i| (i % 5) - 2).collect(); // all within 3 bits
-		// One block spanning everything == the global bitpack figure exactly.
+									      // One block spanning everything == the global bitpack figure exactly.
 		assert_eq!(blocked_bitpack_bytes(&dods, dods.len()), bitpack_bytes(&dods));
 		assert_eq!(blocked_bitpack_bytes(&dods, 1_000_000), bitpack_bytes(&dods));
 		// Splitting a uniform-width stream only adds width-header bytes.
@@ -1966,7 +1966,7 @@ mod tests {
 		assert_eq!(blocked_bitpack_bytes(&[], 8), 0);
 		// An all-zero stream packs each block to just its width header byte.
 		assert_eq!(blocked_bitpack_bytes(&[0; 20], 8), 3); // ceil(20/8) = 3 blocks
-		// A zero block size is clamped to 1 (one header byte per value), never a panic.
+								   // A zero block size is clamped to 1 (one header byte per value), never a panic.
 		assert_eq!(blocked_bitpack_bytes(&[0, 0, 0], 0), 3);
 	}
 
@@ -2051,10 +2051,12 @@ mod tests {
 		// FOR subtracts each block's min and pays only the ~3-bit range + one reference
 		// varint. This is the regime the FOR slice targets.
 		let block = 32;
-		let dods: Vec<i64> = (0..256).map(|i| {
-			let base = 1_000_000 * (1 + (i / block) as i64); // steps each block
-			base + (i % 7) as i64 - 3 // ±3 wiggle within the block
-		}).collect();
+		let dods: Vec<i64> = (0..256)
+			.map(|i| {
+				let base = 1_000_000 * (1 + (i / block) as i64); // steps each block
+				base + (i % 7) as i64 - 3 // ±3 wiggle within the block
+			})
+			.collect();
 		let for_bytes = for_bitpack_bytes(&dods, block);
 		let blocked = blocked_bitpack_bytes(&dods, block);
 		let global = bitpack_bytes(&dods);
@@ -2207,7 +2209,15 @@ mod tests {
 	fn checkpointed_search_equals_the_full_decode_search() {
 		let fixtures: Vec<(&str, Vec<i64>)> = vec![
 			("regular", (0..500).map(|i| 1_000 + i * 7).collect()),
-			("irregular", (0..500).map(|i| 1_000 + i * 7 + (i % 13) * (i % 5)).scan(0_i64, |acc, v| { *acc = (*acc).max(v); Some(*acc) }).collect()),
+			(
+				"irregular",
+				(0..500).map(|i| 1_000 + i * 7 + (i % 13) * (i % 5))
+					.scan(0_i64, |acc, v| {
+						*acc = (*acc).max(v);
+						Some(*acc)
+					})
+					.collect(),
+			),
 			("duplicates", (0..500).map(|i| 1_000 + (i / 3) * 10).collect()),
 			("clustered-jumps", (0..500).map(|i| if i < 250 { 1_000 + i } else { 1_000_000 + i * 3 }).collect()),
 			("two-rows", vec![10, 20]),

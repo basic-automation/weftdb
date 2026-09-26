@@ -1,11 +1,17 @@
 [package]
 name = "weft-reduce"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+authors.workspace = true
 license.workspace = true
 repository.workspace = true
-authors.workspace = true
-version = "0.1.0"
-edition = "2021"
-description = "weft-reduce: vendor-neutral time-series downsampling reductions (min/max/avg/sum/first/last over an epoch-aligned bucket grid, in BigDecimal)."
+homepage.workspace = true
+readme = "README.md"
+description = "Time-series downsampling reductions (min/max/avg/sum/first/last and time-weighted averages) over an epoch-aligned bucket grid, in BigDecimal."
+keywords = ["timeseries", "downsampling", "aggregation", "rollup", "bucket"]
+categories = ["mathematics", "algorithms", "science"]
+
 
 [dependencies]
 # `string-only` makes BigDecimal serialize as a string under serde, so a non-self-describing

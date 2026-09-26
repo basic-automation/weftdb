@@ -64,7 +64,7 @@ pub struct Metrics {
 /// it is rendered back to fractional seconds, the Prometheus convention.
 #[derive(Debug)]
 pub struct LatencyHistogram {
-	/// Per-bucket observation counts aligned with [`LATENCY_BUCKETS_SECS`].
+	/// Per-bucket observation counts aligned with `LATENCY_BUCKETS_SECS`.
 	buckets: [AtomicU64; LATENCY_BUCKETS_SECS.len()],
 	/// Observations exceeding the largest finite bound (the `+Inf` bucket).
 	overflow: AtomicU64,
@@ -92,10 +92,10 @@ impl LatencyHistogram {
 		match LATENCY_BUCKETS_SECS.iter().position(|&bound| secs <= bound) {
 			Some(i) => {
 				self.buckets[i].fetch_add(1, Ordering::Relaxed);
-			},
+			}
 			None => {
 				self.overflow.fetch_add(1, Ordering::Relaxed);
-			},
+			}
 		}
 		self.sum_micros.fetch_add(micros, Ordering::Relaxed);
 		self.count.fetch_add(1, Ordering::Relaxed);
@@ -134,7 +134,7 @@ impl LatencyHistogram {
 /// A point-in-time read of a [`LatencyHistogram`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LatencyHistogramSnapshot {
-	/// Non-cumulative per-bucket counts aligned with [`LATENCY_BUCKETS_SECS`].
+	/// Non-cumulative per-bucket counts aligned with `LATENCY_BUCKETS_SECS`.
 	pub buckets: [u64; LATENCY_BUCKETS_SECS.len()],
 	/// Observations past the largest finite bound (the `+Inf` overflow).
 	pub overflow: u64,

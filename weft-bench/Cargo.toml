@@ -1,11 +1,19 @@
 [package]
 name = "weft-bench"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+authors.workspace = true
 license.workspace = true
 repository.workspace = true
-authors.workspace = true
-version = "0.1.0"
-edition = "2021"
-description = "Weft-Bench: reproducible, correctness-gated benchmark harness for WeftDB (interpolation-heavy irregular time-series)."
+homepage.workspace = true
+readme.workspace = true
+description = "Reproducible, correctness-gated benchmark harness for WeftDB (interpolation-heavy irregular time series)."
+keywords = ["benchmark", "timeseries", "database", "interpolation", "weftdb"]
+categories = ["development-tools::profiling", "database"]
+# Binary/tooling crate: shipped as a GitHub release artifact, not published to crates.io.
+publish = false
+
 
 [dependencies]
 anyhow = { workspace = true }

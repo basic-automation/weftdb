@@ -1,6 +1,6 @@
 //! Intra-segment **page** subdivision (roadmap **Phase 4.3 / 4.4**).
 //!
-//! Phase 4.3 sealed a whole aspect's rows into a single-block [`Segment`]: one
+//! Phase 4.3 sealed a whole aspect's rows into a single-block [`Segment`](crate::Segment): one
 //! value column, one timestamp column, one set of min/max stats. That makes
 //! *inter*-segment skipping work ([`prune_by_time`](crate::prune_by_time)), but a
 //! bounded range query inside one large segment still has to decode the entire
@@ -13,14 +13,14 @@
 //! ([`PagedSegment::prune_pages_by_time`]) and decodes only those
 //! ([`PagedSegment::read_time_range`]) — the Phase-4.4 intra-segment page skipping.
 //!
-//! ## Relationship to [`Segment`]
+//! ## Relationship to [`Segment`](crate::Segment)
 //!
-//! A [`Page`] is the same in-memory shape as a [`Segment`]'s columns (a typed value
+//! A [`Page`] is the same in-memory shape as a [`Segment`](crate::Segment)'s columns (a typed value
 //! column, a delta-of-delta timestamp column, a [`NullMask`], and [`SegmentStats`])
 //! — but it is *not* a frame unit: it has no format version, magic, or per-page
 //! checksum. Those live once at the [`PagedSegment`]/frame level. Reusing the same
 //! column codecs means a page's `bytes_per_point` is computed by the very same
-//! estimators as a [`Segment`]'s, so a paged segment and an equivalent single-block
+//! estimators as a [`Segment`](crate::Segment)'s, so a paged segment and an equivalent single-block
 //! one report storage cost on one ruler.
 //!
 //! This slice is the **in-memory model only**. The on-disk `.weftseg` frame with a
@@ -62,7 +62,7 @@ pub const DEFAULT_ROWS_PER_PAGE: usize = 1_024;
 /// One fixed-height block of rows within a [`PagedSegment`].
 ///
 /// Holds its own typed value column (present values only), delta-of-delta timestamp
-/// column, quality mask, and [`SegmentStats`] — the same shape a [`Segment`] binds,
+/// column, quality mask, and [`SegmentStats`] — the same shape a [`Segment`](crate::Segment) binds,
 /// minus the frame-level version/magic/checksum. A query prunes against a page's
 /// [`stats`](Page::stats) exactly as it does a segment's.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -161,7 +161,7 @@ impl Page {
 	}
 
 	/// **Realized** stored bytes of the page's three columns (value + timestamp +
-	/// quality), on the same estimators a [`Segment`] uses — the codec each column
+	/// quality), on the same estimators a [`Segment`](crate::Segment) uses — the codec each column
 	/// actually writes.
 	#[must_use]
 	pub fn total_bytes(&self) -> usize {
@@ -357,7 +357,7 @@ impl PagedSegment {
 	/// selective than [`prune_pages_by_time`](Self::prune_pages_by_time) — it also
 	/// drops a page that overlaps the window but holds only nulls there (in
 	/// particular a fully [`all-null`](Page::is_all_null) page). Heavier than the
-	/// min/max-only [`prune_pages_by_time`] (it decodes the overlapping pages'
+	/// min/max-only [`prune_pages_by_time`](Self::prune_pages_by_time) (it decodes the overlapping pages'
 	/// timestamp columns to test the mask), so reach for it when skipping an all-null
 	/// page's value column is worth that decode.
 	#[must_use]

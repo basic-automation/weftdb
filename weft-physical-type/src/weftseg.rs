@@ -10,9 +10,9 @@
 //!    (fixed-width little-endian integers, LEB128 unsigned varints, zig-zag signed
 //!    varints, length-prefixed byte/UTF-8 blocks) plus an IEEE **CRC-32** for
 //!    integrity,
-//! 2. the value-column codec ([`PhysicalValue`](crate::PhysicalValue) streams),
-//! 3. the timestamp-column codec ([`DeltaOfDeltaColumn`](crate::DeltaOfDeltaColumn)),
-//! 4. the framed [`Segment`](crate::Segment) — magic + header (stats) + the two
+//! 2. the value-column codec ([`PhysicalValue`] streams),
+//! 3. the timestamp-column codec ([`DeltaOfDeltaColumn`]),
+//! 4. the framed [`Segment`] — magic + header (stats) + the two
 //!    column blocks + a trailing checksum, with corruption detection.
 //!
 //! ## Why hand-rolled
@@ -513,8 +513,8 @@ fn read_decimal(r: &mut ByteReader) -> Result<BigDecimal, WeftSegError> {
 
 /// Value-column codec selector (self-describing byte in a v4+ value block).
 ///
-/// [`VAL_CODEC_VARINT`] is the general per-value payload (the codec every physical
-/// type can use); [`VAL_CODEC_BITPACK`] is the fixed-width bit-packed mantissa
+/// `VAL_CODEC_VARINT` is the general per-value payload (the codec every physical
+/// type can use); `VAL_CODEC_BITPACK` is the fixed-width bit-packed mantissa
 /// stream, defined only for a `ScaledI64` column and written only when it is
 /// strictly smaller than the varint (a regular/small-jitter scaled series).
 const VAL_CODEC_VARINT: u8 = 0;
@@ -543,7 +543,7 @@ const VAL_CODEC_DELTA_CASCADE: u8 = 4;
 /// **Transposed (`FastLanes`-layout) per-tile bit-packing** of a `ScaledI64` column's
 /// mantissas: a tile-size uvarint then a length-prefixed
 /// [`crate::timestamp::transpose_bitpack_encode`] stream (each tile carries a one-byte width
-/// header followed by `width` bit-planes). The same *code* as [`VAL_CODEC_BITPACK`] with its
+/// header followed by `width` bit-planes). The same *code* as `VAL_CODEC_BITPACK` with its
 /// bits permuted, so it never wins the size race — it is written only when a caller asks for
 /// it via [`FrameOptions::transposed_max_overhead`], to buy decode latency: the decoder reads
 /// `u64` plane words and walks only the set bits, skipping a small-magnitude column's empty
@@ -566,13 +566,13 @@ const CASCADE_INNER_RLE: u8 = 4;
 /// After the header (physical-type tag, optional `ScaledI*` scale, count, lossy
 /// count, `max_abs_error`) the block carries a self-describing codec byte, then the
 /// coded payload. Four codecs are realized: the general per-value payload
-/// ([`VAL_CODEC_VARINT`] — IEEE byte patterns for the floats, a zig-zag varint
+/// (`VAL_CODEC_VARINT` — IEEE byte patterns for the floats, a zig-zag varint
 /// mantissa for `ScaledI64`, full-width `i128` for the wide integers, length-prefixed
 /// UTF-8 for `BigDecimalText`), fixed-width **bit-packing** of a `ScaledI64` column's
-/// mantissas ([`VAL_CODEC_BITPACK`], a regular/small-jitter scaled series),
-/// **per-block adaptive bit-packing** ([`VAL_CODEC_BLOCKED`], a mixed-magnitude scaled
+/// mantissas (`VAL_CODEC_BITPACK`, a regular/small-jitter scaled series),
+/// **per-block adaptive bit-packing** (`VAL_CODEC_BLOCKED`, a mixed-magnitude scaled
 /// series where a global width over-pays), and **per-block Frame-of-Reference** packing
-/// ([`VAL_CODEC_FOR`], mantissas clustered at a high base or all-non-negative). The
+/// (`VAL_CODEC_FOR`, mantissas clustered at a high base or all-non-negative). The
 /// codec is chosen through [`ColumnEncoding::best_value_codec`], the single source of
 /// truth, so each `ScaledI64` column realizes the smallest of the four on disk while
 /// every other column keeps the per-value payload. All four codecs are exact and
@@ -582,7 +582,7 @@ pub fn write_value_column(w: &mut ByteWriter, col: &ColumnEncoding) {
 }
 
 /// Write a [`ColumnEncoding`] as a `.weftseg` value block **with the two-level delta cascade
-/// allowed** (the fifth codec, [`VAL_CODEC_DELTA_CASCADE`]).
+/// allowed** (the fifth codec, `VAL_CODEC_DELTA_CASCADE`).
 ///
 /// Identical to [`write_value_column`] except the codec is chosen through
 /// [`ColumnEncoding::best_value_codec_cascading`], so a trending `ScaledI64` column whose
@@ -597,9 +597,10 @@ pub fn write_value_column_cascading(w: &mut ByteWriter, col: &ColumnEncoding) {
 	write_value_column_selected(w, col, col.best_value_codec_cascading());
 }
 
-/// Write a [`ColumnEncoding`] as a `.weftseg` value block **with the transposed
-/// (`FastLanes`-layout) codec allowed** ([`VAL_CODEC_TRANSPOSED`]) up to a size overhead of
-/// `max_overhead` against the size-selected codec.
+/// Write a [`ColumnEncoding`] as a `.weftseg` value block, allowing the transposed codec.
+///
+/// The transposed (`FastLanes`-layout) codec (`VAL_CODEC_TRANSPOSED`) is permitted up to a
+/// size overhead of `max_overhead` against the size-selected codec.
 ///
 /// Identical to [`write_value_column`] except the codec is chosen through
 /// [`ColumnEncoding::best_value_codec_transposed`], so a `ScaledI64` column whose transposed
@@ -804,7 +805,7 @@ pub fn read_value_column(r: &mut ByteReader) -> Result<ColumnEncoding, WeftSegEr
 	Ok(ColumnEncoding { physical_type, values, lossy_count, max_abs_error })
 }
 
-/// Decode a [`VAL_CODEC_DELTA_CASCADE`] value block into its `ScaledI64` values — the
+/// Decode a `VAL_CODEC_DELTA_CASCADE` value block into its `ScaledI64` values — the
 /// anchor (first mantissa) plus the inner-coded first-difference deltas, cumulatively summed.
 ///
 /// Split out of [`read_value_column`] so each stays within one screen. The five inner
@@ -873,7 +874,7 @@ fn read_cascade_value_column(r: &mut ByteReader, physical_type: PhysicalType, ta
 /// **Random-access single-value read** from a `.weftseg` value-column block: the
 /// [`PhysicalValue`] at `index`, or `None` when `index` is past the column.
 ///
-/// For the two per-block `ScaledI64` codecs ([`VAL_CODEC_BLOCKED`], [`VAL_CODEC_FOR`]) this
+/// For the two per-block `ScaledI64` codecs (`VAL_CODEC_BLOCKED`, `VAL_CODEC_FOR`) this
 /// reads only the block covering `index` — skipping the earlier blocks by their headers via
 /// [`crate::timestamp::blocked_bitpack_decode_range`] /
 /// [`crate::timestamp::for_bitpack_decode_range`] — instead of materializing the whole column;
@@ -955,13 +956,13 @@ pub fn read_value_at(bytes: &[u8], index: usize) -> Result<Option<PhysicalValue>
 /// This is the *range* sibling of [`read_value_at`], and the difference is not cosmetic. Each
 /// fixed-layout codec locates a value by walking its block/tile headers **from the start of the
 /// stream**, so resolving a window one value at a time with [`read_value_at`] re-walks that chain
-/// per row — and for the 1024-lane [`VAL_CODEC_TRANSPOSED`] layout it additionally decodes a whole
+/// per row — and for the 1024-lane `VAL_CODEC_TRANSPOSED` layout it additionally decodes a whole
 /// tile to serve each single value, so an `N`-row window costs `O(N * 1024)` value decodes. Doing
 /// the range decode **once** collapses that to one walk and one decode of the covering blocks:
 ///
-/// - [`VAL_CODEC_BLOCKED`] / [`VAL_CODEC_FOR`] / [`VAL_CODEC_TRANSPOSED`] → the codec's own
+/// - `VAL_CODEC_BLOCKED` / `VAL_CODEC_FOR` / `VAL_CODEC_TRANSPOSED` → the codec's own
 ///   `*_decode_range`, which skips the preceding blocks/tiles by their headers;
-/// - [`VAL_CODEC_BITPACK`] → a per-index `O(width)` bit read (already cheap, no chain to walk);
+/// - `VAL_CODEC_BITPACK` → a per-index `O(width)` bit read (already cheap, no chain to walk);
 /// - every other payload → a full [`read_value_column`] then a slice (always correct).
 ///
 /// The result equals `read_value_column(bytes).values[start..start + len]` for every codec.
@@ -1039,8 +1040,8 @@ pub fn read_value_range(bytes: &[u8], start: usize, len: usize) -> Result<Vec<Ph
 }
 
 /// Whether a value block (a `section` positioned at its physical-type tag) uses one of the four
-/// fixed-layout `ScaledI64` codecs ([`VAL_CODEC_BLOCKED`] / [`VAL_CODEC_FOR`] /
-/// [`VAL_CODEC_BITPACK`] / [`VAL_CODEC_TRANSPOSED`]) that [`read_value_at`] can random-access.
+/// fixed-layout `ScaledI64` codecs (`VAL_CODEC_BLOCKED` / `VAL_CODEC_FOR` /
+/// `VAL_CODEC_BITPACK` / `VAL_CODEC_TRANSPOSED`) that [`read_value_at`] can random-access.
 /// Peeks the header + codec byte on a throwaway reader without consuming the caller's cursor.
 /// `false` (including on a short/malformed header) routes the caller to the always-correct
 /// full-decode fallback.
@@ -1059,8 +1060,8 @@ fn value_block_has_random_access_codec(section: &[u8]) -> bool {
 	matches!((tag, r.read_u8()), (TAG_SCALED_I64, Ok(VAL_CODEC_BLOCKED | VAL_CODEC_FOR | VAL_CODEC_BITPACK | VAL_CODEC_TRANSPOSED)))
 }
 
-/// Advance `r` past a value block known to use a random-access codec ([`VAL_CODEC_BLOCKED`] /
-/// [`VAL_CODEC_FOR`] / [`VAL_CODEC_BITPACK`] / [`VAL_CODEC_TRANSPOSED`]) — the header, the codec
+/// Advance `r` past a value block known to use a random-access codec (`VAL_CODEC_BLOCKED` /
+/// `VAL_CODEC_FOR` / `VAL_CODEC_BITPACK` / `VAL_CODEC_TRANSPOSED`) — the header, the codec
 /// byte, and the coded stream — leaving `r` at the following (timestamp) block. Only called after
 /// [`value_block_has_random_access_codec`] confirmed the fast path, so the framing is exactly what
 /// [`write_value_column_selected`] emits for
@@ -1217,11 +1218,11 @@ fn read_point_from_section(section: &[u8], stats: &SegmentStats, t: i64) -> Resu
 /// [`Segment::value_at`]'s answer, **without materializing the value column**.
 ///
 /// The first *present* value whose timestamp equals `t`, read via the per-block random-access
-/// codecs ([`VAL_CODEC_BLOCKED`] / [`VAL_CODEC_FOR`]) when the value block uses one; every other
+/// codecs (`VAL_CODEC_BLOCKED` / `VAL_CODEC_FOR`) when the value block uses one; every other
 /// codec falls back to a full value-column decode + index. Either way the result equals
 /// `read_segment(bytes)?.value_at(t)` for every single-block frame. This is the point-lookup
 /// lever the block-level random-access primitives (and [`read_value_at`]) exist for, wired one
-/// level up to the framed segment (roadmap Phase 4/6). See [`read_point_from_section`].
+/// level up to the framed segment (roadmap Phase 4/6). See `read_point_from_section`.
 ///
 /// # Errors
 ///
@@ -1259,7 +1260,7 @@ pub fn read_segment_point(bytes: &[u8], t: i64) -> Result<Option<BigDecimal>, We
 /// `[min_ts, max_ts]` cannot contain `t` are pruned *without decoding a single column byte*
 /// (on-disk intra-segment page skipping). Each surviving page — in page order, so the first
 /// present value wins, matching [`PagedSegment::value_at`]'s `find_map` — is resolved by the
-/// shared [`read_point_from_section`] over just that page's block (the block-skip value read
+/// shared `read_point_from_section` over just that page's block (the block-skip value read
 /// applies within the page too). For a time-sorted paged segment at most one page survives, so
 /// a point lookup reads one page's timestamp column and one value block regardless of segment
 /// size.
@@ -1512,7 +1513,7 @@ fn read_range_from_section(section: &[u8], stats: &SegmentStats, start: i64, end
 /// Returns the `(timestamp, value)` rows whose timestamp falls in the inclusive `[start, end]`
 /// window, aligned and in row order — exactly `read_segment(bytes)?.decode_nullable()` filtered to
 /// `[start, end]`. A **regular block-coded segment** resolves the window in closed form and unpacks
-/// only its present values (see [`read_range_from_section`]); any other shape full-decodes + filters.
+/// only its present values (see `read_range_from_section`); any other shape full-decodes + filters.
 /// Roadmap Phase 4/6 (the range-read analogue of the streaming point read).
 ///
 /// # Errors
@@ -1544,7 +1545,7 @@ pub fn read_segment_range(bytes: &[u8], start: i64, end: i64) -> Result<(Vec<i64
 ///
 /// The per-page index is parsed once, so pages whose `[min_ts, max_ts]` is disjoint from the window
 /// are skipped without decoding a column byte (on-disk page skipping, as [`read_paged_segment`]'s
-/// range read); each surviving page is windowed through the shared [`read_range_from_section`] (a
+/// range read); each surviving page is windowed through the shared `read_range_from_section` (a
 /// regular page resolves its sub-window in closed form). Rows are concatenated in page order.
 /// Equal to `read_paged_segment(bytes)?.read_time_range(start, end)`.
 ///
@@ -1695,7 +1696,7 @@ pub fn write_timestamp_column(w: &mut ByteWriter, col: &DeltaOfDeltaColumn) {
 
 /// Write a `.weftseg` timestamp-column block **with a persisted sparse checkpoint index**.
 ///
-/// Uses [`TS_CODEC_CHECKPOINTED`], so a point lookup on an irregular sorted column can
+/// Uses `TS_CODEC_CHECKPOINTED`, so a point lookup on an irregular sorted column can
 /// skip the whole timestamp reconstruction (see [`DodCheckpoints`]).
 ///
 /// **Opt-in**, and deliberately so: the index costs bytes the default writer does not
@@ -1951,7 +1952,7 @@ fn read_lazy_checkpointed_ts<'a>(r: &mut ByteReader<'a>) -> Result<Option<LazyCh
 }
 
 /// Read a codec-tagged second-difference stream: the `[codec tag][stream]` body shared
-/// by [`read_timestamp_column`] and the [`TS_CODEC_CHECKPOINTED`] wrapper.
+/// by [`read_timestamp_column`] and the `TS_CODEC_CHECKPOINTED` wrapper.
 ///
 /// Returns the dods and, for a checkpointed block, the persisted index.
 fn read_dod_codec(r: &mut ByteReader, count: usize) -> Result<(Vec<i64>, Option<DodCheckpoints>), WeftSegError> {
@@ -2182,7 +2183,7 @@ pub struct FrameOptions {
 	pub checkpoint_stride: Option<usize>,
 	/// Ceiling on the size overhead ([`ColumnEncoding::transposed_overhead`]) the
 	/// **transposed** value codec may pay against the size-selected codec, or `None` to never
-	/// write it. `Some(1.0)` admits it only when free. See [`VAL_CODEC_TRANSPOSED`].
+	/// write it. `Some(1.0)` admits it only when free. See `VAL_CODEC_TRANSPOSED`.
 	pub transposed_max_overhead: Option<f64>,
 }
 
@@ -2826,13 +2827,12 @@ mod tests {
 		// minimum + narrow residual) wins — exercising the cascade's FOR inner branch on disk.
 		let lits: Vec<String> = {
 			let mut acc = 9_000_000_000_i64;
-			(0..256)
-				.map(|i| {
-					let s = format!("{acc}");
-					acc += 7 + i64::from(i % 3);
-					s
-				})
-				.collect()
+			(0..256).map(|i| {
+				let s = format!("{acc}");
+				acc += 7 + i64::from(i % 3);
+				s
+			})
+			.collect()
 		};
 		let refs: Vec<&str> = lits.iter().map(String::as_str).collect();
 		let enc = crate::encode_column(PhysicalType::ScaledI64 { scale: 0 }, &col(&refs)).expect("encodes");
@@ -2974,7 +2974,12 @@ mod tests {
 		// blocked codec and the transposed codec pack the same bits at the same per-span widths
 		// — the only difference left is that blocked writes one width header per 64 values and
 		// transposed writes one per 1024.
-		let lits: Vec<String> = (0..8_192_i64).map(|i| { let magnitude = if i < 4_096 { 1 } else { 1_i64 << 30 }; format!("{}", if i % 2 == 0 { magnitude } else { -magnitude }) }).collect();
+		let lits: Vec<String> = (0..8_192_i64)
+			.map(|i| {
+				let magnitude = if i < 4_096 { 1 } else { 1_i64 << 30 };
+				format!("{}", if i % 2 == 0 { magnitude } else { -magnitude })
+			})
+			.collect();
 		let enc = crate::encode_column(PhysicalType::ScaledI64 { scale: 0 }, &col(&lits.iter().map(String::as_str).collect::<Vec<_>>())).expect("encodes");
 
 		let transposed = enc.transposed_value_bytes().expect("scaled column");
@@ -3482,14 +3487,7 @@ mod tests {
 		// serialized_bytes() must equal the exact bytes write_physical_value emits for
 		// the values (the payload, excluding the column header) — for every physical
 		// type. This is the realize-accurate figure estimated_bytes() does not give.
-		let cases = [
-			encode_column(PhysicalType::F64, &col(&["0.5", "2.25", "-128.0"])).unwrap(),
-			encode_column(PhysicalType::F32, &col(&["0.5", "-0.25", "16.0"])).unwrap(),
-			encode_column(PhysicalType::ScaledI64 { scale: 2 }, &col(&["1.25", "-3.75", "0.00", "5000.00"])).unwrap(),
-			encode_column(PhysicalType::ScaledI128 { scale: 4 }, &col(&["1234567890.1234", "-9.0001"])).unwrap(),
-			encode_column(PhysicalType::Decimal128, &col(&["123456789012345678901234.567890", "-1.5", "0"])).unwrap(),
-			encode_column(PhysicalType::BigDecimalText, &col(&["1.5", "12345.6789", "-0.000001"])).unwrap(),
-		];
+		let cases = [encode_column(PhysicalType::F64, &col(&["0.5", "2.25", "-128.0"])).unwrap(), encode_column(PhysicalType::F32, &col(&["0.5", "-0.25", "16.0"])).unwrap(), encode_column(PhysicalType::ScaledI64 { scale: 2 }, &col(&["1.25", "-3.75", "0.00", "5000.00"])).unwrap(), encode_column(PhysicalType::ScaledI128 { scale: 4 }, &col(&["1234567890.1234", "-9.0001"])).unwrap(), encode_column(PhysicalType::Decimal128, &col(&["123456789012345678901234.567890", "-1.5", "0"])).unwrap(), encode_column(PhysicalType::BigDecimalText, &col(&["1.5", "12345.6789", "-0.000001"])).unwrap()];
 		for enc in &cases {
 			let mut w = ByteWriter::new();
 			for value in &enc.values {

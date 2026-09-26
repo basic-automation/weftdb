@@ -36,7 +36,7 @@
 //!   them) and a nullable `value: Utf8` column holding each present value's
 //!   **plain decimal text** (`BigDecimal::to_plain_string`), with Arrow validity
 //!   marking the null/absent rows. Decimal text is the always-exact encoding (the
-//!   [`PhysicalType::BigDecimalText`](weft_physical_type::PhysicalType::BigDecimalText)
+//!   [`PhysicalType::BigDecimalText`]
 //!   philosophy): no value can lose a digit crossing into Arrow, honoring hard
 //!   constraint #4 (no silent downcast). The segment's [`TimeUnit`], physical
 //!   encoding name, and format version travel in the schema metadata so the batch
@@ -58,9 +58,9 @@ use std::{collections::HashMap, sync::Arc};
 use arrow_array::{Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_schema::{DataType, Field, Schema, DECIMAL128_MAX_PRECISION};
+use bigdecimal::{num_bigint::BigInt, BigDecimal, FromPrimitive, ToPrimitive};
 use bytes::Bytes;
 use parquet::arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ArrowWriter};
-use bigdecimal::{num_bigint::BigInt, BigDecimal, FromPrimitive, ToPrimitive};
 use weft_physical_type::{Page, PagedSegment, PhysicalType, Segment, SegmentError, TimeUnit};
 
 /// Name of the timestamp column in an exported [`RecordBatch`].
@@ -114,10 +114,10 @@ fn metadata_lookup<'a>(batch: &'a RecordBatch, key: &str) -> Option<&'a String> 
 /// always-exact form.
 pub const VALUE_ENCODING_TEXT: &str = "text";
 /// Value-column wire form: IEEE-754 binary64 (Arrow `Float64`) — the typed fast
-/// path for an [`PhysicalType::F64`](weft_physical_type::PhysicalType::F64) segment.
+/// path for an [`PhysicalType::F64`] segment.
 pub const VALUE_ENCODING_F64: &str = "f64";
 /// Value-column wire form: IEEE-754 binary32 (Arrow `Float32`) — the typed fast
-/// path for an [`PhysicalType::F32`](weft_physical_type::PhysicalType::F32) segment.
+/// path for an [`PhysicalType::F32`] segment.
 pub const VALUE_ENCODING_F32: &str = "f32";
 /// Value-column wire form: fixed-scale Arrow `Decimal128`.
 ///
@@ -719,14 +719,7 @@ pub fn reconstructed_series_to_record_batch(unit: TimeUnit, timestamps: &[i64], 
 	metadata.insert(META_VALUE_ENCODING.to_string(), VALUE_ENCODING_F64.to_string());
 	metadata.insert(META_FORMAT_VERSION.to_string(), LOGICAL_EXPORT_VERSION.to_string());
 
-	let schema = Schema::new_with_metadata(
-		vec![
-			Field::new(TIMESTAMP_COLUMN, DataType::Int64, false),
-			Field::new(VALUE_COLUMN, DataType::Float64, false),
-			Field::new(SERIES_KIND_COLUMN, DataType::Utf8, false),
-		],
-		metadata,
-	);
+	let schema = Schema::new_with_metadata(vec![Field::new(TIMESTAMP_COLUMN, DataType::Int64, false), Field::new(VALUE_COLUMN, DataType::Float64, false), Field::new(SERIES_KIND_COLUMN, DataType::Utf8, false)], metadata);
 
 	RecordBatch::try_new(Arc::new(schema), vec![Arc::new(ts_array), Arc::new(val_array), Arc::new(kind_array)]).expect("timestamp, value, and kind columns share the row count")
 }

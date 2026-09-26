@@ -3,10 +3,10 @@
 
 use std::fs::OpenOptions;
 
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use weft_tui::{
 	logging::{LogBuffer, LogBufferLayer}, run
 };
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 #[tokio::main]
 async fn main() {

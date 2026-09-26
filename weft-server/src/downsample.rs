@@ -33,13 +33,13 @@ use axum::{
 };
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use splimes::{Point, Resolution};
+use weft_reduce::reduce;
 // The reduction core is the vendor-neutral `weft-reduce` crate — shared with the
 // `weft-bench` downsample workload so both drive one implementation. `Aggregation` is
 // re-exported so the server's public API surface (see `lib.rs`) is unchanged.
 pub use weft_reduce::Aggregation;
-use weft_reduce::reduce;
-use serde::{Deserialize, Serialize};
-use splimes::{Point, Resolution};
 
 use crate::{
 	interpolate::{ApiError, InputPoint, ResolutionSpec}, metrics::SharedMetrics
@@ -181,7 +181,7 @@ fn run_downsample(points: &[Point], start: DateTime<Utc>, end: DateTime<Utc>, re
 /// at the API boundary and derives the reported counts. Shared by the compute
 /// endpoints (which reduce a request-supplied series) and the stored-range
 /// endpoint (which reduces persisted segments via
-/// [`database::SegmentStore::downsample_range`]), so both envelopes are identical
+/// [`weftdb::SegmentStore::downsample_range`]), so both envelopes are identical
 /// by construction and cannot drift.
 pub(crate) fn buckets_to_response(buckets: Vec<weft_reduce::Bucket>, resolution: Resolution, aggregations: &[Aggregation]) -> DownsampleResponse {
 	// Every in-window point lands in exactly one bucket, so the bucket counts sum to

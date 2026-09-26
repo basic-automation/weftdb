@@ -32,7 +32,7 @@
 //!   the `BigDecimal` the encoding represents.
 //! - [`PhysicalType::profile`] — declarative per-encoding metadata
 //!   ([`PhysicalProfile`]: storage width, lossless/hot-path eligibility).
-//! - [`column`] — batch [`encode_column`] of a whole column under one encoding,
+//! - [`column`](mod@column) — batch [`encode_column`] of a whole column under one encoding,
 //!   aggregating exactness and estimating storage bytes (Storage-v2 / bytes-per-
 //!   point prep).
 //! - [`timestamp`] — Phase 4.2 integer-epoch timestamp codecs: lossless
@@ -76,7 +76,6 @@
 
 pub mod catalog;
 pub mod column;
-pub mod weftseg;
 pub mod floatcodec;
 pub mod nulls;
 pub mod page;
@@ -84,21 +83,22 @@ pub mod schema;
 pub mod segment;
 pub mod split;
 pub mod timestamp;
+pub mod weftseg;
 
 use bigdecimal::{
 	num_bigint::{BigInt, Sign}, BigDecimal, FromPrimitive, ToPrimitive
 };
 pub use catalog::{SegmentDescriptor, SegmentIndex};
 pub use column::{encode_column, recommend_encoding, CascadeInner, ColumnEncodeError, ColumnEncoding, DeltaCascadePlan};
-pub use weftseg::{crc32, frame_value_codec, read_paged_segment, read_segment, write_paged_segment, write_segment, write_segment_with, ByteReader, ByteWriter, WeftSegError, FrameOptions};
 pub use floatcodec::{best_f64_bytes, best_f64_codec, chimp128_f64_bytes, chimp128_f64_decode, chimp128_f64_encode, chimp_f64_bytes, chimp_f64_decode, chimp_f64_encode, elf_f64_bytes, elf_f64_decode, elf_f64_encode, xor_f64_bytes, xor_f64_decode, xor_f64_encode};
 pub use nulls::{NullMask, NullMaskError};
 pub use page::{Page, PagedSegment, DEFAULT_ROWS_PER_PAGE, PAGED_SEGMENT_FORMAT_VERSION};
 pub use schema::{AspectSchema, SealError};
 pub use segment::{prune_by_time, prune_by_value, prune_present_by_time, Segment, SegmentError, SegmentStats, SEGMENT_FORMAT_VERSION};
-pub use split::{merge_newer_wins, split_index, SplitDecision, SplitPolicy};
 use serde::{Deserialize, Serialize};
+pub use split::{merge_newer_wins, split_index, SplitDecision, SplitPolicy};
 pub use timestamp::{bitpack_bytes, bitpack_decode, bitpack_encode, bitpack_width, decode_delta, decode_delta_of_delta, encode_delta, encode_delta_of_delta, fire_estimated_bytes, fire_reconstruct, fire_residuals, first_order_violation, rle_decode, rle_encode, rle_varint_bytes, uvarint_len, zigzag_varint_bytes, zigzag_varint_len, DeltaColumn, DeltaOfDeltaColumn, TimeUnit};
+pub use weftseg::{crc32, frame_value_codec, read_paged_segment, read_segment, write_paged_segment, write_segment, write_segment_with, ByteReader, ByteWriter, FrameOptions, WeftSegError};
 
 /// A schema-declared physical encoding for an aspect's numeric values.
 ///
