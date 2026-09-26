@@ -87,7 +87,7 @@ precision with no performance cost"; "commercially ready because the TUI works";
    `weft-connector`) holding the `Source`/`Connector` trait + runtime registry. Every
    concrete connector (Thorchain, InfluxDB, CSV, …) lives **outside** the core as its
    own crate that depends on the abstraction, never the reverse. No vendor-specific
-   code/types/deps in `splimes`/`database`/`database_orchestration`/`weft-tui`.
+   code/types/deps in `splimes`/`weftdb`/`weft-orchestration`/`weft-tui`.
    Thorchain is *one of many* sources and must not be coupled to WeftDB.
 3. **Storage boundary.** **libSQL/Turso is the control plane** — catalog, metadata,
    config, pipeline state, transactional control. WeftDB's own **typed columnar
@@ -770,7 +770,7 @@ A checked box = shipped; an unchecked box carries its residual status inline
 - [ ] **B-ilp** *(Phase 2 · partial)* — ILP ingest shipped (parser + endpoints); the ILP/Influx **interop** connector crate (not a storage swap) is still to do. *(src: `dsm-influxdb`, `dsm-batch`)*
 - [ ] **B-rest** *(Phase 2 · partial)* — REST facade + declarative query-params + pagination shipped (`offset`/`limit`/`take`/`page` + `total`/`count` **and now an opaque `next_cursor`/`?cursor=` forward-iteration token** on `…/points` and `…/value-points`); the `interpolation` query-param alias shipped. Residue: cursor tokens are position-over-read-order (stable while the window is unchanged), not a row-identity keyset — a keyset cursor resilient to concurrent inserts is the next refinement. *(src: `DSM-Database`)*
 - [ ] **B-poll / B-retry / B-register** *(Phase 7 · absent)* — Scheduled polling daemon (per-source interval) + at-least-once retry buffer + runtime source registration. *(src: `DSM-Input-Module`)*
-- [x] **B-interp** *(Phase 5)* — Interpolate-on-read, single-instant lookup, out-of-range extrapolation. *(src: `splimes`/`database`)*
+- [x] **B-interp** *(Phase 5)* — Interpolate-on-read, single-instant lookup, out-of-range extrapolation. *(src: `splimes`/`weftdb`)*
 - [ ] **B-analysis** *(Phase 4/9 · verify)* — Per-point analysis model (signed neighbor distance, slope-segmented trends, max-normalized relative vectors); verify `Trend`/`Relative`/`MeasurementVector`/`Analysis` wired end-to-end. *(src: `dataset_management`, `DSM-Measurement`)*
 - [ ] **B-object** *(Phase 4 · absent)* — Schemaless object/annotation store beside numeric aspects. *(src: `DSM-Database`)*
 - [ ] **B-windows** *(Phase 9 · absent/partial)* — Sliding/overlapping + event-centered windows; multi-resolution horizon fan-out; min-density validation; config-driven batching policy. *(src: `dsm-batch`, `DSM-Batcher`)*
@@ -787,7 +787,7 @@ A checked box = shipped; an unchecked box carries its residual status inline
 The 15 predecessor repositories are **not part of this repository**. They were removed
 along with their history, so the backlog items above reference them by name only:
 `dsm-source`, `dsm-asset`, `dsm-influxdb`, `DSM-Thorchain`, `DSM-Input-Module`,
-`DSM-Database`, `DSM-Measurement`, `database`, `dsm-batch`, `DSM-Batch-v2`, `DSM-Batcher`,
+`DSM-Database`, `DSM-Measurement`, `weftdb`, `dsm-batch`, `DSM-Batch-v2`, `DSM-Batcher`,
 `DSM-Pattern`, `DSM-Patterner`, `dataset_management`, `DSM-Log`.
 
 
@@ -811,7 +811,7 @@ of them turn Turso into the measurement backend.
   encrypted on write, decrypted on read). No version bump needed to start.
   *(src: https://turso.tech/blog/turso-0.6.0)*
 - [x] `VACUUM INTO 'file'` for online, consistent control-plane backup/snapshot *(Phase 7.4)* —
-  **MVP shipped (2026-07-21).** `database::backup` (`vacuum_into` + `snapshot_and_verify`) snapshots a
+  **MVP shipped (2026-07-21).** `weftdb::backup` (`vacuum_into` + `snapshot_and_verify`) snapshots a
   control-plane DB to a fresh file and reopens the copy to verify its user-table set + per-table row
   counts match the source; each of the four control-plane stores gained a `backup_to`, and
   `SegmentStore::backup_control_plane(dir)` snapshots all four (segment_index/metadata/aspect_catalog/
@@ -924,7 +924,7 @@ of them turn Turso into the measurement backend.
   and two of the three open questions have answers.** WeftDB pins `turso = "0.6"` and locks 0.6.1.
   **Version check (research 2026-09-23): stable is now `0.7.2` (2026-07-30), with `0.8.0-pre.12`
   out on 2026-09-22 — WeftDB is two minor versions behind, and 0.8-pre is moving weekly, so part of
-  this decision is whether to wait for 0.8 stable.** Before bumping, audit the `database` crate for
+  this decision is whether to wait for 0.8 stable.** Before bumping, audit the `weftdb` crate for
   (a) any place two write statements can be in flight on one connection (now returns busy) and (b)
   any interactive transaction where a statement can be abandoned mid-way (now poisons it) — **the
   backup tick running beside a concurrent catalog writer is exactly the shape that trips (a)**.
@@ -1184,7 +1184,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 - [x] **DONE (2026-07-20) — the LNK1102 link OOM is FIXED at the root: `[profile.test] debug = 1`.**
   With the ICE cleared, the default-parallelism `cargo test --workspace` died in `link.exe` with
   `LINK : fatal error LNK1102: out of memory` while linking several large test executables at once
-  (`weft-arrow-store`, `database`'s `db_tests`, `weft-tui`, `weft-server`); the cascade of
+  (`weft-arrow-store`, `weftdb`'s `db_tests`, `weft-tui`, `weft-server`); the cascade of
   `can't find crate` / `no resolution for an import` "ICE"s after it was downstream noise from those
   failed links, not separate compiler bugs. A resource limit, not a correctness one (~250 rlibs per
   test binary). Two fixes were measured, and the better one shipped:
@@ -1199,12 +1199,12 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
     https://learn.microsoft.com/en-us/previous-versions/troubleshoot/visualstudio/language-compilers/linker-fatal-error-out-of-memory
     · https://doc.rust-lang.org/cargo/reference/profiles.html#debug)*
 - [x] **DONE (2026-07-20) — `cargo test --workspace` COMPLETES for the first time: 969 passed, 0
-  failed, 30 ignored across 29 targets.** The last blocker was `database`'s `db_tests`. Isolated it by
+  failed, 30 ignored across 29 targets.** The last blocker was `weftdb`'s `db_tests`. Isolated it by
   running the target serially: 14 of its 15 tests finish in seconds and
   **`test_create_btc_1min_database`** was the entire stall — it bulk-loads the real
   `datasets/btc_1min.csv` corpus and ran **40+ minutes at ~5 GB RSS** without producing a result
   (memory plateaus, so it grinds rather than leaks). **`SKIP_SLOW_TESTS` was already the repo's
-  convention for exactly this** (`database_orchestration/src/lib.rs` guards four tests with it) but had
+  convention for exactly this** (`weft-orchestration/src/lib.rs` guards four tests with it) but had
   never been wired into this target, so `SKIP_SLOW_TESTS=1` silently did nothing here. Added the same
   guard; the target now runs **15 passed in 53 s** instead of never finishing.
   **Full verified command: `SKIP_SLOW_TESTS=1 cargo test --workspace` → EXIT=0, 969 passed / 0
@@ -1225,14 +1225,14 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   the single test runs in 12.23 s (it previously did not terminate — 40+ min at ~5 GB RSS), and the
   whole `db_tests` target runs 16 passed / 0 failed in 47.45 s.**
 - [x] **ANSWERED (2026-09-23) — `SKIP_SLOW_TESTS` cannot be dropped workspace-wide yet, and the
-  guard has been hiding three real failures.** Timed `database_orchestration` **unguarded**
+  guard has been hiding three real failures.** Timed `weft-orchestration` **unguarded**
   (`SKIP_SLOW_TESTS` unset): **9 m 58 s wall-clock, 14 passed / 3 FAILED / 17 total**. The seven
   guarded tests are the whole cost — `test_api` 596.9 s, `test_batch_processing` 596.9 s,
   `test_pipeline_api_precise` 593.2 s, `test_specific_process_batch` 583.4 s,
   `test_pipeline_api_with_fake_db` 579.8 s, `test_pipeline_api` 406.6 s, `test_api_precise` 357.2 s
   — while every other test in the crate finishes in under 8 s. So the flag is doing real work and
   retiring it would add ~10 minutes to every run.
-- [ ] **The three unguarded `database_orchestration` failures are latent bugs, not flakes — fix them
+- [ ] **The three unguarded `weft-orchestration` failures are latent bugs, not flakes — fix them
   before the guard can retire.** With `SKIP_SLOW_TESTS` unset: `test_api_precise` fails with
   `Database error: Failed to query patterns: Parse error: no such table: patterns` (preceded by
   `Failed to store dictionary metadata: DDL statements require an exclusive transaction (use BEGIN
@@ -1242,7 +1242,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   `Invalid time range: start time must be before end time`. These are **pre-existing** and unrelated
   to the 2026-09-23 increments — they have simply never run in CI because the guard hides them. The
   DDL-under-`BEGIN CONCURRENT` one looks like a genuine control-plane bug rather than a test bug.
-- [ ] **Bound the seven slow `database_orchestration` tests the way `db_tests` was bounded.** Each
+- [ ] **Bound the seven slow `weft-orchestration` tests the way `db_tests` was bounded.** Each
   spends ~6–10 minutes; `test_create_btc_1min_database` was made runnable by capping its row count
   and using a temp data dir (`BTC_TEST_MAX_ROWS`, default 5,000). The same treatment here would let
   the flag retire and give the suite its real coverage back.
@@ -1362,7 +1362,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   finalize at query time — and a sealed segment is immutable, so its partial can never go stale (the
   invariant Timescale needs a refresh policy to maintain, WeftDB gets for free). Shipped across the arc:
   - [x] **(1) per-segment `.weftpart` sidecar at a declared base resolution** — `weft-reduce`'s
-    `PartialReduction`/`DdSketch` are serde-serializable; `database`'s `PartialSidecar` frame
+    `PartialReduction`/`DdSketch` are serde-serializable; `weftdb`'s `PartialSidecar` frame
     (magic-prefixed bincode, staleness stamp = segment `(row_count, byte_len)`), `PartialSidecarPolicy`
     (off by default; `WEFT_SEGMENT_PARTIAL_BASE`/`WEFT_SEGMENT_PARTIAL_MIN_ROWS`), written at seal for the
     ten bounded reductions (`Aggregation::is_sidecar_materializable`).
@@ -1852,7 +1852,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   This is the "decode-throughput is often bandwidth-bound — measure, don't assume" caveat confirmed
   on WeftDB's own path. *(src: https://arxiv.org/pdf/2606.22423)*
 - [x] **DONE (2026-07-16) — the checkpointed seal is REACHABLE (opt-in).** `CheckpointPolicy`
-  (`database`) reads `WEFT_SEGMENT_CHECKPOINT_STRIDE` + `WEFT_SEGMENT_CHECKPOINT_MIN_ROWS` (default
+  (`weftdb`) reads `WEFT_SEGMENT_CHECKPOINT_STRIDE` + `WEFT_SEGMENT_CHECKPOINT_MIN_ROWS` (default
   8192 rows) and applies at `persist`/`persist_paged`, so all six seal entry points inherit it;
   `SegmentStore::with_checkpoint_policy` overrides it programmatically. It fires only where it pays
   — `Segment::benefits_from_checkpoints()` (sorted **and** irregular). **Off by default**: an
@@ -1910,7 +1910,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   a 5-page frame.
 - [x] Add p50/p95/p99 + confidence-interval reporting
 - [x] Add physical value types (`F64`, `ScaledI64`, `BigDecimalText` + three more)
-- [x] Prototype columnar segment reads for one aspect type (`database::SegmentStore`)
+- [x] Prototype columnar segment reads for one aspect type (`weftdb::SegmentStore`)
 - [ ] Publish a methodology document **before** any performance claim
 
 > The key commercial move is not adding features — it is making WeftDB's performance

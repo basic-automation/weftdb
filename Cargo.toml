@@ -1,13 +1,33 @@
 [workspace]
 resolver = "2"
-members = ["database", "database_orchestration", "splimes", "weft-tui", "weft-bench", "weft-server", "weft-line-protocol", "weft-physical-type", "weft-arrow", "weft-arrow-store", "weft-reduce"]
+members = [
+	"weftdb",
+	"weft-orchestration",
+	"splimes",
+	"weft-tui",
+	"weft-bench",
+	"weft-server",
+	"weft-line-protocol",
+	"weft-physical-type",
+	"weft-arrow",
+	"weft-arrow-store",
+	"weft-reduce",
+]
 
 # Fields every workspace member inherits with `<field>.workspace = true`. Each crate keeps
-# its own version, edition and description.
+# its own edition and description; everything else is released in lockstep.
 [workspace.package]
+version = "0.1.0"
 license = "MIT"
 authors = ["Justin Icenhour"]
 repository = "https://github.com/basic-automation/weftdb"
+homepage = "https://github.com/basic-automation/weftdb"
+readme = "README.md"
+# The workspace builds on stable Rust. The floor is set by the `sysinfo` dependency,
+# not by the 2024 edition `splimes` targets; verified with `cargo +1.95 check --workspace`.
+rust-version = "1.95"
+keywords = ["timeseries", "database", "interpolation", "spline", "time-series"]
+categories = ["database-implementations", "science", "mathematics"]
 
 [workspace.dependencies]
 anyhow = "1"
@@ -40,11 +60,14 @@ ratatui = "0"
 crossterm = "0"
 futures-channel = "0"
 sysinfo = "0"
-splimes = { path = "./splimes" }
-weft-line-protocol = { path = "./weft-line-protocol" }
-weft-physical-type = { path = "./weft-physical-type" }
-weft-reduce = { path = "./weft-reduce" }
-weft-arrow = { path = "./weft-arrow" }
+weftdb = { path = "./weftdb", version = "0.1.0" }
+weft-orchestration = { path = "./weft-orchestration", version = "0.1.0" }
+splimes = { path = "./splimes", version = "0.1.0" }
+weft-line-protocol = { path = "./weft-line-protocol", version = "0.1.0" }
+weft-physical-type = { path = "./weft-physical-type", version = "0.1.0" }
+weft-reduce = { path = "./weft-reduce", version = "0.1.0" }
+weft-arrow = { path = "./weft-arrow", version = "0.1.0" }
+weft-arrow-store = { path = "./weft-arrow-store", version = "0.1.0" }
 arrow-array = "59"
 arrow-schema = "59"
 arrow-ipc = "59"

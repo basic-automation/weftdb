@@ -12,7 +12,7 @@
 //!   place routes are registered, so tests exercise the exact router the binary
 //!   serves (no divergence between test and production wiring).
 //! - Liveness vs readiness are kept distinct, matching standard orchestration
-//!   probes: [`health`] reports the process is up (`GET /health`), [`ready`]
+//!   probes: `health` reports the process is up (`GET /health`), `ready`
 //!   reports the service is ready to accept traffic (`GET /ready`). Today
 //!   readiness is unconditional; as real dependencies (control-plane DB, segment
 //!   store) are wired in, `ready` gains the checks while `health` stays cheap.
@@ -174,7 +174,7 @@ mod tests {
 	async fn ready_reports_a_configured_segment_store() {
 		use std::sync::Arc;
 
-		use database::SegmentStore;
+		use weftdb::SegmentStore;
 		use tempfile::TempDir;
 
 		let dir = TempDir::new().unwrap();

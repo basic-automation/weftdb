@@ -22,7 +22,7 @@
 //! ## The store is optional
 //!
 //! When the operator has not configured a store root the [`AppState`] carries no
-//! [`SegmentStore`](database::SegmentStore), and these endpoints answer
+//! [`SegmentStore`](weftdb::SegmentStore), and these endpoints answer
 //! `503 Service Unavailable`. An aspect that was never declared in the store is a
 //! `404 Not Found` (its timestamp unit / encoding is unknown, so there is nothing
 //! to read), and any other read failure is a `500`.
@@ -175,7 +175,7 @@ where
 /// Resolve an aspect's declared schema or map its absence to a clean `404` (the
 /// CSV reads go straight to the store rather than through the bridge, so they
 /// reproduce the bridge's not-found semantics explicitly).
-async fn require_schema(store: &database::SegmentStore, aspect: &str) -> Result<weft_physical_type::AspectSchema, StorageError> {
+async fn require_schema(store: &weftdb::SegmentStore, aspect: &str) -> Result<weft_physical_type::AspectSchema, StorageError> {
 	let schema = store.schema_for(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?;
 	schema.ok_or_else(|| StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")))
 }
@@ -366,7 +366,7 @@ pub async fn storage_ingest_parquet(State(state): State<AppState>, Path(aspect):
 
 /// The body of [`storage_ingest_parquet`], split out so the handler records an error
 /// metric for any failure path uniformly.
-async fn storage_ingest_parquet_inner(store: &database::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, rows_per_page: Option<usize>, require_sorted: bool, body: &Bytes) -> Result<Response, StorageError> {
+async fn storage_ingest_parquet_inner(store: &weftdb::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, rows_per_page: Option<usize>, require_sorted: bool, body: &Bytes) -> Result<Response, StorageError> {
 	if body.is_empty() {
 		return Err(StorageError::BadRequest("empty Parquet body".to_string()));
 	}
@@ -672,7 +672,7 @@ pub struct StoredPointResponse {
 /// span covers `t`, opens only those, and resolves the instant with each segment's
 /// persisted order signal — a `time_sorted` segment binary-searches, an
 /// out-of-order one linear-scans (see
-/// [`SegmentStore::read_point`](database::SegmentStore::read_point)). Values are
+/// [`SegmentStore::read_point`](weftdb::SegmentStore::read_point)). Values are
 /// lossless decimal text (no float round-trip — hard constraint #4).
 ///
 /// # Errors
@@ -725,7 +725,7 @@ pub struct StoredPointsResponse {
 /// Handle `GET /api/v1/storage/{aspect}/at-multi?t=<epoch>,<epoch>,…`.
 ///
 /// The batch counterpart of [`storage_point`] (roadmap Phase 4/6): resolves many instants in
-/// one pass through [`SegmentStore::read_points`](database::SegmentStore::read_points), which
+/// one pass through [`SegmentStore::read_points`](weftdb::SegmentStore::read_points), which
 /// prunes the index once by the batch's whole span and decodes each surviving segment's
 /// timestamp column once for the whole batch. Results are returned in the query order (an
 /// instant may repeat). Values are lossless decimal text.
@@ -857,7 +857,7 @@ pub struct CatalogResponse {
 /// Collect the registered `(database, subject)` hierarchy from a store's registry.
 /// Kept as a free async fn taking `&SegmentStore` so the handler can drop the store
 /// handle before building its response.
-async fn collect_catalog(store: &database::SegmentStore) -> anyhow::Result<Vec<CatalogDatabase>> {
+async fn collect_catalog(store: &weftdb::SegmentStore) -> anyhow::Result<Vec<CatalogDatabase>> {
 	let database_names = store.registry().list_databases().await?;
 	let mut databases = Vec::with_capacity(database_names.len());
 	for name in database_names {
@@ -888,7 +888,7 @@ pub async fn storage_catalog(State(state): State<AppState>) -> Result<Json<Catal
 /// Collect the declared aspects and their schemas into the response DTO. Kept as a
 /// free async fn taking `&SegmentStore` so the handler can drop the store handle
 /// before building its response.
-async fn collect_aspects(store: &database::SegmentStore) -> anyhow::Result<Vec<AspectInfo>> {
+async fn collect_aspects(store: &weftdb::SegmentStore) -> anyhow::Result<Vec<AspectInfo>> {
 	let names = store.list_declared_aspects().await?;
 	let mut aspects = Vec::with_capacity(names.len());
 	for name in names {
@@ -1022,7 +1022,7 @@ pub struct StorageDownsampleParams {
 /// Reduce an aspect's **stored** segments over `[start, end]` into grid-aligned
 /// buckets, shared by this endpoint's four output formats.
 ///
-/// This is the bounded-memory path: [`database::SegmentStore::downsample_range`]
+/// This is the bounded-memory path: [`weftdb::SegmentStore::downsample_range`]
 /// prunes the segment index by time and folds each surviving segment into its own
 /// mergeable `PartialReduction`, so only one segment's rows are ever resident and a
 /// range far larger than RAM still reduces — and with a `sketch_p*` reduction the
@@ -1119,7 +1119,7 @@ mod tests {
 		body::Body, http::{Request, StatusCode}
 	};
 	use bigdecimal::BigDecimal;
-	use database::SegmentStore;
+	use weftdb::SegmentStore;
 	use weft_arrow::{read_ipc_stream, record_batches_to_columns};
 	use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
 	use tempfile::TempDir;

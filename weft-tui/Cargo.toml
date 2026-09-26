@@ -1,16 +1,25 @@
 [package]
 name = "weft-tui"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+authors.workspace = true
 license.workspace = true
 repository.workspace = true
-authors.workspace = true
-version = "0.1.0"
-edition = "2021"
+homepage.workspace = true
+readme.workspace = true
+description = "Terminal UI for exploring and administering a WeftDB instance."
+keywords = ["timeseries", "database", "tui", "terminal", "weftdb"]
+categories = ["command-line-utilities", "database"]
+# Binary/tooling crate: shipped as a GitHub release artifact, not published to crates.io.
+publish = false
+
 
 [dependencies]
 ratatui = { workspace = true }
 crossterm = { workspace = true }
-database = { path = "../database" }
-splimes = { path = "../splimes" }
+weftdb = { workspace = true }
+splimes = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }

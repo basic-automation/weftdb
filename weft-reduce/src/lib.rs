@@ -531,7 +531,7 @@ pub fn reduce(points: &[Point], resolution: Resolution, start: Option<DateTime<U
 /// re-decoding every value column. A round-trip is exact (every field round-trips,
 /// including the [`DdSketch`]), so a deserialized partial merges with a freshly built one
 /// to the same result a single pass would produce — verified by
-/// [`serde_round_trip_preserves_merge_exactness`](tests).
+/// `serde_round_trip_preserves_merge_exactness`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartialReduction {
 	buckets: BTreeMap<i64, BucketAcc>,

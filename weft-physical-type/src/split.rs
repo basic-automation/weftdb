@@ -111,9 +111,11 @@ impl SplitPolicy {
 	}
 }
 
-/// The split boundary in a **sorted** existing segment: the number of rows whose
-/// timestamp is strictly less than `late_min` — i.e. the length of the untouched
-/// prefix when late data whose earliest timestamp is `late_min` is merged in.
+/// The split boundary in a **sorted** existing segment.
+///
+/// That is the number of rows whose timestamp is strictly less than `late_min` — the
+/// length of the untouched prefix when late data whose earliest timestamp is `late_min`
+/// is merged in.
 ///
 /// Equivalently the index of the first existing row at or after the late window, so
 /// `existing_ts[..split_index]` is the prefix a split keeps and

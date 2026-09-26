@@ -5,7 +5,7 @@
 //! its `?threshold=N` form gates that pass on the `unsorted_segments` order-health
 //! backlog. This module turns that same trigger into a **background timer**: on an
 //! interval it sweeps every declared aspect through
-//! [`SegmentStore::reconcile_all_over_threshold`](database::SegmentStore::reconcile_all_over_threshold),
+//! [`SegmentStore::reconcile_all_over_threshold`](weftdb::SegmentStore::reconcile_all_over_threshold),
 //! paying the rewrite only for the aspects whose backlog has crossed the threshold.
 //!
 //! This is the QuestDB-style automatic squash: rather than rewriting on every late
@@ -20,7 +20,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use database::{HotColdSweep, OverlapSweep, ReconcileSweep, SegmentStore, SquashSweep};
+use weftdb::{HotColdSweep, OverlapSweep, ReconcileSweep, SegmentStore, SquashSweep};
 use tracing::Instrument as _;
 
 use crate::metrics::SharedMetrics;
@@ -37,12 +37,12 @@ pub struct ReconcileDaemonConfig {
 	/// (sealed, no-longer-appended) segments on each tick and defer only the
 	/// hot tail until the backlog reaches `threshold` (see
 	/// [`reconcile_tick_hot_cold`] /
-	/// [`SegmentStore::reconcile_all_hot_cold`](database::SegmentStore::reconcile_all_hot_cold)).
+	/// [`SegmentStore::reconcile_all_hot_cold`](weftdb::SegmentStore::reconcile_all_hot_cold)).
 	/// When `false`, use the all-or-nothing threshold sweep (the original
 	/// [`reconcile_tick`] behaviour).
 	pub hot_cold: bool,
 	/// When `true`, each tick **also** runs a store-wide cross-segment overlap merge
-	/// ([`reconcile_tick_overlaps`] / [`SegmentStore::reconcile_all_overlaps`](database::SegmentStore::reconcile_all_overlaps))
+	/// ([`reconcile_tick_overlaps`] / [`SegmentStore::reconcile_all_overlaps`](weftdb::SegmentStore::reconcile_all_overlaps))
 	/// after the intra-segment sweep, so late data that re-entered an already-covered
 	/// window is merged in the background too. Independent of `hot_cold`/`threshold`.
 	pub overlaps: bool,
@@ -54,14 +54,14 @@ pub struct ReconcileDaemonConfig {
 	pub split_min_bytes: Option<u64>,
 	/// Optional segment-count cap (roadmap Phase 4.6). When `Some`, each tick **also**
 	/// squashes every aspect whose segment count exceeds it into one segment
-	/// ([`reconcile_tick_squash`] / [`SegmentStore::squash_all_over_threshold`](database::SegmentStore::squash_all_over_threshold)),
+	/// ([`reconcile_tick_squash`] / [`SegmentStore::squash_all_over_threshold`](weftdb::SegmentStore::squash_all_over_threshold)),
 	/// bounding the fragmentation repeated split carve-offs create. When `None`, no
 	/// squash runs. Independent of `overlaps`/`hot_cold`/`threshold`.
 	pub squash_max_segments: Option<usize>,
 	/// Optional **target segment size in rows** for size-aware compaction (roadmap
 	/// Phase 4.6). When `Some`, each tick **also** coalesces every aspect's segments
 	/// toward ~this many rows per segment
-	/// ([`reconcile_tick_compact`] / [`SegmentStore::squash_all_to_target_rows`](database::SegmentStore::squash_all_to_target_rows)),
+	/// ([`reconcile_tick_compact`] / [`SegmentStore::squash_all_to_target_rows`](weftdb::SegmentStore::squash_all_to_target_rows)),
 	/// holding fragmentation near the read-optimal size rather than folding to one (which
 	/// `squash_max_segments` does). When `None`, no size-aware compaction runs. Independent
 	/// of the other axes; runs after the squash pass.
@@ -81,7 +81,7 @@ pub struct ReconcileDaemonConfig {
 /// # Errors
 ///
 /// Propagates a failure from
-/// [`SegmentStore::reconcile_all_over_threshold`](database::SegmentStore::reconcile_all_over_threshold)
+/// [`SegmentStore::reconcile_all_over_threshold`](weftdb::SegmentStore::reconcile_all_over_threshold)
 /// (a control-plane read, a segment read, or a re-seal failure).
 pub async fn reconcile_tick(store: &SegmentStore, metrics: &SharedMetrics, threshold: usize) -> anyhow::Result<ReconcileSweep> {
 	let span = tracing::info_span!("reconcile.tick", kind = "threshold", threshold, aspects = tracing::field::Empty, segments = tracing::field::Empty);
@@ -97,7 +97,7 @@ pub async fn reconcile_tick(store: &SegmentStore, metrics: &SharedMetrics, thres
 /// Run one **hot/cold** reconcile tick.
 ///
 /// Sweeps every aspect through
-/// [`SegmentStore::reconcile_all_hot_cold`](database::SegmentStore::reconcile_all_hot_cold):
+/// [`SegmentStore::reconcile_all_hot_cold`](weftdb::SegmentStore::reconcile_all_hot_cold):
 /// each aspect's cold segments are reconciled unconditionally and only its hot tail
 /// is gated on `threshold`. Records the reconciled aspects and total (cold + hot)
 /// segments in `metrics`, and returns the [`HotColdSweep`] summary.
@@ -108,7 +108,7 @@ pub async fn reconcile_tick(store: &SegmentStore, metrics: &SharedMetrics, thres
 /// # Errors
 ///
 /// Propagates a failure from
-/// [`SegmentStore::reconcile_all_hot_cold`](database::SegmentStore::reconcile_all_hot_cold)
+/// [`SegmentStore::reconcile_all_hot_cold`](weftdb::SegmentStore::reconcile_all_hot_cold)
 /// (a control-plane read, a segment read, or a re-seal failure).
 pub async fn reconcile_tick_hot_cold(store: &SegmentStore, metrics: &SharedMetrics, threshold: usize) -> anyhow::Result<HotColdSweep> {
 	let span = tracing::info_span!("reconcile.tick", kind = "hot_cold", threshold, aspects = tracing::field::Empty, segments = tracing::field::Empty);
@@ -124,7 +124,7 @@ pub async fn reconcile_tick_hot_cold(store: &SegmentStore, metrics: &SharedMetri
 /// Run one **cross-segment overlap** merge tick.
 ///
 /// Sweeps every aspect through
-/// [`SegmentStore::reconcile_all_overlaps`](database::SegmentStore::reconcile_all_overlaps),
+/// [`SegmentStore::reconcile_all_overlaps`](weftdb::SegmentStore::reconcile_all_overlaps),
 /// merging each aspect's time-overlap groups into single segments. Records the
 /// reconciled aspects and total segments removed in `metrics` (a merge is a pass,
 /// exactly like an intra-segment reconcile), and returns the [`OverlapSweep`]. A sweep
@@ -133,7 +133,7 @@ pub async fn reconcile_tick_hot_cold(store: &SegmentStore, metrics: &SharedMetri
 /// # Errors
 ///
 /// Propagates a failure from
-/// [`SegmentStore::reconcile_all_overlaps`](database::SegmentStore::reconcile_all_overlaps)
+/// [`SegmentStore::reconcile_all_overlaps`](weftdb::SegmentStore::reconcile_all_overlaps)
 /// (a control-plane read, a segment read/write, or a re-seal failure).
 pub async fn reconcile_tick_overlaps(store: &SegmentStore, metrics: &SharedMetrics) -> anyhow::Result<OverlapSweep> {
 	let span = tracing::info_span!("reconcile.tick", kind = "overlaps", aspects = tracing::field::Empty, segments = tracing::field::Empty);
@@ -151,7 +151,7 @@ pub async fn reconcile_tick_overlaps(store: &SegmentStore, metrics: &SharedMetri
 ///
 /// As [`reconcile_tick_overlaps`],
 /// but each aspect's merge runs through
-/// [`SegmentStore::reconcile_all_overlaps_with_policy`](database::SegmentStore::reconcile_all_overlaps_with_policy)
+/// [`SegmentStore::reconcile_all_overlaps_with_policy`](weftdb::SegmentStore::reconcile_all_overlaps_with_policy)
 /// under `SplitPolicy::new(min_split_bytes)`, so a dominant cold prefix is split off
 /// rather than fully rewritten. Records and returns exactly as
 /// [`reconcile_tick_overlaps`].
@@ -159,7 +159,7 @@ pub async fn reconcile_tick_overlaps(store: &SegmentStore, metrics: &SharedMetri
 /// # Errors
 ///
 /// Propagates a failure from
-/// [`SegmentStore::reconcile_all_overlaps_with_policy`](database::SegmentStore::reconcile_all_overlaps_with_policy).
+/// [`SegmentStore::reconcile_all_overlaps_with_policy`](weftdb::SegmentStore::reconcile_all_overlaps_with_policy).
 pub async fn reconcile_tick_overlaps_with_policy(store: &SegmentStore, metrics: &SharedMetrics, min_split_bytes: u64) -> anyhow::Result<OverlapSweep> {
 	let span = tracing::info_span!("reconcile.tick", kind = "overlaps_split", min_split_bytes, aspects = tracing::field::Empty, segments = tracing::field::Empty);
 	let sweep = store.reconcile_all_overlaps_with_policy(weft_physical_type::SplitPolicy::new(min_split_bytes)).instrument(span.clone()).await?;
@@ -175,7 +175,7 @@ pub async fn reconcile_tick_overlaps_with_policy(store: &SegmentStore, metrics: 
 /// split-not-rewrite path).
 ///
 /// Sweeps every aspect through
-/// [`SegmentStore::squash_all_over_threshold`](database::SegmentStore::squash_all_over_threshold),
+/// [`SegmentStore::squash_all_over_threshold`](weftdb::SegmentStore::squash_all_over_threshold),
 /// folding each aspect whose segment count exceeds `max_segments` into one segment —
 /// the bound on the fragmentation repeated split carve-offs create. Records the
 /// squashed aspects and removed segments in `metrics` (a squash is a pass, like a
@@ -185,7 +185,7 @@ pub async fn reconcile_tick_overlaps_with_policy(store: &SegmentStore, metrics: 
 /// # Errors
 ///
 /// Propagates a failure from
-/// [`SegmentStore::squash_all_over_threshold`](database::SegmentStore::squash_all_over_threshold).
+/// [`SegmentStore::squash_all_over_threshold`](weftdb::SegmentStore::squash_all_over_threshold).
 pub async fn reconcile_tick_squash(store: &SegmentStore, metrics: &SharedMetrics, max_segments: usize) -> anyhow::Result<SquashSweep> {
 	let span = tracing::info_span!("reconcile.tick", kind = "squash", max_segments, aspects = tracing::field::Empty, segments = tracing::field::Empty);
 	let sweep = store.squash_all_over_threshold(max_segments).instrument(span.clone()).await?;
@@ -200,7 +200,7 @@ pub async fn reconcile_tick_squash(store: &SegmentStore, metrics: &SharedMetrics
 /// Run one **size-targeted compaction** tick (roadmap Phase 4.6).
 ///
 /// Sweeps every aspect through the **fragmentation-gated**
-/// [`SegmentStore::squash_all_to_target_rows_if_fragmented`](database::SegmentStore::squash_all_to_target_rows_if_fragmented),
+/// [`SegmentStore::squash_all_to_target_rows_if_fragmented`](weftdb::SegmentStore::squash_all_to_target_rows_if_fragmented),
 /// coalescing each *over-fragmented* aspect's segments toward ~`target_rows` rows per segment
 /// (leaving already-well-sized aspects untouched via an O(1) rollup check, no segment-index
 /// scan) — the size-aware bound on fragmentation, motivated by the `downsample_range` knee
@@ -212,7 +212,7 @@ pub async fn reconcile_tick_squash(store: &SegmentStore, metrics: &SharedMetrics
 /// # Errors
 ///
 /// Propagates a failure from
-/// [`SegmentStore::squash_all_to_target_rows_if_fragmented`](database::SegmentStore::squash_all_to_target_rows_if_fragmented).
+/// [`SegmentStore::squash_all_to_target_rows_if_fragmented`](weftdb::SegmentStore::squash_all_to_target_rows_if_fragmented).
 pub async fn reconcile_tick_compact(store: &SegmentStore, metrics: &SharedMetrics, target_rows: usize) -> anyhow::Result<SquashSweep> {
 	let span = tracing::info_span!("reconcile.tick", kind = "compact", target_rows, aspects = tracing::field::Empty, segments = tracing::field::Empty);
 	// The gated sweep: a converged aspect costs one O(1) rollup read per tick, not a full
@@ -307,7 +307,7 @@ mod tests {
 	use std::sync::Arc;
 
 	use bigdecimal::BigDecimal;
-	use database::SegmentStore;
+	use weftdb::SegmentStore;
 	use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
 	use tempfile::TempDir;
 

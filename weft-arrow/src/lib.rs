@@ -36,7 +36,7 @@
 //!   them) and a nullable `value: Utf8` column holding each present value's
 //!   **plain decimal text** (`BigDecimal::to_plain_string`), with Arrow validity
 //!   marking the null/absent rows. Decimal text is the always-exact encoding (the
-//!   [`PhysicalType::BigDecimalText`](weft_physical_type::PhysicalType::BigDecimalText)
+//!   [`PhysicalType::BigDecimalText`]
 //!   philosophy): no value can lose a digit crossing into Arrow, honoring hard
 //!   constraint #4 (no silent downcast). The segment's [`TimeUnit`], physical
 //!   encoding name, and format version travel in the schema metadata so the batch
@@ -114,10 +114,10 @@ fn metadata_lookup<'a>(batch: &'a RecordBatch, key: &str) -> Option<&'a String> 
 /// always-exact form.
 pub const VALUE_ENCODING_TEXT: &str = "text";
 /// Value-column wire form: IEEE-754 binary64 (Arrow `Float64`) — the typed fast
-/// path for an [`PhysicalType::F64`](weft_physical_type::PhysicalType::F64) segment.
+/// path for an [`PhysicalType::F64`] segment.
 pub const VALUE_ENCODING_F64: &str = "f64";
 /// Value-column wire form: IEEE-754 binary32 (Arrow `Float32`) — the typed fast
-/// path for an [`PhysicalType::F32`](weft_physical_type::PhysicalType::F32) segment.
+/// path for an [`PhysicalType::F32`] segment.
 pub const VALUE_ENCODING_F32: &str = "f32";
 /// Value-column wire form: fixed-scale Arrow `Decimal128`.
 ///

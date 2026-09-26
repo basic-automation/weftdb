@@ -1,11 +1,19 @@
 [package]
 name = "weft-server"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+authors.workspace = true
 license.workspace = true
 repository.workspace = true
-authors.workspace = true
-version = "0.1.0"
-edition = "2021"
-description = "WeftDB server: the benchmark-grade HTTP API surface (Phase 2) — health/readiness, and the ingest/query endpoints Weft-Bench drives WeftDB through."
+homepage.workspace = true
+readme.workspace = true
+description = "HTTP API server for WeftDB: health/readiness, ingest, query, interpolation and storage-management endpoints."
+keywords = ["timeseries", "database", "http", "server", "weftdb"]
+categories = ["database-implementations", "web-programming::http-server"]
+# Binary/tooling crate: shipped as a GitHub release artifact, not published to crates.io.
+publish = false
+
 
 [lib]
 name = "weft_server"
@@ -20,9 +28,9 @@ anyhow = { workspace = true }
 axum = { workspace = true }
 bigdecimal = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
-database = { path = "../database" }  # control-plane segment store backing the storage query endpoints
+weftdb = { workspace = true }  # control-plane segment store backing the storage query endpoints
 weft-arrow = { workspace = true }  # reconstructed-series -> Arrow IPC / Parquet bytes for the interpolate endpoint (arrow types stay inside weft-arrow)
-weft-arrow-store = { path = "../weft-arrow-store" }  # stored range -> Arrow IPC bytes (keeps the arrow-* tree off the lean core)
+weft-arrow-store = { workspace = true }  # stored range -> Arrow IPC bytes (keeps the arrow-* tree off the lean core)
 weft-line-protocol = { workspace = true }
 weft-physical-type = { workspace = true }  # AspectSchema / PhysicalType / TimeUnit for the catalog-management write path
 weft-reduce = { workspace = true }  # canonical downsample reduction (Aggregation / reduce / bucket_start)

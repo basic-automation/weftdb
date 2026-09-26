@@ -8,7 +8,7 @@ use std::{
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration, Utc};
 use crossterm::event::{KeyCode, KeyEventKind};
-use database::{
+use weftdb::{
 	database::traits::{AspectStructure, DatabaseStructure, Inputs, Outputs}, AggressivenessScaling, Aspect, CompressionConfig, Database, DatasetId, InputMeasurement, Resolution, SizeBasedCompressionConfig, Subject, TimeBasedCompressionConfig
 };
 use futures::StreamExt;
@@ -1530,7 +1530,7 @@ impl App {
 
 					// Create progress callback to send updates to the TUI
 					let tx_progress = tx.clone();
-					let progress_callback: database::ProgressCallback = std::sync::Arc::new(move |progress| {
+					let progress_callback: weftdb::ProgressCallback = std::sync::Arc::new(move |progress| {
 						let phase_str = format!("{}", progress.phase);
 						let progress_percent = if progress.total_tiers > 0 {
 							Some(((progress.current_tier as f64 / progress.total_tiers as f64) * 100.0) as u8)
@@ -1858,7 +1858,7 @@ impl App {
 }
 
 /// Background task for loading measurements
-async fn load_measurements_background(db_name: String, aspect_id: database::AspectId, native_resolution: Resolution, view_resolution: Resolution, tx: mpsc::Sender<LoadingMessage>, cancel: Arc<AtomicBool>) -> Result<()> {
+async fn load_measurements_background(db_name: String, aspect_id: weftdb::AspectId, native_resolution: Resolution, view_resolution: Resolution, tx: mpsc::Sender<LoadingMessage>, cancel: Arc<AtomicBool>) -> Result<()> {
 	let db = Database::existing(&db_name).await?;
 
 	// Notify UI that loading has started
@@ -2009,7 +2009,7 @@ fn validate_csv_path(path: &str) -> Option<String> {
 async fn list_databases() -> Result<Vec<String>> {
 	// List directories in the active data dir that contain metadata.db
 	use std::fs;
-	let data_dir = database::data_dir();
+	let data_dir = weftdb::data_dir();
 	let mut dbs = vec![];
 	let entries = match fs::read_dir(&data_dir) {
 		Ok(entries) => entries,
@@ -2030,7 +2030,7 @@ async fn list_databases() -> Result<Vec<String>> {
 }
 
 async fn list_subjects(db_name: &str) -> Result<Vec<Subject>> {
-	let data_dir = database::data_dir();
+	let data_dir = weftdb::data_dir();
 	let db_path = format!("{}/{}", data_dir, db_name);
 	let metadata_path = format!("{}/metadata.db", db_path);
 	if !std::path::Path::new(&metadata_path).exists() {
@@ -2126,7 +2126,7 @@ fn parse_timestamp(s: &str) -> Result<DateTime<Utc>> {
 
 /// Background task for importing CSV measurements
 /// Debounces UI updates to prevent excessive redrawing on large files
-async fn import_csv_background(file_path: String, db_name: String, _subject_id: database::SubjectId, aspect_id: database::AspectId, view_resolution: Resolution, tx: mpsc::Sender<LoadingMessage>, cancel: Arc<AtomicBool>) -> Result<()> {
+async fn import_csv_background(file_path: String, db_name: String, _subject_id: weftdb::SubjectId, aspect_id: weftdb::AspectId, view_resolution: Resolution, tx: mpsc::Sender<LoadingMessage>, cancel: Arc<AtomicBool>) -> Result<()> {
 	use std::{str::FromStr, time::Instant};
 
 	use bigdecimal::BigDecimal;

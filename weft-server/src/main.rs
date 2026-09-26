@@ -15,7 +15,7 @@
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use database::SegmentStore;
+use weftdb::SegmentStore;
 use weft_server::{app_with_state, spawn_backup_daemon, spawn_reconcile_daemon, AppState, BackupDaemonConfig, ReconcileDaemonConfig, SERVICE, VERSION};
 
 /// Default bind address when `WEFT_SERVER_ADDR` is unset.

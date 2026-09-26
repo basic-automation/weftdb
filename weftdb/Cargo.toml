@@ -1,0 +1,86 @@
+[package]
+name = "weftdb"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Time-series database for irregularly sampled data: interpolation is a first-class query, and every returned point is labelled raw, interpolated or extrapolated."
+keywords = ["timeseries", "database", "interpolation", "spline", "time-series"]
+categories = ["database-implementations", "science", "mathematics"]
+
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bigdecimal = { workspace = true, features = ["serde"] }
+bincode = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+fake = { workspace = true, features = ["derive", "chrono", "bigdecimal", "uuid"] }
+rand = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+turso = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+uuid = { workspace = true, features = ["v4", "serde"] }
+wide = { workspace = true }
+flume = { workspace = true }
+wgpu = { workspace = true }
+bytemuck = { workspace = true, features = ["derive"] }
+pollster = { workspace = true }
+fastrand = { workspace = true }
+futures = { workspace = true }
+splimes = { workspace = true }
+weft-physical-type = { workspace = true }
+weft-reduce = { workspace = true }
+csv = { workspace = true }
+once_cell = { workspace = true }
+dirs = { workspace = true }
+num_cpus = { workspace = true }
+serde_json = { workspace = true }
+md5 = { workspace = true }
+sysinfo = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true , features = ["html_reports"] }
+tempfile = { workspace = true }
+serial_test = { workspace = true }
+
+[[bench]]
+name = "interpolation_benchmarks"
+harness = false
+
+[[bench]]
+name = "integration_interpolation_benchmarks"
+harness = false
+
+[[bench]]
+name = "optimized_interpolation_benchmarks"
+harness = false
+
+[[bench]]
+name = "strategy_selection_benchmarks"
+harness = false
+
+[[bench]]
+name = "new_api_benchmarks"
+harness = false
+
+[[bench]]
+name = "cache_performance_benchmarks"
+harness = false
+
+[[bench]]
+name = "downsample_range"
+harness = false
+
+[[bench]]
+name = "backup_cost"
+harness = false
+

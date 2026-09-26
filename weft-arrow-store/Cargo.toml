@@ -1,11 +1,17 @@
 [package]
 name = "weft-arrow-store"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+authors.workspace = true
 license.workspace = true
 repository.workspace = true
-authors.workspace = true
-version = "0.1.0"
-edition = "2021"
-description = "Bridge: read a stored WeftDB aspect range straight into an Arrow RecordBatch — the home crate that may depend on both `database` and `weft-arrow` so neither heavy dependency reaches the lean hot-path core (hard constraints #2/#3)."
+homepage.workspace = true
+readme = "README.md"
+description = "Read a stored WeftDB aspect range straight into an Apache Arrow RecordBatch."
+keywords = ["arrow", "timeseries", "columnar", "weftdb", "parquet"]
+categories = ["database", "encoding"]
+
 
 [lib]
 name = "weft_arrow_store"
@@ -15,7 +21,7 @@ path = "src/lib.rs"
 anyhow = { workspace = true }
 arrow-array = { workspace = true }
 bigdecimal = { workspace = true }
-database = { path = "../database" }  # Reference the local workspace member directly
+weftdb = { workspace = true }  # Reference the local workspace member directly
 weft-arrow = { workspace = true }
 weft-physical-type = { workspace = true }
 

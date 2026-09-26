@@ -1172,7 +1172,7 @@ const FIRE_ALPHA_MAX: i64 = 1 << FIRE_SHIFT;
 ///
 /// FIRE generalizes delta-of-delta: instead of the fixed second-difference predictor
 /// `x[i-1] + (x[i-1] - x[i-2])`, it predicts `x[i-1] + alpha·(x[i-1] - x[i-2])` with a learned
-/// fixed-point coefficient `alpha` ([`FIRE_SHIFT`]-scaled), adapted online by a sign-sign LMS
+/// fixed-point coefficient `alpha` (`FIRE_SHIFT`-scaled), adapted online by a sign-sign LMS
 /// step (`alpha += sign(err)·sign(prev_delta)`, clamped to `[0, 2^FIRE_SHIFT]`). This tracks
 /// the *fractional* slope a mean-reverting or damped series wants — where delta-of-delta
 /// (`alpha = 1`) over-predicts and a plain delta (`alpha = 0`) under-predicts — so residuals

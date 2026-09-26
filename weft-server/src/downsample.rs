@@ -181,7 +181,7 @@ fn run_downsample(points: &[Point], start: DateTime<Utc>, end: DateTime<Utc>, re
 /// at the API boundary and derives the reported counts. Shared by the compute
 /// endpoints (which reduce a request-supplied series) and the stored-range
 /// endpoint (which reduces persisted segments via
-/// [`database::SegmentStore::downsample_range`]), so both envelopes are identical
+/// [`weftdb::SegmentStore::downsample_range`]), so both envelopes are identical
 /// by construction and cannot drift.
 pub(crate) fn buckets_to_response(buckets: Vec<weft_reduce::Bucket>, resolution: Resolution, aggregations: &[Aggregation]) -> DownsampleResponse {
 	// Every in-window point lands in exactly one bucket, so the bucket counts sum to
