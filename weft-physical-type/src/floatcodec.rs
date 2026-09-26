@@ -364,9 +364,9 @@ const CHIMP128_THRESHOLD: u32 = 6 + PREVIOUS_VALUES_LOG2;
 /// window, the roadmap's next f64 slice above single-predecessor [`chimp_f64_encode`]).
 ///
 /// Where Gorilla and depth-1 Chimp XOR each value only against its immediate predecessor,
-/// Chimp128 keeps a ring of the previous [`PREVIOUS_VALUES`] samples and a lookup table keyed
+/// Chimp128 keeps a ring of the previous `PREVIOUS_VALUES` samples and a lookup table keyed
 /// on the low `CHIMP128_THRESHOLD + 1` bits → the ring index of the most recent value with that
-/// low-bit pattern. When that reference's XOR clears [`CHIMP128_THRESHOLD`] trailing zeros the
+/// low-bit pattern. When that reference's XOR clears `CHIMP128_THRESHOLD` trailing zeros the
 /// value compresses against it (naming the slot in `log2(128) = 7` bits); otherwise it falls
 /// back to the immediate predecessor. This is the win the single-predecessor codecs cannot
 /// reach: a signal that oscillates over a small set of levels XORs each sample against the
@@ -554,7 +554,7 @@ fn elf_restore(x: f64, p: f64) -> f64 {
 /// bits than the decimal needs, and those low bits are noise that wrecks XOR compression. This
 /// codec shares one **decimal grid** across the column — `alpha`, the maximum fractional-digit
 /// count over all values — and for each value zeroes the largest run of low mantissa bits whose
-/// result still rounds back to the original ([`elf_restore`]). The erased stream is then handed
+/// result still rounds back to the original (`elf_restore`). The erased stream is then handed
 /// to the [`chimp128_f64_encode`] backend; the header is a single `alpha` byte, so the metadata
 /// overhead is one byte per column (not per value).
 ///
@@ -609,7 +609,7 @@ pub fn elf_f64_encode(values: &[f64]) -> Option<Vec<u8>> {
 /// Reconstruct `count` `f64` values from an [`elf_f64_encode`] buffer.
 ///
 /// Bit-exact for every value the encoder accepted (the erasing loop verified each against
-/// [`elf_restore`]). A `count` of `0` yields an empty vector; a truncated buffer decodes
+/// `elf_restore`). A `count` of `0` yields an empty vector; a truncated buffer decodes
 /// trailing values as if the missing bits were zero rather than panicking.
 #[must_use]
 pub fn elf_f64_decode(bytes: &[u8], count: usize) -> Vec<f64> {

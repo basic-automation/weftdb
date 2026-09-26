@@ -2,8 +2,11 @@
 
 **The time-series database for data that wasn't sampled on a clean grid.**
 
-![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
-![Rust](https://img.shields.io/badge/Rust-nightly-orange.svg)
+[![crates.io](https://img.shields.io/crates/v/weftdb.svg)](https://crates.io/crates/weftdb)
+[![docs.rs](https://img.shields.io/docsrs/weftdb)](https://docs.rs/weftdb)
+[![CI](https://github.com/basic-automation/weftdb/actions/workflows/ci.yml/badge.svg)](https://github.com/basic-automation/weftdb/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Rust](https://img.shields.io/badge/Rust-1.95%2B-orange.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue.svg)
 ![Status](https://img.shields.io/badge/status-pre--beta-orange.svg)
 
@@ -66,16 +69,17 @@ on your hardware. Where WeftDB doesn't win, this README says so.
 
 ## Quickstart
 
-**Prerequisites:** Rust **nightly** (the `database` crate uses
-`#![feature(stmt_expr_attributes)]` and `splimes` targets the 2024 edition). A GPU
-with a `wgpu` backend (Vulkan / Metal / DX12) is optional — without one the engine
-falls back to SIMD/parallel CPU automatically.
+**Prerequisites:** Rust **1.95 or newer** on stable. A GPU with a `wgpu` backend
+(Vulkan / Metal / DX12) is optional — without one the engine falls back to
+SIMD/parallel CPU automatically.
 
 ```bash
-rustup toolchain install nightly
-rustup override set nightly        # run inside the repo
 cargo build --release
 ```
+
+Prefer not to build from source? Pre-built `weft-server`, `weft-tui` and `weft-bench`
+binaries for Linux, macOS and Windows are attached to every
+[GitHub release](https://github.com/basic-automation/weftdb/releases).
 
 ### 1. Start the server
 
@@ -478,7 +482,7 @@ only** — the `.weftseg` measurement frames are not part of a snapshot.
   snapshot you took by hand with `?label=nightly` is never a prune candidate, and
   it runs only after a *successful* snapshot, so a run of failures cannot prune
   your last good backup away. Both paths record `weft_backup_*` metrics.
-- **Restore, with a drill.** `database::restore_control_plane(backup_dir, root)`
+- **Restore, with a drill.** `weftdb::restore_control_plane(backup_dir, root)`
   puts a snapshot back into a store root and verifies each restored file **at its
   destination** — what matters is that the file the store will open actually
   reads. It refuses an incomplete backup directory and refuses to overwrite an
@@ -501,8 +505,8 @@ WeftDB is configured primarily through environment variables:
 
 | Variable | Used by | Purpose | Default |
 |----------|---------|---------|---------|
-| `WEFT_DATA_DIR` | `database`, `weft-tui` | Root directory for database files **and** the TUI log (`weft-tui.log`). | portable per-user default (see below) |
-| `TEST_DATA_DIR` | `database` | Highest-priority override for the database root (used by the test suite). | unset |
+| `WEFT_DATA_DIR` | `weftdb`, `weft-tui` | Root directory for database files **and** the TUI log (`weft-tui.log`). | portable per-user default (see below) |
+| `TEST_DATA_DIR` | `weftdb` | Highest-priority override for the database root (used by the test suite). | unset |
 | `WEFT_SERVER_ADDR` | `weft-server` | HTTP bind address. | `127.0.0.1:8080` |
 | `WEFT_SEGMENT_STORE_ROOT` | `weft-server` | Root of the Storage v2 segment store; enables the `/storage` endpoints. | unset (storage endpoints answer `503`) |
 | `WEFT_RECONCILE_INTERVAL_SECS` | `weft-server` | Background reconcile daemon sweep interval in seconds; `0`/unset disables it. | unset (disabled) |
@@ -515,7 +519,7 @@ WeftDB is configured primarily through environment variables:
 | `WEFT_BACKUP_DIR` | `weft-server` | Directory each control-plane backup is written under — shared by the manual `POST …/storage/backup` endpoint and the background backup daemon, so hand-taken and automatic snapshots live together. | `<store_root>/backups` |
 | `WEFT_BACKUP_INTERVAL_SECS` | `weft-server` | Background control-plane backup daemon interval in seconds; `0`/unset disables it. Each tick writes a verified snapshot into a fresh `backup-<unix_millis>` directory, using the concurrent-write-safe `snapshot` verification (it backs up a live store). Needs a segment store configured. | unset (disabled) |
 | `WEFT_BACKUP_KEEP` | `weft-server` | How many **daemon-generated** snapshots to retain; after each successful backup the oldest `backup-<digits>` directories beyond this many are removed. Only generated names are ever pruned — a `?label=`-named snapshot you took by hand is never a candidate. | unset (retain everything) |
-| `BTC_TEST_MAX_ROWS` / `BTC_TEST_FULL` | `database` (tests) | Row cap for the bounded, hermetic default run of `test_create_btc_1min_database` (into a temp data dir), or `BTC_TEST_FULL=1` for the historical whole-corpus load into the shared data dir. | `5000` / unset |
+| `BTC_TEST_MAX_ROWS` / `BTC_TEST_FULL` | `weftdb` (tests) | Row cap for the bounded, hermetic default run of `test_create_btc_1min_database` (into a temp data dir), or `BTC_TEST_FULL=1` for the historical whole-corpus load into the shared data dir. | `5000` / unset |
 | `WEFT_SEGMENT_CHECKPOINT_STRIDE` | `weft-server` | Rows between entries of the sealed **timestamp checkpoint index** — trades a little size for much faster point lookups on **sorted, irregular** columns (~3.45× single-block; see the checkpointed-frames feature above). Applies only where it pays: sorted + irregular + at least `WEFT_SEGMENT_CHECKPOINT_MIN_ROWS` rows. ~1024 is the sweet spot (stride barely moves speed but does move size). | unset (no index; frames byte-for-byte as before) |
 | `WEFT_SEGMENT_CHECKPOINT_MIN_ROWS` | `weft-server` | Row floor below which a segment is never checkpointed (a small column decodes trivially, so an index would be pure cost). | `8192` |
 | `WEFT_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD` | `weft-server` | Ceiling on the timestamp-codec override a checkpointed seal will accept (`blocked / best` bytes; `1.0` = only when free). A checkpointed frame must use the range-decodable per-block codec, which is ~free where that codec already wins but **~3.5× on a Gorilla-shaped and ~14× on an RLE-shaped column** — this refuses those seals rather than silently bloating them. | `1.25` |
@@ -537,8 +541,8 @@ The database root directory is resolved in this order:
 
 No paths are hard-coded: data lands in a writable, machine-independent location out
 of the box, and setting `WEFT_DATA_DIR` relocates both the databases and the TUI log
-together. The resolution functions are exported as `database::data_dir()` (resolved)
-and `database::default_data_dir()` (the raw default).
+together. The resolution functions are exported as `weftdb::data_dir()` (resolved)
+and `weftdb::default_data_dir()` (the raw default).
 
 The `splimes` crate also exposes a build feature:
 
@@ -550,13 +554,39 @@ The `splimes` crate also exposes a build feature:
 
 ## Rust library
 
-WeftDB can be used directly as a set of libraries. The examples below are illustrative —
-run `cargo doc --open` for the authoritative, version-matched API.
+WeftDB can be used directly as a set of libraries, published on
+[crates.io](https://crates.io/crates/weftdb):
+
+```toml
+[dependencies]
+weftdb = "0.1"              # the database: capture, query, interpolate
+splimes = "0.1"             # the interpolation engine on its own
+weft-orchestration = "0.1"  # the analytics pipeline
+```
+
+| Crate | Depend on it when you want |
+|-------|----------------------------|
+| [`weftdb`](https://crates.io/crates/weftdb) | The database — capture measurements, query and interpolate stored series. |
+| [`splimes`](https://crates.io/crates/splimes) | Spline interpolation over irregular series, standalone. No database. |
+| [`weft-orchestration`](https://crates.io/crates/weft-orchestration) | The batching → patterns → events → correlation → signals pipeline. |
+| [`weft-physical-type`](https://crates.io/crates/weft-physical-type) | Declared numeric encodings and the `.weftseg` columnar format. |
+| [`weft-reduce`](https://crates.io/crates/weft-reduce) | Downsampling reductions over an epoch-aligned bucket grid. |
+| [`weft-line-protocol`](https://crates.io/crates/weft-line-protocol) | To parse InfluxDB Line Protocol without an InfluxDB client. |
+| [`weft-arrow`](https://crates.io/crates/weft-arrow) | Segments as Apache Arrow `RecordBatch`, Arrow IPC or Parquet. |
+| [`weft-arrow-store`](https://crates.io/crates/weft-arrow-store) | A stored range read straight into an Arrow `RecordBatch`. |
+
+`weft-server`, `weft-tui` and `weft-bench` are binaries rather than libraries, so they
+are not published to crates.io — take them from the
+[release binaries](https://github.com/basic-automation/weftdb/releases) or build them
+from this repository.
+
+The examples below are illustrative — run `cargo doc --open` for the authoritative,
+version-matched API.
 
 ### Capture Measurements
 
 ```rust,ignore
-use database::{Database, DatasetId, InputMeasurement, Resolution};
+use weftdb::{Database, DatasetId, InputMeasurement, Resolution};
 use bigdecimal::BigDecimal;
 use std::str::FromStr;
 use chrono::{TimeZone, Utc};
@@ -579,7 +609,7 @@ async fn main() -> anyhow::Result<()> {
 ### Query & Interpolate
 
 ```rust,ignore
-use database::{Database, Resolution, Spline};
+use weftdb::{Database, Resolution, Spline};
 use chrono::{TimeZone, Utc};
 use futures::StreamExt;
 
@@ -599,8 +629,8 @@ while let Some(result) = stream.next().await {
 ### Run an Analytics Pipeline
 
 ```rust,ignore
-use database_orchestration::Pipeline;
-use database::Database;
+use weft_orchestration::Pipeline;
+use weftdb::Database;
 use splimes::Spline;
 
 let database = Database::existing("PlantTelemetry").await?;
@@ -662,7 +692,7 @@ The parts below are reference material — you do not need them to use WeftDB.
                │ uses                     │ uses              │ columnar I/O
                ▼                          ▼                   ▼
 ┌──────────────────────────────┐   ┌────────────────────────────────────┐
-│    database_orchestration    │   │   weft-arrow / weft-arrow-store      │
+│    weft-orchestration    │   │   weft-arrow / weft-arrow-store      │
 │  batch → patterns → events   │   │   Arrow IPC + Parquet interchange  │
 │  → correlations → signals    │   └──────────────────┬─────────────────┘
 └───────────────┬──────────────┘                      │
@@ -924,7 +954,7 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   `StorageEstimate.estimated_value_bytes`) as the uncompressed baseline, so
   `realized / logical` reads directly as the storage compression ratio.
 
-#### Segment store (`.weftseg` + `database::SegmentStore`)
+#### Segment store (`.weftseg` + `weftdb::SegmentStore`)
 
 - **Sealed, checksummed segments** — a `Segment` binds a typed value column and a
   delta-of-delta timestamp column with min/max timestamp/value stats, row/null
@@ -1040,13 +1070,13 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   directions: export a stored range, or ingest a Parquet file into a declared
   aspect under the full no-silent-downcast guarantee.
 - **Lean core preserved** — the `arrow-*`/`parquet` dependency tree lives only in
-  these leaf crates; `splimes`/`database`/`weft-physical-type` stay arrow-free.
+  these leaf crates; `splimes`/`weftdb`/`weft-physical-type` stay arrow-free.
 
 ---
 
 ### The Analytics Pipeline
 
-The `database_orchestration` crate provides a fluent **`Pipeline`** API. Each aspect
+The `weft-orchestration` crate provides a fluent **`Pipeline`** API. Each aspect
 has exactly one pipeline, persisted to its `pipeline.db`, so runs are incremental
 and conflict-free. A pipeline can host multiple dictionaries and multiple detectors.
 
@@ -1066,7 +1096,7 @@ and conflict-free. A pipeline can host multiple dictionaries and multiple detect
                                           query_probability(event, time)
 ```
 
-**Built-in event detectors** (in `database_orchestration::detectors`):
+**Built-in event detectors** (in `weft_orchestration::detectors`):
 
 | Detector | Description |
 |----------|-------------|
@@ -1085,7 +1115,7 @@ run pipelines across many aspects in parallel with `run_all_pipelines` /
 ### Dataset Compression
 
 Long-running deployments accumulate huge volumes of raw measurements. The
-compression module (`database::compression`) reduces storage while preserving the
+compression module (`weftdb::compression`) reduces storage while preserving the
 shape of the data, configured per-aspect via `CompressionConfig`:
 
 - **Time-based** — recent data within a "pure" window (e.g. the last 7 years) stays
@@ -1100,7 +1130,7 @@ compressed range marks a **dirty region** for targeted re-compression. Progress 
 reported live (phase, tier, aggressiveness, time range) — surfaced in the TUI.
 
 ```rust,ignore
-use database::{CompressionConfig, TimeBasedCompressionConfig};
+use weftdb::{CompressionConfig, TimeBasedCompressionConfig};
 
 let config = CompressionConfig::time_based(
     TimeBasedCompressionConfig::default_seven_years()
@@ -1201,7 +1231,7 @@ InfluxDB 3, QuestDB, TimescaleDB) are the next tracked step in
 ## Development
 
 ```bash
-# Run the full test suite (use nightly):
+# Run the full test suite:
 cargo test
 
 # Skip long-running tests:
@@ -1218,14 +1248,22 @@ suites alongside the Weft-Bench harness (see
 | Crate | Benchmarks |
 |-------|------------|
 | `splimes` | `interpolation`, `gpu_prewarm`, `gpu_cold`, `should_use_gpu_analysis`, `gpu_optimization_bench` |
-| `database` | `interpolation_benchmarks`, `integration_interpolation_benchmarks`, `optimized_interpolation_benchmarks`, `strategy_selection_benchmarks`, `new_api_benchmarks`, `cache_performance_benchmarks` |
+| `weftdb` | `interpolation_benchmarks`, `integration_interpolation_benchmarks`, `optimized_interpolation_benchmarks`, `strategy_selection_benchmarks`, `new_api_benchmarks`, `cache_performance_benchmarks` |
 
 ```bash
 cargo bench -p splimes
-cargo bench -p database --bench cache_performance_benchmarks
+cargo bench -p weftdb --bench cache_performance_benchmarks
 ```
 
 HTML reports are generated under `target/criterion/`.
+
+**Formatting** uses nightly-only rustfmt options (`imports_granularity`,
+`group_imports`), so the style gate runs on nightly even though the crates
+themselves build on stable:
+
+```bash
+cargo +nightly fmt --all
+```
 
 ---
 
@@ -1239,20 +1277,21 @@ WeftDB/
 │   ├── src/gpu/                # wgpu compute pipeline, shaders, buffer pool
 │   ├── src/optimizations/      # CPU / parallel / fast-path strategies
 │   └── src/helpers/            # strategy selection, target-time generation
-├── database/                   # time-series database (Turso/libSQL control plane + segment store)
+├── weftdb/                     # time-series database (Turso/libSQL control plane + segment store)
 │   └── src/types/
 │       ├── database/           # connection, config, inputs, outputs, pipeline
 │       ├── compression/        # tiered dataset compression
 │       ├── batches/            # batching & analysis
 │       └── …                   # patterns, events, correlations, signals, …
-├── database_orchestration/     # pipeline orchestration & event detectors
-├── weft-physical-type/          # physical encodings, schemas, timestamp codecs, .weftseg
-├── weft-arrow/                  # Arrow/Parquet interchange for segments
-├── weft-arrow-store/            # Arrow/Parquet bridge over the segment store
-├── weft-line-protocol/          # InfluxDB Line Protocol parser (shared dialect)
-├── weft-server/                 # axum HTTP API server
-├── weft-bench/                  # benchmark harness (adapters, profiles, reports)
-└── weft-tui/                    # terminal UI binary
+├── weft-orchestration/         # pipeline orchestration & event detectors
+├── weft-physical-type/         # physical encodings, schemas, timestamp codecs, .weftseg
+├── weft-arrow/                 # Arrow/Parquet interchange for segments
+├── weft-arrow-store/           # Arrow/Parquet bridge over the segment store
+├── weft-line-protocol/         # InfluxDB Line Protocol parser (shared dialect)
+├── weft-reduce/                # downsampling reductions over a bucket grid
+├── weft-server/                # axum HTTP API server
+├── weft-bench/                 # benchmark harness (adapters, profiles, reports)
+└── weft-tui/                   # terminal UI binary
 ```
 
 The complete work queue and design constraints live in
@@ -1268,8 +1307,8 @@ server and an interactive application:
 | Crate | Role |
 |-------|------|
 | [`splimes`](splimes) | Spline interpolation engine — Linear / Quadratic / Cubic / Polynomial methods with automatic GPU, parallel, SIMD, and CPU strategy selection. |
-| [`database`](database) | Time-series database: [Turso](https://turso.tech/) (libSQL) **control plane** (catalog, metadata, segment index; MVCC concurrent writes) + WeftDB's own typed columnar **`.weftseg` segment store** on the measurement hot path, plus the pattern-recognition types and tiered dataset compression. |
-| [`database_orchestration`](database_orchestration) | High-level pipeline that chains batching → pattern extraction → event detection → correlation → signal generation, with built-in detectors and parallel execution. |
+| [`weftdb`](weftdb) | Time-series database: [Turso](https://turso.tech/) (libSQL) **control plane** (catalog, metadata, segment index; MVCC concurrent writes) + WeftDB's own typed columnar **`.weftseg` segment store** on the measurement hot path, plus the pattern-recognition types and tiered dataset compression. |
+| [`weft-orchestration`](weft-orchestration) | High-level pipeline that chains batching → pattern extraction → event detection → correlation → signal generation, with built-in detectors and parallel execution. |
 | [`weft-physical-type`](weft-physical-type) | Vendor-neutral physical type system — schema-declared numeric encodings with explicit exactness, timestamp codecs, and the `.weftseg` columnar segment format (single-block and paged). |
 | [`weft-arrow`](weft-arrow) / [`weft-arrow-store`](weft-arrow-store) | Apache Arrow / Parquet interchange for sealed segments and stored reads, kept in leaf crates so the `arrow-*` dependency tree never reaches the hot-path core. |
 | [`weft-line-protocol`](weft-line-protocol) | Dependency-free InfluxDB Line Protocol parser shared by the server and the benchmark harness. |

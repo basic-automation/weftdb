@@ -32,7 +32,7 @@
 //!   the `BigDecimal` the encoding represents.
 //! - [`PhysicalType::profile`] — declarative per-encoding metadata
 //!   ([`PhysicalProfile`]: storage width, lossless/hot-path eligibility).
-//! - [`column`] — batch [`encode_column`] of a whole column under one encoding,
+//! - [`column`](mod@column) — batch [`encode_column`] of a whole column under one encoding,
 //!   aggregating exactness and estimating storage bytes (Storage-v2 / bytes-per-
 //!   point prep).
 //! - [`timestamp`] — Phase 4.2 integer-epoch timestamp codecs: lossless

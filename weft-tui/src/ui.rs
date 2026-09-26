@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc, Datelike, Timelike};
-use database::database::traits::AspectStructure;
+use weftdb::database::traits::AspectStructure;
 use ratatui::{
 	layout::{Constraint, Direction, Layout, Rect}, style::{Color, Modifier, Style}, widgets::{Block, Borders, Chart, Dataset, GraphType, List, ListItem, Paragraph}, Frame
 };
