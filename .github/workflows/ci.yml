@@ -39,7 +39,14 @@ jobs:
       # Gated on the categories that catch defects. `style`/`pedantic`/`nursery`
       # have a large pre-existing backlog in this workspace; they are reported by
       # running clippy locally, not enforced here, so the gate stays honest.
+      #
+      # RUSTFLAGS is cleared for this job on purpose: the workflow-level `-D warnings`
+      # reaches clippy-driver as a rustc flag and would deny *every* clippy lint,
+      # silently turning the category gate below into "deny everything". rustc warnings
+      # are still denied by the build/test and msrv jobs.
       - run: cargo clippy --workspace --all-targets -- -D clippy::correctness -D clippy::suspicious -D clippy::perf
+        env:
+          RUSTFLAGS: ""
 
   # The MSRV is a published promise in Cargo.toml (rust-version); prove it still holds.
   msrv:
