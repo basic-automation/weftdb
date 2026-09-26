@@ -34,13 +34,15 @@ use axum::{
 };
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
-use weftdb::VerifyMode;
-use weft_line_protocol::TimestampPrecision;
-use weft_physical_type::{first_order_violation, AspectSchema, PhysicalType, SegmentDescriptor, TimeUnit};
 use serde::{Deserialize, Serialize};
 use tracing::Instrument as _;
+use weft_line_protocol::TimestampPrecision;
+use weft_physical_type::{first_order_violation, AspectSchema, PhysicalType, SegmentDescriptor, TimeUnit};
+use weftdb::VerifyMode;
 
-use crate::{state::AppState, storage::{AspectInfo, StorageError}};
+use crate::{
+	state::AppState, storage::{AspectInfo, StorageError}
+};
 
 /// Parse a [`PhysicalType`] from its stable wire token (the inverse of
 /// [`PhysicalType::name`]) plus an optional `scale`.
@@ -271,9 +273,9 @@ async fn reconcile_aspect_inner(store: &weftdb::SegmentStore, aspect: &str, thre
 		// overlaps / hot/cold: record a pass only when it actually changed something
 		// (matches the background daemon / store-wide sweep semantics).
 		("threshold", true, n) => metrics.record_reconcile_pass(u64::try_from(n).unwrap_or(u64::MAX)),
-		("threshold", false, _) => {},
+		("threshold", false, _) => {}
 		(_, _, n) if n > 0 => metrics.record_reconcile_pass(u64::try_from(n).unwrap_or(u64::MAX)),
-		(_, _, _) => {},
+		(_, _, _) => {}
 	}
 	let stats = store.aspect_stats(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?;
 	Ok((StatusCode::OK, Json(ReconcileResponse { aspect: aspect.to_string(), mode, triggered, reconciled, cold_reconciled, hot_reconciled, unsorted_segments: stats.unsorted_segments, overlapping_segments: stats.overlapping_segments })).into_response())
@@ -549,11 +551,7 @@ pub async fn restore_drill(State(state): State<AppState>, Query(params): Query<R
 	let _ = tokio::fs::remove_dir_all(&target).await;
 	let report = outcome.map_err(|err| StorageError::Internal(format!("restore drill for `{}` FAILED: {err:#}", params.label)))?;
 
-	let databases = report
-		.restored
-		.iter()
-		.map(|r| BackupDbReport { name: r.dest.file_name().map_or_else(|| "?".to_string(), |n| n.to_string_lossy().into_owned()), tables: r.tables, rows: r.rows, bytes: r.bytes })
-		.collect();
+	let databases = report.restored.iter().map(|r| BackupDbReport { name: r.dest.file_name().map_or_else(|| "?".to_string(), |n| n.to_string_lossy().into_owned()), tables: r.tables, rows: r.rows, bytes: r.bytes }).collect();
 	let response = RestoreDrillResponse { label: params.label, databases, total_rows: report.total_rows(), total_bytes: report.total_bytes(), restorable: true };
 	Ok((StatusCode::OK, Json(response)).into_response())
 }
@@ -675,10 +673,7 @@ pub async fn backup_store(State(state): State<AppState>, Query(params): Query<Ba
 	let backup = store.backup_control_plane_with_verify(&dest, mode).await.map_err(|err| StorageError::Internal(err.to_string()))?;
 	drop(store);
 	metrics.record_backup(backup.total_bytes());
-	let databases = [("segment_index.db", &backup.segment_index), ("metadata.db", &backup.metadata), ("aspect_catalog.db", &backup.aspect_catalog), ("catalog.db", &backup.registry)]
-		.into_iter()
-		.map(|(name, report)| BackupDbReport { name: name.to_string(), tables: report.tables, rows: report.rows, bytes: report.bytes })
-		.collect();
+	let databases = [("segment_index.db", &backup.segment_index), ("metadata.db", &backup.metadata), ("aspect_catalog.db", &backup.aspect_catalog), ("catalog.db", &backup.registry)].into_iter().map(|(name, report)| BackupDbReport { name: name.to_string(), tables: report.tables, rows: report.rows, bytes: report.bytes }).collect();
 	let response = BackupResponse { dir: backup.dir.display().to_string(), databases, total_rows: backup.total_rows(), total_bytes: backup.total_bytes(), verify: verify_token(mode) };
 	Ok((StatusCode::OK, Json(response)).into_response())
 }
@@ -794,7 +789,10 @@ fn enforce_order_if_required(require_sorted: bool, timestamps: &[i64]) -> Result
 pub async fn ingest_points(State(state): State<AppState>, Path(aspect): Path<String>, Json(request): Json<IngestRequest>) -> Result<Response, StorageError> {
 	let metrics = state.metrics().clone();
 	metrics.record_ingest_request();
-	let store = state.store().cloned().ok_or_else(|| { metrics.record_ingest_error(); StorageError::Unconfigured })?;
+	let store = state.store().cloned().ok_or_else(|| {
+		metrics.record_ingest_error();
+		StorageError::Unconfigured
+	})?;
 	drop(state);
 	// Time the seal path (not the store-unconfigured fast-fail above): this is the
 	// ingest side of the north-star "predictable p95/p99 under ingest + query".
@@ -852,17 +850,7 @@ async fn ingest_points_inner(store: &weftdb::SegmentStore, metrics: &crate::metr
 	// value parsing.
 	let descriptor = seal_batch(store, aspect, &schema, &timestamps, &values, any_null, request.rows_per_page).instrument(tracing::info_span!("storage.ingest.seal", point_count, any_null, format = "json")).await.map_err(|err| classify_seal_error(&err))?;
 	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
-	let response = IngestResponse {
-		aspect: aspect.to_string(),
-		segment_id: descriptor.id,
-		format_version: descriptor.format_version,
-		row_count: descriptor.row_count,
-		null_count: descriptor.null_count,
-		byte_len: descriptor.byte_len,
-		min_ts: descriptor.min_ts,
-		max_ts: descriptor.max_ts,
-		time_sorted: descriptor.time_sorted,
-	};
+	let response = IngestResponse { aspect: aspect.to_string(), segment_id: descriptor.id, format_version: descriptor.format_version, row_count: descriptor.row_count, null_count: descriptor.null_count, byte_len: descriptor.byte_len, min_ts: descriptor.min_ts, max_ts: descriptor.max_ts, time_sorted: descriptor.time_sorted };
 	Ok((StatusCode::CREATED, Json(response)).into_response())
 }
 
@@ -972,7 +960,10 @@ fn parse_csv_points(body: &str) -> Result<ParsedCsv, StorageError> {
 pub async fn ingest_csv(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<CsvIngestParams>, body: String) -> Result<Response, StorageError> {
 	let metrics = state.metrics().clone();
 	metrics.record_ingest_request();
-	let store = state.store().cloned().ok_or_else(|| { metrics.record_ingest_error(); StorageError::Unconfigured })?;
+	let store = state.store().cloned().ok_or_else(|| {
+		metrics.record_ingest_error();
+		StorageError::Unconfigured
+	})?;
 	drop(state);
 	let start = std::time::Instant::now();
 	let result = ingest_csv_inner(&store, &metrics, &aspect, params.rows_per_page, params.require_sorted, &body).await;
@@ -998,17 +989,7 @@ async fn ingest_csv_inner(store: &weftdb::SegmentStore, metrics: &crate::metrics
 	let point_count = timestamps.len();
 	let descriptor = seal_batch(store, aspect, &schema, &timestamps, &values, any_null, rows_per_page).instrument(tracing::info_span!("storage.ingest.seal", point_count, any_null, format = "csv")).await.map_err(|err| classify_seal_error(&err))?;
 	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
-	let response = IngestResponse {
-		aspect: aspect.to_string(),
-		segment_id: descriptor.id,
-		format_version: descriptor.format_version,
-		row_count: descriptor.row_count,
-		null_count: descriptor.null_count,
-		byte_len: descriptor.byte_len,
-		min_ts: descriptor.min_ts,
-		max_ts: descriptor.max_ts,
-		time_sorted: descriptor.time_sorted,
-	};
+	let response = IngestResponse { aspect: aspect.to_string(), segment_id: descriptor.id, format_version: descriptor.format_version, row_count: descriptor.row_count, null_count: descriptor.null_count, byte_len: descriptor.byte_len, min_ts: descriptor.min_ts, max_ts: descriptor.max_ts, time_sorted: descriptor.time_sorted };
 	Ok((StatusCode::CREATED, Json(response)).into_response())
 }
 
@@ -1090,7 +1071,10 @@ const fn epoch_in_unit(instant: DateTime<Utc>, unit: TimeUnit) -> Option<i64> {
 pub async fn ingest_ilp(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<IlpIngestParams>, body: String) -> Result<Response, StorageError> {
 	let metrics = state.metrics().clone();
 	metrics.record_ingest_request();
-	let store = state.store().cloned().ok_or_else(|| { metrics.record_ingest_error(); StorageError::Unconfigured })?;
+	let store = state.store().cloned().ok_or_else(|| {
+		metrics.record_ingest_error();
+		StorageError::Unconfigured
+	})?;
 	drop(state);
 	let start = std::time::Instant::now();
 	let result = ingest_ilp_inner(&store, &metrics, &aspect, &params, &body).await;
@@ -1140,17 +1124,7 @@ async fn ingest_ilp_inner(store: &weftdb::SegmentStore, metrics: &crate::metrics
 	}
 	.map_err(|err| classify_seal_error(&err))?;
 	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
-	let response = IngestResponse {
-		aspect: aspect.to_string(),
-		segment_id: descriptor.id,
-		format_version: descriptor.format_version,
-		row_count: descriptor.row_count,
-		null_count: descriptor.null_count,
-		byte_len: descriptor.byte_len,
-		min_ts: descriptor.min_ts,
-		max_ts: descriptor.max_ts,
-		time_sorted: descriptor.time_sorted,
-	};
+	let response = IngestResponse { aspect: aspect.to_string(), segment_id: descriptor.id, format_version: descriptor.format_version, row_count: descriptor.row_count, null_count: descriptor.null_count, byte_len: descriptor.byte_len, min_ts: descriptor.min_ts, max_ts: descriptor.max_ts, time_sorted: descriptor.time_sorted };
 	Ok((StatusCode::CREATED, Json(response)).into_response())
 }
 
@@ -1161,9 +1135,9 @@ mod tests {
 	use axum::{
 		body::Body, http::{Request, StatusCode}
 	};
-	use weftdb::SegmentStore;
 	use tempfile::TempDir;
 	use tower::ServiceExt;
+	use weftdb::SegmentStore;
 
 	use crate::{app_with_state, AppState};
 

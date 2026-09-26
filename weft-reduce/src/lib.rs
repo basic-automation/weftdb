@@ -25,9 +25,9 @@ pub mod sketch;
 use std::collections::BTreeMap;
 
 use bigdecimal::BigDecimal;
-pub use sketch::{DdSketch, SketchError};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+pub use sketch::{DdSketch, SketchError};
 use splimes::{Point, Resolution, SECONDS_IN_DAY, SECONDS_IN_HOUR, SECONDS_IN_MINUTE, SECONDS_IN_MONTH, SECONDS_IN_WEEK, SECONDS_IN_YEAR};
 
 /// A per-bucket reduction over the values that fell in the bucket.
@@ -116,6 +116,14 @@ pub const SKETCH_ALPHA: f64 = 0.01;
 pub const SKETCH_MAX_BINS: usize = 2048;
 
 impl Aggregation {
+	/// Every reduction, in a stable order — the natural set for a full downsample. Kept
+	/// to the six *streaming* reductions (percentiles need the full bucket materialized,
+	/// so they are opt-in rather than part of the default full set).
+	pub const ALL: [Self; 6] = [Self::Min, Self::Max, Self::Avg, Self::Sum, Self::First, Self::Last];
+	/// The default reduction set (`min`/`max`/`avg`) applied when a caller requests
+	/// none explicitly — the classic downsample triple.
+	pub const DEFAULT: [Self; 3] = [Self::Min, Self::Max, Self::Avg];
+
 	/// The stable wire key this reduction is reported under.
 	#[must_use]
 	pub const fn as_str(self) -> &'static str {
@@ -222,15 +230,6 @@ impl Aggregation {
 	pub const fn is_sidecar_materializable(self) -> bool {
 		!self.needs_full_bucket()
 	}
-
-	/// Every reduction, in a stable order — the natural set for a full downsample. Kept
-	/// to the six *streaming* reductions (percentiles need the full bucket materialized,
-	/// so they are opt-in rather than part of the default full set).
-	pub const ALL: [Self; 6] = [Self::Min, Self::Max, Self::Avg, Self::Sum, Self::First, Self::Last];
-
-	/// The default reduction set (`min`/`max`/`avg`) applied when a caller requests
-	/// none explicitly — the classic downsample triple.
-	pub const DEFAULT: [Self; 3] = [Self::Min, Self::Max, Self::Avg];
 }
 
 /// One emitted bucket of a reduction.
@@ -1008,21 +1007,7 @@ mod tests {
 	/// including the sketches (whose merge is exact) and the order-sensitive first/last.
 	#[test]
 	fn chunked_partials_merge_to_the_single_pass_result() {
-		let all = [
-			Aggregation::Min,
-			Aggregation::Max,
-			Aggregation::Avg,
-			Aggregation::Sum,
-			Aggregation::First,
-			Aggregation::Last,
-			Aggregation::P50,
-			Aggregation::P99,
-			Aggregation::Twa,
-			Aggregation::TwaLinear,
-			Aggregation::TwaBucketEnd,
-			Aggregation::SketchP50,
-			Aggregation::SketchP99,
-		];
+		let all = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::P50, Aggregation::P99, Aggregation::Twa, Aggregation::TwaLinear, Aggregation::TwaBucketEnd, Aggregation::SketchP50, Aggregation::SketchP99];
 		// 600 points spanning several hour-buckets, so chunks straddle bucket boundaries.
 		let points: Vec<Point> = (0..600).map(|i| pt(i64::from(i) * 30, &format!("{}.5", (i * 7) % 97))).collect();
 		let whole = reduce(&points, Resolution::Hours, None, None, &all).expect("reduces");
@@ -1047,16 +1032,7 @@ mod tests {
 	/// for re-decoding the segment, which is the whole point of materializing it at seal.
 	#[test]
 	fn serde_round_trip_preserves_merge_exactness() {
-		let all = [
-			Aggregation::Min,
-			Aggregation::Max,
-			Aggregation::Avg,
-			Aggregation::Sum,
-			Aggregation::First,
-			Aggregation::Last,
-			Aggregation::SketchP50,
-			Aggregation::SketchP99,
-		];
+		let all = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::SketchP50, Aggregation::SketchP99];
 		// Two "segments" straddling several hour-buckets; each is reduced, serialized, and
 		// only the reloaded partials are merged — the in-memory originals are never touched.
 		let points: Vec<Point> = (0..600).map(|i| pt(i64::from(i) * 30, &format!("{}.25", (i * 13) % 89))).collect();

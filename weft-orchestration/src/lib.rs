@@ -428,14 +428,14 @@ use std::{collections::HashMap, sync::LazyLock};
 use anyhow::Result;
 use bigdecimal::{BigDecimal, FromPrimitive, Zero};
 use chrono::Datelike;
-use weftdb::{
-	database::traits::{AspectStructure, DatabaseStructure, Inputs, Outputs}, AspectId, Database, DictionaryId, Resolution
-};
 use futures::{StreamExt, TryStreamExt};
 use rayon::prelude::*;
 use splimes::Spline;
 use tokio::sync::Mutex;
 pub use types::*;
+use weftdb::{
+	database::traits::{AspectStructure, DatabaseStructure, Inputs, Outputs}, AspectId, Database, DictionaryId, Resolution
+};
 
 pub mod batch_utils;
 pub mod detectors;
@@ -452,9 +452,9 @@ mod pattern_fix_test;
 // Re-export main Pipeline API
 // Re-export built-in detectors
 // Re-export compression types for convenience
-pub use weftdb::compression::{AggressivenessScaling, CompressionConfig, CompressionResult, CompressionSummary, SizeBasedCompressionConfig, TimeBasedCompressionConfig};
 pub use detectors::{detect_all_peaks, detect_all_valleys, detect_drawdown, detect_monthly_increase, detect_peaks, detect_threshold_crossing_down, detect_threshold_crossing_up, detect_valleys};
 pub use pipeline::{DetectorId, DictionaryConfig, EventDetector, EventDetectorFn, Pipeline, PipelineBuilder, PipelineRunConfig, ProbabilityResult};
+pub use weftdb::compression::{AggressivenessScaling, CompressionConfig, CompressionResult, CompressionSummary, SizeBasedCompressionConfig, TimeBasedCompressionConfig};
 
 /// Result of running a single pipeline.
 #[derive(Debug)]
@@ -1464,11 +1464,11 @@ mod tests {
 	use batch_utils::*;
 	use bigdecimal::{BigDecimal, FromPrimitive};
 	use chrono::{TimeZone, Utc};
-	use weftdb::{AspectId, Database, DatasetId, InputMeasurement, Resolution, data_dir};
 	use rand::Rng;
 	use serde_json::json;
 	use serial_test::serial;
 	use splimes::Spline;
+	use weftdb::{data_dir, AspectId, Database, DatasetId, InputMeasurement, Resolution};
 
 	use super::*;
 

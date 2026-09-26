@@ -377,17 +377,7 @@ async fn storage_ingest_parquet_inner(store: &weftdb::SegmentStore, metrics: &cr
 	// carrying the request's byte length and the sort-guard flag.
 	let descriptor = weft_arrow_store::ingest_parquet_into_aspect(store, aspect, body, rows_per_page, require_sorted).instrument(tracing::info_span!("storage.ingest.parquet", %aspect, byte_len = body.len(), require_sorted, format = "parquet")).await.map_err(|err| classify_ingest_error(&err))?;
 	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
-	let response = IngestResponse {
-		aspect: aspect.to_string(),
-		segment_id: descriptor.id,
-		format_version: descriptor.format_version,
-		row_count: descriptor.row_count,
-		null_count: descriptor.null_count,
-		byte_len: descriptor.byte_len,
-		min_ts: descriptor.min_ts,
-		max_ts: descriptor.max_ts,
-		time_sorted: descriptor.time_sorted,
-	};
+	let response = IngestResponse { aspect: aspect.to_string(), segment_id: descriptor.id, format_version: descriptor.format_version, row_count: descriptor.row_count, null_count: descriptor.null_count, byte_len: descriptor.byte_len, min_ts: descriptor.min_ts, max_ts: descriptor.max_ts, time_sorted: descriptor.time_sorted };
 	Ok((StatusCode::CREATED, Json(response)).into_response())
 }
 
@@ -558,7 +548,7 @@ fn resolve_pagination_with_cursor(offset: Option<usize>, limit: Option<usize>, t
 		Some(token) => {
 			let cursor_offset = decode_cursor(token).ok_or_else(|| StorageError::BadRequest(format!("`cursor` is not a valid token: {token:?}")))?;
 			Ok((cursor_offset, page_size, None))
-		},
+		}
 		None => Ok((offset, page_size, page)),
 	}
 }
@@ -1119,11 +1109,11 @@ mod tests {
 		body::Body, http::{Request, StatusCode}
 	};
 	use bigdecimal::BigDecimal;
-	use weftdb::SegmentStore;
-	use weft_arrow::{read_ipc_stream, record_batches_to_columns};
-	use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
 	use tempfile::TempDir;
 	use tower::ServiceExt;
+	use weft_arrow::{read_ipc_stream, record_batches_to_columns};
+	use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
+	use weftdb::SegmentStore;
 
 	use crate::{app_with_state, AppState};
 

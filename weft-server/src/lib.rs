@@ -49,7 +49,7 @@ pub use metrics::{DownsampleProfile, IngestProfile, InterpolateProfile, LatencyH
 pub use reconcile_daemon::{reconcile_tick, reconcile_tick_hot_cold, reconcile_tick_overlaps, spawn_reconcile_daemon, ReconcileDaemonConfig};
 use serde::Serialize;
 pub use state::AppState;
-pub use storage::{storage_aspect_schema, storage_aspect_stats, storage_aspects, storage_catalog, storage_downsample, storage_downsample_arrow, storage_downsample_csv, storage_downsample_parquet, storage_ingest_parquet, storage_point, storage_points, storage_stats, storage_time_range, storage_time_range_csv, storage_time_range_json, storage_time_range_parquet, storage_value_range, storage_value_range_csv, storage_value_range_json, storage_value_range_parquet, AspectInfo, AspectListResponse, AspectSchemaResponse, AspectStatsResponse, CatalogDatabase, CatalogResponse, MultiPointParams, ParquetIngestParams, PointParams, StorageDownsampleParams, StorageError, StoredPoint, StoredPointEntry, StoredPointResponse, StoredPointsResponse, StoredRangeResponse, StoreStatsResponse, TimeRangeParams, ValuePointsParams, ValueRangeParams};
+pub use storage::{storage_aspect_schema, storage_aspect_stats, storage_aspects, storage_catalog, storage_downsample, storage_downsample_arrow, storage_downsample_csv, storage_downsample_parquet, storage_ingest_parquet, storage_point, storage_points, storage_stats, storage_time_range, storage_time_range_csv, storage_time_range_json, storage_time_range_parquet, storage_value_range, storage_value_range_csv, storage_value_range_json, storage_value_range_parquet, AspectInfo, AspectListResponse, AspectSchemaResponse, AspectStatsResponse, CatalogDatabase, CatalogResponse, MultiPointParams, ParquetIngestParams, PointParams, StorageDownsampleParams, StorageError, StoreStatsResponse, StoredPoint, StoredPointEntry, StoredPointResponse, StoredPointsResponse, StoredRangeResponse, TimeRangeParams, ValuePointsParams, ValueRangeParams};
 
 /// The server's package version, surfaced in probe responses so a deployed
 /// instance is identifiable from a plain `curl`.
@@ -174,8 +174,8 @@ mod tests {
 	async fn ready_reports_a_configured_segment_store() {
 		use std::sync::Arc;
 
-		use weftdb::SegmentStore;
 		use tempfile::TempDir;
+		use weftdb::SegmentStore;
 
 		let dir = TempDir::new().unwrap();
 		// Construct the store inline so the significant-`Drop` `SegmentStore` is never

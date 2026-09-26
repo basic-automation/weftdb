@@ -3,11 +3,11 @@ use std::{str::FromStr, sync::Arc, time::Duration as StdDuration};
 use ::weftdb::database::traits::{AspectStructure, Inputs};
 use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
-use weftdb::{database::traits::DatabaseStructure, Database, DatasetId, InputMeasurement, Outputs};
 // Add this import
 use splimes::{Resolution, Spline};
 use tokio::{sync::Semaphore, time::timeout};
 use uuid::Uuid;
+use weftdb::{database::traits::DatabaseStructure, Database, DatasetId, InputMeasurement, Outputs};
 
 #[tokio::test]
 async fn test_multiple_aspects_same_subject() {

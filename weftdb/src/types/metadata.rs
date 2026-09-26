@@ -29,8 +29,8 @@ use std::str::FromStr;
 
 use anyhow::{bail, Result};
 use bigdecimal::BigDecimal;
-use weft_physical_type::{SegmentDescriptor, SegmentIndex};
 use turso::{Builder, Value};
+use weft_physical_type::{SegmentDescriptor, SegmentIndex};
 
 /// The materialized segment-set rollup for one aspect — the aspect-wide summary the
 /// [`AspectMetadataStore`] persists and returns.

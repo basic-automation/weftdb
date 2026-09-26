@@ -88,7 +88,7 @@ impl ColumnEncoding {
 	///
 	/// - `F64` → 8, `F32` → 4, `ScaledI128` → 16 (fixed width, so it agrees with the
 	///   naive estimate);
-    /// - `ScaledI64` → the zig-zag-varint width of each mantissa (1..=10 bytes);
+	/// - `ScaledI64` → the zig-zag-varint width of each mantissa (1..=10 bytes);
 	/// - `Decimal128` → 16 for the significand + the zig-zag-varint width of the
 	///   per-value scale;
 	/// - `BigDecimalText` → the UTF-8 length plus its unsigned-varint length prefix.
@@ -121,16 +121,15 @@ impl ColumnEncoding {
 		if !matches!(self.physical_type, PhysicalType::ScaledI64 { .. }) {
 			return None;
 		}
-		Some(
-			self.values
-				.iter()
-				.map(|v| match v {
-					PhysicalValue::ScaledI64 { mantissa, .. } => *mantissa,
-					// Unreachable: a ScaledI64 column holds only ScaledI64 values.
-					_ => 0,
-				})
-				.collect(),
-		)
+		Some(self
+			.values
+			.iter()
+			.map(|v| match v {
+				PhysicalValue::ScaledI64 { mantissa, .. } => *mantissa,
+				// Unreachable: a ScaledI64 column holds only ScaledI64 values.
+				_ => 0,
+			})
+			.collect())
 	}
 
 	/// The realized footprint in bytes of the **fixed-width bit-packed** value codec
@@ -341,16 +340,15 @@ impl ColumnEncoding {
 		if !matches!(self.physical_type, PhysicalType::F64) {
 			return None;
 		}
-		Some(
-			self.values
-				.iter()
-				.map(|v| match v {
-					PhysicalValue::F64(f) => *f,
-					// Unreachable: an F64 column holds only F64 values.
-					_ => 0.0,
-				})
-				.collect(),
-		)
+		Some(self
+			.values
+			.iter()
+			.map(|v| match v {
+				PhysicalValue::F64(f) => *f,
+				// Unreachable: an F64 column holds only F64 values.
+				_ => 0.0,
+			})
+			.collect())
 	}
 
 	/// The realized footprint in bytes of the **Gorilla XOR** value codec for an `F64`
@@ -789,9 +787,7 @@ mod tests {
 		// to the blocks the burst spans, and a FOR reference is wasted (each block's
 		// residual range equals its zig-zag magnitude, so FOR only adds the reference
 		// varint). The blocked codec must be the strict winner.
-		let lits: Vec<String> = (0..192)
-			.map(|i| if (64..128).contains(&i) { format!("{}", (1_000_000_000_i64 + i) * if i % 2 == 0 { 1 } else { -1 }) } else { format!("{}", (i % 5) - 2) })
-			.collect();
+		let lits: Vec<String> = (0..192).map(|i| if (64..128).contains(&i) { format!("{}", (1_000_000_000_i64 + i) * if i % 2 == 0 { 1 } else { -1 }) } else { format!("{}", (i % 5) - 2) }).collect();
 		let refs: Vec<&str> = lits.iter().map(String::as_str).collect();
 		let values = col(&refs);
 		let enc = encode_column(PhysicalType::ScaledI64 { scale: 0 }, &values).expect("encodes");

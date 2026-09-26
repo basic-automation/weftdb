@@ -20,12 +20,12 @@ use std::time::Instant;
 
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use chrono::{DateTime, Duration, TimeZone, Utc};
-pub use weft_reduce::Aggregation;
-use weft_reduce::{reduce, reduce_partial, Bucket, PartialReduction};
-use rayon::prelude::*;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use rayon::prelude::*;
 use splimes::{Point, Resolution};
+pub use weft_reduce::Aggregation;
+use weft_reduce::{reduce, reduce_partial, Bucket, PartialReduction};
 
 use crate::{
 	schema::{BenchResult, CorrectnessReport, DatasetMeta, TimingBreakdown, SCHEMA_VERSION}, stats::{BootstrapConfig, LatencyStats}
@@ -125,7 +125,8 @@ impl DownsampleProfile {
 			let noise = rng.random_range(-1.0..=1.0);
 			let signal = 20.0_f64.mul_add((phase * TAU).sin(), 50.0) + noise;
 			Point { timestamp, value: BigDecimal::from_f64(signal).unwrap_or_else(|| BigDecimal::from(50)) }
-		}).collect()
+		})
+		.collect()
 	}
 }
 
@@ -218,9 +219,7 @@ pub fn run_downsample(profile: &DownsampleProfile, reps: usize) -> anyhow::Resul
 		0.0
 	};
 
-	Ok(BenchResult {
-		schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_DOWNSAMPLE.to_string(), reps, dataset: DatasetMeta { input_points: points.len(), output_points: last_buckets.len(), irregular: false, missingness_fraction: 0.0, seed: profile.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage: None
-	})
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_DOWNSAMPLE.to_string(), reps, dataset: DatasetMeta { input_points: points.len(), output_points: last_buckets.len(), irregular: false, missingness_fraction: 0.0, seed: profile.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage: None })
 }
 
 #[cfg(test)]
@@ -229,7 +228,7 @@ mod tests {
 	/// chunk count. If this ever fails, `--ds-parallel` is measuring a different answer.
 	#[test]
 	fn parallel_chunked_reduction_equals_the_serial_one() {
-		use super::{DownsampleParams, DownsampleProfile, reduce_points};
+		use super::{reduce_points, DownsampleParams, DownsampleProfile};
 		let base = DownsampleParams { point_count: 5_000, aggregations: vec![super::Aggregation::Min, super::Aggregation::Max, super::Aggregation::Avg, super::Aggregation::Sum, super::Aggregation::First, super::Aggregation::Last, super::Aggregation::P99, super::Aggregation::Twa, super::Aggregation::SketchP99], ..DownsampleParams::default() };
 		let serial_profile = DownsampleProfile::new("serial", base.clone());
 		let points = serial_profile.generate();

@@ -1643,7 +1643,6 @@ impl Inputs for Database {
 
 		Ok(())
 	}
-
 }
 
 /// Helper methods for dirty region tracking (not part of trait)
@@ -1667,13 +1666,7 @@ impl Database {
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
 
 		// Query compression_tier_results to see if timestamp falls within a compressed range
-		let mut rows = conn
-			.as_ref()
-			.query(
-				"SELECT time_range_start, time_range_end FROM compression_tier_results WHERE time_range_start <= ? AND time_range_end >= ? LIMIT 1",
-				turso::params![timestamp.timestamp_millis(), timestamp.timestamp_millis()],
-			)
-			.await?;
+		let mut rows = conn.as_ref().query("SELECT time_range_start, time_range_end FROM compression_tier_results WHERE time_range_start <= ? AND time_range_end >= ? LIMIT 1", turso::params![timestamp.timestamp_millis(), timestamp.timestamp_millis()]).await?;
 
 		let compressed_range = if let Some(row) = rows.next().await? {
 			let start_millis = *row.get_value(0)?.as_integer().unwrap_or(&0);
@@ -1693,25 +1686,10 @@ impl Database {
 			let now = chrono::Utc::now();
 
 			// Insert the dirty region
-			conn.as_ref()
-				.execute(
-					"INSERT INTO dirty_regions (region_start, region_end, marked_at, reason) VALUES (?, ?, ?, ?)",
-					turso::params![
-						start_millis,
-						end_millis,
-						now.timestamp_millis(),
-						"New measurement inserted into compressed range".to_string(),
-					],
-				)
-				.await?;
+			conn.as_ref().execute("INSERT INTO dirty_regions (region_start, region_end, marked_at, reason) VALUES (?, ?, ?, ?)", turso::params![start_millis, end_millis, now.timestamp_millis(), "New measurement inserted into compressed range".to_string(),]).await?;
 
 			// Update dirty_regions_count in compression_state
-			conn.as_ref()
-				.execute(
-					"UPDATE compression_state SET dirty_regions_count = (SELECT COUNT(*) FROM dirty_regions) WHERE id = 1",
-					turso::params![],
-				)
-				.await?;
+			conn.as_ref().execute("UPDATE compression_state SET dirty_regions_count = (SELECT COUNT(*) FROM dirty_regions) WHERE id = 1", turso::params![]).await?;
 
 			let _ = Self::commit_concurrent(&conn).await;
 
@@ -1744,13 +1722,7 @@ impl Database {
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
 
 		// Find all compressed ranges that overlap with the batch range
-		let mut rows = conn
-			.as_ref()
-			.query(
-				"SELECT DISTINCT time_range_start, time_range_end FROM compression_tier_results WHERE time_range_start <= ? AND time_range_end >= ?",
-				turso::params![max_timestamp.timestamp_millis(), min_timestamp.timestamp_millis()],
-			)
-			.await?;
+		let mut rows = conn.as_ref().query("SELECT DISTINCT time_range_start, time_range_end FROM compression_tier_results WHERE time_range_start <= ? AND time_range_end >= ?", turso::params![max_timestamp.timestamp_millis(), min_timestamp.timestamp_millis()]).await?;
 
 		let mut compressed_ranges = Vec::new();
 		while let Some(row) = rows.next().await? {
@@ -1768,26 +1740,11 @@ impl Database {
 
 			for (start_millis, end_millis) in &compressed_ranges {
 				// Insert the dirty region
-				conn.as_ref()
-					.execute(
-						"INSERT INTO dirty_regions (region_start, region_end, marked_at, reason) VALUES (?, ?, ?, ?)",
-						turso::params![
-							*start_millis,
-							*end_millis,
-							now.timestamp_millis(),
-							"Batch insert overlapped with compressed range".to_string(),
-						],
-					)
-					.await?;
+				conn.as_ref().execute("INSERT INTO dirty_regions (region_start, region_end, marked_at, reason) VALUES (?, ?, ?, ?)", turso::params![*start_millis, *end_millis, now.timestamp_millis(), "Batch insert overlapped with compressed range".to_string(),]).await?;
 			}
 
 			// Update dirty_regions_count in compression_state
-			conn.as_ref()
-				.execute(
-					"UPDATE compression_state SET dirty_regions_count = (SELECT COUNT(*) FROM dirty_regions) WHERE id = 1",
-					turso::params![],
-				)
-				.await?;
+			conn.as_ref().execute("UPDATE compression_state SET dirty_regions_count = (SELECT COUNT(*) FROM dirty_regions) WHERE id = 1", turso::params![]).await?;
 
 			let _ = Self::commit_concurrent(&conn).await;
 

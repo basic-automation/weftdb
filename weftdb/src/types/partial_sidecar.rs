@@ -29,10 +29,10 @@
 //! <https://www.tigerdata.com/learn/continuous-aggregates-timescaledb>)*
 
 use anyhow::{bail, Context, Result};
-use weft_physical_type::SegmentDescriptor;
-use weft_reduce::{grids_nest, Aggregation, PartialReduction, ReduceError};
 use serde::{Deserialize, Serialize};
 use splimes::Resolution;
+use weft_physical_type::SegmentDescriptor;
+use weft_reduce::{grids_nest, Aggregation, PartialReduction, ReduceError};
 
 /// Magic prefix identifying a `.weftpart` frame — guards against feeding a foreign or
 /// truncated file to [`PartialSidecar::from_bytes`].
@@ -312,8 +312,8 @@ mod tests {
 
 	use bigdecimal::BigDecimal;
 	use chrono::{TimeZone, Utc};
-	use weft_reduce::reduce_partial;
 	use splimes::Point;
+	use weft_reduce::reduce_partial;
 
 	use super::*;
 

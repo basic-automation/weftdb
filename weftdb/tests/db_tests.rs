@@ -4,7 +4,6 @@ use ::weftdb::database::traits::{AspectStructure, Inputs};
 use anyhow::{Context, Result};
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use weftdb::{database::traits::DatabaseStructure, Aspect, Config, Database, DatasetId, InputMeasurement, Outputs, Subject, DATABASES};
 use rayon::prelude::*;
 use serial_test::serial;
 use splimes::{Resolution, Spline};
@@ -12,6 +11,7 @@ use splimes::{Resolution, Spline};
 use tempfile::TempDir;
 use tracing::{debug, instrument};
 use uuid::Uuid;
+use weftdb::{database::traits::DatabaseStructure, Aspect, Config, Database, DatasetId, InputMeasurement, Outputs, Subject, DATABASES};
 
 async fn setup_test_database() -> Result<(TempDir, Database, Subject, Aspect)> {
 	// Changed return type to Aspect
@@ -34,7 +34,8 @@ async fn add_test_measurements(db: &Database, aspect: &Aspect, base_time: DateTi
 		let timestamp = base_time + Duration::seconds(i as i64);
 		let value = BigDecimal::from_str(&format!("{}.{}", i + 1, i * 10 % 100))?;
 		let measurement = InputMeasurement::new(timestamp, value);
-		db.capture_measurement(&aspect.id(), &DatasetId::new(), &measurement).await?; // Use aspect instead of aspect_id
+		db.capture_measurement(&aspect.id(), &DatasetId::new(), &measurement).await?;
+		// Use aspect instead of aspect_id
 	}
 	Ok(())
 }
@@ -674,9 +675,7 @@ async fn ingest_path_profile_legacy_vs_columnar() -> Result<()> {
 	let skip_legacy = std::env::var("INGEST_PROFILE_SKIP_LEGACY").is_ok();
 
 	// The corpus: real BTC 1-minute closes when asked for, else the synthetic grid.
-	let real_csv = std::env::var("INGEST_PROFILE_CSV").ok().map(std::path::PathBuf::from).or_else(|| {
-		(std::env::var("INGEST_PROFILE_CORPUS").as_deref() == Ok("btc")).then(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("datasets").join("btc_1min.csv"))
-	});
+	let real_csv = std::env::var("INGEST_PROFILE_CSV").ok().map(std::path::PathBuf::from).or_else(|| (std::env::var("INGEST_PROFILE_CORPUS").as_deref() == Ok("btc")).then(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("datasets").join("btc_1min.csv")));
 	let base = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
 	let skip_rows: usize = std::env::var("INGEST_PROFILE_SKIP_ROWS").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
 	let (corpus, ts_ms, values) = match &real_csv {

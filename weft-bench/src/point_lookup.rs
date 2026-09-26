@@ -30,12 +30,12 @@
 use std::time::Instant;
 
 use bigdecimal::{BigDecimal, ToPrimitive};
-use weft_physical_type::{
-	weftseg::{read_paged_segment_point, read_paged_segment_points, read_segment_point, read_segment_points}, PagedSegment, Segment, TimeUnit
-};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
+use weft_physical_type::{
+	weftseg::{read_paged_segment_point, read_paged_segment_points, read_segment_point, read_segment_points}, PagedSegment, Segment, TimeUnit
+};
 
 use crate::{
 	schema::{BenchResult, CorrectnessReport, DatasetMeta, StorageEstimate, TimingBreakdown, SCHEMA_VERSION}, stats::{BootstrapConfig, LatencyStats}
@@ -196,7 +196,8 @@ impl PointLookupProfile {
 			(0..n).map(|_| {
 				cur += 2 + i64::from(rng.random::<u8>() % 20);
 				cur
-			}).collect()
+			})
+			.collect()
 		};
 
 		(timestamps, values)
@@ -341,9 +342,7 @@ pub fn run_point_lookup(profile: &PointLookupProfile, reps: usize) -> anyhow::Re
 		0.0
 	};
 
-	Ok(BenchResult {
-		schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_POINT_LOOKUP.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: queries.len(), irregular: !profile.regular, missingness_fraction: 0.0, seed: profile.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage
-	})
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_POINT_LOOKUP.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: queries.len(), irregular: !profile.regular, missingness_fraction: 0.0, seed: profile.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage })
 }
 
 #[cfg(test)]

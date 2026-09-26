@@ -33,13 +33,13 @@ use axum::{
 };
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use splimes::{Point, Resolution};
+use weft_reduce::reduce;
 // The reduction core is the vendor-neutral `weft-reduce` crate — shared with the
 // `weft-bench` downsample workload so both drive one implementation. `Aggregation` is
 // re-exported so the server's public API surface (see `lib.rs`) is unchanged.
 pub use weft_reduce::Aggregation;
-use weft_reduce::reduce;
-use serde::{Deserialize, Serialize};
-use splimes::{Point, Resolution};
 
 use crate::{
 	interpolate::{ApiError, InputPoint, ResolutionSpec}, metrics::SharedMetrics

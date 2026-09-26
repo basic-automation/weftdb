@@ -50,17 +50,15 @@ pub mod size;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+pub use config::{AggressivenessScaling, CompressionConfig, SizeBasedCompressionConfig, TimeBasedCompressionConfig};
 use serde::{Deserialize, Serialize};
 
-pub use config::{AggressivenessScaling, CompressionConfig, SizeBasedCompressionConfig, TimeBasedCompressionConfig};
-
 /// Detailed compression phase information for progress tracking
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum CompressionPhase {
 	/// Compression is initializing
 	#[default]
- Initializing,
+	Initializing,
 	/// Time-based compression in progress
 	TimeBased {
 		/// Current tier number (1-indexed)
@@ -78,7 +76,6 @@ pub enum CompressionPhase {
 	/// Compression complete
 	Complete,
 }
-
 
 impl std::fmt::Display for CompressionPhase {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

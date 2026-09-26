@@ -9,7 +9,9 @@ use splimes::{Point, Resolution, Spline};
 use uuid::Uuid;
 
 use crate::{
-	cache::{self}, correlation::ErrorRate, types::{database::traits::{aspect_structure::AspectStructure, connection::Connection as _ConnectionTrait, database_structure::DatabaseStructure}, error::is_transient_mvcc_error}, AnalysisResult, AspectId, Batch, BatchId, BatchMetatdata, BatchedMeasurement, Correlation, CorrelationID, Database, DatabaseInfo, DatasetId, DictionaryConstraints, DictionaryId, DictionaryMetadata, Error, Event, EventID, Manifestation, ManifestationId, Measurement, MeasurementId, Occurrence, Pattern, PatternID, Relative, SignalType, Steps, SubjectId, VariablilityType
+	cache::{self}, correlation::ErrorRate, types::{
+		database::traits::{aspect_structure::AspectStructure, connection::Connection as _ConnectionTrait, database_structure::DatabaseStructure}, error::is_transient_mvcc_error
+	}, AnalysisResult, AspectId, Batch, BatchId, BatchMetatdata, BatchedMeasurement, Correlation, CorrelationID, Database, DatabaseInfo, DatasetId, DictionaryConstraints, DictionaryId, DictionaryMetadata, Error, Event, EventID, Manifestation, ManifestationId, Measurement, MeasurementId, Occurrence, Pattern, PatternID, Relative, SignalType, Steps, SubjectId, VariablilityType
 };
 
 /// Maximum retries for transient MVCC errors during concurrent compression
@@ -397,145 +399,116 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		let chunk_duration_ns = total_ns / chunk_count;
 		let chunk_duration = chrono::Duration::nanoseconds(chunk_duration_ns);
 
-		tracing::info!(
-			expected_points = expected_points,
-			chunk_count = chunk_count,
-			chunk_duration_ms = chunk_duration.num_milliseconds(),
-			"[analyze_range] Chunked streaming setup"
-		);
+		tracing::info!(expected_points = expected_points, chunk_count = chunk_count, chunk_duration_ms = chunk_duration.num_milliseconds(), "[analyze_range] Chunked streaming setup");
 
 		// Clone self for use in async stream
 		let db_name = self.name().to_string();
 		let aspect_id = *aspect_id;
 
 		// Create streaming iterator that fetches and interpolates per chunk
-		let stream = futures::stream::unfold(
-			(start, None::<std::vec::IntoIter<Point>>, false),
-			move |(current_chunk_start, mut current_iter, done)| {
-				let db_name = db_name.clone();
-				let aspect_id = aspect_id;
-				let end_time = end;
-				let resolution_val = resolution;
-				let method_val = method;
-				let overlap = overlap_duration;
-				let chunk_dur = chunk_duration;
-				let range_start = start;
+		let stream = futures::stream::unfold((start, None::<std::vec::IntoIter<Point>>, false), move |(current_chunk_start, mut current_iter, done)| {
+			let db_name = db_name.clone();
+			let aspect_id = aspect_id;
+			let end_time = end;
+			let resolution_val = resolution;
+			let method_val = method;
+			let overlap = overlap_duration;
+			let chunk_dur = chunk_duration;
+			let range_start = start;
 
-				async move {
-					// Return next point from current chunk if available
-					if let Some(ref mut iter) = current_iter {
-						if let Some(point) = iter.next() {
-							return Some((Ok(point), (current_chunk_start, current_iter, done)));
-						}
+			async move {
+				// Return next point from current chunk if available
+				if let Some(ref mut iter) = current_iter {
+					if let Some(point) = iter.next() {
+						return Some((Ok(point), (current_chunk_start, current_iter, done)));
 					}
+				}
 
-					// If we're done, return None
-					if done || current_chunk_start >= end_time {
+				// If we're done, return None
+				if done || current_chunk_start >= end_time {
+					return None;
+				}
+
+				// Calculate this chunk's boundaries
+				let chunk_end = (current_chunk_start + chunk_dur).min(end_time);
+				let fetch_start = (current_chunk_start - overlap).max(range_start);
+				let fetch_end = (chunk_end + overlap).min(end_time);
+
+				tracing::debug!(
+					chunk_start = %current_chunk_start,
+					chunk_end = %chunk_end,
+					fetch_start = %fetch_start,
+					fetch_end = %fetch_end,
+					"[analyze_range] Processing chunk"
+				);
+
+				// Fetch measurements for this chunk (with overlap)
+				let db = match Self::existing(&db_name).await {
+					Ok(db) => db,
+					Err(e) => return Some((Err(e), (chunk_end, None, true))),
+				};
+
+				let measurements = match db.fetch_measurements_for_chunk(&aspect_id, fetch_start, fetch_end).await {
+					Ok(m) => m,
+					Err(e) => return Some((Err(e), (chunk_end, None, true))),
+				};
+
+				if measurements.is_empty() {
+					// No data for this chunk, move to next
+					if chunk_end >= end_time {
 						return None;
 					}
+					return Some((Ok(Point { timestamp: current_chunk_start, value: BigDecimal::from(0) }), (chunk_end, None, false)));
+				}
 
-					// Calculate this chunk's boundaries
-					let chunk_end = (current_chunk_start + chunk_dur).min(end_time);
-					let fetch_start = (current_chunk_start - overlap).max(range_start);
-					let fetch_end = (chunk_end + overlap).min(end_time);
+				// Convert to points
+				let mut points: Vec<Point> = measurements.iter().map(|m| Point { timestamp: m.timestamp(), value: m.value().clone() }).collect();
 
-					tracing::debug!(
-						chunk_start = %current_chunk_start,
-						chunk_end = %chunk_end,
-						fetch_start = %fetch_start,
-						fetch_end = %fetch_end,
-						"[analyze_range] Processing chunk"
-					);
+				// Adjust effective end to not extrapolate beyond actual data
+				let actual_data_end = points.iter().map(|p| p.timestamp).max().unwrap_or(chunk_end);
+				let effective_chunk_end = chunk_end.min(actual_data_end);
 
-					// Fetch measurements for this chunk (with overlap)
-					let db = match Self::existing(&db_name).await {
-						Ok(db) => db,
-						Err(e) => return Some((Err(e), (chunk_end, None, true))),
-					};
+				// That clamp can COLLAPSE the range. The chunk fetch is inclusive at both
+				// ends, so a chunk whose only visible measurement sits exactly at (or before)
+				// `current_chunk_start` clamps the end back onto the start — and
+				// `auto_interpolate` rejects `start >= end` with "Invalid time range: start
+				// time must be before end time", failing the whole stream. The
+				// `measurements.is_empty()` guard above does not catch this, because the
+				// chunk is not empty; its data is simply all at or behind the start.
+				//
+				// A zero-width window has exactly one sensible answer — the last known value
+				// at the start instant — so emit that and advance, mirroring the empty-chunk
+				// arm above rather than aborting.
+				if effective_chunk_end <= current_chunk_start {
+					// `points` is ordered by timestamp ASC (the fetch query sorts), so the
+					// last element is the newest value at or before the start.
+					let value = points.last().map_or_else(|| BigDecimal::from(0), |p| p.value.clone());
+					let is_last_chunk = chunk_end >= end_time;
+					return Some((Ok(Point { timestamp: current_chunk_start, value }), (chunk_end, None, is_last_chunk)));
+				}
 
-					let measurements = match db.fetch_measurements_for_chunk(&aspect_id, fetch_start, fetch_end).await {
-						Ok(m) => m,
-						Err(e) => return Some((Err(e), (chunk_end, None, true))),
-					};
-
-					if measurements.is_empty() {
-						// No data for this chunk, move to next
-						if chunk_end >= end_time {
-							return None;
-						}
-						return Some((
-							Ok(Point { timestamp: current_chunk_start, value: BigDecimal::from(0) }),
-							(chunk_end, None, false)
-						));
-					}
-
-					// Convert to points
-					let mut points: Vec<Point> = measurements
-						.iter()
-						.map(|m| Point { timestamp: m.timestamp(), value: m.value().clone() })
-						.collect();
-
-					// Adjust effective end to not extrapolate beyond actual data
-					let actual_data_end = points.iter().map(|p| p.timestamp).max().unwrap_or(chunk_end);
-					let effective_chunk_end = chunk_end.min(actual_data_end);
-
-					// That clamp can COLLAPSE the range. The chunk fetch is inclusive at both
-					// ends, so a chunk whose only visible measurement sits exactly at (or before)
-					// `current_chunk_start` clamps the end back onto the start — and
-					// `auto_interpolate` rejects `start >= end` with "Invalid time range: start
-					// time must be before end time", failing the whole stream. The
-					// `measurements.is_empty()` guard above does not catch this, because the
-					// chunk is not empty; its data is simply all at or behind the start.
-					//
-					// A zero-width window has exactly one sensible answer — the last known value
-					// at the start instant — so emit that and advance, mirroring the empty-chunk
-					// arm above rather than aborting.
-					if effective_chunk_end <= current_chunk_start {
-						// `points` is ordered by timestamp ASC (the fetch query sorts), so the
-						// last element is the newest value at or before the start.
-						let value = points.last().map_or_else(|| BigDecimal::from(0), |p| p.value.clone());
+				// Interpolate this chunk
+				match splimes::auto_interpolate(&mut points, current_chunk_start, effective_chunk_end, resolution_val, method_val).await {
+					Ok(interpolated) => {
 						let is_last_chunk = chunk_end >= end_time;
-						return Some((
-							Ok(Point { timestamp: current_chunk_start, value }),
-							(chunk_end, None, is_last_chunk)
-						));
-					}
+						let mut new_iter = interpolated.into_iter();
 
-					// Interpolate this chunk
-					match splimes::auto_interpolate(
-						&mut points,
-						current_chunk_start,
-						effective_chunk_end,
-						resolution_val,
-						method_val
-					).await {
-						Ok(interpolated) => {
-							let is_last_chunk = chunk_end >= end_time;
-							let mut new_iter = interpolated.into_iter();
-
-							// Return first point and set up iterator for the rest
-							match new_iter.next() {
-								Some(first_point) => Some((
-									Ok(first_point),
-									(chunk_end, Some(new_iter), is_last_chunk)
-								)),
-								None => {
-									if is_last_chunk {
-										None
-									} else {
-										Some((
-											Ok(Point { timestamp: current_chunk_start, value: BigDecimal::from(0) }),
-											(chunk_end, None, false)
-										))
-									}
+						// Return first point and set up iterator for the rest
+						match new_iter.next() {
+							Some(first_point) => Some((Ok(first_point), (chunk_end, Some(new_iter), is_last_chunk))),
+							None => {
+								if is_last_chunk {
+									None
+								} else {
+									Some((Ok(Point { timestamp: current_chunk_start, value: BigDecimal::from(0) }), (chunk_end, None, false)))
 								}
 							}
 						}
-						Err(e) => Some((Err(e), (chunk_end, None, true))),
 					}
+					Err(e) => Some((Err(e), (chunk_end, None, true))),
 				}
 			}
-		);
+		});
 
 		Ok(Box::pin(stream))
 	}
@@ -553,11 +526,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 				}
 				Err(e) if is_transient_mvcc_error(&e) && attempt < MAX_MVCC_RETRIES - 1 => {
 					let delay = MVCC_RETRY_BASE_DELAY_MS * 2u64.pow(attempt);
-					tracing::debug!(
-						attempt = attempt + 1,
-						delay_ms = delay,
-						"Transient MVCC error during fetch_measurements_for_range, retrying..."
-					);
+					tracing::debug!(attempt = attempt + 1, delay_ms = delay, "Transient MVCC error during fetch_measurements_for_range, retrying...");
 					tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
 					continue;
 				}
@@ -573,23 +542,14 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 
 	/// Fetch measurements for a specific time chunk with overlap for interpolation
 	/// Includes retry logic for transient MVCC errors during concurrent compression
-	async fn fetch_measurements_for_chunk(
-		&self,
-		aspect_id: &AspectId,
-		chunk_start: DateTime<Utc>,
-		chunk_end: DateTime<Utc>,
-	) -> Result<Vec<Measurement>> {
+	async fn fetch_measurements_for_chunk(&self, aspect_id: &AspectId, chunk_start: DateTime<Utc>, chunk_end: DateTime<Utc>) -> Result<Vec<Measurement>> {
 		// Retry loop for transient MVCC errors
 		for attempt in 0..MAX_MVCC_RETRIES {
 			match Self::fetch_measurements_for_chunk_inner_impl(self, aspect_id, chunk_start, chunk_end).await {
 				Ok(measurements) => return Ok(measurements),
 				Err(e) if is_transient_mvcc_error(&e) && attempt < MAX_MVCC_RETRIES - 1 => {
 					let delay = MVCC_RETRY_BASE_DELAY_MS * 2u64.pow(attempt);
-					tracing::debug!(
-						attempt = attempt + 1,
-						delay_ms = delay,
-						"Transient MVCC error during fetch_measurements_for_chunk, retrying..."
-					);
+					tracing::debug!(attempt = attempt + 1, delay_ms = delay, "Transient MVCC error during fetch_measurements_for_chunk, retrying...");
 					tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
 					continue;
 				}
@@ -1432,21 +1392,13 @@ impl Database {
 	}
 
 	/// Inner implementation of `fetch_measurements_for_chunk` without retry
-	async fn fetch_measurements_for_chunk_inner_impl(
-		&self,
-		aspect_id: &AspectId,
-		chunk_start: DateTime<Utc>,
-		chunk_end: DateTime<Utc>,
-	) -> Result<Vec<Measurement>> {
+	async fn fetch_measurements_for_chunk_inner_impl(&self, aspect_id: &AspectId, chunk_start: DateTime<Utc>, chunk_end: DateTime<Utc>) -> Result<Vec<Measurement>> {
 		let db = self.get_measurement_db(aspect_id).await?;
 		let db_path = self.get_measurement_db_path(aspect_id).await?;
 		let conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
 
 		let query_sql = "SELECT id, dataset_id, timestamp, value FROM measurements WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp ASC";
-		let mut rows: turso::Rows = conn.as_ref().query(
-			query_sql,
-			turso::params![chunk_start.timestamp_millis(), chunk_end.timestamp_millis()]
-		).await.map_err(|e| Error::DatabaseError(format!("Failed to query measurements: {e}")))?;
+		let mut rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![chunk_start.timestamp_millis(), chunk_end.timestamp_millis()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query measurements: {e}")))?;
 
 		let mut measurements: Vec<Measurement> = Vec::new();
 		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get measurement row: {e}")))? {
@@ -1636,10 +1588,7 @@ impl Database {
 		let id_str = match id_val.as_text() {
 			Some(s) => s.clone(),
 			None => {
-				return Err(Error::TransientMvccError(
-					"ID field type mismatch - concurrent compression in progress".to_string(),
-				)
-				.into());
+				return Err(Error::TransientMvccError("ID field type mismatch - concurrent compression in progress".to_string()).into());
 			}
 		};
 
@@ -1647,10 +1596,7 @@ impl Database {
 		let dataset_id_str = match dataset_id_val.as_text() {
 			Some(s) => s.clone(),
 			None => {
-				return Err(Error::TransientMvccError(
-					"Dataset ID field type mismatch - concurrent compression in progress".to_string(),
-				)
-				.into());
+				return Err(Error::TransientMvccError("Dataset ID field type mismatch - concurrent compression in progress".to_string()).into());
 			}
 		};
 
@@ -1658,10 +1604,7 @@ impl Database {
 		let timestamp_millis: i64 = match timestamp_val.as_integer() {
 			Some(i) => *i,
 			None => {
-				return Err(Error::TransientMvccError(
-					"Timestamp field type mismatch - concurrent compression in progress".to_string(),
-				)
-				.into());
+				return Err(Error::TransientMvccError("Timestamp field type mismatch - concurrent compression in progress".to_string()).into());
 			}
 		};
 
@@ -1669,10 +1612,7 @@ impl Database {
 		let value_str = match value_val.as_text() {
 			Some(s) => s.clone(),
 			None => {
-				return Err(Error::TransientMvccError(
-					"Value field type mismatch - concurrent compression in progress".to_string(),
-				)
-				.into());
+				return Err(Error::TransientMvccError("Value field type mismatch - concurrent compression in progress".to_string()).into());
 			}
 		};
 

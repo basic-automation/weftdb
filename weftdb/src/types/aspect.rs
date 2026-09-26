@@ -1309,12 +1309,7 @@ impl Aspect {
 			.await?;
 
 		// Insert singleton if not exists
-		conn.as_ref()
-			.execute(
-				"INSERT OR IGNORE INTO compression_state (id, is_compressing, dirty_regions_count) VALUES (1, 0, 0)",
-				turso::params![],
-			)
-			.await?;
+		conn.as_ref().execute("INSERT OR IGNORE INTO compression_state (id, is_compressing, dirty_regions_count) VALUES (1, 0, 0)", turso::params![]).await?;
 
 		// Index for faster dirty region queries
 		if let Err(e) = conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_dirty_regions_time ON dirty_regions(region_start, region_end)", turso::params![]).await {
@@ -1766,10 +1761,7 @@ impl Aspect {
 
 		tracing::info!(">>> set_compression_config: executing UPDATE");
 		let id_str = self.id.as_uuid().to_string();
-		conn.as_ref().execute(
-			"UPDATE aspects SET compression_config = ? WHERE id = ?",
-			turso::params![config_json, id_str],
-		).await?;
+		conn.as_ref().execute("UPDATE aspects SET compression_config = ? WHERE id = ?", turso::params![config_json, id_str]).await?;
 
 		tracing::info!(">>> set_compression_config: committing");
 		let _ = Database::commit_concurrent(&conn).await;
@@ -1819,14 +1811,9 @@ impl Aspect {
 	/// - Database operations fail
 	/// - Compression algorithm fails
 	#[instrument(skip(self, database, progress_callback))]
-	pub async fn compress_with_progress(
-		&mut self,
-		database: &Database,
-		progress_callback: Option<crate::compression::ProgressCallback>,
-	) -> Result<crate::compression::DetailedCompressionSummary> {
+	pub async fn compress_with_progress(&mut self, database: &Database, progress_callback: Option<crate::compression::ProgressCallback>) -> Result<crate::compression::DetailedCompressionSummary> {
 		use crate::{
-			compression::{size, CompressionPhase, CompressionProgress, CompressionSummary, DetailedCompressionSummary, TierCompressionResult},
-			database::traits::Outputs,
+			compression::{size, CompressionPhase, CompressionProgress, CompressionSummary, DetailedCompressionSummary, TierCompressionResult}, database::traits::Outputs
 		};
 
 		let started_at = chrono::Utc::now();
@@ -1834,25 +1821,12 @@ impl Aspect {
 
 		if !config.enabled {
 			tracing::info!("Compression is disabled for this aspect");
-			return Ok(DetailedCompressionSummary {
-				summary: CompressionSummary::default(),
-				tier_results: Vec::new(),
-				started_at,
-				completed_at: chrono::Utc::now(),
-				total_duration_ms: 0,
-			});
+			return Ok(DetailedCompressionSummary { summary: CompressionSummary::default(), tier_results: Vec::new(), started_at, completed_at: chrono::Utc::now(), total_duration_ms: 0 });
 		}
 
 		// Report initialization
 		if let Some(ref cb) = progress_callback {
-			cb(CompressionProgress {
-				phase: CompressionPhase::Initializing,
-				current_tier: 0,
-				total_tiers: 0,
-				aggressiveness: 0.0,
-				time_range_start: chrono::Utc::now(),
-				time_range_end: chrono::Utc::now(),
-			});
+			cb(CompressionProgress { phase: CompressionPhase::Initializing, current_tier: 0, total_tiers: 0, aggressiveness: 0.0, time_range_start: chrono::Utc::now(), time_range_end: chrono::Utc::now() });
 		}
 
 		let mut summary = CompressionSummary::default();
@@ -1861,9 +1835,7 @@ impl Aspect {
 		// 1. Apply time-based compression first (if configured)
 		if let Some(ref time_config) = config.time_based {
 			tracing::info!("Starting time-based compression");
-			let (results, tier_details) = self
-				.compress_time_based_with_progress(database, time_config, &config, progress_callback.clone())
-				.await?;
+			let (results, tier_details) = self.compress_time_based_with_progress(database, time_config, &config, progress_callback.clone()).await?;
 			summary.time_based_results = results;
 			tier_results.extend(tier_details);
 		}
@@ -1877,9 +1849,7 @@ impl Aspect {
 
 			if current_size > size_config.target_size_bytes {
 				tracing::info!(current_size = current_size, target_size = size_config.target_size_bytes, "Size exceeds target, applying size-based compression");
-				let (results, tier_details) = self
-					.compress_size_based_with_progress(database, size_config, &config, progress_callback.clone())
-					.await?;
+				let (results, tier_details) = self.compress_size_based_with_progress(database, size_config, &config, progress_callback.clone()).await?;
 				summary.size_based_results = results;
 				tier_results.extend(tier_details);
 			} else {
@@ -1889,14 +1859,7 @@ impl Aspect {
 
 		// Report finalizing
 		if let Some(ref cb) = progress_callback {
-			cb(CompressionProgress {
-				phase: CompressionPhase::Finalizing,
-				current_tier: 0,
-				total_tiers: 0,
-				aggressiveness: 0.0,
-				time_range_start: chrono::Utc::now(),
-				time_range_end: chrono::Utc::now(),
-			});
+			cb(CompressionProgress { phase: CompressionPhase::Finalizing, current_tier: 0, total_tiers: 0, aggressiveness: 0.0, time_range_start: chrono::Utc::now(), time_range_end: chrono::Utc::now() });
 		}
 
 		// Calculate totals
@@ -1912,14 +1875,7 @@ impl Aspect {
 		// Report complete
 		tracing::info!(">>> About to send CompressionPhase::Complete callback");
 		if let Some(ref cb) = progress_callback {
-			cb(CompressionProgress {
-				phase: CompressionPhase::Complete,
-				current_tier: 0,
-				total_tiers: 0,
-				aggressiveness: 0.0,
-				time_range_start: started_at,
-				time_range_end: completed_at,
-			});
+			cb(CompressionProgress { phase: CompressionPhase::Complete, current_tier: 0, total_tiers: 0, aggressiveness: 0.0, time_range_start: started_at, time_range_end: completed_at });
 		}
 		tracing::info!(">>> Callback sent, preparing return value");
 
@@ -1932,13 +1888,7 @@ impl Aspect {
 		);
 
 		tracing::info!(">>> Building DetailedCompressionSummary");
-		let result = DetailedCompressionSummary {
-			summary,
-			tier_results,
-			started_at,
-			completed_at,
-			total_duration_ms,
-		};
+		let result = DetailedCompressionSummary { summary, tier_results, started_at, completed_at, total_duration_ms };
 		tracing::info!(">>> Returning from compress_with_progress");
 		Ok(result)
 	}
@@ -1951,13 +1901,7 @@ impl Aspect {
 	}
 
 	/// Apply time-based compression with progress reporting.
-	async fn compress_time_based_with_progress(
-		&self,
-		database: &Database,
-		time_config: &crate::compression::TimeBasedCompressionConfig,
-		config: &CompressionConfig,
-		progress_callback: Option<crate::compression::ProgressCallback>,
-	) -> Result<(Vec<crate::compression::CompressionResult>, Vec<crate::compression::TierCompressionResult>)> {
+	async fn compress_time_based_with_progress(&self, database: &Database, time_config: &crate::compression::TimeBasedCompressionConfig, config: &CompressionConfig, progress_callback: Option<crate::compression::ProgressCallback>) -> Result<(Vec<crate::compression::CompressionResult>, Vec<crate::compression::TierCompressionResult>)> {
 		use crate::compression::{calculate_tier_aggressiveness, CompressionPhase, CompressionProgress, TierCompressionResult};
 
 		let now = chrono::Utc::now();
@@ -1995,14 +1939,7 @@ impl Aspect {
 
 			// Report progress before each tier
 			if let Some(ref cb) = progress_callback {
-				cb(CompressionProgress {
-					phase: CompressionPhase::TimeBased { tier: current_tier, of_tiers: total_tiers },
-					current_tier,
-					total_tiers,
-					aggressiveness,
-					time_range_start: tier_start,
-					time_range_end: tier_end,
-				});
+				cb(CompressionProgress { phase: CompressionPhase::TimeBased { tier: current_tier, of_tiers: total_tiers }, current_tier, total_tiers, aggressiveness, time_range_start: tier_start, time_range_end: tier_end });
 			}
 
 			if aggressiveness > 0.0 {
@@ -2028,17 +1965,7 @@ impl Aspect {
 					);
 
 					// Record detailed tier result
-					tier_details.push(TierCompressionResult {
-						tier_number: current_tier,
-						phase: CompressionPhase::TimeBased { tier: current_tier, of_tiers: total_tiers },
-						original_count: result.original_count,
-						compressed_count: result.compressed_count,
-						compression_ratio: result.compression_ratio,
-						aggressiveness,
-						time_range_start: result.time_range_start,
-						time_range_end: result.time_range_end,
-						duration_ms: tier_duration_ms,
-					});
+					tier_details.push(TierCompressionResult { tier_number: current_tier, phase: CompressionPhase::TimeBased { tier: current_tier, of_tiers: total_tiers }, original_count: result.original_count, compressed_count: result.compressed_count, compression_ratio: result.compression_ratio, aggressiveness, time_range_start: result.time_range_start, time_range_end: result.time_range_end, duration_ms: tier_duration_ms });
 
 					results.push(result);
 				}
@@ -2059,16 +1986,9 @@ impl Aspect {
 	}
 
 	/// Apply size-based compression with progress reporting.
-	async fn compress_size_based_with_progress(
-		&self,
-		database: &Database,
-		size_config: &crate::compression::SizeBasedCompressionConfig,
-		config: &CompressionConfig,
-		progress_callback: Option<crate::compression::ProgressCallback>,
-	) -> Result<(Vec<crate::compression::CompressionResult>, Vec<crate::compression::TierCompressionResult>)> {
+	async fn compress_size_based_with_progress(&self, database: &Database, size_config: &crate::compression::SizeBasedCompressionConfig, config: &CompressionConfig, progress_callback: Option<crate::compression::ProgressCallback>) -> Result<(Vec<crate::compression::CompressionResult>, Vec<crate::compression::TierCompressionResult>)> {
 		use crate::{
-			compression::{size, CompressionPhase, CompressionProgress, TierCompressionResult},
-			database::traits::Outputs,
+			compression::{size, CompressionPhase, CompressionProgress, TierCompressionResult}, database::traits::Outputs
 		};
 
 		let mut results = Vec::new();
@@ -2102,14 +2022,7 @@ impl Aspect {
 
 					// Report progress before each iteration
 					if let Some(ref cb) = progress_callback {
-						cb(CompressionProgress {
-							phase: CompressionPhase::SizeBased { iteration: iteration + 1 },
-							current_tier: iteration + 1,
-							total_tiers: size_config.max_iterations,
-							aggressiveness,
-							time_range_start: start,
-							time_range_end: chunk_end,
-						});
+						cb(CompressionProgress { phase: CompressionPhase::SizeBased { iteration: iteration + 1 }, current_tier: iteration + 1, total_tiers: size_config.max_iterations, aggressiveness, time_range_start: start, time_range_end: chunk_end });
 					}
 
 					tracing::debug!(
@@ -2134,17 +2047,7 @@ impl Aspect {
 						);
 
 						// Record detailed tier result
-						tier_details.push(TierCompressionResult {
-							tier_number: iteration + 1,
-							phase: CompressionPhase::SizeBased { iteration: iteration + 1 },
-							original_count: result.original_count,
-							compressed_count: result.compressed_count,
-							compression_ratio: result.compression_ratio,
-							aggressiveness,
-							time_range_start: result.time_range_start,
-							time_range_end: result.time_range_end,
-							duration_ms: iter_duration_ms,
-						});
+						tier_details.push(TierCompressionResult { tier_number: iteration + 1, phase: CompressionPhase::SizeBased { iteration: iteration + 1 }, original_count: result.original_count, compressed_count: result.compressed_count, compression_ratio: result.compression_ratio, aggressiveness, time_range_start: result.time_range_start, time_range_end: result.time_range_end, duration_ms: iter_duration_ms });
 
 						results.push(result);
 					} else {
@@ -2214,11 +2117,7 @@ impl Aspect {
 	/// # Errors
 	/// Returns an error if database operations fail
 	#[instrument(skip(self, summary, config))]
-	pub async fn save_compression_history(
-		&mut self,
-		summary: &crate::compression::DetailedCompressionSummary,
-		config: &crate::compression::CompressionConfig,
-	) -> Result<String> {
+	pub async fn save_compression_history(&mut self, summary: &crate::compression::DetailedCompressionSummary, config: &crate::compression::CompressionConfig) -> Result<String> {
 		tracing::info!(">>> save_compression_history: getting measurements db");
 		let db = self.measurements().await?;
 		tracing::info!(">>> save_compression_history: beginning concurrent transaction");
@@ -2229,54 +2128,16 @@ impl Aspect {
 		let config_json = serde_json::to_string(config)?;
 
 		// Insert into compression_history
-		conn.as_ref()
-			.execute(
-				"INSERT INTO compression_history (id, started_at, completed_at, duration_ms, original_count, compressed_count, compression_ratio, final_size_bytes, time_based_tiers, size_based_iterations, config_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-				turso::params![
-					id.clone(),
-					summary.started_at.timestamp_millis(),
-					summary.completed_at.timestamp_millis(),
-					summary.total_duration_ms as i64,
-					summary.summary.total_original_count as i64,
-					summary.summary.total_compressed_count as i64,
-					summary.summary.overall_compression_ratio(),
-					summary.summary.final_size_bytes as i64,
-					summary.summary.time_based_results.len() as i64,
-					summary.summary.size_based_results.len() as i64,
-					config_json,
-				],
-			)
-			.await?;
+		conn.as_ref().execute("INSERT INTO compression_history (id, started_at, completed_at, duration_ms, original_count, compressed_count, compression_ratio, final_size_bytes, time_based_tiers, size_based_iterations, config_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", turso::params![id.clone(), summary.started_at.timestamp_millis(), summary.completed_at.timestamp_millis(), summary.total_duration_ms as i64, summary.summary.total_original_count as i64, summary.summary.total_compressed_count as i64, summary.summary.overall_compression_ratio(), summary.summary.final_size_bytes as i64, summary.summary.time_based_results.len() as i64, summary.summary.size_based_results.len() as i64, config_json,]).await?;
 
 		// Insert tier results
 		for tier_result in &summary.tier_results {
 			let phase_str = format!("{}", tier_result.phase);
-			conn.as_ref()
-				.execute(
-					"INSERT INTO compression_tier_results (history_id, tier_number, phase, original_count, compressed_count, compression_ratio, aggressiveness, time_range_start, time_range_end, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-					turso::params![
-						id.clone(),
-						i64::from(tier_result.tier_number),
-						phase_str,
-						tier_result.original_count as i64,
-						tier_result.compressed_count as i64,
-						tier_result.compression_ratio,
-						tier_result.aggressiveness,
-						tier_result.time_range_start.timestamp_millis(),
-						tier_result.time_range_end.timestamp_millis(),
-						tier_result.duration_ms as i64,
-					],
-				)
-				.await?;
+			conn.as_ref().execute("INSERT INTO compression_tier_results (history_id, tier_number, phase, original_count, compressed_count, compression_ratio, aggressiveness, time_range_start, time_range_end, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", turso::params![id.clone(), i64::from(tier_result.tier_number), phase_str, tier_result.original_count as i64, tier_result.compressed_count as i64, tier_result.compression_ratio, tier_result.aggressiveness, tier_result.time_range_start.timestamp_millis(), tier_result.time_range_end.timestamp_millis(), tier_result.duration_ms as i64,]).await?;
 		}
 
 		// Update compression_state singleton
-		conn.as_ref()
-			.execute(
-				"UPDATE compression_state SET is_compressing = 0, current_phase = NULL, current_tier = NULL, total_tiers = NULL, last_compression_id = ?, last_compression_at = ? WHERE id = 1",
-				turso::params![id.clone(), summary.completed_at.timestamp_millis()],
-			)
-			.await?;
+		conn.as_ref().execute("UPDATE compression_state SET is_compressing = 0, current_phase = NULL, current_tier = NULL, total_tiers = NULL, last_compression_id = ?, last_compression_at = ? WHERE id = 1", turso::params![id.clone(), summary.completed_at.timestamp_millis()]).await?;
 
 		let _ = Database::commit_concurrent(&conn).await;
 		// NOTE: Removed checkpoint_wal_passive() call for consistency with other db operations
@@ -2297,13 +2158,7 @@ impl Aspect {
 		let db = self.measurements().await?;
 		let conn = Database::begin_concurrent(&db, &self.measurements_path, None).await?;
 
-		let mut rows = conn
-			.as_ref()
-			.query(
-				"SELECT id, completed_at, original_count, compressed_count, compression_ratio, final_size_bytes, time_based_tiers, size_based_iterations, duration_ms FROM compression_history ORDER BY completed_at DESC LIMIT 1",
-				turso::params![],
-			)
-			.await?;
+		let mut rows = conn.as_ref().query("SELECT id, completed_at, original_count, compressed_count, compression_ratio, final_size_bytes, time_based_tiers, size_based_iterations, duration_ms FROM compression_history ORDER BY completed_at DESC LIMIT 1", turso::params![]).await?;
 
 		let result = if let Some(row) = rows.next().await? {
 			let id = row.get_value(0)?.as_text().cloned().unwrap_or_default();
@@ -2316,17 +2171,7 @@ impl Aspect {
 			let size_based_iterations = *row.get_value(7)?.as_integer().unwrap_or(&0) as usize;
 			let duration_ms = *row.get_value(8)?.as_integer().unwrap_or(&0) as u64;
 
-			Some(crate::compression::LastCompressionInfo {
-				id,
-				completed_at: chrono::DateTime::from_timestamp_millis(completed_at_millis).unwrap_or_default(),
-				original_count,
-				compressed_count,
-				compression_ratio,
-				final_size_bytes,
-				time_based_tiers,
-				size_based_iterations,
-				duration_ms,
-			})
+			Some(crate::compression::LastCompressionInfo { id, completed_at: chrono::DateTime::from_timestamp_millis(completed_at_millis).unwrap_or_default(), original_count, compressed_count, compression_ratio, final_size_bytes, time_based_tiers, size_based_iterations, duration_ms })
 		} else {
 			None
 		};
@@ -2344,16 +2189,9 @@ impl Aspect {
 		let db = self.measurements().await?;
 		let conn = Database::begin_concurrent(&db, &self.measurements_path, None).await?;
 
-		let mut rows = conn
-			.as_ref()
-			.query("SELECT COUNT(*) FROM dirty_regions", turso::params![])
-			.await?;
+		let mut rows = conn.as_ref().query("SELECT COUNT(*) FROM dirty_regions", turso::params![]).await?;
 
-		let count = if let Some(row) = rows.next().await? {
-			*row.get_value(0)?.as_integer().unwrap_or(&0) as usize
-		} else {
-			0
-		};
+		let count = if let Some(row) = rows.next().await? { *row.get_value(0)?.as_integer().unwrap_or(&0) as usize } else { 0 };
 
 		let _ = Database::commit_concurrent(&conn).await;
 		Ok(count)
@@ -2368,13 +2206,7 @@ impl Aspect {
 		let db = self.measurements().await?;
 		let conn = Database::begin_concurrent(&db, &self.measurements_path, None).await?;
 
-		let mut rows = conn
-			.as_ref()
-			.query(
-				"SELECT id, region_start, region_end, marked_at, reason FROM dirty_regions ORDER BY region_start ASC",
-				turso::params![],
-			)
-			.await?;
+		let mut rows = conn.as_ref().query("SELECT id, region_start, region_end, marked_at, reason FROM dirty_regions ORDER BY region_start ASC", turso::params![]).await?;
 
 		let mut regions = Vec::new();
 		while let Some(row) = rows.next().await? {
@@ -2384,13 +2216,7 @@ impl Aspect {
 			let marked_at_millis = *row.get_value(3)?.as_integer().unwrap_or(&0);
 			let reason = row.get_value(4)?.as_text().cloned().unwrap_or_default();
 
-			regions.push(crate::compression::DirtyRegion {
-				id,
-				region_start: chrono::DateTime::from_timestamp_millis(region_start_millis).unwrap_or_default(),
-				region_end: chrono::DateTime::from_timestamp_millis(region_end_millis).unwrap_or_default(),
-				marked_at: chrono::DateTime::from_timestamp_millis(marked_at_millis).unwrap_or_default(),
-				reason,
-			});
+			regions.push(crate::compression::DirtyRegion { id, region_start: chrono::DateTime::from_timestamp_millis(region_start_millis).unwrap_or_default(), region_end: chrono::DateTime::from_timestamp_millis(region_end_millis).unwrap_or_default(), marked_at: chrono::DateTime::from_timestamp_millis(marked_at_millis).unwrap_or_default(), reason });
 		}
 
 		let _ = Database::commit_concurrent(&conn).await;
@@ -2410,37 +2236,17 @@ impl Aspect {
 	/// # Errors
 	/// Returns an error if database operations fail
 	#[instrument(skip(self))]
-	pub async fn mark_dirty_region(
-		&mut self,
-		region_start: chrono::DateTime<chrono::Utc>,
-		region_end: chrono::DateTime<chrono::Utc>,
-		reason: &str,
-	) -> Result<()> {
+	pub async fn mark_dirty_region(&mut self, region_start: chrono::DateTime<chrono::Utc>, region_end: chrono::DateTime<chrono::Utc>, reason: &str) -> Result<()> {
 		let db = self.measurements().await?;
 		let conn = Database::begin_concurrent(&db, &self.measurements_path, None).await?;
 
 		let now = chrono::Utc::now();
 
 		// Insert the dirty region
-		conn.as_ref()
-			.execute(
-				"INSERT INTO dirty_regions (region_start, region_end, marked_at, reason) VALUES (?, ?, ?, ?)",
-				turso::params![
-					region_start.timestamp_millis(),
-					region_end.timestamp_millis(),
-					now.timestamp_millis(),
-					reason.to_string(),
-				],
-			)
-			.await?;
+		conn.as_ref().execute("INSERT INTO dirty_regions (region_start, region_end, marked_at, reason) VALUES (?, ?, ?, ?)", turso::params![region_start.timestamp_millis(), region_end.timestamp_millis(), now.timestamp_millis(), reason.to_string(),]).await?;
 
 		// Update dirty_regions_count in compression_state
-		conn.as_ref()
-			.execute(
-				"UPDATE compression_state SET dirty_regions_count = (SELECT COUNT(*) FROM dirty_regions) WHERE id = 1",
-				turso::params![],
-			)
-			.await?;
+		conn.as_ref().execute("UPDATE compression_state SET dirty_regions_count = (SELECT COUNT(*) FROM dirty_regions) WHERE id = 1", turso::params![]).await?;
 
 		let _ = Database::commit_concurrent(&conn).await;
 		Database::checkpoint_wal_passive(&db).await?;
@@ -2469,20 +2275,10 @@ impl Aspect {
 		let db = self.measurements().await?;
 		let conn = Database::begin_concurrent(&db, &self.measurements_path, None).await?;
 
-		conn.as_ref()
-			.execute(
-				"DELETE FROM dirty_regions WHERE marked_at < ?",
-				turso::params![before.timestamp_millis()],
-			)
-			.await?;
+		conn.as_ref().execute("DELETE FROM dirty_regions WHERE marked_at < ?", turso::params![before.timestamp_millis()]).await?;
 
 		// Update dirty_regions_count in compression_state
-		conn.as_ref()
-			.execute(
-				"UPDATE compression_state SET dirty_regions_count = (SELECT COUNT(*) FROM dirty_regions) WHERE id = 1",
-				turso::params![],
-			)
-			.await?;
+		conn.as_ref().execute("UPDATE compression_state SET dirty_regions_count = (SELECT COUNT(*) FROM dirty_regions) WHERE id = 1", turso::params![]).await?;
 
 		let _ = Database::commit_concurrent(&conn).await;
 		Database::checkpoint_wal_passive(&db).await?;
@@ -2502,29 +2298,17 @@ impl Aspect {
 	/// # Errors
 	/// Returns an error if database operations fail
 	#[instrument(skip(self))]
-	pub async fn get_compressed_range_containing(
-		&mut self,
-		timestamp: chrono::DateTime<chrono::Utc>,
-	) -> Result<Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>> {
+	pub async fn get_compressed_range_containing(&mut self, timestamp: chrono::DateTime<chrono::Utc>) -> Result<Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>> {
 		let db = self.measurements().await?;
 		let conn = Database::begin_concurrent(&db, &self.measurements_path, None).await?;
 
 		// Query tier results to find if timestamp falls within any compressed range
-		let mut rows = conn
-			.as_ref()
-			.query(
-				"SELECT time_range_start, time_range_end FROM compression_tier_results WHERE time_range_start <= ? AND time_range_end >= ? LIMIT 1",
-				turso::params![timestamp.timestamp_millis(), timestamp.timestamp_millis()],
-			)
-			.await?;
+		let mut rows = conn.as_ref().query("SELECT time_range_start, time_range_end FROM compression_tier_results WHERE time_range_start <= ? AND time_range_end >= ? LIMIT 1", turso::params![timestamp.timestamp_millis(), timestamp.timestamp_millis()]).await?;
 
 		let result = if let Some(row) = rows.next().await? {
 			let start_millis = *row.get_value(0)?.as_integer().unwrap_or(&0);
 			let end_millis = *row.get_value(1)?.as_integer().unwrap_or(&0);
-			Some((
-				chrono::DateTime::from_timestamp_millis(start_millis).unwrap_or_default(),
-				chrono::DateTime::from_timestamp_millis(end_millis).unwrap_or_default(),
-			))
+			Some((chrono::DateTime::from_timestamp_millis(start_millis).unwrap_or_default(), chrono::DateTime::from_timestamp_millis(end_millis).unwrap_or_default()))
 		} else {
 			None
 		};

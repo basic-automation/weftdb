@@ -29,12 +29,7 @@ static DICTIONARIES_DB_FOLDERNAME: &str = "dictionaries";
 /// 3. A relative `weftdb_data` directory as a last resort.
 #[must_use]
 pub fn default_data_dir() -> String {
-	dirs::home_dir()
-		.map(|home| home.join(".weftdb").join("data"))
-		.or_else(|| dirs::data_dir().map(|data| data.join("weftdb")))
-		.unwrap_or_else(|| PathBuf::from("weftdb_data"))
-		.to_string_lossy()
-		.into_owned()
+	dirs::home_dir().map(|home| home.join(".weftdb").join("data")).or_else(|| dirs::data_dir().map(|data| data.join("weftdb"))).unwrap_or_else(|| PathBuf::from("weftdb_data")).to_string_lossy().into_owned()
 }
 
 /// Returns the active data directory for WeftDB databases.
@@ -45,9 +40,7 @@ pub fn default_data_dir() -> String {
 /// 3. [`default_data_dir`] — the portable per-user default.
 #[must_use]
 pub fn data_dir() -> String {
-	std::env::var("TEST_DATA_DIR")
-		.or_else(|_| std::env::var("WEFT_DATA_DIR"))
-		.unwrap_or_else(|_| default_data_dir())
+	std::env::var("TEST_DATA_DIR").or_else(|_| std::env::var("WEFT_DATA_DIR")).unwrap_or_else(|_| default_data_dir())
 }
 
 // Version information

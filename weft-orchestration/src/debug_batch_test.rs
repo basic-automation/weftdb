@@ -3,12 +3,10 @@ use ::weftdb::database::traits::{AspectStructure, Inputs, Outputs};
 use anyhow::Result;
 use bigdecimal::BigDecimal;
 use chrono::{TimeZone, Utc};
-use weftdb::{
-	data_dir, database::traits::DatabaseStructure, Database, DatasetId, InputMeasurement
-};
 use futures::TryStreamExt;
 use splimes::{Resolution, Spline};
 use tokio::fs::remove_dir_all;
+use weftdb::{data_dir, database::traits::DatabaseStructure, Database, DatasetId, InputMeasurement};
 
 use crate::batch_utils::build_unprocessed_queue;
 

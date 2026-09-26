@@ -331,12 +331,7 @@ impl DatabaseStructure for Database {
 		let create_aspects_table_transaction = Self::metadata_database_create_aspects_table(conn).await?;
 		tracing::debug!("All tables created successfully");
 
-		Ok(vec![
-			create_transactions_table_transaction,
-			create_database_table_transaction,
-			create_subjects_table_transaction,
-			create_aspects_table_transaction
-		])
+		Ok(vec![create_transactions_table_transaction, create_database_table_transaction, create_subjects_table_transaction, create_aspects_table_transaction])
 	}
 
 	/// Creates a new database instance. Creates folder /{`data_dir}/{name`}.

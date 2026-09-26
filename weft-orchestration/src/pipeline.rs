@@ -38,12 +38,12 @@ use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 use anyhow::Result;
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
-use weftdb::{
-	database::traits::{DatabaseStructure, Inputs, Outputs, PipelineInputs, PipelineOutputs}, AspectId, Database, DetectorMetadata, DetectorType, EventID, PipelineConfig as DbPipelineConfig, PipelineState as DbPipelineState, Resolution
-};
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use splimes::Spline;
+use weftdb::{
+	database::traits::{DatabaseStructure, Inputs, Outputs, PipelineInputs, PipelineOutputs}, AspectId, Database, DetectorMetadata, DetectorType, EventID, PipelineConfig as DbPipelineConfig, PipelineState as DbPipelineState, Resolution
+};
 
 use crate::{Dictionary, DictionaryConstraints, Event, SignalType, Signals, SIGNALS_QUEUE};
 

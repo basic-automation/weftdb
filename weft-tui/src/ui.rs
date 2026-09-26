@@ -1,9 +1,9 @@
-use chrono::{DateTime, Utc, Datelike, Timelike};
-use weftdb::database::traits::AspectStructure;
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use ratatui::{
 	layout::{Constraint, Direction, Layout, Rect}, style::{Color, Modifier, Style}, widgets::{Block, Borders, Chart, Dataset, GraphType, List, ListItem, Paragraph}, Frame
 };
 use splimes::Resolution;
+use weftdb::database::traits::AspectStructure;
 
 use crate::app::{App, AppState, CompressionField, CompressionMode, CompressionStatus};
 
@@ -183,10 +183,7 @@ fn draw_loading(f: &mut Frame, loaded_count: usize, total_scanned: usize, status
 /// Draw loading screen with compression pane visible
 fn draw_loading_with_compression(f: &mut Frame, app: &App, loaded_count: usize, total_scanned: usize, status: &str, area: Rect) {
 	// Split horizontally: loading area + compression pane (75/25)
-	let h_chunks = Layout::default()
-		.direction(Direction::Horizontal)
-		.constraints([Constraint::Percentage(75), Constraint::Percentage(25)])
-		.split(area);
+	let h_chunks = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(75), Constraint::Percentage(25)]).split(area);
 
 	// Draw loading in left area
 	draw_loading(f, loaded_count, total_scanned, status, h_chunks[0]);
@@ -216,10 +213,7 @@ fn draw_plot_with_progress(f: &mut Frame, app: &App, loaded: usize, total: usize
 /// Draw plot with both import progress and compression pane
 fn draw_plot_with_progress_and_compression(f: &mut Frame, app: &App, loaded: usize, total: usize, status: &str, area: Rect) {
 	// Split horizontally: plot + compression pane (75/25)
-	let h_chunks = Layout::default()
-		.direction(Direction::Horizontal)
-		.constraints([Constraint::Percentage(75), Constraint::Percentage(25)])
-		.split(area);
+	let h_chunks = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(75), Constraint::Percentage(25)]).split(area);
 
 	// Split the left side vertically: plot + progress bar
 	let v_chunks = Layout::default()
@@ -372,47 +366,25 @@ fn format_date_for_resolution(timestamp: DateTime<Utc>, resolution: Resolution) 
 	match resolution {
 		// For fine resolutions, show time with date
 		Resolution::Nanoseconds | Resolution::Microseconds | Resolution::Milliseconds => {
-			format!("{:02}:{:02}:{:02}.{:03}",
-				timestamp.hour(),
-				timestamp.minute(),
-				timestamp.second(),
-				timestamp.timestamp_subsec_millis())
+			format!("{:02}:{:02}:{:02}.{:03}", timestamp.hour(), timestamp.minute(), timestamp.second(), timestamp.timestamp_subsec_millis())
 		}
 		Resolution::Seconds => {
-			format!("{:02}:{:02}:{:02}",
-				timestamp.hour(),
-				timestamp.minute(),
-				timestamp.second())
+			format!("{:02}:{:02}:{:02}", timestamp.hour(), timestamp.minute(), timestamp.second())
 		}
 		Resolution::Minutes => {
-			format!("{:02}/{:02} {:02}:{:02}",
-				timestamp.month(),
-				timestamp.day(),
-				timestamp.hour(),
-				timestamp.minute())
+			format!("{:02}/{:02} {:02}:{:02}", timestamp.month(), timestamp.day(), timestamp.hour(), timestamp.minute())
 		}
 		Resolution::Hours => {
-			format!("{:02}/{:02} {:02}:00",
-				timestamp.month(),
-				timestamp.day(),
-				timestamp.hour())
+			format!("{:02}/{:02} {:02}:00", timestamp.month(), timestamp.day(), timestamp.hour())
 		}
 		Resolution::Days => {
-			format!("{}-{:02}-{:02}",
-				timestamp.year(),
-				timestamp.month(),
-				timestamp.day())
+			format!("{}-{:02}-{:02}", timestamp.year(), timestamp.month(), timestamp.day())
 		}
 		Resolution::Weeks => {
-			format!("{}-{:02}-{:02}",
-				timestamp.year(),
-				timestamp.month(),
-				timestamp.day())
+			format!("{}-{:02}-{:02}", timestamp.year(), timestamp.month(), timestamp.day())
 		}
 		Resolution::Months => {
-			format!("{}-{:02}",
-				timestamp.year(),
-				timestamp.month())
+			format!("{}-{:02}", timestamp.year(), timestamp.month())
 		}
 		Resolution::Years => {
 			format!("{}", timestamp.year())
@@ -492,11 +464,7 @@ fn draw_plot(f: &mut Frame, app: &App, area: Rect) {
 	// Generate x-axis labels with min, mid, max values in readable format
 	// Include both relative time and actual date
 	let x_mid = (x_min + x_max) / 2.0;
-	let x_labels = [
-		format_time_label_with_date(x_min, resolution, first_timestamp),
-		format_time_label_with_date(x_mid, resolution, first_timestamp),
-		format_time_label_with_date(x_max, resolution, first_timestamp),
-	];
+	let x_labels = [format_time_label_with_date(x_min, resolution, first_timestamp), format_time_label_with_date(x_mid, resolution, first_timestamp), format_time_label_with_date(x_max, resolution, first_timestamp)];
 
 	// Generate y-axis labels with min, mid, max values
 	let y_mid = (y_min + y_max) / 2.0;
@@ -508,8 +476,7 @@ fn draw_plot(f: &mut Frame, app: &App, area: Rect) {
 
 	// Show streaming indicator when loading is in progress
 	if app.loading_in_progress {
-		let indicator = Paragraph::new(" Streaming data... ")
-			.style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+		let indicator = Paragraph::new(" Streaming data... ").style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
 		let chart_area = chunks[1];
 		let area = Rect::new(chart_area.x + 2, chart_area.y + chart_area.height.saturating_sub(2), 20, 1);
 		f.render_widget(indicator, area);
@@ -653,15 +620,7 @@ fn draw_error(f: &mut Frame, msg: &str, area: Rect) {
 
 /// Draw compression mode selection screen
 fn draw_compression_mode_selection(f: &mut Frame, app: &App, selected_index: usize, area: Rect) {
-	let items: Vec<ListItem> = vec![
-		ListItem::new("Disabled - Remove compression config"),
-		ListItem::new("Time-based (7 years) - Keep 7 years uncompressed, 1-year tiers"),
-		ListItem::new("Time-based (custom) - Configure time-based settings"),
-		ListItem::new("Size-based (10 GB) - Compress to fit within 10GB"),
-		ListItem::new("Size-based (1 GB) - Compress to fit within 1GB"),
-		ListItem::new("Size-based (custom) - Configure size-based settings"),
-		ListItem::new("Combined - Both time and size based"),
-	];
+	let items: Vec<ListItem> = vec![ListItem::new("Disabled - Remove compression config"), ListItem::new("Time-based (7 years) - Keep 7 years uncompressed, 1-year tiers"), ListItem::new("Time-based (custom) - Configure time-based settings"), ListItem::new("Size-based (10 GB) - Compress to fit within 10GB"), ListItem::new("Size-based (1 GB) - Compress to fit within 1GB"), ListItem::new("Size-based (custom) - Configure size-based settings"), ListItem::new("Combined - Both time and size based")];
 
 	let chunks = Layout::default()
 		.direction(Direction::Vertical)
@@ -671,37 +630,19 @@ fn draw_compression_mode_selection(f: &mut Frame, app: &App, selected_index: usi
 		])
 		.split(area);
 
-	let list = List::new(items)
-		.block(Block::default().borders(Borders::ALL).title("Configure Compression"))
-		.highlight_style(Style::default().fg(Color::Yellow))
-		.highlight_symbol(">> ");
+	let list = List::new(items).block(Block::default().borders(Borders::ALL).title("Configure Compression")).highlight_style(Style::default().fg(Color::Yellow)).highlight_symbol(">> ");
 
 	let mut list_state = app.compression_list_state;
 	list_state.select(Some(selected_index));
 	f.render_stateful_widget(list, chunks[0], &mut list_state);
 
-	let help = Paragraph::new("Up/Down: Navigate | Enter: Select | Esc: Cancel")
-		.block(Block::default().borders(Borders::ALL).title("Instructions"));
+	let help = Paragraph::new("Up/Down: Navigate | Enter: Select | Esc: Cancel").block(Block::default().borders(Borders::ALL).title("Instructions"));
 	f.render_widget(help, chunks[1]);
 }
 
 /// Draw compression configuration screen
 #[allow(clippy::too_many_arguments)]
-fn draw_compression_config(
-	f: &mut Frame,
-	mode: &CompressionMode,
-	time_pure_days: &str,
-	time_tier_days: &str,
-	time_max_tiers: &str,
-	time_scaling_index: usize,
-	size_target_gb: &str,
-	size_min_agg: &str,
-	size_max_agg: &str,
-	base_resolution_index: usize,
-	focused_field: &CompressionField,
-	validation_error: Option<&str>,
-	area: Rect,
-) {
+fn draw_compression_config(f: &mut Frame, mode: &CompressionMode, time_pure_days: &str, time_tier_days: &str, time_max_tiers: &str, time_scaling_index: usize, size_target_gb: &str, size_min_agg: &str, size_max_agg: &str, base_resolution_index: usize, focused_field: &CompressionField, validation_error: Option<&str>, area: Rect) {
 	let title = match mode {
 		CompressionMode::TimeBased => "Time-Based Compression",
 		CompressionMode::SizeBased => "Size-Based Compression",
@@ -718,12 +659,9 @@ fn draw_compression_config(
 	let mut constraints = vec![Constraint::Length(3); field_count]; // Fields
 	constraints.push(Constraint::Length(3)); // Error area
 	constraints.push(Constraint::Length(3)); // Instructions
-	constraints.push(Constraint::Min(0));    // Padding
+	constraints.push(Constraint::Min(0)); // Padding
 
-	let chunks = Layout::default()
-		.direction(Direction::Vertical)
-		.constraints(constraints)
-		.split(area);
+	let chunks = Layout::default().direction(Direction::Vertical).constraints(constraints).split(area);
 
 	let scaling_options = ["Linear", "Exponential"];
 	let resolution_options = ["Nanoseconds", "Microseconds", "Milliseconds", "Seconds", "Minutes", "Hours", "Days", "Weeks", "Months", "Years"];
@@ -733,66 +671,30 @@ fn draw_compression_config(
 	// Time-based fields
 	if matches!(mode, CompressionMode::TimeBased | CompressionMode::Combined) {
 		// Pure duration
-		let style = if *focused_field == CompressionField::TimePureDays {
-			Style::default().fg(Color::Yellow)
-		} else {
-			Style::default()
-		};
-		let display = if *focused_field == CompressionField::TimePureDays {
-			format!("{}|", time_pure_days)
-		} else {
-			time_pure_days.to_string()
-		};
-		let field = Paragraph::new(display)
-			.block(Block::default().borders(Borders::ALL).title("Pure Duration (days)"))
-			.style(style);
+		let style = if *focused_field == CompressionField::TimePureDays { Style::default().fg(Color::Yellow) } else { Style::default() };
+		let display = if *focused_field == CompressionField::TimePureDays { format!("{}|", time_pure_days) } else { time_pure_days.to_string() };
+		let field = Paragraph::new(display).block(Block::default().borders(Borders::ALL).title("Pure Duration (days)")).style(style);
 		f.render_widget(field, chunks[chunk_idx]);
 		chunk_idx += 1;
 
 		// Tier duration
-		let style = if *focused_field == CompressionField::TimeTierDays {
-			Style::default().fg(Color::Yellow)
-		} else {
-			Style::default()
-		};
-		let display = if *focused_field == CompressionField::TimeTierDays {
-			format!("{}|", time_tier_days)
-		} else {
-			time_tier_days.to_string()
-		};
-		let field = Paragraph::new(display)
-			.block(Block::default().borders(Borders::ALL).title("Tier Duration (days)"))
-			.style(style);
+		let style = if *focused_field == CompressionField::TimeTierDays { Style::default().fg(Color::Yellow) } else { Style::default() };
+		let display = if *focused_field == CompressionField::TimeTierDays { format!("{}|", time_tier_days) } else { time_tier_days.to_string() };
+		let field = Paragraph::new(display).block(Block::default().borders(Borders::ALL).title("Tier Duration (days)")).style(style);
 		f.render_widget(field, chunks[chunk_idx]);
 		chunk_idx += 1;
 
 		// Max tiers
-		let style = if *focused_field == CompressionField::TimeMaxTiers {
-			Style::default().fg(Color::Yellow)
-		} else {
-			Style::default()
-		};
-		let display = if *focused_field == CompressionField::TimeMaxTiers {
-			format!("{}|", time_max_tiers)
-		} else {
-			time_max_tiers.to_string()
-		};
-		let field = Paragraph::new(display)
-			.block(Block::default().borders(Borders::ALL).title("Max Tiers"))
-			.style(style);
+		let style = if *focused_field == CompressionField::TimeMaxTiers { Style::default().fg(Color::Yellow) } else { Style::default() };
+		let display = if *focused_field == CompressionField::TimeMaxTiers { format!("{}|", time_max_tiers) } else { time_max_tiers.to_string() };
+		let field = Paragraph::new(display).block(Block::default().borders(Borders::ALL).title("Max Tiers")).style(style);
 		f.render_widget(field, chunks[chunk_idx]);
 		chunk_idx += 1;
 
 		// Scaling dropdown
-		let style = if *focused_field == CompressionField::TimeScaling {
-			Style::default().fg(Color::Yellow)
-		} else {
-			Style::default()
-		};
+		let style = if *focused_field == CompressionField::TimeScaling { Style::default().fg(Color::Yellow) } else { Style::default() };
 		let scaling_text = format!("< {} >", scaling_options[time_scaling_index]);
-		let field = Paragraph::new(scaling_text)
-			.block(Block::default().borders(Borders::ALL).title("Scaling"))
-			.style(style);
+		let field = Paragraph::new(scaling_text).block(Block::default().borders(Borders::ALL).title("Scaling")).style(style);
 		f.render_widget(field, chunks[chunk_idx]);
 		chunk_idx += 1;
 	}
@@ -800,95 +702,50 @@ fn draw_compression_config(
 	// Size-based fields
 	if matches!(mode, CompressionMode::SizeBased | CompressionMode::Combined) {
 		// Target size
-		let style = if *focused_field == CompressionField::SizeTargetGb {
-			Style::default().fg(Color::Yellow)
-		} else {
-			Style::default()
-		};
-		let display = if *focused_field == CompressionField::SizeTargetGb {
-			format!("{}|", size_target_gb)
-		} else {
-			size_target_gb.to_string()
-		};
-		let field = Paragraph::new(display)
-			.block(Block::default().borders(Borders::ALL).title("Target Size (GB)"))
-			.style(style);
+		let style = if *focused_field == CompressionField::SizeTargetGb { Style::default().fg(Color::Yellow) } else { Style::default() };
+		let display = if *focused_field == CompressionField::SizeTargetGb { format!("{}|", size_target_gb) } else { size_target_gb.to_string() };
+		let field = Paragraph::new(display).block(Block::default().borders(Borders::ALL).title("Target Size (GB)")).style(style);
 		f.render_widget(field, chunks[chunk_idx]);
 		chunk_idx += 1;
 
 		// Min aggressiveness
-		let style = if *focused_field == CompressionField::SizeMinAgg {
-			Style::default().fg(Color::Yellow)
-		} else {
-			Style::default()
-		};
-		let display = if *focused_field == CompressionField::SizeMinAgg {
-			format!("{}|", size_min_agg)
-		} else {
-			size_min_agg.to_string()
-		};
-		let field = Paragraph::new(display)
-			.block(Block::default().borders(Borders::ALL).title("Min Aggressiveness (0-1)"))
-			.style(style);
+		let style = if *focused_field == CompressionField::SizeMinAgg { Style::default().fg(Color::Yellow) } else { Style::default() };
+		let display = if *focused_field == CompressionField::SizeMinAgg { format!("{}|", size_min_agg) } else { size_min_agg.to_string() };
+		let field = Paragraph::new(display).block(Block::default().borders(Borders::ALL).title("Min Aggressiveness (0-1)")).style(style);
 		f.render_widget(field, chunks[chunk_idx]);
 		chunk_idx += 1;
 
 		// Max aggressiveness
-		let style = if *focused_field == CompressionField::SizeMaxAgg {
-			Style::default().fg(Color::Yellow)
-		} else {
-			Style::default()
-		};
-		let display = if *focused_field == CompressionField::SizeMaxAgg {
-			format!("{}|", size_max_agg)
-		} else {
-			size_max_agg.to_string()
-		};
-		let field = Paragraph::new(display)
-			.block(Block::default().borders(Borders::ALL).title("Max Aggressiveness (0-1)"))
-			.style(style);
+		let style = if *focused_field == CompressionField::SizeMaxAgg { Style::default().fg(Color::Yellow) } else { Style::default() };
+		let display = if *focused_field == CompressionField::SizeMaxAgg { format!("{}|", size_max_agg) } else { size_max_agg.to_string() };
+		let field = Paragraph::new(display).block(Block::default().borders(Borders::ALL).title("Max Aggressiveness (0-1)")).style(style);
 		f.render_widget(field, chunks[chunk_idx]);
 		chunk_idx += 1;
 	}
 
 	// Base resolution (always shown)
-	let style = if *focused_field == CompressionField::BaseResolution {
-		Style::default().fg(Color::Yellow)
-	} else {
-		Style::default()
-	};
+	let style = if *focused_field == CompressionField::BaseResolution { Style::default().fg(Color::Yellow) } else { Style::default() };
 	let resolution_text = format!("< {} >", resolution_options[base_resolution_index]);
-	let field = Paragraph::new(resolution_text)
-		.block(Block::default().borders(Borders::ALL).title("Base Resolution"))
-		.style(style);
+	let field = Paragraph::new(resolution_text).block(Block::default().borders(Borders::ALL).title("Base Resolution")).style(style);
 	f.render_widget(field, chunks[chunk_idx]);
 	chunk_idx += 1;
 
 	// Error area
 	if let Some(err) = validation_error {
-		let error_box = Paragraph::new(err)
-			.block(Block::default().borders(Borders::ALL))
-			.style(Style::default().fg(Color::Red));
+		let error_box = Paragraph::new(err).block(Block::default().borders(Borders::ALL)).style(Style::default().fg(Color::Red));
 		f.render_widget(error_box, chunks[chunk_idx]);
 	}
 	chunk_idx += 1;
 
 	// Instructions
-	let help = Paragraph::new("Up/Down: Fields | Left/Right: Options | Enter: Run | Esc: Back")
-		.block(Block::default().borders(Borders::ALL).title(title));
+	let help = Paragraph::new("Up/Down: Fields | Left/Right: Options | Enter: Run | Esc: Back").block(Block::default().borders(Borders::ALL).title(title));
 	f.render_widget(help, chunks[chunk_idx]);
 }
 
 /// Draw plot with compression status pane on the right
 fn draw_plot_with_compression_pane(f: &mut Frame, app: &App, area: Rect) {
 	// Split horizontally: plot (70%) + compression pane (30%)
-	let chunks = Layout::default()
-		.direction(Direction::Horizontal)
-		.constraints([
-			Constraint::Percentage(70),
-			Constraint::Percentage(30),
-		])
-		.split(area);
+	let chunks = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(70), Constraint::Percentage(30)]).split(area);
 
 	// Draw the plot on the left
 	draw_plot(f, app, chunks[0]);
@@ -902,17 +759,10 @@ fn draw_compression_pane(f: &mut Frame, app: &App, area: Rect) {
 	let content = match &app.compression_status {
 		Some(CompressionStatus::Running { phase, progress_percent, current_tier, total_tiers, aggressiveness, time_range }) => {
 			let spinner_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-			let spinner_idx = std::time::SystemTime::now()
-				.duration_since(std::time::UNIX_EPOCH)
-				.unwrap_or_default()
-				.as_millis() as usize / 100 % spinner_chars.len();
+			let spinner_idx = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as usize / 100 % spinner_chars.len();
 			let spinner = spinner_chars[spinner_idx];
 
-			let progress_str = if let Some(pct) = progress_percent {
-				format!("{}%", pct)
-			} else {
-				"...".to_string()
-			};
+			let progress_str = if let Some(pct) = progress_percent { format!("{}%", pct) } else { "...".to_string() };
 
 			let tier_info = match (current_tier, total_tiers) {
 				(Some(curr), Some(total)) if *total > 0 => format!("  Tier: {} of {}\n", curr, total),
@@ -933,67 +783,28 @@ fn draw_compression_pane(f: &mut Frame, app: &App, area: Rect) {
 				None => String::new(),
 			};
 
-			format!(
-				"  {} Status: Running\n\n  Phase:\n  {}\n\n{}{}{}  {} Processing {}\n\n  [Esc] Cancel",
-				spinner, phase, tier_info, agg_info, range_info, spinner, progress_str
-			)
+			format!("  {} Status: Running\n\n  Phase:\n  {}\n\n{}{}{}  {} Processing {}\n\n  [Esc] Cancel", spinner, phase, tier_info, agg_info, range_info, spinner, progress_str)
 		}
-		Some(CompressionStatus::Complete {
-			original_count,
-			compressed_count,
-			compression_ratio,
-			final_size_bytes,
-			time_based_tiers,
-			size_based_iterations,
-			duration_ms,
-		}) => {
+		Some(CompressionStatus::Complete { original_count, compressed_count, compression_ratio, final_size_bytes, time_based_tiers, size_based_iterations, duration_ms }) => {
 			let ratio_pct = compression_ratio * 100.0;
 			let size_str = format_bytes(*final_size_bytes);
 			let duration_str = format_duration_ms(*duration_ms);
 
-			format!(
-				"  {} Complete!\n\n  Original:  {:>10}\n  Compressed:{:>10}\n  Ratio:     {:>9.1}%\n  Final Size:{:>10}\n\n  Time tiers:    {:>5}\n  Size iters:    {:>5}\n  Duration:   {:>8}\n\n  [Esc] Dismiss",
-				"✓",
-				format_number(*original_count),
-				format_number(*compressed_count),
-				ratio_pct,
-				size_str,
-				time_based_tiers,
-				size_based_iterations,
-				duration_str
-			)
+			format!("  {} Complete!\n\n  Original:  {:>10}\n  Compressed:{:>10}\n  Ratio:     {:>9.1}%\n  Final Size:{:>10}\n\n  Time tiers:    {:>5}\n  Size iters:    {:>5}\n  Duration:   {:>8}\n\n  [Esc] Dismiss", "✓", format_number(*original_count), format_number(*compressed_count), ratio_pct, size_str, time_based_tiers, size_based_iterations, duration_str)
 		}
 		Some(CompressionStatus::Error(msg)) => {
 			format!("  {} Error\n\n  {}\n\n\n\n  [Esc] Dismiss", "✗", msg)
 		}
-		Some(CompressionStatus::Idle { last_compression, dirty_regions_count }) => {
-			match last_compression {
-				Some(info) => {
-					let ratio_pct = info.compression_ratio * 100.0;
-					let time_ago = format_time_ago(info.completed_at);
-					let dirty_str = if *dirty_regions_count > 0 {
-						format!("\n  Dirty regions: {}", dirty_regions_count)
-					} else {
-						String::new()
-					};
-					format!(
-						"  Last Compression\n  {}\n\n  Original:  {:>10}\n  Compressed:{:>10}\n  Ratio:     {:>9.1}%\n  Tiers:         {:>5}{}\n\n  [c] Run compression",
-						time_ago,
-						format_number(info.original_count),
-						format_number(info.compressed_count),
-						ratio_pct,
-						info.time_based_tiers,
-						dirty_str
-					)
-				}
-				None => {
-					"  No compression history\n\n  Press [c] to configure\n  and run compression".to_string()
-				}
+		Some(CompressionStatus::Idle { last_compression, dirty_regions_count }) => match last_compression {
+			Some(info) => {
+				let ratio_pct = info.compression_ratio * 100.0;
+				let time_ago = format_time_ago(info.completed_at);
+				let dirty_str = if *dirty_regions_count > 0 { format!("\n  Dirty regions: {}", dirty_regions_count) } else { String::new() };
+				format!("  Last Compression\n  {}\n\n  Original:  {:>10}\n  Compressed:{:>10}\n  Ratio:     {:>9.1}%\n  Tiers:         {:>5}{}\n\n  [c] Run compression", time_ago, format_number(info.original_count), format_number(info.compressed_count), ratio_pct, info.time_based_tiers, dirty_str)
 			}
-		}
-		None => {
-			"  Loading compression\n  statistics...".to_string()
-		}
+			None => "  No compression history\n\n  Press [c] to configure\n  and run compression".to_string(),
+		},
+		None => "  Loading compression\n  statistics...".to_string(),
 	};
 
 	let style = match &app.compression_status {
@@ -1005,9 +816,7 @@ fn draw_compression_pane(f: &mut Frame, app: &App, area: Rect) {
 		None => Style::default().fg(Color::DarkGray),
 	};
 
-	let paragraph = Paragraph::new(content)
-		.block(Block::default().borders(Borders::ALL).title("Compression"))
-		.style(style);
+	let paragraph = Paragraph::new(content).block(Block::default().borders(Borders::ALL).title("Compression")).style(style);
 	f.render_widget(paragraph, area);
 }
 

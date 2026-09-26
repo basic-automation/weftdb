@@ -13,8 +13,8 @@
 //! result artifacts remain interpretable.
 
 use bigdecimal::BigDecimal;
-use weft_physical_type::{encode_delta_of_delta, fire_estimated_bytes, recommend_encoding, TimeUnit};
 use serde::{Deserialize, Serialize};
+use weft_physical_type::{encode_delta_of_delta, fire_estimated_bytes, recommend_encoding, TimeUnit};
 
 use crate::{
 	accuracy::AccuracyMetrics, profile::SignalShape, stats::{LatencyCis, LatencyStats}

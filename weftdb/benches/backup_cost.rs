@@ -39,10 +39,10 @@ use std::{hint::black_box, path::PathBuf};
 
 use bigdecimal::BigDecimal;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
-use weftdb::{SegmentStore, VerifyMode};
-use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
+use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
+use weftdb::{SegmentStore, VerifyMode};
 
 /// The base directory temp stores/backups are created under: `WEFT_BENCH_BACKUP_DIR` when
 /// set, else the system temp dir (often `tmpfs` — see the module docs).
