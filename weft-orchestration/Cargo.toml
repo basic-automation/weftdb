@@ -13,6 +13,7 @@ categories = ["science", "algorithms", "database"]
 
 
 [dependencies]
+sysinfo = { workspace = true }
 bigdecimal = { workspace = true, features = ["serde", "serde-json", "string-only"] }
 weftdb = { workspace = true }  # Reference the local workspace member directly
 anyhow = { workspace = true }

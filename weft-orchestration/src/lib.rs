@@ -1005,62 +1005,17 @@ pub async fn load_dictionary(database: &Database, aspect_id: &weftdb::AspectId, 
 	Ok(())
 }
 
-/// Get available system memory in MB
-/// Returns a conservative estimate to prevent memory exhaustion
+/// Available system memory in MB, or a conservative 2 GB if the platform won't say.
+///
+/// Uses a memory-only `sysinfo::System`, which reads the real figure on Linux, macOS and
+/// Windows. (This replaced hand-rolled per-platform code: unsafe Windows FFI,
+/// `/proc/meminfo` parsing, and a hard-coded 4 GB guess on macOS.)
 fn get_available_memory_mb() -> usize {
-	#[cfg(target_os = "windows")]
-	{
-		use std::mem;
-
-		#[repr(C)]
-		struct MemoryStatusEx {
-			dw_length: u32,
-			dw_memory_load: u32,
-			ull_total_phys: u64,
-			ull_avail_phys: u64,
-			ull_total_page_file: u64,
-			ull_avail_page_file: u64,
-			ull_total_virtual: u64,
-			ull_avail_virtual: u64,
-			ull_avail_extended_virtual: u64,
-		}
-
-		extern "system" {
-			fn GlobalMemoryStatusEx(lpBuffer: *mut MemoryStatusEx) -> i32;
-		}
-
-		let mut mem_status = MemoryStatusEx { dw_length: u32::try_from(mem::size_of::<MemoryStatusEx>()).unwrap(), dw_memory_load: 0, ull_total_phys: 0, ull_avail_phys: 0, ull_total_page_file: 0, ull_avail_page_file: 0, ull_total_virtual: 0, ull_avail_virtual: 0, ull_avail_extended_virtual: 0 };
-
-		unsafe {
-			if GlobalMemoryStatusEx(&raw mut mem_status) != 0 {
-				return (mem_status.ull_avail_phys / (1024 * 1024)) as usize;
-			}
-		}
+	let system = sysinfo::System::new_with_specifics(sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::everything()));
+	match system.available_memory() {
+		0 => 2048,
+		bytes => usize::try_from(bytes / (1024 * 1024)).unwrap_or(usize::MAX),
 	}
-
-	#[cfg(target_os = "linux")]
-	{
-		if let Ok(contents) = std::fs::read_to_string("/proc/meminfo") {
-			for line in contents.lines() {
-				if line.starts_with("MemAvailable:") {
-					if let Some(value) = line.split_whitespace().nth(1) {
-						if let Ok(kb) = value.parse::<usize>() {
-							return kb / 1024; // Convert KB to MB
-						}
-					}
-				}
-			}
-		}
-	}
-
-	#[cfg(target_os = "macos")]
-	{
-		// Fallback for macOS - could implement using sysctl if needed
-		return 4096; // 4GB conservative fallback
-	}
-
-	// Conservative fallback if we can't determine memory
-	2048 // 2GB conservative fallback
 }
 
 /// Detects 5% price increases from month start to month end

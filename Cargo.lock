@@ -5176,6 +5176,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "splimes",
+ "sysinfo",
  "tokio",
  "tracing",
  "tracing-subscriber",
