@@ -845,13 +845,65 @@ fn metadata_log_path(db_name: &str) -> std::path::PathBuf {
 	std::path::Path::new(&Database::get_data_dir()).join(db_name).join("metadata.db-log")
 }
 
+/// Fold `metadata.db`'s logical log into the main file, leaving a zero-length `-log`
+/// (TRUNCATE is the default checkpoint mode under MVCC).
+async fn truncate_checkpoint(metadata: &turso::Database) -> Result<()> {
+	let conn = metadata.connect()?;
+	let mut rows = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await?;
+	while rows.next().await?.is_some() {}
+	Ok(())
+}
+
+/// Give `metadata.db` and its sidecars (`-log`, any `-wal`) fresh inodes at the same paths,
+/// by copying each one and renaming the copy over it, so the next open is **cold by
+/// construction**.
+///
+/// [`release_database`] makes the reopen cold only as long as nothing else still holds the
+/// old Turso database. Turso's process-wide registry is keyed by the DB file's (dev, ino),
+/// so if a strong handle ever leaked (in `DatabaseInfo`, a cache or a background task) the
+/// reopen would get the live in-memory database back, and the test would pass even with the
+/// log deleted, because the unlink would not touch the live MVCC store. New inodes cannot
+/// match a registry entry, so the reopen has to replay the `-log` from disk. The paths stay
+/// put because the legacy store records its absolute `metadata_path` in metadata.db.
+fn reinode_metadata_files(db_name: &str) -> Result<()> {
+	let dir = std::path::Path::new(&Database::get_data_dir()).join(db_name);
+	for entry in std::fs::read_dir(&dir)? {
+		let path = entry?.path();
+		let is_metadata = path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("metadata.db"));
+		if is_metadata && path.is_file() {
+			let mut copy = path.clone().into_os_string();
+			copy.push(".reinode");
+			std::fs::copy(&path, &copy).with_context(|| format!("copying {}", path.display()))?;
+			std::fs::rename(&copy, &path).with_context(|| format!("renaming the copy over {}", path.display()))?;
+		}
+	}
+	Ok(())
+}
+
+/// Release every handle to `db_name`, check that the acknowledged commits are still only in
+/// the logical log, then give the files fresh inodes, so the following
+/// [`Database::existing`] is a genuine cold open that must replay that log.
+async fn restart_with_uncheckpointed_log(db: Database, db_name: &str) -> Result<()> {
+	release_database(db, db_name).await;
+
+	// Precondition: the acknowledged commits are still only in the logical log. Without
+	// it the test would pass for the wrong reason (a checkpoint had already moved them).
+	let log_len = std::fs::metadata(metadata_log_path(db_name)).context("metadata.db-log is missing before the reopen")?.len();
+	assert!(log_len > 0, "precondition: metadata.db-log holds the uncheckpointed commits (it is empty)");
+
+	reinode_metadata_files(db_name)
+}
+
 /// **Regression (legacy-open-deletes-mvcc-logical-log).** Commits to `metadata.db` that
-/// were acknowledged before a restart must still be there after it.
+/// were acknowledged before a restart must still be there after it, and after a second
+/// restart that follows more writes (replay, then append, then replay again).
 ///
 /// Under MVCC every committed transaction lives in the `metadata.db-log` until a
-/// checkpoint copies it into the main file, and WeftDB's PASSIVE checkpoints are rejected
-/// under MVCC, so nothing ever is. The cold-open path used to delete that log
-/// unconditionally, which threw away the subject, the aspect and the unbatched queue — on
+/// checkpoint copies it into the main file. WeftDB's own PASSIVE checkpoints are rejected
+/// under MVCC, so they never run, and Turso checkpoints by itself only once the log passes
+/// about 4 MB, which this test stays far below (the precondition in
+/// [`restart_with_uncheckpointed_log`] checks it). The cold-open path used to delete that log
+/// unconditionally, which threw away the subject, the aspect and the unbatched queue; on
 /// main the reopen does not even find the `database` table.
 #[tokio::test]
 #[serial]
@@ -866,18 +918,14 @@ async fn acknowledged_metadata_commits_survive_cold_reopen() -> Result<()> {
 	let (subject_id, aspect_id) = (subject.id(), aspect.id());
 
 	let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
-	let batch: Vec<InputMeasurement> = (0..8).map(|i| InputMeasurement::new(base + Duration::seconds(i), BigDecimal::from(i))).collect();
-	let mut expected: Vec<DateTime<Utc>> = batch.iter().map(InputMeasurement::timestamp).collect();
-	db.batch_capture_measurements(aspect_id, DatasetId::new(), batch).await?;
+	let batch = |range: std::ops::Range<i64>| -> Vec<InputMeasurement> { range.map(|i| InputMeasurement::new(base + Duration::seconds(i), BigDecimal::from(i))).collect() };
+	let first = batch(0..8);
+	let mut expected: Vec<DateTime<Utc>> = first.iter().map(InputMeasurement::timestamp).collect();
+	db.batch_capture_measurements(aspect_id, DatasetId::new(), first).await?;
 	assert_eq!(db.count_unbatched_measurements(&aspect_id).await?, 8, "the batch is queued before the restart");
 
 	drop((subject, aspect));
-	release_database(db, &db_name).await;
-
-	// Precondition: the acknowledged commits are still only in the logical log. Without
-	// it the test would pass for the wrong reason (a checkpoint had already moved them).
-	let log_len = std::fs::metadata(metadata_log_path(&db_name)).context("metadata.db-log is missing before the reopen")?.len();
-	assert!(log_len > 0, "precondition: metadata.db-log holds the uncheckpointed commits (it is empty)");
+	restart_with_uncheckpointed_log(db, &db_name).await?;
 
 	let reopened = Database::existing(&db_name).await.context("cold reopen of a database with acknowledged metadata commits")?;
 
@@ -891,12 +939,27 @@ async fn acknowledged_metadata_commits_survive_cold_reopen() -> Result<()> {
 	expected.sort();
 	assert_eq!(queued, expected, "every queued timestamp survives the reopen");
 
+	// Append to the replayed log, then restart again: both generations of commits must survive.
+	let second = batch(8..16);
+	expected.extend(second.iter().map(InputMeasurement::timestamp));
+	reopened.batch_capture_measurements(aspect_id, DatasetId::new(), second).await?;
+	assert_eq!(reopened.count_unbatched_measurements(&aspect_id).await?, 16, "the second batch is queued before the second restart");
+	restart_with_uncheckpointed_log(reopened, &db_name).await?;
+
+	let reopened = Database::existing(&db_name).await.context("second cold reopen after appending to the replayed log")?;
+	assert!(reopened.list_subjects().await?.contains_key(&subject_id), "the subject survives the second reopen");
+	let mut queued = reopened.get_unbatched_measurements(&aspect_id).await?;
+	queued.sort();
+	expected.sort();
+	assert_eq!(queued, expected, "the queued timestamps from both batches survive the second reopen");
+
 	release_database(reopened, &db_name).await;
 	Ok(())
 }
 
 /// The cold-open sweep still removes a **zero-length** `metadata.db-log`: it holds no
-/// commits, so it is litter, the same rule `remove_empty_sidecars` applies to backups.
+/// commits and, once every handle is released, nothing has it open, so it is litter, the
+/// same rule `remove_empty_sidecars` applies to backups.
 ///
 /// Turso may create a fresh log as it opens, so "the path is gone" is not observable.
 /// Instead a hard link pins the empty log's inode: if the sweep unlinked it, the probe is
@@ -917,13 +980,9 @@ async fn zero_length_metadata_log_is_removed_on_cold_open() -> Result<()> {
 	let subject_id = subject.id();
 	drop(subject);
 
-	// Fold the logical log into the main file. Under MVCC the default checkpoint mode is
-	// TRUNCATE, which leaves the `-log` in place at length zero.
-	{
-		let conn = db.metadata().connect()?;
-		let mut rows = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await?;
-		while rows.next().await?.is_some() {}
-	}
+	// Fold the logical log into the main file; TRUNCATE leaves the `-log` in place at
+	// length zero.
+	truncate_checkpoint(db.metadata()).await?;
 	release_database(db, &db_name).await;
 
 	let log = metadata_log_path(&db_name);
@@ -937,5 +996,65 @@ async fn zero_length_metadata_log_is_removed_on_cold_open() -> Result<()> {
 	assert!(reopened.list_subjects().await?.contains_key(&subject_id), "the checkpointed subject is still readable");
 
 	release_database(reopened, &db_name).await;
+	Ok(())
+}
+
+/// Two concurrent cold opens of the same `metadata.db` over a zero-length `-log` must not
+/// unlink each other's live log.
+///
+/// The cold-open sweep removes a zero-length log as litter. Without the connection-cache
+/// guard held across the whole cold path, the second open could miss the cache, see the
+/// fresh empty log the first open's Turso open had just created, and unlink it; Turso
+/// (keyed by the DB file's inode) then hands both callers the same live database, whose
+/// commits are fsynced into an unlinked file that no restart will replay. Each round
+/// races two opens with the second one staggered across the first one's cold path,
+/// commits through the first, and checks the commit reached the `-log` on disk; after a
+/// crash-like release (no checkpoint) the next round's cold open must replay it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn concurrent_cold_opens_keep_the_live_metadata_log() -> Result<()> {
+	const ROUNDS: u64 = 20;
+
+	let temp_dir = tempfile::tempdir()?;
+	std::env::set_var("TEST_DATA_DIR", temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?);
+	let db_name = format!("coldrace_{}", Uuid::new_v4());
+	let db = Database::new(&db_name).await?;
+	let metadata_path = format!("{}/{}/metadata.db", Database::get_data_dir(), db_name);
+	release_database(db, &db_name).await;
+	let log = metadata_log_path(&db_name);
+
+	for round in 0..ROUNDS {
+		// Start from a zero-length log, which the sweep treats as litter.
+		let metadata = Database::get_turso_database(&metadata_path).await?;
+		truncate_checkpoint(&metadata).await?;
+		drop(metadata);
+		weftdb::clear_connection_cache_by_name(&db_name).await;
+		assert_eq!(std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0), 0, "precondition: round {round} starts from an empty log");
+
+		let first_path = metadata_path.clone();
+		let first = tokio::spawn(async move { Database::get_turso_database(&first_path).await });
+		let second_path = metadata_path.clone();
+		let stagger = std::time::Duration::from_micros(round * 250);
+		let second = tokio::spawn(async move {
+			tokio::time::sleep(stagger).await;
+			Database::get_turso_database(&second_path).await
+		});
+		let (first, second) = (first.await??, second.await??);
+
+		first.connect()?.execute("INSERT INTO transactions (id, message, created_at) VALUES (?, ?, ?)", turso::params![Uuid::new_v4().to_string(), format!("race {round}"), 0]).await?;
+		let log_len = std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0);
+		assert!(log_len > 0, "round {round} (stagger {stagger:?}): the acknowledged commit is not in the metadata.db-log on disk, so it went to an unlinked log");
+
+		// Release without a checkpoint, as a crash would.
+		drop((first, second));
+		weftdb::clear_connection_cache_by_name(&db_name).await;
+	}
+
+	let metadata = Database::get_turso_database(&metadata_path).await?;
+	let mut rows = metadata.connect()?.query("SELECT COUNT(*) FROM transactions WHERE message LIKE 'race %'", ()).await?;
+	let count: i64 = rows.next().await?.context("COUNT(*) returned no row")?.get(0)?;
+	assert_eq!(count, i64::try_from(ROUNDS)?, "every acknowledged commit survives the cold reopens");
+	drop((rows, metadata));
+	weftdb::clear_connection_cache_by_name(&db_name).await;
 	Ok(())
 }

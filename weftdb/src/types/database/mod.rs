@@ -65,8 +65,18 @@ impl DatabaseStructure for Database {
 
 	/// Get a Turso database for reuse with concurrent writes enabled
 	async fn get_turso_database(db_path: &str) -> Result<turso::Database> {
+		// Hold the cache guard for the whole cold path (log sweep, build, pragmas, insert), as
+		// `get_or_create_turso_database` does. The sweep below is only safe while no
+		// in-process handle to this database can exist: if two cold opens of the same path
+		// interleaved, the second could unlink the fresh log the first one's Turso open had
+		// just created, and Turso (whose process-wide registry is keyed by the DB file's
+		// inode) would hand the second caller that same live database, so every later commit
+		// would be fsynced into an unlinked file. Nothing below re-enters this map, so
+		// holding it cannot deadlock.
+		let mut cache = CONNECTION_DATABASES.lock().await;
+
 		// Check if the database is already in the cache, if so return it
-		if let Some(turso_db) = CONNECTION_DATABASES.lock().await.get(db_path) {
+		if let Some(turso_db) = cache.get(db_path) {
 			return Ok(turso_db.clone());
 		}
 
@@ -77,18 +87,31 @@ impl DatabaseStructure for Database {
 
 			// The MVCC logical log is where every committed transaction lives until a
 			// checkpoint copies it into the main file, and Turso replays it at open. WeftDB's
-			// PASSIVE checkpoints are rejected under MVCC, so for metadata.db it is usually the
-			// *only* copy of acknowledged commits: deleting a non-empty log here threw away the
-			// subjects, aspects and unbatched queue written before the restart. Only a
-			// zero-length log (no commits; what a TRUNCATE checkpoint leaves) is litter, the
-			// same rule `backup::remove_empty_sidecars` applies.
+			// PASSIVE checkpoints are rejected under MVCC and Turso only checkpoints by itself
+			// once the log passes ~4 MB, so for metadata.db the log is usually the *only* copy
+			// of acknowledged commits: deleting a non-empty log here threw away the subjects,
+			// aspects and unbatched queue written before the restart. A non-empty log is
+			// therefore always kept.
+			//
+			// A zero-length log holds no commits (Turso treats it as absent, and it is what a
+			// TRUNCATE checkpoint leaves), so it is removed as litter, the same rule
+			// `backup::remove_empty_sidecars` applies. That is only safe when no handle has the
+			// log open, which holds here because the guard above keeps any other WeftDB open of
+			// this path out and the cache miss means WeftDB has no cached handle to it.
+			// Residual cases this cannot see (crash-consistency design §12):
+			// - a clone of a `turso::Database` evicted by `close()` or
+			//   `clear_connection_cache_by_name` that is still alive in this process;
+			// - another process that has the database open. Its exclusive fcntl lock makes our
+			//   Turso open fail, but only after this sweep has run.
+			// In both cases unlinking a live, empty log would orphan the commits that follow.
 			match std::fs::metadata(&log_path) {
 				Ok(meta) if meta.len() == 0 => match std::fs::remove_file(&log_path) {
 					Ok(()) => tracing::debug!("Removed empty MVCC log file: {}", log_path),
 					Err(e) => tracing::warn!("Could not remove empty MVCC log file {}: {}", log_path, e),
 				},
 				Ok(meta) => tracing::info!("Keeping MVCC log file {} ({} bytes): it holds committed transactions that Turso replays on open", log_path, meta.len()),
-				Err(_) => {}
+				Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+				Err(e) => tracing::warn!("Could not stat MVCC log file {}: {}; leaving it in place", log_path, e),
 			}
 			// Only remove WAL files if they're empty (indicating incomplete transactions)
 			if Path::new(&wal_path).exists() && std::fs::metadata(&wal_path).map(|m| m.len() == 0).unwrap_or(false) {
@@ -120,7 +143,8 @@ impl DatabaseStructure for Database {
 				drop(conn);
 			}
 
-			CONNECTION_DATABASES.lock().await.insert(db_path.to_string(), turso_db.clone());
+			cache.insert(db_path.to_string(), turso_db.clone());
+			drop(cache);
 			return Ok(turso_db);
 		}
 

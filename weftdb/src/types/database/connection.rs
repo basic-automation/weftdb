@@ -158,9 +158,11 @@ impl Connection for Database {
 			Err(e) => {
 				// Expected under MVCC: Turso rejects PASSIVE unless
 				// `experimental_mvcc_passive_checkpoint` is set (turso_core-0.8.1
-				// translate/pragma.rs:943-948). Nothing is lost; every committed transaction
-				// is already fsynced in the `-log`, which Turso replays at open.
-				tracing::warn!("[checkpoint_wal_passive] PASSIVE checkpoint not run ({e}): Turso rejects PASSIVE under MVCC; committed data stays safe in the -log");
+				// translate/pragma.rs:943-948). Nothing is lost: every committed transaction is
+				// already durable, either in the `-log` (fsynced at COMMIT, replayed at open) or,
+				// once Turso's own TRUNCATE checkpoint has run past ~4 MB of log
+				// (mvcc/database/mod.rs:3706-3715), in the main file.
+				tracing::warn!("[checkpoint_wal_passive] PASSIVE checkpoint not run ({e}): Turso rejects PASSIVE under MVCC; committed data stays durable in the -log (or the main file after Turso's own checkpoint)");
 				Ok(())
 			}
 		}
