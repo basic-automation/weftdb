@@ -72,17 +72,23 @@ impl DatabaseStructure for Database {
 
 		// If not in cache check if the database file exists on disk
 		if Path::new(db_path).exists() {
-			// Check if MVCC log files exist - if so, try to clean them up first
-			// The turso MVCC mode can leave behind log files that cause permission errors on Windows
 			let log_path = format!("{db_path}-log");
 			let wal_path = format!("{db_path}-wal");
 
-			// Remove stale MVCC log files if they exist (they cause permission errors on reopening)
-			if Path::new(&log_path).exists() {
-				match std::fs::remove_file(&log_path) {
-					Ok(()) => tracing::debug!("Removed stale MVCC log file: {}", log_path),
-					Err(e) => tracing::warn!("Could not remove MVCC log file {}: {}", log_path, e),
-				}
+			// The MVCC logical log is where every committed transaction lives until a
+			// checkpoint copies it into the main file, and Turso replays it at open. WeftDB's
+			// PASSIVE checkpoints are rejected under MVCC, so for metadata.db it is usually the
+			// *only* copy of acknowledged commits: deleting a non-empty log here threw away the
+			// subjects, aspects and unbatched queue written before the restart. Only a
+			// zero-length log (no commits; what a TRUNCATE checkpoint leaves) is litter, the
+			// same rule `backup::remove_empty_sidecars` applies.
+			match std::fs::metadata(&log_path) {
+				Ok(meta) if meta.len() == 0 => match std::fs::remove_file(&log_path) {
+					Ok(()) => tracing::debug!("Removed empty MVCC log file: {}", log_path),
+					Err(e) => tracing::warn!("Could not remove empty MVCC log file {}: {}", log_path, e),
+				},
+				Ok(meta) => tracing::info!("Keeping MVCC log file {} ({} bytes): it holds committed transactions that Turso replays on open", log_path, meta.len()),
+				Err(_) => {}
 			}
 			// Only remove WAL files if they're empty (indicating incomplete transactions)
 			if Path::new(&wal_path).exists() && std::fs::metadata(&wal_path).map(|m| m.len() == 0).unwrap_or(false) {
@@ -105,8 +111,10 @@ impl DatabaseStructure for Database {
 				// Set busy timeout for handling transient locks
 				conn.execute("PRAGMA busy_timeout = 30000", turso::params![]).await.ok();
 
-				// Optimize for concurrent access
-				conn.execute("PRAGMA synchronous = NORMAL", turso::params![]).await.ok();
+				// No `PRAGMA synchronous` here: it is per connection, so setting it on this
+				// throwaway connection would change nothing. Every Turso connection starts in
+				// `SyncMode::Full` (turso_core-0.8.1 database.rs:2591), which fsyncs the MVCC
+				// log on every COMMIT, and WeftDB relies on that for its durability.
 
 				// Explicitly drop connection to ensure it's closed
 				drop(conn);
