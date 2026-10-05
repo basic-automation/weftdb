@@ -134,7 +134,7 @@ impl AspectStructure for Aspect {
 			let schema_conn = Database::begin_immediate(&measurements).await?;
 			trace!("Wireframing measurements tables for: {}", measurements_path);
 			Self::wireframe_measurements_tables_direct(&schema_conn).await?;
-			let _ = Database::commit_immediate(&schema_conn).await;
+			Database::commit_immediate(&schema_conn).await?;
 			drop(schema_conn);
 			trace!("Wireframed measurements tables for: {}", measurements_path);
 		}
@@ -149,7 +149,7 @@ impl AspectStructure for Aspect {
 			let schema_conn = Database::begin_immediate(&unprocessed_batches).await?;
 			trace!("Wireframing batches tables for: {}", unprocessed_batches_path);
 			Self::wireframe_batches_tables_direct(&schema_conn).await?;
-			let _ = Database::commit_immediate(&schema_conn).await;
+			Database::commit_immediate(&schema_conn).await?;
 			drop(schema_conn);
 			trace!("Wireframed batches tables for: {}", unprocessed_batches_path);
 		}
@@ -164,7 +164,7 @@ impl AspectStructure for Aspect {
 			let schema_conn = Database::begin_immediate(&processed_batches).await?;
 			trace!("Wireframing batches tables for: {}", processed_batches_path);
 			Self::wireframe_batches_tables_direct(&schema_conn).await?;
-			let _ = Database::commit_immediate(&schema_conn).await;
+			Database::commit_immediate(&schema_conn).await?;
 			drop(schema_conn);
 			trace!("Wireframed batches tables for: {}", processed_batches_path);
 		}
@@ -179,7 +179,7 @@ impl AspectStructure for Aspect {
 			let schema_conn = Database::begin_immediate(&patterns).await?;
 			trace!("Wireframing patterns tables for: {}", patterns_path);
 			Self::wireframe_patterns_tables_direct(&schema_conn).await?;
-			let _ = Database::commit_immediate(&schema_conn).await;
+			Database::commit_immediate(&schema_conn).await?;
 			drop(schema_conn);
 			trace!("Wireframed patterns tables for: {}", patterns_path);
 		}
@@ -194,7 +194,7 @@ impl AspectStructure for Aspect {
 			let schema_conn = Database::begin_immediate(&unprocessed_events).await?;
 			trace!("Wireframing unprocessed_events tables for: {}", unprocessed_events_path);
 			Self::wireframe_events_tables_direct(&schema_conn).await?;
-			let _ = Database::commit_immediate(&schema_conn).await;
+			Database::commit_immediate(&schema_conn).await?;
 			drop(schema_conn);
 			trace!("Wireframed unprocessed_events tables for: {}", unprocessed_events_path);
 		}
@@ -209,7 +209,7 @@ impl AspectStructure for Aspect {
 			let schema_conn = Database::begin_immediate(&processed_events).await?;
 			trace!("Wireframing processed_events tables for: {}", processed_events_path);
 			Self::wireframe_events_tables_direct(&schema_conn).await?;
-			let _ = Database::commit_immediate(&schema_conn).await;
+			Database::commit_immediate(&schema_conn).await?;
 			drop(schema_conn);
 			trace!("Wireframed processed_events tables for: {}", processed_events_path);
 		}
@@ -224,7 +224,7 @@ impl AspectStructure for Aspect {
 			let schema_conn = Database::begin_immediate(&correlations).await?;
 			trace!("Wireframing correlations tables for: {}", correlations_path);
 			Self::wireframe_correlations_tables_direct(&schema_conn).await?;
-			let _ = Database::commit_immediate(&schema_conn).await;
+			Database::commit_immediate(&schema_conn).await?;
 			drop(schema_conn);
 			trace!("Wireframed correlations tables for: {}", correlations_path);
 		}
@@ -239,7 +239,7 @@ impl AspectStructure for Aspect {
 			let schema_conn = Database::begin_immediate(&pipeline).await?;
 			trace!("Wireframing pipeline tables for: {}", pipeline_path);
 			Self::wireframe_pipeline_tables_direct(&schema_conn).await?;
-			let _ = Database::commit_immediate(&schema_conn).await;
+			Database::commit_immediate(&schema_conn).await?;
 			drop(schema_conn);
 			trace!("Wireframed pipeline tables for: {}", pipeline_path);
 		}
@@ -297,7 +297,7 @@ impl AspectStructure for Aspect {
 			let database_metadata_db = Database::get_turso_database(&database_metadata_db_path).await?;
 			let conn = Database::begin_concurrent(&database_metadata_db, &database_metadata_db_path, None).await?;
 			let s = Self::get_subject_name(&conn, subject_id).await?;
-			let _ = Database::commit_concurrent(&conn).await;
+			Database::commit_concurrent(&conn).await?;
 			s
 		};
 
@@ -403,7 +403,7 @@ impl AspectStructure for Aspect {
 		let mut rows = conn.as_ref().query("SELECT metadata_path FROM database", turso::params![]).await?;
 		let row = rows.next().await?.ok_or_else(|| anyhow::anyhow!("Database metadata not found"))?;
 		let metadata_path: String = row.get(0)?;
-		let _ = Database::commit_concurrent(&conn).await;
+		Database::commit_concurrent(&conn).await?;
 
 		Ok(metadata_path)
 	}
@@ -448,7 +448,7 @@ impl AspectStructure for Aspect {
 		if was_new {
 			let schema_conn = Database::begin_immediate(&measurements).await?;
 			Self::wireframe_measurements_tables_direct(&schema_conn).await?;
-			let _ = Database::commit_immediate(&schema_conn).await;
+			Database::commit_immediate(&schema_conn).await?;
 			drop(schema_conn);
 		}
 
@@ -507,7 +507,7 @@ impl AspectStructure for Aspect {
 		if was_new {
 			let schema_conn = Database::begin_immediate(&unprocessed_batches).await?;
 			Self::wireframe_batches_tables_direct(&schema_conn).await?;
-			let _ = Database::commit_immediate(&schema_conn).await;
+			Database::commit_immediate(&schema_conn).await?;
 			drop(schema_conn);
 		}
 
@@ -547,7 +547,7 @@ impl AspectStructure for Aspect {
 		// Note: No indexes to support MVCC (turso MVCC doesn't support indexes yet)
 		// Duplicate batch detection must be handled at application level
 
-		let _ = Database::commit_concurrent(conn).await;
+		Database::commit_concurrent(conn).await?;
 
 		Ok(())
 	}
@@ -571,7 +571,7 @@ impl AspectStructure for Aspect {
 		if was_new {
 			let schema_conn = Database::begin_immediate(&processed_batches).await?;
 			Self::wireframe_batches_tables_direct(&schema_conn).await?;
-			let _ = Database::commit_immediate(&schema_conn).await;
+			Database::commit_immediate(&schema_conn).await?;
 		}
 
 		self.processed_batches = Some(processed_batches.clone());
@@ -605,7 +605,7 @@ impl AspectStructure for Aspect {
 		if was_new {
 			let schema_conn = Database::begin_immediate(&patterns).await?;
 			Self::wireframe_patterns_tables_direct(&schema_conn).await?;
-			let _ = Database::commit_immediate(&schema_conn).await;
+			Database::commit_immediate(&schema_conn).await?;
 		}
 
 		self.patterns = Some(patterns.clone());
@@ -706,7 +706,7 @@ impl AspectStructure for Aspect {
 		if was_new {
 			let schema_conn = Database::begin_immediate(&events).await?;
 			Self::wireframe_events_tables_direct(&schema_conn).await?;
-			let _ = Database::commit_immediate(&schema_conn).await;
+			Database::commit_immediate(&schema_conn).await?;
 		}
 
 		self.unprocessed_events = Some(events.clone());
@@ -740,7 +740,7 @@ impl AspectStructure for Aspect {
 		if was_new {
 			let schema_conn = Database::begin_immediate(&events).await?;
 			Self::wireframe_events_tables_direct(&schema_conn).await?;
-			let _ = Database::commit_immediate(&schema_conn).await;
+			Database::commit_immediate(&schema_conn).await?;
 		}
 
 		self.unprocessed_events = Some(events.clone());
@@ -774,7 +774,7 @@ impl AspectStructure for Aspect {
 		if was_new {
 			let schema_conn = Database::begin_immediate(&events).await?;
 			Self::wireframe_events_tables_direct(&schema_conn).await?;
-			let _ = Database::commit_immediate(&schema_conn).await;
+			Database::commit_immediate(&schema_conn).await?;
 		}
 
 		self.processed_events = Some(events.clone());
@@ -845,7 +845,7 @@ impl AspectStructure for Aspect {
 		if was_new {
 			let schema_conn = Database::begin_immediate(&correlations).await?;
 			Self::wireframe_correlations_tables_direct(&schema_conn).await?;
-			let _ = Database::commit_immediate(&schema_conn).await;
+			Database::commit_immediate(&schema_conn).await?;
 			drop(schema_conn);
 		}
 
@@ -946,7 +946,7 @@ impl AspectStructure for Aspect {
 		if was_new {
 			let schema_conn = Database::begin_immediate(&turso_db).await?;
 			Self::wireframe_pipeline_tables_direct(&schema_conn).await?;
-			let _ = Database::commit_immediate(&schema_conn).await;
+			Database::commit_immediate(&schema_conn).await?;
 		}
 
 		self.pipeline = Some(turso_db.clone());
@@ -1115,7 +1115,7 @@ impl AspectStructure for Aspect {
 		if was_new {
 			let schema_conn = Database::begin_immediate(&dictionaries_db).await?;
 			Self::wireframe_dictionary_tables_direct(&schema_conn).await?;
-			let _ = Database::commit_immediate(&schema_conn).await;
+			Database::commit_immediate(&schema_conn).await?;
 			drop(schema_conn);
 		}
 
@@ -1152,7 +1152,7 @@ impl AspectStructure for Aspect {
 			}
 		}
 
-		let _ = Database::commit_concurrent(&conn).await;
+		Database::commit_concurrent(&conn).await?;
 		Ok(())
 	}
 
@@ -1186,7 +1186,7 @@ impl AspectStructure for Aspect {
 		if was_new {
 			let schema_conn = Database::begin_immediate(&dictionary_db).await?;
 			Self::wireframe_dictionary_tables_direct(&schema_conn).await?;
-			let _ = Database::commit_immediate(&schema_conn).await;
+			Database::commit_immediate(&schema_conn).await?;
 		}
 
 		// Cache it
@@ -1609,7 +1609,7 @@ impl Aspect {
 	pub async fn ensure_dictionary_tables(db: &turso::Database) -> Result<()> {
 		let schema_conn = Database::begin_immediate(db).await?;
 		Self::wireframe_dictionary_tables_direct(&schema_conn).await?;
-		let _ = Database::commit_immediate(&schema_conn).await;
+		Database::commit_immediate(&schema_conn).await?;
 		Ok(())
 	}
 
@@ -1729,7 +1729,7 @@ impl Aspect {
 		tracing::info!(">>> ensure_compression_tables: wireframing tables");
 		Self::wireframe_compression_stats_tables_direct(&schema_conn).await?;
 		tracing::info!(">>> ensure_compression_tables: committing");
-		let _ = Database::commit_immediate(&schema_conn).await;
+		Database::commit_immediate(&schema_conn).await?;
 		tracing::info!(">>> ensure_compression_tables: done");
 		Ok(())
 	}
@@ -1774,7 +1774,7 @@ impl Aspect {
 		).await?;
 
 		tracing::info!(">>> set_compression_config: committing");
-		let _ = Database::commit_concurrent(&conn).await;
+		Database::commit_concurrent(&conn).await?;
 		// NOTE: Removed checkpoint_wal_passive() call - other metadata.db operations don't do this
 		// and it may cause timing issues with MVCC transactions after long compression runs
 
@@ -2280,7 +2280,7 @@ impl Aspect {
 			)
 			.await?;
 
-		let _ = Database::commit_concurrent(&conn).await;
+		Database::commit_concurrent(&conn).await?;
 		// NOTE: Removed checkpoint_wal_passive() call for consistency with other db operations
 
 		tracing::info!(compression_id = %id, "Saved compression history");
@@ -2333,7 +2333,7 @@ impl Aspect {
 			None
 		};
 
-		let _ = Database::commit_concurrent(&conn).await;
+		Database::commit_concurrent(&conn).await?;
 		Ok(result)
 	}
 
@@ -2357,7 +2357,7 @@ impl Aspect {
 			0
 		};
 
-		let _ = Database::commit_concurrent(&conn).await;
+		Database::commit_concurrent(&conn).await?;
 		Ok(count)
 	}
 
@@ -2395,7 +2395,7 @@ impl Aspect {
 			});
 		}
 
-		let _ = Database::commit_concurrent(&conn).await;
+		Database::commit_concurrent(&conn).await?;
 		Ok(regions)
 	}
 
@@ -2444,7 +2444,7 @@ impl Aspect {
 			)
 			.await?;
 
-		let _ = Database::commit_concurrent(&conn).await;
+		Database::commit_concurrent(&conn).await?;
 		Database::checkpoint_wal_passive(&db).await?;
 
 		tracing::debug!(
@@ -2486,7 +2486,7 @@ impl Aspect {
 			)
 			.await?;
 
-		let _ = Database::commit_concurrent(&conn).await;
+		Database::commit_concurrent(&conn).await?;
 		Database::checkpoint_wal_passive(&db).await?;
 
 		tracing::debug!(before = %before, "Cleared dirty regions");
@@ -2531,7 +2531,7 @@ impl Aspect {
 			None
 		};
 
-		let _ = Database::commit_concurrent(&conn).await;
+		Database::commit_concurrent(&conn).await?;
 		Ok(result)
 	}
 }

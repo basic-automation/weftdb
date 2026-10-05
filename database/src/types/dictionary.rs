@@ -904,22 +904,22 @@ impl Dictionary {
 		serde_json::from_str(json).map_err(|e| anyhow::anyhow!("Failed to deserialize dictionary: {e}"))
 	}
 
-	/// Serialize the dictionary to binary format (using bincode)
+	/// Serialize the dictionary to binary format (using postcard)
 	///
 	/// # Errors
 	///
 	/// Returns an error if binary serialization fails.
 	pub fn to_bytes(&self) -> Result<Vec<u8>> {
-		bincode::serialize(self).map_err(|e| anyhow::anyhow!("Failed to serialize dictionary to bytes: {e}"))
+		postcard::to_allocvec(self).map_err(|e| anyhow::anyhow!("Failed to serialize dictionary to bytes: {e}"))
 	}
 
-	/// Deserialize a dictionary from binary format (using bincode)
+	/// Deserialize a dictionary from binary format (using postcard)
 	///
 	/// # Errors
 	///
 	/// Returns an error if binary deserialization fails or the data is invalid.
 	pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-		bincode::deserialize(bytes).map_err(|e| anyhow::anyhow!("Failed to deserialize dictionary from bytes: {e}"))
+		postcard::from_bytes(bytes).map_err(|e| anyhow::anyhow!("Failed to deserialize dictionary from bytes: {e}"))
 	}
 }
 

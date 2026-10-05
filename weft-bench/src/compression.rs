@@ -22,7 +22,7 @@ use std::time::Instant;
 
 use bigdecimal::{BigDecimal, ToPrimitive};
 use weft_physical_type::{weftseg::read_segment, Segment, TimeUnit};
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
 use crate::{

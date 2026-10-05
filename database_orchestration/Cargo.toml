@@ -10,7 +10,6 @@ edition = "2021"
 bigdecimal = { workspace = true, features = ["serde", "serde-json", "string-only"] }
 database = { path = "../database" }  # Reference the local workspace member directly
 anyhow = { workspace = true }
-bincode = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 splimes = { path = "../splimes"}
 rayon = { workspace = true }
@@ -22,9 +21,7 @@ num_cpus = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 futures = { workspace = true }
 indexmap = { workspace = true, features = ["serde", "rayon"] }
-flume = { workspace = true }
 wide = { workspace = true }
-ahash = { workspace = true }
 tracing = { workspace = true }
 
 

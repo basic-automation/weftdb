@@ -9,8 +9,8 @@ description = "weft-reduce: vendor-neutral time-series downsampling reductions (
 
 [dependencies]
 # `string-only` makes BigDecimal serialize as a string under serde, so a non-self-describing
-# format (bincode — the persisted-partial sidecar codec) can round-trip it; the default impl
-# deserializes via `deserialize_any`, which bincode cannot support.
+# format (postcard — the persisted-partial sidecar codec) can round-trip it; the default impl
+# deserializes via `deserialize_any`, which postcard cannot support.
 bigdecimal = { workspace = true, features = ["serde", "string-only"] }
 chrono = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -18,4 +18,4 @@ splimes = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-bincode = { workspace = true }
+postcard = { workspace = true }

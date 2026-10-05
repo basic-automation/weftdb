@@ -116,7 +116,8 @@ impl Subject {
 		let mut rows = conn.as_ref().query("SELECT metadata_path FROM database", turso::params![]).await?;
 		let row = rows.next().await?.ok_or_else(|| anyhow::anyhow!("Database metadata not found"))?;
 		let metadata_path: String = row.get(0)?;
-		let _ = Database::commit_concurrent(&conn).await;
+		drop(rows);
+		Database::commit_concurrent(&conn).await?;
 
 		Ok(metadata_path)
 	}

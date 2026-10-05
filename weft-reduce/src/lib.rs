@@ -1065,11 +1065,11 @@ mod tests {
 
 		let partial_a = reduce_partial(seg_a, Resolution::Hours, None, None, &all).expect("partial a");
 		let partial_b = reduce_partial(seg_b, Resolution::Hours, None, None, &all).expect("partial b");
-		let bytes_a = bincode::serialize(&partial_a).expect("serializes a");
-		let bytes_b = bincode::serialize(&partial_b).expect("serializes b");
+		let bytes_a = postcard::to_allocvec(&partial_a).expect("serializes a");
+		let bytes_b = postcard::to_allocvec(&partial_b).expect("serializes b");
 
-		let mut restored: PartialReduction = bincode::deserialize(&bytes_a).expect("reloads a");
-		let restored_b: PartialReduction = bincode::deserialize(&bytes_b).expect("reloads b");
+		let mut restored: PartialReduction = postcard::from_bytes(&bytes_a).expect("reloads a");
+		let restored_b: PartialReduction = postcard::from_bytes(&bytes_b).expect("reloads b");
 		restored.merge(restored_b).expect("merges reloaded partials");
 		let from_sidecars = restored.finish(Resolution::Hours, &all).expect("finishes");
 
@@ -1084,8 +1084,8 @@ mod tests {
 		let aggs = [Aggregation::Sum, Aggregation::SketchP99];
 		let points: Vec<Point> = (0..200).map(|i| pt(i64::from(i) * 10, &format!("{}.5", (i * 3) % 71))).collect();
 		let original = reduce_partial(&points, Resolution::Minutes, None, None, &aggs).expect("partial");
-		let bytes = bincode::serialize(&original).expect("serializes");
-		let reloaded: PartialReduction = bincode::deserialize(&bytes).expect("reloads");
+		let bytes = postcard::to_allocvec(&original).expect("serializes");
+		let reloaded: PartialReduction = postcard::from_bytes(&bytes).expect("reloads");
 		assert_eq!(reloaded.finish(Resolution::Minutes, &aggs).expect("finishes"), original.finish(Resolution::Minutes, &aggs).expect("finishes"), "a reloaded partial finishes to the same buckets");
 	}
 
