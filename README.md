@@ -1238,7 +1238,7 @@ cargo test
 SKIP_SLOW_TESTS=1 cargo test          # PowerShell: $env:SKIP_SLOW_TESTS=1; cargo test
 
 # Test a single crate:
-cargo test -p splimes
+cargo test -p weftdb
 ```
 
 The workspace ships extensive [Criterion](https://docs.rs/criterion) benchmark
@@ -1247,15 +1247,14 @@ suites alongside the Weft-Bench harness (see
 
 | Crate | Benchmarks |
 |-------|------------|
-| `splimes` | `interpolation`, `gpu_prewarm`, `gpu_cold`, `should_use_gpu_analysis`, `gpu_optimization_bench` |
 | `weftdb` | `interpolation_benchmarks`, `integration_interpolation_benchmarks`, `optimized_interpolation_benchmarks`, `strategy_selection_benchmarks`, `new_api_benchmarks`, `cache_performance_benchmarks` |
 
 ```bash
-cargo bench -p splimes
 cargo bench -p weftdb --bench cache_performance_benchmarks
 ```
 
-HTML reports are generated under `target/criterion/`.
+HTML reports are generated under `target/criterion/`. The interpolation engine's own
+benchmarks live in the [splimes repository](https://github.com/basic-automation/splimes).
 
 **Formatting** uses nightly-only rustfmt options (`imports_granularity`,
 `group_imports`), so the style gate runs on nightly even though the crates
@@ -1272,11 +1271,6 @@ cargo +nightly fmt --all
 ```text
 WeftDB/
 ├── Cargo.toml                  # workspace manifest (members + shared deps)
-├── splimes/                    # spline interpolation engine
-│   ├── src/splines/            # CPU spline implementations
-│   ├── src/gpu/                # wgpu compute pipeline, shaders, buffer pool
-│   ├── src/optimizations/      # CPU / parallel / fast-path strategies
-│   └── src/helpers/            # strategy selection, target-time generation
 ├── weftdb/                     # time-series database (Turso/libSQL control plane + segment store)
 │   └── src/types/
 │       ├── database/           # connection, config, inputs, outputs, pipeline
@@ -1306,7 +1300,7 @@ server and an interactive application:
 
 | Crate | Role |
 |-------|------|
-| [`splimes`](splimes) | Spline interpolation engine — Linear / Quadratic / Cubic / Polynomial methods with automatic GPU, parallel, SIMD, and CPU strategy selection. |
+| [`splimes`](https://github.com/basic-automation/splimes) *(own repo, from crates.io)* | Spline interpolation engine — Linear / Quadratic / Cubic / Polynomial methods with automatic GPU, parallel, SIMD, and CPU strategy selection. |
 | [`weftdb`](weftdb) | Time-series database: [Turso](https://turso.tech/) (libSQL) **control plane** (catalog, metadata, segment index; MVCC concurrent writes) + WeftDB's own typed columnar **`.weftseg` segment store** on the measurement hot path, plus the pattern-recognition types and tiered dataset compression. |
 | [`weft-orchestration`](weft-orchestration) | High-level pipeline that chains batching → pattern extraction → event detection → correlation → signal generation, with built-in detectors and parallel execution. |
 | [`weft-physical-type`](weft-physical-type) | Vendor-neutral physical type system — schema-declared numeric encodings with explicit exactness, timestamp codecs, and the `.weftseg` columnar segment format (single-block and paged). |

@@ -3,7 +3,6 @@ resolver = "2"
 members = [
 	"weftdb",
 	"weft-orchestration",
-	"splimes",
 	"weft-tui",
 	"weft-bench",
 	"weft-server",
@@ -23,7 +22,7 @@ authors = ["Justin Icenhour"]
 repository = "https://github.com/basic-automation/weftdb"
 readme = "README.md"
 # The workspace builds on stable Rust. The floor is set by the `sysinfo` dependency,
-# not by the 2024 edition `splimes` targets; verified with `cargo +1.95 check --workspace`.
+# not by the 2024 edition of the `splimes` dependency; verified with `cargo +1.95 check --workspace`.
 rust-version = "1.95"
 
 [workspace.dependencies]
@@ -54,7 +53,8 @@ ratatui = "0.30"
 crossterm = "0.29"
 sysinfo = "0.39"
 weftdb = { path = "./weftdb", version = "0.1.0" }
-splimes = { path = "./splimes", version = "0.1.0" }
+# Developed in its own repository (github.com/basic-automation/splimes), on its own roadmap.
+splimes = "0.1"
 weft-line-protocol = { path = "./weft-line-protocol", version = "0.1.0" }
 weft-physical-type = { path = "./weft-physical-type", version = "0.1.0" }
 weft-reduce = { path = "./weft-reduce", version = "0.1.0" }

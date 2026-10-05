@@ -17,7 +17,6 @@ cd "$(dirname "$0")/.."
 
 # Dependency order, leaves first.
 CRATES=(
-	splimes
 	weft-physical-type
 	weft-reduce
 	weft-line-protocol

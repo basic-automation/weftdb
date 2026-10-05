@@ -89,17 +89,15 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7
-      # Linux runners have no GPU. Mesa's lavapipe is a software Vulkan driver, so the
-      # wgpu / WGSL path still runs for real, and WEFT_REQUIRE_GPU makes a missing adapter
-      # a failure rather than a silent skip. Windows runners expose WARP (software D3D12,
-      # no f64), which exercises the f32 shader fallback.
+      # Linux runners have no GPU. Mesa's lavapipe is a software Vulkan driver, so splimes'
+      # wgpu path runs for real under WeftDB's tests. (splimes' own CI requires a GPU
+      # adapter; see github.com/basic-automation/splimes.)
       - name: Install software Vulkan (lavapipe)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1 vulkan-tools
           vulkaninfo --summary || true
-          echo "WEFT_REQUIRE_GPU=1" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build

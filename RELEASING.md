@@ -72,8 +72,13 @@ manually with the tag name as input.
 
 ## Which crates are published
 
-Published: `splimes`, `weft-physical-type`, `weft-reduce`, `weft-line-protocol`,
+Published: `weft-physical-type`, `weft-reduce`, `weft-line-protocol`,
 `weft-arrow`, `weftdb`, `weft-arrow-store`, `weft-orchestration`.
+
+`splimes` is released from its own repository
+([basic-automation/splimes](https://github.com/basic-automation/splimes)) and consumed
+here from crates.io. A WeftDB release that needs a splimes change waits for that
+splimes release.
 
 Not published (`publish = false`): `weft-server`, `weft-tui`, `weft-bench`. They are
 binaries and ship as release artifacts instead.
