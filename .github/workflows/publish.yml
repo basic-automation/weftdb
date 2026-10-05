@@ -20,7 +20,7 @@ jobs:
     # and required reviewers if you want a second pair of eyes on every release).
     environment: crates-io
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 

@@ -4,15 +4,22 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Nightly: the full suite including the slow pipeline tests, plus a fresh advisory scan.
+    - cron: "0 7 * * *"
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
   RUSTFLAGS: -D warnings
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # rustfmt.toml uses nightly-only options (imports_granularity, group_imports),
@@ -21,7 +28,7 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
@@ -31,7 +38,7 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -44,7 +51,7 @@ jobs:
       # reaches clippy-driver as a rustc flag and would deny *every* clippy lint,
       # silently turning the category gate below into "deny everything". rustc warnings
       # are still denied by the build/test and msrv jobs.
-      - run: cargo clippy --workspace --all-targets -- -D clippy::correctness -D clippy::suspicious -D clippy::perf
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D clippy::correctness -D clippy::suspicious -D clippy::perf
         env:
           RUSTFLAGS: ""
 
@@ -53,43 +60,71 @@ jobs:
     name: msrv (1.95)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace --all-targets
+      - run: cargo check --workspace --all-targets --locked
+
+  # Early warning only: upstream crates break on nightly (e.g. turso_core's `branches` 0.4
+  # calls a since-removed intrinsic), so this never blocks a merge.
+  nightly:
+    name: check (nightly, advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --all-features --locked
+        env:
+          RUSTFLAGS: ""
 
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      # Linux runners have no GPU. Mesa's lavapipe is a software Vulkan driver, so the
+      # wgpu / WGSL path still runs for real, and WEFT_REQUIRE_GPU makes a missing adapter
+      # a failure rather than a silent skip. Windows runners expose WARP (software D3D12,
+      # no f64), which exercises the f32 shader fallback.
+      - name: Install software Vulkan (lavapipe)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1 vulkan-tools
+          vulkaninfo --summary || true
+          echo "WEFT_REQUIRE_GPU=1" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --workspace --all-targets
-      # CI runners have no GPU adapter; the engine falls back to SIMD/parallel CPU.
-      # SKIP_SLOW_TESTS keeps the hosted runners inside a sane wall-clock budget, and
+        run: cargo build --workspace --all-targets --locked
+      # Pull requests and pushes set SKIP_SLOW_TESTS to keep hosted runners inside a sane
+      # wall-clock budget; the nightly schedule runs the full suite. The tests check only
+      # whether the variable is *set*, so it must be left unset (not empty) there.
       # --test-threads is capped because several suites stand up their own segment
       # stores — at full parallelism a hosted runner gets OOM-killed, which surfaces as
       # a SIGKILL rather than a test failure.
       - name: Test
-        run: cargo test --workspace -- --test-threads=4
-        env:
-          SKIP_SLOW_TESTS: 1
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then export SKIP_SLOW_TESTS=1; fi
+          cargo test --workspace --locked -- --test-threads=4
 
   docs:
     name: rustdoc
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build docs (deny broken intra-doc links)
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -98,7 +133,18 @@ jobs:
     name: cargo package
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo package --workspace --no-verify
+      - run: cargo package --workspace --no-verify --locked
+
+  # Advisories (vulnerable / unmaintained / unsound / yanked), license allow-list,
+  # banned wildcards, and crates.io-only sources. Policy lives in deny.toml.
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources

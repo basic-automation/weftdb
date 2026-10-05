@@ -8,6 +8,33 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+### Changed
+
+- **Turso control plane upgraded 0.6 → 0.8.** ⚠️ This is one-way: once 0.8 writes a
+  store, its MVCC log is v3 and an older WeftDB can no longer open it. Back up the
+  control plane before upgrading.
+- **`.weftpart` sidecars use `postcard` instead of `bincode`** (frame v3). Sidecars
+  written by older versions are ignored: the segment is decoded instead, and the
+  sidecar is rebuilt on the next seal. No data migration is needed.
+- All dependencies updated to their latest major versions, including wgpu 30,
+  Arrow/Parquet 60 and OpenTelemetry 0.33.
+- Builds on stable Rust (MSRV 1.95); nightly is no longer required.
+
+### Fixed
+
+- **Commit failures were silently ignored.** A control-plane write that lost an MVCC
+  conflict was reported as success. Commit errors now reach the caller, and the
+  transaction is rolled back.
+- **Quadratic GPU interpolation failed on GPUs without f64 support** (Apple Silicon,
+  most integrated GPUs, Windows WARP). The f32 fallback shader did not parse, so wgpu
+  panicked.
+
+### Security
+
+- Cleared the `crossbeam-epoch` (RUSTSEC-2026-0204) and `h2` (RUSTSEC-2026-0258)
+  advisories, replaced the unmaintained `bincode` (RUSTSEC-2025-0141), and removed the
+  unsound `lru` 0.16 (RUSTSEC-2026-0253) by disabling turso's unused full-text search.
+
 ## [0.1.0] - 2026-09-25
 
 First public release. WeftDB is pre-beta: the API will change, and the version
