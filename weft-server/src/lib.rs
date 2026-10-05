@@ -26,6 +26,9 @@
 //! dependencies; it is a thin HTTP shell over the WeftDB core and never a place for
 //! a concrete connector to leak in.
 
+// Proving the axum handler bounds for the full router exceeds the default limit of 128;
+// rustc warns that overflowing it will become a hard error.
+#![recursion_limit = "256"]
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 
 pub mod backup_daemon;
