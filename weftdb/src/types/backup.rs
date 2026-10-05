@@ -613,4 +613,38 @@ mod tests {
 		let err = vacuum_into(&conn, &dest).await.unwrap_err();
 		assert!(err.to_string().contains("already exists"), "got: {err}");
 	}
+
+	#[tokio::test]
+	async fn the_verifier_never_relies_on_pragmas_mvcc_reports_as_zero() {
+		// Turso issue #4929 (open since 2026-01-29): under `journal_mode=experimental_mvcc`,
+		// `PRAGMA page_count`, `user_version` and `application_id` read 0 — so a verifier built
+		// on them would pass vacuously against an empty or truncated copy. WeftDB's verifier
+		// enumerates `sqlite_master` and scans every row instead; this pins both halves.
+		// <https://github.com/tursodatabase/turso/issues/4929>
+		//
+		// (1) Static guard: no verification code path issues any of those pragmas (the test
+		// module itself is excluded, since it has to name them).
+		let source = include_str!("backup.rs");
+		let production = source.split("#[cfg(test)]").next().unwrap_or(source).to_ascii_lowercase();
+		for pragma in ["page_count", "user_version", "application_id", "freelist_count"] {
+			assert!(!production.contains(pragma), "the backup verifier must not depend on `PRAGMA {pragma}` (unreliable under MVCC, turso#4929)");
+		}
+
+		// (2) Behavioural: on an MVCC source the row-scan verification sees the real data in
+		// both modes, whatever the pragma reports.
+		let dir = tempfile::tempdir().unwrap();
+		let conn = seed_db(&dir.path().join("src.db")).await;
+		let page_count = match conn.query("PRAGMA page_count", turso::params![]).await {
+			Ok(mut rows) => match rows.next().await {
+				Ok(Some(row)) => row.get_value(0).ok().and_then(|v| v.as_integer().copied()),
+				_ => None,
+			},
+			Err(_) => None,
+		};
+		eprintln!("PRAGMA page_count on the MVCC source reads {page_count:?} (turso#4929 reports 0)");
+		for (mode, name) in [(VerifyMode::SourceMatch, "source.db"), (VerifyMode::SnapshotOnly, "snapshot.db")] {
+			let report = snapshot_with_verify(&conn, &dir.path().join(name), mode).await.unwrap();
+			assert_eq!((report.tables, report.rows), (2, 10), "{mode:?} must count the real tables/rows, not a pragma");
+		}
+	}
 }
