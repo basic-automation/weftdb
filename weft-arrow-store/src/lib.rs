@@ -268,9 +268,9 @@ mod tests {
 
 	use bigdecimal::BigDecimal;
 	use database::SegmentStore;
+	use tempfile::TempDir;
 	use weft_arrow::{record_batch_to_columns, META_TIME_UNIT, VALUE_COLUMN};
 	use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
-	use tempfile::TempDir;
 
 	use super::*;
 

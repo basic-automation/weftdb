@@ -22,9 +22,7 @@
 //! a detached side task; the router and its handlers are untouched.
 
 use std::{
-	path::{Path, PathBuf},
-	sync::Arc,
-	time::Duration,
+	path::{Path, PathBuf}, sync::Arc, time::Duration
 };
 
 use database::{ControlPlaneBackup, SegmentStore, VerifyMode};
@@ -199,11 +197,11 @@ pub fn spawn_backup_daemon(store: Arc<SegmentStore>, metrics: SharedMetrics, con
 					if let Some(keep) = config.keep {
 						match prune_generated_backups(&config.base, keep).await {
 							Ok(removed) if removed > 0 => println!("backup daemon: pruned {removed} snapshot(s), keeping the newest {keep}"),
-							Ok(_) => {},
+							Ok(_) => {}
 							Err(err) => eprintln!("backup daemon: prune failed: {err}"),
 						}
 					}
-				},
+				}
 				Err(err) => eprintln!("backup daemon: snapshot failed: {err}"),
 			}
 		}
@@ -216,8 +214,8 @@ mod tests {
 
 	use bigdecimal::BigDecimal;
 	use database::SegmentStore;
-	use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
 	use tempfile::TempDir;
+	use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
 
 	use super::*;
 	use crate::metrics::Metrics;

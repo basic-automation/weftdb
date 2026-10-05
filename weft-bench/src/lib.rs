@@ -46,7 +46,6 @@ pub mod adapter;
 pub mod baseline_adapter;
 pub mod compression;
 pub mod downsample;
-pub mod weft_adapter;
 pub mod forward_fill_adapter;
 pub mod line_protocol;
 pub mod point_lookup;
@@ -55,6 +54,7 @@ pub mod range_fetch;
 pub mod report;
 pub mod schema;
 pub mod stats;
+pub mod weft_adapter;
 
 use std::time::Instant;
 
@@ -62,7 +62,7 @@ use bigdecimal::ToPrimitive;
 use splimes::generate_target_times;
 
 pub use crate::{
-	accuracy::{synthetic_ground_truth, AccuracyError, AccuracyMetrics}, adapter::SystemAdapter, baseline_adapter::BaselineLinearAdapter, compression::{run_compression, CompressionParams, CompressionProfile, ValueShape}, downsample::{run_downsample, Aggregation, DownsampleParams, DownsampleProfile}, weft_adapter::WeftAdapter, forward_fill_adapter::ForwardFillAdapter, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, point_lookup::{run_point_lookup, LookupMode, PointLookupParams, PointLookupProfile}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError, SignalShape, SyntheticParams}, range_fetch::{run_range_fetch, RangeFetchParams, RangeFetchProfile}, report::{BenchReport, RunMetadata}, schema::{BenchResult, CorrectnessReport, DatasetMeta, StorageEstimate, TimingBreakdown, SCHEMA_VERSION}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}
+	accuracy::{synthetic_ground_truth, AccuracyError, AccuracyMetrics}, adapter::SystemAdapter, baseline_adapter::BaselineLinearAdapter, compression::{run_compression, CompressionParams, CompressionProfile, ValueShape}, downsample::{run_downsample, Aggregation, DownsampleParams, DownsampleProfile}, forward_fill_adapter::ForwardFillAdapter, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, point_lookup::{run_point_lookup, LookupMode, PointLookupParams, PointLookupProfile}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError, SignalShape, SyntheticParams}, range_fetch::{run_range_fetch, RangeFetchParams, RangeFetchProfile}, report::{BenchReport, RunMetadata}, schema::{BenchResult, CorrectnessReport, DatasetMeta, StorageEstimate, TimingBreakdown, SCHEMA_VERSION}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}, weft_adapter::WeftAdapter
 };
 
 /// Workload class label recorded for the interpolation profile.

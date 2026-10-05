@@ -92,10 +92,10 @@ impl LatencyHistogram {
 		match LATENCY_BUCKETS_SECS.iter().position(|&bound| secs <= bound) {
 			Some(i) => {
 				self.buckets[i].fetch_add(1, Ordering::Relaxed);
-			},
+			}
 			None => {
 				self.overflow.fetch_add(1, Ordering::Relaxed);
-			},
+			}
 		}
 		self.sum_micros.fetch_add(micros, Ordering::Relaxed);
 		self.count.fetch_add(1, Ordering::Relaxed);

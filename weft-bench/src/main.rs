@@ -23,10 +23,10 @@
 use std::{path::PathBuf, process::ExitCode};
 
 use chrono::Utc;
-use weft_bench::{
-	report::{default_filename, default_html_filename}, run_compression, run_downsample, run_point_lookup, run_profile, run_range_fetch, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CompressionParams, CompressionProfile, DownsampleParams, DownsampleProfile, WeftAdapter, ForwardFillAdapter, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision, ValueShape
-};
 use splimes::{Resolution, Spline};
+use weft_bench::{
+	report::{default_filename, default_html_filename}, run_compression, run_downsample, run_point_lookup, run_profile, run_range_fetch, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CompressionParams, CompressionProfile, DownsampleParams, DownsampleProfile, ForwardFillAdapter, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter
+};
 
 /// Program name used in usage / error output.
 const PROG: &str = "weft-bench";

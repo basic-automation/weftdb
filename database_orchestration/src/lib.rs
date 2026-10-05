@@ -1464,7 +1464,7 @@ mod tests {
 	use batch_utils::*;
 	use bigdecimal::{BigDecimal, FromPrimitive};
 	use chrono::{TimeZone, Utc};
-	use database::{AspectId, Database, DatasetId, InputMeasurement, Resolution, data_dir};
+	use database::{data_dir, AspectId, Database, DatasetId, InputMeasurement, Resolution};
 	use rand::RngExt;
 	use serde_json::json;
 	use serial_test::serial;

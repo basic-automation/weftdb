@@ -26,8 +26,8 @@ use std::str::FromStr;
 
 use anyhow::{bail, Result};
 use bigdecimal::BigDecimal;
-use weft_physical_type::{SegmentDescriptor, SegmentIndex};
 use turso::{Builder, Value};
+use weft_physical_type::{SegmentDescriptor, SegmentIndex};
 
 /// A durable, libSQL-backed index of sealed segments, scoped by aspect.
 ///
@@ -192,11 +192,11 @@ impl SegmentIndexStore {
 				conn.execute("COMMIT", turso::params![]).await?;
 				span.record("rows_changed", changed);
 				Ok(changed > 0)
-			},
+			}
 			Err(e) => {
 				conn.execute("ROLLBACK", turso::params![]).await.ok();
 				bail!("segment_index delete failed: {e}")
-			},
+			}
 		}
 	}
 
