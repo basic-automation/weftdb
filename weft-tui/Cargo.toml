@@ -9,8 +9,8 @@ edition = "2021"
 [dependencies]
 ratatui = { workspace = true }
 crossterm = { workspace = true }
-database = { path = "../database" }
-splimes = { path = "../splimes" }
+database = { workspace = true }
+splimes = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }

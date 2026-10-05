@@ -37,11 +37,13 @@ ratatui = "0.30"
 crossterm = "0.29"
 futures-channel = "0.3"
 sysinfo = "0.39"
-splimes = { path = "./splimes" }
-weft-line-protocol = { path = "./weft-line-protocol" }
-weft-physical-type = { path = "./weft-physical-type" }
-weft-reduce = { path = "./weft-reduce" }
-weft-arrow = { path = "./weft-arrow" }
+splimes = { path = "./splimes", version = "0.1.0" }
+weft-line-protocol = { path = "./weft-line-protocol", version = "0.1.0" }
+weft-physical-type = { path = "./weft-physical-type", version = "0.1.0" }
+weft-reduce = { path = "./weft-reduce", version = "0.1.0" }
+weft-arrow = { path = "./weft-arrow", version = "0.1.0" }
+weft-arrow-store = { path = "./weft-arrow-store", version = "0.1.0" }
+database = { path = "./database", version = "0.1.0" }
 arrow-array = "60"
 arrow-schema = "60"
 arrow-ipc = "60"

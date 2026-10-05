@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Nightly: the full suite including the slow pipeline tests, plus a fresh advisory scan.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      # rustfmt.toml uses nightly-only options (imports_granularity, group_imports).
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  check:
+    name: check (${{ matrix.toolchain }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, nightly]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.toolchain }}
+      - run: cargo check --workspace --all-targets --all-features --locked
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Fails on clippy errors. The crates opt into pedantic + nursery as warnings; that
+      # backlog is burned down separately before warnings become a gate.
+      - run: cargo clippy --workspace --all-targets --all-features --locked
+
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      # Hosted runners have no GPU. Mesa's lavapipe is a software Vulkan driver, so the
+      # wgpu / WGSL interpolation path still runs for real instead of being skipped.
+      - name: Install software Vulkan (lavapipe)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1 vulkan-tools
+          vulkaninfo --summary || true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        # Pull requests and pushes skip the multi-minute pipeline tests; the nightly run
+        # includes them. The tests check only whether SKIP_SLOW_TESTS is *set*, so it must
+        # be left unset (not empty) on the scheduled run.
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then export SKIP_SLOW_TESTS=1; fi
+          cargo test --workspace --locked
+        env:
+          # Fail (rather than skip) the GPU-comparison tests if lavapipe yields no adapter.
+          WEFT_REQUIRE_GPU: "1"
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources

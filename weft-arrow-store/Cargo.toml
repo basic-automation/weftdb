@@ -15,7 +15,7 @@ path = "src/lib.rs"
 anyhow = { workspace = true }
 arrow-array = { workspace = true }
 bigdecimal = { workspace = true }
-database = { path = "../database" }  # Reference the local workspace member directly
+database = { workspace = true }  # Reference the local workspace member directly
 weft-arrow = { workspace = true }
 weft-physical-type = { workspace = true }
 

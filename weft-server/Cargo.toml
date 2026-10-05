@@ -20,9 +20,9 @@ anyhow = { workspace = true }
 axum = { workspace = true }
 bigdecimal = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
-database = { path = "../database" }  # control-plane segment store backing the storage query endpoints
+database = { workspace = true }  # control-plane segment store backing the storage query endpoints
 weft-arrow = { workspace = true }  # reconstructed-series -> Arrow IPC / Parquet bytes for the interpolate endpoint (arrow types stay inside weft-arrow)
-weft-arrow-store = { path = "../weft-arrow-store" }  # stored range -> Arrow IPC bytes (keeps the arrow-* tree off the lean core)
+weft-arrow-store = { workspace = true }  # stored range -> Arrow IPC bytes (keeps the arrow-* tree off the lean core)
 weft-line-protocol = { workspace = true }
 weft-physical-type = { workspace = true }  # AspectSchema / PhysicalType / TimeUnit for the catalog-management write path
 weft-reduce = { workspace = true }  # canonical downsample reduction (Aggregation / reduce / bucket_start)
