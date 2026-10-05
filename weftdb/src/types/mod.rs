@@ -41,6 +41,7 @@ pub mod correlation;
 pub mod database;
 pub mod dataset;
 pub mod dictionary;
+pub mod durable;
 pub mod error;
 pub mod event;
 pub mod input_measurement;

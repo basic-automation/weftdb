@@ -11,6 +11,11 @@ description = "Time-series database for irregularly sampled data: interpolation 
 keywords = ["timeseries", "database", "interpolation", "spline", "time-series"]
 categories = ["database-implementations", "science", "mathematics"]
 
+[features]
+# Crash-consistency test harness (`durable::fault` actions and the `durable::sim`
+# power-cut filesystem). Off by default: without it `fault::hit` is a const no-op
+# and `WEFT_FAULT` is never read, so a production build cannot be made to abort.
+fault-injection = []
 
 [dependencies]
 anyhow = { workspace = true }
