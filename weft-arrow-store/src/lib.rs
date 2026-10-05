@@ -50,8 +50,8 @@
 use anyhow::{bail, Context, Result};
 use arrow_array::RecordBatch;
 use bigdecimal::BigDecimal;
-use weftdb::SegmentStore;
 use weft_physical_type::{first_order_violation, AspectSchema, SegmentDescriptor, TimeUnit};
+use weftdb::SegmentStore;
 
 /// Read the rows of `aspect` whose timestamp falls in the inclusive `[start, end]`
 /// window and return them as a single lossless Arrow [`RecordBatch`].
@@ -267,10 +267,10 @@ mod tests {
 	use std::str::FromStr;
 
 	use bigdecimal::BigDecimal;
-	use weftdb::SegmentStore;
+	use tempfile::TempDir;
 	use weft_arrow::{record_batch_to_columns, META_TIME_UNIT, VALUE_COLUMN};
 	use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
-	use tempfile::TempDir;
+	use weftdb::SegmentStore;
 
 	use super::*;
 

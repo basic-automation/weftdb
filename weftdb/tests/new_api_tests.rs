@@ -3,10 +3,10 @@ use std::str::FromStr;
 use ::weftdb::database::traits::{AspectStructure, Inputs};
 use bigdecimal::BigDecimal;
 use chrono::{TimeZone, Utc};
-use weftdb::{database::traits::DatabaseStructure, Database, DatasetId, InputMeasurement, Outputs};
 use futures::StreamExt;
 use splimes::{Resolution, Spline};
 use uuid::Uuid;
+use weftdb::{database::traits::DatabaseStructure, Database, DatasetId, InputMeasurement, Outputs};
 
 #[tokio::test]
 async fn test_database_lifecycle() {

@@ -122,11 +122,11 @@ use std::collections::HashMap;
 use anyhow::Result;
 use bigdecimal::{BigDecimal, FromPrimitive};
 use chrono::Datelike;
+use futures::StreamExt;
+use splimes::Spline;
 use weftdb::{
 	database::traits::{DatabaseStructure, Outputs}, AspectId, Database, Resolution
 };
-use futures::StreamExt;
-use splimes::Spline;
 
 use crate::{Event, Manifestation};
 

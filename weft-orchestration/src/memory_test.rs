@@ -2,9 +2,9 @@
 mod memory_tests {
 	use bigdecimal::{BigDecimal, FromPrimitive};
 	use chrono::Utc;
-	use weftdb::{AspectId, DatabaseInfo};
 	use serial_test::serial;
 	use splimes::{Resolution, Spline};
+	use weftdb::{AspectId, DatabaseInfo};
 
 	use crate::types::{Dictionary, DictionaryConstraints, MeasurementVector, Occurrence, Pattern, PatternID, Relative, Steps, Variability, VariablilityType};
 

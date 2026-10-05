@@ -2827,13 +2827,12 @@ mod tests {
 		// minimum + narrow residual) wins — exercising the cascade's FOR inner branch on disk.
 		let lits: Vec<String> = {
 			let mut acc = 9_000_000_000_i64;
-			(0..256)
-				.map(|i| {
-					let s = format!("{acc}");
-					acc += 7 + i64::from(i % 3);
-					s
-				})
-				.collect()
+			(0..256).map(|i| {
+				let s = format!("{acc}");
+				acc += 7 + i64::from(i % 3);
+				s
+			})
+			.collect()
 		};
 		let refs: Vec<&str> = lits.iter().map(String::as_str).collect();
 		let enc = crate::encode_column(PhysicalType::ScaledI64 { scale: 0 }, &col(&refs)).expect("encodes");
@@ -2975,7 +2974,12 @@ mod tests {
 		// blocked codec and the transposed codec pack the same bits at the same per-span widths
 		// — the only difference left is that blocked writes one width header per 64 values and
 		// transposed writes one per 1024.
-		let lits: Vec<String> = (0..8_192_i64).map(|i| { let magnitude = if i < 4_096 { 1 } else { 1_i64 << 30 }; format!("{}", if i % 2 == 0 { magnitude } else { -magnitude }) }).collect();
+		let lits: Vec<String> = (0..8_192_i64)
+			.map(|i| {
+				let magnitude = if i < 4_096 { 1 } else { 1_i64 << 30 };
+				format!("{}", if i % 2 == 0 { magnitude } else { -magnitude })
+			})
+			.collect();
 		let enc = crate::encode_column(PhysicalType::ScaledI64 { scale: 0 }, &col(&lits.iter().map(String::as_str).collect::<Vec<_>>())).expect("encodes");
 
 		let transposed = enc.transposed_value_bytes().expect("scaled column");
@@ -3483,14 +3487,7 @@ mod tests {
 		// serialized_bytes() must equal the exact bytes write_physical_value emits for
 		// the values (the payload, excluding the column header) — for every physical
 		// type. This is the realize-accurate figure estimated_bytes() does not give.
-		let cases = [
-			encode_column(PhysicalType::F64, &col(&["0.5", "2.25", "-128.0"])).unwrap(),
-			encode_column(PhysicalType::F32, &col(&["0.5", "-0.25", "16.0"])).unwrap(),
-			encode_column(PhysicalType::ScaledI64 { scale: 2 }, &col(&["1.25", "-3.75", "0.00", "5000.00"])).unwrap(),
-			encode_column(PhysicalType::ScaledI128 { scale: 4 }, &col(&["1234567890.1234", "-9.0001"])).unwrap(),
-			encode_column(PhysicalType::Decimal128, &col(&["123456789012345678901234.567890", "-1.5", "0"])).unwrap(),
-			encode_column(PhysicalType::BigDecimalText, &col(&["1.5", "12345.6789", "-0.000001"])).unwrap(),
-		];
+		let cases = [encode_column(PhysicalType::F64, &col(&["0.5", "2.25", "-128.0"])).unwrap(), encode_column(PhysicalType::F32, &col(&["0.5", "-0.25", "16.0"])).unwrap(), encode_column(PhysicalType::ScaledI64 { scale: 2 }, &col(&["1.25", "-3.75", "0.00", "5000.00"])).unwrap(), encode_column(PhysicalType::ScaledI128 { scale: 4 }, &col(&["1234567890.1234", "-9.0001"])).unwrap(), encode_column(PhysicalType::Decimal128, &col(&["123456789012345678901234.567890", "-1.5", "0"])).unwrap(), encode_column(PhysicalType::BigDecimalText, &col(&["1.5", "12345.6789", "-0.000001"])).unwrap()];
 		for enc in &cases {
 			let mut w = ByteWriter::new();
 			for value in &enc.values {

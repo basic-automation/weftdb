@@ -21,12 +21,12 @@ use std::hint::black_box;
 
 use bigdecimal::BigDecimal;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use weftdb::{PartialSidecarPolicy, SegmentStore};
-use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
-use weft_reduce::Aggregation;
 use splimes::Resolution;
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
+use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
+use weft_reduce::Aggregation;
+use weftdb::{PartialSidecarPolicy, SegmentStore};
 
 /// Total rows in the corpus, held constant across the segment-count sweep.
 const TOTAL_ROWS: i64 = 200_000;

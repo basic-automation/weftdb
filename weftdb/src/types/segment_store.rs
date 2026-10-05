@@ -32,9 +32,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
+use splimes::{Point, Resolution};
 use weft_physical_type::{merge_newer_wins, split_index, AspectSchema, FrameOptions, PagedSegment, Segment, SegmentDescriptor, SplitDecision, SplitPolicy, TimeUnit, PAGED_SEGMENT_FORMAT_VERSION};
 use weft_reduce::{Aggregation, Bucket, PartialReduction};
-use splimes::{Point, Resolution};
 
 use crate::{AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, PartialSidecar, PartialSidecarPolicy, SegmentIndexStore, SIDECAR_AGGREGATIONS};
 
@@ -185,11 +185,7 @@ const fn instant_from_epoch(epoch: i64, unit: TimeUnit) -> Option<DateTime<Utc>>
 /// Pure and synchronous: it takes the frame bytes and returns the partial, so it holds
 /// no store state and the whole call is `spawn_blocking`-safe.
 fn segment_partial(descriptor: &SegmentDescriptor, bytes: &[u8], start: i64, end: i64, unit: TimeUnit, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Option<PartialReduction>> {
-	let (ts, vs) = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION {
-		weft_physical_type::weftseg::read_paged_segment_range(bytes, start, end).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?
-	} else {
-		weft_physical_type::weftseg::read_segment_range(bytes, start, end).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?
-	};
+	let (ts, vs) = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION { weft_physical_type::weftseg::read_paged_segment_range(bytes, start, end).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))? } else { weft_physical_type::weftseg::read_segment_range(bytes, start, end).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))? };
 	// Null rows carry no value to reduce; present rows lift to absolute instants.
 	let mut points: Vec<Point> = Vec::with_capacity(ts.len());
 	for (t, v) in ts.into_iter().zip(vs) {
@@ -757,11 +753,7 @@ impl SegmentStore {
 			// index range + per-present-row value read) — the paged variant additionally skips whole
 			// pages disjoint from the window — instead of the whole segment; any other shape falls
 			// back to a full decode. Already filtered to `[start, end]`.
-			let (ts, vs) = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION {
-				weft_physical_type::weftseg::read_paged_segment_range(&bytes, start, end).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?
-			} else {
-				weft_physical_type::weftseg::read_segment_range(&bytes, start, end).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?
-			};
+			let (ts, vs) = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION { weft_physical_type::weftseg::read_paged_segment_range(&bytes, start, end).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))? } else { weft_physical_type::weftseg::read_segment_range(&bytes, start, end).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))? };
 			for (t, v) in ts.into_iter().zip(vs) {
 				if start <= t && t <= end {
 					timestamps.push(t);
@@ -892,11 +884,7 @@ impl SegmentStore {
 			// Streaming single-value read: prunes/skips the pages and value-column blocks a point
 			// lookup does not touch, unpacking only the one block covering `t` on a per-block codec
 			// (roadmap Phase 4/6). Equal to `…read_from(&bytes)?.value_at(t)` for every frame.
-			let hit = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION {
-				weft_physical_type::weftseg::read_paged_segment_point(&bytes, t).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?
-			} else {
-				weft_physical_type::weftseg::read_segment_point(&bytes, t).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?
-			};
+			let hit = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION { weft_physical_type::weftseg::read_paged_segment_point(&bytes, t).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))? } else { weft_physical_type::weftseg::read_segment_point(&bytes, t).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))? };
 			if hit.is_some() {
 				found = hit;
 			}
@@ -931,11 +919,7 @@ impl SegmentStore {
 		let mut found = vec![None; ts.len()];
 		for descriptor in &descriptors {
 			let bytes = tokio::fs::read(&descriptor.path).await.with_context(|| format!("reading segment {}", descriptor.path))?;
-			let hits = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION {
-				weft_physical_type::weftseg::read_paged_segment_points(&bytes, ts).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?
-			} else {
-				weft_physical_type::weftseg::read_segment_points(&bytes, ts).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?
-			};
+			let hits = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION { weft_physical_type::weftseg::read_paged_segment_points(&bytes, ts).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))? } else { weft_physical_type::weftseg::read_segment_points(&bytes, ts).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))? };
 			// Later (higher seal-id) segments override earlier ones per instant — last-writer-wins.
 			for (slot, hit) in found.iter_mut().zip(hits) {
 				if hit.is_some() {
@@ -1377,11 +1361,11 @@ impl SegmentStore {
 				Some(component) if lo <= running_max_hi => {
 					component.push(id);
 					running_max_hi = running_max_hi.max(hi);
-				},
+				}
 				_ => {
 					components.push(vec![id]);
 					running_max_hi = hi;
-				},
+				}
 			}
 		}
 		let schema = self.require_schema(aspect).await?;
@@ -2181,8 +2165,8 @@ pub struct AspectStorageStats {
 mod tests {
 	use std::str::FromStr;
 
-	use weft_physical_type::{timestamp::TimeUnit, PhysicalType};
 	use tempfile::TempDir;
+	use weft_physical_type::{timestamp::TimeUnit, PhysicalType};
 
 	use super::*;
 
@@ -2581,8 +2565,8 @@ mod tests {
 	/// showing a downsample still serves from the sidecar.
 	#[tokio::test]
 	async fn reconcile_regenerates_the_partial_sidecar() {
-		use weft_reduce::{reduce, Aggregation};
 		use splimes::{Point, Resolution};
+		use weft_reduce::{reduce, Aggregation};
 
 		let dir = TempDir::new().expect("tempdir");
 		let store = SegmentStore::open(dir.path()).await.expect("opens").with_partial_sidecar_policy(PartialSidecarPolicy::at(Resolution::Hours, 1));
@@ -3747,8 +3731,8 @@ mod tests {
 	/// unconfigured store writes no sidecar.
 	#[tokio::test]
 	async fn seal_writes_a_matching_partial_sidecar_when_configured() {
-		use weft_reduce::reduce_partial;
 		use splimes::{Point, Resolution};
+		use weft_reduce::reduce_partial;
 
 		// The shared schema is SECONDS; one sample a minute so the minute-base sidecar has
 		// one bucket per sample and an hour of data spans a handful of base buckets.
@@ -3789,8 +3773,8 @@ mod tests {
 	/// one pass — for every reduction, across many segments, including the sketch.
 	#[tokio::test]
 	async fn downsample_range_equals_a_single_pass_over_the_whole_range() {
-		use weft_reduce::{reduce, Aggregation};
 		use splimes::{Point, Resolution};
+		use weft_reduce::{reduce, Aggregation};
 
 		let dir = TempDir::new().expect("tempdir");
 		let store = SegmentStore::open(dir.path()).await.expect("opens");
@@ -3844,8 +3828,8 @@ mod tests {
 	/// the frames are gone.
 	#[tokio::test]
 	async fn downsample_range_serves_materializable_queries_from_sidecars() {
-		use weft_reduce::{reduce, Aggregation};
 		use splimes::{Point, Resolution};
+		use weft_reduce::{reduce, Aggregation};
 
 		let dir = TempDir::new().expect("tempdir");
 		// Sidecars at HOUR base (the query resolution), floor 1 so every seal qualifies.
@@ -3897,8 +3881,8 @@ mod tests {
 	/// the base (seconds) cannot be served and must decode.
 	#[tokio::test]
 	async fn downsample_range_rebuckets_a_fine_base_to_a_coarser_resolution() {
-		use weft_reduce::{reduce, Aggregation};
 		use splimes::{Point, Resolution};
+		use weft_reduce::{reduce, Aggregation};
 
 		let dir = TempDir::new().expect("tempdir");
 		// Sidecars at MINUTE base — finer than the HOUR query, so the roll-up re-keys.
@@ -3935,8 +3919,8 @@ mod tests {
 	/// rather than inferred from the multi-segment equality test above.
 	#[tokio::test]
 	async fn downsample_range_single_segment_equals_a_single_pass() {
-		use weft_reduce::{reduce, Aggregation};
 		use splimes::{Point, Resolution};
+		use weft_reduce::{reduce, Aggregation};
 
 		let dir = TempDir::new().expect("tempdir");
 		let store = SegmentStore::open(dir.path()).await.expect("opens");

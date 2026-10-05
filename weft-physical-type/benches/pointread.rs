@@ -17,7 +17,9 @@ use std::hint::black_box;
 
 use bigdecimal::BigDecimal;
 use criterion::{criterion_group, criterion_main, Criterion};
-use weft_physical_type::{weftseg::{read_paged_segment_point, read_segment, read_segment_point, read_segment_points, read_segment_range}, timestamp::TimeUnit, PagedSegment, Segment};
+use weft_physical_type::{
+	timestamp::TimeUnit, weftseg::{read_paged_segment_point, read_segment, read_segment_point, read_segment_points, read_segment_range}, PagedSegment, Segment
+};
 
 /// The FOR-packing corpus values: a high base (`10000000`) with a tiny 2-decimal wobble
 /// (`.00`..`.96`) that f64 cannot represent exactly, so `recommend_encoding` selects `ScaledI64`

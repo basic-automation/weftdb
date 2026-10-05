@@ -22,21 +22,20 @@ use weft_physical_type::timestamp::{bitpack_decode, bitpack_encode, blocked_bitp
 /// value every 37th position (so the upper bit-planes are sparse, not empty). No RNG dep —
 /// a cheap xorshift keyed off the index keeps the bench reproducible.
 fn corpus(n: usize) -> Vec<i64> {
-	(0..n)
-		.map(|i| {
-			let mut x = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-			x ^= x >> 29;
-			x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-			x ^= x >> 32;
-			if i % 37 == 0 {
-				// Occasional wider value (few thousand) — a sparse high bit-plane.
-				i64::from((x % 8_000) as u32) - 4_000
-			} else {
-				// Narrow ±7 jitter — the common case, only a few low planes populated.
-				i64::from((x % 15) as u32) - 7
-			}
-		})
-		.collect()
+	(0..n).map(|i| {
+		let mut x = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+		x ^= x >> 29;
+		x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+		x ^= x >> 32;
+		if i % 37 == 0 {
+			// Occasional wider value (few thousand) — a sparse high bit-plane.
+			i64::from((x % 8_000) as u32) - 4_000
+		} else {
+			// Narrow ±7 jitter — the common case, only a few low planes populated.
+			i64::from((x % 15) as u32) - 7
+		}
+	})
+	.collect()
 }
 
 fn bench_decode(c: &mut Criterion) {

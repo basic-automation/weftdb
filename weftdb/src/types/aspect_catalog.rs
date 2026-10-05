@@ -19,8 +19,8 @@ use std::str::FromStr;
 
 use anyhow::{bail, Result};
 use bigdecimal::BigDecimal;
-use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
 use turso::{Builder, Value};
+use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
 
 /// A durable, libSQL-backed registry of aspect [`AspectSchema`] declarations.
 ///

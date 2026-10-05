@@ -49,7 +49,9 @@ pub async fn request_span(request: Request, next: Next) -> Response {
 
 #[cfg(test)]
 mod tests {
-	use axum::{body::Body, http::{Request as HttpRequest, StatusCode}};
+	use axum::{
+		body::Body, http::{Request as HttpRequest, StatusCode}
+	};
 	use tower::ServiceExt as _;
 
 	use crate::{app_with_state, state::AppState};

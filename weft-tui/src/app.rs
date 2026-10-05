@@ -1,22 +1,21 @@
 use std::{
 	sync::{
 		atomic::{AtomicBool, Ordering}, Arc
-	},
-	time::Instant,
+	}, time::Instant
 };
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration, Utc};
 use crossterm::event::{KeyCode, KeyEventKind};
-use weftdb::{
-	database::traits::{AspectStructure, DatabaseStructure, Inputs, Outputs}, AggressivenessScaling, Aspect, CompressionConfig, Database, DatasetId, InputMeasurement, Resolution, SizeBasedCompressionConfig, Subject, TimeBasedCompressionConfig
-};
 use futures::StreamExt;
 use num_traits::cast::ToPrimitive;
 use ratatui::widgets::ListState;
 use splimes::Spline;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+use weftdb::{
+	database::traits::{AspectStructure, DatabaseStructure, Inputs, Outputs}, AggressivenessScaling, Aspect, CompressionConfig, Database, DatasetId, InputMeasurement, Resolution, SizeBasedCompressionConfig, Subject, TimeBasedCompressionConfig
+};
 
 use crate::logging::LogBuffer;
 
@@ -26,20 +25,50 @@ const RESOLUTION_ORDER: [Resolution; 10] = [Resolution::Nanoseconds, Resolution:
 #[derive(Debug, Clone)]
 pub enum AppState {
 	SelectingMode,
-	EnteringDatabaseName { input: String, cursor_position: usize, validation_error: Option<String> },
-	CreatingDatabase { name: String },
-	EnteringSubjectName { input: String, cursor_position: usize, validation_error: Option<String> },
-	CreatingSubject { name: String },
-	EnteringAspectName { input: String, cursor_position: usize, validation_error: Option<String>, selected_resolution: usize },
-	CreatingAspect { name: String, resolution: Resolution },
-	EnteringCsvPath { input: String, cursor_position: usize, validation_error: Option<String> },
+	EnteringDatabaseName {
+		input: String,
+		cursor_position: usize,
+		validation_error: Option<String>,
+	},
+	CreatingDatabase {
+		name: String,
+	},
+	EnteringSubjectName {
+		input: String,
+		cursor_position: usize,
+		validation_error: Option<String>,
+	},
+	CreatingSubject {
+		name: String,
+	},
+	EnteringAspectName {
+		input: String,
+		cursor_position: usize,
+		validation_error: Option<String>,
+		selected_resolution: usize,
+	},
+	CreatingAspect {
+		name: String,
+		resolution: Resolution,
+	},
+	EnteringCsvPath {
+		input: String,
+		cursor_position: usize,
+		validation_error: Option<String>,
+	},
 	SelectingDatabase,
 	SelectingSubject,
 	SelectingAspect,
-	Loading { loaded_count: usize, total_scanned: usize, status: String },
+	Loading {
+		loaded_count: usize,
+		total_scanned: usize,
+		status: String,
+	},
 	Plotting,
 	/// Step 1: Choose compression mode (with presets)
-	SelectingCompressionMode { selected_index: usize },
+	SelectingCompressionMode {
+		selected_index: usize,
+	},
 	/// Step 2: Configure details for the selected mode
 	ConfiguringCompression {
 		mode: CompressionMode,
@@ -47,7 +76,7 @@ pub enum AppState {
 		time_pure_days: String,
 		time_tier_days: String,
 		time_max_tiers: String,
-		time_scaling_index: usize,     // 0=Linear, 1=Exponential
+		time_scaling_index: usize, // 0=Linear, 1=Exponential
 		// Size-based fields
 		size_target_gb: String,
 		size_min_agg: String,
@@ -102,31 +131,13 @@ pub struct LastCompressionInfo {
 #[derive(Debug, Clone)]
 pub enum CompressionStatus {
 	/// Compression is running
-	Running {
-		phase: String,
-		progress_percent: Option<u8>,
-		current_tier: Option<u32>,
-		total_tiers: Option<u32>,
-		aggressiveness: Option<f64>,
-		time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
-	},
+	Running { phase: String, progress_percent: Option<u8>, current_tier: Option<u32>, total_tiers: Option<u32>, aggressiveness: Option<f64>, time_range: Option<(DateTime<Utc>, DateTime<Utc>)> },
 	/// Compression completed successfully
-	Complete {
-		original_count: usize,
-		compressed_count: usize,
-		compression_ratio: f64,
-		final_size_bytes: u64,
-		time_based_tiers: usize,
-		size_based_iterations: usize,
-		duration_ms: u64,
-	},
+	Complete { original_count: usize, compressed_count: usize, compression_ratio: f64, final_size_bytes: u64, time_based_tiers: usize, size_based_iterations: usize, duration_ms: u64 },
 	/// Compression failed
 	Error(String),
 	/// Idle - showing last compression stats (default state when aspect selected)
-	Idle {
-		last_compression: Option<LastCompressionInfo>,
-		dirty_regions_count: usize,
-	},
+	Idle { last_compression: Option<LastCompressionInfo>, dirty_regions_count: usize },
 }
 
 /// Messages from background compression task
@@ -1112,14 +1123,14 @@ impl App {
 						// Time-based (custom) - go to config screen
 						self.state = AppState::ConfiguringCompression {
 							mode: CompressionMode::TimeBased,
-							time_pure_days: "2555".to_string(),  // ~7 years
+							time_pure_days: "2555".to_string(), // ~7 years
 							time_tier_days: "365".to_string(),
 							time_max_tiers: "10".to_string(),
-							time_scaling_index: 1,  // Exponential
+							time_scaling_index: 1, // Exponential
 							size_target_gb: "10".to_string(),
 							size_min_agg: "0.1".to_string(),
 							size_max_agg: "0.95".to_string(),
-							base_resolution_index: 6,  // Days
+							base_resolution_index: 6, // Days
 							focused_field: CompressionField::TimePureDays,
 							validation_error: None,
 						};
@@ -1136,35 +1147,11 @@ impl App {
 					}
 					5 => {
 						// Size-based (custom) - go to config screen
-						self.state = AppState::ConfiguringCompression {
-							mode: CompressionMode::SizeBased,
-							time_pure_days: "2555".to_string(),
-							time_tier_days: "365".to_string(),
-							time_max_tiers: "10".to_string(),
-							time_scaling_index: 1,
-							size_target_gb: "10".to_string(),
-							size_min_agg: "0.1".to_string(),
-							size_max_agg: "0.95".to_string(),
-							base_resolution_index: 6,
-							focused_field: CompressionField::SizeTargetGb,
-							validation_error: None,
-						};
+						self.state = AppState::ConfiguringCompression { mode: CompressionMode::SizeBased, time_pure_days: "2555".to_string(), time_tier_days: "365".to_string(), time_max_tiers: "10".to_string(), time_scaling_index: 1, size_target_gb: "10".to_string(), size_min_agg: "0.1".to_string(), size_max_agg: "0.95".to_string(), base_resolution_index: 6, focused_field: CompressionField::SizeTargetGb, validation_error: None };
 					}
 					6 => {
 						// Combined - go to config screen
-						self.state = AppState::ConfiguringCompression {
-							mode: CompressionMode::Combined,
-							time_pure_days: "2555".to_string(),
-							time_tier_days: "365".to_string(),
-							time_max_tiers: "10".to_string(),
-							time_scaling_index: 1,
-							size_target_gb: "10".to_string(),
-							size_min_agg: "0.1".to_string(),
-							size_max_agg: "0.95".to_string(),
-							base_resolution_index: 6,
-							focused_field: CompressionField::TimePureDays,
-							validation_error: None,
-						};
+						self.state = AppState::ConfiguringCompression { mode: CompressionMode::Combined, time_pure_days: "2555".to_string(), time_tier_days: "365".to_string(), time_max_tiers: "10".to_string(), time_scaling_index: 1, size_target_gb: "10".to_string(), size_min_agg: "0.1".to_string(), size_max_agg: "0.95".to_string(), base_resolution_index: 6, focused_field: CompressionField::TimePureDays, validation_error: None };
 					}
 					_ => {}
 				}
@@ -1184,15 +1171,8 @@ impl App {
 		}
 
 		// Extract current state
-		let (mode, mut time_pure_days, mut time_tier_days, mut time_max_tiers, mut time_scaling_index,
-			mut size_target_gb, mut size_min_agg, mut size_max_agg, mut base_resolution_index, mut focused_field) = match &self.state {
-			AppState::ConfiguringCompression {
-				mode, time_pure_days, time_tier_days, time_max_tiers, time_scaling_index,
-				size_target_gb, size_min_agg, size_max_agg, base_resolution_index, focused_field, ..
-			} => (
-				mode.clone(), time_pure_days.clone(), time_tier_days.clone(), time_max_tiers.clone(), *time_scaling_index,
-				size_target_gb.clone(), size_min_agg.clone(), size_max_agg.clone(), *base_resolution_index, focused_field.clone()
-			),
+		let (mode, mut time_pure_days, mut time_tier_days, mut time_max_tiers, mut time_scaling_index, mut size_target_gb, mut size_min_agg, mut size_max_agg, mut base_resolution_index, mut focused_field) = match &self.state {
+			AppState::ConfiguringCompression { mode, time_pure_days, time_tier_days, time_max_tiers, time_scaling_index, size_target_gb, size_min_agg, size_max_agg, base_resolution_index, focused_field, .. } => (mode.clone(), time_pure_days.clone(), time_tier_days.clone(), time_max_tiers.clone(), *time_scaling_index, size_target_gb.clone(), size_min_agg.clone(), size_max_agg.clone(), *base_resolution_index, focused_field.clone()),
 			_ => return Ok(false),
 		};
 
@@ -1223,16 +1203,16 @@ impl App {
 						time_scaling_index = if key.code == KeyCode::Right {
 							(time_scaling_index + 1) % 2
 						} else {
-							if time_scaling_index == 0 { 1 } else { 0 }
+							if time_scaling_index == 0 {
+								1
+							} else {
+								0
+							}
 						};
 					}
 					CompressionField::BaseResolution => {
 						// 0=Nanoseconds, ..., 9=Years
-						base_resolution_index = if key.code == KeyCode::Right {
-							(base_resolution_index + 1).min(9)
-						} else {
-							base_resolution_index.saturating_sub(1)
-						};
+						base_resolution_index = if key.code == KeyCode::Right { (base_resolution_index + 1).min(9) } else { base_resolution_index.saturating_sub(1) };
 					}
 					_ => {}
 				}
@@ -1252,32 +1232,37 @@ impl App {
 			KeyCode::Backspace => {
 				// Remove character from current text field
 				match focused_field {
-					CompressionField::TimePureDays => { time_pure_days.pop(); }
-					CompressionField::TimeTierDays => { time_tier_days.pop(); }
-					CompressionField::TimeMaxTiers => { time_max_tiers.pop(); }
-					CompressionField::SizeTargetGb => { size_target_gb.pop(); }
-					CompressionField::SizeMinAgg => { size_min_agg.pop(); }
-					CompressionField::SizeMaxAgg => { size_max_agg.pop(); }
+					CompressionField::TimePureDays => {
+						time_pure_days.pop();
+					}
+					CompressionField::TimeTierDays => {
+						time_tier_days.pop();
+					}
+					CompressionField::TimeMaxTiers => {
+						time_max_tiers.pop();
+					}
+					CompressionField::SizeTargetGb => {
+						size_target_gb.pop();
+					}
+					CompressionField::SizeMinAgg => {
+						size_min_agg.pop();
+					}
+					CompressionField::SizeMaxAgg => {
+						size_max_agg.pop();
+					}
 					_ => {}
 				}
 			}
 			KeyCode::Enter => {
 				// Validate and run compression
-				match self.build_and_run_compression(
-					&mode, &time_pure_days, &time_tier_days, &time_max_tiers, time_scaling_index,
-					&size_target_gb, &size_min_agg, &size_max_agg, base_resolution_index
-				) {
+				match self.build_and_run_compression(&mode, &time_pure_days, &time_tier_days, &time_max_tiers, time_scaling_index, &size_target_gb, &size_min_agg, &size_max_agg, base_resolution_index) {
 					Ok(()) => {
 						self.state = AppState::Plotting;
 						return Ok(false);
 					}
 					Err(e) => {
 						// Show validation error
-						self.state = AppState::ConfiguringCompression {
-							mode, time_pure_days, time_tier_days, time_max_tiers, time_scaling_index,
-							size_target_gb, size_min_agg, size_max_agg, base_resolution_index, focused_field,
-							validation_error: Some(e.to_string()),
-						};
+						self.state = AppState::ConfiguringCompression { mode, time_pure_days, time_tier_days, time_max_tiers, time_scaling_index, size_target_gb, size_min_agg, size_max_agg, base_resolution_index, focused_field, validation_error: Some(e.to_string()) };
 						return Ok(false);
 					}
 				}
@@ -1291,11 +1276,7 @@ impl App {
 		}
 
 		// Update state with new values
-		self.state = AppState::ConfiguringCompression {
-			mode, time_pure_days, time_tier_days, time_max_tiers, time_scaling_index,
-			size_target_gb, size_min_agg, size_max_agg, base_resolution_index, focused_field,
-			validation_error: None,
-		};
+		self.state = AppState::ConfiguringCompression { mode, time_pure_days, time_tier_days, time_max_tiers, time_scaling_index, size_target_gb, size_min_agg, size_max_agg, base_resolution_index, focused_field, validation_error: None };
 
 		Ok(false)
 	}
@@ -1303,29 +1284,9 @@ impl App {
 	/// Get list of fields available for the given compression mode
 	fn get_compression_fields_for_mode(&self, mode: &CompressionMode) -> Vec<CompressionField> {
 		match mode {
-			CompressionMode::TimeBased => vec![
-				CompressionField::TimePureDays,
-				CompressionField::TimeTierDays,
-				CompressionField::TimeMaxTiers,
-				CompressionField::TimeScaling,
-				CompressionField::BaseResolution,
-			],
-			CompressionMode::SizeBased => vec![
-				CompressionField::SizeTargetGb,
-				CompressionField::SizeMinAgg,
-				CompressionField::SizeMaxAgg,
-				CompressionField::BaseResolution,
-			],
-			CompressionMode::Combined => vec![
-				CompressionField::TimePureDays,
-				CompressionField::TimeTierDays,
-				CompressionField::TimeMaxTiers,
-				CompressionField::TimeScaling,
-				CompressionField::SizeTargetGb,
-				CompressionField::SizeMinAgg,
-				CompressionField::SizeMaxAgg,
-				CompressionField::BaseResolution,
-			],
+			CompressionMode::TimeBased => vec![CompressionField::TimePureDays, CompressionField::TimeTierDays, CompressionField::TimeMaxTiers, CompressionField::TimeScaling, CompressionField::BaseResolution],
+			CompressionMode::SizeBased => vec![CompressionField::SizeTargetGb, CompressionField::SizeMinAgg, CompressionField::SizeMaxAgg, CompressionField::BaseResolution],
+			CompressionMode::Combined => vec![CompressionField::TimePureDays, CompressionField::TimeTierDays, CompressionField::TimeMaxTiers, CompressionField::TimeScaling, CompressionField::SizeTargetGb, CompressionField::SizeMinAgg, CompressionField::SizeMaxAgg, CompressionField::BaseResolution],
 		}
 	}
 
@@ -1335,14 +1296,7 @@ impl App {
 		let db_name = self.selected_database.clone().unwrap();
 		let aspect = self.selected_aspect.clone().unwrap();
 
-		self.compression_status = Some(CompressionStatus::Running {
-			phase: "Disabling compression...".to_string(),
-			progress_percent: None,
-			current_tier: None,
-			total_tiers: None,
-			aggressiveness: None,
-			time_range: None,
-		});
+		self.compression_status = Some(CompressionStatus::Running { phase: "Disabling compression...".to_string(), progress_percent: None, current_tier: None, total_tiers: None, aggressiveness: None, time_range: None });
 
 		let (tx, rx) = mpsc::channel(10);
 		self.compression_receiver = Some(rx);
@@ -1359,15 +1313,7 @@ impl App {
 						warn!("Failed to persist compression config removal: {}", e);
 					}
 
-					let _ = tx.send(CompressionMessage::Complete {
-						original_count: 0,
-						compressed_count: 0,
-						compression_ratio: 0.0,
-						final_size_bytes: 0,
-						time_based_tiers: 0,
-						size_based_iterations: 0,
-						duration_ms: 0,
-					}).await;
+					let _ = tx.send(CompressionMessage::Complete { original_count: 0, compressed_count: 0, compression_ratio: 0.0, final_size_bytes: 0, time_based_tiers: 0, size_based_iterations: 0, duration_ms: 0 }).await;
 				}
 				Err(e) => {
 					let _ = tx.send(CompressionMessage::Error(format!("Failed to open database: {}", e))).await;
@@ -1403,18 +1349,7 @@ impl App {
 
 	/// Build compression config from form fields and run compression
 	#[allow(clippy::too_many_arguments)] // Form processing requires all these fields
-	fn build_and_run_compression(
-		&mut self,
-		mode: &CompressionMode,
-		time_pure_days: &str,
-		time_tier_days: &str,
-		time_max_tiers: &str,
-		time_scaling_index: usize,
-		size_target_gb: &str,
-		size_min_agg: &str,
-		size_max_agg: &str,
-		base_resolution_index: usize,
-	) -> Result<()> {
+	fn build_and_run_compression(&mut self, mode: &CompressionMode, time_pure_days: &str, time_tier_days: &str, time_max_tiers: &str, time_scaling_index: usize, size_target_gb: &str, size_min_agg: &str, size_max_agg: &str, base_resolution_index: usize) -> Result<()> {
 		// Parse and validate fields
 		let base_resolution = RESOLUTION_ORDER[base_resolution_index];
 
@@ -1423,16 +1358,9 @@ impl App {
 				let pure_days: i64 = time_pure_days.parse().map_err(|_| anyhow!("Invalid pure duration"))?;
 				let tier_days: i64 = time_tier_days.parse().map_err(|_| anyhow!("Invalid tier duration"))?;
 				let max_tiers: u32 = time_max_tiers.parse().map_err(|_| anyhow!("Invalid max tiers"))?;
-				let scaling = if time_scaling_index == 0 {
-					AggressivenessScaling::Linear
-				} else {
-					AggressivenessScaling::Exponential { base: 0.5 }
-				};
+				let scaling = if time_scaling_index == 0 { AggressivenessScaling::Linear } else { AggressivenessScaling::Exponential { base: 0.5 } };
 
-				let time_config = TimeBasedCompressionConfig::new(
-					Duration::days(pure_days),
-					Duration::days(tier_days),
-				).with_max_tiers(max_tiers).with_scaling(scaling);
+				let time_config = TimeBasedCompressionConfig::new(Duration::days(pure_days), Duration::days(tier_days)).with_max_tiers(max_tiers).with_scaling(scaling);
 
 				CompressionConfig::time_based(time_config).with_base_resolution(base_resolution)
 			}
@@ -1456,16 +1384,9 @@ impl App {
 				let pure_days: i64 = time_pure_days.parse().map_err(|_| anyhow!("Invalid pure duration"))?;
 				let tier_days: i64 = time_tier_days.parse().map_err(|_| anyhow!("Invalid tier duration"))?;
 				let max_tiers: u32 = time_max_tiers.parse().map_err(|_| anyhow!("Invalid max tiers"))?;
-				let scaling = if time_scaling_index == 0 {
-					AggressivenessScaling::Linear
-				} else {
-					AggressivenessScaling::Exponential { base: 0.5 }
-				};
+				let scaling = if time_scaling_index == 0 { AggressivenessScaling::Linear } else { AggressivenessScaling::Exponential { base: 0.5 } };
 
-				let time_config = TimeBasedCompressionConfig::new(
-					Duration::days(pure_days),
-					Duration::days(tier_days),
-				).with_max_tiers(max_tiers).with_scaling(scaling);
+				let time_config = TimeBasedCompressionConfig::new(Duration::days(pure_days), Duration::days(tier_days)).with_max_tiers(max_tiers).with_scaling(scaling);
 
 				let target_gb: f64 = size_target_gb.parse().map_err(|_| anyhow!("Invalid target size"))?;
 				let min_agg: f64 = size_min_agg.parse().map_err(|_| anyhow!("Invalid min aggressiveness"))?;
@@ -1494,14 +1415,7 @@ impl App {
 		let cancel = Arc::new(AtomicBool::new(false));
 		self.compression_receiver = Some(rx);
 		self.compression_cancel = Some(cancel.clone());
-		self.compression_status = Some(CompressionStatus::Running {
-			phase: "Starting compression...".to_string(),
-			progress_percent: None,
-			current_tier: None,
-			total_tiers: None,
-			aggressiveness: None,
-			time_range: None,
-		});
+		self.compression_status = Some(CompressionStatus::Running { phase: "Starting compression...".to_string(), progress_percent: None, current_tier: None, total_tiers: None, aggressiveness: None, time_range: None });
 
 		let db_name = self.selected_database.clone().unwrap();
 		let aspect = self.selected_aspect.clone().unwrap();
@@ -1519,41 +1433,19 @@ impl App {
 						// Continue anyway - compression can still run with local config
 					}
 
-					let _ = tx.send(CompressionMessage::Progress {
-						phase: "Initializing compression...".to_string(),
-						progress_percent: Some(0),
-						current_tier: None,
-						total_tiers: None,
-						aggressiveness: None,
-						time_range: None,
-					}).await;
+					let _ = tx.send(CompressionMessage::Progress { phase: "Initializing compression...".to_string(), progress_percent: Some(0), current_tier: None, total_tiers: None, aggressiveness: None, time_range: None }).await;
 
 					// Create progress callback to send updates to the TUI
 					let tx_progress = tx.clone();
 					let progress_callback: weftdb::ProgressCallback = std::sync::Arc::new(move |progress| {
 						let phase_str = format!("{}", progress.phase);
-						let progress_percent = if progress.total_tiers > 0 {
-							Some(((progress.current_tier as f64 / progress.total_tiers as f64) * 100.0) as u8)
-						} else {
-							None
-						};
-						let time_range = if progress.time_range_start != progress.time_range_end {
-							Some((progress.time_range_start, progress.time_range_end))
-						} else {
-							None
-						};
+						let progress_percent = if progress.total_tiers > 0 { Some(((progress.current_tier as f64 / progress.total_tiers as f64) * 100.0) as u8) } else { None };
+						let time_range = if progress.time_range_start != progress.time_range_end { Some((progress.time_range_start, progress.time_range_end)) } else { None };
 						// Use blocking send since we're in a sync callback
-						let _ = tx_progress.try_send(CompressionMessage::Progress {
-							phase: phase_str,
-							progress_percent,
-							current_tier: Some(progress.current_tier),
-							total_tiers: Some(progress.total_tiers),
-							aggressiveness: Some(progress.aggressiveness),
-							time_range,
-						});
+						let _ = tx_progress.try_send(CompressionMessage::Progress { phase: phase_str, progress_percent, current_tier: Some(progress.current_tier), total_tiers: Some(progress.total_tiers), aggressiveness: Some(progress.aggressiveness), time_range });
 					});
 
-						info!(">>> Starting compress_with_progress...");
+					info!(">>> Starting compress_with_progress...");
 					let compression_start = std::time::Instant::now();
 					let compression_result = aspect.compress_with_progress(&db, Some(progress_callback)).await;
 					info!(">>> compress_with_progress returned");
@@ -1577,15 +1469,7 @@ impl App {
 							info!("History saved");
 
 							info!("Sending Complete message...");
-							let _ = tx.send(CompressionMessage::Complete {
-								original_count: detailed_summary.summary.total_original_count,
-								compressed_count: detailed_summary.summary.total_compressed_count,
-								compression_ratio: detailed_summary.summary.overall_compression_ratio(),
-								final_size_bytes: detailed_summary.summary.final_size_bytes,
-								time_based_tiers: detailed_summary.summary.time_based_results.len(),
-								size_based_iterations: detailed_summary.summary.size_based_results.len(),
-								duration_ms,
-							}).await;
+							let _ = tx.send(CompressionMessage::Complete { original_count: detailed_summary.summary.total_original_count, compressed_count: detailed_summary.summary.total_compressed_count, compression_ratio: detailed_summary.summary.overall_compression_ratio(), final_size_bytes: detailed_summary.summary.final_size_bytes, time_based_tiers: detailed_summary.summary.time_based_results.len(), size_based_iterations: detailed_summary.summary.size_based_results.len(), duration_ms }).await;
 							info!("Complete message sent");
 						}
 						Err(e) => {
@@ -1600,7 +1484,6 @@ impl App {
 		});
 	}
 
-
 	/// Poll compression progress messages
 	pub fn poll_compression(&mut self) {
 		let mut should_clear = false;
@@ -1611,28 +1494,10 @@ impl App {
 			while let Ok(msg) = rx.try_recv() {
 				match msg {
 					CompressionMessage::Progress { phase, progress_percent, current_tier, total_tiers, aggressiveness, time_range } => {
-						new_status = Some(CompressionStatus::Running {
-							phase,
-							progress_percent,
-							current_tier,
-							total_tiers,
-							aggressiveness,
-							time_range,
-						});
+						new_status = Some(CompressionStatus::Running { phase, progress_percent, current_tier, total_tiers, aggressiveness, time_range });
 					}
-					CompressionMessage::Complete {
-						original_count, compressed_count, compression_ratio,
-						final_size_bytes, time_based_tiers, size_based_iterations, duration_ms
-					} => {
-						new_status = Some(CompressionStatus::Complete {
-							original_count,
-							compressed_count,
-							compression_ratio,
-							final_size_bytes,
-							time_based_tiers,
-							size_based_iterations,
-							duration_ms,
-						});
+					CompressionMessage::Complete { original_count, compressed_count, compression_ratio, final_size_bytes, time_based_tiers, size_based_iterations, duration_ms } => {
+						new_status = Some(CompressionStatus::Complete { original_count, compressed_count, compression_ratio, final_size_bytes, time_based_tiers, size_based_iterations, duration_ms });
 						should_clear = true;
 						should_refresh_measurements = true;
 					}
@@ -1641,10 +1506,7 @@ impl App {
 						should_clear = true;
 					}
 					CompressionMessage::StatsLoaded { last_compression, dirty_regions_count } => {
-						new_status = Some(CompressionStatus::Idle {
-							last_compression,
-							dirty_regions_count,
-						});
+						new_status = Some(CompressionStatus::Idle { last_compression, dirty_regions_count });
 						should_clear = true;
 					}
 				}
@@ -1667,10 +1529,7 @@ impl App {
 	fn dismiss_compression_pane(&mut self) {
 		// Transition to Idle state instead of None so we continue to show the pane
 		// with last compression stats
-		self.compression_status = Some(CompressionStatus::Idle {
-			last_compression: None,
-			dirty_regions_count: 0,
-		});
+		self.compression_status = Some(CompressionStatus::Idle { last_compression: None, dirty_regions_count: 0 });
 		self.compression_receiver = None;
 		self.compression_cancel = None;
 		// Reload compression stats in background
@@ -1701,14 +1560,7 @@ impl App {
 					}
 					// Get last compression info
 					let last_compression = match aspect.get_last_compression().await {
-						Ok(Some(info)) => Some(LastCompressionInfo {
-							completed_at: info.completed_at,
-							original_count: info.original_count,
-							compressed_count: info.compressed_count,
-							compression_ratio: info.compression_ratio,
-							time_based_tiers: info.time_based_tiers,
-							duration_ms: info.duration_ms,
-						}),
+						Ok(Some(info)) => Some(LastCompressionInfo { completed_at: info.completed_at, original_count: info.original_count, compressed_count: info.compressed_count, compression_ratio: info.compression_ratio, time_based_tiers: info.time_based_tiers, duration_ms: info.duration_ms }),
 						Ok(None) => None,
 						Err(e) => {
 							debug!("Failed to load last compression info: {}", e);
@@ -1720,10 +1572,7 @@ impl App {
 					let dirty_regions_count = aspect.get_dirty_regions_count().await.unwrap_or(0);
 
 					// Send stats via the compression channel
-					let _ = tx.send(CompressionMessage::StatsLoaded {
-						last_compression,
-						dirty_regions_count,
-					}).await;
+					let _ = tx.send(CompressionMessage::StatsLoaded { last_compression, dirty_regions_count }).await;
 				}
 				Err(e) => {
 					debug!("Failed to open database for compression stats: {}", e);
@@ -1743,10 +1592,7 @@ impl App {
 		// Initialize compression status to Idle with placeholder values
 		// The actual stats will be loaded when measurements finish loading
 		if self.compression_status.is_none() {
-			self.compression_status = Some(CompressionStatus::Idle {
-				last_compression: None,
-				dirty_regions_count: 0,
-			});
+			self.compression_status = Some(CompressionStatus::Idle { last_compression: None, dirty_regions_count: 0 });
 		}
 
 		// Immediately notify UI that loading has started so spinner/progress updates.
@@ -1935,11 +1781,7 @@ async fn load_measurements_background(db_name: String, aspect_id: weftdb::Aspect
 		if points_since_last_update >= MIN_POINTS_PER_UPDATE && elapsed >= adaptive_interval {
 			let update_start = Instant::now();
 			let _ = tx.send(LoadingMessage::UpdateMeasurements(measurements.clone())).await;
-			let _ = tx.send(LoadingMessage::Progress {
-				loaded: measurements.len(),
-				scanned,
-				status: format!("Streaming at {:?} resolution...", view_resolution),
-			}).await;
+			let _ = tx.send(LoadingMessage::Progress { loaded: measurements.len(), scanned, status: format!("Streaming at {:?} resolution...", view_resolution) }).await;
 			last_update_duration = update_start.elapsed();
 			last_update_time = Instant::now();
 			points_since_last_update = 0;

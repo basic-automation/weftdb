@@ -20,8 +20,8 @@
 
 use std::{sync::Arc, time::Duration};
 
-use weftdb::{HotColdSweep, OverlapSweep, ReconcileSweep, SegmentStore, SquashSweep};
 use tracing::Instrument as _;
+use weftdb::{HotColdSweep, OverlapSweep, ReconcileSweep, SegmentStore, SquashSweep};
 
 use crate::metrics::SharedMetrics;
 
@@ -247,16 +247,16 @@ pub fn spawn_reconcile_daemon(store: Arc<SegmentStore>, metrics: SharedMetrics, 
 				match reconcile_tick_hot_cold(&store, &metrics, config.threshold).await {
 					Ok(sweep) if sweep.aspects_reconciled > 0 => {
 						println!("reconcile daemon (hot/cold): scanned {} aspect(s), reconciled {} aspect(s) / {} cold + {} hot segment(s)", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.cold_reconciled, sweep.hot_reconciled);
-					},
-					Ok(_) => {},
+					}
+					Ok(_) => {}
 					Err(err) => eprintln!("reconcile daemon: hot/cold sweep failed: {err}"),
 				}
 			} else {
 				match reconcile_tick(&store, &metrics, config.threshold).await {
 					Ok(sweep) if sweep.aspects_reconciled > 0 => {
 						println!("reconcile daemon: scanned {} aspect(s), reconciled {} aspect(s) / {} segment(s)", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_reconciled);
-					},
-					Ok(_) => {},
+					}
+					Ok(_) => {}
 					Err(err) => eprintln!("reconcile daemon: sweep failed: {err}"),
 				}
 			}
@@ -271,8 +271,8 @@ pub fn spawn_reconcile_daemon(store: Arc<SegmentStore>, metrics: SharedMetrics, 
 				match tick {
 					Ok(sweep) if sweep.aspects_reconciled > 0 => {
 						println!("reconcile daemon (overlaps): scanned {} aspect(s), merged {} aspect(s) / removed {} segment(s)", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_removed);
-					},
-					Ok(_) => {},
+					}
+					Ok(_) => {}
 					Err(err) => eprintln!("reconcile daemon: overlap sweep failed: {err}"),
 				}
 			}
@@ -282,8 +282,8 @@ pub fn spawn_reconcile_daemon(store: Arc<SegmentStore>, metrics: SharedMetrics, 
 				match reconcile_tick_squash(&store, &metrics, max_segments).await {
 					Ok(sweep) if sweep.aspects_squashed > 0 => {
 						println!("reconcile daemon (squash): scanned {} aspect(s), squashed {} aspect(s) / removed {} segment(s)", sweep.aspects_scanned, sweep.aspects_squashed, sweep.segments_removed);
-					},
-					Ok(_) => {},
+					}
+					Ok(_) => {}
 					Err(err) => eprintln!("reconcile daemon: squash sweep failed: {err}"),
 				}
 			}
@@ -293,8 +293,8 @@ pub fn spawn_reconcile_daemon(store: Arc<SegmentStore>, metrics: SharedMetrics, 
 				match reconcile_tick_compact(&store, &metrics, target_rows).await {
 					Ok(sweep) if sweep.aspects_squashed > 0 => {
 						println!("reconcile daemon (compact): scanned {} aspect(s), compacted {} aspect(s) / removed {} segment(s)", sweep.aspects_scanned, sweep.aspects_squashed, sweep.segments_removed);
-					},
-					Ok(_) => {},
+					}
+					Ok(_) => {}
 					Err(err) => eprintln!("reconcile daemon: compaction sweep failed: {err}"),
 				}
 			}
@@ -307,9 +307,9 @@ mod tests {
 	use std::sync::Arc;
 
 	use bigdecimal::BigDecimal;
-	use weftdb::SegmentStore;
-	use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
 	use tempfile::TempDir;
+	use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
+	use weftdb::SegmentStore;
 
 	use super::*;
 	use crate::metrics::Metrics;

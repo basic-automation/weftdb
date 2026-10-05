@@ -1,10 +1,10 @@
 use anyhow::Result;
-use weftdb::{
-	database::traits::{DatabaseStructure, Inputs, Outputs}, AspectId, Database
-};
 use futures::StreamExt;
 use splimes::{Resolution, Spline};
 use tracing::{debug, info};
+use weftdb::{
+	database::traits::{DatabaseStructure, Inputs, Outputs}, AspectId, Database
+};
 
 use super::calculate_affected_windows::{calculate_affected_windows, BatchWindow};
 use crate::{Batch, BatchedMeasurement};
