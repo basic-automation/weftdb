@@ -36,6 +36,9 @@ jobs:
   check:
     name: check (${{ matrix.toolchain }})
     runs-on: ubuntu-24.04
+    # Stable is the supported toolchain. Nightly is an early warning, not a gate: upstream
+    # crates break on it (e.g. turso_core's `branches` 0.4 calls a removed intrinsic).
+    continue-on-error: ${{ matrix.toolchain == 'nightly' }}
     strategy:
       fail-fast: false
       matrix:
