@@ -332,12 +332,13 @@ impl DatabaseStructure for Database {
 		tracing::debug!("All tables created successfully");
 
 		#[rustfmt::skip]
-		Ok(vec![
+		let transactions = vec![
 			create_transactions_table_transaction,
 			create_database_table_transaction,
 			create_subjects_table_transaction,
 			create_aspects_table_transaction
-		])
+		];
+		Ok(transactions)
 	}
 
 	/// Creates a new database instance. Creates folder /{`data_dir}/{name`}.

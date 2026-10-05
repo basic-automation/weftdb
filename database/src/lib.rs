@@ -266,7 +266,6 @@
     clippy::needless_continue,
     clippy::manual_let_else
 )]
-#![feature(stmt_expr_attributes)]
 
 mod types;
 

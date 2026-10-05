@@ -255,7 +255,7 @@ impl AspectStructure for Aspect {
 		info!(aspect_id = %id, "Aspect initialization complete");
 
 		#[rustfmt::skip]
-		Ok(Self {
+		let aspect = Self {
 			id,
 			name: name.to_string(),
 			subject_id: *subject_id,
@@ -282,7 +282,8 @@ impl AspectStructure for Aspect {
 			dictionaries: None,
 			dictionaries_paths: HashMap::new(),
 			compression_config: None, // Set via set_compression_config() after creation
-		})
+		};
+		Ok(aspect)
 	}
 
 	/// Lightweight constructor used when we only need the Aspect metadata
@@ -334,7 +335,7 @@ impl AspectStructure for Aspect {
 		}
 
 		#[rustfmt::skip]
-		Ok(Self {
+		let aspect = Self {
 			id: id.unwrap_or_default(),
 			name: name.clone(),
 			subject_id: *subject_id,
@@ -361,7 +362,8 @@ impl AspectStructure for Aspect {
 			dictionaries: None,
 			dictionaries_paths,
 			compression_config: None, // Will be loaded from metadata.db separately
-		})
+		};
+		Ok(aspect)
 	}
 
 	fn id(&self) -> AspectId {
