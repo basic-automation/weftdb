@@ -23,6 +23,9 @@ serde = { workspace = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 criterion = { workspace = true }
+# Bench-only external yardsticks, pinned exactly (0.x carries no semver promise). Nothing in
+# the library links them: they exist to measure WeftDB's own codecs against upstream.
+fastlanes = "=0.7.2"
 
 [[bench]]
 name = "bitunpack"
@@ -38,4 +41,8 @@ harness = false
 
 [[bench]]
 name = "transposed_read"
+harness = false
+
+[[bench]]
+name = "fastlanes_yardstick"
 harness = false

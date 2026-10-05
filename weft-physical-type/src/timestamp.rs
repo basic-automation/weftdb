@@ -646,10 +646,9 @@ pub fn transpose_bitpack_bytes(values: &[i64], tile: usize) -> usize {
 /// value's `width` bits are contiguous; here a value's bits are scattered one per plane, and
 /// a plane gathers one bit from every value.
 ///
-/// Why: the transpose makes the **high bit-planes of a small-magnitude stream empty**, so
-/// [`transpose_bitpack_decode`] skips them wholesale (an all-zero plane word contributes
-/// nothing), where the scalar per-value [`bitpack_decode`] pays for every bit of every value
-/// regardless. Exact inverse is [`transpose_bitpack_decode`] given the same `tile` and count;
+/// Why: a plane holds the same bit of 8 lanes per byte, so [`transpose_bitpack_decode`]
+/// rebuilds eight lanes per byte read with fixed, branch-free table spreads, where the
+/// scalar per-value [`bitpack_decode`] extracts each value's bits one value at a time. Exact inverse is [`transpose_bitpack_decode`] given the same `tile` and count;
 /// an empty input yields an empty buffer. The emitted length is exactly
 /// [`transpose_bitpack_bytes`] for the same `(values, tile)`.
 #[must_use]
@@ -680,40 +679,84 @@ pub fn transpose_bitpack_encode(values: &[i64], tile: usize) -> Vec<u8> {
 	out
 }
 
+/// `SPREAD[byte]` moves bit `k` of `byte` to bit `8k`: one bit into each of eight byte lanes.
+/// [`transpose_tile_decode`] uses it to scatter a plane byte (8 lanes' bit `b`) into the
+/// eight lanes' accumulator bytes with one lookup instead of a per-bit loop.
+const SPREAD: [u64; 256] = {
+	let mut table = [0_u64; 256];
+	let mut byte = 0;
+	while byte < 256 {
+		let mut k = 0;
+		while k < 8 {
+			if (byte >> k) & 1 == 1 {
+				table[byte] |= 1 << (8 * k);
+			}
+			k += 1;
+		}
+		byte += 1;
+	}
+	table
+};
+
 /// Decode one transposed tile's `len` lanes from its `width` bit-planes (the `plane_bytes =
 /// ceil(len / 8)` bytes per plane starting at `planes`). Shared by [`transpose_bitpack_decode`]
 /// and [`transpose_bitpack_decode_range`].
 ///
-/// Reads each plane as `u64` words and distributes only the **set** bits of each word to their
-/// lanes (`w &= w - 1` walks set bits), so an all-zero plane word costs a single compare — the
-/// decode-latency win. A `width` of 0 (a constant tile) yields `len` zeros; bytes past `planes`
-/// read as 0 (a truncated tile yields zeros rather than panicking).
+/// Walks the tile one **byte column** (8 lanes) at a time, eight planes at a time: each plane
+/// byte is spread by [`SPREAD`] so byte `k` of a `u64` collects lane `k`'s next eight bits, then
+/// those eight bytes are OR-ed into the lanes. The loop has no data-dependent branches, so its
+/// cost is fixed by `width` rather than by how many bits are set. (The previous decoder walked
+/// only the *set* bits of each plane word, `w &= w - 1`, and measured 3.7–15× slower than the
+/// `fastlanes` crate at equal width — `benches/fastlanes_yardstick.rs`.) A `width` of 0 (a
+/// constant tile) yields `len` zeros; bytes past `planes` read as 0 (a truncated tile yields
+/// zeros rather than panicking); widths past 64 are clamped, as no zig-zag code is wider.
 fn transpose_tile_decode(planes: &[u8], width: usize, len: usize) -> Vec<i64> {
+	let mut out = Vec::with_capacity(len);
+	transpose_tile_decode_into(planes, width, len, &mut out);
+	out
+}
+
+/// [`transpose_tile_decode`], appending the `len` lanes to `out` instead of allocating, so a
+/// multi-tile decode writes straight into its result.
+fn transpose_tile_decode_into(planes: &[u8], width: usize, len: usize, out: &mut Vec<i64>) {
+	let start = out.len();
+	out.resize(start + len, 0);
 	if width == 0 {
-		return vec![0; len];
+		return;
 	}
+	let width = width.min(64);
 	let plane_bytes = len.div_ceil(8);
-	let mut acc = vec![0_u64; len];
-	for b in 0..width {
-		let plane_start = b * plane_bytes;
-		let plane = planes.get(plane_start..plane_start + plane_bytes).unwrap_or(&[]);
-		for (g, group) in plane.chunks(8).enumerate() {
-			let mut word = 0_u64;
-			for (i, &byte) in group.iter().enumerate() {
-				word |= u64::from(byte) << (i * 8);
+	let need = width * plane_bytes;
+	// A truncated buffer is zero-padded once up front, so the hot loop indexes without a
+	// per-byte fallback.
+	let padded;
+	let planes = if planes.len() >= need {
+		&planes[..need]
+	} else {
+		padded = {
+			let mut p = planes.to_vec();
+			p.resize(need, 0);
+			p
+		};
+		&padded[..]
+	};
+	let lanes = &mut out[start..];
+	for group in (0..width).step_by(8) {
+		let group_planes = &planes[group * plane_bytes..(group + 8).min(width) * plane_bytes];
+		for (column, eight) in lanes.chunks_mut(8).enumerate() {
+			// Byte `k` of `spread` collects bits `group..group + 8` of lane `8 * column + k`.
+			let mut spread = 0_u64;
+			for (j, plane) in group_planes.chunks_exact(plane_bytes).enumerate() {
+				spread |= SPREAD[usize::from(plane[column])] << j;
 			}
-			let base = g * 64;
-			let mut set = word;
-			while set != 0 {
-				let k = set.trailing_zeros() as usize;
-				if base + k < len {
-					acc[base + k] |= 1_u64 << b;
-				}
-				set &= set - 1;
+			for (k, lane) in eight.iter_mut().enumerate() {
+				*lane |= (((spread >> (8 * k)) & 0xff) << group).cast_signed();
 			}
 		}
 	}
-	acc.iter().map(|&a| unzigzag(a)).collect()
+	for lane in lanes {
+		*lane = unzigzag(lane.cast_unsigned());
+	}
 }
 
 /// Decode the single lane `lane` of one transposed tile of `len` lanes and `width` bit-planes:
@@ -734,11 +777,10 @@ fn transpose_lane_decode(planes: &[u8], width: usize, len: usize, lane: usize) -
 
 /// Reconstruct `count` differences from a transposed per-tile bit-pack buffer.
 ///
-/// Exact inverse of [`transpose_bitpack_encode`] given the same `tile` and `count`. The
-/// decode reads each bit-plane as `u64` words and distributes only the **set** bits of each
-/// word to their lanes (`w &= w - 1` walks set bits), so an all-zero plane word costs a
-/// single compare and a sparse one costs only its population — the decode-latency win over
-/// the scalar [`bitpack_decode`], which loops every bit of every value. Bytes past the buffer
+/// Exact inverse of [`transpose_bitpack_encode`] given the same `tile` and `count`. Each
+/// tile is decoded eight lanes per plane byte by the branch-free spread in
+/// `transpose_tile_decode` — the decode-latency win over the scalar [`bitpack_decode`],
+/// which loops every bit of every value. Bytes past the buffer
 /// read as `0` (a truncated tile yields zeros rather than panicking).
 #[must_use]
 pub fn transpose_bitpack_decode(bytes: &[u8], tile: usize, count: usize) -> Vec<i64> {
@@ -753,7 +795,7 @@ pub fn transpose_bitpack_decode(bytes: &[u8], tile: usize, count: usize) -> Vec<
 		let plane_bytes = len.div_ceil(8);
 		let data_len = width * plane_bytes;
 		let planes = bytes.get(pos..pos + data_len).unwrap_or(&[]);
-		out.extend(transpose_tile_decode(planes, width, len));
+		transpose_tile_decode_into(planes, width, len, &mut out);
 		pos += data_len;
 		remaining -= len;
 	}
@@ -2344,6 +2386,32 @@ mod tests {
 		// Empty stream encodes to nothing and decodes to nothing.
 		assert!(transpose_bitpack_encode(&[], 64).is_empty());
 		assert_eq!(transpose_bitpack_decode(&[], 64, 0), Vec::<i64>::new());
+	}
+
+	#[test]
+	fn transpose_tile_decode_agrees_with_the_per_lane_decode_at_every_width() {
+		// The whole-tile decode spreads eight planes at a time; the single-lane decode reads
+		// one bit per plane. They must agree for every width (including partial final
+		// eight-plane groups), every awkward lane count, a truncated plane buffer, and a
+		// corrupt width byte past 64.
+		for width in 0..=64_usize {
+			for len in [1_usize, 7, 8, 9, 333, 1024] {
+				let plane_bytes = len.div_ceil(8);
+				let planes: Vec<u8> = (0..width * plane_bytes).map(|i| u8::try_from((i * 167 + width * 31) % 251).unwrap_or(0)).collect();
+				let tile = transpose_tile_decode(&planes, width, len);
+				assert_eq!(tile.len(), len);
+				for (lane, &v) in tile.iter().enumerate() {
+					assert_eq!(v, transpose_lane_decode(&planes, width, len, lane), "width {width}, len {len}, lane {lane}");
+				}
+				let truncated = &planes[..planes.len() / 2];
+				let tile = transpose_tile_decode(truncated, width, len);
+				for (lane, &v) in tile.iter().enumerate() {
+					assert_eq!(v, transpose_lane_decode(truncated, width, len, lane), "truncated: width {width}, len {len}, lane {lane}");
+				}
+			}
+		}
+		let planes = vec![0xff_u8; 200 * 128];
+		assert_eq!(transpose_tile_decode(&planes, 200, 1024), transpose_tile_decode(&planes, 64, 1024));
 	}
 
 	#[test]

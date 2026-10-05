@@ -890,9 +890,14 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   cascade beats even FOR broadly, so folding it into the default selector is a headline change
   held for owner sign-off; the default codec choice is unchanged.
 - **Transposed (`FastLanes`-layout) value codec (opt-in)** — `VAL_CODEC_TRANSPOSED` stores a
-  `ScaledI64` column's mantissas **bit-plane-major** in 1024-lane tiles, so the decoder reads `u64`
-  plane words and walks only the *set* bits and a small-magnitude column's empty high bit-planes are
-  skipped wholesale. It carries its **own** size function (`transposed_value_bytes`) and selector
+  `ScaledI64` column's mantissas **bit-plane-major** in 1024-lane tiles, so the decoder rebuilds
+  eight lanes per plane byte with branch-free table spreads and a tile's width header drops the
+  empty high bit-planes of a small-magnitude column. The decode kernel is checked against an
+  external yardstick, the published `fastlanes` crate, at equal bit width
+  ([`weft-physical-type/benches/fastlanes_yardstick.rs`](weft-physical-type/benches/fastlanes_yardstick.rs),
+  1 Mi values): WeftDB's decoder takes **0.78 / 1.50 / 2.32 ms** at widths 3 / 10 / 20 against
+  `fastlanes`' **0.33 ms** — still **2.4–7× behind**, and that gap is an open roadmap item, not a
+  design choice. It carries its **own** size function (`transposed_value_bytes`) and selector
   entry (`best_value_codec_transposed(max_overhead)`) rather than reusing the blocked figure, is
   random-access capable (so it does not regress the streaming point read), and is requested through
   `FrameOptions` / `Segment::write_to_with` or, from a deployment, `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD`.

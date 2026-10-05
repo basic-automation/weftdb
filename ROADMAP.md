@@ -1692,7 +1692,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   the fallback arm sliced against that count — a panic inside a fallible public parser. Now slices
   with `get`, matching `read_value_at`'s existing behaviour; regression-tested with a hand-built
   short-decoding block.
-- [ ] **NEXT — the transposed layout's real lever is a per-tile decode-count threshold, not the
+- [x] **DONE (2026-10-08) — the transposed layout's real lever is a per-tile decode-count threshold, not the
   layout itself (research 2026-09-23).** The `fastlanes` crate's docs state that beyond roughly **10
   values** it is typically faster to unpack a whole tile and index than to unpack values
   individually. WeftDB's reader currently always takes the single-value path in `read_value_at` and
@@ -1713,11 +1713,19 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   before decompression, CPU filter before GPU transfer) pay no gather at all, while only the ordered
   interpolation path restores. *(src: FastLanes file format, VLDB'25 —
   https://www.vldb.org/pvldb/vol18/p4629-afroozeh.pdf)*
-- [ ] **Cross-check WeftDB's hand-rolled bit-plane decoder against the `fastlanes` crate (0.7.2,
+- [x] **DONE (2026-10-08) — Cross-check WeftDB's hand-rolled bit-plane decoder against the `fastlanes` crate (0.7.2,
   2026-09-02, Apache-2.0).** It provides the same 1024-element layout (BitPacking pack/unpack,
   single-value unpack, transposed Delta/RLE, linear FoR) via LLVM auto-vectorization. If WeftDB's
   decoder is materially slower at the same bit width, that is a bug rather than a design choice —
   a cheap external yardstick for `benches/transposed_read.rs`. *(src: https://lib.rs/crates/fastlanes)*
+  - [x] Yardstick shipped (`benches/fastlanes_yardstick.rs`, bench-only pinned dev-dep). It found
+    the set-bit-walking decoder **3.7–15× slower** than `fastlanes` at widths 3/10/20 — a bug, per
+    the rule above. Rewritten as a branch-free table spread written straight into the output:
+    **1.32→0.78 / 5.27→1.50 / 7.60→2.32 ms** per 1 Mi values (1.7× / 3.5× / 3.3×).
+  - [ ] **Residue — still 2.4–7× behind `fastlanes` (0.33 ms flat across widths).** The remaining
+    cost scales with width (~0.07 ns/value/bit). Candidates: a 64×64 bit-matrix transpose per
+    64-lane plane-word column (fixed cost per value regardless of width), or explicit SIMD on the
+    spread. Re-run the yardstick on a quiet box before and after.
 - [ ] **Track the FastLanes SPEC, not the CWI reference implementation.** `cwida/fastlanes` is on a
   `dev` branch with no tagged release (the paper's v0.1), its Rust bindings are path-only
   (`fls-rs = { path = "./rust" }`, not a published crate), and its CUDA reader is listed under

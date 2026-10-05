@@ -755,6 +755,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "const_for"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "988d3bd6bf67b6d7ae2b519c55296fa57411c27c312575e47b2975f8d1d8590b"
+
+[[package]]
 name = "convert_case"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1249,6 +1255,18 @@ dependencies = [
  "getrandom 0.3.4",
  "libm",
  "siphasher",
+]
+
+[[package]]
+name = "fastlanes"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fcb34a73abd2872401096bf65d13e8d26e0c9ca6166d5e2b11a314ba017cdef"
+dependencies = [
+ "const_for",
+ "num-traits",
+ "pastey",
+ "seq-macro",
 ]
 
 [[package]]
@@ -5102,6 +5120,7 @@ version = "0.1.0"
 dependencies = [
  "bigdecimal",
  "criterion",
+ "fastlanes",
  "serde",
  "serde_json",
 ]
