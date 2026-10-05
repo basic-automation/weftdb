@@ -13,13 +13,17 @@
 //! - **`Abort`**: `std::process::abort()`. Tests re-exec their own binary with
 //!   `WEFT_FAULT=<point>:abort` so the parent survives to inspect the store.
 //! - **`Pause`**: park the hitting task on a `Notify`, to force an interleaving.
+//!
+//! Code that is already on a blocking thread (the steps `RealFs` runs on one file
+//! handle inside `spawn_blocking`) uses [`hit_blocking`] instead, which acts the same
+//! way and parks the thread for a `Pause`.
 
 use std::{fmt, str::FromStr};
 
 #[cfg(any(test, feature = "fault-injection"))]
-pub use self::active::{arm, disarm, hit, hits, injected_point, reached, Armed, FaultAction, InjectedFault, FAULT_ENV};
+pub use self::active::{arm, disarm, hit, hit_blocking, hits, injected_point, reached, Armed, FaultAction, InjectedFault, FAULT_ENV};
 #[cfg(not(any(test, feature = "fault-injection")))]
-pub use self::inert::{hit, Inert};
+pub use self::inert::{hit, hit_blocking, Inert};
 
 /// Whether fault points can do anything in this build.
 pub const ENABLED: bool = cfg!(any(test, feature = "fault-injection"));
@@ -124,6 +128,11 @@ fault_points! {
 	LNewRenamed = "L-new-renamed",
 }
 
+impl FaultPoint {
+	/// The recovery steps an `R<n>` point can name (design section 6).
+	pub const RECOVERY_STEPS: std::ops::RangeInclusive<u8> = 1..=13;
+}
+
 impl fmt::Display for FaultPoint {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
@@ -155,8 +164,12 @@ impl FromStr for FaultPoint {
 		if let Some((point, _)) = Self::NAMED.iter().find(|(_, name)| *name == s) {
 			return Ok(*point);
 		}
+		let unknown = || UnknownFaultPoint(s.to_owned());
 		let indexed = |prefix: &str| s.strip_prefix(prefix)?.strip_suffix(')')?.parse::<u32>().ok();
-		let point = if let Some(n) = s.strip_prefix('R').and_then(|n| n.parse().ok()) {
+		let point = if let Some(n) = s.strip_prefix('R').and_then(|n| n.parse::<u8>().ok()) {
+			if !Self::RECOVERY_STEPS.contains(&n) {
+				return Err(unknown());
+			}
 			Self::Recovery(n)
 		} else if let Some(k) = indexed("B-vacuum(") {
 			Self::BVacuum(k)
@@ -165,8 +178,14 @@ impl FromStr for FaultPoint {
 		} else if let Some(k) = indexed("L-chunk(") {
 			Self::LChunk(k)
 		} else {
-			return Err(UnknownFaultPoint(s.to_owned()));
+			return Err(unknown());
 		};
+		// Only the canonical spelling: integer parsing also takes `R04`, `R+4` and
+		// `B-vacuum(+1)`, which would arm a point under a name nothing displays. That is
+		// the silent miss a malformed `WEFT_FAULT` must never be.
+		if point.to_string() != s {
+			return Err(unknown());
+		}
 		Ok(point)
 	}
 }
@@ -202,13 +221,25 @@ mod inert {
 		let _ = point;
 		Inert
 	}
+
+	/// Mark `point` from a blocking thread. Fault injection is compiled out of this
+	/// build, so this is a `const fn` that ignores `point` and returns `Ok(())`.
+	///
+	/// # Errors
+	///
+	/// Never, in this build.
+	#[inline]
+	pub const fn hit_blocking(point: FaultPoint) -> io::Result<()> {
+		let _ = point;
+		Ok(())
+	}
 }
 
 /// The test harness build (`cfg(test)` or `--features fault-injection`).
 #[cfg(any(test, feature = "fault-injection"))]
 mod active {
 	use std::{
-		collections::HashMap, fmt, io, sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError}
+		collections::HashMap, ffi::OsString, fmt, io, sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError}
 	};
 
 	use tokio::sync::Notify;
@@ -322,22 +353,13 @@ mod active {
 	///
 	/// # Panics
 	///
-	/// If `WEFT_FAULT` is malformed: a crash test that silently injected nothing would
-	/// pass for the wrong reason.
+	/// If `WEFT_FAULT` is malformed or not UTF-8: a crash test that silently injected
+	/// nothing would pass for the wrong reason.
 	pub async fn hit(point: FaultPoint) -> io::Result<()> {
-		let armed = {
-			let mut registry = registry();
-			*registry.hits.entry(point).or_insert(0) += 1;
-			registry.armed.get(&point).cloned()
-		};
-		HIT.notify_waiters();
-		match armed.or_else(|| from_env().get(&point).cloned()) {
+		match record(point) {
 			None => Ok(()),
 			Some(FaultAction::ReturnErr) => Err(io::Error::other(InjectedFault(point))),
-			Some(FaultAction::Abort) => {
-				eprintln!("{FAULT_ENV}: aborting at fault point {point}");
-				std::process::abort()
-			}
+			Some(FaultAction::Abort) => abort_at(point),
 			Some(FaultAction::Pause(resume)) => {
 				resume.notified().await;
 				Ok(())
@@ -345,8 +367,58 @@ mod active {
 		}
 	}
 
+	/// [`hit`] for code already running on a blocking thread, such as the steps
+	/// `RealFs` performs on one file handle inside `spawn_blocking`. A `Pause` parks
+	/// the thread, so never call this from an async task.
+	///
+	/// # Errors
+	///
+	/// An [`InjectedFault`] when the point is armed with [`FaultAction::ReturnErr`].
+	///
+	/// # Panics
+	///
+	/// If `WEFT_FAULT` is malformed or not UTF-8, as for [`hit`].
+	pub fn hit_blocking(point: FaultPoint) -> io::Result<()> {
+		match record(point) {
+			None => Ok(()),
+			Some(FaultAction::ReturnErr) => Err(io::Error::other(InjectedFault(point))),
+			Some(FaultAction::Abort) => abort_at(point),
+			Some(FaultAction::Pause(resume)) => {
+				// `Notify` is executor-agnostic, so a thread can wait on it directly.
+				futures::executor::block_on(resume.notified());
+				Ok(())
+			}
+		}
+	}
+
+	/// Count a hit on `point`, wake [`reached`], and return the action armed for it.
+	fn record(point: FaultPoint) -> Option<FaultAction> {
+		let armed = {
+			let mut registry = registry();
+			*registry.hits.entry(point).or_insert(0) += 1;
+			registry.armed.get(&point).cloned()
+		};
+		HIT.notify_waiters();
+		armed.or_else(|| from_env().get(&point).cloned())
+	}
+
+	fn abort_at(point: FaultPoint) -> ! {
+		eprintln!("{FAULT_ENV}: aborting at fault point {point}");
+		std::process::abort()
+	}
+
 	fn from_env() -> &'static HashMap<FaultPoint, FaultAction> {
-		FROM_ENV.get_or_init(|| std::env::var(FAULT_ENV).map(|spec| parse_env(&spec).unwrap_or_else(|e| panic!("{FAULT_ENV}={spec:?}: {e}"))).unwrap_or_default())
+		FROM_ENV.get_or_init(|| faults_from_var(std::env::var_os(FAULT_ENV)))
+	}
+
+	/// The faults a `WEFT_FAULT` value arms. Unset arms nothing. A value that is not
+	/// UTF-8, or does not parse, panics instead of being ignored.
+	// The escaped (Debug) form shows exactly which bytes are not UTF-8.
+	#[allow(clippy::unnecessary_debug_formatting)]
+	pub(super) fn faults_from_var(value: Option<OsString>) -> HashMap<FaultPoint, FaultAction> {
+		let Some(value) = value else { return HashMap::new() };
+		let spec = value.into_string().unwrap_or_else(|raw| panic!("{FAULT_ENV}={raw:?} is not valid UTF-8"));
+		parse_env(&spec).unwrap_or_else(|e| panic!("{FAULT_ENV}={spec:?}: {e}"))
 	}
 
 	pub(super) fn parse_env(spec: &str) -> Result<HashMap<FaultPoint, FaultAction>, String> {
@@ -395,6 +467,11 @@ mod tests {
 		for bad in ["", "S-frame", "R", "Rx", "B-vacuum()", "B-vacuum(2", "L-chunk(-1)"] {
 			assert!(bad.parse::<FaultPoint>().is_err(), "{bad:?} must not parse");
 		}
+		// Only R1-R13 exist, and only canonical spellings parse: anything else would arm
+		// a point that is never hit.
+		for bad in ["R0", "R14", "R255", "R256", "R+4", "R04", "R 4", "B-vacuum(+1)", "B-vacuum(01)", "restore-copied(+0)", "L-chunk(007)"] {
+			assert!(bad.parse::<FaultPoint>().is_err(), "{bad:?} must not parse");
+		}
 	}
 
 	#[test]
@@ -405,6 +482,46 @@ mod tests {
 		assert!(active::parse_env("S-frame-synced").is_err());
 		assert!(active::parse_env("S-frame-syncd:abort").is_err());
 		assert!(active::parse_env("S-frame-synced:explode").is_err());
+		assert!(active::parse_env("R04:abort").is_err(), "a non-canonical point name is a typo");
+		assert!(active::faults_from_var(None).is_empty(), "an unset variable arms nothing");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	#[should_panic(expected = "is not valid UTF-8")]
+	fn a_non_utf8_env_value_panics_instead_of_being_ignored() {
+		use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+		let _ = active::faults_from_var(Some(OsString::from_vec(b"S-frame-synced:abort\xff".to_vec())));
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn hit_blocking_acts_on_a_blocking_thread() {
+		let point = FaultPoint::GUnlinked;
+		let before = hits(point);
+		tokio::task::spawn_blocking(move || hit_blocking(point)).await.unwrap().expect("an unarmed point does nothing");
+
+		let armed = arm(point, FaultAction::ReturnErr);
+		let err = tokio::task::spawn_blocking(move || hit_blocking(point)).await.unwrap().unwrap_err();
+		assert_eq!(injected_point(&err), Some(point));
+		drop(armed);
+
+		let resume = Arc::new(Notify::new());
+		let _armed = arm(point, FaultAction::Pause(resume.clone()));
+		let passed = Arc::new(AtomicBool::new(false));
+		let task = tokio::task::spawn_blocking({
+			let passed = passed.clone();
+			move || {
+				hit_blocking(point).unwrap();
+				passed.store(true, Ordering::SeqCst);
+			}
+		});
+		tokio::time::timeout(Duration::from_secs(10), reached(point, before + 3)).await.expect("the thread reaches the point");
+		tokio::time::sleep(Duration::from_millis(20)).await;
+		assert!(!passed.load(Ordering::SeqCst), "the thread is parked at the point");
+		resume.notify_one();
+		task.await.unwrap();
+		assert!(passed.load(Ordering::SeqCst));
 	}
 
 	#[tokio::test]
@@ -455,9 +572,31 @@ mod tests {
 		if std::env::var_os(CHILD_ENV).is_none() {
 			return;
 		}
+		suppress_core_dump();
 		let result = hit(FaultPoint::SMidSidecar).await;
 		// Reached only when the env var asks for `err` rather than `abort`.
 		assert_eq!(injected_point(&result.unwrap_err()), Some(FaultPoint::SMidSidecar));
+	}
+
+	/// Keep the child's deliberate abort from dumping core. Under systemd-coredump every
+	/// test run would otherwise store a core of this large binary and raise a desktop
+	/// "process crashed" notice.
+	fn suppress_core_dump() {
+		#[cfg(unix)]
+		{
+			let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+			// SAFETY: setrlimit only reads the struct, for the duration of the call.
+			unsafe { libc::setrlimit(libc::RLIMIT_CORE, &raw const none) };
+		}
+		// A pipe `core_pattern` (systemd-coredump) ignores RLIMIT_CORE, but the kernel
+		// never dumps a process that is not dumpable.
+		#[cfg(target_os = "linux")]
+		{
+			let not_dumpable: libc::c_ulong = 0;
+			// SAFETY: PR_SET_DUMPABLE takes one integer and changes only this process's
+			// dumpable flag.
+			unsafe { libc::prctl(libc::PR_SET_DUMPABLE, not_dumpable) };
+		}
 	}
 
 	fn run_child(spec: &str) -> std::process::Output {

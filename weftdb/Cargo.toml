@@ -53,6 +53,10 @@ criterion = { workspace = true , features = ["html_reports"] }
 tempfile = { workspace = true }
 serial_test = { workspace = true }
 
+[target.'cfg(unix)'.dev-dependencies]
+# Only to keep the fault tests' deliberately aborted child from dumping core.
+libc = { workspace = true }
+
 [[bench]]
 name = "interpolation_benchmarks"
 harness = false

@@ -23,6 +23,7 @@ mod durable {
 			std::env::set_var("WEFT_FAULT", "S-frame-synced:abort,S-frame-written:err");
 			assert!(fault::hit(FaultPoint::SFrameSynced).await.is_ok());
 			assert!(fault::hit(FaultPoint::SFrameWritten).await.is_ok());
+			assert!(fault::hit_blocking(FaultPoint::SFrameWritten).is_ok(), "the blocking variant is inert too");
 			assert!(PROBE.await.is_ok());
 		}
 	}

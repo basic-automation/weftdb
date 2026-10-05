@@ -48,6 +48,7 @@ wide = "1"
 wgpu = "30"
 bytemuck = { version = "1", features = ["derive"] }
 fastrand = "2"
+libc = "0.2"
 num_cpus = "1"
 ratatui = "0.30"
 crossterm = "0.29"

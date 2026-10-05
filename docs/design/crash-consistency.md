@@ -168,7 +168,7 @@ The mode is set store-wide by `WEFT_DURABILITY`. The default is `strict`. It is 
 - `.tmp-*` files are used only for sidecar replacement.
 
 **Root files:**
-- `LOCK`, held with std `File::try_lock` (workspace rust-version 1.95, Cargo.toml:26). It records the pid.
+- `LOCK`, held with std `File::try_lock` (workspace rust-version 1.95, Cargo.toml:26). The holder records its pid and session in `LOCK.holder` beside it, because a Windows lock is mandatory and would stop a second opener from reading a record kept in `LOCK` itself.
 - `RESTORED`, a transient marker written by an in-place restore.
 
 **`segment_index.db`.** The DDL runs outside BEGIN CONCURRENT, because DDL inside it fails (ROADMAP.md:1316-1318). Duplicate-column errors are ignored, following the existing pattern at metadata.rs:180.
