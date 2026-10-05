@@ -17,6 +17,9 @@
 //!   transposed layout must decode a whole 1024-lane tile to serve one value while the linear
 //!   codec decodes a 64-value block — the honest cost side of the trade,
 //! - **windowed range read** (`read_segment_range`, `GET …/points?start=&end=`).
+//! - **batch point read** (`read_segment_points`, `GET …/storage/{aspect}/at-multi`) in two
+//!   shapes: 500 instants sharing one 1024-lane tile (the case a per-instant value read
+//!   re-decodes the same tile for) and 64 instants spread one-per-tile across the column.
 //!
 //! The corpus is a zero-straddling small-magnitude `ScaledI64` column (mantissas in
 //! `[-500, 500]`): the regime where the plain bit-pack family wins the size race, so the
@@ -29,7 +32,7 @@ use std::hint::black_box;
 use bigdecimal::BigDecimal;
 use criterion::{criterion_group, criterion_main, Criterion};
 use weft_physical_type::{
-	timestamp::TimeUnit, weftseg::{frame_value_codec, read_segment, read_segment_point, read_segment_range, FrameOptions}, Segment
+	timestamp::TimeUnit, weftseg::{frame_value_codec, read_segment, read_segment_point, read_segment_points, read_segment_range, FrameOptions}, Segment
 };
 
 /// A zero-straddling small-magnitude corpus: two-decimal values in `[-5.00, 5.00]` on a
@@ -64,12 +67,21 @@ fn bench_transposed_read(c: &mut Criterion) {
 	let (w_start, w_end) = (t, t + 10 * 999);
 	assert_eq!(read_segment_range(&linear, w_start, w_end).expect("reads"), read_segment_range(&transposed, w_start, w_end).expect("reads"));
 
+	// Batch shapes: 500 instants inside one tile (rows 1024..1524 of the second tile), and 64
+	// instants spread one per tile across the column.
+	let same_tile: Vec<i64> = (1_024..1_524_i64).map(|row| 1_000 + row * 10).collect();
+	let spread: Vec<i64> = (0..64_i64).map(|k| 1_000 + (k * 15_000 + 7) * 10).collect();
+	assert_eq!(read_segment_points(&linear, &same_tile).expect("reads"), read_segment_points(&transposed, &same_tile).expect("reads"));
+	assert_eq!(read_segment_points(&linear, &spread).expect("reads"), read_segment_points(&transposed, &spread).expect("reads"));
+
 	let mut group = c.benchmark_group("transposed_value_codec_1m");
 	group.sample_size(20);
 	for (label, bytes) in [("linear", &linear), ("transposed", &transposed)] {
 		group.bench_function(format!("full_decode/{label}"), |b| b.iter(|| black_box(read_segment(black_box(bytes)).expect("reads"))));
 		group.bench_function(format!("point_read/{label}"), |b| b.iter(|| black_box(read_segment_point(black_box(bytes), t).expect("reads"))));
 		group.bench_function(format!("range_1000/{label}"), |b| b.iter(|| black_box(read_segment_range(black_box(bytes), w_start, w_end).expect("reads"))));
+		group.bench_function(format!("batch_500_same_tile/{label}"), |b| b.iter(|| black_box(read_segment_points(black_box(bytes), black_box(&same_tile)).expect("reads"))));
+		group.bench_function(format!("batch_64_spread/{label}"), |b| b.iter(|| black_box(read_segment_points(black_box(bytes), black_box(&spread)).expect("reads"))));
 	}
 	group.finish();
 }

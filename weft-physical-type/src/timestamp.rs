@@ -716,6 +716,22 @@ fn transpose_tile_decode(planes: &[u8], width: usize, len: usize) -> Vec<i64> {
 	acc.iter().map(|&a| unzigzag(a)).collect()
 }
 
+/// Decode the single lane `lane` of one transposed tile of `len` lanes and `width` bit-planes:
+/// bit `b` of the lane's zig-zag code is bit `lane % 8` of byte `lane / 8` in plane `b`. An
+/// `O(width)` read — the per-value alternative to [`transpose_tile_decode`] when only a few lanes
+/// of a tile are wanted. Bytes past `planes` read as 0, matching the whole-tile decode.
+fn transpose_lane_decode(planes: &[u8], width: usize, len: usize, lane: usize) -> i64 {
+	let plane_bytes = len.div_ceil(8);
+	let (byte, shift) = (lane / 8, lane % 8);
+	let mut zz = 0_u64;
+	for b in 0..width.min(64) {
+		if planes.get(b * plane_bytes + byte).is_some_and(|&v| (v >> shift) & 1 == 1) {
+			zz |= 1 << b;
+		}
+	}
+	unzigzag(zz)
+}
+
 /// Reconstruct `count` differences from a transposed per-tile bit-pack buffer.
 ///
 /// Exact inverse of [`transpose_bitpack_encode`] given the same `tile` and `count`. The
@@ -774,10 +790,15 @@ pub fn transpose_bitpack_decode_range(bytes: &[u8], tile: usize, count: usize, s
 		// Decode this tile only if the requested range overlaps [idx, idx + tile_len).
 		if idx + tile_len > start {
 			let planes = bytes.get(pos..pos + data_len).unwrap_or(&[]);
-			let decoded = transpose_tile_decode(planes, width, tile_len);
 			let lo = start.saturating_sub(idx);
 			let hi = (end - idx).min(tile_len);
-			out.extend_from_slice(&decoded[lo..hi]);
+			// A short overlap reads its lanes individually (`O(width)` each) rather than paying a
+			// whole-tile decode for a handful of values — the per-tile decode-count dispatch.
+			if hi - lo < GATHER_WHOLE_TILE_THRESHOLD {
+				out.extend((lo..hi).map(|lane| transpose_lane_decode(planes, width, tile_len, lane)));
+			} else {
+				out.extend_from_slice(&transpose_tile_decode(planes, width, tile_len)[lo..hi]);
+			}
 		}
 		pos += data_len;
 		idx += tile_len;
@@ -994,6 +1015,152 @@ pub fn for_bitpack_decode_range(bytes: &[u8], block: usize, count: usize, start:
 		idx += block_len;
 	}
 	out
+}
+
+/// Values requested from one block/tile at or above which a gather decodes the **whole**
+/// block/tile once and indexes it, rather than extracting each value individually.
+///
+/// Upstream `FastLanes` guidance: beyond roughly ten values it is typically faster to unpack a
+/// whole 1024-lane tile and index than to unpack values one by one. Below it, a per-value read is
+/// `O(width)`; above it, the shared unpack amortizes. *(src: <https://lib.rs/crates/fastlanes>)*
+pub const GATHER_WHOLE_TILE_THRESHOLD: usize = 10;
+
+/// The positions of `indices` that address a value (`< count`), ordered by the index they
+/// address — the walk order of the `*_decode_gather` family, which visits each block once.
+fn gather_order(count: usize, indices: &[usize]) -> Vec<usize> {
+	let mut order: Vec<usize> = (0..indices.len()).filter(|&p| indices[p] < count).collect();
+	order.sort_unstable_by_key(|&p| indices[p]);
+	order
+}
+
+/// The shared one-pass walk of the `*_decode_gather` family. `next_block(bytes, pos, block_len)`
+/// parses one block header at byte `pos` and returns `(header_len, data_len, block_state)`;
+/// `decode(state, data, block_len, local_lanes)` returns the values at the requested local lanes
+/// (given in ascending order). Each block's header is read once, a block nobody asked for is
+/// skipped by its length, and the walk stops after the last requested block.
+fn gather_walk<S>(bytes: &[u8], block: usize, count: usize, indices: &[usize], next_block: impl Fn(&[u8], usize, usize) -> (usize, usize, S), decode: impl Fn(&S, &[u8], usize, &[usize]) -> Vec<i64>) -> Vec<Option<i64>> {
+	let block = block.max(1);
+	let order = gather_order(count, indices);
+	let mut out = vec![None; indices.len()];
+	let (mut next, mut pos, mut idx) = (0_usize, 0_usize, 0_usize);
+	while next < order.len() {
+		let block_len = block.min(count - idx);
+		let block_end = idx + block_len;
+		let (header_len, data_len, state) = next_block(bytes, pos, block_len);
+		pos += header_len;
+		let run_end = next + order[next..].partition_point(|&p| indices[p] < block_end);
+		if run_end > next {
+			let run = &order[next..run_end];
+			let lanes: Vec<usize> = run.iter().map(|&p| indices[p] - idx).collect();
+			let data = bytes.get(pos..pos + data_len).unwrap_or(&[]);
+			for (&p, v) in run.iter().zip(decode(&state, data, block_len, &lanes)) {
+				out[p] = Some(v);
+			}
+			next = run_end;
+		}
+		pos += data_len;
+		idx = block_end;
+	}
+	out
+}
+
+/// **Multi-index gather** from a per-block adaptive bit-pack buffer: the value at each of
+/// `indices` (any order, duplicates allowed), aligned to `indices`, `None` for an index
+/// `>= count`.
+///
+/// One pass over the block headers serves the whole batch, and each touched block is decoded
+/// once: whole when at least [`GATHER_WHOLE_TILE_THRESHOLD`] of the requests land in it,
+/// value-by-value (`O(width)` each) otherwise. Equals mapping each index through
+/// `blocked_bitpack_decode(bytes, block, count).get(i)`. The batch sibling of
+/// [`blocked_bitpack_decode_range`] — which re-walks the header chain on every call.
+#[must_use]
+pub fn blocked_bitpack_decode_gather(bytes: &[u8], block: usize, count: usize, indices: &[usize]) -> Vec<Option<i64>> {
+	gather_walk(
+		bytes,
+		block,
+		count,
+		indices,
+		|b, pos, block_len| {
+			let width = u32::from(b.get(pos).copied().unwrap_or(0));
+			(1, (block_len * width as usize).div_ceil(8), width)
+		},
+		|&width, data, block_len, lanes| {
+			if lanes.len() >= GATHER_WHOLE_TILE_THRESHOLD {
+				let decoded = bitpack_decode(width, data, block_len);
+				lanes.iter().map(|&l| decoded[l]).collect()
+			} else {
+				lanes.iter().map(|&l| bitpack_decode_at(width, data, l)).collect()
+			}
+		},
+	)
+}
+
+/// **Multi-index gather** from a Frame-of-Reference per-block buffer — the FOR analogue of
+/// [`blocked_bitpack_decode_gather`].
+///
+/// One header walk, each touched block read once. A FOR
+/// residual is read per lane at `O(width)`, which is already what the whole-block decode does per
+/// row, so there is no threshold to dispatch on. Equals mapping each index through
+/// `for_bitpack_decode(bytes, block, count).get(i)`.
+#[must_use]
+pub fn for_bitpack_decode_gather(bytes: &[u8], block: usize, count: usize, indices: &[usize]) -> Vec<Option<i64>> {
+	gather_walk(
+		bytes,
+		block,
+		count,
+		indices,
+		|b, pos, block_len| {
+			let mut p = pos;
+			let min = unzigzag(for_read_uvarint(b, &mut p));
+			let width = usize::from(b.get(p).copied().unwrap_or(0));
+			p += 1;
+			(p - pos, (block_len * width).div_ceil(8), (min, width))
+		},
+		|&(min, width), data, _, lanes| {
+			lanes
+				.iter()
+				.map(|&row| {
+					let mut r = 0_u64;
+					for b in 0..width {
+						let bit_idx = row * width + b;
+						if data.get(bit_idx / 8).is_some_and(|byte| (byte >> (bit_idx % 8)) & 1 == 1) {
+							r |= 1 << b;
+						}
+					}
+					for_reconstruct(min, r)
+				})
+				.collect()
+		},
+	)
+}
+
+/// **Multi-index gather** from a transposed per-tile bit-pack buffer.
+///
+/// One pass over the tile width headers serves the whole batch, each touched tile read once: a full
+/// [`transpose_tile_decode`] when at least [`GATHER_WHOLE_TILE_THRESHOLD`] requests land in it,
+/// an `O(width)` per-lane extraction otherwise. This is what keeps a batch point read over the
+/// 1024-lane layout from re-decoding the same tile once per instant. Equals mapping each index
+/// through `transpose_bitpack_decode(bytes, tile, count).get(i)`.
+#[must_use]
+pub fn transpose_bitpack_decode_gather(bytes: &[u8], tile: usize, count: usize, indices: &[usize]) -> Vec<Option<i64>> {
+	gather_walk(
+		bytes,
+		tile,
+		count,
+		indices,
+		|b, pos, tile_len| {
+			let width = usize::from(b.get(pos).copied().unwrap_or(0));
+			(1, width * tile_len.div_ceil(8), width)
+		},
+		|&width, planes, tile_len, lanes| {
+			if lanes.len() >= GATHER_WHOLE_TILE_THRESHOLD {
+				let decoded = transpose_tile_decode(planes, width, tile_len);
+				lanes.iter().map(|&l| decoded[l]).collect()
+			} else {
+				lanes.iter().map(|&l| transpose_lane_decode(planes, width, tile_len, l)).collect()
+			}
+		},
+	)
 }
 
 /// Bit cost of one second-difference value under a **Gorilla-style variable-length**
@@ -2274,5 +2441,32 @@ mod tests {
 		// An all-zero (width-0) multi-tile stream random-accesses to zeros.
 		let zeros = transpose_bitpack_encode(&[0; 40], 8);
 		assert_eq!(transpose_bitpack_decode_range(&zeros, 8, 40, 33, 5), vec![0_i64; 5]);
+	}
+
+	type GatherCodec = (&'static str, fn(&[i64], usize) -> Vec<u8>, fn(&[u8], usize, usize) -> Vec<i64>, fn(&[u8], usize, usize, &[usize]) -> Vec<Option<i64>>);
+
+	#[test]
+	fn decode_gather_matches_the_full_decode_for_every_block_codec() {
+		// The one-walk multi-index gather must equal indexing the full decode, for every
+		// block/tile size and index pattern: empty, single, a dense run inside one block (crossing
+		// the whole-tile threshold), sparse spread, duplicates, unsorted, and out-of-range (None).
+		let vals: Vec<i64> = (0..333).map(|i| if (40..56).contains(&i) { 1_000_000 + i } else if i == 200 { i64::MIN } else if i == 201 { i64::MAX } else { (i % 11) - 5 }).collect();
+		let dense: Vec<usize> = (64..96).collect();
+		let patterns: Vec<Vec<usize>> = vec![vec![], vec![0], vec![332], dense, (0..333).step_by(37).collect(), vec![5, 5, 5, 200, 201, 5], vec![300, 2, 150, 41, 41, 0], vec![333, 1_000, 7], (0..333).rev().collect()];
+		let codecs: [GatherCodec; 3] = [("blocked", blocked_bitpack_encode, blocked_bitpack_decode, blocked_bitpack_decode_gather), ("for", for_bitpack_encode, for_bitpack_decode, for_bitpack_decode_gather), ("transposed", transpose_bitpack_encode, transpose_bitpack_decode, transpose_bitpack_decode_gather)];
+		for (name, encode, decode, gather) in codecs {
+			for block in [1_usize, 7, 8, 64, 333, 1024] {
+				let bytes = encode(&vals, block);
+				let full = decode(&bytes, block, vals.len());
+				for indices in &patterns {
+					let expected: Vec<Option<i64>> = indices.iter().map(|&i| full.get(i).copied()).collect();
+					assert_eq!(gather(&bytes, block, vals.len(), indices), expected, "{name} block={block} indices={indices:?}");
+				}
+			}
+		}
+		// A width-0 (all-zero) multi-tile stream gathers zeros on both sides of the threshold.
+		let zeros = transpose_bitpack_encode(&[0; 40], 8);
+		assert_eq!(transpose_bitpack_decode_gather(&zeros, 8, 40, &[3, 39]), vec![Some(0), Some(0)]);
+		assert_eq!(transpose_bitpack_decode_gather(&zeros, 8, 40, &(0..40).collect::<Vec<_>>()), vec![Some(0); 40]);
 	}
 }

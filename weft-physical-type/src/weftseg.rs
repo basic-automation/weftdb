@@ -950,6 +950,71 @@ pub fn read_value_at(bytes: &[u8], index: usize) -> Result<Option<PhysicalValue>
 	}
 }
 
+/// A block codec's one-walk multi-index decoder (`crate::timestamp::*_decode_gather`).
+type GatherFn = fn(&[u8], usize, usize, &[usize]) -> Vec<Option<i64>>;
+
+/// **Random-access batch read** from a `.weftseg` value-column block: the [`PhysicalValue`] at
+/// each of `indices` (any order, duplicates allowed), aligned to `indices`, `None` for an index
+/// past the column.
+///
+/// The batch sibling of [`read_value_at`], and the reason it exists is cost, not convenience:
+/// [`read_value_at`] parses the header and walks the block/tile chain from the start of the stream
+/// on every call, so `N` lookups pay `N` walks — and on [`VAL_CODEC_TRANSPOSED`] `N` lookups landing
+/// in one 1024-lane tile used to pay `N` whole-tile decodes. Here the header is parsed once and the
+/// codec's `*_decode_gather` walks the chain once, decoding each touched block/tile a single time
+/// (whole when [`crate::timestamp::GATHER_WHOLE_TILE_THRESHOLD`] or more requests land in it,
+/// per-value otherwise). [`VAL_CODEC_BITPACK`] reads each index at `O(width)`; every other payload
+/// decodes the column once and indexes it. Equals mapping each index through [`read_value_at`].
+///
+/// # Errors
+///
+/// Propagates the same [`WeftSegError`]s as [`read_value_column`] (a malformed header, an
+/// unrecognised tag/codec, or a short stream).
+pub fn read_values_at(bytes: &[u8], indices: &[usize]) -> Result<Vec<Option<PhysicalValue>>, WeftSegError> {
+	let mut r = ByteReader::new(bytes);
+	let tag = r.read_u8()?;
+	let scale = match tag {
+		TAG_SCALED_I64 => Some(r.read_u8()?),
+		TAG_SCALED_I128 => {
+			r.read_u8()?;
+			None
+		}
+		TAG_F64 | TAG_F32 | TAG_DECIMAL128 | TAG_BIGDECIMAL_TEXT => None,
+		other => return Err(WeftSegError::InvalidTag { kind: "physical_type", value: other }),
+	};
+	let count = usize::try_from(r.read_uvarint()?).map_err(|_| WeftSegError::VarintTooLong)?;
+	let _lossy_count = r.read_uvarint()?;
+	let _max_abs_error = read_decimal(&mut r)?;
+	if indices.iter().all(|&i| i >= count) {
+		return Ok(vec![None; indices.len()]);
+	}
+	let scaled = |mantissas: Vec<Option<i64>>, scale: u8| mantissas.into_iter().map(|m| m.map(|mantissa| PhysicalValue::ScaledI64 { mantissa, scale })).collect();
+	let (kind, gather): (&'static str, GatherFn) = match r.read_u8()? {
+		VAL_CODEC_BLOCKED => ("value_codec_blocked_type", crate::timestamp::blocked_bitpack_decode_gather),
+		VAL_CODEC_FOR => ("value_codec_for_type", crate::timestamp::for_bitpack_decode_gather),
+		VAL_CODEC_TRANSPOSED => ("value_codec_transposed_type", crate::timestamp::transpose_bitpack_decode_gather),
+		VAL_CODEC_BITPACK => {
+			let Some(scale) = scale else {
+				return Err(WeftSegError::InvalidTag { kind: "value_codec_bitpack_type", value: tag });
+			};
+			let width = u32::from(r.read_u8()?);
+			let data = r.take((count * width as usize).div_ceil(8))?;
+			return Ok(scaled(indices.iter().map(|&i| (i < count).then(|| crate::timestamp::bitpack_decode_at(width, data, i))).collect(), scale));
+		}
+		// Per-value / cascade payloads: one full decode, then index it for every request.
+		_ => {
+			let values = read_value_column(&mut ByteReader::new(bytes))?.values;
+			return Ok(indices.iter().map(|&i| values.get(i).cloned()).collect());
+		}
+	};
+	let Some(scale) = scale else {
+		return Err(WeftSegError::InvalidTag { kind, value: tag });
+	};
+	let block = usize::try_from(r.read_uvarint()?).map_err(|_| WeftSegError::VarintTooLong)?;
+	let data = r.read_bytes()?;
+	Ok(scaled(gather(data, block, count, indices), scale))
+}
+
 /// **Random-access windowed read** from a `.weftseg` value-column block: the dense values at
 /// `[start, start + len)`, clamped to the column (an empty vector when `start` is past its end).
 ///
@@ -1129,7 +1194,7 @@ fn locate_present_dense_index(timestamps: &[i64], nulls: &NullMask, sorted: bool
 /// The whole point of batching: the timestamp column + quality mask (and, on the fallback codec,
 /// the value column) are decoded **once** and reused for every requested instant — a lookup of `N`
 /// instants in one segment pays one timestamp decode, not `N`. On a per-block value codec the value
-/// block is skipped by its framing and each covering block unpacked via [`read_value_at`]; every
+/// block is skipped by its framing and the values read in one [`read_values_at`] gather; every
 /// other codec decodes the value column whole and indexes it. A section with no rows (or no `ts` in
 /// its coarse span) is answered all-`None` without decoding a column byte.
 fn read_points_from_section(section: &[u8], stats: &SegmentStats, ts: &[i64]) -> Result<Vec<Option<BigDecimal>>, WeftSegError> {
@@ -1165,7 +1230,9 @@ fn read_points_from_section(section: &[u8], stats: &SegmentStats, ts: &[i64]) ->
 	// searches as before.
 	let stride = if stats.time_sorted { ts_col.as_ref().and_then(DeltaOfDeltaColumn::arithmetic_stride).filter(|&(_, step)| step > 0) } else { None };
 	let timestamps = if stride.is_none() { ts_col.as_ref().map(crate::timestamp::decode_delta_of_delta) } else { None };
-	for (slot, &t) in out.iter_mut().zip(ts) {
+	// Resolve every instant to its dense value index first, then read the values in one batch.
+	let mut resolved: Vec<(usize, usize)> = Vec::new();
+	for (k, &t) in ts.iter().enumerate() {
 		if t < min_ts || t > max_ts {
 			continue;
 		}
@@ -1197,13 +1264,23 @@ fn read_points_from_section(section: &[u8], stats: &SegmentStats, ts: &[i64]) ->
 			};
 			idx
 		};
-		let value = match &present_values {
-			// Fast path: random-access the single covering block straight from the section bytes.
-			None => read_value_at(section, dense_index)?,
-			// Fallback: index the already-decoded present values.
-			Some(values) => values.get(dense_index).cloned(),
-		};
-		*slot = value.map(|pv| pv.to_logical());
+		resolved.push((k, dense_index));
+	}
+	match &present_values {
+		// Fast path: one batch gather straight from the section bytes — the block/tile chain is
+		// walked once and each covering block decoded once, however many instants share it.
+		None => {
+			let indices: Vec<usize> = resolved.iter().map(|&(_, i)| i).collect();
+			for (&(k, _), value) in resolved.iter().zip(read_values_at(section, &indices)?) {
+				out[k] = value.map(|pv| pv.to_logical());
+			}
+		}
+		// Fallback: index the already-decoded present values.
+		Some(values) => {
+			for &(k, i) in &resolved {
+				out[k] = values.get(i).map(PhysicalValue::to_logical);
+			}
+		}
 	}
 	Ok(out)
 }
@@ -3029,6 +3106,13 @@ mod tests {
 			assert_eq!(read_segment_range(&transposed, start, end).expect("reads"), read_segment_range(&linear, start, end).expect("reads"), "range read [{start}, {end}]");
 		}
 
+		// Batch point reads agree too — including many instants inside one tile (the gather's
+		// whole-tile branch), a few in another (its per-lane branch), and duplicates/misses.
+		let mut batch: Vec<i64> = (1_024..1_100_i64).map(|row| 1_000 + row * 10).collect();
+		batch.extend([1_000, 1_005, 1_000 + 2_048 * 10, 1_000, 1_000 + (n - 1) * 10, 1_000 + (n + 5) * 10]);
+		assert_eq!(read_segment_points(&transposed, &batch).expect("reads"), read_segment_points(&linear, &batch).expect("reads"), "batch point read");
+		assert_eq!(read_segment_points(&transposed, &batch).expect("reads"), batch.iter().map(|&t| read_segment_point(&linear, t).expect("reads")).collect::<Vec<_>>(), "batch equals per-instant reads");
+
 		// And it composes with the other opt-in (the timestamp checkpoint index).
 		let both = seg.write_to_with(&FrameOptions { checkpoint_stride: Some(1_024), transposed_max_overhead: Some(1.05) });
 		assert_eq!(frame_value_codec(&both).expect("codec"), "scaled_transposed");
@@ -3064,6 +3148,7 @@ mod tests {
 		assert_eq!(read_value_range(&bytes, 2, 8).expect("reads"), decoded[2..].to_vec());
 		assert_eq!(read_value_range(&bytes, 5, 5).expect("reads"), Vec::new());
 		assert_eq!(read_value_at(&bytes, 9).expect("reads"), None, "read_value_at agrees: nothing at row 9");
+		assert_eq!(read_values_at(&bytes, &[9, 2, 0]).expect("reads"), vec![None, decoded.get(2).cloned(), decoded.first().cloned()], "the batch read agrees and does not panic");
 	}
 
 	#[test]
@@ -3137,6 +3222,38 @@ mod tests {
 			assert_eq!(read_value_at(&bytes, i).expect("reads"), full.values.get(i).cloned(), "transposed index {i}");
 		}
 		assert_eq!(read_value_at(&bytes, transposed_enc.len()).expect("reads"), None, "out-of-range index must be None (transposed)");
+	}
+
+	#[test]
+	fn read_values_at_matches_read_value_at_across_every_codec() {
+		// The batch value read must equal mapping each index through the single-value read, for
+		// every codec (the four fixed-layout codecs take the one-walk gather; the rest decode once)
+		// and for unsorted, duplicated, dense-in-one-tile, and out-of-range index sets.
+		let scale2 = PhysicalType::ScaledI64 { scale: 2 };
+		let bitpack_col = crate::encode_column(scale2, &(0..80).map(|i| BigDecimal::new((i - 40).into(), 2)).collect::<Vec<_>>()).unwrap();
+		let blocked_lits: Vec<String> = (0..192).map(|i| if (64..128).contains(&i) { format!("{}", ((10_000_000 + i) * 100 + 1) * if i % 2 == 0 { 1 } else { -1 }) } else { format!("{}", (i % 5) - 2) }).collect();
+		let blocked_col = crate::encode_column(PhysicalType::ScaledI64 { scale: 0 }, &col(&blocked_lits.iter().map(String::as_str).collect::<Vec<_>>())).unwrap();
+		let for_lits: Vec<String> = (0..192).map(|i| format!("10000000.0{}", i % 7)).collect();
+		let for_col = crate::encode_column(scale2, &col(&for_lits.iter().map(String::as_str).collect::<Vec<_>>())).unwrap();
+		let varint_col = crate::encode_column(PhysicalType::ScaledI64 { scale: 0 }, &col(&["1", "1000000000", "2", "3"])).unwrap();
+		let f64_col = crate::encode_column(PhysicalType::F64, &col(&["0.5", "1.5", "2.5", "3.5", "4.5"])).unwrap();
+		let mut blocks: Vec<Vec<u8>> = Vec::new();
+		for enc in [&bitpack_col, &blocked_col, &for_col, &varint_col, &f64_col] {
+			let mut w = ByteWriter::new();
+			write_value_column(&mut w, enc);
+			blocks.push(w.into_vec());
+		}
+		let mut w = ByteWriter::new();
+		write_value_column_transposed(&mut w, &transposed_corpus(), 1.05);
+		blocks.push(w.into_vec());
+		for bytes in &blocks {
+			let n = read_value_column(&mut ByteReader::new(bytes)).expect("reads").values.len();
+			let patterns: Vec<Vec<usize>> = vec![vec![], vec![0], vec![n - 1, 0, n / 2, n / 2], (0..n.min(40)).collect(), (0..n).rev().step_by(3).collect(), vec![n, n + 9, 1.min(n - 1)]];
+			for indices in &patterns {
+				let expected: Vec<Option<PhysicalValue>> = indices.iter().map(|&i| read_value_at(bytes, i).expect("reads")).collect();
+				assert_eq!(read_values_at(bytes, indices).expect("reads"), expected, "n={n} indices={indices:?}");
+			}
+		}
 	}
 
 	#[test]
