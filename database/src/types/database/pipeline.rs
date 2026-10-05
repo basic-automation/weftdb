@@ -35,7 +35,7 @@ impl PipelineInputs for Database {
 			conn.as_ref().execute(insert_sql, turso::params![spline_str, batch_size_i64, now, now]).await.map_err(|e| Error::DatabaseError(format!("Failed to insert pipeline config: {e}")))?;
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(())
 	}
 
@@ -61,7 +61,7 @@ impl PipelineInputs for Database {
 			conn.as_ref().execute(insert_sql, turso::params![last_run, run_count_i64, version_i64]).await.map_err(|e| Error::DatabaseError(format!("Failed to insert pipeline state: {e}")))?;
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(())
 	}
 
@@ -76,7 +76,7 @@ impl PipelineInputs for Database {
 		conn.as_ref().execute("DELETE FROM pipeline_dictionaries", turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to delete pipeline dictionaries: {e}")))?;
 		conn.as_ref().execute("DELETE FROM pipeline_detectors", turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to delete pipeline detectors: {e}")))?;
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(())
 	}
 
@@ -96,7 +96,7 @@ impl PipelineInputs for Database {
 			conn.as_ref().execute(insert_sql, turso::params![dictionary_name, now]).await.map_err(|e| Error::DatabaseError(format!("Failed to add dictionary: {e}")))?;
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(())
 	}
 
@@ -108,7 +108,7 @@ impl PipelineInputs for Database {
 		let sql = "DELETE FROM pipeline_dictionaries WHERE dictionary_name = ?";
 		conn.as_ref().execute(sql, turso::params![dictionary_name]).await.map_err(|e| Error::DatabaseError(format!("Failed to remove dictionary: {e}")))?;
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(())
 	}
 
@@ -119,7 +119,7 @@ impl PipelineInputs for Database {
 
 		conn.as_ref().execute("DELETE FROM pipeline_dictionaries", turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to clear dictionaries: {e}")))?;
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(())
 	}
 
@@ -140,7 +140,7 @@ impl PipelineInputs for Database {
 		";
 		conn.as_ref().execute(insert_sql, turso::params![metadata.detector_id(), metadata.name(), metadata.description(), detector_type_str, metadata.config_json(), now]).await.map_err(|e| Error::DatabaseError(format!("Failed to insert detector: {e}")))?;
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(())
 	}
 
@@ -151,7 +151,7 @@ impl PipelineInputs for Database {
 
 		conn.as_ref().execute("DELETE FROM pipeline_detectors WHERE detector_id = ?", turso::params![detector_id]).await.map_err(|e| Error::DatabaseError(format!("Failed to remove detector: {e}")))?;
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(())
 	}
 
@@ -162,7 +162,7 @@ impl PipelineInputs for Database {
 
 		conn.as_ref().execute("DELETE FROM pipeline_detectors", turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to clear detectors: {e}")))?;
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(())
 	}
 }
@@ -189,7 +189,7 @@ impl PipelineOutputs for Database {
 			None
 		};
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(result)
 	}
 
@@ -215,7 +215,7 @@ impl PipelineOutputs for Database {
 			None
 		};
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(result)
 	}
 
@@ -233,7 +233,7 @@ impl PipelineOutputs for Database {
 			names.push(name);
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(names)
 	}
 
@@ -258,7 +258,7 @@ impl PipelineOutputs for Database {
 			detectors.push(DetectorMetadata::new(&id, &name, description, detector_type, config_json));
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(detectors)
 	}
 
@@ -284,7 +284,7 @@ impl PipelineOutputs for Database {
 			None
 		};
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(result)
 	}
 
@@ -298,7 +298,7 @@ impl PipelineOutputs for Database {
 
 		let exists = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to read row: {e}")))?.is_some();
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(exists)
 	}
 }

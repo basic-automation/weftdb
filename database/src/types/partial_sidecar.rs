@@ -36,7 +36,7 @@ use splimes::Resolution;
 
 /// Magic prefix identifying a `.weftpart` frame — guards against feeding a foreign or
 /// truncated file to [`PartialSidecar::from_bytes`].
-const PARTIAL_SIDECAR_MAGIC: &[u8; 8] = b"WEFTPRT\x01";
+const PARTIAL_SIDECAR_MAGIC: &[u8; 8] = b"WEFTPRT\x02";
 
 /// The frame layout version. Bumped if the on-disk shape changes incompatibly; a reader
 /// that sees a newer version treats the sidecar as absent rather than misreading it.
@@ -45,7 +45,12 @@ const PARTIAL_SIDECAR_MAGIC: &[u8; 8] = b"WEFTPRT\x01";
 /// (base only) fails the version check and is treated as absent — correct, because a
 /// sidecar is a pure accelerator (regenerated on the next seal, or the read simply
 /// decodes), so no committed data depends on it.
-pub const PARTIAL_SIDECAR_VERSION: u16 = 2;
+///
+/// **v3** moved the body codec from `bincode` (unmaintained, RUSTSEC-2025-0141) to
+/// `postcard`, whose wire format is frozen for its 1.x line. The magic's last byte moved
+/// with it (`\x01` → `\x02`), so a bincode-era frame fails the magic check and is treated
+/// as absent instead of being fed to the wrong decoder.
+pub const PARTIAL_SIDECAR_VERSION: u16 = 3;
 
 /// The **bounded** reductions a sidecar materializes — every [`Aggregation`] whose
 /// per-bucket state stays constant-sized ([`Aggregation::is_sidecar_materializable`]).
@@ -194,13 +199,13 @@ impl PartialSidecar {
 		best.map(|(res, partial)| partial.rebucket(res, resolution)).transpose().map(Option::flatten)
 	}
 
-	/// Serialize to a `.weftpart` frame: the magic prefix followed by the bincode body.
+	/// Serialize to a `.weftpart` frame: the magic prefix followed by the postcard body.
 	///
 	/// # Errors
 	///
-	/// Propagates a bincode encoding failure (in practice unreachable for this type).
+	/// Propagates a postcard encoding failure (in practice unreachable for this type).
 	pub fn to_bytes(&self) -> Result<Vec<u8>> {
-		let body = bincode::serialize(self).context("serializing a partial sidecar")?;
+		let body = postcard::to_allocvec(self).context("serializing a partial sidecar")?;
 		let mut out = Vec::with_capacity(PARTIAL_SIDECAR_MAGIC.len() + body.len());
 		out.extend_from_slice(PARTIAL_SIDECAR_MAGIC);
 		out.extend_from_slice(&body);
@@ -211,12 +216,12 @@ impl PartialSidecar {
 	///
 	/// # Errors
 	///
-	/// Errors on a missing/wrong magic prefix, a bincode decode failure, or a frame whose
+	/// Errors on a missing/wrong magic prefix, a postcard decode failure, or a frame whose
 	/// recorded version is not [`PARTIAL_SIDECAR_VERSION`] (a reader never misreads a
 	/// newer/foreign frame — the caller treats the error as "no usable sidecar").
 	pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
 		let body = bytes.strip_prefix(PARTIAL_SIDECAR_MAGIC.as_slice()).context("not a .weftpart frame (bad magic)")?;
-		let sidecar: Self = bincode::deserialize(body).context("decoding a partial sidecar")?;
+		let sidecar: Self = postcard::from_bytes(body).context("decoding a partial sidecar")?;
 		if sidecar.version != PARTIAL_SIDECAR_VERSION {
 			bail!("partial sidecar version {} is not the supported {PARTIAL_SIDECAR_VERSION}", sidecar.version);
 		}

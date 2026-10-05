@@ -54,7 +54,7 @@ impl Inputs for Database {
 			}
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(())
 	}
 
@@ -89,7 +89,7 @@ impl Inputs for Database {
 			}
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(())
 	}
 
@@ -109,7 +109,7 @@ impl Inputs for Database {
 			}
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(())
 	}
 
@@ -146,7 +146,7 @@ impl Inputs for Database {
 			}
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		// Checkpoint WAL to ensure measurement is persisted
 		Self::checkpoint_wal_passive(&db).await?;
@@ -191,7 +191,7 @@ impl Inputs for Database {
 			}
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		// Checkpoint WAL to ensure measurement is persisted
 		Self::checkpoint_wal_passive(&db).await?;
@@ -301,7 +301,7 @@ impl Inputs for Database {
 				tracing::debug!("[batch_capture] Chunk {}: INSERT succeeded, committing...", chunk_idx);
 			}
 
-			let _ = Self::commit_concurrent(&conn).await;
+			Self::commit_concurrent(&conn).await?;
 			all_tx_ids.extend(chunk_tx_ids);
 
 			// Periodic PASSIVE checkpoint every 100 chunks to prevent WAL from growing too large
@@ -384,7 +384,7 @@ impl Inputs for Database {
 		// Execute the bulk insert with all parameters
 		conn.as_ref().execute(&bulk_sql, turso::params_from_iter(params)).await.map_err(|e| Error::DatabaseError(format!("Failed to bulk insert measurements: {e}")))?;
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		// Enqueue all measurement timestamps for incremental batch processing
 		let chunk_timestamps: Vec<chrono::DateTime<chrono::Utc>> = chunk.iter().map(InputMeasurement::timestamp).collect();
@@ -431,7 +431,7 @@ impl Inputs for Database {
 				}
 			}
 
-			let _ = Self::commit_concurrent(&conn).await;
+			Self::commit_concurrent(&conn).await?;
 		}
 
 		// Enqueue all successfully inserted measurement timestamps for incremental batch processing
@@ -473,7 +473,7 @@ impl Inputs for Database {
 			}
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		Ok(tx_id)
 	}
@@ -538,7 +538,7 @@ impl Inputs for Database {
 			return Err(anyhow::anyhow!("Failed to remove unprocessed batch: {e}"));
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		let log = format!("Removed unprocessed batch {batch_id} for aspect {aspect_id}");
 		Ok(self.record_transaction(&log).await?)
@@ -560,7 +560,7 @@ impl Inputs for Database {
 			}
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		let log = format!("Cleared all unprocessed batches for aspect {aspect_id}");
 		Ok(self.record_transaction(&log).await?)
 	}
@@ -581,7 +581,7 @@ impl Inputs for Database {
 			}
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		let log = format!("Cleaned up unprocessed batches older than {older_than} for aspect {aspect_id}");
 		Ok(self.record_transaction(&log).await?)
 	}
@@ -612,7 +612,7 @@ impl Inputs for Database {
 			return Err(anyhow::anyhow!("Failed to insert processed batch: {e}"));
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		Ok(tx_id)
 	}
@@ -649,7 +649,7 @@ impl Inputs for Database {
 			return Err(anyhow::anyhow!("Failed to remove processed batch: {e}"));
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		let log = format!("Removed processed batch {batch_id} for aspect {aspect_id}");
 		Ok(self.record_transaction(&log).await?)
@@ -675,7 +675,7 @@ impl Inputs for Database {
 			conn.as_ref().execute(&delete_sql, turso::params_from_iter(params)).await.map_err(|e| Error::DatabaseError(format!("Failed to bulk delete processed batches: {e}")))?;
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(())
 	}
 
@@ -696,7 +696,7 @@ impl Inputs for Database {
 			}
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		let log = format!("Cleared all processed batches for aspect {aspect_id}");
 		Ok(self.record_transaction(&log).await?)
 	}
@@ -718,7 +718,7 @@ impl Inputs for Database {
 			}
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		let log = format!("Cleaned up processed batches older than {older_than} for aspect {aspect_id}");
 		Ok(self.record_transaction(&log).await?)
 	}
@@ -767,7 +767,7 @@ impl Inputs for Database {
 			conn.as_ref().execute(&bulk_sql, turso::params_from_iter(params)).await.map_err(|e| Error::DatabaseError(format!("Failed to bulk insert processed batches: {e}")))?;
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(())
 	}
 
@@ -791,7 +791,7 @@ impl Inputs for Database {
 			conn.as_ref().execute(&delete_sql, turso::params_from_iter(params)).await.map_err(|e| Error::DatabaseError(format!("Failed to bulk delete unprocessed batches: {e}")))?;
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(())
 	}
 
@@ -872,7 +872,7 @@ impl Inputs for Database {
 			}
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		let log = format!("Inserted pattern '{}' for aspect {}", pattern.id(), aspect_id);
 		let _ = self.record_transaction(&log).await?;
@@ -904,7 +904,7 @@ impl Inputs for Database {
 				return Err(anyhow::anyhow!("Failed to remove pattern: {e}"));
 			}
 		}
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		let log = format!("Removed pattern '{pattern}' for aspect {aspect_id}");
 		Ok(self.record_transaction(&log).await?)
 	}
@@ -923,7 +923,7 @@ impl Inputs for Database {
 				return Err(anyhow::anyhow!("Failed to clear patterns: {e}"));
 			}
 		}
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		let log = format!("Cleared all patterns for aspect {aspect_id}");
 		Ok(self.record_transaction(&log).await?)
 	}
@@ -958,7 +958,7 @@ impl Inputs for Database {
 			}
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		let log = format!("Inserted event {event_id} for aspect {aspect_id}");
 		let _ = self.record_transaction(&log).await?;
@@ -990,7 +990,7 @@ impl Inputs for Database {
 				return Err(anyhow::anyhow!("Failed to remove event: {e}"));
 			}
 		}
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		let log = format!("Removed event {event_id} for aspect {aspect_id}");
 		let _ = self.record_transaction(&log).await?;
 		Ok(TxId::new())
@@ -1010,7 +1010,7 @@ impl Inputs for Database {
 				return Err(anyhow::anyhow!("Failed to clear events: {e}"));
 			}
 		}
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		let log = format!("Cleared all events for aspect {aspect_id}");
 		let _ = self.record_transaction(&log).await?;
 		Ok(TxId::new())
@@ -1049,7 +1049,7 @@ impl Inputs for Database {
 			}
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		let log = format!("Set metadata for dictionary '{dictionary_name}' for aspect {aspect_id}");
 		let _ = self.record_transaction(&log).await?;
@@ -1114,7 +1114,7 @@ impl Inputs for Database {
 			}
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		let log = format!("Inserted pattern '{}' into dictionary '{}' for aspect {}", pattern.id(), dictionary_name, aspect_id);
 		let _ = self.record_transaction(&log).await?;
@@ -1191,7 +1191,7 @@ impl Inputs for Database {
 			}
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		let log = format!("Inserted correlation '{}' for aspect {}", correlation.id(), aspect_id);
 		let _ = self.record_transaction(&log).await?;
@@ -1273,7 +1273,7 @@ impl Inputs for Database {
 			}
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		// Update the cache with the new correlation data
 		let cache_key = format!("correlation_{}_{}", aspect_id.as_uuid(), correlation.id().to_uuid());
@@ -1319,7 +1319,7 @@ impl Inputs for Database {
 			}
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		let log = format!("Removed correlation {correlation_id} for aspect {aspect_id}");
 		let _ = self.record_transaction(&log).await?;
 		Ok(TxId::new())
@@ -1359,7 +1359,7 @@ impl Inputs for Database {
 				}
 			}
 		}
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		let log = format!("Inserted unprocessed event {event_id} for aspect {aspect_id}");
 		let _ = self.record_transaction(&log).await?;
 		Ok(tx_id)
@@ -1390,7 +1390,7 @@ impl Inputs for Database {
 			}
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		let log = format!("Removed unprocessed event {event_id} for aspect {aspect_id}");
 		let _ = self.record_transaction(&log).await?;
 		Ok(TxId::new())
@@ -1420,7 +1420,7 @@ impl Inputs for Database {
 			}
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		let log = format!("Cleared all unprocessed events for aspect {aspect_id}");
 		let _ = self.record_transaction(&log).await?;
 		Ok(TxId::new())
@@ -1439,7 +1439,7 @@ impl Inputs for Database {
 				return Err(anyhow::anyhow!("Failed to cleanup unprocessed events: {e}"));
 			}
 		}
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		let log = format!("Cleaned up unprocessed events older than {older_than} for aspect {aspect_id}");
 		let _ = self.record_transaction(&log).await?;
 		Ok(TxId::new())
@@ -1477,7 +1477,7 @@ impl Inputs for Database {
 				}
 			}
 		}
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		let log = format!("Inserted processed event {event_id} for aspect {aspect_id}");
 		let _ = self.record_transaction(&log).await?;
 		Ok(tx_id)
@@ -1508,7 +1508,7 @@ impl Inputs for Database {
 			}
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		let log = format!("Removed processed event {event_id} for aspect {aspect_id}");
 		let _ = self.record_transaction(&log).await?;
 		Ok(TxId::new())
@@ -1538,7 +1538,7 @@ impl Inputs for Database {
 			}
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		let log = format!("Cleared all processed events for aspect {aspect_id}");
 		let _ = self.record_transaction(&log).await?;
 		Ok(TxId::new())
@@ -1557,7 +1557,7 @@ impl Inputs for Database {
 				return Err(anyhow::anyhow!("Failed to cleanup processed events: {e}"));
 			}
 		}
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		let log = format!("Cleaned up processed events older than {older_than} for aspect {aspect_id}");
 		let _ = self.record_transaction(&log).await?;
 		Ok(TxId::new())
@@ -1583,7 +1583,7 @@ impl Inputs for Database {
 				return Err(anyhow::anyhow!("Failed to delete measurements in range: {e}"));
 			}
 
-			let _ = Self::commit_concurrent(&conn).await;
+			Self::commit_concurrent(&conn).await?;
 			Self::checkpoint_wal_passive(&db).await?;
 			return Ok(());
 		}
@@ -1626,7 +1626,7 @@ impl Inputs for Database {
 			}
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Self::checkpoint_wal_passive(&db).await?;
 
 		// Invalidate cache
@@ -1684,7 +1684,7 @@ impl Database {
 		};
 
 		// Need to commit this read transaction before starting a new write
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		if let Some((start_millis, end_millis)) = compressed_range {
 			// Open a new connection for the write
@@ -1713,7 +1713,7 @@ impl Database {
 				)
 				.await?;
 
-			let _ = Self::commit_concurrent(&conn).await;
+			Self::commit_concurrent(&conn).await?;
 
 			tracing::debug!(
 				aspect_id = %aspect_id,
@@ -1760,7 +1760,7 @@ impl Database {
 		}
 
 		// Need to commit this read transaction before starting a new write
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		if !compressed_ranges.is_empty() {
 			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
@@ -1789,7 +1789,7 @@ impl Database {
 				)
 				.await?;
 
-			let _ = Self::commit_concurrent(&conn).await;
+			Self::commit_concurrent(&conn).await?;
 
 			tracing::debug!(
 				aspect_id = %aspect_id,

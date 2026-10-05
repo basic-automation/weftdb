@@ -14,7 +14,7 @@
 //! config so an interval is exactly reproducible — the same fair-protocol
 //! discipline applied to dataset generation.
 
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 

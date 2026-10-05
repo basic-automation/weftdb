@@ -173,7 +173,7 @@ impl DatabaseStructure for Database {
 			}
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		// Return immediately without waiting for the logging to complete
 		Ok(tx_id)
@@ -202,7 +202,7 @@ impl DatabaseStructure for Database {
 			}
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		// Return immediately without waiting for the logging to complete
 		Ok(())
@@ -401,7 +401,7 @@ impl DatabaseStructure for Database {
 			}
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		drop(conn);
 
@@ -521,7 +521,7 @@ impl DatabaseStructure for Database {
 			db_info.add_subject(subject);
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		DATABASES.lock().await.insert(db_id, db_info);
 
@@ -677,7 +677,7 @@ impl DatabaseStructure for Database {
 			}
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		tracing::debug!("Subject inserted successfully");
 
 		// Update in-memory cache so subsequent operations don't need metadata DB
@@ -728,7 +728,7 @@ impl DatabaseStructure for Database {
 			}
 		};
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(subject)
 	}
 
@@ -782,7 +782,7 @@ impl DatabaseStructure for Database {
 				return Err(anyhow::anyhow!("SQL execution failure 13: `{e}`"));
 			}
 		}
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		// Log the transaction
 		self.record_transaction(&format!("Removed subject '{}'", subject.name())).await?;
@@ -805,7 +805,7 @@ impl DatabaseStructure for Database {
 			}
 		};
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		let mut raw_rows: Vec<(String, String, String)> = Vec::new();
 		while let Some(row) = rows.next().await? {
@@ -849,7 +849,7 @@ impl DatabaseStructure for Database {
 					aspects.push(Aspect::from_metadata(Some(aspect_id), name, &subject_id_parsed, &resolution, self.metadata_path.clone(), None).await?);
 				}
 
-				let _ = Self::commit_concurrent(&conn).await;
+				Self::commit_concurrent(&conn).await?;
 
 				return Ok(aspects);
 			}
@@ -923,7 +923,7 @@ impl DatabaseStructure for Database {
 		// Set compression config on the created aspect
 		aspect.set_compression_config_local(compression_config);
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		// Update in-memory cache with the newly created aspect to avoid future metadata reads
 		{
@@ -996,7 +996,7 @@ impl DatabaseStructure for Database {
 				return Err(anyhow::anyhow!("SQL execution failure 16: in get_aspect: `{e}`"));
 			}
 		};
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		self.cache.lock().await.store(&cache_key, aspect.clone()).await;
 		Ok(aspect)
 	}
@@ -1040,7 +1040,7 @@ impl DatabaseStructure for Database {
 				return Err(anyhow::anyhow!("SQL execution failure in 17: get_aspect_by_name: `{e}`"));
 			}
 		};
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(aspect)
 	}
 
@@ -1083,7 +1083,7 @@ impl DatabaseStructure for Database {
 			}
 		};
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		if let Some(ts) = timestamp {
 			self.cache.lock().await.store(&cache_key, ts).await;
@@ -1102,7 +1102,7 @@ impl DatabaseStructure for Database {
 		match res {
 			Ok(mut rows) => {
 				if let Some(row) = rows.next().await? {
-					let _ = Self::commit_concurrent(&conn).await;
+					Self::commit_concurrent(&conn).await?;
 					// Check if the value is null (empty table)
 					let value = row.get_value(0)?;
 					if matches!(value, turso::Value::Null) {
@@ -1146,7 +1146,7 @@ impl DatabaseStructure for Database {
 				return Err(anyhow::anyhow!("SQL execution failure 20: `{e}`"));
 			}
 		}
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(())
 	}
 
@@ -1365,10 +1365,11 @@ impl DatabaseStructure for Database {
 						false
 					}
 					Err(e) => {
-						// Check if error is due to lock
-						let err_msg = e.to_string().to_lowercase();
+						// Lock contention surfaces as `Busy`; under MVCC an aborted commit
+						// dependency surfaces as `BusySnapshot` (turso 0.8+). Match the variants,
+						// not the message text, which changes between releases.
 						drop(conn);
-						err_msg.contains("locked") || err_msg.contains("busy")
+						matches!(e, turso::Error::Busy(_) | turso::Error::BusySnapshot(_))
 					}
 				}
 			}
@@ -1415,10 +1416,11 @@ impl DatabaseStructure for Database {
 								false
 							}
 							Err(e) => {
-								// Check if error is due to lock
-								let err_msg = e.to_string().to_lowercase();
+								// Lock contention surfaces as `Busy`; under MVCC an aborted commit
+								// dependency surfaces as `BusySnapshot` (turso 0.8+). Match the variants,
+								// not the message text, which changes between releases.
 								drop(conn);
-								err_msg.contains("locked") || err_msg.contains("busy")
+								matches!(e, turso::Error::Busy(_) | turso::Error::BusySnapshot(_))
 							}
 						}
 					}
@@ -1675,12 +1677,12 @@ impl DatabaseInfo {
 						if let Some(row) = rows.next().await? {
 							let timestamp_str = Database::value_to_string(&row.get_value(0)?, "Creation Timestamp").await?;
 							if timestamp_str.is_empty() {
-								let _ = Database::commit_concurrent(&conn).await;
+								Database::commit_concurrent(&conn).await?;
 								return Ok(None);
 							}
 							DateTime::parse_from_rfc3339(&timestamp_str)?.with_timezone(&Utc)
 						} else {
-							let _ = Database::commit_concurrent(&conn).await;
+							Database::commit_concurrent(&conn).await?;
 							return Ok(None);
 						}
 					}
@@ -1690,7 +1692,7 @@ impl DatabaseInfo {
 					}
 				};
 
-				let _ = Database::commit_concurrent(&conn).await;
+				Database::commit_concurrent(&conn).await?;
 				return Ok(Some(timestamp));
 			}
 		}
@@ -1744,7 +1746,7 @@ impl DatabaseInfo {
 			}
 		}
 
-		let _ = Database::commit_concurrent(&conn).await;
+		Database::commit_concurrent(&conn).await?;
 		Ok(stats)
 	}
 

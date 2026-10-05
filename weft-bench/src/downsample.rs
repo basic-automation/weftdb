@@ -23,7 +23,7 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 pub use weft_reduce::Aggregation;
 use weft_reduce::{reduce, reduce_partial, Bucket, PartialReduction};
 use rayon::prelude::*;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use splimes::{Point, Resolution};
 

@@ -7,6 +7,24 @@ use super::Database;
 pub use crate::types::database::traits::config::Config;
 use crate::{cache, database::traits::Connection, DatabaseCache};
 
+/// `COMMIT` the connection's open transaction; on failure, roll it back before returning
+/// the error.
+///
+/// A failed commit (an MVCC write-write conflict, an aborted commit dependency, or a
+/// transaction poisoned by an abandoned write statement) means **nothing was written**, so
+/// the error must reach the caller. The best-effort `ROLLBACK` leaves the connection
+/// without a dangling transaction; its own error is ignored because the commit error is
+/// the one that matters.
+async fn commit_or_rollback(conn: &cache::Connection) -> Result<()> {
+	match conn.as_ref().execute("COMMIT", turso::params![]).await {
+		Ok(_) => Ok(()),
+		Err(e) => {
+			let _ = conn.as_ref().execute("ROLLBACK", turso::params![]).await;
+			Err(anyhow::anyhow!("Commit failed; the transaction was rolled back: {e}"))
+		}
+	}
+}
+
 #[async_trait::async_trait]
 impl Connection for Database {
 	/// Create a new database connection with MVCC concurrent transaction support
@@ -52,7 +70,7 @@ impl Connection for Database {
 	}
 
 	async fn commit_concurrent(conn: &cache::Connection) -> anyhow::Result<()> {
-		conn.as_ref().execute("COMMIT", turso::params![]).await.map_err(Into::into).map(|_| ())
+		commit_or_rollback(conn).await
 	}
 
 	async fn rollback_concurrent(conn: &cache::Connection) -> Result<()> {
@@ -112,7 +130,7 @@ impl Connection for Database {
 
 	/// Commit an immediate transaction
 	async fn commit_immediate(conn: &cache::Connection) -> Result<()> {
-		conn.as_ref().execute("COMMIT", turso::params![]).await.map_err(Into::into).map(|_| ())
+		commit_or_rollback(conn).await
 	}
 
 	/// Non-blocking WAL checkpoint using PASSIVE mode.

@@ -11,7 +11,7 @@
 
 use bigdecimal::{BigDecimal, FromPrimitive};
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 use splimes::{Point, Resolution, Spline};

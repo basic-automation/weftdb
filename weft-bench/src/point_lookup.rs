@@ -33,7 +33,7 @@ use bigdecimal::{BigDecimal, ToPrimitive};
 use weft_physical_type::{
 	weftseg::{read_paged_segment_point, read_paged_segment_points, read_segment_point, read_segment_points}, PagedSegment, Segment, TimeUnit
 };
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 

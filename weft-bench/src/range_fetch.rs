@@ -23,7 +23,7 @@ use bigdecimal::{BigDecimal, ToPrimitive};
 use weft_physical_type::{
 	weftseg::{read_paged_segment_range, read_segment_range}, PagedSegment, Segment, TimeUnit
 };
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
 use crate::{

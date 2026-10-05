@@ -1465,7 +1465,7 @@ mod tests {
 	use bigdecimal::{BigDecimal, FromPrimitive};
 	use chrono::{TimeZone, Utc};
 	use database::{AspectId, Database, DatasetId, InputMeasurement, Resolution, data_dir};
-	use rand::Rng;
+	use rand::RngExt;
 	use serde_json::json;
 	use serial_test::serial;
 	use splimes::Spline;

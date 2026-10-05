@@ -32,6 +32,7 @@ repositories**, which are archived outside this repository.
 - [Guiding principles & hard constraints](#guiding-principles--hard-constraints)
 - [Top-level tracks](#top-level-tracks)
 - [Phased roadmap (0–9)](#phased-roadmap-09)
+- [1.0 release criteria](#10-release-criteria)
 - [Updated priority order](#updated-priority-order)
 - [Predecessor-derived backlog](#predecessor-derived-backlog)
 - [Control-plane engine: Turso/libSQL 0.6 adoption](#control-plane-engine-tursolibsql-06-adoption)
@@ -739,6 +740,64 @@ vector DB. *(Maps backlog Themes 5, 6, 8.)*
 
 ---
 
+## 1.0 release criteria
+
+The phases above define **beta** (Phase 7) and **paid beta** (Phase 8); this section
+defines **1.0 / stable**: the point at which WeftDB makes a semver promise about its
+API, its on-disk format, and its durability. Today WeftDB is **pre-beta** — every crate
+is `0.1.0` and nothing is tagged. 1.0 ships when every box below is ticked.
+
+Gates that point at an item elsewhere in this file are ticked **only** when that item
+is ticked there — the referenced item stays the source of truth for its detail.
+
+**Recommended order:** CI → WAL & crash consistency → bulk ingest on the seal → tags →
+whole-store backup → 24 h soak (**beta**) → TLS/auth + Docker → first cross-engine
+report → API/format freeze → **1.0**.
+
+### Durability & correctness *(the beta bar — Phase 7)*
+
+- [ ] **7.2 WAL & crash consistency** — the largest blocker; no durability promise is possible without it
+- [ ] **7.3 Corruption detection** — startup verification, catalog checks, repair tooling (beyond the shipped `.weftseg` CRC-32)
+- [ ] **7.4 Whole-store backup manifest** — fold the `.weftseg` frames in beside the control plane; a restore must not yield a frame-less store
+- [ ] **7.4 Documented RPO/RTO** against the measured snapshot cadence
+- [ ] **7.5 Compaction** with query consistency, cancellation, and resource limits
+- [ ] **7.6 Quotas/limits** — request size, query timeout, memory, GPU memory
+- [ ] **Phase 7 acceptance run** — the 24-hour soak (ingest + interpolation + range scans + compaction + late arrivals + simulated failures + restart) with bounded p99 and no loss beyond the declared durability mode, published as a benchmark artifact
+
+### Hot path & data model *(must land before the freeze)*
+
+- [ ] **Measurement bulk ingest routed through the `.weftseg` seal** — the legacy `batch_capture_measurements` path is super-linear (see [Immediate next actions](#immediate-next-actions))
+- [ ] **B-tags** — per-measurement tags/labels; a data-model change that must precede the API/format freeze
+- [x] **Control-plane engine decision** — moved to stable `turso` 0.8 (2026-10-05). `experimental_mvcc` stays on and is the documented known risk. The bump also fixed 139 call sites that silently discarded `COMMIT` errors; see the `turso` item in the [Turso section](#control-plane-engine-tursolibsql-06-adoption)
+
+### Security & packaging *(Phase 8 minimum)*
+
+- [ ] TLS on `weft-server`
+- [ ] API-key/token auth + basic RBAC + audit log
+- [ ] Packaging — static binaries, Docker image, systemd unit, documented config schema
+- [ ] Upgrade/rollback procedure, exercised against the previous release
+
+### Release engineering
+
+- [x] **Dependencies current and audited (2026-10-05)** — every dependency on its latest major (turso 0.8, wgpu 30, arrow/parquet 60, OpenTelemetry 0.33, rand 0.10, thiserror 2, …). The unmaintained `bincode` (RUSTSEC-2025-0141; its 3.0.0 release is a `compile_error!` tombstone) was replaced by `postcard` 1.x for the `.weftpart` sidecar (frame v3, magic `\x02`; older sidecars are ignored and the segment is decoded instead). The `crossbeam-epoch` and `h2` advisories were cleared, and wildcard `"0"` requirements were pinned to their minor versions
+- [ ] **CI** — build, test, `clippy`, `fmt` on every PR (the repository has no workflows today); a nightly benchmark-regression job
+- [ ] **Public surface declared and frozen** — `/api/v1` HTTP contract, `.weftseg` `format_version`, control-plane schema; anything not listed is explicitly unstable
+- [ ] **Compatibility tests** — a fixture store written by the previous release is read by the current one; a format change requires a version bump and a migration
+- [ ] **Semver policy + `CHANGELOG.md`**, starting from the first tagged pre-release
+- [ ] **Crate publishing split** — `publish = false` on internal crates (`weft-bench`, `weft-tui`, likely `database_orchestration`); published crates carry versioned path dependencies, docs, and a single edition
+- [ ] **Panic audit on server paths** — no `.unwrap()`/`.expect()` reachable from a request or ingest path; failures surface as typed errors / HTTP status codes
+- [ ] **Security process** — `SECURITY.md` with a disclosure contact, `cargo audit`/`cargo deny` (advisories + licenses) in CI
+
+### Claims & documentation
+
+- [ ] Every performance claim in the README links to a benchmark artifact (the [governing rule](#weftdb-roadmap))
+- [ ] First cross-engine report — WeftDB vs DuckDB at minimum, meeting the [Benchmark report requirements](#benchmark-report-requirements)
+- [ ] Honesty pages shipped (see [Commercial thesis](#commercial-thesis--positioning))
+- [ ] Legal review of competitor benchmark-publication terms + codec licenses (see [Research & business notes](#research--business-notes))
+- [ ] README *Project status* table updated to reflect 1.0 and the status badge changed from `pre-beta`
+
+---
+
 ## Updated priority order
 
 **Move up immediately:** 1) Weft-Bench · 2) public API/server · 3) InfluxDB Line
@@ -920,7 +979,16 @@ of them turn Turso into the measurement backend.
   tests. WeftDB's verifier compares user-table sets and *scans every row*, so it should be unaffected,
   but that is worth asserting explicitly rather than assuming, since a pragma-based check would be
   vacuously passing. *(src: https://github.com/tursodatabase/turso/issues/4929)*
-- [ ] **Evaluate the `turso` 0.7 upgrade — the release notes are now read (research 2026-07-23),
+- [x] **Upgraded to `turso` 0.8.1 (2026-10-05).** No API breaks. Behaviour changes handled: (1) **139
+  `let _ = commit_*` call sites silently dropped `COMMIT` errors**, so a write lost to an MVCC
+  conflict was reported as success. They now propagate, and `commit_concurrent`/`commit_immediate`
+  `ROLLBACK` on failure. (2) The lock probes in `database/mod.rs` match `Error::Busy | Error::BusySnapshot`
+  instead of the message text, because 0.8 reports aborted commit dependencies as `BusySnapshot`.
+  (3) Open read cursors are dropped before `COMMIT`. **One-way:** once 0.8 writes, the MVCC log is
+  v3 and 0.6 can no longer open the store. Still open: a retry policy for `BusySnapshot` on the
+  hot write paths (today it surfaces to the caller), and adopting `TransactionBehavior::Concurrent`
+  in place of the raw `BEGIN CONCURRENT` strings. The original evaluation notes follow.
+- [x] ~~**Evaluate the `turso` 0.7 upgrade**~~ — the release notes are now read (research 2026-07-23),
   and two of the three open questions have answers.** WeftDB pins `turso = "0.6"` and locks 0.6.1.
   **Version check (research 2026-09-23): stable is now `0.7.2` (2026-07-30), with `0.8.0-pre.12`
   out on 2026-09-22 — WeftDB is two minor versions behind, and 0.8-pre is moving weekly, so part of

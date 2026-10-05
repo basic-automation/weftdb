@@ -56,7 +56,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 			timestamps.push(ts);
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(timestamps)
 	}
 
@@ -76,7 +76,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 			0
 		};
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(count)
 	}
 
@@ -96,7 +96,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 			0
 		};
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(count)
 	}
 
@@ -116,7 +116,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 			0
 		};
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(count)
 	}
 
@@ -169,7 +169,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 			}
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		// Sort by timestamp to maintain chronological order
 		all_measurements.sort_by_key(|m: &Measurement| m.timestamp());
@@ -203,7 +203,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		let conn: cache::Connection = Self::begin_concurrent(&measurement_db, &db_path, Some(self.cache.clone())).await?;
 		let mut rows: turso::Rows = conn.as_ref().query(count_sql, turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to count measurements: {e}")))?;
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		if let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get count row: {e}")))? {
 			let count_value = row.get_value(0)?;
@@ -625,7 +625,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 
 		let mut rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![batch_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query batch: {e}")))?;
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		if let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get batch row: {e}")))? {
 			let batch = Self::parse_batch_row_helper(&row, self.name(), &db_path)?;
@@ -687,7 +687,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		// Convert to stream
 		let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(Box::pin(batch_stream))
 	}
 
@@ -726,11 +726,11 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 			// Cache the single batch (as a vec with one element)
 			self.cache.lock().await.store(&cache_key, vec![batch.clone()]).await;
 
-			let _ = Self::commit_concurrent(&conn).await;
+			Self::commit_concurrent(&conn).await?;
 
 			Ok(batch)
 		} else {
-			let _ = Self::commit_concurrent(&conn).await;
+			Self::commit_concurrent(&conn).await?;
 			Err(anyhow::anyhow!("Batch with ID {batch_id} not found"))
 		}
 	}
@@ -773,7 +773,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 			}
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		// Cache the results for future queries
 		if !batches.is_empty() {
@@ -852,10 +852,10 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 			} else {
 				None
 			};
-			let _ = Self::commit_concurrent(&conn).await;
+			Self::commit_concurrent(&conn).await?;
 			Ok(result)
 		} else {
-			let _ = Self::commit_concurrent(&conn).await;
+			Self::commit_concurrent(&conn).await?;
 			Ok(None)
 		}
 	}
@@ -893,7 +893,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 
 			dictionaries.push(metadata);
 		}
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		self.cache.lock().await.store(&cache_key, dictionaries.clone()).await;
 		Ok(dictionaries)
 	}
@@ -917,7 +917,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
                 ";
 
 		let mut rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![pattern_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query pattern: {e}")))?;
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		if let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get pattern row: {e}")))? {
 			let id_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Pattern ID is not text".to_string()))?.clone();
@@ -1027,7 +1027,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 				tracing::warn!("Failed to parse pattern row for ID {pattern_id_str}");
 			}
 		}
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		// Cache the results for future queries
 		if !patterns.is_empty() {
 			self.cache.lock().await.store(&cache_key, patterns.clone()).await;
@@ -1074,10 +1074,10 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 
 			// Cache the correlation
 			self.cache.lock().await.store(&cache_key, correlation.clone()).await;
-			let _ = Self::commit_concurrent(&conn).await;
+			Self::commit_concurrent(&conn).await?;
 			Ok(correlation)
 		} else {
-			let _ = Self::commit_concurrent(&conn).await;
+			Self::commit_concurrent(&conn).await?;
 			Err(anyhow::anyhow!("Correlation with ID {correlation_id} not found"))
 		}
 	}
@@ -1147,7 +1147,10 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 						}
 					}
 
-					let _ = Self::commit_concurrent(&conn).await;
+					drop(rows);
+					if let Err(e) = Self::commit_concurrent(&conn).await {
+						return Some((Err(e), (offset, current_ids, db, db_path, cache, aspect_id)));
+					}
 
 					if new_ids.is_empty() {
 						// No more data, end the stream
@@ -1241,11 +1244,11 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 			// Cache the event
 			self.cache.lock().await.store(&cache_key, event.clone()).await;
 
-			let _ = Self::commit_concurrent(&conn).await;
+			Self::commit_concurrent(&conn).await?;
 
 			Ok(event)
 		} else {
-			let _ = Self::commit_concurrent(&conn).await;
+			Self::commit_concurrent(&conn).await?;
 			Err(anyhow::anyhow!("Unprocessed Event with ID {event_id} not found"))
 		}
 	}
@@ -1324,11 +1327,11 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 			// Cache the event
 			self.cache.lock().await.store(&cache_key, event.clone()).await;
 
-			let _ = Self::commit_concurrent(&conn).await;
+			Self::commit_concurrent(&conn).await?;
 
 			Ok(event)
 		} else {
-			let _ = Self::commit_concurrent(&conn).await;
+			Self::commit_concurrent(&conn).await?;
 			Err(anyhow::anyhow!("Processed Event with ID {event_id} not found"))
 		}
 	}
@@ -1401,7 +1404,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 			measurements.push(m);
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		let stream = futures::stream::iter(measurements.into_iter().map(Ok));
 		Ok(Box::pin(stream))
@@ -1426,7 +1429,7 @@ impl Database {
 			measurements.push(m);
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		Ok(measurements)
 	}
@@ -1454,7 +1457,7 @@ impl Database {
 			measurements.push(m);
 		}
 
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 		Ok(measurements)
 	}
 }
@@ -1492,7 +1495,7 @@ impl Database {
 
 		// Cache the correlation
 		cache.lock().await.store(&cache_key, correlation.clone()).await;
-		let _ = Self::commit_concurrent(&conn).await;
+		Self::commit_concurrent(&conn).await?;
 
 		Ok(correlation)
 	}
