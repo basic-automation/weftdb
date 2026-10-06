@@ -351,6 +351,12 @@ Weft-Bench shows ingest/scan/compression gains; correctness tests cover late + O
 
 ### Phase 5 — GPU interpolation flagship · *High (parallel w/ Phase 4)*
 
+> **Moved (2026-10-05):** the interpolation engine is now its own crate and repository,
+> [basic-automation/splimes](https://github.com/basic-automation/splimes), with its own
+> [roadmap](https://github.com/basic-automation/splimes/blob/main/ROADMAP.md). Engine items
+> below (5.1–5.6, GPU memory stability) are tracked there; WeftDB keeps only the
+> **end-to-end** benchmark (storage read → … → API serialization), which needs the database.
+
 Interpolation/extrapolation already works end to end (CPU/SIMD/GPU); this phase makes
 the GPU path *fast end-to-end and economically justified*. GPU benchmarks must be
 **end-to-end** (storage read → decode → filter → Decimal convert → transfer → queue
@@ -765,6 +771,11 @@ report → API/format freeze → **1.0**.
 - [ ] **Phase 7 acceptance run** — the 24-hour soak (ingest + interpolation + range scans + compaction + late arrivals + simulated failures + restart) with bounded p99 and no loss beyond the declared durability mode, published as a benchmark artifact
 
 ### Hot path & data model *(must land before the freeze)*
+
+- [ ] **splimes 1.0 is released**, and WeftDB depends on it. The interpolation engine is
+  its own crate ([basic-automation/splimes](https://github.com/basic-automation/splimes),
+  0.1.0 published 2026-10-05) with its own 1.0 criteria; a stable WeftDB can't promise a
+  stable API on top of an unstable engine
 
 - [ ] **Measurement bulk ingest routed through the `.weftseg` seal** — the legacy `batch_capture_measurements` path is super-linear (see [Immediate next actions](#immediate-next-actions))
 - [ ] **B-tags** — per-measurement tags/labels; a data-model change that must precede the API/format freeze

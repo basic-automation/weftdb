@@ -10,6 +10,9 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Changed
 
+- **`splimes` moved to its own repository** ([basic-automation/splimes](https://github.com/basic-automation/splimes))
+  and is now a crates.io dependency (`splimes = "0.1"`). It is released on its own
+  schedule, and a stable WeftDB waits on a stable splimes.
 - **Turso control plane upgraded 0.6 → 0.8.** ⚠️ This is one-way: once 0.8 writes a
   store, its MVCC log is v3 and an older WeftDB can no longer open it. Back up the
   control plane before upgrading.
