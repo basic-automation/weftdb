@@ -25,6 +25,24 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Fixed
 
+- **A segment store root is now owned by one process.** Opening a store takes a `LOCK`
+  file in the root (with the holder's pid and session in `LOCK.holder` beside it) and
+  holds it until the store closes. A second `weft-server` on the same
+  `WEFT_SEGMENT_STORE_ROOT` now exits at startup with an error naming the pid that
+  holds the root, instead of Turso's "File is locked by another process". The lock is
+  released by the OS however the holder exits, so there is never a stale lock to
+  clear. Within one process, a second `SegmentStore::open` on an open root returns
+  the new `StoreLocked` error; close the first store before reopening.
+- **A control-plane database that could not switch to MVCC was opened anyway.** The
+  segment store's four control-plane databases now refuse to open unless they run in
+  MVCC journal mode and a new connection syncs FULL, which is what makes a COMMIT
+  durable when it returns. Previously a failed switch was ignored and the database
+  committed in WAL mode.
+- **Opening a store now makes its files' directory entries durable.** The root,
+  `segments/` and any directory the open created are fsynced, so the control-plane
+  databases and their logs cannot vanish from the directory after a power cut.
+- **The store's database/subject registration is one transaction.** A crash during
+  open could leave the database registered without its subject.
 - **Commit failures were silently ignored.** A control-plane write that lost an MVCC
   conflict was reported as success. Commit errors now reach the caller, and the
   transaction is rolled back.

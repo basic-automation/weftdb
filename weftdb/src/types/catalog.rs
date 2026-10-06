@@ -30,6 +30,8 @@
 use anyhow::{bail, Result};
 use turso::{Builder, Value};
 
+use crate::types::durable::{fault, FaultPoint};
+
 /// A durable, libSQL-backed registry of the database → subject hierarchy.
 ///
 /// Open one with [`CatalogStore::open`] (a file path) or
@@ -48,12 +50,13 @@ impl CatalogStore {
 	///
 	/// # Errors
 	///
-	/// Propagates any libSQL connection or DDL failure.
+	/// Fails if the database does not end up in MVCC journal mode or a new connection
+	/// does not sync FULL, and propagates any libSQL connection or DDL failure.
 	pub async fn open(path: &str) -> Result<Self> {
 		let db = Builder::new_local(path).build().await?;
 		let conn = db.connect()?;
-		// Match the control plane's MVCC write path (Turso 0.6, no AUTOINCREMENT).
-		conn.execute("PRAGMA journal_mode=experimental_mvcc", turso::params![]).await.ok();
+		// The control plane's MVCC write path; open fails rather than run without it.
+		crate::types::durable::control_plane::enable_mvcc_full(&db, &conn, path).await?;
 		conn.execute("PRAGMA busy_timeout=600000", turso::params![]).await.ok();
 		conn.execute(
 			"CREATE TABLE IF NOT EXISTS databases (
@@ -155,6 +158,41 @@ impl CatalogStore {
 			Err(e) => {
 				conn.execute("ROLLBACK", turso::params![]).await.ok();
 				bail!("register_subject failed: {e}")
+			}
+		}
+	}
+
+	/// Register `database` and `subject` under it in **one** transaction (idempotent):
+	/// the scope a [`SegmentStore`](crate::SegmentStore) opens under.
+	///
+	/// [`register_database`](Self::register_database) followed by
+	/// [`register_subject`](Self::register_subject) is two commits, so a crash between
+	/// them leaves a database without the subject the open was for (design window
+	/// open-scoped-register-database-then-subject). Here both rows commit together or
+	/// not at all, and the subject can never dangle because its database is inserted in
+	/// the same transaction.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL write failure; nothing is registered unless both rows are.
+	pub async fn register_scope(&self, database: &str, subject: &str) -> Result<()> {
+		let conn = self.db.connect()?;
+		conn.execute("BEGIN CONCURRENT", turso::params![]).await?;
+		let res: Result<()> = async {
+			conn.execute("INSERT OR IGNORE INTO databases (name) VALUES (?)", turso::params![database.to_string()]).await?;
+			fault::hit(FaultPoint::OScopeDatabaseInserted).await?;
+			conn.execute("INSERT OR IGNORE INTO subjects (database, subject) VALUES (?, ?)", turso::params![database.to_string(), subject.to_string()]).await?;
+			Ok(())
+		}
+		.await;
+		match res {
+			Ok(()) => {
+				conn.execute("COMMIT", turso::params![]).await?;
+				Ok(())
+			}
+			Err(e) => {
+				conn.execute("ROLLBACK", turso::params![]).await.ok();
+				bail!("register_scope failed: {e:#}")
 			}
 		}
 	}
@@ -322,6 +360,20 @@ mod tests {
 		let subjects = catalog.list_subjects("d").await.expect("lists");
 		drop(catalog);
 		assert_eq!(subjects, vec!["s".to_string()]);
+	}
+
+	#[tokio::test]
+	async fn register_scope_registers_a_database_and_its_subject_together() {
+		let catalog = CatalogStore::open_in_memory().await.expect("opens");
+		// No prior register_database: the scope brings its own database row.
+		catalog.register_scope("market", "BTCUSD").await.expect("registers");
+		catalog.register_scope("market", "BTCUSD").await.expect("idempotent");
+		catalog.register_scope("market", "ETHUSD").await.expect("a second subject under a registered database");
+		let dbs = catalog.list_databases().await.expect("lists");
+		let subjects = catalog.list_subjects("market").await.expect("lists");
+		drop(catalog);
+		assert_eq!(dbs, vec!["market".to_string()]);
+		assert_eq!(subjects, vec!["BTCUSD".to_string(), "ETHUSD".to_string()]);
 	}
 
 	#[tokio::test]

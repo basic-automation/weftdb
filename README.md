@@ -316,7 +316,9 @@ See the [Quickstart](#quickstart) to start it.
 Bind address defaults to `127.0.0.1:8080` (`WEFT_SERVER_ADDR` overrides). Setting
 `WEFT_SEGMENT_STORE_ROOT` opens a Storage v2 segment store and enables the
 `/storage` endpoints (without it they answer `503`, and `GET /ready` reports the
-`segment_store` dependency).
+`segment_store` dependency). A store root belongs to one server at a time: the server
+holds the root's `LOCK` file while it runs, and a second server pointed at the same
+root exits at startup with an error naming the first one's pid.
 
 ### Service endpoints
 

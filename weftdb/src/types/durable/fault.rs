@@ -126,6 +126,9 @@ fault_points! {
 	LNewCreated = "L-new-created",
 	/// `L-new-renamed`: `Database::new` has renamed the database into place.
 	LNewRenamed = "L-new-renamed",
+	/// `O-scope-database-inserted`: an open's scope registration has inserted the
+	/// database row, not yet the subject row.
+	OScopeDatabaseInserted = "O-scope-database-inserted",
 }
 
 impl FaultPoint {
@@ -187,6 +190,29 @@ impl FromStr for FaultPoint {
 			return Err(unknown());
 		}
 		Ok(point)
+	}
+}
+
+/// Keep a test child's deliberate abort from dumping core. Every test that re-executes
+/// itself to abort at a fault point calls this in the child first: under
+/// systemd-coredump each run would otherwise store a core of this large binary and
+/// raise a desktop "process crashed" notice.
+#[cfg(test)]
+pub(crate) fn suppress_core_dump() {
+	#[cfg(unix)]
+	{
+		let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+		// SAFETY: setrlimit only reads the struct, for the duration of the call.
+		unsafe { libc::setrlimit(libc::RLIMIT_CORE, &raw const none) };
+	}
+	// A pipe `core_pattern` (systemd-coredump) ignores RLIMIT_CORE, but the kernel
+	// never dumps a process that is not dumpable.
+	#[cfg(target_os = "linux")]
+	{
+		let not_dumpable: libc::c_ulong = 0;
+		// SAFETY: PR_SET_DUMPABLE takes one integer and changes only this process's
+		// dumpable flag.
+		unsafe { libc::prctl(libc::PR_SET_DUMPABLE, not_dumpable) };
 	}
 }
 
@@ -576,27 +602,6 @@ mod tests {
 		let result = hit(FaultPoint::SMidSidecar).await;
 		// Reached only when the env var asks for `err` rather than `abort`.
 		assert_eq!(injected_point(&result.unwrap_err()), Some(FaultPoint::SMidSidecar));
-	}
-
-	/// Keep the child's deliberate abort from dumping core. Under systemd-coredump every
-	/// test run would otherwise store a core of this large binary and raise a desktop
-	/// "process crashed" notice.
-	fn suppress_core_dump() {
-		#[cfg(unix)]
-		{
-			let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-			// SAFETY: setrlimit only reads the struct, for the duration of the call.
-			unsafe { libc::setrlimit(libc::RLIMIT_CORE, &raw const none) };
-		}
-		// A pipe `core_pattern` (systemd-coredump) ignores RLIMIT_CORE, but the kernel
-		// never dumps a process that is not dumpable.
-		#[cfg(target_os = "linux")]
-		{
-			let not_dumpable: libc::c_ulong = 0;
-			// SAFETY: PR_SET_DUMPABLE takes one integer and changes only this process's
-			// dumpable flag.
-			unsafe { libc::prctl(libc::PR_SET_DUMPABLE, not_dumpable) };
-		}
 	}
 
 	fn run_child(spec: &str) -> std::process::Output {

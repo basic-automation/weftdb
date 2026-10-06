@@ -37,11 +37,13 @@ impl AspectCatalog {
 	///
 	/// # Errors
 	///
-	/// Propagates any libSQL connection or DDL failure.
+	/// Fails if the database does not end up in MVCC journal mode or a new connection
+	/// does not sync FULL, and propagates any libSQL connection or DDL failure.
 	pub async fn open(path: &str) -> Result<Self> {
 		let db = Builder::new_local(path).build().await?;
 		let conn = db.connect()?;
-		conn.execute("PRAGMA journal_mode=experimental_mvcc", turso::params![]).await.ok();
+		// The control plane's MVCC write path; open fails rather than run without it.
+		crate::types::durable::control_plane::enable_mvcc_full(&db, &conn, path).await?;
 		conn.execute("PRAGMA busy_timeout=600000", turso::params![]).await.ok();
 		conn.execute(
 			"CREATE TABLE IF NOT EXISTS aspect_schema (

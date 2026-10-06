@@ -36,7 +36,9 @@ use splimes::{Point, Resolution};
 use weft_physical_type::{merge_newer_wins, split_index, AspectSchema, FrameOptions, PagedSegment, Segment, SegmentDescriptor, SplitDecision, SplitPolicy, TimeUnit, PAGED_SEGMENT_FORMAT_VERSION};
 use weft_reduce::{Aggregation, Bucket, PartialReduction};
 
-use crate::{AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, PartialSidecar, PartialSidecarPolicy, SegmentIndexStore, SIDECAR_AGGREGATIONS};
+use crate::{
+	types::durable::{LockHolder, RealFs, RootLock, RootLockError, StoreFs}, AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, PartialSidecar, PartialSidecarPolicy, SegmentIndexStore, SIDECAR_AGGREGATIONS
+};
 
 /// The `(database, subject)` namespace a [`SegmentStore`] opened with the plain
 /// [`open`](SegmentStore::open) constructor declares its aspect schemas under.
@@ -212,6 +214,37 @@ fn window_covers_segment(descriptor: &SegmentDescriptor, start: i64, end: i64) -
 	descriptor.min_ts.zip(descriptor.max_ts).is_some_and(|(min_ts, max_ts)| start <= min_ts && max_ts <= end)
 }
 
+/// [`SegmentStore::open_scoped`] found its root already open: by another process, or
+/// by another [`SegmentStore`] in this one that has not been dropped yet.
+///
+/// A store root is single-process (design section 5.5, OPEN step 1): Turso already
+/// refuses a second process its database files, but `segments/` has no such guard, and
+/// two owners would race each other's frame names, reaper and recovery. The root's
+/// `LOCK` file turns that into this error, which names the holder, before any database
+/// is opened. It arrives inside an [`anyhow::Error`]; `downcast_ref::<StoreLocked>()`
+/// recovers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreLocked {
+	/// The store root that is in use.
+	pub root: PathBuf,
+	/// The process holding it, as recorded in the root's `LOCK.holder` file, or `None`
+	/// when that record could not be read (for example because the holder had not
+	/// written it yet).
+	pub holder: Option<LockHolder>,
+}
+
+impl std::fmt::Display for StoreLocked {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		let root = self.root.display();
+		match &self.holder {
+			Some(holder) => write!(f, "segment store root {root} is in use by pid {} (session {}): a root can be open in only one process, and only once in it; stop that process, or close its store, and retry", holder.pid, holder.session),
+			None => write!(f, "segment store root {root} is in use by another process (its pid could not be read from {}): a root can be open in only one process, and only once in it", self.root.join(crate::types::durable::lock::HOLDER_FILE).display()),
+		}
+	}
+}
+
+impl std::error::Error for StoreLocked {}
+
 pub struct SegmentStore {
 	/// The store root; sealed frames live in `root/segments/`.
 	root: PathBuf,
@@ -242,6 +275,65 @@ pub struct SegmentStore {
 	/// is scoped to one subject, so its flat aspect keys (which name the `.weftseg`
 	/// files and index rows) are unique within it.
 	subject: String,
+	/// The root's `LOCK`, held for the store's lifetime. Declared last so that it drops
+	/// last: the next opener cannot take the root while a database above is still
+	/// closing.
+	_root_lock: RootLock,
+}
+
+/// The directories `create_dir_all(dir)` will create: `dir` and each missing ancestor,
+/// deepest first, up to the first that exists.
+async fn missing_dirs(dir: &Path) -> Vec<PathBuf> {
+	let mut missing = Vec::new();
+	for ancestor in dir.ancestors().filter(|a| !a.as_os_str().is_empty()) {
+		if !matches!(tokio::fs::try_exists(ancestor).await, Ok(false)) {
+			break;
+		}
+		missing.push(ancestor.to_path_buf());
+	}
+	missing
+}
+
+/// Take `root`'s `LOCK` (design section 5.5, OPEN step 1). The acquire opens a file and
+/// can briefly wait out a lock that a child being spawned still shares, so it runs on a
+/// blocking thread.
+async fn lock_root(root: &Path) -> Result<RootLock> {
+	let owned = root.to_path_buf();
+	let acquired = tokio::task::spawn_blocking(move || RootLock::acquire(&owned)).await.context("taking the store root lock")?;
+	match acquired {
+		Ok(lock) => Ok(lock),
+		Err(RootLockError::Held { root, holder }) => Err(StoreLocked { root, holder }.into()),
+		Err(e @ RootLockError::Io { .. }) => Err(e.into()),
+	}
+}
+
+/// Make the store layout's directory entries durable (design section 5.5, OPEN step 5):
+/// fsync `segments/` and the root, which hold the frames and the control-plane database
+/// files with their `-log`s, and every directory in `created` together with the parent
+/// of the topmost one, so a root this open created is itself reachable after a power
+/// cut.
+///
+/// Once is enough: Turso truncates an MVCC `-log` in place on checkpoint instead of
+/// recreating it (`turso_core` `logical_log.rs`), so an entry fsynced here stays durable.
+async fn sync_layout(root: &Path, segments_dir: &Path, created: &[PathBuf]) -> Result<()> {
+	for dir in layout_dirs(root, segments_dir, created) {
+		RealFs.sync_dir(&dir).await.with_context(|| format!("fsyncing directory {}", dir.display()))?;
+	}
+	Ok(())
+}
+
+/// The directories [`sync_layout`] fsyncs, deepest first.
+fn layout_dirs(root: &Path, segments_dir: &Path, created: &[PathBuf]) -> Vec<PathBuf> {
+	let mut dirs = vec![segments_dir.to_path_buf(), root.to_path_buf()];
+	// The topmost created directory's entry lives in its parent, which existed. A bare
+	// relative name's parent is the empty path, meaning the working directory.
+	let anchor = created.last().and_then(|top| top.parent()).map(|parent| if parent.as_os_str().is_empty() { PathBuf::from(".") } else { parent.to_path_buf() });
+	for dir in created.iter().cloned().chain(anchor) {
+		if !dirs.contains(&dir) {
+			dirs.push(dir);
+		}
+	}
+	dirs
 }
 
 impl SegmentStore {
@@ -254,8 +346,8 @@ impl SegmentStore {
 	///
 	/// # Errors
 	///
-	/// Propagates a filesystem error creating the layout, or any libSQL failure
-	/// opening the index or catalog.
+	/// As [`open_scoped`](SegmentStore::open_scoped): a [`StoreLocked`] error if the
+	/// root is already open, and any failure opening the layout or the databases.
 	pub async fn open(root: impl AsRef<Path>) -> Result<Self> {
 		Self::open_scoped(root, DEFAULT_DATABASE, DEFAULT_SUBJECT).await
 	}
@@ -268,14 +360,32 @@ impl SegmentStore {
 	/// `(database, subject, aspect)` triple so a reopened store recovers the encoding
 	/// it sealed under.
 	///
+	/// The open follows design section 5.5:
+	///
+	/// 1. take the root's `LOCK`, before any database is opened, so one store (in one
+	///    process) owns the root;
+	/// 2. open the four control-plane databases, each refusing to open unless it runs
+	///    MVCC and a new connection syncs FULL;
+	/// 3. fsync `segments/`, the root, and any directory this open created above it, so
+	///    the database files and their `-log` files keep their directory entries through
+	///    a power cut (Turso truncates a `-log` in place, so one fsync covers it for
+	///    good);
+	/// 4. register the store's `(database, subject)` scope in one catalog transaction.
+	///
+	/// The lock is held until the store drops.
+	///
 	/// # Errors
 	///
-	/// Propagates a filesystem error creating the layout, or any libSQL failure
-	/// opening the index or catalog.
+	/// A [`StoreLocked`] error if the root is already open, in another process or in
+	/// this one; an error if a database cannot run MVCC or does not sync FULL, or if a
+	/// directory fsync fails; and any filesystem error creating the layout or libSQL
+	/// failure opening the databases.
 	pub async fn open_scoped(root: impl AsRef<Path>, database: &str, subject: &str) -> Result<Self> {
 		let root = root.as_ref().to_path_buf();
 		let segments_dir = root.join("segments");
+		let created = missing_dirs(&segments_dir).await;
 		tokio::fs::create_dir_all(&segments_dir).await.with_context(|| format!("creating segments dir {}", segments_dir.display()))?;
+		let root_lock = lock_root(&root).await?;
 		let index_path = root.join("segment_index.db");
 		let index = SegmentIndexStore::open(&index_path.to_string_lossy()).await?;
 		let metadata_path = root.join("metadata.db");
@@ -284,14 +394,14 @@ impl SegmentStore {
 		let catalog = AspectCatalog::open(&catalog_path.to_string_lossy()).await?;
 		let registry_path = root.join("catalog.db");
 		let registry = CatalogStore::open(&registry_path.to_string_lossy()).await?;
+		sync_layout(&root, &segments_dir, &created).await?;
 		// Record this store's place in the hierarchy so the control plane can enumerate
-		// the databases/subjects a root holds (idempotent).
-		registry.register_database(database).await?;
-		registry.register_subject(database, subject).await?;
+		// the databases/subjects a root holds (idempotent, and atomic).
+		registry.register_scope(database, subject).await?;
 		let checkpoints = CheckpointPolicy::from_env();
 		let partials = PartialSidecarPolicy::from_env();
 		let transposed = TransposedPolicy::from_env();
-		Ok(Self { root, index, metadata, catalog, registry, database: database.to_string(), subject: subject.to_string(), checkpoints, partials, transposed })
+		Ok(Self { root, index, metadata, catalog, registry, database: database.to_string(), subject: subject.to_string(), checkpoints, partials, transposed, _root_lock: root_lock })
 	}
 
 	/// Override this store's [`CheckpointPolicy`] (the env-read default is
@@ -3608,11 +3718,12 @@ mod tests {
 	#[tokio::test]
 	async fn open_registers_its_database_and_subject() {
 		let dir = TempDir::new().expect("tempdir");
-		// Two scoped stores over one root populate the shared catalog.db hierarchy.
-		let market = SegmentStore::open_scoped(dir.path(), "market", "BTCUSD").await.expect("opens");
-		let _iot = SegmentStore::open_scoped(dir.path(), "iot", "sensor-7").await.expect("opens");
+		// Scoped stores opened over one root in turn (a root is open once at a time)
+		// populate the shared catalog.db hierarchy.
+		drop(SegmentStore::open_scoped(dir.path(), "market", "BTCUSD").await.expect("opens"));
+		drop(SegmentStore::open_scoped(dir.path(), "iot", "sensor-7").await.expect("opens"));
 		// Re-opening the same scope is idempotent — no duplicate rows.
-		let _again = SegmentStore::open_scoped(dir.path(), "market", "BTCUSD").await.expect("opens");
+		let market = SegmentStore::open_scoped(dir.path(), "market", "BTCUSD").await.expect("opens");
 		let dbs = market.registry().list_databases().await.expect("lists");
 		let market_subjects = market.registry().list_subjects("market").await.expect("lists");
 		drop(market);
@@ -3626,29 +3737,177 @@ mod tests {
 		let store = SegmentStore::open_scoped(dir.path(), "d", "s").await.expect("opens");
 		store.declare("temp", &schema()).await.expect("declares");
 		store.declare("humidity", &schema()).await.expect("declares");
+		drop(store);
 		// A sibling subject's declaration is not listed here.
 		let sibling = SegmentStore::open_scoped(dir.path(), "d", "other").await.expect("opens");
 		sibling.declare("pressure", &schema()).await.expect("declares");
+		drop(sibling);
+		let store = SegmentStore::open_scoped(dir.path(), "d", "s").await.expect("reopens");
 		let aspects = store.list_declared_aspects().await.expect("lists");
 		drop(store);
-		drop(sibling);
 		assert_eq!(aspects, vec!["humidity".to_string(), "temp".to_string()]);
 	}
 
 	#[tokio::test]
 	async fn scopes_isolate_declarations() {
 		let dir = TempDir::new().expect("tempdir");
-		// Two stores over the same root but different subjects share the catalog DB;
-		// a declaration under one subject is invisible to the other.
+		// Stores over the same root but different subjects share the catalog DB; a
+		// declaration under one subject is invisible to the other. A root is open once at
+		// a time, so the two scopes take turns.
 		let a = SegmentStore::open_scoped(dir.path(), "d", "subject-a").await.expect("opens");
 		a.declare("temp", &schema()).await.expect("declares");
+		drop(a);
 		let b = SegmentStore::open_scoped(dir.path(), "d", "subject-b").await.expect("opens");
 		let seen_by_b = b.schema_for("temp").await.expect("looks up");
+		drop(b);
+		let a = SegmentStore::open_scoped(dir.path(), "d", "subject-a").await.expect("reopens");
 		let seen_by_a = a.schema_for("temp").await.expect("looks up");
 		drop(a);
-		drop(b);
 		assert_eq!(seen_by_a, Some(schema()));
 		assert_eq!(seen_by_b, None, "a sibling subject does not see the declaration");
+	}
+
+	#[tokio::test]
+	async fn the_open_fsyncs_every_directory_it_created_and_the_parent_above_them() {
+		let dir = TempDir::new().expect("tempdir");
+		let paths = |names: &[&str]| -> Vec<PathBuf> { names.iter().map(|n| dir.path().join(n)).collect() };
+
+		// An existing root: just `segments/` and the root.
+		std::fs::create_dir(dir.path().join("existing")).unwrap();
+		let segments = dir.path().join("existing/segments");
+		let created = missing_dirs(&segments).await;
+		assert_eq!(created, paths(&["existing/segments"]));
+		assert_eq!(layout_dirs(&dir.path().join("existing"), &segments, &created), paths(&["existing/segments", "existing"]));
+
+		// A root two levels below an existing directory: every created directory, then the
+		// existing parent that holds the topmost one.
+		let segments = dir.path().join("a/b/segments");
+		let created = missing_dirs(&segments).await;
+		assert_eq!(created, paths(&["a/b/segments", "a/b", "a"]));
+		let mut expected = paths(&["a/b/segments", "a/b", "a"]);
+		expected.push(dir.path().to_path_buf());
+		assert_eq!(layout_dirs(&dir.path().join("a/b"), &segments, &created), expected);
+
+		// A bare relative root's parent is the working directory.
+		let created = [PathBuf::from("store/segments"), PathBuf::from("store")];
+		assert_eq!(layout_dirs(Path::new("store"), Path::new("store/segments"), &created), vec![PathBuf::from("store/segments"), PathBuf::from("store"), PathBuf::from(".")]);
+
+		// And a real open of a fresh nested root succeeds, which it cannot unless every one
+		// of those fsyncs did.
+		drop(SegmentStore::open(dir.path().join("a/b")).await.expect("opens a fresh nested root"));
+	}
+
+	/// The database and subject rows a root's catalog holds, read without opening a
+	/// store (which would register a scope of its own).
+	async fn registered_scopes(root: &Path) -> (Vec<String>, Vec<String>) {
+		let catalog = CatalogStore::open(&root.join("catalog.db").to_string_lossy()).await.expect("opens the catalog");
+		let databases = catalog.list_databases().await.expect("lists databases");
+		let subjects = catalog.list_subjects("market").await.expect("lists subjects");
+		drop(catalog);
+		(databases, subjects)
+	}
+
+	#[tokio::test]
+	async fn a_second_open_of_a_root_is_refused_until_the_first_store_drops() {
+		let dir = TempDir::new().expect("tempdir");
+		let first = SegmentStore::open_scoped(dir.path(), "market", "BTCUSD").await.expect("opens");
+		// The same scope and a different one are refused alike: the root is the unit.
+		for (database, subject) in [("market", "BTCUSD"), ("iot", "sensor-7")] {
+			let err = SegmentStore::open_scoped(dir.path(), database, subject).await.err().unwrap_or_else(|| panic!("{database}/{subject}: a second open of a held root must be refused"));
+			let locked = err.downcast_ref::<StoreLocked>().unwrap_or_else(|| panic!("{database}/{subject}: expected StoreLocked, got {err:#}"));
+			assert_eq!(locked.root, dir.path());
+			let holder = locked.holder.as_ref().expect("the holder's record is readable");
+			assert_eq!(holder.pid, std::process::id(), "the error names the holding process");
+			assert!(err.to_string().contains(&format!("in use by pid {}", std::process::id())), "{err}");
+		}
+		drop(first);
+		assert_eq!(registered_scopes(dir.path()).await.0, vec!["market".to_string()], "a refused open registers nothing");
+
+		let second = SegmentStore::open_scoped(dir.path(), "iot", "sensor-7").await.expect("the root is free once the first store drops");
+		drop(second);
+	}
+
+	/// Hold the database at `path` open in this process in a mode that cannot run MVCC:
+	/// multiprocess WAL. Turso shares one instance per file within a process, so a
+	/// store that opens the same file gets this instance and its switch to MVCC fails.
+	async fn hold_without_mvcc(path: &Path) -> turso::Database {
+		let db = turso::Builder::new_local(&path.to_string_lossy()).experimental_multiprocess_wal(true).build().await.expect("opens in multiprocess WAL mode");
+		let conn = db.connect().expect("connects");
+		conn.execute("CREATE TABLE IF NOT EXISTS placeholder (x INTEGER)", turso::params![]).await.expect("creates the file's schema");
+		drop(conn);
+		db
+	}
+
+	/// Every COMMIT in the control plane relies on MVCC: `BEGIN CONCURRENT`, and a log
+	/// that is fsynced before COMMIT returns. Before S3 a failed switch to MVCC was
+	/// discarded with `.ok()`, and the store opened and committed in WAL mode.
+	#[tokio::test]
+	async fn an_open_fails_closed_when_a_database_cannot_run_mvcc() {
+		for file in crate::CONTROL_PLANE_FILES {
+			let dir = TempDir::new().expect("tempdir");
+			let held = hold_without_mvcc(&dir.path().join(file)).await;
+			let err = SegmentStore::open(dir.path()).await.err().unwrap_or_else(|| panic!("{file}: the store opened although {file} cannot run MVCC"));
+			let message = format!("{err:#}");
+			assert!(message.contains(file), "{file}: the error names the database: {message}");
+			assert!(message.contains("MVCC"), "{file}: the error names the missing journal mode: {message}");
+			drop(held);
+			let store = SegmentStore::open(dir.path()).await.unwrap_or_else(|e| panic!("{file}: the root opens once nothing pins it out of MVCC: {e:#}"));
+			drop(store);
+		}
+	}
+
+	/// Set only in the child process `run_open_child` starts: the root to open.
+	const OPEN_CHILD_ROOT: &str = "WEFT_TEST_OPEN_CHILD_ROOT";
+
+	/// The body the re-executed child of
+	/// `register_scope_is_atomic_across_a_crash_between_its_rows` runs: open
+	/// `market/BTCUSD` at the root it is given, under the fault the parent put in
+	/// `WEFT_FAULT`. In a normal test run the variable is unset and this does nothing.
+	#[tokio::test]
+	async fn open_scoped_child() {
+		let Some(root) = std::env::var_os(OPEN_CHILD_ROOT) else { return };
+		crate::types::durable::fault::suppress_core_dump();
+		// Returns only when the point is armed with `err` rather than `abort`.
+		let err = SegmentStore::open_scoped(PathBuf::from(root), "market", "BTCUSD").await.err().expect("the open stops at the armed fault");
+		assert!(format!("{err:#}").contains("injected fault at O-scope-database-inserted"), "{err:#}");
+	}
+
+	/// Run [`open_scoped_child`] at `root` in a fresh process with `WEFT_FAULT=<spec>`.
+	/// A child, because fault points are process-global and every concurrently running
+	/// test's open passes this one.
+	async fn run_open_child(root: &Path, spec: &str) -> std::process::Output {
+		let exe = std::env::current_exe().expect("finds the test binary");
+		tokio::process::Command::new(exe).args(["types::segment_store::tests::open_scoped_child", "--exact", "--nocapture", "--test-threads=1"]).env(OPEN_CHILD_ROOT, root).env(crate::types::durable::fault::FAULT_ENV, spec).output().await.expect("runs the child")
+	}
+
+	/// Window open-scoped-register-database-then-subject: an open registers its
+	/// database and subject in one catalog transaction, so a crash between the two
+	/// inserts leaves neither row. Before S3 they were two commits, and a crash between
+	/// them left a database without the subject the open was for.
+	#[tokio::test]
+	async fn register_scope_is_atomic_across_a_crash_between_its_rows() {
+		for spec in ["O-scope-database-inserted:err", "O-scope-database-inserted:abort"] {
+			let dir = TempDir::new().expect("tempdir");
+			let out = run_open_child(dir.path(), spec).await;
+			let stderr = String::from_utf8_lossy(&out.stderr);
+			if spec.ends_with(":abort") {
+				assert!(!out.status.success(), "{spec}: the child aborted: {out:?}");
+				#[cfg(unix)]
+				{
+					use std::os::unix::process::ExitStatusExt;
+					assert_eq!(out.status.signal(), Some(6), "{spec}: killed by SIGABRT: {out:?}");
+				}
+				assert!(stderr.contains("aborting at fault point O-scope-database-inserted"), "{spec}: {stderr}");
+			} else {
+				assert!(out.status.success(), "{spec}: the child saw the injected error: {out:?}");
+				assert!(String::from_utf8_lossy(&out.stdout).contains("1 passed"), "{spec}: the child really ran the open: {out:?}");
+			}
+			assert_eq!(registered_scopes(dir.path()).await, (Vec::new(), Vec::new()), "{spec}: a crash between the two inserts registers neither row");
+
+			let store = SegmentStore::open_scoped(dir.path(), "market", "BTCUSD").await.expect("the next open succeeds");
+			drop(store);
+			assert_eq!(registered_scopes(dir.path()).await, (vec!["market".to_string()], vec!["BTCUSD".to_string()]), "{spec}: the next open registers the whole scope");
+		}
 	}
 
 	#[tokio::test]

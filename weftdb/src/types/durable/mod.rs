@@ -17,10 +17,13 @@
 //!   not.
 //! - [`fault`] marks the steps of each commit protocol so the crash tests can fail,
 //!   abort or pause there. Without the feature, a fault point compiles to nothing.
+//! - `control_plane` proves at open that each control-plane database really runs
+//!   MVCC and syncs FULL, instead of trusting the pragmas that ask for it.
 //!
-//! Nothing in the store calls this module yet: S3 takes the root lock at open, and
-//! S5 onwards route their writes through it.
+//! `SegmentStore::open_scoped` takes the root lock, runs the control-plane probes and
+//! fsyncs the root's directories (S3). S5 onwards route their writes through the rest.
 
+pub(crate) mod control_plane;
 pub mod dirsync;
 pub mod fault;
 pub mod fs;

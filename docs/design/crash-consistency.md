@@ -326,7 +326,7 @@ This single transaction replaces today's separate commits at segment_store.rs:99
 2. Open the four DBs. Probe `PRAGMA journal_mode` and fail the open unless it reports MVCC. Probe `PRAGMA synchronous` on a fresh connection and fail unless it is FULL. This replaces the `.ok()` at segment_index.rs:94, metadata.rs:158, catalog.rs:56 and aspect_catalog.rs:44.
 3. Run the schema migration.
 4. Register database and subject in **one** catalog transaction. Today these are two commits (segment_store.rs:289-290 → catalog.rs:119-160).
-5. fsync `segments/` and the root once, which covers the DB files and their `-log` entries.
+5. fsync `segments/` and the root once, which covers the DB files and their `-log` entries. When the open created the root, the directories it created above it and the parent of the topmost one are fsynced too, so the root itself survives a power cut.
 6. Run recovery (section 6).
 7. The server binds its listener only after `build_state` returns (weft-server/src/main.rs:98-102), so no request is served before recovery finishes.
 
@@ -577,6 +577,7 @@ Expected results, to be measured in S10 and S21 rather than assumed:
 | Recovery | each of R1-R13 |
 | Backup / restore | B-partial-created, B-vacuum(k), B-links, B-manifest, B-renamed, prune-renamed, prune-removed, restore-copied(k), restore-renamed |
 | Legacy | L-enqueued, L-chunk(k), L-sealed, L-consumer-batches, L-new-created, L-new-renamed |
+| Open | O-scope-database-inserted (S3: between the two inserts of `register_scope`) |
 
 **Process-crash matrix.** Each point × each applicable op, where the ops are seal (dense, nullable, paged), multi-frame ingest, reconcile, split, overlap-full, overlap-split, squash, compact, reaper, recovery itself, backup, prune, restore, legacy ingest and `Database::new`. Each case uses ReturnErr, plus Abort for a sampled subset.
 
