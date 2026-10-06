@@ -15,12 +15,15 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `/api/v1/interpolate*` endpoint. A larger grid is a `400` that names its size and the
   limit, refused before anything is allocated; before, a fine resolution over a long
   range tried to allocate all of it.
-- **`weft-server` calibrates the interpolation backends at startup.** Before serving,
-  it runs `splimes::calibrate()` once on a blocking thread: that starts the GPU if there
-  is one, times the single-thread, rayon and GPU backends, and sets where
-  `Backend::Auto` switches between them. The adapter (or why there is none) and the
-  thresholds are logged. It takes several seconds and never fails startup; set
-  `WEFT_GPU_CALIBRATE=0` to skip it. Without it, splimes 1.0 never uses the GPU.
+- **`weft-server` calibrates the interpolation backends at startup.** Once the listener
+  is bound, it runs `splimes::calibrate()` once in the background on a blocking thread:
+  that starts the GPU if there is one, times the single-thread, rayon and GPU backends,
+  and sets where `Backend::Auto` switches between them. It takes several seconds and
+  never delays serving or fails startup; until it finishes, requests interpolate on the
+  CPU with splimes' default thresholds. The adapter (or why there is none) and the
+  thresholds are logged. A CPU/software adapter (llvmpipe, lavapipe, WARP) is not
+  calibrated unless `WEFT_GPU_CALIBRATE=force`; `WEFT_GPU_CALIBRATE=0` skips calibration.
+  Without it, splimes 1.0 never uses the GPU.
 
 ### Changed
 

@@ -508,7 +508,7 @@ WeftDB is configured primarily through environment variables:
 | `WEFT_DATA_DIR` | `weftdb`, `weft-tui` | Root directory for database files **and** the TUI log (`weft-tui.log`). | portable per-user default (see below) |
 | `TEST_DATA_DIR` | `weftdb` | Highest-priority override for the database root (used by the test suite). | unset |
 | `WEFT_SERVER_ADDR` | `weft-server` | HTTP bind address. | `127.0.0.1:8080` |
-| `WEFT_GPU_CALIBRATE` | `weft-server` | `0` (or `false`/`no`/`off`) skips the startup calibration. Otherwise, before serving, the server runs `splimes::calibrate()` once on a blocking thread: it starts the GPU if there is one, times the single-thread, rayon and GPU backends on grids up to 16 Mi points (several seconds, a few hundred MB), and sets where `Backend::Auto` switches between them. It logs the adapter (or why there is none) and the thresholds, and never fails startup; skipped or failed, interpolation stays on the CPU with splimes' defaults. | unset (calibrate) |
+| `WEFT_GPU_CALIBRATE` | `weft-server` | Startup calibration. By default, once the listener is bound, the server runs `splimes::calibrate()` once in the background on a blocking thread: it starts the GPU if there is one, times the single-thread, rayon and GPU backends on grids up to 16 Mi points (several seconds, a few hundred MB), and sets where `Backend::Auto` switches between them. Requests are served from the start and interpolate on the CPU with splimes' default thresholds until it finishes. A CPU/software adapter (llvmpipe, lavapipe, WARP) is not calibrated, with a log line saying why; `force` calibrates it anyway. `0` (or `false`/`no`/`off`) skips calibration. It logs the adapter (or why there is none) and the thresholds, and never fails startup; skipped or failed, interpolation stays on the CPU with splimes' defaults. | unset (calibrate, except a software adapter) |
 | `WEFT_SEGMENT_STORE_ROOT` | `weft-server` | Root of the Storage v2 segment store; enables the `/storage` endpoints. | unset (storage endpoints answer `503`) |
 | `WEFT_RECONCILE_INTERVAL_SECS` | `weft-server` | Background reconcile daemon sweep interval in seconds; `0`/unset disables it. | unset (disabled) |
 | `WEFT_RECONCILE_THRESHOLD` | `weft-server` | `unsorted_segments` backlog an aspect must reach before the daemon reconciles it. | `1` |
@@ -553,8 +553,8 @@ The `splimes` crate also exposes build features:
 | `serde` *(default)* | `Serialize`/`Deserialize` for `Point`, `PointKind`, `Resolution` and `Spline`. |
 | `tokio` | `Interpolator::run_async`, which runs an interpolation on tokio's blocking pool. WeftDB enables it: every async caller (the `weftdb` read and compression paths, `weft-server`, the bench adapter) interpolates off the async workers. |
 
-The GPU is started at runtime, not at build time: `weft-server` calibrates it at
-startup (`WEFT_GPU_CALIBRATE`, above), and an embedding program calls
+The GPU is started at runtime, not at build time: `weft-server` calibrates it in the
+background at startup (`WEFT_GPU_CALIBRATE`, above), and an embedding program calls
 `splimes::calibrate()` or `splimes::prewarm_gpu()` itself.
 
 ---
@@ -813,7 +813,8 @@ grid size, using `AutoThresholds`:
 
 `Auto` never starts the GPU itself. `splimes::calibrate()` starts it, times every
 backend on this machine and sets the thresholds to the measured crossovers;
-`weft-server` runs it once at startup (`WEFT_GPU_CALIBRATE=0` skips it). Otherwise:
+`weft-server` runs it once in the background at startup, skipping a CPU/software
+adapter (`WEFT_GPU_CALIBRATE=0` skips it, `force` calibrates any adapter). Otherwise:
 
 - `splimes::prewarm_gpu()` starts the GPU and returns its `GpuInfo` (adapter, API,
   device type, driver, `f64` support); then set thresholds with
@@ -1335,7 +1336,7 @@ columnar segments throughout.
   TTL/LRU cache (default: 50 connections, 30-minute TTL) and starts MVCC
   `BEGIN CONCURRENT` transactions automatically, with retry + backoff on
   transient failures.
-- **Calibrate the backends once.** `weft-server` does it at startup; a program
+- **Calibrate the backends once.** `weft-server` does it in the background at startup; a program
   embedding the libraries calls `splimes::calibrate()` (or `splimes::prewarm_gpu()`
   plus `splimes::set_auto_thresholds`) once, off any latency-critical path. Without
   it, interpolation never uses the GPU.
