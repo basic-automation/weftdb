@@ -42,6 +42,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   by `weftdb::units_between`, with the same results.
 - `Resolution` names parse case-insensitively (`Hours`, `HOURS`), for example in
   `WEFT_SEGMENT_PARTIAL_BASE`, which ignored anything but lowercase before.
+- **`weft-server` provenance comes from splimes.** The `kind` of each interpolated
+  point (JSON, CSV, Arrow, Parquet, and the point query) is splimes' `PointKind`, with
+  the same `raw` / `interpolated` / `extrapolated` tokens, and `weft_server::PointKind`
+  is now a re-export of it. It agrees with the classification `weft-server` did itself
+  except at a leap second: an input at `23:59:60.5` and a grid instant at `00:00:00.5`
+  the next day are one POSIX instant, so that point is now `raw` (it was `extrapolated`
+  or `interpolated`).
 
 ### Fixed
 

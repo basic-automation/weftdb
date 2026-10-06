@@ -25,6 +25,11 @@ use axum::{
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+/// Provenance of a reconstructed value: `raw` (the grid point coincides with an input
+/// observation), `interpolated` (strictly inside the observed span) or `extrapolated`
+/// (outside it). splimes reports it for every output point, serialised as those
+/// lowercase tokens.
+pub use splimes::PointKind;
 use splimes::{Interpolator, Point, Resolution, Spline};
 use tracing::Instrument as _;
 use weft_line_protocol::TimestampPrecision;
@@ -51,35 +56,6 @@ pub struct OutputPoint {
 	/// observation), `interpolated` (within the observed span), or `extrapolated`
 	/// (outside it).
 	pub kind: PointKind,
-}
-
-/// Provenance of a reconstructed value.
-///
-/// Lets a caller never silently treat a synthetic point as an observed one (the
-/// Phase-2 raw/interpolated/extrapolated distinction — backlog item B-tags,
-/// synthetic-point marking).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PointKind {
-	/// The output timestamp coincides with an input observation.
-	Raw,
-	/// The timestamp lies within `[min_ts, max_ts]` of the inputs (and is not raw).
-	Interpolated,
-	/// The timestamp lies outside the observed span.
-	Extrapolated,
-}
-
-/// Classify an output timestamp against the input observations: `Raw` if it
-/// coincides with an input, else `Extrapolated` when outside the observed span,
-/// else `Interpolated`.
-fn classify(timestamp: DateTime<Utc>, input_timestamps: &std::collections::HashSet<DateTime<Utc>>, min_ts: Option<DateTime<Utc>>, max_ts: Option<DateTime<Utc>>) -> PointKind {
-	if input_timestamps.contains(&timestamp) {
-		return PointKind::Raw;
-	}
-	match (min_ts, max_ts) {
-		(Some(lo), Some(hi)) if timestamp < lo || timestamp > hi => PointKind::Extrapolated,
-		_ => PointKind::Interpolated,
-	}
 }
 
 /// Spline method selector. Mirrors [`splimes::Spline`] but with stable,
@@ -305,34 +281,19 @@ async fn run_interpolation(points: Vec<Point>, start: DateTime<Utc>, end: DateTi
 	let spline_label = spline.to_string();
 	let resolution_label = format!("{resolution:?}");
 
-	// Capture input provenance before the engine consumes the points, so each
-	// output grid point can be marked raw / interpolated / extrapolated.
-	let input_timestamps: std::collections::HashSet<DateTime<Utc>> = points.iter().map(|p| p.timestamp).collect();
-	let min_ts = points.iter().map(|p| p.timestamp).min();
-	let max_ts = points.iter().map(|p| p.timestamp).max();
-
 	// `interpolate.compute` child span (roadmap Phase 3): the spline engine kernel
-	// itself, on tokio's blocking pool, isolated from the surrounding provenance capture
-	// and result shaping so the dominant compute cost is attributable on its own.
+	// itself, on tokio's blocking pool, isolated from the result shaping so the
+	// dominant compute cost is attributable on its own. splimes labels every output
+	// point raw / interpolated / extrapolated as it goes.
 	let output = Interpolator::new(spline, resolution).run_async(points, start, end).instrument(tracing::info_span!("interpolate.compute")).await.map_err(|err| ApiError::internal(err.to_string()))?;
 
 	// `interpolate.serialize` child span (roadmap Phase 3): the `BigDecimal` → wire-f64
-	// conversion and raw/interpolated/extrapolated provenance marking of every output
-	// grid point — the result-shaping stage timed apart from the kernel.
-	let points: Vec<OutputPoint> = tracing::info_span!("interpolate.serialize", output_points = output.len()).in_scope(|| output.iter().map(|(timestamp, value, _)| OutputPoint { timestamp, value: value.to_f64().unwrap_or_default(), kind: classify(timestamp, &input_timestamps, min_ts, max_ts) }).collect());
+	// conversion of every output grid point, with its provenance — the result-shaping
+	// stage timed apart from the kernel.
+	let points: Vec<OutputPoint> = tracing::info_span!("interpolate.serialize", output_points = output.len()).in_scope(|| output.iter().map(|(timestamp, value, kind)| OutputPoint { timestamp, value: value.to_f64().unwrap_or_default(), kind }).collect());
 
 	tracing::Span::current().record("output_points", points.len());
 	Ok(Json(InterpolateResponse { spline: spline_label, resolution: resolution_label, output_points: points.len(), input_points, points }))
-}
-
-/// The stable lowercase CSV token for a point's provenance (matches the JSON
-/// `kind` serialization).
-const fn kind_token(kind: PointKind) -> &'static str {
-	match kind {
-		PointKind::Raw => "raw",
-		PointKind::Interpolated => "interpolated",
-		PointKind::Extrapolated => "extrapolated",
-	}
 }
 
 /// Render an [`InterpolateResponse`] as a `timestamp,value,kind` CSV document.
@@ -348,7 +309,7 @@ fn interpolate_response_to_csv(response: &InterpolateResponse) -> Response {
 	use std::fmt::Write as _;
 	let mut out = String::from("timestamp,value,kind\n");
 	for point in &response.points {
-		let _ = writeln!(out, "{},{},{}", point.timestamp.to_rfc3339(), point.value, kind_token(point.kind));
+		let _ = writeln!(out, "{},{},{}", point.timestamp.to_rfc3339(), point.value, point.kind.as_str());
 	}
 	([(header::CONTENT_TYPE, "text/csv; charset=utf-8")], out).into_response()
 }
@@ -373,7 +334,7 @@ fn response_columns(response: &InterpolateResponse) -> (Vec<i64>, Vec<f64>, Vec<
 	for point in &response.points {
 		timestamps.push(point.timestamp.timestamp_nanos_opt().unwrap_or_default());
 		values.push(point.value);
-		kinds.push(kind_token(point.kind));
+		kinds.push(point.kind.as_str());
 	}
 	(timestamps, values, kinds)
 }
@@ -531,21 +492,17 @@ async fn interpolate_point_inner(request: PointRequest) -> Result<Json<PointResp
 		points.push(Point::new(sample.timestamp, value));
 	}
 
-	let input_timestamps: std::collections::HashSet<DateTime<Utc>> = points.iter().map(|p| p.timestamp).collect();
-	let min_ts = points.iter().map(|p| p.timestamp).min();
-	let max_ts = points.iter().map(|p| p.timestamp).max();
-	let kind = classify(instant, &input_timestamps, min_ts, max_ts);
-
 	let spline: Spline = spline.into();
 	let spline_label = spline.to_string();
 
 	// Evaluate the fitted spline at the single instant: a grid with `start == end` is
-	// exactly that one instant. (The resolution only sets the step, which a one-point
-	// grid never takes.)
+	// exactly that one instant, and splimes labels it raw / interpolated / extrapolated
+	// against the inputs. (The resolution only sets the step, which a one-point grid
+	// never takes.)
 	let output = Interpolator::new(spline, Resolution::Nanoseconds).run_async(points, instant, instant).await.map_err(|err| ApiError::internal(err.to_string()))?;
-	let value = output.values().first().ok_or_else(|| ApiError::internal("interpolation produced no value at the instant"))?.to_f64().unwrap_or_default();
+	let (_, value, kind) = output.iter().next().ok_or_else(|| ApiError::internal("interpolation produced no value at the instant"))?;
 
-	Ok(Json(PointResponse { spline: spline_label, instant, input_points: input.len(), value, kind }))
+	Ok(Json(PointResponse { spline: spline_label, instant, input_points: input.len(), value: value.to_f64().unwrap_or_default(), kind }))
 }
 
 /// Query parameters for the ILP interpolation endpoint.
@@ -1040,10 +997,13 @@ mod tests {
 	}
 
 	#[test]
-	fn kind_token_maps_each_provenance() {
-		assert_eq!(kind_token(PointKind::Raw), "raw");
-		assert_eq!(kind_token(PointKind::Interpolated), "interpolated");
-		assert_eq!(kind_token(PointKind::Extrapolated), "extrapolated");
+	fn provenance_tokens_are_unchanged() {
+		// splimes' `PointKind` replaced WeftDB's own enum; the wire tokens (JSON `kind`,
+		// the CSV and Arrow/Parquet `kind` column) must be exactly the ones it had.
+		for (kind, token) in [(PointKind::Raw, "raw"), (PointKind::Interpolated, "interpolated"), (PointKind::Extrapolated, "extrapolated")] {
+			assert_eq!(kind.as_str(), token);
+			assert_eq!(serde_json::to_value(kind).unwrap(), serde_json::json!(token));
+		}
 	}
 
 	#[tokio::test]
@@ -1057,6 +1017,27 @@ mod tests {
 		assert_eq!(body["points"][0]["timestamp"], "1970-01-01T00:00:30Z");
 		assert_eq!(body["points"][0]["value"], 4.5);
 		assert_eq!(body["points"][0]["kind"], "raw");
+	}
+
+	#[tokio::test]
+	async fn provenance_folds_a_leap_second_onto_the_next_second() {
+		// The one case where splimes' `PointKind` differs from the `classify` WeftDB used
+		// before: time is on the POSIX scale, so an input at 23:59:60.5 is the same instant
+		// as 00:00:00.5 the next day, and a grid point there is `raw` (with that input's
+		// value). `classify` compared chrono values, which differ, and since chrono orders
+		// the leap second before midnight it called the point `extrapolated`.
+		let body = serde_json::json!({
+			"spline": "linear",
+			"instant": "2017-01-01T00:00:00.5Z",
+			"points": [
+				{ "timestamp": "2016-12-31T23:59:59Z", "value": 0.0 },
+				{ "timestamp": "2016-12-31T23:59:60.5Z", "value": 7.0 },
+			],
+		});
+		let (status, body) = post_json("/api/v1/interpolate/point", body).await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["kind"], "raw", "body: {body}");
+		assert_eq!(body["value"], 7.0);
 	}
 
 	/// POST a JSON body and return `(status, content-type, raw bytes)`.
