@@ -11,17 +11,37 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 ### Changed
 
 - **`splimes` moved to its own repository** ([basic-automation/splimes](https://github.com/basic-automation/splimes))
-  and is now a crates.io dependency (`splimes = "0.1"`). It is released on its own
-  schedule, and a stable WeftDB waits on a stable splimes.
-- **Turso control plane upgraded 0.6 → 0.8.** ⚠️ This is one-way: once 0.8 writes a
-  store, its MVCC log is v3 and an older WeftDB can no longer open it. Back up the
-  control plane before upgrading.
-- **`.weftpart` sidecars use `postcard` instead of `bincode`** (frame v3). Sidecars
-  written by older versions are ignored: the segment is decoded instead, and the
-  sidecar is rebuilt on the next seal. No data migration is needed.
-- All dependencies updated to their latest major versions, including wgpu 30,
-  Arrow/Parquet 60 and OpenTelemetry 0.33.
-- Builds on stable Rust (MSRV 1.95); nightly is no longer required.
+  and is now a crates.io dependency. It is released on its own schedule, and a stable
+  WeftDB waits on a stable splimes.
+- **splimes 0.1 → 1.0.** WeftDB depends on `splimes = "1"`, built against the
+  `release/1.0` commit through a temporary `[patch.crates-io]` until 1.0.0 is on
+  crates.io. splimes' [migration guide](https://github.com/basic-automation/splimes/blob/main/MIGRATING.md)
+  lists the results that change; through WeftDB:
+  - large inputs keep their method (0.1 swapped cubic for quadratic from 2,500 input
+    points and for linear from 5,000);
+  - `Polynomial(1 | 2 | 3, b)` stays a polynomial, so it extends outside the data
+    instead of holding flat, and with too few points a polynomial steps down to degree
+    `n − 1` rather than to `Cubic`/`Quadratic`/`Linear`;
+  - a polynomial degree above 8 is an error instead of being capped at 8;
+  - a zero-span range returns its one point: `POST /api/v1/interpolate` with a single
+    input point and no explicit range answers `200` with that point (it was a `500`);
+  - points that coincide with an input return that input's value exactly, and
+    interpolated `BigDecimal`s are the shortest decimal that round-trips;
+  - time is exact to the nanosecond at every resolution, duplicate timestamps keep the
+    last value, and a leap second is the same instant as the start of the next second;
+  - `Backend::Auto` uses the GPU only once the program has started it.
+- **No interpolation runs on an async worker.** splimes 1.0 is synchronous; `weftdb`'s
+  `analyze_point`, `analyze_range` and compression, every `weft-server` interpolation
+  endpoint, and the Weft-Bench WeftDB adapter run it on tokio's blocking pool
+  (`Interpolator::run_async`, splimes' `tokio` feature). 0.1's `async` functions
+  computed on the calling worker.
+- **Downsample buckets don't move.** splimes 1.0 removed `Resolution::to_base` and the
+  `SECONDS_IN_*` constants; the new `weft_reduce::bucket_index` reproduces 0.1's index
+  exactly, including its rounding toward zero before 1970, so bucket edges and the keys
+  of persisted `.weftpart` sidecars are unchanged. `Resolution::difference` is replaced
+  by `weftdb::units_between`, with the same results.
+- `Resolution` names parse case-insensitively (`Hours`, `HOURS`), for example in
+  `WEFT_SEGMENT_PARTIAL_BASE`, which ignored anything but lowercase before.
 
 ### Fixed
 

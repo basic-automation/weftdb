@@ -3068,6 +3068,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "pollster"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f3a9f18d041e6d0e102a0a46750538147e5e8992d3b4873aaafee2520b00ce3"
+
+[[package]]
 name = "polyval"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3935,22 +3941,19 @@ dependencies = [
 
 [[package]]
 name = "splimes"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebd610de5921e679aa80f32a52ed359eca76810fb3f164bb1385e5904e2bfec2"
+version = "1.0.0"
+source = "git+https://github.com/basic-automation/splimes?rev=1bee9dd5493f830a9eded00812522725faac68b7#1bee9dd5493f830a9eded00812522725faac68b7"
 dependencies = [
- "anyhow",
  "bigdecimal",
  "bytemuck",
  "chrono",
+ "log",
+ "pollster",
  "rayon",
  "serde",
- "sysinfo",
- "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "wgpu",
- "wide",
 ]
 
 [[package]]

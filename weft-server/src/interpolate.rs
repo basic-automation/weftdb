@@ -1,10 +1,14 @@
 //! The interpolation endpoint (`POST /api/v1/interpolate`).
 //!
 //! This is the first benchmark-grade *capability* endpoint on the Phase-2 API:
-//! it drives WeftDB's flagship interpolation-on-read path (`splimes::auto_interpolate`,
-//! which selects CPU / SIMD / parallel / GPU strategies internally) through plain
-//! HTTP + JSON, exactly the surface Weft-Bench and external clients need so they no
-//! longer have to embed the Rust API to exercise the engine.
+//! it drives WeftDB's flagship interpolation-on-read path (splimes' [`Interpolator`],
+//! whose default `Backend::Auto` picks the serial, rayon or — once the program has
+//! started it — GPU backend by grid size) through plain HTTP + JSON, exactly the surface
+//! Weft-Bench and external clients need so they no longer have to embed the Rust API
+//! to exercise the engine.
+//!
+//! splimes is synchronous and CPU-bound, so every call runs on tokio's blocking pool
+//! (`Interpolator::run_async`), never on an async worker.
 //!
 //! ## Numeric boundary (deliberate, documented)
 //!
@@ -21,7 +25,7 @@ use axum::{
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use splimes::{Point, Resolution, Spline};
+use splimes::{Interpolator, Point, Resolution, Spline};
 use tracing::Instrument as _;
 use weft_line_protocol::TimestampPrecision;
 
@@ -293,7 +297,7 @@ async fn interpolate_inner(request: InterpolateRequest) -> Result<Json<Interpola
 /// provenance shaping) child spans; the f64 → `BigDecimal` input lift is timed by the
 /// sibling `interpolate.parse` span in [`interpolate_inner`].
 #[tracing::instrument(name = "interpolate.engine", skip_all, fields(input_points = input_points, spline = %spline, resolution = ?resolution, output_points = tracing::field::Empty))]
-async fn run_interpolation(mut points: Vec<Point>, start: DateTime<Utc>, end: DateTime<Utc>, spline: Spline, resolution: Resolution, input_points: usize) -> Result<Json<InterpolateResponse>, ApiError> {
+async fn run_interpolation(points: Vec<Point>, start: DateTime<Utc>, end: DateTime<Utc>, spline: Spline, resolution: Resolution, input_points: usize) -> Result<Json<InterpolateResponse>, ApiError> {
 	if end < start {
 		return Err(ApiError::bad_request("`end` must not be before `start`"));
 	}
@@ -308,14 +312,14 @@ async fn run_interpolation(mut points: Vec<Point>, start: DateTime<Utc>, end: Da
 	let max_ts = points.iter().map(|p| p.timestamp).max();
 
 	// `interpolate.compute` child span (roadmap Phase 3): the spline engine kernel
-	// itself, isolated from the surrounding provenance capture and result shaping so
-	// the dominant compute cost is attributable on its own.
-	let output = splimes::auto_interpolate(&mut points, start, end, resolution, spline).instrument(tracing::info_span!("interpolate.compute")).await.map_err(|err| ApiError::internal(err.to_string()))?;
+	// itself, on tokio's blocking pool, isolated from the surrounding provenance capture
+	// and result shaping so the dominant compute cost is attributable on its own.
+	let output = Interpolator::new(spline, resolution).run_async(points, start, end).instrument(tracing::info_span!("interpolate.compute")).await.map_err(|err| ApiError::internal(err.to_string()))?;
 
 	// `interpolate.serialize` child span (roadmap Phase 3): the `BigDecimal` → wire-f64
 	// conversion and raw/interpolated/extrapolated provenance marking of every output
 	// grid point — the result-shaping stage timed apart from the kernel.
-	let points: Vec<OutputPoint> = tracing::info_span!("interpolate.serialize", output_points = output.len()).in_scope(|| output.iter().map(|p| OutputPoint { timestamp: p.timestamp, value: p.value.to_f64().unwrap_or_default(), kind: classify(p.timestamp, &input_timestamps, min_ts, max_ts) }).collect());
+	let points: Vec<OutputPoint> = tracing::info_span!("interpolate.serialize", output_points = output.len()).in_scope(|| output.iter().map(|(timestamp, value, _)| OutputPoint { timestamp, value: value.to_f64().unwrap_or_default(), kind: classify(timestamp, &input_timestamps, min_ts, max_ts) }).collect());
 
 	tracing::Span::current().record("output_points", points.len());
 	Ok(Json(InterpolateResponse { spline: spline_label, resolution: resolution_label, output_points: points.len(), input_points, points }))
@@ -535,14 +539,11 @@ async fn interpolate_point_inner(request: PointRequest) -> Result<Json<PointResp
 	let spline: Spline = spline.into();
 	let spline_label = spline.to_string();
 
-	// Evaluate the fitted spline at the single instant: the spline's value at
-	// `instant` is independent of the rest of the output grid, so we interpolate a
-	// minimal nanosecond-wide grid that begins at the instant and read the value
-	// back at the instant itself (the first grid point). `auto_interpolate`
-	// rejects a zero-span range, hence the `+1ns` end.
-	let end = instant + Resolution::Nanoseconds.to_step();
-	let output = splimes::auto_interpolate(&mut points, instant, end, Resolution::Nanoseconds, spline).await.map_err(|err| ApiError::internal(err.to_string()))?;
-	let value = output.first().ok_or_else(|| ApiError::internal("interpolation produced no value at the instant"))?.value.to_f64().unwrap_or_default();
+	// Evaluate the fitted spline at the single instant: a grid with `start == end` is
+	// exactly that one instant. (The resolution only sets the step, which a one-point
+	// grid never takes.)
+	let output = Interpolator::new(spline, Resolution::Nanoseconds).run_async(points, instant, instant).await.map_err(|err| ApiError::internal(err.to_string()))?;
+	let value = output.values().first().ok_or_else(|| ApiError::internal("interpolation produced no value at the instant"))?.to_f64().unwrap_or_default();
 
 	Ok(Json(PointResponse { spline: spline_label, instant, input_points: input.len(), value, kind }))
 }
@@ -1043,6 +1044,19 @@ mod tests {
 		assert_eq!(kind_token(PointKind::Raw), "raw");
 		assert_eq!(kind_token(PointKind::Interpolated), "interpolated");
 		assert_eq!(kind_token(PointKind::Extrapolated), "extrapolated");
+	}
+
+	#[tokio::test]
+	async fn a_single_input_point_reconstructs_to_that_point() {
+		// One sample and no explicit range makes `start == end`; splimes 1.0 returns the
+		// one-point grid (0.1 refused a zero-span range, which surfaced as a 500).
+		let body = serde_json::json!({ "points": [ { "timestamp": ts(30), "value": 4.5 } ] });
+		let (status, body) = post_json("/api/v1/interpolate", body).await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["output_points"], 1);
+		assert_eq!(body["points"][0]["timestamp"], "1970-01-01T00:00:30Z");
+		assert_eq!(body["points"][0]["value"], 4.5);
+		assert_eq!(body["points"][0]["kind"], "raw");
 	}
 
 	/// POST a JSON body and return `(status, content-type, raw bytes)`.

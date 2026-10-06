@@ -59,8 +59,8 @@ pub mod weft_adapter;
 use std::time::Instant;
 
 use bigdecimal::ToPrimitive;
-use splimes::generate_target_times;
 
+use crate::adapter::grid_timestamps;
 pub use crate::{
 	accuracy::{synthetic_ground_truth, AccuracyError, AccuracyMetrics}, adapter::SystemAdapter, baseline_adapter::BaselineLinearAdapter, compression::{run_compression, CompressionParams, CompressionProfile, ValueShape}, downsample::{run_downsample, Aggregation, DownsampleParams, DownsampleProfile}, forward_fill_adapter::ForwardFillAdapter, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, point_lookup::{run_point_lookup, LookupMode, PointLookupParams, PointLookupProfile}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError, SignalShape, SyntheticParams}, range_fetch::{run_range_fetch, RangeFetchParams, RangeFetchProfile}, report::{BenchReport, RunMetadata}, schema::{BenchResult, CorrectnessReport, DatasetMeta, StorageEstimate, TimingBreakdown, SCHEMA_VERSION}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}, weft_adapter::WeftAdapter
 };
@@ -100,7 +100,7 @@ pub async fn run_profile<A: SystemAdapter + ?Sized>(adapter: &A, profile: &Inter
 	let dataset_generation_ns = span_ns(gen_start);
 	let input_points = dataset.len();
 	let (start, end) = (profile.start(), profile.end());
-	let expected_output_points = generate_target_times(start, end, profile.resolution).len();
+	let expected_output_points = grid_timestamps(start, end, profile.resolution).len();
 
 	let mut samples_ns: Vec<u64> = Vec::with_capacity(reps);
 	let mut last_output: Vec<splimes::Point> = Vec::new();
@@ -326,7 +326,7 @@ cpu,host=h0 usage=14.0 600\n";
 	#[tokio::test]
 	async fn measure_accuracy_scores_every_reconstruction_against_ground_truth() {
 		let profile = InterpolationProfile::interpolation_heavy_irregular();
-		let expected = generate_target_times(profile.start(), profile.end(), profile.resolution).len();
+		let expected = grid_timestamps(profile.start(), profile.end(), profile.resolution).len();
 
 		// Every in-process reconstruction method must yield finite, grid-aligned
 		// accuracy metrics obeying the universal error-statistic invariants

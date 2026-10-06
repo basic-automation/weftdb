@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use bigdecimal::{BigDecimal, Zero};
 use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt};
-use splimes::{Point, Resolution, Spline};
+use splimes::{Interpolator, Point, Resolution, Spline};
 use uuid::Uuid;
 
 use crate::{
@@ -239,18 +239,13 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 			return Ok(Point { timestamp: cached_result.timestamp(), value: cached_result.value().clone() });
 		}
 
-		// Determine minimum points needed for this interpolation method
-		let min_points_needed = match method {
-			Spline::Linear => 2,
-			Spline::Quadratic => 3,
-			Spline::Cubic => 4,
-			Spline::Polynomial(degree, _) => degree + 1,
-		};
+		// Determine minimum points needed for this interpolation method (its degree + 1)
+		let min_points_needed = method.min_points();
 
 		// Get measurements efficiently using pagination with time range optimization
 		// For point analysis, fetch data around the target time for better efficiency
 		// Start with a reasonable window and expand if needed
-		let base_window = resolution.to_step() * 100;
+		let base_window = resolution.step() * 100;
 		let initial_page_size = 10_000;
 		let mut all_measurements = Vec::new();
 		let mut found_target_range = false;
@@ -334,15 +329,15 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		all_measurements.sort_by_key(|m: &Measurement| m.timestamp());
 
 		// Convert to Points for splimes
-		let mut points: Vec<Point> = all_measurements.iter().map(|m| Point { timestamp: m.timestamp(), value: m.value().clone() }).collect();
+		let points: Vec<Point> = all_measurements.iter().map(|m| Point { timestamp: m.timestamp(), value: m.value().clone() }).collect();
 
-		// Use splimes::auto_interpolate which handles both interpolation and extrapolation
-		// We just need a single point, so set end_time slightly after our target
-		let end_time = time + resolution.to_step();
-		let interpolated = splimes::auto_interpolate(&mut points, time, end_time, *resolution, *method).await?;
+		// splimes handles both interpolation and extrapolation. We need a single point, and a
+		// grid with `start == end` is exactly that one instant. splimes is synchronous and
+		// CPU-bound, so it runs on tokio's blocking pool rather than this async task.
+		let interpolated = Interpolator::new(*method, *resolution).run_async(points, time, time).await?;
 
-		// Get the interpolated point (should be the first and likely only point)
-		let point = interpolated.into_iter().next().unwrap_or_else(|| Point { timestamp: time, value: BigDecimal::zero() });
+		// Get the interpolated point (the grid's only point)
+		let point = interpolated.into_points().into_iter().next().unwrap_or_else(|| Point { timestamp: time, value: BigDecimal::zero() });
 
 		// Cache the result
 		let method_description = if all_measurements.len() == 1 {
@@ -379,18 +374,13 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 
 		// Calculate chunk parameters
 		let total_duration = end - start;
-		let step_duration = resolution.to_step();
+		let step_duration = resolution.step();
 		let total_ns = total_duration.num_nanoseconds().unwrap_or(i64::MAX);
 		let step_ns = step_duration.num_nanoseconds().unwrap_or(1);
 		let expected_points = if step_ns > 0 { (total_ns / step_ns) + 1 } else { 1 };
 
-		// Calculate overlap needed for interpolation method
-		let overlap_points = match method {
-			Spline::Linear => 1,
-			Spline::Quadratic => 2,
-			Spline::Cubic => 3,
-			Spline::Polynomial(d, _) => d,
-		};
+		// Calculate overlap needed for interpolation method (its degree)
+		let overlap_points = method.degree();
 		let overlap_duration = step_duration * i32::try_from(overlap_points).unwrap_or(3);
 
 		// Target ~50,000 output points per chunk for responsive streaming
@@ -462,7 +452,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 				}
 
 				// Convert to points
-				let mut points: Vec<Point> = measurements.iter().map(|m| Point { timestamp: m.timestamp(), value: m.value().clone() }).collect();
+				let points: Vec<Point> = measurements.iter().map(|m| Point { timestamp: m.timestamp(), value: m.value().clone() }).collect();
 
 				// Adjust effective end to not extrapolate beyond actual data
 				let actual_data_end = points.iter().map(|p| p.timestamp).max().unwrap_or(chunk_end);
@@ -470,11 +460,10 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 
 				// That clamp can COLLAPSE the range. The chunk fetch is inclusive at both
 				// ends, so a chunk whose only visible measurement sits exactly at (or before)
-				// `current_chunk_start` clamps the end back onto the start — and
-				// `auto_interpolate` rejects `start >= end` with "Invalid time range: start
-				// time must be before end time", failing the whole stream. The
-				// `measurements.is_empty()` guard above does not catch this, because the
-				// chunk is not empty; its data is simply all at or behind the start.
+				// `current_chunk_start` clamps the end back onto (or behind) the start — and
+				// splimes rejects `start > end` with `Error::InvalidTimeRange`, failing the
+				// whole stream. The `measurements.is_empty()` guard above does not catch this,
+				// because the chunk is not empty; its data is simply all at or behind the start.
 				//
 				// A zero-width window has exactly one sensible answer — the last known value
 				// at the start instant — so emit that and advance, mirroring the empty-chunk
@@ -487,11 +476,12 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 					return Some((Ok(Point { timestamp: current_chunk_start, value }), (chunk_end, None, is_last_chunk)));
 				}
 
-				// Interpolate this chunk
-				match splimes::auto_interpolate(&mut points, current_chunk_start, effective_chunk_end, resolution_val, method_val).await {
+				// Interpolate this chunk, on tokio's blocking pool: splimes is synchronous and
+				// CPU-bound, and a chunk can be tens of thousands of grid points.
+				match Interpolator::new(method_val, resolution_val).run_async(points, current_chunk_start, effective_chunk_end).await {
 					Ok(interpolated) => {
 						let is_last_chunk = chunk_end >= end_time;
-						let mut new_iter = interpolated.into_iter();
+						let mut new_iter = interpolated.into_points().into_iter();
 
 						// Return first point and set up iterator for the rest
 						match new_iter.next() {
@@ -505,7 +495,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 							}
 						}
 					}
-					Err(e) => Some((Err(e), (chunk_end, None, true))),
+					Err(e) => Some((Err(e.into()), (chunk_end, None, true))),
 				}
 			}
 		});

@@ -52,7 +52,7 @@ crossterm = "0.29"
 sysinfo = "0.39"
 weftdb = { path = "./weftdb", version = "0.1.0" }
 # Developed in its own repository (github.com/basic-automation/splimes), on its own roadmap.
-splimes = "0.1"
+splimes = "1"
 weft-line-protocol = { path = "./weft-line-protocol", version = "0.1.0" }
 weft-physical-type = { path = "./weft-physical-type", version = "0.1.0" }
 weft-reduce = { path = "./weft-reduce", version = "0.1.0" }
@@ -93,3 +93,8 @@ codegen-units = 1
 
 [profile.test]
 debug = 1
+
+# TEMPORARY: splimes 1.0.0 is not on crates.io yet. Pin the release/1.0 commit so the
+# migration can be built and tested; delete this section once 1.0.0 is published.
+[patch.crates-io]
+splimes = { git = "https://github.com/basic-automation/splimes", rev = "1bee9dd5493f830a9eded00812522725faac68b7" }

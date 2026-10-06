@@ -13,6 +13,26 @@ use crate::{
 	}, AspectId
 };
 
+/// The number of whole `units` from `subtrahend` to `minuend` (`minuend - subtrahend`),
+/// truncated toward zero.
+///
+/// This is splimes 0.1's `Resolution::difference`, which splimes 1.0 removed, with the
+/// same results for every resolution: the exact elapsed time divided by the resolution's
+/// step (a month is 30 days and a year 365, as before). Unlike chrono's
+/// `num_nanoseconds`, the elapsed time is taken in `i128` nanoseconds, so it never
+/// overflows on the way.
+///
+/// # Errors
+///
+/// Returns an error if the count does not fit an `i64`, which only a nanosecond or
+/// microsecond count over more than about 292 thousand (µs) or 292 (ns) years can do.
+pub fn units_between(units: Resolution, minuend: &DateTime<Utc>, subtrahend: &DateTime<Utc>) -> Result<i64> {
+	let elapsed = *minuend - *subtrahend;
+	// `subsec_nanos` carries the sign of the whole delta, so this sum is exact.
+	let nanos = i128::from(elapsed.num_seconds()) * 1_000_000_000 + i128::from(elapsed.subsec_nanos());
+	i64::try_from(nanos / i128::from(units.step_nanos())).map_err(|_| anyhow::anyhow!("the {units} between {subtrahend} and {minuend} do not fit an i64"))
+}
+
 /// Finds the midpoint of the manifestation that occurred immediately before the given
 /// `manifestation_id`.
 ///
@@ -253,6 +273,9 @@ impl Signal {
 			Resolution::Weeks => BigDecimal::from(604_800_i64),
 			Resolution::Months => BigDecimal::from(2_592_000_i64), // 30 days
 			Resolution::Years => BigDecimal::from(31_536_000_i64), // 365 days
+			// `Resolution` is `#[non_exhaustive]`: one added after splimes 1.0 converts by its
+			// step, in seconds per unit (multiplied in below).
+			_ => BigDecimal::from(distance.units.step_nanos()) / BigDecimal::from(1_000_000_000_i64),
 		};
 
 		// For sub-second units, divide by factor; for super-second units, multiply by factor
@@ -275,6 +298,9 @@ impl Signal {
 			Resolution::Weeks => BigDecimal::from(604_800_i64),
 			Resolution::Months => BigDecimal::from(2_592_000_i64), // 30 days
 			Resolution::Years => BigDecimal::from(31_536_000_i64), // 365 days
+			// `Resolution` is `#[non_exhaustive]`: one added after splimes 1.0 converts by its
+			// step, in seconds per unit (divided by below).
+			_ => BigDecimal::from(self.distance.units.step_nanos()) / BigDecimal::from(1_000_000_000_i64),
 		};
 
 		// For sub-second units, multiply by factor; for super-second units, divide by factor
@@ -330,7 +356,7 @@ impl Signal {
 		}
 
 		// Calculate time elapsed since the signal's manifestation date (in average_distance units)
-		let Some(time_elapsed) = BigDecimal::from_i64(average_distance.units.difference(&date, &self.manifestation_date)?) else { bail!("Failed to convert time difference to BigDecimal") };
+		let Some(time_elapsed) = BigDecimal::from_i64(units_between(average_distance.units, &date, &self.manifestation_date)?) else { bail!("Failed to convert time difference to BigDecimal") };
 
 		// If time_elapsed <= 0, we're before or at the manifestation date
 		if time_elapsed <= BigDecimal::zero() {
@@ -367,7 +393,7 @@ impl Signal {
 		}
 
 		// Calculate time elapsed since the signal's manifestation date
-		let Some(time_elapsed) = BigDecimal::from_i64(self.distance.units.difference(&date, &self.manifestation_date)?) else { bail!("Failed to convert time difference to BigDecimal") };
+		let Some(time_elapsed) = BigDecimal::from_i64(units_between(self.distance.units, &date, &self.manifestation_date)?) else { bail!("Failed to convert time difference to BigDecimal") };
 
 		// Convert error rate to the signal's distance units if they differ
 		let error_rate_in_signal_units = if error_rate.units == self.distance.units {
@@ -674,7 +700,7 @@ impl Signals {
 					let reference_time = previous_midpoint.or(last_manifestation_midpoint).unwrap_or_else(|| *s.manifestation_date());
 
 					// Calculate time elapsed from reference point
-					let time_elapsed_i64 = avg_dist.units().difference(&date, &reference_time)?;
+					let time_elapsed_i64 = units_between(*avg_dist.units(), &date, &reference_time)?;
 					if time_elapsed_i64 <= 0 {
 						continue; // Not yet past the reference point
 					}
@@ -804,7 +830,7 @@ impl Signals {
 		};
 
 		// Calculate time elapsed since reference point (in the average_distance units)
-		let time_elapsed = average_distance.units().difference(&date, reference_time)?;
+		let time_elapsed = units_between(*average_distance.units(), &date, reference_time)?;
 
 		// If we're before or at the reference point, probability is 0
 		if time_elapsed <= 0 {
@@ -917,5 +943,47 @@ impl Signals {
 
 		// Find signals that belong to these correlations
 		self.0.values().filter(|signal| correlation_ids.contains(&signal.correlation_id)).collect()
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use chrono::{DateTime, Utc};
+	use splimes::Resolution;
+
+	use super::units_between;
+
+	/// splimes 0.1's `Resolution::difference`, verbatim, as the reference.
+	fn splimes_0_1_difference(units: Resolution, minuend: &DateTime<Utc>, subtrahend: &DateTime<Utc>) -> Option<i64> {
+		let d = *minuend - *subtrahend;
+		Some(match units {
+			Resolution::Nanoseconds => d.num_nanoseconds()?,
+			Resolution::Microseconds => d.num_microseconds()?,
+			Resolution::Milliseconds => d.num_milliseconds(),
+			Resolution::Seconds => d.num_seconds(),
+			Resolution::Minutes => d.num_minutes(),
+			Resolution::Hours => d.num_hours(),
+			Resolution::Days => d.num_days(),
+			Resolution::Weeks => d.num_weeks(),
+			Resolution::Months => d.num_days() / 30,
+			Resolution::Years => d.num_days() / 365,
+			_ => unreachable!("splimes 0.1 had no {units:?}"),
+		})
+	}
+
+	#[test]
+	fn units_between_matches_splimes_0_1_difference() {
+		let at = |s: i64, ns: u32| DateTime::from_timestamp(s, ns).unwrap();
+		let instants = [at(0, 0), at(0, 1), at(-1, 999_999_999), at(59, 999_999_999), at(-61, 0), at(86_399, 5), at(2_591_999, 0), at(-31_536_001, 7), at(1_700_000_000, 123_456_789), at(9_000_000_000, 0), at(-9_000_000_000, 0), DateTime::<Utc>::MIN_UTC, DateTime::<Utc>::MAX_UTC];
+		for &units in Resolution::ALL {
+			for a in &instants {
+				for b in &instants {
+					assert_eq!(units_between(units, a, b).ok(), splimes_0_1_difference(units, a, b), "{units:?}: {a} - {b}");
+				}
+			}
+		}
+		// Truncated toward zero in both directions.
+		assert_eq!(units_between(Resolution::Minutes, &at(119, 0), &at(0, 0)).unwrap(), 1);
+		assert_eq!(units_between(Resolution::Minutes, &at(0, 0), &at(119, 0)).unwrap(), -1);
 	}
 }

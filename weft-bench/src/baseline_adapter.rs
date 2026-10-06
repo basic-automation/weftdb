@@ -25,9 +25,9 @@
 use async_trait::async_trait;
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
-use splimes::{generate_target_times, Point, Resolution, Spline};
+use splimes::{Point, Resolution, Spline};
 
-use crate::adapter::SystemAdapter;
+use crate::adapter::{grid_timestamps, SystemAdapter};
 
 /// Adapter that reconstructs a dense regular grid with piecewise-linear
 /// interpolation — the portable client-side baseline WeftDB is compared against.
@@ -55,7 +55,7 @@ impl SystemAdapter for BaselineLinearAdapter {
 		// safe and lets the bracketing search below assume ascending timestamps.
 		points.sort_by_key(|p| p.timestamp);
 
-		let grid = generate_target_times(start, end, resolution);
+		let grid = grid_timestamps(start, end, resolution);
 		let mut out = Vec::with_capacity(grid.len());
 		for t in grid {
 			out.push(Point::new(t, linear_value_at(points, t)));
