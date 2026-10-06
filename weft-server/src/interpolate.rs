@@ -1251,6 +1251,23 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn invalid_polynomial_parameters_are_bad_requests() {
+		// 0.1 accepted all of these and answered 200 (a degree above 8 was capped at 8);
+		// splimes 1.0 rejects them before computing anything.
+		for (spline, message) in [(serde_json::json!({ "polynomial": { "degree": 0 } }), "invalid polynomial degree 0: must be between 1 and 8"), (serde_json::json!({ "polynomial": { "degree": 9 } }), "invalid polynomial degree 9: must be between 1 and 8"), (serde_json::json!({ "polynomial": { "degree": 2, "bounds_factor": -1.5 } }), "invalid bounds factor -1.5: must be finite and not negative")] {
+			let body = serde_json::json!({ "spline": spline, "resolution": "seconds", "points": [ { "timestamp": ts(0), "value": 0.0 }, { "timestamp": ts(10), "value": 10.0 }, { "timestamp": ts(20), "value": 5.0 } ] });
+			for uri in ["/api/v1/interpolate", "/api/v1/interpolate/csv"] {
+				let (status, _content_type, text) = post_json_for_text(uri, body.clone()).await;
+				assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {spline}: {text}");
+				assert!(text.contains(message), "{uri} {spline}: {text}");
+			}
+			let point = serde_json::json!({ "spline": spline, "instant": ts(5), "points": body["points"] });
+			let (status, body) = post_json("/api/v1/interpolate/point", point).await;
+			assert_eq!(status, StatusCode::BAD_REQUEST, "point {spline}: {body}");
+		}
+	}
+
+	#[tokio::test]
 	async fn a_single_input_point_reconstructs_to_that_point() {
 		// One sample and no explicit range makes `start == end`; splimes 1.0 returns the
 		// one-point grid (0.1 refused a zero-span range, which surfaced as a 500).

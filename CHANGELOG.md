@@ -47,8 +47,17 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
     interpolated `BigDecimal`s are the shortest decimal that round-trips;
   - time is exact to the nanosecond at every resolution, duplicate timestamps keep the
     last value, and a leap second is the same instant as the start of the next second;
-  - `Backend::Auto` uses the GPU only once the program has started it (see the startup
-    calibration above).
+  - results no longer depend on whether the GPU ran them. With a GPU present, 0.1's
+    `auto_interpolate` (behind `analyze_range`, `analyze_point`, compression and every
+    `weft-server` interpolation endpoint) ran a call on it when the larger of its input
+    count and grid size was 100–999, or either reached 50,000. Its GPU path evaluated
+    `Polynomial(d, b)` at degree `d + 1` and, in `f64`, ignored any bounds factor other
+    than 1.0, so those calls returned different polynomial values from the CPU's, and on
+    a GPU without `f64` support it computed in `f32`. 1.0 computes the same method, in
+    `f64`, on every backend;
+  - `Backend::Auto` uses the GPU only once the program has started it, and only above
+    the calibrated thresholds (see the startup calibration above); without calibration
+    every interpolation runs on the CPU.
 - **No interpolation runs on an async worker.** splimes 1.0 is synchronous; `weftdb`'s
   `analyze_point`, `analyze_range` and compression, every `weft-server` interpolation
   endpoint, and the Weft-Bench WeftDB adapter run it on tokio's blocking pool
@@ -59,6 +68,29 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   exactly, including its rounding toward zero before 1970, so bucket edges and the keys
   of persisted `.weftpart` sidecars are unchanged. `Resolution::difference` is replaced
   by `weftdb::units_between`, with the same results.
+- **Breaking for Rust users: `weftdb::Resolution` and `weftdb::Spline` are
+  `#[non_exhaustive]`.** They are re-exports of splimes' types, which 1.0 marks
+  non-exhaustive so new variants can arrive in minor releases: an exhaustive `match` on
+  either needs a `_` arm. Their removed 0.1 helpers go with them: use
+  `Resolution::step()`/`step_nanos()` for `to_step()` and the `SECONDS_IN_*` constants,
+  `weftdb::units_between` for `difference`, `weft_reduce::bucket_index` for `to_base`,
+  and `Spline::min_points()` for `number_of_points_required()`.
+- **Stored spline methods are validated when they are loaded.** A dictionary's step
+  interpolation is persisted as the `Spline`'s text (`steps_interpolation` in the
+  `dictionary_constraints` table of `<aspect>/dictionaries/<dictionary>.db`), and splimes
+  1.0's `Spline::from_str` validates what it parses. A stored `Polynomial` with degree 0,
+  a degree above 8, or a negative or non-finite bounds factor, which 0.1 accepted, no
+  longer loads: `get_dictionary_metadata` returns `Database error: Invalid interpolation
+  format: invalid polynomial degree 9: must be between 1 and 8` (or `… invalid bounds
+  factor -1: must be finite and not negative`), and `weft_orchestration::load_dictionary`
+  logs that error as a warning ("Failed to check dictionary metadata, attempting to
+  create"). To fix it, stop WeftDB and rewrite the stored value with Turso's shell
+  (`tursodb`, not `sqlite3`: the file is in Turso's MVCC journal mode), e.g.
+  `UPDATE dictionary_constraints SET steps_interpolation = 'Polynomial(degree: 8,
+  bounds_factor: None)' WHERE steps_interpolation = 'Polynomial(degree: 9,
+  bounds_factor: None)'`; 0.1's CPU path capped any degree above 8 at 8. Degree 0 and
+  invalid bounds factors have no exact 1.0 equivalent: choose a degree from 1 to 8 and a
+  finite, non-negative bounds factor, or `None`.
 - `Resolution` names parse case-insensitively (`Hours`, `HOURS`), for example in
   `WEFT_SEGMENT_PARTIAL_BASE`, which ignored anything but lowercase before.
 - **`weft-server` provenance comes from splimes.** The `kind` of each interpolated
@@ -68,10 +100,17 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   except at a leap second: an input at `23:59:60.5` and a grid instant at `00:00:00.5`
   the next day are one POSIX instant, so that point is now `raw` (it was `extrapolated`
   or `interpolated`).
-- **Interpolation errors map to HTTP status by kind.** Invalid polynomial parameters
-  (a degree outside 1–8, a negative or non-finite bounds factor), an input or
-  extrapolated value beyond `f64`'s range, and an oversized grid are `400`s; every
-  engine error was a `500` before.
+- **Invalid polynomial parameters are a `400`.** A `polynomial` spline with degree 0, a
+  degree above 8, or a negative `bounds_factor` used to be accepted, and the
+  interpolation endpoints answered `200` with a result (0.1's CPU path capped a degree
+  above 8 at 8). splimes 1.0 rejects them, and the request is now a `400` naming the
+  problem, e.g. `invalid polynomial degree 9: must be between 1 and 8`. (JSON cannot
+  carry a non-finite bounds factor; such a body is a `400` from the JSON parser before
+  splimes sees it.)
+- **Interpolation errors map to HTTP status by kind.** An input or extrapolated value
+  beyond `f64`'s range and an oversized grid are `400`s too; any other engine error
+  (a GPU failure, a panicked blocking task) stays a `500`, as every engine error was
+  before.
 - **Turso control plane upgraded 0.6 → 0.8.** ⚠️ This is one-way: once 0.8 writes a
   store, its MVCC log is v3 and an older WeftDB can no longer open it. Back up the
   control plane before upgrading.
