@@ -28,6 +28,8 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 - `Database::list_stored_databases()` lists the legacy databases on disk (the folders
   of the data directory that hold a `metadata.db`), sweeping the build directories of
   interrupted `Database::new` calls first. `weft-tui` lists databases through it.
+- `weft-orchestration` has a `fault-injection` feature (it enables weftdb's) for its
+  crash tests: `cargo test -p weft-orchestration --features fault-injection --test legacy_queue_crash`.
 
 ### Fixed
 
