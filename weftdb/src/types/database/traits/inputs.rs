@@ -1,7 +1,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 
-use crate::{cache::Connection, AspectId, Batch, BatchId, Correlation, CorrelationID, DatasetId, DictionaryMetadata, Event, EventID, InputMeasurement, Pattern, PatternID, TxId};
+use crate::{cache::Connection, AspectId, Batch, BatchId, Correlation, CorrelationID, DatasetId, DictionaryMetadata, Event, EventID, InputMeasurement, Pattern, PatternID, TxId, UnbatchedEntry};
 
 /// Trait for database structure operations
 /// This trait defines the operations related to managing the structure of the database.
@@ -18,10 +18,26 @@ pub trait Inputs {
 	async fn enqueue_unbatched_measurement(&self, aspect_id: &AspectId, data_timestamp: DateTime<Utc>) -> Result<()>;
 
 	/// Enqueue multiple measurement timestamps as unbatched (bulk insert)
+	///
+	/// A timestamp that is already queued keeps its one entry, and the entry's `queued_at`
+	/// moves strictly forward, so a queue consumer that read the entry before this call
+	/// leaves it queued when it dequeues what it read (see [`UnbatchedEntry`]).
 	async fn enqueue_unbatched_measurements(&self, aspect_id: &AspectId, data_timestamps: &[DateTime<Utc>]) -> Result<()>;
 
 	/// Dequeue unbatched measurements after they have been included in batches
+	///
+	/// This removes the timestamps whatever their `queued_at`. A queue consumer dequeues
+	/// with [`dequeue_unbatched_entries`](Self::dequeue_unbatched_entries) instead: this
+	/// would also remove a timestamp queued again after the consumer read it, such as by
+	/// an ingest whose row committed in the meantime, and that row would never be batched.
 	async fn dequeue_unbatched_measurements(&self, aspect_id: &AspectId, data_timestamps: &[DateTime<Utc>]) -> Result<()>;
+
+	/// Dequeue queue entries a consumer read (with
+	/// [`Outputs::get_unbatched_entries`](crate::database::traits::Outputs::get_unbatched_entries))
+	/// and batched. Each entry is removed only while it is still queued under the
+	/// `queued_at` it was read with: one queued again since then stays queued for the
+	/// consumer's next run (crash-consistency design, S18).
+	async fn dequeue_unbatched_entries(&self, aspect_id: &AspectId, entries: &[UnbatchedEntry]) -> Result<()>;
 
 	/// Clear all unbatched measurements for an aspect
 	async fn clear_unbatched_measurements(&self, aspect_id: &AspectId) -> Result<()>;
@@ -35,10 +51,22 @@ pub trait Inputs {
 	///
 	/// # Crash consistency (rows mode)
 	///
-	/// The timestamp is queued for batching before the row is inserted, so the unbatched
-	/// queue always covers every stored row. If the call fails or the process dies after
-	/// the insert committed, the row is stored although the call did not return `Ok`, and
-	/// a retry stores it a second time: there is no idempotency key in rows mode.
+	/// The timestamp is queued for batching before the row is inserted (write-ahead), and
+	/// queued again once the row is committed. The first keeps the row queued if the call
+	/// dies after the commit; the second keeps a queue consumer that ran in between, and
+	/// read the timestamp before its row existed, from dequeuing it for good (a consumer
+	/// dequeues only the entries it read; see [`UnbatchedEntry`]). Everything after the
+	/// commit (queuing again, the checkpoint, the dirty-region marking, the transaction
+	/// log) is best-effort: a failure is logged and the call still returns `Ok`, since the row is
+	/// stored. Residuals until rows-mode aspects move to the segment store
+	/// (crash-consistency design, S19):
+	///
+	/// - **Duplicates on retry.** If the process dies after the commit, the row is stored
+	///   although the call never returned `Ok`, and a retry stores it a second time: there
+	///   is no idempotency key in rows mode.
+	/// - **A consumer during the call, then a crash.** The row is left unqueued only if a
+	///   consumer ran during the call and the call then died, or could not queue the
+	///   timestamp again, between its commit and the second enqueue.
 	async fn capture_measurement(&self, aspect_id: &AspectId, dataset_id: &DatasetId, input_measurement: &InputMeasurement) -> Result<TxId>;
 
 	/// Capture new measurements for a given aspect
@@ -50,20 +78,34 @@ pub trait Inputs {
 	///
 	/// # Crash consistency (rows mode)
 	///
-	/// Every timestamp is queued for batching before the first row is inserted, so the
-	/// unbatched queue always covers every stored row; a timestamp whose row never lands
-	/// only waits in the queue. The rows are then inserted in chunks (2,500 rows, or 5,000
-	/// above 100,000), each committed on its own. Two residuals remain until rows-mode
-	/// aspects move to the segment store (crash-consistency design, S19):
+	/// Every timestamp is queued for batching before the first row is inserted
+	/// (write-ahead), and each chunk's timestamps are queued again once that chunk is
+	/// committed. The rows are inserted in chunks (2,500 rows, or 5,000 above 100,000),
+	/// each committed on its own. The write-ahead enqueue keeps the committed chunks of a
+	/// call that fails or dies midway queued; the second enqueue keeps a queue consumer
+	/// that ran during the call, and read timestamps before their rows existed, from
+	/// dequeuing them for good (a consumer dequeues only the entries it read; see
+	/// [`UnbatchedEntry`]). Residuals until rows-mode aspects move to the segment store
+	/// (crash-consistency design, S19):
 	///
 	/// - **Partial prefix.** An error or crash mid-call leaves the chunks committed before
 	///   it stored, although the call does not return `Ok`.
 	/// - **Duplicates on retry.** There is no idempotency key, so retrying such a call, or
 	///   one whose `Ok` was lost, stores the already committed rows a second time.
+	/// - **A consumer during the call, then a crash.** A chunk's rows are left unqueued
+	///   only if a consumer ran during the call and the call then died, or could not queue
+	///   them again, between the chunk's commit and its second enqueue.
 	///
-	/// The steps after the last chunk (dirty-region marking and the aspect's earliest and
-	/// latest timestamps) are best-effort: their failure is logged and the call still
-	/// returns `Ok`, so a stored batch is not retried into a duplicate.
+	/// A queued timestamp whose row never lands is handled by the consumer like any other:
+	/// inside the stored range its windows are built from the interpolated series, as a
+	/// full rebuild builds them, and it is dequeued; past the range it waits until rows
+	/// reach its windows; before the range it has no window, and it waits until a run
+	/// finds nothing else queued, which clears it.
+	///
+	/// Everything after a chunk's commit (queuing again, and after the last chunk the
+	/// checkpoint, the dirty-region marking and the aspect's earliest and latest
+	/// timestamps) is best-effort: a failure is logged and the call still returns `Ok`, so a stored batch
+	/// is not retried into a duplicate.
 	async fn batch_capture_measurements(&self, aspect_id: AspectId, dataset_id: DatasetId, input_measurements: Vec<InputMeasurement>) -> Result<Vec<TxId>>;
 
 	/// Capture a chunk of measurements - generates `TxIds` internally

@@ -1,17 +1,14 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use splimes::{Resolution, Spline};
 use tracing::{debug, info};
 use weftdb::{
-	database::traits::{DatabaseStructure, Inputs, Outputs}, AspectId, Database
+	database::traits::{DatabaseStructure, Inputs, Outputs}, AspectId, Database, UnbatchedEntry
 };
 
 use super::calculate_affected_windows::{calculate_affected_windows, BatchWindow};
 use crate::{Batch, BatchedMeasurement};
-
-/// How many batch points [`build_incremental_unprocessed_queue`] holds before it stores
-/// them (see there).
-const STORE_GROUP_POINTS: usize = 100_000;
 
 /// Checks if this is the first run for an aspect (no batches exist yet).
 ///
@@ -40,6 +37,19 @@ pub async fn is_first_run(database: &Database, aspect_id: &AspectId) -> Result<b
 ///
 /// If this is the first run (no existing batches), it falls back to the full rebuild.
 ///
+/// # Crash consistency (crash-consistency design, S18)
+///
+/// - **Crash before the dequeue.** The batches are stored before their timestamps are
+///   dequeued, so a run that dies in between rebuilds the same windows next time; storing
+///   skips every batch already queued or processed, so the re-run adds no duplicates.
+/// - **Ingest running at the same time.** Ingest queues a timestamp before its row is
+///   inserted and again once it is committed, so this run may read a timestamp whose row
+///   is not stored yet and build its windows without it. It therefore dequeues only the
+///   queue entries it read, matched on their `queued_at`
+///   ([`dequeue_unbatched_entries`](Inputs::dequeue_unbatched_entries)): an entry queued
+///   again after the read survives, and the next run batches the landed row. The row is
+///   missed only if that ingest also died, or failed to queue it again, after its commit.
+///
 /// # Errors
 /// Returns an error if database reads or writes fail while constructing or persisting batches.
 pub async fn build_incremental_unprocessed_queue(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, batch_size: usize) -> Result<()> {
@@ -49,8 +59,9 @@ pub async fn build_incremental_unprocessed_queue(database: &Database, aspect: &A
 		return build_unprocessed_queue(database, aspect, resolution, method, batch_size).await;
 	}
 
-	// Get unbatched measurements
-	let unbatched_timestamps = database.get_unbatched_measurements(aspect).await?;
+	// Get the unbatched queue entries; only these are dequeued below
+	let unbatched = database.get_unbatched_entries(aspect).await?;
+	let unbatched_timestamps: Vec<DateTime<Utc>> = unbatched.iter().map(|entry| entry.data_timestamp).collect();
 
 	if unbatched_timestamps.is_empty() {
 		info!("No unbatched measurements, nothing to process");
@@ -61,8 +72,8 @@ pub async fn build_incremental_unprocessed_queue(database: &Database, aspect: &A
 
 	// Get the earliest measurement for window alignment. Ingest queues timestamps before it
 	// inserts their rows (write-ahead enqueue), so the queue can hold timestamps whose rows
-	// never landed, here every one of them: there is nothing to batch yet, and they stay
-	// queued for the rows a retry stores.
+	// have not landed (or never will), here every one of them: there is nothing to batch
+	// yet, and they stay queued.
 	let Some(earliest_measurement) = database.get_earliest_measurement(aspect).await? else {
 		info!(unbatched_count = unbatched_timestamps.len(), "Queued timestamps but no stored measurements yet, nothing to batch");
 		return Ok(());
@@ -71,9 +82,12 @@ pub async fn build_incremental_unprocessed_queue(database: &Database, aspect: &A
 	// Calculate which windows are affected
 	let affected_windows: std::collections::HashSet<BatchWindow> = calculate_affected_windows(&unbatched_timestamps, resolution, batch_size, earliest_measurement);
 
+	// Only timestamps before the earliest stored row (whose rows have not landed) have no
+	// window. Clearing only the entries read above leaves one queued again since then,
+	// such as by a backfill whose rows committed meanwhile, for the next run.
 	if affected_windows.is_empty() {
 		info!("No affected windows found, clearing unbatched queue");
-		database.dequeue_unbatched_measurements(aspect, &unbatched_timestamps).await?;
+		database.dequeue_unbatched_entries(aspect, &unbatched).await?;
 		return Ok(());
 	}
 
@@ -82,14 +96,8 @@ pub async fn build_incremental_unprocessed_queue(database: &Database, aspect: &A
 	let database_info = database.get_database_info().await.map_err(|_| anyhow::anyhow!("Database info not available"))?;
 
 	let mut batches_created = 0;
-	let mut timestamps_to_dequeue = Vec::new();
-	// Batches are stored in groups through `batch_insert_unprocessed_batches`, whose
-	// duplicate check reads the queued and processed batch hashes once per call. Storing
-	// them one by one would scan both tables (which cannot be indexed under MVCC) once per
-	// window, and the processed batches are only drained by pattern extraction. The group
-	// size bounds the points held in memory.
-	let group_len = (STORE_GROUP_POINTS / batch_size.max(1)).max(1);
-	let mut pending = Vec::new();
+	// Which of the entries read above a stored batch covers.
+	let mut covered = vec![false; unbatched.len()];
 
 	// For each affected window, create a batch
 	for window in affected_windows {
@@ -110,16 +118,14 @@ pub async fn build_incremental_unprocessed_queue(database: &Database, aspect: &A
 
 			let batch = Batch::new(batch_size, measurements, *resolution, *aspect, database_info.clone());
 
-			pending.push(batch);
+			// Skipped (still `Ok`) when the batch is already queued or processed.
+			database.insert_unprocessed_batch(aspect, &batch).await?;
 			batches_created += 1;
-			if pending.len() >= group_len {
-				database.batch_insert_unprocessed_batches(aspect, std::mem::take(&mut pending)).await?;
-			}
 
-			// Track which timestamps from unbatched queue are now covered by this batch
-			for ts in &unbatched_timestamps {
-				if window.contains(*ts) {
-					timestamps_to_dequeue.push(*ts);
+			// Track which entries from unbatched queue are now covered by this batch
+			for (entry, covered) in unbatched.iter().zip(covered.iter_mut()) {
+				if window.contains(entry.data_timestamp) {
+					*covered = true;
 				}
 			}
 		} else {
@@ -133,22 +139,17 @@ pub async fn build_incremental_unprocessed_queue(database: &Database, aspect: &A
 		}
 	}
 
-	if !pending.is_empty() {
-		database.batch_insert_unprocessed_batches(aspect, pending).await?;
-	}
-
 	// The batches are committed and their timestamps are still queued. A crash here makes
 	// the next run rebuild the same windows; the store skips each batch whose hash is
 	// already queued or processed, so that re-run adds no duplicates.
 	weftdb::durable::fault::hit(weftdb::durable::FaultPoint::LConsumerBatches).await?;
 
-	// Dequeue the processed timestamps (deduplicated)
-	timestamps_to_dequeue.sort();
-	timestamps_to_dequeue.dedup();
+	// Dequeue the covered entries, each only if it was not queued again since it was read
+	let entries_to_dequeue: Vec<UnbatchedEntry> = unbatched.iter().zip(covered).filter_map(|(entry, covered)| covered.then_some(*entry)).collect();
 
-	if !timestamps_to_dequeue.is_empty() {
-		database.dequeue_unbatched_measurements(aspect, &timestamps_to_dequeue).await?;
-		info!(dequeued = timestamps_to_dequeue.len(), "Dequeued processed timestamps");
+	if !entries_to_dequeue.is_empty() {
+		database.dequeue_unbatched_entries(aspect, &entries_to_dequeue).await?;
+		info!(dequeued = entries_to_dequeue.len(), "Dequeued processed timestamps");
 	}
 
 	info!(batches_created, "Incremental batch creation complete");

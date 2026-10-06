@@ -542,8 +542,7 @@ impl AspectStructure for Aspect {
 			)
 			.await?;
 
-		// Note: No indexes to support MVCC (turso MVCC doesn't support indexes yet)
-		// Duplicate batch detection must be handled at application level
+		Self::index_batch_hashes(conn).await;
 
 		Database::commit_concurrent(conn).await?;
 
@@ -1345,7 +1344,24 @@ impl Aspect {
 			)
 			.await?;
 
+		Self::index_batch_hashes(conn).await;
+
 		Ok(())
+	}
+
+	/// Index the batches by `(aspect_id, batch_hash)` for the queue's duplicate check
+	/// (crash-consistency design, S18), which looks a batch's hash up in the unprocessed and
+	/// the processed batches before queuing it. Without the index each lookup scans the
+	/// table, measurements and all, and the processed batches are drained only by pattern
+	/// extraction. `IF NOT EXISTS`, so a table created before the index exists gets it the
+	/// first time this process opens it. Turso 0.8 maintains indexes under MVCC; like the
+	/// measurements' timestamp index this is best-effort, and a failure only makes the
+	/// lookups scan. Not unique: duplicate batches stored before the check may exist, and
+	/// the dedupe is application-level.
+	async fn index_batch_hashes(conn: &Connection) {
+		if let Err(e) = conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_batches_hash ON batches(aspect_id, batch_hash)", turso::params![]).await {
+			tracing::warn!("Could not create the batch hash index; duplicate checks will scan the batches: {e}");
+		}
 	}
 
 	#[instrument]

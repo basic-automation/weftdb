@@ -1066,7 +1066,7 @@ impl DatabaseStructure for Database {
 	}
 
 	async fn get_earliest_measurement(&self, aspect_id: &AspectId) -> Result<Option<DateTime<Utc>>> {
-		let cache_key = format!("metadata_earliest_measurement_{}", aspect_id.as_uuid());
+		let cache_key = Self::earliest_measurement_cache_key(aspect_id);
 		self.cache.lock().await.cleanup_expired().await;
 		if let Some(cached) = self.cache.lock().await.get(&cache_key).await {
 			return Ok(Some(cached));
@@ -1460,6 +1460,23 @@ impl DatabaseStructure for Database {
 }
 
 impl Database {
+	/// The cache key of an aspect's earliest measurement timestamp.
+	fn earliest_measurement_cache_key(aspect_id: &AspectId) -> String {
+		format!("metadata_earliest_measurement_{}", aspect_id.as_uuid())
+	}
+
+	/// Forget the cached earliest measurement of `aspect_id`, after rows were committed
+	/// that may be earlier (crash-consistency design, S18).
+	///
+	/// The queue consumer aligns its windows on the earliest measurement. While a stale
+	/// value was cached (for minutes, and nothing invalidated it), every timestamp of a
+	/// backfill before it fell before the consumer's base, where it has no window, so the
+	/// consumer cleared those timestamps from the queue and the backfilled rows were never
+	/// batched.
+	pub(crate) async fn forget_cached_earliest_measurement(&self, aspect_id: &AspectId) {
+		self.cache.lock().await.invalidate(&Self::earliest_measurement_cache_key(aspect_id)).await;
+	}
+
 	/// DDL-safe version that uses a direct `turso::Connection` for schema creation
 	/// DDL operations (CREATE TABLE) may not work well with BEGIN CONCURRENT transactions
 	/// Note: Tables have no indexes to support MVCC (turso MVCC doesn't support indexes yet)
@@ -1620,6 +1637,22 @@ impl Default for DatabaseId {
 	fn default() -> Self {
 		Self::new()
 	}
+}
+
+/// One entry of an aspect's unbatched-measurements queue, as a queue consumer read it.
+///
+/// `queued_at` is part of the entry's identity: enqueuing a timestamp that is already
+/// queued moves its `queued_at` strictly forward, and
+/// [`dequeue_unbatched_entries`](traits::Inputs::dequeue_unbatched_entries) removes an
+/// entry only while it still has the `queued_at` it was read with. So a timestamp queued
+/// again after a consumer read it, such as by ingest once the timestamp's row is
+/// committed, stays queued for the consumer's next run (crash-consistency design, S18).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UnbatchedEntry {
+	/// The measurement timestamp the entry queues.
+	pub data_timestamp: DateTime<Utc>,
+	/// When the timestamp was (last) queued, in Unix milliseconds; see the type docs.
+	pub queued_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

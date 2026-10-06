@@ -9,7 +9,7 @@ pub use catalog::CatalogStore;
 pub use compression::{AggressivenessScaling, CompressionConfig, CompressionPhase, CompressionProgress, CompressionResult, CompressionSummary, DetailedCompressionSummary, DirtyRegion, LastCompressionInfo, ProgressCallback, SizeBasedCompressionConfig, TierCompressionResult, TimeBasedCompressionConfig};
 pub use correlation::{Correlation, CorrelationID, Correlations};
 pub use database::{
-	clear_connection_cache_by_name, data_dir, default_data_dir, traits::{Config, DatabaseStructure, EventDatabase, Outputs, PatternDatabase, PipelineInputs, PipelineOutputs}, Database, DatabaseId, DatabaseInfo, DatabaseMap, DATABASES
+	clear_connection_cache_by_name, data_dir, default_data_dir, traits::{Config, DatabaseStructure, EventDatabase, Outputs, PatternDatabase, PipelineInputs, PipelineOutputs}, Database, DatabaseId, DatabaseInfo, DatabaseMap, UnbatchedEntry, DATABASES
 };
 pub use dataset::{Dataset, DatasetId};
 pub use dictionary::{Dictionary, DictionaryConstraints, DictionaryId, DictionaryMetadata, Steps, Variability, VariablilityType};

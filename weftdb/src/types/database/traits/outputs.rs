@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use futures::Stream;
 use splimes::{Point, Resolution, Spline};
 
-use crate::{AspectId, Batch, BatchId, Correlation, CorrelationID, DictionaryMetadata, Event, EventID, Measurement, Pattern, PatternID};
+use crate::{AspectId, Batch, BatchId, Correlation, CorrelationID, DictionaryMetadata, Event, EventID, Measurement, Pattern, PatternID, UnbatchedEntry};
 
 /// Trait for database analysis and output operations
 #[async_trait::async_trait]
@@ -16,6 +16,14 @@ pub trait Outputs {
 
 	/// Get all unbatched measurement timestamps for an aspect (measurements not yet included in batches)
 	async fn get_unbatched_measurements(&self, aspect_id: &AspectId) -> Result<Vec<DateTime<Utc>>>;
+
+	/// Get every unbatched queue entry for an aspect, with the `queued_at` it was read at.
+	///
+	/// A queue consumer reads these, not bare timestamps, and dequeues what it batched with
+	/// [`Inputs::dequeue_unbatched_entries`](crate::database::traits::Inputs::dequeue_unbatched_entries),
+	/// so that a timestamp queued again after this read stays queued (see
+	/// [`UnbatchedEntry`]).
+	async fn get_unbatched_entries(&self, aspect_id: &AspectId) -> Result<Vec<UnbatchedEntry>>;
 
 	/// Count unbatched measurements for an aspect
 	async fn count_unbatched_measurements(&self, aspect_id: &AspectId) -> Result<u64>;

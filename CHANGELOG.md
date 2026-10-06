@@ -28,6 +28,9 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 - `Database::list_stored_databases()` lists the legacy databases on disk (the folders
   of the data directory that hold a `metadata.db`), sweeping the build directories of
   interrupted `Database::new` calls first. `weft-tui` lists databases through it.
+- `Outputs::get_unbatched_entries` and `Inputs::dequeue_unbatched_entries` read and
+  dequeue unbatched-queue entries together with their `queued_at` (`UnbatchedEntry`),
+  so a queue consumer dequeues only what it read; see the ingest fix below.
 - `weft-orchestration` has a `fault-injection` feature (it enables weftdb's) for its
   crash tests: `cargo test -p weft-orchestration --features fault-injection --test legacy_queue_crash`.
 
@@ -46,20 +49,39 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 - **Legacy ingest could store rows that were never batched.** `batch_capture_measurements`
   and `capture_measurement` queued the timestamps for batching only after the rows
   committed, so a failure in between left rows the incremental pipeline never saw.
-  The timestamps are now queued first, so the queue always covers the stored rows; a
-  timestamp whose row never landed waits in the queue, and the incremental build no
-  longer fails on an aspect whose queue holds timestamps but no rows yet. Updating the
-  aspect's earliest/latest columns after the insert is now best-effort, like the
-  dirty-region marking, so it cannot fail a call whose rows are already stored.
+  The timestamps are now queued before the insert, and queued again once their rows (or
+  each chunk) are committed. The incremental build no longer fails on an aspect whose
+  queue holds timestamps but no rows yet.
+- **An incremental build running during an ingest could drop the ingest's rows.** It
+  could read a queued timestamp before its row was committed, build the window without
+  it and dequeue it, and it cleared the whole queue when every queued timestamp lay
+  before the earliest stored row, as a backfill's do. Enqueuing a timestamp that is
+  already queued now moves its `queued_at` forward (it used to keep the old one), and
+  the build dequeues only the entries it read with the `queued_at` it read, so the
+  second enqueue after the commit keeps the row queued for the next build. The cached
+  earliest measurement, which the build aligns its windows on, is also dropped when
+  ingest commits rows: a stale value made the build clear a backfill from the queue.
+  Calling `build_incremental_unprocessed_queue` (or `Pipeline::prepare_data`) while
+  ingesting into the same aspect is therefore safe, unless the ingest also dies between
+  a commit and its second enqueue.
+- **Legacy ingest could fail after its rows were stored.** The steps after the commit
+  (the second enqueue, the checkpoint, the dirty-region marking, the aspect's
+  earliest/latest columns and `capture_measurement`'s transaction-log entry) are now
+  best-effort: a failure is logged and the call returns `Ok`, since a client would retry
+  an error into duplicate rows.
 - **A crashed batch consumer queued its batches twice.** `insert_unprocessed_batch` and
   `batch_insert_unprocessed_batches` now skip a batch whose `(aspect_id, batch_hash)` is
   already queued or processed, so re-running the incremental build after a crash before
   its dequeue adds no duplicate batches or pattern occurrences. Processed batches keep
   the hash they were queued under (it used to be recomputed from the processed
-  measurements).
-- Two rows-mode ingest residuals remain until aspects move to the segment store, and
-  are now documented on `batch_capture_measurements`: an error mid-call leaves the
-  chunks committed before it, and retrying stores those rows again.
+  measurements). The unprocessed and processed batch databases gain an index,
+  `idx_batches_hash` on `batches(aspect_id, batch_hash)`, created when a process first
+  opens them, so each check is a point lookup. Batches that pattern extraction has
+  already consumed (and deleted) are not recognised: after a consumer crash, re-run the
+  consumer before processing and extracting, as `Pipeline::run` does.
+- Rows-mode ingest residuals remain until aspects move to the segment store, and are now
+  documented on `batch_capture_measurements` and `capture_measurement`: an error mid-call
+  leaves the chunks committed before it, and retrying stores those rows again.
 - **Commit failures were silently ignored.** A control-plane write that lost an MVCC
   conflict was reported as success. Commit errors now reach the caller, and the
   transaction is rolled back.

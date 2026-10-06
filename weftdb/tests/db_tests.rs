@@ -1108,6 +1108,78 @@ async fn queuing_a_queued_or_processed_batch_again_stores_nothing() -> Result<()
 	Ok(())
 }
 
+/// A queue entry read by a consumer and queued again afterwards survives the consumer's
+/// dequeue (crash-consistency design, S18): enqueuing a queued timestamp moves its
+/// `queued_at` strictly forward, even within the same millisecond, and
+/// `dequeue_unbatched_entries` removes an entry only while it has the `queued_at` it was
+/// read with. Ingest relies on this to keep a row it committed after a consumer read the
+/// row's write-ahead entry. Dequeuing bare timestamps removed it.
+#[tokio::test]
+#[serial]
+async fn an_entry_queued_again_after_it_was_read_survives_the_dequeue() -> Result<()> {
+	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
+	let aspect_id = aspect.id();
+	let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+	let (requeued, untouched) = (base, base + Duration::minutes(1));
+
+	db.enqueue_unbatched_measurements(&aspect_id, &[requeued, untouched]).await?;
+	let read = db.get_unbatched_entries(&aspect_id).await?;
+	assert_eq!(read.len(), 2);
+	db.enqueue_unbatched_measurement(&aspect_id, requeued).await?;
+	let after = db.get_unbatched_entries(&aspect_id).await?;
+	let queued_at = |entries: &[weftdb::UnbatchedEntry], at| entries.iter().find(|entry| entry.data_timestamp == at).map(|entry| entry.queued_at);
+	assert!(queued_at(&after, requeued) > queued_at(&read, requeued), "queuing again moves queued_at forward: {read:?} -> {after:?}");
+	assert_eq!(queued_at(&after, untouched), queued_at(&read, untouched));
+
+	db.dequeue_unbatched_entries(&aspect_id, &read).await?;
+	assert_eq!(db.get_unbatched_measurements(&aspect_id).await?, vec![requeued], "only the entry not queued again since the read is dequeued");
+	db.dequeue_unbatched_entries(&aspect_id, &db.get_unbatched_entries(&aspect_id).await?).await?;
+	assert_eq!(db.count_unbatched_measurements(&aspect_id).await?, 0);
+	Ok(())
+}
+
+/// The batch tables carry the `(aspect_id, batch_hash)` index that the queue's duplicate
+/// check looks a batch up in (crash-consistency design, S18), so each check is a point
+/// lookup instead of a scan of every stored batch; and a batch table created before the
+/// index gets it the next time a process opens it.
+#[tokio::test]
+#[serial]
+async fn the_batch_tables_index_their_hashes() -> Result<()> {
+	/// Turso's plan for the duplicate check's lookup in `batches`.
+	async fn lookup_plan(conn: &turso::Connection) -> Result<String> {
+		let mut rows = conn.query("EXPLAIN QUERY PLAN SELECT 1 FROM batches WHERE aspect_id = ? AND batch_hash = ? LIMIT 1", ("aspect", "hash")).await?;
+		let mut plan = String::new();
+		while let Some(row) = rows.next().await? {
+			plan.push_str(&row.get::<String>(3)?);
+		}
+		Ok(plan)
+	}
+
+	let (_temp_dir, db, subject, aspect) = setup_test_database().await?;
+	let aspect_id = aspect.id();
+	let name = db.name().to_string();
+	drop((subject, aspect));
+	for processed in [false, true] {
+		let batches = if processed { db.get_processed_batches_db(&aspect_id).await? } else { db.get_unprocessed_batches_db(&aspect_id).await? };
+		let conn = batches.connect()?;
+		let plan = lookup_plan(&conn).await?;
+		assert!(plan.contains("idx_batches_hash"), "processed={processed}: the lookup does not use the hash index: {plan}");
+		// What a batch table created before the index looks like.
+		conn.execute("DROP INDEX idx_batches_hash", ()).await?;
+		assert!(!lookup_plan(&conn).await?.contains("idx_batches_hash"), "precondition: the index is gone");
+	}
+	release_database(db, &name).await;
+
+	let db = Database::existing(&name).await?;
+	for processed in [false, true] {
+		let batches = if processed { db.get_processed_batches_db(&aspect_id).await? } else { db.get_unprocessed_batches_db(&aspect_id).await? };
+		let plan = lookup_plan(&batches.connect()?).await?;
+		assert!(plan.contains("idx_batches_hash"), "processed={processed}: reopening did not add the hash index: {plan}");
+	}
+	release_database(db, &name).await;
+	Ok(())
+}
+
 /// `Database::new` refuses a name of the form of its own build directories
 /// (`.{name}.creating-{nonce}`), which a stale-build sweep would take for crash litter.
 #[tokio::test]
