@@ -11,8 +11,10 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 ### Added
 
 - **Interpolation grids requested over HTTP are capped** at 10,000,000 points per
-  request (`weft_server::MAX_INTERPOLATE_OUTPUT_POINTS`), on every
-  `/api/v1/interpolate*` endpoint. A larger grid is a `400` that names its size and the
+  request by default (`weft_server::MAX_INTERPOLATE_OUTPUT_POINTS`), on every
+  `/api/v1/interpolate*` endpoint; set `WEFT_MAX_INTERPOLATE_POINTS` to change it. The
+  variable is read once at startup, and a value that is not a positive integer stops
+  `weft-server` from starting. A larger grid is a `400` that names its size and the
   limit, refused before anything is allocated; before, a fine resolution over a long
   range tried to allocate all of it.
 - **`weft-server` calibrates the interpolation backends at startup.** Once the listener

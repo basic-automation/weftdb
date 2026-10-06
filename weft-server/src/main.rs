@@ -13,6 +13,13 @@
 //! only the stateless interpolation/downsample API and those endpoints answer
 //! `503`. Readiness (`GET /ready`) reports which mode is active.
 //!
+//! ## Interpolation cap
+//!
+//! Every `/api/v1/interpolate*` request may produce at most 10,000,000 output points
+//! (`weft_server::MAX_INTERPOLATE_OUTPUT_POINTS`); `WEFT_MAX_INTERPOLATE_POINTS` sets
+//! another positive limit. It is read once at startup, and a value that is not a
+//! positive integer stops the server from starting.
+//!
 //! ## GPU calibration
 //!
 //! Once the listener is bound, the server calibrates the interpolation engine's backend
@@ -26,7 +33,7 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use weft_server::{
-	app_with_state, gpu::{self, CalibrationMode, GPU_CALIBRATE_ENV}, spawn_backup_daemon, spawn_reconcile_daemon, AppState, BackupDaemonConfig, ReconcileDaemonConfig, SERVICE, VERSION
+	app_with_state, gpu::{self, CalibrationMode, GPU_CALIBRATE_ENV}, spawn_backup_daemon, spawn_reconcile_daemon, AppState, BackupDaemonConfig, InterpolateConfig, ReconcileDaemonConfig, MAX_INTERPOLATE_POINTS_ENV, SERVICE, VERSION
 };
 use weftdb::SegmentStore;
 
@@ -107,7 +114,8 @@ async fn main() -> anyhow::Result<()> {
 	let otel_provider = init_tracing();
 	let addr: SocketAddr = std::env::var("WEFT_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string()).parse()?;
 
-	let state = build_state().await?;
+	let interpolate = interpolate_config_from_env()?;
+	let state = build_state().await?.with_interpolate_config(interpolate);
 	spawn_reconcile_daemon_if_configured(&state)?;
 	spawn_backup_daemon_if_configured(&state)?;
 
@@ -181,6 +189,19 @@ fn build_otlp_provider() -> Option<opentelemetry_sdk::trace::SdkTracerProvider> 
 	};
 	let resource = opentelemetry_sdk::Resource::builder().with_service_name(SERVICE).build();
 	Some(opentelemetry_sdk::trace::SdkTracerProvider::builder().with_batch_exporter(exporter).with_resource(resource).build())
+}
+
+/// Read the interpolation settings ([`InterpolateConfig`]) from
+/// `WEFT_MAX_INTERPOLATE_POINTS`, once, and log the output-grid cap in force.
+///
+/// # Errors
+///
+/// A value that is not a positive integer (a malformed operator config should fail
+/// loudly at start rather than silently default).
+fn interpolate_config_from_env() -> anyhow::Result<InterpolateConfig> {
+	let config = InterpolateConfig::from_env_value(std::env::var(MAX_INTERPOLATE_POINTS_ENV).ok().as_deref()).map_err(anyhow::Error::msg)?;
+	println!("interpolation: at most {} output points per request (set {MAX_INTERPOLATE_POINTS_ENV} to change)", config.max_output_points());
+	Ok(config)
 }
 
 /// Start the GPU calibration ([`gpu::calibrate`]) in the background on tokio's blocking

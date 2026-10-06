@@ -9,9 +9,10 @@
 //!
 //! splimes is synchronous and CPU-bound, so every call runs on tokio's blocking pool
 //! (`Interpolator::run_async`), never on an async worker. The output grid comes from the
-//! request (`start`, `end`, `resolution`), so it is capped at
-//! [`MAX_INTERPOLATE_OUTPUT_POINTS`]; a larger grid is a `400`, refused before anything
-//! is allocated.
+//! request (`start`, `end`, `resolution`), so it is capped by [`InterpolateConfig`]: at
+//! [`MAX_INTERPOLATE_OUTPUT_POINTS`] unless the operator sets
+//! [`MAX_INTERPOLATE_POINTS_ENV`]. A larger grid is a `400`, refused before anything is
+//! allocated.
 //!
 //! ## Numeric boundary (deliberate, documented)
 //!
@@ -21,6 +22,8 @@
 //! convenience for this slice, not a precision decision. Schema-declared physical
 //! encodings (Phase 4) replace this with explicit, lossless-by-default types — at
 //! which point this endpoint gains a precision-preserving value representation.
+
+use std::num::NonZeroUsize;
 
 use axum::{
 	extract::{Query, State}, http::{header, StatusCode}, response::{IntoResponse, Response}, Json
@@ -61,18 +64,70 @@ pub struct OutputPoint {
 	pub kind: PointKind,
 }
 
-/// The most output points one interpolation request may produce.
+/// The default for the most output points one interpolation request may produce
+/// ([`InterpolateConfig::max_output_points`]).
 ///
 /// The grid is `start..=end` at `resolution`, all three from the request, so without a
 /// cap a nanosecond grid over a day (86 trillion points) would try to allocate itself.
 /// Ten million points is about 0.7 GB of JSON, far beyond any interactive query; larger
-/// reconstructions belong in several requests over sub-ranges.
+/// reconstructions belong in several requests over sub-ranges. An operator changes it
+/// with [`MAX_INTERPOLATE_POINTS_ENV`].
 pub const MAX_INTERPOLATE_OUTPUT_POINTS: usize = 10_000_000;
 
-/// The interpolator every endpoint here runs: `spline` onto a `resolution` grid on the
-/// default `Backend::Auto`, refusing grids above [`MAX_INTERPOLATE_OUTPUT_POINTS`].
-const fn interpolator(spline: Spline, resolution: Resolution) -> Interpolator {
-	Interpolator::new(spline, resolution).max_points(MAX_INTERPOLATE_OUTPUT_POINTS)
+/// Environment variable that sets [`InterpolateConfig::max_output_points`]: a positive
+/// integer, read once at startup. Unset means [`MAX_INTERPOLATE_OUTPUT_POINTS`].
+pub const MAX_INTERPOLATE_POINTS_ENV: &str = "WEFT_MAX_INTERPOLATE_POINTS";
+
+/// The interpolation settings every `/api/v1/interpolate*` handler applies.
+///
+/// Read once at startup ([`InterpolateConfig::from_env_value`]) and held in
+/// [`AppState`](crate::AppState), from which the handlers extract it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterpolateConfig {
+	/// The most output points one request may produce.
+	max_output_points: NonZeroUsize,
+}
+
+impl InterpolateConfig {
+	/// The defaults: at most [`MAX_INTERPOLATE_OUTPUT_POINTS`] output points per request.
+	pub const DEFAULT: Self = Self { max_output_points: NonZeroUsize::new(MAX_INTERPOLATE_OUTPUT_POINTS).expect("the default cap is positive") };
+
+	/// Settings that allow at most `max_output_points` output points per request.
+	#[must_use]
+	pub const fn new(max_output_points: NonZeroUsize) -> Self {
+		Self { max_output_points }
+	}
+
+	/// The settings for a value of [`MAX_INTERPOLATE_POINTS_ENV`] (`None` when it is
+	/// unset, which gives [`DEFAULT`](Self::DEFAULT)).
+	///
+	/// # Errors
+	///
+	/// A message naming the variable when the value is not a positive integer (`0`, a
+	/// negative or fractional number, or text), so a malformed setting fails startup
+	/// instead of silently falling back to the default.
+	pub fn from_env_value(value: Option<&str>) -> Result<Self, String> {
+		value.map_or(Ok(Self::DEFAULT), |raw| raw.parse().map(Self::new).map_err(|e| format!("{MAX_INTERPOLATE_POINTS_ENV}={raw:?} is not a positive integer: {e}")))
+	}
+
+	/// The most output points one request may produce; a larger grid is a `400`.
+	#[must_use]
+	pub const fn max_output_points(self) -> usize {
+		self.max_output_points.get()
+	}
+
+	/// The interpolator every endpoint here runs: `spline` onto a `resolution` grid on
+	/// the default `Backend::Auto`, refusing grids above
+	/// [`max_output_points`](Self::max_output_points).
+	const fn interpolator(self, spline: Spline, resolution: Resolution) -> Interpolator {
+		Interpolator::new(spline, resolution).max_points(self.max_output_points())
+	}
+}
+
+impl Default for InterpolateConfig {
+	fn default() -> Self {
+		Self::DEFAULT
+	}
 }
 
 /// Spline method selector. Mirrors [`splimes::Spline`] but with stable,
@@ -210,11 +265,11 @@ impl ApiError {
 	/// Map an interpolation failure to a status by its variant: a request the engine
 	/// cannot serve as asked (a grid over the cap, bad polynomial parameters, a value or
 	/// an extrapolation beyond `f64`'s range) is the caller's `400`; anything else is a
-	/// `500`.
-	fn from_engine(err: &splimes::Error) -> Self {
+	/// `500`. `config` supplies the cap an oversized grid's message names.
+	fn from_engine(err: &splimes::Error, config: InterpolateConfig) -> Self {
 		use splimes::Error as E;
 		match err {
-			E::OutputTooLarge { points } => Self::bad_request(format!("the output grid would have {points} points, more than the {MAX_INTERPOLATE_OUTPUT_POINTS} one request may produce; narrow `start`..`end` or use a coarser `resolution`")),
+			E::OutputTooLarge { points } => Self::bad_request(format!("the output grid would have {points} points, more than the {} one request may produce; narrow `start`..`end` or use a coarser `resolution`", config.max_output_points())),
 			E::NoPoints => Self::bad_request("`points` must not be empty"),
 			E::InvalidTimeRange { .. } => Self::bad_request("`end` must not be before `start`"),
 			E::InvalidDegree { .. } | E::InvalidBoundsFactor(_) | E::ValueOutOfRange { .. } | E::NonFiniteResult { .. } | E::InsufficientPoints { .. } => Self::bad_request(err.to_string()),
@@ -251,12 +306,12 @@ impl IntoResponse for ApiError {
 /// # Errors
 ///
 /// Returns [`ApiError::BadRequest`] for an empty point set, a non-finite value,
-/// an inverted range, an output grid above [`MAX_INTERPOLATE_OUTPUT_POINTS`], or
+/// an inverted range, an output grid above [`InterpolateConfig::max_output_points`], or
 /// parameters the engine rejects, and [`ApiError::Internal`] if the engine fails.
-pub async fn interpolate(State(metrics): State<SharedMetrics>, Json(request): Json<InterpolateRequest>) -> Result<Json<InterpolateResponse>, ApiError> {
+pub async fn interpolate(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, Json(request): Json<InterpolateRequest>) -> Result<Json<InterpolateResponse>, ApiError> {
 	let start = std::time::Instant::now();
 	metrics.record_interpolate_request();
-	let result = interpolate_inner(request).await;
+	let result = interpolate_inner(request, config).await;
 	record_outcome(&metrics, &result);
 	// Latency of every request — success and error alike — feeds the p95 target.
 	metrics.observe_interpolate_latency(start.elapsed());
@@ -274,7 +329,7 @@ fn record_outcome(metrics: &SharedMetrics, result: &Result<Json<InterpolateRespo
 
 /// The core JSON-request handling: validate, lift to `BigDecimal` points, derive
 /// the range, then delegate to [`run_interpolation`].
-async fn interpolate_inner(request: InterpolateRequest) -> Result<Json<InterpolateResponse>, ApiError> {
+async fn interpolate_inner(request: InterpolateRequest, config: InterpolateConfig) -> Result<Json<InterpolateResponse>, ApiError> {
 	if request.points.is_empty() {
 		return Err(ApiError::bad_request("`points` must not be empty"));
 	}
@@ -295,7 +350,7 @@ async fn interpolate_inner(request: InterpolateRequest) -> Result<Json<Interpola
 	let start = request.start.unwrap_or_else(|| points.iter().map(|p| p.timestamp).min().unwrap_or_else(Utc::now));
 	let end = request.end.unwrap_or_else(|| points.iter().map(|p| p.timestamp).max().unwrap_or_else(Utc::now));
 
-	run_interpolation(points, start, end, request.spline.into(), request.resolution.into(), input_points).await
+	run_interpolation(points, start, end, request.spline.into(), request.resolution.into(), input_points, config).await
 }
 
 /// Run the engine over a prepared point set and shape the response. Shared by
@@ -309,7 +364,7 @@ async fn interpolate_inner(request: InterpolateRequest) -> Result<Json<Interpola
 /// provenance shaping) child spans; the f64 → `BigDecimal` input lift is timed by the
 /// sibling `interpolate.parse` span in [`interpolate_inner`].
 #[tracing::instrument(name = "interpolate.engine", skip_all, fields(input_points = input_points, spline = %spline, resolution = ?resolution, output_points = tracing::field::Empty))]
-async fn run_interpolation(points: Vec<Point>, start: DateTime<Utc>, end: DateTime<Utc>, spline: Spline, resolution: Resolution, input_points: usize) -> Result<Json<InterpolateResponse>, ApiError> {
+async fn run_interpolation(points: Vec<Point>, start: DateTime<Utc>, end: DateTime<Utc>, spline: Spline, resolution: Resolution, input_points: usize, config: InterpolateConfig) -> Result<Json<InterpolateResponse>, ApiError> {
 	if end < start {
 		return Err(ApiError::bad_request("`end` must not be before `start`"));
 	}
@@ -321,7 +376,7 @@ async fn run_interpolation(points: Vec<Point>, start: DateTime<Utc>, end: DateTi
 	// itself, on tokio's blocking pool, isolated from the result shaping so the
 	// dominant compute cost is attributable on its own. splimes labels every output
 	// point raw / interpolated / extrapolated as it goes.
-	let output = interpolator(spline, resolution).run_async(points, start, end).instrument(tracing::info_span!("interpolate.compute")).await.map_err(|err| ApiError::from_engine(&err))?;
+	let output = config.interpolator(spline, resolution).run_async(points, start, end).instrument(tracing::info_span!("interpolate.compute")).await.map_err(|err| ApiError::from_engine(&err, config))?;
 
 	// `interpolate.serialize` child span (roadmap Phase 3): the `BigDecimal` → wire-f64
 	// conversion of every output grid point, with its provenance — the result-shaping
@@ -420,9 +475,9 @@ fn interpolate_response_to_parquet(response: &InterpolateResponse) -> Result<Res
 /// As [`interpolate`]: [`ApiError::BadRequest`] for an empty point set, a
 /// non-finite value, or an inverted range, and [`ApiError::Internal`] on an engine
 /// or Arrow-encoding failure.
-pub async fn interpolate_arrow(State(metrics): State<SharedMetrics>, Json(request): Json<InterpolateRequest>) -> Result<Response, ApiError> {
+pub async fn interpolate_arrow(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, Json(request): Json<InterpolateRequest>) -> Result<Response, ApiError> {
 	metrics.record_interpolate_request();
-	let result = interpolate_inner(request).await;
+	let result = interpolate_inner(request, config).await;
 	record_outcome(&metrics, &result);
 	interpolate_response_to_arrow(&result?.0)
 }
@@ -442,9 +497,9 @@ pub async fn interpolate_arrow(State(metrics): State<SharedMetrics>, Json(reques
 /// As [`interpolate`]: [`ApiError::BadRequest`] for an empty point set, a
 /// non-finite value, or an inverted range, and [`ApiError::Internal`] on an engine
 /// or Parquet-encoding failure.
-pub async fn interpolate_parquet(State(metrics): State<SharedMetrics>, Json(request): Json<InterpolateRequest>) -> Result<Response, ApiError> {
+pub async fn interpolate_parquet(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, Json(request): Json<InterpolateRequest>) -> Result<Response, ApiError> {
 	metrics.record_interpolate_request();
-	let result = interpolate_inner(request).await;
+	let result = interpolate_inner(request, config).await;
 	record_outcome(&metrics, &result);
 	interpolate_response_to_parquet(&result?.0)
 }
@@ -463,9 +518,9 @@ pub async fn interpolate_parquet(State(metrics): State<SharedMetrics>, Json(requ
 /// As [`interpolate`]: [`ApiError::BadRequest`] for an empty point set, a
 /// non-finite value, or an inverted range, and [`ApiError::Internal`] on an engine
 /// failure.
-pub async fn interpolate_csv(State(metrics): State<SharedMetrics>, Json(request): Json<InterpolateRequest>) -> Result<Response, ApiError> {
+pub async fn interpolate_csv(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, Json(request): Json<InterpolateRequest>) -> Result<Response, ApiError> {
 	metrics.record_interpolate_request();
-	let result = interpolate_inner(request).await;
+	let result = interpolate_inner(request, config).await;
 	record_outcome(&metrics, &result);
 	Ok(interpolate_response_to_csv(&result?.0))
 }
@@ -506,9 +561,9 @@ pub struct PointResponse {
 ///
 /// Returns [`ApiError::BadRequest`] for an empty point set, a non-finite value, or
 /// parameters the engine rejects, and [`ApiError::Internal`] if the engine fails.
-pub async fn interpolate_point(State(metrics): State<SharedMetrics>, Json(request): Json<PointRequest>) -> Result<Json<PointResponse>, ApiError> {
+pub async fn interpolate_point(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, Json(request): Json<PointRequest>) -> Result<Json<PointResponse>, ApiError> {
 	metrics.record_interpolate_request();
-	let result = interpolate_point_inner(request).await;
+	let result = interpolate_point_inner(request, config).await;
 	match &result {
 		Ok(_) => metrics.add_output_points(1),
 		Err(_) => metrics.record_interpolate_error(),
@@ -516,7 +571,7 @@ pub async fn interpolate_point(State(metrics): State<SharedMetrics>, Json(reques
 	result
 }
 
-async fn interpolate_point_inner(request: PointRequest) -> Result<Json<PointResponse>, ApiError> {
+async fn interpolate_point_inner(request: PointRequest, config: InterpolateConfig) -> Result<Json<PointResponse>, ApiError> {
 	let PointRequest { spline, instant, points: input } = request;
 	if input.is_empty() {
 		return Err(ApiError::bad_request("`points` must not be empty"));
@@ -535,7 +590,7 @@ async fn interpolate_point_inner(request: PointRequest) -> Result<Json<PointResp
 	// exactly that one instant, and splimes labels it raw / interpolated / extrapolated
 	// against the inputs. (The resolution only sets the step, which a one-point grid
 	// never takes.)
-	let output = interpolator(spline, Resolution::Nanoseconds).run_async(points, instant, instant).await.map_err(|err| ApiError::from_engine(&err))?;
+	let output = config.interpolator(spline, Resolution::Nanoseconds).run_async(points, instant, instant).await.map_err(|err| ApiError::from_engine(&err, config))?;
 	let (_, value, kind) = output.iter().next().ok_or_else(|| ApiError::internal("interpolation produced no value at the instant"))?;
 
 	Ok(Json(PointResponse { spline: spline_label, instant, input_points: input.len(), value: value.to_f64().unwrap_or_default(), kind }))
@@ -587,12 +642,12 @@ impl IlpParams {
 ///
 /// Returns [`ApiError::BadRequest`] for an unknown precision/spline/resolution
 /// token, a malformed payload, fewer than two usable points, a zero-span series,
-/// or an output grid above [`MAX_INTERPOLATE_OUTPUT_POINTS`], and
+/// or an output grid above [`InterpolateConfig::max_output_points`], and
 /// [`ApiError::Internal`] if the engine fails.
-pub async fn interpolate_ilp(State(metrics): State<SharedMetrics>, Query(params): Query<IlpParams>, body: String) -> Result<Json<InterpolateResponse>, ApiError> {
+pub async fn interpolate_ilp(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, Query(params): Query<IlpParams>, body: String) -> Result<Json<InterpolateResponse>, ApiError> {
 	let start = std::time::Instant::now();
 	metrics.record_interpolate_request();
-	let result = interpolate_ilp_inner(&params, &body).await;
+	let result = interpolate_ilp_inner(&params, &body, config).await;
 	record_outcome(&metrics, &result);
 	// The ILP path is what a TSBS-style harness drives — its latency feeds p95 too.
 	metrics.observe_interpolate_latency(start.elapsed());
@@ -611,9 +666,9 @@ pub async fn interpolate_ilp(State(metrics): State<SharedMetrics>, Query(params)
 /// # Errors
 ///
 /// As [`interpolate_ilp`].
-pub async fn interpolate_ilp_csv(State(metrics): State<SharedMetrics>, Query(params): Query<IlpParams>, body: String) -> Result<Response, ApiError> {
+pub async fn interpolate_ilp_csv(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, Query(params): Query<IlpParams>, body: String) -> Result<Response, ApiError> {
 	metrics.record_interpolate_request();
-	let result = interpolate_ilp_inner(&params, &body).await;
+	let result = interpolate_ilp_inner(&params, &body, config).await;
 	record_outcome(&metrics, &result);
 	Ok(interpolate_response_to_csv(&result?.0))
 }
@@ -628,9 +683,9 @@ pub async fn interpolate_ilp_csv(State(metrics): State<SharedMetrics>, Query(par
 /// # Errors
 ///
 /// As [`interpolate_ilp`], plus [`ApiError::Internal`] on an Arrow-encoding failure.
-pub async fn interpolate_ilp_arrow(State(metrics): State<SharedMetrics>, Query(params): Query<IlpParams>, body: String) -> Result<Response, ApiError> {
+pub async fn interpolate_ilp_arrow(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, Query(params): Query<IlpParams>, body: String) -> Result<Response, ApiError> {
 	metrics.record_interpolate_request();
-	let result = interpolate_ilp_inner(&params, &body).await;
+	let result = interpolate_ilp_inner(&params, &body, config).await;
 	record_outcome(&metrics, &result);
 	interpolate_response_to_arrow(&result?.0)
 }
@@ -644,14 +699,14 @@ pub async fn interpolate_ilp_arrow(State(metrics): State<SharedMetrics>, Query(p
 /// # Errors
 ///
 /// As [`interpolate_ilp`], plus [`ApiError::Internal`] on a Parquet-encoding failure.
-pub async fn interpolate_ilp_parquet(State(metrics): State<SharedMetrics>, Query(params): Query<IlpParams>, body: String) -> Result<Response, ApiError> {
+pub async fn interpolate_ilp_parquet(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, Query(params): Query<IlpParams>, body: String) -> Result<Response, ApiError> {
 	metrics.record_interpolate_request();
-	let result = interpolate_ilp_inner(&params, &body).await;
+	let result = interpolate_ilp_inner(&params, &body, config).await;
 	record_outcome(&metrics, &result);
 	interpolate_response_to_parquet(&result?.0)
 }
 
-async fn interpolate_ilp_inner(params: &IlpParams, body: &str) -> Result<Json<InterpolateResponse>, ApiError> {
+async fn interpolate_ilp_inner(params: &IlpParams, body: &str, config: InterpolateConfig) -> Result<Json<InterpolateResponse>, ApiError> {
 	let precision = parse_precision_token(params.precision.as_deref())?;
 	let spline = parse_spline_token(params.spline_token())?;
 	let resolution = parse_resolution_token(params.resolution.as_deref())?;
@@ -670,7 +725,7 @@ async fn interpolate_ilp_inner(params: &IlpParams, body: &str) -> Result<Json<In
 	}
 
 	let input_points = points.len();
-	run_interpolation(points, start, end, spline, resolution, input_points).await
+	run_interpolation(points, start, end, spline, resolution, input_points, config).await
 }
 
 /// Map an optional precision token to [`TimestampPrecision`] (default ns).
@@ -1068,23 +1123,69 @@ mod tests {
 		assert!(body["error"].as_str().unwrap().contains("more than the"));
 	}
 
+	/// A cap of ten points, for exercising the exact boundary without a large grid.
+	fn ten_point_cap() -> InterpolateConfig {
+		InterpolateConfig::new(NonZeroUsize::new(10).unwrap())
+	}
+
 	#[test]
-	fn the_interpolator_refuses_one_point_over_the_cap() {
-		// Every endpoint's interpolator carries the cap: one point over it is refused
-		// before anything is allocated, so this costs nothing to check. (splimes allows
-		// exactly `max_points`.)
+	fn the_interpolator_allows_exactly_the_cap_and_refuses_one_more() {
+		// splimes allows a grid of exactly `max_points` points and refuses one more,
+		// before allocating anything.
 		let points = [Point::new(Utc.timestamp_opt(0, 0).unwrap(), BigDecimal::from(0))];
 		let start = Utc.timestamp_opt(0, 0).unwrap();
-		let last = start + chrono::TimeDelta::nanoseconds(i64::try_from(MAX_INTERPOLATE_OUTPUT_POINTS).unwrap() - 1);
-		let over = interpolator(Spline::Linear, Resolution::Nanoseconds).run(&points, start, last + chrono::TimeDelta::nanoseconds(1));
-		assert!(matches!(over, Err(splimes::Error::OutputTooLarge { points }) if points == MAX_INTERPOLATE_OUTPUT_POINTS as u128 + 1), "{over:?}");
-		let at_cap = interpolator(Spline::Linear, Resolution::Seconds).run(&points, start, start + chrono::TimeDelta::seconds(9));
-		assert_eq!(at_cap.map(|o| o.len()).ok(), Some(10));
+		let at_cap = ten_point_cap().interpolator(Spline::Linear, Resolution::Seconds).run(&points, start, start + chrono::TimeDelta::seconds(9));
+		assert_eq!(at_cap.map(|o| o.len()).ok(), Some(10), "a 10-point grid fits a 10-point cap");
+		let over = ten_point_cap().interpolator(Spline::Linear, Resolution::Seconds).run(&points, start, start + chrono::TimeDelta::seconds(10));
+		assert!(matches!(over, Err(splimes::Error::OutputTooLarge { points: 11 })), "{over:?}");
+		// The default cap is the same check at ten million: one over is refused.
+		let over_default = InterpolateConfig::DEFAULT.interpolator(Spline::Linear, Resolution::Nanoseconds).run(&points, start, start + chrono::TimeDelta::nanoseconds(i64::try_from(MAX_INTERPOLATE_OUTPUT_POINTS).unwrap()));
+		assert!(matches!(over_default, Err(splimes::Error::OutputTooLarge { points }) if points == MAX_INTERPOLATE_OUTPUT_POINTS as u128 + 1), "{over_default:?}");
+	}
+
+	#[tokio::test]
+	async fn every_endpoint_applies_the_configured_cap() {
+		// With the cap set to 10, a 10-point grid (0..=9 s) is served and an 11-point grid
+		// (0..=10 s) is a 400 naming both sizes, on every grid-producing endpoint.
+		let router = || crate::app_with_state(crate::AppState::new().with_interpolate_config(ten_point_cap()));
+		let request = |uri: &str, content_type: &str, body: Vec<u8>| Request::builder().method("POST").uri(uri).header("content-type", content_type).body(Body::from(body)).unwrap();
+		let json_body = |end: i64| serde_json::to_vec(&serde_json::json!({ "spline": "linear", "resolution": "seconds", "points": [ { "timestamp": ts(0), "value": 0.0 }, { "timestamp": ts(end), "value": 1.0 } ] })).unwrap();
+		for uri in ["/api/v1/interpolate", "/api/v1/interpolate/csv", "/api/v1/interpolate/arrow", "/api/v1/interpolate/parquet"] {
+			let at_cap = router().oneshot(request(uri, "application/json", json_body(9))).await.unwrap();
+			assert_eq!(at_cap.status(), StatusCode::OK, "{uri}: exactly at the cap");
+			let over = router().oneshot(request(uri, "application/json", json_body(10))).await.unwrap();
+			assert_eq!(over.status(), StatusCode::BAD_REQUEST, "{uri}: one over the cap");
+			let error: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(over.into_body(), usize::MAX).await.unwrap()).unwrap();
+			assert!(error["error"].as_str().unwrap().contains("would have 11 points, more than the 10 one request"), "{uri}: {error}");
+		}
+		let response = router().oneshot(request("/api/v1/interpolate", "application/json", json_body(9))).await.unwrap();
+		let body: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+		assert_eq!(body["output_points"], 10);
+		// ILP derives its range from the data: 0 and 9 or 10 seconds.
+		for uri in ["/api/v1/interpolate/ilp", "/api/v1/interpolate/ilp/csv", "/api/v1/interpolate/ilp/arrow", "/api/v1/interpolate/ilp/parquet"] {
+			let uri = format!("{uri}?field=load&precision=s&spline=linear&resolution=seconds");
+			let at_cap = router().oneshot(request(&uri, "text/plain", b"cpu load=0 0\ncpu load=1 9\n".to_vec())).await.unwrap();
+			assert_eq!(at_cap.status(), StatusCode::OK, "{uri}: exactly at the cap");
+			let over = router().oneshot(request(&uri, "text/plain", b"cpu load=0 0\ncpu load=1 10\n".to_vec())).await.unwrap();
+			assert_eq!(over.status(), StatusCode::BAD_REQUEST, "{uri}: one over the cap");
+		}
+	}
+
+	#[test]
+	fn the_cap_is_read_from_its_environment_variable() {
+		assert_eq!(InterpolateConfig::from_env_value(None), Ok(InterpolateConfig::DEFAULT), "unset is the default");
+		assert_eq!(InterpolateConfig::DEFAULT.max_output_points(), 10_000_000);
+		assert_eq!(InterpolateConfig::from_env_value(Some("10")).map(InterpolateConfig::max_output_points), Ok(10));
+		assert_eq!(InterpolateConfig::from_env_value(Some("50000000")).map(InterpolateConfig::max_output_points), Ok(50_000_000));
+		for invalid in ["0", "-1", "1.5", "ten", "", " 10"] {
+			let error = InterpolateConfig::from_env_value(Some(invalid)).expect_err(invalid);
+			assert!(error.starts_with(&format!("WEFT_MAX_INTERPOLATE_POINTS={invalid:?} is not a positive integer: ")), "{invalid:?}: {error}");
+		}
 	}
 
 	#[test]
 	fn engine_errors_map_to_status_by_variant() {
-		let status = |err: splimes::Error| ApiError::from_engine(&err).into_response().status();
+		let status = |err: splimes::Error| ApiError::from_engine(&err, InterpolateConfig::DEFAULT).into_response().status();
 		let at = Utc.timestamp_opt(0, 0).unwrap();
 		assert_eq!(status(splimes::Error::OutputTooLarge { points: 1 << 40 }), StatusCode::BAD_REQUEST);
 		assert_eq!(status(splimes::Error::NoPoints), StatusCode::BAD_REQUEST);
