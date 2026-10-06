@@ -93,8 +93,3 @@ codegen-units = 1
 
 [profile.test]
 debug = 1
-
-# TEMPORARY: splimes 1.0.0 is not on crates.io yet. Pin the release/1.0 commit so the
-# migration can be built and tested; delete this section once 1.0.0 is published.
-[patch.crates-io]
-splimes = { git = "https://github.com/basic-automation/splimes", rev = "1bee9dd5493f830a9eded00812522725faac68b7" }

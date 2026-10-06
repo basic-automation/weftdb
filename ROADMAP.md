@@ -772,12 +772,11 @@ report → API/format freeze → **1.0**.
 
 ### Hot path & data model *(must land before the freeze)*
 
-- [ ] **splimes 1.0 is released**, and WeftDB depends on it. The interpolation engine is
-  its own crate ([basic-automation/splimes](https://github.com/basic-automation/splimes),
-  0.1.0 published 2026-10-05) with its own 1.0 criteria; a stable WeftDB can't promise a
-  stable API on top of an unstable engine. *WeftDB is migrated to the 1.0 API, built
-  against the `release/1.0` commit through a temporary `[patch.crates-io]` in the root
-  `Cargo.toml`; done once 1.0.0 is on crates.io and the patch is gone.*
+- [x] **splimes 1.0 is released**, and WeftDB depends on it. The interpolation engine is
+  its own crate ([basic-automation/splimes](https://github.com/basic-automation/splimes))
+  with its own 1.0 criteria; a stable WeftDB can't promise a stable API on top of an
+  unstable engine. *splimes 1.0.0 was published to crates.io on 2026-10-05, and WeftDB
+  depends on it from the registry (`splimes = "1"`, no patch or git source).*
 
 - [ ] **Measurement bulk ingest routed through the `.weftseg` seal** — the legacy `batch_capture_measurements` path is super-linear (see [Immediate next actions](#immediate-next-actions))
 - [ ] **B-tags** — per-measurement tags/labels; a data-model change that must precede the API/format freeze

@@ -3942,7 +3942,8 @@ dependencies = [
 [[package]]
 name = "splimes"
 version = "1.0.0"
-source = "git+https://github.com/basic-automation/splimes?rev=1bee9dd5493f830a9eded00812522725faac68b7#1bee9dd5493f830a9eded00812522725faac68b7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "80b4d2f8d35dd1dbfc07ea986a1c2198fbe368edfa8785ed0d03e8295e1247ea"
 dependencies = [
  "bigdecimal",
  "bytemuck",

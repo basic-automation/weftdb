@@ -27,8 +27,7 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 - **`splimes` moved to its own repository** ([basic-automation/splimes](https://github.com/basic-automation/splimes))
   and is now a crates.io dependency. It is released on its own schedule, and a stable
   WeftDB waits on a stable splimes.
-- **splimes 0.1 → 1.0.** WeftDB depends on `splimes = "1"`, built against the
-  `release/1.0` commit through a temporary `[patch.crates-io]` until 1.0.0 is on
+- **splimes 0.1 → 1.0.** WeftDB depends on `splimes = "1"`, resolved to 1.0.0 from
   crates.io. splimes' [migration guide](https://github.com/basic-automation/splimes/blob/main/MIGRATING.md)
   lists the results that change; through WeftDB:
   - large inputs keep their method (0.1 swapped cubic for quadratic from 2,500 input
