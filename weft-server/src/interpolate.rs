@@ -717,8 +717,14 @@ async fn interpolate_ilp_inner(params: &IlpParams, body: &str, config: Interpola
 
 	let points = weft_line_protocol::parse_points(body, &params.field, precision).map_err(|err| ApiError::bad_request(err.to_string()))?;
 
-	// `parse_points` returns points sorted ascending by timestamp; the engine
-	// needs at least two distinct instants to interpolate between.
+	// `parse_points` returns points sorted ascending by timestamp, and the range is their
+	// own span: ILP has no `start`/`end` parameters. splimes 1.0 itself accepts one point
+	// or `start == end` (it returns a one-point `raw` series, as the JSON endpoint does for
+	// one input and no explicit range), but here that could only echo a single input back.
+	// With no range of its own to fill, a payload with fewer than two points or a single
+	// distinct timestamp is far more likely a mistake (the field on only one line, every
+	// line at one timestamp) than a request for that echo, so it stays a `400` that names
+	// the field and the count, as the README documents for this endpoint.
 	if points.len() < 2 {
 		return Err(ApiError::bad_request(format!("need at least two points carrying field `{}` with a timestamp, found {}", params.field, points.len())));
 	}
@@ -993,6 +999,15 @@ mod tests {
 		let (status, body) = post_text("/api/v1/interpolate/ilp?field=load&precision=s", payload).await;
 		assert_eq!(status, StatusCode::BAD_REQUEST);
 		assert!(body["error"].as_str().unwrap().contains("at least two"));
+	}
+
+	#[tokio::test]
+	async fn ilp_endpoint_rejects_a_zero_span_series() {
+		// Two rows at one timestamp: splimes would return a one-point series, but the ILP
+		// range is the data's own span, so the endpoint keeps refusing it.
+		let (status, body) = post_text("/api/v1/interpolate/ilp?field=load&precision=s", "cpu load=1 5\ncpu load=2 5\n").await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+		assert!(body["error"].as_str().unwrap().contains("spans zero time"), "body: {body}");
 	}
 
 	#[tokio::test]
