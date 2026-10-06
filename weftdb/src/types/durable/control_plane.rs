@@ -43,8 +43,28 @@ pub async fn enable_mvcc_full(db: &turso::Database, conn: &turso::Connection, na
 	let mode = pragma(conn, "PRAGMA journal_mode").await.with_context(|| format!("{name}: reading PRAGMA journal_mode"))?;
 	require_mvcc(name, &mode, switched.err())?;
 	let fresh = db.connect().with_context(|| format!("{name}: connecting to read PRAGMA synchronous"))?;
+	#[cfg(test)]
+	downgrade_for_test(&fresh, name).await?;
 	let synchronous = pragma(&fresh, "PRAGMA synchronous").await.with_context(|| format!("{name}: reading PRAGMA synchronous"))?;
 	require_full_sync(name, &synchronous)
+}
+
+#[cfg(test)]
+tokio::task_local! {
+	/// Test-only `(file, statement)`: before the probe reads `PRAGMA synchronous`, it runs
+	/// `statement` (say `PRAGMA synchronous=OFF`) on the fresh connection of the database
+	/// whose file name is `file`. That stands in for a Turso whose new connections are not
+	/// FULL, which Turso 0.8 never produces, so without it nothing could show the real
+	/// open refusing one. Task-local, so the opens of tests running alongside never see it.
+	pub(crate) static NEW_CONNECTION_OVERRIDE: (&'static str, &'static str);
+}
+
+/// Apply [`NEW_CONNECTION_OVERRIDE`] to `fresh` when it names the database at `name`.
+#[cfg(test)]
+async fn downgrade_for_test(fresh: &turso::Connection, name: &str) -> Result<()> {
+	let Ok(Some(statement)) = NEW_CONNECTION_OVERRIDE.try_with(|(file, statement)| (std::path::Path::new(name).file_name() == Some(std::ffi::OsStr::new(file))).then_some(*statement)) else { return Ok(()) };
+	fresh.execute(statement, ()).await.with_context(|| format!("{name}: test override {statement}"))?;
+	Ok(())
 }
 
 /// The single value a pragma query answers with.
@@ -103,6 +123,28 @@ mod tests {
 		enable_mvcc_full(&memory, &memory_conn, ":memory:").await.expect("in-memory stores (tests) run MVCC too");
 		drop(memory_conn);
 		drop(memory);
+	}
+
+	/// The probe reads `synchronous` from a fresh connection and refuses the open on
+	/// anything but FULL. Turso 0.8 always answers FULL, so the override plays a Turso
+	/// that does not; without the probe (or with it reading some other connection) this
+	/// open would pass.
+	#[tokio::test]
+	async fn a_fresh_connection_that_is_not_full_fails_the_probe() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("probe.db");
+		let path = path.to_string_lossy();
+		let db = turso::Builder::new_local(&path).build().await.unwrap();
+		let conn = db.connect().unwrap();
+		for (statement, shown) in [("PRAGMA synchronous=OFF", "0"), ("PRAGMA synchronous=NORMAL", "1")] {
+			let err = NEW_CONNECTION_OVERRIDE.scope(("probe.db", statement), enable_mvcc_full(&db, &conn, &path)).await.expect_err(statement).to_string();
+			assert_eq!(err, format!("a new connection to {path} reports PRAGMA synchronous={shown}, not FULL (2). Without FULL a COMMIT can return before its log reaches the disk, so WeftDB will not open this database"));
+		}
+		// The override names one file; any other database is left alone.
+		NEW_CONNECTION_OVERRIDE.scope(("other.db", "PRAGMA synchronous=OFF"), enable_mvcc_full(&db, &conn, &path)).await.expect("only the named file is downgraded");
+		enable_mvcc_full(&db, &conn, &path).await.expect("a fresh connection is FULL again");
+		drop(conn);
+		drop(db);
 	}
 
 	#[test]

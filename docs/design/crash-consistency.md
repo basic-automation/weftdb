@@ -87,6 +87,7 @@ So a 201 survives a process crash. It does **not** survive power loss, a concurr
 - **Log fsync and errors.** COMMIT under FULL fsyncs the MVCC logical log. A sync error is returned with `?` (mvcc/database/mod.rs:3545). No poison logic exists on that path.
 - **Group commit** is enabled by default (mvcc/database/group_commit.rs:82) and used for non-exclusive commits (mvcc/database/mod.rs:3401-3403).
 - **The log is truncated in place on checkpoint** (mvcc/persistent_storage/logical_log.rs:1032-1046, 1054-1093). It is not unlinked and recreated. So once the `-log` directory entry has been fsynced (S3), it stays durable. This refutes the "Turso recreates -log" risk raised against Atomic Publish.
+- **The switch to MVCC does not fsync the DB file.** `PRAGMA journal_mode=experimental_mvcc` writes page 1 with the MVCC header (vdbe/execute.rs:19149-19160, `OpJournalModeSubState::WritePage`) and never syncs it. Later COMMITs fsync only the `-log`; the DB file is next fsynced by a checkpoint that backfills frames (mvcc/database/checkpoint_state_machine.rs:2979-3011), which comes at the 4 MB log threshold (logical_log.rs:270) or when the last connection closes. The open's probe reads the header back from cache, so it proves the mode in memory, not on disk. A power cut on a brand-new store before that first checkpoint can leave a header that still reads WAL beside a `-log` of acknowledged commits, and Turso then refuses to open the file ("MVCC logical log file exists ... header indicates WAL mode", database.rs:2091-2096). The obvious fix, `File::open(db)?.sync_all()` from WeftDB, is wrong: Turso's lock is a process-associated `F_SETLK` (rustix `fcntl_lock`), which POSIX releases when *any* descriptor the process has on the file closes, so the fsync would silently unlock the DB file for every other process. **Open window, owned by S6** (which owns the open's schema migration): make Turso itself sync the DB file once the switch changed the header, for example a TRUNCATE checkpoint after the migration on a database whose mode was not MVCC before the open; or take an upstream Turso fix that syncs page 1 in `op_journal_mode`.
 - **DB files are fcntl-locked exclusively on open** (io/unix.rs:67-71, 278-299). Two processes already cannot open the same DB file, so a root LOCK file adds a clear error message and covers `segments/`. It does not take away a working multi-process mode.
 - **PASSIVE checkpoints are rejected under MVCC** (translate/pragma.rs:943-948). WeftDB swallows that error (connection.rs:146-157).
 
@@ -325,8 +326,8 @@ This single transaction replaces today's separate commits at segment_store.rs:99
 1. Take LOCK before opening any DB.
 2. Open the four DBs. Probe `PRAGMA journal_mode` and fail the open unless it reports MVCC. Probe `PRAGMA synchronous` on a fresh connection and fail unless it is FULL. This replaces the `.ok()` at segment_index.rs:94, metadata.rs:158, catalog.rs:56 and aspect_catalog.rs:44.
 3. Run the schema migration.
-4. Register database and subject in **one** catalog transaction. Today these are two commits (segment_store.rs:289-290 → catalog.rs:119-160).
-5. fsync `segments/` and the root once, which covers the DB files and their `-log` entries. When the open created the root, the directories it created above it and the parent of the topmost one are fsynced too, so the root itself survives a power cut.
+4. fsync `segments/` and the root once, which covers the DB files and their `-log` entries. The root's parent is fsynced on every open, so the root itself survives a power cut even when the open that created it died before this step; when this open created the root, the directories it created above it and the parent of the topmost one are fsynced too. A root that predates the open and sits in a parent the server cannot read is opened anyway, with a warning.
+5. Register database and subject in **one** catalog transaction. Today these are two commits (segment_store.rs:289-290 → catalog.rs:119-160). This comes after the fsync, so the registration commit lands in a `-log` whose directory entry is already durable.
 6. Run recovery (section 6).
 7. The server binds its listener only after `build_state` returns (weft-server/src/main.rs:98-102), so no request is served before recovery finishes.
 
@@ -671,7 +672,7 @@ Ordering rule: after every slice the store is no worse than today, and every sli
 | S3 | Storage-v2 open hardening, root LOCK, register_scope | 4 | S2 |
 | S4 | Store-wide sweep isolation | 4 | none |
 | S5 | Backup directory atomic publish and hygiene | 7 | S2 |
-| S6 | Schema v2, IndexTxn, poison, root-relative path resolution | 7 | S3 |
+| S6 | Schema v2, IndexTxn, poison, root-relative path resolution, durable MVCC header (section 1.3) | 7 | S3 |
 | S7 | Persistent allocator, per-aspect locks, plain INSERT | 6 | S6 |
 | S8 | Write-once maintenance I: journal, swap, reaper, pins (reconcile, split) | 8 | S7 |
 | S9 | Write-once maintenance II (overlap, squash, compact) | 8 | S8 |

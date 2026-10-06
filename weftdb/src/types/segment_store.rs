@@ -307,28 +307,54 @@ async fn lock_root(root: &Path) -> Result<RootLock> {
 	}
 }
 
-/// Make the store layout's directory entries durable (design section 5.5, OPEN step 5):
+/// Make the store layout's directory entries durable (design section 5.5, OPEN step 4):
 /// fsync `segments/` and the root, which hold the frames and the control-plane database
-/// files with their `-log`s, and every directory in `created` together with the parent
-/// of the topmost one, so a root this open created is itself reachable after a power
-/// cut.
+/// files with their `-log`s; every directory in `created` together with the parent of
+/// the topmost one, so a root this open created is itself reachable after a power cut;
+/// and the root's parent on every open.
+///
+/// The root's parent is synced even when this open did not create the root, because the
+/// open that did may have died before reaching this point (a failed probe, a lost lock
+/// race, a SIGKILL), and no later open would know the root's entry was never made
+/// durable. A root several levels deep created by such an open still leaves the levels
+/// above its parent unsynced; that needs both a crash before this step and a power cut
+/// before the kernel writes the directories back on its own.
+///
+/// A root this open did not create may sit in a parent the server cannot read (a
+/// service account's store under a `0711` directory, say). Opening that parent for the
+/// fsync then fails with `PermissionDenied`, which is logged and skipped rather than
+/// refusing a store that opened before S3.
 ///
 /// Once is enough: Turso truncates an MVCC `-log` in place on checkpoint instead of
 /// recreating it (`turso_core` `logical_log.rs`), so an entry fsynced here stays durable.
-async fn sync_layout(root: &Path, segments_dir: &Path, created: &[PathBuf]) -> Result<()> {
+async fn sync_layout(fs: &dyn StoreFs, root: &Path, segments_dir: &Path, created: &[PathBuf]) -> Result<()> {
+	let root_parent = parent_dir(root);
+	let created_root = created.iter().any(|dir| dir == root);
 	for dir in layout_dirs(root, segments_dir, created) {
-		RealFs.sync_dir(&dir).await.with_context(|| format!("fsyncing directory {}", dir.display()))?;
+		match fs.sync_dir(&dir).await {
+			Ok(()) => {}
+			Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && !created_root && root_parent.as_ref() == Some(&dir) => {
+				tracing::warn!(dir = %dir.display(), root = %root.display(), error = %e, "cannot open the store root's parent to fsync it; the root predates this open, so its directory entry is left to the filesystem");
+			}
+			Err(e) => return Err(e).with_context(|| format!("fsyncing directory {}", dir.display())),
+		}
 	}
 	Ok(())
 }
 
-/// The directories [`sync_layout`] fsyncs, deepest first.
+/// The directory holding `path`'s entry: its parent, with the working directory standing
+/// in for the empty parent of a bare relative name. `None` for a filesystem root.
+fn parent_dir(path: &Path) -> Option<PathBuf> {
+	path.parent().map(|parent| if parent.as_os_str().is_empty() { PathBuf::from(".") } else { parent.to_path_buf() })
+}
+
+/// The directories [`sync_layout`] fsyncs, deepest first: `segments/`, the root, each
+/// directory in `created` and the existing parent of the topmost one, then the root's
+/// parent.
 fn layout_dirs(root: &Path, segments_dir: &Path, created: &[PathBuf]) -> Vec<PathBuf> {
 	let mut dirs = vec![segments_dir.to_path_buf(), root.to_path_buf()];
-	// The topmost created directory's entry lives in its parent, which existed. A bare
-	// relative name's parent is the empty path, meaning the working directory.
-	let anchor = created.last().and_then(|top| top.parent()).map(|parent| if parent.as_os_str().is_empty() { PathBuf::from(".") } else { parent.to_path_buf() });
-	for dir in created.iter().cloned().chain(anchor) {
+	let anchor = created.last().and_then(|top| parent_dir(top));
+	for dir in created.iter().cloned().chain(anchor).chain(parent_dir(root)) {
 		if !dirs.contains(&dir) {
 			dirs.push(dir);
 		}
@@ -366,11 +392,13 @@ impl SegmentStore {
 	///    process) owns the root;
 	/// 2. open the four control-plane databases, each refusing to open unless it runs
 	///    MVCC and a new connection syncs FULL;
-	/// 3. fsync `segments/`, the root, and any directory this open created above it, so
-	///    the database files and their `-log` files keep their directory entries through
-	///    a power cut (Turso truncates a `-log` in place, so one fsync covers it for
-	///    good);
-	/// 4. register the store's `(database, subject)` scope in one catalog transaction.
+	/// 3. fsync `segments/`, the root, any directory this open created above it and the
+	///    root's parent, so the database files and their `-log` files keep their
+	///    directory entries through a power cut (Turso truncates a `-log` in place, so one
+	///    fsync covers it for good);
+	/// 4. register the store's `(database, subject)` scope in one catalog transaction,
+	///    after the fsyncs, so its commit lands in a `-log` whose entry is already
+	///    durable.
 	///
 	/// The lock is held until the store drops.
 	///
@@ -381,7 +409,13 @@ impl SegmentStore {
 	/// directory fsync fails; and any filesystem error creating the layout or libSQL
 	/// failure opening the databases.
 	pub async fn open_scoped(root: impl AsRef<Path>, database: &str, subject: &str) -> Result<Self> {
-		let root = root.as_ref().to_path_buf();
+		Self::open_scoped_on(&RealFs, root.as_ref(), database, subject).await
+	}
+
+	/// [`open_scoped`](SegmentStore::open_scoped), with its directory fsyncs going through
+	/// `fs`, so a test can see which directories the open syncs and fail one.
+	async fn open_scoped_on(fs: &dyn StoreFs, root: &Path, database: &str, subject: &str) -> Result<Self> {
+		let root = root.to_path_buf();
 		let segments_dir = root.join("segments");
 		let created = missing_dirs(&segments_dir).await;
 		tokio::fs::create_dir_all(&segments_dir).await.with_context(|| format!("creating segments dir {}", segments_dir.display()))?;
@@ -394,7 +428,7 @@ impl SegmentStore {
 		let catalog = AspectCatalog::open(&catalog_path.to_string_lossy()).await?;
 		let registry_path = root.join("catalog.db");
 		let registry = CatalogStore::open(&registry_path.to_string_lossy()).await?;
-		sync_layout(&root, &segments_dir, &created).await?;
+		sync_layout(fs, &root, &segments_dir, &created).await?;
 		// Record this store's place in the hierarchy so the control plane can enumerate
 		// the databases/subjects a root holds (idempotent, and atomic).
 		registry.register_scope(database, subject).await?;
@@ -3768,16 +3802,19 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn the_open_fsyncs_every_directory_it_created_and_the_parent_above_them() {
+	async fn the_directories_to_fsync_are_the_layout_the_created_ancestors_and_the_roots_parent() {
 		let dir = TempDir::new().expect("tempdir");
 		let paths = |names: &[&str]| -> Vec<PathBuf> { names.iter().map(|n| dir.path().join(n)).collect() };
 
-		// An existing root: just `segments/` and the root.
+		// An existing root: `segments/`, the root, and the root's parent.
 		std::fs::create_dir(dir.path().join("existing")).unwrap();
 		let segments = dir.path().join("existing/segments");
 		let created = missing_dirs(&segments).await;
 		assert_eq!(created, paths(&["existing/segments"]));
-		assert_eq!(layout_dirs(&dir.path().join("existing"), &segments, &created), paths(&["existing/segments", "existing"]));
+		let mut expected = paths(&["existing/segments", "existing"]);
+		expected.push(dir.path().to_path_buf());
+		assert_eq!(layout_dirs(&dir.path().join("existing"), &segments, &created), expected);
+		assert_eq!(layout_dirs(&dir.path().join("existing"), &segments, &[]), expected, "with nothing created, the root's parent is still synced");
 
 		// A root two levels below an existing directory: every created directory, then the
 		// existing parent that holds the topmost one.
@@ -3788,13 +3825,116 @@ mod tests {
 		expected.push(dir.path().to_path_buf());
 		assert_eq!(layout_dirs(&dir.path().join("a/b"), &segments, &created), expected);
 
-		// A bare relative root's parent is the working directory.
+		// A bare relative root's parent is the working directory, created or not.
 		let created = [PathBuf::from("store/segments"), PathBuf::from("store")];
-		assert_eq!(layout_dirs(Path::new("store"), Path::new("store/segments"), &created), vec![PathBuf::from("store/segments"), PathBuf::from("store"), PathBuf::from(".")]);
+		let expected = vec![PathBuf::from("store/segments"), PathBuf::from("store"), PathBuf::from(".")];
+		assert_eq!(layout_dirs(Path::new("store"), Path::new("store/segments"), &created), expected);
+		assert_eq!(layout_dirs(Path::new("store"), Path::new("store/segments"), &[]), expected);
+	}
 
-		// And a real open of a fresh nested root succeeds, which it cannot unless every one
-		// of those fsyncs did.
-		drop(SegmentStore::open(dir.path().join("a/b")).await.expect("opens a fresh nested root"));
+	/// A [`StoreFs`] that records every directory fsync before passing it to [`RealFs`],
+	/// and can fail the one for `refuse` with an error of the given kind instead.
+	#[derive(Debug, Default)]
+	struct RecordingFs {
+		synced: std::sync::Mutex<Vec<PathBuf>>,
+		refuse: Option<(PathBuf, std::io::ErrorKind)>,
+	}
+
+	impl RecordingFs {
+		fn refusing(dir: PathBuf, kind: std::io::ErrorKind) -> Self {
+			Self { synced: std::sync::Mutex::default(), refuse: Some((dir, kind)) }
+		}
+
+		fn synced(&self) -> Vec<PathBuf> {
+			self.synced.lock().expect("not poisoned").clone()
+		}
+	}
+
+	#[async_trait::async_trait]
+	impl StoreFs for RecordingFs {
+		async fn create_new_write(&self, path: &Path, bytes: Vec<u8>, policy: crate::types::durable::SyncPolicy, points: crate::types::durable::WritePoints) -> std::io::Result<()> {
+			RealFs.create_new_write(path, bytes, policy, points).await
+		}
+
+		async fn sync_file(&self, path: &Path) -> std::io::Result<()> {
+			RealFs.sync_file(path).await
+		}
+
+		async fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
+			self.synced.lock().expect("not poisoned").push(dir.to_path_buf());
+			match &self.refuse {
+				Some((refused, kind)) if refused == dir => Err(std::io::Error::from(*kind)),
+				_ => RealFs.sync_dir(dir).await,
+			}
+		}
+
+		async fn hard_link(&self, src: &Path, dst: &Path) -> std::io::Result<()> {
+			RealFs.hard_link(src, dst).await
+		}
+
+		async fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+			RealFs.rename(from, to).await
+		}
+
+		async fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+			RealFs.remove_file(path).await
+		}
+
+		async fn read_dir(&self, dir: &Path) -> std::io::Result<Vec<crate::types::durable::FsEntry>> {
+			RealFs.read_dir(dir).await
+		}
+
+		async fn metadata(&self, path: &Path) -> std::io::Result<crate::types::durable::FsMetadata> {
+			RealFs.metadata(path).await
+		}
+	}
+
+	/// Design section 5.5, OPEN step 4: the open itself fsyncs every directory that holds
+	/// one of its entries, and does so before it registers its scope.
+	#[tokio::test]
+	async fn an_open_fsyncs_its_directories_before_it_registers_its_scope() {
+		let dir = TempDir::new().expect("tempdir");
+		let paths = |names: &[&str]| -> Vec<PathBuf> { names.iter().map(|n| dir.path().join(n)).collect() };
+		let root = dir.path().join("a/b");
+
+		// A fresh nested root: everything it created, and the directory that held the top.
+		let fs = RecordingFs::default();
+		drop(SegmentStore::open_scoped_on(&fs, &root, "market", "BTCUSD").await.expect("opens a fresh nested root"));
+		let mut expected = paths(&["a/b/segments", "a/b", "a"]);
+		expected.push(dir.path().to_path_buf());
+		assert_eq!(fs.synced(), expected);
+
+		// Reopening it still syncs the root's parent: the open that created the root may
+		// have died before its own fsyncs, and this one cannot tell.
+		let fs = RecordingFs::default();
+		drop(SegmentStore::open_scoped_on(&fs, &root, "market", "BTCUSD").await.expect("reopens"));
+		assert_eq!(fs.synced(), paths(&["a/b/segments", "a/b", "a"]));
+
+		// A failed fsync fails the open before the scope is registered.
+		let fresh = dir.path().join("c");
+		let fs = RecordingFs::refusing(fresh.join("segments"), std::io::ErrorKind::Other);
+		let err = SegmentStore::open_scoped_on(&fs, &fresh, "market", "BTCUSD").await.err().expect("a failed directory fsync fails the open");
+		assert!(format!("{err:#}").contains(&format!("fsyncing directory {}", fresh.join("segments").display())), "{err:#}");
+		assert_eq!(registered_scopes(&fresh).await, (Vec::new(), Vec::new()), "the scope is registered only after the layout is durable");
+	}
+
+	/// The root's parent is synced on every open, but a store whose root predates the open
+	/// still opens when that parent cannot be opened for reading. A root the open created
+	/// is another matter: its entry is the open's own to make durable.
+	#[tokio::test]
+	async fn an_unreadable_parent_is_skipped_only_for_a_root_the_open_did_not_create() {
+		let dir = TempDir::new().expect("tempdir");
+		let root = dir.path().join("store");
+		let fs = RecordingFs::refusing(dir.path().to_path_buf(), std::io::ErrorKind::PermissionDenied);
+		let err = SegmentStore::open_scoped_on(&fs, &root, "market", "BTCUSD").await.err().expect("a root this open created needs its parent synced");
+		assert!(format!("{err:#}").contains(&format!("fsyncing directory {}", dir.path().display())), "{err:#}");
+
+		let fs = RecordingFs::refusing(dir.path().to_path_buf(), std::io::ErrorKind::PermissionDenied);
+		drop(SegmentStore::open_scoped_on(&fs, &root, "market", "BTCUSD").await.expect("the existing root opens"));
+		assert_eq!(fs.synced(), vec![root.join("segments"), root.clone(), dir.path().to_path_buf()], "the parent was tried");
+
+		let fs = RecordingFs::refusing(dir.path().to_path_buf(), std::io::ErrorKind::Other);
+		assert!(SegmentStore::open_scoped_on(&fs, &root, "market", "BTCUSD").await.is_err(), "any other error syncing the parent still fails the open");
 	}
 
 	/// The database and subject rows a root's catalog holds, read without opening a
@@ -3830,6 +3970,10 @@ mod tests {
 	/// Hold the database at `path` open in this process in a mode that cannot run MVCC:
 	/// multiprocess WAL. Turso shares one instance per file within a process, so a
 	/// store that opens the same file gets this instance and its switch to MVCC fails.
+	///
+	/// Unix only: Turso 0.8's Windows backend (`WindowsIO`) has no multiprocess WAL
+	/// (`supports_shared_wal_coordination` is false), so the build fails there.
+	#[cfg(unix)]
 	async fn hold_without_mvcc(path: &Path) -> turso::Database {
 		let db = turso::Builder::new_local(&path.to_string_lossy()).experimental_multiprocess_wal(true).build().await.expect("opens in multiprocess WAL mode");
 		let conn = db.connect().expect("connects");
@@ -3841,6 +3985,12 @@ mod tests {
 	/// Every COMMIT in the control plane relies on MVCC: `BEGIN CONCURRENT`, and a log
 	/// that is fsynced before COMMIT returns. Before S3 a failed switch to MVCC was
 	/// discarded with `.ok()`, and the store opened and committed in WAL mode.
+	///
+	/// Unix only, as [`hold_without_mvcc`]: on Windows nothing in Turso 0.8 can pin a file
+	/// out of MVCC. The decision itself is tested on every platform in
+	/// `durable::control_plane`, and the open's synchronous probe by
+	/// `an_open_fails_closed_when_a_new_connection_does_not_sync_full`.
+	#[cfg(unix)]
 	#[tokio::test]
 	async fn an_open_fails_closed_when_a_database_cannot_run_mvcc() {
 		for file in crate::CONTROL_PLANE_FILES {
@@ -3852,6 +4002,23 @@ mod tests {
 			assert!(message.contains("MVCC"), "{file}: the error names the missing journal mode: {message}");
 			drop(held);
 			let store = SegmentStore::open(dir.path()).await.unwrap_or_else(|e| panic!("{file}: the root opens once nothing pins it out of MVCC: {e:#}"));
+			drop(store);
+		}
+	}
+
+	/// Each of the four control-plane databases refuses to open unless a new connection
+	/// syncs FULL. Turso 0.8 always does, so the probe's test override plays one that
+	/// does not, for one file at a time.
+	#[tokio::test]
+	async fn an_open_fails_closed_when_a_new_connection_does_not_sync_full() {
+		use crate::types::durable::control_plane::NEW_CONNECTION_OVERRIDE;
+
+		for file in crate::CONTROL_PLANE_FILES {
+			let dir = TempDir::new().expect("tempdir");
+			let err = NEW_CONNECTION_OVERRIDE.scope((file, "PRAGMA synchronous=NORMAL"), SegmentStore::open(dir.path())).await.err().unwrap_or_else(|| panic!("{file}: the store opened although a new connection to {file} syncs NORMAL"));
+			let message = format!("{err:#}");
+			assert!(message.contains(&format!("{} reports PRAGMA synchronous=1, not FULL", dir.path().join(file).display())), "{file}: {message}");
+			let store = SegmentStore::open(dir.path()).await.unwrap_or_else(|e| panic!("{file}: the root opens once new connections are FULL: {e:#}"));
 			drop(store);
 		}
 	}

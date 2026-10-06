@@ -22,6 +22,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 - All dependencies updated to their latest major versions, including wgpu 30,
   Arrow/Parquet 60 and OpenTelemetry 0.33.
 - Builds on stable Rust (MSRV 1.95); nightly is no longer required.
+- **A segment store root can be open in only one `SegmentStore` at a time.** ⚠️ A
+  second `SegmentStore::open`/`open_scoped` on a root that this process already has
+  open used to succeed, so several scopes could share one root at once. It now fails
+  with the new `StoreLocked` error (downcast it from the `anyhow::Error`). Embedders
+  that kept several scoped stores open on one root must close one before opening the
+  next, or give each scope its own root.
 
 ### Fixed
 
@@ -31,16 +37,17 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `WEFT_SEGMENT_STORE_ROOT` now exits at startup with an error naming the pid that
   holds the root, instead of Turso's "File is locked by another process". The lock is
   released by the OS however the holder exits, so there is never a stale lock to
-  clear. Within one process, a second `SegmentStore::open` on an open root returns
-  the new `StoreLocked` error; close the first store before reopening.
+  clear. (In-process, see the `StoreLocked` entry under Changed.)
 - **A control-plane database that could not switch to MVCC was opened anyway.** The
   segment store's four control-plane databases now refuse to open unless they run in
   MVCC journal mode and a new connection syncs FULL, which is what makes a COMMIT
   durable when it returns. Previously a failed switch was ignored and the database
   committed in WAL mode.
 - **Opening a store now makes its files' directory entries durable.** The root,
-  `segments/` and any directory the open created are fsynced, so the control-plane
-  databases and their logs cannot vanish from the directory after a power cut.
+  `segments/`, the root's parent and any directory the open created are fsynced, so
+  the control-plane databases and their logs cannot vanish from the directory after a
+  power cut. A pre-existing root whose parent the server cannot read still opens, with
+  a warning.
 - **The store's database/subject registration is one transaction.** A crash during
   open could leave the database registered without its subject.
 - **Commit failures were silently ignored.** A control-plane write that lost an MVCC
