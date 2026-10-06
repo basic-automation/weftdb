@@ -2,8 +2,8 @@
 //!
 //! This is the first benchmark-grade *capability* endpoint on the Phase-2 API:
 //! it drives WeftDB's flagship interpolation-on-read path (splimes' [`Interpolator`],
-//! whose default `Backend::Auto` picks the serial, rayon or — once the program has
-//! started it — GPU backend by grid size) through plain HTTP + JSON, exactly the surface
+//! whose default `Backend::Auto` picks the serial, rayon or — once calibrated at
+//! startup — GPU backend by grid size) through plain HTTP + JSON, exactly the surface
 //! Weft-Bench and external clients need so they no longer have to embed the Rust API
 //! to exercise the engine.
 //!

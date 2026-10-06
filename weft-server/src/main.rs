@@ -12,10 +12,20 @@
 //! query endpoints (`/api/v1/storage/...`) go live; without it the server serves
 //! only the stateless interpolation/downsample API and those endpoints answer
 //! `503`. Readiness (`GET /ready`) reports which mode is active.
+//!
+//! ## GPU calibration
+//!
+//! Before it starts serving, the server calibrates the interpolation engine's backend
+//! choice once ([`weft_server::gpu`]): it starts the GPU if there is one and measures
+//! where the rayon pool and the GPU overtake a single core. That takes several seconds;
+//! set `WEFT_GPU_CALIBRATE=0` to skip it, leaving interpolation on the CPU with splimes'
+//! default thresholds. It never stops the server from starting.
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use weft_server::{app_with_state, spawn_backup_daemon, spawn_reconcile_daemon, AppState, BackupDaemonConfig, ReconcileDaemonConfig, SERVICE, VERSION};
+use weft_server::{
+	app_with_state, gpu::{self, GPU_CALIBRATE_ENV}, spawn_backup_daemon, spawn_reconcile_daemon, AppState, BackupDaemonConfig, ReconcileDaemonConfig, SERVICE, VERSION
+};
 use weftdb::SegmentStore;
 
 /// Default bind address when `WEFT_SERVER_ADDR` is unset.
@@ -95,6 +105,10 @@ async fn main() -> anyhow::Result<()> {
 	let otel_provider = init_tracing();
 	let addr: SocketAddr = std::env::var("WEFT_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string()).parse()?;
 
+	// Before anything else competes for the CPU (the store, the daemons, requests), so the
+	// measurements are clean.
+	calibrate_gpu_if_enabled().await;
+
 	let state = build_state().await?;
 	spawn_reconcile_daemon_if_configured(&state)?;
 	spawn_backup_daemon_if_configured(&state)?;
@@ -166,6 +180,21 @@ fn build_otlp_provider() -> Option<opentelemetry_sdk::trace::SdkTracerProvider> 
 	};
 	let resource = opentelemetry_sdk::Resource::builder().with_service_name(SERVICE).build();
 	Some(opentelemetry_sdk::trace::SdkTracerProvider::builder().with_batch_exporter(exporter).with_resource(resource).build())
+}
+
+/// Run the startup GPU calibration ([`gpu::calibrate`]) on tokio's blocking pool unless
+/// `WEFT_GPU_CALIBRATE` opts out, and print what it found. Never fails: a missing GPU,
+/// a failed calibration, or even a panicking one only leaves splimes' defaults in force.
+async fn calibrate_gpu_if_enabled() {
+	if !gpu::calibration_enabled(std::env::var(GPU_CALIBRATE_ENV).ok().as_deref()) {
+		println!("gpu calibration: skipped ({GPU_CALIBRATE_ENV} is off); interpolation stays on the CPU with the default thresholds");
+		return;
+	}
+	println!("gpu calibration: timing the interpolation backends (a few seconds; set {GPU_CALIBRATE_ENV}=0 to skip)");
+	match tokio::task::spawn_blocking(gpu::calibrate).await {
+		Ok(lines) => lines.iter().for_each(|line| println!("{line}")),
+		Err(err) => eprintln!("gpu calibration: aborted ({err}); interpolation stays on the CPU with the default thresholds"),
+	}
 }
 
 /// Start the background reconcile daemon (roadmap Phase 4.6) when a store is

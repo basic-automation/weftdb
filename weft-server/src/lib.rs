@@ -33,6 +33,7 @@
 
 pub mod backup_daemon;
 pub mod downsample;
+pub mod gpu;
 pub mod interpolate;
 pub mod manage;
 pub mod metrics;

@@ -15,6 +15,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `/api/v1/interpolate*` endpoint. A larger grid is a `400` that names its size and the
   limit, refused before anything is allocated; before, a fine resolution over a long
   range tried to allocate all of it.
+- **`weft-server` calibrates the interpolation backends at startup.** Before serving,
+  it runs `splimes::calibrate()` once on a blocking thread: that starts the GPU if there
+  is one, times the single-thread, rayon and GPU backends, and sets where
+  `Backend::Auto` switches between them. The adapter (or why there is none) and the
+  thresholds are logged. It takes several seconds and never fails startup; set
+  `WEFT_GPU_CALIBRATE=0` to skip it. Without it, splimes 1.0 never uses the GPU.
 
 ### Changed
 
@@ -37,7 +43,8 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
     interpolated `BigDecimal`s are the shortest decimal that round-trips;
   - time is exact to the nanosecond at every resolution, duplicate timestamps keep the
     last value, and a leap second is the same instant as the start of the next second;
-  - `Backend::Auto` uses the GPU only once the program has started it.
+  - `Backend::Auto` uses the GPU only once the program has started it (see the startup
+    calibration above).
 - **No interpolation runs on an async worker.** splimes 1.0 is synchronous; `weftdb`'s
   `analyze_point`, `analyze_range` and compression, every `weft-server` interpolation
   endpoint, and the Weft-Bench WeftDB adapter run it on tokio's blocking pool

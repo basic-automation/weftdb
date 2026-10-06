@@ -508,6 +508,7 @@ WeftDB is configured primarily through environment variables:
 | `WEFT_DATA_DIR` | `weftdb`, `weft-tui` | Root directory for database files **and** the TUI log (`weft-tui.log`). | portable per-user default (see below) |
 | `TEST_DATA_DIR` | `weftdb` | Highest-priority override for the database root (used by the test suite). | unset |
 | `WEFT_SERVER_ADDR` | `weft-server` | HTTP bind address. | `127.0.0.1:8080` |
+| `WEFT_GPU_CALIBRATE` | `weft-server` | `0` (or `false`/`no`/`off`) skips the startup calibration. Otherwise, before serving, the server runs `splimes::calibrate()` once on a blocking thread: it starts the GPU if there is one, times the single-thread, rayon and GPU backends on grids up to 16 Mi points (several seconds, a few hundred MB), and sets where `Backend::Auto` switches between them. It logs the adapter (or why there is none) and the thresholds, and never fails startup; skipped or failed, interpolation stays on the CPU with splimes' defaults. | unset (calibrate) |
 | `WEFT_SEGMENT_STORE_ROOT` | `weft-server` | Root of the Storage v2 segment store; enables the `/storage` endpoints. | unset (storage endpoints answer `503`) |
 | `WEFT_RECONCILE_INTERVAL_SECS` | `weft-server` | Background reconcile daemon sweep interval in seconds; `0`/unset disables it. | unset (disabled) |
 | `WEFT_RECONCILE_THRESHOLD` | `weft-server` | `unsorted_segments` backlog an aspect must reach before the daemon reconciles it. | `1` |
