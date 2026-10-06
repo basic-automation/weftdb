@@ -266,6 +266,18 @@ mod tests {
 			unreachable!()
 		}
 
+		async fn create_dir(&self, _: &Path) -> io::Result<()> {
+			unreachable!()
+		}
+
+		async fn remove_dir_all(&self, _: &Path) -> io::Result<()> {
+			unreachable!()
+		}
+
+		async fn copy_new(&self, _: &Path, _: &Path, _: SyncPolicy) -> io::Result<u64> {
+			unreachable!()
+		}
+
 		async fn read_dir(&self, _: &Path) -> io::Result<Vec<FsEntry>> {
 			unreachable!()
 		}

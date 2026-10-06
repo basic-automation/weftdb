@@ -18,6 +18,16 @@
 //! took by hand with `POST …/storage/backup?label=nightly` is never a prune candidate,
 //! so a retention setting cannot silently delete a deliberately-kept backup.
 //!
+//! Retention counts only **complete** backups (design section 9): a directory with a
+//! `MANIFEST.json`, or one from before manifests that holds all four databases. A backup
+//! is built in a `.partial-*` directory and renamed into place only once complete, so a
+//! crash can no longer leave a half-written `backup-<digits>`; one left by an older
+//! release is neither counted nor pruned. A pruned backup is renamed to `.deleting-*`,
+//! durably, before its files are removed, so a crash part-way never leaves a
+//! half-removed directory under a backup's name. At start and on every tick the daemon
+//! sweeps `.partial-*`, `.deleting-*` and `.restore-drill-*` entries untouched for an
+//! hour ([`weftdb::STAGING_SWEEP_AGE`]): what a crashed backup, prune or drill left.
+//!
 //! The daemon holds only `Arc` handles (the store and the metrics registry), so it is
 //! a detached side task; the router and its handlers are untouched.
 
@@ -26,7 +36,7 @@ use std::{
 };
 
 use tracing::Instrument as _;
-use weftdb::{ControlPlaneBackup, SegmentStore, VerifyMode};
+use weftdb::{durable::RealFs, ControlPlaneBackup, SegmentStore, VerifyMode};
 
 use crate::metrics::SharedMetrics;
 
@@ -92,7 +102,10 @@ fn fresh_dir(base: &Path, millis: u128) -> PathBuf {
 /// Returns `(stamp, path)` pairs sorted by the numeric stamp, so "oldest" is the
 /// snapshot's own recorded time rather than a filesystem mtime (which a copy or a
 /// restore would perturb). Non-matching entries (an operator's labelled backup, a stray
-/// file) are ignored. A missing `base` yields an empty list.
+/// file) are ignored, and so is an incomplete one: only a directory
+/// [`weftdb::is_complete_backup`] accepts (a manifest, or all four databases from before
+/// manifests) is a backup, so a half-written directory never counts toward retention
+/// and is never pruned in a good backup's place. A missing `base` yields an empty list.
 ///
 /// # Errors
 ///
@@ -114,7 +127,11 @@ pub async fn list_generated_backups(base: &Path) -> anyhow::Result<Vec<(u128, Pa
 			continue;
 		}
 		let Ok(stamp) = name.trim_start_matches("backup-").parse::<u128>() else { continue };
-		found.push((stamp, entry.path()));
+		let path = entry.path();
+		if !weftdb::is_complete_backup(&path).await? {
+			continue;
+		}
+		found.push((stamp, path));
 	}
 	found.sort_unstable_by_key(|(stamp, _)| *stamp);
 	Ok(found)
@@ -123,21 +140,43 @@ pub async fn list_generated_backups(base: &Path) -> anyhow::Result<Vec<(u128, Pa
 /// Remove the oldest daemon-generated snapshots under `base` until at most `keep`
 /// remain, returning how many directories were removed.
 ///
-/// Only `backup-<digits>` directories are candidates (see `is_generated_label`), so a
-/// hand-labelled snapshot is never pruned. `keep = 0` removes every generated snapshot.
+/// Only complete `backup-<digits>` directories are candidates (see
+/// [`list_generated_backups`]), so a hand-labelled snapshot is never pruned. `keep = 0`
+/// removes every generated snapshot. Each is removed with [`weftdb::retire_backup`]:
+/// renamed to `.deleting-*` and the rename made durable before any file goes, so a
+/// crash part-way leaves a `.deleting-*` entry for the sweep rather than a backup name
+/// over half its files.
 ///
 /// # Errors
 ///
-/// Propagates a failure listing `base` or removing a snapshot directory.
+/// Propagates a failure listing `base` or retiring a snapshot directory.
 pub async fn prune_generated_backups(base: &Path, keep: usize) -> anyhow::Result<usize> {
 	let found = list_generated_backups(base).await?;
 	let excess = found.len().saturating_sub(keep);
 	let mut removed = 0usize;
 	for (_, path) in found.into_iter().take(excess) {
-		tokio::fs::remove_dir_all(&path).await.map_err(|err| anyhow::Error::new(err).context(format!("pruning backup {}", path.display())))?;
+		weftdb::retire_backup(&RealFs, &path).await.map_err(|err| anyhow::Error::new(err).context(format!("pruning backup {}", path.display())))?;
 		removed += 1;
 	}
 	Ok(removed)
+}
+
+/// Remove the staging entries under `base` (`.partial-*`, `.deleting-*`,
+/// `.restore-drill-*`) left untouched for [`weftdb::STAGING_SWEEP_AGE`], logging what it
+/// did. A failure is logged and left for the next sweep: litter must never stop a
+/// backup.
+async fn sweep_stale_staging(base: &Path) {
+	match weftdb::sweep_backup_staging(&RealFs, base, weftdb::STAGING_SWEEP_AGE).await {
+		Ok(swept) => {
+			if !swept.removed.is_empty() {
+				println!("backup daemon: swept {} stale staging entr{} under {}", swept.removed.len(), if swept.removed.len() == 1 { "y" } else { "ies" }, base.display());
+			}
+			for (path, err) in &swept.failed {
+				eprintln!("backup daemon: could not sweep {}: {err}", path.display());
+			}
+		}
+		Err(err) => eprintln!("backup daemon: could not list {} to sweep it: {err}", base.display()),
+	}
 }
 
 /// Run one backup tick: snapshot the control plane into a fresh directory under
@@ -180,15 +219,19 @@ pub async fn backup_tick(store: &SegmentStore, metrics: &SharedMetrics, base: &P
 /// consumed first), so start-up is not stampeded by an eager backup. Each snapshot logs
 /// a one-line summary; a failed snapshot is logged and the loop continues (a transient
 /// control-plane error must not kill the daemon, and the next tick retries into a fresh
-/// directory).
+/// directory). The stale-staging sweep runs at start, without waiting for the first
+/// interval, and again before every snapshot.
 #[must_use]
 pub fn spawn_backup_daemon(store: Arc<SegmentStore>, metrics: SharedMetrics, config: BackupDaemonConfig) -> tokio::task::JoinHandle<()> {
 	tokio::spawn(async move {
+		// What a crash before this start left behind goes first.
+		sweep_stale_staging(&config.base).await;
 		let mut ticker = tokio::time::interval(config.interval);
 		// Consume the immediate first tick so the first snapshot waits one interval.
 		ticker.tick().await;
 		loop {
 			ticker.tick().await;
+			sweep_stale_staging(&config.base).await;
 			match backup_tick(&store, &metrics, &config.base).await {
 				Ok(backup) => {
 					println!("backup daemon: snapshotted control plane to {} ({} row(s), {} byte(s))", backup.dir.display(), backup.total_rows(), backup.total_bytes());
@@ -215,7 +258,7 @@ mod tests {
 	use bigdecimal::BigDecimal;
 	use tempfile::TempDir;
 	use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
-	use weftdb::SegmentStore;
+	use weftdb::{SegmentStore, CONTROL_PLANE_FILES};
 
 	use super::*;
 	use crate::metrics::Metrics;
@@ -287,10 +330,13 @@ mod tests {
 		let dir = TempDir::new().unwrap();
 		let base = dir.path().join("backups");
 		// Three generated snapshots (stamps out of creation order to prove the sort is by
-		// stamp, not by mtime) plus one hand-labelled operator backup.
+		// stamp, not by mtime) plus one hand-labelled operator backup. Each holds all four
+		// control-plane files, the shape of a complete backup from before manifests.
 		for name in ["backup-300", "backup-100", "backup-200", "nightly"] {
 			tokio::fs::create_dir_all(base.join(name)).await.unwrap();
-			tokio::fs::write(base.join(name).join("catalog.db"), b"x").await.unwrap();
+			for file in CONTROL_PLANE_FILES {
+				tokio::fs::write(base.join(name).join(file), b"x").await.unwrap();
+			}
 		}
 
 		let removed = prune_generated_backups(&base, 2).await.unwrap();
@@ -299,6 +345,9 @@ mod tests {
 		assert!(base.join("backup-200").exists());
 		assert!(base.join("backup-300").exists());
 		assert!(base.join("nightly").exists(), "an operator's labelled backup is never pruned");
+		let mut left: Vec<String> = std::fs::read_dir(&base).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+		left.sort();
+		assert_eq!(left, ["backup-200", "backup-300", "nightly"], "the pruned backup's `.deleting-*` name went with it");
 
 		// Retention is idempotent once the count is at the limit.
 		assert_eq!(prune_generated_backups(&base, 2).await.unwrap(), 0);
@@ -334,5 +383,59 @@ mod tests {
 		assert_eq!(listed[0].1, dirs[2], "the newest two survive");
 		assert_eq!(listed[1].1, dirs[3]);
 		assert_eq!(metrics.snapshot().backup.snapshots, 4, "every tick was still counted");
+	}
+
+	#[tokio::test]
+	async fn retention_counts_only_complete_backups_including_pre_manifest_ones() {
+		let dir = TempDir::new().unwrap();
+		let store = SegmentStore::open(dir.path()).await.unwrap();
+		store.declare("a", &schema()).await.unwrap();
+		let base = dir.path().join("backups");
+		for stamp in [100, 200, 300] {
+			store.backup_control_plane_with_verify(base.join(generated_label(stamp)), VerifyMode::SnapshotOnly).await.unwrap();
+		}
+		drop(store);
+		// backup-100 predates manifests: the four databases and nothing else.
+		std::fs::remove_file(base.join("backup-100").join(weftdb::BACKUP_MANIFEST)).unwrap();
+		// backup-150 is a pre-manifest backup that never finished: two of its databases.
+		std::fs::create_dir(base.join("backup-150")).unwrap();
+		for file in &CONTROL_PLANE_FILES[..2] {
+			std::fs::copy(base.join("backup-100").join(file), base.join("backup-150").join(file)).unwrap();
+		}
+
+		let listed: Vec<u128> = list_generated_backups(&base).await.unwrap().into_iter().map(|(stamp, _)| stamp).collect();
+		assert_eq!(listed, vec![100, 200, 300], "the unfinished backup is not counted, the pre-manifest one is");
+
+		assert_eq!(prune_generated_backups(&base, 2).await.unwrap(), 1);
+		assert!(!base.join("backup-100").exists(), "a complete pre-manifest backup is still pruned by retention");
+		assert!(base.join("backup-150").exists(), "an unfinished one is not a backup, so retention never takes it for one");
+		let listed: Vec<u128> = list_generated_backups(&base).await.unwrap().into_iter().map(|(stamp, _)| stamp).collect();
+		assert_eq!(listed, vec![200, 300], "and it never displaced a complete backup");
+	}
+
+	#[tokio::test]
+	async fn the_daemon_sweeps_stale_staging_entries_when_it_starts() {
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(SegmentStore::open(dir.path().join("store")).await.unwrap());
+		let base = dir.path().join("backups");
+		let stale = base.join(".partial-backup-1-0011223344556677");
+		let fresh = base.join(".restore-drill-2");
+		for path in [&stale, &fresh, &base.join("nightly")] {
+			std::fs::create_dir_all(path).unwrap();
+		}
+		std::fs::File::open(&stale).unwrap().set_modified(std::time::SystemTime::now() - 2 * weftdb::STAGING_SWEEP_AGE).unwrap();
+
+		let config = BackupDaemonConfig { interval: Duration::from_secs(3600), base: base.clone(), keep: None };
+		let daemon = spawn_backup_daemon(store, Arc::new(Metrics::default()), config);
+		tokio::time::timeout(Duration::from_secs(10), async {
+			while stale.exists() {
+				tokio::time::sleep(Duration::from_millis(5)).await;
+			}
+		})
+		.await
+		.expect("the start-up sweep removes a stale build directory without waiting for a tick");
+		daemon.abort();
+		assert!(fresh.exists(), "a drill that may still be running is left alone");
+		assert!(base.join("nightly").exists(), "backups are never swept");
 	}
 }

@@ -145,6 +145,11 @@ pub struct AspectMetadataStore {
 }
 
 impl AspectMetadataStore {
+	/// The tables every `metadata.db` holds once opened. A snapshot missing any of them is
+	/// not a backup of this database (an empty file passes every other check), so
+	/// backup and restore verification require them.
+	pub const TABLES: &'static [&'static str] = &["aspect_metadata"];
+
 	/// Open (creating if absent) the `metadata.db` at `path`, enabling MVCC and ensuring
 	/// the `aspect_metadata` table exists.
 	///
@@ -213,7 +218,7 @@ impl AspectMetadataStore {
 	/// Propagates a connection failure or any backup/verify failure.
 	pub async fn backup_to_with(&self, dest: &std::path::Path, mode: crate::VerifyMode) -> Result<crate::SnapshotReport> {
 		let conn = self.db.connect()?;
-		crate::types::backup::snapshot_with_verify(&conn, dest, mode).await
+		crate::types::backup::snapshot_with_verify(&conn, dest, mode, Self::TABLES).await
 	}
 
 	/// Materialize (or overwrite) the rollup for `aspect`, returning the number of

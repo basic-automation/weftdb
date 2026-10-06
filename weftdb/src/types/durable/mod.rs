@@ -18,8 +18,9 @@
 //! - [`fault`] marks the steps of each commit protocol so the crash tests can fail,
 //!   abort or pause there. Without the feature, a fault point compiles to nothing.
 //!
-//! Nothing in the store calls this module yet: S3 takes the root lock at open, and
-//! S5 onwards route their writes through it.
+//! The control-plane backup, its retention and the restore (S5) are the first writers
+//! routed through it; S3 takes the root lock at open, and the later slices route the
+//! seal and maintenance writes through it.
 
 pub mod dirsync;
 pub mod fault;
@@ -30,7 +31,7 @@ pub mod sim;
 
 pub use dirsync::DirSyncer;
 pub use fault::FaultPoint;
-pub use fs::{write_new_durable, FsEntry, FsMetadata, RealFs, StoreFs, SyncPolicy, WritePoints};
+pub use fs::{create_dir_all_durable, write_new_durable, FsEntry, FsMetadata, RealFs, StoreFs, SyncPolicy, WritePoints};
 pub use lock::{LockHolder, RootLock, RootLockError, LOCK_FILE};
 #[cfg(any(test, feature = "fault-injection"))]
 pub use sim::SimFs;

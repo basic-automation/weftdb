@@ -38,7 +38,9 @@ use serde::{Deserialize, Serialize};
 use tracing::Instrument as _;
 use weft_line_protocol::TimestampPrecision;
 use weft_physical_type::{first_order_violation, AspectSchema, PhysicalType, SegmentDescriptor, TimeUnit};
-use weftdb::VerifyMode;
+use weftdb::{
+	durable::{RealFs, StoreFs}, VerifyMode, RESTORE_DRILL_PREFIX
+};
 
 use crate::{
 	state::AppState, storage::{AspectInfo, StorageError}
@@ -549,6 +551,11 @@ pub struct RestoreDrillResponse {
 	/// Always `true` when the call returns `200`: the backup restored and every restored
 	/// database opened and scanned. A failure is reported as a non-`200` instead.
 	pub restorable: bool,
+	/// Why the rehearsal copy could not be removed afterwards, or `null` when it was.
+	/// The drill's answer stands either way; a copy left behind is a
+	/// `.restore-drill-*` directory beside the backups, which the backup daemon's sweep
+	/// removes once it is an hour old.
+	pub cleanup_error: Option<String>,
 }
 
 /// Handle `POST /api/v1/storage/restore/drill?label=`: **rehearse** restoring a backup.
@@ -557,7 +564,9 @@ pub struct RestoreDrillResponse {
 /// every restored database at its destination (it opens, and every row of every table
 /// reads), reports what came back, and then deletes the rehearsal copy. The live store is
 /// never touched and nothing is overwritten — the whole point is that an operator can
-/// answer "is my backup actually restorable?" on a running system without risking it.
+/// answer "is my backup actually restorable?" on a running system without risking it. If
+/// the copy cannot be deleted, the response says so in `cleanup_error` (and the backup
+/// daemon's sweep removes the copy once it is an hour old).
 ///
 /// Restoring *over* a live control plane is deliberately not offered here: the library
 /// primitive refuses to clobber, and choosing a new store root is a deployment decision
@@ -566,7 +575,8 @@ pub struct RestoreDrillResponse {
 /// # Errors
 ///
 /// [`StorageError::Unconfigured`] when no store is attached, [`StorageError::BadRequest`]
-/// when the label is malformed, [`StorageError::NotFound`] when no such backup exists, and
+/// when the label is malformed or names a staging directory (an unfinished backup,
+/// prune or drill), [`StorageError::NotFound`] when no such backup exists, and
 /// [`StorageError::Internal`] when the backup will not restore or verify — which is a
 /// failed drill, and the answer the caller asked for.
 pub async fn restore_drill(State(state): State<AppState>, Query(params): Query<RestoreDrillParams>) -> Result<Response, StorageError> {
@@ -574,6 +584,9 @@ pub async fn restore_drill(State(state): State<AppState>, Query(params): Query<R
 	drop(state);
 	if !valid_backup_label(&params.label) {
 		return Err(StorageError::BadRequest(format!("invalid backup label `{}` — use only letters, digits, '.', '_', '-'", params.label)));
+	}
+	if weftdb::is_staging_name(&params.label) {
+		return Err(StorageError::BadRequest(format!("`{}` names an unfinished backup, prune or drill (a name starting with one of {:?}), not a backup", params.label, weftdb::STAGING_PREFIXES)));
 	}
 	let base = std::env::var_os("WEFT_BACKUP_DIR").map_or_else(|| store.root().join("backups"), std::path::PathBuf::from);
 	let backup_dir = base.join(&params.label);
@@ -586,14 +599,28 @@ pub async fn restore_drill(State(state): State<AppState>, Query(params): Query<R
 	// like the real thing) and never the live store root. Cleaned up on every path,
 	// success or failure.
 	let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|err| StorageError::Internal(err.to_string()))?.as_millis();
-	let target = base.join(format!(".restore-drill-{millis}"));
-	let outcome = weftdb::restore_control_plane(&backup_dir, &target).await;
-	let _ = tokio::fs::remove_dir_all(&target).await;
-	let report = outcome.map_err(|err| StorageError::Internal(format!("restore drill for `{}` FAILED: {err:#}", params.label)))?;
+	let target = base.join(format!("{RESTORE_DRILL_PREFIX}{millis}"));
+	let response = drill_response(&RealFs, params.label, &backup_dir, &target).await?;
+	Ok((StatusCode::OK, Json(response)).into_response())
+}
+
+/// Rehearse restoring `backup_dir` into the throwaway directory `target` through `fs`,
+/// remove `target` again whatever the outcome, and build the drill's answer.
+async fn drill_response(fs: &dyn StoreFs, label: String, backup_dir: &std::path::Path, target: &std::path::Path) -> Result<RestoreDrillResponse, StorageError> {
+	let outcome = weftdb::restore_control_plane_with(fs, backup_dir, target).await;
+	// The drill's answer stands whether or not its copy can be removed, but a copy left
+	// behind is disk an operator is paying for: say so instead of dropping the error.
+	let cleanup_error = fs.remove_dir_all(target).await.err().map(|err| format!("could not remove the rehearsal copy {}: {err}", target.display()));
+	if let Some(cleanup) = &cleanup_error {
+		tracing::warn!(label = %label, error = %cleanup, "restore drill left its rehearsal copy behind; the backup daemon's sweep removes it once stale");
+	}
+	let report = outcome.map_err(|err| {
+		let also = cleanup_error.as_deref().map_or_else(String::new, |cleanup| format!(" (and it {cleanup})"));
+		StorageError::Internal(format!("restore drill for `{label}` FAILED: {err:#}{also}"))
+	})?;
 
 	let databases = report.restored.iter().map(|r| BackupDbReport { name: r.dest.file_name().map_or_else(|| "?".to_string(), |n| n.to_string_lossy().into_owned()), tables: r.tables, rows: r.rows, bytes: r.bytes }).collect();
-	let response = RestoreDrillResponse { label: params.label, databases, total_rows: report.total_rows(), total_bytes: report.total_bytes(), restorable: true };
-	Ok((StatusCode::OK, Json(response)).into_response())
+	Ok(RestoreDrillResponse { label, databases, total_rows: report.total_rows(), total_bytes: report.total_bytes(), restorable: true, cleanup_error })
 }
 
 /// Query parameters for `POST /api/v1/storage/backup`.
@@ -678,15 +705,17 @@ fn valid_backup_label(label: &str) -> bool {
 ///
 /// The snapshot lands in `<base>/<label>`, where `<base>` is `WEFT_BACKUP_DIR` if set
 /// else `<store_root>/backups`, and `<label>` is the (validated) `?label=` or a generated
-/// `backup-<unix_millis>`. Each destination file must be fresh (`VACUUM INTO` needs a
-/// non-existing file), so a directory that already exists is rejected. The `.weftseg`
-/// measurement frames are **not** part of this backup — control plane only, per the
-/// storage boundary (hard-constraint #3).
+/// `backup-<unix_millis>`. The backup is built in a `.partial-*` directory beside it and
+/// renamed into place, with a `MANIFEST.json`, only once complete and durable, so a
+/// directory that already exists is rejected. The `.weftseg` measurement frames are
+/// **not** part of this backup — control plane only, per the storage boundary
+/// (hard-constraint #3).
 ///
 /// # Errors
 ///
 /// [`StorageError::Unconfigured`] when no store is attached,
-/// [`StorageError::BadRequest`] when `label` is malformed or the target dir already
+/// [`StorageError::BadRequest`] when `label` is malformed, reserved for a staging
+/// directory (`.partial-*`, `.deleting-*`, `.restore-drill-*`) or the target dir already
 /// exists, and [`StorageError::Internal`] on a backup/verify failure.
 pub async fn backup_store(State(state): State<AppState>, Query(params): Query<BackupParams>) -> Result<Response, StorageError> {
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
@@ -700,6 +729,9 @@ pub async fn backup_store(State(state): State<AppState>, Query(params): Query<Ba
 	let sub = if let Some(label) = params.label {
 		if !valid_backup_label(&label) {
 			return Err(StorageError::BadRequest(format!("invalid backup label `{label}` — use only letters, digits, '.', '_', '-'")));
+		}
+		if weftdb::is_staging_name(&label) {
+			return Err(StorageError::BadRequest(format!("backup label `{label}` is reserved: names starting with one of {:?} are unfinished backups, prunes and drills, which are swept", weftdb::STAGING_PREFIXES)));
 		}
 		label
 	} else {
@@ -1532,6 +1564,7 @@ mod tests {
 		let djson: serde_json::Value = serde_json::from_slice(&dbytes).unwrap();
 		assert_eq!(dstatus, StatusCode::OK, "body: {djson}");
 		assert_eq!(djson["restorable"], true, "the backup restored and verified");
+		assert_eq!(djson["cleanup_error"], serde_json::Value::Null, "the rehearsal copy was removed");
 		assert_eq!(djson["databases"].as_array().unwrap().len(), 4, "all four control-plane DBs came back");
 		assert!(djson["total_rows"].as_i64().unwrap() >= 2, "rows read back out of the restored copies");
 		// The rehearsal left nothing behind, and the live store is untouched.
@@ -1546,6 +1579,105 @@ mod tests {
 		let router = app_with_state(state.clone());
 		let traversal = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/restore/drill?label=..").body(Body::empty()).unwrap()).await.unwrap();
 		assert_eq!(traversal.status(), StatusCode::BAD_REQUEST, "traversal label rejected on the drill too");
+		drop(store);
+	}
+
+	/// A filesystem whose every operation is the real one except removing a directory
+	/// tree, which fails: the drill's cleanup step.
+	#[derive(Debug)]
+	struct CleanupFails;
+
+	#[async_trait::async_trait]
+	impl weftdb::durable::StoreFs for CleanupFails {
+		async fn create_new_write(&self, path: &std::path::Path, bytes: Vec<u8>, policy: weftdb::durable::SyncPolicy, points: weftdb::durable::WritePoints) -> std::io::Result<()> {
+			weftdb::durable::RealFs.create_new_write(path, bytes, policy, points).await
+		}
+
+		async fn sync_file(&self, path: &std::path::Path) -> std::io::Result<()> {
+			weftdb::durable::RealFs.sync_file(path).await
+		}
+
+		async fn sync_dir(&self, dir: &std::path::Path) -> std::io::Result<()> {
+			weftdb::durable::RealFs.sync_dir(dir).await
+		}
+
+		async fn hard_link(&self, src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+			weftdb::durable::RealFs.hard_link(src, dst).await
+		}
+
+		async fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+			weftdb::durable::RealFs.rename(from, to).await
+		}
+
+		async fn remove_file(&self, path: &std::path::Path) -> std::io::Result<()> {
+			weftdb::durable::RealFs.remove_file(path).await
+		}
+
+		async fn create_dir(&self, path: &std::path::Path) -> std::io::Result<()> {
+			weftdb::durable::RealFs.create_dir(path).await
+		}
+
+		async fn remove_dir_all(&self, _: &std::path::Path) -> std::io::Result<()> {
+			Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "injected cleanup failure"))
+		}
+
+		async fn copy_new(&self, src: &std::path::Path, dst: &std::path::Path, policy: weftdb::durable::SyncPolicy) -> std::io::Result<u64> {
+			weftdb::durable::RealFs.copy_new(src, dst, policy).await
+		}
+
+		async fn read_dir(&self, dir: &std::path::Path) -> std::io::Result<Vec<weftdb::durable::FsEntry>> {
+			weftdb::durable::RealFs.read_dir(dir).await
+		}
+
+		async fn metadata(&self, path: &std::path::Path) -> std::io::Result<weftdb::durable::FsMetadata> {
+			weftdb::durable::RealFs.metadata(path).await
+		}
+	}
+
+	/// The regression for `drill-dir-leak`: the drill discarded its cleanup error, so a
+	/// rehearsal copy it could not remove was left on disk with nobody told.
+	#[tokio::test]
+	async fn a_failed_drill_cleanup_is_reported_in_the_response() {
+		let dir = TempDir::new().unwrap();
+		let sc = weft_physical_type::AspectSchema::new(weft_physical_type::PhysicalType::F64, "0".parse().unwrap(), weft_physical_type::TimeUnit::Seconds);
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("price", &sc).await.expect("declares");
+		let base = dir.path().join("backups");
+		store.backup_control_plane_with_verify(base.join("nightly"), weftdb::VerifyMode::SnapshotOnly).await.expect("backs up");
+		drop(store);
+
+		let target = base.join(".restore-drill-1");
+		let response = super::drill_response(&CleanupFails, "nightly".to_string(), &base.join("nightly"), &target).await.expect("the backup itself restores");
+		assert!(response.restorable);
+		let cleanup = response.cleanup_error.as_deref().expect("the failed cleanup is reported, not swallowed");
+		assert!(cleanup.contains("injected cleanup failure") && cleanup.contains(".restore-drill-1"), "names the cause and the leftover: {cleanup}");
+		assert_eq!(serde_json::to_value(&response).unwrap()["cleanup_error"], serde_json::json!(cleanup), "it is in the JSON body");
+		assert!(target.exists(), "the copy really was left behind, for the sweep");
+
+		// A drill whose restore fails reports a failed cleanup in its error as well.
+		let err = super::drill_response(&CleanupFails, "missing".to_string(), &base.join("missing"), &base.join(".restore-drill-2")).await.unwrap_err();
+		let super::StorageError::Internal(message) = err else { panic!("a failed drill is an internal error") };
+		assert!(message.contains("FAILED") && message.contains("injected cleanup failure"), "{message}");
+	}
+
+	#[tokio::test]
+	async fn staging_names_are_refused_as_backup_and_drill_labels() {
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+		let state = AppState::new().with_store(store.clone());
+		for label in [".partial-backup-1-00", ".deleting-backup-1-00", ".restore-drill-1"] {
+			// A backup under such a name would be swept as litter an hour later.
+			let uri = format!("/api/v1/storage/backup?label={label}");
+			let response = app_with_state(state.clone()).oneshot(Request::builder().method("POST").uri(&uri).body(Body::empty()).unwrap()).await.unwrap();
+			assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}: a staging name is reserved");
+			assert!(!dir.path().join("backups").join(label).exists(), "{uri}: nothing was written");
+
+			// And a directory under such a name is an unfinished backup, prune or drill.
+			std::fs::create_dir_all(dir.path().join("backups").join(label)).unwrap();
+			let uri = format!("/api/v1/storage/restore/drill?label={label}");
+			let response = app_with_state(state.clone()).oneshot(Request::builder().method("POST").uri(&uri).body(Body::empty()).unwrap()).await.unwrap();
+			assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}: a staging name is never a backup");
+		}
 		drop(store);
 	}
 

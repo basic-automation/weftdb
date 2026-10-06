@@ -22,9 +22,43 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 - All dependencies updated to their latest major versions, including wgpu 30,
   Arrow/Parquet 60 and OpenTelemetry 0.33.
 - Builds on stable Rust (MSRV 1.95); nightly is no longer required.
+- **Control-plane backups are published atomically, with a manifest.** A backup is
+  built in a `.partial-{label}-{nonce}/` directory beside its destination, each
+  database verified and fsynced, then a `MANIFEST.json` (format, creation time, and
+  each file's size, tables and rows) is written and fsynced, the directory fsynced,
+  renamed to its label and the parent fsynced. A backup directory now holds the four
+  databases plus `MANIFEST.json`. Backing up into a directory that already exists is
+  refused (it was accepted when empty).
+- **Backup retention counts only complete backups**: a `backup-<digits>` directory
+  with a `MANIFEST.json`, or one from before manifests that holds all four databases.
+  Pruning renames a backup to `.deleting-*` (durably) before removing its files. The
+  backup daemon removes `.partial-*`, `.deleting-*` and `.restore-drill-*` entries
+  left untouched for an hour, at start and on every tick.
+- **Backup and drill labels starting with `.partial-`, `.deleting-` or
+  `.restore-drill-` are rejected with `400`**: those names belong to unfinished
+  backups, prunes and drills, which are never restored and are swept.
+- **`restore_control_plane` stages each file as `<name>.tmp`**, synced and verified,
+  renames them into place only once all four verify, and fsyncs the root. A backup
+  with a manifest must match it (sizes, tables, rows).
+- Library API: `verify_snapshot` and `snapshot_with_verify` take the tables the
+  snapshot must hold, and `SnapshotReport` lists them in `table_names`. `StoreFs`
+  gains `create_dir`, `remove_dir_all` and `copy_new`, and the `SimFs` power-cut
+  simulator (`fault-injection` feature) now models directories.
 
 ### Fixed
 
+- **A backup that stopped part-way could count as a backup.** A crash or error
+  mid-backup left a `backup-<digits>` directory with only some of its databases,
+  which retention counted (so it could prune a good backup in its place) and a drill
+  could pick. A pruned backup interrupted part-way was left half-removed under its
+  name. Neither can happen now; see above.
+- **A reported backup could be lost on power loss**: nothing fsynced its files'
+  directory entries or the directory itself.
+- **An empty control-plane snapshot passed verification.** Every snapshot must now
+  hold its database's tables, at backup and at restore.
+- **The restore drill discarded a failed cleanup.** `POST /api/v1/storage/restore/drill`
+  now reports it in a new `cleanup_error` field (`null` when the rehearsal copy was
+  removed).
 - **Commit failures were silently ignored.** A control-plane write that lost an MVCC
   conflict was reported as success. Commit errors now reach the caller, and the
   transaction is rolled back.
