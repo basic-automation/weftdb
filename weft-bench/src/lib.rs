@@ -33,6 +33,9 @@
 //!   confidence intervals ([`LatencyStats::bootstrap_cis`]).
 //! - [`report`] — the JSON report runner: a [`BenchReport`] envelope (run
 //!   metadata + results) persisted as a durable `reports/json/` artifact.
+//! - [`engine`] — calibrates the interpolation backends before an interpolation run,
+//!   as `weft-server` does at startup, and records the result ([`EngineMetadata`]) in
+//!   the report's run metadata.
 //!
 //! Competitor adapters (`ClickHouse`, `InfluxDB 3`, `QuestDB`, `TimescaleDB`,
 //! `DuckDB`), additional workloads, dataset corpora, and report runners land in
@@ -46,6 +49,7 @@ pub mod adapter;
 pub mod baseline_adapter;
 pub mod compression;
 pub mod downsample;
+pub mod engine;
 pub mod forward_fill_adapter;
 pub mod line_protocol;
 pub mod point_lookup;
@@ -62,7 +66,7 @@ use bigdecimal::ToPrimitive;
 
 use crate::adapter::grid_timestamps;
 pub use crate::{
-	accuracy::{synthetic_ground_truth, AccuracyError, AccuracyMetrics}, adapter::SystemAdapter, baseline_adapter::BaselineLinearAdapter, compression::{run_compression, CompressionParams, CompressionProfile, ValueShape}, downsample::{run_downsample, Aggregation, DownsampleParams, DownsampleProfile}, forward_fill_adapter::ForwardFillAdapter, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, point_lookup::{run_point_lookup, LookupMode, PointLookupParams, PointLookupProfile}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError, SignalShape, SyntheticParams}, range_fetch::{run_range_fetch, RangeFetchParams, RangeFetchProfile}, report::{BenchReport, RunMetadata}, schema::{BenchResult, CorrectnessReport, DatasetMeta, StorageEstimate, TimingBreakdown, SCHEMA_VERSION}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}, weft_adapter::WeftAdapter
+	accuracy::{synthetic_ground_truth, AccuracyError, AccuracyMetrics}, adapter::SystemAdapter, baseline_adapter::BaselineLinearAdapter, compression::{run_compression, CompressionParams, CompressionProfile, ValueShape}, downsample::{run_downsample, Aggregation, DownsampleParams, DownsampleProfile}, engine::{CalibrationStatus, EngineMetadata}, forward_fill_adapter::ForwardFillAdapter, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, point_lookup::{run_point_lookup, LookupMode, PointLookupParams, PointLookupProfile}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError, SignalShape, SyntheticParams}, range_fetch::{run_range_fetch, RangeFetchParams, RangeFetchProfile}, report::{BenchReport, RunMetadata}, schema::{BenchResult, CorrectnessReport, DatasetMeta, StorageEstimate, TimingBreakdown, SCHEMA_VERSION}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}, weft_adapter::WeftAdapter
 };
 
 /// Workload class label recorded for the interpolation profile.

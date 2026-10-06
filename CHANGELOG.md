@@ -26,6 +26,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   thresholds are logged. A CPU/software adapter (llvmpipe, lavapipe, WARP) is not
   calibrated unless `WEFT_GPU_CALIBRATE=force`; `WEFT_GPU_CALIBRATE=0` skips calibration.
   Without it, splimes 1.0 never uses the GPU.
+- **Weft-Bench calibrates like `weft-server`.** An interpolation run (line protocol or
+  `--synthetic`) calls `splimes::calibrate()` once before anything is timed, skipping a
+  CPU/software adapter as the server does, so the numbers come from the engine the
+  server runs on that machine; `--no-gpu-calibrate` turns it off. The calibration, the
+  GPU and `Backend::Auto`'s thresholds are printed and recorded in the report's
+  `metadata.engine` (bench schema v16) and its HTML view.
 
 ### Changed
 
@@ -117,6 +123,9 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 - **`.weftpart` sidecars use `postcard` instead of `bincode`** (frame v3). Sidecars
   written by older versions are ignored: the segment is decoded instead, and the
   sidecar is rebuilt on the next seal. No data migration is needed.
+- `weft-bench --spline poly:N` rejects a degree outside 1–8 when the arguments are
+  parsed, naming the limit. 0.1.0 accepted any degree, and with splimes 1.0 such a run
+  would only have failed once the engine rejected it.
 - All dependencies updated to their latest major versions, including wgpu 30,
   Arrow/Parquet 60 and OpenTelemetry 0.33.
 - Builds on stable Rust (MSRV 1.95); nightly is no longer required.

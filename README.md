@@ -1212,6 +1212,12 @@ What it does today:
 - **Reports** — a `BenchReport` JSON artifact (run metadata + a best-effort
   hardware probe: CPU model, cores, RAM) under `reports/json/`, plus a
   self-contained **HTML** view (`--html`) with the most-accurate row highlighted.
+- **The engine the server runs** — an interpolation run first calls
+  `splimes::calibrate()` once, as `weft-server` does at startup (skipping a
+  CPU/software adapter the same way), so `Backend::Auto` uses rayon and the GPU
+  where they are faster on this machine. The calibration, GPU and thresholds are
+  printed and recorded in the report's `metadata.engine` (schema v16);
+  `--no-gpu-calibrate` skips it and records splimes' defaults.
 - **ILP / TSBS input** — a `.lp` / TSBS file drives the same harness, correctness
   gate, and reporting via the shared `weft-line-protocol` parser.
 
