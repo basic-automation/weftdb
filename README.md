@@ -70,8 +70,8 @@ on your hardware. Where WeftDB doesn't win, this README says so.
 ## Quickstart
 
 **Prerequisites:** Rust **1.95 or newer** on stable. A GPU with a `wgpu` backend
-(Vulkan / Metal / DX12) is optional — without one the engine falls back to
-SIMD/parallel CPU automatically.
+(Vulkan / Metal / DX12) is optional — without one the engine runs on the CPU
+(one thread or the rayon pool) automatically.
 
 ```bash
 cargo build --release
@@ -214,9 +214,9 @@ truth for status and priorities, and it records negative results alongside wins.
 
 - **Interpolation on read** — reconstruct any series onto any grid from nanoseconds
   to years, with Linear / Quadratic / Cubic / Polynomial splines. The engine picks
-  GPU, parallel (Rayon), SIMD or single-threaded CPU by dataset size, and degrades
-  the method gracefully (Cubic → Quadratic → Linear) when data is too sparse to
-  support it.
+  single-threaded CPU, parallel (Rayon) or — once calibrated — GPU by grid size, and
+  degrades the method gracefully (Cubic → Quadratic → Linear) when data is too sparse
+  to support it.
 - **Provenance on every point** — `raw`, `interpolated` or `extrapolated`.
 - **Downsampling** into epoch-aligned buckets: `min`/`max`/`avg`/`sum`/`first`/`last`,
   exact nearest-rank `p50`/`p90`/`p95`/`p99`, three **time-weighted averages** (LOCF
@@ -545,11 +545,17 @@ of the box, and setting `WEFT_DATA_DIR` relocates both the databases and the TUI
 together. The resolution functions are exported as `weftdb::data_dir()` (resolved)
 and `weftdb::default_data_dir()` (the raw default).
 
-The `splimes` crate also exposes a build feature:
+The `splimes` crate also exposes build features:
 
 | Feature | Effect |
 |---------|--------|
-| `gpu-eager-init` | Initializes the GPU *before* `main()` via a constructor, eliminating first-use latency. |
+| `gpu` *(default)* | The `wgpu` backend. Without it, interpolation always runs on the CPU. |
+| `serde` *(default)* | `Serialize`/`Deserialize` for `Point`, `PointKind`, `Resolution` and `Spline`. |
+| `tokio` | `Interpolator::run_async`, which runs an interpolation on tokio's blocking pool. WeftDB enables it: every async caller (the `weftdb` read and compression paths, `weft-server`, the bench adapter) interpolates off the async workers. |
+
+The GPU is started at runtime, not at build time: `weft-server` calibrates it at
+startup (`WEFT_GPU_CALIBRATE`, above), and an embedding program calls
+`splimes::calibrate()` or `splimes::prewarm_gpu()` itself.
 
 ---
 
@@ -774,9 +780,12 @@ Higher-level analytics types build on this foundation:
 
 `splimes` is the numerical heart of WeftDB. Given a set of `Point`s and a target time
 range + resolution, it produces an interpolated series using one of four spline
-methods, choosing the fastest execution strategy automatically. It interpolates
-**and extrapolates** — single-instant lookups and full ranges — on CPU, SIMD, and
-GPU.
+methods, choosing the execution backend automatically, and labels every output point
+`Raw`, `Interpolated` or `Extrapolated` (`PointKind`). It interpolates **and
+extrapolates** — single-instant lookups and full ranges — on the CPU (one thread or
+rayon's pool) and the GPU. WeftDB depends on splimes 1.0; its own
+[migration guide](https://github.com/basic-automation/splimes/blob/main/MIGRATING.md)
+lists what changed from 0.1.
 
 #### Spline Methods
 
@@ -785,50 +794,48 @@ GPU.
 | `Linear` | 2 | Straight-line interpolation. |
 | `Quadratic` | 3 | Second-degree. |
 | `Cubic` | 4 | Smooth third-degree splines. |
-| `Polynomial(degree, bounds_factor)` | degree + 1 | Arbitrary degree with optional bounds damping. |
+| `Polynomial(degree, bounds_factor)` | degree + 1 | Degree 1–8, with optional bounds damping of the extrapolation. |
 
-If a method needs more points than are available, WeftDB **falls back** to the next
-simpler method automatically (`Cubic → Quadratic → Linear`), never upgrading beyond
-what you requested.
+If a method needs more distinct points than are available, splimes **steps down**
+automatically (`Cubic → Quadratic → Linear`; `Polynomial(d) → Polynomial(n − 1)`),
+never upgrading beyond what you requested, and reports the method it used.
 
-#### Strategy Selection
+#### Backend Selection
 
-The `should_use_gpu()` heuristic routes each request to the best backend based on
-input and estimated output size (thresholds derived from internal benchmarks):
+Every call is synchronous; `Backend::Auto` (the default) picks the backend by output
+grid size, using `AutoThresholds`:
 
-| Dataset size | Strategy |
-|--------------|----------|
-| ≥ 5M points (or ≥ 2.5M outputs) | **GPU primary** (memory efficiency dominates) |
-| ≥ 50K points (or ≥ 50K outputs) | **GPU, then parallel fallback** |
-| 1K – 50K points | **CPU** (avoids synchronization overhead) |
-| 100 – 1K points | **GPU streaming** (pipelining overlaps well) |
-| < 100 points | **CPU** (avoid all setup overhead) |
+| Grid size | Backend |
+|-----------|---------|
+| below `parallel_min_points` (default 64 Ki) | **CPU**, the calling thread |
+| from `parallel_min_points` | **Parallel**, rayon's pool |
+| from `gpu_min_points` (default *never*), once the GPU has been started | **GPU** ([`wgpu`](https://wgpu.rs/) compute shaders), falling back to rayon if it fails |
 
-The GPU path uses [`wgpu`](https://wgpu.rs/) compute shaders with:
+`Auto` never starts the GPU itself. `splimes::calibrate()` starts it, times every
+backend on this machine and sets the thresholds to the measured crossovers;
+`weft-server` runs it once at startup (`WEFT_GPU_CALIBRATE=0` skips it). Otherwise:
 
-- **Buffer pooling** — size-tiered (4 KB–128 MB), LRU-evicted pool used throughout
-  the interpolation paths (including the static f64/f32 entry points); cut
-  per-run allocations from 7,000+ to under 50 on a 1M-point run and reuses
-  buffers across batches.
-- **Persistent staging buffers** — 3-buffer round-robin with persistent mapping
-  that eliminates unmap/remap overhead.
-- **f64 / f32 precision paths** — automatically chosen by GPU capability.
-- **Pre-warming** — `splimes::prewarm_gpu()` (or the `gpu-eager-init` feature)
-  removes first-call initialization latency. `splimes::prewarm_gpu_with_config()`
-  takes a `GpuConfig` preset (`minimal()`, `low_memory()`, `default()`,
-  `high_performance()`) to size the **buffer pool** and **staging buffers**.
-  The interpolator is a process-wide singleton sized once at initialization, so a
-  configuration must be supplied **before any other GPU use** — if the GPU is
-  already up, the call reports an error rather than silently ignoring it, and
-  `gpu_config_applied()` / `effective_gpu_config()` let you check what is in force.
-  `GpuConfig::max_command_batch_size` is **reserved and currently has no effect**:
-  command batching is not implemented yet (roadmap Phase 5.1).
+- `splimes::prewarm_gpu()` starts the GPU and returns its `GpuInfo` (adapter, API,
+  device type, driver, `f64` support); then set thresholds with
+  `splimes::set_auto_thresholds`.
+- `splimes::configure_gpu(GpuConfig)` — before the GPU's first use — sizes its
+  buffer pool and per-dispatch chunk (`max_pool_bytes`, `chunk_points`, `low_power`;
+  presets `GpuConfig::minimal()`, `low_memory()`, `DEFAULT`, `high_performance()`).
+  Calling it after the GPU has started is an `Error::GpuAlreadyConfigured`, never a
+  silent no-op; `splimes::gpu_config()` reports what is in force.
+- `splimes::gpu_pool_stats()` returns the buffer pool's counters once the GPU is up.
+- The GPU computes in `f64` where the adapter supports it; `f32` must be asked for
+  (`Interpolator::gpu_precision(Precision::F32)`).
 
 ```rust,ignore
-use splimes::{auto_interpolate, Resolution, Spline};
+use splimes::{Interpolator, Resolution, Spline};
 
-// Automatically selects GPU/CPU/parallel based on size:
-let series = auto_interpolate(&mut points, start, end, Resolution::Seconds, Spline::Cubic).await?;
+// Backend::Auto picks the backend by grid size; from async code, run it off the
+// executor (`run_async` needs the `tokio` feature):
+let series = Interpolator::new(Spline::Cubic, Resolution::Seconds).run_async(points, start, end).await?;
+for (timestamp, value, kind) in series.iter() {
+    // kind: PointKind::Raw | Interpolated | Extrapolated
+}
 ```
 
 ---
@@ -1178,7 +1185,7 @@ What it does today:
   The underlying point/range read speedups are quantified at the codec layer in
   [`weft-physical-type/benches/pointread.rs`](weft-physical-type/benches/pointread.rs).
 - **Vendor-neutral adapters** — every system is driven through the
-  `SystemAdapter` trait: the WeftDB reference adapter (`splimes::auto_interpolate`),
+  `SystemAdapter` trait: the WeftDB reference adapter (splimes' `Interpolator` on `Backend::Auto`),
   a precision-aware **portable linear baseline** (fair-protocol class C), and a
   **forward-fill/LOCF baseline** (class B — the in-process mirror of
   `FILL(previous)` / `locf()`).
@@ -1301,7 +1308,7 @@ server and an interactive application:
 
 | Crate | Role |
 |-------|------|
-| [`splimes`](https://github.com/basic-automation/splimes) *(own repo, from crates.io)* | Spline interpolation engine — Linear / Quadratic / Cubic / Polynomial methods with automatic GPU, parallel, SIMD, and CPU strategy selection. |
+| [`splimes`](https://github.com/basic-automation/splimes) *(own repo, from crates.io)* | Spline interpolation engine — Linear / Quadratic / Cubic / Polynomial methods on the CPU (one thread or rayon) or the GPU, chosen by grid size, with raw / interpolated / extrapolated provenance on every point. |
 | [`weftdb`](weftdb) | Time-series database: [Turso](https://turso.tech/) (libSQL) **control plane** (catalog, metadata, segment index; MVCC concurrent writes) + WeftDB's own typed columnar **`.weftseg` segment store** on the measurement hot path, plus the pattern-recognition types and tiered dataset compression. |
 | [`weft-orchestration`](weft-orchestration) | High-level pipeline that chains batching → pattern extraction → event detection → correlation → signal generation, with built-in detectors and parallel execution. |
 | [`weft-physical-type`](weft-physical-type) | Vendor-neutral physical type system — schema-declared numeric encodings with explicit exactness, timestamp codecs, and the `.weftseg` columnar segment format (single-block and paged). |
@@ -1328,11 +1335,13 @@ columnar segments throughout.
   TTL/LRU cache (default: 50 connections, 30-minute TTL) and starts MVCC
   `BEGIN CONCURRENT` transactions automatically, with retry + backoff on
   transient failures.
-- **Pre-warm the GPU.** Call `splimes::prewarm_gpu()` at startup (or enable
-  `gpu-eager-init`) to avoid ~1.2 s of first-call initialization latency.
+- **Calibrate the backends once.** `weft-server` does it at startup; a program
+  embedding the libraries calls `splimes::calibrate()` (or `splimes::prewarm_gpu()`
+  plus `splimes::set_auto_thresholds`) once, off any latency-critical path. Without
+  it, interpolation never uses the GPU.
 - **Pick sensible batch sizes** for pipelines (typically 24–100 for hourly data).
-- **Let the engine choose.** `auto_interpolate` / `analyze_range` already select the
-  optimal backend — overriding is rarely necessary.
+- **Let the engine choose.** `Backend::Auto` (behind `analyze_range` and every
+  endpoint) already selects the backend by grid size — overriding is rarely necessary.
 - Pipeline pattern loading is **memory-aware**: batch sizes adapt to available RAM to
   avoid exhaustion on large datasets.
 
