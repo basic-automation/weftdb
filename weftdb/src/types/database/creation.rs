@@ -27,11 +27,11 @@
 //! exercised for process crashes only.
 
 use std::{
-	fs::{File, OpenOptions, TryLockError}, io, path::{Path, PathBuf}
+	fs::{File, OpenOptions, TryLockError}, io, path::{Path, PathBuf}, sync::Arc
 };
 
 use crate::types::durable::{
-	fault::{self, FaultPoint}, RealFs, StoreFs
+	fault::{self, FaultPoint}, fs::sync_dir_blocking
 };
 
 /// The lock file creators share and sweepers take exclusively, in the directory that
@@ -167,18 +167,25 @@ impl CreatorLock {
 
 /// One `Database::new` in progress: its build directory and its creator lock.
 ///
-/// Dropping a `Build` that was not [published](Self::publish) removes its build
-/// directory, so every early return of `new` cleans up after itself; a crash leaves the
-/// directory to the next sweep instead.
+/// Dropping a `Build` that was never [published](Self::publish) removes its build
+/// directory, so every early return of `new` before the publish cleans up after itself; a
+/// crash leaves the directory to the next sweep instead. Once `publish` has started, its
+/// blocking task alone decides the directory's fate (see there).
 #[derive(Debug)]
 pub struct Build {
 	dir: PathBuf,
 	parent: PathBuf,
 	target: PathBuf,
-	published: bool,
-	/// Dropped after [`Drop::drop`] has removed an unpublished directory, so no sweep can
-	/// race that cleanup.
-	_lock: CreatorLock,
+	/// Set when [`publish`](Self::publish) hands the build directory to its blocking task.
+	/// [`Drop`] then leaves the directory alone: the task may be renaming it at that very
+	/// moment (a `new` future dropped mid-publish, by a timeout or a `select!`, does not
+	/// stop it), and removing the files then could publish a half-built database.
+	handed_off: bool,
+	/// Shared with the publish task, so that the lock is held until that task ends even if
+	/// this `Build` is dropped first: a sweep must not take the directory from under the
+	/// rename either. Otherwise it is dropped after [`Drop::drop`] has removed an
+	/// unpublished directory, so no sweep can race that cleanup.
+	lock: Arc<CreatorLock>,
 }
 
 impl Build {
@@ -199,7 +206,7 @@ impl Build {
 		let lock = CreatorLock::take(&parent).await?;
 		let create = dir.clone();
 		blocking(move || std::fs::create_dir(&create)).await?;
-		Ok(Self { dir, parent, target: target.to_path_buf(), published: false, _lock: lock })
+		Ok(Self { dir, parent, target: target.to_path_buf(), handed_off: false, lock: Arc::new(lock) })
 	}
 
 	/// The build directory, where the database files are written.
@@ -214,48 +221,72 @@ impl Build {
 	/// rename a directory with open files, and a database opened afterwards must be
 	/// opened at its final path.
 	///
+	/// All of it, and the cleanup after a failure, runs as one blocking task that holds
+	/// the creator lock. If this future is dropped before the task ends, the task still
+	/// runs to its end, and the `Build` leaves the directory to it: the database is then
+	/// either published or, after a failure, removed by the task.
+	///
 	/// # Errors
 	///
 	/// `AlreadyExists` if the target exists (another `new` of the same name won). Any
 	/// other error syncing or renaming. A failure after the rename (the parent fsync, or
 	/// the `L-new-renamed` fault point) renames the build back, so an error always means
-	/// the database was not created; if that rename back fails too, the complete database
-	/// stays at the target and the error says so.
+	/// the database was not created, and its build directory is gone; if that rename back
+	/// fails too, the complete database stays at the target and the error says so.
 	pub async fn publish(&mut self) -> io::Result<()> {
-		let taken = || io::Error::new(io::ErrorKind::AlreadyExists, format!("{} already exists", self.target.display()));
-		RealFs.sync_dir(&self.dir).await?;
-		if RealFs.metadata(&self.target).await.is_ok() {
-			return Err(taken());
-		}
-		// A concurrent `new` of the same name can publish between the check and the rename;
-		// renaming onto its directory, which is not empty, then fails with `ENOTEMPTY` (or
-		// `EEXIST`) rather than replacing it.
-		RealFs.rename(&self.dir, &self.target).await.map_err(|e| if matches!(e.kind(), io::ErrorKind::AlreadyExists | io::ErrorKind::DirectoryNotEmpty) { taken() } else { e })?;
-		let committed = match fault::hit(FaultPoint::LNewRenamed).await {
-			Ok(()) => RealFs.sync_dir(&self.parent).await,
-			Err(e) => Err(e),
-		};
-		if let Err(e) = committed {
-			if let Err(back) = RealFs.rename(&self.target, &self.dir).await {
-				self.published = true;
-				return Err(io::Error::new(e.kind(), format!("{e}; the database at {} is complete but could not be withdrawn ({back})", self.target.display())));
+		let (dir, parent, target, lock) = (self.dir.clone(), self.parent.clone(), self.target.clone(), Arc::clone(&self.lock));
+		self.handed_off = true;
+		blocking(move || {
+			let _lock = lock;
+			let published = publish_blocking(&dir, &parent, &target);
+			if published.is_err() {
+				remove_build_dir(&dir);
 			}
-			return Err(e);
+			published
+		})
+		.await
+	}
+}
+
+/// [`Build::publish`]'s steps, on a blocking thread. On an error the database is not at
+/// `target`, unless the error says it could not be withdrawn.
+fn publish_blocking(dir: &Path, parent: &Path, target: &Path) -> io::Result<()> {
+	let taken = || io::Error::new(io::ErrorKind::AlreadyExists, format!("{} already exists", target.display()));
+	sync_dir_blocking(dir)?;
+	if std::fs::metadata(target).is_ok() {
+		return Err(taken());
+	}
+	// A concurrent `new` of the same name can publish between the check and the rename;
+	// renaming onto its directory, which is not empty, then fails with `ENOTEMPTY` (or
+	// `EEXIST`) rather than replacing it.
+	std::fs::rename(dir, target).map_err(|e| if matches!(e.kind(), io::ErrorKind::AlreadyExists | io::ErrorKind::DirectoryNotEmpty) { taken() } else { e })?;
+	let committed = fault::hit_blocking(FaultPoint::LNewRenamed).and_then(|()| sync_dir_blocking(parent));
+	if let Err(e) = committed {
+		if let Err(back) = std::fs::rename(target, dir) {
+			return Err(io::Error::new(e.kind(), format!("{e}; the database at {} is complete but could not be withdrawn ({back})", target.display())));
 		}
-		self.published = true;
-		Ok(())
+		return Err(e);
+	}
+	Ok(())
+}
+
+/// Remove an unpublished build directory; a failure is logged and left to the next sweep.
+fn remove_build_dir(dir: &Path) {
+	match std::fs::remove_dir_all(dir) {
+		Ok(()) => {}
+		Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+		Err(e) => tracing::warn!(dir = %dir.display(), error = %e, "could not remove the build directory of a failed Database::new; the next sweep removes it"),
 	}
 }
 
 impl Drop for Build {
+	/// Removes the build directory unless [`publish`](Build::publish) took it over. This
+	/// is the error path of `new` before the publish, on a directory holding a few small
+	/// files, so it runs inline: deferring it to another thread would let `new` return its
+	/// error while the directory still exists.
 	fn drop(&mut self) {
-		if self.published {
-			return;
-		}
-		match std::fs::remove_dir_all(&self.dir) {
-			Ok(()) => {}
-			Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-			Err(e) => tracing::warn!(dir = %self.dir.display(), error = %e, "could not remove the build directory of a failed Database::new; the next sweep removes it"),
+		if !self.handed_off {
+			remove_build_dir(&self.dir);
 		}
 	}
 }
@@ -263,6 +294,8 @@ impl Drop for Build {
 #[cfg(test)]
 mod tests {
 	use std::time::{Duration, Instant};
+
+	use serial_test::serial;
 
 	use super::*;
 
@@ -305,7 +338,10 @@ mod tests {
 		assert!(!dir.exists(), "an unpublished build removes its directory");
 	}
 
+	// Every test that publishes runs serially: one of them arms `L-new-renamed`, which is
+	// process-global.
 	#[tokio::test]
+	#[serial(build_publish)]
 	async fn a_stale_build_is_swept_and_other_entries_are_kept() {
 		let root = tempfile::tempdir().unwrap();
 		assert_eq!(sweep_stale_build_dirs(root.path()).await.unwrap(), 0, "no lock file: nothing was ever built here");
@@ -326,6 +362,7 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[serial(build_publish)]
 	async fn publish_refuses_an_existing_target_and_cleans_up() {
 		let root = tempfile::tempdir().unwrap();
 		let target = root.path().join("taken");
@@ -337,5 +374,44 @@ mod tests {
 		drop(build);
 		assert!(!dir.exists());
 		assert!(target.is_dir(), "the existing target is untouched");
+	}
+
+	/// A `publish` whose future is dropped part-way (a timeout or a `select!` dropping
+	/// `Database::new`) leaves the build to its blocking task: dropping the `Build` removes
+	/// nothing, no sweep runs until the task ends (it holds the creator lock), and the task
+	/// completes the publish. Before, the `Build`'s drop removed the directory while its
+	/// rename could be in flight, and released the lock to a sweep.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	#[serial(build_publish)]
+	async fn a_dropped_publish_is_finished_by_its_task() {
+		let root = tempfile::tempdir().unwrap();
+		let target = root.path().join("db");
+		let mut build = Build::begin(&target).await.unwrap();
+		std::fs::write(build.dir().join("metadata.db"), b"x").unwrap();
+
+		let resume = Arc::new(tokio::sync::Notify::new());
+		let before = fault::hits(FaultPoint::LNewRenamed);
+		let armed = fault::arm(FaultPoint::LNewRenamed, fault::FaultAction::Pause(resume.clone()));
+		{
+			let publishing = build.publish();
+			tokio::pin!(publishing);
+			tokio::select! {
+				_ = &mut publishing => panic!("the publish task is paused at L-new-renamed"),
+				() = fault::reached(FaultPoint::LNewRenamed, before + 1) => {}
+			}
+		}
+		drop(build);
+		drop(armed);
+		assert!(target.join("metadata.db").exists(), "dropping the Build mid-publish removed nothing");
+
+		// What a crashed creator leaves: no sweep may run while the publish task holds the lock.
+		let stale = root.path().join(format!(".gone{BUILD_INFIX}{}", uuid::Uuid::new_v4().simple()));
+		std::fs::create_dir(&stale).unwrap();
+		assert_eq!(sweep_stale_build_dirs(root.path()).await.unwrap(), 0, "the publish task still holds the creator lock");
+		assert!(stale.exists());
+
+		resume.notify_one();
+		assert_eq!(sweep_once_unlocked(root.path()).await, 1, "the lock is released once the task ends");
+		assert!(target.join("metadata.db").exists(), "the task completed the publish");
 	}
 }
