@@ -4,7 +4,7 @@ use crate::{
 	cache::Connection, database::traits::{AspectStructure, Inputs}, types::{
 		database::{
 			helpers::safe_usize_to_f64, traits::{config::Config, connection::Connection as ConnectionTrait, DatabaseStructure}
-		}, TxId
+		}, durable::{fault, FaultPoint}, TxId
 	}, Aspect, AspectId, Batch, BatchId, Correlation, CorrelationID, Database, DatasetId, DictionaryMetadata, Error, Event, EventID, InputMeasurement, Measurement, Pattern, PatternID
 };
 
@@ -129,6 +129,15 @@ impl Inputs for Database {
 		let measurement = Measurement::from_input_measurement(dataset_id, input_measurement);
 		let data_timestamp = measurement.timestamp();
 
+		// Write-ahead enqueue (crash-consistency design, S18): queue the timestamp before the
+		// row is inserted, so the unbatched queue is always a superset of the stored rows.
+		// Enqueuing after the insert left a committed but unqueued row, which the incremental
+		// build could miss, whenever the call failed or crashed in between. A queued
+		// timestamp whose row never lands only waits in the queue: its windows lack the
+		// points to form a batch.
+		self.enqueue_unbatched_measurement(aspect_id, data_timestamp).await?;
+		fault::hit(FaultPoint::LEnqueued).await?;
+
 		// Simple INSERT - no unique constraints with MVCC, duplicates handled at app level
 		let insert_sql = r"
 			INSERT INTO measurements (id, dataset_id, timestamp, value) 
@@ -150,9 +159,6 @@ impl Inputs for Database {
 
 		// Checkpoint WAL to ensure measurement is persisted
 		Self::checkpoint_wal_passive(&db).await?;
-
-		// Enqueue measurement for incremental batch processing
-		self.enqueue_unbatched_measurement(aspect_id, data_timestamp).await?;
 
 		// Check if this measurement falls in a previously compressed range and mark dirty if so
 		// This is best-effort - errors are logged but don't fail the insert
@@ -236,8 +242,21 @@ impl Inputs for Database {
 		let db = self.get_measurement_db(&aspect_id).await?;
 		tracing::debug!("[batch_capture] Got measurement DB, getting path...");
 		let db_path = self.get_measurement_db_path(&aspect_id).await?;
-		tracing::debug!("[batch_capture] Got DB path, starting chunk loop ({} chunks of {})", total_measurements / chunk_size + 1, chunk_size);
 		let dataset_id_str = dataset_id.as_uuid().to_string();
+
+		// Write-ahead enqueue (crash-consistency design, S18): queue every timestamp before
+		// the first chunk is inserted, so the unbatched queue is always a superset of the
+		// stored rows. The chunks commit one by one, so a failure or crash mid-call leaves a
+		// committed prefix; enqueuing after the loop left that prefix unqueued, and the
+		// incremental build could miss it. Timestamps whose rows never land only wait in the
+		// queue.
+		tracing::debug!("[batch_capture] Enqueuing {} unbatched measurements...", input_measurements.len());
+		let all_timestamps: Vec<chrono::DateTime<chrono::Utc>> = input_measurements.iter().map(InputMeasurement::timestamp).collect();
+		self.enqueue_unbatched_measurements(&aspect_id, &all_timestamps).await?;
+		fault::hit(FaultPoint::LEnqueued).await?;
+		tracing::debug!("[batch_capture] Unbatched measurements enqueued");
+
+		tracing::debug!("[batch_capture] Starting chunk loop ({} chunks of {})", total_measurements / chunk_size + 1, chunk_size);
 
 		for (chunk_idx, chunk) in input_measurements.chunks(chunk_size).enumerate() {
 			let start = chunk_idx * chunk_size;
@@ -303,6 +322,7 @@ impl Inputs for Database {
 
 			Self::commit_concurrent(&conn).await?;
 			all_tx_ids.extend(chunk_tx_ids);
+			fault::hit(FaultPoint::LChunk(u32::try_from(chunk_idx).unwrap_or(u32::MAX))).await?;
 
 			// Periodic PASSIVE checkpoint every 100 chunks to prevent WAL from growing too large
 			// PASSIVE doesn't block, unlike TRUNCATE
@@ -326,11 +346,9 @@ impl Inputs for Database {
 		Self::checkpoint_wal_passive(&db).await?;
 		tracing::debug!("[batch_capture] Final checkpoint complete");
 
-		// Enqueue all measurement timestamps for incremental batch processing
-		tracing::debug!("[batch_capture] Enqueuing {} unbatched measurements...", input_measurements.len());
-		let all_timestamps: Vec<chrono::DateTime<chrono::Utc>> = input_measurements.iter().map(InputMeasurement::timestamp).collect();
-		self.enqueue_unbatched_measurements(&aspect_id, &all_timestamps).await?;
-		tracing::debug!("[batch_capture] Unbatched measurements enqueued");
+		// Every row is committed and queued by now, so the dirty-region marking and the
+		// timestamp update are best-effort: their error must not turn a stored batch into a
+		// failed call that the client retries, which in rows mode stores it twice.
 
 		// Check if any measurements in this batch fall within previously compressed ranges
 		// This is best-effort - errors are logged but don't fail the import
@@ -338,9 +356,13 @@ impl Inputs for Database {
 			tracing::debug!("[batch_capture] Failed to check dirty regions for batch: {e}");
 		}
 
-		// Update earliest and latest in metadata
+		// Update earliest and latest in metadata. Nothing reads these columns back (the
+		// earliest and latest measurement are computed from the rows), so a failure is
+		// only logged.
 		tracing::debug!("[batch_capture] Updating aspect timestamps...");
-		self.update_aspect_timestamps(&aspect_id, min_new, max_new).await?;
+		if let Err(e) = self.update_aspect_timestamps(&aspect_id, min_new, max_new).await {
+			tracing::warn!("[batch_capture] Failed to update aspect timestamps for {aspect_id}; the measurements are stored: {e}");
+		}
 		tracing::info!("[batch_capture] Batch complete: {} measurements imported for aspect {}", total_measurements, aspect_id);
 		Ok(all_tx_ids)
 	}
@@ -443,55 +465,86 @@ impl Inputs for Database {
 	}
 
 	/// Insert unprocessed batch (implement missing trait method)
+	///
+	/// Skips the insert, and still returns `Ok`, when a batch with the same
+	/// `(aspect_id, batch_hash)` is already queued or already processed (crash-consistency
+	/// design, S18). The queue consumer inserts its batches and only then dequeues the
+	/// timestamps they cover, so a consumer that crashed in between rebuilds the same
+	/// windows on its next run; without this check every one of those batches was queued,
+	/// processed and turned into a pattern occurrence twice. The hash is the MD5 of the
+	/// batch's measurements, which include their timestamps, so two different windows
+	/// never share one.
+	///
+	/// The unprocessed check runs inside the insert's own transaction. The processed
+	/// batches live in another database, so that check runs just before it. Neither table
+	/// can carry a unique index under MVCC, so two consumers racing on the same aspect can
+	/// still both insert a batch; the consumer runs once per aspect. Each check scans its
+	/// table, so storing many batches goes through
+	/// [`batch_insert_unprocessed_batches`](Self::batch_insert_unprocessed_batches), which
+	/// reads the hashes once.
 	async fn insert_unprocessed_batch(&self, aspect_id: &AspectId, batch: &Batch) -> Result<TxId> {
 		let tx_id = TxId::new();
-		let measurements_json = serde_json::to_string(&batch.measurements).map_err(|e| Error::DatabaseError(format!("Failed to serialize: {e}")))?;
-		let batch_hash = format!("{:x}", md5::compute(&measurements_json));
-		let batch_id = batch.id().to_string();
+		let (measurements_json, batch_hash) = Self::batch_identity(batch)?;
+		if self.processed_batch_hash_exists(aspect_id, &batch_hash).await? {
+			tracing::debug!("Batch {} for aspect {aspect_id} is already processed (hash {batch_hash}); not queuing it again", batch.id());
+			return Ok(tx_id);
+		}
+
 		let db = self.get_unprocessed_batches_db(aspect_id).await?;
 		let db_path = self.get_unprocessed_batches_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
-		// Simple INSERT - no unique constraints with MVCC
-		let insert_sql = r"
-			INSERT INTO batches (id, aspect_id, database_id, size, resolution, measurements, batch_hash, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		";
-
-		let batch_metadata_size: i64 = match i64::try_from(batch.metadata.size) {
-			Ok(size) => size,
-			Err(e) => {
-				return Err(anyhow::anyhow!("Batch size conversion error: {e}"));
-			}
-		};
-
-		let res = conn.as_ref().execute(insert_sql, turso::params![batch_id.clone(), aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string(), batch_metadata_size, format!("{}", batch.metadata.resolution), measurements_json.clone(), batch_hash.clone(), "unprocessed", chrono::Utc::now().timestamp_millis()]).await;
-		match res {
-			Ok(_) => {}
-			Err(e) => {
-				tracing::warn!("Failed to insert unprocessed batch {batch_id}: {e}");
+		match Self::batch_hash_exists(&conn, aspect_id, &batch_hash).await {
+			Ok(false) => {}
+			Ok(true) => {
 				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("Failed to insert unprocessed batch: {e}"));
+				tracing::debug!("Batch {} for aspect {aspect_id} is already queued (hash {batch_hash}); not queuing it again", batch.id());
+				return Ok(tx_id);
+			}
+			Err(e) => {
+				let _ = Self::rollback_concurrent(&conn).await;
+				return Err(e);
 			}
 		}
-
+		self.insert_unprocessed_batch_row(&conn, aspect_id, batch, measurements_json, batch_hash).await?;
 		Self::commit_concurrent(&conn).await?;
 
 		Ok(tx_id)
 	}
 
 	/// Batch insert unprocessed batches (implement missing trait method)
+	///
+	/// Applies the same dedupe as [`insert_unprocessed_batch`](Self::insert_unprocessed_batch),
+	/// and also drops repeats within `batches`, but reads the queued and processed hashes
+	/// once up front instead of scanning both tables for every batch: the tables have no
+	/// index, and a full rebuild inserts one batch per point, so a scan per insert would
+	/// make it quadratic. Every input batch still gets a `TxId`, inserted or skipped.
 	async fn batch_insert_unprocessed_batches(&self, aspect_id: &AspectId, batches: Vec<Batch>) -> Result<Vec<TxId>> {
 		let total = batches.len();
 		let mut tx_ids = Vec::with_capacity(total);
 		let report_interval = std::cmp::max(1000, total / 10); // Report every 1000 or 10% (whichever is larger)
+		let mut known = self.known_batch_hashes(aspect_id).await?;
+		let mut skipped = 0usize;
+		let db = self.get_unprocessed_batches_db(aspect_id).await?;
+		let db_path = self.get_unprocessed_batches_db_path(aspect_id).await?;
 
 		for (i, b) in batches.into_iter().enumerate() {
-			let tx = self.insert_unprocessed_batch(aspect_id, &b).await?;
-			tx_ids.push(tx);
+			let (measurements_json, batch_hash) = Self::batch_identity(&b)?;
+			if known.insert(batch_hash.clone()) {
+				let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+				self.insert_unprocessed_batch_row(&conn, aspect_id, &b, measurements_json, batch_hash).await?;
+				Self::commit_concurrent(&conn).await?;
+			} else {
+				skipped += 1;
+			}
+			tx_ids.push(TxId::new());
 
 			// Report progress intermittently
 			if (i + 1) % report_interval == 0 || i + 1 == total {
 				tracing::debug!("Inserted unprocessed batches: {}/{}", i + 1, total);
 			}
+		}
+		if skipped > 0 {
+			tracing::debug!("Skipped {skipped} of {total} unprocessed batches for aspect {aspect_id}: already queued or processed");
 		}
 		Ok(tx_ids)
 	}
@@ -590,7 +643,7 @@ impl Inputs for Database {
 	async fn insert_processed_batch(&self, aspect_id: &AspectId, batch: &Batch) -> Result<TxId> {
 		let tx_id = TxId::new();
 		let measurements_json = serde_json::to_string(&batch.measurements).map_err(|e| Error::DatabaseError(format!("Failed to serialize: {e}")))?;
-		let batch_hash = format!("{:x}", md5::compute(&measurements_json));
+		let batch_hash = Self::processed_batch_hash(batch, &measurements_json);
 		let batch_id = batch.batch_id().to_string();
 		let db = self.get_processed_batches_db(aspect_id).await?;
 		let db_path = self.get_processed_batches_db_path(aspect_id).await?;
@@ -750,7 +803,7 @@ impl Inputs for Database {
 			let mut params: Vec<String> = Vec::with_capacity(sub_chunk.len() * 9);
 			for batch in sub_chunk {
 				let measurements_json = serde_json::to_string(&batch.measurements).map_err(|e| Error::DatabaseError(format!("Failed to serialize: {e}")))?;
-				let batch_hash = format!("{:x}", md5::compute(&measurements_json));
+				let batch_hash = Self::processed_batch_hash(batch, &measurements_json);
 				let batch_metadata_size: i64 = i64::try_from(batch.metadata.size).unwrap_or(0);
 
 				params.push(batch.batch_id().to_string());
@@ -1647,6 +1700,86 @@ impl Inputs for Database {
 
 /// Helper methods for dirty region tracking (not part of trait)
 impl Database {
+	/// A batch's identity for the queue dedupe: its measurements as stored (JSON) and
+	/// their MD5, the `batch_hash` column.
+	fn batch_identity(batch: &Batch) -> Result<(String, String)> {
+		let measurements_json = serde_json::to_string(&batch.measurements).map_err(|e| Error::DatabaseError(format!("Failed to serialize: {e}")))?;
+		let batch_hash = format!("{:x}", md5::compute(&measurements_json));
+		Ok((measurements_json, batch_hash))
+	}
+
+	/// The `batch_hash` a processed batch is stored under: the hash it was queued under,
+	/// when it came from the unprocessed queue, so that
+	/// [`insert_unprocessed_batch`](Inputs::insert_unprocessed_batch) recognises it. Processing
+	/// rewrites the measurements (level transform, analysis), so a hash of the processed
+	/// measurements would never match the batch the consumer rebuilds.
+	fn processed_batch_hash(batch: &Batch, measurements_json: &str) -> String {
+		batch.batch_hash().cloned().unwrap_or_else(|| format!("{:x}", md5::compute(measurements_json)))
+	}
+
+	/// Whether a batch with `batch_hash` is stored for `aspect_id` in the batches table
+	/// `conn` is open on, read inside `conn`'s transaction.
+	async fn batch_hash_exists(conn: &Connection, aspect_id: &AspectId, batch_hash: &str) -> Result<bool> {
+		let mut rows = conn.as_ref().query("SELECT 1 FROM batches WHERE aspect_id = ? AND batch_hash = ? LIMIT 1", turso::params![aspect_id.as_uuid().to_string(), batch_hash.to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to look up batch hash: {e}")))?;
+		Ok(rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to look up batch hash: {e}")))?.is_some())
+	}
+
+	/// Whether the processed batches hold a batch with `batch_hash` for `aspect_id`.
+	async fn processed_batch_hash_exists(&self, aspect_id: &AspectId, batch_hash: &str) -> Result<bool> {
+		let db = self.get_processed_batches_db(aspect_id).await?;
+		let db_path = self.get_processed_batches_db_path(aspect_id).await?;
+		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		let exists = Self::batch_hash_exists(&conn, aspect_id, batch_hash).await;
+		let _ = Self::rollback_concurrent(&conn).await;
+		exists
+	}
+
+	/// Every `batch_hash` queued or processed for `aspect_id`, one read of each table.
+	async fn known_batch_hashes(&self, aspect_id: &AspectId) -> Result<std::collections::HashSet<String>> {
+		let mut known = std::collections::HashSet::new();
+		let sources = [(self.get_unprocessed_batches_db(aspect_id).await?, self.get_unprocessed_batches_db_path(aspect_id).await?), (self.get_processed_batches_db(aspect_id).await?, self.get_processed_batches_db_path(aspect_id).await?)];
+		for (db, db_path) in sources {
+			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+			let read = async {
+				let mut rows = conn.as_ref().query("SELECT batch_hash FROM batches WHERE aspect_id = ? AND batch_hash IS NOT NULL", turso::params![aspect_id.as_uuid().to_string()]).await?;
+				while let Some(row) = rows.next().await? {
+					known.insert(row.get::<String>(0)?);
+				}
+				Ok::<_, turso::Error>(())
+			}
+			.await;
+			let _ = Self::rollback_concurrent(&conn).await;
+			read.map_err(|e| Error::DatabaseError(format!("Failed to read batch hashes: {e}")))?;
+		}
+		Ok(known)
+	}
+
+	/// INSERT one unprocessed batch row inside `conn`'s open transaction. On error the
+	/// transaction is rolled back.
+	async fn insert_unprocessed_batch_row(&self, conn: &Connection, aspect_id: &AspectId, batch: &Batch, measurements_json: String, batch_hash: String) -> Result<()> {
+		let batch_id = batch.id().to_string();
+		// Simple INSERT - no unique constraints with MVCC
+		let insert_sql = r"
+			INSERT INTO batches (id, aspect_id, database_id, size, resolution, measurements, batch_hash, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		";
+
+		let batch_metadata_size: i64 = match i64::try_from(batch.metadata.size) {
+			Ok(size) => size,
+			Err(e) => {
+				let _ = Self::rollback_concurrent(conn).await;
+				return Err(anyhow::anyhow!("Batch size conversion error: {e}"));
+			}
+		};
+
+		let res = conn.as_ref().execute(insert_sql, turso::params![batch_id.clone(), aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string(), batch_metadata_size, format!("{}", batch.metadata.resolution), measurements_json, batch_hash, "unprocessed", chrono::Utc::now().timestamp_millis()]).await;
+		if let Err(e) = res {
+			tracing::warn!("Failed to insert unprocessed batch {batch_id}: {e}");
+			Self::rollback_concurrent(conn).await?;
+			return Err(anyhow::anyhow!("Failed to insert unprocessed batch: {e}"));
+		}
+		Ok(())
+	}
+
 	/// Check if a timestamp falls within a previously compressed range and mark it as dirty if so.
 	///
 	/// This is called after inserting measurements to track when new data is inserted

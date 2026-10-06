@@ -23,8 +23,41 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   Arrow/Parquet 60 and OpenTelemetry 0.33.
 - Builds on stable Rust (MSRV 1.95); nightly is no longer required.
 
+### Added
+
+- `Database::list_stored_databases()` lists the legacy databases on disk (the folders
+  of the data directory that hold a `metadata.db`), sweeping the build directories of
+  interrupted `Database::new` calls first. `weft-tui` lists databases through it.
+
 ### Fixed
 
+- **`Database::new` could leave a half-created database** that neither a retry of
+  `new` ("already exists") nor `Database::existing` (no `database` row) could use. A
+  database is now built in a hidden `.{name}.creating-{nonce}` folder beside its final
+  place and renamed to `{name}` only once its schema and `database` row are committed,
+  then the data directory is fsynced. An error or crash leaves either nothing under
+  `{name}` (retry `new`) or the complete database (open it with `existing`). Build
+  folders left by a crash are removed by the next `new` or listing; the data directory
+  gains a `.weft-creating.lock` file that keeps a sweep away from a creation in
+  progress, in this or another process. `new` now refuses a name of the build folders'
+  form (`.{x}.creating-` followed by 32 hex digits).
+- **Legacy ingest could store rows that were never batched.** `batch_capture_measurements`
+  and `capture_measurement` queued the timestamps for batching only after the rows
+  committed, so a failure in between left rows the incremental pipeline never saw.
+  The timestamps are now queued first, so the queue always covers the stored rows; a
+  timestamp whose row never landed waits in the queue, and the incremental build no
+  longer fails on an aspect whose queue holds timestamps but no rows yet. Updating the
+  aspect's earliest/latest columns after the insert is now best-effort, like the
+  dirty-region marking, so it cannot fail a call whose rows are already stored.
+- **A crashed batch consumer queued its batches twice.** `insert_unprocessed_batch` and
+  `batch_insert_unprocessed_batches` now skip a batch whose `(aspect_id, batch_hash)` is
+  already queued or processed, so re-running the incremental build after a crash before
+  its dequeue adds no duplicate batches or pattern occurrences. Processed batches keep
+  the hash they were queued under (it used to be recomputed from the processed
+  measurements).
+- Two rows-mode ingest residuals remain until aspects move to the segment store, and
+  are now documented on `batch_capture_measurements`: an error mid-call leaves the
+  chunks committed before it, and retrying stores those rows again.
 - **Commit failures were silently ignored.** A control-plane write that lost an MVCC
   conflict was reported as success. Commit errors now reach the caller, and the
   transaction is rolled back.

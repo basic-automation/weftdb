@@ -9,6 +9,10 @@ use weftdb::{
 use super::calculate_affected_windows::{calculate_affected_windows, BatchWindow};
 use crate::{Batch, BatchedMeasurement};
 
+/// How many batch points [`build_incremental_unprocessed_queue`] holds before it stores
+/// them (see there).
+const STORE_GROUP_POINTS: usize = 100_000;
+
 /// Checks if this is the first run for an aspect (no batches exist yet).
 ///
 /// First run is detected when:
@@ -55,9 +59,14 @@ pub async fn build_incremental_unprocessed_queue(database: &Database, aspect: &A
 
 	info!(unbatched_count = unbatched_timestamps.len(), "Processing unbatched measurements");
 
-	// Get the earliest measurement for window alignment
-	let earliest_measurement = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
-	let _latest_measurement = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
+	// Get the earliest measurement for window alignment. Ingest queues timestamps before it
+	// inserts their rows (write-ahead enqueue), so the queue can hold timestamps whose rows
+	// never landed, here every one of them: there is nothing to batch yet, and they stay
+	// queued for the rows a retry stores.
+	let Some(earliest_measurement) = database.get_earliest_measurement(aspect).await? else {
+		info!(unbatched_count = unbatched_timestamps.len(), "Queued timestamps but no stored measurements yet, nothing to batch");
+		return Ok(());
+	};
 
 	// Calculate which windows are affected
 	let affected_windows: std::collections::HashSet<BatchWindow> = calculate_affected_windows(&unbatched_timestamps, resolution, batch_size, earliest_measurement);
@@ -74,6 +83,13 @@ pub async fn build_incremental_unprocessed_queue(database: &Database, aspect: &A
 
 	let mut batches_created = 0;
 	let mut timestamps_to_dequeue = Vec::new();
+	// Batches are stored in groups through `batch_insert_unprocessed_batches`, whose
+	// duplicate check reads the queued and processed batch hashes once per call. Storing
+	// them one by one would scan both tables (which cannot be indexed under MVCC) once per
+	// window, and the processed batches are only drained by pattern extraction. The group
+	// size bounds the points held in memory.
+	let group_len = (STORE_GROUP_POINTS / batch_size.max(1)).max(1);
+	let mut pending = Vec::new();
 
 	// For each affected window, create a batch
 	for window in affected_windows {
@@ -94,8 +110,11 @@ pub async fn build_incremental_unprocessed_queue(database: &Database, aspect: &A
 
 			let batch = Batch::new(batch_size, measurements, *resolution, *aspect, database_info.clone());
 
-			database.insert_unprocessed_batch(aspect, &batch).await?;
+			pending.push(batch);
 			batches_created += 1;
+			if pending.len() >= group_len {
+				database.batch_insert_unprocessed_batches(aspect, std::mem::take(&mut pending)).await?;
+			}
 
 			// Track which timestamps from unbatched queue are now covered by this batch
 			for ts in &unbatched_timestamps {
@@ -113,6 +132,15 @@ pub async fn build_incremental_unprocessed_queue(database: &Database, aspect: &A
 			);
 		}
 	}
+
+	if !pending.is_empty() {
+		database.batch_insert_unprocessed_batches(aspect, pending).await?;
+	}
+
+	// The batches are committed and their timestamps are still queued. A crash here makes
+	// the next run rebuild the same windows; the store skips each batch whose hash is
+	// already queued or processed, so that re-run adds no duplicates.
+	weftdb::durable::fault::hit(weftdb::durable::FaultPoint::LConsumerBatches).await?;
 
 	// Dequeue the processed timestamps (deduplicated)
 	timestamps_to_dequeue.sort();

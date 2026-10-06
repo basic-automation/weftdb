@@ -32,6 +32,13 @@ pub trait Inputs {
 
 	/// Capture a new measurement for a given aspect
 	/// If a measurement with the same timestamp already exists, the average of the two values is stored.
+	///
+	/// # Crash consistency (rows mode)
+	///
+	/// The timestamp is queued for batching before the row is inserted, so the unbatched
+	/// queue always covers every stored row. If the call fails or the process dies after
+	/// the insert committed, the row is stored although the call did not return `Ok`, and
+	/// a retry stores it a second time: there is no idempotency key in rows mode.
 	async fn capture_measurement(&self, aspect_id: &AspectId, dataset_id: &DatasetId, input_measurement: &InputMeasurement) -> Result<TxId>;
 
 	/// Capture new measurements for a given aspect
@@ -40,6 +47,23 @@ pub trait Inputs {
 
 	/// Capture multiple measurements for a given aspect
 	/// If a measurement with the same timestamp already exists, the average of the two values is stored.
+	///
+	/// # Crash consistency (rows mode)
+	///
+	/// Every timestamp is queued for batching before the first row is inserted, so the
+	/// unbatched queue always covers every stored row; a timestamp whose row never lands
+	/// only waits in the queue. The rows are then inserted in chunks (2,500 rows, or 5,000
+	/// above 100,000), each committed on its own. Two residuals remain until rows-mode
+	/// aspects move to the segment store (crash-consistency design, S19):
+	///
+	/// - **Partial prefix.** An error or crash mid-call leaves the chunks committed before
+	///   it stored, although the call does not return `Ok`.
+	/// - **Duplicates on retry.** There is no idempotency key, so retrying such a call, or
+	///   one whose `Ok` was lost, stores the already committed rows a second time.
+	///
+	/// The steps after the last chunk (dirty-region marking and the aspect's earliest and
+	/// latest timestamps) are best-effort: their failure is logged and the call still
+	/// returns `Ok`, so a stored batch is not retried into a duplicate.
 	async fn batch_capture_measurements(&self, aspect_id: AspectId, dataset_id: DatasetId, input_measurements: Vec<InputMeasurement>) -> Result<Vec<TxId>>;
 
 	/// Capture a chunk of measurements - generates `TxIds` internally
@@ -57,9 +81,15 @@ pub trait Inputs {
 	//
 
 	/// insert unprocessed batch for a given aspect
+	///
+	/// A batch whose `(aspect_id, batch_hash)` is already queued or already processed is
+	/// skipped, and the call still returns `Ok`, so a queue consumer that crashed before it
+	/// dequeued its timestamps can re-run without queuing its batches twice.
 	async fn insert_unprocessed_batch(&self, aspect_id: &AspectId, batch: &Batch) -> Result<TxId>;
 
-	// Capture multiple unprocessed batches for a given aspect
+	/// Capture multiple unprocessed batches for a given aspect, skipping, as
+	/// [`insert_unprocessed_batch`](Self::insert_unprocessed_batch) does, every batch that
+	/// is already queued or processed (and repeats within `batches`).
 	async fn batch_insert_unprocessed_batches(&self, aspect_id: &AspectId, batches: Vec<Batch>) -> Result<Vec<TxId>>;
 
 	// Capture a chunk of batches - works for both processed and unprocessed batches

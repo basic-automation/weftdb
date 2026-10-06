@@ -13,7 +13,7 @@ use uuid::Uuid;
 pub use crate::types::database::traits::config::Config;
 use crate::{
 	cache, database::traits::Connection, types::{
-		database::traits::{aspect_structure::AspectStructure, database_structure::DatabaseStructure}, Transaction, TxId
+		database::traits::{aspect_structure::AspectStructure, database_structure::DatabaseStructure}, durable::{fault, FaultPoint}, Transaction, TxId
 	}, Aspect, AspectId, Error, Subject, SubjectId
 };
 
@@ -38,6 +38,7 @@ pub async fn clear_connection_cache_by_name(name: &str) {
 
 pub mod config;
 pub mod connection;
+mod creation;
 pub mod helpers;
 pub mod inputs;
 pub mod navigation;
@@ -369,79 +370,73 @@ impl DatabaseStructure for Database {
 	/// Creates a new database instance. Creates folder /{`data_dir}/{name`}.
 	/// Keeps count of instances of `DB::existing({name`}) and manages read / write access as necessary.
 	///
+	/// Creation is atomic (crash-consistency design, S18): the database is built in a hidden
+	/// `.{name}.creating-{nonce}` directory beside the target, its schema and `database` row
+	/// are committed there, and only then is it renamed to `{name}` and the data directory
+	/// fsynced. An error, or a crash, before that rename leaves no `{name}` folder, so
+	/// retrying `new(name)` works; the build directory of a crashed call is removed by the
+	/// next `new` or [`Database::list_stored_databases`]. Once the rename has happened the
+	/// database is complete, so `existing(name)` opens it (see `database/creation.rs`).
+	///
 	/// # Errors
-	/// - if folder /data/{name} already exists.
+	/// - if folder /data/{name} already exists, including when a concurrent `new(name)`
+	///   published it first;
+	/// - if `name` has the form of a build directory (`.{x}.creating-{32 hex digits}`);
+	/// - if the build, the rename or the directory fsync fails. The database was then not
+	///   created, unless the error says it could not be withdrawn after the rename.
 	async fn new(name: &str) -> Result<Self> {
 		tracing::debug!("Creating new database: {name}");
 		let data_dir = Self::get_data_dir();
 		let db_path = format!("{data_dir}/{name}");
 		tracing::debug!("Database path: {db_path}");
+		let target = Path::new(&db_path);
 
-		// Check if folder already exists
-		if Path::new(&db_path).exists() {
-			bail!("Database folder already exists: {db_path}");
+		// A database under a build directory's name would be swept as crash litter.
+		if target.file_name().and_then(|leaf| leaf.to_str()).is_some_and(creation::is_build_dir_name) {
+			bail!("Database name is reserved for the build folders of Database::new: {name}");
 		}
 
-		// Create the directory
-		std::fs::create_dir_all(&db_path)?;
-		tracing::debug!("Created directory: {db_path}");
+		// Remove the build directories of earlier calls that crashed. Best-effort: a
+		// leftover build directory takes space but never a name.
+		if let Some(parent) = target.parent() {
+			if let Err(e) = creation::sweep_stale_build_dirs(parent).await {
+				tracing::warn!("Could not sweep stale database build directories in {}: {e}", parent.display());
+			}
+		}
+
+		// Check if folder already exists
+		if target.exists() {
+			bail!("Database folder already exists: {db_path}");
+		}
 
 		let db_id = DatabaseId::new();
 		tracing::debug!("Generated database ID: {}", db_id.as_uuid());
 
-		// Use shared connection database
+		// The `database` row records the final path, not the build directory's: aspects
+		// resolve their own paths from it.
 		let metadata_db_path = format!("{db_path}/metadata.db");
-		tracing::debug!("Creating Turso database at: {metadata_db_path}");
-		let metadata_turso_db = Self::create_turso_database(&metadata_db_path).await?;
-		tracing::debug!("Turso database created successfully");
 
-		// For DDL operations (CREATE TABLE), use a direct connection without BEGIN CONCURRENT
-		// DDL operations may not be compatible with MVCC concurrent transactions
-		tracing::debug!("Creating metadata tables...");
-		let schema_conn = metadata_turso_db.connect()?;
-		let transactions = Self::wireframe_metadata_database_direct(&schema_conn).await;
-		let mut transactions = match transactions {
-			Ok(txs) => txs,
-			Err(e) => {
-				tracing::debug!("Failed to create metadata tables: {e}");
-				return Err(anyhow::anyhow!("Failed to create metadata tables: {e}"));
-			}
-		};
-		drop(schema_conn);
-		tracing::debug!("Metadata tables created, {} transactions logged", transactions.len());
-
-		// Now use BEGIN CONCURRENT for data operations (INSERT)
-		let conn = Self::begin_concurrent(&metadata_turso_db, &metadata_db_path, None).await?;
-
-		// Insert database metadata using concurrent-safe transaction pattern
-		tracing::debug!("Inserting database metadata...");
-
-		let exec_res = conn.as_ref().execute("INSERT INTO database (id, name, created_at, metadata_path) VALUES (?, ?, ?, ?)", turso::params![db_id.as_uuid().to_string(), name.to_string(), chrono::Utc::now().timestamp_millis(), metadata_db_path.clone()]).await;
-
-		match exec_res {
-			Ok(_) => tracing::debug!("Database metadata inserted successfully"),
-			Err(e) => {
-				tracing::debug!("Failed to insert database metadata: {e}");
-				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("SQL execution failure 9: `{e}`"));
-			}
+		let mut build = creation::Build::begin(target).await?;
+		tracing::debug!("Building database {name} in {}", build.dir().display());
+		Self::build_metadata_database(&build.dir().join("metadata.db"), db_id, name, &metadata_db_path).await?;
+		fault::hit(FaultPoint::LNewCreated).await?;
+		match build.publish().await {
+			Ok(()) => {}
+			Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => bail!("Database folder already exists: {db_path}"),
+			Err(e) => return Err(anyhow::anyhow!("Could not publish database {name} at {db_path}: {e}")),
 		}
+		// Sweeps may run again from here; the database is no longer under a build name.
+		drop(build);
+		tracing::debug!("Published database {name} at {db_path}");
 
-		Self::commit_concurrent(&conn).await?;
-
-		drop(conn);
-
-		transactions.push(Transaction::new(None, "Insert database metadata".to_string()));
+		// Open it at its final path: a cold open, exactly as `existing` does.
+		let metadata_turso_db = Self::get_turso_database(&metadata_db_path).await?;
 
 		let mut db_info = DatabaseInfo::new(name.to_string(), db_path);
 		db_info.set_metadata(Some(metadata_turso_db.clone()));
 		DATABASES.lock().await.insert(db_id, db_info);
 
 		let db = Self { id: db_id, name: name.to_string(), metadata: metadata_turso_db, metadata_path: metadata_db_path, cache: Arc::new(Mutex::new(cache::DatabaseCache::new())) };
-
-		for transaction in transactions {
-			let () = db.log_transaction(&transaction).await?;
-		}
 
 		// Checkpoint metadata WAL to ensure schema and initial data are persisted
 		Self::checkpoint_wal_passive(&db.metadata).await?;
@@ -1552,6 +1547,46 @@ impl Database {
 		tracing::debug!("All tables created successfully");
 
 		Ok(vec![Transaction::new(None, "Create transactions table".to_string()), Transaction::new(None, "Create database table".to_string()), Transaction::new(None, "Create subjects table".to_string()), Transaction::new(None, "Create aspects table".to_string()), Transaction::new(None, "Create unbatched_measurements table".to_string())])
+	}
+
+	/// Build a new database's `metadata.db` at `path` (inside its build directory): run
+	/// the DDL, then commit the `database` row, recording `metadata_path` (the final path),
+	/// together with the audit rows for the DDL and the insert.
+	///
+	/// The Turso database is opened directly, not through the connection cache, and every
+	/// handle is dropped before this returns, so the build directory can be renamed (Windows
+	/// refuses to rename a directory with open files) and the database is next opened, cold,
+	/// at its final path.
+	async fn build_metadata_database(path: &Path, db_id: DatabaseId, name: &str, metadata_path: &str) -> Result<()> {
+		let path = path.to_str().ok_or_else(|| anyhow::anyhow!("database path {} is not UTF-8", path.display()))?;
+		tracing::debug!("Creating Turso database at: {path}");
+		let turso_db = Builder::new_local(path).build().await?;
+		Self::configure_database_for_mvcc(&turso_db).await?;
+
+		// For DDL operations (CREATE TABLE), use a direct connection without BEGIN CONCURRENT
+		// DDL operations may not be compatible with MVCC concurrent transactions
+		let schema_conn = turso_db.connect()?;
+		let mut transactions = Self::wireframe_metadata_database_direct(&schema_conn).await.map_err(|e| anyhow::anyhow!("Failed to create metadata tables: {e}"))?;
+		drop(schema_conn);
+		transactions.push(Transaction::new(None, "Insert database metadata".to_string()));
+
+		// Now use BEGIN CONCURRENT for data operations (INSERT)
+		let conn = Self::begin_concurrent(&turso_db, path, None).await?;
+		let mut written = conn.as_ref().execute("INSERT INTO database (id, name, created_at, metadata_path) VALUES (?, ?, ?, ?)", turso::params![db_id.as_uuid().to_string(), name.to_string(), chrono::Utc::now().timestamp_millis(), metadata_path.to_string()]).await.map(drop);
+		for transaction in &transactions {
+			if written.is_err() {
+				break;
+			}
+			written = conn.as_ref().execute("INSERT INTO transactions (id, message, created_at) VALUES (?, ?, ?)", turso::params![transaction.id().as_uuid().to_string(), transaction.message().to_string(), transaction.created_at().timestamp_millis()]).await.map(drop);
+		}
+		if let Err(e) = written {
+			let _ = Self::rollback_concurrent(&conn).await;
+			return Err(anyhow::anyhow!("SQL execution failure 9: `{e}`"));
+		}
+		Self::commit_concurrent(&conn).await?;
+		drop(conn);
+		drop(turso_db);
+		Ok(())
 	}
 }
 

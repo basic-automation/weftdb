@@ -277,12 +277,12 @@ fn sync_file_blocking(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn sync_dir_blocking(dir: &Path) -> io::Result<()> {
+pub(crate) fn sync_dir_blocking(dir: &Path) -> io::Result<()> {
 	std::fs::File::open(dir)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn sync_dir_blocking(dir: &Path) -> io::Result<()> {
+pub(crate) fn sync_dir_blocking(dir: &Path) -> io::Result<()> {
 	use std::sync::atomic::{AtomicBool, Ordering};
 
 	static WARNED: AtomicBool = AtomicBool::new(false);

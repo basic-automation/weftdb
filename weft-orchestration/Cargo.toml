@@ -37,4 +37,11 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 serde_json = { workspace = true }
 serial_test = {workspace =  true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tempfile = { workspace = true }
+# Arms weftdb's crash points (`durable::fault`) in the tests only; a normal build of this
+# crate keeps them inert.
+weftdb = { workspace = true, features = ["fault-injection"] }
 
+[target.'cfg(unix)'.dev-dependencies]
+# Only to keep the crash tests' deliberately aborted child from dumping core.
+libc = { workspace = true }

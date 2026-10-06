@@ -1058,3 +1058,272 @@ async fn concurrent_cold_opens_keep_the_live_metadata_log() -> Result<()> {
 	weftdb::clear_connection_cache_by_name(&db_name).await;
 	Ok(())
 }
+
+/// **Regression (legacy-queue-consumer-batch-before-dequeue, crash-consistency design
+/// S18).** Queuing a batch whose measurements are already queued, or already processed,
+/// stores nothing, through either insert API; a new batch is still queued. The processed
+/// case holds although processing rewrites a batch's measurements: the processed row keeps
+/// the hash the batch was queued under. On main every call inserted another copy.
+#[tokio::test]
+#[serial]
+async fn queuing_a_queued_or_processed_batch_again_stores_nothing() -> Result<()> {
+	use futures::TryStreamExt;
+	use weftdb::{Batch, BatchedMeasurement, Point};
+
+	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
+	let aspect_id = aspect.id();
+	let info = db.get_database_info().await?;
+	let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+	// A fresh `Batch` (new id) over the five points from minute `start`, as the consumer
+	// builds one for a window.
+	let batch = |start: i64| {
+		let points = (start..start + 5).map(|i| BatchedMeasurement::new(Point::new(base + Duration::minutes(i), BigDecimal::from((i * 7) % 11)))).collect();
+		Batch::new(5, points, Resolution::Minutes, aspect_id, info.clone())
+	};
+	let queued = || db.count_unprocessed_batches(&aspect_id);
+
+	db.insert_unprocessed_batch(&aspect_id, &batch(0)).await?;
+	db.insert_unprocessed_batch(&aspect_id, &batch(0)).await?;
+	assert_eq!(queued().await?, 1, "insert_unprocessed_batch queued the same batch twice");
+	let tx_ids = db.batch_insert_unprocessed_batches(&aspect_id, vec![batch(0), batch(1), batch(1)]).await?;
+	assert_eq!(tx_ids.len(), 3, "every input batch gets a TxId, stored or skipped");
+	assert_eq!(queued().await?, 2, "batch_insert_unprocessed_batches stores only the new batch, once");
+
+	// Process the queued batches, as the batch processor does, and move them over.
+	let mut stored: Vec<Batch> = db.get_unprocessed_batches(&aspect_id).await?.try_collect().await?;
+	for stored in &mut stored {
+		let before = serde_json::to_string(stored.measurements())?;
+		stored.process()?;
+		assert_ne!(serde_json::to_string(stored.measurements())?, before, "precondition: processing rewrites the measurements");
+	}
+	db.move_batches_to_processed(&aspect_id, &stored).await?;
+	assert_eq!((queued().await?, db.count_processed_batches(&aspect_id).await?), (0, 2), "precondition: both batches are processed");
+
+	db.insert_unprocessed_batch(&aspect_id, &batch(0)).await?;
+	db.batch_insert_unprocessed_batches(&aspect_id, vec![batch(1)]).await?;
+	assert_eq!(queued().await?, 0, "a processed batch was queued again");
+	db.insert_unprocessed_batch(&aspect_id, &batch(2)).await?;
+	db.batch_insert_unprocessed_batches(&aspect_id, vec![batch(3)]).await?;
+	assert_eq!(queued().await?, 2, "new batches are still queued");
+	Ok(())
+}
+
+/// `Database::new` refuses a name of the form of its own build directories
+/// (`.{name}.creating-{nonce}`), which a stale-build sweep would take for crash litter.
+#[tokio::test]
+#[serial]
+async fn database_new_refuses_a_build_directory_name() -> Result<()> {
+	let temp_dir = tempfile::tempdir()?;
+	std::env::set_var("TEST_DATA_DIR", temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?);
+	let name = format!(".sensors.creating-{}", Uuid::new_v4().simple());
+	let err = Database::new(&name).await.expect_err("a build directory's name is reserved");
+	assert!(err.to_string().contains("reserved"), "{err:#}");
+	assert!(!temp_dir.path().join(&name).exists(), "nothing was created");
+	Ok(())
+}
+
+/// Crash tests for `Database::new` at its fault points (crash-consistency design, S18:
+/// legacy-database-new-half-created).
+#[cfg(feature = "fault-injection")]
+mod database_new_crash {
+	use std::{
+		path::{Path, PathBuf}, sync::Arc, time::Duration
+	};
+
+	use anyhow::{Context, Result};
+	use serial_test::serial;
+	use tokio::sync::Notify;
+	use uuid::Uuid;
+	use weftdb::{
+		database::traits::DatabaseStructure, durable::fault::{self, FaultAction, FaultPoint, FAULT_ENV}, Config, Database
+	};
+
+	use super::release_database;
+
+	/// Set only in the child process [`a_process_crash_at_each_point_is_recoverable`]
+	/// spawns; it holds the name of the database the child creates.
+	const CHILD_ENV: &str = "WEFT_DB_NEW_CRASH_CHILD";
+
+	fn database_dir(name: &str) -> PathBuf {
+		Path::new(&Database::get_data_dir()).join(name)
+	}
+
+	/// The `.{name}.creating-*` build directories under the data directory.
+	fn build_dirs(name: &str) -> Vec<String> {
+		let prefix = format!(".{name}.creating-");
+		let Ok(entries) = std::fs::read_dir(Database::get_data_dir()) else { return Vec::new() };
+		entries.filter_map(Result::ok).filter_map(|entry| entry.file_name().into_string().ok()).filter(|file| file.starts_with(&prefix)).collect()
+	}
+
+	/// `existing(name)` opens the database cold and finds the row `new` committed, with the
+	/// final (not the build directory's) metadata path, and a subject written through it
+	/// survives another cold reopen.
+	async fn assert_usable(name: &str) -> Result<()> {
+		let db = Database::existing(name).await.with_context(|| format!("Database::existing({name})"))?;
+		let subject = db.observe_subject("after_crash").await?;
+		let subject_id = subject.id();
+		drop(subject);
+		let metadata = db.metadata().clone();
+		let mut rows = metadata.connect()?.query("SELECT name, metadata_path FROM database", ()).await?;
+		let row = rows.next().await?.context("no database row")?;
+		let (stored_name, stored_path): (String, String) = (row.get(0)?, row.get(1)?);
+		assert!(rows.next().await?.is_none(), "exactly one database row");
+		drop((rows, metadata));
+		assert_eq!(stored_name, name);
+		assert_eq!(Path::new(&stored_path), database_dir(name).join("metadata.db"), "the row records the final metadata path, not the build directory's");
+		release_database(db, name).await;
+
+		let reopened = Database::existing(name).await?;
+		assert!(reopened.list_subjects().await?.contains_key(&subject_id), "a subject written after the recovery survives a cold reopen");
+		release_database(reopened, name).await;
+		Ok(())
+	}
+
+	/// **Regression (legacy-database-new-half-created).** A failure at either fault point
+	/// makes `new` return an error and leave nothing behind, so retrying `new(name)`
+	/// succeeds and `existing(name)` works. On main the failed call left a half-built
+	/// `{name}` folder, so the retry failed with "Database folder already exists".
+	#[tokio::test]
+	#[serial]
+	async fn a_failure_at_each_point_leaves_nothing_and_the_retry_succeeds() -> Result<()> {
+		let temp_dir = tempfile::tempdir()?;
+		std::env::set_var("TEST_DATA_DIR", temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?);
+
+		for point in [FaultPoint::LNewCreated, FaultPoint::LNewRenamed] {
+			let name = format!("newfail_{}", Uuid::new_v4().simple());
+			{
+				let _armed = fault::arm(point, FaultAction::ReturnErr);
+				let err = Database::new(&name).await.expect_err("the armed point fails the call");
+				assert!(format!("{err:#}").contains(&format!("injected fault at {point}")), "{point}: unexpected error {err:#}");
+			}
+			assert!(!database_dir(&name).exists(), "{point}: a failed Database::new left a database folder behind");
+			assert_eq!(build_dirs(&name), Vec::<String>::new(), "{point}: a failed Database::new left its build directory behind");
+
+			let db = Database::new(&name).await.with_context(|| format!("retrying Database::new after a failure at {point}"))?;
+			release_database(db, &name).await;
+			assert_usable(&name).await.with_context(|| format!("after a failure at {point}"))?;
+		}
+		Ok(())
+	}
+
+	/// The on-disk listing never lists a build directory, never sweeps the one a running
+	/// `new` owns, and sweeps a stale one (left by a crashed `new`) once no `new` is running.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	#[serial]
+	async fn the_listing_sweeps_stale_builds_but_never_a_live_one() -> Result<()> {
+		let temp_dir = tempfile::tempdir()?;
+		std::env::set_var("TEST_DATA_DIR", temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?);
+		let listed = format!("listed_{}", Uuid::new_v4().simple());
+		release_database(Database::new(&listed).await?, &listed).await;
+
+		// A `new` paused after building, before its rename.
+		let pending = format!("pending_{}", Uuid::new_v4().simple());
+		let resume = Arc::new(Notify::new());
+		let armed = fault::arm(FaultPoint::LNewCreated, FaultAction::Pause(resume.clone()));
+		let before = fault::hits(FaultPoint::LNewCreated);
+		let creating = tokio::spawn({
+			let pending = pending.clone();
+			async move { Database::new(&pending).await }
+		});
+		tokio::time::timeout(Duration::from_secs(30), fault::reached(FaultPoint::LNewCreated, before + 1)).await.context("the new() reaches L-new-created")?;
+		drop(armed);
+		let live = build_dirs(&pending);
+		assert_eq!(live.len(), 1, "the paused new() has its build directory");
+
+		// What a `new` that crashed after building leaves: a complete-looking build
+		// directory. (Made only now: the paused `new` swept the data directory as it began.)
+		let stale = database_dir(&format!(".ghost.creating-{}", Uuid::new_v4().simple()));
+		std::fs::create_dir(&stale)?;
+		std::fs::write(stale.join("metadata.db"), b"")?;
+
+		assert_eq!(Database::list_stored_databases().await?, vec![listed.clone()], "build directories are never listed");
+		assert_eq!(build_dirs(&pending), live, "the live build directory is not swept");
+		assert!(stale.exists(), "no sweep runs while a new() is running");
+
+		resume.notify_one();
+		let db = creating.await?.context("the paused new() completes")?;
+		release_database(db, &pending).await;
+		let mut expected = vec![listed.clone(), pending.clone()];
+		expected.sort();
+		assert_eq!(Database::list_stored_databases().await?, expected);
+		assert!(!stale.exists(), "the listing swept the stale build directory");
+		assert_usable(&pending).await
+	}
+
+	/// The body the re-executed child runs: create the database named by [`CHILD_ENV`],
+	/// which aborts at the point `WEFT_FAULT` arms. In a normal run the variable is unset
+	/// and this does nothing.
+	#[tokio::test]
+	async fn child() -> Result<()> {
+		let Some(name) = std::env::var_os(CHILD_ENV) else { return Ok(()) };
+		suppress_core_dump();
+		let name = name.into_string().map_err(|raw| anyhow::anyhow!("{raw:?} is not UTF-8"))?;
+		Database::new(&name).await?;
+		panic!("{FAULT_ENV} did not abort Database::new");
+	}
+
+	/// Keep the child's deliberate abort from dumping core, exactly as the fault module's
+	/// own abort test does: this machine (and CI) may run systemd-coredump, which would
+	/// otherwise store a core of the test binary on every run.
+	fn suppress_core_dump() {
+		#[cfg(unix)]
+		{
+			let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+			// SAFETY: setrlimit only reads the struct, for the duration of the call.
+			unsafe { libc::setrlimit(libc::RLIMIT_CORE, &raw const none) };
+		}
+		// A pipe `core_pattern` (systemd-coredump) ignores RLIMIT_CORE, but the kernel
+		// never dumps a process that is not dumpable.
+		#[cfg(target_os = "linux")]
+		{
+			let not_dumpable: libc::c_ulong = 0;
+			// SAFETY: PR_SET_DUMPABLE takes one integer and changes only this process's
+			// dumpable flag.
+			unsafe { libc::prctl(libc::PR_SET_DUMPABLE, not_dumpable) };
+		}
+	}
+
+	/// A process crash (abort) at each point of `Database::new`.
+	///
+	/// - At `L-new-created` the database is fully built but still under its
+	///   `.{name}.creating-*` name: `{name}` does not exist, the next `new(name)` sweeps the
+	///   stale build directory and succeeds, and `existing(name)` works. On main the crash
+	///   left a half-created `{name}` folder that neither `new` nor `existing` could use.
+	/// - At `L-new-renamed` the rename, which is the commit point, has happened: the
+	///   database is complete under `{name}`, so `existing(name)` works and `new(name)`
+	///   reports that it already exists, as for any existing database.
+	#[tokio::test]
+	#[serial]
+	async fn a_process_crash_at_each_point_is_recoverable() -> Result<()> {
+		let temp_dir = tempfile::tempdir()?;
+		let data_dir = temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?;
+		std::env::set_var("TEST_DATA_DIR", data_dir);
+
+		for point in [FaultPoint::LNewCreated, FaultPoint::LNewRenamed] {
+			let name = format!("newcrash_{}", Uuid::new_v4().simple());
+			let output = std::process::Command::new(std::env::current_exe()?).args(["database_new_crash::child", "--exact", "--nocapture", "--test-threads=1"]).env(CHILD_ENV, &name).env("TEST_DATA_DIR", data_dir).env(FAULT_ENV, format!("{point}:abort")).output()?;
+			assert!(!output.status.success(), "{point}: the child aborted: {output:?}");
+			#[cfg(unix)]
+			{
+				use std::os::unix::process::ExitStatusExt;
+				assert_eq!(output.status.signal(), Some(6), "{point}: killed by SIGABRT: {output:?}");
+			}
+			assert!(String::from_utf8_lossy(&output.stderr).contains(&format!("aborting at fault point {point}")), "{point}: the child reached the point: {output:?}");
+
+			if point == FaultPoint::LNewCreated {
+				assert!(!database_dir(&name).exists(), "{point}: a crash before the rename must not leave a {name} folder");
+				assert_eq!(build_dirs(&name).len(), 1, "{point}: the crash leaves its build directory for the next sweep");
+				let db = Database::new(&name).await.with_context(|| format!("retrying Database::new after a crash at {point}"))?;
+				release_database(db, &name).await;
+				assert_eq!(build_dirs(&name), Vec::<String>::new(), "{point}: the retry swept the stale build directory");
+			} else {
+				assert!(database_dir(&name).join("metadata.db").exists(), "{point}: the renamed database is in place");
+				assert_eq!(build_dirs(&name), Vec::<String>::new(), "{point}: nothing is left under the build name");
+				let err = Database::new(&name).await.expect_err("the database exists, so new() refuses it");
+				assert!(err.to_string().contains("already exists"), "{point}: {err:#}");
+			}
+			assert_usable(&name).await.with_context(|| format!("after a crash at {point}"))?;
+		}
+		Ok(())
+	}
+}
