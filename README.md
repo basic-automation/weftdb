@@ -468,8 +468,13 @@ only** — the `.weftseg` measurement frames are not part of a snapshot.
   `.partial-{label}-{nonce}/` directory; each database is verified and fsynced, the
   manifest (format, creation time, each file's size, tables and rows) is written and
   fsynced, and the directory is fsynced, renamed to its label, and the parent
-  fsynced. A crash or error at any step leaves at most a `.partial-*` directory,
-  which is never counted or restored.
+  fsynced. A backup that fails with an error before the rename removes its build
+  directory again; a crash there leaves the `.partial-*` directory, which is never
+  counted or restored, and which the backup daemon's sweep removes (where the
+  daemon is not enabled, remove it by hand). Once renamed, only the parent's fsync
+  is left: if that fails, the call reports an error (`500` over HTTP) although the
+  complete backup is already under its label, so a retry with the same label is
+  refused. The next backup's fsync of the same parent makes it durable.
 - **What a snapshot costs is dominated by the filesystem, not by the vacuum.**
   Benchmarked in [`database/benches/backup_cost.rs`](database/benches/backup_cost.rs):
   on `tmpfs` a whole four-database backup-and-verify runs in **8.62 ms** at one
@@ -504,7 +509,10 @@ only** — the `.weftseg` measurement frames are not part of a snapshot.
   existing control plane, pre-flighting both across all four files before writing
   anything, so a rejected restore leaves nothing behind. Each file is copied to
   `<name>.tmp`, fsynced and verified; only once all four verify are they renamed
-  into place and the root fsynced. Restoring beside the
+  into place, one after another, and the root fsynced. A failure before the
+  renames leaves only `.tmp` files, which a retry replaces; one part-way through
+  them leaves some databases in place, which a retry refuses to overwrite, so clear
+  the root first. Restoring beside the
   original `segments/` frames reconstitutes a working store: the round-trip test
   reopens the restored root and reads its measurements back.
 - **Drills on a live server.** `POST /api/v1/storage/restore/drill?label=` rehearses

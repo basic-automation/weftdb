@@ -32,11 +32,13 @@
 //! a detached side task; the router and its handlers are untouched.
 
 use std::{
-	path::{Path, PathBuf}, sync::Arc, time::Duration
+	path::{Path, PathBuf}, sync::Arc, time::{Duration, SystemTime}
 };
 
 use tracing::Instrument as _;
-use weftdb::{durable::RealFs, ControlPlaneBackup, SegmentStore, VerifyMode};
+use weftdb::{
+	durable::{RealFs, StoreFs}, ControlPlaneBackup, SegmentStore, VerifyMode
+};
 
 use crate::metrics::SharedMetrics;
 
@@ -105,7 +107,10 @@ fn fresh_dir(base: &Path, millis: u128) -> PathBuf {
 /// file) are ignored, and so is an incomplete one: only a directory
 /// [`weftdb::is_complete_backup`] accepts (a manifest, or all four databases from before
 /// manifests) is a backup, so a half-written directory never counts toward retention
-/// and is never pruned in a good backup's place. A missing `base` yields an empty list.
+/// and is never pruned in a good backup's place. A directory whose completeness cannot
+/// be checked (a stat inside it fails with something other than `NotFound`, such as a
+/// permission error) is skipped the same way, and logged: one unreadable directory must
+/// not stop retention for every other backup. A missing `base` yields an empty list.
 ///
 /// # Errors
 ///
@@ -128,10 +133,11 @@ pub async fn list_generated_backups(base: &Path) -> anyhow::Result<Vec<(u128, Pa
 		}
 		let Ok(stamp) = name.trim_start_matches("backup-").parse::<u128>() else { continue };
 		let path = entry.path();
-		if !weftdb::is_complete_backup(&path).await? {
-			continue;
+		match weftdb::is_complete_backup(&path).await {
+			Ok(true) => found.push((stamp, path)),
+			Ok(false) => {}
+			Err(err) => tracing::warn!(dir = %path.display(), error = %err, "backup retention: cannot tell whether this backup is complete, so it is neither counted nor pruned"),
 		}
-		found.push((stamp, path));
 	}
 	found.sort_unstable_by_key(|(stamp, _)| *stamp);
 	Ok(found)
@@ -151,22 +157,28 @@ pub async fn list_generated_backups(base: &Path) -> anyhow::Result<Vec<(u128, Pa
 ///
 /// Propagates a failure listing `base` or retiring a snapshot directory.
 pub async fn prune_generated_backups(base: &Path, keep: usize) -> anyhow::Result<usize> {
+	prune_generated_backups_via(&RealFs, base, keep).await
+}
+
+/// [`prune_generated_backups`], with each retirement's rename, fsync and removal going
+/// through `fs`, so a test can see the order they happen in.
+async fn prune_generated_backups_via(fs: &dyn StoreFs, base: &Path, keep: usize) -> anyhow::Result<usize> {
 	let found = list_generated_backups(base).await?;
 	let excess = found.len().saturating_sub(keep);
 	let mut removed = 0usize;
 	for (_, path) in found.into_iter().take(excess) {
-		weftdb::retire_backup(&RealFs, &path).await.map_err(|err| anyhow::Error::new(err).context(format!("pruning backup {}", path.display())))?;
+		weftdb::retire_backup(fs, &path).await.map_err(|err| anyhow::Error::new(err).context(format!("pruning backup {}", path.display())))?;
 		removed += 1;
 	}
 	Ok(removed)
 }
 
 /// Remove the staging entries under `base` (`.partial-*`, `.deleting-*`,
-/// `.restore-drill-*`) left untouched for [`weftdb::STAGING_SWEEP_AGE`], logging what it
-/// did. A failure is logged and left for the next sweep: litter must never stop a
-/// backup.
-async fn sweep_stale_staging(base: &Path) {
-	match weftdb::sweep_backup_staging(&RealFs, base, weftdb::STAGING_SWEEP_AGE).await {
+/// `.restore-drill-*`) left untouched for [`weftdb::STAGING_SWEEP_AGE`] as of `now`,
+/// logging what it did. A failure is logged and left for the next sweep: litter must
+/// never stop a backup.
+async fn sweep_stale_staging(base: &Path, now: SystemTime) {
+	match weftdb::sweep_backup_staging_at(&RealFs, base, weftdb::STAGING_SWEEP_AGE, now).await {
 		Ok(swept) => {
 			if !swept.removed.is_empty() {
 				println!("backup daemon: swept {} stale staging entr{} under {}", swept.removed.len(), if swept.removed.len() == 1 { "y" } else { "ies" }, base.display());
@@ -223,15 +235,26 @@ pub async fn backup_tick(store: &SegmentStore, metrics: &SharedMetrics, base: &P
 /// interval, and again before every snapshot.
 #[must_use]
 pub fn spawn_backup_daemon(store: Arc<SegmentStore>, metrics: SharedMetrics, config: BackupDaemonConfig) -> tokio::task::JoinHandle<()> {
+	spawn_backup_daemon_with_clock(store, metrics, config, SystemTime::now)
+}
+
+/// [`spawn_backup_daemon`], with the stale-staging sweep reading the time from `now`.
+///
+/// The tests pass a clock ahead of the real one, which ages a staging entry without
+/// setting its mtime: std below Rust 1.99 cannot set a directory's mtime on Windows.
+fn spawn_backup_daemon_with_clock<C>(store: Arc<SegmentStore>, metrics: SharedMetrics, config: BackupDaemonConfig, now: C) -> tokio::task::JoinHandle<()>
+where
+	C: Fn() -> SystemTime + Send + 'static,
+{
 	tokio::spawn(async move {
 		// What a crash before this start left behind goes first.
-		sweep_stale_staging(&config.base).await;
+		sweep_stale_staging(&config.base, now()).await;
 		let mut ticker = tokio::time::interval(config.interval);
 		// Consume the immediate first tick so the first snapshot waits one interval.
 		ticker.tick().await;
 		loop {
 			ticker.tick().await;
-			sweep_stale_staging(&config.base).await;
+			sweep_stale_staging(&config.base, now()).await;
 			match backup_tick(&store, &metrics, &config.base).await {
 				Ok(backup) => {
 					println!("backup daemon: snapshotted control plane to {} ({} row(s), {} byte(s))", backup.dir.display(), backup.total_rows(), backup.total_bytes());
@@ -261,7 +284,9 @@ mod tests {
 	use weftdb::{SegmentStore, CONTROL_PLANE_FILES};
 
 	use super::*;
-	use crate::metrics::Metrics;
+	use crate::{
+		metrics::Metrics, test_fs::{FsOp, RecordingFs, INJECTED_CLEANUP_FAILURE}
+	};
 
 	fn schema() -> AspectSchema {
 		AspectSchema::new(PhysicalType::F64, "0".parse().unwrap(), TimeUnit::Seconds)
@@ -413,29 +438,163 @@ mod tests {
 		assert_eq!(listed, vec![200, 300], "and it never displaced a complete backup");
 	}
 
+	/// The names directly under `dir`, sorted.
+	fn names_in(dir: &Path) -> Vec<String> {
+		let mut names: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+		names.sort();
+		names
+	}
+
+	fn mtime(path: &Path) -> SystemTime {
+		std::fs::metadata(path).unwrap().modified().unwrap()
+	}
+
+	/// Make each of `names` under `base` a complete backup of the pre-manifest shape: the
+	/// four control-plane files, and nothing else.
+	fn plant_backups(base: &Path, names: &[&str]) {
+		for name in names {
+			std::fs::create_dir_all(base.join(name)).unwrap();
+			for file in CONTROL_PLANE_FILES {
+				std::fs::write(base.join(name).join(file), b"x").unwrap();
+			}
+		}
+	}
+
+	async fn wait_until_gone(path: &Path, what: &str) {
+		tokio::time::timeout(Duration::from_secs(10), async {
+			while path.exists() {
+				tokio::time::sleep(Duration::from_millis(5)).await;
+			}
+		})
+		.await
+		.unwrap_or_else(|_| panic!("{what}"));
+	}
+
+	/// The regression for a prune that removes a backup in place, which a crash part-way
+	/// leaves half-removed under its own name. A successful prune ends in the same state
+	/// either way, so the order of the operations is what is checked: each victim is
+	/// renamed to `.deleting-*` beside it, the base fsynced, and only then removed.
+	#[tokio::test]
+	async fn prune_retires_each_victim_through_a_durable_rename_before_removing_it() {
+		let dir = TempDir::new().unwrap();
+		let base = dir.path().join("backups");
+		plant_backups(&base, &["backup-100", "backup-200", "backup-300"]);
+
+		let fs = RecordingFs::default();
+		assert_eq!(prune_generated_backups_via(&fs, &base, 1).await.unwrap(), 2);
+		let ops = fs.ops();
+		let mut rest = ops.as_slice();
+		for victim in ["backup-100", "backup-200"] {
+			let [FsOp::Rename(from, to), FsOp::SyncDir(synced), FsOp::RemoveDirAll(removed), tail @ ..] = rest else { panic!("{victim}: expected a rename, the base fsync, then the removal; got {rest:?}") };
+			assert_eq!(from, &base.join(victim), "{victim} is renamed away first");
+			assert_eq!(to.parent(), Some(base.as_path()), "{victim}: beside the backups");
+			assert!(to.file_name().unwrap().to_str().unwrap().starts_with(&format!(".deleting-{victim}-")), "{victim}: to a `.deleting-*` name: {}", to.display());
+			assert_eq!(synced, &base, "{victim}: the rename is made durable before any file goes");
+			assert_eq!(removed, to, "{victim}: only the `.deleting-*` name is removed, never the backup's own");
+			rest = tail;
+		}
+		assert!(rest.is_empty(), "nothing else: {rest:?}");
+		assert_eq!(names_in(&base), ["backup-300"]);
+	}
+
+	#[tokio::test]
+	async fn a_prune_whose_removal_fails_leaves_no_backup_name_behind() {
+		let dir = TempDir::new().unwrap();
+		let base = dir.path().join("backups");
+		plant_backups(&base, &["backup-100", "backup-200"]);
+
+		let err = prune_generated_backups_via(&RecordingFs::failing_remove_dir_all(), &base, 1).await.unwrap_err();
+		assert!(format!("{err:#}").contains(INJECTED_CLEANUP_FAILURE), "{err:#}");
+		let names = names_in(&base);
+		assert!(!names.iter().any(|name| name == "backup-100"), "the victim's name went before its files: {names:?}");
+		assert!(names.iter().any(|name| name.starts_with(".deleting-backup-100-")), "its files wait under a `.deleting-*` name, for the sweep: {names:?}");
+		let listed: Vec<u128> = list_generated_backups(&base).await.unwrap().into_iter().map(|(stamp, _)| stamp).collect();
+		assert_eq!(listed, [200], "retention never counts the half-pruned backup again");
+	}
+
+	/// One backup directory that cannot be inspected used to fail the whole listing, so
+	/// retention failed on every tick and never pruned anything again.
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn a_backup_that_cannot_be_inspected_is_skipped_rather_than_failing_retention() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let dir = TempDir::new().unwrap();
+		let base = dir.path().join("backups");
+		plant_backups(&base, &["backup-100", "backup-200", "backup-300"]);
+		let locked = base.join("backup-200");
+		std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+		if std::fs::metadata(locked.join(CONTROL_PLANE_FILES[0])).is_ok() {
+			// Running as root, which permissions do not stop: nothing to provoke.
+			std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+			return;
+		}
+		let listed = list_generated_backups(&base).await;
+		let pruned = prune_generated_backups(&base, 1).await;
+		std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+		let listed: Vec<u128> = listed.expect("one unreadable backup does not fail the listing").into_iter().map(|(stamp, _)| stamp).collect();
+		assert_eq!(listed, [100, 300], "it is neither counted nor pruned");
+		assert_eq!(pruned.expect("nor does it stop retention"), 1);
+		assert_eq!(names_in(&base), ["backup-200", "backup-300"]);
+	}
+
+	// The daemon tests age staging entries by moving the sweep's clock, not their mtimes:
+	// std cannot set a directory's mtime on Windows below Rust 1.99, and CI tests there.
+
 	#[tokio::test]
 	async fn the_daemon_sweeps_stale_staging_entries_when_it_starts() {
 		let dir = TempDir::new().unwrap();
 		let store = Arc::new(SegmentStore::open(dir.path().join("store")).await.unwrap());
 		let base = dir.path().join("backups");
-		let stale = base.join(".partial-backup-1-0011223344556677");
-		let fresh = base.join(".restore-drill-2");
-		for path in [&stale, &fresh, &base.join("nightly")] {
-			std::fs::create_dir_all(path).unwrap();
+		// `stale` sorts after `fresh`, so once the sweep has removed `stale` it has already
+		// judged `fresh`.
+		let fresh = base.join(".partial-backup-1-0011223344556677");
+		let stale = base.join(".restore-drill-2");
+		std::fs::create_dir_all(&stale).unwrap();
+		std::fs::create_dir(base.join("nightly")).unwrap();
+		// `fresh` must be strictly newer than `stale`: the clock below sits between them.
+		let deadline = std::time::Instant::now() + Duration::from_secs(5);
+		loop {
+			std::fs::create_dir(&fresh).unwrap();
+			if mtime(&fresh) > mtime(&stale) {
+				break;
+			}
+			std::fs::remove_dir(&fresh).unwrap();
+			assert!(std::time::Instant::now() < deadline, "the clock never moved past the stale entry's mtime");
+			std::thread::sleep(Duration::from_millis(10));
 		}
-		std::fs::File::open(&stale).unwrap().set_modified(std::time::SystemTime::now() - 2 * weftdb::STAGING_SWEEP_AGE).unwrap();
+		let gap = mtime(&fresh).duration_since(mtime(&stale)).unwrap();
+		// `stale` has sat untouched for longer than the sweep age, `fresh` for not quite
+		// that long.
+		let now = mtime(&stale) + weftdb::STAGING_SWEEP_AGE + gap / 2;
 
 		let config = BackupDaemonConfig { interval: Duration::from_secs(3600), base: base.clone(), keep: None };
-		let daemon = spawn_backup_daemon(store, Arc::new(Metrics::default()), config);
-		tokio::time::timeout(Duration::from_secs(10), async {
-			while stale.exists() {
-				tokio::time::sleep(Duration::from_millis(5)).await;
-			}
-		})
-		.await
-		.expect("the start-up sweep removes a stale build directory without waiting for a tick");
+		let daemon = spawn_backup_daemon_with_clock(store, Arc::new(Metrics::default()), config, move || now);
+		wait_until_gone(&stale, "the start-up sweep removes a stale entry without waiting for a tick").await;
 		daemon.abort();
-		assert!(fresh.exists(), "a drill that may still be running is left alone");
+		let _ = daemon.await;
+		assert!(fresh.exists(), "a backup that may still be building is left alone");
 		assert!(base.join("nightly").exists(), "backups are never swept");
+	}
+
+	#[tokio::test]
+	async fn the_daemon_sweeps_again_on_every_tick() {
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(SegmentStore::open(dir.path().join("store")).await.unwrap());
+		let base = dir.path().join("backups");
+		let first = base.join(".partial-backup-1-00");
+		std::fs::create_dir_all(&first).unwrap();
+
+		// Two sweep ages ahead, every staging entry is stale.
+		let config = BackupDaemonConfig { interval: Duration::from_millis(50), base: base.clone(), keep: None };
+		let daemon = spawn_backup_daemon_with_clock(store, Arc::new(Metrics::default()), config, || SystemTime::now() + 2 * weftdb::STAGING_SWEEP_AGE);
+		wait_until_gone(&first, "the start-up sweep runs").await;
+		// Made after the start-up sweep listed the base, so only a tick's sweep can see it.
+		let second = base.join(".restore-drill-2");
+		std::fs::create_dir(&second).unwrap();
+		wait_until_gone(&second, "a tick sweeps what a crash left while the daemon was running").await;
+		daemon.abort();
+		let _ = daemon.await;
 	}
 }

@@ -553,8 +553,8 @@ pub struct RestoreDrillResponse {
 	pub restorable: bool,
 	/// Why the rehearsal copy could not be removed afterwards, or `null` when it was.
 	/// The drill's answer stands either way; a copy left behind is a
-	/// `.restore-drill-*` directory beside the backups, which the backup daemon's sweep
-	/// removes once it is an hour old.
+	/// `.restore-drill-*` directory beside the backups. The backup daemon's sweep removes
+	/// it once it is an hour old; where the daemon is not enabled, remove it by hand.
 	pub cleanup_error: Option<String>,
 }
 
@@ -566,7 +566,7 @@ pub struct RestoreDrillResponse {
 /// never touched and nothing is overwritten — the whole point is that an operator can
 /// answer "is my backup actually restorable?" on a running system without risking it. If
 /// the copy cannot be deleted, the response says so in `cleanup_error` (and the backup
-/// daemon's sweep removes the copy once it is an hour old).
+/// daemon's sweep, when the daemon is enabled, removes the copy once it is an hour old).
 ///
 /// Restoring *over* a live control plane is deliberately not offered here: the library
 /// primitive refuses to clobber, and choosing a new store root is a deployment decision
@@ -612,7 +612,7 @@ async fn drill_response(fs: &dyn StoreFs, label: String, backup_dir: &std::path:
 	// behind is disk an operator is paying for: say so instead of dropping the error.
 	let cleanup_error = fs.remove_dir_all(target).await.err().map(|err| format!("could not remove the rehearsal copy {}: {err}", target.display()));
 	if let Some(cleanup) = &cleanup_error {
-		tracing::warn!(label = %label, error = %cleanup, "restore drill left its rehearsal copy behind; the backup daemon's sweep removes it once stale");
+		tracing::warn!(label = %label, error = %cleanup, "restore drill left its rehearsal copy behind; the backup daemon's sweep removes it once stale, if the daemon is enabled");
 	}
 	let report = outcome.map_err(|err| {
 		let also = cleanup_error.as_deref().map_or_else(String::new, |cleanup| format!(" (and it {cleanup})"));
@@ -707,8 +707,11 @@ fn valid_backup_label(label: &str) -> bool {
 /// else `<store_root>/backups`, and `<label>` is the (validated) `?label=` or a generated
 /// `backup-<unix_millis>`. The backup is built in a `.partial-*` directory beside it and
 /// renamed into place, with a `MANIFEST.json`, only once complete and durable, so a
-/// directory that already exists is rejected. The `.weftseg` measurement frames are
-/// **not** part of this backup — control plane only, per the storage boundary
+/// directory that already exists is rejected. A backup that fails removes its build
+/// directory again, except in one window: if the final fsync of `<base>` fails after the
+/// rename, the response is a `500` although the complete backup is already under its
+/// label (so a retry with the same label is a `400`). The `.weftseg` measurement frames
+/// are **not** part of this backup — control plane only, per the storage boundary
 /// (hard-constraint #3).
 ///
 /// # Errors
@@ -1211,7 +1214,9 @@ mod tests {
 	use tower::ServiceExt;
 	use weftdb::SegmentStore;
 
-	use crate::{app_with_state, AppState};
+	use crate::{
+		app_with_state, test_fs::{FsOp, RecordingFs, INJECTED_CLEANUP_FAILURE}, AppState
+	};
 
 	/// Build a router over a fresh, empty store under `dir` (no aspects declared).
 	async fn router_with_empty_store(dir: &TempDir) -> axum::Router {
@@ -1582,58 +1587,6 @@ mod tests {
 		drop(store);
 	}
 
-	/// A filesystem whose every operation is the real one except removing a directory
-	/// tree, which fails: the drill's cleanup step.
-	#[derive(Debug)]
-	struct CleanupFails;
-
-	#[async_trait::async_trait]
-	impl weftdb::durable::StoreFs for CleanupFails {
-		async fn create_new_write(&self, path: &std::path::Path, bytes: Vec<u8>, policy: weftdb::durable::SyncPolicy, points: weftdb::durable::WritePoints) -> std::io::Result<()> {
-			weftdb::durable::RealFs.create_new_write(path, bytes, policy, points).await
-		}
-
-		async fn sync_file(&self, path: &std::path::Path) -> std::io::Result<()> {
-			weftdb::durable::RealFs.sync_file(path).await
-		}
-
-		async fn sync_dir(&self, dir: &std::path::Path) -> std::io::Result<()> {
-			weftdb::durable::RealFs.sync_dir(dir).await
-		}
-
-		async fn hard_link(&self, src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-			weftdb::durable::RealFs.hard_link(src, dst).await
-		}
-
-		async fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
-			weftdb::durable::RealFs.rename(from, to).await
-		}
-
-		async fn remove_file(&self, path: &std::path::Path) -> std::io::Result<()> {
-			weftdb::durable::RealFs.remove_file(path).await
-		}
-
-		async fn create_dir(&self, path: &std::path::Path) -> std::io::Result<()> {
-			weftdb::durable::RealFs.create_dir(path).await
-		}
-
-		async fn remove_dir_all(&self, _: &std::path::Path) -> std::io::Result<()> {
-			Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "injected cleanup failure"))
-		}
-
-		async fn copy_new(&self, src: &std::path::Path, dst: &std::path::Path, policy: weftdb::durable::SyncPolicy) -> std::io::Result<u64> {
-			weftdb::durable::RealFs.copy_new(src, dst, policy).await
-		}
-
-		async fn read_dir(&self, dir: &std::path::Path) -> std::io::Result<Vec<weftdb::durable::FsEntry>> {
-			weftdb::durable::RealFs.read_dir(dir).await
-		}
-
-		async fn metadata(&self, path: &std::path::Path) -> std::io::Result<weftdb::durable::FsMetadata> {
-			weftdb::durable::RealFs.metadata(path).await
-		}
-	}
-
 	/// The regression for `drill-dir-leak`: the drill discarded its cleanup error, so a
 	/// rehearsal copy it could not remove was left on disk with nobody told.
 	#[tokio::test]
@@ -1647,17 +1600,19 @@ mod tests {
 		drop(store);
 
 		let target = base.join(".restore-drill-1");
-		let response = super::drill_response(&CleanupFails, "nightly".to_string(), &base.join("nightly"), &target).await.expect("the backup itself restores");
+		let fs = RecordingFs::failing_remove_dir_all();
+		let response = super::drill_response(&fs, "nightly".to_string(), &base.join("nightly"), &target).await.expect("the backup itself restores");
 		assert!(response.restorable);
 		let cleanup = response.cleanup_error.as_deref().expect("the failed cleanup is reported, not swallowed");
-		assert!(cleanup.contains("injected cleanup failure") && cleanup.contains(".restore-drill-1"), "names the cause and the leftover: {cleanup}");
+		assert!(cleanup.contains(INJECTED_CLEANUP_FAILURE) && cleanup.contains(".restore-drill-1"), "names the cause and the leftover: {cleanup}");
+		assert!(fs.ops().contains(&FsOp::RemoveDirAll(target.clone())), "the drill tried to remove its copy");
 		assert_eq!(serde_json::to_value(&response).unwrap()["cleanup_error"], serde_json::json!(cleanup), "it is in the JSON body");
 		assert!(target.exists(), "the copy really was left behind, for the sweep");
 
 		// A drill whose restore fails reports a failed cleanup in its error as well.
-		let err = super::drill_response(&CleanupFails, "missing".to_string(), &base.join("missing"), &base.join(".restore-drill-2")).await.unwrap_err();
+		let err = super::drill_response(&fs, "missing".to_string(), &base.join("missing"), &base.join(".restore-drill-2")).await.unwrap_err();
 		let super::StorageError::Internal(message) = err else { panic!("a failed drill is an internal error") };
-		assert!(message.contains("FAILED") && message.contains("injected cleanup failure"), "{message}");
+		assert!(message.contains("FAILED") && message.contains(INJECTED_CLEANUP_FAILURE), "{message}");
 	}
 
 	#[tokio::test]

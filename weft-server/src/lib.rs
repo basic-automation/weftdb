@@ -39,6 +39,8 @@ pub mod metrics;
 pub mod reconcile_daemon;
 pub mod state;
 pub mod storage;
+#[cfg(test)]
+mod test_fs;
 pub mod trace;
 
 use axum::{

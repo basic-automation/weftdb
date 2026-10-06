@@ -28,20 +28,26 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   each file's size, tables and rows) is written and fsynced, the directory fsynced,
   renamed to its label and the parent fsynced. A backup directory now holds the four
   databases plus `MANIFEST.json`. Backing up into a directory that already exists is
-  refused (it was accepted when empty).
+  refused (it was accepted when empty). A backup that fails removes its build
+  directory again, unless it fails after the rename (only the parent's fsync is left
+  then): that error, a `500` over HTTP, leaves the complete backup under its label.
 - **Backup retention counts only complete backups**: a `backup-<digits>` directory
   with a `MANIFEST.json`, or one from before manifests that holds all four databases.
-  Pruning renames a backup to `.deleting-*` (durably) before removing its files. The
-  backup daemon removes `.partial-*`, `.deleting-*` and `.restore-drill-*` entries
-  left untouched for an hour, at start and on every tick.
+  Pruning renames a backup to `.deleting-*` (durably) before removing its files. A
+  backup directory that cannot be inspected (a permission error, say) is skipped and
+  logged instead of failing retention. The backup daemon removes `.partial-*`,
+  `.deleting-*` and `.restore-drill-*` entries left untouched for an hour, at start
+  and on every tick; without the daemon, what a crash leaves there stays until
+  removed by hand.
 - **Backup and drill labels starting with `.partial-`, `.deleting-` or
   `.restore-drill-` are rejected with `400`**: those names belong to unfinished
   backups, prunes and drills, which are never restored and are swept.
 - **`restore_control_plane` stages each file as `<name>.tmp`**, synced and verified,
-  renames them into place only once all four verify, and fsyncs the root. A backup
-  with a manifest must match it (sizes, tables, rows).
+  renames them into place only once all four verify, and fsyncs the root, which it
+  now creates durably. A backup with a manifest must match it (sizes, tables, rows).
 - Library API: `verify_snapshot` and `snapshot_with_verify` take the tables the
-  snapshot must hold, and `SnapshotReport` lists them in `table_names`. `StoreFs`
+  snapshot must hold, and `SnapshotReport` lists them in `table_names`.
+  `sweep_backup_staging_at` is `sweep_backup_staging` with an explicit clock. `StoreFs`
   gains `create_dir`, `remove_dir_all` and `copy_new`, and the `SimFs` power-cut
   simulator (`fault-injection` feature) now models directories.
 
