@@ -27,7 +27,6 @@ rust-version = "1.95"
 
 [workspace.dependencies]
 anyhow = "1"
-ctor = "1.0"
 async-trait = "0.1"
 bigdecimal = "0.4"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
@@ -45,7 +44,6 @@ thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1.27", features = ["v4", "serde"] }
 wide = "1"
-wgpu = "30"
 bytemuck = { version = "1", features = ["derive"] }
 fastrand = "2"
 libc = "0.2"
