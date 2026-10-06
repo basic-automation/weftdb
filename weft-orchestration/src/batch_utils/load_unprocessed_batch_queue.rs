@@ -41,14 +41,23 @@ pub async fn is_first_run(database: &Database, aspect_id: &AspectId) -> Result<b
 ///
 /// - **Crash before the dequeue.** The batches are stored before their timestamps are
 ///   dequeued, so a run that dies in between rebuilds the same windows next time; storing
-///   skips every batch already queued or processed, so the re-run adds no duplicates.
+///   skips every batch already queued, processed or extracted, so the re-run adds no
+///   duplicate batches or pattern occurrences, whatever ran in between.
 /// - **Ingest running at the same time.** Ingest queues a timestamp before its row is
 ///   inserted and again once it is committed, so this run may read a timestamp whose row
 ///   is not stored yet and build its windows without it. It therefore dequeues only the
 ///   queue entries it read, matched on their `queued_at`
 ///   ([`dequeue_unbatched_entries`](Inputs::dequeue_unbatched_entries)): an entry queued
 ///   again after the read survives, and the next run batches the landed row. The row is
-///   missed only if that ingest also died, or failed to queue it again, after its commit.
+///   missed only if that ingest also died, or failed to queue it again within its
+///   retries, after its commit. A window this run batched from committed rows is rebuilt
+///   by the next run, after the second enqueue, into the same batch, which storing skips;
+///   only a window spanning committed rows and rows of the same ingest still to come is
+///   batched twice, differently (see `batch_capture_measurements`).
+/// - **Window alignment.** The windows are aligned on the earliest stored measurement,
+///   read from the rows on every run: a value cached before a backfill (by this or another
+///   `Database` instance) would put the backfill before the base, where it has no window,
+///   and the run would clear it from the queue.
 ///
 /// # Errors
 /// Returns an error if database reads or writes fail while constructing or persisting batches.
@@ -70,11 +79,11 @@ pub async fn build_incremental_unprocessed_queue(database: &Database, aspect: &A
 
 	info!(unbatched_count = unbatched_timestamps.len(), "Processing unbatched measurements");
 
-	// Get the earliest measurement for window alignment. Ingest queues timestamps before it
-	// inserts their rows (write-ahead enqueue), so the queue can hold timestamps whose rows
-	// have not landed (or never will), here every one of them: there is nothing to batch
-	// yet, and they stay queued.
-	let Some(earliest_measurement) = database.get_earliest_measurement(aspect).await? else {
+	// Get the earliest measurement for window alignment, uncached (see above). Ingest
+	// queues timestamps before it inserts their rows (write-ahead enqueue), so the queue
+	// can hold timestamps whose rows have not landed (or never will), here every one of
+	// them: there is nothing to batch yet, and they stay queued.
+	let Some(earliest_measurement) = database.get_earliest_measurement_uncached(aspect).await? else {
 		info!(unbatched_count = unbatched_timestamps.len(), "Queued timestamps but no stored measurements yet, nothing to batch");
 		return Ok(());
 	};
@@ -118,7 +127,7 @@ pub async fn build_incremental_unprocessed_queue(database: &Database, aspect: &A
 
 			let batch = Batch::new(batch_size, measurements, *resolution, *aspect, database_info.clone());
 
-			// Skipped (still `Ok`) when the batch is already queued or processed.
+			// Skipped (still `Ok`) when the batch is already queued, processed or extracted.
 			database.insert_unprocessed_batch(aspect, &batch).await?;
 			batches_created += 1;
 
@@ -141,7 +150,7 @@ pub async fn build_incremental_unprocessed_queue(database: &Database, aspect: &A
 
 	// The batches are committed and their timestamps are still queued. A crash here makes
 	// the next run rebuild the same windows; the store skips each batch whose hash is
-	// already queued or processed, so that re-run adds no duplicates.
+	// already queued, processed or extracted, so that re-run adds no duplicates.
 	weftdb::durable::fault::hit(weftdb::durable::FaultPoint::LConsumerBatches).await?;
 
 	// Dequeue the covered entries, each only if it was not queued again since it was read

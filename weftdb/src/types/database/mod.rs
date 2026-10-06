@@ -383,7 +383,10 @@ impl DatabaseStructure for Database {
 	///   published it first;
 	/// - if `name` has the form of a build directory (`.{x}.creating-{32 hex digits}`);
 	/// - if the build, the rename or the directory fsync fails. The database was then not
-	///   created, unless the error says it could not be withdrawn after the rename.
+	///   created, unless the error says it could not be withdrawn after the rename;
+	/// - if the published database cannot be opened at its final path. It was then
+	///   created and is complete, and the error says to open it with `existing`, since
+	///   `new(name)` would now report that it already exists.
 	async fn new(name: &str) -> Result<Self> {
 		tracing::debug!("Creating new database: {name}");
 		let data_dir = Self::get_data_dir();
@@ -429,8 +432,10 @@ impl DatabaseStructure for Database {
 		drop(build);
 		tracing::debug!("Published database {name} at {db_path}");
 
-		// Open it at its final path: a cold open, exactly as `existing` does.
-		let metadata_turso_db = Self::get_turso_database(&metadata_db_path).await?;
+		// Open it at its final path: a cold open, exactly as `existing` does. The database
+		// exists from here on, so an error must say so: a retried `new` would only report
+		// that it already exists.
+		let metadata_turso_db = Self::get_turso_database(&metadata_db_path).await.map_err(|e| anyhow::anyhow!("Database {name} was created at {db_path} but could not be opened; open it with Database::existing: {e}"))?;
 
 		let mut db_info = DatabaseInfo::new(name.to_string(), db_path);
 		db_info.set_metadata(Some(metadata_turso_db.clone()));
@@ -438,8 +443,12 @@ impl DatabaseStructure for Database {
 
 		let db = Self { id: db_id, name: name.to_string(), metadata: metadata_turso_db, metadata_path: metadata_db_path, cache: Arc::new(Mutex::new(cache::DatabaseCache::new())) };
 
-		// Checkpoint metadata WAL to ensure schema and initial data are persisted
-		Self::checkpoint_wal_passive(&db.metadata).await?;
+		// Fold the build's log into the database file. Best-effort, as after every commit:
+		// the schema and the `database` row are durable once committed (the commit fsyncs
+		// the log), and failing here would hand back an error for a database that exists.
+		if let Err(e) = Self::checkpoint_wal_passive(&db.metadata).await {
+			tracing::debug!("Failed to checkpoint the new database {name}; it is created and committed: {e}");
+		}
 
 		Ok(db)
 	}
@@ -1072,46 +1081,11 @@ impl DatabaseStructure for Database {
 			return Ok(Some(cached));
 		}
 
-		let db = self.get_measurement_db(aspect_id).await?;
-		let db_path = self.get_measurement_db_path(aspect_id).await?;
-		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
-		let res = conn.as_ref().query("SELECT MIN(timestamp) FROM measurements", turso::params![]).await;
-
-		let timestamp = match res {
-			Ok(mut rows) => {
-				if let Some(row) = rows.next().await? {
-					// Check if the value is null (empty table)
-					let value = row.get_value(0)?;
-					if matches!(value, turso::Value::Null) {
-						None
-					} else {
-						let timestamp_str = Self::value_to_string(&value, "Earliest Measurement Timestamp").await?;
-						if timestamp_str.is_empty() {
-							return Ok(None);
-						}
-						// Parse as milliseconds (i64) instead of RFC3339
-						let timestamp_millis: i64 = timestamp_str.parse().map_err(|e| anyhow::anyhow!("Invalid timestamp format: {e}"))?;
-						let timestamp = DateTime::from_timestamp_millis(timestamp_millis).ok_or_else(|| anyhow::anyhow!("Invalid timestamp"))?;
-						Some(timestamp)
-					}
-				} else {
-					None
-				}
-			}
-			Err(e) => {
-				let _ = Self::rollback_concurrent(&conn).await;
-				return Err(anyhow::anyhow!("SQL execution failure 18: in get_earliest_measurement: `{e}`"));
-			}
-		};
-
-		Self::commit_concurrent(&conn).await?;
-
-		if let Some(ts) = timestamp {
+		let earliest = self.get_earliest_measurement_uncached(aspect_id).await?;
+		if let Some(ts) = earliest {
 			self.cache.lock().await.store(&cache_key, ts).await;
-			Ok(Some(ts))
-		} else {
-			Ok(None)
 		}
+		Ok(earliest)
 	}
 
 	async fn get_latest_measurement(&self, aspect_id: &AspectId) -> Result<Option<DateTime<Utc>>> {
@@ -1468,13 +1442,63 @@ impl Database {
 	/// Forget the cached earliest measurement of `aspect_id`, after rows were committed
 	/// that may be earlier (crash-consistency design, S18).
 	///
-	/// The queue consumer aligns its windows on the earliest measurement. While a stale
-	/// value was cached (for minutes, and nothing invalidated it), every timestamp of a
-	/// backfill before it fell before the consumer's base, where it has no window, so the
-	/// consumer cleared those timestamps from the queue and the backfilled rows were never
-	/// batched.
+	/// The cache belongs to this `Database` (and its clones): another instance, such as
+	/// the one a weft-tui action or another pipeline opened, keeps its own copy, which
+	/// this does not reach, for up to its lifetime of 10 minutes. The queue consumer does
+	/// not rely on it: it reads the earliest measurement with
+	/// [`get_earliest_measurement_uncached`](Self::get_earliest_measurement_uncached).
 	pub(crate) async fn forget_cached_earliest_measurement(&self, aspect_id: &AspectId) {
 		self.cache.lock().await.invalidate(&Self::earliest_measurement_cache_key(aspect_id)).await;
+	}
+
+	/// The earliest stored measurement of `aspect_id`, read from the rows (one `MIN`
+	/// query), bypassing and leaving untouched the cache that
+	/// [`get_earliest_measurement`](DatabaseStructure::get_earliest_measurement) reads.
+	///
+	/// The queue consumer aligns its windows on this value (crash-consistency design,
+	/// S18). A stale one, cached before a backfill committed rows earlier than it (by this
+	/// or another `Database` instance, which each cache on their own), put the backfill's
+	/// timestamps before the consumer's base, where they have no window, and the consumer
+	/// cleared them from the queue: the backfilled rows were never batched.
+	///
+	/// # Errors
+	///
+	/// If the aspect's measurement database cannot be opened or queried.
+	pub async fn get_earliest_measurement_uncached(&self, aspect_id: &AspectId) -> Result<Option<DateTime<Utc>>> {
+		let db = self.get_measurement_db(aspect_id).await?;
+		let db_path = self.get_measurement_db_path(aspect_id).await?;
+		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		let res = conn.as_ref().query("SELECT MIN(timestamp) FROM measurements", turso::params![]).await;
+
+		let timestamp = match res {
+			Ok(mut rows) => {
+				if let Some(row) = rows.next().await? {
+					// Check if the value is null (empty table)
+					let value = row.get_value(0)?;
+					if matches!(value, turso::Value::Null) {
+						None
+					} else {
+						let timestamp_str = Self::value_to_string(&value, "Earliest Measurement Timestamp").await?;
+						if timestamp_str.is_empty() {
+							return Ok(None);
+						}
+						// Parse as milliseconds (i64) instead of RFC3339
+						let timestamp_millis: i64 = timestamp_str.parse().map_err(|e| anyhow::anyhow!("Invalid timestamp format: {e}"))?;
+						let timestamp = DateTime::from_timestamp_millis(timestamp_millis).ok_or_else(|| anyhow::anyhow!("Invalid timestamp"))?;
+						Some(timestamp)
+					}
+				} else {
+					None
+				}
+			}
+			Err(e) => {
+				let _ = Self::rollback_concurrent(&conn).await;
+				return Err(anyhow::anyhow!("SQL execution failure 18: in get_earliest_measurement: `{e}`"));
+			}
+		};
+
+		Self::commit_concurrent(&conn).await?;
+		Ok(timestamp)
 	}
 
 	/// DDL-safe version that uses a direct `turso::Connection` for schema creation

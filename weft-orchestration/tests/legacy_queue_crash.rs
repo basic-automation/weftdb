@@ -8,13 +8,14 @@
 //! - **Batch dedupe** (legacy-queue-consumer-batch-before-dequeue): a consumer that
 //!   dies after inserting its batches but before dequeuing their timestamps rebuilds
 //!   the same windows on its next run; storing a batch skips it when its hash is already
-//!   queued or processed, so the re-run adds no duplicate batches and the pattern
-//!   dictionary no duplicate occurrences.
+//!   queued, processed or extracted, so the re-run adds no duplicate batches and the
+//!   pattern dictionary no duplicate occurrences.
 //! - **A consumer running during an ingest**: the write-ahead entry is visible before
 //!   its row commits, so a consumer can read it, build the windows without the row and
 //!   dequeue it. Ingest queues each timestamp again once its row is committed, and the
 //!   consumer dequeues only the queue entries it read, so the landed row is batched by
-//!   the next run.
+//!   the next run; a window it had already batched from committed rows is rebuilt
+//!   identically, and the dedupe skips it even after extraction.
 //!
 //! A failure is injected with `ReturnErr` at a fault point and the store then
 //! "restarts": every handle is released and the database is reopened cold, so no cache
@@ -22,7 +23,7 @@
 //! run as one: a re-executed child aborts at the point (`WEFT_FAULT=<point>:abort`).
 
 use std::{
-	collections::{BTreeSet, HashSet}, sync::Arc
+	collections::{BTreeMap, BTreeSet, HashSet}, sync::Arc
 };
 
 use anyhow::{Context, Result};
@@ -133,6 +134,32 @@ impl Store {
 	async fn covered(&self) -> Result<BTreeSet<DateTime<Utc>>> {
 		Ok(self.batch_rows(false).await?.into_iter().flat_map(|(_, points)| points).map(|point| point.timestamp).collect())
 	}
+
+	/// The stages of `Pipeline::run` that touch batches: build the queue, process it, and
+	/// extract the processed batches into `dictionary`, which deletes them.
+	async fn run_pipeline(&self, dictionary: &mut Dictionary) -> Result<()> {
+		self.build().await.context("the consumer")?;
+		build_processed_batch_queue(&self.db, &self.aspect).await.context("batch processing")?;
+		build_patterns_queue(&self.db, &self.aspect, dictionary).await.context("pattern extraction")
+	}
+}
+
+/// A dictionary for the extraction tests. It has no variability constraints, so every
+/// batch becomes a pattern of its own, with one occurrence.
+fn dictionary() -> Dictionary {
+	Dictionary::new("crash".to_string(), "S18 crash test".to_string(), DictionaryConstraints::default())
+}
+
+/// An occurrence's span: its beginning and end.
+type Span = (DateTime<Utc>, DateTime<Utc>);
+
+/// The occurrence spans `dictionary` holds more than once, with how often.
+fn repeated_spans(dictionary: &Dictionary) -> Vec<(Span, usize)> {
+	let mut spans = BTreeMap::new();
+	for occurrence in dictionary.patterns().iter().flat_map(|pattern| pattern.occurrences().iter()) {
+		*spans.entry((*occurrence.beginning(), *occurrence.end())).or_insert(0) += 1;
+	}
+	spans.into_iter().filter(|(_, count)| *count > 1).collect()
 }
 
 fn base() -> DateTime<Utc> {
@@ -159,7 +186,7 @@ fn assert_unique_hashes(batches: &[BatchRow], what: &str) {
 /// the same occurrence twice and that there is exactly one occurrence span per batch.
 async fn assert_no_duplicate_occurrences(store: &Store, batches: usize) -> Result<()> {
 	build_processed_batch_queue(&store.db, &store.aspect).await?;
-	let mut dictionary = Dictionary::new("crash".to_string(), "S18 crash test".to_string(), DictionaryConstraints::default());
+	let mut dictionary = dictionary();
 	build_patterns_queue(&store.db, &store.aspect, &mut dictionary).await?;
 	let mut spans = HashSet::new();
 	for pattern in dictionary.patterns() {
@@ -228,6 +255,76 @@ async fn a_consumer_rerun_after_its_batches_were_processed_adds_no_duplicates() 
 	assert_unique_hashes(&store.batch_rows(true).await?, "the processed batches");
 
 	assert_no_duplicate_occurrences(&store, crashed.len()).await
+}
+
+/// The same crash, but the crashed run's batches are processed *and* extracted into
+/// patterns, which deletes them, before the consumer re-runs. Extraction records the
+/// hashes of the batches it consumed, and the dedupe checks them too, so the re-run
+/// queues nothing again. Before, the dedupe saw only the two batch tables, and the
+/// re-run queued every extracted batch again: a second occurrence of each span.
+#[tokio::test]
+#[serial]
+async fn a_consumer_rerun_after_its_batches_were_extracted_adds_no_duplicates() -> Result<()> {
+	let store = Store::new("consumer_extracted").await?;
+	let crashed = crash_the_consumer(&store).await?;
+	let mut dictionary = dictionary();
+	build_processed_batch_queue(&store.db, &store.aspect).await?;
+	build_patterns_queue(&store.db, &store.aspect, &mut dictionary).await?;
+	assert_eq!((store.batch_rows(false).await?.len(), store.batch_rows(true).await?.len()), (0, 0), "precondition: extraction consumed the crashed run's batches");
+	let extracted = dictionary.patterns().iter().map(|pattern| pattern.occurrences().len()).sum::<usize>();
+	assert_eq!(extracted, crashed.len(), "precondition: one occurrence per batch");
+
+	let store = store.restart().await?;
+	store.run_pipeline(&mut dictionary).await.context("the re-run")?;
+	assert_eq!(repeated_spans(&dictionary), Vec::new(), "the re-run extracted the crashed run's batches again");
+	Ok(())
+}
+
+/// **Regression (an ingest during a pipeline run, then extraction).** A pipeline run
+/// (consumer, processing, extraction) while a `batch_capture_measurements` is between a
+/// chunk's commit and the chunk's second enqueue: the consumer reads the chunk's
+/// write-ahead entries, batches the windows with the committed rows and dequeues them,
+/// and extraction consumes those batches. The second enqueue then queues the timestamps
+/// again, and the next run rebuilds the same windows into byte-identical batches. The
+/// dedupe recognises them by the hashes extraction recorded, so no span becomes a second
+/// occurrence. Before, it saw only the batches still in a table, so every one of those
+/// windows was extracted twice.
+#[tokio::test]
+#[serial]
+async fn a_pipeline_run_during_an_ingest_extracts_each_window_once() -> Result<()> {
+	let store = Store::new("concurrent_extract").await?;
+	let mut dictionary = dictionary();
+	store.db.batch_capture_measurements(store.aspect, DatasetId::new(), minutes(0..20)).await?;
+	store.run_pipeline(&mut dictionary).await?;
+	assert!(!dictionary.patterns().is_empty(), "precondition: the first run extracted patterns");
+	// Each run below uses a cold handle, as a separate pipeline invocation (or a weft-tui
+	// action) does, so that no batch list a previous run cached is served again.
+	let store = store.restart().await?;
+
+	// The ingest is one chunk; pause it after that chunk's commit, before its second
+	// enqueue, and run the pipeline there.
+	let point = FaultPoint::LChunk(0);
+	let resume = Arc::new(Notify::new());
+	let before = fault::hits(point);
+	let armed = fault::arm(point, FaultAction::Pause(resume.clone()));
+	let ingesting = store.db.batch_capture_measurements(store.aspect, DatasetId::new(), minutes(20..40));
+	let running = async {
+		fault::reached(point, before + 1).await;
+		drop(armed);
+		let ran = store.run_pipeline(&mut dictionary).await;
+		resume.notify_one();
+		ran
+	};
+	let (ingested, ran) = tokio::time::timeout(std::time::Duration::from_secs(120), async { tokio::join!(ingesting, running) }).await.context("the paused ingest and the pipeline run finish")?;
+	ingested.context("the paused ingest")?;
+	ran.context("the pipeline run during the ingest")?;
+	let ingested_from = base() + Duration::minutes(20);
+	assert!(dictionary.patterns().iter().flat_map(|pattern| pattern.occurrences().iter()).any(|occurrence| *occurrence.end() >= ingested_from), "precondition: the run during the ingest extracted windows over the ingested rows");
+
+	let store = store.restart().await?;
+	store.run_pipeline(&mut dictionary).await.context("the run after the ingest")?;
+	assert_eq!(repeated_spans(&dictionary), Vec::new(), "a window was extracted twice");
+	Ok(())
 }
 
 /// Set only in the child process [`a_consumer_killed_before_the_dequeue_reruns_without_duplicates`]
@@ -438,15 +535,66 @@ async fn assert_a_consumer_during_the_ingest_misses_nothing(store: &Store, inges
 #[tokio::test]
 #[serial]
 async fn a_consumer_during_an_ingest_inside_the_range_misses_nothing() -> Result<()> {
-	let store = Store::new("concurrent_inside").await?;
+	let (store, landed) = a_store_with_a_gap("concurrent_inside").await?;
+	assert_a_consumer_during_the_ingest_misses_nothing(&store, Ingest::Capture(landed)).await
+}
+
+/// A store holding minutes 0..20 except minute 10, batched, and the row that fills the gap
+/// (with a value no interpolation across the gap produces).
+async fn a_store_with_a_gap(tag: &str) -> Result<(Store, InputMeasurement)> {
+	let store = Store::new(tag).await?;
 	let mut rows = minutes(0..10);
 	rows.extend(minutes(11..20));
 	store.db.batch_capture_measurements(store.aspect, DatasetId::new(), rows).await?;
 	store.build().await?;
 	assert!(store.db.count_unprocessed_batches(&store.aspect).await? > 0, "precondition: the aspect has batches, so the consumer runs incrementally");
+	Ok((store, InputMeasurement::new(base() + Duration::minutes(10), BigDecimal::from(1000))))
+}
 
-	let landed = InputMeasurement::new(base() + Duration::minutes(10), BigDecimal::from(1000));
-	assert_a_consumer_during_the_ingest_misses_nothing(&store, Ingest::Capture(landed)).await
+/// **Regression (the dequeue matches the entry it read).** The second enqueue lands
+/// between the consumer's read and its dequeue: the consumer reads the write-ahead entry
+/// while the ingest is paused at `L-enqueued`, builds the window without the row and is
+/// paused at `L-consumer-batches`; the ingest then commits its row and queues it again,
+/// which moves the still-queued entry's `queued_at`; only then does the consumer dequeue.
+/// It dequeues the entry only under the `queued_at` it read, so the entry stays queued and
+/// the next run batches the landed row. A dequeue by bare timestamp removed it, and the
+/// row was never batched.
+#[tokio::test]
+#[serial]
+async fn an_entry_queued_again_before_the_consumers_dequeue_stays_queued() -> Result<()> {
+	let (store, landed) = a_store_with_a_gap("requeue_before_dequeue").await?;
+	let (resume_ingest, resume_consumer, ingested) = (Arc::new(Notify::new()), Arc::new(Notify::new()), Notify::new());
+	let (enqueued, batched) = (fault::hits(FaultPoint::LEnqueued), fault::hits(FaultPoint::LConsumerBatches));
+	let armed = (fault::arm(FaultPoint::LEnqueued, FaultAction::Pause(resume_ingest.clone())), fault::arm(FaultPoint::LConsumerBatches, FaultAction::Pause(resume_consumer.clone())));
+	let ingesting = async {
+		let stored = store.db.capture_measurement(&store.aspect, &DatasetId::new(), &landed).await;
+		ingested.notify_one();
+		stored
+	};
+	let consuming = async {
+		fault::reached(FaultPoint::LEnqueued, enqueued + 1).await;
+		let queued = store.queued().await;
+		(queued, store.build().await)
+	};
+	let interleaving = async {
+		// The consumer has read the entry and stored its batches; the ingest stores the row
+		// and queues it again before the consumer dequeues.
+		fault::reached(FaultPoint::LConsumerBatches, batched + 1).await;
+		resume_ingest.notify_one();
+		ingested.notified().await;
+		resume_consumer.notify_one();
+	};
+	let (stored, (queued, built), ()) = tokio::time::timeout(std::time::Duration::from_secs(120), async { tokio::join!(ingesting, consuming, interleaving) }).await.context("the interleaved ingest and consumer finish")?;
+	drop(armed);
+	stored.context("the paused ingest")?;
+	assert!(queued?.contains(&landed.timestamp()), "precondition: the consumer read the entry before the row was stored");
+	built.context("the consumer run during the ingest")?;
+	assert!(store.queued().await?.contains(&landed.timestamp()), "the consumer dequeued an entry queued again after it read it");
+
+	store.build().await.context("the consumer run after the ingest")?;
+	let batched: Vec<Point> = store.batch_rows(false).await?.into_iter().flat_map(|(_, points)| points).collect();
+	assert!(batched.iter().any(|point| point.timestamp == landed.timestamp() && point.value == *landed.value()), "no batch holds the landed row");
+	Ok(())
 }
 
 /// **Regression (write-ahead enqueue vs. a concurrent consumer, a backfill).** The same
@@ -466,4 +614,35 @@ async fn a_consumer_during_a_backfill_misses_nothing() -> Result<()> {
 	store.db.clear_unbatched_measurements(&store.aspect).await?;
 
 	assert_a_consumer_during_the_ingest_misses_nothing(&store, Ingest::BatchCapture(minutes(0..10))).await
+}
+
+/// **Regression (window alignment on a cached earliest measurement).** The consumer aligns
+/// its windows on the earliest stored measurement, and reads it from the rows on every
+/// run. A `Database` caches that value for 10 minutes, and an ingest drops only its own
+/// instance's copy, so another instance (each weft-tui action opens one), or an ingest
+/// path that does not drop it (`capture_new_measurement` here), leaves a stale value
+/// behind. Aligned on it, a backfill lies before the consumer's base, where it has no
+/// window, and the consumer cleared it from the queue: the backfilled rows were never
+/// batched.
+#[tokio::test]
+#[serial]
+async fn the_consumer_aligns_on_the_stored_earliest_measurement_not_a_cached_one() -> Result<()> {
+	let store = Store::new("stale_earliest").await?;
+	store.db.batch_capture_measurements(store.aspect, DatasetId::new(), minutes(10..20)).await?;
+	store.build().await?;
+	assert!(store.db.count_unprocessed_batches(&store.aspect).await? > 0, "precondition: the aspect has batches, so the consumer runs incrementally");
+	store.db.clear_unbatched_measurements(&store.aspect).await?;
+	assert_eq!(store.db.get_earliest_measurement(&store.aspect).await?, Some(base() + Duration::minutes(10)), "precondition: the earliest measurement is cached");
+
+	let backfill = minutes(0..10);
+	for row in &backfill {
+		store.db.capture_new_measurement(&store.aspect, &DatasetId::new(), row).await?;
+	}
+	assert_eq!(store.db.get_earliest_measurement(&store.aspect).await?, Some(base() + Duration::minutes(10)), "precondition: the cached value is stale");
+
+	store.build().await?;
+	let covered = store.covered().await?;
+	let missing: Vec<_> = timestamps(&backfill).difference(&covered).copied().collect();
+	assert!(missing.is_empty(), "the consumer did not batch the backfilled rows {missing:?}");
+	Ok(())
 }

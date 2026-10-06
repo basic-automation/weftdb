@@ -376,6 +376,17 @@ mod tests {
 		assert!(target.is_dir(), "the existing target is untouched");
 	}
 
+	/// Resumes a task paused at a fault point when dropped, so that a failed assertion
+	/// while it is paused fails the test instead of leaving the runtime's shutdown waiting
+	/// on that task forever (and the `serial` group behind it).
+	struct ResumeOnDrop(Arc<tokio::sync::Notify>);
+
+	impl Drop for ResumeOnDrop {
+		fn drop(&mut self) {
+			self.0.notify_one();
+		}
+	}
+
 	/// A `publish` whose future is dropped part-way (a timeout or a `select!` dropping
 	/// `Database::new`) leaves the build to its blocking task: dropping the `Build` removes
 	/// nothing, no sweep runs until the task ends (it holds the creator lock), and the task
@@ -392,6 +403,7 @@ mod tests {
 		let resume = Arc::new(tokio::sync::Notify::new());
 		let before = fault::hits(FaultPoint::LNewRenamed);
 		let armed = fault::arm(FaultPoint::LNewRenamed, fault::FaultAction::Pause(resume.clone()));
+		let paused = ResumeOnDrop(resume);
 		{
 			let publishing = build.publish();
 			tokio::pin!(publishing);
@@ -402,15 +414,19 @@ mod tests {
 		}
 		drop(build);
 		drop(armed);
-		assert!(target.join("metadata.db").exists(), "dropping the Build mid-publish removed nothing");
 
+		// Observe everything while the task is paused, then resume it before asserting.
+		let published_while_paused = target.join("metadata.db").exists();
 		// What a crashed creator leaves: no sweep may run while the publish task holds the lock.
 		let stale = root.path().join(format!(".gone{BUILD_INFIX}{}", uuid::Uuid::new_v4().simple()));
 		std::fs::create_dir(&stale).unwrap();
-		assert_eq!(sweep_stale_build_dirs(root.path()).await.unwrap(), 0, "the publish task still holds the creator lock");
-		assert!(stale.exists());
+		let swept_while_paused = sweep_stale_build_dirs(root.path()).await;
+		let stale_kept = stale.exists();
+		drop(paused);
 
-		resume.notify_one();
+		assert!(published_while_paused, "dropping the Build mid-publish removed nothing");
+		assert_eq!(swept_while_paused.unwrap(), 0, "the publish task still holds the creator lock");
+		assert!(stale_kept);
 		assert_eq!(sweep_once_unlocked(root.path()).await, 1, "the lock is released once the task ends");
 		assert!(target.join("metadata.db").exists(), "the task completed the publish");
 	}

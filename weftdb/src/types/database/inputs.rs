@@ -4,9 +4,87 @@ use crate::{
 	cache::Connection, database::traits::{AspectStructure, Inputs}, types::{
 		database::{
 			helpers::safe_usize_to_f64, traits::{config::Config, connection::Connection as ConnectionTrait, DatabaseStructure}
-		}, durable::{fault, FaultPoint}, TxId
+		}, durable::{fault, FaultPoint}, error::is_transient_mvcc_error, TxId
 	}, Aspect, AspectId, Batch, BatchId, Correlation, CorrelationID, Database, DatasetId, DictionaryMetadata, Error, Event, EventID, InputMeasurement, Measurement, Pattern, PatternID, UnbatchedEntry
 };
+
+/// How often a write to the unbatched queue is attempted when it loses an MVCC
+/// write-write conflict over the same entries (crash-consistency design, S18): ingest's
+/// enqueues and a consumer's dequeue upsert and delete the same `(aspect_id,
+/// data_timestamp)` rows, and two ingests into one aspect can queue the same timestamps.
+/// With the backoff of [`queue_write_backoff`] the attempts span about three seconds,
+/// many times the longest transaction they wait on (a dequeue transaction removes at most
+/// [`DEQUEUE_CHUNK`] entries).
+const QUEUE_WRITE_ATTEMPTS: u32 = 10;
+
+/// The most queue entries one dequeue transaction removes. A consumer dequeues in several
+/// short transactions rather than one per run, so an ingest whose enqueue conflicts with
+/// it waits for one of them, never for the whole dequeue.
+const DEQUEUE_CHUNK: usize = 500;
+
+/// The wait before the retry that follows attempt `attempt` (from 1) of a queue write:
+/// doubling from 20 ms up to 500 ms, plus up to half again of jitter, so that two writers
+/// that conflicted do not retry in step.
+fn queue_write_backoff(attempt: u32) -> std::time::Duration {
+	let base = std::cmp::min(10u64 << attempt.min(6), 500);
+	std::time::Duration::from_millis(base + fastrand::u64(0..=base / 2))
+}
+
+/// Whether `e` is an MVCC conflict that retrying the whole transaction can resolve: a
+/// write-write conflict with another open transaction (Turso 0.8 reports it only as a
+/// generic error, by its message), a stale snapshot or aborted commit dependency
+/// (`BusySnapshot`), or a busy database.
+fn is_mvcc_conflict(e: &turso::Error) -> bool {
+	match e {
+		turso::Error::Busy(_) | turso::Error::BusySnapshot(_) => true,
+		turso::Error::Error(message) => message.contains("Write-write conflict"),
+		_ => false,
+	}
+}
+
+/// The error of a failed queue write: an [`Error::TransientMvccError`] when `e` is a
+/// conflict that a retry can resolve (see [`is_mvcc_conflict`]), so that the retry loops
+/// recognise it, and a plain error otherwise.
+fn queue_write_error(context: &str, e: &turso::Error) -> anyhow::Error {
+	if is_mvcc_conflict(e) {
+		Error::TransientMvccError(format!("{context}: {e}")).into()
+	} else {
+		anyhow::anyhow!("{context}: {e}")
+	}
+}
+
+/// `COMMIT` a queue write; on failure roll back and return the error classified as by
+/// [`queue_write_error`]. (`commit_concurrent` returns the error as text, so a conflict
+/// at the commit could not be told apart from any other failure.)
+async fn commit_queue_write(conn: &Connection, context: &str) -> Result<()> {
+	if let Err(e) = conn.as_ref().execute("COMMIT", turso::params![]).await {
+		let _ = conn.as_ref().execute("ROLLBACK", turso::params![]).await;
+		return Err(queue_write_error(&format!("{context}: the commit failed and was rolled back"), &e));
+	}
+	Ok(())
+}
+
+/// Run `write`, a whole queue-write transaction, again while it fails with a transient
+/// MVCC conflict, up to [`QUEUE_WRITE_ATTEMPTS`] times in all, and return its last result.
+/// Each attempt is a fresh transaction on a fresh snapshot, and a failed one wrote
+/// nothing.
+async fn retry_queue_write<F, Fut>(what: &str, mut write: F) -> Result<()>
+where
+	F: FnMut() -> Fut + Send,
+	Fut: std::future::Future<Output = Result<()>> + Send,
+{
+	let mut attempt = 1;
+	loop {
+		match write().await {
+			Err(e) if attempt < QUEUE_WRITE_ATTEMPTS && is_transient_mvcc_error(&e) => {
+				tracing::debug!("{what} lost an MVCC conflict (attempt {attempt} of {QUEUE_WRITE_ATTEMPTS}), retrying: {e}");
+				tokio::time::sleep(queue_write_backoff(attempt)).await;
+				attempt += 1;
+			}
+			done => return done,
+		}
+	}
+}
 
 #[async_trait::async_trait]
 impl Inputs for Database {
@@ -28,6 +106,11 @@ impl Inputs for Database {
 	/// that lands after the consumer's read, such as ingest's second enqueue once its rows
 	/// are committed, keeps the timestamp queued for the next run (crash-consistency
 	/// design, S18). This used to be `INSERT OR IGNORE`, which left the old `queued_at`.
+	///
+	/// One attempt: an MVCC write-write conflict with another write to the same entries
+	/// (a concurrent enqueue of the same timestamps, or a consumer's dequeue) is returned as
+	/// an [`Error::TransientMvccError`], after which nothing was written and a retry can
+	/// succeed; ingest retries it.
 	async fn enqueue_unbatched_measurements(&self, aspect_id: &AspectId, data_timestamps: &[chrono::DateTime<chrono::Utc>]) -> Result<()> {
 		if data_timestamps.is_empty() {
 			return Ok(());
@@ -56,15 +139,14 @@ impl Inputs for Database {
 				params.push(queued_at.to_string());
 			}
 
-			let res = conn.as_ref().execute(&bulk_sql, turso::params_from_iter(params)).await;
-			if let Err(e) = res {
-				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("Failed to enqueue unbatched measurements: {e}"));
+			if let Err(e) = conn.as_ref().execute(&bulk_sql, turso::params_from_iter(params)).await {
+				// The conflict, not a failed rollback of the transaction it ended, is the error.
+				let _ = Self::rollback_concurrent(&conn).await;
+				return Err(queue_write_error("Failed to enqueue unbatched measurements", &e));
 			}
 		}
 
-		Self::commit_concurrent(&conn).await?;
-		Ok(())
+		commit_queue_write(&conn, "Failed to enqueue unbatched measurements").await
 	}
 
 	/// Dequeue unbatched measurements after they have been included in batches
@@ -105,33 +187,21 @@ impl Inputs for Database {
 	/// Dequeue the queue entries a consumer read, each only while it still has the
 	/// `queued_at` it was read with.
 	///
-	/// One `DELETE` per entry, prepared once: Turso seeks the `(aspect_id, data_timestamp)`
-	/// key for an equality, but not for an `IN` list, which it answers by scanning the
-	/// aspect's entries.
+	/// The entries are removed in transactions of at most [`DEQUEUE_CHUNK`], so that an
+	/// ingest queuing one of the same timestamps meanwhile waits for one short transaction,
+	/// not for the whole dequeue. A transaction that loses an MVCC conflict to such an
+	/// enqueue is retried: it re-reads the entries, so one queued again in the meantime no
+	/// longer matches and stays queued. Each transaction runs one `DELETE` per entry,
+	/// prepared once: Turso seeks the `(aspect_id, data_timestamp)` key for an equality,
+	/// but not for an `IN` list, which it answers by scanning the aspect's entries.
+	///
+	/// On an error the transactions before the failed one stay committed; the entries left
+	/// queued are batched again by the next run, whose duplicate check skips the batches
+	/// already stored.
 	async fn dequeue_unbatched_entries(&self, aspect_id: &AspectId, entries: &[UnbatchedEntry]) -> Result<()> {
-		if entries.is_empty() {
-			return Ok(());
+		for chunk in entries.chunks(DEQUEUE_CHUNK) {
+			retry_queue_write("Dequeuing unbatched measurements", || self.dequeue_entry_chunk(aspect_id, chunk)).await?;
 		}
-
-		let metadata_db = self.metadata();
-		let metadata_db_path = self.metadata_path();
-		let conn = Self::begin_concurrent(metadata_db, metadata_db_path, Some(self.cache.clone())).await?;
-		let aspect_id_str = aspect_id.as_uuid().to_string();
-
-		let deleted = async {
-			let mut delete = conn.as_ref().prepare("DELETE FROM unbatched_measurements WHERE aspect_id = ? AND data_timestamp = ? AND queued_at = ?").await?;
-			for entry in entries {
-				delete.execute(turso::params![aspect_id_str.clone(), entry.data_timestamp.timestamp_millis(), entry.queued_at]).await?;
-			}
-			Ok::<_, turso::Error>(())
-		}
-		.await;
-		if let Err(e) = deleted {
-			let _ = Self::rollback_concurrent(&conn).await;
-			return Err(anyhow::anyhow!("Failed to dequeue unbatched measurements: {e}"));
-		}
-
-		Self::commit_concurrent(&conn).await?;
 		Ok(())
 	}
 
@@ -177,7 +247,7 @@ impl Inputs for Database {
 		// in between. A consumer can now read the timestamp before its row exists, so it is
 		// queued again after the commit (below). A timestamp whose row never lands is
 		// handled by the consumer like any other (see the trait docs).
-		self.enqueue_unbatched_measurement(aspect_id, data_timestamp).await?;
+		self.enqueue_retrying(aspect_id, &[data_timestamp]).await?;
 		fault::hit(FaultPoint::LEnqueued).await?;
 
 		// Simple INSERT - no unique constraints with MVCC, duplicates handled at app level
@@ -310,7 +380,7 @@ impl Inputs for Database {
 		// any others (see the trait docs).
 		tracing::debug!("[batch_capture] Enqueuing {} unbatched measurements...", input_measurements.len());
 		let all_timestamps: Vec<chrono::DateTime<chrono::Utc>> = input_measurements.iter().map(InputMeasurement::timestamp).collect();
-		self.enqueue_unbatched_measurements(&aspect_id, &all_timestamps).await?;
+		self.enqueue_retrying(&aspect_id, &all_timestamps).await?;
 		fault::hit(FaultPoint::LEnqueued).await?;
 		tracing::debug!("[batch_capture] Unbatched measurements enqueued");
 
@@ -530,25 +600,23 @@ impl Inputs for Database {
 	/// Insert unprocessed batch (implement missing trait method)
 	///
 	/// Skips the insert, and still returns `Ok`, when a batch with the same
-	/// `(aspect_id, batch_hash)` is already queued or already processed (crash-consistency
-	/// design, S18). The queue consumer inserts its batches and only then dequeues the
-	/// timestamps they cover, so a consumer that crashed in between rebuilds the same
-	/// windows on its next run; without this check every one of those batches was queued,
-	/// processed and turned into a pattern occurrence twice. The hash is the MD5 of the
-	/// batch's measurements, which include their timestamps, so two different windows
-	/// never share one. Both checks are point lookups on the `(aspect_id, batch_hash)`
-	/// index of the batch tables, the queued one first (`queue_batch_unless_known` says
-	/// why the order matters).
+	/// `(aspect_id, batch_hash)` is already queued, processed, or extracted
+	/// (crash-consistency design, S18). The consumer rebuilds a window it already batched
+	/// whenever a timestamp in it is queued again: after a consumer crash between its
+	/// inserts and its dequeue, and after an ingest that ran during a consumer run queues
+	/// its committed rows again (see [`UnbatchedEntry`]). With the same rows the rebuilt
+	/// batch is byte-identical; without this check it was queued, processed and turned
+	/// into a pattern occurrence a second time. The hash is the MD5 of the batch's
+	/// measurements, which include their timestamps, so two different windows never share
+	/// one, while a window rebuilt over changed rows (a gap filled since) gets a new hash
+	/// and is queued. Extracted batches are known by the hashes
+	/// [`remove_extracted_batches`](Inputs::remove_extracted_batches) recorded when it
+	/// deleted them. Every check is a point lookup on an `(aspect_id, batch_hash)` index,
+	/// the queued one first (`queue_batch_unless_known` says why the order matters).
 	///
-	/// Two residuals remain. The index is not unique (a hash can be `NULL`, and batches
-	/// stored before the dedupe may repeat), so two consumers racing on the same aspect can
-	/// still both insert a batch; the consumer runs once per aspect. And the dedupe sees
-	/// only batches still in one of the two tables: pattern extraction
-	/// (`build_patterns_queue`) deletes the processed batches it consumed, so if a consumer
-	/// crashes before its dequeue and its batches are then processed *and* extracted before
-	/// it re-runs, the re-run queues them again and they become duplicate occurrences.
-	/// `Pipeline::run` and `prepare_data` run the consumer before processing and extraction,
-	/// so a pipeline re-run after a crash never reaches that state.
+	/// The index is not unique (a hash can be `NULL`, and batches stored before the dedupe
+	/// may repeat), so two consumers racing on the same aspect can still both insert a
+	/// batch; the consumer runs once per aspect.
 	async fn insert_unprocessed_batch(&self, aspect_id: &AspectId, batch: &Batch) -> Result<TxId> {
 		let tx_id = TxId::new();
 		let db = self.get_unprocessed_batches_db(aspect_id).await?;
@@ -562,7 +630,10 @@ impl Inputs for Database {
 	///
 	/// Applies the same dedupe as [`insert_unprocessed_batch`](Self::insert_unprocessed_batch)
 	/// to every batch, which also drops repeats within `batches` (a repeat finds the first
-	/// one queued). Every input batch still gets a `TxId`, inserted or skipped.
+	/// one queued). Every input batch still gets a `TxId`, inserted or skipped. A full
+	/// rebuild stores through this, so it too skips the windows already extracted; a
+	/// rebuild meant to extract every window again clears the processed batches first
+	/// (`Pipeline::prepare_data_full_rebuild` does), which clears that record.
 	async fn batch_insert_unprocessed_batches(&self, aspect_id: &AspectId, batches: Vec<Batch>) -> Result<Vec<TxId>> {
 		let total = batches.len();
 		let mut tx_ids = Vec::with_capacity(total);
@@ -772,15 +843,53 @@ impl Inputs for Database {
 		Ok(())
 	}
 
-	/// clear all processed batches for a given aspect
+	/// Remove processed batches that pattern extraction consumed, recording each one's
+	/// `(aspect_id, batch_hash)` in `extracted_batches` in the same transaction
+	/// (crash-consistency design, S18).
+	async fn remove_extracted_batches(&self, aspect_id: &AspectId, batch_ids: &[BatchId]) -> Result<()> {
+		if batch_ids.is_empty() {
+			return Ok(());
+		}
+
+		let db = self.get_processed_batches_db(aspect_id).await?;
+		let db_path = self.get_processed_batches_db_path(aspect_id).await?;
+		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		let extracted_at = chrono::Utc::now().timestamp_millis();
+
+		let removed = async {
+			// Sub-chunks keep each statement under SQLite's variable limit.
+			for sub_chunk in batch_ids.chunks(500) {
+				let placeholders: Vec<&str> = (0..sub_chunk.len()).map(|_| "?").collect();
+				let placeholders = placeholders.join(", ");
+				let ids: Vec<String> = sub_chunk.iter().map(std::string::ToString::to_string).collect();
+				conn.as_ref().execute(&format!("INSERT INTO extracted_batches (aspect_id, batch_hash, extracted_at) SELECT aspect_id, batch_hash, {extracted_at} FROM batches WHERE batch_hash IS NOT NULL AND id IN ({placeholders})"), turso::params_from_iter(ids.clone())).await?;
+				conn.as_ref().execute(&format!("DELETE FROM batches WHERE id IN ({placeholders})"), turso::params_from_iter(ids)).await?;
+			}
+			Ok::<_, turso::Error>(())
+		}
+		.await;
+		if let Err(e) = removed {
+			let _ = Self::rollback_concurrent(&conn).await;
+			return Err(Error::DatabaseError(format!("Failed to remove extracted batches: {e}")).into());
+		}
+
+		Self::commit_concurrent(&conn).await
+	}
+
+	/// clear all processed batches for a given aspect, and the record of the batches
+	/// extraction consumed
 	async fn clear_processed_batches(&self, aspect_id: &AspectId) -> Result<TxId> {
 		let db = self.get_processed_batches_db(aspect_id).await?;
 		let db_path = self.get_processed_batches_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
 
-		let delete_sql = r"DELETE FROM batches";
-
-		let res = conn.as_ref().execute(delete_sql, turso::params![]).await;
+		// The extracted-batch record goes with the batches: a full rebuild clears them to
+		// batch, process and extract every window again, which the duplicate check would
+		// otherwise refuse for every window extracted before.
+		let mut res = conn.as_ref().execute(r"DELETE FROM batches", turso::params![]).await;
+		if res.is_ok() {
+			res = conn.as_ref().execute(r"DELETE FROM extracted_batches", turso::params![]).await;
+		}
 		match res {
 			Ok(_) => tracing::debug!("Cleared all processed batches for aspect {aspect_id}"),
 			Err(e) => {
@@ -1757,32 +1866,44 @@ impl Database {
 		batch.batch_hash().cloned().unwrap_or_else(|| format!("{:x}", md5::compute(measurements_json)))
 	}
 
-	/// Whether a batch with `batch_hash` is stored for `aspect_id` in the batches table
-	/// `conn` is open on: a point lookup on the `(aspect_id, batch_hash)` index, read in
-	/// `conn`'s open transaction if it has one, else in a statement of its own.
-	async fn batch_hash_exists(conn: &turso::Connection, aspect_id: &AspectId, batch_hash: &str) -> Result<bool> {
-		let mut rows = conn.query("SELECT 1 FROM batches WHERE aspect_id = ? AND batch_hash = ? LIMIT 1", turso::params![aspect_id.as_uuid().to_string(), batch_hash.to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to look up batch hash: {e}")))?;
-		Ok(rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to look up batch hash: {e}")))?.is_some())
+	/// Whether `table` (`batches` or `extracted_batches`, in the DB `conn` is open on)
+	/// holds `batch_hash` for `aspect_id`: a point lookup on its `(aspect_id, batch_hash)`
+	/// index, read in `conn`'s open transaction if it has one, else in a statement of its
+	/// own.
+	async fn batch_hash_recorded(conn: &turso::Connection, table: &'static str, aspect_id: &AspectId, batch_hash: &str) -> Result<bool> {
+		let mut rows = conn.query(&format!("SELECT 1 FROM {table} WHERE aspect_id = ? AND batch_hash = ? LIMIT 1"), turso::params![aspect_id.as_uuid().to_string(), batch_hash.to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to look up batch hash in {table}: {e}")))?;
+		Ok(rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to look up batch hash in {table}: {e}")))?.is_some())
+	}
+
+	/// Whether a batch with `batch_hash` is processed (in the processed batches) or was
+	/// extracted (recorded in `extracted_batches` when extraction deleted it), checked in
+	/// that order, each in a statement of its own on `processed`.
+	async fn processed_or_extracted(processed: &turso::Connection, aspect_id: &AspectId, batch_hash: &str) -> Result<Option<&'static str>> {
+		if Self::batch_hash_recorded(processed, "batches", aspect_id, batch_hash).await? {
+			return Ok(Some("processed"));
+		}
+		Ok(Self::batch_hash_recorded(processed, "extracted_batches", aspect_id, batch_hash).await?.then_some("extracted"))
 	}
 
 	/// Insert `batch` into the unprocessed batches (`db`) unless its
-	/// `(aspect_id, batch_hash)` is already queued there or processed (`processed`, a
-	/// connection to the processed batches with no open transaction), and return whether it
-	/// was inserted.
+	/// `(aspect_id, batch_hash)` is already queued there, processed, or extracted
+	/// (`processed`, a connection to the processed batches DB with no open transaction),
+	/// and return whether it was inserted.
 	///
-	/// The queued check runs first, inside the insert's transaction, and the processed check
-	/// after it, each as of when it runs. A batch processor moves a batch by inserting it
-	/// into the processed batches and only then deleting it here
-	/// (`move_batches_to_processed`), so a move that happens between the two checks is
-	/// still seen by one of them: if the first check missed the batch, the delete had
-	/// committed, so the insert it follows is visible to the second. Checking the processed
-	/// batches first missed such a batch in both.
+	/// The checks follow a batch's way through the tables, each as of when it runs: the
+	/// queued check first, inside the insert's transaction, then the processed batches,
+	/// then the extracted ones. A batch moves forward by being written to the next table
+	/// no later than it is deleted from the previous one (`move_batches_to_processed`
+	/// inserts the processed batch before it deletes the queued one;
+	/// `remove_extracted_batches` records the hash in the transaction that deletes the
+	/// processed batch), so a batch that moves between two checks is still seen by the
+	/// later one. Checking in any other order could miss a moving batch in every table.
 	async fn queue_batch_unless_known(&self, aspect_id: &AspectId, batch: &Batch, db: &turso::Database, db_path: &str, processed: &turso::Connection) -> Result<bool> {
 		let (measurements_json, batch_hash) = Self::batch_identity(batch)?;
 		let conn = Self::begin_concurrent(db, db_path, Some(self.cache.clone())).await?;
-		let known = match Self::batch_hash_exists(conn.as_ref(), aspect_id, &batch_hash).await {
+		let known = match Self::batch_hash_recorded(conn.as_ref(), "batches", aspect_id, &batch_hash).await {
 			Ok(true) => Ok(Some("queued")),
-			Ok(false) => Self::batch_hash_exists(processed, aspect_id, &batch_hash).await.map(|exists| exists.then_some("processed")),
+			Ok(false) => Self::processed_or_extracted(processed, aspect_id, &batch_hash).await,
 			Err(e) => Err(e),
 		};
 		match known {
@@ -1813,22 +1934,47 @@ impl Database {
 	///
 	/// It runs after the rows are committed, so like every post-commit step it is
 	/// best-effort and never fails the call (the client would retry it into duplicate
-	/// rows). A failure is retried, since the likely one, an MVCC write-write conflict with
-	/// a consumer dequeuing the same entry, is transient; if every attempt fails it is
-	/// logged, and the rows stay covered by the write-ahead entry unless a consumer
-	/// dequeued it during this call.
+	/// rows). An MVCC write-write conflict with a consumer dequeuing the same entries is
+	/// retried, as by [`enqueue_retrying`](Self::enqueue_retrying); a failure that outlasts
+	/// the retries is logged, and the rows stay covered by the write-ahead entry unless a
+	/// consumer dequeued it during this call.
 	async fn requeue_committed(&self, aspect_id: &AspectId, timestamps: &[chrono::DateTime<chrono::Utc>]) {
-		const ATTEMPTS: u32 = 5;
-		for attempt in 1..=ATTEMPTS {
-			match self.enqueue_unbatched_measurements(aspect_id, timestamps).await {
-				Ok(()) => return,
-				Err(e) if attempt < ATTEMPTS => {
-					tracing::debug!("Queuing {} committed timestamps of aspect {aspect_id} again failed (attempt {attempt} of {ATTEMPTS}), retrying: {e}", timestamps.len());
-					tokio::time::sleep(std::time::Duration::from_millis(10 << attempt)).await;
-				}
-				Err(e) => tracing::warn!("Could not queue {} committed timestamps of aspect {aspect_id} again; they stay queued unless a batch consumer ran during this ingest: {e}", timestamps.len()),
-			}
+		if let Err(e) = self.enqueue_retrying(aspect_id, timestamps).await {
+			tracing::warn!("Could not queue {} committed timestamps of aspect {aspect_id} again; they stay queued unless a batch consumer ran during this ingest: {e}", timestamps.len());
 		}
+	}
+
+	/// Enqueue `timestamps`, retrying an MVCC write-write conflict with another write to the
+	/// same queue entries (see [`QUEUE_WRITE_ATTEMPTS`]): a consumer's dequeue, or another
+	/// ingest queuing the same timestamps. The enqueue is an upsert, so unlike the
+	/// `INSERT OR IGNORE` it replaced it writes an entry that is already queued, and such a
+	/// conflict would otherwise fail the call. Retrying is safe: a failed attempt wrote
+	/// nothing.
+	async fn enqueue_retrying(&self, aspect_id: &AspectId, timestamps: &[chrono::DateTime<chrono::Utc>]) -> Result<()> {
+		retry_queue_write("Enqueuing unbatched measurements", || self.enqueue_unbatched_measurements(aspect_id, timestamps)).await
+	}
+
+	/// One transaction of [`dequeue_unbatched_entries`](Inputs::dequeue_unbatched_entries):
+	/// delete each of `entries` that still has the `queued_at` it was read with. A
+	/// conflict is returned as an [`Error::TransientMvccError`].
+	async fn dequeue_entry_chunk(&self, aspect_id: &AspectId, entries: &[UnbatchedEntry]) -> Result<()> {
+		let conn = Self::begin_concurrent(self.metadata(), self.metadata_path(), Some(self.cache.clone())).await?;
+		let aspect_id_str = aspect_id.as_uuid().to_string();
+
+		let deleted = async {
+			let mut delete = conn.as_ref().prepare("DELETE FROM unbatched_measurements WHERE aspect_id = ? AND data_timestamp = ? AND queued_at = ?").await?;
+			for entry in entries {
+				delete.execute(turso::params![aspect_id_str.clone(), entry.data_timestamp.timestamp_millis(), entry.queued_at]).await?;
+			}
+			Ok::<_, turso::Error>(())
+		}
+		.await;
+		if let Err(e) = deleted {
+			let _ = Self::rollback_concurrent(&conn).await;
+			return Err(queue_write_error("Failed to dequeue unbatched measurements", &e));
+		}
+
+		commit_queue_write(&conn, "Failed to dequeue unbatched measurements").await
 	}
 
 	/// INSERT one unprocessed batch row inside `conn`'s open transaction. On error the

@@ -1108,6 +1108,102 @@ async fn queuing_a_queued_or_processed_batch_again_stores_nothing() -> Result<()
 	Ok(())
 }
 
+/// **Regression (crash-consistency design, S18: the dedupe after extraction).** A batch
+/// that pattern extraction consumed is not queued again: `remove_extracted_batches`
+/// records its hash in the transaction that deletes it, and the queue's duplicate check
+/// looks there too. A batch removed with the plain `bulk_remove_processed_batches` is not
+/// recorded, and `clear_processed_batches` clears the record, so a full rebuild queues
+/// every window again. Before, a batch extraction had deleted was queued again, and
+/// extracted as a second occurrence of its window.
+#[tokio::test]
+#[serial]
+async fn queuing_an_extracted_batch_again_stores_nothing() -> Result<()> {
+	use futures::TryStreamExt;
+	use weftdb::{Batch, BatchId, BatchedMeasurement, Point};
+
+	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
+	let aspect_id = aspect.id();
+	let info = db.get_database_info().await?;
+	let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+	let batch = |start: i64| {
+		let points = (start..start + 5).map(|i| BatchedMeasurement::new(Point::new(base + Duration::minutes(i), BigDecimal::from((i * 7) % 11)))).collect();
+		Batch::new(5, points, Resolution::Minutes, aspect_id, info.clone())
+	};
+	let windows = || vec![batch(0), batch(1), batch(2)];
+	let queued = || db.count_unprocessed_batches(&aspect_id);
+
+	db.batch_insert_unprocessed_batches(&aspect_id, windows()).await?;
+	let mut stored: Vec<Batch> = db.get_unprocessed_batches(&aspect_id).await?.try_collect().await?;
+	let window = |start: i64| -> Result<BatchId> { Ok(*stored.iter().find(|stored| *stored.measurements()[0].get_measurement_timestamp() == base + Duration::minutes(start)).context("the window's batch")?.batch_id()) };
+	let (extracted, removed) = ([window(0)?, window(1)?], window(2)?);
+	for stored in &mut stored {
+		stored.process()?;
+	}
+	db.move_batches_to_processed(&aspect_id, &stored).await?;
+	db.remove_extracted_batches(&aspect_id, &extracted).await?;
+	db.bulk_remove_processed_batches(&aspect_id, &[removed]).await?;
+	assert_eq!((queued().await?, db.count_processed_batches(&aspect_id).await?), (0, 0), "precondition: every batch is gone from both tables");
+
+	db.batch_insert_unprocessed_batches(&aspect_id, windows()).await?;
+	db.insert_unprocessed_batch(&aspect_id, &batch(1)).await?;
+	assert_eq!(queued().await?, 1, "only the window removed without extraction is queued again");
+
+	// A full rebuild clears the batches, and with the processed ones the record.
+	db.clear_unprocessed_batches(&aspect_id).await?;
+	db.clear_processed_batches(&aspect_id).await?;
+	db.batch_insert_unprocessed_batches(&aspect_id, windows()).await?;
+	assert_eq!(queued().await?, 3, "after clear_processed_batches every window is queued again");
+	Ok(())
+}
+
+/// Queue writes retry an MVCC write-write conflict over the same entry (crash-consistency
+/// design, S18). The enqueue is an upsert, so it writes an entry that is already queued,
+/// and conflicts with a consumer's dequeue (or another ingest's enqueue) of the same
+/// timestamp. A held, uncommitted write stands in for the other side here:
+///
+/// - an ingest whose write-ahead enqueue meets a dequeue of its timestamp retries until
+///   the dequeue commits, instead of failing the call (one attempt fails);
+/// - a dequeue that meets an enqueue of an entry it read retries until the enqueue
+///   commits, and then leaves that entry queued, since it moved past what was read.
+#[tokio::test]
+#[serial]
+async fn queue_writes_retry_a_conflict_over_the_same_entry() -> Result<()> {
+	/// Commit the held transaction after a while, so that the other side meets it first.
+	async fn release_later(holder: &turso::Connection) -> Result<()> {
+		tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+		holder.execute("COMMIT", ()).await?;
+		Ok(())
+	}
+
+	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
+	let aspect_id = aspect.id();
+	let aspect_key = aspect_id.as_uuid().to_string();
+	let at = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+	db.enqueue_unbatched_measurement(&aspect_id, at).await?;
+	let holder = db.metadata().connect()?;
+
+	// A consumer's dequeue holds the entry while an ingest queues the same timestamp.
+	holder.execute("BEGIN CONCURRENT", ()).await?;
+	holder.execute("DELETE FROM unbatched_measurements WHERE aspect_id = ? AND data_timestamp = ?", (aspect_key.clone(), at.timestamp_millis())).await?;
+	let err = db.enqueue_unbatched_measurement(&aspect_id, at).await.expect_err("precondition: a single enqueue loses the conflict");
+	assert!(weftdb::error::is_transient_mvcc_error(&err), "a conflict is reported as transient: {err:#}");
+	let (row, dataset) = (InputMeasurement::new(at, BigDecimal::from(1)), DatasetId::new());
+	let (captured, released) = tokio::join!(db.capture_measurement(&aspect_id, &dataset, &row), release_later(&holder));
+	released?;
+	captured.context("the ingest retries its enqueue past the conflict")?;
+	assert_eq!(db.get_unbatched_measurements(&aspect_id).await?, vec![at], "the ingest's row is queued");
+
+	// An ingest's enqueue holds the entry while a consumer dequeues what it read.
+	let read = db.get_unbatched_entries(&aspect_id).await?;
+	holder.execute("BEGIN CONCURRENT", ()).await?;
+	holder.execute("UPDATE unbatched_measurements SET queued_at = queued_at + 1 WHERE aspect_id = ? AND data_timestamp = ?", (aspect_key, at.timestamp_millis())).await?;
+	let (dequeued, released) = tokio::join!(db.dequeue_unbatched_entries(&aspect_id, &read), release_later(&holder));
+	released?;
+	dequeued.context("the dequeue retries past the conflict")?;
+	assert_eq!(db.get_unbatched_measurements(&aspect_id).await?, vec![at], "the entry queued again during the dequeue stays queued");
+	Ok(())
+}
+
 /// A queue entry read by a consumer and queued again afterwards survives the consumer's
 /// dequeue (crash-consistency design, S18): enqueuing a queued timestamp moves its
 /// `queued_at` strictly forward, even within the same millisecond, and
@@ -1138,16 +1234,17 @@ async fn an_entry_queued_again_after_it_was_read_survives_the_dequeue() -> Resul
 	Ok(())
 }
 
-/// The batch tables carry the `(aspect_id, batch_hash)` index that the queue's duplicate
-/// check looks a batch up in (crash-consistency design, S18), so each check is a point
-/// lookup instead of a scan of every stored batch; and a batch table created before the
-/// index gets it the next time a process opens it.
+/// The batch tables, and the processed batches DB's record of the extracted ones, carry
+/// the `(aspect_id, batch_hash)` index that the queue's duplicate check looks a batch up
+/// in (crash-consistency design, S18), so each check is a point lookup instead of a scan
+/// of every stored batch; and a DB created before the index (or the record) gets it the
+/// next time a process opens it.
 #[tokio::test]
 #[serial]
 async fn the_batch_tables_index_their_hashes() -> Result<()> {
-	/// Turso's plan for the duplicate check's lookup in `batches`.
-	async fn lookup_plan(conn: &turso::Connection) -> Result<String> {
-		let mut rows = conn.query("EXPLAIN QUERY PLAN SELECT 1 FROM batches WHERE aspect_id = ? AND batch_hash = ? LIMIT 1", ("aspect", "hash")).await?;
+	/// Turso's plan for the duplicate check's lookup in `table`.
+	async fn lookup_plan(conn: &turso::Connection, table: &str) -> Result<String> {
+		let mut rows = conn.query(&format!("EXPLAIN QUERY PLAN SELECT 1 FROM {table} WHERE aspect_id = ? AND batch_hash = ? LIMIT 1"), ("aspect", "hash")).await?;
 		let mut plan = String::new();
 		while let Some(row) = rows.next().await? {
 			plan.push_str(&row.get::<String>(3)?);
@@ -1162,20 +1259,29 @@ async fn the_batch_tables_index_their_hashes() -> Result<()> {
 	for processed in [false, true] {
 		let batches = if processed { db.get_processed_batches_db(&aspect_id).await? } else { db.get_unprocessed_batches_db(&aspect_id).await? };
 		let conn = batches.connect()?;
-		let plan = lookup_plan(&conn).await?;
+		let plan = lookup_plan(&conn, "batches").await?;
 		assert!(plan.contains("idx_batches_hash"), "processed={processed}: the lookup does not use the hash index: {plan}");
 		// What a batch table created before the index looks like.
 		conn.execute("DROP INDEX idx_batches_hash", ()).await?;
-		assert!(!lookup_plan(&conn).await?.contains("idx_batches_hash"), "precondition: the index is gone");
+		assert!(!lookup_plan(&conn, "batches").await?.contains("idx_batches_hash"), "precondition: the index is gone");
 	}
+	// The processed batches DB also records the batches extraction consumed, indexed the
+	// same way; a DB created before that record gets it when it is next opened.
+	let conn = db.get_processed_batches_db(&aspect_id).await?.connect()?;
+	let plan = lookup_plan(&conn, "extracted_batches").await?;
+	assert!(plan.contains("idx_extracted_batches_hash"), "the extracted lookup does not use its hash index: {plan}");
+	conn.execute("DROP TABLE extracted_batches", ()).await?;
+	drop(conn);
 	release_database(db, &name).await;
 
 	let db = Database::existing(&name).await?;
 	for processed in [false, true] {
 		let batches = if processed { db.get_processed_batches_db(&aspect_id).await? } else { db.get_unprocessed_batches_db(&aspect_id).await? };
-		let plan = lookup_plan(&batches.connect()?).await?;
+		let plan = lookup_plan(&batches.connect()?, "batches").await?;
 		assert!(plan.contains("idx_batches_hash"), "processed={processed}: reopening did not add the hash index: {plan}");
 	}
+	let plan = lookup_plan(&db.get_processed_batches_db(&aspect_id).await?.connect()?, "extracted_batches").await?;
+	assert!(plan.contains("idx_extracted_batches_hash"), "reopening did not add the extracted batches and their index: {plan}");
 	release_database(db, &name).await;
 	Ok(())
 }

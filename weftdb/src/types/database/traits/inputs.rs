@@ -22,6 +22,13 @@ pub trait Inputs {
 	/// A timestamp that is already queued keeps its one entry, and the entry's `queued_at`
 	/// moves strictly forward, so a queue consumer that read the entry before this call
 	/// leaves it queued when it dequeues what it read (see [`UnbatchedEntry`]).
+	///
+	/// # Errors
+	///
+	/// Writing an entry that a concurrent transaction is also writing (another enqueue of
+	/// the same timestamp, or a consumer's dequeue) loses an MVCC write-write conflict,
+	/// returned as [`crate::Error::TransientMvccError`]: nothing was written, and a retry
+	/// can succeed. Ingest retries it.
 	async fn enqueue_unbatched_measurements(&self, aspect_id: &AspectId, data_timestamps: &[DateTime<Utc>]) -> Result<()>;
 
 	/// Dequeue unbatched measurements after they have been included in batches
@@ -37,6 +44,10 @@ pub trait Inputs {
 	/// and batched. Each entry is removed only while it is still queued under the
 	/// `queued_at` it was read with: one queued again since then stays queued for the
 	/// consumer's next run (crash-consistency design, S18).
+	///
+	/// The entries are removed in short transactions (at most 500 entries each), each
+	/// retried when it loses an MVCC conflict to an enqueue of the same timestamps. An
+	/// error leaves the earlier transactions committed and the rest of the entries queued.
 	async fn dequeue_unbatched_entries(&self, aspect_id: &AspectId, entries: &[UnbatchedEntry]) -> Result<()>;
 
 	/// Clear all unbatched measurements for an aspect
@@ -55,10 +66,11 @@ pub trait Inputs {
 	/// queued again once the row is committed. The first keeps the row queued if the call
 	/// dies after the commit; the second keeps a queue consumer that ran in between, and
 	/// read the timestamp before its row existed, from dequeuing it for good (a consumer
-	/// dequeues only the entries it read; see [`UnbatchedEntry`]). Everything after the
+	/// dequeues only the entries it read; see [`UnbatchedEntry`]). Both enqueues retry an
+	/// MVCC conflict with a concurrent write to the same queue entry. Everything after the
 	/// commit (queuing again, the checkpoint, the dirty-region marking, the transaction
-	/// log) is best-effort: a failure is logged and the call still returns `Ok`, since the row is
-	/// stored. Residuals until rows-mode aspects move to the segment store
+	/// log) is best-effort: a failure is logged and the call still returns `Ok`, since the
+	/// row is stored. Residuals until rows-mode aspects move to the segment store
 	/// (crash-consistency design, S19):
 	///
 	/// - **Duplicates on retry.** If the process dies after the commit, the row is stored
@@ -66,7 +78,12 @@ pub trait Inputs {
 	///   is no idempotency key in rows mode.
 	/// - **A consumer during the call, then a crash.** The row is left unqueued only if a
 	///   consumer ran during the call and the call then died, or could not queue the
-	///   timestamp again, between its commit and the second enqueue.
+	///   timestamp again within its retries, between its commit and the second enqueue.
+	///
+	/// A consumer that reads the timestamp during the call batches the windows around it
+	/// as they are before or after the row: the first as earlier runs batched them, the
+	/// second as the next run rebuilds them, so the batch dedupe (see
+	/// [`insert_unprocessed_batch`](Self::insert_unprocessed_batch)) skips the repeat.
 	async fn capture_measurement(&self, aspect_id: &AspectId, dataset_id: &DatasetId, input_measurement: &InputMeasurement) -> Result<TxId>;
 
 	/// Capture new measurements for a given aspect
@@ -85,8 +102,12 @@ pub trait Inputs {
 	/// call that fails or dies midway queued; the second enqueue keeps a queue consumer
 	/// that ran during the call, and read timestamps before their rows existed, from
 	/// dequeuing them for good (a consumer dequeues only the entries it read; see
-	/// [`UnbatchedEntry`]). Residuals until rows-mode aspects move to the segment store
-	/// (crash-consistency design, S19):
+	/// [`UnbatchedEntry`]). Both enqueues retry an MVCC conflict with a concurrent write to
+	/// the same queue entries (a consumer's dequeue, or another ingest of the same
+	/// timestamps). A consumer that batched windows from rows already committed rebuilds
+	/// them after the second enqueue into identical batches, which the batch dedupe skips,
+	/// whether they are still queued, processed, or already extracted. Residuals until
+	/// rows-mode aspects move to the segment store (crash-consistency design, S19):
 	///
 	/// - **Partial prefix.** An error or crash mid-call leaves the chunks committed before
 	///   it stored, although the call does not return `Ok`.
@@ -94,7 +115,15 @@ pub trait Inputs {
 	///   one whose `Ok` was lost, stores the already committed rows a second time.
 	/// - **A consumer during the call, then a crash.** A chunk's rows are left unqueued
 	///   only if a consumer ran during the call and the call then died, or could not queue
-	///   them again, between the chunk's commit and its second enqueue.
+	///   them again within its retries, between the chunk's commit and its second enqueue.
+	/// - **A consumer between two chunks of a backfill or gap fill.** A consumer run
+	///   between two chunks of a call whose rows lie inside the stored range (or before
+	///   it, with chunks still to come between the committed ones and the stored rows)
+	///   batches the windows that span committed rows and rows still to come with the
+	///   latter interpolated, and the next run batches those windows again with all their
+	///   rows: two different batches, and occurrences, for one window, both kept by the
+	///   dedupe. Past the stored range a window short of points is not batched, so an
+	///   append is not affected.
 	///
 	/// A queued timestamp whose row never lands is handled by the consumer like any other:
 	/// inside the stored range its windows are built from the interpolated series, as a
@@ -124,14 +153,17 @@ pub trait Inputs {
 
 	/// insert unprocessed batch for a given aspect
 	///
-	/// A batch whose `(aspect_id, batch_hash)` is already queued or already processed is
-	/// skipped, and the call still returns `Ok`, so a queue consumer that crashed before it
-	/// dequeued its timestamps can re-run without queuing its batches twice.
+	/// A batch whose `(aspect_id, batch_hash)` is already queued, processed, or extracted
+	/// (see [`remove_extracted_batches`](Self::remove_extracted_batches)) is skipped, and
+	/// the call still returns `Ok`. So a queue consumer that rebuilds windows it already
+	/// batched (after a crash before its dequeue, or once an ingest that ran during it
+	/// queues its rows again) stores no second copy, and extraction yields no second
+	/// occurrence of the same window.
 	async fn insert_unprocessed_batch(&self, aspect_id: &AspectId, batch: &Batch) -> Result<TxId>;
 
 	/// Capture multiple unprocessed batches for a given aspect, skipping, as
 	/// [`insert_unprocessed_batch`](Self::insert_unprocessed_batch) does, every batch that
-	/// is already queued or processed (and repeats within `batches`).
+	/// is already queued, processed, or extracted (and repeats within `batches`).
 	async fn batch_insert_unprocessed_batches(&self, aspect_id: &AspectId, batches: Vec<Batch>) -> Result<Vec<TxId>>;
 
 	// Capture a chunk of batches - works for both processed and unprocessed batches
@@ -167,9 +199,29 @@ pub trait Inputs {
 	async fn remove_processed_batch(&self, aspect_id: &AspectId, batch_id: &BatchId) -> Result<TxId>;
 
 	/// Bulk remove processed batches for a given aspect (single transaction)
+	///
+	/// A plain delete: the queue consumer may queue a removed batch again. Pattern
+	/// extraction removes the batches it consumed with
+	/// [`remove_extracted_batches`](Self::remove_extracted_batches) instead.
 	async fn bulk_remove_processed_batches(&self, aspect_id: &AspectId, batch_ids: &[BatchId]) -> Result<()>;
 
+	/// Remove processed batches that pattern extraction consumed, in one transaction that
+	/// also records each one's `(aspect_id, batch_hash)` in the processed batches DB
+	/// (`extracted_batches`), so that
+	/// [`insert_unprocessed_batch`](Self::insert_unprocessed_batch) never queues the same
+	/// batch again (crash-consistency design, S18). Without the record, a window the
+	/// consumer rebuilt after its batch was extracted (after a consumer crash, or an ingest
+	/// that ran during a consumer run) was extracted again, as a second occurrence of the
+	/// same span. The record is one small row per batch, kept until
+	/// [`clear_processed_batches`](Self::clear_processed_batches).
+	async fn remove_extracted_batches(&self, aspect_id: &AspectId, batch_ids: &[BatchId]) -> Result<()>;
+
 	/// clear all processed batches for a given aspect
+	///
+	/// This also clears the record of the batches extraction consumed (see
+	/// [`remove_extracted_batches`](Self::remove_extracted_batches)), so that a full
+	/// rebuild, which clears the batches to batch and extract every window again, is not
+	/// refused by the batch dedupe.
 	async fn clear_processed_batches(&self, aspect_id: &AspectId) -> Result<TxId>;
 
 	/// cleanup processed batches older than the specified timestamp for a given aspect
