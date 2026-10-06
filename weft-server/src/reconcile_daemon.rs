@@ -15,6 +15,13 @@
 //! how often the daemon fires and how much it rewrites and tune the threshold and
 //! interval against it.
 //!
+//! **Sweep isolation (crash-consistency S4).** The store-wide sweeps visit every
+//! aspect and return the ones that failed in their `failed` list instead of stopping at
+//! the first error, so one torn frame no longer stalls maintenance of every aspect after
+//! it in name order. Each tick logs one `WARN` line per failed aspect (naming the sweep
+//! kind, the aspect and the full error chain) and counts it in
+//! `weft_reconcile_failed_passes_total`; the healthy aspects are maintained as usual.
+//!
 //! The daemon holds only `Arc` handles (the store and the metrics registry), so it
 //! is a detached side task; the router and its handlers are untouched.
 
@@ -24,6 +31,29 @@ use tracing::Instrument as _;
 use weftdb::{HotColdSweep, OverlapSweep, ReconcileSweep, SegmentStore, SquashSweep};
 
 use crate::metrics::SharedMetrics;
+
+/// Log and count the aspects a store-wide sweep could not maintain.
+///
+/// The sweeps record a failing aspect and move on (crash-consistency S4), so a failure
+/// no longer surfaces as the tick's `Err`. Without this, an aspect that fails on every
+/// tick (a truncated frame, say) would be skipped silently forever. Each failure is
+/// logged as exactly one `WARN` line inside the tick's span, carrying the sweep kind, the
+/// aspect and the error with its full cause chain, and the count is added to
+/// `weft_reconcile_failed_passes_total`. A sweep with no failures logs nothing and
+/// leaves the counter unchanged.
+fn report_sweep_failures(span: &tracing::Span, metrics: &SharedMetrics, kind: &'static str, failed: &[(String, anyhow::Error)]) {
+	span.record("failed", failed.len());
+	if failed.is_empty() {
+		return;
+	}
+	span.in_scope(|| {
+		for (aspect, err) in failed {
+			let error = format!("{err:#}");
+			tracing::warn!(sweep = kind, aspect = %aspect, error = %error, "reconcile daemon: aspect pass failed; the sweep skipped it and continued");
+		}
+	});
+	metrics.record_reconcile_failures(u64::try_from(failed.len()).unwrap_or(u64::MAX));
+}
 
 /// Configuration for the background reconcile daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,19 +108,23 @@ pub struct ReconcileDaemonConfig {
 /// waiting on a real interval. Records nothing when the sweep reconciled nothing, so
 /// a quiet tick leaves the `weft_reconcile_*` counters unchanged.
 ///
+/// An aspect whose pass failed (a segment read or re-seal failure) is skipped by the
+/// sweep, logged as one `WARN` line and counted in `weft_reconcile_failed_passes_total`;
+/// it is also returned in [`ReconcileSweep::failed`](weftdb::ReconcileSweep::failed).
+///
 /// # Errors
 ///
-/// Propagates a failure from
-/// [`SegmentStore::reconcile_all_over_threshold`](weftdb::SegmentStore::reconcile_all_over_threshold)
-/// (a control-plane read, a segment read, or a re-seal failure).
+/// Propagates a failure to list the store's aspects from
+/// [`SegmentStore::reconcile_all_over_threshold`](weftdb::SegmentStore::reconcile_all_over_threshold).
 pub async fn reconcile_tick(store: &SegmentStore, metrics: &SharedMetrics, threshold: usize) -> anyhow::Result<ReconcileSweep> {
-	let span = tracing::info_span!("reconcile.tick", kind = "threshold", threshold, aspects = tracing::field::Empty, segments = tracing::field::Empty);
+	let span = tracing::info_span!("reconcile.tick", kind = "threshold", threshold, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty);
 	let sweep = store.reconcile_all_over_threshold(threshold).instrument(span.clone()).await?;
 	span.record("aspects", sweep.aspects_reconciled);
 	span.record("segments", sweep.segments_reconciled);
 	if sweep.aspects_reconciled > 0 {
 		metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_reconciled).unwrap_or(u64::MAX));
 	}
+	report_sweep_failures(&span, metrics, "threshold", &sweep.failed);
 	Ok(sweep)
 }
 
@@ -103,21 +137,22 @@ pub async fn reconcile_tick(store: &SegmentStore, metrics: &SharedMetrics, thres
 /// segments in `metrics`, and returns the [`HotColdSweep`] summary.
 ///
 /// As with [`reconcile_tick`], a sweep that reconciled nothing records nothing, so a
-/// quiet tick leaves the `weft_reconcile_*` counters unchanged.
+/// quiet tick leaves the `weft_reconcile_*` counters unchanged, and a failed aspect is
+/// skipped, logged as one `WARN` line and counted in `weft_reconcile_failed_passes_total`.
 ///
 /// # Errors
 ///
-/// Propagates a failure from
-/// [`SegmentStore::reconcile_all_hot_cold`](weftdb::SegmentStore::reconcile_all_hot_cold)
-/// (a control-plane read, a segment read, or a re-seal failure).
+/// Propagates a failure to list the store's aspects from
+/// [`SegmentStore::reconcile_all_hot_cold`](weftdb::SegmentStore::reconcile_all_hot_cold).
 pub async fn reconcile_tick_hot_cold(store: &SegmentStore, metrics: &SharedMetrics, threshold: usize) -> anyhow::Result<HotColdSweep> {
-	let span = tracing::info_span!("reconcile.tick", kind = "hot_cold", threshold, aspects = tracing::field::Empty, segments = tracing::field::Empty);
+	let span = tracing::info_span!("reconcile.tick", kind = "hot_cold", threshold, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty);
 	let sweep = store.reconcile_all_hot_cold(threshold).instrument(span.clone()).await?;
 	span.record("aspects", sweep.aspects_reconciled);
 	span.record("segments", sweep.segments_reconciled());
 	if sweep.aspects_reconciled > 0 {
 		metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_reconciled()).unwrap_or(u64::MAX));
 	}
+	report_sweep_failures(&span, metrics, "hot_cold", &sweep.failed);
 	Ok(sweep)
 }
 
@@ -128,21 +163,22 @@ pub async fn reconcile_tick_hot_cold(store: &SegmentStore, metrics: &SharedMetri
 /// merging each aspect's time-overlap groups into single segments. Records the
 /// reconciled aspects and total segments removed in `metrics` (a merge is a pass,
 /// exactly like an intra-segment reconcile), and returns the [`OverlapSweep`]. A sweep
-/// that merged nothing records nothing.
+/// that merged nothing records nothing. A failed aspect is skipped, logged as one `WARN`
+/// line and counted in `weft_reconcile_failed_passes_total`.
 ///
 /// # Errors
 ///
-/// Propagates a failure from
-/// [`SegmentStore::reconcile_all_overlaps`](weftdb::SegmentStore::reconcile_all_overlaps)
-/// (a control-plane read, a segment read/write, or a re-seal failure).
+/// Propagates a failure to list the store's aspects from
+/// [`SegmentStore::reconcile_all_overlaps`](weftdb::SegmentStore::reconcile_all_overlaps).
 pub async fn reconcile_tick_overlaps(store: &SegmentStore, metrics: &SharedMetrics) -> anyhow::Result<OverlapSweep> {
-	let span = tracing::info_span!("reconcile.tick", kind = "overlaps", aspects = tracing::field::Empty, segments = tracing::field::Empty);
+	let span = tracing::info_span!("reconcile.tick", kind = "overlaps", aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty);
 	let sweep = store.reconcile_all_overlaps().instrument(span.clone()).await?;
 	span.record("aspects", sweep.aspects_reconciled);
 	span.record("segments", sweep.segments_removed);
 	if sweep.aspects_reconciled > 0 {
 		metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_removed).unwrap_or(u64::MAX));
 	}
+	report_sweep_failures(&span, metrics, "overlaps", &sweep.failed);
 	Ok(sweep)
 }
 
@@ -158,16 +194,17 @@ pub async fn reconcile_tick_overlaps(store: &SegmentStore, metrics: &SharedMetri
 ///
 /// # Errors
 ///
-/// Propagates a failure from
+/// Propagates a failure to list the store's aspects from
 /// [`SegmentStore::reconcile_all_overlaps_with_policy`](weftdb::SegmentStore::reconcile_all_overlaps_with_policy).
 pub async fn reconcile_tick_overlaps_with_policy(store: &SegmentStore, metrics: &SharedMetrics, min_split_bytes: u64) -> anyhow::Result<OverlapSweep> {
-	let span = tracing::info_span!("reconcile.tick", kind = "overlaps_split", min_split_bytes, aspects = tracing::field::Empty, segments = tracing::field::Empty);
+	let span = tracing::info_span!("reconcile.tick", kind = "overlaps_split", min_split_bytes, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty);
 	let sweep = store.reconcile_all_overlaps_with_policy(weft_physical_type::SplitPolicy::new(min_split_bytes)).instrument(span.clone()).await?;
 	span.record("aspects", sweep.aspects_reconciled);
 	span.record("segments", sweep.segments_removed);
 	if sweep.aspects_reconciled > 0 {
 		metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_removed).unwrap_or(u64::MAX));
 	}
+	report_sweep_failures(&span, metrics, "overlaps_split", &sweep.failed);
 	Ok(sweep)
 }
 
@@ -180,20 +217,22 @@ pub async fn reconcile_tick_overlaps_with_policy(store: &SegmentStore, metrics: 
 /// the bound on the fragmentation repeated split carve-offs create. Records the
 /// squashed aspects and removed segments in `metrics` (a squash is a pass, like a
 /// reconcile), and returns the [`SquashSweep`]. A sweep that squashed nothing records
-/// nothing.
+/// nothing. A failed aspect is skipped, logged as one `WARN` line and counted in
+/// `weft_reconcile_failed_passes_total`.
 ///
 /// # Errors
 ///
-/// Propagates a failure from
+/// Propagates a failure to list the store's aspects from
 /// [`SegmentStore::squash_all_over_threshold`](weftdb::SegmentStore::squash_all_over_threshold).
 pub async fn reconcile_tick_squash(store: &SegmentStore, metrics: &SharedMetrics, max_segments: usize) -> anyhow::Result<SquashSweep> {
-	let span = tracing::info_span!("reconcile.tick", kind = "squash", max_segments, aspects = tracing::field::Empty, segments = tracing::field::Empty);
+	let span = tracing::info_span!("reconcile.tick", kind = "squash", max_segments, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty);
 	let sweep = store.squash_all_over_threshold(max_segments).instrument(span.clone()).await?;
 	span.record("aspects", sweep.aspects_squashed);
 	span.record("segments", sweep.segments_removed);
 	if sweep.aspects_squashed > 0 {
 		metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_squashed).unwrap_or(u64::MAX), u64::try_from(sweep.segments_removed).unwrap_or(u64::MAX));
 	}
+	report_sweep_failures(&span, metrics, "squash", &sweep.failed);
 	Ok(sweep)
 }
 
@@ -207,14 +246,15 @@ pub async fn reconcile_tick_squash(store: &SegmentStore, metrics: &SharedMetrics
 /// (one giant segment reads slower than several mid-sized ones, so [`reconcile_tick_squash`]'s
 /// fold-to-one over-corrects). Records the compacted aspects and removed segments in `metrics`
 /// (a compaction is a pass, like a squash), and returns the [`SquashSweep`]. A sweep that
-/// coalesced nothing records nothing.
+/// coalesced nothing records nothing. A failed aspect is skipped, logged as one `WARN`
+/// line and counted in `weft_reconcile_failed_passes_total`.
 ///
 /// # Errors
 ///
-/// Propagates a failure from
+/// Propagates a failure to list the store's aspects from
 /// [`SegmentStore::squash_all_to_target_rows_if_fragmented`](weftdb::SegmentStore::squash_all_to_target_rows_if_fragmented).
 pub async fn reconcile_tick_compact(store: &SegmentStore, metrics: &SharedMetrics, target_rows: usize) -> anyhow::Result<SquashSweep> {
-	let span = tracing::info_span!("reconcile.tick", kind = "compact", target_rows, aspects = tracing::field::Empty, segments = tracing::field::Empty);
+	let span = tracing::info_span!("reconcile.tick", kind = "compact", target_rows, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty);
 	// The gated sweep: a converged aspect costs one O(1) rollup read per tick, not a full
 	// segment-index scan, so the 1s daemon does not churn the control plane on a tidy store.
 	let sweep = store.squash_all_to_target_rows_if_fragmented(target_rows).instrument(span.clone()).await?;
@@ -223,6 +263,7 @@ pub async fn reconcile_tick_compact(store: &SegmentStore, metrics: &SharedMetric
 	if sweep.aspects_squashed > 0 {
 		metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_squashed).unwrap_or(u64::MAX), u64::try_from(sweep.segments_removed).unwrap_or(u64::MAX));
 	}
+	report_sweep_failures(&span, metrics, "compact", &sweep.failed);
 	Ok(sweep)
 }
 
@@ -233,8 +274,11 @@ pub async fn reconcile_tick_compact(store: &SegmentStore, metrics: &SharedMetric
 ///
 /// The first sweep fires one interval after start (the immediate `interval` tick is
 /// consumed first), so start-up is not stampeded by an eager pass. Each sweep that
-/// reconciles at least one aspect logs a one-line summary; a sweep failure is logged
-/// and the loop continues (a transient control-plane error must not kill the daemon).
+/// reconciles at least one aspect logs a one-line summary. An aspect whose pass fails is
+/// logged by the tick (one `WARN` line per aspect) while the sweep carries on with the
+/// remaining aspects; a whole-sweep failure (the aspect list itself unreadable) is
+/// logged and the loop continues (a transient control-plane error must not kill the
+/// daemon).
 #[must_use]
 pub fn spawn_reconcile_daemon(store: Arc<SegmentStore>, metrics: SharedMetrics, config: ReconcileDaemonConfig) -> tokio::task::JoinHandle<()> {
 	tokio::spawn(async move {
@@ -492,5 +536,120 @@ mod tests {
 		drop(store);
 		assert_eq!(quiet.aspects_squashed, 0);
 		assert_eq!(snap2.reconcile.passes, 1, "the quiet compaction tick did not bump the pass counter");
+	}
+
+	/// A `tracing` writer that appends every formatted line to a shared buffer, so a test
+	/// can count exactly what a tick logged.
+	#[derive(Clone, Default)]
+	struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+	impl std::io::Write for CapturedLog {
+		fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+			self.0.lock().expect("log buffer").extend_from_slice(buf);
+			Ok(buf.len())
+		}
+
+		fn flush(&mut self) -> std::io::Result<()> {
+			Ok(())
+		}
+	}
+
+	impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+		type Writer = Self;
+
+		fn make_writer(&'a self) -> Self::Writer {
+			self.clone()
+		}
+	}
+
+	impl CapturedLog {
+		/// A `fmt` subscriber at `INFO` (the daemon's default filter) writing into this log.
+		fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
+			tracing_subscriber::fmt().with_writer(self.clone()).with_ansi(false).with_max_level(tracing::Level::INFO).finish()
+		}
+
+		/// The captured lines logged at `WARN` or `ERROR`.
+		fn failure_lines(&self) -> Vec<String> {
+			let bytes = self.0.lock().expect("log buffer").clone();
+			String::from_utf8(bytes).expect("utf-8 log").lines().filter(|line| line.contains("WARN") || line.contains("ERROR")).map(str::to_owned).collect()
+		}
+	}
+
+	/// The crash-consistency S4 fixture: six aspects (`s1`..`s6`, name order), each with
+	/// three internally out-of-order, transitively time-overlapping 3-row segments so every
+	/// tick kind has work on every aspect, and `s2`'s lowest-id frame cut to half its length
+	/// so any pass that decodes it fails on that aspect.
+	async fn sweep_isolation_fixture(dir: &std::path::Path) -> SegmentStore {
+		let store = SegmentStore::open(dir).await.unwrap();
+		for aspect in ["s1", "s2", "s3", "s4", "s5", "s6"] {
+			store.declare(aspect, &schema()).await.unwrap();
+			let first = store.seal(aspect, &schema(), &[100_i64, 130, 110], &[bd("1"), bd("3"), bd("2")]).await.unwrap();
+			store.seal(aspect, &schema(), &[120_i64, 150, 125], &[bd("4"), bd("6"), bd("5")]).await.unwrap();
+			store.seal(aspect, &schema(), &[140_i64, 170, 145], &[bd("7"), bd("9"), bd("8")]).await.unwrap();
+			if aspect == "s2" {
+				let file = std::fs::OpenOptions::new().write(true).open(&first.path).unwrap();
+				let len = file.metadata().unwrap().len();
+				file.set_len(len / 2).unwrap();
+			}
+		}
+		store
+	}
+
+	/// Crash-consistency S4: a tick over a store with one truncated frame logs exactly one
+	/// failure line (naming the bad aspect), counts it once in
+	/// `weft_reconcile_failed_passes_total`, and still reconciles the five healthy aspects.
+	#[tokio::test]
+	async fn tick_logs_one_line_per_failed_aspect_and_maintains_the_rest() {
+		let dir = TempDir::new().unwrap();
+		let store = sweep_isolation_fixture(dir.path()).await;
+		let metrics: SharedMetrics = Arc::new(Metrics::default());
+		let log = CapturedLog::default();
+		let guard = tracing::subscriber::set_default(log.subscriber());
+		let sweep = reconcile_tick(&store, &metrics, 1).await.expect("a bad aspect does not fail the tick");
+		drop(guard);
+		let s6_unsorted = store.aspect_stats("s6").await.unwrap().unsorted_segments;
+		drop(store);
+		let lines = log.failure_lines();
+		let snap = metrics.snapshot();
+		assert_eq!(lines.len(), 1, "exactly one failure line: {lines:#?}");
+		assert!(lines[0].contains("aspect=s2"), "the line names the bad aspect: {}", lines[0]);
+		assert!(lines[0].contains("sweep=\"threshold\""), "the line names the sweep kind: {}", lines[0]);
+		assert!(lines[0].contains("s2-0.weftseg"), "the line carries the error chain down to the frame: {}", lines[0]);
+		assert_eq!(sweep.aspects_reconciled, 5, "every healthy aspect is reconciled");
+		assert_eq!(sweep.failed.len(), 1);
+		assert_eq!(s6_unsorted, 0, "the last aspect in name order is still reached");
+		assert_eq!(snap.reconcile.failed_passes, 1, "one failed aspect pass counted");
+		assert_eq!(snap.reconcile.passes, 5, "the healthy aspects still count as passes");
+	}
+
+	/// Crash-consistency S4: every tick kind the daemon runs isolates the bad aspect the
+	/// same way: one failure line, one counted failed pass, five healthy aspects maintained.
+	#[tokio::test]
+	async fn every_tick_kind_isolates_a_truncated_frame() {
+		for kind in ["threshold", "hot_cold", "overlaps", "overlaps_split", "squash", "compact"] {
+			let dir = TempDir::new().unwrap();
+			let store = sweep_isolation_fixture(dir.path()).await;
+			let metrics: SharedMetrics = Arc::new(Metrics::default());
+			let log = CapturedLog::default();
+			let guard = tracing::subscriber::set_default(log.subscriber());
+			let (maintained, failed) = match kind {
+				"threshold" => reconcile_tick(&store, &metrics, 1).await.map(|s| (s.aspects_reconciled, s.failed.len())),
+				"hot_cold" => reconcile_tick_hot_cold(&store, &metrics, 1).await.map(|s| (s.aspects_reconciled, s.failed.len())),
+				"overlaps" => reconcile_tick_overlaps(&store, &metrics).await.map(|s| (s.aspects_reconciled, s.failed.len())),
+				"overlaps_split" => reconcile_tick_overlaps_with_policy(&store, &metrics, 1).await.map(|s| (s.aspects_reconciled, s.failed.len())),
+				"squash" => reconcile_tick_squash(&store, &metrics, 2).await.map(|s| (s.aspects_squashed, s.failed.len())),
+				"compact" => reconcile_tick_compact(&store, &metrics, 6).await.map(|s| (s.aspects_squashed, s.failed.len())),
+				_ => unreachable!("unknown tick kind {kind}"),
+			}
+			.unwrap_or_else(|err| panic!("{kind}: a bad aspect failed the whole tick: {err:#}"));
+			drop(guard);
+			drop(store);
+			let lines = log.failure_lines();
+			assert_eq!(lines.len(), 1, "{kind}: exactly one failure line: {lines:#?}");
+			assert!(lines[0].contains("aspect=s2"), "{kind}: the line names the bad aspect: {}", lines[0]);
+			assert_eq!(maintained, 5, "{kind}: every healthy aspect is maintained");
+			assert_eq!(failed, 1, "{kind}: only the bad aspect fails");
+			assert_eq!(metrics.snapshot().reconcile.failed_passes, 1, "{kind}: one failed aspect pass counted");
+		}
 	}
 }
