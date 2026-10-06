@@ -232,7 +232,9 @@ pub struct InterpolateRequest {
 /// Response body for `POST /api/v1/interpolate`.
 #[derive(Debug, Clone, Serialize)]
 pub struct InterpolateResponse {
-	/// Spline method actually used (`Display` form).
+	/// Spline method actually used (`Display` form): the requested one, or the simpler
+	/// one splimes stepped down to because there were too few distinct input timestamps
+	/// (e.g. `Quadratic` when `cubic` was asked for with three).
 	pub spline: String,
 	/// Output-grid resolution actually used.
 	pub resolution: String,
@@ -369,7 +371,6 @@ async fn run_interpolation(points: Vec<Point>, start: DateTime<Utc>, end: DateTi
 		return Err(ApiError::bad_request("`end` must not be before `start`"));
 	}
 
-	let spline_label = spline.to_string();
 	let resolution_label = format!("{resolution:?}");
 
 	// `interpolate.compute` child span (roadmap Phase 3): the spline engine kernel
@@ -384,7 +385,9 @@ async fn run_interpolation(points: Vec<Point>, start: DateTime<Utc>, end: DateTi
 	let points: Vec<OutputPoint> = tracing::info_span!("interpolate.serialize", output_points = output.len()).in_scope(|| output.iter().map(|(timestamp, value, kind)| OutputPoint { timestamp, value: value.to_f64().unwrap_or_default(), kind }).collect());
 
 	tracing::Span::current().record("output_points", points.len());
-	Ok(Json(InterpolateResponse { spline: spline_label, resolution: resolution_label, output_points: points.len(), input_points, points }))
+	// The method splimes ran, which is simpler than the requested one when there were
+	// too few distinct input timestamps for it.
+	Ok(Json(InterpolateResponse { spline: output.spline().to_string(), resolution: resolution_label, output_points: points.len(), input_points, points }))
 }
 
 /// Render an [`InterpolateResponse`] as a `timestamp,value,kind` CSV document.
@@ -540,7 +543,8 @@ pub struct PointRequest {
 /// Response body for `POST /api/v1/interpolate/point`.
 #[derive(Debug, Clone, Serialize)]
 pub struct PointResponse {
-	/// Spline method actually used (`Display` form).
+	/// Spline method actually used (`Display` form): the requested one, or the simpler
+	/// one splimes stepped down to because there were too few distinct input timestamps.
 	pub spline: String,
 	/// The instant evaluated, echoed back.
 	pub instant: DateTime<Utc>,
@@ -584,7 +588,6 @@ async fn interpolate_point_inner(request: PointRequest, config: InterpolateConfi
 	}
 
 	let spline: Spline = spline.into();
-	let spline_label = spline.to_string();
 
 	// Evaluate the fitted spline at the single instant: a grid with `start == end` is
 	// exactly that one instant, and splimes labels it raw / interpolated / extrapolated
@@ -593,7 +596,8 @@ async fn interpolate_point_inner(request: PointRequest, config: InterpolateConfi
 	let output = config.interpolator(spline, Resolution::Nanoseconds).run_async(points, instant, instant).await.map_err(|err| ApiError::from_engine(&err, config))?;
 	let (_, value, kind) = output.iter().next().ok_or_else(|| ApiError::internal("interpolation produced no value at the instant"))?;
 
-	Ok(Json(PointResponse { spline: spline_label, instant, input_points: input.len(), value: value.to_f64().unwrap_or_default(), kind }))
+	// The method splimes ran, which may be simpler than the requested one.
+	Ok(Json(PointResponse { spline: output.spline().to_string(), instant, input_points: input.len(), value: value.to_f64().unwrap_or_default(), kind }))
 }
 
 /// Query parameters for the ILP interpolation endpoint.
@@ -845,16 +849,45 @@ mod tests {
 
 	#[tokio::test]
 	async fn default_spline_is_cubic() {
+		// Four points: the fewest a cubic needs, so it is the method that runs.
 		let body = serde_json::json!({
 			"points": [
 				{ "timestamp": ts(0), "value": 1.0 },
 				{ "timestamp": ts(120), "value": 2.0 },
 				{ "timestamp": ts(240), "value": 1.5 },
+				{ "timestamp": ts(360), "value": 1.0 },
 			],
 		});
 		let (status, body) = post_json("/api/v1/interpolate", body).await;
 		assert_eq!(status, StatusCode::OK, "body: {body}");
 		assert_eq!(body["spline"], "Cubic");
+	}
+
+	#[tokio::test]
+	async fn too_few_points_report_the_method_splimes_stepped_down_to() {
+		// `spline` is the method actually used. Cubic needs four distinct timestamps, so
+		// with three splimes runs a quadratic, and the response says so (it used to echo
+		// the requested `Cubic`).
+		let three = serde_json::json!([
+			{ "timestamp": ts(0), "value": 1.0 },
+			{ "timestamp": ts(60), "value": 2.0 },
+			{ "timestamp": ts(120), "value": 1.5 },
+		]);
+		let (status, body) = post_json("/api/v1/interpolate", serde_json::json!({ "spline": "cubic", "points": three })).await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["spline"], "Quadratic");
+		// The point query reports it the same way.
+		let (status, body) = post_json("/api/v1/interpolate/point", serde_json::json!({ "spline": "cubic", "instant": ts(30), "points": three })).await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["spline"], "Quadratic");
+		// A polynomial steps down to degree n - 1, keeping its bounds factor.
+		let (status, body) = post_json("/api/v1/interpolate", serde_json::json!({ "spline": { "polynomial": { "degree": 5, "bounds_factor": 1.5 } }, "points": three })).await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["spline"], "Polynomial(degree: 2, bounds_factor: 1.5)");
+		// The ILP JSON response too: a cubic over two rows is linear.
+		let (status, body) = post_text("/api/v1/interpolate/ilp?field=load&precision=s&spline=cubic&resolution=seconds", "cpu load=0 0\ncpu load=60 60\n").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["spline"], "Linear");
 	}
 
 	#[tokio::test]
@@ -923,8 +956,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn ilp_endpoint_spline_takes_precedence_over_the_alias() {
-		// When both are given, the canonical `spline` wins over `interpolation`.
-		let payload = "cpu,host=a load=0 1000000000\ncpu,host=a load=60 1000000060\n";
+		// When both are given, the canonical `spline` wins over `interpolation`. Three rows,
+		// so a quadratic has the points it needs and is what runs.
+		let payload = "cpu,host=a load=0 1000000000\ncpu,host=a load=60 1000000060\ncpu,host=a load=30 1000000120\n";
 		let (status, body) = post_text("/api/v1/interpolate/ilp?field=load&precision=s&spline=quadratic&interpolation=linear", payload).await;
 		assert_eq!(status, StatusCode::OK, "body: {body}");
 		assert_eq!(body["spline"], "Quadratic");

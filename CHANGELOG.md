@@ -84,6 +84,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Fixed
 
+- **Interpolation responses report the method that ran.** `spline` in the
+  `/api/v1/interpolate` and `/api/v1/interpolate/ilp` JSON responses and in the point
+  query is documented as the method actually used, but echoed the requested one. With
+  fewer distinct timestamps than a method needs, splimes steps down (`Cubic` →
+  `Quadratic` → `Linear`, `Polynomial(d, b)` → `Polynomial(n − 1, b)`), so a `cubic`
+  request over three points ran a quadratic and still said `Cubic`; it now says
+  `Quadratic`. The CSV, Arrow and Parquet outputs carry no method field.
 - **Commit failures were silently ignored.** A control-plane write that lost an MVCC
   conflict was reported as success. Commit errors now reach the caller, and the
   transaction is rolled back.
