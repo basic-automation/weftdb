@@ -20,7 +20,7 @@ use std::{hint::black_box, str::FromStr};
 use bigdecimal::BigDecimal;
 use criterion::{criterion_group, criterion_main, Criterion};
 use weft_physical_type::{
-	weftseg::{read_paged_segment_point, read_segment_point, write_paged_segment, write_paged_segment_checkpointed, write_segment, write_segment_checkpointed}, page::PagedSegment, timestamp::{decode_delta_of_delta, encode_delta_of_delta, DeltaOfDeltaColumn, TimeUnit}, Segment
+	page::PagedSegment, timestamp::{decode_delta_of_delta, encode_delta_of_delta, DeltaOfDeltaColumn, TimeUnit}, weftseg::{read_paged_segment_point, read_segment_point, write_paged_segment, write_paged_segment_checkpointed, write_segment, write_segment_checkpointed}, Segment
 };
 
 /// A deterministic sorted-irregular epoch column: a base stride of ~1000 ms perturbed by
@@ -28,17 +28,16 @@ use weft_physical_type::{
 /// a cheap xorshift keyed off the index keeps the bench reproducible.
 fn corpus(n: usize) -> Vec<i64> {
 	let mut ts: i64 = 1_600_000_000_000;
-	(0..n)
-		.map(|i| {
-			let mut x = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-			x ^= x >> 29;
-			x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-			x ^= x >> 32;
-			// Gap in [1, 2000] ms: irregular, always forward (so the column stays sorted).
-			ts = ts.wrapping_add(1 + i64::try_from(x % 2000).unwrap_or(1));
-			ts
-		})
-		.collect()
+	(0..n).map(|i| {
+		let mut x = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+		x ^= x >> 29;
+		x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+		x ^= x >> 32;
+		// Gap in [1, 2000] ms: irregular, always forward (so the column stays sorted).
+		ts = ts.wrapping_add(1 + i64::try_from(x % 2000).unwrap_or(1));
+		ts
+	})
+	.collect()
 }
 
 /// The status quo: reconstruct the whole column, then binary-search it.

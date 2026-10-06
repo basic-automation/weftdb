@@ -2,7 +2,7 @@
 //!
 //! Until now every handler took the bare [`SharedMetrics`] as its router state.
 //! The storage-query endpoints (roadmap Phase 2 — raw range / stored queries)
-//! need a second long-lived dependency: a [`database::SegmentStore`] reading the
+//! need a second long-lived dependency: a [`weftdb::SegmentStore`] reading the
 //! on-disk Storage v2 segments. Rather than thread two parallel `State` extractors
 //! through the router, the service now carries one [`AppState`] and exposes its
 //! parts through [`axum::extract::FromRef`].
@@ -27,7 +27,7 @@
 use std::sync::Arc;
 
 use axum::extract::FromRef;
-use database::SegmentStore;
+use weftdb::SegmentStore;
 
 use crate::metrics::SharedMetrics;
 

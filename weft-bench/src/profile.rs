@@ -297,7 +297,7 @@ impl InterpolationProfile {
 	///
 	/// # Panics
 	///
-	/// Panics only if [`EPOCH_ANCHOR_SECS`] is not a representable UTC instant,
+	/// Panics only if `EPOCH_ANCHOR_SECS` is not a representable UTC instant,
 	/// which cannot happen for the compiled-in constant.
 	#[must_use]
 	pub fn start(&self) -> DateTime<Utc> {
@@ -325,7 +325,7 @@ impl InterpolationProfile {
 	///
 	/// # Panics
 	///
-	/// Panics only if [`EPOCH_ANCHOR_SECS`] is not a representable UTC instant,
+	/// Panics only if `EPOCH_ANCHOR_SECS` is not a representable UTC instant,
 	/// which cannot happen for the compiled-in constant.
 	#[must_use]
 	fn anchor() -> DateTime<Utc> {

@@ -111,9 +111,11 @@ impl SplitPolicy {
 	}
 }
 
-/// The split boundary in a **sorted** existing segment: the number of rows whose
-/// timestamp is strictly less than `late_min` — i.e. the length of the untouched
-/// prefix when late data whose earliest timestamp is `late_min` is merged in.
+/// The split boundary in a **sorted** existing segment.
+///
+/// That is the number of rows whose timestamp is strictly less than `late_min` — the
+/// length of the untouched prefix when late data whose earliest timestamp is `late_min`
+/// is merged in.
 ///
 /// Equivalently the index of the first existing row at or after the late window, so
 /// `existing_ts[..split_index]` is the prefix a split keeps and
@@ -150,11 +152,11 @@ pub fn merge_newer_wins<V: Clone>(older: &[(i64, V)], newer: &[(i64, V)]) -> Vec
 			std::cmp::Ordering::Less => {
 				out.push(older[i].clone());
 				i += 1;
-			},
+			}
 			std::cmp::Ordering::Greater => {
 				out.push(newer[j].clone());
 				j += 1;
-			},
+			}
 			std::cmp::Ordering::Equal => {
 				// Shared instant: newer supersedes older. Drop the whole older run at
 				// this timestamp and emit the whole newer run.
@@ -166,7 +168,7 @@ pub fn merge_newer_wins<V: Clone>(older: &[(i64, V)], newer: &[(i64, V)]) -> Vec
 					out.push(newer[j].clone());
 					j += 1;
 				}
-			},
+			}
 		}
 	}
 	out.extend_from_slice(&older[i..]);

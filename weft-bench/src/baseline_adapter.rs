@@ -6,7 +6,7 @@
 //! adapter *is* that baseline: a dependency-free, straightforward piecewise-linear
 //! reconstruction implemented directly in the harness, with no engine
 //! sophistication behind it. It is the honest reference WeftDB's native path is
-//! measured against — until now Weft-Bench had only one system ([`WeftAdapter`]) and
+//! measured against — until now Weft-Bench had only one system ([`WeftAdapter`](crate::WeftAdapter)) and
 //! so could not produce a *comparison* at all.
 //!
 //! Two deliberate properties keep the baseline trustworthy:

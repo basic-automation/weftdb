@@ -1061,68 +1061,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "database"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bigdecimal",
- "bytemuck",
- "chrono",
- "criterion",
- "csv",
- "dirs",
- "fake",
- "fastrand",
- "futures",
- "md5",
- "num_cpus",
- "once_cell",
- "postcard",
- "rand 0.10.3",
- "rayon",
- "serde",
- "serde_json",
- "serial_test",
- "splimes",
- "sysinfo",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "turso",
- "uuid",
- "weft-physical-type",
- "weft-reduce",
- "wide",
-]
-
-[[package]]
-name = "database_orchestration"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bigdecimal",
- "chrono",
- "database",
- "futures",
- "indexmap",
- "num_cpus",
- "rand 0.10.3",
- "rayon",
- "serde",
- "serde_json",
- "serial_test",
- "splimes",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "wide",
-]
-
-[[package]]
 name = "deltae"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4077,8 +4015,7 @@ dependencies = [
  "crossterm 0.29.0",
  "ctor",
  "fake",
- "futures",
- "futures-channel",
+ "naga",
  "rand 0.10.3",
  "rand_chacha 0.10.0",
  "ratatui",
@@ -5186,11 +5123,11 @@ dependencies = [
  "anyhow",
  "arrow-array",
  "bigdecimal",
- "database",
  "tempfile",
  "tokio",
  "weft-arrow",
  "weft-physical-type",
+ "weftdb",
 ]
 
 [[package]]
@@ -5224,6 +5161,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "weft-orchestration"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bigdecimal",
+ "chrono",
+ "futures",
+ "indexmap",
+ "num_cpus",
+ "rand 0.10.3",
+ "rayon",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "splimes",
+ "sysinfo",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "weftdb",
+ "wide",
+]
+
+[[package]]
 name = "weft-physical-type"
 version = "0.1.0"
 dependencies = [
@@ -5253,7 +5215,6 @@ dependencies = [
  "axum",
  "bigdecimal",
  "chrono",
- "database",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -5271,6 +5232,7 @@ dependencies = [
  "weft-line-protocol",
  "weft-physical-type",
  "weft-reduce",
+ "weftdb",
 ]
 
 [[package]]
@@ -5281,7 +5243,6 @@ dependencies = [
  "bigdecimal",
  "chrono",
  "crossterm 0.29.0",
- "database",
  "dirs",
  "futures",
  "num-traits",
@@ -5291,6 +5252,45 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-subscriber",
+ "weftdb",
+]
+
+[[package]]
+name = "weftdb"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bigdecimal",
+ "bytemuck",
+ "chrono",
+ "criterion",
+ "csv",
+ "dirs",
+ "fake",
+ "fastrand",
+ "futures",
+ "md5",
+ "num_cpus",
+ "once_cell",
+ "postcard",
+ "rand 0.10.3",
+ "rayon",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "splimes",
+ "sysinfo",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "turso",
+ "uuid",
+ "weft-physical-type",
+ "weft-reduce",
+ "wide",
 ]
 
 [[package]]

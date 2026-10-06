@@ -298,7 +298,7 @@ impl SegmentIndex {
 		if spans.len() < 2 {
 			return Vec::new();
 		}
-		spans.sort_by(|a, b| (a.1, a.2).cmp(&(b.1, b.2)));
+		spans.sort_by_key(|s| (s.1, s.2));
 		let mut flagged = vec![false; spans.len()];
 		// Overlaps a predecessor: this span starts at or before the running max end.
 		let mut running_max_hi = i64::MIN;

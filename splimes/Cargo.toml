@@ -1,10 +1,16 @@
 [package]
 name = "splimes"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+authors.workspace = true
 license.workspace = true
 repository.workspace = true
-authors.workspace = true
-version = "0.1.0"
-edition = "2024"
+readme = "README.md"
+description = "Spline interpolation over irregular time series, on CPU (SIMD/rayon) or GPU (wgpu), with provenance-labelled output points."
+keywords = ["spline", "interpolation", "timeseries", "gpu", "simd"]
+categories = ["mathematics", "science", "algorithms"]
+
 
 [features]
 default = []
@@ -21,15 +27,15 @@ bytemuck = { workspace = true }
 wide = { workspace = true }
 rayon = { workspace = true }
 tokio = { workspace = true }
-futures-channel = { workspace = true }
 sysinfo = { workspace = true }
 tempfile = { workspace = true }
-futures = { workspace = true }
 fake = { workspace = true, features = ["derive", "bigdecimal", "chrono"] }
-rand = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
+# Parses and validates the WGSL shaders in unit tests, with no GPU needed. Same major as
+# the naga wgpu uses, so it adds no extra build.
+naga = { version = "30", features = ["wgsl-in"] }
 criterion = { workspace = true, features = ["async_futures"] }
 rand = { workspace = true }
 rand_chacha = { workspace = true }

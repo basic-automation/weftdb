@@ -2,7 +2,7 @@
 //!
 //! The bridge that reads a **stored** WeftDB aspect range straight into an Apache
 //! Arrow [`RecordBatch`] — joining the on-disk Storage v2 segment store
-//! ([`database::SegmentStore`], roadmap **Phase 4.3**) to the Arrow interchange
+//! ([`weftdb::SegmentStore`], roadmap **Phase 4.3**) to the Arrow interchange
 //! ([`weft_arrow`], roadmap **Phase 4.5**).
 //!
 //! ## Why this is its own crate
@@ -24,7 +24,7 @@
 //!
 //! Arrow is an open, vendor-neutral interchange standard, not a storage backend:
 //! the measurement bytes still live in WeftDB's own `.weftseg` segments
-//! ([`database::SegmentStore`] reads them), and this crate only *re-expresses* a
+//! ([`weftdb::SegmentStore`] reads them), and this crate only *re-expresses* a
 //! read result in Arrow's in-memory shape. No vendor connector enters the core.
 //!
 //! ## What this slice covers
@@ -32,13 +32,13 @@
 //! Two reads, each returning a self-describing, **lossless** Arrow batch:
 //!
 //! - [`read_time_range_to_record_batch`] — the segment-pruned time-range read
-//!   ([`SegmentStore::read_time_range`](database::SegmentStore::read_time_range)),
+//!   ([`SegmentStore::read_time_range`](weftdb::SegmentStore::read_time_range)),
 //!   re-expressed as a `timestamp: Int64` + nullable `value: Utf8` batch.
 //! - [`read_value_range_to_record_batch`] — the value-pruned read
-//!   ([`SegmentStore::read_value_range`](database::SegmentStore::read_value_range)),
+//!   ([`SegmentStore::read_value_range`](weftdb::SegmentStore::read_value_range)),
 //!   likewise.
 //!
-//! Both recover the aspect's declared [`TimeUnit`](weft_physical_type::TimeUnit)
+//! Both recover the aspect's declared [`TimeUnit`]
 //! from its schema so the batch carries the right time-unit metadata, and both go
 //! through [`weft_arrow::columns_to_record_batch`], so the value column is the
 //! always-exact decimal-text form — no value loses a digit crossing into Arrow
@@ -50,14 +50,14 @@
 use anyhow::{bail, Context, Result};
 use arrow_array::RecordBatch;
 use bigdecimal::BigDecimal;
-use database::SegmentStore;
 use weft_physical_type::{first_order_violation, AspectSchema, SegmentDescriptor, TimeUnit};
+use weftdb::SegmentStore;
 
 /// Read the rows of `aspect` whose timestamp falls in the inclusive `[start, end]`
 /// window and return them as a single lossless Arrow [`RecordBatch`].
 ///
 /// The read itself is the segment-pruned
-/// [`SegmentStore::read_time_range`](database::SegmentStore::read_time_range) — the
+/// [`SegmentStore::read_time_range`](weftdb::SegmentStore::read_time_range) — the
 /// libSQL index prunes to the overlapping `.weftseg` files before any segment byte
 /// is touched, and a paged frame skips pages within the file too. The resulting
 /// logical columns (which may have crossed several segments) are converted with
@@ -104,7 +104,7 @@ pub async fn read_time_range_to_record_batch_typed(store: &SegmentStore, aspect:
 /// `[lo, hi]` range and return them as a single lossless Arrow [`RecordBatch`].
 ///
 /// The read is the value-pruned
-/// [`SegmentStore::read_value_range`](database::SegmentStore::read_value_range)
+/// [`SegmentStore::read_value_range`](weftdb::SegmentStore::read_value_range)
 /// (only segments whose value span overlaps `[lo, hi]` are opened). Its present
 /// values are re-expressed as the nullable Arrow value column (every row is
 /// present here, so no Arrow null is emitted) with the aspect's declared
@@ -267,10 +267,10 @@ mod tests {
 	use std::str::FromStr;
 
 	use bigdecimal::BigDecimal;
-	use database::SegmentStore;
+	use tempfile::TempDir;
 	use weft_arrow::{record_batch_to_columns, META_TIME_UNIT, VALUE_COLUMN};
 	use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
-	use tempfile::TempDir;
+	use weftdb::SegmentStore;
 
 	use super::*;
 

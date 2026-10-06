@@ -28,7 +28,9 @@ use std::hint::black_box;
 
 use bigdecimal::BigDecimal;
 use criterion::{criterion_group, criterion_main, Criterion};
-use weft_physical_type::{weftseg::{frame_value_codec, read_segment, read_segment_point, read_segment_range, FrameOptions}, timestamp::TimeUnit, Segment};
+use weft_physical_type::{
+	timestamp::TimeUnit, weftseg::{frame_value_codec, read_segment, read_segment_point, read_segment_range, FrameOptions}, Segment
+};
 
 /// A zero-straddling small-magnitude corpus: two-decimal values in `[-5.00, 5.00]` on a
 /// regular 10 ms grid. Mantissas span ±500 (10 zig-zag bits), so per-block/global bit-packing

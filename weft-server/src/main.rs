@@ -15,8 +15,8 @@
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use database::SegmentStore;
 use weft_server::{app_with_state, spawn_backup_daemon, spawn_reconcile_daemon, AppState, BackupDaemonConfig, ReconcileDaemonConfig, SERVICE, VERSION};
+use weftdb::SegmentStore;
 
 /// Default bind address when `WEFT_SERVER_ADDR` is unset.
 const DEFAULT_ADDR: &str = "127.0.0.1:8080";
