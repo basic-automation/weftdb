@@ -563,6 +563,10 @@ Expected results, to be measured in S10 and S21 rather than assumed:
 
   Turso files are copied at the cut. That is sound because every returned COMMIT was FULL-fsynced (asserted in S3). Phantom commits come from a fault placed after COMMIT executes.
 
+  Every other write is distrusted unless it went through `StoreFs`. `SimFs::new` records the files under the root as the durable baseline. A file created, rewritten or removed after that by anything else (today's `tokio::fs::write` seal frames, in-place reconcile and split rewrites, sidecars) gets the outcomes of an unsynced file, with no ordering. Only paths the test exempts are copied as they are; `SimFs::turso_file` exempts Turso's `*.db`, `*.db-log`, `*.db-wal` and `*.db-shm`. This is what lets the S8/S9, S10 and S15 regression tests below fail before their fix.
+- `StoreFs::create_new_write` performs `create_new`, `write_all` and, under `SyncPolicy::Full`, `sync_all` on one handle in one `spawn_blocking` (SEAL-4, M4). Its `WritePoints` hit S-frame-created / S-frame-written / M-output-written between the steps through `fault::hit_blocking`. A ReturnErr there makes the write remove its own file, so it is not a process crash; use Abort for the process-crash matrix at those points.
+- **SimFs limit: directories are not modelled.** A directory counts as durable as soon as it exists, and renaming a directory through `SimFs` returns `Unsupported`. So B-partial-created, B-renamed, prune-renamed, restore-renamed and L-new-renamed, and the backup-dirent-not-durable window, cannot be power-cut simulated yet. S5, S16 and S18 must first extend `SimFs` with directory create/rename/remove ops whose durability follows the parent directory's fsync (carrying their subtree), before they claim power-loss coverage of those points.
+
 **Fault points:**
 
 | Group | Points |

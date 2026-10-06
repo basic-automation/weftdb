@@ -2,37 +2,51 @@
 //!
 //! [`SimFs`] performs every operation on a real directory, so the store, Turso and
 //! the read paths see an ordinary live filesystem. Alongside, it keeps a model of
-//! what a power cut would preserve: per file, the bytes made durable by `sync_file`
+//! what a power cut would preserve: per file, the bytes made durable by a sync
 //! versus the bytes merely written; per directory entry, the state made durable by
 //! `sync_dir` versus the operations still pending. [`SimFs::power_cut`] then writes
 //! one legal post-crash image of the root into a fresh directory, chosen by a seed:
 //!
 //! - an unsynced file comes back absent (its entry was lost), empty, as a prefix of
 //!   what was written, as a prefix followed by zero fill (the size reached the disk
-//!   but the data blocks did not), or complete;
+//!   but the data blocks did not), or complete. A file rewritten in place can also
+//!   come back with its old content;
 //! - each pending directory operation is either applied or not. An operation is
-//!   applied only together with the earlier pending operations it depends on (those
-//!   on the same name or the same file), so the image never holds a state no
-//!   filesystem could produce, such as a rename's target without its source ever
-//!   having existed;
-//! - everything `SimFs` never touched (Turso's database files, for example) is copied
-//!   as it is. That is sound for Turso because every COMMIT that returned was FULL
-//!   fsynced (asserted at open in S3).
+//!   applied only together with the earlier pending operations on the same name, so
+//!   the image never holds a state no filesystem could produce, such as a rename's
+//!   target without its source ever having existed, or a new file that took a name
+//!   whose previous file thereby lost every name;
+//! - writes that bypass `SimFs` are not trusted. [`SimFs::new`] records every file
+//!   under the root as the durable baseline. A file created, rewritten or removed
+//!   since then by anything other than `SimFs` (`tokio::fs::write`, say), including
+//!   one `SimFs` tracks, gets the outcomes of an unsynced one, so a write path that
+//!   bypasses [`StoreFs`] shows up in the crash tests as torn or lost data instead of
+//!   passing unexamined. Only the paths the caller exempts are copied as they are:
+//!   [`SimFs::turso_file`] exempts Turso's databases and logs, which is sound because
+//!   every COMMIT that returned was FULL fsynced (asserted at open in S3).
 //!
 //! The model is deliberately harsher than ext4 or XFS in ordered mode, which commit
 //! metadata as a journal prefix: a directory fsync here makes durable only the
 //! operations in that directory (plus their dependencies), which is all POSIX
-//! promises. Directories themselves are not modelled: they must exist before `SimFs`
-//! touches them and are assumed durable, and renaming a directory through `SimFs` is
-//! refused rather than simulated wrongly.
+//! promises. Changes made behind `SimFs`'s back carry no order at all, so a test that
+//! needs one must route the operation through [`StoreFs`].
+//!
+//! Directories themselves are not modelled: a directory is assumed durable as soon as
+//! it exists, and renaming one through `SimFs` is refused rather than simulated wrongly.
+//! The power-loss points that create or rename directories (`B-partial-created`,
+//! `B-renamed`, `prune-renamed`, `restore-renamed`, `L-new-renamed`) therefore cannot
+//! be simulated yet: the slices that own them (S5, S16, S18) extend the model first
+//! (design section 11).
 
 use std::{
-	collections::{BTreeMap, BTreeSet}, ffi::OsString, io, path::{Component, Path, PathBuf}, sync::{Mutex, MutexGuard, PoisonError}
+	collections::{BTreeMap, BTreeSet}, ffi::{OsStr, OsString}, fmt, fs::File, io::{self, Write}, path::{Component, Path, PathBuf}, sync::{Mutex, MutexGuard, PoisonError}
 };
 
 use async_trait::async_trait;
 
-use super::fs::{create_new_write_blocking, metadata_blocking, read_dir_blocking, remove_file_blocking, FsEntry, FsMetadata, StoreFs};
+use super::{
+	fault, fs::{metadata_blocking, read_dir_blocking, remove_file_blocking, FsEntry, FsMetadata, StoreFs, SyncPolicy, WritePoints}
+};
 
 /// A directory entry: (directory relative to the root, file name).
 type Slot = (PathBuf, OsString);
@@ -46,32 +60,32 @@ struct Inode {
 	current: Vec<u8>,
 }
 
-impl Inode {
-	/// The content this file has after a power cut, drawn from `rng`.
-	fn after_cut(&self, rng: &mut fastrand::Rng) -> Vec<u8> {
-		let (durable, current) = (&self.durable, &self.current);
-		if durable == current {
-			return current.clone();
+/// The content a file whose durable bytes are `durable` and whose written bytes are
+/// `current` has after a power cut, drawn from `rng`.
+fn after_cut(durable: &[u8], current: &[u8], rng: &mut fastrand::Rng) -> Vec<u8> {
+	if durable == current {
+		return current.to_vec();
+	}
+	// The unsynced bytes either extend the durable ones (a new file, or an append) or
+	// replace them (a rewrite in place: truncate, then write). Only an extension keeps
+	// a durable prefix.
+	let kept = if current.starts_with(durable) { durable.len() } else { 0 };
+	match rng.u8(0..5) {
+		// Part of the new bytes reached the disk.
+		1 if current.len() - kept >= 2 => current[..rng.usize(kept + 1..current.len())].to_vec(),
+		// The new size reached the disk but not all of the data blocks.
+		2 if current.len() > kept => {
+			let mut torn = current[..rng.usize(kept..current.len())].to_vec();
+			torn.resize(current.len(), 0);
+			torn
 		}
-		// Files are written once, so the unsynced bytes always extend the durable ones;
-		// anything else could only be the old or the new content.
-		if !current.starts_with(durable) {
-			return if rng.bool() { durable.clone() } else { current.clone() };
-		}
-		match rng.u8(0..4) {
-			// Part of the unsynced bytes reached the disk.
-			1 if current.len() - durable.len() >= 2 => current[..rng.usize(durable.len() + 1..current.len())].to_vec(),
-			// The new size reached the disk but not all the data blocks.
-			2 => {
-				let mut torn = current[..rng.usize(durable.len()..current.len())].to_vec();
-				torn.resize(current.len(), 0);
-				torn
-			}
-			3 => current.clone(),
-			// None of them did, so a new file comes back empty. (A one-byte tail has no
-			// partial prefix, so that draw lands here too.)
-			_ => durable.clone(),
-		}
+		3 => current.to_vec(),
+		// The truncation reached the disk but none of the new bytes, so a rewritten file
+		// comes back empty (and an extended one as it was).
+		4 => current[..kept].to_vec(),
+		// None of the change did. (A one-byte tail has no partial prefix, so that draw
+		// lands here too.)
+		_ => durable.to_vec(),
 	}
 }
 
@@ -95,23 +109,22 @@ impl DirOp {
 		std::iter::once(first).chain(second)
 	}
 
-	/// The file the operation needs to exist. A removal needs only its own name.
-	const fn ino(&self) -> Option<Ino> {
-		match self {
-			Self::Add { ino, .. } | Self::Rename { ino, .. } => Some(*ino),
-			Self::Remove { .. } => None,
-		}
-	}
-
 	fn touches_dir(&self, dir: &Path) -> bool {
 		self.slots().any(|(slot_dir, _)| slot_dir == dir)
 	}
 
-	/// Whether this operation is only meaningful once `earlier` has been applied.
+	/// Whether this operation is only meaningful once `earlier` has been applied:
+	/// whether they name a common entry. Applying two operations on one name out of
+	/// order gives an image no filesystem could produce (a rename's target without
+	/// its source, a create in a name the old file still holds).
+	///
+	/// Sharing a file is deliberately not a dependency. A hard link names the inode,
+	/// not its source entry, so an image may keep the link and lose the original
+	/// name, as POSIX allows when only the link's directory was synced; and syncing
+	/// one directory must not make durable an operation in another that merely
+	/// involves the same file.
 	fn depends_on(&self, earlier: &Self) -> bool {
-		let same_slot = self.slots().any(|slot| earlier.slots().any(|e| e == slot));
-		let same_file = matches!((self.ino(), earlier.ino()), (Some(a), Some(b)) if a == b);
-		same_slot || same_file
+		self.slots().any(|slot| earlier.slots().any(|e| e == slot))
 	}
 
 	fn apply(&self, entries: &mut BTreeMap<Slot, Ino>) {
@@ -146,8 +159,8 @@ fn with_dependencies(ops: &[DirOp], roots: impl IntoIterator<Item = usize>) -> B
 #[derive(Debug, Default)]
 struct Model {
 	inodes: Vec<Inode>,
-	/// Every entry the model has an opinion about. Untracked entries are copied into
-	/// an image as they are.
+	/// Every entry the model tracks: those `SimFs` has operated on. Untracked entries
+	/// are judged against the baseline in an image.
 	known: BTreeSet<Slot>,
 	/// The known entries that survive any power cut.
 	durable: BTreeMap<Slot, Ino>,
@@ -163,27 +176,6 @@ impl Model {
 	fn new_inode(&mut self, durable: Vec<u8>, current: Vec<u8>) -> Ino {
 		self.inodes.push(Inode { durable, current });
 		self.inodes.len() - 1
-	}
-
-	/// Start tracking `slot` before the first operation on it. A file already on disk
-	/// predates the simulation and counts as durable.
-	fn adopt(&mut self, slot: &Slot, path: &Path) -> io::Result<()> {
-		if self.known.contains(slot) {
-			return Ok(());
-		}
-		match std::fs::symlink_metadata(path) {
-			Ok(meta) if meta.is_dir() => return Err(io::Error::new(io::ErrorKind::Unsupported, format!("SimFs models file entries only, and {} is a directory", path.display()))),
-			Ok(_) => {
-				let bytes = std::fs::read(path)?;
-				let ino = self.new_inode(bytes.clone(), bytes);
-				self.durable.insert(slot.clone(), ino);
-				self.live.insert(slot.clone(), ino);
-			}
-			Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-			Err(e) => return Err(e),
-		}
-		self.known.insert(slot.clone());
-		Ok(())
 	}
 
 	/// Make the operations at `indices` durable, in their original order.
@@ -204,17 +196,61 @@ impl Model {
 
 /// A [`StoreFs`] over a real directory that can also produce the image a power cut
 /// at this instant could leave behind. See the module docs for the crash model.
-#[derive(Debug)]
 pub struct SimFs {
 	root: PathBuf,
+	/// Paths (relative to the root) trusted as durable whatever happens to them.
+	exempt: fn(&Path) -> bool,
+	/// Every other file under the root when the simulation began, with its content:
+	/// what a power cut keeps of a file nothing has synced through `SimFs`.
+	baseline: BTreeMap<Slot, Vec<u8>>,
 	model: Mutex<Model>,
 }
 
+impl fmt::Debug for SimFs {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("SimFs").field("root", &self.root).field("baseline_files", &self.baseline.len()).finish_non_exhaustive()
+	}
+}
+
 impl SimFs {
-	/// Simulate over the existing directory `root`. Every path passed to the
-	/// [`StoreFs`] methods must lie under it.
-	pub fn new(root: impl Into<PathBuf>) -> Self {
-		Self { root: root.into(), model: Mutex::default() }
+	/// Simulate over the existing directory `root`, taking every file under it now
+	/// as durable and every later change not made through `SimFs` as unsynced. Every
+	/// path passed to the [`StoreFs`] methods must lie under the root.
+	///
+	/// # Errors
+	///
+	/// Any error reading the root.
+	pub fn new(root: impl Into<PathBuf>) -> io::Result<Self> {
+		Self::exempting(root, |_| false)
+	}
+
+	/// Like [`new`](Self::new), but a file whose path relative to the root satisfies
+	/// `exempt` is trusted as durable whatever happens to it, and is copied into every
+	/// image as it is. Pass [`SimFs::turso_file`] when the root holds Turso databases.
+	///
+	/// # Errors
+	///
+	/// Any error reading the root.
+	pub fn exempting(root: impl Into<PathBuf>, exempt: fn(&Path) -> bool) -> io::Result<Self> {
+		let root = root.into();
+		let mut baseline = BTreeMap::new();
+		for slot in scan(&root)?.1 {
+			let rel = slot_path(&slot);
+			if !exempt(&rel) {
+				let bytes = std::fs::read(root.join(&rel))?;
+				baseline.insert(slot, bytes);
+			}
+		}
+		Ok(Self { root, exempt, baseline, model: Mutex::default() })
+	}
+
+	/// The exemption for Turso's files: databases (`*.db`) and their logs (`*.db-log`,
+	/// `*.db-wal`, `*.db-shm`). Turso writes them itself, never through [`StoreFs`],
+	/// and every COMMIT that returned was FULL fsynced, so the image copies them as
+	/// they are at the cut.
+	#[must_use]
+	pub fn turso_file(rel: &Path) -> bool {
+		rel.file_name().and_then(OsStr::to_str).is_some_and(|name| [".db", ".db-log", ".db-wal", ".db-shm"].iter().any(|suffix| name.ends_with(suffix)))
 	}
 
 	/// The simulated root.
@@ -223,7 +259,8 @@ impl SimFs {
 		&self.root
 	}
 
-	/// How many `sync_file` calls have succeeded.
+	/// How many file syncs have succeeded: `sync_file` calls and
+	/// [`SyncPolicy::Full`] writes.
 	#[must_use]
 	pub fn file_syncs(&self) -> u64 {
 		self.lock().file_syncs
@@ -235,7 +272,8 @@ impl SimFs {
 		self.lock().dir_syncs
 	}
 
-	/// How many directory operations a power cut could still lose.
+	/// How many directory operations made through `SimFs` a power cut could still
+	/// lose.
 	#[must_use]
 	pub fn pending_dir_ops(&self) -> usize {
 		self.lock().pending.len()
@@ -265,8 +303,14 @@ impl SimFs {
 			return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("the crash image directory {} is not empty", dest.display())));
 		}
 		std::fs::create_dir_all(dest)?;
-		copy_untracked(&self.root, dest, Path::new(""), &model.known)?;
+		let (dirs, files) = scan(&self.root)?;
+		// Directories are not modelled: every one that exists now is in the image.
+		for dir in &dirs {
+			std::fs::create_dir_all(dest.join(dir))?;
+		}
 
+		// The names `SimFs` tracks: the durable entries plus a seeded subset of the
+		// pending operations, each with the earlier ones it depends on.
 		let mut rng = fastrand::Rng::with_seed(seed);
 		let flipped: Vec<usize> = (0..model.pending.len()).filter(|_| rng.bool()).collect();
 		let applied = with_dependencies(&model.pending, flipped);
@@ -277,13 +321,78 @@ impl SimFs {
 			}
 		}
 
+		// What is on disk now under those names. A change made to them behind
+		// `SimFs`'s back is as unordered and unsynced as any other untracked change.
+		let mut on_disk: BTreeMap<Ino, Vec<u8>> = BTreeMap::new();
+		let mut recreated = Vec::new();
+		for slot in &model.known {
+			match (model.live.get(slot), read_if_file(&self.root.join(slot_path(slot)))?) {
+				(Some(&ino), Some(bytes)) => {
+					on_disk.insert(ino, bytes);
+				}
+				(Some(_), None) => {
+					if rng.bool() {
+						entries.remove(slot);
+					}
+				}
+				(None, Some(bytes)) => {
+					if rng.bool() {
+						recreated.push((slot, bytes));
+					}
+				}
+				(None, None) => {}
+			}
+		}
+
 		// One outcome per file, shared by all of its names.
-		let files: BTreeSet<Ino> = entries.values().copied().collect();
-		let contents: BTreeMap<Ino, Vec<u8>> = files.into_iter().map(|ino| (ino, model.inodes[ino].after_cut(&mut rng))).collect();
-		for ((dir, name), ino) in &entries {
+		let in_image: BTreeSet<Ino> = entries.values().copied().collect();
+		let contents: BTreeMap<Ino, Vec<u8>> = in_image
+			.into_iter()
+			.map(|ino| {
+				let inode = &model.inodes[ino];
+				(ino, after_cut(&inode.durable, on_disk.get(&ino).unwrap_or(&inode.current), &mut rng))
+			})
+			.collect();
+		let mut image: BTreeMap<Slot, Vec<u8>> = entries.iter().map(|(slot, ino)| (slot.clone(), contents[ino].clone())).collect();
+		for (slot, bytes) in recreated {
+			image.insert(slot.clone(), after_cut(&[], &bytes, &mut rng));
+		}
+
+		// Untracked files: what the baseline holds is durable, and every change since is
+		// unsynced. Exempt files are copied as they are.
+		let live_untracked: BTreeSet<&Slot> = files.iter().filter(|slot| !model.known.contains(*slot)).collect();
+		let untracked: BTreeSet<&Slot> = live_untracked.iter().copied().chain(self.baseline.keys().filter(|slot| !model.known.contains(*slot))).collect();
+		for slot in untracked {
+			let rel = slot_path(slot);
+			let now = if live_untracked.contains(slot) { Some(std::fs::read(self.root.join(&rel))?) } else { None };
+			let kept = if (self.exempt)(&rel) {
+				now
+			} else {
+				match (self.baseline.get(slot), now) {
+					// The entry is durable; the content changed without a sync.
+					(Some(old), Some(now)) => Some(after_cut(old, &now, &mut rng)),
+					// Removed without a directory sync, so the removal may be lost.
+					(Some(old), None) if !dirs.contains(&rel) => rng.bool().then(|| old.clone()),
+					// Created without either sync: absent, or torn.
+					(None, Some(now)) => {
+						if rng.bool() {
+							Some(after_cut(&[], &now, &mut rng))
+						} else {
+							None
+						}
+					}
+					_ => None,
+				}
+			};
+			if let Some(bytes) = kept {
+				image.insert(slot.clone(), bytes);
+			}
+		}
+
+		for ((dir, name), bytes) in &image {
 			let dir = dest.join(dir);
 			std::fs::create_dir_all(&dir)?;
-			std::fs::write(dir.join(name), &contents[ino])?;
+			std::fs::write(dir.join(name), bytes)?;
 		}
 		Ok(())
 	}
@@ -304,50 +413,143 @@ impl SimFs {
 			_ => Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{} names the simulated root itself, not a file under it", path.display()))),
 		}
 	}
+
+	/// Start tracking `slot` before the first operation on it. A power cut keeps what
+	/// the baseline holds there (or, for an exempt path, what is there now); anything
+	/// done to it since, behind `SimFs`'s back, is not durable.
+	fn adopt(&self, model: &mut Model, slot: &Slot, path: &Path) -> io::Result<()> {
+		if model.known.contains(slot) {
+			return Ok(());
+		}
+		let now = match std::fs::symlink_metadata(path) {
+			Ok(meta) if meta.is_dir() => return Err(io::Error::new(io::ErrorKind::Unsupported, format!("SimFs models file entries only, and {} is a directory", path.display()))),
+			Ok(_) => Some(std::fs::read(path)?),
+			Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+			Err(e) => return Err(e),
+		};
+		let durable = if (self.exempt)(&slot_path(slot)) { now.clone() } else { self.baseline.get(slot).cloned() };
+		match (durable, now) {
+			(Some(durable), Some(now)) => {
+				let ino = model.new_inode(durable, now);
+				model.durable.insert(slot.clone(), ino);
+				model.live.insert(slot.clone(), ino);
+			}
+			// Removed behind `SimFs`'s back: the removal is not known to be durable.
+			(Some(durable), None) => {
+				let ino = model.new_inode(durable.clone(), durable);
+				model.durable.insert(slot.clone(), ino);
+				model.pending.push(DirOp::Remove { slot: slot.clone() });
+			}
+			// Created behind `SimFs`'s back: neither its entry nor its bytes are durable.
+			(None, Some(now)) => {
+				let ino = model.new_inode(Vec::new(), now);
+				model.live.insert(slot.clone(), ino);
+				model.pending.push(DirOp::Add { slot: slot.clone(), ino });
+			}
+			(None, None) => {}
+		}
+		model.known.insert(slot.clone());
+		Ok(())
+	}
+
+	/// The steps of `create_new_write` after the create, as `RealFs` runs them, with
+	/// the model brought up to date after each.
+	async fn fill(&self, mut file: File, ino: Ino, bytes: Vec<u8>, policy: SyncPolicy, points: WritePoints) -> io::Result<()> {
+		if let Some(point) = points.created {
+			fault::hit(point).await?;
+		}
+		file.write_all(&bytes)?;
+		drop(file);
+		self.lock().inodes[ino].current = bytes;
+		if let Some(point) = points.written {
+			fault::hit(point).await?;
+		}
+		if policy == SyncPolicy::Full {
+			let mut model = self.lock();
+			let inode = &mut model.inodes[ino];
+			inode.durable.clone_from(&inode.current);
+			model.file_syncs += 1;
+		}
+		Ok(())
+	}
 }
 
-/// Copy every file under `src/rel` that the model does not track into `dest/rel`,
-/// recreating the directory tree. Only regular files and directories belong in a
-/// store; anything else is skipped.
-fn copy_untracked(src: &Path, dest: &Path, rel: &Path, known: &BTreeSet<Slot>) -> io::Result<()> {
-	for entry in std::fs::read_dir(src.join(rel))? {
-		let entry = entry?;
-		let name = entry.file_name();
-		let child = rel.join(&name);
-		let kind = entry.file_type()?;
-		if kind.is_dir() {
-			std::fs::create_dir_all(dest.join(&child))?;
-			copy_untracked(src, dest, &child, known)?;
-		} else if kind.is_file() && !known.contains(&(rel.to_path_buf(), name)) {
-			std::fs::copy(src.join(&child), dest.join(&child))?;
+/// `(dir, name)` as a path relative to the root.
+fn slot_path((dir, name): &Slot) -> PathBuf {
+	dir.join(name)
+}
+
+/// Every directory and regular file under `root`, relative to it. Only regular files
+/// and directories belong in a store; anything else is skipped.
+fn scan(root: &Path) -> io::Result<(BTreeSet<PathBuf>, BTreeSet<Slot>)> {
+	let (mut dirs, mut files) = (BTreeSet::new(), BTreeSet::new());
+	let mut stack = vec![PathBuf::new()];
+	while let Some(rel) = stack.pop() {
+		for entry in std::fs::read_dir(root.join(&rel))? {
+			let entry = entry?;
+			let kind = entry.file_type()?;
+			if kind.is_dir() {
+				let child = rel.join(entry.file_name());
+				dirs.insert(child.clone());
+				stack.push(child);
+			} else if kind.is_file() {
+				files.insert((rel.clone(), entry.file_name()));
+			}
 		}
 	}
-	Ok(())
+	Ok((dirs, files))
 }
 
-// Each method holds the model lock across the real operation, so the model and the
-// directory never disagree about the order operations happened in.
+/// The content of the regular file at `path`, or `None` if no file is there.
+fn read_if_file(path: &Path) -> io::Result<Option<Vec<u8>>> {
+	match std::fs::symlink_metadata(path) {
+		Ok(meta) if meta.is_file() => std::fs::read(path).map(Some),
+		Ok(_) => Ok(None),
+		Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+		Err(e) => Err(e),
+	}
+}
+
+// Each method holds the model lock across the real directory operation, so the model
+// and the directory never disagree about the order those happened in.
+// `create_new_write` lets go after the create: its fault points may pause, and the
+// content writes that follow have no order to keep.
 #[allow(clippy::significant_drop_tightening)]
 #[async_trait]
 impl StoreFs for SimFs {
-	async fn create_new_write(&self, path: &Path, bytes: Vec<u8>) -> io::Result<()> {
+	async fn create_new_write(&self, path: &Path, bytes: Vec<u8>, policy: SyncPolicy, points: WritePoints) -> io::Result<()> {
 		let slot = self.slot(path)?;
-		let mut model = self.lock();
-		model.adopt(&slot, path)?;
-		create_new_write_blocking(path, &bytes)?;
-		let ino = model.new_inode(Vec::new(), bytes);
-		model.live.insert(slot.clone(), ino);
-		model.pending.push(DirOp::Add { slot, ino });
+		let (file, ino) = {
+			let mut model = self.lock();
+			self.adopt(&mut model, &slot, path)?;
+			let file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+			let ino = model.new_inode(Vec::new(), Vec::new());
+			model.live.insert(slot.clone(), ino);
+			model.pending.push(DirOp::Add { slot, ino });
+			(file, ino)
+		};
+		if let Err(e) = self.fill(file, ino, bytes, policy, points).await {
+			// As `RealFs` does, remove the file this call created. The removal is as
+			// unsynced as the create, so a power cut may still bring the file back.
+			if let Err(remove_err) = self.remove_file(path).await {
+				tracing::warn!(path = %path.display(), cause = %e, error = %remove_err, "SimFs could not remove a partially written file");
+			}
+			return Err(e);
+		}
 		Ok(())
 	}
 
 	async fn sync_file(&self, path: &Path) -> io::Result<()> {
 		let slot = self.slot(path)?;
 		let mut model = self.lock();
-		model.adopt(&slot, path)?;
+		self.adopt(&mut model, &slot, path)?;
 		let ino = model.live_ino(&slot, path)?;
+		// The fsync makes durable whatever the file holds now, including bytes written
+		// behind `SimFs`'s back.
+		let bytes = std::fs::read(path)?;
 		let inode = &mut model.inodes[ino];
-		inode.durable.clone_from(&inode.current);
+		inode.durable.clone_from(&bytes);
+		inode.current = bytes;
 		model.file_syncs += 1;
 		Ok(())
 	}
@@ -368,8 +570,8 @@ impl StoreFs for SimFs {
 	async fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()> {
 		let (src_slot, dst_slot) = (self.slot(src)?, self.slot(dst)?);
 		let mut model = self.lock();
-		model.adopt(&src_slot, src)?;
-		model.adopt(&dst_slot, dst)?;
+		self.adopt(&mut model, &src_slot, src)?;
+		self.adopt(&mut model, &dst_slot, dst)?;
 		let ino = model.live_ino(&src_slot, src)?;
 		std::fs::hard_link(src, dst)?;
 		model.live.insert(dst_slot.clone(), ino);
@@ -380,8 +582,8 @@ impl StoreFs for SimFs {
 	async fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
 		let (from_slot, to_slot) = (self.slot(from)?, self.slot(to)?);
 		let mut model = self.lock();
-		model.adopt(&from_slot, from)?;
-		model.adopt(&to_slot, to)?;
+		self.adopt(&mut model, &from_slot, from)?;
+		self.adopt(&mut model, &to_slot, to)?;
 		let ino = model.live_ino(&from_slot, from)?;
 		std::fs::rename(from, to)?;
 		if from_slot != to_slot {
@@ -395,7 +597,7 @@ impl StoreFs for SimFs {
 	async fn remove_file(&self, path: &Path) -> io::Result<()> {
 		let slot = self.slot(path)?;
 		let mut model = self.lock();
-		model.adopt(&slot, path)?;
+		self.adopt(&mut model, &slot, path)?;
 		remove_file_blocking(path)?;
 		if model.live.remove(&slot).is_some() {
 			model.pending.push(DirOp::Remove { slot });
@@ -417,7 +619,9 @@ mod tests {
 	use std::collections::HashSet;
 
 	use super::*;
-	use crate::types::durable::fs::{write_new_durable, SyncPolicy};
+	use crate::types::durable::{
+		fault::{arm, FaultAction, FaultPoint}, fs::{write_new_durable, SyncPolicy, WritePoints}
+	};
 
 	const SEEDS: u64 = 256;
 
@@ -459,11 +663,12 @@ mod tests {
 		(0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(salt) | 1).collect()
 	}
 
-	/// A store root with a `segments/` directory, and the `SimFs` over it.
+	/// A store root with a `segments/` directory, and the `SimFs` over it, which
+	/// trusts Turso's files as the store's crash tests will.
 	fn store() -> (tempfile::TempDir, SimFs) {
 		let root = tempfile::tempdir().unwrap();
 		std::fs::create_dir(root.path().join("segments")).unwrap();
-		let sim = SimFs::new(root.path());
+		let sim = SimFs::exempting(root.path(), SimFs::turso_file).unwrap();
 		(root, sim)
 	}
 
@@ -482,12 +687,12 @@ mod tests {
 		let (root, sim) = store();
 		let segments = root.path().join("segments");
 		let durable = payload(4096, 1);
-		write_new_durable(&sim, &segments, "a~g1~p1.weftseg", durable.clone(), SyncPolicy::Full).await.unwrap();
+		write_new_durable(&sim, &segments, "a~g1~p1.weftseg", durable.clone(), SyncPolicy::Full, WritePoints::NONE).await.unwrap();
 		sim.sync_dir(&segments).await.unwrap();
-		// Untracked files (Turso's) are copied as they are; unsynced writes after the
+		// Exempt files (Turso's) are copied as they are; unsynced writes after the
 		// directory sync must not disturb the synced frame.
 		std::fs::write(root.path().join("segment_index.db"), b"turso pages").unwrap();
-		write_new_durable(&sim, &segments, "a~g2~p2.weftseg", payload(512, 2), SyncPolicy::None).await.unwrap();
+		write_new_durable(&sim, &segments, "a~g2~p2.weftseg", payload(512, 2), SyncPolicy::None, WritePoints::NONE).await.unwrap();
 
 		for seed in 0..SEEDS {
 			let image = cut(&sim, seed);
@@ -502,7 +707,7 @@ mod tests {
 		let (root, sim) = store();
 		let segments = root.path().join("segments");
 		let written = payload(1000, 3);
-		write_new_durable(&sim, &segments, "a~g1~p1.weftseg", written.clone(), SyncPolicy::None).await.unwrap();
+		write_new_durable(&sim, &segments, "a~g1~p1.weftseg", written.clone(), SyncPolicy::None, WritePoints::NONE).await.unwrap();
 
 		let seen: HashSet<Outcome> = outcomes(&sim, "segments/a~g1~p1.weftseg", &written).into_iter().collect();
 		let every = HashSet::from([Outcome::Absent, Outcome::Empty, Outcome::Prefix, Outcome::ZeroFilled, Outcome::Complete]);
@@ -521,7 +726,7 @@ mod tests {
 		let segments = root.path().join("segments");
 		let frames: Vec<_> = (0..4u8).map(|i| (format!("a~g{i}~p{i}.weftseg"), payload(300 + 100 * usize::from(i), i))).collect();
 		for (name, bytes) in &frames {
-			write_new_durable(&sim, &segments, name, bytes.clone(), SyncPolicy::Full).await.unwrap();
+			write_new_durable(&sim, &segments, name, bytes.clone(), SyncPolicy::Full, WritePoints::NONE).await.unwrap();
 		}
 		sim.sync_dir(&segments).await.unwrap();
 
@@ -538,7 +743,7 @@ mod tests {
 		let (root, sim) = store();
 		let segments = root.path().join("segments");
 		let written = payload(2000, 4);
-		write_new_durable(&sim, &segments, "a~g1~p1.weftseg", written.clone(), SyncPolicy::None).await.unwrap();
+		write_new_durable(&sim, &segments, "a~g1~p1.weftseg", written.clone(), SyncPolicy::None, WritePoints::NONE).await.unwrap();
 		sim.sync_dir(&segments).await.unwrap();
 
 		let seen = outcomes(&sim, "segments/a~g1~p1.weftseg", &written);
@@ -551,7 +756,7 @@ mod tests {
 		let (root, sim) = store();
 		let segments = root.path().join("segments");
 		let written = payload(700, 5);
-		write_new_durable(&sim, &segments, "a~g1~p1.weftseg", written.clone(), SyncPolicy::Full).await.unwrap();
+		write_new_durable(&sim, &segments, "a~g1~p1.weftseg", written.clone(), SyncPolicy::Full, WritePoints::NONE).await.unwrap();
 
 		let seen: HashSet<Outcome> = outcomes(&sim, "segments/a~g1~p1.weftseg", &written).into_iter().collect();
 		assert_eq!(seen, HashSet::from([Outcome::Absent, Outcome::Complete]), "the bytes are durable, the name is not");
@@ -566,7 +771,7 @@ mod tests {
 		let (root, sim) = store();
 		let segments = root.path().join("segments");
 		let written = payload(64, 6);
-		write_new_durable(&sim, &segments, ".tmp-a~g1~p1.weftpart", written.clone(), SyncPolicy::Full).await.unwrap();
+		write_new_durable(&sim, &segments, ".tmp-a~g1~p1.weftpart", written.clone(), SyncPolicy::Full, WritePoints::NONE).await.unwrap();
 		sim.sync_dir(&segments).await.unwrap();
 		sim.rename(&segments.join(".tmp-a~g1~p1.weftpart"), &segments.join("a~g1~p1.weftpart")).await.unwrap();
 		assert!(segments.join("a~g1~p1.weftpart").exists() && !segments.join(".tmp-a~g1~p1.weftpart").exists(), "the live directory has the rename");
@@ -593,7 +798,7 @@ mod tests {
 		let segments = root.path().join("segments");
 		let written = payload(64, 7);
 		// Neither the create nor the rename is directory-synced.
-		write_new_durable(&sim, &segments, ".tmp-x", written.clone(), SyncPolicy::Full).await.unwrap();
+		write_new_durable(&sim, &segments, ".tmp-x", written.clone(), SyncPolicy::Full, WritePoints::NONE).await.unwrap();
 		sim.rename(&segments.join(".tmp-x"), &segments.join("x")).await.unwrap();
 
 		let mut seen = HashSet::new();
@@ -611,7 +816,7 @@ mod tests {
 		let (root, sim) = store();
 		let segments = root.path().join("segments");
 		let written = payload(128, 8);
-		write_new_durable(&sim, &segments, "old", written.clone(), SyncPolicy::Full).await.unwrap();
+		write_new_durable(&sim, &segments, "old", written.clone(), SyncPolicy::Full, WritePoints::NONE).await.unwrap();
 		sim.sync_dir(&segments).await.unwrap();
 		std::fs::create_dir(root.path().join("backup")).unwrap();
 		sim.hard_link(&segments.join("old"), &root.path().join("backup/old")).await.unwrap();
@@ -638,15 +843,189 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn operations_pass_through_to_the_real_directory() {
+	async fn writes_behind_simfs_back_are_not_durable() {
 		let (root, sim) = store();
 		let segments = root.path().join("segments");
+		// As the store writes seal frames and sidecars today: with tokio::fs::write,
+		// outside StoreFs, and never synced.
+		let frame = payload(900, 9);
+		std::fs::write(segments.join("a-1.weftseg"), &frame).unwrap();
+		std::fs::write(root.path().join("segment_index.db"), b"turso pages").unwrap();
+		std::fs::write(root.path().join("segment_index.db-log"), b"turso log").unwrap();
+
+		let seen: HashSet<Outcome> = outcomes(&sim, "segments/a-1.weftseg", &frame).into_iter().collect();
+		let every = HashSet::from([Outcome::Absent, Outcome::Empty, Outcome::Prefix, Outcome::ZeroFilled, Outcome::Complete]);
+		assert_eq!(seen, every, "a file written behind SimFs's back can come back torn or absent");
+		for seed in 0..16 {
+			let image = cut(&sim, seed);
+			assert_eq!(std::fs::read(image.path().join("segment_index.db")).unwrap(), b"turso pages", "seed {seed}: exempt files are copied as they are");
+			assert_eq!(std::fs::read(image.path().join("segment_index.db-log")).unwrap(), b"turso log", "seed {seed}");
+		}
+		assert!(SimFs::turso_file(Path::new("db/metadata.db")) && !SimFs::turso_file(Path::new("segments/a-1.weftseg")) && !SimFs::turso_file(Path::new("segments/a-1.weftpart")));
+	}
+
+	#[tokio::test]
+	async fn files_that_predate_the_simulation_are_its_durable_baseline() {
+		let root = tempfile::tempdir().unwrap();
+		let segments = root.path().join("segments");
+		std::fs::create_dir(&segments).unwrap();
+		let (kept, old, removed) = (payload(300, 10), payload(400, 11), payload(200, 12));
+		std::fs::write(segments.join("kept"), &kept).unwrap();
+		std::fs::write(segments.join("rewritten"), &old).unwrap();
+		std::fs::write(segments.join("removed"), &removed).unwrap();
+		let sim = SimFs::new(root.path()).unwrap();
+
+		// Behind SimFs's back, as the in-place reconcile and the unlinks do today.
+		let new = payload(500, 13);
+		std::fs::write(segments.join("rewritten"), &new).unwrap();
+		std::fs::remove_file(segments.join("removed")).unwrap();
+
+		let (mut rewritten, mut gone) = (HashSet::new(), HashSet::new());
+		for seed in 0..SEEDS {
+			let image = cut(&sim, seed);
+			assert_eq!(outcome(image.path(), "segments/kept", &kept), Outcome::Complete, "seed {seed}: an untouched file is durable");
+			let bytes = std::fs::read(image.path().join("segments/rewritten")).unwrap();
+			rewritten.insert(if bytes == old { None } else { Some(outcome(image.path(), "segments/rewritten", &new)) });
+			gone.insert(outcome(image.path(), "segments/removed", &removed));
+		}
+		let every_tear = [None, Some(Outcome::Empty), Some(Outcome::Prefix), Some(Outcome::ZeroFilled), Some(Outcome::Complete)];
+		assert_eq!(rewritten, HashSet::from(every_tear), "a rewrite in place comes back old, empty, torn or new, never absent");
+		assert_eq!(gone, HashSet::from([Outcome::Complete, Outcome::Absent]), "an unsynced removal may be lost");
+	}
+
+	#[tokio::test]
+	async fn a_file_written_behind_simfs_back_is_not_adopted_as_durable() {
+		let (root, sim) = store();
+		let segments = root.path().join("segments");
+		// Written outside StoreFs, then renamed and directory-synced through it, as a
+		// sidecar's tmp-then-rename would be.
+		let bytes = payload(600, 14);
+		std::fs::write(segments.join(".tmp-a-1.weftpart"), &bytes).unwrap();
+		sim.rename(&segments.join(".tmp-a-1.weftpart"), &segments.join("a-1.weftpart")).await.unwrap();
+		sim.sync_dir(&segments).await.unwrap();
+
+		let seen: HashSet<Outcome> = outcomes(&sim, "segments/a-1.weftpart", &bytes).into_iter().collect();
+		assert_eq!(seen, HashSet::from([Outcome::Empty, Outcome::Prefix, Outcome::ZeroFilled, Outcome::Complete]), "the name is durable, the unsynced bytes are not");
+		for seed in 0..16 {
+			assert_eq!(outcome(cut(&sim, seed).path(), "segments/.tmp-a-1.weftpart", &bytes), Outcome::Absent, "seed {seed}");
+		}
+
+		sim.sync_file(&segments.join("a-1.weftpart")).await.unwrap();
+		assert!(outcomes(&sim, "segments/a-1.weftpart", &bytes).iter().all(|o| *o == Outcome::Complete), "a sync through SimFs makes them durable");
+	}
+
+	#[tokio::test]
+	async fn a_tracked_file_changed_behind_simfs_back_can_tear_or_reappear() {
+		let (root, sim) = store();
+		let segments = root.path().join("segments");
+		let (old, new) = (payload(800, 15), payload(800, 16));
+		write_new_durable(&sim, &segments, "a-1.weftseg", old.clone(), SyncPolicy::Full, WritePoints::NONE).await.unwrap();
+		write_new_durable(&sim, &segments, "a-2.weftseg", old.clone(), SyncPolicy::Full, WritePoints::NONE).await.unwrap();
+		sim.sync_dir(&segments).await.unwrap();
+		// An in-place rewrite and an unlink, outside StoreFs.
+		std::fs::write(segments.join("a-1.weftseg"), &new).unwrap();
+		std::fs::remove_file(segments.join("a-2.weftseg")).unwrap();
+
+		let (mut rewritten, mut removed) = (HashSet::new(), HashSet::new());
+		for seed in 0..SEEDS {
+			let image = cut(&sim, seed);
+			let bytes = std::fs::read(image.path().join("segments/a-1.weftseg")).unwrap();
+			rewritten.insert(if bytes == old { None } else { Some(outcome(image.path(), "segments/a-1.weftseg", &new)) });
+			removed.insert(outcome(image.path(), "segments/a-2.weftseg", &old));
+		}
+		assert!(rewritten.contains(&None) && rewritten.iter().any(|o| o.is_some_and(Outcome::torn)), "old or torn: {rewritten:?}");
+		assert_eq!(removed, HashSet::from([Outcome::Complete, Outcome::Absent]));
+	}
+
+	#[tokio::test]
+	async fn syncing_a_links_directory_leaves_the_sources_create_pending() {
+		let (root, sim) = store();
+		let segments = root.path().join("segments");
+		let backup = root.path().join("backup");
+		std::fs::create_dir(&backup).unwrap();
+		let written = payload(256, 17);
+		write_new_durable(&sim, &segments, "f", written.clone(), SyncPolicy::Full, WritePoints::NONE).await.unwrap();
+		sim.hard_link(&segments.join("f"), &backup.join("f")).await.unwrap();
+		sim.sync_dir(&backup).await.unwrap();
+		assert_eq!(sim.pending_dir_ops(), 1, "segments/ was never synced, so its create is still pending");
+
+		let mut seen = HashSet::new();
+		for seed in 0..SEEDS {
+			let image = cut(&sim, seed);
+			seen.insert((outcome(image.path(), "segments/f", &written), outcome(image.path(), "backup/f", &written)));
+		}
+		assert_eq!(seen, HashSet::from([(Outcome::Complete, Outcome::Complete), (Outcome::Absent, Outcome::Complete)]), "the link survives, with or without the original name");
+	}
+
+	#[tokio::test]
+	async fn a_create_never_applies_without_the_rename_that_freed_its_name() {
+		let (root, sim) = store();
+		let segments = root.path().join("segments");
+		let (old, new) = (payload(128, 18), payload(96, 19));
+		write_new_durable(&sim, &segments, "x", old.clone(), SyncPolicy::Full, WritePoints::NONE).await.unwrap();
+		sim.sync_dir(&segments).await.unwrap();
+		sim.rename(&segments.join("x"), &segments.join("y")).await.unwrap();
+		write_new_durable(&sim, &segments, "x", new.clone(), SyncPolicy::Full, WritePoints::NONE).await.unwrap();
+
+		for seed in 0..SEEDS {
+			let image = cut(&sim, seed);
+			let (x, y) = (std::fs::read(image.path().join("segments/x")).ok(), std::fs::read(image.path().join("segments/y")).ok());
+			assert!(x.as_ref() == Some(&old) || y.as_ref() == Some(&old), "seed {seed}: the old file keeps a name (x={:?}, y={:?})", x.map(|b| b.len()), y.map(|b| b.len()));
+		}
+	}
+
+	#[tokio::test]
+	async fn every_name_of_a_file_shows_the_same_content() {
+		let (root, sim) = store();
+		let segments = root.path().join("segments");
+		let backup = root.path().join("backup");
+		std::fs::create_dir(&backup).unwrap();
+		let written = payload(1500, 20);
+		write_new_durable(&sim, &segments, "f", written.clone(), SyncPolicy::None, WritePoints::NONE).await.unwrap();
+		sim.hard_link(&segments.join("f"), &backup.join("f")).await.unwrap();
+		sim.sync_dir(&segments).await.unwrap();
+		sim.sync_dir(&backup).await.unwrap();
+
+		let mut torn = 0;
+		for seed in 0..SEEDS {
+			let image = cut(&sim, seed);
+			let (a, b) = (std::fs::read(image.path().join("segments/f")).unwrap(), std::fs::read(image.path().join("backup/f")).unwrap());
+			assert_eq!(a, b, "seed {seed}: two names of one inode cannot hold different bytes");
+			torn += usize::from(outcome(image.path(), "segments/f", &written).torn());
+		}
+		assert!(torn > 0, "the unsynced bytes do tear");
+	}
+
+	#[tokio::test]
+	async fn a_failed_write_removes_its_file_but_not_durably() {
+		let (root, sim) = store();
+		let segments = root.path().join("segments");
+		let written = payload(64, 21);
+		let point = FaultPoint::MOutputWritten;
+		let _armed = arm(point, FaultAction::ReturnErr);
+		let err = write_new_durable(&sim, &segments, "out", written.clone(), SyncPolicy::Full, WritePoints { written: Some(point), ..WritePoints::NONE }).await.unwrap_err();
+		assert_eq!(crate::types::durable::fault::injected_point(&err), Some(point));
+		assert!(!segments.join("out").exists(), "the live directory no longer has the file");
+		assert_eq!(sim.file_syncs(), 0, "the write failed before its fsync");
+
+		// Neither the create nor the removal is directory-synced, so a power cut may keep
+		// the create alone: litter for recovery, never a durable frame.
+		let seen: HashSet<Outcome> = outcomes(&sim, "segments/out", &written).into_iter().collect();
+		assert!(seen.contains(&Outcome::Absent) && seen.iter().any(|o| o.torn()), "{seen:?}");
+	}
+
+	#[tokio::test]
+	async fn operations_pass_through_to_the_real_directory() {
+		let root = tempfile::tempdir().unwrap();
+		let segments = root.path().join("segments");
+		std::fs::create_dir(&segments).unwrap();
 		// A file that predates the simulation counts as durable and is never clobbered.
 		std::fs::write(segments.join("a-1.weftseg"), b"legacy frame").unwrap();
-		let err = sim.create_new_write(&segments.join("a-1.weftseg"), b"clobber".to_vec()).await.unwrap_err();
+		let sim = SimFs::new(root.path()).unwrap();
+		let err = sim.create_new_write(&segments.join("a-1.weftseg"), b"clobber".to_vec(), SyncPolicy::Full, WritePoints::NONE).await.unwrap_err();
 		assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
 
-		sim.create_new_write(&segments.join("new"), b"live bytes".to_vec()).await.unwrap();
+		sim.create_new_write(&segments.join("new"), b"live bytes".to_vec(), SyncPolicy::None, WritePoints::NONE).await.unwrap();
 		let names: Vec<_> = sim.read_dir(&segments).await.unwrap().into_iter().map(|e| e.name).collect();
 		assert_eq!(names, vec![OsString::from("a-1.weftseg"), OsString::from("new")]);
 		assert_eq!(sim.metadata(&segments.join("new")).await.unwrap().len, 10);
@@ -663,8 +1042,8 @@ mod tests {
 	async fn misuse_is_refused() {
 		let (root, sim) = store();
 		let outside = tempfile::tempdir().unwrap();
-		assert_eq!(sim.create_new_write(&outside.path().join("x"), vec![1]).await.unwrap_err().kind(), io::ErrorKind::InvalidInput, "paths outside the root are refused");
-		assert_eq!(sim.create_new_write(&root.path().join("segments/../x"), vec![1]).await.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+		assert_eq!(sim.create_new_write(&outside.path().join("x"), vec![1], SyncPolicy::Full, WritePoints::NONE).await.unwrap_err().kind(), io::ErrorKind::InvalidInput, "paths outside the root are refused");
+		assert_eq!(sim.create_new_write(&root.path().join("segments/../x"), vec![1], SyncPolicy::Full, WritePoints::NONE).await.unwrap_err().kind(), io::ErrorKind::InvalidInput);
 		assert_eq!(sim.rename(&root.path().join("segments"), &root.path().join("moved")).await.unwrap_err().kind(), io::ErrorKind::Unsupported, "directory renames are not simulated");
 		assert_eq!(sim.power_cut(0, &root.path().join("image")).unwrap_err().kind(), io::ErrorKind::InvalidInput, "the image cannot live inside the root");
 		std::fs::write(outside.path().join("stale"), b"x").unwrap();

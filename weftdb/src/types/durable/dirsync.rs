@@ -200,7 +200,7 @@ mod tests {
 	use tokio::sync::Barrier;
 
 	use super::*;
-	use crate::types::durable::fs::{FsEntry, FsMetadata, RealFs};
+	use crate::types::durable::fs::{FsEntry, FsMetadata, RealFs, SyncPolicy, WritePoints};
 
 	/// A [`StoreFs`] whose `sync_dir` only records itself: when each fsync began and
 	/// ended on a shared logical clock, after an optional delay or gate, and optionally
@@ -229,7 +229,7 @@ mod tests {
 
 	#[async_trait]
 	impl StoreFs for ProbeFs {
-		async fn create_new_write(&self, _: &Path, _: Vec<u8>) -> io::Result<()> {
+		async fn create_new_write(&self, _: &Path, _: Vec<u8>, _: SyncPolicy, _: WritePoints) -> io::Result<()> {
 			unreachable!()
 		}
 

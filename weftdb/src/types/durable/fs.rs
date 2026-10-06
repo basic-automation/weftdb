@@ -12,12 +12,15 @@
 //! real directory, so the existing read paths see the live state unchanged.
 
 use std::{
-	ffi::OsString, fmt, io::{self, Write}, path::Path
+	ffi::OsString, fmt, fs::File, io::{self, Write}, path::{Component, Path}
 };
 
 use async_trait::async_trait;
 
-/// Whether [`write_new_durable`] makes the file's bytes durable before it returns.
+use super::fault::{self, FaultPoint};
+
+/// Whether [`StoreFs::create_new_write`] (and so [`write_new_durable`]) makes the
+/// file's bytes durable before it returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncPolicy {
 	/// `sync_all` the file before returning: strict-mode seals and every maintenance
@@ -26,6 +29,28 @@ pub enum SyncPolicy {
 	/// Leave the bytes to the page cache. Only relaxed-mode seals (S17) use this; a
 	/// background syncer later makes them durable and advances `synced_epoch`.
 	None,
+}
+
+/// Fault points [`StoreFs::create_new_write`] hits between its steps (design section
+/// 11), so the crash tests can stop a write in the states the protocols name. Both
+/// default to none.
+///
+/// The point after the fsync (`S-frame-synced`, `M-output-synced`) needs no hook here:
+/// nothing happens between the fsync and the return, so the caller hits it itself.
+/// A point armed with `ReturnErr` makes the write fail and remove its own file, as any
+/// write error does, so it is not a process crash at that point; `Abort` is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WritePoints {
+	/// Hit once the name exists and before any byte is written: `S-frame-created`.
+	pub created: Option<FaultPoint>,
+	/// Hit once every byte is written and before the fsync: `S-frame-written`,
+	/// `M-output-written`.
+	pub written: Option<FaultPoint>,
+}
+
+impl WritePoints {
+	/// No fault points: what every write outside the crash tests passes.
+	pub const NONE: Self = Self { created: None, written: None };
 }
 
 /// What [`StoreFs::metadata`] reports about a path (symlinks are followed).
@@ -54,20 +79,35 @@ pub struct FsEntry {
 /// which on a loaded HDD array is tens of milliseconds.
 #[async_trait]
 pub trait StoreFs: Send + Sync + fmt::Debug {
-	/// Create `path`, which must not exist (`O_CREAT | O_EXCL`), and write `bytes` to
-	/// it. Nothing is synced.
+	/// Create `path`, which must not exist (`O_CREAT | O_EXCL`), write `bytes` to it
+	/// and, under [`SyncPolicy::Full`], `sync_all` it, hitting `points` between the
+	/// steps.
+	///
+	/// The fsync goes through the handle that wrote the bytes (SEAL-4, M4). Reopening
+	/// the file by path to fsync it would cost an extra open and, worse, could miss a
+	/// writeback error: if the error happened while no descriptor was open and the
+	/// inode was then evicted, the fresh descriptor's fsync reports success for data
+	/// that never reached the disk (fsyncgate). This does not make the directory entry
+	/// durable: that is [`sync_dir`](Self::sync_dir)'s job.
 	///
 	/// # Errors
 	///
 	/// `AlreadyExists` if `path` exists; the existing file is left untouched. On any
-	/// other error no file is left at `path`: a file this call created but could not
-	/// fully write is removed again, because a short frame under a final name is
-	/// exactly the torn-frame window the design closes.
-	async fn create_new_write(&self, path: &Path, bytes: Vec<u8>) -> io::Result<()>;
+	/// other error, including an fsync error or an error injected at one of `points`,
+	/// no file is left at `path`: a file this call created but could not fully write
+	/// or sync is removed again, because a short frame under a final name is exactly
+	/// the torn-frame window the design closes, and a frame whose fsync failed was
+	/// never durable.
+	async fn create_new_write(&self, path: &Path, bytes: Vec<u8>, policy: SyncPolicy, points: WritePoints) -> io::Result<()>;
 
 	/// Make the contents of the existing file at `path` durable (`fsync`; on Apple
 	/// targets std issues `F_FULLFSYNC`). It does not make the file's directory entry
 	/// durable: that is [`sync_dir`](Self::sync_dir)'s job.
+	///
+	/// This opens the file afresh, so it is for files written earlier and left to the
+	/// page cache, such as relaxed-mode frames that S17's background syncer catches up
+	/// on. A file written now is synced through its own handle by
+	/// [`create_new_write`](Self::create_new_write) instead.
 	///
 	/// # Errors
 	///
@@ -147,9 +187,9 @@ where
 
 #[async_trait]
 impl StoreFs for RealFs {
-	async fn create_new_write(&self, path: &Path, bytes: Vec<u8>) -> io::Result<()> {
+	async fn create_new_write(&self, path: &Path, bytes: Vec<u8>, policy: SyncPolicy, points: WritePoints) -> io::Result<()> {
 		let path = path.to_path_buf();
-		blocking(move || create_new_write_blocking(&path, &bytes)).await
+		blocking(move || create_new_write_blocking(&path, &bytes, policy, points)).await
 	}
 
 	async fn sync_file(&self, path: &Path) -> io::Result<()> {
@@ -188,15 +228,30 @@ impl StoreFs for RealFs {
 	}
 }
 
-/// `create_new` + `write_all`, removing the file again if the write fails part way.
-/// Shared with `SimFs`, which performs the real operation before recording it.
-pub(super) fn create_new_write_blocking(path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// `create_new`, then [`fill`] on the same handle, removing the file again if any
+/// step after the create fails. All of it runs in one `spawn_blocking` task.
+fn create_new_write_blocking(path: &Path, bytes: &[u8], policy: SyncPolicy, points: WritePoints) -> io::Result<()> {
 	let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
-	if let Err(e) = file.write_all(bytes) {
+	if let Err(e) = fill(&mut file, bytes, policy, points) {
 		// Close first: Windows refuses to remove a file that is still open.
 		drop(file);
 		discard_own_file(path, &e);
 		return Err(e);
+	}
+	Ok(())
+}
+
+/// The steps after the create: write, then fsync under `Full`, through one handle.
+fn fill(file: &mut File, bytes: &[u8], policy: SyncPolicy, points: WritePoints) -> io::Result<()> {
+	if let Some(point) = points.created {
+		fault::hit_blocking(point)?;
+	}
+	file.write_all(bytes)?;
+	if let Some(point) = points.written {
+		fault::hit_blocking(point)?;
+	}
+	if policy == SyncPolicy::Full {
+		file.sync_all()?;
 	}
 	Ok(())
 }
@@ -261,9 +316,10 @@ pub(super) fn metadata_blocking(path: &Path) -> io::Result<FsMetadata> {
 
 /// Write a complete frame under a new final name and return its CRC trailer.
 ///
-/// This is `create_new` at `dir/name`, `write_all`, and `sync_all` when `policy` is
-/// [`SyncPolicy::Full`]. The returned value is the frame's trailing CRC-32, which the
-/// index records as `frame_crc`.
+/// This is `create_new` at `dir/name`, `write_all`, and `sync_all` on the same handle
+/// when `policy` is [`SyncPolicy::Full`], with the crash tests' `points` between the
+/// steps (see [`StoreFs::create_new_write`]). The returned value is the frame's
+/// trailing CRC-32, which the index records as `frame_crc`.
 ///
 /// There is no temporary name and no rename. The name is never reused (design
 /// section 4), so `create_new` both proves nobody else owns it and makes a torn write
@@ -283,26 +339,15 @@ pub(super) fn metadata_blocking(path: &Path) -> io::Result<FsMetadata> {
 /// - `InvalidInput`, before anything is created, if `name` is not a single plain path
 ///   component or `bytes` is too short to end in a 4-byte CRC trailer;
 /// - `AlreadyExists` if `dir/name` exists, which is left untouched;
-/// - any create, write or sync error. On every error except `AlreadyExists`, no file
-///   is left at `dir/name`.
-pub async fn write_new_durable<F>(fs: &F, dir: &Path, name: &str, bytes: Vec<u8>, policy: SyncPolicy) -> io::Result<u32>
+/// - any create, write or sync error, or an error injected at one of `points`. On
+///   every error except `AlreadyExists`, no file is left at `dir/name`.
+pub async fn write_new_durable<F>(fs: &F, dir: &Path, name: &str, bytes: Vec<u8>, policy: SyncPolicy, points: WritePoints) -> io::Result<u32>
 where
 	F: StoreFs + ?Sized,
 {
 	check_file_name(name)?;
 	let crc = trailer_crc(&bytes)?;
-	let path = dir.join(name);
-	fs.create_new_write(&path, bytes).await?;
-	if policy == SyncPolicy::Full {
-		if let Err(e) = fs.sync_file(&path).await {
-			// The file is ours (create_new succeeded), so removing it cannot touch anyone
-			// else's data. Its contents were never acknowledged as durable.
-			if let Err(remove_err) = fs.remove_file(&path).await {
-				tracing::warn!(path = %path.display(), cause = %e, error = %remove_err, "could not remove a frame whose fsync failed; recovery will quarantine it");
-			}
-			return Err(e);
-		}
-	}
+	fs.create_new_write(&dir.join(name), bytes, policy, points).await?;
 	Ok(crc)
 }
 
@@ -315,12 +360,15 @@ fn trailer_crc(bytes: &[u8]) -> io::Result<u32> {
 	}
 }
 
-/// Accept only a single, plain path component, so a name can never escape `dir`.
-/// Frame names are `enc`-escaped (design section 4) and contain no separator; both
-/// separators are rejected on every platform so a name valid on Unix is also safe on
-/// Windows.
+/// Accept only a name that is exactly one plain path component, so it can never
+/// escape `dir`. Frame names are `enc`-escaped (design section 4) and contain none of
+/// the rejected characters. Both separators and `:` are rejected on every platform, so
+/// a name valid on Unix is also safe on Windows, where `dir.join("C:x")` replaces `dir`
+/// with a drive-relative path and `a:b` names an NTFS alternate data stream of `a`.
 fn check_file_name(name: &str) -> io::Result<()> {
-	if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0']) {
+	let mut components = Path::new(name).components();
+	let single = matches!((components.next(), components.next()), (Some(Component::Normal(_)), None));
+	if !single || name.contains(['/', '\\', '\0', ':']) {
 		return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{name:?} is not a plain file name")));
 	}
 	Ok(())
@@ -328,13 +376,13 @@ fn check_file_name(name: &str) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-	use std::sync::{
-		atomic::{AtomicUsize, Ordering}, Arc
-	};
+	use std::{sync::Arc, time::Duration};
 
+	use tokio::sync::Notify;
 	use weft_physical_type::crc32;
 
 	use super::*;
+	use crate::types::durable::fault::{arm, hits, injected_point, reached, FaultAction};
 
 	/// A frame-shaped byte string: a body followed by its CRC-32, little-endian.
 	fn frame(body: &[u8]) -> Vec<u8> {
@@ -343,55 +391,13 @@ mod tests {
 		bytes
 	}
 
-	/// [`RealFs`], except that `sync_file` always fails, as an fsync EIO would.
-	#[derive(Debug, Default)]
-	struct SyncFailsFs {
-		removes: AtomicUsize,
-	}
-
-	#[async_trait]
-	impl StoreFs for SyncFailsFs {
-		async fn create_new_write(&self, path: &Path, bytes: Vec<u8>) -> io::Result<()> {
-			RealFs.create_new_write(path, bytes).await
-		}
-
-		async fn sync_file(&self, _path: &Path) -> io::Result<()> {
-			Err(io::Error::other("injected fsync failure"))
-		}
-
-		async fn sync_dir(&self, dir: &Path) -> io::Result<()> {
-			RealFs.sync_dir(dir).await
-		}
-
-		async fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()> {
-			RealFs.hard_link(src, dst).await
-		}
-
-		async fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-			RealFs.rename(from, to).await
-		}
-
-		async fn remove_file(&self, path: &Path) -> io::Result<()> {
-			self.removes.fetch_add(1, Ordering::SeqCst);
-			RealFs.remove_file(path).await
-		}
-
-		async fn read_dir(&self, dir: &Path) -> io::Result<Vec<FsEntry>> {
-			RealFs.read_dir(dir).await
-		}
-
-		async fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
-			RealFs.metadata(path).await
-		}
-	}
-
 	#[tokio::test]
 	async fn write_new_durable_writes_the_bytes_and_returns_the_trailer_crc() {
 		let dir = tempfile::tempdir().unwrap();
 		let bytes = frame(b"WEFTSEG body");
 		for policy in [SyncPolicy::Full, SyncPolicy::None] {
 			let name = format!("a~g{}~p1.weftseg", u8::from(policy == SyncPolicy::Full));
-			let crc = write_new_durable(&RealFs, dir.path(), &name, bytes.clone(), policy).await.unwrap();
+			let crc = write_new_durable(&RealFs, dir.path(), &name, bytes.clone(), policy, WritePoints::NONE).await.unwrap();
 			assert_eq!(crc, crc32(b"WEFTSEG body"), "the returned CRC is the frame's trailer");
 			assert_eq!(std::fs::read(dir.path().join(&name)).unwrap(), bytes);
 		}
@@ -404,39 +410,63 @@ mod tests {
 		std::fs::write(&path, b"someone else's frame").unwrap();
 
 		let fs: Arc<dyn StoreFs> = Arc::new(RealFs);
-		let err = write_new_durable(fs.as_ref(), dir.path(), "a~g1~p1.weftseg", frame(b"mine"), SyncPolicy::Full).await.unwrap_err();
+		let err = write_new_durable(fs.as_ref(), dir.path(), "a~g1~p1.weftseg", frame(b"mine"), SyncPolicy::Full, WritePoints::NONE).await.unwrap_err();
 		assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
 		assert_eq!(std::fs::read(&path).unwrap(), b"someone else's frame", "create_new never truncates or removes another writer's file");
 	}
 
+	/// An error between the write and the fsync takes the same path as an fsync error
+	/// (the fsync is the next step on the same handle), so this covers both.
 	#[tokio::test]
-	async fn write_new_durable_leaves_no_file_when_the_fsync_fails() {
+	async fn write_new_durable_leaves_no_file_when_a_step_after_the_create_fails() {
 		let dir = tempfile::tempdir().unwrap();
-		let fs = SyncFailsFs::default();
-		let err = write_new_durable(&fs, dir.path(), "a~g1~p1.weftseg", frame(b"body"), SyncPolicy::Full).await.unwrap_err();
-		assert_eq!(err.to_string(), "injected fsync failure", "the fsync error is the one returned");
-		assert_eq!(fs.removes.load(Ordering::SeqCst), 1, "the half-made frame was removed");
+		let point = FaultPoint::SFrameWritten;
+		let points = WritePoints { written: Some(point), ..WritePoints::NONE };
+		let armed = arm(point, FaultAction::ReturnErr);
+		let err = write_new_durable(&RealFs, dir.path(), "a~g1~p1.weftseg", frame(b"body"), SyncPolicy::Full, points).await.unwrap_err();
+		assert_eq!(injected_point(&err), Some(point), "the step's error is the one returned");
 		assert!(!dir.path().join("a~g1~p1.weftseg").exists(), "no file is left behind on error");
+		drop(armed);
 
-		// Under SyncPolicy::None the fsync never runs, so the same filesystem succeeds.
-		write_new_durable(&fs, dir.path(), "a~g2~p2.weftseg", frame(b"body"), SyncPolicy::None).await.unwrap();
-		assert!(dir.path().join("a~g2~p2.weftseg").exists());
+		write_new_durable(&RealFs, dir.path(), "a~g1~p1.weftseg", frame(b"body"), SyncPolicy::Full, points).await.expect("the name was never taken");
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn the_created_point_sees_an_empty_file_under_the_final_name() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("a~g1~p1.weftseg");
+		let point = FaultPoint::SFrameCreated;
+		let resume = Arc::new(Notify::new());
+		let _armed = arm(point, FaultAction::Pause(resume.clone()));
+		let before = hits(point);
+
+		let bytes = frame(b"body");
+		let write = tokio::spawn({
+			let (dir, bytes) = (dir.path().to_path_buf(), bytes.clone());
+			async move { write_new_durable(&RealFs, &dir, "a~g1~p1.weftseg", bytes, SyncPolicy::Full, WritePoints { created: Some(point), ..WritePoints::NONE }).await }
+		});
+		tokio::time::timeout(Duration::from_secs(10), reached(point, before + 1)).await.expect("the write reaches the point");
+		assert_eq!(std::fs::read(&path).unwrap(), b"", "a crash here leaves an empty file at the final name");
+
+		resume.notify_one();
+		write.await.unwrap().unwrap();
+		assert_eq!(std::fs::read(&path).unwrap(), bytes);
 	}
 
 	#[tokio::test]
 	async fn write_new_durable_rejects_bad_input_before_creating_anything() {
 		let dir = tempfile::tempdir().unwrap();
-		for name in ["", ".", "..", "../escape", "a/b", "a\\b", "nul\0byte"] {
-			let err = write_new_durable(&RealFs, dir.path(), name, frame(b"body"), SyncPolicy::Full).await.unwrap_err();
+		for name in ["", ".", "..", "../escape", "a/b", "a\\b", "nul\0byte", "C:x", "a:b", "/abs", "a/"] {
+			let err = write_new_durable(&RealFs, dir.path(), name, frame(b"body"), SyncPolicy::Full, WritePoints::NONE).await.unwrap_err();
 			assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{name:?} must be rejected");
 		}
-		let err = write_new_durable(&RealFs, dir.path(), "short.weftseg", vec![1, 2, 3], SyncPolicy::Full).await.unwrap_err();
+		let err = write_new_durable(&RealFs, dir.path(), "short.weftseg", vec![1, 2, 3], SyncPolicy::Full, WritePoints::NONE).await.unwrap_err();
 		assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "three bytes cannot hold a CRC trailer");
 		assert!(RealFs.read_dir(dir.path()).await.unwrap().is_empty(), "nothing was created");
 		assert!(!dir.path().parent().unwrap().join("escape").exists());
 
 		let missing = dir.path().join("no-such-dir");
-		let err = write_new_durable(&RealFs, &missing, "a.weftseg", frame(b"body"), SyncPolicy::Full).await.unwrap_err();
+		let err = write_new_durable(&RealFs, &missing, "a.weftseg", frame(b"body"), SyncPolicy::Full, WritePoints::NONE).await.unwrap_err();
 		assert_eq!(err.kind(), io::ErrorKind::NotFound);
 	}
 
@@ -446,8 +476,8 @@ mod tests {
 		let root = dir.path();
 		std::fs::create_dir(root.join("quarantine")).unwrap();
 
-		RealFs.create_new_write(&root.join("b"), b"bee".to_vec()).await.unwrap();
-		assert_eq!(RealFs.create_new_write(&root.join("b"), b"again".to_vec()).await.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+		RealFs.create_new_write(&root.join("b"), b"bee".to_vec(), SyncPolicy::None, WritePoints::NONE).await.unwrap();
+		assert_eq!(RealFs.create_new_write(&root.join("b"), b"again".to_vec(), SyncPolicy::Full, WritePoints::NONE).await.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
 		RealFs.sync_file(&root.join("b")).await.unwrap();
 		RealFs.sync_dir(root).await.unwrap();
 		assert_eq!(RealFs.metadata(&root.join("b")).await.unwrap(), FsMetadata { len: 3, is_dir: false });

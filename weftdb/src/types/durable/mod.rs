@@ -8,8 +8,9 @@
 //!   for production and, under `cfg(test)` or the `fault-injection` feature, `SimFs`
 //!   (in `durable::sim`), which can produce any legal power-cut image of the store.
 //! - [`write_new_durable`] writes a frame under a never-used final name with
-//!   `create_new`, optionally fsyncs it, and returns its CRC trailer. It never
-//!   truncates or replaces an existing file and leaves nothing behind on error.
+//!   `create_new`, optionally fsyncs it through the same handle, and returns its CRC
+//!   trailer. It never truncates or replaces an existing file and leaves nothing
+//!   behind on error. [`WritePoints`] let the crash tests stop it between steps.
 //! - [`DirSyncer`] coalesces directory fsyncs across concurrent writers, and poisons
 //!   itself on the first fsync error.
 //! - [`RootLock`] makes a store root single-process and names the holder when it is
@@ -29,7 +30,7 @@ pub mod sim;
 
 pub use dirsync::DirSyncer;
 pub use fault::FaultPoint;
-pub use fs::{write_new_durable, FsEntry, FsMetadata, RealFs, StoreFs, SyncPolicy};
+pub use fs::{write_new_durable, FsEntry, FsMetadata, RealFs, StoreFs, SyncPolicy, WritePoints};
 pub use lock::{LockHolder, RootLock, RootLockError, LOCK_FILE};
 #[cfg(any(test, feature = "fault-injection"))]
 pub use sim::SimFs;
