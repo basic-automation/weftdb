@@ -8,6 +8,14 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **Interpolation grids requested over HTTP are capped** at 10,000,000 points per
+  request (`weft_server::MAX_INTERPOLATE_OUTPUT_POINTS`), on every
+  `/api/v1/interpolate*` endpoint. A larger grid is a `400` that names its size and the
+  limit, refused before anything is allocated; before, a fine resolution over a long
+  range tried to allocate all of it.
+
 ### Changed
 
 - **`splimes` moved to its own repository** ([basic-automation/splimes](https://github.com/basic-automation/splimes))
@@ -49,6 +57,19 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   except at a leap second: an input at `23:59:60.5` and a grid instant at `00:00:00.5`
   the next day are one POSIX instant, so that point is now `raw` (it was `extrapolated`
   or `interpolated`).
+- **Interpolation errors map to HTTP status by kind.** Invalid polynomial parameters
+  (a degree outside 1–8, a negative or non-finite bounds factor), an input or
+  extrapolated value beyond `f64`'s range, and an oversized grid are `400`s; every
+  engine error was a `500` before.
+- **Turso control plane upgraded 0.6 → 0.8.** ⚠️ This is one-way: once 0.8 writes a
+  store, its MVCC log is v3 and an older WeftDB can no longer open it. Back up the
+  control plane before upgrading.
+- **`.weftpart` sidecars use `postcard` instead of `bincode`** (frame v3). Sidecars
+  written by older versions are ignored: the segment is decoded instead, and the
+  sidecar is rebuilt on the next seal. No data migration is needed.
+- All dependencies updated to their latest major versions, including wgpu 30,
+  Arrow/Parquet 60 and OpenTelemetry 0.33.
+- Builds on stable Rust (MSRV 1.95); nightly is no longer required.
 
 ### Fixed
 

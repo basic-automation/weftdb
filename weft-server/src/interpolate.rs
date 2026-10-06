@@ -8,7 +8,10 @@
 //! to exercise the engine.
 //!
 //! splimes is synchronous and CPU-bound, so every call runs on tokio's blocking pool
-//! (`Interpolator::run_async`), never on an async worker.
+//! (`Interpolator::run_async`), never on an async worker. The output grid comes from the
+//! request (`start`, `end`, `resolution`), so it is capped at
+//! [`MAX_INTERPOLATE_OUTPUT_POINTS`]; a larger grid is a `400`, refused before anything
+//! is allocated.
 //!
 //! ## Numeric boundary (deliberate, documented)
 //!
@@ -56,6 +59,20 @@ pub struct OutputPoint {
 	/// observation), `interpolated` (within the observed span), or `extrapolated`
 	/// (outside it).
 	pub kind: PointKind,
+}
+
+/// The most output points one interpolation request may produce.
+///
+/// The grid is `start..=end` at `resolution`, all three from the request, so without a
+/// cap a nanosecond grid over a day (86 trillion points) would try to allocate itself.
+/// Ten million points is about 0.7 GB of JSON, far beyond any interactive query; larger
+/// reconstructions belong in several requests over sub-ranges.
+pub const MAX_INTERPOLATE_OUTPUT_POINTS: usize = 10_000_000;
+
+/// The interpolator every endpoint here runs: `spline` onto a `resolution` grid on the
+/// default `Backend::Auto`, refusing grids above [`MAX_INTERPOLATE_OUTPUT_POINTS`].
+const fn interpolator(spline: Spline, resolution: Resolution) -> Interpolator {
+	Interpolator::new(spline, resolution).max_points(MAX_INTERPOLATE_OUTPUT_POINTS)
 }
 
 /// Spline method selector. Mirrors [`splimes::Spline`] but with stable,
@@ -189,6 +206,24 @@ impl ApiError {
 	fn internal(message: impl Into<String>) -> Self {
 		Self::Internal(message.into())
 	}
+
+	/// Map an interpolation failure to a status by its variant: a request the engine
+	/// cannot serve as asked (a grid over the cap, bad polynomial parameters, a value or
+	/// an extrapolation beyond `f64`'s range) is the caller's `400`; anything else is a
+	/// `500`.
+	fn from_engine(err: &splimes::Error) -> Self {
+		use splimes::Error as E;
+		match err {
+			E::OutputTooLarge { points } => Self::bad_request(format!("the output grid would have {points} points, more than the {MAX_INTERPOLATE_OUTPUT_POINTS} one request may produce; narrow `start`..`end` or use a coarser `resolution`")),
+			E::NoPoints => Self::bad_request("`points` must not be empty"),
+			E::InvalidTimeRange { .. } => Self::bad_request("`end` must not be before `start`"),
+			E::InvalidDegree { .. } | E::InvalidBoundsFactor(_) | E::ValueOutOfRange { .. } | E::NonFiniteResult { .. } | E::InsufficientPoints { .. } => Self::bad_request(err.to_string()),
+			// GPU failures (only an explicit `Backend::Gpu` surfaces them), a panicked
+			// blocking task (`Task`), the variants `run` never returns, and any variant added
+			// after splimes 1.0 (`Error` is `#[non_exhaustive]`).
+			_ => Self::internal(err.to_string()),
+		}
+	}
 }
 
 /// JSON error envelope.
@@ -216,7 +251,8 @@ impl IntoResponse for ApiError {
 /// # Errors
 ///
 /// Returns [`ApiError::BadRequest`] for an empty point set, a non-finite value,
-/// or an inverted range, and [`ApiError::Internal`] if the engine fails.
+/// an inverted range, an output grid above [`MAX_INTERPOLATE_OUTPUT_POINTS`], or
+/// parameters the engine rejects, and [`ApiError::Internal`] if the engine fails.
 pub async fn interpolate(State(metrics): State<SharedMetrics>, Json(request): Json<InterpolateRequest>) -> Result<Json<InterpolateResponse>, ApiError> {
 	let start = std::time::Instant::now();
 	metrics.record_interpolate_request();
@@ -285,7 +321,7 @@ async fn run_interpolation(points: Vec<Point>, start: DateTime<Utc>, end: DateTi
 	// itself, on tokio's blocking pool, isolated from the result shaping so the
 	// dominant compute cost is attributable on its own. splimes labels every output
 	// point raw / interpolated / extrapolated as it goes.
-	let output = Interpolator::new(spline, resolution).run_async(points, start, end).instrument(tracing::info_span!("interpolate.compute")).await.map_err(|err| ApiError::internal(err.to_string()))?;
+	let output = interpolator(spline, resolution).run_async(points, start, end).instrument(tracing::info_span!("interpolate.compute")).await.map_err(|err| ApiError::from_engine(&err))?;
 
 	// `interpolate.serialize` child span (roadmap Phase 3): the `BigDecimal` → wire-f64
 	// conversion of every output grid point, with its provenance — the result-shaping
@@ -468,8 +504,8 @@ pub struct PointResponse {
 ///
 /// # Errors
 ///
-/// Returns [`ApiError::BadRequest`] for an empty point set or a non-finite value,
-/// and [`ApiError::Internal`] if the engine fails.
+/// Returns [`ApiError::BadRequest`] for an empty point set, a non-finite value, or
+/// parameters the engine rejects, and [`ApiError::Internal`] if the engine fails.
 pub async fn interpolate_point(State(metrics): State<SharedMetrics>, Json(request): Json<PointRequest>) -> Result<Json<PointResponse>, ApiError> {
 	metrics.record_interpolate_request();
 	let result = interpolate_point_inner(request).await;
@@ -499,7 +535,7 @@ async fn interpolate_point_inner(request: PointRequest) -> Result<Json<PointResp
 	// exactly that one instant, and splimes labels it raw / interpolated / extrapolated
 	// against the inputs. (The resolution only sets the step, which a one-point grid
 	// never takes.)
-	let output = Interpolator::new(spline, Resolution::Nanoseconds).run_async(points, instant, instant).await.map_err(|err| ApiError::internal(err.to_string()))?;
+	let output = interpolator(spline, Resolution::Nanoseconds).run_async(points, instant, instant).await.map_err(|err| ApiError::from_engine(&err))?;
 	let (_, value, kind) = output.iter().next().ok_or_else(|| ApiError::internal("interpolation produced no value at the instant"))?;
 
 	Ok(Json(PointResponse { spline: spline_label, instant, input_points: input.len(), value: value.to_f64().unwrap_or_default(), kind }))
@@ -550,8 +586,9 @@ impl IlpParams {
 /// # Errors
 ///
 /// Returns [`ApiError::BadRequest`] for an unknown precision/spline/resolution
-/// token, a malformed payload, fewer than two usable points, or a zero-span
-/// series, and [`ApiError::Internal`] if the engine fails.
+/// token, a malformed payload, fewer than two usable points, a zero-span series,
+/// or an output grid above [`MAX_INTERPOLATE_OUTPUT_POINTS`], and
+/// [`ApiError::Internal`] if the engine fails.
 pub async fn interpolate_ilp(State(metrics): State<SharedMetrics>, Query(params): Query<IlpParams>, body: String) -> Result<Json<InterpolateResponse>, ApiError> {
 	let start = std::time::Instant::now();
 	metrics.record_interpolate_request();
@@ -1004,6 +1041,78 @@ mod tests {
 			assert_eq!(kind.as_str(), token);
 			assert_eq!(serde_json::to_value(kind).unwrap(), serde_json::json!(token));
 		}
+	}
+
+	#[tokio::test]
+	async fn oversized_grid_is_bad_request() {
+		// A nanosecond grid over a minute is 60 billion points: refused up front with a
+		// 400 naming the cap, not allocated.
+		let body = serde_json::json!({
+			"spline": "linear",
+			"resolution": "nanoseconds",
+			"points": [
+				{ "timestamp": ts(0), "value": 0.0 },
+				{ "timestamp": ts(60), "value": 60.0 },
+			],
+		});
+		for uri in ["/api/v1/interpolate", "/api/v1/interpolate/csv", "/api/v1/interpolate/arrow", "/api/v1/interpolate/parquet"] {
+			let (status, _content_type, text) = post_json_for_text(uri, body.clone()).await;
+			assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {text}");
+			let error: serde_json::Value = serde_json::from_str(&text).unwrap();
+			let message = error["error"].as_str().unwrap();
+			assert!(message.contains("60000000001 points") && message.contains(&MAX_INTERPOLATE_OUTPUT_POINTS.to_string()), "{uri}: {message}");
+		}
+		// The ILP path derives its range from the data, and is capped the same way.
+		let (status, body) = post_text("/api/v1/interpolate/ilp?field=load&precision=s&resolution=nanoseconds", "cpu load=0 0\ncpu load=60 60\n").await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+		assert!(body["error"].as_str().unwrap().contains("more than the"));
+	}
+
+	#[test]
+	fn the_interpolator_refuses_one_point_over_the_cap() {
+		// Every endpoint's interpolator carries the cap: one point over it is refused
+		// before anything is allocated, so this costs nothing to check. (splimes allows
+		// exactly `max_points`.)
+		let points = [Point::new(Utc.timestamp_opt(0, 0).unwrap(), BigDecimal::from(0))];
+		let start = Utc.timestamp_opt(0, 0).unwrap();
+		let last = start + chrono::TimeDelta::nanoseconds(i64::try_from(MAX_INTERPOLATE_OUTPUT_POINTS).unwrap() - 1);
+		let over = interpolator(Spline::Linear, Resolution::Nanoseconds).run(&points, start, last + chrono::TimeDelta::nanoseconds(1));
+		assert!(matches!(over, Err(splimes::Error::OutputTooLarge { points }) if points == MAX_INTERPOLATE_OUTPUT_POINTS as u128 + 1), "{over:?}");
+		let at_cap = interpolator(Spline::Linear, Resolution::Seconds).run(&points, start, start + chrono::TimeDelta::seconds(9));
+		assert_eq!(at_cap.map(|o| o.len()).ok(), Some(10));
+	}
+
+	#[test]
+	fn engine_errors_map_to_status_by_variant() {
+		let status = |err: splimes::Error| ApiError::from_engine(&err).into_response().status();
+		let at = Utc.timestamp_opt(0, 0).unwrap();
+		assert_eq!(status(splimes::Error::OutputTooLarge { points: 1 << 40 }), StatusCode::BAD_REQUEST);
+		assert_eq!(status(splimes::Error::NoPoints), StatusCode::BAD_REQUEST);
+		assert_eq!(status(splimes::Error::InvalidTimeRange { start: at, end: at }), StatusCode::BAD_REQUEST);
+		assert_eq!(status(splimes::Error::InvalidDegree { degree: 9, max: 8 }), StatusCode::BAD_REQUEST);
+		assert_eq!(status(splimes::Error::InvalidBoundsFactor(-1.0)), StatusCode::BAD_REQUEST);
+		assert_eq!(status(splimes::Error::ValueOutOfRange { timestamp: at }), StatusCode::BAD_REQUEST);
+		assert_eq!(status(splimes::Error::NonFiniteResult { timestamp: at }), StatusCode::BAD_REQUEST);
+		assert_eq!(status(splimes::Error::GpuUnavailable("no adapter".into())), StatusCode::INTERNAL_SERVER_ERROR);
+		assert_eq!(status(splimes::Error::Gpu("device lost".into())), StatusCode::INTERNAL_SERVER_ERROR);
+		assert_eq!(status(splimes::Error::Task("panicked".into())), StatusCode::INTERNAL_SERVER_ERROR);
+	}
+
+	#[tokio::test]
+	async fn polynomial_degree_above_the_maximum_is_bad_request() {
+		// splimes 1.0 rejects a degree above 8 (0.1 capped it silently); the request is
+		// the caller's to fix, so it is a 400 naming the limit.
+		let body = serde_json::json!({
+			"spline": { "polynomial": { "degree": 9 } },
+			"resolution": "seconds",
+			"points": [
+				{ "timestamp": ts(0), "value": 0.0 },
+				{ "timestamp": ts(10), "value": 10.0 },
+			],
+		});
+		let (status, body) = post_json("/api/v1/interpolate", body).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+		assert!(body["error"].as_str().unwrap().contains("between 1 and 8"), "body: {body}");
 	}
 
 	#[tokio::test]
