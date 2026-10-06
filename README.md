@@ -47,8 +47,9 @@ observed endpoints marked `raw`, the 59 between them `interpolated`.
 ## Why WeftDB
 
 **Interpolation is a first-class query, not post-processing.** Resampling, gap
-filling and upsampling run next to the data, over typed columnar segments, on
-CPU / SIMD / GPU — not in a client loop pulling raw rows across the wire.
+filling and upsampling run next to the data, over typed columnar segments, on one CPU
+thread, the rayon pool or — once calibrated — the GPU, chosen by grid size, not in a
+client loop pulling raw rows across the wire.
 
 **Precision is declared, never silently lost.** Values are logically
 [`BigDecimal`](https://docs.rs/bigdecimal). Each aspect declares a physical encoding
@@ -716,7 +717,7 @@ The parts below are reference material — you do not need them to use WeftDB.
 ┌──────────────────────────────┐   ┌──────────────────────────────────┐
 │      weft-physical-type       │   │             splimes              │
 │  encodings · schemas ·       │   │   Spline interpolation engine    │
-│  timestamp codecs · .weftseg  │   │  GPU (wgpu/WGSL) · Rayon · SIMD  │
+│  timestamp codecs · .weftseg  │   │  CPU · Rayon · GPU (calibrated)  │
 └──────────────────────────────┘   └──────────────────────────────────┘
 ```
 
@@ -1323,8 +1324,8 @@ server and an interactive application:
 
 The platform is designed for **real-time and large-scale** workloads: measurements
 are stored with [`BigDecimal`](https://docs.rs/bigdecimal) logical precision,
-interpolation transparently scales from a handful of points to millions across the
-GPU, and the storage layer uses bulk transactions, cached connections, and typed
+interpolation scales from a handful of points to millions, from one CPU thread to the
+rayon pool and, where calibration measured it faster, the GPU, and the storage layer uses bulk transactions, cached connections, and typed
 columnar segments throughout.
 
 ---

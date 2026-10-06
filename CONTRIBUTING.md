@@ -21,9 +21,11 @@ You need **Rust 1.95 or newer** on stable. The one exception is formatting:
 cargo +nightly fmt --all
 ```
 
-A GPU is optional. Without a `wgpu` backend the engine falls back to SIMD/parallel CPU,
-and the test suite is expected to pass either way — if a test only passes with a GPU,
-that's a bug in the test.
+A GPU is optional. The engine (splimes 1.0) runs on one CPU thread or the rayon pool,
+by grid size, and uses the GPU only after `splimes::calibrate()` has started it and
+measured where it is faster (`weft-server` calibrates at startup; the tests don't).
+Without a `wgpu` backend everything runs on the CPU, and the test suite is expected to
+pass either way — if a test only passes with a GPU, that's a bug in the test.
 
 ## What CI checks
 
