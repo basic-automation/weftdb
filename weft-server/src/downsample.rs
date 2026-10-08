@@ -12,8 +12,8 @@
 //!
 //! ## Bucketing semantics
 //!
-//! Buckets are aligned to the epoch grid for the chosen resolution (the same
-//! [`splimes::Resolution::to_base`] index the engine uses), so a bucket's start
+//! Buckets are aligned to the epoch grid for the chosen resolution (the
+//! [`weft_reduce::bucket_index`] every reducing surface uses), so a bucket's start
 //! is reproducible from the resolution alone — independent of where the series
 //! happens to begin. Only buckets that actually contain samples are emitted;
 //! gap-filling is the interpolation endpoint's job, not this one's.
@@ -612,7 +612,7 @@ mod tests {
 	fn bucket_start_is_grid_aligned() {
 		// 1970-01-01T00:02:00Z falls in minute-bucket index 2.
 		let t = Utc.timestamp_opt(125, 0).unwrap();
-		let base = Resolution::Minutes.to_base(&t).unwrap();
+		let base = weft_reduce::bucket_index(Resolution::Minutes, &t).unwrap();
 		assert_eq!(base, 2);
 		let start = weft_reduce::bucket_start(Resolution::Minutes, base).unwrap();
 		assert_eq!(start, Utc.timestamp_opt(120, 0).unwrap());

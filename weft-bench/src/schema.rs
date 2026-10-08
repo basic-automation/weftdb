@@ -60,9 +60,11 @@ use crate::{
 /// cascade on a trending value column. The cascade is realized on disk
 /// (`weftseg::write_value_column_cascading` / `VAL_CODEC_DELTA_CASCADE`) but is a broad
 /// realized-bytes change, so it is opt-in and surfaced advisory-first (like FOR/f64 before
-/// adoption); the default `value_codec` is unchanged. All optional fields are `#[serde(default)]`,
-/// so older artifacts still deserialize.
-pub const SCHEMA_VERSION: u32 = 15;
+/// adoption); the default `value_codec` is unchanged. v16 added the report's optional
+/// `metadata.engine` (whether the interpolation backends were calibrated, the GPU adapter, and
+/// `Backend::Auto`'s thresholds for the run). All optional fields are `#[serde(default)]`, so
+/// older artifacts still deserialize.
+pub const SCHEMA_VERSION: u32 = 16;
 
 /// Metadata describing the dataset a result was measured against.
 ///

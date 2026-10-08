@@ -22,9 +22,9 @@
 
 use bigdecimal::ToPrimitive;
 use serde::{Deserialize, Serialize};
-use splimes::{generate_target_times, Point};
+use splimes::Point;
 
-use crate::profile::InterpolationProfile;
+use crate::{adapter::grid_timestamps, profile::InterpolationProfile};
 
 /// Why an accuracy measurement could not be produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,7 +127,7 @@ impl AccuracyMetrics {
 ///
 /// Evaluates the analytic clean signal at every instant of the reconstruction
 /// grid the adapter is asked to produce
-/// (`generate_target_times(start, end, resolution)`), so the result aligns
+/// ([`grid_timestamps`]), so the result aligns
 /// one-for-one with a passing adapter's output.
 ///
 /// # Errors
@@ -135,7 +135,7 @@ impl AccuracyMetrics {
 /// Returns [`AccuracyError::NoGroundTruth`] for a line-protocol profile, which has
 /// no known true signal to score against.
 pub fn synthetic_ground_truth(profile: &InterpolationProfile) -> Result<Vec<f64>, AccuracyError> {
-	let targets = generate_target_times(profile.start(), profile.end(), profile.resolution);
+	let targets = grid_timestamps(profile.start(), profile.end(), profile.resolution);
 	targets.iter().map(|t| profile.clean_signal_at(*t).ok_or(AccuracyError::NoGroundTruth)).collect()
 }
 
@@ -227,7 +227,7 @@ mod tests {
 	fn synthetic_ground_truth_is_finite_in_range_and_aligns_with_the_grid() {
 		let profile = InterpolationProfile::interpolation_heavy_irregular();
 		let truth = synthetic_ground_truth(&profile).expect("generated profile has ground truth");
-		let expected = generate_target_times(profile.start(), profile.end(), profile.resolution).len();
+		let expected = grid_timestamps(profile.start(), profile.end(), profile.resolution).len();
 		assert_eq!(truth.len(), expected, "ground truth must cover the whole reconstruction grid");
 		assert!(!truth.is_empty());
 		for v in truth {

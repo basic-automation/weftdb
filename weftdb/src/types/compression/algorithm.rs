@@ -6,7 +6,7 @@
 
 use anyhow::Result;
 use bigdecimal::BigDecimal;
-use splimes::{Point, Resolution, Spline};
+use splimes::{Interpolator, Point, Resolution, Spline};
 
 use crate::Measurement;
 
@@ -65,7 +65,7 @@ pub async fn simplify_with_aggressiveness(measurements: &[Measurement], aggressi
 	let target_resolution = interpolate_resolution(original_resolution, base_resolution, aggressiveness);
 
 	// Convert to points
-	let mut points: Vec<Point> = measurements.iter().map(|m| Point { timestamp: m.timestamp(), value: m.value().clone() }).collect();
+	let points: Vec<Point> = measurements.iter().map(|m| Point { timestamp: m.timestamp(), value: m.value().clone() }).collect();
 
 	let start = measurements.first().unwrap().timestamp();
 	let end = measurements.last().unwrap().timestamp();
@@ -75,8 +75,9 @@ pub async fn simplify_with_aggressiveness(measurements: &[Measurement], aggressi
 		return Ok(points);
 	}
 
-	// Interpolate to the target (coarser) resolution
-	let interpolated = splimes::auto_interpolate(&mut points, start, end, target_resolution, interpolation_method).await?;
+	// Interpolate to the target (coarser) resolution, on tokio's blocking pool: splimes is
+	// synchronous and CPU-bound, and this runs inside an async compression pass.
+	let interpolated = Interpolator::new(interpolation_method, target_resolution).run_async(points, start, end).await?.into_points();
 
 	// Apply slope-change simplification to remove redundant points
 	let simplified = simplify_by_slope_change(&interpolated);
@@ -99,36 +100,17 @@ fn interpolate_resolution(original: Resolution, base: Resolution, aggressiveness
 	rank_to_resolution(target_rank)
 }
 
-/// Get a numeric rank for a resolution (higher = coarser).
-const fn resolution_rank(resolution: Resolution) -> i32 {
-	match resolution {
-		Resolution::Nanoseconds => 0,
-		Resolution::Microseconds => 1,
-		Resolution::Milliseconds => 2,
-		Resolution::Seconds => 3,
-		Resolution::Minutes => 4,
-		Resolution::Hours => 5,
-		Resolution::Days => 6,
-		Resolution::Weeks => 7,
-		Resolution::Months => 8,
-		Resolution::Years => 9,
-	}
+/// Get a numeric rank for a resolution (higher = coarser): its position in
+/// [`Resolution::ALL`], which lists every resolution finest first (`Nanoseconds` = 0 …
+/// `Years` = 9). `Resolution` is `#[non_exhaustive]`, so the list, not a `match`, is the
+/// complete set.
+fn resolution_rank(resolution: Resolution) -> i32 {
+	Resolution::ALL.iter().position(|&r| r == resolution).and_then(|i| i32::try_from(i).ok()).unwrap_or(0)
 }
 
-/// Convert a rank back to a resolution.
-const fn rank_to_resolution(rank: i32) -> Resolution {
-	match rank {
-		0 => Resolution::Nanoseconds,
-		1 => Resolution::Microseconds,
-		2 => Resolution::Milliseconds,
-		3 => Resolution::Seconds,
-		4 => Resolution::Minutes,
-		5 => Resolution::Hours,
-		6 => Resolution::Days,
-		7 => Resolution::Weeks,
-		8 => Resolution::Months,
-		_ => Resolution::Years,
-	}
+/// Convert a rank back to a resolution; out-of-range ranks are the coarsest, `Years`.
+fn rank_to_resolution(rank: i32) -> Resolution {
+	usize::try_from(rank).ok().and_then(|i| Resolution::ALL.get(i)).copied().unwrap_or(Resolution::Years)
 }
 
 /// Simplify points by keeping only those where the slope direction changes.
@@ -214,6 +196,18 @@ mod tests {
 		// At aggressiveness 0.5, should be halfway (Hours is rank 5, between Minutes=4 and Days=6)
 		let res = interpolate_resolution(Resolution::Minutes, Resolution::Days, 0.5);
 		assert_eq!(res, Resolution::Hours);
+	}
+
+	#[test]
+	fn resolution_ranks_are_unchanged() {
+		// The ranks the explicit table gave before splimes 1.0 made `Resolution` non-exhaustive.
+		let table = [Resolution::Nanoseconds, Resolution::Microseconds, Resolution::Milliseconds, Resolution::Seconds, Resolution::Minutes, Resolution::Hours, Resolution::Days, Resolution::Weeks, Resolution::Months, Resolution::Years];
+		for (rank, resolution) in (0..).zip(table) {
+			assert_eq!(resolution_rank(resolution), rank, "{resolution:?}");
+			assert_eq!(rank_to_resolution(rank), resolution, "rank {rank}");
+		}
+		assert_eq!(rank_to_resolution(10), Resolution::Years);
+		assert_eq!(rank_to_resolution(-1), Resolution::Years);
 	}
 
 	#[test]

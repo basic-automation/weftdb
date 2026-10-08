@@ -368,7 +368,7 @@ points/sec for irregular cubic interpolation including storage read, decode, GPU
 transfer, kernel, readback, and API serialization, p95 = Z."*
 
 - [x] Interpolation/extrapolation capability — linear/quadratic/cubic/polynomial on CPU, SIMD, and GPU (`Outputs::analyze_range`/`analyze_point`)
-- [x] GPU infra — size-tiered LRU buffer pool (wired through the static f64/f32 paths), persistent staging buffers, async-handle scaffold (`GpuInterpolationResult<T>` + `IntoFuture`; computes synchronously today), `GpuConfig` presets + `prewarm_gpu_with_config()`/`gpu_buffer_pool_stats()`
+- [x] GPU infra — size-tiered LRU buffer pool (wired through the static f64/f32 paths), persistent staging buffers, async-handle scaffold (`GpuInterpolationResult<T>` + `IntoFuture`; computes synchronously today), `GpuConfig` presets + `prewarm_gpu_with_config()`/`gpu_buffer_pool_stats()` *(splimes 0.1; 1.0 replaced them with `configure_gpu(GpuConfig)`, `prewarm_gpu() -> GpuInfo`, `gpu_pool_stats()` and `calibrate()`, which `weft-server` runs at startup)*
 - [ ] 5.1 Command batching
 - [ ] 5.2 True async GPU handles (non-blocking; CPU parse/read overlaps GPU)
 - [ ] 5.3 CPU/GPU overlap (chunked read → decode → upload → kernel → stream output)
@@ -772,10 +772,11 @@ report → API/format freeze → **1.0**.
 
 ### Hot path & data model *(must land before the freeze)*
 
-- [ ] **splimes 1.0 is released**, and WeftDB depends on it. The interpolation engine is
-  its own crate ([basic-automation/splimes](https://github.com/basic-automation/splimes),
-  0.1.0 published 2026-10-05) with its own 1.0 criteria; a stable WeftDB can't promise a
-  stable API on top of an unstable engine
+- [x] **splimes 1.0 is released**, and WeftDB depends on it. The interpolation engine is
+  its own crate ([basic-automation/splimes](https://github.com/basic-automation/splimes))
+  with its own 1.0 criteria; a stable WeftDB can't promise a stable API on top of an
+  unstable engine. *splimes 1.0.0 was published to crates.io on 2026-10-05, and WeftDB
+  depends on it from the registry (`splimes = "1"`, no patch or git source).*
 
 - [ ] **Measurement bulk ingest routed through the `.weftseg` seal** — the legacy `batch_capture_measurements` path is super-linear (see [Immediate next actions](#immediate-next-actions))
 - [ ] **B-tags** — per-measurement tags/labels; a data-model change that must precede the API/format freeze
@@ -1806,7 +1807,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   baseline). Pre-v10 bytes/point artifacts are not comparable.
 - [x] **weft-bench parallel-test OOM — ROOT-CAUSED + FIXED (it was a logic bug, not
   environmental).** A full-backtrace capture pinned the ~28 GB allocation to
-  `splimes::helpers::generate_target_times::TargetTimesIterator::next_impl`, which sized the
+  `splimes::helpers::generate_target_times::TargetTimesIterator::next_impl` (splimes 0.1; 1.0 has no such iterator), which sized the
   per-batch `Vec<DateTime<Utc>>` from *free system memory* (`available_memory / point_size /
   2`) instead of from the number of timestamps to produce — a tens-of-GiB speculative
   `Vec::with_capacity` per call. Single-threaded one such allocation succeeds when RAM is

@@ -52,7 +52,7 @@ crossterm = "0.29"
 sysinfo = "0.39"
 weftdb = { path = "./weftdb", version = "0.1.0" }
 # Developed in its own repository (github.com/basic-automation/splimes), on its own roadmap.
-splimes = "0.1"
+splimes = "1"
 weft-line-protocol = { path = "./weft-line-protocol", version = "0.1.0" }
 weft-physical-type = { path = "./weft-physical-type", version = "0.1.0" }
 weft-reduce = { path = "./weft-reduce", version = "0.1.0" }
