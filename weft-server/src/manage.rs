@@ -582,7 +582,9 @@ pub async fn compact_aspect(State(state): State<AppState>, Path(aspect): Path<St
 #[derive(Debug, Clone, Deserialize)]
 pub struct RestoreDrillParams {
 	/// The backup subdirectory to rehearse restoring, under the same backup root the
-	/// snapshot endpoint writes to. Traversal-guarded exactly like the backup label.
+	/// snapshot endpoint writes to, in the same label grammar
+	/// (`[A-Za-z0-9][A-Za-z0-9._-]{0,99}`, not ending with `.`). Unlike the backup
+	/// endpoint, the drill accepts a daemon snapshot's `backup-<digits>`: it only reads it.
 	pub label: String,
 }
 
@@ -626,10 +628,12 @@ pub struct RestoreDrillResponse {
 /// # Errors
 ///
 /// [`StorageError::Unconfigured`] when no store is attached, [`StorageError::BadRequest`]
-/// when the label is malformed or names a staging directory (an unfinished backup,
-/// prune or drill), [`StorageError::NotFound`] when no such backup exists, and
-/// [`StorageError::Internal`] when the backup will not restore or verify — which is a
-/// failed drill, and the answer the caller asked for.
+/// when the label is malformed (see [`BackupParams::label`] for the grammar) or names a
+/// staging directory (an unfinished backup, prune or drill), [`StorageError::NotFound`]
+/// when no such backup exists, [`StorageError::AlreadyExists`] when the rehearsal
+/// directory is already taken by another drill, and [`StorageError::Internal`] when the
+/// backup will not restore or verify — which is a failed drill, and the answer the
+/// caller asked for.
 pub async fn restore_drill(State(state): State<AppState>, Query(params): Query<RestoreDrillParams>) -> Result<Response, StorageError> {
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	drop(state);
@@ -647,8 +651,8 @@ pub async fn restore_drill(State(state): State<AppState>, Query(params): Query<R
 	drop(store);
 
 	// A throwaway destination beside the backups: same volume (so the rehearsal is sized
-	// like the real thing) and never the live store root. Cleaned up on every path,
-	// success or failure.
+	// like the real thing) and never the live store root. Once claimed, it is cleaned up
+	// on every path, success or failure.
 	let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|err| StorageError::Internal(err.to_string()))?.as_millis();
 	let target = base.join(format!("{RESTORE_DRILL_PREFIX}{millis}"));
 	let response = drill_response(&RealFs, params.label, &backup_dir, &target).await?;
@@ -657,7 +661,21 @@ pub async fn restore_drill(State(state): State<AppState>, Query(params): Query<R
 
 /// Rehearse restoring `backup_dir` into the throwaway directory `target` through `fs`,
 /// remove `target` again whatever the outcome, and build the drill's answer.
+///
+/// `target` is claimed first, by creating it with a call that fails if anything is
+/// already there, so two drills never share a rehearsal directory. A drill that finds it
+/// taken (another drill started in the same millisecond) answers `409 already_exists`
+/// and leaves it alone, instead of restoring into it and then removing the other drill's
+/// copy. The new directory's entry is not fsynced: the copy is removed when the drill
+/// ends, and one a crash leaves behind is swept like any other stale drill.
 async fn drill_response(fs: &dyn StoreFs, label: String, backup_dir: &std::path::Path, target: &std::path::Path) -> Result<RestoreDrillResponse, StorageError> {
+	match fs.create_dir(target).await {
+		Ok(()) => {}
+		Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+			return Err(StorageError::AlreadyExists(format!("restore drill for `{label}`: its rehearsal directory {} already exists; nothing was restored into it or removed — retry the drill, which picks a fresh directory", target.display())));
+		}
+		Err(err) => return Err(StorageError::Internal(format!("restore drill for `{label}` could not create its rehearsal directory {}: {err}", target.display()))),
+	}
 	let outcome = weftdb::restore_control_plane_with(fs, backup_dir, target).await;
 	// The drill's answer stands whether or not its copy can be removed, but a copy left
 	// behind is disk an operator is paying for: say so instead of dropping the error.
@@ -677,13 +695,15 @@ async fn drill_response(fs: &dyn StoreFs, label: String, backup_dir: &std::path:
 /// Query parameters for `POST /api/v1/storage/backup`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct BackupParams {
-	/// A subdirectory name for this snapshot under the backup root. Restricted to
-	/// `[A-Za-z0-9._-]`, neither starting nor ending with `.`, so an API caller can never
+	/// A subdirectory name for this snapshot under the backup root, in the grammar
+	/// `[A-Za-z0-9][A-Za-z0-9._-]{0,99}` and not ending with `.`, so an API caller can never
 	/// traverse out of the backup root and every platform names the directory exactly as
-	/// given (Windows would strip a trailing `.`). Absent → a `manual-<unix_millis>` name is generated. The backup
-	/// daemon's grammar (`backup-` and digits only) is reserved for the daemon, because
-	/// backup retention counts and prunes exactly those names; a label matching it → `400`.
-	/// No snapshot taken through this endpoint is ever pruned by retention.
+	/// given (Windows would strip a trailing `.`); anything else → `400`. Absent → a
+	/// `manual-<unix_millis>` name is generated. The backup daemon's grammar (`backup-` and
+	/// digits only) is reserved for the daemon, because backup retention counts and prunes
+	/// exactly those names; a label matching it → `400`. A label already taken → `409`
+	/// with code `already_exists`. No snapshot taken through this endpoint is ever pruned
+	/// by retention.
 	pub label: Option<String>,
 	/// How each snapshot copy is verified: `source` (default) cross-checks it against a
 	/// fresh read of the live control plane — the strongest check, but it assumes a
@@ -746,25 +766,34 @@ const fn verify_token(mode: VerifyMode) -> &'static str {
 	}
 }
 
+/// The longest backup label [`valid_backup_label`] accepts, in bytes; a label is ASCII,
+/// so this is also its length in characters.
+const MAX_BACKUP_LABEL_LEN: usize = 100;
+
 /// The error for a `label` that [`valid_backup_label`] rejects.
 fn invalid_backup_label(label: &str) -> StorageError {
-	StorageError::BadRequest(format!("invalid backup label `{label}` — use only letters, digits, '.', '_', '-', not starting or ending with '.'"))
+	StorageError::BadRequest(format!("invalid backup label `{label}` — use 1 to {MAX_BACKUP_LABEL_LEN} letters, digits, '.', '_' or '-', starting with a letter or digit and not ending with '.'"))
 }
 
-/// Validate a caller-supplied backup `label`: non-empty, only `[A-Za-z0-9._-]`, and
-/// neither starting nor ending with `.` — so it names a single subdirectory under the
+/// Validate a backup `label` against the grammar frozen for 1.0:
+/// `[A-Za-z0-9][A-Za-z0-9._-]{0,99}`, not ending with `.`. A label is therefore 1 to
+/// [`MAX_BACKUP_LABEL_LEN`] ASCII characters naming a single subdirectory under the
 /// backup root, the same one on every platform, and can never be an absolute path or a
-/// `../` traversal.
+/// `../` traversal. Both the backup and the restore-drill endpoints apply it.
 ///
 /// The trailing-dot rule matters on Windows, which strips trailing dots from a path
 /// component: `backup-123.` would otherwise pass the reserved-grammar check in
 /// [`backup_store`] and still create the directory `backup-123`, which retention counts
-/// and prunes. With `.` refused at both ends, a label is plain ASCII with no trailing dot
-/// or space, so no platform names it as anything but itself. A leading `.` is refused
-/// because it would make a hidden directory, and the restore drill keeps its own scratch
-/// directories (`.restore-drill-<millis>`, deleted after every drill) under that prefix.
+/// and prunes. With no trailing dot or space, no platform names a label as anything but
+/// itself. The first character is a letter or digit: a leading `.` would make a hidden
+/// directory and could take a staging prefix (`.partial-`, `.deleting-`,
+/// `.restore-drill-`), and a leading `-` reads as an option to the command-line tools an
+/// operator points at the backup directory. The length bound keeps the label, and the
+/// `.partial-{label}-{nonce}` and `.deleting-{label}-{nonce}` names built from it, well
+/// inside every filesystem's 255-byte name limit.
 fn valid_backup_label(label: &str) -> bool {
-	!label.is_empty() && !label.starts_with('.') && !label.ends_with('.') && label.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+	let bytes = label.as_bytes();
+	bytes.first().is_some_and(u8::is_ascii_alphanumeric) && bytes.len() <= MAX_BACKUP_LABEL_LEN && bytes.last() != Some(&b'.') && bytes.iter().all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// Handle `POST /api/v1/storage/backup`: snapshot the store's four control-plane DBs.
@@ -777,20 +806,21 @@ fn valid_backup_label(label: &str) -> bool {
 /// `manual-<unix_millis>` ([`manual_label`](crate::backup_daemon::manual_label)), which
 /// backup retention never counts or prunes. The backup is built in a `.partial-*`
 /// directory beside it and renamed into place, with a `MANIFEST.json`, only once complete
-/// and durable, so a directory that already exists is rejected. A backup that fails
-/// removes its build directory again, except in one window: if the final fsync of
-/// `<base>` fails after the rename, the response is a `500` although the complete backup
-/// is already under its label (so a retry with the same label is a `400`). The `.weftseg`
-/// measurement frames are **not** part of this backup — control plane only, per the
-/// storage boundary (hard-constraint #3).
+/// and durable, so a directory that already exists is rejected (`409 already_exists`). A
+/// backup that fails removes its build directory again, except in one window: if the final
+/// fsync of `<base>` fails after the rename, the response is a `500` although the complete
+/// backup is already under its label (so a retry with the same label is a `409`). The
+/// `.weftseg` measurement frames are **not** part of this backup — control plane only, per
+/// the storage boundary (hard-constraint #3).
 ///
 /// # Errors
 ///
 /// [`StorageError::Unconfigured`] when no store is attached,
-/// [`StorageError::BadRequest`] when `label` is malformed, in the reserved
-/// `backup-<digits>` form, reserved for a staging directory (`.partial-*`, `.deleting-*`,
-/// `.restore-drill-*`), or the target dir already exists, and [`StorageError::Internal`]
-/// on a backup/verify failure.
+/// [`StorageError::BadRequest`] when `label` is malformed (see [`BackupParams::label`]
+/// for the grammar), in the reserved `backup-<digits>` form, or reserved for a staging
+/// directory (`.partial-*`, `.deleting-*`, `.restore-drill-*`),
+/// [`StorageError::AlreadyExists`] when the target dir already exists, and
+/// [`StorageError::Internal`] on a backup/verify failure.
 pub async fn backup_store(State(state): State<AppState>, Query(params): Query<BackupParams>) -> Result<Response, StorageError> {
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	let metrics = state.metrics().clone();
@@ -823,7 +853,7 @@ pub async fn backup_store(State(state): State<AppState>, Query(params): Query<Ba
 	};
 	let dest = base.join(&sub);
 	if dest.exists() {
-		return Err(StorageError::BadRequest(format!("backup target already exists: {} (choose a fresh label)", dest.display())));
+		return Err(StorageError::AlreadyExists(format!("backup target already exists: {} (choose a fresh label)", dest.display())));
 	}
 	let backup = store.backup_control_plane_with_verify(&dest, mode).await.map_err(|err| StorageError::Internal(err.to_string()))?;
 	drop(store);
@@ -1653,6 +1683,18 @@ mod tests {
 		assert!(!valid_backup_label(".hidden"));
 		assert!(!valid_backup_label(".restore-drill-1"));
 		assert!(valid_backup_label("a.b"), "a dot inside the label is fine");
+		// The frozen grammar: `[A-Za-z0-9][A-Za-z0-9._-]{0,99}`, not ending with `.`.
+		assert!(valid_backup_label("A"), "one letter is a label");
+		assert!(valid_backup_label("7"), "one digit is a label");
+		assert!(valid_backup_label("nightly-") && valid_backup_label("nightly_"), "only a trailing `.` is refused");
+		assert!(valid_backup_label("backup-123"), "the grammar admits a daemon name; the backup endpoint reserves it separately");
+		assert!(!valid_backup_label("-nightly"), "a label starts with a letter or digit, so it never reads as a command-line option");
+		assert!(!valid_backup_label("_nightly"));
+		assert!(!valid_backup_label(".partial-x"));
+		assert!(valid_backup_label(&"a".repeat(100)), "100 characters is the limit");
+		assert!(!valid_backup_label(&"a".repeat(101)), "101 characters is one too many");
+		assert!(!valid_backup_label("café"), "ASCII only");
+		assert!(!valid_backup_label("a:b") && !valid_backup_label("a\0b") && !valid_backup_label("a\tb"));
 	}
 
 	#[tokio::test]
@@ -1687,10 +1729,13 @@ mod tests {
 			assert!(backup_dir.join(name).exists(), "{name} written to disk");
 		}
 
-		// Re-using the same label collides with the existing dir → 400 (VACUUM INTO needs a fresh file).
-		let router = app_with_state(state.clone());
-		let dup = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/backup?label=nightly").body(Body::empty()).unwrap()).await.unwrap();
-		assert_eq!(dup.status(), StatusCode::BAD_REQUEST, "an existing backup dir is rejected");
+		// Re-using the same label collides with the existing dir → 409 `already_exists`
+		// (a backup is published under a fresh name), and the existing backup is kept.
+		let (status, body) = post_empty(app_with_state(state.clone()), "/api/v1/storage/backup?label=nightly").await;
+		assert_eq!(status, StatusCode::CONFLICT, "an existing backup dir is a conflict; body: {body}");
+		assert_eq!(body["code"], "already_exists", "body: {body}");
+		assert!(body["error"].as_str().unwrap().contains("already exists"), "body: {body}");
+		assert!(backup_dir.join(weftdb::BACKUP_MANIFEST).exists(), "the existing backup is untouched");
 
 		// /metrics reflects the one successful snapshot (the failed dup did not bump it).
 		let router = app_with_state(state.clone());
@@ -1875,6 +1920,105 @@ mod tests {
 		for snapshot in &daemon {
 			assert!(snapshot.exists(), "{} was evicted by unlabelled API backups", snapshot.display());
 		}
+	}
+
+	/// SEC-1's retention-poisoning case end to end: with `keep = 2`, three attempts to plant
+	/// far-future `backup-<digits>` snapshots through `?label=` all fail, so the next prune
+	/// keeps both genuine daemon snapshots.
+	#[tokio::test]
+	async fn poisoned_labels_never_evict_daemon_snapshots() {
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+		let state = AppState::new().with_store(store.clone());
+		let backups = dir.path().join("backups");
+		let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+		let daemon: Vec<std::path::PathBuf> = [3_000_u128, 2_000].into_iter().map(|age| backups.join(crate::backup_daemon::generated_label(now - age))).collect();
+		for snapshot in &daemon {
+			tokio::fs::create_dir_all(snapshot).await.unwrap();
+			for file in weftdb::CONTROL_PLANE_FILES {
+				tokio::fs::write(snapshot.join(file), b"x").await.unwrap();
+			}
+		}
+		for label in ["backup-99999999999999", "backup-99999999999998.", "backup-99999999999997"] {
+			let (status, body) = post_empty(app_with_state(state.clone()), &format!("/api/v1/storage/backup?label={label}&verify=snapshot")).await;
+			assert_eq!(status, StatusCode::BAD_REQUEST, "{label} must be refused; body: {body}");
+		}
+		drop(state);
+		drop(store);
+		let mut names: Vec<String> = std::fs::read_dir(&backups).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect();
+		names.sort();
+		let mut expected: Vec<String> = daemon.iter().map(|snapshot| snapshot.file_name().unwrap().to_string_lossy().into_owned()).collect();
+		expected.sort();
+		assert_eq!(names, expected, "the refused labels created nothing");
+		let removed = crate::backup_daemon::prune_generated_backups(&backups, 2).await.unwrap();
+		assert_eq!(removed, 0, "both genuine snapshots are kept");
+		for snapshot in &daemon {
+			assert!(snapshot.exists(), "{} was pruned", snapshot.display());
+		}
+	}
+
+	/// SEC-1 / FRE-7b: the backup label grammar frozen for 1.0 is
+	/// `[A-Za-z0-9][A-Za-z0-9._-]{0,99}`, not ending with `.`, on the backup and the drill
+	/// endpoints alike. A drill still accepts a daemon name, because it only reads.
+	#[tokio::test]
+	async fn backup_and_drill_labels_follow_the_frozen_grammar() {
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+		let state = AppState::new().with_store(store.clone());
+		let backups = dir.path().join("backups");
+		let too_long = "a".repeat(101);
+		for label in ["-nightly", "_nightly", ".partial-x", too_long.as_str()] {
+			let (status, body) = post_empty(app_with_state(state.clone()), &format!("/api/v1/storage/backup?label={label}&verify=snapshot")).await;
+			assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: body: {body}");
+			assert!(body["error"].as_str().unwrap().contains("invalid backup label"), "{label}: body: {body}");
+			assert!(!backups.join(label).exists(), "{label}: a refused label writes nothing");
+			// A directory under such a name is refused by the drill too, before it is looked up.
+			std::fs::create_dir_all(backups.join(label)).unwrap();
+			let (status, body) = post_empty(app_with_state(state.clone()), &format!("/api/v1/storage/restore/drill?label={label}")).await;
+			assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: the drill uses the same grammar; body: {body}");
+		}
+		// The longest label the grammar admits is an ordinary backup.
+		let longest = "a".repeat(100);
+		let (status, body) = post_empty(app_with_state(state.clone()), &format!("/api/v1/storage/backup?label={longest}&verify=snapshot")).await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		// A daemon snapshot can be drilled: the reservation guards creation only.
+		store.backup_control_plane_with_verify(backups.join("backup-123"), weftdb::VerifyMode::SnapshotOnly).await.expect("backs up");
+		let (status, body) = post_empty(app_with_state(state.clone()), "/api/v1/storage/restore/drill?label=backup-123").await;
+		drop(state);
+		drop(store);
+		assert_eq!(status, StatusCode::OK, "a drill of backup-<digits> is accepted; body: {body}");
+		assert_eq!(body["restorable"], true, "body: {body}");
+	}
+
+	/// Regression: a drill restored into its rehearsal directory even when that directory
+	/// already existed (another drill started in the same millisecond), and then removed
+	/// it, deleting the other drill's copy. It is now a `409 already_exists` that leaves
+	/// the directory as it found it.
+	#[tokio::test]
+	async fn a_drill_whose_rehearsal_directory_exists_is_a_conflict_and_leaves_it_alone() {
+		use axum::response::IntoResponse as _;
+
+		let dir = TempDir::new().unwrap();
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		let base = dir.path().join("backups");
+		store.backup_control_plane_with_verify(base.join("nightly"), weftdb::VerifyMode::SnapshotOnly).await.expect("backs up");
+		drop(store);
+		let target = base.join(".restore-drill-1");
+		std::fs::create_dir_all(&target).unwrap();
+		std::fs::write(target.join("in-use"), b"another drill's copy").unwrap();
+
+		let fs = RecordingFs::default();
+		let err = super::drill_response(&fs, "nightly".to_string(), &base.join("nightly"), &target).await.expect_err("an existing rehearsal directory is never reused");
+		let response = err.into_response();
+		let status = response.status();
+		let body: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+		assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+		assert_eq!(body["code"], "already_exists", "body: {body}");
+		assert!(target.join("in-use").exists(), "the other drill's copy is untouched");
+		for name in weftdb::CONTROL_PLANE_FILES {
+			assert!(!target.join(name).exists(), "nothing was restored into it: {name}");
+		}
+		assert!(!fs.ops().iter().any(|op| matches!(op, FsOp::RemoveDirAll(_))), "nothing was removed: {:?}", fs.ops());
 	}
 
 	#[test]

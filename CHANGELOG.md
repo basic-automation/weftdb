@@ -310,6 +310,17 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 - **Backup and drill labels starting with `.partial-`, `.deleting-` or
   `.restore-drill-` are rejected with `400`**: those names belong to unfinished
   backups, prunes and drills, which are never restored and are swept.
+- **The backup label grammar is fixed for 1.0: `[A-Za-z0-9][A-Za-z0-9._-]{0,99}`, not
+  ending with `.`.** ⚠️ `POST /api/v1/storage/backup?label=` and
+  `POST /api/v1/storage/restore/drill?label=` answer `400` for a label that starts with
+  `-` or `_` or is longer than 100 characters; both were accepted before. The drill still
+  accepts a daemon snapshot's `backup-<digits>`. An existing backup whose name falls
+  outside the grammar can be drilled once renamed into it (not into `backup-<digits>`,
+  which retention prunes).
+- **A backup label that is already taken is a `409` with `"code": "already_exists"`**
+  (it was a `400`); the existing backup is untouched. `weft_server::StorageError` gains
+  the `AlreadyExists` variant for it, and the JSON error body carries a `code` field
+  for that error only.
 - **`restore_control_plane` stages each file as `<name>.tmp`**, synced and verified,
   renames them into place only once all four verify, and fsyncs the root, which it
   now creates durably. A backup with a manifest must match it (sizes, tables, rows).
@@ -493,6 +504,11 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 - **The restore drill discarded a failed cleanup.** `POST /api/v1/storage/restore/drill`
   now reports it in a new `cleanup_error` field (`null` when the rehearsal copy was
   removed).
+- **Two restore drills started in the same millisecond shared a rehearsal directory**,
+  so whichever ended first removed the directory the other was still using. A drill
+  now claims its `.restore-drill-<millis>` directory before restoring into it, and one
+  that finds it taken answers `409` with `"code": "already_exists"`, leaving it alone;
+  retry it.
 - **`Database::new` could leave a half-created database** that neither a retry of
   `new` ("already exists") nor `Database::existing` (no `database` row) could use. A
   database is now built in a hidden `.{name}.creating-{nonce}` folder beside its final
