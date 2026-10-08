@@ -23,13 +23,22 @@
 //! recording I/O backend (`turso_probe`), Turso 0.8.1 does sync the DB file during the
 //! switch of a database that never ran MVCC (its MVCC metadata bootstrap backfills a
 //! new table through a checkpoint), but not the switch of one that already carries
-//! Turso's MVCC metadata, such as a database switched back to WAL. So whenever an open
-//! is the one that switched, [`enable_mvcc_full`] has Turso itself sync the DB file: it
-//! commits one MVCC transaction (rewriting `user_version` with its own value) and runs a
-//! TRUNCATE checkpoint, which backfills that commit through the WAL and fsyncs the DB
-//! file, header included. WeftDB never fsyncs the file itself: Turso's lock is a
-//! process-associated `fcntl` lock, which closing any other descriptor on the file
-//! would release.
+//! Turso's MVCC metadata, such as a database switched back to WAL. So every open has
+//! Turso itself sync the DB file before it returns: [`enable_mvcc_full`] commits one MVCC
+//! transaction (rewriting `user_version` with its own value) and runs a TRUNCATE
+//! checkpoint, which backfills that commit through the WAL, rewrites page 1 and fsyncs
+//! the DB file, header included.
+//!
+//! Every open, not only the one that switched. Whether an open switched can only be told
+//! from the header Turso reads back, and that read can come from the OS page cache rather
+//! than the disk: an open that crashed or failed between its switch and the sync (the
+//! checkpoint's fsync hit EIO, say) leaves an MVCC header that the next open reads as
+//! MVCC although it was never synced. Were only the switching open to sync, the next one
+//! would skip it and acknowledge commits that sync only the `-log`. The price is one
+//! commit and one checkpoint per database per open.
+//!
+//! WeftDB never fsyncs the file itself: Turso's lock is a process-associated `fcntl`
+//! lock, which closing any other descriptor on the file would release.
 
 use anyhow::{bail, Context, Result};
 use turso::Value;
@@ -42,19 +51,17 @@ const MVCC: &str = "mvcc";
 /// What `PRAGMA synchronous` reports for FULL (`turso_core` `SyncMode::Full`).
 const SYNCHRONOUS_FULL: i64 = 2;
 
-/// Switch the database behind `conn` to MVCC, then prove that it is in MVCC and that a
-/// fresh connection to `db`, like the ones every write opens, syncs FULL. When this call
-/// is the one that switched the database, it also makes the header the switch wrote
-/// durable (see the module documentation). `name` (the database's path) is what the
-/// errors call it.
+/// Switch the database behind `conn` to MVCC, prove that it is in MVCC and that a fresh
+/// connection to `db`, like the ones every write opens, syncs FULL, then make the MVCC
+/// header durable (see the module documentation). `name` (the database's path) is what
+/// the errors call it.
 ///
 /// # Errors
 ///
 /// If a pragma cannot be read, if the journal mode is not MVCC (the error carries the
 /// switch's own error, when it had one), if a fresh connection is not FULL, or if the
-/// switched header cannot be synced.
+/// header cannot be synced.
 pub async fn enable_mvcc_full(db: &turso::Database, conn: &turso::Connection, name: &str) -> Result<()> {
-	let before = pragma(conn, "PRAGMA journal_mode").await.with_context(|| format!("{name}: reading PRAGMA journal_mode"))?;
 	// A query, not `execute`: the switch answers with the mode now in effect, and
 	// `execute` fails on that row ("unexpected row during execution") even when the
 	// switch worked. Its result is only kept to explain a failure; the read-back below
@@ -67,20 +74,17 @@ pub async fn enable_mvcc_full(db: &turso::Database, conn: &turso::Connection, na
 	downgrade_for_test(&fresh, name).await?;
 	let synchronous = pragma(&fresh, "PRAGMA synchronous").await.with_context(|| format!("{name}: reading PRAGMA synchronous"))?;
 	require_full_sync(name, &synchronous)?;
-	if is_mvcc(&before) {
-		return Ok(());
-	}
 	// On the connection just proven FULL, so that the checkpoint does fsync.
-	sync_switched_header(&fresh).await.with_context(|| format!("{name}: syncing the MVCC header this open wrote (a commit, then a TRUNCATE checkpoint)"))
+	sync_header(&fresh).await.with_context(|| format!("{name}: syncing the MVCC header (a commit, then a TRUNCATE checkpoint)"))
 }
 
-/// Make the MVCC header the switch wrote durable, through Turso: commit one transaction
-/// that changes nothing (`user_version` rewritten with its own value), then checkpoint
-/// it with TRUNCATE. The checkpoint writes that commit through the WAL into the DB file
-/// and fsyncs the file before it truncates the log, which syncs page 1 with it. A
-/// checkpoint alone is not enough: with nothing committed since the switch it backfills
-/// nothing and syncs nothing.
-async fn sync_switched_header(conn: &turso::Connection) -> Result<()> {
+/// Make the MVCC header durable, through Turso: commit one transaction that changes
+/// nothing (`user_version` rewritten with its own value), then checkpoint it with
+/// TRUNCATE. The checkpoint writes that commit through the WAL into the DB file, page 1
+/// with it, and fsyncs the file before it truncates the log. A checkpoint alone is not
+/// enough: with nothing committed since the switch it backfills nothing and syncs
+/// nothing.
+async fn sync_header(conn: &turso::Connection) -> Result<()> {
 	let user_version = match pragma(conn, "PRAGMA user_version").await.context("reading PRAGMA user_version")? {
 		Value::Integer(version) => version,
 		other => bail!("PRAGMA user_version answered {}, not an integer", show(&other)),
@@ -224,31 +228,46 @@ mod tests {
 		}
 	}
 
-	/// An open that finds the database in MVCC already switches nothing, so it writes
-	/// nothing to the DB file and runs no checkpoint; the rows are all there.
+	/// Every open syncs the header, not only the one that switched. An open that switched
+	/// and then crashed, or failed, before its sync leaves an MVCC header that was written
+	/// but never synced, and the next open reads it back as MVCC (from the OS page cache):
+	/// judged by that, it would have nothing to sync, and its commits would sync only the
+	/// `-log`. Here a bare switch plays the open that crashed (the recording backend shows
+	/// its header write left unsynced), and the next open still rewrites page 1 and fsyncs
+	/// the DB file before it returns. The rows are all there.
 	#[tokio::test]
-	async fn an_open_of_an_mvcc_database_writes_nothing_to_it() {
-		use crate::types::durable::turso_probe::ProbeIo;
+	async fn every_open_syncs_the_header_even_one_that_finds_mvcc() {
+		use crate::types::durable::turso_probe::{FileEvent, ProbeIo};
 
 		let dir = tempfile::tempdir().unwrap();
 		let path = dir.path().join("mvcc.db");
 		let path = path.to_string_lossy();
 		switched_back_to_wal(&path).await;
-		let db = turso::Builder::new_local(&path).build().await.unwrap();
+		// The open that crashed between its switch and the sync.
+		let crashed = ProbeIo::new().unwrap();
+		let db = turso::Builder::new_local(&path).with_io_impl(crashed.clone()).build().await.unwrap();
 		let conn = db.connect().unwrap();
-		enable_mvcc_full(&db, &conn, &path).await.unwrap();
+		let switched = show(&pragma(&conn, "PRAGMA journal_mode=experimental_mvcc").await.unwrap());
 		drop(conn);
 		drop(db);
 
 		let io = ProbeIo::new().unwrap();
 		let db = turso::Builder::new_local(&path).with_io_impl(io.clone()).build().await.unwrap();
 		let conn = db.connect().unwrap();
+		let found = show(&pragma(&conn, "PRAGMA journal_mode").await.unwrap());
 		enable_mvcc_full(&db, &conn, &path).await.expect("passes");
+		let rewrote_header = io.writes("mvcc.db").iter().any(|&(pos, _)| pos == 0);
+		let fsynced = io.events().contains(&FileEvent::Sync { file: "mvcc.db".to_string() });
+		let synced = io.synced_since_last_write("mvcc.db");
 		let rows = pragma(&conn, "SELECT COUNT(*) FROM t").await.unwrap();
 		drop(conn);
 		drop(db);
+		assert_eq!(switched, MVCC);
+		assert!(crashed.writes("mvcc.db").iter().any(|&(pos, _)| pos == 0) && !crashed.synced_since_last_write("mvcc.db"), "the crashed open wrote the header and never synced it: {:?}", crashed.events());
+		assert_eq!(found, MVCC, "the next open reads the unsynced header as MVCC");
+		assert!(rewrote_header, "it rewrites page 1: {:?}", io.events());
+		assert!(fsynced && synced, "and fsyncs the DB file after every write to it: {:?}", io.events());
 		assert_eq!(rows, Value::Integer(1));
-		assert_eq!(io.writes("mvcc.db"), Vec::new(), "{:?}", io.events());
 	}
 
 	/// The probe reads `synchronous` from a fresh connection and refuses the open on

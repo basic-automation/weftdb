@@ -84,7 +84,9 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `aspect_metadata` and `segment_changes`, which later releases fill. `store_meta`
   records `layout_version = 2` and a `store_uuid`. An earlier WeftDB still opens a
   migrated store, which ignores the additions; a WeftDB refuses a store whose
-  `layout_version` is newer than it knows, before it changes anything in it.
+  `layout_version` is newer than it knows, before it writes anything to its
+  databases (the open has already taken the root's `LOCK`, and created `segments/` if
+  it was missing).
 - Segment-index writes (seals, reconciles, splits, merges, squashes) commit through
   one transaction type. A write that loses an MVCC conflict to another writer of the
   same row still fails the call at once, as before: retrying it would replay it over
@@ -146,14 +148,17 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   MVCC journal mode and a new connection syncs FULL, which is what makes a COMMIT
   durable when it returns. Previously a failed switch was ignored and the database
   committed in WAL mode.
-- **The open that switches a control-plane database to MVCC now syncs the header it
+- **Opening a control-plane database now syncs the MVCC header the switch to MVCC
   wrote.** The switch writes the MVCC header into the database file without syncing
   it, and commits then sync only the `-log`, so a power cut could leave a header that
   still says WAL beside a log of acknowledged commits, which Turso refuses to open.
   Turso synced it anyway for a database that never ran MVCC, but not for one switched
-  back to WAL. The open now commits a no-op transaction and runs a TRUNCATE
-  checkpoint, which makes Turso fsync the file, header included; an open of a database
-  already in MVCC does neither.
+  back to WAL. Every open of each of the four databases now commits a no-op
+  transaction and runs a TRUNCATE checkpoint, which makes Turso fsync the file, header
+  included, before the open returns. Every open, not only the one that switched: an
+  open that crashed between its switch and that sync leaves a header the next open
+  reads back as MVCC although it never reached the disk. This costs one commit and one
+  checkpoint per database per open.
 - **Opening a store now makes its files' directory entries durable.** The root,
   `segments/`, the root's parent and any directory the open created are fsynced, so
   the control-plane databases and their logs cannot vanish from the directory after a

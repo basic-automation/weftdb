@@ -522,7 +522,7 @@ impl SegmentStore {
 	/// 1. take the root's `LOCK`, before any database is opened, so one store (in one
 	///    process) owns the root;
 	/// 2. open the four control-plane databases, each refusing to open unless it runs
-	///    MVCC and a new connection syncs FULL;
+	///    MVCC and a new connection syncs FULL, and each syncing its MVCC header;
 	/// 3. fsync `segments/`, the root, any directory this open created above it and the
 	///    root's parent, so the database files and their `-log` files keep their
 	///    directory entries through a power cut (Turso truncates a `-log` in place, so one

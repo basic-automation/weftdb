@@ -149,16 +149,18 @@ impl SegmentIndexStore {
 		crate::types::backup::snapshot_with_verify(&conn, dest, mode, Self::TABLES).await
 	}
 
-	/// Enable MVCC, prove it took and that commits sync FULL, create the `segment_index`
-	/// table if it does not exist, and migrate the database to layout v2. `path` names
-	/// the database in errors.
+	/// Refuse a newer store layout, enable MVCC, prove it took and that commits sync
+	/// FULL, create the `segment_index` table if it does not exist, and migrate the
+	/// database to layout v2. `path` names the database in errors.
 	async fn configure_and_wireframe(db: &turso::Database, path: &str) -> Result<()> {
 		let conn = db.connect()?;
+		// Before anything writes to the database (the switch to MVCC, its header sync, any
+		// DDL): a store of a newer layout is refused untouched. Turso replayed the MVCC log
+		// when it built the database, so `store_meta` reads the same before the switch.
+		let recorded = recorded_layout(&conn, path).await?;
 		// The control plane's MVCC write path; open fails rather than run without it.
 		crate::types::durable::control_plane::enable_mvcc_full(db, &conn, path).await?;
 		conn.execute("PRAGMA busy_timeout=600000", turso::params![]).await.ok();
-		// Before any DDL: a store of a newer layout is refused untouched.
-		let recorded = recorded_layout(&conn, path).await?;
 		conn.execute(
 			"CREATE TABLE IF NOT EXISTS segment_index (
 				aspect TEXT NOT NULL,
@@ -456,8 +458,8 @@ impl SegmentIndexStore {
 /// Migrate the database behind `conn` to layout v2, in place and idempotently: add the
 /// v2 columns `segment_index` lacks, create the v2 tables that do not exist, and record
 /// the layout and a store UUID in `store_meta` unless they are there. `recorded` is the
-/// layout `store_meta` recorded before the open ran any DDL ([`recorded_layout`], which
-/// refuses a newer one). `path` names the database in errors.
+/// layout `store_meta` recorded before the open wrote anything ([`recorded_layout`],
+/// which refuses a newer one). `path` names the database in errors.
 ///
 /// The DDL runs outside `BEGIN CONCURRENT`, where Turso rejects it. Only the columns
 /// `PRAGMA table_info` does not list are added, so a reopen runs no `ALTER` at all; a
@@ -499,10 +501,11 @@ async fn migrate_to_v2(conn: &turso::Connection, path: &str, recorded: Option<u3
 
 /// The layout the database behind `conn` records in `store_meta`, if it records one.
 ///
-/// The open reads it before it runs any DDL, and refuses a layout newer than
-/// [`LAYOUT_VERSION`] there: running this build's schema statements first would re-add a
-/// table or column the newer layout dropped or renamed, in a store the refusal then says
-/// this build does not write to. A store without `store_meta` is layout 1.
+/// The open reads it before it writes anything to the database (the switch to MVCC, the
+/// header sync, any DDL), and refuses a layout newer than [`LAYOUT_VERSION`] there:
+/// running this build's schema statements first would re-add a table or column the newer
+/// layout dropped or renamed, in a store the refusal then says this build does not write
+/// to. A store without `store_meta` is layout 1.
 ///
 /// # Errors
 ///
@@ -749,8 +752,26 @@ mod tests {
 		assert!(none.is_empty());
 	}
 
+	/// Every file in `dir`, by name, with its bytes.
+	fn files_in(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+		std::fs::read_dir(dir).expect("lists the directory").map(|entry| entry.expect("an entry").path()).filter(|path| path.is_file()).map(|path| (path.file_name().expect("a name").to_string_lossy().into_owned(), std::fs::read(&path).expect("reads the file"))).collect()
+	}
+
+	/// The journal mode of the database at `path`, read on a raw connection.
+	async fn journal_mode(path: &str) -> Value {
+		let db = turso::Builder::new_local(path).build().await.expect("opens raw");
+		let mut rows = db.connect().expect("connects").query("PRAGMA journal_mode", ()).await.expect("reads the journal mode");
+		let mode = rows.next().await.expect("answers").expect("a row").get_value(0).expect("the mode");
+		drop(rows);
+		drop(db);
+		mode
+	}
+
 	/// The open records layout 2 and a store UUID once, keeps both across reopens, and
-	/// refuses a store whose `store_meta` records a newer layout than this build knows.
+	/// refuses a store whose `store_meta` records a newer layout than this build knows
+	/// before it writes anything to the database: no DDL, no switch to MVCC, no header
+	/// sync. The refused files are byte for byte what they were, for a newer store in MVCC
+	/// and for one in WAL mode, which the refused open leaves in WAL.
 	#[tokio::test]
 	async fn the_layout_is_recorded_once_and_a_newer_one_is_refused() {
 		let dir = tempfile::TempDir::new().expect("tempdir");
@@ -769,27 +790,43 @@ mod tests {
 		conn.execute("DROP INDEX idx_segment_index_time", ()).await.expect("drops the time index");
 		drop(conn);
 		drop(store);
+		let before = files_in(dir.path());
 		let refused = SegmentIndexStore::open(&path).await.err().expect("a newer layout is refused").to_string();
+		let after = files_in(dir.path());
 		let db = turso::Builder::new_local(&path).build().await.expect("opens the refused store raw");
-		let mut rows = db.connect().expect("connects").query("SELECT name FROM sqlite_schema WHERE name IN ('segment_changes', 'idx_segment_index_time')", ()).await.expect("reads the schema");
+		let conn = db.connect().expect("connects");
+		let mut rows = conn.query("SELECT name FROM sqlite_schema WHERE name IN ('segment_changes', 'idx_segment_index_time')", ()).await.expect("reads the schema");
 		let recreated = rows.next().await.expect("reads").map(|row| row.get_value(0).expect("a name"));
 		drop(rows);
+		// The same store in WAL mode: the refused open must not switch it to MVCC.
+		let mut rows = conn.query("PRAGMA journal_mode=wal", ()).await.expect("switches back to WAL");
+		assert_eq!(rows.next().await.expect("answers").expect("a row").get_value(0).expect("the mode"), Value::Text("wal".into()));
+		drop(rows);
+		drop(conn);
 		drop(db);
+		let wal_before = files_in(dir.path());
+		let wal_refused = SegmentIndexStore::open(&path).await.err().expect("a newer layout in WAL mode is refused").to_string();
+		let wal_after = files_in(dir.path());
+		let wal_mode = journal_mode(&path).await;
 		assert_eq!(layout.as_deref(), Some("2"));
 		assert_eq!(uuid_again, Some(uuid), "a reopen keeps the store's UUID");
 		assert!(refused.contains("records store layout 3, newer than layout 2"), "{refused}");
 		assert_eq!(recreated, None, "the refused open ran none of its DDL on the newer store");
+		assert!(before == after, "the refused open wrote nothing to the database files: {:?} became {:?}", before.keys(), after.keys());
+		assert!(wal_refused.contains("records store layout 3, newer than layout 2"), "{wal_refused}");
+		assert!(wal_before == wal_after, "nor to a newer store in WAL mode: {:?} became {:?}", wal_before.keys(), wal_after.keys());
+		assert_eq!(wal_mode, Value::Text("wal".into()), "which it did not switch to MVCC");
 	}
 
 	/// Design section 1.3, through the real open: when it is the open that switches
 	/// `segment_index.db` to MVCC, every write it made to the DB file (the switched header
 	/// first among them) is synced by the time it returns, for a new store and for a v2
 	/// store that was switched back to WAL, whose switch Turso does not sync by itself.
-	/// The rows are all there, and an open of a store already in MVCC writes nothing to
-	/// the DB file.
+	/// The rows are all there, and an open of a store already in MVCC syncs the DB file
+	/// as well (see `control_plane`: it cannot tell whether that header was ever synced).
 	#[tokio::test]
 	async fn the_open_leaves_the_switched_header_synced() {
-		use crate::types::durable::turso_probe::ProbeIo;
+		use crate::types::durable::turso_probe::{FileEvent, ProbeIo};
 
 		const FILE: &str = "segment_index.db";
 		let dir = tempfile::TempDir::new().expect("tempdir");
@@ -825,7 +862,7 @@ mod tests {
 
 		let io = ProbeIo::new().expect("probe");
 		drop(opened(&io).await.expect("reopens"));
-		assert_eq!(io.writes(FILE), Vec::new(), "an open that switches nothing writes nothing to the DB file: {:?}", io.events());
+		assert!(io.events().contains(&FileEvent::Sync { file: FILE.to_string() }) && io.synced_since_last_write(FILE), "an open of a store already in MVCC syncs the DB file too, since it cannot tell whether its header ever was: {:?}", io.events());
 	}
 
 	#[tokio::test]
