@@ -91,23 +91,42 @@ refuses reason:"missing file: $tmp/partial/weft-physical-type/THIRD-PARTY-NOTICE
 	"$stage" archive x86_64-unknown-linux-gnu v1.2.3 "$tmp/bin/x86_64-unknown-linux-gnu" "$tmp/partial" "$tmp/other"
 refuses "archive with a missing binary" \
 	"$stage" archive x86_64-unknown-linux-gnu v1.2.3 "$tmp/nowhere" "$src" "$tmp/other"
-refuses "archive with a bad tag" \
-	"$stage" archive x86_64-unknown-linux-gnu 'v1.2.3;id' "$tmp/bin/x86_64-unknown-linux-gnu" "$src" "$tmp/other"
+linux_bin=$tmp/bin/x86_64-unknown-linux-gnu
+for bad in 'v1.2.3;id' v1.2.3-beta.1 v01.2.3 v1.2.3-dryrun-abc v1.2.3-dryrun-0123456789ab-release \
+	v1.2.3-dryrun-0123456789AB; do
+	refuses reason:"not a release tag or a dry-run label" "archive with the label $bad" \
+		"$stage" archive x86_64-unknown-linux-gnu "$bad" "$linux_bin" "$src" "$tmp/other"
+done
 
-check "sums over every target" "$stage" sums "$tmp/dist" "${targets[@]}"
+# A dry run's archives carry its commit, and -dev for a dev-profile build.
+for label in v1.2.3-dryrun-0123456789ab v1.2.3-dryrun-0123456789ab-dev v0.2.0-alpha.1-dryrun-0123456789ab; do
+	check "archive with the dry-run label $label" \
+		"$stage" archive x86_64-unknown-linux-gnu "$label" "$linux_bin" "$src" "$tmp/dry-$label"
+	check "  is named for it" test -f "$tmp/dry-$label/weftdb-$label-x86_64-unknown-linux-gnu.tar.gz"
+	check "  and sums over it" "$stage" sums "$tmp/dry-$label" "$label" x86_64-unknown-linux-gnu
+done
+
+check "sums over every target" "$stage" sums "$tmp/dist" v1.2.3 "${targets[@]}"
 check "SHA256SUMS verifies with sha256sum -c" sha256sum_c "$tmp/dist" SHA256SUMS
 check "SHA256SUMS lists every archive" test "$(wc -l <"$tmp/dist/SHA256SUMS")" -eq 2
 
-refuses "sums with a target missing" "$stage" sums "$tmp/dist" "${targets[@]}" x86_64-pc-windows-msvc
-refuses "sums with an archive no target asked for" "$stage" sums "$tmp/dist" "${targets[0]}"
+refuses reason:"missing the archive" "sums with a target missing" \
+	"$stage" sums "$tmp/dist" v1.2.3 "${targets[@]}" x86_64-pc-windows-msvc
+refuses reason:"2 archives for 1 targets" "sums with an archive no target asked for" \
+	"$stage" sums "$tmp/dist" v1.2.3 "${targets[0]}"
+refuses reason:"missing the archive" "sums over archives named for another label" \
+	"$stage" sums "$tmp/dist" v1.2.4 "${targets[@]}"
+refuses reason:"missing the archive" "sums for a release over a dry run's archives" \
+	"$stage" sums "$tmp/dry-v1.2.3-dryrun-0123456789ab" v1.2.3 x86_64-unknown-linux-gnu
 
 cp -r "$tmp/dist" "$tmp/corrupt"
 printf 'x' >>"$tmp/corrupt/weftdb-v1.2.3-aarch64-apple-darwin.tar.gz"
-refuses "sums over a corrupted archive" "$stage" sums "$tmp/corrupt" "${targets[@]}"
+refuses reason:"sha256 is" "sums over a corrupted archive" "$stage" sums "$tmp/corrupt" v1.2.3 "${targets[@]}"
 
 cp -r "$tmp/dist" "$tmp/nosum"
 rm "$tmp/nosum/weftdb-v1.2.3-aarch64-apple-darwin.tar.gz.sha256"
-refuses "sums with a .sha256 missing" "$stage" sums "$tmp/nosum" "${targets[@]}"
+refuses reason:"missing weftdb-v1.2.3-aarch64-apple-darwin.tar.gz.sha256" "sums with a .sha256 missing" \
+	"$stage" sums "$tmp/nosum" v1.2.3 "${targets[@]}"
 
 if ((failures > 0)); then
 	echo "$failures failure(s)"

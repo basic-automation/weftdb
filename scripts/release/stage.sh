@@ -1,22 +1,27 @@
 #!/usr/bin/env bash
 # Stage the release archives and their checksums.
 #
-#   scripts/release/stage.sh archive <target> <tag> <bin-dir> <src-dir> <out-dir>
+#   scripts/release/stage.sh archive <target> <label> <bin-dir> <src-dir> <out-dir>
 #       Packs weft-server, weft-tui and weft-bench from <bin-dir>, with the files in
-#       DOCS from <src-dir>, into <out-dir>/weftdb-<tag>-<target>.tar.gz (a .zip for a
+#       DOCS from <src-dir>, into <out-dir>/weftdb-<label>-<target>.tar.gz (a .zip for a
 #       Windows target), and writes <archive>.sha256 next to it.
 #
-#   scripts/release/stage.sh sums <dist-dir> <target>...
-#       Requires exactly one archive per <target> in <dist-dir> and nothing else,
-#       checks each archive against its .sha256, then writes <dist-dir>/SHA256SUMS over
-#       all of them and checks that too.
+#   scripts/release/stage.sh sums <dist-dir> <label> <target>...
+#       Requires exactly weftdb-<label>-<target> for each <target> in <dist-dir> and no
+#       other archive, checks each against its .sha256, then writes
+#       <dist-dir>/SHA256SUMS over all of them and checks that too.
+#
+# <label> is a release tag (vX.Y.Z or vX.Y.Z-rc.N), or for a dry run
+# v<version>-dryrun-<12-hex commit>, with -dev appended for a dev-profile build, so a
+# dry run's archives can never be named like a release's.
 #
 # Runs on Linux, macOS and Windows (Git Bash). The checksum files use the
 # "<sha256>  <file name>" format that `sha256sum -c` and `shasum -a 256 -c` read.
 set -euo pipefail
 
 TARGET_RE='^[a-z0-9_]+(-[a-z0-9_]+){2,3}$'
-TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+TAG_RE='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.(0|[1-9][0-9]*))?$'
+DRY_RUN_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?-dryrun-[0-9a-f]{12}(-dev)?$'
 BINARIES=(weft-server weft-tui weft-bench)
 # What every archive carries besides the binaries, as <path in the source tree>:<name in
 # the archive>. Apache-2.0 section 4: the binaries contain code adapted from Chimp
@@ -41,7 +46,21 @@ fail() {
 }
 
 usage() {
-	fail "usage: stage.sh archive <target> <tag> <bin-dir> <src-dir> <out-dir> | stage.sh sums <dist-dir> <target>..."
+	fail "usage: stage.sh archive <target> <label> <bin-dir> <src-dir> <out-dir> | stage.sh sums <dist-dir> <label> <target>..."
+}
+
+check_label() {
+	[[ $1 =~ $TAG_RE || $1 =~ $DRY_RUN_RE ]] ||
+		fail "not a release tag or a dry-run label: $(printf '%q' "$1")"
+}
+
+# archive_name <label> <target>: the archive's file name.
+archive_name() {
+	if [[ $2 == *-windows-* ]]; then
+		printf 'weftdb-%s-%s.zip\n' "$1" "$2"
+	else
+		printf 'weftdb-%s-%s.tar.gz\n' "$1" "$2"
+	fi
 }
 
 sha256_of() {
@@ -70,14 +89,14 @@ check_line() {
 
 archive() {
 	[[ $# -eq 5 ]] || usage
-	local target=$1 tag=$2 bin_dir=$3 src_dir=$4 out_dir=$5 exe='' format name work f from to
+	local target=$1 label=$2 bin_dir=$3 src_dir=$4 out_dir=$5 exe='' format name work f from to
 	[[ $target =~ $TARGET_RE ]] || fail "not a target triple: $(printf '%q' "$target")"
-	[[ $tag =~ $TAG_RE ]] || fail "not a release tag: $(printf '%q' "$tag")"
+	check_label "$label"
 	[[ $target == *-windows-* ]] && exe=.exe
 	format=tar.gz
 	[[ $target == *-windows-* ]] && format=zip
 
-	name="weftdb-$tag-$target"
+	name="weftdb-$label-$target"
 	mkdir -p "$out_dir"
 	out_dir=$(cd "$out_dir" && pwd)
 	work=$(mktemp -d)
@@ -115,19 +134,17 @@ archive() {
 }
 
 sums() {
-	[[ $# -ge 2 ]] || usage
-	local dist=$1 target line f
-	shift
+	[[ $# -ge 3 ]] || usage
+	local dist=$1 label=$2 target line f
+	shift 2
 	[[ -d $dist ]] || fail "no such directory: $dist"
-	local -a archives=() found=() all=()
+	check_label "$label"
+	local -a archives=() all=()
 	for target in "$@"; do
 		[[ $target =~ $TARGET_RE ]] || fail "not a target triple: $(printf '%q' "$target")"
-		shopt -s nullglob
-		found=("$dist"/weftdb-v*-"$target".tar.gz "$dist"/weftdb-v*-"$target".zip)
-		shopt -u nullglob
-		[[ ${#found[@]} -eq 1 ]] ||
-			fail "expected one archive for $target, found ${#found[@]}: ${found[*]:-none}"
-		archives+=("${found[0]##*/}")
+		f=$(archive_name "$label" "$target")
+		[[ -f $dist/$f ]] || fail "missing the archive for $target: $f"
+		archives+=("$f")
 	done
 
 	shopt -s nullglob
