@@ -205,7 +205,11 @@
 //!
 //! - **High Performance**: Optimized for real-time data processing with batch operations
 //! - **Advanced Interpolation**: Linear, cubic, quadratic, and polynomial spline methods
-//! - **GPU Acceleration**: Automatic strategy selection for large datasets
+//!   (splimes 1.0), run on tokio's blocking pool so they never occupy an async worker
+//! - **Interpolation Backends**: splimes picks one CPU thread or the rayon pool by output
+//!   grid size, and the GPU (`wgpu`) only above the thresholds `splimes::calibrate()`
+//!   measures; a program calls it once at startup (`weft-server` does), and without it
+//!   interpolation stays on the CPU
 //! - **MVCC Concurrency**: Concurrent writes with `BEGIN CONCURRENT` transactions
 //! - **Pattern Recognition**: Extract and match recurring patterns in time-series data
 //! - **Event Detection**: Detect significant occurrences and predict future events
@@ -241,14 +245,17 @@
 //! | Query (point lookup)     | 0.1-1     | Indexed lookup with caching         |
 //! | Query (range scan)       | 1-100     | Depends on range size               |
 //! | Interpolation (1K points)| 5-50      | Depends on method and hardware      |
-//! | GPU Interpolation (1M)   | 100-500   | Requires compatible GPU             |
+//!
+//! Large grids run on the rayon pool, or on the GPU where calibration measured it
+//! faster; splimes' `BENCHMARKS.md` has the backend timings.
 //!
 //! ## Compatibility
 //!
 //! - **Operating Systems**: Linux, macOS, Windows
-//! - **Rust Version**: 1.75.0 or later (requires 2024 edition features)
+//! - **Rust Version**: 1.95 or later, on stable
 //! - **Hardware**: `x86_64`, ARM64 architectures
-//! - **GPU Support**: Via wgpu (Vulkan, Metal, DX12)
+//! - **GPU Support**: Optional, through splimes' `wgpu` backend (Vulkan, Metal, DX12),
+//!   used once `splimes::calibrate()` has run
 
 #![recursion_limit = "1024"]
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]

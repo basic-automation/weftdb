@@ -127,6 +127,36 @@ jobs:
           # Not a crash test, but it poisons a store through the same feature's hook.
           cargo test -p weft-server --features fault-injection --locked --test ready_poisoned -- --test-threads=4
 
+  # The workspace jobs never see weft-physical-type's cargo features on their own terms:
+  # resolver 2 unifies features across `--workspace`, so weft-bench's `experimental-codecs`
+  # is always on there, and nothing turns `bitsliced-codec` on. Selecting packages with `-p`
+  # avoids that, so this job checks the configuration crates.io users get (no features) and
+  # runs the tests that only compile with `bitsliced-codec` (the reader that stores which set
+  # WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD depend on). Linux only: the feature split is not
+  # platform-specific, and the per-OS test job above already covers the rest.
+  features:
+    name: feature matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check default features alone (no workspace feature unification)
+        run: cargo check -p weft-physical-type -p weftdb --all-targets --locked
+      - name: Build docs for default features alone (deny broken intra-doc links)
+        run: cargo doc -p weft-physical-type --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+      # Same SKIP_SLOW_TESTS / --test-threads policy as the test job.
+      - name: Test default features alone, then every optional codec
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then export SKIP_SLOW_TESTS=1; fi
+          cargo test -p weft-physical-type --locked -- --test-threads=4
+          cargo test -p weft-physical-type --all-features --locked -- --test-threads=4
+          cargo test -p weftdb --features bitsliced-codec --lib --test bitsliced_codec_feature --locked -- --test-threads=4
+
   docs:
     name: rustdoc
     runs-on: ubuntu-latest
@@ -159,3 +189,14 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories bans licenses sources
+
+  # The contribution-terms workflow runs scripts/contrib/dco_check.py against the GitHub API;
+  # this runs the checker's tests against stubbed API responses (scripts/contrib/testdata).
+  contrib:
+    name: contribution-terms checker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: python3 -m unittest discover -s scripts/contrib -p 'test_*.py' -v
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"

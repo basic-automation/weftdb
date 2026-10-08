@@ -30,3 +30,6 @@ DETAILED_CHANGES.txt
 # Editor workspace settings
 .vscode
 .zed
+
+# Python bytecode (scripts/contrib)
+__pycache__

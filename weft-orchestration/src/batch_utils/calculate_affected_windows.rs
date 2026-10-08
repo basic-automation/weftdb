@@ -48,7 +48,7 @@ pub fn calculate_affected_windows(unbatched_timestamps: &[DateTime<Utc>], resolu
 		return HashSet::new();
 	}
 
-	let step = resolution.to_step();
+	let step = resolution.step();
 	let step_millis = step.num_milliseconds();
 	if step_millis <= 0 {
 		return HashSet::new();

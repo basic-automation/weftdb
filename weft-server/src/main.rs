@@ -5,6 +5,17 @@
 //! `WEFT_SERVER_ADDR` environment variable (e.g. `0.0.0.0:9000`). Keeping the
 //! wiring this thin means the router under test is exactly the router served.
 //!
+//! ## Request guard
+//!
+//! When the bound address is a loopback address, every request must be addressed to a
+//! loopback host (`Host: localhost`, `127.0.0.0/8` or `[::1]`, else `421`), and a
+//! state-changing request carrying a non-loopback `Origin` is refused (`403`), so web
+//! pages from non-loopback origins, open in a local browser, cannot drive the server
+//! ([`weft_server::host_guard`]).
+//! `WEFT_ALLOW_ANY_HOST=1` turns this off for a local reverse proxy that forwards a
+//! different `Host` or a browser UI's non-loopback `Origin`. A non-loopback bind is not guarded: there is no authentication yet,
+//! so such a server must not be reachable from an untrusted network.
+//!
 //! ## Optional segment store
 //!
 //! Set `WEFT_SEGMENT_STORE_ROOT` to a directory to open a [`SegmentStore`] rooted
@@ -12,10 +23,29 @@
 //! query endpoints (`/api/v1/storage/...`) go live; without it the server serves
 //! only the stateless interpolation/downsample API and those endpoints answer
 //! `503`. Readiness (`GET /ready`) reports which mode is active.
+//!
+//! ## Interpolation cap
+//!
+//! Every `/api/v1/interpolate*` request may produce at most 10,000,000 output points
+//! (`weft_server::MAX_INTERPOLATE_OUTPUT_POINTS`); `WEFT_MAX_INTERPOLATE_POINTS` sets
+//! another positive limit. It is read once at startup, and a value that is not a
+//! positive integer stops the server from starting.
+//!
+//! ## GPU calibration
+//!
+//! Once the listener is bound, the server calibrates the interpolation engine's backend
+//! choice once, in the background ([`weft_server::gpu`]): it starts the GPU if there is
+//! one and measures where the rayon pool and the GPU overtake a single core. That takes
+//! several seconds, during which requests are already served and interpolate on the CPU
+//! with splimes' default thresholds. A CPU/software adapter (llvmpipe, lavapipe, WARP) is
+//! not calibrated unless `WEFT_GPU_CALIBRATE=force`; `WEFT_GPU_CALIBRATE=0` skips
+//! calibration altogether. It never stops the server from starting.
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use weft_server::{app_with_state, spawn_backup_daemon, spawn_reconcile_daemon, AppState, BackupDaemonConfig, ReconcileDaemonConfig, SERVICE, VERSION};
+use weft_server::{
+	app_with_state, gpu::{self, CalibrationMode, GPU_CALIBRATE_ENV}, host_guard::{self, HostGuard, ALLOW_ANY_HOST_ENV}, spawn_backup_daemon, spawn_reconcile_daemon, AppState, BackupDaemonConfig, InterpolateConfig, ReconcileDaemonConfig, MAX_INTERPOLATE_POINTS_ENV, SERVICE, VERSION
+};
 use weftdb::SegmentStore;
 
 /// Default bind address when `WEFT_SERVER_ADDR` is unset.
@@ -95,13 +125,18 @@ async fn main() -> anyhow::Result<()> {
 	let otel_provider = init_tracing();
 	let addr: SocketAddr = std::env::var("WEFT_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string()).parse()?;
 
-	let state = build_state().await?;
+	let interpolate = interpolate_config_from_env()?;
+	let state = build_state().await?.with_interpolate_config(interpolate);
 	spawn_reconcile_daemon_if_configured(&state)?;
 	spawn_backup_daemon_if_configured(&state)?;
 
 	let listener = tokio::net::TcpListener::bind(addr).await?;
 	let local = listener.local_addr()?;
 	println!("{SERVICE} v{VERSION} listening on http://{local}");
+	let state = state.with_host_guard(host_guard_for(local));
+
+	// After the bind and in the background, so serving never waits for it.
+	spawn_gpu_calibration_if_enabled();
 
 	let serve_result = axum::serve(listener, app_with_state(state)).await;
 	if let Some(provider) = otel_provider {
@@ -110,6 +145,19 @@ async fn main() -> anyhow::Result<()> {
 	}
 	serve_result?;
 	Ok(())
+}
+
+/// Pick the request guard for the bound address `local` ([`HostGuard::for_bind`],
+/// honouring `WEFT_ALLOW_ANY_HOST`) and log which one is in force.
+fn host_guard_for(local: SocketAddr) -> HostGuard {
+	let allow_any_host = host_guard::allow_any_host_from_env(std::env::var(ALLOW_ANY_HOST_ENV).ok().as_deref());
+	let guard = HostGuard::for_bind(local, allow_any_host);
+	match guard {
+		HostGuard::Loopback => println!("request guard: loopback only (Host must be localhost, 127.0.0.0/8 or [::1]; state-changing requests from non-loopback web origins are refused; set {ALLOW_ANY_HOST_ENV}=1 behind a local reverse proxy that rewrites Host or forwards a non-loopback Origin)"),
+		HostGuard::Off if local.ip().to_canonical().is_loopback() => println!("request guard: off ({ALLOW_ANY_HOST_ENV} is set)"),
+		HostGuard::Off => println!("request guard: off (bound to the non-loopback address {local}; there is no authentication, so keep this server off untrusted networks)"),
+	}
+	guard
 }
 
 /// Install the process-wide tracing subscriber (roadmap Phase 3): a `fmt` layer
@@ -166,6 +214,35 @@ fn build_otlp_provider() -> Option<opentelemetry_sdk::trace::SdkTracerProvider> 
 	};
 	let resource = opentelemetry_sdk::Resource::builder().with_service_name(SERVICE).build();
 	Some(opentelemetry_sdk::trace::SdkTracerProvider::builder().with_batch_exporter(exporter).with_resource(resource).build())
+}
+
+/// Read the interpolation settings ([`InterpolateConfig`]) from
+/// `WEFT_MAX_INTERPOLATE_POINTS`, once, and log the output-grid cap in force.
+///
+/// # Errors
+///
+/// A value that is not a positive integer (a malformed operator config should fail
+/// loudly at start rather than silently default).
+fn interpolate_config_from_env() -> anyhow::Result<InterpolateConfig> {
+	let config = InterpolateConfig::from_env_value(std::env::var(MAX_INTERPOLATE_POINTS_ENV).ok().as_deref()).map_err(anyhow::Error::msg)?;
+	println!("interpolation: at most {} output points per request (set {MAX_INTERPOLATE_POINTS_ENV} to change)", config.max_output_points());
+	Ok(config)
+}
+
+/// Start the GPU calibration ([`gpu::calibrate`]) in the background on tokio's blocking
+/// pool unless `WEFT_GPU_CALIBRATE` opts out; it prints what it found when it finishes.
+/// Returns at once: the server serves while it runs, interpolating on the CPU until the
+/// measured thresholds are in force. Never fails: a missing GPU, a software adapter, a
+/// failed calibration, or even a panicking one only leaves splimes' defaults in force.
+fn spawn_gpu_calibration_if_enabled() {
+	let mode = CalibrationMode::from_env_value(std::env::var(GPU_CALIBRATE_ENV).ok().as_deref());
+	if mode == CalibrationMode::Off {
+		println!("gpu calibration: skipped ({GPU_CALIBRATE_ENV} is off); interpolation stays on the CPU with the default thresholds");
+		return;
+	}
+	println!("gpu calibration: timing the interpolation backends in the background (several seconds, on the CPU until it finishes; set {GPU_CALIBRATE_ENV}=0 to skip)");
+	// Detached for the process lifetime, like the daemons; its handle is dropped on purpose.
+	drop(gpu::spawn_in_background(move || gpu::calibrate(mode)));
 }
 
 /// Start the background reconcile daemon (roadmap Phase 4.6) when a store is

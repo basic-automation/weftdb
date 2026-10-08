@@ -6,7 +6,7 @@ use chrono::{TimeZone, Utc};
 use futures::StreamExt;
 use splimes::{Resolution, Spline};
 use uuid::Uuid;
-use weftdb::{database::traits::DatabaseStructure, Database, DatasetId, InputMeasurement, Outputs};
+use weftdb::{database::traits::DatabaseStructure, Database, DatasetId, DictionaryConstraints, InputMeasurement, Outputs, Steps};
 
 #[tokio::test]
 async fn test_database_lifecycle() {
@@ -254,5 +254,58 @@ async fn test_caching_behavior() {
 	println!("First call: {first_duration:?}, Second call: {second_duration:?}");
 
 	// Clean up
+	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+}
+
+/// Rewrite a dictionary's stored step interpolation, as the CHANGELOG's remedy for a
+/// stored method splimes 1.0 rejects does with Turso's shell.
+async fn set_stored_interpolation(db: &Database, aspect_id: &weftdb::AspectId, dictionary: &str, from: &str, to: &str) {
+	let dictionary_db = db.get_dictionary_db(aspect_id, dictionary).await.expect("Failed to open dictionary database");
+	let conn = dictionary_db.connect().expect("Failed to connect to dictionary database");
+	let changed = conn.execute("UPDATE dictionary_constraints SET steps_interpolation = ? WHERE steps_interpolation = ?", turso::params![to, from]).await.expect("Failed to rewrite steps_interpolation");
+	assert_eq!(changed, 1, "one stored `{from}` to rewrite");
+}
+
+/// A dictionary's stored step interpolation loads through `get_dictionary_metadata`,
+/// which validates it with splimes 1.0's `Spline::from_str`; a method 0.1 accepted and
+/// 1.0 rejects is the documented error until the stored text is rewritten.
+#[tokio::test]
+async fn test_dictionary_metadata_validates_stored_interpolation() {
+	let db_name = format!("test_dictionary_steps_{}", Uuid::new_v4());
+	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+
+	let db = Database::new(&db_name).await.expect("Failed to create database");
+	let subject = db.observe_subject("dictionary_subject").await.expect("Failed to add subject");
+	let aspect = db.track_aspect(&subject.id(), "pressure", &splimes::Resolution::Seconds, None).await.expect("Failed to track aspect");
+
+	// A dictionary without steps stores NULL for both columns and loads with none.
+	aspect.new_dictionary("unstepped", "no steps", &DictionaryConstraints::default()).await.expect("Failed to create dictionary");
+	let metadata = db.get_dictionary_metadata(&aspect.id(), "unstepped").await.expect("Failed to load dictionary metadata").expect("dictionary exists");
+	assert_eq!(metadata.name, "unstepped");
+	assert!(metadata.constraints.steps().is_none());
+
+	// `new_dictionary` refuses to store a method that could not load...
+	let invalid = DictionaryConstraints::new(Some(Steps::new(10, Spline::Polynomial(9, None))), None);
+	let err = aspect.new_dictionary("rejected", "degree 9", &invalid).await.expect_err("a degree 9 must not be stored");
+	assert_eq!(err.to_string(), "Invalid step interpolation for dictionary 'rejected': invalid polynomial degree 9: must be between 1 and 8");
+
+	// ...so write what 0.1 could store, a degree above 8, directly.
+	let stepped = DictionaryConstraints::new(Some(Steps::new(10, Spline::Polynomial(8, None))), None);
+	aspect.new_dictionary("stepped", "polynomial steps", &stepped).await.expect("Failed to create dictionary");
+	set_stored_interpolation(&db, &aspect.id(), "stepped", "Polynomial(degree: 8, bounds_factor: None)", "Polynomial(degree: 9, bounds_factor: None)").await;
+	let err = db.get_dictionary_metadata(&aspect.id(), "stepped").await.expect_err("a stored degree 9 must not load");
+	assert_eq!(err.to_string(), "Database error: Invalid interpolation format: invalid polynomial degree 9: must be between 1 and 8");
+
+	// The CHANGELOG's remedy makes it load.
+	set_stored_interpolation(&db, &aspect.id(), "stepped", "Polynomial(degree: 9, bounds_factor: None)", "Polynomial(degree: 8, bounds_factor: None)").await;
+	let metadata = db.get_dictionary_metadata(&aspect.id(), "stepped").await.expect("Failed to load dictionary metadata").expect("dictionary exists");
+	let steps = metadata.constraints.steps().as_ref().expect("stored steps");
+	assert_eq!((steps.count(), *steps.interpolation()), (10, Spline::Polynomial(8, None)));
+
+	// `list_dictionaries` reads the same table (from the dictionary named "default").
+	aspect.new_dictionary("default", "listed", &DictionaryConstraints::default()).await.expect("Failed to create dictionary");
+	let listed = db.list_dictionaries(&aspect.id()).await.expect("Failed to list dictionaries");
+	assert_eq!(listed.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["default"]);
+
 	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
 }

@@ -5,7 +5,7 @@
 [![crates.io](https://img.shields.io/crates/v/weftdb.svg)](https://crates.io/crates/weftdb)
 [![docs.rs](https://img.shields.io/docsrs/weftdb)](https://docs.rs/weftdb)
 [![CI](https://github.com/basic-automation/weftdb/actions/workflows/ci.yml/badge.svg)](https://github.com/basic-automation/weftdb/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 ![Rust](https://img.shields.io/badge/Rust-1.95%2B-orange.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue.svg)
 ![Status](https://img.shields.io/badge/status-pre--beta-orange.svg)
@@ -47,8 +47,9 @@ observed endpoints marked `raw`, the 59 between them `interpolated`.
 ## Why WeftDB
 
 **Interpolation is a first-class query, not post-processing.** Resampling, gap
-filling and upsampling run next to the data, over typed columnar segments, on
-CPU / SIMD / GPU — not in a client loop pulling raw rows across the wire.
+filling and upsampling run next to the data, over typed columnar segments, on one CPU
+thread, the rayon pool or — once calibrated — the GPU, chosen by grid size, not in a
+client loop pulling raw rows across the wire.
 
 **Precision is declared, never silently lost.** Values are logically
 [`BigDecimal`](https://docs.rs/bigdecimal). Each aspect declares a physical encoding
@@ -70,8 +71,8 @@ on your hardware. Where WeftDB doesn't win, this README says so.
 ## Quickstart
 
 **Prerequisites:** Rust **1.95 or newer** on stable. A GPU with a `wgpu` backend
-(Vulkan / Metal / DX12) is optional — without one the engine falls back to
-SIMD/parallel CPU automatically.
+(Vulkan / Metal / DX12) is optional — without one the engine runs on the CPU
+(one thread or the rayon pool) automatically.
 
 ```bash
 cargo build --release
@@ -214,9 +215,9 @@ truth for status and priorities, and it records negative results alongside wins.
 
 - **Interpolation on read** — reconstruct any series onto any grid from nanoseconds
   to years, with Linear / Quadratic / Cubic / Polynomial splines. The engine picks
-  GPU, parallel (Rayon), SIMD or single-threaded CPU by dataset size, and degrades
-  the method gracefully (Cubic → Quadratic → Linear) when data is too sparse to
-  support it.
+  single-threaded CPU, parallel (Rayon) or — once calibrated — GPU by grid size, and
+  degrades the method gracefully (Cubic → Quadratic → Linear) when data is too sparse
+  to support it.
 - **Provenance on every point** — `raw`, `interpolated` or `extrapolated`.
 - **Downsampling** into epoch-aligned buckets: `min`/`max`/`avg`/`sum`/`first`/`last`,
   exact nearest-rank `p50`/`p90`/`p95`/`p99`, three **time-weighted averages** (LOCF
@@ -297,11 +298,12 @@ while using bounded memory per bucket.
 
 ### Where it doesn't pay off
 
-A deliberately-kept honest result: the FastLanes **transposed value codec** delivers
+A deliberately-kept honest result: the **bit-sliced (transposed) value codec** delivers
 ~5.7× faster bit-unpacking at the kernel level, but end-to-end it is a **wash** —
 +0.08% bytes and full decode, windowed range and point reads all within noise of the
 linear codec ([`benches/transposed_read.rs`](weft-physical-type/benches/transposed_read.rs)).
-It ships **off by default** for exactly that reason. Kernel speedups often don't
+It ships **off by default** for exactly that reason (and is now behind the
+`bitsliced-codec` build feature, pending patent review). Kernel speedups often don't
 survive a whole read path, and this README would rather say so than quote the 5.7×.
 
 ---
@@ -320,6 +322,22 @@ Bind address defaults to `127.0.0.1:8080` (`WEFT_SERVER_ADDR` overrides). Settin
 holds the root's `LOCK` file while it runs, and a second server pointed at the same
 root exits at startup with an error naming the first one's pid.
 
+While bound to a loopback address, the server only answers requests addressed to a
+loopback host: `Host` must be `localhost`, an address in `127.0.0.0/8` or `[::1]`
+(anything else is a `421`), and a state-changing request whose `Origin` is not a
+loopback origin is a `403`. That keeps web pages from non-loopback origins, open in a
+local browser, from driving the server; a page served by another local web server (any
+loopback origin, on any port) is still trusted until authentication lands. Clients that
+send no `Origin`, like `curl`, are unaffected. `/health` and `/ready` follow the same
+rule, so a health probe must send a loopback `Host` such as `localhost` or `127.0.0.1`,
+as every HTTP/1.1 client does; an HTTP/1.0 probe that sends no `Host` gets a `421`, so
+configure it to send one or set `WEFT_ALLOW_ANY_HOST=1`. Behind a local reverse
+proxy that forwards a different `Host`, set `WEFT_ALLOW_ANY_HOST=1`; a proxy that keeps
+`Host: 127.0.0.1` but forwards the `Origin` of a browser UI served from a non-loopback
+origin needs it too, or that UI's state-changing requests get a `403`. A non-loopback
+bind is not guarded: there is no authentication yet, so keep such a server off
+untrusted networks.
+
 ### Service endpoints
 
 | Method & path | Purpose |
@@ -337,7 +355,7 @@ CSV, Arrow IPC, or Parquet**:
 
 | Endpoint | Purpose |
 |----------|---------|
-| `POST /api/v1/interpolate` | Reconstruct an irregular series onto a regular grid (`spline` = `linear` \| `quadratic` \| `cubic` \| polynomial; `resolution` = `nanoseconds`..`years`). Every output point carries a `kind` — `raw` / `interpolated` / `extrapolated`. |
+| `POST /api/v1/interpolate` | Reconstruct an irregular series onto a regular grid (`spline` = `linear` \| `quadratic` \| `cubic` \| polynomial; `resolution` = `nanoseconds`..`years`). Every output point carries a `kind` — `raw` / `interpolated` / `extrapolated`. A grid of more than 10,000,000 points (`MAX_INTERPOLATE_OUTPUT_POINTS`, or `WEFT_MAX_INTERPOLATE_POINTS`) is refused with `400` before anything is computed; split larger ranges across requests. The response's `spline` is the method that ran: with fewer distinct timestamps than the requested method needs (cubic 4, quadratic 3, polynomial degree + 1) it is the simpler method splimes stepped down to. |
 | `POST /api/v1/interpolate/point` | Evaluate the reconstructed signal at a single instant, labelled raw/interpolated/extrapolated. |
 | `POST /api/v1/downsample` | Reduce samples into epoch-grid-aligned buckets — `min`/`max`/`avg`/`sum`/`first`/`last`, nearest-rank percentiles `p50`/`p90`/`p95`/`p99`, the three **time-weighted averages** (`twa`, LOCF dwell-weighting, for change-only sensors; `twa_linear`, trapezoidal `Σ½(vᵢ+vᵢ₊₁)Δtᵢ/ΣΔtᵢ`, for irregularly-sampled continuous signals; `twa_bucket_end`, LOCF that additionally carries the bucket's last sample to its grid end — `twa` gives that sample no weight, so a sensor reporting `0` then `100` a minute into an hour bucket reads `twa`=0 but `twa_bucket_end`=98.33), and the **approximate `sketch_p50`/`p90`/`p95`/`p99`** (see below); all reductions computed in `BigDecimal` by the shared [`weft-reduce`](weft-reduce) crate. Aliases: `median`→`p50`, `time_weighted_avg`/`twa_locf`→`twa`, `time_weighted_avg_linear`→`twa_linear`, `twa_locf_end`→`twa_bucket_end`, `sketch_median`→`sketch_p50`. Only non-empty buckets are emitted. |
 | `POST /api/v1/{interpolate,downsample}/ilp` | The same, fed an ILP `text/plain` body (the TSBS/InfluxDB/QuestDB wire format); `field`, `precision` (`ns`/`us`/`ms`/`s`), and the compute knobs are query parameters. `interpolation=` is accepted as an alias for `spline=` (the canonical `spline` wins if both are given). |
@@ -409,7 +427,7 @@ under the declared encoding/tolerance is rejected `400`.
 
 | Endpoint | Purpose |
 |----------|---------|
-| `POST /api/v1/storage/aspects` | **Declare** an aspect's schema — physical encoding, value tolerance, timestamp unit. |
+| `POST /api/v1/storage/aspects` | **Declare** an aspect's schema — physical encoding, value tolerance, timestamp unit. The name also names the aspect's files on disk, so it must be at most 160 bytes with no `/`, `\`, control characters, bidirectional controls, line separators or invisible formatting characters (the zero-width joiner and non-joiner are allowed), leading `.`, trailing `.` or space, and must not be a Windows device name (`CON`, `NUL`, `COM1`, …, also with an extension or a `:` suffix, as in `nul:x`); a server running on Windows also refuses `<`, `>`, `:`, `"`, `|`, `?` and `*`. Anything else is a `400`. |
 | `GET /api/v1/storage/aspects` · `…/{aspect}/schema` · `…/catalog` | List declared schemas; read one aspect's schema; report the store's `(database, subject)` scope + registered hierarchy. |
 | `POST /api/v1/storage/{aspect}/points` | Ingest a JSON batch (dense or nullable; single-block or paged via `rows_per_page`). Set `require_sorted` to reject an out-of-order batch (`400`, naming the first backwards row) instead of sealing it. Every ingest response reports `time_sorted` (whether the sealed segment stored in monotonic order). |
 | `POST /api/v1/storage/{aspect}/{ilp,parquet,csv}` | Ingest an ILP payload, a Parquet file, or CSV rows into a declared aspect — all sealing through the same schema-enforced path, and all honouring `require_sorted` (query param) + reporting `time_sorted`. |
@@ -424,7 +442,7 @@ under the declared encoding/tolerance is rejected `400`.
 | `POST /api/v1/storage/{aspect}/squash` | **Squash** the aspect's segments into one (newer-wins), bounding split-path fragmentation. `?max_segments=N` gates it (squash only when the count exceeds `N`). Returns `triggered`/`removed`/`segment_count`. Waits for a busy aspect and answers `409` as `reconcile` does. |
 | `POST /api/v1/storage/{aspect}/compact?target_rows=N` | **Size-targeted compaction** — coalesce the aspect's segments toward ~`N` rows per segment (leaving already-large segments untouched), holding fragmentation near the read-optimal size rather than folding to one (which `squash` does). Motivated by the `downsample_range` knee (one giant segment reads slower than several mid-sized ones). `target_rows` is required (absent → `400`). Returns `removed`/`segment_count`. The manual counterpart of the `WEFT_COMPACT_TARGET_ROWS` daemon pass. Waits for a busy aspect and answers `409` as `reconcile` does. |
 | `POST /api/v1/storage/reconcile` | **Store-wide reconciliation sweep** across every declared aspect: threshold (default), `?hot_cold=true`, or `?overlaps=true` (+ `?split_min_bytes=N` for split-not-rewrite). Returns `mode`, `aspects_scanned` / `aspects_reconciled` / `segments_reconciled` (+ cold/hot split), the post-sweep store-wide `unsorted_segments` + `overlapping_segments`, and **`failed`**: a `[{aspect, error}]` list of the aspects whose pass failed (empty on a clean sweep). A failing aspect (e.g. a torn or truncated frame) no longer aborts the sweep: every other aspect is still swept and the response is `200`, so check `failed` to tell a partial sweep from a clean one (earlier versions returned `500` at the first failing aspect and left every aspect after it in name order unswept). Only an unreadable aspect list is still a `500`. An aspect another maintenance operation holds is waited for (30 s in all, across the sweep); if some are still held then, the others are swept and the answer is **`409 Conflict`** naming the held ones. (The background daemon never waits: it skips a busy aspect until its next tick.) The manual counterpart to the background reconcile daemon (`WEFT_RECONCILE_INTERVAL_SECS` / `WEFT_RECONCILE_THRESHOLD` / `WEFT_RECONCILE_HOT_COLD` / `WEFT_RECONCILE_OVERLAPS` / `WEFT_RECONCILE_SPLIT_MIN_BYTES` / `WEFT_RECONCILE_MAX_SPLITS`). |
-| `POST /api/v1/storage/backup` | **Online control-plane backup** (Phase 7.4) — snapshot the store's four control-plane DBs (`segment_index`/`metadata`/`aspect_catalog`/`catalog`) to fresh files via Turso's stable `VACUUM INTO`. Lands in `<base>/<label>` where `<base>` is `WEFT_BACKUP_DIR` or `<store_root>/backups` and `<label>` is a traversal-guarded `?label=` (`[A-Za-z0-9._-]`) or a generated `backup-<unix_millis>`. **`?verify=source\|snapshot`** picks the verification: `source` (the default) cross-checks each copy's user-table set + row counts against the live control plane — the strongest check, but it assumes a **quiescent** store; `snapshot` verifies each copy on its own terms (it reopens and **fully scans every row of every table**) without re-reading the source, which is what an **online** backup taken while ingest continues needs. An unknown token → `400`. Returns per-DB `{name, tables, rows, bytes}` + `total_rows`/`total_bytes` + the `verify` mode that ran. The backup is built in a `.partial-*` directory beside its label and appears under the label, with a `MANIFEST.json`, only once complete and durable. An existing target dir, or a label starting with `.partial-`, `.deleting-` or `.restore-drill-` (reserved for unfinished backups, prunes and drills) → `400`; no store → `503`. Control plane only — the `.weftseg` measurement frames are not part of this backup (hard-constraint #3). |
+| `POST /api/v1/storage/backup` | **Online control-plane backup** (Phase 7.4) — snapshot the store's four control-plane DBs (`segment_index`/`metadata`/`aspect_catalog`/`catalog`) to fresh files via Turso's stable `VACUUM INTO`. Lands in `<base>/<label>` where `<base>` is `WEFT_BACKUP_DIR` or `<store_root>/backups` and `<label>` is a traversal-guarded `?label=` (`[A-Za-z0-9._-]`, not starting or ending with `.`) or, without one, a generated `manual-<unix_millis>`. The `backup-<digits>` form is reserved for the backup daemon (retention counts and prunes exactly those names), so a `?label=` in that form is a `400`, and no snapshot taken through this endpoint is ever pruned by retention. **`?verify=source\|snapshot`** picks the verification: `source` (the default) cross-checks each copy's user-table set + row counts against the live control plane — the strongest check, but it assumes a **quiescent** store; `snapshot` verifies each copy on its own terms (it reopens and **fully scans every row of every table**) without re-reading the source, which is what an **online** backup taken while ingest continues needs. An unknown token → `400`. Returns per-DB `{name, tables, rows, bytes}` + `total_rows`/`total_bytes` + the `verify` mode that ran. The backup is built in a `.partial-*` directory beside its label and appears under the label, with a `MANIFEST.json`, only once complete and durable. An existing target dir, or a label starting with `.partial-`, `.deleting-` or `.restore-drill-` (reserved for unfinished backups, prunes and drills) → `400`; no store → `503`. Control plane only — the `.weftseg` measurement frames are not part of this backup (hard-constraint #3). |
 | `POST /api/v1/storage/restore/drill?label=<backup>` | **Restore drill** (Phase 7.4) — rehearse restoring a backup *on a running server*, so an operator can answer "is my backup actually restorable?" without risking anything. Restores the named backup into a throwaway directory beside the backups, verifies every restored database at its destination (it opens, and every row of every table reads), returns per-DB `{name, tables, rows, bytes}` + `total_rows`/`total_bytes`/`restorable`, then deletes the rehearsal copy (`cleanup_error` says why, if it could not; it is `null` otherwise). **Non-destructive by construction** — it cannot touch the live store, and restoring *over* a live control plane is deliberately not offered (the library primitive refuses to clobber; pointing `WEFT_SEGMENT_STORE_ROOT` at a restored copy is a deployment decision, not an HTTP call). Unknown backup → `404`; traversal or staging (`.partial-*`, `.deleting-*`, `.restore-drill-*`) label → `400`; a backup that will not restore → `500` carrying the failure, which is a failed drill rather than a server bug. |
 | `GET /api/v1/storage/{aspect}/stats` · `…/storage/stats` | Materialized per-aspect and store-wide rollups, including the realized **bytes/point** (the north-star cost term), an `unsorted_segments` order-health count (segments that would force a linear scan on a point lookup), and an `overlapping_segments` count (time-overlapping segments — the cross-segment order-health signal, computed by an index scan). Rollup fields are served from the control plane without opening a segment. |
 
@@ -495,14 +513,21 @@ only** — the `.weftseg` measurement frames are not part of a snapshot.
   each tick (verifying `snapshot`-only, since it backs up a live store), and
   `WEFT_BACKUP_KEEP` to retain only the newest N. Retention is deliberately narrow:
   it only ever removes daemon-**generated** `backup-<digits>` directories, so a
-  snapshot you took by hand with `?label=nightly` is never a prune candidate, and
+  snapshot you took through the API (`?label=nightly`, or an unlabelled
+  `manual-<unix_millis>`) is never a prune candidate and never counts toward N, and
   it runs only after a *successful* snapshot, so a run of failures cannot prune
   your last good backup away. It counts only complete backups (a manifest, or all
   four databases from before manifests), and renames a pruned backup to
   `.deleting-*` before removing its files, so an interrupted prune never leaves a
-  half-removed backup. At start and on every tick the daemon removes `.partial-*`,
-  `.deleting-*` and `.restore-drill-*` entries untouched for an hour. Both paths
-  record `weft_backup_*` metrics.
+  half-removed backup. A `backup-<digits>` directory stamped more than 24 h
+  past the clock, or past the directory's own modification time, did not come from
+  the daemon: retention neither counts nor removes it, and logs a warning each time
+  it sees it. The modification-time check keeps such a directory ignored after the
+  clock catches up with its stamp, as long as the directory is left unmodified and the
+  filesystem reports modification times; remove it by hand when the warning appears.
+  At start and on every tick the daemon removes `.partial-*`, `.deleting-*` and
+  `.restore-drill-*` entries untouched for an hour. Both paths record
+  `weft_backup_*` metrics.
 - **Restore, with a drill.** `weftdb::restore_control_plane(backup_dir, root)`
   puts a snapshot back into a store root and verifies each restored file **at its
   destination** — what matters is that the file the store will open actually
@@ -536,6 +561,9 @@ WeftDB is configured primarily through environment variables:
 | `TEST_DATA_DIR` | `weftdb` | Highest-priority override for the database root (used by the test suite). | unset |
 | `WEFT_EXTRACTED_BATCH_RETENTION_SECS` | `weftdb` | How long (seconds) a legacy aspect remembers the batches pattern extraction consumed, so the incremental build does not queue them again. Each extraction deletes older records, keeping about one row per resolution step of this period. Set it above the longest interval between pipeline runs of an aspect plus the longest ingest call; a non-positive or unparsable value keeps the default. | `172800` (48 hours) |
 | `WEFT_SERVER_ADDR` | `weft-server` | HTTP bind address. | `127.0.0.1:8080` |
+| `WEFT_ALLOW_ANY_HOST` | `weft-server` | Truthy (`1`/`true`/`yes`/`on`) → turn off the loopback request guard. On a loopback bind the server otherwise answers only requests whose `Host` is `localhost`, `127.0.0.0/8` or `[::1]` (`421` otherwise) and refuses state-changing requests from non-loopback web origins (`403`). Set it behind a local reverse proxy that forwards a different `Host`, or one that forwards the non-loopback `Origin` of a browser UI it fronts. A non-loopback bind is never guarded. | unset (guarded on a loopback bind) |
+| `WEFT_GPU_CALIBRATE` | `weft-server` | Startup calibration. By default, once the listener is bound, the server runs `splimes::calibrate()` once in the background on a blocking thread: it starts the GPU if there is one, times the single-thread, rayon and GPU backends on grids up to 16 Mi points (several seconds, a few hundred MB), and sets where `Backend::Auto` switches between them. Requests are served from the start and interpolate on the CPU with splimes' default thresholds until it finishes. A CPU/software adapter (llvmpipe, lavapipe, WARP) is not calibrated, with a log line saying why; `force` calibrates it anyway. `0` (or `false`/`no`/`off`) skips calibration. It logs the adapter (or why there is none) and the thresholds, and never fails startup; skipped or failed, interpolation stays on the CPU with splimes' defaults. | unset (calibrate, except a software adapter) |
+| `WEFT_MAX_INTERPOLATE_POINTS` | `weft-server` | The most output points one `/api/v1/interpolate*` request may produce; a larger grid is a `400` naming its size and the limit, refused before anything is allocated. A positive integer, read once at startup; anything else (including `0`) stops the server from starting with a message naming the variable. | `10000000` |
 | `WEFT_SEGMENT_STORE_ROOT` | `weft-server` | Root of the Storage v2 segment store; enables the `/storage` endpoints. | unset (storage endpoints answer `503`) |
 | `WEFT_ON_AMBIGUOUS_COMMIT` | `weft-server` | What the segment store does after a COMMIT that may or may not have committed: `poison` refuses every write until the server restarts, while reads keep working and `GET /ready` reports `poisoned`; `exit` logs and exits with status 70, for a supervisor that restarts the server. The restart's open settles the transaction either way. Read when the store opens. | unset (`poison`) |
 | `WEFT_RECONCILE_INTERVAL_SECS` | `weft-server` | Background reconcile daemon sweep interval in seconds; `0`/unset disables it. | unset (disabled) |
@@ -547,12 +575,12 @@ WeftDB is configured primarily through environment variables:
 | `WEFT_COMPACT_TARGET_ROWS` | `weft-server` | Target segment size in **rows** for the daemon's size-aware compaction pass; each tick coalesces every aspect's segments toward ~this many rows per segment (leaving already-large segments alone), holding fragmentation near the read-optimal size instead of folding to one (`WEFT_RECONCILE_MAX_SPLITS`). Motivated by the `downsample_range` knee (one giant segment reads slower than several mid-sized ones). Needs the daemon interval set. | unset (no compaction) |
 | `WEFT_BACKUP_DIR` | `weft-server` | Directory each control-plane backup is written under — shared by the manual `POST …/storage/backup` endpoint and the background backup daemon, so hand-taken and automatic snapshots live together. | `<store_root>/backups` |
 | `WEFT_BACKUP_INTERVAL_SECS` | `weft-server` | Background control-plane backup daemon interval in seconds; `0`/unset disables it. Each tick writes a verified snapshot into a fresh `backup-<unix_millis>` directory, using the concurrent-write-safe `snapshot` verification (it backs up a live store). Needs a segment store configured. | unset (disabled) |
-| `WEFT_BACKUP_KEEP` | `weft-server` | How many **daemon-generated** snapshots to retain; after each successful backup the oldest `backup-<digits>` directories beyond this many are removed. Only generated names are ever pruned — a `?label=`-named snapshot you took by hand is never a candidate. | unset (retain everything) |
+| `WEFT_BACKUP_KEEP` | `weft-server` | How many **daemon-generated** snapshots to retain; after each successful backup the oldest `backup-<digits>` directories beyond this many are removed. Only daemon-generated names are ever counted or pruned — a snapshot taken through `POST …/storage/backup` (a `?label=` one, or an unlabelled `manual-<unix_millis>` one) is never a candidate — and a generated-looking directory stamped more than 24 h past the clock or past its own modification time is ignored (not counted, not removed, logged as a warning; remove it by hand). | unset (retain everything) |
 | `BTC_TEST_MAX_ROWS` / `BTC_TEST_FULL` | `weftdb` (tests) | Row cap for the bounded, hermetic default run of `test_create_btc_1min_database` (into a temp data dir), or `BTC_TEST_FULL=1` for the historical whole-corpus load into the shared data dir. | `5000` / unset |
 | `WEFT_SEGMENT_CHECKPOINT_STRIDE` | `weft-server` | Rows between entries of the sealed **timestamp checkpoint index** — trades a little size for much faster point lookups on **sorted, irregular** columns (~3.45× single-block; see the checkpointed-frames feature above). Applies only where it pays: sorted + irregular + at least `WEFT_SEGMENT_CHECKPOINT_MIN_ROWS` rows. ~1024 is the sweet spot (stride barely moves speed but does move size). | unset (no index; frames byte-for-byte as before) |
 | `WEFT_SEGMENT_CHECKPOINT_MIN_ROWS` | `weft-server` | Row floor below which a segment is never checkpointed (a small column decodes trivially, so an index would be pure cost). | `8192` |
 | `WEFT_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD` | `weft-server` | Ceiling on the timestamp-codec override a checkpointed seal will accept (`blocked / best` bytes; `1.0` = only when free). A checkpointed frame must use the range-decodable per-block codec, which is ~free where that codec already wins but **~3.5× on a Gorilla-shaped and ~14× on an RLE-shaped column** — this refuses those seals rather than silently bloating them. | `1.25` |
-| `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` | `weft-server` | Ceiling on the size overhead the **transposed (`FastLanes`-layout) value codec** may pay against the size-selected codec (`transposed / best` bytes; `1.0` = only when free, and a value **below 1.0 is meaningful** — the transposed layout can be a strict size win, since it pays one width header per 1024-lane tile where the blocked codec pays one per 64 values). Stores the value column bit-plane-major for faster bit-plane-skipping decode. Measured byte- and read-neutral end-to-end on a 1M-row column (see the transposed-codec feature above), so it is off by default. | unset (no transposed codec; frames byte-for-byte as before) |
+| `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` | `weft-server` | Ceiling on the size overhead the **bit-sliced (transposed) value codec** may pay against the size-selected codec (`transposed / best` bytes; `1.0` = only when free, and a value **below 1.0 is meaningful** — the bit-sliced layout can be a strict size win, since it pays one width header per 1024-value tile where the blocked codec pays one per 64 values). Stores the value column bit-plane-major for faster bit-plane-skipping decode. Measured byte- and read-neutral end-to-end on a 1M-row column (see the bit-sliced-codec feature above), so it is off by default. **Needs a build with the `bitsliced-codec` feature**; any other build ignores the variable and logs a warning. | unset (no transposed codec; frames byte-for-byte as before) |
 | `WEFT_SEGMENT_PARTIAL_BASE` | `weft-server` | Resolution token (`seconds`/`minutes`/`hours`/…) at which each sealed segment materializes a **partial-reduction `.weftpart` sidecar** — a stored mergeable partial of the bounded reductions. A stored-range downsample of those reductions then **merges the sidecars instead of decoding the value column** (measured **3.2×**), re-keyed to any coarser nesting resolution. A sealed segment is immutable, so the sidecar never goes stale; a rewrite (reconcile/split/squash) regenerates it. | unset (no sidecar; `downsample_range` decodes as before) |
 | `WEFT_SEGMENT_PARTIAL_MIN_ROWS` | `weft-server` | Row floor below which a segment gets no partial sidecar (a tiny segment's partial saves too little decode to be worth the extra file). | `4096` |
 | `WEFT_SEGMENT_PARTIAL_TIERS` | `weft-server` | Comma-separated fine→coarse rollup resolutions (e.g. `hours,days`) materialized **beside** the `WEFT_SEGMENT_PARTIAL_BASE` partial, each re-keyed from the tier below (up to four kept; a finer/non-nesting entry is skipped). A coarse stored-range downsample then folds the coarsest matching tier instead of re-keying the whole fine base (measured **~1.16×** on a DAY query over a MINUTES base). No effect unless `WEFT_SEGMENT_PARTIAL_BASE` is set. | unset (base-only sidecar) |
@@ -573,11 +601,27 @@ of the box, and setting `WEFT_DATA_DIR` relocates both the databases and the TUI
 together. The resolution functions are exported as `weftdb::data_dir()` (resolved)
 and `weftdb::default_data_dir()` (the raw default).
 
-The `splimes` crate also exposes a build feature:
+The `splimes` crate also exposes build features:
 
 | Feature | Effect |
 |---------|--------|
-| `gpu-eager-init` | Initializes the GPU *before* `main()` via a constructor, eliminating first-use latency. |
+| `gpu` *(default)* | The `wgpu` backend. Without it, interpolation always runs on the CPU. |
+| `serde` *(default)* | `Serialize`/`Deserialize` for `Point`, `PointKind`, `Resolution` and `Spline`. |
+| `tokio` | `Interpolator::run_async`, which runs an interpolation on tokio's blocking pool. WeftDB enables it: every async caller (the `weftdb` read and compression paths, `weft-server`, the bench adapter) interpolates off the async workers. |
+
+The GPU is started at runtime, not at build time: `weft-server` calibrates it in the
+background at startup (`WEFT_GPU_CALIBRATE`, above), and an embedding program calls
+`splimes::calibrate()` or `splimes::prewarm_gpu()` itself.
+
+WeftDB's own build features are all **off by default**, sit **outside the 1.0 semver
+promise**, and are **pending patent review**. A default build reads every segment written
+under the default configuration (`WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` unset). A segment
+written with that variable set, which 0.1.0 did whenever it was set, needs `bitsliced-codec`.
+
+| Feature | Crate(s) | Effect |
+|---------|----------|--------|
+| `bitsliced-codec` | `weft-physical-type`, forwarded by `weftdb` and `weft-server` | Compiles in the opt-in bit-sliced value codec, so `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` takes effect. Without it, a segment written with the codec fails to read with an error naming the feature. |
+| `experimental-codecs` | `weft-physical-type` (enabled by `weft-bench`) | Advisory codecs never written to disk: Gorilla-XOR, Chimp, Chimp128 and Elf for `f64`, and the Sprintz FIRE timestamp forecaster. Benchmark what-ifs only. |
 
 ---
 
@@ -737,7 +781,7 @@ The parts below are reference material — you do not need them to use WeftDB.
 ┌──────────────────────────────┐   ┌──────────────────────────────────┐
 │      weft-physical-type       │   │             splimes              │
 │  encodings · schemas ·       │   │   Spline interpolation engine    │
-│  timestamp codecs · .weftseg  │   │  GPU (wgpu/WGSL) · Rayon · SIMD  │
+│  timestamp codecs · .weftseg  │   │  CPU · Rayon · GPU (calibrated)  │
 └──────────────────────────────┘   └──────────────────────────────────┘
 ```
 
@@ -802,9 +846,12 @@ Higher-level analytics types build on this foundation:
 
 `splimes` is the numerical heart of WeftDB. Given a set of `Point`s and a target time
 range + resolution, it produces an interpolated series using one of four spline
-methods, choosing the fastest execution strategy automatically. It interpolates
-**and extrapolates** — single-instant lookups and full ranges — on CPU, SIMD, and
-GPU.
+methods, choosing the execution backend automatically, and labels every output point
+`Raw`, `Interpolated` or `Extrapolated` (`PointKind`). It interpolates **and
+extrapolates** — single-instant lookups and full ranges — on the CPU (one thread or
+rayon's pool) and the GPU. WeftDB depends on splimes 1.0; its own
+[migration guide](https://github.com/basic-automation/splimes/blob/main/MIGRATING.md)
+lists what changed from 0.1.
 
 #### Spline Methods
 
@@ -813,50 +860,49 @@ GPU.
 | `Linear` | 2 | Straight-line interpolation. |
 | `Quadratic` | 3 | Second-degree. |
 | `Cubic` | 4 | Smooth third-degree splines. |
-| `Polynomial(degree, bounds_factor)` | degree + 1 | Arbitrary degree with optional bounds damping. |
+| `Polynomial(degree, bounds_factor)` | degree + 1 | Degree 1–8, with optional bounds damping of the extrapolation. |
 
-If a method needs more points than are available, WeftDB **falls back** to the next
-simpler method automatically (`Cubic → Quadratic → Linear`), never upgrading beyond
-what you requested.
+If a method needs more distinct points than are available, splimes **steps down**
+automatically (`Cubic → Quadratic → Linear`; `Polynomial(d) → Polynomial(n − 1)`),
+never upgrading beyond what you requested, and reports the method it used.
 
-#### Strategy Selection
+#### Backend Selection
 
-The `should_use_gpu()` heuristic routes each request to the best backend based on
-input and estimated output size (thresholds derived from internal benchmarks):
+Every call is synchronous; `Backend::Auto` (the default) picks the backend by output
+grid size, using `AutoThresholds`:
 
-| Dataset size | Strategy |
-|--------------|----------|
-| ≥ 5M points (or ≥ 2.5M outputs) | **GPU primary** (memory efficiency dominates) |
-| ≥ 50K points (or ≥ 50K outputs) | **GPU, then parallel fallback** |
-| 1K – 50K points | **CPU** (avoids synchronization overhead) |
-| 100 – 1K points | **GPU streaming** (pipelining overlaps well) |
-| < 100 points | **CPU** (avoid all setup overhead) |
+| Grid size | Backend |
+|-----------|---------|
+| below `parallel_min_points` (default 64 Ki) | **CPU**, the calling thread |
+| from `parallel_min_points` | **Parallel**, rayon's pool |
+| from `gpu_min_points` (default *never*), once the GPU has been started | **GPU** ([`wgpu`](https://wgpu.rs/) compute shaders), falling back to rayon if it fails |
 
-The GPU path uses [`wgpu`](https://wgpu.rs/) compute shaders with:
+`Auto` never starts the GPU itself. `splimes::calibrate()` starts it, times every
+backend on this machine and sets the thresholds to the measured crossovers;
+`weft-server` runs it once in the background at startup, skipping a CPU/software
+adapter (`WEFT_GPU_CALIBRATE=0` skips it, `force` calibrates any adapter). Otherwise:
 
-- **Buffer pooling** — size-tiered (4 KB–128 MB), LRU-evicted pool used throughout
-  the interpolation paths (including the static f64/f32 entry points); cut
-  per-run allocations from 7,000+ to under 50 on a 1M-point run and reuses
-  buffers across batches.
-- **Persistent staging buffers** — 3-buffer round-robin with persistent mapping
-  that eliminates unmap/remap overhead.
-- **f64 / f32 precision paths** — automatically chosen by GPU capability.
-- **Pre-warming** — `splimes::prewarm_gpu()` (or the `gpu-eager-init` feature)
-  removes first-call initialization latency. `splimes::prewarm_gpu_with_config()`
-  takes a `GpuConfig` preset (`minimal()`, `low_memory()`, `default()`,
-  `high_performance()`) to size the **buffer pool** and **staging buffers**.
-  The interpolator is a process-wide singleton sized once at initialization, so a
-  configuration must be supplied **before any other GPU use** — if the GPU is
-  already up, the call reports an error rather than silently ignoring it, and
-  `gpu_config_applied()` / `effective_gpu_config()` let you check what is in force.
-  `GpuConfig::max_command_batch_size` is **reserved and currently has no effect**:
-  command batching is not implemented yet (roadmap Phase 5.1).
+- `splimes::prewarm_gpu()` starts the GPU and returns its `GpuInfo` (adapter, API,
+  device type, driver, `f64` support); then set thresholds with
+  `splimes::set_auto_thresholds`.
+- `splimes::configure_gpu(GpuConfig)` — before the GPU's first use — sizes its
+  buffer pool and per-dispatch chunk (`max_pool_bytes`, `chunk_points`, `low_power`;
+  presets `GpuConfig::minimal()`, `low_memory()`, `DEFAULT`, `high_performance()`).
+  Calling it after the GPU has started is an `Error::GpuAlreadyConfigured`, never a
+  silent no-op; `splimes::gpu_config()` reports what is in force.
+- `splimes::gpu_pool_stats()` returns the buffer pool's counters once the GPU is up.
+- The GPU computes in `f64` where the adapter supports it; `f32` must be asked for
+  (`Interpolator::gpu_precision(Precision::F32)`).
 
 ```rust,ignore
-use splimes::{auto_interpolate, Resolution, Spline};
+use splimes::{Interpolator, Resolution, Spline};
 
-// Automatically selects GPU/CPU/parallel based on size:
-let series = auto_interpolate(&mut points, start, end, Resolution::Seconds, Spline::Cubic).await?;
+// Backend::Auto picks the backend by grid size; from async code, run it off the
+// executor (`run_async` needs the `tokio` feature):
+let series = Interpolator::new(Spline::Cubic, Resolution::Seconds).run_async(points, start, end).await?;
+for (timestamp, value, kind) in series.iter() {
+    // kind: PointKind::Raw | Interpolated | Extrapolated
+}
 ```
 
 ---
@@ -918,8 +964,9 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   (`StorageEstimate.advisory_delta_cascade_value_bytes`, schema v15). It is **opt-in** — the
   cascade beats even FOR broadly, so folding it into the default selector is a headline change
   held for owner sign-off; the default codec choice is unchanged.
-- **Transposed (`FastLanes`-layout) value codec (opt-in)** — `VAL_CODEC_TRANSPOSED` stores a
-  `ScaledI64` column's mantissas **bit-plane-major** in 1024-lane tiles, so the decoder reads `u64`
+- **Bit-sliced (transposed) value codec (opt-in, `bitsliced-codec` build feature)** —
+  `VAL_CODEC_TRANSPOSED` stores a
+  `ScaledI64` column's mantissas **bit-plane-major** in 1024-value tiles, so the decoder reads `u64`
   plane words and walks only the *set* bits and a small-magnitude column's empty high bit-planes are
   skipped wholesale. It carries its **own** size function (`transposed_value_bytes`) and selector
   entry (`best_value_codec_transposed(max_overhead)`) rather than reusing the blocked figure, is
@@ -933,16 +980,20 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   byte-neutral and read-neutral here; it stays **opt-in** and the default codec choice is unchanged.
   Note the codec is chosen only when a *strict* size win or within the caller's overhead ceiling —
   the ceiling may legitimately be set below 1.0, because per-tile widths with one header per 1024
-  lanes can beat both a global width and the blocked codec's one-header-per-64.
+  values can beat both a global width and the blocked codec's one-header-per-64. It is a
+  bit-sliced layout, not the FastLanes layout (which keeps each value's bits together), and it
+  is compiled only with the `bitsliced-codec` feature, pending patent review; without it the
+  writer never selects it and reading a segment that uses it fails with an error naming the
+  feature.
 - **Block-level random access** — the fixed-layout value codecs support decoding a single value
   (or a sub-range) without materializing the whole column: `weftseg::read_value_at(bytes, i)`
   reads only the block covering row `i` (skipping earlier blocks by their headers) for the
   blocked/FOR codecs, reads bit `i * width` directly for the fixed-width bit-pack codec, and decodes
-  only the covering tile for the transposed codec — the point-lookup / late-materialization lever.
+  only the covering tile for the bit-sliced codec — the point-lookup / late-materialization lever.
   `weftseg::read_value_range(bytes, start, len)` is its **windowed** sibling: every fixed-layout codec
   locates a value by walking its block/tile headers from the start of the stream, so resolving a
   window one value at a time re-walks that chain per row. The range read does the decode **once**,
-  which is what keeps a windowed read on the 1024-lane transposed layout from costing a whole tile
+  which is what keeps a windowed read on the 1024-value-tile bit-sliced layout from costing a whole tile
   decode per row. `weftseg::read_segment_point(bytes, t)`
   wires this up to the framed single-block segment — it skips the value block by its framing,
   decodes only the timestamps to find the row, and unpacks the one covering value block — so a
@@ -1206,7 +1257,7 @@ What it does today:
   The underlying point/range read speedups are quantified at the codec layer in
   [`weft-physical-type/benches/pointread.rs`](weft-physical-type/benches/pointread.rs).
 - **Vendor-neutral adapters** — every system is driven through the
-  `SystemAdapter` trait: the WeftDB reference adapter (`splimes::auto_interpolate`),
+  `SystemAdapter` trait: the WeftDB reference adapter (splimes' `Interpolator` on `Backend::Auto`),
   a precision-aware **portable linear baseline** (fair-protocol class C), and a
   **forward-fill/LOCF baseline** (class B — the in-process mirror of
   `FILL(previous)` / `locf()`).
@@ -1226,10 +1277,20 @@ What it does today:
   `_codec`) for a lossy `F64` column, and the **Sprintz FIRE** forecaster's
   footprint on the timestamp column (`advisory_fire_timestamp_bytes`) — each a
   *what-if* number the adopt-or-drop decision reads, never a realized headline
-  claim.
+  claim. These codecs live behind `weft-physical-type`'s `experimental-codecs`
+  feature, which only `weft-bench` enables.
 - **Reports** — a `BenchReport` JSON artifact (run metadata + a best-effort
   hardware probe: CPU model, cores, RAM) under `reports/json/`, plus a
   self-contained **HTML** view (`--html`) with the most-accurate row highlighted.
+- **The engine the server runs** — an interpolation run first calls
+  `splimes::calibrate()` once, as `weft-server` does at startup (skipping a
+  CPU/software adapter the same way), so `Backend::Auto` uses rayon and the GPU
+  where they are faster on this machine. The calibration, GPU and thresholds are
+  printed and recorded in the report's `metadata.engine` (schema v16);
+  `--no-gpu-calibrate` skips it and records splimes' defaults. There is no
+  counterpart to the server's `WEFT_GPU_CALIBRATE=force`: on a software adapter the
+  bench always skips calibration, so there it cannot reproduce a server started with
+  `force`.
 - **ILP / TSBS input** — a `.lp` / TSBS file drives the same harness, correctness
   gate, and reporting via the shared `weft-line-protocol` parser.
 
@@ -1329,7 +1390,7 @@ server and an interactive application:
 
 | Crate | Role |
 |-------|------|
-| [`splimes`](https://github.com/basic-automation/splimes) *(own repo, from crates.io)* | Spline interpolation engine — Linear / Quadratic / Cubic / Polynomial methods with automatic GPU, parallel, SIMD, and CPU strategy selection. |
+| [`splimes`](https://github.com/basic-automation/splimes) *(own repo, from crates.io)* | Spline interpolation engine — Linear / Quadratic / Cubic / Polynomial methods on the CPU (one thread or rayon) or the GPU, chosen by grid size, with raw / interpolated / extrapolated provenance on every point. |
 | [`weftdb`](weftdb) | Time-series database: [Turso](https://turso.tech/) (libSQL) **control plane** (catalog, metadata, segment index; MVCC concurrent writes) + WeftDB's own typed columnar **`.weftseg` segment store** on the measurement hot path, plus the pattern-recognition types and tiered dataset compression. |
 | [`weft-orchestration`](weft-orchestration) | High-level pipeline that chains batching → pattern extraction → event detection → correlation → signal generation, with built-in detectors and parallel execution. |
 | [`weft-physical-type`](weft-physical-type) | Vendor-neutral physical type system — schema-declared numeric encodings with explicit exactness, timestamp codecs, and the `.weftseg` columnar segment format (single-block and paged). |
@@ -1342,9 +1403,9 @@ server and an interactive application:
 
 The platform is designed for **real-time and large-scale** workloads: measurements
 are stored with [`BigDecimal`](https://docs.rs/bigdecimal) logical precision,
-interpolation transparently scales from a handful of points to millions across the
-GPU, and the storage layer uses bulk transactions, cached connections, and typed
-columnar segments throughout.
+interpolation scales from a handful of points to millions, from one CPU thread to the
+rayon pool and, where calibration measured it faster, the GPU, and the storage layer
+uses bulk transactions, cached connections, and typed columnar segments throughout.
 
 ---
 
@@ -1356,11 +1417,13 @@ columnar segments throughout.
   TTL/LRU cache (default: 50 connections, 30-minute TTL) and starts MVCC
   `BEGIN CONCURRENT` transactions automatically, with retry + backoff on
   transient failures.
-- **Pre-warm the GPU.** Call `splimes::prewarm_gpu()` at startup (or enable
-  `gpu-eager-init`) to avoid ~1.2 s of first-call initialization latency.
+- **Calibrate the backends once.** `weft-server` does it in the background at startup; a program
+  embedding the libraries calls `splimes::calibrate()` (or `splimes::prewarm_gpu()`
+  plus `splimes::set_auto_thresholds`) once, off any latency-critical path. Without
+  it, interpolation never uses the GPU.
 - **Pick sensible batch sizes** for pipelines (typically 24–100 for hourly data).
-- **Let the engine choose.** `auto_interpolate` / `analyze_range` already select the
-  optimal backend — overriding is rarely necessary.
+- **Let the engine choose.** `Backend::Auto` (behind `analyze_range` and every
+  endpoint) already selects the backend by grid size — overriding is rarely necessary.
 - Pipeline pattern loading is **memory-aware**: batch sizes adapt to available RAM to
   avoid exhaustion on large datasets.
 
@@ -1379,4 +1442,27 @@ artifact.
 
 ## License
 
-Released under the [MIT License](LICENSE). Copyright © 2025 Justin Icenhour.
+Copyright (c) 2025-2026 Justin Icenhour.
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option.
+
+Two crates include code adapted from Apache-2.0 projects — the Chimp codecs in
+`weft-physical-type` and the DDSketch quantile sketch in `weft-reduce`. Those portions
+stay under the Apache License 2.0 whichever option you choose. [NOTICE](NOTICE) lists
+them, and each crate's `THIRD-PARTY-NOTICES` file carries the attribution and the
+license text.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for
+inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual
+licensed as above, without any additional terms or conditions.
+
+Every pull request also needs either a DCO sign-off on each commit or a signed CLA; see
+[Contribution terms](CONTRIBUTING.md#contribution-terms).

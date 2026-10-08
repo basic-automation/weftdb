@@ -14,6 +14,20 @@ categories = ["database-implementations", "web-programming::http-server"]
 publish = false
 
 
+[features]
+# Forwards weftdb's opt-in bit-sliced value codec so `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD`
+# takes effect. Off by default and pending patent review (ROADMAP.md, Phase 6.1); without it
+# the variable is ignored with a warning.
+bitsliced-codec = ["weftdb/bitsliced-codec"]
+# Lets the `/ready` poison test write-poison a real store, and the maintenance-busy test
+# hold a real aspect's maintenance lock, through weftdb's `fault-injection` hooks. A
+# feature rather than a dev-dependency feature, as in
+# weft-orchestration: Cargo unifies features across a workspace build, so a dev-dependency
+# enabling it would compile the fault points into every crate's tests in
+# `cargo test --workspace`, and weftdb's check that production builds keep them inert
+# (tests/durable_fault_disabled.rs) would compile to nothing.
+fault-injection = ["weftdb/fault-injection"]
+
 [lib]
 name = "weft_server"
 path = "src/lib.rs"
@@ -35,7 +49,7 @@ weft-physical-type = { workspace = true }  # AspectSchema / PhysicalType / TimeU
 weft-reduce = { workspace = true }  # canonical downsample reduction (Aggregation / reduce / bucket_start)
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-splimes = { workspace = true }
+splimes = { workspace = true, features = ["tokio"] }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }  # per-request engine spans on the compute path (Phase 3 instrumentation)
 tracing-subscriber = { workspace = true }  # RUST_LOG-driven span/event subscriber (env-filter from the workspace dep)
@@ -43,16 +57,6 @@ opentelemetry = { workspace = true }  # OTLP trace export (Phase 3) — env-gate
 opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 tracing-opentelemetry = { workspace = true }
-
-[features]
-# Lets the `/ready` poison test write-poison a real store, and the maintenance-busy test
-# hold a real aspect's maintenance lock, through weftdb's `fault-injection` hooks. A
-# feature rather than a dev-dependency feature, as in
-# weft-orchestration: Cargo unifies features across a workspace build, so a dev-dependency
-# enabling it would compile the fault points into every crate's tests in
-# `cargo test --workspace`, and weftdb's check that production builds keep them inert
-# (tests/durable_fault_disabled.rs) would compile to nothing.
-fault-injection = ["weftdb/fault-injection"]
 
 # Run with `cargo test -p weft-server --features fault-injection --test ready_poisoned`.
 [[test]]

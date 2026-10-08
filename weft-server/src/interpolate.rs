@@ -1,10 +1,18 @@
 //! The interpolation endpoint (`POST /api/v1/interpolate`).
 //!
 //! This is the first benchmark-grade *capability* endpoint on the Phase-2 API:
-//! it drives WeftDB's flagship interpolation-on-read path (`splimes::auto_interpolate`,
-//! which selects CPU / SIMD / parallel / GPU strategies internally) through plain
-//! HTTP + JSON, exactly the surface Weft-Bench and external clients need so they no
-//! longer have to embed the Rust API to exercise the engine.
+//! it drives WeftDB's flagship interpolation-on-read path (splimes' [`Interpolator`],
+//! whose default `Backend::Auto` picks the serial, rayon or — once calibrated at
+//! startup — GPU backend by grid size) through plain HTTP + JSON, exactly the surface
+//! Weft-Bench and external clients need so they no longer have to embed the Rust API
+//! to exercise the engine.
+//!
+//! splimes is synchronous and CPU-bound, so every call runs on tokio's blocking pool
+//! (`Interpolator::run_async`), never on an async worker. The output grid comes from the
+//! request (`start`, `end`, `resolution`), so it is capped by [`InterpolateConfig`]: at
+//! [`MAX_INTERPOLATE_OUTPUT_POINTS`] unless the operator sets
+//! [`MAX_INTERPOLATE_POINTS_ENV`]. A larger grid is a `400`, refused before anything is
+//! allocated.
 //!
 //! ## Numeric boundary (deliberate, documented)
 //!
@@ -15,13 +23,20 @@
 //! encodings (Phase 4) replace this with explicit, lossless-by-default types — at
 //! which point this endpoint gains a precision-preserving value representation.
 
+use std::num::NonZeroUsize;
+
 use axum::{
 	extract::{Query, State}, http::{header, StatusCode}, response::{IntoResponse, Response}, Json
 };
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use splimes::{Point, Resolution, Spline};
+/// Provenance of a reconstructed value: `raw` (the grid point coincides with an input
+/// observation), `interpolated` (strictly inside the observed span) or `extrapolated`
+/// (outside it). splimes reports it for every output point, serialised as those
+/// lowercase tokens.
+pub use splimes::PointKind;
+use splimes::{Interpolator, Point, Resolution, Spline};
 use tracing::Instrument as _;
 use weft_line_protocol::TimestampPrecision;
 
@@ -49,32 +64,69 @@ pub struct OutputPoint {
 	pub kind: PointKind,
 }
 
-/// Provenance of a reconstructed value.
+/// The default for the most output points one interpolation request may produce
+/// ([`InterpolateConfig::max_output_points`]).
 ///
-/// Lets a caller never silently treat a synthetic point as an observed one (the
-/// Phase-2 raw/interpolated/extrapolated distinction — backlog item B-tags,
-/// synthetic-point marking).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PointKind {
-	/// The output timestamp coincides with an input observation.
-	Raw,
-	/// The timestamp lies within `[min_ts, max_ts]` of the inputs (and is not raw).
-	Interpolated,
-	/// The timestamp lies outside the observed span.
-	Extrapolated,
+/// The grid is `start..=end` at `resolution`, all three from the request, so without a
+/// cap a nanosecond grid over a day (86 trillion points) would try to allocate itself.
+/// Ten million points is about 0.7 GB of JSON, far beyond any interactive query; larger
+/// reconstructions belong in several requests over sub-ranges. An operator changes it
+/// with [`MAX_INTERPOLATE_POINTS_ENV`].
+pub const MAX_INTERPOLATE_OUTPUT_POINTS: usize = 10_000_000;
+
+/// Environment variable that sets [`InterpolateConfig::max_output_points`]: a positive
+/// integer, read once at startup. Unset means [`MAX_INTERPOLATE_OUTPUT_POINTS`].
+pub const MAX_INTERPOLATE_POINTS_ENV: &str = "WEFT_MAX_INTERPOLATE_POINTS";
+
+/// The interpolation settings every `/api/v1/interpolate*` handler applies.
+///
+/// Read once at startup ([`InterpolateConfig::from_env_value`]) and held in
+/// [`AppState`](crate::AppState), from which the handlers extract it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterpolateConfig {
+	/// The most output points one request may produce.
+	max_output_points: NonZeroUsize,
 }
 
-/// Classify an output timestamp against the input observations: `Raw` if it
-/// coincides with an input, else `Extrapolated` when outside the observed span,
-/// else `Interpolated`.
-fn classify(timestamp: DateTime<Utc>, input_timestamps: &std::collections::HashSet<DateTime<Utc>>, min_ts: Option<DateTime<Utc>>, max_ts: Option<DateTime<Utc>>) -> PointKind {
-	if input_timestamps.contains(&timestamp) {
-		return PointKind::Raw;
+impl InterpolateConfig {
+	/// The defaults: at most [`MAX_INTERPOLATE_OUTPUT_POINTS`] output points per request.
+	pub const DEFAULT: Self = Self { max_output_points: NonZeroUsize::new(MAX_INTERPOLATE_OUTPUT_POINTS).expect("the default cap is positive") };
+
+	/// Settings that allow at most `max_output_points` output points per request.
+	#[must_use]
+	pub const fn new(max_output_points: NonZeroUsize) -> Self {
+		Self { max_output_points }
 	}
-	match (min_ts, max_ts) {
-		(Some(lo), Some(hi)) if timestamp < lo || timestamp > hi => PointKind::Extrapolated,
-		_ => PointKind::Interpolated,
+
+	/// The settings for a value of [`MAX_INTERPOLATE_POINTS_ENV`] (`None` when it is
+	/// unset, which gives [`DEFAULT`](Self::DEFAULT)).
+	///
+	/// # Errors
+	///
+	/// A message naming the variable when the value is not a positive integer (`0`, a
+	/// negative or fractional number, or text), so a malformed setting fails startup
+	/// instead of silently falling back to the default.
+	pub fn from_env_value(value: Option<&str>) -> Result<Self, String> {
+		value.map_or(Ok(Self::DEFAULT), |raw| raw.parse().map(Self::new).map_err(|e| format!("{MAX_INTERPOLATE_POINTS_ENV}={raw:?} is not a positive integer: {e}")))
+	}
+
+	/// The most output points one request may produce; a larger grid is a `400`.
+	#[must_use]
+	pub const fn max_output_points(self) -> usize {
+		self.max_output_points.get()
+	}
+
+	/// The interpolator every endpoint here runs: `spline` onto a `resolution` grid on
+	/// the default `Backend::Auto`, refusing grids above
+	/// [`max_output_points`](Self::max_output_points).
+	const fn interpolator(self, spline: Spline, resolution: Resolution) -> Interpolator {
+		Interpolator::new(spline, resolution).max_points(self.max_output_points())
+	}
+}
+
+impl Default for InterpolateConfig {
+	fn default() -> Self {
+		Self::DEFAULT
 	}
 }
 
@@ -180,7 +232,9 @@ pub struct InterpolateRequest {
 /// Response body for `POST /api/v1/interpolate`.
 #[derive(Debug, Clone, Serialize)]
 pub struct InterpolateResponse {
-	/// Spline method actually used (`Display` form).
+	/// Spline method actually used (`Display` form): the requested one, or the simpler
+	/// one splimes stepped down to because there were too few distinct input timestamps
+	/// (e.g. `Quadratic` when `cubic` was asked for with three).
 	pub spline: String,
 	/// Output-grid resolution actually used.
 	pub resolution: String,
@@ -209,6 +263,24 @@ impl ApiError {
 	fn internal(message: impl Into<String>) -> Self {
 		Self::Internal(message.into())
 	}
+
+	/// Map an interpolation failure to a status by its variant: a request the engine
+	/// cannot serve as asked (a grid over the cap, bad polynomial parameters, a value or
+	/// an extrapolation beyond `f64`'s range) is the caller's `400`; anything else is a
+	/// `500`. `config` supplies the cap an oversized grid's message names.
+	fn from_engine(err: &splimes::Error, config: InterpolateConfig) -> Self {
+		use splimes::Error as E;
+		match err {
+			E::OutputTooLarge { points } => Self::bad_request(format!("the output grid would have {points} points, more than the {} one request may produce; narrow `start`..`end` or use a coarser `resolution`", config.max_output_points())),
+			E::NoPoints => Self::bad_request("`points` must not be empty"),
+			E::InvalidTimeRange { .. } => Self::bad_request("`end` must not be before `start`"),
+			E::InvalidDegree { .. } | E::InvalidBoundsFactor(_) | E::ValueOutOfRange { .. } | E::NonFiniteResult { .. } | E::InsufficientPoints { .. } => Self::bad_request(err.to_string()),
+			// GPU failures (only an explicit `Backend::Gpu` surfaces them), a panicked
+			// blocking task (`Task`), the variants `run` never returns, and any variant added
+			// after splimes 1.0 (`Error` is `#[non_exhaustive]`).
+			_ => Self::internal(err.to_string()),
+		}
+	}
 }
 
 /// JSON error envelope.
@@ -236,11 +308,12 @@ impl IntoResponse for ApiError {
 /// # Errors
 ///
 /// Returns [`ApiError::BadRequest`] for an empty point set, a non-finite value,
-/// or an inverted range, and [`ApiError::Internal`] if the engine fails.
-pub async fn interpolate(State(metrics): State<SharedMetrics>, Json(request): Json<InterpolateRequest>) -> Result<Json<InterpolateResponse>, ApiError> {
+/// an inverted range, an output grid above [`InterpolateConfig::max_output_points`], or
+/// parameters the engine rejects, and [`ApiError::Internal`] if the engine fails.
+pub async fn interpolate(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, Json(request): Json<InterpolateRequest>) -> Result<Json<InterpolateResponse>, ApiError> {
 	let start = std::time::Instant::now();
 	metrics.record_interpolate_request();
-	let result = interpolate_inner(request).await;
+	let result = interpolate_inner(request, config).await;
 	record_outcome(&metrics, &result);
 	// Latency of every request — success and error alike — feeds the p95 target.
 	metrics.observe_interpolate_latency(start.elapsed());
@@ -258,7 +331,7 @@ fn record_outcome(metrics: &SharedMetrics, result: &Result<Json<InterpolateRespo
 
 /// The core JSON-request handling: validate, lift to `BigDecimal` points, derive
 /// the range, then delegate to [`run_interpolation`].
-async fn interpolate_inner(request: InterpolateRequest) -> Result<Json<InterpolateResponse>, ApiError> {
+async fn interpolate_inner(request: InterpolateRequest, config: InterpolateConfig) -> Result<Json<InterpolateResponse>, ApiError> {
 	if request.points.is_empty() {
 		return Err(ApiError::bad_request("`points` must not be empty"));
 	}
@@ -279,56 +352,47 @@ async fn interpolate_inner(request: InterpolateRequest) -> Result<Json<Interpola
 	let start = request.start.unwrap_or_else(|| points.iter().map(|p| p.timestamp).min().unwrap_or_else(Utc::now));
 	let end = request.end.unwrap_or_else(|| points.iter().map(|p| p.timestamp).max().unwrap_or_else(Utc::now));
 
-	run_interpolation(points, start, end, request.spline.into(), request.resolution.into(), input_points).await
+	run_interpolation(points, start, end, request.spline.into(), request.resolution.into(), input_points, config).await
 }
 
 /// Run the engine over a prepared point set and shape the response. Shared by
 /// the JSON and ILP entry points so both produce identical result envelopes.
 ///
 /// Traced as the `interpolate.engine` span (roadmap Phase 3): it records the input
-/// point count, spline, and resolution at entry and the produced output-point count
-/// on completion, so a `RUST_LOG`-enabled run attributes the dominant compute cost of
-/// an interpolate request to the engine call. Decomposed into `interpolate.compute`
-/// (the spline kernel) and `interpolate.serialize` (the `BigDecimal` → wire-f64 +
-/// provenance shaping) child spans; the f64 → `BigDecimal` input lift is timed by the
-/// sibling `interpolate.parse` span in [`interpolate_inner`].
-#[tracing::instrument(name = "interpolate.engine", skip_all, fields(input_points = input_points, spline = %spline, resolution = ?resolution, output_points = tracing::field::Empty))]
-async fn run_interpolation(mut points: Vec<Point>, start: DateTime<Utc>, end: DateTime<Utc>, spline: Spline, resolution: Resolution, input_points: usize) -> Result<Json<InterpolateResponse>, ApiError> {
+/// point count, the requested spline (`spline`), and resolution at entry, and on
+/// completion the produced output-point count and the spline splimes actually ran
+/// (`effective_spline`, which the response reports), so a `RUST_LOG`-enabled run
+/// attributes the dominant compute cost of an interpolate request to the engine call.
+/// Decomposed into `interpolate.compute` (the spline kernel) and
+/// `interpolate.serialize` (the `BigDecimal` → wire-f64 + provenance shaping) child
+/// spans; the f64 → `BigDecimal` input lift is timed by the sibling `interpolate.parse`
+/// span in [`interpolate_inner`].
+#[tracing::instrument(name = "interpolate.engine", skip_all, fields(input_points = input_points, spline = %spline, resolution = ?resolution, effective_spline = tracing::field::Empty, output_points = tracing::field::Empty))]
+async fn run_interpolation(points: Vec<Point>, start: DateTime<Utc>, end: DateTime<Utc>, spline: Spline, resolution: Resolution, input_points: usize, config: InterpolateConfig) -> Result<Json<InterpolateResponse>, ApiError> {
 	if end < start {
 		return Err(ApiError::bad_request("`end` must not be before `start`"));
 	}
 
-	let spline_label = spline.to_string();
 	let resolution_label = format!("{resolution:?}");
 
-	// Capture input provenance before the engine consumes the points, so each
-	// output grid point can be marked raw / interpolated / extrapolated.
-	let input_timestamps: std::collections::HashSet<DateTime<Utc>> = points.iter().map(|p| p.timestamp).collect();
-	let min_ts = points.iter().map(|p| p.timestamp).min();
-	let max_ts = points.iter().map(|p| p.timestamp).max();
-
 	// `interpolate.compute` child span (roadmap Phase 3): the spline engine kernel
-	// itself, isolated from the surrounding provenance capture and result shaping so
-	// the dominant compute cost is attributable on its own.
-	let output = splimes::auto_interpolate(&mut points, start, end, resolution, spline).instrument(tracing::info_span!("interpolate.compute")).await.map_err(|err| ApiError::internal(err.to_string()))?;
+	// itself, on tokio's blocking pool, isolated from the result shaping so the
+	// dominant compute cost is attributable on its own. splimes labels every output
+	// point raw / interpolated / extrapolated as it goes.
+	let output = config.interpolator(spline, resolution).run_async(points, start, end).instrument(tracing::info_span!("interpolate.compute")).await.map_err(|err| ApiError::from_engine(&err, config))?;
 
 	// `interpolate.serialize` child span (roadmap Phase 3): the `BigDecimal` → wire-f64
-	// conversion and raw/interpolated/extrapolated provenance marking of every output
-	// grid point — the result-shaping stage timed apart from the kernel.
-	let points: Vec<OutputPoint> = tracing::info_span!("interpolate.serialize", output_points = output.len()).in_scope(|| output.iter().map(|p| OutputPoint { timestamp: p.timestamp, value: p.value.to_f64().unwrap_or_default(), kind: classify(p.timestamp, &input_timestamps, min_ts, max_ts) }).collect());
+	// conversion of every output grid point, with its provenance — the result-shaping
+	// stage timed apart from the kernel.
+	let points: Vec<OutputPoint> = tracing::info_span!("interpolate.serialize", output_points = output.len()).in_scope(|| output.iter().map(|(timestamp, value, kind)| OutputPoint { timestamp, value: value.to_f64().unwrap_or_default(), kind }).collect());
 
-	tracing::Span::current().record("output_points", points.len());
-	Ok(Json(InterpolateResponse { spline: spline_label, resolution: resolution_label, output_points: points.len(), input_points, points }))
-}
-
-/// The stable lowercase CSV token for a point's provenance (matches the JSON
-/// `kind` serialization).
-const fn kind_token(kind: PointKind) -> &'static str {
-	match kind {
-		PointKind::Raw => "raw",
-		PointKind::Interpolated => "interpolated",
-		PointKind::Extrapolated => "extrapolated",
-	}
+	// The method splimes ran, which is simpler than the requested one when there were
+	// too few distinct input timestamps for it.
+	let effective_spline = output.spline().to_string();
+	let span = tracing::Span::current();
+	span.record("effective_spline", effective_spline.as_str());
+	span.record("output_points", points.len());
+	Ok(Json(InterpolateResponse { spline: effective_spline, resolution: resolution_label, output_points: points.len(), input_points, points }))
 }
 
 /// Render an [`InterpolateResponse`] as a `timestamp,value,kind` CSV document.
@@ -344,7 +408,7 @@ fn interpolate_response_to_csv(response: &InterpolateResponse) -> Response {
 	use std::fmt::Write as _;
 	let mut out = String::from("timestamp,value,kind\n");
 	for point in &response.points {
-		let _ = writeln!(out, "{},{},{}", point.timestamp.to_rfc3339(), point.value, kind_token(point.kind));
+		let _ = writeln!(out, "{},{},{}", point.timestamp.to_rfc3339(), point.value, point.kind.as_str());
 	}
 	([(header::CONTENT_TYPE, "text/csv; charset=utf-8")], out).into_response()
 }
@@ -369,7 +433,7 @@ fn response_columns(response: &InterpolateResponse) -> (Vec<i64>, Vec<f64>, Vec<
 	for point in &response.points {
 		timestamps.push(point.timestamp.timestamp_nanos_opt().unwrap_or_default());
 		values.push(point.value);
-		kinds.push(kind_token(point.kind));
+		kinds.push(point.kind.as_str());
 	}
 	(timestamps, values, kinds)
 }
@@ -419,9 +483,9 @@ fn interpolate_response_to_parquet(response: &InterpolateResponse) -> Result<Res
 /// As [`interpolate`]: [`ApiError::BadRequest`] for an empty point set, a
 /// non-finite value, or an inverted range, and [`ApiError::Internal`] on an engine
 /// or Arrow-encoding failure.
-pub async fn interpolate_arrow(State(metrics): State<SharedMetrics>, Json(request): Json<InterpolateRequest>) -> Result<Response, ApiError> {
+pub async fn interpolate_arrow(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, Json(request): Json<InterpolateRequest>) -> Result<Response, ApiError> {
 	metrics.record_interpolate_request();
-	let result = interpolate_inner(request).await;
+	let result = interpolate_inner(request, config).await;
 	record_outcome(&metrics, &result);
 	interpolate_response_to_arrow(&result?.0)
 }
@@ -441,9 +505,9 @@ pub async fn interpolate_arrow(State(metrics): State<SharedMetrics>, Json(reques
 /// As [`interpolate`]: [`ApiError::BadRequest`] for an empty point set, a
 /// non-finite value, or an inverted range, and [`ApiError::Internal`] on an engine
 /// or Parquet-encoding failure.
-pub async fn interpolate_parquet(State(metrics): State<SharedMetrics>, Json(request): Json<InterpolateRequest>) -> Result<Response, ApiError> {
+pub async fn interpolate_parquet(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, Json(request): Json<InterpolateRequest>) -> Result<Response, ApiError> {
 	metrics.record_interpolate_request();
-	let result = interpolate_inner(request).await;
+	let result = interpolate_inner(request, config).await;
 	record_outcome(&metrics, &result);
 	interpolate_response_to_parquet(&result?.0)
 }
@@ -462,9 +526,9 @@ pub async fn interpolate_parquet(State(metrics): State<SharedMetrics>, Json(requ
 /// As [`interpolate`]: [`ApiError::BadRequest`] for an empty point set, a
 /// non-finite value, or an inverted range, and [`ApiError::Internal`] on an engine
 /// failure.
-pub async fn interpolate_csv(State(metrics): State<SharedMetrics>, Json(request): Json<InterpolateRequest>) -> Result<Response, ApiError> {
+pub async fn interpolate_csv(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, Json(request): Json<InterpolateRequest>) -> Result<Response, ApiError> {
 	metrics.record_interpolate_request();
-	let result = interpolate_inner(request).await;
+	let result = interpolate_inner(request, config).await;
 	record_outcome(&metrics, &result);
 	Ok(interpolate_response_to_csv(&result?.0))
 }
@@ -484,7 +548,8 @@ pub struct PointRequest {
 /// Response body for `POST /api/v1/interpolate/point`.
 #[derive(Debug, Clone, Serialize)]
 pub struct PointResponse {
-	/// Spline method actually used (`Display` form).
+	/// Spline method actually used (`Display` form): the requested one, or the simpler
+	/// one splimes stepped down to because there were too few distinct input timestamps.
 	pub spline: String,
 	/// The instant evaluated, echoed back.
 	pub instant: DateTime<Utc>,
@@ -503,11 +568,11 @@ pub struct PointResponse {
 ///
 /// # Errors
 ///
-/// Returns [`ApiError::BadRequest`] for an empty point set or a non-finite value,
-/// and [`ApiError::Internal`] if the engine fails.
-pub async fn interpolate_point(State(metrics): State<SharedMetrics>, Json(request): Json<PointRequest>) -> Result<Json<PointResponse>, ApiError> {
+/// Returns [`ApiError::BadRequest`] for an empty point set, a non-finite value, or
+/// parameters the engine rejects, and [`ApiError::Internal`] if the engine fails.
+pub async fn interpolate_point(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, Json(request): Json<PointRequest>) -> Result<Json<PointResponse>, ApiError> {
 	metrics.record_interpolate_request();
-	let result = interpolate_point_inner(request).await;
+	let result = interpolate_point_inner(request, config).await;
 	match &result {
 		Ok(_) => metrics.add_output_points(1),
 		Err(_) => metrics.record_interpolate_error(),
@@ -515,7 +580,7 @@ pub async fn interpolate_point(State(metrics): State<SharedMetrics>, Json(reques
 	result
 }
 
-async fn interpolate_point_inner(request: PointRequest) -> Result<Json<PointResponse>, ApiError> {
+async fn interpolate_point_inner(request: PointRequest, config: InterpolateConfig) -> Result<Json<PointResponse>, ApiError> {
 	let PointRequest { spline, instant, points: input } = request;
 	if input.is_empty() {
 		return Err(ApiError::bad_request("`points` must not be empty"));
@@ -527,24 +592,17 @@ async fn interpolate_point_inner(request: PointRequest) -> Result<Json<PointResp
 		points.push(Point::new(sample.timestamp, value));
 	}
 
-	let input_timestamps: std::collections::HashSet<DateTime<Utc>> = points.iter().map(|p| p.timestamp).collect();
-	let min_ts = points.iter().map(|p| p.timestamp).min();
-	let max_ts = points.iter().map(|p| p.timestamp).max();
-	let kind = classify(instant, &input_timestamps, min_ts, max_ts);
-
 	let spline: Spline = spline.into();
-	let spline_label = spline.to_string();
 
-	// Evaluate the fitted spline at the single instant: the spline's value at
-	// `instant` is independent of the rest of the output grid, so we interpolate a
-	// minimal nanosecond-wide grid that begins at the instant and read the value
-	// back at the instant itself (the first grid point). `auto_interpolate`
-	// rejects a zero-span range, hence the `+1ns` end.
-	let end = instant + Resolution::Nanoseconds.to_step();
-	let output = splimes::auto_interpolate(&mut points, instant, end, Resolution::Nanoseconds, spline).await.map_err(|err| ApiError::internal(err.to_string()))?;
-	let value = output.first().ok_or_else(|| ApiError::internal("interpolation produced no value at the instant"))?.value.to_f64().unwrap_or_default();
+	// Evaluate the fitted spline at the single instant: a grid with `start == end` is
+	// exactly that one instant, and splimes labels it raw / interpolated / extrapolated
+	// against the inputs. (The resolution only sets the step, which a one-point grid
+	// never takes.)
+	let output = config.interpolator(spline, Resolution::Nanoseconds).run_async(points, instant, instant).await.map_err(|err| ApiError::from_engine(&err, config))?;
+	let (_, value, kind) = output.iter().next().ok_or_else(|| ApiError::internal("interpolation produced no value at the instant"))?;
 
-	Ok(Json(PointResponse { spline: spline_label, instant, input_points: input.len(), value, kind }))
+	// The method splimes ran, which may be simpler than the requested one.
+	Ok(Json(PointResponse { spline: output.spline().to_string(), instant, input_points: input.len(), value: value.to_f64().unwrap_or_default(), kind }))
 }
 
 /// Query parameters for the ILP interpolation endpoint.
@@ -592,12 +650,13 @@ impl IlpParams {
 /// # Errors
 ///
 /// Returns [`ApiError::BadRequest`] for an unknown precision/spline/resolution
-/// token, a malformed payload, fewer than two usable points, or a zero-span
-/// series, and [`ApiError::Internal`] if the engine fails.
-pub async fn interpolate_ilp(State(metrics): State<SharedMetrics>, Query(params): Query<IlpParams>, body: String) -> Result<Json<InterpolateResponse>, ApiError> {
+/// token, a malformed payload, fewer than two usable points, a zero-span series,
+/// or an output grid above [`InterpolateConfig::max_output_points`], and
+/// [`ApiError::Internal`] if the engine fails.
+pub async fn interpolate_ilp(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, Query(params): Query<IlpParams>, body: String) -> Result<Json<InterpolateResponse>, ApiError> {
 	let start = std::time::Instant::now();
 	metrics.record_interpolate_request();
-	let result = interpolate_ilp_inner(&params, &body).await;
+	let result = interpolate_ilp_inner(&params, &body, config).await;
 	record_outcome(&metrics, &result);
 	// The ILP path is what a TSBS-style harness drives — its latency feeds p95 too.
 	metrics.observe_interpolate_latency(start.elapsed());
@@ -616,9 +675,9 @@ pub async fn interpolate_ilp(State(metrics): State<SharedMetrics>, Query(params)
 /// # Errors
 ///
 /// As [`interpolate_ilp`].
-pub async fn interpolate_ilp_csv(State(metrics): State<SharedMetrics>, Query(params): Query<IlpParams>, body: String) -> Result<Response, ApiError> {
+pub async fn interpolate_ilp_csv(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, Query(params): Query<IlpParams>, body: String) -> Result<Response, ApiError> {
 	metrics.record_interpolate_request();
-	let result = interpolate_ilp_inner(&params, &body).await;
+	let result = interpolate_ilp_inner(&params, &body, config).await;
 	record_outcome(&metrics, &result);
 	Ok(interpolate_response_to_csv(&result?.0))
 }
@@ -633,9 +692,9 @@ pub async fn interpolate_ilp_csv(State(metrics): State<SharedMetrics>, Query(par
 /// # Errors
 ///
 /// As [`interpolate_ilp`], plus [`ApiError::Internal`] on an Arrow-encoding failure.
-pub async fn interpolate_ilp_arrow(State(metrics): State<SharedMetrics>, Query(params): Query<IlpParams>, body: String) -> Result<Response, ApiError> {
+pub async fn interpolate_ilp_arrow(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, Query(params): Query<IlpParams>, body: String) -> Result<Response, ApiError> {
 	metrics.record_interpolate_request();
-	let result = interpolate_ilp_inner(&params, &body).await;
+	let result = interpolate_ilp_inner(&params, &body, config).await;
 	record_outcome(&metrics, &result);
 	interpolate_response_to_arrow(&result?.0)
 }
@@ -649,22 +708,28 @@ pub async fn interpolate_ilp_arrow(State(metrics): State<SharedMetrics>, Query(p
 /// # Errors
 ///
 /// As [`interpolate_ilp`], plus [`ApiError::Internal`] on a Parquet-encoding failure.
-pub async fn interpolate_ilp_parquet(State(metrics): State<SharedMetrics>, Query(params): Query<IlpParams>, body: String) -> Result<Response, ApiError> {
+pub async fn interpolate_ilp_parquet(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, Query(params): Query<IlpParams>, body: String) -> Result<Response, ApiError> {
 	metrics.record_interpolate_request();
-	let result = interpolate_ilp_inner(&params, &body).await;
+	let result = interpolate_ilp_inner(&params, &body, config).await;
 	record_outcome(&metrics, &result);
 	interpolate_response_to_parquet(&result?.0)
 }
 
-async fn interpolate_ilp_inner(params: &IlpParams, body: &str) -> Result<Json<InterpolateResponse>, ApiError> {
+async fn interpolate_ilp_inner(params: &IlpParams, body: &str, config: InterpolateConfig) -> Result<Json<InterpolateResponse>, ApiError> {
 	let precision = parse_precision_token(params.precision.as_deref())?;
 	let spline = parse_spline_token(params.spline_token())?;
 	let resolution = parse_resolution_token(params.resolution.as_deref())?;
 
 	let points = weft_line_protocol::parse_points(body, &params.field, precision).map_err(|err| ApiError::bad_request(err.to_string()))?;
 
-	// `parse_points` returns points sorted ascending by timestamp; the engine
-	// needs at least two distinct instants to interpolate between.
+	// `parse_points` returns points sorted ascending by timestamp, and the range is their
+	// own span: ILP has no `start`/`end` parameters. splimes 1.0 itself accepts one point
+	// or `start == end` (it returns a one-point `raw` series, as the JSON endpoint does for
+	// one input and no explicit range), but here that could only echo a single input back.
+	// With no range of its own to fill, a payload with fewer than two points or a single
+	// distinct timestamp is far more likely a mistake (the field on only one line, every
+	// line at one timestamp) than a request for that echo, so it stays a `400` that names
+	// the field and the count, as the README documents for this endpoint.
 	if points.len() < 2 {
 		return Err(ApiError::bad_request(format!("need at least two points carrying field `{}` with a timestamp, found {}", params.field, points.len())));
 	}
@@ -675,7 +740,7 @@ async fn interpolate_ilp_inner(params: &IlpParams, body: &str) -> Result<Json<In
 	}
 
 	let input_points = points.len();
-	run_interpolation(points, start, end, spline, resolution, input_points).await
+	run_interpolation(points, start, end, spline, resolution, input_points, config).await
 }
 
 /// Map an optional precision token to [`TimestampPrecision`] (default ns).
@@ -795,16 +860,45 @@ mod tests {
 
 	#[tokio::test]
 	async fn default_spline_is_cubic() {
+		// Four points: the fewest a cubic needs, so it is the method that runs.
 		let body = serde_json::json!({
 			"points": [
 				{ "timestamp": ts(0), "value": 1.0 },
 				{ "timestamp": ts(120), "value": 2.0 },
 				{ "timestamp": ts(240), "value": 1.5 },
+				{ "timestamp": ts(360), "value": 1.0 },
 			],
 		});
 		let (status, body) = post_json("/api/v1/interpolate", body).await;
 		assert_eq!(status, StatusCode::OK, "body: {body}");
 		assert_eq!(body["spline"], "Cubic");
+	}
+
+	#[tokio::test]
+	async fn too_few_points_report_the_method_splimes_stepped_down_to() {
+		// `spline` is the method actually used. Cubic needs four distinct timestamps, so
+		// with three splimes runs a quadratic, and the response says so (it used to echo
+		// the requested `Cubic`).
+		let three = serde_json::json!([
+			{ "timestamp": ts(0), "value": 1.0 },
+			{ "timestamp": ts(60), "value": 2.0 },
+			{ "timestamp": ts(120), "value": 1.5 },
+		]);
+		let (status, body) = post_json("/api/v1/interpolate", serde_json::json!({ "spline": "cubic", "points": three })).await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["spline"], "Quadratic");
+		// The point query reports it the same way.
+		let (status, body) = post_json("/api/v1/interpolate/point", serde_json::json!({ "spline": "cubic", "instant": ts(30), "points": three })).await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["spline"], "Quadratic");
+		// A polynomial steps down to degree n - 1, keeping its bounds factor.
+		let (status, body) = post_json("/api/v1/interpolate", serde_json::json!({ "spline": { "polynomial": { "degree": 5, "bounds_factor": 1.5 } }, "points": three })).await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["spline"], "Polynomial(degree: 2, bounds_factor: 1.5)");
+		// The ILP JSON response too: a cubic over two rows is linear.
+		let (status, body) = post_text("/api/v1/interpolate/ilp?field=load&precision=s&spline=cubic&resolution=seconds", "cpu load=0 0\ncpu load=60 60\n").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["spline"], "Linear");
 	}
 
 	#[tokio::test]
@@ -873,8 +967,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn ilp_endpoint_spline_takes_precedence_over_the_alias() {
-		// When both are given, the canonical `spline` wins over `interpolation`.
-		let payload = "cpu,host=a load=0 1000000000\ncpu,host=a load=60 1000000060\n";
+		// When both are given, the canonical `spline` wins over `interpolation`. Three rows,
+		// so a quadratic has the points it needs and is what runs.
+		let payload = "cpu,host=a load=0 1000000000\ncpu,host=a load=60 1000000060\ncpu,host=a load=30 1000000120\n";
 		let (status, body) = post_text("/api/v1/interpolate/ilp?field=load&precision=s&spline=quadratic&interpolation=linear", payload).await;
 		assert_eq!(status, StatusCode::OK, "body: {body}");
 		assert_eq!(body["spline"], "Quadratic");
@@ -909,6 +1004,15 @@ mod tests {
 		let (status, body) = post_text("/api/v1/interpolate/ilp?field=load&precision=s", payload).await;
 		assert_eq!(status, StatusCode::BAD_REQUEST);
 		assert!(body["error"].as_str().unwrap().contains("at least two"));
+	}
+
+	#[tokio::test]
+	async fn ilp_endpoint_rejects_a_zero_span_series() {
+		// Two rows at one timestamp: splimes would return a one-point series, but the ILP
+		// range is the data's own span, so the endpoint keeps refusing it.
+		let (status, body) = post_text("/api/v1/interpolate/ilp?field=load&precision=s", "cpu load=1 5\ncpu load=2 5\n").await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+		assert!(body["error"].as_str().unwrap().contains("spans zero time"), "body: {body}");
 	}
 
 	#[tokio::test]
@@ -1039,10 +1143,182 @@ mod tests {
 	}
 
 	#[test]
-	fn kind_token_maps_each_provenance() {
-		assert_eq!(kind_token(PointKind::Raw), "raw");
-		assert_eq!(kind_token(PointKind::Interpolated), "interpolated");
-		assert_eq!(kind_token(PointKind::Extrapolated), "extrapolated");
+	fn provenance_tokens_are_unchanged() {
+		// splimes' `PointKind` replaced WeftDB's own enum; the wire tokens (JSON `kind`,
+		// the CSV and Arrow/Parquet `kind` column) must be exactly the ones it had.
+		for (kind, token) in [(PointKind::Raw, "raw"), (PointKind::Interpolated, "interpolated"), (PointKind::Extrapolated, "extrapolated")] {
+			assert_eq!(kind.as_str(), token);
+			assert_eq!(serde_json::to_value(kind).unwrap(), serde_json::json!(token));
+		}
+	}
+
+	#[tokio::test]
+	async fn oversized_grid_is_bad_request() {
+		// A nanosecond grid over a minute is 60 billion points: refused up front with a
+		// 400 naming the cap, not allocated.
+		let body = serde_json::json!({
+			"spline": "linear",
+			"resolution": "nanoseconds",
+			"points": [
+				{ "timestamp": ts(0), "value": 0.0 },
+				{ "timestamp": ts(60), "value": 60.0 },
+			],
+		});
+		for uri in ["/api/v1/interpolate", "/api/v1/interpolate/csv", "/api/v1/interpolate/arrow", "/api/v1/interpolate/parquet"] {
+			let (status, _content_type, text) = post_json_for_text(uri, body.clone()).await;
+			assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {text}");
+			let error: serde_json::Value = serde_json::from_str(&text).unwrap();
+			let message = error["error"].as_str().unwrap();
+			assert!(message.contains("60000000001 points") && message.contains(&MAX_INTERPOLATE_OUTPUT_POINTS.to_string()), "{uri}: {message}");
+		}
+		// The ILP path derives its range from the data, and is capped the same way.
+		let (status, body) = post_text("/api/v1/interpolate/ilp?field=load&precision=s&resolution=nanoseconds", "cpu load=0 0\ncpu load=60 60\n").await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+		assert!(body["error"].as_str().unwrap().contains("more than the"));
+	}
+
+	/// A cap of ten points, for exercising the exact boundary without a large grid.
+	fn ten_point_cap() -> InterpolateConfig {
+		InterpolateConfig::new(NonZeroUsize::new(10).unwrap())
+	}
+
+	#[test]
+	fn the_interpolator_allows_exactly_the_cap_and_refuses_one_more() {
+		// splimes allows a grid of exactly `max_points` points and refuses one more,
+		// before allocating anything.
+		let points = [Point::new(Utc.timestamp_opt(0, 0).unwrap(), BigDecimal::from(0))];
+		let start = Utc.timestamp_opt(0, 0).unwrap();
+		let at_cap = ten_point_cap().interpolator(Spline::Linear, Resolution::Seconds).run(&points, start, start + chrono::TimeDelta::seconds(9));
+		assert_eq!(at_cap.map(|o| o.len()).ok(), Some(10), "a 10-point grid fits a 10-point cap");
+		let over = ten_point_cap().interpolator(Spline::Linear, Resolution::Seconds).run(&points, start, start + chrono::TimeDelta::seconds(10));
+		assert!(matches!(over, Err(splimes::Error::OutputTooLarge { points: 11 })), "{over:?}");
+		// The default cap is the same check at ten million: one over is refused.
+		let over_default = InterpolateConfig::DEFAULT.interpolator(Spline::Linear, Resolution::Nanoseconds).run(&points, start, start + chrono::TimeDelta::nanoseconds(i64::try_from(MAX_INTERPOLATE_OUTPUT_POINTS).unwrap()));
+		assert!(matches!(over_default, Err(splimes::Error::OutputTooLarge { points }) if points == MAX_INTERPOLATE_OUTPUT_POINTS as u128 + 1), "{over_default:?}");
+	}
+
+	#[tokio::test]
+	async fn every_endpoint_applies_the_configured_cap() {
+		// With the cap set to 10, a 10-point grid (0..=9 s) is served and an 11-point grid
+		// (0..=10 s) is a 400 naming both sizes, on every grid-producing endpoint.
+		let router = || crate::app_with_state(crate::AppState::new().with_interpolate_config(ten_point_cap()));
+		let request = |uri: &str, content_type: &str, body: Vec<u8>| Request::builder().method("POST").uri(uri).header("content-type", content_type).body(Body::from(body)).unwrap();
+		let json_body = |end: i64| serde_json::to_vec(&serde_json::json!({ "spline": "linear", "resolution": "seconds", "points": [ { "timestamp": ts(0), "value": 0.0 }, { "timestamp": ts(end), "value": 1.0 } ] })).unwrap();
+		for uri in ["/api/v1/interpolate", "/api/v1/interpolate/csv", "/api/v1/interpolate/arrow", "/api/v1/interpolate/parquet"] {
+			let at_cap = router().oneshot(request(uri, "application/json", json_body(9))).await.unwrap();
+			assert_eq!(at_cap.status(), StatusCode::OK, "{uri}: exactly at the cap");
+			let over = router().oneshot(request(uri, "application/json", json_body(10))).await.unwrap();
+			assert_eq!(over.status(), StatusCode::BAD_REQUEST, "{uri}: one over the cap");
+			let error: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(over.into_body(), usize::MAX).await.unwrap()).unwrap();
+			assert!(error["error"].as_str().unwrap().contains("would have 11 points, more than the 10 one request"), "{uri}: {error}");
+		}
+		let response = router().oneshot(request("/api/v1/interpolate", "application/json", json_body(9))).await.unwrap();
+		let body: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+		assert_eq!(body["output_points"], 10);
+		// ILP derives its range from the data: 0 and 9 or 10 seconds.
+		for uri in ["/api/v1/interpolate/ilp", "/api/v1/interpolate/ilp/csv", "/api/v1/interpolate/ilp/arrow", "/api/v1/interpolate/ilp/parquet"] {
+			let uri = format!("{uri}?field=load&precision=s&spline=linear&resolution=seconds");
+			let at_cap = router().oneshot(request(&uri, "text/plain", b"cpu load=0 0\ncpu load=1 9\n".to_vec())).await.unwrap();
+			assert_eq!(at_cap.status(), StatusCode::OK, "{uri}: exactly at the cap");
+			let over = router().oneshot(request(&uri, "text/plain", b"cpu load=0 0\ncpu load=1 10\n".to_vec())).await.unwrap();
+			assert_eq!(over.status(), StatusCode::BAD_REQUEST, "{uri}: one over the cap");
+		}
+	}
+
+	#[test]
+	fn the_cap_is_read_from_its_environment_variable() {
+		assert_eq!(InterpolateConfig::from_env_value(None), Ok(InterpolateConfig::DEFAULT), "unset is the default");
+		assert_eq!(InterpolateConfig::DEFAULT.max_output_points(), 10_000_000);
+		assert_eq!(InterpolateConfig::from_env_value(Some("10")).map(InterpolateConfig::max_output_points), Ok(10));
+		assert_eq!(InterpolateConfig::from_env_value(Some("50000000")).map(InterpolateConfig::max_output_points), Ok(50_000_000));
+		for invalid in ["0", "-1", "1.5", "ten", "", " 10"] {
+			let error = InterpolateConfig::from_env_value(Some(invalid)).expect_err(invalid);
+			assert!(error.starts_with(&format!("WEFT_MAX_INTERPOLATE_POINTS={invalid:?} is not a positive integer: ")), "{invalid:?}: {error}");
+		}
+	}
+
+	#[test]
+	fn engine_errors_map_to_status_by_variant() {
+		let status = |err: splimes::Error| ApiError::from_engine(&err, InterpolateConfig::DEFAULT).into_response().status();
+		let at = Utc.timestamp_opt(0, 0).unwrap();
+		assert_eq!(status(splimes::Error::OutputTooLarge { points: 1 << 40 }), StatusCode::BAD_REQUEST);
+		assert_eq!(status(splimes::Error::NoPoints), StatusCode::BAD_REQUEST);
+		assert_eq!(status(splimes::Error::InvalidTimeRange { start: at, end: at }), StatusCode::BAD_REQUEST);
+		assert_eq!(status(splimes::Error::InvalidDegree { degree: 9, max: 8 }), StatusCode::BAD_REQUEST);
+		assert_eq!(status(splimes::Error::InvalidBoundsFactor(-1.0)), StatusCode::BAD_REQUEST);
+		assert_eq!(status(splimes::Error::ValueOutOfRange { timestamp: at }), StatusCode::BAD_REQUEST);
+		assert_eq!(status(splimes::Error::NonFiniteResult { timestamp: at }), StatusCode::BAD_REQUEST);
+		assert_eq!(status(splimes::Error::GpuUnavailable("no adapter".into())), StatusCode::INTERNAL_SERVER_ERROR);
+		assert_eq!(status(splimes::Error::Gpu("device lost".into())), StatusCode::INTERNAL_SERVER_ERROR);
+		assert_eq!(status(splimes::Error::Task("panicked".into())), StatusCode::INTERNAL_SERVER_ERROR);
+	}
+
+	#[tokio::test]
+	async fn polynomial_degree_above_the_maximum_is_bad_request() {
+		// splimes 1.0 rejects a degree above 8 (0.1 capped it silently); the request is
+		// the caller's to fix, so it is a 400 naming the limit.
+		let body = serde_json::json!({
+			"spline": { "polynomial": { "degree": 9 } },
+			"resolution": "seconds",
+			"points": [
+				{ "timestamp": ts(0), "value": 0.0 },
+				{ "timestamp": ts(10), "value": 10.0 },
+			],
+		});
+		let (status, body) = post_json("/api/v1/interpolate", body).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+		assert!(body["error"].as_str().unwrap().contains("between 1 and 8"), "body: {body}");
+	}
+
+	#[tokio::test]
+	async fn invalid_polynomial_parameters_are_bad_requests() {
+		// 0.1 accepted all of these and answered 200 (a degree above 8 was capped at 8);
+		// splimes 1.0 rejects them before computing anything.
+		for (spline, message) in [(serde_json::json!({ "polynomial": { "degree": 0 } }), "invalid polynomial degree 0: must be between 1 and 8"), (serde_json::json!({ "polynomial": { "degree": 9 } }), "invalid polynomial degree 9: must be between 1 and 8"), (serde_json::json!({ "polynomial": { "degree": 2, "bounds_factor": -1.5 } }), "invalid bounds factor -1.5: must be finite and not negative")] {
+			let body = serde_json::json!({ "spline": spline, "resolution": "seconds", "points": [ { "timestamp": ts(0), "value": 0.0 }, { "timestamp": ts(10), "value": 10.0 }, { "timestamp": ts(20), "value": 5.0 } ] });
+			for uri in ["/api/v1/interpolate", "/api/v1/interpolate/csv"] {
+				let (status, _content_type, text) = post_json_for_text(uri, body.clone()).await;
+				assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {spline}: {text}");
+				assert!(text.contains(message), "{uri} {spline}: {text}");
+			}
+			let point = serde_json::json!({ "spline": spline, "instant": ts(5), "points": body["points"] });
+			let (status, body) = post_json("/api/v1/interpolate/point", point).await;
+			assert_eq!(status, StatusCode::BAD_REQUEST, "point {spline}: {body}");
+		}
+	}
+
+	#[tokio::test]
+	async fn a_single_input_point_reconstructs_to_that_point() {
+		// One sample and no explicit range makes `start == end`; splimes 1.0 returns the
+		// one-point grid (0.1 refused a zero-span range, which surfaced as a 500).
+		let body = serde_json::json!({ "points": [ { "timestamp": ts(30), "value": 4.5 } ] });
+		let (status, body) = post_json("/api/v1/interpolate", body).await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["output_points"], 1);
+		assert_eq!(body["points"][0]["timestamp"], "1970-01-01T00:00:30Z");
+		assert_eq!(body["points"][0]["value"], 4.5);
+		assert_eq!(body["points"][0]["kind"], "raw");
+	}
+
+	#[tokio::test]
+	async fn provenance_folds_a_leap_second_onto_the_next_second() {
+		// The one case where splimes' `PointKind` differs from the `classify` WeftDB used
+		// before: time is on the POSIX scale, so an input at 23:59:60.5 is the same instant
+		// as 00:00:00.5 the next day, and a grid point there is `raw` (with that input's
+		// value). `classify` compared chrono values, which differ, and since chrono orders
+		// the leap second before midnight it called the point `extrapolated`.
+		let body = serde_json::json!({
+			"spline": "linear",
+			"instant": "2017-01-01T00:00:00.5Z",
+			"points": [
+				{ "timestamp": "2016-12-31T23:59:59Z", "value": 0.0 },
+				{ "timestamp": "2016-12-31T23:59:60.5Z", "value": 7.0 },
+			],
+		});
+		let (status, body) = post_json("/api/v1/interpolate/point", body).await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["kind"], "raw", "body: {body}");
+		assert_eq!(body["value"], 7.0);
 	}
 
 	/// POST a JSON body and return `(status, content-type, raw bytes)`.

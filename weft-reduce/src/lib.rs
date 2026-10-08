@@ -6,8 +6,9 @@
 //! workload, and any future SDK).
 //!
 //! A reduction groups points into buckets aligned to the epoch grid at a chosen
-//! [`splimes::Resolution`] (via [`splimes::Resolution::to_base`], the same index the
-//! engine uses everywhere else), then computes one or more [`Aggregation`]s per
+//! [`splimes::Resolution`] (via [`bucket_index`], the index splimes 0.1's
+//! `Resolution::to_base` computed, kept bit-for-bit so bucket edges and persisted
+//! partials never move), then computes one or more [`Aggregation`]s per
 //! non-empty bucket. Per WeftDB's precision principle every reduction runs in
 //! [`BigDecimal`] — the logical/API numeric type — so sums and averages carry no
 //! float drift; a caller that needs `f64` (a JSON body, a plot) converts at its own
@@ -25,10 +26,10 @@ pub mod sketch;
 use std::collections::BTreeMap;
 
 use bigdecimal::BigDecimal;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 pub use sketch::{DdSketch, SketchError};
-use splimes::{Point, Resolution, SECONDS_IN_DAY, SECONDS_IN_HOUR, SECONDS_IN_MINUTE, SECONDS_IN_MONTH, SECONDS_IN_WEEK, SECONDS_IN_YEAR};
+use splimes::{Point, Resolution};
 
 /// A per-bucket reduction over the values that fell in the bucket.
 ///
@@ -239,7 +240,7 @@ impl Aggregation {
 /// Values stay in [`BigDecimal`] — no lossy `f64` cast.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bucket {
-	/// Grid-aligned bucket start timestamp (the inverse of [`Resolution::to_base`]).
+	/// Grid-aligned bucket start timestamp (the inverse of [`bucket_index`]).
 	pub timestamp: DateTime<Utc>,
 	/// Number of input samples that fell in this bucket.
 	pub count: usize,
@@ -611,8 +612,7 @@ impl PartialReduction {
 			// The source bucket's grid start lands inside exactly one `to` bucket (the grids
 			// nest), so re-keying by that start groups every covered source bucket together.
 			let start = bucket_start(from, base).ok_or(ReduceError::BucketStartOverflow)?;
-			let to_base = to.to_base(&start).map_err(|_| ReduceError::TimestampRange)?;
-			match out.entry(to_base) {
+			match out.entry(bucket_index(to, &start)?) {
 				std::collections::btree_map::Entry::Occupied(mut e) => e.get_mut().merge(acc.clone())?,
 				std::collections::btree_map::Entry::Vacant(e) => {
 					e.insert(acc.clone());
@@ -649,7 +649,7 @@ pub fn reduce_partial(points: &[Point], resolution: Resolution, start: Option<Da
 		if start.is_some_and(|s| p.timestamp < s) || end.is_some_and(|e| p.timestamp > e) {
 			continue;
 		}
-		let base = resolution.to_base(&p.timestamp).map_err(|_| ReduceError::TimestampRange)?;
+		let base = bucket_index(resolution, &p.timestamp)?;
 		// The sketch is built inside the insert closure so a bucket that already exists
 		// does not construct (and immediately drop) one per point.
 		buckets.entry(base).or_insert_with(|| BucketAcc::new(collect, sketching.then(DdSketch::with_default_accuracy))).push(p.timestamp, p.value.clone())?;
@@ -658,44 +658,64 @@ pub fn reduce_partial(points: &[Point], resolution: Resolution, start: Option<Da
 	Ok(PartialReduction { buckets })
 }
 
+/// Nanoseconds in one second.
+const NANOS_PER_SECOND: i64 = 1_000_000_000;
+
+/// The epoch-grid bucket index of `timestamp` at `resolution`: the key every reduction
+/// buckets by, and the key a persisted [`PartialReduction`] is stored under.
+///
+/// This is splimes 0.1's `Resolution::to_base`, which splimes 1.0 removed, reproduced
+/// exactly so bucket edges and persisted keys do not move:
+///
+/// - **Sub-second resolutions** floor the instant's nanoseconds since the epoch to the
+///   step (0.1's `timestamp_nanos_opt` / `timestamp_micros` / `timestamp_millis`).
+/// - **Second-and-coarser resolutions** take whole seconds since the epoch (chrono's
+///   floor) and divide by the step in seconds, **rounding toward zero**. Before 1970 that
+///   rounds toward the epoch rather than down, so bucket `0` spans one step either side of
+///   it; 0.1 did the same, and changing it would re-key existing data.
+///
+/// The step comes from [`Resolution::step_nanos`]; splimes 1.0's steps equal 0.1's
+/// `SECONDS_IN_*` constants for every resolution (a month is 30 days, a year 365), which
+/// `bucket_grid_matches_splimes_0_1_for_every_resolution` pins.
+///
+/// # Errors
+///
+/// [`ReduceError::TimestampRange`] if the index does not fit an `i64` (only at nanosecond
+/// resolution, for an instant outside roughly 1677–2262).
+pub fn bucket_index(resolution: Resolution, timestamp: &DateTime<Utc>) -> Result<i64, ReduceError> {
+	if let Some(step_secs) = resolution_step_secs(resolution) {
+		return Ok(timestamp.timestamp() / step_secs);
+	}
+	let nanos = i128::from(timestamp.timestamp()) * i128::from(NANOS_PER_SECOND) + i128::from(timestamp.timestamp_subsec_nanos());
+	i64::try_from(nanos.div_euclid(i128::from(resolution.step_nanos()))).map_err(|_| ReduceError::TimestampRange)
+}
+
 /// Reconstruct a bucket's grid-aligned start timestamp from its resolution index.
 ///
-/// The inverse of [`Resolution::to_base`]. Returns `None` only if the index scales
-/// past the representable `i64`-second range.
+/// The inverse of [`bucket_index`]: the epoch plus `base` steps. Returns `None` only if
+/// that instant is outside the range chrono can represent.
 #[must_use]
 pub fn bucket_start(resolution: Resolution, base: i64) -> Option<DateTime<Utc>> {
-	let duration = match resolution {
-		Resolution::Nanoseconds => Duration::nanoseconds(base),
-		Resolution::Microseconds => Duration::microseconds(base),
-		Resolution::Milliseconds => Duration::milliseconds(base),
-		Resolution::Seconds => Duration::seconds(base),
-		Resolution::Minutes => Duration::seconds(base.checked_mul(SECONDS_IN_MINUTE)?),
-		Resolution::Hours => Duration::seconds(base.checked_mul(SECONDS_IN_HOUR)?),
-		Resolution::Days => Duration::seconds(base.checked_mul(SECONDS_IN_DAY)?),
-		Resolution::Weeks => Duration::seconds(base.checked_mul(SECONDS_IN_WEEK)?),
-		Resolution::Months => Duration::seconds(base.checked_mul(SECONDS_IN_MONTH)?),
-		Resolution::Years => Duration::seconds(base.checked_mul(SECONDS_IN_YEAR)?),
-	};
-	DateTime::<Utc>::UNIX_EPOCH.checked_add_signed(duration)
+	// At most 2^63 steps of at most a 365-day year in nanoseconds: well inside i128.
+	let nanos = i128::from(base) * i128::from(resolution.step_nanos());
+	let secs = i64::try_from(nanos.div_euclid(i128::from(NANOS_PER_SECOND))).ok()?;
+	let subsec = u32::try_from(nanos.rem_euclid(i128::from(NANOS_PER_SECOND))).ok()?;
+	DateTime::from_timestamp(secs, subsec)
 }
 
 /// The bucket width of a resolution in **whole seconds**, or `None` for the sub-second
-/// resolutions (whose [`Resolution::to_base`] keys on nanos/micros/millis, not seconds,
-/// so a seconds-based nesting test does not apply to them).
+/// resolutions (whose [`bucket_index`] keys on nanos/micros/millis, not seconds, so a
+/// seconds-based nesting test does not apply to them).
 ///
-/// For every second-and-coarser resolution `to_base` is `timestamp_seconds / step`, so two
-/// such grids nest exactly when one step divides the other — see [`grids_nest`]. WeftDB fixes
-/// a month at 30 days and a year at 365 days, so those are exact multiples too.
+/// For every second-and-coarser resolution [`bucket_index`] is `timestamp_seconds / step`,
+/// so two such grids nest exactly when one step divides the other — see [`grids_nest`].
+/// WeftDB fixes a month at 30 days and a year at 365 days, so those are exact multiples too.
 const fn resolution_step_secs(r: Resolution) -> Option<i64> {
-	match r {
-		Resolution::Seconds => Some(1),
-		Resolution::Minutes => Some(SECONDS_IN_MINUTE),
-		Resolution::Hours => Some(SECONDS_IN_HOUR),
-		Resolution::Days => Some(SECONDS_IN_DAY),
-		Resolution::Weeks => Some(SECONDS_IN_WEEK),
-		Resolution::Months => Some(SECONDS_IN_MONTH),
-		Resolution::Years => Some(SECONDS_IN_YEAR),
-		Resolution::Nanoseconds | Resolution::Microseconds | Resolution::Milliseconds => None,
+	let step = r.step_nanos();
+	if step >= NANOS_PER_SECOND && step % NANOS_PER_SECOND == 0 {
+		Some(step / NANOS_PER_SECOND)
+	} else {
+		None
 	}
 }
 
@@ -1143,11 +1163,79 @@ mod tests {
 	}
 
 	#[test]
-	fn bucket_start_inverts_to_base() {
-		// For a representative resolution, bucket_start(to_base(t)) aligns t down to the grid.
+	fn bucket_start_inverts_bucket_index() {
+		// For a representative resolution, bucket_start(bucket_index(t)) aligns t down to the grid.
 		let t = Utc.timestamp_opt(3661, 0).single().unwrap(); // 01:01:01
-		let base = Resolution::Minutes.to_base(&t).unwrap();
+		let base = bucket_index(Resolution::Minutes, &t).unwrap();
 		let start = bucket_start(Resolution::Minutes, base).unwrap();
 		assert_eq!(start, Utc.timestamp_opt(3660, 0).single().unwrap(), "aligns down to 01:01:00");
+	}
+
+	/// splimes 0.1's `Resolution::to_base`, verbatim (with its `SECONDS_IN_*` constants), as
+	/// the reference [`bucket_index`] must reproduce.
+	fn splimes_0_1_to_base(resolution: Resolution, t: &DateTime<Utc>) -> Option<i64> {
+		Some(match resolution {
+			Resolution::Nanoseconds => t.timestamp_nanos_opt()?,
+			Resolution::Microseconds => t.timestamp_micros(),
+			Resolution::Milliseconds => t.timestamp_millis(),
+			Resolution::Seconds => t.timestamp(),
+			Resolution::Minutes => t.timestamp() / 60,
+			Resolution::Hours => t.timestamp() / 3_600,
+			Resolution::Days => t.timestamp() / 86_400,
+			Resolution::Weeks => t.timestamp() / 604_800,
+			Resolution::Months => t.timestamp() / 2_592_000,
+			Resolution::Years => t.timestamp() / 31_536_000,
+			_ => unreachable!("splimes 0.1 had no {resolution:?}"),
+		})
+	}
+
+	#[test]
+	fn bucket_grid_matches_splimes_0_1_for_every_resolution() {
+		// splimes 1.0 dropped `SECONDS_IN_*` and `Resolution::to_base`; the bucket grid now
+		// steps by `Resolution::step_nanos`. Pin each step to 0.1's constant, so a change
+		// upstream fails here instead of silently moving bucket edges (and the keys of
+		// every persisted partial).
+		let expected_step_nanos: [(Resolution, i64); 10] = [(Resolution::Nanoseconds, 1), (Resolution::Microseconds, 1_000), (Resolution::Milliseconds, 1_000_000), (Resolution::Seconds, 1_000_000_000), (Resolution::Minutes, 60 * 1_000_000_000), (Resolution::Hours, 3_600 * 1_000_000_000), (Resolution::Days, 86_400 * 1_000_000_000), (Resolution::Weeks, 604_800 * 1_000_000_000), (Resolution::Months, 2_592_000 * 1_000_000_000), (Resolution::Years, 31_536_000 * 1_000_000_000)];
+		assert_eq!(Resolution::ALL.len(), expected_step_nanos.len(), "a new resolution needs a pinned grid");
+		for (r, step) in expected_step_nanos {
+			assert_eq!(r.step_nanos(), step, "{r:?} step");
+		}
+
+		// Pinned bucket starts for one instant, 2024-02-29T13:45:30.123456789Z, at every
+		// resolution: the index and the grid start it maps back to.
+		let t = DateTime::parse_from_rfc3339("2024-02-29T13:45:30.123456789Z").unwrap().to_utc();
+		let pinned: [(Resolution, i64, &str); 10] = [(Resolution::Nanoseconds, 1_709_214_330_123_456_789, "2024-02-29T13:45:30.123456789+00:00"), (Resolution::Microseconds, 1_709_214_330_123_456, "2024-02-29T13:45:30.123456+00:00"), (Resolution::Milliseconds, 1_709_214_330_123, "2024-02-29T13:45:30.123+00:00"), (Resolution::Seconds, 1_709_214_330, "2024-02-29T13:45:30+00:00"), (Resolution::Minutes, 28_486_905, "2024-02-29T13:45:00+00:00"), (Resolution::Hours, 474_781, "2024-02-29T13:00:00+00:00"), (Resolution::Days, 19_782, "2024-02-29T00:00:00+00:00"), (Resolution::Weeks, 2_826, "2024-02-29T00:00:00+00:00"), (Resolution::Months, 659, "2024-02-17T00:00:00+00:00"), (Resolution::Years, 54, "2023-12-19T00:00:00+00:00")];
+		for (r, index, start) in pinned {
+			assert_eq!(bucket_index(r, &t), Ok(index), "{r:?} index");
+			assert_eq!(bucket_start(r, index).map(|s| s.to_rfc3339()), Some(start.to_string()), "{r:?} start");
+		}
+
+		// The same index as 0.1's `to_base` at every resolution, across the epoch (where
+		// 0.1 rounds coarse indexes toward zero), sub-second offsets, a leap second, and
+		// the extremes chrono can represent.
+		let mut instants: Vec<DateTime<Utc>> = [0, 1, -1, 59, -59, 60, -60, 61, -61, 86_399, -86_401, 2_591_999, -2_592_001, 31_535_999, -31_536_001, 1_700_000_000, -1_700_000_000, 9_223_372_036, -9_223_372_037].iter().flat_map(|&s| [0, 1, 999_999_999].map(|ns| DateTime::from_timestamp(s, ns).unwrap())).collect();
+		instants.push(DateTime::parse_from_rfc3339("2016-12-31T23:59:60.5Z").unwrap().to_utc());
+		instants.push(DateTime::<Utc>::MIN_UTC);
+		instants.push(DateTime::<Utc>::MAX_UTC);
+		for &r in Resolution::ALL {
+			for t in &instants {
+				let old = splimes_0_1_to_base(r, t);
+				assert_eq!(bucket_index(r, t).ok(), old, "{r:?} index of {t}");
+				// Pre-1970 the coarse buckets are rounded toward zero (and a leap second is
+				// indexed by the second before it), so only for ordinary instants from the
+				// epoch on does the start align `t` down to within one step.
+				if let Some(base) = old {
+					let start = bucket_start(r, base);
+					if *t >= DateTime::<Utc>::UNIX_EPOCH && t.timestamp_subsec_nanos() < 1_000_000_000 {
+						assert!(start.is_some_and(|s| s <= *t && *t - s < r.step()), "{r:?} start of {t}: {start:?}");
+					}
+				}
+			}
+		}
+		// The pre-epoch rounding toward zero, explicitly: 30 s before the epoch is in minute
+		// bucket 0, which starts at the epoch.
+		let before = DateTime::from_timestamp(-30, 0).unwrap();
+		assert_eq!(bucket_index(Resolution::Minutes, &before), Ok(0));
+		assert_eq!(bucket_index(Resolution::Milliseconds, &before), Ok(-30_000));
 	}
 }

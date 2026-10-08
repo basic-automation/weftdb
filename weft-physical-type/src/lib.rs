@@ -65,6 +65,30 @@
 //! [`Decimal128`]: PhysicalType::Decimal128
 //! [`BigDecimalText`]: PhysicalType::BigDecimalText
 //!
+//! ## Cargo features
+//!
+//! Every feature is **off by default**, sits **outside the 1.0 semver promise** (its items may
+//! change or disappear in any release), and is **pending patent review** (ROADMAP.md, the
+//! Phase 6.1 codec patent/licence gate). None of them is needed to read or write a frame under
+//! the default configuration, that is with [`FrameOptions::transposed_max_overhead`] unset. A
+//! frame written with that option set (as 0.1.0 did whenever it was set) needs
+//! `bitsliced-codec`.
+//!
+//! - `experimental-codecs` — the advisory float and timestamp codecs the `.weftseg` writer
+//!   never emits: the `floatcodec` module (Gorilla-XOR, Chimp, Chimp128, Elf, and the
+//!   `best_f64_codec` / `best_f64_bytes` selector), the matching `ColumnEncoding` estimates
+//!   (`gorilla_f64_bytes`, `best_f64_bytes`, `best_f64_codec`), and the Sprintz FIRE
+//!   forecaster (`fire_residuals`, `fire_reconstruct`, `fire_estimated_bytes`). They exist
+//!   so the benchmark harness can report what-if sizes; they are not a storage format.
+//! - `bitsliced-codec` — the opt-in bit-sliced (bit-plane-major) `ScaledI64` value codec
+//!   (`VAL_CODEC_TRANSPOSED`, codec name `scaled_transposed`): the `transpose_bitpack_*`
+//!   primitives and `TRANSPOSE_TILE` in [`timestamp`], the `ColumnEncoding` entries
+//!   (`transposed_value_bytes`, `transposed_overhead`, `best_value_codec_transposed`), and
+//!   `weftseg::write_value_column_transposed`. Without it the writers ignore
+//!   [`FrameOptions::transposed_max_overhead`] and every reader returns
+//!   [`WeftSegError::CodecNotEnabled`] for a block that uses the codec, so a store that holds
+//!   one fails loudly rather than misreading it.
+//!
 //! ## Vendor-neutrality
 //!
 //! Per the workspace hard constraints this crate carries no vendor-specific
@@ -76,6 +100,7 @@
 
 pub mod catalog;
 pub mod column;
+#[cfg(feature = "experimental-codecs")]
 pub mod floatcodec;
 pub mod nulls;
 pub mod page;
@@ -90,6 +115,7 @@ use bigdecimal::{
 };
 pub use catalog::{SegmentDescriptor, SegmentIndex};
 pub use column::{encode_column, recommend_encoding, CascadeInner, ColumnEncodeError, ColumnEncoding, DeltaCascadePlan};
+#[cfg(feature = "experimental-codecs")]
 pub use floatcodec::{best_f64_bytes, best_f64_codec, chimp128_f64_bytes, chimp128_f64_decode, chimp128_f64_encode, chimp_f64_bytes, chimp_f64_decode, chimp_f64_encode, elf_f64_bytes, elf_f64_decode, elf_f64_encode, xor_f64_bytes, xor_f64_decode, xor_f64_encode};
 pub use nulls::{NullMask, NullMaskError};
 pub use page::{Page, PagedSegment, DEFAULT_ROWS_PER_PAGE, PAGED_SEGMENT_FORMAT_VERSION};
@@ -97,7 +123,9 @@ pub use schema::{AspectSchema, SealError};
 pub use segment::{prune_by_time, prune_by_value, prune_present_by_time, Segment, SegmentError, SegmentStats, SEGMENT_FORMAT_VERSION};
 use serde::{Deserialize, Serialize};
 pub use split::{merge_newer_wins, split_index, SplitDecision, SplitPolicy};
-pub use timestamp::{bitpack_bytes, bitpack_decode, bitpack_encode, bitpack_width, decode_delta, decode_delta_of_delta, encode_delta, encode_delta_of_delta, fire_estimated_bytes, fire_reconstruct, fire_residuals, first_order_violation, rle_decode, rle_encode, rle_varint_bytes, uvarint_len, zigzag_varint_bytes, zigzag_varint_len, DeltaColumn, DeltaOfDeltaColumn, TimeUnit};
+pub use timestamp::{bitpack_bytes, bitpack_decode, bitpack_encode, bitpack_width, decode_delta, decode_delta_of_delta, encode_delta, encode_delta_of_delta, first_order_violation, rle_decode, rle_encode, rle_varint_bytes, uvarint_len, zigzag_varint_bytes, zigzag_varint_len, DeltaColumn, DeltaOfDeltaColumn, TimeUnit};
+#[cfg(feature = "experimental-codecs")]
+pub use timestamp::{fire_estimated_bytes, fire_reconstruct, fire_residuals};
 pub use weftseg::{crc32, frame_value_codec, read_paged_segment, read_segment, write_paged_segment, write_segment, write_segment_with, ByteReader, ByteWriter, FrameOptions, WeftSegError};
 
 /// A schema-declared physical encoding for an aspect's numeric values.

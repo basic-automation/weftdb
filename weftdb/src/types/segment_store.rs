@@ -27,6 +27,12 @@
 //! version, so a paged segment skips pages *within* the file too. The
 //! catalog/`metadata.db` registry is a later slice.
 //!
+//! Aspect names become file names, so every method that takes one and declares, seals,
+//! reads or maintains it first checks it with [`aspect_name::validate`] and fails with an
+//! [`InvalidAspectName`](crate::InvalidAspectName) for a name that could point a path
+//! outside `segments/`. The path builder also checks that each frame path it returns is a
+//! direct child of `segments/`.
+//!
 //! **Concurrency** (docs/design/crash-consistency.md section 5.1, slice S7). Each aspect
 //! has two locks. Its *commit* lock is held around every control-plane transaction of the
 //! aspect and guards its id allocator: a seal takes its id from the allocator, writes its
@@ -41,7 +47,7 @@
 //! its [`MaintenanceWait`] says.
 
 use std::{
-	collections::HashMap, future::Future, path::{Component, Path, PathBuf}, sync::{
+	collections::HashMap, ffi::OsStr, future::Future, path::{Component, Path, PathBuf}, sync::{
 		atomic::{AtomicBool, AtomicU64, Ordering}, OnceLock
 	}, time::Duration
 };
@@ -54,7 +60,7 @@ use weft_physical_type::{merge_newer_wins, split_index, AspectSchema, FrameOptio
 use weft_reduce::{Aggregation, Bucket, PartialReduction};
 
 use crate::{
-	types::{
+	aspect_name, types::{
 		aspect_locks::{AspectLocks, AspectState, CommitGuard, MaintGuard}, durable::{
 			create_dir_all_durable, fault::{self, FaultPoint}, LockHolder, RealFs, RootLock, RootLockError, StoreFs, SyncPolicy, WritePoints
 		}, index_txn::{IndexOp, IndexRow, IndexTxn, IndexTxnError, TxnApplied, TxnErrorKind}
@@ -148,10 +154,10 @@ impl CheckpointPolicy {
 	}
 }
 
-/// When a freshly sealed segment writes its value column in the **transposed
-/// (`FastLanes`-layout) bit-plane-major** codec instead of the size-selected one.
+/// When a freshly sealed segment writes its value column in the **bit-sliced
+/// (bit-plane-major)** codec instead of the size-selected one.
 ///
-/// The transposed layout stores the same *code* as the linear bit-pack with its bits permuted,
+/// The bit-sliced layout stores the same *code* as the linear bit-pack with its bits permuted,
 /// so it never wins on size — it is a **decode-latency** trade. Its decoder reads `u64` plane
 /// words and walks only the set bits, so a small-magnitude column's empty high bit-planes are
 /// skipped wholesale (measured ~5.7x the linear per-block unpack at the primitive level,
@@ -165,6 +171,11 @@ impl CheckpointPolicy {
 /// same shape as [`CheckpointPolicy`]'s `max_codec_overhead` gate.
 ///
 /// Whether making this the default is owner-gated — it changes the headline bytes/point.
+///
+/// **Needs the `bitsliced-codec` cargo feature**, which is off by default and pending patent
+/// review. Without it the codec is not compiled in: [`from_env`](Self::from_env) logs a warning
+/// and returns [`DISABLED`](Self::DISABLED), any other policy is ignored by the frame writer,
+/// and reading a segment that uses the codec fails with an error naming the feature.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TransposedPolicy {
 	/// Ceiling on the transposed block's size overhead against the size-selected codec, or
@@ -179,11 +190,22 @@ impl TransposedPolicy {
 
 	/// Read the policy from `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` (absent, unparseable,
 	/// non-finite or non-positive → [`DISABLED`](Self::DISABLED)). A value **below 1.0 is
-	/// meaningful**: it adopts the transposed layout only where it is also a strict size win
-	/// (see [`ColumnEncoding::transposed_overhead`](weft_physical_type::ColumnEncoding::transposed_overhead)).
+	/// meaningful**: it adopts the bit-sliced layout only where it is also a strict size win
+	/// (see `weft_physical_type::ColumnEncoding::transposed_overhead`).
+	///
+	/// Without the `bitsliced-codec` feature a set variable is ignored, with one warning per
+	/// process, and the result is always [`DISABLED`](Self::DISABLED).
 	#[must_use]
 	pub fn from_env() -> Self {
-		Self { max_overhead: std::env::var("WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|r| r.is_finite() && *r > 0.0) }
+		let raw = std::env::var("WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD").ok();
+		if !cfg!(feature = "bitsliced-codec") {
+			if raw.is_some() {
+				static WARNED: std::sync::Once = std::sync::Once::new();
+				WARNED.call_once(|| tracing::warn!("WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD is set, but this build does not include the bit-sliced value codec (cargo feature `bitsliced-codec`); ignoring it"));
+			}
+			return Self::DISABLED;
+		}
+		Self { max_overhead: raw.and_then(|v| v.trim().parse::<f64>().ok()).filter(|r| r.is_finite() && *r > 0.0) }
 	}
 }
 
@@ -487,6 +509,26 @@ async fn legacy_file_ids(segments: PathBuf) -> Result<HashMap<String, u64>> {
 		}
 	}
 	Ok(ids)
+}
+
+/// Join `file_name` onto `dir`, refusing a result that is not a file directly inside
+/// `dir`.
+///
+/// Frame names come from aspect names, which [`aspect_name::validate`] already keeps free
+/// of separators and dot segments. This is the second line of defence: whatever the name,
+/// the store never writes, reads or deletes a frame anywhere but its own `segments/`
+/// directory.
+///
+/// # Errors
+///
+/// When the joined path's parent is not `dir`, or its last component is not `file_name`
+/// (an absolute or drive-prefixed name replaces `dir`; a `..` or a separator moves it).
+fn contained_file(dir: &Path, file_name: &str) -> Result<PathBuf> {
+	let path = dir.join(file_name);
+	if path.parent() != Some(dir) || path.file_name() != Some(OsStr::new(file_name)) {
+		anyhow::bail!("refusing segment file {}: it is not directly inside {}", path.display(), dir.display());
+	}
+	Ok(path)
 }
 
 pub struct SegmentStore {
@@ -1211,10 +1253,16 @@ impl SegmentStore {
 	/// [`seal_declared`](SegmentStore::seal_declared) calls need not be handed the
 	/// schema. Idempotent on the aspect (a re-declaration overwrites).
 	///
+	/// The name also names the aspect's segment files, so it must pass
+	/// [`aspect_name::validate`] (no path separators, no leading `.`, no control
+	/// characters, …); a name that does not is refused before anything is written.
+	///
 	/// # Errors
 	///
-	/// Propagates any libSQL write failure.
+	/// An [`InvalidAspectName`](crate::InvalidAspectName) when `aspect` is not a valid
+	/// name; otherwise propagates any libSQL write failure.
 	pub async fn declare(&self, aspect: &str, schema: &AspectSchema) -> Result<()> {
+		aspect_name::validate(aspect)?;
 		self.writable()?;
 		self.catalog.declare(&self.database, &self.subject, aspect, schema).await
 	}
@@ -1348,6 +1396,7 @@ impl SegmentStore {
 	/// seals of one aspect write their frames in parallel; the row, the allocator's raise
 	/// and the rollup fold then commit under it ([`publish_seal`](Self::publish_seal)).
 	async fn persist(&self, aspect: &str, segment: &Segment) -> Result<SegmentDescriptor> {
+		aspect_name::validate(aspect)?;
 		let id = self.allocate_id(aspect).await?;
 		// Both opt-in layouts are applied here: the timestamp checkpoint index only when
 		// configured AND the segment's shape actually benefits (sorted + irregular + big
@@ -1355,7 +1404,7 @@ impl SegmentStore {
 		// ceiling. With neither configured this writes the historical frame byte-for-byte, and
 		// every combination reads identically.
 		let bytes = segment.write_to_with(&self.frame_options(segment.stats.row_count, segment.benefits_from_checkpoints(), segment.checkpoint_codec_overhead()));
-		let path = self.segment_path(aspect, id);
+		let path = self.segment_path(aspect, id)?;
 		tokio::fs::write(&path, &bytes).await.with_context(|| format!("writing segment {}", path.display()))?;
 		fault::hit(FaultPoint::SFrameWritten).await?;
 		let descriptor = SegmentDescriptor::of_segment(id, path.to_string_lossy().into_owned(), bytes.len() as u64, segment);
@@ -1375,11 +1424,12 @@ impl SegmentStore {
 	/// record its descriptor. The paged analogue of [`persist`](SegmentStore::persist), with
 	/// the same id allocation and commit.
 	async fn persist_paged(&self, aspect: &str, segment: &PagedSegment) -> Result<SegmentDescriptor> {
+		aspect_name::validate(aspect)?;
 		let id = self.allocate_id(aspect).await?;
 		// As `persist`, though the checkpoint win is far smaller here — page pruning already
 		// bounds a probe's decode to `rows_per_page`.
 		let bytes = segment.write_to_with(&self.frame_options(segment.stats.row_count, segment.benefits_from_checkpoints(), segment.checkpoint_codec_overhead()));
-		let path = self.segment_path(aspect, id);
+		let path = self.segment_path(aspect, id)?;
 		tokio::fs::write(&path, &bytes).await.with_context(|| format!("writing segment {}", path.display()))?;
 		fault::hit(FaultPoint::SFrameWritten).await?;
 		let descriptor = SegmentDescriptor::of_paged_segment(id, path.to_string_lossy().into_owned(), bytes.len() as u64, segment);
@@ -1395,14 +1445,35 @@ impl SegmentStore {
 	}
 
 	/// The on-disk path a freshly sealed segment of the given `aspect`/`id` takes.
-	fn segment_path(&self, aspect: &str, id: u64) -> PathBuf {
-		self.root.join("segments").join(format!("{aspect}-{id}.weftseg"))
+	///
+	/// # Errors
+	///
+	/// As [`aspect_file_path`](Self::aspect_file_path).
+	fn segment_path(&self, aspect: &str, id: u64) -> Result<PathBuf> {
+		self.aspect_file_path(aspect, id, "weftseg")
 	}
 
 	/// The on-disk path of the partial-reduction sidecar beside an `aspect`/`id` segment
 	/// (`{aspect}-{id}.weftpart`, alongside the `.weftseg`).
-	fn sidecar_path(&self, aspect: &str, id: u64) -> PathBuf {
-		self.root.join("segments").join(format!("{aspect}-{id}.weftpart"))
+	///
+	/// # Errors
+	///
+	/// As [`aspect_file_path`](Self::aspect_file_path).
+	fn sidecar_path(&self, aspect: &str, id: u64) -> Result<PathBuf> {
+		self.aspect_file_path(aspect, id, "weftpart")
+	}
+
+	/// The path of the `{aspect}-{id}.{extension}` file under `segments/`: the one place
+	/// an aspect name becomes a path.
+	///
+	/// # Errors
+	///
+	/// An [`InvalidAspectName`](crate::InvalidAspectName) when `aspect` fails
+	/// [`aspect_name::validate`], or an error when the joined path is somehow not a
+	/// direct child of `segments/` (defence in depth behind the name check).
+	fn aspect_file_path(&self, aspect: &str, id: u64, extension: &str) -> Result<PathBuf> {
+		aspect_name::validate(aspect)?;
+		contained_file(&self.root.join("segments"), &format!("{aspect}-{id}.{extension}"))
 	}
 
 	/// Materialize a per-segment partial-reduction sidecar for a just-sealed segment, when
@@ -1431,7 +1502,7 @@ impl SegmentStore {
 		// tier below), so a coarse downsample folds a coarse tier rather than the whole base.
 		let sidecar = PartialSidecar::materialize(base, descriptor, partial, &self.partials.tiers()).map_err(|e| anyhow::anyhow!("building rollup tiers for segment {}: {e}", descriptor.path))?;
 		let bytes = sidecar.to_bytes()?;
-		let path = self.sidecar_path(aspect, descriptor.id);
+		let path = self.sidecar_path(aspect, descriptor.id)?;
 		tokio::fs::write(&path, &bytes).await.with_context(|| format!("writing partial sidecar {}", path.display()))?;
 		Ok(())
 	}
@@ -1446,7 +1517,7 @@ impl SegmentStore {
 	///
 	/// Propagates a filesystem read error other than "not found".
 	pub async fn load_partial_sidecar(&self, aspect: &str, descriptor: &SegmentDescriptor) -> Result<Option<PartialSidecar>> {
-		let path = self.sidecar_path(aspect, descriptor.id);
+		let path = self.sidecar_path(aspect, descriptor.id)?;
 		let bytes = match tokio::fs::read(&path).await {
 			Ok(bytes) => bytes,
 			Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1466,7 +1537,7 @@ impl SegmentStore {
 	///
 	/// Propagates a filesystem error other than "not found".
 	async fn remove_sidecar(&self, aspect: &str, id: u64) -> Result<()> {
-		let path = self.sidecar_path(aspect, id);
+		let path = self.sidecar_path(aspect, id)?;
 		match tokio::fs::remove_file(&path).await {
 			Ok(()) => Ok(()),
 			Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1505,6 +1576,7 @@ impl SegmentStore {
 	/// Propagates a libSQL prune failure, a filesystem read error, or a
 	/// [`weft_physical_type::weftseg::WeftSegError`] for a corrupt/unreadable `.weftseg`.
 	pub async fn read_time_range(&self, aspect: &str, start: i64, end: i64) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>)> {
+		aspect_name::validate(aspect)?;
 		let descriptors = self.index.prune_by_time(aspect, start, end).await?;
 		let mut timestamps = Vec::new();
 		let mut values = Vec::new();
@@ -1547,6 +1619,7 @@ impl SegmentStore {
 	/// stored epoch falls outside the representable instant range, or if the reduction
 	/// fails.
 	pub async fn downsample_range(&self, aspect: &str, start: i64, end: i64, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Vec<Bucket>> {
+		aspect_name::validate(aspect)?;
 		let schema = self.require_schema(aspect).await?;
 		let descriptors = self.index.prune_by_time(aspect, start, end).await?;
 
@@ -1640,6 +1713,7 @@ impl SegmentStore {
 	/// Propagates a libSQL prune failure, a filesystem read error, or a
 	/// [`weft_physical_type::weftseg::WeftSegError`] for a corrupt/unreadable `.weftseg`.
 	pub async fn read_point(&self, aspect: &str, t: i64) -> Result<Option<BigDecimal>> {
+		aspect_name::validate(aspect)?;
 		let descriptors = self.index.prune_by_time(aspect, t, t).await?;
 		let mut found = None;
 		for descriptor in &descriptors {
@@ -1673,6 +1747,7 @@ impl SegmentStore {
 	/// Propagates a libSQL prune failure, a filesystem read error, or a
 	/// [`weft_physical_type::weftseg::WeftSegError`] for a corrupt/unreadable `.weftseg`.
 	pub async fn read_points(&self, aspect: &str, ts: &[i64]) -> Result<Vec<Option<BigDecimal>>> {
+		aspect_name::validate(aspect)?;
 		if ts.is_empty() {
 			return Ok(Vec::new());
 		}
@@ -1719,6 +1794,7 @@ impl SegmentStore {
 	/// A [`MaintenanceBusy`] error if another maintenance operation holds the aspect for
 	/// longer than [`maintenance_wait`](Self::maintenance_wait).
 	pub async fn reconcile_segment(&self, aspect: &str, id: u64) -> Result<bool> {
+		aspect_name::validate(aspect)?;
 		self.writable()?;
 		let held = self.maintain(aspect).await?;
 		self.reconcile_segment_held(&held, id).await
@@ -1728,6 +1804,7 @@ impl SegmentStore {
 	async fn reconcile_segment_held(&self, held: &MaintGuard, id: u64) -> Result<bool> {
 		self.writable()?;
 		let aspect = held.aspect();
+		aspect_name::validate(aspect)?;
 		let descriptor = self.index.all(aspect).await?.into_iter().find(|d| d.id == id).ok_or_else(|| anyhow::anyhow!("aspect {aspect:?} has no segment {id}"))?;
 		if descriptor.time_sorted {
 			return Ok(false);
@@ -1751,7 +1828,7 @@ impl SegmentStore {
 		let (sorted_ts, sorted_vs): (Vec<i64>, Vec<Option<BigDecimal>>) = rows.into_iter().unzip();
 		fault::hit(FaultPoint::MPlanned).await?;
 		// Re-seal the sorted rows in the original frame kind, to the same id/file.
-		let path = self.segment_path(aspect, id);
+		let path = self.segment_path(aspect, id)?;
 		let new_descriptor = if let Some(rows_per_page) = rows_per_page {
 			let segment = schema.seal_paged_nullable(&sorted_ts, &sorted_vs, rows_per_page).map_err(|e| anyhow::anyhow!("re-seal failed: {e}"))?;
 			let new_bytes = segment.write_to();
@@ -1805,7 +1882,7 @@ impl SegmentStore {
 	/// selects and write it to the `.weftseg` file for `aspect`/`id`, returning its
 	/// descriptor; nothing is indexed.
 	async fn write_resealed(&self, aspect: &str, schema: &AspectSchema, id: u64, timestamps: &[i64], values: &[Option<BigDecimal>], rows_per_page: Option<usize>) -> Result<SegmentDescriptor> {
-		let path = self.segment_path(aspect, id);
+		let path = self.segment_path(aspect, id)?;
 		let descriptor = if let Some(rows_per_page) = rows_per_page {
 			let segment = schema.seal_paged_nullable(timestamps, values, rows_per_page).map_err(|e| anyhow::anyhow!("split re-seal failed: {e}"))?;
 			let new_bytes = segment.write_to();
@@ -1858,6 +1935,7 @@ impl SegmentStore {
 	/// A [`MaintenanceBusy`] error if another maintenance operation holds the aspect for
 	/// longer than [`maintenance_wait`](Self::maintenance_wait).
 	pub async fn split_segment(&self, aspect: &str, id: u64, boundary: i64) -> Result<Option<u64>> {
+		aspect_name::validate(aspect)?;
 		self.writable()?;
 		let held = self.maintain(aspect).await?;
 		self.split_segment_held(&held, id, boundary).await
@@ -1867,6 +1945,7 @@ impl SegmentStore {
 	async fn split_segment_held(&self, held: &MaintGuard, id: u64, boundary: i64) -> Result<Option<u64>> {
 		self.writable()?;
 		let aspect = held.aspect();
+		aspect_name::validate(aspect)?;
 		let descriptor = self.index.all(aspect).await?.into_iter().find(|d| d.id == id).ok_or_else(|| anyhow::anyhow!("aspect {aspect:?} has no segment {id}"))?;
 		if !descriptor.time_sorted {
 			return Err(anyhow::anyhow!("segment {id} of aspect {aspect:?} is out of order; reconcile it before splitting"));
@@ -1916,6 +1995,7 @@ impl SegmentStore {
 	///
 	/// As [`reconcile_segment`](SegmentStore::reconcile_segment).
 	pub async fn reconcile_aspect(&self, aspect: &str) -> Result<usize> {
+		aspect_name::validate(aspect)?;
 		self.writable()?;
 		let held = self.maintain(aspect).await?;
 		self.reconcile_aspect_held(&held).await
@@ -1924,6 +2004,7 @@ impl SegmentStore {
 	/// [`reconcile_aspect`](Self::reconcile_aspect) under the maintenance lock `held`.
 	async fn reconcile_aspect_held(&self, held: &MaintGuard) -> Result<usize> {
 		self.writable()?;
+		aspect_name::validate(held.aspect())?;
 		let unsorted_ids: Vec<u64> = self.index.all(held.aspect()).await?.into_iter().filter(|d| !d.time_sorted).map(|d| d.id).collect();
 		let mut reconciled = 0;
 		for id in unsorted_ids {
@@ -1964,6 +2045,7 @@ impl SegmentStore {
 	/// As [`reconcile_aspect`](SegmentStore::reconcile_aspect); also propagates the
 	/// index read behind the backlog count.
 	pub async fn reconcile_aspect_if_unsorted_exceeds(&self, aspect: &str, threshold: usize) -> Result<Option<usize>> {
+		aspect_name::validate(aspect)?;
 		self.writable()?;
 		let held = self.maintain(aspect).await?;
 		self.reconcile_aspect_if_unsorted_exceeds_held(&held, threshold).await
@@ -1973,6 +2055,7 @@ impl SegmentStore {
 	/// under the maintenance lock `held`.
 	async fn reconcile_aspect_if_unsorted_exceeds_held(&self, held: &MaintGuard, threshold: usize) -> Result<Option<usize>> {
 		self.writable()?;
+		aspect_name::validate(held.aspect())?;
 		let threshold = threshold.max(1);
 		let unsorted = self.index.load_index(held.aspect()).await?.unsorted_count();
 		if unsorted < threshold {
@@ -2057,6 +2140,7 @@ impl SegmentStore {
 	/// As [`reconcile_segment`](SegmentStore::reconcile_segment); also propagates the
 	/// index read behind the segment list.
 	pub async fn reconcile_aspect_hot_cold(&self, aspect: &str, threshold: usize) -> Result<HotColdReconcile> {
+		aspect_name::validate(aspect)?;
 		self.writable()?;
 		let held = self.maintain(aspect).await?;
 		self.reconcile_aspect_hot_cold_held(&held, threshold).await
@@ -2066,6 +2150,7 @@ impl SegmentStore {
 	/// maintenance lock `held`.
 	async fn reconcile_aspect_hot_cold_held(&self, held: &MaintGuard, threshold: usize) -> Result<HotColdReconcile> {
 		self.writable()?;
+		aspect_name::validate(held.aspect())?;
 		let threshold = threshold.max(1);
 		let descriptors = self.index.all(held.aspect()).await?;
 		let hot_tail_id = descriptors.iter().map(|d| d.id).max();
@@ -2212,6 +2297,7 @@ impl SegmentStore {
 	///
 	/// As [`reconcile_overlaps`](SegmentStore::reconcile_overlaps).
 	pub async fn reconcile_overlaps_with_policy(&self, aspect: &str, policy: SplitPolicy) -> Result<usize> {
+		aspect_name::validate(aspect)?;
 		self.writable()?;
 		let held = self.maintain(aspect).await?;
 		self.reconcile_overlaps_held(&held, policy).await
@@ -2222,6 +2308,7 @@ impl SegmentStore {
 	async fn reconcile_overlaps_held(&self, held: &MaintGuard, policy: SplitPolicy) -> Result<usize> {
 		self.writable()?;
 		let aspect = held.aspect();
+		aspect_name::validate(aspect)?;
 		let descriptors = self.index.all(aspect).await?;
 		// Components of transitively time-overlapping segments: sort spans by (min_ts,
 		// max_ts), sweep, and start a new component whenever a span begins after the
@@ -2298,7 +2385,7 @@ impl SegmentStore {
 			// Drop the other members: control-plane row then the file (and its sidecar).
 			for &id in component.iter().skip(1) {
 				self.remove_descriptor(aspect, id).await?;
-				let victim = self.segment_path(aspect, id);
+				let victim = self.segment_path(aspect, id)?;
 				tokio::fs::remove_file(&victim).await.with_context(|| format!("removing merged-away segment {}", victim.display()))?;
 				// A merged-away segment's sidecar is now orphaned — drop it too.
 				self.remove_sidecar(aspect, id).await?;
@@ -2431,6 +2518,7 @@ impl SegmentStore {
 	/// A [`MaintenanceBusy`] error if another maintenance operation holds the aspect for
 	/// longer than [`maintenance_wait`](Self::maintenance_wait).
 	pub async fn squash_aspect(&self, aspect: &str) -> Result<usize> {
+		aspect_name::validate(aspect)?;
 		self.writable()?;
 		let held = self.maintain(aspect).await?;
 		self.squash_aspect_held(&held).await
@@ -2440,6 +2528,7 @@ impl SegmentStore {
 	async fn squash_aspect_held(&self, held: &MaintGuard) -> Result<usize> {
 		self.writable()?;
 		let aspect = held.aspect();
+		aspect_name::validate(aspect)?;
 		let descriptors = self.index.all(aspect).await?;
 		if descriptors.len() < 2 {
 			return Ok(0);
@@ -2461,7 +2550,7 @@ impl SegmentStore {
 		self.reseal_nullable_at(aspect, &schema, target, &all_ts, &all_vs, None).await?;
 		for &id in ids.iter().skip(1) {
 			self.remove_descriptor(aspect, id).await?;
-			let victim = self.segment_path(aspect, id);
+			let victim = self.segment_path(aspect, id)?;
 			tokio::fs::remove_file(&victim).await.with_context(|| format!("removing squashed-away segment {}", victim.display()))?;
 			// The squashed-away segment's sidecar is now orphaned — drop it too.
 			self.remove_sidecar(aspect, id).await?;
@@ -2489,6 +2578,7 @@ impl SegmentStore {
 	///
 	/// As [`squash_aspect`](SegmentStore::squash_aspect); also propagates the segment-count read.
 	pub async fn squash_aspect_if_exceeds(&self, aspect: &str, max_segments: usize) -> Result<Option<usize>> {
+		aspect_name::validate(aspect)?;
 		self.writable()?;
 		let held = self.maintain(aspect).await?;
 		self.squash_aspect_if_exceeds_held(&held, max_segments).await
@@ -2498,6 +2588,7 @@ impl SegmentStore {
 	/// lock `held`.
 	async fn squash_aspect_if_exceeds_held(&self, held: &MaintGuard, max_segments: usize) -> Result<Option<usize>> {
 		self.writable()?;
+		aspect_name::validate(held.aspect())?;
 		let max_segments = max_segments.max(1);
 		if self.index.count(held.aspect()).await? <= max_segments {
 			return Ok(None);
@@ -2575,6 +2666,7 @@ impl SegmentStore {
 	///
 	/// As [`squash_aspect`](SegmentStore::squash_aspect).
 	pub async fn squash_aspect_to_target_rows(&self, aspect: &str, target_rows: usize) -> Result<usize> {
+		aspect_name::validate(aspect)?;
 		self.writable()?;
 		let held = self.maintain(aspect).await?;
 		self.squash_aspect_to_target_rows_held(&held, target_rows).await
@@ -2585,6 +2677,7 @@ impl SegmentStore {
 	async fn squash_aspect_to_target_rows_held(&self, held: &MaintGuard, target_rows: usize) -> Result<usize> {
 		self.writable()?;
 		let aspect = held.aspect();
+		aspect_name::validate(aspect)?;
 		let target_rows = target_rows.max(1);
 		let descriptors = self.index.all(aspect).await?;
 		if descriptors.len() < 2 {
@@ -2630,7 +2723,7 @@ impl SegmentStore {
 			self.reseal_nullable_at(aspect, &schema, target, &all_ts, &all_vs, None).await?;
 			for &id in group.iter().skip(1) {
 				self.remove_descriptor(aspect, id).await?;
-				let victim = self.segment_path(aspect, id);
+				let victim = self.segment_path(aspect, id)?;
 				tokio::fs::remove_file(&victim).await.with_context(|| format!("removing compacted-away segment {}", victim.display()))?;
 				self.remove_sidecar(aspect, id).await?;
 				removed += 1;
@@ -2706,6 +2799,7 @@ impl SegmentStore {
 	/// As [`squash_aspect_to_target_rows`](SegmentStore::squash_aspect_to_target_rows); also
 	/// propagates the rollup read.
 	pub async fn squash_aspect_to_target_rows_if_fragmented(&self, aspect: &str, target_rows: usize) -> Result<Option<usize>> {
+		aspect_name::validate(aspect)?;
 		self.writable()?;
 		let held = self.maintain(aspect).await?;
 		self.squash_aspect_to_target_rows_if_fragmented_held(&held, target_rows).await
@@ -2715,6 +2809,7 @@ impl SegmentStore {
 	/// under the maintenance lock `held`.
 	async fn squash_aspect_to_target_rows_if_fragmented_held(&self, held: &MaintGuard, target_rows: usize) -> Result<Option<usize>> {
 		self.writable()?;
+		aspect_name::validate(held.aspect())?;
 		let target_rows = target_rows.max(1);
 		let Some(meta) = self.metadata.get(held.aspect()).await? else { return Ok(None) };
 		// Minimum segments to hold total_rows at the target; a fully-compacted aspect sits at
@@ -2783,6 +2878,7 @@ impl SegmentStore {
 	/// Propagates a libSQL read failure, a filesystem read error, or a
 	/// [`weft_physical_type::weftseg::WeftSegError`] for a corrupt/unreadable `.weftseg`.
 	pub async fn read_value_range(&self, aspect: &str, lo: &BigDecimal, hi: &BigDecimal) -> Result<(Vec<i64>, Vec<BigDecimal>)> {
+		aspect_name::validate(aspect)?;
 		let index = self.index.load_index(aspect).await?;
 		let mut timestamps = Vec::new();
 		let mut values = Vec::new();
@@ -3266,6 +3362,87 @@ mod tests {
 		let (rt, rv) = Segment::read_from(&on_disk).expect("decodes").decode();
 		assert_eq!(rt, ts);
 		assert_eq!(rv, vs);
+	}
+
+	/// Every `.weftseg`/`.weftpart` file anywhere under `dir`.
+	fn frames_under(dir: &Path) -> Vec<PathBuf> {
+		let mut found = Vec::new();
+		for entry in std::fs::read_dir(dir).expect("reads dir").map(|entry| entry.expect("dir entry")) {
+			let path = entry.path();
+			if path.is_dir() {
+				found.extend(frames_under(&path));
+			} else if path.extension().is_some_and(|ext| ext == "weftseg" || ext == "weftpart") {
+				found.push(path);
+			}
+		}
+		found
+	}
+
+	/// Regression: an aspect name is part of a frame's file name, so a name that leaves
+	/// `segments/` — a `..` traversal or an absolute path — must be refused by `declare` and
+	/// by every seal, and no frame may be written anywhere.
+	#[tokio::test]
+	async fn path_escaping_aspect_names_are_refused_and_write_nothing() {
+		let dir = TempDir::new().expect("tempdir");
+		let root = dir.path().join("store");
+		let store = SegmentStore::open(&root).await.expect("opens");
+		let absolute = dir.path().join("abs").to_string_lossy().into_owned();
+		for name in ["../x", "../../x", absolute.as_str()] {
+			assert!(store.declare(name, &schema()).await.is_err(), "declare({name:?}) must be refused");
+			assert!(store.seal(name, &schema(), &[0, 10], &[bd("1"), bd("2")]).await.is_err(), "seal({name:?}) must be refused");
+			assert!(store.seal_paged(name, &schema(), &[0, 10], &[bd("1"), bd("2")], 1).await.is_err(), "seal_paged({name:?}) must be refused");
+		}
+		let declared = store.list_declared_aspects().await.expect("lists");
+		drop(store);
+		assert!(declared.is_empty(), "nothing was declared: {declared:?}");
+		let frames = frames_under(dir.path());
+		assert!(frames.is_empty(), "no frame was written anywhere: {frames:?}");
+	}
+
+	/// A name declared before names were checked cannot be sealed, read or maintained (a
+	/// typed error, not a panic), and a store-wide sweep reports it in `failed` while it
+	/// still maintains every other aspect.
+	#[tokio::test]
+	async fn a_previously_declared_unsafe_name_errors_on_use_and_sweeps_report_it() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		// Written straight into the catalog, as an older version would have accepted it.
+		store.catalog().declare(store.database(), store.subject(), "../x", &schema()).await.expect("raw declare");
+		store.declare("ok", &schema()).await.expect("declares");
+		// Out of order and twice, so the sweeps below have work to do on the valid aspect.
+		store.seal_declared("ok", &[10, 0], &[bd("1"), bd("2")]).await.expect("seals");
+		store.seal_declared("ok", &[20, 30], &[bd("3"), bd("4")]).await.expect("seals");
+
+		let results = [store.seal_declared("../x", &[0], &[bd("1")]).await.map(|_| ()), store.read_time_range("../x", 0, 10).await.map(|_| ()), store.read_point("../x", 0).await.map(|_| ()), store.downsample_range("../x", 0, 10, Resolution::Seconds, &[Aggregation::Avg]).await.map(|_| ()), store.reconcile_aspect("../x").await.map(|_| ()), store.reconcile_overlaps("../x").await.map(|_| ()), store.squash_aspect("../x").await.map(|_| ())];
+		let reconcile = store.reconcile_all_over_threshold(1, MaintenanceWait::Skip).await;
+		let squash = store.squash_all_over_threshold(1, MaintenanceWait::Skip).await;
+		drop(store);
+		for result in results {
+			let err = result.expect_err("an unsafe name is refused");
+			let invalid = err.downcast_ref::<crate::InvalidAspectName>().unwrap_or_else(|| panic!("a typed InvalidAspectName, got: {err:#}"));
+			assert_eq!(invalid.name(), "../x");
+		}
+		let reconcile = reconcile.expect("the sweep runs despite the unsafe declaration");
+		assert_eq!(reconcile.aspects_scanned, 2, "both declared aspects are visited");
+		assert_eq!(reconcile.segments_reconciled, 1, "the valid aspect is still maintained");
+		let squash = squash.expect("the sweep runs despite the unsafe declaration");
+		assert_eq!(squash.segments_removed, 1, "the valid aspect is still squashed");
+		for failed in [&reconcile.failed, &squash.failed] {
+			assert_eq!(failed.len(), 1, "only the unsafe aspect fails: {failed:?}");
+			assert_eq!(failed[0].0, "../x");
+			assert!(failed[0].1.downcast_ref::<crate::InvalidAspectName>().is_some(), "reported as an InvalidAspectName: {:#}", failed[0].1);
+		}
+		assert!(frames_under(dir.path()).iter().all(|path| path.starts_with(dir.path().join("segments"))), "every frame stays under segments/");
+	}
+
+	#[test]
+	fn contained_file_refuses_paths_outside_the_directory() {
+		let dir = Path::new("store").join("segments");
+		assert_eq!(contained_file(&dir, "a-0.weftseg").expect("inside"), dir.join("a-0.weftseg"));
+		let absolute = std::env::temp_dir().join("abs-0.weftseg").to_string_lossy().into_owned();
+		for escaping in ["../a-0.weftseg", "x/../../a-0.weftseg", "sub/a-0.weftseg", "a/.", "..", absolute.as_str()] {
+			assert!(contained_file(&dir, escaping).is_err(), "{escaping:?} must be refused");
+		}
 	}
 
 	#[tokio::test]
@@ -5504,6 +5681,7 @@ mod tests {
 	/// stores answer every read identically. The store is the layer that makes the codec
 	/// reachable from a deployment, so this is the test that it is actually wired up.
 	#[tokio::test]
+	#[cfg(feature = "bitsliced-codec")]
 	async fn transposed_seal_reads_identically_and_only_changes_the_bytes() {
 		use weft_physical_type::frame_value_codec;
 

@@ -10,7 +10,7 @@ all-features = true
 ignore = []
 
 [licenses]
-# Permissive licenses only. WeftDB is MIT; anything copyleft needs an explicit exception.
+# Permissive licenses only. WeftDB is MIT OR Apache-2.0; anything copyleft needs an explicit exception.
 allow = [
 	"MIT",
 	"Apache-2.0",

@@ -1,5 +1,6 @@
 pub use aspect::{Aspect, AspectId};
 pub use aspect_catalog::AspectCatalog;
+pub use aspect_name::InvalidAspectName;
 pub use backup::{count_rows, expected_tables, is_complete_backup, is_staging_name, remove_empty_sidecars, restore_control_plane, restore_control_plane_with, retire_backup, scan_rows, snapshot_and_verify, snapshot_with_verify, sweep_backup_staging, sweep_backup_staging_at, user_tables, vacuum_into, verify_snapshot, BackupManifest, ManifestFile, RestoreReport, SnapshotReport, StagingSweep, VerifyMode, BACKUP_MANIFEST, CONTROL_PLANE_FILES, DELETING_PREFIX, MANIFEST_FORMAT, PARTIAL_PREFIX, RESTORE_DRILL_PREFIX, STAGING_PREFIXES, STAGING_SWEEP_AGE};
 pub use batches::{
 	batched_measurements::{analysis::Analysis, batched_distance::BatchDistance, BatchedMeasurement}, Batch, BatchId, BatchMetatdata, Batches
@@ -28,7 +29,7 @@ pub use segment_index::SegmentIndexStore;
 #[doc(hidden)]
 pub use segment_store::MaintenanceHold;
 pub use segment_store::{AspectStorageStats, CheckpointPolicy, ControlPlaneBackup, HotColdReconcile, HotColdSweep, MaintenanceBusy, MaintenanceWait, OverlapSweep, Poisoned, ReconcileSweep, SegmentStore, SquashSweep, StoreLocked, StoreStorageStats, TransposedPolicy, AMBIGUOUS_COMMIT_ENV, AMBIGUOUS_COMMIT_EXIT_CODE, DEFAULT_CHECKPOINT_MIN_ROWS, DEFAULT_MAINTENANCE_WAIT};
-pub use signal::{Distance, ErrVal, Signal, SignalType, Signals};
+pub use signal::{units_between, Distance, ErrVal, Signal, SignalType, Signals};
 pub use subject::{Subject, SubjectId};
 pub use transaction::{Transaction, TxId};
 pub use trend::Trend;
@@ -36,6 +37,7 @@ pub use trend::Trend;
 pub mod aspect;
 pub mod aspect_catalog;
 pub(crate) mod aspect_locks;
+pub mod aspect_name;
 pub mod backup;
 pub mod batches;
 pub mod cache;

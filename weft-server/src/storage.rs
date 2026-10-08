@@ -120,12 +120,15 @@ impl From<crate::interpolate::ApiError> for StorageError {
 }
 
 /// Classify a bridge read error: an undeclared aspect (its schema is unknown) is a
-/// `404`, everything else (libSQL prune, filesystem read, corrupt frame, IPC
-/// serialization) is a `500`.
+/// `404`, an aspect whose name is not safe as a file name (declared before names were
+/// checked) is a `400`, and everything else (libSQL prune, filesystem read, corrupt
+/// frame, IPC serialization) is a `500`.
 fn classify_read_error(err: &anyhow::Error) -> StorageError {
 	let message = err.to_string();
 	if message.contains("no declared schema") {
 		StorageError::NotFound(message)
+	} else if err.downcast_ref::<weftdb::InvalidAspectName>().is_some() {
+		StorageError::BadRequest(message)
 	} else {
 		StorageError::Internal(message)
 	}
@@ -323,13 +326,13 @@ pub struct ParquetIngestParams {
 
 /// Classify a Parquet-ingest error: an undeclared aspect is a `404`; a malformed
 /// Parquet body, a batch missing WeftDB's columns, or a value unrepresentable under the
-/// declared encoding/tolerance (hard constraint #4) are client-data problems →
-/// `400`; anything else (filesystem, libSQL) is a `500`.
+/// declared encoding/tolerance (hard constraint #4), and an aspect name that is not safe
+/// as a file name are client-data problems → `400`; anything else (filesystem, libSQL) is a `500`.
 fn classify_ingest_error(err: &anyhow::Error) -> StorageError {
 	let message = err.to_string();
 	if message.contains("no declared schema") {
 		StorageError::NotFound(message)
-	} else if message.contains("seal failed") || message.contains("paged seal failed") || message.contains("parquet error") || message.contains("is missing the") || message.contains("expected Arrow") || message.contains("required metadata") || message.contains("unrecognized time unit") || message.contains("does not parse") || message.contains("out-of-order timestamp") {
+	} else if message.contains("seal failed") || message.contains("paged seal failed") || message.contains("parquet error") || message.contains("is missing the") || message.contains("expected Arrow") || message.contains("required metadata") || message.contains("unrecognized time unit") || message.contains("does not parse") || message.contains("out-of-order timestamp") || err.downcast_ref::<weftdb::InvalidAspectName>().is_some() {
 		StorageError::BadRequest(message)
 	} else {
 		StorageError::Internal(message)

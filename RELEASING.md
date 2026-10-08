@@ -65,6 +65,9 @@ The tag triggers `.github/workflows/release.yml`, which builds `weft-server`,
 | `x86_64-pc-windows-msvc` | `windows-latest` |
 
 Each is uploaded as a `.tar.gz` (or `.zip` on Windows) with a `.sha256` next to it.
+Every archive holds the three binaries, `README.md`, both license files (`LICENSE-MIT`,
+`LICENSE-APACHE`), `NOTICE`, and the `THIRD-PARTY-NOTICES` of `weft-physical-type` and
+`weft-reduce`, whose Apache-2.0 portions are compiled into the binaries.
 
 The release is created as a **draft**: review the notes and the attached archives, then
 publish it. If the workflow needs re-running against an existing tag, dispatch it

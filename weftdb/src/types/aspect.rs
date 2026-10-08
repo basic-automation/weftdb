@@ -1099,6 +1099,12 @@ impl AspectStructure for Aspect {
 
 	#[instrument]
 	async fn new_dictionary(&self, name: &str, description: &str, constraints: &DictionaryConstraints) -> Result<()> {
+		// The step interpolation is stored as text and validated by `Spline::from_str` when
+		// it is read back (`get_dictionary_metadata`), so refuse one that could not load.
+		if let Some(steps) = constraints.steps() {
+			steps.interpolation().validate().map_err(|e| anyhow::anyhow!("Invalid step interpolation for dictionary '{name}': {e}"))?;
+		}
+
 		// Extract db_name from path (path is like C:\Users\...\weft_data\{db_name}\{subject}\{aspect})
 		// Use the parent's parent to get db_name from the aspect path
 		let path = std::path::Path::new(&self.path);

@@ -17,7 +17,7 @@ members = [
 # its own edition and description; everything else is released in lockstep.
 [workspace.package]
 version = "0.1.0"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 authors = ["Justin Icenhour"]
 repository = "https://github.com/basic-automation/weftdb"
 readme = "README.md"
@@ -53,7 +53,7 @@ crossterm = "0.29"
 sysinfo = "0.39"
 weftdb = { path = "./weftdb", version = "0.1.0" }
 # Developed in its own repository (github.com/basic-automation/splimes), on its own roadmap.
-splimes = "0.1"
+splimes = "1"
 weft-line-protocol = { path = "./weft-line-protocol", version = "0.1.0" }
 weft-physical-type = { path = "./weft-physical-type", version = "0.1.0" }
 weft-reduce = { path = "./weft-reduce", version = "0.1.0" }
