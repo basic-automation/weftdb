@@ -50,7 +50,7 @@ jobs:
         id: toolchain
         shell: bash
         run: echo "version=$(tr -d '[:space:]' < .github/release-toolchain)" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
         with:
           toolchain: ${{ steps.toolchain.outputs.version }}
           components: clippy
@@ -116,7 +116,7 @@ jobs:
         id: toolchain
         shell: bash
         run: echo "version=$(tr -d '[:space:]' < .github/release-toolchain)" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
         with:
           toolchain: ${{ steps.toolchain.outputs.version }}
       - uses: Swatinem/rust-cache@v2
@@ -151,7 +151,7 @@ jobs:
         id: toolchain
         shell: bash
         run: echo "version=$(tr -d '[:space:]' < .github/release-toolchain)" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
         with:
           toolchain: ${{ steps.toolchain.outputs.version }}
       - uses: Swatinem/rust-cache@v2
@@ -179,7 +179,7 @@ jobs:
         id: toolchain
         shell: bash
         run: echo "version=$(tr -d '[:space:]' < .github/release-toolchain)" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
         with:
           toolchain: ${{ steps.toolchain.outputs.version }}
       - uses: Swatinem/rust-cache@v2
@@ -198,7 +198,7 @@ jobs:
         id: toolchain
         shell: bash
         run: echo "version=$(tr -d '[:space:]' < .github/release-toolchain)" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
         with:
           toolchain: ${{ steps.toolchain.outputs.version }}
       - uses: Swatinem/rust-cache@v2
@@ -232,11 +232,11 @@ jobs:
     name: actionlint + shellcheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: actionlint
-        uses: docker://rhysd/actionlint:1.7.12
+        uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # 1.7.12
         with:
           args: -color
       - name: shellcheck

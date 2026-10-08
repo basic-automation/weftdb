@@ -14,6 +14,8 @@ name: Release
 # scripts/release/ from that commit: verify refuses one dispatched from anywhere but its
 # tag, and every job that runs the scripts checks it has that commit's copy. User input
 # reaches scripts only through env, never through ${{ }} inside a script.
+#
+# Third-party actions are pinned to full commit SHAs (Dependabot keeps them current).
 
 on:
   push:
@@ -65,7 +67,7 @@ jobs:
     steps:
       # Every branch and tag, which verify.sh checks the tag and the commit's ancestry
       # against. The scripts run are those of the commit this workflow runs from.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -148,7 +150,7 @@ jobs:
 
       - name: Upload the release notes
         if: steps.mode.outputs.mode == 'tag'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-notes
           path: ${{ runner.temp }}/NOTES.md
@@ -201,7 +203,7 @@ jobs:
             target: x86_64-pc-windows-msvc
     steps:
       - name: Check out the verified commit
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.verify.outputs.sha }}
           path: src
@@ -210,7 +212,7 @@ jobs:
       # The commit this workflow runs from. For a release that is the verified commit
       # (asserted below); a dry run may try new scripts on an older commit.
       - name: Check out the release scripts
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: tools
           persist-credentials: false
@@ -245,7 +247,7 @@ jobs:
           fi
           echo "version=$toolchain" >>"$GITHUB_OUTPUT"
 
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
         with:
           toolchain: ${{ steps.toolchain.outputs.version }}
           targets: ${{ matrix.target }}
@@ -287,7 +289,7 @@ jobs:
           set -euo pipefail
           tools/scripts/release/stage.sh archive "$TARGET" "$LABEL" "$BIN_DIR" src dist
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: weftdb-${{ matrix.target }}
           path: dist/
@@ -299,7 +301,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out the release scripts
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: tools
           persist-credentials: false
@@ -316,7 +318,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: weftdb-*
           path: dist
@@ -337,7 +339,7 @@ jobs:
           tools/scripts/release/stage.sh sums dist "$LABEL" "${targets[@]}"
           (cd dist && sha256sum -c SHA256SUMS)
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: SHA256SUMS
           path: dist/SHA256SUMS
@@ -358,7 +360,7 @@ jobs:
       # No credentials kept: a third-party action runs in this job, and the repository is
       # public, so re-reading the tag below needs none.
       - name: Check out the verified commit
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.verify.outputs.sha }}
           persist-credentials: false
@@ -383,18 +385,18 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: weftdb-*
           path: dist
           merge-multiple: true
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: SHA256SUMS
           path: dist
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-notes
           path: notes
@@ -467,7 +469,7 @@ jobs:
           printf '\n---\n\n%s\n' \
             "The archives attached to this release were built from commit \`$SHA\`." >>notes/NOTES.md
 
-      - uses: softprops/action-gh-release@v3
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ needs.verify.outputs.tag }}
           name: ${{ needs.verify.outputs.tag }}

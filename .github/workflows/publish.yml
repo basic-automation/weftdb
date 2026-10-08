@@ -15,6 +15,8 @@ name: Publish to crates.io
 # Create `crates-io` (required reviewers; deployments limited to v* tags) before the
 # first dispatch of this workflow, dry run included: whether GitHub creates the
 # environment for a job its `if:` skips is not documented. See RELEASING.md.
+#
+# Third-party actions are pinned to full commit SHAs (Dependabot keeps them current).
 on:
   workflow_dispatch:
     inputs:
@@ -42,16 +44,16 @@ jobs:
     if: inputs.dry_run
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Read the release toolchain
         id: toolchain
         run: echo "version=$(tr -d '[:space:]' < .github/release-toolchain)" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
         with:
           toolchain: ${{ steps.toolchain.outputs.version }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Dry run
         run: ./scripts/publish.sh
 
@@ -79,7 +81,7 @@ jobs:
           fi
 
       # Every branch and tag: verify.sh checks the commit's ancestry against them.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ inputs.tag }}
           fetch-depth: 0
@@ -102,7 +104,7 @@ jobs:
       - name: Read the release toolchain
         id: toolchain
         run: echo "version=$(tr -d '[:space:]' < .github/release-toolchain)" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
         with:
           toolchain: ${{ steps.toolchain.outputs.version }}
 
