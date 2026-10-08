@@ -291,10 +291,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   active`), and control-plane writes (registering or creating a dictionary, inserting a
   pattern, removing an event, …) returned that error, `Rollback failed: …`, in place of
   the conflict. They now return the statement's error and log the failed rollback as a
-  warning. `weftdb::error::is_transient_mvcc_error` recognises the conflict as
-  retryable: it also matches Turso's `Busy`, `BusySnapshot` and write-write conflict
-  errors anywhere in an error's chain (it matched only WeftDB's own
-  `TransientMvccError`), and a failed commit keeps Turso's error in the chain.
+  warning. `weftdb::error::is_transient_mvcc_error` also matches Turso's `Busy`,
+  `BusySnapshot` and write-write conflict errors anywhere in an error's chain (it
+  matched only WeftDB's own `TransientMvccError`), so it recognises the conflict as
+  retryable where the returned error keeps Turso's error in its chain: from registering
+  or creating a dictionary (`set_dictionary_metadata`, `register_dictionary_if_absent`,
+  `AspectStructure::new_dictionary`) and from a failed commit. The other control-plane
+  writes still return the statement's error as text only, which it does not recognise.
 - **Quadratic GPU interpolation failed on GPUs without f64 support** (Apple Silicon,
   most integrated GPUs, Windows WARP). The f32 fallback shader did not parse, so wgpu
   panicked.
@@ -339,6 +342,19 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `Result<String>` (they returned the path), and `list_dictionaries` skips a `.db` file
   whose name is not a valid dictionary name, with a warning. No `weft-server` endpoint
   takes a dictionary name.
+
+  **Breaking for existing data:** a dictionary an earlier release created under a name
+  these rules now refuse (a leading `.`, a trailing `.` or space, a Windows device name
+  on any OS such as `aux`, `con`, `com1` or `nul.x`, a control, bidirectional or
+  invisible formatting character, or more than 160 bytes) can no longer be reached.
+  Every operation on it returns `InvalidDictionaryName`, `load_dictionary` fails the
+  pipeline run that uses it, and `list_dictionaries` leaves it out with a warning.
+  Nothing is deleted. To recover one, stop everything that uses the database, rename
+  `<aspect>/dictionaries/<name>.db`, and the `<name>.db-log` and `<name>.db-wal` files
+  beside it if present, to a valid name, then set that name in the `name` column of the
+  dictionary's `dictionary_metadata` rows, in the `dictionary_name` column of the
+  `pipeline_dictionaries` rows in the aspect's `pipeline.db`, and in the pipeline
+  configuration (`PipelineRunConfig`, `PipelineBuilder`) that names it.
 - **API callers can no longer make backup retention delete the daemon's snapshots.**
   `WEFT_BACKUP_KEEP` retention keeps the newest `backup-<digits>` directories by their
   embedded timestamp, and `POST /api/v1/storage/backup` created directories in that same
