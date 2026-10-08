@@ -39,8 +39,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      # Stable jobs build with the release compiler, pinned in one file that the release
+      # workflow reads too, so CI tests exactly what ships.
+      - name: Read the release toolchain
+        id: toolchain
+        shell: bash
+        run: echo "version=$(tr -d '[:space:]' < .github/release-toolchain)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
           components: clippy
       - uses: Swatinem/rust-cache@v2
       # Gated on the categories that catch defects. `style`/`pedantic`/`nursery`
@@ -56,6 +63,8 @@ jobs:
           RUSTFLAGS: ""
 
   # The MSRV is a published promise in Cargo.toml (rust-version); prove it still holds.
+  # Pinned here on purpose, not read from .github/release-toolchain: this job tests the
+  # oldest supported compiler, not the release one.
   msrv:
     name: msrv (1.95)
     runs-on: ubuntu-latest
@@ -98,7 +107,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1 vulkan-tools
           vulkaninfo --summary || true
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Read the release toolchain
+        id: toolchain
+        shell: bash
+        run: echo "version=$(tr -d '[:space:]' < .github/release-toolchain)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --workspace --all-targets --locked
@@ -119,7 +134,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Read the release toolchain
+        id: toolchain
+        shell: bash
+        run: echo "version=$(tr -d '[:space:]' < .github/release-toolchain)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
       - uses: Swatinem/rust-cache@v2
       - name: Build docs (deny broken intra-doc links)
         run: cargo doc --workspace --no-deps --locked
@@ -132,7 +153,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Read the release toolchain
+        id: toolchain
+        shell: bash
+        run: echo "version=$(tr -d '[:space:]' < .github/release-toolchain)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo package --workspace --no-verify --locked
 
@@ -146,3 +173,21 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories bans licenses sources
+
+  # The workflows (actionlint, which also shellchecks their run: blocks) and the release
+  # scripts (shellcheck, then their tests against a throwaway repository).
+  release-scripts:
+    name: actionlint + shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: actionlint
+        uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: -color
+      - name: shellcheck
+        run: shellcheck --version && shellcheck scripts/release/*.sh
+      - name: verify.sh tests
+        run: scripts/release/test-verify.sh
+      - name: stage.sh tests
+        run: scripts/release/test-stage.sh
