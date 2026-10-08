@@ -622,13 +622,28 @@ detection within Y% and improving historical query latency by Z."*
       adopt for decimal-shaped f64 columns, with a per-column fallback to Chimp/ALP-RD when the
       exception rate is high (ALP's own sampling picks this). Mirror the Parquet layout per the
       frozen-wire-layout item above.
-    - [ ] **NEW — per-vector scale is the lever the realized exact path is missing.** On the BTC
+    - [x] **DONE (2026-10-08, advisory) — per-vector scale is the lever the realized exact path is missing.** On the BTC
       window, `recommend_encoding` must declare **scale 8 for the whole column** because a few
       closes carry 8 decimals, which inflates every FOR residual to ~33 bits. ALP picks an exponent
       **per 1024 vector** and pushes the 0.01% odd values to exceptions, reaching 15.35 bits. A
       `ScaledI64` codec with a per-tile scale and an exception list would keep the `BigDecimal`
       logical type exact, with no float on the path, and should approach ALP's figure. Measure it on
       the same bench before deciding between that and ALP.
+      Shipped as the **decimal-exponent FOR** (`timestamp::dfor_bitpack_{bytes,encode,decode,decode_range}`
+      + `ColumnEncoding::dfor_value_bytes`). Each 64-value block factors out its common power of ten
+      (the fewest trailing decimal zeros of any mantissa in it, stored in one header byte), then
+      FOR-packs. It is exact integer arithmetic, so no float and no exception list are needed. Only 1
+      of 16,384 BTC blocks had to keep scale 8. Measured (`alp_vs_f64_codecs`): **btc_close 13.58 b**
+      vs realized `scaled_for` 33.74 b (**2.48× smaller**) vs ALP 15.35 b; decode 2.10 ms vs
+      1.78 ms (FOR) / 0.67 ms (ALP). **sensor_2dp 5.64 b vs 5.51 b**: it loses by the header byte
+      when nothing factors out, so a selector must pick it only when strictly smallest.
+    - [ ] **NEXT — realize the decimal-exponent FOR as `VAL_CODEC_DFOR` (owner sign-off: headline
+      bytes/point change).** Add it to `best_value_codec`'s strict-smallest race and wire a
+      writer/reader selector byte plus the range and gather paths, mirroring `VAL_CODEC_FOR`. Then re-run
+      `ingest_path_profile_legacy_vs_columnar` on the real corpus: the 4.22 B/point realized headline
+      should fall, since the value column is most of it. Expected value column: ~13.6 b vs ~33.7 b.
+      Meanwhile surface `advisory_dfor_value_bytes` in the `weft-bench` `StorageEstimate` beside
+      `advisory_best_f64_bytes`.
     - [x] **DONE (2026-10-08) — the scalar FOR/blocked decode is the read-path bottleneck at wide widths.**
       `for_bitpack_decode` takes **70.8 ms per 1 Mi values at ~33 bits** (11.3 ms at ~5.5 bits). It
       loops per bit per value, so cost scales with width. The `fastlanes` unpack inside the ALP arm

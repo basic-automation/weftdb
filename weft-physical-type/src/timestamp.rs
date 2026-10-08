@@ -1049,6 +1049,131 @@ pub fn for_bitpack_decode_range(bytes: &[u8], block: usize, count: usize, start:
 	out
 }
 
+/// The largest decimal exponent a [`dfor_bitpack_encode`] block may factor out: `10^18` is the
+/// largest power of ten an `i64` holds.
+const DFOR_MAX_EXPONENT: u32 = 18;
+
+/// How many trailing decimal zeros `v` has, capped at [`DFOR_MAX_EXPONENT`] (`0` has the cap:
+/// it is a multiple of every power of ten).
+const fn decimal_trailing_zeros(v: i64) -> u32 {
+	let mut m = v.unsigned_abs();
+	if m == 0 {
+		return DFOR_MAX_EXPONENT;
+	}
+	let mut k = 0;
+	while k < DFOR_MAX_EXPONENT && m.is_multiple_of(10) {
+		m /= 10;
+		k += 1;
+	}
+	k
+}
+
+/// One decimal-exponent FOR block's header choices: the shared exponent `k`, the reduced
+/// mantissas `v / 10^k`, their minimum, and the residual width.
+fn dfor_block(chunk: &[i64]) -> (u32, Vec<i64>, i64, usize) {
+	let k = chunk.iter().map(|&v| decimal_trailing_zeros(v)).min().unwrap_or(0);
+	let divisor = 10_i64.pow(k);
+	let reduced: Vec<i64> = chunk.iter().map(|&v| v / divisor).collect();
+	let min = reduced.iter().copied().min().unwrap_or(0);
+	let width = reduced.iter().map(|&v| 64 - for_residual(v, min).leading_zeros()).max().unwrap_or(0) as usize;
+	(k, reduced, min, width)
+}
+
+/// Estimated footprint of a **decimal-exponent Frame-of-Reference** per-block bit-packing
+/// (advisory; roadmap Phase 6.1, "per-vector scale is the lever the realized exact path is
+/// missing").
+///
+/// A `ScaledI64` column carries one scale for the whole column, so a single value with
+/// eight decimals forces every mantissa of a two-decimal price series to carry six trailing
+/// zeros, about 20 wasted bits per value. This codec factors each block's common power of
+/// ten out first: `k` = the fewest trailing decimal zeros of any mantissa in the block, then
+/// FOR-packs `v / 10^k`. It is ALP's per-vector exponent kept in exact integer arithmetic, so
+/// the `BigDecimal` logical type never passes through a float. Per block: the zig-zag varint
+/// reference, one exponent byte, one width byte, and `ceil(len * width / 8)` data bytes.
+#[must_use]
+pub fn dfor_bitpack_bytes(values: &[i64], block: usize) -> usize {
+	values.chunks(block.max(1))
+		.map(|chunk| {
+			let (_, _, min, width) = dfor_block(chunk);
+			zigzag_varint_len(min) + 2 + (chunk.len() * width).div_ceil(8)
+		})
+		.sum()
+}
+
+/// Decimal-exponent Frame-of-Reference per-block encode (see [`dfor_bitpack_bytes`]).
+///
+/// Block by block: a zig-zag-varint reference (the minimum reduced mantissa), a one-byte
+/// decimal exponent `k`, a one-byte width, and the unsigned residuals of `v / 10^k`
+/// bit-packed LSB-first. The emitted length is exactly [`dfor_bitpack_bytes`]; the exact
+/// inverse is [`dfor_bitpack_decode`] given the same `block` and count. An empty input
+/// yields an empty buffer.
+#[must_use]
+pub fn dfor_bitpack_encode(values: &[i64], block: usize) -> Vec<u8> {
+	let mut out = Vec::new();
+	for chunk in values.chunks(block.max(1)) {
+		let (k, reduced, min, width) = dfor_block(chunk);
+		for_push_uvarint(&mut out, zigzag(min));
+		// Both are at most 64 by construction, so the conversions never saturate.
+		out.push(u8::try_from(k).unwrap_or(0));
+		out.push(u8::try_from(width).unwrap_or(64));
+		let start = out.len();
+		out.resize(start + (chunk.len() * width).div_ceil(8), 0);
+		for (i, &v) in reduced.iter().enumerate() {
+			write_bits(&mut out[start..], i * width, for_residual(v, min), width);
+		}
+	}
+	out
+}
+
+/// Read one decimal-exponent FOR block header at `*pos` (advancing past it): the reference,
+/// the multiplier `10^k`, the width, and the data length for a block of `block_len` values.
+/// A corrupt exponent past [`DFOR_MAX_EXPONENT`] is clamped rather than overflowing.
+fn dfor_read_header(bytes: &[u8], pos: &mut usize, block_len: usize) -> (i64, i64, usize, usize) {
+	let min = unzigzag(for_read_uvarint(bytes, pos));
+	let k = u32::from(bytes.get(*pos).copied().unwrap_or(0)).min(DFOR_MAX_EXPONENT);
+	let width = usize::from(bytes.get(*pos + 1).copied().unwrap_or(0));
+	*pos += 2;
+	(min, 10_i64.pow(k), width, (block_len * width).div_ceil(8))
+}
+
+/// Reconstruct `count` values from a decimal-exponent FOR buffer.
+///
+/// The exact inverse of [`dfor_bitpack_encode`] given the same `block` and `count`. Bytes past the buffer read as
+/// `0`, and the multiply wraps rather than panicking on a corrupt block.
+#[must_use]
+pub fn dfor_bitpack_decode(bytes: &[u8], block: usize, count: usize) -> Vec<i64> {
+	dfor_bitpack_decode_range(bytes, block, count, 0, count)
+}
+
+/// **Block-level random access** over a decimal-exponent FOR buffer.
+///
+/// Decodes only the `len` values at global index `start`. Blocks before `start` are skipped by their headers alone.
+/// Equals `dfor_bitpack_decode(bytes, block, count)[start..start + len]` (clamped to `count`).
+#[must_use]
+pub fn dfor_bitpack_decode_range(bytes: &[u8], block: usize, count: usize, start: usize, len: usize) -> Vec<i64> {
+	let block = block.max(1);
+	let end = start.saturating_add(len).min(count);
+	if start >= end {
+		return Vec::new();
+	}
+	let mut out = Vec::with_capacity(end - start);
+	let mut pos = 0_usize;
+	let mut idx = 0_usize;
+	while idx < end {
+		let block_len = block.min(count - idx);
+		let (min, multiplier, width, data_len) = dfor_read_header(bytes, &mut pos, block_len);
+		if idx + block_len > start {
+			let data = bytes.get(pos..pos + data_len).unwrap_or(&[]);
+			let lo = start.saturating_sub(idx);
+			let hi = (end - idx).min(block_len);
+			out.extend((lo..hi).map(|row| for_reconstruct(min, read_bits(data, row * width, width)).wrapping_mul(multiplier)));
+		}
+		pos += data_len;
+		idx += block_len;
+	}
+	out
+}
+
 /// Values requested from one block/tile at or above which a gather decodes the **whole**
 /// block/tile once and indexes it, rather than extracting each value individually.
 ///
@@ -2357,6 +2482,41 @@ mod tests {
 		// Empty stream encodes to nothing and decodes to nothing.
 		assert!(transpose_bitpack_encode(&[], 64).is_empty());
 		assert_eq!(transpose_bitpack_decode(&[], 64, 0), Vec::<i64>::new());
+	}
+
+	#[test]
+	fn dfor_round_trips_and_factors_out_each_blocks_decimal_exponent() {
+		// Two-decimal prices at scale 8 (six trailing zeros each) with one eight-decimal
+		// outlier in the second block: the first block factors out 10^6, the outlier's block
+		// keeps k = 0, and every value round-trips exactly.
+		let mut prices: Vec<i64> = (0..256_i64).map(|i| (350_000 + (i * 37) % 900) * 1_000_000).collect();
+		prices[100] = 35_123_456_789;
+		for block in [1_usize, 7, 64, 256, 1024] {
+			let bytes = dfor_bitpack_encode(&prices, block);
+			assert_eq!(bytes.len(), dfor_bitpack_bytes(&prices, block), "estimate equals encoding (block {block})");
+			assert_eq!(dfor_bitpack_decode(&bytes, block, prices.len()), prices, "round trip (block {block})");
+			for (start, len) in [(0, 1), (63, 3), (99, 4), (200, 100), (256, 5)] {
+				let end = (start + len).min(prices.len());
+				assert_eq!(dfor_bitpack_decode_range(&bytes, block, prices.len(), start, len), prices[start.min(end)..end], "range {start}+{len} (block {block})");
+			}
+		}
+		let (k_clean, _, _, _) = dfor_block(&prices[..64]);
+		let (k_outlier, _, _, _) = dfor_block(&prices[64..128]);
+		assert_eq!((k_clean, k_outlier), (6, 0));
+		// The exponent is what wins: on a clean block, under half of plain FOR; over the whole
+		// column (outlier block included), still strictly smaller.
+		assert!(dfor_bitpack_bytes(&prices[..64], 64) * 2 < for_bitpack_bytes(&prices[..64], 64));
+		assert!(dfor_bitpack_bytes(&prices, 64) < for_bitpack_bytes(&prices, 64));
+		// Extremes, zeros, negatives and an empty stream.
+		let edge = [i64::MIN, i64::MAX, 0, -1_000, 1_000_000_000_000_000_000, -10, 0];
+		assert_eq!(dfor_bitpack_decode(&dfor_bitpack_encode(&edge, 4), 4, edge.len()), edge);
+		let zeros = [0_i64; 70];
+		assert_eq!(dfor_bitpack_decode(&dfor_bitpack_encode(&zeros, 64), 64, zeros.len()), zeros);
+		assert_eq!(dfor_bitpack_encode(&[], 64), Vec::<u8>::new());
+		// A corrupt exponent byte is clamped instead of overflowing `10^k`.
+		let mut corrupt = dfor_bitpack_encode(&[5, 7], 64);
+		corrupt[1] = 200;
+		let _ = dfor_bitpack_decode(&corrupt, 64, 2);
 	}
 
 	#[test]

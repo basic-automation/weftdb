@@ -1,7 +1,8 @@
 //! ALP adopt-or-drop benchmark (roadmap Phase 6.1, "use the `alp` crate to get the ALP adopt
 //! benchmarked, rather than hand-rolling it first"): bytes/value **and** decode throughput for
 //! classic ALP against every f64 codec WeftDB ships (Gorilla, Chimp, Chimp128, Elf) and against
-//! the realized exact path (`ScaledI64` mantissas under the default value-codec selector).
+//! the realized exact path (`ScaledI64` mantissas under the default value-codec selector), and
+//! the advisory decimal-exponent FOR (`dfor`) over the same exact mantissas.
 //!
 //! ## The ALP arm
 //!
@@ -34,7 +35,7 @@ use bigdecimal::BigDecimal;
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use fastlanes::BitPacking;
 use weft_physical_type::{
-	column::recommend_encoding, floatcodec::{chimp128_f64_decode, chimp128_f64_encode, chimp_f64_decode, chimp_f64_encode, elf_f64_decode, elf_f64_encode, xor_f64_decode, xor_f64_encode}, timestamp::{blocked_bitpack_decode, blocked_bitpack_encode, for_bitpack_decode, for_bitpack_encode, BLOCKED_BITPACK_BLOCK}, PhysicalType
+	column::recommend_encoding, floatcodec::{chimp128_f64_decode, chimp128_f64_encode, chimp_f64_decode, chimp_f64_encode, elf_f64_decode, elf_f64_encode, xor_f64_decode, xor_f64_encode}, timestamp::{blocked_bitpack_decode, blocked_bitpack_encode, dfor_bitpack_decode, dfor_bitpack_encode, for_bitpack_decode, for_bitpack_encode, BLOCKED_BITPACK_BLOCK}, PhysicalType
 };
 
 const N: usize = 1 << 20;
@@ -163,6 +164,23 @@ fn real_doubles() -> Corpus {
 	from_floats("real_doubles", floats)
 }
 
+/// The advisory decimal-exponent FOR arm: the same exact mantissas as the realized arm, with
+/// each 64-value block's common power of ten factored out before FOR packing.
+fn weft_dfor(corpus: &Corpus) -> Option<(Vec<u8>, u8)> {
+	let encoding = recommend_encoding(&corpus.decimals, &BigDecimal::from(0));
+	let PhysicalType::ScaledI64 { scale } = encoding.physical_type else {
+		return None;
+	};
+	let bytes = dfor_bitpack_encode(&encoding.scaled_i64_mantissas()?, BLOCKED_BITPACK_BLOCK);
+	assert_eq!(Some(bytes.len()), encoding.dfor_value_bytes(), "the bench must size what the advisory estimate sizes");
+	Some((bytes, scale))
+}
+
+fn weft_dfor_decode(bytes: &[u8], scale: u8) -> Vec<f64> {
+	let divisor = 10_f64.powi(i32::from(scale));
+	dfor_bitpack_decode(bytes, BLOCKED_BITPACK_BLOCK, N).iter().map(|&m| m as f64 / divisor).collect()
+}
+
 /// The realized exact path for a corpus: the codec the default selector picks, and a decoder
 /// that yields the same `f64`s (`mantissa / 10^scale` is one correctly rounded division, so it
 /// equals parsing the decimal while the mantissa is below 2^53).
@@ -220,6 +238,10 @@ fn bench_alp(c: &mut Criterion) {
 		if let Some((codec, bytes, scale)) = &scaled {
 			assert_eq!(weft_scaled_decode(codec, bytes, *scale), *values, "{}: the realized scaled path must reproduce the floats", corpus.name);
 		}
+		let dfor = weft_dfor(corpus);
+		if let Some((bytes, scale)) = &dfor {
+			assert_eq!(weft_dfor_decode(bytes, *scale), *values, "{}: the decimal-exponent FOR must reproduce the floats", corpus.name);
+		}
 
 		eprintln!("== {} ({N} values) — bits/value", corpus.name);
 		eprintln!("  alp (FOR + fastlanes pack) {:>7.3}   exceptions {exceptions} ({:.3}%)", bits_per_value(alp_bytes(&alp)), exceptions as f64 * 100.0 / N as f64);
@@ -233,6 +255,9 @@ fn bench_alp(c: &mut Criterion) {
 		}
 		if let Some((codec, bytes, scale)) = &scaled {
 			eprintln!("  weft {codec} (scale {scale})  {:>7.3}", bits_per_value(bytes.len()));
+		}
+		if let Some((bytes, _)) = &dfor {
+			eprintln!("  weft dfor (advisory)       {:>7.3}", bits_per_value(bytes.len()));
 		}
 
 		let mut group = c.benchmark_group(format!("f64_decode_1mi/{}", corpus.name));
@@ -253,6 +278,9 @@ fn bench_alp(c: &mut Criterion) {
 		}
 		if let Some((codec, bytes, scale)) = &scaled {
 			group.bench_function(format!("weft_{codec}"), |b| b.iter(|| black_box(weft_scaled_decode(codec, black_box(bytes), *scale))));
+		}
+		if let Some((bytes, scale)) = &dfor {
+			group.bench_function("weft_dfor", |b| b.iter(|| black_box(weft_dfor_decode(black_box(bytes), *scale))));
 		}
 		group.finish();
 	}
