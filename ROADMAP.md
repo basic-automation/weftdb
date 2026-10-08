@@ -1372,7 +1372,11 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
       closes, a 128-instant batch over 50 reps has p50 **2.43 ms** single-block vs **0.90 ms** paged
       (8,192 rows/page), both PASS. The single-block frame is 4.2 MB, and every read CRCs all of it.
       That is real-data evidence for the per-block checksum item.
-    - [ ] Residue: `range_fetch` / `downsample` still read only generated corpora.
+    - [x] **DONE (2026-10-08) — `range_fetch` on a real corpus:** `--rf-csv <FILE>`. On 1M real BTC
+      closes, 32 windows of 100 rows over 30 reps have p50 **60.8 ms** single-block vs **17.8 ms**
+      paged (8,192 rows/page), both PASS. That is ~1.9 ms per window, dominated by the whole-frame
+      CRC of the 4.2 MB frame.
+    - [ ] Residue: `downsample` still reads only a generated series.
 
 - [x] **DONE (2026-07-20) — BUG ROOT-CAUSED + FIXED: the "flaky GPU interpolation tests" were never a
   GPU bug.** The roadmap offered two hypotheses — a real GPU race, or an unsound check. **Both the

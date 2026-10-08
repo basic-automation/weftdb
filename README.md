@@ -1183,7 +1183,8 @@ What it does today:
   a 128-instant batch at p50 **2.43 ms** single-block vs **0.90 ms** paged at 8,192 rows/page,
   `weft-bench --point-lookup --pl-csv database/datasets/btc_1min.csv --csv-value-col 4
   --csv-skip 3000000 --pl-rows 1000000 --pl-queries 128 [--pl-rows-per-page 8192] --reps 50`);
-  **`range_fetch`** (`--range-fetch`) times the windowed
+  **`range_fetch`** (`--range-fetch`, real corpus via `--rf-csv`: 32 × 100-row windows over 1M
+  real BTC closes at p50 **60.8 ms** single-block vs **17.8 ms** paged) times the windowed
   range read; **`compression`** (`--compression`) reports realized bytes/point, the
   value-column compression ratio, and decode throughput, gated on an exact
   round-trip — over a seeded shape, or a **real corpus** with `--comp-csv <FILE>`
