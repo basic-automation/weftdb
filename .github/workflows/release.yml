@@ -275,9 +275,10 @@ jobs:
           # (dist here) to a directory of its own name.
           profile_dir=$PROFILE
           if [[ $PROFILE == dev ]]; then profile_dir=debug; fi
-          bin_dir=src/target/$TARGET/$profile_dir
-          ls -l "$bin_dir"/weft-server* "$bin_dir"/weft-tui* "$bin_dir"/weft-bench*
-          echo "BIN_DIR=$bin_dir" >>"$GITHUB_ENV"
+          # This step runs in src/; the steps that read BIN_DIR run from the workspace root.
+          out=target/$TARGET/$profile_dir
+          ls -l "$out"/weft-server* "$out"/weft-tui* "$out"/weft-bench*
+          echo "BIN_DIR=src/$out" >>"$GITHUB_ENV"
 
       # Each runner builds its own target, so the binary can run here. weft-bench is the
       # one whose --help exits without starting anything.
