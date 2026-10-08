@@ -50,8 +50,9 @@
 //! ran (a `Busy` at `BEGIN`, which used no snapshot), and is otherwise reported at its
 //! first conflict, as every segment-index write was before this type existed. Seals
 //! (`InsertNew` and `SeqBump`, since S7) get the retries, and so do the write-once swaps
-//! of reconcile and split (S8), whose ops are all guarded: `ReplaceExpected`,
-//! `InsertNew`, the journal ops and `SeqBump`.
+//! of every maintenance operation (reconcile and split since S8, the overlap merge,
+//! squash and compaction since S9), whose ops are all guarded: `ReplaceExpected`,
+//! `DeleteExpected`, `InsertNew`, the journal ops and `SeqBump`.
 //!
 //! **The write scope** (robustness track ROB-2). Every transaction runs inside
 //! [`control_plane_write`](crate::exec::control_plane_write), so the process's panic hook
@@ -135,14 +136,15 @@ pub enum IndexOp {
 	/// Replace the row matching `expected` with `row`. Exactly one row must match.
 	ReplaceExpected { aspect: String, expected: RowVersion, row: IndexRow },
 	/// Delete the row matching `expected`. Exactly one row must match.
-	#[cfg_attr(not(test), expect(dead_code, reason = "the merging maintenance swaps (S9) delete their members with this"))]
 	DeleteExpected { aspect: String, expected: RowVersion },
-	/// Insert `row`, replacing any row with its `(aspect, id)` (`INSERT OR REPLACE`).
-	/// Today's seal and in-place rewrite semantics, kept until S7-S9 replace them with
-	/// [`InsertNew`](Self::InsertNew) and [`ReplaceExpected`](Self::ReplaceExpected).
+	/// Insert `row`, replacing any row with its `(aspect, id)` (`INSERT OR REPLACE`): the
+	/// legacy [`SegmentIndexStore::insert`](crate::SegmentIndexStore::insert). No path of
+	/// the store writes it any more: seals insert with [`InsertNew`](Self::InsertNew) (S7)
+	/// and maintenance swaps with [`ReplaceExpected`](Self::ReplaceExpected) (S8, S9).
 	Upsert { aspect: String, row: IndexRow },
-	/// Delete the row with `(aspect, id)`, if any. Today's merge and squash semantics,
-	/// kept until S9 replaces them with [`DeleteExpected`](Self::DeleteExpected).
+	/// Delete the row with `(aspect, id)`, if any: the legacy
+	/// [`SegmentIndexStore::delete`](crate::SegmentIndexStore::delete). Maintenance swaps
+	/// delete their members with [`DeleteExpected`](Self::DeleteExpected) (S9).
 	Delete { aspect: String, id: u64 },
 	/// Raise `aspect`'s persisted allocator (its `aspect_seq` row) to at least `next_id`,
 	/// `next_gen` and `epoch`, creating the row if the aspect has none. No value ever

@@ -28,6 +28,15 @@
 //! pass) holds is left for the next tick, logged at `DEBUG` and recorded in the tick
 //! span's `busy` field, and the HTTP endpoints, which do wait, never queue behind a tick.
 //!
+//! **Write-once passes (crash-consistency S8, S9).** Every pass a tick runs (a reconcile,
+//! an overlap merge, a squash, a compaction) writes its outputs to new, fsynced frames and
+//! swaps them in with one `segment_index.db` transaction per segment, overlap component or
+//! compaction group, so a crash, power cut or kill in the middle of a tick leaves each of
+//! them as it was or as the pass left it, never torn or half-merged, and the frames a swap
+//! replaced are deleted by the store's reaper once no read can still be using them. A
+//! pass stopped part way (its task dropped at shutdown) leaves outputs that the next pass
+//! on the aspect, or the next start's journal replay, removes.
+//!
 //! The daemon holds only `Arc` handles (the store and the metrics registry), so it
 //! is a detached side task; the router and its handlers are untouched.
 

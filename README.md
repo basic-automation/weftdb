@@ -230,15 +230,18 @@ truth for status and priorities, and it records negative results alongside wins.
 
 ### Store
 
-- **Typed columnar segments (`.weftseg`)** — immutable once sealed, CRC-checksummed,
-  page-indexed, with per-segment and per-page min/max statistics for data skipping
-  and a null/quality column.
+- **Typed columnar segments (`.weftseg`)** — written once, never rewritten: maintenance
+  (reconcile, split, overlap merge, squash, compaction) writes its output to new frames,
+  fsyncs them, and swaps them for its inputs in one control-plane transaction, so a
+  crash leaves either the inputs or the outputs, and a replaced frame is deleted only
+  once no read can still be using it. CRC-checksummed, page-indexed, with per-segment
+  and per-page min/max statistics for data skipping and a null/quality column.
 - **Compression that adapts per column** — timestamps pick among delta-of-delta,
   RLE, Gorilla, fixed and per-block bit-packing; values pick among varint,
   bit-packing, per-block adaptive packing, frame-of-reference and an opt-in delta
   cascade. The codec each column actually used is reported, and `bytes/point` is the
   **realized** figure, not an estimate.
-- **Late and out-of-order data** — detected, counted, and reconciled in place or
+- **Late and out-of-order data** — detected, counted, and reconciled within a segment or
   across segments with last-writer-wins semantics, on demand or by background sweep.
 - **Backup and restore** of the control plane, with two verification modes (one safe
   under concurrent writes) and a **non-destructive restore drill** so you can answer
