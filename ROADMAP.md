@@ -425,8 +425,8 @@ detection within Y% and improving historical query latency by Z."*
     folded into `best_estimated_bytes`/`best_encoding_name` (`delta_of_delta_blocked`),
     and round-trip- + runtime-verified. A single-block stream ties global bit-pack, so the
     selector keeps the simpler label there. *(src: "Dynamic Bit Packing", Sensors 2023 —
-    https://www.mdpi.com/1424-8220/23/20/8575 · Sprintz per-block bit-packing, ACM TODS'18
-    — https://arxiv.org/abs/1808.02515)*
+    https://www.mdpi.com/1424-8220/23/20/8575 · Sprintz per-block bit-packing, Proc. ACM
+    IMWUT 2(3), 2018 — https://doi.org/10.1145/3264903 · https://arxiv.org/abs/1808.02515)*
   - [x] **Frame-of-Reference (FOR) per-block codec — prototyped + benchmarked (advisory).**
     `for_bitpack_bytes`/`encode`/`decode` beside the blocked codec: each block emits a
     zig-zag-varint reference (the block minimum) then the *unsigned* residuals (`v - min`)
@@ -458,8 +458,8 @@ detection within Y% and improving historical query latency by Z."*
     {varint, bit-pack, blocked bit-pack, **RLE**} over the residual tail (the zero/run-length
     half). Surfaced in the bench as `StorageEstimate.advisory_fire_timestamp_bytes` (schema
     v14) so the FIRE-vs-dod question is answered on the *real* timestamp corpus. Measured
-    54.8% below dod on a constructed geometric-velocity stream. *(src: Sprintz, ACM TODS'18 —
-    https://arxiv.org/abs/1808.02515)*
+    54.8% below dod on a constructed geometric-velocity stream. *(src: Sprintz, Proc. ACM IMWUT
+    2(3), 2018 — https://doi.org/10.1145/3264903 · https://arxiv.org/abs/1808.02515)*
   - [x] **FIRE adopt-or-drop — DECIDED (2026-07-16): DROPPED.** Measured on the *real* bench
     corpora exactly as this item demanded, via the shipped `advisory_fire_timestamp_bytes` (8
     distinct timestamp corpora — jitter 0.0/0.02/0.05/0.15/0.35/0.5/0.8/0.9 × missingness

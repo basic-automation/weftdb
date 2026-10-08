@@ -286,11 +286,16 @@ impl ColumnEncoding {
 	/// counter, a monotone sensor) defeats them: FOR pays the whole run's range, bit-packing
 	/// pays the widest mantissa. The delta transform turns that trend into a near-constant
 	/// difference stream, which the same packers (or RLE, on a constant delta) then crush. This
-	/// is the first slice of the roadmap's cascading-codec item (FOR→delta→bit-pack chains):
-	/// an **advisory** estimate over the same first-difference transform as [`crate::encode_delta`]
-	/// and the shipped packers — not a `.weftseg` codec (a composed on-disk pipeline is the
-	/// residue). The
-	/// first mantissa is the varint anchor; a single-value column has only that anchor.
+	/// is the first slice of the roadmap's cascading-codec item (FOR→delta→bit-pack chains),
+	/// built from the same first-difference transform as [`crate::encode_delta`] and the shipped
+	/// packers. It **is** a `.weftseg` codec: the opt-in `VAL_CODEC_DELTA_CASCADE` block, written
+	/// by [`write_value_column_cascading`](crate::weftseg::write_value_column_cascading) and read
+	/// back by the ordinary reader, and this figure is exactly that block's payload (both route
+	/// through [`delta_cascade_plan`](Self::delta_cascade_plan)). It is **not** on the default
+	/// seal path: the default selector [`best_value_codec`](Self::best_value_codec) never picks
+	/// it, and only the opt-in [`best_value_codec_cascading`](Self::best_value_codec_cascading)
+	/// does, so by default the figure is advisory. The first mantissa is the varint anchor; a
+	/// single-value column has only that anchor.
 	/// *(src: Vortex / `FastLanes` cascading compression — <https://vortex.dev/>)*
 	#[must_use]
 	pub fn delta_cascade_bytes(&self) -> Option<usize> {

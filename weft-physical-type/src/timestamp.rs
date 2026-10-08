@@ -1195,7 +1195,8 @@ const FIRE_ALPHA_MAX: i64 = 1 << FIRE_SHIFT;
 /// so the exact inverse [`fire_reconstruct`] round-trips every stream regardless of overflow.
 /// Advisory (roadmap Phase 6.1) — a benchmarkable estimate, not wired into any on-disk selector,
 /// and behind the `experimental-codecs` feature.
-/// *(src: Sprintz, ACM TODS'18 — <https://arxiv.org/abs/1808.02515>)*
+/// *(src: Sprintz, Proc. ACM IMWUT 2(3), 2018 — <https://doi.org/10.1145/3264903> ·
+/// <https://arxiv.org/abs/1808.02515>)*
 #[cfg(feature = "experimental-codecs")]
 #[must_use]
 pub fn fire_residuals(values: &[i64]) -> Vec<i64> {
@@ -1270,8 +1271,8 @@ pub fn fire_reconstruct(residuals: &[i64]) -> Vec<i64> {
 /// Structured exactly like [`DeltaOfDeltaColumn::best_estimated_bytes`] (anchor + first delta +
 /// packed second-order stream) so the two are directly comparable — FIRE wins when its adaptive
 /// coefficient yields a smaller residual tail than the fixed delta-of-delta predictor. Advisory
-/// only, and behind the `experimental-codecs` feature. *(src: Sprintz, ACM TODS'18 —
-/// <https://arxiv.org/abs/1808.02515>)*
+/// only, and behind the `experimental-codecs` feature. *(src: Sprintz, Proc. ACM IMWUT 2(3),
+/// 2018 — <https://doi.org/10.1145/3264903> · <https://arxiv.org/abs/1808.02515>)*
 #[cfg(feature = "experimental-codecs")]
 #[must_use]
 pub fn fire_estimated_bytes(values: &[i64]) -> usize {
