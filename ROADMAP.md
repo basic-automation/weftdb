@@ -392,7 +392,37 @@ detection within Y% and improving historical query latency by Z."*
   disk in the value block)*; Chimp-style f64; ALP-inspired vectorized f64;
   Decimal128/scaled-int codecs; **block-level random access** *(shipped —
   `blocked`/`for_bitpack_decode_range` + `weftseg::read_value_at`)*. *(Check codec
-  patents/licenses before embedding.)*
+  patents/licenses before embedding — and before shipping; see the gate below.)*
+  - [ ] **Codec patent/licence gate (owner decisions 2026-10-08).** The check covers **every
+    codec the crates ship**, not only what the `.weftseg` writer embeds: a codec in a published
+    crate's public API, or one that only a bench reaches, is still distributed code. Status:
+    - [x] **Elf, FIRE and the advisory f64 codecs: gated.** Gorilla-XOR, Chimp, Chimp128, Elf,
+      the `best_f64_*` selector and the Sprintz FIRE forecaster sit behind
+      `weft-physical-type`'s non-default `experimental-codecs` feature, outside the 1.0 semver
+      promise. None is written to disk and no default read or write path calls one; only the
+      unpublished `weft-bench` enables the feature. A flagged Chongqing patent names Elf
+      explicitly, so Elf stays gated (or is removed) unless counsel clears it.
+    - [x] **Bit-sliced value codec: gated pending counsel.** The opt-in `VAL_CODEC_TRANSPOSED`
+      codec is behind the non-default `bitsliced-codec` feature (forwarded by `weftdb` and
+      `weft-server`) because a WARF patent is flagged against it. Without the feature the writer
+      never selects it, `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` is ignored with a warning, and
+      readers return `WeftSegError::CodecNotEnabled`. Its docs now call it bit-sliced; it was
+      never the FastLanes layout.
+    - [ ] **Default FOR codec and the Tiger Data family: with counsel.** Amazon US 11,308,093 is
+      flagged against the frame-of-reference value codec WeftDB writes **by default**
+      (`VAL_CODEC_FOR`), and Tiger Data patents against both ingest paths. Technical claim charts
+      are prepared. These stay ungated because default stores depend on them; the decision is
+      counsel's.
+    - [ ] **SAP family: review before the Phase 6.2 design.** Read the flagged SAP patents before
+      designing model-based compression (6.2), so the design starts clear of them rather than
+      being reworked afterwards.
+    - [ ] **Possible future: a patent-clear codec in a new crate.** If counsel advises against a
+      shipped codec, implement a replacement that avoids the claims in its own crate, and keep
+      the gated original only so existing stores stay readable.
+    - [x] **Attribution for adapted code.** Chimp/Chimp128 (`weft-physical-type`) and DDSketch
+      (`weft-reduce`) are treated as adapted from their Apache-2.0 reference implementations: a
+      root `NOTICE` and per-crate `THIRD-PARTY-NOTICES` (shipped in each package) meet
+      Apache-2.0 section 4.
   - [x] **Gorilla + RLE realized on disk** — the timestamp block now carries four
     codecs (varint/bit-pack/RLE/Gorilla) chosen by the single-source-of-truth
     `best_encoding_name`, so the reported codec always matches the bytes written; the
@@ -643,7 +673,9 @@ detection within Y% and improving historical query latency by Z."*
     win visible and maps onto the $/billion-interpolated-points north star.
     *(src: https://azimafroozeh.org/assets/papers/g-alp.pdf)*
   - [x] **FastLanes "Unified Transposed Layout" for the bit-pack codecs (decode-speed
-    slice): shipped (prototype).** `TRANSPOSE_TILE`/`transpose_bitpack_bytes`/`_encode`/`_decode`
+    slice): shipped (prototype).** *(Correction 2026-10-08: what shipped is a bit-sliced,
+    bit-plane-major layout, not the FastLanes layout; it is now behind the `bitsliced-codec`
+    feature — see the codec patent/licence gate above.)* `TRANSPOSE_TILE`/`transpose_bitpack_bytes`/`_encode`/`_decode`
     — a per-tile bit-plane-major layout whose decoder reads `u64` words and walks only the *set*
     bits (`w &= w-1`), so the empty high bit-planes of a small-magnitude stream are skipped
     wholesale (where the scalar per-value loop pays every bit of every value). Byte footprint is a
@@ -1645,6 +1677,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   (`scaled_for`, strict-win selection); timestamps stay advisory (small dods, FOR
   rarely wins). Decided together with the headline flip below — one metric break.
 - [x] **FastLanes transposed bit-unpack (Phase 6.1, decode-speed): shipped (prototype).**
+  *(Correction 2026-10-08: a bit-sliced layout, not FastLanes'; now behind `bitsliced-codec`.)*
   `TRANSPOSE_TILE`/`transpose_bitpack_bytes`/`_encode`/`_decode` — a per-tile bit-plane-major
   layout whose decoder reads `u64` words and walks only the *set* bits (`w &= w-1`), so the empty
   high bit-planes of a small-magnitude stream are skipped wholesale. Byte footprint identical to
