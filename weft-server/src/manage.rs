@@ -92,8 +92,8 @@ pub struct DeclareAspectRequest {
 	/// The aspect name to declare (unique within the store's `(database, subject)`
 	/// scope; a re-declaration overwrites). It also names the aspect's files on disk, so
 	/// it must pass [`weftdb::aspect_name::validate`]: at most 160 bytes, no `/`, `\`,
-	/// control characters, leading `.`, trailing `.` or space, and not a Windows device
-	/// name such as `CON`.
+	/// control characters, leading `.`, trailing `.` or space, not a Windows device name
+	/// such as `CON` or `nul:x`, and, on Windows, none of `<>:"|?*`.
 	pub name: String,
 	/// The physical encoding token (e.g. `"f64"`, `"scaled_i64"`).
 	pub physical_type: String,
@@ -232,8 +232,10 @@ pub struct ReconcileResponse {
 /// # Errors
 ///
 /// [`StorageError::Unconfigured`] when no store is attached,
-/// [`StorageError::NotFound`] when the aspect is undeclared, and
-/// [`StorageError::Internal`] on a read/seal/control-plane failure.
+/// [`StorageError::NotFound`] when the aspect is undeclared,
+/// [`StorageError::BadRequest`] when its name is not safe as a file name (declared
+/// before names were checked), and [`StorageError::Internal`] on a
+/// read/seal/control-plane failure.
 pub async fn reconcile_aspect(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<ReconcileParams>) -> Result<Response, StorageError> {
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	let metrics = state.metrics().clone();
@@ -241,6 +243,17 @@ pub async fn reconcile_aspect(State(state): State<AppState>, Path(aspect): Path<
 	let result = reconcile_aspect_inner(&store, &aspect, params.threshold, params.hot_cold, params.overlaps, params.split_min_bytes, &metrics).await;
 	drop(store);
 	result
+}
+
+/// Classify a per-aspect maintenance error (reconcile, squash, compact): an aspect whose
+/// name is not safe as a file name, declared before names were checked, is a `400`, as on
+/// ingest and read; anything else is a `500`.
+fn classify_maintenance_error(err: &anyhow::Error) -> StorageError {
+	if err.downcast_ref::<weftdb::InvalidAspectName>().is_some() {
+		StorageError::BadRequest(err.to_string())
+	} else {
+		StorageError::Internal(err.to_string())
+	}
 }
 
 /// The body of [`reconcile_aspect`], split out so the significant-`Drop`
@@ -262,17 +275,17 @@ async fn reconcile_aspect_inner(store: &weftdb::SegmentStore, aspect: &str, thre
 		// `split_min_bytes` selects the split-not-rewrite floor; absent → the default
 		// 50 MiB QuestDB floor (small components always full-rewrite).
 		let removed = match split_min_bytes {
-			Some(min) => store.reconcile_overlaps_with_policy(aspect, weft_physical_type::SplitPolicy::new(min)).await.map_err(|err| StorageError::Internal(err.to_string()))?,
-			None => store.reconcile_overlaps(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?,
+			Some(min) => store.reconcile_overlaps_with_policy(aspect, weft_physical_type::SplitPolicy::new(min)).await.map_err(|err| classify_maintenance_error(&err))?,
+			None => store.reconcile_overlaps(aspect).await.map_err(|err| classify_maintenance_error(&err))?,
 		};
 		("overlaps", true, removed, 0, 0)
 	} else if hot_cold {
-		let outcome = store.reconcile_aspect_hot_cold(aspect, threshold.unwrap_or(1)).await.map_err(|err| StorageError::Internal(err.to_string()))?;
+		let outcome = store.reconcile_aspect_hot_cold(aspect, threshold.unwrap_or(1)).await.map_err(|err| classify_maintenance_error(&err))?;
 		("hot_cold", true, outcome.total(), outcome.cold_reconciled, outcome.hot_reconciled)
 	} else {
 		let (triggered, reconciled) = match threshold {
-			Some(threshold) => store.reconcile_aspect_if_unsorted_exceeds(aspect, threshold).await.map_err(|err| StorageError::Internal(err.to_string()))?.map_or((false, 0), |reconciled| (true, reconciled)),
-			None => (true, store.reconcile_aspect(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?),
+			Some(threshold) => store.reconcile_aspect_if_unsorted_exceeds(aspect, threshold).await.map_err(|err| classify_maintenance_error(&err))?.map_or((false, 0), |reconciled| (true, reconciled)),
+			None => (true, store.reconcile_aspect(aspect).await.map_err(|err| classify_maintenance_error(&err))?),
 		};
 		("threshold", triggered, reconciled, 0, 0)
 	};
@@ -463,8 +476,10 @@ pub struct SquashResponse {
 /// # Errors
 ///
 /// [`StorageError::Unconfigured`] when no store is attached,
-/// [`StorageError::NotFound`] when the aspect is undeclared, and
-/// [`StorageError::Internal`] on a read/seal/control-plane failure.
+/// [`StorageError::NotFound`] when the aspect is undeclared,
+/// [`StorageError::BadRequest`] when its name is not safe as a file name (declared
+/// before names were checked), and [`StorageError::Internal`] on a
+/// read/seal/control-plane failure.
 pub async fn squash_aspect(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<SquashParams>) -> Result<Response, StorageError> {
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	drop(state);
@@ -473,8 +488,8 @@ pub async fn squash_aspect(State(state): State<AppState>, Path(aspect): Path<Str
 		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	}
 	let (triggered, removed) = match params.max_segments {
-		Some(max) => store.squash_aspect_if_exceeds(&aspect, max).await.map_err(|err| StorageError::Internal(err.to_string()))?.map_or((false, 0), |removed| (true, removed)),
-		None => (true, store.squash_aspect(&aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?),
+		Some(max) => store.squash_aspect_if_exceeds(&aspect, max).await.map_err(|err| classify_maintenance_error(&err))?.map_or((false, 0), |removed| (true, removed)),
+		None => (true, store.squash_aspect(&aspect).await.map_err(|err| classify_maintenance_error(&err))?),
 	};
 	let segment_count = store.segment_count(&aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?;
 	drop(store);
@@ -515,7 +530,8 @@ pub struct CompactResponse {
 /// # Errors
 ///
 /// [`StorageError::Unconfigured`] when no store is attached,
-/// [`StorageError::BadRequest`] when `target_rows` is absent,
+/// [`StorageError::BadRequest`] when `target_rows` is absent or the aspect's name is not
+/// safe as a file name (declared before names were checked),
 /// [`StorageError::NotFound`] when the aspect is undeclared, and
 /// [`StorageError::Internal`] on a read/seal/control-plane failure.
 pub async fn compact_aspect(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<CompactParams>) -> Result<Response, StorageError> {
@@ -526,7 +542,7 @@ pub async fn compact_aspect(State(state): State<AppState>, Path(aspect): Path<St
 	if store.schema_for(&aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?.is_none() {
 		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	}
-	let removed = store.squash_aspect_to_target_rows(&aspect, target_rows).await.map_err(|err| StorageError::Internal(err.to_string()))?;
+	let removed = store.squash_aspect_to_target_rows(&aspect, target_rows).await.map_err(|err| classify_maintenance_error(&err))?;
 	let segment_count = store.segment_count(&aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?;
 	drop(store);
 	Ok((StatusCode::OK, Json(CompactResponse { aspect, removed, segment_count })).into_response())
@@ -1324,7 +1340,8 @@ mod tests {
 	}
 
 	/// An aspect declared under an unsafe name by an older version (straight into the
-	/// catalog) is refused on use with a `400`, and no frame is written for it.
+	/// catalog) is refused on use with a `400` (ingest, read and per-aspect maintenance),
+	/// the store-wide sweep lists it in `failed`, and no frame is written for it.
 	#[tokio::test]
 	async fn a_previously_declared_unsafe_name_is_a_bad_request_on_use() {
 		let dir = TempDir::new().unwrap();
@@ -1338,6 +1355,15 @@ mod tests {
 		assert!(body["error"].as_str().unwrap().contains("invalid aspect name"), "body: {body}");
 		let response = app_with_state(state.clone()).oneshot(Request::builder().uri("/api/v1/storage/..%2Fx/range.csv?start=0&end=10").body(Body::empty()).unwrap()).await.unwrap();
 		assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+		for uri in ["/api/v1/storage/..%2Fx/reconcile", "/api/v1/storage/..%2Fx/reconcile?threshold=1", "/api/v1/storage/..%2Fx/reconcile?hot_cold=true", "/api/v1/storage/..%2Fx/reconcile?overlaps=true", "/api/v1/storage/..%2Fx/squash", "/api/v1/storage/..%2Fx/squash?max_segments=1", "/api/v1/storage/..%2Fx/compact?target_rows=10"] {
+			let (status, body) = post_empty(app_with_state(state.clone()), uri).await;
+			assert_eq!(status, StatusCode::BAD_REQUEST, "POST {uri}: {body}");
+			assert!(body["error"].as_str().unwrap().contains("invalid aspect name"), "POST {uri}: {body}");
+		}
+		let (status, body) = post_empty(app_with_state(state.clone()), "/api/v1/storage/reconcile").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["failed"][0]["aspect"], "../x", "the sweep reports the unsafe aspect: {body}");
+		assert!(body["failed"][0]["error"].as_str().unwrap().contains("invalid aspect name"), "body: {body}");
 		drop(state);
 		drop(store);
 		assert!(frames_under(dir.path()).is_empty(), "no frame was written anywhere");

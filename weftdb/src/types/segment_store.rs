@@ -439,25 +439,6 @@ impl SegmentStore {
 		self.catalog.list_aspects(&self.database, &self.subject).await
 	}
 
-	/// The declared aspects a store-wide maintenance sweep visits: every declared aspect
-	/// whose name passes [`aspect_name::validate`].
-	///
-	/// A name declared before that check existed and failing it is skipped with a warning
-	/// instead of failing the sweep, so one bad declaration cannot stop maintenance of
-	/// every other aspect. Addressing such an aspect directly still fails with an
-	/// [`InvalidAspectName`](crate::InvalidAspectName).
-	async fn sweepable_aspects(&self) -> Result<Vec<String>> {
-		let mut aspects = self.list_declared_aspects().await?;
-		aspects.retain(|aspect| match aspect_name::validate(aspect) {
-			Ok(()) => true,
-			Err(err) => {
-				tracing::warn!(error = %err, "maintenance sweep skipped a declared aspect whose name is not safe as a file name");
-				false
-			}
-		});
-		Ok(aspects)
-	}
-
 	/// Take an online, consistent snapshot of this store's **four control-plane
 	/// databases** (`segment_index.db`, `metadata.db`, `aspect_catalog.db`, `catalog.db`)
 	/// into `dest_dir`, via Turso's `VACUUM INTO` (roadmap **Phase 7.4**). Each copy is
@@ -1263,7 +1244,7 @@ impl SegmentStore {
 	/// Propagates only the aspect-list read; per-aspect failures are reported in
 	/// [`ReconcileSweep::failed`].
 	pub async fn reconcile_all_over_threshold(&self, threshold: usize) -> Result<ReconcileSweep> {
-		let aspects = self.sweepable_aspects().await?;
+		let aspects = self.list_declared_aspects().await?;
 		let mut sweep = ReconcileSweep { aspects_scanned: aspects.len(), ..ReconcileSweep::default() };
 		for aspect in &aspects {
 			match self.reconcile_aspect_if_unsorted_exceeds(aspect, threshold).await {
@@ -1352,7 +1333,7 @@ impl SegmentStore {
 	/// Propagates only the aspect-list read; per-aspect failures are reported in
 	/// [`HotColdSweep::failed`].
 	pub async fn reconcile_all_hot_cold(&self, threshold: usize) -> Result<HotColdSweep> {
-		let aspects = self.sweepable_aspects().await?;
+		let aspects = self.list_declared_aspects().await?;
 		let mut sweep = HotColdSweep { aspects_scanned: aspects.len(), ..HotColdSweep::default() };
 		for aspect in &aspects {
 			match self.reconcile_aspect_hot_cold(aspect, threshold).await {
@@ -1557,7 +1538,7 @@ impl SegmentStore {
 	/// Propagates only the aspect-list read; per-aspect failures are reported in
 	/// [`OverlapSweep::failed`].
 	pub async fn reconcile_all_overlaps(&self) -> Result<OverlapSweep> {
-		let aspects = self.sweepable_aspects().await?;
+		let aspects = self.list_declared_aspects().await?;
 		let mut sweep = OverlapSweep { aspects_scanned: aspects.len(), ..OverlapSweep::default() };
 		for aspect in &aspects {
 			match self.reconcile_overlaps(aspect).await {
@@ -1595,7 +1576,7 @@ impl SegmentStore {
 	///
 	/// As [`reconcile_all_overlaps`](SegmentStore::reconcile_all_overlaps).
 	pub async fn reconcile_all_overlaps_with_policy(&self, policy: SplitPolicy) -> Result<OverlapSweep> {
-		let aspects = self.sweepable_aspects().await?;
+		let aspects = self.list_declared_aspects().await?;
 		let mut sweep = OverlapSweep { aspects_scanned: aspects.len(), ..OverlapSweep::default() };
 		for aspect in &aspects {
 			let pass = async {
@@ -1715,7 +1696,7 @@ impl SegmentStore {
 	/// Propagates only the aspect-list read; per-aspect failures are reported in
 	/// [`SquashSweep::failed`].
 	pub async fn squash_all_over_threshold(&self, max_segments: usize) -> Result<SquashSweep> {
-		let aspects = self.sweepable_aspects().await?;
+		let aspects = self.list_declared_aspects().await?;
 		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
 		for aspect in &aspects {
 			match self.squash_aspect_if_exceeds(aspect, max_segments).await {
@@ -1837,7 +1818,7 @@ impl SegmentStore {
 	/// Propagates only the aspect-list read; per-aspect failures are reported in
 	/// [`SquashSweep::failed`].
 	pub async fn squash_all_to_target_rows(&self, target_rows: usize) -> Result<SquashSweep> {
-		let aspects = self.sweepable_aspects().await?;
+		let aspects = self.list_declared_aspects().await?;
 		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
 		for aspect in &aspects {
 			match self.squash_aspect_to_target_rows(aspect, target_rows).await {
@@ -1902,7 +1883,7 @@ impl SegmentStore {
 	/// Propagates only the aspect-list read; per-aspect failures are reported in
 	/// [`SquashSweep::failed`].
 	pub async fn squash_all_to_target_rows_if_fragmented(&self, target_rows: usize) -> Result<SquashSweep> {
-		let aspects = self.sweepable_aspects().await?;
+		let aspects = self.list_declared_aspects().await?;
 		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
 		for aspect in &aspects {
 			match self.squash_aspect_to_target_rows_if_fragmented(aspect, target_rows).await {
@@ -2415,28 +2396,38 @@ mod tests {
 	}
 
 	/// A name declared before names were checked cannot be sealed, read or maintained (a
-	/// typed error, not a panic), and a store-wide sweep skips it instead of failing.
+	/// typed error, not a panic), and a store-wide sweep reports it in `failed` while it
+	/// still maintains every other aspect.
 	#[tokio::test]
-	async fn a_previously_declared_unsafe_name_errors_on_use_and_sweeps_skip_it() {
+	async fn a_previously_declared_unsafe_name_errors_on_use_and_sweeps_report_it() {
 		let dir = TempDir::new().expect("tempdir");
 		let store = SegmentStore::open(dir.path()).await.expect("opens");
 		// Written straight into the catalog, as an older version would have accepted it.
 		store.catalog().declare(store.database(), store.subject(), "../x", &schema()).await.expect("raw declare");
 		store.declare("ok", &schema()).await.expect("declares");
-		// Out of order, so the sweep below has one segment to reconcile.
+		// Out of order and twice, so the sweeps below have work to do on the valid aspect.
 		store.seal_declared("ok", &[10, 0], &[bd("1"), bd("2")]).await.expect("seals");
+		store.seal_declared("ok", &[20, 30], &[bd("3"), bd("4")]).await.expect("seals");
 
 		let results = [store.seal_declared("../x", &[0], &[bd("1")]).await.map(|_| ()), store.read_time_range("../x", 0, 10).await.map(|_| ()), store.read_point("../x", 0).await.map(|_| ()), store.downsample_range("../x", 0, 10, Resolution::Seconds, &[Aggregation::Avg]).await.map(|_| ()), store.reconcile_aspect("../x").await.map(|_| ()), store.reconcile_overlaps("../x").await.map(|_| ()), store.squash_aspect("../x").await.map(|_| ())];
-		let sweep = store.reconcile_all_over_threshold(1).await;
+		let reconcile = store.reconcile_all_over_threshold(1).await;
+		let squash = store.squash_all_over_threshold(1).await;
 		drop(store);
 		for result in results {
 			let err = result.expect_err("an unsafe name is refused");
 			let invalid = err.downcast_ref::<crate::InvalidAspectName>().unwrap_or_else(|| panic!("a typed InvalidAspectName, got: {err:#}"));
 			assert_eq!(invalid.name(), "../x");
 		}
-		let sweep = sweep.expect("the sweep runs despite the unsafe declaration");
-		assert_eq!(sweep.aspects_scanned, 1, "only the valid aspect is visited");
-		assert_eq!(sweep.segments_reconciled, 1, "the valid aspect is still maintained");
+		let reconcile = reconcile.expect("the sweep runs despite the unsafe declaration");
+		assert_eq!(reconcile.aspects_scanned, 2, "both declared aspects are visited");
+		assert_eq!(reconcile.segments_reconciled, 1, "the valid aspect is still maintained");
+		let squash = squash.expect("the sweep runs despite the unsafe declaration");
+		assert_eq!(squash.segments_removed, 1, "the valid aspect is still squashed");
+		for failed in [&reconcile.failed, &squash.failed] {
+			assert_eq!(failed.len(), 1, "only the unsafe aspect fails: {failed:?}");
+			assert_eq!(failed[0].0, "../x");
+			assert!(failed[0].1.downcast_ref::<crate::InvalidAspectName>().is_some(), "reported as an InvalidAspectName: {:#}", failed[0].1);
+		}
 		assert!(frames_under(dir.path()).iter().all(|path| path.starts_with(dir.path().join("segments"))), "every frame stays under segments/");
 	}
 

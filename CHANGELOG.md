@@ -186,11 +186,19 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `segments/` directory. Names are now validated wherever they are declared or turned
   into a path (`weftdb::aspect_name::validate`): at most 160 bytes, no `/` or `\`, no
   control characters, no leading `.`, no trailing `.` or space, and not a Windows device
-  name (`CON`, `NUL`, `COM1`, …). `POST /api/v1/storage/aspects` answers `400` for such a
+  name (`CON`, `NUL`, `COM1`, `CONIN$`, …, also with an extension or a `:` suffix). On
+  Windows, `<`, `>`, `:`, `"`, `|`, `?` and `*` are refused too, since such a name could
+  never be sealed there. `POST /api/v1/storage/aspects` answers `400` for an invalid
   name, and every frame path is also checked to be a direct child of `segments/`. An
-  aspect already declared under such a name was never safe to use: it now fails on every
-  use with a typed `weftdb::InvalidAspectName` error (a `400` over HTTP), and the
-  store-wide maintenance sweeps skip it with a warning instead of failing.
+  aspect already declared under such a name was never safe to use: sealing, reading or
+  maintaining it now fails with a typed `weftdb::InvalidAspectName` error (a `400` from
+  the ingest, read, reconcile, squash and compact endpoints), and the store-wide
+  maintenance sweeps list it in `failed` and count it in
+  `weft_reconcile_failed_passes_total` while still maintaining every other aspect.
+  Listing it and reading its schema or stats, which touch no files, still work. Names
+  that differ only in letter case or Unicode normalisation are still accepted and can
+  share frame files on a case-insensitive or normalising filesystem; that is a collision
+  inside `segments/`, not a way out of it, and the planned encoded frame names remove it.
 - **Backup retention can no longer be made to delete genuine snapshots.**
   `WEFT_BACKUP_KEEP` retention keeps the newest `backup-<digits>` directories by their
   embedded timestamp, and `POST /api/v1/storage/backup?label=` accepted labels in that
