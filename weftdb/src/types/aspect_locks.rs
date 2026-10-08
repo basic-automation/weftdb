@@ -26,29 +26,41 @@
 //!
 //! The locks are in-process: a store root has one owner (its `LOCK`), so nothing else
 //! writes its index.
+//!
+//! Beside the locks, each aspect has a lock-free **generation** counter (design section
+//! 5.1, `next_gen`; slice S8), which names the write-once frames: every generation is
+//! handed out once, so no frame name is ever reused. It is seeded the first time it is
+//! used, from the persisted `aspect_seq.next_gen` and the highest generation a frame of
+//! the aspect on disk carries, and every commit that used one raises `aspect_seq.next_gen`
+//! past it.
 
 use std::{
-	collections::HashMap, future::Future, sync::{Arc, Mutex as StdMutex, PoisonError}, time::Duration
+	collections::HashMap, future::Future, sync::{
+		atomic::{AtomicU64, Ordering}, Arc, Mutex as StdMutex, PoisonError
+	}, time::Duration
 };
 
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::sync::{Mutex, OnceCell, OwnedMutexGuard};
 
-/// What an aspect's commit lock guards: its id allocator.
+/// What an aspect's commit lock guards: its id allocator and its epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AspectState {
 	/// The next segment id to hand out. Every id below it was handed out once.
 	pub next_id: u64,
-	/// The aspect's epoch, as `aspect_seq` records it. Nothing advances it yet (the
-	/// write-once swaps and seals of S8-S10 do); a commit writes it back unchanged.
+	/// The aspect's epoch, as `aspect_seq` records it: the commit epoch of its latest
+	/// write-once swap (S8; seals advance it from S10). A commit that is not a swap writes
+	/// it back unchanged.
 	pub epoch: u64,
 }
 
-/// One aspect's two locks.
+/// One aspect's two locks and its generation counter.
 #[derive(Default)]
 struct AspectLock {
 	/// `None` until the allocator is seeded, which happens under the lock.
 	commit: Arc<Mutex<Option<AspectState>>>,
 	maint: Arc<Mutex<()>>,
+	/// The next generation to hand out, once seeded.
+	next_gen: OnceCell<AtomicU64>,
 }
 
 /// The per-aspect locks of one store, created on first use and kept for the store's life.
@@ -101,6 +113,31 @@ impl AspectLocks {
 		let held = self.of(aspect).maint.clone().try_lock_owned().ok()?;
 		Some(MaintGuard { aspect: aspect.to_string(), _held: held })
 	}
+
+	/// Hand out `count` consecutive generations of `aspect`, returning the first, seeding
+	/// the counter with `seed` (the first generation it may hand out) if this is its first
+	/// use. Lock-free once seeded. The generations are never handed out again, whether or
+	/// not the caller commits them.
+	///
+	/// # Errors
+	///
+	/// The seed's error (the next caller seeds again), or when the aspect has used up
+	/// every generation.
+	pub async fn allocate_gens<Seed>(&self, aspect: &str, count: u64, seed: impl FnOnce() -> Seed) -> anyhow::Result<u64>
+	where
+		Seed: Future<Output = anyhow::Result<u64>>,
+	{
+		let lock = self.of(aspect);
+		let counter = lock.next_gen.get_or_try_init(|| async { seed().await.map(AtomicU64::new) }).await?;
+		let mut next = counter.load(Ordering::Acquire);
+		loop {
+			let after = next.checked_add(count).ok_or_else(|| anyhow::anyhow!("aspect {aspect:?} has used every frame generation"))?;
+			match counter.compare_exchange_weak(next, after, Ordering::AcqRel, Ordering::Acquire) {
+				Ok(first) => return Ok(first),
+				Err(current) => next = current,
+			}
+		}
+	}
 }
 
 /// An aspect's commit lock, held, with its seeded allocator.
@@ -113,6 +150,13 @@ impl CommitGuard {
 	/// The allocator as it stands.
 	pub const fn state(&self) -> AspectState {
 		self.state
+	}
+
+	/// Record that a commit under this guard advanced the aspect's epoch to `epoch` (a
+	/// write-once swap). Only ever raises it.
+	pub fn set_epoch(&mut self, epoch: u64) {
+		self.state.epoch = self.state.epoch.max(epoch);
+		*self.slot = Some(self.state);
 	}
 
 	/// Hand out the next id. It is never handed out again, whether or not the caller
@@ -137,6 +181,14 @@ pub struct MaintGuard {
 }
 
 impl MaintGuard {
+	/// A guard for `aspect` that holds no lock: what a maintenance operation that ignores
+	/// the maintenance lock runs under, for the tests that stage one racing another.
+	#[cfg(test)]
+	pub fn unlocked(aspect: &str) -> Self {
+		let free = Arc::new(Mutex::new(()));
+		Self { aspect: aspect.to_string(), _held: free.try_lock_owned().unwrap_or_else(|_| unreachable!("a new mutex is free")) }
+	}
+
 	/// The aspect this guard holds.
 	pub fn aspect(&self) -> &str {
 		&self.aspect
@@ -170,6 +222,31 @@ mod tests {
 		assert_eq!(ids, [5, 6]);
 		assert_eq!(next, 7, "the second taker's seed is not used");
 		assert_eq!(other_id, 0, "aspects allocate independently");
+	}
+
+	/// Generations are seeded once and handed out in runs that never overlap, per aspect;
+	/// a failed seed is retried by the next caller.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn generations_are_seeded_once_and_never_handed_out_twice() {
+		let locks = Arc::new(AspectLocks::default());
+		let failed = locks.allocate_gens("a", 1, || std::future::ready(Err(anyhow::anyhow!("the seed failed")))).await.err().map(|e| e.to_string());
+		let tasks: Vec<_> = (0..32)
+			.map(|_| {
+				let locks = locks.clone();
+				tokio::spawn(async move { locks.allocate_gens("a", 2, || std::future::ready(Ok(7))).await })
+			})
+			.collect();
+		let mut firsts = Vec::new();
+		for task in tasks {
+			firsts.push(task.await.expect("joins").expect("allocates"));
+		}
+		let other = locks.allocate_gens("b", 1, || std::future::ready(Ok(1))).await.expect("seeds another aspect");
+		let exhausted = locks.allocate_gens("c", 2, || std::future::ready(Ok(u64::MAX - 1))).await.err().map(|e| e.to_string());
+		firsts.sort_unstable();
+		assert_eq!(failed.as_deref(), Some("the seed failed"));
+		assert_eq!(firsts, (0..32).map(|i| 7 + 2 * i).collect::<Vec<u64>>(), "runs of two from the seed, none shared");
+		assert_eq!(other, 1, "aspects count independently");
+		assert!(exhausted.is_some_and(|e| e.contains("every frame generation")), "the counter never wraps");
 	}
 
 	/// The commit lock serializes its takers per aspect, and only per aspect.

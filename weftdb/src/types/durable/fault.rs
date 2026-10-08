@@ -521,9 +521,13 @@ mod tests {
 		let _ = active::faults_from_var(Some(OsString::from_vec(b"S-frame-synced:abort\xff".to_vec())));
 	}
 
+	/// Armed points are process-global, so the tests here arm points no store path reaches
+	/// (no legacy ingest has 2^32 chunks): a point a path passes, such as `G-unlinked`,
+	/// which every reconcile's reaper passes, would fail or park a maintenance operation
+	/// running in another test at the same moment.
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn hit_blocking_acts_on_a_blocking_thread() {
-		let point = FaultPoint::GUnlinked;
+		let point = FaultPoint::LChunk(u32::MAX - 1);
 		let before = hits(point);
 		tokio::task::spawn_blocking(move || hit_blocking(point)).await.unwrap().expect("an unarmed point does nothing");
 
@@ -569,7 +573,8 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn pause_parks_the_task_until_notified() {
-		let point = FaultPoint::MSwapBegun;
+		// Not `M-swap-begun`, which every reconcile and split passes (see above).
+		let point = FaultPoint::LChunk(u32::MAX - 2);
 		let resume = Arc::new(Notify::new());
 		let _armed = arm(point, FaultAction::Pause(resume.clone()));
 		let before = hits(point);

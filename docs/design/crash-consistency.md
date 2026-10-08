@@ -163,6 +163,7 @@ The mode is set store-wide by `WEFT_DURABILITY`. The default is `strict`. It is 
 - **New:** `{enc(aspect)}~g{gen}~p{prec}.weftseg`.
   - `enc` keeps the bytes `[a-z0-9_]` literal and writes every other byte, including uppercase letters, `-`, `.`, `/`, `~` and `%`, as `%XX` in uppercase hex. The result contains no `/`, `.`, `-` or `~`, so there is no traversal (today the raw name is joined at segment_store.rs:636). Lowercase literals and uppercase hex escapes can never coincide, so the mapping stays injective even under case folding, which removes the Windows/macOS case-collision risk without rejecting any existing aspect name. Every non-ASCII byte is escaped as well, so an encoded name is plain ASCII and a normalising filesystem (HFS+) cannot merge the NFC and NFD spellings of one name into one file either. Both properties are requirements: legacy `{aspect}-{id}` names still collide in both ways (the aspect-name validator rejects names that leave `segments/`, name a device or display deceptively, not names that differ only in case or normalisation), and S10 is what removes the collision for new frames.
   - `enc` can triple a name's length, and the aspect-name validator already accepts names up to 160 bytes (`MAX_ASPECT_NAME_BYTES`). Such a name with uppercase letters, `-`, `.` or non-ASCII bytes encodes to as much as 480 bytes, and the `~g{gen}~p{prec}.weftseg` suffix adds more, well past the common 255-byte file-name limit. S10 must store every name the validator accepts, for example by falling back to a truncated encoding plus a hash of the full name when the encoded file name would be too long (the catalog keeps the real name). Otherwise the 160-byte cap has to be lowered before S10 ships, which would strand aspects already declared under longer names.
+  - As built (S8): `enc` is `weftdb::aspect_name::encode`, and a name whose encoding is longer than 200 bytes gets the stem `{first ≤160 bytes of enc, cut on an escape boundary}~h{FNV-1a 64 of the name, 16 lowercase hex}`, so every name the validator accepts gets a file name of at most 252 bytes (`frame_name.rs`). Such a stem holds no `-` and is told from a plain one by its `~`.
   - `gen` comes from a per-aspect counter that is never reused. `prec` is the adoption-order key: `gen` for seals, and the max member `prec` for maintenance outputs (legacy members count as 0).
   - Legacy names always contain `-{digits}.weftseg`; new names never contain `-`. The two forms are therefore disjoint.
 - **Sidecars:** `{frame stem}.weftpart`. For legacy frames this is exactly today's `{aspect}-{id}.weftpart` (segment_store.rs:641-643).
@@ -295,7 +296,7 @@ After success, update AspectState and release the lock.
   - Members are an overlap closure, or a contiguous id run in compaction (segment_store.rs:1642-1660), so no non-member that existed at the snapshot shares timestamps with the outputs.
   - Today's fold order, members ascending by id with newer wins (segment_store.rs:1380-1399, merge at weft-physical-type/src/split.rs:147), is preserved.
 
-**M3. Pending journal.** Commit `frame_journal` 'pending' rows for every output name. This is a small FULL commit. It needs no lock, because the names are unique.
+**M3. Pending journal.** Commit `frame_journal` 'pending' rows for every output name. This is a small FULL commit. It needs no lock, because the names are unique. As built (S8): the same commit raises `aspect_seq.next_gen` past the outputs' generations, so a gen journaled by a run that then crashed is never handed out again, and it takes `aspect.commit` (briefly) so that its `aspect_seq` write never conflicts with a seal's.
 
 **M4. Build outputs.**
 - Decode the inputs, checking `len == byte_len` and the CRC against `frame_crc`.
@@ -316,6 +317,8 @@ This single transaction replaces today's separate commits at segment_store.rs:99
 
 **M6. Release.** Release the locks, hand the retired names to the reaper, and refresh sidecars for the outputs (detached).
 
+As built (S8, `reconcile_segment` and `split_segment`): the rollup is rebuilt in `metadata.db` under `aspect.commit` right after the COMMIT (the interim until S11), and the epoch the swap commits in is `aspect_seq.epoch + 1`, which is also each output's `commit_epoch` and the retired rows' `retire_epoch`. A failure certain not to have committed (Conflict included) unlinks the outputs this run wrote, fsyncs `segments/`, then deletes their pending rows; an output whose own write failed keeps its pending row for the reaper or R6. The sidecars of the outputs are written inline after the swap, through `StoreFs`, under `.tmp-*` and renamed into place. A split re-checks the precedence rule under `aspect.commit` against the rows the swap commits over, and allocates the suffix id there.
+
 ### 5.4 REAPER (S8)
 
 - **G1.** Select retired journal rows that are eligible under the reclaim pins and `gc_hold == 0`.
@@ -324,6 +327,7 @@ This single transaction replaces today's separate commits at segment_store.rs:99
 - **G4.** `DirSyncer.sync()`.
 - **G5.** One commit deletes the processed journal rows.
 - The same task prunes ledger rows past their TTL (S13) and quarantine entries past their TTL (S12).
+- As built (S8): there is no reaper task; the reaper runs at the end of every reconcile and split (on its aspect, under `aspect.maint`), and on demand through `SegmentStore::reap`, which takes each aspect's `aspect.maint` in turn. The eligibility epochs are in memory (`reaper::ReclaimEpochs`): right after a swap's COMMIT the store records its retired names under the current reclaim epoch and advances it, and a read pins the epoch it starts in, so a retired frame goes once no pin of its epoch or an earlier one is alive; a name this process did not retire (left by a previous one) is not pinned by any of its reads. Pins are RAII guards held by the read futures, so a dropped (timed-out) read releases its pin. `gc_hold` is an RAII hold as well. Pending rows of the aspect are processed too (the caller holds `aspect.maint`, so they are abandoned). An unlink that fails with `EBUSY`, or on Windows with a sharing or lock violation, keeps its row for a later pass and is not an error. G3's sidecar half: the id-named sidecar of a retired legacy `{aspect}-{id}` frame goes when no live row has that id.
 
 ### 5.5 OPEN, SHUTDOWN, POISON
 
@@ -384,6 +388,8 @@ Record the maximum legacy id and the maximum gen per aspect, across both directo
 - 'retired' but referenced: keep the file and log it (the guard).
 
 Then fsync `segments/`, and make one commit that deletes the processed rows.
+
+As built (S8, the minimal replay): this runs at the end of every open whose layout this build may write, after the scope registration, and also rebuilds the rollup of every aspect whose retired rows it processed (a swap that committed before a crash may not have reached its rollup rebuild). An unlink that fails leaves its row for the reaper and does not fail the open.
 
 **R7. Verify every live row.**
 - Stat the resolved path. A missing frame, or a length different from `byte_len`, quarantines the row: one IndexTxn per aspect runs QuarantineRow, LedgerInvalidateSpan and a rollup recompute, and any file goes to `quarantine/`. Reads over that span then succeed with the remaining data, instead of every overlapping query failing as it does today at segment_store.rs:749, 883, 921 and 1818.

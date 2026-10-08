@@ -136,6 +136,16 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   which stays at zero unless something outside the store contends for the index. Under
   the `fault-injection` feature `SegmentStore` has a hidden `hold_maintenance` test hook,
   used by `cargo test -p weft-server --features fault-injection --test maintenance_busy`.
+- `SegmentStore::reap(MaintenanceWait)` (`weftdb::ReapSweep`): runs the reaper of the
+  frame journal (see the write-once maintenance entry under Changed) over every aspect
+  with journal rows, unlinking each frame a reconcile or split retired once no running
+  read and no backup may still need it. Reconciles and splits reap after themselves, and
+  every open replays the whole journal, so this is for frames a long read still held, or
+  that the filesystem asked to retry later.
+- `weftdb::aspect_name::encode` and `decode`: the file-name form of an aspect name in the
+  write-once frame names (crash-consistency design §4): `[a-z0-9_]` as they are, every
+  other byte as `%XX` in uppercase hex, injective even where the filesystem folds case
+  or normalises Unicode.
 
 ### Changed
 
@@ -396,6 +406,40 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   their signatures, wait up to `SegmentStore::maintenance_wait()` (30 s,
   `DEFAULT_MAINTENANCE_WAIT`; change it with `with_maintenance_wait`), and then fail
   with the new `MaintenanceBusy` error.
+- **Reconcile and split are write-once** (crash-consistency design §5.3-5.4, S8).
+  `reconcile_segment` (and every reconcile pass built on it) and `split_segment` no
+  longer rewrite a `.weftseg` frame. Their outputs are new frames in `segments/` named
+  `{enc(aspect)}~g{gen}~p{prec}.weftseg` (the aspect name encoded as by
+  `aspect_name::encode`, a per-aspect generation that is never handed out twice, and the
+  adoption order; an aspect name that would encode past the file-name limit is cut and
+  completed with a hash, `…~h{16 hex digits}~g…`), journaled as pending in
+  `segment_index.db`'s `frame_journal`, written and fsynced, then `segments/` fsynced.
+  One `segment_index.db` transaction then swaps them in: it replaces the segment's row
+  only if it is still the version that was read (id, generation and frame CRC; another
+  version fails the operation with a `Conflict` and writes nothing back), inserts a
+  split's suffix under an id allocated inside it, journals the old frame as retired,
+  and advances the aspect's epoch and generation counter. The old frame is unlinked by
+  the reaper once no read that may still open it is running (every read pins the
+  reclaim epoch it started in, released when its future is dropped, timed out or not),
+  then its journal row is deleted; a frame the filesystem refuses to unlink for now (a
+  Windows sharing violation, `EBUSY`) waits for a later pass instead of failing anything.
+  Every open replays the journal before it returns: outputs a crash left before their
+  swap are unlinked, retired frames no row references are unlinked, `segments/` is
+  fsynced, the rows are deleted, and the rollup of an aspect whose swap committed is
+  rebuilt. A reconcile also checks that the frame it reads is the one its row was
+  committed with (its length, and its CRC once bound), and the sidecars of its outputs
+  are written under a `.tmp-*` name and renamed into place. The overlap merge, squash
+  and compaction still rewrite in place until S9; when they rewrite a segment a
+  reconcile or split had moved to a write-once frame, they go back to its
+  `{aspect}-{id}.weftseg` name and remove the write-once frame. An older layout-2
+  WeftDB reads the new frames (the index keeps recording root-joined paths) but does not
+  replay the journal.
+- ⚠️ **`split_segment` refuses a split whose suffix a newer segment overlaps.** The
+  suffix takes an id above every segment of the aspect, so where it shares a timestamp
+  with a segment sealed after the split one it would outrank that segment's newer
+  value. The split now fails with an error, changing nothing, when any segment with a
+  higher id overlaps `[boundary, max_ts]`; the check runs again under the aspect's
+  commit lock right before the swap, against a seal that committed meanwhile.
 - **Advisory codecs moved behind the `experimental-codecs` feature** (`weft-physical-type`).
   ⚠️ Breaking for code that calls them: the `floatcodec` module (Gorilla-XOR, Chimp,
   Chimp128, Elf and `best_f64_*`), `ColumnEncoding::{gorilla_f64_bytes, best_f64_bytes,
@@ -435,6 +479,21 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Fixed
 
+- **Power loss during or after a reconcile or split could lose or tear rows.** Both
+  rewrote the segment's frame in place with an unsynced write (a split also wrote its
+  suffix that way), so a power cut, even after the call returned, could leave a
+  committed row over an empty, torn or zero-filled frame: its rows gone and every read
+  over them failing with a checksum error. Their outputs are now fsynced, under new
+  names, before the commit that switches to them (see Changed).
+- **A read during a reconcile or split could fail or see rows twice.** A read could open
+  a frame half way through its in-place rewrite, and a split committed its suffix before
+  it shrank its prefix, so a read in between returned the suffix's rows twice. A swap is
+  now one transaction, and the frames it retires stay until no read that may open them
+  is running.
+- **A reconcile whose segment another operation changed meanwhile wrote it back.** Its
+  swap now requires the segment's row to be the version it read and fails with a
+  `Conflict` otherwise (the maintenance lock already keeps the store's own operations
+  apart; this holds for anything else that writes the index).
 - **Concurrent seals of one aspect could lose an acknowledged batch.** Two seals that
   ran at once took the same id: the later one's write replaced the earlier one's frame
   and its row, so a batch whose seal had succeeded was gone, or one of the seals failed
