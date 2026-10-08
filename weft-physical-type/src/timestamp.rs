@@ -1749,6 +1749,42 @@ impl DeltaOfDeltaColumn {
 		8 + self.first_delta.map_or(0, zigzag_varint_len) + for_bitpack_bytes(&self.dods, BLOCKED_BITPACK_BLOCK)
 	}
 
+	/// The largest integer every first-order delta of the column is a multiple of (the GCD of
+	/// the first delta and every second difference), or [`None`] when it is `0` or `1` or the
+	/// column has no deltas. A microsecond column of millisecond-precise instants has `1000`
+	/// here.
+	#[must_use]
+	pub fn common_multiple(&self) -> Option<u64> {
+		const fn gcd(mut a: u64, mut b: u64) -> u64 {
+			while b != 0 {
+				(a, b) = (b, a % b);
+			}
+			a
+		}
+		let first = self.first_delta?.unsigned_abs();
+		let g = self.dods.iter().fold(first, |g, &d| if g == 1 { 1 } else { gcd(g, d.unsigned_abs()) });
+		(g > 1).then_some(g)
+	}
+
+	/// **Advisory** packed size after factoring out the column's [`common_multiple`](Self::common_multiple)
+	/// (roadmap Phase 6.1, pco's `IntMult` mode).
+	///
+	/// Divides the first delta and every second difference by the common multiple `g`, then takes
+	/// [`best_estimated_bytes`](Self::best_estimated_bytes) of the reduced column plus one varint
+	/// for `g`. Every delta is `g` times an integer, so the reduction is exact and the declared
+	/// [`TimeUnit`] is unchanged. Real deployments do this all the time by storing
+	/// millisecond-precise instants in a microsecond column, where every second difference
+	/// carries three wasted decimal digits (`benches/timestamp_vs_pco.rs`: 20 bits/value shipped
+	/// vs 9 for pco). `None` when there is no common multiple above 1. Not yet a realized
+	/// timestamp codec: adopting it changes the headline bytes/point.
+	#[must_use]
+	pub fn common_multiple_estimated_bytes(&self) -> Option<usize> {
+		let g = self.common_multiple()?;
+		let divisor = i64::try_from(g).ok()?;
+		let reduced = Self { first: self.first, first_delta: self.first_delta.map(|d| d / divisor), dods: self.dods.iter().map(|&d| d / divisor).collect(), unit: self.unit };
+		Some(reduced.best_estimated_bytes() + uvarint_len(g))
+	}
+
 	/// The smallest of the plain-varint, RLE, bit-packed, Gorilla, and per-block adaptive
 	/// bit-pack second-difference estimates — the realistic stored size once the cheapest
 	/// codec is chosen.
@@ -2482,6 +2518,30 @@ mod tests {
 		// Empty stream encodes to nothing and decodes to nothing.
 		assert!(transpose_bitpack_encode(&[], 64).is_empty());
 		assert_eq!(transpose_bitpack_decode(&[], 64, 0), Vec::<i64>::new());
+	}
+
+	#[test]
+	fn common_multiple_factors_ms_precise_instants_out_of_a_micros_column() {
+		// Millisecond-precise irregular instants stored in microseconds: every delta is a
+		// multiple of 1000, the reduced column is exactly the millisecond one, and the estimate
+		// is the millisecond column's best size plus a varint for the factor.
+		let ms: Vec<i64> = (0..2_000_i64).scan(1_700_000_000_000_i64, |t, i| {
+			*t += 1 + (i * 7_919) % 500;
+			Some(*t)
+		}).collect();
+		let micros: Vec<i64> = ms.iter().map(|&t| t * 1_000).collect();
+		let col = encode_delta_of_delta(&micros, TimeUnit::Micros);
+		assert_eq!(col.common_multiple(), Some(1_000));
+		let as_ms = encode_delta_of_delta(&ms, TimeUnit::Millis);
+		assert_eq!(col.common_multiple_estimated_bytes(), Some(as_ms.best_estimated_bytes() + uvarint_len(1_000)));
+		assert!(col.common_multiple_estimated_bytes().unwrap_or(usize::MAX) < col.best_estimated_bytes(), "factoring must save here");
+		// No shared factor (an odd stride step), too few points, and a regular column whose
+		// only delta is the stride itself.
+		assert_eq!(encode_delta_of_delta(&[0, 3, 7, 12], TimeUnit::Micros).common_multiple(), None);
+		assert_eq!(encode_delta_of_delta(&[5], TimeUnit::Micros).common_multiple(), None);
+		assert_eq!(encode_delta_of_delta(&[0, 60, 120, 180], TimeUnit::Seconds).common_multiple(), Some(60));
+		// Negative and extreme deltas never panic.
+		assert_eq!(encode_delta_of_delta(&[i64::MAX, 0, i64::MIN], TimeUnit::Micros).common_multiple(), None);
 	}
 
 	#[test]

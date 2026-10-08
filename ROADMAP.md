@@ -527,8 +527,13 @@ detection within Y% and improving historical query latency by Z."*
       0.001 (the window is perfectly regular, so both are free); **ms_as_micros** (ms-precise instants
       stored in µs) **20.000 vs 9.001**; **jittered_micros** 20.000 vs 19.001. pco decode 0.88 /
       1.63 / 1.28 ms.
-    - [ ] **NEW — factor a timestamp column's common multiple (pco's `IntMult`) before DoD
-      packing.** A µs column holding ms-precise instants costs WeftDB **20 bits/value against pco's
+    - [x] **DONE (2026-10-08, advisory) — factor a timestamp column's common multiple (pco's `IntMult`) before DoD
+      packing.** Shipped as `DeltaOfDeltaColumn::common_multiple()` (the GCD of the first delta and
+      every second difference) and `common_multiple_estimated_bytes()` (the shipped selector's best
+      over the reduced column, plus a varint for g). Measured on ms_as_micros at **20.000 → 10.000
+      bits/value** (g = 1000; pco 9.001). On real btc_minutes it finds g = 60 at no gain (already
+      0 bits); on jittered µs it finds none. Next: realize it as a timestamp codec flag (owner-gated,
+      headline change) and surface it as a `StorageEstimate` advisory. Original rationale: A µs column holding ms-precise instants costs WeftDB **20 bits/value against pco's
       9**, because every second difference carries three wasted decimal digits. This is the
       timestamp twin of the decimal-exponent FOR. Per block (or column), compute the GCD of the
       deltas, store it once, and pack `dod / gcd`. Expect ~10 bits on that corpus. It stays exact,

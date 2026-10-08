@@ -1,7 +1,8 @@
 //! Timestamp-column half of the Pcodec evaluation (roadmap Phase 6.1, "run the bench head to
 //! head per column — pco `IntMult` vs the shipped delta/blocked/Gorilla timestamp codecs"):
-//! bits/value of the shipped delta-of-delta codec selector against `pco` on the raw epochs, and
-//! decode time for `pco`.
+//! bits/value of the shipped delta-of-delta codec selector, of the advisory common-multiple
+//! factor (`DeltaOfDeltaColumn::common_multiple_estimated_bytes`), and of `pco` on the raw epochs,
+//! and decode time for `pco`.
 //!
 //! The shipped side is sized exactly as a sealed segment sizes it:
 //! `encode_delta_of_delta(ts, unit).best_estimated_bytes()` over plain varint, RLE, fixed and
@@ -12,8 +13,8 @@
 //!
 //! - `btc_minutes`: 1 Mi real one-minute BTC timestamps in seconds from
 //!   `database/datasets/btc_1min.csv` (rows 3,000,000 onward; `WEFT_BTC_CSV` overrides the
-//!   path; skipped with a note when absent). Mostly a regular 60 s stride, with the feed's
-//!   real gaps.
+//!   path; skipped with a note when absent). This window turns out to be gap-free (a
+//!   constant 60 s stride), so it measures only the regular case.
 //! - `ms_as_micros`: an irregular event stream whose instants are millisecond-precise but
 //!   stored in microseconds, the regime pco's `IntMult` mode names ("ms-precise timestamps
 //!   stored as us").
@@ -91,6 +92,10 @@ fn bench_timestamps(c: &mut Criterion) {
 		assert_eq!(pco::standalone::simple_decompress::<i64>(&pco_bytes).expect("pco decompresses"), *ts, "{name}: pco must round-trip exactly");
 		eprintln!("== {name} ({N} timestamps) — bits/value");
 		eprintln!("  weft dod best ({:<22}) {:>7.3}", dod.best_encoding_name(), bits_per_value(dod.best_estimated_bytes()));
+		match dod.common_multiple_estimated_bytes() {
+			Some(bytes) => eprintln!("  weft dod / common multiple {:>8} {:>7.3}", dod.common_multiple().unwrap_or(1), bits_per_value(bytes)),
+			None => eprintln!("  weft dod / common multiple      none"),
+		}
 		eprintln!("  pco                                {:>7.3}", bits_per_value(pco_bytes.len()));
 
 		let mut group = c.benchmark_group(format!("timestamp_decode_1mi/{name}"));
