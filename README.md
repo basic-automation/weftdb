@@ -78,9 +78,14 @@ on your hardware. Where WeftDB doesn't win, this README says so.
 cargo build --release
 ```
 
-Prefer not to build from source? Pre-built `weft-server`, `weft-tui` and `weft-bench`
-binaries for Linux, macOS and Windows are attached to every
-[GitHub release](https://github.com/basic-automation/weftdb/releases).
+Prefer not to build from source? From v0.1.0 on, each
+[GitHub release](https://github.com/basic-automation/weftdb/releases) carries pre-built
+`weft-server`, `weft-tui` and `weft-bench` archives for Linux (x86_64 and aarch64),
+macOS (x86_64 and Apple silicon) and Windows (x86_64), and a `SHA256SUMS` file to check
+them with `sha256sum -c SHA256SUMS`. The Linux binaries are built on Ubuntu 24.04 and
+need glibc 2.39 or newer. The macOS and Windows binaries are not signed, so Gatekeeper
+and SmartScreen will warn before running them. Until the first release is published
+there, build from source.
 
 ### 1. Start the server
 
@@ -200,7 +205,8 @@ deployment.
 | Backup & restore (control plane) | Working, with verification and a rehearsal drill |
 | Observability — Prometheus metrics, OpenTelemetry traces | Working |
 | **Security — TLS, auth, RBAC, audit logs** | **Not started** |
-| Packaging — Docker, Helm, binaries | Not started |
+| Pre-built binaries (Linux, macOS, Windows) | Release pipeline in place; first release (v0.1.0) not yet published |
+| Packaging — Docker, Helm | Not started |
 | Client SDKs (Python, TypeScript) | Not started |
 | Per-measurement tags | Not started |
 
@@ -622,8 +628,8 @@ weft-orchestration = "0.1"  # the analytics pipeline
 | [`weft-arrow-store`](https://crates.io/crates/weft-arrow-store) | A stored range read straight into an Arrow `RecordBatch`. |
 
 `weft-server`, `weft-tui` and `weft-bench` are binaries rather than libraries, so they
-are not published to crates.io — take them from the
-[release binaries](https://github.com/basic-automation/weftdb/releases) or build them
+are not published to crates.io — take them from the archives on a
+[GitHub release](https://github.com/basic-automation/weftdb/releases) or build them
 from this repository.
 
 The examples below are illustrative — run `cargo doc --open` for the authoritative,

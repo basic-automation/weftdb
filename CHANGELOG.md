@@ -426,8 +426,9 @@ number says so.
 - **Weft-Bench** (`weft-bench`), a reproducible, correctness-gated benchmark harness.
 - **Analytics pipeline** (`weft-orchestration`) chaining batching, pattern extraction,
   event detection, correlation and signal generation.
-- Pre-built `weft-server`, `weft-tui` and `weft-bench` binaries for Linux, macOS and
-  Windows (x86_64 and arm64) attached to every GitHub release.
+- Pre-built `weft-server`, `weft-tui` and `weft-bench` archives for Linux (x86_64 and
+  aarch64), macOS (x86_64 and arm64) and Windows (x86_64), with a `SHA256SUMS` file,
+  attached to the GitHub release.
 
 ### Changed
 
