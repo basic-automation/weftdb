@@ -5,10 +5,12 @@ use ::weftdb::{
 };
 use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, BenchmarkId, Criterion};
 use splimes::{Resolution, Spline};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
+
+mod common;
 
 fn benchmark_aspect_creation(c: &mut Criterion) {
 	// Suppress verbose logging during benchmarks
@@ -20,7 +22,7 @@ fn benchmark_aspect_creation(c: &mut Criterion) {
 	// Create a single shared database and subject for all aspect creation benchmarks
 	let (db, subject, db_name) = rt.block_on(async {
 		let db_name = format!("bench_aspect_shared_{}", Uuid::new_v4());
-		std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+		common::remove_database(&db_name);
 
 		let db = Database::new(&db_name).await.unwrap();
 		let subject = db.observe_subject("bench_subject").await.unwrap();
@@ -42,7 +44,7 @@ fn benchmark_aspect_creation(c: &mut Criterion) {
 	// Cleanup
 	rt.block_on(async {
 		db.close().await.unwrap();
-		std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+		common::discard_database(&db_name).await;
 	});
 }
 
@@ -73,7 +75,7 @@ fn benchmark_data_insertion(c: &mut Criterion) {
 	// Cleanup
 	rt.block_on(async {
 		db.close().await.unwrap();
-		std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+		common::discard_database(&db_name).await;
 	});
 }
 
@@ -105,7 +107,7 @@ fn benchmark_batch_insertion(c: &mut Criterion) {
 	// Cleanup
 	rt.block_on(async {
 		db.close().await.unwrap();
-		std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+		common::discard_database(&db_name).await;
 	});
 }
 
@@ -148,7 +150,7 @@ fn benchmark_point_analysis(c: &mut Criterion) {
 	// Cleanup
 	rt.block_on(async {
 		db.close().await.unwrap();
-		std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+		common::discard_database(&db_name).await;
 	});
 }
 
@@ -193,7 +195,7 @@ fn benchmark_range_analysis(c: &mut Criterion) {
 	// Cleanup
 	rt.block_on(async {
 		db.close().await.unwrap();
-		std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+		common::discard_database(&db_name).await;
 	});
 }
 
@@ -229,7 +231,7 @@ fn benchmark_cache_usage(c: &mut Criterion) {
 	// Cleanup
 	rt.block_on(async {
 		db.close().await.unwrap();
-		std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+		common::discard_database(&db_name).await;
 	});
 }
 
@@ -272,9 +274,12 @@ fn benchmark_concurrent_access(c: &mut Criterion) {
 	// Cleanup
 	rt.block_on(async {
 		db.close().await.unwrap();
-		std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+		common::discard_database(&db_name).await;
 	});
 }
 
 criterion_group!(benches, benchmark_aspect_creation, benchmark_data_insertion, benchmark_batch_insertion, benchmark_point_analysis, benchmark_range_analysis, benchmark_cache_usage, benchmark_concurrent_access);
-criterion_main!(benches);
+
+fn main() {
+	common::criterion_main(&[benches]);
+}
