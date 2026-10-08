@@ -1,13 +1,13 @@
 //! WeftDB system adapter.
 //!
-//! Drives WeftDB's own interpolation engine (`splimes::auto_interpolate`, which
-//! already selects CPU / SIMD / parallel / GPU strategies internally) through
-//! the vendor-neutral [`SystemAdapter`] trait. This is the reference adapter the
-//! competitor adapters are measured against.
+//! Drives WeftDB's own interpolation engine (splimes' [`Interpolator`] on its default
+//! `Backend::Auto`, which picks the serial, rayon or — once `splimes::calibrate` has run —
+//! GPU backend by grid size) through the vendor-neutral [`SystemAdapter`] trait. This is
+//! the reference adapter the competitor adapters are measured against.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use splimes::{Point, Resolution, Spline};
+use splimes::{Interpolator, Point, Resolution, Spline};
 
 use crate::adapter::SystemAdapter;
 
@@ -30,6 +30,11 @@ impl SystemAdapter for WeftAdapter {
 	}
 
 	async fn interpolate_range(&self, points: &mut [Point], start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, spline: Spline) -> anyhow::Result<Vec<Point>> {
-		splimes::auto_interpolate(points, start, end, resolution, spline).await
+		// splimes is synchronous and CPU-bound, so it runs on tokio's blocking pool, as it
+		// does behind weft-server; the measured latency includes that hand-off. The blocking
+		// task must own its input: the trait lets an adapter mutate the slice (the harness
+		// hands every rep a fresh clone), so the values are moved out, not copied.
+		let owned: Vec<Point> = points.iter_mut().map(|p| Point::new(p.timestamp, std::mem::take(&mut p.value))).collect();
+		Ok(Interpolator::new(spline, resolution).run_async(owned, start, end).await?.into_points())
 	}
 }

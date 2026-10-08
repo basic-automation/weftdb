@@ -27,7 +27,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
-splimes = { workspace = true }
+splimes = { workspace = true, features = ["tokio"] }
 sysinfo = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 

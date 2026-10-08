@@ -1172,7 +1172,7 @@ pub async fn create_correlations_for_events(database: &Database, dictionary: &Di
 				}
 
 				for window in manifestation_times.windows(2) {
-					if let Ok(diff) = pattern_resolution.difference(&window[1], &window[0]) {
+					if let Ok(diff) = weftdb::units_between(pattern_resolution, &window[1], &window[0]) {
 						if diff > 0 {
 							total_distance += diff;
 							distance_count += 1;
@@ -1227,9 +1227,9 @@ async fn process_correlation_signals(correlation: &weftdb::Correlation, events: 
 
 				let occurrence_end = *occurrence.end();
 				let pattern_resolution = *occurrence.resolution();
-				let time_diff_start = pattern_resolution.difference(&manifestation_start, &occurrence_end)?;
-				let time_diff_midpoint = pattern_resolution.difference(&manifestation_midpoint, &occurrence_end)?;
-				let time_diff_end = pattern_resolution.difference(&manifestation_end, &occurrence_end)?;
+				let time_diff_start = weftdb::units_between(pattern_resolution, &manifestation_start, &occurrence_end)?;
+				let time_diff_midpoint = weftdb::units_between(pattern_resolution, &manifestation_midpoint, &occurrence_end)?;
+				let time_diff_end = weftdb::units_between(pattern_resolution, &manifestation_end, &occurrence_end)?;
 
 				if occurrence_end >= manifestation_start {
 					continue;
@@ -1260,7 +1260,7 @@ async fn process_correlation_signals(correlation: &weftdb::Correlation, events: 
 					let manifestation_start = *manifestation.start();
 					if occurrence_end < manifestation_start {
 						let pattern_resolution = *occurrence.resolution();
-						if let Ok(diff) = pattern_resolution.difference(&manifestation_start, &occurrence_end) {
+						if let Ok(diff) = weftdb::units_between(pattern_resolution, &manifestation_start, &occurrence_end) {
 							if diff > 0 {
 								min_distance = Some(min_distance.map_or(diff, |current| current.min(diff)));
 							}

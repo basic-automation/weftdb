@@ -35,7 +35,7 @@ wide = { workspace = true }
 bytemuck = { workspace = true, features = ["derive"] }
 fastrand = { workspace = true }
 futures = { workspace = true }
-splimes = { workspace = true }
+splimes = { workspace = true, features = ["tokio"] }
 weft-physical-type = { workspace = true }
 weft-reduce = { workspace = true }
 once_cell = { workspace = true }

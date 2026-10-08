@@ -16,6 +16,12 @@
 //! downsample handlers and their tests untouched while the router gains a second
 //! dependency.
 //!
+//! ## Interpolation settings
+//!
+//! The interpolation handlers extract an [`InterpolateConfig`] the same way (it is
+//! `Copy`): the binary reads it from the environment once at startup
+//! (`WEFT_MAX_INTERPOLATE_POINTS`), and [`AppState::new`] carries the defaults.
+//!
 //! ## The store is optional on purpose
 //!
 //! A segment store is only present when the operator configures a store root (see
@@ -29,39 +35,49 @@ use std::sync::Arc;
 use axum::extract::FromRef;
 use weftdb::SegmentStore;
 
-use crate::metrics::SharedMetrics;
+use crate::{interpolate::InterpolateConfig, metrics::SharedMetrics};
 
-/// The router state shared by every handler: the process metrics plus an optional
-/// segment store backing the storage-query endpoints.
+/// The router state shared by every handler: the process metrics, the interpolation
+/// settings, and an optional segment store backing the storage-query endpoints.
 ///
-/// Cheap to clone — both fields are `Arc`-backed handles.
+/// Cheap to clone — the metrics and store are `Arc`-backed handles, the settings `Copy`.
 #[derive(Clone, Default)]
 pub struct AppState {
 	/// Process-lifetime counters (`/metrics`), shared with the capability handlers.
 	metrics: SharedMetrics,
 	/// The on-disk segment store, present only when a store root is configured.
 	store: Option<Arc<SegmentStore>>,
+	/// What the `/api/v1/interpolate*` handlers allow (the output-grid cap).
+	interpolate: InterpolateConfig,
 }
 
 impl AppState {
-	/// Build state with a fresh metrics registry and no segment store — the shape
-	/// the stateless API (and the existing tests) run under.
+	/// Build state with a fresh metrics registry, the default interpolation settings
+	/// and no segment store — the shape the stateless API (and the existing tests) run
+	/// under.
 	#[must_use]
 	pub fn new() -> Self {
 		Self::default()
 	}
 
 	/// Build state over a caller-supplied [`SharedMetrics`] (so a test can observe
-	/// the counters) and no segment store.
+	/// the counters), the default interpolation settings and no segment store.
 	#[must_use]
 	pub const fn with_metrics(metrics: SharedMetrics) -> Self {
-		Self { metrics, store: None }
+		Self { metrics, store: None, interpolate: InterpolateConfig::DEFAULT }
 	}
 
 	/// Attach a segment store, enabling the storage-query endpoints.
 	#[must_use]
 	pub fn with_store(mut self, store: Arc<SegmentStore>) -> Self {
 		self.store = Some(store);
+		self
+	}
+
+	/// Replace the interpolation settings (the binary's `WEFT_MAX_INTERPOLATE_POINTS`).
+	#[must_use]
+	pub const fn with_interpolate_config(mut self, config: InterpolateConfig) -> Self {
+		self.interpolate = config;
 		self
 	}
 
@@ -76,11 +92,23 @@ impl AppState {
 	pub const fn store(&self) -> Option<&Arc<SegmentStore>> {
 		self.store.as_ref()
 	}
+
+	/// The interpolation settings.
+	#[must_use]
+	pub const fn interpolate_config(&self) -> InterpolateConfig {
+		self.interpolate
+	}
 }
 
 impl FromRef<AppState> for SharedMetrics {
 	fn from_ref(state: &AppState) -> Self {
 		state.metrics.clone()
+	}
+}
+
+impl FromRef<AppState> for InterpolateConfig {
+	fn from_ref(state: &AppState) -> Self {
+		state.interpolate
 	}
 }
 
@@ -92,6 +120,8 @@ mod tests {
 	fn default_state_has_metrics_and_no_store() {
 		let state = AppState::new();
 		assert!(state.store().is_none());
+		assert_eq!(state.interpolate_config(), InterpolateConfig::DEFAULT);
+		assert_eq!(AppState::with_metrics(SharedMetrics::default()).interpolate_config(), InterpolateConfig::DEFAULT);
 		// The metrics handle is real and usable.
 		state.metrics().record_interpolate_request();
 		let requests = state.metrics().snapshot().interpolate.requests;
@@ -109,5 +139,13 @@ mod tests {
 		drop(state);
 		projected.record_interpolate_request();
 		assert_eq!(metrics.snapshot().interpolate.requests, 1);
+	}
+
+	#[test]
+	fn from_ref_projects_the_interpolate_config() {
+		let config = InterpolateConfig::new(std::num::NonZeroUsize::new(10).unwrap());
+		let state = AppState::new().with_interpolate_config(config);
+		assert_eq!(InterpolateConfig::from_ref(&state), config);
+		assert_eq!(InterpolateConfig::from_ref(&state).max_output_points(), 10);
 	}
 }

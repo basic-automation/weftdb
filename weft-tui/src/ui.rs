@@ -335,6 +335,8 @@ fn format_time_label(value_seconds: f64, resolution: Resolution) -> String {
 				(value_ns, "ns")
 			}
 		}
+		// `Resolution` is `#[non_exhaustive]`: one added after splimes 1.0 shows plain seconds.
+		_ => (value_seconds, "s"),
 	};
 
 	// Format with appropriate precision
@@ -389,6 +391,8 @@ fn format_date_for_resolution(timestamp: DateTime<Utc>, resolution: Resolution) 
 		Resolution::Years => {
 			format!("{}", timestamp.year())
 		}
+		// `Resolution` is `#[non_exhaustive]`: one added after splimes 1.0 shows date and time.
+		_ => timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
 	}
 }
 
@@ -458,6 +462,8 @@ fn draw_plot(f: &mut Frame, app: &App, area: Rect) {
 		Resolution::Weeks => "w",
 		Resolution::Months => "mo",
 		Resolution::Years => "y",
+		// `Resolution` is `#[non_exhaustive]`: one added after splimes 1.0 shows its name.
+		_ => resolution.as_str(),
 	};
 	let time_axis_title = format!("Time [{}]", time_unit);
 
