@@ -184,18 +184,20 @@ jobs:
     strategy:
       fail-fast: false
       # Every runner builds its own native target, so no cross toolchain is needed.
-      # Keep this list in step with TARGETS in the checksums job.
+      # The images are pinned, not *-latest: the Linux image sets the glibc the binaries
+      # need (README.md states it), and a floating label would move it silently.
+      # Keep this list in step with TARGETS in the checksums job, and with RELEASING.md.
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
           - os: macos-15-intel
             target: x86_64-apple-darwin
-          - os: macos-latest
+          - os: macos-15
             target: aarch64-apple-darwin
-          - os: windows-latest
+          - os: windows-2025
             target: x86_64-pc-windows-msvc
     steps:
       - name: Check out the verified commit

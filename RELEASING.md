@@ -63,14 +63,17 @@ natively on five targets — no cross toolchains — with the compiler from
 
 | Target | Runner |
 |--------|--------|
-| `x86_64-unknown-linux-gnu` | `ubuntu-latest` |
+| `x86_64-unknown-linux-gnu` | `ubuntu-24.04` |
 | `aarch64-unknown-linux-gnu` | `ubuntu-24.04-arm` |
 | `x86_64-apple-darwin` | `macos-15-intel` |
-| `aarch64-apple-darwin` | `macos-latest` |
-| `x86_64-pc-windows-msvc` | `windows-latest` |
+| `aarch64-apple-darwin` | `macos-15` |
+| `x86_64-pc-windows-msvc` | `windows-2025` |
 
-Intel macOS used to build on `macos-13`, which GitHub has retired; `macos-15-intel` is
-its hosted Intel replacement.
+The images are pinned rather than `*-latest`, so a release is reproducible and the glibc
+floor the README states (2.39, from Ubuntu 24.04) cannot rise silently when GitHub moves
+`ubuntu-latest`. Moving an image is a deliberate change: update this table and the README
+with it. Intel macOS used to build on `macos-13`, which GitHub has retired;
+`macos-15-intel` is its hosted Intel replacement.
 
 Each binary is built by its own `cargo build --locked`, so no package's features leak
 into another's binary, and nothing is restored from a build cache. Each target is packed as a
