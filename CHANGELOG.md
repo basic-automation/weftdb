@@ -217,13 +217,14 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   authentication, the default `127.0.0.1` bind was the only protection, but a page open
   in a browser on the same machine could still send requests that need no CORS
   preflight (enough to trigger maintenance, backups and ingest), or reach the API
-  through DNS rebinding. While bound to a loopback address, the server now answers only
-  requests addressed to `localhost`, `127.0.0.0/8` or `[::1]` (`421 Misdirected
-  Request` otherwise, `/health` and `/ready` included) and refuses a state-changing
-  request whose `Origin` is not a loopback origin (`403`). Clients that send no
-  `Origin`, such as `curl`, are unaffected. Behind a local reverse proxy that forwards a
-  different `Host`, set `WEFT_ALLOW_ANY_HOST=1`. Non-loopback binds are unchanged and
-  remain unauthenticated.
+  through DNS rebinding. While bound to a loopback address (including the IPv4-mapped
+  `[::ffff:127.0.0.1]`), the server now answers only requests addressed to `localhost`,
+  `127.0.0.0/8` or `[::1]` (`421 Misdirected Request` otherwise, `/health` and `/ready`
+  included) and refuses a state-changing request whose `Origin` is not a loopback origin
+  (`403`). Clients that send no `Origin`, such as `curl`, are unaffected. Behind a local
+  reverse proxy that forwards a different `Host`, or the non-loopback `Origin` of a
+  browser UI it fronts, set `WEFT_ALLOW_ANY_HOST=1`. Non-loopback binds are unchanged
+  and remain unauthenticated.
 - Cleared the `crossbeam-epoch` (RUSTSEC-2026-0204) and `h2` (RUSTSEC-2026-0258)
   advisories, replaced the unmaintained `bincode` (RUSTSEC-2025-0141), and removed the
   unsound `lru` 0.16 (RUSTSEC-2026-0253) by disabling turso's unused full-text search.

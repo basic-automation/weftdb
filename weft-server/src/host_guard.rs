@@ -11,8 +11,9 @@
 //! While the server is bound to a loopback address, [`enforce`] refuses:
 //!
 //! - **a request not addressed to a loopback host**, with `421 Misdirected Request`. The
-//!   `Host` header must be `localhost`, an IPv4 address in `127.0.0.0/8` or `[::1]`, each
-//!   with an optional port (the name is compared case-insensitively). A request target
+//!   `Host` header must be `localhost`, an IPv4 address in `127.0.0.0/8` or `[::1]` (or
+//!   the IPv4-mapped form of a `127.0.0.0/8` address, `[::ffff:127.0.0.1]`), each with an
+//!   optional port (the name is compared case-insensitively). A request target
 //!   that carries its own authority (absolute form, HTTP/2) is held to the same rule. A
 //!   request with no host at all, or with more than one `Host` header, is refused too;
 //!   HTTP/1.1 requires exactly one, and browsers always send it.
@@ -30,7 +31,10 @@
 //! The guard is off for a non-loopback bind, which is unchanged (there is no
 //! authentication yet, so such a server must not be reachable from an untrusted network;
 //! see `SECURITY.md`), and when `WEFT_ALLOW_ANY_HOST=1`, for a local reverse proxy that
-//! forwards a different `Host`. It is a stop-gap until authentication exists, not a
+//! forwards a different `Host`, or that forwards the `Origin` of a browser UI served
+//! from a non-loopback origin (its state-changing requests would otherwise get `403`).
+//! A bind to the IPv4-mapped form of a loopback address (`[::ffff:127.0.0.1]`) counts
+//! as loopback. It is a stop-gap until authentication exists, not a
 //! replacement for it. [`AppState`](crate::AppState) starts with [`HostGuard::Off`], so
 //! a router built with [`app_with_state`](crate::app_with_state) is unguarded unless the
 //! caller sets [`AppState::with_host_guard`](crate::AppState::with_host_guard); the
@@ -43,7 +47,8 @@ use axum::{
 };
 
 /// Environment variable that turns the guard off on a loopback bind: `1`, `true`, `yes`
-/// or `on` (any case). For a local reverse proxy that forwards a non-loopback `Host`.
+/// or `on` (any case). For a local reverse proxy that forwards a non-loopback `Host`, or
+/// a non-loopback browser `Origin`.
 pub const ALLOW_ANY_HOST_ENV: &str = "WEFT_ALLOW_ANY_HOST";
 
 /// The longest prefix of a refused `Host`/`Origin` value an error message quotes.
@@ -66,10 +71,11 @@ pub enum HostGuard {
 
 impl HostGuard {
 	/// The guard for a server bound to `addr`: [`Loopback`](Self::Loopback) for a loopback
-	/// address unless `allow_any_host`, otherwise [`Off`](Self::Off).
+	/// address (including the IPv4-mapped `::ffff:127.0.0.0/104`) unless
+	/// `allow_any_host`, otherwise [`Off`](Self::Off).
 	#[must_use]
 	pub const fn for_bind(addr: SocketAddr, allow_any_host: bool) -> Self {
-		if addr.ip().is_loopback() && !allow_any_host {
+		if addr.ip().to_canonical().is_loopback() && !allow_any_host {
 			Self::Loopback
 		} else {
 			Self::Off
@@ -121,7 +127,7 @@ fn check_loopback(request: &Request) -> Result<(), Refusal> {
 	if !request.method().is_safe() {
 		for origin in request.headers().get_all(header::ORIGIN) {
 			if !origin.to_str().is_ok_and(is_loopback_origin) {
-				return Err((StatusCode::FORBIDDEN, format!("this server is bound to a loopback address and refuses a {} request from the web origin {}", request.method(), shown(origin))));
+				return Err((StatusCode::FORBIDDEN, format!("this server is bound to a loopback address and refuses a {} request from the web origin {} (behind a local reverse proxy that forwards a browser's non-loopback Origin, set {ALLOW_ANY_HOST_ENV}=1)", request.method(), shown(origin))));
 			}
 		}
 	}
@@ -130,11 +136,12 @@ fn check_loopback(request: &Request) -> Result<(), Refusal> {
 
 /// Whether `authority` (a `Host` value, or the `host[:port]` of an origin or request
 /// target) names a loopback host: `localhost` (any case), an IPv4 address in
-/// `127.0.0.0/8`, or `[::1]`, with an optional port.
+/// `127.0.0.0/8`, `[::1]`, or the IPv4-mapped form of a `127.0.0.0/8` address, with an
+/// optional port.
 fn is_loopback_authority(authority: &str) -> bool {
 	if let Some(bracketed) = authority.strip_prefix('[') {
 		let Some((address, rest)) = bracketed.split_once(']') else { return false };
-		return is_port_suffix(rest) && address.parse::<Ipv6Addr>().is_ok_and(|ip| ip.is_loopback());
+		return is_port_suffix(rest) && address.parse::<Ipv6Addr>().is_ok_and(|ip| ip.to_canonical().is_loopback());
 	}
 	let (host, rest) = authority.find(':').map_or((authority, ""), |colon| authority.split_at(colon));
 	is_port_suffix(rest) && (host.eq_ignore_ascii_case("localhost") || host.parse::<Ipv4Addr>().is_ok_and(|ip| ip.is_loopback()))
@@ -219,7 +226,7 @@ mod tests {
 	#[tokio::test]
 	async fn loopback_hosts_are_served() {
 		let metrics = SharedMetrics::default();
-		for host in ["localhost", "localhost:8080", "LocalHost:8080", "localhost:", "127.0.0.1", "127.0.0.1:8080", "127.10.20.30:1", "[::1]", "[::1]:8080"] {
+		for host in ["localhost", "localhost:8080", "LocalHost:8080", "localhost:", "127.0.0.1", "127.0.0.1:8080", "127.10.20.30:1", "[::1]", "[::1]:8080", "[::ffff:127.0.0.1]:8080", "[::ffff:7f00:1]"] {
 			let (status, body) = send(guarded(&metrics), get("/health", Some(host))).await;
 			assert_eq!(status, StatusCode::OK, "Host {host:?}: {body}");
 		}
@@ -229,7 +236,7 @@ mod tests {
 	#[tokio::test]
 	async fn a_foreign_host_is_misdirected() {
 		let metrics = SharedMetrics::default();
-		for host in ["evil.example", "evil.example:8080", "localhost.evil.example", "127.0.0.1.nip.io", "10.0.0.1:8080", "0.0.0.0:8080", "[::2]:8080", "[::ffff:127.0.0.1]", "::1", "localhost:80a", "localhost:123456", "user@localhost", "localhost/x"] {
+		for host in ["evil.example", "evil.example:8080", "localhost.evil.example", "127.0.0.1.nip.io", "10.0.0.1:8080", "0.0.0.0:8080", "[::2]:8080", "[::ffff:10.0.0.1]", "::1", "localhost:80a", "localhost:123456", "user@localhost", "localhost/x"] {
 			for uri in ["/health", "/ready", "/metrics", "/api/v1/storage/stats"] {
 				let (status, body) = send(guarded(&metrics), get(uri, Some(host))).await;
 				assert_eq!(status, StatusCode::MISDIRECTED_REQUEST, "GET {uri} with Host {host:?}: {body}");
@@ -294,6 +301,8 @@ mod tests {
 		assert_eq!(HostGuard::for_bind(at("127.0.0.1:8080"), false), HostGuard::Loopback);
 		assert_eq!(HostGuard::for_bind(at("127.1.2.3:8080"), false), HostGuard::Loopback);
 		assert_eq!(HostGuard::for_bind(at("[::1]:8080"), false), HostGuard::Loopback);
+		assert_eq!(HostGuard::for_bind(at("[::ffff:127.0.0.1]:8080"), false), HostGuard::Loopback, "an IPv4-mapped loopback bind is loopback");
+		assert_eq!(HostGuard::for_bind(at("[::ffff:10.0.0.1]:8080"), false), HostGuard::Off);
 		assert_eq!(HostGuard::for_bind(at("127.0.0.1:8080"), true), HostGuard::Off, "WEFT_ALLOW_ANY_HOST opts out");
 		assert_eq!(HostGuard::for_bind(at("0.0.0.0:8080"), false), HostGuard::Off, "a non-loopback bind is unchanged");
 		assert_eq!(HostGuard::for_bind(at("[::]:8080"), false), HostGuard::Off);

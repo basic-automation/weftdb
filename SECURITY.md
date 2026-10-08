@@ -34,7 +34,8 @@ Bound to a loopback address (the default), `weft-server` only answers requests
 addressed to a loopback host and refuses state-changing requests from other web
 origins, so a web page in a browser on the same machine cannot drive it. That is a
 guard for the default deployment, not authentication: any local process can still call
-the API.
+the API. A local reverse proxy that forwards a different `Host`, or a browser UI's
+non-loopback `Origin`, needs `WEFT_ALLOW_ANY_HOST=1`, which turns the guard off.
 
 What *is* in scope: memory-safety problems, panics or crashes reachable from untrusted
 input (a malformed request body, a corrupt `.weftseg` segment, a hostile Line Protocol

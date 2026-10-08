@@ -12,7 +12,7 @@
 //! state-changing request carrying a non-loopback `Origin` is refused (`403`), so web
 //! pages in a local browser cannot drive the server ([`weft_server::host_guard`]).
 //! `WEFT_ALLOW_ANY_HOST=1` turns this off for a local reverse proxy that forwards a
-//! different `Host`. A non-loopback bind is not guarded: there is no authentication yet,
+//! different `Host` or a browser UI's non-loopback `Origin`. A non-loopback bind is not guarded: there is no authentication yet,
 //! so such a server must not be reachable from an untrusted network.
 //!
 //! ## Optional segment store
@@ -152,8 +152,8 @@ fn host_guard_for(local: SocketAddr) -> HostGuard {
 	let allow_any_host = host_guard::allow_any_host_from_env(std::env::var(ALLOW_ANY_HOST_ENV).ok().as_deref());
 	let guard = HostGuard::for_bind(local, allow_any_host);
 	match guard {
-		HostGuard::Loopback => println!("request guard: loopback only (Host must be localhost, 127.0.0.0/8 or [::1]; state-changing requests from other web origins are refused; set {ALLOW_ANY_HOST_ENV}=1 behind a local reverse proxy that rewrites Host)"),
-		HostGuard::Off if local.ip().is_loopback() => println!("request guard: off ({ALLOW_ANY_HOST_ENV} is set)"),
+		HostGuard::Loopback => println!("request guard: loopback only (Host must be localhost, 127.0.0.0/8 or [::1]; state-changing requests from other web origins are refused; set {ALLOW_ANY_HOST_ENV}=1 behind a local reverse proxy that rewrites Host or forwards a non-loopback Origin)"),
+		HostGuard::Off if local.ip().to_canonical().is_loopback() => println!("request guard: off ({ALLOW_ANY_HOST_ENV} is set)"),
 		HostGuard::Off => println!("request guard: off (bound to the non-loopback address {local}; there is no authentication, so keep this server off untrusted networks)"),
 	}
 	guard
