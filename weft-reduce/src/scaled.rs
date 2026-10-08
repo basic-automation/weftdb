@@ -20,7 +20,7 @@ use bigdecimal::{num_bigint::BigInt, BigDecimal};
 use chrono::{DateTime, Utc};
 use splimes::{Resolution, SECONDS_IN_DAY, SECONDS_IN_HOUR, SECONDS_IN_MINUTE, SECONDS_IN_MONTH, SECONDS_IN_WEEK, SECONDS_IN_YEAR};
 
-use crate::{bucket_start, Aggregation, Bucket, BucketAcc, PartialReduction, ReduceError};
+use crate::{bucket_start, Aggregation, Bucket, BucketAcc, DdSketch, PartialReduction, ReduceError};
 
 const NANOS_PER_SECOND: i64 = 1_000_000_000;
 
@@ -265,8 +265,10 @@ pub fn reduce_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32, resolut
 /// Each bucket's integer state is converted once into the `BigDecimal` accumulator the
 /// partial carries (sum, min, max, and first/last with their instants), so the per-sample
 /// work stays in integers and only the per-bucket conversion touches `BigDecimal`. Like
-/// [`reduce_scaled`], it returns `Ok(None)` for a non-streaming reduction, a bound outside
+/// [`reduce_scaled`], it returns `Ok(None)` for an exact percentile or TWA, a bound outside
 /// epoch nanoseconds, or mismatched slices, and the caller falls back to `reduce_partial`.
+/// Unlike [`reduce_scaled`] it also accepts the `sketch_p*` reductions (see below), so it covers
+/// the whole `.weftpart` sidecar set.
 ///
 /// # Errors
 ///
@@ -274,22 +276,38 @@ pub fn reduce_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32, resolut
 /// a timestamp (unreachable for nanosecond epochs, which always are).
 pub fn reduce_partial_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32, resolution: Resolution, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, aggregations: &[Aggregation]) -> Result<Option<PartialReduction>, ReduceError> {
 	let aggregations = if aggregations.is_empty() { &Aggregation::DEFAULT[..] } else { aggregations };
-	if !aggregations.iter().all(|&a| is_streaming(a)) {
+	// The `sketch_p*` reductions are accepted too: they need each value, but only as the
+	// sketch's `f64`, which is fed through the same `DdSketch::add_decimal` the BigDecimal path
+	// uses so every sketch is identical. Percentiles and TWA still need the samples: decline.
+	if !aggregations.iter().all(|&a| is_streaming(a) || a.sketch_quantile().is_some()) {
 		return Ok(None);
 	}
+	let sketching = aggregations.iter().any(|a| a.sketch_quantile().is_some());
 	let Some(buckets) = accumulate(epoch_nanos, mantissas, resolution, start, end) else {
 		return Ok(None);
 	};
 	let scale = i64::from(scale);
 	let decimal = |m: i64| BigDecimal::new(BigInt::from(m), scale);
 	let instant = |n: i64| DateTime::from_timestamp_nanos(n);
-	let converted = buckets
+	let mut converted: BTreeMap<i64, BucketAcc> = buckets
 		.into_iter()
 		.map(|(base, acc)| {
-			let state = BucketAcc { count: usize::try_from(acc.count).map_err(|_| ReduceError::TimestampRange)?, sum: BigDecimal::new(BigInt::from(acc.sum), scale), min: Some(decimal(acc.min)), max: Some(decimal(acc.max)), first: Some((instant(acc.first.0), decimal(acc.first.1))), last: Some((instant(acc.last.0), decimal(acc.last.1))), samples: Vec::new(), collect: false, sketch: None };
+			let state = BucketAcc { count: usize::try_from(acc.count).map_err(|_| ReduceError::TimestampRange)?, sum: BigDecimal::new(BigInt::from(acc.sum), scale), min: Some(decimal(acc.min)), max: Some(decimal(acc.max)), first: Some((instant(acc.first.0), decimal(acc.first.1))), last: Some((instant(acc.last.0), decimal(acc.last.1))), samples: Vec::new(), collect: false, sketch: sketching.then(DdSketch::with_default_accuracy) };
 			Ok((base, state))
 		})
-		.collect::<Result<BTreeMap<_, _>, ReduceError>>()?;
+		.collect::<Result<_, ReduceError>>()?;
+	if sketching {
+		let bound = |b: Option<DateTime<Utc>>| b.and_then(|t| t.timestamp_nanos_opt());
+		let (lo, hi) = (bound(start), bound(end));
+		for (&nanos, &mantissa) in epoch_nanos.iter().zip(mantissas) {
+			if lo.is_some_and(|l| nanos < l) || hi.is_some_and(|h| nanos > h) {
+				continue;
+			}
+			if let Some(sketch) = converted.get_mut(&base_of(resolution, nanos)).and_then(|acc| acc.sketch.as_mut()) {
+				sketch.add_decimal(&decimal(mantissa)).map_err(|_| ReduceError::SketchValue)?;
+			}
+		}
+	}
 	Ok(Some(PartialReduction { buckets: converted }))
 }
 
@@ -404,6 +422,23 @@ mod tests {
 			assert_eq!(b.finish(resolution, &aggs).expect("finishes"), whole);
 		}
 		assert!(reduce_partial_scaled(&nanos, &mantissas, 6, Resolution::Hours, None, None, &[Aggregation::P50]).expect("ok").is_none());
+	}
+
+	#[test]
+	fn reduce_partial_scaled_builds_identical_sketches() {
+		// With the sidecar's full set (streaming + sketch_p50..p99) the integer partial must
+		// finish to exactly the BigDecimal partial's buckets, sketch quantiles included, and a
+		// window must filter the sketch inputs too.
+		let mut next = noise(0xbb67_ae85_84ca_a73b);
+		let nanos: Vec<i64> = (0..3_000_i64).map(|i| i * 7_000_000_000 + (next() % 5_000_000_000).cast_signed()).collect();
+		let mantissas: Vec<i64> = (0..3_000).map(|_| (next() % 9_000_000).cast_signed() - 1_000_000).collect();
+		let pts = points(&nanos, &mantissas, 4);
+		let aggs = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::SketchP50, Aggregation::SketchP90, Aggregation::SketchP95, Aggregation::SketchP99];
+		for (start, end) in [(None, None), (Some(DateTime::from_timestamp_nanos(nanos[300])), Some(DateTime::from_timestamp_nanos(nanos[2_200])))] {
+			let expected = crate::reduce_partial(&pts, Resolution::Hours, start, end, &aggs).expect("reduces").finish(Resolution::Hours, &aggs).expect("finishes");
+			let actual = reduce_partial_scaled(&nanos, &mantissas, 4, Resolution::Hours, start, end, &aggs).expect("reduces").expect("covered").finish(Resolution::Hours, &aggs).expect("finishes");
+			assert_eq!(actual, expected, "{start:?}..{end:?}");
+		}
 	}
 
 	#[test]

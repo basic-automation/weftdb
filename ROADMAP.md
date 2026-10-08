@@ -1339,8 +1339,15 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
     one-scale ScaledI64 rows, falling back otherwise. Runtime-verified on the real server: 100k BTC
     closes, hourly min/max/avg/sum/first/last, all 1,667 buckets match an independent Python
     `Decimal` recomputation.
-  - [ ] **NEXT — the sidecar build and an end-to-end number.** The `.weftpart` sidecar build at seal
-    time still calls `reduce_partial` on BigDecimal points; switch it the same way. Then add a
+  - [x] **DONE (2026-10-08) — `reduce_partial_scaled` accepts `sketch_p*`**, feeding each bucket's
+    DdSketch through the same `add_decimal` (so sketches are identical; tested against
+    `reduce_partial` with the full sidecar set). Stored-range `sketch_p*` downsamples therefore take
+    the integer path too. Not switched: bigdecimal's `to_f64` is a custom digit-trimming
+    conversion, not provably correctly rounded, so `m as f64 / 10^s` cannot replace it.
+  - [ ] **NEXT — the sidecar build and an end-to-end number.** The `.weftpart` sidecar build
+    (`write_partial_sidecar`) receives the seal's BigDecimal values rather than stored mantissas,
+    so switching it means threading the seal's encoded column through instead. Its callers sit in
+    the persist paths the durability arc is reworking, so do it after that lands. Then add a
     server-level downsample timing (real corpus, many segments) and publish the end-to-end factor
     beside QuestDB's ~2×. `decimal_tax` covers the reduction only.
   - [ ] *(original item)* **a `ScaledI64`-native reduction fast path in `weft-reduce`:** reduce
