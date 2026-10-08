@@ -407,6 +407,45 @@ async fn test_set_dictionary_metadata_registers_and_replaces() {
 	common::remove_database(&db_name);
 }
 
+/// Dictionary names become file names (`<aspect>/dictionaries/<name>.db`), so a name that
+/// would change where that path points is an `InvalidDictionaryName` in every dictionary
+/// operation, before any file is touched. `../escape` reached `<aspect>/escape.db`, and an
+/// absolute name replaced the whole path.
+#[tokio::test]
+async fn test_dictionary_names_are_checked_before_they_become_paths() {
+	let db_name = format!("test_dictionary_names_{}", Uuid::new_v4());
+	common::remove_database(&db_name);
+
+	let db = Database::new(&db_name).await.expect("Failed to create database");
+	let subject = db.observe_subject("dictionary_subject").await.expect("Failed to add subject");
+	let mut aspect = db.track_aspect(&subject.id(), "pressure", &Resolution::Seconds, None).await.expect("Failed to track aspect");
+	let aspect_dir = common::data_dir().join(&db_name).join("dictionary_subject").join("pressure");
+	let absolute = common::data_dir().join("escaped");
+	let absolute = absolute.to_str().expect("a UTF-8 temp dir");
+
+	fn assert_invalid(err: &anyhow::Error, name: &str) {
+		let invalid = err.downcast_ref::<weftdb::InvalidDictionaryName>().unwrap_or_else(|| panic!("{name:?} is an InvalidDictionaryName: {err:#}"));
+		assert_eq!(invalid.name(), name);
+	}
+	for name in ["../escape", absolute, "", "..", "a\\b", "NUL"] {
+		let metadata = DictionaryMetadata { id: DictionaryId::new(), name: name.to_string(), description: String::new(), constraints: DictionaryConstraints::default() };
+		assert_invalid(&aspect.new_dictionary(name, "", &DictionaryConstraints::default()).await.expect_err("new_dictionary"), name);
+		assert_invalid(&db.set_dictionary_metadata(&aspect.id(), name, &metadata).await.expect_err("set_dictionary_metadata"), name);
+		assert_invalid(&db.get_dictionary_metadata(&aspect.id(), name).await.expect_err("get_dictionary_metadata"), name);
+		assert_invalid(&db.get_dictionary_db(&aspect.id(), name).await.expect_err("get_dictionary_db"), name);
+		assert_invalid(&db.get_dictionary_patterns(&aspect.id(), name).await.err().expect("get_dictionary_patterns"), name);
+		assert_invalid(&aspect.dictionary(name).await.expect_err("Aspect::dictionary"), name);
+	}
+	assert!(!aspect_dir.join("escape.db").exists(), "nothing was created next to dictionaries/");
+	assert!(!common::data_dir().join("escaped.db").exists(), "nothing was created at the absolute path");
+	let mut created: Vec<_> = std::fs::read_dir(aspect_dir.join("dictionaries")).expect("the dictionaries dir").map(|entry| entry.expect("an entry").file_name()).collect();
+	created.sort();
+	assert!(created.is_empty(), "no dictionary file was created: {created:?}");
+	assert!(db.list_dictionaries(&aspect.id()).await.expect("Failed to list dictionaries").is_empty());
+
+	common::remove_database(&db_name);
+}
+
 /// Assert that `err` is the write-write conflict a dictionary write lost, not the failed
 /// `ROLLBACK` after it.
 fn assert_write_write_conflict(err: &anyhow::Error) {

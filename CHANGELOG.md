@@ -286,6 +286,20 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   that differ only in letter case or Unicode normalisation are still accepted and can
   share frame files on a case-insensitive or normalising filesystem; that is a collision
   inside `segments/`, not a way out of it, and the planned encoded frame names remove it.
+- **Dictionary names can no longer point outside the aspect's `dictionaries/`
+  directory.** Each dictionary is its own `<aspect>/dictionaries/<name>.db`, and the name
+  was not checked, so `../x` reached `<aspect>/x.db` and an absolute name such as `/tmp/x`
+  replaced the whole path; `get_dictionary_metadata` then created that file and its
+  tables, and `new_dictionary` and `set_dictionary_metadata` wrote to it. Dictionary
+  names now follow the aspect-name rules (`weftdb::dictionary_name::validate`), checked by
+  the dictionary path builders, so every dictionary operation (`new_dictionary`,
+  `Aspect::dictionary`, `set_dictionary_metadata`, `insert_pattern_into_dictionary`,
+  `get_dictionary_metadata`, `get_dictionary_db`, `get_dictionary_patterns`) refuses
+  such a name with a typed `weftdb::InvalidDictionaryName` error before any file is
+  touched. `Config::aspect_dictionaries_db_path` and `Config::dictionary_path` return
+  `Result<String>` (they returned the path), and `list_dictionaries` skips a `.db` file
+  whose name is not a valid dictionary name, with a warning. No `weft-server` endpoint
+  takes a dictionary name.
 - **API callers can no longer make backup retention delete the daemon's snapshots.**
   `WEFT_BACKUP_KEEP` retention keeps the newest `backup-<digits>` directories by their
   embedded timestamp, and `POST /api/v1/storage/backup` created directories in that same

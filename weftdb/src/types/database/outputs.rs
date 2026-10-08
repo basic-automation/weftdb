@@ -750,7 +750,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		// this name, so the answer is `None` (on which `load_dictionary` registers the
 		// dictionary), not the error `get_dictionary_db` gives for a missing file.
 		let aspect = self.get_aspect(aspect_id).await?;
-		let db_path = Self::aspect_dictionaries_db_path(&self.name, aspect.subject_name(), aspect.name(), dictionary_name);
+		let db_path = Self::aspect_dictionaries_db_path(&self.name, aspect.subject_name(), aspect.name(), dictionary_name)?;
 		if !tokio::fs::try_exists(&db_path).await? {
 			return Ok(None);
 		}
@@ -793,7 +793,12 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 			let path = entry.path();
 			if path.extension().is_some_and(|ext| ext == "db") && tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_file()) {
 				if let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) {
-					names.push(name.to_string());
+					// No dictionary operation accepts a name that fails validation, so such a
+					// file (`.backup.db`, `CON.db`) is not one of the aspect's dictionaries.
+					match crate::dictionary_name::validate(name) {
+						Ok(()) => names.push(name.to_string()),
+						Err(e) => tracing::warn!(error = %e, path = %path.display(), "Skipping a file in the dictionaries directory whose name is not a dictionary name"),
+					}
 				}
 			}
 		}

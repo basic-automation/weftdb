@@ -1023,7 +1023,7 @@ impl Inputs for Database {
 		Self::check_dictionary_constraints(dictionary_name, &metadata.constraints)?;
 		let aspect = self.get_aspect(aspect_id).await?;
 		let db_name = &self.name;
-		let db_path = Self::aspect_dictionaries_db_path(db_name.as_str(), aspect.subject_name(), aspect.name(), dictionary_name);
+		let db_path = Self::aspect_dictionaries_db_path(db_name.as_str(), aspect.subject_name(), aspect.name(), dictionary_name)?;
 		let (db, _was_new) = Self::get_or_create_turso_database(&db_path).await?;
 		// Create the schema FIRST, in an exclusive transaction. Turso rejects DDL inside
 		// `BEGIN CONCURRENT` ("DDL statements require an exclusive transaction"), so the
@@ -1065,7 +1065,7 @@ impl Inputs for Database {
 		let tx_id = TxId::new();
 		let aspect = self.get_aspect(aspect_id).await?;
 		let db_name = &self.name;
-		let db_path = Self::aspect_dictionaries_db_path(db_name.as_str(), aspect.subject_name(), aspect.name(), dictionary_name);
+		let db_path = Self::aspect_dictionaries_db_path(db_name.as_str(), aspect.subject_name(), aspect.name(), dictionary_name)?;
 		let (db, _was_new) = Self::get_or_create_turso_database(&db_path).await?;
 		let conn = Self::begin_concurrent(&db, db_name, Some(self.cache.clone())).await?;
 
