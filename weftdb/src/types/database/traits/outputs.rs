@@ -68,8 +68,24 @@ pub trait Outputs {
 	// Dictionaries
 	//
 
+	/// The registration of the aspect's dictionary `dictionary_name`: its id, description,
+	/// steps and variabilities. `None` when there is none, because the dictionary has no
+	/// database yet or nothing complete is registered in it.
+	///
+	/// # Errors
+	///
+	/// A failed read, or a stored value that does not parse, such as a step interpolation
+	/// splimes rejects.
 	async fn get_dictionary_metadata(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<Option<DictionaryMetadata>>;
 
+	/// The registration of each of the aspect's dictionaries, by name, as
+	/// [`get_dictionary_metadata`](Self::get_dictionary_metadata) reads it; a dictionary
+	/// without one is not listed.
+	///
+	/// # Errors
+	///
+	/// As `get_dictionary_metadata`, for any of them, or when the aspect's dictionaries
+	/// directory cannot be read.
 	async fn list_dictionaries(&self, aspect_id: &AspectId) -> Result<Vec<DictionaryMetadata>>;
 
 	async fn get_dictionary_pattern(&self, aspect_id: &AspectId, dictionary_name: &str, pattern_id: &PatternID) -> Result<Pattern>;
