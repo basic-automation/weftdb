@@ -191,6 +191,17 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   aspect already declared under such a name was never safe to use: it now fails on every
   use with a typed `weftdb::InvalidAspectName` error (a `400` over HTTP), and the
   store-wide maintenance sweeps skip it with a warning instead of failing.
+- **Backup retention can no longer be made to delete genuine snapshots.**
+  `WEFT_BACKUP_KEEP` retention keeps the newest `backup-<digits>` directories by their
+  embedded timestamp, and `POST /api/v1/storage/backup?label=` accepted labels in that
+  same form, so a caller could create directories that retention counted as the newest
+  snapshots and pruned real ones in their place. The endpoint now refuses a `?label=` in
+  the generated `backup-<digits>` form with a `400` (an unlabelled backup still gets a
+  generated name, and the restore drill still accepts one). Retention also ignores any
+  generated-looking directory stamped more than 24 hours past the current clock: it is
+  never counted and never removed, and each listing logs a warning naming it, so a
+  directory planted before this release cannot evict snapshots either; inspect and
+  remove such directories by hand.
 - Cleared the `crossbeam-epoch` (RUSTSEC-2026-0204) and `h2` (RUSTSEC-2026-0258)
   advisories, replaced the unmaintained `bincode` (RUSTSEC-2025-0141), and removed the
   unsound `lru` 0.16 (RUSTSEC-2026-0253) by disabling turso's unused full-text search.

@@ -16,7 +16,15 @@
 //! Pruning only ever removes directories the daemon itself generated —
 //! `backup-<digits>`, the shape [`generated_label`] writes. A snapshot an operator
 //! took by hand with `POST …/storage/backup?label=nightly` is never a prune candidate,
-//! so a retention setting cannot silently delete a deliberately-kept backup.
+//! so a retention setting cannot silently delete a deliberately-kept backup. That
+//! grammar is reserved for the server: the endpoint refuses a `?label=` that matches it
+//! ([`is_generated_label`]), so a caller cannot plant a directory retention would count.
+//!
+//! Retention also distrusts a generated-looking directory whose stamp lies more than
+//! [`FUTURE_STAMP_TOLERANCE`] past the current clock. Such a stamp sorts as the newest
+//! snapshot, so enough of them would fill the retained set and get every genuine
+//! snapshot pruned. It cannot come from this daemon (its stamps are the wall clock), so
+//! it is never counted and never removed, and each listing logs a warning naming it.
 //!
 //! The daemon holds only `Arc` handles (the store and the metrics registry), so it is
 //! a detached side task; the router and its handlers are untouched.
@@ -55,10 +63,21 @@ pub fn generated_label(millis: u128) -> String {
 	format!("backup-{millis}")
 }
 
-/// True for a directory name this daemon generated — `backup-` followed by at least one
-/// digit and nothing else. The prune predicate: an operator's own `?label=nightly`
-/// snapshot does not match and is never removed.
-fn is_generated_label(name: &str) -> bool {
+/// How far past the current clock a generated directory's stamp may lie and still count.
+///
+/// 24 hours: far more than any clock correction or skew between hosts sharing a backup
+/// directory. A stamp beyond it did not come from this daemon's clock, so
+/// [`list_generated_backups`] ignores it (see the module docs).
+pub const FUTURE_STAMP_TOLERANCE: Duration = Duration::from_hours(24);
+
+/// True for a directory name in the server's generated grammar: `backup-` and digits.
+///
+/// `backup-` must be followed by at least one digit and nothing else. This is the prune
+/// predicate: an operator's own `?label=nightly` snapshot does not match and is never
+/// removed. The backup endpoint refuses a caller-chosen label that matches, so only the
+/// server creates such names.
+#[must_use]
+pub fn is_generated_label(name: &str) -> bool {
 	name.strip_prefix("backup-").is_some_and(|stamp| !stamp.is_empty() && stamp.chars().all(|c| c.is_ascii_digit()))
 }
 
@@ -87,17 +106,33 @@ fn fresh_dir(base: &Path, millis: u128) -> PathBuf {
 	}
 }
 
+/// The wall clock in unix milliseconds, or 0 if it reads before the epoch. A zero clock
+/// makes every stamp look far in the future, so retention then counts and prunes
+/// nothing — the safe direction.
+fn now_millis() -> u128 {
+	std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_millis())
+}
+
 /// List the daemon-generated snapshot directories under `base`, oldest first.
 ///
 /// Returns `(stamp, path)` pairs sorted by the numeric stamp, so "oldest" is the
 /// snapshot's own recorded time rather than a filesystem mtime (which a copy or a
 /// restore would perturb). Non-matching entries (an operator's labelled backup, a stray
-/// file) are ignored. A missing `base` yields an empty list.
+/// file) are ignored, and so is a generated-looking directory stamped more than
+/// [`FUTURE_STAMP_TOLERANCE`] past the current clock, with a warning: it is never
+/// counted toward retention and never pruned. A missing `base` yields an empty list.
 ///
 /// # Errors
 ///
 /// Propagates a failure reading `base` (other than its absence).
 pub async fn list_generated_backups(base: &Path) -> anyhow::Result<Vec<(u128, PathBuf)>> {
+	list_generated_backups_at(base, now_millis()).await
+}
+
+/// [`list_generated_backups`] against an explicit clock reading `now` (unix millis), so
+/// the future-stamp rule is testable without a clock.
+async fn list_generated_backups_at(base: &Path, now: u128) -> anyhow::Result<Vec<(u128, PathBuf)>> {
+	let latest_trusted = now.saturating_add(FUTURE_STAMP_TOLERANCE.as_millis());
 	let mut entries = match tokio::fs::read_dir(base).await {
 		Ok(entries) => entries,
 		Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -114,6 +149,10 @@ pub async fn list_generated_backups(base: &Path) -> anyhow::Result<Vec<(u128, Pa
 			continue;
 		}
 		let Ok(stamp) = name.trim_start_matches("backup-").parse::<u128>() else { continue };
+		if stamp > latest_trusted {
+			tracing::warn!(dir = %entry.path().display(), stamp, now, "backup retention ignores a generated-looking directory stamped more than 24 h in the future: it is never counted or pruned; inspect it and remove it by hand");
+			continue;
+		}
 		found.push((stamp, entry.path()));
 	}
 	found.sort_unstable_by_key(|(stamp, _)| *stamp);
@@ -123,14 +162,21 @@ pub async fn list_generated_backups(base: &Path) -> anyhow::Result<Vec<(u128, Pa
 /// Remove the oldest daemon-generated snapshots under `base` until at most `keep`
 /// remain, returning how many directories were removed.
 ///
-/// Only `backup-<digits>` directories are candidates (see `is_generated_label`), so a
-/// hand-labelled snapshot is never pruned. `keep = 0` removes every generated snapshot.
+/// Only `backup-<digits>` directories are candidates (see [`is_generated_label`]), so a
+/// hand-labelled snapshot is never pruned, and one stamped more than
+/// [`FUTURE_STAMP_TOLERANCE`] in the future is neither counted nor pruned (see
+/// [`list_generated_backups`]). `keep = 0` removes every generated snapshot.
 ///
 /// # Errors
 ///
 /// Propagates a failure listing `base` or removing a snapshot directory.
 pub async fn prune_generated_backups(base: &Path, keep: usize) -> anyhow::Result<usize> {
-	let found = list_generated_backups(base).await?;
+	prune_generated_backups_at(base, keep, now_millis()).await
+}
+
+/// [`prune_generated_backups`] against an explicit clock reading `now` (unix millis).
+async fn prune_generated_backups_at(base: &Path, keep: usize, now: u128) -> anyhow::Result<usize> {
+	let found = list_generated_backups_at(base, now).await?;
 	let excess = found.len().saturating_sub(keep);
 	let mut removed = 0usize;
 	for (_, path) in found.into_iter().take(excess) {
@@ -302,6 +348,53 @@ mod tests {
 
 		// Retention is idempotent once the count is at the limit.
 		assert_eq!(prune_generated_backups(&base, 2).await.unwrap(), 0);
+	}
+
+	/// Create one fake snapshot directory per name under `base`.
+	async fn make_backup_dirs<'a>(base: &Path, names: impl IntoIterator<Item = &'a str>) {
+		for name in names {
+			tokio::fs::create_dir_all(base.join(name)).await.unwrap();
+			tokio::fs::write(base.join(name).join("catalog.db"), b"x").await.unwrap();
+		}
+	}
+
+	/// Regression: a generated-looking directory stamped far in the future sorts as the
+	/// newest snapshot, so `keep` of them used to fill the retained set and get every
+	/// genuine snapshot pruned. They are now neither counted nor removed.
+	#[tokio::test]
+	async fn future_stamped_dirs_never_evict_genuine_snapshots() {
+		let dir = TempDir::new().unwrap();
+		let base = dir.path().join("backups");
+		let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+		let genuine: Vec<String> = [3_000_u128, 2_000, 1_000].into_iter().map(|age| generated_label(now - age)).collect();
+		let poisoned = ["backup-99999999999999", "backup-99999999999998"];
+		make_backup_dirs(&base, genuine.iter().map(String::as_str).chain(poisoned)).await;
+
+		let removed = prune_generated_backups(&base, 2).await.unwrap();
+		assert_eq!(removed, 1, "only the oldest genuine snapshot is beyond the newest two");
+		assert!(!base.join(&genuine[0]).exists(), "the oldest genuine snapshot was pruned");
+		assert!(base.join(&genuine[1]).exists(), "a genuine snapshot was evicted");
+		assert!(base.join(&genuine[2]).exists(), "a genuine snapshot was evicted");
+		for name in poisoned {
+			assert!(base.join(name).exists(), "{name} is never pruned (left for an operator to inspect)");
+		}
+		let listed: Vec<PathBuf> = list_generated_backups(&base).await.unwrap().into_iter().map(|(_, path)| path).collect();
+		assert_eq!(listed, [base.join(&genuine[1]), base.join(&genuine[2])], "future stamps are not listed as retained snapshots");
+	}
+
+	#[tokio::test]
+	async fn the_future_stamp_cut_off_tolerates_clock_skew() {
+		let dir = TempDir::new().unwrap();
+		let base = dir.path().join("backups");
+		let now = 1_800_000_000_000_u128;
+		let tolerance = FUTURE_STAMP_TOLERANCE.as_millis();
+		let names = [generated_label(now), generated_label(now + tolerance), generated_label(now + tolerance + 1)];
+		make_backup_dirs(&base, names.iter().map(String::as_str)).await;
+
+		let stamps: Vec<u128> = list_generated_backups_at(&base, now).await.unwrap().into_iter().map(|(stamp, _)| stamp).collect();
+		assert_eq!(stamps, [now, now + tolerance], "a stamp up to 24 h ahead is still a snapshot; one past it is not");
+		assert_eq!(prune_generated_backups_at(&base, 0, now).await.unwrap(), 2);
+		assert!(base.join(&names[2]).exists(), "the untrusted directory survives even keep = 0");
 	}
 
 	#[tokio::test]
