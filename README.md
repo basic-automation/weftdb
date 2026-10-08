@@ -2,8 +2,7 @@
 
 **The time-series database for data that wasn't sampled on a clean grid.**
 
-[![crates.io](https://img.shields.io/crates/v/weftdb.svg)](https://crates.io/crates/weftdb)
-[![docs.rs](https://img.shields.io/docsrs/weftdb)](https://docs.rs/weftdb)
+[![Release](https://img.shields.io/github/v/release/basic-automation/weftdb?include_prereleases)](https://github.com/basic-automation/weftdb/releases)
 [![CI](https://github.com/basic-automation/weftdb/actions/workflows/ci.yml/badge.svg)](https://github.com/basic-automation/weftdb/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 ![Rust](https://img.shields.io/badge/Rust-1.95%2B-orange.svg)
@@ -78,14 +77,15 @@ on your hardware. Where WeftDB doesn't win, this README says so.
 cargo build --release
 ```
 
-Prefer not to build from source? From v0.1.0 on, each
-[GitHub release](https://github.com/basic-automation/weftdb/releases) carries pre-built
-`weft-server`, `weft-tui` and `weft-bench` archives for Linux (x86_64 and aarch64),
-macOS (x86_64 and Apple silicon) and Windows (x86_64), and a `SHA256SUMS` file to check
-them with `sha256sum -c SHA256SUMS`. The Linux binaries are built on Ubuntu 24.04 and
-need glibc 2.39 or newer. The macOS and Windows binaries are not signed, so Gatekeeper
-and SmartScreen will warn before running them. Until the first release is published
-there, build from source.
+Prefer not to build from source? Each
+[GitHub release](https://github.com/basic-automation/weftdb/releases), from v0.1.0 on,
+carries pre-built `weft-server`, `weft-tui` and `weft-bench` archives for Linux (x86_64
+and aarch64), macOS (x86_64 and Apple silicon) and Windows (x86_64), and a `SHA256SUMS`
+file to check them with `sha256sum -c SHA256SUMS`. The Linux binaries are built on
+Ubuntu 24.04: `weft-server` and `weft-bench` need glibc 2.34 or newer, and `weft-tui`
+needs glibc 2.39 or newer. The macOS and Windows binaries are not signed, so Gatekeeper
+and SmartScreen will warn before running them. Read the release's
+[known limitations](CHANGELOG.md#known-limitations) before you run it.
 
 ### 1. Start the server
 
@@ -199,13 +199,22 @@ Being honest about this saves you an evaluation.
 benchmarks are real and reproducible — but it has not been hardened for production
 deployment.
 
+**v0.1.0 is the pre-beta baseline release**: pre-built binaries on the
+[GitHub release](https://github.com/basic-automation/weftdb/releases/tag/v0.1.0), and no
+crates on crates.io. Later releases test their upgrade, rollback and compatibility
+against it. Its [known limitations](CHANGELOG.md#known-limitations) include no
+authentication or TLS, incomplete crash consistency, and a store layout that the next
+release upgrades one way.
+
 | Area | State |
 |---|---|
 | Storage engine, interpolation, HTTP API, Arrow/Parquet | Working, tested, benchmarked |
 | Backup & restore (control plane) | Working, with verification and a rehearsal drill |
 | Observability — Prometheus metrics, OpenTelemetry traces | Working |
+| Crash consistency — power-loss durability, crash-safe maintenance | In progress ([design](docs/design/crash-consistency.md)) |
 | **Security — TLS, auth, RBAC, audit logs** | **Not started** |
-| Pre-built binaries (Linux, macOS, Windows) | Release pipeline in place; first release (v0.1.0) not yet published |
+| Pre-built binaries (Linux, macOS, Windows) | Released: v0.1.0, on GitHub |
+| Library crates on crates.io | Not published yet |
 | Packaging — Docker, Helm | Not started |
 | Client SDKs (Python, TypeScript) | Not started |
 | Per-measurement tags | Not started |
@@ -595,7 +604,9 @@ background at startup (`WEFT_GPU_CALIBRATE`, above), and an embedding program ca
 WeftDB's own build features are all **off by default**, sit **outside the 1.0 semver
 promise**, and are **pending patent review**. A default build reads every segment written
 under the default configuration (`WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` unset). A segment
-written with that variable set, which 0.1.0 did whenever it was set, needs `bitsliced-codec`.
+written with that variable set, as builds from before v0.1.0 did whenever it was set, needs
+`bitsliced-codec`. The release binaries are built without either feature, except that
+`weft-bench` enables `experimental-codecs`.
 
 | Feature | Crate(s) | Effect |
 |---------|----------|--------|
@@ -606,26 +617,30 @@ written with that variable set, which 0.1.0 did whenever it was set, needs `bits
 
 ## Rust library
 
-WeftDB can be used directly as a set of libraries, published on
-[crates.io](https://crates.io/crates/weftdb):
+WeftDB can be used directly as a set of libraries. They are not on crates.io yet
+(v0.1.0 ships binaries only), so depend on them from this repository, pinned to a
+release tag. `splimes`, the interpolation engine, is on crates.io:
 
 ```toml
 [dependencies]
-weftdb = "0.1"              # the database: capture, query, interpolate
-splimes = "0.1"             # the interpolation engine on its own
-weft-orchestration = "0.1"  # the analytics pipeline
+# the database: capture, query, interpolate
+weftdb = { git = "https://github.com/basic-automation/weftdb", tag = "v0.1.0" }
+# the analytics pipeline
+weft-orchestration = { git = "https://github.com/basic-automation/weftdb", tag = "v0.1.0" }
+# the interpolation engine on its own
+splimes = "1"
 ```
 
 | Crate | Depend on it when you want |
 |-------|----------------------------|
-| [`weftdb`](https://crates.io/crates/weftdb) | The database — capture measurements, query and interpolate stored series. |
+| [`weftdb`](weftdb) | The database — capture measurements, query and interpolate stored series. |
 | [`splimes`](https://crates.io/crates/splimes) | Spline interpolation over irregular series, standalone. No database. |
-| [`weft-orchestration`](https://crates.io/crates/weft-orchestration) | The batching → patterns → events → correlation → signals pipeline. |
-| [`weft-physical-type`](https://crates.io/crates/weft-physical-type) | Declared numeric encodings and the `.weftseg` columnar format. |
-| [`weft-reduce`](https://crates.io/crates/weft-reduce) | Downsampling reductions over an epoch-aligned bucket grid. |
-| [`weft-line-protocol`](https://crates.io/crates/weft-line-protocol) | To parse InfluxDB Line Protocol without an InfluxDB client. |
-| [`weft-arrow`](https://crates.io/crates/weft-arrow) | Segments as Apache Arrow `RecordBatch`, Arrow IPC or Parquet. |
-| [`weft-arrow-store`](https://crates.io/crates/weft-arrow-store) | A stored range read straight into an Arrow `RecordBatch`. |
+| [`weft-orchestration`](weft-orchestration) | The batching → patterns → events → correlation → signals pipeline. |
+| [`weft-physical-type`](weft-physical-type) | Declared numeric encodings and the `.weftseg` columnar format. |
+| [`weft-reduce`](weft-reduce) | Downsampling reductions over an epoch-aligned bucket grid. |
+| [`weft-line-protocol`](weft-line-protocol) | To parse InfluxDB Line Protocol without an InfluxDB client. |
+| [`weft-arrow`](weft-arrow) | Segments as Apache Arrow `RecordBatch`, Arrow IPC or Parquet. |
+| [`weft-arrow-store`](weft-arrow-store) | A stored range read straight into an Arrow `RecordBatch`. |
 
 `weft-server`, `weft-tui` and `weft-bench` are binaries rather than libraries, so they
 are not published to crates.io — take them from the archives on a

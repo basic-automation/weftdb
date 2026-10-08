@@ -161,6 +161,9 @@ Leave it as a draft until the crates are published.
 
 ## 4. Publish to crates.io
 
+v0.1.0 is a binaries-only baseline release and publishes no crates: skip this section
+for it and go on to section 5.
+
 Order matters: crates.io resolves path dependencies by version, so nothing can be
 published before its dependencies are on the registry. `scripts/publish.sh` encodes
 the order.
