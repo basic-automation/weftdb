@@ -16,9 +16,7 @@ categories = ["database-implementations", "science", "mathematics"]
 # power-cut filesystem). Off by default: without it `fault::hit` is a const no-op
 # and `WEFT_FAULT` is never read, so a production build cannot be made to abort.
 fault-injection = []
-
 # Off by default; outside the semver promise and pending patent review (ROADMAP.md, Phase 6.1).
-[features]
 # The opt-in bit-sliced (bit-plane-major) value codec from `weft-physical-type`. Without it
 # `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` is ignored with a warning, and reading a segment that
 # uses the codec fails with an error naming this feature.
