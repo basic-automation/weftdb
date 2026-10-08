@@ -25,7 +25,7 @@ use std::{path::PathBuf, process::ExitCode};
 use chrono::Utc;
 use splimes::{Resolution, Spline};
 use weft_bench::{
-	load_csv_corpus, report::{default_filename, default_html_filename}, run_compression, run_compression_on, run_downsample, run_point_lookup, run_profile, run_range_fetch, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CompressionParams, CompressionProfile, CorpusRun, DownsampleParams, DownsampleProfile, ForwardFillAdapter, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter
+	load_csv_corpus, report::{default_filename, default_html_filename}, run_compression, run_compression_on, run_downsample, run_point_lookup, run_point_lookup_on, run_profile, run_range_fetch, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CompressionParams, CompressionProfile, CorpusRun, DownsampleParams, DownsampleProfile, ForwardFillAdapter, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter
 };
 
 /// Program name used in usage / error output.
@@ -133,7 +133,16 @@ fn run_point_lookup_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 	let profile_name = cli.name.clone().unwrap_or_else(|| if cli.irregular { "point-lookup-irregular".to_string() } else { "point-lookup-regular".to_string() });
 	let params = PointLookupParams { seed: cli.seed, point_count: cli.pl_rows, query_count: cli.pl_queries, regular: !cli.irregular, absent_fraction: cli.pl_absent, mode: cli.pl_mode, rows_per_page: cli.pl_rows_per_page };
 	let profile = PointLookupProfile::new(profile_name, params);
-	let result = run_point_lookup(&profile, cli.reps).map_err(|e| anyhow::anyhow!("point-lookup benchmark run failed: {e}"))?;
+	let result = if let Some(path) = &cli.pl_csv {
+		// A real corpus: the same lookup engine, queries drawn from the loaded timestamps.
+		let load_start = std::time::Instant::now();
+		let (timestamps, values) = load_csv_corpus(path, cli.comp_value_col, cli.comp_skip, cli.pl_rows)?;
+		let generation_ns = u64::try_from(load_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+		run_point_lookup_on(&profile, &timestamps, &values, weft_physical_type::TimeUnit::Seconds, generation_ns, cli.reps)
+	} else {
+		run_point_lookup(&profile, cli.reps)
+	}
+	.map_err(|e| anyhow::anyhow!("point-lookup benchmark run failed: {e}"))?;
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
 	let report = BenchReport::with_results(metadata, vec![result]);
 	finish(cli, &report)
@@ -312,10 +321,13 @@ struct Cli {
 	comp_shape: ValueShape,
 	/// Compression mode: a real `timestamp,value…` CSV corpus (epoch seconds) instead of a shape.
 	comp_csv: Option<PathBuf>,
-	/// Compression mode: 0-based CSV column holding the value (with `--comp-csv`).
+	/// 0-based CSV column holding the value (with `--comp-csv` / `--pl-csv`).
 	comp_value_col: usize,
-	/// Compression mode: data rows skipped after the header (with `--comp-csv`).
+	/// Data rows skipped after the header (with `--comp-csv` / `--pl-csv`).
 	comp_skip: usize,
+	/// Point-lookup mode: a real `timestamp,value…` CSV corpus (epoch seconds) instead of the
+	/// generated one; `--pl-rows` caps it.
+	pl_csv: Option<PathBuf>,
 	/// Downsample mode: input sample count.
 	ds_points: usize,
 	/// Downsample mode: input sample spacing, in seconds.
@@ -438,6 +450,7 @@ impl Cli {
 		let mut compression = false;
 		let mut downsample = false;
 		let (mut comp_rows, mut comp_shape, mut comp_csv, mut comp_value_col, mut comp_skip): (usize, ValueShape, Option<PathBuf>, usize, usize) = (comp_defaults.point_count, comp_defaults.value_shape, None, 1, 0);
+		let mut pl_csv: Option<PathBuf> = None;
 		let (mut ds_points, mut ds_stride, mut ds_bucket) = (ds_defaults.point_count, ds_defaults.input_stride_secs, ds_defaults.bucket_resolution);
 		let mut ds_aggs = ds_defaults.aggregations;
 		let mut ds_parallel = ds_defaults.parallel_chunks.max(1);
@@ -487,8 +500,9 @@ impl Cli {
 				"--comp-rows" => comp_rows = parse_points_count(&take_value(&key)?)?,
 				"--comp-shape" => comp_shape = parse_value_shape(&take_value(&key)?)?,
 				"--comp-csv" => comp_csv = Some(PathBuf::from(take_value(&key)?)),
-				"--comp-value-col" => comp_value_col = take_value(&key)?.parse().map_err(|_| "invalid --comp-value-col (expected a 0-based column index)".to_string())?,
-				"--comp-skip" => comp_skip = take_value(&key)?.parse().map_err(|_| "invalid --comp-skip (expected a row count)".to_string())?,
+				"--csv-value-col" => comp_value_col = take_value(&key)?.parse().map_err(|_| "invalid --csv-value-col (expected a 0-based column index)".to_string())?,
+				"--csv-skip" => comp_skip = take_value(&key)?.parse().map_err(|_| "invalid --csv-skip (expected a row count)".to_string())?,
+				"--pl-csv" => pl_csv = Some(PathBuf::from(take_value(&key)?)),
 				"-d" | "--downsample" => downsample = true,
 				"--ds-points" => ds_points = parse_points_count(&take_value(&key)?)?,
 				"--ds-stride" => ds_stride = parse_stride_secs(&take_value(&key)?)?,
@@ -534,7 +548,7 @@ impl Cli {
 		let mode = select_workload_mode(&[(synthetic, InputMode::Synthetic), (point_lookup, InputMode::PointLookup), (range_fetch, InputMode::RangeFetch), (compression, InputMode::Compression), (downsample, InputMode::Downsample)])?;
 		validate_mode(mode, input.as_ref(), field.as_deref(), compare)?;
 
-		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, comp_csv, comp_value_col, comp_skip, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare, html })))
+		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, comp_csv, comp_value_col, comp_skip, pl_csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare, html })))
 	}
 }
 
@@ -808,6 +822,9 @@ STORAGE-WORKLOAD OPTIONS (with --point-lookup or --range-fetch):
 
 POINT-LOOKUP OPTIONS (with --point-lookup):
         --pl-rows <N>        Rows sealed into the segment (>=2)     [default: 20000]
+        --pl-csv <FILE>      Look up in a REAL corpus instead of the generated one
+                             (same CSV rules as --comp-csv; --pl-rows caps it,
+                             --csv-value-col / --csv-skip apply)
         --pl-queries <N>     Instants resolved per rep (>=1)           [default: 128]
         --pl-absent <F>      Off-grid-miss fraction in [0, 1]          [default: 0.25]
         --pl-mode <M>        Issue mode: single|batch                [default: batch]
@@ -829,8 +846,9 @@ COMPRESSION OPTIONS (with --compression):
         --comp-csv <FILE>    Measure a REAL corpus instead of a shape: CSV whose first
                              field is an epoch in seconds (a header line is skipped);
                              values are read as exact decimal text. --comp-rows caps it.
-        --comp-value-col <N> 0-based CSV column holding the value     [default: 1]
-        --comp-skip <N>      Data rows skipped first (skip a degenerate head) [default: 0]
+        --csv-value-col <N>  0-based CSV column holding the value (with --comp-csv /
+                             --pl-csv)                                [default: 1]
+        --csv-skip <N>       Data rows skipped first (skip a degenerate head) [default: 0]
 
 DOWNSAMPLE OPTIONS (with --downsample):
         --ds-points <N>      Input sample count (>=2)              [default: 60000]
@@ -1035,10 +1053,11 @@ mod tests {
 		assert_eq!(expect_run(&["-z", "--comp-shape", "jitter"]).comp_shape, ValueShape::Jitter);
 		assert!(run_cli(&["-z", "--comp-shape", "triangle"]).unwrap_err().contains("invalid --comp-shape"));
 		// A real corpus: path, value column and skip parse; bad numbers are rejected.
-		let cli = expect_run(&["-z", "--comp-csv", "btc.csv", "--comp-value-col", "4", "--comp-skip", "3000000"]);
+		let cli = expect_run(&["-z", "--comp-csv", "btc.csv", "--csv-value-col", "4", "--csv-skip", "3000000"]);
 		assert_eq!((cli.comp_csv.as_deref(), cli.comp_value_col, cli.comp_skip), (Some(std::path::Path::new("btc.csv")), 4, 3_000_000));
 		assert_eq!((expect_run(&["-z"]).comp_csv, expect_run(&["-z"]).comp_value_col), (None, 1));
-		assert!(run_cli(&["-z", "--comp-csv", "x.csv", "--comp-value-col", "four"]).unwrap_err().contains("invalid --comp-value-col"));
+		assert!(run_cli(&["-z", "--comp-csv", "x.csv", "--csv-value-col", "four"]).unwrap_err().contains("invalid --csv-value-col"));
+		assert_eq!(expect_run(&["-p", "--pl-csv", "btc.csv"]).pl_csv.as_deref(), Some(std::path::Path::new("btc.csv")));
 		// Conflicts: another mode, an input file, and --compare.
 		assert!(run_cli(&["--compression", "--synthetic"]).unwrap_err().contains("only one workload mode"));
 		assert!(run_cli(&["--compression", "--input", "x.lp"]).unwrap_err().contains("cannot be combined with an input file"));

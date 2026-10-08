@@ -743,7 +743,8 @@ detection within Y% and improving historical query latency by Z."*
       (~0.5 GB/s). Now slicing-by-16 (same IEEE polynomial, identical checksums, no dependency).
       A/B: 1M-row point read **2.50→0.81 ms**, 1000-row range 2.32→0.63 ms; `pointread` streaming point
       185→56 µs, paged 175→33 µs, 64-instant batch 189→67 µs. README read table re-measured.
-    - [ ] **Next read-path floor: every point read still CRCs the whole frame.** Now ~0.8 ms on a
+    - [ ] **Next read-path floor: every point read still CRCs the whole frame** (real-data evidence
+      2026-10-08: 1M BTC closes, 128-instant batch p50 2.43 ms single-block vs 0.90 ms paged). Now ~0.8 ms on a
       1M-row frame, against the ~10 GB/s a CLMUL CRC reaches. Two options. Add a per-block
       (or per-page) checksum so a point read verifies only the bytes it decodes; this is a format
       bump, but the paged frame already has the page structure. Or adopt a hardware CRC (`crc32fast`,
@@ -1364,10 +1365,14 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   - [ ] Audit the other `weft-bench` workloads' generators for the same class of flattery (the shape
     knobs are seeded and reproducible, but "reproducible" is not "representative").
     - [x] **DONE (2026-10-08) — the compression workload runs on a real corpus:** `--comp-csv <FILE>`
-      (`--comp-value-col`, `--comp-skip`; exact decimal text; header auto-skipped; rows sorted).
+      (`--csv-value-col`, `--csv-skip`; exact decimal text; header auto-skipped; rows sorted).
       1M real BTC closes (rows 3M..): **4.22 B/point realized** (`scaled_for`), round trip PASS,
-      20.8M points/s decode, `advisory_dfor_value_bytes` = 1.70 B/point. Residue: `point_lookup` /
-      `range_fetch` / `downsample` still read only generated corpora.
+      20.8M points/s decode, `advisory_dfor_value_bytes` = 1.70 B/point.
+    - [x] **DONE (2026-10-08) — `point_lookup` on a real corpus:** `--pl-csv <FILE>`. On 1M real BTC
+      closes, a 128-instant batch over 50 reps has p50 **2.43 ms** single-block vs **0.90 ms** paged
+      (8,192 rows/page), both PASS. The single-block frame is 4.2 MB, and every read CRCs all of it.
+      That is real-data evidence for the per-block checksum item.
+    - [ ] Residue: `range_fetch` / `downsample` still read only generated corpora.
 
 - [x] **DONE (2026-07-20) — BUG ROOT-CAUSED + FIXED: the "flaky GPU interpolation tests" were never a
   GPU bug.** The roadmap offered two hypotheses — a real GPU race, or an unsound check. **Both the
