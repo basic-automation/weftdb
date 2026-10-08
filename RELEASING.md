@@ -92,8 +92,9 @@ CI passed for it. It then builds all five targets and uploads the archives and
 `SHA256SUMS` as workflow artifacts. It creates no tag and no release. To check them:
 
 ```bash
-gh run download <run-id> --dir dist
-(cd dist && mv */* . && sha256sum -c SHA256SUMS)
+gh run download <run-id> --dir dist --pattern 'weftdb-*'
+gh run download <run-id> --dir dist --name SHA256SUMS
+(cd dist && mv weftdb-*/* . && sha256sum -c SHA256SUMS)
 ```
 
 `fast=true` builds with the dev profile. Use it to test staging changes quickly, never to
