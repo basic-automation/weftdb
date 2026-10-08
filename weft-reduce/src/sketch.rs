@@ -1,3 +1,7 @@
+// Portions adapted from DDSketch, sketches-java (https://github.com/DataDog/sketches-java),
+// licensed under Apache-2.0; see THIRD-PARTY-NOTICES. Modifications: re-implemented in Rust
+// with sparse ordered-map stores, BigDecimal entry points, typed errors and serde persistence.
+
 //! # Mergeable approximate quantiles — `DDSketch`
 //!
 //! The [`Aggregation`](crate::Aggregation) percentiles are *exact* nearest-rank: they
@@ -27,6 +31,10 @@
 //!
 //! *(src: `DDSketch`, PVLDB'19 — <https://dl.acm.org/doi/10.14778/3352063.3352135> ·
 //! <https://arxiv.org/abs/1908.10693>)*
+//!
+//! Adapted from Datadog's Apache-2.0 reference implementation, sketches-java
+//! (<https://github.com/DataDog/sketches-java>); the crate's THIRD-PARTY-NOTICES file carries
+//! the attribution, its NOTICE text and the licence.
 
 use std::collections::BTreeMap;
 

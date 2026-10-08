@@ -33,6 +33,19 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   that machine; `--no-gpu-calibrate` turns it off. The calibration, the GPU and
   `Backend::Auto`'s thresholds are printed and recorded in the report's
   `metadata.engine` (bench schema v16) and its HTML view.
+- **Third-party attribution.** A root `NOTICE`, and a `THIRD-PARTY-NOTICES` file shipped in
+  the `weft-physical-type` and `weft-reduce` packages, credit the two Apache-2.0 projects
+  whose code is adapted here: the Chimp/Chimp128 codecs (from the authors' reference
+  implementation) and the DDSketch quantile sketch (from Datadog's sketches-java), with the
+  upstream NOTICE text and the license. The Chimp128 docs no longer credit DuckDB as the
+  source.
+- **Contribution terms.** Every pull request takes one of two routes, the contributor's
+  choice: a DCO sign-off (`git commit -s`) on every commit, or the WeftDB Individual
+  Contributor License Agreement ([`CLA.md`](CLA.md), version 1, adapted from the Apache
+  Software Foundation's ICLA with Justin Icenhour as the recipient), signed once by a pull
+  request comment. The `contribution-terms` check passes a pull request when either holds.
+  Contributions are licensed `MIT OR Apache-2.0`. See
+  [`CONTRIBUTING.md`](CONTRIBUTING.md#contribution-terms).
 
 ### Changed
 
@@ -150,6 +163,36 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 - All dependencies updated to their latest major versions, including wgpu 30,
   Arrow/Parquet 60 and OpenTelemetry 0.33.
 - Builds on stable Rust (MSRV 1.95); nightly is no longer required.
+- **Advisory codecs moved behind the `experimental-codecs` feature** (`weft-physical-type`).
+  ⚠️ Breaking for code that calls them: the `floatcodec` module (Gorilla-XOR, Chimp,
+  Chimp128, Elf and `best_f64_*`), `ColumnEncoding::{gorilla_f64_bytes, best_f64_bytes,
+  best_f64_codec}` and the FIRE forecaster (`fire_*`) now need
+  `features = ["experimental-codecs"]`. None of them was ever written to disk, so stored
+  segments are unaffected. The feature is off by default, outside the semver promise, and
+  pending patent review.
+- **The opt-in transposed value codec is now the `bitsliced-codec` feature**
+  (`weft-physical-type`, forwarded by `weftdb` and `weft-server`), pending patent review.
+  ⚠️ A store that enabled it with `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` must be built with
+  `bitsliced-codec` to read those segments: without the feature, reading one fails with the
+  new `WeftSegError::CodecNotEnabled` (which names the feature) instead of decoding, and the
+  variable is ignored with a warning. For library callers, without the feature
+  `FrameOptions::transposed_max_overhead` is accepted but silently ignored
+  (`write_segment_with` and `write_paged_segment_with` emit the size-selected codec), and
+  `WeftSegError` gains the `CodecNotEnabled` variant, which breaks exhaustive matches on it.
+  The `transpose_bitpack_*` primitives, `TRANSPOSE_TILE`,
+  `ColumnEncoding::{transposed_value_bytes, transposed_overhead, best_value_codec_transposed}`
+  and `weftseg::write_value_column_transposed` need the feature too. The default
+  configuration never wrote this codec, so a store that never set the variable (or
+  `FrameOptions::transposed_max_overhead`) is unaffected. The docs now call it a bit-sliced
+  (bit-plane-major) layout; it is not the FastLanes layout they used to name.
+- **WeftDB is dual-licensed under MIT OR Apache-2.0**, at your option, from this release on.
+  Every crate declares `license = "MIT OR Apache-2.0"`, and the repository root and every
+  crate ship `LICENSE-MIT` and `LICENSE-APACHE` in place of `LICENSE`. The release archives
+  carry both files, `NOTICE` and the `THIRD-PARTY-NOTICES` files. Earlier commits remain
+  available under MIT, as they were published. The portions adapted from Chimp and
+  DDSketch stay under Apache-2.0 whichever option you choose.
+- The MIT license text (now `LICENSE-MIT`) reads `Copyright (c) 2025-2026 Justin Icenhour`,
+  naming the individual copyright holder for both years of the project.
 
 ### Fixed
 

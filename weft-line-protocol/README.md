@@ -2,7 +2,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/weft-line-protocol.svg)](https://crates.io/crates/weft-line-protocol)
 [![docs.rs](https://img.shields.io/docsrs/weft-line-protocol)](https://docs.rs/weft-line-protocol)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 A **format parser** for InfluxDB Line Protocol (ILP). Text in, neutral records out.
 
@@ -23,4 +23,9 @@ Part of [WeftDB](https://github.com/basic-automation/weftdb).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for
+inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual
+licensed as above, without any additional terms or conditions.
