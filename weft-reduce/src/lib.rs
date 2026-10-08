@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-pub use scaled::reduce_scaled;
+pub use scaled::{reduce_partial_scaled, reduce_scaled};
 pub use sketch::{DdSketch, SketchError};
 use splimes::{Point, Resolution, SECONDS_IN_DAY, SECONDS_IN_HOUR, SECONDS_IN_MINUTE, SECONDS_IN_MONTH, SECONDS_IN_WEEK, SECONDS_IN_YEAR};
 

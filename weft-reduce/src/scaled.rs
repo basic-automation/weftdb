@@ -20,7 +20,7 @@ use bigdecimal::{num_bigint::BigInt, BigDecimal};
 use chrono::{DateTime, Utc};
 use splimes::{Resolution, SECONDS_IN_DAY, SECONDS_IN_HOUR, SECONDS_IN_MINUTE, SECONDS_IN_MONTH, SECONDS_IN_WEEK, SECONDS_IN_YEAR};
 
-use crate::{bucket_start, Aggregation, Bucket, ReduceError};
+use crate::{bucket_start, Aggregation, Bucket, BucketAcc, PartialReduction, ReduceError};
 
 const NANOS_PER_SECOND: i64 = 1_000_000_000;
 
@@ -167,31 +167,16 @@ const fn is_streaming(aggregation: Aggregation) -> bool {
 	matches!(aggregation, Aggregation::Min | Aggregation::Max | Aggregation::Avg | Aggregation::Sum | Aggregation::First | Aggregation::Last)
 }
 
-/// Reduce a `ScaledI64` column (`value = mantissa × 10^-scale`) into grid-aligned buckets.
-///
-/// Returns the same buckets [`reduce`](crate::reduce) returns for the equivalent `BigDecimal`
-/// points, with the same inclusive `[start, end]` filter, the same ascending order, the same
-/// default reduction set for an empty `aggregations`, and equal values. It works from integer
-/// accumulators and materializes a [`BigDecimal`] once per output bucket. `epoch_nanos[i]`
-/// is the instant of `mantissas[i]` in nanoseconds since the Unix epoch; input order does not
-/// matter, but time-ordered input takes a no-lookup fast path.
-///
-/// Returns `Ok(None)` when it cannot answer exactly and the caller should use
-/// [`reduce`](crate::reduce): a requested reduction is not a streaming one (percentiles, TWA,
-/// sketches), a bound cannot be expressed in epoch nanoseconds, or the slices differ in length.
-///
-/// # Errors
-///
-/// [`ReduceError::BucketStartOverflow`] if a bucket's grid start scales past the representable
-/// time range.
-pub fn reduce_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32, resolution: Resolution, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, aggregations: &[Aggregation]) -> Result<Option<Vec<Bucket>>, ReduceError> {
-	let aggregations = if aggregations.is_empty() { &Aggregation::DEFAULT[..] } else { aggregations };
-	if epoch_nanos.len() != mantissas.len() || !aggregations.iter().all(|&a| is_streaming(a)) {
-		return Ok(None);
+/// Fold `(epoch_nanos, mantissa)` pairs into integer per-bucket state, applying the inclusive
+/// `[start, end]` filter. `None` when a bound cannot be expressed in epoch nanoseconds or the
+/// slices differ in length (the caller falls back to the `BigDecimal` path).
+fn accumulate(epoch_nanos: &[i64], mantissas: &[i64], resolution: Resolution, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>) -> Option<BTreeMap<i64, ScaledAcc>> {
+	if epoch_nanos.len() != mantissas.len() {
+		return None;
 	}
 	let bound = |b: Option<DateTime<Utc>>| b.map(|t| t.timestamp_nanos_opt()).map_or(Some(None), |n| n.map(Some));
 	let (Some(lo), Some(hi)) = (bound(start), bound(end)) else {
-		return Ok(None);
+		return None;
 	};
 
 	let mut buckets: BTreeMap<i64, ScaledAcc> = BTreeMap::new();
@@ -216,6 +201,35 @@ pub fn reduce_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32, resolut
 	if let Some((key, acc)) = current {
 		buckets.entry(key).and_modify(|existing| existing.merge(&acc)).or_insert(acc);
 	}
+
+	Some(buckets)
+}
+
+/// Reduce a `ScaledI64` column (`value = mantissa × 10^-scale`) into grid-aligned buckets.
+///
+/// Returns the same buckets [`reduce`](crate::reduce) returns for the equivalent `BigDecimal`
+/// points, with the same inclusive `[start, end]` filter, the same ascending order, the same
+/// default reduction set for an empty `aggregations`, and equal values. It works from integer
+/// accumulators and materializes a [`BigDecimal`] once per output bucket. `epoch_nanos[i]`
+/// is the instant of `mantissas[i]` in nanoseconds since the Unix epoch; input order does not
+/// matter, but time-ordered input takes a no-lookup fast path.
+///
+/// Returns `Ok(None)` when it cannot answer exactly and the caller should use
+/// [`reduce`](crate::reduce): a requested reduction is not a streaming one (percentiles, TWA,
+/// sketches), a bound cannot be expressed in epoch nanoseconds, or the slices differ in length.
+///
+/// # Errors
+///
+/// [`ReduceError::BucketStartOverflow`] if a bucket's grid start scales past the representable
+/// time range.
+pub fn reduce_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32, resolution: Resolution, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, aggregations: &[Aggregation]) -> Result<Option<Vec<Bucket>>, ReduceError> {
+	let aggregations = if aggregations.is_empty() { &Aggregation::DEFAULT[..] } else { aggregations };
+	if !aggregations.iter().all(|&a| is_streaming(a)) {
+		return Ok(None);
+	}
+	let Some(buckets) = accumulate(epoch_nanos, mantissas, resolution, start, end) else {
+		return Ok(None);
+	};
 
 	let scale = i64::from(scale);
 	let decimal = |m: i128| BigDecimal::new(BigInt::from(m), scale);
@@ -242,6 +256,41 @@ pub fn reduce_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32, resolut
 		})
 		.collect::<Result<Vec<_>, _>>()
 		.map(Some)
+}
+
+/// The mergeable form of [`reduce_scaled`]: the same integer accumulation, returned as a
+/// [`PartialReduction`] that merges exactly with partials built by
+/// [`reduce_partial`](crate::reduce_partial), including persisted `.weftpart` sidecars.
+///
+/// Each bucket's integer state is converted once into the `BigDecimal` accumulator the
+/// partial carries (sum, min, max, and first/last with their instants), so the per-sample
+/// work stays in integers and only the per-bucket conversion touches `BigDecimal`. Like
+/// [`reduce_scaled`], it returns `Ok(None)` for a non-streaming reduction, a bound outside
+/// epoch nanoseconds, or mismatched slices, and the caller falls back to `reduce_partial`.
+///
+/// # Errors
+///
+/// [`ReduceError::TimestampRange`] if a bucket's first/last instant cannot be represented as
+/// a timestamp (unreachable for nanosecond epochs, which always are).
+pub fn reduce_partial_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32, resolution: Resolution, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, aggregations: &[Aggregation]) -> Result<Option<PartialReduction>, ReduceError> {
+	let aggregations = if aggregations.is_empty() { &Aggregation::DEFAULT[..] } else { aggregations };
+	if !aggregations.iter().all(|&a| is_streaming(a)) {
+		return Ok(None);
+	}
+	let Some(buckets) = accumulate(epoch_nanos, mantissas, resolution, start, end) else {
+		return Ok(None);
+	};
+	let scale = i64::from(scale);
+	let decimal = |m: i64| BigDecimal::new(BigInt::from(m), scale);
+	let instant = |n: i64| DateTime::from_timestamp_nanos(n);
+	let converted = buckets
+		.into_iter()
+		.map(|(base, acc)| {
+			let state = BucketAcc { count: usize::try_from(acc.count).map_err(|_| ReduceError::TimestampRange)?, sum: BigDecimal::new(BigInt::from(acc.sum), scale), min: Some(decimal(acc.min)), max: Some(decimal(acc.max)), first: Some((instant(acc.first.0), decimal(acc.first.1))), last: Some((instant(acc.last.0), decimal(acc.last.1))), samples: Vec::new(), collect: false, sketch: None };
+			Ok((base, state))
+		})
+		.collect::<Result<BTreeMap<_, _>, ReduceError>>()?;
+	Ok(Some(PartialReduction { buckets: converted }))
 }
 
 #[cfg(test)]
@@ -329,6 +378,32 @@ mod tests {
 			let actual = avg_like_bigdecimal(sum, scale, count);
 			assert_eq!(actual.as_bigint_and_exponent(), expected.as_bigint_and_exponent(), "{sum}e-{scale} / {count}");
 		}
+	}
+
+	#[test]
+	fn reduce_partial_scaled_merges_exactly_with_bigdecimal_partials() {
+		// Split one series in two: reduce one half with the integer partial and the other with
+		// the BigDecimal partial, merge in both orders, and finish. The result must equal a
+		// single BigDecimal pass over the whole series, and the scaled partial alone must finish
+		// to its half's single pass.
+		let mut next = noise(0x6a09_e667_f3bc_c909);
+		let nanos: Vec<i64> = (0..4_000_i64).map(|i| i * 17_000_000_000 + (next() % 9_000_000_000).cast_signed()).collect();
+		let mantissas: Vec<i64> = (0..4_000).map(|_| (next() % 900_000_000).cast_signed() - 300_000_000).collect();
+		let pts = points(&nanos, &mantissas, 6);
+		let aggs = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last];
+		for resolution in [Resolution::Minutes, Resolution::Hours] {
+			let whole = reduce(&pts, resolution, None, None, &aggs).expect("reduces");
+			let scaled_half = reduce_partial_scaled(&nanos[..2_500], &mantissas[..2_500], 6, resolution, None, None, &aggs).expect("reduces").expect("streaming");
+			assert_eq!(scaled_half.clone().finish(resolution, &aggs).expect("finishes"), reduce(&pts[..2_500], resolution, None, None, &aggs).expect("reduces"));
+			let big_half = crate::reduce_partial(&pts[2_500..], resolution, None, None, &aggs).expect("reduces");
+			let mut a = scaled_half.clone();
+			a.merge(big_half.clone()).expect("merges");
+			let mut b = big_half;
+			b.merge(scaled_half).expect("merges");
+			assert_eq!(a.finish(resolution, &aggs).expect("finishes"), whole);
+			assert_eq!(b.finish(resolution, &aggs).expect("finishes"), whole);
+		}
+		assert!(reduce_partial_scaled(&nanos, &mantissas, 6, Resolution::Hours, None, None, &[Aggregation::P50]).expect("ok").is_none());
 	}
 
 	#[test]
