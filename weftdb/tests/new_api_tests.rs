@@ -8,12 +8,33 @@ use splimes::{Resolution, Spline};
 use uuid::Uuid;
 use weftdb::{database::traits::DatabaseStructure, Database, DatasetId, DictionaryConstraints, DictionaryId, DictionaryMetadata, InputMeasurement, Outputs, Steps, Variability, VariablilityType};
 
+mod common;
+
+/// The databases these tests create go to the binary's temporary data dir
+/// (`common::data_dir`), not to the user's `~/.weftdb/data`. Their cleanups used a
+/// `data/<name>` path relative to the crate, so every run left its databases there.
+#[tokio::test]
+async fn test_databases_are_created_in_the_test_data_dir() {
+	let db_name = format!("test_data_dir_{}", Uuid::new_v4());
+	let dir = common::data_dir();
+	assert_eq!(std::path::Path::new(&weftdb::data_dir()), dir);
+
+	let _db = Database::new(&db_name).await.expect("Failed to create database");
+	assert!(dir.join(&db_name).join("metadata.db").is_file(), "the database is in the test data dir");
+	if std::path::Path::new(&weftdb::default_data_dir()) != dir {
+		assert!(!std::path::Path::new(&weftdb::default_data_dir()).join(&db_name).exists(), "nothing is created in the default data dir");
+	}
+
+	common::remove_database(&db_name);
+	assert!(!dir.join(&db_name).exists(), "the cleanup removes it");
+}
+
 #[tokio::test]
 async fn test_database_lifecycle() {
 	let db_name = format!("test_db_{}", Uuid::new_v4());
 
 	// Clean up any existing test data
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 
 	// Test new database creation
 	let db = Database::new(&db_name).await.expect("Failed to create database");
@@ -51,7 +72,7 @@ async fn test_database_lifecycle() {
 	assert_eq!(first_point.timestamp, start_time);
 
 	// Clean up
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 }
 
 #[tokio::test]
@@ -59,7 +80,7 @@ async fn test_existing_database() {
 	let db_name = format!("test_existing_{}", Uuid::new_v4());
 
 	// Clean up any existing test data
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 
 	// Create initial database
 	let db = Database::new(&db_name).await.expect("Failed to create database");
@@ -76,7 +97,7 @@ async fn test_existing_database() {
 	let _new_subject = loaded_db.observe_subject("new_subject_in_loaded_db").await.expect("Failed to add subject to loaded database");
 
 	// Clean up
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 }
 
 #[tokio::test]
@@ -84,7 +105,7 @@ async fn test_multiple_subjects_and_aspects() {
 	let db_name = format!("test_multi_{}", Uuid::new_v4());
 
 	// Clean up any existing test data
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 
 	let db = Database::new(&db_name).await.expect("Failed to create database");
 
@@ -127,7 +148,7 @@ async fn test_multiple_subjects_and_aspects() {
 	assert_ne!(temp1_result.value, temp2_result.value);
 
 	// Clean up
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 }
 
 #[tokio::test]
@@ -135,7 +156,7 @@ async fn test_error_conditions() {
 	let db_name = format!("test_errors_{}", Uuid::new_v4());
 
 	// Clean up any existing test data
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 
 	// Test duplicate database creation
 	let _db = Database::new(&db_name).await.expect("Failed to create database");
@@ -147,7 +168,7 @@ async fn test_error_conditions() {
 	assert!(non_existent_result.is_err(), "Should fail to load non-existent database");
 
 	// Clean up
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 }
 
 #[tokio::test]
@@ -155,7 +176,7 @@ async fn test_interpolation_methods() {
 	let db_name = format!("test_interpolation_{}", Uuid::new_v4());
 
 	// Clean up any existing test data
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 
 	let db = Database::new(&db_name).await.expect("Failed to create database");
 	let subject = db.observe_subject("test_subject").await.expect("Failed to add subject");
@@ -213,7 +234,7 @@ async fn test_interpolation_methods() {
 	assert_eq!(linear_result.timestamp, linear_result2.timestamp, "Linear interpolation timestamps should match");
 
 	// Clean up
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 }
 
 #[tokio::test]
@@ -221,7 +242,7 @@ async fn test_caching_behavior() {
 	let db_name = format!("test_caching_{}", Uuid::new_v4());
 
 	// Clean up any existing test data
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 
 	let db = Database::new(&db_name).await.expect("Failed to create database");
 	let subject = db.observe_subject("cache_test_subject").await.expect("Failed to add subject");
@@ -254,7 +275,7 @@ async fn test_caching_behavior() {
 	println!("First call: {first_duration:?}, Second call: {second_duration:?}");
 
 	// Clean up
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 }
 
 /// Rewrite a dictionary's stored step interpolation, as the CHANGELOG's remedy for a
@@ -272,7 +293,7 @@ async fn set_stored_interpolation(db: &Database, aspect_id: &weftdb::AspectId, d
 #[tokio::test]
 async fn test_dictionary_metadata_validates_stored_interpolation() {
 	let db_name = format!("test_dictionary_steps_{}", Uuid::new_v4());
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 
 	let db = Database::new(&db_name).await.expect("Failed to create database");
 	let subject = db.observe_subject("dictionary_subject").await.expect("Failed to add subject");
@@ -306,7 +327,7 @@ async fn test_dictionary_metadata_validates_stored_interpolation() {
 	let listed = db.list_dictionaries(&aspect.id()).await.expect("Failed to list dictionaries");
 	assert_eq!(listed.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["stepped", "unstepped"]);
 
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 }
 
 /// Count the rows of `table` in a dictionary's database.
@@ -335,7 +356,7 @@ fn variability(kind: fn(Variability) -> VariablilityType, value: &str) -> Variab
 #[tokio::test]
 async fn test_set_dictionary_metadata_registers_and_replaces() {
 	let db_name = format!("test_dictionary_set_{}", Uuid::new_v4());
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 
 	let db = Database::new(&db_name).await.expect("Failed to create database");
 	let subject = db.observe_subject("dictionary_subject").await.expect("Failed to add subject");
@@ -383,7 +404,7 @@ async fn test_set_dictionary_metadata_registers_and_replaces() {
 	assert_eq!(err.to_string(), "Invalid step interpolation for dictionary 'pipeline': invalid polynomial degree 9: must be between 1 and 8");
 	assert_eq!(db.get_dictionary_metadata(&aspect.id(), "pipeline").await.expect("Failed to load dictionary metadata").expect("registered").id, bare.id);
 
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 }
 
 /// Databases written before `set_dictionary_metadata` replaced registrations hold a metadata
@@ -393,7 +414,7 @@ async fn test_set_dictionary_metadata_registers_and_replaces() {
 #[tokio::test]
 async fn test_dictionary_metadata_reads_past_duplicate_rows() {
 	let db_name = format!("test_dictionary_duplicates_{}", Uuid::new_v4());
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 
 	let db = Database::new(&db_name).await.expect("Failed to create database");
 	let subject = db.observe_subject("dictionary_subject").await.expect("Failed to add subject");
@@ -440,7 +461,7 @@ async fn test_dictionary_metadata_reads_past_duplicate_rows() {
 	assert_eq!(dictionary_rows(&db, &aspect.id(), "loaded", "dictionary_constraints").await, 1);
 	assert_eq!(dictionary_rows(&db, &aspect.id(), "loaded", "dictionary_variabilities").await, 0);
 
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 }
 
 /// `list_dictionaries` lists every dictionary of the aspect, each with its constraints. It
@@ -449,7 +470,7 @@ async fn test_dictionary_metadata_reads_past_duplicate_rows() {
 #[tokio::test]
 async fn test_list_dictionaries_lists_the_aspects_dictionaries() {
 	let db_name = format!("test_dictionary_list_{}", Uuid::new_v4());
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 
 	let db = Database::new(&db_name).await.expect("Failed to create database");
 	let subject = db.observe_subject("dictionary_subject").await.expect("Failed to add subject");
@@ -473,5 +494,5 @@ async fn test_list_dictionaries_lists_the_aspects_dictionaries() {
 	let listed = db.list_dictionaries(&other.id()).await.expect("Failed to list dictionaries");
 	assert_eq!(listed.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["gamma"]);
 
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 }

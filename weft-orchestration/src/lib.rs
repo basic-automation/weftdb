@@ -448,6 +448,8 @@ mod debug_batch_test;
 mod memory_test;
 #[cfg(test)]
 mod pattern_fix_test;
+#[cfg(test)]
+mod test_support;
 
 // Re-export main Pipeline API
 // Re-export built-in detectors
@@ -1415,9 +1417,10 @@ mod tests {
 	use serde_json::json;
 	use serial_test::serial;
 	use splimes::Spline;
-	use weftdb::{data_dir, AspectId, Database, DatasetId, InputMeasurement, Resolution};
+	use weftdb::{AspectId, Database, DatasetId, InputMeasurement, Resolution};
 
 	use super::*;
+	use crate::test_support::{data_dir, remove_database};
 
 	#[tokio::test]
 	#[serial]
@@ -1433,8 +1436,8 @@ mod tests {
 		}
 
 		// Debug: Show where we're looking for the database
-		tracing::info!(path = %format!("{}/Crypto", data_dir()), "Looking for Crypto database");
-		tracing::debug!(metadata_path = %format!("{}/Crypto/metadata.db", data_dir()), "Metadata file location");
+		tracing::info!(path = %data_dir().join("Crypto").display(), "Looking for Crypto database");
+		tracing::debug!(metadata_path = %data_dir().join("Crypto").join("metadata.db").display(), "Metadata file location");
 
 		// Try to get the Crypto database, skip test if it doesn't exist or doesn't have the required data
 		let database = match Database::existing("Crypto").await {
@@ -1687,7 +1690,7 @@ mod tests {
 		}
 
 		// Debug: Show where we're looking for the database
-		tracing::info!(path = %format!("{}/Crypto", data_dir()), "Looking for Crypto database");
+		tracing::info!(path = %data_dir().join("Crypto").display(), "Looking for Crypto database");
 
 		// Try to get the Crypto database, skip test if it doesn't exist or doesn't have the required data
 		let database = match Database::existing("Crypto").await {
@@ -2227,9 +2230,6 @@ mod tests {
 	}
 
 	async fn fake_database() -> Database {
-		// Cleanup existing test database if it exists
-		use std::fs::remove_dir_all;
-
 		use weftdb::{clear_connection_cache_by_name, DATABASES};
 
 		// Clear any cached database entry for TestDB before recreating
@@ -2245,8 +2245,8 @@ mod tests {
 		// Also clear the connection cache to release file handles
 		clear_connection_cache_by_name("TestDB").await;
 
-		let db_path = format!("{}/TestDB", data_dir());
-		remove_dir_all(&db_path).ok();
+		// Remove the database an earlier test left
+		remove_database("TestDB");
 
 		let db = Database::new("TestDB").await.unwrap();
 		let test_subject = db.observe_subject("TestSubject").await.unwrap();
@@ -2272,16 +2272,13 @@ mod tests {
 	#[tokio::test]
 	#[serial]
 	async fn test_batch_processing() -> Result<()> {
-		use std::fs::remove_dir_all;
-
 		// Skip this test if running in CI or if we want fast feedback
 		if std::env::var("SKIP_SLOW_TESTS").is_ok() {
 			tracing::info!("Skipping test_batch_processing due to SKIP_SLOW_TESTS environment variable");
 			return Ok(());
 		}
 
-		let db_path = format!("{}/test_bath_processing", data_dir());
-		remove_dir_all(&db_path).ok();
+		remove_database("test_bath_processing");
 
 		let db = Database::new("test_bath_processing").await.unwrap();
 		let test_subject = db.observe_subject("TestSubject").await.unwrap();
@@ -2339,16 +2336,13 @@ mod tests {
 	#[tokio::test]
 	#[serial]
 	async fn test_specific_process_batch() -> Result<()> {
-		use std::fs::remove_dir_all;
-
 		// Skip this test if running in CI or if we want fast feedback
 		if std::env::var("SKIP_SLOW_TESTS").is_ok() {
 			tracing::info!("Skipping test_specific_process_batch due to SKIP_SLOW_TESTS environment variable");
 			return Ok(());
 		}
 
-		let db_path = format!("{}/test_specific_process_batch", data_dir());
-		remove_dir_all(&db_path).ok();
+		remove_database("test_specific_process_batch");
 
 		let db = Database::new("test_specific_process_batch").await.unwrap();
 		let test_subject = db.observe_subject("TestSubject").await.unwrap();
@@ -2592,8 +2586,6 @@ mod tests {
 	#[tokio::test]
 	#[serial]
 	async fn test_load_or_create_pipeline() -> Result<()> {
-		use std::fs::remove_dir_all;
-
 		use weftdb::clear_connection_cache_by_name;
 
 		tracing::info!("=== Testing Pipeline::load_or_create ===");
@@ -2607,8 +2599,7 @@ mod tests {
 			}
 		}
 		clear_connection_cache_by_name("TestLoadOrCreate").await;
-		let db_path = format!("{}/TestLoadOrCreate", data_dir());
-		remove_dir_all(&db_path).ok();
+		remove_database("TestLoadOrCreate");
 
 		// Create database with test data
 		let db = Database::new("TestLoadOrCreate").await?;
@@ -2652,8 +2643,6 @@ mod tests {
 	#[tokio::test]
 	#[serial]
 	async fn test_run_subject_pipelines() -> Result<()> {
-		use std::fs::remove_dir_all;
-
 		use weftdb::clear_connection_cache_by_name;
 
 		tracing::info!("=== Testing run_subject_pipelines ===");
@@ -2667,8 +2656,7 @@ mod tests {
 			}
 		}
 		clear_connection_cache_by_name("TestParallelPipelines").await;
-		let db_path = format!("{}/TestParallelPipelines", data_dir());
-		remove_dir_all(&db_path).ok();
+		remove_database("TestParallelPipelines");
 
 		// Create database with multiple aspects
 		let db = Database::new("TestParallelPipelines").await?;
@@ -2722,6 +2710,7 @@ mod tests {
 	#[tokio::test]
 	async fn load_dictionary_registers_a_dictionary_once() -> Result<()> {
 		let db_name = format!("load_dictionary_{}", uuid::Uuid::new_v4());
+		remove_database(&db_name);
 		let db = Database::new(&db_name).await?;
 		let subject = db.observe_subject("subject").await?;
 		let aspect = db.track_aspect(&subject.id(), "aspect", &Resolution::Seconds, None).await?;
@@ -2747,7 +2736,7 @@ mod tests {
 		let listed = db.list_dictionaries(&aspect.id()).await?;
 		assert_eq!(listed.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["pipeline"]);
 
-		std::fs::remove_dir_all(format!("{}/{db_name}", data_dir())).ok();
+		remove_database(&db_name);
 		Ok(())
 	}
 }
