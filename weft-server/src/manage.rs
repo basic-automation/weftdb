@@ -90,7 +90,10 @@ fn parse_time_unit(token: &str) -> Result<TimeUnit, String> {
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeclareAspectRequest {
 	/// The aspect name to declare (unique within the store's `(database, subject)`
-	/// scope; a re-declaration overwrites).
+	/// scope; a re-declaration overwrites). It also names the aspect's files on disk, so
+	/// it must pass [`weftdb::aspect_name::validate`]: at most 160 bytes, no `/`, `\`,
+	/// control characters, leading `.`, trailing `.` or space, and not a Windows device
+	/// name such as `CON`.
 	pub name: String,
 	/// The physical encoding token (e.g. `"f64"`, `"scaled_i64"`).
 	pub physical_type: String,
@@ -132,11 +135,15 @@ fn schema_from_request(request: &DeclareAspectRequest) -> Result<AspectSchema, S
 /// # Errors
 ///
 /// [`StorageError::Unconfigured`] when no store is attached,
-/// [`StorageError::BadRequest`] when a token/tolerance does not parse, and
-/// [`StorageError::Internal`] on a control-plane write failure.
+/// [`StorageError::BadRequest`] when the name is not a valid aspect name or a
+/// token/tolerance does not parse, and [`StorageError::Internal`] on a control-plane
+/// write failure.
 pub async fn declare_aspect(State(state): State<AppState>, Json(request): Json<DeclareAspectRequest>) -> Result<Response, StorageError> {
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	drop(state);
+	// The name becomes part of every frame's file name: refuse one that could leave the
+	// store's `segments/` directory before anything is written.
+	weftdb::aspect_name::validate(&request.name).map_err(|err| StorageError::BadRequest(err.to_string()))?;
 	let schema = schema_from_request(&request)?;
 	let result = store.declare(&request.name, &schema).await;
 	drop(store);
@@ -787,7 +794,9 @@ pub struct IngestResponse {
 /// libSQL) is a `500`.
 fn classify_seal_error(err: &anyhow::Error) -> StorageError {
 	let message = err.to_string();
-	if message.contains("seal failed") || message.contains("paged seal failed") {
+	// An aspect declared under a name that is not safe as a file name (before names were
+	// checked) is the caller's addressing problem, not a server fault.
+	if message.contains("seal failed") || message.contains("paged seal failed") || err.downcast_ref::<weftdb::InvalidAspectName>().is_some() {
 		StorageError::BadRequest(message)
 	} else {
 		StorageError::Internal(message)
@@ -1263,6 +1272,67 @@ mod tests {
 		let body = serde_json::json!({ "name": "x", "physical_type": "f64", "timestamp_unit": "seconds" });
 		let (status, _body) = post_json(router, "/api/v1/storage/aspects", &body).await;
 		assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+	}
+
+	/// Every `.weftseg`/`.weftpart` file anywhere under `dir`.
+	fn frames_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+		let mut found = Vec::new();
+		for entry in std::fs::read_dir(dir).unwrap().map(Result::unwrap) {
+			let path = entry.path();
+			if path.is_dir() {
+				found.extend(frames_under(&path));
+			} else if path.extension().is_some_and(|ext| ext == "weftseg" || ext == "weftpart") {
+				found.push(path);
+			}
+		}
+		found
+	}
+
+	/// Regression: the declared name becomes part of every frame's file name, so a name
+	/// that would leave the store's `segments/` directory — a `..` traversal or an
+	/// absolute path — is a `400` in the JSON error envelope, and nothing is declared or
+	/// written.
+	#[tokio::test]
+	async fn declare_rejects_path_escaping_names() {
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(SegmentStore::open(dir.path().join("store")).await.expect("opens store"));
+		let state = AppState::new().with_store(store.clone());
+		let absolute = dir.path().join("abs").to_string_lossy().into_owned();
+		for name in ["../x", "../../x", absolute.as_str(), "a/b", "..", ".hidden", "CON", "a\u{0}b"] {
+			let body = serde_json::json!({ "name": name, "physical_type": "f64", "timestamp_unit": "seconds" });
+			let (status, body) = post_json(app_with_state(state.clone()), "/api/v1/storage/aspects", &body).await;
+			assert_eq!(status, StatusCode::BAD_REQUEST, "{name:?} must be refused; body: {body}");
+			assert!(body["error"].as_str().unwrap().contains("invalid aspect name"), "body: {body}");
+		}
+		// An ingest addressed through percent-encoded separators finds nothing declared.
+		let points = serde_json::json!({ "points": [{ "timestamp": 0, "value": "1" }] });
+		let (status, body) = post_json(app_with_state(state.clone()), "/api/v1/storage/..%2F..%2Fx/points", &points).await;
+		assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+		let declared = store.list_declared_aspects().await.unwrap();
+		drop(state);
+		drop(store);
+		assert!(declared.is_empty(), "nothing was declared: {declared:?}");
+		assert!(frames_under(dir.path()).is_empty(), "no frame was written anywhere");
+	}
+
+	/// An aspect declared under an unsafe name by an older version (straight into the
+	/// catalog) is refused on use with a `400`, and no frame is written for it.
+	#[tokio::test]
+	async fn a_previously_declared_unsafe_name_is_a_bad_request_on_use() {
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(SegmentStore::open(dir.path().join("store")).await.expect("opens store"));
+		let schema = weft_physical_type::AspectSchema::new(weft_physical_type::PhysicalType::F64, "0".parse().unwrap(), weft_physical_type::TimeUnit::Seconds);
+		store.catalog().declare(store.database(), store.subject(), "../x", &schema).await.expect("raw declare");
+		let state = AppState::new().with_store(store.clone());
+		let points = serde_json::json!({ "points": [{ "timestamp": 0, "value": "1" }] });
+		let (status, body) = post_json(app_with_state(state.clone()), "/api/v1/storage/..%2Fx/points", &points).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+		assert!(body["error"].as_str().unwrap().contains("invalid aspect name"), "body: {body}");
+		let response = app_with_state(state.clone()).oneshot(Request::builder().uri("/api/v1/storage/..%2Fx/range.csv?start=0&end=10").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+		drop(state);
+		drop(store);
+		assert!(frames_under(dir.path()).is_empty(), "no frame was written anywhere");
 	}
 
 	/// Declare `price` (F64, seconds) in a fresh store under `dir`, returning a router

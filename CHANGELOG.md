@@ -179,6 +179,18 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Security
 
+- **Aspect names can no longer point outside the segment store.** An aspect's name is
+  part of the file names of its `.weftseg` frames and `.weftpart` sidecars, and it was
+  not checked, so a client of `weft-server` could declare a name that made sealing,
+  reconciling or compacting create, overwrite or delete those files outside the store's
+  `segments/` directory. Names are now validated wherever they are declared or turned
+  into a path (`weftdb::aspect_name::validate`): at most 160 bytes, no `/` or `\`, no
+  control characters, no leading `.`, no trailing `.` or space, and not a Windows device
+  name (`CON`, `NUL`, `COM1`, …). `POST /api/v1/storage/aspects` answers `400` for such a
+  name, and every frame path is also checked to be a direct child of `segments/`. An
+  aspect already declared under such a name was never safe to use: it now fails on every
+  use with a typed `weftdb::InvalidAspectName` error (a `400` over HTTP), and the
+  store-wide maintenance sweeps skip it with a warning instead of failing.
 - Cleared the `crossbeam-epoch` (RUSTSEC-2026-0204) and `h2` (RUSTSEC-2026-0258)
   advisories, replaced the unmaintained `bincode` (RUSTSEC-2025-0141), and removed the
   unsound `lru` 0.16 (RUSTSEC-2026-0253) by disabling turso's unused full-text search.
