@@ -532,8 +532,11 @@ detection within Y% and improving historical query latency by Z."*
       every second difference) and `common_multiple_estimated_bytes()` (the shipped selector's best
       over the reduced column, plus a varint for g). Measured on ms_as_micros at **20.000 → 10.000
       bits/value** (g = 1000; pco 9.001). On real btc_minutes it finds g = 60 at no gain (already
-      0 bits); on jittered µs it finds none. Next: realize it as a timestamp codec flag (owner-gated,
-      headline change) and surface it as a `StorageEstimate` advisory. Original rationale: A µs column holding ms-precise instants costs WeftDB **20 bits/value against pco's
+      0 bits); on jittered µs it finds none. Surfaced as `storage.advisory_common_multiple_timestamp_bytes`
+      (and the delta-FOR one as `advisory_delta_for_timestamp_bytes`, schema v17). On a real
+      `weft-bench --input` run over 20k ms-precise instants: 50,007 → 25,011 timestamp bytes.
+      - [ ] **NEXT — realize the common-multiple factor as a timestamp codec flag (owner sign-off:
+        headline bytes/point change).** Original rationale: A µs column holding ms-precise instants costs WeftDB **20 bits/value against pco's
       9**, because every second difference carries three wasted decimal digits. This is the
       timestamp twin of the decimal-exponent FOR. Per block (or column), compute the GCD of the
       deltas, store it once, and pack `dod / gcd`. Expect ~10 bits on that corpus. It stays exact,

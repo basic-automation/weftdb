@@ -1215,7 +1215,14 @@ What it does today:
   present only when it beats the realized codec — e.g. a `ScaledI64` column whose
   scale is forced by a few high-precision values; real BTC closes measure 13.58 vs
   33.74 bits/value in
-  [`weft-physical-type/benches/alp_vs_f64_codecs.rs`](weft-physical-type/benches/alp_vs_f64_codecs.rs))
+  [`weft-physical-type/benches/alp_vs_f64_codecs.rs`](weft-physical-type/benches/alp_vs_f64_codecs.rs)),
+  plus two timestamp-column what-ifs (schema v17), each present only when it beats the
+  realized codec: `advisory_common_multiple_timestamp_bytes` (the GCD of the deltas
+  factored out — millisecond-precise instants stored in microseconds measure 20 → 10
+  bits/value in
+  [`weft-physical-type/benches/timestamp_vs_pco.rs`](weft-physical-type/benches/timestamp_vs_pco.rs))
+  and `advisory_delta_for_timestamp_bytes` (first-order deltas under per-block FOR, for
+  independent random intervals: 20.0 → 19.4 bits/value)
   — each a *what-if* number the adopt-or-drop decision reads, never a realized
   headline claim.
 - **Reports** — a `BenchReport` JSON artifact (run metadata + a best-effort

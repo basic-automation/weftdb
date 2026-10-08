@@ -64,8 +64,13 @@ use crate::{
 /// `storage.advisory_dfor_value_bytes` — the footprint of the **decimal-exponent FOR** value codec
 /// (each block factors out its common power of ten before FOR packing) when it beats the realized
 /// codec, the potential saving on a `ScaledI64` column whose scale is set by a few high-precision
-/// values. All optional fields are `#[serde(default)]`, so older artifacts still deserialize.
-pub const SCHEMA_VERSION: u32 = 16;
+/// values. v17 added two timestamp-column advisories: `storage.advisory_common_multiple_timestamp_bytes`
+/// (the delta-of-delta column with the GCD of its deltas factored out, for instants stored at a
+/// finer unit than their precision) and `storage.advisory_delta_for_timestamp_bytes` (first-order
+/// deltas under per-block FOR, for independent random intervals), each present only when it
+/// beats the realized timestamp codec. All optional fields are `#[serde(default)]`, so older
+/// artifacts still deserialize.
+pub const SCHEMA_VERSION: u32 = 17;
 
 /// Metadata describing the dataset a result was measured against.
 ///
@@ -283,6 +288,21 @@ pub struct StorageEstimate {
 	/// encoding, or on a pre-v16 artifact. Advisory: not yet a realized value codec (owner-gated).
 	#[serde(default)]
 	pub advisory_dfor_value_bytes: Option<usize>,
+	/// **Advisory** timestamp-column footprint with the column's common multiple factored out
+	/// ([`DeltaOfDeltaColumn::common_multiple_estimated_bytes`](weft_physical_type::DeltaOfDeltaColumn::common_multiple_estimated_bytes)).
+	/// It covers instants stored at a finer unit than their precision, such as millisecond
+	/// events in a microsecond column (20 → 10 bits/value in
+	/// `weft-physical-type/benches/timestamp_vs_pco.rs`). `Some` only when it strictly beats
+	/// [`timestamp_bytes`](Self::timestamp_bytes); `None` otherwise or on a pre-v17 artifact.
+	#[serde(default)]
+	pub advisory_common_multiple_timestamp_bytes: Option<usize>,
+	/// **Advisory** timestamp-column footprint as first-order deltas under per-block FOR
+	/// ([`DeltaOfDeltaColumn::delta_for_estimated_bytes`](weft_physical_type::DeltaOfDeltaColumn::delta_for_estimated_bytes)).
+	/// It wins on independent random intervals, where delta-of-delta's stride assumption costs
+	/// about a bit per value. `Some` only when it strictly beats
+	/// [`timestamp_bytes`](Self::timestamp_bytes); `None` otherwise or on a pre-v17 artifact.
+	#[serde(default)]
+	pub advisory_delta_for_timestamp_bytes: Option<usize>,
 }
 
 impl StorageEstimate {
@@ -322,11 +342,14 @@ impl StorageEstimate {
 		// single jitter) — the same single source of truth a stored `Segment` uses,
 		// so the advisory bench estimate and a realized segment never disagree on
 		// size or codec label.
-		let (timestamp_bytes, timestamp_encoding) = if timestamps.is_empty() {
-			(0, "delta_of_delta")
+		let (timestamp_bytes, timestamp_encoding, advisory_common_multiple_timestamp_bytes, advisory_delta_for_timestamp_bytes) = if timestamps.is_empty() {
+			(0, "delta_of_delta", None, None)
 		} else {
 			let dod = encode_delta_of_delta(timestamps, unit);
-			(dod.best_estimated_bytes(), dod.best_encoding_name())
+			let best = dod.best_estimated_bytes();
+			// Advisories: the common-multiple factor and first-order delta + FOR, each surfaced
+			// only when it strictly beats the realized timestamp codec.
+			(best, dod.best_encoding_name(), dod.common_multiple_estimated_bytes().filter(|&b| b < best), Some(dod.delta_for_estimated_bytes()).filter(|&b| b < best))
 		};
 		let timestamp_bytes_per_point = per_point(timestamp_bytes, timestamps.len());
 		// Advisory: the FIRE forecaster's footprint on the same timestamp column — the potential
@@ -345,7 +368,7 @@ impl StorageEstimate {
 		// realized codec (so it answers "would a per-block decimal exponent help this corpus?").
 		let advisory_dfor_value_bytes = enc.dfor_value_bytes().filter(|&dfor| dfor < realized_value_bytes);
 
-		Self { physical_type: enc.physical_type.name().to_string(), value_count, estimated_value_bytes, realized_value_bytes, value_codec, bytes_per_point, is_exact: enc.is_exact(), lossy_count: enc.lossy_count, max_abs_error: enc.max_abs_error.to_string(), tolerance: tolerance.to_string(), timestamp_unit: unit.name().to_string(), timestamp_encoding: timestamp_encoding.to_string(), timestamp_bytes, timestamp_bytes_per_point, total_bytes_per_point: bytes_per_point + timestamp_bytes_per_point, advisory_best_f64_bytes, advisory_best_f64_codec, advisory_fire_timestamp_bytes, advisory_delta_cascade_value_bytes, advisory_dfor_value_bytes }
+		Self { physical_type: enc.physical_type.name().to_string(), value_count, estimated_value_bytes, realized_value_bytes, value_codec, bytes_per_point, is_exact: enc.is_exact(), lossy_count: enc.lossy_count, max_abs_error: enc.max_abs_error.to_string(), tolerance: tolerance.to_string(), timestamp_unit: unit.name().to_string(), timestamp_encoding: timestamp_encoding.to_string(), timestamp_bytes, timestamp_bytes_per_point, total_bytes_per_point: bytes_per_point + timestamp_bytes_per_point, advisory_best_f64_bytes, advisory_best_f64_codec, advisory_fire_timestamp_bytes, advisory_delta_cascade_value_bytes, advisory_dfor_value_bytes, advisory_common_multiple_timestamp_bytes, advisory_delta_for_timestamp_bytes }
 	}
 }
 
@@ -423,7 +446,7 @@ mod tests {
 
 	fn sample_result() -> BenchResult {
 		let samples = [100, 200, 300];
-		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "weftdb".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: Some(SignalShape::MultiSine) }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true }, accuracy: Some(AccuracyMetrics { count: 1000, rmse: 1.5, mae: 1.1, max_abs_error: 4.2, bias: -0.3 }), storage: Some(StorageEstimate { physical_type: "scaled_i64".to_string(), value_count: 200, estimated_value_bytes: 1600, realized_value_bytes: 420, value_codec: "varint".to_string(), bytes_per_point: 2.1, is_exact: true, lossy_count: 0, max_abs_error: "0".to_string(), tolerance: "0".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 208, timestamp_bytes_per_point: 1.04, total_bytes_per_point: 3.14, advisory_best_f64_bytes: None, advisory_best_f64_codec: None, advisory_fire_timestamp_bytes: Some(180), advisory_delta_cascade_value_bytes: None, advisory_dfor_value_bytes: None }) }
+		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "weftdb".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: Some(SignalShape::MultiSine) }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true }, accuracy: Some(AccuracyMetrics { count: 1000, rmse: 1.5, mae: 1.1, max_abs_error: 4.2, bias: -0.3 }), storage: Some(StorageEstimate { physical_type: "scaled_i64".to_string(), value_count: 200, estimated_value_bytes: 1600, realized_value_bytes: 420, value_codec: "varint".to_string(), bytes_per_point: 2.1, is_exact: true, lossy_count: 0, max_abs_error: "0".to_string(), tolerance: "0".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 208, timestamp_bytes_per_point: 1.04, total_bytes_per_point: 3.14, advisory_best_f64_bytes: None, advisory_best_f64_codec: None, advisory_fire_timestamp_bytes: Some(180), advisory_delta_cascade_value_bytes: None, advisory_dfor_value_bytes: None, advisory_common_multiple_timestamp_bytes: None, advisory_delta_for_timestamp_bytes: None }) }
 	}
 
 	#[test]
@@ -645,6 +668,32 @@ mod tests {
 		let jitter: Vec<BigDecimal> = (0..400).map(|i| BigDecimal::from_str(&format!("{}.5", i % 7)).unwrap()).collect();
 		let flat = StorageEstimate::from_columns(&jitter, &[], TimeUnit::Micros, &BigDecimal::from(0));
 		assert_eq!(flat.advisory_delta_cascade_value_bytes, None, "off-trend column must carry no cascade advisory");
+	}
+
+	#[test]
+	fn timestamp_advisories_surface_only_where_they_beat_the_realized_codec() {
+		// Millisecond-precise random instants stored in microseconds: the common-multiple factor
+		// beats the realized codec. A constant 60 s stride: neither advisory can beat it.
+		let values: Vec<BigDecimal> = (0..2_048).map(|i| BigDecimal::from(i % 9)).collect();
+		let mut state = 0x2545_f491_4f6c_dd1d_u64;
+		let mut t = 1_700_000_000_000_000_i64;
+		let ms_in_us: Vec<i64> = (0..2_048)
+			.map(|_| {
+				state ^= state << 13;
+				state ^= state >> 7;
+				state ^= state << 17;
+				t += (i64::try_from(state % 500).unwrap_or(0) + 1) * 1_000;
+				t
+			})
+			.collect();
+		let est = StorageEstimate::from_columns(&values, &ms_in_us, TimeUnit::Micros, &BigDecimal::from(0));
+		let factored = est.advisory_common_multiple_timestamp_bytes.expect("ms-in-us carries the common-multiple advisory");
+		assert!(factored < est.timestamp_bytes);
+		let regular: Vec<i64> = (0..2_048_i64).map(|i| 1_700_000_000 + i * 60).collect();
+		let flat = StorageEstimate::from_columns(&values, &regular, TimeUnit::Seconds, &BigDecimal::from(0));
+		assert_eq!((flat.advisory_common_multiple_timestamp_bytes, flat.advisory_delta_for_timestamp_bytes), (None, None));
+		let none = StorageEstimate::from_values(&values, &BigDecimal::from(0));
+		assert_eq!((none.advisory_common_multiple_timestamp_bytes, none.advisory_delta_for_timestamp_bytes), (None, None));
 	}
 
 	#[test]
