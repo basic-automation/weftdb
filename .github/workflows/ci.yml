@@ -43,7 +43,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # Stable jobs build with the release compiler, pinned in one file that the release
-      # workflow reads too, so CI tests exactly what ships.
+      # workflow reads too, so CI tests with the same compiler that builds a release. (Not
+      # the same build: CI unifies features across --workspace and uses the dev profile;
+      # a release builds each binary alone, with fat LTO.)
       - name: Read the release toolchain
         id: toolchain
         shell: bash
@@ -231,6 +233,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: actionlint
         uses: docker://rhysd/actionlint:1.7.12
         with:

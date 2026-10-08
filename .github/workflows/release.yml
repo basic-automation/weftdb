@@ -270,6 +270,15 @@ jobs:
           if [[ $PROFILE == dev ]]; then profile_dir=debug; fi
           echo "BIN_DIR=src/target/$TARGET/$profile_dir" >>"$GITHUB_ENV"
 
+      # Each runner builds its own target, so the binary can run here. weft-bench is the
+      # one whose --help exits without starting anything.
+      - name: Smoke-test a binary
+        run: |
+          set -euo pipefail
+          exe=''
+          if [[ $RUNNER_OS == Windows ]]; then exe=.exe; fi
+          "$BIN_DIR/weft-bench$exe" --help >/dev/null
+
       - name: Stage the archive
         env:
           TARGET: ${{ matrix.target }}
