@@ -135,8 +135,10 @@ fn value_span<'a>(descriptors: impl Iterator<Item = &'a SegmentDescriptor>) -> O
 
 /// A durable, libSQL-backed store of per-aspect segment-set rollups.
 ///
-/// Open one with [`AspectMetadataStore::open`] (a file path) or
-/// [`AspectMetadataStore::open_in_memory`] (tests); materialize an aspect's rollup with
+/// A [`SegmentStore`](crate::SegmentStore) opens one over its root's `metadata.db` and
+/// hands it out with [`SegmentStore::metadata`](crate::SegmentStore::metadata); it cannot
+/// be opened on its own, since its schema is the store's migration registry's, which runs
+/// only behind the store's `STORE_FORMAT` gate. Materialize an aspect's rollup with
 /// [`put`](AspectMetadataStore::put) (or fold a fresh seal in with
 /// [`record_seal`](AspectMetadataStore::record_seal)); read it back with
 /// [`get`](AspectMetadataStore::get).
@@ -150,28 +152,14 @@ impl AspectMetadataStore {
 	/// backup and restore verification require them.
 	pub const TABLES: &'static [&'static str] = &["aspect_metadata"];
 
-	/// Open (creating if absent) the `metadata.db` at `path` on its own, outside a store:
-	/// enable MVCC, prove it took, and bring the schema up to this build's layout with the
-	/// migration registry's DDL (the `aspect_metadata` table). A [`SegmentStore`](crate::SegmentStore)
-	/// opens it without DDL instead and runs the registry itself, after its marker gate.
+	/// Open (creating if absent) the `metadata.db` at `path` without running any DDL:
+	/// enable MVCC, prove it and sync its header, nothing else. What a
+	/// [`SegmentStore`](crate::SegmentStore) opens before it runs the migration registry.
 	///
 	/// # Errors
 	///
 	/// Fails if the database does not end up in MVCC journal mode or a new connection
-	/// does not sync FULL, and propagates any libSQL connection or DDL failure.
-	pub async fn open(path: &str) -> Result<Self> {
-		let store = Self::open_unmigrated(path).await?;
-		crate::types::migrations::apply_standalone(&crate::types::migrations::ControlPlane { metadata: Some(crate::types::migrations::Db { db: &store.db, name: path }), ..crate::types::migrations::ControlPlane::default() }).await?;
-		Ok(store)
-	}
-
-	/// Open the `metadata.db` at `path` without running any DDL: enable MVCC, prove it and
-	/// sync its header, nothing else. What a [`SegmentStore`](crate::SegmentStore) opens
-	/// before it runs the migrations.
-	///
-	/// # Errors
-	///
-	/// As [`open`](Self::open), less the DDL.
+	/// does not sync FULL, and propagates any libSQL connection failure.
 	pub(crate) async fn open_unmigrated(path: &str) -> Result<Self> {
 		let db = Builder::new_local(path).build().await?;
 		let conn = crate::types::durable::control_plane::connect(&db).await?;
@@ -186,13 +174,14 @@ impl AspectMetadataStore {
 		&self.db
 	}
 
-	/// Open an ephemeral in-memory store (`:memory:`) for tests.
-	///
-	/// # Errors
-	///
-	/// Propagates any libSQL connection or DDL failure.
-	pub async fn open_in_memory() -> Result<Self> {
-		Self::open(":memory:").await
+	/// The tests' database on its own (`:memory:` or a file):
+	/// [`open_unmigrated`](Self::open_unmigrated), then the registry's DDL for this
+	/// database (the `aspect_metadata` table), recorded nowhere.
+	#[cfg(test)]
+	pub(crate) async fn open_migrated(path: &str) -> Result<Self> {
+		let store = Self::open_unmigrated(path).await?;
+		crate::types::migrations::apply_standalone(&crate::types::migrations::ControlPlane { metadata: Some(crate::types::migrations::Db { db: &store.db, name: path }), ..crate::types::migrations::ControlPlane::default() }).await?;
+		Ok(store)
 	}
 
 	/// Snapshot this `metadata.db` to `dest` (a fresh file) via Turso's `VACUUM INTO`,
@@ -403,7 +392,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn put_then_get_round_trips() {
-		let store = AspectMetadataStore::open_in_memory().await.expect("opens");
+		let store = AspectMetadataStore::open_migrated(":memory:").await.expect("opens");
 		let meta = AspectMetadata { segment_count: 2, total_rows: 20, total_nulls: 3, total_bytes: 256, unsorted_segments: 1, time_range: Some((0, 190)), value_range: Some((bd("0"), bd("19.5"))) };
 		store.put("temp", &meta).await.expect("puts");
 		let got = store.get("temp").await.expect("gets");
@@ -419,7 +408,7 @@ mod tests {
 	/// the write's own report, not an inference from whether a row already existed.
 	#[tokio::test]
 	async fn put_reports_its_affected_row_count() {
-		let store = AspectMetadataStore::open_in_memory().await.expect("opens");
+		let store = AspectMetadataStore::open_migrated(":memory:").await.expect("opens");
 		let meta = AspectMetadata { segment_count: 1, total_rows: 10, total_nulls: 0, total_bytes: 128, unsorted_segments: 0, time_range: Some((0, 90)), value_range: Some((bd("0"), bd("9"))) };
 		let first = store.put("temp", &meta).await.expect("puts");
 		// Overwriting the same aspect key replaces the row rather than adding one.
@@ -435,7 +424,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn from_index_matches_a_fold_chain() {
-		let store = AspectMetadataStore::open_in_memory().await.expect("opens");
+		let store = AspectMetadataStore::open_migrated(":memory:").await.expect("opens");
 		// Build a two-segment index and the equivalent fold chain; they must agree.
 		let mut index = SegmentIndex::new();
 		let mut folded = AspectMetadata::default();
@@ -459,7 +448,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn record_seal_accumulates_incrementally() {
-		let store = AspectMetadataStore::open_in_memory().await.expect("opens");
+		let store = AspectMetadataStore::open_migrated(":memory:").await.expect("opens");
 		let (first, len0) = sealed(0);
 		let (second, len1) = sealed(100);
 		// First seal creates the rollup; second folds in.
@@ -480,7 +469,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn nullable_segment_counts_nulls_and_skips_empty_value_span() {
-		let store = AspectMetadataStore::open_in_memory().await.expect("opens");
+		let store = AspectMetadataStore::open_migrated(":memory:").await.expect("opens");
 		// Two nulls among four rows; the value span still spans the present values.
 		let ts = vec![10_i64, 20, 30, 40];
 		let vs = vec![Some(bd("1.25")), None, Some(bd("3.75")), None];
@@ -497,7 +486,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn empty_segment_records_no_bounds() {
-		let store = AspectMetadataStore::open_in_memory().await.expect("opens");
+		let store = AspectMetadataStore::open_migrated(":memory:").await.expect("opens");
 		let empty = Segment::build(&[], &[], TimeUnit::Seconds, &bd("0")).expect("builds");
 		let d = SegmentDescriptor::of_segment(0, "empty.weftseg", empty.write_to().len() as u64, &empty);
 		let meta = store.record_seal("a", &d).await.expect("records");
@@ -512,7 +501,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn list_and_remove() {
-		let store = AspectMetadataStore::open_in_memory().await.expect("opens");
+		let store = AspectMetadataStore::open_migrated(":memory:").await.expect("opens");
 		let (d, _) = sealed(0);
 		store.record_seal("temp", &d).await.expect("records");
 		store.record_seal("humidity", &d).await.expect("records");
@@ -532,10 +521,10 @@ mod tests {
 		let path = dir.path().join("metadata.db");
 		let path = path.to_string_lossy().into_owned();
 		let (d, _) = sealed(0);
-		let first = AspectMetadataStore::open(&path).await.expect("opens");
+		let first = AspectMetadataStore::open_migrated(&path).await.expect("opens");
 		let recorded = first.record_seal("a", &d).await.expect("records");
 		drop(first);
-		let reopened = AspectMetadataStore::open(&path).await.expect("reopens");
+		let reopened = AspectMetadataStore::open_migrated(&path).await.expect("reopens");
 		let got = reopened.get("a").await.expect("gets");
 		drop(reopened);
 		assert_eq!(got, Some(recorded));

@@ -15,7 +15,9 @@
 //! [`SUPPORTED_LAYOUT`] ([`StoreError::IncompatibleLayout`](crate::StoreError)). So a
 //! WeftDB never runs its pragmas, its probes or its DDL on a store it would break, and a
 //! Turso format change can be refused before Turso opens anything, by a migration that
-//! raises both floors.
+//! raises both floors. A root that has databases but no marker (written before markers
+//! existed, or its marker lost) is judged instead by the copy `segment_index.db`'s
+//! `store_meta` keeps, read before anything is written to the root.
 //!
 //! - `layout_version` is the layout the store is in; `min_read_layout` and
 //!   `min_write_layout` are the oldest layouts a WeftDB must know to read and to write
@@ -115,6 +117,15 @@ impl StoreFormat {
 	#[must_use]
 	pub(crate) fn legacy(scope: StoreScope) -> Self {
 		Self { kind: STORE_KIND.to_string(), layout_version: LEGACY_LAYOUT, min_read_layout: LEGACY_LAYOUT, min_write_layout: LEGACY_LAYOUT, last_written_layout: LEGACY_LAYOUT, migrating_to: None, applied_through: None, store_uuid: uuid::Uuid::new_v4().to_string(), scope }
+	}
+
+	/// Whether this is the marker a new store starts with, still unsettled: an open that
+	/// was creating the store stopped before it finished, and the next open finishes it.
+	/// It is migrating to its own layout with nothing applied; a layout-1 store being
+	/// migrated is migrating to a newer layout than its own.
+	#[must_use]
+	pub(crate) fn is_unfinished_creation(&self) -> bool {
+		self.applied_through.is_none() && self.migrating_to == Some(self.layout_version)
 	}
 
 	/// Whether a WeftDB that writes layouts up to `supported` may write this store.

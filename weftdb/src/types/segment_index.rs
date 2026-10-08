@@ -50,9 +50,10 @@ const SELECT_COLUMNS: &str = "id, path, format_version, physical_type, time_unit
 
 /// A durable, libSQL-backed index of sealed segments, scoped by aspect.
 ///
-/// Open one with [`SegmentIndexStore::open`] (a file path) or
-/// [`SegmentIndexStore::open_in_memory`] (tests); record a freshly sealed segment
-/// with [`insert`](SegmentIndexStore::insert); prune a query with
+/// A [`SegmentStore`](crate::SegmentStore) opens one over its root's `segment_index.db`
+/// and hands it out with [`SegmentStore::index`](crate::SegmentStore::index); it cannot
+/// be opened on its own, since its schema is the store's migration registry's, which
+/// runs only behind the store's `STORE_FORMAT` gate. Prune a query with
 /// [`prune_by_time`](SegmentIndexStore::prune_by_time).
 pub struct SegmentIndexStore {
 	db: turso::Database,
@@ -64,41 +65,35 @@ impl SegmentIndexStore {
 	/// backup and restore verification require them.
 	pub const TABLES: &'static [&'static str] = &["segment_index"];
 
-	/// Open (creating if absent) the `segment_index.db` at `path` on its own, outside a
-	/// store: enable MVCC, prove it took, and bring the schema up to this build's layout
-	/// with the migration registry's DDL (recording nothing, since a database on its own
-	/// has no `STORE_FORMAT`).
-	///
-	/// A [`SegmentStore`](crate::SegmentStore) does not use this: it opens the database
-	/// without DDL and runs the registry itself, after its marker gate.
+	/// Open (creating if absent) the `segment_index.db` at `path` without running any DDL:
+	/// refuse a newer write floor, enable MVCC, prove it and sync its header, nothing else.
+	/// What a [`SegmentStore`](crate::SegmentStore) opens before it runs the migration
+	/// registry.
 	///
 	/// # Errors
 	///
-	/// Fails if the database does not end up in MVCC journal mode or a new connection
-	/// does not sync FULL, or if its `store_meta` records a write floor newer than
-	/// [`SUPPORTED_LAYOUT`] ([`StoreError::IncompatibleLayout`]), and propagates any libSQL
-	/// connection or DDL failure.
-	pub async fn open(path: &str) -> Result<Self> {
+	/// Fails if its `store_meta` records a write floor newer than [`SUPPORTED_LAYOUT`]
+	/// ([`StoreError::IncompatibleLayout`], with nothing written to the database), or if
+	/// the database does not end up in MVCC journal mode or a new connection does not sync
+	/// FULL, and propagates any libSQL connection failure.
+	pub(crate) async fn open_unmigrated(path: &str) -> Result<Self> {
+		Self::open_with(Builder::new_local(path), path).await
+	}
+
+	/// The tests' database on its own (`:memory:` or a file):
+	/// [`open_unmigrated`](Self::open_unmigrated), then the registry's DDL for this
+	/// database, recorded nowhere.
+	#[cfg(test)]
+	pub(crate) async fn open_migrated(path: &str) -> Result<Self> {
 		let store = Self::open_unmigrated(path).await?;
 		migrations::apply_standalone(&migrations::ControlPlane { index: Some(migrations::Db { db: &store.db, name: path }), ..migrations::ControlPlane::default() }).await?;
 		Ok(store)
 	}
 
-	/// Open the `segment_index.db` at `path` without running any DDL: refuse a newer write
-	/// floor, enable MVCC, prove it and sync its header, nothing else. What a
-	/// [`SegmentStore`](crate::SegmentStore) opens before it runs the migrations.
-	///
-	/// # Errors
-	///
-	/// As [`open`](Self::open), less the DDL.
-	pub(crate) async fn open_unmigrated(path: &str) -> Result<Self> {
-		Self::open_with(Builder::new_local(path), path).await
-	}
-
-	/// [`open`](Self::open) on Turso I/O backend `io`, for the tests that record what the
-	/// open does to the files.
+	/// [`open_migrated`](Self::open_migrated) on Turso I/O backend `io`, for the tests that
+	/// record what the open does to the files.
 	#[cfg(test)]
-	pub(crate) async fn open_with_io(path: &str, io: std::sync::Arc<dyn turso::core::IO>) -> Result<Self> {
+	pub(crate) async fn open_migrated_with_io(path: &str, io: std::sync::Arc<dyn turso::core::IO>) -> Result<Self> {
 		let store = Self::open_with(Builder::new_local(path).with_io_impl(io), path).await?;
 		migrations::apply_standalone(&migrations::ControlPlane { index: Some(migrations::Db { db: &store.db, name: path }), ..migrations::ControlPlane::default() }).await?;
 		Ok(store)
@@ -110,15 +105,6 @@ impl SegmentIndexStore {
 		let db = builder.build().await?;
 		Self::configure(&db, path).await?;
 		Ok(Self { db })
-	}
-
-	/// Open an ephemeral in-memory store — the path `:memory:` — for tests.
-	///
-	/// # Errors
-	///
-	/// Propagates any libSQL connection or DDL failure.
-	pub async fn open_in_memory() -> Result<Self> {
-		Self::open(":memory:").await
 	}
 
 	/// Snapshot this `segment_index.db` to `dest` (a fresh file) via Turso's
@@ -538,7 +524,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn insert_then_read_round_trips_a_descriptor() {
-		let store = SegmentIndexStore::open_in_memory().await.expect("opens");
+		let store = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
 		let (seg, len) = sealed(100);
 		let d = SegmentDescriptor::of_segment(1, "segments/1.weftseg", len, &seg);
 		store.insert("temp", &d).await.expect("inserts");
@@ -557,7 +543,7 @@ mod tests {
 	/// affects zero rows, which is exactly the signal an idempotency ledger needs.
 	#[tokio::test]
 	async fn control_plane_writes_report_their_affected_row_counts() {
-		let store = SegmentIndexStore::open_in_memory().await.expect("opens");
+		let store = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
 		let (seg, len) = sealed(100);
 		let d = SegmentDescriptor::of_segment(1, "segments/1.weftseg", len, &seg);
 		let inserted = store.insert("temp", &d).await.expect("inserts");
@@ -576,7 +562,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn prune_by_time_skips_disjoint_segments_in_sql() {
-		let store = SegmentIndexStore::open_in_memory().await.expect("opens");
+		let store = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
 		for (i, base) in [0_i64, 100, 200].into_iter().enumerate() {
 			let (seg, len) = sealed(base);
 			let d = SegmentDescriptor::of_segment(i as u64, format!("s{i}.weftseg"), len, &seg);
@@ -597,7 +583,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn aspects_are_isolated() {
-		let store = SegmentIndexStore::open_in_memory().await.expect("opens");
+		let store = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
 		let (seg, len) = sealed(0);
 		store.insert("a", &SegmentDescriptor::of_segment(0, "a0.weftseg", len, &seg)).await.expect("inserts");
 		store.insert("b", &SegmentDescriptor::of_segment(0, "b0.weftseg", len, &seg)).await.expect("inserts");
@@ -614,7 +600,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn reinsert_same_id_replaces() {
-		let store = SegmentIndexStore::open_in_memory().await.expect("opens");
+		let store = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
 		let (seg, len) = sealed(0);
 		store.insert("a", &SegmentDescriptor::of_segment(0, "old.weftseg", len, &seg)).await.expect("inserts");
 		store.insert("a", &SegmentDescriptor::of_segment(0, "new.weftseg", len, &seg)).await.expect("re-inserts");
@@ -627,7 +613,7 @@ mod tests {
 	#[tokio::test]
 	#[allow(deprecated)]
 	async fn delete_removes_a_row_and_reports_whether_it_matched() {
-		let store = SegmentIndexStore::open_in_memory().await.expect("opens");
+		let store = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
 		let (seg, len) = sealed(0);
 		store.insert("a", &SegmentDescriptor::of_segment(0, "s0.weftseg", len, &seg)).await.expect("inserts 0");
 		store.insert("a", &SegmentDescriptor::of_segment(1, "s1.weftseg", len, &seg)).await.expect("inserts 1");
@@ -648,7 +634,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn nullable_and_metadata_round_trip() {
-		let store = SegmentIndexStore::open_in_memory().await.expect("opens");
+		let store = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
 		// A nullable segment with two nulls and a scaled encoding to exercise the
 		// JSON metadata + plain-text decimal round trip.
 		let ts = vec![10_i64, 20, 30, 40];
@@ -667,7 +653,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn load_index_rebuilds_resident_pruning() {
-		let store = SegmentIndexStore::open_in_memory().await.expect("opens");
+		let store = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
 		// Values offset by base ⇒ disjoint value spans [0,9], [100,109], [200,209].
 		for (i, base) in [0_i64, 100, 200].into_iter().enumerate() {
 			let ts: Vec<i64> = (0..10).map(|v| base + v * 10).collect();
@@ -687,7 +673,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn empty_segment_never_overlaps() {
-		let store = SegmentIndexStore::open_in_memory().await.expect("opens");
+		let store = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
 		let empty = Segment::build(&[], &[], TimeUnit::Seconds, &bd("0")).expect("builds");
 		let d = SegmentDescriptor::of_segment(0, "empty.weftseg", empty.write_to().len() as u64, &empty);
 		store.insert("a", &d).await.expect("inserts");
@@ -701,7 +687,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn list_aspects_enumerates_distinct_aspects_in_order() {
-		let store = SegmentIndexStore::open_in_memory().await.expect("opens");
+		let store = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
 		let (seg, len) = sealed(0);
 		// Two aspects, one with multiple segments — list_aspects deduplicates.
 		store.insert("temp", &SegmentDescriptor::of_segment(0, "t0.weftseg", len, &seg)).await.expect("inserts");
@@ -709,7 +695,7 @@ mod tests {
 		store.insert("humidity", &SegmentDescriptor::of_segment(0, "h0.weftseg", len, &seg)).await.expect("inserts");
 		let aspects = store.list_aspects().await.expect("lists");
 		// An empty index lists nothing.
-		let empty = SegmentIndexStore::open_in_memory().await.expect("opens");
+		let empty = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
 		let none = empty.list_aspects().await.expect("lists");
 		drop(store);
 		drop(empty);
@@ -744,7 +730,7 @@ mod tests {
 		let dir = tempfile::TempDir::new().expect("tempdir");
 		let path = dir.path().join("segment_index.db");
 		let path = path.to_string_lossy();
-		let store = SegmentIndexStore::open(&path).await.expect("opens");
+		let store = SegmentIndexStore::open_migrated(&path).await.expect("opens");
 		let conn = store.db.connect().expect("connects");
 		// A newer WeftDB that dropped one of layout 2's tables and the time index, and
 		// recorded only its layout.
@@ -754,7 +740,7 @@ mod tests {
 		drop(conn);
 		drop(store);
 		let before = files_in(dir.path());
-		let refused = SegmentIndexStore::open(&path).await.err().expect("a newer layout is refused");
+		let refused = SegmentIndexStore::open_migrated(&path).await.err().expect("a newer layout is refused");
 		let after = files_in(dir.path());
 		let db = turso::Builder::new_local(&path).build().await.expect("opens the refused store raw");
 		let conn = db.connect().expect("connects");
@@ -768,7 +754,7 @@ mod tests {
 		drop(conn);
 		drop(db);
 		let wal_before = files_in(dir.path());
-		let wal_refused = SegmentIndexStore::open(&path).await.err().expect("a newer layout in WAL mode is refused");
+		let wal_refused = SegmentIndexStore::open_migrated(&path).await.err().expect("a newer layout in WAL mode is refused");
 		let wal_after = files_in(dir.path());
 		let wal_mode = journal_mode(&path).await;
 		assert_eq!(refused.downcast_ref::<StoreError>(), Some(&StoreError::IncompatibleLayout { min_write: 3, supported: SUPPORTED_LAYOUT }), "{refused:#}");
@@ -784,7 +770,7 @@ mod tests {
 		conn.execute("INSERT INTO store_meta (key, value) VALUES ('min_write_layout', '2')", ()).await.expect("records a write floor");
 		drop(conn);
 		drop(db);
-		let store = SegmentIndexStore::open(&path).await.expect("a newer layout this build may write opens");
+		let store = SegmentIndexStore::open_migrated(&path).await.expect("a newer layout this build may write opens");
 		let floor = store.meta("min_write_layout").await.expect("reads");
 		drop(store);
 		assert_eq!(floor.as_deref(), Some("2"));
@@ -805,7 +791,7 @@ mod tests {
 		let path = dir.path().join(FILE);
 		let path = path.to_string_lossy();
 		let (seg, len) = sealed(0);
-		let opened = |io: &std::sync::Arc<ProbeIo>| SegmentIndexStore::open_with_io(&path, io.clone());
+		let opened = |io: &std::sync::Arc<ProbeIo>| SegmentIndexStore::open_migrated_with_io(&path, io.clone());
 
 		let io = ProbeIo::new().expect("probe");
 		let store = opened(&io).await.expect("creates the store");
@@ -840,7 +826,7 @@ mod tests {
 	#[tokio::test]
 	#[allow(deprecated)]
 	async fn next_id_is_monotonic_per_aspect() {
-		let store = SegmentIndexStore::open_in_memory().await.expect("opens");
+		let store = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
 		let (seg, len) = sealed(0);
 		// An empty aspect starts at 0.
 		let first = store.next_id("a").await.expect("next_id");

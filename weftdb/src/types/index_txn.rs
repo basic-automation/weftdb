@@ -40,14 +40,17 @@
 //! [`IndexOp::ReplaceExpected`] and [`IndexOp::DeleteExpected`] are guarded, and a race
 //! they lost turns into a [`TxnErrorKind::Conflict`] on the retry. [`IndexOp::SeqBump`]
 //! only ever raises the allocator row, so running it again over another writer's raise
-//! keeps the larger value. The legacy [`IndexOp::Upsert`] and [`IndexOp::Delete`] are not
-//! retry-safe: their callers chose the id from an earlier read (a reconcile's or a squash's
-//! member list), and a retry would replace or delete the row the winner just committed,
-//! then report success to both callers. So a transaction holding either of them is
-//! retried only when its conflict came before any op ran (a `Busy` at `BEGIN`, which used
-//! no snapshot), and is otherwise reported at its first conflict, as every segment-index
-//! write was before this type existed. Seals (`InsertNew` and `SeqBump`, since S7) get the
-//! retries, as will the write-once swaps that replace the maintenance ops (S8, S9).
+//! keeps the larger value; [`IndexOp::RaiseFloor`] only ever raises the floors, and
+//! [`IndexOp::RecordMigration`] keeps a migration's first record. The legacy
+//! [`IndexOp::Upsert`] and [`IndexOp::Delete`] are not retry-safe: their callers chose the
+//! id from an earlier read (a reconcile's or a squash's member list), and a retry would
+//! replace or delete the row the winner just committed, then report success to both
+//! callers. Nor is [`IndexOp::MetaSet`], which replaces a `store_meta` value. So a
+//! transaction holding any of them is retried only when its conflict came before any op
+//! ran (a `Busy` at `BEGIN`, which used no snapshot), and is otherwise reported at its
+//! first conflict, as every segment-index write was before this type existed. Seals
+//! (`InsertNew` and `SeqBump`, since S7) get the retries, as will the write-once swaps
+//! that replace the maintenance ops (S8, S9).
 //!
 //! **The write scope** (robustness track ROB-2). Every transaction runs inside
 //! [`control_plane_write`](crate::exec::control_plane_write), so the process's panic hook
@@ -165,11 +168,14 @@ impl IndexOp {
 	/// writer committed in between (see the module documentation).
 	const fn is_guarded(&self) -> bool {
 		match self {
-			// The store_meta and store_migrations ops write the same value whoever runs them
-			// (a raise only ever raises), so running them again over another writer's commit
-			// changes nothing that writer did.
-			Self::InsertNew { .. } | Self::ReplaceExpected { .. } | Self::DeleteExpected { .. } | Self::SeqBump { .. } | Self::MetaSet { .. } | Self::RaiseFloor { .. } | Self::RecordMigration { .. } => true,
-			Self::Upsert { .. } | Self::Delete { .. } => false,
+			// A floor raise only ever raises, and a migration keeps its first record, so
+			// running them again over another writer's commit changes nothing that writer
+			// did.
+			Self::InsertNew { .. } | Self::ReplaceExpected { .. } | Self::DeleteExpected { .. } | Self::SeqBump { .. } | Self::RaiseFloor { .. } | Self::RecordMigration { .. } => true,
+			// `MetaSet` replaces the value, so a retry would overwrite what another writer
+			// committed in between. (Its one writer today is the open, under the root's
+			// LOCK, which nothing races.)
+			Self::Upsert { .. } | Self::Delete { .. } | Self::MetaSet { .. } => false,
 		}
 	}
 }
@@ -632,7 +638,7 @@ mod tests {
 	async fn only_writers_of_one_row_conflict_and_never_ambiguously() {
 		let dir = tempfile::TempDir::new().expect("tempdir");
 		let path = dir.path().join("segment_index.db").to_string_lossy().into_owned();
-		drop(SegmentIndexStore::open(&path).await.expect("creates the index"));
+		drop(SegmentIndexStore::open_migrated(&path).await.expect("creates the index"));
 		let db = std::sync::Arc::new(turso::Builder::new_local(&path).build().await.expect("opens the database"));
 		let upsert = |aspect: String, id: u64, version: usize| {
 			let mut desc = row(id, 0, None).desc;
@@ -694,7 +700,7 @@ mod tests {
 		for (what, op, kind, attempts, asked) in losers {
 			let dir = tempfile::TempDir::new().expect("tempdir");
 			let path = dir.path().join("segment_index.db").to_string_lossy().into_owned();
-			let index = SegmentIndexStore::open(&path).await.expect("opens");
+			let index = SegmentIndexStore::open_migrated(&path).await.expect("opens");
 			index.apply(&IndexTxn::new(vec![insert(base.clone())])).await.expect("commits the base row");
 
 			let winning = index.database().connect().expect("connects");
@@ -743,7 +749,7 @@ mod tests {
 		for (what, op, ids) in ops {
 			let dir = tempfile::TempDir::new().expect("tempdir");
 			let path = dir.path().join(FILE).to_string_lossy().into_owned();
-			drop(SegmentIndexStore::open(&path).await.expect("creates the index"));
+			drop(SegmentIndexStore::open_migrated(&path).await.expect("creates the index"));
 			let io = ProbeIo::new().expect("probe");
 			let db = turso::Builder::new_local(&path).with_io_impl(io.clone()).build().await.expect("opens the database");
 			// A commit for the checkpoint to backfill, so that it fsyncs the DB file.
@@ -794,7 +800,7 @@ mod tests {
 	/// seal's ops (`InsertNew` and `SeqBump`) counts as guarded.
 	#[tokio::test]
 	async fn seq_bump_creates_and_only_ever_raises_the_allocator_row() {
-		let index = SegmentIndexStore::open_in_memory().await.expect("opens");
+		let index = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
 		let bump = |aspect: &str, next_id: u64, epoch: u64| IndexTxn::new(vec![IndexOp::SeqBump { aspect: aspect.to_string(), next_id, epoch }]);
 		let empty = index.allocator_seed(ASPECT).await.expect("reads");
 		let mut seen = Vec::new();
@@ -822,7 +828,7 @@ mod tests {
 	/// ends with the transaction.
 	#[tokio::test]
 	async fn every_op_runs_inside_the_control_plane_write_scope() {
-		let index = SegmentIndexStore::open_in_memory().await.expect("opens");
+		let index = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
 		let txn = IndexTxn::new(vec![insert(row(0, 1, Some(1))), IndexOp::SeqBump { aspect: ASPECT.to_string(), next_id: 1, epoch: 0 }, IndexOp::MetaSet { key: "k".into(), value: "v".into() }]);
 		let seen = crate::types::exec::OBSERVED_SCOPES
 			.scope(std::cell::RefCell::new(Vec::new()), async {
@@ -837,10 +843,11 @@ mod tests {
 
 	/// The `store_meta` and `store_migrations` ops: `MetaSet` replaces, `RaiseFloor` only ever
 	/// raises both floors and compares them as numbers (as text "10" < "9"), and
-	/// `RecordMigration` keeps a migration's first record.
+	/// `RecordMigration` keeps a migration's first record. So the last two are retry-safe
+	/// and `MetaSet` is not.
 	#[tokio::test]
 	async fn meta_floor_and_migration_ops_record_what_they_say() {
-		let index = SegmentIndexStore::open_in_memory().await.expect("opens");
+		let index = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
 		let meta = |key: &'static str| {
 			let index = &index;
 			async move { index.meta(key).await.expect("reads") }
@@ -863,13 +870,15 @@ mod tests {
 		drop(rows);
 		drop(index);
 		assert_eq!(record, (Value::Text("0002_s6_s7".into()), Value::Integer(2), Value::Integer(5)), "the first record stays");
+		assert!(IndexOp::RaiseFloor { level: 2 }.is_guarded() && IndexOp::RecordMigration { id: "0002_s6_s7".into(), layout: 2, applied_ms: 0 }.is_guarded(), "a raise and a first record are retry-safe");
+		assert!(!IndexOp::MetaSet { key: "layout_version".into(), value: "2".into() }.is_guarded(), "a replacing set is not: a retry would overwrite a commit made in between");
 	}
 
 	/// Every column of every op round-trips: the write-once columns of a row written with
 	/// them, and the legacy shape (generation 0, nothing bound) of an upsert.
 	#[tokio::test]
 	async fn rows_round_trip_their_write_once_columns() {
-		let index = SegmentIndexStore::open_in_memory().await.expect("opens");
+		let index = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
 		let fresh = IndexRow { series_id: 42, ..row(0, 7, Some(u32::MAX)) };
 		let legacy = IndexRow::legacy(row(1, 0, None).desc);
 		let applied = index.apply(&IndexTxn::new(vec![insert(fresh.clone()), IndexOp::Upsert { aspect: ASPECT.to_string(), row: legacy.clone() }])).await.expect("commits");
@@ -887,7 +896,7 @@ mod tests {
 	/// the guarded row.
 	#[tokio::test]
 	async fn a_precondition_mismatch_rolls_back_every_op() {
-		let index = SegmentIndexStore::open_in_memory().await.expect("opens");
+		let index = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
 		let [c, d] = base_rows();
 		index.apply(&IndexTxn::new(vec![insert(c.clone()), insert(d.clone())])).await.expect("commits the base rows");
 		let a = row(0, 1, Some(1));
@@ -919,7 +928,7 @@ mod tests {
 		let Some(path) = std::env::var_os(TXN_CHILD_INDEX) else { return };
 		crate::types::durable::fault::suppress_core_dump();
 		let path = path.to_string_lossy().into_owned();
-		let index = SegmentIndexStore::open(&path).await.expect("opens");
+		let index = SegmentIndexStore::open_migrated(&path).await.expect("opens");
 		let txn = the_txn_under_test().with_points(TxnPoints { after_op: Some((1, FaultPoint::SRowsInserted)), ..TxnPoints::NONE });
 		// Returns only when the point is armed with `err` rather than `abort`.
 		let err = index.apply(&txn).await.expect_err("the transaction stops at the armed fault");
@@ -928,7 +937,7 @@ mod tests {
 		// The error is what a crash at this point looks like to the next open: drop the
 		// store and reopen it.
 		drop(index);
-		let index = SegmentIndexStore::open(&path).await.expect("reopens");
+		let index = SegmentIndexStore::open_migrated(&path).await.expect("reopens");
 		assert_eq!(rows_of(&index, ASPECT).await, base_rows().to_vec(), "the reopened index holds none of the transaction's ops");
 	}
 
@@ -950,7 +959,7 @@ mod tests {
 		for spec in ["S-rows-inserted:err", "S-rows-inserted:abort"] {
 			let dir = tempfile::TempDir::new().expect("tempdir");
 			let path = dir.path().join("segment_index.db");
-			let index = SegmentIndexStore::open(&path.to_string_lossy()).await.expect("opens");
+			let index = SegmentIndexStore::open_migrated(&path.to_string_lossy()).await.expect("opens");
 			index.apply(&IndexTxn::new(base_rows().into_iter().map(insert).collect())).await.expect("commits the base rows");
 			drop(index);
 
@@ -969,7 +978,7 @@ mod tests {
 				assert!(String::from_utf8_lossy(&out.stdout).contains("1 passed"), "{spec}: the child really ran the transaction: {out:?}");
 			}
 
-			let index = SegmentIndexStore::open(&path.to_string_lossy()).await.expect("reopens");
+			let index = SegmentIndexStore::open_migrated(&path.to_string_lossy()).await.expect("reopens");
 			assert_eq!(rows_of(&index, ASPECT).await, base_rows().to_vec(), "{spec}: none of the transaction's ops survived the crash");
 			let applied = index.apply(&the_txn_under_test()).await.expect("the same transaction commits without the fault");
 			let rows = rows_of(&index, ASPECT).await;

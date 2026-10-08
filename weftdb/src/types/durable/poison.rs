@@ -8,7 +8,9 @@
 //! write entry point of every store checks it alongside the store's own: writes are
 //! refused until the process restarts, reads keep working, and an embedder that exits on
 //! poison (`weft-server` under `WEFT_ON_AMBIGUOUS_COMMIT=exit`) hears about it through
-//! [`GlobalPoison::subscribe`].
+//! [`GlobalPoison::subscribe`]. No store opens meanwhile either, since an open writes
+//! (its marker, its migrations, `store_meta` and its scope): reopening a root in the same
+//! process would write through the same engine.
 //!
 //! It is set once and never cleared: only a restart, whose recovery settles the
 //! interrupted write, takes it away.

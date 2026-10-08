@@ -24,8 +24,10 @@ use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
 
 /// A durable, libSQL-backed registry of aspect [`AspectSchema`] declarations.
 ///
-/// Open with [`AspectCatalog::open`] (a file path) or
-/// [`AspectCatalog::open_in_memory`] (tests); declare an aspect's schema with
+/// A [`SegmentStore`](crate::SegmentStore) opens one over its root's `aspect_catalog.db`
+/// and hands it out with [`SegmentStore::catalog`](crate::SegmentStore::catalog); it
+/// cannot be opened on its own, since its schema is the store's migration registry's,
+/// which runs only behind the store's `STORE_FORMAT` gate. Declare an aspect's schema with
 /// [`declare`](AspectCatalog::declare); look it up with [`get`](AspectCatalog::get).
 pub struct AspectCatalog {
 	db: turso::Database,
@@ -37,28 +39,14 @@ impl AspectCatalog {
 	/// backup and restore verification require them.
 	pub const TABLES: &'static [&'static str] = &["aspect_schema"];
 
-	/// Open (creating if absent) the `aspect_catalog.db` at `path` on its own, outside a store:
-	/// enable MVCC, prove it took, and bring the schema up to this build's layout with the
-	/// migration registry's DDL (the `aspect_schema` table). A [`SegmentStore`](crate::SegmentStore)
-	/// opens it without DDL instead and runs the registry itself, after its marker gate.
+	/// Open (creating if absent) the `aspect_catalog.db` at `path` without running any
+	/// DDL: enable MVCC, prove it and sync its header, nothing else. What a
+	/// [`SegmentStore`](crate::SegmentStore) opens before it runs the migration registry.
 	///
 	/// # Errors
 	///
 	/// Fails if the database does not end up in MVCC journal mode or a new connection
-	/// does not sync FULL, and propagates any libSQL connection or DDL failure.
-	pub async fn open(path: &str) -> Result<Self> {
-		let store = Self::open_unmigrated(path).await?;
-		crate::types::migrations::apply_standalone(&crate::types::migrations::ControlPlane { aspect_catalog: Some(crate::types::migrations::Db { db: &store.db, name: path }), ..crate::types::migrations::ControlPlane::default() }).await?;
-		Ok(store)
-	}
-
-	/// Open the `aspect_catalog.db` at `path` without running any DDL: enable MVCC, prove it and
-	/// sync its header, nothing else. What a [`SegmentStore`](crate::SegmentStore) opens
-	/// before it runs the migrations.
-	///
-	/// # Errors
-	///
-	/// As [`open`](Self::open), less the DDL.
+	/// does not sync FULL, and propagates any libSQL connection failure.
 	pub(crate) async fn open_unmigrated(path: &str) -> Result<Self> {
 		let db = Builder::new_local(path).build().await?;
 		let conn = crate::types::durable::control_plane::connect(&db).await?;
@@ -73,13 +61,14 @@ impl AspectCatalog {
 		&self.db
 	}
 
-	/// Open an ephemeral in-memory catalog (`:memory:`) for tests.
-	///
-	/// # Errors
-	///
-	/// Propagates any libSQL connection or DDL failure.
-	pub async fn open_in_memory() -> Result<Self> {
-		Self::open(":memory:").await
+	/// The tests' database on its own (`:memory:` or a file):
+	/// [`open_unmigrated`](Self::open_unmigrated), then the registry's DDL for this
+	/// database (the `aspect_schema` table), recorded nowhere.
+	#[cfg(test)]
+	pub(crate) async fn open_migrated(path: &str) -> Result<Self> {
+		let store = Self::open_unmigrated(path).await?;
+		crate::types::migrations::apply_standalone(&crate::types::migrations::ControlPlane { aspect_catalog: Some(crate::types::migrations::Db { db: &store.db, name: path }), ..crate::types::migrations::ControlPlane::default() }).await?;
+		Ok(store)
 	}
 
 	/// Snapshot this `aspect_catalog.db` to `dest` (a fresh file) via Turso's
@@ -206,7 +195,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn declare_then_get_round_trips_a_schema() {
-		let catalog = AspectCatalog::open_in_memory().await.expect("opens");
+		let catalog = AspectCatalog::open_migrated(":memory:").await.expect("opens");
 		let schema = AspectSchema::new(PhysicalType::ScaledI64 { scale: 4 }, bd("0.00005"), TimeUnit::Micros);
 		catalog.declare("market", "BTCUSD", "price", &schema).await.expect("declares");
 		let got = catalog.get("market", "BTCUSD", "price").await.expect("reads");
@@ -217,7 +206,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn get_unknown_aspect_is_none() {
-		let catalog = AspectCatalog::open_in_memory().await.expect("opens");
+		let catalog = AspectCatalog::open_migrated(":memory:").await.expect("opens");
 		let got = catalog.get("market", "BTCUSD", "missing").await.expect("reads");
 		drop(catalog);
 		assert_eq!(got, None);
@@ -225,7 +214,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn redeclare_replaces_the_schema() {
-		let catalog = AspectCatalog::open_in_memory().await.expect("opens");
+		let catalog = AspectCatalog::open_migrated(":memory:").await.expect("opens");
 		catalog.declare("d", "s", "a", &AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds)).await.expect("declares");
 		catalog.declare("d", "s", "a", &AspectSchema::new(PhysicalType::F32, bd("0.01"), TimeUnit::Millis)).await.expect("re-declares");
 		let got = catalog.get("d", "s", "a").await.expect("reads");
@@ -235,7 +224,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn list_all_enumerates_every_declaration_ordered() {
-		let catalog = AspectCatalog::open_in_memory().await.expect("opens");
+		let catalog = AspectCatalog::open_migrated(":memory:").await.expect("opens");
 		let f64 = AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds);
 		// Declared out of order across two databases and subjects.
 		catalog.declare("market", "ETHUSD", "price", &f64).await.expect("declares");
@@ -249,7 +238,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn list_all_is_empty_for_a_fresh_catalog() {
-		let catalog = AspectCatalog::open_in_memory().await.expect("opens");
+		let catalog = AspectCatalog::open_migrated(":memory:").await.expect("opens");
 		let all = catalog.list_all().await.expect("lists");
 		drop(catalog);
 		assert!(all.is_empty());
@@ -257,7 +246,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn list_aspects_scopes_to_subject_in_order() {
-		let catalog = AspectCatalog::open_in_memory().await.expect("opens");
+		let catalog = AspectCatalog::open_migrated(":memory:").await.expect("opens");
 		let f64 = AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds);
 		catalog.declare("d", "s", "temp", &f64).await.expect("declares");
 		catalog.declare("d", "s", "humidity", &f64).await.expect("declares");

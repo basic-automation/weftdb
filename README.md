@@ -323,15 +323,18 @@ holds the root's `LOCK` file while it runs, and a second server pointed at the s
 root exits at startup with an error naming the first one's pid and host.
 
 The root's `STORE_FORMAT` file records the store's layout and the oldest layouts a
-WeftDB must know to read and to write it (plain JSON; see `weftdb::StoreFormat`). The
-server reads it before it opens any database, and refuses a store a newer WeftDB wrote
-(`IncompatibleLayout`) without changing anything but `LOCK` and `LOCK.holder`. A store
-written before the marker existed is layout 1 and is upgraded in place on first open,
-through the registered migrations (`store_migrations` in `segment_index.db` lists those
-applied); its frames are not rewritten. A layout-1 store whose index records a frame
-outside `segments/` (possible only through the aspect-name traversal of earlier builds)
-is refused with `UnsafeLegacyPath`, naming the aspects, and nothing is moved: drop or
-re-seal those aspects with the build that wrote them first.
+WeftDB must know to read and to write it (plain JSON; see `weftdb::StoreFormat`), and
+`segment_index.db`'s `store_meta` table keeps a copy. The server reads the marker before
+it opens any database (a root without one, the copy, before it writes anything), and
+refuses a store a newer WeftDB wrote (`IncompatibleLayout`) without changing anything
+but `LOCK` and `LOCK.holder`. A store written before the marker existed is layout 1 and
+is upgraded in place on first open, through the registered migrations
+(`store_migrations` in `segment_index.db` lists those applied); its frames are not
+rewritten. A layout-1 store whose index records a frame outside `segments/` (possible
+only through the aspect-name traversal of earlier builds) is refused with
+`UnsafeLegacyPath`, naming the aspects, before any migration applies or a marker is
+written, and nothing is moved: drop or re-seal those aspects with the build that wrote
+them first.
 
 While bound to a loopback address, the server only answers requests addressed to a
 loopback host: `Host` must be `localhost`, an address in `127.0.0.0/8` or `[::1]`

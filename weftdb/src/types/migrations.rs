@@ -2,19 +2,22 @@
 //!
 //! Every schema change of the four control-plane databases is a registered
 //! [`Migration`], identified by an ordinal id (`0001_baseline`, `0002_s6_s7`, …) and
-//! applied in that order. No database's open function runs DDL: a
-//! [`SegmentStore`](crate::SegmentStore) opens its databases (pragmas and probes only),
-//! then runs the migrations its `store_migrations` table does not list, each recording
-//! itself there once it has applied. So a development store created half way through a
-//! release still receives every later migration, and running the registry again is a
-//! no-op.
+//! applied in that order. No database's open function runs DDL, and none of the four
+//! databases can be opened on its own: a [`SegmentStore`](crate::SegmentStore) opens
+//! them (pragmas and probes only) behind its `STORE_FORMAT` gate (for a root without a
+//! marker, `segment_index.db` first, whose `store_meta` copy is then the gate), then runs
+//! the migrations its `store_migrations` table does not list, each recording itself
+//! there once it has applied. So a development store created half way through a release
+//! still receives every later migration, and running the registry again is a no-op.
 //!
-//! Each migration is idempotent (a crash between its DDL and its record re-runs it) and
-//! runs its DDL outside `BEGIN CONCURRENT`, where Turso refuses DDL (ROADMAP.md,
-//! "DDL inside BEGIN CONCURRENT"). A column it adds is added only when `PRAGMA
-//! table_info` does not list it, and a racing duplicate-column error is matched exactly
-//! ([`is_duplicate_column`]); any other error fails the open instead of leaving a store
-//! half migrated behind a successful one.
+//! Before it applies anything, the open runs the prechecks of every pending migration
+//! ([`precheck`]); a refusal leaves every migration unapplied. Each migration is
+//! idempotent (a crash between its DDL and its record re-runs it) and runs its DDL
+//! outside `BEGIN CONCURRENT`, where Turso refuses DDL (ROADMAP.md, "DDL inside BEGIN
+//! CONCURRENT"). A column it adds is added only when `PRAGMA table_info` does not list
+//! it, and a racing duplicate-column error is matched exactly ([`is_duplicate_column`]);
+//! any other error fails the open instead of leaving a store half migrated behind a
+//! successful one.
 //!
 //! A migration also says what it needs from the store's floors: once it has applied, a
 //! WeftDB must know `min_read_after` to read the store and `min_write_after` to write it
@@ -30,8 +33,9 @@
 //!   registry itself needs.
 //! - **`0002_s6_s7`** (layout 2): the write-once columns and tables of the
 //!   crash-consistency design (S6, S7), `segment_index.series_id` (tags A7) and
-//!   `aspect_seq.next_series_id`. It refuses a store whose index records a frame outside
-//!   `segments/` ([`StoreError::UnsafeLegacyPath`]) before it changes anything.
+//!   `aspect_seq.next_series_id`. Its precheck refuses a store whose index records a
+//!   frame outside `segments/` ([`StoreError::UnsafeLegacyPath`]) before any migration
+//!   applies and before the open raises the marker's floors.
 
 use std::collections::BTreeSet;
 
@@ -151,21 +155,46 @@ pub(crate) async fn applied(index: Db<'_>) -> Result<BTreeSet<String>> {
 	Ok(ids)
 }
 
-/// Run `migrations` in order against `cp`, which must hold all four databases: each one's
-/// precheck, then its DDL, then its record in `store_migrations`. Returns the ids
-/// applied.
+/// Run `migrations` against `cp`: every one's precheck ([`precheck`]), then each one's
+/// DDL and record in order ([`apply`]). Returns the ids applied.
 ///
 /// # Errors
 ///
-/// A precheck's refusal (nothing of that migration ran), or a failed DDL statement or
-/// record (the migration re-runs at the next open).
+/// As [`precheck`] (then nothing applied) and [`apply`].
+#[cfg(test)]
 pub(crate) async fn run(cp: &ControlPlane<'_>, migrations: &[&Migration]) -> Result<Vec<&'static str>> {
-	let index = cp.index.context("running the store migrations needs segment_index.db")?;
-	let mut ran = Vec::with_capacity(migrations.len());
+	precheck(cp, migrations).await?;
+	apply(cp, migrations).await
+}
+
+/// Run the precheck of each of `migrations`, in order, against `cp`: reads only, so a
+/// refusal leaves the store as it was. The open runs them all before it applies the first
+/// migration and, for an existing store, before it raises the marker's floors, so a store
+/// one of them refuses is not left with some migrations applied and others not.
+///
+/// # Errors
+///
+/// The first refusal, or a failed read.
+pub(crate) async fn precheck(cp: &ControlPlane<'_>, migrations: &[&Migration]) -> Result<()> {
 	for migration in migrations {
 		if let Some(precheck) = migration.precheck {
 			precheck(cp).await.with_context(|| format!("checking the store before migration {}", migration.id))?;
 		}
+	}
+	Ok(())
+}
+
+/// Apply `migrations` in order against `cp`, which must hold all four databases: each
+/// one's DDL, then its record in `store_migrations`. Their prechecks have run
+/// ([`precheck`]). Returns the ids applied.
+///
+/// # Errors
+///
+/// A failed DDL statement or record (the migration re-runs at the next open).
+pub(crate) async fn apply(cp: &ControlPlane<'_>, migrations: &[&Migration]) -> Result<Vec<&'static str>> {
+	let index = cp.index.context("running the store migrations needs segment_index.db")?;
+	let mut ran = Vec::with_capacity(migrations.len());
+	for migration in migrations {
 		(migration.apply)(cp).await.with_context(|| format!("applying migration {}", migration.id))?;
 		let applied_ms = i64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis()).unwrap_or(i64::MAX);
 		IndexTxn::new(vec![IndexOp::RecordMigration { id: migration.id.to_string(), layout: migration.layout, applied_ms }]).run(index.db).await.with_context(|| format!("{}: recording migration {}", index.name, migration.id))?;
@@ -193,12 +222,15 @@ pub(crate) async fn rederive(cp: &ControlPlane<'_>, registry: &[Migration], appl
 }
 
 /// Apply every registered migration's DDL to the databases `cp` holds, recording
-/// nothing: what a control-plane database opened on its own (outside a store, so with
-/// no marker and no floors) needs to be usable. Idempotent.
+/// nothing: what the unit tests of one control-plane database, opened on its own (so
+/// with no marker and no floors), need to use it. Only tests have it: outside one, the
+/// databases open only inside a store, which runs the registry behind its gate.
+/// Idempotent.
 ///
 /// # Errors
 ///
 /// A failed DDL statement.
+#[cfg(test)]
 pub(crate) async fn apply_standalone(cp: &ControlPlane<'_>) -> Result<()> {
 	for migration in REGISTRY {
 		(migration.apply)(cp).await.with_context(|| format!("applying migration {}", migration.id))?;
@@ -355,6 +387,11 @@ fn refuse_unsafe_legacy_paths<'a>(cp: &'a ControlPlane<'a>) -> BoxFuture<'a, Res
 	Box::pin(async move {
 		let Some(index) = cp.index else { return Ok(()) };
 		let conn = connect(index.db).await.with_context(|| format!("{}: connecting", index.name))?;
+		// The prechecks run before any migration applies, so a store whose index never got
+		// its table (a new store, or a root holding only other databases) has none.
+		if !table_exists(&conn, "segment_index").await.with_context(|| format!("{}: looking for segment_index", index.name))? {
+			return Ok(());
+		}
 		// Before layout 2 every row is a legacy (generation 0) row; once `gen` exists,
 		// only those are named after their aspect and id.
 		let legacy_only = column_names(&conn, "segment_index").await.with_context(|| format!("{}: listing the segment_index columns", index.name))?.iter().any(|name| name == "gen");

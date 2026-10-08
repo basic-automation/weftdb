@@ -71,14 +71,18 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   A new store writes its marker before any database file exists. Every control-plane
   table is now created by a registered, idempotent migration (`0001_baseline`: the
   pre-1.0 schema; `0002_s6_s7`: layout 2), recorded in a new `store_migrations` table
-  of `segment_index.db`; the open raises the marker's floors before it runs a pending
-  migration, so a crash half way never leaves floors an older WeftDB would not respect,
-  and mirrors the marker into `store_meta`. A store without a marker but with databases
-  is layout 1 and is migrated in place; one whose layout is newer than this build's but
-  whose write floor it meets opens without migrating (recovery is told to only report).
-  No database's own open runs DDL any more: `SegmentIndexStore::open` and the other
-  stores' `open`, used on their own, apply the registry's DDL for their database
-  without recording it.
+  of `segment_index.db`; the open runs every pending migration's precheck first, raises
+  the marker's floors before it applies one, so a crash half way never leaves floors an
+  older WeftDB would not respect, and mirrors the marker into `store_meta`. A root
+  without a marker but with databases is judged by `store_meta` before anything is
+  written to it: a newer write floor recorded there is `IncompatibleLayout`, a lost
+  marker is rebuilt from that copy (keeping the store's layout, floors and identity),
+  and a store written before markers existed is layout 1 and is migrated in place. A
+  store whose layout is newer than this build's but whose write floor it meets opens
+  without migrating (recovery is told to only report); a root holding only such a
+  marker, with no database, is refused with `StoreError::NewerStoreWithoutDatabases`
+  and nothing created. No open function runs DDL any more, and the control-plane
+  databases are opened only by a store (see Changed).
 - `SegmentStore::open_report()` (`weftdb::OpenReport`: `created_new`,
   `migrated_from`, the migrations `applied`, `recovery_report_only`),
   `SegmentStore::store_uuid()` and `SegmentStore::store_format()`. `weft-server`
@@ -92,6 +96,7 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   task-local control-plane write scope, so a panic hook can tell a panic in the middle
   of a control-plane write from one in a read, and the process-wide poison it would set
   refuses every write of every store, as a store's own poison does, while reads go on.
+  It refuses every store open too (`weftdb::Poisoned`), since an open writes.
 - `LOCK.holder` records the holder's host name and boot id beside its pid, and a
   second opener's error names the host (`… in use by pid 1 on host db-2 (session …)`).
   The short wait for a lock that a child being spawned still shares now applies only to
@@ -147,8 +152,14 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   written on Windows reads on Unix and the other way round, and a path that would lead
   out of `segments/` (a `..`, no `segments` component) is refused instead of read
   where it points. Upgrading a layout-1 store whose index records such a path fails
-  with `StoreError::UnsafeLegacyPath`, naming the aspects; nothing is moved or
-  quarantined.
+  with `StoreError::UnsafeLegacyPath`, naming the aspects, before any migration applies
+  or a marker is written; nothing is moved or quarantined.
+- **Breaking for Rust users: `SegmentIndexStore`, `AspectMetadataStore`, `AspectCatalog`
+  and `CatalogStore` can no longer be opened on their own.** Their `open` and
+  `open_in_memory` are gone: they created this build's schema in any file, without the
+  store's `STORE_FORMAT` gate, which would let a WeftDB write tables into a store a newer
+  one wrote. A `SegmentStore` opens all four (`index()`, `metadata()`, `catalog()`,
+  `registry()`); nothing in the workspace opened them otherwise.
 - A store root's parent that cannot be fsynced because its filesystem refuses (`EROFS`,
   `EINVAL`, `ENOTSUP`: read-only mounts, FUSE and Docker Desktop bind mounts) is now
   skipped with a warning when the root predates the open, as an unreadable parent
