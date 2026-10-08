@@ -17,16 +17,20 @@
 //!   that carries its own authority (absolute form, HTTP/2) is held to the same rule. A
 //!   request with no host at all, or with more than one `Host` header, is refused too;
 //!   HTTP/1.1 requires exactly one, and browsers always send it.
-//! - **a state-changing request from another web origin**, with `403 Forbidden`: any
-//!   method but `GET`, `HEAD`, `OPTIONS` and `TRACE` that carries an `Origin` header
+//! - **a state-changing request from a non-loopback web origin**, with `403 Forbidden`:
+//!   any method but `GET`, `HEAD`, `OPTIONS` and `TRACE` that carries an `Origin` header
 //!   whose host is not a loopback host, including the opaque `null` origin. Browsers
 //!   send `Origin` with every cross-origin `POST`; `curl` and other non-browser clients
-//!   send none and are not affected.
+//!   send none and are not affected. Any loopback origin passes, on any port, so a page
+//!   served by another local web server is still trusted: comparing the port with the
+//!   bound one would break reverse proxies, and authentication is what will close it.
 //!
 //! `/health` and `/ready` get no exemption. A probe on the same host reaches a
-//! loopback-bound server as `localhost` or `127.0.0.1` and passes; a probe from another
-//! network namespace (a container health check from outside, a kubelet) can only reach a
-//! server bound to a non-loopback address, where the guard is off.
+//! loopback-bound server as `localhost` or `127.0.0.1` and passes if it sends that
+//! `Host`, as every HTTP/1.1 client does; an HTTP/1.0 probe that sends no `Host` gets
+//! `421` and must be configured to send one (or the guard turned off). A probe from
+//! another network namespace (a container health check from outside, a kubelet) can only
+//! reach a server bound to a non-loopback address, where the guard is off.
 //!
 //! The guard is off for a non-loopback bind, which is unchanged (there is no
 //! authentication yet, so such a server must not be reachable from an untrusted network;

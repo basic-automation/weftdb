@@ -31,10 +31,12 @@ directly to an untrusted network; put it behind something that does terminate TL
 authenticate callers.
 
 Bound to a loopback address (the default), `weft-server` only answers requests
-addressed to a loopback host and refuses state-changing requests from other web
-origins, so a web page in a browser on the same machine cannot drive it. That is a
-guard for the default deployment, not authentication: any local process can still call
-the API. A local reverse proxy that forwards a different `Host`, or a browser UI's
+addressed to a loopback host and refuses state-changing requests from non-loopback
+web origins, so a web page from another site, open in a browser on the same machine,
+cannot drive it. That is a guard for the default deployment, not authentication: any
+local process can still call the API, and a page served by another local web server
+(any loopback origin, on any port) is still trusted until authentication lands. A local
+reverse proxy that forwards a different `Host`, or a browser UI's
 non-loopback `Origin`, needs `WEFT_ALLOW_ANY_HOST=1`, which turns the guard off.
 
 What *is* in scope: memory-safety problems, panics or crashes reachable from untrusted

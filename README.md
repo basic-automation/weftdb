@@ -322,9 +322,13 @@ Bind address defaults to `127.0.0.1:8080` (`WEFT_SERVER_ADDR` overrides). Settin
 While bound to a loopback address, the server only answers requests addressed to a
 loopback host: `Host` must be `localhost`, an address in `127.0.0.0/8` or `[::1]`
 (anything else is a `421`), and a state-changing request whose `Origin` is not a
-loopback origin is a `403`. That keeps web pages open in a local browser from driving
-the server. Clients that send no `Origin`, like `curl`, are unaffected, and `/health` and
-`/ready` follow the same rule (a probe on the same host passes). Behind a local reverse
+loopback origin is a `403`. That keeps web pages from non-loopback origins, open in a
+local browser, from driving the server; a page served by another local web server (any
+loopback origin, on any port) is still trusted until authentication lands. Clients that
+send no `Origin`, like `curl`, are unaffected. `/health` and `/ready` follow the same
+rule, so a health probe must send a loopback `Host` such as `localhost` or `127.0.0.1`,
+as every HTTP/1.1 client does; an HTTP/1.0 probe that sends no `Host` gets a `421`, so
+configure it to send one or set `WEFT_ALLOW_ANY_HOST=1`. Behind a local reverse
 proxy that forwards a different `Host`, set `WEFT_ALLOW_ANY_HOST=1`; a proxy that keeps
 `Host: 127.0.0.1` but forwards the `Origin` of a browser UI served from a non-loopback
 origin needs it too, or that UI's state-changing requests get a `403`. A non-loopback

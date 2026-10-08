@@ -233,7 +233,11 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `[::ffff:127.0.0.1]`), the server now answers only requests addressed to `localhost`,
   `127.0.0.0/8` or `[::1]` (`421 Misdirected Request` otherwise, `/health` and `/ready`
   included) and refuses a state-changing request whose `Origin` is not a loopback origin
-  (`403`). Clients that send no `Origin`, such as `curl`, are unaffected. Behind a local
+  (`403`). Clients that send no `Origin`, such as `curl`, are unaffected. Pages served by
+  another local web server (any loopback origin, on any port) are still trusted until
+  authentication lands. Health probes must send a loopback `Host` such as `localhost` or
+  `127.0.0.1`, as every HTTP/1.1 client does; an HTTP/1.0 probe that sends no `Host` now
+  gets `421`, so configure it to send one or set `WEFT_ALLOW_ANY_HOST=1`. Behind a local
   reverse proxy that forwards a different `Host`, or the non-loopback `Origin` of a
   browser UI it fronts, set `WEFT_ALLOW_ANY_HOST=1`. Non-loopback binds are unchanged
   and remain unauthenticated.
