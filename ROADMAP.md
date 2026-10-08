@@ -1094,7 +1094,11 @@ of them turn Turso into the measurement backend.
   + WAL truncate-checkpoint). Record this as the attribution rather than re-litigating it, and stop
   reading the ~1–2.5 s tick drift as daemon scheduling jitter. *(src:
   https://docs.turso.tech/sql-reference/statements/vacuum)*
-- [ ] **Backup cost residue (b) — two cheap A/B experiments on the shipped bench, in this order.**
+- [ ] **Backup cost residue (b) — (i) MEASURED 2026-10-08: `synchronous=OFF` is NOT a material win.**
+  `backup_cost` on the HDD volume (`WEFT_BENCH_BACKUP_DIR` under /mnt/deepmem, load average ~12–21):
+  snapshot_only/1 4.77 → 4.25 s, /16 4.88 → 4.61 s, with overlapping confidence intervals. The
+  pragma was set on the store connection in a throwaway patch, never committed. (ii) checkpoint-first
+  is still untried. Original item:
   (i) Upstream SQLite makes the output fsync **conditional** on the *source* database's
   `PRAGMA synchronous` being NORMAL or FULL, and Turso implements that pragma partially (OFF and FULL
   only) — so `synchronous=OFF` on the snapshot connection may collapse the seconds-scale cost. Note
@@ -1271,7 +1275,13 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 
 ## Immediate next actions
 
-- [ ] **START HERE (filed 2026-09-23 for the next run).** The 2026-09-23 run closed both cheap backup
+- [ ] **START HERE (filed 2026-10-08 for the next run).** The 2026-10-08 run (PR `routine/dsp-2026-10-08`)
+  rebuilt the codec read path and cut the exact-decimal reduction tax. Recommended order:
+  (1) owner decisions waiting: `VAL_CODEC_DFOR` (BTC 33.7 → 13.6 bits/value), the timestamp
+  common-multiple codec, ALP adoption, and retiring `VAL_CODEC_TRANSPOSED`; (2) the remaining ~6×
+  decimal tax (profile per-bucket materialization); (3) the backup checkpoint-first A/B;
+  (4) bulk ingest through the `.weftseg` seal, once the durability arc has landed.
+- [ ] **(2026-09-23 list; item 3 shipped 2026-10-08.)** The 2026-09-23 run closed both cheap backup
   follow-ons (sidecar sweep shipped; snapshot cost **measured**, and the diagnosis on record was
   wrong — it is I/O, not vacuum CPU) and landed the depth item (**transposed layout realized on
   disk**, with an honest end-to-end *no-win* result). Recommended order:
