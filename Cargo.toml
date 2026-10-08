@@ -87,6 +87,15 @@ lto = true
 codegen-units = 1
 debug = true
 
+# The binaries in a release archive (.github/workflows/release.yml, RELEASING.md): the
+# release profile without its debug info, which is kept there for profiling and makes
+# weft-server about 400 MB. Symbols are stripped too, so a panic's backtrace shows no
+# function names; reproduce a crash with a `--release` build to get them.
+[profile.dist]
+inherits = "release"
+debug = false
+strip = "symbols"
+
 [profile.bench]
 opt-level = 3
 lto = true

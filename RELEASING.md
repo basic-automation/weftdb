@@ -66,13 +66,19 @@ natively on five targets — no cross toolchains — with the compiler from
 | `x86_64-pc-windows-msvc` | `windows-2025` |
 
 The images are pinned rather than `*-latest`, so a release is reproducible and the glibc
-floor the README states (2.39, from Ubuntu 24.04) cannot rise silently when GitHub moves
-`ubuntu-latest`. Moving an image is a deliberate change: update this table and the README
-with it. Intel macOS used to build on `macos-13`, which GitHub has retired;
-`macos-15-intel` is its hosted Intel replacement.
+floor the README states (from Ubuntu 24.04: 2.39 for `weft-tui`, 2.34 for `weft-server`
+and `weft-bench`) cannot rise silently when GitHub moves `ubuntu-latest`. Moving an
+image is a deliberate change: update this table and the README with it. Intel macOS
+used to build on `macos-13`, which GitHub has retired; `macos-15-intel` is its hosted
+Intel replacement.
 
-Each binary is built by its own `cargo build --locked`, so no package's features leak
-into another's binary, and nothing is restored from a build cache. Each leg runs
+Each binary is built by its own `cargo build --locked --profile dist`, so no package's
+features leak into another's binary, and nothing is restored from a build cache. The
+`dist` profile, in the root `Cargo.toml`, is the `release` profile (fat LTO, one codegen
+unit) without debug info and with symbols stripped. `release` keeps full debug info for
+profiling, which made the Linux `weft-server` about 400 MB. A stripped binary's panic
+backtrace names no functions: to investigate a crash, reproduce it on a
+`cargo build --release` of the same commit. Each leg lists the binaries' sizes, runs
 `weft-bench --help` from what it built, then packs the target as a `.tar.gz` (a `.zip`
 on Windows) with a `.sha256` next to it, and a last job checks every archive and writes
 one `SHA256SUMS` over all five.
@@ -109,8 +115,8 @@ gh run download <run-id> --dir dist --name SHA256SUMS
 (cd dist && mv weftdb-*/* . && sha256sum -c SHA256SUMS)
 ```
 
-`fast=true` builds with the dev profile. Use it to test staging changes quickly, never to
-judge a release build.
+A dry run builds the same `dist` profile as a release. `fast=true` builds with the dev
+profile instead. Use it to test staging changes quickly, never to judge a release build.
 
 The workflow file and `scripts/release/` come from the branch you dispatch from; the code
 built comes from `ref`. A dry run of an unmerged branch's own head fails the ancestry
@@ -151,9 +157,13 @@ built from.
 
 The release is created as a **draft**, with the five archives, their `.sha256` files and
 `SHA256SUMS`. A `-rc.N` tag makes a prerelease, which never becomes the Latest release.
-Leave it as a draft until the crates are published.
+Leave it as a draft until the crates are published (v0.1.0 publishes none: go straight
+to section 5).
 
 ## 4. Publish to crates.io
+
+v0.1.0 is a binaries-only baseline release and publishes no crates: skip this section
+for it and go on to section 5.
 
 Order matters: crates.io resolves path dependencies by version, so nothing can be
 published before its dependencies are on the registry. `scripts/publish.sh` encodes

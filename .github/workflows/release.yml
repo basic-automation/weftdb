@@ -3,6 +3,9 @@ name: Release
 # Builds weft-server, weft-tui and weft-bench for five targets and attaches them, with a
 # SHA256SUMS file, to a draft GitHub release. See RELEASING.md.
 #
+# Releases and dry runs build with Cargo.toml's `dist` profile: the release profile
+# without debug info, and stripped. A dry run with fast=true builds the dev profile.
+#
 # - Pushing a tag vX.Y.Z or vX.Y.Z-rc.N releases that tag.
 # - Dispatching (Actions tab, or `gh workflow run release.yml`) is a dry run unless
 #   dry_run is false: it verifies and builds `ref`, uploads the archives and SHA256SUMS
@@ -81,10 +84,11 @@ jobs:
         run: |
           set -euo pipefail
           # A tag push releases. A dispatch releases only when dry_run is explicitly false.
+          # Both build the dist profile; only a dry run can ask for dev (fast=true).
           if [[ $EVENT == push || ($EVENT == workflow_dispatch && $DRY_RUN == false) ]]; then
-            mode=tag release=true profile=release
+            mode=tag release=true profile=dist
           else
-            mode=ref release=false profile=release
+            mode=ref release=false profile=dist
             [[ $FAST == true ]] && profile=dev
           fi
           {
@@ -267,10 +271,14 @@ jobs:
             cargo build --locked --profile "$PROFILE" --target "$TARGET" -p "$package"
             echo "::endgroup::"
           done
-          # Cargo writes the dev profile to target/<triple>/debug.
+          # Cargo writes the dev profile to target/<triple>/debug, and any other profile
+          # (dist here) to a directory of its own name.
           profile_dir=$PROFILE
           if [[ $PROFILE == dev ]]; then profile_dir=debug; fi
-          echo "BIN_DIR=src/target/$TARGET/$profile_dir" >>"$GITHUB_ENV"
+          # This step runs in src/; the steps that read BIN_DIR run from the workspace root.
+          out=target/$TARGET/$profile_dir
+          ls -l "$out"/weft-server* "$out"/weft-tui* "$out"/weft-bench*
+          echo "BIN_DIR=src/$out" >>"$GITHUB_ENV"
 
       # Each runner builds its own target, so the binary can run here. weft-bench is the
       # one whose --help exits without starting anything.
