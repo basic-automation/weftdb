@@ -33,6 +33,19 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   that machine; `--no-gpu-calibrate` turns it off. The calibration, the GPU and
   `Backend::Auto`'s thresholds are printed and recorded in the report's
   `metadata.engine` (bench schema v16) and its HTML view.
+- **Third-party attribution.** A root `NOTICE`, and a `THIRD-PARTY-NOTICES` file shipped in
+  the `weft-physical-type` and `weft-reduce` packages, credit the two Apache-2.0 projects
+  whose code is adapted here: the Chimp/Chimp128 codecs (from the authors' reference
+  implementation) and the DDSketch quantile sketch (from Datadog's sketches-java), with the
+  upstream NOTICE text and the license. The Chimp128 docs no longer credit DuckDB as the
+  source.
+- **Contribution terms.** Every pull request takes one of two routes, the contributor's
+  choice: a DCO sign-off (`git commit -s`) on every commit, or the WeftDB Individual
+  Contributor License Agreement ([`CLA.md`](CLA.md), version 1, adapted from the Apache
+  Software Foundation's ICLA with Justin Icenhour as the recipient), signed once by a pull
+  request comment. The `contribution-terms` check passes a pull request when either holds.
+  Contributions are licensed `MIT OR Apache-2.0`. See
+  [`CONTRIBUTING.md`](CONTRIBUTING.md#contribution-terms).
 
 ### Changed
 
@@ -91,17 +104,18 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   engine checks the range and steps down when there are too few points (or, under
   `Interpolator::exact(true)`, returns `InsufficientPoints`).
 - **Stored spline methods are validated when they are loaded.** A dictionary created
-  with `AspectStructure::new_dictionary` persists its step interpolation as the
-  `Spline`'s text (`steps_interpolation` in the `dictionary_constraints` table of
-  `<aspect>/dictionaries/<dictionary>.db`); a dictionary that a pipeline registers
-  through `weft_orchestration::load_dictionary` stores no constraints and is not
-  affected. splimes 1.0's `Spline::from_str` validates what it parses, so a stored
+  with `AspectStructure::new_dictionary`, or registered by a pipeline through
+  `weft_orchestration::load_dictionary` (which stored no constraints before this
+  release; see Fixed), persists its step interpolation as the `Spline`'s text
+  (`steps_interpolation` in the `dictionary_constraints` table of
+  `<aspect>/dictionaries/<dictionary>.db`). splimes 1.0's `Spline::from_str` validates what it parses, so a stored
   `Polynomial` with degree 0, a degree above 8, or a negative or non-finite bounds
   factor, which 0.1 accepted, no longer loads: `get_dictionary_metadata` returns
   `Database error: Invalid interpolation format: invalid polynomial degree 9: must be
   between 1 and 8` (or `… invalid bounds factor -1: must be finite and not negative`),
-  and `load_dictionary` logs that error as a warning ("Failed to check dictionary
-  metadata, attempting to create"). Until this release `get_dictionary_metadata` could
+  and `load_dictionary` logs that error as a warning ("Failed to read dictionary
+  metadata; leaving the stored registration as it is") and carries on with the
+  pipeline's own constraints, without touching what is stored. Until this release `get_dictionary_metadata` could
   not read any stored dictionary (see Fixed), so this is the first release that reads,
   and so checks, a stored method at all. To fix it, stop WeftDB and rewrite the stored
   value with Turso's shell (`tursodb`, not `sqlite3`: the file is in Turso's MVCC
@@ -112,7 +126,8 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   from 1 to 8 and a finite, non-negative bounds factor, or `None`. `new_dictionary`
   now checks the method with `Spline::validate()` and refuses one that would not load,
   e.g. `Invalid step interpolation for dictionary 'd': invalid polynomial degree 9: must
-  be between 1 and 8`; it stored any method before.
+  be between 1 and 8`; it stored any method before. `set_dictionary_metadata`, and so
+  `load_dictionary` when it registers a dictionary, refuses one the same way.
 - `Resolution` names parse case-insensitively (`Hours`, `HOURS`), for example in
   `WEFT_SEGMENT_PARTIAL_BASE`, which ignored anything but lowercase before.
 - **`weft-server` provenance comes from splimes.** The `kind` of each interpolated
@@ -150,6 +165,36 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 - All dependencies updated to their latest major versions, including wgpu 30,
   Arrow/Parquet 60 and OpenTelemetry 0.33.
 - Builds on stable Rust (MSRV 1.95); nightly is no longer required.
+- **Advisory codecs moved behind the `experimental-codecs` feature** (`weft-physical-type`).
+  ⚠️ Breaking for code that calls them: the `floatcodec` module (Gorilla-XOR, Chimp,
+  Chimp128, Elf and `best_f64_*`), `ColumnEncoding::{gorilla_f64_bytes, best_f64_bytes,
+  best_f64_codec}` and the FIRE forecaster (`fire_*`) now need
+  `features = ["experimental-codecs"]`. None of them was ever written to disk, so stored
+  segments are unaffected. The feature is off by default, outside the semver promise, and
+  pending patent review.
+- **The opt-in transposed value codec is now the `bitsliced-codec` feature**
+  (`weft-physical-type`, forwarded by `weftdb` and `weft-server`), pending patent review.
+  ⚠️ A store that enabled it with `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` must be built with
+  `bitsliced-codec` to read those segments: without the feature, reading one fails with the
+  new `WeftSegError::CodecNotEnabled` (which names the feature) instead of decoding, and the
+  variable is ignored with a warning. For library callers, without the feature
+  `FrameOptions::transposed_max_overhead` is accepted but silently ignored
+  (`write_segment_with` and `write_paged_segment_with` emit the size-selected codec), and
+  `WeftSegError` gains the `CodecNotEnabled` variant, which breaks exhaustive matches on it.
+  The `transpose_bitpack_*` primitives, `TRANSPOSE_TILE`,
+  `ColumnEncoding::{transposed_value_bytes, transposed_overhead, best_value_codec_transposed}`
+  and `weftseg::write_value_column_transposed` need the feature too. The default
+  configuration never wrote this codec, so a store that never set the variable (or
+  `FrameOptions::transposed_max_overhead`) is unaffected. The docs now call it a bit-sliced
+  (bit-plane-major) layout; it is not the FastLanes layout they used to name.
+- **WeftDB is dual-licensed under MIT OR Apache-2.0**, at your option, from this release on.
+  Every crate declares `license = "MIT OR Apache-2.0"`, and the repository root and every
+  crate ship `LICENSE-MIT` and `LICENSE-APACHE` in place of `LICENSE`. The release archives
+  carry both files, `NOTICE` and the `THIRD-PARTY-NOTICES` files. Earlier commits remain
+  available under MIT, as they were published. The portions adapted from Chimp and
+  DDSketch stay under Apache-2.0 whichever option you choose.
+- The MIT license text (now `LICENSE-MIT`) reads `Copyright (c) 2025-2026 Justin Icenhour`,
+  naming the individual copyright holder for both years of the project.
 
 ### Fixed
 
@@ -170,6 +215,34 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   still accepted), and a dictionary without steps as `None`. The metadata
   `get_dictionary_metadata` caches is keyed by aspect as well as name, so two aspects'
   dictionaries of the same name no longer share it.
+- **A pipeline's dictionaries lost their steps and variabilities, and gained a metadata
+  row on every load.** `set_dictionary_metadata`, which
+  `weft_orchestration::load_dictionary` registers a pipeline's dictionaries with,
+  inserted only the `dictionary_metadata` row. The steps and variabilities were never
+  stored, `get_dictionary_metadata` (which needs the constraints row) never found the
+  dictionary, and so every `load_dictionary` (two per `Pipeline::extract_patterns`)
+  registered it again, with another row and a new id. It now writes the whole
+  registration and replaces any earlier one of that name, since the tables cannot carry
+  a unique constraint; `AspectStructure::new_dictionary` writes the same way, so creating
+  a dictionary twice no longer leaves two. `load_dictionary` registers a dictionary only
+  when none is registered, under the `Dictionary`'s own id: `get_dictionary_metadata`
+  now answers `Ok(None)` for a dictionary with no database yet (it was an error,
+  `Dictionary '…' does not exist for aspect '…'`), and a registration it cannot read
+  is left alone instead of registered again. Of several rows for one name,
+  `get_dictionary_metadata` reads the newest that has constraints (it read whichever
+  came first), so a dictionary an earlier release registered from a pipeline reads as
+  unregistered and is registered again, with its constraints, on its next load, which
+  also deletes its extra rows.
+- **`get_dictionary_metadata` returned no variabilities.** It always answered `None`,
+  although `new_dictionary` stores them. It now reads them back in the order they were
+  stored; an empty list stores nothing, and so reads back as `None`.
+- **`list_dictionaries` read only a dictionary named "default".** It opened the
+  aspect's dictionary named "default", so it failed for an aspect without one
+  (`Dictionary 'default' does not exist for aspect '…'`) and otherwise listed only that
+  dictionary. Each dictionary is its own `<aspect>/dictionaries/<name>.db`; it now lists
+  all of them, by name, each with its steps and variabilities (it returned empty
+  constraints), and the list is no longer cached, so it does not go stale when a
+  dictionary is added.
 - **Commit failures were silently ignored.** A control-plane write that lost an MVCC
   conflict was reported as success. Commit errors now reach the caller, and the
   transaction is rolled back.
@@ -179,6 +252,68 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Security
 
+- **Aspect names can no longer point outside the segment store.** An aspect's name is
+  part of the file names of its `.weftseg` frames and `.weftpart` sidecars, and it was
+  not checked, so a client of `weft-server` could declare a name that made sealing,
+  reconciling or compacting create, overwrite or delete those files outside the store's
+  `segments/` directory. Names are now validated wherever they are declared or turned
+  into a path (`weftdb::aspect_name::validate`): at most 160 bytes, no `/` or `\`, no
+  control characters, no leading `.`, no trailing `.` or space, and not a Windows device
+  name (`CON`, `NUL`, `COM1`, `CONIN$`, …, also with an extension or a `:` suffix).
+  Bidirectional controls, line and paragraph separators and invisible formatting
+  characters are refused as well, so a name cannot display as a different one in
+  listings and logs (the zero-width joiner and non-joiner, which some scripts need, are
+  still accepted). On
+  Windows, `<`, `>`, `:`, `"`, `|`, `?` and `*` are refused too, since such a name could
+  never be sealed there. `POST /api/v1/storage/aspects` answers `400` for an invalid
+  name, and every frame path is also checked to be a direct child of `segments/`. An
+  aspect already declared under such a name was never safe to use: sealing, reading or
+  maintaining it now fails with a typed `weftdb::InvalidAspectName` error (a `400` from
+  the ingest, read, reconcile, squash and compact endpoints), and the store-wide
+  maintenance sweeps list it in `failed` and count it in
+  `weft_reconcile_failed_passes_total` while still maintaining every other aspect.
+  Listing it and reading its schema or stats, which touch no files, still work. Names
+  that differ only in letter case or Unicode normalisation are still accepted and can
+  share frame files on a case-insensitive or normalising filesystem; that is a collision
+  inside `segments/`, not a way out of it, and the planned encoded frame names remove it.
+- **API callers can no longer make backup retention delete the daemon's snapshots.**
+  `WEFT_BACKUP_KEEP` retention keeps the newest `backup-<digits>` directories by their
+  embedded timestamp, and `POST /api/v1/storage/backup` created directories in that same
+  form, both for a `?label=` in it and for every unlabelled backup, so a caller could fill
+  the retained set and get the daemon's genuine snapshots pruned. That form is now
+  reserved for the backup daemon: a `?label=` in it is a `400`, and an unlabelled backup
+  is now named `manual-<unix_millis>`. A label also may no longer start or end with `.`
+  (Windows drops a trailing dot from a directory name, so such a label could still land
+  on a reserved name there); the restore drill's `?label=` follows the same rule.
+  Snapshots taken through the endpoint are therefore never counted or pruned by
+  retention; this is a behaviour change for unlabelled backups, which used to be pruned,
+  so remove them by hand when no longer needed. Retention also ignores a
+  generated-looking directory whose stamp is more than 24 hours past the current clock or
+  past the directory's own modification time, which no daemon snapshot ever is: it is
+  not counted and not removed, and each listing logs a warning naming it. A directory
+  planted through the API before this release keeps its planting time as its
+  modification time, so a far-future stamp stays ignored after the clock reaches it, as
+  long as the directory is not modified and its filesystem reports modification times.
+  One stamped less than 24 hours past its planting looks like a snapshot from a skewed
+  clock and is counted, but no longer outranks new snapshots a day after it was
+  planted. Remove such directories by hand. Anyone who can write to the backup directory
+  directly can still affect retention; this closes the API path.
+- **Web pages can no longer drive a loopback-bound `weft-server`.** With no
+  authentication, the default `127.0.0.1` bind was the only protection, but a page open
+  in a browser on the same machine could still send requests that need no CORS
+  preflight (enough to trigger maintenance, backups and ingest), or reach the API
+  through DNS rebinding. While bound to a loopback address (including the IPv4-mapped
+  `[::ffff:127.0.0.1]`), the server now answers only requests addressed to `localhost`,
+  `127.0.0.0/8` or `[::1]` (`421 Misdirected Request` otherwise, `/health` and `/ready`
+  included) and refuses a state-changing request whose `Origin` is not a loopback origin
+  (`403`). Clients that send no `Origin`, such as `curl`, are unaffected. Pages served by
+  another local web server (any loopback origin, on any port) are still trusted until
+  authentication lands. Health probes must send a loopback `Host` such as `localhost` or
+  `127.0.0.1`, as every HTTP/1.1 client does; an HTTP/1.0 probe that sends no `Host` now
+  gets `421`, so configure it to send one or set `WEFT_ALLOW_ANY_HOST=1`. Behind a local
+  reverse proxy that forwards a different `Host`, or the non-loopback `Origin` of a
+  browser UI it fronts, set `WEFT_ALLOW_ANY_HOST=1`. Non-loopback binds are unchanged
+  and remain unauthenticated.
 - Cleared the `crossbeam-epoch` (RUSTSEC-2026-0204) and `h2` (RUSTSEC-2026-0258)
   advisories, replaced the unmaintained `bincode` (RUSTSEC-2025-0141), and removed the
   unsound `lru` 0.16 (RUSTSEC-2026-0253) by disabling turso's unused full-text search.

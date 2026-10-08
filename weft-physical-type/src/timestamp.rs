@@ -611,24 +611,28 @@ pub fn blocked_bitpack_decode_range(bytes: &[u8], block: usize, count: usize, st
 	out
 }
 
-/// The tile size the transposed bit-unpack codec ([`transpose_bitpack_encode`])
+/// The tile size the bit-sliced bit-unpack codec ([`transpose_bitpack_encode`])
 /// partitions a stream into.
 ///
-/// The `FastLanes` "unified transposed layout" targets a virtual 1024-lane SIMD register,
-/// so a 1024-value tile lets each bit-plane of a full tile land on a 128-byte (16×`u64`)
-/// word-aligned boundary; only the final short tile is unaligned. *(src: `FastLanes`
-/// Compression Layout, VLDB'23 — <https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf>)*
+/// A 1024-value tile makes each bit-plane of a full tile exactly 1024 bits — 128 bytes, sixteen
+/// `u64` words — so every plane of a full tile starts on a word boundary and the decoder reads it
+/// in whole words; only the final short tile is unaligned. (Tiles are counted in **values**: a
+/// tile holds 1024 values, and each of its `width` planes holds one bit of each.)
+///
+/// Behind the `bitsliced-codec` feature, as is every `transpose_bitpack_*` function.
+#[cfg(feature = "bitsliced-codec")]
 pub const TRANSPOSE_TILE: usize = 1024;
 
-/// Estimated footprint of a **transposed** per-tile bit-packing of a difference stream:
-/// a one-byte width header plus `width * ceil(len / 8)` plane bytes per tile.
+/// Estimated footprint of a **bit-sliced** (transposed) per-tile bit-packing of a difference
+/// stream: a one-byte width header plus `width * ceil(len / 8)` plane bytes per tile.
 ///
 /// The bit budget is identical to [`blocked_bitpack_bytes`] at the same tile size for any
-/// tile whose length is a multiple of 8 (every full 1024-lane tile is) — the transpose is a
+/// tile whose length is a multiple of 8 (every full 1024-value tile is) — the transpose is a
 /// *permutation* of the same bits, not a different code. A short trailing tile whose length
 /// is not a multiple of 8 costs at most `width - 1` extra bytes because each bit-plane rounds
 /// up to a whole byte independently (vs the single global round-up of the linear layout). The
 /// point of the layout is **decode speed**, not size: see [`transpose_bitpack_decode`].
+#[cfg(feature = "bitsliced-codec")]
 #[must_use]
 pub fn transpose_bitpack_bytes(values: &[i64], tile: usize) -> usize {
 	if values.is_empty() {
@@ -638,13 +642,15 @@ pub fn transpose_bitpack_bytes(values: &[i64], tile: usize) -> usize {
 	values.chunks(tile).map(|chunk| 1 + bitpack_width(chunk) as usize * chunk.len().div_ceil(8)).sum()
 }
 
-/// Transposed per-tile bit-pack encode of a difference stream (the `FastLanes` layout).
+/// Bit-sliced per-tile bit-pack encode of a difference stream.
 ///
 /// Each tile emits a one-byte width header then `width` **bit-planes**: plane `b` is the
 /// `ceil(len / 8)` bytes holding bit `b` of every lane in the tile (lane `l` at bit `l` of
 /// byte `l / 8`). This is the transpose of the linear [`bitpack_encode`] layout, where a
 /// value's `width` bits are contiguous; here a value's bits are scattered one per plane, and
-/// a plane gathers one bit from every value.
+/// a plane gathers one bit from every value. This is a bit-sliced (vertical, bit-plane-major)
+/// layout. It is **not** the `FastLanes` layout, which keeps each value's bits together and
+/// interleaves whole packed values across the lanes of a 1024-bit virtual register.
 ///
 /// Why: the transpose makes the **high bit-planes of a small-magnitude stream empty**, so
 /// [`transpose_bitpack_decode`] skips them wholesale (an all-zero plane word contributes
@@ -652,6 +658,7 @@ pub fn transpose_bitpack_bytes(values: &[i64], tile: usize) -> usize {
 /// regardless. Exact inverse is [`transpose_bitpack_decode`] given the same `tile` and count;
 /// an empty input yields an empty buffer. The emitted length is exactly
 /// [`transpose_bitpack_bytes`] for the same `(values, tile)`.
+#[cfg(feature = "bitsliced-codec")]
 #[must_use]
 pub fn transpose_bitpack_encode(values: &[i64], tile: usize) -> Vec<u8> {
 	let tile = tile.max(1);
@@ -680,7 +687,7 @@ pub fn transpose_bitpack_encode(values: &[i64], tile: usize) -> Vec<u8> {
 	out
 }
 
-/// Decode one transposed tile's `len` lanes from its `width` bit-planes (the `plane_bytes =
+/// Decode one bit-sliced tile's `len` lanes from its `width` bit-planes (the `plane_bytes =
 /// ceil(len / 8)` bytes per plane starting at `planes`). Shared by [`transpose_bitpack_decode`]
 /// and [`transpose_bitpack_decode_range`].
 ///
@@ -688,6 +695,7 @@ pub fn transpose_bitpack_encode(values: &[i64], tile: usize) -> Vec<u8> {
 /// lanes (`w &= w - 1` walks set bits), so an all-zero plane word costs a single compare — the
 /// decode-latency win. A `width` of 0 (a constant tile) yields `len` zeros; bytes past `planes`
 /// read as 0 (a truncated tile yields zeros rather than panicking).
+#[cfg(feature = "bitsliced-codec")]
 fn transpose_tile_decode(planes: &[u8], width: usize, len: usize) -> Vec<i64> {
 	if width == 0 {
 		return vec![0; len];
@@ -716,7 +724,7 @@ fn transpose_tile_decode(planes: &[u8], width: usize, len: usize) -> Vec<i64> {
 	acc.iter().map(|&a| unzigzag(a)).collect()
 }
 
-/// Reconstruct `count` differences from a transposed per-tile bit-pack buffer.
+/// Reconstruct `count` differences from a bit-sliced per-tile bit-pack buffer.
 ///
 /// Exact inverse of [`transpose_bitpack_encode`] given the same `tile` and `count`. The
 /// decode reads each bit-plane as `u64` words and distributes only the **set** bits of each
@@ -724,6 +732,7 @@ fn transpose_tile_decode(planes: &[u8], width: usize, len: usize) -> Vec<i64> {
 /// single compare and a sparse one costs only its population — the decode-latency win over
 /// the scalar [`bitpack_decode`], which loops every bit of every value. Bytes past the buffer
 /// read as `0` (a truncated tile yields zeros rather than panicking).
+#[cfg(feature = "bitsliced-codec")]
 #[must_use]
 pub fn transpose_bitpack_decode(bytes: &[u8], tile: usize, count: usize) -> Vec<i64> {
 	let tile = tile.max(1);
@@ -745,17 +754,17 @@ pub fn transpose_bitpack_decode(bytes: &[u8], tile: usize, count: usize) -> Vec<
 }
 
 /// **Tile-level random access:** decode only the `len` differences at global index `start` from
-/// a transposed per-tile bit-pack buffer.
+/// a bit-sliced per-tile bit-pack buffer.
 ///
 /// The tiles before `start` are skipped by reading their one-byte width headers (and computing
-/// each tile's plane-byte length) rather than decoding their planes — the transposed mirror of
-/// [`blocked_bitpack_decode_range`]. This is the random-access primitive the transposed layout
+/// each tile's plane-byte length) rather than decoding their planes — the bit-sliced mirror of
+/// [`blocked_bitpack_decode_range`]. This is the random-access primitive the bit-sliced layout
 /// needs to serve a point lookup or sub-range without materializing the whole column (so the
 /// layout can back a block-random-access value/timestamp codec without regressing the streaming
 /// point read). The result equals `transpose_bitpack_decode(bytes, tile, count)[start..start+len]`
 /// (clamped to `count`); a `start >= count` or `len == 0` yields an empty vector. Roadmap Phase
-/// 6.1 "realize the transposed layout on disk". *(src: `FastLanes` Compression Layout, VLDB'23 —
-/// <https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf>)*
+/// 6.1 "realize the transposed layout on disk".
+#[cfg(feature = "bitsliced-codec")]
 #[must_use]
 pub fn transpose_bitpack_decode_range(bytes: &[u8], tile: usize, count: usize, start: usize, len: usize) -> Vec<i64> {
 	let tile = tile.max(1);
@@ -1163,8 +1172,10 @@ pub fn decode_gorilla_dods(bytes: &[u8], count: usize) -> Vec<i64> {
 /// `alpha` ranges over `0..=2^FIRE_SHIFT`, representing a slope multiplier in `[0, 1]`.
 /// At `alpha = 2^FIRE_SHIFT` the predictor is exactly delta-of-delta; at `alpha = 0` it is a
 /// plain delta. FIRE adapts between the two per stream.
+#[cfg(feature = "experimental-codecs")]
 const FIRE_SHIFT: i64 = 8;
 /// The upper clamp for the FIRE coefficient — `2^FIRE_SHIFT`, i.e. a multiplier of `1.0`.
+#[cfg(feature = "experimental-codecs")]
 const FIRE_ALPHA_MAX: i64 = 1 << FIRE_SHIFT;
 
 /// Apply the **Sprintz FIRE** (Fast Integer `REgression`) forecaster to an integer stream,
@@ -1182,8 +1193,11 @@ const FIRE_ALPHA_MAX: i64 = 1 << FIRE_SHIFT;
 /// comparable: `res[0]` is the anchor value verbatim, `res[1]` (if present) is the first
 /// delta, and `res[2..]` are the FIRE prediction residuals. All arithmetic is wrapping `i64`,
 /// so the exact inverse [`fire_reconstruct`] round-trips every stream regardless of overflow.
-/// Advisory (roadmap Phase 6.1) — a benchmarkable estimate, not wired into any on-disk selector.
-/// *(src: Sprintz, ACM TODS'18 — <https://arxiv.org/abs/1808.02515>)*
+/// Advisory (roadmap Phase 6.1) — a benchmarkable estimate, not wired into any on-disk selector,
+/// and behind the `experimental-codecs` feature.
+/// *(src: Sprintz, Proc. ACM IMWUT 2(3), 2018 — <https://doi.org/10.1145/3264903> ·
+/// <https://arxiv.org/abs/1808.02515>)*
+#[cfg(feature = "experimental-codecs")]
 #[must_use]
 pub fn fire_residuals(values: &[i64]) -> Vec<i64> {
 	let mut res = Vec::with_capacity(values.len());
@@ -1215,7 +1229,9 @@ pub fn fire_residuals(values: &[i64]) -> Vec<i64> {
 }
 
 /// Reconstruct the original integer stream from a [`fire_residuals`] output — the exact
-/// inverse, mirroring the forecaster's deterministic wrapping `i64` arithmetic.
+/// inverse, mirroring the forecaster's deterministic wrapping `i64` arithmetic. Behind the
+/// `experimental-codecs` feature.
+#[cfg(feature = "experimental-codecs")]
 #[must_use]
 pub fn fire_reconstruct(residuals: &[i64]) -> Vec<i64> {
 	let mut out = Vec::with_capacity(residuals.len());
@@ -1255,7 +1271,9 @@ pub fn fire_reconstruct(residuals: &[i64]) -> Vec<i64> {
 /// Structured exactly like [`DeltaOfDeltaColumn::best_estimated_bytes`] (anchor + first delta +
 /// packed second-order stream) so the two are directly comparable — FIRE wins when its adaptive
 /// coefficient yields a smaller residual tail than the fixed delta-of-delta predictor. Advisory
-/// only. *(src: Sprintz, ACM TODS'18 — <https://arxiv.org/abs/1808.02515>)*
+/// only, and behind the `experimental-codecs` feature. *(src: Sprintz, Proc. ACM IMWUT 2(3),
+/// 2018 — <https://doi.org/10.1145/3264903> · <https://arxiv.org/abs/1808.02515>)*
+#[cfg(feature = "experimental-codecs")]
 #[must_use]
 pub fn fire_estimated_bytes(values: &[i64]) -> usize {
 	let residuals = fire_residuals(values);
@@ -1512,6 +1530,7 @@ mod tests {
 
 	/// Every FIRE fixture must round-trip exactly (the predictor is a deterministic wrapping
 	/// bijection).
+	#[cfg(feature = "experimental-codecs")]
 	fn fire_round_trips(values: &[i64]) {
 		let res = fire_residuals(values);
 		assert_eq!(res.len(), values.len(), "residual stream keeps the length");
@@ -1519,6 +1538,7 @@ mod tests {
 	}
 
 	#[test]
+	#[cfg(feature = "experimental-codecs")]
 	fn fire_round_trips_across_shapes() {
 		fire_round_trips(&[]);
 		fire_round_trips(&[42]);
@@ -1532,6 +1552,7 @@ mod tests {
 	}
 
 	#[test]
+	#[cfg(feature = "experimental-codecs")]
 	fn fire_matches_delta_of_delta_when_the_coefficient_stays_at_one() {
 		// FIRE starts at alpha = 1.0, which IS the delta-of-delta predictor. On a perfectly
 		// linear ramp every FIRE residual past the first delta is zero (dod = 0), and the
@@ -1543,6 +1564,7 @@ mod tests {
 	}
 
 	#[test]
+	#[cfg(feature = "experimental-codecs")]
 	fn fire_beats_delta_of_delta_on_a_geometric_velocity_stream() {
 		// FIRE's regime: a stream whose velocity decays geometrically (v[i] ≈ 7/8·v[i-1]), so the
 		// optimal predictor coefficient is a stable *fraction* (~7/8), not 1. Delta-of-delta's
@@ -1567,6 +1589,7 @@ mod tests {
 	}
 
 	#[test]
+	#[cfg(feature = "experimental-codecs")]
 	fn fire_rle_pass_collapses_a_constant_residual_run() {
 		// Constant acceleration (x = i²) makes FIRE (alpha pinned at 1.0, = delta-of-delta)
 		// produce a constant residual run of 2. The run-length pass — the second half of the
@@ -2158,6 +2181,7 @@ mod tests {
 	}
 
 	#[test]
+	#[cfg(feature = "bitsliced-codec")]
 	fn transpose_bitpack_round_trips_and_agrees_with_the_scalar_decoder() {
 		// The transposed layout is a permutation of the scalar bit-pack's bits: for every
 		// tile and awkward tail length, the transposed decode must reproduce the exact
@@ -2180,9 +2204,10 @@ mod tests {
 	}
 
 	#[test]
+	#[cfg(feature = "bitsliced-codec")]
 	fn transpose_bitpack_footprint_matches_the_linear_layout_on_aligned_tiles() {
 		// The transpose is the same bit budget as the linear per-block layout for any tile
-		// whose length is a multiple of 8 — a full 1024-lane tile always is, so a stream
+		// whose length is a multiple of 8 — a full 1024-value tile always is, so a stream
 		// sized to whole tiles is byte-for-byte the same size (the win is decode speed, not
 		// size). Values kept small so every tile shares a modest width.
 		let vals: Vec<i64> = (0..2048).map(|i| (i % 9) - 4).collect();
@@ -2190,6 +2215,7 @@ mod tests {
 	}
 
 	#[test]
+	#[cfg(feature = "bitsliced-codec")]
 	fn transpose_bitpack_handles_all_zero_and_empty_streams() {
 		assert_eq!(transpose_bitpack_bytes(&[], 8), 0);
 		// An all-zero stream: each tile costs a single width-header byte (width 0, no planes).
@@ -2257,6 +2283,7 @@ mod tests {
 	}
 
 	#[test]
+	#[cfg(feature = "bitsliced-codec")]
 	fn transpose_bitpack_decode_range_matches_the_full_decode() {
 		// Tile-level random access must equal the full decode sliced to [start, start+len) for
 		// every tile size and window — including single-value reads, windows straddling tile

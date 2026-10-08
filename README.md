@@ -5,7 +5,7 @@
 [![crates.io](https://img.shields.io/crates/v/weftdb.svg)](https://crates.io/crates/weftdb)
 [![docs.rs](https://img.shields.io/docsrs/weftdb)](https://docs.rs/weftdb)
 [![CI](https://github.com/basic-automation/weftdb/actions/workflows/ci.yml/badge.svg)](https://github.com/basic-automation/weftdb/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 ![Rust](https://img.shields.io/badge/Rust-1.95%2B-orange.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue.svg)
 ![Status](https://img.shields.io/badge/status-pre--beta-orange.svg)
@@ -302,11 +302,12 @@ while using bounded memory per bucket.
 
 ### Where it doesn't pay off
 
-A deliberately-kept honest result: the FastLanes **transposed value codec** delivers
+A deliberately-kept honest result: the **bit-sliced (transposed) value codec** delivers
 ~5.7× faster bit-unpacking at the kernel level, but end-to-end it is a **wash** —
 +0.08% bytes and full decode, windowed range and point reads all within noise of the
 linear codec ([`benches/transposed_read.rs`](weft-physical-type/benches/transposed_read.rs)).
-It ships **off by default** for exactly that reason. Kernel speedups often don't
+It ships **off by default** for exactly that reason (and is now behind the
+`bitsliced-codec` build feature, pending patent review). Kernel speedups often don't
 survive a whole read path, and this README would rather say so than quote the 5.7×.
 
 ---
@@ -322,6 +323,22 @@ Bind address defaults to `127.0.0.1:8080` (`WEFT_SERVER_ADDR` overrides). Settin
 `WEFT_SEGMENT_STORE_ROOT` opens a Storage v2 segment store and enables the
 `/storage` endpoints (without it they answer `503`, and `GET /ready` reports the
 `segment_store` dependency).
+
+While bound to a loopback address, the server only answers requests addressed to a
+loopback host: `Host` must be `localhost`, an address in `127.0.0.0/8` or `[::1]`
+(anything else is a `421`), and a state-changing request whose `Origin` is not a
+loopback origin is a `403`. That keeps web pages from non-loopback origins, open in a
+local browser, from driving the server; a page served by another local web server (any
+loopback origin, on any port) is still trusted until authentication lands. Clients that
+send no `Origin`, like `curl`, are unaffected. `/health` and `/ready` follow the same
+rule, so a health probe must send a loopback `Host` such as `localhost` or `127.0.0.1`,
+as every HTTP/1.1 client does; an HTTP/1.0 probe that sends no `Host` gets a `421`, so
+configure it to send one or set `WEFT_ALLOW_ANY_HOST=1`. Behind a local reverse
+proxy that forwards a different `Host`, set `WEFT_ALLOW_ANY_HOST=1`; a proxy that keeps
+`Host: 127.0.0.1` but forwards the `Origin` of a browser UI served from a non-loopback
+origin needs it too, or that UI's state-changing requests get a `403`. A non-loopback
+bind is not guarded: there is no authentication yet, so keep such a server off
+untrusted networks.
 
 ### Service endpoints
 
@@ -412,7 +429,7 @@ under the declared encoding/tolerance is rejected `400`.
 
 | Endpoint | Purpose |
 |----------|---------|
-| `POST /api/v1/storage/aspects` | **Declare** an aspect's schema — physical encoding, value tolerance, timestamp unit. |
+| `POST /api/v1/storage/aspects` | **Declare** an aspect's schema — physical encoding, value tolerance, timestamp unit. The name also names the aspect's files on disk, so it must be at most 160 bytes with no `/`, `\`, control characters, bidirectional controls, line separators or invisible formatting characters (the zero-width joiner and non-joiner are allowed), leading `.`, trailing `.` or space, and must not be a Windows device name (`CON`, `NUL`, `COM1`, …, also with an extension or a `:` suffix, as in `nul:x`); a server running on Windows also refuses `<`, `>`, `:`, `"`, `|`, `?` and `*`. Anything else is a `400`. |
 | `GET /api/v1/storage/aspects` · `…/{aspect}/schema` · `…/catalog` | List declared schemas; read one aspect's schema; report the store's `(database, subject)` scope + registered hierarchy. |
 | `POST /api/v1/storage/{aspect}/points` | Ingest a JSON batch (dense or nullable; single-block or paged via `rows_per_page`). Set `require_sorted` to reject an out-of-order batch (`400`, naming the first backwards row) instead of sealing it. Every ingest response reports `time_sorted` (whether the sealed segment stored in monotonic order). |
 | `POST /api/v1/storage/{aspect}/{ilp,parquet,csv}` | Ingest an ILP payload, a Parquet file, or CSV rows into a declared aspect — all sealing through the same schema-enforced path, and all honouring `require_sorted` (query param) + reporting `time_sorted`. |
@@ -426,8 +443,8 @@ under the declared encoding/tolerance is rejected `400`.
 | `POST /api/v1/storage/{aspect}/reconcile` | **Reconciliation pass** (`mode` in the response). Default (intra-segment): rewrite every out-of-order segment of the aspect into a time-sorted one in place. `?threshold=N` gates it on `unsorted_segments >= N` (QuestDB-style split-count trigger). `?hot_cold=true` reconciles cold segments but defers the hot tail until the backlog reaches the threshold. `?overlaps=true` instead runs the **cross-segment overlap merge** (newer-wins) — `reconciled` is then the number of segments merged away, and `?split_min_bytes=N` makes that merge **split-not-rewrite** (carve off a dominant cold prefix instead of rewriting the whole component). Returns `triggered`/`reconciled`/`cold_reconciled`/`hot_reconciled` and the post-pass `unsorted_segments` + `overlapping_segments`. |
 | `POST /api/v1/storage/{aspect}/squash` | **Squash** the aspect's segments into one (newer-wins), bounding split-path fragmentation. `?max_segments=N` gates it (squash only when the count exceeds `N`). Returns `triggered`/`removed`/`segment_count`. |
 | `POST /api/v1/storage/{aspect}/compact?target_rows=N` | **Size-targeted compaction** — coalesce the aspect's segments toward ~`N` rows per segment (leaving already-large segments untouched), holding fragmentation near the read-optimal size rather than folding to one (which `squash` does). Motivated by the `downsample_range` knee (one giant segment reads slower than several mid-sized ones). `target_rows` is required (absent → `400`). Returns `removed`/`segment_count`. The manual counterpart of the `WEFT_COMPACT_TARGET_ROWS` daemon pass. |
-| `POST /api/v1/storage/reconcile` | **Store-wide reconciliation sweep** across every declared aspect: threshold (default), `?hot_cold=true`, or `?overlaps=true` (+ `?split_min_bytes=N` for split-not-rewrite). Returns `mode`, `aspects_scanned` / `aspects_reconciled` / `segments_reconciled` (+ cold/hot split) and the post-sweep store-wide `unsorted_segments` + `overlapping_segments`. The manual counterpart to the background reconcile daemon (`WEFT_RECONCILE_INTERVAL_SECS` / `WEFT_RECONCILE_THRESHOLD` / `WEFT_RECONCILE_HOT_COLD` / `WEFT_RECONCILE_OVERLAPS` / `WEFT_RECONCILE_SPLIT_MIN_BYTES` / `WEFT_RECONCILE_MAX_SPLITS`). |
-| `POST /api/v1/storage/backup` | **Online control-plane backup** (Phase 7.4) — snapshot the store's four control-plane DBs (`segment_index`/`metadata`/`aspect_catalog`/`catalog`) to fresh files via Turso's stable `VACUUM INTO`. Lands in `<base>/<label>` where `<base>` is `WEFT_BACKUP_DIR` or `<store_root>/backups` and `<label>` is a traversal-guarded `?label=` (`[A-Za-z0-9._-]`) or a generated `backup-<unix_millis>`. **`?verify=source\|snapshot`** picks the verification: `source` (the default) cross-checks each copy's user-table set + row counts against the live control plane — the strongest check, but it assumes a **quiescent** store; `snapshot` verifies each copy on its own terms (it reopens and **fully scans every row of every table**) without re-reading the source, which is what an **online** backup taken while ingest continues needs. An unknown token → `400`. Returns per-DB `{name, tables, rows, bytes}` + `total_rows`/`total_bytes` + the `verify` mode that ran. An existing target dir → `400`; no store → `503`. Control plane only — the `.weftseg` measurement frames are not part of this backup (hard-constraint #3). |
+| `POST /api/v1/storage/reconcile` | **Store-wide reconciliation sweep** across every declared aspect: threshold (default), `?hot_cold=true`, or `?overlaps=true` (+ `?split_min_bytes=N` for split-not-rewrite). Returns `mode`, `aspects_scanned` / `aspects_reconciled` / `segments_reconciled` (+ cold/hot split), the post-sweep store-wide `unsorted_segments` + `overlapping_segments`, and **`failed`**: a `[{aspect, error}]` list of the aspects whose pass failed (empty on a clean sweep). A failing aspect (e.g. a torn or truncated frame) no longer aborts the sweep: every other aspect is still swept and the response is `200`, so check `failed` to tell a partial sweep from a clean one (earlier versions returned `500` at the first failing aspect and left every aspect after it in name order unswept). Only an unreadable aspect list is still a `500`. The manual counterpart to the background reconcile daemon (`WEFT_RECONCILE_INTERVAL_SECS` / `WEFT_RECONCILE_THRESHOLD` / `WEFT_RECONCILE_HOT_COLD` / `WEFT_RECONCILE_OVERLAPS` / `WEFT_RECONCILE_SPLIT_MIN_BYTES` / `WEFT_RECONCILE_MAX_SPLITS`). |
+| `POST /api/v1/storage/backup` | **Online control-plane backup** (Phase 7.4) — snapshot the store's four control-plane DBs (`segment_index`/`metadata`/`aspect_catalog`/`catalog`) to fresh files via Turso's stable `VACUUM INTO`. Lands in `<base>/<label>` where `<base>` is `WEFT_BACKUP_DIR` or `<store_root>/backups` and `<label>` is a traversal-guarded `?label=` (`[A-Za-z0-9._-]`, not starting or ending with `.`) or, without one, a generated `manual-<unix_millis>`. The `backup-<digits>` form is reserved for the backup daemon (retention counts and prunes exactly those names), so a `?label=` in that form is a `400`, and no snapshot taken through this endpoint is ever pruned by retention. **`?verify=source\|snapshot`** picks the verification: `source` (the default) cross-checks each copy's user-table set + row counts against the live control plane — the strongest check, but it assumes a **quiescent** store; `snapshot` verifies each copy on its own terms (it reopens and **fully scans every row of every table**) without re-reading the source, which is what an **online** backup taken while ingest continues needs. An unknown token → `400`. Returns per-DB `{name, tables, rows, bytes}` + `total_rows`/`total_bytes` + the `verify` mode that ran. An existing target dir → `400`; no store → `503`. Control plane only — the `.weftseg` measurement frames are not part of this backup (hard-constraint #3). |
 | `POST /api/v1/storage/restore/drill?label=<backup>` | **Restore drill** (Phase 7.4) — rehearse restoring a backup *on a running server*, so an operator can answer "is my backup actually restorable?" without risking anything. Restores the named backup into a throwaway directory beside the backups, verifies every restored database at its destination (it opens, and every row of every table reads), returns per-DB `{name, tables, rows, bytes}` + `total_rows`/`total_bytes`/`restorable`, then deletes the rehearsal copy. **Non-destructive by construction** — it cannot touch the live store, and restoring *over* a live control plane is deliberately not offered (the library primitive refuses to clobber; pointing `WEFT_SEGMENT_STORE_ROOT` at a restored copy is a deployment decision, not an HTTP call). Unknown backup → `404`; traversal label → `400`; a backup that will not restore → `500` carrying the failure, which is a failed drill rather than a server bug. |
 | `GET /api/v1/storage/{aspect}/stats` · `…/storage/stats` | Materialized per-aspect and store-wide rollups, including the realized **bytes/point** (the north-star cost term), an `unsorted_segments` order-health count (segments that would force a linear scan on a point lookup), and an `overlapping_segments` count (time-overlapping segments — the cross-segment order-health signal, computed by an index scan). Rollup fields are served from the control plane without opening a segment. |
 
@@ -438,9 +455,11 @@ under the declared encoding/tolerance is rejected `400`.
 `weft_ingest_*` counters (requests/errors/rows/segments) on the ingest paths,
 `weft_reconcile_*` counters (`_passes_total` / `_segments_reconciled_total`) over the
 out-of-order reconciliation passes (manual, store-wide, and the background daemon —
-threshold-held calls excluded), `weft_backup_*` counters (`_snapshots_total` /
-`_bytes_written_total`) over the online control-plane backups, and latency histograms
-over the compute and seal paths.
+threshold-held calls excluded) plus `_failed_passes_total`, the per-aspect passes a
+store-wide sweep (daemon tick or `POST /api/v1/storage/reconcile`) skipped after an
+error (the daemon also logs one `WARN` line per failed aspect), `weft_backup_*`
+counters (`_snapshots_total` / `_bytes_written_total`) over the online control-plane
+backups, and latency histograms over the compute and seal paths.
 `GET /debug/profile/current` serves the same timing data as a live p50/p95/p99
 snapshot.
 
@@ -484,9 +503,16 @@ only** — the `.weftseg` measurement frames are not part of a snapshot.
   each tick (verifying `snapshot`-only, since it backs up a live store), and
   `WEFT_BACKUP_KEEP` to retain only the newest N. Retention is deliberately narrow:
   it only ever removes daemon-**generated** `backup-<digits>` directories, so a
-  snapshot you took by hand with `?label=nightly` is never a prune candidate, and
+  snapshot you took through the API (`?label=nightly`, or an unlabelled
+  `manual-<unix_millis>`) is never a prune candidate and never counts toward N, and
   it runs only after a *successful* snapshot, so a run of failures cannot prune
-  your last good backup away. Both paths record `weft_backup_*` metrics.
+  your last good backup away. A `backup-<digits>` directory stamped more than 24 h
+  past the clock, or past the directory's own modification time, did not come from
+  the daemon: retention neither counts nor removes it, and logs a warning each time
+  it sees it. The modification-time check keeps such a directory ignored after the
+  clock catches up with its stamp, as long as the directory is left unmodified and the
+  filesystem reports modification times; remove it by hand when the warning appears.
+  Both paths record `weft_backup_*` metrics.
 - **Restore, with a drill.** `weftdb::restore_control_plane(backup_dir, root)`
   puts a snapshot back into a store root and verifies each restored file **at its
   destination** — what matters is that the file the store will open actually
@@ -513,6 +539,7 @@ WeftDB is configured primarily through environment variables:
 | `WEFT_DATA_DIR` | `weftdb`, `weft-tui` | Root directory for database files **and** the TUI log (`weft-tui.log`). | portable per-user default (see below) |
 | `TEST_DATA_DIR` | `weftdb` | Highest-priority override for the database root (used by the test suite). | unset |
 | `WEFT_SERVER_ADDR` | `weft-server` | HTTP bind address. | `127.0.0.1:8080` |
+| `WEFT_ALLOW_ANY_HOST` | `weft-server` | Truthy (`1`/`true`/`yes`/`on`) → turn off the loopback request guard. On a loopback bind the server otherwise answers only requests whose `Host` is `localhost`, `127.0.0.0/8` or `[::1]` (`421` otherwise) and refuses state-changing requests from non-loopback web origins (`403`). Set it behind a local reverse proxy that forwards a different `Host`, or one that forwards the non-loopback `Origin` of a browser UI it fronts. A non-loopback bind is never guarded. | unset (guarded on a loopback bind) |
 | `WEFT_GPU_CALIBRATE` | `weft-server` | Startup calibration. By default, once the listener is bound, the server runs `splimes::calibrate()` once in the background on a blocking thread: it starts the GPU if there is one, times the single-thread, rayon and GPU backends on grids up to 16 Mi points (several seconds, a few hundred MB), and sets where `Backend::Auto` switches between them. Requests are served from the start and interpolate on the CPU with splimes' default thresholds until it finishes. A CPU/software adapter (llvmpipe, lavapipe, WARP) is not calibrated, with a log line saying why; `force` calibrates it anyway. `0` (or `false`/`no`/`off`) skips calibration. It logs the adapter (or why there is none) and the thresholds, and never fails startup; skipped or failed, interpolation stays on the CPU with splimes' defaults. | unset (calibrate, except a software adapter) |
 | `WEFT_MAX_INTERPOLATE_POINTS` | `weft-server` | The most output points one `/api/v1/interpolate*` request may produce; a larger grid is a `400` naming its size and the limit, refused before anything is allocated. A positive integer, read once at startup; anything else (including `0`) stops the server from starting with a message naming the variable. | `10000000` |
 | `WEFT_SEGMENT_STORE_ROOT` | `weft-server` | Root of the Storage v2 segment store; enables the `/storage` endpoints. | unset (storage endpoints answer `503`) |
@@ -525,12 +552,12 @@ WeftDB is configured primarily through environment variables:
 | `WEFT_COMPACT_TARGET_ROWS` | `weft-server` | Target segment size in **rows** for the daemon's size-aware compaction pass; each tick coalesces every aspect's segments toward ~this many rows per segment (leaving already-large segments alone), holding fragmentation near the read-optimal size instead of folding to one (`WEFT_RECONCILE_MAX_SPLITS`). Motivated by the `downsample_range` knee (one giant segment reads slower than several mid-sized ones). Needs the daemon interval set. | unset (no compaction) |
 | `WEFT_BACKUP_DIR` | `weft-server` | Directory each control-plane backup is written under — shared by the manual `POST …/storage/backup` endpoint and the background backup daemon, so hand-taken and automatic snapshots live together. | `<store_root>/backups` |
 | `WEFT_BACKUP_INTERVAL_SECS` | `weft-server` | Background control-plane backup daemon interval in seconds; `0`/unset disables it. Each tick writes a verified snapshot into a fresh `backup-<unix_millis>` directory, using the concurrent-write-safe `snapshot` verification (it backs up a live store). Needs a segment store configured. | unset (disabled) |
-| `WEFT_BACKUP_KEEP` | `weft-server` | How many **daemon-generated** snapshots to retain; after each successful backup the oldest `backup-<digits>` directories beyond this many are removed. Only generated names are ever pruned — a `?label=`-named snapshot you took by hand is never a candidate. | unset (retain everything) |
+| `WEFT_BACKUP_KEEP` | `weft-server` | How many **daemon-generated** snapshots to retain; after each successful backup the oldest `backup-<digits>` directories beyond this many are removed. Only daemon-generated names are ever counted or pruned — a snapshot taken through `POST …/storage/backup` (a `?label=` one, or an unlabelled `manual-<unix_millis>` one) is never a candidate — and a generated-looking directory stamped more than 24 h past the clock or past its own modification time is ignored (not counted, not removed, logged as a warning; remove it by hand). | unset (retain everything) |
 | `BTC_TEST_MAX_ROWS` / `BTC_TEST_FULL` | `weftdb` (tests) | Row cap for the bounded, hermetic default run of `test_create_btc_1min_database` (into a temp data dir), or `BTC_TEST_FULL=1` for the historical whole-corpus load into the shared data dir. | `5000` / unset |
 | `WEFT_SEGMENT_CHECKPOINT_STRIDE` | `weft-server` | Rows between entries of the sealed **timestamp checkpoint index** — trades a little size for much faster point lookups on **sorted, irregular** columns (~3.45× single-block; see the checkpointed-frames feature above). Applies only where it pays: sorted + irregular + at least `WEFT_SEGMENT_CHECKPOINT_MIN_ROWS` rows. ~1024 is the sweet spot (stride barely moves speed but does move size). | unset (no index; frames byte-for-byte as before) |
 | `WEFT_SEGMENT_CHECKPOINT_MIN_ROWS` | `weft-server` | Row floor below which a segment is never checkpointed (a small column decodes trivially, so an index would be pure cost). | `8192` |
 | `WEFT_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD` | `weft-server` | Ceiling on the timestamp-codec override a checkpointed seal will accept (`blocked / best` bytes; `1.0` = only when free). A checkpointed frame must use the range-decodable per-block codec, which is ~free where that codec already wins but **~3.5× on a Gorilla-shaped and ~14× on an RLE-shaped column** — this refuses those seals rather than silently bloating them. | `1.25` |
-| `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` | `weft-server` | Ceiling on the size overhead the **transposed (`FastLanes`-layout) value codec** may pay against the size-selected codec (`transposed / best` bytes; `1.0` = only when free, and a value **below 1.0 is meaningful** — the transposed layout can be a strict size win, since it pays one width header per 1024-lane tile where the blocked codec pays one per 64 values). Stores the value column bit-plane-major for faster bit-plane-skipping decode. Measured byte- and read-neutral end-to-end on a 1M-row column (see the transposed-codec feature above), so it is off by default. | unset (no transposed codec; frames byte-for-byte as before) |
+| `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` | `weft-server` | Ceiling on the size overhead the **bit-sliced (transposed) value codec** may pay against the size-selected codec (`transposed / best` bytes; `1.0` = only when free, and a value **below 1.0 is meaningful** — the bit-sliced layout can be a strict size win, since it pays one width header per 1024-value tile where the blocked codec pays one per 64 values). Stores the value column bit-plane-major for faster bit-plane-skipping decode. Measured byte- and read-neutral end-to-end on a 1M-row column (see the bit-sliced-codec feature above), so it is off by default. **Needs a build with the `bitsliced-codec` feature**; any other build ignores the variable and logs a warning. | unset (no transposed codec; frames byte-for-byte as before) |
 | `WEFT_SEGMENT_PARTIAL_BASE` | `weft-server` | Resolution token (`seconds`/`minutes`/`hours`/…) at which each sealed segment materializes a **partial-reduction `.weftpart` sidecar** — a stored mergeable partial of the bounded reductions. A stored-range downsample of those reductions then **merges the sidecars instead of decoding the value column** (measured **3.2×**), re-keyed to any coarser nesting resolution. A sealed segment is immutable, so the sidecar never goes stale; a rewrite (reconcile/split/squash) regenerates it. | unset (no sidecar; `downsample_range` decodes as before) |
 | `WEFT_SEGMENT_PARTIAL_MIN_ROWS` | `weft-server` | Row floor below which a segment gets no partial sidecar (a tiny segment's partial saves too little decode to be worth the extra file). | `4096` |
 | `WEFT_SEGMENT_PARTIAL_TIERS` | `weft-server` | Comma-separated fine→coarse rollup resolutions (e.g. `hours,days`) materialized **beside** the `WEFT_SEGMENT_PARTIAL_BASE` partial, each re-keyed from the tier below (up to four kept; a finer/non-nesting entry is skipped). A coarse stored-range downsample then folds the coarsest matching tier instead of re-keying the whole fine base (measured **~1.16×** on a DAY query over a MINUTES base). No effect unless `WEFT_SEGMENT_PARTIAL_BASE` is set. | unset (base-only sidecar) |
@@ -562,6 +589,16 @@ The `splimes` crate also exposes build features:
 The GPU is started at runtime, not at build time: `weft-server` calibrates it in the
 background at startup (`WEFT_GPU_CALIBRATE`, above), and an embedding program calls
 `splimes::calibrate()` or `splimes::prewarm_gpu()` itself.
+
+WeftDB's own build features are all **off by default**, sit **outside the 1.0 semver
+promise**, and are **pending patent review**. A default build reads every segment written
+under the default configuration (`WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` unset). A segment
+written with that variable set, which 0.1.0 did whenever it was set, needs `bitsliced-codec`.
+
+| Feature | Crate(s) | Effect |
+|---------|----------|--------|
+| `bitsliced-codec` | `weft-physical-type`, forwarded by `weftdb` and `weft-server` | Compiles in the opt-in bit-sliced value codec, so `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` takes effect. Without it, a segment written with the codec fails to read with an error naming the feature. |
+| `experimental-codecs` | `weft-physical-type` (enabled by `weft-bench`) | Advisory codecs never written to disk: Gorilla-XOR, Chimp, Chimp128 and Elf for `f64`, and the Sprintz FIRE timestamp forecaster. Benchmark what-ifs only. |
 
 ---
 
@@ -904,8 +941,9 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   (`StorageEstimate.advisory_delta_cascade_value_bytes`, schema v15). It is **opt-in** — the
   cascade beats even FOR broadly, so folding it into the default selector is a headline change
   held for owner sign-off; the default codec choice is unchanged.
-- **Transposed (`FastLanes`-layout) value codec (opt-in)** — `VAL_CODEC_TRANSPOSED` stores a
-  `ScaledI64` column's mantissas **bit-plane-major** in 1024-lane tiles, so the decoder reads `u64`
+- **Bit-sliced (transposed) value codec (opt-in, `bitsliced-codec` build feature)** —
+  `VAL_CODEC_TRANSPOSED` stores a
+  `ScaledI64` column's mantissas **bit-plane-major** in 1024-value tiles, so the decoder reads `u64`
   plane words and walks only the *set* bits and a small-magnitude column's empty high bit-planes are
   skipped wholesale. It carries its **own** size function (`transposed_value_bytes`) and selector
   entry (`best_value_codec_transposed(max_overhead)`) rather than reusing the blocked figure, is
@@ -919,16 +957,20 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   byte-neutral and read-neutral here; it stays **opt-in** and the default codec choice is unchanged.
   Note the codec is chosen only when a *strict* size win or within the caller's overhead ceiling —
   the ceiling may legitimately be set below 1.0, because per-tile widths with one header per 1024
-  lanes can beat both a global width and the blocked codec's one-header-per-64.
+  values can beat both a global width and the blocked codec's one-header-per-64. It is a
+  bit-sliced layout, not the FastLanes layout (which keeps each value's bits together), and it
+  is compiled only with the `bitsliced-codec` feature, pending patent review; without it the
+  writer never selects it and reading a segment that uses it fails with an error naming the
+  feature.
 - **Block-level random access** — the fixed-layout value codecs support decoding a single value
   (or a sub-range) without materializing the whole column: `weftseg::read_value_at(bytes, i)`
   reads only the block covering row `i` (skipping earlier blocks by their headers) for the
   blocked/FOR codecs, reads bit `i * width` directly for the fixed-width bit-pack codec, and decodes
-  only the covering tile for the transposed codec — the point-lookup / late-materialization lever.
+  only the covering tile for the bit-sliced codec — the point-lookup / late-materialization lever.
   `weftseg::read_value_range(bytes, start, len)` is its **windowed** sibling: every fixed-layout codec
   locates a value by walking its block/tile headers from the start of the stream, so resolving a
   window one value at a time re-walks that chain per row. The range read does the decode **once**,
-  which is what keeps a windowed read on the 1024-lane transposed layout from costing a whole tile
+  which is what keeps a windowed read on the 1024-value-tile bit-sliced layout from costing a whole tile
   decode per row. `weftseg::read_segment_point(bytes, t)`
   wires this up to the framed single-block segment — it skips the value block by its framing,
   decodes only the timestamps to find the row, and unpacks the one covering value block — so a
@@ -1212,7 +1254,8 @@ What it does today:
   `_codec`) for a lossy `F64` column, and the **Sprintz FIRE** forecaster's
   footprint on the timestamp column (`advisory_fire_timestamp_bytes`) — each a
   *what-if* number the adopt-or-drop decision reads, never a realized headline
-  claim.
+  claim. These codecs live behind `weft-physical-type`'s `experimental-codecs`
+  feature, which only `weft-bench` enables.
 - **Reports** — a `BenchReport` JSON artifact (run metadata + a best-effort
   hardware probe: CPU model, cores, RAM) under `reports/json/`, plus a
   self-contained **HTML** view (`--html`) with the most-accurate row highlighted.
@@ -1376,4 +1419,27 @@ artifact.
 
 ## License
 
-Released under the [MIT License](LICENSE). Copyright © 2025 Justin Icenhour.
+Copyright (c) 2025-2026 Justin Icenhour.
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option.
+
+Two crates include code adapted from Apache-2.0 projects — the Chimp codecs in
+`weft-physical-type` and the DDSketch quantile sketch in `weft-reduce`. Those portions
+stay under the Apache License 2.0 whichever option you choose. [NOTICE](NOTICE) lists
+them, and each crate's `THIRD-PARTY-NOTICES` file carries the attribution and the
+license text.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for
+inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual
+licensed as above, without any additional terms or conditions.
+
+Every pull request also needs either a DCO sign-off on each commit or a signed CLA; see
+[Contribution terms](CONTRIBUTING.md#contribution-terms).

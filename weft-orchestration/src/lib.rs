@@ -887,31 +887,23 @@ pub async fn build_patterns_queue(database: &Database, aspect_id: &weftdb::Aspec
 ///
 /// Returns an error if:
 /// - Database operations fail (getting patterns, dequeuing patterns)
+/// - The dictionary is not registered yet and registering it fails, e.g. because its step
+///   interpolation is one splimes rejects
 /// - Pattern import fails during dictionary loading
 /// - Memory calculation fails
 pub async fn load_dictionary(database: &Database, aspect_id: &weftdb::AspectId, dictionary: &mut Dictionary) -> Result<()> {
-	// Check if dictionary metadata exists, create it if not
+	// Register the dictionary (its description, steps and variabilities) the first time the
+	// aspect sees it. A registration that exists but cannot be read, such as a stored step
+	// method splimes rejects, is reported and left for the user to repair: overwriting it
+	// would lose what was stored, and this dictionary still works from its own constraints.
 	match database.get_dictionary_metadata(aspect_id, dictionary.name()).await {
-		Ok(Some(_)) => {
-			// Dictionary metadata exists, proceed normally
-		}
+		Ok(Some(_)) => {}
 		Ok(None) => {
-			// Dictionary metadata doesn't exist, create it
-			let metadata = weftdb::DictionaryMetadata { id: DictionaryId::new(), name: dictionary.name().to_string(), description: dictionary.description().to_string(), constraints: dictionary.constraints().clone() };
-
-			// Store dictionary metadata
+			let metadata = weftdb::DictionaryMetadata { id: *dictionary.id(), name: dictionary.name().to_string(), description: dictionary.description().to_string(), constraints: dictionary.constraints().clone() };
 			database.set_dictionary_metadata(aspect_id, dictionary.name(), &metadata).await?;
 		}
 		Err(e) => {
-			// If dictionary metadata retrieval fails, try to create it anyway
-			tracing::warn!(error = %e, "Failed to check dictionary metadata, attempting to create");
-			let metadata = weftdb::DictionaryMetadata { id: DictionaryId::new(), name: dictionary.name().to_string(), description: dictionary.description().to_string(), constraints: dictionary.constraints().clone() };
-
-			// Try to store dictionary metadata - if this fails, the database might not support it yet
-			if let Err(store_err) = database.set_dictionary_metadata(aspect_id, dictionary.name(), &metadata).await {
-				tracing::warn!(error = %store_err, "Failed to store dictionary metadata");
-				tracing::warn!("Continuing without dictionary metadata (dictionary will still function)");
-			}
+			tracing::warn!(error = %e, dictionary = dictionary.name(), "Failed to read dictionary metadata; leaving the stored registration as it is");
 		}
 	}
 
@@ -2720,6 +2712,42 @@ mod tests {
 		}
 
 		tracing::info!("test_run_subject_pipelines completed successfully!");
+		Ok(())
+	}
+
+	/// `load_dictionary` registers a pipeline's dictionary once, with its steps and
+	/// variabilities. It used to store only a metadata row, which `get_dictionary_metadata`
+	/// never found, so every load (two per `Pipeline::extract_patterns`) added another row
+	/// and the dictionary's constraints were never stored.
+	#[tokio::test]
+	async fn load_dictionary_registers_a_dictionary_once() -> Result<()> {
+		let db_name = format!("load_dictionary_{}", uuid::Uuid::new_v4());
+		let db = Database::new(&db_name).await?;
+		let subject = db.observe_subject("subject").await?;
+		let aspect = db.track_aspect(&subject.id(), "aspect", &Resolution::Seconds, None).await?;
+		let constraints = DictionaryConstraints::new(Some(Steps::new(10, Spline::Linear)), Some(vec![VariablilityType::AveragePercentile(Variability::new(BigDecimal::from_f64(0.25).unwrap()))]));
+		let mut dictionary = Dictionary::new("pipeline".to_string(), "a pipeline dictionary".to_string(), constraints);
+
+		for _ in 0..3 {
+			load_dictionary(&db, &aspect.id(), &mut dictionary).await?;
+		}
+
+		let stored = db.get_dictionary_metadata(&aspect.id(), "pipeline").await?.expect("the dictionary is registered");
+		assert_eq!((stored.id, stored.description.as_str()), (*dictionary.id(), "a pipeline dictionary"));
+		let steps = stored.constraints.steps().as_ref().expect("stored steps");
+		assert_eq!((steps.count(), *steps.interpolation()), (10, Spline::Linear));
+		let variabilities = stored.constraints.variabilities().as_ref().map(|v| v.iter().map(ToString::to_string).collect::<Vec<_>>());
+		assert_eq!(variabilities, Some(vec!["AveragePercentile(0.25)".to_string()]));
+
+		let conn = db.get_dictionary_db(&aspect.id(), "pipeline").await?.connect()?;
+		let mut rows = conn.query("SELECT COUNT(*) FROM dictionary_metadata", ()).await?;
+		let count = *rows.next().await?.expect("a count").get_value(0)?.as_integer().expect("an integer count");
+		assert_eq!(count, 1, "one metadata row after three loads");
+
+		let listed = db.list_dictionaries(&aspect.id()).await?;
+		assert_eq!(listed.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["pipeline"]);
+
+		std::fs::remove_dir_all(format!("{}/{db_name}", data_dir())).ok();
 		Ok(())
 	}
 }

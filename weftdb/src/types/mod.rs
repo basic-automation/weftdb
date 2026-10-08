@@ -1,5 +1,6 @@
 pub use aspect::{Aspect, AspectId};
 pub use aspect_catalog::AspectCatalog;
+pub use aspect_name::InvalidAspectName;
 pub use backup::{count_rows, remove_empty_sidecars, restore_control_plane, scan_rows, snapshot_and_verify, snapshot_with_verify, user_tables, vacuum_into, verify_snapshot, RestoreReport, SnapshotReport, VerifyMode, CONTROL_PLANE_FILES};
 pub use batches::{
 	batched_measurements::{analysis::Analysis, batched_distance::BatchDistance, BatchedMeasurement}, Batch, BatchId, BatchMetatdata, Batches
@@ -32,6 +33,7 @@ pub use trend::Trend;
 
 pub mod aspect;
 pub mod aspect_catalog;
+pub mod aspect_name;
 pub mod backup;
 pub mod batches;
 pub mod cache;
@@ -41,6 +43,7 @@ pub mod correlation;
 pub mod database;
 pub mod dataset;
 pub mod dictionary;
+pub mod durable;
 pub mod error;
 pub mod event;
 pub mod input_measurement;

@@ -26,8 +26,16 @@
 //! [`AspectSchema::seal_paged`] — the read path dispatches on the recorded frame
 //! version, so a paged segment skips pages *within* the file too. The
 //! catalog/`metadata.db` registry is a later slice.
+//!
+//! Aspect names become file names, so every method that takes one and declares, seals,
+//! reads or maintains it first checks it with [`aspect_name::validate`] and fails with an
+//! [`InvalidAspectName`](crate::InvalidAspectName) for a name that could point a path
+//! outside `segments/`. The path builder also checks that each frame path it returns is a
+//! direct child of `segments/`.
 
-use std::path::{Path, PathBuf};
+use std::{
+	ffi::OsStr, path::{Path, PathBuf}
+};
 
 use anyhow::{Context, Result};
 use bigdecimal::BigDecimal;
@@ -36,7 +44,7 @@ use splimes::{Point, Resolution};
 use weft_physical_type::{merge_newer_wins, split_index, AspectSchema, FrameOptions, PagedSegment, Segment, SegmentDescriptor, SplitDecision, SplitPolicy, TimeUnit, PAGED_SEGMENT_FORMAT_VERSION};
 use weft_reduce::{Aggregation, Bucket, PartialReduction};
 
-use crate::{AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, PartialSidecar, PartialSidecarPolicy, SegmentIndexStore, SIDECAR_AGGREGATIONS};
+use crate::{aspect_name, AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, PartialSidecar, PartialSidecarPolicy, SegmentIndexStore, SIDECAR_AGGREGATIONS};
 
 /// The `(database, subject)` namespace a [`SegmentStore`] opened with the plain
 /// [`open`](SegmentStore::open) constructor declares its aspect schemas under.
@@ -125,10 +133,10 @@ impl CheckpointPolicy {
 	}
 }
 
-/// When a freshly sealed segment writes its value column in the **transposed
-/// (`FastLanes`-layout) bit-plane-major** codec instead of the size-selected one.
+/// When a freshly sealed segment writes its value column in the **bit-sliced
+/// (bit-plane-major)** codec instead of the size-selected one.
 ///
-/// The transposed layout stores the same *code* as the linear bit-pack with its bits permuted,
+/// The bit-sliced layout stores the same *code* as the linear bit-pack with its bits permuted,
 /// so it never wins on size — it is a **decode-latency** trade. Its decoder reads `u64` plane
 /// words and walks only the set bits, so a small-magnitude column's empty high bit-planes are
 /// skipped wholesale (measured ~5.7x the linear per-block unpack at the primitive level,
@@ -142,6 +150,11 @@ impl CheckpointPolicy {
 /// same shape as [`CheckpointPolicy`]'s `max_codec_overhead` gate.
 ///
 /// Whether making this the default is owner-gated — it changes the headline bytes/point.
+///
+/// **Needs the `bitsliced-codec` cargo feature**, which is off by default and pending patent
+/// review. Without it the codec is not compiled in: [`from_env`](Self::from_env) logs a warning
+/// and returns [`DISABLED`](Self::DISABLED), any other policy is ignored by the frame writer,
+/// and reading a segment that uses the codec fails with an error naming the feature.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TransposedPolicy {
 	/// Ceiling on the transposed block's size overhead against the size-selected codec, or
@@ -156,11 +169,22 @@ impl TransposedPolicy {
 
 	/// Read the policy from `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` (absent, unparseable,
 	/// non-finite or non-positive → [`DISABLED`](Self::DISABLED)). A value **below 1.0 is
-	/// meaningful**: it adopts the transposed layout only where it is also a strict size win
-	/// (see [`ColumnEncoding::transposed_overhead`](weft_physical_type::ColumnEncoding::transposed_overhead)).
+	/// meaningful**: it adopts the bit-sliced layout only where it is also a strict size win
+	/// (see `weft_physical_type::ColumnEncoding::transposed_overhead`).
+	///
+	/// Without the `bitsliced-codec` feature a set variable is ignored, with one warning per
+	/// process, and the result is always [`DISABLED`](Self::DISABLED).
 	#[must_use]
 	pub fn from_env() -> Self {
-		Self { max_overhead: std::env::var("WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|r| r.is_finite() && *r > 0.0) }
+		let raw = std::env::var("WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD").ok();
+		if !cfg!(feature = "bitsliced-codec") {
+			if raw.is_some() {
+				static WARNED: std::sync::Once = std::sync::Once::new();
+				WARNED.call_once(|| tracing::warn!("WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD is set, but this build does not include the bit-sliced value codec (cargo feature `bitsliced-codec`); ignoring it"));
+			}
+			return Self::DISABLED;
+		}
+		Self { max_overhead: raw.and_then(|v| v.trim().parse::<f64>().ok()).filter(|r| r.is_finite() && *r > 0.0) }
 	}
 }
 
@@ -210,6 +234,26 @@ fn segment_partial(descriptor: &SegmentDescriptor, bytes: &[u8], start: i64, end
 /// (it has nothing to serve and no sidecar anyway).
 fn window_covers_segment(descriptor: &SegmentDescriptor, start: i64, end: i64) -> bool {
 	descriptor.min_ts.zip(descriptor.max_ts).is_some_and(|(min_ts, max_ts)| start <= min_ts && max_ts <= end)
+}
+
+/// Join `file_name` onto `dir`, refusing a result that is not a file directly inside
+/// `dir`.
+///
+/// Frame names come from aspect names, which [`aspect_name::validate`] already keeps free
+/// of separators and dot segments. This is the second line of defence: whatever the name,
+/// the store never writes, reads or deletes a frame anywhere but its own `segments/`
+/// directory.
+///
+/// # Errors
+///
+/// When the joined path's parent is not `dir`, or its last component is not `file_name`
+/// (an absolute or drive-prefixed name replaces `dir`; a `..` or a separator moves it).
+fn contained_file(dir: &Path, file_name: &str) -> Result<PathBuf> {
+	let path = dir.join(file_name);
+	if path.parent() != Some(dir) || path.file_name() != Some(OsStr::new(file_name)) {
+		anyhow::bail!("refusing segment file {}: it is not directly inside {}", path.display(), dir.display());
+	}
+	Ok(path)
 }
 
 pub struct SegmentStore {
@@ -463,10 +507,16 @@ impl SegmentStore {
 	/// [`seal_declared`](SegmentStore::seal_declared) calls need not be handed the
 	/// schema. Idempotent on the aspect (a re-declaration overwrites).
 	///
+	/// The name also names the aspect's segment files, so it must pass
+	/// [`aspect_name::validate`] (no path separators, no leading `.`, no control
+	/// characters, …); a name that does not is refused before anything is written.
+	///
 	/// # Errors
 	///
-	/// Propagates any libSQL write failure.
+	/// An [`InvalidAspectName`](crate::InvalidAspectName) when `aspect` is not a valid
+	/// name; otherwise propagates any libSQL write failure.
 	pub async fn declare(&self, aspect: &str, schema: &AspectSchema) -> Result<()> {
+		aspect_name::validate(aspect)?;
 		self.catalog.declare(&self.database, &self.subject, aspect, schema).await
 	}
 
@@ -586,6 +636,7 @@ impl SegmentStore {
 	/// Write a freshly sealed segment to disk and record its descriptor. Shared by
 	/// the dense and nullable seal paths.
 	async fn persist(&self, aspect: &str, segment: &Segment) -> Result<SegmentDescriptor> {
+		aspect_name::validate(aspect)?;
 		let id = self.index.next_id(aspect).await?;
 		// Both opt-in layouts are applied here: the timestamp checkpoint index only when
 		// configured AND the segment's shape actually benefits (sorted + irregular + big
@@ -593,7 +644,7 @@ impl SegmentStore {
 		// ceiling. With neither configured this writes the historical frame byte-for-byte, and
 		// every combination reads identically.
 		let bytes = segment.write_to_with(&self.frame_options(segment.stats.row_count, segment.benefits_from_checkpoints(), segment.checkpoint_codec_overhead()));
-		let path = self.segment_path(aspect, id);
+		let path = self.segment_path(aspect, id)?;
 		tokio::fs::write(&path, &bytes).await.with_context(|| format!("writing segment {}", path.display()))?;
 		let descriptor = SegmentDescriptor::of_segment(id, path.to_string_lossy().into_owned(), bytes.len() as u64, segment);
 		self.index.insert(aspect, &descriptor).await?;
@@ -612,11 +663,12 @@ impl SegmentStore {
 	/// Write a freshly sealed **paged** segment to disk (format-version-3 frame) and
 	/// record its descriptor. The paged analogue of [`persist`](SegmentStore::persist).
 	async fn persist_paged(&self, aspect: &str, segment: &PagedSegment) -> Result<SegmentDescriptor> {
+		aspect_name::validate(aspect)?;
 		let id = self.index.next_id(aspect).await?;
 		// As `persist`, though the checkpoint win is far smaller here — page pruning already
 		// bounds a probe's decode to `rows_per_page`.
 		let bytes = segment.write_to_with(&self.frame_options(segment.stats.row_count, segment.benefits_from_checkpoints(), segment.checkpoint_codec_overhead()));
-		let path = self.segment_path(aspect, id);
+		let path = self.segment_path(aspect, id)?;
 		tokio::fs::write(&path, &bytes).await.with_context(|| format!("writing segment {}", path.display()))?;
 		let descriptor = SegmentDescriptor::of_paged_segment(id, path.to_string_lossy().into_owned(), bytes.len() as u64, segment);
 		self.index.insert(aspect, &descriptor).await?;
@@ -632,14 +684,35 @@ impl SegmentStore {
 	}
 
 	/// The on-disk path a freshly sealed segment of the given `aspect`/`id` takes.
-	fn segment_path(&self, aspect: &str, id: u64) -> PathBuf {
-		self.root.join("segments").join(format!("{aspect}-{id}.weftseg"))
+	///
+	/// # Errors
+	///
+	/// As [`frame_path`](Self::frame_path).
+	fn segment_path(&self, aspect: &str, id: u64) -> Result<PathBuf> {
+		self.frame_path(aspect, id, "weftseg")
 	}
 
 	/// The on-disk path of the partial-reduction sidecar beside an `aspect`/`id` segment
 	/// (`{aspect}-{id}.weftpart`, alongside the `.weftseg`).
-	fn sidecar_path(&self, aspect: &str, id: u64) -> PathBuf {
-		self.root.join("segments").join(format!("{aspect}-{id}.weftpart"))
+	///
+	/// # Errors
+	///
+	/// As [`frame_path`](Self::frame_path).
+	fn sidecar_path(&self, aspect: &str, id: u64) -> Result<PathBuf> {
+		self.frame_path(aspect, id, "weftpart")
+	}
+
+	/// The path of the `{aspect}-{id}.{extension}` file under `segments/`: the one place
+	/// an aspect name becomes a path.
+	///
+	/// # Errors
+	///
+	/// An [`InvalidAspectName`](crate::InvalidAspectName) when `aspect` fails
+	/// [`aspect_name::validate`], or an error when the joined path is somehow not a
+	/// direct child of `segments/` (defence in depth behind the name check).
+	fn frame_path(&self, aspect: &str, id: u64, extension: &str) -> Result<PathBuf> {
+		aspect_name::validate(aspect)?;
+		contained_file(&self.root.join("segments"), &format!("{aspect}-{id}.{extension}"))
 	}
 
 	/// Materialize a per-segment partial-reduction sidecar for a just-sealed segment, when
@@ -668,7 +741,7 @@ impl SegmentStore {
 		// tier below), so a coarse downsample folds a coarse tier rather than the whole base.
 		let sidecar = PartialSidecar::materialize(base, descriptor, partial, &self.partials.tiers()).map_err(|e| anyhow::anyhow!("building rollup tiers for segment {}: {e}", descriptor.path))?;
 		let bytes = sidecar.to_bytes()?;
-		let path = self.sidecar_path(aspect, descriptor.id);
+		let path = self.sidecar_path(aspect, descriptor.id)?;
 		tokio::fs::write(&path, &bytes).await.with_context(|| format!("writing partial sidecar {}", path.display()))?;
 		Ok(())
 	}
@@ -683,7 +756,7 @@ impl SegmentStore {
 	///
 	/// Propagates a filesystem read error other than "not found".
 	pub async fn load_partial_sidecar(&self, aspect: &str, descriptor: &SegmentDescriptor) -> Result<Option<PartialSidecar>> {
-		let path = self.sidecar_path(aspect, descriptor.id);
+		let path = self.sidecar_path(aspect, descriptor.id)?;
 		let bytes = match tokio::fs::read(&path).await {
 			Ok(bytes) => bytes,
 			Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -703,7 +776,7 @@ impl SegmentStore {
 	///
 	/// Propagates a filesystem error other than "not found".
 	async fn remove_sidecar(&self, aspect: &str, id: u64) -> Result<()> {
-		let path = self.sidecar_path(aspect, id);
+		let path = self.sidecar_path(aspect, id)?;
 		match tokio::fs::remove_file(&path).await {
 			Ok(()) => Ok(()),
 			Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -742,6 +815,7 @@ impl SegmentStore {
 	/// Propagates a libSQL prune failure, a filesystem read error, or a
 	/// [`weft_physical_type::weftseg::WeftSegError`] for a corrupt/unreadable `.weftseg`.
 	pub async fn read_time_range(&self, aspect: &str, start: i64, end: i64) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>)> {
+		aspect_name::validate(aspect)?;
 		let descriptors = self.index.prune_by_time(aspect, start, end).await?;
 		let mut timestamps = Vec::new();
 		let mut values = Vec::new();
@@ -784,6 +858,7 @@ impl SegmentStore {
 	/// stored epoch falls outside the representable instant range, or if the reduction
 	/// fails.
 	pub async fn downsample_range(&self, aspect: &str, start: i64, end: i64, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Vec<Bucket>> {
+		aspect_name::validate(aspect)?;
 		let schema = self.require_schema(aspect).await?;
 		let descriptors = self.index.prune_by_time(aspect, start, end).await?;
 
@@ -877,6 +952,7 @@ impl SegmentStore {
 	/// Propagates a libSQL prune failure, a filesystem read error, or a
 	/// [`weft_physical_type::weftseg::WeftSegError`] for a corrupt/unreadable `.weftseg`.
 	pub async fn read_point(&self, aspect: &str, t: i64) -> Result<Option<BigDecimal>> {
+		aspect_name::validate(aspect)?;
 		let descriptors = self.index.prune_by_time(aspect, t, t).await?;
 		let mut found = None;
 		for descriptor in &descriptors {
@@ -910,6 +986,7 @@ impl SegmentStore {
 	/// Propagates a libSQL prune failure, a filesystem read error, or a
 	/// [`weft_physical_type::weftseg::WeftSegError`] for a corrupt/unreadable `.weftseg`.
 	pub async fn read_points(&self, aspect: &str, ts: &[i64]) -> Result<Vec<Option<BigDecimal>>> {
+		aspect_name::validate(aspect)?;
 		if ts.is_empty() {
 			return Ok(Vec::new());
 		}
@@ -954,6 +1031,7 @@ impl SegmentStore {
 	/// Returns an error if `aspect` has no declared schema or no segment `id`;
 	/// propagates a filesystem/read error, a re-seal failure, or a libSQL failure.
 	pub async fn reconcile_segment(&self, aspect: &str, id: u64) -> Result<bool> {
+		aspect_name::validate(aspect)?;
 		let descriptor = self.index.all(aspect).await?.into_iter().find(|d| d.id == id).ok_or_else(|| anyhow::anyhow!("aspect {aspect:?} has no segment {id}"))?;
 		if descriptor.time_sorted {
 			return Ok(false);
@@ -976,7 +1054,7 @@ impl SegmentStore {
 		rows.sort_by_key(|(t, _)| *t);
 		let (sorted_ts, sorted_vs): (Vec<i64>, Vec<Option<BigDecimal>>) = rows.into_iter().unzip();
 		// Re-seal the sorted rows in the original frame kind, to the same id/file.
-		let path = self.segment_path(aspect, id);
+		let path = self.segment_path(aspect, id)?;
 		let new_descriptor = if let Some(rows_per_page) = rows_per_page {
 			let segment = schema.seal_paged_nullable(&sorted_ts, &sorted_vs, rows_per_page).map_err(|e| anyhow::anyhow!("re-seal failed: {e}"))?;
 			let new_bytes = segment.write_to();
@@ -1008,7 +1086,7 @@ impl SegmentStore {
 	/// materialized rollup — a caller that changes the segment set rebuilds it once at
 	/// the end.
 	async fn reseal_nullable_at(&self, aspect: &str, schema: &AspectSchema, id: u64, timestamps: &[i64], values: &[Option<BigDecimal>], rows_per_page: Option<usize>) -> Result<SegmentDescriptor> {
-		let path = self.segment_path(aspect, id);
+		let path = self.segment_path(aspect, id)?;
 		let descriptor = if let Some(rows_per_page) = rows_per_page {
 			let segment = schema.seal_paged_nullable(timestamps, values, rows_per_page).map_err(|e| anyhow::anyhow!("split re-seal failed: {e}"))?;
 			let new_bytes = segment.write_to();
@@ -1062,6 +1140,7 @@ impl SegmentStore {
 	/// the [`split_index`] precondition holds), or propagates a filesystem/decode/re-seal/
 	/// libSQL failure.
 	pub async fn split_segment(&self, aspect: &str, id: u64, boundary: i64) -> Result<Option<u64>> {
+		aspect_name::validate(aspect)?;
 		let descriptor = self.index.all(aspect).await?.into_iter().find(|d| d.id == id).ok_or_else(|| anyhow::anyhow!("aspect {aspect:?} has no segment {id}"))?;
 		if !descriptor.time_sorted {
 			return Err(anyhow::anyhow!("segment {id} of aspect {aspect:?} is out of order; reconcile it before splitting"));
@@ -1110,6 +1189,7 @@ impl SegmentStore {
 	///
 	/// As [`reconcile_segment`](SegmentStore::reconcile_segment).
 	pub async fn reconcile_aspect(&self, aspect: &str) -> Result<usize> {
+		aspect_name::validate(aspect)?;
 		let unsorted_ids: Vec<u64> = self.index.all(aspect).await?.into_iter().filter(|d| !d.time_sorted).map(|d| d.id).collect();
 		let mut reconciled = 0;
 		for id in unsorted_ids {
@@ -1150,6 +1230,7 @@ impl SegmentStore {
 	/// As [`reconcile_aspect`](SegmentStore::reconcile_aspect); also propagates the
 	/// index read behind the backlog count.
 	pub async fn reconcile_aspect_if_unsorted_exceeds(&self, aspect: &str, threshold: usize) -> Result<Option<usize>> {
+		aspect_name::validate(aspect)?;
 		let threshold = threshold.max(1);
 		let unsorted = self.index.load_index(aspect).await?.unsorted_count();
 		if unsorted < threshold {
@@ -1170,17 +1251,25 @@ impl SegmentStore {
 	/// [`ReconcileSweep`] summary — how many aspects were scanned, how many fired, and
 	/// the total segments rewritten — the numbers a daemon logs and exports per tick.
 	///
+	/// A per-aspect failure (as [`reconcile_aspect_if_unsorted_exceeds`](SegmentStore::reconcile_aspect_if_unsorted_exceeds))
+	/// is recorded in [`ReconcileSweep::failed`] and the sweep continues with the next
+	/// aspect, so one bad aspect cannot stall maintenance of every aspect after it.
+	///
 	/// # Errors
 	///
-	/// As [`reconcile_aspect_if_unsorted_exceeds`](SegmentStore::reconcile_aspect_if_unsorted_exceeds);
-	/// also propagates the aspect-list read.
+	/// Propagates only the aspect-list read; per-aspect failures are reported in
+	/// [`ReconcileSweep::failed`].
 	pub async fn reconcile_all_over_threshold(&self, threshold: usize) -> Result<ReconcileSweep> {
 		let aspects = self.list_declared_aspects().await?;
 		let mut sweep = ReconcileSweep { aspects_scanned: aspects.len(), ..ReconcileSweep::default() };
 		for aspect in &aspects {
-			if let Some(reconciled) = self.reconcile_aspect_if_unsorted_exceeds(aspect, threshold).await? {
-				sweep.aspects_reconciled += 1;
-				sweep.segments_reconciled += reconciled;
+			match self.reconcile_aspect_if_unsorted_exceeds(aspect, threshold).await {
+				Ok(Some(reconciled)) => {
+					sweep.aspects_reconciled += 1;
+					sweep.segments_reconciled += reconciled;
+				}
+				Ok(None) => {}
+				Err(err) => sweep.failed.push((aspect.clone(), err)),
 			}
 		}
 		Ok(sweep)
@@ -1218,6 +1307,7 @@ impl SegmentStore {
 	/// As [`reconcile_segment`](SegmentStore::reconcile_segment); also propagates the
 	/// index read behind the segment list.
 	pub async fn reconcile_aspect_hot_cold(&self, aspect: &str, threshold: usize) -> Result<HotColdReconcile> {
+		aspect_name::validate(aspect)?;
 		let threshold = threshold.max(1);
 		let descriptors = self.index.all(aspect).await?;
 		let hot_tail_id = descriptors.iter().map(|d| d.id).max();
@@ -1251,19 +1341,25 @@ impl SegmentStore {
 	/// Returns a [`HotColdSweep`] — aspects scanned, aspects that rewrote at least one
 	/// segment, and the cold/hot rewrite split — the numbers a daemon logs and exports.
 	///
+	/// A per-aspect failure (as [`reconcile_aspect_hot_cold`](SegmentStore::reconcile_aspect_hot_cold))
+	/// is recorded in [`HotColdSweep::failed`] and the sweep continues with the next aspect.
+	///
 	/// # Errors
 	///
-	/// As [`reconcile_aspect_hot_cold`](SegmentStore::reconcile_aspect_hot_cold); also
-	/// propagates the aspect-list read.
+	/// Propagates only the aspect-list read; per-aspect failures are reported in
+	/// [`HotColdSweep::failed`].
 	pub async fn reconcile_all_hot_cold(&self, threshold: usize) -> Result<HotColdSweep> {
 		let aspects = self.list_declared_aspects().await?;
 		let mut sweep = HotColdSweep { aspects_scanned: aspects.len(), ..HotColdSweep::default() };
 		for aspect in &aspects {
-			let outcome = self.reconcile_aspect_hot_cold(aspect, threshold).await?;
-			if outcome.total() > 0 {
-				sweep.aspects_reconciled += 1;
-				sweep.cold_reconciled += outcome.cold_reconciled;
-				sweep.hot_reconciled += outcome.hot_reconciled;
+			match self.reconcile_aspect_hot_cold(aspect, threshold).await {
+				Ok(outcome) if outcome.total() > 0 => {
+					sweep.aspects_reconciled += 1;
+					sweep.cold_reconciled += outcome.cold_reconciled;
+					sweep.hot_reconciled += outcome.hot_reconciled;
+				}
+				Ok(_) => {}
+				Err(err) => sweep.failed.push((aspect.clone(), err)),
 			}
 		}
 		Ok(sweep)
@@ -1348,6 +1444,7 @@ impl SegmentStore {
 	///
 	/// As [`reconcile_overlaps`](SegmentStore::reconcile_overlaps).
 	pub async fn reconcile_overlaps_with_policy(&self, aspect: &str, policy: SplitPolicy) -> Result<usize> {
+		aspect_name::validate(aspect)?;
 		let descriptors = self.index.all(aspect).await?;
 		// Components of transitively time-overlapping segments: sort spans by (min_ts,
 		// max_ts), sweep, and start a new component whenever a span begins after the
@@ -1423,7 +1520,7 @@ impl SegmentStore {
 			// Drop the other members: control-plane row then the file (and its sidecar).
 			for &id in component.iter().skip(1) {
 				self.index.delete(aspect, id).await?;
-				let victim = self.segment_path(aspect, id);
+				let victim = self.segment_path(aspect, id)?;
 				tokio::fs::remove_file(&victim).await.with_context(|| format!("removing merged-away segment {}", victim.display()))?;
 				// A merged-away segment's sidecar is now orphaned — drop it too.
 				self.remove_sidecar(aspect, id).await?;
@@ -1449,18 +1546,24 @@ impl SegmentStore {
 	/// aspects were scanned, how many actually merged anything, and the total segments
 	/// removed — the numbers a daemon logs and exports.
 	///
+	/// A per-aspect failure (as [`reconcile_overlaps`](SegmentStore::reconcile_overlaps))
+	/// is recorded in [`OverlapSweep::failed`] and the sweep continues with the next aspect.
+	///
 	/// # Errors
 	///
-	/// As [`reconcile_overlaps`](SegmentStore::reconcile_overlaps); also propagates the
-	/// aspect-list read.
+	/// Propagates only the aspect-list read; per-aspect failures are reported in
+	/// [`OverlapSweep::failed`].
 	pub async fn reconcile_all_overlaps(&self) -> Result<OverlapSweep> {
 		let aspects = self.list_declared_aspects().await?;
 		let mut sweep = OverlapSweep { aspects_scanned: aspects.len(), ..OverlapSweep::default() };
 		for aspect in &aspects {
-			let removed = self.reconcile_overlaps(aspect).await?;
-			if removed > 0 {
-				sweep.aspects_reconciled += 1;
-				sweep.segments_removed += removed;
+			match self.reconcile_overlaps(aspect).await {
+				Ok(removed) if removed > 0 => {
+					sweep.aspects_reconciled += 1;
+					sweep.segments_removed += removed;
+				}
+				Ok(_) => {}
+				Err(err) => sweep.failed.push((aspect.clone(), err)),
 			}
 		}
 		Ok(sweep)
@@ -1482,6 +1585,9 @@ impl SegmentStore {
 	/// [`reconcile_all_overlaps`](SegmentStore::reconcile_all_overlaps), since there
 	/// overlap-present ⟺ a segment is removed.
 	///
+	/// A per-aspect failure (the pre-pass overlap read or the merge itself) is recorded in
+	/// [`OverlapSweep::failed`] and the sweep continues with the next aspect.
+	///
 	/// # Errors
 	///
 	/// As [`reconcile_all_overlaps`](SegmentStore::reconcile_all_overlaps).
@@ -1489,11 +1595,18 @@ impl SegmentStore {
 		let aspects = self.list_declared_aspects().await?;
 		let mut sweep = OverlapSweep { aspects_scanned: aspects.len(), ..OverlapSweep::default() };
 		for aspect in &aspects {
-			let had_overlap = self.index.load_index(aspect).await?.overlapping_count() > 0;
-			let removed = self.reconcile_overlaps_with_policy(aspect, policy).await?;
-			if had_overlap {
-				sweep.aspects_reconciled += 1;
-				sweep.segments_removed += removed;
+			let pass = async {
+				let had_overlap = self.index.load_index(aspect).await?.overlapping_count() > 0;
+				let removed = self.reconcile_overlaps_with_policy(aspect, policy).await?;
+				anyhow::Ok((had_overlap, removed))
+			};
+			match pass.await {
+				Ok((true, removed)) => {
+					sweep.aspects_reconciled += 1;
+					sweep.segments_removed += removed;
+				}
+				Ok((false, _)) => {}
+				Err(err) => sweep.failed.push((aspect.clone(), err)),
 			}
 		}
 		Ok(sweep)
@@ -1522,6 +1635,7 @@ impl SegmentStore {
 	/// Returns an error if `aspect` has no declared schema; propagates a filesystem
 	/// read/write error, a decode/re-seal failure, or a libSQL failure.
 	pub async fn squash_aspect(&self, aspect: &str) -> Result<usize> {
+		aspect_name::validate(aspect)?;
 		let descriptors = self.index.all(aspect).await?;
 		if descriptors.len() < 2 {
 			return Ok(0);
@@ -1543,7 +1657,7 @@ impl SegmentStore {
 		self.reseal_nullable_at(aspect, &schema, target, &all_ts, &all_vs, None).await?;
 		for &id in ids.iter().skip(1) {
 			self.index.delete(aspect, id).await?;
-			let victim = self.segment_path(aspect, id);
+			let victim = self.segment_path(aspect, id)?;
 			tokio::fs::remove_file(&victim).await.with_context(|| format!("removing squashed-away segment {}", victim.display()))?;
 			// The squashed-away segment's sidecar is now orphaned — drop it too.
 			self.remove_sidecar(aspect, id).await?;
@@ -1571,6 +1685,7 @@ impl SegmentStore {
 	///
 	/// As [`squash_aspect`](SegmentStore::squash_aspect); also propagates the segment-count read.
 	pub async fn squash_aspect_if_exceeds(&self, aspect: &str, max_segments: usize) -> Result<Option<usize>> {
+		aspect_name::validate(aspect)?;
 		let max_segments = max_segments.max(1);
 		if self.index.count(aspect).await? <= max_segments {
 			return Ok(None);
@@ -1589,17 +1704,24 @@ impl SegmentStore {
 	/// order; a `max_segments` of 0 clamps to 1. Returns a [`SquashSweep`] — how many
 	/// aspects were scanned, how many were squashed, and the total segments removed.
 	///
+	/// A per-aspect failure (as [`squash_aspect_if_exceeds`](SegmentStore::squash_aspect_if_exceeds))
+	/// is recorded in [`SquashSweep::failed`] and the sweep continues with the next aspect.
+	///
 	/// # Errors
 	///
-	/// As [`squash_aspect_if_exceeds`](SegmentStore::squash_aspect_if_exceeds); also
-	/// propagates the aspect-list read.
+	/// Propagates only the aspect-list read; per-aspect failures are reported in
+	/// [`SquashSweep::failed`].
 	pub async fn squash_all_over_threshold(&self, max_segments: usize) -> Result<SquashSweep> {
 		let aspects = self.list_declared_aspects().await?;
 		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
 		for aspect in &aspects {
-			if let Some(removed) = self.squash_aspect_if_exceeds(aspect, max_segments).await? {
-				sweep.aspects_squashed += 1;
-				sweep.segments_removed += removed;
+			match self.squash_aspect_if_exceeds(aspect, max_segments).await {
+				Ok(Some(removed)) => {
+					sweep.aspects_squashed += 1;
+					sweep.segments_removed += removed;
+				}
+				Ok(None) => {}
+				Err(err) => sweep.failed.push((aspect.clone(), err)),
 			}
 		}
 		Ok(sweep)
@@ -1633,6 +1755,7 @@ impl SegmentStore {
 	///
 	/// As [`squash_aspect`](SegmentStore::squash_aspect).
 	pub async fn squash_aspect_to_target_rows(&self, aspect: &str, target_rows: usize) -> Result<usize> {
+		aspect_name::validate(aspect)?;
 		let target_rows = target_rows.max(1);
 		let descriptors = self.index.all(aspect).await?;
 		if descriptors.len() < 2 {
@@ -1678,7 +1801,7 @@ impl SegmentStore {
 			self.reseal_nullable_at(aspect, &schema, target, &all_ts, &all_vs, None).await?;
 			for &id in group.iter().skip(1) {
 				self.index.delete(aspect, id).await?;
-				let victim = self.segment_path(aspect, id);
+				let victim = self.segment_path(aspect, id)?;
 				tokio::fs::remove_file(&victim).await.with_context(|| format!("removing compacted-away segment {}", victim.display()))?;
 				self.remove_sidecar(aspect, id).await?;
 				removed += 1;
@@ -1703,18 +1826,24 @@ impl SegmentStore {
 	/// order. Returns a [`SquashSweep`]: how many aspects were scanned, how many actually
 	/// coalesced at least one segment, and the total segments removed.
 	///
+	/// A per-aspect failure (as [`squash_aspect_to_target_rows`](SegmentStore::squash_aspect_to_target_rows))
+	/// is recorded in [`SquashSweep::failed`] and the sweep continues with the next aspect.
+	///
 	/// # Errors
 	///
-	/// As [`squash_aspect_to_target_rows`](SegmentStore::squash_aspect_to_target_rows); also
-	/// propagates the aspect-list read.
+	/// Propagates only the aspect-list read; per-aspect failures are reported in
+	/// [`SquashSweep::failed`].
 	pub async fn squash_all_to_target_rows(&self, target_rows: usize) -> Result<SquashSweep> {
 		let aspects = self.list_declared_aspects().await?;
 		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
 		for aspect in &aspects {
-			let removed = self.squash_aspect_to_target_rows(aspect, target_rows).await?;
-			if removed > 0 {
-				sweep.aspects_squashed += 1;
-				sweep.segments_removed += removed;
+			match self.squash_aspect_to_target_rows(aspect, target_rows).await {
+				Ok(removed) if removed > 0 => {
+					sweep.aspects_squashed += 1;
+					sweep.segments_removed += removed;
+				}
+				Ok(_) => {}
+				Err(err) => sweep.failed.push((aspect.clone(), err)),
 			}
 		}
 		Ok(sweep)
@@ -1740,6 +1869,7 @@ impl SegmentStore {
 	/// As [`squash_aspect_to_target_rows`](SegmentStore::squash_aspect_to_target_rows); also
 	/// propagates the rollup read.
 	pub async fn squash_aspect_to_target_rows_if_fragmented(&self, aspect: &str, target_rows: usize) -> Result<Option<usize>> {
+		aspect_name::validate(aspect)?;
 		let target_rows = target_rows.max(1);
 		let Some(meta) = self.metadata.get(aspect).await? else { return Ok(None) };
 		// Minimum segments to hold total_rows at the target; a fully-compacted aspect sits at
@@ -1761,19 +1891,24 @@ impl SegmentStore {
 	/// caller wants), this skips aspects already at or below their ideal segment count.
 	/// Returns a [`SquashSweep`].
 	///
+	/// A per-aspect failure (as [`squash_aspect_to_target_rows_if_fragmented`](SegmentStore::squash_aspect_to_target_rows_if_fragmented))
+	/// is recorded in [`SquashSweep::failed`] and the sweep continues with the next aspect.
+	///
 	/// # Errors
 	///
-	/// As [`squash_aspect_to_target_rows_if_fragmented`](SegmentStore::squash_aspect_to_target_rows_if_fragmented);
-	/// also propagates the aspect-list read.
+	/// Propagates only the aspect-list read; per-aspect failures are reported in
+	/// [`SquashSweep::failed`].
 	pub async fn squash_all_to_target_rows_if_fragmented(&self, target_rows: usize) -> Result<SquashSweep> {
 		let aspects = self.list_declared_aspects().await?;
 		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
 		for aspect in &aspects {
-			if let Some(removed) = self.squash_aspect_to_target_rows_if_fragmented(aspect, target_rows).await? {
-				if removed > 0 {
+			match self.squash_aspect_to_target_rows_if_fragmented(aspect, target_rows).await {
+				Ok(Some(removed)) if removed > 0 => {
 					sweep.aspects_squashed += 1;
 					sweep.segments_removed += removed;
 				}
+				Ok(_) => {}
+				Err(err) => sweep.failed.push((aspect.clone(), err)),
 			}
 		}
 		Ok(sweep)
@@ -1795,6 +1930,7 @@ impl SegmentStore {
 	/// Propagates a libSQL read failure, a filesystem read error, or a
 	/// [`weft_physical_type::weftseg::WeftSegError`] for a corrupt/unreadable `.weftseg`.
 	pub async fn read_value_range(&self, aspect: &str, lo: &BigDecimal, hi: &BigDecimal) -> Result<(Vec<i64>, Vec<BigDecimal>)> {
+		aspect_name::validate(aspect)?;
 		let index = self.index.load_index(aspect).await?;
 		let mut timestamps = Vec::new();
 		let mut values = Vec::new();
@@ -1969,7 +2105,10 @@ impl SegmentStore {
 /// The outcome of a store-wide threshold reconcile sweep, returned by
 /// [`SegmentStore::reconcile_all_over_threshold`] — the per-tick numbers an
 /// automatic background reconcile daemon logs and exports.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// Not `Clone`/`PartialEq`: [`failed`](Self::failed) carries the per-aspect
+/// [`anyhow::Error`]s, which are neither.
+#[derive(Debug, Default)]
 pub struct ReconcileSweep {
 	/// Number of declared aspects the sweep visited.
 	pub aspects_scanned: usize,
@@ -1978,6 +2117,13 @@ pub struct ReconcileSweep {
 	pub aspects_reconciled: usize,
 	/// Total out-of-order segments rewritten sorted across every reconciled aspect.
 	pub segments_reconciled: usize,
+	/// Aspects whose pass failed, each with its error, in visit (declared-name) order.
+	/// The sweep records the failure and moves on, so one unreadable aspect (a torn or
+	/// truncated frame, a transient I/O error) cannot stop maintenance of every aspect
+	/// after it in name order. Empty when every aspect succeeded. A failed aspect counts
+	/// only toward `aspects_scanned`, even if its pass rewrote some segments before the
+	/// error.
+	pub failed: Vec<(String, anyhow::Error)>,
 }
 
 /// The cold-vs-hot split of a hot/cold reconcile pass over one aspect, returned by
@@ -2004,7 +2150,10 @@ impl HotColdReconcile {
 /// The outcome of a store-wide hot/cold reconcile sweep, returned by
 /// [`SegmentStore::reconcile_all_hot_cold`] — the per-tick numbers a background
 /// reconcile daemon in hot/cold mode logs and exports.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// Not `Clone`/`PartialEq`: [`failed`](Self::failed) carries the per-aspect
+/// [`anyhow::Error`]s, which are neither.
+#[derive(Debug, Default)]
 pub struct HotColdSweep {
 	/// Number of declared aspects the sweep visited.
 	pub aspects_scanned: usize,
@@ -2014,6 +2163,13 @@ pub struct HotColdSweep {
 	pub cold_reconciled: usize,
 	/// Total hot-tail segments rewritten across every aspect.
 	pub hot_reconciled: usize,
+	/// Aspects whose pass failed, each with its error, in visit (declared-name) order.
+	/// The sweep records the failure and moves on, so one unreadable aspect (a torn or
+	/// truncated frame, a transient I/O error) cannot stop maintenance of every aspect
+	/// after it in name order. Empty when every aspect succeeded. A failed aspect counts
+	/// only toward `aspects_scanned`, even if its pass rewrote some segments before the
+	/// error.
+	pub failed: Vec<(String, anyhow::Error)>,
 }
 
 impl HotColdSweep {
@@ -2027,7 +2183,10 @@ impl HotColdSweep {
 /// The outcome of a store-wide cross-segment overlap merge sweep, returned by
 /// [`SegmentStore::reconcile_all_overlaps`] — the per-tick numbers a background
 /// reconcile daemon in overlaps mode logs and exports.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// Not `Clone`/`PartialEq`: [`failed`](Self::failed) carries the per-aspect
+/// [`anyhow::Error`]s, which are neither.
+#[derive(Debug, Default)]
 pub struct OverlapSweep {
 	/// Number of declared aspects the sweep visited.
 	pub aspects_scanned: usize,
@@ -2036,12 +2195,22 @@ pub struct OverlapSweep {
 	/// Total segments removed by merging across every aspect (sum of per-component
 	/// `members − 1`).
 	pub segments_removed: usize,
+	/// Aspects whose pass failed, each with its error, in visit (declared-name) order.
+	/// The sweep records the failure and moves on, so one unreadable aspect (a torn or
+	/// truncated frame, a transient I/O error) cannot stop maintenance of every aspect
+	/// after it in name order. Empty when every aspect succeeded. A failed aspect counts
+	/// only toward `aspects_scanned`, even if its pass rewrote some segments before the
+	/// error.
+	pub failed: Vec<(String, anyhow::Error)>,
 }
 
 /// The outcome of a store-wide squash sweep, returned by
 /// [`SegmentStore::squash_all_over_threshold`] — the per-tick numbers a background
 /// squash daemon logs and exports.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// Not `Clone`/`PartialEq`: [`failed`](Self::failed) carries the per-aspect
+/// [`anyhow::Error`]s, which are neither.
+#[derive(Debug, Default)]
 pub struct SquashSweep {
 	/// Number of declared aspects the sweep visited.
 	pub aspects_scanned: usize,
@@ -2051,6 +2220,13 @@ pub struct SquashSweep {
 	/// Total segments removed by squashing across every aspect (sum of per-aspect
 	/// `count − 1`).
 	pub segments_removed: usize,
+	/// Aspects whose pass failed, each with its error, in visit (declared-name) order.
+	/// The sweep records the failure and moves on, so one unreadable aspect (a torn or
+	/// truncated frame, a transient I/O error) cannot stop maintenance of every aspect
+	/// after it in name order. Empty when every aspect succeeded. A failed aspect counts
+	/// only toward `aspects_scanned`, even if its pass rewrote some segments before the
+	/// error.
+	pub failed: Vec<(String, anyhow::Error)>,
 }
 
 /// The outcome of a [`SegmentStore::backup_control_plane`] run: the verified snapshot of
@@ -2198,6 +2374,87 @@ mod tests {
 		let (rt, rv) = Segment::read_from(&on_disk).expect("decodes").decode();
 		assert_eq!(rt, ts);
 		assert_eq!(rv, vs);
+	}
+
+	/// Every `.weftseg`/`.weftpart` file anywhere under `dir`.
+	fn frames_under(dir: &Path) -> Vec<PathBuf> {
+		let mut found = Vec::new();
+		for entry in std::fs::read_dir(dir).expect("reads dir").map(|entry| entry.expect("dir entry")) {
+			let path = entry.path();
+			if path.is_dir() {
+				found.extend(frames_under(&path));
+			} else if path.extension().is_some_and(|ext| ext == "weftseg" || ext == "weftpart") {
+				found.push(path);
+			}
+		}
+		found
+	}
+
+	/// Regression: an aspect name is part of a frame's file name, so a name that leaves
+	/// `segments/` — a `..` traversal or an absolute path — must be refused by `declare` and
+	/// by every seal, and no frame may be written anywhere.
+	#[tokio::test]
+	async fn path_escaping_aspect_names_are_refused_and_write_nothing() {
+		let dir = TempDir::new().expect("tempdir");
+		let root = dir.path().join("store");
+		let store = SegmentStore::open(&root).await.expect("opens");
+		let absolute = dir.path().join("abs").to_string_lossy().into_owned();
+		for name in ["../x", "../../x", absolute.as_str()] {
+			assert!(store.declare(name, &schema()).await.is_err(), "declare({name:?}) must be refused");
+			assert!(store.seal(name, &schema(), &[0, 10], &[bd("1"), bd("2")]).await.is_err(), "seal({name:?}) must be refused");
+			assert!(store.seal_paged(name, &schema(), &[0, 10], &[bd("1"), bd("2")], 1).await.is_err(), "seal_paged({name:?}) must be refused");
+		}
+		let declared = store.list_declared_aspects().await.expect("lists");
+		drop(store);
+		assert!(declared.is_empty(), "nothing was declared: {declared:?}");
+		let frames = frames_under(dir.path());
+		assert!(frames.is_empty(), "no frame was written anywhere: {frames:?}");
+	}
+
+	/// A name declared before names were checked cannot be sealed, read or maintained (a
+	/// typed error, not a panic), and a store-wide sweep reports it in `failed` while it
+	/// still maintains every other aspect.
+	#[tokio::test]
+	async fn a_previously_declared_unsafe_name_errors_on_use_and_sweeps_report_it() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		// Written straight into the catalog, as an older version would have accepted it.
+		store.catalog().declare(store.database(), store.subject(), "../x", &schema()).await.expect("raw declare");
+		store.declare("ok", &schema()).await.expect("declares");
+		// Out of order and twice, so the sweeps below have work to do on the valid aspect.
+		store.seal_declared("ok", &[10, 0], &[bd("1"), bd("2")]).await.expect("seals");
+		store.seal_declared("ok", &[20, 30], &[bd("3"), bd("4")]).await.expect("seals");
+
+		let results = [store.seal_declared("../x", &[0], &[bd("1")]).await.map(|_| ()), store.read_time_range("../x", 0, 10).await.map(|_| ()), store.read_point("../x", 0).await.map(|_| ()), store.downsample_range("../x", 0, 10, Resolution::Seconds, &[Aggregation::Avg]).await.map(|_| ()), store.reconcile_aspect("../x").await.map(|_| ()), store.reconcile_overlaps("../x").await.map(|_| ()), store.squash_aspect("../x").await.map(|_| ())];
+		let reconcile = store.reconcile_all_over_threshold(1).await;
+		let squash = store.squash_all_over_threshold(1).await;
+		drop(store);
+		for result in results {
+			let err = result.expect_err("an unsafe name is refused");
+			let invalid = err.downcast_ref::<crate::InvalidAspectName>().unwrap_or_else(|| panic!("a typed InvalidAspectName, got: {err:#}"));
+			assert_eq!(invalid.name(), "../x");
+		}
+		let reconcile = reconcile.expect("the sweep runs despite the unsafe declaration");
+		assert_eq!(reconcile.aspects_scanned, 2, "both declared aspects are visited");
+		assert_eq!(reconcile.segments_reconciled, 1, "the valid aspect is still maintained");
+		let squash = squash.expect("the sweep runs despite the unsafe declaration");
+		assert_eq!(squash.segments_removed, 1, "the valid aspect is still squashed");
+		for failed in [&reconcile.failed, &squash.failed] {
+			assert_eq!(failed.len(), 1, "only the unsafe aspect fails: {failed:?}");
+			assert_eq!(failed[0].0, "../x");
+			assert!(failed[0].1.downcast_ref::<crate::InvalidAspectName>().is_some(), "reported as an InvalidAspectName: {:#}", failed[0].1);
+		}
+		assert!(frames_under(dir.path()).iter().all(|path| path.starts_with(dir.path().join("segments"))), "every frame stays under segments/");
+	}
+
+	#[test]
+	fn contained_file_refuses_paths_outside_the_directory() {
+		let dir = Path::new("store").join("segments");
+		assert_eq!(contained_file(&dir, "a-0.weftseg").expect("inside"), dir.join("a-0.weftseg"));
+		let absolute = std::env::temp_dir().join("abs-0.weftseg").to_string_lossy().into_owned();
+		for escaping in ["../a-0.weftseg", "x/../../a-0.weftseg", "sub/a-0.weftseg", "a/.", "..", absolute.as_str()] {
+			assert!(contained_file(&dir, escaping).is_err(), "{escaping:?} must be refused");
+		}
 	}
 
 	#[tokio::test]
@@ -3270,6 +3527,165 @@ mod tests {
 		assert_eq!(one, 0, "a single segment has nothing to compact");
 	}
 
+	/// The six aspects of the sweep-isolation fixture, in name order. The second,
+	/// [`SWEEP_BAD`], carries the truncated frame, so four healthy aspects sort after it.
+	const SWEEP_ASPECTS: [&str; 6] = ["s1", "s2", "s3", "s4", "s5", "s6"];
+	/// The fixture aspect whose lowest-id frame is truncated on disk.
+	const SWEEP_BAD: &str = "s2";
+
+	/// Build the sweep-isolation fixture under `dir`: six aspects, each with three 3-row
+	/// segments that are internally out of order **and** transitively time-overlapping
+	/// (`[100,130]`, `[120,150]`, `[140,170]`), so every store-wide sweep (reconcile,
+	/// hot/cold, overlap, squash, compact) has work on every aspect. The [`SWEEP_BAD`]
+	/// aspect's lowest-id frame is then cut to half its length, the shape a torn write or
+	/// a short copy leaves, so any sweep that decodes it fails on that aspect. Returns the
+	/// store and the truncated frame's path.
+	async fn sweep_isolation_fixture(dir: &Path) -> (SegmentStore, String) {
+		let store = SegmentStore::open(dir).await.expect("opens");
+		let mut bad_frame = String::new();
+		for aspect in SWEEP_ASPECTS {
+			store.declare(aspect, &schema()).await.expect("declares");
+			let first = store.seal(aspect, &schema(), &[100_i64, 130, 110], &[bd("1"), bd("3"), bd("2")]).await.expect("seals 0");
+			store.seal(aspect, &schema(), &[120_i64, 150, 125], &[bd("4"), bd("6"), bd("5")]).await.expect("seals 1");
+			store.seal(aspect, &schema(), &[140_i64, 170, 145], &[bd("7"), bd("9"), bd("8")]).await.expect("seals 2");
+			if aspect == SWEEP_BAD {
+				let file = std::fs::OpenOptions::new().write(true).open(&first.path).expect("opens frame");
+				let len = file.metadata().expect("stats frame").len();
+				file.set_len(len / 2).expect("truncates frame");
+				bad_frame = first.path;
+			}
+		}
+		(store, bad_frame)
+	}
+
+	/// The healthy fixture aspects (every one but [`SWEEP_BAD`]) whose stats fail
+	/// `maintained` after a sweep — empty when the sweep reached all five.
+	async fn unmaintained_healthy(store: &SegmentStore, maintained: fn(&AspectStorageStats) -> bool) -> Vec<&'static str> {
+		let mut out = Vec::new();
+		for aspect in SWEEP_ASPECTS.into_iter().filter(|aspect| *aspect != SWEEP_BAD) {
+			if !maintained(&store.aspect_stats(aspect).await.expect("stats")) {
+				out.push(aspect);
+			}
+		}
+		out
+	}
+
+	/// Assert a sweep's `failed` list names exactly [`SWEEP_BAD`], and that its error is
+	/// the truncated frame's decode rather than some unrelated failure.
+	fn assert_only_the_bad_aspect_failed(failed: &[(String, anyhow::Error)], bad_frame: &str) {
+		let names: Vec<&str> = failed.iter().map(|(aspect, _)| aspect.as_str()).collect();
+		assert_eq!(names, vec![SWEEP_BAD], "only the truncated aspect fails: {failed:?}");
+		let error = format!("{:#}", failed[0].1);
+		assert!(error.contains(bad_frame), "the failure is the truncated frame's decode: {error}");
+	}
+
+	/// Crash-consistency S4: a truncated frame in one aspect must not stop the store-wide
+	/// reconcile sweeps (threshold and hot/cold) at that aspect. Before S4 the first
+	/// per-aspect error was propagated with `?`, so `s3`..`s6` were never reconciled.
+	#[tokio::test]
+	async fn store_wide_reconcile_sweeps_isolate_a_truncated_frame() {
+		let dir = TempDir::new().expect("tempdir");
+		let (store, bad_frame) = sweep_isolation_fixture(dir.path()).await;
+		let sweep = store.reconcile_all_over_threshold(1).await.expect("a bad aspect does not fail the sweep");
+		let missed = unmaintained_healthy(&store, |stats| stats.unsorted_segments == 0).await;
+		let bad = store.aspect_stats(SWEEP_BAD).await.expect("bad stats");
+		drop(store);
+		assert_eq!(sweep.aspects_scanned, 6);
+		assert_eq!(sweep.aspects_reconciled, 5, "every healthy aspect is reconciled");
+		assert_eq!(sweep.segments_reconciled, 15, "three segments in each of five aspects");
+		assert_only_the_bad_aspect_failed(&sweep.failed, &bad_frame);
+		assert_eq!(missed, Vec::<&str>::new(), "healthy aspects left out of order");
+		assert_eq!(bad.unsorted_segments, 3, "the bad aspect is left as it was");
+
+		let dir = TempDir::new().expect("tempdir");
+		let (store, bad_frame) = sweep_isolation_fixture(dir.path()).await;
+		let sweep = store.reconcile_all_hot_cold(1).await.expect("a bad aspect does not fail the sweep");
+		let missed = unmaintained_healthy(&store, |stats| stats.unsorted_segments == 0).await;
+		drop(store);
+		assert_eq!(sweep.aspects_scanned, 6);
+		assert_eq!(sweep.aspects_reconciled, 5);
+		assert_eq!(sweep.cold_reconciled, 10, "two cold segments in each of five aspects");
+		assert_eq!(sweep.hot_reconciled, 5, "threshold 1 fires every healthy hot tail");
+		assert_only_the_bad_aspect_failed(&sweep.failed, &bad_frame);
+		assert_eq!(missed, Vec::<&str>::new(), "healthy aspects left out of order");
+	}
+
+	/// Crash-consistency S4: the store-wide overlap merges (default and split policy) keep
+	/// going past an aspect whose frame is truncated.
+	#[tokio::test]
+	async fn store_wide_overlap_sweeps_isolate_a_truncated_frame() {
+		let dir = TempDir::new().expect("tempdir");
+		let (store, bad_frame) = sweep_isolation_fixture(dir.path()).await;
+		let sweep = store.reconcile_all_overlaps().await.expect("a bad aspect does not fail the sweep");
+		let missed = unmaintained_healthy(&store, |stats| stats.overlapping_segments == 0 && stats.segment_count == 1).await;
+		let bad = store.aspect_stats(SWEEP_BAD).await.expect("bad stats");
+		drop(store);
+		assert_eq!(sweep.aspects_scanned, 6);
+		assert_eq!(sweep.aspects_reconciled, 5, "every healthy aspect is merged");
+		assert_eq!(sweep.segments_removed, 10, "each healthy 3-member component merges to one");
+		assert_only_the_bad_aspect_failed(&sweep.failed, &bad_frame);
+		assert_eq!(missed, Vec::<&str>::new(), "healthy aspects left overlapping");
+		assert_eq!((bad.segment_count, bad.overlapping_segments), (3, 3), "the bad aspect is left as it was");
+
+		let dir = TempDir::new().expect("tempdir");
+		let (store, bad_frame) = sweep_isolation_fixture(dir.path()).await;
+		let sweep = store.reconcile_all_overlaps_with_policy(SplitPolicy::new(1)).await.expect("a bad aspect does not fail the sweep");
+		let missed = unmaintained_healthy(&store, |stats| stats.overlapping_segments == 0).await;
+		drop(store);
+		assert_eq!(sweep.aspects_scanned, 6);
+		assert_eq!(sweep.aspects_reconciled, 5);
+		assert_only_the_bad_aspect_failed(&sweep.failed, &bad_frame);
+		assert_eq!(missed, Vec::<&str>::new(), "healthy aspects left overlapping");
+	}
+
+	/// Crash-consistency S4: the store-wide squash keeps going past an aspect whose frame
+	/// is truncated.
+	#[tokio::test]
+	async fn store_wide_squash_sweep_isolates_a_truncated_frame() {
+		let dir = TempDir::new().expect("tempdir");
+		let (store, bad_frame) = sweep_isolation_fixture(dir.path()).await;
+		let sweep = store.squash_all_over_threshold(2).await.expect("a bad aspect does not fail the sweep");
+		let missed = unmaintained_healthy(&store, |stats| stats.segment_count == 1).await;
+		let bad = store.aspect_stats(SWEEP_BAD).await.expect("bad stats");
+		drop(store);
+		assert_eq!(sweep.aspects_scanned, 6);
+		assert_eq!(sweep.aspects_squashed, 5, "every healthy aspect is squashed");
+		assert_eq!(sweep.segments_removed, 10, "each healthy aspect folds 3 segments to 1");
+		assert_only_the_bad_aspect_failed(&sweep.failed, &bad_frame);
+		assert_eq!(missed, Vec::<&str>::new(), "healthy aspects left unsquashed");
+		assert_eq!(bad.segment_count, 3, "the bad aspect is left as it was");
+	}
+
+	/// Crash-consistency S4: the store-wide size-targeted compactions (the forced sweep and
+	/// the daemon's fragmentation-gated one) keep going past an aspect whose frame is
+	/// truncated.
+	#[tokio::test]
+	async fn store_wide_compact_sweeps_isolate_a_truncated_frame() {
+		let dir = TempDir::new().expect("tempdir");
+		let (store, bad_frame) = sweep_isolation_fixture(dir.path()).await;
+		let sweep = store.squash_all_to_target_rows(6).await.expect("a bad aspect does not fail the sweep");
+		let missed = unmaintained_healthy(&store, |stats| stats.segment_count == 2).await;
+		let bad = store.aspect_stats(SWEEP_BAD).await.expect("bad stats");
+		drop(store);
+		assert_eq!(sweep.aspects_scanned, 6);
+		assert_eq!(sweep.aspects_squashed, 5, "every healthy aspect is compacted");
+		assert_eq!(sweep.segments_removed, 5, "each healthy aspect pairs its first two 3-row segments");
+		assert_only_the_bad_aspect_failed(&sweep.failed, &bad_frame);
+		assert_eq!(missed, Vec::<&str>::new(), "healthy aspects left uncompacted");
+		assert_eq!(bad.segment_count, 3, "the bad aspect is left as it was");
+
+		let dir = TempDir::new().expect("tempdir");
+		let (store, bad_frame) = sweep_isolation_fixture(dir.path()).await;
+		let sweep = store.squash_all_to_target_rows_if_fragmented(6).await.expect("a bad aspect does not fail the sweep");
+		let missed = unmaintained_healthy(&store, |stats| stats.segment_count == 2).await;
+		drop(store);
+		assert_eq!(sweep.aspects_scanned, 6);
+		assert_eq!(sweep.aspects_squashed, 5);
+		assert_eq!(sweep.segments_removed, 5);
+		assert_only_the_bad_aspect_failed(&sweep.failed, &bad_frame);
+		assert_eq!(missed, Vec::<&str>::new(), "healthy aspects left uncompacted");
+	}
+
 	#[tokio::test]
 	async fn reconcile_overlaps_is_a_noop_without_overlap() {
 		let dir = TempDir::new().expect("tempdir");
@@ -3689,6 +4105,7 @@ mod tests {
 	/// stores answer every read identically. The store is the layer that makes the codec
 	/// reachable from a deployment, so this is the test that it is actually wired up.
 	#[tokio::test]
+	#[cfg(feature = "bitsliced-codec")]
 	async fn transposed_seal_reads_identically_and_only_changes_the_bytes() {
 		use weft_physical_type::frame_value_codec;
 

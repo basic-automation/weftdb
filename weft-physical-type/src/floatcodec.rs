@@ -24,7 +24,15 @@
 //! ([`ColumnEncoding::gorilla_f64_bytes`](crate::column::ColumnEncoding::gorilla_f64_bytes));
 //! it is **not** yet wired into the `.weftseg` writer or any codec selector (that is the
 //! adopt-or-drop slice, exactly as the Gorilla-timestamp and FOR codecs were introduced
-//! advisory-first and adopted later). *(src: Gorilla, VLDB'15 —
+//! advisory-first and adopted later).
+//!
+//! The Chimp and Chimp128 codecs are adapted from the authors' Apache-2.0 reference
+//! implementation (<https://github.com/panagiotisl/chimp>); the crate's THIRD-PARTY-NOTICES
+//! file carries the attribution and licence text.
+//!
+//! **Behind the `experimental-codecs` feature.** No codec here is written to disk, so the
+//! whole module is off by default, outside the 1.0 semver promise, and pending patent review
+//! (ROADMAP.md, Phase 6.1). *(src: Gorilla, VLDB'15 —
 //! <https://www.vldb.org/pvldb/vol8/p1816-teller.pdf> · Chimp, VLDB'22 —
 //! <https://www.vldb.org/pvldb/vol15/p3058-liakos.pdf>)*
 
@@ -210,6 +218,11 @@ pub fn xor_f64_bytes(values: &[f64]) -> usize {
 	xor_f64_encode(values).len()
 }
 
+// Portions adapted from Chimp (https://github.com/panagiotisl/chimp), licensed under
+// Apache-2.0; see THIRD-PARTY-NOTICES. Modifications: ported from Java (Chimp.java,
+// ChimpN.java) to Rust over an MSB-first byte buffer, with count-driven, truncation-tolerant
+// decoding. The adapted code runs from here through `chimp128_f64_bytes`.
+
 /// Chimp's leading-zero representation table: the eight leading-zero counts a 3-bit code
 /// can name. A value's actual leading-zero count is rounded *down* to the nearest entry,
 /// so the meaningful-bit window it names always contains every set bit.
@@ -388,8 +401,9 @@ const CHIMP128_THRESHOLD: u32 = 6 + PREVIOUS_VALUES_LOG2;
 /// subnormals, both signed zeros). Exact inverse: [`chimp128_f64_decode`] with the same value
 /// count. **Advisory only** (roadmap Phase 6.1); benchmarked against Gorilla / depth-1 Chimp
 /// before an adopt-or-drop decision realizes a winner on disk. *(src: Chimp128 algorithm —
-/// <https://www.vldb.org/pvldb/vol15/p3058-liakos.pdf> · `DuckDB` Chimp128 impl notes —
-/// <https://github.com/duckdb/duckdb/pull/4878>)*
+/// <https://www.vldb.org/pvldb/vol15/p3058-liakos.pdf> · adapted from the authors' reference
+/// implementation, `ChimpN.java` — <https://github.com/panagiotisl/chimp>, Apache-2.0; see
+/// THIRD-PARTY-NOTICES)*
 #[must_use]
 pub fn chimp128_f64_encode(values: &[f64]) -> Vec<u8> {
 	let mut w = BitWriter::new();

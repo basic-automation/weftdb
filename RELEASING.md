@@ -77,6 +77,12 @@ into another's binary, and nothing is restored from a build cache. Each target i
 `.tar.gz` (a `.zip` on Windows) with a `.sha256` next to it, and a last job checks every
 archive and writes one `SHA256SUMS` over all five.
 
+Every archive holds the three binaries, `README.md`, both license files (`LICENSE-MIT`,
+`LICENSE-APACHE`), `NOTICE`, and the `THIRD-PARTY-NOTICES` of `weft-physical-type` and
+`weft-reduce` (as `THIRD-PARTY-NOTICES-weft-physical-type` and
+`THIRD-PARTY-NOTICES-weft-reduce`), whose Apache-2.0 portions are compiled into the
+binaries. `scripts/release/stage.sh` lists them.
+
 ### Dry run first
 
 Dispatching the workflow is a dry run unless you say otherwise:

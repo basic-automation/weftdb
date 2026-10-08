@@ -2,9 +2,9 @@
 # Stage the release archives and their checksums.
 #
 #   scripts/release/stage.sh archive <target> <tag> <bin-dir> <src-dir> <out-dir>
-#       Packs weft-server, weft-tui and weft-bench from <bin-dir>, with README.md and
-#       LICENSE from <src-dir>, into <out-dir>/weftdb-<tag>-<target>.tar.gz (a .zip for
-#       a Windows target), and writes <archive>.sha256 next to it.
+#       Packs weft-server, weft-tui and weft-bench from <bin-dir>, with the files in
+#       DOCS from <src-dir>, into <out-dir>/weftdb-<tag>-<target>.tar.gz (a .zip for a
+#       Windows target), and writes <archive>.sha256 next to it.
 #
 #   scripts/release/stage.sh sums <dist-dir> <target>...
 #       Requires exactly one archive per <target> in <dist-dir> and nothing else,
@@ -18,7 +18,18 @@ set -euo pipefail
 TARGET_RE='^[a-z0-9_]+(-[a-z0-9_]+){2,3}$'
 TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
 BINARIES=(weft-server weft-tui weft-bench)
-DOCS=(README.md LICENSE)
+# What every archive carries besides the binaries, as <path in the source tree>:<name in
+# the archive>. Apache-2.0 section 4: the binaries contain code adapted from Chimp
+# (weft-physical-type) and DDSketch (weft-reduce), so both crates' notices ship. Both
+# files are named THIRD-PARTY-NOTICES, so each is renamed after its crate.
+DOCS=(
+	README.md:README.md
+	LICENSE-MIT:LICENSE-MIT
+	LICENSE-APACHE:LICENSE-APACHE
+	NOTICE:NOTICE
+	weft-physical-type/THIRD-PARTY-NOTICES:THIRD-PARTY-NOTICES-weft-physical-type
+	weft-reduce/THIRD-PARTY-NOTICES:THIRD-PARTY-NOTICES-weft-reduce
+)
 
 fail() {
 	if [[ ${GITHUB_ACTIONS:-} == true ]]; then
@@ -59,7 +70,7 @@ check_line() {
 
 archive() {
 	[[ $# -eq 5 ]] || usage
-	local target=$1 tag=$2 bin_dir=$3 src_dir=$4 out_dir=$5 exe='' format name work f
+	local target=$1 tag=$2 bin_dir=$3 src_dir=$4 out_dir=$5 exe='' format name work f from to
 	[[ $target =~ $TARGET_RE ]] || fail "not a target triple: $(printf '%q' "$target")"
 	[[ $tag =~ $TAG_RE ]] || fail "not a release tag: $(printf '%q' "$tag")"
 	[[ $target == *-windows-* ]] && exe=.exe
@@ -79,8 +90,11 @@ archive() {
 		cp "$bin_dir/$f$exe" "$work/$name/"
 	done
 	for f in "${DOCS[@]}"; do
-		[[ -f $src_dir/$f ]] || fail "missing file: $src_dir/$f"
-		cp "$src_dir/$f" "$work/$name/"
+		from=${f%%:*}
+		to=${f#*:}
+		[[ -f $src_dir/$from ]] || fail "missing file: $src_dir/$from"
+		[[ ! -e $work/$name/$to ]] || fail "two files would be packed as $to"
+		cp "$src_dir/$from" "$work/$name/$to"
 	done
 
 	# Archive from inside the scratch dir with relative paths, so the archive holds a

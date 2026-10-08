@@ -219,6 +219,7 @@ pub struct IngestMetrics {
 pub struct ReconcileMetrics {
 	passes: AtomicU64,
 	segments_reconciled: AtomicU64,
+	failed_passes: AtomicU64,
 }
 
 /// Counters for the online control-plane backup (`POST …/storage/backup`, roadmap
@@ -288,6 +289,10 @@ pub struct ReconcileSnapshot {
 	pub passes: u64,
 	/// Total out-of-order segments rewritten sorted across all passes.
 	pub segments_reconciled: u64,
+	/// Per-aspect passes that failed inside a store-wide sweep (daemon tick or
+	/// `POST /api/v1/storage/reconcile`). The sweep skips a failed aspect and carries on,
+	/// so this counter is how a permanently failing aspect stays visible.
+	pub failed_passes: u64,
 }
 
 /// A point-in-time read of [`BackupMetrics`].
@@ -364,6 +369,13 @@ impl Metrics {
 		self.reconcile.segments_reconciled.fetch_add(segments_reconciled, Ordering::Relaxed);
 	}
 
+	/// Record the per-aspect passes a store-wide sweep could not complete (crash-consistency
+	/// S4). A sweep now records a failing aspect and moves on rather than aborting, so the
+	/// failure no longer surfaces as the tick's error; this counter keeps it visible.
+	pub fn record_reconcile_failures(&self, failed_passes: u64) {
+		self.reconcile.failed_passes.fetch_add(failed_passes, Ordering::Relaxed);
+	}
+
 	/// Record one completed, verified control-plane backup snapshot and the bytes it
 	/// wrote (roadmap Phase 7.4). Only a snapshot that succeeded should call this.
 	pub fn record_backup(&self, bytes_written: u64) {
@@ -390,7 +402,7 @@ impl Metrics {
 	/// Take a consistent-enough snapshot of all counters.
 	#[must_use]
 	pub fn snapshot(&self) -> MetricsSnapshot {
-		MetricsSnapshot { interpolate: InterpolateSnapshot { requests: self.interpolate.requests.load(Ordering::Relaxed), errors: self.interpolate.errors.load(Ordering::Relaxed), output_points: self.interpolate.output_points.load(Ordering::Relaxed) }, downsample: DownsampleSnapshot { requests: self.downsample.requests.load(Ordering::Relaxed), errors: self.downsample.errors.load(Ordering::Relaxed), output_buckets: self.downsample.output_buckets.load(Ordering::Relaxed) }, ingest: IngestSnapshot { requests: self.ingest.requests.load(Ordering::Relaxed), errors: self.ingest.errors.load(Ordering::Relaxed), rows_sealed: self.ingest.rows_sealed.load(Ordering::Relaxed), segments_sealed: self.ingest.segments_sealed.load(Ordering::Relaxed) }, reconcile: ReconcileSnapshot { passes: self.reconcile.passes.load(Ordering::Relaxed), segments_reconciled: self.reconcile.segments_reconciled.load(Ordering::Relaxed) }, backup: BackupSnapshot { snapshots: self.backup.snapshots.load(Ordering::Relaxed), bytes_written: self.backup.bytes_written.load(Ordering::Relaxed) } }
+		MetricsSnapshot { interpolate: InterpolateSnapshot { requests: self.interpolate.requests.load(Ordering::Relaxed), errors: self.interpolate.errors.load(Ordering::Relaxed), output_points: self.interpolate.output_points.load(Ordering::Relaxed) }, downsample: DownsampleSnapshot { requests: self.downsample.requests.load(Ordering::Relaxed), errors: self.downsample.errors.load(Ordering::Relaxed), output_buckets: self.downsample.output_buckets.load(Ordering::Relaxed) }, ingest: IngestSnapshot { requests: self.ingest.requests.load(Ordering::Relaxed), errors: self.ingest.errors.load(Ordering::Relaxed), rows_sealed: self.ingest.rows_sealed.load(Ordering::Relaxed), segments_sealed: self.ingest.segments_sealed.load(Ordering::Relaxed) }, reconcile: ReconcileSnapshot { passes: self.reconcile.passes.load(Ordering::Relaxed), segments_reconciled: self.reconcile.segments_reconciled.load(Ordering::Relaxed), failed_passes: self.reconcile.failed_passes.load(Ordering::Relaxed) }, backup: BackupSnapshot { snapshots: self.backup.snapshots.load(Ordering::Relaxed), bytes_written: self.backup.bytes_written.load(Ordering::Relaxed) } }
 	}
 
 	/// Render the counters in the Prometheus text exposition format (v0.0.4).
@@ -399,7 +411,7 @@ impl Metrics {
 		use std::fmt::Write as _;
 		let snap = self.snapshot();
 		let mut out = String::with_capacity(512);
-		let counters = [("weft_interpolate_requests_total", "Total interpolation requests received.", snap.interpolate.requests), ("weft_interpolate_errors_total", "Interpolation requests that returned an error.", snap.interpolate.errors), ("weft_interpolate_output_points_total", "Total interpolated output points served.", snap.interpolate.output_points), ("weft_downsample_requests_total", "Total downsample requests received.", snap.downsample.requests), ("weft_downsample_errors_total", "Downsample requests that returned an error.", snap.downsample.errors), ("weft_downsample_output_buckets_total", "Total downsample buckets served.", snap.downsample.output_buckets), ("weft_ingest_requests_total", "Total storage-ingest requests received.", snap.ingest.requests), ("weft_ingest_errors_total", "Storage-ingest requests that returned an error.", snap.ingest.errors), ("weft_ingest_rows_sealed_total", "Total rows sealed across all storage ingests.", snap.ingest.rows_sealed), ("weft_ingest_segments_sealed_total", "Total segments sealed across all storage ingests.", snap.ingest.segments_sealed), ("weft_reconcile_passes_total", "Out-of-order reconciliation passes that actually ran (threshold-gated holds excluded).", snap.reconcile.passes), ("weft_reconcile_segments_reconciled_total", "Total out-of-order segments rewritten sorted across all reconciliation passes.", snap.reconcile.segments_reconciled), ("weft_backup_snapshots_total", "Control-plane backup snapshots that completed and verified.", snap.backup.snapshots), ("weft_backup_bytes_written_total", "Total bytes written across all control-plane backup snapshots.", snap.backup.bytes_written)];
+		let counters = [("weft_interpolate_requests_total", "Total interpolation requests received.", snap.interpolate.requests), ("weft_interpolate_errors_total", "Interpolation requests that returned an error.", snap.interpolate.errors), ("weft_interpolate_output_points_total", "Total interpolated output points served.", snap.interpolate.output_points), ("weft_downsample_requests_total", "Total downsample requests received.", snap.downsample.requests), ("weft_downsample_errors_total", "Downsample requests that returned an error.", snap.downsample.errors), ("weft_downsample_output_buckets_total", "Total downsample buckets served.", snap.downsample.output_buckets), ("weft_ingest_requests_total", "Total storage-ingest requests received.", snap.ingest.requests), ("weft_ingest_errors_total", "Storage-ingest requests that returned an error.", snap.ingest.errors), ("weft_ingest_rows_sealed_total", "Total rows sealed across all storage ingests.", snap.ingest.rows_sealed), ("weft_ingest_segments_sealed_total", "Total segments sealed across all storage ingests.", snap.ingest.segments_sealed), ("weft_reconcile_passes_total", "Out-of-order reconciliation passes that actually ran (threshold-gated holds excluded).", snap.reconcile.passes), ("weft_reconcile_segments_reconciled_total", "Total out-of-order segments rewritten sorted across all reconciliation passes.", snap.reconcile.segments_reconciled), ("weft_reconcile_failed_passes_total", "Per-aspect passes that failed inside a store-wide maintenance sweep (the sweep skipped the aspect and continued).", snap.reconcile.failed_passes), ("weft_backup_snapshots_total", "Control-plane backup snapshots that completed and verified.", snap.backup.snapshots), ("weft_backup_bytes_written_total", "Total bytes written across all control-plane backup snapshots.", snap.backup.bytes_written)];
 		for (name, help, value) in counters {
 			// `writeln!` into a String is infallible.
 			let _ = writeln!(out, "# HELP {name} {help}");
@@ -545,6 +557,7 @@ mod tests {
 		m.record_interpolate_request();
 		m.add_output_points(5);
 		m.record_reconcile_pass(3);
+		m.record_reconcile_failures(2);
 		m.record_backup(4096);
 		let text = m.render_prometheus();
 		// Every counter carries HELP, TYPE, and a value line.
@@ -552,9 +565,9 @@ mod tests {
 		assert!(text.contains("# TYPE weft_interpolate_requests_total counter"));
 		assert!(text.contains("weft_interpolate_requests_total 1"));
 		assert!(text.contains("weft_interpolate_output_points_total 5"));
-		// No value line is left dangling without a preceding TYPE line: 14
+		// No value line is left dangling without a preceding TYPE line: 15
 		// counters + the 3 latency histograms.
-		assert_eq!(text.matches("# TYPE ").count(), 17);
+		assert_eq!(text.matches("# TYPE ").count(), 18);
 		// The downsample counters are exposed too.
 		assert!(text.contains("# TYPE weft_downsample_requests_total counter"));
 		// And the storage-ingest counters.
@@ -563,6 +576,9 @@ mod tests {
 		assert!(text.contains("# TYPE weft_reconcile_passes_total counter"));
 		assert!(text.contains("weft_reconcile_passes_total 1"));
 		assert!(text.contains("weft_reconcile_segments_reconciled_total 3"));
+		// And the per-aspect sweep failure counter (two failed aspect passes).
+		assert!(text.contains("# TYPE weft_reconcile_failed_passes_total counter"));
+		assert!(text.contains("weft_reconcile_failed_passes_total 2"));
 		// And the control-plane backup counters (one snapshot, 4096 bytes written).
 		assert!(text.contains("# TYPE weft_backup_snapshots_total counter"));
 		assert!(text.contains("weft_backup_snapshots_total 1"));

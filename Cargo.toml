@@ -17,7 +17,7 @@ members = [
 # its own edition and description; everything else is released in lockstep.
 [workspace.package]
 version = "0.1.0"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 authors = ["Justin Icenhour"]
 repository = "https://github.com/basic-automation/weftdb"
 readme = "README.md"
@@ -46,6 +46,7 @@ uuid = { version = "1.27", features = ["v4", "serde"] }
 wide = "1"
 bytemuck = { version = "1", features = ["derive"] }
 fastrand = "2"
+libc = "0.2"
 num_cpus = "1"
 ratatui = "0.30"
 crossterm = "0.29"

@@ -1,0 +1,39 @@
+{
+  "number": 42,
+  "state": "open",
+  "title": "Example change",
+  "user": {
+    "login": "ada-l",
+    "id": 7,
+    "type": "User"
+  },
+  "head": {
+    "ref": "fix-range",
+    "sha": "4444444444444444444444444444444444444444",
+    "user": {
+      "login": "ada-l",
+      "id": 1005,
+      "type": "User"
+    },
+    "repo": {
+      "full_name": "ada-l/weftdb",
+      "owner": {
+        "login": "ada-l",
+        "id": 1005,
+        "type": "User"
+      }
+    }
+  },
+  "base": {
+    "ref": "main",
+    "repo": {
+      "full_name": "basic-automation/weftdb",
+      "owner": {
+        "login": "basic-automation",
+        "id": 9000,
+        "type": "Organization"
+      }
+    }
+  },
+  "commits": 4
+}

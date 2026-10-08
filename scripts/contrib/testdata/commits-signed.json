@@ -1,0 +1,149 @@
+[
+  {
+    "sha": "1111111111111111111111111111111111111111",
+    "node_id": "C_11111111",
+    "commit": {
+      "author": {
+        "name": "Ada Lovelace",
+        "email": "ada@example.org",
+        "date": "2026-10-08T12:00:00Z"
+      },
+      "committer": {
+        "name": "Ada Lovelace",
+        "email": "ada@example.org",
+        "date": "2026-10-08T12:00:00Z"
+      },
+      "message": "fix(weftdb): handle an empty range\n\nSigned-off-by: Ada Lovelace <ada@example.org>\n",
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "signature": null,
+        "payload": null
+      }
+    },
+    "author": {
+      "login": "ada-l",
+      "id": 1005,
+      "type": "User"
+    },
+    "committer": {
+      "login": "ada-l",
+      "id": 1005,
+      "type": "User"
+    },
+    "parents": [
+      {
+        "sha": "0000000000000000000000000000000000000000"
+      }
+    ]
+  },
+  {
+    "sha": "2222222222222222222222222222222222222222",
+    "node_id": "C_22222222",
+    "commit": {
+      "author": {
+        "name": "Ada Lovelace",
+        "email": "Ada@Example.org",
+        "date": "2026-10-08T12:00:00Z"
+      },
+      "committer": {
+        "name": "Ada Lovelace",
+        "email": "Ada@Example.org",
+        "date": "2026-10-08T12:00:00Z"
+      },
+      "message": "docs: explain the range\n\nCo-authored-by: Grace Hopper <grace@example.org>\nsigned-off-by: Ada Lovelace <ada@EXAMPLE.org>\n",
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "signature": null,
+        "payload": null
+      }
+    },
+    "author": {
+      "login": "ada-l",
+      "id": 1005,
+      "type": "User"
+    },
+    "committer": {
+      "login": "ada-l",
+      "id": 1005,
+      "type": "User"
+    },
+    "parents": [
+      {
+        "sha": "0000000000000000000000000000000000000000"
+      }
+    ]
+  },
+  {
+    "sha": "3333333333333333333333333333333333333333",
+    "node_id": "C_33333333",
+    "commit": {
+      "author": {
+        "name": "Ada Lovelace",
+        "email": "ada@example.org",
+        "date": "2026-10-08T12:00:00Z"
+      },
+      "committer": {
+        "name": "GitHub",
+        "email": "noreply@github.com",
+        "date": "2026-10-08T12:00:00Z"
+      },
+      "message": "Merge branch 'main' into fix-range\n",
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n...\n-----END PGP SIGNATURE-----\n",
+        "payload": "tree 0000000000000000000000000000000000000000\n"
+      }
+    },
+    "author": {
+      "login": "ada-l",
+      "id": 1005,
+      "type": "User"
+    },
+    "committer": {
+      "login": "web-flow",
+      "id": 19864447,
+      "type": "User"
+    },
+    "parents": [
+      {
+        "sha": "0000000000000000000000000000000000000000"
+      },
+      {
+        "sha": "0000000000000000000000000000000000000001"
+      }
+    ]
+  },
+  {
+    "sha": "4444444444444444444444444444444444444444",
+    "node_id": "C_44444444",
+    "commit": {
+      "author": {
+        "name": "Grace Hopper",
+        "email": "grace@example.org",
+        "date": "2026-10-08T12:00:00Z"
+      },
+      "committer": {
+        "name": "Grace Hopper",
+        "email": "grace@example.org",
+        "date": "2026-10-08T12:00:00Z"
+      },
+      "message": "test: cover the empty range\n\nSigned-off-by: Grace Hopper <grace@example.org>",
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "signature": null,
+        "payload": null
+      }
+    },
+    "author": null,
+    "committer": null,
+    "parents": [
+      {
+        "sha": "0000000000000000000000000000000000000000"
+      }
+    ]
+  }
+]

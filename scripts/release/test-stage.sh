@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Tests for scripts/release/stage.sh with stand-in binaries. Needs tar, and 7z for the
-# Windows case (skipped without it); touches nothing outside a temp directory.
+# Tests for scripts/release/stage.sh with stand-in binaries. The documents come from this
+# repository's own tree, so a file stage.sh packs that the tree no longer has fails here,
+# not in a release. Needs tar, and 7z for the Windows case (skipped without it); writes
+# nothing outside a temp directory.
 #
 #   scripts/release/test-stage.sh
 set -euo pipefail
 
 stage="$(cd "$(dirname "$0")" && pwd)/stage.sh"
+src="$(cd "$(dirname "$0")/../.." && pwd)"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 unset GITHUB_ACTIONS
@@ -22,11 +25,20 @@ check() { # check <description> <command...>
 		failures=$((failures + 1))
 	fi
 }
-refuses() { # refuses <description> <command...>
+refuses() { # refuses [reason:<text>] <description> <command...>: fails, saying <text>
+	local reason=''
+	if [[ $1 == reason:* ]]; then
+		reason=${1#reason:}
+		shift
+	fi
 	local description=$1
 	shift
 	if "$@" >"$tmp/log" 2>&1; then
 		printf 'FAIL  %s: succeeded\n' "$description"
+		failures=$((failures + 1))
+	elif [[ -n $reason ]] && ! grep -qF -- "$reason" "$tmp/log"; then
+		printf 'FAIL  %s: failed without saying "%s"\n' "$description" "$reason"
+		sed 's/^/      /' "$tmp/log"
 		failures=$((failures + 1))
 	else
 		printf 'ok    %s\n' "$description"
@@ -35,11 +47,6 @@ refuses() { # refuses <description> <command...>
 
 # sha256sum_c <dir> <checksum file>: what a user runs to check a download.
 sha256sum_c() { (cd "$1" && sha256sum -c "$2"); }
-
-src=$tmp/src
-mkdir -p "$src"
-echo readme >"$src/README.md"
-echo license >"$src/LICENSE"
 
 targets=(x86_64-unknown-linux-gnu aarch64-apple-darwin)
 for target in "${targets[@]}"; do
@@ -50,9 +57,21 @@ for target in "${targets[@]}"; do
 	check "archive $target" "$stage" archive "$target" v1.2.3 "$tmp/bin/$target" "$src" "$tmp/dist"
 done
 
-listing=$(tar -tzf "$tmp/dist/weftdb-v1.2.3-x86_64-unknown-linux-gnu.tar.gz" | LC_ALL=C sort | tr '\n' ' ')
-want="weftdb-v1.2.3-x86_64-unknown-linux-gnu/ weftdb-v1.2.3-x86_64-unknown-linux-gnu/LICENSE weftdb-v1.2.3-x86_64-unknown-linux-gnu/README.md weftdb-v1.2.3-x86_64-unknown-linux-gnu/weft-bench weftdb-v1.2.3-x86_64-unknown-linux-gnu/weft-server weftdb-v1.2.3-x86_64-unknown-linux-gnu/weft-tui "
-check "the archive holds one directory with the binaries and docs" test "$listing" = "$want"
+dir=weftdb-v1.2.3-x86_64-unknown-linux-gnu
+listing=$(tar -tzf "$tmp/dist/$dir.tar.gz" | LC_ALL=C sort | tr '\n' ' ')
+want=""
+for f in / /LICENSE-APACHE /LICENSE-MIT /NOTICE /README.md /THIRD-PARTY-NOTICES-weft-physical-type \
+	/THIRD-PARTY-NOTICES-weft-reduce /weft-bench /weft-server /weft-tui; do
+	want+="$dir$f "
+done
+check "the archive holds one directory with the binaries, licenses and notices" \
+	test "$listing" = "$want"
+mkdir "$tmp/unpacked"
+tar -xzf "$tmp/dist/$dir.tar.gz" -C "$tmp/unpacked"
+for crate in weft-physical-type weft-reduce; do
+	check "$crate's THIRD-PARTY-NOTICES is packed under its own name" \
+		cmp "$src/$crate/THIRD-PARTY-NOTICES" "$tmp/unpacked/$dir/THIRD-PARTY-NOTICES-$crate"
+done
 check "the .sha256 verifies with sha256sum -c" \
 	sha256sum_c "$tmp/dist" weftdb-v1.2.3-x86_64-unknown-linux-gnu.tar.gz.sha256
 
@@ -65,6 +84,11 @@ else
 	echo "skip  the Windows zip (no 7z)"
 fi
 
+mkdir -p "$tmp/partial"
+cp "$src/README.md" "$src/LICENSE-MIT" "$src/LICENSE-APACHE" "$src/NOTICE" "$tmp/partial/"
+refuses reason:"missing file: $tmp/partial/weft-physical-type/THIRD-PARTY-NOTICES" \
+	"archive with a notice file missing" \
+	"$stage" archive x86_64-unknown-linux-gnu v1.2.3 "$tmp/bin/x86_64-unknown-linux-gnu" "$tmp/partial" "$tmp/other"
 refuses "archive with a missing binary" \
 	"$stage" archive x86_64-unknown-linux-gnu v1.2.3 "$tmp/nowhere" "$src" "$tmp/other"
 refuses "archive with a bad tag" \
