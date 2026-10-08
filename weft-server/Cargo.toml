@@ -44,6 +44,20 @@ opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 
+[features]
+# Lets the `/ready` poison test write-poison a real store, through weftdb's
+# `fault-injection` hook. A feature rather than a dev-dependency feature, as in
+# weft-orchestration: Cargo unifies features across a workspace build, so a dev-dependency
+# enabling it would compile the fault points into every crate's tests in
+# `cargo test --workspace`, and weftdb's check that production builds keep them inert
+# (tests/durable_fault_disabled.rs) would compile to nothing.
+fault-injection = ["weftdb/fault-injection"]
+
+# Run with `cargo test -p weft-server --features fault-injection --test ready_poisoned`.
+[[test]]
+name = "ready_poisoned"
+required-features = ["fault-injection"]
+
 [dev-dependencies]
 async-trait = { workspace = true }  # a StoreFs test double whose cleanup fails
 tower = { workspace = true, features = ["util"] }
