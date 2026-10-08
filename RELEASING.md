@@ -157,7 +157,8 @@ built from.
 
 The release is created as a **draft**, with the five archives, their `.sha256` files and
 `SHA256SUMS`. A `-rc.N` tag makes a prerelease, which never becomes the Latest release.
-Leave it as a draft until the crates are published.
+Leave it as a draft until the crates are published (v0.1.0 publishes none: go straight
+to section 5).
 
 ## 4. Publish to crates.io
 

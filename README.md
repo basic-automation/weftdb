@@ -84,8 +84,10 @@ and aarch64), macOS (x86_64 and Apple silicon) and Windows (x86_64), and a `SHA2
 file to check them with `sha256sum -c SHA256SUMS`. The Linux binaries are built on
 Ubuntu 24.04: `weft-server` and `weft-bench` need glibc 2.34 or newer, and `weft-tui`
 needs glibc 2.39 or newer. The macOS and Windows binaries are not signed, so Gatekeeper
-and SmartScreen will warn before running them. Read the release's
-[known limitations](CHANGELOG.md#known-limitations) before you run it.
+and SmartScreen will warn before running them. Read the release's known limitations
+(v0.1.0's are in its
+[changelog](https://github.com/basic-automation/weftdb/blob/v0.1.0/CHANGELOG.md#known-limitations))
+before you run it.
 
 ### 1. Start the server
 
@@ -202,7 +204,9 @@ deployment.
 **v0.1.0 is the pre-beta baseline release**: pre-built binaries on the
 [GitHub release](https://github.com/basic-automation/weftdb/releases/tag/v0.1.0), and no
 crates on crates.io. Later releases test their upgrade, rollback and compatibility
-against it. Its [known limitations](CHANGELOG.md#known-limitations) include no
+against it. Its
+[known limitations](https://github.com/basic-automation/weftdb/blob/v0.1.0/CHANGELOG.md#known-limitations)
+include no
 authentication or TLS, incomplete crash consistency, and a store layout that the next
 release upgrades one way.
 

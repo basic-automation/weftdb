@@ -35,8 +35,9 @@ before this release. A bare "0.1" in them means splimes 0.1.
   place, so a crash during a rewrite can tear one. And two seals into one aspect at the
   same moment can be given the same segment id, so that one replaces the other.
   [`docs/design/crash-consistency.md`](https://github.com/basic-automation/weftdb/blob/v0.1.0/docs/design/crash-consistency.md)
-  lists the 43 verified windows; the durability work that follows this release closes
-  them.
+  lists the 43 windows it verified. This release closes one of them, the deleted MVCC
+  log (see Fixed). The durability work after it closes or mitigates the rest, though a
+  legacy (rows-mode) database keeps some of them by design.
 - **The next release changes the store layout.** It moves a store to layout v2, in
   place, and the upgrade is one-way: once a newer release has written to a store, do not
   run v0.1.0 on it again. Before upgrading, stop `weft-server` and copy the whole store
@@ -47,7 +48,7 @@ before this release. A bare "0.1" in them means splimes 0.1.
   and `weft-bench` but not `weft-tui`; on an older glibc, build from source.
 - **The macOS and Windows binaries are not signed.** Gatekeeper and SmartScreen warn
   before running them. Check each archive against `SHA256SUMS` instead.
-- **The codec features are off in the release binaries.** None of them is built with
+- **The bit-sliced codec is off in the release binaries.** None of them is built with
   `bitsliced-codec`, so they never write the bit-sliced value codec
   (`WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` is ignored, with a warning) and cannot read a
   segment written with it; for a store that has such segments, build `weft-server` from
@@ -117,8 +118,9 @@ before this release. A bare "0.1" in them means splimes 0.1.
   Contributor License Agreement
   ([`CLA.md`](https://github.com/basic-automation/weftdb/blob/v0.1.0/CLA.md), version 1,
   adapted from the Apache Software Foundation's ICLA with Justin Icenhour as the
-  recipient), signed once by a pull request comment. The `contribution-terms` check passes a pull request when either holds.
-  Contributions are licensed `MIT OR Apache-2.0`. See
+  recipient), signed once by a pull request comment. The `contribution-terms` check
+  passes a pull request when either holds. Contributions are licensed
+  `MIT OR Apache-2.0`. See
   [`CONTRIBUTING.md`](https://github.com/basic-automation/weftdb/blob/v0.1.0/CONTRIBUTING.md#contribution-terms).
 - **`Inputs::register_dictionary_if_absent`** registers a dictionary as
   `set_dictionary_metadata` does unless a complete registration of that name exists,
