@@ -364,20 +364,21 @@ CSV, Arrow IPC, or Parquet**:
 | `POST /api/v1/{interpolate,downsample}/{csv,arrow,parquet}` and `…/ilp/{csv,arrow,parquet}` | The same computations with CSV (`text/csv`), Arrow IPC stream, or Parquet output — so a harness feeding line protocol pulls results in any of the four formats. |
 
 **What the reductions cost.** Measured on the shipped harness (500k points, 5 reps, hour buckets,
-correctness PASS throughout — `weft-bench --downsample --ds-points 500000 --ds-aggs <agg>`). These
+correctness PASS throughout — `weft-bench --downsample --ds-points 500000 --ds-aggs <agg>`;
+re-measured 2026-10-08 after the `avg` division change, at load average ~19). These
 use the generated series, whose values are exact binary expansions of floats (~50 significant
 digits), so they are a pessimistic bound. On **real** two-decimal prices (`--ds-csv`, 1M BTC/USD
-one-minute closes, hourly `avg,p99,twa`) the same reduction runs at **3.39M points/sec** against
-**0.53M points/sec** for a generated series of the same size (`weft-bench --downsample --ds-csv
+one-minute closes, hourly `avg,p99,twa`) the same reduction runs at **4.24M points/sec** against
+**0.56M points/sec** for a generated series of the same size (`weft-bench --downsample --ds-csv
 database/datasets/btc_1min.csv --csv-value-col 4 --csv-skip 3000000 --ds-points 1000000 --ds-bucket h
 --ds-aggs avg,p99,twa --reps 5`):
 
 | reduction | p50 | throughput | note |
 |---|---|---|---|
-| `avg` | 293.1 ms | 1,711,287 points/sec | the streaming baseline — no bucket materialized |
-| `twa` | 426.0 ms | 1,169,431 points/sec | 1.45× the streaming cost: dwell-weighting needs the time-ordered samples |
-| `twa_bucket_end` | 430.7 ms | 1,167,829 points/sec | +1.1% over `twa` — one extra weight, effectively free |
-| `twa_linear` | 538.6 ms | 928,112 points/sec | 1.26× `twa`: an extra `BigDecimal` add + divide per interval for the trapezoidal mean |
+| `avg` | 240.8 ms | 2,075,477 points/sec | the streaming baseline — no bucket materialized |
+| `twa` | 334.1 ms | 1,515,029 points/sec | 1.39× the streaming cost: dwell-weighting needs the time-ordered samples |
+| `twa_bucket_end` | 332.1 ms | 1,518,520 points/sec | within noise of `twa` — one extra weight, effectively free |
+| `twa_linear` | 407.8 ms | 1,197,606 points/sec | 1.22× `twa`: an extra `BigDecimal` add + divide per interval for the trapezoidal mean |
 
 **Exact vs sketch percentiles — which to ask for.** The `p50`/`p90`/`p95`/`p99` reductions are
 *exact* nearest-rank: they return an actual observed `BigDecimal` from the bucket, but they
@@ -387,8 +388,8 @@ materialize and sort the whole bucket, and two buckets' results cannot be combin
 (`weft_reduce::SKETCH_ALPHA`), **bounded memory** regardless of bucket size (values fold in as they
 arrive; `SKETCH_MAX_BINS` caps the store absolutely), and an **exactly mergeable** structure, so a
 p99 can be computed over a large or streaming bucket. Measured on the shipped harness (500k points,
-5 reps, correctness PASS): `sketch_p99` runs at **1,075,976 points/sec (p50 = 468.90 ms)** versus
-exact `p99` at **249,169 points/sec (p50 = 2018.53 ms)** — **~4.3× faster**
+5 reps, correctness PASS): `sketch_p99` runs at **1,528,361 points/sec (p50 = 327.30 ms)** versus
+exact `p99` at **584,469 points/sec (p50 = 852.39 ms)** — **~2.6× faster**
 (`weft-bench --downsample --ds-points 500000 --ds-aggs sketch_p99` vs `--ds-aggs p99`).
 
 The approximation is **declared, never silent** — WeftDB's precision principle. The sketch shares the
@@ -1221,8 +1222,8 @@ What it does today:
   [`weft-reduce`](weft-reduce) reduction into grid-aligned buckets with a
   `--ds-aggs` selector over `min`/`max`/`avg`/`sum`/`first`/`last`/`p50`…`p99`/`twa`/`twa_linear`/`twa_bucket_end`/`sketch_p50`…`sketch_p99`.
   `--ds-parallel <N>` reduces in N chunks via mergeable partial reductions (identical
-  buckets to serial, asserted by test) — measured **14.7× at 64 chunks** on a 16-core box
-  (441.2 ms → 30.1 ms, 1,134,659 → 16,921,104 points/sec, `--ds-aggs sketch_p99`, 500k points,
+  buckets to serial, asserted by test) — measured **14.7× at 64 chunks** on a quiet 16-core box
+  (441.2 ms → 30.1 ms; re-run 2026-10-08 at load average ~19: 327.3 → 48.5 ms, 6.7×), 1,134,659 → 16,921,104 points/sec, `--ds-aggs sketch_p99`, 500k points,
   5 reps, correctness PASS).
   The underlying point/range read speedups are quantified at the codec layer in
   [`weft-physical-type/benches/pointread.rs`](weft-physical-type/benches/pointread.rs).
