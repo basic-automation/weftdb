@@ -653,6 +653,16 @@ detection within Y% and improving historical query latency by Z."*
       Chimp128 **19.8→4.45**, Elf 29.4→5.58 ms. Range across all three corpora: 2.7–10.9×. ALP
       (0.57 ms, 15.35 b) is still the fastest and smallest on BTC, but the decode gap to Chimp128
       is now 7.8×, not 30×.
+    - [x] **DONE (2026-10-08) — the ~2.4 ms "frame parse" floor under every read was the CRC.**
+      `weftseg::crc32` was a byte-at-a-time table CRC over the whole frame body, run by every read
+      (~0.5 GB/s). Now slicing-by-16 (same IEEE polynomial, identical checksums, no dependency).
+      A/B: 1M-row point read **2.50→0.81 ms**, 1000-row range 2.32→0.63 ms; `pointread` streaming point
+      185→56 µs, paged 175→33 µs, 64-instant batch 189→67 µs. README read table re-measured.
+    - [ ] **Next read-path floor: every point read still CRCs the whole frame.** Now ~0.8 ms on a
+      1M-row frame, against the ~10 GB/s a CLMUL CRC reaches. Two options. Add a per-block
+      (or per-page) checksum so a point read verifies only the bytes it decodes; this is a format
+      bump, but the paged frame already has the page structure. Or adopt a hardware CRC (`crc32fast`,
+      a pure codec crate). The per-block checksum is the one that changes the asymptotics.
   - [ ] **Set the ALP acceptance bar from upstream's own ablation, and be willing to DECLINE.**
     FastLanes' per-encoding ablation (VLDB'25, Table 7, PUBLIC_BI) reports ALP at **+4.36%
     compression ratio for −7.28% decompression speed**, with ALP_RD +0.57%/−2.30% and Patch

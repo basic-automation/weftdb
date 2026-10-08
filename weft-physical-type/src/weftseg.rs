@@ -128,15 +128,61 @@ const fn crc32_table() -> [u32; 256] {
 /// The precomputed CRC-32 table.
 const CRC32_TABLE: [u32; 256] = crc32_table();
 
+/// Slicing-by-16 tables: `CRC32_SLICES[k][b]` is the CRC contribution of byte `b`
+/// followed by `k` zero bytes, so sixteen input bytes fold into the CRC with sixteen
+/// independent lookups instead of sixteen dependent ones. `CRC32_SLICES[0]` is
+/// [`CRC32_TABLE`].
+const CRC32_SLICES: [[u32; 256]; 16] = {
+	let mut slices = [[0_u32; 256]; 16];
+	slices[0] = CRC32_TABLE;
+	let mut k = 1;
+	while k < 16 {
+		let mut i = 0;
+		while i < 256 {
+			let prev = slices[k - 1][i];
+			slices[k][i] = (prev >> 8) ^ CRC32_TABLE[(prev & 0xFF) as usize];
+			i += 1;
+		}
+		k += 1;
+	}
+	slices
+};
+
 /// IEEE CRC-32 (zlib/PNG variant) over a byte slice.
 ///
 /// Used to checksum the body of a `.weftseg` frame so a single flipped or dropped
 /// byte is detected on read rather than silently misinterpreted. Standard test
 /// vector: `crc32(b"123456789") == 0xCBF4_3926`.
+///
+/// Processes sixteen bytes per step with the slicing-by-16 tables (`CRC32_SLICES`),
+/// then the tail a byte at a time. The result is identical to the byte-at-a-time
+/// table CRC; every read verifies the whole frame body, so this is on every point read's
+/// critical path.
 #[must_use]
 pub fn crc32(data: &[u8]) -> u32 {
+	let t = &CRC32_SLICES;
 	let mut crc = 0xFFFF_FFFF_u32;
-	for &byte in data {
+	let (chunks, tail) = data.as_chunks::<16>();
+	for c in chunks {
+		let a = crc ^ u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+		crc = t[15][(a & 0xFF) as usize]
+			^ t[14][((a >> 8) & 0xFF) as usize]
+			^ t[13][((a >> 16) & 0xFF) as usize]
+			^ t[12][(a >> 24) as usize]
+			^ t[11][usize::from(c[4])]
+			^ t[10][usize::from(c[5])]
+			^ t[9][usize::from(c[6])]
+			^ t[8][usize::from(c[7])]
+			^ t[7][usize::from(c[8])]
+			^ t[6][usize::from(c[9])]
+			^ t[5][usize::from(c[10])]
+			^ t[4][usize::from(c[11])]
+			^ t[3][usize::from(c[12])]
+			^ t[2][usize::from(c[13])]
+			^ t[1][usize::from(c[14])]
+			^ t[0][usize::from(c[15])];
+	}
+	for &byte in tail {
 		let idx = ((crc ^ u32::from(byte)) & 0xFF) as usize;
 		crc = (crc >> 8) ^ CRC32_TABLE[idx];
 	}
@@ -2586,6 +2632,26 @@ pub fn read_paged_segment(bytes: &[u8]) -> Result<PagedSegment, WeftSegError> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn crc32_slicing_by_16_matches_the_byte_at_a_time_crc() {
+		// The sliced CRC must equal the plain table CRC for every length around and across
+		// the 16-byte step, including the empty input.
+		let bytewise = |data: &[u8]| {
+			let mut crc = 0xFFFF_FFFF_u32;
+			for &byte in data {
+				crc = (crc >> 8) ^ CRC32_TABLE[((crc ^ u32::from(byte)) & 0xFF) as usize];
+			}
+			crc ^ 0xFFFF_FFFF
+		};
+		let data: Vec<u8> = (0..1_000_u32).map(|i| u8::try_from(i.wrapping_mul(2_654_435_761) >> 24).unwrap_or(0)).collect();
+		for len in (0..80).chain([255, 256, 257, 999, 1_000]) {
+			assert_eq!(crc32(&data[..len]), bytewise(&data[..len]), "length {len}");
+		}
+		for start in 1..17 {
+			assert_eq!(crc32(&data[start..]), bytewise(&data[start..]), "offset {start}");
+		}
+	}
 
 	#[test]
 	fn crc32_matches_the_standard_vector() {

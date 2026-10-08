@@ -267,12 +267,13 @@ specification for your hardware.
 
 | Operation | WeftDB | Naive full decode | Gain |
 |---|---|---|---|
-| Point lookup, 100k-row segment | **192 µs** | 11.9 ms | ~62× |
-| Point lookup, paged frame | **169 µs** | 1.20 ms | ~7.1× |
-| Batch of 64 instants | **521 µs** | 13.9 ms | ~27× |
-| 100-row window over 100k rows | **629 µs** | 12.7 ms | ~20× |
+| Point lookup, 100k-row segment | **56 µs** | 2.60 ms | ~46× |
+| Point lookup, paged frame | **33 µs** | 279 µs | ~8.5× |
+| Batch of 64 instants (one pass vs 64 single lookups) | **67 µs** | 3.57 ms | ~54× |
+| 100-row window over 100k rows | **58 µs** | 2.73 ms | ~47× |
 
-*Source: [`weft-physical-type/benches/pointread.rs`](weft-physical-type/benches/pointread.rs).*
+*Source: [`weft-physical-type/benches/pointread.rs`](weft-physical-type/benches/pointread.rs),
+re-measured 2026-10-08 after the word-wise bit reads and the slicing-by-16 frame CRC.*
 The wins come from skipping the value column entirely until a specific row is needed,
 and from resolving regular timestamp columns in closed form.
 
@@ -912,9 +913,9 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   **Honest result: no read-path win over the linear codec.** Measured on a 1M-row zero-straddling
   column ([`weft-physical-type/benches/transposed_read.rs`](weft-physical-type/benches/transposed_read.rs),
   2026-10-08, transposed vs linear): frame bytes **+0.08%** (1,251,057 vs 1,250,076), full decode
-  **7.81 ms vs 6.87 ms**, windowed 1000-row range **3.54 ms vs 2.46 ms**, single point read
-  **2.61 ms vs 2.47 ms**. The point read is dominated by the ~2.4 ms frame parse/CRC both layouts
-  share. So the layout is byte-neutral and slightly slower on reads; it stays **opt-in** and the
+  **7.81 ms vs 6.87 ms**; with the slicing-by-16 frame CRC, windowed 1000-row range **638 µs vs
+  632 µs** and single point read **820 µs vs 805 µs**. So the layout is byte-neutral and no faster
+  (slightly slower) on reads; it stays **opt-in** and the
   default codec choice is unchanged.
   Note the codec is chosen only when a *strict* size win or within the caller's overhead ceiling —
   the ceiling may legitimately be set below 1.0, because per-tile widths with one header per 1024
@@ -936,9 +937,9 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   does the same for a paged frame, first pruning pages on their indexed min/max timestamp so only
   the surviving page is touched. A **regular (constant-stride) timestamp column** is resolved in
   closed form — `ts[i] = first + i*step`, so the row for an instant is `O(1)` with no timestamp
-  materialization at all. Measured **~62× faster** point lookup on a 100k-row single-block FOR
-  segment (192 µs vs 11.9 ms) and **~7.1× faster** on the paged frame (169 µs vs 1.20 ms), with the
-  closed-form timestamp path a further **~7×** over an irregular column (192 µs vs 1.34 ms), identical
+  materialization at all. Measured **~46× faster** point lookup on a 100k-row single-block FOR
+  segment (56 µs vs 2.60 ms) and **~8.5× faster** on the paged frame (33 µs vs 279 µs), with the
+  closed-form timestamp path a further **~3.4×** over an irregular column (56 µs vs 188 µs), identical
   bytes on disk ([`weft-physical-type/benches/pointread.rs`](weft-physical-type/benches/pointread.rs)).
 - **Checkpointed frames — sublinear point lookup on an *irregular* sorted column** *(opt-in;
   `write_segment_checkpointed` / `write_paged_segment_checkpointed`)*. The closed form above only
@@ -1000,8 +1001,8 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   min/max timestamp without decoding a column byte** before touching the one surviving page.
   `SegmentStore::read_points` resolves a **batch** of instants in one pass — the index is pruned
   once and each segment's timestamp column decoded once for the whole batch, so `N` instants
-  sharing a segment cost one decode, not `N` (**~27× faster** for 64 instants on a 100k-row FOR
-  frame — 452 µs vs 12.2 ms,
+  sharing a segment cost one decode, not `N` (**~54× faster** for 64 instants on a 100k-row FOR
+  frame than 64 single lookups — 67 µs vs 3.57 ms,
   [`weft-physical-type/benches/pointread.rs`](weft-physical-type/benches/pointread.rs)).
 - **Intra-segment reconciliation** — `SegmentStore::reconcile_segment`/`reconcile_aspect`
   rewrite an out-of-order segment into a sorted one in place (stable sort by
@@ -1062,8 +1063,8 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   nulls there are skipped). A **range read over a regular (constant-stride)
   block-coded segment** goes further — `read_segment_range` computes the row
   window in closed form and unpacks only the present values inside it, so a
-  selective range decodes ~`window` values, not the whole segment (**~20× faster**
-  for a 100-row window over a 100k-row FOR frame — 629 µs vs 12.7 ms,
+  selective range decodes ~`window` values, not the whole segment (**~47× faster**
+  for a 100-row window over a 100k-row FOR frame — 58 µs vs 2.73 ms,
   [`weft-physical-type/benches/pointread.rs`](weft-physical-type/benches/pointread.rs)).
 - **Control plane** — `SegmentIndexStore` persists one descriptor per sealed
   segment in libSQL and answers range queries with SQL pruning;
