@@ -59,7 +59,7 @@ pub const MAX_ASPECT_NAME_BYTES: usize = 160;
 
 /// The longest prefix of a rejected name an [`InvalidAspectName`] message quotes, in
 /// characters, so an oversized name cannot flood a log line or an error response.
-const MESSAGE_NAME_CHARS: usize = 64;
+pub(crate) const MESSAGE_NAME_CHARS: usize = 64;
 
 /// Windows device names that cannot be used as a file name, with or without an
 /// extension or a stream suffix. Compared case-insensitively against the part of a name
@@ -173,8 +173,8 @@ const fn is_deceptive_format_character(c: char) -> bool {
 
 /// The first rule `name` breaks, or [`None`] when it is a valid aspect name. `windows`
 /// adds the Windows-only character rule; it is a parameter so both rule sets are tested
-/// on every platform.
-fn reason(name: &str, windows: bool) -> Option<AspectNameReason> {
+/// on every platform. [`dictionary_name`](crate::dictionary_name) applies the same rules.
+pub(crate) fn reason(name: &str, windows: bool) -> Option<AspectNameReason> {
 	if name.is_empty() {
 		return Some(AspectNameReason::Empty);
 	}

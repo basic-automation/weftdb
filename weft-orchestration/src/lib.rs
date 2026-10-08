@@ -448,6 +448,8 @@ mod debug_batch_test;
 mod memory_test;
 #[cfg(test)]
 mod pattern_fix_test;
+#[cfg(test)]
+mod test_support;
 
 // Re-export main Pipeline API
 // Re-export built-in detectors
@@ -887,21 +889,28 @@ pub async fn build_patterns_queue(database: &Database, aspect_id: &weftdb::Aspec
 ///
 /// Returns an error if:
 /// - Database operations fail (getting patterns, dequeuing patterns)
+/// - The dictionary's name cannot name its database file
+///   ([`weftdb::InvalidDictionaryName`])
 /// - The dictionary is not registered yet and registering it fails, e.g. because its step
 ///   interpolation is one splimes rejects
 /// - Pattern import fails during dictionary loading
 /// - Memory calculation fails
 pub async fn load_dictionary(database: &Database, aspect_id: &weftdb::AspectId, dictionary: &mut Dictionary) -> Result<()> {
 	// Register the dictionary (its description, steps and variabilities) the first time the
-	// aspect sees it. A registration that exists but cannot be read, such as a stored step
-	// method splimes rejects, is reported and left for the user to repair: overwriting it
-	// would lose what was stored, and this dictionary still works from its own constraints.
+	// aspect sees it. `register_dictionary_if_absent` checks again inside its write, so a
+	// registration committed after this read (an explicit `set_dictionary_metadata` with
+	// tuned constraints, say) is kept rather than overwritten with this pipeline's own. A
+	// registration that exists but cannot be read, such as a stored step method splimes
+	// rejects, is reported and left for the user to repair: overwriting it would lose what
+	// was stored, and this dictionary still works from its own constraints.
 	match database.get_dictionary_metadata(aspect_id, dictionary.name()).await {
 		Ok(Some(_)) => {}
 		Ok(None) => {
 			let metadata = weftdb::DictionaryMetadata { id: *dictionary.id(), name: dictionary.name().to_string(), description: dictionary.description().to_string(), constraints: dictionary.constraints().clone() };
-			database.set_dictionary_metadata(aspect_id, dictionary.name(), &metadata).await?;
+			database.register_dictionary_if_absent(aspect_id, dictionary.name(), &metadata).await?;
 		}
+		// A name that cannot name a file has no registration to leave alone.
+		Err(e) if e.downcast_ref::<weftdb::InvalidDictionaryName>().is_some() => return Err(e),
 		Err(e) => {
 			tracing::warn!(error = %e, dictionary = dictionary.name(), "Failed to read dictionary metadata; leaving the stored registration as it is");
 		}
@@ -1415,9 +1424,10 @@ mod tests {
 	use serde_json::json;
 	use serial_test::serial;
 	use splimes::Spline;
-	use weftdb::{data_dir, AspectId, Database, DatasetId, InputMeasurement, Resolution};
+	use weftdb::{AspectId, Database, DatasetId, InputMeasurement, Resolution};
 
 	use super::*;
+	use crate::test_support::{data_dir, remove_database};
 
 	#[tokio::test]
 	#[serial]
@@ -1432,9 +1442,12 @@ mod tests {
 			return Ok(());
 		}
 
-		// Debug: Show where we're looking for the database
-		tracing::info!(path = %format!("{}/Crypto", data_dir()), "Looking for Crypto database");
-		tracing::debug!(metadata_path = %format!("{}/Crypto/metadata.db", data_dir()), "Metadata file location");
+		// Point this binary at its test data dir before opening anything. A plain statement,
+		// never a log field: tracing evaluates fields only for enabled events, so under a
+		// filter without info `Database::existing` would resolve the real ~/.weftdb/data.
+		let crypto = data_dir().join("Crypto");
+		tracing::info!(path = %crypto.display(), "Looking for Crypto database");
+		tracing::debug!(metadata_path = %crypto.join("metadata.db").display(), "Metadata file location");
 
 		// Try to get the Crypto database, skip test if it doesn't exist or doesn't have the required data
 		let database = match Database::existing("Crypto").await {
@@ -1686,8 +1699,10 @@ mod tests {
 			return Ok(());
 		}
 
-		// Debug: Show where we're looking for the database
-		tracing::info!(path = %format!("{}/Crypto", data_dir()), "Looking for Crypto database");
+		// Point this binary at its test data dir before opening anything, as a plain statement
+		// (see `test_api`).
+		let crypto = data_dir().join("Crypto");
+		tracing::info!(path = %crypto.display(), "Looking for Crypto database");
 
 		// Try to get the Crypto database, skip test if it doesn't exist or doesn't have the required data
 		let database = match Database::existing("Crypto").await {
@@ -2042,6 +2057,7 @@ mod tests {
 				drop(signals_lock);
 			}
 		}
+		discard_database("TestDB").await;
 		Ok(())
 	}
 
@@ -2214,6 +2230,7 @@ mod tests {
 		}
 
 		tracing::info!("Pipeline API precise test completed successfully!");
+		discard_database("TestDB").await;
 		Ok(())
 	}
 
@@ -2226,27 +2243,24 @@ mod tests {
 		.collect()
 	}
 
-	async fn fake_database() -> Database {
-		// Cleanup existing test database if it exists
-		use std::fs::remove_dir_all;
-
-		use weftdb::{clear_connection_cache_by_name, DATABASES};
-
-		// Clear any cached database entry for TestDB before recreating
+	/// Forget database `db_name`, which a test created under a fixed name, and remove it from
+	/// the test data dir: its entry in `weftdb::DATABASES` and its cached connections go
+	/// first, so that the next `Database::new` of that name starts afresh.
+	async fn discard_database(db_name: &str) {
 		{
-			let mut databases = DATABASES.lock().await;
-			// Find and remove any existing TestDB entry by name
-			let keys_to_remove: Vec<_> = databases.iter().filter(|(_, info)| info.name() == "TestDB").map(|(id, _)| *id).collect();
+			let mut databases = weftdb::DATABASES.lock().await;
+			let keys_to_remove: Vec<_> = databases.iter().filter(|(_, info)| info.name() == db_name).map(|(id, _)| *id).collect();
 			for key in keys_to_remove {
 				databases.remove(&key);
 			}
 		}
+		weftdb::clear_connection_cache_by_name(db_name).await;
+		remove_database(db_name);
+	}
 
-		// Also clear the connection cache to release file handles
-		clear_connection_cache_by_name("TestDB").await;
-
-		let db_path = format!("{}/TestDB", data_dir());
-		remove_dir_all(&db_path).ok();
+	async fn fake_database() -> Database {
+		// Remove the database an earlier test left
+		discard_database("TestDB").await;
 
 		let db = Database::new("TestDB").await.unwrap();
 		let test_subject = db.observe_subject("TestSubject").await.unwrap();
@@ -2272,16 +2286,13 @@ mod tests {
 	#[tokio::test]
 	#[serial]
 	async fn test_batch_processing() -> Result<()> {
-		use std::fs::remove_dir_all;
-
 		// Skip this test if running in CI or if we want fast feedback
 		if std::env::var("SKIP_SLOW_TESTS").is_ok() {
 			tracing::info!("Skipping test_batch_processing due to SKIP_SLOW_TESTS environment variable");
 			return Ok(());
 		}
 
-		let db_path = format!("{}/test_bath_processing", data_dir());
-		remove_dir_all(&db_path).ok();
+		remove_database("test_bath_processing");
 
 		let db = Database::new("test_bath_processing").await.unwrap();
 		let test_subject = db.observe_subject("TestSubject").await.unwrap();
@@ -2333,22 +2344,20 @@ mod tests {
 		// With 15 points and batch size 10, sliding window creates: 15 - 10 + 1 = 6 overlapping batches
 		assert_eq!(processed_batches.len(), 6);
 
+		remove_database("test_bath_processing");
 		Ok(())
 	}
 
 	#[tokio::test]
 	#[serial]
 	async fn test_specific_process_batch() -> Result<()> {
-		use std::fs::remove_dir_all;
-
 		// Skip this test if running in CI or if we want fast feedback
 		if std::env::var("SKIP_SLOW_TESTS").is_ok() {
 			tracing::info!("Skipping test_specific_process_batch due to SKIP_SLOW_TESTS environment variable");
 			return Ok(());
 		}
 
-		let db_path = format!("{}/test_specific_process_batch", data_dir());
-		remove_dir_all(&db_path).ok();
+		remove_database("test_specific_process_batch");
 
 		let db = Database::new("test_specific_process_batch").await.unwrap();
 		let test_subject = db.observe_subject("TestSubject").await.unwrap();
@@ -2400,6 +2409,7 @@ mod tests {
 		// With 15 points and batch size 10, sliding window creates: 15 - 10 + 1 = 6 overlapping batches
 		assert_eq!(processed_batches.len(), 6);
 
+		remove_database("test_specific_process_batch");
 		Ok(())
 	}
 
@@ -2586,29 +2596,17 @@ mod tests {
 		assert!(!Pipeline::exists(&db, &aspect.id()).await?);
 
 		tracing::info!("test_pipeline_api completed successfully!");
+		discard_database("TestDB").await;
 		Ok(())
 	}
 
 	#[tokio::test]
 	#[serial]
 	async fn test_load_or_create_pipeline() -> Result<()> {
-		use std::fs::remove_dir_all;
-
-		use weftdb::clear_connection_cache_by_name;
-
 		tracing::info!("=== Testing Pipeline::load_or_create ===");
 
 		// Cleanup
-		{
-			let mut databases = weftdb::DATABASES.lock().await;
-			let keys_to_remove: Vec<_> = databases.iter().filter(|(_, info)| info.name() == "TestLoadOrCreate").map(|(id, _)| *id).collect();
-			for key in keys_to_remove {
-				databases.remove(&key);
-			}
-		}
-		clear_connection_cache_by_name("TestLoadOrCreate").await;
-		let db_path = format!("{}/TestLoadOrCreate", data_dir());
-		remove_dir_all(&db_path).ok();
+		discard_database("TestLoadOrCreate").await;
 
 		// Create database with test data
 		let db = Database::new("TestLoadOrCreate").await?;
@@ -2644,6 +2642,9 @@ mod tests {
 
 		// Cleanup
 		pipeline.delete().await?;
+		drop(pipeline);
+		drop(db);
+		discard_database("TestLoadOrCreate").await;
 
 		tracing::info!("test_load_or_create_pipeline completed successfully!");
 		Ok(())
@@ -2652,23 +2653,10 @@ mod tests {
 	#[tokio::test]
 	#[serial]
 	async fn test_run_subject_pipelines() -> Result<()> {
-		use std::fs::remove_dir_all;
-
-		use weftdb::clear_connection_cache_by_name;
-
 		tracing::info!("=== Testing run_subject_pipelines ===");
 
 		// Cleanup
-		{
-			let mut databases = weftdb::DATABASES.lock().await;
-			let keys_to_remove: Vec<_> = databases.iter().filter(|(_, info)| info.name() == "TestParallelPipelines").map(|(id, _)| *id).collect();
-			for key in keys_to_remove {
-				databases.remove(&key);
-			}
-		}
-		clear_connection_cache_by_name("TestParallelPipelines").await;
-		let db_path = format!("{}/TestParallelPipelines", data_dir());
-		remove_dir_all(&db_path).ok();
+		discard_database("TestParallelPipelines").await;
 
 		// Create database with multiple aspects
 		let db = Database::new("TestParallelPipelines").await?;
@@ -2711,6 +2699,9 @@ mod tests {
 			);
 		}
 
+		drop(db);
+		discard_database("TestParallelPipelines").await;
+
 		tracing::info!("test_run_subject_pipelines completed successfully!");
 		Ok(())
 	}
@@ -2719,9 +2710,15 @@ mod tests {
 	/// variabilities. It used to store only a metadata row, which `get_dictionary_metadata`
 	/// never found, so every load (two per `Pipeline::extract_patterns`) added another row
 	/// and the dictionary's constraints were never stored.
+	///
+	/// It registers through `register_dictionary_if_absent`, which keeps a registration
+	/// committed between `load_dictionary`'s read and its write. That needs a writer inside
+	/// that window, so it is not tested here: weftdb's
+	/// `test_register_dictionary_if_absent_keeps_a_complete_registration` tests the method.
 	#[tokio::test]
 	async fn load_dictionary_registers_a_dictionary_once() -> Result<()> {
 		let db_name = format!("load_dictionary_{}", uuid::Uuid::new_v4());
+		remove_database(&db_name);
 		let db = Database::new(&db_name).await?;
 		let subject = db.observe_subject("subject").await?;
 		let aspect = db.track_aspect(&subject.id(), "aspect", &Resolution::Seconds, None).await?;
@@ -2747,7 +2744,63 @@ mod tests {
 		let listed = db.list_dictionaries(&aspect.id()).await?;
 		assert_eq!(listed.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["pipeline"]);
 
-		std::fs::remove_dir_all(format!("{}/{db_name}", data_dir())).ok();
+		remove_database(&db_name);
+		Ok(())
+	}
+
+	/// The stored registration's `steps_interpolation` and its number of metadata rows.
+	async fn stored_registration(db: &Database, aspect_id: &AspectId, dictionary: &str) -> Result<(String, i64)> {
+		let conn = db.get_dictionary_db(aspect_id, dictionary).await?.connect()?;
+		let mut rows = conn.query("SELECT steps_interpolation FROM dictionary_constraints", ()).await?;
+		let interpolation = rows.next().await?.expect("a constraints row").get_value(0)?.as_text().expect("text").clone();
+		drop(rows);
+		let mut rows = conn.query("SELECT COUNT(*) FROM dictionary_metadata", ()).await?;
+		let count = *rows.next().await?.expect("a count").get_value(0)?.as_integer().expect("an integer count");
+		Ok((interpolation, count))
+	}
+
+	/// A registration that cannot be read, such as a stored step method splimes rejects, is
+	/// left alone: `load_dictionary` logs the error and goes on with its own constraints
+	/// instead of registering the dictionary again over what was stored.
+	#[tokio::test]
+	async fn load_dictionary_leaves_an_unreadable_registration_alone() -> Result<()> {
+		let db_name = format!("load_dictionary_unreadable_{}", uuid::Uuid::new_v4());
+		remove_database(&db_name);
+		let db = Database::new(&db_name).await?;
+		let subject = db.observe_subject("subject").await?;
+		let aspect = db.track_aspect(&subject.id(), "aspect", &Resolution::Seconds, None).await?;
+		let constraints = DictionaryConstraints::new(Some(Steps::new(10, Spline::Polynomial(8, None))), None);
+		let mut dictionary = Dictionary::new("pipeline".to_string(), "a pipeline dictionary".to_string(), constraints);
+		load_dictionary(&db, &aspect.id(), &mut dictionary).await?;
+
+		let degree_9 = "Polynomial(degree: 9, bounds_factor: None)";
+		let conn = db.get_dictionary_db(&aspect.id(), "pipeline").await?.connect()?;
+		assert_eq!(conn.execute(format!("UPDATE dictionary_constraints SET steps_interpolation = '{degree_9}'"), ()).await?, 1);
+		assert!(db.get_dictionary_metadata(&aspect.id(), "pipeline").await.is_err(), "the stored degree 9 does not load");
+
+		load_dictionary(&db, &aspect.id(), &mut dictionary).await?;
+		assert_eq!(stored_registration(&db, &aspect.id(), "pipeline").await?, (degree_9.to_string(), 1), "the stored registration is unchanged");
+
+		remove_database(&db_name);
+		Ok(())
+	}
+
+	/// A dictionary whose name cannot name its database file is an error, not a
+	/// registration it reads as unreadable and leaves alone.
+	#[tokio::test]
+	async fn load_dictionary_refuses_an_invalid_name() -> Result<()> {
+		let db_name = format!("load_dictionary_invalid_{}", uuid::Uuid::new_v4());
+		remove_database(&db_name);
+		let db = Database::new(&db_name).await?;
+		let subject = db.observe_subject("subject").await?;
+		let aspect = db.track_aspect(&subject.id(), "aspect", &Resolution::Seconds, None).await?;
+		let mut dictionary = Dictionary::new("../escape".to_string(), "outside".to_string(), DictionaryConstraints::default());
+
+		let err = load_dictionary(&db, &aspect.id(), &mut dictionary).await.expect_err("an invalid name");
+		assert_eq!(err.downcast_ref::<weftdb::InvalidDictionaryName>().map(weftdb::InvalidDictionaryName::name), Some("../escape"));
+		assert!(!data_dir().join(&db_name).join("subject").join("aspect").join("escape.db").exists());
+
+		remove_database(&db_name);
 		Ok(())
 	}
 }

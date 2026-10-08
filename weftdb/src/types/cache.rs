@@ -266,6 +266,11 @@ impl CacheableEntry {
 #[derive(Debug)]
 pub struct DatabaseCache {
 	cache: Arc<RwLock<HashMap<String, CacheableEntry>>>,
+	/// How many times each key was invalidated through
+	/// [`invalidate_generation`](Self::invalidate_generation); see
+	/// [`generation`](Self::generation). Only keys a writer replaces have one, so it stays
+	/// small. Always locked after `cache`, never before.
+	generations: Arc<RwLock<HashMap<String, u64>>>,
 	max_entries: usize,
 	ttl: Duration,
 }
@@ -281,7 +286,7 @@ impl DatabaseCache {
 		let adjusted_max_entries = available_gb * 100;
 		let ttl = Duration::from_secs(600);
 
-		Self { cache: Arc::new(RwLock::new(HashMap::new())), max_entries: adjusted_max_entries, ttl }
+		Self { cache: Arc::new(RwLock::new(HashMap::new())), generations: Arc::new(RwLock::new(HashMap::new())), max_entries: adjusted_max_entries, ttl }
 	}
 
 	/// Get a value from cache with type checking
@@ -319,6 +324,46 @@ impl DatabaseCache {
 		cache.remove(cache_key);
 	}
 
+	/// The generation of `cache_key`: how many times a writer has invalidated it with
+	/// [`invalidate_generation`](Self::invalidate_generation).
+	///
+	/// A reader takes it *before* it opens the transaction it reads the value in, and
+	/// caches what it read with [`store_if_generation`](Self::store_if_generation). A
+	/// writer that commits a new value in between invalidates the key after its commit,
+	/// which a plain [`store`](Self::store) by that reader would undo: its snapshot can
+	/// predate the commit, and the old value would then be served until the TTL expires.
+	pub async fn generation(&self, cache_key: &str) -> u64 {
+		self.generations.read().await.get(cache_key).copied().unwrap_or(0)
+	}
+
+	/// Remove `cache_key`'s value and start its next [`generation`](Self::generation), so
+	/// a reader that took the previous one does not store what it read. A writer calls it
+	/// after its commit.
+	pub async fn invalidate_generation(&self, cache_key: &str) {
+		let mut cache = self.cache.write().await;
+		cache.remove(cache_key);
+		let mut generations = self.generations.write().await;
+		let generation = generations.entry(cache_key.to_string()).or_insert(0);
+		*generation = generation.wrapping_add(1);
+	}
+
+	/// [`store`](Self::store) `value` under `cache_key` unless the key was invalidated with
+	/// [`invalidate_generation`](Self::invalidate_generation) since the reader took
+	/// `generation`. Returns whether it stored the value.
+	pub async fn store_if_generation<T: Cacheable>(&self, cache_key: &str, generation: u64, value: T) -> bool {
+		let mut cache = self.cache.write().await;
+		// Holding `cache` keeps an `invalidate_generation` from running between this check
+		// and the insert.
+		if self.generations.read().await.get(cache_key).copied().unwrap_or(0) != generation {
+			return false;
+		}
+		if cache.len() >= self.max_entries {
+			Self::evict_lru(&mut cache);
+		}
+		cache.insert(cache_key.to_string(), CacheableEntry::new(Box::new(value)));
+		true
+	}
+
 	fn evict_lru(cache: &mut HashMap<String, CacheableEntry>) {
 		let evict_count = cache.len() / 10;
 		if evict_count == 0 {
@@ -342,5 +387,30 @@ impl DatabaseCache {
 impl Default for DatabaseCache {
 	fn default() -> Self {
 		Self::new()
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// A reader that took the generation before a writer's commit does not cache what it
+	/// read: its snapshot may predate the commit.
+	#[tokio::test]
+	async fn a_store_from_before_an_invalidation_is_skipped() {
+		let cache = DatabaseCache::new();
+		let reader = cache.generation("key").await;
+		cache.store("key", "old".to_string()).await;
+		cache.invalidate_generation("key").await;
+		assert_eq!(cache.get::<String>("key").await, None, "the writer removed the value");
+
+		assert!(!cache.store_if_generation("key", reader, "old".to_string()).await, "the reader's store is skipped");
+		assert_eq!(cache.get::<String>("key").await, None);
+
+		let next = cache.generation("key").await;
+		assert_ne!(next, reader);
+		assert!(cache.store_if_generation("key", next, "new".to_string()).await, "a reader after the write stores");
+		assert_eq!(cache.get::<String>("key").await.as_deref(), Some("new"));
+		assert!(cache.store_if_generation("other", cache.generation("other").await, "x".to_string()).await, "a key never invalidated is at generation 0");
 	}
 }

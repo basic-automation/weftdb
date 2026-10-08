@@ -133,6 +133,17 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" != "schedule" ]; then export SKIP_SLOW_TESTS=1; fi
           cargo test --workspace --locked -- --test-threads=4
+      # Tests create their legacy databases in a temporary data dir (weftdb/tests/common,
+      # weft-orchestration's test_support, db_tests' own temp dirs), never in the default
+      # ~/.weftdb/data. A fresh runner has no ~/.weftdb, so one here was written by a test.
+      - name: Tests wrote nothing to ~/.weftdb
+        shell: bash
+        run: |
+          if [ -e "$HOME/.weftdb" ]; then
+            echo "::error::the test run wrote to $HOME/.weftdb; a test must create its databases in a temporary data dir"
+            find "$HOME/.weftdb" -maxdepth 3 | head -n 50
+            exit 1
+          fi
 
   # The workspace jobs never see weft-physical-type's cargo features on their own terms:
   # resolver 2 unifies features across `--workspace`, so weft-bench's `experimental-codecs`

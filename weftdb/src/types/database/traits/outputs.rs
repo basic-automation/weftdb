@@ -70,22 +70,43 @@ pub trait Outputs {
 
 	/// The registration of the aspect's dictionary `dictionary_name`: its id, description,
 	/// steps and variabilities. `None` when there is none, because the dictionary has no
-	/// database yet or nothing complete is registered in it.
+	/// database yet, its database has no tables yet, or nothing complete is registered in
+	/// it.
+	///
+	/// A registration that was read is cached for up to ten minutes, per `Database`
+	/// handle. [`set_dictionary_metadata`](crate::database::traits::Inputs::set_dictionary_metadata)
+	/// and [`register_dictionary_if_absent`](crate::database::traits::Inputs::register_dictionary_if_absent)
+	/// on the same handle invalidate it, and a read that overlapped such a write does not
+	/// cache what it read. A registration written any other way, through
+	/// [`AspectStructure::new_dictionary`](crate::database::traits::AspectStructure::new_dictionary),
+	/// another handle or another process, can be answered from the cache until the entry
+	/// expires.
 	///
 	/// # Errors
 	///
-	/// A failed read, or a stored value that does not parse, such as a step interpolation
-	/// splimes rejects.
+	/// An [`InvalidDictionaryName`](crate::InvalidDictionaryName) for a name that cannot
+	/// name a dictionary's file, a failed read, or a stored value that does not parse, such
+	/// as a step interpolation splimes rejects.
 	async fn get_dictionary_metadata(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<Option<DictionaryMetadata>>;
 
 	/// The registration of each of the aspect's dictionaries, by name, as
-	/// [`get_dictionary_metadata`](Self::get_dictionary_metadata) reads it; a dictionary
-	/// without one is not listed.
+	/// [`get_dictionary_metadata`](Self::get_dictionary_metadata) reads it.
+	///
+	/// The aspect's dictionaries are the regular files `<name>.db` in its `dictionaries/`
+	/// directory whose `<name>` is a valid dictionary name; symlinks, directories and other
+	/// entries are skipped. Each of them is opened, which sets its journal mode and can
+	/// create the dictionary tables in it, so keep copies and backups out of that directory
+	/// or give them another extension. A dictionary without a registration is not listed,
+	/// and one whose stored registration does not parse (such as a stored step
+	/// interpolation splimes rejects) is logged as a warning and skipped, so the readable
+	/// ones are still listed; `get_dictionary_metadata` reports why it does not parse.
 	///
 	/// # Errors
 	///
-	/// As `get_dictionary_metadata`, for any of them, or when the aspect's dictionaries
-	/// directory cannot be read.
+	/// When the aspect is unknown, its dictionaries directory cannot be read, or reading a
+	/// dictionary's registration fails (I/O, a query, an MVCC conflict such as `Busy`):
+	/// such a failure fails the whole listing, so a dictionary is never left out of it
+	/// only because it could not be read this time.
 	async fn list_dictionaries(&self, aspect_id: &AspectId) -> Result<Vec<DictionaryMetadata>>;
 
 	async fn get_dictionary_pattern(&self, aspect_id: &AspectId, dictionary_name: &str, pattern_id: &PatternID) -> Result<Pattern>;
