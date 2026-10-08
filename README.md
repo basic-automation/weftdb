@@ -325,7 +325,7 @@ root exits at startup with an error naming the first one's pid.
 | Method & path | Purpose |
 |---------------|---------|
 | `GET /health` | Liveness. |
-| `GET /ready` | Readiness, including the segment-store dependency check. |
+| `GET /ready` | Readiness, including the segment-store dependency check. With a store, `poisoned` / `restart_required` report that a segment-index COMMIT failed in a way that may still have committed, so the store refuses writes until the server restarts (reads keep working, and `ready` stays `true`); `poison_reason` says which transaction and error. |
 | `GET /metrics` | Prometheus text exposition — request/error/output counters, ingest counters (`weft_ingest_*`), and **latency histograms** for the compute and storage-ingest paths. |
 | `GET /debug/profile/current` | Live p50/p95/p99 latency snapshot per instrumented path. |
 
@@ -537,6 +537,7 @@ WeftDB is configured primarily through environment variables:
 | `WEFT_EXTRACTED_BATCH_RETENTION_SECS` | `weftdb` | How long (seconds) a legacy aspect remembers the batches pattern extraction consumed, so the incremental build does not queue them again. Each extraction deletes older records, keeping about one row per resolution step of this period. Set it above the longest interval between pipeline runs of an aspect plus the longest ingest call; a non-positive or unparsable value keeps the default. | `172800` (48 hours) |
 | `WEFT_SERVER_ADDR` | `weft-server` | HTTP bind address. | `127.0.0.1:8080` |
 | `WEFT_SEGMENT_STORE_ROOT` | `weft-server` | Root of the Storage v2 segment store; enables the `/storage` endpoints. | unset (storage endpoints answer `503`) |
+| `WEFT_ON_AMBIGUOUS_COMMIT` | `weft-server` | What the segment store does after a COMMIT that may or may not have committed: `poison` refuses every write until the server restarts, while reads keep working and `GET /ready` reports `poisoned`; `exit` logs and exits with status 70, for a supervisor that restarts the server. The restart's open settles the transaction either way. Read when the store opens. | unset (`poison`) |
 | `WEFT_RECONCILE_INTERVAL_SECS` | `weft-server` | Background reconcile daemon sweep interval in seconds; `0`/unset disables it. | unset (disabled) |
 | `WEFT_RECONCILE_THRESHOLD` | `weft-server` | `unsorted_segments` backlog an aspect must reach before the daemon reconciles it. | `1` |
 | `WEFT_RECONCILE_HOT_COLD` | `weft-server` | Truthy → the daemon reconciles cold segments each tick and defers the hot tail until the threshold. | unset (all-or-nothing) |
