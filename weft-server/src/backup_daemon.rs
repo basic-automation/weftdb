@@ -14,11 +14,13 @@
 //! # Retention safety
 //!
 //! Pruning only ever removes directories the daemon itself generated —
-//! `backup-<digits>`, the shape [`generated_label`] writes. A snapshot an operator
-//! took by hand with `POST …/storage/backup?label=nightly` is never a prune candidate,
-//! so a retention setting cannot silently delete a deliberately-kept backup. That
-//! grammar is reserved for the server: the endpoint refuses a `?label=` that matches it
-//! ([`is_generated_label`]), so a caller cannot plant a directory retention would count.
+//! `backup-<digits>`, the shape [`generated_label`] writes. A snapshot taken through
+//! `POST …/storage/backup` is never a prune candidate, so a retention setting cannot
+//! silently delete a deliberately-kept backup. That grammar is reserved for the daemon:
+//! the endpoint refuses a `?label=` that matches it ([`is_generated_label`]), and names
+//! an unlabelled snapshot `manual-<unix_millis>` ([`manual_label`]). So an API caller can
+//! neither plant a directory retention would count nor, by taking backups, push the
+//! daemon's own snapshots out of the retained set.
 //!
 //! Retention also distrusts a generated-looking directory whose stamp lies more than
 //! [`FUTURE_STAMP_TOLERANCE`] past the current clock. Such a stamp sorts as the newest
@@ -53,14 +55,25 @@ pub struct BackupDaemonConfig {
 	pub keep: Option<usize>,
 }
 
-/// The label a daemon tick writes its snapshot under: `backup-<unix_millis>`, matching
-/// the manual endpoint's generated (unlabelled) form.
+/// The label a daemon tick writes its snapshot under: `backup-<unix_millis>`, the only
+/// shape retention counts and prunes.
 ///
 /// `millis` is the wall-clock stamp; the caller passes it so the naming is testable
 /// without a clock.
 #[must_use]
 pub fn generated_label(millis: u128) -> String {
 	format!("backup-{millis}")
+}
+
+/// The label an unlabelled `POST …/storage/backup` writes its snapshot under:
+/// `manual-<unix_millis>`.
+///
+/// Deliberately outside the daemon's `backup-<digits>` grammar: retention counts and
+/// prunes only daemon snapshots, so API calls cannot crowd them out of the retained set,
+/// and a snapshot taken by hand is never pruned.
+#[must_use]
+pub fn manual_label(millis: u128) -> String {
+	format!("manual-{millis}")
 }
 
 /// How far past the current clock a generated directory's stamp may lie and still count.
@@ -70,12 +83,12 @@ pub fn generated_label(millis: u128) -> String {
 /// [`list_generated_backups`] ignores it (see the module docs).
 pub const FUTURE_STAMP_TOLERANCE: Duration = Duration::from_hours(24);
 
-/// True for a directory name in the server's generated grammar: `backup-` and digits.
+/// True for a directory name in the daemon's generated grammar: `backup-` and digits.
 ///
 /// `backup-` must be followed by at least one digit and nothing else. This is the prune
-/// predicate: an operator's own `?label=nightly` snapshot does not match and is never
-/// removed. The backup endpoint refuses a caller-chosen label that matches, so only the
-/// server creates such names.
+/// predicate: an operator's own `?label=nightly` snapshot and an unlabelled
+/// `manual-<unix_millis>` one do not match and are never removed. The backup endpoint
+/// refuses a caller-chosen label that matches, so only the daemon creates such names.
 #[must_use]
 pub fn is_generated_label(name: &str) -> bool {
 	name.strip_prefix("backup-").is_some_and(|stamp| !stamp.is_empty() && stamp.chars().all(|c| c.is_ascii_digit()))

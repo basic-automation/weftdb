@@ -199,17 +199,20 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   that differ only in letter case or Unicode normalisation are still accepted and can
   share frame files on a case-insensitive or normalising filesystem; that is a collision
   inside `segments/`, not a way out of it, and the planned encoded frame names remove it.
-- **Backup retention can no longer be made to delete genuine snapshots.**
+- **API callers can no longer make backup retention delete the daemon's snapshots.**
   `WEFT_BACKUP_KEEP` retention keeps the newest `backup-<digits>` directories by their
-  embedded timestamp, and `POST /api/v1/storage/backup?label=` accepted labels in that
-  same form, so a caller could create directories that retention counted as the newest
-  snapshots and pruned real ones in their place. The endpoint now refuses a `?label=` in
-  the generated `backup-<digits>` form with a `400` (an unlabelled backup still gets a
-  generated name, and the restore drill still accepts one). Retention also ignores any
-  generated-looking directory stamped more than 24 hours past the current clock: it is
-  never counted and never removed, and each listing logs a warning naming it, so a
-  directory planted before this release cannot evict snapshots either; inspect and
-  remove such directories by hand.
+  embedded timestamp, and `POST /api/v1/storage/backup` created directories in that same
+  form, both for a `?label=` in it and for every unlabelled backup, so a caller could fill
+  the retained set and get the daemon's genuine snapshots pruned. That form is now
+  reserved for the backup daemon: a `?label=` in it is a `400`, and an unlabelled backup
+  is now named `manual-<unix_millis>`. Snapshots taken through the endpoint are
+  therefore never counted or pruned by retention; this is a behaviour change for
+  unlabelled backups, which used to be pruned, so remove them by hand when no longer
+  needed. Retention also ignores any generated-looking directory stamped more than 24
+  hours past the current clock: it is never counted and never removed, and each listing
+  logs a warning naming it, so a directory planted before this release cannot evict
+  snapshots either; inspect and remove such directories by hand. Anyone who can write
+  to the backup directory directly can still affect retention; this closes the API path.
 - **Web pages can no longer drive a loopback-bound `weft-server`.** With no
   authentication, the default `127.0.0.1` bind was the only protection, but a page open
   in a browser on the same machine could still send requests that need no CORS
