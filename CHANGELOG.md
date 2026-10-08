@@ -222,6 +222,68 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Security
 
+- **Aspect names can no longer point outside the segment store.** An aspect's name is
+  part of the file names of its `.weftseg` frames and `.weftpart` sidecars, and it was
+  not checked, so a client of `weft-server` could declare a name that made sealing,
+  reconciling or compacting create, overwrite or delete those files outside the store's
+  `segments/` directory. Names are now validated wherever they are declared or turned
+  into a path (`weftdb::aspect_name::validate`): at most 160 bytes, no `/` or `\`, no
+  control characters, no leading `.`, no trailing `.` or space, and not a Windows device
+  name (`CON`, `NUL`, `COM1`, `CONIN$`, …, also with an extension or a `:` suffix).
+  Bidirectional controls, line and paragraph separators and invisible formatting
+  characters are refused as well, so a name cannot display as a different one in
+  listings and logs (the zero-width joiner and non-joiner, which some scripts need, are
+  still accepted). On
+  Windows, `<`, `>`, `:`, `"`, `|`, `?` and `*` are refused too, since such a name could
+  never be sealed there. `POST /api/v1/storage/aspects` answers `400` for an invalid
+  name, and every frame path is also checked to be a direct child of `segments/`. An
+  aspect already declared under such a name was never safe to use: sealing, reading or
+  maintaining it now fails with a typed `weftdb::InvalidAspectName` error (a `400` from
+  the ingest, read, reconcile, squash and compact endpoints), and the store-wide
+  maintenance sweeps list it in `failed` and count it in
+  `weft_reconcile_failed_passes_total` while still maintaining every other aspect.
+  Listing it and reading its schema or stats, which touch no files, still work. Names
+  that differ only in letter case or Unicode normalisation are still accepted and can
+  share frame files on a case-insensitive or normalising filesystem; that is a collision
+  inside `segments/`, not a way out of it, and the planned encoded frame names remove it.
+- **API callers can no longer make backup retention delete the daemon's snapshots.**
+  `WEFT_BACKUP_KEEP` retention keeps the newest `backup-<digits>` directories by their
+  embedded timestamp, and `POST /api/v1/storage/backup` created directories in that same
+  form, both for a `?label=` in it and for every unlabelled backup, so a caller could fill
+  the retained set and get the daemon's genuine snapshots pruned. That form is now
+  reserved for the backup daemon: a `?label=` in it is a `400`, and an unlabelled backup
+  is now named `manual-<unix_millis>`. A label also may no longer start or end with `.`
+  (Windows drops a trailing dot from a directory name, so such a label could still land
+  on a reserved name there); the restore drill's `?label=` follows the same rule.
+  Snapshots taken through the endpoint are therefore never counted or pruned by
+  retention; this is a behaviour change for unlabelled backups, which used to be pruned,
+  so remove them by hand when no longer needed. Retention also ignores a
+  generated-looking directory whose stamp is more than 24 hours past the current clock or
+  past the directory's own modification time, which no daemon snapshot ever is: it is
+  not counted and not removed, and each listing logs a warning naming it. A directory
+  planted through the API before this release keeps its planting time as its
+  modification time, so a far-future stamp stays ignored after the clock reaches it, as
+  long as the directory is not modified and its filesystem reports modification times.
+  One stamped less than 24 hours past its planting looks like a snapshot from a skewed
+  clock and is counted, but no longer outranks new snapshots a day after it was
+  planted. Remove such directories by hand. Anyone who can write to the backup directory
+  directly can still affect retention; this closes the API path.
+- **Web pages can no longer drive a loopback-bound `weft-server`.** With no
+  authentication, the default `127.0.0.1` bind was the only protection, but a page open
+  in a browser on the same machine could still send requests that need no CORS
+  preflight (enough to trigger maintenance, backups and ingest), or reach the API
+  through DNS rebinding. While bound to a loopback address (including the IPv4-mapped
+  `[::ffff:127.0.0.1]`), the server now answers only requests addressed to `localhost`,
+  `127.0.0.0/8` or `[::1]` (`421 Misdirected Request` otherwise, `/health` and `/ready`
+  included) and refuses a state-changing request whose `Origin` is not a loopback origin
+  (`403`). Clients that send no `Origin`, such as `curl`, are unaffected. Pages served by
+  another local web server (any loopback origin, on any port) are still trusted until
+  authentication lands. Health probes must send a loopback `Host` such as `localhost` or
+  `127.0.0.1`, as every HTTP/1.1 client does; an HTTP/1.0 probe that sends no `Host` now
+  gets `421`, so configure it to send one or set `WEFT_ALLOW_ANY_HOST=1`. Behind a local
+  reverse proxy that forwards a different `Host`, or the non-loopback `Origin` of a
+  browser UI it fronts, set `WEFT_ALLOW_ANY_HOST=1`. Non-loopback binds are unchanged
+  and remain unauthenticated.
 - Cleared the `crossbeam-epoch` (RUSTSEC-2026-0204) and `h2` (RUSTSEC-2026-0258)
   advisories, replaced the unmaintained `bincode` (RUSTSEC-2025-0141), and removed the
   unsound `lru` 0.16 (RUSTSEC-2026-0253) by disabling turso's unused full-text search.
