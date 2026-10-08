@@ -28,4 +28,6 @@ inclusion in the work by you, as defined in the Apache-2.0 license, shall be dua
 licensed as above, without any additional terms or conditions.
 
 The `DdSketch` quantile sketch is adapted from Datadog's DDSketch reference implementation
-(sketches-java, Apache-2.0); see [THIRD-PARTY-NOTICES](THIRD-PARTY-NOTICES).
+(sketches-java, Apache-2.0). That portion stays under the Apache License 2.0 whichever
+option you choose; [THIRD-PARTY-NOTICES](THIRD-PARTY-NOTICES) carries the attribution and
+the license text.

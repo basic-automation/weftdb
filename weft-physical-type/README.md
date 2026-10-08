@@ -50,4 +50,6 @@ inclusion in the work by you, as defined in the Apache-2.0 license, shall be dua
 licensed as above, without any additional terms or conditions.
 
 The Chimp and Chimp128 codecs (behind `experimental-codecs`) are adapted from the authors'
-reference implementation (Apache-2.0); see [THIRD-PARTY-NOTICES](THIRD-PARTY-NOTICES).
+reference implementation (Apache-2.0). Those portions stay under the Apache License 2.0
+whichever option you choose; [THIRD-PARTY-NOTICES](THIRD-PARTY-NOTICES) carries the
+attribution and the license text.

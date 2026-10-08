@@ -423,12 +423,14 @@ detection within Y% and improving historical query latency by Z."*
       (`weft-reduce`) are treated as adapted from their Apache-2.0 reference implementations: a
       root `NOTICE` and per-crate `THIRD-PARTY-NOTICES` (shipped in each package) meet
       Apache-2.0 section 4.
-    - [x] **Package licence metadata: settled by the relicense (owner decision 2026-10-08).** Every
-      crate now declares `license = "MIT OR Apache-2.0"`, so crates.io, `cargo deny` and other
-      scanners that read the field see Apache-2.0. The Chimp and DDSketch portions stay under
-      Apache-2.0 whichever option a user picks, which the two crates' `THIRD-PARTY-NOTICES` say.
-      If counsel wants the field itself to say so, the expression for those two crates is
-      `(MIT OR Apache-2.0) AND Apache-2.0`.
+    - [ ] **Package licence metadata: mitigated by the relicense; the expression is with
+      counsel.** Every crate now declares `license = "MIT OR Apache-2.0"`, so Apache-2.0 is one
+      of the two options scanners see, and the two crates' `THIRD-PARTY-NOTICES` and READMEs say
+      that the Chimp and DDSketch portions stay under Apache-2.0 whichever option a user picks.
+      The field itself still offers MIT for the whole of `weft-physical-type` and `weft-reduce`.
+      The candidate expression for those two crates is `(MIT OR Apache-2.0) AND Apache-2.0`;
+      it is on the [Phase 8](#phase-8--commercial-hardening--required-for-paid-beta) counsel
+      list.
   - [x] **Gorilla + RLE realized on disk** — the timestamp block now carries four
     codecs (varint/bit-pack/RLE/Gorilla) chosen by the single-source-of-truth
     `best_encoding_name`, so the reported codec always matches the bytes written; the
@@ -765,10 +767,10 @@ metrics, recover from a restart, and file useful support tickets.
   - [x] **Licence: `MIT OR Apache-2.0`**, the Rust ecosystem's dual licence, for every WeftDB crate: `LICENSE-MIT` and `LICENSE-APACHE` at the root and in every crate, `license = "MIT OR Apache-2.0"` in `[workspace.package]`. Earlier commits remain available under MIT. `splimes` (its own repository) stays MIT.
   - [x] **Copyright holder: Justin Icenhour**, as an individual, and the only one. His employer has signed off. Every commit so far is his (some carry `test@example.com` as the author email; AI-co-authored commits carry Claude trailers). No crate was on crates.io yet, so relicensing needed no one else's consent.
   - [x] **Contribution terms: DCO or CLA, the contributor's choice.** `git commit -s` on every commit, or the CLA ([`CLA.md`](CLA.md), version 1, adapted from the ASF ICLA, with Justin Icenhour as the counterparty) signed once by a pull request comment. Contributions are licensed `MIT OR Apache-2.0`. The `contribution-terms` workflow passes a pull request when either holds; see [CONTRIBUTING.md](CONTRIBUTING.md#contribution-terms).
-    - [ ] **Enforce it (owner, once on main):** create the `cla-signatures` branch with `signatures/cla/v1.json` (commands in the workflow's header), then require the `contribution-terms` check in branch protection.
+    - [ ] **Enforce it (owner, once on main):** create the `cla-signatures` branch with `signatures/cla/v1.json`, tag the main commit carrying CLA.md version 1 as `cla-v1` and protect the tag with a ruleset (commands in the workflow's header), then require the `contribution-terms` check in branch protection.
   - [x] **kdb+/KDB-X: excluded from published benchmarks** unless KX consents in writing. See the [Legal notes](#research--business-notes).
   - [x] **Codec patents: gate the flagged opt-in codecs.** The advisory float/timestamp codecs are behind `experimental-codecs` and the bit-sliced value codec behind `bitsliced-codec` (the [Phase 6.1 codec gate](#phase-6--compression-v2--high)).
-  - [ ] **With counsel:** Amazon US 11,308,093 against the default FOR codec; the Tiger Data family (both ingest paths); the SAP family, before the Phase 6.2 design; **WEFTDB** trademark clearance; the benchmark policy — which competitor editions may be run and published, dataset redistribution, and the claims wording.
+  - [ ] **With counsel:** Amazon US 11,308,093 against the default FOR codec; the Tiger Data family (both ingest paths); the SAP family, before the Phase 6.2 design; **WEFTDB** trademark clearance; the benchmark policy — which competitor editions may be run and published, dataset redistribution, and the claims wording; the package licence expression for the two crates with adapted code, `(MIT OR Apache-2.0) AND Apache-2.0` ([Phase 6.1](#phase-6--compression-v2--high)); CLA v1 — a successors-and-assigns clause and any outbound-licence undertaking, before the CLA is enforced.
   - [ ] Still open: open-core vs commercial split; customer-data handling.
 
 ### Phase 9 — Analytics premium · *Medium, after benchmark foundation*
@@ -1180,7 +1182,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   - [x] **kdb+/KDB-X (owner decision 2026-10-08): excluded from every published benchmark unless KX consents in writing.** No published report, README figure or claim may include a kdb+/KDB-X result without that consent on file.
   - [x] **WeftDB's own terms (2026-10-08):** `MIT OR Apache-2.0`; contributions by DCO sign-off or the CLA; sole copyright holder Justin Icenhour, with his employer's sign-off. Detail under [Phase 8](#phase-8--commercial-hardening--required-for-paid-beta).
   - [x] **Codec patents (2026-10-08):** the flagged opt-in codecs are gated (`experimental-codecs`, `bitsliced-codec`); the default FOR codec stays ungated pending counsel (the [Phase 6.1 codec gate](#phase-6--compression-v2--high)).
-  - [ ] **Open with counsel:** Amazon FOR (US 11,308,093), Tiger Data, SAP (before Phase 6.2), **WEFTDB** trademark clearance, and the benchmark policy: which competitor editions may be run and published, whether the datasets may be redistributed, and the wording of claims.
+  - [ ] **Open with counsel:** Amazon FOR (US 11,308,093), Tiger Data, SAP (before Phase 6.2), **WEFTDB** trademark clearance, and the benchmark policy: which competitor editions may be run and published, whether the datasets may be redistributed, and the wording of claims. Also the package licence expression for `weft-physical-type` and `weft-reduce`, and CLA v1's successors-and-assigns clause and any outbound-licence undertaking.
 
 ---
 
