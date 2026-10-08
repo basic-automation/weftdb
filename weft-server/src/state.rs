@@ -22,6 +22,12 @@
 //! `Copy`): the binary reads it from the environment once at startup
 //! (`WEFT_MAX_INTERPOLATE_POINTS`), and [`AppState::new`] carries the defaults.
 //!
+//! ## Request guard
+//!
+//! The [`HostGuard`] the router enforces on every request (see
+//! [`host_guard`](crate::host_guard)). It starts [`HostGuard::Off`]; the binary turns it
+//! on with [`AppState::with_host_guard`] when it binds a loopback address.
+//!
 //! ## The store is optional on purpose
 //!
 //! A segment store is only present when the operator configures a store root (see
@@ -35,7 +41,7 @@ use std::sync::Arc;
 use axum::extract::FromRef;
 use weftdb::SegmentStore;
 
-use crate::{interpolate::InterpolateConfig, metrics::SharedMetrics};
+use crate::{host_guard::HostGuard, interpolate::InterpolateConfig, metrics::SharedMetrics};
 
 /// The router state shared by every handler: the process metrics, the interpolation
 /// settings, and an optional segment store backing the storage-query endpoints.
@@ -49,6 +55,8 @@ pub struct AppState {
 	store: Option<Arc<SegmentStore>>,
 	/// What the `/api/v1/interpolate*` handlers allow (the output-grid cap).
 	interpolate: InterpolateConfig,
+	/// The `Host`/`Origin` checks applied to every request (off unless set).
+	host_guard: HostGuard,
 }
 
 impl AppState {
@@ -64,7 +72,7 @@ impl AppState {
 	/// the counters), the default interpolation settings and no segment store.
 	#[must_use]
 	pub const fn with_metrics(metrics: SharedMetrics) -> Self {
-		Self { metrics, store: None, interpolate: InterpolateConfig::DEFAULT }
+		Self { metrics, store: None, interpolate: InterpolateConfig::DEFAULT, host_guard: HostGuard::Off }
 	}
 
 	/// Attach a segment store, enabling the storage-query endpoints.
@@ -78,6 +86,14 @@ impl AppState {
 	#[must_use]
 	pub const fn with_interpolate_config(mut self, config: InterpolateConfig) -> Self {
 		self.interpolate = config;
+		self
+	}
+
+	/// Set the request guard (see [`host_guard`](crate::host_guard)); the binary passes
+	/// [`HostGuard::for_bind`] of the address it bound.
+	#[must_use]
+	pub const fn with_host_guard(mut self, guard: HostGuard) -> Self {
+		self.host_guard = guard;
 		self
 	}
 
@@ -97,6 +113,12 @@ impl AppState {
 	#[must_use]
 	pub const fn interpolate_config(&self) -> InterpolateConfig {
 		self.interpolate
+	}
+
+	/// The request guard the router enforces.
+	#[must_use]
+	pub const fn host_guard(&self) -> HostGuard {
+		self.host_guard
 	}
 }
 

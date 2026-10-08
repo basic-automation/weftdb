@@ -30,6 +30,12 @@ on the roadmap, not a vulnerability report we need. Do not expose `weft-server`
 directly to an untrusted network; put it behind something that does terminate TLS and
 authenticate callers.
 
+Bound to a loopback address (the default), `weft-server` only answers requests
+addressed to a loopback host and refuses state-changing requests from other web
+origins, so a web page in a browser on the same machine cannot drive it. That is a
+guard for the default deployment, not authentication: any local process can still call
+the API.
+
 What *is* in scope: memory-safety problems, panics or crashes reachable from untrusted
 input (a malformed request body, a corrupt `.weftseg` segment, a hostile Line Protocol
 payload), data corruption or silent precision loss, and anything that lets a caller read

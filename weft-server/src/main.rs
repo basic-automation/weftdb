@@ -5,6 +5,16 @@
 //! `WEFT_SERVER_ADDR` environment variable (e.g. `0.0.0.0:9000`). Keeping the
 //! wiring this thin means the router under test is exactly the router served.
 //!
+//! ## Request guard
+//!
+//! When the bound address is a loopback address, every request must be addressed to a
+//! loopback host (`Host: localhost`, `127.0.0.0/8` or `[::1]`, else `421`), and a
+//! state-changing request carrying a non-loopback `Origin` is refused (`403`), so web
+//! pages in a local browser cannot drive the server ([`weft_server::host_guard`]).
+//! `WEFT_ALLOW_ANY_HOST=1` turns this off for a local reverse proxy that forwards a
+//! different `Host`. A non-loopback bind is not guarded: there is no authentication yet,
+//! so such a server must not be reachable from an untrusted network.
+//!
 //! ## Optional segment store
 //!
 //! Set `WEFT_SEGMENT_STORE_ROOT` to a directory to open a [`SegmentStore`] rooted
@@ -33,7 +43,7 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use weft_server::{
-	app_with_state, gpu::{self, CalibrationMode, GPU_CALIBRATE_ENV}, spawn_backup_daemon, spawn_reconcile_daemon, AppState, BackupDaemonConfig, InterpolateConfig, ReconcileDaemonConfig, MAX_INTERPOLATE_POINTS_ENV, SERVICE, VERSION
+	app_with_state, gpu::{self, CalibrationMode, GPU_CALIBRATE_ENV}, host_guard::{self, HostGuard, ALLOW_ANY_HOST_ENV}, spawn_backup_daemon, spawn_reconcile_daemon, AppState, BackupDaemonConfig, InterpolateConfig, ReconcileDaemonConfig, MAX_INTERPOLATE_POINTS_ENV, SERVICE, VERSION
 };
 use weftdb::SegmentStore;
 
@@ -122,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
 	let listener = tokio::net::TcpListener::bind(addr).await?;
 	let local = listener.local_addr()?;
 	println!("{SERVICE} v{VERSION} listening on http://{local}");
+	let state = state.with_host_guard(host_guard_for(local));
 
 	// After the bind and in the background, so serving never waits for it.
 	spawn_gpu_calibration_if_enabled();
@@ -133,6 +144,19 @@ async fn main() -> anyhow::Result<()> {
 	}
 	serve_result?;
 	Ok(())
+}
+
+/// Pick the request guard for the bound address `local` ([`HostGuard::for_bind`],
+/// honouring `WEFT_ALLOW_ANY_HOST`) and log which one is in force.
+fn host_guard_for(local: SocketAddr) -> HostGuard {
+	let allow_any_host = host_guard::allow_any_host_from_env(std::env::var(ALLOW_ANY_HOST_ENV).ok().as_deref());
+	let guard = HostGuard::for_bind(local, allow_any_host);
+	match guard {
+		HostGuard::Loopback => println!("request guard: loopback only (Host must be localhost, 127.0.0.0/8 or [::1]; state-changing requests from other web origins are refused; set {ALLOW_ANY_HOST_ENV}=1 behind a local reverse proxy that rewrites Host)"),
+		HostGuard::Off if local.ip().is_loopback() => println!("request guard: off ({ALLOW_ANY_HOST_ENV} is set)"),
+		HostGuard::Off => println!("request guard: off (bound to the non-loopback address {local}; there is no authentication, so keep this server off untrusted networks)"),
+	}
+	guard
 }
 
 /// Install the process-wide tracing subscriber (roadmap Phase 3): a `fmt` layer

@@ -319,6 +319,16 @@ Bind address defaults to `127.0.0.1:8080` (`WEFT_SERVER_ADDR` overrides). Settin
 `/storage` endpoints (without it they answer `503`, and `GET /ready` reports the
 `segment_store` dependency).
 
+While bound to a loopback address, the server only answers requests addressed to a
+loopback host: `Host` must be `localhost`, an address in `127.0.0.0/8` or `[::1]`
+(anything else is a `421`), and a state-changing request whose `Origin` is not a
+loopback origin is a `403`. That keeps web pages open in a local browser from driving
+the server. Clients that send no `Origin`, like `curl`, are unaffected, and `/health` and
+`/ready` follow the same rule (a probe on the same host passes). Behind a local reverse
+proxy that forwards a different `Host`, set `WEFT_ALLOW_ANY_HOST=1`. A non-loopback bind
+is not guarded: there is no authentication yet, so keep such a server off untrusted
+networks.
+
 ### Service endpoints
 
 | Method & path | Purpose |
@@ -513,6 +523,7 @@ WeftDB is configured primarily through environment variables:
 | `WEFT_DATA_DIR` | `weftdb`, `weft-tui` | Root directory for database files **and** the TUI log (`weft-tui.log`). | portable per-user default (see below) |
 | `TEST_DATA_DIR` | `weftdb` | Highest-priority override for the database root (used by the test suite). | unset |
 | `WEFT_SERVER_ADDR` | `weft-server` | HTTP bind address. | `127.0.0.1:8080` |
+| `WEFT_ALLOW_ANY_HOST` | `weft-server` | Truthy (`1`/`true`/`yes`/`on`) → turn off the loopback request guard. On a loopback bind the server otherwise answers only requests whose `Host` is `localhost`, `127.0.0.0/8` or `[::1]` (`421` otherwise) and refuses state-changing requests from non-loopback web origins (`403`). Set it behind a local reverse proxy that forwards a different `Host`. A non-loopback bind is never guarded. | unset (guarded on a loopback bind) |
 | `WEFT_GPU_CALIBRATE` | `weft-server` | Startup calibration. By default, once the listener is bound, the server runs `splimes::calibrate()` once in the background on a blocking thread: it starts the GPU if there is one, times the single-thread, rayon and GPU backends on grids up to 16 Mi points (several seconds, a few hundred MB), and sets where `Backend::Auto` switches between them. Requests are served from the start and interpolate on the CPU with splimes' default thresholds until it finishes. A CPU/software adapter (llvmpipe, lavapipe, WARP) is not calibrated, with a log line saying why; `force` calibrates it anyway. `0` (or `false`/`no`/`off`) skips calibration. It logs the adapter (or why there is none) and the thresholds, and never fails startup; skipped or failed, interpolation stays on the CPU with splimes' defaults. | unset (calibrate, except a software adapter) |
 | `WEFT_MAX_INTERPOLATE_POINTS` | `weft-server` | The most output points one `/api/v1/interpolate*` request may produce; a larger grid is a `400` naming its size and the limit, refused before anything is allocated. A positive integer, read once at startup; anything else (including `0`) stops the server from starting with a message naming the variable. | `10000000` |
 | `WEFT_SEGMENT_STORE_ROOT` | `weft-server` | Root of the Storage v2 segment store; enables the `/storage` endpoints. | unset (storage endpoints answer `503`) |
