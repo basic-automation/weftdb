@@ -1,4 +1,7 @@
 # Auto detect text files and perform LF normalization
 * text=auto
-# Store fixtures are byte-exact: databases, logs, frames and sidecars, never normalized
-weftdb/tests/fixtures/**/root/** -text
+# Store fixtures are byte-exact, never normalized: the databases, logs, frames and
+# sidecars of a fixture root, and the text beside it. A test compares
+# expected_reads.txt to what it builds with LF line endings, so a CRLF checkout
+# (core.autocrlf=true, the Windows runners' default) would fail it.
+weftdb/tests/fixtures/** -text
