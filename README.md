@@ -5,7 +5,7 @@
 [![crates.io](https://img.shields.io/crates/v/weftdb.svg)](https://crates.io/crates/weftdb)
 [![docs.rs](https://img.shields.io/docsrs/weftdb)](https://docs.rs/weftdb)
 [![CI](https://github.com/basic-automation/weftdb/actions/workflows/ci.yml/badge.svg)](https://github.com/basic-automation/weftdb/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 ![Rust](https://img.shields.io/badge/Rust-1.95%2B-orange.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue.svg)
 ![Status](https://img.shields.io/badge/status-pre--beta-orange.svg)
@@ -1389,9 +1389,27 @@ artifact.
 
 ## License
 
-Released under the [MIT License](LICENSE). Copyright (c) 2025-2026 Justin Icenhour.
+Copyright (c) 2025-2026 Justin Icenhour.
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option.
 
 Two crates include code adapted from Apache-2.0 projects — the Chimp codecs in
-`weft-physical-type` and the DDSketch quantile sketch in `weft-reduce`. [NOTICE](NOTICE)
-lists them, and each crate's `THIRD-PARTY-NOTICES` file carries the attribution and the
+`weft-physical-type` and the DDSketch quantile sketch in `weft-reduce`. Those portions
+stay under the Apache License 2.0 whichever option you choose. [NOTICE](NOTICE) lists
+them, and each crate's `THIRD-PARTY-NOTICES` file carries the attribution and the
 license text.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for
+inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual
+licensed as above, without any additional terms or conditions.
+
+Every pull request also needs either a DCO sign-off on each commit or a signed CLA; see
+[Contribution terms](CONTRIBUTING.md#contribution-terms).

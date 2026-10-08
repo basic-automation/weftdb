@@ -178,8 +178,14 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   configuration never wrote this codec, so a store that never set the variable (or
   `FrameOptions::transposed_max_overhead`) is unaffected. The docs now call it a bit-sliced
   (bit-plane-major) layout; it is not the FastLanes layout they used to name.
-- Every `LICENSE` file now reads `Copyright (c) 2025-2026 Justin Icenhour`, naming the
-  individual copyright holder for both years of the project. The license (MIT) is unchanged.
+- **WeftDB is dual-licensed under MIT OR Apache-2.0**, at your option, from this release on.
+  Every crate declares `license = "MIT OR Apache-2.0"`, and the repository root and every
+  crate ship `LICENSE-MIT` and `LICENSE-APACHE` in place of `LICENSE`. The release archives
+  carry both files, `NOTICE` and the `THIRD-PARTY-NOTICES` files. Earlier commits remain
+  available under MIT, as they were published. The portions adapted from Chimp and
+  DDSketch stay under Apache-2.0 whichever option you choose.
+- The MIT license text (now `LICENSE-MIT`) reads `Copyright (c) 2025-2026 Justin Icenhour`,
+  naming the individual copyright holder for both years of the project.
 
 ### Fixed
 
