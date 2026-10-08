@@ -134,19 +134,33 @@ fn avg_like_bigdecimal(sum: i128, scale: i64, count: u64) -> BigDecimal {
 		let mut precision = lead.checked_ilog10().map_or(1, |d| d + 1);
 		// Digits after the leading quotient, gathered in `u128` chunks of up to 38 digits so
 		// the `BigInt` is touched once per chunk rather than once per digit.
-		let (mut chunk, mut chunk_digits) = (0_u128, 0_u32);
+		let mut digits = DigitSink { quotient, chunk: 0, chunk_digits: 0 };
 		rem *= 10;
-		while rem != 0 && precision < BIGDECIMAL_DIV_PRECISION {
-			chunk = chunk * 10 + rem / den;
-			rem = (rem % den) * 10;
-			chunk_digits += 1;
-			precision += 1;
-			scale += 1;
-			if chunk_digits == 38 {
-				quotient = quotient * BigInt::from(10_u128.pow(38)) + BigInt::from(chunk);
-				(chunk, chunk_digits) = (0, 0);
+		// Every remainder stays below `10 × den`, so for any divisor up to `u64::MAX / 10` the
+		// digit loop runs in `u64`, several times cheaper than `u128` division. A larger
+		// divisor (a bucket of more than ~1.8e18 samples) keeps the `u128` loop.
+		match u64::try_from(den) {
+			Ok(d) if d <= u64::MAX / 10 => {
+				let mut r = u64::try_from(rem).unwrap_or(u64::MAX);
+				while r != 0 && precision < BIGDECIMAL_DIV_PRECISION {
+					digits.push(u128::from(r / d));
+					r = (r % d) * 10;
+					precision += 1;
+					scale += 1;
+				}
+				rem = u128::from(r);
+			}
+			_ => {
+				while rem != 0 && precision < BIGDECIMAL_DIV_PRECISION {
+					digits.push(rem / den);
+					rem = (rem % den) * 10;
+					precision += 1;
+					scale += 1;
+				}
 			}
 		}
+		let DigitSink { quotient: q, chunk, chunk_digits } = digits;
+		quotient = q;
 		if chunk_digits > 0 {
 			quotient = quotient * BigInt::from(10_u128.pow(chunk_digits)) + BigInt::from(chunk);
 		}
@@ -159,6 +173,25 @@ fn avg_like_bigdecimal(sum: i128, scale: i64, count: u64) -> BigDecimal {
 		-magnitude
 	} else {
 		magnitude
+	}
+}
+
+/// Accumulates quotient digits into a `BigInt`, 38 at a time through a `u128` chunk, so the
+/// `BigInt` is touched once per chunk rather than once per digit.
+struct DigitSink {
+	quotient: BigInt,
+	chunk: u128,
+	chunk_digits: u32,
+}
+
+impl DigitSink {
+	fn push(&mut self, digit: u128) {
+		self.chunk = self.chunk * 10 + digit;
+		self.chunk_digits += 1;
+		if self.chunk_digits == 38 {
+			self.quotient = std::mem::take(&mut self.quotient) * BigInt::from(10_u128.pow(38)) + BigInt::from(self.chunk);
+			(self.chunk, self.chunk_digits) = (0, 0);
+		}
 	}
 }
 
