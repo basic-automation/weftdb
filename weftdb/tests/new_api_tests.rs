@@ -546,6 +546,92 @@ async fn test_dictionary_metadata_reads_past_duplicate_rows() {
 	assert_eq!(dictionary_rows(&db, &aspect.id(), "loaded", "dictionary_constraints").await, 1);
 	assert_eq!(dictionary_rows(&db, &aspect.id(), "loaded", "dictionary_variabilities").await, 0);
 
+	// Several complete registrations, as the old `new_dictionary` left when a dictionary was
+	// created twice: the newest by `created_at` is read, whatever order the rows were
+	// written in. The newest is written second and the oldest last, so reading by rowid
+	// either way, or by `created_at` ascending, reads another one.
+	aspect.new_dictionary("twice", "written first", &DictionaryConstraints::new(Some(Steps::new(2, Spline::Linear)), None)).await.expect("Failed to create dictionary");
+	{
+		let dictionary_db = db.get_dictionary_db(&aspect.id(), "twice").await.expect("Failed to open dictionary database");
+		let conn = dictionary_db.connect().expect("Failed to connect to dictionary database");
+		for (description, offset_ms, count, interpolation) in [("newest", 60_000_i64, 3_i64, "Cubic"), ("oldest", -60_000, 5, "Quadratic")] {
+			let id = Uuid::new_v4().to_string();
+			conn.execute("INSERT INTO dictionary_metadata (id, name, description, created_at) VALUES (?, ?, ?, ?)", turso::params![id.as_str(), "twice", description, Utc::now().timestamp_millis() + offset_ms]).await.expect("Failed to insert a registration");
+			conn.execute("INSERT INTO dictionary_constraints (dictionary_id, steps_count, steps_interpolation) VALUES (?, ?, ?)", turso::params![id.as_str(), count, interpolation]).await.expect("Failed to insert its constraints");
+		}
+	}
+	assert_eq!(dictionary_rows(&db, &aspect.id(), "twice", "dictionary_constraints").await, 3);
+	let stored = db.get_dictionary_metadata(&aspect.id(), "twice").await.expect("Failed to load dictionary metadata").expect("registered");
+	assert_eq!(stored.description, "newest");
+	assert_eq!(stored.constraints.steps().as_ref().map(|s| (s.count(), *s.interpolation())), Some((3, Spline::Cubic)));
+
+	common::remove_database(&db_name);
+}
+
+/// A dictionary file can exist without its tables: `insert_pattern_into_dictionary` opens
+/// (and so creates) the file but no tables, and once the file is open in this process
+/// nothing else created them. Such a file holds no registration, so it reads as
+/// unregistered and is registered over; the read failed with "no such table", so
+/// `load_dictionary` never registered it and `list_dictionaries` failed for the aspect.
+#[tokio::test]
+async fn test_a_dictionary_file_without_tables_is_unregistered() {
+	let db_name = format!("test_dictionary_no_tables_{}", Uuid::new_v4());
+	common::remove_database(&db_name);
+
+	let db = Database::new(&db_name).await.expect("Failed to create database");
+	let subject = db.observe_subject("dictionary_subject").await.expect("Failed to add subject");
+	let aspect = db.track_aspect(&subject.id(), "pressure", &Resolution::Seconds, None).await.expect("Failed to track aspect");
+	aspect.new_dictionary("complete", "has its tables", &DictionaryConstraints::default()).await.expect("Failed to create dictionary");
+
+	let pattern = weftdb::Pattern::new(weftdb::PatternID::new(), Vec::new(), Vec::new());
+	let err = db.insert_pattern_into_dictionary(&aspect.id(), "bare", &pattern).await.expect_err("the file has no `patterns` table");
+	assert!(err.to_string().contains("no such table"), "{err:#}");
+	assert!(common::data_dir().join(&db_name).join("dictionary_subject").join("pressure").join("dictionaries").join("bare.db").is_file(), "the file exists");
+
+	assert!(db.get_dictionary_metadata(&aspect.id(), "bare").await.expect("a file without tables is not an error").is_none());
+	let listed = db.list_dictionaries(&aspect.id()).await.expect("one file without tables does not fail the listing");
+	assert_eq!(listed.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["complete"]);
+
+	let metadata = DictionaryMetadata { id: DictionaryId::new(), name: "bare".to_string(), description: "registered over it".to_string(), constraints: DictionaryConstraints::new(Some(Steps::new(4, Spline::Linear)), None) };
+	db.set_dictionary_metadata(&aspect.id(), "bare", &metadata).await.expect("Failed to set dictionary metadata");
+	assert_eq!(db.get_dictionary_metadata(&aspect.id(), "bare").await.expect("Failed to load dictionary metadata").expect("registered").id, metadata.id);
+	db.insert_pattern_into_dictionary(&aspect.id(), "bare", &pattern).await.expect("the tables exist now");
+
+	common::remove_database(&db_name);
+}
+
+/// `list_dictionaries` lists the aspect's readable dictionaries and skips the rest of the
+/// directory: a dictionary whose registration cannot be read (logged; it failed the whole
+/// listing), a file whose name is no dictionary name, and anything not a regular file.
+/// Opening a file converts its journal mode and can create tables, so a symlink is never
+/// followed: its target is left as it was.
+#[tokio::test]
+async fn test_list_dictionaries_skips_what_it_cannot_list() {
+	let db_name = format!("test_dictionary_list_skips_{}", Uuid::new_v4());
+	common::remove_database(&db_name);
+
+	let db = Database::new(&db_name).await.expect("Failed to create database");
+	let subject = db.observe_subject("dictionary_subject").await.expect("Failed to add subject");
+	let aspect = db.track_aspect(&subject.id(), "pressure", &Resolution::Seconds, None).await.expect("Failed to track aspect");
+	let dictionaries = common::data_dir().join(&db_name).join("dictionary_subject").join("pressure").join("dictionaries");
+
+	aspect.new_dictionary("readable", "listed", &DictionaryConstraints::default()).await.expect("Failed to create dictionary");
+	aspect.new_dictionary("unreadable", "degree 9", &DictionaryConstraints::new(Some(Steps::new(10, Spline::Polynomial(8, None))), None)).await.expect("Failed to create dictionary");
+	set_stored_interpolation(&db, &aspect.id(), "unreadable", "Polynomial(degree: 8, bounds_factor: None)", "Polynomial(degree: 9, bounds_factor: None)").await;
+	db.get_dictionary_metadata(&aspect.id(), "unreadable").await.expect_err("a stored degree 9 does not load");
+	std::fs::write(dictionaries.join(".backup.db"), b"").expect("Failed to write a stray file");
+	std::fs::create_dir(dictionaries.join("folder.db")).expect("Failed to create a directory");
+	let outside = common::data_dir().join(&db_name).join("outside.db");
+	std::fs::write(&outside, b"").expect("Failed to write the link's target");
+	#[cfg(unix)]
+	std::os::unix::fs::symlink(&outside, dictionaries.join("linked.db")).expect("Failed to create a symlink");
+
+	let listed = db.list_dictionaries(&aspect.id()).await.expect("Failed to list dictionaries");
+	assert_eq!(listed.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["readable"]);
+	assert_eq!(std::fs::metadata(&outside).expect("the link's target").len(), 0, "the link's target was not opened");
+	assert!(!common::data_dir().join(&db_name).join("outside.db-log").exists(), "nor given a log");
+	assert_eq!(std::fs::metadata(dictionaries.join(".backup.db")).expect("the stray file").len(), 0, "nor was the stray file");
+
 	common::remove_database(&db_name);
 }
 

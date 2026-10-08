@@ -242,7 +242,30 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   dictionary. Each dictionary is its own `<aspect>/dictionaries/<name>.db`; it now lists
   all of them, by name, each with its steps and variabilities (it returned empty
   constraints), and the list is no longer cached, so it does not go stale when a
-  dictionary is added.
+  dictionary is added. Only regular files are listed: a symlink, which it followed and
+  so opened (setting the target's journal mode and creating tables in it), a directory
+  or another entry named `*.db` is skipped. Every regular `*.db` file there is still
+  opened as a dictionary, so keep backups out of that directory or under another
+  extension. A dictionary whose registration cannot be read, such as one with a stored
+  step method splimes rejects, is logged as a warning and left out instead of failing
+  the whole listing.
+- **A dictionary file without its tables could not be registered.** A dictionary's file
+  can exist before its tables, for example when `insert_pattern_into_dictionary` opened
+  it first, which creates no tables. Once the file was open in the process nothing created
+  them, so `get_dictionary_metadata` failed with `no such table: dictionary_metadata`,
+  `load_dictionary` only warned and never registered the dictionary, and
+  `list_dictionaries` failed for the whole aspect. Such a file holds no registration, so
+  it now reads as unregistered (`Ok(None)`), and registering the dictionary creates the
+  tables.
+- **A metadata read could cache a registration that had just been replaced.** A
+  `get_dictionary_metadata` whose snapshot predated a `set_dictionary_metadata` commit
+  could store the old registration after the write had invalidated it, and the old one
+  was then served for up to the ten-minute cache lifetime. A read now caches what it read
+  only if no write on the same `Database` invalidated the entry since it began
+  (`DatabaseCache::generation`, `invalidate_generation` and `store_if_generation`). A
+  registration written through `AspectStructure::new_dictionary`, another `Database`
+  handle or another process still does not invalidate the cache, and can be served
+  stale until the entry expires.
 - **Commit failures were silently ignored.** A control-plane write that lost an MVCC
   conflict was reported as success. Commit errors now reach the caller, and the
   transaction is rolled back.

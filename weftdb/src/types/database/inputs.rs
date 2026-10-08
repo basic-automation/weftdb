@@ -1052,7 +1052,9 @@ impl Inputs for Database {
 		}
 
 		Self::commit_concurrent(&conn).await?;
-		self.cache.lock().await.invalidate(&Self::dictionary_metadata_cache_key(aspect_id, dictionary_name)).await;
+		// After the commit, and as a new generation: a read whose snapshot predates the commit
+		// then does not cache the registration this replaced.
+		self.cache.lock().await.invalidate_generation(&Self::dictionary_metadata_cache_key(aspect_id, dictionary_name)).await;
 
 		let log = format!("Set metadata for dictionary '{dictionary_name}' for aspect {aspect_id}");
 		let _ = self.record_transaction(&log).await?;

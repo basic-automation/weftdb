@@ -755,7 +755,9 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 			return Ok(None);
 		}
 
-		// Get from database
+		// Get from database. The cache generation is taken before the read's snapshot, so a
+		// registration a writer replaces meanwhile is not cached over its invalidation.
+		let generation = self.cache.lock().await.generation(&cache_key).await;
 		let db = self.get_dictionary_db(aspect_id, dictionary_name).await?;
 		let conn: cache::Connection = Self::begin_concurrent(&db, dictionary_name, Some(self.cache.clone())).await?;
 		let metadata = match Self::read_dictionary_registration(&conn, dictionary_name).await {
@@ -769,7 +771,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		Self::commit_concurrent(&conn).await?;
 
 		if let Some(metadata) = &metadata {
-			self.cache.lock().await.store(&cache_key, metadata.clone()).await;
+			self.cache.lock().await.store_if_generation(&cache_key, generation, metadata.clone()).await;
 		}
 		Ok(metadata)
 	}
@@ -791,26 +793,44 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		while let Some(entry) = entries.next_entry().await.map_err(|e| Error::DatabaseError(format!("Failed to read dictionaries directory '{dictionaries_path}': {e}")))? {
 			// `<name>.db` only, not Turso's `<name>.db-wal` and `<name>.db-log` beside it.
 			let path = entry.path();
-			if path.extension().is_some_and(|ext| ext == "db") && tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_file()) {
-				if let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) {
-					// No dictionary operation accepts a name that fails validation, so such a
-					// file (`.backup.db`, `CON.db`) is not one of the aspect's dictionaries.
-					match crate::dictionary_name::validate(name) {
-						Ok(()) => names.push(name.to_string()),
-						Err(e) => tracing::warn!(error = %e, path = %path.display(), "Skipping a file in the dictionaries directory whose name is not a dictionary name"),
-					}
+			if !path.extension().is_some_and(|ext| ext == "db") {
+				continue;
+			}
+			// A regular file only. Reading a dictionary opens its file, which sets its journal
+			// mode and can create its tables, so a symlink (to anywhere), a directory or a
+			// device named `*.db` is skipped: `symlink_metadata` does not follow the link.
+			match tokio::fs::symlink_metadata(&path).await {
+				Ok(metadata) if metadata.file_type().is_file() => {}
+				Ok(_) => {
+					tracing::warn!(path = %path.display(), "Skipping an entry in the dictionaries directory that is not a regular file");
+					continue;
+				}
+				Err(e) => {
+					tracing::warn!(error = %e, path = %path.display(), "Skipping an entry in the dictionaries directory that cannot be inspected");
+					continue;
+				}
+			}
+			if let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) {
+				// No dictionary operation accepts a name that fails validation, so such a
+				// file (`.backup.db`, `CON.db`) is not one of the aspect's dictionaries.
+				match crate::dictionary_name::validate(name) {
+					Ok(()) => names.push(name.to_string()),
+					Err(e) => tracing::warn!(error = %e, path = %path.display(), "Skipping a file in the dictionaries directory whose name is not a dictionary name"),
 				}
 			}
 		}
 		names.sort_unstable();
 
 		// A file with no complete registration (see `read_dictionary_registration`) is not
-		// listed; a registration that cannot be read is an error, as it is for
-		// `get_dictionary_metadata`.
+		// listed. Nor is one whose registration cannot be read, such as a stored step method
+		// splimes rejects: it is logged, and the readable dictionaries are still listed
+		// (`get_dictionary_metadata` reports its error).
 		let mut dictionaries = Vec::with_capacity(names.len());
 		for name in names {
-			if let Some(metadata) = self.get_dictionary_metadata(aspect_id, &name).await? {
-				dictionaries.push(metadata);
+			match self.get_dictionary_metadata(aspect_id, &name).await {
+				Ok(Some(metadata)) => dictionaries.push(metadata),
+				Ok(None) => {}
+				Err(e) => tracing::warn!(error = %e, dictionary = %name, aspect = %aspect_id, "Skipping a dictionary whose registration cannot be read"),
 			}
 		}
 		Ok(dictionaries)
@@ -1598,7 +1618,12 @@ impl Database {
 	/// variabilities (none is `None`). The metadata table has no unique constraint, and
 	/// databases written before `set_dictionary_metadata` replaced registrations can hold
 	/// several rows for a name, some without constraints (it wrote none): the newest
-	/// complete one is read, and a name with none is `None`.
+	/// complete one, by `created_at` and then id, is read, and a name with none is `None`.
+	///
+	/// A dictionary file can exist without its tables: one that
+	/// `insert_pattern_into_dictionary` opened first (it creates none), or one this process
+	/// opened while another was still creating them. It cannot hold a registration, so it
+	/// is `None`, on which `load_dictionary` registers the dictionary and so creates them.
 	///
 	/// # Errors
 	///
@@ -1606,6 +1631,10 @@ impl Database {
 	/// [`parse_stored_steps`](Self::parse_stored_steps) and
 	/// [`parse_stored_variability`](Self::parse_stored_variability).
 	async fn read_dictionary_registration(conn: &cache::Connection, dictionary_name: &str) -> Result<Option<DictionaryMetadata>> {
+		let tables = Self::registration_tables(conn).await?;
+		if !(tables.metadata && tables.constraints) {
+			return Ok(None);
+		}
 		let query_sql = r"
                         SELECT m.id, m.name, m.description, c.steps_count, c.steps_interpolation
                         FROM dictionary_metadata m
@@ -1631,14 +1660,35 @@ impl Database {
                         WHERE dictionary_id = ?
                         ORDER BY id
                 ";
-		let mut rows: turso::Rows = conn.as_ref().query(variability_query_sql, turso::params![id_str]).await.map_err(|e| Error::DatabaseError(format!("Failed to query dictionary variabilities: {e}")))?;
 		let mut variabilities = Vec::new();
-		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get variability row: {e}")))? {
-			variabilities.push(Self::parse_stored_variability(&row.get_value(0)?, &row.get_value(1)?)?);
+		if tables.variabilities {
+			let mut rows: turso::Rows = conn.as_ref().query(variability_query_sql, turso::params![id_str]).await.map_err(|e| Error::DatabaseError(format!("Failed to query dictionary variabilities: {e}")))?;
+			while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get variability row: {e}")))? {
+				variabilities.push(Self::parse_stored_variability(&row.get_value(0)?, &row.get_value(1)?)?);
+			}
 		}
 		let variabilities = (!variabilities.is_empty()).then_some(variabilities);
 
 		Ok(Some(DictionaryMetadata { id, name, description, constraints: DictionaryConstraints::new(steps, variabilities) }))
+	}
+
+	/// Which of a registration's tables exist in the dictionary's database, on `conn`.
+	///
+	/// # Errors
+	///
+	/// A failed query of `sqlite_master`.
+	async fn registration_tables(conn: &cache::Connection) -> Result<RegistrationTables> {
+		let mut tables = RegistrationTables::default();
+		let mut rows = conn.as_ref().query("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('dictionary_metadata', 'dictionary_constraints', 'dictionary_variabilities')", turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to list the dictionary's tables: {e}")))?;
+		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to list the dictionary's tables: {e}")))? {
+			match row.get_value(0)?.as_text().map(String::as_str) {
+				Some("dictionary_metadata") => tables.metadata = true,
+				Some("dictionary_constraints") => tables.constraints = true,
+				Some("dictionary_variabilities") => tables.variabilities = true,
+				_ => {}
+			}
+		}
+		Ok(tables)
 	}
 
 	/// Parse one of a dictionary's stored variabilities: the `variability_type` and
@@ -1681,6 +1731,17 @@ impl Database {
 		let interpolation: Spline = interpolation.parse().map_err(|e| Error::DatabaseError(format!("Invalid interpolation format: {e}")))?;
 		Ok(Some(Steps::new(count, interpolation)))
 	}
+}
+
+/// Which of the tables a dictionary's registration is stored in exist in its database.
+#[derive(Debug, Default, Clone, Copy)]
+struct RegistrationTables {
+	/// `dictionary_metadata`.
+	metadata: bool,
+	/// `dictionary_constraints`.
+	constraints: bool,
+	/// `dictionary_variabilities`.
+	variabilities: bool,
 }
 
 #[cfg(test)]
