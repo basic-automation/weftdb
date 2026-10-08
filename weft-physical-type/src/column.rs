@@ -187,7 +187,7 @@ impl ColumnEncoding {
 		self.scaled_i64_mantissas().map(|m| crate::timestamp::for_bitpack_bytes(&m, crate::timestamp::BLOCKED_BITPACK_BLOCK))
 	}
 
-	/// The realized footprint in bytes of the **transposed (`FastLanes`-layout) per-tile
+	/// The realized footprint in bytes of the **bit-sliced (bit-plane-major) per-tile
 	/// bit-packed** value codec for a `ScaledI64` column —
 	/// [`crate::timestamp::transpose_bitpack_bytes`] at [`crate::timestamp::TRANSPOSE_TILE`].
 	/// `None` for any other physical type.
@@ -200,7 +200,7 @@ impl ColumnEncoding {
 	/// small-magnitude stream are skipped wholesale (measured ~5.7× the linear per-block unpack
 	/// in `benches/bitunpack.rs`).
 	///
-	/// It is **not** strictly larger, though: it adapts its width per 1024-lane *tile* while
+	/// It is **not** strictly larger, though: it adapts its width per 1024-value *tile* while
 	/// paying one width header per tile, where the blocked codec pays one per 64-value block.
 	/// On a column whose magnitude varies across wide spans it can therefore come in strictly
 	/// under every size-selected codec — which is why
@@ -210,25 +210,28 @@ impl ColumnEncoding {
 	/// It therefore has its **own** size function and its own selector entry
 	/// ([`best_value_codec_transposed`](Self::best_value_codec_transposed)) rather than
 	/// re-using the blocked figure, and is never chosen by the default (size-minimizing)
-	/// [`best_value_codec`](Self::best_value_codec). *(src: `FastLanes` Compression Layout,
-	/// VLDB'23 — <https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf>)*
+	/// [`best_value_codec`](Self::best_value_codec). Behind the `bitsliced-codec` feature, as
+	/// are [`transposed_overhead`](Self::transposed_overhead) and
+	/// [`best_value_codec_transposed`](Self::best_value_codec_transposed).
+	#[cfg(feature = "bitsliced-codec")]
 	#[must_use]
 	pub fn transposed_value_bytes(&self) -> Option<usize> {
 		self.scaled_i64_mantissas().map(|m| crate::timestamp::transpose_bitpack_bytes(&m, crate::timestamp::TRANSPOSE_TILE))
 	}
 
-	/// The size penalty the transposed codec would pay on this column, as a ratio against the
+	/// The size penalty the bit-sliced codec would pay on this column, as a ratio against the
 	/// smallest size-selected codec (`transposed / best_serialized_bytes`). `None` for a
 	/// non-`ScaledI64` column, and `None` for an empty column (no ratio is meaningful).
 	///
 	/// `1.0` means the transposed layout is free (its bits are a permutation of the winning
 	/// bit-pack's); **below `1.0` it is a strict size win too** (per-tile widths with one header
-	/// per 1024 lanes can beat both the global width and the blocked codec's per-64 headers);
+	/// per 1024 values can beat both the global width and the blocked codec's per-64 headers);
 	/// a large ratio means a *different* codec family won the size race (FOR on a clustered
 	/// column, RLE-shaped data) and the transposed layout would bloat the column to buy its
 	/// decode speed. This is the gate
 	/// [`best_value_codec_transposed`](Self::best_value_codec_transposed) applies — the same
 	/// shape as the timestamp checkpoint index's `max_codec_overhead` ceiling.
+	#[cfg(feature = "bitsliced-codec")]
 	#[must_use]
 	pub fn transposed_overhead(&self) -> Option<f64> {
 		let transposed = self.transposed_value_bytes()?;
@@ -244,7 +247,7 @@ impl ColumnEncoding {
 		Some(ratio)
 	}
 
-	/// The value codec to write when the **transposed layout is permitted** up to a size
+	/// The value codec to write when the **bit-sliced layout is permitted** up to a size
 	/// overhead of `max_overhead` (a ratio against the size-selected codec; `1.0` = only when
 	/// free).
 	///
@@ -260,6 +263,7 @@ impl ColumnEncoding {
 	/// default is a headline bytes/point change and is owner-gated (as FOR / the cascade / the
 	/// checkpoint index were). Callers request it explicitly through
 	/// [`FrameOptions`](crate::weftseg::FrameOptions).
+	#[cfg(feature = "bitsliced-codec")]
 	#[must_use]
 	pub fn best_value_codec_transposed(&self, max_overhead: f64) -> &'static str {
 		let single = self.best_value_codec();

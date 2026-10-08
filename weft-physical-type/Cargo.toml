@@ -25,6 +25,10 @@ path = "src/lib.rs"
 # module (Gorilla-XOR, Chimp, Chimp128, Elf and the `best_f64_*` selector) and the Sprintz
 # FIRE forecaster (`fire_*`).
 experimental-codecs = []
+# The opt-in bit-sliced (bit-plane-major) `ScaledI64` value codec, `VAL_CODEC_TRANSPOSED`.
+# Without it the writer never selects the codec and a frame that uses it fails to read with
+# `WeftSegError::CodecNotEnabled`, naming this feature.
+bitsliced-codec = []
 
 [dependencies]
 bigdecimal = { workspace = true, features = ["serde"] }
@@ -37,6 +41,7 @@ criterion = { workspace = true }
 [[bench]]
 name = "bitunpack"
 harness = false
+required-features = ["bitsliced-codec"]
 
 [[bench]]
 name = "pointread"
@@ -49,3 +54,4 @@ harness = false
 [[bench]]
 name = "transposed_read"
 harness = false
+required-features = ["bitsliced-codec"]

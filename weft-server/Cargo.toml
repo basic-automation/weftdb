@@ -14,6 +14,12 @@ categories = ["database-implementations", "web-programming::http-server"]
 publish = false
 
 
+[features]
+# Forwards weftdb's opt-in bit-sliced value codec so `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD`
+# takes effect. Off by default and pending patent review (ROADMAP.md, Phase 6.1); without it
+# the variable is ignored with a warning.
+bitsliced-codec = ["weftdb/bitsliced-codec"]
+
 [lib]
 name = "weft_server"
 path = "src/lib.rs"

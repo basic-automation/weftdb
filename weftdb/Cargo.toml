@@ -12,6 +12,13 @@ keywords = ["timeseries", "database", "interpolation", "spline", "time-series"]
 categories = ["database-implementations", "science", "mathematics"]
 
 
+# Off by default; outside the semver promise and pending patent review (ROADMAP.md, Phase 6.1).
+[features]
+# The opt-in bit-sliced (bit-plane-major) value codec from `weft-physical-type`. Without it
+# `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` is ignored with a warning, and reading a segment that
+# uses the codec fails with an error naming this feature.
+bitsliced-codec = ["weft-physical-type/bitsliced-codec"]
+
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }

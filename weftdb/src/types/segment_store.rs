@@ -125,10 +125,10 @@ impl CheckpointPolicy {
 	}
 }
 
-/// When a freshly sealed segment writes its value column in the **transposed
-/// (`FastLanes`-layout) bit-plane-major** codec instead of the size-selected one.
+/// When a freshly sealed segment writes its value column in the **bit-sliced
+/// (bit-plane-major)** codec instead of the size-selected one.
 ///
-/// The transposed layout stores the same *code* as the linear bit-pack with its bits permuted,
+/// The bit-sliced layout stores the same *code* as the linear bit-pack with its bits permuted,
 /// so it never wins on size — it is a **decode-latency** trade. Its decoder reads `u64` plane
 /// words and walks only the set bits, so a small-magnitude column's empty high bit-planes are
 /// skipped wholesale (measured ~5.7x the linear per-block unpack at the primitive level,
@@ -142,6 +142,11 @@ impl CheckpointPolicy {
 /// same shape as [`CheckpointPolicy`]'s `max_codec_overhead` gate.
 ///
 /// Whether making this the default is owner-gated — it changes the headline bytes/point.
+///
+/// **Needs the `bitsliced-codec` cargo feature**, which is off by default and pending patent
+/// review. Without it the codec is not compiled in: [`from_env`](Self::from_env) logs a warning
+/// and returns [`DISABLED`](Self::DISABLED), any other policy is ignored by the frame writer,
+/// and reading a segment that uses the codec fails with an error naming the feature.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TransposedPolicy {
 	/// Ceiling on the transposed block's size overhead against the size-selected codec, or
@@ -156,11 +161,22 @@ impl TransposedPolicy {
 
 	/// Read the policy from `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` (absent, unparseable,
 	/// non-finite or non-positive → [`DISABLED`](Self::DISABLED)). A value **below 1.0 is
-	/// meaningful**: it adopts the transposed layout only where it is also a strict size win
-	/// (see [`ColumnEncoding::transposed_overhead`](weft_physical_type::ColumnEncoding::transposed_overhead)).
+	/// meaningful**: it adopts the bit-sliced layout only where it is also a strict size win
+	/// (see `weft_physical_type::ColumnEncoding::transposed_overhead`).
+	///
+	/// Without the `bitsliced-codec` feature a set variable is ignored, with one warning per
+	/// process, and the result is always [`DISABLED`](Self::DISABLED).
 	#[must_use]
 	pub fn from_env() -> Self {
-		Self { max_overhead: std::env::var("WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|r| r.is_finite() && *r > 0.0) }
+		let raw = std::env::var("WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD").ok();
+		if !cfg!(feature = "bitsliced-codec") {
+			if raw.is_some() {
+				static WARNED: std::sync::Once = std::sync::Once::new();
+				WARNED.call_once(|| tracing::warn!("WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD is set, but this build does not include the bit-sliced value codec (cargo feature `bitsliced-codec`); ignoring it"));
+			}
+			return Self::DISABLED;
+		}
+		Self { max_overhead: raw.and_then(|v| v.trim().parse::<f64>().ok()).filter(|r| r.is_finite() && *r > 0.0) }
 	}
 }
 
@@ -3689,6 +3705,7 @@ mod tests {
 	/// stores answer every read identically. The store is the layer that makes the codec
 	/// reachable from a deployment, so this is the test that it is actually wired up.
 	#[tokio::test]
+	#[cfg(feature = "bitsliced-codec")]
 	async fn transposed_seal_reads_identically_and_only_changes_the_bytes() {
 		use weft_physical_type::frame_value_codec;
 

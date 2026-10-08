@@ -16,7 +16,8 @@ is no silent `BigDecimal -> f64`. If you store money or calibrated instrument re
 this is the difference between a store you can audit and one you cannot.
 
 Also provides the typed columnar segment format (`.weftseg`) used on WeftDB's hot path,
-including bit-packing, delta-of-delta timestamp coding and a transposed value layout.
+including bit-packing, frame-of-reference and delta-of-delta coding, plus an opt-in
+bit-sliced value layout (behind a feature, below).
 
 ```toml
 [dependencies]
@@ -31,6 +32,7 @@ reads and writes every frame a default build has ever written.
 
 | Feature | Enables |
 |---------|---------|
+| `bitsliced-codec` | The opt-in bit-sliced (bit-plane-major) `ScaledI64` value codec, `scaled_transposed`. Without it the writer never selects the codec, and reading a segment that uses it fails with `WeftSegError::CodecNotEnabled` naming this feature. |
 | `experimental-codecs` | Advisory codecs the `.weftseg` writer never emits: Gorilla-XOR, Chimp, Chimp128 and Elf for `f64` columns (plus the `best_f64_*` selector), and the Sprintz FIRE timestamp forecaster. Benchmark what-ifs, not a storage format. |
 
 Part of [WeftDB](https://github.com/basic-automation/weftdb).

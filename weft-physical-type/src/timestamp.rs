@@ -611,24 +611,28 @@ pub fn blocked_bitpack_decode_range(bytes: &[u8], block: usize, count: usize, st
 	out
 }
 
-/// The tile size the transposed bit-unpack codec ([`transpose_bitpack_encode`])
+/// The tile size the bit-sliced bit-unpack codec ([`transpose_bitpack_encode`])
 /// partitions a stream into.
 ///
-/// The `FastLanes` "unified transposed layout" targets a virtual 1024-lane SIMD register,
-/// so a 1024-value tile lets each bit-plane of a full tile land on a 128-byte (16×`u64`)
-/// word-aligned boundary; only the final short tile is unaligned. *(src: `FastLanes`
-/// Compression Layout, VLDB'23 — <https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf>)*
+/// A 1024-value tile makes each bit-plane of a full tile exactly 1024 bits — 128 bytes, sixteen
+/// `u64` words — so every plane of a full tile starts on a word boundary and the decoder reads it
+/// in whole words; only the final short tile is unaligned. (Tiles are counted in **values**: a
+/// tile holds 1024 values, and each of its `width` planes holds one bit of each.)
+///
+/// Behind the `bitsliced-codec` feature, as is every `transpose_bitpack_*` function.
+#[cfg(feature = "bitsliced-codec")]
 pub const TRANSPOSE_TILE: usize = 1024;
 
-/// Estimated footprint of a **transposed** per-tile bit-packing of a difference stream:
-/// a one-byte width header plus `width * ceil(len / 8)` plane bytes per tile.
+/// Estimated footprint of a **bit-sliced** (transposed) per-tile bit-packing of a difference
+/// stream: a one-byte width header plus `width * ceil(len / 8)` plane bytes per tile.
 ///
 /// The bit budget is identical to [`blocked_bitpack_bytes`] at the same tile size for any
-/// tile whose length is a multiple of 8 (every full 1024-lane tile is) — the transpose is a
+/// tile whose length is a multiple of 8 (every full 1024-value tile is) — the transpose is a
 /// *permutation* of the same bits, not a different code. A short trailing tile whose length
 /// is not a multiple of 8 costs at most `width - 1` extra bytes because each bit-plane rounds
 /// up to a whole byte independently (vs the single global round-up of the linear layout). The
 /// point of the layout is **decode speed**, not size: see [`transpose_bitpack_decode`].
+#[cfg(feature = "bitsliced-codec")]
 #[must_use]
 pub fn transpose_bitpack_bytes(values: &[i64], tile: usize) -> usize {
 	if values.is_empty() {
@@ -638,13 +642,15 @@ pub fn transpose_bitpack_bytes(values: &[i64], tile: usize) -> usize {
 	values.chunks(tile).map(|chunk| 1 + bitpack_width(chunk) as usize * chunk.len().div_ceil(8)).sum()
 }
 
-/// Transposed per-tile bit-pack encode of a difference stream (the `FastLanes` layout).
+/// Bit-sliced per-tile bit-pack encode of a difference stream.
 ///
 /// Each tile emits a one-byte width header then `width` **bit-planes**: plane `b` is the
 /// `ceil(len / 8)` bytes holding bit `b` of every lane in the tile (lane `l` at bit `l` of
 /// byte `l / 8`). This is the transpose of the linear [`bitpack_encode`] layout, where a
 /// value's `width` bits are contiguous; here a value's bits are scattered one per plane, and
-/// a plane gathers one bit from every value.
+/// a plane gathers one bit from every value. This is a bit-sliced (vertical, bit-plane-major)
+/// layout. It is **not** the `FastLanes` layout, which keeps each value's bits together and
+/// interleaves whole packed values across the lanes of a 1024-bit virtual register.
 ///
 /// Why: the transpose makes the **high bit-planes of a small-magnitude stream empty**, so
 /// [`transpose_bitpack_decode`] skips them wholesale (an all-zero plane word contributes
@@ -652,6 +658,7 @@ pub fn transpose_bitpack_bytes(values: &[i64], tile: usize) -> usize {
 /// regardless. Exact inverse is [`transpose_bitpack_decode`] given the same `tile` and count;
 /// an empty input yields an empty buffer. The emitted length is exactly
 /// [`transpose_bitpack_bytes`] for the same `(values, tile)`.
+#[cfg(feature = "bitsliced-codec")]
 #[must_use]
 pub fn transpose_bitpack_encode(values: &[i64], tile: usize) -> Vec<u8> {
 	let tile = tile.max(1);
@@ -680,7 +687,7 @@ pub fn transpose_bitpack_encode(values: &[i64], tile: usize) -> Vec<u8> {
 	out
 }
 
-/// Decode one transposed tile's `len` lanes from its `width` bit-planes (the `plane_bytes =
+/// Decode one bit-sliced tile's `len` lanes from its `width` bit-planes (the `plane_bytes =
 /// ceil(len / 8)` bytes per plane starting at `planes`). Shared by [`transpose_bitpack_decode`]
 /// and [`transpose_bitpack_decode_range`].
 ///
@@ -688,6 +695,7 @@ pub fn transpose_bitpack_encode(values: &[i64], tile: usize) -> Vec<u8> {
 /// lanes (`w &= w - 1` walks set bits), so an all-zero plane word costs a single compare — the
 /// decode-latency win. A `width` of 0 (a constant tile) yields `len` zeros; bytes past `planes`
 /// read as 0 (a truncated tile yields zeros rather than panicking).
+#[cfg(feature = "bitsliced-codec")]
 fn transpose_tile_decode(planes: &[u8], width: usize, len: usize) -> Vec<i64> {
 	if width == 0 {
 		return vec![0; len];
@@ -716,7 +724,7 @@ fn transpose_tile_decode(planes: &[u8], width: usize, len: usize) -> Vec<i64> {
 	acc.iter().map(|&a| unzigzag(a)).collect()
 }
 
-/// Reconstruct `count` differences from a transposed per-tile bit-pack buffer.
+/// Reconstruct `count` differences from a bit-sliced per-tile bit-pack buffer.
 ///
 /// Exact inverse of [`transpose_bitpack_encode`] given the same `tile` and `count`. The
 /// decode reads each bit-plane as `u64` words and distributes only the **set** bits of each
@@ -724,6 +732,7 @@ fn transpose_tile_decode(planes: &[u8], width: usize, len: usize) -> Vec<i64> {
 /// single compare and a sparse one costs only its population — the decode-latency win over
 /// the scalar [`bitpack_decode`], which loops every bit of every value. Bytes past the buffer
 /// read as `0` (a truncated tile yields zeros rather than panicking).
+#[cfg(feature = "bitsliced-codec")]
 #[must_use]
 pub fn transpose_bitpack_decode(bytes: &[u8], tile: usize, count: usize) -> Vec<i64> {
 	let tile = tile.max(1);
@@ -745,17 +754,17 @@ pub fn transpose_bitpack_decode(bytes: &[u8], tile: usize, count: usize) -> Vec<
 }
 
 /// **Tile-level random access:** decode only the `len` differences at global index `start` from
-/// a transposed per-tile bit-pack buffer.
+/// a bit-sliced per-tile bit-pack buffer.
 ///
 /// The tiles before `start` are skipped by reading their one-byte width headers (and computing
-/// each tile's plane-byte length) rather than decoding their planes — the transposed mirror of
-/// [`blocked_bitpack_decode_range`]. This is the random-access primitive the transposed layout
+/// each tile's plane-byte length) rather than decoding their planes — the bit-sliced mirror of
+/// [`blocked_bitpack_decode_range`]. This is the random-access primitive the bit-sliced layout
 /// needs to serve a point lookup or sub-range without materializing the whole column (so the
 /// layout can back a block-random-access value/timestamp codec without regressing the streaming
 /// point read). The result equals `transpose_bitpack_decode(bytes, tile, count)[start..start+len]`
 /// (clamped to `count`); a `start >= count` or `len == 0` yields an empty vector. Roadmap Phase
-/// 6.1 "realize the transposed layout on disk". *(src: `FastLanes` Compression Layout, VLDB'23 —
-/// <https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf>)*
+/// 6.1 "realize the transposed layout on disk".
+#[cfg(feature = "bitsliced-codec")]
 #[must_use]
 pub fn transpose_bitpack_decode_range(bytes: &[u8], tile: usize, count: usize, start: usize, len: usize) -> Vec<i64> {
 	let tile = tile.max(1);
@@ -2171,6 +2180,7 @@ mod tests {
 	}
 
 	#[test]
+	#[cfg(feature = "bitsliced-codec")]
 	fn transpose_bitpack_round_trips_and_agrees_with_the_scalar_decoder() {
 		// The transposed layout is a permutation of the scalar bit-pack's bits: for every
 		// tile and awkward tail length, the transposed decode must reproduce the exact
@@ -2193,9 +2203,10 @@ mod tests {
 	}
 
 	#[test]
+	#[cfg(feature = "bitsliced-codec")]
 	fn transpose_bitpack_footprint_matches_the_linear_layout_on_aligned_tiles() {
 		// The transpose is the same bit budget as the linear per-block layout for any tile
-		// whose length is a multiple of 8 — a full 1024-lane tile always is, so a stream
+		// whose length is a multiple of 8 — a full 1024-value tile always is, so a stream
 		// sized to whole tiles is byte-for-byte the same size (the win is decode speed, not
 		// size). Values kept small so every tile shares a modest width.
 		let vals: Vec<i64> = (0..2048).map(|i| (i % 9) - 4).collect();
@@ -2203,6 +2214,7 @@ mod tests {
 	}
 
 	#[test]
+	#[cfg(feature = "bitsliced-codec")]
 	fn transpose_bitpack_handles_all_zero_and_empty_streams() {
 		assert_eq!(transpose_bitpack_bytes(&[], 8), 0);
 		// An all-zero stream: each tile costs a single width-header byte (width 0, no planes).
@@ -2270,6 +2282,7 @@ mod tests {
 	}
 
 	#[test]
+	#[cfg(feature = "bitsliced-codec")]
 	fn transpose_bitpack_decode_range_matches_the_full_decode() {
 		// Tile-level random access must equal the full decode sliced to [start, start+len) for
 		// every tile size and window — including single-value reads, windows straddling tile

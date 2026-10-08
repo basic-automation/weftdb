@@ -298,11 +298,12 @@ while using bounded memory per bucket.
 
 ### Where it doesn't pay off
 
-A deliberately-kept honest result: the FastLanes **transposed value codec** delivers
+A deliberately-kept honest result: the **bit-sliced (transposed) value codec** delivers
 ~5.7× faster bit-unpacking at the kernel level, but end-to-end it is a **wash** —
 +0.08% bytes and full decode, windowed range and point reads all within noise of the
 linear codec ([`benches/transposed_read.rs`](weft-physical-type/benches/transposed_read.rs)).
-It ships **off by default** for exactly that reason. Kernel speedups often don't
+It ships **off by default** for exactly that reason (and is now behind the
+`bitsliced-codec` build feature, pending patent review). Kernel speedups often don't
 survive a whole read path, and this README would rather say so than quote the 5.7×.
 
 ---
@@ -526,7 +527,7 @@ WeftDB is configured primarily through environment variables:
 | `WEFT_SEGMENT_CHECKPOINT_STRIDE` | `weft-server` | Rows between entries of the sealed **timestamp checkpoint index** — trades a little size for much faster point lookups on **sorted, irregular** columns (~3.45× single-block; see the checkpointed-frames feature above). Applies only where it pays: sorted + irregular + at least `WEFT_SEGMENT_CHECKPOINT_MIN_ROWS` rows. ~1024 is the sweet spot (stride barely moves speed but does move size). | unset (no index; frames byte-for-byte as before) |
 | `WEFT_SEGMENT_CHECKPOINT_MIN_ROWS` | `weft-server` | Row floor below which a segment is never checkpointed (a small column decodes trivially, so an index would be pure cost). | `8192` |
 | `WEFT_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD` | `weft-server` | Ceiling on the timestamp-codec override a checkpointed seal will accept (`blocked / best` bytes; `1.0` = only when free). A checkpointed frame must use the range-decodable per-block codec, which is ~free where that codec already wins but **~3.5× on a Gorilla-shaped and ~14× on an RLE-shaped column** — this refuses those seals rather than silently bloating them. | `1.25` |
-| `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` | `weft-server` | Ceiling on the size overhead the **transposed (`FastLanes`-layout) value codec** may pay against the size-selected codec (`transposed / best` bytes; `1.0` = only when free, and a value **below 1.0 is meaningful** — the transposed layout can be a strict size win, since it pays one width header per 1024-lane tile where the blocked codec pays one per 64 values). Stores the value column bit-plane-major for faster bit-plane-skipping decode. Measured byte- and read-neutral end-to-end on a 1M-row column (see the transposed-codec feature above), so it is off by default. | unset (no transposed codec; frames byte-for-byte as before) |
+| `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` | `weft-server` | Ceiling on the size overhead the **bit-sliced (transposed) value codec** may pay against the size-selected codec (`transposed / best` bytes; `1.0` = only when free, and a value **below 1.0 is meaningful** — the bit-sliced layout can be a strict size win, since it pays one width header per 1024-value tile where the blocked codec pays one per 64 values). Stores the value column bit-plane-major for faster bit-plane-skipping decode. Measured byte- and read-neutral end-to-end on a 1M-row column (see the bit-sliced-codec feature above), so it is off by default. **Needs a build with the `bitsliced-codec` feature**; any other build ignores the variable and logs a warning. | unset (no transposed codec; frames byte-for-byte as before) |
 | `WEFT_SEGMENT_PARTIAL_BASE` | `weft-server` | Resolution token (`seconds`/`minutes`/`hours`/…) at which each sealed segment materializes a **partial-reduction `.weftpart` sidecar** — a stored mergeable partial of the bounded reductions. A stored-range downsample of those reductions then **merges the sidecars instead of decoding the value column** (measured **3.2×**), re-keyed to any coarser nesting resolution. A sealed segment is immutable, so the sidecar never goes stale; a rewrite (reconcile/split/squash) regenerates it. | unset (no sidecar; `downsample_range` decodes as before) |
 | `WEFT_SEGMENT_PARTIAL_MIN_ROWS` | `weft-server` | Row floor below which a segment gets no partial sidecar (a tiny segment's partial saves too little decode to be worth the extra file). | `4096` |
 | `WEFT_SEGMENT_PARTIAL_TIERS` | `weft-server` | Comma-separated fine→coarse rollup resolutions (e.g. `hours,days`) materialized **beside** the `WEFT_SEGMENT_PARTIAL_BASE` partial, each re-keyed from the tier below (up to four kept; a finer/non-nesting entry is skipped). A coarse stored-range downsample then folds the coarsest matching tier instead of re-keying the whole fine base (measured **~1.16×** on a DAY query over a MINUTES base). No effect unless `WEFT_SEGMENT_PARTIAL_BASE` is set. | unset (base-only sidecar) |
@@ -558,6 +559,15 @@ The `splimes` crate also exposes build features:
 The GPU is started at runtime, not at build time: `weft-server` calibrates it in the
 background at startup (`WEFT_GPU_CALIBRATE`, above), and an embedding program calls
 `splimes::calibrate()` or `splimes::prewarm_gpu()` itself.
+
+WeftDB's own build features are all **off by default**, sit **outside the 1.0 semver
+promise**, and are **pending patent review**. A default build reads and writes every
+segment a default build has ever written.
+
+| Feature | Crate(s) | Effect |
+|---------|----------|--------|
+| `bitsliced-codec` | `weft-physical-type`, forwarded by `weftdb` and `weft-server` | Compiles in the opt-in bit-sliced value codec, so `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` takes effect. Without it, a segment written with the codec fails to read with an error naming the feature. |
+| `experimental-codecs` | `weft-physical-type` (enabled by `weft-bench`) | Advisory codecs never written to disk: Gorilla-XOR, Chimp, Chimp128 and Elf for `f64`, and the Sprintz FIRE timestamp forecaster. Benchmark what-ifs only. |
 
 ---
 
@@ -900,8 +910,9 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   (`StorageEstimate.advisory_delta_cascade_value_bytes`, schema v15). It is **opt-in** — the
   cascade beats even FOR broadly, so folding it into the default selector is a headline change
   held for owner sign-off; the default codec choice is unchanged.
-- **Transposed (`FastLanes`-layout) value codec (opt-in)** — `VAL_CODEC_TRANSPOSED` stores a
-  `ScaledI64` column's mantissas **bit-plane-major** in 1024-lane tiles, so the decoder reads `u64`
+- **Bit-sliced (transposed) value codec (opt-in, `bitsliced-codec` build feature)** —
+  `VAL_CODEC_TRANSPOSED` stores a
+  `ScaledI64` column's mantissas **bit-plane-major** in 1024-value tiles, so the decoder reads `u64`
   plane words and walks only the *set* bits and a small-magnitude column's empty high bit-planes are
   skipped wholesale. It carries its **own** size function (`transposed_value_bytes`) and selector
   entry (`best_value_codec_transposed(max_overhead)`) rather than reusing the blocked figure, is
@@ -915,16 +926,20 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   byte-neutral and read-neutral here; it stays **opt-in** and the default codec choice is unchanged.
   Note the codec is chosen only when a *strict* size win or within the caller's overhead ceiling —
   the ceiling may legitimately be set below 1.0, because per-tile widths with one header per 1024
-  lanes can beat both a global width and the blocked codec's one-header-per-64.
+  values can beat both a global width and the blocked codec's one-header-per-64. It is a
+  bit-sliced layout, not the FastLanes layout (which keeps each value's bits together), and it
+  is compiled only with the `bitsliced-codec` feature, pending patent review; without it the
+  writer never selects it and reading a segment that uses it fails with an error naming the
+  feature.
 - **Block-level random access** — the fixed-layout value codecs support decoding a single value
   (or a sub-range) without materializing the whole column: `weftseg::read_value_at(bytes, i)`
   reads only the block covering row `i` (skipping earlier blocks by their headers) for the
   blocked/FOR codecs, reads bit `i * width` directly for the fixed-width bit-pack codec, and decodes
-  only the covering tile for the transposed codec — the point-lookup / late-materialization lever.
+  only the covering tile for the bit-sliced codec — the point-lookup / late-materialization lever.
   `weftseg::read_value_range(bytes, start, len)` is its **windowed** sibling: every fixed-layout codec
   locates a value by walking its block/tile headers from the start of the stream, so resolving a
   window one value at a time re-walks that chain per row. The range read does the decode **once**,
-  which is what keeps a windowed read on the 1024-lane transposed layout from costing a whole tile
+  which is what keeps a windowed read on the 1024-value-tile bit-sliced layout from costing a whole tile
   decode per row. `weftseg::read_segment_point(bytes, t)`
   wires this up to the framed single-block segment — it skips the value block by its framing,
   decodes only the timestamps to find the row, and unpacks the one covering value block — so a
@@ -1208,7 +1223,8 @@ What it does today:
   `_codec`) for a lossy `F64` column, and the **Sprintz FIRE** forecaster's
   footprint on the timestamp column (`advisory_fire_timestamp_bytes`) — each a
   *what-if* number the adopt-or-drop decision reads, never a realized headline
-  claim.
+  claim. These codecs live behind `weft-physical-type`'s `experimental-codecs`
+  feature, which only `weft-bench` enables.
 - **Reports** — a `BenchReport` JSON artifact (run metadata + a best-effort
   hardware probe: CPU model, cores, RAM) under `reports/json/`, plus a
   self-contained **HTML** view (`--html`) with the most-accurate row highlighted.

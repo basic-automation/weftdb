@@ -78,6 +78,14 @@
 //!   (`gorilla_f64_bytes`, `best_f64_bytes`, `best_f64_codec`), and the Sprintz FIRE
 //!   forecaster (`fire_residuals`, `fire_reconstruct`, `fire_estimated_bytes`). They exist
 //!   so the benchmark harness can report what-if sizes; they are not a storage format.
+//! - `bitsliced-codec` — the opt-in bit-sliced (bit-plane-major) `ScaledI64` value codec
+//!   (`VAL_CODEC_TRANSPOSED`, codec name `scaled_transposed`): the `transpose_bitpack_*`
+//!   primitives and `TRANSPOSE_TILE` in [`timestamp`], the `ColumnEncoding` entries
+//!   (`transposed_value_bytes`, `transposed_overhead`, `best_value_codec_transposed`), and
+//!   `weftseg::write_value_column_transposed`. Without it the writers ignore
+//!   [`FrameOptions::transposed_max_overhead`] and every reader returns
+//!   [`WeftSegError::CodecNotEnabled`] for a block that uses the codec, so a store that holds
+//!   one fails loudly rather than misreading it.
 //!
 //! ## Vendor-neutrality
 //!

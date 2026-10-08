@@ -1,9 +1,9 @@
 //! Decode-throughput benchmark for the value/timestamp bit-pack codecs.
 //!
-//! Roadmap Phase 6.1 "FastLanes transposed bit-unpack" — the realized `ScaledI64`
+//! Roadmap Phase 6.1 "transposed bit-unpack" — the realized `ScaledI64`
 //! value codec and the timestamp bit-pack codec pack scalar LSB-first, so decode is a
-//! per-value bit loop ([`bitpack_decode`]/[`blocked_bitpack_decode`]). The transposed
-//! layout ([`transpose_bitpack_decode`]) stores each tile bit-plane-major, so the decoder
+//! per-value bit loop ([`bitpack_decode`]/[`blocked_bitpack_decode`]). The bit-sliced
+//! (transposed) layout ([`transpose_bitpack_decode`]) stores each tile bit-plane-major, so the decoder
 //! reads `u64` words and walks only the *set* bits, skipping the empty high planes of a
 //! small-magnitude stream wholesale. This bench measures that decode-latency win at an
 //! **identical byte footprint** (the transpose is a permutation of the same bits).
@@ -12,6 +12,9 @@
 //! timestamp codecs actually see after delta transforms): mostly narrow jitter with a
 //! sparse scatter of wider values, so the high bit-planes are sparse — exactly where
 //! plane-skipping pays. bytes/point is unchanged; this is a decode-throughput artifact.
+//!
+//! Needs the `bitsliced-codec` feature (`cargo bench -p weft-physical-type --features
+//! bitsliced-codec --bench bitunpack`).
 
 use std::hint::black_box;
 

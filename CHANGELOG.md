@@ -157,6 +157,16 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `features = ["experimental-codecs"]`. None of them was ever written to disk, so stored
   segments are unaffected. The feature is off by default, outside the semver promise, and
   pending patent review.
+- **The opt-in transposed value codec is now the `bitsliced-codec` feature**
+  (`weft-physical-type`, forwarded by `weftdb` and `weft-server`), pending patent review.
+  ⚠️ A store that enabled it with `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` must be built with
+  `bitsliced-codec` to read those segments: without the feature, reading one fails with the
+  new `WeftSegError::CodecNotEnabled` (which names the feature) instead of decoding, and the
+  variable is ignored with a warning. The `transpose_bitpack_*` primitives, `TRANSPOSE_TILE`,
+  `ColumnEncoding::{transposed_value_bytes, transposed_overhead, best_value_codec_transposed}`
+  and `weftseg::write_value_column_transposed` need the feature too. Default builds never
+  wrote this codec, so their stores are unaffected. The docs now call it a bit-sliced
+  (bit-plane-major) layout; it is not the FastLanes layout they used to name.
 
 ### Fixed
 
