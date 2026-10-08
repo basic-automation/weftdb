@@ -45,10 +45,11 @@ impl SegmentIndexStore {
 	///
 	/// # Errors
 	///
-	/// Propagates any libSQL connection or DDL failure.
+	/// Fails if the database does not end up in MVCC journal mode or a new connection
+	/// does not sync FULL, and propagates any libSQL connection or DDL failure.
 	pub async fn open(path: &str) -> Result<Self> {
 		let db = Builder::new_local(path).build().await?;
-		Self::configure_and_wireframe(&db).await?;
+		Self::configure_and_wireframe(&db, path).await?;
 		Ok(Self { db })
 	}
 
@@ -87,11 +88,12 @@ impl SegmentIndexStore {
 		crate::types::backup::snapshot_with_verify(&conn, dest, mode).await
 	}
 
-	/// Enable MVCC and create the `segment_index` table if it does not exist.
-	async fn configure_and_wireframe(db: &turso::Database) -> Result<()> {
+	/// Enable MVCC, prove it took and that commits sync FULL, and create the
+	/// `segment_index` table if it does not exist. `path` names the database in errors.
+	async fn configure_and_wireframe(db: &turso::Database, path: &str) -> Result<()> {
 		let conn = db.connect()?;
-		// Match the control plane's MVCC write path (Turso 0.6, no AUTOINCREMENT).
-		conn.execute("PRAGMA journal_mode=experimental_mvcc", turso::params![]).await.ok();
+		// The control plane's MVCC write path; open fails rather than run without it.
+		crate::types::durable::control_plane::enable_mvcc_full(db, &conn, path).await?;
 		conn.execute("PRAGMA busy_timeout=600000", turso::params![]).await.ok();
 		conn.execute(
 			"CREATE TABLE IF NOT EXISTS segment_index (
