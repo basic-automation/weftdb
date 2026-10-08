@@ -538,7 +538,11 @@ detection within Y% and improving historical query latency by Z."*
       timestamp twin of the decimal-exponent FOR. Per block (or column), compute the GCD of the
       deltas, store it once, and pack `dod / gcd`. Expect ~10 bits on that corpus. It stays exact,
       and the declared `TimeUnit` is unchanged.
-    - [ ] **NEW — first-order delta + FOR as a timestamp candidate beside DoD.** On fully jittered
+    - [x] **DONE (2026-10-08, advisory) — first-order delta + FOR as a timestamp candidate beside DoD.**
+      `DeltaOfDeltaColumn::delta_for_estimated_bytes()`, measured at jittered_micros **20.000 →
+      19.424** bits/value (pco 19.001), ms_as_micros 19.420 (the common-multiple factor's 10.000 is
+      far better there), and btc_minutes 0.250 (it loses on a constant stride, as expected). A
+      modest ~3% on random-interval streams only. Original rationale: On fully jittered
       intervals the second difference doubles the variance, costing ~1 bit/value (20 vs pco's 19).
       Add a "delta-FOR" arm to `best_estimated_bytes`'s race; it wins only on random-interval
       streams, and that is also exactly where DoD's premise (a near-constant stride) fails.

@@ -1785,6 +1785,37 @@ impl DeltaOfDeltaColumn {
 		Some(reduced.best_estimated_bytes() + uvarint_len(g))
 	}
 
+	/// The first-order deltas this column reconstructs (`ts[i+1] - ts[i]`), recovered from the
+	/// first delta and the second differences. Empty for fewer than two points.
+	fn first_order_deltas(&self) -> Vec<i64> {
+		let Some(first_delta) = self.first_delta else {
+			return Vec::new();
+		};
+		let mut deltas = Vec::with_capacity(self.dods.len() + 1);
+		deltas.push(first_delta);
+		let mut delta = first_delta;
+		for &dod in &self.dods {
+			delta = delta.wrapping_add(dod);
+			deltas.push(delta);
+		}
+		deltas
+	}
+
+	/// **Advisory** packed size of the timestamps as **first-order deltas under per-block FOR**
+	/// rather than second differences: the anchor plus [`for_bitpack_bytes`] over the deltas at
+	/// [`BLOCKED_BITPACK_BLOCK`].
+	///
+	/// Delta-of-delta assumes a near-constant stride, so its second differences are small. On an
+	/// event stream whose intervals are independent and random, the second difference of two
+	/// random intervals spans twice their range, costing about one extra bit per value, while
+	/// FOR over the deltas pays only the interval range (`benches/timestamp_vs_pco.rs`, jittered
+	/// µs: 20 bits/value for the shipped selector vs 19 for pco). Advisory: not a realized
+	/// timestamp codec and not in [`best_estimated_bytes`](Self::best_estimated_bytes).
+	#[must_use]
+	pub fn delta_for_estimated_bytes(&self) -> usize {
+		8 + for_bitpack_bytes(&self.first_order_deltas(), BLOCKED_BITPACK_BLOCK)
+	}
+
 	/// The smallest of the plain-varint, RLE, bit-packed, Gorilla, and per-block adaptive
 	/// bit-pack second-difference estimates — the realistic stored size once the cheapest
 	/// codec is chosen.
@@ -2518,6 +2549,30 @@ mod tests {
 		// Empty stream encodes to nothing and decodes to nothing.
 		assert!(transpose_bitpack_encode(&[], 64).is_empty());
 		assert_eq!(transpose_bitpack_decode(&[], 64, 0), Vec::<i64>::new());
+	}
+
+	#[test]
+	fn delta_for_beats_delta_of_delta_on_independent_random_intervals() {
+		// Independent random intervals: second differences span twice the interval range, so
+		// FOR over the first-order deltas is smaller than the best DoD codec. A constant stride
+		// is DoD's home ground, where it stays at least as small.
+		let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+		let mut t = 1_700_000_000_000_000_i64;
+		let random: Vec<i64> = (0..4_096)
+			.map(|_| {
+				state ^= state << 13;
+				state ^= state >> 7;
+				state ^= state << 17;
+				t += i64::try_from(state % 500_000).unwrap_or(0) + 1_000;
+				t
+			})
+			.collect();
+		let col = encode_delta_of_delta(&random, TimeUnit::Micros);
+		assert_eq!(col.first_order_deltas(), random.windows(2).map(|w| w[1] - w[0]).collect::<Vec<_>>());
+		assert!(col.delta_for_estimated_bytes() < col.best_estimated_bytes(), "delta-FOR {} must beat DoD best {}", col.delta_for_estimated_bytes(), col.best_estimated_bytes());
+		let regular = encode_delta_of_delta(&(0..4_096_i64).map(|i| i * 60).collect::<Vec<_>>(), TimeUnit::Seconds);
+		assert!(regular.best_estimated_bytes() <= regular.delta_for_estimated_bytes());
+		assert_eq!(encode_delta_of_delta(&[7], TimeUnit::Seconds).delta_for_estimated_bytes(), 8);
 	}
 
 	#[test]

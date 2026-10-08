@@ -96,6 +96,7 @@ fn bench_timestamps(c: &mut Criterion) {
 			Some(bytes) => eprintln!("  weft dod / common multiple {:>8} {:>7.3}", dod.common_multiple().unwrap_or(1), bits_per_value(bytes)),
 			None => eprintln!("  weft dod / common multiple      none"),
 		}
+		eprintln!("  weft delta + FOR (advisory)        {:>7.3}", bits_per_value(dod.delta_for_estimated_bytes()));
 		eprintln!("  pco                                {:>7.3}", bits_per_value(pco_bytes.len()));
 
 		let mut group = c.benchmark_group(format!("timestamp_decode_1mi/{name}"));
