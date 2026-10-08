@@ -28,7 +28,7 @@ pub use segment_index::SegmentIndexStore;
 #[cfg(feature = "fault-injection")]
 #[doc(hidden)]
 pub use segment_store::MaintenanceHold;
-pub use segment_store::{AspectStorageStats, CheckpointPolicy, ControlPlaneBackup, HotColdReconcile, HotColdSweep, MaintenanceBusy, MaintenanceWait, OpenReport, OverlapSweep, Poisoned, ReconcileSweep, SegmentStore, SegmentStoreOptions, SquashSweep, StoreLocked, StoreStorageStats, TransposedPolicy, AMBIGUOUS_COMMIT_ENV, AMBIGUOUS_COMMIT_EXIT_CODE, DEFAULT_CHECKPOINT_MIN_ROWS, DEFAULT_MAINTENANCE_WAIT};
+pub use segment_store::{AspectStorageStats, CheckpointPolicy, ControlPlaneBackup, HotColdReconcile, HotColdSweep, MaintenanceBusy, MaintenanceWait, OpenReport, OverlapSweep, Poisoned, ReapSweep, ReconcileSweep, SegmentStore, SegmentStoreOptions, SquashSweep, StoreLocked, StoreStorageStats, TransposedPolicy, AMBIGUOUS_COMMIT_ENV, AMBIGUOUS_COMMIT_EXIT_CODE, DEFAULT_CHECKPOINT_MIN_ROWS, DEFAULT_MAINTENANCE_WAIT};
 pub use signal::{units_between, Distance, ErrVal, Signal, SignalType, Signals};
 pub use store_format::{StoreFormat, StoreScope, LEGACY_LAYOUT, STORE_FORMAT_FILE, SUPPORTED_LAYOUT};
 pub use subject::{Subject, SubjectId};
@@ -52,6 +52,7 @@ pub mod durable;
 pub mod error;
 pub mod event;
 pub mod exec;
+pub(crate) mod frame_name;
 pub(crate) mod index_txn;
 pub mod input_measurement;
 pub mod measurement;
@@ -62,6 +63,7 @@ pub mod occurrence;
 pub mod partial_sidecar;
 pub mod pattern;
 pub mod pipeline;
+pub(crate) mod reaper;
 pub mod relative;
 pub mod segment_index;
 pub mod segment_store;

@@ -1182,7 +1182,10 @@ mod tests {
 		let (root, sim) = store();
 		let segments = root.path().join("segments");
 		let written = payload(64, 21);
-		let point = FaultPoint::MOutputWritten;
+		// A point no store path reaches: armed points are process-global, and
+		// `M-output-written`, which every reconcile and split passes, would fail one running
+		// in another test.
+		let point = FaultPoint::LChunk(u32::MAX - 3);
 		let _armed = arm(point, FaultAction::ReturnErr);
 		let err = write_new_durable(&sim, &segments, "out", written.clone(), SyncPolicy::Full, WritePoints { written: Some(point), ..WritePoints::NONE }).await.unwrap_err();
 		assert_eq!(crate::types::durable::fault::injected_point(&err), Some(point));

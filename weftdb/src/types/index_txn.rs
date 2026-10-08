@@ -49,8 +49,9 @@
 //! transaction holding any of them is retried only when its conflict came before any op
 //! ran (a `Busy` at `BEGIN`, which used no snapshot), and is otherwise reported at its
 //! first conflict, as every segment-index write was before this type existed. Seals
-//! (`InsertNew` and `SeqBump`, since S7) get the retries, as will the write-once swaps
-//! that replace the maintenance ops (S8, S9).
+//! (`InsertNew` and `SeqBump`, since S7) get the retries, and so do the write-once swaps
+//! of reconcile and split (S8), whose ops are all guarded: `ReplaceExpected`,
+//! `InsertNew`, the journal ops and `SeqBump`.
 //!
 //! **The write scope** (robustness track ROB-2). Every transaction runs inside
 //! [`control_plane_write`](crate::exec::control_plane_write), so the process's panic hook
@@ -111,7 +112,6 @@ impl IndexRow {
 	}
 
 	/// The identity a precondition on this row names.
-	#[cfg_attr(not(test), expect(dead_code, reason = "the swap protocols (S8, S9) take their preconditions from the rows they read"))]
 	pub const fn version(&self) -> RowVersion {
 		RowVersion { id: self.desc.id, gen: self.gen, frame_crc: self.frame_crc }
 	}
@@ -133,10 +133,9 @@ pub enum IndexOp {
 	/// `OR REPLACE`. A taken key is a [`TxnErrorKind::Conflict`].
 	InsertNew { aspect: String, row: IndexRow },
 	/// Replace the row matching `expected` with `row`. Exactly one row must match.
-	#[cfg_attr(not(test), expect(dead_code, reason = "the maintenance swaps (S8, S9) replace their members with this"))]
 	ReplaceExpected { aspect: String, expected: RowVersion, row: IndexRow },
 	/// Delete the row matching `expected`. Exactly one row must match.
-	#[cfg_attr(not(test), expect(dead_code, reason = "the maintenance swaps (S8, S9) delete their members with this"))]
+	#[cfg_attr(not(test), expect(dead_code, reason = "the merging maintenance swaps (S9) delete their members with this"))]
 	DeleteExpected { aspect: String, expected: RowVersion },
 	/// Insert `row`, replacing any row with its `(aspect, id)` (`INSERT OR REPLACE`).
 	/// Today's seal and in-place rewrite semantics, kept until S7-S9 replace them with
@@ -145,11 +144,26 @@ pub enum IndexOp {
 	/// Delete the row with `(aspect, id)`, if any. Today's merge and squash semantics,
 	/// kept until S9 replaces them with [`DeleteExpected`](Self::DeleteExpected).
 	Delete { aspect: String, id: u64 },
-	/// Raise `aspect`'s persisted allocator (its `aspect_seq` row) to at least `next_id`
-	/// and `epoch`, creating the row if the aspect has none. Neither value ever moves
-	/// back, so a commit that used ids below `next_id` keeps them from being reissued
-	/// after a restart, whatever order such commits land in.
-	SeqBump { aspect: String, next_id: u64, epoch: u64 },
+	/// Raise `aspect`'s persisted allocator (its `aspect_seq` row) to at least `next_id`,
+	/// `next_gen` and `epoch`, creating the row if the aspect has none. No value ever
+	/// moves back, so a commit that used ids or generations below them keeps them from
+	/// being reissued after a restart, whatever order such commits land in. A new row's
+	/// `next_gen` is at least 1: generation 0 names the legacy `{aspect}-{id}` frames.
+	SeqBump { aspect: String, next_id: u64, next_gen: u64, epoch: u64 },
+	/// Journal `name`, a frame file directly under `segments/`, as a `'pending'` output of
+	/// a maintenance operation on `aspect` (design section 5.3, M3): written, or about to
+	/// be, and not yet swapped in. A plain `INSERT`: frame names are never reused, so a
+	/// taken name is a [`TxnErrorKind::Conflict`].
+	JournalPending { aspect: String, name: String, created_ms: i64 },
+	/// Journal `name` as `'retired'` from `aspect` by the swap this transaction commits,
+	/// in aspect epoch `retire_epoch` (M5): no live row references it any more, and the
+	/// reaper unlinks it once no read that may still open it is running. A plain `INSERT`,
+	/// as for [`JournalPending`](Self::JournalPending).
+	JournalRetire { aspect: String, name: String, retire_epoch: u64, created_ms: i64 },
+	/// Delete the journal row of `name`, whatever its state, if it has one: a swap clears
+	/// its outputs' `'pending'` rows, the reaper and the open's replay the rows they
+	/// processed.
+	ClearJournal { name: String },
 	/// Record `store_meta[key] = value`, replacing what was there. The open mirrors its
 	/// `STORE_FORMAT` marker into `store_meta` with these.
 	MetaSet { key: String, value: String },
@@ -171,7 +185,11 @@ impl IndexOp {
 			// A floor raise only ever raises, and a migration keeps its first record, so
 			// running them again over another writer's commit changes nothing that writer
 			// did.
-			Self::InsertNew { .. } | Self::ReplaceExpected { .. } | Self::DeleteExpected { .. } | Self::SeqBump { .. } | Self::RaiseFloor { .. } | Self::RecordMigration { .. } => true,
+			//
+			// A journal insert finds a taken name a conflict, as `InsertNew` does a taken id,
+			// and a journal delete removes the row of a name that is never reused, so
+			// running it again removes nothing another writer made.
+			Self::InsertNew { .. } | Self::ReplaceExpected { .. } | Self::DeleteExpected { .. } | Self::SeqBump { .. } | Self::RaiseFloor { .. } | Self::RecordMigration { .. } | Self::JournalPending { .. } | Self::JournalRetire { .. } | Self::ClearJournal { .. } => true,
 			// `MetaSet` replaces the value, so a retry would overwrite what another writer
 			// committed in between. (Its one writer today is the open, under the root's
 			// LOCK, which nothing races.)
@@ -313,7 +331,6 @@ impl IndexTxn {
 
 	/// The same transaction, hitting `points`.
 	#[must_use]
-	#[cfg_attr(not(test), expect(dead_code, reason = "the seal and swap protocols (S8, S10) pass their fault points; until then only the tests do"))]
 	pub const fn with_points(mut self, points: TxnPoints) -> Self {
 		self.points = points;
 		self
@@ -435,12 +452,21 @@ async fn apply(conn: &turso::Connection, op: &IndexOp) -> Result<u64, (TxnErrorK
 			expect_one(changed, "delete", aspect, *expected)
 		}
 		IndexOp::Delete { aspect, id } => conn.execute("DELETE FROM segment_index WHERE aspect = ? AND id = ?", vec![Value::Text(aspect.clone()), integer(*id)]).await.map_err(|e| statement_error(&format!("deleting {aspect:?} segment {id}"), &e)),
-		IndexOp::SeqBump { aspect, next_id, epoch } => {
-			// A new row's `next_gen` is 1: generation 0 names the legacy `{aspect}-{id}`
-			// frames, so no write-once frame may take it.
-			let sql = "INSERT INTO aspect_seq (aspect, next_id, next_gen, epoch) VALUES (?, ?, 1, ?) ON CONFLICT (aspect) DO UPDATE SET next_id = MAX(next_id, excluded.next_id), epoch = MAX(epoch, excluded.epoch)";
-			conn.execute(sql, vec![Value::Text(aspect.clone()), integer(*next_id), integer(*epoch)]).await.map_err(|e| statement_error(&format!("raising the {aspect:?} allocator to {next_id}"), &e))
+		IndexOp::SeqBump { aspect, next_id, next_gen, epoch } => {
+			// A new row's `next_gen` is at least 1: generation 0 names the legacy
+			// `{aspect}-{id}` frames, so no write-once frame may take it.
+			let sql = "INSERT INTO aspect_seq (aspect, next_id, next_gen, epoch) VALUES (?, ?, ?, ?) ON CONFLICT (aspect) DO UPDATE SET next_id = MAX(next_id, excluded.next_id), next_gen = MAX(next_gen, excluded.next_gen), epoch = MAX(epoch, excluded.epoch)";
+			conn.execute(sql, vec![Value::Text(aspect.clone()), integer(*next_id), integer((*next_gen).max(1)), integer(*epoch)]).await.map_err(|e| statement_error(&format!("raising the {aspect:?} allocator to id {next_id}, generation {next_gen}"), &e))
 		}
+		IndexOp::JournalPending { aspect, name, created_ms } => {
+			let sql = "INSERT INTO frame_journal (name, aspect, state, retire_epoch, created_ms) VALUES (?, ?, 'pending', NULL, ?)";
+			conn.execute(sql, vec![Value::Text(name.clone()), Value::Text(aspect.clone()), Value::Integer(*created_ms)]).await.map_err(|e| statement_error(&format!("journaling {aspect:?} output {name} as pending"), &e))
+		}
+		IndexOp::JournalRetire { aspect, name, retire_epoch, created_ms } => {
+			let sql = "INSERT INTO frame_journal (name, aspect, state, retire_epoch, created_ms) VALUES (?, ?, 'retired', ?, ?)";
+			conn.execute(sql, vec![Value::Text(name.clone()), Value::Text(aspect.clone()), integer(*retire_epoch), Value::Integer(*created_ms)]).await.map_err(|e| statement_error(&format!("journaling {aspect:?} frame {name} as retired"), &e))
+		}
+		IndexOp::ClearJournal { name } => conn.execute("DELETE FROM frame_journal WHERE name = ?", vec![Value::Text(name.clone())]).await.map_err(|e| statement_error(&format!("clearing the journal row of {name}"), &e)),
 		IndexOp::MetaSet { key, value } => conn.execute("INSERT OR REPLACE INTO store_meta (key, value) VALUES (?, ?)", vec![Value::Text(key.clone()), Value::Text(value.clone())]).await.map_err(|e| statement_error(&format!("recording store_meta {key}"), &e)),
 		IndexOp::RaiseFloor { level } => {
 			// store_meta holds text, so the comparison casts: as text, "10" < "9".
@@ -794,33 +820,53 @@ mod tests {
 		}
 	}
 
-	/// `SeqBump` creates an aspect's allocator row (with `next_gen` 1, past the legacy
-	/// generation 0) and only ever raises it: a bump below the recorded values changes
-	/// neither, and each aspect's row is its own. It is retry-safe, so a transaction of a
-	/// seal's ops (`InsertNew` and `SeqBump`) counts as guarded.
+	/// `SeqBump` creates an aspect's allocator row (with `next_gen` at least 1, past the
+	/// legacy generation 0) and only ever raises it: a bump below the recorded values
+	/// changes none of them, and each aspect's row is its own. It is retry-safe, so a
+	/// transaction of a seal's ops (`InsertNew` and `SeqBump`) counts as guarded.
 	#[tokio::test]
 	async fn seq_bump_creates_and_only_ever_raises_the_allocator_row() {
 		let index = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
-		let bump = |aspect: &str, next_id: u64, epoch: u64| IndexTxn::new(vec![IndexOp::SeqBump { aspect: aspect.to_string(), next_id, epoch }]);
+		let bump = |aspect: &str, next_id: u64, next_gen: u64, epoch: u64| IndexTxn::new(vec![IndexOp::SeqBump { aspect: aspect.to_string(), next_id, next_gen, epoch }]);
 		let empty = index.allocator_seed(ASPECT).await.expect("reads");
 		let mut seen = Vec::new();
-		for (next_id, epoch) in [(5, 2), (3, 1), (9, 0), (9, 4)] {
-			let applied = index.apply(&bump(ASPECT, next_id, epoch)).await.expect("bumps");
-			assert_eq!(applied.changes, vec![1], "bump to ({next_id}, {epoch})");
+		for (next_id, next_gen, epoch) in [(5, 0, 2), (3, 4, 1), (9, 2, 0), (9, 7, 4)] {
+			let applied = index.apply(&bump(ASPECT, next_id, next_gen, epoch)).await.expect("bumps");
+			assert_eq!(applied.changes, vec![1], "bump to ({next_id}, {next_gen}, {epoch})");
 			let seed = index.allocator_seed(ASPECT).await.expect("reads");
-			seen.push((seed.next_id, seed.epoch));
+			seen.push((seed.next_id, seed.next_gen, seed.epoch));
 		}
-		index.apply(&bump("other", 1, 0)).await.expect("bumps another aspect");
+		index.apply(&bump("other", 1, 0, 0)).await.expect("bumps another aspect");
 		let other = index.allocator_seed("other").await.expect("reads");
-		let mut rows = index.database().connect().expect("connects").query("SELECT next_gen FROM aspect_seq WHERE aspect = ?", [Value::Text(ASPECT.to_string())]).await.expect("reads");
-		let next_gen = rows.next().await.expect("reads").expect("the row").get_value(0).expect("next_gen");
-		drop(rows);
 		drop(index);
 		assert_eq!(empty, crate::types::segment_index::AllocatorSeed::default(), "an aspect without a row has no persisted allocator");
-		assert_eq!(seen, vec![(Some(5), 2), (Some(5), 2), (Some(9), 2), (Some(9), 4)], "neither value moves back");
-		assert_eq!((other.next_id, other.epoch), (Some(1), 0), "each aspect has a row of its own");
-		assert_eq!(next_gen, Value::Integer(1));
-		assert!(IndexOp::SeqBump { aspect: ASPECT.to_string(), next_id: 0, epoch: 0 }.is_guarded() && insert(row(0, 0, None)).is_guarded(), "a seal's transaction is retried on a conflict");
+		assert_eq!(seen, vec![(Some(5), Some(1), 2), (Some(5), Some(4), 2), (Some(9), Some(4), 2), (Some(9), Some(7), 4)], "no value moves back, and a new row's next_gen is at least 1");
+		assert_eq!((other.next_id, other.next_gen, other.epoch), (Some(1), Some(1), 0), "each aspect has a row of its own");
+		assert!(IndexOp::SeqBump { aspect: ASPECT.to_string(), next_id: 0, next_gen: 0, epoch: 0 }.is_guarded() && insert(row(0, 0, None)).is_guarded(), "a seal's transaction is retried on a conflict");
+	}
+
+	/// The journal ops (design section 5.3): a pending and a retired row record what they
+	/// say, a name is journaled once (a second insert is a `Conflict`), and clearing a
+	/// name removes its row whatever its state and is a no-op for a name without one. All
+	/// three are retry-safe, so a write-once swap's transaction is retried on a conflict.
+	#[tokio::test]
+	async fn journal_ops_record_retire_and_clear_frame_names() {
+		let index = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
+		let pending = |name: &str| IndexOp::JournalPending { aspect: ASPECT.to_string(), name: name.to_string(), created_ms: 5 };
+		let retire = |name: &str| IndexOp::JournalRetire { aspect: ASPECT.to_string(), name: name.to_string(), retire_epoch: 3, created_ms: 6 };
+		let clear = |name: &str| IndexOp::ClearJournal { name: name.to_string() };
+		index.apply(&IndexTxn::new(vec![pending("a~g1~p0.weftseg"), retire("a-0.weftseg")])).await.expect("journals");
+		let taken = index.apply(&IndexTxn::new(vec![pending("a-0.weftseg")])).await.expect_err("a name is journaled once");
+		let journal = index.journal(None).await.expect("reads");
+		let cleared = index.apply(&IndexTxn::new(vec![clear("a~g1~p0.weftseg"), clear("a-0.weftseg"), clear("never-journaled")])).await.expect("clears");
+		let after = index.journal(Some(ASPECT)).await.expect("reads");
+		drop(index);
+		assert_eq!(taken.kind, TxnErrorKind::Conflict, "{taken}");
+		let shown: Vec<_> = journal.iter().map(|e| (e.name.as_str(), e.aspect.as_str(), e.state, e.retire_epoch)).collect();
+		assert_eq!(shown, vec![("a-0.weftseg", ASPECT, crate::types::reaper::JournalState::Retired, Some(3)), ("a~g1~p0.weftseg", ASPECT, crate::types::reaper::JournalState::Pending, None)]);
+		assert_eq!(cleared.changes, vec![1, 1, 0]);
+		assert!(after.is_empty());
+		assert!([pending("x"), retire("x"), clear("x")].iter().all(IndexOp::is_guarded), "a swap of guarded ops is retried");
 	}
 
 	/// Robustness track ROB-2: every op of every transaction runs inside the control-plane
@@ -829,7 +875,7 @@ mod tests {
 	#[tokio::test]
 	async fn every_op_runs_inside_the_control_plane_write_scope() {
 		let index = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
-		let txn = IndexTxn::new(vec![insert(row(0, 1, Some(1))), IndexOp::SeqBump { aspect: ASPECT.to_string(), next_id: 1, epoch: 0 }, IndexOp::MetaSet { key: "k".into(), value: "v".into() }]);
+		let txn = IndexTxn::new(vec![insert(row(0, 1, Some(1))), IndexOp::SeqBump { aspect: ASPECT.to_string(), next_id: 1, next_gen: 1, epoch: 0 }, IndexOp::MetaSet { key: "k".into(), value: "v".into() }]);
 		let seen = crate::types::exec::OBSERVED_SCOPES
 			.scope(std::cell::RefCell::new(Vec::new()), async {
 				index.apply(&txn).await.expect("commits");

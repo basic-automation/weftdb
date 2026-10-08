@@ -40,7 +40,7 @@ use weft_physical_type::{SegmentDescriptor, SegmentIndex};
 
 use crate::{
 	types::{
-		durable::control_plane::connect, index_txn::{IndexOp, IndexRow, IndexTxn, IndexTxnError, TxnApplied}, migrations
+		durable::control_plane::connect, index_txn::{IndexOp, IndexRow, IndexTxn, IndexTxnError, TxnApplied}, migrations, reaper::{JournalEntry, JournalState}
 	}, StoreError, SUPPORTED_LAYOUT
 };
 
@@ -371,16 +371,50 @@ impl SegmentIndexStore {
 	/// Propagates any libSQL read failure.
 	pub(crate) async fn allocator_seed(&self, aspect: &str) -> Result<AllocatorSeed> {
 		let conn = connect(&self.db).await?;
-		let mut rows = conn.query("SELECT next_id, epoch FROM aspect_seq WHERE aspect = ?", turso::params![aspect.to_string()]).await?;
+		let mut rows = conn.query("SELECT next_id, next_gen, epoch FROM aspect_seq WHERE aspect = ?", turso::params![aspect.to_string()]).await?;
 		let persisted = match rows.next().await? {
 			Some(row) => {
 				let unsigned = |idx: usize| Self::opt_integer(&row, idx).and_then(|n| u64::try_from(n).ok()).unwrap_or(0);
-				Some((unsigned(0), unsigned(1)))
+				Some((unsigned(0), unsigned(1), unsigned(2)))
 			}
 			None => None,
 		};
 		drop(rows);
-		Ok(AllocatorSeed { next_id: persisted.map(|(next_id, _)| next_id), epoch: persisted.map_or(0, |(_, epoch)| epoch), max_id: self.max_id(aspect).await? })
+		let mut rows = conn.query("SELECT MAX(gen) FROM segment_index WHERE aspect = ?", turso::params![aspect.to_string()]).await?;
+		let max_gen = match rows.next().await? {
+			Some(row) => Self::opt_integer(&row, 0).and_then(|n| u64::try_from(n).ok()),
+			None => None,
+		};
+		drop(rows);
+		Ok(AllocatorSeed { next_id: persisted.map(|(next_id, _, _)| next_id), next_gen: persisted.map(|(_, next_gen, _)| next_gen), epoch: persisted.map_or(0, |(_, _, epoch)| epoch), max_id: self.max_id(aspect).await?, max_gen })
+	}
+
+	/// The `frame_journal` rows (design section 5.3) of `aspect`, or of every aspect for
+	/// `None`, by name.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure, or a row whose state is neither `'pending'` nor
+	/// `'retired'`.
+	pub(crate) async fn journal(&self, aspect: Option<&str>) -> Result<Vec<JournalEntry>> {
+		let conn = connect(&self.db).await?;
+		let mut rows = match aspect {
+			Some(aspect) => conn.query("SELECT name, aspect, state, retire_epoch FROM frame_journal WHERE aspect = ? ORDER BY name", turso::params![aspect.to_string()]).await?,
+			None => conn.query("SELECT name, aspect, state, retire_epoch FROM frame_journal ORDER BY name", ()).await?,
+		};
+		let mut out = Vec::new();
+		while let Some(row) = rows.next().await? {
+			let text = |idx: usize| -> Result<String> {
+				match row.get_value(idx)? {
+					Value::Text(text) => Ok(text),
+					other => bail!("frame_journal holds {other:?} where it records text"),
+				}
+			};
+			let (name, aspect, state) = (text(0)?, text(1)?, text(2)?);
+			let state = JournalState::parse(&state).with_context(|| format!("frame_journal row {name:?}"))?;
+			out.push(JournalEntry { name, aspect, state, retire_epoch: Self::opt_integer(&row, 3).and_then(|n| u64::try_from(n).ok()) });
+		}
+		Ok(out)
 	}
 
 	/// Decode a result set ([`SELECT_COLUMNS`], in that order) into [`IndexRow`]s.
@@ -456,10 +490,14 @@ impl SegmentIndexStore {
 pub(crate) struct AllocatorSeed {
 	/// `aspect_seq.next_id`, when the aspect has a row there.
 	pub next_id: Option<u64>,
+	/// `aspect_seq.next_gen`, when the aspect has a row there.
+	pub next_gen: Option<u64>,
 	/// `aspect_seq.epoch`, or 0 without a row.
 	pub epoch: u64,
 	/// The largest id among the aspect's `segment_index` rows, when it has any.
 	pub max_id: Option<u64>,
+	/// The largest generation among the aspect's `segment_index` rows, when it has any.
+	pub max_gen: Option<u64>,
 }
 
 /// Refuse the database behind `conn` when its `store_meta` records a write floor newer
