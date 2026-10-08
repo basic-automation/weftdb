@@ -33,6 +33,9 @@ refuses() { # refuses <description> <command...>
 	fi
 }
 
+# sha256sum_c <dir> <checksum file>: what a user runs to check a download.
+sha256sum_c() { (cd "$1" && sha256sum -c "$2"); }
+
 src=$tmp/src
 mkdir -p "$src"
 echo readme >"$src/README.md"
@@ -51,7 +54,7 @@ listing=$(tar -tzf "$tmp/dist/weftdb-v1.2.3-x86_64-unknown-linux-gnu.tar.gz" | L
 want="weftdb-v1.2.3-x86_64-unknown-linux-gnu/ weftdb-v1.2.3-x86_64-unknown-linux-gnu/LICENSE weftdb-v1.2.3-x86_64-unknown-linux-gnu/README.md weftdb-v1.2.3-x86_64-unknown-linux-gnu/weft-bench weftdb-v1.2.3-x86_64-unknown-linux-gnu/weft-server weftdb-v1.2.3-x86_64-unknown-linux-gnu/weft-tui "
 check "the archive holds one directory with the binaries and docs" test "$listing" = "$want"
 check "the .sha256 verifies with sha256sum -c" \
-	bash -c 'cd "$1" && sha256sum -c weftdb-v1.2.3-x86_64-unknown-linux-gnu.tar.gz.sha256' _ "$tmp/dist"
+	sha256sum_c "$tmp/dist" weftdb-v1.2.3-x86_64-unknown-linux-gnu.tar.gz.sha256
 
 if command -v 7z >/dev/null 2>&1; then
 	mkdir -p "$tmp/bin/win"
@@ -68,7 +71,7 @@ refuses "archive with a bad tag" \
 	"$stage" archive x86_64-unknown-linux-gnu 'v1.2.3;id' "$tmp/bin/x86_64-unknown-linux-gnu" "$src" "$tmp/other"
 
 check "sums over every target" "$stage" sums "$tmp/dist" "${targets[@]}"
-check "SHA256SUMS verifies with sha256sum -c" bash -c 'cd "$1" && sha256sum -c SHA256SUMS' _ "$tmp/dist"
+check "SHA256SUMS verifies with sha256sum -c" sha256sum_c "$tmp/dist" SHA256SUMS
 check "SHA256SUMS lists every archive" test "$(wc -l <"$tmp/dist/SHA256SUMS")" -eq 2
 
 refuses "sums with a target missing" "$stage" sums "$tmp/dist" "${targets[@]}" x86_64-pc-windows-msvc
