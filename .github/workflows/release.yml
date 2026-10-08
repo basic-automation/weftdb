@@ -137,7 +137,9 @@ jobs:
     name: build (${{ matrix.target }})
     needs: verify
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    # The x86_64-apple-darwin leg is the slow one: its first dry run spent 90 minutes
+    # compiling (fat LTO, one codegen unit, three uncached invocations).
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       # Every runner builds its own native target, so no cross toolchain is needed.
