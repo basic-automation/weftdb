@@ -97,7 +97,19 @@ impl SegmentIndexStore {
 	/// does not sync FULL, or if it records a store layout newer than
 	/// [`LAYOUT_VERSION`], and propagates any libSQL connection, DDL or migration failure.
 	pub async fn open(path: &str) -> Result<Self> {
-		let db = Builder::new_local(path).build().await?;
+		Self::open_with(Builder::new_local(path), path).await
+	}
+
+	/// [`open`](Self::open) on Turso I/O backend `io`, for the tests that record what the
+	/// open does to the files.
+	#[cfg(test)]
+	pub(crate) async fn open_with_io(path: &str, io: std::sync::Arc<dyn turso::core::IO>) -> Result<Self> {
+		Self::open_with(Builder::new_local(path).with_io_impl(io), path).await
+	}
+
+	/// Build the database `builder` describes and open it as [`open`](Self::open) does.
+	async fn open_with(builder: Builder, path: &str) -> Result<Self> {
+		let db = builder.build().await?;
 		Self::configure_and_wireframe(&db, path).await?;
 		Ok(Self { db })
 	}
@@ -145,6 +157,8 @@ impl SegmentIndexStore {
 		// The control plane's MVCC write path; open fails rather than run without it.
 		crate::types::durable::control_plane::enable_mvcc_full(db, &conn, path).await?;
 		conn.execute("PRAGMA busy_timeout=600000", turso::params![]).await.ok();
+		// Before any DDL: a store of a newer layout is refused untouched.
+		let recorded = recorded_layout(&conn, path).await?;
 		conn.execute(
 			"CREATE TABLE IF NOT EXISTS segment_index (
 				aspect TEXT NOT NULL,
@@ -168,7 +182,7 @@ impl SegmentIndexStore {
 		.await?;
 		// A covering range index over the time span turns prune_by_time into an index scan.
 		conn.execute("CREATE INDEX IF NOT EXISTS idx_segment_index_time ON segment_index(aspect, min_ts, max_ts)", turso::params![]).await.ok();
-		migrate_to_v2(&conn, path).await
+		migrate_to_v2(&conn, path, recorded).await
 	}
 
 	/// Record a sealed segment's descriptor under `aspect`, returning the number of
@@ -187,6 +201,12 @@ impl SegmentIndexStore {
 	/// The row is a legacy one (generation 0, nothing bound). A
 	/// [`SegmentStore`](crate::SegmentStore) writes through its own poison-aware commit
 	/// path instead of this method, so that an ambiguous COMMIT stops its writes.
+	///
+	/// **This method knows nothing of a store's write poison.** Called on the index of a
+	/// [`SegmentStore`](crate::SegmentStore) (through
+	/// [`SegmentStore::index`](crate::SegmentStore::index)), it writes even while that
+	/// store is poisoned, and an ambiguous COMMIT here does not poison the store. Write
+	/// through the store's own entry points instead.
 	///
 	/// # Errors
 	///
@@ -211,6 +231,23 @@ impl SegmentIndexStore {
 		txn.run(&self.db).await
 	}
 
+	/// [`apply`](Self::apply), asking `may_retry` before each retry
+	/// ([`IndexTxn::run_while`]).
+	///
+	/// # Errors
+	///
+	/// As [`apply`](Self::apply).
+	pub(crate) async fn apply_while(&self, txn: &IndexTxn, may_retry: impl Fn() -> bool) -> std::result::Result<TxnApplied, IndexTxnError> {
+		txn.run_while(&self.db, may_retry).await
+	}
+
+	/// The database behind this index, for tests that race a transaction of their own
+	/// against an [`IndexTxn`].
+	#[cfg(test)]
+	pub(crate) const fn database(&self) -> &turso::Database {
+		&self.db
+	}
+
 	/// Remove the descriptor for segment `id` under `aspect` from the index, returning
 	/// `true` when a row was deleted and `false` when none matched.
 	///
@@ -219,6 +256,10 @@ impl SegmentIndexStore {
 	/// pruned read never opens the now-absent file. Since ids are handed out as
 	/// `MAX(id) + 1` ([`next_id`](SegmentIndexStore::next_id)), deleting a segment can
 	/// free an id below the maximum without risking reuse of a still-live one.
+	///
+	/// Like [`insert`](Self::insert), this knows nothing of a
+	/// [`SegmentStore`](crate::SegmentStore)'s write poison: it deletes even while the
+	/// store is poisoned, and an ambiguous COMMIT here does not poison the store.
 	///
 	/// # Errors
 	///
@@ -414,8 +455,9 @@ impl SegmentIndexStore {
 
 /// Migrate the database behind `conn` to layout v2, in place and idempotently: add the
 /// v2 columns `segment_index` lacks, create the v2 tables that do not exist, and record
-/// the layout and a store UUID in `store_meta` unless they are there. `path` names the
-/// database in errors.
+/// the layout and a store UUID in `store_meta` unless they are there. `recorded` is the
+/// layout `store_meta` recorded before the open ran any DDL ([`recorded_layout`], which
+/// refuses a newer one). `path` names the database in errors.
 ///
 /// The DDL runs outside `BEGIN CONCURRENT`, where Turso rejects it. Only the columns
 /// `PRAGMA table_info` does not list are added, so a reopen runs no `ALTER` at all; a
@@ -424,9 +466,8 @@ impl SegmentIndexStore {
 ///
 /// # Errors
 ///
-/// A failed DDL statement or `store_meta` write, or a `store_meta` that records a layout
-/// newer than [`LAYOUT_VERSION`] or one that is not a number.
-async fn migrate_to_v2(conn: &turso::Connection, path: &str) -> Result<()> {
+/// A failed DDL statement or `store_meta` write.
+async fn migrate_to_v2(conn: &turso::Connection, path: &str, recorded: Option<u32>) -> Result<()> {
 	let present = column_names(conn, "segment_index").await.with_context(|| format!("{path}: listing the segment_index columns"))?;
 	for (column, declaration) in V2_COLUMNS {
 		if present.iter().any(|name| name == column) {
@@ -441,24 +482,48 @@ async fn migrate_to_v2(conn: &turso::Connection, path: &str) -> Result<()> {
 	for ddl in V2_TABLES {
 		conn.execute(ddl, ()).await.with_context(|| format!("{path}: {ddl}"))?;
 	}
-	match meta_value(conn, "layout_version").await.with_context(|| format!("{path}: reading the store layout"))? {
+	match recorded {
 		None => {
 			conn.execute("INSERT OR IGNORE INTO store_meta (key, value) VALUES ('layout_version', ?)", [Value::Text(LAYOUT_VERSION.to_string())]).await.with_context(|| format!("{path}: recording the store layout"))?;
 		}
-		Some(recorded) => {
-			let version: u32 = recorded.trim().parse().with_context(|| format!("{path}: store_meta records layout_version {recorded:?}, which is not a layout number"))?;
-			if version > LAYOUT_VERSION {
-				bail!("{path} records store layout {version}, newer than layout {LAYOUT_VERSION}, the newest this WeftDB knows: a newer WeftDB wrote this store, and this one would break its invariants by writing to it. Open it with that WeftDB, or a newer one");
-			}
-			if version < LAYOUT_VERSION {
-				conn.execute("UPDATE store_meta SET value = ? WHERE key = 'layout_version'", [Value::Text(LAYOUT_VERSION.to_string())]).await.with_context(|| format!("{path}: recording the store layout"))?;
-			}
+		Some(version) if version < LAYOUT_VERSION => {
+			conn.execute("UPDATE store_meta SET value = ? WHERE key = 'layout_version'", [Value::Text(LAYOUT_VERSION.to_string())]).await.with_context(|| format!("{path}: recording the store layout"))?;
 		}
+		Some(_) => {}
 	}
 	if meta_value(conn, "store_uuid").await.with_context(|| format!("{path}: reading the store UUID"))?.is_none() {
 		conn.execute("INSERT OR IGNORE INTO store_meta (key, value) VALUES ('store_uuid', ?)", [Value::Text(uuid::Uuid::new_v4().to_string())]).await.with_context(|| format!("{path}: recording the store UUID"))?;
 	}
 	Ok(())
+}
+
+/// The layout the database behind `conn` records in `store_meta`, if it records one.
+///
+/// The open reads it before it runs any DDL, and refuses a layout newer than
+/// [`LAYOUT_VERSION`] there: running this build's schema statements first would re-add a
+/// table or column the newer layout dropped or renamed, in a store the refusal then says
+/// this build does not write to. A store without `store_meta` is layout 1.
+///
+/// # Errors
+///
+/// A failed read, or a recorded layout that is newer than [`LAYOUT_VERSION`] or not a
+/// number.
+async fn recorded_layout(conn: &turso::Connection, path: &str) -> Result<Option<u32>> {
+	if !table_exists(conn, "store_meta").await.with_context(|| format!("{path}: looking for store_meta"))? {
+		return Ok(None);
+	}
+	let Some(recorded) = meta_value(conn, "layout_version").await.with_context(|| format!("{path}: reading the store layout"))? else { return Ok(None) };
+	let version: u32 = recorded.trim().parse().with_context(|| format!("{path}: store_meta records layout_version {recorded:?}, which is not a layout number"))?;
+	if version > LAYOUT_VERSION {
+		bail!("{path} records store layout {version}, newer than layout {LAYOUT_VERSION}, the newest this WeftDB knows: a newer WeftDB wrote this store, and this one would break its invariants by writing to it. Open it with that WeftDB, or a newer one");
+	}
+	Ok(Some(version))
+}
+
+/// Whether the database behind `conn` has a table named `table`.
+async fn table_exists(conn: &turso::Connection, table: &str) -> Result<bool> {
+	let mut rows = conn.query("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?", [Value::Text(table.to_string())]).await?;
+	Ok(rows.next().await?.is_some())
 }
 
 /// The column names of `table`, from `PRAGMA table_info`.
@@ -698,13 +763,69 @@ mod tests {
 		let store = SegmentIndexStore::open(&path).await.expect("reopens");
 		let uuid_again = store.meta("store_uuid").await.expect("reads");
 		let conn = store.db.connect().expect("connects");
+		// A newer WeftDB that dropped one of layout 2's tables and the time index.
 		conn.execute("UPDATE store_meta SET value = '3' WHERE key = 'layout_version'", ()).await.expect("plays a newer WeftDB");
+		conn.execute("DROP TABLE segment_changes", ()).await.expect("drops a v2 table");
+		conn.execute("DROP INDEX idx_segment_index_time", ()).await.expect("drops the time index");
 		drop(conn);
 		drop(store);
 		let refused = SegmentIndexStore::open(&path).await.err().expect("a newer layout is refused").to_string();
+		let db = turso::Builder::new_local(&path).build().await.expect("opens the refused store raw");
+		let mut rows = db.connect().expect("connects").query("SELECT name FROM sqlite_schema WHERE name IN ('segment_changes', 'idx_segment_index_time')", ()).await.expect("reads the schema");
+		let recreated = rows.next().await.expect("reads").map(|row| row.get_value(0).expect("a name"));
+		drop(rows);
+		drop(db);
 		assert_eq!(layout.as_deref(), Some("2"));
 		assert_eq!(uuid_again, Some(uuid), "a reopen keeps the store's UUID");
 		assert!(refused.contains("records store layout 3, newer than layout 2"), "{refused}");
+		assert_eq!(recreated, None, "the refused open ran none of its DDL on the newer store");
+	}
+
+	/// Design section 1.3, through the real open: when it is the open that switches
+	/// `segment_index.db` to MVCC, every write it made to the DB file (the switched header
+	/// first among them) is synced by the time it returns, for a new store and for a v2
+	/// store that was switched back to WAL, whose switch Turso does not sync by itself.
+	/// The rows are all there, and an open of a store already in MVCC writes nothing to
+	/// the DB file.
+	#[tokio::test]
+	async fn the_open_leaves_the_switched_header_synced() {
+		use crate::types::durable::turso_probe::ProbeIo;
+
+		const FILE: &str = "segment_index.db";
+		let dir = tempfile::TempDir::new().expect("tempdir");
+		let path = dir.path().join(FILE);
+		let path = path.to_string_lossy();
+		let (seg, len) = sealed(0);
+		let opened = |io: &std::sync::Arc<ProbeIo>| SegmentIndexStore::open_with_io(&path, io.clone());
+
+		let io = ProbeIo::new().expect("probe");
+		let store = opened(&io).await.expect("creates the store");
+		let synced = io.synced_since_last_write(FILE);
+		store.insert("a", &SegmentDescriptor::of_segment(0, "a0.weftseg", len, &seg)).await.expect("inserts");
+		drop(store);
+		assert!(synced, "a new store: {:?}", io.events());
+
+		let db = turso::Builder::new_local(&path).build().await.expect("opens raw");
+		let conn = db.connect().expect("connects");
+		let mut rows = conn.query("PRAGMA journal_mode=wal", ()).await.expect("switches back to WAL");
+		assert_eq!(rows.next().await.expect("answers").expect("a row").get_value(0).expect("the mode"), Value::Text("wal".into()));
+		drop(rows);
+		drop(conn);
+		drop(db);
+
+		let io = ProbeIo::new().expect("probe");
+		let store = opened(&io).await.expect("switches the store back to MVCC");
+		let header_written = io.writes(FILE).iter().any(|&(pos, _)| pos == 0);
+		let synced = io.synced_since_last_write(FILE);
+		let all = store.all("a").await.expect("reads");
+		drop(store);
+		assert!(header_written, "the switch wrote the header: {:?}", io.events());
+		assert!(synced, "a store switched back to WAL: {:?}", io.events());
+		assert_eq!(all.len(), 1);
+
+		let io = ProbeIo::new().expect("probe");
+		drop(opened(&io).await.expect("reopens"));
+		assert_eq!(io.writes(FILE), Vec::new(), "an open that switches nothing writes nothing to the DB file: {:?}", io.events());
 	}
 
 	#[tokio::test]

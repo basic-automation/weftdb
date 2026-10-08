@@ -44,7 +44,7 @@ use crate::{
 	types::{
 		durable::{
 			create_dir_all_durable, fault::{self, FaultPoint}, LockHolder, RealFs, RootLock, RootLockError, StoreFs, SyncPolicy, WritePoints
-		}, index_txn::{IndexOp, IndexRow, IndexTxn, IndexTxnError, TxnApplied}
+		}, index_txn::{IndexOp, IndexRow, IndexTxn, IndexTxnError, TxnApplied, TxnErrorKind}
 	}, AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, PartialSidecar, PartialSidecarPolicy, SegmentIndexStore, SnapshotReport, SIDECAR_AGGREGATIONS
 };
 
@@ -267,9 +267,11 @@ pub const AMBIGUOUS_COMMIT_EXIT_CODE: i32 = 70;
 
 /// A write to a [`SegmentStore`] that is write-poisoned.
 ///
-/// An earlier control-plane COMMIT returned an error, so that transaction may or may not
-/// be durable, and the store refuses every write until the process restarts (design
-/// section 5.1, poison). Writes are refused because each one would build on a state nobody knows: a seal
+/// An earlier control-plane COMMIT failed in a way that may still have committed (any
+/// COMMIT error except a conflict Turso found while validating the transaction, which it
+/// rolls back before writing anything), so that transaction may or may not be durable,
+/// and the store refuses every write until the process restarts (design section 5.1,
+/// poison). Writes are refused because each one would build on a state nobody knows: a seal
 /// would take the next id after a row that might not exist, a maintenance swap would
 /// replace members that might already be gone. Reads go on serving what is committed.
 /// The restart's open replays Turso's log, which is the authority on whether the
@@ -569,8 +571,10 @@ impl SegmentStore {
 
 	/// The store's write poison, or `None` while it accepts writes.
 	///
-	/// A store poisons itself when a `segment_index.db` COMMIT returns an error, because
-	/// that transaction may or may not be durable (see [`Poisoned`]). From then on every
+	/// A store poisons itself when a `segment_index.db` COMMIT fails in a way that may
+	/// still have committed, because that transaction may or may not be durable (see
+	/// [`Poisoned`]); a conflict Turso finds while validating the commit is not one of
+	/// them, since it rolls the transaction back before writing anything. From then on every
 	/// write fails with that [`Poisoned`] error and reads go on working, until the
 	/// process restarts. `weft-server`'s `/ready` reports it as `poisoned` and
 	/// `restart_required`.
@@ -592,16 +596,27 @@ impl SegmentStore {
 	/// failure poisons the store (or, under `WEFT_ON_AMBIGUOUS_COMMIT=exit`, exits the
 	/// process) before the error is returned, so no later write builds on it.
 	///
+	/// The poison is checked again before every retry of a conflict, so a transaction
+	/// waiting out a conflict while another writer poisons the store gives up with
+	/// [`Poisoned`] instead of committing after it. An attempt already running when the
+	/// poison is set is not stopped, and its COMMIT can still land: like every write
+	/// entry point, the poison refuses what starts after it.
+	///
 	/// # Errors
 	///
-	/// [`Poisoned`] if the store already is, or the transaction's [`IndexTxnError`].
+	/// [`Poisoned`] if the store already is, or became so while the transaction waited to
+	/// retry a conflict; otherwise the transaction's [`IndexTxnError`].
 	pub(crate) async fn commit_index(&self, txn: &IndexTxn) -> Result<TxnApplied> {
 		self.writable()?;
-		match self.index.apply(txn).await {
+		match self.index.apply_while(txn, || self.poison.get().is_none()).await {
 			Ok(applied) => Ok(applied),
 			Err(e) => {
 				if e.is_ambiguous() {
 					self.on_ambiguous_commit(&e);
+				} else if e.kind == TxnErrorKind::Retryable {
+					// The conflict may have gone unretried because the store was poisoned
+					// meanwhile; then the poison is the reason to report.
+					self.writable()?;
 				}
 				Err(e.into())
 			}
@@ -709,12 +724,20 @@ impl SegmentStore {
 	/// The control-plane index backing this store, for pruning/accounting queries
 	/// ([`prune_by_time`](SegmentIndexStore::prune_by_time),
 	/// [`load_index`](SegmentIndexStore::load_index), …).
+	///
+	/// For reads. Its writers ([`insert`](SegmentIndexStore::insert),
+	/// [`delete`](SegmentIndexStore::delete)) bypass this store's write poison: they
+	/// write even while it is [`poisoned`](Self::poisoned), and an ambiguous COMMIT in
+	/// them does not poison it. Write through this store's own entry points.
 	#[must_use]
 	pub const fn index(&self) -> &SegmentIndexStore {
 		&self.index
 	}
 
 	/// The aspect-schema catalog backing this store.
+	///
+	/// For reads. Its writer ([`declare`](AspectCatalog::declare)) bypasses this store's
+	/// write poison; declare through [`SegmentStore::declare`] instead.
 	#[must_use]
 	pub const fn catalog(&self) -> &AspectCatalog {
 		&self.catalog
@@ -723,6 +746,11 @@ impl SegmentStore {
 	/// The per-aspect segment-set rollup store backing this store, for the materialized
 	/// aspect-wide summary ([`get`](AspectMetadataStore::get),
 	/// [`list_aspects`](AspectMetadataStore::list_aspects)).
+	///
+	/// For reads. Its writers ([`put`](AspectMetadataStore::put),
+	/// [`record_seal`](AspectMetadataStore::record_seal),
+	/// [`remove`](AspectMetadataStore::remove)) bypass this store's write poison; rebuild
+	/// a rollup through [`rebuild_aspect_metadata`](Self::rebuild_aspect_metadata) instead.
 	#[must_use]
 	pub const fn metadata(&self) -> &AspectMetadataStore {
 		&self.metadata
@@ -5552,11 +5580,23 @@ mod tests {
 		let poisoned = store.poisoned().expect("an ambiguous COMMIT poisons the store");
 		assert!(poisoned.reason.contains("injected fault at S-commit-phantom"), "{poisoned}");
 
+		// Every write entry point, each with arguments under which it would write
+		// something: frames for the seals, metadata.db for the rollup rebuilds, a squash
+		// of the two segments. The refusal must come first, so no file of the root
+		// changes (a seal refused only by `commit_index` would leave its frame behind, and
+		// a rollup rebuild never reaches `commit_index` at all).
 		let schema = schema();
-		let refused: Vec<(&str, anyhow::Error)> = vec![("seal", store.seal("price", &schema, &[50], &[bd("6")]).await.expect_err("seal")), ("seal_declared_paged", store.seal_declared_paged("price", &[50], &[bd("6")], 4).await.expect_err("seal_declared_paged")), ("declare", store.declare("temp", &schema).await.expect_err("declare")), ("reconcile_aspect", store.reconcile_aspect("price").await.expect_err("reconcile_aspect")), ("reconcile_all_over_threshold", store.reconcile_all_over_threshold(1).await.expect_err("reconcile_all_over_threshold")), ("split_segment", store.split_segment("price", 0, 10).await.expect_err("split_segment")), ("reconcile_overlaps", store.reconcile_overlaps("price").await.expect_err("reconcile_overlaps")), ("squash_aspect", store.squash_aspect("price").await.expect_err("squash_aspect")), ("squash_all_to_target_rows", store.squash_all_to_target_rows(10).await.expect_err("squash_all_to_target_rows")), ("rebuild_aspect_metadata", store.rebuild_aspect_metadata("price").await.expect_err("rebuild_aspect_metadata")), ("commit_index", store.commit_index(&IndexTxn::new(vec![IndexOp::Delete { aspect: "price".to_string(), id: 0 }])).await.expect_err("commit_index"))];
-		for (write, err) in &refused {
+		let policy = SplitPolicy { min_split_bytes: 0 };
+		let (ts, vs, nullable) = ([50_i64, 60], [bd("6"), bd("7")], [Some(bd("6")), None]);
+		let before = tree_bytes(dir.path());
+		let refused: Vec<(&str, Result<()>)> = vec![("declare", store.declare("temp", &schema).await), ("seal", store.seal("price", &schema, &ts, &vs).await.map(drop)), ("seal_nullable", store.seal_nullable("price", &schema, &ts, &nullable).await.map(drop)), ("seal_paged", store.seal_paged("price", &schema, &ts, &vs, 1).await.map(drop)), ("seal_paged_nullable", store.seal_paged_nullable("price", &schema, &ts, &nullable, 1).await.map(drop)), ("seal_declared", store.seal_declared("price", &ts, &vs).await.map(drop)), ("seal_declared_nullable", store.seal_declared_nullable("price", &ts, &nullable).await.map(drop)), ("seal_declared_paged", store.seal_declared_paged("price", &ts, &vs, 1).await.map(drop)), ("reconcile_segment", store.reconcile_segment("price", 0).await.map(drop)), ("split_segment", store.split_segment("price", 0, 10).await.map(drop)), ("reconcile_aspect", store.reconcile_aspect("price").await.map(drop)), ("reconcile_aspect_if_unsorted_exceeds", store.reconcile_aspect_if_unsorted_exceeds("price", 1).await.map(drop)), ("reconcile_all_over_threshold", store.reconcile_all_over_threshold(1).await.map(drop)), ("reconcile_aspect_hot_cold", store.reconcile_aspect_hot_cold("price", 1).await.map(drop)), ("reconcile_all_hot_cold", store.reconcile_all_hot_cold(1).await.map(drop)), ("reconcile_overlaps", store.reconcile_overlaps("price").await.map(drop)), ("reconcile_overlaps_with_policy", store.reconcile_overlaps_with_policy("price", policy).await.map(drop)), ("reconcile_all_overlaps", store.reconcile_all_overlaps().await.map(drop)), ("reconcile_all_overlaps_with_policy", store.reconcile_all_overlaps_with_policy(policy).await.map(drop)), ("squash_aspect", store.squash_aspect("price").await.map(drop)), ("squash_aspect_if_exceeds", store.squash_aspect_if_exceeds("price", 1).await.map(drop)), ("squash_all_over_threshold", store.squash_all_over_threshold(1).await.map(drop)), ("squash_aspect_to_target_rows", store.squash_aspect_to_target_rows("price", 10).await.map(drop)), ("squash_all_to_target_rows", store.squash_all_to_target_rows(10).await.map(drop)), ("squash_aspect_to_target_rows_if_fragmented", store.squash_aspect_to_target_rows_if_fragmented("price", 10).await.map(drop)), ("squash_all_to_target_rows_if_fragmented", store.squash_all_to_target_rows_if_fragmented(10).await.map(drop)), ("rebuild_aspect_metadata", store.rebuild_aspect_metadata("price").await.map(drop)), ("rebuild_all_metadata", store.rebuild_all_metadata().await.map(drop)), ("commit_index", store.commit_index(&IndexTxn::new(vec![IndexOp::Delete { aspect: "price".to_string(), id: 0 }])).await.map(drop))];
+		let after = tree_bytes(dir.path());
+		for (write, result) in &refused {
+			let err = result.as_ref().err().unwrap_or_else(|| panic!("{write} is refused"));
 			assert_eq!(err.downcast_ref::<Poisoned>(), Some(&poisoned), "{write} is refused as poisoned: {err:#}");
 		}
+		let changed: Vec<&PathBuf> = before.keys().chain(after.keys()).filter(|path| before.get(*path) != after.get(*path)).collect();
+		assert!(changed.is_empty(), "no refused write changed a file of the root (frames, metadata.db, the index): {changed:?}");
 
 		let (times, values) = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("a poisoned store still reads");
 		let point = store.read_point("price", 40).await.expect("reads a point");
@@ -5576,6 +5616,47 @@ mod tests {
 		drop(reopened);
 		assert_eq!(healthy, None, "the restart clears the poison");
 		assert_eq!(sealed.expect("the restarted store writes again").id, 2);
+	}
+
+	/// The poison is checked again before each retry. A guarded transaction that lost a
+	/// conflict (a winner holds an uncommitted change to its row) waits out its backoff;
+	/// another writer poisons the store meanwhile, and the transaction gives up with
+	/// `Poisoned` instead of starting another attempt, which could commit after the
+	/// poison. `S-txn-begun`, paused, holds the first attempt until the poison is set and
+	/// counts the attempts: a second one would park there for good, and the timeout
+	/// would fail the test.
+	#[tokio::test]
+	#[serial(index_txn_fault_points)]
+	async fn a_transaction_waiting_to_retry_stops_at_the_poison() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		let base = IndexRow { desc: write_frame(dir.path(), "price", 0, &[(0, "1")]), gen: 1, prec: Some(1), frame_crc: Some(7), commit_epoch: Some(1) };
+		store.commit_index(&IndexTxn::new(vec![IndexOp::InsertNew { aspect: "price".to_string(), row: base.clone() }])).await.expect("commits the base row");
+		let winner = store.index().database().connect().expect("connects");
+		winner.execute("BEGIN CONCURRENT", ()).await.expect("begins");
+		winner.execute("UPDATE segment_index SET frame_crc = 8 WHERE aspect = 'price' AND id = 0", ()).await.expect("the winner takes the row");
+
+		let loser = IndexTxn::new(vec![IndexOp::ReplaceExpected { aspect: "price".to_string(), expected: base.version(), row: IndexRow { gen: 2, ..base.clone() } }]).with_points(TxnPoints { begun: Some(FaultPoint::STxnBegun), ..TxnPoints::NONE });
+		let resume = std::sync::Arc::new(tokio::sync::Notify::new());
+		let armed = fault::arm(FaultPoint::STxnBegun, fault::FaultAction::Pause(resume.clone()));
+		let hits = fault::hits(FaultPoint::STxnBegun);
+		let poison_meanwhile = async {
+			fault::reached(FaultPoint::STxnBegun, hits + 1).await;
+			store.poison.set("a phantom commit elsewhere".to_string());
+			resume.notify_one();
+		};
+		let raced = tokio::time::timeout(std::time::Duration::from_secs(30), async { tokio::join!(store.commit_index(&loser), poison_meanwhile) }).await;
+		let attempts = fault::hits(FaultPoint::STxnBegun) - hits;
+		drop(armed);
+		winner.execute("ROLLBACK", ()).await.expect("the winner gives up");
+		drop(winner);
+		let rows = store.index().rows("price").await.expect("reads");
+		drop(store);
+		let (result, ()) = raced.expect("the transaction stopped instead of starting a second attempt");
+		let err = result.expect_err("the transaction did not commit");
+		assert_eq!(err.downcast_ref::<Poisoned>().map(|poisoned| poisoned.reason.as_str()), Some("a phantom commit elsewhere"), "{err:#}");
+		assert_eq!(attempts, 1, "no attempt started once the store was poisoned");
+		assert_eq!(rows, vec![base], "the row is as it was");
 	}
 
 	/// Set only in the child process `an_ambiguous_commit_exits_when_asked_to` starts:

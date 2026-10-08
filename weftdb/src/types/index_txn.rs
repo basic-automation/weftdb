@@ -12,8 +12,9 @@
 //! ([`TxnErrorKind`]):
 //!
 //! - **Retryable**: an MVCC conflict (`Busy`, `BusySnapshot`, a write-write conflict)
-//!   before COMMIT. Nothing was written, and the whole transaction is retried on a
-//!   fresh snapshot, up to [`MAX_RETRIES`] times with backoff, before it is reported.
+//!   before COMMIT. Nothing was written. Whether the whole transaction is retried on a
+//!   fresh snapshot (up to [`MAX_RETRIES`] times, with backoff) depends on its ops; see
+//!   below.
 //! - **Conflict**: a precondition failed. [`IndexOp::ReplaceExpected`] and
 //!   [`IndexOp::DeleteExpected`] must each change exactly the one row whose
 //!   `(aspect, id, gen, frame_crc)` the caller read, and [`IndexOp::InsertNew`] must not
@@ -29,9 +30,23 @@
 //! validates the commit (a write-write conflict with a transaction that committed first,
 //! a stale snapshot or an aborted commit dependency, the last two as `BusySnapshot`).
 //! Turso checks those before it writes the log record and rolls the transaction back,
-//! so they are certain not to have committed and are retried like the same conflicts
+//! so they are certain not to have committed and are classified like the same conflicts
 //! raised by a statement. Calling them ambiguous would poison a store over an ordinary
 //! race between two writers.
+//!
+//! **Which conflicts are retried.** A retry re-runs every op on a snapshot that now holds
+//! the commit of the writer that won the conflict, so it is only safe for an op that
+//! re-checks, on that snapshot, what its caller decided from: [`IndexOp::InsertNew`],
+//! [`IndexOp::ReplaceExpected`] and [`IndexOp::DeleteExpected`] are guarded, and a race
+//! they lost turns into a [`TxnErrorKind::Conflict`] on the retry. The legacy
+//! [`IndexOp::Upsert`] and [`IndexOp::Delete`] are not: their callers chose the id from an
+//! earlier read (a seal's `MAX(id) + 1`, a reconcile's or a squash's member list), and a
+//! retry would replace or delete the row the winner just committed, then report success
+//! to both callers. So a transaction holding either of them is retried only when its
+//! conflict came before any op ran (a `Busy` at `BEGIN`, which used no snapshot), and is
+//! otherwise reported at its first conflict, as every segment-index write was before
+//! this type existed. The write-once protocols that replace those ops (S7-S9) get the
+//! retries.
 
 use std::{fmt, time::Duration};
 
@@ -119,6 +134,18 @@ pub enum IndexOp {
 	Delete { aspect: String, id: u64 },
 }
 
+impl IndexOp {
+	/// Whether the op re-checks, when it runs, the state its caller decided from, so
+	/// that running it again on a later snapshot cannot overwrite or delete a row another
+	/// writer committed in between (see the module documentation).
+	const fn is_guarded(&self) -> bool {
+		match self {
+			Self::InsertNew { .. } | Self::ReplaceExpected { .. } | Self::DeleteExpected { .. } => true,
+			Self::Upsert { .. } | Self::Delete { .. } => false,
+		}
+	}
+}
+
 /// The fault points one [`IndexTxn`] hits, so the crash tests can stop it between its
 /// steps. The protocol that builds a transaction passes its own (a seal's `S-*`, a
 /// swap's `M-*`, from S8 and S10 on). Every transaction S6 commits passes
@@ -153,27 +180,32 @@ pub struct IndexTxn {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxnApplied {
 	pub changes: Vec<u64>,
+	/// How many attempts it took: 1, plus one per retry.
+	pub attempts: u32,
 }
 
 /// Why an [`IndexTxn`] failed, which decides what its caller may do next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxnErrorKind {
-	/// An MVCC conflict before COMMIT, still there after every retry. Nothing was
-	/// written; the caller may try again later.
+	/// An MVCC conflict before COMMIT, and either the transaction may not be retried
+	/// (an unguarded op had run; see the module documentation) or the conflict outlasted
+	/// every retry. Nothing was written; the caller may try again later, from a fresh
+	/// read.
 	Retryable,
 	/// A precondition failed. Nothing was written; the caller's view of the rows is stale.
 	Conflict,
 	/// Any other failure before COMMIT. Nothing was written.
 	Definite,
-	/// COMMIT returned an error (or a phantom fault fired after it): the transaction may
-	/// or may not be durable. The store must stop writing until a restart recovers.
+	/// COMMIT returned an error other than a conflict found while validating the commit
+	/// (or a phantom fault fired after it): the transaction may or may not be durable.
+	/// The store must stop writing until a restart recovers.
 	Ambiguous,
 }
 
 impl fmt::Display for TxnErrorKind {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.write_str(match self {
-			Self::Retryable => "an MVCC conflict that outlasted every retry",
+			Self::Retryable => "an MVCC conflict",
 			Self::Conflict => "a precondition that no longer holds",
 			Self::Definite => "an error before COMMIT",
 			Self::Ambiguous => "an ambiguous COMMIT",
@@ -182,17 +214,19 @@ impl fmt::Display for TxnErrorKind {
 }
 
 /// A failed [`IndexTxn`]: its [`TxnErrorKind`], the op it failed at (when it failed at
-/// one), and what went wrong.
+/// one), what went wrong, and how many attempts were made.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexTxnError {
 	pub kind: TxnErrorKind,
 	pub op: Option<usize>,
 	pub message: String,
+	/// How many attempts were made: 1, plus one per retry. The error is the last one's.
+	pub attempts: u32,
 }
 
 impl IndexTxnError {
-	fn new(kind: TxnErrorKind, op: Option<usize>, message: impl Into<String>) -> Self {
-		Self { kind, op, message: message.into() }
+	const fn new(kind: TxnErrorKind, op: Option<usize>, message: String) -> Self {
+		Self { kind, op, message, attempts: 1 }
 	}
 
 	/// Whether the transaction may have committed although it reported an error.
@@ -203,10 +237,34 @@ impl IndexTxnError {
 
 impl fmt::Display for IndexTxnError {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self.op {
-			Some(op) => write!(f, "segment_index transaction failed with {} at op {op}: {}", self.kind, self.message),
-			None => write!(f, "segment_index transaction failed with {}: {}", self.kind, self.message),
+		write!(f, "segment_index transaction failed with {}", self.kind)?;
+		if let Some(op) = self.op {
+			write!(f, " at op {op}")?;
 		}
+		if self.attempts > 1 {
+			write!(f, " (attempt {})", self.attempts)?;
+		}
+		write!(f, ": {}", self.message)
+	}
+}
+
+/// A failed attempt of an [`IndexTxn`], and whether any of its ops had run, which
+/// decides whether an unguarded transaction may be retried.
+struct AttemptFailure {
+	error: IndexTxnError,
+	ops_ran: bool,
+}
+
+impl AttemptFailure {
+	/// A failure before the first op ran: connecting, or `BEGIN`.
+	const fn before_ops(error: IndexTxnError) -> Self {
+		Self { error, ops_ran: false }
+	}
+
+	/// A failure once an op had run, or could have: from the ops themselves, COMMIT, or
+	/// after it.
+	const fn after_ops(error: IndexTxnError) -> Self {
+		Self { error, ops_ran: true }
 	}
 }
 
@@ -227,35 +285,56 @@ impl IndexTxn {
 	}
 
 	/// Apply every op in one `BEGIN CONCURRENT … COMMIT` on a fresh connection to `db`,
-	/// retrying the whole transaction on a [`TxnErrorKind::Retryable`] failure.
+	/// retrying the whole transaction on a [`TxnErrorKind::Retryable`] failure when that
+	/// is safe (see the module documentation).
 	///
 	/// # Errors
 	///
 	/// An [`IndexTxnError`] whose kind says whether the transaction is certain not to
 	/// have committed (every kind but [`TxnErrorKind::Ambiguous`]).
 	pub async fn run(&self, db: &turso::Database) -> Result<TxnApplied, IndexTxnError> {
-		let mut retries = 0;
+		self.run_while(db, || true).await
+	}
+
+	/// [`run`](Self::run), asking `may_retry` before each retry, after its backoff: when it
+	/// answers `false`, the conflict the retry would have resolved is returned instead. A
+	/// store passes "not poisoned", so that a transaction waiting out a conflict does not
+	/// commit after another writer poisoned the store.
+	///
+	/// # Errors
+	///
+	/// As [`run`](Self::run).
+	pub async fn run_while(&self, db: &turso::Database, may_retry: impl Fn() -> bool) -> Result<TxnApplied, IndexTxnError> {
+		let mut attempts = 1;
 		loop {
-			match self.attempt(db).await {
-				Err(e) if e.kind == TxnErrorKind::Retryable && retries < MAX_RETRIES => {
-					retries += 1;
-					tracing::debug!(retry = retries, of = MAX_RETRIES, error = %e, "segment_index transaction lost an MVCC conflict; retrying it on a fresh snapshot");
-					tokio::time::sleep(backoff(retries)).await;
-				}
-				done => return done,
+			let failure = match self.attempt(db).await {
+				Ok(changes) => return Ok(TxnApplied { changes, attempts }),
+				Err(failure) => failure,
+			};
+			let error = IndexTxnError { attempts, ..failure.error };
+			let retry_safe = !failure.ops_ran || self.ops.iter().all(IndexOp::is_guarded);
+			if error.kind != TxnErrorKind::Retryable || !retry_safe || attempts > MAX_RETRIES {
+				return Err(error);
 			}
+			tracing::debug!(retry = attempts, of = MAX_RETRIES, %error, "segment_index transaction lost an MVCC conflict; retrying it on a fresh snapshot");
+			tokio::time::sleep(backoff(attempts)).await;
+			if !may_retry() {
+				return Err(error);
+			}
+			attempts += 1;
 		}
 	}
 
-	/// One attempt of [`run`](Self::run).
-	async fn attempt(&self, db: &turso::Database) -> Result<TxnApplied, IndexTxnError> {
-		let conn = db.connect().map_err(|e| IndexTxnError::new(TxnErrorKind::Definite, None, format!("connecting: {e}")))?;
-		conn.execute("BEGIN CONCURRENT", ()).await.map_err(|e| IndexTxnError::new(statement_error_kind(&e), None, format!("BEGIN CONCURRENT: {e}")))?;
+	/// One attempt of [`run_while`](Self::run_while): the rows each op changed, or why it
+	/// failed.
+	async fn attempt(&self, db: &turso::Database) -> Result<Vec<u64>, AttemptFailure> {
+		let conn = db.connect().map_err(|e| AttemptFailure::before_ops(IndexTxnError::new(TxnErrorKind::Definite, None, format!("connecting: {e}"))))?;
+		conn.execute("BEGIN CONCURRENT", ()).await.map_err(|e| AttemptFailure::before_ops(IndexTxnError::new(statement_error_kind(&e), None, format!("BEGIN CONCURRENT: {e}"))))?;
 		let changes = match self.apply_ops(&conn).await {
 			Ok(changes) => changes,
 			Err(e) => {
 				rollback(&conn).await;
-				return Err(e);
+				return Err(AttemptFailure::after_ops(e));
 			}
 		};
 		if let Err(e) = conn.execute("COMMIT", ()).await {
@@ -263,12 +342,12 @@ impl IndexTxn {
 			// may have left the connection inside the transaction. Either way the
 			// connection is dropped next, and only recovery can say what is durable.
 			rollback(&conn).await;
-			return Err(IndexTxnError::new(commit_error_kind(&e), None, format!("COMMIT: {e}")));
+			return Err(AttemptFailure::after_ops(IndexTxnError::new(commit_error_kind(&e), None, format!("COMMIT: {e}"))));
 		}
 		if let Some(point) = self.points.phantom {
-			fault::hit(point).await.map_err(|e| IndexTxnError::new(TxnErrorKind::Ambiguous, None, format!("after COMMIT: {e}")))?;
+			fault::hit(point).await.map_err(|e| AttemptFailure::after_ops(IndexTxnError::new(TxnErrorKind::Ambiguous, None, format!("after COMMIT: {e}"))))?;
 		}
-		Ok(TxnApplied { changes })
+		Ok(changes)
 	}
 
 	/// Apply each op inside the open transaction, checking its precondition and hitting
@@ -494,42 +573,107 @@ mod tests {
 	/// first attempt, with no retry to hide a conflict. Writers of one row do conflict,
 	/// and Turso reports many of those from COMMIT itself ("Write-write conflict", raised
 	/// while it validates the commit, before it writes the log record). An `IndexTxn`
-	/// retries them and never calls one ambiguous, so a race between two writers of a
-	/// row cannot poison a store.
+	/// never calls one ambiguous, so a race between two writers of a row cannot poison a
+	/// store. Nor does it replay a legacy upsert that lost: each of the 16 upserters
+	/// either committed on its first attempt or failed `Retryable` there, and the row
+	/// holds the version of one that committed.
 	#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 	async fn only_writers_of_one_row_conflict_and_never_ambiguously() {
 		let dir = tempfile::TempDir::new().expect("tempdir");
 		let path = dir.path().join("segment_index.db").to_string_lossy().into_owned();
 		drop(SegmentIndexStore::open(&path).await.expect("creates the index"));
 		let db = std::sync::Arc::new(turso::Builder::new_local(&path).build().await.expect("opens the database"));
-		let upsert = |aspect: String, id: u64| IndexTxn::new(vec![IndexOp::Upsert { aspect, row: IndexRow::legacy(row(id, 0, None).desc) }]);
+		let upsert = |aspect: String, id: u64, version: usize| {
+			let mut desc = row(id, 0, None).desc;
+			desc.path = format!("/root/segments/{aspect}-{id}.v{version}.weftseg");
+			IndexTxn::new(vec![IndexOp::Upsert { aspect, row: IndexRow::legacy(desc) }])
+		};
 
 		let distinct: Vec<_> = (0..64_u64)
 			.map(|i| {
-				let (db, txn) = (db.clone(), upsert(format!("a{}", i % 4), i));
-				tokio::spawn(async move { txn.attempt(&db).await })
+				let (db, txn) = (db.clone(), upsert(format!("a{}", i % 4), i, 0));
+				tokio::spawn(async move { txn.run(&db).await })
 			})
 			.collect();
 		for (i, task) in distinct.into_iter().enumerate() {
 			let applied = task.await.expect("joins").unwrap_or_else(|e| panic!("transaction {i}, alone on its row, conflicted: {e}"));
-			assert_eq!(applied.changes, vec![1]);
+			assert_eq!((applied.changes, applied.attempts), (vec![1], 1), "transaction {i}");
 		}
 
 		let one_row: Vec<_> = (0..16)
-			.map(|_| {
-				let (db, txn) = (db.clone(), upsert("a0".to_string(), 1000));
-				tokio::spawn(async move { txn.run(&db).await })
+			.map(|version| {
+				let (db, txn) = (db.clone(), upsert("a0".to_string(), 1000, version));
+				tokio::spawn(async move { (version, txn.run(&db).await) })
 			})
 			.collect();
-		let mut committed = 0;
+		let mut committed = Vec::new();
 		for task in one_row {
 			match task.await.expect("joins") {
-				Ok(_) => committed += 1,
-				Err(e) => assert_eq!(e.kind, TxnErrorKind::Retryable, "a conflict over one row is never ambiguous: {e}"),
+				(version, Ok(applied)) => {
+					assert_eq!(applied.attempts, 1, "upserter {version} committed on its first attempt, not by replaying itself over a winner");
+					committed.push(format!("/root/segments/a0-1000.v{version}.weftseg"));
+				}
+				(version, Err(e)) => assert_eq!((e.kind, e.attempts), (TxnErrorKind::Retryable, 1), "upserter {version}: a conflict over one row is never ambiguous, and a legacy upsert is not retried: {e}"),
 			}
 		}
+		let mut kept = db.connect().expect("connects").query("SELECT path FROM segment_index WHERE aspect = 'a0' AND id = 1000", ()).await.expect("reads");
+		let kept = kept.next().await.expect("reads").expect("the contended row").get_value(0).expect("its path").as_text().cloned().expect("text");
 		drop(db);
-		assert!(committed > 0, "the writers of one row are serialised, not all refused");
+		assert!(!committed.is_empty(), "the writers of one row are serialised, not all refused");
+		assert!(committed.contains(&kept), "the row holds the version of an upserter that reported success, {kept:?}");
+	}
+
+	/// The hazard the retry rule exists for, made deterministic. A winner holds an
+	/// uncommitted change to row 5 while a loser's transaction runs, so the loser's first
+	/// attempt conflicts; `may_retry` then commits the winner before letting a retry go
+	/// ahead, which is exactly the window a retry on a fresh snapshot runs in.
+	///
+	/// - A legacy `Upsert` or `Delete` of the row is not retried: it fails `Retryable` on
+	///   its first attempt, without asking, and the winner's row stands. (Retried, the
+	///   upsert would have replaced the winner's row and the delete removed it, both
+	///   reporting success.)
+	/// - A guarded `ReplaceExpected` of the version the loser read is retried, and the
+	///   retry, on a snapshot holding the winner's commit, fails its precondition: a
+	///   `Conflict`, and the winner's row still stands.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn a_retry_never_replays_an_unguarded_op_over_the_winners_commit() {
+		let base = row(5, 1, Some(10));
+		let winner = row(5, 2, Some(20));
+		let losers = [("upsert", IndexOp::Upsert { aspect: ASPECT.to_string(), row: IndexRow::legacy(row(5, 0, None).desc) }, TxnErrorKind::Retryable, 1, 0), ("delete", IndexOp::Delete { aspect: ASPECT.to_string(), id: 5 }, TxnErrorKind::Retryable, 1, 0), ("guarded replace", replace(base.version(), row(5, 3, Some(30))), TxnErrorKind::Conflict, 2, 1)];
+		for (what, op, kind, attempts, asked) in losers {
+			let dir = tempfile::TempDir::new().expect("tempdir");
+			let path = dir.path().join("segment_index.db").to_string_lossy().into_owned();
+			let index = SegmentIndexStore::open(&path).await.expect("opens");
+			index.apply(&IndexTxn::new(vec![insert(base.clone())])).await.expect("commits the base row");
+
+			let winning = index.database().connect().expect("connects");
+			winning.execute("BEGIN CONCURRENT", ()).await.expect("begins");
+			apply(&winning, &replace(base.version(), winner.clone())).await.expect("the winner takes the row first");
+			let (go, go_rx) = std::sync::mpsc::channel::<()>();
+			let (done_tx, done) = std::sync::mpsc::channel::<()>();
+			let committer = tokio::spawn(async move {
+				tokio::task::spawn_blocking(move || go_rx.recv()).await.expect("joins").expect("told to commit");
+				winning.execute("COMMIT", ()).await.expect("the winner commits");
+				done_tx.send(()).expect("reports the commit");
+			});
+			let asks = std::sync::atomic::AtomicU32::new(0);
+			let commit_the_winner = || {
+				if asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+					go.send(()).expect("starts the commit");
+					done.recv().expect("waits for it");
+				}
+				true
+			};
+			let err = index.apply_while(&IndexTxn::new(vec![op]), commit_the_winner).await.expect_err(what);
+			if asks.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+				go.send(()).expect("starts the commit");
+			}
+			committer.await.expect("the winner committed");
+			let rows = rows_of(&index, ASPECT).await;
+			drop(index);
+			assert_eq!((err.kind, err.attempts, asks.into_inner()), (kind, attempts, asked), "{what}: {err}");
+			assert_eq!(rows, vec![winner.clone()], "{what}: the winner's row stands");
+		}
 	}
 
 	/// Every column of every op round-trips: the write-once columns of a row written with

@@ -84,15 +84,19 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `aspect_metadata` and `segment_changes`, which later releases fill. `store_meta`
   records `layout_version = 2` and a `store_uuid`. An earlier WeftDB still opens a
   migrated store, which ignores the additions; a WeftDB refuses a store whose
-  `layout_version` is newer than it knows.
+  `layout_version` is newer than it knows, before it changes anything in it.
 - Segment-index writes (seals, reconciles, splits, merges, squashes) commit through
-  one transaction type that retries an MVCC conflict up to five times, with backoff,
-  before it fails the call; before, the first conflict failed it.
+  one transaction type. A write that loses an MVCC conflict to another writer of the
+  same row still fails the call at once, as before: retrying it would replay it over
+  the other writer's committed row. Only a database that is busy before the
+  transaction starts is retried, up to five times with backoff.
 
 ### Added
 
-- **Write poison** (crash-consistency design, S6). When a segment-index COMMIT returns
-  an error, the transaction may or may not be durable, so the store now refuses every
+- **Write poison** (crash-consistency design, S6). When a segment-index COMMIT fails
+  in a way that may still have committed (any COMMIT error except a conflict Turso
+  detects while validating the transaction, which it rolls back before writing
+  anything), the transaction may or may not be durable, so the store now refuses every
   write (seal, declare, reconcile, split, merge, squash, compact, rollup rebuild) with
   the new `weftdb::Poisoned` error until the process restarts, while reads keep
   working; the restart's open settles the transaction. `SegmentStore::poisoned()`
@@ -142,6 +146,14 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   MVCC journal mode and a new connection syncs FULL, which is what makes a COMMIT
   durable when it returns. Previously a failed switch was ignored and the database
   committed in WAL mode.
+- **The open that switches a control-plane database to MVCC now syncs the header it
+  wrote.** The switch writes the MVCC header into the database file without syncing
+  it, and commits then sync only the `-log`, so a power cut could leave a header that
+  still says WAL beside a log of acknowledged commits, which Turso refuses to open.
+  Turso synced it anyway for a database that never ran MVCC, but not for one switched
+  back to WAL. The open now commits a no-op transaction and runs a TRUNCATE
+  checkpoint, which makes Turso fsync the file, header included; an open of a database
+  already in MVCC does neither.
 - **Opening a store now makes its files' directory entries durable.** The root,
   `segments/`, the root's parent and any directory the open created are fsynced, so
   the control-plane databases and their logs cannot vanish from the directory after a

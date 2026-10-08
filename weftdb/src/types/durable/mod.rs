@@ -32,6 +32,8 @@ pub mod fs;
 pub mod lock;
 #[cfg(any(test, feature = "fault-injection"))]
 pub mod sim;
+#[cfg(test)]
+pub(crate) mod turso_probe;
 
 pub use dirsync::DirSyncer;
 pub use fault::FaultPoint;

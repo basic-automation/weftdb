@@ -95,9 +95,10 @@ pub struct ReadyResponse {
 	/// Whether a segment store is configured — i.e. the storage-query endpoints
 	/// (`/api/v1/storage/...`) are live rather than answering `503`.
 	pub segment_store: bool,
-	/// Whether the segment store is write-poisoned: a control-plane COMMIT returned an
-	/// error, so it may or may not have committed, and the store refuses every write
-	/// until the server restarts. Reads keep working, so `ready` stays `true`.
+	/// Whether the segment store is write-poisoned: a control-plane COMMIT failed in a
+	/// way that may still have committed (not a conflict found while validating it), and
+	/// the store refuses every write until the server restarts. Reads keep working, so
+	/// `ready` stays `true`.
 	pub poisoned: bool,
 	/// Whether the server must be restarted to accept writes again. The restart's open
 	/// replays the control plane's log, which settles the ambiguous commit.
