@@ -255,9 +255,9 @@ impl SegmentIndexStore {
 	///
 	/// The control-plane half of dropping a segment (roadmap Phase 4.6 cross-segment
 	/// merge): the caller removes the `.weftseg` file; this removes its catalog row so a
-	/// pruned read never opens the now-absent file. Since ids are handed out as
-	/// `MAX(id) + 1` ([`next_id`](SegmentIndexStore::next_id)), deleting a segment can
-	/// free an id below the maximum without risking reuse of a still-live one.
+	/// pruned read never opens the now-absent file. A [`SegmentStore`](crate::SegmentStore)
+	/// hands ids out from a persisted per-aspect allocator, so it never reissues the id of
+	/// a deleted row, not even the largest one.
 	///
 	/// Like [`insert`](Self::insert), this knows nothing of a
 	/// [`SegmentStore`](crate::SegmentStore)'s write poison: it deletes even while the
@@ -373,22 +373,53 @@ impl SegmentIndexStore {
 		Ok(usize::try_from(n).unwrap_or(0))
 	}
 
-	/// The next unused segment `id` for `aspect`: one past the current maximum, or
-	/// `0` when the aspect has no segments yet. The id a fresh seal should claim so
-	/// segment ids stay monotonic within an aspect.
+	/// One past the largest segment `id` indexed under `aspect`, or `0` when the aspect
+	/// has no segments.
+	///
+	/// This is not an id to seal under. It hands out again the id of a deleted segment
+	/// that had the largest one, and of a frame a seal wrote but crashed before indexing,
+	/// and two callers that read it before either commits get the same id. A
+	/// [`SegmentStore`](crate::SegmentStore) takes its ids from a persisted per-aspect
+	/// allocator instead (crash-consistency design, S7). Kept for tests.
 	///
 	/// # Errors
 	///
 	/// Propagates any libSQL read failure.
+	#[deprecated(note = "MAX(id) + 1 reissues deleted and crashed ids and races concurrent callers; SegmentStore allocates ids from its persisted per-aspect allocator. Kept for tests only.")]
 	pub async fn next_id(&self, aspect: &str) -> Result<u64> {
+		Ok(self.max_id(aspect).await?.map_or(0, |max| max.saturating_add(1)))
+	}
+
+	/// The largest segment `id` indexed under `aspect`, if it has any.
+	async fn max_id(&self, aspect: &str) -> Result<Option<u64>> {
 		let conn = self.db.connect()?;
 		let mut rows = conn.query("SELECT MAX(id) FROM segment_index WHERE aspect = ?", turso::params![aspect.to_string()]).await?;
 		let row = rows.next().await?.ok_or_else(|| anyhow::anyhow!("MAX returned no row"))?;
-		// MAX over no rows is SQL NULL → start at 0; otherwise one past the maximum.
+		// MAX over no rows is SQL NULL.
 		match row.get_value(0)? {
-			Value::Integer(max) => Ok(u64::try_from(max).unwrap_or(0).saturating_add(1)),
-			_ => Ok(0),
+			Value::Integer(max) => Ok(Some(u64::try_from(max).unwrap_or(0))),
+			_ => Ok(None),
 		}
+	}
+
+	/// What `aspect`'s id allocator is seeded from in the index: its persisted
+	/// `aspect_seq` row, if it has one, and the largest id among its rows, if it has any.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure.
+	pub(crate) async fn allocator_seed(&self, aspect: &str) -> Result<AllocatorSeed> {
+		let conn = self.db.connect()?;
+		let mut rows = conn.query("SELECT next_id, epoch FROM aspect_seq WHERE aspect = ?", turso::params![aspect.to_string()]).await?;
+		let persisted = match rows.next().await? {
+			Some(row) => {
+				let unsigned = |idx: usize| Self::opt_integer(&row, idx).and_then(|n| u64::try_from(n).ok()).unwrap_or(0);
+				Some((unsigned(0), unsigned(1)))
+			}
+			None => None,
+		};
+		drop(rows);
+		Ok(AllocatorSeed { next_id: persisted.map(|(next_id, _)| next_id), epoch: persisted.map_or(0, |(_, epoch)| epoch), max_id: self.max_id(aspect).await? })
 	}
 
 	/// Decode a result set ([`SELECT_COLUMNS`], in that order) into [`IndexRow`]s.
@@ -453,6 +484,18 @@ impl SegmentIndexStore {
 	pub(crate) async fn meta(&self, key: &str) -> Result<Option<String>> {
 		meta_value(&self.db.connect()?, key).await
 	}
+}
+
+/// What an aspect's id allocator is seeded from in `segment_index.db`
+/// ([`SegmentIndexStore::allocator_seed`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AllocatorSeed {
+	/// `aspect_seq.next_id`, when the aspect has a row there.
+	pub next_id: Option<u64>,
+	/// `aspect_seq.epoch`, or 0 without a row.
+	pub epoch: u64,
+	/// The largest id among the aspect's `segment_index` rows, when it has any.
+	pub max_id: Option<u64>,
 }
 
 /// Migrate the database behind `conn` to layout v2, in place and idempotently: add the
@@ -661,6 +704,7 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[allow(deprecated)]
 	async fn delete_removes_a_row_and_reports_whether_it_matched() {
 		let store = SegmentIndexStore::open_in_memory().await.expect("opens");
 		let (seg, len) = sealed(0);
@@ -866,6 +910,7 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[allow(deprecated)]
 	async fn next_id_is_monotonic_per_aspect() {
 		let store = SegmentIndexStore::open_in_memory().await.expect("opens");
 		let (seg, len) = sealed(0);
