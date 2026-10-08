@@ -20,12 +20,12 @@ Source:     https://github.com/panagiotisl/chimp
             src/main/java/gr/aueb/delorean/chimp/ChimpN.java,
             reviewed at commit 320d397157c7e0696b3c64dc1711fc17a3add3da
 License:    Apache License, Version 2.0 (the repository's LICENCE.md)
-Copyright:  Copyright the Chimp authors (Panagiotis Liakos, Katia
-            Papakonstantinopoulou, Yannis Kotidis).
+Copyright:  Copyright the Chimp authors.
             The repository has no NOTICE file, and its LICENCE.md leaves the
             appendix copyright line as the unfilled template
-            "Copyright [yyyy] [name of copyright owner]". Both source files
-            carry "@author Panagiotis Liakos".
+            "Copyright [yyyy] [name of copyright owner]", so it names no
+            copyright holder. Both source files name Panagiotis Liakos as
+            author ("@author Panagiotis Liakos").
 Paper:      P. Liakos, K. Papakonstantinopoulou, Y. Kotidis. "Chimp: Efficient
             Lossless Floating Point Compression for Time Series Databases".
             PVLDB 15(11), 2022.

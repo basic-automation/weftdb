@@ -423,6 +423,11 @@ detection within Y% and improving historical query latency by Z."*
       (`weft-reduce`) are treated as adapted from their Apache-2.0 reference implementations: a
       root `NOTICE` and per-crate `THIRD-PARTY-NOTICES` (shipped in each package) meet
       Apache-2.0 section 4.
+    - [ ] **Package licence metadata: owner or counsel to decide.** Both crates still declare the
+      workspace `license = "MIT"`, while their packages carry Apache-2.0 portions, so crates.io,
+      `cargo deny` and other scanners that read the field see MIT only. The option is
+      `license = "MIT AND Apache-2.0"` on those two crates (Apache-2.0 is already on
+      `deny.toml`'s allow-list). Left as MIT until the owner or counsel decides.
   - [x] **Gorilla + RLE realized on disk** — the timestamp block now carries four
     codecs (varint/bit-pack/RLE/Gorilla) chosen by the single-source-of-truth
     `best_encoding_name`, so the reported codec always matches the bytes written; the
@@ -1715,7 +1720,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 - [x] **Windowed value reads no longer re-walk the codec chain per row (found by review of the
   above).** `read_range_from_section` resolved a window by calling `read_value_at` once per row, and
   every fixed-layout codec locates a value by walking its block/tile headers *from the start of the
-  stream* — so an `N`-row window cost `N` walks, and on the 1024-lane transposed layout it decoded a
+  stream* — so an `N`-row window cost `N` walks, and on the 1024-value-tile bit-sliced layout it decoded a
   whole tile per value (measured ~27× slower than linear, and ~20× slower than the full-decode
   fallback it was supposed to beat). Fixed by `weftseg::read_value_range(bytes, start, len)`, which
   does the range decode **once** per codec; this also removes the pre-existing per-row walk for the
@@ -1737,8 +1742,11 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   and so re-decodes one tile per instant when several instants share a tile (measured by review:
   500 same-tile instants ≈ 2.33 ms vs 0.52 ms linear). *(src: https://lib.rs/crates/fastlanes)*
 - [ ] **NEXT — upstream FastLanes does NOT make the transposed layout its default either, and
-  exposes the permutation instead (research 2026-09-23).** The FastLanes *file format* paper states
-  they "use the Unified Transposed Layout (UTL) as an option rather than as the default", because
+  exposes the permutation instead (research 2026-09-23).**
+  *(Correction 2026-10-08: WeftDB's codec is bit-sliced, not FastLanes' transposed layout; the
+  FastLanes findings below are an analogy for it, not a description of it.)* The FastLanes *file
+  format* paper states they "use the Unified Transposed Layout (UTL) as an option rather than as the
+  default", because
   for Delta schemes it permutes tuple order and restoring that order costs a gather; their escape
   hatch is a **shareable 1024-entry selection vector** that a vectorized engine can apply in front of
   decoded vectors, with the restore performed only on request. This independently validates WeftDB's
@@ -1748,8 +1756,10 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   interpolation path restores. *(src: FastLanes file format, VLDB'25 —
   https://www.vldb.org/pvldb/vol18/p4629-afroozeh.pdf)*
 - [ ] **Cross-check WeftDB's hand-rolled bit-plane decoder against the `fastlanes` crate (0.7.2,
-  2026-09-02, Apache-2.0).** It provides the same 1024-element layout (BitPacking pack/unpack,
-  single-value unpack, transposed Delta/RLE, linear FoR) via LLVM auto-vectorization. If WeftDB's
+  2026-09-02, Apache-2.0).** *(Correction 2026-10-08: the tile size matches, the bit order does
+  not; WeftDB's codec is bit-sliced, so compare decode speed at a width, not layouts.)* It provides
+  a 1024-element layout (BitPacking pack/unpack, single-value unpack, transposed Delta/RLE, linear
+  FoR) via LLVM auto-vectorization. If WeftDB's
   decoder is materially slower at the same bit width, that is a bug rather than a design choice —
   a cheap external yardstick for `benches/transposed_read.rs`. *(src: https://lib.rs/crates/fastlanes)*
 - [ ] **Track the FastLanes SPEC, not the CWI reference implementation.** `cwida/fastlanes` is on a
