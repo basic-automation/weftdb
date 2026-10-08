@@ -1349,6 +1349,16 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
     reductions **183.6 → 134.0 ms (1.37×)**; avg + sketch_p99 309.6 → 281.5 ms (1.10×). The
     reduction itself is no longer the cost (~28 ms in isolation), so the next lever is the
     physical window decode. Profile `read_segment_range_physical` on this frame.
+  - [x] **DONE (2026-10-08) — `BucketAcc::finish` computes `avg` through `avg_of_sum`**, the
+    proven-identical integer long division, whenever the sum's unscaled integer fits i128. This
+    speeds up every path, the BigDecimal `reduce` included. Quieter-box numbers (load avg ~11):
+    hourly avg `reduce` **60.04 ms**, `reduce_scaled` **13.52 ms**, f64 2.14 ms; per-segment
+    streaming6 **127.6 → 59.7 ms**; avg+sketch_p99 176.5 → 144.0 ms (the sketch's per-value
+    `to_f64` is now the cost). The decimal tax on the integer path is ~6.3× f64, against QuestDB's
+    documented ~2×.
+  - [ ] **NEXT — the remaining 6.3×:** per-bucket BigDecimal materialization (six values + the
+    `BTreeMap<String, _>` per bucket) and the window decode (~30 ms of the 59.7). Profile before
+    choosing.
   - [ ] **NEXT — the sidecar build.** The `.weftpart` sidecar build
     (`write_partial_sidecar`) receives the seal's BigDecimal values rather than stored mantissas,
     so switching it means threading the seal's encoded column through instead. Its callers sit in

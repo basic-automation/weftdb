@@ -375,7 +375,6 @@ impl BucketAcc {
 	/// Materialize the requested reductions and the grid-aligned bucket start.
 	fn finish(self, resolution: Resolution, base: i64, aggregations: &[Aggregation]) -> Result<Bucket, ReduceError> {
 		let timestamp = bucket_start(resolution, base).ok_or(ReduceError::BucketStartOverflow)?;
-		let count = BigDecimal::from(self.count as u64);
 		// Percentiles read the values in ascending value order; sort a value-only copy
 		// once, lazily, only if a percentile is requested.
 		let sorted_values: Option<Vec<BigDecimal>> = aggregations.iter().any(|a| a.percentile_rank().is_some()).then(|| {
@@ -394,7 +393,8 @@ impl BucketAcc {
 					Aggregation::Min => self.min.clone(),
 					Aggregation::Max => self.max.clone(),
 					Aggregation::Sum => Some(self.sum.clone()),
-					Aggregation::Avg => (self.count > 0).then(|| &self.sum / &count),
+					// Identical to `&self.sum / &count`, by integer long division when the sum fits.
+					Aggregation::Avg => (self.count > 0).then(|| scaled::avg_of_sum(&self.sum, self.count as u64)),
 					Aggregation::First => self.first.as_ref().map(|(_, v)| v.clone()),
 					Aggregation::Last => self.last.as_ref().map(|(_, v)| v.clone()),
 					Aggregation::Twa => time_weighted_average(&self.samples, TwaMethod::Locf, None),

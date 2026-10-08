@@ -162,6 +162,14 @@ fn avg_like_bigdecimal(sum: i128, scale: i64, count: u64) -> BigDecimal {
 	}
 }
 
+/// `sum / count` for a [`BigDecimal`] sum, identical to `bigdecimal`'s own division: through
+/// [`avg_like_bigdecimal`] when the sum's unscaled integer fits `i128` (every realistic bucket),
+/// otherwise by the `BigDecimal` division itself.
+pub fn avg_of_sum(sum: &BigDecimal, count: u64) -> BigDecimal {
+	let (digits, scale) = sum.as_bigint_and_exponent();
+	i128::try_from(&digits).map_or_else(|_| sum / &BigDecimal::from(count), |int| avg_like_bigdecimal(int, scale, count))
+}
+
 /// Whether [`reduce_scaled`] can compute `aggregation` from integer state alone.
 const fn is_streaming(aggregation: Aggregation) -> bool {
 	matches!(aggregation, Aggregation::Min | Aggregation::Max | Aggregation::Avg | Aggregation::Sum | Aggregation::First | Aggregation::Last)
@@ -395,7 +403,11 @@ mod tests {
 			let expected = &BigDecimal::new(BigInt::from(sum), scale) / &BigDecimal::from(count);
 			let actual = avg_like_bigdecimal(sum, scale, count);
 			assert_eq!(actual.as_bigint_and_exponent(), expected.as_bigint_and_exponent(), "{sum}e-{scale} / {count}");
+			assert_eq!(avg_of_sum(&BigDecimal::new(BigInt::from(sum), scale), count).as_bigint_and_exponent(), expected.as_bigint_and_exponent());
 		}
+		// A sum past i128 takes the BigDecimal division, unchanged.
+		let huge = BigDecimal::new(BigInt::from(i128::MAX) * BigInt::from(1_000), 3);
+		assert_eq!(avg_of_sum(&huge, 7).as_bigint_and_exponent(), (&huge / &BigDecimal::from(7_u64)).as_bigint_and_exponent());
 	}
 
 	#[test]
