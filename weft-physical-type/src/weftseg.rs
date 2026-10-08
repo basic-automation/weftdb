@@ -81,7 +81,8 @@ pub enum WeftSegError {
 	InvalidNullMask(crate::nulls::NullMaskError),
 	/// The block uses a codec this build was compiled without. The frame is well formed;
 	/// rebuilding with the named cargo feature reads it. Today this is only the bit-sliced
-	/// value codec (`VAL_CODEC_TRANSPOSED`, feature `bitsliced-codec`).
+	/// value codec (`VAL_CODEC_TRANSPOSED`, feature `bitsliced-codec`), which `weftdb` and
+	/// `weft-server` forward under the same name — the feature an operator actually sets.
 	CodecNotEnabled {
 		/// The codec the block uses.
 		codec: &'static str,
@@ -103,7 +104,7 @@ impl std::fmt::Display for WeftSegError {
 			Self::ChecksumMismatch { stored, computed } => write!(f, "segment checksum mismatch: stored {stored:#010x}, computed {computed:#010x}"),
 			Self::TrailingBytes { remaining } => write!(f, "{remaining} trailing bytes after segment frame"),
 			Self::InvalidNullMask(source) => write!(f, "invalid quality column: {source}"),
-			Self::CodecNotEnabled { codec, feature } => write!(f, "segment uses the {codec} codec, which this build does not include; rebuild weft-physical-type with the `{feature}` feature to read it"),
+			Self::CodecNotEnabled { codec, feature } => write!(f, "segment uses the {codec} codec, which this build does not include; rebuild with the `{feature}` cargo feature (weft-physical-type; forwarded by weftdb and weft-server) to read it"),
 		}
 	}
 }

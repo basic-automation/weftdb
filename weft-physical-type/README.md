@@ -28,7 +28,10 @@ weft-physical-type = "0.1"
 
 All features are off by default, are **not** covered by the 1.0 semver promise (their items
 may change or disappear in any release), and are pending patent review. A default build
-reads and writes every frame a default build has ever written.
+reads every frame written under the default configuration, that is with
+`FrameOptions::transposed_max_overhead` unset (WeftDB's `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD`).
+A frame written with that option set, which 0.1.0 did whenever it was set, needs
+`bitsliced-codec`.
 
 | Feature | Enables |
 |---------|---------|

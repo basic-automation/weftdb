@@ -168,10 +168,15 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   ⚠️ A store that enabled it with `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` must be built with
   `bitsliced-codec` to read those segments: without the feature, reading one fails with the
   new `WeftSegError::CodecNotEnabled` (which names the feature) instead of decoding, and the
-  variable is ignored with a warning. The `transpose_bitpack_*` primitives, `TRANSPOSE_TILE`,
+  variable is ignored with a warning. For library callers, without the feature
+  `FrameOptions::transposed_max_overhead` is accepted but silently ignored
+  (`write_segment_with` and `write_paged_segment_with` emit the size-selected codec), and
+  `WeftSegError` gains the `CodecNotEnabled` variant, which breaks exhaustive matches on it.
+  The `transpose_bitpack_*` primitives, `TRANSPOSE_TILE`,
   `ColumnEncoding::{transposed_value_bytes, transposed_overhead, best_value_codec_transposed}`
-  and `weftseg::write_value_column_transposed` need the feature too. Default builds never
-  wrote this codec, so their stores are unaffected. The docs now call it a bit-sliced
+  and `weftseg::write_value_column_transposed` need the feature too. The default
+  configuration never wrote this codec, so a store that never set the variable (or
+  `FrameOptions::transposed_max_overhead`) is unaffected. The docs now call it a bit-sliced
   (bit-plane-major) layout; it is not the FastLanes layout they used to name.
 - Every `LICENSE` file now reads `Copyright (c) 2025-2026 Justin Icenhour`, naming the
   individual copyright holder for both years of the project. The license (MIT) is unchanged.

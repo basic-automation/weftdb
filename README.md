@@ -561,8 +561,9 @@ background at startup (`WEFT_GPU_CALIBRATE`, above), and an embedding program ca
 `splimes::calibrate()` or `splimes::prewarm_gpu()` itself.
 
 WeftDB's own build features are all **off by default**, sit **outside the 1.0 semver
-promise**, and are **pending patent review**. A default build reads and writes every
-segment a default build has ever written.
+promise**, and are **pending patent review**. A default build reads every segment written
+under the default configuration (`WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` unset). A segment
+written with that variable set, which 0.1.0 did whenever it was set, needs `bitsliced-codec`.
 
 | Feature | Crate(s) | Effect |
 |---------|----------|--------|
