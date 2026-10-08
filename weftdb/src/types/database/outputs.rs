@@ -740,40 +740,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 	//
 
 	async fn get_dictionary_metadata(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<Option<DictionaryMetadata>> {
-		// Check cache first. Keyed by aspect too: dictionary names are per aspect.
-		let cache_key = Self::dictionary_metadata_cache_key(aspect_id, dictionary_name);
-		if let Some(metadata) = self.cache.lock().await.get::<DictionaryMetadata>(&cache_key).await {
-			return Ok(Some(metadata));
-		}
-
-		// Each dictionary is its own database file. Without one nothing is registered under
-		// this name, so the answer is `None` (on which `load_dictionary` registers the
-		// dictionary), not the error `get_dictionary_db` gives for a missing file.
-		let aspect = self.get_aspect(aspect_id).await?;
-		let db_path = Self::aspect_dictionaries_db_path(&self.name, aspect.subject_name(), aspect.name(), dictionary_name)?;
-		if !tokio::fs::try_exists(&db_path).await? {
-			return Ok(None);
-		}
-
-		// Get from database. The cache generation is taken before the read's snapshot, so a
-		// registration a writer replaces meanwhile is not cached over its invalidation.
-		let generation = self.cache.lock().await.generation(&cache_key).await;
-		let db = self.get_dictionary_db(aspect_id, dictionary_name).await?;
-		let conn: cache::Connection = Self::begin_concurrent(&db, dictionary_name, Some(self.cache.clone())).await?;
-		let metadata = match Self::read_dictionary_registration(&conn, dictionary_name).await {
-			Ok(metadata) => metadata,
-			Err(e) => {
-				// Report why the read failed, not a failed rollback.
-				Self::rollback_after_error(&conn).await;
-				return Err(e);
-			}
-		};
-		Self::commit_concurrent(&conn).await?;
-
-		if let Some(metadata) = &metadata {
-			self.cache.lock().await.store_if_generation(&cache_key, generation, metadata.clone()).await;
-		}
-		Ok(metadata)
+		self.dictionary_registration(aspect_id, dictionary_name).await?.transpose()
 	}
 
 	async fn list_dictionaries(&self, aspect_id: &AspectId) -> Result<Vec<DictionaryMetadata>> {
@@ -822,15 +789,16 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		names.sort_unstable();
 
 		// A file with no complete registration (see `read_dictionary_registration`) is not
-		// listed. Nor is one whose registration cannot be read, such as a stored step method
+		// listed. Nor is one whose stored registration does not parse, such as a step method
 		// splimes rejects: it is logged, and the readable dictionaries are still listed
-		// (`get_dictionary_metadata` reports its error).
+		// (`get_dictionary_metadata` reports its error). A read that fails (a query, I/O, an
+		// MVCC conflict) fails the listing, so that a shorter list never just means absent.
 		let mut dictionaries = Vec::with_capacity(names.len());
 		for name in names {
-			match self.get_dictionary_metadata(aspect_id, &name).await {
-				Ok(Some(metadata)) => dictionaries.push(metadata),
-				Ok(None) => {}
-				Err(e) => tracing::warn!(error = %e, dictionary = %name, aspect = %aspect_id, "Skipping a dictionary whose registration cannot be read"),
+			match self.dictionary_registration(aspect_id, &name).await? {
+				Some(Ok(metadata)) => dictionaries.push(metadata),
+				Some(Err(e)) => tracing::warn!(error = %e, dictionary = %name, aspect = %aspect_id, "Skipping a dictionary whose stored registration does not parse"),
+				None => {}
 			}
 		}
 		Ok(dictionaries)
@@ -1611,6 +1579,58 @@ impl Database {
 		format!("dictionary_metadata_{}_{dictionary_name}", aspect_id.as_uuid())
 	}
 
+	/// [`get_dictionary_metadata`](crate::database::traits::Outputs::get_dictionary_metadata),
+	/// with a registration whose stored values do not parse as `Some(Err(…))` instead of an
+	/// error: [`list_dictionaries`](crate::database::traits::Outputs::list_dictionaries)
+	/// skips such a dictionary, but fails on a read that failed.
+	///
+	/// A registration that was read is cached (see `get_dictionary_metadata`), and only if
+	/// no write on this `Database` invalidated its entry since the read began: the cache
+	/// generation is taken before the read's snapshot. Only `DatabaseCache`'s
+	/// `store_if_generation` is tested for that; the interleaving inside this method, a
+	/// replacing commit between the snapshot and the store, has no deterministic test.
+	///
+	/// # Errors
+	///
+	/// An [`InvalidDictionaryName`](crate::InvalidDictionaryName), an unknown aspect, or a
+	/// failed read: I/O, a query, or an MVCC conflict.
+	async fn dictionary_registration(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<Option<StoredRegistration>> {
+		// Check cache first. Keyed by aspect too: dictionary names are per aspect.
+		let cache_key = Self::dictionary_metadata_cache_key(aspect_id, dictionary_name);
+		if let Some(metadata) = self.cache.lock().await.get::<DictionaryMetadata>(&cache_key).await {
+			return Ok(Some(Ok(metadata)));
+		}
+
+		// Each dictionary is its own database file. Without one nothing is registered under
+		// this name, so the answer is `None` (on which `load_dictionary` registers the
+		// dictionary), not the error `get_dictionary_db` gives for a missing file.
+		let aspect = self.get_aspect(aspect_id).await?;
+		let db_path = Self::aspect_dictionaries_db_path(&self.name, aspect.subject_name(), aspect.name(), dictionary_name)?;
+		if !tokio::fs::try_exists(&db_path).await? {
+			return Ok(None);
+		}
+
+		// Get from database. The cache generation is taken before the read's snapshot, so a
+		// registration a writer replaces meanwhile is not cached over its invalidation.
+		let generation = self.cache.lock().await.generation(&cache_key).await;
+		let db = self.get_dictionary_db(aspect_id, dictionary_name).await?;
+		let conn: cache::Connection = Self::begin_concurrent(&db, dictionary_name, Some(self.cache.clone())).await?;
+		let registration = match Self::read_dictionary_registration(&conn, dictionary_name).await {
+			Ok(registration) => registration,
+			Err(e) => {
+				// Report why the read failed, not a failed rollback.
+				Self::rollback_after_error(&conn).await;
+				return Err(e);
+			}
+		};
+		Self::commit_concurrent(&conn).await?;
+
+		if let Some(Ok(metadata)) = &registration {
+			self.cache.lock().await.store_if_generation(&cache_key, generation, metadata.clone()).await;
+		}
+		Ok(registration)
+	}
+
 	/// Read `dictionary_name`'s registration on `conn`, a transaction on its database.
 	///
 	/// A registration is a `dictionary_metadata` row with a `dictionary_constraints` row;
@@ -1625,12 +1645,14 @@ impl Database {
 	/// opened while another was still creating them. It cannot hold a registration, so it
 	/// is `None`, on which `load_dictionary` registers the dictionary and so creates them.
 	///
-	/// # Errors
-	///
-	/// A failed query, or a stored value that does not parse: see
+	/// A registration whose stored values do not parse is `Some(Err(…))`: see
 	/// [`parse_stored_steps`](Self::parse_stored_steps) and
 	/// [`parse_stored_variability`](Self::parse_stored_variability).
-	async fn read_dictionary_registration(conn: &cache::Connection, dictionary_name: &str) -> Result<Option<DictionaryMetadata>> {
+	///
+	/// # Errors
+	///
+	/// A failed query.
+	async fn read_dictionary_registration(conn: &cache::Connection, dictionary_name: &str) -> Result<Option<StoredRegistration>> {
 		let tables = Self::registration_tables(conn).await?;
 		if !(tables.metadata && tables.constraints) {
 			return Ok(None);
@@ -1647,12 +1669,21 @@ impl Database {
 		let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get metadata row: {e}")))? else {
 			return Ok(None);
 		};
-		let id_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary ID is not text".to_string()))?.clone();
-		let name = row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary name is not text".to_string()))?.clone();
-		let description = row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary description is not text".to_string()))?.clone();
-		let steps = Self::parse_stored_steps(&row.get_value(3)?, &row.get_value(4)?)?;
+		let columns = [row.get_value(0)?, row.get_value(1)?, row.get_value(2)?, row.get_value(3)?, row.get_value(4)?];
 		drop(rows);
-		let id = DictionaryId::from_uuid(Uuid::parse_str(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for dictionary ID: {e}")))?);
+		let [id, name, description, steps_count, steps_interpolation] = &columns;
+		let parsed = (|| -> Result<_> {
+			let id_str = id.as_text().ok_or_else(|| Error::DatabaseError("Dictionary ID is not text".to_string()))?;
+			let name = name.as_text().ok_or_else(|| Error::DatabaseError("Dictionary name is not text".to_string()))?.clone();
+			let description = description.as_text().ok_or_else(|| Error::DatabaseError("Dictionary description is not text".to_string()))?.clone();
+			let steps = Self::parse_stored_steps(steps_count, steps_interpolation)?;
+			let id = DictionaryId::from_uuid(Uuid::parse_str(id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for dictionary ID: {e}")))?);
+			Ok((id, id_str.clone(), name, description, steps))
+		})();
+		let (id, id_str, name, description, steps) = match parsed {
+			Ok(parsed) => parsed,
+			Err(e) => return Ok(Some(Err(e))),
+		};
 
 		let variability_query_sql = r"
                         SELECT variability_type, variability_value
@@ -1660,16 +1691,19 @@ impl Database {
                         WHERE dictionary_id = ?
                         ORDER BY id
                 ";
-		let mut variabilities = Vec::new();
+		let mut stored_variabilities = Vec::new();
 		if tables.variabilities {
 			let mut rows: turso::Rows = conn.as_ref().query(variability_query_sql, turso::params![id_str]).await.map_err(|e| Error::DatabaseError(format!("Failed to query dictionary variabilities: {e}")))?;
 			while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get variability row: {e}")))? {
-				variabilities.push(Self::parse_stored_variability(&row.get_value(0)?, &row.get_value(1)?)?);
+				stored_variabilities.push((row.get_value(0)?, row.get_value(1)?));
 			}
 		}
-		let variabilities = (!variabilities.is_empty()).then_some(variabilities);
+		let variabilities = match stored_variabilities.iter().map(|(kind, value)| Self::parse_stored_variability(kind, value)).collect::<Result<Vec<_>>>() {
+			Ok(variabilities) => (!variabilities.is_empty()).then_some(variabilities),
+			Err(e) => return Ok(Some(Err(e))),
+		};
 
-		Ok(Some(DictionaryMetadata { id, name, description, constraints: DictionaryConstraints::new(steps, variabilities) }))
+		Ok(Some(Ok(DictionaryMetadata { id, name, description, constraints: DictionaryConstraints::new(steps, variabilities) })))
 	}
 
 	/// Which of a registration's tables exist in the dictionary's database, on `conn`.
@@ -1732,6 +1766,10 @@ impl Database {
 		Ok(Some(Steps::new(count, interpolation)))
 	}
 }
+
+/// A dictionary's registration as stored: its metadata, or why its stored values do not
+/// parse (see `Database::read_dictionary_registration`).
+type StoredRegistration = Result<DictionaryMetadata>;
 
 /// Which of the tables a dictionary's registration is stored in exist in its database.
 #[derive(Debug, Default, Clone, Copy)]

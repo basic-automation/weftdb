@@ -97,13 +97,16 @@ pub trait Outputs {
 	/// entries are skipped. Each of them is opened, which sets its journal mode and can
 	/// create the dictionary tables in it, so keep copies and backups out of that directory
 	/// or give them another extension. A dictionary without a registration is not listed,
-	/// and one whose registration cannot be read (such as a stored step interpolation
-	/// splimes rejects) is logged as a warning and skipped, so the readable ones are still
-	/// listed; `get_dictionary_metadata` reports why it cannot be read.
+	/// and one whose stored registration does not parse (such as a stored step
+	/// interpolation splimes rejects) is logged as a warning and skipped, so the readable
+	/// ones are still listed; `get_dictionary_metadata` reports why it does not parse.
 	///
 	/// # Errors
 	///
-	/// When the aspect is unknown or its dictionaries directory cannot be read.
+	/// When the aspect is unknown, its dictionaries directory cannot be read, or reading a
+	/// dictionary's registration fails (I/O, a query, an MVCC conflict such as `Busy`):
+	/// such a failure fails the whole listing, so a dictionary is never left out of it
+	/// only because it could not be read this time.
 	async fn list_dictionaries(&self, aspect_id: &AspectId) -> Result<Vec<DictionaryMetadata>>;
 
 	async fn get_dictionary_pattern(&self, aspect_id: &AspectId, dictionary_name: &str, pattern_id: &PatternID) -> Result<Pattern>;

@@ -259,9 +259,10 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   so opened (setting the target's journal mode and creating tables in it), a directory
   or another entry named `*.db` is skipped. Every regular `*.db` file there is still
   opened as a dictionary, so keep backups out of that directory or under another
-  extension. A dictionary whose registration cannot be read, such as one with a stored
-  step method splimes rejects, is logged as a warning and left out instead of failing
-  the whole listing.
+  extension. A dictionary whose stored registration does not parse, such as one with a
+  stored step method splimes rejects, is logged as a warning and left out instead of
+  failing the whole listing; a read that fails (I/O, a query, an MVCC conflict) still
+  fails it, so a dictionary is never left out only because it could not be read.
 - **A dictionary file without its tables could not be registered.** A dictionary's file
   can exist before its tables, for example when `insert_pattern_into_dictionary` opened
   it first, which creates no tables. Once the file was open in the process nothing created

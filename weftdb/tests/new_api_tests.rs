@@ -691,8 +691,9 @@ async fn test_a_dictionary_file_without_tables_is_unregistered() {
 }
 
 /// `list_dictionaries` lists the aspect's readable dictionaries and skips the rest of the
-/// directory: a dictionary whose registration cannot be read (logged; it failed the whole
-/// listing), a file whose name is no dictionary name, and anything not a regular file.
+/// directory: a dictionary whose stored registration does not parse (logged; it failed
+/// the whole listing), a file whose name is no dictionary name, and anything not a
+/// regular file. A dictionary it fails to read still fails the listing.
 /// Opening a file converts its journal mode and can create tables, so a symlink is never
 /// followed: its target is left as it was.
 #[tokio::test]
@@ -721,6 +722,13 @@ async fn test_list_dictionaries_skips_what_it_cannot_list() {
 	assert_eq!(std::fs::metadata(&outside).expect("the link's target").len(), 0, "the link's target was not opened");
 	assert!(!common::data_dir().join(&db_name).join("outside.db-log").exists(), "nor given a log");
 	assert_eq!(std::fs::metadata(dictionaries.join(".backup.db")).expect("the stray file").len(), 0, "nor was the stray file");
+
+	// A dictionary whose read fails, here a file that is no database, is not skipped: the
+	// listing fails, so a dictionary never drops out of it only because it could not be
+	// read this time (as under contention).
+	std::fs::write(dictionaries.join("corrupt.db"), vec![0xA5_u8; 8192]).expect("Failed to write a corrupt dictionary");
+	let err = db.list_dictionaries(&aspect.id()).await.expect_err("a dictionary that cannot be read fails the listing");
+	assert!(format!("{err:#}").contains("not a database"), "{err:#}");
 
 	common::remove_database(&db_name);
 }
