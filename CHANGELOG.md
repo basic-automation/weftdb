@@ -145,7 +145,9 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   fewer distinct timestamps than a method needs, splimes steps down (`Cubic` →
   `Quadratic` → `Linear`, `Polynomial(d, b)` → `Polynomial(n − 1, b)`), so a `cubic`
   request over three points ran a quadratic and still said `Cubic`; it now says
-  `Quadratic`. The CSV, Arrow and Parquet outputs carry no method field.
+  `Quadratic`. The CSV, Arrow and Parquet outputs carry no method field. The
+  `interpolate.engine` trace span keeps the requested method in `spline` and now
+  records the one that ran as `effective_spline`.
 - **`get_dictionary_metadata` and `list_dictionaries` failed for every stored
   dictionary.** Both selected an `updated_at` column that the `dictionary_metadata`
   table does not have (`Failed to query dictionary metadata: … no such column:

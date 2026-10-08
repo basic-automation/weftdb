@@ -359,13 +359,15 @@ async fn interpolate_inner(request: InterpolateRequest, config: InterpolateConfi
 /// the JSON and ILP entry points so both produce identical result envelopes.
 ///
 /// Traced as the `interpolate.engine` span (roadmap Phase 3): it records the input
-/// point count, spline, and resolution at entry and the produced output-point count
-/// on completion, so a `RUST_LOG`-enabled run attributes the dominant compute cost of
-/// an interpolate request to the engine call. Decomposed into `interpolate.compute`
-/// (the spline kernel) and `interpolate.serialize` (the `BigDecimal` → wire-f64 +
-/// provenance shaping) child spans; the f64 → `BigDecimal` input lift is timed by the
-/// sibling `interpolate.parse` span in [`interpolate_inner`].
-#[tracing::instrument(name = "interpolate.engine", skip_all, fields(input_points = input_points, spline = %spline, resolution = ?resolution, output_points = tracing::field::Empty))]
+/// point count, the requested spline (`spline`), and resolution at entry, and on
+/// completion the produced output-point count and the spline splimes actually ran
+/// (`effective_spline`, which the response reports), so a `RUST_LOG`-enabled run
+/// attributes the dominant compute cost of an interpolate request to the engine call.
+/// Decomposed into `interpolate.compute` (the spline kernel) and
+/// `interpolate.serialize` (the `BigDecimal` → wire-f64 + provenance shaping) child
+/// spans; the f64 → `BigDecimal` input lift is timed by the sibling `interpolate.parse`
+/// span in [`interpolate_inner`].
+#[tracing::instrument(name = "interpolate.engine", skip_all, fields(input_points = input_points, spline = %spline, resolution = ?resolution, effective_spline = tracing::field::Empty, output_points = tracing::field::Empty))]
 async fn run_interpolation(points: Vec<Point>, start: DateTime<Utc>, end: DateTime<Utc>, spline: Spline, resolution: Resolution, input_points: usize, config: InterpolateConfig) -> Result<Json<InterpolateResponse>, ApiError> {
 	if end < start {
 		return Err(ApiError::bad_request("`end` must not be before `start`"));
@@ -384,10 +386,13 @@ async fn run_interpolation(points: Vec<Point>, start: DateTime<Utc>, end: DateTi
 	// stage timed apart from the kernel.
 	let points: Vec<OutputPoint> = tracing::info_span!("interpolate.serialize", output_points = output.len()).in_scope(|| output.iter().map(|(timestamp, value, kind)| OutputPoint { timestamp, value: value.to_f64().unwrap_or_default(), kind }).collect());
 
-	tracing::Span::current().record("output_points", points.len());
 	// The method splimes ran, which is simpler than the requested one when there were
 	// too few distinct input timestamps for it.
-	Ok(Json(InterpolateResponse { spline: output.spline().to_string(), resolution: resolution_label, output_points: points.len(), input_points, points }))
+	let effective_spline = output.spline().to_string();
+	let span = tracing::Span::current();
+	span.record("effective_spline", effective_spline.as_str());
+	span.record("output_points", points.len());
+	Ok(Json(InterpolateResponse { spline: effective_spline, resolution: resolution_label, output_points: points.len(), input_points, points }))
 }
 
 /// Render an [`InterpolateResponse`] as a `timestamp,value,kind` CSV document.
