@@ -269,6 +269,14 @@ impl AspectMetadataStore {
 	/// descriptor in, and write it back. The O(1)-per-seal incremental update the
 	/// segment store uses.
 	///
+	/// The read and the write are two transactions, so two calls for one aspect that run
+	/// at once can both read the same rollup, and the fold of whichever writes first is
+	/// lost (or the second write fails on an MVCC conflict). Calls for one aspect must
+	/// therefore not overlap: [`SegmentStore`](crate::SegmentStore) makes them under the
+	/// aspect's commit lock, together with the seal's index commit, where its rollup
+	/// rebuilds run too. Any other caller must serialize them per aspect the same way, or
+	/// re-derive the rollup with [`AspectMetadata::from_index`].
+	///
 	/// # Errors
 	///
 	/// Propagates any libSQL read or write failure.

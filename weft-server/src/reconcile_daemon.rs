@@ -22,13 +22,19 @@
 //! kind, the aspect and the full error chain) and counts it in
 //! `weft_reconcile_failed_passes_total`; the healthy aspects are maintained as usual.
 //!
+//! **Busy aspects (crash-consistency S7).** Maintenance operations on one aspect take
+//! turns under the aspect's maintenance lock. The daemon never waits for it: every sweep
+//! runs with [`MaintenanceWait::Skip`], so an aspect an operator's request (or a long
+//! pass) holds is left for the next tick, logged at `DEBUG` and recorded in the tick
+//! span's `busy` field, and the HTTP endpoints, which do wait, never queue behind a tick.
+//!
 //! The daemon holds only `Arc` handles (the store and the metrics registry), so it
 //! is a detached side task; the router and its handlers are untouched.
 
 use std::{sync::Arc, time::Duration};
 
 use tracing::Instrument as _;
-use weftdb::{HotColdSweep, OverlapSweep, ReconcileSweep, SegmentStore, SquashSweep};
+use weftdb::{HotColdSweep, MaintenanceWait, OverlapSweep, ReconcileSweep, SegmentStore, SquashSweep};
 
 use crate::metrics::SharedMetrics;
 
@@ -53,6 +59,18 @@ fn report_sweep_failures(span: &tracing::Span, metrics: &SharedMetrics, kind: &'
 		}
 	});
 	metrics.record_reconcile_failures(u64::try_from(failed.len()).unwrap_or(u64::MAX));
+}
+
+/// Record the aspects a sweep skipped because another maintenance operation held them:
+/// the tick span's `busy` field, and one `DEBUG` line each. A busy aspect is not a
+/// failure (it is maintained on a later tick), so it is not counted as one.
+fn report_busy_aspects(span: &tracing::Span, kind: &'static str, busy: &[String]) {
+	span.record("busy", busy.len());
+	span.in_scope(|| {
+		for aspect in busy {
+			tracing::debug!(sweep = kind, aspect = %aspect, "reconcile daemon: aspect busy with another maintenance operation; skipped this tick");
+		}
+	});
 }
 
 /// Configuration for the background reconcile daemon.
@@ -117,14 +135,15 @@ pub struct ReconcileDaemonConfig {
 /// Propagates a failure to list the store's aspects from
 /// [`SegmentStore::reconcile_all_over_threshold`](weftdb::SegmentStore::reconcile_all_over_threshold).
 pub async fn reconcile_tick(store: &SegmentStore, metrics: &SharedMetrics, threshold: usize) -> anyhow::Result<ReconcileSweep> {
-	let span = tracing::info_span!("reconcile.tick", kind = "threshold", threshold, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty);
-	let sweep = store.reconcile_all_over_threshold(threshold).instrument(span.clone()).await?;
+	let span = tracing::info_span!("reconcile.tick", kind = "threshold", threshold, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty, busy = tracing::field::Empty);
+	let sweep = store.reconcile_all_over_threshold(threshold, MaintenanceWait::Skip).instrument(span.clone()).await?;
 	span.record("aspects", sweep.aspects_reconciled);
 	span.record("segments", sweep.segments_reconciled);
 	if sweep.aspects_reconciled > 0 {
 		metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_reconciled).unwrap_or(u64::MAX));
 	}
 	report_sweep_failures(&span, metrics, "threshold", &sweep.failed);
+	report_busy_aspects(&span, "threshold", &sweep.busy);
 	Ok(sweep)
 }
 
@@ -145,14 +164,15 @@ pub async fn reconcile_tick(store: &SegmentStore, metrics: &SharedMetrics, thres
 /// Propagates a failure to list the store's aspects from
 /// [`SegmentStore::reconcile_all_hot_cold`](weftdb::SegmentStore::reconcile_all_hot_cold).
 pub async fn reconcile_tick_hot_cold(store: &SegmentStore, metrics: &SharedMetrics, threshold: usize) -> anyhow::Result<HotColdSweep> {
-	let span = tracing::info_span!("reconcile.tick", kind = "hot_cold", threshold, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty);
-	let sweep = store.reconcile_all_hot_cold(threshold).instrument(span.clone()).await?;
+	let span = tracing::info_span!("reconcile.tick", kind = "hot_cold", threshold, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty, busy = tracing::field::Empty);
+	let sweep = store.reconcile_all_hot_cold(threshold, MaintenanceWait::Skip).instrument(span.clone()).await?;
 	span.record("aspects", sweep.aspects_reconciled);
 	span.record("segments", sweep.segments_reconciled());
 	if sweep.aspects_reconciled > 0 {
 		metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_reconciled()).unwrap_or(u64::MAX));
 	}
 	report_sweep_failures(&span, metrics, "hot_cold", &sweep.failed);
+	report_busy_aspects(&span, "hot_cold", &sweep.busy);
 	Ok(sweep)
 }
 
@@ -171,14 +191,15 @@ pub async fn reconcile_tick_hot_cold(store: &SegmentStore, metrics: &SharedMetri
 /// Propagates a failure to list the store's aspects from
 /// [`SegmentStore::reconcile_all_overlaps`](weftdb::SegmentStore::reconcile_all_overlaps).
 pub async fn reconcile_tick_overlaps(store: &SegmentStore, metrics: &SharedMetrics) -> anyhow::Result<OverlapSweep> {
-	let span = tracing::info_span!("reconcile.tick", kind = "overlaps", aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty);
-	let sweep = store.reconcile_all_overlaps().instrument(span.clone()).await?;
+	let span = tracing::info_span!("reconcile.tick", kind = "overlaps", aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty, busy = tracing::field::Empty);
+	let sweep = store.reconcile_all_overlaps(MaintenanceWait::Skip).instrument(span.clone()).await?;
 	span.record("aspects", sweep.aspects_reconciled);
 	span.record("segments", sweep.segments_removed);
 	if sweep.aspects_reconciled > 0 {
 		metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_removed).unwrap_or(u64::MAX));
 	}
 	report_sweep_failures(&span, metrics, "overlaps", &sweep.failed);
+	report_busy_aspects(&span, "overlaps", &sweep.busy);
 	Ok(sweep)
 }
 
@@ -197,14 +218,15 @@ pub async fn reconcile_tick_overlaps(store: &SegmentStore, metrics: &SharedMetri
 /// Propagates a failure to list the store's aspects from
 /// [`SegmentStore::reconcile_all_overlaps_with_policy`](weftdb::SegmentStore::reconcile_all_overlaps_with_policy).
 pub async fn reconcile_tick_overlaps_with_policy(store: &SegmentStore, metrics: &SharedMetrics, min_split_bytes: u64) -> anyhow::Result<OverlapSweep> {
-	let span = tracing::info_span!("reconcile.tick", kind = "overlaps_split", min_split_bytes, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty);
-	let sweep = store.reconcile_all_overlaps_with_policy(weft_physical_type::SplitPolicy::new(min_split_bytes)).instrument(span.clone()).await?;
+	let span = tracing::info_span!("reconcile.tick", kind = "overlaps_split", min_split_bytes, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty, busy = tracing::field::Empty);
+	let sweep = store.reconcile_all_overlaps_with_policy(weft_physical_type::SplitPolicy::new(min_split_bytes), MaintenanceWait::Skip).instrument(span.clone()).await?;
 	span.record("aspects", sweep.aspects_reconciled);
 	span.record("segments", sweep.segments_removed);
 	if sweep.aspects_reconciled > 0 {
 		metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_removed).unwrap_or(u64::MAX));
 	}
 	report_sweep_failures(&span, metrics, "overlaps_split", &sweep.failed);
+	report_busy_aspects(&span, "overlaps_split", &sweep.busy);
 	Ok(sweep)
 }
 
@@ -225,14 +247,15 @@ pub async fn reconcile_tick_overlaps_with_policy(store: &SegmentStore, metrics: 
 /// Propagates a failure to list the store's aspects from
 /// [`SegmentStore::squash_all_over_threshold`](weftdb::SegmentStore::squash_all_over_threshold).
 pub async fn reconcile_tick_squash(store: &SegmentStore, metrics: &SharedMetrics, max_segments: usize) -> anyhow::Result<SquashSweep> {
-	let span = tracing::info_span!("reconcile.tick", kind = "squash", max_segments, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty);
-	let sweep = store.squash_all_over_threshold(max_segments).instrument(span.clone()).await?;
+	let span = tracing::info_span!("reconcile.tick", kind = "squash", max_segments, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty, busy = tracing::field::Empty);
+	let sweep = store.squash_all_over_threshold(max_segments, MaintenanceWait::Skip).instrument(span.clone()).await?;
 	span.record("aspects", sweep.aspects_squashed);
 	span.record("segments", sweep.segments_removed);
 	if sweep.aspects_squashed > 0 {
 		metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_squashed).unwrap_or(u64::MAX), u64::try_from(sweep.segments_removed).unwrap_or(u64::MAX));
 	}
 	report_sweep_failures(&span, metrics, "squash", &sweep.failed);
+	report_busy_aspects(&span, "squash", &sweep.busy);
 	Ok(sweep)
 }
 
@@ -254,16 +277,17 @@ pub async fn reconcile_tick_squash(store: &SegmentStore, metrics: &SharedMetrics
 /// Propagates a failure to list the store's aspects from
 /// [`SegmentStore::squash_all_to_target_rows_if_fragmented`](weftdb::SegmentStore::squash_all_to_target_rows_if_fragmented).
 pub async fn reconcile_tick_compact(store: &SegmentStore, metrics: &SharedMetrics, target_rows: usize) -> anyhow::Result<SquashSweep> {
-	let span = tracing::info_span!("reconcile.tick", kind = "compact", target_rows, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty);
+	let span = tracing::info_span!("reconcile.tick", kind = "compact", target_rows, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty, busy = tracing::field::Empty);
 	// The gated sweep: a converged aspect costs one O(1) rollup read per tick, not a full
 	// segment-index scan, so the 1s daemon does not churn the control plane on a tidy store.
-	let sweep = store.squash_all_to_target_rows_if_fragmented(target_rows).instrument(span.clone()).await?;
+	let sweep = store.squash_all_to_target_rows_if_fragmented(target_rows, MaintenanceWait::Skip).instrument(span.clone()).await?;
 	span.record("aspects", sweep.aspects_squashed);
 	span.record("segments", sweep.segments_removed);
 	if sweep.aspects_squashed > 0 {
 		metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_squashed).unwrap_or(u64::MAX), u64::try_from(sweep.segments_removed).unwrap_or(u64::MAX));
 	}
 	report_sweep_failures(&span, metrics, "compact", &sweep.failed);
+	report_busy_aspects(&span, "compact", &sweep.busy);
 	Ok(sweep)
 }
 

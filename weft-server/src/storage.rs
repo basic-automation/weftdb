@@ -79,6 +79,9 @@ pub enum StorageError {
 	NotFound(String),
 	/// A malformed request parameter (e.g. an unparseable value bound) → 400.
 	BadRequest(String),
+	/// The request conflicts with work in progress (another maintenance operation held
+	/// the aspect for longer than the request would wait) → 409; retry later.
+	Conflict(String),
 	/// An underlying read or serialization failure → 500.
 	Internal(String),
 }
@@ -95,6 +98,7 @@ impl IntoResponse for StorageError {
 			Self::Unconfigured => (StatusCode::SERVICE_UNAVAILABLE, "no segment store is configured on this server".to_string()),
 			Self::NotFound(message) => (StatusCode::NOT_FOUND, message),
 			Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
+			Self::Conflict(message) => (StatusCode::CONFLICT, message),
 			Self::Internal(message) => (StatusCode::INTERNAL_SERVER_ERROR, message),
 		};
 		(status, Json(ErrorBody { error })).into_response()

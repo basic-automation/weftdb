@@ -535,10 +535,15 @@ mod tests {
 
 	/// An error between the write and the fsync takes the same path as an fsync error
 	/// (the fsync is the next step on the same handle), so this covers both.
+	///
+	/// The point is one no store path ever reaches (no legacy ingest has 2^32 chunks): an
+	/// armed point is process-global, and arming one a store path passes, such as
+	/// `S-frame-written`, which every seal passes, would fail a seal running in another
+	/// test at the same moment.
 	#[tokio::test]
 	async fn write_new_durable_leaves_no_file_when_a_step_after_the_create_fails() {
 		let dir = tempfile::tempdir().unwrap();
-		let point = FaultPoint::SFrameWritten;
+		let point = FaultPoint::LChunk(u32::MAX);
 		let points = WritePoints { written: Some(point), ..WritePoints::NONE };
 		let armed = arm(point, FaultAction::ReturnErr);
 		let err = write_new_durable(&RealFs, dir.path(), "a~g1~p1.weftseg", frame(b"body"), SyncPolicy::Full, points).await.unwrap_err();

@@ -38,15 +38,16 @@
 //! the commit of the writer that won the conflict, so it is only safe for an op that
 //! re-checks, on that snapshot, what its caller decided from: [`IndexOp::InsertNew`],
 //! [`IndexOp::ReplaceExpected`] and [`IndexOp::DeleteExpected`] are guarded, and a race
-//! they lost turns into a [`TxnErrorKind::Conflict`] on the retry. The legacy
-//! [`IndexOp::Upsert`] and [`IndexOp::Delete`] are not: their callers chose the id from an
-//! earlier read (a seal's `MAX(id) + 1`, a reconcile's or a squash's member list), and a
-//! retry would replace or delete the row the winner just committed, then report success
-//! to both callers. So a transaction holding either of them is retried only when its
-//! conflict came before any op ran (a `Busy` at `BEGIN`, which used no snapshot), and is
-//! otherwise reported at its first conflict, as every segment-index write was before
-//! this type existed. The write-once protocols that replace those ops (S7-S9) get the
-//! retries.
+//! they lost turns into a [`TxnErrorKind::Conflict`] on the retry. [`IndexOp::SeqBump`]
+//! only ever raises the allocator row, so running it again over another writer's raise
+//! keeps the larger value. The legacy [`IndexOp::Upsert`] and [`IndexOp::Delete`] are not
+//! retry-safe: their callers chose the id from an earlier read (a reconcile's or a squash's
+//! member list), and a retry would replace or delete the row the winner just committed,
+//! then report success to both callers. So a transaction holding either of them is
+//! retried only when its conflict came before any op ran (a `Busy` at `BEGIN`, which used
+//! no snapshot), and is otherwise reported at its first conflict, as every segment-index
+//! write was before this type existed. Seals (`InsertNew` and `SeqBump`, since S7) get the
+//! retries, as will the write-once swaps that replace the maintenance ops (S8, S9).
 
 use std::{fmt, time::Duration};
 
@@ -117,7 +118,6 @@ pub struct RowVersion {
 pub enum IndexOp {
 	/// Insert a row whose `(aspect, id)` must be free: a plain `INSERT`, never
 	/// `OR REPLACE`. A taken key is a [`TxnErrorKind::Conflict`].
-	#[cfg_attr(not(test), expect(dead_code, reason = "seals switch to plain INSERT with the persistent allocator (S7)"))]
 	InsertNew { aspect: String, row: IndexRow },
 	/// Replace the row matching `expected` with `row`. Exactly one row must match.
 	#[cfg_attr(not(test), expect(dead_code, reason = "the maintenance swaps (S8, S9) replace their members with this"))]
@@ -132,6 +132,11 @@ pub enum IndexOp {
 	/// Delete the row with `(aspect, id)`, if any. Today's merge and squash semantics,
 	/// kept until S9 replaces them with [`DeleteExpected`](Self::DeleteExpected).
 	Delete { aspect: String, id: u64 },
+	/// Raise `aspect`'s persisted allocator (its `aspect_seq` row) to at least `next_id`
+	/// and `epoch`, creating the row if the aspect has none. Neither value ever moves
+	/// back, so a commit that used ids below `next_id` keeps them from being reissued
+	/// after a restart, whatever order such commits land in.
+	SeqBump { aspect: String, next_id: u64, epoch: u64 },
 }
 
 impl IndexOp {
@@ -140,7 +145,7 @@ impl IndexOp {
 	/// writer committed in between (see the module documentation).
 	const fn is_guarded(&self) -> bool {
 		match self {
-			Self::InsertNew { .. } | Self::ReplaceExpected { .. } | Self::DeleteExpected { .. } => true,
+			Self::InsertNew { .. } | Self::ReplaceExpected { .. } | Self::DeleteExpected { .. } | Self::SeqBump { .. } => true,
 			Self::Upsert { .. } | Self::Delete { .. } => false,
 		}
 	}
@@ -396,6 +401,12 @@ async fn apply(conn: &turso::Connection, op: &IndexOp) -> Result<u64, (TxnErrorK
 			expect_one(changed, "delete", aspect, *expected)
 		}
 		IndexOp::Delete { aspect, id } => conn.execute("DELETE FROM segment_index WHERE aspect = ? AND id = ?", vec![Value::Text(aspect.clone()), integer(*id)]).await.map_err(|e| statement_error(&format!("deleting {aspect:?} segment {id}"), &e)),
+		IndexOp::SeqBump { aspect, next_id, epoch } => {
+			// A new row's `next_gen` is 1: generation 0 names the legacy `{aspect}-{id}`
+			// frames, so no write-once frame may take it.
+			let sql = "INSERT INTO aspect_seq (aspect, next_id, next_gen, epoch) VALUES (?, ?, 1, ?) ON CONFLICT (aspect) DO UPDATE SET next_id = MAX(next_id, excluded.next_id), epoch = MAX(epoch, excluded.epoch)";
+			conn.execute(sql, vec![Value::Text(aspect.clone()), integer(*next_id), integer(*epoch)]).await.map_err(|e| statement_error(&format!("raising the {aspect:?} allocator to {next_id}"), &e))
+		}
 	}
 }
 
@@ -736,6 +747,35 @@ mod tests {
 			assert_eq!((applied.changes, applied.attempts, asks.into_inner()), (vec![1], 2, 1), "{what}: the first attempt failed at BEGIN and the retry committed");
 			assert_eq!(kept, ids, "{what}: the retry's op applied");
 		}
+	}
+
+	/// `SeqBump` creates an aspect's allocator row (with `next_gen` 1, past the legacy
+	/// generation 0) and only ever raises it: a bump below the recorded values changes
+	/// neither, and each aspect's row is its own. It is retry-safe, so a transaction of a
+	/// seal's ops (`InsertNew` and `SeqBump`) counts as guarded.
+	#[tokio::test]
+	async fn seq_bump_creates_and_only_ever_raises_the_allocator_row() {
+		let index = SegmentIndexStore::open_in_memory().await.expect("opens");
+		let bump = |aspect: &str, next_id: u64, epoch: u64| IndexTxn::new(vec![IndexOp::SeqBump { aspect: aspect.to_string(), next_id, epoch }]);
+		let empty = index.allocator_seed(ASPECT).await.expect("reads");
+		let mut seen = Vec::new();
+		for (next_id, epoch) in [(5, 2), (3, 1), (9, 0), (9, 4)] {
+			let applied = index.apply(&bump(ASPECT, next_id, epoch)).await.expect("bumps");
+			assert_eq!(applied.changes, vec![1], "bump to ({next_id}, {epoch})");
+			let seed = index.allocator_seed(ASPECT).await.expect("reads");
+			seen.push((seed.next_id, seed.epoch));
+		}
+		index.apply(&bump("other", 1, 0)).await.expect("bumps another aspect");
+		let other = index.allocator_seed("other").await.expect("reads");
+		let mut rows = index.database().connect().expect("connects").query("SELECT next_gen FROM aspect_seq WHERE aspect = ?", [Value::Text(ASPECT.to_string())]).await.expect("reads");
+		let next_gen = rows.next().await.expect("reads").expect("the row").get_value(0).expect("next_gen");
+		drop(rows);
+		drop(index);
+		assert_eq!(empty, crate::types::segment_index::AllocatorSeed::default(), "an aspect without a row has no persisted allocator");
+		assert_eq!(seen, vec![(Some(5), 2), (Some(5), 2), (Some(9), 2), (Some(9), 4)], "neither value moves back");
+		assert_eq!((other.next_id, other.epoch), (Some(1), 0), "each aspect has a row of its own");
+		assert_eq!(next_gen, Value::Integer(1));
+		assert!(IndexOp::SeqBump { aspect: ASPECT.to_string(), next_id: 0, epoch: 0 }.is_guarded() && insert(row(0, 0, None)).is_guarded(), "a seal's transaction is retried on a conflict");
 	}
 
 	/// Every column of every op round-trips: the write-once columns of a row written with

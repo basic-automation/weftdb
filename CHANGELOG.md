@@ -92,6 +92,37 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   same row still fails the call at once, as before: retrying it would replay it over
   the other writer's committed row. Only a database that is busy before the
   transaction starts is retried, up to five times with backoff.
+- **Segment ids come from a persistent per-aspect allocator** (crash-consistency design,
+  S7). A seal took `MAX(id) + 1` for its aspect; it now takes the next id of an
+  allocator that hands each id out once, writes its frame, and commits its row with a
+  plain `INSERT` (never `INSERT OR REPLACE`) together with the allocator's raise, which
+  is persisted in `segment_index.db`'s `aspect_seq` table. A deleted segment's id, even
+  the highest, is never reused, before or after a restart, and neither is the id of a
+  frame a seal wrote but crashed before committing: the allocator starts above every
+  `{aspect}-{id}.weftseg` (and `.weftpart`) name in `segments/`. Ids still grow, but no
+  longer as `MAX(id) + 1`: after a squash or merge deleted the highest segments, the
+  next seal's id leaves a gap. The suffixes that splits and split overlap merges create
+  take their ids from the same allocator. Each aspect's control-plane writes (a seal's
+  row and rollup fold, maintenance row rewrites and deletes, rollup rebuilds) take turns
+  under a per-aspect lock, so they no longer conflict with one another, and a seal's
+  index transaction is retried (up to five times) if anything else does conflict with it.
+- **Maintenance operations on one aspect take turns.** A reconcile, split, overlap
+  merge, squash or compaction now holds its aspect for its whole run. The HTTP
+  maintenance endpoints (`POST /api/v1/storage/{aspect}/reconcile`, `…/squash`,
+  `…/compact` and the store-wide `POST /api/v1/storage/reconcile`) wait up to 30 s for
+  an aspect another operation holds and then answer **`409 Conflict`**, naming it; the
+  store-wide sweep maintains the other aspects first. The background reconcile daemon
+  never waits: it skips a busy aspect until its next tick (logged at `DEBUG`, counted
+  in the tick span's `busy` field, not as a failed pass). ⚠️ Library API: the store-wide
+  sweeps (`reconcile_all_over_threshold`, `reconcile_all_hot_cold`,
+  `reconcile_all_overlaps`, `reconcile_all_overlaps_with_policy`,
+  `squash_all_over_threshold`, `squash_all_to_target_rows`,
+  `squash_all_to_target_rows_if_fragmented`) take a new last argument,
+  `MaintenanceWait::Skip` or `MaintenanceWait::Wait(duration)`, and their results gain
+  a `busy` list of the aspects they could not take. The per-aspect entry points keep
+  their signatures, wait up to `SegmentStore::maintenance_wait()` (30 s,
+  `DEFAULT_MAINTENANCE_WAIT`; change it with `with_maintenance_wait`), and then fail
+  with the new `MaintenanceBusy` error.
 
 ### Added
 
@@ -130,9 +161,42 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   that `GET /ready` reports a poisoned store:
   `cargo test -p weft-server --features fault-injection --test ready_poisoned`. Under
   that feature `SegmentStore` has a hidden `inject_poison` test hook.
+- `MaintenanceBusy`, `MaintenanceWait`, `DEFAULT_MAINTENANCE_WAIT`,
+  `SegmentStore::maintenance_wait` and `SegmentStore::with_maintenance_wait` (see the
+  maintenance entry under Changed), and `SegmentStore::index_conflicts()`, the number of
+  segment-index transaction attempts that lost an MVCC conflict since the store opened,
+  which stays at zero unless something outside the store contends for the index. Under
+  the `fault-injection` feature `SegmentStore` has a hidden `hold_maintenance` test hook,
+  used by `cargo test -p weft-server --features fault-injection --test maintenance_busy`.
+
+### Deprecated
+
+- `SegmentIndexStore::next_id` (`MAX(id) + 1`): it reissues the id of a deleted or
+  crashed segment and races concurrent callers. `SegmentStore` no longer uses it; it is
+  kept for tests.
 
 ### Fixed
 
+- **Concurrent seals of one aspect could lose an acknowledged batch.** Two seals that
+  ran at once took the same id: the later one's write replaced the earlier one's frame
+  and its row, so a batch whose seal had succeeded was gone, or one of the seals failed
+  with an MVCC write-write conflict. Every seal now gets an id of its own (see the
+  allocator entry under Changed).
+- **A seal could reuse the id of a deleted segment or overwrite a crashed seal's
+  frame.** After a squash or merge deleted an aspect's highest segment, the next seal
+  took its id again, so a seal racing the merge's unlink could lose its frame, and a
+  leftover sidecar of the deleted segment could be served for it. A seal that crashed
+  after writing its frame and before committing it left the frame behind, and the next
+  seal truncated it.
+- **A reconcile racing a squash or merge of the same aspect could bring a merged
+  segment back.** A reconcile that had read a segment wrote it back after the merge
+  had folded it into its target and deleted it, so its stale values outranked the
+  merged ones and its rows read twice. Maintenance operations on one aspect now take
+  turns (see Changed).
+- **Concurrent seals could leave the aspect's rollup (`metadata.db`) wrong**, missing
+  some of them, or fail after their row had committed: each folded itself in with an
+  unlocked read-then-write. The fold, and rollup rebuilds, now run under the aspect's
+  lock with the seal's commit.
 - **A segment store that was moved, restored into another root or mounted at another
   path could not read its frames.** The index records each frame by the absolute path
   it was written under, and every read opened that path. Reads now resolve it against

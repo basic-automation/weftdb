@@ -24,7 +24,10 @@ pub use pattern::{Pattern, PatternID};
 pub use pipeline::{DetectorMetadata, DetectorType, PipelineConfig, PipelineState};
 pub use relative::Relative;
 pub use segment_index::SegmentIndexStore;
-pub use segment_store::{AspectStorageStats, CheckpointPolicy, ControlPlaneBackup, HotColdReconcile, HotColdSweep, OverlapSweep, Poisoned, ReconcileSweep, SegmentStore, SquashSweep, StoreLocked, StoreStorageStats, TransposedPolicy, AMBIGUOUS_COMMIT_ENV, AMBIGUOUS_COMMIT_EXIT_CODE, DEFAULT_CHECKPOINT_MIN_ROWS};
+#[cfg(feature = "fault-injection")]
+#[doc(hidden)]
+pub use segment_store::MaintenanceHold;
+pub use segment_store::{AspectStorageStats, CheckpointPolicy, ControlPlaneBackup, HotColdReconcile, HotColdSweep, MaintenanceBusy, MaintenanceWait, OverlapSweep, Poisoned, ReconcileSweep, SegmentStore, SquashSweep, StoreLocked, StoreStorageStats, TransposedPolicy, AMBIGUOUS_COMMIT_ENV, AMBIGUOUS_COMMIT_EXIT_CODE, DEFAULT_CHECKPOINT_MIN_ROWS, DEFAULT_MAINTENANCE_WAIT};
 pub use signal::{Distance, ErrVal, Signal, SignalType, Signals};
 pub use subject::{Subject, SubjectId};
 pub use transaction::{Transaction, TxId};
@@ -32,6 +35,7 @@ pub use trend::Trend;
 
 pub mod aspect;
 pub mod aspect_catalog;
+pub(crate) mod aspect_locks;
 pub mod backup;
 pub mod batches;
 pub mod cache;

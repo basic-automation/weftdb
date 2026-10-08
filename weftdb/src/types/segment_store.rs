@@ -26,11 +26,24 @@
 //! [`AspectSchema::seal_paged`] — the read path dispatches on the recorded frame
 //! version, so a paged segment skips pages *within* the file too. The
 //! catalog/`metadata.db` registry is a later slice.
+//!
+//! **Concurrency** (docs/design/crash-consistency.md section 5.1, slice S7). Each aspect
+//! has two locks. Its *commit* lock is held around every control-plane transaction of the
+//! aspect and guards its id allocator: a seal takes its id from the allocator, writes its
+//! frame with the lock released, then inserts its row (a plain `INSERT`, which cannot
+//! replace another), raises the persisted allocator (`aspect_seq`) and folds the rollup
+//! under it again; maintenance row rewrites, member deletes and rollup rebuilds run under
+//! it too. So ids are never shared or reissued (not after a delete, a crash or a restart),
+//! and no rollup update is lost to a concurrent one. Its *maintenance* lock is held for a
+//! whole maintenance operation, so two never interleave on one aspect. A per-aspect
+//! maintenance entry point waits for it up to [`SegmentStore::maintenance_wait`] and then
+//! fails with [`MaintenanceBusy`]; a store-wide sweep skips or waits for a busy aspect as
+//! its [`MaintenanceWait`] says.
 
 use std::{
-	future::Future, path::{Component, Path, PathBuf}, sync::{
-		atomic::{AtomicBool, Ordering}, OnceLock
-	}
+	collections::HashMap, future::Future, path::{Component, Path, PathBuf}, sync::{
+		atomic::{AtomicBool, AtomicU64, Ordering}, OnceLock
+	}, time::Duration
 };
 
 use anyhow::{bail, Context, Result};
@@ -42,7 +55,7 @@ use weft_reduce::{Aggregation, Bucket, PartialReduction};
 
 use crate::{
 	types::{
-		durable::{
+		aspect_locks::{AspectLocks, AspectState, CommitGuard, MaintGuard}, durable::{
 			create_dir_all_durable, fault::{self, FaultPoint}, LockHolder, RealFs, RootLock, RootLockError, StoreFs, SyncPolicy, WritePoints
 		}, index_txn::{IndexOp, IndexRow, IndexTxn, IndexTxnError, TxnApplied, TxnErrorKind}
 	}, AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, PartialSidecar, PartialSidecarPolicy, SegmentIndexStore, SnapshotReport, SIDECAR_AGGREGATIONS
@@ -292,6 +305,76 @@ impl std::fmt::Display for Poisoned {
 
 impl std::error::Error for Poisoned {}
 
+/// How long a maintenance entry point waits for a busy aspect by default: 30 seconds.
+///
+/// A per-aspect maintenance entry point of a [`SegmentStore`] waits this long for an
+/// aspect another maintenance operation holds before it gives up with [`MaintenanceBusy`]
+/// (design section 5.3, M1), unless changed with [`SegmentStore::with_maintenance_wait`].
+pub const DEFAULT_MAINTENANCE_WAIT: Duration = Duration::from_secs(30);
+
+/// A maintenance operation on an aspect did not start because another one held the aspect
+/// for longer than the caller would wait.
+///
+/// Every maintenance operation (a reconcile, a split, an overlap merge, a squash, a
+/// compaction) holds its aspect's maintenance lock from its first read to its last write,
+/// so two of them never interleave on one aspect: a reconcile that had read a segment
+/// could otherwise write it back after a squash had merged it away, bringing back a
+/// member's stale rows. A per-aspect entry point waits for the lock up to
+/// [`SegmentStore::maintenance_wait`] and then fails with this error, having read and
+/// written nothing; try again once the other operation is done. `weft-server` answers it
+/// with `409 Conflict`. It arrives inside an [`anyhow::Error`];
+/// `downcast_ref::<MaintenanceBusy>()` recovers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaintenanceBusy {
+	/// The aspect another maintenance operation held.
+	pub aspect: String,
+	/// How long the caller waited for it.
+	pub waited: Duration,
+}
+
+impl std::fmt::Display for MaintenanceBusy {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "aspect {:?} is busy with another maintenance operation (waited {:?} for it); retry once that operation finishes", self.aspect, self.waited)
+	}
+}
+
+impl std::error::Error for MaintenanceBusy {}
+
+/// An aspect's maintenance lock, held by [`SegmentStore::hold_maintenance`] until it drops.
+#[cfg(feature = "fault-injection")]
+#[doc(hidden)]
+pub struct MaintenanceHold {
+	/// Held for its drop, which releases the lock.
+	_held: MaintGuard,
+}
+
+/// How a store-wide maintenance sweep treats an aspect another operation holds.
+///
+/// Maintenance operations on one aspect take turns (see [`MaintenanceBusy`]). Either way,
+/// an aspect the sweep could not take is left as it is and listed in the sweep's `busy`
+/// field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintenanceWait {
+	/// Pass over it at once. What a background daemon wants: a tick never queues behind
+	/// an operator's request or a long pass, and the next tick tries the aspect again.
+	Skip,
+	/// Wait for it, up to this long in all, for the whole sweep rather than per aspect.
+	/// What an operator's request wants: it waits out a daemon pass in progress instead
+	/// of leaving the aspect unmaintained.
+	Wait(Duration),
+}
+
+impl MaintenanceWait {
+	/// When a sweep that starts now stops waiting for busy aspects; `None` for
+	/// [`Skip`](Self::Skip).
+	fn deadline(self) -> Option<tokio::time::Instant> {
+		match self {
+			Self::Skip => None,
+			Self::Wait(wait) => Some(tokio::time::Instant::now() + wait),
+		}
+	}
+}
+
 /// What a store does once a COMMIT is ambiguous; see [`AMBIGUOUS_COMMIT_ENV`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OnAmbiguousCommit {
@@ -371,6 +454,41 @@ fn resolve_frame_path(root: &Path, stored: &str) -> PathBuf {
 	tail.iter().fold(root.join("segments"), |path, component| path.join(component))
 }
 
+/// The [`IndexOp::SeqBump`] that persists the allocator `commit` holds for `aspect`: past
+/// every id handed out so far, including those of seals still writing their frames.
+fn seq_bump(aspect: &str, commit: &CommitGuard) -> IndexOp {
+	let state = commit.state();
+	IndexOp::SeqBump { aspect: aspect.to_string(), next_id: state.next_id, epoch: state.epoch }
+}
+
+/// The aspect and id a legacy-named file carries: a frame `{aspect}-{id}.weftseg` or its
+/// sidecar `{aspect}-{id}.weftpart`. The id is the digits after the last `-`, so an aspect
+/// name that itself contains `-` still parses exactly. `None` for any other name.
+fn legacy_file_id(name: &str) -> Option<(&str, u64)> {
+	let stem = name.strip_suffix(".weftseg").or_else(|| name.strip_suffix(".weftpart"))?;
+	let (aspect, id) = stem.rsplit_once('-')?;
+	if aspect.is_empty() || id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+		return None;
+	}
+	Some((aspect, id.parse().ok()?))
+}
+
+/// The largest id each aspect's legacy-named files directly under `segments` carry (see
+/// [`legacy_file_id`]). A sidecar counts as well as a frame: one left behind by a deleted
+/// segment would otherwise match the frame of a seal that reused its id.
+async fn legacy_file_ids(segments: PathBuf) -> Result<HashMap<String, u64>> {
+	let mut ids: HashMap<String, u64> = HashMap::new();
+	let mut entries = tokio::fs::read_dir(&segments).await.with_context(|| format!("listing {}", segments.display()))?;
+	while let Some(entry) = entries.next_entry().await.with_context(|| format!("listing {}", segments.display()))? {
+		let name = entry.file_name();
+		if let Some((aspect, id)) = name.to_str().and_then(legacy_file_id) {
+			let max = ids.entry(aspect.to_string()).or_insert(id);
+			*max = (*max).max(id);
+		}
+	}
+	Ok(ids)
+}
+
 pub struct SegmentStore {
 	/// The store root; sealed frames live in `root/segments/`.
 	root: PathBuf,
@@ -406,6 +524,21 @@ pub struct SegmentStore {
 	poison: StorePoison,
 	/// Whether an ambiguous COMMIT poisons the store or exits the process.
 	on_ambiguous: OnAmbiguousCommit,
+	/// Each aspect's commit lock (around every control-plane transaction of the aspect,
+	/// guarding its id allocator) and maintenance lock (around a whole maintenance
+	/// operation); see `aspect_locks`.
+	locks: AspectLocks,
+	/// The largest id each aspect's legacy-named files in `segments/` carry, read once,
+	/// when the first allocator is seeded. Every id handed out after that comes from an
+	/// allocator seeded above it, so the one listing stays a valid floor for an aspect
+	/// seeded later.
+	legacy_ids: tokio::sync::OnceCell<HashMap<String, u64>>,
+	/// How long a per-aspect maintenance entry point waits for an aspect another
+	/// maintenance operation holds.
+	maintenance_wait: Duration,
+	/// Segment-index transaction attempts that lost an MVCC conflict; see
+	/// [`index_conflicts`](SegmentStore::index_conflicts).
+	index_conflicts: AtomicU64,
 	/// The root's `LOCK`, held for the store's lifetime. Declared last so that it drops
 	/// last: the next opener cannot take the root while a database above is still
 	/// closing.
@@ -566,7 +699,7 @@ impl SegmentStore {
 		let checkpoints = CheckpointPolicy::from_env();
 		let partials = PartialSidecarPolicy::from_env();
 		let transposed = TransposedPolicy::from_env();
-		Ok(Self { root, index, metadata, catalog, registry, database: database.to_string(), subject: subject.to_string(), checkpoints, partials, transposed, poison: StorePoison::default(), on_ambiguous: OnAmbiguousCommit::from_env(), _root_lock: root_lock })
+		Ok(Self { root, index, metadata, catalog, registry, database: database.to_string(), subject: subject.to_string(), checkpoints, partials, transposed, poison: StorePoison::default(), on_ambiguous: OnAmbiguousCommit::from_env(), locks: AspectLocks::default(), legacy_ids: tokio::sync::OnceCell::new(), maintenance_wait: DEFAULT_MAINTENANCE_WAIT, index_conflicts: AtomicU64::new(0), _root_lock: root_lock })
 	}
 
 	/// The store's write poison, or `None` while it accepts writes.
@@ -590,6 +723,21 @@ impl SegmentStore {
 	#[doc(hidden)]
 	pub fn inject_poison(&self, reason: impl Into<String>) {
 		self.poison.set(reason.into());
+	}
+
+	/// Hold `aspect`'s maintenance lock until the returned guard drops, as a maintenance
+	/// operation in progress would, without running one. The hook for tests of the layers
+	/// above (`weft-server`'s `409 Conflict` and its daemon's skip), which cannot reach the
+	/// lock; only `fault-injection` builds have it.
+	///
+	/// # Errors
+	///
+	/// [`MaintenanceBusy`] if another operation holds the aspect for longer than
+	/// [`maintenance_wait`](Self::maintenance_wait).
+	#[cfg(feature = "fault-injection")]
+	#[doc(hidden)]
+	pub async fn hold_maintenance(&self, aspect: &str) -> Result<MaintenanceHold> {
+		Ok(MaintenanceHold { _held: self.maintain(aspect).await? })
 	}
 
 	/// Refuse a write while the store is poisoned. Every write entry point calls this
@@ -617,7 +765,18 @@ impl SegmentStore {
 	/// retry a conflict; otherwise the transaction's [`IndexTxnError`].
 	pub(crate) async fn commit_index(&self, txn: &IndexTxn) -> Result<TxnApplied> {
 		self.writable()?;
-		match self.index.apply_while(txn, || self.poison.get().is_none()).await {
+		let result = self.index.apply_while(txn, || self.poison.get().is_none()).await;
+		// Every attempt before the last lost a conflict, and so did the last one when the
+		// conflict is what the transaction failed with.
+		let lost = match &result {
+			Ok(applied) => applied.attempts.saturating_sub(1),
+			Err(e) if e.kind == TxnErrorKind::Retryable => e.attempts,
+			Err(e) => e.attempts.saturating_sub(1),
+		};
+		if lost > 0 {
+			self.index_conflicts.fetch_add(u64::from(lost), Ordering::Relaxed);
+		}
+		match result {
 			Ok(applied) => Ok(applied),
 			Err(e) => {
 				if e.is_ambiguous() {
@@ -649,18 +808,121 @@ impl SegmentStore {
 		}
 	}
 
-	/// Record `descriptor` as `aspect`'s legacy row (generation 0), replacing any row with
-	/// its id: a seal or an in-place rewrite.
-	async fn put_descriptor(&self, aspect: &str, descriptor: &SegmentDescriptor) -> Result<()> {
-		let txn = IndexTxn::new(vec![IndexOp::Upsert { aspect: aspect.to_string(), row: IndexRow::legacy(descriptor.clone()) }]);
-		self.commit_index(&txn).await?;
+	/// How many segment-index transaction attempts have lost an MVCC conflict (or found
+	/// the database busy) since this store opened, whether the transaction was then
+	/// retried or failed.
+	///
+	/// The store's own writers do not conflict with each other: the writers of one aspect
+	/// take turns under its commit lock, and those of different aspects touch different
+	/// rows. So this stays at zero unless something else contends for
+	/// `segment_index.db`, and a count that rises is a conflict nothing explains.
+	#[must_use]
+	pub fn index_conflicts(&self) -> u64 {
+		self.index_conflicts.load(Ordering::Relaxed)
+	}
+
+	/// How long a per-aspect maintenance entry point waits for an aspect another
+	/// maintenance operation holds before it fails with [`MaintenanceBusy`]
+	/// ([`DEFAULT_MAINTENANCE_WAIT`] unless changed with
+	/// [`with_maintenance_wait`](Self::with_maintenance_wait)).
+	#[must_use]
+	pub const fn maintenance_wait(&self) -> Duration {
+		self.maintenance_wait
+	}
+
+	/// Override how long a per-aspect maintenance entry point waits for a busy aspect; see
+	/// [`maintenance_wait`](Self::maintenance_wait). `Duration::ZERO` makes it take the
+	/// aspect only if it is free.
+	#[must_use]
+	pub const fn with_maintenance_wait(mut self, wait: Duration) -> Self {
+		self.maintenance_wait = wait;
+		self
+	}
+
+	/// Take `aspect`'s commit lock, seeding its id allocator the first time.
+	async fn commit_lock(&self, aspect: &str) -> Result<CommitGuard> {
+		self.locks.commit(aspect, || self.seed_allocator(aspect)).await
+	}
+
+	/// Where `aspect`'s id allocator starts: above every id it can have used, which is the
+	/// largest of its persisted `aspect_seq.next_id`, one past its largest indexed id, and
+	/// one past the largest id a legacy-named file of it in `segments/` carries. The last
+	/// covers a frame whose seal crashed before committing it, which nothing in the index
+	/// records.
+	async fn seed_allocator(&self, aspect: &str) -> Result<AspectState> {
+		let seed = self.index.allocator_seed(aspect).await?;
+		let legacy = self.legacy_ids.get_or_try_init(|| legacy_file_ids(self.root.join("segments"))).await?.get(aspect).copied();
+		let past = |id: Option<u64>| id.map_or(0, |id| id.saturating_add(1));
+		let next_id = seed.next_id.unwrap_or(0).max(past(seed.max_id)).max(past(legacy));
+		Ok(AspectState { next_id, epoch: seed.epoch })
+	}
+
+	/// Hand out a segment id for `aspect` that no segment, live or deleted, and no frame
+	/// on disk has had, and that will never be handed out again, even if the caller never
+	/// commits it.
+	async fn allocate_id(&self, aspect: &str) -> Result<u64> {
+		self.commit_lock(aspect).await?.allocate()
+	}
+
+	/// Take `aspect`'s maintenance lock for a per-aspect maintenance entry point, waiting
+	/// up to [`maintenance_wait`](Self::maintenance_wait).
+	async fn maintain(&self, aspect: &str) -> Result<MaintGuard> {
+		match self.locks.maint_within(aspect, self.maintenance_wait).await {
+			Some(held) => Ok(held),
+			None => Err(MaintenanceBusy { aspect: aspect.to_string(), waited: self.maintenance_wait }.into()),
+		}
+	}
+
+	/// Take `aspect`'s maintenance lock for a store-wide sweep: at once or not at all with
+	/// no `deadline` ([`MaintenanceWait::Skip`]), else waiting until `deadline`.
+	async fn sweep_maintain(&self, aspect: &str, deadline: Option<tokio::time::Instant>) -> Option<MaintGuard> {
+		match deadline {
+			None => self.locks.try_maint(aspect),
+			Some(deadline) => self.locks.maint_within(aspect, deadline.saturating_duration_since(tokio::time::Instant::now())).await,
+		}
+	}
+
+	/// Commit a freshly sealed frame's row (generation 0) under `aspect`'s commit lock:
+	/// a plain insert of its allocated id, which no other row can hold, with the
+	/// persisted allocator raised past it in the same transaction; then, under the same
+	/// lock, fold it into the rollup, which no other writer of the aspect can be reading
+	/// or writing meanwhile.
+	async fn publish_seal(&self, aspect: &str, descriptor: &SegmentDescriptor) -> Result<()> {
+		let commit = self.commit_lock(aspect).await?;
+		self.commit_index(&IndexTxn::new(vec![IndexOp::InsertNew { aspect: aspect.to_string(), row: IndexRow::legacy(descriptor.clone()) }, seq_bump(aspect, &commit)])).await?;
+		self.metadata.record_seal(aspect, descriptor).await?;
+		drop(commit);
 		Ok(())
 	}
 
-	/// Remove `aspect`'s row for segment `id`, if there is one.
+	/// Commit the row (generation 0) of a maintenance output that took a freshly
+	/// allocated id, a split suffix, under `aspect`'s commit lock: a plain insert with the
+	/// persisted allocator raised past it, as a seal commits. The caller rebuilds the
+	/// rollup once its operation is done.
+	async fn insert_descriptor(&self, aspect: &str, descriptor: &SegmentDescriptor) -> Result<()> {
+		let commit = self.commit_lock(aspect).await?;
+		self.commit_index(&IndexTxn::new(vec![IndexOp::InsertNew { aspect: aspect.to_string(), row: IndexRow::legacy(descriptor.clone()) }, seq_bump(aspect, &commit)])).await?;
+		drop(commit);
+		Ok(())
+	}
+
+	/// Record `descriptor` as `aspect`'s legacy row (generation 0) under the aspect's
+	/// commit lock, replacing any row with its id: an in-place rewrite by maintenance.
+	async fn put_descriptor(&self, aspect: &str, descriptor: &SegmentDescriptor) -> Result<()> {
+		let commit = self.commit_lock(aspect).await?;
+		let txn = IndexTxn::new(vec![IndexOp::Upsert { aspect: aspect.to_string(), row: IndexRow::legacy(descriptor.clone()) }]);
+		self.commit_index(&txn).await?;
+		drop(commit);
+		Ok(())
+	}
+
+	/// Remove `aspect`'s row for segment `id`, if there is one, under the aspect's commit
+	/// lock.
 	async fn remove_descriptor(&self, aspect: &str, id: u64) -> Result<()> {
+		let commit = self.commit_lock(aspect).await?;
 		let txn = IndexTxn::new(vec![IndexOp::Delete { aspect: aspect.to_string(), id }]);
 		self.commit_index(&txn).await?;
+		drop(commit);
 		Ok(())
 	}
 
@@ -1079,8 +1341,14 @@ impl SegmentStore {
 
 	/// Write a freshly sealed segment to disk and record its descriptor. Shared by
 	/// the dense and nullable seal paths.
+	///
+	/// The id comes from the aspect's allocator, under its commit lock, so concurrent seals
+	/// never share an id or a frame name, and no seal takes the id of a deleted segment or
+	/// of a frame a crashed seal left behind. The frame is written outside the lock, so
+	/// seals of one aspect write their frames in parallel; the row, the allocator's raise
+	/// and the rollup fold then commit under it ([`publish_seal`](Self::publish_seal)).
 	async fn persist(&self, aspect: &str, segment: &Segment) -> Result<SegmentDescriptor> {
-		let id = self.index.next_id(aspect).await?;
+		let id = self.allocate_id(aspect).await?;
 		// Both opt-in layouts are applied here: the timestamp checkpoint index only when
 		// configured AND the segment's shape actually benefits (sorted + irregular + big
 		// enough), and the transposed value codec only when configured AND within its overhead
@@ -1089,9 +1357,9 @@ impl SegmentStore {
 		let bytes = segment.write_to_with(&self.frame_options(segment.stats.row_count, segment.benefits_from_checkpoints(), segment.checkpoint_codec_overhead()));
 		let path = self.segment_path(aspect, id);
 		tokio::fs::write(&path, &bytes).await.with_context(|| format!("writing segment {}", path.display()))?;
+		fault::hit(FaultPoint::SFrameWritten).await?;
 		let descriptor = SegmentDescriptor::of_segment(id, path.to_string_lossy().into_owned(), bytes.len() as u64, segment);
-		self.put_descriptor(aspect, &descriptor).await?;
-		self.metadata.record_seal(aspect, &descriptor).await?;
+		self.publish_seal(aspect, &descriptor).await?;
 		// Per-segment partial sidecar (opt-in) — a pure read accelerator, so decode only
 		// when the policy actually wants one, and never fail the seal on a sidecar error.
 		if self.partials.base_for(segment.stats.row_count).is_some() {
@@ -1104,17 +1372,18 @@ impl SegmentStore {
 	}
 
 	/// Write a freshly sealed **paged** segment to disk (format-version-3 frame) and
-	/// record its descriptor. The paged analogue of [`persist`](SegmentStore::persist).
+	/// record its descriptor. The paged analogue of [`persist`](SegmentStore::persist), with
+	/// the same id allocation and commit.
 	async fn persist_paged(&self, aspect: &str, segment: &PagedSegment) -> Result<SegmentDescriptor> {
-		let id = self.index.next_id(aspect).await?;
+		let id = self.allocate_id(aspect).await?;
 		// As `persist`, though the checkpoint win is far smaller here — page pruning already
 		// bounds a probe's decode to `rows_per_page`.
 		let bytes = segment.write_to_with(&self.frame_options(segment.stats.row_count, segment.benefits_from_checkpoints(), segment.checkpoint_codec_overhead()));
 		let path = self.segment_path(aspect, id);
 		tokio::fs::write(&path, &bytes).await.with_context(|| format!("writing segment {}", path.display()))?;
+		fault::hit(FaultPoint::SFrameWritten).await?;
 		let descriptor = SegmentDescriptor::of_paged_segment(id, path.to_string_lossy().into_owned(), bytes.len() as u64, segment);
-		self.put_descriptor(aspect, &descriptor).await?;
-		self.metadata.record_seal(aspect, &descriptor).await?;
+		self.publish_seal(aspect, &descriptor).await?;
 		// As `persist`: opt-in per-segment partial sidecar, never failing the seal.
 		if self.partials.base_for(segment.stats.row_count).is_some() {
 			let (ts, vs) = segment.decode_nullable();
@@ -1447,8 +1716,18 @@ impl SegmentStore {
 	///
 	/// Returns an error if `aspect` has no declared schema or no segment `id`;
 	/// propagates a filesystem/read error, a re-seal failure, or a libSQL failure.
+	/// A [`MaintenanceBusy`] error if another maintenance operation holds the aspect for
+	/// longer than [`maintenance_wait`](Self::maintenance_wait).
 	pub async fn reconcile_segment(&self, aspect: &str, id: u64) -> Result<bool> {
 		self.writable()?;
+		let held = self.maintain(aspect).await?;
+		self.reconcile_segment_held(&held, id).await
+	}
+
+	/// [`reconcile_segment`](Self::reconcile_segment) under the maintenance lock `held`.
+	async fn reconcile_segment_held(&self, held: &MaintGuard, id: u64) -> Result<bool> {
+		self.writable()?;
+		let aspect = held.aspect();
 		let descriptor = self.index.all(aspect).await?.into_iter().find(|d| d.id == id).ok_or_else(|| anyhow::anyhow!("aspect {aspect:?} has no segment {id}"))?;
 		if descriptor.time_sorted {
 			return Ok(false);
@@ -1470,6 +1749,7 @@ impl SegmentStore {
 		let mut rows: Vec<(i64, Option<BigDecimal>)> = timestamps.into_iter().zip(values).collect();
 		rows.sort_by_key(|(t, _)| *t);
 		let (sorted_ts, sorted_vs): (Vec<i64>, Vec<Option<BigDecimal>>) = rows.into_iter().unzip();
+		fault::hit(FaultPoint::MPlanned).await?;
 		// Re-seal the sorted rows in the original frame kind, to the same id/file.
 		let path = self.segment_path(aspect, id);
 		let new_descriptor = if let Some(rows_per_page) = rows_per_page {
@@ -1494,15 +1774,37 @@ impl SegmentStore {
 	}
 
 	/// Re-seal a nullable `(timestamps, values)` batch into the `.weftseg` file for
-	/// `aspect`/`id`, in the frame kind selected by `rows_per_page` (`Some` → paged,
-	/// `None` → single-block), recording the new descriptor in the control-plane index.
+	/// `aspect`'s existing segment `id`, in the frame kind selected by `rows_per_page`
+	/// (`Some` → paged, `None` → single-block), replacing its descriptor in the
+	/// control-plane index.
 	///
-	/// The write-half shared by the split path: [`reconcile_segment`] inlines the same
-	/// logic against a single id, this one targets an arbitrary id so a split can write
-	/// its prefix and suffix through one code path. It does **not** touch the
-	/// materialized rollup — a caller that changes the segment set rebuilds it once at
-	/// the end.
+	/// The write-half shared by the split and merge paths: [`reconcile_segment`] inlines
+	/// the same logic against a single id. It does **not** touch the materialized rollup —
+	/// a caller that changes the segment set rebuilds it once at the end. A new segment
+	/// (a split suffix) goes through [`reseal_nullable_fresh`](Self::reseal_nullable_fresh)
+	/// instead.
 	async fn reseal_nullable_at(&self, aspect: &str, schema: &AspectSchema, id: u64, timestamps: &[i64], values: &[Option<BigDecimal>], rows_per_page: Option<usize>) -> Result<SegmentDescriptor> {
+		let descriptor = self.write_resealed(aspect, schema, id, timestamps, values, rows_per_page).await?;
+		self.put_descriptor(aspect, &descriptor).await?;
+		// Keep the sidecar consistent with the freshly written bytes at this id.
+		self.refresh_sidecar_after_rewrite(aspect, &descriptor, timestamps.to_vec(), values.to_vec()).await;
+		Ok(descriptor)
+	}
+
+	/// [`reseal_nullable_at`](Self::reseal_nullable_at) for a new segment: `id` comes
+	/// from [`allocate_id`](Self::allocate_id), and its row is inserted, never replacing
+	/// one, with the allocator raised past it.
+	async fn reseal_nullable_fresh(&self, aspect: &str, schema: &AspectSchema, id: u64, timestamps: &[i64], values: &[Option<BigDecimal>], rows_per_page: Option<usize>) -> Result<SegmentDescriptor> {
+		let descriptor = self.write_resealed(aspect, schema, id, timestamps, values, rows_per_page).await?;
+		self.insert_descriptor(aspect, &descriptor).await?;
+		self.refresh_sidecar_after_rewrite(aspect, &descriptor, timestamps.to_vec(), values.to_vec()).await;
+		Ok(descriptor)
+	}
+
+	/// Seal a nullable `(timestamps, values)` batch in the frame kind `rows_per_page`
+	/// selects and write it to the `.weftseg` file for `aspect`/`id`, returning its
+	/// descriptor; nothing is indexed.
+	async fn write_resealed(&self, aspect: &str, schema: &AspectSchema, id: u64, timestamps: &[i64], values: &[Option<BigDecimal>], rows_per_page: Option<usize>) -> Result<SegmentDescriptor> {
 		let path = self.segment_path(aspect, id);
 		let descriptor = if let Some(rows_per_page) = rows_per_page {
 			let segment = schema.seal_paged_nullable(timestamps, values, rows_per_page).map_err(|e| anyhow::anyhow!("split re-seal failed: {e}"))?;
@@ -1515,9 +1817,6 @@ impl SegmentStore {
 			tokio::fs::write(&path, &new_bytes).await.with_context(|| format!("writing split segment {}", path.display()))?;
 			SegmentDescriptor::of_segment(id, path.to_string_lossy().into_owned(), new_bytes.len() as u64, &segment)
 		};
-		self.put_descriptor(aspect, &descriptor).await?;
-		// Keep the sidecar consistent with the freshly written bytes at this id.
-		self.refresh_sidecar_after_rewrite(aspect, &descriptor, timestamps.to_vec(), values.to_vec()).await;
 		Ok(descriptor)
 	}
 
@@ -1556,8 +1855,18 @@ impl SegmentStore {
 	/// is **not time-sorted** (split requires a sorted segment — reconcile it first, so
 	/// the [`split_index`] precondition holds), or propagates a filesystem/decode/re-seal/
 	/// libSQL failure.
+	/// A [`MaintenanceBusy`] error if another maintenance operation holds the aspect for
+	/// longer than [`maintenance_wait`](Self::maintenance_wait).
 	pub async fn split_segment(&self, aspect: &str, id: u64, boundary: i64) -> Result<Option<u64>> {
 		self.writable()?;
+		let held = self.maintain(aspect).await?;
+		self.split_segment_held(&held, id, boundary).await
+	}
+
+	/// [`split_segment`](Self::split_segment) under the maintenance lock `held`.
+	async fn split_segment_held(&self, held: &MaintGuard, id: u64, boundary: i64) -> Result<Option<u64>> {
+		self.writable()?;
+		let aspect = held.aspect();
 		let descriptor = self.index.all(aspect).await?.into_iter().find(|d| d.id == id).ok_or_else(|| anyhow::anyhow!("aspect {aspect:?} has no segment {id}"))?;
 		if !descriptor.time_sorted {
 			return Err(anyhow::anyhow!("segment {id} of aspect {aspect:?} is out of order; reconcile it before splitting"));
@@ -1583,9 +1892,10 @@ impl SegmentStore {
 		let (prefix_ts, suffix_ts) = timestamps.split_at(k);
 		let (prefix_vs, suffix_vs) = values.split_at(k);
 		// Suffix first (new id), then rewrite the prefix in place: a crash between the
-		// two duplicates rows rather than dropping them.
-		let suffix_id = self.index.next_id(aspect).await?;
-		self.reseal_nullable_at(aspect, &schema, suffix_id, suffix_ts, suffix_vs, rows_per_page).await?;
+		// two duplicates rows rather than dropping them. The suffix's id comes from the
+		// allocator seals use, so it is never one a seal or a deleted segment had.
+		let suffix_id = self.allocate_id(aspect).await?;
+		self.reseal_nullable_fresh(aspect, &schema, suffix_id, suffix_ts, suffix_vs, rows_per_page).await?;
 		self.reseal_nullable_at(aspect, &schema, id, prefix_ts, prefix_vs, rows_per_page).await?;
 		// A split turns one segment into two; the O(1) rollup fold would miscount, so
 		// rebuild it from the durable index.
@@ -1607,10 +1917,17 @@ impl SegmentStore {
 	/// As [`reconcile_segment`](SegmentStore::reconcile_segment).
 	pub async fn reconcile_aspect(&self, aspect: &str) -> Result<usize> {
 		self.writable()?;
-		let unsorted_ids: Vec<u64> = self.index.all(aspect).await?.into_iter().filter(|d| !d.time_sorted).map(|d| d.id).collect();
+		let held = self.maintain(aspect).await?;
+		self.reconcile_aspect_held(&held).await
+	}
+
+	/// [`reconcile_aspect`](Self::reconcile_aspect) under the maintenance lock `held`.
+	async fn reconcile_aspect_held(&self, held: &MaintGuard) -> Result<usize> {
+		self.writable()?;
+		let unsorted_ids: Vec<u64> = self.index.all(held.aspect()).await?.into_iter().filter(|d| !d.time_sorted).map(|d| d.id).collect();
 		let mut reconciled = 0;
 		for id in unsorted_ids {
-			if self.reconcile_segment(aspect, id).await? {
+			if self.reconcile_segment_held(held, id).await? {
 				reconciled += 1;
 			}
 		}
@@ -1648,12 +1965,20 @@ impl SegmentStore {
 	/// index read behind the backlog count.
 	pub async fn reconcile_aspect_if_unsorted_exceeds(&self, aspect: &str, threshold: usize) -> Result<Option<usize>> {
 		self.writable()?;
+		let held = self.maintain(aspect).await?;
+		self.reconcile_aspect_if_unsorted_exceeds_held(&held, threshold).await
+	}
+
+	/// [`reconcile_aspect_if_unsorted_exceeds`](Self::reconcile_aspect_if_unsorted_exceeds)
+	/// under the maintenance lock `held`.
+	async fn reconcile_aspect_if_unsorted_exceeds_held(&self, held: &MaintGuard, threshold: usize) -> Result<Option<usize>> {
+		self.writable()?;
 		let threshold = threshold.max(1);
-		let unsorted = self.index.load_index(aspect).await?.unsorted_count();
+		let unsorted = self.index.load_index(held.aspect()).await?.unsorted_count();
 		if unsorted < threshold {
 			return Ok(None);
 		}
-		Ok(Some(self.reconcile_aspect(aspect).await?))
+		Ok(Some(self.reconcile_aspect_held(held).await?))
 	}
 
 	/// **Store-wide threshold sweep** (roadmap Phase 4.6): apply the
@@ -1671,17 +1996,24 @@ impl SegmentStore {
 	/// A per-aspect failure (as [`reconcile_aspect_if_unsorted_exceeds`](SegmentStore::reconcile_aspect_if_unsorted_exceeds))
 	/// is recorded in [`ReconcileSweep::failed`] and the sweep continues with the next
 	/// aspect, so one bad aspect cannot stall maintenance of every aspect after it.
+	/// An aspect another maintenance operation holds is skipped or waited for as `wait`
+	/// says, and listed in [`ReconcileSweep::busy`] if the sweep could not take it.
 	///
 	/// # Errors
 	///
 	/// Propagates only the aspect-list read; per-aspect failures are reported in
 	/// [`ReconcileSweep::failed`].
-	pub async fn reconcile_all_over_threshold(&self, threshold: usize) -> Result<ReconcileSweep> {
+	pub async fn reconcile_all_over_threshold(&self, threshold: usize, wait: MaintenanceWait) -> Result<ReconcileSweep> {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
+		let deadline = wait.deadline();
 		let mut sweep = ReconcileSweep { aspects_scanned: aspects.len(), ..ReconcileSweep::default() };
 		for aspect in &aspects {
-			match self.reconcile_aspect_if_unsorted_exceeds(aspect, threshold).await {
+			let Some(held) = self.sweep_maintain(aspect, deadline).await else {
+				sweep.busy.push(aspect.clone());
+				continue;
+			};
+			match self.reconcile_aspect_if_unsorted_exceeds_held(&held, threshold).await {
 				Ok(Some(reconciled)) => {
 					sweep.aspects_reconciled += 1;
 					sweep.segments_reconciled += reconciled;
@@ -1726,8 +2058,16 @@ impl SegmentStore {
 	/// index read behind the segment list.
 	pub async fn reconcile_aspect_hot_cold(&self, aspect: &str, threshold: usize) -> Result<HotColdReconcile> {
 		self.writable()?;
+		let held = self.maintain(aspect).await?;
+		self.reconcile_aspect_hot_cold_held(&held, threshold).await
+	}
+
+	/// [`reconcile_aspect_hot_cold`](Self::reconcile_aspect_hot_cold) under the
+	/// maintenance lock `held`.
+	async fn reconcile_aspect_hot_cold_held(&self, held: &MaintGuard, threshold: usize) -> Result<HotColdReconcile> {
+		self.writable()?;
 		let threshold = threshold.max(1);
-		let descriptors = self.index.all(aspect).await?;
+		let descriptors = self.index.all(held.aspect()).await?;
 		let hot_tail_id = descriptors.iter().map(|d| d.id).max();
 		let unsorted: Vec<u64> = descriptors.iter().filter(|d| !d.time_sorted).map(|d| d.id).collect();
 		let hot_fires = unsorted.len() >= threshold;
@@ -1735,10 +2075,10 @@ impl SegmentStore {
 		for id in unsorted {
 			if Some(id) == hot_tail_id {
 				// The hot tail is deferred until the backlog reaches the threshold.
-				if hot_fires && self.reconcile_segment(aspect, id).await? {
+				if hot_fires && self.reconcile_segment_held(held, id).await? {
 					out.hot_reconciled += 1;
 				}
-			} else if self.reconcile_segment(aspect, id).await? {
+			} else if self.reconcile_segment_held(held, id).await? {
 				// A cold segment is always worth reconciling.
 				out.cold_reconciled += 1;
 			}
@@ -1761,17 +2101,24 @@ impl SegmentStore {
 	///
 	/// A per-aspect failure (as [`reconcile_aspect_hot_cold`](SegmentStore::reconcile_aspect_hot_cold))
 	/// is recorded in [`HotColdSweep::failed`] and the sweep continues with the next aspect.
+	/// An aspect another maintenance operation holds is skipped or waited for as `wait`
+	/// says, and listed in [`HotColdSweep::busy`] if the sweep could not take it.
 	///
 	/// # Errors
 	///
 	/// Propagates only the aspect-list read; per-aspect failures are reported in
 	/// [`HotColdSweep::failed`].
-	pub async fn reconcile_all_hot_cold(&self, threshold: usize) -> Result<HotColdSweep> {
+	pub async fn reconcile_all_hot_cold(&self, threshold: usize, wait: MaintenanceWait) -> Result<HotColdSweep> {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
+		let deadline = wait.deadline();
 		let mut sweep = HotColdSweep { aspects_scanned: aspects.len(), ..HotColdSweep::default() };
 		for aspect in &aspects {
-			match self.reconcile_aspect_hot_cold(aspect, threshold).await {
+			let Some(held) = self.sweep_maintain(aspect, deadline).await else {
+				sweep.busy.push(aspect.clone());
+				continue;
+			};
+			match self.reconcile_aspect_hot_cold_held(&held, threshold).await {
 				Ok(outcome) if outcome.total() > 0 => {
 					sweep.aspects_reconciled += 1;
 					sweep.cold_reconciled += outcome.cold_reconciled;
@@ -1825,6 +2172,8 @@ impl SegmentStore {
 	///
 	/// Returns an error if `aspect` has no declared schema; propagates a filesystem
 	/// read/write error, a decode/re-seal failure, or a libSQL failure.
+	/// A [`MaintenanceBusy`] error if another maintenance operation holds the aspect for
+	/// longer than [`maintenance_wait`](Self::maintenance_wait).
 	pub async fn reconcile_overlaps(&self, aspect: &str) -> Result<usize> {
 		self.reconcile_overlaps_with_policy(aspect, SplitPolicy::questdb_default()).await
 	}
@@ -1864,6 +2213,15 @@ impl SegmentStore {
 	/// As [`reconcile_overlaps`](SegmentStore::reconcile_overlaps).
 	pub async fn reconcile_overlaps_with_policy(&self, aspect: &str, policy: SplitPolicy) -> Result<usize> {
 		self.writable()?;
+		let held = self.maintain(aspect).await?;
+		self.reconcile_overlaps_held(&held, policy).await
+	}
+
+	/// [`reconcile_overlaps_with_policy`](Self::reconcile_overlaps_with_policy) under the
+	/// maintenance lock `held`.
+	async fn reconcile_overlaps_held(&self, held: &MaintGuard, policy: SplitPolicy) -> Result<usize> {
+		self.writable()?;
+		let aspect = held.aspect();
 		let descriptors = self.index.all(aspect).await?;
 		// Components of transitively time-overlapping segments: sort spans by (min_ts,
 		// max_ts), sweep, and start a new component whenever a span begins after the
@@ -1927,10 +2285,11 @@ impl SegmentStore {
 			let target = component[0];
 			if split {
 				// Carve the cold prefix into the lowest id and the hot suffix into a fresh
-				// id; the two are disjoint so no cross-segment overlap remains. Write the
-				// suffix first so a crash duplicates rather than drops rows.
-				let suffix_id = self.index.next_id(aspect).await?;
-				self.reseal_nullable_at(aspect, &schema, suffix_id, &all_ts[prefix_len..], &all_vs[prefix_len..], None).await?;
+				// id from the allocator seals use; the two are disjoint so no cross-segment
+				// overlap remains. Write the suffix first so a crash duplicates rather than
+				// drops rows.
+				let suffix_id = self.allocate_id(aspect).await?;
+				self.reseal_nullable_fresh(aspect, &schema, suffix_id, &all_ts[prefix_len..], &all_vs[prefix_len..], None).await?;
 				self.reseal_nullable_at(aspect, &schema, target, &all_ts[..prefix_len], &all_vs[..prefix_len], None).await?;
 			} else {
 				// Full rewrite: the whole merged component into the lowest id.
@@ -1967,17 +2326,24 @@ impl SegmentStore {
 	///
 	/// A per-aspect failure (as [`reconcile_overlaps`](SegmentStore::reconcile_overlaps))
 	/// is recorded in [`OverlapSweep::failed`] and the sweep continues with the next aspect.
+	/// An aspect another maintenance operation holds is skipped or waited for as `wait`
+	/// says, and listed in [`OverlapSweep::busy`] if the sweep could not take it.
 	///
 	/// # Errors
 	///
 	/// Propagates only the aspect-list read; per-aspect failures are reported in
 	/// [`OverlapSweep::failed`].
-	pub async fn reconcile_all_overlaps(&self) -> Result<OverlapSweep> {
+	pub async fn reconcile_all_overlaps(&self, wait: MaintenanceWait) -> Result<OverlapSweep> {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
+		let deadline = wait.deadline();
 		let mut sweep = OverlapSweep { aspects_scanned: aspects.len(), ..OverlapSweep::default() };
 		for aspect in &aspects {
-			match self.reconcile_overlaps(aspect).await {
+			let Some(held) = self.sweep_maintain(aspect, deadline).await else {
+				sweep.busy.push(aspect.clone());
+				continue;
+			};
+			match self.reconcile_overlaps_held(&held, SplitPolicy::questdb_default()).await {
 				Ok(removed) if removed > 0 => {
 					sweep.aspects_reconciled += 1;
 					sweep.segments_removed += removed;
@@ -2007,18 +2373,25 @@ impl SegmentStore {
 	///
 	/// A per-aspect failure (the pre-pass overlap read or the merge itself) is recorded in
 	/// [`OverlapSweep::failed`] and the sweep continues with the next aspect.
+	/// An aspect another maintenance operation holds is skipped or waited for as `wait`
+	/// says, and listed in [`OverlapSweep::busy`] if the sweep could not take it.
 	///
 	/// # Errors
 	///
 	/// As [`reconcile_all_overlaps`](SegmentStore::reconcile_all_overlaps).
-	pub async fn reconcile_all_overlaps_with_policy(&self, policy: SplitPolicy) -> Result<OverlapSweep> {
+	pub async fn reconcile_all_overlaps_with_policy(&self, policy: SplitPolicy, wait: MaintenanceWait) -> Result<OverlapSweep> {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
+		let deadline = wait.deadline();
 		let mut sweep = OverlapSweep { aspects_scanned: aspects.len(), ..OverlapSweep::default() };
 		for aspect in &aspects {
+			let Some(held) = self.sweep_maintain(aspect, deadline).await else {
+				sweep.busy.push(aspect.clone());
+				continue;
+			};
 			let pass = async {
 				let had_overlap = self.index.load_index(aspect).await?.overlapping_count() > 0;
-				let removed = self.reconcile_overlaps_with_policy(aspect, policy).await?;
+				let removed = self.reconcile_overlaps_held(&held, policy).await?;
 				anyhow::Ok((had_overlap, removed))
 			};
 			match pass.await {
@@ -2055,8 +2428,18 @@ impl SegmentStore {
 	///
 	/// Returns an error if `aspect` has no declared schema; propagates a filesystem
 	/// read/write error, a decode/re-seal failure, or a libSQL failure.
+	/// A [`MaintenanceBusy`] error if another maintenance operation holds the aspect for
+	/// longer than [`maintenance_wait`](Self::maintenance_wait).
 	pub async fn squash_aspect(&self, aspect: &str) -> Result<usize> {
 		self.writable()?;
+		let held = self.maintain(aspect).await?;
+		self.squash_aspect_held(&held).await
+	}
+
+	/// [`squash_aspect`](Self::squash_aspect) under the maintenance lock `held`.
+	async fn squash_aspect_held(&self, held: &MaintGuard) -> Result<usize> {
+		self.writable()?;
+		let aspect = held.aspect();
 		let descriptors = self.index.all(aspect).await?;
 		if descriptors.len() < 2 {
 			return Ok(0);
@@ -2107,11 +2490,19 @@ impl SegmentStore {
 	/// As [`squash_aspect`](SegmentStore::squash_aspect); also propagates the segment-count read.
 	pub async fn squash_aspect_if_exceeds(&self, aspect: &str, max_segments: usize) -> Result<Option<usize>> {
 		self.writable()?;
+		let held = self.maintain(aspect).await?;
+		self.squash_aspect_if_exceeds_held(&held, max_segments).await
+	}
+
+	/// [`squash_aspect_if_exceeds`](Self::squash_aspect_if_exceeds) under the maintenance
+	/// lock `held`.
+	async fn squash_aspect_if_exceeds_held(&self, held: &MaintGuard, max_segments: usize) -> Result<Option<usize>> {
+		self.writable()?;
 		let max_segments = max_segments.max(1);
-		if self.index.count(aspect).await? <= max_segments {
+		if self.index.count(held.aspect()).await? <= max_segments {
 			return Ok(None);
 		}
-		Ok(Some(self.squash_aspect(aspect).await?))
+		Ok(Some(self.squash_aspect_held(held).await?))
 	}
 
 	/// **Store-wide threshold squash** (roadmap Phase 4.6): apply the
@@ -2127,17 +2518,24 @@ impl SegmentStore {
 	///
 	/// A per-aspect failure (as [`squash_aspect_if_exceeds`](SegmentStore::squash_aspect_if_exceeds))
 	/// is recorded in [`SquashSweep::failed`] and the sweep continues with the next aspect.
+	/// An aspect another maintenance operation holds is skipped or waited for as `wait`
+	/// says, and listed in [`SquashSweep::busy`] if the sweep could not take it.
 	///
 	/// # Errors
 	///
 	/// Propagates only the aspect-list read; per-aspect failures are reported in
 	/// [`SquashSweep::failed`].
-	pub async fn squash_all_over_threshold(&self, max_segments: usize) -> Result<SquashSweep> {
+	pub async fn squash_all_over_threshold(&self, max_segments: usize, wait: MaintenanceWait) -> Result<SquashSweep> {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
+		let deadline = wait.deadline();
 		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
 		for aspect in &aspects {
-			match self.squash_aspect_if_exceeds(aspect, max_segments).await {
+			let Some(held) = self.sweep_maintain(aspect, deadline).await else {
+				sweep.busy.push(aspect.clone());
+				continue;
+			};
+			match self.squash_aspect_if_exceeds_held(&held, max_segments).await {
 				Ok(Some(removed)) => {
 					sweep.aspects_squashed += 1;
 					sweep.segments_removed += removed;
@@ -2178,6 +2576,15 @@ impl SegmentStore {
 	/// As [`squash_aspect`](SegmentStore::squash_aspect).
 	pub async fn squash_aspect_to_target_rows(&self, aspect: &str, target_rows: usize) -> Result<usize> {
 		self.writable()?;
+		let held = self.maintain(aspect).await?;
+		self.squash_aspect_to_target_rows_held(&held, target_rows).await
+	}
+
+	/// [`squash_aspect_to_target_rows`](Self::squash_aspect_to_target_rows) under the
+	/// maintenance lock `held`.
+	async fn squash_aspect_to_target_rows_held(&self, held: &MaintGuard, target_rows: usize) -> Result<usize> {
+		self.writable()?;
+		let aspect = held.aspect();
 		let target_rows = target_rows.max(1);
 		let descriptors = self.index.all(aspect).await?;
 		if descriptors.len() < 2 {
@@ -2250,17 +2657,24 @@ impl SegmentStore {
 	///
 	/// A per-aspect failure (as [`squash_aspect_to_target_rows`](SegmentStore::squash_aspect_to_target_rows))
 	/// is recorded in [`SquashSweep::failed`] and the sweep continues with the next aspect.
+	/// An aspect another maintenance operation holds is skipped or waited for as `wait`
+	/// says, and listed in [`SquashSweep::busy`] if the sweep could not take it.
 	///
 	/// # Errors
 	///
 	/// Propagates only the aspect-list read; per-aspect failures are reported in
 	/// [`SquashSweep::failed`].
-	pub async fn squash_all_to_target_rows(&self, target_rows: usize) -> Result<SquashSweep> {
+	pub async fn squash_all_to_target_rows(&self, target_rows: usize, wait: MaintenanceWait) -> Result<SquashSweep> {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
+		let deadline = wait.deadline();
 		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
 		for aspect in &aspects {
-			match self.squash_aspect_to_target_rows(aspect, target_rows).await {
+			let Some(held) = self.sweep_maintain(aspect, deadline).await else {
+				sweep.busy.push(aspect.clone());
+				continue;
+			};
+			match self.squash_aspect_to_target_rows_held(&held, target_rows).await {
 				Ok(removed) if removed > 0 => {
 					sweep.aspects_squashed += 1;
 					sweep.segments_removed += removed;
@@ -2293,15 +2707,23 @@ impl SegmentStore {
 	/// propagates the rollup read.
 	pub async fn squash_aspect_to_target_rows_if_fragmented(&self, aspect: &str, target_rows: usize) -> Result<Option<usize>> {
 		self.writable()?;
+		let held = self.maintain(aspect).await?;
+		self.squash_aspect_to_target_rows_if_fragmented_held(&held, target_rows).await
+	}
+
+	/// [`squash_aspect_to_target_rows_if_fragmented`](Self::squash_aspect_to_target_rows_if_fragmented)
+	/// under the maintenance lock `held`.
+	async fn squash_aspect_to_target_rows_if_fragmented_held(&self, held: &MaintGuard, target_rows: usize) -> Result<Option<usize>> {
+		self.writable()?;
 		let target_rows = target_rows.max(1);
-		let Some(meta) = self.metadata.get(aspect).await? else { return Ok(None) };
+		let Some(meta) = self.metadata.get(held.aspect()).await? else { return Ok(None) };
 		// Minimum segments to hold total_rows at the target; a fully-compacted aspect sits at
 		// exactly this count (or below), so more than this means there is fragmentation to fold.
 		let ideal = meta.total_rows.div_ceil(target_rows as u64).max(1);
 		if (meta.segment_count as u64) <= ideal {
 			return Ok(None);
 		}
-		Ok(Some(self.squash_aspect_to_target_rows(aspect, target_rows).await?))
+		Ok(Some(self.squash_aspect_to_target_rows_held(held, target_rows).await?))
 	}
 
 	/// **Fragmentation-gated store-wide** size-targeted compaction (roadmap Phase 4.6).
@@ -2316,17 +2738,24 @@ impl SegmentStore {
 	///
 	/// A per-aspect failure (as [`squash_aspect_to_target_rows_if_fragmented`](SegmentStore::squash_aspect_to_target_rows_if_fragmented))
 	/// is recorded in [`SquashSweep::failed`] and the sweep continues with the next aspect.
+	/// An aspect another maintenance operation holds is skipped or waited for as `wait`
+	/// says, and listed in [`SquashSweep::busy`] if the sweep could not take it.
 	///
 	/// # Errors
 	///
 	/// Propagates only the aspect-list read; per-aspect failures are reported in
 	/// [`SquashSweep::failed`].
-	pub async fn squash_all_to_target_rows_if_fragmented(&self, target_rows: usize) -> Result<SquashSweep> {
+	pub async fn squash_all_to_target_rows_if_fragmented(&self, target_rows: usize, wait: MaintenanceWait) -> Result<SquashSweep> {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
+		let deadline = wait.deadline();
 		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
 		for aspect in &aspects {
-			match self.squash_aspect_to_target_rows_if_fragmented(aspect, target_rows).await {
+			let Some(held) = self.sweep_maintain(aspect, deadline).await else {
+				sweep.busy.push(aspect.clone());
+				continue;
+			};
+			match self.squash_aspect_to_target_rows_if_fragmented_held(&held, target_rows).await {
 				Ok(Some(removed)) if removed > 0 => {
 					sweep.aspects_squashed += 1;
 					sweep.segments_removed += removed;
@@ -2435,14 +2864,20 @@ impl SegmentStore {
 	/// fold, a re-seal of an id, a metadata.db restored from an older snapshot). The
 	/// segment index is the source of truth; this makes the rollup match it.
 	///
+	/// It reads the index and writes the rollup under the aspect's commit lock, where a
+	/// seal commits its row and folds it in, so a seal committing meanwhile is either in
+	/// the index it reads or folded into the rollup after it writes, never lost.
+	///
 	/// # Errors
 	///
 	/// Propagates any libSQL read or write failure.
 	pub async fn rebuild_aspect_metadata(&self, aspect: &str) -> Result<AspectMetadata> {
 		self.writable()?;
+		let commit = self.commit_lock(aspect).await?;
 		let index = self.index.load_index(aspect).await?;
 		let meta = AspectMetadata::from_index(&index);
 		self.metadata.put(aspect, &meta).await?;
+		drop(commit);
 		Ok(meta)
 	}
 
@@ -2549,6 +2984,10 @@ pub struct ReconcileSweep {
 	/// only toward `aspects_scanned`, even if its pass rewrote some segments before the
 	/// error.
 	pub failed: Vec<(String, anyhow::Error)>,
+	/// Aspects the sweep left alone because another maintenance operation held them (see
+	/// [`MaintenanceWait`]), in visit order. Empty when it took every aspect. A busy
+	/// aspect counts only toward `aspects_scanned`; a later sweep maintains it.
+	pub busy: Vec<String>,
 }
 
 /// The cold-vs-hot split of a hot/cold reconcile pass over one aspect, returned by
@@ -2595,6 +3034,10 @@ pub struct HotColdSweep {
 	/// only toward `aspects_scanned`, even if its pass rewrote some segments before the
 	/// error.
 	pub failed: Vec<(String, anyhow::Error)>,
+	/// Aspects the sweep left alone because another maintenance operation held them (see
+	/// [`MaintenanceWait`]), in visit order. Empty when it took every aspect. A busy
+	/// aspect counts only toward `aspects_scanned`; a later sweep maintains it.
+	pub busy: Vec<String>,
 }
 
 impl HotColdSweep {
@@ -2627,6 +3070,10 @@ pub struct OverlapSweep {
 	/// only toward `aspects_scanned`, even if its pass rewrote some segments before the
 	/// error.
 	pub failed: Vec<(String, anyhow::Error)>,
+	/// Aspects the sweep left alone because another maintenance operation held them (see
+	/// [`MaintenanceWait`]), in visit order. Empty when it took every aspect. A busy
+	/// aspect counts only toward `aspects_scanned`; a later sweep maintains it.
+	pub busy: Vec<String>,
 }
 
 /// The outcome of a store-wide squash sweep, returned by
@@ -2652,6 +3099,10 @@ pub struct SquashSweep {
 	/// only toward `aspects_scanned`, even if its pass rewrote some segments before the
 	/// error.
 	pub failed: Vec<(String, anyhow::Error)>,
+	/// Aspects the sweep left alone because another maintenance operation held them (see
+	/// [`MaintenanceWait`]), in visit order. Empty when it took every aspect. A busy
+	/// aspect counts only toward `aspects_scanned`; a later sweep maintains it.
+	pub busy: Vec<String>,
 }
 
 /// Await one database's snapshot into a backup's build directory, fsync the copy through
@@ -3670,11 +4121,11 @@ mod tests {
 		// aspect b: one out-of-order segment (backlog 1).
 		store.seal("b", &schema(), &[100_i64, 130, 110], &[bd("7"), bd("9"), bd("8")]).await.expect("b ooo1");
 		// Sweep at threshold 2: only aspect a fires; b holds below the threshold.
-		let sweep = store.reconcile_all_over_threshold(2).await.expect("sweeps");
+		let sweep = store.reconcile_all_over_threshold(2, MaintenanceWait::Skip).await.expect("sweeps");
 		let a_after = store.aspect_stats("a").await.expect("stats a").unsorted_segments;
 		let b_after = store.aspect_stats("b").await.expect("stats b").unsorted_segments;
 		// A second sweep at threshold 1 now clears b too.
-		let sweep2 = store.reconcile_all_over_threshold(1).await.expect("sweeps again");
+		let sweep2 = store.reconcile_all_over_threshold(1, MaintenanceWait::Skip).await.expect("sweeps again");
 		let b_final = store.aspect_stats("b").await.expect("stats b").unsorted_segments;
 		drop(store);
 		assert_eq!(sweep.aspects_scanned, 2);
@@ -3758,7 +4209,7 @@ mod tests {
 		store.seal("b", &schema(), &[100_i64, 130, 110], &[bd("7"), bd("9"), bd("8")]).await.expect("b hot only");
 		// Sweep at threshold 2: a's cold segment is reconciled, a's hot tail fires (backlog 2);
 		// b's only segment is its hot tail and stays deferred (backlog 1 < 2).
-		let sweep = store.reconcile_all_hot_cold(2).await.expect("sweeps");
+		let sweep = store.reconcile_all_hot_cold(2, MaintenanceWait::Skip).await.expect("sweeps");
 		let a_after = store.aspect_stats("a").await.expect("stats a").unsorted_segments;
 		let b_after = store.aspect_stats("b").await.expect("stats b").unsorted_segments;
 		drop(store);
@@ -3936,7 +4387,7 @@ mod tests {
 		store.seal("a", &schema(), &[10_i64, 20, 30], &[bd("4"), bd("5"), bd("6")]).await.expect("a newer");
 		store.seal("b", &schema(), &[0_i64, 10, 20], &[bd("7"), bd("8"), bd("9")]).await.expect("b lo");
 		store.seal("b", &schema(), &[100_i64, 110, 120], &[bd("1"), bd("2"), bd("3")]).await.expect("b hi");
-		let sweep = store.reconcile_all_overlaps().await.expect("sweeps");
+		let sweep = store.reconcile_all_overlaps(MaintenanceWait::Skip).await.expect("sweeps");
 		let a_after = store.aspect_stats("a").await.expect("stats a").overlapping_segments;
 		let b_after = store.aspect_stats("b").await.expect("stats b").overlapping_segments;
 		drop(store);
@@ -3961,7 +4412,7 @@ mod tests {
 		// b: no overlap.
 		store.seal("b", &schema(), &[0_i64, 10], &[bd("7"), bd("8")]).await.expect("b lo");
 		store.seal("b", &schema(), &[100_i64, 110], &[bd("1"), bd("2")]).await.expect("b hi");
-		let sweep = store.reconcile_all_overlaps_with_policy(SplitPolicy::new(1)).await.expect("sweeps");
+		let sweep = store.reconcile_all_overlaps_with_policy(SplitPolicy::new(1), MaintenanceWait::Skip).await.expect("sweeps");
 		let a_stats = store.aspect_stats("a").await.expect("stats a");
 		drop(store);
 		// a is counted as reconciled even though its split left the segment count
@@ -4008,7 +4459,7 @@ mod tests {
 		store.seal("a", &schema(), &[20_i64, 30], &[bd("2"), bd("3")]).await.expect("a1");
 		store.seal("a", &schema(), &[40_i64, 50], &[bd("4"), bd("5")]).await.expect("a2");
 		store.seal("b", &schema(), &[0_i64, 10], &[bd("7"), bd("8")]).await.expect("b0");
-		let sweep = store.squash_all_over_threshold(2).await.expect("sweeps");
+		let sweep = store.squash_all_over_threshold(2, MaintenanceWait::Skip).await.expect("sweeps");
 		let a_count = store.segment_count("a").await.expect("a count");
 		let b_count = store.segment_count("b").await.expect("b count");
 		drop(store);
@@ -4104,7 +4555,7 @@ mod tests {
 			store.seal("a", &schema(), &[base, base + 10], &[bd("0"), bd("1")]).await.expect("a seg");
 		}
 		store.seal("b", &schema(), &[0_i64, 10], &[bd("7"), bd("8")]).await.expect("b0");
-		let sweep = store.squash_all_to_target_rows(4).await.expect("sweeps");
+		let sweep = store.squash_all_to_target_rows(4, MaintenanceWait::Skip).await.expect("sweeps");
 		let a_count = store.segment_count("a").await.expect("a count");
 		let b_count = store.segment_count("b").await.expect("b count");
 		drop(store);
@@ -4149,7 +4600,7 @@ mod tests {
 		}
 		// tidy: one 4-row segment already at its ideal.
 		store.seal("tidy", &schema(), &[0_i64, 1, 2, 3], &[bd("1"), bd("2"), bd("3"), bd("4")]).await.expect("tidy seg");
-		let sweep = store.squash_all_to_target_rows_if_fragmented(4).await.expect("gated sweep");
+		let sweep = store.squash_all_to_target_rows_if_fragmented(4, MaintenanceWait::Skip).await.expect("gated sweep");
 		let frag_count = store.segment_count("frag").await.expect("frag count");
 		let tidy_count = store.segment_count("tidy").await.expect("tidy count");
 		drop(store);
@@ -4240,7 +4691,7 @@ mod tests {
 	async fn store_wide_reconcile_sweeps_isolate_a_truncated_frame() {
 		let dir = TempDir::new().expect("tempdir");
 		let (store, bad_frame) = sweep_isolation_fixture(dir.path()).await;
-		let sweep = store.reconcile_all_over_threshold(1).await.expect("a bad aspect does not fail the sweep");
+		let sweep = store.reconcile_all_over_threshold(1, MaintenanceWait::Skip).await.expect("a bad aspect does not fail the sweep");
 		let missed = unmaintained_healthy(&store, |stats| stats.unsorted_segments == 0).await;
 		let bad = store.aspect_stats(SWEEP_BAD).await.expect("bad stats");
 		drop(store);
@@ -4253,7 +4704,7 @@ mod tests {
 
 		let dir = TempDir::new().expect("tempdir");
 		let (store, bad_frame) = sweep_isolation_fixture(dir.path()).await;
-		let sweep = store.reconcile_all_hot_cold(1).await.expect("a bad aspect does not fail the sweep");
+		let sweep = store.reconcile_all_hot_cold(1, MaintenanceWait::Skip).await.expect("a bad aspect does not fail the sweep");
 		let missed = unmaintained_healthy(&store, |stats| stats.unsorted_segments == 0).await;
 		drop(store);
 		assert_eq!(sweep.aspects_scanned, 6);
@@ -4270,7 +4721,7 @@ mod tests {
 	async fn store_wide_overlap_sweeps_isolate_a_truncated_frame() {
 		let dir = TempDir::new().expect("tempdir");
 		let (store, bad_frame) = sweep_isolation_fixture(dir.path()).await;
-		let sweep = store.reconcile_all_overlaps().await.expect("a bad aspect does not fail the sweep");
+		let sweep = store.reconcile_all_overlaps(MaintenanceWait::Skip).await.expect("a bad aspect does not fail the sweep");
 		let missed = unmaintained_healthy(&store, |stats| stats.overlapping_segments == 0 && stats.segment_count == 1).await;
 		let bad = store.aspect_stats(SWEEP_BAD).await.expect("bad stats");
 		drop(store);
@@ -4283,7 +4734,7 @@ mod tests {
 
 		let dir = TempDir::new().expect("tempdir");
 		let (store, bad_frame) = sweep_isolation_fixture(dir.path()).await;
-		let sweep = store.reconcile_all_overlaps_with_policy(SplitPolicy::new(1)).await.expect("a bad aspect does not fail the sweep");
+		let sweep = store.reconcile_all_overlaps_with_policy(SplitPolicy::new(1), MaintenanceWait::Skip).await.expect("a bad aspect does not fail the sweep");
 		let missed = unmaintained_healthy(&store, |stats| stats.overlapping_segments == 0).await;
 		drop(store);
 		assert_eq!(sweep.aspects_scanned, 6);
@@ -4298,7 +4749,7 @@ mod tests {
 	async fn store_wide_squash_sweep_isolates_a_truncated_frame() {
 		let dir = TempDir::new().expect("tempdir");
 		let (store, bad_frame) = sweep_isolation_fixture(dir.path()).await;
-		let sweep = store.squash_all_over_threshold(2).await.expect("a bad aspect does not fail the sweep");
+		let sweep = store.squash_all_over_threshold(2, MaintenanceWait::Skip).await.expect("a bad aspect does not fail the sweep");
 		let missed = unmaintained_healthy(&store, |stats| stats.segment_count == 1).await;
 		let bad = store.aspect_stats(SWEEP_BAD).await.expect("bad stats");
 		drop(store);
@@ -4317,7 +4768,7 @@ mod tests {
 	async fn store_wide_compact_sweeps_isolate_a_truncated_frame() {
 		let dir = TempDir::new().expect("tempdir");
 		let (store, bad_frame) = sweep_isolation_fixture(dir.path()).await;
-		let sweep = store.squash_all_to_target_rows(6).await.expect("a bad aspect does not fail the sweep");
+		let sweep = store.squash_all_to_target_rows(6, MaintenanceWait::Skip).await.expect("a bad aspect does not fail the sweep");
 		let missed = unmaintained_healthy(&store, |stats| stats.segment_count == 2).await;
 		let bad = store.aspect_stats(SWEEP_BAD).await.expect("bad stats");
 		drop(store);
@@ -4330,7 +4781,7 @@ mod tests {
 
 		let dir = TempDir::new().expect("tempdir");
 		let (store, bad_frame) = sweep_isolation_fixture(dir.path()).await;
-		let sweep = store.squash_all_to_target_rows_if_fragmented(6).await.expect("a bad aspect does not fail the sweep");
+		let sweep = store.squash_all_to_target_rows_if_fragmented(6, MaintenanceWait::Skip).await.expect("a bad aspect does not fail the sweep");
 		let missed = unmaintained_healthy(&store, |stats| stats.segment_count == 2).await;
 		drop(store);
 		assert_eq!(sweep.aspects_scanned, 6);
@@ -5598,7 +6049,7 @@ mod tests {
 		let policy = SplitPolicy { min_split_bytes: 0 };
 		let (ts, vs, nullable) = ([50_i64, 60], [bd("6"), bd("7")], [Some(bd("6")), None]);
 		let before = tree_bytes(dir.path());
-		let refused: Vec<(&str, Result<()>)> = vec![("declare", store.declare("temp", &schema).await), ("seal", store.seal("price", &schema, &ts, &vs).await.map(drop)), ("seal_nullable", store.seal_nullable("price", &schema, &ts, &nullable).await.map(drop)), ("seal_paged", store.seal_paged("price", &schema, &ts, &vs, 1).await.map(drop)), ("seal_paged_nullable", store.seal_paged_nullable("price", &schema, &ts, &nullable, 1).await.map(drop)), ("seal_declared", store.seal_declared("price", &ts, &vs).await.map(drop)), ("seal_declared_nullable", store.seal_declared_nullable("price", &ts, &nullable).await.map(drop)), ("seal_declared_paged", store.seal_declared_paged("price", &ts, &vs, 1).await.map(drop)), ("reconcile_segment", store.reconcile_segment("price", 0).await.map(drop)), ("split_segment", store.split_segment("price", 0, 10).await.map(drop)), ("reconcile_aspect", store.reconcile_aspect("price").await.map(drop)), ("reconcile_aspect_if_unsorted_exceeds", store.reconcile_aspect_if_unsorted_exceeds("price", 1).await.map(drop)), ("reconcile_all_over_threshold", store.reconcile_all_over_threshold(1).await.map(drop)), ("reconcile_aspect_hot_cold", store.reconcile_aspect_hot_cold("price", 1).await.map(drop)), ("reconcile_all_hot_cold", store.reconcile_all_hot_cold(1).await.map(drop)), ("reconcile_overlaps", store.reconcile_overlaps("price").await.map(drop)), ("reconcile_overlaps_with_policy", store.reconcile_overlaps_with_policy("price", policy).await.map(drop)), ("reconcile_all_overlaps", store.reconcile_all_overlaps().await.map(drop)), ("reconcile_all_overlaps_with_policy", store.reconcile_all_overlaps_with_policy(policy).await.map(drop)), ("squash_aspect", store.squash_aspect("price").await.map(drop)), ("squash_aspect_if_exceeds", store.squash_aspect_if_exceeds("price", 1).await.map(drop)), ("squash_all_over_threshold", store.squash_all_over_threshold(1).await.map(drop)), ("squash_aspect_to_target_rows", store.squash_aspect_to_target_rows("price", 10).await.map(drop)), ("squash_all_to_target_rows", store.squash_all_to_target_rows(10).await.map(drop)), ("squash_aspect_to_target_rows_if_fragmented", store.squash_aspect_to_target_rows_if_fragmented("price", 10).await.map(drop)), ("squash_all_to_target_rows_if_fragmented", store.squash_all_to_target_rows_if_fragmented(10).await.map(drop)), ("rebuild_aspect_metadata", store.rebuild_aspect_metadata("price").await.map(drop)), ("rebuild_all_metadata", store.rebuild_all_metadata().await.map(drop)), ("commit_index", store.commit_index(&IndexTxn::new(vec![IndexOp::Delete { aspect: "price".to_string(), id: 0 }])).await.map(drop))];
+		let refused: Vec<(&str, Result<()>)> = vec![("declare", store.declare("temp", &schema).await), ("seal", store.seal("price", &schema, &ts, &vs).await.map(drop)), ("seal_nullable", store.seal_nullable("price", &schema, &ts, &nullable).await.map(drop)), ("seal_paged", store.seal_paged("price", &schema, &ts, &vs, 1).await.map(drop)), ("seal_paged_nullable", store.seal_paged_nullable("price", &schema, &ts, &nullable, 1).await.map(drop)), ("seal_declared", store.seal_declared("price", &ts, &vs).await.map(drop)), ("seal_declared_nullable", store.seal_declared_nullable("price", &ts, &nullable).await.map(drop)), ("seal_declared_paged", store.seal_declared_paged("price", &ts, &vs, 1).await.map(drop)), ("reconcile_segment", store.reconcile_segment("price", 0).await.map(drop)), ("split_segment", store.split_segment("price", 0, 10).await.map(drop)), ("reconcile_aspect", store.reconcile_aspect("price").await.map(drop)), ("reconcile_aspect_if_unsorted_exceeds", store.reconcile_aspect_if_unsorted_exceeds("price", 1).await.map(drop)), ("reconcile_all_over_threshold", store.reconcile_all_over_threshold(1, MaintenanceWait::Skip).await.map(drop)), ("reconcile_aspect_hot_cold", store.reconcile_aspect_hot_cold("price", 1).await.map(drop)), ("reconcile_all_hot_cold", store.reconcile_all_hot_cold(1, MaintenanceWait::Skip).await.map(drop)), ("reconcile_overlaps", store.reconcile_overlaps("price").await.map(drop)), ("reconcile_overlaps_with_policy", store.reconcile_overlaps_with_policy("price", policy).await.map(drop)), ("reconcile_all_overlaps", store.reconcile_all_overlaps(MaintenanceWait::Skip).await.map(drop)), ("reconcile_all_overlaps_with_policy", store.reconcile_all_overlaps_with_policy(policy, MaintenanceWait::Skip).await.map(drop)), ("squash_aspect", store.squash_aspect("price").await.map(drop)), ("squash_aspect_if_exceeds", store.squash_aspect_if_exceeds("price", 1).await.map(drop)), ("squash_all_over_threshold", store.squash_all_over_threshold(1, MaintenanceWait::Skip).await.map(drop)), ("squash_aspect_to_target_rows", store.squash_aspect_to_target_rows("price", 10).await.map(drop)), ("squash_all_to_target_rows", store.squash_all_to_target_rows(10, MaintenanceWait::Skip).await.map(drop)), ("squash_aspect_to_target_rows_if_fragmented", store.squash_aspect_to_target_rows_if_fragmented("price", 10).await.map(drop)), ("squash_all_to_target_rows_if_fragmented", store.squash_all_to_target_rows_if_fragmented(10, MaintenanceWait::Skip).await.map(drop)), ("rebuild_aspect_metadata", store.rebuild_aspect_metadata("price").await.map(drop)), ("rebuild_all_metadata", store.rebuild_all_metadata().await.map(drop)), ("commit_index", store.commit_index(&IndexTxn::new(vec![IndexOp::Delete { aspect: "price".to_string(), id: 0 }])).await.map(drop))];
 		let after = tree_bytes(dir.path());
 		for (write, result) in &refused {
 			let err = result.as_ref().err().unwrap_or_else(|| panic!("{write} is refused"));
@@ -5746,5 +6197,405 @@ mod tests {
 		let mut union: Vec<(i64, Option<BigDecimal>)> = range_ts.into_iter().zip(range_vs).collect();
 		union.sort_by_key(|(t, _)| *t);
 		assert_eq!(squashed_ts.into_iter().zip(squashed_vs).collect::<Vec<_>>(), union);
+	}
+
+	/// Batch `i` of the concurrency tests: ten rows from `i * 1000` on, ten apart, each
+	/// valued by its own timestamp, so no two batches share a timestamp or a value.
+	fn numbered_batch(i: usize) -> (Vec<i64>, Vec<BigDecimal>) {
+		let base = i64::try_from(i).expect("a small batch number") * 1000;
+		((0..10).map(|r| base + r * 10).collect(), (0..10).map(|r| BigDecimal::from(base + r * 10)).collect())
+	}
+
+	/// Seal [`numbered_batch`]es `0..count` into `aspect` at once, each from a task of its
+	/// own, and return every seal's result in batch order.
+	async fn seal_concurrently(store: &std::sync::Arc<SegmentStore>, aspect: &str, count: usize) -> Vec<Result<SegmentDescriptor>> {
+		let tasks: Vec<_> = (0..count)
+			.map(|i| {
+				let (store, aspect) = (store.clone(), aspect.to_string());
+				tokio::spawn(async move {
+					let (ts, vs) = numbered_batch(i);
+					store.seal(&aspect, &schema(), &ts, &vs).await
+				})
+			})
+			.collect();
+		let mut results = Vec::with_capacity(count);
+		for task in tasks {
+			results.push(task.await.expect("a seal task joins"));
+		}
+		results
+	}
+
+	/// The batches of `0..count` that do not read back from `aspect` exactly as sealed.
+	async fn unreadable_batches(store: &SegmentStore, aspect: &str, count: usize) -> Vec<usize> {
+		let mut lost = Vec::new();
+		for i in 0..count {
+			let (ts, vs) = numbered_batch(i);
+			let (read_ts, read_vs) = store.read_time_range(aspect, ts[0], ts[ts.len() - 1]).await.expect("reads the batch's window");
+			if read_ts != ts || read_vs != vs.into_iter().map(Some).collect::<Vec<_>>() {
+				lost.push(i);
+			}
+		}
+		lost
+	}
+
+	/// The error of every seal in `results` that failed, by batch number.
+	fn failed_seals(results: &[Result<SegmentDescriptor>]) -> Vec<String> {
+		results.iter().enumerate().filter_map(|(i, result)| result.as_ref().err().map(|e| format!("seal {i}: {e:#}"))).collect()
+	}
+
+	/// Crash-consistency S7, window race-next-id-collision: 64 seals of one aspect at once
+	/// each get an id of their own, and every batch reads back. A seal used to take
+	/// `MAX(id) + 1`, read with no lock held, so concurrent seals took the same id: the
+	/// later one's truncating write replaced the earlier one's frame and its
+	/// `INSERT OR REPLACE` its row, and an acknowledged batch was gone (or the second
+	/// writer of the row lost an MVCC conflict and the seal failed).
+	#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+	async fn concurrent_seals_of_one_aspect_take_distinct_ids_and_all_read_back() {
+		const SEALS: usize = 64;
+		let dir = TempDir::new().expect("tempdir");
+		let store = std::sync::Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+		let results = seal_concurrently(&store, "price", SEALS).await;
+		let ids: std::collections::BTreeSet<u64> = results.iter().filter_map(|result| result.as_ref().ok().map(|d| d.id)).collect();
+		let lost = unreadable_batches(&store, "price", SEALS).await;
+		let count = store.segment_count("price").await.expect("counts");
+		drop(store);
+		assert_eq!(failed_seals(&results), Vec::<String>::new(), "every seal succeeds");
+		assert_eq!(ids.len(), SEALS, "every seal took an id of its own: {ids:?}");
+		assert_eq!(lost, Vec::<usize>::new(), "every acknowledged batch reads back exactly as sealed");
+		assert_eq!(count, SEALS);
+	}
+
+	/// Crash-consistency S7, window race-metadata-rollup-lost-update: after 200 seals of
+	/// one aspect at once, the materialized rollup equals the one derived from the index.
+	/// Each seal used to fold itself into the rollup with an unlocked get-then-put, so two
+	/// seals read the same rollup and one fold was lost (or the second put lost an MVCC
+	/// conflict and failed the seal after its row had committed).
+	#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+	async fn concurrent_seals_keep_the_rollup_equal_to_the_index() {
+		const SEALS: usize = 200;
+		let dir = TempDir::new().expect("tempdir");
+		let store = std::sync::Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+		let results = seal_concurrently(&store, "price", SEALS).await;
+		let rollup = store.aspect_metadata("price").await.expect("reads the rollup");
+		let derived = AspectMetadata::from_index(&store.index().load_index("price").await.expect("loads the index"));
+		drop(store);
+		assert_eq!(failed_seals(&results), Vec::<String>::new(), "every seal succeeds");
+		assert_eq!(rollup, derived, "the rollup is exactly what the index says");
+		assert_eq!(derived.segment_count, SEALS);
+	}
+
+	/// Crash-consistency S7, window race-max-id-reused-between-delete-and-unlink: an id is
+	/// never handed out twice, not even once the segment that had it is gone. A squash
+	/// keeps its lowest member and deletes the rest, the highest id among them; the next
+	/// seal used to take `MAX(id) + 1`, that same id, so a seal racing the squash's unlink
+	/// lost its frame, and a leftover sidecar of the deleted segment could match it. The
+	/// allocator is persisted in `aspect_seq`, so a reopened store, whose rows and frames
+	/// no longer show the deleted ids, does not reissue them either.
+	#[tokio::test]
+	async fn an_id_freed_by_deleting_the_highest_segment_is_never_reissued() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("price", &schema()).await.expect("declares");
+		for i in 0..3 {
+			let (ts, vs) = numbered_batch(i);
+			store.seal("price", &schema(), &ts, &vs).await.expect("seals");
+		}
+		let removed = store.squash_aspect("price").await.expect("squashes");
+		let (ts, vs) = numbered_batch(3);
+		let after_squash = store.seal("price", &schema(), &ts, &vs).await.expect("seals after the squash").id;
+		let removed_again = store.squash_aspect("price").await.expect("squashes again");
+		drop(store);
+		let store = SegmentStore::open(dir.path()).await.expect("reopens");
+		let (ts, vs) = numbered_batch(4);
+		let after_reopen = store.seal("price", &schema(), &ts, &vs).await.expect("seals after the reopen").id;
+		let ids: Vec<u64> = store.index().all("price").await.expect("reads").iter().map(|d| d.id).collect();
+		let lost = unreadable_batches(&store, "price", 5).await;
+		drop(store);
+		assert_eq!(removed, 2, "the squash deleted segments 1 and 2");
+		assert_eq!(after_squash, 3, "the seal after the squash does not reuse id 2 (or 1)");
+		assert_eq!(removed_again, 1, "the second squash deleted segment 3, the highest");
+		assert_eq!(after_reopen, 4, "nor does the first seal after a reopen, although no row or frame has an id above 0");
+		assert_eq!(ids, vec![0, 4]);
+		assert_eq!(lost, Vec::<usize>::new(), "every batch reads back");
+	}
+
+	/// Set only in the child process
+	/// `a_seal_does_not_overwrite_the_frame_of_a_seal_that_crashed_before_its_commit`
+	/// starts: the root to open.
+	const ORPHAN_CHILD_ROOT: &str = "WEFT_TEST_ORPHAN_CHILD_ROOT";
+
+	/// The rows the child's seal writes and never commits.
+	const ORPHAN_ROWS: [(i64, &str); 2] = [(100, "7"), (110, "8")];
+
+	/// The body that child runs: seal [`ORPHAN_ROWS`] into `price` with `S-frame-written`
+	/// armed by the parent's `WEFT_FAULT`, so the seal stops after writing its frame and
+	/// before committing it. It returns only when the point is armed with `err` rather than
+	/// `abort`. In a normal test run the variable is unset and this does nothing.
+	#[tokio::test]
+	async fn orphan_child() {
+		let Some(root) = std::env::var_os(ORPHAN_CHILD_ROOT) else { return };
+		crate::types::durable::fault::suppress_core_dump();
+		let store = SegmentStore::open(PathBuf::from(root)).await.expect("opens");
+		let (ts, vs): (Vec<i64>, Vec<BigDecimal>) = ORPHAN_ROWS.iter().map(|(t, v)| (*t, bd(v))).unzip();
+		let err = store.seal("price", &schema(), &ts, &vs).await.expect_err("the seal stops at the armed fault");
+		drop(store);
+		assert!(format!("{err:#}").contains("injected fault at S-frame-written"), "{err:#}");
+	}
+
+	/// Crash-consistency S7, window seal-orphan-frame-before-index-commit: a seal that
+	/// crashed after writing its frame and before committing it leaves that frame behind
+	/// with no row, and the next seal after the restart takes an id above it rather than
+	/// truncating it. The orphan's id used to be `MAX(id) + 1` again (nothing had committed
+	/// it), so the next seal overwrote the frame in place. The crash is an injected error
+	/// (after which the child exits and the store is reopened here) and a real abort.
+	#[tokio::test]
+	async fn a_seal_does_not_overwrite_the_frame_of_a_seal_that_crashed_before_its_commit() {
+		for spec in ["S-frame-written:err", "S-frame-written:abort"] {
+			let dir = TempDir::new().expect("tempdir");
+			let store = SegmentStore::open(dir.path()).await.expect("opens");
+			let first = store.seal("price", &schema(), &[0, 10], &[bd("1"), bd("2")]).await.expect("seals");
+			drop(store);
+
+			let exe = std::env::current_exe().expect("finds the test binary");
+			let out = tokio::process::Command::new(exe).args(["types::segment_store::tests::orphan_child", "--exact", "--nocapture", "--test-threads=1"]).env(ORPHAN_CHILD_ROOT, dir.path()).env(fault::FAULT_ENV, spec).output().await.expect("runs the child");
+			if spec.ends_with(":abort") {
+				#[cfg(unix)]
+				{
+					use std::os::unix::process::ExitStatusExt;
+					assert_eq!(out.status.signal(), Some(6), "{spec}: the child was killed by SIGABRT: {out:?}");
+				}
+				assert!(!out.status.success(), "{spec}: the child aborted: {out:?}");
+			} else {
+				assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("1 passed"), "{spec}: the child's seal stopped at the injected error: {out:?}");
+			}
+			let segments = dir.path().join("segments");
+			let orphans: Vec<String> = names_in(&segments).into_iter().filter(|name| name != "price-0.weftseg").collect();
+			let [orphan] = orphans.as_slice() else { panic!("{spec}: the crashed seal left exactly one frame behind: {orphans:?}") };
+			let orphan_bytes = std::fs::read(segments.join(orphan)).expect("reads the orphan");
+
+			let store = SegmentStore::open(dir.path()).await.expect("reopens");
+			let next = store.seal("price", &schema(), &[200, 210, 220], &[bd("3"), bd("4"), bd("5")]).await.expect("seals after the crash");
+			let (ts, vs) = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
+			drop(store);
+			assert_eq!(first.id, 0);
+			assert_ne!(segments.join(orphan), PathBuf::from(&next.path), "{spec}: the next seal took a frame name of its own");
+			assert_eq!(std::fs::read(segments.join(orphan)).expect("reads the orphan again"), orphan_bytes, "{spec}: the orphan frame is as the crash left it");
+			assert_eq!(ts, vec![0, 10, 200, 210, 220], "{spec}: both committed seals read back, and the orphan's rows are not visible");
+			assert_eq!(vs.into_iter().flatten().map(|v| v.to_plain_string()).collect::<Vec<_>>(), vec!["1", "2", "3", "4", "5"], "{spec}");
+		}
+	}
+
+	/// Set only in the child process
+	/// `a_reconcile_racing_a_squash_cannot_resurrect_a_merged_member` starts: the root to
+	/// open.
+	const RACE_CHILD_ROOT: &str = "WEFT_TEST_RACE_CHILD_ROOT";
+
+	/// The body that child runs, in a process of its own because it arms `M-planned`
+	/// in-process (a point every reconcile passes) with a pause.
+	///
+	/// Segment 1 is out of order and shares timestamp 20 with segment 2, which is newer.
+	/// A reconcile of segment 1 reads it, sorts it and parks at `M-planned`; a squash of
+	/// the aspect is started meanwhile and given a second to finish; then the reconcile
+	/// goes on. The squash must not have merged segment 1 away underneath the reconcile,
+	/// which would then write it back: the old row and file of a member the squash had
+	/// merged, its stale value at timestamp 20 winning over segment 2's again (its id is
+	/// above the squash's target), and every row it shares with the target read twice.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn race_child() {
+		let Some(root) = std::env::var_os(RACE_CHILD_ROOT) else { return };
+		let store = std::sync::Arc::new(SegmentStore::open(PathBuf::from(root)).await.expect("opens"));
+		store.declare("price", &schema()).await.expect("declares");
+		store.seal("price", &schema(), &[0, 10], &[bd("1"), bd("2")]).await.expect("seals segment 0");
+		store.seal("price", &schema(), &[30, 20], &[bd("30"), bd("20")]).await.expect("seals segment 1, out of order");
+		store.seal("price", &schema(), &[20, 40], &[bd("200"), bd("400")]).await.expect("seals segment 2");
+
+		let resume = std::sync::Arc::new(tokio::sync::Notify::new());
+		let armed = fault::arm(FaultPoint::MPlanned, fault::FaultAction::Pause(resume.clone()));
+		let hits = fault::hits(FaultPoint::MPlanned);
+		let reconcile = tokio::spawn({
+			let store = store.clone();
+			async move { store.reconcile_segment("price", 1).await }
+		});
+		tokio::time::timeout(std::time::Duration::from_secs(30), fault::reached(FaultPoint::MPlanned, hits + 1)).await.expect("the reconcile reaches M-planned");
+		drop(armed);
+		let mut squash = tokio::spawn({
+			let store = store.clone();
+			async move { store.squash_aspect("price").await }
+		});
+		// Unserialized, the squash runs to completion here; serialized, it waits for the
+		// reconcile and this times out.
+		let early = tokio::time::timeout(std::time::Duration::from_secs(1), &mut squash).await;
+		let squashed_first = early.is_ok();
+		resume.notify_one();
+		let reconciled = reconcile.await.expect("the reconcile joins");
+		let squashed = match early {
+			Ok(joined) => joined,
+			Err(_) => squash.await,
+		}
+		.expect("the squash joins");
+
+		let ids: Vec<u64> = store.index().all("price").await.expect("reads").iter().map(|d| d.id).collect();
+		let (ts, vs) = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
+		let at_20 = store.read_point("price", 20).await.expect("reads a point");
+		let rollup = store.aspect_metadata("price").await.expect("reads the rollup");
+		let derived = AspectMetadata::from_index(&store.index().load_index("price").await.expect("loads the index"));
+		drop(store);
+		eprintln!("squash finished while the reconcile was parked: {squashed_first}");
+		assert!(reconciled.as_ref().is_ok_and(|rewrote| *rewrote), "the reconcile rewrote segment 1: {reconciled:?}");
+		assert!(squashed.is_ok(), "the squash succeeded: {squashed:?}");
+		assert_eq!(ids, vec![0], "one segment is left, and no merged member came back");
+		assert_eq!(ts, vec![0, 10, 20, 30, 40], "every timestamp reads once");
+		assert_eq!(vs.into_iter().flatten().map(|v| v.to_plain_string()).collect::<Vec<_>>(), vec!["1", "2", "200", "30", "400"], "the newer segment's value wins at 20");
+		assert_eq!(at_20, Some(bd("200")), "a point read agrees");
+		assert_eq!(rollup, derived, "the rollup matches the index");
+		assert!(!squashed_first, "the squash waited for the reconcile instead of running while it was parked");
+	}
+
+	/// Crash-consistency S7, window race-reconcile-resurrects-merged-member: a reconcile
+	/// paused after reading its segment, and a squash of the same aspect started meanwhile,
+	/// leave the aspect squashed with no merged member written back (see [`race_child`],
+	/// which runs in a child process).
+	#[tokio::test]
+	async fn a_reconcile_racing_a_squash_cannot_resurrect_a_merged_member() {
+		let dir = TempDir::new().expect("tempdir");
+		let exe = std::env::current_exe().expect("finds the test binary");
+		let out = tokio::process::Command::new(exe).args(["types::segment_store::tests::race_child", "--exact", "--nocapture", "--test-threads=1"]).env(RACE_CHILD_ROOT, dir.path()).output().await.expect("runs the child");
+		assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("1 passed"), "the race left the aspect squashed, with no merged member written back: {}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+	}
+
+	/// Crash-consistency S7: seals of different aspects never conflict, and those of one
+	/// aspect take turns under its commit lock instead of conflicting. Eight aspects, sixteen
+	/// seals each, all at once: the store counts every segment-index attempt that lost an
+	/// MVCC conflict, retried or not, and the count stays at zero; every seal succeeds,
+	/// each aspect's ids are distinct and every batch reads back.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+	async fn eight_aspects_sealing_at_once_lose_no_mvcc_conflict() {
+		const ASPECTS: usize = 8;
+		const SEALS: usize = 16;
+		let dir = TempDir::new().expect("tempdir");
+		let store = std::sync::Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+		let sealing: Vec<_> = (0..ASPECTS)
+			.map(|a| {
+				let store = store.clone();
+				tokio::spawn(async move { seal_concurrently(&store, &format!("aspect{a}"), SEALS).await })
+			})
+			.collect();
+		let mut outcomes = Vec::new();
+		for (a, task) in sealing.into_iter().enumerate() {
+			let results = task.await.expect("an aspect's seals join");
+			let aspect = format!("aspect{a}");
+			let ids: std::collections::BTreeSet<u64> = results.iter().filter_map(|result| result.as_ref().ok().map(|d| d.id)).collect();
+			outcomes.push((aspect.clone(), failed_seals(&results), ids.len(), unreadable_batches(&store, &aspect, SEALS).await));
+		}
+		let conflicts = store.index_conflicts();
+		drop(store);
+		for (aspect, failed, distinct, lost) in outcomes {
+			assert_eq!(failed, Vec::<String>::new(), "{aspect}: every seal succeeds");
+			assert_eq!(distinct, SEALS, "{aspect}: every seal took an id of its own");
+			assert_eq!(lost, Vec::<usize>::new(), "{aspect}: every batch reads back");
+		}
+		assert_eq!(conflicts, 0, "no segment-index attempt lost an MVCC conflict");
+	}
+
+	/// Crash-consistency S7: a split's suffix and an overlap split's suffix take their ids
+	/// from the allocator seals use, so neither reuses the id of a segment a squash or a
+	/// merge deleted. They used to take `MAX(id) + 1`: here the split's suffix would have
+	/// taken id 1 (deleted by the squash) and the overlap split's id 3.
+	#[tokio::test]
+	async fn split_suffixes_take_never_used_ids() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("price", &schema()).await.expect("declares");
+		for i in 0..3 {
+			let (ts, vs) = numbered_batch(i);
+			store.seal("price", &schema(), &ts, &vs).await.expect("seals");
+		}
+		store.squash_aspect("price").await.expect("squashes ids 1 and 2 into 0");
+		let split = store.split_segment("price", 0, 1500).await.expect("splits segment 0");
+		// A late batch overwriting the end of the split's suffix, then an overlap merge
+		// under a floor small enough to split off the suffix's cold prefix.
+		let late = store.seal("price", &schema(), &[2080, 2090, 2100], &[bd("-1"), bd("-2"), bd("-3")]).await.expect("seals a late batch").id;
+		let removed = store.reconcile_overlaps_with_policy("price", SplitPolicy::new(1)).await.expect("merges the overlap");
+		let ids: Vec<u64> = store.index().all("price").await.expect("reads").iter().map(|d| d.id).collect();
+		let (ts, vs) = store.read_time_range("price", 2000, 2100).await.expect("reads the merged window");
+		let next = store.seal("price", &schema(), &[5000], &[bd("5")]).await.expect("seals").id;
+		drop(store);
+		assert_eq!(split, Some(3), "the split's suffix takes the next never-used id");
+		assert_eq!(late, 4);
+		assert_eq!(removed, 0, "a two-member split keeps two segments");
+		assert_eq!(ids, vec![0, 3, 5], "the overlap split kept its prefix at 3 and put its suffix at a fresh id, 5");
+		assert_eq!(ts, vec![2000, 2010, 2020, 2030, 2040, 2050, 2060, 2070, 2080, 2090, 2100]);
+		let tail: Vec<String> = vs.into_iter().flatten().skip(8).map(|v| v.to_plain_string()).collect();
+		assert_eq!(tail, vec!["-1", "-2", "-3"], "the late batch wins where it overlaps");
+		assert_eq!(next, 6, "and the next seal goes on from there");
+	}
+
+	/// Crash-consistency S7: every public maintenance entry point takes its aspect's
+	/// maintenance lock. While another operation holds the aspect, each per-aspect entry
+	/// point waits up to the store's `maintenance_wait` and then fails with
+	/// `MaintenanceBusy`, and each store-wide sweep under `MaintenanceWait::Skip` lists
+	/// the aspect in `busy`, all without changing a file. A seal is not maintenance and
+	/// does not wait. Once the holder lets go within a `MaintenanceWait::Wait`, the sweep
+	/// takes the aspect and maintains it.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn a_busy_aspect_is_refused_skipped_or_waited_for() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens").with_maintenance_wait(std::time::Duration::from_millis(100));
+		store.declare("price", &schema()).await.expect("declares");
+		// Out of order and overlapping, so every operation would have work to do.
+		store.seal("price", &schema(), &[30, 10, 20], &[bd("3"), bd("1"), bd("2")]).await.expect("seals");
+		store.seal("price", &schema(), &[25, 15, 35], &[bd("5"), bd("4"), bd("6")]).await.expect("seals");
+		let held = store.locks.try_maint("price").expect("the aspect is free");
+
+		let started = std::time::Instant::now();
+		let waited = store.reconcile_aspect("price").await.expect_err("the aspect is busy");
+		let elapsed = started.elapsed();
+		let store = store.with_maintenance_wait(std::time::Duration::ZERO);
+		let before = tree_bytes(dir.path());
+		let policy = SplitPolicy::new(1);
+		let per_aspect: Vec<(&str, Result<()>)> = vec![("reconcile_segment", store.reconcile_segment("price", 0).await.map(drop)), ("split_segment", store.split_segment("price", 1, 20).await.map(drop)), ("reconcile_aspect", store.reconcile_aspect("price").await.map(drop)), ("reconcile_aspect_if_unsorted_exceeds", store.reconcile_aspect_if_unsorted_exceeds("price", 1).await.map(drop)), ("reconcile_aspect_hot_cold", store.reconcile_aspect_hot_cold("price", 1).await.map(drop)), ("reconcile_overlaps", store.reconcile_overlaps("price").await.map(drop)), ("reconcile_overlaps_with_policy", store.reconcile_overlaps_with_policy("price", policy).await.map(drop)), ("squash_aspect", store.squash_aspect("price").await.map(drop)), ("squash_aspect_if_exceeds", store.squash_aspect_if_exceeds("price", 1).await.map(drop)), ("squash_aspect_to_target_rows", store.squash_aspect_to_target_rows("price", 10).await.map(drop)), ("squash_aspect_to_target_rows_if_fragmented", store.squash_aspect_to_target_rows_if_fragmented("price", 10).await.map(drop))];
+		let skip = MaintenanceWait::Skip;
+		let sweeps: Vec<(&str, Result<Vec<String>>)> = vec![("reconcile_all_over_threshold", store.reconcile_all_over_threshold(1, skip).await.map(|s| s.busy)), ("reconcile_all_hot_cold", store.reconcile_all_hot_cold(1, skip).await.map(|s| s.busy)), ("reconcile_all_overlaps", store.reconcile_all_overlaps(skip).await.map(|s| s.busy)), ("reconcile_all_overlaps_with_policy", store.reconcile_all_overlaps_with_policy(policy, skip).await.map(|s| s.busy)), ("squash_all_over_threshold", store.squash_all_over_threshold(1, skip).await.map(|s| s.busy)), ("squash_all_to_target_rows", store.squash_all_to_target_rows(10, skip).await.map(|s| s.busy)), ("squash_all_to_target_rows_if_fragmented", store.squash_all_to_target_rows_if_fragmented(10, skip).await.map(|s| s.busy))];
+		let after = tree_bytes(dir.path());
+		let sealed = tokio::time::timeout(std::time::Duration::from_secs(30), store.seal("price", &schema(), &[50, 40], &[bd("8"), bd("7")])).await;
+
+		let store = std::sync::Arc::new(store);
+		let release = tokio::spawn(async move {
+			tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+			drop(held);
+		});
+		let waited_for = store.reconcile_all_over_threshold(1, MaintenanceWait::Wait(std::time::Duration::from_secs(30))).await.expect("sweeps");
+		release.await.expect("the holder lets go");
+		let unsorted = store.aspect_stats("price").await.expect("reads the stats").unsorted_segments;
+		drop(store);
+
+		assert_eq!(waited.downcast_ref::<MaintenanceBusy>(), Some(&MaintenanceBusy { aspect: "price".to_string(), waited: std::time::Duration::from_millis(100) }), "{waited:#}");
+		assert!(elapsed >= std::time::Duration::from_millis(100), "the entry point waited for the aspect first: {elapsed:?}");
+		for (entry, result) in &per_aspect {
+			let err = result.as_ref().err().unwrap_or_else(|| panic!("{entry} is refused while the aspect is busy"));
+			assert_eq!(err.downcast_ref::<MaintenanceBusy>().map(|busy| busy.aspect.as_str()), Some("price"), "{entry}: {err:#}");
+		}
+		for (sweep, result) in &sweeps {
+			let busy = result.as_ref().unwrap_or_else(|e| panic!("{sweep} sweeps: {e:#}"));
+			assert_eq!(busy, &vec!["price".to_string()], "{sweep} skips the busy aspect and says so");
+		}
+		let changed: Vec<&PathBuf> = before.keys().chain(after.keys()).filter(|path| before.get(*path) != after.get(*path)).collect();
+		assert!(changed.is_empty(), "no refused or skipped operation changed a file: {changed:?}");
+		assert!(sealed.is_ok_and(|sealed| sealed.is_ok()), "a seal does not wait for maintenance");
+		assert_eq!(waited_for.busy, Vec::<String>::new(), "a waiting sweep takes the aspect once it is let go");
+		assert_eq!(waited_for.aspects_reconciled, 1);
+		assert_eq!(unsorted, 0, "and maintains it");
+	}
+
+	/// The aspect and id of a legacy-named file, and nothing for any other name.
+	#[test]
+	fn legacy_file_names_parse_to_their_aspect_and_id() {
+		assert_eq!(legacy_file_id("price-12.weftseg"), Some(("price", 12)));
+		assert_eq!(legacy_file_id("price-12.weftpart"), Some(("price", 12)));
+		assert_eq!(legacy_file_id("sensor-a-7.weftseg"), Some(("sensor-a", 7)), "the id follows the last `-`");
+		assert_eq!(legacy_file_id("sensor-7-3.weftseg"), Some(("sensor-7", 3)));
+		for other in ["price.weftseg", "price-.weftseg", "-3.weftseg", "price-1x.weftseg", "price-1.weftseg.tmp", "price-1.txt", "price~g1~p1.weftseg", "LOCK"] {
+			assert_eq!(legacy_file_id(other), None, "{other}");
+		}
 	}
 }

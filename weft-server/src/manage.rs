@@ -39,7 +39,7 @@ use tracing::Instrument as _;
 use weft_line_protocol::TimestampPrecision;
 use weft_physical_type::{first_order_violation, AspectSchema, PhysicalType, SegmentDescriptor, TimeUnit};
 use weftdb::{
-	durable::{RealFs, StoreFs}, VerifyMode, RESTORE_DRILL_PREFIX
+	durable::{RealFs, StoreFs}, MaintenanceBusy, MaintenanceWait, VerifyMode, RESTORE_DRILL_PREFIX
 };
 
 use crate::{
@@ -147,6 +147,18 @@ pub async fn declare_aspect(State(state): State<AppState>, Json(request): Json<D
 	Ok((StatusCode::CREATED, Json(DeclareAspectResponse { aspect })).into_response())
 }
 
+/// Classify a maintenance error: another maintenance operation holding the aspect for
+/// longer than the store's maintenance wait ([`MaintenanceBusy`]) is a `409`, to retry
+/// once it is done; anything else (a damaged frame, a filesystem or control-plane
+/// failure) is a `500`.
+fn maintenance_error(err: &anyhow::Error) -> StorageError {
+	if err.downcast_ref::<MaintenanceBusy>().is_some() {
+		StorageError::Conflict(format!("{err:#}"))
+	} else {
+		StorageError::Internal(err.to_string())
+	}
+}
+
 /// Query parameters for `POST /api/v1/storage/{aspect}/reconcile`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ReconcileParams {
@@ -224,11 +236,16 @@ pub struct ReconcileResponse {
 /// threshold are not). Returns `200 OK` with whether it triggered, the number
 /// rewritten, and the post-pass order-health count.
 ///
+/// Maintenance operations on one aspect take turns: while another one (a daemon pass,
+/// another request) holds the aspect, this waits for it up to the store's maintenance
+/// wait (30 s by default) and then answers `409 Conflict` without touching the aspect.
+///
 /// # Errors
 ///
 /// [`StorageError::Unconfigured`] when no store is attached,
-/// [`StorageError::NotFound`] when the aspect is undeclared, and
-/// [`StorageError::Internal`] on a read/seal/control-plane failure.
+/// [`StorageError::NotFound`] when the aspect is undeclared,
+/// [`StorageError::Conflict`] when another maintenance operation held the aspect for the
+/// whole wait, and [`StorageError::Internal`] on a read/seal/control-plane failure.
 pub async fn reconcile_aspect(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<ReconcileParams>) -> Result<Response, StorageError> {
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	let metrics = state.metrics().clone();
@@ -257,17 +274,17 @@ async fn reconcile_aspect_inner(store: &weftdb::SegmentStore, aspect: &str, thre
 		// `split_min_bytes` selects the split-not-rewrite floor; absent → the default
 		// 50 MiB QuestDB floor (small components always full-rewrite).
 		let removed = match split_min_bytes {
-			Some(min) => store.reconcile_overlaps_with_policy(aspect, weft_physical_type::SplitPolicy::new(min)).await.map_err(|err| StorageError::Internal(err.to_string()))?,
-			None => store.reconcile_overlaps(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?,
+			Some(min) => store.reconcile_overlaps_with_policy(aspect, weft_physical_type::SplitPolicy::new(min)).await.map_err(|err| maintenance_error(&err))?,
+			None => store.reconcile_overlaps(aspect).await.map_err(|err| maintenance_error(&err))?,
 		};
 		("overlaps", true, removed, 0, 0)
 	} else if hot_cold {
-		let outcome = store.reconcile_aspect_hot_cold(aspect, threshold.unwrap_or(1)).await.map_err(|err| StorageError::Internal(err.to_string()))?;
+		let outcome = store.reconcile_aspect_hot_cold(aspect, threshold.unwrap_or(1)).await.map_err(|err| maintenance_error(&err))?;
 		("hot_cold", true, outcome.total(), outcome.cold_reconciled, outcome.hot_reconciled)
 	} else {
 		let (triggered, reconciled) = match threshold {
-			Some(threshold) => store.reconcile_aspect_if_unsorted_exceeds(aspect, threshold).await.map_err(|err| StorageError::Internal(err.to_string()))?.map_or((false, 0), |reconciled| (true, reconciled)),
-			None => (true, store.reconcile_aspect(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?),
+			Some(threshold) => store.reconcile_aspect_if_unsorted_exceeds(aspect, threshold).await.map_err(|err| maintenance_error(&err))?.map_or((false, 0), |reconciled| (true, reconciled)),
+			None => (true, store.reconcile_aspect(aspect).await.map_err(|err| maintenance_error(&err))?),
 		};
 		("threshold", triggered, reconciled, 0, 0)
 	};
@@ -368,11 +385,18 @@ pub struct ReconcileStoreResponse {
 /// `weft_reconcile_failed_passes_total`, and the remaining aspects are still swept; the
 /// response is a `200` either way.
 ///
+/// An aspect another maintenance operation holds (a daemon pass, another request) is
+/// waited for, with one maintenance wait (the store's, 30 s by default) shared by the
+/// whole sweep. If an aspect is still held when that runs out, the sweep leaves it alone,
+/// maintains the rest, and answers `409 Conflict` naming the aspects it left, so the
+/// caller knows to retry.
+///
 /// # Errors
 ///
-/// [`StorageError::Unconfigured`] when no store is attached, and
-/// [`StorageError::Internal`] when the aspect list or the post-sweep store stats cannot
-/// be read.
+/// [`StorageError::Unconfigured`] when no store is attached,
+/// [`StorageError::Conflict`] when other maintenance operations held some aspects for
+/// the whole wait, and [`StorageError::Internal`] when the aspect list or the post-sweep
+/// store stats cannot be read.
 pub async fn reconcile_store(State(state): State<AppState>, Query(params): Query<ReconcileParams>) -> Result<Response, StorageError> {
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	let metrics = state.metrics().clone();
@@ -386,32 +410,37 @@ pub async fn reconcile_store(State(state): State<AppState>, Query(params): Query
 /// [`SegmentStore`](weftdb::SegmentStore) handle is dropped in the caller.
 async fn reconcile_store_inner(store: &weftdb::SegmentStore, threshold: Option<usize>, hot_cold: bool, overlaps: bool, split_min_bytes: Option<u64>, metrics: &crate::metrics::SharedMetrics) -> Result<Response, StorageError> {
 	let threshold = threshold.unwrap_or(1).max(1);
-	let (mode, aspects_scanned, aspects_reconciled, segments_reconciled, cold_reconciled, hot_reconciled, failed) = if overlaps {
+	// Wait out a daemon pass (or another request) on an aspect rather than skip it.
+	let wait = MaintenanceWait::Wait(store.maintenance_wait());
+	let (mode, aspects_scanned, aspects_reconciled, segments_reconciled, cold_reconciled, hot_reconciled, failed, busy) = if overlaps {
 		// `split_min_bytes` selects the store-wide split-not-rewrite floor; absent → the
 		// default 50 MiB floor (every aspect's small components full-rewrite).
 		let sweep = match split_min_bytes {
-			Some(min) => store.reconcile_all_overlaps_with_policy(weft_physical_type::SplitPolicy::new(min)).await.map_err(|err| StorageError::Internal(err.to_string()))?,
-			None => store.reconcile_all_overlaps().await.map_err(|err| StorageError::Internal(err.to_string()))?,
+			Some(min) => store.reconcile_all_overlaps_with_policy(weft_physical_type::SplitPolicy::new(min), wait).await.map_err(|err| StorageError::Internal(err.to_string()))?,
+			None => store.reconcile_all_overlaps(wait).await.map_err(|err| StorageError::Internal(err.to_string()))?,
 		};
 		if sweep.aspects_reconciled > 0 {
 			metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_removed).unwrap_or(u64::MAX));
 		}
-		("overlaps", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_removed, 0, 0, SweepFailure::list(&sweep.failed))
+		("overlaps", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_removed, 0, 0, SweepFailure::list(&sweep.failed), sweep.busy)
 	} else if hot_cold {
-		let sweep = store.reconcile_all_hot_cold(threshold).await.map_err(|err| StorageError::Internal(err.to_string()))?;
+		let sweep = store.reconcile_all_hot_cold(threshold, wait).await.map_err(|err| StorageError::Internal(err.to_string()))?;
 		if sweep.aspects_reconciled > 0 {
 			metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_reconciled()).unwrap_or(u64::MAX));
 		}
-		("hot_cold", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_reconciled(), sweep.cold_reconciled, sweep.hot_reconciled, SweepFailure::list(&sweep.failed))
+		("hot_cold", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_reconciled(), sweep.cold_reconciled, sweep.hot_reconciled, SweepFailure::list(&sweep.failed), sweep.busy)
 	} else {
-		let sweep = store.reconcile_all_over_threshold(threshold).await.map_err(|err| StorageError::Internal(err.to_string()))?;
+		let sweep = store.reconcile_all_over_threshold(threshold, wait).await.map_err(|err| StorageError::Internal(err.to_string()))?;
 		if sweep.aspects_reconciled > 0 {
 			metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_reconciled).unwrap_or(u64::MAX));
 		}
-		("threshold", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_reconciled, 0, 0, SweepFailure::list(&sweep.failed))
+		("threshold", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_reconciled, 0, 0, SweepFailure::list(&sweep.failed), sweep.busy)
 	};
 	if !failed.is_empty() {
 		metrics.record_reconcile_failures(u64::try_from(failed.len()).unwrap_or(u64::MAX));
+	}
+	if !busy.is_empty() {
+		return Err(StorageError::Conflict(format!("aspects {busy:?} were held by other maintenance operations for the whole {:?} wait and were not swept; the other {} aspects were swept; retry", store.maintenance_wait(), aspects_scanned.saturating_sub(busy.len()))));
 	}
 	let unsorted_segments = store.store_stats().await.map_err(|err| StorageError::Internal(err.to_string()))?.unsorted_segments;
 	let overlapping_segments = store.store_overlapping_segments().await.map_err(|err| StorageError::Internal(err.to_string()))?;
@@ -453,13 +482,16 @@ pub struct SquashResponse {
 /// [`squash_aspect_if_exceeds`](weftdb::SegmentStore::squash_aspect_if_exceeds), so
 /// the rewrite runs only when the segment count exceeds `N` — the trigger that bounds
 /// the fragmentation repeated split carve-offs create. Returns `200 OK` with whether
-/// it triggered, how many segments it removed, and the post-pass segment count.
+/// it triggered, how many segments it removed, and the post-pass segment count. Like
+/// the reconcile endpoint, it waits for an aspect another maintenance operation holds up
+/// to the store's maintenance wait (30 s by default), then answers `409 Conflict`.
 ///
 /// # Errors
 ///
 /// [`StorageError::Unconfigured`] when no store is attached,
-/// [`StorageError::NotFound`] when the aspect is undeclared, and
-/// [`StorageError::Internal`] on a read/seal/control-plane failure.
+/// [`StorageError::NotFound`] when the aspect is undeclared,
+/// [`StorageError::Conflict`] when another maintenance operation held the aspect for the
+/// whole wait, and [`StorageError::Internal`] on a read/seal/control-plane failure.
 pub async fn squash_aspect(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<SquashParams>) -> Result<Response, StorageError> {
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	drop(state);
@@ -468,8 +500,8 @@ pub async fn squash_aspect(State(state): State<AppState>, Path(aspect): Path<Str
 		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	}
 	let (triggered, removed) = match params.max_segments {
-		Some(max) => store.squash_aspect_if_exceeds(&aspect, max).await.map_err(|err| StorageError::Internal(err.to_string()))?.map_or((false, 0), |removed| (true, removed)),
-		None => (true, store.squash_aspect(&aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?),
+		Some(max) => store.squash_aspect_if_exceeds(&aspect, max).await.map_err(|err| maintenance_error(&err))?.map_or((false, 0), |removed| (true, removed)),
+		None => (true, store.squash_aspect(&aspect).await.map_err(|err| maintenance_error(&err))?),
 	};
 	let segment_count = store.segment_count(&aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?;
 	drop(store);
@@ -506,13 +538,16 @@ pub struct CompactResponse {
 /// The manual counterpart of the `WEFT_COMPACT_TARGET_ROWS` daemon pass, delegating to
 /// [`SegmentStore::squash_aspect_to_target_rows`](weftdb::SegmentStore::squash_aspect_to_target_rows).
 /// Returns `200 OK` with how many segments it removed and the post-pass segment count.
+/// Like the reconcile endpoint, it waits for an aspect another maintenance operation holds
+/// up to the store's maintenance wait (30 s by default), then answers `409 Conflict`.
 ///
 /// # Errors
 ///
 /// [`StorageError::Unconfigured`] when no store is attached,
 /// [`StorageError::BadRequest`] when `target_rows` is absent,
-/// [`StorageError::NotFound`] when the aspect is undeclared, and
-/// [`StorageError::Internal`] on a read/seal/control-plane failure.
+/// [`StorageError::NotFound`] when the aspect is undeclared,
+/// [`StorageError::Conflict`] when another maintenance operation held the aspect for the
+/// whole wait, and [`StorageError::Internal`] on a read/seal/control-plane failure.
 pub async fn compact_aspect(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<CompactParams>) -> Result<Response, StorageError> {
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	drop(state);
@@ -521,7 +556,7 @@ pub async fn compact_aspect(State(state): State<AppState>, Path(aspect): Path<St
 	if store.schema_for(&aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?.is_none() {
 		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	}
-	let removed = store.squash_aspect_to_target_rows(&aspect, target_rows).await.map_err(|err| StorageError::Internal(err.to_string()))?;
+	let removed = store.squash_aspect_to_target_rows(&aspect, target_rows).await.map_err(|err| maintenance_error(&err))?;
 	let segment_count = store.segment_count(&aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?;
 	drop(store);
 	Ok((StatusCode::OK, Json(CompactResponse { aspect, removed, segment_count })).into_response())
