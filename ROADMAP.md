@@ -799,6 +799,13 @@ defines **1.0 / stable**: the point at which WeftDB makes a semver promise about
 API, its on-disk format, and its durability. Today WeftDB is **pre-beta** — every crate
 is `0.1.0` and nothing is tagged. 1.0 ships when every box below is ticked.
 
+**Execution plan:** [`docs/release/1.0-plan.md`](docs/release/1.0-plan.md) orders every
+remaining box into waves W0–W15. Its preface records the owner's decisions of 2026-10-08:
+everything ships as 1.0, the library crates included, with a frozen Rust API; B-tags stay a
+gate; a v0.1.0 baseline GitHub release (no crates.io) is tagged before durability slice S6
+reaches main; the soak and report runs use a dedicated SSD volume at `/mnt/weftbench`; every
+other open question takes the plan's recommendation.
+
 Gates that point at an item elsewhere in this file are ticked **only** when that item
 is ticked there — the referenced item stays the source of truth for its detail.
 
@@ -840,7 +847,7 @@ report → API/format freeze → **1.0**.
 
 - [x] **Dependencies current and audited (2026-10-05)** — every dependency on its latest major (turso 0.8, wgpu 30, arrow/parquet 60, OpenTelemetry 0.33, rand 0.10, thiserror 2, …). The unmaintained `bincode` (RUSTSEC-2025-0141; its 3.0.0 release is a `compile_error!` tombstone) was replaced by `postcard` 1.x for the `.weftpart` sidecar (frame v3, magic `\x02`; older sidecars are ignored and the segment is decoded instead). The `crossbeam-epoch` and `h2` advisories were cleared, and wildcard `"0"` requirements were pinned to their minor versions
 - [ ] **CI** — build, test, `clippy`, `fmt` on every PR (the repository has no workflows today); a nightly benchmark-regression job
-- [ ] **Public surface declared and frozen** — `/api/v1` HTTP contract, `.weftseg` `format_version`, control-plane schema; anything not listed is explicitly unstable
+- [ ] **Public surface declared and frozen** — `/api/v1` HTTP contract, `.weftseg` `format_version`, control-plane schema, and the published library crates' Rust API (owner decision 2026-10-08: every crate ships as 1.0); anything not listed is explicitly unstable
 - [ ] **Compatibility tests** — a fixture store written by the previous release is read by the current one; a format change requires a version bump and a migration
 - [ ] **Semver policy + `CHANGELOG.md`**, starting from the first tagged pre-release
 - [ ] **Crate publishing split** — `publish = false` on internal crates (`weft-bench`, `weft-tui`, likely `database_orchestration`); published crates carry versioned path dependencies, docs, and a single edition
