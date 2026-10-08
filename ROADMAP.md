@@ -172,7 +172,7 @@ pattern_pipeline), `datasets/`, `runners/` (local, docker_compose, cloud),
 - [x] **DONE (2026-10-08) — disk capture:** `RunMetadata.work_disk_{kind,file_system,mount_point}` (schema v18). The disk
   under the working directory, found by longest mount-point prefix through `sysinfo::Disks`.
   Verified live: a run from `/mnt/deepmem` reports `hdd btrfs`, one from `/` reports `ssd btrfs`.
-- [ ] Remaining hardware capture — GPU and driver versions in run metadata (needs a wgpu adapter
+- [ ] Remaining hardware capture — GPU and driver versions in run metadata. **Blocked on the splimes 0.1→1 migration** (`deps/splimes-1`): `splimes` 1.0 exposes `gpu::gpu_info()` with a `driver` field, 0.1 does not. Original note: needs a wgpu adapter
   query; `splimes` owns the adapter)
 - [ ] Report surfaces beyond JSON/HTML — Parquet / Grafana dashboards
 - [ ] Anti-Goodhart (Phase 1.3) — publish negative results + WeftDB-losing workloads; benchmark code separate from engine code; run customer-supplied workloads; README policy line *("WeftDB benchmarks guide real engineering decisions, not synthetic wins")* — policy line + the sawtooth negative finding shipped; the publication pipeline is open
@@ -1363,6 +1363,11 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
     scale is *window-dependent* — which is exactly why it must be derived, not declared by a benchmark.
   - [ ] Audit the other `weft-bench` workloads' generators for the same class of flattery (the shape
     knobs are seeded and reproducible, but "reproducible" is not "representative").
+    - [x] **DONE (2026-10-08) — the compression workload runs on a real corpus:** `--comp-csv <FILE>`
+      (`--comp-value-col`, `--comp-skip`; exact decimal text; header auto-skipped; rows sorted).
+      1M real BTC closes (rows 3M..): **4.22 B/point realized** (`scaled_for`), round trip PASS,
+      20.8M points/s decode, `advisory_dfor_value_bytes` = 1.70 B/point. Residue: `point_lookup` /
+      `range_fetch` / `downsample` still read only generated corpora.
 
 - [x] **DONE (2026-07-20) — BUG ROOT-CAUSED + FIXED: the "flaky GPU interpolation tests" were never a
   GPU bug.** The roadmap offered two hypotheses — a real GPU race, or an unsound check. **Both the

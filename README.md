@@ -1182,7 +1182,13 @@ What it does today:
   the full-decode value; **`range_fetch`** (`--range-fetch`) times the windowed
   range read; **`compression`** (`--compression`) reports realized bytes/point, the
   value-column compression ratio, and decode throughput, gated on an exact
-  round-trip; and **`downsample`** (`--downsample`) times WeftDB's canonical
+  round-trip — over a seeded shape, or a **real corpus** with `--comp-csv <FILE>`
+  (`--comp-value-col`, `--comp-skip`; values read as exact decimal text). On 1M real
+  BTC/USD one-minute closes (rows 3M onward of `btc_1min.csv`) it measures **4.22 B/point
+  realized** (`scaled_for`, exact), full-decode **20.8M points/sec** (p50 52.7 ms, 5 reps),
+  and an advisory decimal-exponent FOR footprint of **1.70 B/point**
+  (`weft-bench --compression --comp-csv database/datasets/btc_1min.csv --comp-value-col 4
+  --comp-skip 3000000 --comp-rows 1000000 --reps 5`); and **`downsample`** (`--downsample`) times WeftDB's canonical
   [`weft-reduce`](weft-reduce) reduction into grid-aligned buckets with a
   `--ds-aggs` selector over `min`/`max`/`avg`/`sum`/`first`/`last`/`p50`…`p99`/`twa`/`twa_linear`/`twa_bucket_end`/`sketch_p50`…`sketch_p99`.
   `--ds-parallel <N>` reduces in N chunks via mergeable partial reductions (identical
@@ -1245,6 +1251,7 @@ cargo run -p weft-bench -- \
 cargo run -p weft-bench -- --point-lookup --pl-rows 100000 --pl-queries 128 --reps 50
 cargo run -p weft-bench -- --range-fetch --rf-window 100 --rf-windows 32 --reps 30
 cargo run -p weft-bench -- --compression --comp-shape clustered --reps 20
+cargo run --release -p weft-bench -- --compression --comp-csv database/datasets/btc_1min.csv --comp-value-col 4 --comp-skip 3000000 --comp-rows 1000000 --reps 5
 cargo run -p weft-bench -- --downsample --ds-bucket m --ds-aggs min,max,p99,twa --reps 20
 ```
 

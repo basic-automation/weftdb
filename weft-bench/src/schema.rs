@@ -70,7 +70,7 @@ use crate::{
 /// deltas under per-block FOR, for independent random intervals), each present only when it
 /// beats the realized timestamp codec. v18 added the report's `metadata.work_disk_kind` /
 /// `work_disk_file_system` / `work_disk_mount_point` (the disk under the working directory, so
-/// an HDD-backed run is distinguishable from an NVMe one). All optional fields are
+/// an HDD-backed run is distinguishable from a solid-state one). All optional fields are
 /// `#[serde(default)]`, so older artifacts still deserialize.
 pub const SCHEMA_VERSION: u32 = 18;
 

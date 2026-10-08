@@ -17,8 +17,15 @@
 //!
 //! Like the other storage workloads it drives WeftDB's own `weft-physical-type` path
 //! directly (no `database`/libSQL), keeping Weft-Bench a vendor-neutral leaf crate.
+//!
+//! Besides the three seeded shapes, [`load_csv_corpus`] + [`run_compression_on`] run the same
+//! workload over a **real** `timestamp,value` CSV corpus (`--comp-csv`). The seeded shapes are
+//! reproducible but not representative: on the real BTC corpus the synthetic generator
+//! overstated compression ~2.5×, so real-data runs are the ones a bytes/point claim should cite.
 
-use std::time::Instant;
+use std::{
+	io::{BufRead, BufReader}, path::Path, time::Instant
+};
 
 use bigdecimal::{BigDecimal, ToPrimitive};
 use rand::{RngExt, SeedableRng};
@@ -185,15 +192,44 @@ fn span_ns(since: Instant) -> u64 {
 /// Returns an error if `reps == 0`, if the corpus cannot be sealed, or if a decode
 /// fails.
 pub fn run_compression(profile: &CompressionProfile, reps: usize) -> anyhow::Result<BenchResult> {
+	let setup_start = Instant::now();
+	let (timestamps, values) = profile.generate();
+	let generation_ns = span_ns(setup_start);
+	run_compression_on(&CorpusRun { name: &profile.name, seed: profile.seed, unit: SEGMENT_UNIT, generation_ns }, &timestamps, &values, reps)
+}
+
+/// Identity and provenance of one compression run's corpus.
+#[derive(Debug, Clone, Copy)]
+pub struct CorpusRun<'a> {
+	/// Profile name recorded in the result.
+	pub name: &'a str,
+	/// Seed recorded in the result (`0` for a loaded corpus, which has none).
+	pub seed: u64,
+	/// The unit the timestamps are expressed in.
+	pub unit: TimeUnit,
+	/// Nanoseconds spent producing the corpus (generation or loading), charged to setup.
+	pub generation_ns: u64,
+}
+
+/// Run the compression workload over an explicit, time-sorted `(timestamps, values)` corpus.
+///
+/// Seals it once, then times `reps` full decodes. The engine behind [`run_compression`], exposed
+/// so a real corpus ([`load_csv_corpus`]) is measured by exactly the same code. `irregular` in
+/// the result is derived from the data (`false` only for a constant stride).
+///
+/// # Errors
+///
+/// Returns an error if `reps == 0`, if the corpus cannot be sealed (unsorted timestamps, or a
+/// value unrepresentable exactly), or if a decode fails.
+pub fn run_compression_on(run: &CorpusRun<'_>, timestamps: &[i64], values: &[BigDecimal], reps: usize) -> anyhow::Result<BenchResult> {
 	anyhow::ensure!(reps > 0, "reps must be > 0");
 
 	let run_start = Instant::now();
 
 	let setup_start = Instant::now();
-	let (timestamps, values) = profile.generate();
-	let segment = Segment::build_sorted(&timestamps, &values, SEGMENT_UNIT, &BigDecimal::from(0)).map_err(|e| anyhow::anyhow!("cannot seal compression segment: {e:?}"))?;
+	let segment = Segment::build_sorted(timestamps, values, run.unit, &BigDecimal::from(0)).map_err(|e| anyhow::anyhow!("cannot seal compression segment: {e:?}"))?;
 	let bytes = segment.write_to();
-	let setup_ns = span_ns(setup_start);
+	let setup_ns = span_ns(setup_start).saturating_add(run.generation_ns);
 
 	// The expected round-trip: the input values as `Some` (the corpus has no nulls).
 	let expected_values: Vec<Option<BigDecimal>> = values.iter().cloned().map(Some).collect();
@@ -208,20 +244,20 @@ pub fn run_compression(profile: &CompressionProfile, reps: usize) -> anyhow::Res
 	}
 
 	let measured_ns = samples_ns.iter().copied().fold(0_u64, u64::saturating_add);
-	let end_to_end_ns = span_ns(run_start);
+	let end_to_end_ns = span_ns(run_start).saturating_add(run.generation_ns);
 	let timing = TimingBreakdown { dataset_generation_ns: setup_ns, measured_ns, end_to_end_ns };
 
 	// Correctness: the decode must round-trip the input exactly (timestamps + values),
 	// and every decoded value must be finite.
 	let (dec_ts, dec_vals) = &last_decoded;
-	let round_trips = dec_ts == &timestamps && dec_vals == &expected_values;
+	let round_trips = dec_ts.as_slice() == timestamps && dec_vals == &expected_values;
 	let values_finite = dec_vals.iter().flatten().all(|v| v.to_f64().is_some_and(f64::is_finite));
 	let correctness = CorrectnessReport { output_count_ok: dec_ts.len() == timestamps.len() && round_trips, expected_output_points: timestamps.len(), actual_output_points: dec_ts.len(), values_finite };
 
-	let storage = Some(StorageEstimate::from_columns(&values, &timestamps, SEGMENT_UNIT, &BigDecimal::from(0)));
+	let storage = Some(StorageEstimate::from_columns(values, timestamps, run.unit, &BigDecimal::from(0)));
 
 	let latency = LatencyStats::from_samples(&samples_ns);
-	let latency_ci = Some(LatencyStats::bootstrap_cis(&samples_ns, &BootstrapConfig { seed: profile.seed ^ 0x_C0FF_EE15_C0DE_u64, ..BootstrapConfig::default() }));
+	let latency_ci = Some(LatencyStats::bootstrap_cis(&samples_ns, &BootstrapConfig { seed: run.seed ^ 0x_C0FF_EE15_C0DE_u64, ..BootstrapConfig::default() }));
 	// Throughput is points decoded per second (the whole segment per rep).
 	let throughput_points_per_sec = if latency.mean_ns > 0 {
 		#[allow(clippy::cast_precision_loss)]
@@ -232,8 +268,49 @@ pub fn run_compression(profile: &CompressionProfile, reps: usize) -> anyhow::Res
 	} else {
 		0.0
 	};
+	let irregular = timestamps.windows(3).any(|w| w[2] - w[1] != w[1] - w[0]);
 
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_COMPRESSION.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: dec_ts.len(), irregular: !profile.regular, missingness_fraction: 0.0, seed: profile.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: run.name.to_string(), adapter: "weftdb".to_string(), workload: WORKLOAD_COMPRESSION.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: dec_ts.len(), irregular, missingness_fraction: 0.0, seed: run.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage })
+}
+
+/// Load a real `(timestamp, value)` corpus from a CSV file for [`run_compression_on`].
+///
+/// Each data row's first field is the timestamp: an integer epoch, or one with a fractional
+/// part (`1325412060.0`) whose integer part is taken. The field at `value_column` (0-based) is the
+/// value, parsed as **decimal text**, so `3558.93` stays exactly `3558.93` and never passes
+/// through a float. A first line whose timestamp does not parse is treated as a header. After the
+/// header, `skip_rows` data rows are skipped (the head of a real feed is often unrepresentative:
+/// the BTC file opens with constant 2012 ticks) and at most `max_rows` are read. The rows are
+/// then stably sorted by timestamp, since sealing requires time order.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read, a data row has no field at `value_column`, a
+/// timestamp or value does not parse, or fewer than two rows remain.
+pub fn load_csv_corpus(path: &Path, value_column: usize, skip_rows: usize, max_rows: usize) -> anyhow::Result<(Vec<i64>, Vec<BigDecimal>)> {
+	let file = std::fs::File::open(path).map_err(|e| anyhow::anyhow!("cannot open {}: {e}", path.display()))?;
+	let parse_ts = |field: &str| field.trim().split('.').next().and_then(|whole| whole.parse::<i64>().ok());
+	let mut lines = BufReader::new(file).lines().enumerate().peekable();
+	if let Some((_, Ok(first))) = lines.peek() {
+		if parse_ts(first.split(',').next().unwrap_or("")).is_none() {
+			lines.next();
+		}
+	}
+	let mut rows: Vec<(i64, BigDecimal)> = Vec::new();
+	for (line_no, line) in lines.skip(skip_rows).take(max_rows) {
+		let line = line.map_err(|e| anyhow::anyhow!("{}: line {}: {e}", path.display(), line_no + 1))?;
+		if line.trim().is_empty() {
+			continue;
+		}
+		let fields: Vec<&str> = line.split(',').collect();
+		let ts = fields.first().and_then(|f| parse_ts(f)).ok_or_else(|| anyhow::anyhow!("{}: line {}: unparseable timestamp", path.display(), line_no + 1))?;
+		let raw = fields.get(value_column).ok_or_else(|| anyhow::anyhow!("{}: line {}: no column {value_column}", path.display(), line_no + 1))?;
+		let value: BigDecimal = raw.trim().parse().map_err(|e| anyhow::anyhow!("{}: line {}: value {raw:?}: {e}", path.display(), line_no + 1))?;
+		rows.push((ts, value));
+	}
+	anyhow::ensure!(rows.len() >= 2, "{}: need at least two rows after skipping {skip_rows}, found {}", path.display(), rows.len());
+	rows.sort_by_key(|(ts, _)| *ts);
+	Ok(rows.into_iter().unzip())
 }
 
 #[cfg(test)]
@@ -271,6 +348,27 @@ mod tests {
 		// The realized value column is well below the naive fixed-width baseline — a real
 		// compression ratio, the headline the workload exists to surface.
 		assert!(storage.realized_value_bytes < storage.estimated_value_bytes, "the corpus must actually compress: realized {} vs logical {}", storage.realized_value_bytes, storage.estimated_value_bytes);
+	}
+
+	#[test]
+	fn a_csv_corpus_loads_exactly_and_runs_through_the_same_workload() {
+		let dir = std::env::temp_dir().join(format!("weft-bench-comp-csv-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).expect("temp dir");
+		let path = dir.join("corpus.csv");
+		// A header, two head rows to skip, then out-of-order rows with an 8-decimal value.
+		std::fs::write(&path, "Timestamp,Open,Close\n1.0,9,9\n2.0,9,9\n1505412180.0,1,3542.17\n1505412060.0,1,3558.93\n1505412120.0,1,3550.12345678\n").expect("write");
+		let (ts, vals) = load_csv_corpus(&path, 2, 2, usize::MAX).expect("loads");
+		assert_eq!(ts, vec![1_505_412_060, 1_505_412_120, 1_505_412_180], "header skipped, head skipped, sorted");
+		assert_eq!(vals.iter().map(ToString::to_string).collect::<Vec<_>>(), vec!["3558.93", "3550.12345678", "3542.17"], "decimal text stays exact");
+		let result = run_compression_on(&CorpusRun { name: "csv", seed: 0, unit: TimeUnit::Seconds, generation_ns: 0 }, &ts, &vals, 2).expect("runs");
+		assert!(result.correctness.passed(), "a real corpus must round-trip exactly: {:?}", result.correctness);
+		assert!(!result.dataset.irregular, "a constant 60 s stride is regular");
+		assert_eq!(result.storage.expect("storage").timestamp_unit, "seconds");
+		// Errors: a missing column, too few rows, an unreadable file.
+		assert!(load_csv_corpus(&path, 9, 0, usize::MAX).is_err());
+		assert!(load_csv_corpus(&path, 2, 4, usize::MAX).is_err());
+		assert!(load_csv_corpus(&dir.join("absent.csv"), 1, 0, 10).is_err());
+		std::fs::remove_dir_all(&dir).ok();
 	}
 
 	#[test]
