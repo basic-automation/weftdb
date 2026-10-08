@@ -313,8 +313,11 @@ Exact decimals are not free yet either. An hourly `avg` over 1M real BTC closes 
 in `f64`, about a **43×** precision tax, where QuestDB documents ~2× for its `DECIMAL`. The
 same reduction over the exact scaled-integer mantissas WeftDB already stores runs in **1.44 ms**,
 faster than `f64`, so the gap comes from the arithmetic path and not from exactness itself
-([`weft-reduce/benches/decimal_tax.rs`](weft-reduce/benches/decimal_tax.rs)). An integer-native
-reduction is on the roadmap.
+([`weft-reduce/benches/decimal_tax.rs`](weft-reduce/benches/decimal_tax.rs)). The first step has
+shipped as `weft_reduce::reduce_scaled`, which gives the same buckets as `reduce` from integer
+accumulators: an hourly `sum` drops from **58.65 ms to 8.46 ms**. An hourly `avg` is still
+dominated by its per-bucket `BigDecimal` division, and it is not yet wired into the server's
+downsample path.
 
 ---
 

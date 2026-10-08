@@ -1320,7 +1320,24 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
     arithmetic. Either way, against QuestDB's documented ~2× the precision wedge currently costs
     more than the competitor's, while the exact integer path WeftDB's `ScaledI64` columns already
     store is *faster* than f64.
-  - [ ] **NEXT — a `ScaledI64`-native reduction fast path in `weft-reduce`:** reduce
+  - [x] **DONE (2026-10-08) — `weft_reduce::reduce_scaled`**, the integer-native streaming reduction
+    (count/sum/avg/min/max/first/last over `(epoch_nanos, mantissa, scale)`, i128/i64 accumulators,
+    one BigDecimal per output bucket). It is **equal bucket-for-bucket to `reduce`** (tested over
+    resolutions, filters and out-of-order input; bucket keys property-tested against
+    `Resolution::to_base`) and returns `None` for percentiles, TWA and sketches. On the real-BTC
+    `decimal_tax` bench: **`sum` 58.65 → 8.46 ms (6.9×)**. **`avg` 133–153 → 50–133 ms** across two
+    loaded runs, because the per-bucket `BigDecimal` division (17,477 of them) now dominates both
+    paths.
+  - [ ] **NEXT — the `avg` division is the new floor.** Both paths spend most of an hourly `avg`
+    in 17,477 default-precision BigDecimal divisions. Options that keep the API exact: defer the
+    division (return sum + count, and divide only for what the caller serializes), or produce the
+    quotient by integer long division to the same precision with the same rounding, proven equal
+    by the `reduce_scaled_equals_reduce` test.
+  - [ ] **NEXT — wire `reduce_scaled` into the read path:** `SegmentStore::downsample_range` and the
+    `.weftpart` sidecar build should call it with the segment's decoded mantissas when the column
+    is `ScaledI64` and every requested reduction is streaming, and fall back to `reduce` otherwise.
+    Then re-run `--ds-csv` and `decimal_tax` and publish the factor beside QuestDB's ~2×.
+  - [ ] *(original item)* **a `ScaledI64`-native reduction fast path in `weft-reduce`:** reduce
     `(epoch, mantissa, scale)` columns straight from the segment for count/sum/avg/min/max/first/last
     (i128 accumulators), materializing a BigDecimal only per output bucket. It stays exact (the
     BigDecimal stays the API type) and the measured ceiling is ~70× over today's path on this

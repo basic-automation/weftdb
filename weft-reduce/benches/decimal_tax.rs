@@ -11,6 +11,8 @@
 //! - `scaled_i64_loop`: the same buckets over the **exact** scale-8 `i64` mantissas a
 //!   `ScaledI64` column already stores, summed in `i128`. It is exact like `BigDecimal` and
 //!   integer-fast like `f64`, and it is what a `ScaledI64`-native reduction would cost.
+//! - `reduce_scaled`: the shipped integer-native reduction ([`weft_reduce::reduce_scaled`]) over
+//!   the same mantissas, producing the same `Bucket`s as `bigdecimal_reduce` (asserted equal).
 //!
 //! Before timing, the three are checked against each other: the integer sums must equal the
 //! `BigDecimal` sums exactly, and the `f64` averages must agree to 1e-9 relative.
@@ -23,7 +25,7 @@ use bigdecimal::{BigDecimal, ToPrimitive};
 use chrono::DateTime;
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use splimes::{Point, Resolution};
-use weft_reduce::{reduce, Aggregation};
+use weft_reduce::{reduce, reduce_scaled, Aggregation};
 
 const N: usize = 1 << 20;
 const SKIP: usize = 3_000_000;
@@ -112,14 +114,30 @@ fn bench_decimal_tax(c: &mut Criterion) {
 		let shipped_avg = bucket.values.get(Aggregation::Avg.as_str()).and_then(ToPrimitive::to_f64).expect("avg");
 		assert!((shipped_avg - avg).abs() <= 1e-9 * shipped_avg.abs(), "f64 avg {avg} vs BigDecimal avg {shipped_avg} (bucket {start})");
 	}
-	eprintln!("decimal_tax: {} hourly buckets over {N} real closes; all three paths agree", exact.len());
+	let nanos: Vec<i64> = corpus.seconds.iter().map(|&t| t * 1_000_000_000).collect();
+	let scale_u32 = u32::try_from(SCALE).unwrap_or(0);
+	let avg_only = reduce(&corpus.points, Resolution::Hours, None, None, &[Aggregation::Avg]).expect("reduces");
+	assert_eq!(reduce_scaled(&nanos, &corpus.mantissas, scale_u32, Resolution::Hours, None, None, &[Aggregation::Avg]).expect("reduces"), Some(avg_only), "reduce_scaled must equal reduce bucket for bucket");
+	eprintln!("decimal_tax: {} hourly buckets over {N} real closes; all four paths agree", exact.len());
 
 	let mut group = c.benchmark_group("hourly_avg_1mi_btc");
 	group.sample_size(10);
 	group.throughput(Throughput::Elements(N as u64));
 	group.bench_function("bigdecimal_reduce", |b| b.iter(|| black_box(reduce(black_box(&corpus.points), Resolution::Hours, None, None, &[Aggregation::Avg]).expect("reduces"))));
 	group.bench_function("f64_loop", |b| b.iter(|| black_box(f64_hourly_avg(black_box(&corpus.seconds), black_box(&corpus.floats)))));
+	group.bench_function("reduce_scaled", |b| b.iter(|| black_box(reduce_scaled(black_box(&nanos), black_box(&corpus.mantissas), scale_u32, Resolution::Hours, None, None, &[Aggregation::Avg]).expect("reduces"))));
 	group.bench_function("scaled_i64_loop", |b| b.iter(|| black_box(scaled_hourly_sums(black_box(&corpus.seconds), black_box(&corpus.mantissas)))));
+	group.finish();
+
+	// The same two shipped paths with `sum` only, which isolates the per-bucket `avg` division
+	// (a `BigDecimal` division at its default precision) from the per-sample accumulation.
+	let sum_only = reduce(&corpus.points, Resolution::Hours, None, None, &[Aggregation::Sum]).expect("reduces");
+	assert_eq!(reduce_scaled(&nanos, &corpus.mantissas, scale_u32, Resolution::Hours, None, None, &[Aggregation::Sum]).expect("reduces"), Some(sum_only));
+	let mut group = c.benchmark_group("hourly_sum_1mi_btc");
+	group.sample_size(10);
+	group.throughput(Throughput::Elements(N as u64));
+	group.bench_function("bigdecimal_reduce", |b| b.iter(|| black_box(reduce(black_box(&corpus.points), Resolution::Hours, None, None, &[Aggregation::Sum]).expect("reduces"))));
+	group.bench_function("reduce_scaled", |b| b.iter(|| black_box(reduce_scaled(black_box(&nanos), black_box(&corpus.mantissas), scale_u32, Resolution::Hours, None, None, &[Aggregation::Sum]).expect("reduces"))));
 	group.finish();
 }
 
