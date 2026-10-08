@@ -124,6 +124,8 @@ jobs:
           if [ "${{ github.event_name }}" != "schedule" ]; then export SKIP_SLOW_TESTS=1; fi
           cargo test -p weftdb --features fault-injection --locked --test db_tests -- database_new_crash --test-threads=4
           cargo test -p weft-orchestration --features fault-injection --locked --test legacy_queue_crash -- --test-threads=4
+          # Not a crash test, but it poisons a store through the same feature's hook.
+          cargo test -p weft-server --features fault-injection --locked --test ready_poisoned -- --test-threads=4
 
   docs:
     name: rustdoc

@@ -583,6 +583,15 @@ impl SegmentStore {
 		self.poison.get()
 	}
 
+	/// Write-poison the store for `reason`, as an ambiguous COMMIT would, without staging
+	/// one. The hook for tests of the layers above (`weft-server`'s `/ready`), which
+	/// cannot reach the store's commit path; only `fault-injection` builds have it.
+	#[cfg(feature = "fault-injection")]
+	#[doc(hidden)]
+	pub fn inject_poison(&self, reason: impl Into<String>) {
+		self.poison.set(reason.into());
+	}
+
 	/// Refuse a write while the store is poisoned. Every write entry point calls this
 	/// first, before it reads or writes anything.
 	fn writable(&self) -> Result<()> {

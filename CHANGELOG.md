@@ -126,6 +126,10 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   windows on it.
 - `weft-orchestration` has a `fault-injection` feature (it enables weftdb's) for its
   crash tests: `cargo test -p weft-orchestration --features fault-injection --test legacy_queue_crash`.
+- `weft-server` has a `fault-injection` feature too (it enables weftdb's), for the test
+  that `GET /ready` reports a poisoned store:
+  `cargo test -p weft-server --features fault-injection --test ready_poisoned`. Under
+  that feature `SegmentStore` has a hidden `inject_poison` test hook.
 
 ### Fixed
 
