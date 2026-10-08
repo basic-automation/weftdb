@@ -39,6 +39,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   implementation) and the DDSketch quantile sketch (from Datadog's sketches-java), with the
   upstream NOTICE text and the license. The Chimp128 docs no longer credit DuckDB as the
   source.
+- **Contribution terms.** Every pull request takes one of two routes, the contributor's
+  choice: a DCO sign-off (`git commit -s`) on every commit, or the WeftDB Individual
+  Contributor License Agreement ([`CLA.md`](CLA.md), version 1, adapted from the Apache
+  Software Foundation's ICLA with Justin Icenhour as the recipient), signed once by a pull
+  request comment. The `contribution-terms` check passes a pull request when either holds.
+  Contributions are licensed `MIT OR Apache-2.0`. See
+  [`CONTRIBUTING.md`](CONTRIBUTING.md#contribution-terms).
 
 ### Changed
 
