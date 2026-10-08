@@ -187,10 +187,11 @@ pub struct TxnApplied {
 /// Why an [`IndexTxn`] failed, which decides what its caller may do next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxnErrorKind {
-	/// An MVCC conflict before COMMIT, and either the transaction may not be retried
-	/// (an unguarded op had run; see the module documentation) or the conflict outlasted
-	/// every retry. Nothing was written; the caller may try again later, from a fresh
-	/// read.
+	/// An MVCC conflict raised before COMMIT, or by COMMIT's own validation (which rolls
+	/// the transaction back before it writes the log record), that was not retried: an
+	/// unguarded op had run (see the module documentation), the caller's `may_retry`
+	/// declined ([`IndexTxn::run_while`]), or the conflict outlasted every retry. Nothing
+	/// was written; the caller may try again later, from a fresh read.
 	Retryable,
 	/// A precondition failed. Nothing was written; the caller's view of the rows is stale.
 	Conflict,
@@ -673,6 +674,67 @@ mod tests {
 			drop(index);
 			assert_eq!((err.kind, err.attempts, asks.into_inner()), (kind, attempts, asked), "{what}: {err}");
 			assert_eq!(rows, vec![winner.clone()], "{what}: the winner's row stands");
+		}
+	}
+
+	/// A `Busy` at `BEGIN` is retried even for a transaction of unguarded ops: no op had
+	/// run and no snapshot was taken, so the retry cannot replay one over another
+	/// writer's commit. Every `BEGIN CONCURRENT` shares Turso's stop-the-world checkpoint
+	/// gate, which a TRUNCATE checkpoint holds exclusively, so a `BEGIN` during one fails
+	/// `Busy`. The recording backend parks the checkpoint in its fsync of the DB file, with
+	/// the gate held, for the first attempt; `may_retry` lets it finish before the retry,
+	/// which commits.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn a_busy_begin_is_retried_even_for_unguarded_ops() {
+		use crate::types::durable::turso_probe::ProbeIo;
+
+		const FILE: &str = "segment_index.db";
+		let ops = [("an upsert", IndexOp::Upsert { aspect: ASPECT.to_string(), row: IndexRow::legacy(row(5, 0, None).desc) }, vec![0, 5]), ("a delete", IndexOp::Delete { aspect: ASPECT.to_string(), id: 0 }, Vec::new())];
+		for (what, op, ids) in ops {
+			let dir = tempfile::TempDir::new().expect("tempdir");
+			let path = dir.path().join(FILE).to_string_lossy().into_owned();
+			drop(SegmentIndexStore::open(&path).await.expect("creates the index"));
+			let io = ProbeIo::new().expect("probe");
+			let db = turso::Builder::new_local(&path).with_io_impl(io.clone()).build().await.expect("opens the database");
+			// A commit for the checkpoint to backfill, so that it fsyncs the DB file.
+			IndexTxn::new(vec![insert(row(0, 1, Some(1)))]).run(&db).await.expect("commits a row");
+
+			let hold = io.hold_next_sync(FILE);
+			let conn = db.connect().expect("connects");
+			let checkpoint = std::thread::spawn(move || {
+				futures::executor::block_on(async move {
+					let mut rows = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await?;
+					rows.next().await.map(drop)
+				})
+			});
+			assert!(hold.reached(Duration::from_secs(30)), "{what}: the checkpoint reached its fsync of the DB file");
+			let checkpoint = std::sync::Mutex::new(Some(checkpoint));
+			let finish_the_checkpoint = || {
+				hold.release();
+				let unjoined = checkpoint.lock().expect("not poisoned").take();
+				if let Some(checkpoint) = unjoined {
+					checkpoint.join().expect("joins").expect("the checkpoint completes");
+				}
+			};
+			let asks = std::sync::atomic::AtomicU32::new(0);
+			let result = IndexTxn::new(vec![op])
+				.run_while(&db, || {
+					asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+					finish_the_checkpoint();
+					true
+				})
+				.await;
+			finish_the_checkpoint();
+			let mut rows = db.connect().expect("connects").query("SELECT id FROM segment_index WHERE aspect = ? ORDER BY id", [Value::Text(ASPECT.to_string())]).await.expect("reads");
+			let mut kept = Vec::new();
+			while let Some(row) = rows.next().await.expect("reads") {
+				kept.push(row.get_value(0).expect("an id").as_integer().copied().expect("an integer id"));
+			}
+			drop(rows);
+			drop(db);
+			let applied = result.unwrap_or_else(|e| panic!("{what}: a Busy at BEGIN is retried: {e}"));
+			assert_eq!((applied.changes, applied.attempts, asks.into_inner()), (vec![1], 2, 1), "{what}: the first attempt failed at BEGIN and the retry committed");
+			assert_eq!(kept, ids, "{what}: the retry's op applied");
 		}
 	}
 

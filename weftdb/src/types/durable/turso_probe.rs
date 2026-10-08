@@ -5,10 +5,12 @@
 //!
 //! [`ProbeIo`] wraps the platform backend Turso would use anyway and delegates every
 //! call to it unchanged, so a database opened on it behaves exactly as in production;
-//! it only appends a [`FileEvent`] for each write, sync and truncate it passes on.
+//! it only appends a [`FileEvent`] for each write, sync and truncate it passes on. A test
+//! can also hold one sync ([`ProbeIo::hold_next_sync`]) to stop Turso inside a step,
+//! with whatever locks that step holds still held.
 
 use std::{
-	path::Path, ptr::NonNull, sync::{Arc, Mutex}
+	path::Path, ptr::NonNull, sync::{mpsc, Arc, Mutex}, time::Duration
 };
 
 use turso::core::{
@@ -40,12 +42,51 @@ impl FileEvent {
 pub struct ProbeIo {
 	inner: Arc<dyn IO>,
 	events: Arc<Mutex<Vec<FileEvent>>>,
+	held: Arc<Mutex<Option<HeldSync>>>,
+}
+
+/// The sync [`ProbeIo::hold_next_sync`] armed: the file, and the two ends of the hold.
+struct HeldSync {
+	file: String,
+	reached: mpsc::Sender<()>,
+	release: mpsc::Receiver<()>,
+}
+
+/// A sync held by [`ProbeIo::hold_next_sync`]. Dropping it releases the sync.
+pub struct SyncHold {
+	reached: mpsc::Receiver<()>,
+	release: mpsc::Sender<()>,
+}
+
+impl SyncHold {
+	/// Wait, for at most `timeout`, until a thread is held in the sync. Whether one is.
+	pub fn reached(&self, timeout: Duration) -> bool {
+		self.reached.recv_timeout(timeout).is_ok()
+	}
+
+	/// Let the held sync go ahead (now, or as soon as it is reached).
+	pub fn release(&self) {
+		let _ = self.release.send(());
+	}
 }
 
 impl ProbeIo {
 	/// The platform backend, recording.
 	pub fn new() -> turso::core::Result<Arc<Self>> {
-		Ok(Arc::new(Self { inner: Arc::new(PlatformIO::new()?), events: Arc::default() }))
+		Ok(Arc::new(Self { inner: Arc::new(PlatformIO::new()?), events: Arc::default(), held: Arc::default() }))
+	}
+
+	/// Hold the next sync of `file`: the thread that issues it blocks, before the sync
+	/// reaches the platform, until [`SyncHold::release`] (or the hold drops). Turso stays
+	/// inside the step that synced, so a test can act while that step's locks are held:
+	/// a TRUNCATE checkpoint, say, which holds MVCC's stop-the-world gate.
+	pub fn hold_next_sync(&self, file: &str) -> SyncHold {
+		let (reached_tx, reached) = mpsc::channel();
+		let (release, release_rx) = mpsc::channel();
+		if let Ok(mut held) = self.held.lock() {
+			*held = Some(HeldSync { file: file.to_string(), reached: reached_tx, release: release_rx });
+		}
+		SyncHold { reached, release }
 	}
 
 	/// Every event so far, in the order Turso issued them.
@@ -73,7 +114,7 @@ impl ProbeIo {
 
 	fn wrap(&self, path: &str, file: Arc<dyn File>) -> Arc<dyn File> {
 		let name = Path::new(path).file_name().map_or_else(|| path.to_string(), |name| name.to_string_lossy().into_owned());
-		Arc::new(ProbeFile { inner: file, name, events: self.events.clone() })
+		Arc::new(ProbeFile { inner: file, name, events: self.events.clone(), held: self.held.clone() })
 	}
 }
 
@@ -154,12 +195,23 @@ struct ProbeFile {
 	inner: Arc<dyn File>,
 	name: String,
 	events: Arc<Mutex<Vec<FileEvent>>>,
+	held: Arc<Mutex<Option<HeldSync>>>,
 }
 
 impl ProbeFile {
 	fn record(&self, event: FileEvent) {
 		if let Ok(mut events) = self.events.lock() {
 			events.push(event);
+		}
+	}
+
+	/// If [`ProbeIo::hold_next_sync`] armed a hold of this file, take it (it holds one
+	/// sync) and block until it is released.
+	fn wait_if_held(&self) {
+		let held = self.held.lock().ok().and_then(|mut held| if held.as_ref().is_some_and(|held| held.file == self.name) { held.take() } else { None });
+		if let Some(held) = held {
+			let _ = held.reached.send(());
+			let _ = held.release.recv();
 		}
 	}
 }
@@ -183,6 +235,7 @@ impl File for ProbeFile {
 	}
 
 	fn sync(&self, c: Completion, sync_type: FileSyncType) -> turso::core::Result<Completion> {
+		self.wait_if_held();
 		self.record(FileEvent::Sync { file: self.name.clone() });
 		self.inner.sync(c, sync_type)
 	}
