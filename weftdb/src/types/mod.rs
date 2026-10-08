@@ -1,6 +1,6 @@
 pub use aspect::{Aspect, AspectId};
 pub use aspect_catalog::AspectCatalog;
-pub use backup::{count_rows, remove_empty_sidecars, restore_control_plane, scan_rows, snapshot_and_verify, snapshot_with_verify, user_tables, vacuum_into, verify_snapshot, RestoreReport, SnapshotReport, VerifyMode, CONTROL_PLANE_FILES};
+pub use backup::{count_rows, expected_tables, is_complete_backup, is_staging_name, remove_empty_sidecars, restore_control_plane, restore_control_plane_with, retire_backup, scan_rows, snapshot_and_verify, snapshot_with_verify, sweep_backup_staging, sweep_backup_staging_at, user_tables, vacuum_into, verify_snapshot, BackupManifest, ManifestFile, RestoreReport, SnapshotReport, StagingSweep, VerifyMode, BACKUP_MANIFEST, CONTROL_PLANE_FILES, DELETING_PREFIX, MANIFEST_FORMAT, PARTIAL_PREFIX, RESTORE_DRILL_PREFIX, STAGING_PREFIXES, STAGING_SWEEP_AGE};
 pub use batches::{
 	batched_measurements::{analysis::Analysis, batched_distance::BatchDistance, BatchedMeasurement}, Batch, BatchId, BatchMetatdata, Batches
 };

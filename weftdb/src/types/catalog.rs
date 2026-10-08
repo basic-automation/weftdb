@@ -45,6 +45,11 @@ pub struct CatalogStore {
 }
 
 impl CatalogStore {
+	/// The tables every `catalog.db` holds once opened. A snapshot missing any of them is
+	/// not a backup of this database (an empty file passes every other check), so
+	/// backup and restore verification require them.
+	pub const TABLES: &'static [&'static str] = &["databases", "subjects"];
+
 	/// Open (creating if absent) the `catalog.db` at `path`, enabling MVCC and ensuring
 	/// the `databases` and `subjects` tables exist.
 	///
@@ -110,7 +115,7 @@ impl CatalogStore {
 	/// Propagates a connection failure or any backup/verify failure.
 	pub async fn backup_to_with(&self, dest: &std::path::Path, mode: crate::VerifyMode) -> Result<crate::SnapshotReport> {
 		let conn = self.db.connect()?;
-		crate::types::backup::snapshot_with_verify(&conn, dest, mode).await
+		crate::types::backup::snapshot_with_verify(&conn, dest, mode, Self::TABLES).await
 	}
 
 	/// Register a database namespace `name` (idempotent — re-registering an existing

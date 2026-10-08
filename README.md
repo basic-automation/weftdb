@@ -424,8 +424,8 @@ under the declared encoding/tolerance is rejected `400`.
 | `POST /api/v1/storage/{aspect}/squash` | **Squash** the aspect's segments into one (newer-wins), bounding split-path fragmentation. `?max_segments=N` gates it (squash only when the count exceeds `N`). Returns `triggered`/`removed`/`segment_count`. |
 | `POST /api/v1/storage/{aspect}/compact?target_rows=N` | **Size-targeted compaction** — coalesce the aspect's segments toward ~`N` rows per segment (leaving already-large segments untouched), holding fragmentation near the read-optimal size rather than folding to one (which `squash` does). Motivated by the `downsample_range` knee (one giant segment reads slower than several mid-sized ones). `target_rows` is required (absent → `400`). Returns `removed`/`segment_count`. The manual counterpart of the `WEFT_COMPACT_TARGET_ROWS` daemon pass. |
 | `POST /api/v1/storage/reconcile` | **Store-wide reconciliation sweep** across every declared aspect: threshold (default), `?hot_cold=true`, or `?overlaps=true` (+ `?split_min_bytes=N` for split-not-rewrite). Returns `mode`, `aspects_scanned` / `aspects_reconciled` / `segments_reconciled` (+ cold/hot split), the post-sweep store-wide `unsorted_segments` + `overlapping_segments`, and **`failed`**: a `[{aspect, error}]` list of the aspects whose pass failed (empty on a clean sweep). A failing aspect (e.g. a torn or truncated frame) no longer aborts the sweep: every other aspect is still swept and the response is `200`, so check `failed` to tell a partial sweep from a clean one (earlier versions returned `500` at the first failing aspect and left every aspect after it in name order unswept). Only an unreadable aspect list is still a `500`. The manual counterpart to the background reconcile daemon (`WEFT_RECONCILE_INTERVAL_SECS` / `WEFT_RECONCILE_THRESHOLD` / `WEFT_RECONCILE_HOT_COLD` / `WEFT_RECONCILE_OVERLAPS` / `WEFT_RECONCILE_SPLIT_MIN_BYTES` / `WEFT_RECONCILE_MAX_SPLITS`). |
-| `POST /api/v1/storage/backup` | **Online control-plane backup** (Phase 7.4) — snapshot the store's four control-plane DBs (`segment_index`/`metadata`/`aspect_catalog`/`catalog`) to fresh files via Turso's stable `VACUUM INTO`. Lands in `<base>/<label>` where `<base>` is `WEFT_BACKUP_DIR` or `<store_root>/backups` and `<label>` is a traversal-guarded `?label=` (`[A-Za-z0-9._-]`) or a generated `backup-<unix_millis>`. **`?verify=source\|snapshot`** picks the verification: `source` (the default) cross-checks each copy's user-table set + row counts against the live control plane — the strongest check, but it assumes a **quiescent** store; `snapshot` verifies each copy on its own terms (it reopens and **fully scans every row of every table**) without re-reading the source, which is what an **online** backup taken while ingest continues needs. An unknown token → `400`. Returns per-DB `{name, tables, rows, bytes}` + `total_rows`/`total_bytes` + the `verify` mode that ran. An existing target dir → `400`; no store → `503`. Control plane only — the `.weftseg` measurement frames are not part of this backup (hard-constraint #3). |
-| `POST /api/v1/storage/restore/drill?label=<backup>` | **Restore drill** (Phase 7.4) — rehearse restoring a backup *on a running server*, so an operator can answer "is my backup actually restorable?" without risking anything. Restores the named backup into a throwaway directory beside the backups, verifies every restored database at its destination (it opens, and every row of every table reads), returns per-DB `{name, tables, rows, bytes}` + `total_rows`/`total_bytes`/`restorable`, then deletes the rehearsal copy. **Non-destructive by construction** — it cannot touch the live store, and restoring *over* a live control plane is deliberately not offered (the library primitive refuses to clobber; pointing `WEFT_SEGMENT_STORE_ROOT` at a restored copy is a deployment decision, not an HTTP call). Unknown backup → `404`; traversal label → `400`; a backup that will not restore → `500` carrying the failure, which is a failed drill rather than a server bug. |
+| `POST /api/v1/storage/backup` | **Online control-plane backup** (Phase 7.4) — snapshot the store's four control-plane DBs (`segment_index`/`metadata`/`aspect_catalog`/`catalog`) to fresh files via Turso's stable `VACUUM INTO`. Lands in `<base>/<label>` where `<base>` is `WEFT_BACKUP_DIR` or `<store_root>/backups` and `<label>` is a traversal-guarded `?label=` (`[A-Za-z0-9._-]`) or a generated `backup-<unix_millis>`. **`?verify=source\|snapshot`** picks the verification: `source` (the default) cross-checks each copy's user-table set + row counts against the live control plane — the strongest check, but it assumes a **quiescent** store; `snapshot` verifies each copy on its own terms (it reopens and **fully scans every row of every table**) without re-reading the source, which is what an **online** backup taken while ingest continues needs. An unknown token → `400`. Returns per-DB `{name, tables, rows, bytes}` + `total_rows`/`total_bytes` + the `verify` mode that ran. The backup is built in a `.partial-*` directory beside its label and appears under the label, with a `MANIFEST.json`, only once complete and durable. An existing target dir, or a label starting with `.partial-`, `.deleting-` or `.restore-drill-` (reserved for unfinished backups, prunes and drills) → `400`; no store → `503`. Control plane only — the `.weftseg` measurement frames are not part of this backup (hard-constraint #3). |
+| `POST /api/v1/storage/restore/drill?label=<backup>` | **Restore drill** (Phase 7.4) — rehearse restoring a backup *on a running server*, so an operator can answer "is my backup actually restorable?" without risking anything. Restores the named backup into a throwaway directory beside the backups, verifies every restored database at its destination (it opens, and every row of every table reads), returns per-DB `{name, tables, rows, bytes}` + `total_rows`/`total_bytes`/`restorable`, then deletes the rehearsal copy (`cleanup_error` says why, if it could not; it is `null` otherwise). **Non-destructive by construction** — it cannot touch the live store, and restoring *over* a live control plane is deliberately not offered (the library primitive refuses to clobber; pointing `WEFT_SEGMENT_STORE_ROOT` at a restored copy is a deployment decision, not an HTTP call). Unknown backup → `404`; traversal or staging (`.partial-*`, `.deleting-*`, `.restore-drill-*`) label → `400`; a backup that will not restore → `500` carrying the failure, which is a failed drill rather than a server bug. |
 | `GET /api/v1/storage/{aspect}/stats` · `…/storage/stats` | Materialized per-aspect and store-wide rollups, including the realized **bytes/point** (the north-star cost term), an `unsorted_segments` order-health count (segments that would force a linear scan on a point lookup), and an `overlapping_segments` count (time-overlapping segments — the cross-segment order-health signal, computed by an index scan). Rollup fields are served from the control plane without opening a segment. |
 
 ### Metrics
@@ -460,11 +460,23 @@ only** — the `.weftseg` measurement frames are not part of a snapshot.
   every table, so it is correct while writers are committing. A snapshot-only
   backup taken with six concurrent ingests in flight returns `200` with the
   concurrent seals visible in the copy.
-- **A backup directory holds exactly its four databases.** Verifying a snapshot
-  reopens it, which leaves zero-byte `-wal` / `-log` journal sidecars beside the
-  copy; these are swept after every verification, in both modes. Only a sidecar
-  that is *exactly* zero bytes is removed — a non-empty `-wal` holds
-  un-checkpointed frames, which is data, and is never touched.
+- **A backup directory holds exactly its four databases and a `MANIFEST.json`.**
+  Verifying a snapshot reopens it, which leaves zero-byte `-wal` / `-log` journal
+  sidecars beside the copy; these are swept after every verification, in both
+  modes. Only a sidecar that is *exactly* zero bytes is removed — a non-empty `-wal`
+  holds un-checkpointed frames, which is data, and is never touched. Verification
+  also requires each database's own tables, so an empty file never passes.
+- **A backup appears only once it is complete and durable.** It is built in a
+  `.partial-{label}-{nonce}/` directory; each database is verified and fsynced, the
+  manifest (format, creation time, each file's size, tables and rows) is written and
+  fsynced, and the directory is fsynced, renamed to its label, and the parent
+  fsynced. A backup that fails with an error before the rename removes its build
+  directory again; a crash there leaves the `.partial-*` directory, which is never
+  counted or restored, and which the backup daemon's sweep removes (where the
+  daemon is not enabled, remove it by hand). Once renamed, only the parent's fsync
+  is left: if that fails, the call reports an error (`500` over HTTP) although the
+  complete backup is already under its label, so a retry with the same label is
+  refused. The next backup's fsync of the same parent makes it durable.
 - **What a snapshot costs is dominated by the filesystem, not by the vacuum.**
   Benchmarked in [`database/benches/backup_cost.rs`](database/benches/backup_cost.rs):
   on `tmpfs` a whole four-database backup-and-verify runs in **8.62 ms** at one
@@ -485,13 +497,24 @@ only** — the `.weftseg` measurement frames are not part of a snapshot.
   it only ever removes daemon-**generated** `backup-<digits>` directories, so a
   snapshot you took by hand with `?label=nightly` is never a prune candidate, and
   it runs only after a *successful* snapshot, so a run of failures cannot prune
-  your last good backup away. Both paths record `weft_backup_*` metrics.
+  your last good backup away. It counts only complete backups (a manifest, or all
+  four databases from before manifests), and renames a pruned backup to
+  `.deleting-*` before removing its files, so an interrupted prune never leaves a
+  half-removed backup. At start and on every tick the daemon removes `.partial-*`,
+  `.deleting-*` and `.restore-drill-*` entries untouched for an hour. Both paths
+  record `weft_backup_*` metrics.
 - **Restore, with a drill.** `weftdb::restore_control_plane(backup_dir, root)`
   puts a snapshot back into a store root and verifies each restored file **at its
   destination** — what matters is that the file the store will open actually
-  reads. It refuses an incomplete backup directory and refuses to overwrite an
+  reads. It refuses an incomplete backup directory (or one whose files no longer
+  match its manifest, or one with a staging name) and refuses to overwrite an
   existing control plane, pre-flighting both across all four files before writing
-  anything, so a rejected restore leaves nothing behind. Restoring beside the
+  anything, so a rejected restore leaves nothing behind. Each file is copied to
+  `<name>.tmp`, fsynced and verified; only once all four verify are they renamed
+  into place, one after another, and the root fsynced. A failure before the
+  renames leaves only `.tmp` files, which a retry replaces; one part-way through
+  them leaves some databases in place, which a retry refuses to overwrite, so clear
+  the root first. Restoring beside the
   original `segments/` frames reconstitutes a working store: the round-trip test
   reopens the restored root and reads its measurements back.
 - **Drills on a live server.** `POST /api/v1/storage/restore/drill?label=` rehearses

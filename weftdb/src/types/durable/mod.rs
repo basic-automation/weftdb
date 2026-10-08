@@ -21,7 +21,9 @@
 //!   MVCC and syncs FULL, instead of trusting the pragmas that ask for it.
 //!
 //! `SegmentStore::open_scoped` takes the root lock, runs the control-plane probes and
-//! fsyncs the root's directories (S3). S5 onwards route their writes through the rest.
+//! fsyncs the root's directories (S3). The control-plane backup, its retention and the
+//! restore (S5) are the first writers routed through the rest; the later slices route
+//! the seal and maintenance writes through it.
 
 pub(crate) mod control_plane;
 pub mod dirsync;
@@ -33,7 +35,7 @@ pub mod sim;
 
 pub use dirsync::DirSyncer;
 pub use fault::FaultPoint;
-pub use fs::{write_new_durable, FsEntry, FsMetadata, RealFs, StoreFs, SyncPolicy, WritePoints};
+pub use fs::{create_dir_all_durable, write_new_durable, FsEntry, FsMetadata, RealFs, StoreFs, SyncPolicy, WritePoints};
 pub use lock::{LockHolder, RootLock, RootLockError, LOCK_FILE};
 #[cfg(any(test, feature = "fault-injection"))]
 pub use sim::SimFs;

@@ -27,9 +27,11 @@
 //! version, so a paged segment skips pages *within* the file too. The
 //! catalog/`metadata.db` registry is a later slice.
 
-use std::path::{Path, PathBuf};
+use std::{
+	future::Future, path::{Path, PathBuf}
+};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use splimes::{Point, Resolution};
@@ -37,7 +39,9 @@ use weft_physical_type::{merge_newer_wins, split_index, AspectSchema, FrameOptio
 use weft_reduce::{Aggregation, Bucket, PartialReduction};
 
 use crate::{
-	types::durable::{LockHolder, RealFs, RootLock, RootLockError, StoreFs}, AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, PartialSidecar, PartialSidecarPolicy, SegmentIndexStore, SIDECAR_AGGREGATIONS
+	types::durable::{
+		create_dir_all_durable, fault::{self, FaultPoint}, LockHolder, RealFs, RootLock, RootLockError, StoreFs, SyncPolicy, WritePoints
+	}, AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, PartialSidecar, PartialSidecarPolicy, SegmentIndexStore, SnapshotReport, SIDECAR_AGGREGATIONS
 };
 
 /// The `(database, subject)` namespace a [`SegmentStore`] opened with the plain
@@ -562,17 +566,22 @@ impl SegmentStore {
 	///
 	/// The `.weftseg` measurement frames under `segments/` are **not** part of this backup
 	/// — this is the control-plane (catalog/index/metadata) snapshot only, per the storage
-	/// boundary (hard-constraint #3). `dest_dir` is created if absent; each destination
-	/// file must not already exist (`VACUUM INTO` needs a fresh file), so back up into a
-	/// fresh (e.g. timestamped) directory.
+	/// boundary (hard-constraint #3). `dest_dir` must not exist yet: the backup is built
+	/// beside it and appears under that name, with a `MANIFEST.json`, only once it is
+	/// complete and durable (see [`backup_control_plane_via`](SegmentStore::backup_control_plane_via)).
+	/// Its parent is created if absent.
 	///
 	/// See [`snapshot_and_verify`](crate::snapshot_and_verify) for the consistency scope
 	/// of the per-file verification (the row-count match assumes a quiescent source).
 	///
 	/// # Errors
 	///
-	/// Propagates a filesystem error creating `dest_dir`, or any per-database backup/verify
-	/// failure (bad/existing destination, libSQL error, or a source/copy mismatch).
+	/// `dest_dir` already exists, a filesystem error building or publishing the backup,
+	/// or any per-database backup/verify failure (libSQL error, a missing table, or a
+	/// source/copy mismatch). An error before the backup is published removes what it
+	/// built. One after it (only the parent's fsync is left by then) leaves the complete
+	/// backup under `dest_dir`; see
+	/// [`backup_control_plane_via`](SegmentStore::backup_control_plane_via).
 	pub async fn backup_control_plane(&self, dest_dir: impl AsRef<Path>) -> Result<ControlPlaneBackup> {
 		self.backup_control_plane_with_verify(dest_dir, crate::VerifyMode::default()).await
 	}
@@ -591,16 +600,101 @@ impl SegmentStore {
 	///
 	/// # Errors
 	///
-	/// Propagates a filesystem error creating `dest_dir`, or any per-database backup/verify
-	/// failure.
+	/// As [`backup_control_plane`](SegmentStore::backup_control_plane).
 	pub async fn backup_control_plane_with_verify(&self, dest_dir: impl AsRef<Path>, mode: crate::VerifyMode) -> Result<ControlPlaneBackup> {
+		self.backup_control_plane_via(&RealFs, dest_dir, mode).await
+	}
+
+	/// [`backup_control_plane_with_verify`](SegmentStore::backup_control_plane_with_verify),
+	/// with every directory operation and fsync going through `fs` (the crash tests pass
+	/// a `SimFs`).
+	///
+	/// The backup becomes visible only once it is complete and durable (design section
+	/// 9): it is built in `<parent>/.partial-{label}-{nonce}/`, where each database is
+	/// vacuumed, verified (including its expected table set) and fsynced; then a
+	/// `MANIFEST.json` recording each file's size, tables and rows is written and synced,
+	/// the build directory is fsynced, renamed to `dest_dir`, and the parent fsynced.
+	///
+	/// What a failure leaves depends on when it strikes:
+	///
+	/// - An error before the rename removes the build directory again, so nothing is
+	///   left. The removal is best effort: if it fails, it is logged, the backup's own
+	///   error is returned, and the directory is left as a crash would leave it.
+	/// - A crash before the rename leaves the `.partial-*` directory. It is never counted
+	///   or restored, and [`sweep_backup_staging`](crate::sweep_backup_staging) removes it
+	///   once stale. weft-server's backup daemon runs that sweep; where the daemon is not
+	///   enabled, such a directory stays until an operator removes it.
+	/// - After the rename only the parent's fsync is left. An error there (or an injected
+	///   fault at `B-renamed`) is returned although the complete backup is already under
+	///   `dest_dir`: it counts toward retention, it restores, and its label is taken. It
+	///   is only not yet known to survive power loss, which the next backup's fsync of
+	///   the same parent makes it. A crash there leaves the same state.
+	///
+	/// # Errors
+	///
+	/// As [`backup_control_plane`](SegmentStore::backup_control_plane), or an injected
+	/// fault at a `B-*` point.
+	pub async fn backup_control_plane_via(&self, fs: &dyn StoreFs, dest_dir: impl AsRef<Path>, mode: crate::VerifyMode) -> Result<ControlPlaneBackup> {
 		let dir = dest_dir.as_ref().to_path_buf();
-		tokio::fs::create_dir_all(&dir).await.with_context(|| format!("creating backup dir {}", dir.display()))?;
-		let segment_index = self.index.backup_to_with(&dir.join("segment_index.db"), mode).await.context("backing up segment_index.db")?;
-		let metadata = self.metadata.backup_to_with(&dir.join("metadata.db"), mode).await.context("backing up metadata.db")?;
-		let aspect_catalog = self.catalog.backup_to_with(&dir.join("aspect_catalog.db"), mode).await.context("backing up aspect_catalog.db")?;
-		let registry = self.registry.backup_to_with(&dir.join("catalog.db"), mode).await.context("backing up catalog.db")?;
+		let (base, label) = crate::types::backup::split_dir(&dir).with_context(|| format!("choosing where to build backup {}", dir.display()))?;
+		if fs.metadata(&dir).await.is_ok() {
+			bail!("backup destination {} already exists (a backup is published under a fresh name)", dir.display());
+		}
+		create_dir_all_durable(fs, &base).await.with_context(|| format!("creating backup base {}", base.display()))?;
+		let partial = base.join(crate::types::backup::staging_name(crate::PARTIAL_PREFIX, &label));
+		fs.create_dir(&partial).await.with_context(|| format!("creating backup build directory {}", partial.display()))?;
+
+		let [mut segment_index, mut metadata, mut aspect_catalog, mut registry] = match self.build_backup(fs, &partial, &dir, mode).await {
+			Ok(reports) => reports,
+			Err(err) => {
+				// An error, unlike a crash, can clean up after itself. The build directory
+				// may hold three full database copies, and the sweep that removes a crash's
+				// leftovers runs only in weft-server's backup daemon, so a deployment that
+				// takes only manual backups would otherwise collect them unseen.
+				if let Err(cleanup) = fs.remove_dir_all(&partial).await {
+					tracing::warn!(dir = %partial.display(), error = %cleanup, cause = %format!("{err:#}"), "could not remove a failed backup's build directory; the backup daemon's sweep removes it once stale, if the daemon is enabled");
+				}
+				return Err(err);
+			}
+		};
+		fault::hit(FaultPoint::BRenamed).await?;
+		fs.sync_dir(&base).await.with_context(|| format!("syncing backup base {}", base.display()))?;
+
+		for (report, name) in [(&mut segment_index, "segment_index.db"), (&mut metadata, "metadata.db"), (&mut aspect_catalog, "aspect_catalog.db"), (&mut registry, "catalog.db")] {
+			report.dest = dir.join(name);
+		}
 		Ok(ControlPlaneBackup { dir, segment_index, metadata, aspect_catalog, registry })
+	}
+
+	/// The steps of [`backup_control_plane_via`](SegmentStore::backup_control_plane_via)
+	/// from the freshly created build directory `partial` up to its rename to `dir`:
+	/// everything an error can still undo by removing `partial`. Returns the four
+	/// snapshots' reports in [`CONTROL_PLANE_FILES`](crate::CONTROL_PLANE_FILES) order,
+	/// still naming the files under `partial`.
+	async fn build_backup(&self, fs: &dyn StoreFs, partial: &Path, dir: &Path, mode: crate::VerifyMode) -> Result<[SnapshotReport; 4]> {
+		fault::hit(FaultPoint::BPartialCreated).await?;
+
+		let segment_index = snapshot_into(fs, 0, self.index.backup_to_with(&partial.join("segment_index.db"), mode)).await.context("backing up segment_index.db")?;
+		let metadata = snapshot_into(fs, 1, self.metadata.backup_to_with(&partial.join("metadata.db"), mode)).await.context("backing up metadata.db")?;
+		let aspect_catalog = snapshot_into(fs, 2, self.catalog.backup_to_with(&partial.join("aspect_catalog.db"), mode)).await.context("backing up aspect_catalog.db")?;
+		let registry = snapshot_into(fs, 3, self.registry.backup_to_with(&partial.join("catalog.db"), mode)).await.context("backing up catalog.db")?;
+		// A control-plane backup links no frames (the whole-store backup, S16, links them
+		// here); the point keeps the crash matrix's `B-*` sequence whole.
+		fault::hit(FaultPoint::BLinks).await?;
+
+		let created_ms = u64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis()).unwrap_or(u64::MAX);
+		let manifest = crate::BackupManifest::new(created_ms, &[("segment_index.db", &segment_index), ("metadata.db", &metadata), ("aspect_catalog.db", &aspect_catalog), ("catalog.db", &registry)]);
+		let manifest_bytes = serde_json::to_vec_pretty(&manifest).context("encoding the backup manifest")?;
+		fs.create_new_write(&partial.join(crate::BACKUP_MANIFEST), manifest_bytes, SyncPolicy::Full, WritePoints::NONE).await.context("writing the backup manifest")?;
+		fault::hit(FaultPoint::BManifest).await?;
+		fs.sync_dir(partial).await.with_context(|| format!("syncing backup build directory {}", partial.display()))?;
+
+		// Publish. The rename is the instant the backup appears under its label, whole.
+		if fs.metadata(dir).await.is_ok() {
+			bail!("backup destination {} appeared while the backup was being built", dir.display());
+		}
+		fs.rename(partial, dir).await.with_context(|| format!("publishing backup {} -> {}", partial.display(), dir.display()))?;
+		Ok([segment_index, metadata, aspect_catalog, registry])
 	}
 
 	/// Declare `aspect`'s [`AspectSchema`] in this store's catalog, so later
@@ -2285,6 +2379,20 @@ pub struct SquashSweep {
 	pub failed: Vec<(String, anyhow::Error)>,
 }
 
+/// Await one database's snapshot into a backup's build directory, fsync the copy through
+/// `fs`, and hit `B-vacuum(k)`.
+///
+/// `VACUUM INTO` already fsyncs its output (`turso_core`'s `finalize_vacuum_into_output`),
+/// and verifying the copy does not write to it, but Turso writes it behind
+/// [`StoreFs`]'s back. The backup's durability rests on this fsync instead, which costs
+/// next to nothing on a file that is already clean.
+async fn snapshot_into(fs: &dyn StoreFs, k: u32, snapshot: impl Future<Output = Result<SnapshotReport>>) -> Result<SnapshotReport> {
+	let report = snapshot.await?;
+	fs.sync_file(&report.dest).await.with_context(|| format!("syncing {}", report.dest.display()))?;
+	fault::hit(FaultPoint::BVacuum(k)).await?;
+	Ok(report)
+}
+
 /// The outcome of a [`SegmentStore::backup_control_plane`] run: the verified snapshot of
 /// each of the store's four control-plane databases (roadmap Phase 7.4).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2397,6 +2505,7 @@ pub struct AspectStorageStats {
 mod tests {
 	use std::str::FromStr;
 
+	use serial_test::serial;
 	use tempfile::TempDir;
 	use weft_physical_type::{timestamp::TimeUnit, PhysicalType};
 
@@ -2433,6 +2542,7 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[serial(backup_fault_points)]
 	async fn backup_then_restore_round_trips_a_working_store() {
 		// The Phase 7.4 drill: back the control plane up, restore it into a fresh root
 		// beside the original's segment frames, and prove the restored store still
@@ -2473,6 +2583,7 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[serial(backup_fault_points)]
 	async fn restore_refuses_to_clobber_an_existing_control_plane() {
 		let dir = TempDir::new().unwrap();
 		let schema = AspectSchema::new(PhysicalType::F64, "0".parse().unwrap(), TimeUnit::Seconds);
@@ -2497,7 +2608,295 @@ mod tests {
 		assert!(!fresh.join("catalog.db").exists(), "a refused restore writes nothing");
 	}
 
+	/// A store with one declared aspect and one sealed segment, so every control-plane
+	/// database holds rows.
+	async fn populated_store(root: &Path) -> SegmentStore {
+		let store = SegmentStore::open(root).await.expect("opens");
+		store.declare("price", &schema()).await.expect("declares");
+		store.seal("price", &schema(), &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("seals");
+		store
+	}
+
+	/// The names directly under `dir`, sorted.
+	fn names_in(dir: &Path) -> Vec<String> {
+		let mut names: Vec<String> = std::fs::read_dir(dir).expect("lists").map(|e| e.expect("entry").file_name().to_string_lossy().into_owned()).collect();
+		names.sort();
+		names
+	}
+
 	#[tokio::test]
+	#[serial(backup_fault_points)]
+	async fn a_published_backup_carries_a_manifest_and_leaves_no_build_directory() {
+		let dir = TempDir::new().unwrap();
+		let store = populated_store(&dir.path().join("live")).await;
+		let base = dir.path().join("backups");
+		let backup = store.backup_control_plane_with_verify(base.join("nightly"), crate::VerifyMode::SnapshotOnly).await.expect("backs up");
+		let again = store.backup_control_plane_with_verify(base.join("nightly"), crate::VerifyMode::SnapshotOnly).await;
+		drop(store);
+
+		assert_eq!(names_in(&base), vec!["nightly".to_string()], "the backup was built aside and renamed into place, leaving nothing else");
+		let manifest = crate::BackupManifest::read(&backup.dir).await.expect("reads").expect("a published backup has a manifest");
+		assert_eq!(manifest.format, crate::MANIFEST_FORMAT);
+		for (report, file) in backup.reports().into_iter().zip(&manifest.files) {
+			assert_eq!(report.dest, backup.dir.join(&file.name), "the reports name the published files");
+			assert_eq!(std::fs::metadata(&report.dest).unwrap().len(), file.bytes, "{}: the manifest records the size", file.name);
+			assert_eq!((report.rows, &report.table_names), (file.rows, &file.tables), "{}", file.name);
+			for table in crate::expected_tables(&file.name).unwrap() {
+				assert!(file.tables.iter().any(|t| t == table), "{}: holds {table}", file.name);
+			}
+		}
+		assert!(again.is_err(), "a backup never replaces an existing one");
+		assert_eq!(names_in(&base), vec!["nightly".to_string()], "and a refused backup builds nothing");
+	}
+
+	/// The regression for an empty snapshot verifying: a pre-manifest backup whose
+	/// `catalog.db` is an empty database (a crash mid-`VACUUM INTO`, say) restored as a
+	/// valid control plane with no databases or subjects in it.
+	#[tokio::test]
+	#[serial(backup_fault_points)]
+	async fn restore_rejects_an_empty_catalog_snapshot() {
+		let dir = TempDir::new().unwrap();
+		let store = populated_store(&dir.path().join("live")).await;
+		let backup_dir = dir.path().join("backup");
+		store.backup_control_plane_with_verify(&backup_dir, crate::VerifyMode::SnapshotOnly).await.expect("backs up");
+		drop(store);
+		// Make it a pre-manifest backup, then empty its catalog.
+		let _ = std::fs::remove_file(backup_dir.join("MANIFEST.json"));
+		std::fs::remove_file(backup_dir.join("catalog.db")).unwrap();
+		let empty = turso::Builder::new_local(backup_dir.join("catalog.db").to_str().unwrap()).build().await.unwrap();
+		drop(empty.connect().unwrap());
+		drop(empty);
+
+		let fresh = dir.path().join("fresh");
+		let err = crate::restore_control_plane(&backup_dir, &fresh).await.expect_err("an empty catalog.db is not a backup of one");
+		assert!(format!("{err:#}").contains("missing the table(s)"), "got: {err:#}");
+		for name in crate::CONTROL_PLANE_FILES {
+			assert!(!fresh.join(name).exists(), "a failed restore leaves no control-plane file under its final name: {name}");
+		}
+	}
+
+	#[tokio::test]
+	#[serial(backup_fault_points)]
+	async fn a_legacy_backup_without_a_manifest_still_restores() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path().join("live");
+		let store = populated_store(&root).await;
+		let backup_dir = dir.path().join("backup");
+		let backup = store.backup_control_plane_with_verify(&backup_dir, crate::VerifyMode::SnapshotOnly).await.expect("backs up");
+		drop(store);
+		let _ = std::fs::remove_file(backup_dir.join("MANIFEST.json"));
+		assert!(crate::is_complete_backup(&backup_dir).await.unwrap(), "four databases and no manifest: a complete pre-manifest backup");
+
+		let restored_root = dir.path().join("restored");
+		tokio::fs::create_dir_all(restored_root.join("segments")).await.unwrap();
+		for entry in std::fs::read_dir(root.join("segments")).unwrap() {
+			let entry = entry.unwrap();
+			std::fs::copy(entry.path(), restored_root.join("segments").join(entry.file_name())).unwrap();
+		}
+		let report = crate::restore_control_plane(&backup_dir, &restored_root).await.expect("a pre-manifest backup restores");
+		assert_eq!(report.total_rows(), backup.total_rows());
+		assert!(!names_in(&restored_root).iter().any(|n| Path::new(n).extension().is_some_and(|ext| ext == "tmp")), "the staged copies were renamed into place");
+		let reopened = SegmentStore::open(&restored_root).await.expect("opens");
+		let (times, _) = reopened.read_time_range("price", 0, 20).await.expect("reads");
+		assert_eq!(times, vec![0_i64, 10, 20]);
+	}
+
+	#[tokio::test]
+	#[serial(backup_fault_points)]
+	async fn restore_refuses_a_staging_directory_and_a_backup_changed_since_its_manifest() {
+		let dir = TempDir::new().unwrap();
+		let store = populated_store(&dir.path().join("live")).await;
+		let base = dir.path().join("backups");
+		let backup = store.backup_control_plane_with_verify(base.join("backup-1"), crate::VerifyMode::SnapshotOnly).await.expect("backs up");
+		drop(store);
+
+		// A build directory can hold all four databases and even a manifest; its name
+		// still says it was never published.
+		let staged = base.join(".partial-backup-1-0123456789abcdef");
+		std::fs::rename(&backup.dir, &staged).unwrap();
+		let err = crate::restore_control_plane(&staged, &dir.path().join("a")).await.unwrap_err();
+		assert!(format!("{err:#}").contains("unfinished"), "got: {err:#}");
+		std::fs::rename(&staged, &backup.dir).unwrap();
+
+		// A file that no longer matches the manifest is refused before anything is copied.
+		let catalog = backup.dir.join("catalog.db");
+		let mut bytes = std::fs::read(&catalog).unwrap();
+		bytes.extend_from_slice(&[0; 4096]);
+		std::fs::write(&catalog, bytes).unwrap();
+		let fresh = dir.path().join("b");
+		let err = crate::restore_control_plane(&backup.dir, &fresh).await.unwrap_err();
+		assert!(format!("{err:#}").contains("manifest recorded"), "got: {err:#}");
+		assert!(!fresh.exists(), "nothing was written");
+	}
+
+	/// A reported backup survives power loss whole: every image a power cut right after
+	/// the call returns could leave holds the backup under its label, complete and
+	/// restorable, and no build directory. The live store's own databases are trusted
+	/// (Turso commits them FULL); everything the backup writes, including the snapshots
+	/// Turso vacuums into it, counts only once made durable through `StoreFs`.
+	#[tokio::test]
+	#[serial(backup_fault_points)]
+	async fn a_power_cut_after_a_reported_backup_leaves_it_complete() {
+		fn live_database(rel: &Path) -> bool {
+			rel.parent() == Some(Path::new("")) && crate::durable::SimFs::turso_file(rel)
+		}
+		let dir = TempDir::new().unwrap();
+		let root = dir.path().join("live");
+		let store = populated_store(&root).await;
+		let sim = crate::durable::SimFs::exempting(&root, live_database).unwrap();
+		let backup = store.backup_control_plane_via(&sim, root.join("backups/backup-1"), crate::VerifyMode::SnapshotOnly).await.expect("backs up");
+		drop(store);
+
+		for seed in 0..16 {
+			let image = TempDir::new().unwrap();
+			sim.power_cut(seed, image.path()).unwrap();
+			let base = image.path().join("backups");
+			assert!(base.is_dir(), "seed {seed}: the backup base the backup created survives");
+			assert_eq!(names_in(&base), vec!["backup-1".to_string()], "seed {seed}: the backup is under its label, and only there");
+			let published = base.join("backup-1");
+			let manifest = crate::BackupManifest::read(&published).await.unwrap_or_else(|e| panic!("seed {seed}: {e:#}"));
+			assert!(manifest.is_some(), "seed {seed}: the manifest survives with the backup");
+			let restored = crate::restore_control_plane(&published, &image.path().join("restored")).await.unwrap_or_else(|e| panic!("seed {seed}: the backup restores: {e:#}"));
+			assert_eq!(restored.total_rows(), backup.total_rows(), "seed {seed}");
+		}
+	}
+
+	/// A reported restore survives power loss whole: every image a power cut right after
+	/// the call returns could leave holds all four databases under their final names,
+	/// each complete, and no `.tmp` copy. The restore root is new, so its own entry must
+	/// be durable too. Nothing in the restore root is exempt: Turso's reopen to verify a
+	/// copy is trusted only if it leaves the synced bytes as they were.
+	#[tokio::test]
+	#[serial(backup_fault_points)]
+	async fn a_power_cut_after_a_reported_restore_leaves_every_database_complete() {
+		let dir = TempDir::new().unwrap();
+		let store = populated_store(&dir.path().join("live")).await;
+		let backup_dir = dir.path().join("backup");
+		store.backup_control_plane_with_verify(&backup_dir, crate::VerifyMode::SnapshotOnly).await.expect("backs up");
+		drop(store);
+
+		let restores = dir.path().join("restores");
+		std::fs::create_dir(&restores).unwrap();
+		let sim = crate::durable::SimFs::new(&restores).unwrap();
+		let root = restores.join("restored");
+		crate::restore_control_plane_with(&sim, &backup_dir, &root).await.expect("restores");
+
+		let mut files: Vec<String> = crate::CONTROL_PLANE_FILES.iter().map(ToString::to_string).collect();
+		files.sort();
+		assert_eq!(names_in(&root), files, "the restore left exactly the four databases");
+		for seed in 0..16 {
+			let image = TempDir::new().unwrap();
+			sim.power_cut(seed, image.path()).unwrap();
+			let restored = image.path().join("restored");
+			assert!(restored.is_dir(), "seed {seed}: the new restore root survives");
+			assert_eq!(names_in(&restored), files, "seed {seed}: every database is under its final name, and no `.tmp` copy is left");
+			for name in crate::CONTROL_PLANE_FILES {
+				assert!(std::fs::read(restored.join(name)).unwrap() == std::fs::read(root.join(name)).unwrap(), "seed {seed}: {name} is complete");
+			}
+		}
+	}
+
+	/// The `B-*` points, in the order a backup reaches them.
+	const BACKUP_POINTS: [FaultPoint; 8] = [FaultPoint::BPartialCreated, FaultPoint::BVacuum(0), FaultPoint::BVacuum(1), FaultPoint::BVacuum(2), FaultPoint::BVacuum(3), FaultPoint::BLinks, FaultPoint::BManifest, FaultPoint::BRenamed];
+
+	/// The regression for `backup-vacuum-into-partial-dest`,
+	/// `backup-partial-dir-counts-toward-retention` and `verify-sidecar-litter`: a backup
+	/// that stopped part-way left a directory under the backup's own name holding some of
+	/// its databases (and the verification's litter), which retention counted and a drill
+	/// could pick. Now a crash at any point leaves nothing incomplete that retention
+	/// counts ([`crate::is_complete_backup`], what the daemon lists by) or that restores,
+	/// and the sweep removes what it does leave.
+	///
+	/// The crash is a backup parked at the point and dropped there. Unlike an error, that
+	/// runs none of the backup's own cleanup, so what is left is what a process crash
+	/// leaves (the OS keeps every write; power loss is the `SimFs` tests' job).
+	#[tokio::test]
+	#[serial(backup_fault_points)]
+	async fn a_crash_at_any_backup_point_leaves_nothing_incomplete_counted_or_restorable() {
+		use std::sync::Arc;
+
+		use tokio::sync::Notify;
+
+		use crate::durable::fault::{arm, hits, reached, FaultAction};
+
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(populated_store(&dir.path().join("live")).await);
+		let base = dir.path().join("backups");
+		for (n, point) in BACKUP_POINTS.into_iter().enumerate() {
+			let label = format!("backup-{n}");
+			let armed = arm(point, FaultAction::Pause(Arc::new(Notify::new())));
+			let before = hits(point);
+			let backup = tokio::spawn({
+				let (store, dest) = (store.clone(), base.join(&label));
+				async move { store.backup_control_plane_with_verify(dest, crate::VerifyMode::SnapshotOnly).await }
+			});
+			tokio::time::timeout(std::time::Duration::from_secs(30), reached(point, before + 1)).await.unwrap_or_else(|_| panic!("the backup never reached {point}"));
+			backup.abort();
+			assert!(backup.await.expect_err("the backup is dropped at the point").is_cancelled(), "{point}");
+			drop(armed);
+
+			// Stopped after the rename, the backup is whole under its label (only the base
+			// fsync had not run), so it rightly counts. Stopped anywhere before, its build
+			// directory is all there is, and it does not.
+			let expected: Vec<String> = if point == FaultPoint::BRenamed { vec![label.clone()] } else { Vec::new() };
+			let names = names_in(&base);
+			if point != FaultPoint::BRenamed {
+				assert!(matches!(names.as_slice(), [only] if only.starts_with(&format!(".partial-{label}-"))), "{point}: the crash leaves its build directory and nothing else: {names:?}");
+			}
+			let mut complete = Vec::new();
+			for name in names {
+				let path = base.join(&name);
+				let restored = crate::restore_control_plane(&path, &dir.path().join(format!("restore-{point}-{name}"))).await;
+				if crate::is_complete_backup(&path).await.unwrap() {
+					restored.unwrap_or_else(|e| panic!("{point}: {name} counts as a backup, so it restores: {e:#}"));
+					complete.push(name);
+				} else {
+					assert!(restored.is_err(), "{point}: {name} does not count as a backup, so it must not restore either");
+				}
+			}
+			assert_eq!(complete, expected, "{point}");
+
+			let swept = crate::sweep_backup_staging(&RealFs, &base, std::time::Duration::ZERO).await.unwrap();
+			assert!(swept.failed.is_empty(), "{point}: {:?}", swept.failed);
+			assert_eq!(names_in(&base), expected, "{point}: the sweep removes everything that is not a backup");
+		}
+		drop(store);
+	}
+
+	/// An error, unlike a crash, cleans up after itself. Stopped by an error anywhere
+	/// before it is published, a backup leaves nothing under the base, so a deployment
+	/// without the backup daemon (whose sweep removes what a crash leaves) does not
+	/// collect hidden database copies. Stopped by one after the publishing rename, it is
+	/// already whole under its label, which stays taken.
+	#[tokio::test]
+	#[serial(backup_fault_points)]
+	async fn an_error_at_any_backup_point_removes_what_it_built() {
+		use crate::durable::fault::{arm, injected_point, FaultAction};
+
+		let dir = TempDir::new().unwrap();
+		let store = populated_store(&dir.path().join("live")).await;
+		let base = dir.path().join("backups");
+		for (n, point) in BACKUP_POINTS.into_iter().enumerate() {
+			let label = format!("backup-{n}");
+			let armed = arm(point, FaultAction::ReturnErr);
+			let err = store.backup_control_plane_with_verify(base.join(&label), crate::VerifyMode::SnapshotOnly).await.expect_err("the fault stops the backup");
+			drop(armed);
+			assert_eq!(err.chain().find_map(|cause| cause.downcast_ref::<std::io::Error>()).and_then(injected_point), Some(point), "{point}: {err:#}");
+
+			if point == FaultPoint::BRenamed {
+				assert_eq!(names_in(&base), [label.clone()], "{point}: published before the error");
+				assert!(crate::is_complete_backup(&base.join(&label)).await.unwrap(), "{point}");
+				let again = store.backup_control_plane_with_verify(base.join(&label), crate::VerifyMode::SnapshotOnly).await;
+				assert!(again.is_err(), "{point}: the label is taken");
+			} else {
+				assert!(names_in(&base).is_empty(), "{point}: the failed backup removed its build directory: {:?}", names_in(&base));
+			}
+		}
+		drop(store);
+	}
+
+	#[tokio::test]
+	#[serial(backup_fault_points)]
 	async fn backup_control_plane_snapshots_and_verifies_every_db() {
 		let dir = TempDir::new().expect("tempdir");
 		let store = SegmentStore::open_scoped(dir.path(), "market", "btc").await.expect("opens");
@@ -3878,6 +4277,18 @@ mod tests {
 
 		async fn remove_file(&self, path: &Path) -> std::io::Result<()> {
 			RealFs.remove_file(path).await
+		}
+
+		async fn create_dir(&self, path: &Path) -> std::io::Result<()> {
+			RealFs.create_dir(path).await
+		}
+
+		async fn remove_dir_all(&self, path: &Path) -> std::io::Result<()> {
+			RealFs.remove_dir_all(path).await
+		}
+
+		async fn copy_new(&self, src: &Path, dst: &Path, policy: crate::types::durable::SyncPolicy) -> std::io::Result<u64> {
+			RealFs.copy_new(src, dst, policy).await
 		}
 
 		async fn read_dir(&self, dir: &Path) -> std::io::Result<Vec<crate::types::durable::FsEntry>> {
