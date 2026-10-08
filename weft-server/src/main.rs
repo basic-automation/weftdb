@@ -18,11 +18,12 @@
 //!
 //! ## Optional segment store
 //!
-//! Set `WEFT_SEGMENT_STORE_ROOT` to a directory to open a [`SegmentStore`] rooted
-//! there (creating the Storage v2 layout if absent). With it set, the stored-range
-//! query endpoints (`/api/v1/storage/...`) go live; without it the server serves
-//! only the stateless interpolation/downsample API and those endpoints answer
-//! `503`. Readiness (`GET /ready`) reports which mode is active.
+//! Set `WEFT_SEGMENT_STORE_ROOT` to a directory to open a
+//! [`SegmentStore`](weftdb::SegmentStore) rooted there (creating the Storage v2 layout
+//! if absent). With it set, the stored-range query endpoints (`/api/v1/storage/...`) go
+//! live; without it the server serves only the stateless interpolation/downsample API
+//! and those endpoints answer `503`. Readiness (`GET /ready`) reports which mode is
+//! active.
 //!
 //! The store is opened with the options the `WEFT_SEGMENT_*` variables describe
 //! ([`weft_server::store_open`]); the library reads none of them itself. With
@@ -49,9 +50,8 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use weft_server::{
-	app_with_state, gpu::{self, CalibrationMode, GPU_CALIBRATE_ENV}, host_guard::{self, HostGuard, ALLOW_ANY_HOST_ENV}, spawn_backup_daemon, spawn_reconcile_daemon, store_open::{self, OnPoison}, AppState, BackupDaemonConfig, InterpolateConfig, ReconcileDaemonConfig, MAX_INTERPOLATE_POINTS_ENV, SERVICE, VERSION
+	app_with_state, gpu::{self, CalibrationMode, GPU_CALIBRATE_ENV}, host_guard::{self, HostGuard, ALLOW_ANY_HOST_ENV}, spawn_backup_daemon, spawn_reconcile_daemon, store_open, AppState, BackupDaemonConfig, InterpolateConfig, ReconcileDaemonConfig, MAX_INTERPOLATE_POINTS_ENV, SERVICE, VERSION
 };
-use weftdb::SegmentStore;
 
 /// Default bind address when `WEFT_SERVER_ADDR` is unset.
 const DEFAULT_ADDR: &str = "127.0.0.1:8080";
@@ -341,10 +341,9 @@ fn spawn_backup_daemon_if_configured(state: &AppState) -> anyhow::Result<()> {
 /// Build the router state, opening a segment store when `WEFT_SEGMENT_STORE_ROOT`
 /// is set and logging which mode the server runs in.
 ///
-/// The store is opened with the options the environment describes
-/// ([`store_open::store_options_from_env`]), and under `WEFT_ON_AMBIGUOUS_COMMIT=exit` a
-/// task exits the process once it is write-poisoned
-/// ([`store_open::spawn_exit_on_poison`]).
+/// The store is opened by [`store_open::open_from_env`]: with the options the
+/// environment describes, and under `WEFT_ON_AMBIGUOUS_COMMIT=exit` with a task that exits
+/// the process once it is write-poisoned.
 ///
 /// # Errors
 ///
@@ -352,17 +351,12 @@ fn spawn_backup_daemon_if_configured(state: &AppState) -> anyhow::Result<()> {
 async fn build_state() -> anyhow::Result<AppState> {
 	match std::env::var(STORE_ROOT_ENV) {
 		Ok(root) => {
-			let on_poison = OnPoison::from_env();
-			let store = Arc::new(SegmentStore::open_with_options(&root, store_open::store_options_from_env()).await?);
+			let store = Arc::new(store_open::open_from_env(&root).await?);
 			let report = store.open_report();
 			let how = if report.created_new { "created".to_string() } else { report.migrated_from.map_or_else(|| "opened".to_string(), |layout| format!("migrated from layout {layout}")) };
 			println!("segment store: {how} at {root} (storage endpoints live; store {}, layout {})", store.store_uuid(), store.store_format().layout_version);
 			if report.recovery_report_only {
 				println!("segment store: its layout is newer than this build's; it opened without migrating");
-			}
-			if on_poison == OnPoison::Exit {
-				// Runs for the life of the process; its handle is dropped on purpose.
-				drop(store_open::spawn_exit_on_poison(Arc::clone(&store)));
 			}
 			Ok(AppState::new().with_store(store))
 		}
