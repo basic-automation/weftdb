@@ -407,6 +407,52 @@ async fn test_set_dictionary_metadata_registers_and_replaces() {
 	common::remove_database(&db_name);
 }
 
+/// Assert that `err` is the write-write conflict a dictionary write lost, not the failed
+/// `ROLLBACK` after it.
+fn assert_write_write_conflict(err: &anyhow::Error) {
+	assert!(weftdb::error::is_transient_mvcc_error(err), "a conflict is transient: {err:#}");
+	assert!(err.to_string().contains("Write-write conflict"), "the conflict is reported: {err:#}");
+	assert!(!format!("{err:#}").contains("Rollback failed"), "the rollback's error does not replace it: {err:#}");
+}
+
+/// A dictionary write that loses an MVCC write-write conflict reports the conflict. Turso
+/// rolls the transaction back itself, so the `ROLLBACK` after the failed statement fails
+/// ("no transaction is active"); `set_dictionary_metadata` and `new_dictionary` returned
+/// that error instead (`Rollback failed: …`), which `is_transient_mvcc_error` could not
+/// recognise as a conflict to retry.
+#[tokio::test]
+async fn test_dictionary_writes_report_a_write_write_conflict() {
+	let db_name = format!("test_dictionary_conflict_{}", Uuid::new_v4());
+	common::remove_database(&db_name);
+
+	let db = Database::new(&db_name).await.expect("Failed to create database");
+	let subject = db.observe_subject("dictionary_subject").await.expect("Failed to add subject");
+	let aspect = db.track_aspect(&subject.id(), "pressure", &Resolution::Seconds, None).await.expect("Failed to track aspect");
+	aspect.new_dictionary("contended", "first", &DictionaryConstraints::default()).await.expect("Failed to create dictionary");
+
+	// Another transaction deletes the registration and stays open, so the delete with which
+	// a registration replaces the one before it conflicts.
+	let dictionary_db = db.get_dictionary_db(&aspect.id(), "contended").await.expect("Failed to open dictionary database");
+	let holder = dictionary_db.connect().expect("Failed to connect to dictionary database");
+	holder.execute("BEGIN CONCURRENT", ()).await.expect("Failed to begin the holder's transaction");
+	holder.execute("DELETE FROM dictionary_metadata WHERE name = 'contended'", ()).await.expect("Failed to delete in the holder's transaction");
+
+	let metadata = DictionaryMetadata { id: DictionaryId::new(), name: "contended".to_string(), description: "second".to_string(), constraints: DictionaryConstraints::default() };
+	let err = db.set_dictionary_metadata(&aspect.id(), "contended", &metadata).await.expect_err("the registration conflicts with the open delete");
+	assert_write_write_conflict(&err);
+	assert!(err.to_string().starts_with("Failed to set dictionary metadata: "), "{err}");
+	let err = aspect.new_dictionary("contended", "third", &DictionaryConstraints::default()).await.expect_err("creating it again conflicts too");
+	assert_write_write_conflict(&err);
+
+	// Neither wrote anything: once the holder gives up, the first registration is intact.
+	holder.execute("ROLLBACK", ()).await.expect("Failed to roll back the holder's transaction");
+	let stored = db.get_dictionary_metadata(&aspect.id(), "contended").await.expect("Failed to load dictionary metadata").expect("registered");
+	assert_eq!(stored.description, "first");
+	assert_eq!(dictionary_rows(&db, &aspect.id(), "contended", "dictionary_metadata").await, 1);
+
+	common::remove_database(&db_name);
+}
+
 /// Databases written before `set_dictionary_metadata` replaced registrations hold a metadata
 /// row (with no constraints) for every `load_dictionary` of a pipeline dictionary, beside
 /// any complete registration. The read picks the newest complete one; a name with only

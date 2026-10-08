@@ -1126,7 +1126,7 @@ impl AspectStructure for Aspect {
 		// its registration rather than adding a second one.
 		let conn = Database::begin_concurrent(&dictionaries_db, &dictionaries_db_path, None).await?;
 		if let Err(e) = Database::replace_dictionary_registration(&conn, &DictionaryId::new(), name, description, constraints).await {
-			Database::rollback_concurrent(&conn).await?;
+			Database::rollback_after_error(&conn).await;
 			return Err(e);
 		}
 

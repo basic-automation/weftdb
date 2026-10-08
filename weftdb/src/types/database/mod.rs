@@ -229,7 +229,7 @@ impl DatabaseStructure for Database {
 			Ok(_) => tracing::trace!("Logged transaction id={id_str}"),
 			Err(e) => {
 				tracing::trace!("Transaction logging attempt failed: {e}");
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to log transaction {id_str}: {e}"));
 			}
 		}
@@ -422,7 +422,7 @@ impl DatabaseStructure for Database {
 			Ok(_) => tracing::debug!("Database metadata inserted successfully"),
 			Err(e) => {
 				tracing::debug!("Failed to insert database metadata: {e}");
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("SQL execution failure 9: `{e}`"));
 			}
 		}
@@ -698,7 +698,7 @@ impl DatabaseStructure for Database {
 		match res {
 			Ok(_) => tracing::debug!("Subject inserted successfully"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("SQL execution failure 10: `{e}`"));
 			}
 		}
@@ -749,7 +749,7 @@ impl DatabaseStructure for Database {
 				}
 			}
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("SQL execution failure 12: in get_subject: `{e}`"));
 			}
 		};
@@ -775,7 +775,7 @@ impl DatabaseStructure for Database {
 
 			return Subject::new(Some(subject_id), name, database_id, self.metadata_path.clone()).await;
 		}
-		Self::rollback_concurrent(&conn).await?;
+		Self::rollback_after_error(&conn).await;
 		return Err(anyhow::anyhow!("Subject not found"));
 	}
 
@@ -804,7 +804,7 @@ impl DatabaseStructure for Database {
 		match res {
 			Ok(_) => tracing::debug!("Deleted subject with ID {}", id.as_uuid()),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("SQL execution failure 13: `{e}`"));
 			}
 		}
@@ -826,7 +826,7 @@ impl DatabaseStructure for Database {
 		let mut rows = match res {
 			Ok(rows) => rows,
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("SQL execution failure 14: `{e}`"));
 			}
 		};
@@ -880,7 +880,7 @@ impl DatabaseStructure for Database {
 				return Ok(aspects);
 			}
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("SQL execution failure 15: in list_aspects: `{e}`"));
 			}
 		}
@@ -1018,7 +1018,7 @@ impl DatabaseStructure for Database {
 				}
 			}
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("SQL execution failure 16: in get_aspect: `{e}`"));
 			}
 		};
@@ -1062,7 +1062,7 @@ impl DatabaseStructure for Database {
 				}
 			}
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("SQL execution failure in 17: get_aspect_by_name: `{e}`"));
 			}
 		};
@@ -1713,7 +1713,7 @@ impl DatabaseInfo {
 						}
 					}
 					Err(e) => {
-						Database::rollback_concurrent(&conn).await?;
+						Database::rollback_after_error(&conn).await;
 						return Err(anyhow::anyhow!("SQL execution failure 21: in get_creation_time: `{e}`"));
 					}
 				};
@@ -1752,7 +1752,7 @@ impl DatabaseInfo {
 				}
 			}
 			Err(e) => {
-				Database::rollback_concurrent(&conn).await?;
+				Database::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("SQL execution failure 22: in get_size_stats: `{e}`"));
 			}
 		}
@@ -1767,7 +1767,7 @@ impl DatabaseInfo {
 				}
 			}
 			Err(e) => {
-				Database::rollback_concurrent(&conn).await?;
+				Database::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!(" 13: in get_size_stats: `{e}`"));
 			}
 		}

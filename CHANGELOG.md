@@ -246,6 +246,16 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 - **Commit failures were silently ignored.** A control-plane write that lost an MVCC
   conflict was reported as success. Commit errors now reach the caller, and the
   transaction is rolled back.
+- **A write that lost an MVCC conflict reported a failed rollback instead.** Turso rolls
+  a transaction back itself when one of its statements loses a write-write conflict, so
+  the `ROLLBACK` after the failed statement fails (`cannot rollback - no transaction is
+  active`), and control-plane writes (registering or creating a dictionary, inserting a
+  pattern, removing an event, …) returned that error, `Rollback failed: …`, in place of
+  the conflict. They now return the statement's error and log the failed rollback as a
+  warning. `weftdb::error::is_transient_mvcc_error` recognises the conflict as
+  retryable: it also matches Turso's `Busy`, `BusySnapshot` and write-write conflict
+  errors anywhere in an error's chain (it matched only WeftDB's own
+  `TransientMvccError`), and a failed commit keeps Turso's error in the chain.
 - **Quadratic GPU interpolation failed on GPUs without f64 support** (Apple Silicon,
   most integrated GPUs, Windows WARP). The f32 fallback shader did not parse, so wgpu
   panicked.

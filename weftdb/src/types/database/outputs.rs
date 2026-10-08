@@ -762,9 +762,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 			Ok(metadata) => metadata,
 			Err(e) => {
 				// Report why the read failed, not a failed rollback.
-				if let Err(rollback) = Self::rollback_concurrent(&conn).await {
-					tracing::warn!(error = %rollback, dictionary = dictionary_name, "Failed to roll back a dictionary metadata read");
-				}
+				Self::rollback_after_error(&conn).await;
 				return Err(e);
 			}
 		};
