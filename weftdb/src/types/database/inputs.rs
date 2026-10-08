@@ -1873,10 +1873,20 @@ impl Database {
 	}
 }
 
+/// How long [`retry_once_if_transient`] waits before its second attempt, in milliseconds:
+/// a random delay in this range, like `begin_concurrent`'s first backoff.
+const RETRY_DELAY_MS: std::ops::RangeInclusive<u64> = 10..=50;
+
 /// Run `attempt`, and once more if it fails with a transient MVCC error
 /// ([`is_transient_mvcc_error`]): a write-write conflict or a stale snapshot, after which
 /// the transaction is gone and a new one can succeed. The second attempt's result is
 /// returned as it is.
+///
+/// It waits a short random delay ([`RETRY_DELAY_MS`]) first. A write-write conflict also
+/// fires against another transaction's uncommitted write, and a second attempt made at
+/// once, while that writer is still open, would most likely conflict again; after the
+/// delay it usually sees the winner's commit (and `register_dictionary_if_absent` then
+/// finds its registration).
 async fn retry_once_if_transient<T, F, Fut>(dictionary_name: &str, mut attempt: F) -> Result<T>
 where
 	F: FnMut() -> Fut + Send,
@@ -1886,6 +1896,7 @@ where
 	match attempt().await {
 		Err(e) if is_transient_mvcc_error(&e) => {
 			tracing::debug!(error = %e, dictionary = dictionary_name, "Registering the dictionary conflicted with another write; trying once more");
+			tokio::time::sleep(std::time::Duration::from_millis(fastrand::u64(RETRY_DELAY_MS))).await;
 			attempt().await
 		}
 		result => result,
@@ -1903,8 +1914,9 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn a_transient_failure_is_tried_once_more() {
+	async fn a_transient_failure_is_tried_once_more_after_a_delay() {
 		let attempts = AtomicUsize::new(0);
+		let started = std::time::Instant::now();
 		let result = retry_once_if_transient("d", || async {
 			if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
 				Err(conflict())
@@ -1915,6 +1927,7 @@ mod tests {
 		.await;
 		assert!(result.expect("the second attempt succeeds"));
 		assert_eq!(attempts.load(Ordering::SeqCst), 2);
+		assert!(started.elapsed() >= std::time::Duration::from_millis(*RETRY_DELAY_MS.start()), "it waited before trying again: {:?}", started.elapsed());
 	}
 
 	#[tokio::test]

@@ -157,17 +157,21 @@ pub trait Inputs {
 	/// registration of that name exists. Returns whether it registered the dictionary.
 	///
 	/// The check runs inside the write's own transaction, so a registration another writer
-	/// committed after the caller last looked (an explicit `set_dictionary_metadata` with
-	/// tuned constraints, say) is kept, not replaced. A complete registration that cannot
-	/// be read, such as a stored step interpolation splimes rejects, also counts as one and
-	/// is left alone. Rows of the name without constraints, which earlier releases wrote,
-	/// are replaced. A write that loses an MVCC conflict, as two of these healing the same
-	/// rows can, is tried once more, and then sees the winner's registration.
+	/// committed before that transaction began, after the caller last looked (an explicit
+	/// `set_dictionary_metadata` with tuned constraints, say), is kept, not replaced. A
+	/// complete registration that cannot be read, such as a stored step interpolation
+	/// splimes rejects, also counts as one and is left alone. Rows of the name without
+	/// constraints, which earlier releases wrote, are replaced. A write that loses an MVCC
+	/// conflict, as two of these healing the same rows can, is tried once more after a short
+	/// random delay, and then usually sees the winner's registration.
 	///
-	/// Two writers that register the same *new* dictionary at the same moment can both find
-	/// none and both write one, since the tables cannot carry a unique constraint;
-	/// [`get_dictionary_metadata`](crate::Outputs::get_dictionary_metadata) still reads one
-	/// of them, the newest.
+	/// The check sees only registrations committed before its transaction began. One that
+	/// another writer commits while it runs, without touching the same rows, is not seen:
+	/// both commit, and [`get_dictionary_metadata`](crate::Outputs::get_dictionary_metadata)
+	/// reads the one with the later `created_at`, which can be the one written here, so it
+	/// can shadow the other. That is also how two writers registering the same *new*
+	/// dictionary at the same moment both write one, since the tables cannot carry a unique
+	/// constraint; reads pick the newest.
 	///
 	/// # Errors
 	///

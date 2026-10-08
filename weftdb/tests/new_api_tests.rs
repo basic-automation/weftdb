@@ -550,11 +550,43 @@ async fn test_register_dictionary_if_absent_keeps_a_complete_registration() {
 	common::remove_database(&db_name);
 }
 
+/// Counts the events, on the thread it is the default subscriber of, whose message
+/// contains `needle`.
+struct CountEvents {
+	needle: &'static str,
+	count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CountEvents {
+	fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+		struct Message(Option<String>);
+		impl tracing::field::Visit for Message {
+			fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+				if field.name() == "message" {
+					self.0 = Some(format!("{value:?}"));
+				}
+			}
+		}
+		let mut message = Message(None);
+		event.record(&mut message);
+		if message.0.is_some_and(|message| message.contains(self.needle)) {
+			self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+		}
+	}
+}
+
 /// Two loads healing the same legacy rows both delete them, and the second loses a
 /// write-write conflict. `register_dictionary_if_absent` tries once more and, if the
 /// conflict persists, reports it as transient; it writes nothing either way.
 #[tokio::test]
 async fn test_register_dictionary_if_absent_reports_a_persistent_conflict() {
+	use tracing_subscriber::layer::SubscriberExt as _;
+
+	// Count the retries: the error is the same transient one whether or not it retried.
+	// `tokio::test` runs this on one thread, so a thread-local subscriber sees them.
+	let retries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+	let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry().with(CountEvents { needle: "trying once more", count: retries.clone() }));
+
 	let db_name = format!("test_dictionary_if_absent_conflict_{}", Uuid::new_v4());
 	common::remove_database(&db_name);
 
@@ -573,10 +605,12 @@ async fn test_register_dictionary_if_absent_reports_a_persistent_conflict() {
 	let err = db.register_dictionary_if_absent(&aspect.id(), "healing", &metadata).await.expect_err("both attempts conflict");
 	assert_write_write_conflict(&err);
 	assert!(err.to_string().starts_with("Failed to register dictionary 'healing': "), "{err}");
+	assert_eq!(retries.load(std::sync::atomic::Ordering::SeqCst), 1, "it tried a second time, and only once more");
 
 	conn.execute("ROLLBACK", ()).await.expect("Failed to roll back the holder's transaction");
 	assert!(db.get_dictionary_metadata(&aspect.id(), "healing").await.expect("Failed to load dictionary metadata").is_none(), "nothing was written");
 	assert!(db.register_dictionary_if_absent(&aspect.id(), "healing", &metadata).await.expect("Failed to register"));
+	assert_eq!(retries.load(std::sync::atomic::Ordering::SeqCst), 1, "a write without a conflict is not retried");
 	assert_eq!(dictionary_rows(&db, &aspect.id(), "healing", "dictionary_metadata").await, 1);
 
 	common::remove_database(&db_name);

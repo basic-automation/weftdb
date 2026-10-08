@@ -51,8 +51,10 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `set_dictionary_metadata` does unless a complete registration of that name exists,
   checking inside its own write transaction, and returns whether it registered it. A
   registration that cannot be read counts as existing and is left alone, and a write
-  that loses an MVCC conflict is tried once more. Two writers registering the same new
-  dictionary at the same moment can still both write one; reads pick the newest.
+  that loses an MVCC conflict is tried once more after a short random delay. The check
+  sees registrations committed before its transaction began: one committed while it
+  runs, like a second writer registering the same new dictionary at the same moment, is
+  not seen, both are written, and reads pick the newest.
 
 ### Changed
 
@@ -234,10 +236,10 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   a dictionary twice no longer leaves two. `load_dictionary` registers a dictionary only
   when none is registered, under the `Dictionary`'s own id, through the new
   `Inputs::register_dictionary_if_absent`: it checks again inside its write, so a
-  registration committed after `load_dictionary` read none (an explicit
-  `set_dictionary_metadata` with tuned constraints, say) is kept instead of replaced
-  with the pipeline's, and a write that loses an MVCC conflict to another load healing
-  the same rows is tried once more. A dictionary name that cannot name a file is an
+  registration committed after `load_dictionary` read none and before that write began
+  (an explicit `set_dictionary_metadata` with tuned constraints, say) is kept instead of
+  replaced with the pipeline's, and a write that loses an MVCC conflict to another load
+  healing the same rows is tried once more. A dictionary name that cannot name a file is an
   error from `load_dictionary`. `get_dictionary_metadata`
   now answers `Ok(None)` for a dictionary with no database yet (it was an error,
   `Dictionary '…' does not exist for aspect '…'`), and a registration it cannot read
