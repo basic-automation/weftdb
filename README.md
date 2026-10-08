@@ -315,9 +315,11 @@ same reduction over the exact scaled-integer mantissas WeftDB already stores run
 faster than `f64`, so the gap comes from the arithmetic path and not from exactness itself
 ([`weft-reduce/benches/decimal_tax.rs`](weft-reduce/benches/decimal_tax.rs)). The first step has
 shipped as `weft_reduce::reduce_scaled`, which gives the same buckets as `reduce` from integer
-accumulators: an hourly `sum` drops from **58.65 ms to 8.46 ms**. An hourly `avg` is still
-dominated by its per-bucket `BigDecimal` division, and it is not yet wired into the server's
-downsample path.
+accumulators, and computes each bucket's `avg` by integer long division that reproduces
+`bigdecimal`'s quotient digit for digit. In one run (load avg ~50) an hourly `avg` took
+**28.45 ms** against **122.75 ms** for the shipped path and **2.77 ms** for `f64`: about a
+**10×** exact-decimal tax instead of ~44×. In an earlier run an hourly `sum` took 8.46 ms against
+58.65 ms. It is not yet wired into the server's downsample path.
 
 ---
 

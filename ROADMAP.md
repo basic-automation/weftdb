@@ -1328,11 +1328,12 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
     `decimal_tax` bench: **`sum` 58.65 → 8.46 ms (6.9×)**. **`avg` 133–153 → 50–133 ms** across two
     loaded runs, because the per-bucket `BigDecimal` division (17,477 of them) now dominates both
     paths.
-  - [ ] **NEXT — the `avg` division is the new floor.** Both paths spend most of an hourly `avg`
-    in 17,477 default-precision BigDecimal divisions. Options that keep the API exact: defer the
-    division (return sum + count, and divide only for what the caller serializes), or produce the
-    quotient by integer long division to the same precision with the same rounding, proven equal
-    by the `reduce_scaled_equals_reduce` test.
+  - [x] **DONE (2026-10-08) — the `avg` division floor.** `avg_like_bigdecimal` transcribes
+    `bigdecimal` 0.4's `impl_division` (special cases, 100-digit precision, round-half-up on the next
+    digit) into `u128` long division, building the BigInt once per 38 digits. It is **identical in
+    representation** (`int_val`, `scale`) to `bigdecimal`'s own `/` over 20,000+ random and edge cases.
+    Hourly `avg` on real BTC: shipped **122.75 ms → `reduce_scaled` 28.45 ms (4.3×)**, f64 2.77 ms,
+    so the decimal tax on this path went from ~44× to ~10× (one run, load avg ~50).
   - [ ] **NEXT — wire `reduce_scaled` into the read path:** `SegmentStore::downsample_range` and the
     `.weftpart` sidecar build should call it with the segment's decoded mantissas when the column
     is `ScaledI64` and every requested reduction is streaming, and fall back to `reduce` otherwise.

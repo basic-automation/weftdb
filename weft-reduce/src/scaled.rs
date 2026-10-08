@@ -97,6 +97,71 @@ impl ScaledAcc {
 	}
 }
 
+/// The significant digits `bigdecimal`'s `/` keeps (its build-time `DEFAULT_PRECISION`, `100`
+/// unless `RUST_BIGDECIMAL_DEFAULT_PRECISION` overrides it at build time). The equality tests
+/// below compare against `bigdecimal`'s own division, so a build with a different precision
+/// fails them rather than silently diverging.
+const BIGDECIMAL_DIV_PRECISION: u32 = 100;
+
+/// `BigDecimal::new(sum, scale) / BigDecimal::from(count)`, computed the way `bigdecimal` 0.4
+/// computes it and with an identical result, but with `u128` long division instead of a
+/// `BigInt` `div_rem` per digit.
+///
+/// This is the per-bucket `avg`. It transcribes `bigdecimal`'s `impl_division`, including the
+/// special cases its `Div` takes first: a zero numerator or a divisor of one returns the
+/// numerator unchanged, and equal integers return `1` at the operand scale. Digits are
+/// generated until the remainder is zero or the quotient holds [`BIGDECIMAL_DIV_PRECISION`]
+/// digits, then a non-zero remainder rounds the last digit up when the next digit is `>= 5`
+/// (`get_rounding_term` of a single digit). A divisor in `u64` keeps every remainder in `u128`.
+fn avg_like_bigdecimal(sum: i128, scale: i64, count: u64) -> BigDecimal {
+	if sum == 0 || count == 1 {
+		return BigDecimal::new(BigInt::from(sum), scale);
+	}
+	if sum == i128::from(count) {
+		return BigDecimal::new(BigInt::from(1), scale);
+	}
+	let negative = sum < 0;
+	let den = u128::from(count);
+	let mut num = sum.unsigned_abs();
+	let mut scale = scale;
+	while num < den {
+		scale += 1;
+		num *= 10;
+	}
+	let (lead, mut rem) = (num / den, num % den);
+	let mut quotient = BigInt::from(lead);
+	if rem != 0 {
+		let mut precision = lead.checked_ilog10().map_or(1, |d| d + 1);
+		// Digits after the leading quotient, gathered in `u128` chunks of up to 38 digits so
+		// the `BigInt` is touched once per chunk rather than once per digit.
+		let (mut chunk, mut chunk_digits) = (0_u128, 0_u32);
+		rem *= 10;
+		while rem != 0 && precision < BIGDECIMAL_DIV_PRECISION {
+			chunk = chunk * 10 + rem / den;
+			rem = (rem % den) * 10;
+			chunk_digits += 1;
+			precision += 1;
+			scale += 1;
+			if chunk_digits == 38 {
+				quotient = quotient * BigInt::from(10_u128.pow(38)) + BigInt::from(chunk);
+				(chunk, chunk_digits) = (0, 0);
+			}
+		}
+		if chunk_digits > 0 {
+			quotient = quotient * BigInt::from(10_u128.pow(chunk_digits)) + BigInt::from(chunk);
+		}
+		if rem != 0 && rem / den >= 5 {
+			quotient += 1;
+		}
+	}
+	let magnitude = BigDecimal::new(quotient, scale);
+	if negative {
+		-magnitude
+	} else {
+		magnitude
+	}
+}
+
 /// Whether [`reduce_scaled`] can compute `aggregation` from integer state alone.
 const fn is_streaming(aggregation: Aggregation) -> bool {
 	matches!(aggregation, Aggregation::Min | Aggregation::Max | Aggregation::Avg | Aggregation::Sum | Aggregation::First | Aggregation::Last)
@@ -165,8 +230,8 @@ pub fn reduce_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32, resolut
 					Aggregation::Min => decimal(i128::from(acc.min)),
 					Aggregation::Max => decimal(i128::from(acc.max)),
 					Aggregation::Sum => sum.clone(),
-					// The same division `reduce` performs, on a numerically equal sum.
-					Aggregation::Avg => &sum / &BigDecimal::from(acc.count),
+					// The same result `reduce`'s `sum / count` produces, from integer long division.
+					Aggregation::Avg => avg_like_bigdecimal(acc.sum, scale, acc.count),
 					Aggregation::First => decimal(i128::from(acc.first.1)),
 					Aggregation::Last => decimal(i128::from(acc.last.1)),
 					_ => unreachable!("non-streaming reductions return Ok(None) above"),
@@ -243,6 +308,26 @@ mod tests {
 					assert_eq!(actual, expected, "{resolution:?} {start:?}..{end:?} {aggs:?}");
 				}
 			}
+		}
+	}
+
+	#[test]
+	fn avg_like_bigdecimal_is_identical_to_bigdecimal_division() {
+		// Same value AND same representation (int_val, scale) as `bigdecimal`'s own `/`, over
+		// random sums and counts, the special cases, exact and repeating quotients, rounding
+		// carries (…999 → …000) and extreme magnitudes.
+		let mut next = noise(0xd1b5_4a32_d192_ed03);
+		let mut cases: Vec<(i128, i64, u64)> = vec![(0, 8, 7), (5, 2, 1), (7, 0, 7), (-7, 3, 7), (1, 0, 3), (2, 0, 3), (-2, 5, 3), (10, 1, 4), (1, 0, 9_999_999_999), (i128::from(i64::MAX) * 1_000, 8, 3), (-i128::from(i64::MAX) * 1_000, 8, 7), (1, 0, u64::MAX), (u64::MAX.into(), 0, u64::MAX - 1), (2, 0, 30), (1, 0, 6)];
+		for _ in 0..20_000 {
+			let sum = i128::from((next() % 4_000_000_000_000).cast_signed() - 2_000_000_000_000) * i128::from(next() % 1_000 + 1);
+			let count = next() % 100_000 + 1;
+			let scale = (next() % 12).cast_signed();
+			cases.push((sum, scale, count));
+		}
+		for (sum, scale, count) in cases {
+			let expected = &BigDecimal::new(BigInt::from(sum), scale) / &BigDecimal::from(count);
+			let actual = avg_like_bigdecimal(sum, scale, count);
+			assert_eq!(actual.as_bigint_and_exponent(), expected.as_bigint_and_exponent(), "{sum}e-{scale} / {count}");
 		}
 	}
 
