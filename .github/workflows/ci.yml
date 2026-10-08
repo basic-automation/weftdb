@@ -176,3 +176,14 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories bans licenses sources
+
+  # The contribution-terms workflow runs scripts/contrib/dco_check.py against the GitHub API;
+  # this runs the checker's tests against stubbed API responses (scripts/contrib/testdata).
+  contrib:
+    name: contribution-terms checker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: python3 -m unittest discover -s scripts/contrib -p 'test_*.py' -v
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"

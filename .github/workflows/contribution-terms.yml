@@ -1,0 +1,150 @@
+name: Contribution terms
+
+# A pull request passes when either of the two contribution routes holds
+# (CONTRIBUTING.md, "Contribution terms"):
+#
+#   1. DCO: every commit carries `Signed-off-by: Name <email>` matching its author email.
+#      Checked by scripts/contrib/dco_check.py, whose tests run in ci.yml.
+#   2. CLA: otherwise, every commit author has signed CLA.md, recorded by CLA Assistant Lite.
+#
+# Branch protection requires the `contribution-terms` job, and only that job. `DCO sign-off`
+# and `CLA` feed it; `CLA` is skipped when the DCO route already holds.
+#
+# The allowlist (the owner and two bots) passes without either: a pull request opened by an
+# allowlisted account passes outright, and an allowlisted commit author needs no sign-off or
+# signature. The owner answers for the terms of anyone else's commits in his own pull requests.
+#
+# Security. pull_request_target and issue_comment runs get a write token even for pull
+# requests from forks, so no job checks out, builds or runs pull request code. The DCO job
+# checks out the default branch, for the checker only, and reads the pull request through the
+# REST API. The CLA job runs only the pinned action. Pull request text never appears in a
+# ${{ }} expression inside a script. Third-party actions are pinned to full commit SHAs.
+#
+# One-time setup by the owner, before requiring the check. The action cannot create the
+# branch or the file:
+#
+#   git switch --orphan cla-signatures
+#   mkdir -p signatures/cla && printf '{\n  "signedContributors": []\n}\n' > signatures/cla/v1.json
+#   git add signatures/cla/v1.json && git commit -s -m "chore: start the CLA v1 signature file"
+#   git push origin cla-signatures && git switch main
+#
+# Leave `cla-signatures` unprotected: the action commits each signature to it with the
+# workflow token.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+env:
+  ALLOWLIST: physics515,dependabot[bot],github-actions[bot]
+  SIGN_COMMENT: I have read the CLA Document and I hereby sign the CLA
+
+jobs:
+  dco:
+    name: DCO sign-off
+    # Every pull request event; for comments, only a pull request comment that signs the CLA
+    # or asks for a recheck.
+    if: >-
+      github.event_name == 'pull_request_target' ||
+      (github.event.issue.pull_request &&
+      github.event.comment.user.type != 'Bot' &&
+      (github.event.comment.body == 'recheck' ||
+      contains(github.event.comment.body, 'I have read the CLA Document and I hereby sign the CLA')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read # check out the checker from the default branch
+      pull-requests: read # list the pull request's commits
+    outputs:
+      satisfied: ${{ steps.check.outputs.satisfied }}
+    steps:
+      - name: Check out the checker from the default branch (never the pull request)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: scripts/contrib
+
+      - name: Check every commit for its author's Signed-off-by
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          set +e
+          python3 scripts/contrib/dco_check.py --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" --allow "$ALLOWLIST"
+          status=$?
+          set -e
+          case "$status" in
+            0) echo "satisfied=true" >> "$GITHUB_OUTPUT" ;;
+            1) echo "satisfied=false" >> "$GITHUB_OUTPUT"
+               echo "::notice title=DCO::Not every commit is signed off by its author, so the CLA decides." ;;
+            *) exit "$status" ;;
+          esac
+
+  cla:
+    name: CLA
+    needs: dco
+    if: needs.dco.outputs.satisfied != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write # re-run the pull request's check after a signing comment
+      contents: write # commit signatures/cla/v1.json on the cla-signatures branch
+      pull-requests: write # read the commit authors; post and update the CLA comment
+    steps:
+      - name: CLA Assistant Lite
+        uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          path-to-document: https://github.com/basic-automation/weftdb/blob/main/CLA.md
+          path-to-signatures: signatures/cla/v1.json
+          branch: cla-signatures
+          allowlist: ${{ env.ALLOWLIST }}
+          custom-pr-sign-comment: ${{ env.SIGN_COMMENT }}
+          custom-notsigned-prcomment: >-
+            Thank you for the pull request. WeftDB takes contributions under either of two
+            terms, and $you can choose
+            (see <a href="https://github.com/basic-automation/weftdb/blob/main/CONTRIBUTING.md#contribution-terms">Contribution terms</a>).<br/><br/>
+            <b>Sign off every commit</b> under the
+            <a href="https://developercertificate.org">Developer Certificate of Origin</a>:
+            run <code>git rebase --signoff &lt;base&gt;</code> and force-push. Each sign-off's
+            email must match its commit's author email.<br/><br/>
+            <b>Or sign the
+            <a href="https://github.com/basic-automation/weftdb/blob/main/CLA.md">Contributor License Agreement</a></b>
+            once, by posting the comment below on this pull request.<br/>
+
+  contribution-terms:
+    name: contribution-terms
+    needs: [dco, cla]
+    if: ${{ !cancelled() && needs.dco.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Pass if either route holds
+        env:
+          DCO_RESULT: ${{ needs.dco.result }}
+          DCO_SATISFIED: ${{ needs.dco.outputs.satisfied }}
+          CLA_RESULT: ${{ needs.cla.result }}
+        run: |
+          if [ "$DCO_RESULT" != "success" ]; then
+            echo "::error title=Contribution terms::The DCO check did not finish ($DCO_RESULT); re-run it."
+            exit 1
+          fi
+          if [ "$DCO_SATISFIED" = "true" ]; then
+            echo "DCO: every commit is signed off by its author, or the pull request is allowlisted."
+            exit 0
+          fi
+          if [ "$CLA_RESULT" = "success" ]; then
+            echo "CLA: every commit author has signed the CLA, or is allowlisted."
+            exit 0
+          fi
+          echo "::error title=Contribution terms::Sign off every commit (git rebase --signoff) or sign the CLA. See CONTRIBUTING.md, Contribution terms."
+          exit 1

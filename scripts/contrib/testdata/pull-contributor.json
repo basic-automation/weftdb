@@ -1,0 +1,11 @@
+{
+  "number": 42,
+  "state": "open",
+  "title": "Example change",
+  "user": {
+    "login": "ada-l",
+    "id": 7,
+    "type": "User"
+  },
+  "commits": 4
+}
