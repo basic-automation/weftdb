@@ -11,7 +11,7 @@ use crate::{
 	cache::Connection, types::{
 		compression::CompressionConfig, database::{
 			traits::{aspect_structure::AspectStructure, connection::Connection as ConnectionTrait}, Config
-		}, dictionary::VariablilityType
+		}
 	}, Database, DatabaseStructure, DictionaryConstraints, DictionaryId, SubjectId
 };
 
@@ -1101,9 +1101,7 @@ impl AspectStructure for Aspect {
 	async fn new_dictionary(&self, name: &str, description: &str, constraints: &DictionaryConstraints) -> Result<()> {
 		// The step interpolation is stored as text and validated by `Spline::from_str` when
 		// it is read back (`get_dictionary_metadata`), so refuse one that could not load.
-		if let Some(steps) = constraints.steps() {
-			steps.interpolation().validate().map_err(|e| anyhow::anyhow!("Invalid step interpolation for dictionary '{name}': {e}"))?;
-		}
+		Database::check_dictionary_constraints(name, constraints)?;
 
 		// Extract db_name from path (path is like C:\Users\...\weft_data\{db_name}\{subject}\{aspect})
 		// Use the parent's parent to get db_name from the aspect path
@@ -1124,37 +1122,13 @@ impl AspectStructure for Aspect {
 			drop(schema_conn);
 		}
 
-		// Now use BEGIN CONCURRENT for data operations
+		// Now use BEGIN CONCURRENT for data operations. The registration is written as
+		// `set_dictionary_metadata` writes it, so creating a dictionary that exists replaces
+		// its registration rather than adding a second one.
 		let conn = Database::begin_concurrent(&dictionaries_db, &dictionaries_db_path, None).await?;
-		let id = DictionaryId::new();
-
-		// Insert metadata
-		conn.as_ref().execute("INSERT INTO dictionary_metadata (id, name, description, created_at) VALUES (?, ?, ?, ?)", turso::params![id.as_uuid().to_string(), name, description, chrono::Utc::now().timestamp_millis()]).await?;
-
-		// Insert constraints
-		let steps_count = constraints.steps().as_ref().map(|s| s.count().to_string());
-		let steps_interpolation = constraints.steps().as_ref().map(|s| s.interpolation().to_string());
-		conn.as_ref().execute("INSERT INTO dictionary_constraints (dictionary_id, steps_count, steps_interpolation) VALUES (?, ?, ?)", turso::params![id.as_uuid().to_string(), steps_count, steps_interpolation]).await?;
-
-		// Insert variabilities
-		if let Some(variabilities) = constraints.variabilities() {
-			for variability in variabilities {
-				let (var_type, var_value) = match variability {
-					VariablilityType::MaximumStatic(v) => ("MaximumStatic", v.value().to_string()),
-					VariablilityType::AverageStatic(v) => ("AverageStatic", v.value().to_string()),
-					VariablilityType::AbsoluteMaximumStatic(v) => ("AbsoluteMaximumStatic", v.value().to_string()),
-					VariablilityType::AbsoluteAverageStatic(v) => ("AbsoluteAverageStatic", v.value().to_string()),
-					VariablilityType::MaximumPercentile(v) => ("MaximumPercentile", v.value().to_string()),
-					VariablilityType::AveragePercentile(v) => ("AveragePercentile", v.value().to_string()),
-					VariablilityType::AbsoluteMaximumPercentile(v) => ("AbsoluteMaximumPercentile", v.value().to_string()),
-					VariablilityType::AbsoluteAveragePercentile(v) => ("AbsoluteAveragePercentile", v.value().to_string()),
-					VariablilityType::SumStatic(v) => ("SumStatic", v.value().to_string()),
-					VariablilityType::SumPercentile(v) => ("SumPercentile", v.value().to_string()),
-					VariablilityType::AbsoluteSumStatic(v) => ("AbsoluteSumStatic", v.value().to_string()),
-					VariablilityType::AbsoluteSumPercentile(v) => ("AbsoluteSumPercentile", v.value().to_string()),
-				};
-				conn.as_ref().execute("INSERT INTO dictionary_variabilities (dictionary_id, variability_type, variability_value) VALUES (?, ?, ?)", turso::params![id.as_uuid().to_string(), var_type, var_value]).await?;
-			}
+		if let Err(e) = Database::replace_dictionary_registration(&conn, &DictionaryId::new(), name, description, constraints).await {
+			Database::rollback_concurrent(&conn).await?;
+			return Err(e);
 		}
 
 		Database::commit_concurrent(&conn).await?;

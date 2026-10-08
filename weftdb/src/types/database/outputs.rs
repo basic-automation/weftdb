@@ -10,8 +10,8 @@ use uuid::Uuid;
 
 use crate::{
 	cache::{self}, correlation::ErrorRate, types::{
-		database::traits::{aspect_structure::AspectStructure, connection::Connection as _ConnectionTrait, database_structure::DatabaseStructure}, error::is_transient_mvcc_error
-	}, AnalysisResult, AspectId, Batch, BatchId, BatchMetatdata, BatchedMeasurement, Correlation, CorrelationID, Database, DatabaseInfo, DatasetId, DictionaryConstraints, DictionaryId, DictionaryMetadata, Error, Event, EventID, Manifestation, ManifestationId, Measurement, MeasurementId, Occurrence, Pattern, PatternID, Relative, SignalType, Steps, SubjectId, UnbatchedEntry, VariablilityType
+		database::traits::{aspect_structure::AspectStructure, config::Config, connection::Connection as _ConnectionTrait, database_structure::DatabaseStructure}, error::is_transient_mvcc_error
+	}, AnalysisResult, AspectId, Batch, BatchId, BatchMetatdata, BatchedMeasurement, Correlation, CorrelationID, Database, DatabaseInfo, DatasetId, DictionaryConstraints, DictionaryId, DictionaryMetadata, Error, Event, EventID, Manifestation, ManifestationId, Measurement, MeasurementId, Occurrence, Pattern, PatternID, Relative, SignalType, Steps, SubjectId, UnbatchedEntry, Variability, VariablilityType
 };
 
 /// Maximum retries for transient MVCC errors during concurrent compression
@@ -767,99 +767,75 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 
 	async fn get_dictionary_metadata(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<Option<DictionaryMetadata>> {
 		// Check cache first. Keyed by aspect too: dictionary names are per aspect.
-		let cache_key = format!("dictionary_metadata_{}_{dictionary_name}", aspect_id.as_uuid());
+		let cache_key = Self::dictionary_metadata_cache_key(aspect_id, dictionary_name);
 		if let Some(metadata) = self.cache.lock().await.get::<DictionaryMetadata>(&cache_key).await {
 			return Ok(Some(metadata));
+		}
+
+		// Each dictionary is its own database file. Without one nothing is registered under
+		// this name, so the answer is `None` (on which `load_dictionary` registers the
+		// dictionary), not the error `get_dictionary_db` gives for a missing file.
+		let aspect = self.get_aspect(aspect_id).await?;
+		let db_path = Self::aspect_dictionaries_db_path(&self.name, aspect.subject_name(), aspect.name(), dictionary_name);
+		if !tokio::fs::try_exists(&db_path).await? {
+			return Ok(None);
 		}
 
 		// Get from database
 		let db = self.get_dictionary_db(aspect_id, dictionary_name).await?;
 		let conn: cache::Connection = Self::begin_concurrent(&db, dictionary_name, Some(self.cache.clone())).await?;
-		// `dictionary_metadata` has no `updated_at` column (see
-		// `Aspect::create_dictionary_metadata_table`); selecting one failed every read.
-		let query_sql = r"
-                        SELECT id, name, description, created_at
-                        FROM dictionary_metadata 
-                        WHERE name = ?
-                ";
+		let metadata = match Self::read_dictionary_registration(&conn, dictionary_name).await {
+			Ok(metadata) => metadata,
+			Err(e) => {
+				// Report why the read failed, not a failed rollback.
+				if let Err(rollback) = Self::rollback_concurrent(&conn).await {
+					tracing::warn!(error = %rollback, dictionary = dictionary_name, "Failed to roll back a dictionary metadata read");
+				}
+				return Err(e);
+			}
+		};
+		Self::commit_concurrent(&conn).await?;
 
-		let mut metadata_rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![dictionary_name]).await.map_err(|e| Error::DatabaseError(format!("Failed to query dictionary metadata: {e}")))?;
-		if let Some(row) = metadata_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get metadata row: {e}")))? {
-			let id_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary ID is not text".to_string()))?.clone();
-			let name_str = row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary name is not text".to_string()))?.clone();
-			let description_str = row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary description is not text".to_string()))?.clone();
-			let created_at_millis: i64 = *row.get_value(3)?.as_integer().ok_or_else(|| Error::DatabaseError("Created at is not integer".to_string()))?;
-
-			let id = DictionaryId::from_uuid(Uuid::parse_str(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for dictionary ID: {e}")))?);
-			let _created_at = DateTime::from_timestamp_millis(created_at_millis).ok_or_else(|| Error::DatabaseError("Invalid created at timestamp".to_string()))?;
-
-			let constraint_query_sql = r"
-                                SELECT steps_count, steps_interpolation
-                                FROM dictionary_constraints
-                                WHERE dictionary_id = ?
-                        "
-			.to_string();
-
-			let mut constraint_rows: turso::Rows = conn.as_ref().query(&constraint_query_sql, turso::params![id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query dictionary constraints: {e}")))?;
-			let result = if let Some(constraint_row) = constraint_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get constraint row: {e}")))? {
-				let steps = Self::parse_stored_steps(&constraint_row.get_value(0)?, &constraint_row.get_value(1)?)?;
-
-				// Parse variabilities - try to get from a separate query or use None
-				let variabilities: Option<Vec<VariablilityType>> = None;
-
-				let constraints = DictionaryConstraints::new(steps, variabilities);
-
-				let metadata = DictionaryMetadata { id, name: name_str, description: description_str, constraints };
-
-				// Cache the metadata
-				self.cache.lock().await.store(&cache_key, metadata.clone()).await;
-
-				Some(metadata)
-			} else {
-				None
-			};
-			Self::commit_concurrent(&conn).await?;
-			Ok(result)
-		} else {
-			Self::commit_concurrent(&conn).await?;
-			Ok(None)
+		if let Some(metadata) = &metadata {
+			self.cache.lock().await.store(&cache_key, metadata.clone()).await;
 		}
+		Ok(metadata)
 	}
 
 	async fn list_dictionaries(&self, aspect_id: &AspectId) -> Result<Vec<DictionaryMetadata>> {
-		// Check cache first
-		let cache_key = format!("dictionaries_list_{}", aspect_id.as_uuid());
-		if let Some(dictionaries) = self.cache.lock().await.get::<Vec<DictionaryMetadata>>(&cache_key).await {
-			return Ok(dictionaries);
+		// Each dictionary is its own `<aspect>/dictionaries/<name>.db`, so the aspect's
+		// dictionaries are the `.db` files there. (This read one dictionary's database, the
+		// one named "default", and failed for an aspect without it.) Not cached: a
+		// dictionary created through `Aspect::new_dictionary` could not invalidate it, and
+		// each dictionary's metadata is cached by `get_dictionary_metadata`.
+		let aspect = self.get_aspect(aspect_id).await?;
+		let dictionaries_path = Self::aspect_dictionaries_path(&self.name, aspect.subject_name(), aspect.name());
+		let mut entries = match tokio::fs::read_dir(&dictionaries_path).await {
+			Ok(entries) => entries,
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+			Err(e) => return Err(Error::DatabaseError(format!("Failed to read dictionaries directory '{dictionaries_path}': {e}")).into()),
+		};
+		let mut names = Vec::new();
+		while let Some(entry) = entries.next_entry().await.map_err(|e| Error::DatabaseError(format!("Failed to read dictionaries directory '{dictionaries_path}': {e}")))? {
+			// `<name>.db` only, not Turso's `<name>.db-wal` and `<name>.db-log` beside it.
+			let path = entry.path();
+			if path.extension().is_some_and(|ext| ext == "db") && tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_file()) {
+				if let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) {
+					names.push(name.to_string());
+				}
+			}
 		}
+		names.sort_unstable();
 
-		// Get from database
-		let db = self.get_dictionary_db(aspect_id, "default").await?;
-		let conn: cache::Connection = Self::begin_concurrent(&db, "default", Some(self.cache.clone())).await?;
-		// No `updated_at`: the table has no such column (see `get_dictionary_metadata`).
-		let query_sql = r"
-                        SELECT id, name, description, created_at
-                        FROM dictionary_metadata
-                ";
-
-		let mut rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to query dictionaries: {e}")))?;
-		let mut dictionaries: Vec<DictionaryMetadata> = Vec::new();
-
-		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get dictionary row: {e}")))? {
-			let id_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary ID is not text".to_string()))?.clone();
-			let name_str = row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary name is not text".to_string()))?.clone();
-			let description_str = row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary description is not text".to_string()))?.clone();
-			let created_at_millis: i64 = *row.get_value(3)?.as_integer().ok_or_else(|| Error::DatabaseError("Created at is not integer".to_string()))?;
-
-			let id = DictionaryId::from_uuid(Uuid::parse_str(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for dictionary ID: {e}")))?);
-			let _created_at = DateTime::from_timestamp_millis(created_at_millis).ok_or_else(|| Error::DatabaseError("Invalid created at timestamp".to_string()))?;
-
-			let metadata = DictionaryMetadata { id, name: name_str, description: description_str, constraints: DictionaryConstraints::default() };
-
-			dictionaries.push(metadata);
+		// A file with no complete registration (see `read_dictionary_registration`) is not
+		// listed; a registration that cannot be read is an error, as it is for
+		// `get_dictionary_metadata`.
+		let mut dictionaries = Vec::with_capacity(names.len());
+		for name in names {
+			if let Some(metadata) = self.get_dictionary_metadata(aspect_id, &name).await? {
+				dictionaries.push(metadata);
+			}
 		}
-		Self::commit_concurrent(&conn).await?;
-		self.cache.lock().await.store(&cache_key, dictionaries.clone()).await;
 		Ok(dictionaries)
 	}
 
@@ -1632,6 +1608,77 @@ impl Database {
 		Ok(Measurement::new(id, dataset_id, timestamp, value))
 	}
 
+	/// The key `get_dictionary_metadata` caches a dictionary's metadata under, which
+	/// `set_dictionary_metadata` invalidates. Dictionary names are per aspect, so it has both.
+	pub(crate) fn dictionary_metadata_cache_key(aspect_id: &AspectId, dictionary_name: &str) -> String {
+		format!("dictionary_metadata_{}_{dictionary_name}", aspect_id.as_uuid())
+	}
+
+	/// Read `dictionary_name`'s registration on `conn`, a transaction on its database.
+	///
+	/// A registration is a `dictionary_metadata` row with a `dictionary_constraints` row;
+	/// its `dictionary_variabilities` rows, in the order they were written, are its
+	/// variabilities (none is `None`). The metadata table has no unique constraint, and
+	/// databases written before `set_dictionary_metadata` replaced registrations can hold
+	/// several rows for a name, some without constraints (it wrote none): the newest
+	/// complete one is read, and a name with none is `None`.
+	///
+	/// # Errors
+	///
+	/// A failed query, or a stored value that does not parse: see
+	/// [`parse_stored_steps`](Self::parse_stored_steps) and
+	/// [`parse_stored_variability`](Self::parse_stored_variability).
+	async fn read_dictionary_registration(conn: &cache::Connection, dictionary_name: &str) -> Result<Option<DictionaryMetadata>> {
+		let query_sql = r"
+                        SELECT m.id, m.name, m.description, c.steps_count, c.steps_interpolation
+                        FROM dictionary_metadata m
+                        JOIN dictionary_constraints c ON c.dictionary_id = m.id
+                        WHERE m.name = ?
+                        ORDER BY m.created_at DESC, m.id DESC
+                        LIMIT 1
+                ";
+		let mut rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![dictionary_name]).await.map_err(|e| Error::DatabaseError(format!("Failed to query dictionary metadata: {e}")))?;
+		let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get metadata row: {e}")))? else {
+			return Ok(None);
+		};
+		let id_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary ID is not text".to_string()))?.clone();
+		let name = row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary name is not text".to_string()))?.clone();
+		let description = row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary description is not text".to_string()))?.clone();
+		let steps = Self::parse_stored_steps(&row.get_value(3)?, &row.get_value(4)?)?;
+		drop(rows);
+		let id = DictionaryId::from_uuid(Uuid::parse_str(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for dictionary ID: {e}")))?);
+
+		let variability_query_sql = r"
+                        SELECT variability_type, variability_value
+                        FROM dictionary_variabilities
+                        WHERE dictionary_id = ?
+                        ORDER BY id
+                ";
+		let mut rows: turso::Rows = conn.as_ref().query(variability_query_sql, turso::params![id_str]).await.map_err(|e| Error::DatabaseError(format!("Failed to query dictionary variabilities: {e}")))?;
+		let mut variabilities = Vec::new();
+		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get variability row: {e}")))? {
+			variabilities.push(Self::parse_stored_variability(&row.get_value(0)?, &row.get_value(1)?)?);
+		}
+		let variabilities = (!variabilities.is_empty()).then_some(variabilities);
+
+		Ok(Some(DictionaryMetadata { id, name, description, constraints: DictionaryConstraints::new(steps, variabilities) }))
+	}
+
+	/// Parse one of a dictionary's stored variabilities: the `variability_type` and
+	/// `variability_value` columns of a `dictionary_variabilities` row, which hold the
+	/// variant's name ([`VariablilityType::kind`]) and its value as decimal text.
+	///
+	/// # Errors
+	///
+	/// A `DatabaseError` for a column that is not text, a value that is not a decimal, or a
+	/// name that is no variant, e.g. `Invalid variability: Unknown VariabilityType: Median`.
+	fn parse_stored_variability(variability_type: &turso::Value, variability_value: &turso::Value) -> Result<VariablilityType> {
+		let kind = variability_type.as_text().ok_or_else(|| Error::DatabaseError("Variability type is not text".to_string()))?;
+		let value = variability_value.as_text().ok_or_else(|| Error::DatabaseError("Variability value is not text".to_string()))?;
+		let value = BigDecimal::from_str(value).map_err(|e| Error::DatabaseError(format!("Invalid variability value '{value}': {e}")))?;
+		Ok(VariablilityType::from_kind(kind, Variability::new(value)).map_err(|e| Error::DatabaseError(format!("Invalid variability: {e}")))?)
+	}
+
 	/// Parse a dictionary's stored step configuration: the `steps_count` and
 	/// `steps_interpolation` columns of its `dictionary_constraints` row.
 	///
@@ -1685,6 +1732,17 @@ mod tests {
 		for count in [Value::Null, text(""), text("null")] {
 			assert!(Database::parse_stored_steps(&count, &Value::Null).expect("no steps").is_none());
 		}
+	}
+
+	#[test]
+	fn stored_variabilities_read_their_kind_and_value() {
+		let variability = Database::parse_stored_variability(&text("AveragePercentile"), &text("0.000000001")).expect("a stored variability");
+		assert_eq!(variability.kind(), "AveragePercentile");
+		assert_eq!(variability.variability().value(), &BigDecimal::from_str("0.000000001").unwrap());
+		let err = Database::parse_stored_variability(&text("Median"), &text("1")).expect_err("no such variant");
+		assert_eq!(err.to_string(), "Database error: Invalid variability: Unknown VariabilityType: Median");
+		assert!(Database::parse_stored_variability(&text("SumStatic"), &text("lots")).is_err());
+		assert!(Database::parse_stored_variability(&Value::Null, &text("1")).is_err());
 	}
 
 	#[test]

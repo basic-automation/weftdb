@@ -156,22 +156,60 @@ pub enum VariablilityType {
 	AbsoluteSumPercentile(Variability),
 }
 
+impl VariablilityType {
+	/// The variant's name, e.g. `"AveragePercentile"`: what [`Display`] writes before the
+	/// value, and what a dictionary stores in `dictionary_variabilities.variability_type`.
+	pub(crate) const fn kind(&self) -> &'static str {
+		match self {
+			Self::MaximumStatic(_) => "MaximumStatic",
+			Self::AverageStatic(_) => "AverageStatic",
+			Self::AbsoluteMaximumStatic(_) => "AbsoluteMaximumStatic",
+			Self::AbsoluteAverageStatic(_) => "AbsoluteAverageStatic",
+			Self::MaximumPercentile(_) => "MaximumPercentile",
+			Self::AveragePercentile(_) => "AveragePercentile",
+			Self::AbsoluteMaximumPercentile(_) => "AbsoluteMaximumPercentile",
+			Self::AbsoluteAveragePercentile(_) => "AbsoluteAveragePercentile",
+			Self::SumStatic(_) => "SumStatic",
+			Self::SumPercentile(_) => "SumPercentile",
+			Self::AbsoluteSumStatic(_) => "AbsoluteSumStatic",
+			Self::AbsoluteSumPercentile(_) => "AbsoluteSumPercentile",
+		}
+	}
+
+	/// The variability every variant carries.
+	pub(crate) const fn variability(&self) -> &Variability {
+		match self {
+			Self::MaximumStatic(v) | Self::AverageStatic(v) | Self::AbsoluteMaximumStatic(v) | Self::AbsoluteAverageStatic(v) | Self::MaximumPercentile(v) | Self::AveragePercentile(v) | Self::AbsoluteMaximumPercentile(v) | Self::AbsoluteAveragePercentile(v) | Self::SumStatic(v) | Self::SumPercentile(v) | Self::AbsoluteSumStatic(v) | Self::AbsoluteSumPercentile(v) => v,
+		}
+	}
+
+	/// The variant [`kind`](Self::kind) names, carrying `variability`.
+	///
+	/// # Errors
+	///
+	/// `Unknown VariabilityType: <kind>` when `kind` names no variant.
+	pub(crate) fn from_kind(kind: &str, variability: Variability) -> Result<Self> {
+		Ok(match kind {
+			"MaximumStatic" => Self::MaximumStatic(variability),
+			"AverageStatic" => Self::AverageStatic(variability),
+			"AbsoluteMaximumStatic" => Self::AbsoluteMaximumStatic(variability),
+			"AbsoluteAverageStatic" => Self::AbsoluteAverageStatic(variability),
+			"MaximumPercentile" => Self::MaximumPercentile(variability),
+			"AveragePercentile" => Self::AveragePercentile(variability),
+			"AbsoluteMaximumPercentile" => Self::AbsoluteMaximumPercentile(variability),
+			"AbsoluteAveragePercentile" => Self::AbsoluteAveragePercentile(variability),
+			"SumStatic" => Self::SumStatic(variability),
+			"SumPercentile" => Self::SumPercentile(variability),
+			"AbsoluteSumStatic" => Self::AbsoluteSumStatic(variability),
+			"AbsoluteSumPercentile" => Self::AbsoluteSumPercentile(variability),
+			_ => bail!("Unknown VariabilityType: {kind}"),
+		})
+	}
+}
+
 impl Display for VariablilityType {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		match self {
-			Self::MaximumStatic(var) => write!(f, "MaximumStatic({})", var.value()),
-			Self::AverageStatic(var) => write!(f, "AverageStatic({})", var.value()),
-			Self::AbsoluteMaximumStatic(var) => write!(f, "AbsoluteMaximumStatic({})", var.value()),
-			Self::AbsoluteAverageStatic(var) => write!(f, "AbsoluteAverageStatic({})", var.value()),
-			Self::MaximumPercentile(var) => write!(f, "MaximumPercentile({})", var.value()),
-			Self::AveragePercentile(var) => write!(f, "AveragePercentile({})", var.value()),
-			Self::AbsoluteMaximumPercentile(var) => write!(f, "AbsoluteMaximumPercentile({})", var.value()),
-			Self::AbsoluteAveragePercentile(var) => write!(f, "AbsoluteAveragePercentile({})", var.value()),
-			Self::SumStatic(var) => write!(f, "SumStatic({})", var.value()),
-			Self::SumPercentile(var) => write!(f, "SumPercentile({})", var.value()),
-			Self::AbsoluteSumStatic(var) => write!(f, "AbsoluteSumStatic({})", var.value()),
-			Self::AbsoluteSumPercentile(var) => write!(f, "AbsoluteSumPercentile({})", var.value()),
-		}
+		write!(f, "{}({})", self.kind(), self.variability().value())
 	}
 }
 
@@ -188,23 +226,7 @@ impl FromStr for VariablilityType {
 		let value_str = parts[1];
 		let value = BigDecimal::from_str(value_str)?;
 
-		let variability = Variability::new(value);
-
-		match var_type {
-			"MaximumStatic" => Ok(Self::MaximumStatic(variability)),
-			"AverageStatic" => Ok(Self::AverageStatic(variability)),
-			"AbsoluteMaximumStatic" => Ok(Self::AbsoluteMaximumStatic(variability)),
-			"AbsoluteAverageStatic" => Ok(Self::AbsoluteAverageStatic(variability)),
-			"MaximumPercentile" => Ok(Self::MaximumPercentile(variability)),
-			"AveragePercentile" => Ok(Self::AveragePercentile(variability)),
-			"AbsoluteMaximumPercentile" => Ok(Self::AbsoluteMaximumPercentile(variability)),
-			"AbsoluteAveragePercentile" => Ok(Self::AbsoluteAveragePercentile(variability)),
-			"SumStatic" => Ok(Self::SumStatic(variability)),
-			"SumPercentile" => Ok(Self::SumPercentile(variability)),
-			"AbsoluteSumStatic" => Ok(Self::AbsoluteSumStatic(variability)),
-			"AbsoluteSumPercentile" => Ok(Self::AbsoluteSumPercentile(variability)),
-			_ => bail!("Unknown VariabilityType: {var_type}"),
-		}
+		Self::from_kind(var_type, Variability::new(value))
 	}
 }
 
@@ -1166,5 +1188,20 @@ mod tests {
 		assert_eq!(dictionary.patterns.len(), 2);
 		assert_eq!(dictionary.patterns[0].occurrences().len(), 2); // pattern1 + pattern3
 		assert_eq!(dictionary.patterns[1].occurrences().len(), 2); // pattern2 + pattern3
+	}
+
+	#[test]
+	fn variability_types_round_trip_through_their_kind_and_text() {
+		let value = || Variability::new(BigDecimal::from_str("0.000000001").unwrap());
+		let all = [VariablilityType::MaximumStatic(value()), VariablilityType::AverageStatic(value()), VariablilityType::AbsoluteMaximumStatic(value()), VariablilityType::AbsoluteAverageStatic(value()), VariablilityType::MaximumPercentile(value()), VariablilityType::AveragePercentile(value()), VariablilityType::AbsoluteMaximumPercentile(value()), VariablilityType::AbsoluteAveragePercentile(value()), VariablilityType::SumStatic(value()), VariablilityType::SumPercentile(value()), VariablilityType::AbsoluteSumStatic(value()), VariablilityType::AbsoluteSumPercentile(value())];
+		for variability in all {
+			// The (kind, value) pair a dictionary stores, and the text `Display` writes.
+			let stored = VariablilityType::from_kind(variability.kind(), variability.variability().clone()).unwrap();
+			let parsed: VariablilityType = variability.to_string().parse().unwrap();
+			for other in [stored, parsed] {
+				assert_eq!((other.kind(), other.variability().value()), (variability.kind(), variability.variability().value()));
+			}
+		}
+		assert_eq!(VariablilityType::from_kind("MedianStatic", value()).unwrap_err().to_string(), "Unknown VariabilityType: MedianStatic");
 	}
 }

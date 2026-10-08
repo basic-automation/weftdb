@@ -146,17 +146,18 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   engine checks the range and steps down when there are too few points (or, under
   `Interpolator::exact(true)`, returns `InsufficientPoints`).
 - **Stored spline methods are validated when they are loaded.** A dictionary created
-  with `AspectStructure::new_dictionary` persists its step interpolation as the
-  `Spline`'s text (`steps_interpolation` in the `dictionary_constraints` table of
-  `<aspect>/dictionaries/<dictionary>.db`); a dictionary that a pipeline registers
-  through `weft_orchestration::load_dictionary` stores no constraints and is not
-  affected. splimes 1.0's `Spline::from_str` validates what it parses, so a stored
+  with `AspectStructure::new_dictionary`, or registered by a pipeline through
+  `weft_orchestration::load_dictionary` (which stored no constraints before this
+  release; see Fixed), persists its step interpolation as the `Spline`'s text
+  (`steps_interpolation` in the `dictionary_constraints` table of
+  `<aspect>/dictionaries/<dictionary>.db`). splimes 1.0's `Spline::from_str` validates what it parses, so a stored
   `Polynomial` with degree 0, a degree above 8, or a negative or non-finite bounds
   factor, which 0.1 accepted, no longer loads: `get_dictionary_metadata` returns
   `Database error: Invalid interpolation format: invalid polynomial degree 9: must be
   between 1 and 8` (or `… invalid bounds factor -1: must be finite and not negative`),
-  and `load_dictionary` logs that error as a warning ("Failed to check dictionary
-  metadata, attempting to create"). Until this release `get_dictionary_metadata` could
+  and `load_dictionary` logs that error as a warning ("Failed to read dictionary
+  metadata; leaving the stored registration as it is") and carries on with the
+  pipeline's own constraints, without touching what is stored. Until this release `get_dictionary_metadata` could
   not read any stored dictionary (see Fixed), so this is the first release that reads,
   and so checks, a stored method at all. To fix it, stop WeftDB and rewrite the stored
   value with Turso's shell (`tursodb`, not `sqlite3`: the file is in Turso's MVCC
@@ -167,7 +168,8 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   from 1 to 8 and a finite, non-negative bounds factor, or `None`. `new_dictionary`
   now checks the method with `Spline::validate()` and refuses one that would not load,
   e.g. `Invalid step interpolation for dictionary 'd': invalid polynomial degree 9: must
-  be between 1 and 8`; it stored any method before.
+  be between 1 and 8`; it stored any method before. `set_dictionary_metadata`, and so
+  `load_dictionary` when it registers a dictionary, refuses one the same way.
 - `Resolution` names parse case-insensitively (`Hours`, `HOURS`), for example in
   `WEFT_SEGMENT_PARTIAL_BASE`, which ignored anything but lowercase before.
 - **`weft-server` provenance comes from splimes.** The `kind` of each interpolated
@@ -526,6 +528,34 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   still accepted), and a dictionary without steps as `None`. The metadata
   `get_dictionary_metadata` caches is keyed by aspect as well as name, so two aspects'
   dictionaries of the same name no longer share it.
+- **A pipeline's dictionaries lost their steps and variabilities, and gained a metadata
+  row on every load.** `set_dictionary_metadata`, which
+  `weft_orchestration::load_dictionary` registers a pipeline's dictionaries with,
+  inserted only the `dictionary_metadata` row. The steps and variabilities were never
+  stored, `get_dictionary_metadata` (which needs the constraints row) never found the
+  dictionary, and so every `load_dictionary` (two per `Pipeline::extract_patterns`)
+  registered it again, with another row and a new id. It now writes the whole
+  registration and replaces any earlier one of that name, since the tables cannot carry
+  a unique constraint; `AspectStructure::new_dictionary` writes the same way, so creating
+  a dictionary twice no longer leaves two. `load_dictionary` registers a dictionary only
+  when none is registered, under the `Dictionary`'s own id: `get_dictionary_metadata`
+  now answers `Ok(None)` for a dictionary with no database yet (it was an error,
+  `Dictionary '…' does not exist for aspect '…'`), and a registration it cannot read
+  is left alone instead of registered again. Of several rows for one name,
+  `get_dictionary_metadata` reads the newest that has constraints (it read whichever
+  came first), so a dictionary an earlier release registered from a pipeline reads as
+  unregistered and is registered again, with its constraints, on its next load, which
+  also deletes its extra rows.
+- **`get_dictionary_metadata` returned no variabilities.** It always answered `None`,
+  although `new_dictionary` stores them. It now reads them back in the order they were
+  stored; an empty list stores nothing, and so reads back as `None`.
+- **`list_dictionaries` read only a dictionary named "default".** It opened the
+  aspect's dictionary named "default", so it failed for an aspect without one
+  (`Dictionary 'default' does not exist for aspect '…'`) and otherwise listed only that
+  dictionary. Each dictionary is its own `<aspect>/dictionaries/<name>.db`; it now lists
+  all of them, by name, each with its steps and variabilities (it returned empty
+  constraints), and the list is no longer cached, so it does not go stale when a
+  dictionary is added.
 - **Commit failures were silently ignored.** A control-plane write that lost an MVCC
   conflict was reported as success. Commit errors now reach the caller, and the
   transaction is rolled back.
