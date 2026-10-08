@@ -11,6 +11,11 @@ description = "Time-series database for irregularly sampled data: interpolation 
 keywords = ["timeseries", "database", "interpolation", "spline", "time-series"]
 categories = ["database-implementations", "science", "mathematics"]
 
+[features]
+# Crash-consistency test harness (`durable::fault` actions and the `durable::sim`
+# power-cut filesystem). Off by default: without it `fault::hit` is a const no-op
+# and `WEFT_FAULT` is never read, so a production build cannot be made to abort.
+fault-injection = []
 
 # Off by default; outside the semver promise and pending patent review (ROADMAP.md, Phase 6.1).
 [features]
@@ -54,6 +59,10 @@ csv = { workspace = true }
 criterion = { workspace = true , features = ["html_reports"] }
 tempfile = { workspace = true }
 serial_test = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+# Only to keep the fault tests' deliberately aborted child from dumping core.
+libc = { workspace = true }
 
 [[bench]]
 name = "interpolation_benchmarks"

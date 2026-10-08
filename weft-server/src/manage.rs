@@ -281,6 +281,26 @@ async fn reconcile_aspect_inner(store: &weftdb::SegmentStore, aspect: &str, thre
 	Ok((StatusCode::OK, Json(ReconcileResponse { aspect: aspect.to_string(), mode, triggered, reconciled, cold_reconciled, hot_reconciled, unsorted_segments: stats.unsorted_segments, overlapping_segments: stats.overlapping_segments })).into_response())
 }
 
+/// One aspect a store-wide sweep could not maintain, as listed in
+/// [`ReconcileStoreResponse::failed`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SweepFailure {
+	/// The aspect whose pass failed.
+	pub aspect: String,
+	/// The failure with its full cause chain (for a damaged frame, the decode error and
+	/// the frame's path).
+	pub error: String,
+}
+
+impl SweepFailure {
+	/// Render a sweep's `failed` list for the response body, keeping the whole cause
+	/// chain (`{:#}`) so an operator sees *which* frame is damaged, not just that a
+	/// decode failed.
+	fn list(failed: &[(String, anyhow::Error)]) -> Vec<Self> {
+		failed.iter().map(|(aspect, err)| Self { aspect: aspect.clone(), error: format!("{err:#}") }).collect()
+	}
+}
+
 /// Response body for `POST /api/v1/storage/reconcile` — the outcome of a store-wide
 /// threshold reconciliation sweep across every declared aspect.
 #[derive(Debug, Clone, Serialize)]
@@ -307,6 +327,17 @@ pub struct ReconcileStoreResponse {
 	/// The store-wide cross-segment overlap count *after* the sweep — zero once no two
 	/// segments' windows intersect (the `overlaps` mode drives this to zero).
 	pub overlapping_segments: usize,
+	/// The aspects whose pass failed, each `{aspect, error}`, in the order the sweep
+	/// visited them (declared-name order). Empty when every aspect succeeded.
+	///
+	/// **Response change (crash-consistency S4):** a per-aspect failure used to fail the
+	/// whole request with a `500` at the first failing aspect, leaving every aspect after
+	/// it in name order unswept. The sweep now visits every aspect and answers `200` with
+	/// the failures listed here, so a caller must check this list (or
+	/// `weft_reconcile_failed_passes_total`) to tell a partial sweep from a clean one. A
+	/// failed aspect is counted in `aspects_scanned` only. Failing to list the aspects at
+	/// all is still a `500`.
+	pub failed: Vec<SweepFailure>,
 }
 
 /// Handle `POST /api/v1/storage/reconcile`: sweep **every** declared aspect,
@@ -330,10 +361,16 @@ pub struct ReconcileStoreResponse {
 /// merging each aspect's time-overlap groups; `segments_reconciled` is then the number
 /// of segments merged away. `overlaps` takes precedence over `hot_cold`/`threshold`.
 ///
+/// An aspect whose pass fails (a damaged frame, an I/O error) does not stop the sweep:
+/// it is listed in [`ReconcileStoreResponse::failed`], counted in
+/// `weft_reconcile_failed_passes_total`, and the remaining aspects are still swept; the
+/// response is a `200` either way.
+///
 /// # Errors
 ///
 /// [`StorageError::Unconfigured`] when no store is attached, and
-/// [`StorageError::Internal`] on a read/seal/control-plane failure.
+/// [`StorageError::Internal`] when the aspect list or the post-sweep store stats cannot
+/// be read.
 pub async fn reconcile_store(State(state): State<AppState>, Query(params): Query<ReconcileParams>) -> Result<Response, StorageError> {
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	let metrics = state.metrics().clone();
@@ -347,7 +384,7 @@ pub async fn reconcile_store(State(state): State<AppState>, Query(params): Query
 /// [`SegmentStore`](weftdb::SegmentStore) handle is dropped in the caller.
 async fn reconcile_store_inner(store: &weftdb::SegmentStore, threshold: Option<usize>, hot_cold: bool, overlaps: bool, split_min_bytes: Option<u64>, metrics: &crate::metrics::SharedMetrics) -> Result<Response, StorageError> {
 	let threshold = threshold.unwrap_or(1).max(1);
-	let (mode, aspects_scanned, aspects_reconciled, segments_reconciled, cold_reconciled, hot_reconciled) = if overlaps {
+	let (mode, aspects_scanned, aspects_reconciled, segments_reconciled, cold_reconciled, hot_reconciled, failed) = if overlaps {
 		// `split_min_bytes` selects the store-wide split-not-rewrite floor; absent → the
 		// default 50 MiB floor (every aspect's small components full-rewrite).
 		let sweep = match split_min_bytes {
@@ -357,23 +394,26 @@ async fn reconcile_store_inner(store: &weftdb::SegmentStore, threshold: Option<u
 		if sweep.aspects_reconciled > 0 {
 			metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_removed).unwrap_or(u64::MAX));
 		}
-		("overlaps", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_removed, 0, 0)
+		("overlaps", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_removed, 0, 0, SweepFailure::list(&sweep.failed))
 	} else if hot_cold {
 		let sweep = store.reconcile_all_hot_cold(threshold).await.map_err(|err| StorageError::Internal(err.to_string()))?;
 		if sweep.aspects_reconciled > 0 {
 			metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_reconciled()).unwrap_or(u64::MAX));
 		}
-		("hot_cold", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_reconciled(), sweep.cold_reconciled, sweep.hot_reconciled)
+		("hot_cold", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_reconciled(), sweep.cold_reconciled, sweep.hot_reconciled, SweepFailure::list(&sweep.failed))
 	} else {
 		let sweep = store.reconcile_all_over_threshold(threshold).await.map_err(|err| StorageError::Internal(err.to_string()))?;
 		if sweep.aspects_reconciled > 0 {
 			metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_reconciled).unwrap_or(u64::MAX));
 		}
-		("threshold", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_reconciled, 0, 0)
+		("threshold", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_reconciled, 0, 0, SweepFailure::list(&sweep.failed))
 	};
+	if !failed.is_empty() {
+		metrics.record_reconcile_failures(u64::try_from(failed.len()).unwrap_or(u64::MAX));
+	}
 	let unsorted_segments = store.store_stats().await.map_err(|err| StorageError::Internal(err.to_string()))?.unsorted_segments;
 	let overlapping_segments = store.store_overlapping_segments().await.map_err(|err| StorageError::Internal(err.to_string()))?;
-	Ok((StatusCode::OK, Json(ReconcileStoreResponse { threshold, mode, aspects_scanned, aspects_reconciled, segments_reconciled, cold_reconciled, hot_reconciled, unsorted_segments, overlapping_segments })).into_response())
+	Ok((StatusCode::OK, Json(ReconcileStoreResponse { threshold, mode, aspects_scanned, aspects_reconciled, segments_reconciled, cold_reconciled, hot_reconciled, unsorted_segments, overlapping_segments, failed })).into_response())
 }
 
 /// Query parameters for `POST /api/v1/storage/{aspect}/squash`.
@@ -1331,6 +1371,49 @@ mod tests {
 		assert_eq!(json["segments_reconciled"], 2);
 		assert_eq!(json["unsorted_segments"], 0);
 		assert_eq!(json["overlapping_segments"], 0, "the reconciled segments cover disjoint windows");
+		assert_eq!(json["failed"], serde_json::json!([]), "a clean sweep lists no failures");
+	}
+
+	/// Crash-consistency S4: six aspects (`s1`..`s6`), each with three out-of-order,
+	/// time-overlapping segments, and `s2`'s lowest-id frame truncated to half its length.
+	/// Every store-wide reconcile mode must answer `200`, sweep the five healthy aspects and
+	/// list `s2` (with the damaged frame in its error) in `failed`; before S4 the request
+	/// failed with a `500` at `s2` and `s3`..`s6` were never swept.
+	#[tokio::test]
+	async fn reconcile_store_endpoint_lists_a_failed_aspect_and_sweeps_the_rest() {
+		let sc = weft_physical_type::AspectSchema::new(weft_physical_type::PhysicalType::F64, "0".parse().unwrap(), weft_physical_type::TimeUnit::Seconds);
+		let v = |s: &str| -> bigdecimal::BigDecimal { s.parse().unwrap() };
+		for uri in ["/api/v1/storage/reconcile", "/api/v1/storage/reconcile?hot_cold=true", "/api/v1/storage/reconcile?overlaps=true", "/api/v1/storage/reconcile?overlaps=true&split_min_bytes=1"] {
+			let dir = TempDir::new().unwrap();
+			let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+			for aspect in ["s1", "s2", "s3", "s4", "s5", "s6"] {
+				store.declare(aspect, &sc).await.expect("declares");
+				let first = store.seal(aspect, &sc, &[100_i64, 130, 110], &[v("1"), v("3"), v("2")]).await.expect("seal 0");
+				store.seal(aspect, &sc, &[120_i64, 150, 125], &[v("4"), v("6"), v("5")]).await.expect("seal 1");
+				store.seal(aspect, &sc, &[140_i64, 170, 145], &[v("7"), v("9"), v("8")]).await.expect("seal 2");
+				if aspect == "s2" {
+					let file = std::fs::OpenOptions::new().write(true).open(&first.path).expect("opens frame");
+					let len = file.metadata().expect("stats frame").len();
+					file.set_len(len / 2).expect("truncates frame");
+				}
+			}
+			let router = app_with_state(AppState::new().with_store(store.clone()));
+			let response = router.oneshot(Request::builder().method("POST").uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+			let status = response.status();
+			let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+			let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+			let s6 = store.aspect_stats("s6").await.unwrap();
+			drop(store);
+			assert_eq!(status, StatusCode::OK, "{uri}: a failed aspect does not fail the request: {json}");
+			assert_eq!(json["aspects_scanned"], 6, "{uri}");
+			assert_eq!(json["aspects_reconciled"], 5, "{uri}: every healthy aspect is swept: {json}");
+			let failed = json["failed"].as_array().unwrap_or_else(|| panic!("{uri}: failed is a list: {json}"));
+			assert_eq!(failed.len(), 1, "{uri}: only the damaged aspect fails: {json}");
+			assert_eq!(failed[0]["aspect"], "s2", "{uri}");
+			assert!(failed[0]["error"].as_str().unwrap_or_default().contains("s2-0.weftseg"), "{uri}: the error names the damaged frame: {json}");
+			let reached = if uri.contains("overlaps") { s6.overlapping_segments == 0 } else { s6.unsorted_segments == 0 };
+			assert!(reached, "{uri}: the last aspect in name order is still reached: {s6:?}");
+		}
 	}
 
 	#[tokio::test]
