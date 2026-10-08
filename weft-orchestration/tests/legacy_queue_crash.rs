@@ -434,6 +434,115 @@ async fn a_failure_after_a_chunk_leaves_the_landed_rows_queued_and_batched() -> 
 	Ok(())
 }
 
+/// Rows `batch_capture_measurements` stores in its first chunk (it commits 2,500 rows at
+/// a time below 100,000 rows).
+const CHUNK_ROWS: i64 = 2_500;
+
+/// A two-chunk ingest appended after minutes `0..8`: the first chunk's rows, then the
+/// rest, whose timestamps lie past every row of the first. The rows are 240 ms apart, so
+/// the first chunk spans ten minutes (`8:00` to `17:59.76`, a row on every whole minute):
+/// the minute-resolution consumer then builds a dozen windows, not one per row, which
+/// keeps the test fast in a debug build.
+fn two_chunks() -> (Vec<InputMeasurement>, Vec<InputMeasurement>) {
+	let row = |i: i64| InputMeasurement::new(base() + Duration::minutes(8) + Duration::milliseconds(240 * i), BigDecimal::from((i * 7) % 11));
+	((0..CHUNK_ROWS).map(row).collect(), (CHUNK_ROWS..CHUNK_ROWS + 20).map(row).collect())
+}
+
+/// After a two-chunk ingest died once its first chunk committed: the first chunk landed
+/// and the second did not, and the write-ahead enqueue left every timestamp of both
+/// queued. The incremental build then batches the landed rows (every minute from `8:00`
+/// to `17:00` is a point of some batch: the windows that end by the last landed row) and
+/// leaves the second chunk's timestamps, past the stored range, queued for rows that may
+/// still come, building none of their windows.
+async fn assert_a_partial_prefix_is_batched_and_the_rest_waits(store: &Store) -> Result<()> {
+	let (landed, lost) = two_chunks();
+	let last_landed = landed.last().map(InputMeasurement::timestamp).context("the first chunk has rows")?;
+	assert_eq!(store.db.get_latest_measurement(&store.aspect).await?, Some(last_landed), "precondition: exactly the first chunk landed");
+	let queued = store.queued().await?;
+	let (landed_at, lost_at) = (timestamps(&landed), timestamps(&lost));
+	assert!(landed_at.is_subset(&queued) && lost_at.is_subset(&queued), "the write-ahead enqueue queued both chunks; missing: {:?}", landed_at.union(&lost_at).filter(|at| !queued.contains(at)).collect::<Vec<_>>());
+
+	store.build().await.context("the build over a partial prefix")?;
+	let covered = store.covered().await?;
+	let missing: Vec<_> = (8..=17).map(|minute| base() + Duration::minutes(minute)).filter(|at| !covered.contains(at)).collect();
+	assert!(missing.is_empty(), "the incremental build did not batch the landed rows at {missing:?}");
+	assert!(covered.iter().all(|at| *at <= last_landed), "no batch reaches past the stored rows");
+	assert!(lost_at.is_subset(&store.queued().await?), "the timestamps whose rows never landed stay queued");
+	Ok(())
+}
+
+/// **Regression (legacy-measurements-committed-not-queued, a multi-chunk partial
+/// prefix).** A `batch_capture_measurements` of two chunks fails after its first chunk
+/// committed (`L-chunk(0)`): the first chunk's rows are batched, and the second chunk's
+/// timestamps, queued ahead of rows that never landed, wait in the queue without failing
+/// the build. On main the enqueue ran after the chunk loop, so the landed chunk was never
+/// queued.
+#[tokio::test]
+#[serial]
+async fn a_failure_after_the_first_of_two_chunks_leaves_a_batched_prefix() -> Result<()> {
+	let store = Store::new("two_chunk_crash").await?;
+	store.db.batch_capture_measurements(store.aspect, DatasetId::new(), minutes(0..8)).await?;
+	store.build().await?;
+	assert!(store.db.count_unprocessed_batches(&store.aspect).await? > 0, "precondition: the aspect has batches, so the consumer runs incrementally");
+
+	let (landed, lost) = two_chunks();
+	{
+		let _armed = fault::arm(FaultPoint::LChunk(0), FaultAction::ReturnErr);
+		let err = store.db.batch_capture_measurements(store.aspect, DatasetId::new(), [landed, lost].concat()).await.expect_err("the ingest fails after its first chunk");
+		assert!(format!("{err:#}").contains("injected fault at L-chunk(0)"), "{err:#}");
+	}
+	let store = store.restart().await?;
+	assert_a_partial_prefix_is_batched_and_the_rest_waits(&store).await
+}
+
+/// Set only in the child process [`an_ingest_killed_after_its_first_chunk_leaves_a_batched_prefix`]
+/// spawns; it holds the database name and the aspect id, separated by a space.
+const INGEST_CHILD_ENV: &str = "WEFT_LEGACY_INGEST_CRASH_CHILD";
+
+/// The body the re-executed child runs: open the database named by [`INGEST_CHILD_ENV`] and
+/// run the two-chunk ingest, which aborts at the point `WEFT_FAULT` arms. In a normal run
+/// the variable is unset and this does nothing.
+#[tokio::test]
+async fn ingest_child() -> Result<()> {
+	let Some(spec) = std::env::var_os(INGEST_CHILD_ENV) else { return Ok(()) };
+	suppress_core_dump();
+	let spec = spec.into_string().map_err(|raw| anyhow::anyhow!("{raw:?} is not UTF-8"))?;
+	let (name, aspect) = spec.split_once(' ').context("the child spec is `<name> <aspect id>`")?;
+	let db = Database::existing(name).await?;
+	let aspect = AspectId::from_uuid(Uuid::parse_str(aspect)?);
+	let (landed, lost) = two_chunks();
+	db.batch_capture_measurements(aspect, DatasetId::new(), [landed, lost].concat()).await?;
+	panic!("{} did not abort the ingest", fault::FAULT_ENV);
+}
+
+/// The same partial prefix after a real process crash: a child process runs the two-chunk
+/// ingest and aborts at `L-chunk(0)`, after its first chunk committed. The write-ahead
+/// entries and the chunk survive the crash, and the build in this process batches the
+/// landed rows and leaves the rest queued.
+#[tokio::test]
+#[serial]
+async fn an_ingest_killed_after_its_first_chunk_leaves_a_batched_prefix() -> Result<()> {
+	let store = Store::new("two_chunk_abort").await?;
+	store.db.batch_capture_measurements(store.aspect, DatasetId::new(), minutes(0..8)).await?;
+	store.build().await?;
+	assert!(store.db.count_unprocessed_batches(&store.aspect).await? > 0, "precondition: the aspect has batches, so the consumer runs incrementally");
+	let closed = store.close().await;
+
+	let data_dir = closed.dir.path().to_str().context("temp data dir is not valid UTF-8")?;
+	let point = FaultPoint::LChunk(0);
+	let output = std::process::Command::new(std::env::current_exe()?).args(["ingest_child", "--exact", "--nocapture", "--test-threads=1"]).env("TEST_DATA_DIR", data_dir).env(INGEST_CHILD_ENV, format!("{} {}", closed.name, closed.aspect.as_uuid())).env(fault::FAULT_ENV, format!("{point}:abort")).output()?;
+	assert!(!output.status.success(), "the child aborted: {output:?}");
+	#[cfg(unix)]
+	{
+		use std::os::unix::process::ExitStatusExt;
+		assert_eq!(output.status.signal(), Some(6), "killed by SIGABRT: {output:?}");
+	}
+	assert!(String::from_utf8_lossy(&output.stderr).contains(&format!("aborting at fault point {point}")), "the child reached the point: {output:?}");
+
+	let store = closed.reopen().await?;
+	assert_a_partial_prefix_is_batched_and_the_rest_waits(&store).await
+}
+
 /// A failure after the write-ahead enqueue and before any chunk (`L-enqueued`): nothing
 /// landed, the queue holds the batch's timestamps (a superset of the data), and the
 /// incremental build neither fails nor invents batches for rows that do not exist. The

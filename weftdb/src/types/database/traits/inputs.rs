@@ -45,9 +45,10 @@ pub trait Inputs {
 	/// `queued_at` it was read with: one queued again since then stays queued for the
 	/// consumer's next run (crash-consistency design, S18).
 	///
-	/// The entries are removed in short transactions (at most 500 entries each), each
-	/// retried when it loses an MVCC conflict to an enqueue of the same timestamps. An
-	/// error leaves the earlier transactions committed and the rest of the entries queued.
+	/// The entries are removed in short transactions (at most 5,000 entries each, one
+	/// synced commit each), each retried when it loses an MVCC conflict to an enqueue of
+	/// the same timestamps. An error leaves the earlier transactions committed and the rest
+	/// of the entries queued.
 	async fn dequeue_unbatched_entries(&self, aspect_id: &AspectId, entries: &[UnbatchedEntry]) -> Result<()>;
 
 	/// Clear all unbatched measurements for an aspect
@@ -88,6 +89,15 @@ pub trait Inputs {
 
 	/// Capture new measurements for a given aspect
 	/// If a measurement with the same timestamp already exists, an error is returned.
+	///
+	/// # Errors
+	///
+	/// The timestamp is queued for batching only after the row is committed (this path has
+	/// no write-ahead enqueue), so an error from the enqueue (or the checkpoint before it)
+	/// fails the call although the row is stored. The enqueue is an upsert, which writes an
+	/// entry that is already queued (crash-consistency design, S18), so it can lose an MVCC
+	/// write-write conflict to a queue consumer dequeuing that entry; such a conflict is
+	/// retried for about three seconds before it fails the call.
 	async fn capture_new_measurement(&self, aspect_id: &AspectId, dataset_id: &DatasetId, input_measurement: &InputMeasurement) -> Result<TxId>;
 
 	/// Capture multiple measurements for a given aspect
@@ -106,7 +116,9 @@ pub trait Inputs {
 	/// the same queue entries (a consumer's dequeue, or another ingest of the same
 	/// timestamps). A consumer that batched windows from rows already committed rebuilds
 	/// them after the second enqueue into identical batches, which the batch dedupe skips,
-	/// whether they are still queued, processed, or already extracted. Residuals until
+	/// whether they are still queued, processed, or already extracted (within the
+	/// extracted-batch record's retention; see
+	/// [`remove_extracted_batches`](Self::remove_extracted_batches)). Residuals until
 	/// rows-mode aspects move to the segment store (crash-consistency design, S19):
 	///
 	/// - **Partial prefix.** An error or crash mid-call leaves the chunks committed before
@@ -128,8 +140,16 @@ pub trait Inputs {
 	/// A queued timestamp whose row never lands is handled by the consumer like any other:
 	/// inside the stored range its windows are built from the interpolated series, as a
 	/// full rebuild builds them, and it is dequeued; past the range it waits until rows
-	/// reach its windows; before the range it has no window, and it waits until a run
-	/// finds nothing else queued, which clears it.
+	/// reach its windows (the consumer skips such windows without interpolating them, so
+	/// the timestamps of an abandoned append, up to a whole call's worth, cost each later
+	/// run only the reading of their queue entries); before the range it has no window,
+	/// and it waits until a run finds nothing else queued, which clears it.
+	///
+	/// The write-ahead enqueue upserts all of the call's timestamps in one transaction. A
+	/// consumer dequeuing some of the same timestamps (a re-import of timestamps that are
+	/// still queued) waits for that whole transaction, and either side can run out of
+	/// conflict retries: the consumer run fails, or the call fails before it stores any
+	/// row. Both are safe to re-run.
 	///
 	/// Everything after a chunk's commit (queuing again, and after the last chunk the
 	/// checkpoint, the dirty-region marking and the aspect's earliest and latest
@@ -138,6 +158,13 @@ pub trait Inputs {
 	async fn batch_capture_measurements(&self, aspect_id: AspectId, dataset_id: DatasetId, input_measurements: Vec<InputMeasurement>) -> Result<Vec<TxId>>;
 
 	/// Capture a chunk of measurements - generates `TxIds` internally
+	///
+	/// # Errors
+	///
+	/// The chunk's timestamps are queued only after its rows are committed, so an error
+	/// from the enqueue fails the call although the rows are stored; an MVCC conflict with
+	/// a consumer dequeuing the same entries is retried first, as for
+	/// [`capture_new_measurement`](Self::capture_new_measurement).
 	async fn capture_measurement_chunk(&self, aspect_id: &AspectId, dataset_id: DatasetId, chunk: &[InputMeasurement]) -> Result<Vec<TxId>>;
 
 	/// Capture multiple measurements for a given aspect
@@ -145,6 +172,13 @@ pub trait Inputs {
 	async fn batch_capture_new_measurements(&self, aspect_id: &AspectId, dataset_id: &DatasetId, input_measurements: Vec<InputMeasurement>) -> Result<Vec<TxId>>;
 
 	/// Capture a chunk of new measurements with batch processing
+	///
+	/// # Errors
+	///
+	/// The rows are committed one by one and their timestamps queued after the last one,
+	/// so an error from the enqueue fails the call although the rows are stored; an MVCC
+	/// conflict with a consumer dequeuing the same entries is retried first, as for
+	/// [`capture_new_measurement`](Self::capture_new_measurement).
 	async fn capture_new_measurement_chunk(&self, aspect_id: &AspectId, db: &turso::Database, db_path: &str, dataset_id: &DatasetId, chunk: &[InputMeasurement], all_tx_ids: &[TxId], tx_id_offset: usize) -> Result<Vec<TxId>>;
 
 	//
@@ -154,8 +188,9 @@ pub trait Inputs {
 	/// insert unprocessed batch for a given aspect
 	///
 	/// A batch whose `(aspect_id, batch_hash)` is already queued, processed, or extracted
-	/// (see [`remove_extracted_batches`](Self::remove_extracted_batches)) is skipped, and
-	/// the call still returns `Ok`. So a queue consumer that rebuilds windows it already
+	/// within the retention of the extracted-batch record (see
+	/// [`remove_extracted_batches`](Self::remove_extracted_batches)) is skipped, and the
+	/// call still returns `Ok`. So a queue consumer that rebuilds windows it already
 	/// batched (after a crash before its dequeue, or once an ingest that ran during it
 	/// queues its rows again) stores no second copy, and extraction yields no second
 	/// occurrence of the same window.
@@ -206,14 +241,23 @@ pub trait Inputs {
 	async fn bulk_remove_processed_batches(&self, aspect_id: &AspectId, batch_ids: &[BatchId]) -> Result<()>;
 
 	/// Remove processed batches that pattern extraction consumed, in one transaction that
-	/// also records each one's `(aspect_id, batch_hash)` in the processed batches DB
+	/// also records each one's `batch_hash` in the processed batches DB
 	/// (`extracted_batches`), so that
-	/// [`insert_unprocessed_batch`](Self::insert_unprocessed_batch) never queues the same
+	/// [`insert_unprocessed_batch`](Self::insert_unprocessed_batch) does not queue the same
 	/// batch again (crash-consistency design, S18). Without the record, a window the
 	/// consumer rebuilt after its batch was extracted (after a consumer crash, or an ingest
 	/// that ran during a consumer run) was extracted again, as a second occurrence of the
-	/// same span. The record is one small row per batch, kept until
-	/// [`clear_processed_batches`](Self::clear_processed_batches).
+	/// same span.
+	///
+	/// The record is bounded: the same transaction deletes the records older than the
+	/// retention, `WEFT_EXTRACTED_BATCH_RETENTION_SECS` (a positive number of seconds;
+	/// 48 hours by default), and [`clear_processed_batches`](Self::clear_processed_batches)
+	/// deletes them all. Extraction consumes about one batch per resolution step, so the
+	/// record holds about one row per step of the retention. The rebuilds it guards
+	/// against come on the next consumer run after an ingest that overlapped a pipeline
+	/// run, or on the re-run after a consumer crash, so the retention must exceed the
+	/// longest interval between pipeline runs of an aspect plus the longest ingest call:
+	/// a window rebuilt after its record expired is extracted again.
 	async fn remove_extracted_batches(&self, aspect_id: &AspectId, batch_ids: &[BatchId]) -> Result<()>;
 
 	/// clear all processed batches for a given aspect

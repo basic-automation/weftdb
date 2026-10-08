@@ -1367,28 +1367,33 @@ impl Aspect {
 	}
 
 	/// The processed batches DB's record of the batches pattern extraction consumed: the
-	/// `(aspect_id, batch_hash)` of each, written in the transaction that deletes the batch
-	/// (`bulk_remove_processed_batches`), and checked by the queue's duplicate check like the
-	/// two batch tables (crash-consistency design, S18). Without it a batch that was
-	/// extracted, and so deleted, was queued again when the consumer rebuilt its window
-	/// (after a consumer crash, or after an ingest that ran during the consumer), and became
-	/// a second occurrence of the same span. One small row per extracted batch, kept until
-	/// the processed batches are cleared (`clear_processed_batches`, as a full rebuild
-	/// does). `IF NOT EXISTS`, so a processed batches DB created before the table gets it
+	/// `batch_hash` of each and when it was extracted, written in the transaction that
+	/// deletes the batch (`remove_extracted_batches`), and checked by the queue's duplicate
+	/// check like the two batch tables (crash-consistency design, S18). Without it a batch
+	/// that was extracted, and so deleted, was queued again when the consumer rebuilt its
+	/// window (after a consumer crash, or after an ingest that ran during the consumer),
+	/// and became a second occurrence of the same span.
+	///
+	/// The record only has to outlive the next consumer run, so it is bounded:
+	/// `remove_extracted_batches` deletes the rows older than the retention
+	/// (`WEFT_EXTRACTED_BATCH_RETENTION_SECS`, 48 hours by default) in the same transaction,
+	/// and `clear_processed_batches` (a full rebuild) deletes them all. Extraction consumes
+	/// about one sliding-window batch per resolution step, so the table holds about one row
+	/// per step of the retention. There is no `aspect_id` column: the DB belongs to one
+	/// aspect. `IF NOT EXISTS`, so a processed batches DB created before the table gets it
 	/// the first time this process opens it; the index is best-effort, as for the batches.
 	async fn wireframe_extracted_batches_direct(conn: &Connection) -> Result<()> {
 		conn.as_ref()
 			.execute(
 				r"
 			CREATE TABLE IF NOT EXISTS extracted_batches (
-				aspect_id TEXT NOT NULL,
 				batch_hash TEXT NOT NULL,
 				extracted_at INTEGER NOT NULL
 			)",
 				turso::params![],
 			)
 			.await?;
-		if let Err(e) = conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_extracted_batches_hash ON extracted_batches(aspect_id, batch_hash)", turso::params![]).await {
+		if let Err(e) = conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_extracted_batches_hash ON extracted_batches(batch_hash)", turso::params![]).await {
 			tracing::warn!("Could not create the extracted batch hash index; duplicate checks will scan the extracted batches: {e}");
 		}
 		Ok(())

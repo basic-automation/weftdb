@@ -12,15 +12,63 @@ use crate::{
 /// write-write conflict over the same entries (crash-consistency design, S18): ingest's
 /// enqueues and a consumer's dequeue upsert and delete the same `(aspect_id,
 /// data_timestamp)` rows, and two ingests into one aspect can queue the same timestamps.
-/// With the backoff of [`queue_write_backoff`] the attempts span about three seconds,
-/// many times the longest transaction they wait on (a dequeue transaction removes at most
-/// [`DEQUEUE_CHUNK`] entries).
+/// With the backoff of [`queue_write_backoff`] the attempts span about three seconds.
+///
+/// That is many times a dequeue transaction (at most [`DEQUEUE_CHUNK`] entries) and the
+/// second enqueue after a chunk's commit (one chunk's timestamps), which are what an
+/// ingest and a consumer normally meet. It is not a bound on the write-ahead enqueue: that
+/// upserts every timestamp of a `batch_capture_measurements` call in one transaction, so
+/// a dequeue that meets it (only when the call re-imports timestamps that are still
+/// queued and that the consumer read) waits for the whole of it and can run out of
+/// attempts, failing the consumer run; the other way round the whole upsert is retried
+/// and can fail the call before any row is stored. Both are recoverable: the entries
+/// stay queued, and the batch dedupe makes the consumer's re-run safe.
 const QUEUE_WRITE_ATTEMPTS: u32 = 10;
 
 /// The most queue entries one dequeue transaction removes. A consumer dequeues in several
 /// short transactions rather than one per run, so an ingest whose enqueue conflicts with
-/// it waits for one of them, never for the whole dequeue.
-const DEQUEUE_CHUNK: usize = 500;
+/// it waits for one of them, never for the whole dequeue, and a conflict retries one of
+/// them. Each transaction is a synced commit, so this also sets the dequeue's commit count:
+/// one per this many entries (a run used to dequeue in a single commit).
+const DEQUEUE_CHUNK: usize = 5_000;
+
+/// The environment variable that sets, in whole seconds, how long the processed batches DB
+/// remembers a batch pattern extraction consumed (its `extracted_batches` row), and so
+/// how long the queue's duplicate check recognises that batch (crash-consistency design,
+/// S18). Unset, zero or not a number: [`DEFAULT_EXTRACTED_BATCH_RETENTION_SECS`].
+const EXTRACTED_BATCH_RETENTION_ENV: &str = "WEFT_EXTRACTED_BATCH_RETENTION_SECS";
+
+/// The default retention of the extracted-batch record: 48 hours.
+///
+/// The record is only consulted when the consumer rebuilds a window whose batch was
+/// already extracted, which happens on the first consumer run after an ingest that
+/// overlapped a pipeline run queues its committed rows again, or on the re-run after a
+/// consumer crash. So it has to outlive one interval between pipeline runs, plus the
+/// ingest; 48 hours covers a daily schedule with a day to spare. Extraction consumes
+/// about one batch per resolution step, so the record holds about one row per step of the
+/// retention (2,880 rows for a minute-resolution aspect, 172,800 for a second-resolution
+/// one); before it was bounded it kept a row for every step ever extracted.
+const DEFAULT_EXTRACTED_BATCH_RETENTION_SECS: i64 = 48 * 60 * 60;
+
+/// The extracted-batch retention in milliseconds, from [`EXTRACTED_BATCH_RETENTION_ENV`],
+/// read once per process.
+fn extracted_batch_retention_millis() -> i64 {
+	static RETENTION: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+	*RETENTION.get_or_init(|| {
+		let raw = std::env::var(EXTRACTED_BATCH_RETENTION_ENV).ok();
+		let secs = parse_extracted_batch_retention(raw.as_deref());
+		if raw.is_some_and(|raw| raw.trim().parse::<i64>().ok() != Some(secs)) {
+			tracing::warn!("{EXTRACTED_BATCH_RETENTION_ENV} is not a positive number of seconds; keeping extracted batches for the default {DEFAULT_EXTRACTED_BATCH_RETENTION_SECS} s");
+		}
+		secs.saturating_mul(1000)
+	})
+}
+
+/// The retention, in seconds, that a raw [`EXTRACTED_BATCH_RETENTION_ENV`] value sets: a
+/// positive whole number, else the default.
+fn parse_extracted_batch_retention(raw: Option<&str>) -> i64 {
+	raw.and_then(|raw| raw.trim().parse::<i64>().ok()).filter(|&secs| secs > 0).unwrap_or(DEFAULT_EXTRACTED_BATCH_RETENTION_SECS)
+}
 
 /// The wait before the retry that follows attempt `attempt` (from 1) of a queue write:
 /// doubling from 20 ms up to 500 ms, plus up to half again of jitter, so that two writers
@@ -329,8 +377,11 @@ impl Inputs for Database {
 		// Checkpoint WAL to ensure measurement is persisted
 		Self::checkpoint_wal_passive(&db).await?;
 
-		// Enqueue measurement for incremental batch processing
-		self.enqueue_unbatched_measurement(aspect_id, data_timestamp).await?;
+		// Enqueue measurement for incremental batch processing. The enqueue is an upsert, so
+		// it writes an entry that is already queued and can lose an MVCC conflict to a
+		// consumer's dequeue of it; retry that, as the write-ahead paths do (crash-consistency
+		// design, S18). This path still enqueues only after the commit (see the trait docs).
+		self.enqueue_retrying(aspect_id, &[data_timestamp]).await?;
 
 		self.record_transaction(&format!("Inserted new measurement at {} for dataset {}", measurement.timestamp(), dataset_id)).await
 	}
@@ -541,9 +592,10 @@ impl Inputs for Database {
 
 		Self::commit_concurrent(&conn).await?;
 
-		// Enqueue all measurement timestamps for incremental batch processing
+		// Enqueue all measurement timestamps for incremental batch processing, retrying an
+		// MVCC conflict over an entry that is already queued (see capture_new_measurement).
 		let chunk_timestamps: Vec<chrono::DateTime<chrono::Utc>> = chunk.iter().map(InputMeasurement::timestamp).collect();
-		self.enqueue_unbatched_measurements(aspect_id, &chunk_timestamps).await?;
+		self.enqueue_retrying(aspect_id, &chunk_timestamps).await?;
 
 		Ok(chunk_tx_ids)
 	}
@@ -589,9 +641,11 @@ impl Inputs for Database {
 			Self::commit_concurrent(&conn).await?;
 		}
 
-		// Enqueue all successfully inserted measurement timestamps for incremental batch processing
+		// Enqueue all successfully inserted measurement timestamps for incremental batch
+		// processing, retrying an MVCC conflict over an entry that is already queued (see
+		// capture_new_measurement).
 		if !successful_timestamps.is_empty() {
-			self.enqueue_unbatched_measurements(aspect_id, &successful_timestamps).await?;
+			self.enqueue_retrying(aspect_id, &successful_timestamps).await?;
 		}
 
 		Ok(successful)
@@ -611,8 +665,9 @@ impl Inputs for Database {
 	/// one, while a window rebuilt over changed rows (a gap filled since) gets a new hash
 	/// and is queued. Extracted batches are known by the hashes
 	/// [`remove_extracted_batches`](Inputs::remove_extracted_batches) recorded when it
-	/// deleted them. Every check is a point lookup on an `(aspect_id, batch_hash)` index,
-	/// the queued one first (`queue_batch_unless_known` says why the order matters).
+	/// deleted them, for as long as it keeps them (48 hours by default; see there). Every
+	/// check is a point lookup on a hash index, the queued one first
+	/// (`queue_batch_unless_known` says why the order matters).
 	///
 	/// The index is not unique (a hash can be `NULL`, and batches stored before the dedupe
 	/// may repeat), so two consumers racing on the same aspect can still both insert a
@@ -655,7 +710,7 @@ impl Inputs for Database {
 			}
 		}
 		if skipped > 0 {
-			tracing::debug!("Skipped {skipped} of {total} unprocessed batches for aspect {aspect_id}: already queued or processed");
+			tracing::debug!("Skipped {skipped} of {total} unprocessed batches for aspect {aspect_id}: already queued, processed or extracted");
 		}
 		Ok(tx_ids)
 	}
@@ -844,8 +899,10 @@ impl Inputs for Database {
 	}
 
 	/// Remove processed batches that pattern extraction consumed, recording each one's
-	/// `(aspect_id, batch_hash)` in `extracted_batches` in the same transaction
-	/// (crash-consistency design, S18).
+	/// `batch_hash` in `extracted_batches` in the same transaction (crash-consistency
+	/// design, S18). The same transaction deletes the records older than the retention
+	/// (`WEFT_EXTRACTED_BATCH_RETENTION_SECS`, 48 hours by default), which keeps the record
+	/// bounded; the delete scans the record, which that bound keeps small.
 	async fn remove_extracted_batches(&self, aspect_id: &AspectId, batch_ids: &[BatchId]) -> Result<()> {
 		if batch_ids.is_empty() {
 			return Ok(());
@@ -855,14 +912,16 @@ impl Inputs for Database {
 		let db_path = self.get_processed_batches_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
 		let extracted_at = chrono::Utc::now().timestamp_millis();
+		let expired_before = extracted_at.saturating_sub(extracted_batch_retention_millis());
 
 		let removed = async {
+			conn.as_ref().execute("DELETE FROM extracted_batches WHERE extracted_at < ?", turso::params![expired_before]).await?;
 			// Sub-chunks keep each statement under SQLite's variable limit.
 			for sub_chunk in batch_ids.chunks(500) {
 				let placeholders: Vec<&str> = (0..sub_chunk.len()).map(|_| "?").collect();
 				let placeholders = placeholders.join(", ");
 				let ids: Vec<String> = sub_chunk.iter().map(std::string::ToString::to_string).collect();
-				conn.as_ref().execute(&format!("INSERT INTO extracted_batches (aspect_id, batch_hash, extracted_at) SELECT aspect_id, batch_hash, {extracted_at} FROM batches WHERE batch_hash IS NOT NULL AND id IN ({placeholders})"), turso::params_from_iter(ids.clone())).await?;
+				conn.as_ref().execute(&format!("INSERT INTO extracted_batches (batch_hash, extracted_at) SELECT batch_hash, {extracted_at} FROM batches WHERE batch_hash IS NOT NULL AND id IN ({placeholders})"), turso::params_from_iter(ids.clone())).await?;
 				conn.as_ref().execute(&format!("DELETE FROM batches WHERE id IN ({placeholders})"), turso::params_from_iter(ids)).await?;
 			}
 			Ok::<_, turso::Error>(())
@@ -1866,23 +1925,37 @@ impl Database {
 		batch.batch_hash().cloned().unwrap_or_else(|| format!("{:x}", md5::compute(measurements_json)))
 	}
 
-	/// Whether `table` (`batches` or `extracted_batches`, in the DB `conn` is open on)
-	/// holds `batch_hash` for `aspect_id`: a point lookup on its `(aspect_id, batch_hash)`
-	/// index, read in `conn`'s open transaction if it has one, else in a statement of its
-	/// own.
-	async fn batch_hash_recorded(conn: &turso::Connection, table: &'static str, aspect_id: &AspectId, batch_hash: &str) -> Result<bool> {
-		let mut rows = conn.query(&format!("SELECT 1 FROM {table} WHERE aspect_id = ? AND batch_hash = ? LIMIT 1"), turso::params![aspect_id.as_uuid().to_string(), batch_hash.to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to look up batch hash in {table}: {e}")))?;
-		Ok(rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to look up batch hash in {table}: {e}")))?.is_some())
+	/// Whether the `batches` table of the DB `conn` is open on (the unprocessed or the
+	/// processed batches) holds `batch_hash` for `aspect_id`: a point lookup on its
+	/// `(aspect_id, batch_hash)` index, read in `conn`'s open transaction if it has one,
+	/// else in a statement of its own.
+	async fn batch_hash_stored(conn: &turso::Connection, aspect_id: &AspectId, batch_hash: &str) -> Result<bool> {
+		let rows = conn.query("SELECT 1 FROM batches WHERE aspect_id = ? AND batch_hash = ? LIMIT 1", turso::params![aspect_id.as_uuid().to_string(), batch_hash.to_string()]).await;
+		Self::lookup_found(rows, "batches").await
+	}
+
+	/// Whether the processed batches DB `conn` is open on records `batch_hash` as extracted
+	/// (`extracted_batches`, which has no `aspect_id` column: the DB belongs to one
+	/// aspect): a point lookup on its `batch_hash` index, in a statement of its own.
+	async fn batch_hash_extracted(conn: &turso::Connection, batch_hash: &str) -> Result<bool> {
+		let rows = conn.query("SELECT 1 FROM extracted_batches WHERE batch_hash = ? LIMIT 1", turso::params![batch_hash.to_string()]).await;
+		Self::lookup_found(rows, "extracted_batches").await
+	}
+
+	/// Whether a point lookup in `table` found a row.
+	async fn lookup_found(rows: std::result::Result<turso::Rows, turso::Error>, table: &str) -> Result<bool> {
+		let failed = |e: turso::Error| Error::DatabaseError(format!("Failed to look up batch hash in {table}: {e}"));
+		Ok(rows.map_err(failed)?.next().await.map_err(failed)?.is_some())
 	}
 
 	/// Whether a batch with `batch_hash` is processed (in the processed batches) or was
 	/// extracted (recorded in `extracted_batches` when extraction deleted it), checked in
 	/// that order, each in a statement of its own on `processed`.
 	async fn processed_or_extracted(processed: &turso::Connection, aspect_id: &AspectId, batch_hash: &str) -> Result<Option<&'static str>> {
-		if Self::batch_hash_recorded(processed, "batches", aspect_id, batch_hash).await? {
+		if Self::batch_hash_stored(processed, aspect_id, batch_hash).await? {
 			return Ok(Some("processed"));
 		}
-		Ok(Self::batch_hash_recorded(processed, "extracted_batches", aspect_id, batch_hash).await?.then_some("extracted"))
+		Ok(Self::batch_hash_extracted(processed, batch_hash).await?.then_some("extracted"))
 	}
 
 	/// Insert `batch` into the unprocessed batches (`db`) unless its
@@ -1901,7 +1974,7 @@ impl Database {
 	async fn queue_batch_unless_known(&self, aspect_id: &AspectId, batch: &Batch, db: &turso::Database, db_path: &str, processed: &turso::Connection) -> Result<bool> {
 		let (measurements_json, batch_hash) = Self::batch_identity(batch)?;
 		let conn = Self::begin_concurrent(db, db_path, Some(self.cache.clone())).await?;
-		let known = match Self::batch_hash_recorded(conn.as_ref(), "batches", aspect_id, &batch_hash).await {
+		let known = match Self::batch_hash_stored(conn.as_ref(), aspect_id, &batch_hash).await {
 			Ok(true) => Ok(Some("queued")),
 			Ok(false) => Self::processed_or_extracted(processed, aspect_id, &batch_hash).await,
 			Err(e) => Err(e),
@@ -2112,5 +2185,23 @@ impl Database {
 		}
 
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// `WEFT_EXTRACTED_BATCH_RETENTION_SECS` takes a positive whole number of seconds;
+	/// anything else keeps the default, so a typo cannot switch the record off (or make
+	/// extraction delete every record as soon as it is written).
+	#[test]
+	fn the_extracted_batch_retention_is_a_positive_number_of_seconds() {
+		assert_eq!(parse_extracted_batch_retention(None), DEFAULT_EXTRACTED_BATCH_RETENTION_SECS);
+		assert_eq!(parse_extracted_batch_retention(Some("3600")), 3600);
+		assert_eq!(parse_extracted_batch_retention(Some(" 600 ")), 600);
+		for invalid in ["", "0", "-5", "1.5", "2d", "forever"] {
+			assert_eq!(parse_extracted_batch_retention(Some(invalid)), DEFAULT_EXTRACTED_BATCH_RETENTION_SECS, "{invalid:?}");
+		}
 	}
 }

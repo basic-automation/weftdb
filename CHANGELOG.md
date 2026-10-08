@@ -22,6 +22,26 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 - All dependencies updated to their latest major versions, including wgpu 30,
   Arrow/Parquet 60 and OpenTelemetry 0.33.
 - Builds on stable Rust (MSRV 1.95); nightly is no longer required.
+- **Breaking for implementors of `Inputs` and `Outputs`.** Three required methods were
+  added without default implementations: `Inputs::dequeue_unbatched_entries`,
+  `Inputs::remove_extracted_batches` and `Outputs::get_unbatched_entries` (see Added).
+  Behaviour that implementations must now match: `insert_unprocessed_batch` and
+  `batch_insert_unprocessed_batches` return `Ok` when they skip a batch that is already
+  queued, processed or extracted; a processed batch's `batch_hash` is the hash it was
+  queued under, not a hash of its processed measurements; and
+  `enqueue_unbatched_measurements` is an upsert that moves an already-queued entry's
+  `queued_at` forward and reports a write-write conflict as
+  `Error::TransientMvccError`.
+- **Rows-mode ingest and the incremental build commit more often** (crash-consistency
+  fixes below). `capture_measurement` makes four synced commits where it made three
+  (the write-ahead enqueue, the row, the second enqueue, the transaction-log entry), and
+  `batch_capture_measurements` one more per chunk (each chunk's second enqueue). The
+  incremental build dequeues in transactions of at most 5,000 entries, one synced
+  commit each, where a run dequeued in a single commit, so a backfill of a million rows
+  costs about 200 dequeue commits.
+- `weft-tui` lists databases with `Database::list_stored_databases`: the names are
+  sorted, and an unreadable data directory is reported as an error instead of showing
+  an empty list (a missing one still lists nothing).
 
 ### Added
 
@@ -32,8 +52,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   dequeue unbatched-queue entries together with their `queued_at` (`UnbatchedEntry`),
   so a queue consumer dequeues only what it read; see the ingest fix below.
 - `Inputs::remove_extracted_batches` removes the processed batches pattern extraction
-  consumed and records their hashes, so the batch consumer never queues them again;
-  `build_patterns_queue` uses it (see the batch dedupe fix below).
+  consumed and records their hashes, so the batch consumer does not queue them again
+  while the record keeps them; `build_patterns_queue` uses it (see the batch dedupe fix
+  below).
+- `WEFT_EXTRACTED_BATCH_RETENTION_SECS` (weftdb): how long, in seconds, the record of
+  extracted batches keeps a batch's hash. A positive whole number; anything else keeps
+  the default, 48 hours. Set it above the longest interval between pipeline runs of an
+  aspect plus the longest ingest call (see the batch dedupe fix below).
 - `Database::get_earliest_measurement_uncached` reads an aspect's earliest measurement
   from its rows, bypassing the per-instance cache; the incremental build aligns its
   windows on it.
@@ -51,9 +76,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   folders left by a crash are removed by the next `new` or listing; the data directory
   gains a `.weft-creating.lock` file that keeps a sweep away from a creation in
   progress, in this or another process. `new` now refuses a name of the build folders'
-  form (`.{x}.creating-` followed by 32 hex digits). If the published database cannot
-  be opened at its final path, the error says it was created and to open it with
-  `existing`; the checkpoint after creation is best-effort.
+  form (`.{x}.creating-` followed by 32 hex digits). The rename is the commit point:
+  if the data directory cannot be fsynced after it, or the published database cannot
+  be opened at its final path, the database stays in place (another task or process may
+  already have opened it) and the error says it was created and to open it with
+  `existing`; after a failed fsync it also says the creation may not survive a power
+  loss. The checkpoint after creation is best-effort.
 - **Legacy ingest could store rows that were never batched.** `batch_capture_measurements`
   and `capture_measurement` queued the timestamps for batching only after the rows
   committed, so a failure in between left rows the incremental pipeline never saw.
@@ -82,11 +110,25 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 - **Concurrent writes to the batching queue failed the call.** The queue enqueue is an
   upsert, so it writes a timestamp that is already queued, and an MVCC write-write
   conflict with a consumer's dequeue, or with another ingest of the same timestamps,
-  failed the ingest (before its rows were stored) or the consumer's dequeue. Ingest's
-  enqueues and the consumer's dequeue now retry such a conflict, for about three
-  seconds; a single `enqueue_unbatched_measurements` call returns it as
-  `Error::TransientMvccError`. The consumer dequeues in transactions of at most 500
-  entries, so an enqueue never waits long for it.
+  failed the ingest or the consumer's dequeue. Every ingest path's enqueue
+  (`capture_measurement`, `batch_capture_measurements`, `capture_new_measurement`,
+  `capture_measurement_chunk`, `capture_new_measurement_chunk`) and the consumer's
+  dequeue now retry such a conflict, for about three seconds; a single
+  `enqueue_unbatched_measurements` call returns it as `Error::TransientMvccError`. The
+  consumer dequeues in transactions of at most 5,000 entries, so an enqueue waits for
+  one of them, not the whole dequeue. `batch_capture_measurements` queues all of its
+  timestamps in one transaction before it stores any row, so a consumer dequeuing some
+  of the same timestamps (a re-import of timestamps still queued) waits for all of it,
+  and either side can run out of retries: the build fails, or the import fails before
+  storing anything. Both are safe to re-run. The paths without a write-ahead enqueue
+  (`capture_new_measurement` and the two chunk methods) still queue after their commit,
+  so an error there fails the call although the rows are stored.
+- **The incremental build interpolated windows that could not be complete.** A queued
+  timestamp past the latest stored row (an append in progress, or the write-ahead
+  entries of one that failed or was abandoned, up to a whole call's worth) stays queued
+  until rows reach its windows, and every build interpolated each of those windows only
+  to find it short. The build now reads the latest stored measurement once per run and
+  skips a window that ends after it; the timestamps stay queued as before.
 - **Legacy ingest could fail after its rows were stored.** The steps after the commit
   (the second enqueue, the checkpoint, the dirty-region marking, the aspect's
   earliest/latest columns and `capture_measurement`'s transaction-log entry) are now
@@ -100,14 +142,23 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   already queued, processed, or extracted. Processed batches keep the hash they were
   queued under (it used to be recomputed from the processed measurements), and pattern
   extraction records the hashes of the batches it consumes in a new `extracted_batches`
-  table of the processed batch database, in the transaction that deletes them: one
-  small row per extracted batch, removed by `clear_processed_batches` (which
-  `Pipeline::prepare_data_full_rebuild` calls), so a full rebuild still extracts every
-  window again. A first-run full rebuild (`is_first_run`) now skips the windows already
-  extracted. The unprocessed and processed batch databases gain an index,
-  `idx_batches_hash` on `batches(aspect_id, batch_hash)`, and `extracted_batches` one on
-  `(aspect_id, batch_hash)`, created when a process first opens them, so each check is
-  a point lookup.
+  table of the processed batch database (a hash and a time per batch, indexed by hash),
+  in the transaction that deletes them. That table grows by about one row
+  per resolution step of the aspect, since extraction consumes about one sliding-window
+  batch per step, so it is bounded: each extraction also deletes the rows older than
+  `WEFT_EXTRACTED_BATCH_RETENTION_SECS` (48 hours by default: about 2,880 rows for a
+  minute-resolution aspect, 172,800 for a second-resolution one), and
+  `clear_processed_batches` (which `Pipeline::prepare_data_full_rebuild` calls) deletes
+  them all, so a full rebuild still extracts every window again. The rebuilds the record
+  guards against come on the first build after an ingest that overlapped a pipeline
+  run, or on the re-run after a build crashed; one that comes after the record expired
+  (a pipeline run more than the retention after the previous one, or a longer crash
+  recovery) extracts those windows a second time. A first-run full rebuild
+  (`is_first_run`) now skips the windows extracted within the retention; older ones are
+  batched and extracted again, as before. The unprocessed and processed batch databases
+  gain an index, `idx_batches_hash` on `batches(aspect_id, batch_hash)`, and
+  `extracted_batches` one on `batch_hash`, created when a process first opens them, so
+  each check is a point lookup.
 - Rows-mode ingest residuals remain until aspects move to the segment store, and are now
   documented on `batch_capture_measurements` and `capture_measurement`: an error mid-call
   leaves the chunks committed before it, and retrying stores those rows again.

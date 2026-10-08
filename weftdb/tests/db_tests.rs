@@ -1156,6 +1156,58 @@ async fn queuing_an_extracted_batch_again_stores_nothing() -> Result<()> {
 	Ok(())
 }
 
+/// **Regression (crash-consistency design, S18: the extracted-batch record is bounded).**
+/// `remove_extracted_batches` deletes the records older than the retention (48 hours by
+/// default) in the transaction that writes the new ones, so the record holds about the
+/// retention's worth of batches instead of one row per batch ever extracted. A batch whose
+/// record expired is queued again; one still recorded is not. Before, only
+/// `clear_processed_batches` removed a record, and the table grew by about one row per
+/// resolution step of every aspect, forever.
+#[tokio::test]
+#[serial]
+async fn the_extracted_batch_record_expires_after_its_retention() -> Result<()> {
+	use futures::TryStreamExt;
+	use weftdb::{Batch, BatchId, BatchedMeasurement, Point};
+
+	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
+	let aspect_id = aspect.id();
+	let info = db.get_database_info().await?;
+	let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+	let batch = |start: i64| {
+		let points = (start..start + 5).map(|i| BatchedMeasurement::new(Point::new(base + Duration::minutes(i), BigDecimal::from((i * 7) % 11)))).collect();
+		Batch::new(5, points, Resolution::Minutes, aspect_id, info.clone())
+	};
+	let queued = || db.count_unprocessed_batches(&aspect_id);
+	let processed = db.get_processed_batches_db(&aspect_id).await?.connect()?;
+	let recorded = || async {
+		let mut rows = processed.query("SELECT COUNT(*) FROM extracted_batches", ()).await?;
+		let count: i64 = rows.next().await?.context("COUNT(*) returned no row")?.get(0)?;
+		anyhow::Ok(count)
+	};
+
+	db.batch_insert_unprocessed_batches(&aspect_id, vec![batch(0), batch(1)]).await?;
+	let mut stored: Vec<Batch> = db.get_unprocessed_batches(&aspect_id).await?.try_collect().await?;
+	let window = |start: i64| -> Result<BatchId> { Ok(*stored.iter().find(|stored| *stored.measurements()[0].get_measurement_timestamp() == base + Duration::minutes(start)).context("the window's batch")?.batch_id()) };
+	let (first, second) = (window(0)?, window(1)?);
+	for stored in &mut stored {
+		stored.process()?;
+	}
+	db.move_batches_to_processed(&aspect_id, &stored).await?;
+
+	db.remove_extracted_batches(&aspect_id, &[first]).await?;
+	assert_eq!(recorded().await?, 1, "precondition: extraction recorded the batch");
+	// The record is now older than the default retention, as two days later.
+	processed.execute("UPDATE extracted_batches SET extracted_at = extracted_at - ?", (49 * 60 * 60 * 1000_i64,)).await?;
+	db.remove_extracted_batches(&aspect_id, &[second]).await?;
+	assert_eq!(recorded().await?, 1, "the next extraction deleted the expired record and recorded its own batch");
+
+	db.insert_unprocessed_batch(&aspect_id, &batch(1)).await?;
+	assert_eq!(queued().await?, 0, "a batch still recorded is not queued again");
+	db.insert_unprocessed_batch(&aspect_id, &batch(0)).await?;
+	assert_eq!(queued().await?, 1, "a batch whose record expired is queued again");
+	Ok(())
+}
+
 /// Queue writes retry an MVCC write-write conflict over the same entry (crash-consistency
 /// design, S18). The enqueue is an upsert, so it writes an entry that is already queued,
 /// and conflicts with a consumer's dequeue (or another ingest's enqueue) of the same
@@ -1235,16 +1287,17 @@ async fn an_entry_queued_again_after_it_was_read_survives_the_dequeue() -> Resul
 }
 
 /// The batch tables, and the processed batches DB's record of the extracted ones, carry
-/// the `(aspect_id, batch_hash)` index that the queue's duplicate check looks a batch up
-/// in (crash-consistency design, S18), so each check is a point lookup instead of a scan
-/// of every stored batch; and a DB created before the index (or the record) gets it the
-/// next time a process opens it.
+/// the hash index that the queue's duplicate check looks a batch up in (crash-consistency
+/// design, S18): `(aspect_id, batch_hash)` on the batches, `batch_hash` on the record
+/// (whose DB belongs to one aspect). So each check is a point lookup instead of a scan of
+/// every stored batch; and a DB created before the index (or the record) gets it the next
+/// time a process opens it.
 #[tokio::test]
 #[serial]
 async fn the_batch_tables_index_their_hashes() -> Result<()> {
 	/// Turso's plan for the duplicate check's lookup in `table`.
 	async fn lookup_plan(conn: &turso::Connection, table: &str) -> Result<String> {
-		let mut rows = conn.query(&format!("EXPLAIN QUERY PLAN SELECT 1 FROM {table} WHERE aspect_id = ? AND batch_hash = ? LIMIT 1"), ("aspect", "hash")).await?;
+		let mut rows = if table == "extracted_batches" { conn.query("EXPLAIN QUERY PLAN SELECT 1 FROM extracted_batches WHERE batch_hash = ? LIMIT 1", ("hash",)).await? } else { conn.query(&format!("EXPLAIN QUERY PLAN SELECT 1 FROM {table} WHERE aspect_id = ? AND batch_hash = ? LIMIT 1"), ("aspect", "hash")).await? };
 		let mut plan = String::new();
 		while let Some(row) = rows.next().await? {
 			plan.push_str(&row.get::<String>(3)?);
@@ -1358,12 +1411,20 @@ mod database_new_crash {
 	}
 
 	/// **Regression (legacy-database-new-half-created).** A failure at either fault point
-	/// makes `new` return an error and leave nothing behind, so retrying `new(name)`
-	/// succeeds and `existing(name)` works. On main the failed call left a half-built
-	/// `{name}` folder, so the retry failed with "Database folder already exists".
+	/// makes `new` return an error and leaves a usable state. On main the failed call left
+	/// a half-built `{name}` folder, so the retry failed with "Database folder already
+	/// exists" and `existing` could not open it.
+	///
+	/// - At `L-new-created`, before the rename, nothing is left behind: retrying
+	///   `new(name)` succeeds, and `existing(name)` works.
+	/// - At `L-new-renamed` (standing in for a failed fsync of the data directory) the
+	///   rename, which is the commit point, has happened: the complete database stays, the
+	///   error says it was created and to open it with `existing`, and `new(name)` reports
+	///   that it exists. It used to be renamed back and removed, which deleted the files
+	///   under any handle a concurrent `existing(name)` had opened meanwhile.
 	#[tokio::test]
 	#[serial]
-	async fn a_failure_at_each_point_leaves_nothing_and_the_retry_succeeds() -> Result<()> {
+	async fn a_failure_at_each_point_is_recoverable() -> Result<()> {
 		let temp_dir = tempfile::tempdir()?;
 		std::env::set_var("TEST_DATA_DIR", temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?);
 
@@ -1373,12 +1434,21 @@ mod database_new_crash {
 				let _armed = fault::arm(point, FaultAction::ReturnErr);
 				let err = Database::new(&name).await.expect_err("the armed point fails the call");
 				assert!(format!("{err:#}").contains(&format!("injected fault at {point}")), "{point}: unexpected error {err:#}");
+				if point == FaultPoint::LNewRenamed {
+					assert!(format!("{err:#}").contains("was created") && format!("{err:#}").contains("Database::existing"), "{point}: the error says the database exists: {err:#}");
+				}
 			}
-			assert!(!database_dir(&name).exists(), "{point}: a failed Database::new left a database folder behind");
 			assert_eq!(build_dirs(&name), Vec::<String>::new(), "{point}: a failed Database::new left its build directory behind");
 
-			let db = Database::new(&name).await.with_context(|| format!("retrying Database::new after a failure at {point}"))?;
-			release_database(db, &name).await;
+			if point == FaultPoint::LNewCreated {
+				assert!(!database_dir(&name).exists(), "{point}: a failed Database::new left a database folder behind");
+				let db = Database::new(&name).await.with_context(|| format!("retrying Database::new after a failure at {point}"))?;
+				release_database(db, &name).await;
+			} else {
+				assert!(database_dir(&name).join("metadata.db").exists(), "{point}: the published database stays in place");
+				let err = Database::new(&name).await.expect_err("the database exists, so new() refuses it");
+				assert!(err.to_string().contains("already exists"), "{point}: {err:#}");
+			}
 			assert_usable(&name).await.with_context(|| format!("after a failure at {point}"))?;
 		}
 		Ok(())

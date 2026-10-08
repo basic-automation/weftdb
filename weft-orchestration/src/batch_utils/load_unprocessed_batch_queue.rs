@@ -42,7 +42,9 @@ pub async fn is_first_run(database: &Database, aspect_id: &AspectId) -> Result<b
 /// - **Crash before the dequeue.** The batches are stored before their timestamps are
 ///   dequeued, so a run that dies in between rebuilds the same windows next time; storing
 ///   skips every batch already queued, processed or extracted, so the re-run adds no
-///   duplicate batches or pattern occurrences, whatever ran in between.
+///   duplicate batches or pattern occurrences, whatever ran in between (an extracted
+///   batch is recognised while the extracted-batch record keeps it, 48 hours by default;
+///   see `Inputs::remove_extracted_batches`).
 /// - **Ingest running at the same time.** Ingest queues a timestamp before its row is
 ///   inserted and again once it is committed, so this run may read a timestamp whose row
 ///   is not stored yet and build its windows without it. It therefore dequeues only the
@@ -58,6 +60,15 @@ pub async fn is_first_run(database: &Database, aspect_id: &AspectId) -> Result<b
 ///   read from the rows on every run: a value cached before a backfill (by this or another
 ///   `Database` instance) would put the backfill before the base, where it has no window,
 ///   and the run would clear it from the queue.
+/// - **Timestamps past the stored range.** A window that ends after the latest stored
+///   measurement cannot have its last point (`analyze_range` does not extrapolate past
+///   the data), so it is skipped without being interpolated, and its entries stay queued
+///   until rows reach it. Such timestamps are an append in progress, or the write-ahead
+///   entries of one that failed or was abandoned before its rows landed (up to a whole
+///   call's worth); without the skip every run interpolated each of their windows only to
+///   find it short. The latest measurement is read (uncached) after the entries, so a row
+///   committed after that read is queued again after the read too, its entry survives
+///   this run's dequeue, and the next run builds its windows.
 ///
 /// # Errors
 /// Returns an error if database reads or writes fail while constructing or persisting batches.
@@ -102,14 +113,28 @@ pub async fn build_incremental_unprocessed_queue(database: &Database, aspect: &A
 
 	info!(affected_window_count = affected_windows.len(), "Creating batches for affected windows");
 
+	// The latest stored measurement, read after the entries (see the docs above): a window
+	// that ends after it is skipped without interpolating it.
+	let Some(latest_measurement) = database.get_latest_measurement(aspect).await? else {
+		info!(unbatched_count = unbatched_timestamps.len(), "Queued timestamps but no stored measurements yet, nothing to batch");
+		return Ok(());
+	};
+
 	let database_info = database.get_database_info().await.map_err(|_| anyhow::anyhow!("Database info not available"))?;
 
 	let mut batches_created = 0;
+	let mut windows_past_the_data = 0usize;
 	// Which of the entries read above a stored batch covers.
 	let mut covered = vec![false; unbatched.len()];
 
 	// For each affected window, create a batch
 	for window in affected_windows {
+		// It cannot reach `batch_size` points yet; its entries stay queued.
+		if window.end > latest_measurement {
+			windows_past_the_data += 1;
+			continue;
+		}
+
 		// Fetch points within this window
 		let mut point_stream = Outputs::analyze_range(database, aspect, window.start, window.end, *resolution, *method).await?;
 
@@ -161,7 +186,7 @@ pub async fn build_incremental_unprocessed_queue(database: &Database, aspect: &A
 		info!(dequeued = entries_to_dequeue.len(), "Dequeued processed timestamps");
 	}
 
-	info!(batches_created, "Incremental batch creation complete");
+	info!(batches_created, windows_past_the_data, "Incremental batch creation complete");
 
 	Ok(())
 }

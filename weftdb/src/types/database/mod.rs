@@ -376,17 +376,19 @@ impl DatabaseStructure for Database {
 	/// fsynced. An error, or a crash, before that rename leaves no `{name}` folder, so
 	/// retrying `new(name)` works; the build directory of a crashed call is removed by the
 	/// next `new` or [`Database::list_stored_databases`]. Once the rename has happened the
-	/// database is complete, so `existing(name)` opens it (see `database/creation.rs`).
+	/// database is complete, so `existing(name)` opens it, and nothing undoes it (see
+	/// `database/creation.rs`).
 	///
 	/// # Errors
 	/// - if folder /data/{name} already exists, including when a concurrent `new(name)`
 	///   published it first;
 	/// - if `name` has the form of a build directory (`.{x}.creating-{32 hex digits}`);
-	/// - if the build, the rename or the directory fsync fails. The database was then not
-	///   created, unless the error says it could not be withdrawn after the rename;
-	/// - if the published database cannot be opened at its final path. It was then
-	///   created and is complete, and the error says to open it with `existing`, since
-	///   `new(name)` would now report that it already exists.
+	/// - if the build or the rename fails. The database was then not created;
+	/// - if the data directory cannot be fsynced after the rename, or the published
+	///   database cannot be opened at its final path. It was then created and is complete
+	///   (after a failed fsync its creation may not survive a power loss), and the error
+	///   says to open it with `existing`, since `new(name)` would now report that it
+	///   already exists.
 	async fn new(name: &str) -> Result<Self> {
 		tracing::debug!("Creating new database: {name}");
 		let data_dir = Self::get_data_dir();
@@ -423,13 +425,17 @@ impl DatabaseStructure for Database {
 		tracing::debug!("Building database {name} in {}", build.dir().display());
 		Self::build_metadata_database(&build.dir().join("metadata.db"), db_id, name, &metadata_db_path).await?;
 		fault::hit(FaultPoint::LNewCreated).await?;
-		match build.publish().await {
-			Ok(()) => {}
-			Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => bail!("Database folder already exists: {db_path}"),
-			Err(e) => return Err(anyhow::anyhow!("Could not publish database {name} at {db_path}: {e}")),
-		}
+		let published = build.publish().await;
 		// Sweeps may run again from here; the database is no longer under a build name.
 		drop(build);
+		match published {
+			Ok(()) => {}
+			Err(creation::PublishError::NotPublished(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => bail!("Database folder already exists: {db_path}"),
+			Err(creation::PublishError::NotPublished(e)) => return Err(anyhow::anyhow!("Could not publish database {name} at {db_path}: {e}")),
+			// Past the rename, the commit point: the database exists and may already be open
+			// elsewhere, so it stays, and a retried `new` would only report that it exists.
+			Err(creation::PublishError::NotDurable(e)) => return Err(anyhow::anyhow!("Database {name} was created at {db_path}, but the data directory could not be synced afterwards, so its creation may not survive a power loss; it is complete: open it with Database::existing: {e}")),
+		}
 		tracing::debug!("Published database {name} at {db_path}");
 
 		// Open it at its final path: a cold open, exactly as `existing` does. The database

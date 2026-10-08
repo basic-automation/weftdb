@@ -10,7 +10,10 @@
 //!
 //! - before it, `{name}` does not exist, so a retry of `new(name)` starts over, and the
 //!   build directory is crash litter that the next `new` or database listing sweeps;
-//! - after it, `{name}` is complete, so `existing(name)` opens it.
+//! - after it, `{name}` is complete, so `existing(name)` opens it. Nothing after the
+//!   rename is undone: from that moment another task or process can open the database,
+//!   so a failed parent fsync leaves it in place and only reports that the rename may not
+//!   survive a power loss ([`PublishError::NotDurable`]).
 //!
 //! **Which build directories are stale.** A sweep must never delete the directory of a
 //! `new` that is still running, in this process or another one. Every creator holds a
@@ -224,50 +227,62 @@ impl Build {
 	/// All of it, and the cleanup after a failure, runs as one blocking task that holds
 	/// the creator lock. If this future is dropped before the task ends, the task still
 	/// runs to its end, and the `Build` leaves the directory to it: the database is then
-	/// either published or, after a failure, removed by the task.
+	/// either published or, after a failure before the rename, removed by the task.
 	///
 	/// # Errors
 	///
-	/// `AlreadyExists` if the target exists (another `new` of the same name won). Any
-	/// other error syncing or renaming. A failure after the rename (the parent fsync, or
-	/// the `L-new-renamed` fault point) renames the build back, so an error always means
-	/// the database was not created, and its build directory is gone; if that rename back
-	/// fails too, the complete database stays at the target and the error says so.
-	pub async fn publish(&mut self) -> io::Result<()> {
+	/// - [`PublishError::NotPublished`]: syncing the build directory or the rename failed,
+	///   with `AlreadyExists` if the target exists (another `new` of the same name won).
+	///   Nothing is at the target, and the build directory is gone.
+	/// - [`PublishError::NotDurable`]: the rename happened but the parent fsync (or the
+	///   `L-new-renamed` fault point) failed. The complete database is at the target and
+	///   stays there.
+	pub async fn publish(&mut self) -> Result<(), PublishError> {
 		let (dir, parent, target, lock) = (self.dir.clone(), self.parent.clone(), self.target.clone(), Arc::clone(&self.lock));
 		self.handed_off = true;
-		blocking(move || {
+		let published = blocking(move || {
 			let _lock = lock;
 			let published = publish_blocking(&dir, &parent, &target);
-			if published.is_err() {
+			if matches!(published, Err(PublishError::NotPublished(_))) {
 				remove_build_dir(&dir);
 			}
-			published
+			Ok(published)
 		})
-		.await
+		.await;
+		// The task did not complete (the runtime is shutting down): reported as before the
+		// rename, with an error that says the task did not complete.
+		published.unwrap_or_else(|e| Err(PublishError::NotPublished(e)))
 	}
 }
 
-/// [`Build::publish`]'s steps, on a blocking thread. On an error the database is not at
-/// `target`, unless the error says it could not be withdrawn.
-fn publish_blocking(dir: &Path, parent: &Path, target: &Path) -> io::Result<()> {
+/// How a [`Build::publish`] failed: before its rename, which is the commit point, or
+/// after it.
+#[derive(Debug)]
+pub enum PublishError {
+	/// The database was not published: nothing is at the target, and the build directory
+	/// is removed. `AlreadyExists` when the target exists.
+	NotPublished(io::Error),
+	/// The database was published, complete, at the target, but the parent directory could
+	/// not be fsynced afterwards, so the rename may not survive a power loss (after which
+	/// the target would be gone and the build directory back, for a sweep). It is left in
+	/// place rather than renamed back: from the rename on, another task or process can
+	/// have opened it, and withdrawing it would delete files under that handle.
+	NotDurable(io::Error),
+}
+
+/// [`Build::publish`]'s steps, on a blocking thread.
+fn publish_blocking(dir: &Path, parent: &Path, target: &Path) -> Result<(), PublishError> {
 	let taken = || io::Error::new(io::ErrorKind::AlreadyExists, format!("{} already exists", target.display()));
-	sync_dir_blocking(dir)?;
+	sync_dir_blocking(dir).map_err(PublishError::NotPublished)?;
 	if std::fs::metadata(target).is_ok() {
-		return Err(taken());
+		return Err(PublishError::NotPublished(taken()));
 	}
 	// A concurrent `new` of the same name can publish between the check and the rename;
 	// renaming onto its directory, which is not empty, then fails with `ENOTEMPTY` (or
 	// `EEXIST`) rather than replacing it.
-	std::fs::rename(dir, target).map_err(|e| if matches!(e.kind(), io::ErrorKind::AlreadyExists | io::ErrorKind::DirectoryNotEmpty) { taken() } else { e })?;
-	let committed = fault::hit_blocking(FaultPoint::LNewRenamed).and_then(|()| sync_dir_blocking(parent));
-	if let Err(e) = committed {
-		if let Err(back) = std::fs::rename(target, dir) {
-			return Err(io::Error::new(e.kind(), format!("{e}; the database at {} is complete but could not be withdrawn ({back})", target.display())));
-		}
-		return Err(e);
-	}
-	Ok(())
+	std::fs::rename(dir, target).map_err(|e| PublishError::NotPublished(if matches!(e.kind(), io::ErrorKind::AlreadyExists | io::ErrorKind::DirectoryNotEmpty) { taken() } else { e }))?;
+	// The commit point is passed: the database is visible at `target` from here on.
+	fault::hit_blocking(FaultPoint::LNewRenamed).and_then(|()| sync_dir_blocking(parent)).map_err(PublishError::NotDurable)
 }
 
 /// Remove an unpublished build directory; a failure is logged and left to the next sweep.
@@ -370,10 +385,37 @@ mod tests {
 		let mut build = Build::begin(&target).await.unwrap();
 		let dir = build.dir().to_path_buf();
 		let err = build.publish().await.unwrap_err();
-		assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+		assert!(matches!(&err, PublishError::NotPublished(e) if e.kind() == io::ErrorKind::AlreadyExists), "{err:?}");
 		drop(build);
 		assert!(!dir.exists());
 		assert!(target.is_dir(), "the existing target is untouched");
+	}
+
+	/// A failure after the rename (the parent fsync; here the `L-new-renamed` fault point
+	/// standing in for it) leaves the published database where it is and says so. The
+	/// rename is the commit point: a concurrent `existing` can already have opened the
+	/// database, and renaming it back and removing it, as this used to, deleted the files
+	/// under that handle.
+	#[tokio::test]
+	#[serial(build_publish)]
+	async fn a_failure_after_the_rename_leaves_the_database_published() {
+		let root = tempfile::tempdir().unwrap();
+		let target = root.path().join("db");
+		let mut build = Build::begin(&target).await.unwrap();
+		std::fs::write(build.dir().join("metadata.db"), b"x").unwrap();
+		let dir = build.dir().to_path_buf();
+		let published = {
+			let _armed = fault::arm(FaultPoint::LNewRenamed, fault::FaultAction::ReturnErr);
+			build.publish().await
+		};
+		drop(build);
+
+		let err = published.unwrap_err();
+		assert!(matches!(&err, PublishError::NotDurable(e) if e.to_string().contains("injected fault at L-new-renamed")), "{err:?}");
+		assert_eq!(std::fs::read(target.join("metadata.db")).unwrap(), b"x", "the database stays published");
+		assert!(!dir.exists(), "nothing is left under the build name");
+		assert_eq!(sweep_stale_build_dirs(root.path()).await.unwrap(), 0);
+		assert!(target.join("metadata.db").exists(), "a sweep leaves the published database alone");
 	}
 
 	/// Resumes a task paused at a fault point when dropped, so that a failed assertion

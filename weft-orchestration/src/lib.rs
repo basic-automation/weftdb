@@ -871,8 +871,10 @@ pub async fn build_patterns_queue(database: &Database, aspect_id: &weftdb::Aspec
 
 	// Remove processed batches from database queue using bulk operation
 	// This is ~1000x faster than individual deletes for large batch counts. The removal
-	// records each batch's hash, so that the queue consumer never queues the same batch
-	// again when it rebuilds the window (crash-consistency design, S18).
+	// records each batch's hash, so that the queue consumer does not queue the same batch
+	// again when it rebuilds the window, for as long as the record keeps it
+	// (`WEFT_EXTRACTED_BATCH_RETENTION_SECS`, 48 hours by default; crash-consistency
+	// design, S18).
 	if !processed_batch_ids.is_empty() {
 		tracing::debug!(batch_count = processed_batch_ids.len(), "Removing processed batches from queue");
 		database.remove_extracted_batches(aspect_id, &processed_batch_ids).await?;
