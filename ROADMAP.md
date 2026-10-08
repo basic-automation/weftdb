@@ -696,8 +696,34 @@ recovery, with bounded p99 and no loss beyond the declared durability mode.
 - [ ] **7.1 Online ingest** — scheduled polling daemon, runtime source registration, retry
   buffer, backpressure, idempotency ledger, at-least-once, dedup/upsert, late-arrival
   policy *(maps backlog B-poll, B-retry, B-register, B-dedup)*
-- [ ] **7.2 WAL & crash consistency** — WAL design, segment-seal protocol, atomic catalog
-  updates, recovery, partial-write handling, fsync policy, durability modes
+- [ ] **7.2 WAL & crash consistency.** The design is in [`docs/design/crash-consistency.md`](docs/design/crash-consistency.md) (2026-10-05).
+  A code audit verified **43 crash/consistency windows**: 7 lose data that was already acknowledged, and 6 corrupt data that was already committed.
+  The worst: segment frames are never fsynced while the index commit is; maintenance rewrites committed frames in place;
+  concurrent seals can share an id; and a cold open deletes the legacy `metadata.db-log`, dropping committed rows.
+  The design is "Atomic Publish": write-once fsynced frames, one control-plane transaction per state change, and startup recovery. There is no separate WAL in 1.0.
+  Milestones: **M1** (S1–S12 + S15) makes the strict promise true; **M2** (S13–S14) adds idempotent HTTP ingest; **M3** (S16) adds whole-store backup;
+  **M4** (S18–S20) moves legacy ingest onto the seal (Immediate #1). Slices:
+  - [ ] **S1** Preserve legacy MVCC logs and drop no-op sync pragmas *(~2.5 h; after none)*
+  - [ ] **S2** Durable I/O layer, fault points and power-cut simulator *(~8 h; after none)*
+  - [ ] **S3** Storage-v2 open hardening: MVCC/FULL probes, root LOCK, register_scope, directory durability *(~4 h; after S2)*
+  - [ ] **S4** Store-wide sweep isolation *(~4 h; after none)*
+  - [ ] **S5** Backup directory atomic publish, manifest, retention and drill hygiene *(~7 h; after S2)*
+  - [ ] **S6** Schema v2, IndexTxn, write poison, root-relative frame path resolution *(~7 h; after S3)*
+  - [ ] **S7** Persistent per-aspect id allocator, per-aspect commit/maint locks, plain INSERT for seals *(~6 h; after S6)*
+  - [ ] **S8** Write-once maintenance I: generational outputs, frame journal, single-transaction swap, reaper and reader pins (reconcile_segment, split_segment) *(~8 h; after S7)*
+  - [ ] **S9** Write-once maintenance II: overlap merge (both branches), squash, size-targeted compaction *(~8 h; after S8)*
+  - [ ] **S10** Write-once durable seal with id assigned at commit *(~8 h; after S9)*
+  - [ ] **S11** Rollup into segment_index.db, folded in the seal and swap transactions *(~7 h; after S10)*
+  - [ ] **S12** Startup recovery, quarantine with TTL, fsck endpoint, /ready report *(~8 h; after S11)*
+  - [ ] **S13** Idempotent atomic ingest entry point (library) *(~7 h; after S12)*
+  - [ ] **S14** HTTP ingest wiring: Idempotency-Key, detached tasks, body limit, backpressure, status classes, graceful shutdown *(~7 h; after S13)*
+  - [ ] **S15** Partial sidecar v4: CRC trailer, frame-stem naming, frame_crc stamp, tmp+rename, backfill *(~5 h; after S10)*
+  - [ ] **S16** Whole-store backup with hard-linked frames; restore_store and in-place restore mode with adoption *(~8 h; after S5, S12)*
+  - [ ] **S17** Relaxed durability mode with synced_epoch watermark (optional for 1.0) *(~6 h; after S12)*
+  - [ ] **S18** Legacy rows-mode hygiene: atomic Database::new, write-ahead enqueue, batch dedupe *(~5 h; after S1)*
+  - [ ] **S19** Seal-backed legacy aspects: storage_mode, legacy ingest and reads through SegmentStore *(~8 h; after S13, S18)*
+  - [ ] **S20** Change log replaces the per-timestamp unbatched queue for seal-backed aspects *(~7 h; after S19)*
+  - [ ] **S21** Crash-matrix CI, subprocess SIGKILL soak, durability benchmark and ROADMAP re-baseline *(~7 h; after S14, S16)*
 - [ ] **7.3 Corruption detection** — segment/page checksums *(CRC-32 shipped in the
   `.weftseg` frame)*, catalog checks, startup verification, repair tooling
 - **7.4 Backup/restore** — online backup, PITR if feasible, verification, drills, documented RPO/RTO
