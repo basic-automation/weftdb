@@ -27,6 +27,7 @@ criterion = { workspace = true }
 # the library links them: they exist to measure WeftDB's own codecs against upstream.
 fastlanes = "=0.7.2"
 alp = "=0.0.4"
+pco = "=1.0.4"
 
 [[bench]]
 name = "bitunpack"

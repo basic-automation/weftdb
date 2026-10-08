@@ -502,11 +502,28 @@ detection within Y% and improving historical query latency by Z."*
       `best_value_codec` on the real corpus, the actionable outcome is to steal the **heuristic**,
       which stays inside hard-constraint #4 because WeftDB's scale is already schema-declared.
       *(src: https://arxiv.org/pdf/2502.06112)*
-    - [ ] **`pco` is now 1.0 (1.0.3, 2026-08-01) — pin it in `weft-bench` only**, keeping it out of
+    - [x] **DONE (2026-10-08) — `pco` is now 1.0 (1.0.3, 2026-08-01) — pin it in `weft-bench` only**, keeping it out of
       the core crates until an adopt decision, per the out-of-core boundary. Build the harness with
       the `bmi1`/`bmi2`/`avx2` target features the crate's docs call for ("improves ... decompression
       speed substantially") or the measured decode throughput will understate pco and produce a false
       adopt-or-drop verdict. *(src: https://lib.rs/crates/pco)*
+    - [x] **Measured (2026-10-08), value column, per column as asked.** `pco =1.0.4` is pinned as
+      a bench-only dev-dependency of `weft-physical-type`, beside `alp`/`fastlanes` in
+      `benches/alp_vs_f64_codecs.rs`. The library links none of them; the arm sits with the other
+      codec arms rather than in `weft-bench`. Bits/value at default level 8: **btc_close: pco on exact
+      mantissas 11.09**, pco on floats 11.64, vs dfor 13.58, ALP 15.35, realized `scaled_for` 33.74,
+      opt-in delta cascade 32.55. **sensor_2dp: pco 2.81** (= log₂7, the entropy of its ±3-cent
+      steps), pco floats 3.43, vs delta cascade **3.000**, realized 5.51. **real_doubles: pco 45.90**
+      vs Chimp 49.50, ALP-RD 56.16. Decode times were taken at load avg 48–63 and are indicative
+      only (pco 4.6–10 ms per 1 Mi values vs realized FOR ~1.9 ms). Built without BMI/AVX2, so pco's
+      times are a floor. Reading: pco is the **ratio ceiling** on every corpus. On a random walk the
+      shipped opt-in cascade is already within 0.19 bits of it. On BTC, dfor plus in-block deltas
+      reaches only 13.06 bits (Python estimate over the same window). The remaining ~2 bits are
+      pco's entropy coding of heavy-tailed deltas, which bit-packing at the block's max width cannot
+      reach. That is a cold-tier argument (pco's page-serial decode), not a hot-path one, matching
+      the scope correction above.
+    - [ ] Residue: the timestamp half (pco `IntMult` vs the shipped delta/blocked/Gorilla timestamp
+      codecs) is not measured yet.
   - [x] **Scaled-int value bit-pack codec — realized on disk.** The `.weftseg` value block
     now carries a self-describing codec selector (`VAL_CODEC_VARINT`/`VAL_CODEC_BITPACK`);
     a `ScaledI64` column whose mantissas fixed-width bit-pack below the per-value varint

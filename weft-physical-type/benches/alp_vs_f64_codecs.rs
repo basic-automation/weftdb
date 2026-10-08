@@ -2,7 +2,10 @@
 //! benchmarked, rather than hand-rolling it first"): bytes/value **and** decode throughput for
 //! classic ALP against every f64 codec WeftDB ships (Gorilla, Chimp, Chimp128, Elf) and against
 //! the realized exact path (`ScaledI64` mantissas under the default value-codec selector), and
-//! the advisory decimal-exponent FOR (`dfor`) over the same exact mantissas.
+//! the advisory decimal-exponent FOR (`dfor`) over the same exact mantissas. Pcodec (`pco`) is
+//! the external ratio ceiling, run per column as the roadmap asks: once on the floats (where its
+//! `FloatMult` mode detects "multiples of 0.01") and once on the exact `ScaledI64` mantissas
+//! (its integer modes), each at the crate's default level 8.
 //!
 //! ## The ALP arm
 //!
@@ -23,9 +26,11 @@
 //! - `sensor_2dp`: a deterministic two-decimal random walk around 100.00.
 //! - `real_doubles`: full-mantissa doubles (a scaled sine plus noise), ALP's worst case.
 //!
-//! Every arm is asserted to decode its corpus exactly before anything is timed. Both
-//! `alp` and `fastlanes` are bench-only dev-dependencies, pinned exactly; the library links
-//! neither.
+//! Every arm is asserted to decode its corpus exactly before anything is timed. `alp`,
+//! `fastlanes` and `pco` are bench-only dev-dependencies, pinned exactly; the library links
+//! none of them. Built without extra target features, so every arm, `pco` included, runs the
+//! same portable code (pco's docs note BMI/AVX2 speed up its decode, so its times here are a
+//! floor, not its best).
 
 use std::{
 	hint::black_box, io::{BufRead, BufReader}, str::FromStr
@@ -181,6 +186,28 @@ fn weft_dfor_decode(bytes: &[u8], scale: u8) -> Vec<f64> {
 	dfor_bitpack_decode(bytes, BLOCKED_BITPACK_BLOCK, N).iter().map(|&m| m as f64 / divisor).collect()
 }
 
+fn pco_f64(values: &[f64]) -> Vec<u8> {
+	pco::standalone::simple_compress(values, &pco::ChunkConfig::default()).expect("pco compresses")
+}
+
+fn pco_f64_decode(bytes: &[u8]) -> Vec<f64> {
+	pco::standalone::simple_decompress::<f64>(bytes).expect("pco decompresses")
+}
+
+/// Pcodec over the exact `ScaledI64` mantissas, decoded to the same floats as the other exact arms.
+fn pco_scaled(corpus: &Corpus) -> Option<(Vec<u8>, u8)> {
+	let encoding = recommend_encoding(&corpus.decimals, &BigDecimal::from(0));
+	let PhysicalType::ScaledI64 { scale } = encoding.physical_type else {
+		return None;
+	};
+	Some((pco::standalone::simple_compress(&encoding.scaled_i64_mantissas()?, &pco::ChunkConfig::default()).expect("pco compresses"), scale))
+}
+
+fn pco_scaled_decode(bytes: &[u8], scale: u8) -> Vec<f64> {
+	let divisor = 10_f64.powi(i32::from(scale));
+	pco::standalone::simple_decompress::<i64>(bytes).expect("pco decompresses").iter().map(|&m| m as f64 / divisor).collect()
+}
+
 /// The realized exact path for a corpus: the codec the default selector picks, and a decoder
 /// that yields the same `f64`s (`mantissa / 10^scale` is one correctly rounded division, so it
 /// equals parsing the decimal while the mantissa is below 2^53).
@@ -238,6 +265,12 @@ fn bench_alp(c: &mut Criterion) {
 		if let Some((codec, bytes, scale)) = &scaled {
 			assert_eq!(weft_scaled_decode(codec, bytes, *scale), *values, "{}: the realized scaled path must reproduce the floats", corpus.name);
 		}
+		let pco_floats = pco_f64(values);
+		assert!(pco_f64_decode(&pco_floats).iter().zip(values).all(|(a, b)| a.to_bits() == b.to_bits()), "{}: pco must round-trip the floats bit-exactly", corpus.name);
+		let pco_exact = pco_scaled(corpus);
+		if let Some((bytes, scale)) = &pco_exact {
+			assert_eq!(pco_scaled_decode(bytes, *scale), *values, "{}: pco over the mantissas must reproduce the floats", corpus.name);
+		}
 		let dfor = weft_dfor(corpus);
 		if let Some((bytes, scale)) = &dfor {
 			assert_eq!(weft_dfor_decode(bytes, *scale), *values, "{}: the decimal-exponent FOR must reproduce the floats", corpus.name);
@@ -259,6 +292,13 @@ fn bench_alp(c: &mut Criterion) {
 		if let Some((bytes, _)) = &dfor {
 			eprintln!("  weft dfor (advisory)       {:>7.3}", bits_per_value(bytes.len()));
 		}
+		if let Some(cascade) = recommend_encoding(&corpus.decimals, &BigDecimal::from(0)).delta_cascade_bytes() {
+			eprintln!("  weft delta cascade (opt-in, sized only) {:>7.3}", bits_per_value(cascade));
+		}
+		eprintln!("  pco on floats              {:>7.3}", bits_per_value(pco_floats.len()));
+		if let Some((bytes, _)) = &pco_exact {
+			eprintln!("  pco on exact mantissas     {:>7.3}", bits_per_value(bytes.len()));
+		}
 
 		let mut group = c.benchmark_group(format!("f64_decode_1mi/{}", corpus.name));
 		group.sample_size(20);
@@ -278,6 +318,10 @@ fn bench_alp(c: &mut Criterion) {
 		}
 		if let Some((codec, bytes, scale)) = &scaled {
 			group.bench_function(format!("weft_{codec}"), |b| b.iter(|| black_box(weft_scaled_decode(codec, black_box(bytes), *scale))));
+		}
+		group.bench_function("pco_floats", |b| b.iter(|| black_box(pco_f64_decode(black_box(&pco_floats)))));
+		if let Some((bytes, scale)) = &pco_exact {
+			group.bench_function("pco_mantissas", |b| b.iter(|| black_box(pco_scaled_decode(black_box(bytes), *scale))));
 		}
 		if let Some((bytes, scale)) = &dfor {
 			group.bench_function("weft_dfor", |b| b.iter(|| black_box(weft_dfor_decode(black_box(bytes), *scale))));
