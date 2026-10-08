@@ -1163,8 +1163,10 @@ pub fn decode_gorilla_dods(bytes: &[u8], count: usize) -> Vec<i64> {
 /// `alpha` ranges over `0..=2^FIRE_SHIFT`, representing a slope multiplier in `[0, 1]`.
 /// At `alpha = 2^FIRE_SHIFT` the predictor is exactly delta-of-delta; at `alpha = 0` it is a
 /// plain delta. FIRE adapts between the two per stream.
+#[cfg(feature = "experimental-codecs")]
 const FIRE_SHIFT: i64 = 8;
 /// The upper clamp for the FIRE coefficient — `2^FIRE_SHIFT`, i.e. a multiplier of `1.0`.
+#[cfg(feature = "experimental-codecs")]
 const FIRE_ALPHA_MAX: i64 = 1 << FIRE_SHIFT;
 
 /// Apply the **Sprintz FIRE** (Fast Integer `REgression`) forecaster to an integer stream,
@@ -1182,8 +1184,10 @@ const FIRE_ALPHA_MAX: i64 = 1 << FIRE_SHIFT;
 /// comparable: `res[0]` is the anchor value verbatim, `res[1]` (if present) is the first
 /// delta, and `res[2..]` are the FIRE prediction residuals. All arithmetic is wrapping `i64`,
 /// so the exact inverse [`fire_reconstruct`] round-trips every stream regardless of overflow.
-/// Advisory (roadmap Phase 6.1) — a benchmarkable estimate, not wired into any on-disk selector.
+/// Advisory (roadmap Phase 6.1) — a benchmarkable estimate, not wired into any on-disk selector,
+/// and behind the `experimental-codecs` feature.
 /// *(src: Sprintz, ACM TODS'18 — <https://arxiv.org/abs/1808.02515>)*
+#[cfg(feature = "experimental-codecs")]
 #[must_use]
 pub fn fire_residuals(values: &[i64]) -> Vec<i64> {
 	let mut res = Vec::with_capacity(values.len());
@@ -1215,7 +1219,9 @@ pub fn fire_residuals(values: &[i64]) -> Vec<i64> {
 }
 
 /// Reconstruct the original integer stream from a [`fire_residuals`] output — the exact
-/// inverse, mirroring the forecaster's deterministic wrapping `i64` arithmetic.
+/// inverse, mirroring the forecaster's deterministic wrapping `i64` arithmetic. Behind the
+/// `experimental-codecs` feature.
+#[cfg(feature = "experimental-codecs")]
 #[must_use]
 pub fn fire_reconstruct(residuals: &[i64]) -> Vec<i64> {
 	let mut out = Vec::with_capacity(residuals.len());
@@ -1255,7 +1261,9 @@ pub fn fire_reconstruct(residuals: &[i64]) -> Vec<i64> {
 /// Structured exactly like [`DeltaOfDeltaColumn::best_estimated_bytes`] (anchor + first delta +
 /// packed second-order stream) so the two are directly comparable — FIRE wins when its adaptive
 /// coefficient yields a smaller residual tail than the fixed delta-of-delta predictor. Advisory
-/// only. *(src: Sprintz, ACM TODS'18 — <https://arxiv.org/abs/1808.02515>)*
+/// only, and behind the `experimental-codecs` feature. *(src: Sprintz, ACM TODS'18 —
+/// <https://arxiv.org/abs/1808.02515>)*
+#[cfg(feature = "experimental-codecs")]
 #[must_use]
 pub fn fire_estimated_bytes(values: &[i64]) -> usize {
 	let residuals = fire_residuals(values);
@@ -1512,6 +1520,7 @@ mod tests {
 
 	/// Every FIRE fixture must round-trip exactly (the predictor is a deterministic wrapping
 	/// bijection).
+	#[cfg(feature = "experimental-codecs")]
 	fn fire_round_trips(values: &[i64]) {
 		let res = fire_residuals(values);
 		assert_eq!(res.len(), values.len(), "residual stream keeps the length");
@@ -1519,6 +1528,7 @@ mod tests {
 	}
 
 	#[test]
+	#[cfg(feature = "experimental-codecs")]
 	fn fire_round_trips_across_shapes() {
 		fire_round_trips(&[]);
 		fire_round_trips(&[42]);
@@ -1532,6 +1542,7 @@ mod tests {
 	}
 
 	#[test]
+	#[cfg(feature = "experimental-codecs")]
 	fn fire_matches_delta_of_delta_when_the_coefficient_stays_at_one() {
 		// FIRE starts at alpha = 1.0, which IS the delta-of-delta predictor. On a perfectly
 		// linear ramp every FIRE residual past the first delta is zero (dod = 0), and the
@@ -1543,6 +1554,7 @@ mod tests {
 	}
 
 	#[test]
+	#[cfg(feature = "experimental-codecs")]
 	fn fire_beats_delta_of_delta_on_a_geometric_velocity_stream() {
 		// FIRE's regime: a stream whose velocity decays geometrically (v[i] ≈ 7/8·v[i-1]), so the
 		// optimal predictor coefficient is a stable *fraction* (~7/8), not 1. Delta-of-delta's
@@ -1567,6 +1579,7 @@ mod tests {
 	}
 
 	#[test]
+	#[cfg(feature = "experimental-codecs")]
 	fn fire_rle_pass_collapses_a_constant_residual_run() {
 		// Constant acceleration (x = i²) makes FIRE (alpha pinned at 1.0, = delta-of-delta)
 		// produce a constant residual run of 2. The run-length pass — the second half of the

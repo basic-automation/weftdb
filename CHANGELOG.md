@@ -150,6 +150,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 - All dependencies updated to their latest major versions, including wgpu 30,
   Arrow/Parquet 60 and OpenTelemetry 0.33.
 - Builds on stable Rust (MSRV 1.95); nightly is no longer required.
+- **Advisory codecs moved behind the `experimental-codecs` feature** (`weft-physical-type`).
+  ⚠️ Breaking for code that calls them: the `floatcodec` module (Gorilla-XOR, Chimp,
+  Chimp128, Elf and `best_f64_*`), `ColumnEncoding::{gorilla_f64_bytes, best_f64_bytes,
+  best_f64_codec}` and the FIRE forecaster (`fire_*`) now need
+  `features = ["experimental-codecs"]`. None of them was ever written to disk, so stored
+  segments are unaffected. The feature is off by default, outside the semver promise, and
+  pending patent review.
 
 ### Fixed
 

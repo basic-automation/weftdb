@@ -16,6 +16,16 @@ categories = ["encoding", "data-structures", "mathematics"]
 name = "weft_physical_type"
 path = "src/lib.rs"
 
+# Off by default, outside the 1.0 semver promise, and pending patent review (ROADMAP.md,
+# Phase 6.1 codec patent/licence gate). Nothing the `.weftseg` writer emits by default
+# depends on a feature here, so a default build reads and writes every frame a default
+# build has ever written.
+[features]
+# Advisory float/timestamp codecs the `.weftseg` writer never emits: the `floatcodec`
+# module (Gorilla-XOR, Chimp, Chimp128, Elf and the `best_f64_*` selector) and the Sprintz
+# FIRE forecaster (`fire_*`).
+experimental-codecs = []
+
 [dependencies]
 bigdecimal = { workspace = true, features = ["serde"] }
 serde = { workspace = true }

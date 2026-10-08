@@ -362,7 +362,9 @@ impl ColumnEncoding {
 	/// slowly-varying series a handful. **Advisory only** (roadmap Phase 6.1): surfaced
 	/// here and benchmarked against the raw `8 * len`, but not yet wired into the
 	/// `.weftseg` writer or a codec selector (that is the adopt-or-drop slice, mirroring
-	/// how the Gorilla-timestamp and FOR codecs were introduced advisory-first).
+	/// how the Gorilla-timestamp and FOR codecs were introduced advisory-first). Behind the
+	/// `experimental-codecs` feature.
+	#[cfg(feature = "experimental-codecs")]
 	#[must_use]
 	pub fn gorilla_f64_bytes(&self) -> Option<usize> {
 		self.f64_values().map(|f| crate::floatcodec::xor_f64_bytes(&f))
@@ -376,7 +378,9 @@ impl ColumnEncoding {
 	/// what a selector would actually pick — never worse than the raw `8 * value_count` an
 	/// `F64` block writes today. This is the figure a future on-disk f64 codec would realize;
 	/// the paired [`best_f64_codec`](Self::best_f64_codec) names which codec wins. **Advisory**
-	/// (roadmap Phase 6.1) — not yet wired into the `.weftseg` writer.
+	/// (roadmap Phase 6.1) — not yet wired into the `.weftseg` writer. Behind the
+	/// `experimental-codecs` feature.
+	#[cfg(feature = "experimental-codecs")]
 	#[must_use]
 	pub fn best_f64_bytes(&self) -> Option<usize> {
 		self.f64_values().map(|f| crate::floatcodec::best_f64_bytes(&f))
@@ -384,7 +388,9 @@ impl ColumnEncoding {
 
 	/// The name of the codec [`best_f64_bytes`](Self::best_f64_bytes) selects for an `F64`
 	/// column — `"chimp128"`, `"chimp"`, `"gorilla"`, or `"raw"` (see
-	/// [`crate::floatcodec::best_f64_codec`]). `None` for any other physical type.
+	/// [`crate::floatcodec::best_f64_codec`]). `None` for any other physical type. Behind the
+	/// `experimental-codecs` feature.
+	#[cfg(feature = "experimental-codecs")]
 	#[must_use]
 	pub fn best_f64_codec(&self) -> Option<&'static str> {
 		self.f64_values().map(|f| crate::floatcodec::best_f64_codec(&f).0)
@@ -934,6 +940,7 @@ mod tests {
 	}
 
 	#[test]
+	#[cfg(feature = "experimental-codecs")]
 	fn gorilla_f64_estimate_beats_raw_on_a_stable_exponent_float_column() {
 		// A stable-exponent f64 series the recommender lands on F64 (a sensor drifting around
 		// a fixed base near 1000): consecutive IEEE patterns share sign/exponent/high mantissa
@@ -953,6 +960,7 @@ mod tests {
 	}
 
 	#[test]
+	#[cfg(feature = "experimental-codecs")]
 	fn best_f64_advisory_selects_a_codec_no_worse_than_raw() {
 		// The best-of advisory over an F64 column never exceeds the raw payload and names the
 		// winning codec.
@@ -976,6 +984,7 @@ mod tests {
 		// column has no f64 stream to XOR.
 		let scaled = encode_column(PhysicalType::ScaledI64 { scale: 2 }, &col(&["1.25", "2.50"])).expect("encodes");
 		assert_eq!(scaled.f64_values(), None);
+		#[cfg(feature = "experimental-codecs")]
 		assert_eq!(scaled.gorilla_f64_bytes(), None);
 	}
 }

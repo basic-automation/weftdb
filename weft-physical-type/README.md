@@ -23,6 +23,16 @@ including bit-packing, delta-of-delta timestamp coding and a transposed value la
 weft-physical-type = "0.1"
 ```
 
+## Features
+
+All features are off by default, are **not** covered by the 1.0 semver promise (their items
+may change or disappear in any release), and are pending patent review. A default build
+reads and writes every frame a default build has ever written.
+
+| Feature | Enables |
+|---------|---------|
+| `experimental-codecs` | Advisory codecs the `.weftseg` writer never emits: Gorilla-XOR, Chimp, Chimp128 and Elf for `f64` columns (plus the `best_f64_*` selector), and the Sprintz FIRE timestamp forecaster. Benchmark what-ifs, not a storage format. |
+
 Part of [WeftDB](https://github.com/basic-automation/weftdb).
 
 ## License

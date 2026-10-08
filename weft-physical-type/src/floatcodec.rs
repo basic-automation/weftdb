@@ -24,7 +24,11 @@
 //! ([`ColumnEncoding::gorilla_f64_bytes`](crate::column::ColumnEncoding::gorilla_f64_bytes));
 //! it is **not** yet wired into the `.weftseg` writer or any codec selector (that is the
 //! adopt-or-drop slice, exactly as the Gorilla-timestamp and FOR codecs were introduced
-//! advisory-first and adopted later). *(src: Gorilla, VLDB'15 —
+//! advisory-first and adopted later).
+//!
+//! **Behind the `experimental-codecs` feature.** No codec here is written to disk, so the
+//! whole module is off by default, outside the 1.0 semver promise, and pending patent review
+//! (ROADMAP.md, Phase 6.1). *(src: Gorilla, VLDB'15 —
 //! <https://www.vldb.org/pvldb/vol8/p1816-teller.pdf> · Chimp, VLDB'22 —
 //! <https://www.vldb.org/pvldb/vol15/p3058-liakos.pdf>)*
 
