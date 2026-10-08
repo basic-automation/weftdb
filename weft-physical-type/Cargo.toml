@@ -52,3 +52,7 @@ harness = false
 [[bench]]
 name = "alp_vs_f64_codecs"
 harness = false
+
+[[bench]]
+name = "timestamp_vs_pco"
+harness = false

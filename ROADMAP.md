@@ -522,8 +522,21 @@ detection within Y% and improving historical query latency by Z."*
       pco's entropy coding of heavy-tailed deltas, which bit-packing at the block's max width cannot
       reach. That is a cold-tier argument (pco's page-serial decode), not a hot-path one, matching
       the scope correction above.
-    - [ ] Residue: the timestamp half (pco `IntMult` vs the shipped delta/blocked/Gorilla timestamp
-      codecs) is not measured yet.
+    - [x] **DONE (2026-10-08) — timestamp half measured** (`benches/timestamp_vs_pco.rs`, 1 Mi each,
+      bits/value, shipped DoD selector vs pco level 8): real **btc_minutes** (rows 3M..) 0.000 vs
+      0.001 (the window is perfectly regular, so both are free); **ms_as_micros** (ms-precise instants
+      stored in µs) **20.000 vs 9.001**; **jittered_micros** 20.000 vs 19.001. pco decode 0.88 /
+      1.63 / 1.28 ms.
+    - [ ] **NEW — factor a timestamp column's common multiple (pco's `IntMult`) before DoD
+      packing.** A µs column holding ms-precise instants costs WeftDB **20 bits/value against pco's
+      9**, because every second difference carries three wasted decimal digits. This is the
+      timestamp twin of the decimal-exponent FOR. Per block (or column), compute the GCD of the
+      deltas, store it once, and pack `dod / gcd`. Expect ~10 bits on that corpus. It stays exact,
+      and the declared `TimeUnit` is unchanged.
+    - [ ] **NEW — first-order delta + FOR as a timestamp candidate beside DoD.** On fully jittered
+      intervals the second difference doubles the variance, costing ~1 bit/value (20 vs pco's 19).
+      Add a "delta-FOR" arm to `best_estimated_bytes`'s race; it wins only on random-interval
+      streams, and that is also exactly where DoD's premise (a near-constant stride) fails.
   - [x] **Scaled-int value bit-pack codec — realized on disk.** The `.weftseg` value block
     now carries a self-describing codec selector (`VAL_CODEC_VARINT`/`VAL_CODEC_BITPACK`);
     a `ScaledI64` column whose mantissas fixed-width bit-pack below the per-value varint
@@ -654,6 +667,15 @@ detection within Y% and improving historical query latency by Z."*
       vs realized `scaled_for` 33.74 b (**2.48× smaller**) vs ALP 15.35 b; decode 2.10 ms vs
       1.78 ms (FOR) / 0.67 ms (ALP). **sensor_2dp 5.64 b vs 5.51 b**: it loses by the header byte
       when nothing factors out, so a selector must pick it only when strictly smallest.
+    - [ ] **Prior art for the decimal-exponent FOR: BtrBlocks' Pseudodecimal Encoding (SIGMOD'23)
+      chooses the exponent PER VALUE, not per block (research 2026-10-08).** It splits a double into
+      two integer columns (signed significant digits and an exponent) plus an exception column,
+      then cascades each into integer schemes such as RLE/FOR/bit-packing. Its selection rule:
+      disable when >50% of values are exceptions, and skip columns with <10% unique values. Before
+      freezing `VAL_CODEC_DFOR`, size a per-value exponent column (RLE'd) against the per-block
+      header byte on `alp_vs_f64_codecs`. On BTC only 1 of 16,384 blocks needed k=0, so per-block
+      should win there, but a column mixing precisions value by value is where per-value would.
+      *(src: https://www.cs.cit.tum.de/fileadmin/w00cfj/dis/papers/btrblocks.pdf)*
     - [ ] **NEXT — realize the decimal-exponent FOR as `VAL_CODEC_DFOR` (owner sign-off: headline
       bytes/point change).** Add it to `best_value_codec`'s strict-smallest race and wire a
       writer/reader selector byte plus the range and gather paths, mirroring `VAL_CODEC_FOR`. Then re-run
@@ -695,6 +717,11 @@ detection within Y% and improving historical query latency by Z."*
       (or per-page) checksum so a point read verifies only the bytes it decodes; this is a format
       bump, but the paged frame already has the page structure. Or adopt a hardware CRC (`crc32fast`,
       a pure codec crate). The per-block checksum is the one that changes the asymptotics.
+      *(research 2026-10-08)* crc32fast's own benchmark puts its 16-bytes-per-iteration baseline,
+      the same shape as WeftDB's new slicing-by-16, at **1,499 MB/s**, against **7,314 MB/s** for the
+      PCLMULQDQ path (~4.9×). The hardware CRC therefore caps the remaining whole-frame cost at about
+      5× less, while a per-block checksum removes it from point reads altogether. Dual MIT/Apache-2.0,
+      so it is admissible if chosen. *(src: https://github.com/srijs/rust-crc32fast)*
   - [ ] **Set the ALP acceptance bar from upstream's own ablation, and be willing to DECLINE.**
     FastLanes' per-encoding ablation (VLDB'25, Table 7, PUBLIC_BI) reports ALP at **+4.36%
     compression ratio for −7.28% decompression speed**, with ALP_RD +0.57%/−2.30% and Patch
@@ -1409,6 +1436,13 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   `Invalid time range: start time must be before end time`. These are **pre-existing** and unrelated
   to the 2026-09-23 increments — they have simply never run in CI because the guard hides them. The
   DDL-under-`BEGIN CONCURRENT` one looks like a genuine control-plane bug rather than a test bug.
+  - [x] **Re-checked 2026-10-08:** `test_api_precise` now **passes**. The DDL-under-`BEGIN CONCURRENT`
+    defect is fixed on main: `set_dictionary_metadata` creates its tables through
+    `Aspect::ensure_dictionary_tables` in an exclusive transaction first. `test_pipeline_api_precise`
+    ran **>29 min without failing**, then hit a 30-min `timeout` (no "Invalid time range" in its
+    output), and `test_pipeline_api_with_fake_db` was never reached. The time-range failures are
+    therefore **unconfirmed either way**. These tests need the bounding below before they can give
+    a verdict.
 - [ ] **Bound the seven slow `weft-orchestration` tests the way `db_tests` was bounded.** Each
   spends ~6–10 minutes; `test_create_btc_1min_database` was made runnable by capping its row count
   and using a temp data dir (`BTC_TEST_MAX_ROWS`, default 5,000). The same treatment here would let
