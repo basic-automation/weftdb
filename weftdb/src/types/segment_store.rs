@@ -33,7 +33,7 @@ use anyhow::{Context, Result};
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use splimes::{Point, Resolution};
-use weft_physical_type::{merge_newer_wins, split_index, AspectSchema, FrameOptions, PagedSegment, Segment, SegmentDescriptor, SplitDecision, SplitPolicy, TimeUnit, PAGED_SEGMENT_FORMAT_VERSION};
+use weft_physical_type::{merge_newer_wins, split_index, AspectSchema, FrameOptions, PagedSegment, PhysicalValue, Segment, SegmentDescriptor, SplitDecision, SplitPolicy, TimeUnit, PAGED_SEGMENT_FORMAT_VERSION};
 use weft_reduce::{Aggregation, Bucket, PartialReduction};
 
 use crate::{AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, PartialSidecar, PartialSidecarPolicy, SegmentIndexStore, SIDECAR_AGGREGATIONS};
@@ -176,6 +176,33 @@ const fn instant_from_epoch(epoch: i64, unit: TimeUnit) -> Option<DateTime<Utc>>
 	}
 }
 
+/// The present in-window rows of a physically-decoded window as `(epoch nanoseconds,
+/// mantissas, scale)`, when every present value is a `ScaledI64` at one shared scale and every
+/// instant fits in epoch nanoseconds. `None` sends the caller to the `BigDecimal` path.
+fn scaled_rows(ts: &[i64], vs: &[Option<PhysicalValue>], start: i64, end: i64, unit: TimeUnit) -> Option<(Vec<i64>, Vec<i64>, u8)> {
+	let per_unit: i64 = match unit {
+		TimeUnit::Seconds => 1_000_000_000,
+		TimeUnit::Millis => 1_000_000,
+		TimeUnit::Micros => 1_000,
+		TimeUnit::Nanos => 1,
+	};
+	let (mut nanos, mut mantissas) = (Vec::with_capacity(ts.len()), Vec::with_capacity(ts.len()));
+	let mut shared_scale: Option<u8> = None;
+	for (&t, v) in ts.iter().zip(vs) {
+		let Some(value) = v else { continue };
+		if t < start || t > end {
+			continue;
+		}
+		let PhysicalValue::ScaledI64 { mantissa, scale } = *value else { return None };
+		if *shared_scale.get_or_insert(scale) != scale {
+			return None;
+		}
+		nanos.push(t.checked_mul(per_unit)?);
+		mantissas.push(mantissa);
+	}
+	Some((nanos, mantissas, shared_scale.unwrap_or(0)))
+}
+
 /// Decode one already-read segment frame's `[start, end]` window and fold it into its
 /// own [`PartialReduction`] — the per-segment half of
 /// [`SegmentStore::downsample_range`], factored out so it can run on the blocking pool.
@@ -185,13 +212,26 @@ const fn instant_from_epoch(epoch: i64, unit: TimeUnit) -> Option<DateTime<Utc>>
 /// Pure and synchronous: it takes the frame bytes and returns the partial, so it holds
 /// no store state and the whole call is `spawn_blocking`-safe.
 fn segment_partial(descriptor: &SegmentDescriptor, bytes: &[u8], start: i64, end: i64, unit: TimeUnit, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Option<PartialReduction>> {
-	let (ts, vs) = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION { weft_physical_type::weftseg::read_paged_segment_range(bytes, start, end).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))? } else { weft_physical_type::weftseg::read_segment_range(bytes, start, end).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))? };
+	// Read the window in its physical encoding, so a ScaledI64 column can be reduced on its
+	// stored mantissas without building a BigDecimal per row.
+	let (ts, vs) = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION { weft_physical_type::weftseg::read_paged_segment_range_physical(bytes, start, end).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))? } else { weft_physical_type::weftseg::read_segment_range_physical(bytes, start, end).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))? };
+	// Integer-native path: every present in-window value is ScaledI64 at one scale and every
+	// requested reduction is a streaming one. `reduce_partial_scaled` then builds the same
+	// mergeable partial `reduce_partial` would, from integer accumulators.
+	if let Some((nanos, mantissas, scale)) = scaled_rows(&ts, &vs, start, end, unit) {
+		if nanos.is_empty() {
+			return Ok(None);
+		}
+		if let Some(partial) = weft_reduce::reduce_partial_scaled(&nanos, &mantissas, u32::from(scale), resolution, None, None, aggregations).map_err(|e| anyhow::anyhow!("reducing segment {}: {e}", descriptor.path))? {
+			return Ok(Some(partial));
+		}
+	}
 	// Null rows carry no value to reduce; present rows lift to absolute instants.
 	let mut points: Vec<Point> = Vec::with_capacity(ts.len());
 	for (t, v) in ts.into_iter().zip(vs) {
 		if let Some(value) = v {
 			if start <= t && t <= end {
-				points.push(Point::new(instant_from_epoch(t, unit).ok_or_else(|| anyhow::anyhow!("segment {} holds epoch {t} outside the representable instant range", descriptor.path))?, value));
+				points.push(Point::new(instant_from_epoch(t, unit).ok_or_else(|| anyhow::anyhow!("segment {} holds epoch {t} outside the representable instant range", descriptor.path))?, value.to_logical()));
 			}
 		}
 	}
@@ -3771,6 +3811,20 @@ mod tests {
 
 	/// The cross-segment downsample must equal reading the whole range and reducing it in
 	/// one pass — for every reduction, across many segments, including the sketch.
+	#[test]
+	fn scaled_rows_takes_one_scale_scaled_columns_and_declines_the_rest() {
+		let scaled = |m: i64, scale: u8| Some(PhysicalValue::ScaledI64 { mantissa: m, scale });
+		// In-window present rows of one scale lift to nanoseconds; nulls and out-of-window rows drop.
+		let ts = [10_i64, 20, 30, 40];
+		let vs = [scaled(125, 2), None, scaled(-5, 2), scaled(7, 2)];
+		assert_eq!(scaled_rows(&ts, &vs, 10, 30, TimeUnit::Seconds), Some((vec![10_000_000_000, 30_000_000_000], vec![125, -5], 2)));
+		assert_eq!(scaled_rows(&ts, &vs, 50, 60, TimeUnit::Millis), Some((Vec::new(), Vec::new(), 0)));
+		// Mixed scales, a non-scaled value, and an instant past the nanosecond range all decline.
+		assert_eq!(scaled_rows(&ts[..2], &[scaled(1, 2), scaled(1, 3)], 0, 100, TimeUnit::Seconds), None);
+		assert_eq!(scaled_rows(&ts[..1], &[Some(PhysicalValue::F64(1.5))], 0, 100, TimeUnit::Seconds), None);
+		assert_eq!(scaled_rows(&[i64::MAX / 10], &[scaled(1, 0)], 0, i64::MAX, TimeUnit::Seconds), None);
+	}
+
 	#[tokio::test]
 	async fn downsample_range_equals_a_single_pass_over_the_whole_range() {
 		use splimes::{Point, Resolution};

@@ -1549,7 +1549,11 @@ pub fn read_paged_segment_points(bytes: &[u8], ts: &[i64]) -> Result<Vec<Option<
 /// the present values inside the window are unpacked via [`read_value_at`] (one block per present
 /// row). Any other shape (irregular timestamps, a per-value/cascade value codec, an out-of-order
 /// segment) fully decodes the section and filters, which is always correct.
-fn read_range_from_section(section: &[u8], stats: &SegmentStats, start: i64, end: i64) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>), WeftSegError> {
+///
+/// Each present value is passed through `map`: `PhysicalValue::to_logical` for the `BigDecimal`
+/// reads, or `PhysicalValue::clone` for the physical reads, so a scaled-integer reduction never
+/// builds a `BigDecimal` per row.
+fn read_range_from_section_with<V>(section: &[u8], stats: &SegmentStats, start: i64, end: i64, map: &dyn Fn(&PhysicalValue) -> V) -> Result<(Vec<i64>, Vec<Option<V>>), WeftSegError> {
 	// Coarse span bail — a window disjoint from the section yields nothing.
 	let (Some(min_ts), Some(max_ts)) = (stats.min_ts, stats.max_ts) else { return Ok((Vec::new(), Vec::new())) };
 	if end < min_ts || start > max_ts {
@@ -1557,7 +1561,7 @@ fn read_range_from_section(section: &[u8], stats: &SegmentStats, start: i64, end
 	}
 	// A full decode of the section then a filter — the always-correct fallback for every shape the
 	// closed-form window below does not cover.
-	let full_filtered = || -> Result<(Vec<i64>, Vec<Option<BigDecimal>>), WeftSegError> {
+	let full_filtered = || -> Result<(Vec<i64>, Vec<Option<V>>), WeftSegError> {
 		let mut fr = ByteReader::new(section);
 		let col = read_value_column(&mut fr)?;
 		let ts_col = read_timestamp_column(&mut fr)?;
@@ -1569,7 +1573,7 @@ fn read_range_from_section(section: &[u8], stats: &SegmentStats, start: i64, end
 			let present = nulls.is_present(row);
 			if start <= t && t <= end {
 				out_times.push(t);
-				out_values.push(if present { col.values.get(dense).cloned().map(|pv| pv.to_logical()) } else { None });
+				out_values.push(if present { col.values.get(dense).map(map) } else { None });
 			}
 			if present {
 				dense += 1;
@@ -1622,7 +1626,7 @@ fn read_range_from_section(section: &[u8], stats: &SegmentStats, start: i64, end
 		let offset = i64::try_from(row).unwrap_or(i64::MAX);
 		timestamps.push(first.wrapping_add(offset.wrapping_mul(step)));
 		if nulls.is_present(row) {
-			values.push(window.get(dense - dense_lo).cloned().map(|pv| pv.to_logical()));
+			values.push(window.get(dense - dense_lo).map(map));
 			dense += 1;
 		} else {
 			values.push(None);
@@ -1636,13 +1640,30 @@ fn read_range_from_section(section: &[u8], stats: &SegmentStats, start: i64, end
 /// Returns the `(timestamp, value)` rows whose timestamp falls in the inclusive `[start, end]`
 /// window, aligned and in row order — exactly `read_segment(bytes)?.decode_nullable()` filtered to
 /// `[start, end]`. A **regular block-coded segment** resolves the window in closed form and unpacks
-/// only its present values (see `read_range_from_section`); any other shape full-decodes + filters.
+/// only its present values (see `read_range_from_section_with`); any other shape full-decodes + filters.
 /// Roadmap Phase 4/6 (the range-read analogue of the streaming point read).
 ///
 /// # Errors
 ///
 /// Propagates the same [`WeftSegError`]s as [`read_segment`].
 pub fn read_segment_range(bytes: &[u8], start: i64, end: i64) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>), WeftSegError> {
+	read_segment_range_with(bytes, start, end, &PhysicalValue::to_logical)
+}
+
+/// [`read_segment_range`] returning each present value in its **physical** encoding (for a
+/// `ScaledI64` column: the stored mantissa and scale) instead of its logical `BigDecimal`.
+///
+/// Same rows, same order, same nulls. This is the input an integer-native reduction
+/// (`weft_reduce::reduce_partial_scaled`) consumes without a `BigDecimal` per row.
+///
+/// # Errors
+///
+/// Propagates the same [`WeftSegError`]s as [`read_segment`].
+pub fn read_segment_range_physical(bytes: &[u8], start: i64, end: i64) -> Result<(Vec<i64>, Vec<Option<PhysicalValue>>), WeftSegError> {
+	read_segment_range_with(bytes, start, end, &PhysicalValue::clone)
+}
+
+fn read_segment_range_with<V>(bytes: &[u8], start: i64, end: i64, map: &dyn Fn(&PhysicalValue) -> V) -> Result<(Vec<i64>, Vec<Option<V>>), WeftSegError> {
 	if bytes.len() < 4 {
 		return Err(WeftSegError::UnexpectedEof { needed: 4, remaining: bytes.len() });
 	}
@@ -1661,14 +1682,14 @@ pub fn read_segment_range(bytes: &[u8], start: i64, end: i64) -> Result<(Vec<i64
 		return Err(WeftSegError::UnsupportedVersion { found: version });
 	}
 	let stats = read_segment_stats(&mut r)?;
-	read_range_from_section(&body[r.pos..], &stats, start, end)
+	read_range_from_section_with(&body[r.pos..], &stats, start, end, map)
 }
 
 /// **Windowed range read** from a **paged** `.weftseg` frame — the rows in `[start, end]`.
 ///
 /// The per-page index is parsed once, so pages whose `[min_ts, max_ts]` is disjoint from the window
 /// are skipped without decoding a column byte (on-disk page skipping, as [`read_paged_segment`]'s
-/// range read); each surviving page is windowed through the shared `read_range_from_section` (a
+/// range read); each surviving page is windowed through the shared `read_range_from_section_with` (a
 /// regular page resolves its sub-window in closed form). Rows are concatenated in page order.
 /// Equal to `read_paged_segment(bytes)?.read_time_range(start, end)`.
 ///
@@ -1676,6 +1697,20 @@ pub fn read_segment_range(bytes: &[u8], start: i64, end: i64) -> Result<(Vec<i64
 ///
 /// Propagates the same [`WeftSegError`]s as [`read_paged_segment`].
 pub fn read_paged_segment_range(bytes: &[u8], start: i64, end: i64) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>), WeftSegError> {
+	read_paged_segment_range_with(bytes, start, end, &PhysicalValue::to_logical)
+}
+
+/// [`read_paged_segment_range`] returning each present value in its **physical** encoding,
+/// as [`read_segment_range_physical`] does for a single-block frame.
+///
+/// # Errors
+///
+/// Propagates the same [`WeftSegError`]s as [`read_paged_segment`].
+pub fn read_paged_segment_range_physical(bytes: &[u8], start: i64, end: i64) -> Result<(Vec<i64>, Vec<Option<PhysicalValue>>), WeftSegError> {
+	read_paged_segment_range_with(bytes, start, end, &PhysicalValue::clone)
+}
+
+fn read_paged_segment_range_with<V>(bytes: &[u8], start: i64, end: i64, map: &dyn Fn(&PhysicalValue) -> V) -> Result<(Vec<i64>, Vec<Option<V>>), WeftSegError> {
 	if bytes.len() < 4 {
 		return Err(WeftSegError::UnexpectedEof { needed: 4, remaining: bytes.len() });
 	}
@@ -1713,7 +1748,7 @@ pub fn read_paged_segment_range(bytes: &[u8], start: i64, end: i64) -> Result<(V
 		let overlaps = matches!((page_stats.min_ts, page_stats.max_ts), (Some(lo), Some(hi)) if end >= lo && start <= hi);
 		if overlaps {
 			let section = body.get(block_start..block_start + block_len).ok_or_else(|| WeftSegError::UnexpectedEof { needed: block_len, remaining: body.len().saturating_sub(block_start) })?;
-			let (pt, pv) = read_range_from_section(section, &page_stats, start, end)?;
+			let (pt, pv) = read_range_from_section_with(section, &page_stats, start, end, map)?;
 			timestamps.extend(pt);
 			values.extend(pv);
 		}
@@ -3556,7 +3591,10 @@ mod tests {
 			for (start, end) in [(lo, hi), (lo + 15, hi - 15), (lo - 100, lo - 1), (hi + 1, hi + 100), (lo + 105, lo + 105), (lo + 106, lo + 107)] {
 				let (rt, rv) = read_segment_range(&bytes, start, end).expect("reads");
 				let expected: (Vec<i64>, Vec<Option<BigDecimal>>) = all_ts.iter().zip(&all_vs).filter(|(t, _)| start <= **t && **t <= end).map(|(&t, v)| (t, v.clone())).unzip();
-				assert_eq!((rt, rv), expected, "codec {} window [{start},{end}]", seg.values.best_value_codec());
+				assert_eq!((rt.clone(), rv.clone()), expected, "codec {} window [{start},{end}]", seg.values.best_value_codec());
+				// The physical read returns the same rows with each value in its stored encoding.
+				let (pt, pv) = read_segment_range_physical(&bytes, start, end).expect("reads");
+				assert_eq!((pt, pv.iter().map(|v| v.as_ref().map(PhysicalValue::to_logical)).collect::<Vec<_>>()), (rt, rv), "physical, codec {} window [{start},{end}]", seg.values.best_value_codec());
 			}
 		}
 
@@ -3567,6 +3605,8 @@ mod tests {
 		let (lo, hi) = (regular_ts[0], regular_ts[299]);
 		for (start, end) in [(lo, hi), (lo + 615, hi - 615), (lo - 100, lo - 1), (hi + 1, hi + 100), (lo + 655, lo + 655), (lo + 656, lo + 657)] {
 			let (rt, rv) = read_paged_segment_range(&paged_bytes, start, end).expect("reads");
+			let (pt, pv) = read_paged_segment_range_physical(&paged_bytes, start, end).expect("reads");
+			assert_eq!((pt, pv.iter().map(|v| v.as_ref().map(PhysicalValue::to_logical)).collect::<Vec<_>>()), (rt.clone(), rv.clone()), "paged physical window [{start},{end}]");
 			assert_eq!((rt, rv), paged.read_time_range(start, end), "paged window [{start},{end}]");
 		}
 	}

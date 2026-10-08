@@ -319,7 +319,9 @@ accumulators, and computes each bucket's `avg` by integer long division that rep
 `bigdecimal`'s quotient digit for digit. In one run (load avg ~50) an hourly `avg` took
 **28.45 ms** against **122.75 ms** for the shipped path and **2.77 ms** for `f64`: about a
 **10×** exact-decimal tax instead of ~44×. In an earlier run an hourly `sum` took 8.46 ms against
-58.65 ms. It is not yet wired into the server's downsample path.
+58.65 ms. The server's stored-range downsample (`GET /api/v1/storage/{aspect}/downsample`) now
+uses it for `ScaledI64` segments when every requested reduction is a streaming one, and falls
+back otherwise.
 
 ---
 

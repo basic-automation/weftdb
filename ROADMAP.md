@@ -1334,10 +1334,15 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
     representation** (`int_val`, `scale`) to `bigdecimal`'s own `/` over 20,000+ random and edge cases.
     Hourly `avg` on real BTC: shipped **122.75 ms → `reduce_scaled` 28.45 ms (4.3×)**, f64 2.77 ms,
     so the decimal tax on this path went from ~44× to ~10× (one run, load avg ~50).
-  - [ ] **NEXT — wire `reduce_scaled` into the read path:** `SegmentStore::downsample_range` and the
-    `.weftpart` sidecar build should call it with the segment's decoded mantissas when the column
-    is `ScaledI64` and every requested reduction is streaming, and fall back to `reduce` otherwise.
-    Then re-run `--ds-csv` and `decimal_tax` and publish the factor beside QuestDB's ~2×.
+  - [x] **DONE (2026-10-08) — wired into `SegmentStore::downsample_range`:** `segment_partial` reads
+    the window physically (`read_segment_range_physical`) and uses `reduce_partial_scaled` for
+    one-scale ScaledI64 rows, falling back otherwise. Runtime-verified on the real server: 100k BTC
+    closes, hourly min/max/avg/sum/first/last, all 1,667 buckets match an independent Python
+    `Decimal` recomputation.
+  - [ ] **NEXT — the sidecar build and an end-to-end number.** The `.weftpart` sidecar build at seal
+    time still calls `reduce_partial` on BigDecimal points; switch it the same way. Then add a
+    server-level downsample timing (real corpus, many segments) and publish the end-to-end factor
+    beside QuestDB's ~2×. `decimal_tax` covers the reduction only.
   - [ ] *(original item)* **a `ScaledI64`-native reduction fast path in `weft-reduce`:** reduce
     `(epoch, mantissa, scale)` columns straight from the segment for count/sum/avg/min/max/first/last
     (i128 accumulators), materializing a BigDecimal only per output bucket. It stays exact (the
