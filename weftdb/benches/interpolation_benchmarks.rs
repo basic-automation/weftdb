@@ -1,14 +1,16 @@
-use std::{hint::black_box, path::Path, str::FromStr};
+use std::{hint::black_box, str::FromStr};
 
 use ::weftdb::{
 	database::traits::{AspectStructure, DatabaseStructure, Inputs, Outputs}, Database, DatasetId, InputMeasurement
 };
 use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, Criterion};
 use splimes::{Resolution, Spline};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
+
+mod common;
 
 fn benchmark_interpolation_sizes(c: &mut Criterion) {
 	let rt = Runtime::new().unwrap();
@@ -27,15 +29,9 @@ fn benchmark_interpolation_sizes(c: &mut Criterion) {
 				rt.block_on(async {
 					// Generate unique name for each iteration
 					let db_name = format!("bench_interp_{}_{}", size, Uuid::new_v4());
-					let db_path = format!("{}/{}", ::weftdb::data_dir(), db_name);
 
 					// Clean up if exists
-					if Path::new(&db_path).exists() {
-						if let Err(e) = std::fs::remove_dir_all(&db_path) {
-							eprintln!("Warning: Failed to remove directory {db_path}: {e}");
-						}
-						tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-					}
+					common::remove_database(&db_name);
 
 					// Create database
 					let db = Database::new(&db_name).await.unwrap();
@@ -60,9 +56,7 @@ fn benchmark_interpolation_sizes(c: &mut Criterion) {
 					// Cleanup
 					db.close().await.unwrap();
 					tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-					if let Err(e) = std::fs::remove_dir_all(&db_path) {
-						eprintln!("Warning: Failed to remove directory after iteration {db_path}: {e}");
-					}
+					common::discard_database(&db_name).await;
 
 					black_box(result)
 				})
@@ -122,8 +116,7 @@ fn benchmark_interpolation_resolutions(c: &mut Criterion) {
 	rt.block_on(async {
 		db.close().await.unwrap();
 		tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-		let db_path = format!("{}/{}", ::weftdb::data_dir(), db_name);
-		std::fs::remove_dir_all(&db_path).ok();
+		common::discard_database(&db_name).await;
 	});
 }
 
@@ -134,8 +127,7 @@ fn benchmark_spline_types(c: &mut Criterion) {
 	let db_name = "bench_spline_shared";
 	let (db, aspect_id) = rt.block_on(async {
 		// Clean up any existing test data
-		let db_path = format!("{}/{}", ::weftdb::data_dir(), db_name);
-		std::fs::remove_dir_all(&db_path).ok();
+		common::remove_database(db_name);
 		tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
 		let db = Database::new(db_name).await.unwrap();
@@ -181,10 +173,12 @@ fn benchmark_spline_types(c: &mut Criterion) {
 	// Cleanup after all benchmarks
 	rt.block_on(async {
 		db.close().await.unwrap();
-		let db_path = format!("{}/{}", ::weftdb::data_dir(), db_name);
-		std::fs::remove_dir_all(&db_path).ok();
+		common::discard_database(db_name).await;
 	});
 }
 
 criterion_group!(benches, benchmark_interpolation_sizes, benchmark_interpolation_resolutions, benchmark_spline_types);
-criterion_main!(benches);
+
+fn main() {
+	common::criterion_main(&[benches]);
+}
