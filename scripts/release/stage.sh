@@ -18,6 +18,9 @@
 # Runs on Linux, macOS and Windows (Git Bash). The checksum files use the
 # "<sha256>  <file name>" format that `sha256sum -c` and `shasum -a 256 -c` read.
 set -euo pipefail
+# Byte-wise regexes: in a locale like en_US.UTF-8, bash's [0-9] also matches other
+# scripts' digits (v１.2.3 passes), so every pattern below is matched in the C locale.
+export LC_ALL=C
 
 TARGET_RE='^[a-z0-9_]+(-[a-z0-9_]+){2,3}$'
 TAG_RE='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.(0|[1-9][0-9]*))?$'

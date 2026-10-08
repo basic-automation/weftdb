@@ -68,6 +68,7 @@ jobs:
       - name: Validate the tag
         env:
           TAG: ${{ inputs.tag }}
+          LC_ALL: C # byte-wise [0-9]: no other scripts' digits
         run: |
           re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.(0|[1-9][0-9]*))?$'
           if [[ ! $TAG =~ $re ]]; then

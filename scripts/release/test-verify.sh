@@ -150,6 +150,14 @@ ci_run "$stray" success 2026-10-08T10:00:00Z
 git checkout --quiet main
 git branch --quiet -D release-1.2 side
 
+# A branch, not a tag, named like a release, at a commit whose version matches it.
+git checkout --quiet -b v9.8.7 "$good"
+branch_named_v=$(commit_version 9.8.7 9.8.7)
+ci_run "$branch_named_v" success 2026-10-08T10:00:00Z
+git update-ref refs/remotes/origin/v9.8.7 HEAD
+git checkout --quiet main
+git branch --quiet -D v9.8.7
+
 failures=0
 out=$tmp/out
 
@@ -221,6 +229,19 @@ if [[ -e $pwned ]]; then
 	echo "FAIL  a metacharacter tag ran a command"
 	failures=$((failures + 1))
 fi
+
+for odd in " v1.2.3" "v1.2.3 " $'v1.2.3\t' $'\tv1.2.3' "V1.2.3" "v1.2.3-RC.1" "v1.2.3-rc.01" "v1.2.3-rc." \
+	"v 1.2.3" "refs/tags/v1.2.3" ""; do
+	expect fail:"tag must be" "a tag shaped almost right: $(printf '%q' "$odd")" tag "$odd"
+done
+# Other scripts' digits. Run under a UTF-8 locale, where bash's [0-9] matches them unless
+# verify.sh matches in the C locale.
+utf8=$(locale -a 2>/dev/null | grep -ixE 'en_US\.utf-?8' | head -n 1 || true)
+for odd in "v１.2.3" "v1.2.٣" "v1.2.³" "v1.2.½"; do
+	LC_ALL=${utf8:-C.UTF-8} expect fail:"tag must be" \
+		"a tag with a non-ASCII digit under ${utf8:-C.UTF-8}: $odd" tag "$odd"
+done
+expect fail:"does not exist" "a branch named like a release, with no such tag" tag v9.8.7
 
 echo "dry run (ref mode)"
 expect ok "main" ref main

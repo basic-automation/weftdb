@@ -98,6 +98,11 @@ for bad in 'v1.2.3;id' v1.2.3-beta.1 v01.2.3 v1.2.3-dryrun-abc v1.2.3-dryrun-012
 		"$stage" archive x86_64-unknown-linux-gnu "$bad" "$linux_bin" "$src" "$tmp/other"
 done
 
+utf8=$(locale -a 2>/dev/null | grep -ixE 'en_US\.utf-?8' | head -n 1 || true)
+LC_ALL=${utf8:-C.UTF-8} refuses reason:"not a release tag or a dry-run label" \
+	"archive with a non-ASCII digit under ${utf8:-C.UTF-8}" \
+	"$stage" archive x86_64-unknown-linux-gnu "v１.2.3" "$linux_bin" "$src" "$tmp/other"
+
 # A dry run's archives carry its commit, and -dev for a dev-profile build.
 for label in v1.2.3-dryrun-0123456789ab v1.2.3-dryrun-0123456789ab-dev v0.2.0-alpha.1-dryrun-0123456789ab; do
 	check "archive with the dry-run label $label" \

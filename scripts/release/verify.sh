@@ -32,6 +32,9 @@
 #   NOTES_OUT          a release writes its CHANGELOG section here (optional)
 #   GITHUB_OUTPUT      receives the outputs above (optional)
 set -euo pipefail
+# Byte-wise regexes: in a locale like en_US.UTF-8, bash's [0-9] also matches other
+# scripts' digits (v１.2.3 passes), so every pattern below is matched in the C locale.
+export LC_ALL=C
 
 TAG_RE='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.(0|[1-9][0-9]*))?$'
 # Branch and tag names as this repository uses them, or an abbreviated or full commit id.
