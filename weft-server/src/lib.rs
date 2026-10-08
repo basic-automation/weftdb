@@ -41,6 +41,7 @@ pub mod metrics;
 pub mod reconcile_daemon;
 pub mod state;
 pub mod storage;
+pub mod store_open;
 #[cfg(test)]
 mod test_fs;
 pub mod trace;

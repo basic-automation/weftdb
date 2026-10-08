@@ -39,6 +39,13 @@
 //!
 //! WeftDB never fsyncs the file itself: Turso's lock is a process-associated `fcntl`
 //! lock, which closing any other descriptor on the file would release.
+//!
+//! **Apple targets** (release plan C-6). Turso's pager syncs with plain `fsync` on Apple
+//! unless a connection sets `PRAGMA fullfsync=ON`, and the MVCC COMMIT syncs its log with
+//! the pager's sync type, so without it a COMMIT there is not durable against power loss
+//! (`fsync` on macOS does not flush the drive's cache). The setting is per connection and
+//! every control-plane call opens a fresh one, so every connection is made through
+//! [`connect`], which sets it, and the open's probe reads it back next to `synchronous`.
 
 use anyhow::{bail, Context, Result};
 use turso::Value;
@@ -50,6 +57,27 @@ const MVCC: &str = "mvcc";
 
 /// What `PRAGMA synchronous` reports for FULL (`turso_core` `SyncMode::Full`).
 const SYNCHRONOUS_FULL: i64 = 2;
+
+/// Open a connection to the control-plane database `db` the way every control-plane
+/// connection must be opened: on Apple targets with `PRAGMA fullfsync=ON`, so its
+/// COMMITs reach the platter (see the module documentation). Elsewhere it is
+/// `db.connect()`.
+///
+/// # Errors
+///
+/// Connecting, or (on Apple targets) setting the pragma.
+#[cfg_attr(not(target_vendor = "apple"), allow(clippy::unused_async, reason = "only Apple targets set a pragma on the new connection"))]
+pub async fn connect(db: &turso::Database) -> turso::Result<turso::Connection> {
+	let conn = db.connect()?;
+	#[cfg(target_vendor = "apple")]
+	{
+		// A query, drained, rather than `execute`, which fails on a pragma that answers
+		// with a row.
+		let mut rows = conn.query("PRAGMA fullfsync=ON", ()).await?;
+		while rows.next().await?.is_some() {}
+	}
+	Ok(conn)
+}
 
 /// Switch the database behind `conn` to MVCC, prove that it is in MVCC and that a fresh
 /// connection to `db`, like the ones every write opens, syncs FULL, then make the MVCC
@@ -69,11 +97,16 @@ pub async fn enable_mvcc_full(db: &turso::Database, conn: &turso::Connection, na
 	let switched = pragma(conn, "PRAGMA journal_mode=experimental_mvcc").await;
 	let mode = pragma(conn, "PRAGMA journal_mode").await.with_context(|| format!("{name}: reading PRAGMA journal_mode"))?;
 	require_mvcc(name, &mode, switched.err())?;
-	let fresh = db.connect().with_context(|| format!("{name}: connecting to read PRAGMA synchronous"))?;
+	let fresh = connect(db).await.with_context(|| format!("{name}: connecting to read PRAGMA synchronous"))?;
 	#[cfg(test)]
 	downgrade_for_test(&fresh, name).await?;
 	let synchronous = pragma(&fresh, "PRAGMA synchronous").await.with_context(|| format!("{name}: reading PRAGMA synchronous"))?;
 	require_full_sync(name, &synchronous)?;
+	#[cfg(target_vendor = "apple")]
+	{
+		let fullfsync = pragma(&fresh, "PRAGMA fullfsync").await.with_context(|| format!("{name}: reading PRAGMA fullfsync"))?;
+		require_fullfsync(name, &fullfsync)?;
+	}
 	// On the connection just proven FULL, so that the checkpoint does fsync.
 	sync_header(&fresh).await.with_context(|| format!("{name}: syncing the MVCC header (a commit, then a TRUNCATE checkpoint)"))
 }
@@ -142,6 +175,16 @@ fn require_full_sync(name: &str, synchronous: &Value) -> Result<()> {
 		return Ok(());
 	}
 	bail!("a new connection to {name} reports PRAGMA synchronous={}, not FULL ({SYNCHRONOUS_FULL}). Without FULL a COMMIT can return before its log reaches the disk, so WeftDB will not open this database", show(synchronous))
+}
+
+/// Fail unless a `PRAGMA fullfsync` answer is on. Only Apple targets ask (elsewhere
+/// Turso has no such pragma and `fsync` is the strongest sync there is).
+#[cfg(any(test, target_vendor = "apple"))]
+fn require_fullfsync(name: &str, fullfsync: &Value) -> Result<()> {
+	if matches!(fullfsync, Value::Integer(1)) {
+		return Ok(());
+	}
+	bail!("a new connection to {name} reports PRAGMA fullfsync={}, not 1. On this platform plain fsync does not flush the drive's cache, so a COMMIT would not survive power loss, and WeftDB will not open this database", show(fullfsync))
 }
 
 /// A pragma value as SQL would print it.
@@ -303,6 +346,29 @@ mod tests {
 		let err = require_mvcc("x.db", &Value::Text("wal".into()), Some(anyhow::anyhow!("database is readonly"))).unwrap_err().to_string();
 		assert!(err.contains("not MVCC (switching to MVCC failed: database is readonly)"), "the switch's own error explains the mode: {err}");
 		assert!(require_mvcc("x.db", &Value::Null, None).is_err());
+	}
+
+	/// Release plan C-6: on Apple targets a fresh connection must report fullfsync on,
+	/// beside the synchronous probe. The decision is tested on every platform; the probe
+	/// itself runs only where Turso has the pragma.
+	#[test]
+	fn only_fullfsync_on_passes_the_apple_check() {
+		require_fullfsync("x.db", &Value::Integer(1)).unwrap();
+		for (value, shown) in [(Value::Integer(0), "0"), (Value::Null, "Null"), (Value::Text("1".into()), "1")] {
+			let err = require_fullfsync("x.db", &value).unwrap_err().to_string();
+			assert!(err.starts_with(&format!("a new connection to x.db reports PRAGMA fullfsync={shown}, not 1.")), "{err}");
+		}
+	}
+
+	/// Every control-plane connection goes through [`connect`]; off Apple targets it is a
+	/// plain connection that works like `db.connect()`.
+	#[tokio::test]
+	async fn connect_opens_a_working_connection() {
+		let db = turso::Builder::new_local(":memory:").build().await.unwrap();
+		let conn = connect(&db).await.unwrap();
+		assert_eq!(pragma(&conn, "SELECT 41 + 1").await.unwrap(), Value::Integer(42));
+		#[cfg(target_vendor = "apple")]
+		assert_eq!(pragma(&conn, "PRAGMA fullfsync").await.unwrap(), Value::Integer(1));
 	}
 
 	#[test]

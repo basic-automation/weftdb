@@ -48,7 +48,7 @@
 
 use std::{
 	collections::HashMap, ffi::OsStr, future::Future, path::{Component, Path, PathBuf}, sync::{
-		atomic::{AtomicBool, AtomicU64, Ordering}, OnceLock
+		atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering}, Arc, OnceLock, PoisonError, RwLock
 	}, time::Duration
 };
 
@@ -62,9 +62,9 @@ use weft_reduce::{Aggregation, Bucket, PartialReduction};
 use crate::{
 	aspect_name, types::{
 		aspect_locks::{AspectLocks, AspectState, CommitGuard, MaintGuard}, durable::{
-			create_dir_all_durable, fault::{self, FaultPoint}, LockHolder, RealFs, RootLock, RootLockError, StoreFs, SyncPolicy, WritePoints
-		}, index_txn::{IndexOp, IndexRow, IndexTxn, IndexTxnError, TxnApplied, TxnErrorKind}
-	}, AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, PartialSidecar, PartialSidecarPolicy, SegmentIndexStore, SnapshotReport, SIDECAR_AGGREGATIONS
+			create_dir_all_durable, fault::{self, FaultPoint}, poison_global, LockHolder, RealFs, RootLock, RootLockError, StoreFs, SyncPolicy, WritePoints
+		}, index_txn::{IndexOp, IndexRow, IndexTxn, IndexTxnError, TxnApplied, TxnErrorKind}, migrations, store_format::{self, StoreFormat, StoreScope}
+	}, AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, PartialSidecar, PartialSidecarPolicy, SegmentIndexStore, SnapshotReport, StoreError, CONTROL_PLANE_FILES, SIDECAR_AGGREGATIONS, SUPPORTED_LAYOUT
 };
 
 /// The `(database, subject)` namespace a [`SegmentStore`] opened with the plain
@@ -280,7 +280,7 @@ impl std::fmt::Display for StoreLocked {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		let root = self.root.display();
 		match &self.holder {
-			Some(holder) => write!(f, "segment store root {root} is in use by pid {} (session {}): a root can be open in only one process, and only once in it; stop that process, or close its store, and retry", holder.pid, holder.session),
+			Some(holder) => write!(f, "segment store root {root} is in use by {holder}: a root can be open in only one process, and only once in it; stop that process, or close its store, and retry"),
 			None => write!(f, "segment store root {root} is in use by another process (its pid could not be read from {}): a root can be open in only one process, and only once in it", self.root.join(crate::types::durable::lock::HOLDER_FILE).display()),
 		}
 	}
@@ -288,17 +288,100 @@ impl std::fmt::Display for StoreLocked {
 
 impl std::error::Error for StoreLocked {}
 
-/// The environment variable that chooses what a store does after an ambiguous COMMIT.
+/// The environment variable with which `weft-server` chooses what happens after an
+/// ambiguous COMMIT.
 ///
-/// Unset or `poison` write-poisons the store (design section 5.1). `exit` logs and exits
-/// the process with [`AMBIGUOUS_COMMIT_EXIT_CODE`], for deployments whose supervisor
-/// restarts the server; the restart's recovery then settles the commit. Read once, when
-/// the store opens.
+/// Unset or `poison` leaves the store write-poisoned (design section 5.1) and serving
+/// reads. `exit` makes the server log and exit with [`AMBIGUOUS_COMMIT_EXIT_CODE`] once
+/// the store is poisoned, for deployments whose supervisor restarts it; the restart's
+/// recovery then settles the commit. The library never reads it and never exits the
+/// process (release plan C-1): a store only poisons itself, and an embedder that wants to
+/// exit waits for that with [`SegmentStore::wait_until_poisoned`].
 pub const AMBIGUOUS_COMMIT_ENV: &str = "WEFT_ON_AMBIGUOUS_COMMIT";
 
-/// The status a process exits with after an ambiguous COMMIT under
+/// The status `weft-server` exits with once its store is poisoned under
 /// `WEFT_ON_AMBIGUOUS_COMMIT=exit`: 70, `EX_SOFTWARE` in sysexits.h.
 pub const AMBIGUOUS_COMMIT_EXIT_CODE: i32 = 70;
+
+/// How a [`SegmentStore`] is configured: everything a deployment tunes, passed in rather
+/// than read from the environment (release plan C-1).
+///
+/// The library reads no `WEFT_*` variable on its own: [`SegmentStore::open`] and
+/// [`open_scoped`](SegmentStore::open_scoped) use [`default`](Self::default), which
+/// writes byte-for-byte the frames WeftDB has always written. An embedder that wants the
+/// environment's settings asks for them explicitly with [`from_env`](Self::from_env)
+/// (what `weft-server` does) and opens with
+/// [`open_with_options`](SegmentStore::open_with_options).
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub struct SegmentStoreOptions {
+	/// Whether new seals carry a timestamp checkpoint index.
+	pub checkpoints: CheckpointPolicy,
+	/// Whether new seals materialize per-segment partial-reduction sidecars.
+	pub partials: PartialSidecarPolicy,
+	/// Whether new seals write the bit-sliced value codec.
+	pub transposed: TransposedPolicy,
+}
+
+impl Default for SegmentStoreOptions {
+	fn default() -> Self {
+		Self { checkpoints: CheckpointPolicy::DISABLED, partials: PartialSidecarPolicy::DISABLED, transposed: TransposedPolicy::DISABLED }
+	}
+}
+
+impl SegmentStoreOptions {
+	/// The options the environment describes: [`CheckpointPolicy::from_env`],
+	/// [`PartialSidecarPolicy::from_env`] and [`TransposedPolicy::from_env`], each as
+	/// lenient as it documents. Explicit: nothing in the library calls it.
+	#[must_use]
+	pub fn from_env() -> Self {
+		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env() }
+	}
+
+	/// These options with `policy` for checkpoints.
+	#[must_use]
+	pub const fn with_checkpoints(mut self, policy: CheckpointPolicy) -> Self {
+		self.checkpoints = policy;
+		self
+	}
+
+	/// These options with `policy` for partial sidecars.
+	#[must_use]
+	pub const fn with_partials(mut self, policy: PartialSidecarPolicy) -> Self {
+		self.partials = policy;
+		self
+	}
+
+	/// These options with `policy` for the bit-sliced value codec.
+	#[must_use]
+	pub const fn with_transposed(mut self, policy: TransposedPolicy) -> Self {
+		self.transposed = policy;
+		self
+	}
+}
+
+/// What a [`SegmentStore`]'s open found and did (release plan C-5).
+///
+/// For the embedder to report: whether it created the store, whether and from which
+/// layout it migrated it, and whether recovery must stay report-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OpenReport {
+	/// This open created the store: no control-plane database existed, or the marker
+	/// was still the one a new store starts with (an open creating the store stopped
+	/// before it finished, and this one finished it).
+	pub created_new: bool,
+	/// The layout an existing store was in before this open, when this open moved it to
+	/// a newer one (1 for a store a pre-marker WeftDB wrote).
+	pub migrated_from: Option<u32>,
+	/// The migrations this open applied, in order.
+	pub applied: Vec<String>,
+	/// The store's layout is newer than this build's ([`SUPPORTED_LAYOUT`]) but its write
+	/// floor lets this build write it. The open ran no migrations, and recovery (S12) may
+	/// only report what it finds: it must not quarantine, adopt or purge anything a newer
+	/// WeftDB might understand.
+	pub recovery_report_only: bool,
+}
 
 /// A write to a [`SegmentStore`] that is write-poisoned.
 ///
@@ -397,43 +480,21 @@ impl MaintenanceWait {
 	}
 }
 
-/// What a store does once a COMMIT is ambiguous; see [`AMBIGUOUS_COMMIT_ENV`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OnAmbiguousCommit {
-	/// Write-poison the store and keep serving reads.
-	Poison,
-	/// Log and exit the process with [`AMBIGUOUS_COMMIT_EXIT_CODE`].
-	Exit,
-}
-
-impl OnAmbiguousCommit {
-	/// Read the choice from [`AMBIGUOUS_COMMIT_ENV`].
-	fn from_env() -> Self {
-		Self::parse(std::env::var(AMBIGUOUS_COMMIT_ENV).ok().as_deref())
-	}
-
-	/// The choice `value` names. An unknown value poisons, the safe default that keeps
-	/// reads up, and says so.
-	fn parse(value: Option<&str>) -> Self {
-		match value.map(str::trim) {
-			Some(exit) if exit.eq_ignore_ascii_case("exit") => Self::Exit,
-			None | Some("") => Self::Poison,
-			Some(poison) if poison.eq_ignore_ascii_case("poison") => Self::Poison,
-			Some(other) => {
-				tracing::warn!(value = other, "{AMBIGUOUS_COMMIT_ENV} is neither `poison` nor `exit`; an ambiguous COMMIT will write-poison the store");
-				Self::Poison
-			}
-		}
-	}
-}
-
 /// A store's write poison: set once, by the first ambiguous COMMIT, and never cleared.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct StorePoison {
 	/// Checked on every write, so it is the one thing a write reads.
 	poisoned: AtomicBool,
 	/// Why, from the first poisoning; later ones keep it.
 	reason: OnceLock<String>,
+	/// Tells watchers once the store is poisoned.
+	tx: tokio::sync::watch::Sender<Option<Poisoned>>,
+}
+
+impl Default for StorePoison {
+	fn default() -> Self {
+		Self { poisoned: AtomicBool::new(false), reason: OnceLock::new(), tx: tokio::sync::watch::Sender::new(None) }
+	}
 }
 
 impl StorePoison {
@@ -441,6 +502,9 @@ impl StorePoison {
 	fn set(&self, reason: String) -> bool {
 		let first = self.reason.set(reason).is_ok();
 		self.poisoned.store(true, Ordering::Release);
+		if first {
+			self.tx.send_replace(self.get());
+		}
 		first
 	}
 
@@ -454,26 +518,31 @@ impl StorePoison {
 /// `path` keeps being written root-joined, and readers resolve it against the current
 /// root).
 ///
-/// A path under `root` is used as it is. Any other path was written under a root that
-/// has since moved: the store was relocated, restored into another root, or is mounted
-/// somewhere else. The frame then lives at the same place below the current root's
-/// `segments/`: `root/segments/` joined with the components after the last component
-/// named `segments` (the last, so that a root which itself sits under a `segments`
-/// directory resolves correctly). A path with no `segments` component, or one whose
-/// tail is not plain names (a `..`, say), is used as it is: there is nothing safe to
-/// resolve it to, and opening it fails or succeeds just as it did before resolution.
-fn resolve_frame_path(root: &Path, stored: &str) -> PathBuf {
-	let stored = Path::new(stored);
-	if stored.starts_with(root) {
-		return stored.to_path_buf();
+/// The frame lives at the same place below the current root's `segments/` as below the
+/// root it was written under: `root/segments/` joined with the components after the last
+/// component named `segments` (the last, so that a root which itself sits under a
+/// `segments` directory resolves correctly). The stored path is split on both `/` and `\`
+/// (release plan, D-S6), so a store written on Windows (`C:\…\segments\x-1.weftseg`)
+/// reads on Unix and the other way round. So a root that was moved, restored into another
+/// root, or mounted somewhere else still reads its own frames, and one that was not reads
+/// them where they always were.
+///
+/// # Errors
+///
+/// A path with no `segments` component, or whose tail is not plain names (a `..` that
+/// would lead out of `segments/`, a drive or root prefix): there is nothing safe to
+/// resolve it to, and the read is refused rather than made outside the store. A layout-1
+/// store recording such a path is refused at its migration to layout 2
+/// ([`StoreError::UnsafeLegacyPath`]); nothing is ever quarantined for it.
+fn resolve_frame_path(root: &Path, stored: &str) -> Result<PathBuf> {
+	let parts: Vec<&str> = stored.split(['/', '\\']).filter(|part| !part.is_empty() && *part != ".").collect();
+	let Some(last_segments) = parts.iter().rposition(|part| *part == "segments") else { bail!("refusing to read frame {stored:?}: its path has no segments/ component to resolve under {}", root.display()) };
+	let tail = &parts[last_segments + 1..];
+	let plain = |part: &&str| *part != ".." && matches!(Path::new(part).components().collect::<Vec<_>>().as_slice(), [Component::Normal(_)]);
+	if tail.is_empty() || !tail.iter().all(plain) {
+		bail!("refusing to read frame {stored:?}: its path leads out of segments/");
 	}
-	let components: Vec<Component<'_>> = stored.components().collect();
-	let Some(last_segments) = components.iter().rposition(|component| component.as_os_str() == "segments") else { return stored.to_path_buf() };
-	let tail = &components[last_segments + 1..];
-	if tail.is_empty() || !tail.iter().all(|component| matches!(component, Component::Normal(_))) {
-		return stored.to_path_buf();
-	}
-	tail.iter().fold(root.join("segments"), |path, component| path.join(component))
+	Ok(tail.iter().fold(root.join("segments"), |path, part| path.join(part)))
 }
 
 /// The [`IndexOp::SeqBump`] that persists the allocator `commit` holds for `aspect`: past
@@ -561,11 +630,23 @@ pub struct SegmentStore {
 	/// is scoped to one subject, so its flat aspect keys (which name the `.weftseg`
 	/// files and index rows) are unique within it.
 	subject: String,
-	/// Set by an ambiguous `segment_index.db` COMMIT; every write checks it and refuses
-	/// while it is set (see [`Poisoned`]).
+	/// Set by an ambiguous `segment_index.db` COMMIT; every write checks it, and the
+	/// process-wide poison, and refuses while either is set (see [`Poisoned`]).
 	poison: StorePoison,
-	/// Whether an ambiguous COMMIT poisons the store or exits the process.
-	on_ambiguous: OnAmbiguousCommit,
+	/// The filesystem every durable store write goes through: the `STORE_FORMAT` marker
+	/// and the directory fsyncs.
+	fs: Arc<dyn StoreFs>,
+	/// The root's `STORE_FORMAT` marker, as this store last wrote or read it.
+	format: RwLock<StoreFormat>,
+	/// Serialises the marker writes of [`ensure_floor`](Self::ensure_floor).
+	marker_writer: tokio::sync::Mutex<()>,
+	/// The highest floor [`ensure_floor`](Self::ensure_floor) has made sure of: both
+	/// floors of the marker are at least this.
+	floor_ensured: AtomicU32,
+	/// The store's identity, from its marker (and `store_meta`).
+	store_uuid: String,
+	/// What the open found and did.
+	report: OpenReport,
 	/// Each aspect's commit lock (around every control-plane transaction of the aspect,
 	/// guarding its id allocator) and maintenance lock (around a whole maintenance
 	/// operation); see `aspect_locks`.
@@ -627,9 +708,11 @@ async fn lock_root(root: &Path) -> Result<RootLock> {
 /// before the kernel writes the directories back on its own.
 ///
 /// A root this open did not create may sit in a parent the server cannot read (a
-/// service account's store under a `0711` directory, say). Opening that parent for the
-/// fsync then fails with `PermissionDenied`, which is logged and skipped rather than
-/// refusing a store that opened before S3.
+/// service account's store under a `0711` directory, say), or on a filesystem that will
+/// not fsync it: a read-only mount (`EROFS`), or a FUSE or Docker Desktop bind mount that
+/// rejects a directory fsync (`EINVAL`, `ENOTSUP`) (release plan C-3). Syncing that parent
+/// then fails, which is logged and skipped rather than refusing a store that opened
+/// before S3. Any other directory, and the parent of a root this open created, must sync.
 ///
 /// Once is enough: Turso truncates an MVCC `-log` in place on checkpoint instead of
 /// recreating it (`turso_core` `logical_log.rs`), so an entry fsynced here stays durable.
@@ -639,13 +722,21 @@ async fn sync_layout(fs: &dyn StoreFs, root: &Path, segments_dir: &Path, created
 	for dir in layout_dirs(root, segments_dir, created) {
 		match fs.sync_dir(&dir).await {
 			Ok(()) => {}
-			Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && !created_root && root_parent.as_ref() == Some(&dir) => {
-				tracing::warn!(dir = %dir.display(), root = %root.display(), error = %e, "cannot open the store root's parent to fsync it; the root predates this open, so its directory entry is left to the filesystem");
+			Err(e) if parent_sync_is_optional(&e) && !created_root && root_parent.as_ref() == Some(&dir) => {
+				tracing::warn!(dir = %dir.display(), root = %root.display(), error = %e, "cannot fsync the store root's parent; the root predates this open, so its directory entry is left to the filesystem");
 			}
 			Err(e) => return Err(e).with_context(|| format!("fsyncing directory {}", dir.display())),
 		}
 	}
 	Ok(())
+}
+
+/// Whether an error fsyncing the parent of a root that predates the open may be skipped:
+/// the parent cannot be read (`PermissionDenied`), or its filesystem refuses a directory
+/// fsync (`EROFS`, `EINVAL`, `ENOTSUP`/`EOPNOTSUPP`). See [`sync_layout`].
+fn parent_sync_is_optional(e: &std::io::Error) -> bool {
+	use std::io::ErrorKind;
+	matches!(e.kind(), ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem | ErrorKind::InvalidInput | ErrorKind::Unsupported)
 }
 
 /// The directory holding `path`'s entry: its parent, with the working directory standing
@@ -668,80 +759,387 @@ fn layout_dirs(root: &Path, segments_dir: &Path, created: &[PathBuf]) -> Vec<Pat
 	dirs
 }
 
+/// Whether any of the four control-plane databases exists under `root`: a root without
+/// them (and without a marker) is a new store.
+async fn control_plane_present(root: &Path) -> bool {
+	for file in CONTROL_PLANE_FILES {
+		if matches!(tokio::fs::try_exists(root.join(file)).await, Ok(true)) {
+			return true;
+		}
+	}
+	false
+}
+
+/// `format` with its floors raised to what `migrations` need and `migrating_to` set to
+/// their layout, or `format` itself when there are none: the marker an open writes before
+/// it runs them (freeze design §4.3, step 5). Floors only ever go up.
+fn raised_for(format: &StoreFormat, migrations: &[&migrations::Migration]) -> StoreFormat {
+	match migrations::floors(migrations.iter().copied()) {
+		Some(needs) => StoreFormat { min_read_layout: format.min_read_layout.max(needs.min_read), min_write_layout: format.min_write_layout.max(needs.min_write), migrating_to: Some(format.migrating_to.unwrap_or(0).max(needs.layout)), ..format.clone() },
+		None => format.clone(),
+	}
+}
+
+/// The marker an open leaves once its migrations are done (freeze design §4.3, steps 9
+/// and 10): every registered migration applied, so the registry's layout and floors,
+/// nothing migrating, `last_written_layout` this build's, and `store_uuid` the store's.
+/// A `newer` store keeps its layout, floors and migration state; only
+/// `last_written_layout` says this build wrote it, so the newer WeftDB re-derives what
+/// its older-writer-safe migrations maintain.
+fn settled_format(format: &StoreFormat, newer: bool, store_uuid: String) -> StoreFormat {
+	if newer {
+		return StoreFormat { last_written_layout: SUPPORTED_LAYOUT, store_uuid, ..format.clone() };
+	}
+	let registry = migrations::floors(migrations::REGISTRY).unwrap_or(migrations::Floors { layout: SUPPORTED_LAYOUT, min_read: SUPPORTED_LAYOUT, min_write: SUPPORTED_LAYOUT });
+	StoreFormat { layout_version: format.layout_version.max(registry.layout), min_read_layout: format.min_read_layout.max(registry.min_read), min_write_layout: format.min_write_layout.max(registry.min_write), last_written_layout: SUPPORTED_LAYOUT, migrating_to: None, applied_through: migrations::REGISTRY.last().map(|migration| migration.id.to_string()), store_uuid, ..format.clone() }
+}
+
+/// Mirror `format` into `index`'s `store_meta` (freeze design §4.3, step 9), writing only
+/// the keys whose recorded value differs, in one transaction.
+async fn mirror_into_store_meta(index: &SegmentIndexStore, name: &str, format: &StoreFormat) -> Result<()> {
+	let wanted = [("layout_version", Some(format.layout_version.to_string())), ("min_read_layout", Some(format.min_read_layout.to_string())), ("min_write_layout", Some(format.min_write_layout.to_string())), ("last_written_layout", Some(format.last_written_layout.to_string())), ("applied_through", format.applied_through.clone()), ("store_uuid", Some(format.store_uuid.clone()))];
+	let mut ops = Vec::new();
+	for (key, value) in wanted {
+		let Some(value) = value else { continue };
+		if index.meta(key).await.with_context(|| format!("{name}: reading store_meta {key}"))?.as_deref() != Some(value.as_str()) {
+			ops.push(IndexOp::MetaSet { key: key.to_string(), value });
+		}
+	}
+	if !ops.is_empty() {
+		index.apply(&IndexTxn::new(ops)).await.with_context(|| format!("{name}: mirroring the store marker into store_meta"))?;
+	}
+	Ok(())
+}
+
+/// A store's four control-plane databases, opened with pragmas and probes only: no DDL.
+struct ControlPlaneDbs {
+	index: SegmentIndexStore,
+	metadata: AspectMetadataStore,
+	catalog: AspectCatalog,
+	registry: CatalogStore,
+}
+
+impl ControlPlaneDbs {
+	/// Open the databases at `names` (the root's [`CONTROL_PLANE_FILES`], in that order),
+	/// the index first: it refuses a write floor newer than this build before anything is
+	/// written to it or opened beside it.
+	async fn open(names: &[String; 4]) -> Result<Self> {
+		let index = SegmentIndexStore::open_unmigrated(&names[0]).await?;
+		let metadata = AspectMetadataStore::open_unmigrated(&names[1]).await?;
+		let catalog = AspectCatalog::open_unmigrated(&names[2]).await?;
+		let registry = CatalogStore::open_unmigrated(&names[3]).await?;
+		Ok(Self { index, metadata, catalog, registry })
+	}
+
+	/// The databases as the migration registry takes them, named by `names`.
+	fn control_plane<'a>(&'a self, names: &'a [String; 4]) -> migrations::ControlPlane<'a> {
+		migrations::ControlPlane { index: Some(migrations::Db { db: self.index.database(), name: &names[0] }), metadata: Some(migrations::Db { db: self.metadata.database(), name: &names[1] }), aspect_catalog: Some(migrations::Db { db: self.catalog.database(), name: &names[2] }), catalog: Some(migrations::Db { db: self.registry.database(), name: &names[3] }) }
+	}
+}
+
+/// The marker `index`'s `store_meta` mirrors, for a root whose own `STORE_FORMAT` is gone
+/// (deleted, or a control plane restored without it), so that the open keeps the store's
+/// layout and floors rather than taking it for layout 1 and lowering them. `None` unless a
+/// WeftDB that writes markers recorded it, which always records `min_write_layout`: a
+/// development store of S6 or S7 records only `layout_version` and `store_uuid`, and is
+/// layout 1 like every store written before the marker.
+///
+/// # Errors
+///
+/// A failed read, or a layout key that does not hold a layout number.
+async fn recorded_format(index: &SegmentIndexStore, name: &str, scope: StoreScope) -> Result<Option<StoreFormat>> {
+	let text = |key: &'static str| async move { index.meta(key).await.with_context(|| format!("{name}: reading store_meta {key}")) };
+	let layout = |key: &'static str| async move {
+		match text(key).await? {
+			Some(value) => value.trim().parse::<u32>().map(Some).with_context(|| format!("{name}: store_meta records {key} {value:?}, which is not a layout number")),
+			None => Ok(None),
+		}
+	};
+	let Some(min_write_layout) = layout("min_write_layout").await? else { return Ok(None) };
+	let layout_version = layout("layout_version").await?.unwrap_or(min_write_layout);
+	let min_read_layout = layout("min_read_layout").await?.unwrap_or(min_write_layout);
+	let last_written_layout = layout("last_written_layout").await?.unwrap_or(layout_version);
+	let applied_through = text("applied_through").await?;
+	let store_uuid = text("store_uuid").await?.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+	Ok(Some(StoreFormat { kind: store_format::STORE_KIND.to_string(), layout_version, min_read_layout, min_write_layout, last_written_layout, migrating_to: None, applied_through, store_uuid, scope }))
+}
+
+/// The process-wide poison ([`poison_global`]) as the [`Poisoned`] error every write, and
+/// every open, fails with while it is set.
+fn process_poisoned() -> Option<Poisoned> {
+	poison_global().get().map(|reason| Poisoned { reason: format!("the process is write-poisoned: {reason}") })
+}
+
 impl SegmentStore {
 	/// Open (creating if absent) a segment store rooted at `root` under the `default`
-	/// database/subject namespace: ensures `root/segments/` exists and opens the
-	/// `root/segment_index.db` and `root/aspect_catalog.db` control-plane DBs.
+	/// database/subject namespace, with [`SegmentStoreOptions::default`].
 	///
 	/// Use [`open_scoped`](SegmentStore::open_scoped) to place the store's declared
-	/// schemas under a named `(database, subject)` instead.
+	/// schemas under a named `(database, subject)` instead, and
+	/// [`open_with_options`](SegmentStore::open_with_options) to configure it.
 	///
 	/// # Errors
 	///
-	/// As [`open_scoped`](SegmentStore::open_scoped): a [`StoreLocked`] error if the
-	/// root is already open, and any failure opening the layout or the databases.
+	/// As [`open_scoped`](SegmentStore::open_scoped).
 	pub async fn open(root: impl AsRef<Path>) -> Result<Self> {
 		Self::open_scoped(root, DEFAULT_DATABASE, DEFAULT_SUBJECT).await
 	}
 
+	/// [`open`](SegmentStore::open), configured by `options` rather than the defaults.
+	///
+	/// # Errors
+	///
+	/// As [`open_scoped`](SegmentStore::open_scoped).
+	pub async fn open_with_options(root: impl AsRef<Path>, options: SegmentStoreOptions) -> Result<Self> {
+		Self::open_scoped_with_options(root, DEFAULT_DATABASE, DEFAULT_SUBJECT, options).await
+	}
+
 	/// Open (creating if absent) a segment store rooted at `root` whose declared aspect
-	/// schemas live under the `(database, subject)` namespace.
+	/// schemas live under the `(database, subject)` namespace, with
+	/// [`SegmentStoreOptions::default`].
 	///
 	/// The segment files and index rows are keyed by the flat aspect name, which is
 	/// unique within one subject; the aspect-schema catalog records the full
 	/// `(database, subject, aspect)` triple so a reopened store recovers the encoding
 	/// it sealed under.
 	///
-	/// The open follows design section 5.5:
+	/// The open follows design section 5.5, as the freeze design (§4.3, FRE-12a) amends
+	/// it:
 	///
-	/// 1. take the root's `LOCK`, before any database is opened, so one store (in one
-	///    process) owns the root;
-	/// 2. open the four control-plane databases, each refusing to open unless it runs
-	///    MVCC and a new connection syncs FULL, and each syncing its MVCC header;
-	/// 3. fsync `segments/`, the root, any directory this open created above it and the
-	///    root's parent, so the database files and their `-log` files keep their
-	///    directory entries through a power cut (Turso truncates a `-log` in place, so one
-	///    fsync covers it for good);
-	/// 4. register the store's `(database, subject)` scope in one catalog transaction,
-	///    after the fsyncs, so its commit lands in a `-log` whose entry is already
-	///    durable.
+	/// 0. refuse to open at all, touching nothing, while the process is write-poisoned
+	///    ([`Poisoned`]; see [`poison_global`]): the open writes;
+	/// 1. create the root if it is missing (a new store);
+	/// 2. take the root's `LOCK`, before anything else of the root is read or written, so
+	///    one store (in one process) owns it;
+	/// 3. read the root's `STORE_FORMAT` marker. A root without one and without
+	///    control-plane databases is a new store, and its marker is written before
+	///    anything else is created;
+	/// 4. refuse the store, having touched only `LOCK` and `LOCK.holder`, when its
+	///    `min_write_layout` is newer than [`SUPPORTED_LAYOUT`]
+	///    ([`StoreError::IncompatibleLayout`]): the marker's before any database opens, and
+	///    for a root without a marker the copy in `segment_index.db`'s `store_meta`, read
+	///    before anything is written to it (step 7). A root without a marker is judged by
+	///    that copy throughout: a lost marker is rebuilt from it, and a store a pre-marker
+	///    WeftDB wrote, which has none, is layout 1. A newer layout is also refused when
+	///    the root holds no database ([`StoreError::NewerStoreWithoutDatabases`]);
+	/// 5. raise the marker's floors to what the pending migrations need, fsynced, before
+	///    any of them runs, so an older WeftDB sees them even if a migration dies half
+	///    way; for an existing store, only once every pending migration's precheck has
+	///    passed (step 8), so a store one refuses is left without a raised marker;
+	/// 6. create `segments/`;
+	/// 7. open the four control-plane databases with no DDL, each refusing to open unless
+	///    it runs MVCC and a new connection syncs FULL, and each syncing its MVCC header:
+	///    a new store's here, an existing store's right after the marker's gate (4),
+	///    `segment_index.db` first;
+	/// 8. run the prechecks of the registered migrations `store_migrations` does not list,
+	///    then the migrations themselves ([`OpenReport::applied`]), unless the store's
+	///    layout is newer than this build's, in which case nothing is migrated and recovery
+	///    is report-only ([`OpenReport::recovery_report_only`]);
+	/// 9. mirror the marker into `store_meta`, then write the marker in its final form,
+	///    with `last_written_layout` set to this build's layout;
+	/// 10. fsync `segments/`, the root, any directory this open created above it and the
+	///     root's parent, so the database files and their `-log` files keep their
+	///     directory entries through a power cut (Turso truncates a `-log` in place, so
+	///     one fsync covers it for good);
+	/// 11. register the store's `(database, subject)` scope in one catalog transaction,
+	///     after the fsyncs, so its commit lands in a `-log` whose entry is already
+	///     durable.
 	///
 	/// The lock is held until the store drops.
 	///
 	/// # Errors
 	///
-	/// A [`StoreLocked`] error if the root is already open, in another process or in
-	/// this one; an error if a database cannot run MVCC or does not sync FULL, or if a
-	/// directory fsync fails; and any filesystem error creating the layout or libSQL
-	/// failure opening the databases.
+	/// [`Poisoned`] while the process is write-poisoned; a [`StoreLocked`] error if the
+	/// root is already open, in another process or in this one; a [`StoreError`] when the
+	/// marker is unreadable, the store is too new to write, or a layout-1 index records
+	/// frames outside `segments/`; an error if a database cannot run MVCC or does not sync
+	/// FULL, if a migration fails, or if a directory fsync fails; and any filesystem error
+	/// creating the layout or libSQL failure opening the databases.
 	pub async fn open_scoped(root: impl AsRef<Path>, database: &str, subject: &str) -> Result<Self> {
-		Self::open_scoped_on(&RealFs, root.as_ref(), database, subject).await
+		Self::open_scoped_with_options(root, database, subject, SegmentStoreOptions::default()).await
 	}
 
-	/// [`open_scoped`](SegmentStore::open_scoped), with its directory fsyncs going through
-	/// `fs`, so a test can see which directories the open syncs and fail one.
-	async fn open_scoped_on(fs: &dyn StoreFs, root: &Path, database: &str, subject: &str) -> Result<Self> {
+	/// [`open_scoped`](SegmentStore::open_scoped), configured by `options`.
+	///
+	/// # Errors
+	///
+	/// As [`open_scoped`](SegmentStore::open_scoped).
+	pub async fn open_scoped_with_options(root: impl AsRef<Path>, database: &str, subject: &str, options: SegmentStoreOptions) -> Result<Self> {
+		Self::open_on(Arc::new(RealFs), root.as_ref(), database, subject, options).await
+	}
+
+	/// [`open_scoped_with_options`](SegmentStore::open_scoped_with_options), with its
+	/// marker writes and directory fsyncs going through `fs`, so a test can see what the
+	/// open writes and syncs, fail a step, or cut the power there.
+	async fn open_on(fs: Arc<dyn StoreFs>, root: &Path, database: &str, subject: &str, options: SegmentStoreOptions) -> Result<Self> {
 		let root = root.to_path_buf();
 		let segments_dir = root.join("segments");
+		let opening = || format!("opening segment store {}", root.display());
+		// 0. A write-poisoned process opens no store: the open writes (the marker, the
+		// migrations, store_meta, the scope), through the engine the poison distrusts.
+		if let Some(poisoned) = process_poisoned() {
+			return Err(anyhow::Error::new(poisoned).context(opening()));
+		}
+		// 1. The root, and any missing ancestor, for a new store.
 		let created = missing_dirs(&segments_dir).await;
-		tokio::fs::create_dir_all(&segments_dir).await.with_context(|| format!("creating segments dir {}", segments_dir.display()))?;
+		tokio::fs::create_dir_all(&root).await.with_context(|| format!("creating store root {}", root.display()))?;
+		// 2. LOCK.
 		let root_lock = lock_root(&root).await?;
-		let index_path = root.join("segment_index.db");
-		let index = SegmentIndexStore::open(&index_path.to_string_lossy()).await?;
-		let metadata_path = root.join("metadata.db");
-		let metadata = AspectMetadataStore::open(&metadata_path.to_string_lossy()).await?;
-		let catalog_path = root.join("aspect_catalog.db");
-		let catalog = AspectCatalog::open(&catalog_path.to_string_lossy()).await?;
-		let registry_path = root.join("catalog.db");
-		let registry = CatalogStore::open(&registry_path.to_string_lossy()).await?;
-		sync_layout(fs, &root, &segments_dir, &created).await?;
+		// 3. The marker.
+		let found = store_format::read_marker(&root).await.map_err(anyhow::Error::new).with_context(opening)?;
+		let had_databases = control_plane_present(&root).await;
+		let scope = StoreScope { database: database.to_string(), subject: subject.to_string() };
+		let names = CONTROL_PLANE_FILES.map(|file| root.join(file).to_string_lossy().into_owned());
+		// 4. The marker's gate, before any database is opened: nothing but LOCK and
+		// LOCK.holder has been touched.
+		if let Some(marker) = found.as_ref().filter(|marker| !marker.writable_by(SUPPORTED_LAYOUT)) {
+			return Err(anyhow::Error::new(StoreError::IncompatibleLayout { min_write: marker.min_write_layout, supported: SUPPORTED_LAYOUT }).context(opening()));
+		}
+		// 7, for a root that has databases: they open now, before anything is written to the
+		// root. segment_index.db opens first and refuses a write floor its store_meta records
+		// newer than this build (the gate of a root without a marker, 4) before anything is
+		// written to it; its store_meta copy stands in for a lost marker; and the pending
+		// migrations' prechecks read them.
+		let opened = if had_databases { Some(ControlPlaneDbs::open(&names).await?) } else { None };
+		let mut format = match (&found, &opened) {
+			(Some(format), _) => format.clone(),
+			(None, Some(databases)) => recorded_format(&databases.index, &names[0], scope.clone()).await?.unwrap_or_else(|| StoreFormat::legacy(scope)),
+			(None, None) => StoreFormat::new_store(scope),
+		};
+		let layout_before = format.layout_version;
+		let created_new = !had_databases || found.as_ref().is_some_and(StoreFormat::is_unfinished_creation);
+		// A marker rebuilt from store_meta passed the index's check already; this holds the
+		// gate for every format the open goes on with.
+		if !format.writable_by(SUPPORTED_LAYOUT) {
+			return Err(anyhow::Error::new(StoreError::IncompatibleLayout { min_write: format.min_write_layout, supported: SUPPORTED_LAYOUT }).context(opening()));
+		}
+		let newer = format.layout_version > SUPPORTED_LAYOUT;
+		if newer && !had_databases {
+			return Err(anyhow::Error::new(StoreError::NewerStoreWithoutDatabases { layout: format.layout_version, supported: SUPPORTED_LAYOUT }).context(opening()));
+		}
+		// The pending migrations' prechecks, before anything is written; for a new store,
+		// whose databases do not exist yet, at step 8, before any migration applies.
+		let prechecked = match (&opened, newer) {
+			(Some(databases), false) => {
+				let done = migrations::applied(migrations::Db { db: databases.index.database(), name: &names[0] }).await?;
+				let pending = migrations::pending(migrations::REGISTRY, &done);
+				migrations::precheck(&databases.control_plane(&names), &pending).await.with_context(opening)?;
+				Some((done, pending))
+			}
+			_ => None,
+		};
+		let mut on_disk = found;
+		// 5. Floors first, by what the marker says is still to run.
+		if !newer {
+			let expected = migrations::after(migrations::REGISTRY, format.applied_through.as_deref());
+			format = raised_for(&format, &expected);
+			if on_disk.as_ref() != Some(&format) {
+				store_format::write_marker(fs.as_ref(), &root, &format).await.with_context(opening)?;
+				on_disk = Some(format.clone());
+			}
+		}
+		// 6. segments/.
+		tokio::fs::create_dir_all(&segments_dir).await.with_context(|| format!("creating segments dir {}", segments_dir.display()))?;
+		// 7. The databases of a new store: pragmas and probes, no DDL.
+		let databases = match opened {
+			Some(databases) => databases,
+			None => ControlPlaneDbs::open(&names).await?,
+		};
+		let cp = databases.control_plane(&names);
+		// 8. The migrations the store has not applied, their prechecks first, and its floors
+		// raised for any the marker did not expect.
+		let mut applied = Vec::new();
+		if !newer {
+			let (done, pending) = if let Some(prechecked) = prechecked {
+				prechecked
+			} else {
+				let done = migrations::applied(migrations::Db { db: databases.index.database(), name: &names[0] }).await?;
+				let pending = migrations::pending(migrations::REGISTRY, &done);
+				migrations::precheck(&cp, &pending).await.with_context(opening)?;
+				(done, pending)
+			};
+			format = raised_for(&format, &pending);
+			if on_disk.as_ref() != Some(&format) {
+				store_format::write_marker(fs.as_ref(), &root, &format).await.with_context(opening)?;
+				on_disk = Some(format.clone());
+			}
+			applied = migrations::apply(&cp, &pending).await?;
+			if format.last_written_layout < format.layout_version {
+				let mut all = done;
+				all.extend(applied.iter().map(|id| (*id).to_string()));
+				migrations::rederive(&cp, migrations::REGISTRY, &all, format.last_written_layout).await?;
+			}
+		}
+		// 9 and 10. The store_meta mirror, then the final marker.
+		let store_uuid = databases.index.meta("store_uuid").await.with_context(|| format!("{}: reading the store UUID", names[0]))?.unwrap_or_else(|| format.store_uuid.clone());
+		let settled = settled_format(&format, newer, store_uuid.clone());
+		mirror_into_store_meta(&databases.index, &names[0], &settled).await?;
+		if on_disk.as_ref() != Some(&settled) {
+			store_format::write_marker(fs.as_ref(), &root, &settled).await.with_context(opening)?;
+		}
+		// 11. The layout's directory entries, then the scope.
+		sync_layout(fs.as_ref(), &root, &segments_dir, &created).await?;
 		// Record this store's place in the hierarchy so the control plane can enumerate
 		// the databases/subjects a root holds (idempotent, and atomic).
-		registry.register_scope(database, subject).await?;
-		let checkpoints = CheckpointPolicy::from_env();
-		let partials = PartialSidecarPolicy::from_env();
-		let transposed = TransposedPolicy::from_env();
-		Ok(Self { root, index, metadata, catalog, registry, database: database.to_string(), subject: subject.to_string(), checkpoints, partials, transposed, poison: StorePoison::default(), on_ambiguous: OnAmbiguousCommit::from_env(), locks: AspectLocks::default(), legacy_ids: tokio::sync::OnceCell::new(), maintenance_wait: DEFAULT_MAINTENANCE_WAIT, index_conflicts: AtomicU64::new(0), _root_lock: root_lock })
+		databases.registry.register_scope(database, subject).await?;
+		let migrated_from = (!created_new && layout_before < settled.layout_version).then_some(layout_before);
+		let report = OpenReport { created_new, migrated_from, applied: applied.iter().map(|id| (*id).to_string()).collect(), recovery_report_only: newer };
+		if newer {
+			tracing::warn!(root = %root.display(), layout = settled.layout_version, supported = SUPPORTED_LAYOUT, "this store's layout is newer than this WeftDB's; it opened without migrating, and recovery only reports what it finds");
+		}
+		let floor_ensured = AtomicU32::new(settled.min_read_layout.min(settled.min_write_layout));
+		let ControlPlaneDbs { index, metadata, catalog, registry } = databases;
+		Ok(Self { root, index, metadata, catalog, registry, database: database.to_string(), subject: subject.to_string(), checkpoints: options.checkpoints, partials: options.partials, transposed: options.transposed, poison: StorePoison::default(), fs, format: RwLock::new(settled), marker_writer: tokio::sync::Mutex::new(()), floor_ensured, store_uuid, report, locks: AspectLocks::default(), legacy_ids: tokio::sync::OnceCell::new(), maintenance_wait: DEFAULT_MAINTENANCE_WAIT, index_conflicts: AtomicU64::new(0), _root_lock: root_lock })
+	}
+
+	/// What this store's open found and did (release plan C-5).
+	#[must_use]
+	pub const fn open_report(&self) -> &OpenReport {
+		&self.report
+	}
+
+	/// The store's identity: the `store_uuid` of its `STORE_FORMAT` marker, mirrored in
+	/// `store_meta`. It survives reopens, relocations and restores of the root.
+	#[must_use]
+	pub fn store_uuid(&self) -> &str {
+		&self.store_uuid
+	}
+
+	/// The store's `STORE_FORMAT` marker, as this store last wrote it.
+	#[must_use]
+	pub fn store_format(&self) -> StoreFormat {
+		self.format.read().unwrap_or_else(PoisonError::into_inner).clone()
+	}
+
+	/// Make sure the store's floors are at least `level` before this store writes
+	/// something only a WeftDB that knows layout `level` may read (freeze design §4.3).
+	/// The `STORE_FORMAT` marker is raised first and fsynced, so an older WeftDB refuses
+	/// the store from then on even if the write never commits; the op this returns raises
+	/// `store_meta`'s copy and belongs in the caller's own transaction. After the first
+	/// call for a level nothing is written and `None` is returned: the marker, which the
+	/// open's gate reads, already holds the floor, and the next open mirrors it into
+	/// `store_meta` if the transaction that carried the op did not commit.
+	///
+	/// # Errors
+	///
+	/// A `level` newer than [`SUPPORTED_LAYOUT`], or a failed marker write.
+	#[cfg_attr(not(test), expect(dead_code, reason = "the first writer of a post-1.0 frame feature (D-S9, D-S10) calls it; until then only the tests do"))]
+	pub(crate) async fn ensure_floor(&self, level: u32) -> Result<Option<IndexOp>> {
+		if level > SUPPORTED_LAYOUT {
+			bail!("cannot raise the store's floors to layout {level}: this WeftDB writes layouts up to {SUPPORTED_LAYOUT}");
+		}
+		if self.floor_ensured.load(Ordering::Acquire) >= level {
+			return Ok(None);
+		}
+		let _writer = self.marker_writer.lock().await;
+		let current = self.store_format();
+		if current.min_read_layout < level || current.min_write_layout < level {
+			let raised = StoreFormat { layout_version: current.layout_version.max(level), min_read_layout: current.min_read_layout.max(level), min_write_layout: current.min_write_layout.max(level), ..current };
+			store_format::write_marker(self.fs.as_ref(), &self.root, &raised).await.context("raising the store's floors")?;
+			*self.format.write().unwrap_or_else(PoisonError::into_inner) = raised;
+		}
+		self.floor_ensured.fetch_max(level, Ordering::AcqRel);
+		Ok(Some(IndexOp::RaiseFloor { level }))
 	}
 
 	/// The store's write poison, or `None` while it accepts writes.
@@ -749,13 +1147,46 @@ impl SegmentStore {
 	/// A store poisons itself when a `segment_index.db` COMMIT fails in a way that may
 	/// still have committed, because that transaction may or may not be durable (see
 	/// [`Poisoned`]); a conflict Turso finds while validating the commit is not one of
-	/// them, since it rolls the transaction back before writing anything. From then on every
-	/// write fails with that [`Poisoned`] error and reads go on working, until the
-	/// process restarts. `weft-server`'s `/ready` reports it as `poisoned` and
-	/// `restart_required`.
+	/// them, since it rolls the transaction back before writing anything. Every store is
+	/// also poisoned once the process is ([`poison_global`]: a panic inside a
+	/// control-plane write), and then no store opens. From then on every write fails with
+	/// that [`Poisoned`] error and reads go on working, until the process restarts.
+	/// `weft-server`'s `/ready` reports it as `poisoned` and `restart_required`.
 	#[must_use]
 	pub fn poisoned(&self) -> Option<Poisoned> {
-		self.poison.get()
+		self.poison.get().or_else(process_poisoned)
+	}
+
+	/// A watch of this store's own write poison: `None` until an ambiguous COMMIT
+	/// poisons it, then the [`Poisoned`] error its writes fail with. The process-wide
+	/// poison has its own watch ([`GlobalPoison::subscribe`](crate::durable::GlobalPoison::subscribe));
+	/// [`wait_until_poisoned`](Self::wait_until_poisoned) waits for either.
+	#[must_use]
+	pub fn subscribe_poison(&self) -> tokio::sync::watch::Receiver<Option<Poisoned>> {
+		self.poison.tx.subscribe()
+	}
+
+	/// Wait until this store is write-poisoned, by its own ambiguous COMMIT or by the
+	/// process-wide poison, and return the poison ([`poisoned`](Self::poisoned)). At once
+	/// if it already is.
+	///
+	/// The library never exits the process (release plan C-1); an embedder that wants to
+	/// exit on poison, as `weft-server` does under `WEFT_ON_AMBIGUOUS_COMMIT=exit`, waits
+	/// here and exits itself.
+	pub async fn wait_until_poisoned(&self) -> Poisoned {
+		let mut own = self.subscribe_poison();
+		let mut global = poison_global().subscribe();
+		loop {
+			if let Some(poisoned) = self.poisoned() {
+				return poisoned;
+			}
+			// Both senders outlive this call (the store's is borrowed, the process's is
+			// static), so neither wait can fail.
+			tokio::select! {
+				_ = own.changed() => {}
+				_ = global.changed() => {}
+			}
+		}
 	}
 
 	/// Write-poison the store for `reason`, as an ambiguous COMMIT would, without staging
@@ -782,18 +1213,19 @@ impl SegmentStore {
 		Ok(MaintenanceHold { _held: self.maintain(aspect).await? })
 	}
 
-	/// Refuse a write while the store is poisoned. Every write entry point calls this
-	/// first, before it reads or writes anything.
+	/// Refuse a write while the store, or the process, is poisoned. Every write entry
+	/// point calls this first, before it reads or writes anything.
 	fn writable(&self) -> Result<()> {
-		match self.poison.get() {
+		match self.poisoned() {
 			Some(poisoned) => Err(poisoned.into()),
 			None => Ok(()),
 		}
 	}
 
 	/// Commit `txn` to the segment index, unless the store is poisoned. An ambiguous
-	/// failure poisons the store (or, under `WEFT_ON_AMBIGUOUS_COMMIT=exit`, exits the
-	/// process) before the error is returned, so no later write builds on it.
+	/// failure poisons the store before the error is returned, so no later write builds on
+	/// it. The transaction runs inside the control-plane write scope
+	/// ([`control_plane_write`](crate::exec::control_plane_write)).
 	///
 	/// The poison is checked again before every retry of a conflict, so a transaction
 	/// waiting out a conflict while another writer poisons the store gives up with
@@ -807,7 +1239,7 @@ impl SegmentStore {
 	/// retry a conflict; otherwise the transaction's [`IndexTxnError`].
 	pub(crate) async fn commit_index(&self, txn: &IndexTxn) -> Result<TxnApplied> {
 		self.writable()?;
-		let result = self.index.apply_while(txn, || self.poison.get().is_none()).await;
+		let result = self.index.apply_while(txn, || self.poisoned().is_none()).await;
 		// Every attempt before the last lost a conflict, and so did the last one when the
 		// conflict is what the transaction failed with.
 		let lost = match &result {
@@ -833,20 +1265,12 @@ impl SegmentStore {
 		}
 	}
 
-	/// React to an ambiguous COMMIT as [`AMBIGUOUS_COMMIT_ENV`] chose.
+	/// Poison the store after an ambiguous COMMIT. The library never exits the process
+	/// (release plan C-1): an embedder that wants that waits for the poison
+	/// ([`wait_until_poisoned`](Self::wait_until_poisoned)).
 	fn on_ambiguous_commit(&self, error: &IndexTxnError) {
-		let root = self.root.display();
-		match self.on_ambiguous {
-			OnAmbiguousCommit::Exit => {
-				tracing::error!(%root, %error, "a segment_index COMMIT is ambiguous; exiting with status {AMBIGUOUS_COMMIT_EXIT_CODE} as {AMBIGUOUS_COMMIT_ENV}=exit asks, so that the restart's recovery settles it");
-				eprintln!("weftdb: segment store {root}: {error}; exiting with status {AMBIGUOUS_COMMIT_EXIT_CODE} ({AMBIGUOUS_COMMIT_ENV}=exit)");
-				std::process::exit(AMBIGUOUS_COMMIT_EXIT_CODE);
-			}
-			OnAmbiguousCommit::Poison => {
-				if self.poison.set(error.to_string()) {
-					tracing::error!(%root, %error, "a segment_index COMMIT is ambiguous; the store refuses writes until the process restarts, and reads go on");
-				}
-			}
+		if self.poison.set(error.to_string()) {
+			tracing::error!(root = %self.root.display(), %error, "a segment_index COMMIT is ambiguous; the store refuses writes until the process restarts, and reads go on");
 		}
 	}
 
@@ -971,19 +1395,22 @@ impl SegmentStore {
 	/// The file holding `descriptor`'s frame: its recorded path, resolved against this
 	/// store's root (see [`resolve_frame_path`]), so that a root that was moved or
 	/// restored elsewhere still reads its own frames.
-	fn frame_path(&self, descriptor: &SegmentDescriptor) -> PathBuf {
+	///
+	/// # Errors
+	///
+	/// A recorded path that does not resolve to a file under `segments/`.
+	fn frame_path(&self, descriptor: &SegmentDescriptor) -> Result<PathBuf> {
 		resolve_frame_path(&self.root, &descriptor.path)
 	}
 
 	/// Read `descriptor`'s frame from [`frame_path`](Self::frame_path).
 	async fn read_frame(&self, descriptor: &SegmentDescriptor) -> Result<Vec<u8>> {
-		let path = self.frame_path(descriptor);
+		let path = self.frame_path(descriptor)?;
 		tokio::fs::read(&path).await.with_context(|| format!("reading segment {}", path.display()))
 	}
 
-	/// Override this store's [`CheckpointPolicy`] (the env-read default is
-	/// [`CheckpointPolicy::DISABLED`]), for a caller that wants the timestamp checkpoint
-	/// index without setting an environment variable.
+	/// Override this store's [`CheckpointPolicy`] (set at open from its
+	/// [`SegmentStoreOptions`], [`CheckpointPolicy::DISABLED`] by default).
 	#[must_use]
 	pub const fn with_checkpoint_policy(mut self, policy: CheckpointPolicy) -> Self {
 		self.checkpoints = policy;
@@ -996,9 +1423,8 @@ impl SegmentStore {
 		self.checkpoints
 	}
 
-	/// Override this store's [`TransposedPolicy`] (the env-read default is
-	/// [`TransposedPolicy::DISABLED`]), for a caller that wants the decode-fast transposed
-	/// value codec without setting an environment variable.
+	/// Override this store's [`TransposedPolicy`] (set at open from its
+	/// [`SegmentStoreOptions`], [`TransposedPolicy::DISABLED`] by default).
 	#[must_use]
 	pub const fn with_transposed_policy(mut self, policy: TransposedPolicy) -> Self {
 		self.transposed = policy;
@@ -1019,9 +1445,8 @@ impl SegmentStore {
 		FrameOptions { checkpoint_stride: self.checkpoints.stride_for(row_count, benefits, codec_overhead), transposed_max_overhead: self.transposed.max_overhead }
 	}
 
-	/// Override this store's [`PartialSidecarPolicy`] (the env-read default is
-	/// [`PartialSidecarPolicy::DISABLED`]), for a caller that wants per-segment partial
-	/// sidecars without setting an environment variable.
+	/// Override this store's [`PartialSidecarPolicy`] (set at open from its
+	/// [`SegmentStoreOptions`], [`PartialSidecarPolicy::DISABLED`] by default).
 	#[must_use]
 	pub const fn with_partial_sidecar_policy(mut self, policy: PartialSidecarPolicy) -> Self {
 		self.partials = policy;
@@ -3332,7 +3757,7 @@ mod tests {
 	use weft_physical_type::{timestamp::TimeUnit, PhysicalType};
 
 	use super::*;
-	use crate::types::index_txn::TxnPoints;
+	use crate::{types::index_txn::TxnPoints, STORE_FORMAT_FILE};
 
 	fn bd(s: &str) -> BigDecimal {
 		BigDecimal::from_str(s).expect("parses")
@@ -5140,20 +5565,27 @@ mod tests {
 	}
 
 	/// A [`StoreFs`] that records every directory fsync before passing it to [`RealFs`],
-	/// and can fail the one for `refuse` with an error of the given kind instead.
+	/// and can fail the one for `refuse` with an error of the given kind instead. It also
+	/// records every `STORE_FORMAT` marker renamed into place, with the control-plane
+	/// databases that existed beside it at that moment.
 	#[derive(Debug, Default)]
 	struct RecordingFs {
 		synced: std::sync::Mutex<Vec<PathBuf>>,
 		refuse: Option<(PathBuf, std::io::ErrorKind)>,
+		markers: std::sync::Mutex<Vec<(StoreFormat, Vec<&'static str>)>>,
 	}
 
 	impl RecordingFs {
 		fn refusing(dir: PathBuf, kind: std::io::ErrorKind) -> Self {
-			Self { synced: std::sync::Mutex::default(), refuse: Some((dir, kind)) }
+			Self { refuse: Some((dir, kind)), ..Self::default() }
 		}
 
 		fn synced(&self) -> Vec<PathBuf> {
 			self.synced.lock().expect("not poisoned").clone()
+		}
+
+		fn markers(&self) -> Vec<(StoreFormat, Vec<&'static str>)> {
+			self.markers.lock().expect("not poisoned").clone()
 		}
 	}
 
@@ -5180,7 +5612,14 @@ mod tests {
 		}
 
 		async fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
-			RealFs.rename(from, to).await
+			RealFs.rename(from, to).await?;
+			if to.file_name() == Some(OsStr::new(STORE_FORMAT_FILE)) {
+				let dir = to.parent().expect("a marker has a directory");
+				let format = serde_json::from_slice(&std::fs::read(to)?).expect("the renamed marker parses");
+				let databases = CONTROL_PLANE_FILES.into_iter().filter(|file| dir.join(file).exists()).collect();
+				self.markers.lock().expect("not poisoned").push((format, databases));
+			}
+			Ok(())
 		}
 
 		async fn remove_file(&self, path: &Path) -> std::io::Result<()> {
@@ -5216,50 +5655,59 @@ mod tests {
 		let paths = |names: &[&str]| -> Vec<PathBuf> { names.iter().map(|n| dir.path().join(n)).collect() };
 		let root = dir.path().join("a/b");
 
-		// A fresh nested root: everything it created, and the directory that held the top.
-		let fs = RecordingFs::default();
-		drop(SegmentStore::open_scoped_on(&fs, &root, "market", "BTCUSD").await.expect("opens a fresh nested root"));
-		let mut expected = paths(&["a/b/segments", "a/b", "a"]);
+		// A fresh nested root: the root twice for its STORE_FORMAT marker (written before
+		// anything else, then in its final form), then everything it created and the
+		// directory that held the top.
+		let fs = Arc::new(RecordingFs::default());
+		drop(SegmentStore::open_on(fs.clone(), &root, "market", "BTCUSD", SegmentStoreOptions::default()).await.expect("opens a fresh nested root"));
+		let mut expected = paths(&["a/b", "a/b", "a/b/segments", "a/b", "a"]);
 		expected.push(dir.path().to_path_buf());
 		assert_eq!(fs.synced(), expected);
 
 		// Reopening it still syncs the root's parent: the open that created the root may
-		// have died before its own fsyncs, and this one cannot tell.
-		let fs = RecordingFs::default();
-		drop(SegmentStore::open_scoped_on(&fs, &root, "market", "BTCUSD").await.expect("reopens"));
+		// have died before its own fsyncs, and this one cannot tell. Its marker is already
+		// final, so it is not rewritten.
+		let fs = Arc::new(RecordingFs::default());
+		drop(SegmentStore::open_on(fs.clone(), &root, "market", "BTCUSD", SegmentStoreOptions::default()).await.expect("reopens"));
 		assert_eq!(fs.synced(), paths(&["a/b/segments", "a/b", "a"]));
 
 		// A failed fsync fails the open before the scope is registered.
 		let fresh = dir.path().join("c");
-		let fs = RecordingFs::refusing(fresh.join("segments"), std::io::ErrorKind::Other);
-		let err = SegmentStore::open_scoped_on(&fs, &fresh, "market", "BTCUSD").await.err().expect("a failed directory fsync fails the open");
+		let fs = Arc::new(RecordingFs::refusing(fresh.join("segments"), std::io::ErrorKind::Other));
+		let err = SegmentStore::open_on(fs, &fresh, "market", "BTCUSD", SegmentStoreOptions::default()).await.err().expect("a failed directory fsync fails the open");
 		assert!(format!("{err:#}").contains(&format!("fsyncing directory {}", fresh.join("segments").display())), "{err:#}");
 		assert_eq!(registered_scopes(&fresh).await, (Vec::new(), Vec::new()), "the scope is registered only after the layout is durable");
 	}
 
 	/// The root's parent is synced on every open, but a store whose root predates the open
-	/// still opens when that parent cannot be opened for reading. A root the open created
-	/// is another matter: its entry is the open's own to make durable.
+	/// still opens when that parent cannot be opened for reading, or sits on a filesystem
+	/// that refuses a directory fsync: read-only (`EROFS`), or a FUSE or Docker Desktop
+	/// mount (`EINVAL`, `ENOTSUP`) (release plan C-3). A root the open created is another
+	/// matter: its entry is the open's own to make durable.
 	#[tokio::test]
-	async fn an_unreadable_parent_is_skipped_only_for_a_root_the_open_did_not_create() {
-		let dir = TempDir::new().expect("tempdir");
-		let root = dir.path().join("store");
-		let fs = RecordingFs::refusing(dir.path().to_path_buf(), std::io::ErrorKind::PermissionDenied);
-		let err = SegmentStore::open_scoped_on(&fs, &root, "market", "BTCUSD").await.err().expect("a root this open created needs its parent synced");
-		assert!(format!("{err:#}").contains(&format!("fsyncing directory {}", dir.path().display())), "{err:#}");
+	async fn an_unsyncable_parent_is_skipped_only_for_a_root_the_open_did_not_create() {
+		use std::io::ErrorKind;
 
-		let fs = RecordingFs::refusing(dir.path().to_path_buf(), std::io::ErrorKind::PermissionDenied);
-		drop(SegmentStore::open_scoped_on(&fs, &root, "market", "BTCUSD").await.expect("the existing root opens"));
-		assert_eq!(fs.synced(), vec![root.join("segments"), root.clone(), dir.path().to_path_buf()], "the parent was tried");
+		for kind in [ErrorKind::PermissionDenied, ErrorKind::ReadOnlyFilesystem, ErrorKind::InvalidInput, ErrorKind::Unsupported] {
+			let dir = TempDir::new().expect("tempdir");
+			let root = dir.path().join("store");
+			let fs = Arc::new(RecordingFs::refusing(dir.path().to_path_buf(), kind));
+			let err = SegmentStore::open_on(fs, &root, "market", "BTCUSD", SegmentStoreOptions::default()).await.err().unwrap_or_else(|| panic!("{kind:?}: a root this open created needs its parent synced"));
+			assert!(format!("{err:#}").contains(&format!("fsyncing directory {}", dir.path().display())), "{kind:?}: {err:#}");
 
-		let fs = RecordingFs::refusing(dir.path().to_path_buf(), std::io::ErrorKind::Other);
-		assert!(SegmentStore::open_scoped_on(&fs, &root, "market", "BTCUSD").await.is_err(), "any other error syncing the parent still fails the open");
+			let fs = Arc::new(RecordingFs::refusing(dir.path().to_path_buf(), kind));
+			drop(SegmentStore::open_on(fs.clone(), &root, "market", "BTCUSD", SegmentStoreOptions::default()).await.unwrap_or_else(|e| panic!("{kind:?}: the existing root opens: {e:#}")));
+			assert_eq!(fs.synced(), vec![root.join("segments"), root.clone(), dir.path().to_path_buf()], "{kind:?}: the parent was tried");
+
+			let fs = Arc::new(RecordingFs::refusing(dir.path().to_path_buf(), ErrorKind::Other));
+			assert!(SegmentStore::open_on(fs, &root, "market", "BTCUSD", SegmentStoreOptions::default()).await.is_err(), "{kind:?}: any other error syncing the parent still fails the open");
+		}
 	}
 
 	/// The database and subject rows a root's catalog holds, read without opening a
 	/// store (which would register a scope of its own).
 	async fn registered_scopes(root: &Path) -> (Vec<String>, Vec<String>) {
-		let catalog = CatalogStore::open(&root.join("catalog.db").to_string_lossy()).await.expect("opens the catalog");
+		let catalog = CatalogStore::open_unmigrated(&root.join("catalog.db").to_string_lossy()).await.expect("opens the catalog");
 		let databases = catalog.list_databases().await.expect("lists databases");
 		let subjects = catalog.list_subjects("market").await.expect("lists subjects");
 		drop(catalog);
@@ -6068,8 +6516,9 @@ mod tests {
 
 	/// What `root`'s `segment_index.db` holds besides frames' data, as text: every table
 	/// with its columns (name, type, NOT NULL, default, primary-key position), every
-	/// `segment_index` row's identity and write-once columns, and every `store_meta` row.
-	/// Read with a connection of its own, so the store must be closed.
+	/// `segment_index` row's identity and write-once columns, every `store_meta` row and
+	/// every `store_migrations` record. Read with a connection of its own, so the store
+	/// must be closed.
 	async fn index_schema(root: &Path) -> String {
 		use std::fmt::Write as _;
 
@@ -6089,11 +6538,14 @@ mod tests {
 			let columns: Vec<String> = texts(&conn, &format!("PRAGMA table_info({name})")).await.into_iter().map(|c| c[1..].join(" ")).collect();
 			writeln!(out, "table {name}: {}", columns.join(" | ")).expect("formats");
 		}
-		for row in texts(&conn, "SELECT aspect, id, path, gen, prec, frame_crc, commit_epoch FROM segment_index ORDER BY aspect, id").await {
+		for row in texts(&conn, "SELECT aspect, id, path, gen, prec, frame_crc, commit_epoch, series_id FROM segment_index ORDER BY aspect, id").await {
 			writeln!(out, "row {}", row.join(" ")).expect("formats");
 		}
 		for row in texts(&conn, "SELECT key, value FROM store_meta ORDER BY key").await {
 			writeln!(out, "meta {}", row.join(" ")).expect("formats");
+		}
+		for row in texts(&conn, "SELECT id, layout, applied_ms FROM store_migrations ORDER BY id").await {
+			writeln!(out, "migration {}", row.join(" ")).expect("formats");
 		}
 		drop(conn);
 		drop(db);
@@ -6102,12 +6554,14 @@ mod tests {
 
 	/// The checked-in pre-v2 store (`tests/fixtures/pre_v2_store/root`, written by WeftDB
 	/// before layout v2: absolute frame paths into a root that no longer exists,
-	/// `{aspect}-{id}` frame names, v3 sidecars) migrates in place on open, and the
-	/// migration is idempotent: three opens in a row leave the same tables, columns, rows
-	/// and `store_meta` (one `store_uuid`), rewrite no frame, and every open reads
-	/// exactly what the pre-v2 build read when it wrote the fixture
-	/// (`expected_reads.txt`). That last part also needs the frame paths resolved
-	/// against the current root.
+	/// `{aspect}-{id}` frame names, v3 sidecars, no `STORE_FORMAT`) is layout 1, and
+	/// upgrades in place through the migration registry (FRE-12a): the first open applies
+	/// `0001_baseline` and `0002_s6_s7`, records both in `store_migrations`, mirrors its
+	/// marker into `store_meta` and leaves the marker at layout 2. The migration is
+	/// idempotent: three opens in a row leave the same tables, columns, rows, `store_meta`
+	/// (one `store_uuid`) and records, rewrite no frame, and every open reads exactly what
+	/// the pre-v2 build read when it wrote the fixture (`expected_reads.txt`). That last
+	/// part also needs the frame paths resolved against the current root.
 	#[tokio::test]
 	async fn a_pre_v2_store_migrates_idempotently_and_reads_identically() {
 		let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pre_v2_store");
@@ -6116,11 +6570,16 @@ mod tests {
 		let root = dir.path().join("store");
 		copy_tree(&fixture.join("root"), &root);
 		let frames_before = tree_bytes(&root.join("segments"));
+		assert!(!root.join(STORE_FORMAT_FILE).exists(), "the fixture predates the marker");
 
 		let mut schemas = Vec::new();
+		let mut reports = Vec::new();
+		let mut formats = Vec::new();
 		for open in 1..=3 {
 			let store = SegmentStore::open(&root).await.unwrap_or_else(|e| panic!("open {open}: {e:#}"));
 			let reads = fixture_reads(&store).await;
+			reports.push(store.open_report().clone());
+			formats.push((store.store_format(), store.store_uuid().to_string()));
 			drop(store);
 			assert_eq!(reads, expected_reads, "open {open} reads what the pre-v2 build read");
 			schemas.push(index_schema(&root).await);
@@ -6129,27 +6588,708 @@ mod tests {
 		assert_eq!(schemas[1], schemas[0], "the second open changes nothing the first did not");
 		assert_eq!(schemas[2], schemas[0], "nor does the third");
 
+		let migrated = OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into()], recovery_report_only: false };
+		let settled = OpenReport { created_new: false, migrated_from: None, applied: Vec::new(), recovery_report_only: false };
+		assert_eq!(reports, vec![migrated, settled.clone(), settled], "the first open migrates from layout 1 through the registry, and the later ones find nothing pending");
+		let (format, uuid) = formats[0].clone();
+		assert_eq!(format, StoreFormat { kind: crate::types::store_format::STORE_KIND.into(), layout_version: 2, min_read_layout: 2, min_write_layout: 2, last_written_layout: 2, migrating_to: None, applied_through: Some("0002_s6_s7".into()), store_uuid: uuid.clone(), scope: StoreScope { database: "default".into(), subject: "default".into() } });
+		assert!(formats.iter().all(|seen| seen == &formats[0]), "the marker and the store's identity stay put: {formats:?}");
+		assert_eq!(crate::types::store_format::read_marker(&root).await.expect("reads the marker"), Some(format));
+
 		let schema = &schemas[0];
-		for table in ["aspect_metadata", "aspect_seq", "frame_journal", "ingest_ledger", "segment_changes", "segment_index", "segment_quarantine", "store_meta"] {
+		for table in ["aspect_metadata", "aspect_seq", "frame_journal", "ingest_ledger", "segment_changes", "segment_index", "segment_quarantine", "store_meta", "store_migrations"] {
 			assert!(schema.contains(&format!("table {table}: ")), "{table} exists:\n{schema}");
 		}
-		assert!(schema.contains("| Text(\"gen\") Text(\"INTEGER\") Integer(1) Text(\"0\") Integer(0) | Text(\"prec\") Text(\"INTEGER\") Integer(0) Null Integer(0) | Text(\"frame_crc\") Text(\"INTEGER\") Integer(0) Null Integer(0) | Text(\"commit_epoch\") Text(\"INTEGER\") Integer(0) Null Integer(0)\n"), "segment_index gains gen (NOT NULL DEFAULT 0), prec, frame_crc and commit_epoch:\n{schema}");
+		assert!(schema.contains("| Text(\"gen\") Text(\"INTEGER\") Integer(1) Text(\"0\") Integer(0) | Text(\"prec\") Text(\"INTEGER\") Integer(0) Null Integer(0) | Text(\"frame_crc\") Text(\"INTEGER\") Integer(0) Null Integer(0) | Text(\"commit_epoch\") Text(\"INTEGER\") Integer(0) Null Integer(0) | Text(\"series_id\") Text(\"INTEGER\") Integer(1) Text(\"0\") Integer(0)\n"), "segment_index gains gen (NOT NULL DEFAULT 0), prec, frame_crc, commit_epoch and series_id (NOT NULL DEFAULT 0):\n{schema}");
+		assert!(schema.contains("| Text(\"next_series_id\") Text(\"INTEGER\") Integer(1) Text(\"1\") Integer(0)\n"), "aspect_seq has next_series_id (NOT NULL DEFAULT 1):\n{schema}");
 		let rows: Vec<&str> = schema.lines().filter(|line| line.starts_with("row ")).collect();
 		assert_eq!(rows.len(), 5, "every legacy row is kept:\n{schema}");
 		for row in rows {
 			assert!(row.contains("/var/tmp/weft-pre-v2-fixture/root/segments/"), "the stored path is left as the pre-v2 build wrote it: {row}");
-			assert!(row.ends_with(" Integer(0) Null Null Null"), "a legacy row is generation 0 with no prec, frame_crc or commit_epoch: {row}");
+			assert!(row.ends_with(" Integer(0) Null Null Null Integer(0)"), "a legacy row is generation 0 and series 0, with no prec, frame_crc or commit_epoch: {row}");
 		}
-		assert!(schema.contains("meta Text(\"layout_version\") Text(\"2\")\n"), "{schema}");
-		let uuid = schema.lines().find_map(|line| line.strip_prefix("meta Text(\"store_uuid\") Text(\"")).and_then(|rest| rest.strip_suffix("\")")).unwrap_or_else(|| panic!("a store_uuid is recorded:\n{schema}"));
-		assert!(uuid::Uuid::parse_str(uuid).is_ok(), "the store_uuid is a UUID: {uuid}");
+		for (key, value) in [("applied_through", "0002_s6_s7"), ("last_written_layout", "2"), ("layout_version", "2"), ("min_read_layout", "2"), ("min_write_layout", "2"), ("store_uuid", uuid.as_str())] {
+			assert!(schema.contains(&format!("meta Text(\"{key}\") Text(\"{value}\")\n")), "store_meta mirrors the marker's {key}:\n{schema}");
+		}
+		assert!(uuid::Uuid::parse_str(&uuid).is_ok(), "the store_uuid is a UUID: {uuid}");
+		let migrations: Vec<&str> = schema.lines().filter_map(|line| line.strip_prefix("migration ")).collect();
+		assert_eq!(migrations.len(), 2, "{schema}");
+		assert!(migrations[0].starts_with("Text(\"0001_baseline\") Integer(1) ") && migrations[1].starts_with("Text(\"0002_s6_s7\") Integer(2) "), "{migrations:?}");
+	}
+
+	/// Every file under `root` with its bytes, but the root's `LOCK` and `LOCK.holder`,
+	/// which every open, even a refused one, takes and rewrites.
+	fn files_but_the_lock(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+		let mut files = tree_bytes(root);
+		files.remove(Path::new(crate::types::durable::LOCK_FILE));
+		files.remove(Path::new(crate::types::durable::lock::HOLDER_FILE));
+		files
+	}
+
+	/// Overwrite `root`'s marker with `format`, as another WeftDB would have written it.
+	fn put_marker(root: &Path, format: &StoreFormat) {
+		std::fs::write(root.join(STORE_FORMAT_FILE), serde_json::to_vec(format).expect("encodes")).expect("writes the marker");
+	}
+
+	/// FRE-12a's gate: a store whose marker says only a WeftDB that knows layout 99 may
+	/// write it is refused with `IncompatibleLayout` before anything is opened, and every
+	/// file of the root but `LOCK` and `LOCK.holder` is byte for byte what it was: no
+	/// database was opened (no MVCC switch, no header sync, no DDL) and nothing was
+	/// created (a root holding only such a marker gains no `segments/` and no database).
+	/// An unreadable marker is refused the same way, with `UnreadableStoreFormat`.
+	#[tokio::test]
+	async fn the_gate_refuses_a_newer_write_floor_before_opening_anything() {
+		let dir = TempDir::new().expect("tempdir");
+		let root = dir.path().join("store");
+		let store = SegmentStore::open(&root).await.expect("creates the store");
+		store.seal("price", &schema(), &[0, 10], &[bd("1"), bd("2")]).await.expect("seals");
+		let format = store.store_format();
+		drop(store);
+		let newer = StoreFormat { layout_version: 99, min_read_layout: 99, min_write_layout: 99, last_written_layout: 99, applied_through: Some("0099_future".into()), ..format };
+		put_marker(&root, &newer);
+		let before = files_but_the_lock(&root);
+		let err = SegmentStore::open(&root).await.err().expect("a store this build may not write is refused");
+		let after = files_but_the_lock(&root);
+		assert_eq!(err.downcast_ref::<StoreError>(), Some(&StoreError::IncompatibleLayout { min_write: 99, supported: SUPPORTED_LAYOUT }), "{err:#}");
+		assert!(before == after, "the refused open changed {:?}", before.keys().chain(after.keys()).filter(|path| before.get(*path) != after.get(*path)).collect::<Vec<_>>());
+
+		let bare = dir.path().join("bare");
+		std::fs::create_dir(&bare).expect("creates a root");
+		put_marker(&bare, &newer);
+		let err = SegmentStore::open_scoped(&bare, "market", "BTCUSD").await.err().expect("refused");
+		assert!(matches!(err.downcast_ref::<StoreError>(), Some(StoreError::IncompatibleLayout { min_write: 99, .. })), "{err:#}");
+		assert_eq!(names_in(&bare), vec!["LOCK", "LOCK.holder", "STORE_FORMAT"], "nothing but the lock beside the marker");
+
+		std::fs::write(root.join(STORE_FORMAT_FILE), b"{\"kind\":\"weftdb-store\",").expect("tears the marker");
+		let before = files_but_the_lock(&root);
+		let err = SegmentStore::open(&root).await.err().expect("an unreadable marker is refused");
+		let after = files_but_the_lock(&root);
+		assert!(matches!(err.downcast_ref::<StoreError>(), Some(StoreError::UnreadableStoreFormat { path, .. }) if path == &root.join(STORE_FORMAT_FILE)), "{err:#}");
+		assert!(before == after, "the refused open changed nothing");
+	}
+
+	/// FRE-12a: a new store writes its marker, at this build's layout and floors and
+	/// migrating to it, before any control-plane database exists; once the databases are
+	/// open and every migration has applied, the marker is rewritten in its final form.
+	#[tokio::test]
+	async fn a_new_store_writes_its_marker_before_any_database_exists() {
+		let dir = TempDir::new().expect("tempdir");
+		let root = dir.path().join("store");
+		let fs = Arc::new(RecordingFs::default());
+		let store = SegmentStore::open_on(fs.clone(), &root, "market", "BTCUSD", SegmentStoreOptions::default()).await.expect("creates the store");
+		let report = store.open_report().clone();
+		let (format, uuid) = (store.store_format(), store.store_uuid().to_string());
+		drop(store);
+		let markers = fs.markers();
+		assert_eq!(markers.len(), 2, "the first marker, then the final one: {markers:?}");
+		let (first, databases) = &markers[0];
+		assert!(databases.is_empty(), "no control-plane database existed when the first marker was in place: {databases:?}");
+		assert_eq!((first.layout_version, first.min_read_layout, first.min_write_layout, first.migrating_to, first.applied_through.as_deref()), (SUPPORTED_LAYOUT, SUPPORTED_LAYOUT, SUPPORTED_LAYOUT, Some(SUPPORTED_LAYOUT), None));
+		let (last, databases) = &markers[1];
+		assert_eq!(databases, &CONTROL_PLANE_FILES.to_vec(), "the final marker follows the databases");
+		assert_eq!(last, &format);
+		assert_eq!(format, StoreFormat { migrating_to: None, applied_through: Some("0002_s6_s7".into()), ..first.clone() }, "the final marker is the first, settled");
+		assert_eq!((format.store_uuid.as_str(), &format.scope), (uuid.as_str(), &StoreScope { database: "market".into(), subject: "BTCUSD".into() }));
+		assert_eq!(report, OpenReport { created_new: true, migrated_from: None, applied: vec!["0001_baseline".into(), "0002_s6_s7".into()], recovery_report_only: false });
+		let reopened = SegmentStore::open_scoped(&root, "market", "BTCUSD").await.expect("reopens");
+		let again = (reopened.open_report().created_new, reopened.store_uuid().to_string());
+		drop(reopened);
+		assert_eq!(again, (false, uuid), "a reopen is not a new store, and keeps its identity");
+	}
+
+	/// Every table, column and index of `root`'s four control-plane databases, with every
+	/// `store_meta` and `store_migrations` row, as text. The store must be closed.
+	async fn control_plane_schema(root: &Path) -> String {
+		use std::fmt::Write as _;
+
+		let mut out = String::new();
+		for file in CONTROL_PLANE_FILES {
+			let db = turso::Builder::new_local(&root.join(file).to_string_lossy()).build().await.expect("opens the database");
+			let conn = db.connect().expect("connects");
+			let mut rows = conn.query("SELECT type, name, sql FROM sqlite_schema ORDER BY type, name", ()).await.expect("reads the schema");
+			while let Some(row) = rows.next().await.expect("reads a row") {
+				writeln!(out, "{file}: {:?} {:?} {:?}", row.get_value(0).expect("type"), row.get_value(1).expect("name"), row.get_value(2).expect("sql")).expect("formats");
+			}
+			drop(rows);
+			for sql in ["SELECT key, value FROM store_meta ORDER BY key", "SELECT id, layout, applied_ms FROM store_migrations ORDER BY id"] {
+				if let Ok(mut rows) = conn.query(sql, ()).await {
+					while let Some(row) = rows.next().await.expect("reads a row") {
+						writeln!(out, "{file}: {:?} {:?} {:?}", row.get_value(0).expect("a value"), row.get_value(1).expect("a value"), row.get_value(2).ok()).expect("formats");
+					}
+				}
+			}
+			drop(conn);
+			drop(db);
+		}
+		out
+	}
+
+	/// FRE-12a: running the migrations again is a no-op. Every registered migration run a
+	/// second time, directly, over a store that has them all leaves every database's
+	/// schema and every record exactly as it was, and the next open finds nothing pending.
+	#[tokio::test]
+	async fn running_the_migrations_twice_is_a_no_op() {
+		let dir = TempDir::new().expect("tempdir");
+		let root = dir.path().join("store");
+		let store = SegmentStore::open(&root).await.expect("creates the store");
+		store.declare("price", &schema()).await.expect("declares");
+		store.seal("price", &schema(), &[0, 10], &[bd("1"), bd("2")]).await.expect("seals");
+		drop(store);
+		let before = control_plane_schema(&root).await;
+
+		let names = CONTROL_PLANE_FILES.map(|file| root.join(file).to_string_lossy().into_owned());
+		let index = SegmentIndexStore::open_unmigrated(&names[0]).await.expect("opens");
+		let metadata = AspectMetadataStore::open_unmigrated(&names[1]).await.expect("opens");
+		let catalog = AspectCatalog::open_unmigrated(&names[2]).await.expect("opens");
+		let registry = CatalogStore::open_unmigrated(&names[3]).await.expect("opens");
+		let cp = migrations::ControlPlane { index: Some(migrations::Db { db: index.database(), name: &names[0] }), metadata: Some(migrations::Db { db: metadata.database(), name: &names[1] }), aspect_catalog: Some(migrations::Db { db: catalog.database(), name: &names[2] }), catalog: Some(migrations::Db { db: registry.database(), name: &names[3] }) };
+		let all: Vec<&migrations::Migration> = migrations::REGISTRY.iter().collect();
+		let ran = migrations::run(&cp, &all).await.expect("runs every migration again");
+		drop((index, metadata, catalog, registry));
+		let after = control_plane_schema(&root).await;
+
+		let store = SegmentStore::open(&root).await.expect("reopens");
+		let applied = store.open_report().applied.clone();
+		let reads = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
+		drop(store);
+		assert_eq!(ran, vec!["0001_baseline", "0002_s6_s7"]);
+		assert!(before.contains("store_migrations") && before.contains("0002_s6_s7"), "{before}");
+		assert_eq!(after, before, "a second run of every migration changed nothing");
+		assert!(applied.is_empty(), "nothing is pending: {applied:?}");
+		assert_eq!(reads.0, vec![0, 10]);
+		assert_eq!(control_plane_schema(&root).await, before, "nor did the reopen");
+	}
+
+	/// A [`StoreFs`] over a [`SimFs`](crate::durable::SimFs) that, right after every step
+	/// of every marker write (the temporary file's synced write, its rename over the
+	/// marker, the root's fsync), cuts the power with each of `seeds` and keeps the
+	/// images.
+	#[derive(Debug)]
+	struct MarkerCuttingFs {
+		sim: crate::durable::SimFs,
+		images: PathBuf,
+		seeds: &'static [u64],
+		taken: std::sync::Mutex<Vec<PathBuf>>,
+	}
+
+	impl MarkerCuttingFs {
+		fn cut(&self) {
+			let mut taken = self.taken.lock().expect("not poisoned");
+			for seed in self.seeds {
+				let image = self.images.join(format!("cut-{}-{seed}", taken.len()));
+				self.sim.power_cut(*seed, &image).expect("cuts the power");
+				taken.push(image);
+			}
+		}
+
+		fn is_marker_step(&self, path: &Path) -> bool {
+			path.parent() == Some(self.sim.root()) && path.file_name().is_some_and(|name| name.to_string_lossy().starts_with(STORE_FORMAT_FILE))
+		}
+	}
+
+	#[async_trait::async_trait]
+	impl StoreFs for MarkerCuttingFs {
+		async fn create_new_write(&self, path: &Path, bytes: Vec<u8>, policy: crate::types::durable::SyncPolicy, points: crate::types::durable::WritePoints) -> std::io::Result<()> {
+			self.sim.create_new_write(path, bytes, policy, points).await?;
+			if self.is_marker_step(path) {
+				self.cut();
+			}
+			Ok(())
+		}
+
+		async fn sync_file(&self, path: &Path) -> std::io::Result<()> {
+			self.sim.sync_file(path).await
+		}
+
+		async fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
+			self.sim.sync_dir(dir).await?;
+			if dir == self.sim.root() {
+				self.cut();
+			}
+			Ok(())
+		}
+
+		async fn hard_link(&self, src: &Path, dst: &Path) -> std::io::Result<()> {
+			self.sim.hard_link(src, dst).await
+		}
+
+		async fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+			self.sim.rename(from, to).await?;
+			if self.is_marker_step(to) {
+				self.cut();
+			}
+			Ok(())
+		}
+
+		async fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+			self.sim.remove_file(path).await
+		}
+
+		async fn create_dir(&self, path: &Path) -> std::io::Result<()> {
+			self.sim.create_dir(path).await
+		}
+
+		async fn remove_dir_all(&self, path: &Path) -> std::io::Result<()> {
+			self.sim.remove_dir_all(path).await
+		}
+
+		async fn copy_new(&self, src: &Path, dst: &Path, policy: crate::types::durable::SyncPolicy) -> std::io::Result<u64> {
+			self.sim.copy_new(src, dst, policy).await
+		}
+
+		async fn read_dir(&self, dir: &Path) -> std::io::Result<Vec<crate::types::durable::FsEntry>> {
+			self.sim.read_dir(dir).await
+		}
+
+		async fn metadata(&self, path: &Path) -> std::io::Result<crate::types::durable::FsMetadata> {
+			self.sim.metadata(path).await
+		}
+	}
+
+	/// The registered migrations a store image's `segment_index.db` records as applied,
+	/// read raw (none when the database or the table is missing).
+	async fn recorded_migrations(root: &Path) -> Vec<String> {
+		let path = root.join("segment_index.db");
+		if !path.exists() {
+			return Vec::new();
+		}
+		let db = turso::Builder::new_local(&path.to_string_lossy()).build().await.expect("opens the image's index");
+		let conn = db.connect().expect("connects");
+		let mut ids = Vec::new();
+		if let Ok(mut rows) = conn.query("SELECT id FROM store_migrations ORDER BY id", ()).await {
+			while let Some(row) = rows.next().await.expect("reads a row") {
+				ids.push(row.get_value(0).expect("an id").as_text().cloned().expect("text"));
+			}
+		}
+		drop(conn);
+		drop(db);
+		ids
+	}
+
+	/// The tables of `root`'s `segment_index.db`, by name, read raw.
+	async fn index_tables(root: &Path) -> Vec<String> {
+		let db = turso::Builder::new_local(&root.join("segment_index.db").to_string_lossy()).build().await.expect("opens the index");
+		let conn = db.connect().expect("connects");
+		let mut rows = conn.query("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name", ()).await.expect("reads the schema");
+		let mut names = Vec::new();
+		while let Some(row) = rows.next().await.expect("reads a row") {
+			names.push(row.get_value(0).expect("a name").as_text().cloned().expect("text"));
+		}
+		drop(rows);
+		drop(conn);
+		drop(db);
+		names
+	}
+
+	/// The column names of `table` in `root`'s `segment_index.db`, read raw.
+	async fn index_columns(root: &Path, table: &str) -> Vec<String> {
+		let db = turso::Builder::new_local(&root.join("segment_index.db").to_string_lossy()).build().await.expect("opens the index");
+		let conn = db.connect().expect("connects");
+		let names = migrations::column_names(&conn, table).await.expect("lists the columns");
+		drop(conn);
+		drop(db);
+		names
+	}
+
+	/// FRE-12a's floor-first rule under power loss: the power is cut (with several seeds)
+	/// right after each step of every marker write an open makes, for a new store and for
+	/// the layout-1 fixture, and in every image the marker's floors (layout 1's when there
+	/// is no marker yet) are at least what every migration the image's `store_migrations`
+	/// records needs. A marker written only after the migrations, as one in its final form
+	/// would be, fails this at the first cut. Every image then opens, settles its marker,
+	/// and reads what the store held.
+	#[tokio::test]
+	async fn a_power_cut_at_any_marker_write_never_leaves_floors_below_a_committed_migration() {
+		// Sixteen seeds, so that the floor invariant by itself catches a marker write that
+		// skips the root's fsync (with three, only the cut count below did).
+		const SEEDS: &[u64] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+		let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pre_v2_store");
+		let expected_reads = std::fs::read_to_string(fixture.join("expected_reads.txt")).expect("reads the expected reads");
+		for legacy in [false, true] {
+			let dir = TempDir::new().expect("tempdir");
+			let root = dir.path().join("store");
+			if legacy {
+				copy_tree(&fixture.join("root"), &root);
+			} else {
+				std::fs::create_dir(&root).expect("creates the root");
+			}
+			let images = dir.path().join("images");
+			let sim = crate::durable::SimFs::exempting(&root, crate::durable::SimFs::turso_file).expect("simulates the root");
+			let fs = Arc::new(MarkerCuttingFs { sim, images, seeds: SEEDS, taken: std::sync::Mutex::default() });
+			drop(SegmentStore::open_on(fs.clone(), &root, "default", "default", SegmentStoreOptions::default()).await.expect("opens"));
+			let taken = fs.taken.lock().expect("not poisoned").clone();
+			assert!(taken.len() >= 6 * SEEDS.len(), "legacy {legacy}: both marker writes were cut at each step: {}", taken.len());
+			for image in taken {
+				let marker = crate::types::store_format::read_marker(&image).await.unwrap_or_else(|e| panic!("{}: the marker is whole or absent, never torn: {e}", image.display()));
+				let (min_read, min_write) = marker.as_ref().map_or((crate::LEGACY_LAYOUT, crate::LEGACY_LAYOUT), |m| (m.min_read_layout, m.min_write_layout));
+				for id in recorded_migrations(&image).await {
+					let migration = migrations::REGISTRY.iter().find(|m| m.id == id).unwrap_or_else(|| panic!("an unknown migration {id}"));
+					assert!(min_read >= migration.min_read_after && min_write >= migration.min_write_after, "{} (legacy {legacy}): {id} committed, needing floors {}/{}, but the marker {marker:?} holds {min_read}/{min_write}", image.display(), migration.min_read_after, migration.min_write_after);
+				}
+				let store = SegmentStore::open(&image).await.unwrap_or_else(|e| panic!("{}: the image opens: {e:#}", image.display()));
+				let settled = store.store_format();
+				let reads = if legacy { Some(fixture_reads(&store).await) } else { None };
+				drop(store);
+				assert_eq!((settled.layout_version, settled.min_write_layout, settled.migrating_to, settled.applied_through.as_deref()), (SUPPORTED_LAYOUT, SUPPORTED_LAYOUT, None, Some("0002_s6_s7")), "{}", image.display());
+				if let Some(reads) = reads {
+					assert_eq!(reads, expected_reads, "{}: the image reads what the fixture holds", image.display());
+				}
+			}
+		}
+	}
+
+	/// FRE-12a: a store whose layout is newer than this build's, but whose write floor
+	/// this build meets, opens without running a single migration (here, not even one its
+	/// `store_migrations` lacks), says recovery must only report, and records only that
+	/// this build wrote it (`last_written_layout`), so the newer WeftDB re-derives what it
+	/// must. It keeps working.
+	#[tokio::test]
+	async fn a_newer_layout_this_build_may_write_opens_without_migrating() {
+		let dir = TempDir::new().expect("tempdir");
+		let root = dir.path().join("store");
+		let store = SegmentStore::open(&root).await.expect("creates the store");
+		store.seal("price", &schema(), &[0, 10], &[bd("1"), bd("2")]).await.expect("seals");
+		let format = store.store_format();
+		drop(store);
+		let newer = StoreFormat { layout_version: 3, min_read_layout: 3, min_write_layout: 2, last_written_layout: 3, applied_through: Some("0009_future".into()), ..format.clone() };
+		put_marker(&root, &newer);
+		// A pending migration and a table it would create, so that a migration run would
+		// show.
+		let db = turso::Builder::new_local(&root.join("segment_index.db").to_string_lossy()).build().await.expect("opens raw");
+		let conn = db.connect().expect("connects");
+		conn.execute("DELETE FROM store_migrations WHERE id = '0002_s6_s7'", ()).await.expect("forgets a migration");
+		conn.execute("DROP TABLE segment_changes", ()).await.expect("drops a table it creates");
+		drop(conn);
+		drop(db);
+
+		let store = SegmentStore::open(&root).await.expect("a newer layout this build may write opens");
+		let report = store.open_report().clone();
+		let settled = store.store_format();
+		let sealed = store.seal("price", &schema(), &[20], &[bd("3")]).await.map(|d| d.id);
+		let (ts, _) = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
+		drop(store);
+		let schema_after = index_schema(&root).await;
+		assert_eq!(report, OpenReport { created_new: false, migrated_from: None, applied: Vec::new(), recovery_report_only: true });
+		assert_eq!(settled, StoreFormat { last_written_layout: SUPPORTED_LAYOUT, ..newer }, "only last_written_layout changes");
+		assert_eq!(crate::types::store_format::read_marker(&root).await.expect("reads"), Some(settled));
+		assert!(!schema_after.contains("table segment_changes"), "no migration ran:\n{schema_after}");
+		assert!(schema_after.contains("meta Text(\"layout_version\") Text(\"3\")") && schema_after.contains("meta Text(\"last_written_layout\") Text(\"2\")") && schema_after.contains("meta Text(\"min_write_layout\") Text(\"2\")"), "store_meta mirrors the marker:\n{schema_after}");
+		assert_eq!(sealed.expect("the store takes writes"), 1);
+		assert_eq!(ts, vec![0, 10, 20]);
+	}
+
+	/// Run each of `statements` on `root`'s `segment_index.db`, on a raw connection of its
+	/// own (the store must be closed).
+	async fn on_raw_index(root: &Path, statements: &[&str]) {
+		let db = turso::Builder::new_local(&root.join("segment_index.db").to_string_lossy()).build().await.expect("opens raw");
+		let conn = db.connect().expect("connects");
+		for sql in statements {
+			conn.execute(*sql, ()).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+		}
+		drop(conn);
+		drop(db);
+	}
+
+	/// A root whose `STORE_FORMAT` is gone, but whose databases a WeftDB that writes
+	/// markers wrote, is judged by the copy of the marker its `store_meta` holds, not
+	/// taken for layout 1:
+	///
+	/// - a settled store gets its marker back as it was (identity and floors), and nothing
+	///   is migrated;
+	/// - a newer layout this build may write opens report-only, and neither its layout nor
+	///   its read floor is lowered, in the marker or in `store_meta`;
+	/// - a write floor of 99 is refused with `IncompatibleLayout` before anything is
+	///   written: every file of the root but `LOCK` and `LOCK.holder` is byte for byte
+	///   what it was, and no marker is planted; nor is a stale layout-1 marker raised.
+	#[tokio::test]
+	async fn a_root_that_lost_its_marker_is_judged_by_store_meta() {
+		let dir = TempDir::new().expect("tempdir");
+		let root = dir.path().join("store");
+		let store = SegmentStore::open(&root).await.expect("creates the store");
+		store.seal("price", &schema(), &[0, 10], &[bd("1"), bd("2")]).await.expect("seals");
+		let format = store.store_format();
+		drop(store);
+
+		std::fs::remove_file(root.join(STORE_FORMAT_FILE)).expect("loses the marker");
+		let store = SegmentStore::open(&root).await.expect("reopens");
+		let (report, restored, uuid) = (store.open_report().clone(), store.store_format(), store.store_uuid().to_string());
+		drop(store);
+		assert_eq!(report, OpenReport { created_new: false, migrated_from: None, applied: Vec::new(), recovery_report_only: false });
+		assert_eq!(restored, format, "the marker is rebuilt from store_meta as it was");
+		assert_eq!(uuid, format.store_uuid);
+		assert_eq!(crate::types::store_format::read_marker(&root).await.expect("reads"), Some(format.clone()), "and written back");
+
+		on_raw_index(&root, &["UPDATE store_meta SET value = '3' WHERE key IN ('layout_version', 'min_read_layout', 'last_written_layout')"]).await;
+		std::fs::remove_file(root.join(STORE_FORMAT_FILE)).expect("loses the marker");
+		let store = SegmentStore::open(&root).await.expect("a newer layout this build may write opens");
+		let (report, restored) = (store.open_report().clone(), store.store_format());
+		let sealed = store.seal("price", &schema(), &[20], &[bd("3")]).await.map(|d| d.id);
+		drop(store);
+		let schema_after = index_schema(&root).await;
+		assert_eq!(report, OpenReport { created_new: false, migrated_from: None, applied: Vec::new(), recovery_report_only: true });
+		assert_eq!(restored, StoreFormat { layout_version: 3, min_read_layout: 3, last_written_layout: SUPPORTED_LAYOUT, ..format.clone() }, "the newer layout and read floor are kept");
+		assert_eq!(crate::types::store_format::read_marker(&root).await.expect("reads"), Some(restored));
+		assert!(schema_after.contains("meta Text(\"layout_version\") Text(\"3\")") && schema_after.contains("meta Text(\"min_read_layout\") Text(\"3\")"), "store_meta is not lowered:\n{schema_after}");
+		assert_eq!(sealed.expect("the store takes writes"), 1);
+
+		on_raw_index(&root, &["UPDATE store_meta SET value = '99' WHERE key = 'min_write_layout'"]).await;
+		std::fs::remove_file(root.join(STORE_FORMAT_FILE)).expect("loses the marker");
+		let before = files_but_the_lock(&root);
+		let err = SegmentStore::open(&root).await.err().expect("a store this build may not write is refused");
+		let after = files_but_the_lock(&root);
+		assert_eq!(err.downcast_ref::<StoreError>(), Some(&StoreError::IncompatibleLayout { min_write: 99, supported: SUPPORTED_LAYOUT }), "{err:#}");
+		assert!(before == after, "the refused open changed {:?}", before.keys().chain(after.keys()).filter(|path| before.get(*path) != after.get(*path)).collect::<Vec<_>>());
+		assert!(!root.join(STORE_FORMAT_FILE).exists(), "no marker was planted");
+
+		// A stale layout-1 marker over the same control plane passes the marker's gate,
+		// and store_meta's floor still refuses the store before the marker is raised.
+		put_marker(&root, &StoreFormat { layout_version: 1, min_read_layout: 1, min_write_layout: 1, last_written_layout: 1, migrating_to: None, applied_through: None, ..format });
+		let before = files_but_the_lock(&root);
+		let err = SegmentStore::open(&root).await.err().expect("refused by store_meta");
+		assert_eq!(err.downcast_ref::<StoreError>(), Some(&StoreError::IncompatibleLayout { min_write: 99, supported: SUPPORTED_LAYOUT }), "{err:#}");
+		assert!(files_but_the_lock(&root) == before, "the stale marker was not raised");
+	}
+
+	/// A root holding only the marker of a layout newer than this build's (its write floor
+	/// this build meets) and none of its databases: a newer WeftDB began creating the store.
+	/// This build cannot create that layout, so it refuses the root with
+	/// `NewerStoreWithoutDatabases`, creating nothing: no database, no `segments/`.
+	#[tokio::test]
+	async fn a_newer_marker_without_databases_is_refused_untouched() {
+		let dir = TempDir::new().expect("tempdir");
+		let root = dir.path().join("store");
+		std::fs::create_dir(&root).expect("creates the root");
+		let newer = StoreFormat { layout_version: 3, min_read_layout: 3, min_write_layout: 2, last_written_layout: 3, migrating_to: Some(3), ..StoreFormat::new_store(StoreScope { database: "default".into(), subject: "default".into() }) };
+		put_marker(&root, &newer);
+		let before = files_but_the_lock(&root);
+		let err = SegmentStore::open(&root).await.err().expect("refused");
+		assert_eq!(err.downcast_ref::<StoreError>(), Some(&StoreError::NewerStoreWithoutDatabases { layout: 3, supported: SUPPORTED_LAYOUT }), "{err:#}");
+		assert_eq!(names_in(&root), vec!["LOCK", "LOCK.holder", "STORE_FORMAT"], "nothing but the lock beside the marker");
+		assert!(files_but_the_lock(&root) == before, "the marker is untouched");
+	}
+
+	/// A development store of S6 or S7 (no marker, no `store_migrations`, a `store_meta`
+	/// with only `layout_version` 2 and its `store_uuid`, `segment_index` without
+	/// `series_id` and `aspect_seq` without `next_series_id`) is layout 1 to the registry:
+	/// it is migrated from layout 1 through both migrations, gains both columns with their
+	/// declarations, keeps its identity, and seals and reads.
+	#[tokio::test]
+	async fn an_s6_era_store_gains_the_series_columns_and_keeps_its_identity() {
+		let dir = TempDir::new().expect("tempdir");
+		let root = dir.path().join("store");
+		let store = SegmentStore::open(&root).await.expect("creates the store");
+		store.seal("price", &schema(), &[0, 10], &[bd("1"), bd("2")]).await.expect("seals");
+		let uuid = store.store_uuid().to_string();
+		drop(store);
+		std::fs::remove_file(root.join(STORE_FORMAT_FILE)).expect("removes the marker");
+		on_raw_index(&root, &["DROP TABLE store_migrations", "DELETE FROM store_meta WHERE key <> 'store_uuid'", "INSERT INTO store_meta (key, value) VALUES ('layout_version', '2')", "ALTER TABLE segment_index DROP COLUMN series_id", "ALTER TABLE aspect_seq DROP COLUMN next_series_id"]).await;
+		let (tables, index_columns, seq_columns) = (index_tables(&root).await, index_columns(&root, "segment_index").await, index_columns(&root, "aspect_seq").await);
+		assert!(!tables.contains(&"store_migrations".to_string()) && index_columns.contains(&"gen".to_string()) && !index_columns.contains(&"series_id".to_string()) && !seq_columns.contains(&"next_series_id".to_string()), "the S6/S7 shape: {tables:?} {index_columns:?} {seq_columns:?}");
+
+		let store = SegmentStore::open(&root).await.expect("an S6-era store opens");
+		let (report, kept) = (store.open_report().clone(), store.store_uuid().to_string());
+		let sealed = store.seal("price", &schema(), &[20], &[bd("3")]).await.map(|d| d.id);
+		let (ts, _) = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
+		drop(store);
+		let schema = index_schema(&root).await;
+		assert_eq!(report, OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into()], recovery_report_only: false });
+		assert_eq!(kept, uuid, "the S6 store_uuid is kept");
+		assert!(schema.contains("| Text(\"series_id\") Text(\"INTEGER\") Integer(1) Text(\"0\") Integer(0)\n"), "segment_index gains series_id (NOT NULL DEFAULT 0):\n{schema}");
+		assert!(schema.contains("| Text(\"next_series_id\") Text(\"INTEGER\") Integer(1) Text(\"1\") Integer(0)\n"), "aspect_seq gains next_series_id (NOT NULL DEFAULT 1):\n{schema}");
+		assert_eq!(sealed.expect("the store seals"), 1);
+		assert_eq!(ts, vec![0, 10, 20]);
+	}
+
+	/// An open that stopped part way leaves its marker unsettled, and the next open reports
+	/// what it finished from that: a new store whose creation stopped after its databases
+	/// existed but before its migrations were recorded (the first marker of a new store)
+	/// is reported as created, not migrated from its own layout; a layout-1 store whose
+	/// upgrade stopped after the floor raise is reported as migrated from layout 1.
+	#[tokio::test]
+	async fn an_unfinished_open_is_reported_as_what_it_was() {
+		let dir = TempDir::new().expect("tempdir");
+		let root = dir.path().join("store");
+		let store = SegmentStore::open(&root).await.expect("creates the store");
+		let format = store.store_format();
+		drop(store);
+		put_marker(&root, &StoreFormat { migrating_to: Some(SUPPORTED_LAYOUT), applied_through: None, ..format.clone() });
+		on_raw_index(&root, &["DELETE FROM store_migrations"]).await;
+		let store = SegmentStore::open(&root).await.expect("finishes the creation");
+		let (report, uuid) = (store.open_report().clone(), store.store_uuid().to_string());
+		drop(store);
+		assert_eq!(report, OpenReport { created_new: true, migrated_from: None, applied: vec!["0001_baseline".into(), "0002_s6_s7".into()], recovery_report_only: false });
+		assert_eq!(uuid, format.store_uuid);
+
+		let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pre_v2_store");
+		let legacy = dir.path().join("legacy");
+		copy_tree(&fixture.join("root"), &legacy);
+		let raised = StoreFormat { layout_version: 1, min_read_layout: 2, min_write_layout: 2, last_written_layout: 1, migrating_to: Some(2), applied_through: None, ..format };
+		put_marker(&legacy, &raised);
+		let store = SegmentStore::open(&legacy).await.expect("finishes the upgrade");
+		let report = store.open_report().clone();
+		drop(store);
+		assert_eq!(report, OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into()], recovery_report_only: false });
+	}
+
+	/// FRE-12a's `ensure_floor`: raising a floor writes the marker first, fsynced, and
+	/// returns the op that raises `store_meta` inside the caller's transaction; after the
+	/// first call for a level nothing is written. A level newer than this build's is
+	/// refused.
+	#[tokio::test]
+	async fn ensure_floor_raises_the_marker_first_and_store_meta_in_the_callers_transaction() {
+		let dir = TempDir::new().expect("tempdir");
+		let root = dir.path().join("store");
+		let store = SegmentStore::open(&root).await.expect("creates the store");
+		assert_eq!(store.ensure_floor(SUPPORTED_LAYOUT).await.expect("ensures"), None, "a fresh store already has this build's floors");
+		// Play a store whose floors are below the level a write needs: what the first
+		// layout-3 frame feature will find on a layout-2 store.
+		let lowered = StoreFormat { min_read_layout: 1, min_write_layout: 1, ..store.store_format() };
+		*store.format.write().expect("not poisoned") = lowered.clone();
+		store.floor_ensured.store(1, Ordering::Release);
+		store.commit_index(&IndexTxn::new(vec![IndexOp::MetaSet { key: "min_read_layout".into(), value: "1".into() }, IndexOp::MetaSet { key: "min_write_layout".into(), value: "1".into() }])).await.expect("lowers store_meta");
+		put_marker(&root, &lowered);
+
+		let op = store.ensure_floor(2).await.expect("raises the floor");
+		let marker = crate::types::store_format::read_marker(&root).await.expect("reads").expect("a marker");
+		let meta_before = (store.index().meta("min_read_layout").await.expect("reads"), store.index().meta("min_write_layout").await.expect("reads"));
+		store.commit_index(&IndexTxn::new(op.clone().into_iter().collect())).await.expect("the caller's transaction commits");
+		let meta_after = (store.index().meta("min_read_layout").await.expect("reads"), store.index().meta("min_write_layout").await.expect("reads"));
+		let again = store.ensure_floor(2).await.expect("ensures again");
+		let too_new = store.ensure_floor(SUPPORTED_LAYOUT + 1).await.err().expect("a newer level is refused").to_string();
+		drop(store);
+		assert_eq!(op, Some(IndexOp::RaiseFloor { level: 2 }));
+		assert_eq!((marker.min_read_layout, marker.min_write_layout), (2, 2), "the marker is raised before the op is handed back");
+		assert_eq!(meta_before, (Some("1".into()), Some("1".into())), "store_meta waits for the caller's transaction");
+		assert_eq!(meta_after, (Some("2".into()), Some("2".into())));
+		assert_eq!(again, None, "the floor is cached after the first call");
+		assert!(too_new.contains(&format!("writes layouts up to {SUPPORTED_LAYOUT}")), "{too_new}");
+	}
+
+	/// Rewrite every `segment_index` row's path under `root` with `rewrite(aspect, id,
+	/// path)`, and insert `extra` rows (aspect, id, path) copied from the first row.
+	async fn rewrite_index_paths(root: &Path, rewrite: impl Fn(&str, i64, &str) -> String, extra: &[(&str, i64, &str)]) {
+		let db = turso::Builder::new_local(&root.join("segment_index.db").to_string_lossy()).build().await.expect("opens raw");
+		let conn = db.connect().expect("connects");
+		let mut rows = conn.query("SELECT aspect, id, path FROM segment_index", ()).await.expect("reads");
+		let mut all = Vec::new();
+		while let Some(row) = rows.next().await.expect("reads a row") {
+			all.push((row.get_value(0).expect("aspect").as_text().cloned().expect("text"), *row.get_value(1).expect("id").as_integer().expect("integer"), row.get_value(2).expect("path").as_text().cloned().expect("text")));
+		}
+		drop(rows);
+		for (aspect, id, path) in &all {
+			conn.execute("UPDATE segment_index SET path = ? WHERE aspect = ? AND id = ?", turso::params![rewrite(aspect, *id, path), aspect.clone(), *id]).await.expect("rewrites a path");
+		}
+		for (aspect, id, path) in extra {
+			let (from_aspect, from_id, _) = &all[0];
+			conn.execute("INSERT INTO segment_index SELECT ?, ?, ?, format_version, physical_type, time_unit, row_count, null_count, time_sorted, min_ts, max_ts, min_value, max_value, byte_len FROM segment_index WHERE aspect = ? AND id = ?", turso::params![aspect.to_string(), *id, path.to_string(), from_aspect.clone(), *from_id]).await.expect("inserts a row");
+		}
+		drop(conn);
+		drop(db);
+	}
+
+	/// Release plan D-S6 / FRE-13: a layout-1 store whose index records a frame outside
+	/// `segments/` (written through the aspect-name traversal of pre-1.0 builds: an aspect
+	/// named `../evil` sealed into `root/evil-0.weftseg`) is refused at its migration to
+	/// layout 2 with `UnsafeLegacyPath`, naming the aspect, before any migration applies
+	/// and before a marker is written: no `STORE_FORMAT`, no `store_meta` or
+	/// `store_migrations`, and nothing moved or quarantined. Once the row is gone the store
+	/// upgrades. The same store with its paths in Windows form
+	/// (`C:\…\segments\price-0.weftseg`) upgrades and reads exactly what the fixture holds.
+	#[tokio::test]
+	async fn an_escaped_layout_one_path_is_refused_and_windows_paths_resolve() {
+		let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pre_v2_store");
+		let expected_reads = std::fs::read_to_string(fixture.join("expected_reads.txt")).expect("reads the expected reads");
+		let dir = TempDir::new().expect("tempdir");
+
+		let root = dir.path().join("escaped");
+		copy_tree(&fixture.join("root"), &root);
+		std::fs::copy(root.join("segments/price-0.weftseg"), root.join("evil-0.weftseg")).expect("plants the escaped frame");
+		rewrite_index_paths(&root, |_, _, path| path.to_string(), &[("../evil", 0, "/var/tmp/weft-pre-v2-fixture/root/segments/../evil-0.weftseg")]).await;
+		let segments_before = tree_bytes(&root.join("segments"));
+		for attempt in 1..=2 {
+			let err = SegmentStore::open(&root).await.err().unwrap_or_else(|| panic!("attempt {attempt}: an escaped frame path is refused"));
+			assert_eq!(err.downcast_ref::<StoreError>(), Some(&StoreError::UnsafeLegacyPath { aspects: vec!["../evil".into()] }), "attempt {attempt}: {err:#}");
+			assert!(format!("{err:#}").contains("\"../evil\""), "the error names the aspect: {err:#}");
+		}
+		assert_eq!(tree_bytes(&root.join("segments")), segments_before, "nothing under segments/ was moved, quarantined or rewritten");
+		assert!(root.join("evil-0.weftseg").exists() && !root.join("segments/quarantine").exists(), "the escaped frame is left where it is");
+		assert!(!root.join(STORE_FORMAT_FILE).exists(), "no marker was written");
+		let tables = index_tables(&root).await;
+		assert!(tables.contains(&"segment_index".to_string()) && !tables.iter().any(|table| ["store_meta", "store_migrations", "aspect_seq"].contains(&table.as_str())), "no migration applied, 0001 included: {tables:?}");
+		let db = turso::Builder::new_local(&root.join("segment_index.db").to_string_lossy()).build().await.expect("opens raw");
+		db.connect().expect("connects").execute("DELETE FROM segment_index WHERE aspect = '../evil'", ()).await.expect("drops the escaped row");
+		drop(db);
+		let store = SegmentStore::open(&root).await.expect("upgrades once the escaped row is gone");
+		let reads = fixture_reads(&store).await;
+		drop(store);
+		assert_eq!(reads, expected_reads);
+
+		let root = dir.path().join("windows");
+		copy_tree(&fixture.join("root"), &root);
+		rewrite_index_paths(&root, |aspect, id, _| format!("C:\\weft\\pre-v2\\root\\segments\\{aspect}-{id}.weftseg"), &[]).await;
+		let store = SegmentStore::open(&root).await.expect("a store written on Windows upgrades");
+		let reads = fixture_reads(&store).await;
+		drop(store);
+		assert_eq!(reads, expected_reads, "and reads its frames through the split on \\");
+	}
+
+	/// Set only in the child process `a_process_wide_poison_refuses_every_store_write`
+	/// starts: the root to open.
+	const GLOBAL_POISON_CHILD_ROOT: &str = "WEFT_TEST_GLOBAL_POISON_CHILD_ROOT";
+
+	/// The body that child runs (the process-wide poison cannot be unset, so it runs in a
+	/// process of its own): poison the process, as the panic hook does for a panic inside
+	/// a control-plane write, and check that an open store refuses writes, keeps reading
+	/// and wakes its poison watchers, and that no store opens any more, the same root
+	/// reopened or a new one, with nothing of either root touched. In a normal test run
+	/// the variable is unset and this does nothing.
+	#[tokio::test]
+	async fn global_poison_child() {
+		let Some(root) = std::env::var_os(GLOBAL_POISON_CHILD_ROOT) else { return };
+		let root = PathBuf::from(root);
+		let reason = "the process is write-poisoned: a panic inside a control-plane write";
+		let store = SegmentStore::open(root.join("before")).await.expect("opens");
+		store.seal("price", &schema(), &[0], &[bd("1")]).await.expect("seals before the poison");
+		assert!(poison_global().set("a panic inside a control-plane write"));
+		assert!(!poison_global().set("a second one"), "the first poisoning is the one kept");
+		let woken = tokio::time::timeout(std::time::Duration::from_secs(10), store.wait_until_poisoned()).await.expect("watchers wake");
+		let seal = store.seal("price", &schema(), &[10], &[bd("2")]).await.expect_err("a seal is refused");
+		let declare = store.declare("temp", &schema()).await.expect_err("a declare is refused");
+		for err in [seal, declare] {
+			assert_eq!(err.downcast_ref::<Poisoned>().map(|poisoned| poisoned.reason.as_str()), Some(reason), "refused as poisoned: {err:#}");
+		}
+		assert!(store.poisoned().is_some());
+		let (ts, _) = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads go on");
+		assert_eq!(ts, vec![0]);
+		drop(store);
+
+		let before = tree_bytes(&root.join("before"));
+		for which in ["before", "after"] {
+			let err = SegmentStore::open(root.join(which)).await.err().unwrap_or_else(|| panic!("{which}: a poisoned process opens no store"));
+			assert_eq!(err.downcast_ref::<Poisoned>().map(|poisoned| poisoned.reason.as_str()), Some(reason), "{which}: {err:#}");
+		}
+		assert!(tree_bytes(&root.join("before")) == before, "the refused reopen touched nothing, not even LOCK");
+		assert!(!root.join("after").exists(), "nor did it create a new root");
+		println!("global poison child: {}", woken.reason);
+	}
+
+	/// Robustness track ROB-2: the process-wide poison (`poison_global`) refuses every
+	/// write of every store while reads go on, and every open, which writes.
+	#[tokio::test]
+	async fn a_process_wide_poison_refuses_every_store_write() {
+		let dir = TempDir::new().expect("tempdir");
+		let exe = std::env::current_exe().expect("finds the test binary");
+		let out = tokio::process::Command::new(exe).args(["types::segment_store::tests::global_poison_child", "--exact", "--nocapture", "--test-threads=1"]).env(GLOBAL_POISON_CHILD_ROOT, dir.path()).output().await.expect("runs the child");
+		let stdout = String::from_utf8_lossy(&out.stdout);
+		assert!(out.status.success(), "{out:?}");
+		assert!(stdout.contains("global poison child: the process is write-poisoned: a panic inside a control-plane write") && stdout.contains("1 passed"), "the child ran: {stdout}");
 	}
 
 	#[test]
 	fn a_frame_path_resolves_against_the_current_root() {
 		let root = Path::new("/srv/weft/store");
-		let resolve = |stored: &str| resolve_frame_path(root, stored);
-		// Under the current root: used as it is.
+		let resolve = |stored: &str| resolve_frame_path(root, stored).unwrap_or_else(|e| panic!("{stored}: {e:#}"));
+		// Under the current root: the same file.
 		assert_eq!(resolve("/srv/weft/store/segments/price-0.weftseg"), root.join("segments/price-0.weftseg"));
 		// Written under a root that moved: the tail after `segments` lands in this root's.
 		assert_eq!(resolve("/old/place/segments/price-0.weftseg"), root.join("segments/price-0.weftseg"));
@@ -6157,24 +7297,20 @@ mod tests {
 		// The last `segments` component counts: a root that itself sits under one.
 		assert_eq!(resolve("/data/segments/old-root/segments/temp-3.weftseg"), root.join("segments/temp-3.weftseg"));
 		// A relative root resolves the same way.
-		assert_eq!(resolve_frame_path(Path::new("store"), "store/segments/a-1.weftseg"), Path::new("store/segments/a-1.weftseg"));
-		assert_eq!(resolve_frame_path(Path::new("store"), "elsewhere/segments/a-1.weftseg"), Path::new("store/segments/a-1.weftseg"));
-		// Nothing safe to resolve to: kept as it is.
-		assert_eq!(resolve("/old/place/frames/price-0.weftseg"), Path::new("/old/place/frames/price-0.weftseg"));
-		assert_eq!(resolve("/old/place/segments"), Path::new("/old/place/segments"));
-		assert_eq!(resolve("/old/segments/../../etc/passwd"), Path::new("/old/segments/../../etc/passwd"));
+		assert_eq!(resolve_frame_path(Path::new("store"), "store/segments/a-1.weftseg").expect("resolves"), Path::new("store/segments/a-1.weftseg"));
+		assert_eq!(resolve_frame_path(Path::new("store"), "elsewhere/segments/a-1.weftseg").expect("resolves"), Path::new("store/segments/a-1.weftseg"));
 		// Component-wise, not textual: a sibling whose name extends the root's is not under it.
 		assert_eq!(resolve("/srv/weft/store-old/segments/a-1.weftseg"), root.join("segments/a-1.weftseg"));
-	}
-
-	#[test]
-	fn the_ambiguous_commit_choice_reads_poison_or_exit() {
-		assert_eq!(OnAmbiguousCommit::parse(None), OnAmbiguousCommit::Poison);
-		assert_eq!(OnAmbiguousCommit::parse(Some("")), OnAmbiguousCommit::Poison);
-		assert_eq!(OnAmbiguousCommit::parse(Some("poison")), OnAmbiguousCommit::Poison);
-		assert_eq!(OnAmbiguousCommit::parse(Some(" EXIT ")), OnAmbiguousCommit::Exit);
-		assert_eq!(OnAmbiguousCommit::parse(Some("exit")), OnAmbiguousCommit::Exit);
-		assert_eq!(OnAmbiguousCommit::parse(Some("abort")), OnAmbiguousCommit::Poison, "an unknown value keeps the safe default");
+		// Split on both separators (release plan, D-S6): a store written on Windows reads
+		// here, and one written here on Windows.
+		assert_eq!(resolve("C:\\weft\\old-root\\segments\\price-0.weftseg"), root.join("segments/price-0.weftseg"));
+		assert_eq!(resolve("\\\\server\\share\\store\\segments\\quarantine\\price-0.weftseg"), root.join("segments/quarantine/price-0.weftseg"));
+		assert_eq!(resolve("D:/mixed\\segments/price-0.weftseg"), root.join("segments/price-0.weftseg"));
+		// Nothing safe to resolve to: refused, never read where it points.
+		for escaped in ["/old/place/frames/price-0.weftseg", "/old/place/segments", "/old/place/segments/", "/old/segments/../../etc/passwd", "/srv/weft/store/segments/../price-0.weftseg", "C:\\old\\segments\\..\\x-0.weftseg", "price-0.weftseg", ""] {
+			let err = resolve_frame_path(root, escaped).expect_err(escaped).to_string();
+			assert!(err.starts_with(&format!("refusing to read frame {escaped:?}")), "{escaped}: {err}");
+		}
 	}
 
 	/// A transaction that upserts `descriptor` under `aspect` and then, after its COMMIT
@@ -6268,7 +7404,7 @@ mod tests {
 	async fn a_transaction_waiting_to_retry_stops_at_the_poison() {
 		let dir = TempDir::new().expect("tempdir");
 		let store = SegmentStore::open(dir.path()).await.expect("opens");
-		let base = IndexRow { desc: write_frame(dir.path(), "price", 0, &[(0, "1")]), gen: 1, prec: Some(1), frame_crc: Some(7), commit_epoch: Some(1) };
+		let base = IndexRow { desc: write_frame(dir.path(), "price", 0, &[(0, "1")]), gen: 1, prec: Some(1), frame_crc: Some(7), commit_epoch: Some(1), series_id: 0 };
 		store.commit_index(&IndexTxn::new(vec![IndexOp::InsertNew { aspect: "price".to_string(), row: base.clone() }])).await.expect("commits the base row");
 		let winner = store.index().database().connect().expect("connects");
 		winner.execute("BEGIN CONCURRENT", ()).await.expect("begins");
@@ -6297,14 +7433,16 @@ mod tests {
 		assert_eq!(rows, vec![base], "the row is as it was");
 	}
 
-	/// Set only in the child process `an_ambiguous_commit_exits_when_asked_to` starts:
-	/// the root to open.
+	/// Set only in the child process `an_ambiguous_commit_poisons_and_never_exits_the_process`
+	/// starts: the root to open.
 	const AMBIGUOUS_CHILD_ROOT: &str = "WEFT_TEST_AMBIGUOUS_CHILD_ROOT";
 
-	/// The body that child runs: commit a phantom transaction with `S-commit-phantom`
-	/// armed by the parent's `WEFT_FAULT` and `WEFT_ON_AMBIGUOUS_COMMIT=exit` set, so the
-	/// store exits the process. In a normal test run the variable is unset and this does
-	/// nothing.
+	/// The body that child runs: commit a phantom transaction with `S-commit-phantom` armed
+	/// by the parent's `WEFT_FAULT`, with `WEFT_ON_AMBIGUOUS_COMMIT=exit` set as a
+	/// deployment that wants the process to exit would set it. The store must poison
+	/// itself and return the ambiguous error, and the child goes on to report it: the
+	/// library never exits the process (release plan C-1). In a normal test run the
+	/// variable is unset and this does nothing.
 	#[tokio::test]
 	async fn ambiguous_commit_child() {
 		let Some(root) = std::env::var_os(AMBIGUOUS_CHILD_ROOT) else { return };
@@ -6312,21 +7450,26 @@ mod tests {
 		let root = PathBuf::from(root);
 		let store = SegmentStore::open(&root).await.expect("opens");
 		let phantom = write_frame(&root, "price", 7, &[(70, "7")]);
-		let result = store.commit_index(&phantom_upsert("price", phantom)).await;
-		panic!("the ambiguous COMMIT returned instead of exiting the process: {result:?}");
+		let err = store.commit_index(&phantom_upsert("price", phantom)).await.expect_err("the phantom COMMIT reports an error");
+		assert!(err.downcast_ref::<IndexTxnError>().is_some_and(IndexTxnError::is_ambiguous), "{err:#}");
+		let poisoned = tokio::time::timeout(std::time::Duration::from_secs(10), store.wait_until_poisoned()).await.expect("the poison is announced to its watchers");
+		assert_eq!(store.poisoned(), Some(poisoned.clone()));
+		println!("child still running, poisoned by: {}", poisoned.reason);
 	}
 
-	/// `WEFT_ON_AMBIGUOUS_COMMIT=exit`: an ambiguous COMMIT logs and exits the process
-	/// with status 70 instead of poisoning the store. The restarted store has the
-	/// transaction (the fault fired after its COMMIT) and accepts writes.
+	/// Release plan C-1: the library never calls `process::exit`, whatever the environment
+	/// says. Under `WEFT_ON_AMBIGUOUS_COMMIT=exit` an ambiguous COMMIT still only poisons
+	/// the store and wakes its poison watchers (an embedder such as `weft-server` exits on
+	/// that itself); the process lives on. The restarted store has the transaction (the
+	/// fault fired after its COMMIT) and accepts writes.
 	#[tokio::test]
-	async fn an_ambiguous_commit_exits_when_asked_to() {
+	async fn an_ambiguous_commit_poisons_and_never_exits_the_process() {
 		let dir = TempDir::new().expect("tempdir");
 		let exe = std::env::current_exe().expect("finds the test binary");
 		let out = tokio::process::Command::new(exe).args(["types::segment_store::tests::ambiguous_commit_child", "--exact", "--nocapture", "--test-threads=1"]).env(AMBIGUOUS_CHILD_ROOT, dir.path()).env(fault::FAULT_ENV, "S-commit-phantom:err").env(AMBIGUOUS_COMMIT_ENV, "exit").output().await.expect("runs the child");
-		let stderr = String::from_utf8_lossy(&out.stderr);
-		assert_eq!(out.status.code(), Some(AMBIGUOUS_COMMIT_EXIT_CODE), "the child exits with status 70: {out:?}");
-		assert!(stderr.contains("exiting with status 70 (WEFT_ON_AMBIGUOUS_COMMIT=exit)") && stderr.contains("injected fault at S-commit-phantom"), "it says why: {stderr}");
+		let stdout = String::from_utf8_lossy(&out.stdout);
+		assert!(out.status.success(), "the child was not exited by the library: {out:?}");
+		assert!(stdout.contains("child still running, poisoned by: ") && stdout.contains("injected fault at S-commit-phantom") && stdout.contains("1 passed"), "the child saw the poison and finished: {stdout}");
 
 		let store = SegmentStore::open(dir.path()).await.expect("the restart opens the store");
 		let poisoned = store.poisoned();
@@ -6335,7 +7478,7 @@ mod tests {
 		let sealed = store.seal("price", &schema(), &[80], &[bd("8")]).await;
 		drop(store);
 		assert_eq!(poisoned, None);
-		assert_eq!(ids, vec![7], "the transaction committed before the process exited");
+		assert_eq!(ids, vec![7], "the transaction committed");
 		assert_eq!(point, Some(bd("7")));
 		assert!(sealed.is_ok(), "the restarted store accepts writes: {sealed:?}");
 	}

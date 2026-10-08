@@ -135,8 +135,10 @@ fn value_span<'a>(descriptors: impl Iterator<Item = &'a SegmentDescriptor>) -> O
 
 /// A durable, libSQL-backed store of per-aspect segment-set rollups.
 ///
-/// Open one with [`AspectMetadataStore::open`] (a file path) or
-/// [`AspectMetadataStore::open_in_memory`] (tests); materialize an aspect's rollup with
+/// A [`SegmentStore`](crate::SegmentStore) opens one over its root's `metadata.db` and
+/// hands it out with [`SegmentStore::metadata`](crate::SegmentStore::metadata); it cannot
+/// be opened on its own, since its schema is the store's migration registry's, which runs
+/// only behind the store's `STORE_FORMAT` gate. Materialize an aspect's rollup with
 /// [`put`](AspectMetadataStore::put) (or fold a fresh seal in with
 /// [`record_seal`](AspectMetadataStore::record_seal)); read it back with
 /// [`get`](AspectMetadataStore::get).
@@ -150,50 +152,36 @@ impl AspectMetadataStore {
 	/// backup and restore verification require them.
 	pub const TABLES: &'static [&'static str] = &["aspect_metadata"];
 
-	/// Open (creating if absent) the `metadata.db` at `path`, enabling MVCC and ensuring
-	/// the `aspect_metadata` table exists.
+	/// Open (creating if absent) the `metadata.db` at `path` without running any DDL:
+	/// enable MVCC, prove it and sync its header, nothing else. What a
+	/// [`SegmentStore`](crate::SegmentStore) opens before it runs the migration registry.
 	///
 	/// # Errors
 	///
 	/// Fails if the database does not end up in MVCC journal mode or a new connection
-	/// does not sync FULL, and propagates any libSQL connection or DDL failure.
-	pub async fn open(path: &str) -> Result<Self> {
+	/// does not sync FULL, and propagates any libSQL connection failure.
+	pub(crate) async fn open_unmigrated(path: &str) -> Result<Self> {
 		let db = Builder::new_local(path).build().await?;
-		let conn = db.connect()?;
+		let conn = crate::types::durable::control_plane::connect(&db).await?;
 		// The control plane's MVCC write path; open fails rather than run without it.
 		crate::types::durable::control_plane::enable_mvcc_full(&db, &conn, path).await?;
 		conn.execute("PRAGMA busy_timeout=600000", turso::params![]).await.ok();
-		conn.execute(
-			"CREATE TABLE IF NOT EXISTS aspect_metadata (
-				aspect TEXT NOT NULL,
-				segment_count INTEGER NOT NULL,
-				total_rows INTEGER NOT NULL,
-				total_nulls INTEGER NOT NULL,
-				total_bytes INTEGER NOT NULL,
-				unsorted_segments INTEGER NOT NULL DEFAULT 0,
-				min_ts INTEGER,
-				max_ts INTEGER,
-				min_value TEXT,
-				max_value TEXT,
-				PRIMARY KEY (aspect)
-			)",
-			turso::params![],
-		)
-		.await?;
-		// Migrate a pre-existing metadata.db created before the order-health column:
-		// CREATE TABLE IF NOT EXISTS above is a no-op on it, so add the column here.
-		// A duplicate-column error (fresh table already has it) is expected and ignored.
-		conn.execute("ALTER TABLE aspect_metadata ADD COLUMN unsorted_segments INTEGER NOT NULL DEFAULT 0", turso::params![]).await.ok();
 		Ok(Self { db })
 	}
 
-	/// Open an ephemeral in-memory store (`:memory:`) for tests.
-	///
-	/// # Errors
-	///
-	/// Propagates any libSQL connection or DDL failure.
-	pub async fn open_in_memory() -> Result<Self> {
-		Self::open(":memory:").await
+	/// The database behind this store, which the migration registry runs against.
+	pub(crate) const fn database(&self) -> &turso::Database {
+		&self.db
+	}
+
+	/// The tests' database on its own (`:memory:` or a file):
+	/// [`open_unmigrated`](Self::open_unmigrated), then the registry's DDL for this
+	/// database (the `aspect_metadata` table), recorded nowhere.
+	#[cfg(test)]
+	pub(crate) async fn open_migrated(path: &str) -> Result<Self> {
+		let store = Self::open_unmigrated(path).await?;
+		crate::types::migrations::apply_standalone(&crate::types::migrations::ControlPlane { metadata: Some(crate::types::migrations::Db { db: &store.db, name: path }), ..crate::types::migrations::ControlPlane::default() }).await?;
+		Ok(store)
 	}
 
 	/// Snapshot this `metadata.db` to `dest` (a fresh file) via Turso's `VACUUM INTO`,
@@ -218,7 +206,7 @@ impl AspectMetadataStore {
 	///
 	/// Propagates a connection failure or any backup/verify failure.
 	pub async fn backup_to_with(&self, dest: &std::path::Path, mode: crate::VerifyMode) -> Result<crate::SnapshotReport> {
-		let conn = self.db.connect()?;
+		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
 		crate::types::backup::snapshot_with_verify(&conn, dest, mode, Self::TABLES).await
 	}
 
@@ -241,7 +229,7 @@ impl AspectMetadataStore {
 		let _guard = span.enter();
 		let (min_ts, max_ts) = meta.time_range.map_or((Value::Null, Value::Null), |(lo, hi)| (Value::Integer(lo), Value::Integer(hi)));
 		let (min_value, max_value) = meta.value_range.as_ref().map_or((Value::Null, Value::Null), |(lo, hi)| (Value::Text(lo.to_plain_string()), Value::Text(hi.to_plain_string())));
-		let conn = self.db.connect()?;
+		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
 		conn.execute("BEGIN CONCURRENT", turso::params![]).await?;
 		let res = conn
 			.execute(
@@ -292,7 +280,7 @@ impl AspectMetadataStore {
 	///
 	/// Propagates any libSQL read failure, or a value bound that cannot be decoded.
 	pub async fn get(&self, aspect: &str) -> Result<Option<AspectMetadata>> {
-		let conn = self.db.connect()?;
+		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
 		let mut rows = conn
 			.query(
 				"SELECT segment_count, total_rows, total_nulls, total_bytes, min_ts, max_ts, min_value, max_value, unsorted_segments
@@ -312,7 +300,7 @@ impl AspectMetadataStore {
 	///
 	/// Propagates any libSQL read failure.
 	pub async fn list_aspects(&self) -> Result<Vec<String>> {
-		let conn = self.db.connect()?;
+		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
 		let mut rows = conn.query("SELECT aspect FROM aspect_metadata ORDER BY aspect", turso::params![]).await?;
 		let mut out = Vec::new();
 		while let Some(row) = rows.next().await? {
@@ -329,7 +317,7 @@ impl AspectMetadataStore {
 	///
 	/// Propagates any libSQL write failure.
 	pub async fn remove(&self, aspect: &str) -> Result<()> {
-		let conn = self.db.connect()?;
+		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
 		conn.execute("BEGIN CONCURRENT", turso::params![]).await?;
 		let res = conn.execute("DELETE FROM aspect_metadata WHERE aspect = ?", turso::params![aspect.to_string()]).await;
 		match res {
@@ -404,7 +392,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn put_then_get_round_trips() {
-		let store = AspectMetadataStore::open_in_memory().await.expect("opens");
+		let store = AspectMetadataStore::open_migrated(":memory:").await.expect("opens");
 		let meta = AspectMetadata { segment_count: 2, total_rows: 20, total_nulls: 3, total_bytes: 256, unsorted_segments: 1, time_range: Some((0, 190)), value_range: Some((bd("0"), bd("19.5"))) };
 		store.put("temp", &meta).await.expect("puts");
 		let got = store.get("temp").await.expect("gets");
@@ -420,7 +408,7 @@ mod tests {
 	/// the write's own report, not an inference from whether a row already existed.
 	#[tokio::test]
 	async fn put_reports_its_affected_row_count() {
-		let store = AspectMetadataStore::open_in_memory().await.expect("opens");
+		let store = AspectMetadataStore::open_migrated(":memory:").await.expect("opens");
 		let meta = AspectMetadata { segment_count: 1, total_rows: 10, total_nulls: 0, total_bytes: 128, unsorted_segments: 0, time_range: Some((0, 90)), value_range: Some((bd("0"), bd("9"))) };
 		let first = store.put("temp", &meta).await.expect("puts");
 		// Overwriting the same aspect key replaces the row rather than adding one.
@@ -436,7 +424,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn from_index_matches_a_fold_chain() {
-		let store = AspectMetadataStore::open_in_memory().await.expect("opens");
+		let store = AspectMetadataStore::open_migrated(":memory:").await.expect("opens");
 		// Build a two-segment index and the equivalent fold chain; they must agree.
 		let mut index = SegmentIndex::new();
 		let mut folded = AspectMetadata::default();
@@ -460,7 +448,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn record_seal_accumulates_incrementally() {
-		let store = AspectMetadataStore::open_in_memory().await.expect("opens");
+		let store = AspectMetadataStore::open_migrated(":memory:").await.expect("opens");
 		let (first, len0) = sealed(0);
 		let (second, len1) = sealed(100);
 		// First seal creates the rollup; second folds in.
@@ -481,7 +469,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn nullable_segment_counts_nulls_and_skips_empty_value_span() {
-		let store = AspectMetadataStore::open_in_memory().await.expect("opens");
+		let store = AspectMetadataStore::open_migrated(":memory:").await.expect("opens");
 		// Two nulls among four rows; the value span still spans the present values.
 		let ts = vec![10_i64, 20, 30, 40];
 		let vs = vec![Some(bd("1.25")), None, Some(bd("3.75")), None];
@@ -498,7 +486,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn empty_segment_records_no_bounds() {
-		let store = AspectMetadataStore::open_in_memory().await.expect("opens");
+		let store = AspectMetadataStore::open_migrated(":memory:").await.expect("opens");
 		let empty = Segment::build(&[], &[], TimeUnit::Seconds, &bd("0")).expect("builds");
 		let d = SegmentDescriptor::of_segment(0, "empty.weftseg", empty.write_to().len() as u64, &empty);
 		let meta = store.record_seal("a", &d).await.expect("records");
@@ -513,7 +501,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn list_and_remove() {
-		let store = AspectMetadataStore::open_in_memory().await.expect("opens");
+		let store = AspectMetadataStore::open_migrated(":memory:").await.expect("opens");
 		let (d, _) = sealed(0);
 		store.record_seal("temp", &d).await.expect("records");
 		store.record_seal("humidity", &d).await.expect("records");
@@ -533,10 +521,10 @@ mod tests {
 		let path = dir.path().join("metadata.db");
 		let path = path.to_string_lossy().into_owned();
 		let (d, _) = sealed(0);
-		let first = AspectMetadataStore::open(&path).await.expect("opens");
+		let first = AspectMetadataStore::open_migrated(&path).await.expect("opens");
 		let recorded = first.record_seal("a", &d).await.expect("records");
 		drop(first);
-		let reopened = AspectMetadataStore::open(&path).await.expect("reopens");
+		let reopened = AspectMetadataStore::open_migrated(&path).await.expect("reopens");
 		let got = reopened.get("a").await.expect("gets");
 		drop(reopened);
 		assert_eq!(got, Some(recorded));

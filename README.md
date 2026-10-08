@@ -320,7 +320,21 @@ Bind address defaults to `127.0.0.1:8080` (`WEFT_SERVER_ADDR` overrides). Settin
 `/storage` endpoints (without it they answer `503`, and `GET /ready` reports the
 `segment_store` dependency). A store root belongs to one server at a time: the server
 holds the root's `LOCK` file while it runs, and a second server pointed at the same
-root exits at startup with an error naming the first one's pid.
+root exits at startup with an error naming the first one's pid and host.
+
+The root's `STORE_FORMAT` file records the store's layout and the oldest layouts a
+WeftDB must know to read and to write it (plain JSON; see `weftdb::StoreFormat`), and
+`segment_index.db`'s `store_meta` table keeps a copy. The server reads the marker before
+it opens any database (a root without one, the copy, before it writes anything), and
+refuses a store a newer WeftDB wrote (`IncompatibleLayout`) without changing anything
+but `LOCK` and `LOCK.holder`. A store written before the marker existed is layout 1 and
+is upgraded in place on first open, through the registered migrations
+(`store_migrations` in `segment_index.db` lists those applied); its frames are not
+rewritten. A layout-1 store whose index records a frame outside `segments/` (possible
+only through the aspect-name traversal of earlier builds) is refused with
+`UnsafeLegacyPath`, naming the aspects, before any migration applies or a marker is
+written, and nothing is moved: drop or re-seal those aspects with the build that wrote
+them first.
 
 While bound to a loopback address, the server only answers requests addressed to a
 loopback host: `Host` must be `localhost`, an address in `127.0.0.0/8` or `[::1]`
@@ -565,7 +579,7 @@ WeftDB is configured primarily through environment variables:
 | `WEFT_GPU_CALIBRATE` | `weft-server` | Startup calibration. By default, once the listener is bound, the server runs `splimes::calibrate()` once in the background on a blocking thread: it starts the GPU if there is one, times the single-thread, rayon and GPU backends on grids up to 16 Mi points (several seconds, a few hundred MB), and sets where `Backend::Auto` switches between them. Requests are served from the start and interpolate on the CPU with splimes' default thresholds until it finishes. A CPU/software adapter (llvmpipe, lavapipe, WARP) is not calibrated, with a log line saying why; `force` calibrates it anyway. `0` (or `false`/`no`/`off`) skips calibration. It logs the adapter (or why there is none) and the thresholds, and never fails startup; skipped or failed, interpolation stays on the CPU with splimes' defaults. | unset (calibrate, except a software adapter) |
 | `WEFT_MAX_INTERPOLATE_POINTS` | `weft-server` | The most output points one `/api/v1/interpolate*` request may produce; a larger grid is a `400` naming its size and the limit, refused before anything is allocated. A positive integer, read once at startup; anything else (including `0`) stops the server from starting with a message naming the variable. | `10000000` |
 | `WEFT_SEGMENT_STORE_ROOT` | `weft-server` | Root of the Storage v2 segment store; enables the `/storage` endpoints. | unset (storage endpoints answer `503`) |
-| `WEFT_ON_AMBIGUOUS_COMMIT` | `weft-server` | What the segment store does after a COMMIT that may or may not have committed: `poison` refuses every write until the server restarts, while reads keep working and `GET /ready` reports `poisoned`; `exit` logs and exits with status 70, for a supervisor that restarts the server. The restart's open settles the transaction either way. Read when the store opens. | unset (`poison`) |
+| `WEFT_ON_AMBIGUOUS_COMMIT` | `weft-server` | What the server does once its segment store is write-poisoned (after a COMMIT that may or may not have committed): `poison` keeps serving, refusing every write until the server restarts while reads keep working and `GET /ready` reports `poisoned`; `exit` logs and exits with status 70, for a supervisor that restarts the server. The restart's open settles the transaction either way. Read once, at startup; the `weftdb` library never reads it and never exits the process. | unset (`poison`) |
 | `WEFT_RECONCILE_INTERVAL_SECS` | `weft-server` | Background reconcile daemon sweep interval in seconds; `0`/unset disables it. | unset (disabled) |
 | `WEFT_RECONCILE_THRESHOLD` | `weft-server` | `unsorted_segments` backlog an aspect must reach before the daemon reconciles it. | `1` |
 | `WEFT_RECONCILE_HOT_COLD` | `weft-server` | Truthy → the daemon reconciles cold segments each tick and defers the hot tail until the threshold. | unset (all-or-nothing) |
@@ -587,6 +601,12 @@ WeftDB is configured primarily through environment variables:
 | `RUST_LOG` | all | [`tracing`](https://docs.rs/tracing) filter. On `weft-server` it drives a per-request root span (`request{method,path,request_id}`, echoed as `x-request-id`) that every per-stage span nests under, each with busy/idle timing: the compute paths (`interpolate.parse`/`compute`/`serialize` under `interpolate.engine`, `downsample.parse`/`reduce`); the **storage read** paths (`storage.{range,value_range,point}.read` + `.serialize`, with a `format` field over JSON/CSV/Arrow/Parquet); the **ingest** paths (`storage.ingest.parse`/`normalize`/`seal` for ILP/CSV/JSON, and `storage.ingest.parquet` for the Parquet decode+seal); the background **reconcile daemon** (`reconcile.tick{kind,…,aspects,segments}`); and the **control-plane writes** on the seal path (`control_plane.index.insert{aspect,id,rows_changed}`, `control_plane.index.delete{…}`, `control_plane.metadata.put{aspect,rows_changed}`), whose `rows_changed` is libSQL's own affected-row count (`Statement::n_change()`) rather than an inference — so a trace shows whether a catalog write actually changed anything. | `weft_tui=debug,database=debug,info` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `weft-server` | When set (e.g. `http://localhost:4317`), export tracing spans to an OpenTelemetry collector over **OTLP/gRPC** in addition to the `RUST_LOG` `fmt` output. Unset → no exporter, no network dependency; a misconfigured/absent collector never blocks startup. `scripts/verify-otlp.sh` verifies delivery end-to-end against a local Jaeger container (starting one if needed). | unset (export disabled) |
 | `SKIP_SLOW_TESTS` | tests | Set to `1` to skip long-running tests. | unset |
+
+The `WEFT_SEGMENT_*` variables configure the store `weft-server` opens; the server maps
+them to `weftdb::SegmentStoreOptions`. A program embedding `weftdb` gets them only by
+asking: `SegmentStore::open` uses `SegmentStoreOptions::default()` (every one of them
+unset), and `SegmentStore::open_with_options(root, SegmentStoreOptions::from_env())`
+reads them as the server does.
 
 The database root directory is resolved in this order:
 

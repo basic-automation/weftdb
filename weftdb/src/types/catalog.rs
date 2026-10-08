@@ -34,8 +34,10 @@ use crate::types::durable::{fault, FaultPoint};
 
 /// A durable, libSQL-backed registry of the database → subject hierarchy.
 ///
-/// Open one with [`CatalogStore::open`] (a file path) or
-/// [`CatalogStore::open_in_memory`] (tests); register a database with
+/// A [`SegmentStore`](crate::SegmentStore) opens one over its root's `catalog.db` and
+/// hands it out with [`SegmentStore::registry`](crate::SegmentStore::registry); it cannot
+/// be opened on its own, since its schema is the store's migration registry's, which runs
+/// only behind the store's `STORE_FORMAT` gate. Register a database with
 /// [`register_database`](CatalogStore::register_database) and a subject under it with
 /// [`register_subject`](CatalogStore::register_subject); enumerate with
 /// [`list_databases`](CatalogStore::list_databases) /
@@ -50,46 +52,36 @@ impl CatalogStore {
 	/// backup and restore verification require them.
 	pub const TABLES: &'static [&'static str] = &["databases", "subjects"];
 
-	/// Open (creating if absent) the `catalog.db` at `path`, enabling MVCC and ensuring
-	/// the `databases` and `subjects` tables exist.
+	/// Open (creating if absent) the `catalog.db` at `path` without running any DDL:
+	/// enable MVCC, prove it and sync its header, nothing else. What a
+	/// [`SegmentStore`](crate::SegmentStore) opens before it runs the migration registry.
 	///
 	/// # Errors
 	///
 	/// Fails if the database does not end up in MVCC journal mode or a new connection
-	/// does not sync FULL, and propagates any libSQL connection or DDL failure.
-	pub async fn open(path: &str) -> Result<Self> {
+	/// does not sync FULL, and propagates any libSQL connection failure.
+	pub(crate) async fn open_unmigrated(path: &str) -> Result<Self> {
 		let db = Builder::new_local(path).build().await?;
-		let conn = db.connect()?;
+		let conn = crate::types::durable::control_plane::connect(&db).await?;
 		// The control plane's MVCC write path; open fails rather than run without it.
 		crate::types::durable::control_plane::enable_mvcc_full(&db, &conn, path).await?;
 		conn.execute("PRAGMA busy_timeout=600000", turso::params![]).await.ok();
-		conn.execute(
-			"CREATE TABLE IF NOT EXISTS databases (
-				name TEXT NOT NULL,
-				PRIMARY KEY (name)
-			)",
-			turso::params![],
-		)
-		.await?;
-		conn.execute(
-			"CREATE TABLE IF NOT EXISTS subjects (
-				database TEXT NOT NULL,
-				subject TEXT NOT NULL,
-				PRIMARY KEY (database, subject)
-			)",
-			turso::params![],
-		)
-		.await?;
 		Ok(Self { db })
 	}
 
-	/// Open an ephemeral in-memory catalog (`:memory:`) for tests.
-	///
-	/// # Errors
-	///
-	/// Propagates any libSQL connection or DDL failure.
-	pub async fn open_in_memory() -> Result<Self> {
-		Self::open(":memory:").await
+	/// The database behind this store, which the migration registry runs against.
+	pub(crate) const fn database(&self) -> &turso::Database {
+		&self.db
+	}
+
+	/// The tests' database on its own (`:memory:` or a file):
+	/// [`open_unmigrated`](Self::open_unmigrated), then the registry's DDL for this
+	/// database (the `databases` and `subjects` tables), recorded nowhere.
+	#[cfg(test)]
+	pub(crate) async fn open_migrated(path: &str) -> Result<Self> {
+		let store = Self::open_unmigrated(path).await?;
+		crate::types::migrations::apply_standalone(&crate::types::migrations::ControlPlane { catalog: Some(crate::types::migrations::Db { db: &store.db, name: path }), ..crate::types::migrations::ControlPlane::default() }).await?;
+		Ok(store)
 	}
 
 	/// Snapshot this `catalog.db` to `dest` (a fresh file) via Turso's `VACUUM INTO`,
@@ -114,7 +106,7 @@ impl CatalogStore {
 	///
 	/// Propagates a connection failure or any backup/verify failure.
 	pub async fn backup_to_with(&self, dest: &std::path::Path, mode: crate::VerifyMode) -> Result<crate::SnapshotReport> {
-		let conn = self.db.connect()?;
+		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
 		crate::types::backup::snapshot_with_verify(&conn, dest, mode, Self::TABLES).await
 	}
 
@@ -125,7 +117,7 @@ impl CatalogStore {
 	///
 	/// Propagates any libSQL write failure.
 	pub async fn register_database(&self, name: &str) -> Result<()> {
-		let conn = self.db.connect()?;
+		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
 		conn.execute("BEGIN CONCURRENT", turso::params![]).await?;
 		let res = conn.execute("INSERT OR IGNORE INTO databases (name) VALUES (?)", turso::params![name.to_string()]).await;
 		match res {
@@ -152,7 +144,7 @@ impl CatalogStore {
 		if !self.database_exists(database).await? {
 			bail!("register_subject: database {database:?} is not registered");
 		}
-		let conn = self.db.connect()?;
+		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
 		conn.execute("BEGIN CONCURRENT", turso::params![]).await?;
 		let res = conn.execute("INSERT OR IGNORE INTO subjects (database, subject) VALUES (?, ?)", turso::params![database.to_string(), subject.to_string()]).await;
 		match res {
@@ -181,7 +173,7 @@ impl CatalogStore {
 	///
 	/// Propagates any libSQL write failure; nothing is registered unless both rows are.
 	pub async fn register_scope(&self, database: &str, subject: &str) -> Result<()> {
-		let conn = self.db.connect()?;
+		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
 		conn.execute("BEGIN CONCURRENT", turso::params![]).await?;
 		let res: Result<()> = async {
 			conn.execute("INSERT OR IGNORE INTO databases (name) VALUES (?)", turso::params![database.to_string()]).await?;
@@ -208,7 +200,7 @@ impl CatalogStore {
 	///
 	/// Propagates any libSQL read failure.
 	pub async fn database_exists(&self, name: &str) -> Result<bool> {
-		let conn = self.db.connect()?;
+		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
 		let mut rows = conn.query("SELECT 1 FROM databases WHERE name = ?", turso::params![name.to_string()]).await?;
 		Ok(rows.next().await?.is_some())
 	}
@@ -219,7 +211,7 @@ impl CatalogStore {
 	///
 	/// Propagates any libSQL read failure.
 	pub async fn subject_exists(&self, database: &str, subject: &str) -> Result<bool> {
-		let conn = self.db.connect()?;
+		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
 		let mut rows = conn.query("SELECT 1 FROM subjects WHERE database = ? AND subject = ?", turso::params![database.to_string(), subject.to_string()]).await?;
 		Ok(rows.next().await?.is_some())
 	}
@@ -230,7 +222,7 @@ impl CatalogStore {
 	///
 	/// Propagates any libSQL read failure.
 	pub async fn list_databases(&self) -> Result<Vec<String>> {
-		let conn = self.db.connect()?;
+		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
 		let mut rows = conn.query("SELECT name FROM databases ORDER BY name", turso::params![]).await?;
 		let mut out = Vec::new();
 		while let Some(row) = rows.next().await? {
@@ -247,7 +239,7 @@ impl CatalogStore {
 	///
 	/// Propagates any libSQL read failure.
 	pub async fn list_subjects(&self, database: &str) -> Result<Vec<String>> {
-		let conn = self.db.connect()?;
+		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
 		let mut rows = conn.query("SELECT subject FROM subjects WHERE database = ? ORDER BY subject", turso::params![database.to_string()]).await?;
 		let mut out = Vec::new();
 		while let Some(row) = rows.next().await? {
@@ -265,7 +257,7 @@ impl CatalogStore {
 	///
 	/// Propagates any libSQL write failure.
 	pub async fn remove_subject(&self, database: &str, subject: &str) -> Result<()> {
-		let conn = self.db.connect()?;
+		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
 		conn.execute("BEGIN CONCURRENT", turso::params![]).await?;
 		let res = conn.execute("DELETE FROM subjects WHERE database = ? AND subject = ?", turso::params![database.to_string(), subject.to_string()]).await;
 		match res {
@@ -287,7 +279,7 @@ impl CatalogStore {
 	///
 	/// Propagates any libSQL write failure.
 	pub async fn remove_database(&self, name: &str) -> Result<()> {
-		let conn = self.db.connect()?;
+		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
 		conn.execute("BEGIN CONCURRENT", turso::params![]).await?;
 		let res = async {
 			conn.execute("DELETE FROM subjects WHERE database = ?", turso::params![name.to_string()]).await?;
@@ -313,7 +305,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn register_then_list_databases_in_order() {
-		let catalog = CatalogStore::open_in_memory().await.expect("opens");
+		let catalog = CatalogStore::open_migrated(":memory:").await.expect("opens");
 		catalog.register_database("market").await.expect("registers");
 		catalog.register_database("iot").await.expect("registers");
 		// Re-registering is a no-op, not a duplicate.
@@ -329,7 +321,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn subjects_scope_to_their_database_in_order() {
-		let catalog = CatalogStore::open_in_memory().await.expect("opens");
+		let catalog = CatalogStore::open_migrated(":memory:").await.expect("opens");
 		catalog.register_database("market").await.expect("registers");
 		catalog.register_database("iot").await.expect("registers");
 		catalog.register_subject("market", "BTCUSD").await.expect("registers");
@@ -348,7 +340,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn subject_under_unregistered_database_fails() {
-		let catalog = CatalogStore::open_in_memory().await.expect("opens");
+		let catalog = CatalogStore::open_migrated(":memory:").await.expect("opens");
 		let err = catalog.register_subject("ghost", "BTCUSD").await;
 		let exists = catalog.subject_exists("ghost", "BTCUSD").await.expect("exists");
 		drop(catalog);
@@ -358,7 +350,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn register_subject_is_idempotent() {
-		let catalog = CatalogStore::open_in_memory().await.expect("opens");
+		let catalog = CatalogStore::open_migrated(":memory:").await.expect("opens");
 		catalog.register_database("d").await.expect("registers");
 		catalog.register_subject("d", "s").await.expect("registers");
 		catalog.register_subject("d", "s").await.expect("idempotent");
@@ -369,7 +361,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn register_scope_registers_a_database_and_its_subject_together() {
-		let catalog = CatalogStore::open_in_memory().await.expect("opens");
+		let catalog = CatalogStore::open_migrated(":memory:").await.expect("opens");
 		// No prior register_database: the scope brings its own database row.
 		catalog.register_scope("market", "BTCUSD").await.expect("registers");
 		catalog.register_scope("market", "BTCUSD").await.expect("idempotent");
@@ -383,7 +375,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn remove_subject_leaves_the_database() {
-		let catalog = CatalogStore::open_in_memory().await.expect("opens");
+		let catalog = CatalogStore::open_migrated(":memory:").await.expect("opens");
 		catalog.register_database("d").await.expect("registers");
 		catalog.register_subject("d", "a").await.expect("registers");
 		catalog.register_subject("d", "b").await.expect("registers");
@@ -399,7 +391,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn remove_database_cascades_to_subjects() {
-		let catalog = CatalogStore::open_in_memory().await.expect("opens");
+		let catalog = CatalogStore::open_migrated(":memory:").await.expect("opens");
 		catalog.register_database("d").await.expect("registers");
 		catalog.register_database("keep").await.expect("registers");
 		catalog.register_subject("d", "a").await.expect("registers");
@@ -420,12 +412,12 @@ mod tests {
 		let dir = tempfile::TempDir::new().expect("tempdir");
 		let path = dir.path().join("catalog.db");
 		let path = path.to_string_lossy().into_owned();
-		let first = CatalogStore::open(&path).await.expect("opens");
+		let first = CatalogStore::open_migrated(&path).await.expect("opens");
 		first.register_database("d").await.expect("registers");
 		first.register_subject("d", "s").await.expect("registers");
 		drop(first);
 		// A fresh store over the same file sees the persisted hierarchy.
-		let reopened = CatalogStore::open(&path).await.expect("reopens");
+		let reopened = CatalogStore::open_migrated(&path).await.expect("reopens");
 		let dbs = reopened.list_databases().await.expect("lists");
 		let subjects = reopened.list_subjects("d").await.expect("lists");
 		drop(reopened);
