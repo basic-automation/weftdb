@@ -1388,7 +1388,7 @@ artifact.
 
 ## License
 
-Released under the [MIT License](LICENSE). Copyright © 2025 Justin Icenhour.
+Released under the [MIT License](LICENSE). Copyright (c) 2025-2026 Justin Icenhour.
 
 Two crates include code adapted from Apache-2.0 projects — the Chimp codecs in
 `weft-physical-type` and the DDSketch quantile sketch in `weft-reduce`. [NOTICE](NOTICE)

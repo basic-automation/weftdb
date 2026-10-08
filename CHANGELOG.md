@@ -173,6 +173,8 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   and `weftseg::write_value_column_transposed` need the feature too. Default builds never
   wrote this codec, so their stores are unaffected. The docs now call it a bit-sliced
   (bit-plane-major) layout; it is not the FastLanes layout they used to name.
+- Every `LICENSE` file now reads `Copyright (c) 2025-2026 Justin Icenhour`, naming the
+  individual copyright holder for both years of the project. The license (MIT) is unchanged.
 
 ### Fixed
 
