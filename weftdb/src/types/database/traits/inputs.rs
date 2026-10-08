@@ -143,7 +143,13 @@ pub trait Inputs {
 	// Dictionary
 	//
 
-	/// update the metadata for a given dictionary
+	/// Register the aspect's dictionary `dictionary_name` with `metadata`'s id, description
+	/// and constraints (not its `name`), replacing any earlier registration of that name.
+	///
+	/// # Errors
+	///
+	/// A step interpolation that [`get_dictionary_metadata`](crate::Outputs::get_dictionary_metadata)
+	/// could not load back, or a failed write.
 	async fn set_dictionary_metadata(&self, aspect_id: &AspectId, dictionary_name: &str, metadata: &DictionaryMetadata) -> Result<TxId>;
 
 	/// insert pattern into dictionary for a given aspect

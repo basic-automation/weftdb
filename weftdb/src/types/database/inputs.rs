@@ -5,7 +5,7 @@ use crate::{
 		database::{
 			helpers::safe_usize_to_f64, traits::{config::Config, connection::Connection as ConnectionTrait, DatabaseStructure}
 		}, TxId
-	}, Aspect, AspectId, Batch, BatchId, Correlation, CorrelationID, Database, DatasetId, DictionaryMetadata, Error, Event, EventID, InputMeasurement, Measurement, Pattern, PatternID
+	}, Aspect, AspectId, Batch, BatchId, Correlation, CorrelationID, Database, DatasetId, DictionaryConstraints, DictionaryId, DictionaryMetadata, Error, Event, EventID, InputMeasurement, Measurement, Pattern, PatternID
 };
 
 #[async_trait::async_trait]
@@ -1018,6 +1018,9 @@ impl Inputs for Database {
 
 	async fn set_dictionary_metadata(&self, aspect_id: &AspectId, dictionary_name: &str, metadata: &DictionaryMetadata) -> Result<TxId> {
 		let tx_id = TxId::new();
+		// Refuse a step method that `get_dictionary_metadata` could not load, before the
+		// dictionary's database file exists.
+		Self::check_dictionary_constraints(dictionary_name, &metadata.constraints)?;
 		let aspect = self.get_aspect(aspect_id).await?;
 		let db_name = &self.name;
 		let db_path = Self::aspect_dictionaries_db_path(db_name.as_str(), aspect.subject_name(), aspect.name(), dictionary_name);
@@ -1037,19 +1040,17 @@ impl Inputs for Database {
 		Aspect::ensure_dictionary_tables(&db).await?;
 		let conn = Self::begin_concurrent(&db, db_name, Some(self.cache.clone())).await?;
 
-		// Insert dictionary metadata (no ON CONFLICT since no unique constraint - app handles duplicates)
-		let insert_sql = r"INSERT INTO dictionary_metadata (id, name, description, created_at) VALUES (?, ?, ?, ?)";
-		let res = conn.as_ref().execute(insert_sql, turso::params![metadata.id.as_uuid().to_string(), dictionary_name, metadata.description.clone(), chrono::Utc::now().timestamp_millis()]).await;
-		match res {
-			Ok(_) => (),
-			Err(e) => {
-				tracing::warn!("Failed to set metadata for dictionary '{dictionary_name}' for aspect {aspect_id}: {e}");
-				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("Failed to set dictionary metadata: {e}"));
-			}
+		// The whole registration: metadata, steps and variabilities. It used to insert only the
+		// metadata row, so `get_dictionary_metadata` (which needs the constraints row) never
+		// found the dictionary, and every `load_dictionary` inserted another metadata row.
+		if let Err(e) = Self::replace_dictionary_registration(&conn, &metadata.id, dictionary_name, &metadata.description, &metadata.constraints).await {
+			tracing::warn!("Failed to set metadata for dictionary '{dictionary_name}' for aspect {aspect_id}: {e}");
+			Self::rollback_concurrent(&conn).await?;
+			return Err(anyhow::anyhow!("Failed to set dictionary metadata: {e}"));
 		}
 
 		Self::commit_concurrent(&conn).await?;
+		self.cache.lock().await.invalidate(&Self::dictionary_metadata_cache_key(aspect_id, dictionary_name)).await;
 
 		let log = format!("Set metadata for dictionary '{dictionary_name}' for aspect {aspect_id}");
 		let _ = self.record_transaction(&log).await?;
@@ -1755,6 +1756,64 @@ impl Database {
 			);
 		}
 
+		Ok(())
+	}
+}
+
+/// A dictionary's registration: its `dictionary_metadata` row and the
+/// `dictionary_constraints` and `dictionary_variabilities` rows keyed by its id, all in the
+/// dictionary's own `<aspect>/dictionaries/<name>.db`.
+impl Database {
+	/// Refuse constraints that [`get_dictionary_metadata`](crate::Outputs::get_dictionary_metadata)
+	/// could not load back: the step interpolation is stored as the [`Spline`](splimes::Spline)'s
+	/// text, and splimes validates it again as it parses it.
+	///
+	/// # Errors
+	///
+	/// `Invalid step interpolation for dictionary '<name>': <reason>`, e.g. `invalid polynomial
+	/// degree 9: must be between 1 and 8`.
+	pub(crate) fn check_dictionary_constraints(dictionary_name: &str, constraints: &DictionaryConstraints) -> Result<()> {
+		if let Some(steps) = constraints.steps() {
+			steps.interpolation().validate().map_err(|e| anyhow::anyhow!("Invalid step interpolation for dictionary '{dictionary_name}': {e}"))?;
+		}
+		Ok(())
+	}
+
+	/// Write `name`'s registration on `conn`, a `BEGIN CONCURRENT` transaction on the
+	/// dictionary's database that the caller commits, or rolls back on an error.
+	///
+	/// The tables have no unique constraint (no indexes under MVCC), so this keeps a name to
+	/// one registration itself: it deletes every metadata row with that name, and the
+	/// constraints and variabilities of each, before it inserts the new ones. A dictionary
+	/// without steps stores `NULL` in both step columns. Variabilities are stored one row
+	/// each, in order; an empty list stores none, and so reads back as `None`.
+	///
+	/// # Errors
+	///
+	/// The first statement that fails.
+	pub(crate) async fn replace_dictionary_registration(conn: &Connection, id: &DictionaryId, name: &str, description: &str, constraints: &DictionaryConstraints) -> Result<()> {
+		let mut replaced = Vec::new();
+		let mut rows = conn.as_ref().query("SELECT id FROM dictionary_metadata WHERE name = ?", turso::params![name]).await?;
+		while let Some(row) = rows.next().await? {
+			replaced.push(row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary ID is not text".to_string()))?.clone());
+		}
+		drop(rows);
+		for old_id in replaced {
+			conn.as_ref().execute("DELETE FROM dictionary_constraints WHERE dictionary_id = ?", turso::params![old_id.as_str()]).await?;
+			conn.as_ref().execute("DELETE FROM dictionary_variabilities WHERE dictionary_id = ?", turso::params![old_id.as_str()]).await?;
+		}
+		conn.as_ref().execute("DELETE FROM dictionary_metadata WHERE name = ?", turso::params![name]).await?;
+
+		let id = id.as_uuid().to_string();
+		conn.as_ref().execute("INSERT INTO dictionary_metadata (id, name, description, created_at) VALUES (?, ?, ?, ?)", turso::params![id.as_str(), name, description, chrono::Utc::now().timestamp_millis()]).await?;
+
+		let steps_count = constraints.steps().as_ref().map(|s| s.count().to_string());
+		let steps_interpolation = constraints.steps().as_ref().map(|s| s.interpolation().to_string());
+		conn.as_ref().execute("INSERT INTO dictionary_constraints (dictionary_id, steps_count, steps_interpolation) VALUES (?, ?, ?)", turso::params![id.as_str(), steps_count, steps_interpolation]).await?;
+
+		for variability in constraints.variabilities().iter().flatten() {
+			conn.as_ref().execute("INSERT INTO dictionary_variabilities (dictionary_id, variability_type, variability_value) VALUES (?, ?, ?)", turso::params![id.as_str(), variability.kind(), variability.variability().value().to_string()]).await?;
+		}
 		Ok(())
 	}
 }
