@@ -60,9 +60,12 @@ use crate::{
 /// cascade on a trending value column. The cascade is realized on disk
 /// (`weftseg::write_value_column_cascading` / `VAL_CODEC_DELTA_CASCADE`) but is a broad
 /// realized-bytes change, so it is opt-in and surfaced advisory-first (like FOR/f64 before
-/// adoption); the default `value_codec` is unchanged. All optional fields are `#[serde(default)]`,
-/// so older artifacts still deserialize.
-pub const SCHEMA_VERSION: u32 = 15;
+/// adoption); the default `value_codec` is unchanged. v16 added
+/// `storage.advisory_dfor_value_bytes` — the footprint of the **decimal-exponent FOR** value codec
+/// (each block factors out its common power of ten before FOR packing) when it beats the realized
+/// codec, the potential saving on a `ScaledI64` column whose scale is set by a few high-precision
+/// values. All optional fields are `#[serde(default)]`, so older artifacts still deserialize.
+pub const SCHEMA_VERSION: u32 = 16;
 
 /// Metadata describing the dataset a result was measured against.
 ///
@@ -270,6 +273,16 @@ pub struct StorageEstimate {
 	/// `value_codec` yet.
 	#[serde(default)]
 	pub advisory_delta_cascade_value_bytes: Option<usize>,
+	/// **Advisory** footprint of the value column under the **decimal-exponent FOR** codec
+	/// ([`ColumnEncoding::dfor_value_bytes`](weft_physical_type::ColumnEncoding::dfor_value_bytes)):
+	/// each 64-value block factors out the power of ten its mantissas share, then FOR-packs. It
+	/// is the saving on a `ScaledI64` column whose column-wide scale is forced by a few
+	/// high-precision values (real BTC closes: 13.58 vs 33.74 bits/value in
+	/// `weft-physical-type/benches/alp_vs_f64_codecs.rs`). `Some` only when it strictly beats
+	/// [`realized_value_bytes`](Self::realized_value_bytes); `None` otherwise, for a non-scaled
+	/// encoding, or on a pre-v16 artifact. Advisory: not yet a realized value codec (owner-gated).
+	#[serde(default)]
+	pub advisory_dfor_value_bytes: Option<usize>,
 }
 
 impl StorageEstimate {
@@ -328,8 +341,11 @@ impl StorageEstimate {
 		// Advisory: the two-level delta-cascade footprint, surfaced only when it strictly beats
 		// the realized single-level codec (so it answers "would the cascade help this corpus?").
 		let advisory_delta_cascade_value_bytes = enc.delta_cascade_bytes().filter(|&cascade| cascade < realized_value_bytes);
+		// Advisory: the decimal-exponent FOR footprint, surfaced only when it strictly beats the
+		// realized codec (so it answers "would a per-block decimal exponent help this corpus?").
+		let advisory_dfor_value_bytes = enc.dfor_value_bytes().filter(|&dfor| dfor < realized_value_bytes);
 
-		Self { physical_type: enc.physical_type.name().to_string(), value_count, estimated_value_bytes, realized_value_bytes, value_codec, bytes_per_point, is_exact: enc.is_exact(), lossy_count: enc.lossy_count, max_abs_error: enc.max_abs_error.to_string(), tolerance: tolerance.to_string(), timestamp_unit: unit.name().to_string(), timestamp_encoding: timestamp_encoding.to_string(), timestamp_bytes, timestamp_bytes_per_point, total_bytes_per_point: bytes_per_point + timestamp_bytes_per_point, advisory_best_f64_bytes, advisory_best_f64_codec, advisory_fire_timestamp_bytes, advisory_delta_cascade_value_bytes }
+		Self { physical_type: enc.physical_type.name().to_string(), value_count, estimated_value_bytes, realized_value_bytes, value_codec, bytes_per_point, is_exact: enc.is_exact(), lossy_count: enc.lossy_count, max_abs_error: enc.max_abs_error.to_string(), tolerance: tolerance.to_string(), timestamp_unit: unit.name().to_string(), timestamp_encoding: timestamp_encoding.to_string(), timestamp_bytes, timestamp_bytes_per_point, total_bytes_per_point: bytes_per_point + timestamp_bytes_per_point, advisory_best_f64_bytes, advisory_best_f64_codec, advisory_fire_timestamp_bytes, advisory_delta_cascade_value_bytes, advisory_dfor_value_bytes }
 	}
 }
 
@@ -407,7 +423,7 @@ mod tests {
 
 	fn sample_result() -> BenchResult {
 		let samples = [100, 200, 300];
-		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "weftdb".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: Some(SignalShape::MultiSine) }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true }, accuracy: Some(AccuracyMetrics { count: 1000, rmse: 1.5, mae: 1.1, max_abs_error: 4.2, bias: -0.3 }), storage: Some(StorageEstimate { physical_type: "scaled_i64".to_string(), value_count: 200, estimated_value_bytes: 1600, realized_value_bytes: 420, value_codec: "varint".to_string(), bytes_per_point: 2.1, is_exact: true, lossy_count: 0, max_abs_error: "0".to_string(), tolerance: "0".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 208, timestamp_bytes_per_point: 1.04, total_bytes_per_point: 3.14, advisory_best_f64_bytes: None, advisory_best_f64_codec: None, advisory_fire_timestamp_bytes: Some(180), advisory_delta_cascade_value_bytes: None }) }
+		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "weftdb".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: Some(SignalShape::MultiSine) }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true }, accuracy: Some(AccuracyMetrics { count: 1000, rmse: 1.5, mae: 1.1, max_abs_error: 4.2, bias: -0.3 }), storage: Some(StorageEstimate { physical_type: "scaled_i64".to_string(), value_count: 200, estimated_value_bytes: 1600, realized_value_bytes: 420, value_codec: "varint".to_string(), bytes_per_point: 2.1, is_exact: true, lossy_count: 0, max_abs_error: "0".to_string(), tolerance: "0".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 208, timestamp_bytes_per_point: 1.04, total_bytes_per_point: 3.14, advisory_best_f64_bytes: None, advisory_best_f64_codec: None, advisory_fire_timestamp_bytes: Some(180), advisory_delta_cascade_value_bytes: None, advisory_dfor_value_bytes: None }) }
 	}
 
 	#[test]
@@ -629,6 +645,23 @@ mod tests {
 		let jitter: Vec<BigDecimal> = (0..400).map(|i| BigDecimal::from_str(&format!("{}.5", i % 7)).unwrap()).collect();
 		let flat = StorageEstimate::from_columns(&jitter, &[], TimeUnit::Micros, &BigDecimal::from(0));
 		assert_eq!(flat.advisory_delta_cascade_value_bytes, None, "off-trend column must carry no cascade advisory");
+	}
+
+	#[test]
+	fn advisory_dfor_surfaces_when_a_few_values_force_a_finer_scale() {
+		// Two-decimal prices with one six-decimal value: the column scale is 6, so the realized
+		// codec carries four wasted decimal digits per mantissa and the decimal-exponent FOR
+		// strictly beats it. A plain two-decimal column has nothing to factor out: no advisory.
+		use std::str::FromStr;
+		let mut prices: Vec<BigDecimal> = (0..512).map(|i| BigDecimal::new((350_000 + (i * 37) % 900).into(), 2)).collect();
+		prices[7] = BigDecimal::from_str("3501.123456").unwrap();
+		let est = StorageEstimate::from_columns(&prices, &[], TimeUnit::Micros, &BigDecimal::from(0));
+		assert_eq!(est.physical_type, "scaled_i64");
+		let dfor = est.advisory_dfor_value_bytes.expect("a scale forced by one value carries the dfor advisory");
+		assert!(dfor < est.realized_value_bytes, "dfor {dfor} must beat realized {}", est.realized_value_bytes);
+		let plain: Vec<BigDecimal> = (0..512).map(|i| BigDecimal::new((350_000 + (i * 37) % 900).into(), 2)).collect();
+		let flat = StorageEstimate::from_columns(&plain, &[], TimeUnit::Micros, &BigDecimal::from(0));
+		assert_eq!(flat.advisory_dfor_value_bytes, None, "nothing to factor out, so no advisory");
 	}
 
 	#[test]

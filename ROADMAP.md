@@ -642,8 +642,8 @@ detection within Y% and improving historical query latency by Z."*
       writer/reader selector byte plus the range and gather paths, mirroring `VAL_CODEC_FOR`. Then re-run
       `ingest_path_profile_legacy_vs_columnar` on the real corpus: the 4.22 B/point realized headline
       should fall, since the value column is most of it. Expected value column: ~13.6 b vs ~33.7 b.
-      Meanwhile surface `advisory_dfor_value_bytes` in the `weft-bench` `StorageEstimate` beside
-      `advisory_best_f64_bytes`.
+      - [x] **DONE (2026-10-08)** surfaced as `storage.advisory_dfor_value_bytes` in the `weft-bench`
+        `StorageEstimate` (schema v16; `Some` only when it strictly beats the realized codec).
     - [x] **DONE (2026-10-08) — the scalar FOR/blocked decode is the read-path bottleneck at wide widths.**
       `for_bitpack_decode` takes **70.8 ms per 1 Mi values at ~33 bits** (11.3 ms at ~5.5 bits). It
       loops per bit per value, so cost scales with width. The `fastlanes` unpack inside the ALP arm

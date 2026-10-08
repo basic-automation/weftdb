@@ -1210,9 +1210,14 @@ What it does today:
   potential-saving** estimates for codecs not yet realized on disk: the best-of
   f64 value codec (Gorilla / Chimp / **Chimp128** XOR, `advisory_best_f64_bytes` /
   `_codec`) for a lossy `F64` column, and the **Sprintz FIRE** forecaster's
-  footprint on the timestamp column (`advisory_fire_timestamp_bytes`) — each a
-  *what-if* number the adopt-or-drop decision reads, never a realized headline
-  claim.
+  footprint on the timestamp column (`advisory_fire_timestamp_bytes`), and the
+  **decimal-exponent FOR** value codec (`advisory_dfor_value_bytes`, schema v16,
+  present only when it beats the realized codec — e.g. a `ScaledI64` column whose
+  scale is forced by a few high-precision values; real BTC closes measure 13.58 vs
+  33.74 bits/value in
+  [`weft-physical-type/benches/alp_vs_f64_codecs.rs`](weft-physical-type/benches/alp_vs_f64_codecs.rs))
+  — each a *what-if* number the adopt-or-drop decision reads, never a realized
+  headline claim.
 - **Reports** — a `BenchReport` JSON artifact (run metadata + a best-effort
   hardware probe: CPU model, cores, RAM) under `reports/json/`, plus a
   self-contained **HTML** view (`--html`) with the most-accurate row highlighted.
