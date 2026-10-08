@@ -10,8 +10,11 @@
 #   3. <tag> is "v" followed by weft-server's version at that commit (cargo metadata);
 #   4. the commit is an ancestor of origin/main, or of an origin/release/* branch (for
 #      patch releases cut from a release branch);
-#   5. the most recent completed run of the CI workflow for the commit concluded success
-#      (cancelled and skipped runs are ignored);
+#   5. the most recent completed run of the CI workflow for the commit concluded success.
+#      Only runs that tested the commit itself count: push, workflow_dispatch and schedule
+#      runs in this repository. A pull_request run tested a merge with the base branch
+#      (and a fork's runs use the fork's workflow), so neither is evidence. Cancelled and
+#      skipped runs are ignored;
 #   6. CHANGELOG.md at the commit has a non-empty "## [<version>]" section.
 # A dry run checks only 4 and 5, against <ref>.
 #
@@ -105,9 +108,11 @@ check_ci() {
 	runs=$(gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs" \
 		-f head_sha="$sha" -f per_page=100) ||
 		fail "could not list $workflow runs for $sha"
-	latest=$(jq -r --arg sha "$sha" '
+	latest=$(jq -r --arg sha "$sha" --arg repo "$GITHUB_REPOSITORY" '
 		[.workflow_runs[]
 			| select(.head_sha == $sha and .status == "completed")
+			| select(.event == "push" or .event == "workflow_dispatch" or .event == "schedule")
+			| select((.head_repository.full_name // "" | ascii_downcase) == ($repo | ascii_downcase))
 			| select(.conclusion != "cancelled" and .conclusion != "skipped")]
 		| sort_by(.created_at) | last
 		| if . == null then "none -" else "\(.conclusion) \(.html_url)" end' <<<"$runs") ||
@@ -116,7 +121,7 @@ check_ci() {
 	url=${latest#* }
 	case $conclusion in
 	success) note "ci: $workflow passed for $sha ($url)" ;;
-	none) fail "$workflow has no completed run for $sha; wait for CI, or run it" ;;
+	none) fail "$workflow has no completed push, dispatch or scheduled run for $sha in $GITHUB_REPOSITORY (pull request runs do not count); push it to main or a release branch, or dispatch CI on it" ;;
 	*) fail "$workflow's latest run for $sha concluded $conclusion ($url)" ;;
 	esac
 }

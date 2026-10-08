@@ -67,18 +67,23 @@ commit_version() {
 	git rev-parse HEAD
 }
 
-# Records a completed CI run for a commit: ci_run <sha> <conclusion> <created_at>.
+# Records a completed CI run for a commit:
+#   ci_run <sha> <conclusion> <created_at> [<event> [<head repository>]]
+# The event defaults to push, and the repository to this one.
 ci_run() {
-	jq --arg sha "$1" --arg c "$2" --arg t "$3" \
+	jq --arg sha "$1" --arg c "$2" --arg t "$3" --arg event "${4:-push}" \
+		--arg repo "${5:-$GITHUB_REPOSITORY}" \
 		'. + [{head_sha: $sha, status: "completed", conclusion: $c, created_at: $t,
+			event: $event, head_repository: {full_name: $repo},
 			html_url: "https://example.invalid/run"}]' "$runs" >"$runs.new"
 	mv "$runs.new" "$runs"
 }
 
 ci_pending() {
-	jq --arg sha "$1" '. + [{head_sha: $sha, status: "in_progress", conclusion: null,
-		created_at: "2026-10-08T23:00:00Z", html_url: "https://example.invalid/run"}]' \
-		"$runs" >"$runs.new"
+	jq --arg sha "$1" --arg repo "$GITHUB_REPOSITORY" '. + [{head_sha: $sha,
+		status: "in_progress", conclusion: null, created_at: "2026-10-08T23:00:00Z",
+		event: "push", head_repository: {full_name: $repo},
+		html_url: "https://example.invalid/run"}]' "$runs" >"$runs.new"
 	mv "$runs.new" "$runs"
 }
 
@@ -90,21 +95,37 @@ git tag -a v1.2.3 -m v1.2.3
 git tag v1.2.4 # a tag whose name does not match the crate version
 ci_run "$good" success 2026-10-08T10:00:00Z
 ci_run "$good" cancelled 2026-10-08T11:00:00Z # a later cancelled run is ignored
+ci_run "$good" failure 2026-10-08T12:00:00Z pull_request # so is a pull request's run
 
 no_notes=$(commit_version 1.3.0 1.2.3)
 git tag v1.3.0
 ci_run "$no_notes" success 2026-10-08T10:00:00Z
 
-# A green commit whose CI later went red on a newer run.
+# A green commit whose CI later went red on a newer (scheduled) run.
 red=$(commit_version 2.0.0-rc.2 2.0.0-rc.2)
 git tag v2.0.0-rc.2
 ci_run "$red" success 2026-10-08T10:00:00Z
-ci_run "$red" failure 2026-10-08T12:00:00Z
+ci_run "$red" failure 2026-10-08T12:00:00Z schedule
 
 # CI has only an in-progress run.
 pending=$(commit_version 2.0.0-rc.3 2.0.0-rc.3)
 git tag v2.0.0-rc.3
 ci_pending "$pending"
+
+# CI passed only on a pull request, which tested a merge with main, not this commit.
+pr_only=$(commit_version 2.0.0-rc.4 2.0.0-rc.4)
+git tag v2.0.0-rc.4
+ci_run "$pr_only" success 2026-10-08T10:00:00Z pull_request
+
+# CI passed only in a fork, under the fork's own workflow.
+fork_only=$(commit_version 2.0.0-rc.5 2.0.0-rc.5)
+git tag v2.0.0-rc.5
+ci_run "$fork_only" success 2026-10-08T10:00:00Z push someone/fork
+
+# CI was dispatched by hand on the commit.
+dispatched=$(commit_version 2.0.0-rc.6 2.0.0-rc.6)
+git tag v2.0.0-rc.6
+ci_run "$dispatched" success 2026-10-08T10:00:00Z workflow_dispatch
 
 # A release candidate, at the head of main.
 rc=$(commit_version 2.0.0-rc.1 2.0.0-rc.1 1.2.3)
@@ -179,7 +200,10 @@ expect fail:"does not exist" "a missing tag" tag v9.9.9
 expect fail:"does not match" "a tag that does not match the crate version" tag v1.2.4
 expect fail:"not an ancestor" "a commit on neither main nor a release branch" tag v1.4.0
 expect fail:"concluded failure" "a red CI conclusion on the latest run" tag v2.0.0-rc.2
-expect fail:"no completed run" "no completed CI run" tag v2.0.0-rc.3
+expect fail:"no completed push" "no completed CI run" tag v2.0.0-rc.3
+expect fail:"no completed push" "CI passed only on a pull request" tag v2.0.0-rc.4
+expect fail:"no completed push" "CI passed only in a fork" tag v2.0.0-rc.5
+expect ok "CI dispatched by hand on the commit" tag v2.0.0-rc.6
 expect fail:"no non-empty '## [1.3.0]' section" "a missing CHANGELOG section" tag v1.3.0
 expect fail:"tag must be" "a tag that is not vX.Y.Z or vX.Y.Z-rc.N" tag v1.2
 expect fail:"tag must be" "a tag with a build suffix" tag v1.2.3+build
@@ -209,7 +233,8 @@ expect_output tag v1.3.0
 expect ok "a release branch" ref release/1.2
 expect ok "an abbreviated commit id" ref "${good:0:12}"
 expect fail:"not an ancestor" "a commit on neither main nor a release branch" ref "$stray"
-expect fail:"no completed run" "a commit with no completed CI run" ref "$pending"
+expect fail:"no completed push" "a commit with no completed CI run" ref "$pending"
+expect fail:"no completed push" "a commit whose CI passed only on a pull request" ref "$pr_only"
 expect fail:"does not resolve" "a ref that does not exist" ref no-such-branch
 expect fail:"not a usable ref" "a ref with shell metacharacters" ref "main;touch $pwned"
 expect fail:"not a usable ref" "a ref range" ref "main..side"

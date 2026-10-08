@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # Release branches too: the release workflow accepts only a push (or dispatched, or
+    # scheduled) run of this workflow as evidence that a commit passed CI, never a pull
+    # request's run, which tests a merge with the base branch rather than the commit.
+    branches: [main, "release/**"]
   pull_request:
   schedule:
     # Nightly: the full suite including the slow pipeline tests, plus a fresh advisory scan.
