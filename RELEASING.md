@@ -10,9 +10,11 @@ the crates, then publish the GitHub release.
 The release gates trust some repository settings that no file here can enforce. The
 repository owner sets these up once, and checks they still hold before each release:
 
-- **A branch ruleset on `main` and `release/*`**: changes only through pull requests, no
-  force pushes, no deletion. `scripts/release/verify.sh` accepts any commit that is on
-  one of these branches, so whoever can push to them can make a commit releasable.
+- **A branch ruleset on `main` and the maintenance branches `release/[0-9]*`**: changes
+  only through pull requests, no force pushes, no deletion. `scripts/release/verify.sh`
+  accepts any commit on `main` or on a `release/<major>.<minor>` branch, so whoever can
+  push to them can make a commit releasable. Other branches never count, even one
+  named `release/<something>`.
 - **A tag ruleset on `refs/tags/v*`**: only maintainers may create, update or delete
   release tags. The workflow builds the commit a tag points at, and publishing a draft
   release attaches it to wherever the tag points at that moment.
@@ -89,8 +91,8 @@ gh workflow run release.yml --ref main -f ref=<commit>   # build another commit
 gh workflow run release.yml --ref <branch> -f fast=true  # dev profile, to iterate on staging
 ```
 
-A dry run checks only that the commit is on `main` (or a `release/*` branch) and that
-CI passed for it. Only a CI run that tested the commit itself counts: a push,
+A dry run checks only that the commit is on `main` (or a `release/<major>.<minor>`
+maintenance branch of its version's series) and that CI passed for it. Only a CI run that tested the commit itself counts: a push,
 dispatched or scheduled run of `ci.yml` in this repository. A pull request's run tested
 the pull request merged into its base branch, not the commit, so it does not count. CI
 runs on every push to `main` and `release/**`; for any other commit, dispatch it with
@@ -111,8 +113,9 @@ gh run download <run-id> --dir dist --name SHA256SUMS
 judge a release build.
 
 The workflow file and `scripts/release/` come from the branch you dispatch from; the code
-built comes from `ref`. To try a change to the release pipeline before it merges,
-dispatch from your branch with `-f ref=main`.
+built comes from `ref`. A dry run of an unmerged branch's own head fails the ancestry
+check, whatever the branch is called. To try a change to the release pipeline before it
+merges, dispatch from your branch with `-f ref=main`.
 
 ## 3. Tag, and draft the GitHub release
 
@@ -131,7 +134,9 @@ anything is built, and fails the run unless:
 - the tag is exactly `vX.Y.Z` or `vX.Y.Z-rc.N`;
 - the tag already exists (the workflow never creates one);
 - the tag is `v` followed by `weft-server`'s version at that commit;
-- the commit is on `origin/main`, or on an `origin/release/*` branch for a patch release;
+- the commit is on `origin/main`, or, for a patch release, on the maintenance branch
+  `origin/release/X.Y` of its own series (`v1.2.5` on `release/1.2`); no other branch
+  counts;
 - the latest completed CI run for that commit passed, counting push, dispatched and
   scheduled runs in this repository, as for a dry run;
 - `CHANGELOG.md` has a non-empty section for the version, which becomes the release notes.

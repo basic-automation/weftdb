@@ -8,8 +8,10 @@
 #   1. the tag is exactly vX.Y.Z or vX.Y.Z-rc.N (it is checked before any other use);
 #   2. refs/tags/<tag> already exists, so the release can never create it;
 #   3. <tag> is "v" followed by weft-server's version at that commit (cargo metadata);
-#   4. the commit is an ancestor of origin/main, or of an origin/release/* branch (for
-#      patch releases cut from a release branch);
+#   4. the commit is an ancestor of origin/main, or of a maintenance branch
+#      origin/release/<major>.<minor> whose <major>.<minor> is the version's (for patch
+#      releases). No other branch counts, so a feature branch named release/<anything>
+#      cannot make a commit releasable;
 #   5. the most recent completed run of the CI workflow for the commit concluded success.
 #      Only runs that tested the commit itself count: push, workflow_dispatch and schedule
 #      runs in this repository. A pull_request run tested a merge with the base branch
@@ -89,20 +91,32 @@ resolve_ref() {
 	return 1
 }
 
+# check_ancestry <sha> <version>: the commit must be on origin/main, or on a maintenance
+# branch origin/release/<major>.<minor> matching the version's <major>.<minor>.
 check_ancestry() {
-	local sha=$1 branch
-	local -a branches=(refs/remotes/origin/main)
+	local sha=$1 version=$2 branch name series
+	local -a mismatched=()
+	if git rev-parse --verify --quiet "refs/remotes/origin/main^{commit}" >/dev/null &&
+		git merge-base --is-ancestor "$sha" refs/remotes/origin/main; then
+		note "ancestry: $sha is on origin/main"
+		return 0
+	fi
 	while IFS= read -r branch; do
-		branches+=("$branch")
-	done < <(git for-each-ref --format='%(refname)' refs/remotes/origin/release/)
-	for branch in "${branches[@]}"; do
-		if git rev-parse --verify --quiet "$branch^{commit}" >/dev/null &&
-			git merge-base --is-ancestor "$sha" "$branch"; then
-			note "ancestry: $sha is on ${branch#refs/remotes/}"
+		name=${branch#refs/remotes/origin/}
+		# Maintenance branches only: release/1.2, never release/1.2.x or release/some-fix.
+		[[ $name =~ ^release/(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || continue
+		series=${name#release/}
+		git merge-base --is-ancestor "$sha" "$branch" || continue
+		if [[ $version == "$series".* ]]; then
+			note "ancestry: $sha is on origin/$name"
 			return 0
 		fi
-	done
-	fail "$sha is not an ancestor of origin/main or of any origin/release/* branch"
+		mismatched+=("origin/$name")
+	done < <(git for-each-ref --format='%(refname)' refs/remotes/origin/release/)
+	if ((${#mismatched[@]} > 0)); then
+		fail "$sha is on ${mismatched[*]}, but its version $version is not of that series"
+	fi
+	fail "$sha is not an ancestor of origin/main or of an origin/release/<major>.<minor> branch (other branches do not count)"
 }
 
 check_ci() {
@@ -169,7 +183,7 @@ tag)
 	note "tag: $tag is $sha"
 	read_version "$sha"
 	[[ $tag == "v$version" ]] || fail "tag $tag does not match weft-server's version $version at $sha"
-	check_ancestry "$sha"
+	check_ancestry "$sha" "$version"
 	check_changelog "$sha" "$version"
 	check_ci "$sha"
 	;;
@@ -180,7 +194,7 @@ ref)
 	note "ref: $ref is $sha (dry run: ancestry and CI only)"
 	read_version "$sha"
 	tag="v$version"
-	check_ancestry "$sha"
+	check_ancestry "$sha" "$version"
 	check_ci "$sha"
 	;;
 *) usage ;;

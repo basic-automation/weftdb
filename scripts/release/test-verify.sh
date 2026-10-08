@@ -147,8 +147,24 @@ stray=$(commit_version 1.4.0 1.4.0)
 git tag v1.4.0
 ci_run "$stray" success 2026-10-08T10:00:00Z
 
+# A feature branch that merely starts with release/: it must not make a commit releasable.
+git checkout --quiet -b feature "$good"
+feature=$(commit_version 1.5.0 1.5.0)
+git tag v1.5.0
+ci_run "$feature" success 2026-10-08T10:00:00Z
+git update-ref refs/remotes/origin/release/some-feature HEAD
+git update-ref refs/remotes/origin/release/1.5.x HEAD
+git update-ref refs/remotes/origin/release/1.5/hotfix HEAD
+
+# A maintenance branch carrying a commit of another series.
+git checkout --quiet -b release-1.3 "$good"
+wrong_series=$(commit_version 1.2.6 1.2.6)
+git tag v1.2.6
+ci_run "$wrong_series" success 2026-10-08T10:00:00Z
+git update-ref refs/remotes/origin/release/1.3 HEAD
+
 git checkout --quiet main
-git branch --quiet -D release-1.2 side
+git branch --quiet -D release-1.2 side feature release-1.3
 
 # A branch, not a tag, named like a release, at a commit whose version matches it.
 git checkout --quiet -b v9.8.7 "$good"
@@ -202,11 +218,14 @@ expect_output tag v1.2.3
 expect_output prerelease false
 expect ok "a release candidate is a prerelease" tag v2.0.0-rc.1
 expect_output prerelease true
-expect ok "a patch release on an origin/release/* branch" tag v1.2.5
+expect ok "a patch release on origin/release/1.2" tag v1.2.5
 expect_output sha "$patch"
 expect fail:"does not exist" "a missing tag" tag v9.9.9
 expect fail:"does not match" "a tag that does not match the crate version" tag v1.2.4
 expect fail:"not an ancestor" "a commit on neither main nor a release branch" tag v1.4.0
+expect fail:"not an ancestor" "a commit only on release/some-feature, release/1.5.x and release/1.5/hotfix" \
+	tag v1.5.0
+expect fail:"not of that series" "a 1.2.x commit only on release/1.3" tag v1.2.6
 expect fail:"concluded failure" "a red CI conclusion on the latest run" tag v2.0.0-rc.2
 expect fail:"no completed push" "no completed CI run" tag v2.0.0-rc.3
 expect fail:"no completed push" "CI passed only on a pull request" tag v2.0.0-rc.4
@@ -254,6 +273,7 @@ expect_output tag v1.3.0
 expect ok "a release branch" ref release/1.2
 expect ok "an abbreviated commit id" ref "${good:0:12}"
 expect fail:"not an ancestor" "a commit on neither main nor a release branch" ref "$stray"
+expect fail:"not an ancestor" "a feature branch named release/some-feature" ref release/some-feature
 expect fail:"no completed push" "a commit with no completed CI run" ref "$pending"
 expect fail:"no completed push" "a commit whose CI passed only on a pull request" ref "$pr_only"
 expect fail:"does not resolve" "a ref that does not exist" ref no-such-branch
