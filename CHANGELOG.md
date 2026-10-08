@@ -186,7 +186,11 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `segments/` directory. Names are now validated wherever they are declared or turned
   into a path (`weftdb::aspect_name::validate`): at most 160 bytes, no `/` or `\`, no
   control characters, no leading `.`, no trailing `.` or space, and not a Windows device
-  name (`CON`, `NUL`, `COM1`, `CONIN$`, …, also with an extension or a `:` suffix). On
+  name (`CON`, `NUL`, `COM1`, `CONIN$`, …, also with an extension or a `:` suffix).
+  Bidirectional controls, line and paragraph separators and invisible formatting
+  characters are refused as well, so a name cannot display as a different one in
+  listings and logs (the zero-width joiner and non-joiner, which some scripts need, are
+  still accepted). On
   Windows, `<`, `>`, `:`, `"`, `|`, `?` and `*` are refused too, since such a name could
   never be sealed there. `POST /api/v1/storage/aspects` answers `400` for an invalid
   name, and every frame path is also checked to be a direct child of `segments/`. An

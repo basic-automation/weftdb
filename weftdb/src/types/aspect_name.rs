@@ -14,6 +14,14 @@
 //!   rather than special-cased;
 //! - `/` or `\` anywhere (the Unix and Windows path separators);
 //! - NUL or any other control character;
+//! - a bidirectional control (U+061C, U+200E, U+200F, U+202A–U+202E, U+2066–U+2069), a
+//!   line or paragraph separator (U+2028, U+2029), or an invisible formatting character
+//!   with no role inside a word (U+00AD, U+200B, U+2060–U+2064, U+206A–U+206F, U+FEFF,
+//!   U+FFF9–U+FFFB and the tag characters U+E0000–U+E007F). None of them can move a path,
+//!   but they make a name display as something else in listings, logs and the TUI
+//!   (reordered, split across lines, or with hidden text). The zero-width joiner and
+//!   non-joiner (U+200C, U+200D) are still accepted, because several scripts need them
+//!   to spell words;
 //! - a trailing `.` or space, which Windows strips (`a.` and `a` would name one file);
 //! - a Windows reserved device name: `CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`,
 //!   `COM0`–`COM9`, `LPT0`–`LPT9` and the superscript `COM¹`–`COM³`/`LPT¹`–`LPT³`, in any
@@ -78,6 +86,9 @@ pub enum AspectNameReason {
 	PathSeparator,
 	/// The name contains NUL or another control character.
 	ControlCharacter,
+	/// The name contains a bidirectional control, a line or paragraph separator, or an
+	/// invisible formatting character, which would make it display as another name.
+	DeceptiveFormatCharacter,
 	/// The name ends with `.` or a space.
 	TrailingDotOrSpace,
 	/// The name is a Windows reserved device name.
@@ -96,6 +107,7 @@ impl fmt::Display for AspectNameReason {
 			Self::LeadingDot => f.write_str("it starts with `.`"),
 			Self::PathSeparator => f.write_str("it contains `/` or `\\`"),
 			Self::ControlCharacter => f.write_str("it contains NUL or another control character"),
+			Self::DeceptiveFormatCharacter => f.write_str("it contains a bidirectional control, a line or paragraph separator, or an invisible formatting character"),
 			Self::TrailingDotOrSpace => f.write_str("it ends with `.` or a space"),
 			Self::ReservedDeviceName => f.write_str("it is a Windows reserved device name (CON, PRN, AUX, NUL, CONIN$, CONOUT$, COM0-9, LPT0-9)"),
 			Self::WindowsForbiddenCharacter => f.write_str("it contains a character Windows does not allow in a file name (< > : \" | ? *)"),
@@ -150,6 +162,15 @@ pub fn validate(name: &str) -> Result<(), InvalidAspectName> {
 	reason(name, cfg!(windows)).map_or(Ok(()), |reason| Err(InvalidAspectName { name: name.to_string(), reason }))
 }
 
+/// True for a character that changes how a name displays without being visible itself:
+/// the bidirectional controls (Unicode's `Bidi_Control` property), the line and paragraph
+/// separators (categories Zl and Zp), and the invisible formatting characters that have
+/// no role inside a word. The zero-width joiner and non-joiner are deliberately absent;
+/// see the [module documentation](self).
+const fn is_deceptive_format_character(c: char) -> bool {
+	matches!(c, '\u{00AD}' | '\u{061C}' | '\u{200B}' | '\u{200E}' | '\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}' | '\u{E0000}'..='\u{E007F}')
+}
+
 /// The first rule `name` breaks, or [`None`] when it is a valid aspect name. `windows`
 /// adds the Windows-only character rule; it is a parameter so both rule sets are tested
 /// on every platform.
@@ -171,6 +192,9 @@ fn reason(name: &str, windows: bool) -> Option<AspectNameReason> {
 	}
 	if name.chars().any(char::is_control) {
 		return Some(AspectNameReason::ControlCharacter);
+	}
+	if name.chars().any(is_deceptive_format_character) {
+		return Some(AspectNameReason::DeceptiveFormatCharacter);
 	}
 	if name.ends_with(['.', ' ']) {
 		return Some(AspectNameReason::TrailingDotOrSpace);
@@ -223,6 +247,21 @@ mod tests {
 		for name in ["a\0b", "a\nb", "a\rb", "a\tb", "a\u{7f}", "a\u{85}b", "\u{1b}[31m"] {
 			assert_eq!(rejected(name), AspectNameReason::ControlCharacter, "{name:?}");
 		}
+	}
+
+	/// A name carrying a bidi override, a line separator or hidden text displays as a
+	/// different name in a listing or a log line (Trojan-Source style).
+	#[test]
+	fn deceptive_format_characters_are_rejected() {
+		for name in ["price\u{202E}gnp.", "a\u{202A}b", "a\u{2066}b\u{2069}", "a\u{200E}", "\u{200F}a", "a\u{061C}b", "a\u{2028}b", "a\u{2029}b", "pr\u{200B}ice", "a\u{FEFF}", "a\u{00AD}b", "a\u{2060}b", "a\u{206F}b", "a\u{FFFA}b", "a\u{E0041}\u{E007F}"] {
+			assert_eq!(rejected(name), AspectNameReason::DeceptiveFormatCharacter, "{name:?}");
+		}
+		// The joiners spell words in several scripts (Persian, Indic) and join emoji.
+		for name in ["می\u{200C}خواهم", "क्\u{200D}ष", "a\u{200D}b"] {
+			assert_eq!(validate(name), Ok(()), "{name:?} should be accepted");
+		}
+		let message = validate("a\u{202E}b").unwrap_err().to_string();
+		assert!(!message.contains('\u{202E}'), "the error message escapes the character: {message}");
 	}
 
 	#[test]
