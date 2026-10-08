@@ -1376,7 +1376,18 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
       closes, 32 windows of 100 rows over 30 reps have p50 **60.8 ms** single-block vs **17.8 ms**
       paged (8,192 rows/page), both PASS. That is ~1.9 ms per window, dominated by the whole-frame
       CRC of the 4.2 MB frame.
-    - [ ] Residue: `downsample` still reads only a generated series.
+    - [x] **DONE (2026-10-08) — `downsample` on a real series:** `--ds-csv <FILE>`. **Finding: the
+      generator flatters in the OTHER direction here.** On 1M real BTC closes, hourly buckets with
+      `avg,p99,twa` run at **3.39M points/s** (p50 292 ms, 5 reps, PASS). The same-size generated series
+      (60 s stride) runs at **0.53M points/s** (p50 1,808 ms), **6.4× slower**, measured back to back at
+      load avg ~44–62. The generator builds values with `BigDecimal::from_f64(signal)`, whose exact
+      binary expansions carry ~50 significant digits and make every BigDecimal op expensive. Real
+      two-decimal prices do not. So the README's reduction table, which is all generator-based,
+      **understates** WeftDB on real price data.
+    - [ ] **NEXT — make the downsample generator emit realistic decimals** (e.g. round the signal to
+      2–4 places, as the compression shapes already do) and re-measure the README reduction table.
+      This changes published numbers, so do it as one explicit re-baselining commit, keeping the old
+      figures cited as "pre-2026-10 generator".
 
 - [x] **DONE (2026-07-20) — BUG ROOT-CAUSED + FIXED: the "flaky GPU interpolation tests" were never a
   GPU bug.** The roadmap offered two hypotheses — a real GPU race, or an unsound check. **Both the

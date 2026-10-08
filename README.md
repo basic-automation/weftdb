@@ -346,7 +346,13 @@ CSV, Arrow IPC, or Parquet**:
 | `POST /api/v1/{interpolate,downsample}/{csv,arrow,parquet}` and `…/ilp/{csv,arrow,parquet}` | The same computations with CSV (`text/csv`), Arrow IPC stream, or Parquet output — so a harness feeding line protocol pulls results in any of the four formats. |
 
 **What the reductions cost.** Measured on the shipped harness (500k points, 5 reps, hour buckets,
-correctness PASS throughout — `weft-bench --downsample --ds-points 500000 --ds-aggs <agg>`):
+correctness PASS throughout — `weft-bench --downsample --ds-points 500000 --ds-aggs <agg>`). These
+use the generated series, whose values are exact binary expansions of floats (~50 significant
+digits), so they are a pessimistic bound. On **real** two-decimal prices (`--ds-csv`, 1M BTC/USD
+one-minute closes, hourly `avg,p99,twa`) the same reduction runs at **3.39M points/sec** against
+**0.53M points/sec** for a generated series of the same size (`weft-bench --downsample --ds-csv
+database/datasets/btc_1min.csv --csv-value-col 4 --csv-skip 3000000 --ds-points 1000000 --ds-bucket h
+--ds-aggs avg,p99,twa --reps 5`):
 
 | reduction | p50 | throughput | note |
 |---|---|---|---|
