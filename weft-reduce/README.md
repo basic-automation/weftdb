@@ -21,3 +21,6 @@ Part of [WeftDB](https://github.com/basic-automation/weftdb).
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+The `DdSketch` quantile sketch is adapted from Datadog's DDSketch reference implementation
+(sketches-java, Apache-2.0); see [THIRD-PARTY-NOTICES](THIRD-PARTY-NOTICES).

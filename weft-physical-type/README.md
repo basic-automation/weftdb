@@ -40,3 +40,6 @@ Part of [WeftDB](https://github.com/basic-automation/weftdb).
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+The Chimp and Chimp128 codecs (behind `experimental-codecs`) are adapted from the authors'
+reference implementation (Apache-2.0); see [THIRD-PARTY-NOTICES](THIRD-PARTY-NOTICES).

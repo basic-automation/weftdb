@@ -33,6 +33,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   that machine; `--no-gpu-calibrate` turns it off. The calibration, the GPU and
   `Backend::Auto`'s thresholds are printed and recorded in the report's
   `metadata.engine` (bench schema v16) and its HTML view.
+- **Third-party attribution.** A root `NOTICE`, and a `THIRD-PARTY-NOTICES` file shipped in
+  the `weft-physical-type` and `weft-reduce` packages, credit the two Apache-2.0 projects
+  whose code is adapted here: the Chimp/Chimp128 codecs (from the authors' reference
+  implementation) and the DDSketch quantile sketch (from Datadog's sketches-java), with the
+  upstream NOTICE text and the license. The Chimp128 docs no longer credit DuckDB as the
+  source.
 
 ### Changed
 

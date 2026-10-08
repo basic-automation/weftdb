@@ -1,0 +1,24 @@
+WeftDB
+Copyright (c) 2025-2026 Justin Icenhour
+
+WeftDB is licensed under the MIT License (see LICENSE).
+
+It includes portions adapted from the third-party works below, which are
+licensed under the Apache License, Version 2.0. Each crate that contains such
+portions ships a THIRD-PARTY-NOTICES file with the details, the upstream
+NOTICE text where there is one, and the full license text.
+
+- Chimp (https://github.com/panagiotisl/chimp), Copyright the Chimp authors.
+  Adapted in weft-physical-type, src/floatcodec.rs.
+  See weft-physical-type/THIRD-PARTY-NOTICES.
+
+- DDSketch, sketches-java (https://github.com/DataDog/sketches-java),
+  Copyright 2021 Datadog, Inc. Adapted in weft-reduce, src/sketch.rs.
+  See weft-reduce/THIRD-PARTY-NOTICES. Its NOTICE file reads:
+
+---- begin sketches-java NOTICE ----
+Datadog sketches-java
+Copyright 2021 Datadog, Inc.
+
+This product includes software developed at Datadog (https://www.datadoghq.com/).
+---- end sketches-java NOTICE ----
