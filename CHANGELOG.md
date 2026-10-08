@@ -28,9 +28,10 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   Without it, splimes 1.0 never uses the GPU.
 - **Weft-Bench calibrates like `weft-server`.** An interpolation run (line protocol or
   `--synthetic`) calls `splimes::calibrate()` once before anything is timed, skipping a
-  CPU/software adapter as the server does, so the numbers come from the engine the
-  server runs on that machine; `--no-gpu-calibrate` turns it off. The calibration, the
-  GPU and `Backend::Auto`'s thresholds are printed and recorded in the report's
+  CPU/software adapter as the server does (it has no counterpart to
+  `WEFT_GPU_CALIBRATE=force`), so the numbers come from the engine the server runs on
+  that machine; `--no-gpu-calibrate` turns it off. The calibration, the GPU and
+  `Backend::Auto`'s thresholds are printed and recorded in the report's
   `metadata.engine` (bench schema v16) and its HTML view.
 
 ### Changed
@@ -42,10 +43,11 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   crates.io. splimes' [migration guide](https://github.com/basic-automation/splimes/blob/main/MIGRATING.md)
   lists the results that change; through WeftDB:
   - large inputs keep their method (0.1 swapped cubic for quadratic from 2,500 input
-    points and for linear from 5,000);
+    points, and cubic and quadratic for linear above 5,000);
   - `Polynomial(1 | 2 | 3, b)` stays a polynomial, so it extends outside the data
     instead of holding flat, and with too few points a polynomial steps down to degree
-    `n − 1` rather than to `Cubic`/`Quadratic`/`Linear`;
+    `n − 1`. 0.1 stepped down to `Cubic`/`Quadratic`/`Linear` with four input points or
+    fewer, and with five or more kept the requested degree and failed;
   - a polynomial degree above 8 is an error instead of being capped at 8;
   - a zero-span range returns its one point: `POST /api/v1/interpolate` with a single
     input point and no explicit range answers `200` with that point (it was a `500`);
@@ -56,11 +58,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   - results no longer depend on whether the GPU ran them. With a GPU present, 0.1's
     `auto_interpolate` (behind `analyze_range`, `analyze_point`, compression and every
     `weft-server` interpolation endpoint) ran a call on it when the larger of its input
-    count and grid size was 100–999, or either reached 50,000. Its GPU path evaluated
-    `Polynomial(d, b)` at degree `d + 1` and, in `f64`, ignored any bounds factor other
-    than 1.0, so those calls returned different polynomial values from the CPU's, and on
-    a GPU without `f64` support it computed in `f32`. 1.0 computes the same method, in
-    `f64`, on every backend;
+    count and grid size was 100–999, or either reached 50,000. Its GPU path evaluated a
+    polynomial of degree 0 or 4–7 one degree higher than the CPU did (both capped at
+    `n − 1` and 8) and, in `f64`, ignored any bounds factor other than 1.0, so those
+    calls returned different polynomial values from the CPU's, and on a GPU without
+    `f64` support it computed in `f32`. 1.0 computes the same method, in `f64`, on every
+    backend;
   - `Backend::Auto` uses the GPU only once the program has started it, and only above
     the calibrated thresholds (see the startup calibration above); without calibration
     every interpolation runs on the CPU.
@@ -80,7 +83,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   either needs a `_` arm. Their removed 0.1 helpers go with them: use
   `Resolution::step()`/`step_nanos()` for `to_step()` and the `SECONDS_IN_*` constants,
   `weftdb::units_between` for `difference`, `weft_reduce::bucket_index` for `to_base`,
-  and `Spline::min_points()` for `number_of_points_required()`.
+  and `Spline::min_points()` for `number_of_points_required()`. `Resolution::round()`
+  and `to_step_base()` need no replacement: a step is one unit at every resolution, so
+  `to_step_base()` was always `1` and `round()` returned its input unchanged (or, at
+  nanosecond resolution outside 1677–2262, an error). `Spline::pre_check()` has no
+  direct replacement: `Spline::validate()` checks a polynomial's parameters, and the
+  engine checks the range and steps down when there are too few points (or, under
+  `Interpolator::exact(true)`, returns `InsufficientPoints`).
 - **Stored spline methods are validated when they are loaded.** A dictionary created
   with `AspectStructure::new_dictionary` persists its step interpolation as the
   `Spline`'s text (`steps_interpolation` in the `dictionary_constraints` table of
@@ -115,11 +124,16 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   or `interpolated`).
 - **Invalid polynomial parameters are a `400`.** A `polynomial` spline with degree 0, a
   degree above 8, or a negative `bounds_factor` used to be accepted, and the
-  interpolation endpoints answered `200` with a result (0.1's CPU path capped a degree
-  above 8 at 8). splimes 1.0 rejects them, and the request is now a `400` naming the
-  problem, e.g. `invalid polynomial degree 9: must be between 1 and 8`. (JSON cannot
-  carry a non-finite bounds factor; such a body is a `400` from the JSON parser before
-  splimes sees it.)
+  interpolation endpoints usually answered `200` with a result (0.1 capped a degree
+  above 8 at 8). Not always: with 5 to `degree` input points a degree above 8 was a
+  `500` (0.1's failed step-down, above), and on a machine without a usable GPU, a
+  request whose larger of input count and grid size was 100–999 or 50,000 and up ran
+  0.1's SIMD path, where degree 0 was a `500` and a bounds factor below −0.5 panicked
+  once it extrapolated non-constant data, dropping the connection without a response.
+  splimes 1.0 rejects them, and the request is now a `400` naming the problem, e.g.
+  `invalid polynomial degree 9: must be between 1 and 8`. (JSON cannot carry a
+  non-finite bounds factor; such a body is a `400` from the JSON parser before splimes
+  sees it.)
 - **Interpolation errors map to HTTP status by kind.** An input or extrapolated value
   beyond `f64`'s range and an oversized grid are `400`s too; any other engine error
   (a GPU failure, a panicked blocking task) stays a `500`, as every engine error was

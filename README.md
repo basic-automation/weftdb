@@ -1217,7 +1217,10 @@ What it does today:
   CPU/software adapter the same way), so `Backend::Auto` uses rayon and the GPU
   where they are faster on this machine. The calibration, GPU and thresholds are
   printed and recorded in the report's `metadata.engine` (schema v16);
-  `--no-gpu-calibrate` skips it and records splimes' defaults.
+  `--no-gpu-calibrate` skips it and records splimes' defaults. There is no
+  counterpart to the server's `WEFT_GPU_CALIBRATE=force`: on a software adapter the
+  bench always skips calibration, so there it cannot reproduce a server started with
+  `force`.
 - **ILP / TSBS input** — a `.lp` / TSBS file drives the same harness, correctness
   gate, and reporting via the shared `weft-line-protocol` parser.
 
@@ -1331,8 +1334,8 @@ server and an interactive application:
 The platform is designed for **real-time and large-scale** workloads: measurements
 are stored with [`BigDecimal`](https://docs.rs/bigdecimal) logical precision,
 interpolation scales from a handful of points to millions, from one CPU thread to the
-rayon pool and, where calibration measured it faster, the GPU, and the storage layer uses bulk transactions, cached connections, and typed
-columnar segments throughout.
+rayon pool and, where calibration measured it faster, the GPU, and the storage layer
+uses bulk transactions, cached connections, and typed columnar segments throughout.
 
 ---
 
