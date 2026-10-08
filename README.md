@@ -1226,7 +1226,7 @@ What it does today:
   — each a *what-if* number the adopt-or-drop decision reads, never a realized
   headline claim.
 - **Reports** — a `BenchReport` JSON artifact (run metadata + a best-effort
-  hardware probe: CPU model, cores, RAM) under `reports/json/`, plus a
+  hardware probe: CPU model, cores, RAM, and the kind/file system/mount of the disk under the working directory) under `reports/json/`, plus a
   self-contained **HTML** view (`--html`) with the most-accurate row highlighted.
 - **ILP / TSBS input** — a `.lp` / TSBS file drives the same harness, correctness
   gate, and reporting via the shared `weft-line-protocol` parser.

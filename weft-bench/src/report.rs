@@ -51,6 +51,17 @@ pub struct RunMetadata {
 	/// Total physical memory in bytes, when available.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub total_memory_bytes: Option<u64>,
+	/// Kind of the disk holding the run's working directory (`"ssd"` or `"hdd"`), when the
+	/// platform reports it. Storage workloads write and read under the working directory, so
+	/// a spinning disk under a contended array is a different measurement from a solid-state drive.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub work_disk_kind: Option<String>,
+	/// File system of that disk (e.g. `btrfs`, `ext4`, `NTFS`), when available.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub work_disk_file_system: Option<String>,
+	/// Mount point of that disk (the longest mount-point prefix of the working directory).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub work_disk_mount_point: Option<String>,
 	/// When the report was generated, RFC 3339 / ISO 8601. Empty when the caller
 	/// constructs metadata without a timestamp (e.g. for reproducible tests).
 	pub generated_at: String,
@@ -79,8 +90,35 @@ impl RunMetadata {
 		let cpu_cores_logical = Some(sys.cpus().len()).filter(|&n| n > 0);
 		let cpu_cores_physical = sysinfo::System::physical_core_count();
 		let total_memory_bytes = Some(sys.total_memory()).filter(|&b| b > 0);
-		Self { weft_bench_version: env!("CARGO_PKG_VERSION").to_string(), os: std::env::consts::OS.to_string(), arch: std::env::consts::ARCH.to_string(), cpu_model, cpu_cores_physical, cpu_cores_logical, total_memory_bytes, generated_at }
+		let (work_disk_kind, work_disk_file_system, work_disk_mount_point) = std::env::current_dir().map_or((None, None, None), |dir| work_disk(&dir));
+		Self { weft_bench_version: env!("CARGO_PKG_VERSION").to_string(), os: std::env::consts::OS.to_string(), arch: std::env::consts::ARCH.to_string(), cpu_model, cpu_cores_physical, cpu_cores_logical, total_memory_bytes, work_disk_kind, work_disk_file_system, work_disk_mount_point, generated_at }
 	}
+}
+
+/// The `(kind, file system, mount point)` of the disk holding `dir`: the disk whose mount
+/// point is the longest prefix of `dir` (canonicalized when possible). Each part is `None` when
+/// unreadable; the kind is `None` when the platform reports it as unknown.
+fn work_disk(dir: &std::path::Path) -> (Option<String>, Option<String>, Option<String>) {
+	let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+	let disks = sysinfo::Disks::new_with_refreshed_list();
+	let Some(index) = longest_mount_prefix(&dir, disks.list().iter().map(sysinfo::Disk::mount_point)) else {
+		return (None, None, None);
+	};
+	let disk = &disks.list()[index];
+	let kind = match disk.kind() {
+		sysinfo::DiskKind::SSD => Some("ssd".to_string()),
+		sysinfo::DiskKind::HDD => Some("hdd".to_string()),
+		sysinfo::DiskKind::Unknown(_) => None,
+	};
+	let file_system = Some(disk.file_system().to_string_lossy().into_owned()).filter(|f| !f.is_empty());
+	(kind, file_system, Some(disk.mount_point().display().to_string()))
+}
+
+/// The index of the mount point that is the longest path prefix of `dir`, or `None` when no
+/// mount point contains it. Compared by path components, so `/mnt/data2` never matches
+/// `/mnt/data`.
+fn longest_mount_prefix<'a>(dir: &std::path::Path, mounts: impl Iterator<Item = &'a std::path::Path>) -> Option<usize> {
+	mounts.enumerate().filter(|(_, mount)| dir.starts_with(mount)).max_by_key(|(_, mount)| mount.components().count()).map(|(index, _)| index)
 }
 
 /// A Weft-Bench report: run metadata plus the results gathered in one session.
@@ -259,6 +297,11 @@ fn hardware_meta_html(m: &RunMetadata) -> String {
 		let gib = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
 		parts.push(format!("{gib:.1} GiB RAM"));
 	}
+	if let Some(mount) = &m.work_disk_mount_point {
+		let kind = m.work_disk_kind.as_deref().unwrap_or("unknown-kind");
+		let fs = m.work_disk_file_system.as_deref().map(|f| format!(" {f}")).unwrap_or_default();
+		parts.push(escape_html(&format!("work disk: {kind}{fs} at {mount}")));
+	}
 	if parts.is_empty() {
 		String::new()
 	} else {
@@ -330,8 +373,23 @@ mod tests {
 		r
 	}
 
+	#[test]
+	fn the_work_disk_is_the_longest_mount_prefix_by_component() {
+		use std::path::Path;
+		let mounts = [Path::new("/"), Path::new("/mnt/data"), Path::new("/mnt/data2"), Path::new("/home")];
+		assert_eq!(longest_mount_prefix(Path::new("/mnt/data/weft/run"), mounts.iter().copied()), Some(1));
+		assert_eq!(longest_mount_prefix(Path::new("/mnt/data2/x"), mounts.iter().copied()), Some(2), "a sibling mount with a shared string prefix must not match");
+		assert_eq!(longest_mount_prefix(Path::new("/tmp/x"), mounts.iter().copied()), Some(0));
+		assert_eq!(longest_mount_prefix(Path::new("relative"), mounts.iter().copied()), None);
+		// The live probe never panics and, when it names a mount, it contains the working dir.
+		let dir = std::env::current_dir().expect("a working directory");
+		if let (_, _, Some(mount)) = work_disk(&dir) {
+			assert!(dir.canonicalize().unwrap_or(dir).starts_with(&mount), "{mount} must contain the working directory");
+		}
+	}
+
 	fn metadata() -> RunMetadata {
-		RunMetadata { weft_bench_version: "0.1.0".to_string(), os: "testos".to_string(), arch: "testarch".to_string(), cpu_model: Some("Test CPU 9000".to_string()), cpu_cores_physical: Some(8), cpu_cores_logical: Some(16), total_memory_bytes: Some(34_359_738_368), generated_at: "2026-06-06T00:00:00+00:00".to_string() }
+		RunMetadata { weft_bench_version: "0.1.0".to_string(), os: "testos".to_string(), arch: "testarch".to_string(), cpu_model: Some("Test CPU 9000".to_string()), cpu_cores_physical: Some(8), cpu_cores_logical: Some(16), total_memory_bytes: Some(34_359_738_368), work_disk_kind: Some("hdd".to_string()), work_disk_file_system: Some("btrfs".to_string()), work_disk_mount_point: Some("/mnt/data".to_string()), generated_at: "2026-06-06T00:00:00+00:00".to_string() }
 	}
 
 	#[test]
@@ -401,6 +459,7 @@ mod tests {
 		assert!(html.contains("Test CPU 9000"), "CPU model must appear: {html}");
 		assert!(html.contains("8 physical / 16 logical cores"), "core split must appear: {html}");
 		assert!(html.contains("32.0 GiB RAM"), "RAM in GiB must appear: {html}");
+		assert!(html.contains("work disk: hdd btrfs at /mnt/data"), "the work disk must appear: {html}");
 	}
 
 	#[test]

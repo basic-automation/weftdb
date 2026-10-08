@@ -68,9 +68,11 @@ use crate::{
 /// (the delta-of-delta column with the GCD of its deltas factored out, for instants stored at a
 /// finer unit than their precision) and `storage.advisory_delta_for_timestamp_bytes` (first-order
 /// deltas under per-block FOR, for independent random intervals), each present only when it
-/// beats the realized timestamp codec. All optional fields are `#[serde(default)]`, so older
-/// artifacts still deserialize.
-pub const SCHEMA_VERSION: u32 = 17;
+/// beats the realized timestamp codec. v18 added the report's `metadata.work_disk_kind` /
+/// `work_disk_file_system` / `work_disk_mount_point` (the disk under the working directory, so
+/// an HDD-backed run is distinguishable from an NVMe one). All optional fields are
+/// `#[serde(default)]`, so older artifacts still deserialize.
+pub const SCHEMA_VERSION: u32 = 18;
 
 /// Metadata describing the dataset a result was measured against.
 ///
