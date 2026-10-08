@@ -1344,7 +1344,12 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
     `reduce_partial` with the full sidecar set). Stored-range `sketch_p*` downsamples therefore take
     the integer path too. Not switched: bigdecimal's `to_f64` is a custom digit-trimming
     conversion, not provably correctly rounded, so `m as f64 / 10^s` cannot replace it.
-  - [ ] **NEXT — the sidecar build and an end-to-end number.** The `.weftpart` sidecar build
+  - [x] **MEASURED (2026-10-08) — per-segment end to end** (`decimal_tax` `segment_downsample_*`, one real
+    1 Mi-row 4.42 MB frame, decode + reduce, both routes asserted equal, load avg ~50): six streaming
+    reductions **183.6 → 134.0 ms (1.37×)**; avg + sketch_p99 309.6 → 281.5 ms (1.10×). The
+    reduction itself is no longer the cost (~28 ms in isolation), so the next lever is the
+    physical window decode. Profile `read_segment_range_physical` on this frame.
+  - [ ] **NEXT — the sidecar build.** The `.weftpart` sidecar build
     (`write_partial_sidecar`) receives the seal's BigDecimal values rather than stored mantissas,
     so switching it means threading the seal's encoded column through instead. Its callers sit in
     the persist paths the durability arc is reworking, so do it after that lands. Then add a

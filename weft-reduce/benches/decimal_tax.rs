@@ -14,6 +14,11 @@
 //! - `reduce_scaled`: the shipped integer-native reduction ([`weft_reduce::reduce_scaled`]) over
 //!   the same mantissas, producing the same `Bucket`s as `bigdecimal_reduce` (asserted equal).
 //!
+//! A second pair, `segment_*`, times the two routes `SegmentStore::downsample_range` takes for one
+//! sealed segment: the window read as `BigDecimal` and reduced by `reduce_partial`, against the
+//! window read physically and reduced by `reduce_partial_scaled`. It covers decode plus
+//! reduction for one real 1 Mi-row `.weftseg` frame.
+//!
 //! Before timing, the three are checked against each other: the integer sums must equal the
 //! `BigDecimal` sums exactly, and the `f64` averages must agree to 1e-9 relative.
 
@@ -25,7 +30,10 @@ use bigdecimal::{BigDecimal, ToPrimitive};
 use chrono::DateTime;
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use splimes::{Point, Resolution};
-use weft_reduce::{reduce, reduce_scaled, Aggregation};
+use weft_physical_type::{
+	weftseg::{read_segment_range, read_segment_range_physical}, PhysicalValue, Segment, TimeUnit
+};
+use weft_reduce::{reduce, reduce_partial, reduce_partial_scaled, reduce_scaled, Aggregation, Bucket};
 
 const N: usize = 1 << 20;
 const SKIP: usize = 3_000_000;
@@ -141,5 +149,48 @@ fn bench_decimal_tax(c: &mut Criterion) {
 	group.finish();
 }
 
-criterion_group!(benches, bench_decimal_tax);
+/// The `BigDecimal` route through one sealed segment: windowed read, lift to points, reduce.
+fn segment_bigdecimal(bytes: &[u8], aggs: &[Aggregation]) -> Vec<Bucket> {
+	let (ts, vs) = read_segment_range(bytes, i64::MIN, i64::MAX).expect("reads");
+	let points: Vec<Point> = ts.into_iter().zip(vs).filter_map(|(t, v)| v.map(|value| Point { timestamp: DateTime::from_timestamp(t, 0).expect("in range"), value })).collect();
+	reduce_partial(&points, Resolution::Hours, None, None, aggs).expect("reduces").finish(Resolution::Hours, aggs).expect("finishes")
+}
+
+/// The integer route: physical windowed read, mantissas, `reduce_partial_scaled`.
+fn segment_scaled(bytes: &[u8], aggs: &[Aggregation]) -> Vec<Bucket> {
+	let (ts, vs) = read_segment_range_physical(bytes, i64::MIN, i64::MAX).expect("reads");
+	let (mut nanos, mut mantissas, mut scale) = (Vec::with_capacity(ts.len()), Vec::with_capacity(ts.len()), 0_u8);
+	for (t, v) in ts.into_iter().zip(vs) {
+		if let Some(PhysicalValue::ScaledI64 { mantissa, scale: s }) = v {
+			nanos.push(t * 1_000_000_000);
+			mantissas.push(mantissa);
+			scale = s;
+		}
+	}
+	reduce_partial_scaled(&nanos, &mantissas, u32::from(scale), Resolution::Hours, None, None, aggs).expect("reduces").expect("covered").finish(Resolution::Hours, aggs).expect("finishes")
+}
+
+fn bench_segment_downsample(c: &mut Criterion) {
+	let Some(corpus) = load() else {
+		return;
+	};
+	let values: Vec<BigDecimal> = corpus.points.iter().map(|p| p.value.clone()).collect();
+	let bytes = Segment::build_sorted(&corpus.seconds, &values, TimeUnit::Seconds, &BigDecimal::from(0)).expect("seals").write_to();
+	let streaming = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last];
+	let with_sketch = [Aggregation::Avg, Aggregation::SketchP99];
+	for aggs in [&streaming[..], &with_sketch[..]] {
+		assert_eq!(segment_scaled(&bytes, aggs), segment_bigdecimal(&bytes, aggs), "both segment routes must produce the same buckets");
+	}
+	eprintln!("segment_downsample: {} byte frame, both routes agree", bytes.len());
+	let mut group = c.benchmark_group("segment_downsample_1mi_btc");
+	group.sample_size(10);
+	group.throughput(Throughput::Elements(N as u64));
+	group.bench_function("bigdecimal_streaming6", |b| b.iter(|| black_box(segment_bigdecimal(black_box(&bytes), &streaming))));
+	group.bench_function("scaled_streaming6", |b| b.iter(|| black_box(segment_scaled(black_box(&bytes), &streaming))));
+	group.bench_function("bigdecimal_avg_sketch_p99", |b| b.iter(|| black_box(segment_bigdecimal(black_box(&bytes), &with_sketch))));
+	group.bench_function("scaled_avg_sketch_p99", |b| b.iter(|| black_box(segment_scaled(black_box(&bytes), &with_sketch))));
+	group.finish();
+}
+
+criterion_group!(benches, bench_decimal_tax, bench_segment_downsample);
 criterion_main!(benches);
