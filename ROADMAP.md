@@ -423,11 +423,12 @@ detection within Y% and improving historical query latency by Z."*
       (`weft-reduce`) are treated as adapted from their Apache-2.0 reference implementations: a
       root `NOTICE` and per-crate `THIRD-PARTY-NOTICES` (shipped in each package) meet
       Apache-2.0 section 4.
-    - [ ] **Package licence metadata: owner or counsel to decide.** Both crates still declare the
-      workspace `license = "MIT"`, while their packages carry Apache-2.0 portions, so crates.io,
-      `cargo deny` and other scanners that read the field see MIT only. The option is
-      `license = "MIT AND Apache-2.0"` on those two crates (Apache-2.0 is already on
-      `deny.toml`'s allow-list). Left as MIT until the owner or counsel decides.
+    - [x] **Package licence metadata: settled by the relicense (owner decision 2026-10-08).** Every
+      crate now declares `license = "MIT OR Apache-2.0"`, so crates.io, `cargo deny` and other
+      scanners that read the field see Apache-2.0. The Chimp and DDSketch portions stay under
+      Apache-2.0 whichever option a user picks, which the two crates' `THIRD-PARTY-NOTICES` say.
+      If counsel wants the field itself to say so, the expression for those two crates is
+      `(MIT OR Apache-2.0) AND Apache-2.0`.
   - [x] **Gorilla + RLE realized on disk** — the timestamp block now carries four
     codecs (varint/bit-pack/RLE/Gorilla) chosen by the single-source-of-truth
     `best_encoding_name`, so the reported codec always matches the bytes written; the
@@ -760,7 +761,15 @@ metrics, recover from a restart, and file useful support tickets.
 - [ ] Packaging — static binaries, Docker, Compose, Helm (later), systemd, config schema, migration/upgrade/rollback
 - [ ] Observability — Prometheus, Grafana, OTel, structured logs, bench dashboard, query profiles
 - [ ] SDKs — Rust → Python → TypeScript → R/Arrow
-- [ ] Licensing/legal — open-core vs commercial, comparative-benchmark terms, kdb+ restrictions, dependency + codec licenses, customer-data handling, trademark use
+- [ ] Licensing/legal — open-core vs commercial, comparative-benchmark terms, kdb+ restrictions, dependency + codec licenses, customer-data handling, trademark use. **Owner decisions 2026-10-08:**
+  - [x] **Licence: `MIT OR Apache-2.0`**, the Rust ecosystem's dual licence, for every WeftDB crate: `LICENSE-MIT` and `LICENSE-APACHE` at the root and in every crate, `license = "MIT OR Apache-2.0"` in `[workspace.package]`. Earlier commits remain available under MIT. `splimes` (its own repository) stays MIT.
+  - [x] **Copyright holder: Justin Icenhour**, as an individual, and the only one. His employer has signed off. Every commit so far is his (some carry `test@example.com` as the author email; AI-co-authored commits carry Claude trailers). No crate was on crates.io yet, so relicensing needed no one else's consent.
+  - [x] **Contribution terms: DCO or CLA, the contributor's choice.** `git commit -s` on every commit, or the CLA ([`CLA.md`](CLA.md), version 1, adapted from the ASF ICLA, with Justin Icenhour as the counterparty) signed once by a pull request comment. Contributions are licensed `MIT OR Apache-2.0`. The `contribution-terms` workflow passes a pull request when either holds; see [CONTRIBUTING.md](CONTRIBUTING.md#contribution-terms).
+    - [ ] **Enforce it (owner, once on main):** create the `cla-signatures` branch with `signatures/cla/v1.json` (commands in the workflow's header), then require the `contribution-terms` check in branch protection.
+  - [x] **kdb+/KDB-X: excluded from published benchmarks** unless KX consents in writing. See the [Legal notes](#research--business-notes).
+  - [x] **Codec patents: gate the flagged opt-in codecs.** The advisory float/timestamp codecs are behind `experimental-codecs` and the bit-sliced value codec behind `bitsliced-codec` (the [Phase 6.1 codec gate](#phase-6--compression-v2--high)).
+  - [ ] **With counsel:** Amazon US 11,308,093 against the default FOR codec; the Tiger Data family (both ingest paths); the SAP family, before the Phase 6.2 design; **WEFTDB** trademark clearance; the benchmark policy — which competitor editions may be run and published, dataset redistribution, and the claims wording.
+  - [ ] Still open: open-core vs commercial split; customer-data handling.
 
 ### Phase 9 — Analytics premium · *Medium, after benchmark foundation*
 
@@ -813,7 +822,8 @@ report → API/format freeze → **1.0**.
   its own crate ([basic-automation/splimes](https://github.com/basic-automation/splimes))
   with its own 1.0 criteria; a stable WeftDB can't promise a stable API on top of an
   unstable engine. *splimes 1.0.0 was published to crates.io on 2026-10-05, and WeftDB
-  depends on it from the registry (`splimes = "1"`, no patch or git source).*
+  depends on it from the registry (`splimes = "1"`, no patch or git source). The migration
+  merged to main as PR #62 on 2026-10-08.*
 
 - [ ] **Measurement bulk ingest routed through the `.weftseg` seal** — the legacy `batch_capture_measurements` path is super-linear (see [Immediate next actions](#immediate-next-actions))
 - [ ] **B-tags** — per-measurement tags/labels; a data-model change that must precede the API/format freeze
@@ -835,14 +845,17 @@ report → API/format freeze → **1.0**.
 - [ ] **Semver policy + `CHANGELOG.md`**, starting from the first tagged pre-release
 - [ ] **Crate publishing split** — `publish = false` on internal crates (`weft-bench`, `weft-tui`, likely `database_orchestration`); published crates carry versioned path dependencies, docs, and a single edition
 - [ ] **Panic audit on server paths** — no `.unwrap()`/`.expect()` reachable from a request or ingest path; failures surface as typed errors / HTTP status codes
-- [ ] **Security process** — `SECURITY.md` with a disclosure contact, `cargo audit`/`cargo deny` (advisories + licenses) in CI
+- [ ] **Security process** — `SECURITY.md` with a disclosure contact, `cargo audit`/`cargo deny` (advisories + licenses) in CI. *Checked on main 2026-10-08:*
+  - [x] `SECURITY.md` is on main; it routes reports to GitHub private vulnerability reporting
+  - [x] `cargo deny check advisories bans licenses sources` runs in CI (the `deny` job of `ci.yml`), covering what `cargo audit` would
+  - [ ] **Private vulnerability reporting is off** — the repository API reports `enabled: false`, so the channel `SECURITY.md` names does not work yet. The owner turns it on (Settings → Security), then this box is ticked
 
 ### Claims & documentation
 
 - [ ] Every performance claim in the README links to a benchmark artifact (the [governing rule](#weftdb-roadmap))
 - [ ] First cross-engine report — WeftDB vs DuckDB at minimum, meeting the [Benchmark report requirements](#benchmark-report-requirements)
 - [ ] Honesty pages shipped (see [Commercial thesis](#commercial-thesis--positioning))
-- [ ] Legal review of competitor benchmark-publication terms + codec licenses (see [Research & business notes](#research--business-notes))
+- [ ] Legal review of competitor benchmark-publication terms + codec licenses (see [Research & business notes](#research--business-notes)). *2026-10-08: licence and contribution terms decided, kdb+/KDB-X excluded unless KX consents, flagged opt-in codecs gated; the counsel items are listed under Phase 8.*
 - [ ] README *Project status* table updated to reflect 1.0 and the status badge changed from `pre-beta`
 
 ---
@@ -1157,6 +1170,10 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 **Legal (before publishing comparative results):**
 
 - [ ] Review each competitor's benchmark-publication terms (kdb+ especially); disclose configs; include reproduction instructions; check dependency + **compression-codec patents/licenses**; document trademark usage; clarify whether benchmark data may be redistributed
+  - [x] **kdb+/KDB-X (owner decision 2026-10-08): excluded from every published benchmark unless KX consents in writing.** No published report, README figure or claim may include a kdb+/KDB-X result without that consent on file.
+  - [x] **WeftDB's own terms (2026-10-08):** `MIT OR Apache-2.0`; contributions by DCO sign-off or the CLA; sole copyright holder Justin Icenhour, with his employer's sign-off. Detail under [Phase 8](#phase-8--commercial-hardening--required-for-paid-beta).
+  - [x] **Codec patents (2026-10-08):** the flagged opt-in codecs are gated (`experimental-codecs`, `bitsliced-codec`); the default FOR codec stays ungated pending counsel (the [Phase 6.1 codec gate](#phase-6--compression-v2--high)).
+  - [ ] **Open with counsel:** Amazon FOR (US 11,308,093), Tiger Data, SAP (before Phase 6.2), **WEFTDB** trademark clearance, and the benchmark policy: which competitor editions may be run and published, whether the datasets may be redistributed, and the wording of claims.
 
 ---
 
