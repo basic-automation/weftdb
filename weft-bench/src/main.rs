@@ -449,11 +449,9 @@ impl Cli {
 		let mut range_fetch = false;
 		let mut compression = false;
 		let mut downsample = false;
-		let (mut comp_rows, mut comp_shape, mut comp_csv, mut comp_value_col, mut comp_skip): (usize, ValueShape, Option<PathBuf>, usize, usize) = (comp_defaults.point_count, comp_defaults.value_shape, None, 1, 0);
-		let mut pl_csv: Option<PathBuf> = None;
+		let (mut comp_rows, mut comp_shape, mut comp_csv, mut comp_value_col, mut comp_skip, mut pl_csv): (usize, ValueShape, Option<PathBuf>, usize, usize, Option<PathBuf>) = (comp_defaults.point_count, comp_defaults.value_shape, None, 1, 0, None);
 		let (mut ds_points, mut ds_stride, mut ds_bucket) = (ds_defaults.point_count, ds_defaults.input_stride_secs, ds_defaults.bucket_resolution);
-		let mut ds_aggs = ds_defaults.aggregations;
-		let mut ds_parallel = ds_defaults.parallel_chunks.max(1);
+		let (mut ds_aggs, mut ds_parallel) = (ds_defaults.aggregations, ds_defaults.parallel_chunks.max(1));
 		let mut irregular = false;
 		let (mut pl_rows, mut pl_queries, mut pl_absent, mut pl_mode, mut pl_rows_per_page) = (pl_defaults.point_count, pl_defaults.query_count, pl_defaults.absent_fraction, pl_defaults.mode, pl_defaults.rows_per_page);
 		let (mut rf_rows, mut rf_window, mut rf_windows, mut rf_rows_per_page) = (rf_defaults.point_count, rf_defaults.window_rows, rf_defaults.window_count, rf_defaults.rows_per_page);
