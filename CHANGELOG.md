@@ -81,22 +81,29 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `Resolution::step()`/`step_nanos()` for `to_step()` and the `SECONDS_IN_*` constants,
   `weftdb::units_between` for `difference`, `weft_reduce::bucket_index` for `to_base`,
   and `Spline::min_points()` for `number_of_points_required()`.
-- **Stored spline methods are validated when they are loaded.** A dictionary's step
-  interpolation is persisted as the `Spline`'s text (`steps_interpolation` in the
-  `dictionary_constraints` table of `<aspect>/dictionaries/<dictionary>.db`), and splimes
-  1.0's `Spline::from_str` validates what it parses. A stored `Polynomial` with degree 0,
-  a degree above 8, or a negative or non-finite bounds factor, which 0.1 accepted, no
-  longer loads: `get_dictionary_metadata` returns `Database error: Invalid interpolation
-  format: invalid polynomial degree 9: must be between 1 and 8` (or `… invalid bounds
-  factor -1: must be finite and not negative`), and `weft_orchestration::load_dictionary`
-  logs that error as a warning ("Failed to check dictionary metadata, attempting to
-  create"). To fix it, stop WeftDB and rewrite the stored value with Turso's shell
-  (`tursodb`, not `sqlite3`: the file is in Turso's MVCC journal mode), e.g.
-  `UPDATE dictionary_constraints SET steps_interpolation = 'Polynomial(degree: 8,
-  bounds_factor: None)' WHERE steps_interpolation = 'Polynomial(degree: 9,
-  bounds_factor: None)'`; 0.1's CPU path capped any degree above 8 at 8. Degree 0 and
-  invalid bounds factors have no exact 1.0 equivalent: choose a degree from 1 to 8 and a
-  finite, non-negative bounds factor, or `None`.
+- **Stored spline methods are validated when they are loaded.** A dictionary created
+  with `AspectStructure::new_dictionary` persists its step interpolation as the
+  `Spline`'s text (`steps_interpolation` in the `dictionary_constraints` table of
+  `<aspect>/dictionaries/<dictionary>.db`); a dictionary that a pipeline registers
+  through `weft_orchestration::load_dictionary` stores no constraints and is not
+  affected. splimes 1.0's `Spline::from_str` validates what it parses, so a stored
+  `Polynomial` with degree 0, a degree above 8, or a negative or non-finite bounds
+  factor, which 0.1 accepted, no longer loads: `get_dictionary_metadata` returns
+  `Database error: Invalid interpolation format: invalid polynomial degree 9: must be
+  between 1 and 8` (or `… invalid bounds factor -1: must be finite and not negative`),
+  and `load_dictionary` logs that error as a warning ("Failed to check dictionary
+  metadata, attempting to create"). Until this release `get_dictionary_metadata` could
+  not read any stored dictionary (see Fixed), so this is the first release that reads,
+  and so checks, a stored method at all. To fix it, stop WeftDB and rewrite the stored
+  value with Turso's shell (`tursodb`, not `sqlite3`: the file is in Turso's MVCC
+  journal mode), e.g. `UPDATE dictionary_constraints SET steps_interpolation =
+  'Polynomial(degree: 8, bounds_factor: None)' WHERE steps_interpolation =
+  'Polynomial(degree: 9, bounds_factor: None)'`; 0.1 capped any degree above 8 at 8.
+  Degree 0 and invalid bounds factors have no exact 1.0 equivalent: choose a degree
+  from 1 to 8 and a finite, non-negative bounds factor, or `None`. `new_dictionary`
+  now checks the method with `Spline::validate()` and refuses one that would not load,
+  e.g. `Invalid step interpolation for dictionary 'd': invalid polynomial degree 9: must
+  be between 1 and 8`; it stored any method before.
 - `Resolution` names parse case-insensitively (`Hours`, `HOURS`), for example in
   `WEFT_SEGMENT_PARTIAL_BASE`, which ignored anything but lowercase before.
 - **`weft-server` provenance comes from splimes.** The `kind` of each interpolated
@@ -139,6 +146,14 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `Quadratic` → `Linear`, `Polynomial(d, b)` → `Polynomial(n − 1, b)`), so a `cubic`
   request over three points ran a quadratic and still said `Cubic`; it now says
   `Quadratic`. The CSV, Arrow and Parquet outputs carry no method field.
+- **`get_dictionary_metadata` and `list_dictionaries` failed for every stored
+  dictionary.** Both selected an `updated_at` column that the `dictionary_metadata`
+  table does not have (`Failed to query dictionary metadata: … no such column:
+  updated_at`), and `get_dictionary_metadata` then read `steps_count`, an `INTEGER`
+  column, as text. They read the table as it is now: the count as an integer (text is
+  still accepted), and a dictionary without steps as `None`. The metadata
+  `get_dictionary_metadata` caches is keyed by aspect as well as name, so two aspects'
+  dictionaries of the same name no longer share it.
 - **Commit failures were silently ignored.** A control-plane write that lost an MVCC
   conflict was reported as success. Commit errors now reach the caller, and the
   transaction is rolled back.

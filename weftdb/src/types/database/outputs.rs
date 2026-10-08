@@ -740,8 +740,8 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 	//
 
 	async fn get_dictionary_metadata(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<Option<DictionaryMetadata>> {
-		// Check cache first
-		let cache_key = format!("dictionary_metadata_{dictionary_name}");
+		// Check cache first. Keyed by aspect too: dictionary names are per aspect.
+		let cache_key = format!("dictionary_metadata_{}_{dictionary_name}", aspect_id.as_uuid());
 		if let Some(metadata) = self.cache.lock().await.get::<DictionaryMetadata>(&cache_key).await {
 			return Ok(Some(metadata));
 		}
@@ -749,8 +749,10 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		// Get from database
 		let db = self.get_dictionary_db(aspect_id, dictionary_name).await?;
 		let conn: cache::Connection = Self::begin_concurrent(&db, dictionary_name, Some(self.cache.clone())).await?;
+		// `dictionary_metadata` has no `updated_at` column (see
+		// `Aspect::create_dictionary_metadata_table`); selecting one failed every read.
 		let query_sql = r"
-                        SELECT id, name, description, created_at, updated_at
+                        SELECT id, name, description, created_at
                         FROM dictionary_metadata 
                         WHERE name = ?
                 ";
@@ -761,11 +763,9 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 			let name_str = row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary name is not text".to_string()))?.clone();
 			let description_str = row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary description is not text".to_string()))?.clone();
 			let created_at_millis: i64 = *row.get_value(3)?.as_integer().ok_or_else(|| Error::DatabaseError("Created at is not integer".to_string()))?;
-			let updated_at_millis: i64 = *row.get_value(4)?.as_integer().ok_or_else(|| Error::DatabaseError("Updated at is not integer".to_string()))?;
 
 			let id = DictionaryId::from_uuid(Uuid::parse_str(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for dictionary ID: {e}")))?);
 			let _created_at = DateTime::from_timestamp_millis(created_at_millis).ok_or_else(|| Error::DatabaseError("Invalid created at timestamp".to_string()))?;
-			let _updated_at = DateTime::from_timestamp_millis(updated_at_millis).ok_or_else(|| Error::DatabaseError("Invalid updated at timestamp".to_string()))?;
 
 			let constraint_query_sql = r"
                                 SELECT steps_count, steps_interpolation
@@ -776,17 +776,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 
 			let mut constraint_rows: turso::Rows = conn.as_ref().query(&constraint_query_sql, turso::params![id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query dictionary constraints: {e}")))?;
 			let result = if let Some(constraint_row) = constraint_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get constraint row: {e}")))? {
-				let steps_count_str = constraint_row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Steps count is not text".to_string()))?.clone();
-				let steps_interpolation_str = constraint_row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Steps interpolation is not text".to_string()))?.clone();
-
-				// Parse steps configuration
-				let steps: Option<Steps> = if steps_count_str.is_empty() || steps_count_str == "null" {
-					None
-				} else {
-					let count: usize = steps_count_str.parse().map_err(|e| Error::DatabaseError(format!("Invalid steps count format: {e}")))?;
-					let interpolation: Spline = steps_interpolation_str.parse().map_err(|e| Error::DatabaseError(format!("Invalid interpolation format: {e}")))?;
-					Some(Steps::new(count, interpolation))
-				};
+				let steps = Self::parse_stored_steps(&constraint_row.get_value(0)?, &constraint_row.get_value(1)?)?;
 
 				// Parse variabilities - try to get from a separate query or use None
 				let variabilities: Option<Vec<VariablilityType>> = None;
@@ -820,8 +810,9 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		// Get from database
 		let db = self.get_dictionary_db(aspect_id, "default").await?;
 		let conn: cache::Connection = Self::begin_concurrent(&db, "default", Some(self.cache.clone())).await?;
+		// No `updated_at`: the table has no such column (see `get_dictionary_metadata`).
 		let query_sql = r"
-                        SELECT id, name, description, created_at, updated_at
+                        SELECT id, name, description, created_at
                         FROM dictionary_metadata
                 ";
 
@@ -833,11 +824,9 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 			let name_str = row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary name is not text".to_string()))?.clone();
 			let description_str = row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary description is not text".to_string()))?.clone();
 			let created_at_millis: i64 = *row.get_value(3)?.as_integer().ok_or_else(|| Error::DatabaseError("Created at is not integer".to_string()))?;
-			let updated_at_millis: i64 = *row.get_value(4)?.as_integer().ok_or_else(|| Error::DatabaseError("Updated at is not integer".to_string()))?;
 
 			let id = DictionaryId::from_uuid(Uuid::parse_str(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for dictionary ID: {e}")))?);
 			let _created_at = DateTime::from_timestamp_millis(created_at_millis).ok_or_else(|| Error::DatabaseError("Invalid created at timestamp".to_string()))?;
-			let _updated_at = DateTime::from_timestamp_millis(updated_at_millis).ok_or_else(|| Error::DatabaseError("Invalid updated at timestamp".to_string()))?;
 
 			let metadata = DictionaryMetadata { id, name: name_str, description: description_str, constraints: DictionaryConstraints::default() };
 
@@ -1615,5 +1604,70 @@ impl Database {
 		let value = BigDecimal::from_str(&value_str).map_err(|e| Error::DatabaseError(format!("Invalid value format: {e}")))?;
 
 		Ok(Measurement::new(id, dataset_id, timestamp, value))
+	}
+
+	/// Parse a dictionary's stored step configuration: the `steps_count` and
+	/// `steps_interpolation` columns of its `dictionary_constraints` row.
+	///
+	/// `steps_count` is an `INTEGER` column, so the count `new_dictionary` binds as text is
+	/// stored as an integer; text is accepted too. A `NULL` count (or an empty or `"null"`
+	/// text one) means the dictionary has no steps, and its interpolation is not read.
+	/// The interpolation is the [`Spline`]'s text, which splimes validates as it parses.
+	///
+	/// # Errors
+	///
+	/// A `DatabaseError` for a count that is not a non-negative integer, or an
+	/// interpolation that is not text or not a valid [`Spline`], e.g.
+	/// `Invalid interpolation format: invalid polynomial degree 9: must be between 1 and 8`.
+	fn parse_stored_steps(steps_count: &turso::Value, steps_interpolation: &turso::Value) -> Result<Option<Steps>> {
+		let count: usize = match steps_count {
+			turso::Value::Null => return Ok(None),
+			turso::Value::Text(text) if text.is_empty() || text == "null" => return Ok(None),
+			turso::Value::Integer(count) => usize::try_from(*count).map_err(|e| Error::DatabaseError(format!("Invalid steps count {count}: {e}")))?,
+			turso::Value::Text(text) => text.parse().map_err(|e| Error::DatabaseError(format!("Invalid steps count format: {e}")))?,
+			turso::Value::Real(_) | turso::Value::Blob(_) => bail!(Error::DatabaseError("Steps count is neither an integer nor text".to_string())),
+		};
+		let interpolation = steps_interpolation.as_text().ok_or_else(|| Error::DatabaseError("Steps interpolation is not text".to_string()))?;
+		let interpolation: Spline = interpolation.parse().map_err(|e| Error::DatabaseError(format!("Invalid interpolation format: {e}")))?;
+		Ok(Some(Steps::new(count, interpolation)))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use turso::Value;
+
+	use super::*;
+
+	fn text(s: &str) -> Value {
+		Value::Text(s.to_string())
+	}
+
+	#[test]
+	fn stored_steps_read_an_integer_or_text_count() {
+		// The column's INTEGER affinity stores the count `new_dictionary` binds as text as
+		// an integer; the old reader required text, so no stored dictionary ever loaded.
+		let steps = Database::parse_stored_steps(&Value::Integer(10), &text("Cubic")).expect("integer count").expect("steps");
+		assert_eq!((steps.count(), *steps.interpolation()), (10, Spline::Cubic));
+		let steps = Database::parse_stored_steps(&text("4"), &text("Polynomial(degree: 8, bounds_factor: None)")).expect("text count").expect("steps");
+		assert_eq!((steps.count(), *steps.interpolation()), (4, Spline::Polynomial(8, None)));
+	}
+
+	#[test]
+	fn stored_steps_without_a_count_are_none() {
+		// `new_dictionary` writes NULL for both columns when the dictionary has no steps.
+		for count in [Value::Null, text(""), text("null")] {
+			assert!(Database::parse_stored_steps(&count, &Value::Null).expect("no steps").is_none());
+		}
+	}
+
+	#[test]
+	fn stored_steps_reject_what_splimes_rejects() {
+		let err = Database::parse_stored_steps(&Value::Integer(10), &text("Polynomial(degree: 9, bounds_factor: None)")).expect_err("degree 9");
+		assert_eq!(err.to_string(), "Database error: Invalid interpolation format: invalid polynomial degree 9: must be between 1 and 8");
+		let err = Database::parse_stored_steps(&Value::Integer(10), &text("Polynomial(degree: 3, bounds_factor: -1)")).expect_err("negative bounds");
+		assert_eq!(err.to_string(), "Database error: Invalid interpolation format: invalid bounds factor -1: must be finite and not negative");
+		assert!(Database::parse_stored_steps(&Value::Integer(-1), &text("Cubic")).is_err());
+		assert!(Database::parse_stored_steps(&Value::Integer(10), &Value::Null).is_err());
 	}
 }
