@@ -13,7 +13,13 @@
         "email": "ada@example.org",
         "date": "2026-10-08T12:00:00Z"
       },
-      "message": "fix(weftdb): handle an empty range\n\nSigned-off-by: Ada Lovelace <ada@example.org>\n"
+      "message": "fix(weftdb): handle an empty range\n\nSigned-off-by: Ada Lovelace <ada@example.org>\n",
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "signature": null,
+        "payload": null
+      }
     },
     "author": {
       "login": "ada-l",
@@ -45,7 +51,13 @@
         "email": "ada@example.org",
         "date": "2026-10-08T12:00:00Z"
       },
-      "message": "chore: tidy\n\nThe sign-off was forgotten.\n"
+      "message": "chore: tidy\n\nThe sign-off was forgotten.\n",
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "signature": null,
+        "payload": null
+      }
     },
     "author": {
       "login": "ada-l",
@@ -77,7 +89,13 @@
         "email": "ada@example.org",
         "date": "2026-10-08T12:00:00Z"
       },
-      "message": "perf: faster\n\nSigned-off-by: Someone Else <someone@example.org>\n"
+      "message": "perf: faster\n\nSigned-off-by: Someone Else <someone@example.org>\n",
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "signature": null,
+        "payload": null
+      }
     },
     "author": {
       "login": "ada-l",
@@ -109,7 +127,13 @@
         "email": "owner@example.org",
         "date": "2026-10-08T12:00:00Z"
       },
-      "message": "fixup: review nits\n"
+      "message": "fixup: review nits\n",
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "signature": null,
+        "payload": null
+      }
     },
     "author": {
       "login": "physics515",

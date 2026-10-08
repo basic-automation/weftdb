@@ -13,7 +13,13 @@
         "email": "ada@example.org",
         "date": "2026-10-08T12:00:00Z"
       },
-      "message": "fix(weftdb): handle an empty range\n\nSigned-off-by: Ada Lovelace <ada@example.org>\n"
+      "message": "fix(weftdb): handle an empty range\n\nSigned-off-by: Ada Lovelace <ada@example.org>\n",
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "signature": null,
+        "payload": null
+      }
     },
     "author": {
       "login": "ada-l",
@@ -45,7 +51,13 @@
         "email": "Ada@Example.org",
         "date": "2026-10-08T12:00:00Z"
       },
-      "message": "docs: explain the range\n\nCo-authored-by: Grace Hopper <grace@example.org>\nsigned-off-by: Ada Lovelace <ada@EXAMPLE.org>\n"
+      "message": "docs: explain the range\n\nCo-authored-by: Grace Hopper <grace@example.org>\nsigned-off-by: Ada Lovelace <ada@EXAMPLE.org>\n",
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "signature": null,
+        "payload": null
+      }
     },
     "author": {
       "login": "ada-l",
@@ -73,11 +85,17 @@
         "date": "2026-10-08T12:00:00Z"
       },
       "committer": {
-        "name": "Ada Lovelace",
-        "email": "ada@example.org",
+        "name": "GitHub",
+        "email": "noreply@github.com",
         "date": "2026-10-08T12:00:00Z"
       },
-      "message": "Merge branch 'main' into fix-range\n"
+      "message": "Merge branch 'main' into fix-range\n",
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n...\n-----END PGP SIGNATURE-----\n",
+        "payload": "tree 0000000000000000000000000000000000000000\n"
+      }
     },
     "author": {
       "login": "ada-l",
@@ -85,8 +103,8 @@
       "type": "User"
     },
     "committer": {
-      "login": "ada-l",
-      "id": 1005,
+      "login": "web-flow",
+      "id": 19864447,
       "type": "User"
     },
     "parents": [
@@ -112,7 +130,13 @@
         "email": "grace@example.org",
         "date": "2026-10-08T12:00:00Z"
       },
-      "message": "test: cover the empty range\n\nSigned-off-by: Grace Hopper <grace@example.org>"
+      "message": "test: cover the empty range\n\nSigned-off-by: Grace Hopper <grace@example.org>",
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "signature": null,
+        "payload": null
+      }
     },
     "author": null,
     "committer": null,

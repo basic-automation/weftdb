@@ -23,6 +23,11 @@
 > Certificate of Origin. [CONTRIBUTING.md](CONTRIBUTING.md#contribution-terms) explains both
 > routes. A later version of this agreement would get a new version number and its own
 > signature file, and would have to be signed again.
+>
+> Version 1 is fixed at the `cla-v1` tag,
+> <https://github.com/basic-automation/weftdb/blob/cla-v1/CLA.md>, and that is the text a
+> version 1 signature refers to. A later edit to this file, even a typo fix, does not change
+> what anyone signed.
 
 ---
 
@@ -125,9 +130,9 @@ Post this comment, exactly as written, on a pull request to
 I have read the CLA Document and I hereby sign the CLA
 ```
 
-Posting it is your signature to this Agreement, version 1, and the date of the comment is
-the date you signed. You sign once; the Agreement covers your present and future
-Contributions.
+Posting it is your signature to this Agreement, version 1, as fixed at the `cla-v1` tag,
+and the date of the comment is the date you signed. You sign once; the Agreement covers
+your present and future Contributions.
 
 This is a legal contract. Signing records your GitHub username and account ID, the ID and
 time of your comment, the repository ID and the pull request number in

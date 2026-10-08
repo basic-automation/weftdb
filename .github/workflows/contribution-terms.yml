@@ -10,9 +10,27 @@ name: Contribution terms
 # Branch protection requires the `contribution-terms` job, and only that job. `DCO sign-off`
 # and `CLA` feed it; `CLA` is skipped when the DCO route already holds.
 #
-# The allowlist (the owner and two bots) passes without either: a pull request opened by an
-# allowlisted account passes outright, and an allowlisted commit author needs no sign-off or
-# signature. The owner answers for the terms of anyone else's commits in his own pull requests.
+# The allowlist (the owner and two bots). A pull request opened by an allowlisted account
+# passes outright: GitHub sets the opener from the signed-in account, so it cannot be faked,
+# and that account answers for any commits in it that are not its own. In anyone else's pull
+# request, a commit showing an allowlisted account is exempt only when it is signature-
+# verified as that account; GitHub links a commit to an account by its email alone, so
+# anything else needs a sign-off. CLA Assistant Lite's own allowlist matches a name the
+# committer chooses (author login, else committer login, else git author name), so the gate
+# refuses the CLA route when the action would drop an unsigned, unverified commit that way
+# (`cla_allowlist_unsafe`), and when the pull request has more than the 100 commits the
+# action reads.
+#
+# Merge commits need a sign-off too, except merges GitHub made itself (committed by
+# `web-flow` and verified), such as "Update branch". A pull request whose only commits are
+# such merges does not pass on the DCO route. A merge from GitHub's web conflict editor is
+# exempt too and can carry the resolver's edits; maintainers review those (CONTRIBUTING.md).
+#
+# Comment-triggered runs (a signing comment, `recheck`) run in the default branch's context,
+# so their checks land on main's latest commit, not the pull request. They only record
+# signatures and, once every author has signed, re-run the pull request's last failed run;
+# the gate job runs only for pull request events. The DCO checker is told the head SHA of a
+# pull request event and refuses to judge a pull request whose head has moved since.
 #
 # Security. pull_request_target and issue_comment runs get a write token even for pull
 # requests from forks, so no job checks out, builds or runs pull request code. The DCO job
@@ -30,6 +48,13 @@ name: Contribution terms
 #
 # Leave `cla-signatures` unprotected: the action commits each signature to it with the
 # workflow token.
+#
+# Signers agree to the text at the `cla-v1` tag, not whatever CLA.md on main says later.
+# Tag the main commit that carries CLA.md version 1, and protect the tag with a ruleset
+# that restricts its update and deletion:
+#
+#   git tag -a cla-v1 -m "WeftDB CLA version 1" <main commit with CLA.md version 1>
+#   git push origin cla-v1
 
 on:
   pull_request_target:
@@ -61,6 +86,8 @@ jobs:
       pull-requests: read # list the pull request's commits
     outputs:
       satisfied: ${{ steps.check.outputs.satisfied }}
+      cla_allowlist_unsafe: ${{ steps.check.outputs.cla_allowlist_unsafe }}
+      commits: ${{ steps.check.outputs.commits }}
     steps:
       - name: Check out the checker from the default branch (never the pull request)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -74,16 +101,18 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+          # Empty for a comment, which carries no head; the checker then reads the current one.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
           set +e
-          python3 scripts/contrib/dco_check.py --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" --allow "$ALLOWLIST"
+          python3 scripts/contrib/dco_check.py --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" \
+            --head-sha "$HEAD_SHA" --allow "$ALLOWLIST" --output "$GITHUB_OUTPUT"
           status=$?
           set -e
           case "$status" in
-            0) echo "satisfied=true" >> "$GITHUB_OUTPUT" ;;
-            1) echo "satisfied=false" >> "$GITHUB_OUTPUT"
-               echo "::notice title=DCO::Not every commit is signed off by its author, so the CLA decides." ;;
+            0) ;;
+            1) echo "::notice title=DCO::Not every commit is signed off by its author, so the CLA decides." ;;
             *) exit "$status" ;;
           esac
 
@@ -103,7 +132,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         with:
-          path-to-document: https://github.com/basic-automation/weftdb/blob/main/CLA.md
+          # The version 1 text, fixed by the protected `cla-v1` tag (see the setup above).
+          path-to-document: https://github.com/basic-automation/weftdb/blob/cla-v1/CLA.md
           path-to-signatures: signatures/cla/v1.json
           branch: cla-signatures
           allowlist: ${{ env.ALLOWLIST }}
@@ -117,13 +147,16 @@ jobs:
             run <code>git rebase --signoff &lt;base&gt;</code> and force-push. Each sign-off's
             email must match its commit's author email.<br/><br/>
             <b>Or sign the
-            <a href="https://github.com/basic-automation/weftdb/blob/main/CLA.md">Contributor License Agreement</a></b>
+            <a href="https://github.com/basic-automation/weftdb/blob/cla-v1/CLA.md">Contributor License Agreement</a></b>
             once, by posting the comment below on this pull request.<br/>
 
   contribution-terms:
     name: contribution-terms
     needs: [dco, cla]
-    if: ${{ !cancelled() && needs.dco.result != 'skipped' }}
+    # Pull request events only: a comment-triggered run reports on main's latest commit, so
+    # it must not report this gate there. always(): a failed or cancelled dependency still
+    # reaches this job and fails it, where a skipped job would count as passing.
+    if: ${{ always() && github.event_name == 'pull_request_target' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}
@@ -132,18 +165,35 @@ jobs:
         env:
           DCO_RESULT: ${{ needs.dco.result }}
           DCO_SATISFIED: ${{ needs.dco.outputs.satisfied }}
+          CLA_ALLOWLIST_UNSAFE: ${{ needs.dco.outputs.cla_allowlist_unsafe }}
+          COMMITS: ${{ needs.dco.outputs.commits }}
           CLA_RESULT: ${{ needs.cla.result }}
+          # CLA Assistant Lite reads only the first 100 commits of a pull request.
+          CLA_COMMIT_LIMIT: "100"
         run: |
           if [ "$DCO_RESULT" != "success" ]; then
-            echo "::error title=Contribution terms::The DCO check did not finish ($DCO_RESULT); re-run it."
+            echo "::error title=Contribution terms::The DCO check did not finish ($DCO_RESULT). If its log says the head moved, the run for the newer head decides; otherwise re-run it."
             exit 1
           fi
           if [ "$DCO_SATISFIED" = "true" ]; then
             echo "DCO: every commit is signed off by its author, or the pull request is allowlisted."
             exit 0
           fi
+          case "$COMMITS" in
+            '' | *[!0-9]*)
+              echo "::error title=Contribution terms::The DCO check reported no commit count; re-run it."
+              exit 1 ;;
+          esac
+          if [ "$COMMITS" -gt "$CLA_COMMIT_LIMIT" ]; then
+            echo "::error title=Contribution terms::The CLA route reads only the first $CLA_COMMIT_LIMIT commits, and this pull request has $COMMITS. Sign off every commit, or split the pull request."
+            exit 1
+          fi
+          if [ "$CLA_ALLOWLIST_UNSAFE" != "false" ]; then
+            echo "::error title=Contribution terms::Some commits show an allowlisted account but are not verified as it, so the CLA route cannot vouch for them. Sign them off; the DCO sign-off job's summary lists them."
+            exit 1
+          fi
           if [ "$CLA_RESULT" = "success" ]; then
-            echo "CLA: every commit author has signed the CLA, or is allowlisted."
+            echo "CLA: every commit author has signed the CLA, apart from allowlisted accounts whose commits are verified or signed off."
             exit 0
           fi
           echo "::error title=Contribution terms::Sign off every commit (git rebase --signoff) or sign the CLA. See CONTRIBUTING.md, Contribution terms."

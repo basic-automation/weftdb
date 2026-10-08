@@ -57,26 +57,53 @@ class SignoffParsing(unittest.TestCase):
                 self.assertEqual(dco_check.signoff_emails(f"x\n\n{line}\n"), [])
 
 
+def make_commit(
+    sha: str,
+    *,
+    login: str | None = "eve-x",
+    committer_login: str | None = "same",
+    name: str = "Eve",
+    email: str = "eve@example.org",
+    message: str = "feat: x\n",
+    verified: bool = False,
+    parents: int = 1,
+) -> dict:
+    """A commit as the pull request commits API returns it."""
+    committer_login = login if committer_login == "same" else committer_login
+    return {
+        "sha": sha * (40 // len(sha)),
+        "commit": {
+            "author": {"name": name, "email": email, "date": "2026-10-08T12:00:00Z"},
+            "committer": {"name": name, "email": email, "date": "2026-10-08T12:00:00Z"},
+            "message": message,
+            "verification": {"verified": verified, "reason": "valid" if verified else "unsigned"},
+        },
+        "author": {"login": login, "id": 1, "type": "User"} if login else None,
+        "committer": {"login": committer_login, "id": 2, "type": "User"} if committer_login else None,
+        "parents": [{"sha": f"{i:040d}"} for i in range(parents)],
+    }
+
+
+def contributor_pull(commits: list[dict], **extra) -> dict:
+    return dict(load("pull-contributor.json"), commits=len(commits), **extra)
+
+
 class Decision(unittest.TestCase):
     def test_signed_pull_request_passes(self):
         result = dco_check.check(load("pull-contributor.json"), load("commits-signed.json"), ALLOW)
         self.assertTrue(result.satisfied, result.problems)
-        # The merge commit is skipped, so three commits are checked.
-        self.assertIn("all 3 non-merge commit(s)", result.reason)
+        # The merge GitHub made is skipped, so three commits are checked.
+        self.assertIn("all 3 commit(s)", result.reason)
+        self.assertEqual(result.cla_unsafe, [])
+        self.assertEqual(result.commit_count, 4)
 
     def test_missing_and_mismatched_signoffs_fail(self):
         result = dco_check.check(load("pull-contributor.json"), load("commits-unsigned.json"), ALLOW)
         self.assertFalse(result.satisfied)
-        self.assertEqual([sha for sha, _ in result.problems], ["b" * 12, "c" * 12])
+        self.assertEqual([sha for sha, _ in result.problems], ["b" * 12, "c" * 12, "d" * 12])
         self.assertEqual(result.problems[0][1], "no Signed-off-by line")
         self.assertIn("someone@example.org", result.problems[1][1])
         self.assertIn("ada@example.org", result.problems[1][1])
-
-    def test_allowlisted_commit_author_needs_no_signoff(self):
-        commits = [c for c in load("commits-unsigned.json") if c["sha"].startswith("a") or c["sha"].startswith("d")]
-        pull = dict(load("pull-contributor.json"), commits=len(commits))
-        self.assertTrue(dco_check.check(pull, commits, ALLOW).satisfied)
-        self.assertFalse(dco_check.check(pull, commits, set()).satisfied)
 
     def test_pull_request_opened_by_the_owner_passes(self):
         result = dco_check.check(load("pull-owner.json"), load("commits-unsigned.json"), ALLOW)
@@ -97,6 +124,7 @@ class Decision(unittest.TestCase):
         result = dco_check.check(pull, commits, ALLOW)
         self.assertFalse(result.satisfied)
         self.assertIn("4 of 300", result.problems[0][1])
+        self.assertEqual(result.commit_count, 300)
 
     def test_untrusted_text_cannot_form_a_workflow_command(self):
         for text in ["::set-output name=satisfied::true", "x ##[add-mask]y", "a|b`c<d>"]:
@@ -113,6 +141,144 @@ class Decision(unittest.TestCase):
         result = dco_check.check(pull, commits, ALLOW)
         self.assertFalse(result.satisfied)
         self.assertNotIn("::", result.problems[0][1])
+
+
+SIGNED = "feat: x\n\nSigned-off-by: Eve <eve@example.org>\n"
+
+
+class Merges(unittest.TestCase):
+    """Only merges GitHub made pass without a sign-off; a local merge can carry changes."""
+
+    def github_merge(self, sha="9"):
+        return make_commit(sha, committer_login="web-flow", verified=True, parents=2, message="Merge branch 'main' into x\n")
+
+    def test_merge_only_pull_request_fails(self):
+        # git merge --no-ff --no-commit main, arbitrary edits, commit: the only commit is M.
+        commits = [make_commit("m", parents=2, message="Merge branch 'main'\n")]
+        result = dco_check.check(contributor_pull(commits), commits, ALLOW)
+        self.assertFalse(result.satisfied)
+        self.assertIn("merge commit not made by GitHub", result.problems[0][1])
+
+    def test_unsigned_local_merge_among_signed_commits_fails(self):
+        commits = [make_commit("1", message=SIGNED), make_commit("m", parents=2, message="Merge branch 'main'\n")]
+        result = dco_check.check(contributor_pull(commits), commits, ALLOW)
+        self.assertFalse(result.satisfied)
+        self.assertEqual([sha for sha, _ in result.problems], ["m" * 12])
+
+    def test_signed_off_local_merge_passes(self):
+        merge = make_commit("m", parents=2, message="Merge branch 'main'\n\nSigned-off-by: Eve <eve@example.org>\n")
+        commits = [make_commit("1", message=SIGNED), merge]
+        self.assertTrue(dco_check.check(contributor_pull(commits), commits, ALLOW).satisfied)
+
+    def test_github_update_branch_merge_needs_no_signoff(self):
+        commits = [make_commit("1", message=SIGNED), self.github_merge()]
+        result = dco_check.check(contributor_pull(commits), commits, ALLOW)
+        self.assertTrue(result.satisfied, result.problems)
+        self.assertIn("all 1 commit(s)", result.reason)
+
+    def test_unverified_web_flow_merge_needs_a_signoff(self):
+        merge = make_commit("9", committer_login="web-flow", verified=False, parents=2)
+        commits = [make_commit("1", message=SIGNED), merge]
+        self.assertFalse(dco_check.check(contributor_pull(commits), commits, ALLOW).satisfied)
+
+    def test_pull_request_of_only_github_merges_fails(self):
+        commits = [self.github_merge()]
+        result = dco_check.check(contributor_pull(commits), commits, ALLOW)
+        self.assertFalse(result.satisfied)
+        self.assertIn("no commit to check", result.problems[0][1])
+
+
+class AllowlistedCommits(unittest.TestCase):
+    """A commit showing an allowlisted account passes only when GitHub verified that account."""
+
+    def test_unverified_owner_commit_needs_a_signoff(self):
+        # GitHub resolves author.login from the email alone, e.g. the owner's noreply address.
+        commits = [make_commit("1", message=SIGNED), make_commit("o", login="physics515", email="1010+physics515@users.noreply.github.com")]
+        result = dco_check.check(contributor_pull(commits), commits, ALLOW)
+        self.assertFalse(result.satisfied)
+        self.assertEqual([sha for sha, _ in result.problems], ["o" * 12])
+
+    def test_owner_commit_verified_as_the_owner_passes(self):
+        commits = [make_commit("1", message=SIGNED), make_commit("o", login="physics515", verified=True)]
+        self.assertTrue(dco_check.check(contributor_pull(commits), commits, ALLOW).satisfied)
+
+    def test_verified_commit_by_someone_else_does_not_vouch_for_the_owner(self):
+        # Authored as the owner, committed and signed by another account.
+        commits = [make_commit("1", message=SIGNED), make_commit("o", login="physics515", committer_login="eve-x", verified=True)]
+        self.assertFalse(dco_check.check(contributor_pull(commits), commits, ALLOW).satisfied)
+
+    def test_verified_web_flow_commit_does_not_vouch_for_the_owner(self):
+        commits = [make_commit("1", message=SIGNED), make_commit("o", login="physics515", committer_login="web-flow", verified=True)]
+        self.assertFalse(dco_check.check(contributor_pull(commits), commits, ALLOW).satisfied)
+
+
+class ClaAllowlistSafety(unittest.TestCase):
+    """cla_unsafe lists commits CLA Assistant Lite would drop as allowlisted on a fakeable basis."""
+
+    def unsafe(self, *commits):
+        commits = [make_commit("1", message=SIGNED), *commits]
+        result = dco_check.check(contributor_pull(list(commits)), list(commits), ALLOW)
+        self.assertFalse(result.satisfied)
+        return [sha for sha, _ in result.cla_unsafe]
+
+    def test_git_author_name_set_to_a_bot(self):
+        # git config user.name 'dependabot[bot]', with an email linked to no account.
+        fake = make_commit("f", login=None, committer_login=None, name="dependabot[bot]", email="x@unlinked.example")
+        self.assertEqual(self.unsafe(fake), ["f" * 12])
+
+    def test_git_author_name_set_to_the_owner(self):
+        fake = make_commit("f", login=None, committer_login=None, name="Physics515", email="x@unlinked.example")
+        self.assertEqual(self.unsafe(fake), ["f" * 12])
+
+    def test_author_email_set_to_the_owners_address(self):
+        fake = make_commit("f", login="physics515", email="1010+physics515@users.noreply.github.com")
+        self.assertEqual(self.unsafe(fake), ["f" * 12])
+
+    def test_unlinked_author_with_an_allowlisted_committer(self):
+        # The action falls back to the committer's account when the author has none.
+        fake = make_commit("f", login=None, committer_login="github-actions[bot]", email="x@unlinked.example")
+        self.assertEqual(self.unsafe(fake), ["f" * 12])
+
+    def test_ordinary_unsigned_commit_is_left_to_the_cla(self):
+        self.assertEqual(self.unsafe(make_commit("u", login="ada-l")), [])
+
+    def test_signed_off_commit_is_not_flagged(self):
+        commits = [make_commit("u", login="ada-l"), make_commit("s", login=None, committer_login=None, name="physics515", message=SIGNED)]
+        self.assertEqual(self.unsafe(*commits), [])
+
+    def test_verified_owner_commit_is_not_flagged(self):
+        commits = [make_commit("u", login="ada-l"), make_commit("o", login="physics515", verified=True)]
+        self.assertEqual(self.unsafe(*commits), [])
+
+    def test_fixture_owner_commit_is_flagged(self):
+        result = dco_check.check(load("pull-contributor.json"), load("commits-unsigned.json"), ALLOW)
+        self.assertEqual([sha for sha, _ in result.cla_unsafe], ["d" * 12])
+
+
+class HeadBinding(unittest.TestCase):
+    def test_matching_head_runs(self):
+        commits = [make_commit("1", message=SIGNED)]
+        pull = contributor_pull(commits, head={"sha": commits[0]["sha"]})
+        self.assertTrue(dco_check.check(pull, commits, ALLOW, head_sha=commits[0]["sha"].upper()).satisfied)
+
+    def test_moved_head_raises(self):
+        commits = [make_commit("1", message=SIGNED)]
+        pull = contributor_pull(commits, head={"sha": commits[0]["sha"]})
+        with self.assertRaises(dco_check.StaleHead):
+            dco_check.check(pull, commits, ALLOW, head_sha="2" * 40)
+
+    def test_head_missing_from_the_commit_list_raises(self):
+        # The pull request moved between reading it and reading its commits.
+        commits = [make_commit("1", message=SIGNED)]
+        pull = contributor_pull(commits, head={"sha": "2" * 40})
+        with self.assertRaises(dco_check.StaleHead):
+            dco_check.check(pull, commits, ALLOW, head_sha="2" * 40)
+
+    def test_head_is_checked_before_the_opener_allowlist(self):
+        commits = [make_commit("1")]
+        pull = dict(load("pull-owner.json"), commits=1, head={"sha": commits[0]["sha"]})
+        with self.assertRaises(dco_check.StaleHead):
+            dco_check.check(pull, commits, ALLOW, head_sha="2" * 40)
 
 
 class CommandLine(unittest.TestCase):
@@ -152,6 +318,30 @@ class CommandLine(unittest.TestCase):
             text = summary.read_text(encoding="utf-8")
             self.assertIn("| `bbbbbbbbbbbb` | no Signed-off-by line |", text)
             self.assertIn("git rebase --signoff", text)
+            self.assertIn("The CLA route cannot vouch", text)
+
+    def test_outputs_are_written_for_the_workflow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out"
+            proc = self.offline("pull-contributor.json", "commits-unsigned.json", "--output", str(out))
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertEqual(out.read_text(encoding="utf-8"), "satisfied=false\ncla_allowlist_unsafe=true\ncommits=4\n")
+            out.unlink()
+            proc = self.offline("pull-contributor.json", "commits-signed.json", "--output", str(out))
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(out.read_text(encoding="utf-8"), "satisfied=true\ncla_allowlist_unsafe=false\ncommits=4\n")
+
+    def test_exit_status_is_2_when_the_head_has_moved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out"
+            pull = Path(tmp) / "pull.json"
+            pull.write_text(json.dumps(dict(load("pull-contributor.json"), head={"sha": "1" * 40})), encoding="utf-8")
+            args = ["--pull-json", str(pull), "--commits-json", str(DATA / "commits-signed.json"), "--output", str(out)]
+            proc = self.run_cli(*args, "--head-sha", "2" * 40)
+            self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+            self.assertIn("newer head decides", proc.stderr)
+            self.assertFalse(out.exists())
+            self.assertEqual(self.run_cli(*args, "--head-sha", "1" * 40).returncode, 0)
 
 
 class FakeResponse(io.BytesIO):
