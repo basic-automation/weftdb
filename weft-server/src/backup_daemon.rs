@@ -23,10 +23,22 @@
 //! daemon's own snapshots out of the retained set.
 //!
 //! Retention also distrusts a generated-looking directory whose stamp lies more than
-//! [`FUTURE_STAMP_TOLERANCE`] past the current clock. Such a stamp sorts as the newest
-//! snapshot, so enough of them would fill the retained set and get every genuine
-//! snapshot pruned. It cannot come from this daemon (its stamps are the wall clock), so
-//! it is never counted and never removed, and each listing logs a warning naming it.
+//! [`FUTURE_STAMP_TOLERANCE`] past the current clock, or past the directory's own
+//! modification time. Such a stamp sorts as the newest snapshot, so enough of them would
+//! fill the retained set and get every genuine snapshot pruned. The daemon writes
+//! neither: it stamps a snapshot with the wall clock just before creating the directory
+//! and writing into it, so a genuine snapshot is modified at or after its stamp (a copy
+//! keeps that time or moves it later). A distrusted directory is not counted and not
+//! removed, and each listing logs a warning naming it; an operator should remove it.
+//!
+//! The modification-time comparison is what keeps distrusting a directory planted ahead
+//! of time once the clock catches up with its stamp, because the directory keeps its
+//! planting time. It needs a readable modification time that nothing has changed since;
+//! without one only the clock comparison applies, and the directory starts counting once
+//! the clock is within the tolerance of its stamp. A directory planted with a stamp
+//! within the tolerance of its planting time is indistinguishable from a snapshot taken
+//! on a skewed clock and is counted; it stops being the newest once the daemon's stamps
+//! pass it, within [`FUTURE_STAMP_TOLERANCE`] of its planting.
 //!
 //! The daemon holds only `Arc` handles (the store and the metrics registry), so it is
 //! a detached side task; the router and its handlers are untouched.
@@ -76,12 +88,33 @@ pub fn manual_label(millis: u128) -> String {
 	format!("manual-{millis}")
 }
 
-/// How far past the current clock a generated directory's stamp may lie and still count.
+/// How far past the current clock, and past the directory's own modification time, a
+/// generated directory's stamp may lie and still count.
 ///
-/// 24 hours: far more than any clock correction or skew between hosts sharing a backup
-/// directory. A stamp beyond it did not come from this daemon's clock, so
-/// [`list_generated_backups`] ignores it (see the module docs).
+/// 24 hours: far more than any clock correction, any skew between hosts sharing a backup
+/// directory, and any time-zone error in a filesystem's timestamps. A stamp beyond it did
+/// not come from this daemon's clock, so [`list_generated_backups`] ignores it (see the
+/// module docs).
 pub const FUTURE_STAMP_TOLERANCE: Duration = Duration::from_hours(24);
+
+/// Whether retention may count, and prune, a generated directory stamped `stamp`, given
+/// the clock reading `now` and the directory's modification time `modified` (all unix
+/// millis; `None` when the filesystem does not report one).
+///
+/// False when the stamp is more than [`FUTURE_STAMP_TOLERANCE`] past either reading: the
+/// daemon stamps a snapshot just before it creates and writes the directory, so a genuine
+/// stamp is never far ahead of either.
+fn stamp_is_trusted(stamp: u128, now: u128, modified: Option<u128>) -> bool {
+	let tolerance = FUTURE_STAMP_TOLERANCE.as_millis();
+	stamp <= now.saturating_add(tolerance) && modified.is_none_or(|modified| stamp <= modified.saturating_add(tolerance))
+}
+
+/// A directory entry's modification time in unix millis, or `None` when it cannot be
+/// read or precedes the epoch.
+async fn modified_millis(entry: &tokio::fs::DirEntry) -> Option<u128> {
+	let modified = entry.metadata().await.ok()?.modified().ok()?;
+	modified.duration_since(std::time::UNIX_EPOCH).ok().map(|since| since.as_millis())
+}
 
 /// True for a directory name in the daemon's generated grammar: `backup-` and digits.
 ///
@@ -131,9 +164,10 @@ fn now_millis() -> u128 {
 /// Returns `(stamp, path)` pairs sorted by the numeric stamp, so "oldest" is the
 /// snapshot's own recorded time rather than a filesystem mtime (which a copy or a
 /// restore would perturb). Non-matching entries (an operator's labelled backup, a stray
-/// file) are ignored, and so is a generated-looking directory stamped more than
-/// [`FUTURE_STAMP_TOLERANCE`] past the current clock, with a warning: it is never
-/// counted toward retention and never pruned. A missing `base` yields an empty list.
+/// file) are ignored, and so, with a warning, is a generated-looking directory stamped
+/// more than [`FUTURE_STAMP_TOLERANCE`] past the current clock or past its own
+/// modification time: it is not counted toward retention and not pruned. A missing
+/// `base` yields an empty list.
 ///
 /// # Errors
 ///
@@ -145,7 +179,6 @@ pub async fn list_generated_backups(base: &Path) -> anyhow::Result<Vec<(u128, Pa
 /// [`list_generated_backups`] against an explicit clock reading `now` (unix millis), so
 /// the future-stamp rule is testable without a clock.
 async fn list_generated_backups_at(base: &Path, now: u128) -> anyhow::Result<Vec<(u128, PathBuf)>> {
-	let latest_trusted = now.saturating_add(FUTURE_STAMP_TOLERANCE.as_millis());
 	let mut entries = match tokio::fs::read_dir(base).await {
 		Ok(entries) => entries,
 		Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -162,8 +195,9 @@ async fn list_generated_backups_at(base: &Path, now: u128) -> anyhow::Result<Vec
 			continue;
 		}
 		let Ok(stamp) = name.trim_start_matches("backup-").parse::<u128>() else { continue };
-		if stamp > latest_trusted {
-			tracing::warn!(dir = %entry.path().display(), stamp, now, "backup retention ignores a generated-looking directory stamped more than 24 h in the future: it is never counted or pruned; inspect it and remove it by hand");
+		let modified = modified_millis(&entry).await;
+		if !stamp_is_trusted(stamp, now, modified) {
+			tracing::warn!(dir = %entry.path().display(), stamp, now, modified, "backup retention ignores a generated-looking directory stamped more than 24 h past the clock or past its own modification time: the backup daemon did not write it, so it is not counted or pruned; inspect it and remove it by hand");
 			continue;
 		}
 		found.push((stamp, entry.path()));
@@ -177,8 +211,9 @@ async fn list_generated_backups_at(base: &Path, now: u128) -> anyhow::Result<Vec
 ///
 /// Only `backup-<digits>` directories are candidates (see [`is_generated_label`]), so a
 /// hand-labelled snapshot is never pruned, and one stamped more than
-/// [`FUTURE_STAMP_TOLERANCE`] in the future is neither counted nor pruned (see
-/// [`list_generated_backups`]). `keep = 0` removes every generated snapshot.
+/// [`FUTURE_STAMP_TOLERANCE`] past the clock or its own modification time is neither
+/// counted nor pruned (see [`list_generated_backups`]). `keep = 0` removes every
+/// generated snapshot.
 ///
 /// # Errors
 ///
@@ -395,11 +430,52 @@ mod tests {
 		assert_eq!(listed, [base.join(&genuine[1]), base.join(&genuine[2])], "future stamps are not listed as retained snapshots");
 	}
 
+	#[test]
+	fn a_stamp_is_trusted_within_the_tolerance_of_both_the_clock_and_the_mtime() {
+		let tolerance = FUTURE_STAMP_TOLERANCE.as_millis();
+		let now = 1_800_000_000_000_u128;
+		assert!(stamp_is_trusted(now, now, Some(now)));
+		assert!(stamp_is_trusted(now + tolerance, now, Some(now)), "up to 24 h ahead of both readings");
+		assert!(!stamp_is_trusted(now + tolerance + 1, now, Some(now + tolerance)), "past the clock's tolerance");
+		assert!(!stamp_is_trusted(now, now + tolerance, Some(now - tolerance - 1)), "past the mtime's tolerance, although the clock has caught up");
+		assert!(stamp_is_trusted(now - 5_000, now, Some(now + 7_000)), "a copy is modified after its stamp");
+		assert!(stamp_is_trusted(now + tolerance, now, None), "without an mtime only the clock decides");
+		assert!(!stamp_is_trusted(now + tolerance + 1, now, None));
+		assert!(!stamp_is_trusted(now, 0, Some(now)), "a clock read as zero (before the epoch) trusts no real stamp");
+	}
+
+	/// Regression: a directory planted with a stamp a few days ahead used to be ignored only
+	/// until the clock came within 24 h of that stamp, and from then on `keep` of them
+	/// counted as the newest snapshots and got every genuine one pruned. It keeps its
+	/// planting time as its mtime, so it now stays distrusted after the clock catches up.
+	#[tokio::test]
+	async fn a_future_stamped_dir_stays_distrusted_after_the_clock_catches_up() {
+		let dir = TempDir::new().unwrap();
+		let base = dir.path().join("backups");
+		let hour = Duration::from_hours(1).as_millis();
+		let planted_at = now_millis();
+		let genuine = generated_label(planted_at - 1_000);
+		let poisoned = [generated_label(planted_at + 48 * hour), generated_label(planted_at + 48 * hour + 1)];
+		make_backup_dirs(&base, std::iter::once(genuine.as_str()).chain(poisoned.iter().map(String::as_str))).await;
+
+		for later in [0, 30 * hour, 47 * hour, 49 * hour, 1_000 * hour] {
+			let listed: Vec<PathBuf> = list_generated_backups_at(&base, planted_at + later).await.unwrap().into_iter().map(|(_, path)| path).collect();
+			assert_eq!(listed, [base.join(&genuine)], "{later} ms after planting, only the genuine snapshot counts");
+		}
+		assert_eq!(prune_generated_backups_at(&base, 1, planted_at + 30 * hour).await.unwrap(), 0, "the genuine snapshot is not evicted");
+		assert!(base.join(&genuine).exists());
+		for name in &poisoned {
+			assert!(base.join(name).exists(), "{name} is not pruned either (left for an operator to inspect)");
+		}
+	}
+
 	#[tokio::test]
 	async fn the_future_stamp_cut_off_tolerates_clock_skew() {
 		let dir = TempDir::new().unwrap();
 		let base = dir.path().join("backups");
-		let now = 1_800_000_000_000_u128;
+		// An hour before the directories are made, so every stamp below is within the
+		// tolerance of their mtime and only the clock comparison decides.
+		let now = now_millis() - Duration::from_hours(1).as_millis();
 		let tolerance = FUTURE_STAMP_TOLERANCE.as_millis();
 		let names = [generated_label(now), generated_label(now + tolerance), generated_label(now + tolerance + 1)];
 		make_backup_dirs(&base, names.iter().map(String::as_str)).await;

@@ -205,14 +205,22 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   form, both for a `?label=` in it and for every unlabelled backup, so a caller could fill
   the retained set and get the daemon's genuine snapshots pruned. That form is now
   reserved for the backup daemon: a `?label=` in it is a `400`, and an unlabelled backup
-  is now named `manual-<unix_millis>`. Snapshots taken through the endpoint are
-  therefore never counted or pruned by retention; this is a behaviour change for
-  unlabelled backups, which used to be pruned, so remove them by hand when no longer
-  needed. Retention also ignores any generated-looking directory stamped more than 24
-  hours past the current clock: it is never counted and never removed, and each listing
-  logs a warning naming it, so a directory planted before this release cannot evict
-  snapshots either; inspect and remove such directories by hand. Anyone who can write
-  to the backup directory directly can still affect retention; this closes the API path.
+  is now named `manual-<unix_millis>`. A label also may no longer start or end with `.`
+  (Windows drops a trailing dot from a directory name, so such a label could still land
+  on a reserved name there); the restore drill's `?label=` follows the same rule.
+  Snapshots taken through the endpoint are therefore never counted or pruned by
+  retention; this is a behaviour change for unlabelled backups, which used to be pruned,
+  so remove them by hand when no longer needed. Retention also ignores a
+  generated-looking directory whose stamp is more than 24 hours past the current clock or
+  past the directory's own modification time, which no daemon snapshot ever is: it is
+  not counted and not removed, and each listing logs a warning naming it. A directory
+  planted through the API before this release keeps its planting time as its
+  modification time, so a far-future stamp stays ignored after the clock reaches it, as
+  long as the directory is not modified and its filesystem reports modification times.
+  One stamped less than 24 hours past its planting looks like a snapshot from a skewed
+  clock and is counted, but no longer outranks new snapshots a day after it was
+  planted. Remove such directories by hand. Anyone who can write to the backup directory
+  directly can still affect retention; this closes the API path.
 - **Web pages can no longer drive a loopback-bound `weft-server`.** With no
   authentication, the default `127.0.0.1` bind was the only protection, but a page open
   in a browser on the same machine could still send requests that need no CORS
