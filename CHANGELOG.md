@@ -76,8 +76,30 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 - `weft-tui` lists databases with `Database::list_stored_databases`: the names are
   sorted, and an unreadable data directory is reported as an error instead of showing
   an empty list (a missing one still lists nothing).
+- **A segment store's `segment_index.db` is migrated to store layout 2 when it opens**
+  (crash-consistency design, S6). The migration is additive and idempotent and
+  rewrites no data: `segment_index` gains the columns `gen` (0 on every existing row),
+  `prec`, `frame_crc` and `commit_epoch`, and the database gains the tables
+  `aspect_seq`, `frame_journal`, `ingest_ledger`, `segment_quarantine`, `store_meta`,
+  `aspect_metadata` and `segment_changes`, which later releases fill. `store_meta`
+  records `layout_version = 2` and a `store_uuid`. An earlier WeftDB still opens a
+  migrated store, which ignores the additions; a WeftDB refuses a store whose
+  `layout_version` is newer than it knows.
+- Segment-index writes (seals, reconciles, splits, merges, squashes) commit through
+  one transaction type that retries an MVCC conflict up to five times, with backoff,
+  before it fails the call; before, the first conflict failed it.
 
 ### Added
+
+- **Write poison** (crash-consistency design, S6). When a segment-index COMMIT returns
+  an error, the transaction may or may not be durable, so the store now refuses every
+  write (seal, declare, reconcile, split, merge, squash, compact, rollup rebuild) with
+  the new `weftdb::Poisoned` error until the process restarts, while reads keep
+  working; the restart's open settles the transaction. `SegmentStore::poisoned()`
+  reports it, and `GET /ready` gains `poisoned`, `restart_required` and
+  `poison_reason`. `WEFT_ON_AMBIGUOUS_COMMIT=exit` makes the process log and exit with
+  status 70 instead, for deployments whose supervisor restarts it (unset or `poison`
+  keeps the default).
 
 - `Database::list_stored_databases()` lists the legacy databases on disk (the folders
   of the data directory that hold a `metadata.db`), sweeping the build directories of
@@ -101,6 +123,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Fixed
 
+- **A segment store that was moved, restored into another root or mounted at another
+  path could not read its frames.** The index records each frame by the absolute path
+  it was written under, and every read opened that path. Reads now resolve it against
+  the store's current root: a path under the root is used as it is, and any other is
+  taken as `root/segments/` plus what follows its last `segments` component. Restoring
+  a control-plane backup next to copied frames no longer needs the original root to
+  still exist.
 - **A segment store root is now owned by one process.** Opening a store takes a `LOCK`
   file in the root (with the holder's pid and session in `LOCK.holder` beside it) and
   holds it until the store closes. A second `weft-server` on the same

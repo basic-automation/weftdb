@@ -28,7 +28,9 @@
 //! catalog/`metadata.db` registry is a later slice.
 
 use std::{
-	future::Future, path::{Path, PathBuf}
+	future::Future, path::{Component, Path, PathBuf}, sync::{
+		atomic::{AtomicBool, Ordering}, OnceLock
+	}
 };
 
 use anyhow::{bail, Context, Result};
@@ -39,8 +41,10 @@ use weft_physical_type::{merge_newer_wins, split_index, AspectSchema, FrameOptio
 use weft_reduce::{Aggregation, Bucket, PartialReduction};
 
 use crate::{
-	types::durable::{
-		create_dir_all_durable, fault::{self, FaultPoint}, LockHolder, RealFs, RootLock, RootLockError, StoreFs, SyncPolicy, WritePoints
+	types::{
+		durable::{
+			create_dir_all_durable, fault::{self, FaultPoint}, LockHolder, RealFs, RootLock, RootLockError, StoreFs, SyncPolicy, WritePoints
+		}, index_txn::{IndexOp, IndexRow, IndexTxn, IndexTxnError, TxnApplied}
 	}, AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, PartialSidecar, PartialSidecarPolicy, SegmentIndexStore, SnapshotReport, SIDECAR_AGGREGATIONS
 };
 
@@ -249,6 +253,122 @@ impl std::fmt::Display for StoreLocked {
 
 impl std::error::Error for StoreLocked {}
 
+/// The environment variable that chooses what a store does after an ambiguous COMMIT.
+///
+/// Unset or `poison` write-poisons the store (design section 5.1). `exit` logs and exits
+/// the process with [`AMBIGUOUS_COMMIT_EXIT_CODE`], for deployments whose supervisor
+/// restarts the server; the restart's recovery then settles the commit. Read once, when
+/// the store opens.
+pub const AMBIGUOUS_COMMIT_ENV: &str = "WEFT_ON_AMBIGUOUS_COMMIT";
+
+/// The status a process exits with after an ambiguous COMMIT under
+/// `WEFT_ON_AMBIGUOUS_COMMIT=exit`: 70, `EX_SOFTWARE` in sysexits.h.
+pub const AMBIGUOUS_COMMIT_EXIT_CODE: i32 = 70;
+
+/// A write to a [`SegmentStore`] that is write-poisoned.
+///
+/// An earlier control-plane COMMIT returned an error, so that transaction may or may not
+/// be durable, and the store refuses every write until the process restarts (design
+/// section 5.1, poison). Writes are refused because each one would build on a state nobody knows: a seal
+/// would take the next id after a row that might not exist, a maintenance swap would
+/// replace members that might already be gone. Reads go on serving what is committed.
+/// The restart's open replays Turso's log, which is the authority on whether the
+/// transaction committed. It arrives inside an [`anyhow::Error`];
+/// `downcast_ref::<Poisoned>()` recovers it, and
+/// [`SegmentStore::poisoned`] reports the same state without a write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Poisoned {
+	/// What poisoned the store: the failed transaction and its error.
+	pub reason: String,
+}
+
+impl std::fmt::Display for Poisoned {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "the segment store refuses writes until it is restarted (it is write-poisoned by {}); reads still work, and the restart's recovery settles the transaction", self.reason)
+	}
+}
+
+impl std::error::Error for Poisoned {}
+
+/// What a store does once a COMMIT is ambiguous; see [`AMBIGUOUS_COMMIT_ENV`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnAmbiguousCommit {
+	/// Write-poison the store and keep serving reads.
+	Poison,
+	/// Log and exit the process with [`AMBIGUOUS_COMMIT_EXIT_CODE`].
+	Exit,
+}
+
+impl OnAmbiguousCommit {
+	/// Read the choice from [`AMBIGUOUS_COMMIT_ENV`].
+	fn from_env() -> Self {
+		Self::parse(std::env::var(AMBIGUOUS_COMMIT_ENV).ok().as_deref())
+	}
+
+	/// The choice `value` names. An unknown value poisons, the safe default that keeps
+	/// reads up, and says so.
+	fn parse(value: Option<&str>) -> Self {
+		match value.map(str::trim) {
+			Some(exit) if exit.eq_ignore_ascii_case("exit") => Self::Exit,
+			None | Some("") => Self::Poison,
+			Some(poison) if poison.eq_ignore_ascii_case("poison") => Self::Poison,
+			Some(other) => {
+				tracing::warn!(value = other, "{AMBIGUOUS_COMMIT_ENV} is neither `poison` nor `exit`; an ambiguous COMMIT will write-poison the store");
+				Self::Poison
+			}
+		}
+	}
+}
+
+/// A store's write poison: set once, by the first ambiguous COMMIT, and never cleared.
+#[derive(Debug, Default)]
+struct StorePoison {
+	/// Checked on every write, so it is the one thing a write reads.
+	poisoned: AtomicBool,
+	/// Why, from the first poisoning; later ones keep it.
+	reason: OnceLock<String>,
+}
+
+impl StorePoison {
+	/// Poison the store for `reason`. Returns whether this call poisoned it (the first).
+	fn set(&self, reason: String) -> bool {
+		let first = self.reason.set(reason).is_ok();
+		self.poisoned.store(true, Ordering::Release);
+		first
+	}
+
+	/// The poison, if the store is poisoned.
+	fn get(&self) -> Option<Poisoned> {
+		self.poisoned.load(Ordering::Acquire).then(|| Poisoned { reason: self.reason.get().cloned().unwrap_or_default() })
+	}
+}
+
+/// The file a stored frame `path` names under the store root `root` (design section 4:
+/// `path` keeps being written root-joined, and readers resolve it against the current
+/// root).
+///
+/// A path under `root` is used as it is. Any other path was written under a root that
+/// has since moved: the store was relocated, restored into another root, or is mounted
+/// somewhere else. The frame then lives at the same place below the current root's
+/// `segments/`: `root/segments/` joined with the components after the last component
+/// named `segments` (the last, so that a root which itself sits under a `segments`
+/// directory resolves correctly). A path with no `segments` component, or one whose
+/// tail is not plain names (a `..`, say), is used as it is: there is nothing safe to
+/// resolve it to, and opening it fails or succeeds just as it did before resolution.
+fn resolve_frame_path(root: &Path, stored: &str) -> PathBuf {
+	let stored = Path::new(stored);
+	if stored.starts_with(root) {
+		return stored.to_path_buf();
+	}
+	let components: Vec<Component<'_>> = stored.components().collect();
+	let Some(last_segments) = components.iter().rposition(|component| component.as_os_str() == "segments") else { return stored.to_path_buf() };
+	let tail = &components[last_segments + 1..];
+	if tail.is_empty() || !tail.iter().all(|component| matches!(component, Component::Normal(_))) {
+		return stored.to_path_buf();
+	}
+	tail.iter().fold(root.join("segments"), |path, component| path.join(component))
+}
+
 pub struct SegmentStore {
 	/// The store root; sealed frames live in `root/segments/`.
 	root: PathBuf,
@@ -279,6 +399,11 @@ pub struct SegmentStore {
 	/// is scoped to one subject, so its flat aspect keys (which name the `.weftseg`
 	/// files and index rows) are unique within it.
 	subject: String,
+	/// Set by an ambiguous `segment_index.db` COMMIT; every write checks it and refuses
+	/// while it is set (see [`Poisoned`]).
+	poison: StorePoison,
+	/// Whether an ambiguous COMMIT poisons the store or exits the process.
+	on_ambiguous: OnAmbiguousCommit,
 	/// The root's `LOCK`, held for the store's lifetime. Declared last so that it drops
 	/// last: the next opener cannot take the root while a database above is still
 	/// closing.
@@ -439,7 +564,93 @@ impl SegmentStore {
 		let checkpoints = CheckpointPolicy::from_env();
 		let partials = PartialSidecarPolicy::from_env();
 		let transposed = TransposedPolicy::from_env();
-		Ok(Self { root, index, metadata, catalog, registry, database: database.to_string(), subject: subject.to_string(), checkpoints, partials, transposed, _root_lock: root_lock })
+		Ok(Self { root, index, metadata, catalog, registry, database: database.to_string(), subject: subject.to_string(), checkpoints, partials, transposed, poison: StorePoison::default(), on_ambiguous: OnAmbiguousCommit::from_env(), _root_lock: root_lock })
+	}
+
+	/// The store's write poison, or `None` while it accepts writes.
+	///
+	/// A store poisons itself when a `segment_index.db` COMMIT returns an error, because
+	/// that transaction may or may not be durable (see [`Poisoned`]). From then on every
+	/// write fails with that [`Poisoned`] error and reads go on working, until the
+	/// process restarts. `weft-server`'s `/ready` reports it as `poisoned` and
+	/// `restart_required`.
+	#[must_use]
+	pub fn poisoned(&self) -> Option<Poisoned> {
+		self.poison.get()
+	}
+
+	/// Refuse a write while the store is poisoned. Every write entry point calls this
+	/// first, before it reads or writes anything.
+	fn writable(&self) -> Result<()> {
+		match self.poison.get() {
+			Some(poisoned) => Err(poisoned.into()),
+			None => Ok(()),
+		}
+	}
+
+	/// Commit `txn` to the segment index, unless the store is poisoned. An ambiguous
+	/// failure poisons the store (or, under `WEFT_ON_AMBIGUOUS_COMMIT=exit`, exits the
+	/// process) before the error is returned, so no later write builds on it.
+	///
+	/// # Errors
+	///
+	/// [`Poisoned`] if the store already is, or the transaction's [`IndexTxnError`].
+	pub(crate) async fn commit_index(&self, txn: &IndexTxn) -> Result<TxnApplied> {
+		self.writable()?;
+		match self.index.apply(txn).await {
+			Ok(applied) => Ok(applied),
+			Err(e) => {
+				if e.is_ambiguous() {
+					self.on_ambiguous_commit(&e);
+				}
+				Err(e.into())
+			}
+		}
+	}
+
+	/// React to an ambiguous COMMIT as [`AMBIGUOUS_COMMIT_ENV`] chose.
+	fn on_ambiguous_commit(&self, error: &IndexTxnError) {
+		let root = self.root.display();
+		match self.on_ambiguous {
+			OnAmbiguousCommit::Exit => {
+				tracing::error!(%root, %error, "a segment_index COMMIT is ambiguous; exiting with status {AMBIGUOUS_COMMIT_EXIT_CODE} as {AMBIGUOUS_COMMIT_ENV}=exit asks, so that the restart's recovery settles it");
+				eprintln!("weftdb: segment store {root}: {error}; exiting with status {AMBIGUOUS_COMMIT_EXIT_CODE} ({AMBIGUOUS_COMMIT_ENV}=exit)");
+				std::process::exit(AMBIGUOUS_COMMIT_EXIT_CODE);
+			}
+			OnAmbiguousCommit::Poison => {
+				if self.poison.set(error.to_string()) {
+					tracing::error!(%root, %error, "a segment_index COMMIT is ambiguous; the store refuses writes until the process restarts, and reads go on");
+				}
+			}
+		}
+	}
+
+	/// Record `descriptor` as `aspect`'s legacy row (generation 0), replacing any row with
+	/// its id: a seal or an in-place rewrite.
+	async fn put_descriptor(&self, aspect: &str, descriptor: &SegmentDescriptor) -> Result<()> {
+		let txn = IndexTxn::new(vec![IndexOp::Upsert { aspect: aspect.to_string(), row: IndexRow::legacy(descriptor.clone()) }]);
+		self.commit_index(&txn).await?;
+		Ok(())
+	}
+
+	/// Remove `aspect`'s row for segment `id`, if there is one.
+	async fn remove_descriptor(&self, aspect: &str, id: u64) -> Result<()> {
+		let txn = IndexTxn::new(vec![IndexOp::Delete { aspect: aspect.to_string(), id }]);
+		self.commit_index(&txn).await?;
+		Ok(())
+	}
+
+	/// The file holding `descriptor`'s frame: its recorded path, resolved against this
+	/// store's root (see [`resolve_frame_path`]), so that a root that was moved or
+	/// restored elsewhere still reads its own frames.
+	fn frame_path(&self, descriptor: &SegmentDescriptor) -> PathBuf {
+		resolve_frame_path(&self.root, &descriptor.path)
+	}
+
+	/// Read `descriptor`'s frame from [`frame_path`](Self::frame_path).
+	async fn read_frame(&self, descriptor: &SegmentDescriptor) -> Result<Vec<u8>> {
+		let path = self.frame_path(descriptor);
+		tokio::fs::read(&path).await.with_context(|| format!("reading segment {}", path.display()))
 	}
 
 	/// Override this store's [`CheckpointPolicy`] (the env-read default is
@@ -705,6 +916,7 @@ impl SegmentStore {
 	///
 	/// Propagates any libSQL write failure.
 	pub async fn declare(&self, aspect: &str, schema: &AspectSchema) -> Result<()> {
+		self.writable()?;
 		self.catalog.declare(&self.database, &self.subject, aspect, schema).await
 	}
 
@@ -733,6 +945,7 @@ impl SegmentStore {
 	/// Returns an error if `aspect` has no declared schema; otherwise as
 	/// [`seal`](SegmentStore::seal).
 	pub async fn seal_declared(&self, aspect: &str, timestamps: &[i64], values: &[BigDecimal]) -> Result<SegmentDescriptor> {
+		self.writable()?;
 		let schema = self.require_schema(aspect).await?;
 		self.seal(aspect, &schema, timestamps, values).await
 	}
@@ -745,6 +958,7 @@ impl SegmentStore {
 	/// Returns an error if `aspect` has no declared schema; otherwise as
 	/// [`seal_nullable`](SegmentStore::seal_nullable).
 	pub async fn seal_declared_nullable(&self, aspect: &str, timestamps: &[i64], values: &[Option<BigDecimal>]) -> Result<SegmentDescriptor> {
+		self.writable()?;
 		let schema = self.require_schema(aspect).await?;
 		self.seal_nullable(aspect, &schema, timestamps, values).await
 	}
@@ -757,6 +971,7 @@ impl SegmentStore {
 	/// Returns an error if `aspect` has no declared schema; otherwise as
 	/// [`seal_paged`](SegmentStore::seal_paged).
 	pub async fn seal_declared_paged(&self, aspect: &str, timestamps: &[i64], values: &[BigDecimal], rows_per_page: usize) -> Result<SegmentDescriptor> {
+		self.writable()?;
 		let schema = self.require_schema(aspect).await?;
 		self.seal_paged(aspect, &schema, timestamps, values, rows_per_page).await
 	}
@@ -776,6 +991,7 @@ impl SegmentStore {
 	/// value, tolerance exceeded), a filesystem write error, or a libSQL index
 	/// failure.
 	pub async fn seal(&self, aspect: &str, schema: &AspectSchema, timestamps: &[i64], values: &[BigDecimal]) -> Result<SegmentDescriptor> {
+		self.writable()?;
 		let segment = schema.seal(timestamps, values).map_err(|e| anyhow::anyhow!("seal failed: {e}"))?;
 		self.persist(aspect, &segment).await
 	}
@@ -791,6 +1007,7 @@ impl SegmentStore {
 	///
 	/// As [`seal`](SegmentStore::seal).
 	pub async fn seal_nullable(&self, aspect: &str, schema: &AspectSchema, timestamps: &[i64], values: &[Option<BigDecimal>]) -> Result<SegmentDescriptor> {
+		self.writable()?;
 		let segment = schema.seal_nullable(timestamps, values).map_err(|e| anyhow::anyhow!("seal failed: {e}"))?;
 		self.persist(aspect, &segment).await
 	}
@@ -806,6 +1023,7 @@ impl SegmentStore {
 	/// As [`seal`](SegmentStore::seal), plus a [`weft_physical_type::SealError::EmptyPageSize`]
 	/// if `rows_per_page` is zero.
 	pub async fn seal_paged(&self, aspect: &str, schema: &AspectSchema, timestamps: &[i64], values: &[BigDecimal], rows_per_page: usize) -> Result<SegmentDescriptor> {
+		self.writable()?;
 		let segment = schema.seal_paged(timestamps, values, rows_per_page).map_err(|e| anyhow::anyhow!("paged seal failed: {e}"))?;
 		self.persist_paged(aspect, &segment).await
 	}
@@ -817,6 +1035,7 @@ impl SegmentStore {
 	///
 	/// As [`seal_paged`](SegmentStore::seal_paged).
 	pub async fn seal_paged_nullable(&self, aspect: &str, schema: &AspectSchema, timestamps: &[i64], values: &[Option<BigDecimal>], rows_per_page: usize) -> Result<SegmentDescriptor> {
+		self.writable()?;
 		let segment = schema.seal_paged_nullable(timestamps, values, rows_per_page).map_err(|e| anyhow::anyhow!("paged seal failed: {e}"))?;
 		self.persist_paged(aspect, &segment).await
 	}
@@ -834,7 +1053,7 @@ impl SegmentStore {
 		let path = self.segment_path(aspect, id);
 		tokio::fs::write(&path, &bytes).await.with_context(|| format!("writing segment {}", path.display()))?;
 		let descriptor = SegmentDescriptor::of_segment(id, path.to_string_lossy().into_owned(), bytes.len() as u64, segment);
-		self.index.insert(aspect, &descriptor).await?;
+		self.put_descriptor(aspect, &descriptor).await?;
 		self.metadata.record_seal(aspect, &descriptor).await?;
 		// Per-segment partial sidecar (opt-in) — a pure read accelerator, so decode only
 		// when the policy actually wants one, and never fail the seal on a sidecar error.
@@ -857,7 +1076,7 @@ impl SegmentStore {
 		let path = self.segment_path(aspect, id);
 		tokio::fs::write(&path, &bytes).await.with_context(|| format!("writing segment {}", path.display()))?;
 		let descriptor = SegmentDescriptor::of_paged_segment(id, path.to_string_lossy().into_owned(), bytes.len() as u64, segment);
-		self.index.insert(aspect, &descriptor).await?;
+		self.put_descriptor(aspect, &descriptor).await?;
 		self.metadata.record_seal(aspect, &descriptor).await?;
 		// As `persist`: opt-in per-segment partial sidecar, never failing the seal.
 		if self.partials.base_for(segment.stats.row_count).is_some() {
@@ -984,7 +1203,7 @@ impl SegmentStore {
 		let mut timestamps = Vec::new();
 		let mut values = Vec::new();
 		for descriptor in &descriptors {
-			let bytes = tokio::fs::read(&descriptor.path).await.with_context(|| format!("reading segment {}", descriptor.path))?;
+			let bytes = self.read_frame(descriptor).await?;
 			// A paged frame (v3) decodes through PagedSegment::read_time_range, which
 			// skips pages *within* the file; a single-block frame decodes whole.
 			// Windowed read: a regular block-coded frame decodes only the row window (closed-form
@@ -1052,7 +1271,7 @@ impl SegmentStore {
 					}
 				}
 			}
-			let bytes = tokio::fs::read(&descriptor.path).await.with_context(|| format!("reading segment {}", descriptor.path))?;
+			let bytes = self.read_frame(descriptor).await?;
 			let partial = segment_partial(descriptor, &bytes, start, end, schema.timestamp_unit, resolution, aggregations)?;
 			return partial.map_or_else(|| Ok(Vec::new()), |p| p.finish(resolution, aggregations).map_err(|e| anyhow::anyhow!("finishing downsample of {aspect:?}: {e}")));
 		}
@@ -1076,7 +1295,7 @@ impl SegmentStore {
 						}
 					}
 				}
-				let bytes = tokio::fs::read(&descriptor.path).await.with_context(|| format!("reading segment {}", descriptor.path))?;
+				let bytes = self.read_frame(&descriptor).await?;
 				tokio::task::spawn_blocking(move || segment_partial(&descriptor, &bytes, start, end, unit, resolution, &aggregations)).await.context("segment reduce task panicked")?
 			}
 		});
@@ -1118,7 +1337,7 @@ impl SegmentStore {
 		let descriptors = self.index.prune_by_time(aspect, t, t).await?;
 		let mut found = None;
 		for descriptor in &descriptors {
-			let bytes = tokio::fs::read(&descriptor.path).await.with_context(|| format!("reading segment {}", descriptor.path))?;
+			let bytes = self.read_frame(descriptor).await?;
 			// Streaming single-value read: prunes/skips the pages and value-column blocks a point
 			// lookup does not touch, unpacking only the one block covering `t` on a per-block codec
 			// (roadmap Phase 4/6). Equal to `…read_from(&bytes)?.value_at(t)` for every frame.
@@ -1156,7 +1375,7 @@ impl SegmentStore {
 		let descriptors = self.index.prune_by_time(aspect, lo, hi).await?;
 		let mut found = vec![None; ts.len()];
 		for descriptor in &descriptors {
-			let bytes = tokio::fs::read(&descriptor.path).await.with_context(|| format!("reading segment {}", descriptor.path))?;
+			let bytes = self.read_frame(descriptor).await?;
 			let hits = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION { weft_physical_type::weftseg::read_paged_segment_points(&bytes, ts).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))? } else { weft_physical_type::weftseg::read_segment_points(&bytes, ts).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))? };
 			// Later (higher seal-id) segments override earlier ones per instant — last-writer-wins.
 			for (slot, hit) in found.iter_mut().zip(hits) {
@@ -1192,12 +1411,13 @@ impl SegmentStore {
 	/// Returns an error if `aspect` has no declared schema or no segment `id`;
 	/// propagates a filesystem/read error, a re-seal failure, or a libSQL failure.
 	pub async fn reconcile_segment(&self, aspect: &str, id: u64) -> Result<bool> {
+		self.writable()?;
 		let descriptor = self.index.all(aspect).await?.into_iter().find(|d| d.id == id).ok_or_else(|| anyhow::anyhow!("aspect {aspect:?} has no segment {id}"))?;
 		if descriptor.time_sorted {
 			return Ok(false);
 		}
 		let schema = self.require_schema(aspect).await?;
-		let bytes = tokio::fs::read(&descriptor.path).await.with_context(|| format!("reading segment {}", descriptor.path))?;
+		let bytes = self.read_frame(&descriptor).await?;
 		let paged = descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION;
 		let (rows_per_page, timestamps, values) = if paged {
 			let segment = PagedSegment::read_from(&bytes).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?;
@@ -1226,7 +1446,7 @@ impl SegmentStore {
 			tokio::fs::write(&path, &new_bytes).await.with_context(|| format!("writing reconciled segment {}", path.display()))?;
 			SegmentDescriptor::of_segment(id, path.to_string_lossy().into_owned(), new_bytes.len() as u64, &segment)
 		};
-		self.index.insert(aspect, &new_descriptor).await?;
+		self.put_descriptor(aspect, &new_descriptor).await?;
 		// The rewrite changed the segment's bytes, staling any sidecar — regenerate it from
 		// the reconciled rows (or drop it if the policy no longer wants one).
 		self.refresh_sidecar_after_rewrite(aspect, &new_descriptor, sorted_ts, sorted_vs).await;
@@ -1258,7 +1478,7 @@ impl SegmentStore {
 			tokio::fs::write(&path, &new_bytes).await.with_context(|| format!("writing split segment {}", path.display()))?;
 			SegmentDescriptor::of_segment(id, path.to_string_lossy().into_owned(), new_bytes.len() as u64, &segment)
 		};
-		self.index.insert(aspect, &descriptor).await?;
+		self.put_descriptor(aspect, &descriptor).await?;
 		// Keep the sidecar consistent with the freshly written bytes at this id.
 		self.refresh_sidecar_after_rewrite(aspect, &descriptor, timestamps.to_vec(), values.to_vec()).await;
 		Ok(descriptor)
@@ -1300,13 +1520,14 @@ impl SegmentStore {
 	/// the [`split_index`] precondition holds), or propagates a filesystem/decode/re-seal/
 	/// libSQL failure.
 	pub async fn split_segment(&self, aspect: &str, id: u64, boundary: i64) -> Result<Option<u64>> {
+		self.writable()?;
 		let descriptor = self.index.all(aspect).await?.into_iter().find(|d| d.id == id).ok_or_else(|| anyhow::anyhow!("aspect {aspect:?} has no segment {id}"))?;
 		if !descriptor.time_sorted {
 			return Err(anyhow::anyhow!("segment {id} of aspect {aspect:?} is out of order; reconcile it before splitting"));
 		}
 		let schema = self.require_schema(aspect).await?;
 		// Read once, capturing the paged page height so each half re-seals in kind.
-		let bytes = tokio::fs::read(&descriptor.path).await.with_context(|| format!("reading segment {}", descriptor.path))?;
+		let bytes = self.read_frame(&descriptor).await?;
 		let (rows_per_page, timestamps, values) = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION {
 			let segment = PagedSegment::read_from(&bytes).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?;
 			let rows_per_page = segment.rows_per_page;
@@ -1348,6 +1569,7 @@ impl SegmentStore {
 	///
 	/// As [`reconcile_segment`](SegmentStore::reconcile_segment).
 	pub async fn reconcile_aspect(&self, aspect: &str) -> Result<usize> {
+		self.writable()?;
 		let unsorted_ids: Vec<u64> = self.index.all(aspect).await?.into_iter().filter(|d| !d.time_sorted).map(|d| d.id).collect();
 		let mut reconciled = 0;
 		for id in unsorted_ids {
@@ -1388,6 +1610,7 @@ impl SegmentStore {
 	/// As [`reconcile_aspect`](SegmentStore::reconcile_aspect); also propagates the
 	/// index read behind the backlog count.
 	pub async fn reconcile_aspect_if_unsorted_exceeds(&self, aspect: &str, threshold: usize) -> Result<Option<usize>> {
+		self.writable()?;
 		let threshold = threshold.max(1);
 		let unsorted = self.index.load_index(aspect).await?.unsorted_count();
 		if unsorted < threshold {
@@ -1417,6 +1640,7 @@ impl SegmentStore {
 	/// Propagates only the aspect-list read; per-aspect failures are reported in
 	/// [`ReconcileSweep::failed`].
 	pub async fn reconcile_all_over_threshold(&self, threshold: usize) -> Result<ReconcileSweep> {
+		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
 		let mut sweep = ReconcileSweep { aspects_scanned: aspects.len(), ..ReconcileSweep::default() };
 		for aspect in &aspects {
@@ -1464,6 +1688,7 @@ impl SegmentStore {
 	/// As [`reconcile_segment`](SegmentStore::reconcile_segment); also propagates the
 	/// index read behind the segment list.
 	pub async fn reconcile_aspect_hot_cold(&self, aspect: &str, threshold: usize) -> Result<HotColdReconcile> {
+		self.writable()?;
 		let threshold = threshold.max(1);
 		let descriptors = self.index.all(aspect).await?;
 		let hot_tail_id = descriptors.iter().map(|d| d.id).max();
@@ -1505,6 +1730,7 @@ impl SegmentStore {
 	/// Propagates only the aspect-list read; per-aspect failures are reported in
 	/// [`HotColdSweep::failed`].
 	pub async fn reconcile_all_hot_cold(&self, threshold: usize) -> Result<HotColdSweep> {
+		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
 		let mut sweep = HotColdSweep { aspects_scanned: aspects.len(), ..HotColdSweep::default() };
 		for aspect in &aspects {
@@ -1600,6 +1826,7 @@ impl SegmentStore {
 	///
 	/// As [`reconcile_overlaps`](SegmentStore::reconcile_overlaps).
 	pub async fn reconcile_overlaps_with_policy(&self, aspect: &str, policy: SplitPolicy) -> Result<usize> {
+		self.writable()?;
 		let descriptors = self.index.all(aspect).await?;
 		// Components of transitively time-overlapping segments: sort spans by (min_ts,
 		// max_ts), sweep, and start a new component whenever a span begins after the
@@ -1674,7 +1901,7 @@ impl SegmentStore {
 			}
 			// Drop the other members: control-plane row then the file (and its sidecar).
 			for &id in component.iter().skip(1) {
-				self.index.delete(aspect, id).await?;
+				self.remove_descriptor(aspect, id).await?;
 				let victim = self.segment_path(aspect, id);
 				tokio::fs::remove_file(&victim).await.with_context(|| format!("removing merged-away segment {}", victim.display()))?;
 				// A merged-away segment's sidecar is now orphaned — drop it too.
@@ -1709,6 +1936,7 @@ impl SegmentStore {
 	/// Propagates only the aspect-list read; per-aspect failures are reported in
 	/// [`OverlapSweep::failed`].
 	pub async fn reconcile_all_overlaps(&self) -> Result<OverlapSweep> {
+		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
 		let mut sweep = OverlapSweep { aspects_scanned: aspects.len(), ..OverlapSweep::default() };
 		for aspect in &aspects {
@@ -1747,6 +1975,7 @@ impl SegmentStore {
 	///
 	/// As [`reconcile_all_overlaps`](SegmentStore::reconcile_all_overlaps).
 	pub async fn reconcile_all_overlaps_with_policy(&self, policy: SplitPolicy) -> Result<OverlapSweep> {
+		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
 		let mut sweep = OverlapSweep { aspects_scanned: aspects.len(), ..OverlapSweep::default() };
 		for aspect in &aspects {
@@ -1790,6 +2019,7 @@ impl SegmentStore {
 	/// Returns an error if `aspect` has no declared schema; propagates a filesystem
 	/// read/write error, a decode/re-seal failure, or a libSQL failure.
 	pub async fn squash_aspect(&self, aspect: &str) -> Result<usize> {
+		self.writable()?;
 		let descriptors = self.index.all(aspect).await?;
 		if descriptors.len() < 2 {
 			return Ok(0);
@@ -1810,7 +2040,7 @@ impl SegmentStore {
 		let target = ids[0];
 		self.reseal_nullable_at(aspect, &schema, target, &all_ts, &all_vs, None).await?;
 		for &id in ids.iter().skip(1) {
-			self.index.delete(aspect, id).await?;
+			self.remove_descriptor(aspect, id).await?;
 			let victim = self.segment_path(aspect, id);
 			tokio::fs::remove_file(&victim).await.with_context(|| format!("removing squashed-away segment {}", victim.display()))?;
 			// The squashed-away segment's sidecar is now orphaned — drop it too.
@@ -1839,6 +2069,7 @@ impl SegmentStore {
 	///
 	/// As [`squash_aspect`](SegmentStore::squash_aspect); also propagates the segment-count read.
 	pub async fn squash_aspect_if_exceeds(&self, aspect: &str, max_segments: usize) -> Result<Option<usize>> {
+		self.writable()?;
 		let max_segments = max_segments.max(1);
 		if self.index.count(aspect).await? <= max_segments {
 			return Ok(None);
@@ -1865,6 +2096,7 @@ impl SegmentStore {
 	/// Propagates only the aspect-list read; per-aspect failures are reported in
 	/// [`SquashSweep::failed`].
 	pub async fn squash_all_over_threshold(&self, max_segments: usize) -> Result<SquashSweep> {
+		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
 		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
 		for aspect in &aspects {
@@ -1908,6 +2140,7 @@ impl SegmentStore {
 	///
 	/// As [`squash_aspect`](SegmentStore::squash_aspect).
 	pub async fn squash_aspect_to_target_rows(&self, aspect: &str, target_rows: usize) -> Result<usize> {
+		self.writable()?;
 		let target_rows = target_rows.max(1);
 		let descriptors = self.index.all(aspect).await?;
 		if descriptors.len() < 2 {
@@ -1952,7 +2185,7 @@ impl SegmentStore {
 			let target = group[0];
 			self.reseal_nullable_at(aspect, &schema, target, &all_ts, &all_vs, None).await?;
 			for &id in group.iter().skip(1) {
-				self.index.delete(aspect, id).await?;
+				self.remove_descriptor(aspect, id).await?;
 				let victim = self.segment_path(aspect, id);
 				tokio::fs::remove_file(&victim).await.with_context(|| format!("removing compacted-away segment {}", victim.display()))?;
 				self.remove_sidecar(aspect, id).await?;
@@ -1986,6 +2219,7 @@ impl SegmentStore {
 	/// Propagates only the aspect-list read; per-aspect failures are reported in
 	/// [`SquashSweep::failed`].
 	pub async fn squash_all_to_target_rows(&self, target_rows: usize) -> Result<SquashSweep> {
+		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
 		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
 		for aspect in &aspects {
@@ -2021,6 +2255,7 @@ impl SegmentStore {
 	/// As [`squash_aspect_to_target_rows`](SegmentStore::squash_aspect_to_target_rows); also
 	/// propagates the rollup read.
 	pub async fn squash_aspect_to_target_rows_if_fragmented(&self, aspect: &str, target_rows: usize) -> Result<Option<usize>> {
+		self.writable()?;
 		let target_rows = target_rows.max(1);
 		let Some(meta) = self.metadata.get(aspect).await? else { return Ok(None) };
 		// Minimum segments to hold total_rows at the target; a fully-compacted aspect sits at
@@ -2050,6 +2285,7 @@ impl SegmentStore {
 	/// Propagates only the aspect-list read; per-aspect failures are reported in
 	/// [`SquashSweep::failed`].
 	pub async fn squash_all_to_target_rows_if_fragmented(&self, target_rows: usize) -> Result<SquashSweep> {
+		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
 		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
 		for aspect in &aspects {
@@ -2101,7 +2337,7 @@ impl SegmentStore {
 	/// Read and fully decode one segment file (frame-version aware), returning all
 	/// rows aligned `(timestamps, values)` with `None` at every null row.
 	async fn decode_all(&self, descriptor: &SegmentDescriptor) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>)> {
-		let bytes = tokio::fs::read(&descriptor.path).await.with_context(|| format!("reading segment {}", descriptor.path))?;
+		let bytes = self.read_frame(descriptor).await?;
 		if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION {
 			let segment = PagedSegment::read_from(&bytes).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?;
 			Ok(segment.decode_nullable())
@@ -2166,6 +2402,7 @@ impl SegmentStore {
 	///
 	/// Propagates any libSQL read or write failure.
 	pub async fn rebuild_aspect_metadata(&self, aspect: &str) -> Result<AspectMetadata> {
+		self.writable()?;
 		let index = self.index.load_index(aspect).await?;
 		let meta = AspectMetadata::from_index(&index);
 		self.metadata.put(aspect, &meta).await?;
@@ -2184,6 +2421,7 @@ impl SegmentStore {
 	///
 	/// Propagates any libSQL read or write failure.
 	pub async fn rebuild_all_metadata(&self) -> Result<usize> {
+		self.writable()?;
 		let aspects = self.index.list_aspects().await?;
 		let count = aspects.len();
 		for aspect in aspects {
@@ -2510,6 +2748,7 @@ mod tests {
 	use weft_physical_type::{timestamp::TimeUnit, PhysicalType};
 
 	use super::*;
+	use crate::types::index_txn::TxnPoints;
 
 	fn bd(s: &str) -> BigDecimal {
 		BigDecimal::from_str(s).expect("parses")
@@ -2569,6 +2808,10 @@ mod tests {
 		let report = crate::restore_control_plane(&backup_dir, &restored_root).await.expect("restores");
 		assert_eq!(report.restored.len(), 4, "all four control-plane DBs restored");
 		assert_eq!(report.total_rows(), backup.total_rows(), "the restored control plane holds the backed-up rows");
+		// The live root is gone, as after a disk loss: the restored index still names the
+		// frames by their old absolute paths, so the reads below pass only because readers
+		// resolve those against the restored root.
+		tokio::fs::remove_dir_all(&root).await.unwrap();
 
 		// The restored store opens and still knows the aspect, its schema and its segments.
 		let reopened = SegmentStore::open(&restored_root).await.expect("restored store opens");
@@ -5069,5 +5312,349 @@ mod tests {
 		let cp_desc = cp.seal("temp", &schema(), &ts, &vs).await.expect("seals");
 
 		assert_eq!(cp_desc.byte_len, plain_desc.byte_len, "a regular column must be byte-for-byte identical — no index written");
+	}
+
+	/// The aspects and segments both the checked-in pre-v2 fixture
+	/// (`tests/fixtures/pre_v2_store`) and the relocation test hold: `price` with a dense,
+	/// a nullable, a paged and an out-of-order segment (the last overlapping the first, at
+	/// timestamps the first does not carry), and `temp` with one dense segment.
+	async fn seal_legacy_layout(store: &SegmentStore) {
+		let schema = schema();
+		for aspect in ["price", "temp"] {
+			store.declare(aspect, &schema).await.expect("declares");
+		}
+		let dense_ts: Vec<i64> = (0..10).map(|i| i * 10).collect();
+		let dense_vs: Vec<BigDecimal> = (0..10).map(|i| bd(&format!("{i}.5"))).collect();
+		store.seal("price", &schema, &dense_ts, &dense_vs).await.expect("seals the dense segment");
+		store.seal_nullable("price", &schema, &[100, 110, 120, 130, 140, 150], &[Some(bd("7.25")), None, Some(bd("-3")), None, Some(bd("12")), Some(bd("0.125"))]).await.expect("seals the nullable segment");
+		let paged_ts: Vec<i64> = (0..12).map(|i| 200 + i * 10).collect();
+		let paged_vs: Vec<BigDecimal> = (0..12).map(|i| BigDecimal::from(100 - i * 3)).collect();
+		store.seal_paged("price", &schema, &paged_ts, &paged_vs, 4).await.expect("seals the paged segment");
+		store.seal("price", &schema, &[55, 45, 65], &[bd("9"), bd("8"), bd("7")]).await.expect("seals the out-of-order segment");
+		store.seal("temp", &schema, &[0, 60, 120, 180], &[bd("20.5"), bd("21"), bd("21.5"), bd("22")]).await.expect("seals temp");
+	}
+
+	/// Every read a store serves over [`seal_legacy_layout`]'s aspects, rendered as text:
+	/// the whole range, single and batched points, a downsample its sidecars can answer and
+	/// one only the frames can (P50), and a value range. Each frame-reading path of the
+	/// store is on it, so two stores whose texts match read the same bytes the same way.
+	async fn fixture_reads(store: &SegmentStore) -> String {
+		use std::fmt::Write as _;
+
+		let show = |vs: &[Option<BigDecimal>]| vs.iter().map(|v| v.as_ref().map_or_else(|| "null".to_string(), BigDecimal::to_plain_string)).collect::<Vec<_>>().join(",");
+		let instants = [0_i64, 45, 55, 60, 110, 120, 230, 310, 999];
+		let mut out = String::new();
+		for aspect in ["price", "temp"] {
+			let (ts, vs) = store.read_time_range(aspect, i64::MIN, i64::MAX).await.expect("reads the range");
+			writeln!(out, "{aspect} range {ts:?} [{}]", show(&vs)).expect("formats");
+			let mut points = Vec::new();
+			for &t in &instants {
+				points.push(store.read_point(aspect, t).await.expect("reads a point"));
+			}
+			writeln!(out, "{aspect} points {instants:?} [{}]", show(&points)).expect("formats");
+			let batch = store.read_points(aspect, &instants).await.expect("reads points");
+			writeln!(out, "{aspect} batch [{}]", show(&batch)).expect("formats");
+			for aggregations in [&[Aggregation::Min, Aggregation::Max, Aggregation::Sum, Aggregation::Last][..], &[Aggregation::P50][..]] {
+				for bucket in store.downsample_range(aspect, i64::MIN, i64::MAX, Resolution::Minutes, aggregations).await.expect("downsamples") {
+					write!(out, "{aspect} bucket {} n={}", bucket.timestamp.timestamp(), bucket.count).expect("formats");
+					for (name, value) in &bucket.values {
+						write!(out, " {name}={}", value.to_plain_string()).expect("formats");
+					}
+					writeln!(out).expect("formats");
+				}
+			}
+			let (vts, vvs) = store.read_value_range(aspect, &bd("-5"), &bd("50")).await.expect("reads a value range");
+			writeln!(out, "{aspect} values {vts:?} [{}]", vvs.iter().map(BigDecimal::to_plain_string).collect::<Vec<_>>().join(",")).expect("formats");
+		}
+		out
+	}
+
+	/// Recursively copy the directory `src` to `dst`.
+	fn copy_tree(src: &Path, dst: &Path) {
+		std::fs::create_dir_all(dst).expect("creates the copy");
+		for entry in std::fs::read_dir(src).expect("lists the source") {
+			let entry = entry.expect("reads an entry");
+			let to = dst.join(entry.file_name());
+			if entry.file_type().expect("reads the entry type").is_dir() {
+				copy_tree(&entry.path(), &to);
+			} else {
+				std::fs::copy(entry.path(), &to).expect("copies a file");
+			}
+		}
+	}
+
+	/// Every file under `dir` (recursively) with its bytes, keyed by its path below `dir`.
+	fn tree_bytes(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+		fn walk(base: &Path, dir: &Path, out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+			for entry in std::fs::read_dir(dir).expect("lists") {
+				let path = entry.expect("reads an entry").path();
+				if path.is_dir() {
+					walk(base, &path, out);
+				} else {
+					out.insert(path.strip_prefix(base).expect("under the base").to_path_buf(), std::fs::read(&path).expect("reads a file"));
+				}
+			}
+		}
+		let mut out = std::collections::BTreeMap::new();
+		walk(dir, dir, &mut out);
+		out
+	}
+
+	/// What `root`'s `segment_index.db` holds besides frames' data, as text: every table
+	/// with its columns (name, type, NOT NULL, default, primary-key position), every
+	/// `segment_index` row's identity and write-once columns, and every `store_meta` row.
+	/// Read with a connection of its own, so the store must be closed.
+	async fn index_schema(root: &Path) -> String {
+		use std::fmt::Write as _;
+
+		async fn texts(conn: &turso::Connection, sql: &str) -> Vec<Vec<String>> {
+			let mut rows = conn.query(sql, ()).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+			let mut out = Vec::new();
+			while let Some(row) = rows.next().await.expect("reads a row") {
+				out.push((0..row.column_count()).map(|i| format!("{:?}", row.get_value(i).expect("reads a value"))).collect());
+			}
+			out
+		}
+		let db = turso::Builder::new_local(&root.join("segment_index.db").to_string_lossy()).build().await.expect("opens the index");
+		let conn = db.connect().expect("connects");
+		let mut out = String::new();
+		for table in texts(&conn, "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name").await {
+			let name = table[0].trim_start_matches("Text(\"").trim_end_matches("\")").to_string();
+			let columns: Vec<String> = texts(&conn, &format!("PRAGMA table_info({name})")).await.into_iter().map(|c| c[1..].join(" ")).collect();
+			writeln!(out, "table {name}: {}", columns.join(" | ")).expect("formats");
+		}
+		for row in texts(&conn, "SELECT aspect, id, path, gen, prec, frame_crc, commit_epoch FROM segment_index ORDER BY aspect, id").await {
+			writeln!(out, "row {}", row.join(" ")).expect("formats");
+		}
+		for row in texts(&conn, "SELECT key, value FROM store_meta ORDER BY key").await {
+			writeln!(out, "meta {}", row.join(" ")).expect("formats");
+		}
+		drop(conn);
+		drop(db);
+		out
+	}
+
+	/// The checked-in pre-v2 store (`tests/fixtures/pre_v2_store/root`, written by WeftDB
+	/// before layout v2: absolute frame paths into a root that no longer exists,
+	/// `{aspect}-{id}` frame names, v3 sidecars) migrates in place on open, and the
+	/// migration is idempotent: three opens in a row leave the same tables, columns, rows
+	/// and `store_meta` (one `store_uuid`), rewrite no frame, and every open reads
+	/// exactly what the pre-v2 build read when it wrote the fixture
+	/// (`expected_reads.txt`). That last part also needs the frame paths resolved
+	/// against the current root.
+	#[tokio::test]
+	async fn a_pre_v2_store_migrates_idempotently_and_reads_identically() {
+		let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pre_v2_store");
+		let expected_reads = std::fs::read_to_string(fixture.join("expected_reads.txt")).expect("reads the expected reads");
+		let dir = TempDir::new().expect("tempdir");
+		let root = dir.path().join("store");
+		copy_tree(&fixture.join("root"), &root);
+		let frames_before = tree_bytes(&root.join("segments"));
+
+		let mut schemas = Vec::new();
+		for open in 1..=3 {
+			let store = SegmentStore::open(&root).await.unwrap_or_else(|e| panic!("open {open}: {e:#}"));
+			let reads = fixture_reads(&store).await;
+			drop(store);
+			assert_eq!(reads, expected_reads, "open {open} reads what the pre-v2 build read");
+			schemas.push(index_schema(&root).await);
+		}
+		assert_eq!(tree_bytes(&root.join("segments")), frames_before, "the migration rewrites no frame or sidecar");
+		assert_eq!(schemas[1], schemas[0], "the second open changes nothing the first did not");
+		assert_eq!(schemas[2], schemas[0], "nor does the third");
+
+		let schema = &schemas[0];
+		for table in ["aspect_metadata", "aspect_seq", "frame_journal", "ingest_ledger", "segment_changes", "segment_index", "segment_quarantine", "store_meta"] {
+			assert!(schema.contains(&format!("table {table}: ")), "{table} exists:\n{schema}");
+		}
+		assert!(schema.contains("| Text(\"gen\") Text(\"INTEGER\") Integer(1) Text(\"0\") Integer(0) | Text(\"prec\") Text(\"INTEGER\") Integer(0) Null Integer(0) | Text(\"frame_crc\") Text(\"INTEGER\") Integer(0) Null Integer(0) | Text(\"commit_epoch\") Text(\"INTEGER\") Integer(0) Null Integer(0)\n"), "segment_index gains gen (NOT NULL DEFAULT 0), prec, frame_crc and commit_epoch:\n{schema}");
+		let rows: Vec<&str> = schema.lines().filter(|line| line.starts_with("row ")).collect();
+		assert_eq!(rows.len(), 5, "every legacy row is kept:\n{schema}");
+		for row in rows {
+			assert!(row.contains("/var/tmp/weft-pre-v2-fixture/root/segments/"), "the stored path is left as the pre-v2 build wrote it: {row}");
+			assert!(row.ends_with(" Integer(0) Null Null Null"), "a legacy row is generation 0 with no prec, frame_crc or commit_epoch: {row}");
+		}
+		assert!(schema.contains("meta Text(\"layout_version\") Text(\"2\")\n"), "{schema}");
+		let uuid = schema.lines().find_map(|line| line.strip_prefix("meta Text(\"store_uuid\") Text(\"")).and_then(|rest| rest.strip_suffix("\")")).unwrap_or_else(|| panic!("a store_uuid is recorded:\n{schema}"));
+		assert!(uuid::Uuid::parse_str(uuid).is_ok(), "the store_uuid is a UUID: {uuid}");
+	}
+
+	#[test]
+	fn a_frame_path_resolves_against_the_current_root() {
+		let root = Path::new("/srv/weft/store");
+		let resolve = |stored: &str| resolve_frame_path(root, stored);
+		// Under the current root: used as it is.
+		assert_eq!(resolve("/srv/weft/store/segments/price-0.weftseg"), root.join("segments/price-0.weftseg"));
+		// Written under a root that moved: the tail after `segments` lands in this root's.
+		assert_eq!(resolve("/old/place/segments/price-0.weftseg"), root.join("segments/price-0.weftseg"));
+		assert_eq!(resolve("/old/place/segments/quarantine/price-0.weftseg"), root.join("segments/quarantine/price-0.weftseg"));
+		// The last `segments` component counts: a root that itself sits under one.
+		assert_eq!(resolve("/data/segments/old-root/segments/temp-3.weftseg"), root.join("segments/temp-3.weftseg"));
+		// A relative root resolves the same way.
+		assert_eq!(resolve_frame_path(Path::new("store"), "store/segments/a-1.weftseg"), Path::new("store/segments/a-1.weftseg"));
+		assert_eq!(resolve_frame_path(Path::new("store"), "elsewhere/segments/a-1.weftseg"), Path::new("store/segments/a-1.weftseg"));
+		// Nothing safe to resolve to: kept as it is.
+		assert_eq!(resolve("/old/place/frames/price-0.weftseg"), Path::new("/old/place/frames/price-0.weftseg"));
+		assert_eq!(resolve("/old/place/segments"), Path::new("/old/place/segments"));
+		assert_eq!(resolve("/old/segments/../../etc/passwd"), Path::new("/old/segments/../../etc/passwd"));
+		// Component-wise, not textual: a sibling whose name extends the root's is not under it.
+		assert_eq!(resolve("/srv/weft/store-old/segments/a-1.weftseg"), root.join("segments/a-1.weftseg"));
+	}
+
+	#[test]
+	fn the_ambiguous_commit_choice_reads_poison_or_exit() {
+		assert_eq!(OnAmbiguousCommit::parse(None), OnAmbiguousCommit::Poison);
+		assert_eq!(OnAmbiguousCommit::parse(Some("")), OnAmbiguousCommit::Poison);
+		assert_eq!(OnAmbiguousCommit::parse(Some("poison")), OnAmbiguousCommit::Poison);
+		assert_eq!(OnAmbiguousCommit::parse(Some(" EXIT ")), OnAmbiguousCommit::Exit);
+		assert_eq!(OnAmbiguousCommit::parse(Some("exit")), OnAmbiguousCommit::Exit);
+		assert_eq!(OnAmbiguousCommit::parse(Some("abort")), OnAmbiguousCommit::Poison, "an unknown value keeps the safe default");
+	}
+
+	/// A transaction that upserts `descriptor` under `aspect` and then, after its COMMIT
+	/// has executed, hits `S-commit-phantom`: armed with an error, that is a COMMIT whose
+	/// caller sees a failure although the transaction is durable.
+	fn phantom_upsert(aspect: &str, descriptor: SegmentDescriptor) -> IndexTxn {
+		IndexTxn::new(vec![IndexOp::Upsert { aspect: aspect.to_string(), row: IndexRow::legacy(descriptor) }]).with_points(TxnPoints { phantom: Some(FaultPoint::SCommitPhantom), ..TxnPoints::NONE })
+	}
+
+	/// Write a frame of `rows` for `aspect`'s segment `id` under `root` the way a seal
+	/// does, without indexing it, and return its descriptor.
+	fn write_frame(root: &Path, aspect: &str, id: u64, rows: &[(i64, &str)]) -> SegmentDescriptor {
+		let (ts, vs): (Vec<i64>, Vec<BigDecimal>) = rows.iter().map(|(t, v)| (*t, bd(v))).unzip();
+		let segment = schema().seal(&ts, &vs).expect("encodes");
+		let bytes = segment.write_to();
+		let path = root.join("segments").join(format!("{aspect}-{id}.weftseg"));
+		std::fs::write(&path, &bytes).expect("writes the frame");
+		SegmentDescriptor::of_segment(id, path.to_string_lossy().into_owned(), bytes.len() as u64, &segment)
+	}
+
+	/// The poison, end to end: a COMMIT that executes but reports an error (a phantom
+	/// fault after it) is ambiguous, so the store poisons itself. Every write entry point
+	/// then fails with `Poisoned` before touching anything, while every read keeps
+	/// serving, including the phantom transaction's row, which did commit. A restart
+	/// clears the poison.
+	#[tokio::test]
+	#[serial(index_txn_fault_points)]
+	async fn a_phantom_commit_poisons_writes_and_leaves_reads_up() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("price", &schema()).await.expect("declares");
+		store.seal("price", &schema(), &[0, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("seals");
+		assert_eq!(store.poisoned(), None, "a fresh store accepts writes");
+
+		let phantom = write_frame(dir.path(), "price", 1, &[(30, "4"), (40, "5")]);
+		let armed = fault::arm(FaultPoint::SCommitPhantom, fault::FaultAction::ReturnErr);
+		let err = store.commit_index(&phantom_upsert("price", phantom)).await.expect_err("the phantom fault reports a committed transaction as failed");
+		drop(armed);
+		let txn_error = err.downcast_ref::<IndexTxnError>().expect("the transaction's own error");
+		assert!(txn_error.is_ambiguous(), "{txn_error}");
+		let poisoned = store.poisoned().expect("an ambiguous COMMIT poisons the store");
+		assert!(poisoned.reason.contains("injected fault at S-commit-phantom"), "{poisoned}");
+
+		let schema = schema();
+		let refused: Vec<(&str, anyhow::Error)> = vec![("seal", store.seal("price", &schema, &[50], &[bd("6")]).await.expect_err("seal")), ("seal_declared_paged", store.seal_declared_paged("price", &[50], &[bd("6")], 4).await.expect_err("seal_declared_paged")), ("declare", store.declare("temp", &schema).await.expect_err("declare")), ("reconcile_aspect", store.reconcile_aspect("price").await.expect_err("reconcile_aspect")), ("reconcile_all_over_threshold", store.reconcile_all_over_threshold(1).await.expect_err("reconcile_all_over_threshold")), ("split_segment", store.split_segment("price", 0, 10).await.expect_err("split_segment")), ("reconcile_overlaps", store.reconcile_overlaps("price").await.expect_err("reconcile_overlaps")), ("squash_aspect", store.squash_aspect("price").await.expect_err("squash_aspect")), ("squash_all_to_target_rows", store.squash_all_to_target_rows(10).await.expect_err("squash_all_to_target_rows")), ("rebuild_aspect_metadata", store.rebuild_aspect_metadata("price").await.expect_err("rebuild_aspect_metadata")), ("commit_index", store.commit_index(&IndexTxn::new(vec![IndexOp::Delete { aspect: "price".to_string(), id: 0 }])).await.expect_err("commit_index"))];
+		for (write, err) in &refused {
+			assert_eq!(err.downcast_ref::<Poisoned>(), Some(&poisoned), "{write} is refused as poisoned: {err:#}");
+		}
+
+		let (times, values) = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("a poisoned store still reads");
+		let point = store.read_point("price", 40).await.expect("reads a point");
+		let count = store.segment_count("price").await.expect("counts");
+		let declared = store.list_declared_aspects().await.expect("lists");
+		drop(store);
+		assert_eq!(times, vec![0, 10, 20, 30, 40], "the phantom transaction did commit, and its row reads back");
+		assert_eq!(values.into_iter().flatten().map(|v| v.to_plain_string()).collect::<Vec<_>>(), vec!["1", "2", "3", "4", "5"]);
+		assert_eq!(point, Some(bd("5")));
+		assert_eq!(count, 2, "no refused write added a segment");
+		assert_eq!(declared, vec!["price".to_string()], "the refused declare declared nothing");
+		assert_eq!(names_in(&dir.path().join("segments")), vec!["price-0.weftseg", "price-1.weftseg"], "no refused write left a frame behind");
+
+		let reopened = SegmentStore::open(dir.path()).await.expect("reopens");
+		let healthy = reopened.poisoned();
+		let sealed = reopened.seal("price", &schema, &[50], &[bd("6")]).await;
+		drop(reopened);
+		assert_eq!(healthy, None, "the restart clears the poison");
+		assert_eq!(sealed.expect("the restarted store writes again").id, 2);
+	}
+
+	/// Set only in the child process `an_ambiguous_commit_exits_when_asked_to` starts:
+	/// the root to open.
+	const AMBIGUOUS_CHILD_ROOT: &str = "WEFT_TEST_AMBIGUOUS_CHILD_ROOT";
+
+	/// The body that child runs: commit a phantom transaction with `S-commit-phantom`
+	/// armed by the parent's `WEFT_FAULT` and `WEFT_ON_AMBIGUOUS_COMMIT=exit` set, so the
+	/// store exits the process. In a normal test run the variable is unset and this does
+	/// nothing.
+	#[tokio::test]
+	async fn ambiguous_commit_child() {
+		let Some(root) = std::env::var_os(AMBIGUOUS_CHILD_ROOT) else { return };
+		crate::types::durable::fault::suppress_core_dump();
+		let root = PathBuf::from(root);
+		let store = SegmentStore::open(&root).await.expect("opens");
+		let phantom = write_frame(&root, "price", 7, &[(70, "7")]);
+		let result = store.commit_index(&phantom_upsert("price", phantom)).await;
+		panic!("the ambiguous COMMIT returned instead of exiting the process: {result:?}");
+	}
+
+	/// `WEFT_ON_AMBIGUOUS_COMMIT=exit`: an ambiguous COMMIT logs and exits the process
+	/// with status 70 instead of poisoning the store. The restarted store has the
+	/// transaction (the fault fired after its COMMIT) and accepts writes.
+	#[tokio::test]
+	async fn an_ambiguous_commit_exits_when_asked_to() {
+		let dir = TempDir::new().expect("tempdir");
+		let exe = std::env::current_exe().expect("finds the test binary");
+		let out = tokio::process::Command::new(exe).args(["types::segment_store::tests::ambiguous_commit_child", "--exact", "--nocapture", "--test-threads=1"]).env(AMBIGUOUS_CHILD_ROOT, dir.path()).env(fault::FAULT_ENV, "S-commit-phantom:err").env(AMBIGUOUS_COMMIT_ENV, "exit").output().await.expect("runs the child");
+		let stderr = String::from_utf8_lossy(&out.stderr);
+		assert_eq!(out.status.code(), Some(AMBIGUOUS_COMMIT_EXIT_CODE), "the child exits with status 70: {out:?}");
+		assert!(stderr.contains("exiting with status 70 (WEFT_ON_AMBIGUOUS_COMMIT=exit)") && stderr.contains("injected fault at S-commit-phantom"), "it says why: {stderr}");
+
+		let store = SegmentStore::open(dir.path()).await.expect("the restart opens the store");
+		let poisoned = store.poisoned();
+		let ids: Vec<u64> = store.index().all("price").await.expect("reads").iter().map(|d| d.id).collect();
+		let point = store.read_point("price", 70).await.expect("reads the committed row");
+		let sealed = store.seal("price", &schema(), &[80], &[bd("8")]).await;
+		drop(store);
+		assert_eq!(poisoned, None);
+		assert_eq!(ids, vec![7], "the transaction committed before the process exited");
+		assert_eq!(point, Some(bd("7")));
+		assert!(sealed.is_ok(), "the restarted store accepts writes: {sealed:?}");
+	}
+
+	/// Readers resolve a frame against the store's current root rather than the absolute
+	/// path the index recorded, so a root that was moved (or restored somewhere else, or
+	/// mounted at another path) still serves every read once the old location is gone.
+	/// The maintenance operations read frames through the same resolution.
+	#[tokio::test]
+	async fn a_relocated_root_serves_every_read() {
+		let dir = TempDir::new().expect("tempdir");
+		let original = dir.path().join("original");
+		let store = SegmentStore::open(&original).await.expect("opens").with_partial_sidecar_policy(PartialSidecarPolicy::at(Resolution::Minutes, 1));
+		seal_legacy_layout(&store).await;
+		let before = fixture_reads(&store).await;
+		let (range_ts, range_vs) = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
+		drop(store);
+
+		let moved = dir.path().join("moved");
+		copy_tree(&original, &moved);
+		std::fs::remove_dir_all(&original).expect("removes the original root");
+
+		let store = SegmentStore::open(&moved).await.expect("the moved root opens");
+		let after = fixture_reads(&store).await;
+		// Segment 3 is out of order (reconcile reads it), segment 0 is sorted (split reads
+		// it), and squash decodes every segment the aspect has.
+		let reconciled = store.reconcile_segment("price", 3).await.expect("reconciles a frame of the moved root");
+		let split = store.split_segment("price", 0, 50).await.expect("splits a frame of the moved root");
+		let squashed = store.squash_aspect("price").await.expect("squashes the moved root's frames");
+		let (squashed_ts, squashed_vs) = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads the squashed aspect");
+		drop(store);
+		assert_eq!(after, before, "the moved root reads exactly what the original did");
+		assert!(reconciled);
+		assert!(split.is_some());
+		assert_eq!(squashed, 4, "five segments (after the split) squash into one");
+		// No two segments share a timestamp, so the squash is their union in time order.
+		let mut union: Vec<(i64, Option<BigDecimal>)> = range_ts.into_iter().zip(range_vs).collect();
+		union.sort_by_key(|(t, _)| *t);
+		assert_eq!(squashed_ts.into_iter().zip(squashed_vs).collect::<Vec<_>>(), union);
 	}
 }

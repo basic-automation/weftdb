@@ -1,2 +1,4 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+# Store fixtures are byte-exact: databases, logs, frames and sidecars, never normalized
+weftdb/tests/fixtures/**/root/** -text

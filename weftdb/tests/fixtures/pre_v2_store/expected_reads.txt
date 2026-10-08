@@ -1,0 +1,28 @@
+price range [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 200, 210, 220, 230, 240, 250, 260, 270, 280, 290, 300, 310, 55, 45, 65] [0.5,1.5,2.5,3.5,4.5,5.5,6.5,7.5,8.5,9.5,7.25,null,-3,null,12,0.125,100,97,94,91,88,85,82,79,76,73,70,67,9,8,7]
+price points [0, 45, 55, 60, 110, 120, 230, 310, 999] [0.5,8,9,6.5,null,-3,91,67,null]
+price batch [0.5,8,9,6.5,null,-3,91,67,null]
+price bucket 0 n=8 last=9 max=9 min=0.5 sum=35.0
+price bucket 60 n=6 last=7.25 max=9.5 min=6.5 sum=46.25
+price bucket 120 n=3 last=0.125 max=12 min=-3 sum=9.125
+price bucket 180 n=4 last=91 max=100 min=91 sum=382
+price bucket 240 n=6 last=73 max=88 min=73 sum=483
+price bucket 300 n=2 last=67 max=70 min=67 sum=137
+price bucket 0 n=8 p50=3.5
+price bucket 60 n=6 p50=7.25
+price bucket 120 n=3 p50=0.125
+price bucket 180 n=4 p50=94
+price bucket 240 n=6 p50=79
+price bucket 300 n=2 p50=67
+price values [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 120, 140, 150, 55, 45, 65] [0.5,1.5,2.5,3.5,4.5,5.5,6.5,7.5,8.5,9.5,7.25,-3,12,0.125,9,8,7]
+temp range [0, 60, 120, 180] [20.5,21,21.5,22]
+temp points [0, 45, 55, 60, 110, 120, 230, 310, 999] [20.5,null,null,21,null,21.5,null,null,null]
+temp batch [20.5,null,null,21,null,21.5,null,null,null]
+temp bucket 0 n=1 last=20.5 max=20.5 min=20.5 sum=20.5
+temp bucket 60 n=1 last=21 max=21 min=21 sum=21
+temp bucket 120 n=1 last=21.5 max=21.5 min=21.5 sum=21.5
+temp bucket 180 n=1 last=22 max=22 min=22 sum=22
+temp bucket 0 n=1 p50=20.5
+temp bucket 60 n=1 p50=21
+temp bucket 120 n=1 p50=21.5
+temp bucket 180 n=1 p50=22
+temp values [0, 60, 120, 180] [20.5,21,21.5,22]
