@@ -599,7 +599,7 @@ detection within Y% and improving historical query latency by Z."*
     the Parquet spec** (mode 0 = ALP, other modes reserved), so if WeftDB uses ALPrd for the
     high-precision fallback, declare it a WeftDB-private mode id and keep mode 0 byte-compatible.
     *(src: https://parquet.apache.org/docs/file-format/data-pages/alpencoding/)*
-  - [ ] **Use the `alp` crate to get the ALP adopt benchmarked, rather than hand-rolling it first.**
+  - [x] **DONE (2026-10-08) — Use the `alp` crate to get the ALP adopt benchmarked, rather than hand-rolling it first.**
     spiraldb's `alp` 0.0.4 (2026-09-08, Apache-2.0) implements both classic ALP and ALP-RD with
     `ENCODE_CHUNK_SIZE = 1024` — matching WeftDB's tile granularity — and an encode/decode API whose
     `decode_single`/`decode_slice_inplace` map onto `read_value_at`/`read_value_range`. It is a pure
@@ -607,6 +607,33 @@ detection within Y% and improving historical query latency by Z."*
     `0.0.x` means no semver promise (pin exactly or vendor), and `alp` pins `fastlanes ^0.6` while
     that crate is at 0.7.2, so a combined dependency pulls two versions unless pinned.
     *(src: https://docs.rs/alp/latest/alp/)*
+    - [x] Shipped `weft-physical-type/benches/alp_vs_f64_codecs.rs` (`alp =0.0.4` + `fastlanes =0.7.2`,
+      bench-only). The ALP arm uses a Parquet-style container: per-1024 vector exponents, FOR, a
+      `fastlanes` pack, and `u16` + f64 exceptions. Every arm is asserted bit-exact before timing.
+      Bits/value and 1 Mi decode (loaded box, load avg ~27):
+      **real BTC closes** (rows 3M..+1Mi): ALP **15.35 b, 0.57 ms** · Chimp128 23.34 b, 17.4 ms ·
+      Elf 38.84 b, 28.1 ms · Chimp 42.09 b · Gorilla 51.74 b · **realized `scaled_for` (scale 8)
+      33.74 b, 70.8 ms**. **sensor_2dp**: ALP 7.22 b, 0.73 ms · realized `scaled_for` **5.51 b**,
+      11.3 ms · Chimp128 11.58 b, 7.85 ms. **real_doubles**: ALP 82.2 b (33.8% exceptions) ·
+      ALP-RD 56.2 b · Chimp **49.5 b**. Against the shipped f64 codecs, ALP clears the acceptance bar
+      below by a wide margin on both decimal-shaped corpora (−34% / −38% bytes vs Chimp128, 10–30×
+      decode). It loses badly on full-mantissa doubles, where ALP-RD or Chimp must be the fallback.
+    - [ ] **ALP adopt as `VAL_CODEC_ALP` — owner sign-off (headline change).** The benchmark says
+      adopt for decimal-shaped f64 columns, with a per-column fallback to Chimp/ALP-RD when the
+      exception rate is high (ALP's own sampling picks this). Mirror the Parquet layout per the
+      frozen-wire-layout item above.
+    - [ ] **NEW — per-vector scale is the lever the realized exact path is missing.** On the BTC
+      window, `recommend_encoding` must declare **scale 8 for the whole column** because a few
+      closes carry 8 decimals, which inflates every FOR residual to ~33 bits. ALP picks an exponent
+      **per 1024 vector** and pushes the 0.01% odd values to exceptions, reaching 15.35 bits. A
+      `ScaledI64` codec with a per-tile scale and an exception list would keep the `BigDecimal`
+      logical type exact, with no float on the path, and should approach ALP's figure. Measure it on
+      the same bench before deciding between that and ALP.
+    - [ ] **NEW — the scalar FOR/blocked decode is the read-path bottleneck at wide widths.**
+      `for_bitpack_decode` takes **70.8 ms per 1 Mi values at ~33 bits** (11.3 ms at ~5.5 bits). It
+      loops per bit per value, so cost scales with width. The `fastlanes` unpack inside the ALP arm
+      does the same FOR + unpack work in under 1 ms. Port the FOR/blocked unpack to a word-wise
+      (or `fastlanes`-style) kernel and re-run `alp_vs_f64_codecs` + `bitunpack`.
   - [ ] **Set the ALP acceptance bar from upstream's own ablation, and be willing to DECLINE.**
     FastLanes' per-encoding ablation (VLDB'25, Table 7, PUBLIC_BI) reports ALP at **+4.36%
     compression ratio for −7.28% decompression speed**, with ALP_RD +0.57%/−2.30% and Patch

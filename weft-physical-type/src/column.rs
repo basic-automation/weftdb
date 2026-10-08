@@ -196,9 +196,9 @@ impl ColumnEncoding {
 	/// bit-pack with the bits permuted, so on a uniform-width column it ties the global
 	/// bit-pack, and a short trailing tile costs up to `width - 1` extra bytes (each bit-plane
 	/// rounds up to a whole byte independently). What it buys is decode latency: the decoder
-	/// reads `u64` plane words and walks only the *set* bits, so the empty high bit-planes of a
-	/// small-magnitude stream are skipped wholesale (measured ~5.7× the linear per-block unpack
-	/// in `benches/bitunpack.rs`).
+	/// rebuilds eight lanes per plane byte with branch-free table spreads, and each tile's width
+	/// header drops the empty high bit-planes of a small-magnitude stream (measured several
+	/// times faster than the linear per-block unpack in `benches/bitunpack.rs`).
 	///
 	/// It is **not** strictly larger, though: it adapts its width per 1024-lane *tile* while
 	/// paying one width header per tile, where the blocked codec pays one per 64-value block.

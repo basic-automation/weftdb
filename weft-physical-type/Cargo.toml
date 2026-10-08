@@ -26,6 +26,7 @@ criterion = { workspace = true }
 # Bench-only external yardsticks, pinned exactly (0.x carries no semver promise). Nothing in
 # the library links them: they exist to measure WeftDB's own codecs against upstream.
 fastlanes = "=0.7.2"
+alp = "=0.0.4"
 
 [[bench]]
 name = "bitunpack"
@@ -45,4 +46,8 @@ harness = false
 
 [[bench]]
 name = "fastlanes_yardstick"
+harness = false
+
+[[bench]]
+name = "alp_vs_f64_codecs"
 harness = false
