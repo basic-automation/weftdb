@@ -1442,9 +1442,12 @@ mod tests {
 			return Ok(());
 		}
 
-		// Debug: Show where we're looking for the database
-		tracing::info!(path = %data_dir().join("Crypto").display(), "Looking for Crypto database");
-		tracing::debug!(metadata_path = %data_dir().join("Crypto").join("metadata.db").display(), "Metadata file location");
+		// Point this binary at its test data dir before opening anything. A plain statement,
+		// never a log field: tracing evaluates fields only for enabled events, so under a
+		// filter without info `Database::existing` would resolve the real ~/.weftdb/data.
+		let crypto = data_dir().join("Crypto");
+		tracing::info!(path = %crypto.display(), "Looking for Crypto database");
+		tracing::debug!(metadata_path = %crypto.join("metadata.db").display(), "Metadata file location");
 
 		// Try to get the Crypto database, skip test if it doesn't exist or doesn't have the required data
 		let database = match Database::existing("Crypto").await {
@@ -1696,8 +1699,10 @@ mod tests {
 			return Ok(());
 		}
 
-		// Debug: Show where we're looking for the database
-		tracing::info!(path = %data_dir().join("Crypto").display(), "Looking for Crypto database");
+		// Point this binary at its test data dir before opening anything, as a plain statement
+		// (see `test_api`).
+		let crypto = data_dir().join("Crypto");
+		tracing::info!(path = %crypto.display(), "Looking for Crypto database");
 
 		// Try to get the Crypto database, skip test if it doesn't exist or doesn't have the required data
 		let database = match Database::existing("Crypto").await {
@@ -2052,6 +2057,7 @@ mod tests {
 				drop(signals_lock);
 			}
 		}
+		discard_database("TestDB").await;
 		Ok(())
 	}
 
@@ -2224,6 +2230,7 @@ mod tests {
 		}
 
 		tracing::info!("Pipeline API precise test completed successfully!");
+		discard_database("TestDB").await;
 		Ok(())
 	}
 
@@ -2236,24 +2243,24 @@ mod tests {
 		.collect()
 	}
 
-	async fn fake_database() -> Database {
-		use weftdb::{clear_connection_cache_by_name, DATABASES};
-
-		// Clear any cached database entry for TestDB before recreating
+	/// Forget database `db_name`, which a test created under a fixed name, and remove it from
+	/// the test data dir: its entry in `weftdb::DATABASES` and its cached connections go
+	/// first, so that the next `Database::new` of that name starts afresh.
+	async fn discard_database(db_name: &str) {
 		{
-			let mut databases = DATABASES.lock().await;
-			// Find and remove any existing TestDB entry by name
-			let keys_to_remove: Vec<_> = databases.iter().filter(|(_, info)| info.name() == "TestDB").map(|(id, _)| *id).collect();
+			let mut databases = weftdb::DATABASES.lock().await;
+			let keys_to_remove: Vec<_> = databases.iter().filter(|(_, info)| info.name() == db_name).map(|(id, _)| *id).collect();
 			for key in keys_to_remove {
 				databases.remove(&key);
 			}
 		}
+		weftdb::clear_connection_cache_by_name(db_name).await;
+		remove_database(db_name);
+	}
 
-		// Also clear the connection cache to release file handles
-		clear_connection_cache_by_name("TestDB").await;
-
+	async fn fake_database() -> Database {
 		// Remove the database an earlier test left
-		remove_database("TestDB");
+		discard_database("TestDB").await;
 
 		let db = Database::new("TestDB").await.unwrap();
 		let test_subject = db.observe_subject("TestSubject").await.unwrap();
@@ -2337,6 +2344,7 @@ mod tests {
 		// With 15 points and batch size 10, sliding window creates: 15 - 10 + 1 = 6 overlapping batches
 		assert_eq!(processed_batches.len(), 6);
 
+		remove_database("test_bath_processing");
 		Ok(())
 	}
 
@@ -2401,6 +2409,7 @@ mod tests {
 		// With 15 points and batch size 10, sliding window creates: 15 - 10 + 1 = 6 overlapping batches
 		assert_eq!(processed_batches.len(), 6);
 
+		remove_database("test_specific_process_batch");
 		Ok(())
 	}
 
@@ -2587,26 +2596,17 @@ mod tests {
 		assert!(!Pipeline::exists(&db, &aspect.id()).await?);
 
 		tracing::info!("test_pipeline_api completed successfully!");
+		discard_database("TestDB").await;
 		Ok(())
 	}
 
 	#[tokio::test]
 	#[serial]
 	async fn test_load_or_create_pipeline() -> Result<()> {
-		use weftdb::clear_connection_cache_by_name;
-
 		tracing::info!("=== Testing Pipeline::load_or_create ===");
 
 		// Cleanup
-		{
-			let mut databases = weftdb::DATABASES.lock().await;
-			let keys_to_remove: Vec<_> = databases.iter().filter(|(_, info)| info.name() == "TestLoadOrCreate").map(|(id, _)| *id).collect();
-			for key in keys_to_remove {
-				databases.remove(&key);
-			}
-		}
-		clear_connection_cache_by_name("TestLoadOrCreate").await;
-		remove_database("TestLoadOrCreate");
+		discard_database("TestLoadOrCreate").await;
 
 		// Create database with test data
 		let db = Database::new("TestLoadOrCreate").await?;
@@ -2642,6 +2642,9 @@ mod tests {
 
 		// Cleanup
 		pipeline.delete().await?;
+		drop(pipeline);
+		drop(db);
+		discard_database("TestLoadOrCreate").await;
 
 		tracing::info!("test_load_or_create_pipeline completed successfully!");
 		Ok(())
@@ -2650,20 +2653,10 @@ mod tests {
 	#[tokio::test]
 	#[serial]
 	async fn test_run_subject_pipelines() -> Result<()> {
-		use weftdb::clear_connection_cache_by_name;
-
 		tracing::info!("=== Testing run_subject_pipelines ===");
 
 		// Cleanup
-		{
-			let mut databases = weftdb::DATABASES.lock().await;
-			let keys_to_remove: Vec<_> = databases.iter().filter(|(_, info)| info.name() == "TestParallelPipelines").map(|(id, _)| *id).collect();
-			for key in keys_to_remove {
-				databases.remove(&key);
-			}
-		}
-		clear_connection_cache_by_name("TestParallelPipelines").await;
-		remove_database("TestParallelPipelines");
+		discard_database("TestParallelPipelines").await;
 
 		// Create database with multiple aspects
 		let db = Database::new("TestParallelPipelines").await?;
@@ -2706,6 +2699,9 @@ mod tests {
 			);
 		}
 
+		drop(db);
+		discard_database("TestParallelPipelines").await;
+
 		tracing::info!("test_run_subject_pipelines completed successfully!");
 		Ok(())
 	}
@@ -2714,6 +2710,11 @@ mod tests {
 	/// variabilities. It used to store only a metadata row, which `get_dictionary_metadata`
 	/// never found, so every load (two per `Pipeline::extract_patterns`) added another row
 	/// and the dictionary's constraints were never stored.
+	///
+	/// It registers through `register_dictionary_if_absent`, which keeps a registration
+	/// committed between `load_dictionary`'s read and its write. That needs a writer inside
+	/// that window, so it is not tested here: weftdb's
+	/// `test_register_dictionary_if_absent_keeps_a_complete_registration` tests the method.
 	#[tokio::test]
 	async fn load_dictionary_registers_a_dictionary_once() -> Result<()> {
 		let db_name = format!("load_dictionary_{}", uuid::Uuid::new_v4());

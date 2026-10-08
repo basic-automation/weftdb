@@ -22,8 +22,12 @@ static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// The variable is set once, under the `OnceLock`, before any database of this binary
 /// resolves it, and no test sets it after.
 ///
-/// The temporary directory is left in place when the binary exits, with the database of
-/// any test that failed before its cleanup, for inspection.
+/// Each test removes the databases it created ([`remove_database`]) when it passes. The
+/// temporary directory itself (`weft-orchestration-test-data-<uuid>` under the system temp dir) is left in
+/// place when the binary exits: empty after a passing run, and holding the database of any
+/// test that failed before its cleanup, for inspection. Nothing removes it at exit, since
+/// a test binary has no exit hook and removing it while other tests run would race their
+/// `Database::new`.
 ///
 /// # Panics
 ///
