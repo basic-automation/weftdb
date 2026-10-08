@@ -297,12 +297,15 @@ while using bounded memory per bucket.
 
 ### Where it doesn't pay off
 
-A deliberately-kept honest result: the FastLanes **transposed value codec** delivers
-~5.7× faster bit-unpacking at the kernel level, but end-to-end it is a **wash** —
-+0.08% bytes and full decode, windowed range and point reads all within noise of the
-linear codec ([`benches/transposed_read.rs`](weft-physical-type/benches/transposed_read.rs)).
-It ships **off by default** for exactly that reason. Kernel speedups often don't
-survive a whole read path, and this README would rather say so than quote the 5.7×.
+A deliberately-kept honest result: the FastLanes **transposed value codec** once
+measured ~5.7× faster than the linear bit-unpack at the kernel level, but only because
+the linear decoder tested one bit at a time. Once that decoder moved to word-wise reads,
+the linear layout unpacked *faster* (1.09 vs 1.95 ms per 1 Mi values,
+[`benches/bitunpack.rs`](weft-physical-type/benches/bitunpack.rs)). End to end, the
+transposed layout costs +0.08% bytes and reads no faster than the linear codec
+([`benches/transposed_read.rs`](weft-physical-type/benches/transposed_read.rs)), so it
+ships **off by default**. A kernel speedup measured against a weak baseline is not a
+result, and this README would rather say so than quote the 5.7×.
 
 ---
 
@@ -879,7 +882,12 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   byte-for-byte unchanged; the realized figure is reported as
   `StorageEstimate.realized_value_bytes` / `value_codec`. The timestamp column keeps an
   *advisory* FOR estimate (`for_estimated_bytes`) — second differences are near-zero, so
-  FOR rarely wins there.
+  FOR rarely wins there. Every linear bit-packed codec decodes with a word-wise field read
+  (one unaligned load and a shift/mask per value), so 1 Mi mantissas unpack in **1.09 ms**
+  (fixed width) / **1.83 ms** (per-block)
+  ([`weft-physical-type/benches/bitunpack.rs`](weft-physical-type/benches/bitunpack.rs)), and
+  1 Mi real BTC closes stored under FOR at scale 8 decode to floats in **1.66 ms**
+  ([`weft-physical-type/benches/alp_vs_f64_codecs.rs`](weft-physical-type/benches/alp_vs_f64_codecs.rs)).
 - **Two-level delta cascade (opt-in)** — a **trending** `ScaledI64` column (a counter or
   monotone sensor whose magnitude every single-level codec pays for) is additionally
   compressible by a *cascade*: delta-transform the mantissas, then pack the differences with
@@ -901,12 +909,13 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   entry (`best_value_codec_transposed(max_overhead)`) rather than reusing the blocked figure, is
   random-access capable (so it does not regress the streaming point read), and is requested through
   `FrameOptions` / `Segment::write_to_with` or, from a deployment, `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD`.
-  **Honest result: the kernel-level decode win does not survive the whole read path.** Measured on a
-  1M-row zero-straddling column ([`weft-physical-type/benches/transposed_read.rs`](weft-physical-type/benches/transposed_read.rs)):
-  frame bytes **+0.08%** (1,251,057 vs 1,250,076), full decode **12.98 ms vs 13.39 ms** (a tie —
-  confidence intervals overlap), windowed 1000-row range **2.380 ms vs 2.393 ms** (a tie), single
-  point read **2.250 ms vs 2.431 ms** (~1.08×, non-overlapping intervals). So the layout is
-  byte-neutral and read-neutral here; it stays **opt-in** and the default codec choice is unchanged.
+  **Honest result: no read-path win over the linear codec.** Measured on a 1M-row zero-straddling
+  column ([`weft-physical-type/benches/transposed_read.rs`](weft-physical-type/benches/transposed_read.rs),
+  2026-10-08, transposed vs linear): frame bytes **+0.08%** (1,251,057 vs 1,250,076), full decode
+  **7.81 ms vs 6.87 ms**, windowed 1000-row range **3.54 ms vs 2.46 ms**, single point read
+  **2.61 ms vs 2.47 ms**. The point read is dominated by the ~2.4 ms frame parse/CRC both layouts
+  share. So the layout is byte-neutral and slightly slower on reads; it stays **opt-in** and the
+  default codec choice is unchanged.
   Note the codec is chosen only when a *strict* size win or within the caller's overhead ceiling —
   the ceiling may legitimately be set below 1.0, because per-tile widths with one header per 1024
   lanes can beat both a global width and the blocked codec's one-header-per-64.

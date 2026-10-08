@@ -374,6 +374,51 @@ pub fn rle_varint_bytes(runs: &[(i64, usize)]) -> usize {
 	runs.iter().map(|&(value, count)| zigzag_varint_len(value) + uvarint_len(count as u64)).sum()
 }
 
+/// Read the `width`-bit field (`width <= 64`) stored LSB-first at bit offset `bit` of `data`.
+/// Bytes past the end of `data` read as `0`, so a truncated stream yields zero bits rather than
+/// panicking. The shared word-wise read behind every LSB-first bit-pack decoder: one unaligned
+/// little-endian load and a shift/mask per value, rather than one test per bit.
+#[inline]
+fn read_bits(data: &[u8], bit: usize, width: usize) -> u64 {
+	if width == 0 {
+		return 0;
+	}
+	let width = width.min(64);
+	let (byte, shift) = (bit / 8, bit % 8);
+	let mask = u64::MAX >> (64 - width);
+	if shift + width <= 64 {
+		if let Some(word) = data.get(byte..byte + 8) {
+			let mut le = [0_u8; 8];
+			le.copy_from_slice(word);
+			return (u64::from_le_bytes(le) >> shift) & mask;
+		}
+	}
+	let mut le = [0_u8; 16];
+	let tail = data.get(byte..).unwrap_or(&[]);
+	let take = tail.len().min(16);
+	le[..take].copy_from_slice(&tail[..take]);
+	let wide = u128::from_le_bytes(le) >> shift;
+	let mut low = [0_u8; 8];
+	low.copy_from_slice(&wide.to_le_bytes()[..8]);
+	u64::from_le_bytes(low) & mask
+}
+
+/// OR the low `width` bits (`width <= 64`) of `value` into `out` LSB-first at bit offset `bit`.
+/// The exact inverse of [`read_bits`]; `out` must be pre-sized and zeroed over the field (bytes
+/// past its end are dropped rather than panicking).
+#[inline]
+fn write_bits(out: &mut [u8], bit: usize, value: u64, width: usize) {
+	if width == 0 {
+		return;
+	}
+	let width = width.min(64);
+	let (byte, shift) = (bit / 8, bit % 8);
+	let field = (u128::from(value & (u64::MAX >> (64 - width)))) << shift;
+	for (dst, src) in out.iter_mut().skip(byte).zip(field.to_le_bytes()).take((shift + width).div_ceil(8)) {
+		*dst |= src;
+	}
+}
+
 /// Zig-zag a signed `i64` into an unsigned `u64` (`0,-1,1,-2 -> 0,1,2,3`), so
 /// small-magnitude negatives stay numerically small. Inverse of [`unzigzag`].
 #[must_use]
@@ -427,15 +472,8 @@ pub fn bitpack_encode(values: &[i64]) -> (u32, Vec<u8>) {
 	}
 	let w = width as usize;
 	let mut out = vec![0_u8; (values.len() * w).div_ceil(8)];
-	let mut bit = 0_usize;
-	for &v in values {
-		let zz = zigzag(v);
-		for b in 0..w {
-			if (zz >> b) & 1 == 1 {
-				out[(bit + b) / 8] |= 1 << ((bit + b) % 8);
-			}
-		}
-		bit += w;
+	for (i, &v) in values.iter().enumerate() {
+		write_bits(&mut out, i * w, zigzag(v), w);
 	}
 	(width, out)
 }
@@ -455,15 +493,7 @@ pub fn bitpack_decode_at(width: u32, bytes: &[u8], index: usize) -> i64 {
 		return 0;
 	}
 	let w = width as usize;
-	let bit = index * w;
-	let mut zz = 0_u64;
-	for b in 0..w {
-		let idx = bit + b;
-		if bytes.get(idx / 8).is_some_and(|byte| (byte >> (idx % 8)) & 1 == 1) {
-			zz |= 1 << b;
-		}
-	}
-	unzigzag(zz)
+	unzigzag(read_bits(bytes, index * w, w))
 }
 
 /// Reconstruct `count` differences from a fixed-width bit-packed buffer. Exact
@@ -474,20 +504,7 @@ pub fn bitpack_decode(width: u32, bytes: &[u8], count: usize) -> Vec<i64> {
 		return vec![0; count];
 	}
 	let w = width as usize;
-	let mut out = Vec::with_capacity(count);
-	let mut bit = 0_usize;
-	for _ in 0..count {
-		let mut zz = 0_u64;
-		for b in 0..w {
-			let idx = bit + b;
-			if bytes.get(idx / 8).is_some_and(|byte| (byte >> (idx % 8)) & 1 == 1) {
-				zz |= 1 << b;
-			}
-		}
-		out.push(unzigzag(zz));
-		bit += w;
-	}
-	out
+	(0..count).map(|i| unzigzag(read_bits(bytes, i * w, w))).collect()
 }
 
 /// The fixed block size the realized dynamic bit-pack codec partitions a
@@ -962,14 +979,8 @@ pub fn for_bitpack_encode(values: &[i64], block: usize) -> Vec<u8> {
 		}
 		let start = out.len();
 		out.resize(start + (chunk.len() * width).div_ceil(8), 0);
-		let mut bit = 0_usize;
-		for &r in &residuals {
-			for b in 0..width {
-				if (r >> b) & 1 == 1 {
-					out[start + (bit + b) / 8] |= 1 << ((bit + b) % 8);
-				}
-			}
-			bit += width;
+		for (i, &r) in residuals.iter().enumerate() {
+			write_bits(&mut out[start..], i * width, r, width);
 		}
 	}
 	out
@@ -994,18 +1005,7 @@ pub fn for_bitpack_decode(bytes: &[u8], block: usize, count: usize) -> Vec<i64> 
 		let data_len = (block_len * width).div_ceil(8);
 		let data = bytes.get(pos..pos + data_len).unwrap_or(&[]);
 		pos += data_len;
-		let mut bit = 0_usize;
-		for _ in 0..block_len {
-			let mut r = 0_u64;
-			for b in 0..width {
-				let idx = bit + b;
-				if data.get(idx / 8).is_some_and(|byte| (byte >> (idx % 8)) & 1 == 1) {
-					r |= 1 << b;
-				}
-			}
-			out.push(for_reconstruct(min, r));
-			bit += width;
-		}
+		out.extend((0..block_len).map(|row| for_reconstruct(min, read_bits(data, row * width, width))));
 		remaining -= block_len;
 	}
 	out
@@ -1041,17 +1041,7 @@ pub fn for_bitpack_decode_range(bytes: &[u8], block: usize, count: usize, start:
 			let data = bytes.get(pos..pos + data_len).unwrap_or(&[]);
 			let lo = start.saturating_sub(idx);
 			let hi = (end - idx).min(block_len);
-			for row in lo..hi {
-				let mut r = 0_u64;
-				let bit = row * width;
-				for b in 0..width {
-					let bit_idx = bit + b;
-					if data.get(bit_idx / 8).is_some_and(|byte| (byte >> (bit_idx % 8)) & 1 == 1) {
-						r |= 1 << b;
-					}
-				}
-				out.push(for_reconstruct(min, r));
-			}
+			out.extend((lo..hi).map(|row| for_reconstruct(min, read_bits(data, row * width, width))));
 		}
 		pos += data_len;
 		idx += block_len;
@@ -1161,16 +1151,7 @@ pub fn for_bitpack_decode_gather(bytes: &[u8], block: usize, count: usize, indic
 		|&(min, width), data, _, lanes| {
 			lanes
 				.iter()
-				.map(|&row| {
-					let mut r = 0_u64;
-					for b in 0..width {
-						let bit_idx = row * width + b;
-						if data.get(bit_idx / 8).is_some_and(|byte| (byte >> (bit_idx % 8)) & 1 == 1) {
-							r |= 1 << b;
-						}
-					}
-					for_reconstruct(min, r)
-				})
+				.map(|&row| for_reconstruct(min, read_bits(data, row * width, width)))
 				.collect()
 		},
 	)
@@ -1258,11 +1239,7 @@ pub fn gorilla_bytes(dods: &[i64]) -> usize {
 /// buffer, advancing the cursor. Same bit order as [`bitpack_encode`], so the two
 /// codecs share a decode convention.
 fn gorilla_put_bits(out: &mut [u8], bit: &mut usize, value: u64, n: usize) {
-	for b in 0..n {
-		if (value >> b) & 1 == 1 {
-			out[(*bit + b) / 8] |= 1 << ((*bit + b) % 8);
-		}
-	}
+	write_bits(out, *bit, value, n);
 	*bit += n;
 }
 
@@ -1270,13 +1247,7 @@ fn gorilla_put_bits(out: &mut [u8], bit: &mut usize, value: u64, n: usize) {
 /// Bits past the buffer read as `0` (the exact inverse of [`gorilla_put_bits`] over a
 /// buffer sized to the written bit count). Inverse convention of [`bitpack_decode`].
 fn gorilla_get_bits(bytes: &[u8], bit: &mut usize, n: usize) -> u64 {
-	let mut v = 0_u64;
-	for b in 0..n {
-		let idx = *bit + b;
-		if bytes.get(idx / 8).is_some_and(|byte| (byte >> (idx % 8)) & 1 == 1) {
-			v |= 1 << b;
-		}
-	}
+	let v = read_bits(bytes, *bit, n);
 	*bit += n;
 	v
 }
@@ -2386,6 +2357,43 @@ mod tests {
 		// Empty stream encodes to nothing and decodes to nothing.
 		assert!(transpose_bitpack_encode(&[], 64).is_empty());
 		assert_eq!(transpose_bitpack_decode(&[], 64, 0), Vec::<i64>::new());
+	}
+
+	#[test]
+	fn read_and_write_bits_match_a_per_bit_reference_at_every_width_and_offset() {
+		// The word-wise field accessors must equal the one-bit-at-a-time definition for every
+		// width 0..=64 at every in-byte offset, including fields that straddle the 8-byte fast
+		// path, fields running off the end of the buffer (missing bits read as 0), and writes
+		// that must leave neighbouring fields untouched.
+		let reference_read = |data: &[u8], bit: usize, width: usize| -> u64 {
+			(0..width).fold(0_u64, |acc, b| {
+				let idx = bit + b;
+				if data.get(idx / 8).is_some_and(|byte| (byte >> (idx % 8)) & 1 == 1) {
+					acc | (1 << b)
+				} else {
+					acc
+				}
+			})
+		};
+		let data: Vec<u8> = (0..40_u32).map(|i| u8::try_from((i * 97 + 13) % 256).unwrap_or(0)).collect();
+		for width in 0..=64_usize {
+			for bit in (0..data.len() * 8 + 16).step_by(3) {
+				assert_eq!(read_bits(&data, bit, width), reference_read(&data, bit, width), "read width {width} bit {bit}");
+			}
+			for at in 0..16 {
+				let value = 0xA5C3_96E1_7B2D_4F08_u64.rotate_left(u32::try_from(width + at).unwrap_or(0));
+				let mut out = vec![0_u8; 12];
+				write_bits(&mut out, at, value, width);
+				let mask = if width == 0 { 0 } else { u64::MAX >> (64 - width) };
+				assert_eq!(read_bits(&out, at, width), value & mask, "write width {width} offset {at}");
+				let bit_set = |i: usize| (out[i / 8] >> (i % 8)) & 1 == 1;
+				assert!(!(0..at).chain(at + width..96).any(bit_set), "bits outside the field must stay clear (width {width} offset {at})");
+			}
+		}
+		// A write running off a short buffer drops the missing bytes instead of panicking.
+		let mut short = [0_u8; 2];
+		write_bits(&mut short, 4, u64::MAX, 64);
+		assert_eq!(short, [0xf0, 0xff]);
 	}
 
 	#[test]

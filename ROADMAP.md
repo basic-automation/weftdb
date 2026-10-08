@@ -629,11 +629,25 @@ detection within Y% and improving historical query latency by Z."*
       `ScaledI64` codec with a per-tile scale and an exception list would keep the `BigDecimal`
       logical type exact, with no float on the path, and should approach ALP's figure. Measure it on
       the same bench before deciding between that and ALP.
-    - [ ] **NEW — the scalar FOR/blocked decode is the read-path bottleneck at wide widths.**
+    - [x] **DONE (2026-10-08) — the scalar FOR/blocked decode is the read-path bottleneck at wide widths.**
       `for_bitpack_decode` takes **70.8 ms per 1 Mi values at ~33 bits** (11.3 ms at ~5.5 bits). It
       loops per bit per value, so cost scales with width. The `fastlanes` unpack inside the ALP arm
       does the same FOR + unpack work in under 1 ms. Port the FOR/blocked unpack to a word-wise
       (or `fastlanes`-style) kernel and re-run `alp_vs_f64_codecs` + `bitunpack`.
+      Fixed with a shared word-wise `read_bits`/`write_bits` (one unaligned LE load + shift/mask)
+      behind every LSB-first codec (global/blocked/FOR bit-pack, the FOR range + gather, Gorilla).
+      A/B: `bitunpack` scalar_global **16.53→1.09 ms**, scalar_blocked **17.19→1.83 ms**;
+      realized `scaled_for` on BTC **78.1→1.66 ms** (47×), sensor_2dp 11.9→2.55 ms;
+      `transposed_read` linear full decode **15.5→6.87 ms**. ALP's 0.57 ms on BTC is now a 2.9×
+      decode gap rather than a 124× one; its byte win (15.35 vs 33.74 b) is unchanged.
+    - [ ] **Re-decide the transposed layout now that the linear baseline is honest.** After the
+      word-wise read the linear unpack beats the transposed one (1.09 vs 1.95 ms per 1 Mi values), and
+      end-to-end full decode is 6.87 (linear) vs 7.81 ms (transposed). The old "~5.7× kernel win"
+      was measured against a per-bit decoder. Either close the yardstick residue
+      above (≥3× faster tile decode) or retire `VAL_CODEC_TRANSPOSED` to read-only.
+    - [ ] **The f64 codecs (Gorilla/Chimp/Chimp128/Elf) still read with their own per-bit loops**
+      in `floatcodec.rs` (17–55 ms per 1 Mi values in `alp_vs_f64_codecs`). Port them to the same
+      word-wise read before any adopt decision compares them with ALP on decode speed.
   - [ ] **Set the ALP acceptance bar from upstream's own ablation, and be willing to DECLINE.**
     FastLanes' per-encoding ablation (VLDB'25, Table 7, PUBLIC_BI) reports ALP at **+4.36%
     compression ratio for −7.28% decompression speed**, with ALP_RD +0.57%/−2.30% and Patch
