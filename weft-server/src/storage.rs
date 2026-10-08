@@ -70,7 +70,7 @@ pub struct ValueRangeParams {
 }
 
 /// An error from a storage endpoint, rendered as `{"error": "..."}` with the
-/// status code that fits the cause.
+/// status code that fits the cause (plus a machine-readable `"code"` where noted).
 #[derive(Debug)]
 pub enum StorageError {
 	/// No segment store is configured (no store root) → 503.
@@ -82,6 +82,11 @@ pub enum StorageError {
 	/// The request conflicts with work in progress (another maintenance operation held
 	/// the aspect for longer than the request would wait) → 409; retry later.
 	Conflict(String),
+	/// The directory the request would create already exists (a backup label already
+	/// taken, or a restore drill's rehearsal directory already in use) → 409 with
+	/// `"code": "already_exists"`. Nothing was written or removed: choose another label,
+	/// or retry the drill, which picks a fresh rehearsal directory.
+	AlreadyExists(String),
 	/// An underlying read or serialization failure → 500.
 	Internal(String),
 }
@@ -90,18 +95,22 @@ pub enum StorageError {
 #[derive(Debug, Serialize)]
 struct ErrorBody {
 	error: String,
+	/// A stable machine-readable error code, for the errors that carry one.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	code: Option<&'static str>,
 }
 
 impl IntoResponse for StorageError {
 	fn into_response(self) -> Response {
-		let (status, error) = match self {
-			Self::Unconfigured => (StatusCode::SERVICE_UNAVAILABLE, "no segment store is configured on this server".to_string()),
-			Self::NotFound(message) => (StatusCode::NOT_FOUND, message),
-			Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
-			Self::Conflict(message) => (StatusCode::CONFLICT, message),
-			Self::Internal(message) => (StatusCode::INTERNAL_SERVER_ERROR, message),
+		let (status, error, code) = match self {
+			Self::Unconfigured => (StatusCode::SERVICE_UNAVAILABLE, "no segment store is configured on this server".to_string(), None),
+			Self::NotFound(message) => (StatusCode::NOT_FOUND, message, None),
+			Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message, None),
+			Self::Conflict(message) => (StatusCode::CONFLICT, message, None),
+			Self::AlreadyExists(message) => (StatusCode::CONFLICT, message, Some("already_exists")),
+			Self::Internal(message) => (StatusCode::INTERNAL_SERVER_ERROR, message, None),
 		};
-		(status, Json(ErrorBody { error })).into_response()
+		(status, Json(ErrorBody { error, code })).into_response()
 	}
 }
 
