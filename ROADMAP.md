@@ -645,9 +645,14 @@ detection within Y% and improving historical query latency by Z."*
       end-to-end full decode is 6.87 (linear) vs 7.81 ms (transposed). The old "~5.7× kernel win"
       was measured against a per-bit decoder. Either close the yardstick residue
       above (≥3× faster tile decode) or retire `VAL_CODEC_TRANSPOSED` to read-only.
-    - [ ] **The f64 codecs (Gorilla/Chimp/Chimp128/Elf) still read with their own per-bit loops**
+    - [x] **DONE (2026-10-08) — The f64 codecs (Gorilla/Chimp/Chimp128/Elf) still read with their own per-bit loops**
       in `floatcodec.rs` (17–55 ms per 1 Mi values in `alp_vs_f64_codecs`). Port them to the same
       word-wise read before any adopt decision compares them with ALP on decode speed.
+      `BitReader::get_bits` is now one big-endian load + shift per field, and `BitWriter::put_bits`
+      writes byte-sized chunks. A/B on BTC: Gorilla **36.4→3.41 ms**, Chimp 35.7→6.77,
+      Chimp128 **19.8→4.45**, Elf 29.4→5.58 ms. Range across all three corpora: 2.7–10.9×. ALP
+      (0.57 ms, 15.35 b) is still the fastest and smallest on BTC, but the decode gap to Chimp128
+      is now 7.8×, not 30×.
   - [ ] **Set the ALP acceptance bar from upstream's own ablation, and be willing to DECLINE.**
     FastLanes' per-encoding ablation (VLDB'25, Table 7, PUBLIC_BI) reports ALP at **+4.36%
     compression ratio for −7.28% decompression speed**, with ALP_RD +0.57%/−2.30% and Patch
