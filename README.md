@@ -1322,6 +1322,11 @@ suites alongside the Weft-Bench harness (see
 cargo bench -p weftdb --bench cache_performance_benchmarks
 ```
 
+These benches create their databases in a temporary data dir of their own, which they
+remove when they finish, never in `~/.weftdb/data`. That dir is under the system temp
+dir, often a tmpfs; to bench another filesystem, set `TEST_DATA_DIR` to a directory on
+it (the benches remove the databases they create there, not the directory).
+
 HTML reports are generated under `target/criterion/`. The interpolation engine's own
 benchmarks live in the [splimes repository](https://github.com/basic-automation/splimes).
 
