@@ -679,7 +679,14 @@ detection within Y% and improving historical query latency by Z."*
       vs realized `scaled_for` 33.74 b (**2.48× smaller**) vs ALP 15.35 b; decode 2.10 ms vs
       1.78 ms (FOR) / 0.67 ms (ALP). **sensor_2dp 5.64 b vs 5.51 b**: it loses by the header byte
       when nothing factors out, so a selector must pick it only when strictly smallest.
-    - [ ] **Prior art for the decimal-exponent FOR: BtrBlocks' Pseudodecimal Encoding (SIGMOD'23)
+    - [x] **DECIDED (2026-10-08) — per-block wins on BTC.** A Python sizing over the same 1 Mi window
+      gives a per-value minimal exponent (Pseudodecimal-style) **25.20 bits/value**: digits FOR-packed
+      at 20.28, plus an RLE'd exponent column at 4.92 across 322,504 runs. That is against **13.58**
+      for the per-block exponent. A value's *minimal* exponent depends on its trailing digits
+      (3558.90 → k=7, 3559.00 → k=8; the k histogram is 6:832k, 7:102k, 8:71k, 9:35k), so per-value
+      exponents scatter and jumble the digit magnitudes FOR then pays for. Keep per-block for
+      `VAL_CODEC_DFOR`. The original item:
+    - [x] **Prior art for the decimal-exponent FOR: BtrBlocks' Pseudodecimal Encoding (SIGMOD'23)
       chooses the exponent PER VALUE, not per block (research 2026-10-08).** It splits a double into
       two integer columns (signed significant digits and an exponent) plus an exception column,
       then cascades each into integer schemes such as RLE/FOR/bit-packing. Its selection rule:
@@ -706,7 +713,15 @@ detection within Y% and improving historical query latency by Z."*
       realized `scaled_for` on BTC **78.1→1.66 ms** (47×), sensor_2dp 11.9→2.55 ms;
       `transposed_read` linear full decode **15.5→6.87 ms**. ALP's 0.57 ms on BTC is now a 2.9×
       decode gap rather than a 124× one; its byte win (15.35 vs 33.74 b) is unchanged.
-    - [ ] **Re-decide the transposed layout now that the linear baseline is honest.** After the
+    - [ ] **Re-decide the transposed layout now that the linear baseline is honest — RECOMMEND
+      RETIRING `VAL_CODEC_TRANSPOSED` to read-only (owner decision).** Tried 2026-10-08: replacing
+      the table spread with a branch-free 8×8 bit-matrix transpose (Hacker's Delight `transpose8`) made
+      the tile decode **11–25% slower** (w3/w10/w20: 0.895/1.78/2.87 ms vs 0.78/1.50/2.32 ms on the
+      `fastlanes` yardstick), so it was reverted. The bit-plane layout needs a transpose that
+      FastLanes' own layout avoids by design. No remaining kernel idea is credible for the ≥3× it
+      would need to beat the linear unpack (1.09 ms), and end to end it is byte-neutral and
+      slightly slower. Keep the reader so existing frames still decode; stop offering
+      `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` for new seals. Original item: After the
       word-wise read the linear unpack beats the transposed one (1.09 vs 1.95 ms per 1 Mi values), and
       end-to-end full decode is 6.87 (linear) vs 7.81 ms (transposed). The old "~5.7× kernel win"
       was measured against a per-bit decoder. Either close the yardstick residue
