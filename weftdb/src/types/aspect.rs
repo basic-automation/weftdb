@@ -1109,7 +1109,7 @@ impl AspectStructure for Aspect {
 		let db_path = subject_path.parent().ok_or_else(|| anyhow::anyhow!("Cannot get db path from subject path"))?;
 		let db_name = db_path.file_name().ok_or_else(|| anyhow::anyhow!("Cannot extract db_name from path"))?.to_string_lossy().to_string();
 
-		let dictionaries_db_path = Database::aspect_dictionaries_db_path(&db_name, &self.subject_name, &self.name, name);
+		let dictionaries_db_path = Database::aspect_dictionaries_db_path(&db_name, &self.subject_name, &self.name, name)?;
 		let (dictionaries_db, was_new) = Database::get_or_create_turso_database(&dictionaries_db_path).await?;
 
 		// Use immediate transaction for DDL (not compatible with BEGIN CONCURRENT)
@@ -1126,7 +1126,7 @@ impl AspectStructure for Aspect {
 		// its registration rather than adding a second one.
 		let conn = Database::begin_concurrent(&dictionaries_db, &dictionaries_db_path, None).await?;
 		if let Err(e) = Database::replace_dictionary_registration(&conn, &DictionaryId::new(), name, description, constraints).await {
-			Database::rollback_concurrent(&conn).await?;
+			Database::rollback_after_error(&conn).await;
 			return Err(e);
 		}
 
@@ -1150,7 +1150,7 @@ impl AspectStructure for Aspect {
 		let db_name = db_path_parent.file_name().ok_or_else(|| anyhow::anyhow!("Cannot extract db_name from path"))?.to_string_lossy().to_string();
 
 		// Get the path for this dictionary
-		let dictionary_path = Database::aspect_dictionaries_db_path(&db_name, &self.subject_name, &self.name, name);
+		let dictionary_path = Database::aspect_dictionaries_db_path(&db_name, &self.subject_name, &self.name, name)?;
 
 		// Check if path exists on disk (dictionary may have been created but not cached in paths map)
 		if !std::path::Path::new(&dictionary_path).exists() && !self.dictionaries_paths.contains_key(name) {

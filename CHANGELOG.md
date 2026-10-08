@@ -47,6 +47,15 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   Contributions are licensed `MIT OR Apache-2.0`. See
   [`CONTRIBUTING.md`](CONTRIBUTING.md#contribution-terms).
 
+- **`Inputs::register_dictionary_if_absent`** registers a dictionary as
+  `set_dictionary_metadata` does unless a complete registration of that name exists,
+  checking inside its own write transaction, and returns whether it registered it. A
+  registration that cannot be read counts as existing and is left alone, and a write
+  that loses an MVCC conflict is tried once more after a short random delay. The check
+  sees registrations committed before its transaction began: one committed while it
+  runs, like a second writer registering the same new dictionary at the same moment, is
+  not seen, both are written, and reads pick the newest.
+
 ### Changed
 
 - **`splimes` moved to its own repository** ([basic-automation/splimes](https://github.com/basic-automation/splimes))
@@ -225,7 +234,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   registration and replaces any earlier one of that name, since the tables cannot carry
   a unique constraint; `AspectStructure::new_dictionary` writes the same way, so creating
   a dictionary twice no longer leaves two. `load_dictionary` registers a dictionary only
-  when none is registered, under the `Dictionary`'s own id: `get_dictionary_metadata`
+  when none is registered, under the `Dictionary`'s own id, through the new
+  `Inputs::register_dictionary_if_absent`: it checks again inside its write, so a
+  registration committed after `load_dictionary` read none and before that write began
+  (an explicit `set_dictionary_metadata` with tuned constraints, say) is kept instead of
+  replaced with the pipeline's, and a write that loses an MVCC conflict to another load
+  healing the same rows is tried once more. A dictionary name that cannot name a file is an
+  error from `load_dictionary`. `get_dictionary_metadata`
   now answers `Ok(None)` for a dictionary with no database yet (it was an error,
   `Dictionary '…' does not exist for aspect '…'`), and a registration it cannot read
   is left alone instead of registered again. Of several rows for one name,
@@ -242,10 +257,47 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   dictionary. Each dictionary is its own `<aspect>/dictionaries/<name>.db`; it now lists
   all of them, by name, each with its steps and variabilities (it returned empty
   constraints), and the list is no longer cached, so it does not go stale when a
-  dictionary is added.
+  dictionary is added. Only regular files are listed: a symlink, which it followed and
+  so opened (setting the target's journal mode and creating tables in it), a directory
+  or another entry named `*.db` is skipped. Every regular `*.db` file there is still
+  opened as a dictionary, so keep backups out of that directory or under another
+  extension. A dictionary whose stored registration does not parse, such as one with a
+  stored step method splimes rejects, is logged as a warning and left out instead of
+  failing the whole listing; a read that fails (I/O, a query, an MVCC conflict) still
+  fails it, so a dictionary is never left out only because it could not be read.
+- **A dictionary file without its tables could not be registered.** A dictionary's file
+  can exist before its tables, for example when `insert_pattern_into_dictionary` opened
+  it first, which creates no tables. Once the file was open in the process nothing created
+  them, so `get_dictionary_metadata` failed with `no such table: dictionary_metadata`,
+  `load_dictionary` only warned and never registered the dictionary, and
+  `list_dictionaries` failed for the whole aspect. Such a file holds no registration, so
+  it now reads as unregistered (`Ok(None)`), and registering the dictionary creates the
+  tables.
+- **A metadata read could cache a registration that had just been replaced.** A
+  `get_dictionary_metadata` whose snapshot predated a `set_dictionary_metadata` commit
+  could store the old registration after the write had invalidated it, and the old one
+  was then served for up to the ten-minute cache lifetime. A read now caches what it read
+  only if no write on the same `Database` invalidated the entry since it began
+  (`DatabaseCache::generation`, `invalidate_generation` and `store_if_generation`). A
+  registration written through `AspectStructure::new_dictionary`, another `Database`
+  handle or another process still does not invalidate the cache, and can be served
+  stale until the entry expires.
 - **Commit failures were silently ignored.** A control-plane write that lost an MVCC
   conflict was reported as success. Commit errors now reach the caller, and the
   transaction is rolled back.
+- **A write that lost an MVCC conflict reported a failed rollback instead.** Turso rolls
+  a transaction back itself when one of its statements loses a write-write conflict, so
+  the `ROLLBACK` after the failed statement fails (`cannot rollback - no transaction is
+  active`), and control-plane writes (registering or creating a dictionary, inserting a
+  pattern, removing an event, …) returned that error, `Rollback failed: …`, in place of
+  the conflict. They now return the statement's error and log the failed rollback as a
+  warning. `weftdb::error::is_transient_mvcc_error` also matches Turso's `Busy`,
+  `BusySnapshot` and write-write conflict errors anywhere in an error's chain (it
+  matched only WeftDB's own `TransientMvccError`), so it recognises the conflict as
+  retryable where the returned error keeps Turso's error in its chain: from registering
+  or creating a dictionary (`set_dictionary_metadata`, `register_dictionary_if_absent`,
+  `AspectStructure::new_dictionary`) and from a failed commit. The other control-plane
+  writes still return the statement's error as text only, which it does not recognise.
 - **Quadratic GPU interpolation failed on GPUs without f64 support** (Apple Silicon,
   most integrated GPUs, Windows WARP). The f32 fallback shader did not parse, so wgpu
   panicked.
@@ -276,6 +328,33 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   that differ only in letter case or Unicode normalisation are still accepted and can
   share frame files on a case-insensitive or normalising filesystem; that is a collision
   inside `segments/`, not a way out of it, and the planned encoded frame names remove it.
+- **Dictionary names can no longer point outside the aspect's `dictionaries/`
+  directory.** Each dictionary is its own `<aspect>/dictionaries/<name>.db`, and the name
+  was not checked, so `../x` reached `<aspect>/x.db` and an absolute name such as `/tmp/x`
+  replaced the whole path; `get_dictionary_metadata` then created that file and its
+  tables, and `new_dictionary` and `set_dictionary_metadata` wrote to it. Dictionary
+  names now follow the aspect-name rules (`weftdb::dictionary_name::validate`), checked by
+  the dictionary path builders, so every dictionary operation (`new_dictionary`,
+  `Aspect::dictionary`, `set_dictionary_metadata`, `insert_pattern_into_dictionary`,
+  `get_dictionary_metadata`, `get_dictionary_db`, `get_dictionary_patterns`) refuses
+  such a name with a typed `weftdb::InvalidDictionaryName` error before any file is
+  touched. `Config::aspect_dictionaries_db_path` and `Config::dictionary_path` return
+  `Result<String>` (they returned the path), and `list_dictionaries` skips a `.db` file
+  whose name is not a valid dictionary name, with a warning. No `weft-server` endpoint
+  takes a dictionary name.
+
+  **Breaking for existing data:** a dictionary an earlier release created under a name
+  these rules now refuse (a leading `.`, a trailing `.` or space, a Windows device name
+  on any OS such as `aux`, `con`, `com1` or `nul.x`, a control, bidirectional or
+  invisible formatting character, or more than 160 bytes) can no longer be reached.
+  Every operation on it returns `InvalidDictionaryName`, `load_dictionary` fails the
+  pipeline run that uses it, and `list_dictionaries` leaves it out with a warning.
+  Nothing is deleted. To recover one, stop everything that uses the database, rename
+  `<aspect>/dictionaries/<name>.db`, and the `<name>.db-log` and `<name>.db-wal` files
+  beside it if present, to a valid name, then set that name in the `name` column of the
+  dictionary's `dictionary_metadata` rows, in the `dictionary_name` column of the
+  `pipeline_dictionaries` rows in the aspect's `pipeline.db`, and in the pipeline
+  configuration (`PipelineRunConfig`, `PipelineBuilder`) that names it.
 - **API callers can no longer make backup retention delete the daemon's snapshots.**
   `WEFT_BACKUP_KEEP` retention keeps the newest `backup-<digits>` directories by their
   embedded timestamp, and `POST /api/v1/storage/backup` created directories in that same

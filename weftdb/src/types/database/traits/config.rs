@@ -34,9 +34,22 @@ pub trait Config {
 
 	fn aspect_dictionaries_path(db_name: &str, subject_name: &str, aspect_name: &str) -> String;
 
-	fn aspect_dictionaries_db_path(db_name: &str, subject_name: &str, aspect_name: &str, dictionary_name: &str) -> String;
+	/// The database of the aspect's dictionary `dictionary_name`:
+	/// `<aspect>/dictionaries/<dictionary_name>.db`.
+	///
+	/// # Errors
+	///
+	/// An [`InvalidDictionaryName`](crate::InvalidDictionaryName) when `dictionary_name`
+	/// fails [`dictionary_name::validate`](crate::dictionary_name::validate), such as `../x`
+	/// or `/tmp/x`: such a name is never turned into a path.
+	fn aspect_dictionaries_db_path(db_name: &str, subject_name: &str, aspect_name: &str, dictionary_name: &str) -> Result<String>;
 
-	fn dictionary_path(db_name: &str, subject_name: &str, aspect_name: &str, dictionary_name: &str) -> String;
+	/// The same path as [`aspect_dictionaries_db_path`](Self::aspect_dictionaries_db_path).
+	///
+	/// # Errors
+	///
+	/// As `aspect_dictionaries_db_path`.
+	fn dictionary_path(db_name: &str, subject_name: &str, aspect_name: &str, dictionary_name: &str) -> Result<String>;
 
 	async fn db_name(metadata_conn: &Connection) -> Result<String>;
 

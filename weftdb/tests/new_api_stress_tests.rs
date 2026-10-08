@@ -9,11 +9,13 @@ use tokio::{sync::Semaphore, time::timeout};
 use uuid::Uuid;
 use weftdb::{database::traits::DatabaseStructure, Database, DatasetId, InputMeasurement, Outputs};
 
+mod common;
+
 #[tokio::test]
 async fn test_multiple_aspects_same_subject() {
 	let db_name = format!("stress_multi_aspects_{}", Uuid::new_v4());
 
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 
 	let db = Database::new(&db_name).await.expect("Failed to create database");
 	let subject = db.observe_subject("multi_aspect_subject").await.expect("Failed to add subject");
@@ -45,7 +47,7 @@ async fn test_multiple_aspects_same_subject() {
 		assert!(!result.value.to_string().is_empty());
 	}
 
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 }
 
 #[tokio::test]
@@ -53,7 +55,7 @@ async fn test_high_frequency_measurements() {
 	let db_name = format!("stress_high_freq_{}", Uuid::new_v4());
 
 	// Clean up any existing test data
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 
 	let db = Database::new(&db_name).await.expect("Failed to create database");
 	let subject = db.observe_subject("high_freq_subject").await.expect("Failed to add subject");
@@ -91,7 +93,7 @@ async fn test_high_frequency_measurements() {
 	assert!(!result.value.to_string().is_empty());
 
 	// Clean up
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 }
 
 #[tokio::test]
@@ -109,7 +111,7 @@ async fn test_concurrent_access() {
 	let db_name = format!("stress_concurrent_{}", Uuid::new_v4());
 
 	// Clean up any existing test data
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 
 	let db = Database::new(&db_name).await.expect("Failed to create database");
 	let subject = db.observe_subject("concurrent_subject").await.expect("Failed to add subject");
@@ -176,7 +178,7 @@ async fn test_concurrent_access() {
 	println!("Completed {} concurrent operations in {:?} ({:.2} ops/sec)", total_operations, duration, total_operations as f64 / duration.as_secs_f64());
 
 	// Clean up
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 }
 
 #[tokio::test]
@@ -194,7 +196,7 @@ async fn test_large_dataset_analysis() {
 	let db_name = format!("stress_large_{}", Uuid::new_v4());
 
 	// Clean up any existing test data
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 
 	let db = Database::new(&db_name).await.expect("Failed to create database");
 	let subject = db.observe_subject("large_dataset_subject").await.expect("Failed to add subject");
@@ -243,7 +245,7 @@ async fn test_large_dataset_analysis() {
 	}
 
 	// Clean up
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 }
 
 #[tokio::test]
@@ -251,7 +253,7 @@ async fn test_memory_usage_stability() {
 	let db_name = format!("stress_memory_{}", Uuid::new_v4());
 
 	// Clean up any existing test data
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 
 	let db = Database::new(&db_name).await.expect("Failed to create database");
 	let subject = db.observe_subject("memory_test_subject").await.expect("Failed to add subject");
@@ -293,7 +295,7 @@ async fn test_memory_usage_stability() {
 	println!("Memory stability test completed successfully");
 
 	// Clean up
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 }
 
 #[tokio::test]
@@ -301,7 +303,7 @@ async fn test_edge_case_scenarios() {
 	let db_name = format!("stress_edge_{}", Uuid::new_v4());
 
 	// Clean up any existing test data
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 
 	let db = Database::new(&db_name).await.expect("Failed to create database");
 	let subject = db.observe_subject("edge_case_subject").await.expect("Failed to add subject");
@@ -368,5 +370,5 @@ async fn test_edge_case_scenarios() {
 	println!("Edge case scenarios completed successfully");
 
 	// Clean up
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 }
