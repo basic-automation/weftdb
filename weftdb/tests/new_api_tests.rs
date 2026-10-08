@@ -492,6 +492,96 @@ async fn test_dictionary_writes_report_a_write_write_conflict() {
 	common::remove_database(&db_name);
 }
 
+/// `register_dictionary_if_absent`, which `weft_orchestration::load_dictionary` registers a
+/// pipeline's dictionaries with, checks for a complete registration inside its own write.
+/// `load_dictionary` used `set_dictionary_metadata`, which replaces: a registration
+/// committed between its read and its write (an explicit one with tuned constraints, say)
+/// was deleted and overwritten with the pipeline's.
+#[tokio::test]
+async fn test_register_dictionary_if_absent_keeps_a_complete_registration() {
+	let db_name = format!("test_dictionary_if_absent_{}", Uuid::new_v4());
+	common::remove_database(&db_name);
+
+	let db = Database::new(&db_name).await.expect("Failed to create database");
+	let subject = db.observe_subject("dictionary_subject").await.expect("Failed to add subject");
+	let aspect = db.track_aspect(&subject.id(), "pressure", &Resolution::Seconds, None).await.expect("Failed to track aspect");
+	let pipeline = |description: &str, count: usize| DictionaryMetadata { id: DictionaryId::new(), name: "pipeline".to_string(), description: description.to_string(), constraints: DictionaryConstraints::new(Some(Steps::new(count, Spline::Linear)), None) };
+	let stored = |db: &Database| {
+		let aspect_id = aspect.id();
+		let db = db.clone();
+		async move { db.get_dictionary_metadata(&aspect_id, "pipeline").await.expect("Failed to load dictionary metadata").expect("registered") }
+	};
+
+	// Absent, even its file: registered.
+	let first = pipeline("first", 10);
+	assert!(db.register_dictionary_if_absent(&aspect.id(), "pipeline", &first).await.expect("Failed to register"));
+	assert_eq!(stored(&db).await.id, first.id);
+
+	// Present: kept, whatever the new one says.
+	assert!(!db.register_dictionary_if_absent(&aspect.id(), "pipeline", &pipeline("second", 20)).await.expect("Failed to register"));
+	assert_eq!(stored(&db).await.id, first.id);
+
+	// An explicit registration committed after a loader found none is kept too.
+	let explicit = pipeline("tuned", 64);
+	db.set_dictionary_metadata(&aspect.id(), "pipeline", &explicit).await.expect("Failed to set dictionary metadata");
+	assert!(!db.register_dictionary_if_absent(&aspect.id(), "pipeline", &pipeline("from the pipeline", 10)).await.expect("Failed to register"));
+	let kept = stored(&db).await;
+	assert_eq!((kept.id, kept.description.as_str(), kept.constraints.steps().as_ref().map(Steps::count)), (explicit.id, "tuned", Some(64)));
+	assert_eq!(dictionary_rows(&db, &aspect.id(), "pipeline", "dictionary_metadata").await, 1);
+
+	// One that cannot be read counts as present, and is left as it is.
+	set_stored_interpolation(&db, &aspect.id(), "pipeline", "Linear", "Polynomial(degree: 9, bounds_factor: None)").await;
+	assert!(!db.register_dictionary_if_absent(&aspect.id(), "pipeline", &pipeline("over the unreadable one", 10)).await.expect("Failed to register"));
+	set_stored_interpolation(&db, &aspect.id(), "pipeline", "Polynomial(degree: 9, bounds_factor: None)", "Linear").await;
+
+	// Only rows without constraints, as earlier releases wrote: registered over them.
+	aspect.new_dictionary("legacy", "pipeline", &DictionaryConstraints::default()).await.expect("Failed to create dictionary");
+	{
+		let dictionary_db = db.get_dictionary_db(&aspect.id(), "legacy").await.expect("Failed to open dictionary database");
+		let conn = dictionary_db.connect().expect("Failed to connect to dictionary database");
+		conn.execute("DELETE FROM dictionary_constraints", ()).await.expect("Failed to delete the constraints");
+		conn.execute("INSERT INTO dictionary_metadata (id, name, description, created_at) VALUES (?, 'legacy', 'pipeline', 0)", turso::params![Uuid::new_v4().to_string()]).await.expect("Failed to insert an old metadata row");
+	}
+	let healed = DictionaryMetadata { name: "legacy".to_string(), ..pipeline("healed", 8) };
+	assert!(db.register_dictionary_if_absent(&aspect.id(), "legacy", &healed).await.expect("Failed to register"));
+	assert_eq!(dictionary_rows(&db, &aspect.id(), "legacy", "dictionary_metadata").await, 1);
+	assert_eq!(db.get_dictionary_metadata(&aspect.id(), "legacy").await.expect("Failed to load dictionary metadata").expect("registered").id, healed.id);
+
+	common::remove_database(&db_name);
+}
+
+/// Two loads healing the same legacy rows both delete them, and the second loses a
+/// write-write conflict. `register_dictionary_if_absent` tries once more and, if the
+/// conflict persists, reports it as transient; it writes nothing either way.
+#[tokio::test]
+async fn test_register_dictionary_if_absent_reports_a_persistent_conflict() {
+	let db_name = format!("test_dictionary_if_absent_conflict_{}", Uuid::new_v4());
+	common::remove_database(&db_name);
+
+	let db = Database::new(&db_name).await.expect("Failed to create database");
+	let subject = db.observe_subject("dictionary_subject").await.expect("Failed to add subject");
+	let aspect = db.track_aspect(&subject.id(), "pressure", &Resolution::Seconds, None).await.expect("Failed to track aspect");
+	aspect.new_dictionary("healing", "pipeline", &DictionaryConstraints::default()).await.expect("Failed to create dictionary");
+	let dictionary_db = db.get_dictionary_db(&aspect.id(), "healing").await.expect("Failed to open dictionary database");
+	let conn = dictionary_db.connect().expect("Failed to connect to dictionary database");
+	conn.execute("DELETE FROM dictionary_constraints", ()).await.expect("Failed to delete the constraints");
+
+	// Another healer has deleted the old row and not committed yet.
+	conn.execute("BEGIN CONCURRENT", ()).await.expect("Failed to begin the holder's transaction");
+	conn.execute("DELETE FROM dictionary_metadata WHERE name = 'healing'", ()).await.expect("Failed to delete in the holder's transaction");
+	let metadata = DictionaryMetadata { id: DictionaryId::new(), name: "healing".to_string(), description: "healed".to_string(), constraints: DictionaryConstraints::default() };
+	let err = db.register_dictionary_if_absent(&aspect.id(), "healing", &metadata).await.expect_err("both attempts conflict");
+	assert_write_write_conflict(&err);
+	assert!(err.to_string().starts_with("Failed to register dictionary 'healing': "), "{err}");
+
+	conn.execute("ROLLBACK", ()).await.expect("Failed to roll back the holder's transaction");
+	assert!(db.get_dictionary_metadata(&aspect.id(), "healing").await.expect("Failed to load dictionary metadata").is_none(), "nothing was written");
+	assert!(db.register_dictionary_if_absent(&aspect.id(), "healing", &metadata).await.expect("Failed to register"));
+	assert_eq!(dictionary_rows(&db, &aspect.id(), "healing", "dictionary_metadata").await, 1);
+
+	common::remove_database(&db_name);
+}
+
 /// Databases written before `set_dictionary_metadata` replaced registrations hold a metadata
 /// row (with no constraints) for every `load_dictionary` of a pipeline dictionary, beside
 /// any complete registration. The read picks the newest complete one; a name with only

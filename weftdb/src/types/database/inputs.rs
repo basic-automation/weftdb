@@ -1,7 +1,9 @@
+use std::future::Future;
+
 use anyhow::Result;
 
 use crate::{
-	cache::Connection, database::traits::{AspectStructure, Inputs}, types::{
+	cache::Connection, database::traits::{AspectStructure, Inputs}, error::is_transient_mvcc_error, types::{
 		database::{
 			helpers::safe_usize_to_f64, traits::{config::Config, connection::Connection as ConnectionTrait, DatabaseStructure}
 		}, TxId
@@ -1062,6 +1064,11 @@ impl Inputs for Database {
 		Ok(tx_id)
 	}
 
+	async fn register_dictionary_if_absent(&self, aspect_id: &AspectId, dictionary_name: &str, metadata: &DictionaryMetadata) -> Result<bool> {
+		Self::check_dictionary_constraints(dictionary_name, &metadata.constraints)?;
+		retry_once_if_transient(dictionary_name, || self.register_dictionary_if_absent_once(aspect_id, dictionary_name, metadata)).await
+	}
+
 	/// insert pattern into dictionary for a given aspect
 	async fn insert_pattern_into_dictionary(&self, aspect_id: &AspectId, dictionary_name: &str, pattern: &Pattern) -> Result<TxId> {
 		let tx_id = TxId::new();
@@ -1783,6 +1790,50 @@ impl Database {
 		Ok(())
 	}
 
+	/// One attempt of [`register_dictionary_if_absent`](Inputs::register_dictionary_if_absent).
+	async fn register_dictionary_if_absent_once(&self, aspect_id: &AspectId, dictionary_name: &str, metadata: &DictionaryMetadata) -> Result<bool> {
+		let aspect = self.get_aspect(aspect_id).await?;
+		let db_path = Self::aspect_dictionaries_db_path(self.name.as_str(), aspect.subject_name(), aspect.name(), dictionary_name)?;
+		let (db, _was_new) = Self::get_or_create_turso_database(&db_path).await?;
+		Aspect::ensure_dictionary_tables(&db).await?;
+		let conn = Self::begin_concurrent(&db, &self.name, Some(self.cache.clone())).await?;
+
+		// Check again in this transaction: a registration committed since the caller read
+		// none is kept. Only rows without constraints are replaced.
+		let registered = match Self::has_complete_registration(&conn, dictionary_name).await {
+			Ok(true) => Ok(false),
+			Ok(false) => Self::replace_dictionary_registration(&conn, &metadata.id, dictionary_name, &metadata.description, &metadata.constraints).await.map(|()| true),
+			Err(e) => Err(e),
+		};
+		let registered = match registered {
+			Ok(registered) => registered,
+			Err(e) => {
+				Self::rollback_after_error(&conn).await;
+				let message = format!("Failed to register dictionary '{dictionary_name}': {e}");
+				return Err(e.context(message));
+			}
+		};
+		Self::commit_concurrent(&conn).await?;
+		if registered {
+			self.cache.lock().await.invalidate_generation(&Self::dictionary_metadata_cache_key(aspect_id, dictionary_name)).await;
+			let log = format!("Registered dictionary '{dictionary_name}' for aspect {aspect_id}");
+			let _ = self.record_transaction(&log).await?;
+		}
+		Ok(registered)
+	}
+
+	/// Whether `name` has a complete registration, a `dictionary_metadata` row with a
+	/// `dictionary_constraints` row, on `conn`, a transaction on the dictionary's database.
+	/// Whether its stored values parse does not matter here.
+	///
+	/// # Errors
+	///
+	/// A failed query.
+	pub(crate) async fn has_complete_registration(conn: &Connection, name: &str) -> Result<bool> {
+		let mut rows = conn.as_ref().query("SELECT 1 FROM dictionary_metadata m JOIN dictionary_constraints c ON c.dictionary_id = m.id WHERE m.name = ? LIMIT 1", turso::params![name]).await?;
+		Ok(rows.next().await?.is_some())
+	}
+
 	/// Write `name`'s registration on `conn`, a `BEGIN CONCURRENT` transaction on the
 	/// dictionary's database that the caller commits, or rolls back on an error.
 	///
@@ -1819,5 +1870,72 @@ impl Database {
 			conn.as_ref().execute("INSERT INTO dictionary_variabilities (dictionary_id, variability_type, variability_value) VALUES (?, ?, ?)", turso::params![id.as_str(), variability.kind(), variability.variability().value().to_string()]).await?;
 		}
 		Ok(())
+	}
+}
+
+/// Run `attempt`, and once more if it fails with a transient MVCC error
+/// ([`is_transient_mvcc_error`]): a write-write conflict or a stale snapshot, after which
+/// the transaction is gone and a new one can succeed. The second attempt's result is
+/// returned as it is.
+async fn retry_once_if_transient<T, F, Fut>(dictionary_name: &str, mut attempt: F) -> Result<T>
+where
+	F: FnMut() -> Fut + Send,
+	Fut: Future<Output = Result<T>> + Send,
+	T: Send,
+{
+	match attempt().await {
+		Err(e) if is_transient_mvcc_error(&e) => {
+			tracing::debug!(error = %e, dictionary = dictionary_name, "Registering the dictionary conflicted with another write; trying once more");
+			attempt().await
+		}
+		result => result,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::sync::atomic::{AtomicUsize, Ordering};
+
+	use super::*;
+
+	fn conflict() -> anyhow::Error {
+		anyhow::Error::new(turso::Error::Error("Write-write conflict".to_string())).context("Failed to register dictionary 'd': Write-write conflict")
+	}
+
+	#[tokio::test]
+	async fn a_transient_failure_is_tried_once_more() {
+		let attempts = AtomicUsize::new(0);
+		let result = retry_once_if_transient("d", || async {
+			if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+				Err(conflict())
+			} else {
+				Ok(true)
+			}
+		})
+		.await;
+		assert!(result.expect("the second attempt succeeds"));
+		assert_eq!(attempts.load(Ordering::SeqCst), 2);
+	}
+
+	#[tokio::test]
+	async fn only_once_and_only_for_a_transient_failure() {
+		let attempts = AtomicUsize::new(0);
+		let err = retry_once_if_transient("d", || async {
+			attempts.fetch_add(1, Ordering::SeqCst);
+			Err::<bool, _>(conflict())
+		})
+		.await
+		.expect_err("still conflicting");
+		assert!(is_transient_mvcc_error(&err), "the second conflict is returned: {err:#}");
+		assert_eq!(attempts.load(Ordering::SeqCst), 2, "tried twice, not more");
+
+		let attempts = AtomicUsize::new(0);
+		retry_once_if_transient("d", || async {
+			attempts.fetch_add(1, Ordering::SeqCst);
+			Err::<bool, _>(anyhow::anyhow!("no such table: dictionary_metadata"))
+		})
+		.await
+		.expect_err("not transient");
+		assert_eq!(attempts.load(Ordering::SeqCst), 1, "a failure that is not transient is not retried");
 	}
 }

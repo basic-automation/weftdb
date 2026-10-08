@@ -75,7 +75,8 @@ pub trait Outputs {
 	///
 	/// A registration that was read is cached for up to ten minutes, per `Database`
 	/// handle. [`set_dictionary_metadata`](crate::database::traits::Inputs::set_dictionary_metadata)
-	/// on the same handle invalidates it, and a read that overlapped that write does not
+	/// and [`register_dictionary_if_absent`](crate::database::traits::Inputs::register_dictionary_if_absent)
+	/// on the same handle invalidate it, and a read that overlapped such a write does not
 	/// cache what it read. A registration written any other way, through
 	/// [`AspectStructure::new_dictionary`](crate::database::traits::AspectStructure::new_dictionary),
 	/// another handle or another process, can be answered from the cache until the entry

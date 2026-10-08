@@ -889,21 +889,28 @@ pub async fn build_patterns_queue(database: &Database, aspect_id: &weftdb::Aspec
 ///
 /// Returns an error if:
 /// - Database operations fail (getting patterns, dequeuing patterns)
+/// - The dictionary's name cannot name its database file
+///   ([`weftdb::InvalidDictionaryName`])
 /// - The dictionary is not registered yet and registering it fails, e.g. because its step
 ///   interpolation is one splimes rejects
 /// - Pattern import fails during dictionary loading
 /// - Memory calculation fails
 pub async fn load_dictionary(database: &Database, aspect_id: &weftdb::AspectId, dictionary: &mut Dictionary) -> Result<()> {
 	// Register the dictionary (its description, steps and variabilities) the first time the
-	// aspect sees it. A registration that exists but cannot be read, such as a stored step
-	// method splimes rejects, is reported and left for the user to repair: overwriting it
-	// would lose what was stored, and this dictionary still works from its own constraints.
+	// aspect sees it. `register_dictionary_if_absent` checks again inside its write, so a
+	// registration committed after this read (an explicit `set_dictionary_metadata` with
+	// tuned constraints, say) is kept rather than overwritten with this pipeline's own. A
+	// registration that exists but cannot be read, such as a stored step method splimes
+	// rejects, is reported and left for the user to repair: overwriting it would lose what
+	// was stored, and this dictionary still works from its own constraints.
 	match database.get_dictionary_metadata(aspect_id, dictionary.name()).await {
 		Ok(Some(_)) => {}
 		Ok(None) => {
 			let metadata = weftdb::DictionaryMetadata { id: *dictionary.id(), name: dictionary.name().to_string(), description: dictionary.description().to_string(), constraints: dictionary.constraints().clone() };
-			database.set_dictionary_metadata(aspect_id, dictionary.name(), &metadata).await?;
+			database.register_dictionary_if_absent(aspect_id, dictionary.name(), &metadata).await?;
 		}
+		// A name that cannot name a file has no registration to leave alone.
+		Err(e) if e.downcast_ref::<weftdb::InvalidDictionaryName>().is_some() => return Err(e),
 		Err(e) => {
 			tracing::warn!(error = %e, dictionary = dictionary.name(), "Failed to read dictionary metadata; leaving the stored registration as it is");
 		}
@@ -2735,6 +2742,62 @@ mod tests {
 
 		let listed = db.list_dictionaries(&aspect.id()).await?;
 		assert_eq!(listed.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["pipeline"]);
+
+		remove_database(&db_name);
+		Ok(())
+	}
+
+	/// The stored registration's `steps_interpolation` and its number of metadata rows.
+	async fn stored_registration(db: &Database, aspect_id: &AspectId, dictionary: &str) -> Result<(String, i64)> {
+		let conn = db.get_dictionary_db(aspect_id, dictionary).await?.connect()?;
+		let mut rows = conn.query("SELECT steps_interpolation FROM dictionary_constraints", ()).await?;
+		let interpolation = rows.next().await?.expect("a constraints row").get_value(0)?.as_text().expect("text").clone();
+		drop(rows);
+		let mut rows = conn.query("SELECT COUNT(*) FROM dictionary_metadata", ()).await?;
+		let count = *rows.next().await?.expect("a count").get_value(0)?.as_integer().expect("an integer count");
+		Ok((interpolation, count))
+	}
+
+	/// A registration that cannot be read, such as a stored step method splimes rejects, is
+	/// left alone: `load_dictionary` logs the error and goes on with its own constraints
+	/// instead of registering the dictionary again over what was stored.
+	#[tokio::test]
+	async fn load_dictionary_leaves_an_unreadable_registration_alone() -> Result<()> {
+		let db_name = format!("load_dictionary_unreadable_{}", uuid::Uuid::new_v4());
+		remove_database(&db_name);
+		let db = Database::new(&db_name).await?;
+		let subject = db.observe_subject("subject").await?;
+		let aspect = db.track_aspect(&subject.id(), "aspect", &Resolution::Seconds, None).await?;
+		let constraints = DictionaryConstraints::new(Some(Steps::new(10, Spline::Polynomial(8, None))), None);
+		let mut dictionary = Dictionary::new("pipeline".to_string(), "a pipeline dictionary".to_string(), constraints);
+		load_dictionary(&db, &aspect.id(), &mut dictionary).await?;
+
+		let degree_9 = "Polynomial(degree: 9, bounds_factor: None)";
+		let conn = db.get_dictionary_db(&aspect.id(), "pipeline").await?.connect()?;
+		assert_eq!(conn.execute(format!("UPDATE dictionary_constraints SET steps_interpolation = '{degree_9}'"), ()).await?, 1);
+		assert!(db.get_dictionary_metadata(&aspect.id(), "pipeline").await.is_err(), "the stored degree 9 does not load");
+
+		load_dictionary(&db, &aspect.id(), &mut dictionary).await?;
+		assert_eq!(stored_registration(&db, &aspect.id(), "pipeline").await?, (degree_9.to_string(), 1), "the stored registration is unchanged");
+
+		remove_database(&db_name);
+		Ok(())
+	}
+
+	/// A dictionary whose name cannot name its database file is an error, not a
+	/// registration it reads as unreadable and leaves alone.
+	#[tokio::test]
+	async fn load_dictionary_refuses_an_invalid_name() -> Result<()> {
+		let db_name = format!("load_dictionary_invalid_{}", uuid::Uuid::new_v4());
+		remove_database(&db_name);
+		let db = Database::new(&db_name).await?;
+		let subject = db.observe_subject("subject").await?;
+		let aspect = db.track_aspect(&subject.id(), "aspect", &Resolution::Seconds, None).await?;
+		let mut dictionary = Dictionary::new("../escape".to_string(), "outside".to_string(), DictionaryConstraints::default());
+
+		let err = load_dictionary(&db, &aspect.id(), &mut dictionary).await.expect_err("an invalid name");
+		assert_eq!(err.downcast_ref::<weftdb::InvalidDictionaryName>().map(weftdb::InvalidDictionaryName::name), Some("../escape"));
+		assert!(!data_dir().join(&db_name).join("subject").join("aspect").join("escape.db").exists());
 
 		remove_database(&db_name);
 		Ok(())

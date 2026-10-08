@@ -47,6 +47,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   Contributions are licensed `MIT OR Apache-2.0`. See
   [`CONTRIBUTING.md`](CONTRIBUTING.md#contribution-terms).
 
+- **`Inputs::register_dictionary_if_absent`** registers a dictionary as
+  `set_dictionary_metadata` does unless a complete registration of that name exists,
+  checking inside its own write transaction, and returns whether it registered it. A
+  registration that cannot be read counts as existing and is left alone, and a write
+  that loses an MVCC conflict is tried once more. Two writers registering the same new
+  dictionary at the same moment can still both write one; reads pick the newest.
+
 ### Changed
 
 - **`splimes` moved to its own repository** ([basic-automation/splimes](https://github.com/basic-automation/splimes))
@@ -225,7 +232,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   registration and replaces any earlier one of that name, since the tables cannot carry
   a unique constraint; `AspectStructure::new_dictionary` writes the same way, so creating
   a dictionary twice no longer leaves two. `load_dictionary` registers a dictionary only
-  when none is registered, under the `Dictionary`'s own id: `get_dictionary_metadata`
+  when none is registered, under the `Dictionary`'s own id, through the new
+  `Inputs::register_dictionary_if_absent`: it checks again inside its write, so a
+  registration committed after `load_dictionary` read none (an explicit
+  `set_dictionary_metadata` with tuned constraints, say) is kept instead of replaced
+  with the pipeline's, and a write that loses an MVCC conflict to another load healing
+  the same rows is tried once more. A dictionary name that cannot name a file is an
+  error from `load_dictionary`. `get_dictionary_metadata`
   now answers `Ok(None)` for a dictionary with no database yet (it was an error,
   `Dictionary '…' does not exist for aspect '…'`), and a registration it cannot read
   is left alone instead of registered again. Of several rows for one name,
