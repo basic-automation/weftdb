@@ -8,8 +8,81 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-08
+
+First public release, and the baseline that later releases' upgrade, rollback and
+compatibility checks run against. WeftDB is pre-beta: the API will change, and the
+version number says so. This release ships as pre-built binaries on the GitHub release
+only; the library crates are not published to crates.io (build them from the `v0.1.0`
+tag).
+
+The Changed, Fixed and Security entries are for anyone who built WeftDB from source
+before this release. A bare "0.1" in them means splimes 0.1.
+
+### Known limitations
+
+- **Pre-beta.** The HTTP API, the Rust API, the configuration and the on-disk format can
+  change in any 0.x release. Nothing is covered by a stability promise before 1.0.
+- **No authentication, authorization or TLS.** `weft-server` serves an unauthenticated,
+  plain-HTTP API; see
+  [`SECURITY.md`](https://github.com/basic-automation/weftdb/blob/v0.1.0/SECURITY.md).
+  Do not expose it to an untrusted network: keep the default loopback bind, or put it
+  behind something that terminates TLS and authenticates callers.
+- **Crash consistency is incomplete.** A `2xx` from a storage ingest survives a crash of
+  the `weft-server` process, but not necessarily a power loss or an operating-system
+  crash: the index commit is fsynced, the segment frame it points at is not.
+  Maintenance (reconcile, split, squash, compaction) still rewrites committed frames in
+  place, so a crash during a rewrite can tear one. And two seals into one aspect at the
+  same moment can be given the same segment id, so that one replaces the other.
+  [`docs/design/crash-consistency.md`](https://github.com/basic-automation/weftdb/blob/v0.1.0/docs/design/crash-consistency.md)
+  lists the 43 verified windows; the durability work that follows this release closes
+  them.
+- **The next release changes the store layout.** It moves a store to layout v2, in
+  place, and the upgrade is one-way: once a newer release has written to a store, do not
+  run v0.1.0 on it again. Before upgrading, stop `weft-server` and copy the whole store
+  directory; `POST /api/v1/storage/backup` copies only the control plane, not the
+  segment frames.
+- **The Linux binaries need glibc 2.34 or newer, and `weft-tui` needs 2.39 or newer.**
+  They are built on Ubuntu 24.04. Ubuntu 22.04, Debian 12 and RHEL 9 run `weft-server`
+  and `weft-bench` but not `weft-tui`; on an older glibc, build from source.
+- **The macOS and Windows binaries are not signed.** Gatekeeper and SmartScreen warn
+  before running them. Check each archive against `SHA256SUMS` instead.
+- **The codec features are off in the release binaries.** None of them is built with
+  `bitsliced-codec`, so they never write the bit-sliced value codec
+  (`WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` is ignored, with a warning) and cannot read a
+  segment written with it; for a store that has such segments, build `weft-server` from
+  source with `--features bitsliced-codec`. `experimental-codecs` is compiled into
+  `weft-bench` only, for its advisory size estimates; nothing writes those codecs to
+  disk.
+
 ### Added
 
+- **Interpolation as a first-class query.** Ask for any resolution and get back a
+  continuous series, reconstructed with the spline method you choose (linear,
+  quadratic, cubic, polynomial), computed on SIMD/parallel CPU or GPU (`wgpu`).
+- **Provenance labelling.** Every returned point is marked `raw`, `interpolated` or
+  `extrapolated`, so a synthetic value is never silently mistaken for an observed one.
+- **Declared precision.** Values are logically `BigDecimal`. Each aspect declares a
+  physical encoding (`F64`, `F32`, `ScaledI64`, `ScaledI128`, `Decimal128`,
+  `BigDecimalText`) and an error bound; a value the encoding cannot represent within
+  that bound is rejected rather than quietly rounded.
+- **Typed columnar segment store** (`.weftseg`) on the measurement hot path, with
+  bit-packing and delta-of-delta timestamp coding (an opt-in bit-sliced value codec sits
+  behind the `bitsliced-codec` feature; see Changed), over a Turso (libSQL) control
+  plane for catalog, metadata and the segment index.
+- **Downsampling** with mergeable partial reductions (`.weftpart` sidecars), including
+  time-weighted averages, over an epoch-aligned bucket grid.
+- **Apache Arrow interchange** — sealed segments to `RecordBatch` and back, plus Arrow
+  IPC and Parquet bytes.
+- **HTTP API** (`weft-server`) covering health/readiness, ingest, query, interpolation,
+  storage management, backup/restore and a restore drill, with OpenTelemetry tracing.
+- **Terminal UI** (`weft-tui`) for exploring and administering an instance.
+- **Weft-Bench** (`weft-bench`), a reproducible, correctness-gated benchmark harness.
+- **Analytics pipeline** (`weft-orchestration`) chaining batching, pattern extraction,
+  event detection, correlation and signal generation.
+- Pre-built `weft-server`, `weft-tui` and `weft-bench` archives for Linux (x86_64 and
+  aarch64), macOS (x86_64 and arm64) and Windows (x86_64), with a `SHA256SUMS` file,
+  attached to the GitHub release.
 - **Interpolation grids requested over HTTP are capped** at 10,000,000 points per
   request by default (`weft_server::MAX_INTERPOLATE_OUTPUT_POINTS`), on every
   `/api/v1/interpolate*` endpoint; set `WEFT_MAX_INTERPOLATE_POINTS` to change it. The
@@ -41,12 +114,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   source.
 - **Contribution terms.** Every pull request takes one of two routes, the contributor's
   choice: a DCO sign-off (`git commit -s`) on every commit, or the WeftDB Individual
-  Contributor License Agreement ([`CLA.md`](CLA.md), version 1, adapted from the Apache
-  Software Foundation's ICLA with Justin Icenhour as the recipient), signed once by a pull
-  request comment. The `contribution-terms` check passes a pull request when either holds.
+  Contributor License Agreement
+  ([`CLA.md`](https://github.com/basic-automation/weftdb/blob/v0.1.0/CLA.md), version 1,
+  adapted from the Apache Software Foundation's ICLA with Justin Icenhour as the
+  recipient), signed once by a pull request comment. The `contribution-terms` check passes a pull request when either holds.
   Contributions are licensed `MIT OR Apache-2.0`. See
-  [`CONTRIBUTING.md`](CONTRIBUTING.md#contribution-terms).
-
+  [`CONTRIBUTING.md`](https://github.com/basic-automation/weftdb/blob/v0.1.0/CONTRIBUTING.md#contribution-terms).
 - **`Inputs::register_dictionary_if_absent`** registers a dictionary as
   `set_dictionary_metadata` does unless a complete registration of that name exists,
   checking inside its own write transaction, and returns whether it registered it. A
@@ -58,6 +131,15 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Changed
 
+- **Crates renamed for publication.** The core crate is now `weftdb` (was `database`,
+  a name already taken on crates.io) and the pipeline crate is `weft-orchestration`
+  (was `database_orchestration`). Import paths change accordingly:
+  `use database::…` becomes `use weftdb::…`, and `use database_orchestration::…`
+  becomes `use weft_orchestration::…`.
+- **The workspace builds on stable Rust** (MSRV 1.95). The
+  `#![feature(stmt_expr_attributes)]` gate is gone, so nightly is no longer required to
+  build, test or depend on any crate. Only `cargo fmt` still uses nightly, because
+  `rustfmt.toml` sets nightly-only options.
 - **`splimes` moved to its own repository** ([basic-automation/splimes](https://github.com/basic-automation/splimes))
   and is now a crates.io dependency. It is released on its own schedule, and a stable
   WeftDB waits on a stable splimes.
@@ -162,6 +244,17 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   beyond `f64`'s range and an oversized grid are `400`s too; any other engine error
   (a GPU failure, a panicked blocking task) stays a `500`, as every engine error was
   before.
+- **Store-wide maintenance carries on past a failing aspect.** Every store-wide sweep
+  (reconcile, overlap merge, squash and compaction, from the background daemon or
+  `POST /api/v1/storage/reconcile`) stopped at the first aspect whose pass failed, on a
+  torn or truncated frame for example, and so never maintained the aspects after it in
+  name order. Each aspect's failure is now its own: the endpoint answers `200` and lists
+  the aspects that failed in `failed: [{aspect, error}]` (it answered `500`), the daemon
+  logs one `WARN` line per failed aspect, and both count them in
+  `weft_reconcile_failed_passes_total`. Only an unreadable aspect list is still a `500`.
+  For Rust callers, `ReconcileSweep`, `HotColdSweep`, `OverlapSweep` and `SquashSweep`
+  gain `failed: Vec<(String, anyhow::Error)>` and are no longer `Copy`, `Clone`,
+  `PartialEq` or `Eq`.
 - **Turso control plane upgraded 0.6 → 0.8.** ⚠️ This is one-way: once 0.8 writes a
   store, its MVCC log is v3 and an older WeftDB can no longer open it. Back up the
   control plane before upgrading.
@@ -169,11 +262,10 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   written by older versions are ignored: the segment is decoded instead, and the
   sidecar is rebuilt on the next seal. No data migration is needed.
 - `weft-bench --spline poly:N` rejects a degree outside 1–8 when the arguments are
-  parsed, naming the limit. 0.1.0 accepted any degree, and with splimes 1.0 such a run
-  would only have failed once the engine rejected it.
+  parsed, naming the limit. It accepted any degree before, and with splimes 1.0 such a
+  run would only have failed once the engine rejected it.
 - All dependencies updated to their latest major versions, including wgpu 30,
   Arrow/Parquet 60 and OpenTelemetry 0.33.
-- Builds on stable Rust (MSRV 1.95); nightly is no longer required.
 - **Advisory codecs moved behind the `experimental-codecs` feature** (`weft-physical-type`).
   ⚠️ Breaking for code that calls them: the `floatcodec` module (Gorilla-XOR, Chimp,
   Chimp128, Elf and `best_f64_*`), `ColumnEncoding::{gorilla_f64_bytes, best_f64_bytes,
@@ -207,6 +299,14 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Fixed
 
+- **A restart lost a legacy database's committed metadata.** The first open of a
+  legacy (rows-mode) database in a process deleted its Turso MVCC log, `<file>.db-log`.
+  Under MVCC that log holds every committed transaction until a checkpoint copies it
+  into the main file, and WeftDB's checkpoints do not run under MVCC, so for
+  `metadata.db` it was usually the only copy: every commit made before a restart (the
+  database row, subjects, aspects, the unbatched queue) was lost, and
+  `Database::existing` then failed with `no such table: database`. A non-empty log is
+  now kept, and Turso replays it at open; only an empty one is removed.
 - **Interpolation responses report the method that ran.** `spline` in the
   `/api/v1/interpolate` and `/api/v1/interpolate/ilp` JSON responses and in the point
   query is documented as the method actually used, but echoed the requested one. With
@@ -245,7 +345,7 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `Dictionary '…' does not exist for aspect '…'`), and a registration it cannot read
   is left alone instead of registered again. Of several rows for one name,
   `get_dictionary_metadata` reads the newest that has constraints (it read whichever
-  came first), so a dictionary an earlier release registered from a pipeline reads as
+  came first), so a dictionary an earlier version registered from a pipeline reads as
   unregistered and is registered again, with its constraints, on its next load, which
   also deletes its extra rows.
 - **`get_dictionary_metadata` returned no variabilities.** It always answered `None`,
@@ -343,7 +443,7 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   whose name is not a valid dictionary name, with a warning. No `weft-server` endpoint
   takes a dictionary name.
 
-  **Breaking for existing data:** a dictionary an earlier release created under a name
+  **Breaking for existing data:** a dictionary an earlier version created under a name
   these rules now refuse (a leading `.`, a trailing `.` or space, a Windows device name
   on any OS such as `aux`, `con`, `com1` or `nul.x`, a control, bidirectional or
   invisible formatting character, or more than 160 bytes) can no longer be reached.
@@ -396,57 +496,6 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 - Cleared the `crossbeam-epoch` (RUSTSEC-2026-0204) and `h2` (RUSTSEC-2026-0258)
   advisories, replaced the unmaintained `bincode` (RUSTSEC-2025-0141), and removed the
   unsound `lru` 0.16 (RUSTSEC-2026-0253) by disabling turso's unused full-text search.
-
-## [0.1.0] - 2026-09-25
-
-First public release. WeftDB is pre-beta: the API will change, and the version
-number says so.
-
-### Added
-
-- **Interpolation as a first-class query.** Ask for any resolution and get back a
-  continuous series, reconstructed with the spline method you choose (linear,
-  quadratic, cubic, polynomial), computed on SIMD/parallel CPU or GPU (`wgpu`).
-- **Provenance labelling.** Every returned point is marked `raw`, `interpolated` or
-  `extrapolated`, so a synthetic value is never silently mistaken for an observed one.
-- **Declared precision.** Values are logically `BigDecimal`. Each aspect declares a
-  physical encoding (`F64`, `F32`, `ScaledI64`, `ScaledI128`, `Decimal128`,
-  `BigDecimalText`) and an error bound; a value the encoding cannot represent within
-  that bound is rejected rather than quietly rounded.
-- **Typed columnar segment store** (`.weftseg`) on the measurement hot path, with
-  bit-packing, delta-of-delta timestamp coding and a transposed value layout, over a
-  Turso (libSQL) control plane for catalog, metadata and the segment index.
-- **Downsampling** with mergeable partial reductions (`.weftpart` sidecars), including
-  time-weighted averages, over an epoch-aligned bucket grid.
-- **Apache Arrow interchange** — sealed segments to `RecordBatch` and back, plus Arrow
-  IPC and Parquet bytes.
-- **HTTP API** (`weft-server`) covering health/readiness, ingest, query, interpolation,
-  storage management, backup/restore and a restore drill, with OpenTelemetry tracing.
-- **Terminal UI** (`weft-tui`) for exploring and administering an instance.
-- **Weft-Bench** (`weft-bench`), a reproducible, correctness-gated benchmark harness.
-- **Analytics pipeline** (`weft-orchestration`) chaining batching, pattern extraction,
-  event detection, correlation and signal generation.
-- Pre-built `weft-server`, `weft-tui` and `weft-bench` archives for Linux (x86_64 and
-  aarch64), macOS (x86_64 and arm64) and Windows (x86_64), with a `SHA256SUMS` file,
-  attached to the GitHub release.
-
-### Changed
-
-- **The workspace now builds on stable Rust** (1.95+). The `#![feature(stmt_expr_attributes)]`
-  gate is gone, so nightly is no longer required to build, test or depend on any crate.
-  Only `cargo fmt` still uses nightly, because `rustfmt.toml` sets nightly-only options.
-- **Crates renamed for publication.** The core crate is now `weftdb` (was `database`,
-  a name already taken on crates.io) and the pipeline crate is `weft-orchestration`
-  (was `database_orchestration`). Import paths change accordingly:
-  `use database::…` becomes `use weftdb::…`, and `use database_orchestration::…`
-  becomes `use weft_orchestration::…`.
-
-### Internal
-
-- `splimes`' unit-test tree is now gated behind `#[cfg(test)]` instead of compiling
-  into released library builds.
-- Dropped unused `splimes` dependencies (`flume`, `num_cpus`, `futures`,
-  `futures-channel`, `pollster`, and `rand` outside dev builds).
 
 [Unreleased]: https://github.com/basic-automation/weftdb/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/basic-automation/weftdb/releases/tag/v0.1.0
