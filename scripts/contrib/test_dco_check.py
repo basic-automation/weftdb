@@ -56,6 +56,17 @@ class SignoffParsing(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertEqual(dco_check.signoff_emails(f"x\n\n{line}\n"), [])
 
+    def test_only_ascii_case_is_folded(self):
+        # U+017F (long s) folds to "s" under Unicode case folding; git does not read it as a trailer.
+        self.assertEqual(dco_check.signoff_emails("x\n\n\u017figned-off-by: M <m@x.example>\n"), [])
+        self.assertEqual(dco_check.signoff_emails("x\n\nSigned-off-\u212ay: M <m@x.example>\n"), [])
+
+    def test_crlf_line_endings_are_accepted(self):
+        # git commit --cleanup=verbatim keeps the \r of a message written with CRLF endings.
+        msg = "feat: x\r\n\r\nSigned-off-by: Ada Lovelace <ada@example.org>\r\n"
+        self.assertEqual(dco_check.signoff_emails(msg), ["ada@example.org"])
+        self.assertEqual(dco_check.signoff_emails("x\r\n\r\nSigned-off-by: Ada <ada@example.org>"), ["ada@example.org"])
+
 
 def make_commit(
     sha: str,
@@ -67,9 +78,14 @@ def make_commit(
     message: str = "feat: x\n",
     verified: bool = False,
     parents: int = 1,
+    author_id: int = 1,
 ) -> dict:
-    """A commit as the pull request commits API returns it."""
+    """A commit as the pull request commits API returns it. A `...[bot]` login is a Bot account."""
     committer_login = login if committer_login == "same" else committer_login
+
+    def account(user: str | None, uid: int) -> dict | None:
+        return {"login": user, "id": uid, "type": "Bot" if user.endswith("[bot]") else "User"} if user else None
+
     return {
         "sha": sha * (40 // len(sha)),
         "commit": {
@@ -78,14 +94,30 @@ def make_commit(
             "message": message,
             "verification": {"verified": verified, "reason": "valid" if verified else "unsigned"},
         },
-        "author": {"login": login, "id": 1, "type": "User"} if login else None,
-        "committer": {"login": committer_login, "id": 2, "type": "User"} if committer_login else None,
+        "author": account(login, author_id),
+        "committer": account(committer_login, author_id if committer_login == login else 2),
         "parents": [{"sha": f"{i:040d}"} for i in range(parents)],
     }
 
 
 def contributor_pull(commits: list[dict], **extra) -> dict:
     return dict(load("pull-contributor.json"), commits=len(commits), **extra)
+
+
+def repo(full_name: str) -> dict:
+    owner = full_name.split("/")[0]
+    return {"full_name": full_name, "owner": {"login": owner, "id": 3, "type": "Bot" if owner.endswith("[bot]") else "User"}}
+
+
+def opened_by(login: str, commits: list[dict], head_repo: str | None = "basic-automation/weftdb") -> dict:
+    """A pull request `login` opened, with its head branch in `head_repo` (None: the fork is gone)."""
+    head = {"ref": "topic", "sha": commits[-1]["sha"] if commits else "", "repo": repo(head_repo) if head_repo else None}
+    return dict(
+        load("pull-contributor.json"),
+        user={"login": login, "id": 4, "type": "Bot" if login.endswith("[bot]") else "User"},
+        head=head,
+        commits=len(commits),
+    )
 
 
 class Decision(unittest.TestCase):
@@ -115,8 +147,9 @@ class Decision(unittest.TestCase):
         self.assertTrue(result.satisfied)
 
     def test_bot_pull_request_passes(self):
-        pull = dict(load("pull-contributor.json"), user={"login": "dependabot[bot]", "type": "Bot"})
-        self.assertTrue(dco_check.check(pull, load("commits-unsigned.json"), ALLOW).satisfied)
+        # Dependabot pushes its branches to this repository.
+        commits = load("commits-unsigned.json")
+        self.assertTrue(dco_check.check(opened_by("dependabot[bot]", commits), commits, ALLOW).satisfied)
 
     def test_commits_beyond_the_api_limit_fail(self):
         commits = load("commits-signed.json")
@@ -157,7 +190,7 @@ class Merges(unittest.TestCase):
         commits = [make_commit("m", parents=2, message="Merge branch 'main'\n")]
         result = dco_check.check(contributor_pull(commits), commits, ALLOW)
         self.assertFalse(result.satisfied)
-        self.assertIn("merge commit not made by GitHub", result.problems[0][1])
+        self.assertIn("merge commit not made in GitHub's web UI", result.problems[0][1])
 
     def test_unsigned_local_merge_among_signed_commits_fails(self):
         commits = [make_commit("1", message=SIGNED), make_commit("m", parents=2, message="Merge branch 'main'\n")]
@@ -187,6 +220,30 @@ class Merges(unittest.TestCase):
         self.assertFalse(result.satisfied)
         self.assertIn("no commit to check", result.problems[0][1])
 
+    def test_verified_merge_made_by_github_actions_needs_a_signoff(self):
+        # A workflow's GITHUB_TOKEN can create a two-parent commit with any tree through the
+        # Git Data API; GitHub signs it, commits it as web-flow, and authors it as the bot.
+        merge = make_commit("9", login="github-actions[bot]", committer_login="web-flow", verified=True, parents=2, author_id=41898282)
+        commits = [make_commit("1", message=SIGNED), merge]
+        result = dco_check.check(contributor_pull(commits), commits, ALLOW)
+        self.assertFalse(result.satisfied)
+        self.assertEqual([sha for sha, _ in result.problems], ["9" * 12])
+        self.assertEqual([sha for sha, _ in result.cla_unsafe], ["9" * 12])
+
+    def test_verified_merge_made_by_another_app_needs_a_signoff(self):
+        merge = make_commit("9", login="some-app[bot]", committer_login="web-flow", verified=True, parents=2)
+        commits = [make_commit("1", message=SIGNED), merge]
+        result = dco_check.check(contributor_pull(commits), commits, ALLOW)
+        self.assertFalse(result.satisfied)
+        self.assertEqual([sha for sha, _ in result.problems], ["9" * 12])
+        # The CLA bot does check some-app[bot], which has not signed, so that route stays open.
+        self.assertEqual(result.cla_unsafe, [])
+
+    def test_merge_needs_an_author_account_to_be_exempt(self):
+        merge = make_commit("9", login=None, committer_login="web-flow", verified=True, parents=2)
+        commits = [make_commit("1", message=SIGNED), merge]
+        self.assertFalse(dco_check.check(contributor_pull(commits), commits, ALLOW).satisfied)
+
 
 class AllowlistedCommits(unittest.TestCase):
     """A commit showing an allowlisted account passes only when GitHub verified that account."""
@@ -210,6 +267,89 @@ class AllowlistedCommits(unittest.TestCase):
     def test_verified_web_flow_commit_does_not_vouch_for_the_owner(self):
         commits = [make_commit("1", message=SIGNED), make_commit("o", login="physics515", committer_login="web-flow", verified=True)]
         self.assertFalse(dco_check.check(contributor_pull(commits), commits, ALLOW).satisfied)
+
+
+class BotCommits(unittest.TestCase):
+    """In a contributor's pull request, a commit by a bot account fails the DCO route outright.
+
+    Anyone's workflow can make GitHub sign a commit as github-actions[bot], so "verified"
+    proves nothing for a bot, and a bot cannot certify the DCO.
+    """
+
+    def bot_commit(self, sha="b", login="github-actions[bot]", **kw):
+        kw.setdefault("email", "41898282+github-actions[bot]@users.noreply.github.com")
+        return make_commit(sha, login=login, name=login, verified=True, author_id=41898282 if login == "github-actions[bot]" else 5, **kw)
+
+    def test_pull_request_of_verified_github_actions_commits_fails(self):
+        commits = [self.bot_commit()]
+        result = dco_check.check(opened_by("mallory", commits, "mallory/weftdb"), commits, ALLOW)
+        self.assertFalse(result.satisfied)
+        self.assertIn("bot account github-actions[bot]", result.problems[0][1])
+        self.assertEqual([sha for sha, _ in result.cla_unsafe], ["b" * 12])
+
+    def test_verified_dependabot_commit_in_a_contributors_pull_request_fails(self):
+        dep = self.bot_commit("d", login="dependabot[bot]", email="49699333+dependabot[bot]@users.noreply.github.com")
+        commits = [make_commit("1", message=SIGNED), dep]
+        result = dco_check.check(contributor_pull(commits), commits, ALLOW)
+        self.assertFalse(result.satisfied)
+        self.assertEqual([sha for sha, _ in result.problems], ["d" * 12])
+        self.assertEqual([sha for sha, _ in result.cla_unsafe], ["d" * 12])
+
+    def test_a_bot_signoff_does_not_count(self):
+        email = "41898282+github-actions[bot]@users.noreply.github.com"
+        bot = self.bot_commit(message=f"feat: x\n\nSigned-off-by: github-actions[bot] <{email}>\n")
+        commits = [make_commit("1", message=SIGNED), bot]
+        result = dco_check.check(contributor_pull(commits), commits, ALLOW)
+        self.assertFalse(result.satisfied)
+        self.assertEqual([sha for sha, _ in result.problems], ["b" * 12])
+
+    def test_github_actions_is_unsafe_for_the_cla_route_even_off_the_allowlist(self):
+        # CLA Assistant Lite drops account id 41898282 whatever its allowlist says.
+        commits = [make_commit("1", message=SIGNED), self.bot_commit()]
+        result = dco_check.check(contributor_pull(commits), commits, {"physics515"})
+        self.assertEqual([sha for sha, _ in result.cla_unsafe], ["b" * 12])
+
+    def test_bot_committed_commit_by_a_person_is_left_to_the_cla(self):
+        # The CLA bot checks the author's account, so only the DCO route is closed to it.
+        commit = make_commit("p", login="ada-l", committer_login="some-app[bot]", message=SIGNED)
+        commits = [make_commit("1", message=SIGNED), commit]
+        result = dco_check.check(contributor_pull(commits), commits, ALLOW)
+        self.assertFalse(result.satisfied)
+        self.assertIn("bot account some-app[bot]", result.problems[0][1])
+        self.assertEqual(result.cla_unsafe, [])
+
+
+class OpenerAllowlist(unittest.TestCase):
+    """An allowlisted opener passes only when it controls the head branch."""
+
+    def test_owner_pull_request_from_this_repository_passes(self):
+        commits = [make_commit("u", login="ada-l")]
+        self.assertTrue(dco_check.check(opened_by("physics515", commits), commits, ALLOW).satisfied)
+
+    def test_owner_pull_request_from_the_owners_fork_passes(self):
+        commits = [make_commit("u", login="ada-l")]
+        self.assertTrue(dco_check.check(opened_by("physics515", commits, "Physics515/weftdb"), commits, ALLOW).satisfied)
+
+    def test_owner_pull_request_from_a_contributors_fork_is_checked_commit_by_commit(self):
+        # gh pr create --head mallory:branch: mallory can keep pushing to the head.
+        owner = make_commit("o", login="physics515", verified=True)
+        pushed = make_commit("m", login="mallory")
+        commits = [owner, pushed]
+        result = dco_check.check(opened_by("physics515", commits, "mallory/weftdb"), commits, ALLOW)
+        self.assertFalse(result.satisfied)
+        self.assertEqual([sha for sha, _ in result.problems], ["m" * 12])
+
+    def test_signed_off_commits_in_a_contributors_fork_still_pass(self):
+        commits = [make_commit("1", message=SIGNED)]
+        self.assertTrue(dco_check.check(opened_by("physics515", commits, "mallory/weftdb"), commits, ALLOW).satisfied)
+
+    def test_head_in_a_deleted_fork_is_checked_commit_by_commit(self):
+        commits = [make_commit("u", login="ada-l")]
+        self.assertFalse(dco_check.check(opened_by("physics515", commits, None), commits, ALLOW).satisfied)
+
+    def test_bot_pull_request_from_a_fork_is_checked_commit_by_commit(self):
+        commits = [make_commit("u", login="ada-l")]
+        self.assertFalse(dco_check.check(opened_by("dependabot[bot]", commits, "mallory/weftdb"), commits, ALLOW).satisfied)
 
 
 class ClaAllowlistSafety(unittest.TestCase):
@@ -276,7 +416,8 @@ class HeadBinding(unittest.TestCase):
 
     def test_head_is_checked_before_the_opener_allowlist(self):
         commits = [make_commit("1")]
-        pull = dict(load("pull-owner.json"), commits=1, head={"sha": commits[0]["sha"]})
+        pull = opened_by("physics515", commits)
+        self.assertTrue(dco_check.check(pull, commits, ALLOW, head_sha=commits[0]["sha"]).satisfied)
         with self.assertRaises(dco_check.StaleHead):
             dco_check.check(pull, commits, ALLOW, head_sha="2" * 40)
 

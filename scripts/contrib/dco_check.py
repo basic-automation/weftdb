@@ -7,33 +7,48 @@ every commit in the pull request carries a line
     Signed-off-by: Name <email>
 
 whose email matches the commit's author email, compared case-insensitively. That is the
-line `git commit -s` writes. The key is matched case-insensitively and the line may sit
-anywhere in the message, as the DCO GitHub App accepts it.
+line `git commit -s` writes. The key is matched case-insensitively (ASCII only) and the line
+may sit anywhere in the message, as the DCO GitHub App accepts it.
 
 Three things pass without a sign-off, and nothing else does:
 
-- A pull request opened by an allowlisted account (the owner and two bots) passes outright.
-  GitHub sets the opener from the authenticated account, so this cannot be faked.
-- A merge commit GitHub made itself, such as one from the "Update branch" button: committed
-  by `web-flow` and signature-verified. Every other merge commit needs a sign-off
-  (`git merge --signoff`), because a merge made locally can carry changes of its own. A
-  merge made in GitHub's web conflict editor is exempt too, though it can carry the
-  resolver's edits; CONTRIBUTING.md asks maintainers to review those.
-- A commit authored and committed by the same allowlisted account and signature-verified as
-  that account. GitHub links a commit to an account by its email alone, so an unverified
-  commit that shows an allowlisted author proves nothing about who wrote it.
+- A pull request opened by an allowlisted account (the owner and two bots), when its head
+  branch lives in this repository or in the opener's own fork, passes outright. GitHub sets
+  the opener from the authenticated account, so this cannot be faked, and only the opener
+  (or someone with write access here) can push to such a head. A head in someone else's
+  fork is checked commit by commit, since its owner can keep pushing to it.
+- A merge commit a person made in GitHub's web UI, such as one from the "Update branch"
+  button: authored by a user account, committed by `web-flow` and signature-verified. A
+  GitHub App or bot can also get GitHub to sign a merge it makes through the API, with any
+  tree it likes, but such a commit is authored by the bot's own account (a custom author
+  turns GitHub's signing off), so the user-author test leaves it out. Every other merge
+  commit needs a sign-off (`git merge --signoff`), because a merge made locally can carry
+  changes of its own. A merge made in GitHub's web conflict editor is exempt too, though it
+  can carry the resolver's edits; CONTRIBUTING.md asks maintainers to review those.
+- A commit authored and committed by the owner and signature-verified as the owner.
+  GitHub links a commit to an account by its email alone, so an unverified commit that
+  shows the owner proves nothing about who wrote it. This per-commit exemption covers only
+  the allowlisted accounts that are not bots: anyone's workflow can make GitHub sign a
+  commit as `github-actions[bot]`, so "verified" proves nothing for a bot.
 
-A pull request with no commit left to check after that (only GitHub-made merges) does not
-pass on this route.
+A commit authored or committed by a bot account fails this route, with or without a
+sign-off: a bot cannot certify the DCO, and the sign-off in a commit made through the API
+is text whoever ran it wrote. A pull request with no commit left to check after that (only
+web-UI merges) does not pass on this route.
 
 The checker also prepares the CLA route, which CLA Assistant Lite decides when this route
-fails. That action drops a commit from its check when the commit's name matches the
-allowlist, and it takes the name from the author's GitHub login, else the committer's, else
-the git author name, all of which the committer chooses. The checker therefore reports
-`cla_allowlist_unsafe` when a commit that lacks its author's sign-off would be dropped that
-way without being verified as above, and `commits`, the pull request's commit count,
-because the action reads only the first 100 commits. The `contribution-terms` job refuses
-the CLA route in either case.
+fails. That action leaves a commit out of its check when the commit's name matches the
+allowlist, taking the name from the author's GitHub login, else the committer's, else the
+git author name, all of which the committer chooses; and it always leaves out
+`github-actions[bot]` (account id 41898282), whatever the allowlist says. The checker
+therefore reports `cla_allowlist_unsafe` when the action would leave out a commit that
+fails this route, and `commits`, the pull request's commit count, because the action reads
+only the first 100 commits. The `contribution-terms` job refuses the CLA route in either
+case.
+
+Both routes attest commit metadata, not identity: anyone can write another person's
+sign-off, or use a CLA signer's email as their author email. The check is a record of the
+terms each commit claims, not authentication.
 
 The pull request is read through the GitHub REST API, or, for the tests, from JSON files
 of the same shape. Nothing from the pull request is checked out or run, and the only
@@ -72,9 +87,16 @@ CLA_COMMIT_LIMIT = 100
 # The account GitHub commits as when it makes a commit itself (web UI, "Update branch").
 GITHUB_COMMITTER = "web-flow"
 
+# github-actions[bot]. CLA Assistant Lite (v2.6.1, src/graphql.ts) drops this account id from
+# every check, whatever its allowlist input says.
+GITHUB_ACTIONS_BOT = "github-actions[bot]"
+GITHUB_ACTIONS_BOT_ID = 41898282
+
+# re.ASCII: without it, IGNORECASE folds Unicode, so U+017F (long s) would stand for "s".
+# A message kept with CRLF line endings (--cleanup=verbatim) leaves \r before the newline.
 SIGNOFF_RE = re.compile(
-    r"^signed-off-by:[ \t]*(?P<name>[^<>\r\n]*?)[ \t]*<(?P<email>[^<>\s]+)>[ \t]*$",
-    re.IGNORECASE | re.MULTILINE,
+    r"^signed-off-by:[ \t]*(?P<name>[^<>\r\n]*?)[ \t]*<(?P<email>[^<>\s]+)>[ \t]*\r?$",
+    re.IGNORECASE | re.MULTILINE | re.ASCII,
 )
 
 _UNSAFE = re.compile(r"[^A-Za-z0-9._@+\-\[\] ]")
@@ -103,21 +125,63 @@ def _verified(c: dict) -> bool:
     return ((c.get("commit") or {}).get("verification") or {}).get("verified") is True
 
 
+def is_bot(account: object) -> bool:
+    """Whether a REST user object is a bot account (an app's `name[bot]` login)."""
+    return isinstance(account, dict) and (account.get("type") == "Bot" or _login(account).endswith("[bot]"))
+
+
+def bot_login(c: dict) -> str:
+    """The login of the bot account that authored or committed the commit, or ""."""
+    for role in ("author", "committer"):
+        if is_bot(c.get(role)):
+            return _login(c.get(role)) or "(a bot)"
+    return ""
+
+
 def is_github_merge(c: dict) -> bool:
-    """A merge commit GitHub made itself: committed by web-flow, signature verified."""
-    return len(c.get("parents") or []) > 1 and _login(c.get("committer")) == GITHUB_COMMITTER and _verified(c)
+    """A merge a person made in GitHub's web UI: user-authored, committed by web-flow, verified.
+
+    A GitHub App or bot can have GitHub sign a merge with any tree, but it is then the
+    author, so the user-author test leaves it out.
+    """
+    author = c.get("author")
+    return (
+        len(c.get("parents") or []) > 1
+        and isinstance(author, dict)
+        and author.get("type") == "User"
+        and _login(c.get("committer")) == GITHUB_COMMITTER
+        and _verified(c)
+    )
 
 
 def vouched(c: dict, allow: set[str]) -> bool:
-    """Authored and committed by one allowlisted account, and verified as that account.
+    """Authored and committed by one allowlisted person (not a bot), verified as that account.
 
     GitHub verifies a signature against the committer: the key must belong to the account
-    that owns the committer email. So a verified commit whose committer is an allowlisted
-    account was made by that account, and requiring the same author keeps a verified
-    committer from vouching for someone else's authorship.
+    that owns the committer email. So a verified commit whose committer is the owner was
+    made by the owner, and requiring the same author keeps a verified committer from
+    vouching for someone else's authorship. Bots are left out: GitHub signs any commit a
+    GitHub App makes through the API without a custom author, so a workflow in anyone's
+    fork can make a verified commit as `github-actions[bot]`.
     """
     author, committer = _login(c.get("author")), _login(c.get("committer"))
-    return bool(author) and author == committer and author in allow and _verified(c)
+    return (
+        bool(author)
+        and author == committer
+        and author in allow
+        and not is_bot(c.get("author"))
+        and not is_bot(c.get("committer"))
+        and _verified(c)
+    )
+
+
+def _cla_account(c: dict) -> dict | None:
+    """The account CLA Assistant Lite attributes a commit to: the author's, else the committer's."""
+    for role in ("author", "committer"):
+        account = c.get(role)
+        if isinstance(account, dict) and account.get("login"):
+            return account
+    return None
 
 
 def cla_name(c: dict) -> str:
@@ -125,12 +189,38 @@ def cla_name(c: dict) -> str:
 
     Its graphql.ts takes `author.user || committer.user || author`, then `login || name`.
     """
-    author, committer = _login(c.get("author")), _login(c.get("committer"))
-    if author:
-        return author
-    if committer:
-        return committer
+    account = _cla_account(c)
+    if account:
+        return _login(account)
     return (((c.get("commit") or {}).get("author") or {}).get("name") or "").lower()
+
+
+def cla_drops(c: dict, allow: set[str]) -> bool:
+    """Whether CLA Assistant Lite would leave the commit out of its check.
+
+    It drops a name on its allowlist, and it drops github-actions[bot] by account id even
+    when the allowlist does not name it.
+    """
+    name = cla_name(c)
+    account = _cla_account(c) or {}
+    return bool(name) and (name in allow or name == GITHUB_ACTIONS_BOT or account.get("id") == GITHUB_ACTIONS_BOT_ID)
+
+
+def head_held_by_opener(pull: dict, opener: str) -> bool:
+    """Whether the head branch lives in the base repository or in the opener's own fork.
+
+    Only then does the opener control what is pushed to it. A head in another account's
+    fork can gain commits from that account after the pull request is opened.
+    """
+    head_repo = (pull.get("head") or {}).get("repo")
+    base_repo = (pull.get("base") or {}).get("repo")
+    if not isinstance(head_repo, dict):
+        return False
+    head_name = (head_repo.get("full_name") or "").lower()
+    base_name = ((base_repo or {}).get("full_name") or "").lower() if isinstance(base_repo, dict) else ""
+    if head_name and head_name == base_name:
+        return True
+    return bool(opener) and _login(head_repo.get("owner")) == opener
 
 
 def signed_off(c: dict) -> tuple[bool, str]:
@@ -174,7 +264,7 @@ def check(pull: dict, commits: list[dict], allow: set[str], head_sha: str | None
             raise StaleHead(f"the commit list does not contain the head {safe(head_sha)[:12]}; it moved while being read")
 
     opener = _login(pull.get("user"))
-    if opener and opener in allow:
+    if opener and opener in allow and head_held_by_opener(pull, opener):
         return Result(True, f"opened by allowlisted account {safe(opener)}", commit_count=count)
 
     problems: list[tuple[str, str]] = []
@@ -190,18 +280,22 @@ def check(pull: dict, commits: list[dict], allow: set[str], head_sha: str | None
         checked += 1
         if vouched(c, allow):
             continue
-        ok, problem = signed_off(c)
-        if ok:
-            continue
-        if len(c.get("parents") or []) > 1:
-            problem = f"merge commit not made by GitHub: {problem}"
+        bot = bot_login(c)
+        if bot:
+            problem = f"made by bot account {safe(bot)}; a bot cannot certify the DCO, so no sign-off counts"
+        else:
+            ok, problem = signed_off(c)
+            if ok:
+                continue
+            if len(c.get("parents") or []) > 1:
+                problem = f"merge commit not made in GitHub's web UI: {problem}"
         problems.append((sha, problem))
-        name = cla_name(c)
-        if name and name in allow:
-            cla_unsafe.append((sha, f"shows allowlisted {safe(name)} but is not signature-verified as that account"))
+        if cla_drops(c, allow):
+            name = safe(cla_name(c))
+            cla_unsafe.append((sha, f"the CLA bot would skip it as {name}, a name any commit can show"))
 
     if checked == 0:
-        problems.append(("-", "no commit to check besides merges GitHub made"))
+        problems.append(("-", "no commit to check besides merges made in GitHub's web UI"))
     if problems:
         return Result(False, f"{len(problems)} problem(s) in {checked} commit(s)", problems, cla_unsafe, count)
     return Result(True, f"all {checked} commit(s) signed off by their authors", commit_count=count)
@@ -254,7 +348,12 @@ def write_summary(path: str, result: Result) -> None:
         lines += [f"| `{sha}` | {problem} |" for sha, problem in result.problems]
         lines += ["", "To fix it, sign off every commit (`git rebase --signoff <base>`, then force-push), or sign the CLA. See CONTRIBUTING.md, \"Contribution terms\"."]
         if result.cla_unsafe:
-            lines += ["", "The CLA route cannot vouch for these commits, because the allowlisted account they show is not verified; sign them off:", ""]
+            lines += [
+                "",
+                "The CLA route cannot vouch for these commits, because the CLA bot would skip them by an account name anyone can use."
+                " Sign off the ones a person made, and drop or rewrite any made by a bot account:",
+                "",
+            ]
             lines += [f"- `{sha}`: {problem}" for sha, problem in result.cla_unsafe]
         if result.commit_count > CLA_COMMIT_LIMIT:
             lines += ["", f"The CLA route reads only the first {CLA_COMMIT_LIMIT} commits, and this pull request has {result.commit_count}; sign off every commit or split it."]

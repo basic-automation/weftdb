@@ -11,26 +11,53 @@ name: Contribution terms
 # and `CLA` feed it; `CLA` is skipped when the DCO route already holds.
 #
 # The allowlist (the owner and two bots). A pull request opened by an allowlisted account
-# passes outright: GitHub sets the opener from the signed-in account, so it cannot be faked,
-# and that account answers for any commits in it that are not its own. In anyone else's pull
-# request, a commit showing an allowlisted account is exempt only when it is signature-
-# verified as that account; GitHub links a commit to an account by its email alone, so
-# anything else needs a sign-off. CLA Assistant Lite's own allowlist matches a name the
-# committer chooses (author login, else committer login, else git author name), so the gate
-# refuses the CLA route when the action would drop an unsigned, unverified commit that way
-# (`cla_allowlist_unsafe`), and when the pull request has more than the 100 commits the
-# action reads.
+# passes outright when its head branch is in this repository or in the opener's own fork:
+# GitHub sets the opener from the signed-in account, so it cannot be faked, and that account
+# answers for any commits in it that are not its own. A head in someone else's fork (say the
+# owner took over an abandoned pull request) is checked commit by commit, because the fork's
+# owner can keep pushing to it.
 #
-# Merge commits need a sign-off too, except merges GitHub made itself (committed by
-# `web-flow` and verified), such as "Update branch". A pull request whose only commits are
-# such merges does not pass on the DCO route. A merge from GitHub's web conflict editor is
+# Per commit, only the owner's own commits are exempt, and only when signature-verified as
+# the owner, as both author and committer. GitHub links a commit to an account by its email
+# alone, so an unverified one needs a sign-off. Bots get no such exemption: any workflow can
+# make GitHub sign a commit as `github-actions[bot]` with its own token. A commit authored
+# or committed by a bot account fails the DCO route even with a sign-off, since a bot cannot
+# certify the DCO.
+#
+# CLA Assistant Lite's own allowlist matches a name the committer chooses (author login,
+# else committer login, else git author name), and it always drops `github-actions[bot]`
+# (account id 41898282). So the gate refuses the CLA route when the action would drop a
+# commit that fails the DCO route (`cla_allowlist_unsafe`), and when the pull request has
+# more than the 100 commits the action reads.
+#
+# Merge commits need a sign-off too, except a merge a person made in GitHub's web UI, such
+# as "Update branch": authored by a user account, committed by `web-flow`, verified. A
+# GitHub App can have GitHub sign a merge with any tree it likes, but that merge is authored
+# by the app's bot account and so is not exempt. A pull request whose only commits are
+# web-UI merges does not pass on the DCO route. A merge from GitHub's web conflict editor is
 # exempt too and can carry the resolver's edits; maintainers review those (CONTRIBUTING.md).
+#
+# Both routes attest commit metadata, not identity. Anyone can write another person's
+# sign-off, or use a CLA signer's email as their commit author email, and the CLA bot then
+# counts the signer's signature. The check records the terms each commit claims; it does not
+# authenticate who wrote it.
 #
 # Comment-triggered runs (a signing comment, `recheck`) run in the default branch's context,
 # so their checks land on main's latest commit, not the pull request. They only record
 # signatures and, once every author has signed, re-run the pull request's last failed run;
-# the gate job runs only for pull request events. The DCO checker is told the head SHA of a
-# pull request event and refuses to judge a pull request whose head has moved since.
+# the gate job runs only for pull request events.
+#
+# Binding to the head. pull_request_target runs the workflow file of the pull request's base
+# branch, so `edited` is a trigger: retargeting a pull request to main re-runs main's
+# version of this check, which supersedes a result collected against another branch's
+# (title and body edits re-run it too). Pull request runs share one concurrency group per
+# pull request and cancel the older run; comment runs each get their own group, so they
+# never cancel a pull request run. The DCO checker is told the event's head SHA and refuses
+# to judge a pull request whose head has moved. CLA Assistant Lite reads the pull request
+# again when its job runs, so the gate re-reads it last and fails unless the head and the
+# commit count still match what the DCO job saw. What remains is a head that moves away and
+# back (A to B to A) between the DCO job and the gate: until the newer run for A finishes,
+# the older run's result is the latest on A.
 #
 # Security. pull_request_target and issue_comment runs get a write token even for pull
 # requests from forks, so no job checks out, builds or runs pull request code. The DCO job
@@ -58,11 +85,20 @@ name: Contribution terms
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, edited]
   issue_comment:
     types: [created]
 
 permissions: {}
+
+# One group per pull request for pull request events, so a newer push, edit or retarget
+# cancels the older run; a unique group per comment run, so comments never cancel them.
+concurrency:
+  group: >-
+    ${{ github.workflow }}-${{ github.event_name == 'pull_request_target'
+    && format('pr-{0}', github.event.pull_request.number)
+    || format('comment-{0}', github.run_id) }}
+  cancel-in-progress: true
 
 env:
   ALLOWLIST: physics515,dependabot[bot],github-actions[bot]
@@ -159,7 +195,8 @@ jobs:
     if: ${{ always() && github.event_name == 'pull_request_target' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    permissions: {}
+    permissions:
+      pull-requests: read # re-read the pull request's head and commit count
     steps:
       - name: Pass if either route holds
         env:
@@ -168,6 +205,9 @@ jobs:
           CLA_ALLOWLIST_UNSAFE: ${{ needs.dco.outputs.cla_allowlist_unsafe }}
           COMMITS: ${{ needs.dco.outputs.commits }}
           CLA_RESULT: ${{ needs.cla.result }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           # CLA Assistant Lite reads only the first 100 commits of a pull request.
           CLA_COMMIT_LIMIT: "100"
         run: |
@@ -175,25 +215,35 @@ jobs:
             echo "::error title=Contribution terms::The DCO check did not finish ($DCO_RESULT). If its log says the head moved, the run for the newer head decides; otherwise re-run it."
             exit 1
           fi
-          if [ "$DCO_SATISFIED" = "true" ]; then
-            echo "DCO: every commit is signed off by its author, or the pull request is allowlisted."
-            exit 0
-          fi
           case "$COMMITS" in
             '' | *[!0-9]*)
               echo "::error title=Contribution terms::The DCO check reported no commit count; re-run it."
               exit 1 ;;
           esac
+          # The CLA job read the pull request again, possibly after a push. Judge only the
+          # head and the commits the DCO job saw.
+          if ! now=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '"\(.head.sha) \(.commits)"'); then
+            echo "::error title=Contribution terms::Could not re-read the pull request; re-run the check."
+            exit 1
+          fi
+          if [ "$now" != "$HEAD_SHA $COMMITS" ]; then
+            echo "::error title=Contribution terms::The pull request changed while the check ran (now head and commit count: $now). The run for the newer state decides."
+            exit 1
+          fi
+          if [ "$DCO_SATISFIED" = "true" ]; then
+            echo "DCO: every commit is signed off by its author, or the pull request is allowlisted."
+            exit 0
+          fi
           if [ "$COMMITS" -gt "$CLA_COMMIT_LIMIT" ]; then
             echo "::error title=Contribution terms::The CLA route reads only the first $CLA_COMMIT_LIMIT commits, and this pull request has $COMMITS. Sign off every commit, or split the pull request."
             exit 1
           fi
           if [ "$CLA_ALLOWLIST_UNSAFE" != "false" ]; then
-            echo "::error title=Contribution terms::Some commits show an allowlisted account but are not verified as it, so the CLA route cannot vouch for them. Sign them off; the DCO sign-off job's summary lists them."
+            echo "::error title=Contribution terms::The CLA bot would skip some commits by an account name anyone can use, so the CLA route cannot vouch for them. Sign off those a person made and drop any made by a bot account; the DCO sign-off job's summary lists them."
             exit 1
           fi
           if [ "$CLA_RESULT" = "success" ]; then
-            echo "CLA: every commit author has signed the CLA, apart from allowlisted accounts whose commits are verified or signed off."
+            echo "CLA: every commit author has signed the CLA; any commit showing the owner is verified as the owner or signed off."
             exit 0
           fi
           echo "::error title=Contribution terms::Sign off every commit (git rebase --signoff) or sign the CLA. See CONTRIBUTING.md, Contribution terms."
