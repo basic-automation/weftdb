@@ -37,33 +37,40 @@ impl AspectCatalog {
 	/// backup and restore verification require them.
 	pub const TABLES: &'static [&'static str] = &["aspect_schema"];
 
-	/// Open (creating if absent) the catalog DB at `path`, enabling MVCC and ensuring
-	/// the `aspect_schema` table exists.
+	/// Open (creating if absent) the `aspect_catalog.db` at `path` on its own, outside a store:
+	/// enable MVCC, prove it took, and bring the schema up to this build's layout with the
+	/// migration registry's DDL (the `aspect_schema` table). A [`SegmentStore`](crate::SegmentStore)
+	/// opens it without DDL instead and runs the registry itself, after its marker gate.
 	///
 	/// # Errors
 	///
 	/// Fails if the database does not end up in MVCC journal mode or a new connection
 	/// does not sync FULL, and propagates any libSQL connection or DDL failure.
 	pub async fn open(path: &str) -> Result<Self> {
+		let store = Self::open_unmigrated(path).await?;
+		crate::types::migrations::apply_standalone(&crate::types::migrations::ControlPlane { aspect_catalog: Some(crate::types::migrations::Db { db: &store.db, name: path }), ..crate::types::migrations::ControlPlane::default() }).await?;
+		Ok(store)
+	}
+
+	/// Open the `aspect_catalog.db` at `path` without running any DDL: enable MVCC, prove it and
+	/// sync its header, nothing else. What a [`SegmentStore`](crate::SegmentStore) opens
+	/// before it runs the migrations.
+	///
+	/// # Errors
+	///
+	/// As [`open`](Self::open), less the DDL.
+	pub(crate) async fn open_unmigrated(path: &str) -> Result<Self> {
 		let db = Builder::new_local(path).build().await?;
-		let conn = db.connect()?;
+		let conn = crate::types::durable::control_plane::connect(&db).await?;
 		// The control plane's MVCC write path; open fails rather than run without it.
 		crate::types::durable::control_plane::enable_mvcc_full(&db, &conn, path).await?;
 		conn.execute("PRAGMA busy_timeout=600000", turso::params![]).await.ok();
-		conn.execute(
-			"CREATE TABLE IF NOT EXISTS aspect_schema (
-				database TEXT NOT NULL,
-				subject TEXT NOT NULL,
-				aspect TEXT NOT NULL,
-				physical_type TEXT NOT NULL,
-				value_tolerance TEXT NOT NULL,
-				timestamp_unit TEXT NOT NULL,
-				PRIMARY KEY (database, subject, aspect)
-			)",
-			turso::params![],
-		)
-		.await?;
 		Ok(Self { db })
+	}
+
+	/// The database behind this store, which the migration registry runs against.
+	pub(crate) const fn database(&self) -> &turso::Database {
+		&self.db
 	}
 
 	/// Open an ephemeral in-memory catalog (`:memory:`) for tests.
@@ -97,7 +104,7 @@ impl AspectCatalog {
 	///
 	/// Propagates a connection failure or any backup/verify failure.
 	pub async fn backup_to_with(&self, dest: &std::path::Path, mode: crate::VerifyMode) -> Result<crate::SnapshotReport> {
-		let conn = self.db.connect()?;
+		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
 		crate::types::backup::snapshot_with_verify(&conn, dest, mode, Self::TABLES).await
 	}
 
@@ -113,7 +120,7 @@ impl AspectCatalog {
 	pub async fn declare(&self, database: &str, subject: &str, aspect: &str, schema: &AspectSchema) -> Result<()> {
 		let physical_type = serde_json::to_string(&schema.value)?;
 		let timestamp_unit = serde_json::to_string(&schema.timestamp_unit)?;
-		let conn = self.db.connect()?;
+		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
 		conn.execute("BEGIN CONCURRENT", turso::params![]).await?;
 		let res = conn.execute("INSERT OR REPLACE INTO aspect_schema (database, subject, aspect, physical_type, value_tolerance, timestamp_unit) VALUES (?, ?, ?, ?, ?, ?)", turso::params![database.to_string(), subject.to_string(), aspect.to_string(), physical_type, schema.value_tolerance.to_plain_string(), timestamp_unit]).await;
 		match res {
@@ -136,7 +143,7 @@ impl AspectCatalog {
 	/// Propagates any libSQL read failure, or a row whose stored declaration cannot
 	/// be decoded.
 	pub async fn get(&self, database: &str, subject: &str, aspect: &str) -> Result<Option<AspectSchema>> {
-		let conn = self.db.connect()?;
+		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
 		let mut rows = conn.query("SELECT physical_type, value_tolerance, timestamp_unit FROM aspect_schema WHERE database = ? AND subject = ? AND aspect = ?", turso::params![database.to_string(), subject.to_string(), aspect.to_string()]).await?;
 		match rows.next().await? {
 			Some(row) => {
@@ -155,7 +162,7 @@ impl AspectCatalog {
 	///
 	/// Propagates any libSQL read failure.
 	pub async fn list_aspects(&self, database: &str, subject: &str) -> Result<Vec<String>> {
-		let conn = self.db.connect()?;
+		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
 		let mut rows = conn.query("SELECT aspect FROM aspect_schema WHERE database = ? AND subject = ? ORDER BY aspect", turso::params![database.to_string(), subject.to_string()]).await?;
 		let mut out = Vec::new();
 		while let Some(row) = rows.next().await? {
@@ -174,7 +181,7 @@ impl AspectCatalog {
 	///
 	/// Propagates any libSQL read failure.
 	pub async fn list_all(&self) -> Result<Vec<(String, String, String)>> {
-		let conn = self.db.connect()?;
+		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
 		let mut rows = conn.query("SELECT database, subject, aspect FROM aspect_schema ORDER BY database, subject, aspect", turso::params![]).await?;
 		let mut out = Vec::new();
 		while let Some(row) = rows.next().await? {

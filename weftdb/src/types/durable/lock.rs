@@ -12,7 +12,8 @@ use std::{
 /// The lock file's name under the store root.
 pub const LOCK_FILE: &str = "LOCK";
 
-/// The file beside [`LOCK_FILE`] in which the holder records its pid and session.
+/// The file beside [`LOCK_FILE`] in which the holder records its pid, its session, its
+/// host name and its boot id.
 ///
 /// The record cannot live in `LOCK` itself: on Windows the lock is mandatory, so no
 /// other handle can read a locked file, and a second opener could never say who holds
@@ -28,6 +29,31 @@ const INHERITED_LOCK_WAIT: Duration = Duration::from_secs(2);
 /// The lock files held by live [`RootLock`]s in this process, canonicalised.
 static HELD_HERE: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Mutex::default);
 
+/// This machine's host name, read once per process, if it has one.
+static HOST: LazyLock<Option<String>> = LazyLock::new(|| sysinfo::System::host_name().map(|host| host.trim().to_owned()).filter(|host| !host.is_empty()));
+
+/// This boot of the machine, read once per process: the kernel's boot id on Linux, the
+/// boot time elsewhere.
+static BOOT_ID: LazyLock<Option<String>> = LazyLock::new(read_boot_id);
+
+/// The current boot's id: `/proc/sys/kernel/random/boot_id` on Linux, which a reboot
+/// changes; elsewhere the boot time in seconds since the epoch, read once per process so
+/// that two reads in it always agree.
+fn read_boot_id() -> Option<String> {
+	if cfg!(target_os = "linux") {
+		if let Ok(id) = std::fs::read_to_string("/proc/sys/kernel/random/boot_id") {
+			let id = id.trim();
+			if !id.is_empty() {
+				return Some(id.to_owned());
+			}
+		}
+	}
+	match sysinfo::System::boot_time() {
+		0 => None,
+		secs => Some(format!("boot-time-{secs}")),
+	}
+}
+
 fn held_here() -> MutexGuard<'static, HashSet<PathBuf>> {
 	HELD_HERE.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -37,16 +63,20 @@ fn held_here() -> MutexGuard<'static, HashSet<PathBuf>> {
 /// It uses std's `File::try_lock` (an advisory `flock` on Unix, a mandatory
 /// `LockFileEx` on Windows). The OS drops the lock when the process exits, however it
 /// exits, so a crash never leaves a stale lock behind and the file is never deleted.
-/// While held, [`HOLDER_FILE`] records the holder's pid and a per-open session id, so
-/// a second opener can say who has the root.
+/// While held, [`HOLDER_FILE`] records the holder's pid, a per-open session id, the host
+/// name and the boot id, so a second opener can say who has the root, and on which
+/// machine.
 ///
 /// A child process spawned by another thread while the lock is held inherits the
 /// lock's file descriptor between its fork and its exec, which closes it (std opens
 /// files close-on-exec). For that moment the lock outlives a drop of its `RootLock`.
 /// [`acquire`](Self::acquire) therefore waits, briefly, when the lock is busy but the
-/// record names this process and no `RootLock` in this process holds it: that is the
-/// in-process reopen racing a spawn, which the crash tests do constantly (they drop
-/// and reopen the store while other tests re-execute the test binary).
+/// record names this process (its pid, on this host, in this boot) and no `RootLock` in
+/// this process holds it: that is the in-process reopen racing a spawn, which the crash
+/// tests do constantly (they drop and reopen the store while other tests re-execute the
+/// test binary). The host and boot matter because a pid alone is not unique: a second
+/// container sharing the root's volume is pid 1 as well, and must be refused at once
+/// (release plan C-3).
 #[derive(Debug)]
 pub struct RootLock {
 	/// Keeps the lock: closing the file releases it.
@@ -59,11 +89,36 @@ pub struct RootLock {
 
 /// Who holds a root, as recorded in its [`HOLDER_FILE`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LockHolder {
 	/// The holder's process id.
 	pub pid: u32,
 	/// The holder's session id, unique per open.
 	pub session: String,
+	/// The holder's host name, if it recorded one (a holder from before it was recorded,
+	/// or on a host without a name, did not).
+	pub host: Option<String>,
+	/// The holder's boot id (see [`HOLDER_FILE`]), if it recorded one.
+	pub boot_id: Option<String>,
+}
+
+impl LockHolder {
+	/// Whether the record names this process: its pid, on this host, in this boot. A
+	/// record without a host or boot id is never this process's (this process writes
+	/// both whenever it has them).
+	fn is_this_process(&self) -> bool {
+		self.pid == std::process::id() && self.host.is_some() && self.host == *HOST && self.boot_id.is_some() && self.boot_id == *BOOT_ID
+	}
+}
+
+impl fmt::Display for LockHolder {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "pid {}", self.pid)?;
+		if let Some(host) = &self.host {
+			write!(f, " on host {host}")?;
+		}
+		write!(f, " (session {})", self.session)
+	}
 }
 
 /// Why [`RootLock::acquire`] failed.
@@ -89,7 +144,7 @@ pub enum RootLockError {
 impl fmt::Display for RootLockError {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
-			Self::Held { root, holder: Some(holder) } => write!(f, "store root {} is in use by pid {} (session {})", root.display(), holder.pid, holder.session),
+			Self::Held { root, holder: Some(holder) } => write!(f, "store root {} is in use by {holder}", root.display()),
 			Self::Held { root, holder: None } => write!(f, "store root {} is in use by another process (its pid could not be read from {})", root.display(), root.join(HOLDER_FILE).display()),
 			Self::Io { path, source } => write!(f, "could not lock {}: {source}", path.display()),
 		}
@@ -126,7 +181,7 @@ impl RootLock {
 				Ok(()) => break,
 				Err(TryLockError::WouldBlock) => {
 					let holder = read_holder(root);
-					let inherited = holder.as_ref().is_some_and(|holder| holder.pid == std::process::id()) && !held_here().contains(&key);
+					let inherited = holder.as_ref().is_some_and(LockHolder::is_this_process) && !held_here().contains(&key);
 					if !inherited || Instant::now() >= deadline {
 						return Err(RootLockError::Held { root: root.to_path_buf(), holder });
 					}
@@ -141,7 +196,7 @@ impl RootLock {
 		// releases the lock anyway, and the next holder rewrites it. A failure to write
 		// it drops `lock`, which releases the root again.
 		let holder_path = root.join(HOLDER_FILE);
-		std::fs::write(&holder_path, format!("pid={}\nsession={}\n", std::process::id(), lock.session)).map_err(|e| io_err(&holder_path, e))?;
+		std::fs::write(&holder_path, holder_record(std::process::id(), &lock.session)).map_err(|e| io_err(&holder_path, e))?;
 		Ok(lock)
 	}
 
@@ -166,11 +221,20 @@ impl Drop for RootLock {
 	}
 }
 
-/// Parse the holder record a [`RootLock`] writes: `pid=<n>` and `session=<id>` lines.
+/// The holder record a [`RootLock`] for process `pid` and `session` writes: `pid=`,
+/// `session=`, and, when this machine has them, `host=` and `boot_id=` lines.
+fn holder_record(pid: u32, session: &str) -> String {
+	let host = HOST.as_deref().map_or_else(String::new, |host| format!("host={host}\n"));
+	let boot_id = BOOT_ID.as_deref().map_or_else(String::new, |boot_id| format!("boot_id={boot_id}\n"));
+	format!("pid={pid}\nsession={session}\n{host}{boot_id}")
+}
+
+/// Parse the holder record a [`RootLock`] writes (see [`holder_record`]).
 fn read_holder(root: &Path) -> Option<LockHolder> {
 	let text = std::fs::read_to_string(root.join(HOLDER_FILE)).ok()?;
-	let field = |key: &str| text.lines().find_map(|line| line.strip_prefix(key)?.strip_prefix('='));
-	Some(LockHolder { pid: field("pid")?.trim().parse().ok()?, session: field("session").unwrap_or("unknown").trim().to_owned() })
+	let field = |key: &str| text.lines().find_map(|line| line.strip_prefix(key)?.strip_prefix('=')).map(str::trim);
+	let named = |key: &str| field(key).filter(|value| !value.is_empty()).map(str::to_owned);
+	Some(LockHolder { pid: field("pid")?.parse().ok()?, session: field("session").unwrap_or("unknown").to_owned(), host: named("host"), boot_id: named("boot_id") })
 }
 
 #[cfg(test)]
@@ -190,15 +254,48 @@ mod tests {
 		let holder = holder.as_ref().expect("the holder's record is readable on every platform");
 		assert_eq!(holder.pid, std::process::id());
 		assert_eq!(holder.session, held.session());
+		assert_eq!((holder.host.as_ref(), holder.boot_id.as_ref()), (HOST.as_ref(), BOOT_ID.as_ref()), "the record names this host and boot");
+		assert!(holder.host.is_some() && holder.boot_id.is_some(), "this machine has a host name and a boot id to record");
 		let message = err.to_string();
-		assert!(message.contains(&format!("in use by pid {}", std::process::id())), "{message}");
+		assert!(message.contains(&format!("in use by pid {} on host {}", std::process::id(), holder.host.as_deref().unwrap_or_default())), "the error names the pid and the host: {message}");
 
 		let session = held.session().to_owned();
 		drop(held);
 		let again = RootLock::acquire(root.path()).expect("dropping the lock releases it");
 		assert_ne!(again.session(), session, "every open records a fresh session");
 		let record = std::fs::read_to_string(root.path().join(HOLDER_FILE)).unwrap();
-		assert_eq!(record, format!("pid={}\nsession={}\n", std::process::id(), again.session()), "the previous holder's record was replaced, not appended to");
+		assert_eq!(record, holder_record(std::process::id(), again.session()), "the previous holder's record was replaced, not appended to");
+		assert!(record.starts_with(&format!("pid={}\nsession={}\nhost=", std::process::id(), again.session())) && record.contains("\nboot_id="), "{record}");
+	}
+
+	/// Release plan C-3: the wait for a lock a spawning child still shares is only for
+	/// this process. A record with this pid but another host (a second container sharing
+	/// the root's volume is pid 1 too), another boot (the pid of a holder from before a
+	/// reboot), or neither (a holder that predates them) is refused at once.
+	#[cfg(unix)]
+	#[test]
+	fn a_lock_held_under_this_pid_elsewhere_is_refused_at_once() {
+		let root = tempfile::tempdir().unwrap();
+		let held = RootLock::acquire(root.path()).unwrap();
+		// Still holds the lock once the RootLock is gone, as a spawning child's copy does.
+		let elsewhere = held._file.try_clone().unwrap();
+		drop(held);
+		let pid = std::process::id();
+		let host = HOST.clone().unwrap_or_default();
+		let boot = BOOT_ID.clone().unwrap_or_default();
+		for (case, record) in [("another host", format!("pid={pid}\nsession=s\nhost=other-{host}\nboot_id={boot}\n")), ("another boot", format!("pid={pid}\nsession=s\nhost={host}\nboot_id=other-{boot}\n")), ("no host or boot", format!("pid={pid}\nsession=s\n"))] {
+			std::fs::write(root.path().join(HOLDER_FILE), &record).unwrap();
+			let started = Instant::now();
+			let err = RootLock::acquire(root.path()).expect_err(case);
+			assert!(started.elapsed() < INHERITED_LOCK_WAIT, "{case}: refused at once, not after the inherited-lock wait ({:?})", started.elapsed());
+			assert!(matches!(&err, RootLockError::Held { holder: Some(holder), .. } if holder.pid == pid), "{case}: {err:?}");
+		}
+		let err = RootLock::acquire(root.path()).expect_err("another host").to_string();
+		assert!(err.contains(&format!("in use by pid {pid} (session s)")), "a record without a host names just the pid: {err}");
+		std::fs::write(root.path().join(HOLDER_FILE), format!("pid={pid}\nsession=s\nhost=elsewhere\nboot_id=b\n")).unwrap();
+		let err = RootLock::acquire(root.path()).expect_err("another host").to_string();
+		assert!(err.contains(&format!("in use by pid {pid} on host elsewhere (session s)")), "the error names the holder's host: {err}");
+		drop(elsewhere);
 	}
 
 	#[test]

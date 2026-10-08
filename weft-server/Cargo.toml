@@ -68,6 +68,11 @@ required-features = ["fault-injection"]
 name = "maintenance_busy"
 required-features = ["fault-injection"]
 
+# Run with `cargo test -p weft-server --features fault-injection --test poison_exit`.
+[[test]]
+name = "poison_exit"
+required-features = ["fault-injection"]
+
 [dev-dependencies]
 async-trait = { workspace = true }  # a StoreFs test double whose cleanup fails
 tower = { workspace = true, features = ["util"] }

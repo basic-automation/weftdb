@@ -150,41 +150,40 @@ impl AspectMetadataStore {
 	/// backup and restore verification require them.
 	pub const TABLES: &'static [&'static str] = &["aspect_metadata"];
 
-	/// Open (creating if absent) the `metadata.db` at `path`, enabling MVCC and ensuring
-	/// the `aspect_metadata` table exists.
+	/// Open (creating if absent) the `metadata.db` at `path` on its own, outside a store:
+	/// enable MVCC, prove it took, and bring the schema up to this build's layout with the
+	/// migration registry's DDL (the `aspect_metadata` table). A [`SegmentStore`](crate::SegmentStore)
+	/// opens it without DDL instead and runs the registry itself, after its marker gate.
 	///
 	/// # Errors
 	///
 	/// Fails if the database does not end up in MVCC journal mode or a new connection
 	/// does not sync FULL, and propagates any libSQL connection or DDL failure.
 	pub async fn open(path: &str) -> Result<Self> {
+		let store = Self::open_unmigrated(path).await?;
+		crate::types::migrations::apply_standalone(&crate::types::migrations::ControlPlane { metadata: Some(crate::types::migrations::Db { db: &store.db, name: path }), ..crate::types::migrations::ControlPlane::default() }).await?;
+		Ok(store)
+	}
+
+	/// Open the `metadata.db` at `path` without running any DDL: enable MVCC, prove it and
+	/// sync its header, nothing else. What a [`SegmentStore`](crate::SegmentStore) opens
+	/// before it runs the migrations.
+	///
+	/// # Errors
+	///
+	/// As [`open`](Self::open), less the DDL.
+	pub(crate) async fn open_unmigrated(path: &str) -> Result<Self> {
 		let db = Builder::new_local(path).build().await?;
-		let conn = db.connect()?;
+		let conn = crate::types::durable::control_plane::connect(&db).await?;
 		// The control plane's MVCC write path; open fails rather than run without it.
 		crate::types::durable::control_plane::enable_mvcc_full(&db, &conn, path).await?;
 		conn.execute("PRAGMA busy_timeout=600000", turso::params![]).await.ok();
-		conn.execute(
-			"CREATE TABLE IF NOT EXISTS aspect_metadata (
-				aspect TEXT NOT NULL,
-				segment_count INTEGER NOT NULL,
-				total_rows INTEGER NOT NULL,
-				total_nulls INTEGER NOT NULL,
-				total_bytes INTEGER NOT NULL,
-				unsorted_segments INTEGER NOT NULL DEFAULT 0,
-				min_ts INTEGER,
-				max_ts INTEGER,
-				min_value TEXT,
-				max_value TEXT,
-				PRIMARY KEY (aspect)
-			)",
-			turso::params![],
-		)
-		.await?;
-		// Migrate a pre-existing metadata.db created before the order-health column:
-		// CREATE TABLE IF NOT EXISTS above is a no-op on it, so add the column here.
-		// A duplicate-column error (fresh table already has it) is expected and ignored.
-		conn.execute("ALTER TABLE aspect_metadata ADD COLUMN unsorted_segments INTEGER NOT NULL DEFAULT 0", turso::params![]).await.ok();
 		Ok(Self { db })
+	}
+
+	/// The database behind this store, which the migration registry runs against.
+	pub(crate) const fn database(&self) -> &turso::Database {
+		&self.db
 	}
 
 	/// Open an ephemeral in-memory store (`:memory:`) for tests.
@@ -218,7 +217,7 @@ impl AspectMetadataStore {
 	///
 	/// Propagates a connection failure or any backup/verify failure.
 	pub async fn backup_to_with(&self, dest: &std::path::Path, mode: crate::VerifyMode) -> Result<crate::SnapshotReport> {
-		let conn = self.db.connect()?;
+		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
 		crate::types::backup::snapshot_with_verify(&conn, dest, mode, Self::TABLES).await
 	}
 
@@ -241,7 +240,7 @@ impl AspectMetadataStore {
 		let _guard = span.enter();
 		let (min_ts, max_ts) = meta.time_range.map_or((Value::Null, Value::Null), |(lo, hi)| (Value::Integer(lo), Value::Integer(hi)));
 		let (min_value, max_value) = meta.value_range.as_ref().map_or((Value::Null, Value::Null), |(lo, hi)| (Value::Text(lo.to_plain_string()), Value::Text(hi.to_plain_string())));
-		let conn = self.db.connect()?;
+		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
 		conn.execute("BEGIN CONCURRENT", turso::params![]).await?;
 		let res = conn
 			.execute(
@@ -292,7 +291,7 @@ impl AspectMetadataStore {
 	///
 	/// Propagates any libSQL read failure, or a value bound that cannot be decoded.
 	pub async fn get(&self, aspect: &str) -> Result<Option<AspectMetadata>> {
-		let conn = self.db.connect()?;
+		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
 		let mut rows = conn
 			.query(
 				"SELECT segment_count, total_rows, total_nulls, total_bytes, min_ts, max_ts, min_value, max_value, unsorted_segments
@@ -312,7 +311,7 @@ impl AspectMetadataStore {
 	///
 	/// Propagates any libSQL read failure.
 	pub async fn list_aspects(&self) -> Result<Vec<String>> {
-		let conn = self.db.connect()?;
+		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
 		let mut rows = conn.query("SELECT aspect FROM aspect_metadata ORDER BY aspect", turso::params![]).await?;
 		let mut out = Vec::new();
 		while let Some(row) = rows.next().await? {
@@ -329,7 +328,7 @@ impl AspectMetadataStore {
 	///
 	/// Propagates any libSQL write failure.
 	pub async fn remove(&self, aspect: &str) -> Result<()> {
-		let conn = self.db.connect()?;
+		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
 		conn.execute("BEGIN CONCURRENT", turso::params![]).await?;
 		let res = conn.execute("DELETE FROM aspect_metadata WHERE aspect = ?", turso::params![aspect.to_string()]).await;
 		match res {

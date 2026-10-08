@@ -48,13 +48,20 @@
 //! no snapshot), and is otherwise reported at its first conflict, as every segment-index
 //! write was before this type existed. Seals (`InsertNew` and `SeqBump`, since S7) get the
 //! retries, as will the write-once swaps that replace the maintenance ops (S8, S9).
+//!
+//! **The write scope** (robustness track ROB-2). Every transaction runs inside
+//! [`control_plane_write`](crate::exec::control_plane_write), so the process's panic hook
+//! can tell a panic in the middle of a control-plane write from one in a read, and poison
+//! the process instead of letting it go on writing through a pager in an unknown state.
 
 use std::{fmt, time::Duration};
 
 use turso::Value;
 use weft_physical_type::SegmentDescriptor;
 
-use crate::types::durable::fault::{self, FaultPoint};
+use crate::types::durable::{
+	control_plane::connect, fault::{self, FaultPoint}
+};
 
 /// How many times a [`TxnErrorKind::Retryable`] failure is retried before it is
 /// returned (design section 5.1).
@@ -62,10 +69,10 @@ pub const MAX_RETRIES: u32 = 5;
 
 /// The `segment_index` columns every row write sets, in the order [`row_values`] binds
 /// them.
-const ROW_COLUMNS: &str = "aspect, id, path, format_version, physical_type, time_unit, row_count, null_count, time_sorted, min_ts, max_ts, min_value, max_value, byte_len, gen, prec, frame_crc, commit_epoch";
+const ROW_COLUMNS: &str = "aspect, id, path, format_version, physical_type, time_unit, row_count, null_count, time_sorted, min_ts, max_ts, min_value, max_value, byte_len, gen, prec, frame_crc, commit_epoch, series_id";
 
 /// One placeholder per [`ROW_COLUMNS`] entry.
-const ROW_PLACEHOLDERS: &str = "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?";
+const ROW_PLACEHOLDERS: &str = "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?";
 
 /// One `segment_index` row: the segment's descriptor plus the write-once columns layout
 /// v2 adds beside it.
@@ -88,13 +95,16 @@ pub struct IndexRow {
 	pub frame_crc: Option<u32>,
 	/// The aspect epoch the row committed in. `None` on legacy rows.
 	pub commit_epoch: Option<u64>,
+	/// The tag series the row's frame holds (tags A7): 0, the empty tag set, for every row
+	/// until tagged ingest lands.
+	pub series_id: u64,
 }
 
 impl IndexRow {
 	/// A legacy row: generation 0, nothing bound. What every seal and in-place rewrite
 	/// writes until the write-once protocols take over (S7-S10).
 	pub const fn legacy(desc: SegmentDescriptor) -> Self {
-		Self { desc, gen: 0, prec: None, frame_crc: None, commit_epoch: None }
+		Self { desc, gen: 0, prec: None, frame_crc: None, commit_epoch: None, series_id: 0 }
 	}
 
 	/// The identity a precondition on this row names.
@@ -137,6 +147,16 @@ pub enum IndexOp {
 	/// back, so a commit that used ids below `next_id` keeps them from being reissued
 	/// after a restart, whatever order such commits land in.
 	SeqBump { aspect: String, next_id: u64, epoch: u64 },
+	/// Record `store_meta[key] = value`, replacing what was there. The open mirrors its
+	/// `STORE_FORMAT` marker into `store_meta` with these.
+	MetaSet { key: String, value: String },
+	/// Raise `store_meta`'s `min_read_layout` and `min_write_layout` to at least `level`,
+	/// creating them if absent; neither moves back. A write that needs a newer layout's
+	/// readers puts this in its own transaction (`SegmentStore::ensure_floor`).
+	RaiseFloor { level: u32 },
+	/// Record that migration `id` (of release layout `layout`) applied, at `applied_ms`;
+	/// a migration already recorded keeps its first record.
+	RecordMigration { id: String, layout: u32, applied_ms: i64 },
 }
 
 impl IndexOp {
@@ -145,7 +165,10 @@ impl IndexOp {
 	/// writer committed in between (see the module documentation).
 	const fn is_guarded(&self) -> bool {
 		match self {
-			Self::InsertNew { .. } | Self::ReplaceExpected { .. } | Self::DeleteExpected { .. } | Self::SeqBump { .. } => true,
+			// The store_meta and store_migrations ops write the same value whoever runs them
+			// (a raise only ever raises), so running them again over another writer's commit
+			// changes nothing that writer did.
+			Self::InsertNew { .. } | Self::ReplaceExpected { .. } | Self::DeleteExpected { .. } | Self::SeqBump { .. } | Self::MetaSet { .. } | Self::RaiseFloor { .. } | Self::RecordMigration { .. } => true,
 			Self::Upsert { .. } | Self::Delete { .. } => false,
 		}
 	}
@@ -311,30 +334,33 @@ impl IndexTxn {
 	///
 	/// As [`run`](Self::run).
 	pub async fn run_while(&self, db: &turso::Database, may_retry: impl Fn() -> bool) -> Result<TxnApplied, IndexTxnError> {
-		let mut attempts = 1;
-		loop {
-			let failure = match self.attempt(db).await {
-				Ok(changes) => return Ok(TxnApplied { changes, attempts }),
-				Err(failure) => failure,
-			};
-			let error = IndexTxnError { attempts, ..failure.error };
-			let retry_safe = !failure.ops_ran || self.ops.iter().all(IndexOp::is_guarded);
-			if error.kind != TxnErrorKind::Retryable || !retry_safe || attempts > MAX_RETRIES {
-				return Err(error);
+		crate::exec::control_plane_write(async {
+			let mut attempts = 1;
+			loop {
+				let failure = match self.attempt(db).await {
+					Ok(changes) => return Ok(TxnApplied { changes, attempts }),
+					Err(failure) => failure,
+				};
+				let error = IndexTxnError { attempts, ..failure.error };
+				let retry_safe = !failure.ops_ran || self.ops.iter().all(IndexOp::is_guarded);
+				if error.kind != TxnErrorKind::Retryable || !retry_safe || attempts > MAX_RETRIES {
+					return Err(error);
+				}
+				tracing::debug!(retry = attempts, of = MAX_RETRIES, %error, "segment_index transaction lost an MVCC conflict; retrying it on a fresh snapshot");
+				tokio::time::sleep(backoff(attempts)).await;
+				if !may_retry() {
+					return Err(error);
+				}
+				attempts += 1;
 			}
-			tracing::debug!(retry = attempts, of = MAX_RETRIES, %error, "segment_index transaction lost an MVCC conflict; retrying it on a fresh snapshot");
-			tokio::time::sleep(backoff(attempts)).await;
-			if !may_retry() {
-				return Err(error);
-			}
-			attempts += 1;
-		}
+		})
+		.await
 	}
 
 	/// One attempt of [`run_while`](Self::run_while): the rows each op changed, or why it
 	/// failed.
 	async fn attempt(&self, db: &turso::Database) -> Result<Vec<u64>, AttemptFailure> {
-		let conn = db.connect().map_err(|e| AttemptFailure::before_ops(IndexTxnError::new(TxnErrorKind::Definite, None, format!("connecting: {e}"))))?;
+		let conn = connect(db).await.map_err(|e| AttemptFailure::before_ops(IndexTxnError::new(TxnErrorKind::Definite, None, format!("connecting: {e}"))))?;
 		conn.execute("BEGIN CONCURRENT", ()).await.map_err(|e| AttemptFailure::before_ops(IndexTxnError::new(statement_error_kind(&e), None, format!("BEGIN CONCURRENT: {e}"))))?;
 		let changes = match self.apply_ops(&conn).await {
 			Ok(changes) => changes,
@@ -364,6 +390,8 @@ impl IndexTxn {
 		}
 		let mut changes = Vec::with_capacity(self.ops.len());
 		for (index, op) in self.ops.iter().enumerate() {
+			#[cfg(test)]
+			crate::types::exec::observe_scope();
 			changes.push(apply(conn, op).await.map_err(|(kind, message)| IndexTxnError::new(kind, Some(index), message))?);
 			if let Some((after, point)) = self.points.after_op {
 				if after == index {
@@ -407,6 +435,17 @@ async fn apply(conn: &turso::Connection, op: &IndexOp) -> Result<u64, (TxnErrorK
 			let sql = "INSERT INTO aspect_seq (aspect, next_id, next_gen, epoch) VALUES (?, ?, 1, ?) ON CONFLICT (aspect) DO UPDATE SET next_id = MAX(next_id, excluded.next_id), epoch = MAX(epoch, excluded.epoch)";
 			conn.execute(sql, vec![Value::Text(aspect.clone()), integer(*next_id), integer(*epoch)]).await.map_err(|e| statement_error(&format!("raising the {aspect:?} allocator to {next_id}"), &e))
 		}
+		IndexOp::MetaSet { key, value } => conn.execute("INSERT OR REPLACE INTO store_meta (key, value) VALUES (?, ?)", vec![Value::Text(key.clone()), Value::Text(value.clone())]).await.map_err(|e| statement_error(&format!("recording store_meta {key}"), &e)),
+		IndexOp::RaiseFloor { level } => {
+			// store_meta holds text, so the comparison casts: as text, "10" < "9".
+			let sql = "INSERT INTO store_meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = CAST(MAX(CAST(value AS INTEGER), CAST(excluded.value AS INTEGER)) AS TEXT)";
+			let mut changed = 0;
+			for key in ["min_read_layout", "min_write_layout"] {
+				changed += conn.execute(sql, vec![Value::Text(key.to_string()), Value::Text(level.to_string())]).await.map_err(|e| statement_error(&format!("raising store_meta {key} to {level}"), &e))?;
+			}
+			Ok(changed)
+		}
+		IndexOp::RecordMigration { id, layout, applied_ms } => conn.execute("INSERT OR IGNORE INTO store_migrations (id, layout, applied_ms) VALUES (?, ?, ?)", vec![Value::Text(id.clone()), Value::Integer(i64::from(*layout)), Value::Integer(*applied_ms)]).await.map_err(|e| statement_error(&format!("recording migration {id}"), &e)),
 	}
 }
 
@@ -432,7 +471,7 @@ fn row_values(aspect: &str, row: &IndexRow) -> Result<Vec<Value>, (TxnErrorKind,
 		None => Value::Null,
 	};
 	let decimal = |value: Option<&bigdecimal::BigDecimal>| value.map_or(Value::Null, |v| Value::Text(v.to_plain_string()));
-	Ok(vec![Value::Text(aspect.to_string()), integer(desc.id), Value::Text(desc.path.clone()), Value::Integer(i64::from(desc.format_version)), physical_type, time_unit, integer(desc.row_count as u64), integer(desc.null_count as u64), Value::Integer(i64::from(desc.time_sorted)), desc.min_ts.map_or(Value::Null, Value::Integer), desc.max_ts.map_or(Value::Null, Value::Integer), decimal(desc.min_value.as_ref()), decimal(desc.max_value.as_ref()), integer(desc.byte_len), integer(row.gen), row.prec.map_or(Value::Null, integer), row.frame_crc.map_or(Value::Null, |crc| Value::Integer(i64::from(crc))), row.commit_epoch.map_or(Value::Null, integer)])
+	Ok(vec![Value::Text(aspect.to_string()), integer(desc.id), Value::Text(desc.path.clone()), Value::Integer(i64::from(desc.format_version)), physical_type, time_unit, integer(desc.row_count as u64), integer(desc.null_count as u64), Value::Integer(i64::from(desc.time_sorted)), desc.min_ts.map_or(Value::Null, Value::Integer), desc.max_ts.map_or(Value::Null, Value::Integer), decimal(desc.min_value.as_ref()), decimal(desc.max_value.as_ref()), integer(desc.byte_len), integer(row.gen), row.prec.map_or(Value::Null, integer), row.frame_crc.map_or(Value::Null, |crc| Value::Integer(i64::from(crc))), row.commit_epoch.map_or(Value::Null, integer), integer(row.series_id)])
 }
 
 /// The `aspect = ? AND id = ? AND gen = ? AND frame_crc IS ?` values of `expected`.
@@ -544,7 +583,7 @@ mod tests {
 		let vs: Vec<BigDecimal> = (0..4).map(BigDecimal::from).collect();
 		let segment = Segment::build(&ts, &vs, TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
 		let desc = SegmentDescriptor::of_segment(id, format!("/root/segments/a~g{gen}~p{gen}.weftseg"), 64 + id, &segment);
-		IndexRow { desc, gen, prec: Some(gen), frame_crc: crc, commit_epoch: Some(gen + 1) }
+		IndexRow { desc, gen, prec: Some(gen), frame_crc: crc, commit_epoch: Some(gen + 1), series_id: 0 }
 	}
 
 	/// `aspect`'s rows, in id order.
@@ -778,12 +817,60 @@ mod tests {
 		assert!(IndexOp::SeqBump { aspect: ASPECT.to_string(), next_id: 0, epoch: 0 }.is_guarded() && insert(row(0, 0, None)).is_guarded(), "a seal's transaction is retried on a conflict");
 	}
 
+	/// Robustness track ROB-2: every op of every transaction runs inside the control-plane
+	/// write scope, so a panic there is known to the panic hook as a write, and the scope
+	/// ends with the transaction.
+	#[tokio::test]
+	async fn every_op_runs_inside_the_control_plane_write_scope() {
+		let index = SegmentIndexStore::open_in_memory().await.expect("opens");
+		let txn = IndexTxn::new(vec![insert(row(0, 1, Some(1))), IndexOp::SeqBump { aspect: ASPECT.to_string(), next_id: 1, epoch: 0 }, IndexOp::MetaSet { key: "k".into(), value: "v".into() }]);
+		let seen = crate::types::exec::OBSERVED_SCOPES
+			.scope(std::cell::RefCell::new(Vec::new()), async {
+				index.apply(&txn).await.expect("commits");
+				assert!(!crate::exec::in_control_plane_write(), "the scope ends with the transaction");
+				crate::types::exec::OBSERVED_SCOPES.with(|seen| seen.borrow().clone())
+			})
+			.await;
+		drop(index);
+		assert_eq!(seen, vec![true, true, true], "each of the three ops ran inside the write scope");
+	}
+
+	/// The `store_meta` and `store_migrations` ops: `MetaSet` replaces, `RaiseFloor` only ever
+	/// raises both floors and compares them as numbers (as text "10" < "9"), and
+	/// `RecordMigration` keeps a migration's first record.
+	#[tokio::test]
+	async fn meta_floor_and_migration_ops_record_what_they_say() {
+		let index = SegmentIndexStore::open_in_memory().await.expect("opens");
+		let meta = |key: &'static str| {
+			let index = &index;
+			async move { index.meta(key).await.expect("reads") }
+		};
+		index.apply(&IndexTxn::new(vec![IndexOp::MetaSet { key: "layout_version".into(), value: "2".into() }, IndexOp::MetaSet { key: "layout_version".into(), value: "3".into() }])).await.expect("sets");
+		assert_eq!(meta("layout_version").await.as_deref(), Some("3"));
+		let mut floors = Vec::new();
+		for level in [9, 10, 3] {
+			index.apply(&IndexTxn::new(vec![IndexOp::RaiseFloor { level }])).await.expect("raises");
+			floors.push((meta("min_read_layout").await, meta("min_write_layout").await));
+		}
+		assert_eq!(floors, vec![(Some("9".into()), Some("9".into())), (Some("10".into()), Some("10".into())), (Some("10".into()), Some("10".into()))]);
+		for applied_ms in [5, 7] {
+			index.apply(&IndexTxn::new(vec![IndexOp::RecordMigration { id: "0002_s6_s7".into(), layout: 2, applied_ms }])).await.expect("records");
+		}
+		let mut rows = index.database().connect().expect("connects").query("SELECT id, layout, applied_ms FROM store_migrations", ()).await.expect("reads");
+		let row = rows.next().await.expect("reads").expect("one record");
+		let record = (row.get_value(0).expect("id"), row.get_value(1).expect("layout"), row.get_value(2).expect("applied_ms"));
+		assert!(rows.next().await.expect("reads").is_none(), "one record per migration");
+		drop(rows);
+		drop(index);
+		assert_eq!(record, (Value::Text("0002_s6_s7".into()), Value::Integer(2), Value::Integer(5)), "the first record stays");
+	}
+
 	/// Every column of every op round-trips: the write-once columns of a row written with
 	/// them, and the legacy shape (generation 0, nothing bound) of an upsert.
 	#[tokio::test]
 	async fn rows_round_trip_their_write_once_columns() {
 		let index = SegmentIndexStore::open_in_memory().await.expect("opens");
-		let fresh = row(0, 7, Some(u32::MAX));
+		let fresh = IndexRow { series_id: 42, ..row(0, 7, Some(u32::MAX)) };
 		let legacy = IndexRow::legacy(row(1, 0, None).desc);
 		let applied = index.apply(&IndexTxn::new(vec![insert(fresh.clone()), IndexOp::Upsert { aspect: ASPECT.to_string(), row: legacy.clone() }])).await.expect("commits");
 		let rows = rows_of(&index, ASPECT).await;
@@ -791,7 +878,7 @@ mod tests {
 		drop(index);
 		assert_eq!(applied.changes, vec![1, 1]);
 		assert_eq!(rows, vec![fresh.clone(), legacy.clone()]);
-		assert_eq!((legacy.gen, legacy.prec, legacy.frame_crc, legacy.commit_epoch), (0, None, None, None));
+		assert_eq!((legacy.gen, legacy.prec, legacy.frame_crc, legacy.commit_epoch, legacy.series_id), (0, None, None, None, 0));
 		assert_eq!(pruned, vec![fresh], "a time prune returns whole rows too");
 	}
 

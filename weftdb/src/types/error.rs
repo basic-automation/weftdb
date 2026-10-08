@@ -48,3 +48,46 @@ impl Error {
 pub fn is_transient_mvcc_error(err: &anyhow::Error) -> bool {
 	err.downcast_ref::<Error>().is_some_and(Error::is_transient_mvcc)
 }
+
+/// Why a [`SegmentStore`](crate::SegmentStore) refused to open its root (freeze design
+/// §4.3, FRE-12a), before it wrote anything a newer or damaged store could not survive.
+///
+/// It arrives inside an [`anyhow::Error`]; `downcast_ref::<StoreError>()` recovers it,
+/// whatever context the open added.
+#[derive(Debug, Clone, PartialEq, Eq, ThisError)]
+#[non_exhaustive]
+pub enum StoreError {
+	/// The store's `STORE_FORMAT` marker (or its `store_meta` copy) says it can only be
+	/// written by a WeftDB that knows layout `min_write` or newer, and this build knows
+	/// layouts up to `supported`. A newer WeftDB wrote it; writing to it with this one
+	/// would break that build's invariants. Nothing was opened or changed: only `LOCK`
+	/// and `LOCK.holder` were touched.
+	#[error("this store needs store layout {min_write} or newer to be written, and this WeftDB writes layouts up to {supported}: a newer WeftDB wrote it. Open it with that WeftDB, or a newer one")]
+	IncompatibleLayout {
+		/// The store's write floor (`min_write_layout`).
+		min_write: u32,
+		/// The newest layout this build reads and writes
+		/// ([`SUPPORTED_LAYOUT`](crate::SUPPORTED_LAYOUT)).
+		supported: u32,
+	},
+	/// The store's `STORE_FORMAT` marker exists but cannot be read as one: it is not
+	/// JSON, lacks a field every marker has, or names another kind of store. Nothing was
+	/// opened or changed.
+	#[error("the store marker {} cannot be read ({reason}); restore it from a backup, or remove it only if this root holds no WeftDB store", path.display())]
+	UnreadableStoreFormat {
+		/// The marker file.
+		path: std::path::PathBuf,
+		/// What is wrong with it.
+		reason: String,
+	},
+	/// The store is layout 1 and its segment index records frames whose paths leave
+	/// `segments/` (possible only through the aspect-name traversal fixed before 1.0), so
+	/// it cannot be migrated to layout 2 safely. The frames are neither moved nor
+	/// quarantined; the store opens again with the WeftDB that wrote it, which can drop
+	/// or re-seal those aspects.
+	#[error("the segment index records frames outside segments/ for {}: this store cannot be upgraded to layout 2 until they are dropped or re-sealed with the WeftDB that wrote them (nothing was moved or quarantined)", aspects.iter().map(|aspect| format!("{aspect:?}")).collect::<Vec<_>>().join(", "))]
+	UnsafeLegacyPath {
+		/// The aspects with such frames, in name order, each once.
+		aspects: Vec<String>,
+	},
+}

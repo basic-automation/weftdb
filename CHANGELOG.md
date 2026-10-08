@@ -54,9 +54,52 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   the new `weftdb::Poisoned` error until the process restarts, while reads keep
   working; the restart's open settles the transaction. `SegmentStore::poisoned()`
   reports it, and `GET /ready` gains `poisoned`, `restart_required` and
-  `poison_reason`. `WEFT_ON_AMBIGUOUS_COMMIT=exit` makes the process log and exit with
-  status 70 instead, for deployments whose supervisor restarts it (unset or `poison`
-  keeps the default).
+  `poison_reason`. `WEFT_ON_AMBIGUOUS_COMMIT=exit` makes `weft-server` log and exit
+  with status 70 once its store is poisoned, for deployments whose supervisor restarts
+  it (unset or `poison` keeps the default); the library itself never exits the process
+  (see the options entry under Changed). `SegmentStore::wait_until_poisoned()` and
+  `subscribe_poison()` let an embedder do the same.
+- **Store format marker and migration registry** (freeze design §4.3, FRE-12a). A
+  segment store root now carries a `STORE_FORMAT` file (plain JSON: `layout_version`,
+  `min_read_layout`, `min_write_layout`, `last_written_layout`, `migrating_to`,
+  `applied_through`, `store_uuid`, `scope`), written through the durable I/O layer
+  (temporary file, fsync, rename, directory fsync). The open reads it right after it
+  takes `LOCK` and before it opens any database, and refuses a store whose
+  `min_write_layout` is newer than this build's layout (`weftdb::SUPPORTED_LAYOUT`,
+  now 2) with `weftdb::StoreError::IncompatibleLayout`, having touched nothing but
+  `LOCK` and `LOCK.holder`; an unparseable marker is `StoreError::UnreadableStoreFormat`.
+  A new store writes its marker before any database file exists. Every control-plane
+  table is now created by a registered, idempotent migration (`0001_baseline`: the
+  pre-1.0 schema; `0002_s6_s7`: layout 2), recorded in a new `store_migrations` table
+  of `segment_index.db`; the open raises the marker's floors before it runs a pending
+  migration, so a crash half way never leaves floors an older WeftDB would not respect,
+  and mirrors the marker into `store_meta`. A store without a marker but with databases
+  is layout 1 and is migrated in place; one whose layout is newer than this build's but
+  whose write floor it meets opens without migrating (recovery is told to only report).
+  No database's own open runs DDL any more: `SegmentIndexStore::open` and the other
+  stores' `open`, used on their own, apply the registry's DDL for their database
+  without recording it.
+- `SegmentStore::open_report()` (`weftdb::OpenReport`: `created_new`,
+  `migrated_from`, the migrations `applied`, `recovery_report_only`),
+  `SegmentStore::store_uuid()` and `SegmentStore::store_format()`. `weft-server`
+  prints whether it created, opened or migrated its store, with the store's UUID and
+  layout.
+- `segment_index.series_id` (`INTEGER NOT NULL DEFAULT 0`, 0 being the empty tag set)
+  and `aspect_seq.next_series_id` (`DEFAULT 1`), in migration `0002`, so tagged
+  series need no table rebuild later (tags A7). Every row reads back as series 0.
+- `weftdb::exec::control_plane_write` and `weftdb::durable::poison_global()`
+  (robustness track ROB-2): every segment-index transaction runs inside the
+  task-local control-plane write scope, so a panic hook can tell a panic in the middle
+  of a control-plane write from one in a read, and the process-wide poison it would set
+  refuses every write of every store, as a store's own poison does, while reads go on.
+- `LOCK.holder` records the holder's host name and boot id beside its pid, and a
+  second opener's error names the host (`… in use by pid 1 on host db-2 (session …)`).
+  The short wait for a lock that a child being spawned still shares now applies only to
+  this process on this host in this boot: another container on the same volume, also
+  pid 1, is refused at once.
+- On Apple targets every control-plane connection sets `PRAGMA fullfsync=ON`, and the
+  open checks it beside `synchronous=FULL`: Turso syncs a COMMIT with plain `fsync`
+  there otherwise, which does not survive power loss.
 
 - `Database::list_stored_databases()` lists the legacy databases on disk (the folders
   of the data directory that hold a `metadata.db`), sweeping the build directories of
@@ -90,6 +133,29 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   used by `cargo test -p weft-server --features fault-injection --test maintenance_busy`.
 
 ### Changed
+
+- **Breaking for Rust users: `weftdb` reads no `WEFT_*` variable when it opens a
+  segment store, and never exits the process** (release plan C-1).
+  `SegmentStore::open` and `open_scoped` now use `SegmentStoreOptions::default()`
+  (no checkpoint index, no partial sidecars, no bit-sliced codec) whatever the
+  environment says; pass `SegmentStoreOptions::from_env()` to the new
+  `SegmentStore::open_with_options` / `open_scoped_with_options` to keep reading
+  `WEFT_SEGMENT_*`, as `weft-server` does. `WEFT_ON_AMBIGUOUS_COMMIT` is read by
+  `weft-server` alone; an ambiguous COMMIT only poisons the store, and the server exits
+  with status 70 on that under `exit`. Deployments of `weft-server` see no difference.
+- **Stored frame paths are resolved by splitting on both `/` and `\`**, so a store
+  written on Windows reads on Unix and the other way round, and a path that would lead
+  out of `segments/` (a `..`, no `segments` component) is refused instead of read
+  where it points. Upgrading a layout-1 store whose index records such a path fails
+  with `StoreError::UnsafeLegacyPath`, naming the aspects; nothing is moved or
+  quarantined.
+- A store root's parent that cannot be fsynced because its filesystem refuses (`EROFS`,
+  `EINVAL`, `ENOTSUP`: read-only mounts, FUSE and Docker Desktop bind mounts) is now
+  skipped with a warning when the root predates the open, as an unreadable parent
+  already was.
+- Adding a missing column during a migration now ignores only Turso's exact
+  duplicate-column error for that column; any other failure fails the open (the
+  `metadata.db` order-health column used to swallow every error).
 
 - **`splimes` moved to its own repository** ([basic-automation/splimes](https://github.com/basic-automation/splimes))
   and is now a crates.io dependency. It is released on its own schedule, and a stable
