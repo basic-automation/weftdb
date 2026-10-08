@@ -308,6 +308,14 @@ transposed layout costs +0.08% bytes and reads no faster than the linear codec
 ships **off by default**. A kernel speedup measured against a weak baseline is not a
 result, and this README would rather say so than quote the 5.7×.
 
+Exact decimals are not free yet either. An hourly `avg` over 1M real BTC closes takes
+**100.65 ms** through the shipped `BigDecimal` reduction against **2.33 ms** for the same buckets
+in `f64`, about a **43×** precision tax, where QuestDB documents ~2× for its `DECIMAL`. The
+same reduction over the exact scaled-integer mantissas WeftDB already stores runs in **1.44 ms**,
+faster than `f64`, so the gap comes from the arithmetic path and not from exactness itself
+([`weft-reduce/benches/decimal_tax.rs`](weft-reduce/benches/decimal_tax.rs)). An integer-native
+reduction is on the roadmap.
+
 ---
 
 ## HTTP API

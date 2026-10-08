@@ -1311,6 +1311,22 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   state **its own decimal-vs-f64 slowdown factor** against QuestDB's published ~2× or the wedge is
   asserted rather than measured. *(src: https://questdb.com/docs/query/datatypes/decimal/)*
 
+  - [x] **MEASURED (2026-10-08) — WeftDB's own decimal-vs-f64 factor is ~43×, not ~2×.**
+    `weft-reduce/benches/decimal_tax.rs` takes 1 Mi real BTC closes, hourly `avg`, three paths
+    cross-checked first (17,477 buckets; the integer sums equal the BigDecimal sums exactly). The
+    shipped `weft_reduce::reduce` over BigDecimal takes **100.65 ms**, an f64 loop **2.33 ms**, and
+    an **exact** scale-8 i64-mantissa loop summed in i128 **1.44 ms**. The shipped path also pays
+    `Point`/`DateTime` bucketing, which the tight loops do not, so 43× is the whole path, not pure
+    arithmetic. Either way, against QuestDB's documented ~2× the precision wedge currently costs
+    more than the competitor's, while the exact integer path WeftDB's `ScaledI64` columns already
+    store is *faster* than f64.
+  - [ ] **NEXT — a `ScaledI64`-native reduction fast path in `weft-reduce`:** reduce
+    `(epoch, mantissa, scale)` columns straight from the segment for count/sum/avg/min/max/first/last
+    (i128 accumulators), materializing a BigDecimal only per output bucket. It stays exact (the
+    BigDecimal stays the API type) and the measured ceiling is ~70× over today's path on this
+    corpus. Wire `SegmentStore::downsample_range` / the `.weftpart` sidecar to it, re-run
+    `decimal_tax` and `--ds-csv`, and publish the new factor beside QuestDB's.
+
 - [ ] **External-engine adapter fairness — three concrete rules from the 2026 landscape.**
   (a) **QuestDB egress:** QuestDB 10.0 (2026-08-06) introduced **QWP**, a binary columnar WebSocket
   protocol that supersedes both ILP (writes) and PG Wire (reads) and streams **Apache Arrow** record

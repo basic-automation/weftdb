@@ -5198,6 +5198,7 @@ version = "0.1.0"
 dependencies = [
  "bigdecimal",
  "chrono",
+ "criterion",
  "postcard",
  "serde",
  "splimes",
