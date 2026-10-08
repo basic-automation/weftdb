@@ -1,8 +1,11 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, path::PathBuf};
 
 use anyhow::{bail, Result};
 
-use crate::{types::database::traits::database_structure::DatabaseStructure, Aspect, Database, DatabaseId, Error, SubjectId, DATABASES};
+use super::creation;
+use crate::{
+	types::database::traits::{config::Config, database_structure::DatabaseStructure}, Aspect, Database, DatabaseId, Error, SubjectId, DATABASES
+};
 
 impl Database {
 	/// Lists all databases in the system.
@@ -17,6 +20,42 @@ impl Database {
 			result.insert(*db_id, db_info.name.clone());
 		}
 		result
+	}
+
+	/// Lists the databases stored in the data directory: every folder that holds a
+	/// `metadata.db`, by name, sorted. Unlike [`list_databases`](Self::list_databases),
+	/// which lists the databases opened in this process, this reads the disk.
+	///
+	/// It first removes the build directories that interrupted [`Database::new`] calls
+	/// left behind (`.{name}.creating-*`, crash-consistency design S18), and it never lists
+	/// a build directory, not even one a running `new` still owns. A missing data directory
+	/// holds no databases.
+	///
+	/// # Errors
+	/// - if the data directory exists but cannot be read
+	pub async fn list_stored_databases() -> Result<Vec<String>> {
+		let data_dir = PathBuf::from(<Self as Config>::get_data_dir());
+		// Best-effort: a leftover build directory is skipped below either way.
+		if let Err(e) = creation::sweep_stale_build_dirs(&data_dir).await {
+			if e.kind() != std::io::ErrorKind::NotFound {
+				tracing::warn!("Could not sweep stale database build directories in {}: {e}", data_dir.display());
+			}
+		}
+		let entries = match std::fs::read_dir(&data_dir) {
+			Ok(entries) => entries,
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+			Err(e) => return Err(e.into()),
+		};
+		let mut names = Vec::new();
+		for entry in entries {
+			let entry = entry?;
+			let Ok(name) = entry.file_name().into_string() else { continue };
+			if !creation::is_build_dir_name(&name) && entry.path().join("metadata.db").exists() {
+				names.push(name);
+			}
+		}
+		names.sort();
+		Ok(names)
 	}
 
 	/// Lists all subjects in a database - returns `HashMap`<`SubjectId`, String> for navigation
