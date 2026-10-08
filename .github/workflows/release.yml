@@ -61,7 +61,10 @@ jobs:
           cp target/${{ matrix.target }}/release/weft-server "$STAGE/"
           cp target/${{ matrix.target }}/release/weft-tui "$STAGE/"
           cp target/${{ matrix.target }}/release/weft-bench "$STAGE/"
-          cp README.md LICENSE "$STAGE/"
+          cp README.md LICENSE NOTICE "$STAGE/"
+          # Apache-2.0 section 4: the binaries contain code adapted from Chimp and DDSketch.
+          cp weft-physical-type/THIRD-PARTY-NOTICES "$STAGE/THIRD-PARTY-NOTICES-weft-physical-type"
+          cp weft-reduce/THIRD-PARTY-NOTICES "$STAGE/THIRD-PARTY-NOTICES-weft-reduce"
           tar -czf "$STAGE.tar.gz" "$STAGE"
           shasum -a 256 "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
 
@@ -76,7 +79,10 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/weft-server.exe" $stage
           Copy-Item "target/${{ matrix.target }}/release/weft-tui.exe" $stage
           Copy-Item "target/${{ matrix.target }}/release/weft-bench.exe" $stage
-          Copy-Item README.md, LICENSE $stage
+          Copy-Item README.md, LICENSE, NOTICE $stage
+          # Apache-2.0 section 4: the binaries contain code adapted from Chimp and DDSketch.
+          Copy-Item weft-physical-type/THIRD-PARTY-NOTICES "$stage/THIRD-PARTY-NOTICES-weft-physical-type"
+          Copy-Item weft-reduce/THIRD-PARTY-NOTICES "$stage/THIRD-PARTY-NOTICES-weft-reduce"
           Compress-Archive -Path $stage -DestinationPath "$stage.zip"
           (Get-FileHash "$stage.zip" -Algorithm SHA256).Hash.ToLower() + "  $stage.zip" |
             Out-File -Encoding ascii "$stage.zip.sha256"
