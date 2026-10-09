@@ -91,6 +91,10 @@ name = "downsample_range"
 harness = false
 
 [[bench]]
+name = "interpolate_range"
+harness = false
+
+[[bench]]
 name = "backup_cost"
 harness = false
 

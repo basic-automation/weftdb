@@ -166,15 +166,27 @@ pattern_pipeline), `datasets/`, `runners/` (local, docker_compose, cloud),
 - [ ] External-engine adapters — DuckDB first, then ClickHouse, InfluxDB 3, QuestDB, TimescaleDB (+ IoTDB)
 - [ ] Full TSBS-compatible comparison harness (ILP parser shipped; harness pending)
 - [x] **Storage/read/aggregation workloads shipped (2026-07-14)** — `point_lookup` (streaming point read, single/paged/batch, regular closed-form vs irregular), `range_fetch` (windowed range read), `compression` (realized bytes/point + value-column compression ratio + decode throughput), and `downsample` (the full reduction set: min/max/avg/sum/first/last + **p50/p90/p95/p99 percentiles** + **TWA**). Each is a parallel `run_*` runner over the `.weftseg`/`weft-reduce` hot path with a correctness gate, p50/p95/p99 latency, and a `--point-lookup`/`--range-fetch`/`--compression`/`--downsample` CLI mode; storage workloads take a `rows_per_page` paged-segment path. OHLC is open/high/low/close = first/max/min/last (already covered by the shipped reductions).
-- [ ] Remaining workloads — bulk-ingest growth curves (1M→10M→100M→1B), online ingest+query, gap fill, compressed query, analytics pipeline
-- [ ] Fair-protocol depth (Phase 1.1) — ≥10 reps for short tests, cold/warm/hot/post-compaction/post-restart separation, saturation curves (batch size, clients, writers, query concurrency, cardinality, dataset size, GPU output size), seeded randomized query mixes (published seeds), failure tests (restart during ingest, crash during compaction, network retry, partial/corrupt segment), independent-reproducibility packaging (versions, SHAs, images, configs, hardware, drivers, command lines, raw artifacts)
+- [x] **DONE (2026-10-09) — `gap_fill` workload** (`--gap-fill`): TSM-Bench Q5's shape (`SAMPLE BY … FILL(LINEAR)`) over a seeded series with outages, timing reduce + `weft_reduce::fill` (new: `Fill::{Null, Previous, Linear, Value}`, dense grid, `count == 0` marks a synthesized bucket) and scoring the filled buckets against the clean signal. One day at 1 s → minutes: linear 4.70 ms, RMSE 0.87; prev RMSE 6.36.
+  - [ ] **NEXT — `?fill=` on the downsample endpoints** (`POST /api/v1/downsample`, `GET …/storage/{aspect}/downsample` and their columnar siblings), with a bounded grid (`FillError::TooManyBuckets` → 400) and the `count == 0` provenance carried to JSON/CSV/Arrow/Parquet. Lanes: the compute handlers are L-COMPUTE and the stored-range handler L-STORAGE-READ ([1.0 plan §2](docs/release/1.0-plan.md#2-operating-rules-for-the-whole-release)), so coordinate before landing.
+  - [ ] **NEXT — arbitrary bucket widths** (`5s`, `15m`): `Resolution` only has unit steps, so Q5's literal `SAMPLE BY 5s` cannot be expressed. A width multiplier over `bucket_index` is the smallest change; it touches every reducing surface and the `.weftpart` re-bucket rules (`grids_nest`).
+  - [x] **DONE (2026-10-09) — gap fill on a real corpus** (`--gf-csv`): the same seeded outages cut from a real series, scored against the real values removed (the series' own gaps are filled, not scored). 1M real BTC closes, hourly, 3,168 hours cut: linear MAE $49.27 (0.67% of the $7,336 mean), prev $76.45.
+  - [x] **MEASURED (2026-10-09) — a spline fill (`Fill::Spline`, `--gf-fill cubic|quadratic`) does NOT beat linear on real prices.** Same outages: generated smooth signal, cubic RMSE 0.115 vs linear 0.865 (7.5× better); real BTC hourly MAE $55.34 cubic / $61.32 quadratic vs $49.27 linear, minute buckets $8.37 vs $6.79, at ~14% more time. Shipped as an opt-in fill, default stays linear; README states where it loses.
+  - [ ] **NEXT — a real smooth-signal corpus for the spline-fill claim.** The only real corpus is a price series, where linear wins; the generated sinusoid is where the spline wins. A real physical-sensor series (temperature, power, vibration) is needed before any "spline fill is more accurate" claim — the honest test of the interpolation wedge on gap fill.
+- [ ] Remaining workloads — bulk-ingest growth curves (1M→10M→100M→1B), online ingest+query, compressed query, analytics pipeline
+- [x] **DONE (2026-10-09) — first-rep/warm separation** (`BenchResult.cold_warm`, schema v21, every workload; console + Parquet). First-in-process, not OS-cold. Finding: the compression workload's first decode is 4.93× its warm p50, so its p95 at 10 reps is one cold rep; the others are 0.99–1.30×.
+  - [x] **EXPLAINED (2026-10-09) — the compression first rep is first-touch memory, not lazy init.** First rep minus warm p50 grows with the decode's size: 0.08–0.09 ms at 2k rows, 0.93–0.98 ms at 20k, 3.3–3.6 ms at 200k, then 2.0–2.6 ms at 1M where the warm reps pay it too (19.0–19.3 ms warm vs 21.0–21.9 first; glibc hands large blocks back to the OS, so a big decode faults every time). Nothing to fix in the codec; it is what a server's first query of a given size pays.
+  - [ ] **NEXT — OS-cold and post-restart runs:** drop the page cache (`/proc/sys/vm/drop_caches`, needs root — owner-gated) or re-exec per rep for the storage workloads that read files, so "cold" means a cold disk, not a cold process.
+- [ ] Fair-protocol depth (Phase 1.1) — ≥10 reps for short tests, hot/post-compaction/post-restart separation, saturation curves (batch size, clients, writers, query concurrency, cardinality, dataset size, GPU output size), seeded randomized query mixes (published seeds), failure tests (restart during ingest, crash during compaction, network retry, partial/corrupt segment), independent-reproducibility packaging (versions, SHAs, images, configs, hardware, drivers, command lines, raw artifacts)
 - [ ] Fair interpolation comparisons (Phase 1.2) — report three classes where possible: (A) native in-DB (Timescale gapfill, QuestDB `SAMPLE BY … FILL`, InfluxQL/SQL fill, ClickHouse ASOF/window, DuckDB window fns, IoTDB fns); (B) portable SQL baseline; (C) client-side end-to-end. Don't hide unfavorable results.
 - [x] **DONE (2026-10-08) — disk capture:** `RunMetadata.work_disk_{kind,file_system,mount_point}` (schema v19). The disk
   under the working directory, found by longest mount-point prefix through `sysinfo::Disks`.
   Verified live: a run from `/mnt/deepmem` reports `hdd btrfs`, one from `/` reports `ssd btrfs`.
-- [ ] Remaining hardware capture — GPU and driver versions in run metadata. **Unblocked (INT-0, 2026-10-08):** splimes 1.0 is on main (PR #62) and its `gpu::gpu_info()` has a `driver` field; an interpolation run's `metadata.engine.gpu` (schema v16) already names the GPU adapter, so the driver version is what remains. Original note: needs a wgpu adapter
-  query; `splimes` owns the adapter)
-- [ ] Report surfaces beyond JSON/HTML — Parquet / Grafana dashboards
+- [x] **DONE (2026-10-09) — GPU and driver versions in run metadata:** an interpolation run's
+  `metadata.engine` names the adapter (`gpu`, schema v16) and now its driver (`gpu_driver`, schema
+  v20, from splimes' `GpuInfo::driver`). Verified live: `NVIDIA GeForce RTX 4070 Ti SUPER (vulkan,
+  discrete; f64 shaders: yes)`, driver `NVIDIA 610.57.04`.
+- [x] **DONE (2026-10-09) — Parquet report surface:** `--parquet` writes a flat results table (one row per result, run metadata repeated, nullable accuracy/storage) beside the JSON, through `weft-arrow`'s writer.
+- [ ] Report surfaces beyond JSON/HTML/Parquet — Grafana dashboards (the Parquet table is their natural source)
 - [ ] Anti-Goodhart (Phase 1.3) — publish negative results + WeftDB-losing workloads; benchmark code separate from engine code; run customer-supplied workloads; README policy line *("WeftDB benchmarks guide real engineering decisions, not synthetic wins")* — policy line + the sawtooth negative finding shipped; the publication pipeline is open
 
 ### Phase 2 — Benchmark-grade server/API · *Very high*
@@ -382,7 +394,14 @@ transfer, kernel, readback, and API serialization, p95 = Z."*
 - [ ] 5.7 Multi-GPU *(deferred until single-GPU wins are proven)*
 - [ ] Memory-mapped GPU I/O *(only after transfer bottlenecks are measured)*
 - [ ] End-to-end GPU interpolation benchmark (storage read → … → API serialization, with p95)
-- [ ] GPU memory-stability + pool-eviction benchmark (verify stable GPU memory across repeated interpolation calls; pool statistics under large/small batches)
+  - [x] **DONE (2026-10-09) — the storage half:** `SegmentStore::interpolate_range` (new `weftdb::types::interpolate_range` module, a `mod` hook only, no `segment_store.rs` edit) and `weftdb/benches/interpolate_range.rs`. **Finding: the GPU loses end to end.** 1 Mi stored samples / 16 segments, cubic to one-second points: ~1M points from 100k knots take 45.3 ms on rayon, 67.9 ms on the GPU, 137.3 ms on one thread (~100k points: 7.7 / 10.9 / 15.5 ms), while `--gpu-memory` measured the GPU at ~152M points/s in isolation.
+  - [x] **MEASURED + DONE (2026-10-09) — where the end-to-end time goes, and the `f64` egress.** On the 100k-knot / ~1M-point window: read+decode 4.1 ms; rayon cubic 7.7 ms with an `f64` result vs 38.0 ms with the `BigDecimal` result; GPU 17.6 vs 59.4 ms. The per-point `BigDecimal` output is ~80% of the call. `SegmentStore::interpolate_range_f64` (knots via the new `weft_reduce::decimal_to_f64`, bit-identical to `to_f64`) takes ~1M points end to end in 14.1–16.3 ms on rayon against 43.3–51.5 ms (two runs).
+  - [ ] **FOUND (2026-10-09) — the compute endpoints widen JSON `f64` values with `BigDecimal::from_f64`** (`weft-server/src/downsample.rs:138`, `interpolate.rs:347` and `:591`), i.e. to each float's exact binary expansion: a client's `99.92` is reduced as `99.9200000000000017053025658242404460906982421875`. That is exactly the downsample generator's old `--ds-decimals full` case, measured at **13.7×** slower hourly `avg` (197.8 vs 14.4 ms at 500k points) and **13.1×** for exact `p99` (414.2 vs 31.5 ms) against two-decimal values. Widening through the shortest round-trip decimal (`f.to_string().parse::<BigDecimal>()`, or a `serde_json` arbitrary-precision number so the client's decimal text arrives intact) would make the reductions cost what they do on real decimals and compute on the value the client wrote. L-COMPUTE lane; it changes result digits only below `f64` resolution, which the JSON response narrows away.
+  - [ ] **NEXT — the compute endpoints pay the same tax:** `POST /api/v1/interpolate` builds a `BigDecimal` per output point and then narrows it to JSON `f64` ("only the final wire value is narrowed"), so its JSON/CSV/Arrow outputs could take `run_f64` and skip ~80% of the work (raw points would then be `f64`-rounded; they already are on the JSON wire). L-COMPUTE lane.
+  - [ ] **Reconcile with EVI-10A:** the 1.0 plan's decision 18 ships stored interpolation as a library API in slice EVI-10A (W3, a new child module with a one-line `mod` hook between D-S10 and D-S11), with the HTTP route deferred past 1.0. `SegmentStore::interpolate_range` / `interpolate_range_f64` (2026-10-09) take exactly that form; the evidence track should review the API (the `margin` knob, the `f64` variant, the error vocabulary) and adopt or reshape it rather than land a second one.
+  - [ ] **NEXT (post-1.0 per decision 18) — the HTTP endpoint:** `GET …/storage/{aspect}/interpolate?start=&end=&resolution=&spline=&margin=` with JSON/CSV/Arrow/Parquet like the other storage reads and a bounded grid. **Missing today and not tracked before:** the HTTP API can interpolate only a request-supplied series, so commercial claim #1 (interpolation-on-read for large stored ranges) has no API surface. The router (L-ROUTER) and storage read handlers (L-STORAGE-READ) are lanes, so it lands through their owners.
+- [x] **DONE (2026-10-09) — GPU memory-stability + pool-eviction benchmark** (`weft-bench --gpu-memory`, `gpu_pool` in schema v22): on the RTX 4070 Ti SUPER the default 512 MiB pool created 2 buffer sets over 60 mixed-size calls (none after round 1, 0 evictions, idle steady at 112 MiB); a 32 MiB cap evicted 20 and re-created 19 at an unchanged per-call p50.
+  - [ ] **NEXT — device memory, not just pool bytes:** `gpu_pool_stats` counts splimes' idle buffers; a leak outside the pool (wgpu staging, driver) would not show. Sample the adapter's allocated bytes over a long soak. **Checked 2026-10-09: `nvidia-smi` cannot do it here** — a wgpu (Vulkan) process does not appear in `--query-compute-apps`, and the device total is shared with every other workload on the GPU, so it cannot attribute a leak. The route is wgpu's own allocator report (`Device::generate_allocator_report`), which splimes would have to expose (a splimes-repo ask).
 
 ### Phase 6 — Compression v2 · *High*
 
@@ -1401,7 +1420,21 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 
 ## Immediate next actions
 
-- [ ] **START HERE (filed 2026-10-08 for the next run).** The 2026-10-08 run (PR `routine/dsp-2026-10-08`)
+- [ ] **START HERE (filed 2026-10-09 for the next run).** The 2026-10-09 run (PR `routine/dsp-2026-10-09`)
+  worked the lanes no other session owns (weft-reduce, weft-bench, a new `weftdb` child module) and
+  filed the lane-owned follow-ups instead of landing them. Recommended order:
+  1. **Lane-owned fixes this run measured and filed (hand to the owners):** the compute endpoints'
+     `BigDecimal::from_f64` widening (13.7× reduction tax on JSON input; L-COMPUTE), their
+     per-point `BigDecimal` output before narrowing to JSON `f64` (~80% of an interpolation;
+     L-COMPUTE), and `?fill=` on the downsample endpoints (L-COMPUTE / L-STORAGE-READ).
+  2. **EVI-10A review:** `SegmentStore::interpolate_range` / `_f64` already have the form decision 18
+     asks for; the evidence track adopts or reshapes them.
+  3. **Free-lane residue:** the sketch's dense bin store (keeps the sidecar's serde form; the
+     sketch is now the costliest per-sample reduction on the integer path), arbitrary bucket
+     widths for Q5's `SAMPLE BY 5s` (freeze-track API decision first), a real smooth-signal corpus
+     for the spline-fill question.
+  4. The 2026-10-08 list below still stands for owner decisions and the durability-gated items.
+- [ ] **(2026-10-08 list.)** The 2026-10-08 run (PR `routine/dsp-2026-10-08`)
   rebuilt the codec read path and cut the exact-decimal reduction tax. Recommended order:
   (1) owner decisions waiting: `VAL_CODEC_DFOR` (BTC 33.7 → 13.6 bits/value), the timestamp
   common-multiple codec, ALP adoption, and retiring `VAL_CODEC_TRANSPOSED`; (2) the remaining ~6×
@@ -1500,6 +1533,33 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   - [ ] **NEXT — the remaining 6.3×:** per-bucket BigDecimal materialization (six values + the
     `BTreeMap<String, _>` per bucket) and the window decode (~30 ms of the 59.7). Profile before
     choosing.
+    - [x] **DONE (2026-10-09) — no per-sample bucket indexing on time-ordered input.**
+      `reduce_scaled`'s accumulation and `reduce_partial_scaled`'s sketch pass keep the current
+      bucket's nanosecond range (`base_range`, proven tight against `base_of` over every
+      resolution, both signs) and index a sample only when it leaves it; the sketch pass finds a
+      bucket by binary search instead of a `BTreeMap` lookup per sample. Criterion
+      `decimal_tax`, pinned to one core, three alternating pairs: hourly `sum` 7.52/8.02/7.83 →
+      6.85/5.41/6.80 ms, hourly `avg` 16.40/17.36/16.37 → 15.08/15.50/14.99 ms; per segment
+      `scaled_avg_sketch_p99` 83.8/92.4/85.6 → 60.7/59.2/74.9 ms (unpinned, load ~14);
+      `scaled_streaming6` unchanged within noise (the decode dominates).
+    - [x] **DONE (2026-10-09, sub-items below) — the `avg` division was the biggest piece of `reduce_scaled`:** hourly `avg`
+      costs ~8 ms over `sum` for 17,477 buckets (~0.5 µs each); BTC averages do not terminate, so
+      every bucket's quotient carries all 100 digits.
+      - [x] **TRIED (2026-10-09), NO WIN — 19 digits per `u128` division.** Base-10¹⁹ long
+        division gives `bigdecimal`'s digit string exactly (it passed the equality test, widened
+        this run to 25,000+ cases including full-range `u64` counts and quotients that terminate
+        mid-chunk), but pinned A/B over three pairs left hourly `avg` at 14.49/15.38/15.77 →
+        15.61/14.30/13.97 ms, inside the noise. The digit loop is not the cost; not landed (the
+        widened test is).
+      - [x] **DONE (2026-10-09) — one `BigUint` multiply + one division per non-terminating
+        average.** `avg_like_bigdecimal` tests termination first (`count / gcd` has only factors
+        2 and 5); a non-terminating quotient, which always runs to 100 digits, is
+        `floor(num · 10^m / count)` rounded on the next digit (`10^m` from a table built once),
+        bit-identical over the widened equality test; terminating ones keep the digit loop.
+        Criterion pinned, nine alternating pairs: hourly `avg` `reduce_scaled` median **15.29 →
+        8.99 ms** (seven pairs 6.74–9.66 ms after; two load-spike outliers at 18.8/20.1), the
+        BigDecimal `reduce` 63.2/64.4/60.0 → 54.6/53.3/55.0 ms. The exact-integer path is now
+        **~4.0× f64** (2.27 ms), against QuestDB's documented ~2×.
   - [ ] **NEXT — the sidecar build.** The `.weftpart` sidecar build
     (`write_partial_sidecar`) receives the seal's BigDecimal values rather than stored mantissas,
     so switching it means threading the seal's encoded column through instead. Its callers sit in
@@ -1588,10 +1648,98 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
       binary expansions carry ~50 significant digits and make every BigDecimal op expensive. Real
       two-decimal prices do not. So the README's reduction table, which is all generator-based,
       **understates** WeftDB on real price data.
-    - [ ] **NEXT — make the downsample generator emit realistic decimals** (e.g. round the signal to
-      2–4 places, as the compression shapes already do) and re-measure the README reduction table.
-      This changes published numbers, so do it as one explicit re-baselining commit, keeping the old
-      figures cited as "pre-2026-10 generator".
+    - [x] **DONE (2026-10-09) — the harness times the integer path too:** `--ds-scaled` runs
+      `reduce_partial_scaled` + `finish` over the series as one `ScaledI64` column (rescaled to the
+      largest scale, as a sealed column is), gated on equalling `reduce` bucket for bucket. Hourly
+      `avg`: 500k two-decimal points 0.58 vs 14.40 ms; 1M real BTC closes 6.4 vs 52.8 ms.
+    - [x] **DONE (2026-10-09) — the interpolation generator: pessimistic at scale, now a knob.**
+      Its samples are exact binary expansions too. On 100k samples the flagship-shaped run
+      interpolates in 50.4–53.7 ms against 24.6–25.8 ms at two decimals (~2×, three runs each,
+      accuracy unchanged to 0.2 RMSE); at the 480-sample flagship the gap is ~5%. `--decimals N`
+      (`SyntheticParams::value_decimals`) rounds the samples; the default stays the exact
+      expansion, because zero-noise accuracy scoring needs samples exactly on the truth. No
+      published figure used the generator's speed.
+    - [ ] **Remaining audit:** the storage generators already emit exact two-decimal text (checked
+      2026-10-09: `point_lookup` and `range_fetch` seal the sawtooth `10000000.{i % 97:02}`, the
+      `compression` shapes are two-decimal), so the open part is whether those value patterns are
+      representative, which only a real-corpus run per workload answers; all three now have one
+      (`--pl-csv`, `--rf-csv`, `--comp-csv`).
+    - [x] **DONE (2026-10-09) — the downsample generator emits realistic decimals:** values are
+      rounded to `--ds-decimals` places (default 2; `full` keeps the pre-2026-10 binary expansion), and
+      the README reduction table was re-baselined with both generators measured back to back. On 1M
+      points (hourly `avg,p99,twa`) the two-decimal generator runs at 5.10M points/s against 4.49M for
+      real BTC closes and 0.61M for the old generator, so it is now within 1.14× of real data rather than
+      7.3× pessimistic.
+    - [ ] **FOUND (2026-10-09) — `sketch_p99`'s published ~2.6× speed-up over exact `p99` was the
+      generator's.** On two-decimal values the two run level (74.1 vs 74.9 ms, 500k points hourly,
+      10 reps); on 1M real BTC closes the sketch is 1.36× faster. The README now says speed is not the
+      reason to pick the sketch.
+      - [x] **DONE (2026-10-09) — exact percentiles select instead of clone-and-sort.** `BucketAcc::finish`
+        ranks borrowed `(value, arrival index)` pairs, so the result equals the old stable sort
+        including the scale of tied values (tested); one percentile uses `select_nth_unstable_by`,
+        several share one sort, and only the selected value is cloned. Single `p99`, hourly, 10 reps,
+        two runs each, before → after: two-decimal 500k **59.7/59.1 → 32.3/38.7 ms**, real BTC 1M
+        **203/116 → 77/96 ms**, full-expansion 500k (5 reps) **1,451/1,362 → 387/418 ms**; all four
+        percentiles together level (real 120/155 → 119/115 ms). Exact `p99` is now ~2× faster than
+        `sketch_p99`.
+      - [x] **DONE (2026-10-09) — the sketch's per-sample `BigDecimal → f64`.** For a value
+        `m × 10^-s` with `|m| < 2^53` and `0 <= s <= 22`, `m as f64 / 10^s` rounds the exact quotient
+        once and is bit-identical to `bigdecimal` 0.4.11's `to_f64`, which (below ~44 digits) formats
+        `<digits>e-<s>` and parses it with std's correctly rounded parser. `DdSketch::add_decimal`
+        takes that path (borrowing the digits), and `reduce_partial_scaled` feeds mantissas straight
+        in (`add_scaled`), so sketches are unchanged (tested bit for bit over 23 scales × 4,000+
+        mantissas). Harness `sketch_p99`, hourly, before → after: two-decimal 500k **63.8/67.0 →
+        30.3/31.6 ms**, real BTC 1M **148.8/149.0 → 76.2/77.4 ms**; the ~50-digit `full` series
+        falls back and is ~4% slower (288.6/303.9 → 304.6/314.9 ms, the extra check). Per sealed
+        1 Mi-row real segment (`decimal_tax` criterion, decode + `avg,sketch_p99`, load avg ~38): the
+        scaled route **202.2 → 97.0 ms (−54%)**, the BigDecimal route 196.4 → 145.5 ms (−27%).
+        Re-check if `bigdecimal` is upgraded: the proof leans on its `to_f64` implementation.
+        *(Checked 2026-10-09: 0.4.11, released 2026-10-03, is the latest on crates.io and the one
+        locked; its notes touch square root, inverse and exp, not `to_f64` or `/`. src:
+        https://github.com/akubera/bigdecimal-rs/releases)*
+      - [x] **DONE (2026-10-09) — the sketch skips `ln` for a value inside the last sample's bucket**
+        (`BinCache`: the bucket shrunk by a relative 1e-9, far wider than `ln`'s index error, so
+        the index is exactly the logarithm's; invisible to equality and serde, so sidecars are
+        unchanged). `sketch_p99`, hourly, 10 reps, three alternating pairs at load ~33: real BTC
+        closes 48.3/46.2/46.7 → 35.4/36.2/35.8 ms (BigDecimal points) and 27.5/24.7/25.2 →
+        18.1/18.9/17.9 ms (`--ds-scaled`); the noisier generated series gains ~5%.
+      - [ ] **Research (2026-10-09) — a cheaper sketch index, if the sketch format is ever revised.**
+        `DdSketch::index` computes `v.ln()` per sample. DataDog's reference sketches-java ships
+        `CubicallyInterpolatedMapping`, which takes `floor(log2 v)` from the float's bits and
+        interpolates the rest cubically, "much faster than computing the logarithm … by a factor of
+        6" at **1%** more bins than the logarithmic mapping. Adopting it changes every bin index, so
+        persisted `.weftpart` sketches would no longer merge with new ones: it needs a sidecar
+        format/version bump (L-FMT/freeze territory) and a measurement that `index` is a material
+        share of `sketch_p99` first. *(src:
+        https://github.com/DataDog/sketches-java/blob/master/src/main/java/com/datadoghq/sketch/ddsketch/mapping/CubicallyInterpolatedMapping.java)*
+      - [ ] **Positioning (2026-10-09) — exact percentiles are a differentiator against QuestDB.**
+        QuestDB's aggregate docs list only `approx_percentile`/`approx_median` (HdrHistogram, a
+        precision knob 0–5, and an error on any negative value); no exact percentile is listed.
+        WeftDB's exact nearest-rank `p*` over exact decimals now runs level with its own sketch, so
+        Weft-Bench's QuestDB arm should compare `approx_percentile` against both `sketch_p*` and
+        exact `p*`, and say which is which. *(src: https://questdb.com/docs/query/functions/aggregation/)*
+      - [x] **DONE (2026-10-09) — the scaled partial serves exact percentiles and TWA.**
+        `reduce_partial_scaled` now accepts every reduction, collecting each bucket's
+        `(instant, value)` samples in input order as `reduce_partial` does while sum, min, max,
+        first and last stay integer (equality-tested alone, filtered, and merged both ways with
+        BigDecimal partials). Before, a stored-range `p*`/`twa` downsample decoded the window
+        physically, was declined, and decoded it again. `decimal_tax` per real 1 Mi-row segment,
+        `avg,p99,twa`, pinned, three pairs: the store's route 210.9/215.6/245.3 → 147.3/167.2/155.1
+        ms (the plain BigDecimal route is 190–210 ms). Runtime-verified on the live server against
+        an independent Python nearest-rank and LOCF computation.
+      - [x] **DONE (2026-10-09) — `reduce`/`reduce_partial` take the integer path themselves**
+        when every value fits an `i64` mantissa at the series' largest scale (≤ 18 places), mixed
+        scales included: compare and sum on integers, locate min/max/first/last by position and
+        return the original values, collect original samples, bring each bucket's sum back to its own
+        largest scale. Postcard bytes of the partial and every finished value's `(digits, scale)` are
+        identical to the BigDecimal reference (tested over mixed scales 0..=8 with equal values at
+        different scales). Pinned criterion on 1 Mi real BTC closes: hourly `avg` 53.0/52.8/52.6 →
+        23.0/22.9/28.3 ms, `sum` 50.8/50.9/50.6 → 20.8/20.4/21.9 ms. `POST /api/v1/downsample` gains
+        once its `from_f64` widening (above) is fixed; today its ~50-digit values decline the path.
+      - [ ] **NEXT — select on the mantissas when a partial is not merged.** A single-segment
+        downsample could rank `i64` mantissas and build one `BigDecimal` per bucket, but a
+        `PartialReduction` must carry `BigDecimal` samples to merge; a finish-only fast path
+        needs `SegmentStore::downsample_range`'s inline single-segment route (L-STORE lane).
 
 - [x] **DONE (2026-07-20) — BUG ROOT-CAUSED + FIXED: the "flaky GPU interpolation tests" were never a
   GPU bug.** The roadmap offered two hypotheses — a real GPU race, or an unsound check. **Both the
@@ -1703,6 +1851,15 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
     output), and `test_pipeline_api_with_fake_db` was never reached. The time-range failures are
     therefore **unconfirmed either way**. These tests need the bounding below before they can give
     a verdict.
+- [ ] **Re-measured 2026-10-09 — still unbounded.** With test databases now in a per-binary temp dir,
+  `cargo test -p weft-orchestration` without `SKIP_SLOW_TESTS` passed 12 tests and
+  `test_api_precise` in **331 s**, then hit a 40-minute `timeout` with eight `#[serial]` tests
+  unfinished (`test_api`, `test_batch_processing`, `test_load_or_create_pipeline`,
+  `test_pipeline_api`, `test_pipeline_api_precise`, `test_pipeline_api_with_fake_db`,
+  `test_run_subject_pipelines`, `test_specific_process_batch`; being serial, most had not
+  started). No failure was printed, so the time-range failures stay unconfirmed. Another session
+  was running `weft-orchestration` crash tests on the same box (`legacy_queue_crash`, durability),
+  so bounding these belongs with whoever owns that crate's lane.
 - [ ] **Bound the seven slow `weft-orchestration` tests the way `db_tests` was bounded.** Each
   spends ~6–10 minutes; `test_create_btc_1min_database` was made runnable by capping its row count
   and using a temp data dir (`BTC_TEST_MAX_ROWS`, default 5,000). The same treatment here would let
@@ -1961,7 +2118,8 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 - [x] Create `weft-bench` as a first-class workspace member
 - [x] Define the first benchmark profile: `interpolation-heavy-irregular`
 - [x] WeftDB adapter + portable baselines (linear class-C, forward-fill class-B) + accuracy scoring + shape-selectable ground truth
-- [ ] Add the **DuckDB** adapter — the first external-engine (real database) baseline
+- [ ] Add the **DuckDB** adapter — the first external-engine (real database) baseline *(owned by the evidence track's EVI-13 → 14 → 15 slices: decision 18 specifies WeftDB against DuckDB `DOUBLE` and `DECIMAL` on MCAR, block-missingness and UCI household-power data at three scales. Note for whoever lands it: the `duckdb` crate 1.10506.0 is MIT but pulls `arrow` 58 non-optionally beside the workspace's 60, plus a bundled C++ build, so it belongs behind an off-by-default feature; checked 2026-10-09)*
+  - [ ] **Research (2026-10-09) — DuckDB has a native linear-interpolation arm:** the `fill(expr ORDER BY x)` window function "replaces `NULL` values of `expr` with a linear interpolation based on the closest non-`NULL` values and the sort values", with one ordering key, and uses **linear extrapolation** for missing values at the ends. So the cross-engine report can run DuckDB as fair-protocol **class A** (a `range()` grid left-joined to the knots, then `fill(value ORDER BY ts)`), not only as a portable-SQL class B baseline. Two fairness notes: its edges extrapolate linearly where splimes' cubic holds the edge value, so score the interior separately or align the edge policy, and it is linear-only, so compare it against WeftDB's linear arm and report the spline arms beside it. *(src: https://duckdb.org/docs/current/sql/functions/window_functions)*
 - [ ] Add ClickHouse, InfluxDB 3, QuestDB, TimescaleDB adapters
 - [x] Implement InfluxDB Line Protocol ingest (shared `weft-line-protocol` crate; bench + server wired end-to-end)
 - [ ] Add end-to-end timing spans *(harness-level spans shipped; per-pipeline-stage spans = Phase 3 tracing item)*

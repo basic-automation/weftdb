@@ -73,9 +73,13 @@ use crate::{
 /// beats the realized timestamp codec. v19 added the report's `metadata.work_disk_kind` /
 /// `work_disk_file_system` / `work_disk_mount_point` (the disk under the working directory, so
 /// an HDD-backed run is distinguishable from a solid-state one). (v17–v19 were numbered v16–v18
-/// on the 2026-10-08 routine branch before it merged behind main's v16.) All optional fields are
+/// on the 2026-10-08 routine branch before it merged behind main's v16.) v20 added
+/// `metadata.engine.gpu_driver` (the GPU driver's name and version, beside the adapter in
+/// `metadata.engine.gpu`). v21 added `cold_warm` (the first timed rep apart from the rest,
+/// [`ColdWarm`]). v22 added `gpu_pool`, the GPU buffer pool's behaviour over a `gpu_memory` run.
+/// All optional fields are
 /// `#[serde(default)]`, so older artifacts still deserialize.
-pub const SCHEMA_VERSION: u32 = 19;
+pub const SCHEMA_VERSION: u32 = 22;
 
 /// Metadata describing the dataset a result was measured against.
 ///
@@ -434,6 +438,49 @@ pub struct BenchResult {
 	/// absent.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub storage: Option<StorageEstimate>,
+	/// The first timed rep apart from the rest (schema v21). `None` with fewer than two
+	/// reps, and for older artifacts.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub cold_warm: Option<ColdWarm>,
+	/// What the GPU buffer pool did over a `gpu_memory` run (schema v22); `None` for every
+	/// other workload and for older artifacts.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub gpu_pool: Option<crate::gpu_memory::GpuPoolSummary>,
+}
+
+/// The first timed repetition apart from the remaining ones.
+///
+/// The fair-protocol rule is that a first run (caches, allocator and page-table warm-up,
+/// lazy initialization) is reported separately from the steady state, not folded into it.
+///
+/// This is **first-rep-in-process**, not an OS-cold measurement: the dataset is generated
+/// or loaded before the timed reps, so it is already in memory. [`BenchResult::latency`]
+/// still covers every rep, so no headline number changes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColdWarm {
+	/// The first timed rep, in nanoseconds.
+	pub first_rep_ns: u64,
+	/// Every rep after the first.
+	pub warm: LatencyStats,
+}
+
+impl ColdWarm {
+	/// Split `samples` (in rep order): `None` with fewer than two.
+	#[must_use]
+	pub fn from_samples(samples: &[u64]) -> Option<Self> {
+		match samples {
+			[first, rest @ ..] if !rest.is_empty() => Some(Self { first_rep_ns: *first, warm: LatencyStats::from_samples(rest) }),
+			_ => None,
+		}
+	}
+
+	/// How many times slower the first rep was than the warm median (`1.0` = no
+	/// warm-up cost); `None` when the warm median is zero.
+	#[must_use]
+	pub fn first_rep_ratio(&self) -> Option<f64> {
+		#[allow(clippy::cast_precision_loss)]
+		(self.warm.p50_ns > 0).then(|| self.first_rep_ns as f64 / self.warm.p50_ns as f64)
+	}
 }
 
 impl BenchResult {
@@ -451,7 +498,7 @@ mod tests {
 
 	fn sample_result() -> BenchResult {
 		let samples = [100, 200, 300];
-		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "weftdb".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: Some(SignalShape::MultiSine) }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true }, accuracy: Some(AccuracyMetrics { count: 1000, rmse: 1.5, mae: 1.1, max_abs_error: 4.2, bias: -0.3 }), storage: Some(StorageEstimate { physical_type: "scaled_i64".to_string(), value_count: 200, estimated_value_bytes: 1600, realized_value_bytes: 420, value_codec: "varint".to_string(), bytes_per_point: 2.1, is_exact: true, lossy_count: 0, max_abs_error: "0".to_string(), tolerance: "0".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 208, timestamp_bytes_per_point: 1.04, total_bytes_per_point: 3.14, advisory_best_f64_bytes: None, advisory_best_f64_codec: None, advisory_fire_timestamp_bytes: Some(180), advisory_delta_cascade_value_bytes: None, advisory_dfor_value_bytes: None, advisory_common_multiple_timestamp_bytes: None, advisory_delta_for_timestamp_bytes: None }) }
+		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "weftdb".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: Some(SignalShape::MultiSine) }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true }, accuracy: Some(AccuracyMetrics { count: 1000, rmse: 1.5, mae: 1.1, max_abs_error: 4.2, bias: -0.3 }), storage: Some(StorageEstimate { physical_type: "scaled_i64".to_string(), value_count: 200, estimated_value_bytes: 1600, realized_value_bytes: 420, value_codec: "varint".to_string(), bytes_per_point: 2.1, is_exact: true, lossy_count: 0, max_abs_error: "0".to_string(), tolerance: "0".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 208, timestamp_bytes_per_point: 1.04, total_bytes_per_point: 3.14, advisory_best_f64_bytes: None, advisory_best_f64_codec: None, advisory_fire_timestamp_bytes: Some(180), advisory_delta_cascade_value_bytes: None, advisory_dfor_value_bytes: None, advisory_common_multiple_timestamp_bytes: None, advisory_delta_for_timestamp_bytes: None }), cold_warm: ColdWarm::from_samples(&samples), gpu_pool: None }
 	}
 
 	#[test]
@@ -461,6 +508,20 @@ mod tests {
 		// A zeroed/inconsistent breakdown must never underflow.
 		assert_eq!(TimingBreakdown::default().overhead_ns(), 0);
 		assert_eq!(TimingBreakdown { dataset_generation_ns: 10, measured_ns: 10, end_to_end_ns: 5 }.overhead_ns(), 0);
+	}
+
+	#[test]
+	fn the_first_rep_is_split_from_the_warm_ones() {
+		assert_eq!(ColdWarm::from_samples(&[]), None);
+		assert_eq!(ColdWarm::from_samples(&[500]), None, "one rep has no warm part");
+		let split = ColdWarm::from_samples(&[900, 100, 300, 200]).expect("splits");
+		assert_eq!(split.first_rep_ns, 900);
+		assert_eq!((split.warm.count, split.warm.min_ns, split.warm.max_ns), (3, 100, 300));
+		assert!((split.first_rep_ratio().expect("ratio") - 900.0 / f64::from(u32::try_from(split.warm.p50_ns).unwrap())).abs() < 1e-12);
+		// A v20 artifact has no `cold_warm`.
+		let mut json = serde_json::to_value(sample_result()).expect("serializes");
+		json.as_object_mut().expect("object").remove("cold_warm");
+		assert_eq!(serde_json::from_value::<BenchResult>(json).expect("deserializes").cold_warm, None);
 	}
 
 	#[test]

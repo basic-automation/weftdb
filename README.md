@@ -320,12 +320,12 @@ as results.
 
 ### Reductions
 
-At 500k points, hour buckets, correctness-gated
-([`weft-bench --downsample`](weft-bench); re-measured 2026-10-08, full table under
-[Compute endpoints](#compute-endpoints)): `avg` runs at **2.08M points/sec**;
-time-weighted average costs about 1.39× that. The approximate `sketch_p99` is
-**~2.6× faster than exact `p99`** (327 ms vs 852 ms) and stays within its 1% bound,
-while using bounded memory per bucket.
+At 500k two-decimal points, hour buckets, correctness-gated
+([`weft-bench --downsample`](weft-bench); re-measured 2026-10-09 on the two-decimal generator, full
+table under [Compute endpoints](#compute-endpoints)): `avg` takes **4.5 ms (118M points/sec)**;
+time-weighted average costs about 5.7× that. Exact `p99` takes **23.5 ms** and the approximate
+`sketch_p99` about the same (**18.8 ms**), on real BTC closes too; what the sketch buys is bounded
+memory per bucket and mergeability, within its 1% bound.
 
 ### Where it doesn't pay off
 
@@ -346,19 +346,41 @@ same buckets:
 
 | path | time | vs `f64` |
 |---|---|---|
-| `f64` loop (lossy baseline) | 2.14 ms | 1× |
-| `weft_reduce::reduce_scaled` (exact, on the stored `ScaledI64` mantissas) | **13.52 ms** | ~6.3× |
-| `weft_reduce::reduce` (exact, per-sample `BigDecimal`) | 60.04 ms | ~28× |
+| `f64` loop (lossy baseline) | 2.27 ms | 1× |
+| `weft_reduce::reduce_scaled` (exact, on the stored `ScaledI64` mantissas) | **8.99 ms** | ~4.0× |
+| `weft_reduce::reduce` (exact, `BigDecimal` points; integer arithmetic inside since 2026-10-09) | 22.9 ms | ~10× |
+
+(Re-measured 2026-10-09, criterion pinned to one core; `reduce_scaled` is the median of nine
+alternating runs, 6.74–9.66 ms apart from two load-spike outliers at 18.8 and 20.1 ms. It was
+13.52 ms on 2026-10-08. `reduce` is the median of three runs, 22.9–28.3 ms; it was 52.6–53.0 ms
+before it took the integer path for points that fit, and 60.04 ms on 2026-10-08.)
 
 QuestDB [documents ~2×](https://questdb.com/docs/query/datatypes/decimal/) for its `DECIMAL`, so
 the precision wedge still costs more here. Before this work the shipped path measured 100.65 ms
-(~43×). Two changes closed most of the gap: integer
-accumulation, and computing each bucket's `avg` by integer long division that reproduces
-`bigdecimal`'s quotient digit for digit. Per sealed 1M-row segment (decode + six reductions), the
+(~43×). Three changes closed most of the gap: integer
+accumulation; computing each bucket's `avg` by integer long division that reproduces
+`bigdecimal`'s quotient digit for digit; and, for an average that never terminates (most of
+them), producing its 100 digits with one `BigUint` multiplication and one division by the
+count instead of a digit loop. Per sealed 1M-row segment (decode + six reductions), the
 stored-range downsample went from 127.6 ms to 59.7 ms. The server's `GET
-/api/v1/storage/{aspect}/downsample` now takes the integer path for `ScaledI64` segments when every
-requested reduction is streaming or a `sketch_p*`, and falls back otherwise
+/api/v1/storage/{aspect}/downsample` takes the integer path for one-scale `ScaledI64` segments for
+every reduction (exact percentiles and time-weighted averages collect their samples from the stored
+mantissas, ~1.4× faster per segment for `avg,p99,twa` than before, 2026-10-09)
 ([`weft-reduce/benches/decimal_tax.rs`](weft-reduce/benches/decimal_tax.rs), load average ~11).
+
+Three more results from 2026-10-09 where the obvious answer was wrong:
+
+- **The GPU is not the fastest way to interpolate stored data.** Reconstructing ~1M one-second
+  points from 100k stored knots end to end (`SegmentStore::interpolate_range_f64`) takes 14.1–16.3
+  ms on rayon and 17.0–29.8 ms on the RTX 4070 Ti SUPER; with `BigDecimal` output both spend most
+  of their time building a decimal per point
+  ([`weftdb/benches/interpolate_range.rs`](weftdb/benches/interpolate_range.rs)).
+- **A spline gap fill is less accurate than a straight line on prices.** On real BTC closes a
+  cubic fill's MAE is $55.34 against linear's $49.27 (hourly buckets); the spline wins only on a
+  smooth signal (`weft-bench --gap-fill --gf-fill cubic`, see [Benchmarking](#benchmarking)).
+- **The approximate percentile is not faster than the exact one.** `sketch_p99` once measured
+  ~2.6× faster than exact `p99`, but only on the old generator's ~50-digit values; on real-shaped
+  decimals the two run level (see [Compute endpoints](#compute-endpoints)).
 
 ---
 
@@ -429,23 +451,46 @@ CSV, Arrow IPC, or Parquet**:
 | `POST /api/v1/{interpolate,downsample}/ilp` | The same, fed an ILP `text/plain` body (the TSBS/InfluxDB/QuestDB wire format); `field`, `precision` (`ns`/`us`/`ms`/`s`), and the compute knobs are query parameters. `interpolation=` is accepted as an alias for `spline=` (the canonical `spline` wins if both are given). |
 | `POST /api/v1/{interpolate,downsample}/{csv,arrow,parquet}` and `…/ilp/{csv,arrow,parquet}` | The same computations with CSV (`text/csv`), Arrow IPC stream, or Parquet output — so a harness feeding line protocol pulls results in any of the four formats. |
 
-**What the reductions cost.** Measured on the shipped harness (500k points, 5 reps, hour buckets,
-correctness PASS throughout — `weft-bench --downsample --ds-points 500000 --ds-aggs <agg>`;
-re-measured 2026-10-08 after the `avg` division change, at load average ~19). These
-use the generated series, whose values are exact binary expansions of floats (~50 significant
-digits), so they are a pessimistic bound. On **real** two-decimal prices (`--ds-csv`, 1M BTC/USD
-one-minute closes from the local corpus described under [Ingest](#ingest), which is not distributed
-with the repository; hourly `avg,p99,twa`) the same reduction runs at **4.24M points/sec** against
-**0.56M points/sec** for a generated series of the same size (`weft-bench --downsample --ds-csv
-database/datasets/btc_1min.csv --csv-value-col 4 --csv-skip 3000000 --ds-points 1000000 --ds-bucket h
---ds-aggs avg,p99,twa --reps 5`):
+**What the reductions cost.** Measured on the shipped harness (500k points at 1 s, 5 reps, hour
+buckets, correctness PASS throughout — `weft-bench --downsample --ds-points 500000 --ds-bucket h
+--ds-aggs <agg> --ds-decimals <2|full>`; 2026-10-09, load average ~12–14, both generators back to
+back). Since 2026-10-09 the generator rounds its values to two decimal places, like the prices in the
+real corpus (`--ds-decimals`, default 2). Before, it kept each float's exact binary expansion (~50
+significant digits, now `--ds-decimals full`), which made every `BigDecimal` operation expensive and
+the published figures a pessimistic bound. The check: on 1M points, hourly `avg,p99,twa`, the
+two-decimal generator (60 s stride) reduces at **5.10M points/sec**, **real** BTC/USD one-minute
+closes at **4.49M points/sec** (`--ds-csv database/datasets/btc_1min.csv --csv-value-col 4 --csv-skip
+3000000`, the local corpus described under [Ingest](#ingest), not distributed with the repository),
+and the old generator at **0.61M points/sec**, 7.3× slower than real data:
 
-| reduction | p50 | throughput | note |
-|---|---|---|---|
-| `avg` | 240.8 ms | 2,075,477 points/sec | the streaming baseline — no bucket materialized |
-| `twa` | 334.1 ms | 1,515,029 points/sec | 1.39× the streaming cost: dwell-weighting needs the time-ordered samples |
-| `twa_bucket_end` | 332.1 ms | 1,518,520 points/sec | within noise of `twa` — one extra weight, effectively free |
-| `twa_linear` | 407.8 ms | 1,197,606 points/sec | 1.22× `twa`: an extra `BigDecimal` add + divide per interval for the trapezoidal mean |
+| reduction | p50 (two decimals) | throughput | p50 (`full`, the pre-2026-10 generator) | throughput | note |
+|---|---|---|---|---|---|
+| `avg` | 4.46 ms | 118,238,781 points/sec | 187.5 ms | 2,686,264 points/sec | the streaming baseline — no bucket materialized |
+| `twa` | 25.44 ms | 16,659,311 points/sec | 240.8 ms | 2,045,708 points/sec | 5.7× the streaming cost: dwell-weighting needs the time-ordered samples |
+| `twa_bucket_end` | 24.40 ms | 17,340,324 points/sec | 241.4 ms | 2,045,536 points/sec | within noise of `twa` — one extra weight, effectively free |
+| `twa_linear` | 68.76 ms | 6,919,376 points/sec | 313.5 ms | 1,578,596 points/sec | 2.7× `twa`: an extra `BigDecimal` add + divide per interval for the trapezoidal mean |
+| `p99` (exact) | 23.46 ms | 20,871,526 points/sec | 391.0 ms | 1,271,820 points/sec | collects each bucket and selects the rank in linear time |
+| `sketch_p99` | 18.79 ms | 25,871,740 points/sec | 280.1 ms | 1,785,661 points/sec | streams into a DDSketch; see below |
+
+(Re-measured 2026-10-09 after `reduce` started taking the integer path for values that fit
+`i64` mantissas at a common scale; the two-decimal series does, the `full` one does not. The
+same day's earlier figures, before that change: `avg` 14.4 ms, `twa` 49.0, `twa_linear` 99.3,
+`p99` 31.5 (57.9 before the selection change), `sketch_p99` 30.3 (59.7 before the `f64` fast
+path).)
+
+These time `weft_reduce::reduce` over `BigDecimal` points, the path `POST /api/v1/downsample` takes.
+Since 2026-10-09 `reduce` itself compares and sums on integers whenever every value fits an `i64`
+mantissa at the series' largest scale, with a result identical in value and representation
+(min, max, first, last and collected samples are the original values; each bucket's sum carries its
+own largest scale); on 1M real BTC closes, hourly `avg` went from 52.4 to 21.6–22.3 ms, `sketch_p99`
+from 71.0 to 42.3–42.9 ms (35.4–36.2 ms once the sketch also skips the logarithm for a value in the
+previous value's bucket) and `avg,p99,twa` from 171.4 to 141.3–142.9 ms (two runs each). A stored
+`ScaledI64` aspect goes further, straight from the stored mantissas (`reduce_partial_scaled`, see
+[Where it doesn't pay off](#where-it-doesnt-pay-off) for the decimal tax), which `--ds-scaled` times on
+the same series, gated on an identical result (10 reps, load average ~24): hourly `avg` over the 500k
+two-decimal points **0.58 ms**, over 1M real BTC closes **6.4 ms**; the six streaming reductions
+7.6 ms, `sketch_p99` 22.3 ms (17.9–18.9 ms with the bucket cache, three runs at load average ~33)
+and `avg,p99,twa` 109.0 ms on the real series (`weft-bench --downsample --ds-scaled …`).
 
 **Exact vs sketch percentiles — which to ask for.** The `p50`/`p90`/`p95`/`p99` reductions are
 *exact* nearest-rank: they return an actual observed `BigDecimal` from the bucket, but they
@@ -454,10 +499,16 @@ materialize and sort the whole bucket, and two buckets' results cannot be combin
 [DDSketch](https://dl.acm.org/doi/10.14778/3352063.3352135) — a **1% relative-error** bound
 (`weft_reduce::SKETCH_ALPHA`), **bounded memory** regardless of bucket size (values fold in as they
 arrive; `SKETCH_MAX_BINS` caps the store absolutely), and an **exactly mergeable** structure, so a
-p99 can be computed over a large or streaming bucket. Measured on the shipped harness (500k points,
-5 reps, correctness PASS): `sketch_p99` runs at **1,528,361 points/sec (p50 = 327.30 ms)** versus
-exact `p99` at **584,469 points/sec (p50 = 852.39 ms)** — **~2.6× faster**
-(`weft-bench --downsample --ds-points 500000 --ds-aggs sketch_p99` vs `--ds-aggs p99`).
+p99 can be computed over a large or streaming bucket. **Speed is not the reason to choose it.** On the
+shipped harness (10 reps, correctness PASS, 2026-10-09) the two run level: p50 **21.3 ms** exact vs
+**18.8 ms** sketch on two-decimal values (500k points, hourly), and **43.4 ms** vs **41.2 ms** on 1M
+real BTC closes (hourly), where values carry up to eight decimal places (`weft-bench --downsample
+--ds-aggs p99` vs `--ds-aggs sketch_p99`, with `--ds-csv` for the real series). The exact percentile selects its rank in linear time over borrowed
+values, cloning only the result. The sketch converts a value with at most 15–16 significant digits
+and at most 22 decimal places to `f64` by one division, which is provably the same `f64` as
+`bigdecimal`'s `to_f64` (tested bit for bit); before that change `sketch_p99` took 63.8 ms here. The
+~2.6× sketch advantage once quoted (327 vs 852 ms) was measured on the old generator's ~50-digit
+values, when the exact path also cloned and fully sorted every bucket.
 
 The approximation is **declared, never silent** — WeftDB's precision principle. The sketch shares the
 exact percentiles' **nearest-rank convention** (`⌈q·n⌉`), so `sketch_p*` and `p*` name the same
@@ -513,7 +564,7 @@ under the declared encoding/tolerance is rejected `400`.
 | `GET /api/v1/storage/{aspect}/points` · `…/value-points` | Lossless JSON reads with declarative pagination — `offset`/`limit` (+ `take` and 1-based `page` aliases), with `total`/`count`/`offset` in the body. For stable forward iteration the body also carries an opaque **`next_cursor`** while rows remain; a client re-issues with `?cursor=<token>` (supersedes `offset`/`page`; malformed → `400`) until it is absent. |
 | `GET /api/v1/storage/{aspect}/at?t=` | **Single-instant point lookup**: the present value at exactly `t` (lossless decimal text) or a `found:false` miss. An **order-signal-driven read planner** resolves each candidate segment with its persisted `time_sorted` flag — binary search on a sorted segment, linear scan only on an out-of-order one — after pruning the index to the files spanning `t`. |
 | `GET /api/v1/storage/{aspect}/at-multi?t=,,` | **Batch point lookup**: a comma-separated list of instants resolved in one pass (`points:[{timestamp,value,found}]` in query order). The index is pruned once by the batch's whole span and each segment's timestamp column decoded once for the whole batch, so `N` instants sharing a segment cost one decode, not `N`. |
-| `GET`·`POST /api/v1/storage/{aspect}/downsample?start=&end=&resolution=&agg=` | **Stored-range downsample** — the same reduction set as `POST /api/v1/downsample` (above), but over the aspect's **persisted segments** instead of a request-supplied series, so a client aggregates a large stored range without fetching it. **Bounded memory**: the index is pruned by time and each surviving segment folds into its own mergeable partial reduction, merged once — only one segment's rows are ever resident, so a range far larger than RAM reduces, and with a `sketch_p*` the per-bucket state is bounded too. Omitted bounds span all stored history. `…/downsample.csv` · `…/downsample.arrow` · `…/downsample.parquet` serve the identical reduction in the compute endpoints' columnar formats. Traced as a `downsample.range` stage span. The pruned segments are reduced **concurrently**: measured **4.69× faster** than the sequential fold (16 segments over 200k rows, 39.88 ms → 8.50 ms; `sketch_p99` 49.49 ms → 9.42 ms, **5.25×**) — see [`database/benches/downsample_range.rs`](database/benches/downsample_range.rs). A single pruned segment takes an inline fast path (concurrency there costs more than it buys). **Materialized partials (opt-in):** with `WEFT_SEGMENT_PARTIAL_BASE` set, each segment carries a `.weftpart` partial-reduction sidecar written at seal (a sealed segment is immutable, so its partial never goes stale), and a downsample of the bounded reductions (`min`/`max`/`avg`/`sum`/`first`/`last` + `sketch_p*`) **merges the stored partials instead of decoding the value column** — measured **3.2× faster** (16 segments / 200k rows, 8.39 ms → 2.60 ms, non-overlapping CIs) and re-keyed to any coarser nesting resolution (minutes→hours→days) with no decode. **Rollup tiers (opt-in):** `WEFT_SEGMENT_PARTIAL_TIERS` materializes coarser tiers beside the base (e.g. `hours,days`), each re-keyed from the tier below, so a coarse query folds the coarsest matching tier instead of the whole fine base — the in-storage analogue of TimescaleDB's hierarchical continuous aggregates. Measured **~1.16×** on a DAY query over a MINUTES base (16 segments / 200k rows, 7.30 ms → 6.30 ms, non-overlapping CIs). The win **grows with the base-bucket count per segment**, and that scaling is now measured rather than asserted: holding rows and segments fixed while widening the sample stride (so only the base buckets per segment change) gives **1.15× at ~208 base buckets → 1.27× at ~3125 → 1.38× at ~12500** (`bench_tiered_span`). Honest read: the win is real and climbs, but a ~60× increase in base buckets buys only 1.15×→1.38×, so the elided re-key is not the dominant cost and the tiers' extra `.weftpart` bytes should be weighed against it — see [`database/benches/downsample_range.rs`](database/benches/downsample_range.rs). A reconcile/split/squash regenerates the sidecar (tiers and all) so the acceleration survives a rewrite. |
+| `GET`·`POST /api/v1/storage/{aspect}/downsample?start=&end=&resolution=&agg=` | **Stored-range downsample** — the same reduction set as `POST /api/v1/downsample` (above), but over the aspect's **persisted segments** instead of a request-supplied series, so a client aggregates a large stored range without fetching it. **Bounded memory**: the index is pruned by time and each surviving segment folds into its own mergeable partial reduction, merged once — only one segment's rows are ever resident, so a range far larger than RAM reduces, and with a `sketch_p*` the per-bucket state is bounded too. Omitted bounds span all stored history. `…/downsample.csv` · `…/downsample.arrow` · `…/downsample.parquet` serve the identical reduction in the compute endpoints' columnar formats. Traced as a `downsample.range` stage span. The pruned segments are reduced **concurrently**: measured **4.69× faster** than the sequential fold (16 segments over 200k rows, 39.88 ms → 8.50 ms; `sketch_p99` 49.49 ms → 9.42 ms, **5.25×**) — see [`weftdb/benches/downsample_range.rs`](weftdb/benches/downsample_range.rs). A single pruned segment takes an inline fast path (concurrency there costs more than it buys). **Materialized partials (opt-in):** with `WEFT_SEGMENT_PARTIAL_BASE` set, each segment carries a `.weftpart` partial-reduction sidecar written at seal (a sealed segment is immutable, so its partial never goes stale), and a downsample of the bounded reductions (`min`/`max`/`avg`/`sum`/`first`/`last` + `sketch_p*`) **merges the stored partials instead of decoding the value column** — measured **3.2× faster** (16 segments / 200k rows, 8.39 ms → 2.60 ms, non-overlapping CIs) and re-keyed to any coarser nesting resolution (minutes→hours→days) with no decode. **Rollup tiers (opt-in):** `WEFT_SEGMENT_PARTIAL_TIERS` materializes coarser tiers beside the base (e.g. `hours,days`), each re-keyed from the tier below, so a coarse query folds the coarsest matching tier instead of the whole fine base — the in-storage analogue of TimescaleDB's hierarchical continuous aggregates. Measured **~1.16×** on a DAY query over a MINUTES base (16 segments / 200k rows, 7.30 ms → 6.30 ms, non-overlapping CIs). The win **grows with the base-bucket count per segment**, and that scaling is now measured rather than asserted: holding rows and segments fixed while widening the sample stride (so only the base buckets per segment change) gives **1.15× at ~208 base buckets → 1.27× at ~3125 → 1.38× at ~12500** (`bench_tiered_span`). Honest read: the win is real and climbs, but a ~60× increase in base buckets buys only 1.15×→1.38×, so the elided re-key is not the dominant cost and the tiers' extra `.weftpart` bytes should be weighed against it — see [`weftdb/benches/downsample_range.rs`](weftdb/benches/downsample_range.rs). A reconcile/split/squash regenerates the sidecar (tiers and all) so the acceleration survives a rewrite. |
 | `POST /api/v1/storage/{aspect}/reconcile` | **Reconciliation pass** (`mode` in the response). Default (intra-segment): rewrite every out-of-order segment of the aspect into a time-sorted one in place. `?threshold=N` gates it on `unsorted_segments >= N` (QuestDB-style split-count trigger). `?hot_cold=true` reconciles cold segments but defers the hot tail until the backlog reaches the threshold. `?overlaps=true` instead runs the **cross-segment overlap merge** (newer-wins) — `reconciled` is then the number of segments merged away, and `?split_min_bytes=N` makes that merge **split-not-rewrite** (carve off a dominant cold prefix instead of rewriting the whole component). Returns `triggered`/`reconciled`/`cold_reconciled`/`hot_reconciled` and the post-pass `unsorted_segments` + `overlapping_segments`. Maintenance operations on one aspect take turns: while another one holds the aspect (a daemon pass, another request), the request waits up to 30 s, then answers **`409 Conflict`** without touching the aspect; retry. |
 | `POST /api/v1/storage/{aspect}/squash` | **Squash** the aspect's segments into one (newer-wins), bounding split-path fragmentation. `?max_segments=N` gates it (squash only when the count exceeds `N`). Returns `triggered`/`removed`/`segment_count`. Waits for a busy aspect and answers `409` as `reconcile` does. |
 | `POST /api/v1/storage/{aspect}/compact?target_rows=N` | **Size-targeted compaction** — coalesce the aspect's segments toward ~`N` rows per segment (leaving already-large segments untouched), holding fragmentation near the read-optimal size rather than folding to one (which `squash` does). Motivated by the `downsample_range` knee (one giant segment reads slower than several mid-sized ones). `target_rows` is required (absent → `400`). Returns `removed`/`segment_count`. The manual counterpart of the `WEFT_COMPACT_TARGET_ROWS` daemon pass. Waits for a busy aspect and answers `409` as `reconcile` does. |
@@ -572,7 +623,7 @@ only** — the `.weftseg` measurement frames are not part of a snapshot.
   complete backup is already under its label, so a retry with the same label is
   refused (`409`). The next backup's fsync of the same parent makes it durable.
 - **What a snapshot costs is dominated by the filesystem, not by the vacuum.**
-  Benchmarked in [`database/benches/backup_cost.rs`](database/benches/backup_cost.rs):
+  Benchmarked in [`weftdb/benches/backup_cost.rs`](weftdb/benches/backup_cost.rs):
   on `tmpfs` a whole four-database backup-and-verify runs in **8.62 ms** at one
   aspect, **6.18 ms** at 16 and **16.79 ms** at 128 (snapshot verification;
   source verification is within noise of those), so the vacuum's own work is
@@ -1340,7 +1391,14 @@ What it does today:
   profile generates an irregularly-spaced, gap-containing series
   (`ChaCha8Rng`, published seed → byte-for-byte reproducible). The underlying
   analytic signal is shape-selectable (`MultiSine` | `Sawtooth` | `Step` |
-  `DampedSine`) and doubles as the accuracy ground truth.
+  `DampedSine`) and doubles as the accuracy ground truth. By default each sample keeps
+  its float's exact binary expansion (~50 significant digits), so a zero-noise sample sits
+  exactly on the ground truth; `--decimals N` rounds samples to N places instead, which is
+  what throughput runs should use: on 100k samples (86,401-point output, 20 reps, PASS,
+  2026-10-09) the exact-expansion series interpolates in p50 **51.0 ms** against **25.5 ms** at
+  two decimals, because splimes converts every input to `f64` and long decimals take
+  `bigdecimal`'s slow conversion path (`weft-bench --synthetic --points 100000 --decimals
+  <2|full> --no-gpu-calibrate --reps 20`; three runs each, 50.4–53.7 vs 24.6–25.8 ms).
 - **Storage, read & aggregation workloads** — beside the flagship interpolation
   run, four parallel workloads exercise WeftDB's own hot paths, each with its own
   correctness gate and p50/p95/p99 latency: **`point_lookup`** (`--point-lookup`)
@@ -1374,6 +1432,34 @@ What it does today:
   `--ds-csv` at a CSV of your own to run the same workloads on real data.
   The underlying point/range read speedups are quantified at the codec layer in
   [`weft-physical-type/benches/pointread.rs`](weft-physical-type/benches/pointread.rs).
+- **Gap fill** (`--gap-fill`) — the shape of TSM-Bench's interpolation query Q5
+  (`SAMPLE BY … FILL(LINEAR)`): a seeded series loses whole outages (runs of buckets,
+  `--gf-outage` percent of them, `--gf-outage-len` buckets on average), and the timed query
+  reduces what is left and fills every empty bucket with `weft_reduce::fill`
+  (`--gf-fill linear|prev|null|<decimal>`). It is gated on a dense grid whose synthesized
+  (`count == 0`) buckets are exactly the outages, and it **scores the filled values** against
+  the mean of the generator's noise-free signal under each outage bucket. One day of one-second
+  samples into minute buckets (70,020 surviving samples, 1,440 buckets, 273 filled; 10 reps,
+  PASS, 2026-10-09, load average ~15): `linear` p50 **4.70 ms**, RMSE **0.87** (max error 2.54);
+  `prev` 3.73 ms, RMSE 6.36; the constant `50` 4.69 ms, RMSE 13.72; `null` 3.51 ms (nothing to
+  score). At 1M generated samples (809,920 surviving, 16,667 buckets) a linear fill takes
+  62.4 ms against 63.5 ms for `null`, so the fill itself is lost in the reduction's noise
+  (`weft-bench --gap-fill [--gf-points 1000000] --gf-fill <M> --reps 10`). `--gf-csv <FILE>` cuts
+  the same outages from a **real** series and scores the fills against the real values removed;
+  the series' own empty buckets are filled too but not scored. On 1M real BTC/USD one-minute
+  closes (2017-09-14 to 2019-08-10, mean $7,336; hourly buckets, 3,168 of 16,667 hours cut;
+  10 reps, PASS): `linear` p50 **57.2 ms**, MAE **$49.27** (0.67% of the mean), RMSE $91.77, worst
+  $957.18; `prev` MAE $76.45, RMSE $147.23; `null` 55.1 ms (`--gf-csv database/datasets/btc_1min.csv
+  --csv-value-col 4 --csv-skip 3000000 --gf-points 1000000 --gf-bucket h`; the local corpus
+  described under [Ingest](#ingest), not distributed with the repository). `--gf-fill cubic` /
+  `quadratic` fill with a splimes spline through the bucket values instead (`Fill::Spline`).
+  That is **not a general win, and the default stays `linear`**: on the smooth generated signal a
+  cubic fill cuts RMSE **7.5×** (0.115 vs 0.865), but on real BTC closes, which move close to a
+  random walk, linear is more accurate — hourly MAE $49.27 linear vs $55.34 cubic vs $61.32
+  quadratic, and at one-minute buckets (187,421 filled minutes, outages averaging three) $6.79
+  vs $8.37 — while the spline costs ~14% more time (64.8 vs 56.7 ms hourly; 10 reps,
+  2026-10-09, load average ~6). Reach for the spline on smooth physical signals, not on prices.
+  WeftDB's grid has only unit widths, so Q5's literal 5-second buckets cannot be expressed yet.
 - **Vendor-neutral adapters** — every system is driven through the
   `SystemAdapter` trait: the WeftDB reference adapter (splimes' `Interpolator` on `Backend::Auto`),
   a precision-aware **portable linear baseline** (fair-protocol class C), and a
@@ -1411,12 +1497,36 @@ What it does today:
   `experimental-codecs` feature, which only `weft-bench` enables.
 - **Reports** — a `BenchReport` JSON artifact (run metadata + a best-effort
   hardware probe: CPU model, cores, RAM, and the kind/file system/mount of the disk under the working directory) under `reports/json/`, plus a
-  self-contained **HTML** view (`--html`) with the most-accurate row highlighted.
+  self-contained **HTML** view (`--html`) with the most-accurate row highlighted, and a flat
+  **Parquet** results table (`--parquet`, same stem): one row per result with the run metadata
+  repeated (machine, GPU and driver, workload, latency percentiles, throughput, timing,
+  correctness, nullable accuracy and storage columns), so a directory of runs reads as one
+  dataset in DuckDB, Polars or Grafana.
+- **GPU memory stability** (`--gpu-memory`, needs a hardware GPU) — rounds of GPU
+  interpolations (`Backend::Gpu`, cubic, `f64`) at mixed output sizes (`--gm-sizes`, default
+  16 Ki, 1 Mi and 4 Mi points, seeded order), sampling splimes' buffer-pool statistics after
+  every call; gated on full finite grids, idle pool bytes never over the cap, and no idle-byte
+  growth after the first round. The report's `gpu_pool` block (schema v22) records the cap and
+  the buffer sets created, reused and evicted. On the RTX 4070 Ti SUPER (driver 610.57.04; 20
+  rounds, 60 calls, 2026-10-09): with splimes' default 512 MiB pool, **2 buffer sets created in
+  all, none after the first round, 58 reuses, 0 evictions**, idle bytes steady at 112 MiB, p50
+  8.29 ms per call, 152M output points/sec; with `--gm-pool-mib 32`, 20 evictions and 19
+  re-creations (the 4 Mi-point set churns every round) at an unchanged p50 of 7.96 ms, so on
+  this GPU eviction churn costs nothing measurable next to the kernels.
+- **First rep apart from the rest** — every result with two or more reps records its first
+  timed rep separately from the warm ones (`cold_warm`, schema v21; printed as `first rep`
+  and in the Parquet table), while `latency` still covers every rep. It is first-in-process,
+  not OS-cold (the data is already in memory). Measured 2026-10-09 (release, default knobs
+  unless noted): interpolation (100k two-decimal samples) 1.00× the warm p50, downsample (500k,
+  hourly `avg`) 0.99×, range fetch 1.04×, gap fill 1.13×, point lookup 1.30×, and
+  **compression 4.93×** (1.198 vs 0.243 ms), so that workload's p95 over 10 reps is its first
+  decode.
 - **The engine the server runs** — an interpolation run first calls
   `splimes::calibrate()` once, as `weft-server` does at startup (skipping a
   CPU/software adapter the same way), so `Backend::Auto` uses rayon and the GPU
-  where they are faster on this machine. The calibration, GPU and thresholds are
-  printed and recorded in the report's `metadata.engine` (schema v16);
+  where they are faster on this machine. The calibration, GPU, its driver version and
+  the thresholds are printed and recorded in the report's `metadata.engine` (schema v16;
+  `gpu_driver` since v20);
   `--no-gpu-calibrate` skips it and records splimes' defaults. There is no
   counterpart to the server's `WEFT_GPU_CALIBRATE=force`: on a software adapter the
   bench always skips calibration, so there it cannot reproduce a server started with
@@ -1527,12 +1637,12 @@ server and an interactive application:
 | Crate | Role |
 |-------|------|
 | [`splimes`](https://github.com/basic-automation/splimes) *(own repo, from crates.io)* | Spline interpolation engine — Linear / Quadratic / Cubic / Polynomial methods on the CPU (one thread or rayon) or the GPU, chosen by grid size, with raw / interpolated / extrapolated provenance on every point. |
-| [`weftdb`](weftdb) | Time-series database: [Turso](https://turso.tech/) (libSQL) **control plane** (catalog, metadata, segment index; MVCC concurrent writes) + WeftDB's own typed columnar **`.weftseg` segment store** on the measurement hot path, plus the pattern-recognition types and tiered dataset compression. |
+| [`weftdb`](weftdb) | Time-series database: [Turso](https://turso.tech/) (libSQL) **control plane** (catalog, metadata, segment index; MVCC concurrent writes) + WeftDB's own typed columnar **`.weftseg` segment store** on the measurement hot path, plus the pattern-recognition types and tiered dataset compression. **Interpolate-on-read over stored segments** (`SegmentStore::interpolate_range`): a splimes grid reconstructed straight from an aspect's persisted samples (index prune → `.weftseg` decode → knots, with a `margin` of extra knots past each edge → the caller's `Interpolator`, any backend), with raw/interpolated/extrapolated provenance. `interpolate_range_f64` returns `f64` values instead: splimes computes in `f64` either way, so only raw points (exact in the `BigDecimal` result) differ, and it skips building a `BigDecimal` per output point, which is most of the cost. Not yet on the HTTP API. Measured end to end ([`weftdb/benches/interpolate_range.rs`](weftdb/benches/interpolate_range.rs), 1 Mi stored irregular samples in 16 segments, cubic to one-second points, two runs, 2026-10-09, load average ~11): ~1M output points from 100k knots in **14.1–16.3 ms with `f64` output on rayon** against 43.3–51.5 ms with `BigDecimal` output; the GPU (RTX 4070 Ti SUPER) takes 17.0–29.8 ms (`f64`) / 53.3–66.4 ms, one thread 42.6–48.8 / 132.8–149.7 ms; at ~100k points rayon takes 3.0 ms (`f64`) / 7.1 ms. Of the `BigDecimal` call on rayon, read and decode are ~4 ms, the kernel ~8 ms and the per-point `BigDecimal` output ~30 ms. The GPU is not the fastest backend on this path. |
 | [`weft-orchestration`](weft-orchestration) | High-level pipeline that chains batching → pattern extraction → event detection → correlation → signal generation, with built-in detectors and parallel execution. |
 | [`weft-physical-type`](weft-physical-type) | Vendor-neutral physical type system — schema-declared numeric encodings with explicit exactness, timestamp codecs, and the `.weftseg` columnar segment format (single-block and paged). |
 | [`weft-arrow`](weft-arrow) / [`weft-arrow-store`](weft-arrow-store) | Apache Arrow / Parquet interchange for sealed segments and stored reads, kept in leaf crates so the `arrow-*` dependency tree never reaches the hot-path core. |
 | [`weft-line-protocol`](weft-line-protocol) | Dependency-free InfluxDB Line Protocol parser shared by the server and the benchmark harness. |
-| [`weft-reduce`](weft-reduce) | Vendor-neutral downsampling reductions, computable over parts and merged (`reduce_partial`/`PartialReduction`, exact for every reduction) — `min`/`max`/`avg`/`sum`/`first`/`last` + nearest-rank `p50`/`p90`/`p95`/`p99` + three time-weighted averages (LOCF, linear/trapezoidal, LOCF-to-bucket-end) + mergeable bounded-error `sketch_p*` percentiles, over an epoch-aligned bucket grid, computed in `BigDecimal`. A `PartialReduction` is **serde-serializable** (so a segment's partial can be persisted and merged later, in place of re-reading it) and **re-bucketable** to any coarser nesting resolution (`rebucket`/`grids_nest`). Shared by the HTTP `downsample` endpoint and the benchmark harness. |
+| [`weft-reduce`](weft-reduce) | Vendor-neutral downsampling reductions, computable over parts and merged (`reduce_partial`/`PartialReduction`, exact for every reduction) — `min`/`max`/`avg`/`sum`/`first`/`last` + nearest-rank `p50`/`p90`/`p95`/`p99` + three time-weighted averages (LOCF, linear/trapezoidal, LOCF-to-bucket-end) + mergeable bounded-error `sketch_p*` percentiles, over an epoch-aligned bucket grid, computed in `BigDecimal`. A `PartialReduction` is **serde-serializable** (so a segment's partial can be persisted and merged later, in place of re-reading it) and **re-bucketable** to any coarser nesting resolution (`rebucket`/`grids_nest`). **Gap filling** (`fill`): the dense bucket grid between two bounds, measured buckets unchanged and every empty step synthesized with `count == 0` by a declared `Fill` (`Null`, `Previous`, `Linear` by grid step, or a constant, SQL `FILL(…)`'s vocabulary, plus `Spline`, a splimes spline through the bucket values). Shared by the HTTP `downsample` endpoint and the benchmark harness. |
 | [`weft-server`](weft-server) | Benchmark-grade `axum` HTTP API — interpolation, downsampling, storage ingest/query, catalog management, Prometheus metrics, live latency profiles. |
 | [`weft-bench`](weft-bench) | Reproducible, correctness-gated benchmark harness — the roadmap's spine; both an internal suite and a customer-runnable diagnostic. |
 | [`weft-tui`](weft-tui) | Terminal user interface (Ratatui + Crossterm) for creating databases, importing CSV data, browsing and plotting aspects, and running compression. |

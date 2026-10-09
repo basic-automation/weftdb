@@ -189,9 +189,78 @@ only the control plane, not the segment frames.
   `storage.advisory_delta_for_timestamp_bytes` (v18), each present only when it beats the
   realized codec, and `metadata.work_disk_kind`, `work_disk_file_system` and
   `work_disk_mount_point`, the disk under the working directory (v19).
+- **Weft-Bench's downsample generator emits two-decimal values** (`--ds-decimals`, default 2;
+  `full` keeps the previous generator's exact binary expansion of each float). The old values
+  carried ~50 significant digits and made the published reduction figures 7.3× slower than real
+  data; the README table is re-measured with both generators, and its claim that `sketch_p99` is
+  ~2.6× faster than exact `p99` is withdrawn (level on two-decimal values, 1.36× on real BTC).
+- **Gap filling** (`weft-reduce`): `weft_reduce::fill` turns a reduction's buckets into the
+  dense grid between two bounds, keeping measured buckets unchanged and synthesizing every
+  empty step with `count == 0` by a declared `Fill` (`Null`, `Previous`, `Linear` by grid
+  step, a constant `Value`, or `Spline`, a splimes spline through the bucket values;
+  `Fill::from_token` parses `null`/`prev`/`linear`/`quadratic`/`cubic`/a decimal),
+  bounded by a caller-given bucket limit (`FillError`).
+- **Weft-Bench `--gap-fill` workload**: TSM-Bench Q5's `SAMPLE BY … FILL(LINEAR)` shape over
+  a seeded series with outages (`--gf-points`, `--gf-stride`, `--gf-bucket`, `--gf-outage`,
+  `--gf-outage-len`, `--gf-fill`, `--gf-agg`), gated on a dense grid and scoring the filled
+  buckets against the clean signal; `--gf-csv` cuts the outages from a real series and
+  scores against the real values removed.
+- **Weft-Bench `--gpu-memory` workload**: repeated mixed-size GPU interpolations with the
+  buffer pool's statistics sampled after every call, gated on bounded, non-growing idle
+  memory (`--gm-rounds`, `--gm-sizes`, `--gm-knots`, `--gm-pool-mib`); reports carry a
+  `gpu_pool` block (bench schema v22).
+- **Weft-Bench reports the first rep apart from the rest**: `cold_warm` (bench schema v21)
+  carries the first timed rep and the warm reps' latency statistics for every result with
+  two or more reps; `latency` still covers every rep.
+- **Weft-Bench `--ds-scaled`**: the downsample workload times the integer-native reduction a
+  stored `ScaledI64` aspect takes (`reduce_partial_scaled`), gated on matching `reduce`.
+- **Weft-Bench `--decimals N`** for `--synthetic` (`SyntheticParams::value_decimals`):
+  rounds the generated samples to N places. The default keeps each sample's exact binary
+  expansion, which interpolates ~2× slower at 100k samples than two-decimal input.
+- **Weft-Bench `--parquet`**: the results as a flat Parquet table beside the JSON report, one
+  row per result with the run metadata repeated, for querying many runs at once.
+- **Weft-Bench records the GPU driver.** An interpolation run's `metadata.engine` gains
+  `gpu_driver`, the driver's name and version as splimes' `GpuInfo::driver` reports it
+  (e.g. `NVIDIA 610.57.04`), beside the adapter in `gpu`; it is printed and shown in the
+  HTML report, and omitted when the driver reports nothing (bench schema v20).
 
 ### Changed
 
+- **Exact percentiles (`p50`/`p90`/`p95`/`p99`) no longer clone and sort every bucket**
+  (`weft-reduce`). A single percentile selects its rank in linear time over borrowed values
+  and several share one sort; only the result is cloned. Results are identical, including
+  which of two numerically equal values (`1.0`, `1.00`) is returned. A lone hourly `p99`
+  runs ~1.6–3.4× faster on the bench (two-decimal, real BTC and full-expansion series),
+  which made it about twice as fast as `sketch_p99` until the next entry.
+- **`SegmentStore::interpolate_range`** (`weftdb`): interpolate-on-read over stored segments
+  — the aspect's samples in a window (plus a `margin` of knots past each edge) run through a
+  caller-supplied splimes `Interpolator`, returning the grid with provenance;
+  `interpolate_range_f64` returns `f64` values (~3× faster at 1M points, since building a
+  `BigDecimal` per output point dominates). Library only; no HTTP endpoint yet.
+- **`weft_reduce::decimal_to_f64`**: a `BigDecimal` to `f64` conversion bit-identical to
+  `bigdecimal`'s `to_f64`, fast for values of at most 15–16 significant digits.
+- **Stored-range percentile and time-weighted-average downsamples take the integer path**
+  (`weft-reduce`): `reduce_partial_scaled` serves `p*` and `twa*` too, collecting samples
+  from the stored mantissas, so `GET …/storage/{aspect}/downsample?agg=p99,twa` on a
+  `ScaledI64` aspect no longer decodes each segment twice. Results are unchanged; ~1.4× per
+  segment on the bench.
+- **`reduce` and `reduce_partial` compute on integers when the values allow it**
+  (`weft-reduce`): when every value fits an `i64` mantissa at the series' largest scale, the
+  reduction compares and sums integers and returns the same buckets, value for value and in
+  representation. ~2.3× on real price series, ~4× on two-decimal ones.
+- **Bucket averages that never terminate are computed in one step** (`weft-reduce`): their
+  100 significant digits come from one big-integer multiplication and one division by the
+  count instead of a digit loop, with an identical result. Hourly `avg` on the integer
+  path runs ~1.7× faster (median 15.3 → 9.0 ms per 1M rows), and every `avg` gains from it.
+- **`sketch_p*` reductions skip the logarithm for a value in the previous value's bucket**
+  (`weft-reduce`), with identical sketches; ~1.3–1.4× on real price series.
+- **`sketch_p*` reductions convert most values to `f64` by one division** (`weft-reduce`).
+  A value `m × 10^-s` with `|m| < 2^53` and `0 <= s <= 22` is converted as
+  `m as f64 / 10^s`, which is bit-identical to `bigdecimal`'s `to_f64`, so sketches and
+  results do not change; `ScaledI64` segments feed their mantissas straight in. Hourly
+  `sketch_p99` runs ~2× faster on two-decimal and real BTC series, and a stored segment's
+  `avg,sketch_p99` downsample ~2× faster on the integer path. Values outside those bounds
+  take the previous conversion.
 - **Breaking for Rust users: `weftdb` reads no `WEFT_*` variable when it opens a
   segment store, and never exits the process** (release plan C-1).
   `SegmentStore::open` and `open_scoped` now use `SegmentStoreOptions::default()`

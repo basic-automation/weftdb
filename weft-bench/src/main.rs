@@ -31,7 +31,7 @@ use std::{path::PathBuf, process::ExitCode};
 use chrono::Utc;
 use splimes::{Resolution, Spline};
 use weft_bench::{
-	engine, load_csv_corpus, report::{default_filename, default_html_filename}, run_compression, run_compression_on, run_downsample, run_downsample_on, run_point_lookup, run_point_lookup_on, run_profile, run_range_fetch, run_range_fetch_on, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CalibrationStatus, CompressionParams, CompressionProfile, CorpusRun, DownsampleParams, DownsampleProfile, EngineMetadata, ForwardFillAdapter, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter
+	engine, load_csv_corpus, report::{default_filename, default_html_filename}, run_compression, run_compression_on, run_downsample, run_downsample_on, run_gap_fill, run_gap_fill_on, run_point_lookup, run_point_lookup_on, run_profile, run_range_fetch, run_range_fetch_on, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CalibrationStatus, CompressionParams, CompressionProfile, CorpusRun, DownsampleParams, DownsampleProfile, EngineMetadata, ForwardFillAdapter, GapFillParams, GapFillProfile, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter
 };
 
 /// Program name used in usage / error output.
@@ -86,7 +86,7 @@ async fn calibrate_engine(enabled: bool) -> EngineMetadata {
 	}
 	let engine = tokio::task::spawn_blocking(move || if enabled { engine::calibrate() } else { EngineMetadata::uncalibrated() }).await.unwrap_or_else(|err| EngineMetadata::new(CalibrationStatus::Failed, None, Some(format!("calibration aborted: {err}")), splimes::auto_thresholds()));
 	println!("engine: {}; {}", engine.describe_calibration(), engine.describe_thresholds());
-	if let Some(gpu) = &engine.gpu {
+	if let Some(gpu) = engine.describe_gpu() {
 		println!("engine: GPU {gpu}");
 	}
 	engine
@@ -110,13 +110,19 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 	if cli.mode == InputMode::Downsample {
 		return run_downsample_workload(&cli);
 	}
+	if cli.mode == InputMode::GapFill {
+		return run_gap_fill_workload(&cli);
+	}
+	if cli.mode == InputMode::GpuMemory {
+		return run_gpu_memory_workload(&cli);
+	}
 
 	// Build the profile from whichever input mode was selected. Synthetic mode
 	// carries a known analytic ground truth, so its report will also include
 	// accuracy metrics; line-protocol mode does not.
 	let profile = if cli.mode == InputMode::Synthetic {
 		let profile_name = cli.name.clone().unwrap_or_else(|| "interpolation-heavy-irregular".to_string());
-		let params = SyntheticParams { seed: cli.seed, input_points: cli.points, missingness_fraction: cli.missingness, jitter_fraction: cli.jitter, noise_amplitude: cli.noise, signal_shape: cli.shape, spline: cli.spline, resolution: cli.resolution };
+		let params = SyntheticParams { seed: cli.seed, input_points: cli.points, missingness_fraction: cli.missingness, jitter_fraction: cli.jitter, noise_amplitude: cli.noise, signal_shape: cli.shape, spline: cli.spline, resolution: cli.resolution, value_decimals: cli.decimals };
 		InterpolationProfile::synthetic(profile_name, params)
 	} else {
 		// Validated in `from_args`: line-protocol mode always carries input + field.
@@ -234,7 +240,7 @@ fn run_compression_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 /// is that the reduction is total (the bucket counts sum to the input size).
 fn run_downsample_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 	let profile_name = cli.name.clone().unwrap_or_else(|| "downsample".to_string());
-	let params = DownsampleParams { seed: cli.seed, point_count: cli.ds_points, input_stride_secs: cli.ds_stride, bucket_resolution: cli.ds_bucket, aggregations: cli.ds_aggs.clone(), parallel_chunks: cli.ds_parallel };
+	let params = DownsampleParams { seed: cli.seed, point_count: cli.ds_points, input_stride_secs: cli.ds_stride, bucket_resolution: cli.ds_bucket, aggregations: cli.ds_aggs.clone(), parallel_chunks: cli.ds_parallel, value_decimals: cli.ds_decimals, scaled: cli.ds_scaled };
 	let profile = DownsampleProfile::new(profile_name, params);
 	let result = if let Some(path) = &cli.csv.downsample {
 		// A real series: the same reduction engine over loaded rows (epoch seconds, exact decimals).
@@ -248,6 +254,44 @@ fn run_downsample_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 	}
 	.map_err(|e| anyhow::anyhow!("downsample benchmark run failed: {e}"))?;
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
+	let report = BenchReport::with_results(metadata, vec![result]);
+	finish(cli, &report)
+}
+
+/// Run the gap-fill workload: generate a seeded series with outages, then time the
+/// bucketed query that reduces it and fills the empty buckets (`weft_reduce::fill`),
+/// scoring the filled buckets against the generator's clean signal.
+fn run_gap_fill_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
+	let profile_name = cli.name.clone().unwrap_or_else(|| "gap-fill".to_string());
+	let profile = GapFillProfile::new(profile_name, GapFillParams { seed: cli.seed, ..cli.gap_fill.clone() });
+	let result = if let Some(path) = &cli.csv.gap_fill {
+		// A real series: the same outages cut from loaded rows, scored against the real values.
+		let load_start = std::time::Instant::now();
+		let (timestamps, values) = load_csv_corpus(path, cli.csv.value_column, cli.csv.skip_rows, cli.gap_fill.point_count)?;
+		let series = timestamps.iter().zip(values).map(|(&t, value)| chrono::DateTime::from_timestamp(t, 0).map(|timestamp| splimes::Point { timestamp, value }).ok_or_else(|| anyhow::anyhow!("epoch {t} is out of range"))).collect::<anyhow::Result<Vec<_>>>()?;
+		let corpus = profile.cut(series)?;
+		run_gap_fill_on(&profile, &corpus, u64::try_from(load_start.elapsed().as_nanos()).unwrap_or(u64::MAX), cli.reps)
+	} else {
+		run_gap_fill(&profile, cli.reps)
+	}
+	.map_err(|e| anyhow::anyhow!("gap-fill benchmark run failed: {e}"))?;
+	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
+	let report = BenchReport::with_results(metadata, vec![result]);
+	finish(cli, &report)
+}
+
+/// Run the GPU memory-stability workload: start the GPU with the requested pool cap, run the
+/// rounds of mixed-size GPU interpolations, and report the pool's behaviour.
+fn run_gpu_memory_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
+	let profile_name = cli.name.clone().unwrap_or_else(|| "gpu-memory".to_string());
+	let profile = weft_bench::gpu_memory::GpuMemoryProfile::new(profile_name, weft_bench::gpu_memory::GpuMemoryParams { seed: cli.seed, ..cli.gpu_memory.clone() });
+	let engine = weft_bench::gpu_memory::start_gpu(&profile)?;
+	println!("engine: GPU {}", engine.describe_gpu().unwrap_or_default());
+	let result = weft_bench::gpu_memory::run_gpu_memory(&profile).map_err(|e| anyhow::anyhow!("gpu-memory benchmark run failed: {e}"))?;
+	if let Some(pool) = &result.gpu_pool {
+		println!("gpu pool: cap {} MiB; created {} ({} after round 1), reused {}, evicted {}; idle peak {} MiB (round 1) / {} MiB (later), final {} MiB; stable: {}", pool.max_pool_bytes >> 20, pool.created, pool.created_after_first_round, pool.reused, pool.evicted, pool.peak_idle_bytes_first_round >> 20, pool.peak_idle_bytes_later >> 20, pool.final_idle_bytes >> 20, pool.stable);
+	}
+	let metadata = RunMetadata::capture(Utc::now().to_rfc3339()).with_engine(Some(engine));
 	let report = BenchReport::with_results(metadata, vec![result]);
 	finish(cli, &report)
 }
@@ -276,9 +320,21 @@ fn finish(cli: &Cli, report: &BenchReport) -> anyhow::Result<ExitCode> {
 		None
 	};
 
+	// And optionally the flat results table (same stem, `.parquet`), one row per result.
+	let parquet_path = if cli.parquet {
+		let path = out_path.with_extension("parquet");
+		weft_bench::parquet_report::write_parquet(report, &path)?;
+		Some(path)
+	} else {
+		None
+	};
+
 	print_summary(report, &out_path);
 	if let Some(path) = &html_path {
 		println!("  html report  : {}", path.display());
+	}
+	if let Some(path) = &parquet_path {
+		println!("  parquet table: {}", path.display());
 	}
 
 	// The run is honest about its own verdict: a correctness failure is a non-zero
@@ -300,7 +356,7 @@ fn print_summary(report: &BenchReport, out_path: &std::path::Path) {
 	// How the interpolation backends were chosen (interpolation workloads only).
 	if let Some(engine) = &report.metadata.engine {
 		println!("  engine       : {}; {}", engine.describe_calibration(), engine.describe_thresholds());
-		if let Some(gpu) = &engine.gpu {
+		if let Some(gpu) = engine.describe_gpu() {
 			println!("  gpu          : {gpu}");
 		}
 	}
@@ -316,6 +372,10 @@ fn print_summary(report: &BenchReport, out_path: &std::path::Path) {
 		println!("    input points : {}", r.dataset.input_points);
 		println!("    output points: {}", r.dataset.output_points);
 		println!("    latency (ms) : p50={:.3} p95={:.3} p99={:.3} mean={:.3}", ms(l.p50_ns), ms(l.p95_ns), ms(l.p99_ns), ms(l.mean_ns));
+		if let Some(split) = &r.cold_warm {
+			let ratio = split.first_rep_ratio().map_or_else(String::new, |x| format!(" ({x:.2}x the warm p50)"));
+			println!("    first rep    : {:.3} ms{ratio}; warm p50={:.3} over {} reps", ms(split.first_rep_ns), ms(split.warm.p50_ns), split.warm.count);
+		}
 		println!("    throughput   : {:.0} points/sec", r.throughput_points_per_sec);
 		println!("    correctness  : {}", if r.correctness.passed() { "PASS" } else { "FAIL" });
 		// Accuracy is present only for a synthetic profile (known ground truth);
@@ -367,6 +427,8 @@ struct CsvKnobs {
 	range_fetch: Option<PathBuf>,
 	/// `--ds-csv`: downsample series (`--ds-points` caps it).
 	downsample: Option<PathBuf>,
+	/// `--gf-csv`: gap-fill series to cut outages from (`--gf-points` caps it).
+	gap_fill: Option<PathBuf>,
 	/// `--csv-value-col`: 0-based column holding the value.
 	value_column: usize,
 	/// `--csv-skip`: data rows skipped after the header.
@@ -375,13 +437,13 @@ struct CsvKnobs {
 
 impl Default for CsvKnobs {
 	fn default() -> Self {
-		Self { compression: None, point_lookup: None, range_fetch: None, downsample: None, value_column: 1, skip_rows: 0 }
+		Self { compression: None, point_lookup: None, range_fetch: None, downsample: None, gap_fill: None, value_column: 1, skip_rows: 0 }
 	}
 }
 
 impl CsvKnobs {
 	/// Every flag this group owns.
-	const FLAGS: [&'static str; 6] = ["--comp-csv", "--pl-csv", "--rf-csv", "--ds-csv", "--csv-value-col", "--csv-skip"];
+	const FLAGS: [&'static str; 7] = ["--comp-csv", "--pl-csv", "--rf-csv", "--ds-csv", "--gf-csv", "--csv-value-col", "--csv-skip"];
 
 	/// Apply one of [`Self::FLAGS`] with its value.
 	fn set(&mut self, flag: &str, value: String) -> Result<(), String> {
@@ -390,6 +452,7 @@ impl CsvKnobs {
 			"--pl-csv" => self.point_lookup = Some(PathBuf::from(value)),
 			"--rf-csv" => self.range_fetch = Some(PathBuf::from(value)),
 			"--ds-csv" => self.downsample = Some(PathBuf::from(value)),
+			"--gf-csv" => self.gap_fill = Some(PathBuf::from(value)),
 			"--csv-value-col" => self.value_column = value.parse().map_err(|_| "invalid --csv-value-col (expected a 0-based column index)".to_string())?,
 			"--csv-skip" => self.skip_rows = value.parse().map_err(|_| "invalid --csv-skip (expected a row count)".to_string())?,
 			other => return Err(format!("unknown CSV flag `{other}`")),
@@ -431,6 +494,15 @@ struct Cli {
 	ds_aggs: Vec<Aggregation>,
 	/// Reduce in this many parallel chunks (partial reductions merged); 1 = serial.
 	ds_parallel: usize,
+	/// Downsample mode: decimal places of the generated values; `None` = the exact
+	/// binary expansion (`--ds-decimals full`).
+	ds_decimals: Option<u32>,
+	/// Downsample mode: time the integer-native path (`--ds-scaled`).
+	ds_scaled: bool,
+	/// Gap-fill mode: the workload knobs (the seed comes from `--seed`).
+	gap_fill: GapFillParams,
+	/// GPU-memory mode: the workload knobs (the seed comes from `--seed`).
+	gpu_memory: weft_bench::gpu_memory::GpuMemoryParams,
 	/// Storage-workload knob (point-lookup / range-fetch): jittered (irregular)
 	/// timestamps instead of a constant-stride regular corpus.
 	irregular: bool,
@@ -462,6 +534,8 @@ struct Cli {
 	jitter: f64,
 	/// Synthetic additive-noise amplitude (`>= 0`; `0` puts samples on truth).
 	noise: f64,
+	/// Synthetic mode: decimal places of the generated samples; `None` = exact expansion.
+	decimals: Option<u32>,
 	/// Analytic shape of the synthetic ground-truth signal.
 	shape: SignalShape,
 	/// Timestamp precision of the input file.
@@ -481,6 +555,8 @@ struct Cli {
 	compare: bool,
 	/// Also write a human-readable HTML report alongside the JSON artifact.
 	html: bool,
+	/// Also write the flat Parquet results table beside the JSON artifact.
+	parquet: bool,
 	/// Calibrate the interpolation backends before an interpolation run, as
 	/// `weft-server` does at startup (`--no-gpu-calibrate` turns it off).
 	gpu_calibrate: bool,
@@ -502,6 +578,10 @@ enum InputMode {
 	Compression,
 	/// The downsample workload (reduces a generated series into grid-aligned buckets).
 	Downsample,
+	/// The gap-fill workload (a bucketed query that fills the buckets outages left empty).
+	GapFill,
+	/// The GPU memory-stability workload (repeated mixed-size GPU interpolations).
+	GpuMemory,
 }
 
 /// What the parsed command line asks the program to do.
@@ -539,22 +619,17 @@ impl Cli {
 		let ds_defaults = DownsampleParams::default();
 
 		let (mut input, mut field): (Option<PathBuf>, Option<String>) = (None, None);
-		let mut synthetic = false;
-		let mut point_lookup = false;
-		let mut range_fetch = false;
-		let mut compression = false;
-		let mut downsample = false;
+		// The workload-mode flags; exactly one may be set (`select_workload_mode`).
+		let (mut synthetic, mut point_lookup, mut range_fetch, mut compression, mut downsample, mut gap_fill_mode, mut gpu_memory_mode) = (false, false, false, false, false, false, false);
+		let (mut gap_fill, mut gpu_memory) = (GapFillParams::default(), weft_bench::gpu_memory::GpuMemoryParams::default());
 		let (mut comp_rows, mut comp_shape, mut csv) = (comp_defaults.point_count, comp_defaults.value_shape, CsvKnobs::default());
 		let (mut ds_points, mut ds_stride, mut ds_bucket) = (ds_defaults.point_count, ds_defaults.input_stride_secs, ds_defaults.bucket_resolution);
-		let (mut ds_aggs, mut ds_parallel) = (ds_defaults.aggregations, ds_defaults.parallel_chunks.max(1));
+		let (mut ds_aggs, mut ds_parallel, mut ds_decimals) = (ds_defaults.aggregations, ds_defaults.parallel_chunks.max(1), ds_defaults.value_decimals);
 		let mut irregular = false;
 		let (mut pl_rows, mut pl_queries, mut pl_absent, mut pl_mode, mut pl_rows_per_page) = (pl_defaults.point_count, pl_defaults.query_count, pl_defaults.absent_fraction, pl_defaults.mode, pl_defaults.rows_per_page);
 		let (mut rf_rows, mut rf_window, mut rf_windows, mut rf_rows_per_page) = (rf_defaults.point_count, rf_defaults.window_rows, rf_defaults.window_count, rf_defaults.rows_per_page);
-		let mut seed = defaults.seed;
-		let mut points = defaults.input_points;
-		let mut missingness = defaults.missingness_fraction;
-		let mut jitter = defaults.jitter_fraction;
-		let mut noise = defaults.noise_amplitude;
+		let (mut seed, mut points, mut missingness, mut jitter) = (defaults.seed, defaults.input_points, defaults.missingness_fraction, defaults.jitter_fraction);
+		let (mut noise, mut decimals) = (defaults.noise_amplitude, defaults.value_decimals);
 		let mut shape = defaults.signal_shape;
 		let mut precision = TimestampPrecision::Nanoseconds;
 		let mut spline = Spline::Cubic;
@@ -563,7 +638,7 @@ impl Cli {
 		let mut out_dir = PathBuf::from("reports").join("json");
 		let mut name: Option<String> = None;
 		let mut compare = false;
-		let mut html = false;
+		let (mut html, mut parquet, mut ds_scaled) = (false, false, false);
 		let mut gpu_calibrate = true;
 
 		let mut iter = args.into_iter();
@@ -595,11 +670,16 @@ impl Cli {
 				"--comp-shape" => comp_shape = parse_value_shape(&take_value(&key)?)?,
 				flag if CsvKnobs::FLAGS.contains(&flag) => csv.set(flag, take_value(&key)?)?,
 				"-d" | "--downsample" => downsample = true,
+				"-g" | "--gap-fill" => gap_fill_mode = true,
+				flag if GAP_FILL_FLAGS.contains(&flag) => set_gap_fill_knob(&mut gap_fill, flag, &take_value(&key)?)?,
+				"--gpu-memory" => gpu_memory_mode = true,
+				flag if GPU_MEMORY_FLAGS.contains(&flag) => set_gpu_memory_knob(&mut gpu_memory, flag, &take_value(&key)?)?,
 				"--ds-points" => ds_points = parse_points_count(&take_value(&key)?)?,
 				"--ds-stride" => ds_stride = parse_stride_secs(&take_value(&key)?)?,
 				"--ds-bucket" => ds_bucket = parse_resolution(&take_value(&key)?)?,
 				"--ds-aggs" => ds_aggs = parse_aggregations(&take_value(&key)?)?,
 				"--ds-parallel" => ds_parallel = take_value(&key)?.parse::<usize>().map_err(|_| "--ds-parallel must be a positive integer".to_string())?.max(1),
+				"--ds-decimals" => ds_decimals = parse_value_decimals(&take_value(&key)?)?,
 				"--irregular" | "--pl-irregular" | "--rf-irregular" => irregular = true,
 				"--pl-rows" => pl_rows = parse_points_count(&take_value(&key)?)?,
 				"--pl-queries" => pl_queries = parse_query_count(&take_value(&key)?)?,
@@ -615,6 +695,7 @@ impl Cli {
 				"--missingness" => missingness = parse_fraction(&take_value(&key)?, "missingness")?,
 				"--jitter" => jitter = parse_fraction(&take_value(&key)?, "jitter")?,
 				"--noise" => noise = parse_noise(&take_value(&key)?)?,
+				"--decimals" => decimals = parse_value_decimals(&take_value(&key)?)?,
 				"--shape" => shape = parse_shape(&take_value(&key)?)?,
 				"--precision" => precision = parse_precision(&take_value(&key)?)?,
 				"--spline" => spline = parse_spline(&take_value(&key)?)?,
@@ -624,6 +705,8 @@ impl Cli {
 				"--name" => name = Some(take_value(&key)?),
 				"-c" | "--compare" => compare = true,
 				"--html" => html = true,
+				"--parquet" => parquet = true,
+				"--ds-scaled" => ds_scaled = true,
 				"--no-gpu-calibrate" => gpu_calibrate = false,
 				other if other.starts_with('-') => return Err(format!("unknown flag `{other}`")),
 				// A bare positional is taken as the input path if one is not set yet.
@@ -637,10 +720,10 @@ impl Cli {
 		}
 
 		// Exactly one workload mode may be selected; the rest default to line protocol.
-		let mode = select_workload_mode(&[(synthetic, InputMode::Synthetic), (point_lookup, InputMode::PointLookup), (range_fetch, InputMode::RangeFetch), (compression, InputMode::Compression), (downsample, InputMode::Downsample)])?;
+		let mode = select_workload_mode(&[(synthetic, InputMode::Synthetic), (point_lookup, InputMode::PointLookup), (range_fetch, InputMode::RangeFetch), (compression, InputMode::Compression), (downsample, InputMode::Downsample), (gap_fill_mode, InputMode::GapFill), (gpu_memory_mode, InputMode::GpuMemory)])?;
 		validate_mode(mode, input.as_ref(), field.as_deref(), compare, gpu_calibrate)?;
 
-		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare, html, gpu_calibrate })))
+		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, gpu_memory, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, html, parquet, gpu_calibrate })))
 	}
 }
 
@@ -649,7 +732,7 @@ impl Cli {
 fn select_workload_mode(candidates: &[(bool, InputMode)]) -> Result<InputMode, String> {
 	let selected: Vec<InputMode> = candidates.iter().filter(|(set, _)| *set).map(|(_, m)| *m).collect();
 	if selected.len() > 1 {
-		return Err("only one workload mode may be given (--synthetic / --point-lookup / --range-fetch / --compression / --downsample)".to_string());
+		return Err("only one workload mode may be given (--synthetic / --point-lookup / --range-fetch / --compression / --downsample / --gap-fill / --gpu-memory)".to_string());
 	}
 	Ok(selected.first().copied().unwrap_or(InputMode::LineProtocol))
 }
@@ -663,6 +746,8 @@ const fn self_generating_mode_flag(mode: InputMode) -> Option<&'static str> {
 		InputMode::RangeFetch => Some("--range-fetch"),
 		InputMode::Compression => Some("--compression"),
 		InputMode::Downsample => Some("--downsample"),
+		InputMode::GapFill => Some("--gap-fill"),
+		InputMode::GpuMemory => Some("--gpu-memory"),
 		InputMode::LineProtocol | InputMode::Synthetic => None,
 	}
 }
@@ -710,7 +795,7 @@ fn validate_mode(mode: InputMode, input: Option<&PathBuf>, field: Option<&str>, 
 				return Err("missing required `--field <name>`".to_string());
 			}
 		}
-		InputMode::PointLookup | InputMode::RangeFetch | InputMode::Compression | InputMode::Downsample => unreachable!("handled by self_generating_mode_flag above"),
+		InputMode::PointLookup | InputMode::RangeFetch | InputMode::Compression | InputMode::Downsample | InputMode::GapFill | InputMode::GpuMemory => unreachable!("handled by self_generating_mode_flag above"),
 	}
 	Ok(())
 }
@@ -828,6 +913,51 @@ fn parse_stride_secs(s: &str) -> Result<i64, String> {
 	Ok(n)
 }
 
+/// The gap-fill workload's knob flags, each taking one value ([`set_gap_fill_knob`]).
+const GAP_FILL_FLAGS: [&str; 7] = ["--gf-points", "--gf-stride", "--gf-bucket", "--gf-outage", "--gf-outage-len", "--gf-fill", "--gf-agg"];
+
+/// Apply one gap-fill knob (`flag` from [`GAP_FILL_FLAGS`]) to `params`.
+fn set_gap_fill_knob(params: &mut GapFillParams, flag: &str, value: &str) -> Result<(), String> {
+	match flag {
+		"--gf-points" => params.point_count = parse_points_count(value)?,
+		"--gf-stride" => params.input_stride_secs = parse_stride_secs(value)?,
+		"--gf-bucket" => params.bucket_resolution = parse_resolution(value)?,
+		"--gf-outage" => params.outage_percent = value.parse::<u32>().ok().filter(|p| *p <= 90).ok_or_else(|| "--gf-outage must be a whole percent in 0..=90".to_string())?,
+		"--gf-outage-len" => params.mean_outage_buckets = value.parse::<u32>().ok().filter(|n| *n >= 1).ok_or_else(|| "--gf-outage-len must be a positive whole number of buckets".to_string())?,
+		"--gf-fill" => params.method = weft_reduce::Fill::from_token(value).ok_or_else(|| format!("invalid --gf-fill `{value}` (use linear|cubic|quadratic|prev|null|<decimal>)"))?,
+		"--gf-agg" => params.aggregation = Aggregation::from_token(value).ok_or_else(|| format!("invalid --gf-agg `{value}`"))?,
+		_ => unreachable!("only GAP_FILL_FLAGS are dispatched here"),
+	}
+	Ok(())
+}
+
+/// The GPU-memory workload's knob flags, each taking one value ([`set_gpu_memory_knob`]).
+const GPU_MEMORY_FLAGS: [&str; 4] = ["--gm-rounds", "--gm-sizes", "--gm-knots", "--gm-pool-mib"];
+
+/// Apply one GPU-memory knob (`flag` from [`GPU_MEMORY_FLAGS`]) to `params`.
+fn set_gpu_memory_knob(params: &mut weft_bench::gpu_memory::GpuMemoryParams, flag: &str, value: &str) -> Result<(), String> {
+	let positive = |name: &str, v: &str| v.parse::<usize>().ok().filter(|n| *n >= 1).ok_or_else(|| format!("{name} must be a positive whole number"));
+	match flag {
+		"--gm-rounds" => params.rounds = positive("--gm-rounds", value)?,
+		"--gm-knots" => params.knots = positive("--gm-knots", value)?.max(2),
+		"--gm-sizes" => params.sizes = value.split(',').map(|v| positive("--gm-sizes", v.trim()).map(|n| n.max(2))).collect::<Result<_, _>>()?,
+		"--gm-pool-mib" => params.pool_mib = Some(value.parse::<u64>().map_err(|_| "--gm-pool-mib must be a whole number of MiB".to_string())?),
+		_ => unreachable!("only GPU_MEMORY_FLAGS are dispatched here"),
+	}
+	Ok(())
+}
+
+/// Parse a `--ds-decimals` value: a place count in `0..=MAX_VALUE_DECIMALS`, or `full`.
+fn parse_value_decimals(s: &str) -> Result<Option<u32>, String> {
+	if s.eq_ignore_ascii_case("full") {
+		return Ok(None);
+	}
+	match s.parse::<u32>() {
+		Ok(places) if places <= weft_bench::downsample::MAX_VALUE_DECIMALS => Ok(Some(places)),
+		_ => Err(format!("invalid decimal places `{s}` (expected 0..={} or `full`)", weft_bench::downsample::MAX_VALUE_DECIMALS)),
+	}
+}
+
 /// Parse a compression value-shape token (`clustered` | `trending` | `jitter`).
 fn parse_value_shape(s: &str) -> Result<ValueShape, String> {
 	match s.to_ascii_lowercase().as_str() {
@@ -891,6 +1021,8 @@ USAGE:
     weft-bench --range-fetch [RANGE-FETCH OPTIONS]
     weft-bench --compression [COMPRESSION OPTIONS]
     weft-bench --downsample [DOWNSAMPLE OPTIONS]
+    weft-bench --gap-fill [GAP-FILL OPTIONS]
+    weft-bench --gpu-memory [GPU-MEMORY OPTIONS]
 
 INPUT MODE (choose one):
     -i, --input <FILE>       Line-protocol input file (.lp / TSBS payload)
@@ -915,6 +1047,11 @@ INPUT MODE (choose one):
                              dense series and time WeftDB's canonical reduction (min/max/
                              avg/sum/first/last) into grid-aligned buckets. Gated on
                              the reduction being total (bucket counts sum to input).
+    -g, --gap-fill           Run the gap-fill workload (TSM-Bench Q5's shape, SAMPLE BY
+                             ... FILL(LINEAR)): cut outages from a seeded series, then
+                             time reduce + fill of every empty bucket. Gated on a dense
+                             grid whose synthesized buckets are exactly the outages;
+                             scores the filled values against the clean signal.
 
 STORAGE-WORKLOAD OPTIONS (with --point-lookup or --range-fetch):
         --irregular          Jittered timestamps (decode + search/filter) instead of
@@ -958,11 +1095,39 @@ DOWNSAMPLE OPTIONS (with --downsample):
                              CSV rules as --comp-csv; --ds-points caps it)
         --ds-parallel <N>    Reduce in N parallel chunks (partials merged);
                              the merged result is identical to serial [default: 1]
+        --ds-decimals <N>    Decimal places of the generated values (0..=12), or
+                             `full` for the f64 signal's exact binary expansion (the
+                             generator before 2026-10-09)               [default: 2]
+        --ds-scaled          Time the integer-native path the stored-range downsample
+                             takes (reduce_partial_scaled over one ScaledI64 column),
+                             gated on equalling the BigDecimal reduce
         --ds-stride <N>      Seconds between input samples (>=1)        [default: 1]
         --ds-bucket <R>      Bucket resolution: s|m|h|d|w|mo|y     [default: minutes]
         --ds-aggs <LIST>     Reductions, comma-separated: min,max,avg,sum,first,
                              last,p50,p90,p95,p99          [default: min,max,avg,
                              sum,first,last]
+
+GAP-FILL OPTIONS (with --gap-fill; seeded by --seed):
+        --gf-points <N>      Samples generated before outages (>=2)  [default: 86400]
+        --gf-stride <N>      Seconds between samples (>=1)              [default: 1]
+        --gf-bucket <R>      Bucket resolution: s|m|h|d|w|mo|y     [default: minutes]
+        --gf-outage <PCT>    Share of interior buckets lost to outages, 0..=90
+                                                                       [default: 20]
+        --gf-outage-len <N>  Mean outage length in buckets (>=1)        [default: 5]
+        --gf-fill <M>        Fill: linear|cubic|quadratic|prev|null|<decimal>
+                             (cubic/quadratic: a splimes spline) [default: linear]
+        --gf-agg <A>         Reduction per bucket, scored on filled buckets
+                                                                      [default: avg]
+        --gf-csv <FILE>      Cut the outages from a REAL series instead (same CSV
+                             rules as --comp-csv; --gf-points caps it); filled
+                             buckets are scored against the real values removed
+
+GPU-MEMORY OPTIONS (with --gpu-memory; needs a hardware GPU; seeded by --seed):
+        --gm-rounds <N>      Rounds; each calls every size once       [default: 20]
+        --gm-sizes <LIST>    Output points per call, comma-separated
+                                               [default: 16384,1048576,4194304]
+        --gm-knots <N>       Input knots per call                    [default: 1000]
+        --gm-pool-mib <N>    Start the GPU with this pool cap  [default: splimes' 512]
 
 SYNTHETIC OPTIONS (with --synthetic):
         --seed <N>           Generator seed, decimal or 0x-hex     [default: flagship]
@@ -970,6 +1135,9 @@ SYNTHETIC OPTIONS (with --synthetic):
         --missingness <F>    Gap fraction in [0, 1]                [default: 0.20]
         --jitter <F>         Timestamp jitter fraction in [0, 1]   [default: 0.60]
         --noise <F>          Sample noise amplitude (>=0; 0=clean) [default: 2.0]
+        --decimals <N>       Round samples to N decimal places (0..=12) or `full`;
+                             set it for throughput runs, since ~50-digit inputs
+                             interpolate ~2x slower at scale        [default: full]
         --shape <S>          Ground-truth signal: multisine|sawtooth|step|
                              dampedsine                       [default: multisine]
 
@@ -985,6 +1153,9 @@ OPTIONS:
                              forward-fill) for comparison
         --html               Also write a human-readable HTML report alongside
                              the JSON artifact
+        --parquet            Also write the results as a flat Parquet table (one
+                             row per result) beside the JSON, for DuckDB/Polars/
+                             Grafana queries across many runs
         --no-gpu-calibrate   Don't calibrate the interpolation backends first. By
                              default an interpolation run calls splimes::calibrate()
                              once (several seconds), as weft-server does at startup,
@@ -1126,6 +1297,35 @@ mod tests {
 	}
 
 	#[test]
+	fn gpu_memory_mode_parses_its_knobs() {
+		let cli = expect_run(&["--gpu-memory"]);
+		assert_eq!(cli.mode, InputMode::GpuMemory);
+		assert_eq!(cli.gpu_memory, weft_bench::gpu_memory::GpuMemoryParams::default());
+		let cli = expect_run(&["--gpu-memory", "--gm-rounds", "5", "--gm-sizes", "1024, 65536", "--gm-knots", "50", "--gm-pool-mib", "32"]);
+		assert_eq!((cli.gpu_memory.rounds, cli.gpu_memory.sizes.clone(), cli.gpu_memory.knots, cli.gpu_memory.pool_mib), (5, vec![1_024, 65_536], 50, Some(32)));
+		assert!(run_cli(&["--gpu-memory", "--gm-sizes", "10,x"]).unwrap_err().contains("--gm-sizes"));
+		assert!(run_cli(&["--gpu-memory", "--gm-rounds", "0"]).unwrap_err().contains("--gm-rounds"));
+		assert!(run_cli(&["--gpu-memory", "-g"]).unwrap_err().contains("only one workload mode"));
+	}
+
+	#[test]
+	fn gap_fill_mode_parses_its_knobs_and_rejects_bad_ones() {
+		let cli = expect_run(&["--gap-fill"]);
+		assert_eq!(cli.mode, InputMode::GapFill);
+		assert_eq!(cli.gap_fill, GapFillParams::default());
+		let cli = expect_run(&["-g", "--gf-points", "7200", "--gf-bucket", "s", "--gf-outage", "35", "--gf-outage-len", "3", "--gf-fill", "prev", "--gf-agg", "max", "--gf-stride", "2"]);
+		let expected = GapFillParams { point_count: 7_200, input_stride_secs: 2, bucket_resolution: Resolution::Seconds, outage_percent: 35, mean_outage_buckets: 3, method: weft_reduce::Fill::Previous, aggregation: Aggregation::Max, ..GapFillParams::default() };
+		assert_eq!(cli.gap_fill, expected);
+		assert_eq!(expect_run(&["-g", "--gf-csv", "x.csv"]).csv.gap_fill, Some(PathBuf::from("x.csv")));
+		assert_eq!(expect_run(&["-g", "--gf-fill", "0.5"]).gap_fill.method, weft_reduce::Fill::Value("0.5".parse().unwrap()));
+		assert!(run_cli(&["-g", "--gf-outage", "95"]).unwrap_err().contains("--gf-outage"));
+		assert!(run_cli(&["-g", "--gf-outage-len", "0"]).unwrap_err().contains("--gf-outage-len"));
+		assert!(run_cli(&["-g", "--gf-fill", "nearest"]).unwrap_err().contains("invalid --gf-fill"));
+		assert!(run_cli(&["-g", "--downsample"]).unwrap_err().contains("only one workload mode"));
+		assert!(run_cli(&["-g", "--compare"]).unwrap_err().contains("`--compare` has no meaning in `--gap-fill` mode"));
+	}
+
+	#[test]
 	fn downsample_mode_parses_with_knob_defaults_and_conflicts_rejected() {
 		let cli = expect_run(&["--downsample"]);
 		assert_eq!(cli.mode, InputMode::Downsample);
@@ -1139,6 +1339,15 @@ mod tests {
 		assert_eq!(cli.ds_stride, 5);
 		assert_eq!(cli.ds_bucket, Resolution::Hours);
 		assert!(run_cli(&["-d", "--ds-stride", "0"]).unwrap_err().contains("--ds-stride must be >= 1"));
+		// Generated values default to two places; `full` restores the pre-2026-10 generator.
+		assert_eq!(cli.ds_decimals, Some(2));
+		assert_eq!(expect_run(&["-d", "--ds-decimals", "4"]).ds_decimals, Some(4));
+		assert_eq!(expect_run(&["-d", "--ds-decimals", "full"]).ds_decimals, None);
+		assert!(run_cli(&["-d", "--ds-decimals", "13"]).unwrap_err().contains("invalid decimal places"));
+		assert_eq!(expect_run(&["-s"]).decimals, None, "synthetic samples keep their exact expansion by default");
+		assert_eq!(expect_run(&["-s", "--decimals", "2"]).decimals, Some(2));
+		assert!(!expect_run(&["-d"]).ds_scaled);
+		assert!(expect_run(&["-d", "--ds-scaled"]).ds_scaled);
 		// Aggregations parse from a comma list (including percentiles) and reject unknowns.
 		assert_eq!(cli.ds_aggs, Aggregation::ALL.to_vec(), "default is the six streaming reductions");
 		assert_eq!(expect_run(&["-d", "--ds-aggs", "min,max,p99"]).ds_aggs, vec![Aggregation::Min, Aggregation::Max, Aggregation::P99]);
@@ -1260,6 +1469,8 @@ mod tests {
 		assert!(!expect_run(&["data.lp", "-f", "v"]).html, "html is off unless requested");
 		assert!(expect_run(&["data.lp", "-f", "v", "--html"]).html);
 		assert!(expect_run(&["-s", "--html"]).html);
+		assert!(!expect_run(&["-s"]).parquet, "parquet is off unless requested");
+		assert!(expect_run(&["-g", "--parquet"]).parquet);
 	}
 
 	#[test]

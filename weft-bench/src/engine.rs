@@ -42,6 +42,10 @@ pub struct EngineMetadata {
 	/// discrete; f64 shaders: yes)`; `None` when calibration was disabled or there is no
 	/// usable GPU.
 	pub gpu: Option<String>,
+	/// The GPU driver's name and version as the driver reports them, e.g. `NVIDIA
+	/// 580.82.09`; `None` with no GPU, or when the driver reports nothing.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub gpu_driver: Option<String>,
 	/// Why there is no GPU, or why calibration was skipped or failed, when it was.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub note: Option<String>,
@@ -59,7 +63,24 @@ impl EngineMetadata {
 	#[must_use]
 	pub fn new(calibration: CalibrationStatus, gpu: Option<String>, note: Option<String>, thresholds: AutoThresholds) -> Self {
 		let threshold = |n: usize| (n != usize::MAX).then_some(n);
-		Self { calibration, gpu, note, parallel_min_points: threshold(thresholds.parallel_min_points), gpu_min_points: threshold(thresholds.gpu_min_points), gpu_f32_min_points: threshold(thresholds.gpu_f32_min_points) }
+		Self { calibration, gpu, gpu_driver: None, note, parallel_min_points: threshold(thresholds.parallel_min_points), gpu_min_points: threshold(thresholds.gpu_min_points), gpu_f32_min_points: threshold(thresholds.gpu_f32_min_points) }
+	}
+
+	/// The same metadata with the GPU driver recorded; an empty or blank `driver` (some
+	/// drivers report none) records nothing.
+	#[must_use]
+	pub fn with_gpu_driver(mut self, driver: &str) -> Self {
+		let driver = driver.trim();
+		self.gpu_driver = (!driver.is_empty()).then(|| driver.to_string());
+		self
+	}
+
+	/// The GPU and its driver in words, e.g. `NVIDIA GeForce RTX 4070 Ti SUPER (vulkan,
+	/// discrete; f64 shaders: yes), driver NVIDIA 580.82.09`; `None` with no GPU.
+	#[must_use]
+	pub fn describe_gpu(&self) -> Option<String> {
+		let gpu = self.gpu.as_deref()?;
+		Some(self.gpu_driver.as_deref().map_or_else(|| gpu.to_string(), |driver| format!("{gpu}, driver {driver}")))
 	}
 
 	/// The engine as it stands without calibration (`--no-gpu-calibrate`): splimes'
@@ -114,21 +135,22 @@ pub fn is_software_adapter(device_type: &str, name: &str) -> bool {
 /// in force and the metadata says why.
 #[must_use]
 pub fn calibrate() -> EngineMetadata {
-	let (gpu, unavailable) = match splimes::prewarm_gpu() {
+	let (gpu, driver, unavailable) = match splimes::prewarm_gpu() {
 		Ok(info) => {
 			let gpu = format!("{} ({}, {}; f64 shaders: {})", info.name, info.api, info.device_type, if info.supports_f64 { "yes" } else { "no" });
 			if is_software_adapter(&info.device_type, &info.name) {
 				let note = format!("{} is a CPU/software adapter, which weft-server does not calibrate either", info.name);
-				return EngineMetadata::new(CalibrationStatus::SoftwareAdapter, Some(gpu), Some(note), splimes::auto_thresholds());
+				return EngineMetadata::new(CalibrationStatus::SoftwareAdapter, Some(gpu), Some(note), splimes::auto_thresholds()).with_gpu_driver(&info.driver);
 			}
-			(Some(gpu), None)
+			(Some(gpu), info.driver, None)
 		}
-		Err(err) => (None, Some(err.to_string())),
+		Err(err) => (None, String::new(), Some(err.to_string())),
 	};
-	match splimes::calibrate() {
+	let engine = match splimes::calibrate() {
 		Ok(calibration) => EngineMetadata::new(CalibrationStatus::Calibrated, gpu, unavailable, calibration.thresholds),
 		Err(err) => EngineMetadata::new(CalibrationStatus::Failed, gpu, Some(err.to_string()), splimes::auto_thresholds()),
-	}
+	};
+	engine.with_gpu_driver(&driver)
 }
 
 #[cfg(test)]
@@ -160,6 +182,31 @@ mod tests {
 		assert_eq!(json["calibration"], "software_adapter");
 		assert_eq!(json["gpu_min_points"], serde_json::Value::Null, "never is null, not usize::MAX");
 		assert_eq!(serde_json::from_value::<EngineMetadata>(json).unwrap(), engine);
+	}
+
+	#[test]
+	fn gpu_driver_is_recorded_beside_the_adapter_and_blank_drivers_are_not() {
+		let gpu = "Test GPU (vulkan, discrete; f64 shaders: yes)";
+		let engine = EngineMetadata::new(CalibrationStatus::Calibrated, Some(gpu.to_string()), None, AutoThresholds::DEFAULT).with_gpu_driver(" NVIDIA 580.82.09 ");
+		assert_eq!(engine.gpu_driver.as_deref(), Some("NVIDIA 580.82.09"));
+		assert_eq!(engine.describe_gpu().as_deref(), Some("Test GPU (vulkan, discrete; f64 shaders: yes), driver NVIDIA 580.82.09"));
+		let json = serde_json::to_value(&engine).unwrap();
+		assert_eq!(json["gpu_driver"], "NVIDIA 580.82.09");
+		assert_eq!(serde_json::from_value::<EngineMetadata>(json).unwrap(), engine);
+
+		let blank = EngineMetadata::new(CalibrationStatus::Calibrated, Some(gpu.to_string()), None, AutoThresholds::DEFAULT).with_gpu_driver("  ");
+		assert_eq!(blank.gpu_driver, None);
+		assert_eq!(blank.describe_gpu().as_deref(), Some(gpu));
+		assert!(serde_json::to_value(&blank).unwrap().get("gpu_driver").is_none(), "an absent driver is omitted, not null");
+		assert_eq!(EngineMetadata::uncalibrated().describe_gpu(), None);
+	}
+
+	#[test]
+	fn engine_metadata_without_a_driver_field_still_deserializes() {
+		// A schema v16..v19 artifact has no `gpu_driver`.
+		let old = serde_json::json!({ "calibration": "calibrated", "gpu": "Test GPU", "parallel_min_points": 16384, "gpu_min_points": 4096, "gpu_f32_min_points": null });
+		let engine: EngineMetadata = serde_json::from_value(old).unwrap();
+		assert_eq!((engine.gpu.as_deref(), engine.gpu_driver), (Some("Test GPU"), None));
 	}
 
 	#[test]
