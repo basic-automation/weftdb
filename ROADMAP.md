@@ -389,6 +389,14 @@ transfer, kernel, readback, and API serialization, p95 = Z."*
 **Acceptance:** honest claim like *"this mode cuts storage by X while preserving event
 detection within Y% and improving historical query latency by Z."*
 
+**Real-corpus figures.** Every "real BTC" number in this phase and below (`btc_close`,
+`btc_minutes`, 4.22 B/point, the `--*-csv` workloads) comes from `database/datasets/btc_1min.csv`,
+a local, gitignored file that is **not distributed with the repository**, so a clone cannot
+reproduce them (the benches that load it by default skip it when the file is absent). Whether the datasets
+may be redistributed, and clearing or retiring the BTC-corpus numbers before 1.0, are open with
+counsel ([Phase 8](#phase-8--commercial-hardening--required-for-paid-beta);
+[1.0 plan, Appendix B](docs/release/1.0-plan.md#appendix-b-human-only-tasks)).
+
 - [ ] **6.1 Lossless typed codecs** — timestamp delta/delta-of-delta + **fixed-width
   bit-packing** + **RLE** + **Gorilla variable-length** + **per-block adaptive
   bit-packing** *(all five realized on disk in the `.weftseg` timestamp block, chosen
@@ -558,11 +566,14 @@ detection within Y% and improving historical query latency by Z."*
       `best_value_codec` on the real corpus, the actionable outcome is to steal the **heuristic**,
       which stays inside hard-constraint #4 because WeftDB's scale is already schema-declared.
       *(src: https://arxiv.org/pdf/2502.06112)*
-    - [x] **DONE (2026-10-08) — `pco` is now 1.0 (1.0.3, 2026-08-01) — pin it in `weft-bench` only**, keeping it out of
-      the core crates until an adopt decision, per the out-of-core boundary. Build the harness with
-      the `bmi1`/`bmi2`/`avx2` target features the crate's docs call for ("improves ... decompression
-      speed substantially") or the measured decode throughput will understate pco and produce a false
-      adopt-or-drop verdict. *(src: https://lib.rs/crates/pco)*
+    - [x] **DONE (2026-10-08) — `pco` reached 1.0 (1.0.3, 2026-08-01); `pco =1.0.4` is pinned as a
+      bench-only dev-dependency of `weft-physical-type`, not a runtime dependency of any core
+      crate.** The library links none of it, so the out-of-core boundary holds until an adopt
+      decision (the plan was to pin it in `weft-bench`; the arm went beside the other codec arms
+      instead, see below). The crate's docs call for the `bmi1`/`bmi2`/`avx2` target features
+      ("improves ... decompression speed substantially"); the measurement below was built without
+      them, so its pco decode times are a floor and must not decide adopt-or-drop on speed.
+      *(src: https://lib.rs/crates/pco)*
     - [x] **Measured (2026-10-08), value column, per column as asked.** `pco =1.0.4` is pinned as
       a bench-only dev-dependency of `weft-physical-type`, beside `alp`/`fastlanes` in
       `benches/alp_vs_f64_codecs.rs`. The library links none of them; the arm sits with the other
@@ -845,15 +856,24 @@ detection within Y% and improving historical query latency by Z."*
     slice): shipped (prototype).** *(Correction 2026-10-08: what shipped is a bit-sliced,
     bit-plane-major layout, not the FastLanes layout; it is now behind the `bitsliced-codec`
     feature — see the codec patent/licence gate above.)* `TRANSPOSE_TILE`/`transpose_bitpack_bytes`/`_encode`/`_decode`
-    — a per-tile bit-plane-major layout whose decoder reads `u64` words and walks only the *set*
-    bits (`w &= w-1`), so the empty high bit-planes of a small-magnitude stream are skipped
-    wholesale (where the scalar per-value loop pays every bit of every value). Byte footprint is a
-    permutation of the linear per-block layout (identical on aligned tiles). Measured (release,
-    `benches/bitunpack.rs`, 1 Mi small-magnitude stream): **~238 Melem/s vs ~41.6 Melem/s** for the
-    linear per-block decode at the same footprint — **~5.7× decode speedup**, bytes/point unchanged.
-    Residue: realize it as the stored blocked layout behind a format-version bump + reader dispatch,
-    and measure the *end-to-end* read win (decode is often bandwidth-bound —
-    https://arxiv.org/pdf/2606.22423). *(src: FastLanes Compression Layout, VLDB'23 —
+    — a per-tile bit-plane-major layout. A plane byte holds the same bit of eight lanes, so the
+    shipped decoder rebuilds eight lanes per byte read with a fixed, branch-free table spread
+    (`SPREAD`) written straight into the output, and each tile's one-byte width header drops a
+    small-magnitude stream's empty high bit-planes. It replaced the first decoder, which read `u64`
+    words and walked only the *set* bits (`w &= w-1`), after the `fastlanes` yardstick found that
+    one 3.7–15× slower than the crate: 1.32→0.78 / 5.27→1.50 / 7.60→2.32 ms per 1 Mi values at
+    widths 3/10/20
+    ([`benches/fastlanes_yardstick.rs`](weft-physical-type/benches/fastlanes_yardstick.rs)). Byte
+    footprint is a permutation of the linear per-block layout (identical on aligned tiles). The
+    **~5.7× decode speedup** once quoted here (~238 vs ~41.6 Melem/s, 1 Mi small-magnitude stream)
+    belongs to that old set-bit decoder, measured against a linear decoder that read one bit at a
+    time, and it did not survive. Once the linear unpack moved to word-wise reads it unpacks faster
+    than the table spread (1.09 vs 1.95 ms per 1 Mi values,
+    [`benches/bitunpack.rs`](weft-physical-type/benches/bitunpack.rs)), and realized on disk as the
+    opt-in `VAL_CODEC_TRANSPOSED` the layout is byte-neutral (+0.08%) and reads no faster end to end
+    ([`benches/transposed_read.rs`](weft-physical-type/benches/transposed_read.rs)), as the
+    caveat that decode is often bandwidth-bound predicted (https://arxiv.org/pdf/2606.22423). See
+    the retire-to-read-only item above. *(src: FastLanes Compression Layout, VLDB'23 —
     https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf)*
   - [x] **Cascading (recursive) codec composition — delta→best-packer chain: advisory + on disk.**
     WeftDB's other value codecs are single-level (one of varint/bit-pack/blocked/FOR); this is the
@@ -1387,6 +1407,10 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   common-multiple codec, ALP adoption, and retiring `VAL_CODEC_TRANSPOSED`; (2) the remaining ~6×
   decimal tax (profile per-bucket materialization); (3) the backup checkpoint-first A/B;
   (4) bulk ingest through the `.weftseg` seal, once the durability arc has landed.
+  Lanes first ([1.0 plan §2](docs/release/1.0-plan.md#2-operating-rules-for-the-whole-release),
+  single-writer hot-file lanes): `backup.rs` and `segment_store.rs` (L-STORE) belong to the
+  durability track and the `weft-physical-type` frame/codec files to L-FMT, so work on them is
+  coordinated with the owning lane, not landed independently.
 - [ ] **(2026-09-23 list; item 3 shipped 2026-10-08.)** The 2026-09-23 run closed both cheap backup
   follow-ons (sidecar sweep shipped; snapshot cost **measured**, and the diagnosis on record was
   wrong — it is I/O, not vacuum CPU) and landed the depth item (**transposed layout realized on
@@ -1527,7 +1551,9 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 - [ ] **BENCHMARK HYGIENE — the synthetic ingest corpus flatters WeftDB, by a lot (measured 2026-07-23).**
   Running `ingest_path_profile_legacy_vs_columnar` on the real corpus for the first time contradicted
   the synthetic numbers three ways, all now guarded in the harness but worth carrying as a standing
-  caution for every workload that uses a generator:
+  caution for every workload that uses a generator. (The real corpus, `database/datasets/btc_1min.csv`,
+  is a local file not distributed with the repository, so the real-data figures below cannot be
+  reproduced from a clone; see the note under [Phase 6](#phase-6--compression-v2--high).)
   - **Compression was overstated ~2.5×.** A representative 1M-row real window frames at **4.22
     B/point** against the synthetic corpus's **1.71 B/point**.
   - **The head of `btc_1min.csv` is degenerate.** Its first ~20k rows are 2012 ticks holding constant

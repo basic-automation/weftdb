@@ -282,8 +282,10 @@ truth for status and priorities, and it records negative results alongside wins.
 
 ## Performance
 
-Every number below comes from a benchmark in this repo, named so you can re-run it.
-All were measured on one developer workstation — treat them as *shape*, not as a
+Every number below comes from a benchmark in this repo, named so you can re-run it. The
+exception is any figure measured on the real BTC corpus: that input is a local file the
+repository does not ship (see [Ingest](#ingest)), so those figures cannot be reproduced from a
+clone. All were measured on one developer workstation — treat them as *shape*, not as a
 specification for your hardware.
 
 ### Reads WeftDB optimises specifically
@@ -305,11 +307,16 @@ and from resolving regular timestamp columns in closed form.
 Sealing **1M rows** of a real 1-minute financial series into a columnar segment:
 **4.57 s — 218,963 rows/sec at 4.22 bytes/point.**
 
-That corpus is a local file, **not redistributed with this repository** and not required to
-build or test — the suite skips the tests that use it when it is absent. It is quoted here
-because a *synthetic* generator materially flatters the result: on the same workload the
-generated corpus reports **1.71 bytes/point against the real 4.22**, roughly 2.5× too
-optimistic. Storage numbers measured on generated data are not reported as results.
+That corpus (`database/datasets/btc_1min.csv`, a BTC/USD one-minute series) is a local,
+gitignored file, **not distributed with this repository** and not required to build or test —
+the suite skips the tests that use it when it is absent, and so do the benches that load it by
+default. Every "real BTC" figure in this README comes from it, so none of them can be reproduced
+from a clone. Whether those numbers are cleared for publication or retired is an open item with
+counsel before 1.0 ([1.0 plan, Appendix B](docs/release/1.0-plan.md#appendix-b-human-only-tasks)).
+The ingest figure is quoted anyway because a *synthetic* generator materially flatters the
+result: on the same workload the generated corpus reports **1.71 bytes/point against the real
+4.22**, roughly 2.5× too optimistic. Storage numbers measured on generated data are not reported
+as results.
 
 ### Reductions
 
@@ -333,8 +340,9 @@ ships **off by default** (and is now behind the `bitsliced-codec` build feature,
 patent review). A kernel speedup measured against a weak baseline is not a result, and
 this README would rather say so than quote the 5.7×.
 
-Exact decimals are not free yet either. Hourly `avg` over 1M real BTC closes, all three paths
-proven to produce the same buckets:
+Exact decimals are not free yet either. Hourly `avg` over 1M real BTC closes (the local corpus
+described under [Ingest](#ingest), not in the repository), all three paths proven to produce the
+same buckets:
 
 | path | time | vs `f64` |
 |---|---|---|
@@ -342,8 +350,9 @@ proven to produce the same buckets:
 | `weft_reduce::reduce_scaled` (exact, on the stored `ScaledI64` mantissas) | **13.52 ms** | ~6.3× |
 | `weft_reduce::reduce` (exact, per-sample `BigDecimal`) | 60.04 ms | ~28× |
 
-QuestDB documents ~2× for its `DECIMAL`, so the precision wedge still costs more here. Before this
-work the shipped path measured 100.65 ms (~43×). Two changes closed most of the gap: integer
+QuestDB [documents ~2×](https://questdb.com/docs/query/datatypes/decimal/) for its `DECIMAL`, so
+the precision wedge still costs more here. Before this work the shipped path measured 100.65 ms
+(~43×). Two changes closed most of the gap: integer
 accumulation, and computing each bucket's `avg` by integer long division that reproduces
 `bigdecimal`'s quotient digit for digit. Per sealed 1M-row segment (decode + six reductions), the
 stored-range downsample went from 127.6 ms to 59.7 ms. The server's `GET
@@ -425,7 +434,8 @@ correctness PASS throughout — `weft-bench --downsample --ds-points 500000 --ds
 re-measured 2026-10-08 after the `avg` division change, at load average ~19). These
 use the generated series, whose values are exact binary expansions of floats (~50 significant
 digits), so they are a pessimistic bound. On **real** two-decimal prices (`--ds-csv`, 1M BTC/USD
-one-minute closes, hourly `avg,p99,twa`) the same reduction runs at **4.24M points/sec** against
+one-minute closes from the local corpus described under [Ingest](#ingest), which is not distributed
+with the repository; hourly `avg,p99,twa`) the same reduction runs at **4.24M points/sec** against
 **0.56M points/sec** for a generated series of the same size (`weft-bench --downsample --ds-csv
 database/datasets/btc_1min.csv --csv-value-col 4 --csv-skip 3000000 --ds-points 1000000 --ds-bucket h
 --ds-aggs avg,p99,twa --reps 5`):
@@ -1356,8 +1366,12 @@ What it does today:
   `--ds-aggs` selector over `min`/`max`/`avg`/`sum`/`first`/`last`/`p50`…`p99`/`twa`/`twa_linear`/`twa_bucket_end`/`sketch_p50`…`sketch_p99`.
   `--ds-parallel <N>` reduces in N chunks via mergeable partial reductions (identical
   buckets to serial, asserted by test) — measured **14.7× at 64 chunks** on a quiet 16-core box
-  (441.2 ms → 30.1 ms; re-run 2026-10-08 at load average ~19: 327.3 → 48.5 ms, 6.7×), 1,134,659 → 16,921,104 points/sec, `--ds-aggs sketch_p99`, 500k points,
-  5 reps, correctness PASS).
+  (441.2 ms → 30.1 ms, 1,134,659 → 16,921,104 points/sec, `--ds-aggs sketch_p99`, 500k points,
+  5 reps, correctness PASS); a re-run on 2026-10-08 at load average ~19 measured 327.3 → 48.5 ms
+  (6.7×).
+  The real-corpus figures in this bullet come from `btc_1min.csv`, a local file not distributed
+  with the repository (see [Ingest](#ingest)); point `--pl-csv` / `--rf-csv` / `--comp-csv` /
+  `--ds-csv` at a CSV of your own to run the same workloads on real data.
   The underlying point/range read speedups are quantified at the codec layer in
   [`weft-physical-type/benches/pointread.rs`](weft-physical-type/benches/pointread.rs).
 - **Vendor-neutral adapters** — every system is driven through the
