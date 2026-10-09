@@ -1088,14 +1088,14 @@ and a box is ticked only when its slice is on main.
 are on main, S10 and S11 merged on the durability integration branch, S12 in progress.
 
 - [ ] **W0 · Land in-flight work and lock the shapes S6/S7 depend on** — ticks **splimes 1.0 is released** (ticked, #62) and **Security process** (once private vulnerability reporting is on)
-  - [ ] **INT-0** Merge deps/splimes-1 → routine/dsp-2026-10-08 → legal → durability/base into main — *in progress*: all but the routine branch are on main (#61/#62, #67, #63); the routine branch (#68) is being merged with main (`integrate/routine-2026-10-08`)
+  - [x] **INT-0** Merge deps/splimes-1 → routine/dsp-2026-10-08 → legal → durability/base into main — #61/#62, #67, #63, and the routine (#68) through #73
   - [x] **D-S3** Storage-v2 open hardening: MVCC/FULL probes, root LOCK, register_scope, directory durability — #72
   - [x] **D-S5** Backup directory atomic publish, manifest, retention and drill hygiene, + **SEC-1** backup-label grammar — #72
   - [x] **D-S18** Legacy rows-mode hygiene: atomic Database::new, write-ahead enqueue, batch dedupe — #72
   - [x] **D-S6** Schema v2, IndexTxn, write poison, root-relative frame paths; **FRE-12a** (STORE_FORMAT gate, migrations) first — #72
   - [x] **D-S7** Persistent per-aspect id allocator, commit/maint locks, plain INSERT for seals (+ `next_series_id`) — #72
   - [x] **PAC-1a** Release pipeline: a safe first run — #64
-  - [ ] **TAG-1** TagSet, SeriesKey and SeriesSelector with canonical form and frozen caps — *in progress*
+  - [x] **TAG-1** TagSet, SeriesKey and SeriesSelector with canonical form and frozen caps — #74
   - [x] **Decision 1** Store shapes for S6/S7: STORE_FORMAT + migration registry, `series_id`, P1/P2 with no key change, `SegmentStoreOptions`, `store_uuid`/`OpenReport` — adopted, #72
   - [ ] Turn on GitHub private vulnerability reporting (Settings → Security) *(owner)*
 - [ ] **W1 · Baseline release, server split, goldens** — starts **Semver policy + `CHANGELOG.md`** (from the first tagged pre-release)
@@ -1111,7 +1111,7 @@ are on main, S10 and S11 merged on the durability integration branch, S12 in pro
   - [ ] **PAC-5a** Configuration registry skeleton: one `VarSpec` registry (absorbs FRE-11, ROB-10's knobs)
   - [ ] **TAG-3** Open `ValueKind` in weftdb, provenance scope; rewords the **B-tags** gate and backlog item
   - [ ] **EVI-1** Claims hygiene: links, contradicted wording, precision, memory, cadence, corpus protection
-  - [ ] **EVI-3** Run manifest v17: runtime provenance, secret-safe capture, reference_grade verdict
+  - [ ] **EVI-3** Run manifest v20: runtime provenance, secret-safe capture, reference_grade verdict
   - [ ] **EVI-9** Block missingness and scale presets
   - [ ] **SOA-1** Soak harness skeleton: profile, `weft-bench soak` CLI, cross-platform supervisor, capability probe
 - [ ] **W2 · Error contract, frame format, portable builds** — ticks **CI** (EVI-5's nightly benchmark-regression job) and **Crate publishing split** (FRE-1 + PAC-3)
