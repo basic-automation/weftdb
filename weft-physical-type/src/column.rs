@@ -206,13 +206,15 @@ impl ColumnEncoding {
 	/// [`crate::timestamp::transpose_bitpack_bytes`] at [`crate::timestamp::TRANSPOSE_TILE`].
 	/// `None` for any other physical type.
 	///
-	/// This is primarily a **decode-speed** codec. Its bit budget is the same code as the linear
+	/// This was meant as a **decode-speed** codec. Its bit budget is the same code as the linear
 	/// bit-pack with the bits permuted, so on a uniform-width column it ties the global
 	/// bit-pack, and a short trailing tile costs up to `width - 1` extra bytes (each bit-plane
-	/// rounds up to a whole byte independently). What it buys is decode latency: the decoder
-	/// rebuilds eight lanes per plane byte with branch-free table spreads, and each tile's width
-	/// header drops the empty high bit-planes of a small-magnitude stream (measured several
-	/// times faster than the linear per-block unpack in `benches/bitunpack.rs`).
+	/// rounds up to a whole byte independently). The decoder rebuilds eight lanes per plane byte
+	/// with branch-free table spreads, and each tile's width header drops the empty high
+	/// bit-planes of a small-magnitude stream. It no longer buys decode latency: the word-wise
+	/// linear unpack is faster in `benches/bitunpack.rs` (the earlier several-fold win was
+	/// against a per-bit linear decoder), and end to end it reads no faster
+	/// (`benches/transposed_read.rs`).
 	///
 	/// It is **not** strictly larger, though: it adapts its width per 1024-value *tile* while
 	/// paying one width header per tile, where the blocked codec pays one per 64-value block.

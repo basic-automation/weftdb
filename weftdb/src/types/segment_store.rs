@@ -186,10 +186,12 @@ impl CheckpointPolicy {
 /// (bit-plane-major)** codec instead of the size-selected one.
 ///
 /// The bit-sliced layout stores the same *code* as the linear bit-pack with its bits permuted,
-/// so it never wins on size — it is a **decode-latency** trade. Its decoder reads `u64` plane
-/// words and walks only the set bits, so a small-magnitude column's empty high bit-planes are
-/// skipped wholesale (measured ~5.7x the linear per-block unpack at the primitive level,
-/// `weft-physical-type`'s `benches/bitunpack.rs`).
+/// so it rarely wins on size — it was meant as a **decode-latency** trade. Its decoder rebuilds
+/// eight lanes per plane byte with branch-free table spreads, and each tile's width header
+/// drops a small-magnitude column's empty high bit-planes. The trade did not pay: the ~5.7x
+/// primitive-level win once measured in `weft-physical-type`'s `benches/bitunpack.rs` was
+/// against the old per-bit linear decoder, the word-wise linear unpack is now faster, and end
+/// to end the codec is byte-neutral and reads no faster (`benches/transposed_read.rs`).
 ///
 /// It is therefore **off by default**: `DISABLED` writes byte-for-byte the frames WeftDB has
 /// always written. Enable per-deployment with `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` — the

@@ -586,10 +586,12 @@ const VAL_CODEC_DELTA_CASCADE: u8 = 4;
 /// mantissas: a tile-size uvarint then a length-prefixed `transpose_bitpack_encode` stream
 /// (each tile carries a one-byte width header followed by `width` bit-planes). The same *code*
 /// as `VAL_CODEC_BITPACK` with its bits permuted — it is written only when a caller asks for
-/// it via [`FrameOptions::transposed_max_overhead`], to buy decode latency: the decoder reads
-/// `u64` plane words and walks only the set bits, skipping a small-magnitude column's empty
-/// high bit-planes wholesale. Random-access capable through `transpose_bitpack_decode_range`,
-/// so it does not regress the streaming point read.
+/// it via [`FrameOptions::transposed_max_overhead`]. It was added to buy decode latency: the
+/// decoder rebuilds eight lanes per plane byte with branch-free table spreads, and each tile's
+/// width header drops a small-magnitude column's empty high bit-planes. End to end it is
+/// byte-neutral and reads no faster than the linear codec (`benches/transposed_read.rs`).
+/// Random-access capable through `transpose_bitpack_decode_range`, so it does not regress the
+/// streaming point read.
 ///
 /// **Behind the `bitsliced-codec` feature.** Without it the writer never selects this codec
 /// and every reader returns [`WeftSegError::CodecNotEnabled`] for a block that uses it. The

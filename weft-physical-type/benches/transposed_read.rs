@@ -4,13 +4,15 @@
 //!
 //! ## What this measures, and why it exists
 //!
-//! `benches/bitunpack.rs` measured the transposed *unpack* alone at ~5.7× the linear per-block
-//! decode on a small-magnitude stream. The roadmap's standing caveat is that a columnar read is
-//! often bandwidth-bound, so a kernel-level unpack win need not survive the whole read path
-//! (frame parse → CRC → value block → timestamp block → null mask → logical values). This bench
-//! is that end-to-end measurement: the same corpus sealed twice — once with the default selector
-//! (`scaled_blocked`/`scaled_bitpack`, the linear layout) and once with the transposed policy —
-//! then timed through the three read entry points a store actually uses:
+//! `benches/bitunpack.rs` once measured the transposed *unpack* alone at ~5.7× the linear
+//! per-block decode on a small-magnitude stream — against the old per-bit linear decoder; the
+//! word-wise linear unpack is now the faster of the two. The roadmap's standing caveat is that
+//! a columnar read is often bandwidth-bound, so a kernel-level unpack win need not survive the
+//! whole read path (frame parse → CRC → value block → timestamp block → null mask → logical
+//! values). This bench is that end-to-end measurement: the same corpus sealed twice — once
+//! with the default selector (`scaled_blocked`/`scaled_bitpack`, the linear layout) and once
+//! with the transposed policy — then timed through the three read entry points a store
+//! actually uses:
 //!
 //! - **full decode** (`read_segment`, the range-scan / downsample path),
 //! - **streaming point read** (`read_segment_point`, `GET …/storage/{aspect}/at`), where the
