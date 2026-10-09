@@ -1697,6 +1697,12 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
         *(Checked 2026-10-09: 0.4.11, released 2026-10-03, is the latest on crates.io and the one
         locked; its notes touch square root, inverse and exp, not `to_f64` or `/`. src:
         https://github.com/akubera/bigdecimal-rs/releases)*
+      - [x] **DONE (2026-10-09) — the sketch skips `ln` for a value inside the last sample's bucket**
+        (`BinCache`: the bucket shrunk by a relative 1e-9, far wider than `ln`'s index error, so
+        the index is exactly the logarithm's; invisible to equality and serde, so sidecars are
+        unchanged). `sketch_p99`, hourly, 10 reps, three alternating pairs at load ~33: real BTC
+        closes 48.3/46.2/46.7 → 35.4/36.2/35.8 ms (BigDecimal points) and 27.5/24.7/25.2 →
+        18.1/18.9/17.9 ms (`--ds-scaled`); the noisier generated series gains ~5%.
       - [ ] **Research (2026-10-09) — a cheaper sketch index, if the sketch format is ever revised.**
         `DdSketch::index` computes `v.ln()` per sample. DataDog's reference sketches-java ships
         `CubicallyInterpolatedMapping`, which takes `floor(log2 v)` from the float's bits and
