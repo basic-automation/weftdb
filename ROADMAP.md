@@ -426,11 +426,14 @@ detection within Y% and improving historical query latency by Z."*
     - [x] **Attribution for adapted code.** Chimp/Chimp128 (`weft-physical-type`) and DDSketch
       (`weft-reduce`) are treated as adapted from their Apache-2.0 reference implementations: a
       root `NOTICE` and per-crate `THIRD-PARTY-NOTICES` (shipped in each package) meet
-      Apache-2.0 section 4.
+      Apache-2.0 section 4. *(INT-0, 2026-10-08: the routine's integer `avg` division in
+      `weft-reduce` transcribes bigdecimal-rs's `impl_division`; it is attributed the same way,
+      taken under the Apache-2.0 option of bigdecimal-rs's MIT OR Apache-2.0.)*
     - [ ] **Package licence metadata: mitigated by the relicense; the expression is with
       counsel.** Every crate now declares `license = "MIT OR Apache-2.0"`, so Apache-2.0 is one
       of the two options scanners see, and the two crates' `THIRD-PARTY-NOTICES` and READMEs say
-      that the Chimp and DDSketch portions stay under Apache-2.0 whichever option a user picks.
+      that the Chimp, DDSketch and bigdecimal-rs portions stay under Apache-2.0 whichever option a
+      user picks.
       The field itself still offers MIT for the whole of `weft-physical-type` and `weft-reduce`.
       The candidate expression for those two crates is `(MIT OR Apache-2.0) AND Apache-2.0`;
       it is on the [Phase 8](#phase-8--commercial-hardening--required-for-paid-beta) counsel
