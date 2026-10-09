@@ -14,9 +14,11 @@
 //! percentiles, time-weighted averages and sketches need the per-sample values, so a request
 //! naming any of them returns `Ok(None)` and the caller falls back to [`reduce`](crate::reduce).
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::OnceLock};
 
-use bigdecimal::{num_bigint::BigInt, BigDecimal};
+use bigdecimal::{
+	num_bigint::{BigInt, BigUint, Sign}, BigDecimal, ToPrimitive
+};
 use chrono::{DateTime, Utc};
 use splimes::Resolution;
 
@@ -149,6 +151,9 @@ fn avg_like_bigdecimal(sum: i128, scale: i64, count: u64) -> BigDecimal {
 		num *= 10;
 	}
 	let (lead, mut rem) = (num / den, num % den);
+	if rem != 0 && !terminates(num, count) {
+		return non_terminating_quotient(num, lead, scale, count, negative);
+	}
 	let mut quotient = BigInt::from(lead);
 	if rem != 0 {
 		let mut precision = lead.checked_ilog10().map_or(1, |d| d + 1);
@@ -189,6 +194,57 @@ fn avg_like_bigdecimal(sum: i128, scale: i64, count: u64) -> BigDecimal {
 		}
 	}
 	let magnitude = BigDecimal::new(quotient, scale);
+	if negative {
+		-magnitude
+	} else {
+		magnitude
+	}
+}
+
+/// Whether `num / count` has a finite decimal expansion: the divisor, reduced by the common
+/// factor, has no prime factor but 2 and 5.
+fn terminates(num: u128, count: u64) -> bool {
+	let (mut a, mut b) = (count, u64::try_from(num % u128::from(count)).unwrap_or(0));
+	while b != 0 {
+		(a, b) = (b, a % b);
+	}
+	let mut d = count / a;
+	d >>= d.trailing_zeros();
+	while d.is_multiple_of(5) {
+		d /= 5;
+	}
+	d == 1
+}
+
+/// `10^k` for `k` in `0..=BIGDECIMAL_DIV_PRECISION`, built once.
+fn power_of_ten(k: u32) -> &'static BigUint {
+	static POWERS: OnceLock<Vec<BigUint>> = OnceLock::new();
+	let powers = POWERS.get_or_init(|| {
+		let mut powers = vec![BigUint::from(1_u8)];
+		for _ in 0..BIGDECIMAL_DIV_PRECISION {
+			let next = powers.last().map_or_else(|| BigUint::from(1_u8), |p| p * 10_u8);
+			powers.push(next);
+		}
+		powers
+	});
+	&powers[usize::try_from(k).unwrap_or(0).min(powers.len() - 1)]
+}
+
+/// The tail of [`avg_like_bigdecimal`] for a quotient that never terminates, where its digit
+/// loop always runs to [`BIGDECIMAL_DIV_PRECISION`] digits: those digits are
+/// `floor(num · 10^m / count)` for the `m` digits after `lead`'s, computed as one `BigUint`
+/// multiplication and one division, then rounded up when the next digit is `>= 5`. The
+/// remainder is never zero, so no digit loop stops early and the result is the loop's.
+/// `BigUint`'s division by a `u64` is a single pass over its limbs.
+fn non_terminating_quotient(num: u128, lead: u128, scale: i64, count: u64, negative: bool) -> BigDecimal {
+	let m = BIGDECIMAL_DIV_PRECISION - lead.checked_ilog10().map_or(1, |d| d + 1);
+	let shifted = BigUint::from(num) * power_of_ten(m);
+	let remainder = u128::from((&shifted % count).to_u64().unwrap_or(0));
+	let mut quotient = shifted / count;
+	if remainder * 10 / u128::from(count) >= 5 {
+		quotient += 1_u8;
+	}
+	let magnitude = BigDecimal::new(BigInt::from_biguint(Sign::Plus, quotient), scale + i64::from(m));
 	if negative {
 		-magnitude
 	} else {

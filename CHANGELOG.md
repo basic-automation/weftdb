@@ -218,6 +218,10 @@ only the control plane, not the segment frames.
   which of two numerically equal values (`1.0`, `1.00`) is returned. A lone hourly `p99`
   runs ~1.6–3.4× faster on the bench (two-decimal, real BTC and full-expansion series),
   which made it about twice as fast as `sketch_p99` until the next entry.
+- **Bucket averages that never terminate are computed in one step** (`weft-reduce`): their
+  100 significant digits come from one big-integer multiplication and one division by the
+  count instead of a digit loop, with an identical result. Hourly `avg` on the integer
+  path runs ~1.7× faster (median 15.3 → 9.0 ms per 1M rows), and every `avg` gains from it.
 - **`sketch_p*` reductions convert most values to `f64` by one division** (`weft-reduce`).
   A value `m × 10^-s` with `|m| < 2^53` and `0 <= s <= 22` is converted as
   `m as f64 / 10^s`, which is bit-identical to `bigdecimal`'s `to_f64`, so sketches and

@@ -1526,11 +1526,15 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
         mid-chunk), but pinned A/B over three pairs left hourly `avg` at 14.49/15.38/15.77 →
         15.61/14.30/13.97 ms, inside the noise. The digit loop is not the cost; not landed (the
         widened test is).
-      - [ ] **NEXT — measure the `BigInt` build instead:** each bucket multiplies its quotient
-        `BigInt` by `10^38` up to three times and allocates. Building the quotient as
-        `floor(num · 10^m / den)` with one `BigUint` multiply and one division by the `u64`
-        count, or a criterion bench of `avg_like_bigdecimal` alone, would show whether that
-        allocation-heavy part is the ~0.5 µs.
+      - [x] **DONE (2026-10-09) — one `BigUint` multiply + one division per non-terminating
+        average.** `avg_like_bigdecimal` tests termination first (`count / gcd` has only factors
+        2 and 5); a non-terminating quotient, which always runs to 100 digits, is
+        `floor(num · 10^m / count)` rounded on the next digit (`10^m` from a table built once),
+        bit-identical over the widened equality test; terminating ones keep the digit loop.
+        Criterion pinned, nine alternating pairs: hourly `avg` `reduce_scaled` median **15.29 →
+        8.99 ms** (seven pairs 6.74–9.66 ms after; two load-spike outliers at 18.8/20.1), the
+        BigDecimal `reduce` 63.2/64.4/60.0 → 54.6/53.3/55.0 ms. The exact-integer path is now
+        **~4.0× f64** (2.27 ms), against QuestDB's documented ~2×.
   - [ ] **NEXT — the sidecar build.** The `.weftpart` sidecar build
     (`write_partial_sidecar`) receives the seal's BigDecimal values rather than stored mantissas,
     so switching it means threading the seal's encoded column through instead. Its callers sit in

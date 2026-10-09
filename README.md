@@ -346,15 +346,21 @@ same buckets:
 
 | path | time | vs `f64` |
 |---|---|---|
-| `f64` loop (lossy baseline) | 2.14 ms | 1× |
-| `weft_reduce::reduce_scaled` (exact, on the stored `ScaledI64` mantissas) | **13.52 ms** | ~6.3× |
-| `weft_reduce::reduce` (exact, per-sample `BigDecimal`) | 60.04 ms | ~28× |
+| `f64` loop (lossy baseline) | 2.27 ms | 1× |
+| `weft_reduce::reduce_scaled` (exact, on the stored `ScaledI64` mantissas) | **8.99 ms** | ~4.0× |
+| `weft_reduce::reduce` (exact, per-sample `BigDecimal`) | 54.6 ms | ~24× |
+
+(Re-measured 2026-10-09, criterion pinned to one core; `reduce_scaled` is the median of nine
+alternating runs, 6.74–9.66 ms apart from two load-spike outliers at 18.8 and 20.1 ms. It was
+13.52 ms on 2026-10-08.)
 
 QuestDB [documents ~2×](https://questdb.com/docs/query/datatypes/decimal/) for its `DECIMAL`, so
 the precision wedge still costs more here. Before this work the shipped path measured 100.65 ms
-(~43×). Two changes closed most of the gap: integer
-accumulation, and computing each bucket's `avg` by integer long division that reproduces
-`bigdecimal`'s quotient digit for digit. Per sealed 1M-row segment (decode + six reductions), the
+(~43×). Three changes closed most of the gap: integer
+accumulation; computing each bucket's `avg` by integer long division that reproduces
+`bigdecimal`'s quotient digit for digit; and, for an average that never terminates (most of
+them), producing its 100 digits with one `BigUint` multiplication and one division by the
+count instead of a digit loop. Per sealed 1M-row segment (decode + six reductions), the
 stored-range downsample went from 127.6 ms to 59.7 ms. The server's `GET
 /api/v1/storage/{aspect}/downsample` now takes the integer path for `ScaledI64` segments when every
 requested reduction is streaming or a `sketch_p*`, and falls back otherwise
