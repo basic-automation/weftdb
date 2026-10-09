@@ -320,12 +320,12 @@ as results.
 
 ### Reductions
 
-At 500k points, hour buckets, correctness-gated
-([`weft-bench --downsample`](weft-bench); re-measured 2026-10-08, full table under
-[Compute endpoints](#compute-endpoints)): `avg` runs at **2.08M points/sec**;
-time-weighted average costs about 1.39× that. The approximate `sketch_p99` is
-**~2.6× faster than exact `p99`** (327 ms vs 852 ms) and stays within its 1% bound,
-while using bounded memory per bucket.
+At 500k two-decimal points, hour buckets, correctness-gated
+([`weft-bench --downsample`](weft-bench); re-measured 2026-10-09 on the two-decimal generator, full
+table under [Compute endpoints](#compute-endpoints)): `avg` takes **14.4 ms (34.5M points/sec)**;
+time-weighted average costs about 3.4× that. The approximate `sketch_p99` is **no faster than exact
+`p99`** on two-decimal values (59.1 ms vs 57.9 ms) and 1.36× faster on real BTC closes; what it buys
+is bounded memory per bucket and mergeability, within its 1% bound.
 
 ### Where it doesn't pay off
 
@@ -429,23 +429,26 @@ CSV, Arrow IPC, or Parquet**:
 | `POST /api/v1/{interpolate,downsample}/ilp` | The same, fed an ILP `text/plain` body (the TSBS/InfluxDB/QuestDB wire format); `field`, `precision` (`ns`/`us`/`ms`/`s`), and the compute knobs are query parameters. `interpolation=` is accepted as an alias for `spline=` (the canonical `spline` wins if both are given). |
 | `POST /api/v1/{interpolate,downsample}/{csv,arrow,parquet}` and `…/ilp/{csv,arrow,parquet}` | The same computations with CSV (`text/csv`), Arrow IPC stream, or Parquet output — so a harness feeding line protocol pulls results in any of the four formats. |
 
-**What the reductions cost.** Measured on the shipped harness (500k points, 5 reps, hour buckets,
-correctness PASS throughout — `weft-bench --downsample --ds-points 500000 --ds-aggs <agg>`;
-re-measured 2026-10-08 after the `avg` division change, at load average ~19). These
-use the generated series, whose values are exact binary expansions of floats (~50 significant
-digits), so they are a pessimistic bound. On **real** two-decimal prices (`--ds-csv`, 1M BTC/USD
-one-minute closes from the local corpus described under [Ingest](#ingest), which is not distributed
-with the repository; hourly `avg,p99,twa`) the same reduction runs at **4.24M points/sec** against
-**0.56M points/sec** for a generated series of the same size (`weft-bench --downsample --ds-csv
-database/datasets/btc_1min.csv --csv-value-col 4 --csv-skip 3000000 --ds-points 1000000 --ds-bucket h
---ds-aggs avg,p99,twa --reps 5`):
+**What the reductions cost.** Measured on the shipped harness (500k points at 1 s, 5 reps, hour
+buckets, correctness PASS throughout — `weft-bench --downsample --ds-points 500000 --ds-bucket h
+--ds-aggs <agg> --ds-decimals <2|full>`; 2026-10-09, load average ~12–14, both generators back to
+back). Since 2026-10-09 the generator rounds its values to two decimal places, like the prices in the
+real corpus (`--ds-decimals`, default 2). Before, it kept each float's exact binary expansion (~50
+significant digits, now `--ds-decimals full`), which made every `BigDecimal` operation expensive and
+the published figures a pessimistic bound. The check: on 1M points, hourly `avg,p99,twa`, the
+two-decimal generator (60 s stride) reduces at **5.10M points/sec**, **real** BTC/USD one-minute
+closes at **4.49M points/sec** (`--ds-csv database/datasets/btc_1min.csv --csv-value-col 4 --csv-skip
+3000000`, the local corpus described under [Ingest](#ingest), not distributed with the repository),
+and the old generator at **0.61M points/sec**, 7.3× slower than real data:
 
-| reduction | p50 | throughput | note |
-|---|---|---|---|
-| `avg` | 240.8 ms | 2,075,477 points/sec | the streaming baseline — no bucket materialized |
-| `twa` | 334.1 ms | 1,515,029 points/sec | 1.39× the streaming cost: dwell-weighting needs the time-ordered samples |
-| `twa_bucket_end` | 332.1 ms | 1,518,520 points/sec | within noise of `twa` — one extra weight, effectively free |
-| `twa_linear` | 407.8 ms | 1,197,606 points/sec | 1.22× `twa`: an extra `BigDecimal` add + divide per interval for the trapezoidal mean |
+| reduction | p50 (two decimals) | throughput | p50 (`full`, the pre-2026-10 generator) | throughput | note |
+|---|---|---|---|---|---|
+| `avg` | 14.4 ms | 34,471,692 points/sec | 197.8 ms | 2,552,581 points/sec | the streaming baseline — no bucket materialized |
+| `twa` | 49.0 ms | 10,006,950 points/sec | 257.6 ms | 1,878,669 points/sec | 3.4× the streaming cost: dwell-weighting needs the time-ordered samples |
+| `twa_bucket_end` | 48.5 ms | 10,006,152 points/sec | 259.1 ms | 1,876,355 points/sec | within noise of `twa` — one extra weight, effectively free |
+| `twa_linear` | 99.3 ms | 5,002,694 points/sec | 345.5 ms | 1,430,149 points/sec | 2.0× `twa`: an extra `BigDecimal` add + divide per interval for the trapezoidal mean |
+| `p99` (exact) | 57.9 ms | 8,623,594 points/sec | 1,397.7 ms | 362,325 points/sec | materializes and sorts each bucket |
+| `sketch_p99` | 59.1 ms | 8,459,360 points/sec | 272.4 ms | 1,848,855 points/sec | streams into a DDSketch; see below |
 
 **Exact vs sketch percentiles — which to ask for.** The `p50`/`p90`/`p95`/`p99` reductions are
 *exact* nearest-rank: they return an actual observed `BigDecimal` from the bucket, but they
@@ -454,10 +457,13 @@ materialize and sort the whole bucket, and two buckets' results cannot be combin
 [DDSketch](https://dl.acm.org/doi/10.14778/3352063.3352135) — a **1% relative-error** bound
 (`weft_reduce::SKETCH_ALPHA`), **bounded memory** regardless of bucket size (values fold in as they
 arrive; `SKETCH_MAX_BINS` caps the store absolutely), and an **exactly mergeable** structure, so a
-p99 can be computed over a large or streaming bucket. Measured on the shipped harness (500k points,
-5 reps, correctness PASS): `sketch_p99` runs at **1,528,361 points/sec (p50 = 327.30 ms)** versus
-exact `p99` at **584,469 points/sec (p50 = 852.39 ms)** — **~2.6× faster**
-(`weft-bench --downsample --ds-points 500000 --ds-aggs sketch_p99` vs `--ds-aggs p99`).
+p99 can be computed over a large or streaming bucket. **Speed is not the reason to choose it.** On the
+shipped harness (10 reps, correctness PASS, 2026-10-09) the two run level on two-decimal values
+(500k points, hourly: p50 **74.1 ms** sketch vs **74.9 ms** exact) and the sketch is **1.36×**
+faster on 1M real BTC closes (hourly: 167.7 ms vs 227.6 ms), where values carry up to eight decimal
+places (`weft-bench --downsample --ds-aggs sketch_p99` vs `--ds-aggs p99`, with `--ds-csv` for the
+real series). The ~2.6× once quoted here (327 vs 852 ms) was measured on the old generator's
+~50-digit values, whose sort is what made exact `p99` slow; the `full` column above reproduces it.
 
 The approximation is **declared, never silent** — WeftDB's precision principle. The sketch shares the
 exact percentiles' **nearest-rank convention** (`⌈q·n⌉`), so `sketch_p*` and `p*` name the same

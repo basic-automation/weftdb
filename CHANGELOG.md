@@ -189,6 +189,11 @@ only the control plane, not the segment frames.
   `storage.advisory_delta_for_timestamp_bytes` (v18), each present only when it beats the
   realized codec, and `metadata.work_disk_kind`, `work_disk_file_system` and
   `work_disk_mount_point`, the disk under the working directory (v19).
+- **Weft-Bench's downsample generator emits two-decimal values** (`--ds-decimals`, default 2;
+  `full` keeps the previous generator's exact binary expansion of each float). The old values
+  carried ~50 significant digits and made the published reduction figures 7.3× slower than real
+  data; the README table is re-measured with both generators, and its claim that `sketch_p99` is
+  ~2.6× faster than exact `p99` is withdrawn (level on two-decimal values, 1.36× on real BTC).
 - **Weft-Bench records the GPU driver.** An interpolation run's `metadata.engine` gains
   `gpu_driver`, the driver's name and version as splimes' `GpuInfo::driver` reports it
   (e.g. `NVIDIA 610.57.04`), beside the adapter in `gpu`; it is printed and shown in the

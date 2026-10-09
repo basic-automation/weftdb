@@ -57,13 +57,25 @@ pub struct DownsampleParams {
 	/// Reduce in this many parallel chunks (`0`/`1` = one serial pass). See
 	/// [`DownsampleProfile::parallel_chunks`].
 	pub parallel_chunks: usize,
+	/// Decimal places the generated values are rounded to. See
+	/// [`DownsampleProfile::value_decimals`].
+	pub value_decimals: Option<u32>,
 }
+
+/// Decimal places a generated downsample value carries by default: two, like the prices
+/// in the real corpus.
+pub const DEFAULT_VALUE_DECIMALS: u32 = 2;
+
+/// The most decimal places [`DownsampleProfile::value_decimals`] accepts: the scaled
+/// value must fit an `i64` mantissa.
+pub const MAX_VALUE_DECIMALS: u32 = 12;
 
 impl Default for DownsampleParams {
 	/// The flagship downsample knob set: 60 000 samples at 1-second spacing (~16.7
-	/// hours) reduced to per-minute buckets (~60 samples/bucket), every reduction.
+	/// hours) reduced to per-minute buckets (~60 samples/bucket), every reduction, values
+	/// at two decimal places.
 	fn default() -> Self {
-		Self { parallel_chunks: 1, seed: DEFAULT_DOWNSAMPLE_SEED, point_count: 60_000, input_stride_secs: 1, bucket_resolution: Resolution::Minutes, aggregations: Aggregation::ALL.to_vec() }
+		Self { parallel_chunks: 1, seed: DEFAULT_DOWNSAMPLE_SEED, point_count: 60_000, input_stride_secs: 1, bucket_resolution: Resolution::Minutes, aggregations: Aggregation::ALL.to_vec(), value_decimals: Some(DEFAULT_VALUE_DECIMALS) }
 	}
 }
 
@@ -88,6 +100,15 @@ pub struct DownsampleProfile {
 	/// this by test), so this knob measures the cost/benefit of distributing a reduction —
 	/// the shape a cross-segment downsample would take — not a different answer.
 	pub parallel_chunks: usize,
+	/// Decimal places each generated value is rounded to (half away from zero), capped at
+	/// [`MAX_VALUE_DECIMALS`]; `None` keeps the `f64` signal's exact binary expansion.
+	///
+	/// `None` is the generator before 2026-10-09. Its values carry ~50 significant digits
+	/// (`BigDecimal::from_f64` is exact), which makes every `BigDecimal` operation far
+	/// more expensive than on real data: on 1M rows it reduced 6.4× slower than real
+	/// two-decimal BTC closes. Rounding to a few places, as prices and most sensor
+	/// readings are, keeps the generated corpus representative.
+	pub value_decimals: Option<u32>,
 }
 
 impl DownsampleProfile {
@@ -100,8 +121,8 @@ impl DownsampleProfile {
 	/// Build a downsample profile from an explicit [`DownsampleParams`] knob set.
 	#[must_use]
 	pub fn new(name: impl Into<String>, params: DownsampleParams) -> Self {
-		let DownsampleParams { seed, point_count, input_stride_secs, bucket_resolution, aggregations, parallel_chunks } = params;
-		Self { parallel_chunks, name: name.into(), seed, point_count: point_count.max(2), input_stride_secs: input_stride_secs.max(1), bucket_resolution, aggregations }
+		let DownsampleParams { seed, point_count, input_stride_secs, bucket_resolution, aggregations, parallel_chunks, value_decimals } = params;
+		Self { parallel_chunks, name: name.into(), seed, point_count: point_count.max(2), input_stride_secs: input_stride_secs.max(1), bucket_resolution, aggregations, value_decimals: value_decimals.map(|places| places.min(MAX_VALUE_DECIMALS)) }
 	}
 
 	/// The fixed epoch anchor (2020-01-01T00:00:00Z).
@@ -110,7 +131,8 @@ impl DownsampleProfile {
 	}
 
 	/// Generate the seeded, regularly-spaced input series (a smooth sinusoid plus a
-	/// little seeded noise, so per-bucket min/max/avg differ meaningfully).
+	/// little seeded noise, so per-bucket min/max/avg differ meaningfully), rounded to
+	/// [`Self::value_decimals`] places.
 	#[must_use]
 	pub fn generate(&self) -> Vec<Point> {
 		use std::f64::consts::TAU;
@@ -124,9 +146,20 @@ impl DownsampleProfile {
 			let phase = i as f64 / 500.0;
 			let noise = rng.random_range(-1.0..=1.0);
 			let signal = 20.0_f64.mul_add((phase * TAU).sin(), 50.0) + noise;
-			Point { timestamp, value: BigDecimal::from_f64(signal).unwrap_or_else(|| BigDecimal::from(50)) }
+			Point { timestamp, value: self.decimal(signal) }
 		})
 		.collect()
+	}
+}
+
+impl DownsampleProfile {
+	/// `signal` as a `BigDecimal` at [`Self::value_decimals`] places (exactly that scale,
+	/// trailing zeros kept, as a price column stores them), or its exact binary expansion.
+	fn decimal(&self, signal: f64) -> BigDecimal {
+		let Some(places) = self.value_decimals else { return BigDecimal::from_f64(signal).unwrap_or_else(|| BigDecimal::from(50)) };
+		#[allow(clippy::cast_possible_truncation)]
+		let mantissa = (signal * 10_f64.powi(places.cast_signed())).round() as i64;
+		BigDecimal::new(mantissa.into(), i64::from(places))
 	}
 }
 
@@ -270,6 +303,24 @@ mod tests {
 	}
 
 	use super::*;
+
+	#[test]
+	fn generated_values_carry_the_declared_decimal_places() {
+		let profile = DownsampleProfile::new("ds-decimals", DownsampleParams { point_count: 2_000, ..DownsampleParams::default() });
+		let points = profile.generate();
+		assert!(points.iter().all(|p| p.value.fractional_digit_count() == 2), "every value is at scale 2");
+		let full = DownsampleProfile::new("ds-full", DownsampleParams { point_count: 2_000, value_decimals: None, ..DownsampleParams::default() }).generate();
+		assert!(full.iter().any(|p| p.value.fractional_digit_count() > 20), "the pre-2026-10 generator keeps the binary expansion");
+		// Rounding is to the nearest cent of the same seeded signal, and nothing else moves.
+		for (rounded, exact) in points.iter().zip(&full) {
+			assert_eq!(rounded.timestamp, exact.timestamp);
+			assert!((rounded.value.clone() - exact.value.clone()).abs() <= BigDecimal::new(5.into(), 3), "{} vs {}", rounded.value, exact.value);
+		}
+		assert_eq!(profile.generate(), points, "the rounded corpus is reproducible");
+		let four = DownsampleProfile::new("ds-4", DownsampleParams { point_count: 10, value_decimals: Some(4), ..DownsampleParams::default() });
+		assert!(four.generate().iter().all(|p| p.value.fractional_digit_count() == 4));
+		assert_eq!(DownsampleProfile::new("ds-cap", DownsampleParams { value_decimals: Some(40), ..DownsampleParams::default() }).value_decimals, Some(MAX_VALUE_DECIMALS));
+	}
 
 	fn small() -> DownsampleProfile {
 		DownsampleProfile::new("ds-small", DownsampleParams { point_count: 3_600, input_stride_secs: 1, bucket_resolution: Resolution::Minutes, ..DownsampleParams::default() })

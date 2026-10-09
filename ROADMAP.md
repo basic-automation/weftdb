@@ -1590,10 +1590,19 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
       binary expansions carry ~50 significant digits and make every BigDecimal op expensive. Real
       two-decimal prices do not. So the README's reduction table, which is all generator-based,
       **understates** WeftDB on real price data.
-    - [ ] **NEXT — make the downsample generator emit realistic decimals** (e.g. round the signal to
-      2–4 places, as the compression shapes already do) and re-measure the README reduction table.
-      This changes published numbers, so do it as one explicit re-baselining commit, keeping the old
-      figures cited as "pre-2026-10 generator".
+    - [x] **DONE (2026-10-09) — the downsample generator emits realistic decimals:** values are
+      rounded to `--ds-decimals` places (default 2; `full` keeps the pre-2026-10 binary expansion), and
+      the README reduction table was re-baselined with both generators measured back to back. On 1M
+      points (hourly `avg,p99,twa`) the two-decimal generator runs at 5.10M points/s against 4.49M for
+      real BTC closes and 0.61M for the old generator, so it is now within 1.14× of real data rather than
+      7.3× pessimistic.
+    - [ ] **FOUND (2026-10-09) — `sketch_p99`'s published ~2.6× speed-up over exact `p99` was the
+      generator's.** On two-decimal values the two run level (74.1 vs 74.9 ms, 500k points hourly,
+      10 reps); on 1M real BTC closes the sketch is 1.36× faster. The README now says speed is not the
+      reason to pick the sketch. Residue: the exact percentile's cost is the per-bucket
+      materialize-and-sort of `BigDecimal`s, so an integer-mantissa sort on `ScaledI64` input (the
+      `reduce_scaled` approach, which returns `None` for percentiles today) is the lever if exact
+      percentiles need to get faster.
 
 - [x] **DONE (2026-07-20) — BUG ROOT-CAUSED + FIXED: the "flaky GPU interpolation tests" were never a
   GPU bug.** The roadmap offered two hypotheses — a real GPU race, or an unsound check. **Both the

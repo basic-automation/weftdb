@@ -234,7 +234,7 @@ fn run_compression_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 /// is that the reduction is total (the bucket counts sum to the input size).
 fn run_downsample_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 	let profile_name = cli.name.clone().unwrap_or_else(|| "downsample".to_string());
-	let params = DownsampleParams { seed: cli.seed, point_count: cli.ds_points, input_stride_secs: cli.ds_stride, bucket_resolution: cli.ds_bucket, aggregations: cli.ds_aggs.clone(), parallel_chunks: cli.ds_parallel };
+	let params = DownsampleParams { seed: cli.seed, point_count: cli.ds_points, input_stride_secs: cli.ds_stride, bucket_resolution: cli.ds_bucket, aggregations: cli.ds_aggs.clone(), parallel_chunks: cli.ds_parallel, value_decimals: cli.ds_decimals };
 	let profile = DownsampleProfile::new(profile_name, params);
 	let result = if let Some(path) = &cli.csv.downsample {
 		// A real series: the same reduction engine over loaded rows (epoch seconds, exact decimals).
@@ -431,6 +431,9 @@ struct Cli {
 	ds_aggs: Vec<Aggregation>,
 	/// Reduce in this many parallel chunks (partial reductions merged); 1 = serial.
 	ds_parallel: usize,
+	/// Downsample mode: decimal places of the generated values; `None` = the exact
+	/// binary expansion (`--ds-decimals full`).
+	ds_decimals: Option<u32>,
 	/// Storage-workload knob (point-lookup / range-fetch): jittered (irregular)
 	/// timestamps instead of a constant-stride regular corpus.
 	irregular: bool,
@@ -546,7 +549,7 @@ impl Cli {
 		let mut downsample = false;
 		let (mut comp_rows, mut comp_shape, mut csv) = (comp_defaults.point_count, comp_defaults.value_shape, CsvKnobs::default());
 		let (mut ds_points, mut ds_stride, mut ds_bucket) = (ds_defaults.point_count, ds_defaults.input_stride_secs, ds_defaults.bucket_resolution);
-		let (mut ds_aggs, mut ds_parallel) = (ds_defaults.aggregations, ds_defaults.parallel_chunks.max(1));
+		let (mut ds_aggs, mut ds_parallel, mut ds_decimals) = (ds_defaults.aggregations, ds_defaults.parallel_chunks.max(1), ds_defaults.value_decimals);
 		let mut irregular = false;
 		let (mut pl_rows, mut pl_queries, mut pl_absent, mut pl_mode, mut pl_rows_per_page) = (pl_defaults.point_count, pl_defaults.query_count, pl_defaults.absent_fraction, pl_defaults.mode, pl_defaults.rows_per_page);
 		let (mut rf_rows, mut rf_window, mut rf_windows, mut rf_rows_per_page) = (rf_defaults.point_count, rf_defaults.window_rows, rf_defaults.window_count, rf_defaults.rows_per_page);
@@ -600,6 +603,7 @@ impl Cli {
 				"--ds-bucket" => ds_bucket = parse_resolution(&take_value(&key)?)?,
 				"--ds-aggs" => ds_aggs = parse_aggregations(&take_value(&key)?)?,
 				"--ds-parallel" => ds_parallel = take_value(&key)?.parse::<usize>().map_err(|_| "--ds-parallel must be a positive integer".to_string())?.max(1),
+				"--ds-decimals" => ds_decimals = parse_value_decimals(&take_value(&key)?)?,
 				"--irregular" | "--pl-irregular" | "--rf-irregular" => irregular = true,
 				"--pl-rows" => pl_rows = parse_points_count(&take_value(&key)?)?,
 				"--pl-queries" => pl_queries = parse_query_count(&take_value(&key)?)?,
@@ -640,7 +644,7 @@ impl Cli {
 		let mode = select_workload_mode(&[(synthetic, InputMode::Synthetic), (point_lookup, InputMode::PointLookup), (range_fetch, InputMode::RangeFetch), (compression, InputMode::Compression), (downsample, InputMode::Downsample)])?;
 		validate_mode(mode, input.as_ref(), field.as_deref(), compare, gpu_calibrate)?;
 
-		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare, html, gpu_calibrate })))
+		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare, html, gpu_calibrate })))
 	}
 }
 
@@ -828,6 +832,17 @@ fn parse_stride_secs(s: &str) -> Result<i64, String> {
 	Ok(n)
 }
 
+/// Parse a `--ds-decimals` value: a place count in `0..=MAX_VALUE_DECIMALS`, or `full`.
+fn parse_value_decimals(s: &str) -> Result<Option<u32>, String> {
+	if s.eq_ignore_ascii_case("full") {
+		return Ok(None);
+	}
+	match s.parse::<u32>() {
+		Ok(places) if places <= weft_bench::downsample::MAX_VALUE_DECIMALS => Ok(Some(places)),
+		_ => Err(format!("invalid --ds-decimals `{s}` (expected 0..={} or `full`)", weft_bench::downsample::MAX_VALUE_DECIMALS)),
+	}
+}
+
 /// Parse a compression value-shape token (`clustered` | `trending` | `jitter`).
 fn parse_value_shape(s: &str) -> Result<ValueShape, String> {
 	match s.to_ascii_lowercase().as_str() {
@@ -958,6 +973,9 @@ DOWNSAMPLE OPTIONS (with --downsample):
                              CSV rules as --comp-csv; --ds-points caps it)
         --ds-parallel <N>    Reduce in N parallel chunks (partials merged);
                              the merged result is identical to serial [default: 1]
+        --ds-decimals <N>    Decimal places of the generated values (0..=12), or
+                             `full` for the f64 signal's exact binary expansion (the
+                             generator before 2026-10-09)               [default: 2]
         --ds-stride <N>      Seconds between input samples (>=1)        [default: 1]
         --ds-bucket <R>      Bucket resolution: s|m|h|d|w|mo|y     [default: minutes]
         --ds-aggs <LIST>     Reductions, comma-separated: min,max,avg,sum,first,
@@ -1139,6 +1157,11 @@ mod tests {
 		assert_eq!(cli.ds_stride, 5);
 		assert_eq!(cli.ds_bucket, Resolution::Hours);
 		assert!(run_cli(&["-d", "--ds-stride", "0"]).unwrap_err().contains("--ds-stride must be >= 1"));
+		// Generated values default to two places; `full` restores the pre-2026-10 generator.
+		assert_eq!(cli.ds_decimals, Some(2));
+		assert_eq!(expect_run(&["-d", "--ds-decimals", "4"]).ds_decimals, Some(4));
+		assert_eq!(expect_run(&["-d", "--ds-decimals", "full"]).ds_decimals, None);
+		assert!(run_cli(&["-d", "--ds-decimals", "13"]).unwrap_err().contains("invalid --ds-decimals"));
 		// Aggregations parse from a comma list (including percentiles) and reject unknowns.
 		assert_eq!(cli.ds_aggs, Aggregation::ALL.to_vec(), "default is the six streaming reductions");
 		assert_eq!(expect_run(&["-d", "--ds-aggs", "min,max,p99"]).ds_aggs, vec![Aggregation::Min, Aggregation::Max, Aggregation::P99]);
