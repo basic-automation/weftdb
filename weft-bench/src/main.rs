@@ -119,7 +119,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 	// accuracy metrics; line-protocol mode does not.
 	let profile = if cli.mode == InputMode::Synthetic {
 		let profile_name = cli.name.clone().unwrap_or_else(|| "interpolation-heavy-irregular".to_string());
-		let params = SyntheticParams { seed: cli.seed, input_points: cli.points, missingness_fraction: cli.missingness, jitter_fraction: cli.jitter, noise_amplitude: cli.noise, signal_shape: cli.shape, spline: cli.spline, resolution: cli.resolution };
+		let params = SyntheticParams { seed: cli.seed, input_points: cli.points, missingness_fraction: cli.missingness, jitter_fraction: cli.jitter, noise_amplitude: cli.noise, signal_shape: cli.shape, spline: cli.spline, resolution: cli.resolution, value_decimals: cli.decimals };
 		InterpolationProfile::synthetic(profile_name, params)
 	} else {
 		// Validated in `from_args`: line-protocol mode always carries input + field.
@@ -507,6 +507,8 @@ struct Cli {
 	jitter: f64,
 	/// Synthetic additive-noise amplitude (`>= 0`; `0` puts samples on truth).
 	noise: f64,
+	/// Synthetic mode: decimal places of the generated samples; `None` = exact expansion.
+	decimals: Option<u32>,
 	/// Analytic shape of the synthetic ground-truth signal.
 	shape: SignalShape,
 	/// Timestamp precision of the input file.
@@ -601,7 +603,7 @@ impl Cli {
 		let mut points = defaults.input_points;
 		let mut missingness = defaults.missingness_fraction;
 		let mut jitter = defaults.jitter_fraction;
-		let mut noise = defaults.noise_amplitude;
+		let (mut noise, mut decimals) = (defaults.noise_amplitude, defaults.value_decimals);
 		let mut shape = defaults.signal_shape;
 		let mut precision = TimestampPrecision::Nanoseconds;
 		let mut spline = Spline::Cubic;
@@ -665,6 +667,7 @@ impl Cli {
 				"--missingness" => missingness = parse_fraction(&take_value(&key)?, "missingness")?,
 				"--jitter" => jitter = parse_fraction(&take_value(&key)?, "jitter")?,
 				"--noise" => noise = parse_noise(&take_value(&key)?)?,
+				"--decimals" => decimals = parse_value_decimals(&take_value(&key)?)?,
 				"--shape" => shape = parse_shape(&take_value(&key)?)?,
 				"--precision" => precision = parse_precision(&take_value(&key)?)?,
 				"--spline" => spline = parse_spline(&take_value(&key)?)?,
@@ -691,7 +694,7 @@ impl Cli {
 		let mode = select_workload_mode(&[(synthetic, InputMode::Synthetic), (point_lookup, InputMode::PointLookup), (range_fetch, InputMode::RangeFetch), (compression, InputMode::Compression), (downsample, InputMode::Downsample), (gap_fill_mode, InputMode::GapFill)])?;
 		validate_mode(mode, input.as_ref(), field.as_deref(), compare, gpu_calibrate)?;
 
-		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, gap_fill, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare, html, parquet, gpu_calibrate })))
+		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, gap_fill, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, html, parquet, gpu_calibrate })))
 	}
 }
 
@@ -905,7 +908,7 @@ fn parse_value_decimals(s: &str) -> Result<Option<u32>, String> {
 	}
 	match s.parse::<u32>() {
 		Ok(places) if places <= weft_bench::downsample::MAX_VALUE_DECIMALS => Ok(Some(places)),
-		_ => Err(format!("invalid --ds-decimals `{s}` (expected 0..={} or `full`)", weft_bench::downsample::MAX_VALUE_DECIMALS)),
+		_ => Err(format!("invalid decimal places `{s}` (expected 0..={} or `full`)", weft_bench::downsample::MAX_VALUE_DECIMALS)),
 	}
 }
 
@@ -1075,6 +1078,9 @@ SYNTHETIC OPTIONS (with --synthetic):
         --missingness <F>    Gap fraction in [0, 1]                [default: 0.20]
         --jitter <F>         Timestamp jitter fraction in [0, 1]   [default: 0.60]
         --noise <F>          Sample noise amplitude (>=0; 0=clean) [default: 2.0]
+        --decimals <N>       Round samples to N decimal places (0..=12) or `full`;
+                             set it for throughput runs, since ~50-digit inputs
+                             interpolate ~2x slower at scale        [default: full]
         --shape <S>          Ground-truth signal: multisine|sawtooth|step|
                              dampedsine                       [default: multisine]
 
@@ -1268,7 +1274,9 @@ mod tests {
 		assert_eq!(cli.ds_decimals, Some(2));
 		assert_eq!(expect_run(&["-d", "--ds-decimals", "4"]).ds_decimals, Some(4));
 		assert_eq!(expect_run(&["-d", "--ds-decimals", "full"]).ds_decimals, None);
-		assert!(run_cli(&["-d", "--ds-decimals", "13"]).unwrap_err().contains("invalid --ds-decimals"));
+		assert!(run_cli(&["-d", "--ds-decimals", "13"]).unwrap_err().contains("invalid decimal places"));
+		assert_eq!(expect_run(&["-s"]).decimals, None, "synthetic samples keep their exact expansion by default");
+		assert_eq!(expect_run(&["-s", "--decimals", "2"]).decimals, Some(2));
 		// Aggregations parse from a comma list (including percentiles) and reject unknowns.
 		assert_eq!(cli.ds_aggs, Aggregation::ALL.to_vec(), "default is the six streaming reductions");
 		assert_eq!(expect_run(&["-d", "--ds-aggs", "min,max,p99"]).ds_aggs, vec![Aggregation::Min, Aggregation::Max, Aggregation::P99]);

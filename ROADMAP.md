@@ -1624,6 +1624,18 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
       binary expansions carry ~50 significant digits and make every BigDecimal op expensive. Real
       two-decimal prices do not. So the README's reduction table, which is all generator-based,
       **understates** WeftDB on real price data.
+    - [x] **DONE (2026-10-09) — the interpolation generator: pessimistic at scale, now a knob.**
+      Its samples are exact binary expansions too. On 100k samples the flagship-shaped run
+      interpolates in 50.4–53.7 ms against 24.6–25.8 ms at two decimals (~2×, three runs each,
+      accuracy unchanged to 0.2 RMSE); at the 480-sample flagship the gap is ~5%. `--decimals N`
+      (`SyntheticParams::value_decimals`) rounds the samples; the default stays the exact
+      expansion, because zero-noise accuracy scoring needs samples exactly on the truth. No
+      published figure used the generator's speed.
+    - [ ] **Remaining audit:** the storage generators already emit exact two-decimal text (checked
+      2026-10-09: `point_lookup` and `range_fetch` seal the sawtooth `10000000.{i % 97:02}`, the
+      `compression` shapes are two-decimal), so the open part is whether those value patterns are
+      representative, which only a real-corpus run per workload answers; all three now have one
+      (`--pl-csv`, `--rf-csv`, `--comp-csv`).
     - [x] **DONE (2026-10-09) — the downsample generator emits realistic decimals:** values are
       rounded to `--ds-decimals` places (default 2; `full` keeps the pre-2026-10 binary expansion), and
       the README reduction table was re-baselined with both generators measured back to back. On 1M

@@ -1358,7 +1358,14 @@ What it does today:
   profile generates an irregularly-spaced, gap-containing series
   (`ChaCha8Rng`, published seed → byte-for-byte reproducible). The underlying
   analytic signal is shape-selectable (`MultiSine` | `Sawtooth` | `Step` |
-  `DampedSine`) and doubles as the accuracy ground truth.
+  `DampedSine`) and doubles as the accuracy ground truth. By default each sample keeps
+  its float's exact binary expansion (~50 significant digits), so a zero-noise sample sits
+  exactly on the ground truth; `--decimals N` rounds samples to N places instead, which is
+  what throughput runs should use: on 100k samples (86,401-point output, 20 reps, PASS,
+  2026-10-09) the exact-expansion series interpolates in p50 **51.0 ms** against **25.5 ms** at
+  two decimals, because splimes converts every input to `f64` and long decimals take
+  `bigdecimal`'s slow conversion path (`weft-bench --synthetic --points 100000 --decimals
+  <2|full> --no-gpu-calibrate --reps 20`; three runs each, 50.4–53.7 vs 24.6–25.8 ms).
 - **Storage, read & aggregation workloads** — beside the flagship interpolation
   run, four parallel workloads exercise WeftDB's own hot paths, each with its own
   correctness gate and p50/p95/p99 latency: **`point_lookup`** (`--point-lookup`)
