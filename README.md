@@ -483,13 +483,14 @@ Since 2026-10-09 `reduce` itself compares and sums on integers whenever every va
 mantissa at the series' largest scale, with a result identical in value and representation
 (min, max, first, last and collected samples are the original values; each bucket's sum carries its
 own largest scale); on 1M real BTC closes, hourly `avg` went from 52.4 to 21.6–22.3 ms, `sketch_p99`
-from 71.0 to 42.3–42.9 ms and `avg,p99,twa` from 171.4 to 141.3–142.9 ms (two runs each). A stored
+from 71.0 to 42.3–42.9 ms (35.4–36.2 ms once the sketch also skips the logarithm for a value in the
+previous value's bucket) and `avg,p99,twa` from 171.4 to 141.3–142.9 ms (two runs each). A stored
 `ScaledI64` aspect goes further, straight from the stored mantissas (`reduce_partial_scaled`, see
 [Where it doesn't pay off](#where-it-doesnt-pay-off) for the decimal tax), which `--ds-scaled` times on
 the same series, gated on an identical result (10 reps, load average ~24): hourly `avg` over the 500k
 two-decimal points **0.58 ms**, over 1M real BTC closes **6.4 ms**; the six streaming reductions
-7.6 ms, `sketch_p99` 22.3 ms and `avg,p99,twa` 109.0 ms on the real series (`weft-bench --downsample
---ds-scaled …`).
+7.6 ms, `sketch_p99` 22.3 ms (17.9–18.9 ms with the bucket cache, three runs at load average ~33)
+and `avg,p99,twa` 109.0 ms on the real series (`weft-bench --downsample --ds-scaled …`).
 
 **Exact vs sketch percentiles — which to ask for.** The `p50`/`p90`/`p95`/`p99` reductions are
 *exact* nearest-rank: they return an actual observed `BigDecimal` from the bucket, but they
