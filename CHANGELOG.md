@@ -8,6 +8,536 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+⚠️ **Upgrading a segment store from v0.1.0 is one-way.** The first open by this
+version migrates a v0.1.0 store in place to store layout v2: it writes a
+`STORE_FORMAT` marker, adds columns and tables to `segment_index.db`, and from then on
+segment ids come from a persistent allocator and maintenance writes new, journaled
+frames instead of rewriting them in place (see Added and Changed). v0.1.0 reads no
+marker, so it would not refuse a migrated store, but it knows none of this: once this
+version has opened a store, do not run v0.1.0 on it again. Before upgrading, stop
+`weft-server` and copy the whole store directory; `POST /api/v1/storage/backup` copies
+only the control plane, not the segment frames.
+
+### Added
+
+- **Write poison** (crash-consistency design, S6). When a segment-index COMMIT fails
+  in a way that may still have committed (any COMMIT error except a conflict Turso
+  detects while validating the transaction, which it rolls back before writing
+  anything), the transaction may or may not be durable, so the store now refuses every
+  write (seal, declare, reconcile, split, merge, squash, compact, rollup rebuild) with
+  the new `weftdb::Poisoned` error until the process restarts, while reads keep
+  working; the restart's open settles the transaction. `SegmentStore::poisoned()`
+  reports it, and `GET /ready` gains `poisoned`, `restart_required` and
+  `poison_reason`. `WEFT_ON_AMBIGUOUS_COMMIT=exit` makes `weft-server` log and exit
+  with status 70 once its store is poisoned, for deployments whose supervisor restarts
+  it (unset or `poison` keeps the default); the library itself never exits the process
+  (see the options entry under Changed). `SegmentStore::wait_until_poisoned()` and
+  `subscribe_poison()` let an embedder do the same.
+- **Store format marker and migration registry** (freeze design §4.3, FRE-12a). A
+  segment store root now carries a `STORE_FORMAT` file (plain JSON: `layout_version`,
+  `min_read_layout`, `min_write_layout`, `last_written_layout`, `migrating_to`,
+  `applied_through`, `store_uuid`, `scope`), written through the durable I/O layer
+  (temporary file, fsync, rename, directory fsync). The open reads it right after it
+  takes `LOCK` and before it opens any database, and refuses a store whose
+  `min_write_layout` is newer than this build's layout (`weftdb::SUPPORTED_LAYOUT`,
+  now 2) with `weftdb::StoreError::IncompatibleLayout`, having touched nothing but
+  `LOCK` and `LOCK.holder`; an unparseable marker is `StoreError::UnreadableStoreFormat`.
+  A new store writes its marker before any database file exists. Every control-plane
+  table is now created by a registered, idempotent migration (`0001_baseline`: the
+  pre-1.0 schema; `0002_s6_s7`: layout 2), recorded in a new `store_migrations` table
+  of `segment_index.db`; the open runs every pending migration's precheck first, raises
+  the marker's floors before it applies one, so a crash half way never leaves floors an
+  older WeftDB would not respect, and mirrors the marker into `store_meta`. A root
+  without a marker but with databases is judged by `store_meta` before anything is
+  written to it: a newer write floor recorded there is `IncompatibleLayout`, a lost
+  marker is rebuilt from that copy (keeping the store's layout, floors and identity),
+  and a store written before markers existed (any v0.1.0 store) is layout 1 and is
+  migrated in place, one way (see the upgrade note at the top of this section). A
+  store whose layout is newer than this build's but whose write floor it meets opens
+  without migrating (recovery is told to only report); a root holding only such a
+  marker, with no database, is refused with `StoreError::NewerStoreWithoutDatabases`
+  and nothing created. No open function runs DDL any more, and the control-plane
+  databases are opened only by a store (see Changed).
+- `SegmentStore::open_report()` (`weftdb::OpenReport`: `created_new`,
+  `migrated_from`, the migrations `applied`, `recovery_report_only`),
+  `SegmentStore::store_uuid()` and `SegmentStore::store_format()`. `weft-server`
+  prints whether it created, opened or migrated its store, with the store's UUID and
+  layout.
+- `segment_index.series_id` (`INTEGER NOT NULL DEFAULT 0`, 0 being the empty tag set)
+  and `aspect_seq.next_series_id` (`DEFAULT 1`), in migration `0002`, so tagged
+  series need no table rebuild later (tags A7). Every row reads back as series 0.
+- `weftdb::exec::control_plane_write` and `weftdb::durable::poison_global()`
+  (robustness track ROB-2): every segment-index transaction runs inside the
+  task-local control-plane write scope, so a panic hook can tell a panic in the middle
+  of a control-plane write from one in a read, and the process-wide poison it would set
+  refuses every write of every store, as a store's own poison does, while reads go on.
+  It refuses every store open too (`weftdb::Poisoned`), since an open writes.
+- `LOCK.holder` records the holder's host name and boot id beside its pid, and a
+  second opener's error names the host (`… in use by pid 1 on host db-2 (session …)`).
+  The short wait for a lock that a child being spawned still shares now applies only to
+  this process on this host in this boot: another container on the same volume, also
+  pid 1, is refused at once.
+- On Apple targets every control-plane connection sets `PRAGMA fullfsync=ON`, and the
+  open checks it beside `synchronous=FULL`: Turso syncs a COMMIT with plain `fsync`
+  there otherwise, which does not survive power loss.
+- `Database::list_stored_databases()` lists the legacy databases on disk (the folders
+  of the data directory that hold a `metadata.db`), sweeping the build directories of
+  interrupted `Database::new` calls first. `weft-tui` lists databases through it.
+- `Outputs::get_unbatched_entries` and `Inputs::dequeue_unbatched_entries` read and
+  dequeue unbatched-queue entries together with their `queued_at` (`UnbatchedEntry`),
+  so a queue consumer dequeues only what it read; see the ingest fix below.
+- `Inputs::remove_extracted_batches` removes the processed batches pattern extraction
+  consumed and records their hashes, so the batch consumer does not queue them again
+  while the record keeps them; `build_patterns_queue` uses it (see the batch dedupe fix
+  below).
+- `WEFT_EXTRACTED_BATCH_RETENTION_SECS` (weftdb): how long, in seconds, the record of
+  extracted batches keeps a batch's hash. A positive whole number; anything else keeps
+  the default, 48 hours. Set it above the longest interval between pipeline runs of an
+  aspect plus the longest ingest call (see the batch dedupe fix below).
+- `Database::get_earliest_measurement_uncached` reads an aspect's earliest measurement
+  from its rows, bypassing the per-instance cache; the incremental build aligns its
+  windows on it.
+- `weft-orchestration` has a `fault-injection` feature (it enables weftdb's) for its
+  crash tests: `cargo test -p weft-orchestration --features fault-injection --test legacy_queue_crash`.
+- `weft-server` has a `fault-injection` feature too (it enables weftdb's), for the test
+  that `GET /ready` reports a poisoned store:
+  `cargo test -p weft-server --features fault-injection --test ready_poisoned`. Under
+  that feature `SegmentStore` has a hidden `inject_poison` test hook.
+- `MaintenanceBusy`, `MaintenanceWait`, `DEFAULT_MAINTENANCE_WAIT`,
+  `SegmentStore::maintenance_wait` and `SegmentStore::with_maintenance_wait` (see the
+  maintenance entry under Changed), and `SegmentStore::index_conflicts()`, the number of
+  segment-index transaction attempts that lost an MVCC conflict since the store opened,
+  which stays at zero unless something outside the store contends for the index. Under
+  the `fault-injection` feature `SegmentStore` has a hidden `hold_maintenance` test hook,
+  used by `cargo test -p weft-server --features fault-injection --test maintenance_busy`.
+- `SegmentStore::reap(MaintenanceWait)` (`weftdb::ReapSweep`): runs the reaper of the
+  frame journal (see the write-once maintenance entries under Changed) over every aspect
+  with journal rows, unlinking each frame a maintenance operation retired once no
+  running read and no backup may still need it, and each output an operation journaled
+  but never swapped in. Every maintenance operation reaps after itself, and every open
+  replays the whole journal, so this is for frames a long read still held, that the
+  filesystem asked to retry later, or that an operation stopped part way (its future
+  dropped, a request cancelled say) left behind; the next maintenance operation on such
+  an aspect also settles those first.
+- `weftdb::aspect_name::encode` and `decode`: the file-name form of an aspect name in the
+  write-once frame names (crash-consistency design §4): `[a-z0-9_]` as they are, every
+  other byte as `%XX` in uppercase hex, injective even where the filesystem folds case
+  or normalises Unicode.
+
+### Changed
+
+- **Breaking for Rust users: `weftdb` reads no `WEFT_*` variable when it opens a
+  segment store, and never exits the process** (release plan C-1).
+  `SegmentStore::open` and `open_scoped` now use `SegmentStoreOptions::default()`
+  (no checkpoint index, no partial sidecars, no bit-sliced codec) whatever the
+  environment says; pass `SegmentStoreOptions::from_env()` to the new
+  `SegmentStore::open_with_options` / `open_scoped_with_options` to keep reading
+  `WEFT_SEGMENT_*`, as `weft-server` does. `WEFT_ON_AMBIGUOUS_COMMIT` is read by
+  `weft-server` alone; an ambiguous COMMIT only poisons the store, and the server exits
+  with status 70 on that under `exit`. Deployments of `weft-server` see no difference.
+- **Stored frame paths are resolved by splitting on both `/` and `\`**, so a store
+  written on Windows reads on Unix and the other way round, and a path that would lead
+  out of `segments/` (a `..`, no `segments` component) is refused instead of read
+  where it points. Upgrading a layout-1 store whose index records such a path fails
+  with `StoreError::UnsafeLegacyPath`, naming the aspects, before any migration applies
+  or a marker is written; nothing is moved or quarantined.
+- **Breaking for Rust users: `SegmentIndexStore`, `AspectMetadataStore`, `AspectCatalog`
+  and `CatalogStore` can no longer be opened on their own.** Their `open` and
+  `open_in_memory` are gone: they created this build's schema in any file, without the
+  store's `STORE_FORMAT` gate, which would let a WeftDB write tables into a store a newer
+  one wrote. A `SegmentStore` opens all four (`index()`, `metadata()`, `catalog()`,
+  `registry()`); nothing in the workspace opened them otherwise.
+- A store root's parent that cannot be fsynced because its filesystem refuses (`EROFS`,
+  `EINVAL`, `ENOTSUP`: read-only mounts, FUSE and Docker Desktop bind mounts) is now
+  skipped with a warning when the root predates the open, as an unreadable parent
+  already was.
+- Adding a missing column during a migration now ignores only Turso's exact
+  duplicate-column error for that column; any other failure fails the open (the
+  `metadata.db` order-health column used to swallow every error).
+- **A segment store root can be open in only one `SegmentStore` at a time.** ⚠️ A
+  second `SegmentStore::open`/`open_scoped` on a root that this process already has
+  open used to succeed, so several scopes could share one root at once. It now fails
+  with the new `StoreLocked` error (downcast it from the `anyhow::Error`). Embedders
+  that kept several scoped stores open on one root must close one before opening the
+  next, or give each scope its own root.
+- **Control-plane backups are published atomically, with a manifest.** A backup is
+  built in a `.partial-{label}-{nonce}/` directory beside its destination, each
+  database verified and fsynced, then a `MANIFEST.json` (format, creation time, and
+  each file's size, tables and rows) is written and fsynced, the directory fsynced,
+  renamed to its label and the parent fsynced. A backup directory now holds the four
+  databases plus `MANIFEST.json`. Backing up into a directory that already exists is
+  refused (it was accepted when empty). A backup that fails removes its build
+  directory again, unless it fails after the rename (only the parent's fsync is left
+  then): that error, a `500` over HTTP, leaves the complete backup under its label.
+- **Backup retention counts only complete backups**: a `backup-<digits>` directory
+  with a `MANIFEST.json`, or one from before manifests that holds all four databases.
+  Pruning renames a backup to `.deleting-*` (durably) before removing its files. A
+  backup directory that cannot be inspected (a permission error, say) is skipped and
+  logged instead of failing retention. The backup daemon removes `.partial-*`,
+  `.deleting-*` and `.restore-drill-*` entries left untouched for an hour, at start
+  and on every tick; without the daemon, what a crash leaves there stays until
+  removed by hand.
+- **A backup label that is already taken is a `409` with `"code": "already_exists"`**
+  (it was a `400`); the existing backup is untouched. `weft_server::StorageError` gains
+  the `AlreadyExists` variant for it, and the JSON error body carries a `code` field
+  for that error only.
+- **`restore_control_plane` stages each file as `<name>.tmp`**, synced and verified,
+  renames them into place only once all four verify, and fsyncs the root, which it
+  now creates durably. A backup with a manifest must match it (sizes, tables, rows).
+- Library API: `verify_snapshot` and `snapshot_with_verify` take the tables the
+  snapshot must hold, and `SnapshotReport` lists them in `table_names`.
+  `sweep_backup_staging_at` is `sweep_backup_staging` with an explicit clock. `StoreFs`
+  gains `create_dir`, `remove_dir_all` and `copy_new`, and the `SimFs` power-cut
+  simulator (`fault-injection` feature) now models directories.
+- **Breaking for implementors of `Inputs` and `Outputs`.** Three required methods were
+  added without default implementations: `Inputs::dequeue_unbatched_entries`,
+  `Inputs::remove_extracted_batches` and `Outputs::get_unbatched_entries` (see Added).
+  Behaviour that implementations must now match: `insert_unprocessed_batch` and
+  `batch_insert_unprocessed_batches` return `Ok` when they skip a batch that is already
+  queued, processed or extracted; a processed batch's `batch_hash` is the hash it was
+  queued under, not a hash of its processed measurements; and
+  `enqueue_unbatched_measurements` is an upsert that moves an already-queued entry's
+  `queued_at` forward and reports a write-write conflict as
+  `Error::TransientMvccError`.
+- **Rows-mode ingest and the incremental build commit more often** (crash-consistency
+  fixes below). `capture_measurement` makes four synced commits where it made three
+  (the write-ahead enqueue, the row, the second enqueue, the transaction-log entry), and
+  `batch_capture_measurements` one more per chunk (each chunk's second enqueue). The
+  incremental build dequeues in transactions of at most 5,000 entries, one synced
+  commit each, where a run dequeued in a single commit, so a backfill of a million rows
+  costs about 200 dequeue commits.
+- `weft-tui` lists databases with `Database::list_stored_databases`: the names are
+  sorted, and an unreadable data directory is reported as an error instead of showing
+  an empty list (a missing one still lists nothing).
+- **A segment store's `segment_index.db` is migrated to store layout 2 when it opens**
+  (crash-consistency design, S6). The migration is additive and idempotent and
+  rewrites no data: `segment_index` gains the columns `gen` (0 on every existing row),
+  `prec`, `frame_crc` and `commit_epoch`, and the database gains the tables
+  `aspect_seq`, `frame_journal`, `ingest_ledger`, `segment_quarantine`, `store_meta`,
+  `aspect_metadata` and `segment_changes`, which later releases fill. `store_meta`
+  records `layout_version = 2` and a `store_uuid`. ⚠️ The migration is one-way:
+  v0.1.0 would still open a migrated store, ignoring the additions, but do not run it
+  on one again (see the upgrade note at the top of this section). A WeftDB refuses a
+  store whose `layout_version` is newer than it knows, before it writes anything to its
+  databases (the open has already taken the root's `LOCK`, and created `segments/` if
+  it was missing).
+- Segment-index writes (seals, reconciles, splits, merges, squashes) commit through
+  one transaction type. A write that loses an MVCC conflict to another writer of the
+  same row still fails the call at once, as before: retrying it would replay it over
+  the other writer's committed row. Only a database that is busy before the
+  transaction starts is retried, up to five times with backoff.
+- **Segment ids come from a persistent per-aspect allocator** (crash-consistency design,
+  S7). A seal took `MAX(id) + 1` for its aspect; it now takes the next id of an
+  allocator that hands each id out once, writes its frame, and commits its row with a
+  plain `INSERT` (never `INSERT OR REPLACE`) together with the allocator's raise, which
+  is persisted in `segment_index.db`'s `aspect_seq` table. A deleted segment's id, even
+  the highest, is never reused, before or after a restart, and neither is the id of a
+  frame a seal wrote but crashed before committing: the allocator starts above every
+  `{aspect}-{id}.weftseg` (and `.weftpart`) name in `segments/`. Ids still grow, but no
+  longer as `MAX(id) + 1`: after a squash or merge deleted the highest segments, the
+  next seal's id leaves a gap. The suffixes that splits and split overlap merges create
+  take their ids from the same allocator. Each aspect's control-plane writes (a seal's
+  row and rollup fold, maintenance row rewrites and deletes, rollup rebuilds) take turns
+  under a per-aspect lock, so they no longer conflict with one another, and a seal's
+  index transaction is retried (up to five times) if anything else does conflict with it.
+- **Maintenance operations on one aspect take turns.** A reconcile, split, overlap
+  merge, squash or compaction now holds its aspect for its whole run. The HTTP
+  maintenance endpoints (`POST /api/v1/storage/{aspect}/reconcile`, `…/squash`,
+  `…/compact` and the store-wide `POST /api/v1/storage/reconcile`) wait up to 30 s for
+  an aspect another operation holds and then answer **`409 Conflict`**, naming it; the
+  store-wide sweep maintains the other aspects first. The background reconcile daemon
+  never waits: it skips a busy aspect until its next tick (logged at `DEBUG`, counted
+  in the tick span's `busy` field, not as a failed pass). ⚠️ Library API: the store-wide
+  sweeps (`reconcile_all_over_threshold`, `reconcile_all_hot_cold`,
+  `reconcile_all_overlaps`, `reconcile_all_overlaps_with_policy`,
+  `squash_all_over_threshold`, `squash_all_to_target_rows`,
+  `squash_all_to_target_rows_if_fragmented`) take a new last argument,
+  `MaintenanceWait::Skip` or `MaintenanceWait::Wait(duration)`, and their results gain
+  a `busy` list of the aspects they could not take. The per-aspect entry points keep
+  their signatures, wait up to `SegmentStore::maintenance_wait()` (30 s,
+  `DEFAULT_MAINTENANCE_WAIT`; change it with `with_maintenance_wait`), and then fail
+  with the new `MaintenanceBusy` error.
+- **Reconcile and split are write-once** (crash-consistency design §5.3-5.4, S8).
+  `reconcile_segment` (and every reconcile pass built on it) and `split_segment` no
+  longer rewrite a `.weftseg` frame. Their outputs are new frames in `segments/` named
+  `{enc(aspect)}~g{gen}~p{prec}.weftseg` (the aspect name encoded as by
+  `aspect_name::encode`, a per-aspect generation that is never handed out twice, and the
+  adoption order; an aspect name that would encode past the file-name limit is cut and
+  completed with a hash, `…~h{16 hex digits}~g…`), journaled as pending in
+  `segment_index.db`'s `frame_journal`, written and fsynced, then `segments/` fsynced.
+  One `segment_index.db` transaction then swaps them in: it replaces the segment's row
+  only if it is still the version that was read (id, generation and frame CRC; another
+  version fails the operation with a `Conflict` and writes nothing back), inserts a
+  split's suffix under an id allocated inside it, journals the old frame as retired,
+  and advances the aspect's epoch and generation counter. The old frame is unlinked by
+  the reaper once no read that may still open it is running (every read pins the
+  reclaim epoch it started in, released when its future is dropped, timed out or not),
+  then its journal row is deleted; a frame the filesystem refuses to unlink for now (a
+  Windows sharing violation, `EBUSY`) waits for a later pass instead of failing anything.
+  Every open replays the journal before it returns: outputs a crash left before their
+  swap are unlinked, retired frames no row references are unlinked, `segments/` is
+  fsynced, the rows are deleted, and the rollup of an aspect whose swap committed is
+  rebuilt. A reconcile also checks that the frame it reads is the one its row was
+  committed with (its length, and its CRC once bound), and the sidecars of its outputs
+  are written under a `.tmp-*` name and renamed into place. The overlap merge, squash
+  and compaction became write-once too (see the next entry). An older layout-2 WeftDB
+  reads the new frames (the index keeps recording root-joined paths) but does not
+  replay the journal.
+- **The overlap merge, squash and compaction are write-once** (crash-consistency design
+  §5.3 and §7, S9). `reconcile_overlaps`/`reconcile_overlaps_with_policy` (both the full
+  rewrite of a component and the split of its cold prefix), `squash_aspect` and
+  `squash_aspect_to_target_rows`, and every sweep and threshold variant built on them, no
+  longer rewrite a segment's frame in place and then delete the other members in commits
+  of their own. Each component, squash or compaction group is now one swap, as a
+  reconcile's is: its output frames are written under new names, fsynced, and
+  `segments/` fsynced, then one `segment_index.db` transaction replaces the members'
+  rows with the outputs' and deletes the members left over, each only if it is still the
+  version that was read (a member another writer changed fails the swap with a
+  `Conflict`, writing nothing), and journals every member's frame as retired for the
+  reaper. The outputs' rows record the frame actually written, so a paged member merged
+  into a single-block output never leaves a row describing the wrong frame kind, and
+  carry the largest adoption order (`prec`) of their members. Merges also check that each
+  member's frame is the one its row was committed with, and merge on a blocking thread.
+  Outputs take their members' ids, the `j`-th output in time order the `j`-th smallest
+  (release plan D17, without a change to the `segment_index` key), and are cut only at
+  timestamp boundaries, so a run of equal timestamps never spans two outputs.
+- ⚠️ **An overlap merge that splits its component no longer allocates an id for the
+  suffix.** The hot suffix takes the component's second-smallest segment id (the cold
+  prefix keeps the smallest), where it used to take a fresh id from the allocator. The
+  segment ids an overlap split leaves, and those later seals receive, change
+  accordingly; the merged data does not.
+- ⚠️ **`split_segment` refuses a split whose suffix a newer segment overlaps.** The
+  suffix takes an id above every segment of the aspect, so where it shares a timestamp
+  with a segment sealed after the split one it would outrank that segment's newer
+  value. The split now fails with an error, changing nothing, when any segment with a
+  higher id overlaps the suffix's span (its first timestamp at or after `boundary` to
+  the segment's last); the check runs again under the aspect's commit lock right before
+  the swap, against a seal that committed meanwhile.
+
+### Deprecated
+
+- `SegmentIndexStore::next_id` (`MAX(id) + 1`): it reissues the id of a deleted or
+  crashed segment and races concurrent callers. `SegmentStore` no longer uses it; it is
+  kept for tests.
+
+### Fixed
+
+- **Power loss during or after a reconcile or split could lose or tear rows.** Both
+  rewrote the segment's frame in place with an unsynced write (a split also wrote its
+  suffix that way), so a power cut, even after the call returned, could leave a
+  committed row over an empty, torn or zero-filled frame: its rows gone and every read
+  over them failing with a checksum error. Their outputs are now fsynced, under new
+  names, before the commit that switches to them (see Changed).
+- **A read during a reconcile or split could fail or see rows twice.** A read could open
+  a frame half way through its in-place rewrite, and a split committed its suffix before
+  it shrank its prefix, so a read in between returned the suffix's rows twice. A swap is
+  now one transaction, and the frames it retires stay until no read that may open them
+  is running.
+- **Power loss during or after an overlap merge, squash or compaction could lose or tear
+  rows.** Each rewrote its lowest segment's frame in place with an unsynced write, then
+  deleted the other members' rows and frames one by one, so a power cut, even after the
+  call returned, could leave the merged row over an empty, torn or zero-filled frame,
+  with the members whose rows it had absorbed already deleted: their rows gone and reads
+  over the merged range failing with a checksum error. A crash between the rewrite and
+  the row update could also leave a paged segment's row over a single-block frame. Each
+  merge is now one swap of fsynced new frames (see Changed).
+- **A read during an overlap merge, squash or compaction could fail or see rows twice.**
+  Between a merge's rewrite of its lowest segment and the deletion of the others, a read
+  returned the merged rows beside the members' own, and a read during the rewrite could
+  open a half-written frame. The swap is now one transaction, and the frames it retires
+  stay until no read that may open them is running.
+- **An overlap merge's split suffix could outrank a newer seal.** The suffix took a fresh
+  id from the allocator when the merge wrote it, above that of a seal that had taken its
+  id meanwhile, or before the merge but committed after it, so where the two shared a
+  timestamp the merge's older value won over the seal's acknowledged one. The suffix now
+  takes a member's id, below the seal's.
+- **A reconcile whose segment another operation changed meanwhile wrote it back.** Its
+  swap now requires the segment's row to be the version it read and fails with a
+  `Conflict` otherwise (the maintenance lock already keeps the store's own operations
+  apart; this holds for anything else that writes the index).
+- **Concurrent seals of one aspect could lose an acknowledged batch.** Two seals that
+  ran at once took the same id: the later one's write replaced the earlier one's frame
+  and its row, so a batch whose seal had succeeded was gone, or one of the seals failed
+  with an MVCC write-write conflict. Every seal now gets an id of its own (see the
+  allocator entry under Changed).
+- **A seal could reuse the id of a deleted segment or overwrite a crashed seal's
+  frame.** After a squash or merge deleted an aspect's highest segment, the next seal
+  took its id again, so a seal racing the merge's unlink could lose its frame, and a
+  leftover sidecar of the deleted segment could be served for it. A seal that crashed
+  after writing its frame and before committing it left the frame behind, and the next
+  seal truncated it.
+- **A reconcile racing a squash or merge of the same aspect could bring a merged
+  segment back.** A reconcile that had read a segment wrote it back after the merge
+  had folded it into its target and deleted it, so its stale values outranked the
+  merged ones and its rows read twice. Maintenance operations on one aspect now take
+  turns (see Changed).
+- **Concurrent seals could leave the aspect's rollup (`metadata.db`) wrong**, missing
+  some of them, or fail after their row had committed: each folded itself in with an
+  unlocked read-then-write. The fold, and rollup rebuilds, now run under the aspect's
+  lock with the seal's commit.
+- **A segment store that was moved, restored into another root or mounted at another
+  path could not read its frames.** The index records each frame by the absolute path
+  it was written under, and every read opened that path. Reads now resolve it against
+  the store's current root: a path under the root is used as it is, and any other is
+  taken as `root/segments/` plus what follows its last `segments` component. Restoring
+  a control-plane backup next to copied frames no longer needs the original root to
+  still exist.
+- **A segment store root is now owned by one process.** Opening a store takes a `LOCK`
+  file in the root (with the holder's pid and session in `LOCK.holder` beside it) and
+  holds it until the store closes. A second `weft-server` on the same
+  `WEFT_SEGMENT_STORE_ROOT` now exits at startup with an error naming the pid that
+  holds the root, instead of Turso's "File is locked by another process". The lock is
+  released by the OS however the holder exits, so there is never a stale lock to
+  clear. (In-process, see the `StoreLocked` entry under Changed.)
+- **A control-plane database that could not switch to MVCC was opened anyway.** The
+  segment store's four control-plane databases now refuse to open unless they run in
+  MVCC journal mode and a new connection syncs FULL, which is what makes a COMMIT
+  durable when it returns. Previously a failed switch was ignored and the database
+  committed in WAL mode.
+- **Opening a control-plane database now syncs the MVCC header the switch to MVCC
+  wrote.** The switch writes the MVCC header into the database file without syncing
+  it, and commits then sync only the `-log`, so a power cut could leave a header that
+  still says WAL beside a log of acknowledged commits, which Turso refuses to open.
+  Turso synced it anyway for a database that never ran MVCC, but not for one switched
+  back to WAL. Every open of each of the four databases now commits a no-op
+  transaction and runs a TRUNCATE checkpoint, which makes Turso fsync the file, header
+  included, before the open returns. Every open, not only the one that switched: an
+  open that crashed between its switch and that sync leaves a header the next open
+  reads back as MVCC although it never reached the disk. This costs one commit and one
+  checkpoint per database per open.
+- **Opening a store now makes its files' directory entries durable.** The root,
+  `segments/`, the root's parent and any directory the open created are fsynced, so
+  the control-plane databases and their logs cannot vanish from the directory after a
+  power cut. A pre-existing root whose parent the server cannot read still opens, with
+  a warning.
+- **The store's database/subject registration is one transaction.** A crash during
+  open could leave the database registered without its subject.
+- **A backup that stopped part-way could count as a backup.** A crash or error
+  mid-backup left a `backup-<digits>` directory with only some of its databases,
+  which retention counted (so it could prune a good backup in its place) and a drill
+  could pick. A pruned backup interrupted part-way was left half-removed under its
+  name. Neither can happen now; see above.
+- **A reported backup could be lost on power loss**: nothing fsynced its files'
+  directory entries or the directory itself.
+- **An empty control-plane snapshot passed verification.** Every snapshot must now
+  hold its database's tables, at backup and at restore.
+- **The restore drill discarded a failed cleanup.** `POST /api/v1/storage/restore/drill`
+  now reports it in a new `cleanup_error` field (`null` when the rehearsal copy was
+  removed).
+- **Two restore drills started in the same millisecond shared a rehearsal directory**,
+  so whichever ended first removed the directory the other was still using. A drill
+  now claims its `.restore-drill-<millis>` directory before restoring into it, and one
+  that finds it taken answers `409` with `"code": "already_exists"`, leaving it alone;
+  retry it.
+- **`Database::new` could leave a half-created database** that neither a retry of
+  `new` ("already exists") nor `Database::existing` (no `database` row) could use. A
+  database is now built in a hidden `.{name}.creating-{nonce}` folder beside its final
+  place and renamed to `{name}` only once its schema and `database` row are committed,
+  then the data directory is fsynced. An error or crash leaves either nothing under
+  `{name}` (retry `new`) or the complete database (open it with `existing`). Build
+  folders left by a crash are removed by the next `new` or listing; the data directory
+  gains a `.weft-creating.lock` file that keeps a sweep away from a creation in
+  progress, in this or another process. `new` now refuses a name of the build folders'
+  form (`.{x}.creating-` followed by 32 hex digits). The rename is the commit point:
+  if the data directory cannot be fsynced after it, or the published database cannot
+  be opened at its final path, the database stays in place (another task or process may
+  already have opened it) and the error says it was created and to open it with
+  `existing`; after a failed fsync it also says the creation may not survive a power
+  loss. The checkpoint after creation is best-effort.
+- **Legacy ingest could store rows that were never batched.** `batch_capture_measurements`
+  and `capture_measurement` queued the timestamps for batching only after the rows
+  committed, so a failure in between left rows the incremental pipeline never saw.
+  The timestamps are now queued before the insert, and queued again once their rows (or
+  each chunk) are committed. The incremental build no longer fails on an aspect whose
+  queue holds timestamps but no rows yet.
+- **An incremental build running during an ingest could drop the ingest's rows.** It
+  could read a queued timestamp before its row was committed, build the window without
+  it and dequeue it, and it cleared the whole queue when every queued timestamp lay
+  before the earliest stored row, as a backfill's do. Enqueuing a timestamp that is
+  already queued now moves its `queued_at` forward (it used to keep the old one), and
+  the build dequeues only the entries it read with the `queued_at` it read, so the
+  second enqueue after the commit keeps the row queued for the next build. The build
+  now reads the earliest measurement, which it aligns its windows on, from the rows on
+  every run: a cached value (kept per `Database` instance for up to 10 minutes) made it
+  clear a backfill from the queue. Ingest also drops that cached value after each
+  commit, but only in the instance (and its clones) that ingests; other instances, such
+  as the one each weft-tui action opens, keep theirs until it expires. A window the
+  build batched from rows that were already committed is rebuilt identically after the
+  second enqueue, and the batch dedupe skips it. Residuals, for a build running while
+  ingesting into the same aspect: the ingest's rows stay unbatched if the ingest dies
+  (or exhausts its retries) between a commit and its second enqueue; and a build run
+  between two chunks of a backfill or gap fill larger than one chunk batches the
+  windows spanning committed rows and rows still to come with the latter interpolated,
+  so those windows get a second, different batch and occurrence once the rows land.
+- **Concurrent writes to the batching queue failed the call.** The queue enqueue is an
+  upsert, so it writes a timestamp that is already queued, and an MVCC write-write
+  conflict with a consumer's dequeue, or with another ingest of the same timestamps,
+  failed the ingest or the consumer's dequeue. Every ingest path's enqueue
+  (`capture_measurement`, `batch_capture_measurements`, `capture_new_measurement`,
+  `capture_measurement_chunk`, `capture_new_measurement_chunk`) and the consumer's
+  dequeue now retry such a conflict, for about three seconds; a single
+  `enqueue_unbatched_measurements` call returns it as `Error::TransientMvccError`. The
+  consumer dequeues in transactions of at most 5,000 entries, so an enqueue waits for
+  one of them, not the whole dequeue. `batch_capture_measurements` queues all of its
+  timestamps in one transaction before it stores any row, so a consumer dequeuing some
+  of the same timestamps (a re-import of timestamps still queued) waits for all of it,
+  and either side can run out of retries: the build fails, or the import fails before
+  storing anything. Both are safe to re-run. The paths without a write-ahead enqueue
+  (`capture_new_measurement` and the two chunk methods) still queue after their commit,
+  so an error there fails the call although the rows are stored.
+- **The incremental build interpolated windows that could not be complete.** A queued
+  timestamp past the latest stored row (an append in progress, or the write-ahead
+  entries of one that failed or was abandoned, up to a whole call's worth) stays queued
+  until rows reach its windows, and every build interpolated each of those windows only
+  to find it short. The build now reads the latest stored measurement once per run and
+  skips a window that ends after it; the timestamps stay queued as before.
+- **Legacy ingest could fail after its rows were stored.** The steps after the commit
+  (the second enqueue, the checkpoint, the dirty-region marking, the aspect's
+  earliest/latest columns and `capture_measurement`'s transaction-log entry) are now
+  best-effort: a failure is logged and the call returns `Ok`, since a client would retry
+  an error into duplicate rows.
+- **The batch consumer could queue a batch twice.** It rebuilds every window a queued
+  timestamp falls in, so after a crash before its dequeue, or once an ingest that ran
+  during it queued its committed rows again, it rebuilt windows it had already batched,
+  and each became a second pattern occurrence. `insert_unprocessed_batch` and
+  `batch_insert_unprocessed_batches` now skip a batch whose `(aspect_id, batch_hash)` is
+  already queued, processed, or extracted. Processed batches keep the hash they were
+  queued under (it used to be recomputed from the processed measurements), and pattern
+  extraction records the hashes of the batches it consumes in a new `extracted_batches`
+  table of the processed batch database (a hash and a time per batch, indexed by hash),
+  in the transaction that deletes them. That table grows by about one row
+  per resolution step of the aspect, since extraction consumes about one sliding-window
+  batch per step, so it is bounded: each extraction also deletes the rows older than
+  `WEFT_EXTRACTED_BATCH_RETENTION_SECS` (48 hours by default: about 2,880 rows for a
+  minute-resolution aspect, 172,800 for a second-resolution one), and
+  `clear_processed_batches` (which `Pipeline::prepare_data_full_rebuild` calls) deletes
+  them all, so a full rebuild still extracts every window again. The rebuilds the record
+  guards against come on the first build after an ingest that overlapped a pipeline
+  run, or on the re-run after a build crashed; one that comes after the record expired
+  (a pipeline run more than the retention after the previous one, or a longer crash
+  recovery) extracts those windows a second time. A first-run full rebuild
+  (`is_first_run`) now skips the windows extracted within the retention; older ones are
+  batched and extracted again, as before. The unprocessed and processed batch databases
+  gain an index, `idx_batches_hash` on `batches(aspect_id, batch_hash)`, and
+  `extracted_batches` one on `batch_hash`, created when a process first opens them, so
+  each check is a point lookup.
+- Rows-mode ingest residuals remain until aspects move to the segment store, and are now
+  documented on `batch_capture_measurements` and `capture_measurement`: an error mid-call
+  leaves the chunks committed before it, and retrying stores those rows again.
+
+### Security
+
+- **Backup and drill labels starting with `.partial-`, `.deleting-` or
+  `.restore-drill-` are rejected with `400`**: those names belong to unfinished
+  backups, prunes and drills, which are never restored and are swept.
+- **The backup label grammar is fixed for 1.0: `[A-Za-z0-9][A-Za-z0-9._-]{0,99}`, not
+  ending with `.`.** ⚠️ `POST /api/v1/storage/backup?label=` and
+  `POST /api/v1/storage/restore/drill?label=` answer `400` for a label that starts with
+  `-` or `_` or is longer than 100 characters; both were accepted before. The drill still
+  accepts a daemon snapshot's `backup-<digits>`. An existing backup whose name falls
+  outside the grammar can be drilled once renamed into it (not into `backup-<digits>`,
+  which retention prunes).
+
 ## [0.1.0] - 2026-10-08
 
 First public release, and the baseline that later releases' upgrade, rollback and

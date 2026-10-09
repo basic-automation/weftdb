@@ -133,6 +133,19 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" != "schedule" ]; then export SKIP_SLOW_TESTS=1; fi
           cargo test --workspace --locked -- --test-threads=4
+      # The crash tests arm fault points, which only a `fault-injection` build has. The
+      # workspace test above must leave the feature off (weftdb's durable_fault_disabled
+      # checks that a production build keeps the points inert), so they run here, per
+      # crate. Linux only: the abort tests check the child's SIGABRT.
+      - name: Crash tests (fault-injection)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then export SKIP_SLOW_TESTS=1; fi
+          cargo test -p weftdb --features fault-injection --locked --test db_tests -- database_new_crash --test-threads=4
+          cargo test -p weft-orchestration --features fault-injection --locked --test legacy_queue_crash -- --test-threads=4
+          # Not a crash test, but it poisons a store through the same feature's hook.
+          cargo test -p weft-server --features fault-injection --locked --test ready_poisoned -- --test-threads=4
       # Tests create their legacy databases in a temporary data dir (weftdb/tests/common,
       # weft-orchestration's test_support, db_tests' own temp dirs), never in the default
       # ~/.weftdb/data. A fresh runner has no ~/.weftdb, so one here was written by a test.

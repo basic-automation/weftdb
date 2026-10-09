@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::{
 	cache::{self}, correlation::ErrorRate, types::{
 		database::traits::{aspect_structure::AspectStructure, config::Config, connection::Connection as _ConnectionTrait, database_structure::DatabaseStructure}, error::is_transient_mvcc_error
-	}, AnalysisResult, AspectId, Batch, BatchId, BatchMetatdata, BatchedMeasurement, Correlation, CorrelationID, Database, DatabaseInfo, DatasetId, DictionaryConstraints, DictionaryId, DictionaryMetadata, Error, Event, EventID, Manifestation, ManifestationId, Measurement, MeasurementId, Occurrence, Pattern, PatternID, Relative, SignalType, Steps, SubjectId, Variability, VariablilityType
+	}, AnalysisResult, AspectId, Batch, BatchId, BatchMetatdata, BatchedMeasurement, Correlation, CorrelationID, Database, DatabaseInfo, DatasetId, DictionaryConstraints, DictionaryId, DictionaryMetadata, Error, Event, EventID, Manifestation, ManifestationId, Measurement, MeasurementId, Occurrence, Pattern, PatternID, Relative, SignalType, Steps, SubjectId, UnbatchedEntry, Variability, VariablilityType
 };
 
 /// Maximum retries for transient MVCC errors during concurrent compression
@@ -60,6 +60,32 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 
 		Self::commit_concurrent(&conn).await?;
 		Ok(timestamps)
+	}
+
+	/// Get every unbatched queue entry for an aspect, with its `queued_at`
+	async fn get_unbatched_entries(&self, aspect_id: &AspectId) -> Result<Vec<UnbatchedEntry>> {
+		let db = self.metadata();
+		let db_path = self.metadata_path();
+		let conn = Self::begin_concurrent(db, db_path, Some(self.cache.clone())).await?;
+
+		let sql = r"
+			SELECT data_timestamp, queued_at FROM unbatched_measurements
+			WHERE aspect_id = ?
+			ORDER BY queued_at ASC
+		";
+
+		let mut rows = conn.as_ref().query(sql, turso::params![aspect_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query unbatched measurements: {e}")))?;
+
+		let mut entries = Vec::new();
+		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get unbatched row: {e}")))? {
+			let ts_millis: i64 = row.get(0).map_err(|e| Error::DatabaseError(format!("Failed to get timestamp: {e}")))?;
+			let queued_at: i64 = row.get(1).map_err(|e| Error::DatabaseError(format!("Failed to get queued_at: {e}")))?;
+			let data_timestamp = DateTime::from_timestamp_millis(ts_millis).ok_or_else(|| Error::DatabaseError("Invalid timestamp".to_string()))?;
+			entries.push(UnbatchedEntry { data_timestamp, queued_at });
+		}
+
+		Self::commit_concurrent(&conn).await?;
+		Ok(entries)
 	}
 
 	/// Count unbatched measurements for an aspect

@@ -164,6 +164,7 @@ impl AspectStructure for Aspect {
 			let schema_conn = Database::begin_immediate(&processed_batches).await?;
 			trace!("Wireframing batches tables for: {}", processed_batches_path);
 			Self::wireframe_batches_tables_direct(&schema_conn).await?;
+			Self::wireframe_extracted_batches_direct(&schema_conn).await?;
 			Database::commit_immediate(&schema_conn).await?;
 			drop(schema_conn);
 			trace!("Wireframed batches tables for: {}", processed_batches_path);
@@ -542,8 +543,7 @@ impl AspectStructure for Aspect {
 			)
 			.await?;
 
-		// Note: No indexes to support MVCC (turso MVCC doesn't support indexes yet)
-		// Duplicate batch detection must be handled at application level
+		Self::index_batch_hashes(conn).await;
 
 		Database::commit_concurrent(conn).await?;
 
@@ -569,6 +569,7 @@ impl AspectStructure for Aspect {
 		if was_new {
 			let schema_conn = Database::begin_immediate(&processed_batches).await?;
 			Self::wireframe_batches_tables_direct(&schema_conn).await?;
+			Self::wireframe_extracted_batches_direct(&schema_conn).await?;
 			Database::commit_immediate(&schema_conn).await?;
 		}
 
@@ -1325,6 +1326,56 @@ impl Aspect {
 			)
 			.await?;
 
+		Self::index_batch_hashes(conn).await;
+
+		Ok(())
+	}
+
+	/// Index the batches by `(aspect_id, batch_hash)` for the queue's duplicate check
+	/// (crash-consistency design, S18), which looks a batch's hash up in the unprocessed and
+	/// the processed batches before queuing it. Without the index each lookup scans the
+	/// table, measurements and all, and the processed batches are drained only by pattern
+	/// extraction. `IF NOT EXISTS`, so a table created before the index exists gets it the
+	/// first time this process opens it. Turso 0.8 maintains indexes under MVCC; like the
+	/// measurements' timestamp index this is best-effort, and a failure only makes the
+	/// lookups scan. Not unique: duplicate batches stored before the check may exist, and
+	/// the dedupe is application-level.
+	async fn index_batch_hashes(conn: &Connection) {
+		if let Err(e) = conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_batches_hash ON batches(aspect_id, batch_hash)", turso::params![]).await {
+			tracing::warn!("Could not create the batch hash index; duplicate checks will scan the batches: {e}");
+		}
+	}
+
+	/// The processed batches DB's record of the batches pattern extraction consumed: the
+	/// `batch_hash` of each and when it was extracted, written in the transaction that
+	/// deletes the batch (`remove_extracted_batches`), and checked by the queue's duplicate
+	/// check like the two batch tables (crash-consistency design, S18). Without it a batch
+	/// that was extracted, and so deleted, was queued again when the consumer rebuilt its
+	/// window (after a consumer crash, or after an ingest that ran during the consumer),
+	/// and became a second occurrence of the same span.
+	///
+	/// The record only has to outlive the next consumer run, so it is bounded:
+	/// `remove_extracted_batches` deletes the rows older than the retention
+	/// (`WEFT_EXTRACTED_BATCH_RETENTION_SECS`, 48 hours by default) in the same transaction,
+	/// and `clear_processed_batches` (a full rebuild) deletes them all. Extraction consumes
+	/// about one sliding-window batch per resolution step, so the table holds about one row
+	/// per step of the retention. There is no `aspect_id` column: the DB belongs to one
+	/// aspect. `IF NOT EXISTS`, so a processed batches DB created before the table gets it
+	/// the first time this process opens it; the index is best-effort, as for the batches.
+	async fn wireframe_extracted_batches_direct(conn: &Connection) -> Result<()> {
+		conn.as_ref()
+			.execute(
+				r"
+			CREATE TABLE IF NOT EXISTS extracted_batches (
+				batch_hash TEXT NOT NULL,
+				extracted_at INTEGER NOT NULL
+			)",
+				turso::params![],
+			)
+			.await?;
+		if let Err(e) = conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_extracted_batches_hash ON extracted_batches(batch_hash)", turso::params![]).await {
+			tracing::warn!("Could not create the extracted batch hash index; duplicate checks will scan the extracted batches: {e}");
+		}
 		Ok(())
 	}
 

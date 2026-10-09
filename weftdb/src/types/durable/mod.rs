@@ -17,20 +17,31 @@
 //!   not.
 //! - [`fault`] marks the steps of each commit protocol so the crash tests can fail,
 //!   abort or pause there. Without the feature, a fault point compiles to nothing.
+//! - `control_plane` proves at open that each control-plane database really runs
+//!   MVCC and syncs FULL, instead of trusting the pragmas that ask for it.
+//! - [`poison_global`] is the process-wide write poison that a panic inside a
+//!   control-plane write sets (ROB-2); every store's write entry points check it.
 //!
-//! Nothing in the store calls this module yet: S3 takes the root lock at open, and
-//! S5 onwards route their writes through it.
+//! `SegmentStore::open_scoped` takes the root lock, runs the control-plane probes and
+//! fsyncs the root's directories (S3). The control-plane backup, its retention and the
+//! restore (S5) are the first writers routed through the rest; the later slices route
+//! the seal and maintenance writes through it.
 
+pub(crate) mod control_plane;
 pub mod dirsync;
 pub mod fault;
 pub mod fs;
 pub mod lock;
+pub mod poison;
 #[cfg(any(test, feature = "fault-injection"))]
 pub mod sim;
+#[cfg(test)]
+pub(crate) mod turso_probe;
 
 pub use dirsync::DirSyncer;
 pub use fault::FaultPoint;
-pub use fs::{write_new_durable, FsEntry, FsMetadata, RealFs, StoreFs, SyncPolicy, WritePoints};
+pub use fs::{create_dir_all_durable, write_new_durable, FsEntry, FsMetadata, RealFs, StoreFs, SyncPolicy, WritePoints};
 pub use lock::{LockHolder, RootLock, RootLockError, LOCK_FILE};
+pub use poison::{poison_global, GlobalPoison};
 #[cfg(any(test, feature = "fault-injection"))]
 pub use sim::SimFs;

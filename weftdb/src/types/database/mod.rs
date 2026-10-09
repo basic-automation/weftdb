@@ -13,7 +13,7 @@ use uuid::Uuid;
 pub use crate::types::database::traits::config::Config;
 use crate::{
 	cache, database::traits::Connection, types::{
-		database::traits::{aspect_structure::AspectStructure, database_structure::DatabaseStructure}, Transaction, TxId
+		database::traits::{aspect_structure::AspectStructure, database_structure::DatabaseStructure}, durable::{fault, FaultPoint}, Transaction, TxId
 	}, Aspect, AspectId, Error, Subject, SubjectId
 };
 
@@ -38,6 +38,7 @@ pub async fn clear_connection_cache_by_name(name: &str) {
 
 pub mod config;
 pub mod connection;
+mod creation;
 pub mod helpers;
 pub mod inputs;
 pub mod navigation;
@@ -369,69 +370,78 @@ impl DatabaseStructure for Database {
 	/// Creates a new database instance. Creates folder /{`data_dir}/{name`}.
 	/// Keeps count of instances of `DB::existing({name`}) and manages read / write access as necessary.
 	///
+	/// Creation is atomic (crash-consistency design, S18): the database is built in a hidden
+	/// `.{name}.creating-{nonce}` directory beside the target, its schema and `database` row
+	/// are committed there, and only then is it renamed to `{name}` and the data directory
+	/// fsynced. An error, or a crash, before that rename leaves no `{name}` folder, so
+	/// retrying `new(name)` works; the build directory of a crashed call is removed by the
+	/// next `new` or [`Database::list_stored_databases`]. Once the rename has happened the
+	/// database is complete, so `existing(name)` opens it, and nothing undoes it (see
+	/// `database/creation.rs`).
+	///
 	/// # Errors
-	/// - if folder /data/{name} already exists.
+	/// - if folder /data/{name} already exists, including when a concurrent `new(name)`
+	///   published it first;
+	/// - if `name` has the form of a build directory (`.{x}.creating-{32 hex digits}`);
+	/// - if the build or the rename fails. The database was then not created;
+	/// - if the data directory cannot be fsynced after the rename, or the published
+	///   database cannot be opened at its final path. It was then created and is complete
+	///   (after a failed fsync its creation may not survive a power loss), and the error
+	///   says to open it with `existing`, since `new(name)` would now report that it
+	///   already exists.
 	async fn new(name: &str) -> Result<Self> {
 		tracing::debug!("Creating new database: {name}");
 		let data_dir = Self::get_data_dir();
 		let db_path = format!("{data_dir}/{name}");
 		tracing::debug!("Database path: {db_path}");
+		let target = Path::new(&db_path);
 
-		// Check if folder already exists
-		if Path::new(&db_path).exists() {
-			bail!("Database folder already exists: {db_path}");
+		// A database under a build directory's name would be swept as crash litter.
+		if target.file_name().and_then(|leaf| leaf.to_str()).is_some_and(creation::is_build_dir_name) {
+			bail!("Database name is reserved for the build folders of Database::new: {name}");
 		}
 
-		// Create the directory
-		std::fs::create_dir_all(&db_path)?;
-		tracing::debug!("Created directory: {db_path}");
+		// Remove the build directories of earlier calls that crashed. Best-effort: a
+		// leftover build directory takes space but never a name.
+		if let Some(parent) = target.parent() {
+			if let Err(e) = creation::sweep_stale_build_dirs(parent).await {
+				tracing::warn!("Could not sweep stale database build directories in {}: {e}", parent.display());
+			}
+		}
+
+		// Check if folder already exists
+		if target.exists() {
+			bail!("Database folder already exists: {db_path}");
+		}
 
 		let db_id = DatabaseId::new();
 		tracing::debug!("Generated database ID: {}", db_id.as_uuid());
 
-		// Use shared connection database
+		// The `database` row records the final path, not the build directory's: aspects
+		// resolve their own paths from it.
 		let metadata_db_path = format!("{db_path}/metadata.db");
-		tracing::debug!("Creating Turso database at: {metadata_db_path}");
-		let metadata_turso_db = Self::create_turso_database(&metadata_db_path).await?;
-		tracing::debug!("Turso database created successfully");
 
-		// For DDL operations (CREATE TABLE), use a direct connection without BEGIN CONCURRENT
-		// DDL operations may not be compatible with MVCC concurrent transactions
-		tracing::debug!("Creating metadata tables...");
-		let schema_conn = metadata_turso_db.connect()?;
-		let transactions = Self::wireframe_metadata_database_direct(&schema_conn).await;
-		let mut transactions = match transactions {
-			Ok(txs) => txs,
-			Err(e) => {
-				tracing::debug!("Failed to create metadata tables: {e}");
-				return Err(anyhow::anyhow!("Failed to create metadata tables: {e}"));
-			}
-		};
-		drop(schema_conn);
-		tracing::debug!("Metadata tables created, {} transactions logged", transactions.len());
-
-		// Now use BEGIN CONCURRENT for data operations (INSERT)
-		let conn = Self::begin_concurrent(&metadata_turso_db, &metadata_db_path, None).await?;
-
-		// Insert database metadata using concurrent-safe transaction pattern
-		tracing::debug!("Inserting database metadata...");
-
-		let exec_res = conn.as_ref().execute("INSERT INTO database (id, name, created_at, metadata_path) VALUES (?, ?, ?, ?)", turso::params![db_id.as_uuid().to_string(), name.to_string(), chrono::Utc::now().timestamp_millis(), metadata_db_path.clone()]).await;
-
-		match exec_res {
-			Ok(_) => tracing::debug!("Database metadata inserted successfully"),
-			Err(e) => {
-				tracing::debug!("Failed to insert database metadata: {e}");
-				Self::rollback_after_error(&conn).await;
-				return Err(anyhow::anyhow!("SQL execution failure 9: `{e}`"));
-			}
+		let mut build = creation::Build::begin(target).await?;
+		tracing::debug!("Building database {name} in {}", build.dir().display());
+		Self::build_metadata_database(&build.dir().join("metadata.db"), db_id, name, &metadata_db_path).await?;
+		fault::hit(FaultPoint::LNewCreated).await?;
+		let published = build.publish().await;
+		// Sweeps may run again from here; the database is no longer under a build name.
+		drop(build);
+		match published {
+			Ok(()) => {}
+			Err(creation::PublishError::NotPublished(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => bail!("Database folder already exists: {db_path}"),
+			Err(creation::PublishError::NotPublished(e)) => return Err(anyhow::anyhow!("Could not publish database {name} at {db_path}: {e}")),
+			// Past the rename, the commit point: the database exists and may already be open
+			// elsewhere, so it stays, and a retried `new` would only report that it exists.
+			Err(creation::PublishError::NotDurable(e)) => return Err(anyhow::anyhow!("Database {name} was created at {db_path}, but the data directory could not be synced afterwards, so its creation may not survive a power loss; it is complete: open it with Database::existing: {e}")),
 		}
+		tracing::debug!("Published database {name} at {db_path}");
 
-		Self::commit_concurrent(&conn).await?;
-
-		drop(conn);
-
-		transactions.push(Transaction::new(None, "Insert database metadata".to_string()));
+		// Open it at its final path: a cold open, exactly as `existing` does. The database
+		// exists from here on, so an error must say so: a retried `new` would only report
+		// that it already exists.
+		let metadata_turso_db = Self::get_turso_database(&metadata_db_path).await.map_err(|e| anyhow::anyhow!("Database {name} was created at {db_path} but could not be opened; open it with Database::existing: {e}"))?;
 
 		let mut db_info = DatabaseInfo::new(name.to_string(), db_path);
 		db_info.set_metadata(Some(metadata_turso_db.clone()));
@@ -439,12 +449,12 @@ impl DatabaseStructure for Database {
 
 		let db = Self { id: db_id, name: name.to_string(), metadata: metadata_turso_db, metadata_path: metadata_db_path, cache: Arc::new(Mutex::new(cache::DatabaseCache::new())) };
 
-		for transaction in transactions {
-			let () = db.log_transaction(&transaction).await?;
+		// Fold the build's log into the database file. Best-effort, as after every commit:
+		// the schema and the `database` row are durable once committed (the commit fsyncs
+		// the log), and failing here would hand back an error for a database that exists.
+		if let Err(e) = Self::checkpoint_wal_passive(&db.metadata).await {
+			tracing::debug!("Failed to checkpoint the new database {name}; it is created and committed: {e}");
 		}
-
-		// Checkpoint metadata WAL to ensure schema and initial data are persisted
-		Self::checkpoint_wal_passive(&db.metadata).await?;
 
 		Ok(db)
 	}
@@ -1071,52 +1081,17 @@ impl DatabaseStructure for Database {
 	}
 
 	async fn get_earliest_measurement(&self, aspect_id: &AspectId) -> Result<Option<DateTime<Utc>>> {
-		let cache_key = format!("metadata_earliest_measurement_{}", aspect_id.as_uuid());
+		let cache_key = Self::earliest_measurement_cache_key(aspect_id);
 		self.cache.lock().await.cleanup_expired().await;
 		if let Some(cached) = self.cache.lock().await.get(&cache_key).await {
 			return Ok(Some(cached));
 		}
 
-		let db = self.get_measurement_db(aspect_id).await?;
-		let db_path = self.get_measurement_db_path(aspect_id).await?;
-		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
-		let res = conn.as_ref().query("SELECT MIN(timestamp) FROM measurements", turso::params![]).await;
-
-		let timestamp = match res {
-			Ok(mut rows) => {
-				if let Some(row) = rows.next().await? {
-					// Check if the value is null (empty table)
-					let value = row.get_value(0)?;
-					if matches!(value, turso::Value::Null) {
-						None
-					} else {
-						let timestamp_str = Self::value_to_string(&value, "Earliest Measurement Timestamp").await?;
-						if timestamp_str.is_empty() {
-							return Ok(None);
-						}
-						// Parse as milliseconds (i64) instead of RFC3339
-						let timestamp_millis: i64 = timestamp_str.parse().map_err(|e| anyhow::anyhow!("Invalid timestamp format: {e}"))?;
-						let timestamp = DateTime::from_timestamp_millis(timestamp_millis).ok_or_else(|| anyhow::anyhow!("Invalid timestamp"))?;
-						Some(timestamp)
-					}
-				} else {
-					None
-				}
-			}
-			Err(e) => {
-				let _ = Self::rollback_concurrent(&conn).await;
-				return Err(anyhow::anyhow!("SQL execution failure 18: in get_earliest_measurement: `{e}`"));
-			}
-		};
-
-		Self::commit_concurrent(&conn).await?;
-
-		if let Some(ts) = timestamp {
+		let earliest = self.get_earliest_measurement_uncached(aspect_id).await?;
+		if let Some(ts) = earliest {
 			self.cache.lock().await.store(&cache_key, ts).await;
-			Ok(Some(ts))
-		} else {
-			Ok(None)
 		}
+		Ok(earliest)
 	}
 
 	async fn get_latest_measurement(&self, aspect_id: &AspectId) -> Result<Option<DateTime<Utc>>> {
@@ -1465,6 +1440,73 @@ impl DatabaseStructure for Database {
 }
 
 impl Database {
+	/// The cache key of an aspect's earliest measurement timestamp.
+	fn earliest_measurement_cache_key(aspect_id: &AspectId) -> String {
+		format!("metadata_earliest_measurement_{}", aspect_id.as_uuid())
+	}
+
+	/// Forget the cached earliest measurement of `aspect_id`, after rows were committed
+	/// that may be earlier (crash-consistency design, S18).
+	///
+	/// The cache belongs to this `Database` (and its clones): another instance, such as
+	/// the one a weft-tui action or another pipeline opened, keeps its own copy, which
+	/// this does not reach, for up to its lifetime of 10 minutes. The queue consumer does
+	/// not rely on it: it reads the earliest measurement with
+	/// [`get_earliest_measurement_uncached`](Self::get_earliest_measurement_uncached).
+	pub(crate) async fn forget_cached_earliest_measurement(&self, aspect_id: &AspectId) {
+		self.cache.lock().await.invalidate(&Self::earliest_measurement_cache_key(aspect_id)).await;
+	}
+
+	/// The earliest stored measurement of `aspect_id`, read from the rows (one `MIN`
+	/// query), bypassing and leaving untouched the cache that
+	/// [`get_earliest_measurement`](DatabaseStructure::get_earliest_measurement) reads.
+	///
+	/// The queue consumer aligns its windows on this value (crash-consistency design,
+	/// S18). A stale one, cached before a backfill committed rows earlier than it (by this
+	/// or another `Database` instance, which each cache on their own), put the backfill's
+	/// timestamps before the consumer's base, where they have no window, and the consumer
+	/// cleared them from the queue: the backfilled rows were never batched.
+	///
+	/// # Errors
+	///
+	/// If the aspect's measurement database cannot be opened or queried.
+	pub async fn get_earliest_measurement_uncached(&self, aspect_id: &AspectId) -> Result<Option<DateTime<Utc>>> {
+		let db = self.get_measurement_db(aspect_id).await?;
+		let db_path = self.get_measurement_db_path(aspect_id).await?;
+		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		let res = conn.as_ref().query("SELECT MIN(timestamp) FROM measurements", turso::params![]).await;
+
+		let timestamp = match res {
+			Ok(mut rows) => {
+				if let Some(row) = rows.next().await? {
+					// Check if the value is null (empty table)
+					let value = row.get_value(0)?;
+					if matches!(value, turso::Value::Null) {
+						None
+					} else {
+						let timestamp_str = Self::value_to_string(&value, "Earliest Measurement Timestamp").await?;
+						if timestamp_str.is_empty() {
+							return Ok(None);
+						}
+						// Parse as milliseconds (i64) instead of RFC3339
+						let timestamp_millis: i64 = timestamp_str.parse().map_err(|e| anyhow::anyhow!("Invalid timestamp format: {e}"))?;
+						let timestamp = DateTime::from_timestamp_millis(timestamp_millis).ok_or_else(|| anyhow::anyhow!("Invalid timestamp"))?;
+						Some(timestamp)
+					}
+				} else {
+					None
+				}
+			}
+			Err(e) => {
+				let _ = Self::rollback_concurrent(&conn).await;
+				return Err(anyhow::anyhow!("SQL execution failure 18: in get_earliest_measurement: `{e}`"));
+			}
+		};
+
+		Self::commit_concurrent(&conn).await?;
+		Ok(timestamp)
+	}
+
 	/// DDL-safe version that uses a direct `turso::Connection` for schema creation
 	/// DDL operations (CREATE TABLE) may not work well with BEGIN CONCURRENT transactions
 	/// Note: Tables have no indexes to support MVCC (turso MVCC doesn't support indexes yet)
@@ -1553,6 +1595,46 @@ impl Database {
 
 		Ok(vec![Transaction::new(None, "Create transactions table".to_string()), Transaction::new(None, "Create database table".to_string()), Transaction::new(None, "Create subjects table".to_string()), Transaction::new(None, "Create aspects table".to_string()), Transaction::new(None, "Create unbatched_measurements table".to_string())])
 	}
+
+	/// Build a new database's `metadata.db` at `path` (inside its build directory): run
+	/// the DDL, then commit the `database` row, recording `metadata_path` (the final path),
+	/// together with the audit rows for the DDL and the insert.
+	///
+	/// The Turso database is opened directly, not through the connection cache, and every
+	/// handle is dropped before this returns, so the build directory can be renamed (Windows
+	/// refuses to rename a directory with open files) and the database is next opened, cold,
+	/// at its final path.
+	async fn build_metadata_database(path: &Path, db_id: DatabaseId, name: &str, metadata_path: &str) -> Result<()> {
+		let path = path.to_str().ok_or_else(|| anyhow::anyhow!("database path {} is not UTF-8", path.display()))?;
+		tracing::debug!("Creating Turso database at: {path}");
+		let turso_db = Builder::new_local(path).build().await?;
+		Self::configure_database_for_mvcc(&turso_db).await?;
+
+		// For DDL operations (CREATE TABLE), use a direct connection without BEGIN CONCURRENT
+		// DDL operations may not be compatible with MVCC concurrent transactions
+		let schema_conn = turso_db.connect()?;
+		let mut transactions = Self::wireframe_metadata_database_direct(&schema_conn).await.map_err(|e| anyhow::anyhow!("Failed to create metadata tables: {e}"))?;
+		drop(schema_conn);
+		transactions.push(Transaction::new(None, "Insert database metadata".to_string()));
+
+		// Now use BEGIN CONCURRENT for data operations (INSERT)
+		let conn = Self::begin_concurrent(&turso_db, path, None).await?;
+		let mut written = conn.as_ref().execute("INSERT INTO database (id, name, created_at, metadata_path) VALUES (?, ?, ?, ?)", turso::params![db_id.as_uuid().to_string(), name.to_string(), chrono::Utc::now().timestamp_millis(), metadata_path.to_string()]).await.map(drop);
+		for transaction in &transactions {
+			if written.is_err() {
+				break;
+			}
+			written = conn.as_ref().execute("INSERT INTO transactions (id, message, created_at) VALUES (?, ?, ?)", turso::params![transaction.id().as_uuid().to_string(), transaction.message().to_string(), transaction.created_at().timestamp_millis()]).await.map(drop);
+		}
+		if let Err(e) = written {
+			Self::rollback_after_error(&conn).await;
+			return Err(anyhow::anyhow!("SQL execution failure 9: `{e}`"));
+		}
+		Self::commit_concurrent(&conn).await?;
+		drop(conn);
+		drop(turso_db);
+		Ok(())
+	}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1585,6 +1667,22 @@ impl Default for DatabaseId {
 	fn default() -> Self {
 		Self::new()
 	}
+}
+
+/// One entry of an aspect's unbatched-measurements queue, as a queue consumer read it.
+///
+/// `queued_at` is part of the entry's identity: enqueuing a timestamp that is already
+/// queued moves its `queued_at` strictly forward, and
+/// [`dequeue_unbatched_entries`](traits::Inputs::dequeue_unbatched_entries) removes an
+/// entry only while it still has the `queued_at` it was read with. So a timestamp queued
+/// again after a consumer read it, such as by ingest once the timestamp's row is
+/// committed, stays queued for the consumer's next run (crash-consistency design, S18).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UnbatchedEntry {
+	/// The measurement timestamp the entry queues.
+	pub data_timestamp: DateTime<Utc>,
+	/// When the timestamp was (last) queued, in Unix milliseconds; see the type docs.
+	pub queued_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

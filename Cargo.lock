@@ -5084,6 +5084,7 @@ dependencies = [
  "chrono",
  "futures",
  "indexmap",
+ "libc",
  "num_cpus",
  "rand 0.10.3",
  "rayon",
@@ -5092,6 +5093,7 @@ dependencies = [
  "serial_test",
  "splimes",
  "sysinfo",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -5127,6 +5129,7 @@ name = "weft-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "bigdecimal",
  "chrono",

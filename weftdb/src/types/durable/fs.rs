@@ -135,11 +135,18 @@ pub trait StoreFs: Send + Sync + fmt::Debug {
 	/// `AlreadyExists` if `dst` exists, or any other link error.
 	async fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()>;
 
-	/// Atomically rename `from` to `to`, replacing `to` if it is a file.
+	/// Atomically rename `from` to `to`, replacing `to` if it is a file. `from` may be a
+	/// directory, which takes its whole subtree with it: that is how a backup is
+	/// published from its `.partial-*` build directory, and how a pruned one is retired
+	/// to `.deleting-*` before its files go (design section 9). The rename is durable
+	/// only once the directory holding `to` (and, across directories, `from`) is
+	/// synced.
 	///
 	/// # Errors
 	///
-	/// Any rename error.
+	/// Any rename error. Renaming a directory onto an existing directory is refused by
+	/// the OS unless that directory is empty (and on Windows even then); callers check
+	/// that the target is free first.
 	async fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
 
 	/// Remove the file at `path`. A missing file counts as success, so that the
@@ -150,6 +157,40 @@ pub trait StoreFs: Send + Sync + fmt::Debug {
 	///
 	/// Any removal error other than `NotFound`.
 	async fn remove_file(&self, path: &Path) -> io::Result<()>;
+
+	/// Create the directory `path`, whose parent must exist. Like a file create, the
+	/// new entry is durable only once the parent directory is synced.
+	///
+	/// # Errors
+	///
+	/// `AlreadyExists` if anything is at `path`, `NotFound` if its parent is missing,
+	/// or any other create error.
+	async fn create_dir(&self, path: &Path) -> io::Result<()>;
+
+	/// Remove the directory `path` and everything under it. A missing directory counts
+	/// as success, so a sweep can replay a removal a crash interrupted.
+	///
+	/// This is many operations, not one: a crash part-way leaves the directory with
+	/// some of its entries gone, and even a completed removal is durable only once the
+	/// parent is synced. So a directory whose half-removed state must never be
+	/// mistaken for a valid one (a pruned backup) is first renamed to a name nothing
+	/// reads, with the parent synced, and only then removed (design section 9).
+	///
+	/// # Errors
+	///
+	/// Any error other than `NotFound` listing or removing an entry, including
+	/// `path` being a file.
+	async fn remove_dir_all(&self, path: &Path) -> io::Result<()>;
+
+	/// Copy the file `src` to `dst`, which must not exist (`O_CREAT | O_EXCL`), and,
+	/// under [`SyncPolicy::Full`], `sync_all` the copy through the handle that wrote
+	/// it before returning its length. A restore copies each snapshot this way.
+	///
+	/// # Errors
+	///
+	/// `AlreadyExists` if `dst` exists, which is left untouched. On any other error no
+	/// file is left at `dst`, as for [`create_new_write`](Self::create_new_write).
+	async fn copy_new(&self, src: &Path, dst: &Path, policy: SyncPolicy) -> io::Result<u64>;
 
 	/// List the entries of `dir`, sorted by name so that recovery is deterministic.
 	///
@@ -217,6 +258,21 @@ impl StoreFs for RealFs {
 		blocking(move || remove_file_blocking(&path)).await
 	}
 
+	async fn create_dir(&self, path: &Path) -> io::Result<()> {
+		let path = path.to_path_buf();
+		blocking(move || std::fs::create_dir(&path)).await
+	}
+
+	async fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+		let path = path.to_path_buf();
+		blocking(move || remove_dir_all_blocking(&path)).await
+	}
+
+	async fn copy_new(&self, src: &Path, dst: &Path, policy: SyncPolicy) -> io::Result<u64> {
+		let (src, dst) = (src.to_path_buf(), dst.to_path_buf());
+		blocking(move || copy_new_blocking(&src, &dst, policy)).await
+	}
+
 	async fn read_dir(&self, dir: &Path) -> io::Result<Vec<FsEntry>> {
 		let dir = dir.to_path_buf();
 		blocking(move || read_dir_blocking(&dir)).await
@@ -277,12 +333,12 @@ fn sync_file_blocking(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn sync_dir_blocking(dir: &Path) -> io::Result<()> {
+pub(crate) fn sync_dir_blocking(dir: &Path) -> io::Result<()> {
 	std::fs::File::open(dir)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn sync_dir_blocking(dir: &Path) -> io::Result<()> {
+pub(crate) fn sync_dir_blocking(dir: &Path) -> io::Result<()> {
 	use std::sync::atomic::{AtomicBool, Ordering};
 
 	static WARNED: AtomicBool = AtomicBool::new(false);
@@ -299,6 +355,26 @@ pub(super) fn remove_file_blocking(path: &Path) -> io::Result<()> {
 	}
 }
 
+fn remove_dir_all_blocking(path: &Path) -> io::Result<()> {
+	match std::fs::remove_dir_all(path) {
+		Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+		other => other,
+	}
+}
+
+/// `create_new` at `dst`, stream `src` into it and, under `Full`, `sync_all` it through
+/// the same handle, removing the copy again if any step after the create fails.
+fn copy_new_blocking(src: &Path, dst: &Path, policy: SyncPolicy) -> io::Result<u64> {
+	let mut source = File::open(src)?;
+	let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(dst)?;
+	let copied = io::copy(&mut source, &mut file).and_then(|len| if policy == SyncPolicy::Full { file.sync_all().map(|()| len) } else { Ok(len) });
+	if let Err(e) = &copied {
+		drop(file);
+		discard_own_file(dst, e);
+	}
+	copied
+}
+
 pub(super) fn read_dir_blocking(dir: &Path) -> io::Result<Vec<FsEntry>> {
 	let mut entries = Vec::new();
 	for entry in std::fs::read_dir(dir)? {
@@ -312,6 +388,48 @@ pub(super) fn read_dir_blocking(dir: &Path) -> io::Result<Vec<FsEntry>> {
 pub(super) fn metadata_blocking(path: &Path) -> io::Result<FsMetadata> {
 	let meta = std::fs::metadata(path)?;
 	Ok(FsMetadata { len: meta.len(), is_dir: meta.is_dir() })
+}
+
+/// Create `dir` and any missing ancestors, fsyncing the parent of each one created.
+///
+/// So the whole chain survives power loss, and a file later published inside `dir` is
+/// not lost with a directory entry that never reached the disk. A directory that
+/// already exists is taken as durable.
+///
+/// # Errors
+///
+/// `NotADirectory` if a file is in the way, or any stat, create or sync error. A
+/// directory a concurrent caller creates first is not an error.
+pub async fn create_dir_all_durable<F>(fs: &F, dir: &Path) -> io::Result<()>
+where
+	F: StoreFs + ?Sized,
+{
+	let mut missing = Vec::new();
+	let mut cursor = dir;
+	loop {
+		match fs.metadata(cursor).await {
+			Ok(meta) if meta.is_dir => break,
+			Ok(_) => return Err(io::Error::new(io::ErrorKind::NotADirectory, format!("{} is not a directory", cursor.display()))),
+			Err(e) if e.kind() == io::ErrorKind::NotFound => {
+				missing.push(cursor);
+				match cursor.parent() {
+					Some(parent) if !parent.as_os_str().is_empty() => cursor = parent,
+					_ => break,
+				}
+			}
+			Err(e) => return Err(e),
+		}
+	}
+	for created in missing.into_iter().rev() {
+		match fs.create_dir(created).await {
+			Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
+			_ => {}
+		}
+		if let Some(parent) = created.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+			fs.sync_dir(parent).await?;
+		}
+	}
+	Ok(())
 }
 
 /// Write a complete frame under a new final name and return its CRC trailer.
@@ -417,10 +535,15 @@ mod tests {
 
 	/// An error between the write and the fsync takes the same path as an fsync error
 	/// (the fsync is the next step on the same handle), so this covers both.
+	///
+	/// The point is one no store path ever reaches (no legacy ingest has 2^32 chunks): an
+	/// armed point is process-global, and arming one a store path passes, such as
+	/// `S-frame-written`, which every seal passes, would fail a seal running in another
+	/// test at the same moment.
 	#[tokio::test]
 	async fn write_new_durable_leaves_no_file_when_a_step_after_the_create_fails() {
 		let dir = tempfile::tempdir().unwrap();
-		let point = FaultPoint::SFrameWritten;
+		let point = FaultPoint::LChunk(u32::MAX);
 		let points = WritePoints { written: Some(point), ..WritePoints::NONE };
 		let armed = arm(point, FaultAction::ReturnErr);
 		let err = write_new_durable(&RealFs, dir.path(), "a~g1~p1.weftseg", frame(b"body"), SyncPolicy::Full, points).await.unwrap_err();
@@ -493,5 +616,28 @@ mod tests {
 		RealFs.remove_file(&root.join("c")).await.unwrap();
 		RealFs.remove_file(&root.join("c")).await.unwrap();
 		assert!(!root.join("c").exists(), "removing a missing file is a success, so a removal can be replayed");
+
+		RealFs.create_dir(&root.join("d")).await.unwrap();
+		assert_eq!(RealFs.create_dir(&root.join("d")).await.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+		assert_eq!(RealFs.copy_new(&root.join("a"), &root.join("d/a"), SyncPolicy::Full).await.unwrap(), 3);
+		assert_eq!(RealFs.copy_new(&root.join("a"), &root.join("d/a"), SyncPolicy::Full).await.unwrap_err().kind(), io::ErrorKind::AlreadyExists, "a copy never clobbers");
+		assert_eq!(RealFs.copy_new(&root.join("missing"), &root.join("d/b"), SyncPolicy::Full).await.unwrap_err().kind(), io::ErrorKind::NotFound);
+		assert!(!root.join("d/b").exists(), "a copy that cannot read its source creates nothing");
+		RealFs.rename(&root.join("d"), &root.join("e")).await.unwrap();
+		assert_eq!(std::fs::read(root.join("e/a")).unwrap(), b"bee", "a directory rename carries its contents");
+		RealFs.remove_dir_all(&root.join("e")).await.unwrap();
+		RealFs.remove_dir_all(&root.join("e")).await.unwrap();
+		assert!(!root.join("e").exists(), "removing a missing directory is a success, so a sweep can be replayed");
+	}
+
+	#[tokio::test]
+	async fn create_dir_all_durable_creates_every_missing_ancestor() {
+		let dir = tempfile::tempdir().unwrap();
+		let deep = dir.path().join("a/b/c");
+		create_dir_all_durable(&RealFs, &deep).await.unwrap();
+		assert!(deep.is_dir());
+		create_dir_all_durable(&RealFs, &deep).await.expect("an existing directory is fine");
+		std::fs::write(dir.path().join("file"), b"x").unwrap();
+		assert_eq!(create_dir_all_durable(&RealFs, &dir.path().join("file/sub")).await.unwrap_err().kind(), io::ErrorKind::NotADirectory);
 	}
 }

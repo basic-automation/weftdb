@@ -19,6 +19,14 @@ publish = false
 # takes effect. Off by default and pending patent review (ROADMAP.md, Phase 6.1); without it
 # the variable is ignored with a warning.
 bitsliced-codec = ["weftdb/bitsliced-codec"]
+# Lets the `/ready` poison test write-poison a real store, and the maintenance-busy test
+# hold a real aspect's maintenance lock, through weftdb's `fault-injection` hooks. A
+# feature rather than a dev-dependency feature, as in
+# weft-orchestration: Cargo unifies features across a workspace build, so a dev-dependency
+# enabling it would compile the fault points into every crate's tests in
+# `cargo test --workspace`, and weftdb's check that production builds keep them inert
+# (tests/durable_fault_disabled.rs) would compile to nothing.
+fault-injection = ["weftdb/fault-injection"]
 
 [lib]
 name = "weft_server"
@@ -50,7 +58,23 @@ opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 
+# Run with `cargo test -p weft-server --features fault-injection --test ready_poisoned`.
+[[test]]
+name = "ready_poisoned"
+required-features = ["fault-injection"]
+
+# Run with `cargo test -p weft-server --features fault-injection --test maintenance_busy`.
+[[test]]
+name = "maintenance_busy"
+required-features = ["fault-injection"]
+
+# Run with `cargo test -p weft-server --features fault-injection --test poison_exit`.
+[[test]]
+name = "poison_exit"
+required-features = ["fault-injection"]
+
 [dev-dependencies]
+async-trait = { workspace = true }  # a StoreFs test double whose cleanup fails
 tower = { workspace = true, features = ["util"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util", "macros"] }

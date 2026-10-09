@@ -41,6 +41,9 @@ pub mod metrics;
 pub mod reconcile_daemon;
 pub mod state;
 pub mod storage;
+pub mod store_open;
+#[cfg(test)]
+mod test_fs;
 pub mod trace;
 
 use axum::{
@@ -83,6 +86,7 @@ impl Default for HealthResponse {
 
 /// Response body for the readiness probe (`GET /ready`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[allow(clippy::struct_excessive_bools, reason = "a probe body is a set of independent flags that orchestrators and operators read by name")]
 pub struct ReadyResponse {
 	/// `true` once the service can accept traffic. The stateless API is always
 	/// ready; this gains further dependency checks as more of the control plane is
@@ -95,11 +99,30 @@ pub struct ReadyResponse {
 	/// Whether a segment store is configured — i.e. the storage-query endpoints
 	/// (`/api/v1/storage/...`) are live rather than answering `503`.
 	pub segment_store: bool,
+	/// Whether the segment store is write-poisoned: a control-plane COMMIT failed in a
+	/// way that may still have committed (not a conflict found while validating it), and
+	/// the store refuses every write until the server restarts. Reads keep working, so
+	/// `ready` stays `true`.
+	pub poisoned: bool,
+	/// Whether the server must be restarted to accept writes again. The restart's open
+	/// replays the control plane's log, which settles the ambiguous commit.
+	pub restart_required: bool,
+	/// Why the store is poisoned, while it is.
+	pub poison_reason: Option<String>,
 }
 
 impl Default for ReadyResponse {
 	fn default() -> Self {
-		Self { ready: true, service: SERVICE, version: VERSION, segment_store: false }
+		Self { ready: true, service: SERVICE, version: VERSION, segment_store: false, poisoned: false, restart_required: false, poison_reason: None }
+	}
+}
+
+impl ReadyResponse {
+	/// This response with the store's write poison, if it has one, reported.
+	#[must_use]
+	pub fn with_poison(self, poison: Option<weftdb::Poisoned>) -> Self {
+		let poisoned = poison.is_some();
+		Self { poisoned, restart_required: poisoned, poison_reason: poison.map(|p| p.reason), ..self }
 	}
 }
 
@@ -135,9 +158,10 @@ async fn health() -> Json<HealthResponse> {
 
 /// Readiness probe: the service is ready to accept traffic. Reports whether a
 /// segment store is configured so an operator can confirm the storage endpoints
-/// are live.
+/// are live, and whether that store is write-poisoned and needs a restart.
 async fn ready(axum::extract::State(state): axum::extract::State<AppState>) -> Json<ReadyResponse> {
-	Json(ReadyResponse { segment_store: state.store().is_some(), ..ReadyResponse::default() })
+	let poison = state.store().and_then(|store| store.poisoned());
+	Json(ReadyResponse { segment_store: state.store().is_some(), ..ReadyResponse::default() }.with_poison(poison))
 }
 
 #[cfg(test)]
@@ -175,6 +199,24 @@ mod tests {
 		assert_eq!(body["version"], VERSION);
 		// The default router has no segment store, so the storage endpoints are off.
 		assert_eq!(body["segment_store"], false);
+		// No store, so nothing to poison.
+		assert_eq!(body["poisoned"], false);
+		assert_eq!(body["restart_required"], false);
+		assert_eq!(body["poison_reason"], serde_json::Value::Null);
+	}
+
+	/// A poisoned store is reported as poisoned and needing a restart, with the reason,
+	/// and the service stays ready: reads keep working.
+	#[test]
+	fn ready_reports_a_poisoned_store() {
+		let reason = "segment_index transaction failed with an ambiguous COMMIT: COMMIT: I/O error (Other): sync".to_string();
+		let ready = ReadyResponse { segment_store: true, ..ReadyResponse::default() }.with_poison(Some(weftdb::Poisoned { reason: reason.clone() }));
+		let body = serde_json::to_value(&ready).unwrap();
+		assert_eq!(body["ready"], true);
+		assert_eq!(body["poisoned"], true);
+		assert_eq!(body["restart_required"], true);
+		assert_eq!(body["poison_reason"], reason);
+		assert_eq!(ReadyResponse::default().with_poison(None), ReadyResponse::default(), "no poison changes nothing");
 	}
 
 	#[tokio::test]
@@ -194,6 +236,10 @@ mod tests {
 		let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 		// With a store attached, readiness advertises the storage endpoints as live.
 		assert_eq!(body["segment_store"], true);
+		// A freshly opened store is not poisoned.
+		assert_eq!(body["poisoned"], false);
+		assert_eq!(body["restart_required"], false);
+		assert_eq!(body["poison_reason"], serde_json::Value::Null);
 	}
 
 	#[tokio::test]

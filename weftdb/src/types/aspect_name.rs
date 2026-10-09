@@ -44,10 +44,14 @@
 //! Names that differ only in letter case or in Unicode normalisation (`price` and
 //! `PRICE`, or the NFC and NFD spellings of `é`) are distinct aspects but are not
 //! rejected, although a case-insensitive filesystem (NTFS, APFS by default) or one that
-//! normalises names (HFS+) stores their frames under one file name. That is a collision
-//! between two aspects inside `segments/`, not a way out of it; the encoded frame names
-//! of the crash-consistency design (`docs/design/crash-consistency.md` §4, slice S10)
-//! are what remove it.
+//! normalises names (HFS+) stores their legacy `<aspect>-<id>` frames under one file
+//! name. That is a collision between two aspects inside `segments/`, not a way out of it.
+//! The write-once frame names of the crash-consistency design
+//! (`docs/design/crash-consistency.md` §4) remove it: they carry the aspect through
+//! [`encode`], which keeps only `[a-z0-9_]` literal and escapes every other byte as `%XX`
+//! in uppercase hex, so two names that differ in case or normalisation encode to file
+//! names that differ under case folding and normalisation too. Maintenance outputs take
+//! these names from slice S8 on; seals from S10.
 
 use std::fmt;
 
@@ -160,6 +164,69 @@ impl std::error::Error for InvalidAspectName {}
 /// An [`InvalidAspectName`] naming the first rule `name` breaks.
 pub fn validate(name: &str) -> Result<(), InvalidAspectName> {
 	reason(name, cfg!(windows)).map_or(Ok(()), |reason| Err(InvalidAspectName { name: name.to_string(), reason }))
+}
+
+/// Whether `byte` stands for itself in [`encode`]'s output: `[a-z0-9_]`.
+const fn is_literal(byte: u8) -> bool {
+	byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+}
+
+/// The uppercase hex digits [`encode`] escapes with.
+const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+/// The file-name form of an aspect name (crash-consistency design §4, `enc`): the bytes
+/// `[a-z0-9_]` as they are, and every other byte (uppercase letters, `-`, `.`, `/`, `~`,
+/// `%`, every non-ASCII byte) as `%XX` in uppercase hex.
+///
+/// The result is plain ASCII with no `/`, `\`, `.`, `-`, `~` or `:`, so it can never
+/// leave the directory it is joined onto, and it never contains the `-{digits}` of a
+/// legacy `{aspect}-{id}` frame name or the `~` that separates the fields of a
+/// write-once one. The mapping is injective, and stays so under case folding (a literal
+/// is always lowercase, an escape's digits always uppercase, and `%` is never a literal)
+/// and under Unicode normalisation (every non-ASCII byte is escaped). [`decode`] inverts
+/// it.
+#[must_use]
+pub fn encode(name: &str) -> String {
+	let mut out = String::with_capacity(name.len());
+	for &byte in name.as_bytes() {
+		if is_literal(byte) {
+			out.push(char::from(byte));
+		} else {
+			out.push('%');
+			out.push(char::from(HEX[usize::from(byte >> 4)]));
+			out.push(char::from(HEX[usize::from(byte & 0x0F)]));
+		}
+	}
+	out
+}
+
+/// The aspect name [`encode`] turned into `encoded`, or `None` when no name encodes to
+/// exactly it: a byte that is neither a literal nor the start of an escape, an escape
+/// that is not two uppercase hex digits, an escape of a byte that `encode` writes as a
+/// literal (so `decode(&encode(n)) == Some(n)` and `encode` of a decoded name gives the
+/// input back), or bytes that are not UTF-8.
+#[must_use]
+pub fn decode(encoded: &str) -> Option<String> {
+	let hex = |digit: u8| HEX.iter().position(|&h| h == digit).and_then(|value| u8::try_from(value).ok());
+	let bytes = encoded.as_bytes();
+	let mut out = Vec::with_capacity(bytes.len());
+	let mut at = 0;
+	while let Some(&byte) = bytes.get(at) {
+		if is_literal(byte) {
+			out.push(byte);
+			at += 1;
+		} else if byte == b'%' {
+			let value = hex(*bytes.get(at + 1)?)? << 4 | hex(*bytes.get(at + 2)?)?;
+			if is_literal(value) {
+				return None;
+			}
+			out.push(value);
+			at += 3;
+		} else {
+			return None;
+		}
+	}
+	String::from_utf8(out).ok()
 }
 
 /// True for a character that changes how a name displays without being visible itself:
@@ -305,6 +372,56 @@ mod tests {
 		let message = validate(&"y".repeat(100_000)).unwrap_err().to_string();
 		assert!(message.len() < 200, "the message quotes a bounded prefix: {message}");
 		assert!(message.contains('…'));
+	}
+
+	#[test]
+	fn encode_keeps_lowercase_digits_and_underscore_and_escapes_every_other_byte() {
+		assert_eq!(encode("price_1"), "price_1");
+		assert_eq!(encode("Room-A.temp"), "%52oom%2D%41%2Etemp");
+		assert_eq!(encode("a~b%c/d\\e:f g"), "a%7Eb%25c%2Fd%5Ce%3Af%20g");
+		assert_eq!(encode("é"), "%C3%A9", "every byte of a non-ASCII character is escaped");
+		assert_eq!(encode(""), "");
+		for name in ["price", "Room-A.temp", "温度", "job:rate5m", "a~g1~p2", "%41", "MiXeD_case-1", "e\u{301}"] {
+			let encoded = encode(name);
+			assert!(encoded.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'%' || (b'A'..=b'F').contains(&b)), "{name:?} encodes to {encoded:?}");
+			assert_eq!(decode(&encoded).as_deref(), Some(name), "{name:?} round-trips");
+		}
+	}
+
+	/// Only `encode`'s exact output decodes, so no two spellings name one aspect.
+	#[test]
+	fn decode_accepts_only_canonical_encodings() {
+		for bad in ["%61", "%2d", "%2", "%", "%G0", "A", "a-b", "a.b", "a~b", "%FF", "%C3"] {
+			assert_eq!(decode(bad), None, "{bad:?}");
+		}
+		assert_eq!(decode("%2D").as_deref(), Some("-"));
+	}
+
+	/// The point of the escaping (crash-consistency design §4): names that differ only in
+	/// case or in Unicode normalisation encode to names that still differ once a
+	/// filesystem folds case, and the encoding is injective over a sample of awkward names.
+	#[test]
+	fn encode_is_injective_even_under_case_folding() {
+		let names = ["price", "PRICE", "Price", "pRICE", "é", "e\u{301}", "É", "a-b", "a_b", "a.b", "a%2Db", "a%2db", "A%2Db", "x", "X", "%58", "_", "-", "a b", "a  b", "温度", "溫度"];
+		let mut folded = std::collections::BTreeMap::new();
+		for name in names {
+			let encoded = encode(name);
+			if let Some(other) = folded.insert(encoded.to_lowercase(), name) {
+				panic!("{other:?} and {name:?} collide once case is folded: {encoded:?}");
+			}
+		}
+		// Every byte string up to two bytes long that is UTF-8.
+		let mut seen = std::collections::BTreeMap::new();
+		for first in 0..=u8::MAX {
+			for second in [None, Some(b'a'), Some(b'A'), Some(b'%'), Some(0x80)] {
+				let bytes: Vec<u8> = std::iter::once(first).chain(second).collect();
+				let Ok(name) = String::from_utf8(bytes) else { continue };
+				let encoded = encode(&name).to_lowercase();
+				if let Some(other) = seen.insert(encoded.clone(), name.clone()) {
+					panic!("{other:?} and {name:?} both encode to {encoded:?} under case folding");
+				}
+			}
+		}
 	}
 
 	#[test]

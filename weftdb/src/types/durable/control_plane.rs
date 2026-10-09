@@ -1,0 +1,382 @@
+//! Open-time proof that a control-plane database commits the way the durability
+//! promise assumes (docs/design/crash-consistency.md sections 1.3 and 5.5, OPEN step 2).
+//!
+//! Every control-plane write is a `BEGIN CONCURRENT` transaction, and a COMMIT counts
+//! as durable because, under MVCC with `synchronous=FULL`, Turso fsyncs the logical
+//! log before COMMIT returns. Neither is guaranteed by asking for it:
+//!
+//! - the switch to MVCC can fail, for example on a file another handle in this process
+//!   holds in multiprocess-WAL mode. The stores used to discard that error with
+//!   `.ok()` and carry on in WAL mode. (The switch always looked like a failure to
+//!   `execute` anyway, because it answers with a row.)
+//! - `synchronous` is per connection, and every write path opens a fresh one. Turso
+//!   defaults a new connection to FULL today; nothing else makes it so.
+//!
+//! So each store's open switches to MVCC, then reads both settings back and refuses to
+//! open on anything else.
+//!
+//! **The switch's header** (design section 1.3, closed by S6). `PRAGMA
+//! journal_mode=experimental_mvcc` writes page 1 with the MVCC header straight into the
+//! DB file and does not fsync it; COMMITs then fsync only the `-log`. A power cut before
+//! anything else syncs the DB file can leave a header that still reads WAL beside a
+//! `-log` of acknowledged commits, and Turso refuses to open that pair. Measured with a
+//! recording I/O backend (`turso_probe`), Turso 0.8.1 does sync the DB file during the
+//! switch of a database that never ran MVCC (its MVCC metadata bootstrap backfills a
+//! new table through a checkpoint), but not the switch of one that already carries
+//! Turso's MVCC metadata, such as a database switched back to WAL. So every open has
+//! Turso itself sync the DB file before it returns: [`enable_mvcc_full`] commits one MVCC
+//! transaction (rewriting `user_version` with its own value) and runs a TRUNCATE
+//! checkpoint, which backfills that commit through the WAL, rewrites page 1 and fsyncs
+//! the DB file, header included.
+//!
+//! Every open, not only the one that switched. Whether an open switched can only be told
+//! from the header Turso reads back, and that read can come from the OS page cache rather
+//! than the disk: an open that crashed or failed between its switch and the sync (the
+//! checkpoint's fsync hit EIO, say) leaves an MVCC header that the next open reads as
+//! MVCC although it was never synced. Were only the switching open to sync, the next one
+//! would skip it and acknowledge commits that sync only the `-log`. The price is one
+//! commit and one checkpoint per database per open.
+//!
+//! WeftDB never fsyncs the file itself: Turso's lock is a process-associated `fcntl`
+//! lock, which closing any other descriptor on the file would release.
+//!
+//! **Apple targets** (release plan C-6). Turso's pager syncs with plain `fsync` on Apple
+//! unless a connection sets `PRAGMA fullfsync=ON`, and the MVCC COMMIT syncs its log with
+//! the pager's sync type, so without it a COMMIT there is not durable against power loss
+//! (`fsync` on macOS does not flush the drive's cache). The setting is per connection and
+//! every control-plane call opens a fresh one, so every connection is made through
+//! [`connect`], which sets it, and the open's probe reads it back next to `synchronous`.
+
+use anyhow::{bail, Context, Result};
+use turso::Value;
+
+/// What `PRAGMA journal_mode` reports for Turso's MVCC journal (`turso_core`
+/// `JournalMode::Mvcc`, displayed as `mvcc`; `experimental_mvcc` is the name it is
+/// requested by).
+const MVCC: &str = "mvcc";
+
+/// What `PRAGMA synchronous` reports for FULL (`turso_core` `SyncMode::Full`).
+const SYNCHRONOUS_FULL: i64 = 2;
+
+/// Open a connection to the control-plane database `db` the way every control-plane
+/// connection must be opened: on Apple targets with `PRAGMA fullfsync=ON`, so its
+/// COMMITs reach the platter (see the module documentation). Elsewhere it is
+/// `db.connect()`.
+///
+/// # Errors
+///
+/// Connecting, or (on Apple targets) setting the pragma.
+#[cfg_attr(not(target_vendor = "apple"), allow(clippy::unused_async, reason = "only Apple targets set a pragma on the new connection"))]
+pub async fn connect(db: &turso::Database) -> turso::Result<turso::Connection> {
+	let conn = db.connect()?;
+	#[cfg(target_vendor = "apple")]
+	{
+		// A query, drained, rather than `execute`, which fails on a pragma that answers
+		// with a row.
+		let mut rows = conn.query("PRAGMA fullfsync=ON", ()).await?;
+		while rows.next().await?.is_some() {}
+	}
+	Ok(conn)
+}
+
+/// Switch the database behind `conn` to MVCC, prove that it is in MVCC and that a fresh
+/// connection to `db`, like the ones every write opens, syncs FULL, then make the MVCC
+/// header durable (see the module documentation). `name` (the database's path) is what
+/// the errors call it.
+///
+/// # Errors
+///
+/// If a pragma cannot be read, if the journal mode is not MVCC (the error carries the
+/// switch's own error, when it had one), if a fresh connection is not FULL, or if the
+/// header cannot be synced.
+pub async fn enable_mvcc_full(db: &turso::Database, conn: &turso::Connection, name: &str) -> Result<()> {
+	// A query, not `execute`: the switch answers with the mode now in effect, and
+	// `execute` fails on that row ("unexpected row during execution") even when the
+	// switch worked. Its result is only kept to explain a failure; the read-back below
+	// is what decides.
+	let switched = pragma(conn, "PRAGMA journal_mode=experimental_mvcc").await;
+	let mode = pragma(conn, "PRAGMA journal_mode").await.with_context(|| format!("{name}: reading PRAGMA journal_mode"))?;
+	require_mvcc(name, &mode, switched.err())?;
+	let fresh = connect(db).await.with_context(|| format!("{name}: connecting to read PRAGMA synchronous"))?;
+	#[cfg(test)]
+	downgrade_for_test(&fresh, name).await?;
+	let synchronous = pragma(&fresh, "PRAGMA synchronous").await.with_context(|| format!("{name}: reading PRAGMA synchronous"))?;
+	require_full_sync(name, &synchronous)?;
+	#[cfg(target_vendor = "apple")]
+	{
+		let fullfsync = pragma(&fresh, "PRAGMA fullfsync").await.with_context(|| format!("{name}: reading PRAGMA fullfsync"))?;
+		require_fullfsync(name, &fullfsync)?;
+	}
+	// On the connection just proven FULL, so that the checkpoint does fsync.
+	sync_header(&fresh).await.with_context(|| format!("{name}: syncing the MVCC header (a commit, then a TRUNCATE checkpoint)"))
+}
+
+/// Make the MVCC header durable, through Turso: commit one transaction that changes
+/// nothing (`user_version` rewritten with its own value), then checkpoint it with
+/// TRUNCATE. The checkpoint writes that commit through the WAL into the DB file, page 1
+/// with it, and fsyncs the file before it truncates the log. A checkpoint alone is not
+/// enough: with nothing committed since the switch it backfills nothing and syncs
+/// nothing.
+async fn sync_header(conn: &turso::Connection) -> Result<()> {
+	let user_version = match pragma(conn, "PRAGMA user_version").await.context("reading PRAGMA user_version")? {
+		Value::Integer(version) => version,
+		other => bail!("PRAGMA user_version answered {}, not an integer", show(&other)),
+	};
+	conn.execute(format!("PRAGMA user_version = {user_version}"), ()).await.context("rewriting PRAGMA user_version")?;
+	pragma(conn, "PRAGMA wal_checkpoint(TRUNCATE)").await.context("PRAGMA wal_checkpoint(TRUNCATE)")?;
+	Ok(())
+}
+
+#[cfg(test)]
+tokio::task_local! {
+	/// Test-only `(file, statement)`: before the probe reads `PRAGMA synchronous`, it runs
+	/// `statement` (say `PRAGMA synchronous=OFF`) on the fresh connection of the database
+	/// whose file name is `file`. That stands in for a Turso whose new connections are not
+	/// FULL, which Turso 0.8 never produces, so without it nothing could show the real
+	/// open refusing one. Task-local, so the opens of tests running alongside never see it.
+	pub(crate) static NEW_CONNECTION_OVERRIDE: (&'static str, &'static str);
+}
+
+/// Apply [`NEW_CONNECTION_OVERRIDE`] to `fresh` when it names the database at `name`.
+#[cfg(test)]
+async fn downgrade_for_test(fresh: &turso::Connection, name: &str) -> Result<()> {
+	let Ok(Some(statement)) = NEW_CONNECTION_OVERRIDE.try_with(|(file, statement)| (std::path::Path::new(name).file_name() == Some(std::ffi::OsStr::new(file))).then_some(*statement)) else { return Ok(()) };
+	fresh.execute(statement, ()).await.with_context(|| format!("{name}: test override {statement}"))?;
+	Ok(())
+}
+
+/// The single value a pragma query answers with.
+async fn pragma(conn: &turso::Connection, sql: &str) -> Result<Value> {
+	let mut rows = conn.query(sql, ()).await?;
+	match rows.next().await? {
+		Some(row) => Ok(row.get_value(0)?),
+		None => bail!("{sql} returned no row"),
+	}
+}
+
+/// Whether a `PRAGMA journal_mode` answer is MVCC.
+fn is_mvcc(mode: &Value) -> bool {
+	matches!(mode, Value::Text(mode) if mode.eq_ignore_ascii_case(MVCC))
+}
+
+/// Fail unless `mode` is MVCC. `switch_error` is why the switch to MVCC failed, if it
+/// reported an error.
+fn require_mvcc(name: &str, mode: &Value, switch_error: Option<anyhow::Error>) -> Result<()> {
+	if is_mvcc(mode) {
+		return Ok(());
+	}
+	let cause = switch_error.map_or_else(String::new, |e| format!(" (switching to MVCC failed: {e:#})"));
+	bail!("{name} is in journal mode {}, not MVCC{cause}. WeftDB's control plane commits with BEGIN CONCURRENT and counts a COMMIT as durable only because MVCC fsyncs its log first, so it will not open this database in any other mode", show(mode))
+}
+
+/// Fail unless `synchronous` is FULL.
+fn require_full_sync(name: &str, synchronous: &Value) -> Result<()> {
+	if matches!(synchronous, Value::Integer(SYNCHRONOUS_FULL)) {
+		return Ok(());
+	}
+	bail!("a new connection to {name} reports PRAGMA synchronous={}, not FULL ({SYNCHRONOUS_FULL}). Without FULL a COMMIT can return before its log reaches the disk, so WeftDB will not open this database", show(synchronous))
+}
+
+/// Fail unless a `PRAGMA fullfsync` answer is on. Only Apple targets ask (elsewhere
+/// Turso has no such pragma and `fsync` is the strongest sync there is).
+#[cfg(any(test, target_vendor = "apple"))]
+fn require_fullfsync(name: &str, fullfsync: &Value) -> Result<()> {
+	if matches!(fullfsync, Value::Integer(1)) {
+		return Ok(());
+	}
+	bail!("a new connection to {name} reports PRAGMA fullfsync={}, not 1. On this platform plain fsync does not flush the drive's cache, so a COMMIT would not survive power loss, and WeftDB will not open this database", show(fullfsync))
+}
+
+/// A pragma value as SQL would print it.
+fn show(value: &Value) -> String {
+	match value {
+		Value::Text(text) => text.clone(),
+		Value::Integer(n) => n.to_string(),
+		other => format!("{other:?}"),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[tokio::test]
+	async fn a_new_database_is_switched_to_mvcc_and_passes() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("probe.db");
+		let path = path.to_string_lossy();
+		let db = turso::Builder::new_local(&path).build().await.unwrap();
+		let conn = db.connect().unwrap();
+		assert_eq!(show(&pragma(&conn, "PRAGMA journal_mode").await.unwrap()), "wal", "Turso creates a database in WAL mode");
+		enable_mvcc_full(&db, &conn, &path).await.expect("the switch takes and a fresh connection is FULL");
+		assert_eq!(show(&pragma(&db.connect().unwrap(), "PRAGMA journal_mode").await.unwrap()), MVCC);
+
+		let memory = turso::Builder::new_local(":memory:").build().await.unwrap();
+		let memory_conn = memory.connect().unwrap();
+		enable_mvcc_full(&memory, &memory_conn, ":memory:").await.expect("in-memory stores (tests) run MVCC too");
+		drop(memory_conn);
+		drop(memory);
+	}
+
+	/// A database at `path` that ran MVCC, holds a committed row, and was switched back
+	/// to WAL: it keeps Turso's MVCC metadata, so switching it to MVCC again is the case
+	/// Turso's own bootstrap does not sync.
+	async fn switched_back_to_wal(path: &str) {
+		let db = turso::Builder::new_local(path).build().await.unwrap();
+		let conn = db.connect().unwrap();
+		enable_mvcc_full(&db, &conn, path).await.unwrap();
+		conn.execute("CREATE TABLE t (x INTEGER)", ()).await.unwrap();
+		conn.execute("INSERT INTO t VALUES (1)", ()).await.unwrap();
+		assert_eq!(show(&pragma(&conn, "PRAGMA journal_mode=wal").await.unwrap()), "wal");
+		drop(conn);
+		drop(db);
+	}
+
+	/// Design section 1.3: the switch to MVCC writes page 1 and, on a database that
+	/// already carries Turso's MVCC metadata, nothing in Turso fsyncs it; a COMMIT then
+	/// syncs only the `-log`, and a power cut leaves a WAL header beside a log of
+	/// acknowledged commits, which Turso refuses to open. The open that switches has
+	/// Turso sync the DB file (a commit and a TRUNCATE checkpoint), so when it returns
+	/// every write to the DB file, the header included, is synced. Without that step the
+	/// recording backend shows the header write as the DB file's last, unsynced.
+	#[tokio::test]
+	async fn the_open_that_switches_to_mvcc_leaves_the_header_synced() {
+		use crate::types::durable::turso_probe::ProbeIo;
+
+		let dir = tempfile::tempdir().unwrap();
+		for (case, back_to_wal) in [("a new database", false), ("a database switched back to WAL", true)] {
+			let path = dir.path().join(format!("{back_to_wal}.db"));
+			let path = path.to_string_lossy();
+			let file = format!("{back_to_wal}.db");
+			if back_to_wal {
+				switched_back_to_wal(&path).await;
+			}
+			let io = ProbeIo::new().unwrap();
+			let db = turso::Builder::new_local(&path).with_io_impl(io.clone()).build().await.unwrap();
+			let conn = db.connect().unwrap();
+			enable_mvcc_full(&db, &conn, &path).await.expect("switches");
+			let header_written = io.writes(&file).iter().any(|&(pos, _)| pos == 0);
+			let synced = io.synced_since_last_write(&file);
+			// What the store's open does next: a commit, which syncs only the `-log`.
+			conn.execute("CREATE TABLE IF NOT EXISTS u (x INTEGER)", ()).await.unwrap();
+			conn.execute("INSERT INTO u VALUES (2)", ()).await.unwrap();
+			let still_synced = io.synced_since_last_write(&file);
+			let mode = show(&pragma(&conn, "PRAGMA journal_mode").await.unwrap());
+			drop(conn);
+			drop(db);
+			assert!(header_written, "{case}: the switch wrote page 1: {:?}", io.events());
+			assert!(synced, "{case}: every write to the DB file is synced when the switch returns: {:?}", io.events());
+			assert!(still_synced, "{case}: and the commits after it do not write the DB file unsynced: {:?}", io.events());
+			assert_eq!(mode, MVCC, "{case}");
+		}
+	}
+
+	/// Every open syncs the header, not only the one that switched. An open that switched
+	/// and then crashed, or failed, before its sync leaves an MVCC header that was written
+	/// but never synced, and the next open reads it back as MVCC (from the OS page cache):
+	/// judged by that, it would have nothing to sync, and its commits would sync only the
+	/// `-log`. Here a bare switch plays the open that crashed (the recording backend shows
+	/// its header write left unsynced), and the next open still rewrites page 1 and fsyncs
+	/// the DB file before it returns. The rows are all there.
+	#[tokio::test]
+	async fn every_open_syncs_the_header_even_one_that_finds_mvcc() {
+		use crate::types::durable::turso_probe::{FileEvent, ProbeIo};
+
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("mvcc.db");
+		let path = path.to_string_lossy();
+		switched_back_to_wal(&path).await;
+		// The open that crashed between its switch and the sync.
+		let crashed = ProbeIo::new().unwrap();
+		let db = turso::Builder::new_local(&path).with_io_impl(crashed.clone()).build().await.unwrap();
+		let conn = db.connect().unwrap();
+		let switched = show(&pragma(&conn, "PRAGMA journal_mode=experimental_mvcc").await.unwrap());
+		drop(conn);
+		drop(db);
+
+		let io = ProbeIo::new().unwrap();
+		let db = turso::Builder::new_local(&path).with_io_impl(io.clone()).build().await.unwrap();
+		let conn = db.connect().unwrap();
+		let found = show(&pragma(&conn, "PRAGMA journal_mode").await.unwrap());
+		enable_mvcc_full(&db, &conn, &path).await.expect("passes");
+		let rewrote_header = io.writes("mvcc.db").iter().any(|&(pos, _)| pos == 0);
+		let fsynced = io.events().contains(&FileEvent::Sync { file: "mvcc.db".to_string() });
+		let synced = io.synced_since_last_write("mvcc.db");
+		let rows = pragma(&conn, "SELECT COUNT(*) FROM t").await.unwrap();
+		drop(conn);
+		drop(db);
+		assert_eq!(switched, MVCC);
+		assert!(crashed.writes("mvcc.db").iter().any(|&(pos, _)| pos == 0) && !crashed.synced_since_last_write("mvcc.db"), "the crashed open wrote the header and never synced it: {:?}", crashed.events());
+		assert_eq!(found, MVCC, "the next open reads the unsynced header as MVCC");
+		assert!(rewrote_header, "it rewrites page 1: {:?}", io.events());
+		assert!(fsynced && synced, "and fsyncs the DB file after every write to it: {:?}", io.events());
+		assert_eq!(rows, Value::Integer(1));
+	}
+
+	/// The probe reads `synchronous` from a fresh connection and refuses the open on
+	/// anything but FULL. Turso 0.8 always answers FULL, so the override plays a Turso
+	/// that does not; without the probe (or with it reading some other connection) this
+	/// open would pass.
+	#[tokio::test]
+	async fn a_fresh_connection_that_is_not_full_fails_the_probe() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("probe.db");
+		let path = path.to_string_lossy();
+		let db = turso::Builder::new_local(&path).build().await.unwrap();
+		let conn = db.connect().unwrap();
+		for (statement, shown) in [("PRAGMA synchronous=OFF", "0"), ("PRAGMA synchronous=NORMAL", "1")] {
+			let err = NEW_CONNECTION_OVERRIDE.scope(("probe.db", statement), enable_mvcc_full(&db, &conn, &path)).await.expect_err(statement).to_string();
+			assert_eq!(err, format!("a new connection to {path} reports PRAGMA synchronous={shown}, not FULL (2). Without FULL a COMMIT can return before its log reaches the disk, so WeftDB will not open this database"));
+		}
+		// The override names one file; any other database is left alone.
+		NEW_CONNECTION_OVERRIDE.scope(("other.db", "PRAGMA synchronous=OFF"), enable_mvcc_full(&db, &conn, &path)).await.expect("only the named file is downgraded");
+		enable_mvcc_full(&db, &conn, &path).await.expect("a fresh connection is FULL again");
+		drop(conn);
+		drop(db);
+	}
+
+	#[test]
+	fn only_mvcc_passes_the_journal_mode_check() {
+		require_mvcc("x.db", &Value::Text("mvcc".into()), None).unwrap();
+		require_mvcc("x.db", &Value::Text("MVCC".into()), None).unwrap();
+		for mode in ["wal", "delete", "experimental_mvcc", ""] {
+			let err = require_mvcc("x.db", &Value::Text(mode.into()), None).unwrap_err().to_string();
+			assert!(err.starts_with(&format!("x.db is in journal mode {mode}, not MVCC.")), "{err}");
+		}
+		let err = require_mvcc("x.db", &Value::Text("wal".into()), Some(anyhow::anyhow!("database is readonly"))).unwrap_err().to_string();
+		assert!(err.contains("not MVCC (switching to MVCC failed: database is readonly)"), "the switch's own error explains the mode: {err}");
+		assert!(require_mvcc("x.db", &Value::Null, None).is_err());
+	}
+
+	/// Release plan C-6: on Apple targets a fresh connection must report fullfsync on,
+	/// beside the synchronous probe. The decision is tested on every platform; the probe
+	/// itself runs only where Turso has the pragma.
+	#[test]
+	fn only_fullfsync_on_passes_the_apple_check() {
+		require_fullfsync("x.db", &Value::Integer(1)).unwrap();
+		for (value, shown) in [(Value::Integer(0), "0"), (Value::Null, "Null"), (Value::Text("1".into()), "1")] {
+			let err = require_fullfsync("x.db", &value).unwrap_err().to_string();
+			assert!(err.starts_with(&format!("a new connection to x.db reports PRAGMA fullfsync={shown}, not 1.")), "{err}");
+		}
+	}
+
+	/// Every control-plane connection goes through [`connect`]; off Apple targets it is a
+	/// plain connection that works like `db.connect()`.
+	#[tokio::test]
+	async fn connect_opens_a_working_connection() {
+		let db = turso::Builder::new_local(":memory:").build().await.unwrap();
+		let conn = connect(&db).await.unwrap();
+		assert_eq!(pragma(&conn, "SELECT 41 + 1").await.unwrap(), Value::Integer(42));
+		#[cfg(target_vendor = "apple")]
+		assert_eq!(pragma(&conn, "PRAGMA fullfsync").await.unwrap(), Value::Integer(1));
+	}
+
+	#[test]
+	fn only_full_passes_the_synchronous_check() {
+		require_full_sync("x.db", &Value::Integer(2)).unwrap();
+		for (value, shown) in [(Value::Integer(0), "0"), (Value::Integer(1), "1"), (Value::Integer(3), "3"), (Value::Text("2".into()), "2"), (Value::Null, "Null")] {
+			let err = require_full_sync("x.db", &value).unwrap_err().to_string();
+			assert!(err.starts_with(&format!("a new connection to x.db reports PRAGMA synchronous={shown}, not FULL (2).")), "{err}");
+		}
+	}
+}

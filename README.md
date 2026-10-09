@@ -249,15 +249,18 @@ truth for status and priorities, and it records negative results alongside wins.
 
 ### Store
 
-- **Typed columnar segments (`.weftseg`)** — immutable once sealed, CRC-checksummed,
-  page-indexed, with per-segment and per-page min/max statistics for data skipping
-  and a null/quality column.
+- **Typed columnar segments (`.weftseg`)** — written once, never rewritten: maintenance
+  (reconcile, split, overlap merge, squash, compaction) writes its output to new frames,
+  fsyncs them, and swaps them for its inputs in one control-plane transaction, so a
+  crash leaves either the inputs or the outputs, and a replaced frame is deleted only
+  once no read can still be using it. CRC-checksummed, page-indexed, with per-segment
+  and per-page min/max statistics for data skipping and a null/quality column.
 - **Compression that adapts per column** — timestamps pick among delta-of-delta,
   RLE, Gorilla, fixed and per-block bit-packing; values pick among varint,
   bit-packing, per-block adaptive packing, frame-of-reference and an opt-in delta
   cascade. The codec each column actually used is reported, and `bytes/point` is the
   **realized** figure, not an estimate.
-- **Late and out-of-order data** — detected, counted, and reconciled in place or
+- **Late and out-of-order data** — detected, counted, and reconciled within a segment or
   across segments with last-writer-wins semantics, on demand or by background sweep.
 - **Backup and restore** of the control plane, with two verification modes (one safe
   under concurrent writes) and a **non-destructive restore drill** so you can answer
@@ -337,7 +340,23 @@ See the [Quickstart](#quickstart) to start it.
 Bind address defaults to `127.0.0.1:8080` (`WEFT_SERVER_ADDR` overrides). Setting
 `WEFT_SEGMENT_STORE_ROOT` opens a Storage v2 segment store and enables the
 `/storage` endpoints (without it they answer `503`, and `GET /ready` reports the
-`segment_store` dependency).
+`segment_store` dependency). A store root belongs to one server at a time: the server
+holds the root's `LOCK` file while it runs, and a second server pointed at the same
+root exits at startup with an error naming the first one's pid and host.
+
+The root's `STORE_FORMAT` file records the store's layout and the oldest layouts a
+WeftDB must know to read and to write it (plain JSON; see `weftdb::StoreFormat`), and
+`segment_index.db`'s `store_meta` table keeps a copy. The server reads the marker before
+it opens any database (a root without one, the copy, before it writes anything), and
+refuses a store a newer WeftDB wrote (`IncompatibleLayout`) without changing anything
+but `LOCK` and `LOCK.holder`. A store written before the marker existed is layout 1 and
+is upgraded in place on first open, through the registered migrations
+(`store_migrations` in `segment_index.db` lists those applied); its frames are not
+rewritten. A layout-1 store whose index records a frame outside `segments/` (possible
+only through the aspect-name traversal of earlier builds) is refused with
+`UnsafeLegacyPath`, naming the aspects, before any migration applies or a marker is
+written, and nothing is moved: drop or re-seal those aspects with the build that wrote
+them first.
 
 While bound to a loopback address, the server only answers requests addressed to a
 loopback host: `Host` must be `localhost`, an address in `127.0.0.0/8` or `[::1]`
@@ -360,7 +379,7 @@ untrusted networks.
 | Method & path | Purpose |
 |---------------|---------|
 | `GET /health` | Liveness. |
-| `GET /ready` | Readiness, including the segment-store dependency check. |
+| `GET /ready` | Readiness, including the segment-store dependency check. With a store, `poisoned` / `restart_required` report that a segment-index COMMIT failed in a way that may still have committed, so the store refuses writes until the server restarts (reads keep working, and `ready` stays `true`); `poison_reason` says which transaction and error. |
 | `GET /metrics` | Prometheus text exposition — request/error/output counters, ingest counters (`weft_ingest_*`), and **latency histograms** for the compute and storage-ingest paths. |
 | `GET /debug/profile/current` | Live p50/p95/p99 latency snapshot per instrumented path. |
 
@@ -455,12 +474,12 @@ under the declared encoding/tolerance is rejected `400`.
 | `GET /api/v1/storage/{aspect}/at?t=` | **Single-instant point lookup**: the present value at exactly `t` (lossless decimal text) or a `found:false` miss. An **order-signal-driven read planner** resolves each candidate segment with its persisted `time_sorted` flag — binary search on a sorted segment, linear scan only on an out-of-order one — after pruning the index to the files spanning `t`. |
 | `GET /api/v1/storage/{aspect}/at-multi?t=,,` | **Batch point lookup**: a comma-separated list of instants resolved in one pass (`points:[{timestamp,value,found}]` in query order). The index is pruned once by the batch's whole span and each segment's timestamp column decoded once for the whole batch, so `N` instants sharing a segment cost one decode, not `N`. |
 | `GET`·`POST /api/v1/storage/{aspect}/downsample?start=&end=&resolution=&agg=` | **Stored-range downsample** — the same reduction set as `POST /api/v1/downsample` (above), but over the aspect's **persisted segments** instead of a request-supplied series, so a client aggregates a large stored range without fetching it. **Bounded memory**: the index is pruned by time and each surviving segment folds into its own mergeable partial reduction, merged once — only one segment's rows are ever resident, so a range far larger than RAM reduces, and with a `sketch_p*` the per-bucket state is bounded too. Omitted bounds span all stored history. `…/downsample.csv` · `…/downsample.arrow` · `…/downsample.parquet` serve the identical reduction in the compute endpoints' columnar formats. Traced as a `downsample.range` stage span. The pruned segments are reduced **concurrently**: measured **4.69× faster** than the sequential fold (16 segments over 200k rows, 39.88 ms → 8.50 ms; `sketch_p99` 49.49 ms → 9.42 ms, **5.25×**) — see [`database/benches/downsample_range.rs`](database/benches/downsample_range.rs). A single pruned segment takes an inline fast path (concurrency there costs more than it buys). **Materialized partials (opt-in):** with `WEFT_SEGMENT_PARTIAL_BASE` set, each segment carries a `.weftpart` partial-reduction sidecar written at seal (a sealed segment is immutable, so its partial never goes stale), and a downsample of the bounded reductions (`min`/`max`/`avg`/`sum`/`first`/`last` + `sketch_p*`) **merges the stored partials instead of decoding the value column** — measured **3.2× faster** (16 segments / 200k rows, 8.39 ms → 2.60 ms, non-overlapping CIs) and re-keyed to any coarser nesting resolution (minutes→hours→days) with no decode. **Rollup tiers (opt-in):** `WEFT_SEGMENT_PARTIAL_TIERS` materializes coarser tiers beside the base (e.g. `hours,days`), each re-keyed from the tier below, so a coarse query folds the coarsest matching tier instead of the whole fine base — the in-storage analogue of TimescaleDB's hierarchical continuous aggregates. Measured **~1.16×** on a DAY query over a MINUTES base (16 segments / 200k rows, 7.30 ms → 6.30 ms, non-overlapping CIs). The win **grows with the base-bucket count per segment**, and that scaling is now measured rather than asserted: holding rows and segments fixed while widening the sample stride (so only the base buckets per segment change) gives **1.15× at ~208 base buckets → 1.27× at ~3125 → 1.38× at ~12500** (`bench_tiered_span`). Honest read: the win is real and climbs, but a ~60× increase in base buckets buys only 1.15×→1.38×, so the elided re-key is not the dominant cost and the tiers' extra `.weftpart` bytes should be weighed against it — see [`database/benches/downsample_range.rs`](database/benches/downsample_range.rs). A reconcile/split/squash regenerates the sidecar (tiers and all) so the acceleration survives a rewrite. |
-| `POST /api/v1/storage/{aspect}/reconcile` | **Reconciliation pass** (`mode` in the response). Default (intra-segment): rewrite every out-of-order segment of the aspect into a time-sorted one in place. `?threshold=N` gates it on `unsorted_segments >= N` (QuestDB-style split-count trigger). `?hot_cold=true` reconciles cold segments but defers the hot tail until the backlog reaches the threshold. `?overlaps=true` instead runs the **cross-segment overlap merge** (newer-wins) — `reconciled` is then the number of segments merged away, and `?split_min_bytes=N` makes that merge **split-not-rewrite** (carve off a dominant cold prefix instead of rewriting the whole component). Returns `triggered`/`reconciled`/`cold_reconciled`/`hot_reconciled` and the post-pass `unsorted_segments` + `overlapping_segments`. |
-| `POST /api/v1/storage/{aspect}/squash` | **Squash** the aspect's segments into one (newer-wins), bounding split-path fragmentation. `?max_segments=N` gates it (squash only when the count exceeds `N`). Returns `triggered`/`removed`/`segment_count`. |
-| `POST /api/v1/storage/{aspect}/compact?target_rows=N` | **Size-targeted compaction** — coalesce the aspect's segments toward ~`N` rows per segment (leaving already-large segments untouched), holding fragmentation near the read-optimal size rather than folding to one (which `squash` does). Motivated by the `downsample_range` knee (one giant segment reads slower than several mid-sized ones). `target_rows` is required (absent → `400`). Returns `removed`/`segment_count`. The manual counterpart of the `WEFT_COMPACT_TARGET_ROWS` daemon pass. |
-| `POST /api/v1/storage/reconcile` | **Store-wide reconciliation sweep** across every declared aspect: threshold (default), `?hot_cold=true`, or `?overlaps=true` (+ `?split_min_bytes=N` for split-not-rewrite). Returns `mode`, `aspects_scanned` / `aspects_reconciled` / `segments_reconciled` (+ cold/hot split), the post-sweep store-wide `unsorted_segments` + `overlapping_segments`, and **`failed`**: a `[{aspect, error}]` list of the aspects whose pass failed (empty on a clean sweep). A failing aspect (e.g. a torn or truncated frame) no longer aborts the sweep: every other aspect is still swept and the response is `200`, so check `failed` to tell a partial sweep from a clean one (earlier versions returned `500` at the first failing aspect and left every aspect after it in name order unswept). Only an unreadable aspect list is still a `500`. The manual counterpart to the background reconcile daemon (`WEFT_RECONCILE_INTERVAL_SECS` / `WEFT_RECONCILE_THRESHOLD` / `WEFT_RECONCILE_HOT_COLD` / `WEFT_RECONCILE_OVERLAPS` / `WEFT_RECONCILE_SPLIT_MIN_BYTES` / `WEFT_RECONCILE_MAX_SPLITS`). |
-| `POST /api/v1/storage/backup` | **Online control-plane backup** (Phase 7.4) — snapshot the store's four control-plane DBs (`segment_index`/`metadata`/`aspect_catalog`/`catalog`) to fresh files via Turso's stable `VACUUM INTO`. Lands in `<base>/<label>` where `<base>` is `WEFT_BACKUP_DIR` or `<store_root>/backups` and `<label>` is a traversal-guarded `?label=` (`[A-Za-z0-9._-]`, not starting or ending with `.`) or, without one, a generated `manual-<unix_millis>`. The `backup-<digits>` form is reserved for the backup daemon (retention counts and prunes exactly those names), so a `?label=` in that form is a `400`, and no snapshot taken through this endpoint is ever pruned by retention. **`?verify=source\|snapshot`** picks the verification: `source` (the default) cross-checks each copy's user-table set + row counts against the live control plane — the strongest check, but it assumes a **quiescent** store; `snapshot` verifies each copy on its own terms (it reopens and **fully scans every row of every table**) without re-reading the source, which is what an **online** backup taken while ingest continues needs. An unknown token → `400`. Returns per-DB `{name, tables, rows, bytes}` + `total_rows`/`total_bytes` + the `verify` mode that ran. An existing target dir → `400`; no store → `503`. Control plane only — the `.weftseg` measurement frames are not part of this backup (hard-constraint #3). |
-| `POST /api/v1/storage/restore/drill?label=<backup>` | **Restore drill** (Phase 7.4) — rehearse restoring a backup *on a running server*, so an operator can answer "is my backup actually restorable?" without risking anything. Restores the named backup into a throwaway directory beside the backups, verifies every restored database at its destination (it opens, and every row of every table reads), returns per-DB `{name, tables, rows, bytes}` + `total_rows`/`total_bytes`/`restorable`, then deletes the rehearsal copy. **Non-destructive by construction** — it cannot touch the live store, and restoring *over* a live control plane is deliberately not offered (the library primitive refuses to clobber; pointing `WEFT_SEGMENT_STORE_ROOT` at a restored copy is a deployment decision, not an HTTP call). Unknown backup → `404`; traversal label → `400`; a backup that will not restore → `500` carrying the failure, which is a failed drill rather than a server bug. |
+| `POST /api/v1/storage/{aspect}/reconcile` | **Reconciliation pass** (`mode` in the response). Default (intra-segment): rewrite every out-of-order segment of the aspect into a time-sorted one in place. `?threshold=N` gates it on `unsorted_segments >= N` (QuestDB-style split-count trigger). `?hot_cold=true` reconciles cold segments but defers the hot tail until the backlog reaches the threshold. `?overlaps=true` instead runs the **cross-segment overlap merge** (newer-wins) — `reconciled` is then the number of segments merged away, and `?split_min_bytes=N` makes that merge **split-not-rewrite** (carve off a dominant cold prefix instead of rewriting the whole component). Returns `triggered`/`reconciled`/`cold_reconciled`/`hot_reconciled` and the post-pass `unsorted_segments` + `overlapping_segments`. Maintenance operations on one aspect take turns: while another one holds the aspect (a daemon pass, another request), the request waits up to 30 s, then answers **`409 Conflict`** without touching the aspect; retry. |
+| `POST /api/v1/storage/{aspect}/squash` | **Squash** the aspect's segments into one (newer-wins), bounding split-path fragmentation. `?max_segments=N` gates it (squash only when the count exceeds `N`). Returns `triggered`/`removed`/`segment_count`. Waits for a busy aspect and answers `409` as `reconcile` does. |
+| `POST /api/v1/storage/{aspect}/compact?target_rows=N` | **Size-targeted compaction** — coalesce the aspect's segments toward ~`N` rows per segment (leaving already-large segments untouched), holding fragmentation near the read-optimal size rather than folding to one (which `squash` does). Motivated by the `downsample_range` knee (one giant segment reads slower than several mid-sized ones). `target_rows` is required (absent → `400`). Returns `removed`/`segment_count`. The manual counterpart of the `WEFT_COMPACT_TARGET_ROWS` daemon pass. Waits for a busy aspect and answers `409` as `reconcile` does. |
+| `POST /api/v1/storage/reconcile` | **Store-wide reconciliation sweep** across every declared aspect: threshold (default), `?hot_cold=true`, or `?overlaps=true` (+ `?split_min_bytes=N` for split-not-rewrite). Returns `mode`, `aspects_scanned` / `aspects_reconciled` / `segments_reconciled` (+ cold/hot split), the post-sweep store-wide `unsorted_segments` + `overlapping_segments`, and **`failed`**: a `[{aspect, error}]` list of the aspects whose pass failed (empty on a clean sweep). A failing aspect (e.g. a torn or truncated frame) no longer aborts the sweep: every other aspect is still swept and the response is `200`, so check `failed` to tell a partial sweep from a clean one (earlier versions returned `500` at the first failing aspect and left every aspect after it in name order unswept). Only an unreadable aspect list is still a `500`. An aspect another maintenance operation holds is waited for (30 s in all, across the sweep); if some are still held then, the others are swept and the answer is **`409 Conflict`** naming the held ones. (The background daemon never waits: it skips a busy aspect until its next tick.) The manual counterpart to the background reconcile daemon (`WEFT_RECONCILE_INTERVAL_SECS` / `WEFT_RECONCILE_THRESHOLD` / `WEFT_RECONCILE_HOT_COLD` / `WEFT_RECONCILE_OVERLAPS` / `WEFT_RECONCILE_SPLIT_MIN_BYTES` / `WEFT_RECONCILE_MAX_SPLITS`). |
+| `POST /api/v1/storage/backup` | **Online control-plane backup** (Phase 7.4) — snapshot the store's four control-plane DBs (`segment_index`/`metadata`/`aspect_catalog`/`catalog`) to fresh files via Turso's stable `VACUUM INTO`. Lands in `<base>/<label>` where `<base>` is `WEFT_BACKUP_DIR` or `<store_root>/backups` and `<label>` is a traversal-guarded `?label=` (`[A-Za-z0-9][A-Za-z0-9._-]{0,99}`: 1 to 100 letters, digits, `.`, `_` or `-`, starting with a letter or digit and not ending with `.`) or, without one, a generated `manual-<unix_millis>`. The `backup-<digits>` form is reserved for the backup daemon (retention counts and prunes exactly those names), so a `?label=` in that form is a `400`, and no snapshot taken through this endpoint is ever pruned by retention. **`?verify=source\|snapshot`** picks the verification: `source` (the default) cross-checks each copy's user-table set + row counts against the live control plane — the strongest check, but it assumes a **quiescent** store; `snapshot` verifies each copy on its own terms (it reopens and **fully scans every row of every table**) without re-reading the source, which is what an **online** backup taken while ingest continues needs. An unknown token → `400`. Returns per-DB `{name, tables, rows, bytes}` + `total_rows`/`total_bytes` + the `verify` mode that ran. The backup is built in a `.partial-*` directory beside its label and appears under the label, with a `MANIFEST.json`, only once complete and durable. A label outside that grammar → `400` (the grammar also keeps out `.partial-*`, `.deleting-*` and `.restore-drill-*`, the names of unfinished backups, prunes and drills); an existing target dir → `409` with `"code": "already_exists"`; no store → `503`. Control plane only — the `.weftseg` measurement frames are not part of this backup (hard-constraint #3). |
+| `POST /api/v1/storage/restore/drill?label=<backup>` | **Restore drill** (Phase 7.4) — rehearse restoring a backup *on a running server*, so an operator can answer "is my backup actually restorable?" without risking anything. Restores the named backup into a throwaway directory beside the backups, verifies every restored database at its destination (it opens, and every row of every table reads), returns per-DB `{name, tables, rows, bytes}` + `total_rows`/`total_bytes`/`restorable`, then deletes the rehearsal copy (`cleanup_error` says why, if it could not; it is `null` otherwise). **Non-destructive by construction** — it cannot touch the live store, and restoring *over* a live control plane is deliberately not offered (the library primitive refuses to clobber; pointing `WEFT_SEGMENT_STORE_ROOT` at a restored copy is a deployment decision, not an HTTP call). Unknown backup → `404`; a label outside the backup label grammar (so also traversal and the staging names `.partial-*`, `.deleting-*`, `.restore-drill-*`) → `400`, while a daemon snapshot's `backup-<digits>` is accepted, since a drill only reads it; a rehearsal directory already taken by a drill started in the same millisecond → `409` with `"code": "already_exists"` (retry; nothing was restored or removed); a backup that will not restore → `500` carrying the failure, which is a failed drill rather than a server bug. |
 | `GET /api/v1/storage/{aspect}/stats` · `…/storage/stats` | Materialized per-aspect and store-wide rollups, including the realized **bytes/point** (the north-star cost term), an `unsorted_segments` order-health count (segments that would force a linear scan on a point lookup), and an `overlapping_segments` count (time-overlapping segments — the cross-segment order-health signal, computed by an index scan). Rollup fields are served from the control plane without opening a segment. |
 
 ### Metrics
@@ -495,45 +514,72 @@ only** — the `.weftseg` measurement frames are not part of a snapshot.
   every table, so it is correct while writers are committing. A snapshot-only
   backup taken with six concurrent ingests in flight returns `200` with the
   concurrent seals visible in the copy.
-- **A backup directory holds exactly its four databases.** Verifying a snapshot
-  reopens it, which leaves zero-byte `-wal` / `-log` journal sidecars beside the
-  copy; these are swept after every verification, in both modes. Only a sidecar
-  that is *exactly* zero bytes is removed — a non-empty `-wal` holds
-  un-checkpointed frames, which is data, and is never touched.
+- **A backup directory holds exactly its four databases and a `MANIFEST.json`.**
+  Verifying a snapshot reopens it, which leaves zero-byte `-wal` / `-log` journal
+  sidecars beside the copy; these are swept after every verification, in both
+  modes. Only a sidecar that is *exactly* zero bytes is removed — a non-empty `-wal`
+  holds un-checkpointed frames, which is data, and is never touched. Verification
+  also requires each database's own tables, so an empty file never passes.
+- **A backup appears only once it is complete and durable.** It is built in a
+  `.partial-{label}-{nonce}/` directory; each database is verified and fsynced, the
+  manifest (format, creation time, each file's size, tables and rows) is written and
+  fsynced, and the directory is fsynced, renamed to its label, and the parent
+  fsynced. A backup that fails with an error before the rename removes its build
+  directory again; a crash there leaves the `.partial-*` directory, which is never
+  counted or restored, and which the backup daemon's sweep removes (where the
+  daemon is not enabled, remove it by hand). Once renamed, only the parent's fsync
+  is left: if that fails, the call reports an error (`500` over HTTP) although the
+  complete backup is already under its label, so a retry with the same label is
+  refused (`409`). The next backup's fsync of the same parent makes it durable.
 - **What a snapshot costs is dominated by the filesystem, not by the vacuum.**
   Benchmarked in [`database/benches/backup_cost.rs`](database/benches/backup_cost.rs):
   on `tmpfs` a whole four-database backup-and-verify runs in **8.62 ms** at one
   aspect, **6.18 ms** at 16 and **16.79 ms** at 128 (snapshot verification;
   source verification is within noise of those), so the vacuum's own work is
   milliseconds and scales with control-plane rows rather than being a fixed
-  per-database floor. On a real disk it is orders of magnitude slower — the
-  background daemon's ticks land ~1.0–2.5 s apart at a 2 s configured interval on
-  this project's btrfs volume — because Turso's `VACUUM INTO` fsyncs the
-  destination and runs a TRUNCATE checkpoint before returning. **Set
-  `WEFT_BACKUP_INTERVAL_SECS` from what your storage can sustain, not from how
-  much data you have**; point `WEFT_BENCH_BACKUP_DIR` at your own volume to
-  measure it.
+  per-database floor. On a real disk it is orders of magnitude slower, because
+  Turso's `VACUUM INTO` fsyncs the destination and runs a TRUNCATE checkpoint
+  before returning. On this project's btrfs volume (load average ~12) the
+  background daemon's ticks landed 3.0–4.5 s apart at a 2 s configured interval.
+  A tick fires late only when the one before it outlasts the interval (tokio's
+  default `Burst` catch-up), so each snapshot and its prune took that long, and
+  they ran back to back. **Set `WEFT_BACKUP_INTERVAL_SECS` from what your storage
+  can sustain, not from how much data you have**; point `WEFT_BENCH_BACKUP_DIR`
+  at your own volume to measure it.
 - **Unattended backups with retention.** Set `WEFT_BACKUP_INTERVAL_SECS` to run a
   background daemon that snapshots into a fresh `backup-<unix_millis>` directory
   each tick (verifying `snapshot`-only, since it backs up a live store), and
   `WEFT_BACKUP_KEEP` to retain only the newest N. Retention is deliberately narrow:
-  it only ever removes daemon-**generated** `backup-<digits>` directories, so a
-  snapshot you took through the API (`?label=nightly`, or an unlabelled
-  `manual-<unix_millis>`) is never a prune candidate and never counts toward N, and
+  it only ever removes daemon-**generated** `backup-<digits>` directories, a form
+  the API refuses to create (a directory you rename into it by hand is treated as
+  generated and can be pruned, as it always could), so a snapshot you took
+  through the API (`?label=nightly`, or an unlabelled `manual-<unix_millis>`) is
+  never a prune candidate and never counts toward N, and
   it runs only after a *successful* snapshot, so a run of failures cannot prune
-  your last good backup away. A `backup-<digits>` directory stamped more than 24 h
+  your last good backup away. It counts only complete backups (a manifest, or all
+  four databases from before manifests), and renames a pruned backup to
+  `.deleting-*` before removing its files, so an interrupted prune never leaves a
+  half-removed backup. A `backup-<digits>` directory stamped more than 24 h
   past the clock, or past the directory's own modification time, did not come from
   the daemon: retention neither counts nor removes it, and logs a warning each time
   it sees it. The modification-time check keeps such a directory ignored after the
   clock catches up with its stamp, as long as the directory is left unmodified and the
   filesystem reports modification times; remove it by hand when the warning appears.
-  Both paths record `weft_backup_*` metrics.
+  At start and on every tick the daemon removes `.partial-*`, `.deleting-*` and
+  `.restore-drill-*` entries untouched for an hour. Both paths record
+  `weft_backup_*` metrics.
 - **Restore, with a drill.** `weftdb::restore_control_plane(backup_dir, root)`
   puts a snapshot back into a store root and verifies each restored file **at its
   destination** — what matters is that the file the store will open actually
-  reads. It refuses an incomplete backup directory and refuses to overwrite an
+  reads. It refuses an incomplete backup directory (or one whose files no longer
+  match its manifest, or one with a staging name) and refuses to overwrite an
   existing control plane, pre-flighting both across all four files before writing
-  anything, so a rejected restore leaves nothing behind. Restoring beside the
+  anything, so a rejected restore leaves nothing behind. Each file is copied to
+  `<name>.tmp`, fsynced and verified; only once all four verify are they renamed
+  into place, one after another, and the root fsynced. A failure before the
+  renames leaves only `.tmp` files, which a retry replaces; one part-way through
+  them leaves some databases in place, which a retry refuses to overwrite, so clear
+  the root first. Restoring beside the
   original `segments/` frames reconstitutes a working store: the round-trip test
   reopens the restored root and reads its measurements back.
 - **Drills on a live server.** `POST /api/v1/storage/restore/drill?label=` rehearses
@@ -553,11 +599,13 @@ WeftDB is configured primarily through environment variables:
 |----------|---------|---------|---------|
 | `WEFT_DATA_DIR` | `weftdb`, `weft-tui` | Root directory for database files **and** the TUI log (`weft-tui.log`). | portable per-user default (see below) |
 | `TEST_DATA_DIR` | `weftdb` | Highest-priority override for the database root (used by the test suite). | unset |
+| `WEFT_EXTRACTED_BATCH_RETENTION_SECS` | `weftdb` | How long (seconds) a legacy aspect remembers the batches pattern extraction consumed, so the incremental build does not queue them again. Each extraction deletes older records, keeping about one row per resolution step of this period. Set it above the longest interval between pipeline runs of an aspect plus the longest ingest call; a non-positive or unparsable value keeps the default. | `172800` (48 hours) |
 | `WEFT_SERVER_ADDR` | `weft-server` | HTTP bind address. | `127.0.0.1:8080` |
 | `WEFT_ALLOW_ANY_HOST` | `weft-server` | Truthy (`1`/`true`/`yes`/`on`) → turn off the loopback request guard. On a loopback bind the server otherwise answers only requests whose `Host` is `localhost`, `127.0.0.0/8` or `[::1]` (`421` otherwise) and refuses state-changing requests from non-loopback web origins (`403`). Set it behind a local reverse proxy that forwards a different `Host`, or one that forwards the non-loopback `Origin` of a browser UI it fronts. A non-loopback bind is never guarded. | unset (guarded on a loopback bind) |
 | `WEFT_GPU_CALIBRATE` | `weft-server` | Startup calibration. By default, once the listener is bound, the server runs `splimes::calibrate()` once in the background on a blocking thread: it starts the GPU if there is one, times the single-thread, rayon and GPU backends on grids up to 16 Mi points (several seconds, a few hundred MB), and sets where `Backend::Auto` switches between them. Requests are served from the start and interpolate on the CPU with splimes' default thresholds until it finishes. A CPU/software adapter (llvmpipe, lavapipe, WARP) is not calibrated, with a log line saying why; `force` calibrates it anyway. `0` (or `false`/`no`/`off`) skips calibration. It logs the adapter (or why there is none) and the thresholds, and never fails startup; skipped or failed, interpolation stays on the CPU with splimes' defaults. | unset (calibrate, except a software adapter) |
 | `WEFT_MAX_INTERPOLATE_POINTS` | `weft-server` | The most output points one `/api/v1/interpolate*` request may produce; a larger grid is a `400` naming its size and the limit, refused before anything is allocated. A positive integer, read once at startup; anything else (including `0`) stops the server from starting with a message naming the variable. | `10000000` |
 | `WEFT_SEGMENT_STORE_ROOT` | `weft-server` | Root of the Storage v2 segment store; enables the `/storage` endpoints. | unset (storage endpoints answer `503`) |
+| `WEFT_ON_AMBIGUOUS_COMMIT` | `weft-server` | What the server does once its segment store is write-poisoned (after a COMMIT that may or may not have committed): `poison` keeps serving, refusing every write until the server restarts while reads keep working and `GET /ready` reports `poisoned`; `exit` logs and exits with status 70, for a supervisor that restarts the server. The restart's open settles the transaction either way. Read once, at startup; the `weftdb` library never reads it and never exits the process. | unset (`poison`) |
 | `WEFT_RECONCILE_INTERVAL_SECS` | `weft-server` | Background reconcile daemon sweep interval in seconds; `0`/unset disables it. | unset (disabled) |
 | `WEFT_RECONCILE_THRESHOLD` | `weft-server` | `unsorted_segments` backlog an aspect must reach before the daemon reconciles it. | `1` |
 | `WEFT_RECONCILE_HOT_COLD` | `weft-server` | Truthy → the daemon reconciles cold segments each tick and defers the hot tail until the threshold. | unset (all-or-nothing) |
@@ -579,6 +627,12 @@ WeftDB is configured primarily through environment variables:
 | `RUST_LOG` | all | [`tracing`](https://docs.rs/tracing) filter. On `weft-server` it drives a per-request root span (`request{method,path,request_id}`, echoed as `x-request-id`) that every per-stage span nests under, each with busy/idle timing: the compute paths (`interpolate.parse`/`compute`/`serialize` under `interpolate.engine`, `downsample.parse`/`reduce`); the **storage read** paths (`storage.{range,value_range,point}.read` + `.serialize`, with a `format` field over JSON/CSV/Arrow/Parquet); the **ingest** paths (`storage.ingest.parse`/`normalize`/`seal` for ILP/CSV/JSON, and `storage.ingest.parquet` for the Parquet decode+seal); the background **reconcile daemon** (`reconcile.tick{kind,…,aspects,segments}`); and the **control-plane writes** on the seal path (`control_plane.index.insert{aspect,id,rows_changed}`, `control_plane.index.delete{…}`, `control_plane.metadata.put{aspect,rows_changed}`), whose `rows_changed` is libSQL's own affected-row count (`Statement::n_change()`) rather than an inference — so a trace shows whether a catalog write actually changed anything. | `weft_tui=debug,database=debug,info` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `weft-server` | When set (e.g. `http://localhost:4317`), export tracing spans to an OpenTelemetry collector over **OTLP/gRPC** in addition to the `RUST_LOG` `fmt` output. Unset → no exporter, no network dependency; a misconfigured/absent collector never blocks startup. `scripts/verify-otlp.sh` verifies delivery end-to-end against a local Jaeger container (starting one if needed). | unset (export disabled) |
 | `SKIP_SLOW_TESTS` | tests | Set to `1` to skip long-running tests. | unset |
+
+The `WEFT_SEGMENT_*` variables configure the store `weft-server` opens; the server maps
+them to `weftdb::SegmentStoreOptions`. A program embedding `weftdb` gets them only by
+asking: `SegmentStore::open` uses `SegmentStoreOptions::default()` (every one of them
+unset), and `SegmentStore::open_with_options(root, SegmentStoreOptions::from_env())`
+reads them as the server does.
 
 The database root directory is resolved in this order:
 
