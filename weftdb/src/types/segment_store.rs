@@ -7131,8 +7131,8 @@ mod tests {
 		assert!(plain.load_partial_sidecar("temp", &plain_desc).await.expect("reads").is_none(), "no sidecar without a policy");
 	}
 
-	/// The cross-segment downsample must equal reading the whole range and reducing it in
-	/// one pass — for every reduction, across many segments, including the sketch.
+	/// `scaled_rows` admits a window to the integer path only when every present in-window
+	/// value is a `ScaledI64` at one scale and every instant fits in epoch nanoseconds.
 	#[test]
 	fn scaled_rows_takes_one_scale_scaled_columns_and_declines_the_rest() {
 		let scaled = |m: i64, scale: u8| Some(PhysicalValue::ScaledI64 { mantissa: m, scale });
@@ -7147,6 +7147,8 @@ mod tests {
 		assert_eq!(scaled_rows(&[i64::MAX / 10], &[scaled(1, 0)], 0, i64::MAX, TimeUnit::Seconds), None);
 	}
 
+	/// The cross-segment downsample must equal reading the whole range and reducing it in
+	/// one pass — for every reduction, across many segments, including the sketch.
 	#[tokio::test]
 	async fn downsample_range_equals_a_single_pass_over_the_whole_range() {
 		use splimes::{Point, Resolution};
@@ -7193,6 +7195,103 @@ mod tests {
 		let one = store.downsample_range("temp", s_start, s_end, Resolution::Hours, &aggs).await.expect("downsamples");
 		let in_one: Vec<Point> = all.iter().filter(|p| (s_start..=s_end).contains(&p.timestamp.timestamp())).cloned().collect();
 		assert_eq!(one, reduce(&in_one, Resolution::Hours, None, None, &aggs).expect("reduces"), "the single-segment fast path must equal the single pass");
+	}
+
+	/// The integer path end to end: on a `ScaledI64` aspect every frame's window goes through
+	/// `scaled_rows` into `reduce_partial_scaled`, and the merged downsample must still equal
+	/// `read_time_range` followed by one `reduce` — value for value and exponent for exponent —
+	/// across overlapping, out-of-order, nullable and paged segments, and again after
+	/// maintenance has rewritten them.
+	#[tokio::test]
+	async fn downsample_range_on_scaled_segments_takes_the_integer_path_and_matches_a_single_pass() {
+		use splimes::{Point, Resolution};
+		use weft_reduce::{reduce, Aggregation};
+
+		const ASPECT: &str = "px";
+
+		/// `downsample_range` over `[start, end]` against `read_time_range` + one `reduce`.
+		async fn assert_single_pass(store: &SegmentStore, start: i64, end: i64, aggs: &[Aggregation], label: &str) {
+			let (ts, vs) = store.read_time_range(ASPECT, start, end).await.expect("reads");
+			let points: Vec<Point> = ts.iter().zip(vs).filter_map(|(t, v)| v.map(|v| Point::new(DateTime::<Utc>::from_timestamp_millis(*t).expect("instant"), v))).collect();
+			let single = reduce(&points, Resolution::Minutes, None, None, aggs).expect("reduces");
+			let cross = store.downsample_range(ASPECT, start, end, Resolution::Minutes, aggs).await.expect("downsamples");
+			assert!(cross.len() > 1, "{label}: the fixture must span several buckets, got {}", cross.len());
+			assert_eq!(cross, single, "{label}: the downsample must equal the single pass");
+			// `BigDecimal` equality ignores the exponent, so compare the representation too.
+			for (c, s) in cross.iter().zip(&single) {
+				for (name, value) in &c.values {
+					assert_eq!(Some(value.as_bigint_and_exponent()), s.values.get(name).map(BigDecimal::as_bigint_and_exponent), "{label}: {name} at {} must carry the same digits and exponent", c.timestamp);
+				}
+			}
+		}
+
+		/// Every frame of the aspect is admitted to the integer path rather than the fallback.
+		async fn assert_integer_path(store: &SegmentStore, aggs: &[Aggregation]) {
+			let descriptors = store.index.prune_by_time(ASPECT, i64::MIN, i64::MAX).await.expect("prunes");
+			assert!(descriptors.len() > 1, "the fixture must span several segments");
+			for descriptor in &descriptors {
+				let bytes = store.read_frame(descriptor).await.expect("reads the frame");
+				let decoded = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION { weft_physical_type::weftseg::read_paged_segment_range_physical(&bytes, i64::MIN, i64::MAX) } else { weft_physical_type::weftseg::read_segment_range_physical(&bytes, i64::MIN, i64::MAX) };
+				let (ts, vs) = decoded.expect("decodes");
+				let (nanos, mantissas, scale) = scaled_rows(&ts, &vs, i64::MIN, i64::MAX, TimeUnit::Millis).expect("a ScaledI64 frame is admitted to the integer path");
+				assert_eq!(scale, 4, "the declared scale reaches the reducer");
+				assert!(weft_reduce::reduce_partial_scaled(&nanos, &mantissas, u32::from(scale), Resolution::Minutes, None, None, aggs).expect("reduces").is_some(), "every requested reduction is integer-native");
+			}
+		}
+
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		let scaled = AspectSchema::new(PhysicalType::ScaledI64 { scale: 4 }, bd("0"), TimeUnit::Millis);
+		store.declare(ASPECT, &scaled).await.expect("declares");
+		// Four-decimal values, negative and whole ones included, so the integer `avg` quotient
+		// has digits and an exponent to disagree with `BigDecimal`'s on.
+		let value = |i: i64| if i % 13 == 0 { bd(&format!("{}", i % 50 - 25)) } else { bd(&format!("{}.{:04}", (i * 37) % 211 - 100, (i * 7919).rem_euclid(10_000))) };
+		let base = 1_700_000_000_000_i64;
+		// A sorted segment, and a second interleaved with it (distinct instants, overlapping windows).
+		let a_ts: Vec<i64> = (0..300).map(|i| base + i * 7_000).collect();
+		store.seal(ASPECT, &scaled, &a_ts, &(0..300).map(value).collect::<Vec<_>>()).await.expect("seals a");
+		let b_ts: Vec<i64> = (100..400).map(|i| base + 3_500 + i * 7_000).collect();
+		store.seal(ASPECT, &scaled, &b_ts, &(100..400).map(|i| value(i + 1_000)).collect::<Vec<_>>()).await.expect("seals b");
+		// An out-of-order segment.
+		let c_ts: Vec<i64> = (0..200).rev().map(|i| base + 3_000_000 + i * 11_000).collect();
+		store.seal(ASPECT, &scaled, &c_ts, &(0..200).rev().map(|i| value(i + 2_000)).collect::<Vec<_>>()).await.expect("seals c");
+		// A nullable segment, and a paged nullable one overlapping its tail.
+		let d_ts: Vec<i64> = (0..250).map(|i| base + 6_000_000 + i * 5_000).collect();
+		let d_vs: Vec<Option<BigDecimal>> = (0..250).map(|i| (i % 5 != 0).then(|| value(i + 3_000))).collect();
+		store.seal_nullable(ASPECT, &scaled, &d_ts, &d_vs).await.expect("seals d");
+		let e_ts: Vec<i64> = (0..300).map(|i| base + 7_000_001 + i * 3_000).collect();
+		let e_vs: Vec<Option<BigDecimal>> = (0..300).map(|i| (i % 7 != 3).then(|| value(i + 4_000))).collect();
+		let paged = store.seal_paged_nullable(ASPECT, &scaled, &e_ts, &e_vs, 32).await.expect("seals e");
+		assert_eq!(paged.format_version, PAGED_SEGMENT_FORMAT_VERSION, "e is a paged frame");
+		let stats = store.aspect_stats(ASPECT).await.expect("stats");
+		assert!(stats.unsorted_segments >= 1 && stats.overlapping_segments >= 4, "the fixture holds unsorted and overlapping segments: {stats:?}");
+
+		// Streaming reductions and the sketch take the integer path; exact percentiles and TWA
+		// fall back, and must agree on the same scaled store too.
+		let integer = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::SketchP99];
+		let fallback = [Aggregation::Avg, Aggregation::P99, Aggregation::Twa];
+		let whole = (i64::MIN, i64::MAX);
+		// A window that trims inside the first, second and nullable segments.
+		let window = (base + 1_000_000, base + 6_500_000);
+
+		assert_integer_path(&store, &integer).await;
+		for (start, end) in [whole, window] {
+			assert_single_pass(&store, start, end, &integer, "sealed, integer path").await;
+			assert_single_pass(&store, start, end, &fallback, "sealed, fallback").await;
+		}
+
+		// Maintenance sorts the out-of-order segment and merges the overlapping ones; the
+		// rewritten frames must still be admitted and still agree.
+		store.reconcile_aspect(ASPECT).await.expect("reconciles");
+		store.reconcile_overlaps(ASPECT).await.expect("merges");
+		let stats = store.aspect_stats(ASPECT).await.expect("stats");
+		assert_eq!((stats.unsorted_segments, stats.overlapping_segments), (0, 0), "maintenance left no unsorted or overlapping segment: {stats:?}");
+		assert_integer_path(&store, &integer).await;
+		for (start, end) in [whole, window] {
+			assert_single_pass(&store, start, end, &integer, "maintained, integer path").await;
+			assert_single_pass(&store, start, end, &fallback, "maintained, fallback").await;
+		}
+		drop(store);
 	}
 
 	/// The sidecar **consumption** path: with a partial sidecar written per segment at the
