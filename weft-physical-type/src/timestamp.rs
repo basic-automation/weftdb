@@ -374,6 +374,51 @@ pub fn rle_varint_bytes(runs: &[(i64, usize)]) -> usize {
 	runs.iter().map(|&(value, count)| zigzag_varint_len(value) + uvarint_len(count as u64)).sum()
 }
 
+/// Read the `width`-bit field (`width <= 64`) stored LSB-first at bit offset `bit` of `data`.
+/// Bytes past the end of `data` read as `0`, so a truncated stream yields zero bits rather than
+/// panicking. The shared word-wise read behind every LSB-first bit-pack decoder: one unaligned
+/// little-endian load and a shift/mask per value, rather than one test per bit.
+#[inline]
+fn read_bits(data: &[u8], bit: usize, width: usize) -> u64 {
+	if width == 0 {
+		return 0;
+	}
+	let width = width.min(64);
+	let (byte, shift) = (bit / 8, bit % 8);
+	let mask = u64::MAX >> (64 - width);
+	if shift + width <= 64 {
+		if let Some(word) = data.get(byte..byte + 8) {
+			let mut le = [0_u8; 8];
+			le.copy_from_slice(word);
+			return (u64::from_le_bytes(le) >> shift) & mask;
+		}
+	}
+	let mut le = [0_u8; 16];
+	let tail = data.get(byte..).unwrap_or(&[]);
+	let take = tail.len().min(16);
+	le[..take].copy_from_slice(&tail[..take]);
+	let wide = u128::from_le_bytes(le) >> shift;
+	let mut low = [0_u8; 8];
+	low.copy_from_slice(&wide.to_le_bytes()[..8]);
+	u64::from_le_bytes(low) & mask
+}
+
+/// OR the low `width` bits (`width <= 64`) of `value` into `out` LSB-first at bit offset `bit`.
+/// The exact inverse of [`read_bits`]; `out` must be pre-sized and zeroed over the field (bytes
+/// past its end are dropped rather than panicking).
+#[inline]
+fn write_bits(out: &mut [u8], bit: usize, value: u64, width: usize) {
+	if width == 0 {
+		return;
+	}
+	let width = width.min(64);
+	let (byte, shift) = (bit / 8, bit % 8);
+	let field = (u128::from(value & (u64::MAX >> (64 - width)))) << shift;
+	for (dst, src) in out.iter_mut().skip(byte).zip(field.to_le_bytes()).take((shift + width).div_ceil(8)) {
+		*dst |= src;
+	}
+}
+
 /// Zig-zag a signed `i64` into an unsigned `u64` (`0,-1,1,-2 -> 0,1,2,3`), so
 /// small-magnitude negatives stay numerically small. Inverse of [`unzigzag`].
 #[must_use]
@@ -427,15 +472,8 @@ pub fn bitpack_encode(values: &[i64]) -> (u32, Vec<u8>) {
 	}
 	let w = width as usize;
 	let mut out = vec![0_u8; (values.len() * w).div_ceil(8)];
-	let mut bit = 0_usize;
-	for &v in values {
-		let zz = zigzag(v);
-		for b in 0..w {
-			if (zz >> b) & 1 == 1 {
-				out[(bit + b) / 8] |= 1 << ((bit + b) % 8);
-			}
-		}
-		bit += w;
+	for (i, &v) in values.iter().enumerate() {
+		write_bits(&mut out, i * w, zigzag(v), w);
 	}
 	(width, out)
 }
@@ -455,15 +493,7 @@ pub fn bitpack_decode_at(width: u32, bytes: &[u8], index: usize) -> i64 {
 		return 0;
 	}
 	let w = width as usize;
-	let bit = index * w;
-	let mut zz = 0_u64;
-	for b in 0..w {
-		let idx = bit + b;
-		if bytes.get(idx / 8).is_some_and(|byte| (byte >> (idx % 8)) & 1 == 1) {
-			zz |= 1 << b;
-		}
-	}
-	unzigzag(zz)
+	unzigzag(read_bits(bytes, index * w, w))
 }
 
 /// Reconstruct `count` differences from a fixed-width bit-packed buffer. Exact
@@ -474,20 +504,7 @@ pub fn bitpack_decode(width: u32, bytes: &[u8], count: usize) -> Vec<i64> {
 		return vec![0; count];
 	}
 	let w = width as usize;
-	let mut out = Vec::with_capacity(count);
-	let mut bit = 0_usize;
-	for _ in 0..count {
-		let mut zz = 0_u64;
-		for b in 0..w {
-			let idx = bit + b;
-			if bytes.get(idx / 8).is_some_and(|byte| (byte >> (idx % 8)) & 1 == 1) {
-				zz |= 1 << b;
-			}
-		}
-		out.push(unzigzag(zz));
-		bit += w;
-	}
-	out
+	(0..count).map(|i| unzigzag(read_bits(bytes, i * w, w))).collect()
 }
 
 /// The fixed block size the realized dynamic bit-pack codec partitions a
@@ -652,10 +669,9 @@ pub fn transpose_bitpack_bytes(values: &[i64], tile: usize) -> usize {
 /// layout. It is **not** the `FastLanes` layout, which keeps each value's bits together and
 /// interleaves whole packed values across the lanes of a 1024-bit virtual register.
 ///
-/// Why: the transpose makes the **high bit-planes of a small-magnitude stream empty**, so
-/// [`transpose_bitpack_decode`] skips them wholesale (an all-zero plane word contributes
-/// nothing), where the scalar per-value [`bitpack_decode`] pays for every bit of every value
-/// regardless. Exact inverse is [`transpose_bitpack_decode`] given the same `tile` and count;
+/// Why: a plane holds the same bit of 8 lanes per byte, so [`transpose_bitpack_decode`]
+/// rebuilds eight lanes per byte read with fixed, branch-free table spreads, where the
+/// scalar per-value [`bitpack_decode`] extracts each value's bits one value at a time. Exact inverse is [`transpose_bitpack_decode`] given the same `tile` and count;
 /// an empty input yields an empty buffer. The emitted length is exactly
 /// [`transpose_bitpack_bytes`] for the same `(values, tile)`.
 #[cfg(feature = "bitsliced-codec")]
@@ -687,50 +703,112 @@ pub fn transpose_bitpack_encode(values: &[i64], tile: usize) -> Vec<u8> {
 	out
 }
 
+/// `SPREAD[byte]` moves bit `k` of `byte` to bit `8k`: one bit into each of eight byte lanes.
+/// [`transpose_tile_decode`] uses it to scatter a plane byte (8 lanes' bit `b`) into the
+/// eight lanes' accumulator bytes with one lookup instead of a per-bit loop.
+#[cfg(feature = "bitsliced-codec")]
+const SPREAD: [u64; 256] = {
+	let mut table = [0_u64; 256];
+	let mut byte = 0;
+	while byte < 256 {
+		let mut k = 0;
+		while k < 8 {
+			if (byte >> k) & 1 == 1 {
+				table[byte] |= 1 << (8 * k);
+			}
+			k += 1;
+		}
+		byte += 1;
+	}
+	table
+};
+
 /// Decode one bit-sliced tile's `len` lanes from its `width` bit-planes (the `plane_bytes =
 /// ceil(len / 8)` bytes per plane starting at `planes`). Shared by [`transpose_bitpack_decode`]
 /// and [`transpose_bitpack_decode_range`].
 ///
-/// Reads each plane as `u64` words and distributes only the **set** bits of each word to their
-/// lanes (`w &= w - 1` walks set bits), so an all-zero plane word costs a single compare — the
-/// decode-latency win. A `width` of 0 (a constant tile) yields `len` zeros; bytes past `planes`
-/// read as 0 (a truncated tile yields zeros rather than panicking).
+/// Walks the tile one **byte column** (8 lanes) at a time, eight planes at a time: each plane
+/// byte is spread by [`SPREAD`] so byte `k` of a `u64` collects lane `k`'s next eight bits, then
+/// those eight bytes are OR-ed into the lanes. The loop has no data-dependent branches, so its
+/// cost is fixed by `width` rather than by how many bits are set. (The previous decoder walked
+/// only the *set* bits of each plane word, `w &= w - 1`, and measured 3.7–15× slower than the
+/// `fastlanes` crate at equal width — `benches/fastlanes_yardstick.rs`.) A `width` of 0 (a
+/// constant tile) yields `len` zeros; bytes past `planes` read as 0 (a truncated tile yields
+/// zeros rather than panicking); widths past 64 are clamped, as no zig-zag code is wider.
 #[cfg(feature = "bitsliced-codec")]
 fn transpose_tile_decode(planes: &[u8], width: usize, len: usize) -> Vec<i64> {
+	let mut out = Vec::with_capacity(len);
+	transpose_tile_decode_into(planes, width, len, &mut out);
+	out
+}
+
+/// [`transpose_tile_decode`], appending the `len` lanes to `out` instead of allocating, so a
+/// multi-tile decode writes straight into its result.
+#[cfg(feature = "bitsliced-codec")]
+fn transpose_tile_decode_into(planes: &[u8], width: usize, len: usize, out: &mut Vec<i64>) {
+	let start = out.len();
+	out.resize(start + len, 0);
 	if width == 0 {
-		return vec![0; len];
+		return;
 	}
+	let width = width.min(64);
 	let plane_bytes = len.div_ceil(8);
-	let mut acc = vec![0_u64; len];
-	for b in 0..width {
-		let plane_start = b * plane_bytes;
-		let plane = planes.get(plane_start..plane_start + plane_bytes).unwrap_or(&[]);
-		for (g, group) in plane.chunks(8).enumerate() {
-			let mut word = 0_u64;
-			for (i, &byte) in group.iter().enumerate() {
-				word |= u64::from(byte) << (i * 8);
+	let need = width * plane_bytes;
+	// A truncated buffer is zero-padded once up front, so the hot loop indexes without a
+	// per-byte fallback.
+	let padded;
+	let planes = if planes.len() >= need {
+		&planes[..need]
+	} else {
+		padded = {
+			let mut p = planes.to_vec();
+			p.resize(need, 0);
+			p
+		};
+		&padded[..]
+	};
+	let lanes = &mut out[start..];
+	for group in (0..width).step_by(8) {
+		let group_planes = &planes[group * plane_bytes..(group + 8).min(width) * plane_bytes];
+		for (column, eight) in lanes.chunks_mut(8).enumerate() {
+			// Byte `k` of `spread` collects bits `group..group + 8` of lane `8 * column + k`.
+			let mut spread = 0_u64;
+			for (j, plane) in group_planes.chunks_exact(plane_bytes).enumerate() {
+				spread |= SPREAD[usize::from(plane[column])] << j;
 			}
-			let base = g * 64;
-			let mut set = word;
-			while set != 0 {
-				let k = set.trailing_zeros() as usize;
-				if base + k < len {
-					acc[base + k] |= 1_u64 << b;
-				}
-				set &= set - 1;
+			for (k, lane) in eight.iter_mut().enumerate() {
+				*lane |= (((spread >> (8 * k)) & 0xff) << group).cast_signed();
 			}
 		}
 	}
-	acc.iter().map(|&a| unzigzag(a)).collect()
+	for lane in lanes {
+		*lane = unzigzag(lane.cast_unsigned());
+	}
+}
+
+/// Decode the single lane `lane` of one bit-sliced tile of `len` lanes and `width` bit-planes:
+/// bit `b` of the lane's zig-zag code is bit `lane % 8` of byte `lane / 8` in plane `b`. An
+/// `O(width)` read — the per-value alternative to [`transpose_tile_decode`] when only a few lanes
+/// of a tile are wanted. Bytes past `planes` read as 0, matching the whole-tile decode.
+#[cfg(feature = "bitsliced-codec")]
+fn transpose_lane_decode(planes: &[u8], width: usize, len: usize, lane: usize) -> i64 {
+	let plane_bytes = len.div_ceil(8);
+	let (byte, shift) = (lane / 8, lane % 8);
+	let mut zz = 0_u64;
+	for b in 0..width.min(64) {
+		if planes.get(b * plane_bytes + byte).is_some_and(|&v| (v >> shift) & 1 == 1) {
+			zz |= 1 << b;
+		}
+	}
+	unzigzag(zz)
 }
 
 /// Reconstruct `count` differences from a bit-sliced per-tile bit-pack buffer.
 ///
-/// Exact inverse of [`transpose_bitpack_encode`] given the same `tile` and `count`. The
-/// decode reads each bit-plane as `u64` words and distributes only the **set** bits of each
-/// word to their lanes (`w &= w - 1` walks set bits), so an all-zero plane word costs a
-/// single compare and a sparse one costs only its population — the decode-latency win over
-/// the scalar [`bitpack_decode`], which loops every bit of every value. Bytes past the buffer
+/// Exact inverse of [`transpose_bitpack_encode`] given the same `tile` and `count`. Each
+/// tile is decoded eight lanes per plane byte by the branch-free spread in
+/// `transpose_tile_decode` — the decode-latency win over the scalar [`bitpack_decode`],
+/// which loops every bit of every value. Bytes past the buffer
 /// read as `0` (a truncated tile yields zeros rather than panicking).
 #[cfg(feature = "bitsliced-codec")]
 #[must_use]
@@ -746,7 +824,7 @@ pub fn transpose_bitpack_decode(bytes: &[u8], tile: usize, count: usize) -> Vec<
 		let plane_bytes = len.div_ceil(8);
 		let data_len = width * plane_bytes;
 		let planes = bytes.get(pos..pos + data_len).unwrap_or(&[]);
-		out.extend(transpose_tile_decode(planes, width, len));
+		transpose_tile_decode_into(planes, width, len, &mut out);
 		pos += data_len;
 		remaining -= len;
 	}
@@ -783,10 +861,15 @@ pub fn transpose_bitpack_decode_range(bytes: &[u8], tile: usize, count: usize, s
 		// Decode this tile only if the requested range overlaps [idx, idx + tile_len).
 		if idx + tile_len > start {
 			let planes = bytes.get(pos..pos + data_len).unwrap_or(&[]);
-			let decoded = transpose_tile_decode(planes, width, tile_len);
 			let lo = start.saturating_sub(idx);
 			let hi = (end - idx).min(tile_len);
-			out.extend_from_slice(&decoded[lo..hi]);
+			// A short overlap reads its lanes individually (`O(width)` each) rather than paying a
+			// whole-tile decode for a handful of values — the per-tile decode-count dispatch.
+			if hi - lo < GATHER_WHOLE_TILE_THRESHOLD {
+				out.extend((lo..hi).map(|lane| transpose_lane_decode(planes, width, tile_len, lane)));
+			} else {
+				out.extend_from_slice(&transpose_tile_decode(planes, width, tile_len)[lo..hi]);
+			}
 		}
 		pos += data_len;
 		idx += tile_len;
@@ -908,14 +991,8 @@ pub fn for_bitpack_encode(values: &[i64], block: usize) -> Vec<u8> {
 		}
 		let start = out.len();
 		out.resize(start + (chunk.len() * width).div_ceil(8), 0);
-		let mut bit = 0_usize;
-		for &r in &residuals {
-			for b in 0..width {
-				if (r >> b) & 1 == 1 {
-					out[start + (bit + b) / 8] |= 1 << ((bit + b) % 8);
-				}
-			}
-			bit += width;
+		for (i, &r) in residuals.iter().enumerate() {
+			write_bits(&mut out[start..], i * width, r, width);
 		}
 	}
 	out
@@ -940,18 +1017,7 @@ pub fn for_bitpack_decode(bytes: &[u8], block: usize, count: usize) -> Vec<i64> 
 		let data_len = (block_len * width).div_ceil(8);
 		let data = bytes.get(pos..pos + data_len).unwrap_or(&[]);
 		pos += data_len;
-		let mut bit = 0_usize;
-		for _ in 0..block_len {
-			let mut r = 0_u64;
-			for b in 0..width {
-				let idx = bit + b;
-				if data.get(idx / 8).is_some_and(|byte| (byte >> (idx % 8)) & 1 == 1) {
-					r |= 1 << b;
-				}
-			}
-			out.push(for_reconstruct(min, r));
-			bit += width;
-		}
+		out.extend((0..block_len).map(|row| for_reconstruct(min, read_bits(data, row * width, width))));
 		remaining -= block_len;
 	}
 	out
@@ -987,22 +1053,270 @@ pub fn for_bitpack_decode_range(bytes: &[u8], block: usize, count: usize, start:
 			let data = bytes.get(pos..pos + data_len).unwrap_or(&[]);
 			let lo = start.saturating_sub(idx);
 			let hi = (end - idx).min(block_len);
-			for row in lo..hi {
-				let mut r = 0_u64;
-				let bit = row * width;
-				for b in 0..width {
-					let bit_idx = bit + b;
-					if data.get(bit_idx / 8).is_some_and(|byte| (byte >> (bit_idx % 8)) & 1 == 1) {
-						r |= 1 << b;
-					}
-				}
-				out.push(for_reconstruct(min, r));
-			}
+			out.extend((lo..hi).map(|row| for_reconstruct(min, read_bits(data, row * width, width))));
 		}
 		pos += data_len;
 		idx += block_len;
 	}
 	out
+}
+
+/// The largest decimal exponent a [`dfor_bitpack_encode`] block may factor out: `10^18` is the
+/// largest power of ten an `i64` holds.
+const DFOR_MAX_EXPONENT: u32 = 18;
+
+/// How many trailing decimal zeros `v` has, capped at [`DFOR_MAX_EXPONENT`] (`0` has the cap:
+/// it is a multiple of every power of ten).
+const fn decimal_trailing_zeros(v: i64) -> u32 {
+	let mut m = v.unsigned_abs();
+	if m == 0 {
+		return DFOR_MAX_EXPONENT;
+	}
+	let mut k = 0;
+	while k < DFOR_MAX_EXPONENT && m.is_multiple_of(10) {
+		m /= 10;
+		k += 1;
+	}
+	k
+}
+
+/// One decimal-exponent FOR block's header choices: the shared exponent `k`, the reduced
+/// mantissas `v / 10^k`, their minimum, and the residual width.
+fn dfor_block(chunk: &[i64]) -> (u32, Vec<i64>, i64, usize) {
+	let k = chunk.iter().map(|&v| decimal_trailing_zeros(v)).min().unwrap_or(0);
+	let divisor = 10_i64.pow(k);
+	let reduced: Vec<i64> = chunk.iter().map(|&v| v / divisor).collect();
+	let min = reduced.iter().copied().min().unwrap_or(0);
+	let width = reduced.iter().map(|&v| 64 - for_residual(v, min).leading_zeros()).max().unwrap_or(0) as usize;
+	(k, reduced, min, width)
+}
+
+/// Estimated footprint of a **decimal-exponent Frame-of-Reference** per-block bit-packing
+/// (advisory; roadmap Phase 6.1, "per-vector scale is the lever the realized exact path is
+/// missing").
+///
+/// A `ScaledI64` column carries one scale for the whole column, so a single value with
+/// eight decimals forces every mantissa of a two-decimal price series to carry six trailing
+/// zeros, about 20 wasted bits per value. This codec factors each block's common power of
+/// ten out first: `k` = the fewest trailing decimal zeros of any mantissa in the block, then
+/// FOR-packs `v / 10^k`. It is ALP's per-vector exponent kept in exact integer arithmetic, so
+/// the `BigDecimal` logical type never passes through a float. Per block: the zig-zag varint
+/// reference, one exponent byte, one width byte, and `ceil(len * width / 8)` data bytes.
+#[must_use]
+pub fn dfor_bitpack_bytes(values: &[i64], block: usize) -> usize {
+	values.chunks(block.max(1))
+		.map(|chunk| {
+			let (_, _, min, width) = dfor_block(chunk);
+			zigzag_varint_len(min) + 2 + (chunk.len() * width).div_ceil(8)
+		})
+		.sum()
+}
+
+/// Decimal-exponent Frame-of-Reference per-block encode (see [`dfor_bitpack_bytes`]).
+///
+/// Block by block: a zig-zag-varint reference (the minimum reduced mantissa), a one-byte
+/// decimal exponent `k`, a one-byte width, and the unsigned residuals of `v / 10^k`
+/// bit-packed LSB-first. The emitted length is exactly [`dfor_bitpack_bytes`]; the exact
+/// inverse is [`dfor_bitpack_decode`] given the same `block` and count. An empty input
+/// yields an empty buffer.
+#[must_use]
+pub fn dfor_bitpack_encode(values: &[i64], block: usize) -> Vec<u8> {
+	let mut out = Vec::new();
+	for chunk in values.chunks(block.max(1)) {
+		let (k, reduced, min, width) = dfor_block(chunk);
+		for_push_uvarint(&mut out, zigzag(min));
+		// Both are at most 64 by construction, so the conversions never saturate.
+		out.push(u8::try_from(k).unwrap_or(0));
+		out.push(u8::try_from(width).unwrap_or(64));
+		let start = out.len();
+		out.resize(start + (chunk.len() * width).div_ceil(8), 0);
+		for (i, &v) in reduced.iter().enumerate() {
+			write_bits(&mut out[start..], i * width, for_residual(v, min), width);
+		}
+	}
+	out
+}
+
+/// Read one decimal-exponent FOR block header at `*pos` (advancing past it): the reference,
+/// the multiplier `10^k`, the width, and the data length for a block of `block_len` values.
+/// A corrupt exponent past [`DFOR_MAX_EXPONENT`] is clamped rather than overflowing.
+fn dfor_read_header(bytes: &[u8], pos: &mut usize, block_len: usize) -> (i64, i64, usize, usize) {
+	let min = unzigzag(for_read_uvarint(bytes, pos));
+	let k = u32::from(bytes.get(*pos).copied().unwrap_or(0)).min(DFOR_MAX_EXPONENT);
+	let width = usize::from(bytes.get(*pos + 1).copied().unwrap_or(0));
+	*pos += 2;
+	(min, 10_i64.pow(k), width, (block_len * width).div_ceil(8))
+}
+
+/// Reconstruct `count` values from a decimal-exponent FOR buffer.
+///
+/// The exact inverse of [`dfor_bitpack_encode`] given the same `block` and `count`. Bytes past the buffer read as
+/// `0`, and the multiply wraps rather than panicking on a corrupt block.
+#[must_use]
+pub fn dfor_bitpack_decode(bytes: &[u8], block: usize, count: usize) -> Vec<i64> {
+	dfor_bitpack_decode_range(bytes, block, count, 0, count)
+}
+
+/// **Block-level random access** over a decimal-exponent FOR buffer.
+///
+/// Decodes only the `len` values at global index `start`. Blocks before `start` are skipped by their headers alone.
+/// Equals `dfor_bitpack_decode(bytes, block, count)[start..start + len]` (clamped to `count`).
+#[must_use]
+pub fn dfor_bitpack_decode_range(bytes: &[u8], block: usize, count: usize, start: usize, len: usize) -> Vec<i64> {
+	let block = block.max(1);
+	let end = start.saturating_add(len).min(count);
+	if start >= end {
+		return Vec::new();
+	}
+	let mut out = Vec::with_capacity(end - start);
+	let mut pos = 0_usize;
+	let mut idx = 0_usize;
+	while idx < end {
+		let block_len = block.min(count - idx);
+		let (min, multiplier, width, data_len) = dfor_read_header(bytes, &mut pos, block_len);
+		if idx + block_len > start {
+			let data = bytes.get(pos..pos + data_len).unwrap_or(&[]);
+			let lo = start.saturating_sub(idx);
+			let hi = (end - idx).min(block_len);
+			out.extend((lo..hi).map(|row| for_reconstruct(min, read_bits(data, row * width, width)).wrapping_mul(multiplier)));
+		}
+		pos += data_len;
+		idx += block_len;
+	}
+	out
+}
+
+/// Values requested from one block/tile at or above which a gather decodes the **whole**
+/// block/tile once and indexes it, rather than extracting each value individually.
+///
+/// Upstream `FastLanes` guidance: beyond roughly ten values it is typically faster to unpack a
+/// whole 1024-lane tile and index than to unpack values one by one. Below it, a per-value read is
+/// `O(width)`; above it, the shared unpack amortizes. *(src: <https://lib.rs/crates/fastlanes>)*
+pub const GATHER_WHOLE_TILE_THRESHOLD: usize = 10;
+
+/// The positions of `indices` that address a value (`< count`), ordered by the index they
+/// address — the walk order of the `*_decode_gather` family, which visits each block once.
+fn gather_order(count: usize, indices: &[usize]) -> Vec<usize> {
+	let mut order: Vec<usize> = (0..indices.len()).filter(|&p| indices[p] < count).collect();
+	order.sort_unstable_by_key(|&p| indices[p]);
+	order
+}
+
+/// The shared one-pass walk of the `*_decode_gather` family. `next_block(bytes, pos, block_len)`
+/// parses one block header at byte `pos` and returns `(header_len, data_len, block_state)`;
+/// `decode(state, data, block_len, local_lanes)` returns the values at the requested local lanes
+/// (given in ascending order). Each block's header is read once, a block nobody asked for is
+/// skipped by its length, and the walk stops after the last requested block.
+fn gather_walk<S>(bytes: &[u8], block: usize, count: usize, indices: &[usize], next_block: impl Fn(&[u8], usize, usize) -> (usize, usize, S), decode: impl Fn(&S, &[u8], usize, &[usize]) -> Vec<i64>) -> Vec<Option<i64>> {
+	let block = block.max(1);
+	let order = gather_order(count, indices);
+	let mut out = vec![None; indices.len()];
+	let (mut next, mut pos, mut idx) = (0_usize, 0_usize, 0_usize);
+	while next < order.len() {
+		let block_len = block.min(count - idx);
+		let block_end = idx + block_len;
+		let (header_len, data_len, state) = next_block(bytes, pos, block_len);
+		pos += header_len;
+		let run_end = next + order[next..].partition_point(|&p| indices[p] < block_end);
+		if run_end > next {
+			let run = &order[next..run_end];
+			let lanes: Vec<usize> = run.iter().map(|&p| indices[p] - idx).collect();
+			let data = bytes.get(pos..pos + data_len).unwrap_or(&[]);
+			for (&p, v) in run.iter().zip(decode(&state, data, block_len, &lanes)) {
+				out[p] = Some(v);
+			}
+			next = run_end;
+		}
+		pos += data_len;
+		idx = block_end;
+	}
+	out
+}
+
+/// **Multi-index gather** from a per-block adaptive bit-pack buffer: the value at each of
+/// `indices` (any order, duplicates allowed), aligned to `indices`, `None` for an index
+/// `>= count`.
+///
+/// One pass over the block headers serves the whole batch, and each touched block is decoded
+/// once: whole when at least [`GATHER_WHOLE_TILE_THRESHOLD`] of the requests land in it,
+/// value-by-value (`O(width)` each) otherwise. Equals mapping each index through
+/// `blocked_bitpack_decode(bytes, block, count).get(i)`. The batch sibling of
+/// [`blocked_bitpack_decode_range`] — which re-walks the header chain on every call.
+#[must_use]
+pub fn blocked_bitpack_decode_gather(bytes: &[u8], block: usize, count: usize, indices: &[usize]) -> Vec<Option<i64>> {
+	gather_walk(
+		bytes,
+		block,
+		count,
+		indices,
+		|b, pos, block_len| {
+			let width = u32::from(b.get(pos).copied().unwrap_or(0));
+			(1, (block_len * width as usize).div_ceil(8), width)
+		},
+		|&width, data, block_len, lanes| {
+			if lanes.len() >= GATHER_WHOLE_TILE_THRESHOLD {
+				let decoded = bitpack_decode(width, data, block_len);
+				lanes.iter().map(|&l| decoded[l]).collect()
+			} else {
+				lanes.iter().map(|&l| bitpack_decode_at(width, data, l)).collect()
+			}
+		},
+	)
+}
+
+/// **Multi-index gather** from a Frame-of-Reference per-block buffer — the FOR analogue of
+/// [`blocked_bitpack_decode_gather`].
+///
+/// One header walk, each touched block read once. A FOR
+/// residual is read per lane at `O(width)`, which is already what the whole-block decode does per
+/// row, so there is no threshold to dispatch on. Equals mapping each index through
+/// `for_bitpack_decode(bytes, block, count).get(i)`.
+#[must_use]
+pub fn for_bitpack_decode_gather(bytes: &[u8], block: usize, count: usize, indices: &[usize]) -> Vec<Option<i64>> {
+	gather_walk(
+		bytes,
+		block,
+		count,
+		indices,
+		|b, pos, block_len| {
+			let mut p = pos;
+			let min = unzigzag(for_read_uvarint(b, &mut p));
+			let width = usize::from(b.get(p).copied().unwrap_or(0));
+			p += 1;
+			(p - pos, (block_len * width).div_ceil(8), (min, width))
+		},
+		|&(min, width), data, _, lanes| lanes.iter().map(|&row| for_reconstruct(min, read_bits(data, row * width, width))).collect(),
+	)
+}
+
+/// **Multi-index gather** from a bit-sliced per-tile bit-pack buffer.
+///
+/// One pass over the tile width headers serves the whole batch, each touched tile read once: a full
+/// `transpose_tile_decode` when at least [`GATHER_WHOLE_TILE_THRESHOLD`] requests land in it,
+/// an `O(width)` per-lane extraction otherwise. This is what keeps a batch point read over the
+/// 1024-lane layout from re-decoding the same tile once per instant. Equals mapping each index
+/// through `transpose_bitpack_decode(bytes, tile, count).get(i)`.
+#[cfg(feature = "bitsliced-codec")]
+#[must_use]
+pub fn transpose_bitpack_decode_gather(bytes: &[u8], tile: usize, count: usize, indices: &[usize]) -> Vec<Option<i64>> {
+	gather_walk(
+		bytes,
+		tile,
+		count,
+		indices,
+		|b, pos, tile_len| {
+			let width = usize::from(b.get(pos).copied().unwrap_or(0));
+			(1, width * tile_len.div_ceil(8), width)
+		},
+		|&width, planes, tile_len, lanes| {
+			if lanes.len() >= GATHER_WHOLE_TILE_THRESHOLD {
+				let decoded = transpose_tile_decode(planes, width, tile_len);
+				lanes.iter().map(|&l| decoded[l]).collect()
+			} else {
+				lanes.iter().map(|&l| transpose_lane_decode(planes, width, tile_len, l)).collect()
+			}
+		},
+	)
 }
 
 /// Bit cost of one second-difference value under a **Gorilla-style variable-length**
@@ -1058,11 +1372,7 @@ pub fn gorilla_bytes(dods: &[i64]) -> usize {
 /// buffer, advancing the cursor. Same bit order as [`bitpack_encode`], so the two
 /// codecs share a decode convention.
 fn gorilla_put_bits(out: &mut [u8], bit: &mut usize, value: u64, n: usize) {
-	for b in 0..n {
-		if (value >> b) & 1 == 1 {
-			out[(*bit + b) / 8] |= 1 << ((*bit + b) % 8);
-		}
-	}
+	write_bits(out, *bit, value, n);
 	*bit += n;
 }
 
@@ -1070,13 +1380,7 @@ fn gorilla_put_bits(out: &mut [u8], bit: &mut usize, value: u64, n: usize) {
 /// Bits past the buffer read as `0` (the exact inverse of [`gorilla_put_bits`] over a
 /// buffer sized to the written bit count). Inverse convention of [`bitpack_decode`].
 fn gorilla_get_bits(bytes: &[u8], bit: &mut usize, n: usize) -> u64 {
-	let mut v = 0_u64;
-	for b in 0..n {
-		let idx = *bit + b;
-		if bytes.get(idx / 8).is_some_and(|byte| (byte >> (idx % 8)) & 1 == 1) {
-			v |= 1 << b;
-		}
-	}
+	let v = read_bits(bytes, *bit, n);
 	*bit += n;
 	v
 }
@@ -1460,6 +1764,73 @@ impl DeltaOfDeltaColumn {
 	#[must_use]
 	pub fn for_estimated_bytes(&self) -> usize {
 		8 + self.first_delta.map_or(0, zigzag_varint_len) + for_bitpack_bytes(&self.dods, BLOCKED_BITPACK_BLOCK)
+	}
+
+	/// The largest integer every first-order delta of the column is a multiple of (the GCD of
+	/// the first delta and every second difference), or [`None`] when it is `0` or `1` or the
+	/// column has no deltas. A microsecond column of millisecond-precise instants has `1000`
+	/// here.
+	#[must_use]
+	pub fn common_multiple(&self) -> Option<u64> {
+		const fn gcd(mut a: u64, mut b: u64) -> u64 {
+			while b != 0 {
+				(a, b) = (b, a % b);
+			}
+			a
+		}
+		let first = self.first_delta?.unsigned_abs();
+		let g = self.dods.iter().fold(first, |g, &d| if g == 1 { 1 } else { gcd(g, d.unsigned_abs()) });
+		(g > 1).then_some(g)
+	}
+
+	/// **Advisory** packed size after factoring out the column's [`common_multiple`](Self::common_multiple)
+	/// (roadmap Phase 6.1, pco's `IntMult` mode).
+	///
+	/// Divides the first delta and every second difference by the common multiple `g`, then takes
+	/// [`best_estimated_bytes`](Self::best_estimated_bytes) of the reduced column plus one varint
+	/// for `g`. Every delta is `g` times an integer, so the reduction is exact and the declared
+	/// [`TimeUnit`] is unchanged. Real deployments do this all the time by storing
+	/// millisecond-precise instants in a microsecond column, where every second difference
+	/// carries three wasted decimal digits (`benches/timestamp_vs_pco.rs`: 20 bits/value shipped
+	/// vs 9 for pco). `None` when there is no common multiple above 1. Not yet a realized
+	/// timestamp codec: adopting it changes the headline bytes/point.
+	#[must_use]
+	pub fn common_multiple_estimated_bytes(&self) -> Option<usize> {
+		let g = self.common_multiple()?;
+		let divisor = i64::try_from(g).ok()?;
+		let reduced = Self { first: self.first, first_delta: self.first_delta.map(|d| d / divisor), dods: self.dods.iter().map(|&d| d / divisor).collect(), unit: self.unit };
+		Some(reduced.best_estimated_bytes() + uvarint_len(g))
+	}
+
+	/// The first-order deltas this column reconstructs (`ts[i+1] - ts[i]`), recovered from the
+	/// first delta and the second differences. Empty for fewer than two points.
+	fn first_order_deltas(&self) -> Vec<i64> {
+		let Some(first_delta) = self.first_delta else {
+			return Vec::new();
+		};
+		let mut deltas = Vec::with_capacity(self.dods.len() + 1);
+		deltas.push(first_delta);
+		let mut delta = first_delta;
+		for &dod in &self.dods {
+			delta = delta.wrapping_add(dod);
+			deltas.push(delta);
+		}
+		deltas
+	}
+
+	/// **Advisory** packed size of the timestamps as **first-order deltas under per-block FOR**
+	/// rather than second differences: the anchor plus [`for_bitpack_bytes`] over the deltas at
+	/// [`BLOCKED_BITPACK_BLOCK`].
+	///
+	/// Delta-of-delta assumes a near-constant stride, so its second differences are small. On an
+	/// event stream whose intervals are independent and random, the second difference of two
+	/// random intervals spans twice their range, costing about one extra bit per value, while
+	/// FOR over the deltas pays only the interval range (`benches/timestamp_vs_pco.rs`, jittered
+	/// µs: 20 bits/value for the shipped selector vs 19 for pco). Advisory: not a realized
+	/// timestamp codec and not in [`best_estimated_bytes`](Self::best_estimated_bytes).
+	#[must_use]
+	pub fn delta_for_estimated_bytes(&self) -> usize {
+		8 + for_bitpack_bytes(&self.first_order_deltas(), BLOCKED_BITPACK_BLOCK)
 	}
 
 	/// The smallest of the plain-varint, RLE, bit-packed, Gorilla, and per-block adaptive
@@ -2204,6 +2575,155 @@ mod tests {
 	}
 
 	#[test]
+	fn delta_for_beats_delta_of_delta_on_independent_random_intervals() {
+		// Independent random intervals: second differences span twice the interval range, so
+		// FOR over the first-order deltas is smaller than the best DoD codec. A constant stride
+		// is DoD's home ground, where it stays at least as small.
+		let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+		let mut t = 1_700_000_000_000_000_i64;
+		let random: Vec<i64> = (0..4_096)
+			.map(|_| {
+				state ^= state << 13;
+				state ^= state >> 7;
+				state ^= state << 17;
+				t += i64::try_from(state % 500_000).unwrap_or(0) + 1_000;
+				t
+			})
+			.collect();
+		let col = encode_delta_of_delta(&random, TimeUnit::Micros);
+		assert_eq!(col.first_order_deltas(), random.windows(2).map(|w| w[1] - w[0]).collect::<Vec<_>>());
+		assert!(col.delta_for_estimated_bytes() < col.best_estimated_bytes(), "delta-FOR {} must beat DoD best {}", col.delta_for_estimated_bytes(), col.best_estimated_bytes());
+		let regular = encode_delta_of_delta(&(0..4_096_i64).map(|i| i * 60).collect::<Vec<_>>(), TimeUnit::Seconds);
+		assert!(regular.best_estimated_bytes() <= regular.delta_for_estimated_bytes());
+		assert_eq!(encode_delta_of_delta(&[7], TimeUnit::Seconds).delta_for_estimated_bytes(), 8);
+	}
+
+	#[test]
+	fn common_multiple_factors_ms_precise_instants_out_of_a_micros_column() {
+		// Millisecond-precise irregular instants stored in microseconds: every delta is a
+		// multiple of 1000, the reduced column is exactly the millisecond one, and the estimate
+		// is the millisecond column's best size plus a varint for the factor.
+		let ms: Vec<i64> = (0..2_000_i64)
+			.scan(1_700_000_000_000_i64, |t, i| {
+				*t += 1 + (i * 7_919) % 500;
+				Some(*t)
+			})
+			.collect();
+		let micros: Vec<i64> = ms.iter().map(|&t| t * 1_000).collect();
+		let col = encode_delta_of_delta(&micros, TimeUnit::Micros);
+		assert_eq!(col.common_multiple(), Some(1_000));
+		let as_ms = encode_delta_of_delta(&ms, TimeUnit::Millis);
+		assert_eq!(col.common_multiple_estimated_bytes(), Some(as_ms.best_estimated_bytes() + uvarint_len(1_000)));
+		assert!(col.common_multiple_estimated_bytes().unwrap_or(usize::MAX) < col.best_estimated_bytes(), "factoring must save here");
+		// No shared factor (an odd stride step), too few points, and a regular column whose
+		// only delta is the stride itself.
+		assert_eq!(encode_delta_of_delta(&[0, 3, 7, 12], TimeUnit::Micros).common_multiple(), None);
+		assert_eq!(encode_delta_of_delta(&[5], TimeUnit::Micros).common_multiple(), None);
+		assert_eq!(encode_delta_of_delta(&[0, 60, 120, 180], TimeUnit::Seconds).common_multiple(), Some(60));
+		// Negative and extreme deltas never panic.
+		assert_eq!(encode_delta_of_delta(&[i64::MAX, 0, i64::MIN], TimeUnit::Micros).common_multiple(), None);
+	}
+
+	#[test]
+	fn dfor_round_trips_and_factors_out_each_blocks_decimal_exponent() {
+		// Two-decimal prices at scale 8 (six trailing zeros each) with one eight-decimal
+		// outlier in the second block: the first block factors out 10^6, the outlier's block
+		// keeps k = 0, and every value round-trips exactly.
+		let mut prices: Vec<i64> = (0..256_i64).map(|i| (350_000 + (i * 37) % 900) * 1_000_000).collect();
+		prices[100] = 35_123_456_789;
+		for block in [1_usize, 7, 64, 256, 1024] {
+			let bytes = dfor_bitpack_encode(&prices, block);
+			assert_eq!(bytes.len(), dfor_bitpack_bytes(&prices, block), "estimate equals encoding (block {block})");
+			assert_eq!(dfor_bitpack_decode(&bytes, block, prices.len()), prices, "round trip (block {block})");
+			for (start, len) in [(0, 1), (63, 3), (99, 4), (200, 100), (256, 5)] {
+				let end = (start + len).min(prices.len());
+				assert_eq!(dfor_bitpack_decode_range(&bytes, block, prices.len(), start, len), prices[start.min(end)..end], "range {start}+{len} (block {block})");
+			}
+		}
+		let (k_clean, _, _, _) = dfor_block(&prices[..64]);
+		let (k_outlier, _, _, _) = dfor_block(&prices[64..128]);
+		assert_eq!((k_clean, k_outlier), (6, 0));
+		// The exponent is what wins: on a clean block, under half of plain FOR; over the whole
+		// column (outlier block included), still strictly smaller.
+		assert!(dfor_bitpack_bytes(&prices[..64], 64) * 2 < for_bitpack_bytes(&prices[..64], 64));
+		assert!(dfor_bitpack_bytes(&prices, 64) < for_bitpack_bytes(&prices, 64));
+		// Extremes, zeros, negatives and an empty stream.
+		let edge = [i64::MIN, i64::MAX, 0, -1_000, 1_000_000_000_000_000_000, -10, 0];
+		assert_eq!(dfor_bitpack_decode(&dfor_bitpack_encode(&edge, 4), 4, edge.len()), edge);
+		let zeros = [0_i64; 70];
+		assert_eq!(dfor_bitpack_decode(&dfor_bitpack_encode(&zeros, 64), 64, zeros.len()), zeros);
+		assert_eq!(dfor_bitpack_encode(&[], 64), Vec::<u8>::new());
+		// A corrupt exponent byte is clamped instead of overflowing `10^k`.
+		let mut corrupt = dfor_bitpack_encode(&[5, 7], 64);
+		corrupt[1] = 200;
+		let _ = dfor_bitpack_decode(&corrupt, 64, 2);
+	}
+
+	#[test]
+	fn read_and_write_bits_match_a_per_bit_reference_at_every_width_and_offset() {
+		// The word-wise field accessors must equal the one-bit-at-a-time definition for every
+		// width 0..=64 at every in-byte offset, including fields that straddle the 8-byte fast
+		// path, fields running off the end of the buffer (missing bits read as 0), and writes
+		// that must leave neighbouring fields untouched.
+		let reference_read = |data: &[u8], bit: usize, width: usize| -> u64 {
+			(0..width).fold(0_u64, |acc, b| {
+				let idx = bit + b;
+				if data.get(idx / 8).is_some_and(|byte| (byte >> (idx % 8)) & 1 == 1) {
+					acc | (1 << b)
+				} else {
+					acc
+				}
+			})
+		};
+		let data: Vec<u8> = (0..40_u32).map(|i| u8::try_from((i * 97 + 13) % 256).unwrap_or(0)).collect();
+		for width in 0..=64_usize {
+			for bit in (0..data.len() * 8 + 16).step_by(3) {
+				assert_eq!(read_bits(&data, bit, width), reference_read(&data, bit, width), "read width {width} bit {bit}");
+			}
+			for at in 0..16 {
+				let value = 0xA5C3_96E1_7B2D_4F08_u64.rotate_left(u32::try_from(width + at).unwrap_or(0));
+				let mut out = vec![0_u8; 12];
+				write_bits(&mut out, at, value, width);
+				let mask = if width == 0 { 0 } else { u64::MAX >> (64 - width) };
+				assert_eq!(read_bits(&out, at, width), value & mask, "write width {width} offset {at}");
+				let bit_set = |i: usize| (out[i / 8] >> (i % 8)) & 1 == 1;
+				assert!(!(0..at).chain(at + width..96).any(bit_set), "bits outside the field must stay clear (width {width} offset {at})");
+			}
+		}
+		// A write running off a short buffer drops the missing bytes instead of panicking.
+		let mut short = [0_u8; 2];
+		write_bits(&mut short, 4, u64::MAX, 64);
+		assert_eq!(short, [0xf0, 0xff]);
+	}
+
+	#[test]
+	#[cfg(feature = "bitsliced-codec")]
+	fn transpose_tile_decode_agrees_with_the_per_lane_decode_at_every_width() {
+		// The whole-tile decode spreads eight planes at a time; the single-lane decode reads
+		// one bit per plane. They must agree for every width (including partial final
+		// eight-plane groups), every awkward lane count, a truncated plane buffer, and a
+		// corrupt width byte past 64.
+		for width in 0..=64_usize {
+			for len in [1_usize, 7, 8, 9, 333, 1024] {
+				let plane_bytes = len.div_ceil(8);
+				let planes: Vec<u8> = (0..width * plane_bytes).map(|i| u8::try_from((i * 167 + width * 31) % 251).unwrap_or(0)).collect();
+				let tile = transpose_tile_decode(&planes, width, len);
+				assert_eq!(tile.len(), len);
+				for (lane, &v) in tile.iter().enumerate() {
+					assert_eq!(v, transpose_lane_decode(&planes, width, len, lane), "width {width}, len {len}, lane {lane}");
+				}
+				let truncated = &planes[..planes.len() / 2];
+				let tile = transpose_tile_decode(truncated, width, len);
+				for (lane, &v) in tile.iter().enumerate() {
+					assert_eq!(v, transpose_lane_decode(truncated, width, len, lane), "truncated: width {width}, len {len}, lane {lane}");
+				}
+			}
+		}
+		let planes = vec![0xff_u8; 200 * 128];
+		assert_eq!(transpose_tile_decode(&planes, 200, 1024), transpose_tile_decode(&planes, 64, 1024));
+	}
+
+	#[test]
 	#[cfg(feature = "bitsliced-codec")]
 	fn transpose_bitpack_footprint_matches_the_linear_layout_on_aligned_tiles() {
 		// The transpose is the same bit budget as the linear per-block layout for any tile
@@ -2301,5 +2821,51 @@ mod tests {
 		// An all-zero (width-0) multi-tile stream random-accesses to zeros.
 		let zeros = transpose_bitpack_encode(&[0; 40], 8);
 		assert_eq!(transpose_bitpack_decode_range(&zeros, 8, 40, 33, 5), vec![0_i64; 5]);
+	}
+
+	type GatherCodec = (&'static str, fn(&[i64], usize) -> Vec<u8>, fn(&[u8], usize, usize) -> Vec<i64>, fn(&[u8], usize, usize, &[usize]) -> Vec<Option<i64>>);
+
+	#[test]
+	fn decode_gather_matches_the_full_decode_for_every_block_codec() {
+		// The one-walk multi-index gather must equal indexing the full decode, for every
+		// block/tile size and index pattern: empty, single, a dense run inside one block (crossing
+		// the whole-tile threshold), sparse spread, duplicates, unsorted, and out-of-range (None).
+		let vals: Vec<i64> = (0..333)
+			.map(|i| {
+				if (40..56).contains(&i) {
+					1_000_000 + i
+				} else if i == 200 {
+					i64::MIN
+				} else if i == 201 {
+					i64::MAX
+				} else {
+					(i % 11) - 5
+				}
+			})
+			.collect();
+		let dense: Vec<usize> = (64..96).collect();
+		let patterns: Vec<Vec<usize>> = vec![vec![], vec![0], vec![332], dense, (0..333).step_by(37).collect(), vec![5, 5, 5, 200, 201, 5], vec![300, 2, 150, 41, 41, 0], vec![333, 1_000, 7], (0..333).rev().collect()];
+		let linear: [GatherCodec; 2] = [("blocked", blocked_bitpack_encode, blocked_bitpack_decode, blocked_bitpack_decode_gather), ("for", for_bitpack_encode, for_bitpack_decode, for_bitpack_decode_gather)];
+		#[cfg(feature = "bitsliced-codec")]
+		let bit_sliced: [GatherCodec; 1] = [("transposed", transpose_bitpack_encode, transpose_bitpack_decode, transpose_bitpack_decode_gather)];
+		#[cfg(not(feature = "bitsliced-codec"))]
+		let bit_sliced: [GatherCodec; 0] = [];
+		for (name, encode, decode, gather) in linear.into_iter().chain(bit_sliced) {
+			for block in [1_usize, 7, 8, 64, 333, 1024] {
+				let bytes = encode(&vals, block);
+				let full = decode(&bytes, block, vals.len());
+				for indices in &patterns {
+					let expected: Vec<Option<i64>> = indices.iter().map(|&i| full.get(i).copied()).collect();
+					assert_eq!(gather(&bytes, block, vals.len(), indices), expected, "{name} block={block} indices={indices:?}");
+				}
+			}
+		}
+		// A width-0 (all-zero) multi-tile stream gathers zeros on both sides of the threshold.
+		#[cfg(feature = "bitsliced-codec")]
+		{
+			let zeros = transpose_bitpack_encode(&[0; 40], 8);
+			assert_eq!(transpose_bitpack_decode_gather(&zeros, 8, 40, &[3, 39]), vec![Some(0), Some(0)]);
+			assert_eq!(transpose_bitpack_decode_gather(&zeros, 8, 40, &(0..40).collect::<Vec<_>>()), vec![Some(0); 40]);
+		}
 	}
 }

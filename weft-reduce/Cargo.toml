@@ -24,3 +24,9 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 postcard = { workspace = true }
+criterion = { workspace = true }
+weft-physical-type = { workspace = true }
+
+[[bench]]
+name = "decimal_tax"
+harness = false

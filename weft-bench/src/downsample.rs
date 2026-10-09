@@ -177,25 +177,40 @@ fn reduce_points(points: &[Point], profile: &DownsampleProfile) -> Result<Vec<Bu
 /// Returns an error if `reps == 0` or if a reduction fails (a timestamp that cannot
 /// be indexed at the resolution).
 pub fn run_downsample(profile: &DownsampleProfile, reps: usize) -> anyhow::Result<BenchResult> {
-	anyhow::ensure!(reps > 0, "reps must be > 0");
-
-	let run_start = Instant::now();
-
 	let setup_start = Instant::now();
 	let points = profile.generate();
-	let setup_ns = span_ns(setup_start);
+	run_downsample_on(profile, &points, span_ns(setup_start), reps)
+}
+
+/// Run the downsample workload over an explicit, time-sorted series of `points`.
+///
+/// The engine behind [`run_downsample`], exposed so a real corpus is reduced by exactly the
+/// same code. The profile supplies the reduction knobs (bucket resolution, aggregations,
+/// parallel chunks). `generation_ns`, the time spent producing or loading the series, is
+/// charged to setup.
+///
+/// # Errors
+///
+/// Returns an error if `reps == 0`, if `points` holds fewer than two samples, or if a
+/// reduction fails.
+pub fn run_downsample_on(profile: &DownsampleProfile, points: &[Point], generation_ns: u64, reps: usize) -> anyhow::Result<BenchResult> {
+	anyhow::ensure!(reps > 0, "reps must be > 0");
+	anyhow::ensure!(points.len() >= 2, "a downsample series needs at least two samples");
+
+	let run_start = Instant::now();
+	let setup_ns = generation_ns;
 
 	let mut samples_ns: Vec<u64> = Vec::with_capacity(reps);
 	let mut last_buckets: Vec<Bucket> = Vec::new();
 	for _ in 0..reps {
 		let t0 = Instant::now();
-		let buckets = reduce_points(&points, profile).map_err(|e| anyhow::anyhow!("downsample reduction failed: {e}"))?;
+		let buckets = reduce_points(points, profile).map_err(|e| anyhow::anyhow!("downsample reduction failed: {e}"))?;
 		samples_ns.push(span_ns(t0));
 		last_buckets = buckets;
 	}
 
 	let measured_ns = samples_ns.iter().copied().fold(0_u64, u64::saturating_add);
-	let end_to_end_ns = span_ns(run_start);
+	let end_to_end_ns = span_ns(run_start).saturating_add(generation_ns);
 	let timing = TimingBreakdown { dataset_generation_ns: setup_ns, measured_ns, end_to_end_ns };
 
 	// Correctness: the reduction is total (every input point lands in exactly one
@@ -219,13 +234,27 @@ pub fn run_downsample(profile: &DownsampleProfile, reps: usize) -> anyhow::Resul
 		0.0
 	};
 
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_DOWNSAMPLE.to_string(), reps, dataset: DatasetMeta { input_points: points.len(), output_points: last_buckets.len(), irregular: false, missingness_fraction: 0.0, seed: profile.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage: None })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_DOWNSAMPLE.to_string(), reps, dataset: DatasetMeta { input_points: points.len(), output_points: last_buckets.len(), irregular: points.windows(3).any(|w| w[2].timestamp - w[1].timestamp != w[1].timestamp - w[0].timestamp), missingness_fraction: 0.0, seed: profile.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage: None })
 }
 
 #[cfg(test)]
 mod tests {
 	/// The parallel path must be a pure performance knob: identical buckets, whatever the
 	/// chunk count. If this ever fails, `--ds-parallel` is measuring a different answer.
+	#[test]
+	fn an_explicit_series_runs_through_the_same_reduction_engine() {
+		// Exact two-decimal prices on a one-minute stride, reduced to hourly buckets: the
+		// reduction is total over the given series and the stride is detected as regular.
+		let anchor = Utc.timestamp_opt(1_505_412_060, 0).single().expect("valid epoch");
+		let points: Vec<Point> = (0..600_i64).map(|i| Point { timestamp: anchor + Duration::minutes(i), value: BigDecimal::new((355_893 + i % 97).into(), 2) }).collect();
+		let profile = DownsampleProfile::new("ds-csv", DownsampleParams { bucket_resolution: Resolution::Hours, ..DownsampleParams::default() });
+		let result = run_downsample_on(&profile, &points, 0, 2).expect("runs");
+		assert!(result.correctness.passed(), "{:?}", result.correctness);
+		assert_eq!(result.dataset.input_points, 600);
+		assert!(!result.dataset.irregular);
+		assert!(run_downsample_on(&profile, &points[..1], 0, 1).is_err());
+	}
+
 	#[test]
 	fn parallel_chunked_reduction_equals_the_serial_one() {
 		use super::{reduce_points, DownsampleParams, DownsampleProfile};

@@ -282,20 +282,23 @@ truth for status and priorities, and it records negative results alongside wins.
 
 ## Performance
 
-Every number below comes from a benchmark in this repo, named so you can re-run it.
-All were measured on one developer workstation — treat them as *shape*, not as a
+Every number below comes from a benchmark in this repo, named so you can re-run it. The
+exception is any figure measured on the real BTC corpus: that input is a local file the
+repository does not ship (see [Ingest](#ingest)), so those figures cannot be reproduced from a
+clone. All were measured on one developer workstation — treat them as *shape*, not as a
 specification for your hardware.
 
 ### Reads WeftDB optimises specifically
 
 | Operation | WeftDB | Naive full decode | Gain |
 |---|---|---|---|
-| Point lookup, 100k-row segment | **192 µs** | 11.9 ms | ~62× |
-| Point lookup, paged frame | **169 µs** | 1.20 ms | ~7.1× |
-| Batch of 64 instants | **521 µs** | 13.9 ms | ~27× |
-| 100-row window over 100k rows | **629 µs** | 12.7 ms | ~20× |
+| Point lookup, 100k-row segment | **56 µs** | 2.60 ms | ~46× |
+| Point lookup, paged frame | **33 µs** | 279 µs | ~8.5× |
+| Batch of 64 instants (one pass vs 64 single lookups) | **67 µs** | 3.57 ms | ~54× |
+| 100-row window over 100k rows | **58 µs** | 2.73 ms | ~47× |
 
-*Source: [`weft-physical-type/benches/pointread.rs`](weft-physical-type/benches/pointread.rs).*
+*Source: [`weft-physical-type/benches/pointread.rs`](weft-physical-type/benches/pointread.rs),
+re-measured 2026-10-08 after the word-wise bit reads and the slicing-by-16 frame CRC.*
 The wins come from skipping the value column entirely until a specific row is needed,
 and from resolving regular timestamp columns in closed form.
 
@@ -304,29 +307,58 @@ and from resolving regular timestamp columns in closed form.
 Sealing **1M rows** of a real 1-minute financial series into a columnar segment:
 **4.57 s — 218,963 rows/sec at 4.22 bytes/point.**
 
-That corpus is a local file, **not redistributed with this repository** and not required to
-build or test — the suite skips the tests that use it when it is absent. It is quoted here
-because a *synthetic* generator materially flatters the result: on the same workload the
-generated corpus reports **1.71 bytes/point against the real 4.22**, roughly 2.5× too
-optimistic. Storage numbers measured on generated data are not reported as results.
+That corpus (`database/datasets/btc_1min.csv`, a BTC/USD one-minute series) is a local,
+gitignored file, **not distributed with this repository** and not required to build or test —
+the suite skips the tests that use it when it is absent, and so do the benches that load it by
+default. Every "real BTC" figure in this README comes from it, so none of them can be reproduced
+from a clone. Whether those numbers are cleared for publication or retired is an open item with
+counsel before 1.0 ([1.0 plan, Appendix B](docs/release/1.0-plan.md#appendix-b-human-only-tasks)).
+The ingest figure is quoted anyway because a *synthetic* generator materially flatters the
+result: on the same workload the generated corpus reports **1.71 bytes/point against the real
+4.22**, roughly 2.5× too optimistic. Storage numbers measured on generated data are not reported
+as results.
 
 ### Reductions
 
 At 500k points, hour buckets, correctness-gated
-([`weft-bench --downsample`](weft-bench)): `avg` runs at **1.71M points/sec**;
-time-weighted average costs about 1.45× that. The approximate `sketch_p99` is
-**~4.3× faster than exact `p99`** (469 ms vs 2,019 ms) and stays within its 1% bound,
+([`weft-bench --downsample`](weft-bench); re-measured 2026-10-08, full table under
+[Compute endpoints](#compute-endpoints)): `avg` runs at **2.08M points/sec**;
+time-weighted average costs about 1.39× that. The approximate `sketch_p99` is
+**~2.6× faster than exact `p99`** (327 ms vs 852 ms) and stays within its 1% bound,
 while using bounded memory per bucket.
 
 ### Where it doesn't pay off
 
-A deliberately-kept honest result: the **bit-sliced (transposed) value codec** delivers
-~5.7× faster bit-unpacking at the kernel level, but end-to-end it is a **wash** —
-+0.08% bytes and full decode, windowed range and point reads all within noise of the
-linear codec ([`benches/transposed_read.rs`](weft-physical-type/benches/transposed_read.rs)).
-It ships **off by default** for exactly that reason (and is now behind the
-`bitsliced-codec` build feature, pending patent review). Kernel speedups often don't
-survive a whole read path, and this README would rather say so than quote the 5.7×.
+A deliberately-kept honest result: the **bit-sliced (transposed) value codec** once
+measured ~5.7× faster than the linear bit-unpack at the kernel level, but only because
+the linear decoder tested one bit at a time. Once that decoder moved to word-wise reads,
+the linear layout unpacked *faster* (1.09 vs 1.95 ms per 1 Mi values,
+[`benches/bitunpack.rs`](weft-physical-type/benches/bitunpack.rs)). End to end, the
+bit-sliced layout costs +0.08% bytes and reads no faster than the linear codec
+([`benches/transposed_read.rs`](weft-physical-type/benches/transposed_read.rs)), so it
+ships **off by default** (and is now behind the `bitsliced-codec` build feature, pending
+patent review). A kernel speedup measured against a weak baseline is not a result, and
+this README would rather say so than quote the 5.7×.
+
+Exact decimals are not free yet either. Hourly `avg` over 1M real BTC closes (the local corpus
+described under [Ingest](#ingest), not in the repository), all three paths proven to produce the
+same buckets:
+
+| path | time | vs `f64` |
+|---|---|---|
+| `f64` loop (lossy baseline) | 2.14 ms | 1× |
+| `weft_reduce::reduce_scaled` (exact, on the stored `ScaledI64` mantissas) | **13.52 ms** | ~6.3× |
+| `weft_reduce::reduce` (exact, per-sample `BigDecimal`) | 60.04 ms | ~28× |
+
+QuestDB [documents ~2×](https://questdb.com/docs/query/datatypes/decimal/) for its `DECIMAL`, so
+the precision wedge still costs more here. Before this work the shipped path measured 100.65 ms
+(~43×). Two changes closed most of the gap: integer
+accumulation, and computing each bucket's `avg` by integer long division that reproduces
+`bigdecimal`'s quotient digit for digit. Per sealed 1M-row segment (decode + six reductions), the
+stored-range downsample went from 127.6 ms to 59.7 ms. The server's `GET
+/api/v1/storage/{aspect}/downsample` now takes the integer path for `ScaledI64` segments when every
+requested reduction is streaming or a `sketch_p*`, and falls back otherwise
+([`weft-reduce/benches/decimal_tax.rs`](weft-reduce/benches/decimal_tax.rs), load average ~11).
 
 ---
 
@@ -398,14 +430,22 @@ CSV, Arrow IPC, or Parquet**:
 | `POST /api/v1/{interpolate,downsample}/{csv,arrow,parquet}` and `…/ilp/{csv,arrow,parquet}` | The same computations with CSV (`text/csv`), Arrow IPC stream, or Parquet output — so a harness feeding line protocol pulls results in any of the four formats. |
 
 **What the reductions cost.** Measured on the shipped harness (500k points, 5 reps, hour buckets,
-correctness PASS throughout — `weft-bench --downsample --ds-points 500000 --ds-aggs <agg>`):
+correctness PASS throughout — `weft-bench --downsample --ds-points 500000 --ds-aggs <agg>`;
+re-measured 2026-10-08 after the `avg` division change, at load average ~19). These
+use the generated series, whose values are exact binary expansions of floats (~50 significant
+digits), so they are a pessimistic bound. On **real** two-decimal prices (`--ds-csv`, 1M BTC/USD
+one-minute closes from the local corpus described under [Ingest](#ingest), which is not distributed
+with the repository; hourly `avg,p99,twa`) the same reduction runs at **4.24M points/sec** against
+**0.56M points/sec** for a generated series of the same size (`weft-bench --downsample --ds-csv
+database/datasets/btc_1min.csv --csv-value-col 4 --csv-skip 3000000 --ds-points 1000000 --ds-bucket h
+--ds-aggs avg,p99,twa --reps 5`):
 
 | reduction | p50 | throughput | note |
 |---|---|---|---|
-| `avg` | 293.1 ms | 1,711,287 points/sec | the streaming baseline — no bucket materialized |
-| `twa` | 426.0 ms | 1,169,431 points/sec | 1.45× the streaming cost: dwell-weighting needs the time-ordered samples |
-| `twa_bucket_end` | 430.7 ms | 1,167,829 points/sec | +1.1% over `twa` — one extra weight, effectively free |
-| `twa_linear` | 538.6 ms | 928,112 points/sec | 1.26× `twa`: an extra `BigDecimal` add + divide per interval for the trapezoidal mean |
+| `avg` | 240.8 ms | 2,075,477 points/sec | the streaming baseline — no bucket materialized |
+| `twa` | 334.1 ms | 1,515,029 points/sec | 1.39× the streaming cost: dwell-weighting needs the time-ordered samples |
+| `twa_bucket_end` | 332.1 ms | 1,518,520 points/sec | within noise of `twa` — one extra weight, effectively free |
+| `twa_linear` | 407.8 ms | 1,197,606 points/sec | 1.22× `twa`: an extra `BigDecimal` add + divide per interval for the trapezoidal mean |
 
 **Exact vs sketch percentiles — which to ask for.** The `p50`/`p90`/`p95`/`p99` reductions are
 *exact* nearest-rank: they return an actual observed `BigDecimal` from the bucket, but they
@@ -415,8 +455,8 @@ materialize and sort the whole bucket, and two buckets' results cannot be combin
 (`weft_reduce::SKETCH_ALPHA`), **bounded memory** regardless of bucket size (values fold in as they
 arrive; `SKETCH_MAX_BINS` caps the store absolutely), and an **exactly mergeable** structure, so a
 p99 can be computed over a large or streaming bucket. Measured on the shipped harness (500k points,
-5 reps, correctness PASS): `sketch_p99` runs at **1,075,976 points/sec (p50 = 468.90 ms)** versus
-exact `p99` at **249,169 points/sec (p50 = 2018.53 ms)** — **~4.3× faster**
+5 reps, correctness PASS): `sketch_p99` runs at **1,528,361 points/sec (p50 = 327.30 ms)** versus
+exact `p99` at **584,469 points/sec (p50 = 852.39 ms)** — **~2.6× faster**
 (`weft-bench --downsample --ds-points 500000 --ds-aggs sketch_p99` vs `--ds-aggs p99`).
 
 The approximation is **declared, never silent** — WeftDB's precision principle. The sketch shares the
@@ -620,7 +660,7 @@ WeftDB is configured primarily through environment variables:
 | `WEFT_SEGMENT_CHECKPOINT_STRIDE` | `weft-server` | Rows between entries of the sealed **timestamp checkpoint index** — trades a little size for much faster point lookups on **sorted, irregular** columns (~3.45× single-block; see the checkpointed-frames feature above). Applies only where it pays: sorted + irregular + at least `WEFT_SEGMENT_CHECKPOINT_MIN_ROWS` rows. ~1024 is the sweet spot (stride barely moves speed but does move size). | unset (no index; frames byte-for-byte as before) |
 | `WEFT_SEGMENT_CHECKPOINT_MIN_ROWS` | `weft-server` | Row floor below which a segment is never checkpointed (a small column decodes trivially, so an index would be pure cost). | `8192` |
 | `WEFT_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD` | `weft-server` | Ceiling on the timestamp-codec override a checkpointed seal will accept (`blocked / best` bytes; `1.0` = only when free). A checkpointed frame must use the range-decodable per-block codec, which is ~free where that codec already wins but **~3.5× on a Gorilla-shaped and ~14× on an RLE-shaped column** — this refuses those seals rather than silently bloating them. | `1.25` |
-| `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` | `weft-server` | Ceiling on the size overhead the **bit-sliced (transposed) value codec** may pay against the size-selected codec (`transposed / best` bytes; `1.0` = only when free, and a value **below 1.0 is meaningful** — the bit-sliced layout can be a strict size win, since it pays one width header per 1024-value tile where the blocked codec pays one per 64 values). Stores the value column bit-plane-major for faster bit-plane-skipping decode. Measured byte- and read-neutral end-to-end on a 1M-row column (see the bit-sliced-codec feature above), so it is off by default. **Needs a build with the `bitsliced-codec` feature**; any other build ignores the variable and logs a warning. | unset (no transposed codec; frames byte-for-byte as before) |
+| `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` | `weft-server` | Ceiling on the size overhead the **bit-sliced (transposed) value codec** may pay against the size-selected codec (`transposed / best` bytes; `1.0` = only when free, and a value **below 1.0 is meaningful** — the bit-sliced layout can be a strict size win, since it pays one width header per 1024-value tile where the blocked codec pays one per 64 values). Stores the value column bit-plane-major. Measured byte-neutral end to end on a 1M-row column and no faster to read than the linear codec (see [Where it doesn't pay off](#where-it-doesnt-pay-off)), so it is off by default. **Needs a build with the `bitsliced-codec` feature**; any other build ignores the variable and logs a warning. | unset (no transposed codec; frames byte-for-byte as before) |
 | `WEFT_SEGMENT_PARTIAL_BASE` | `weft-server` | Resolution token (`seconds`/`minutes`/`hours`/…) at which each sealed segment materializes a **partial-reduction `.weftpart` sidecar** — a stored mergeable partial of the bounded reductions. A stored-range downsample of those reductions then **merges the sidecars instead of decoding the value column** (measured **3.2×**), re-keyed to any coarser nesting resolution. A sealed segment is immutable, so the sidecar never goes stale; a rewrite (reconcile/split/squash) regenerates it. | unset (no sidecar; `downsample_range` decodes as before) |
 | `WEFT_SEGMENT_PARTIAL_MIN_ROWS` | `weft-server` | Row floor below which a segment gets no partial sidecar (a tiny segment's partial saves too little decode to be worth the extra file). | `4096` |
 | `WEFT_SEGMENT_PARTIAL_TIERS` | `weft-server` | Comma-separated fine→coarse rollup resolutions (e.g. `hours,days`) materialized **beside** the `WEFT_SEGMENT_PARTIAL_BASE` partial, each re-keyed from the tier below (up to four kept; a finer/non-nesting entry is skipped). A coarse stored-range downsample then folds the coarsest matching tier instead of re-keying the whole fine base (measured **~1.16×** on a DAY query over a MINUTES base). No effect unless `WEFT_SEGMENT_PARTIAL_BASE` is set. | unset (base-only sidecar) |
@@ -1006,7 +1046,12 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   byte-for-byte unchanged; the realized figure is reported as
   `StorageEstimate.realized_value_bytes` / `value_codec`. The timestamp column keeps an
   *advisory* FOR estimate (`for_estimated_bytes`) — second differences are near-zero, so
-  FOR rarely wins there.
+  FOR rarely wins there. Every linear bit-packed codec decodes with a word-wise field read
+  (one unaligned load and a shift/mask per value), so 1 Mi mantissas unpack in **1.09 ms**
+  (fixed width) / **1.83 ms** (per-block)
+  ([`weft-physical-type/benches/bitunpack.rs`](weft-physical-type/benches/bitunpack.rs)), and
+  1 Mi real BTC closes stored under FOR at scale 8 decode to floats in **1.66 ms**
+  ([`weft-physical-type/benches/alp_vs_f64_codecs.rs`](weft-physical-type/benches/alp_vs_f64_codecs.rs)).
 - **Two-level delta cascade (opt-in)** — a **trending** `ScaledI64` column (a counter or
   monotone sensor whose magnitude every single-level codec pays for) is additionally
   compressible by a *cascade*: delta-transform the mantissas, then pack the differences with
@@ -1018,18 +1063,24 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   held for owner sign-off; the default codec choice is unchanged.
 - **Bit-sliced (transposed) value codec (opt-in, `bitsliced-codec` build feature)** —
   `VAL_CODEC_TRANSPOSED` stores a
-  `ScaledI64` column's mantissas **bit-plane-major** in 1024-value tiles, so the decoder reads `u64`
-  plane words and walks only the *set* bits and a small-magnitude column's empty high bit-planes are
-  skipped wholesale. It carries its **own** size function (`transposed_value_bytes`) and selector
+  `ScaledI64` column's mantissas **bit-plane-major** in 1024-value tiles, so the decoder rebuilds
+  eight lanes per plane byte with branch-free table spreads and a tile's width header drops the
+  empty high bit-planes of a small-magnitude column. The decode kernel is checked against an
+  external yardstick, the published `fastlanes` crate, at equal bit width
+  ([`weft-physical-type/benches/fastlanes_yardstick.rs`](weft-physical-type/benches/fastlanes_yardstick.rs),
+  1 Mi values): WeftDB's decoder takes **0.78 / 1.50 / 2.32 ms** at widths 3 / 10 / 20 against
+  `fastlanes`' **0.33 ms** — still **2.4–7× behind**, and that gap is an open roadmap item, not a
+  design choice. It carries its **own** size function (`transposed_value_bytes`) and selector
   entry (`best_value_codec_transposed(max_overhead)`) rather than reusing the blocked figure, is
   random-access capable (so it does not regress the streaming point read), and is requested through
   `FrameOptions` / `Segment::write_to_with` or, from a deployment, `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD`.
-  **Honest result: the kernel-level decode win does not survive the whole read path.** Measured on a
-  1M-row zero-straddling column ([`weft-physical-type/benches/transposed_read.rs`](weft-physical-type/benches/transposed_read.rs)):
-  frame bytes **+0.08%** (1,251,057 vs 1,250,076), full decode **12.98 ms vs 13.39 ms** (a tie —
-  confidence intervals overlap), windowed 1000-row range **2.380 ms vs 2.393 ms** (a tie), single
-  point read **2.250 ms vs 2.431 ms** (~1.08×, non-overlapping intervals). So the layout is
-  byte-neutral and read-neutral here; it stays **opt-in** and the default codec choice is unchanged.
+  **Honest result: no read-path win over the linear codec.** Measured on a 1M-row zero-straddling
+  column ([`weft-physical-type/benches/transposed_read.rs`](weft-physical-type/benches/transposed_read.rs),
+  2026-10-08, transposed vs linear): frame bytes **+0.08%** (1,251,057 vs 1,250,076), full decode
+  **7.81 ms vs 6.87 ms**; with the slicing-by-16 frame CRC, windowed 1000-row range **638 µs vs
+  632 µs** and single point read **820 µs vs 805 µs**. So the layout is byte-neutral and no faster
+  (slightly slower) on reads; it stays **opt-in** and the
+  default codec choice is unchanged.
   Note the codec is chosen only when a *strict* size win or within the caller's overhead ceiling —
   the ceiling may legitimately be set below 1.0, because per-tile widths with one header per 1024
   values can beat both a global width and the blocked codec's one-header-per-64. It is a
@@ -1054,9 +1105,9 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   does the same for a paged frame, first pruning pages on their indexed min/max timestamp so only
   the surviving page is touched. A **regular (constant-stride) timestamp column** is resolved in
   closed form — `ts[i] = first + i*step`, so the row for an instant is `O(1)` with no timestamp
-  materialization at all. Measured **~62× faster** point lookup on a 100k-row single-block FOR
-  segment (192 µs vs 11.9 ms) and **~7.1× faster** on the paged frame (169 µs vs 1.20 ms), with the
-  closed-form timestamp path a further **~7×** over an irregular column (192 µs vs 1.34 ms), identical
+  materialization at all. Measured **~46× faster** point lookup on a 100k-row single-block FOR
+  segment (56 µs vs 2.60 ms) and **~8.5× faster** on the paged frame (33 µs vs 279 µs), with the
+  closed-form timestamp path a further **~3.4×** over an irregular column (56 µs vs 188 µs), identical
   bytes on disk ([`weft-physical-type/benches/pointread.rs`](weft-physical-type/benches/pointread.rs)).
 - **Checkpointed frames — sublinear point lookup on an *irregular* sorted column** *(opt-in;
   `write_segment_checkpointed` / `write_paged_segment_checkpointed`)*. The closed form above only
@@ -1118,8 +1169,8 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   min/max timestamp without decoding a column byte** before touching the one surviving page.
   `SegmentStore::read_points` resolves a **batch** of instants in one pass — the index is pruned
   once and each segment's timestamp column decoded once for the whole batch, so `N` instants
-  sharing a segment cost one decode, not `N` (**~27× faster** for 64 instants on a 100k-row FOR
-  frame — 452 µs vs 12.2 ms,
+  sharing a segment cost one decode, not `N` (**~54× faster** for 64 instants on a 100k-row FOR
+  frame than 64 single lookups — 67 µs vs 3.57 ms,
   [`weft-physical-type/benches/pointread.rs`](weft-physical-type/benches/pointread.rs)).
 - **Intra-segment reconciliation** — `SegmentStore::reconcile_segment`/`reconcile_aspect`
   rewrite an out-of-order segment into a sorted one in place (stable sort by
@@ -1180,8 +1231,8 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   nulls there are skipped). A **range read over a regular (constant-stride)
   block-coded segment** goes further — `read_segment_range` computes the row
   window in closed form and unpacks only the present values inside it, so a
-  selective range decodes ~`window` values, not the whole segment (**~20× faster**
-  for a 100-row window over a 100k-row FOR frame — 629 µs vs 12.7 ms,
+  selective range decodes ~`window` values, not the whole segment (**~47× faster**
+  for a 100-row window over a 100k-row FOR frame — 58 µs vs 2.73 ms,
   [`weft-physical-type/benches/pointread.rs`](weft-physical-type/benches/pointread.rs)).
 - **Control plane** — `SegmentIndexStore` persists one descriptor per sealed
   segment in libSQL and answers range queries with SQL pruning;
@@ -1296,16 +1347,31 @@ What it does today:
   seals a `.weftseg` segment and times the streaming point read
   (`read_segment_point`/`read_segment_points`, single or batch, single-block or
   paged via `--pl-rows-per-page`, regular closed-form vs irregular), gated against
-  the full-decode value; **`range_fetch`** (`--range-fetch`) times the windowed
+  the full-decode value — also over a real corpus with `--pl-csv` (1M real BTC closes:
+  a 128-instant batch at p50 **2.43 ms** single-block vs **0.90 ms** paged at 8,192 rows/page,
+  `weft-bench --point-lookup --pl-csv database/datasets/btc_1min.csv --csv-value-col 4
+  --csv-skip 3000000 --pl-rows 1000000 --pl-queries 128 [--pl-rows-per-page 8192] --reps 50`);
+  **`range_fetch`** (`--range-fetch`, real corpus via `--rf-csv`: 32 × 100-row windows over 1M
+  real BTC closes at p50 **60.8 ms** single-block vs **17.8 ms** paged) times the windowed
   range read; **`compression`** (`--compression`) reports realized bytes/point, the
   value-column compression ratio, and decode throughput, gated on an exact
-  round-trip; and **`downsample`** (`--downsample`) times WeftDB's canonical
+  round-trip — over a seeded shape, or a **real corpus** with `--comp-csv <FILE>`
+  (`--csv-value-col`, `--csv-skip`; values read as exact decimal text; `--pl-csv` does the same for `point_lookup`). On 1M real
+  BTC/USD one-minute closes (rows 3M onward of `btc_1min.csv`) it measures **4.22 B/point
+  realized** (`scaled_for`, exact), full-decode **20.8M points/sec** (p50 52.7 ms, 5 reps),
+  and an advisory decimal-exponent FOR footprint of **1.70 B/point**
+  (`weft-bench --compression --comp-csv database/datasets/btc_1min.csv --csv-value-col 4
+  --csv-skip 3000000 --comp-rows 1000000 --reps 5`); and **`downsample`** (`--downsample`) times WeftDB's canonical
   [`weft-reduce`](weft-reduce) reduction into grid-aligned buckets with a
   `--ds-aggs` selector over `min`/`max`/`avg`/`sum`/`first`/`last`/`p50`…`p99`/`twa`/`twa_linear`/`twa_bucket_end`/`sketch_p50`…`sketch_p99`.
   `--ds-parallel <N>` reduces in N chunks via mergeable partial reductions (identical
-  buckets to serial, asserted by test) — measured **14.7× at 64 chunks** on a 16-core box
+  buckets to serial, asserted by test) — measured **14.7× at 64 chunks** on a quiet 16-core box
   (441.2 ms → 30.1 ms, 1,134,659 → 16,921,104 points/sec, `--ds-aggs sketch_p99`, 500k points,
-  5 reps, correctness PASS).
+  5 reps, correctness PASS); a re-run on 2026-10-08 at load average ~19 measured 327.3 → 48.5 ms
+  (6.7×).
+  The real-corpus figures in this bullet come from `btc_1min.csv`, a local file not distributed
+  with the repository (see [Ingest](#ingest)); point `--pl-csv` / `--rf-csv` / `--comp-csv` /
+  `--ds-csv` at a CSV of your own to run the same workloads on real data.
   The underlying point/range read speedups are quantified at the codec layer in
   [`weft-physical-type/benches/pointread.rs`](weft-physical-type/benches/pointread.rs).
 - **Vendor-neutral adapters** — every system is driven through the
@@ -1327,12 +1393,24 @@ What it does today:
   potential-saving** estimates for codecs not yet realized on disk: the best-of
   f64 value codec (Gorilla / Chimp / **Chimp128** XOR, `advisory_best_f64_bytes` /
   `_codec`) for a lossy `F64` column, and the **Sprintz FIRE** forecaster's
-  footprint on the timestamp column (`advisory_fire_timestamp_bytes`) — each a
-  *what-if* number the adopt-or-drop decision reads, never a realized headline
-  claim. These codecs live behind `weft-physical-type`'s `experimental-codecs`
-  feature, which only `weft-bench` enables.
+  footprint on the timestamp column (`advisory_fire_timestamp_bytes`), and the
+  **decimal-exponent FOR** value codec (`advisory_dfor_value_bytes`, schema v17,
+  present only when it beats the realized codec — e.g. a `ScaledI64` column whose
+  scale is forced by a few high-precision values; real BTC closes measure 13.58 vs
+  33.74 bits/value in
+  [`weft-physical-type/benches/alp_vs_f64_codecs.rs`](weft-physical-type/benches/alp_vs_f64_codecs.rs)),
+  plus two timestamp-column what-ifs (schema v18), each present only when it beats the
+  realized codec: `advisory_common_multiple_timestamp_bytes` (the GCD of the deltas
+  factored out — millisecond-precise instants stored in microseconds measure 20 → 10
+  bits/value in
+  [`weft-physical-type/benches/timestamp_vs_pco.rs`](weft-physical-type/benches/timestamp_vs_pco.rs))
+  and `advisory_delta_for_timestamp_bytes` (first-order deltas under per-block FOR, for
+  independent random intervals: 20.0 → 19.4 bits/value)
+  — each a *what-if* number the adopt-or-drop decision reads, never a realized
+  headline claim. The f64 codecs and FIRE live behind `weft-physical-type`'s
+  `experimental-codecs` feature, which only `weft-bench` enables.
 - **Reports** — a `BenchReport` JSON artifact (run metadata + a best-effort
-  hardware probe: CPU model, cores, RAM) under `reports/json/`, plus a
+  hardware probe: CPU model, cores, RAM, and the kind/file system/mount of the disk under the working directory) under `reports/json/`, plus a
   self-contained **HTML** view (`--html`) with the most-accurate row highlighted.
 - **The engine the server runs** — an interpolation run first calls
   `splimes::calibrate()` once, as `weft-server` does at startup (skipping a
@@ -1360,6 +1438,7 @@ cargo run -p weft-bench -- \
 cargo run -p weft-bench -- --point-lookup --pl-rows 100000 --pl-queries 128 --reps 50
 cargo run -p weft-bench -- --range-fetch --rf-window 100 --rf-windows 32 --reps 30
 cargo run -p weft-bench -- --compression --comp-shape clustered --reps 20
+cargo run --release -p weft-bench -- --compression --comp-csv database/datasets/btc_1min.csv --csv-value-col 4 --csv-skip 3000000 --comp-rows 1000000 --reps 5
 cargo run -p weft-bench -- --downsample --ds-bucket m --ds-aggs min,max,p99,twa --reps 20
 ```
 

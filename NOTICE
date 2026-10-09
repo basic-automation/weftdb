@@ -5,9 +5,14 @@ WeftDB is licensed under either of the Apache License, Version 2.0
 (see LICENSE-APACHE) or the MIT License (see LICENSE-MIT), at your option.
 
 It includes portions adapted from the third-party works below, which are
-licensed under the Apache License, Version 2.0. Each crate that contains such
+licensed under the Apache License, Version 2.0 (bigdecimal-rs under MIT OR
+Apache-2.0, used here under Apache-2.0). Each crate that contains such
 portions ships a THIRD-PARTY-NOTICES file with the details, the upstream
 NOTICE text where there is one, and the full license text.
+
+- bigdecimal-rs (https://github.com/akubera/bigdecimal-rs), Copyright 2023
+  The BigDecimal-rs Contributors. Adapted in weft-reduce, src/scaled.rs.
+  See weft-reduce/THIRD-PARTY-NOTICES.
 
 - Chimp (https://github.com/panagiotisl/chimp), Copyright the Chimp authors.
   Adapted in weft-physical-type, src/floatcodec.rs.
