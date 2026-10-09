@@ -2,6 +2,21 @@ name: Publish to crates.io
 
 # Manual only, on purpose. Publishing is irreversible — a version can be yanked but
 # never replaced — so this never fires automatically from a push or a tag.
+#
+# One dispatch runs one of two jobs:
+# - dry-run (the default) verifies every crate and uploads nothing. It names no
+#   environment, on purpose: GitHub creates a missing environment, unprotected, the
+#   first time a job references it, so a dry run must never mention `crates-io`.
+# - execute publishes the existing release `tag`, and must be dispatched from that tag
+#   (--ref <tag>). It runs in the `crates-io` environment, which holds the
+#   CARGO_REGISTRY_TOKEN secret. It checks out the tag, proves it did, and runs the
+#   release gate (scripts/release/verify.sh) on it before anything is uploaded.
+#
+# Create `crates-io` (required reviewers; deployments limited to v* tags) before the
+# first dispatch of this workflow, dry run included: whether GitHub creates the
+# environment for a job its `if:` skips is not documented. See RELEASING.md.
+#
+# Third-party actions are pinned to full commit SHAs (Dependabot keeps them current).
 on:
   workflow_dispatch:
     inputs:
@@ -9,27 +24,100 @@ on:
         description: "Verify only, upload nothing"
         type: boolean
         default: true
+      tag:
+        description: "Execute only (dry_run off): the existing release tag to publish, e.g. v0.1.0; dispatch from that tag"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
-jobs:
-  publish:
-    runs-on: ubuntu-latest
-    # Requires the `crates-io` environment (add the CARGO_REGISTRY_TOKEN secret there,
-    # and required reviewers if you want a second pair of eyes on every release).
-    environment: crates-io
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+defaults:
+  run:
+    shell: bash
 
+jobs:
+  dry-run:
+    if: inputs.dry_run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Read the release toolchain
+        id: toolchain
+        run: echo "version=$(tr -d '[:space:]' < .github/release-toolchain)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Dry run
-        if: ${{ inputs.dry_run }}
         run: ./scripts/publish.sh
 
+  execute:
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      actions: read # verify.sh reads ci.yml's runs for the commit
+    steps:
+      - name: Validate the tag
+        env:
+          TAG: ${{ inputs.tag }}
+          LC_ALL: C # byte-wise [0-9]: no other scripts' digits
+        run: |
+          re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.(0|[1-9][0-9]*))?$'
+          if [[ ! $TAG =~ $re ]]; then
+            echo "::error::tag must be an existing vX.Y.Z or vX.Y.Z-rc.N tag"
+            exit 1
+          fi
+          # This workflow file and the scripts it runs then come from the tagged commit.
+          if [[ $GITHUB_REF != "refs/tags/$TAG" ]]; then
+            echo "::error::dispatch this workflow from the tag (--ref $TAG), not from $GITHUB_REF"
+            exit 1
+          fi
+
+      # Every branch and tag: verify.sh checks the commit's ancestry against them.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Assert the checkout is the tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          head=$(git rev-parse HEAD)
+          tagged=$(git rev-parse "refs/tags/$TAG^{commit}")
+          if [[ $head != "$tagged" ]]; then
+            echo "::error::checked out $head, but $TAG is $tagged"
+            exit 1
+          fi
+          echo "publishing $TAG at $head"
+
+      # No build cache here: the publish verification builds from a clean target dir.
+      - name: Read the release toolchain
+        id: toolchain
+        run: echo "version=$(tr -d '[:space:]' < .github/release-toolchain)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
+
+      # The release workflow's gate: the tag matches weft-server's version, the commit is
+      # on main or a release branch, its CI passed, and CHANGELOG.md has its section.
+      - name: Verify the tag
+        env:
+          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/release/verify.sh tag "$TAG"
+
       - name: Publish
-        if: ${{ !inputs.dry_run }}
         run: ./scripts/publish.sh --execute
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

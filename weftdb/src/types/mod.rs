@@ -14,6 +14,7 @@ pub use database::{
 };
 pub use dataset::{Dataset, DatasetId};
 pub use dictionary::{Dictionary, DictionaryConstraints, DictionaryId, DictionaryMetadata, Steps, Variability, VariablilityType};
+pub use dictionary_name::InvalidDictionaryName;
 pub use event::{Event, EventID, EventName, Events, Manifestation, ManifestationId};
 pub use input_measurement::InputMeasurement;
 pub use measurement::{Measurement, MeasurementId};
@@ -48,6 +49,7 @@ pub mod correlation;
 pub mod database;
 pub mod dataset;
 pub mod dictionary;
+pub mod dictionary_name;
 pub mod durable;
 pub mod error;
 pub mod event;

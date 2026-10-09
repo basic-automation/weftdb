@@ -7,7 +7,8 @@
 #   ./scripts/publish.sh            # dry run: verifies every crate, uploads nothing
 #   ./scripts/publish.sh --execute  # actually publishes
 #
-# Requires `cargo login` (or CARGO_REGISTRY_TOKEN in the environment).
+# Requires `cargo login` (or CARGO_REGISTRY_TOKEN in the environment). Run --execute
+# from a checkout of the release tag, after the tag is pushed (RELEASING.md).
 #
 # weft-server, weft-tui and weft-bench are `publish = false`: they ship as GitHub
 # release binaries, not registry crates.
@@ -52,5 +53,5 @@ done
 
 echo
 echo "All library crates published."
-echo "Next: push the tag so the release workflow builds the binaries, e.g."
-echo "  git tag -a v0.1.0 -m 'WeftDB v0.1.0' && git push origin v0.1.0"
+echo "Next: check and publish the draft GitHub release the release workflow made for"
+echo "this tag (RELEASING.md, \"Publish the GitHub release\")."

@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # Release branches too: the release workflow accepts only a push (or dispatched, or
+    # scheduled) run of this workflow as evidence that a commit passed CI, never a pull
+    # request's run, which tests a merge with the base branch rather than the commit.
+    branches: [main, "release/**"]
   pull_request:
   schedule:
     # Nightly: the full suite including the slow pipeline tests, plus a fresh advisory scan.
@@ -39,8 +42,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      # Stable jobs build with the release compiler, pinned in one file that the release
+      # workflow reads too, so CI tests with the same compiler that builds a release. (Not
+      # the same build: CI unifies features across --workspace and uses the dev profile;
+      # a release builds each binary alone, with fat LTO.)
+      - name: Read the release toolchain
+        id: toolchain
+        shell: bash
+        run: echo "version=$(tr -d '[:space:]' < .github/release-toolchain)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
         with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
           components: clippy
       - uses: Swatinem/rust-cache@v2
       # Gated on the categories that catch defects. `style`/`pedantic`/`nursery`
@@ -56,6 +68,8 @@ jobs:
           RUSTFLAGS: ""
 
   # The MSRV is a published promise in Cargo.toml (rust-version); prove it still holds.
+  # Pinned here on purpose, not read from .github/release-toolchain: this job tests the
+  # oldest supported compiler, not the release one.
   msrv:
     name: msrv (1.95)
     runs-on: ubuntu-latest
@@ -98,7 +112,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1 vulkan-tools
           vulkaninfo --summary || true
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Read the release toolchain
+        id: toolchain
+        shell: bash
+        run: echo "version=$(tr -d '[:space:]' < .github/release-toolchain)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --workspace --all-targets --locked
@@ -126,6 +146,17 @@ jobs:
           cargo test -p weft-orchestration --features fault-injection --locked --test legacy_queue_crash -- --test-threads=4
           # Not a crash test, but it poisons a store through the same feature's hook.
           cargo test -p weft-server --features fault-injection --locked --test ready_poisoned -- --test-threads=4
+      # Tests create their legacy databases in a temporary data dir (weftdb/tests/common,
+      # weft-orchestration's test_support, db_tests' own temp dirs), never in the default
+      # ~/.weftdb/data. A fresh runner has no ~/.weftdb, so one here was written by a test.
+      - name: Tests wrote nothing to ~/.weftdb
+        shell: bash
+        run: |
+          if [ -e "$HOME/.weftdb" ]; then
+            echo "::error::the test run wrote to $HOME/.weftdb; a test must create its databases in a temporary data dir"
+            find "$HOME/.weftdb" -maxdepth 3 | head -n 50
+            exit 1
+          fi
 
   # The workspace jobs never see weft-physical-type's cargo features on their own terms:
   # resolver 2 unifies features across `--workspace`, so weft-bench's `experimental-codecs`
@@ -140,7 +171,13 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Read the release toolchain
+        id: toolchain
+        shell: bash
+        run: echo "version=$(tr -d '[:space:]' < .github/release-toolchain)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
       - uses: Swatinem/rust-cache@v2
       - name: Check default features alone (no workspace feature unification)
         run: cargo check -p weft-physical-type -p weftdb --all-targets --locked
@@ -162,7 +199,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Read the release toolchain
+        id: toolchain
+        shell: bash
+        run: echo "version=$(tr -d '[:space:]' < .github/release-toolchain)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
       - uses: Swatinem/rust-cache@v2
       - name: Build docs (deny broken intra-doc links)
         run: cargo doc --workspace --no-deps --locked
@@ -175,7 +218,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Read the release toolchain
+        id: toolchain
+        shell: bash
+        run: echo "version=$(tr -d '[:space:]' < .github/release-toolchain)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo package --workspace --no-verify --locked
 
@@ -200,3 +249,23 @@ jobs:
       - run: python3 -m unittest discover -s scripts/contrib -p 'test_*.py' -v
         env:
           PYTHONDONTWRITEBYTECODE: "1"
+
+  # The workflows (actionlint, which also shellchecks their run: blocks) and the release
+  # scripts (shellcheck, then their tests against a throwaway repository).
+  release-scripts:
+    name: actionlint + shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: actionlint
+        uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # 1.7.12
+        with:
+          args: -color
+      - name: shellcheck
+        run: shellcheck --version && shellcheck scripts/release/*.sh
+      - name: verify.sh tests
+        run: scripts/release/test-verify.sh
+      - name: stage.sh tests
+        run: scripts/release/test-stage.sh

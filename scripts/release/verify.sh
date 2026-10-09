@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+# Decide whether the release workflow may build a commit, and which commit that is.
+#
+#   scripts/release/verify.sh tag <vX.Y.Z | vX.Y.Z-rc.N>   # a release
+#   scripts/release/verify.sh ref <branch | tag | commit>   # a dry run
+#
+# A release fails unless every one of these holds:
+#   1. the tag is exactly vX.Y.Z or vX.Y.Z-rc.N (it is checked before any other use);
+#   2. refs/tags/<tag> already exists, so the release can never create it;
+#   3. <tag> is "v" followed by weft-server's version at that commit (cargo metadata);
+#   4. the commit is an ancestor of origin/main, or of a maintenance branch
+#      origin/release/<major>.<minor> whose <major>.<minor> is the version's (for patch
+#      releases). No other branch counts, so a feature branch named release/<anything>
+#      cannot make a commit releasable;
+#   5. the most recent completed run of the CI workflow for the commit concluded success.
+#      Only runs that tested the commit itself count: push, workflow_dispatch and schedule
+#      runs in this repository. A pull_request run tested a merge with the base branch
+#      (and a fork's runs use the fork's workflow), so neither is evidence. Cancelled and
+#      skipped runs are ignored;
+#   6. CHANGELOG.md at the commit has a non-empty "## [<version>]" section.
+# A dry run checks only 4 and 5, against <ref>.
+#
+# On success it prints, and appends to $GITHUB_OUTPUT when that is set:
+#   sha=<commit>  version=<weft-server version>  tag=<tag>  prerelease=<true|false>
+# For a dry run, tag is the tag this version would be released as (v<version>).
+#
+# It reads the repository it runs in, which must have every branch and tag fetched
+# (actions/checkout with fetch-depth: 0). It needs git, cargo, jq and gh.
+#
+# Environment:
+#   GITHUB_REPOSITORY  owner/name whose CI runs are checked (required)
+#   GH_TOKEN           token for gh, with actions: read
+#   CI_WORKFLOW        the CI workflow file (default: ci.yml)
+#   NOTES_OUT          a release writes its CHANGELOG section here (optional)
+#   GITHUB_OUTPUT      receives the outputs above (optional)
+set -euo pipefail
+# Byte-wise regexes: in a locale like en_US.UTF-8, bash's [0-9] also matches other
+# scripts' digits (v１.2.3 passes), so every pattern below is matched in the C locale.
+export LC_ALL=C
+
+TAG_RE='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.(0|[1-9][0-9]*))?$'
+# Branch and tag names as this repository uses them, or an abbreviated or full commit id.
+REF_RE='^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$'
+VERSION_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+
+fail() {
+	if [[ ${GITHUB_ACTIONS:-} == true ]]; then
+		printf '::error title=release verify::%s\n' "$*"
+	else
+		printf 'verify: %s\n' "$*" >&2
+	fi
+	exit 1
+}
+
+note() { printf 'verify: %s\n' "$*"; }
+
+emit() {
+	printf '%s=%s\n' "$1" "$2"
+	if [[ -n ${GITHUB_OUTPUT:-} ]]; then
+		printf '%s=%s\n' "$1" "$2" >>"$GITHUB_OUTPUT"
+	fi
+}
+
+usage() { fail "usage: verify.sh tag <vX.Y.Z|vX.Y.Z-rc.N> | verify.sh ref <ref>"; }
+
+# Sets $version to weft-server's version at a commit. cargo metadata reads it from a
+# scratch worktree, so the caller's checkout is never touched.
+read_version() {
+	local sha=$1
+	git worktree add --detach --quiet "$scratch/src" "$sha" >/dev/null 2>&1 ||
+		fail "could not check out $sha to read its version"
+	version=$(cargo metadata --no-deps --format-version 1 --manifest-path "$scratch/src/Cargo.toml" |
+		jq -r '[.packages[] | select(.name == "weft-server") | .version] | first // empty') ||
+		fail "cargo metadata failed at $sha"
+	[[ -n $version ]] || fail "no weft-server package at $sha"
+	[[ $version =~ $VERSION_RE ]] || fail "weft-server's version at $sha is not semver: $version"
+}
+
+resolve_ref() {
+	local ref=$1 candidate sha
+	for candidate in "refs/remotes/origin/$ref" "refs/tags/$ref" "refs/heads/$ref"; do
+		if sha=$(git rev-parse --verify --quiet "$candidate^{commit}"); then
+			printf '%s\n' "$sha"
+			return 0
+		fi
+	done
+	if [[ $ref =~ ^[0-9a-f]{7,40}$ ]] && sha=$(git rev-parse --verify --quiet "$ref^{commit}"); then
+		printf '%s\n' "$sha"
+		return 0
+	fi
+	return 1
+}
+
+# check_ancestry <sha> <version>: the commit must be on origin/main, or on a maintenance
+# branch origin/release/<major>.<minor> matching the version's <major>.<minor>.
+check_ancestry() {
+	local sha=$1 version=$2 branch name series
+	local -a mismatched=()
+	if git rev-parse --verify --quiet "refs/remotes/origin/main^{commit}" >/dev/null &&
+		git merge-base --is-ancestor "$sha" refs/remotes/origin/main; then
+		note "ancestry: $sha is on origin/main"
+		return 0
+	fi
+	while IFS= read -r branch; do
+		name=${branch#refs/remotes/origin/}
+		# Maintenance branches only: release/1.2, never release/1.2.x or release/some-fix.
+		[[ $name =~ ^release/(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || continue
+		series=${name#release/}
+		git merge-base --is-ancestor "$sha" "$branch" || continue
+		if [[ $version == "$series".* ]]; then
+			note "ancestry: $sha is on origin/$name"
+			return 0
+		fi
+		mismatched+=("origin/$name")
+	done < <(git for-each-ref --format='%(refname)' refs/remotes/origin/release/)
+	if ((${#mismatched[@]} > 0)); then
+		fail "$sha is on ${mismatched[*]}, but its version $version is not of that series"
+	fi
+	fail "$sha is not an ancestor of origin/main or of an origin/release/<major>.<minor> branch (other branches do not count)"
+}
+
+check_ci() {
+	local sha=$1 workflow=${CI_WORKFLOW:-ci.yml} runs latest conclusion url
+	[[ -n ${GITHUB_REPOSITORY:-} ]] || fail "GITHUB_REPOSITORY is not set"
+	runs=$(gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs" \
+		-f head_sha="$sha" -f per_page=100) ||
+		fail "could not list $workflow runs for $sha"
+	latest=$(jq -r --arg sha "$sha" --arg repo "$GITHUB_REPOSITORY" '
+		[.workflow_runs[]
+			| select(.head_sha == $sha and .status == "completed")
+			| select(.event == "push" or .event == "workflow_dispatch" or .event == "schedule")
+			| select((.head_repository.full_name // "" | ascii_downcase) == ($repo | ascii_downcase))
+			| select(.conclusion != "cancelled" and .conclusion != "skipped")]
+		| sort_by(.created_at) | last
+		| if . == null then "none -" else "\(.conclusion) \(.html_url)" end' <<<"$runs") ||
+		fail "could not read the $workflow runs for $sha"
+	conclusion=${latest%% *}
+	url=${latest#* }
+	case $conclusion in
+	success) note "ci: $workflow passed for $sha ($url)" ;;
+	none) fail "$workflow has no completed push, dispatch or scheduled run for $sha in $GITHUB_REPOSITORY (pull request runs do not count); push it to main or a release branch, or dispatch CI on it" ;;
+	*) fail "$workflow's latest run for $sha concluded $conclusion ($url)" ;;
+	esac
+}
+
+check_changelog() {
+	local sha=$1 version=$2 changelog notes
+	changelog=$(git show "$sha:CHANGELOG.md" 2>/dev/null) || fail "no CHANGELOG.md at $sha"
+	# The section runs from its heading to the next "## [" heading or the link
+	# definitions at the foot of the file.
+	notes=$(awk -v heading="## [$version]" '
+		index($0, heading) == 1 { found = 1; next }
+		found && (/^## \[/ || /^\[[^ ]*\]: /) { exit }
+		found { print }
+	' <<<"$changelog")
+	grep -q '[^[:space:]]' <<<"$notes" ||
+		fail "CHANGELOG.md at $sha has no non-empty '## [$version]' section"
+	note "changelog: found the [$version] section"
+	if [[ -n ${NOTES_OUT:-} ]]; then
+		printf '%s\n' "$notes" >"$NOTES_OUT"
+	fi
+}
+
+[[ $# -eq 2 ]] || usage
+mode=$1
+arg=$2
+
+scratch=$(mktemp -d)
+cleanup() {
+	if [[ -d $scratch/src ]]; then
+		git worktree remove --force "$scratch/src" >/dev/null 2>&1 || true
+	fi
+	rm -rf "$scratch"
+}
+trap cleanup EXIT
+
+case $mode in
+tag)
+	tag=$arg
+	[[ $tag =~ $TAG_RE ]] || fail "tag must be vX.Y.Z or vX.Y.Z-rc.N; got $(printf '%q' "$tag")"
+	sha=$(git rev-parse --verify --quiet "refs/tags/$tag^{commit}") ||
+		fail "tag $tag does not exist; push it first (a release never creates its tag)"
+	note "tag: $tag is $sha"
+	read_version "$sha"
+	[[ $tag == "v$version" ]] || fail "tag $tag does not match weft-server's version $version at $sha"
+	check_ancestry "$sha" "$version"
+	check_changelog "$sha" "$version"
+	check_ci "$sha"
+	;;
+ref)
+	ref=$arg
+	[[ $ref =~ $REF_RE && $ref != *..* ]] || fail "not a usable ref: $(printf '%q' "$ref")"
+	sha=$(resolve_ref "$ref") || fail "ref $ref does not resolve to a commit"
+	note "ref: $ref is $sha (dry run: ancestry and CI only)"
+	read_version "$sha"
+	tag="v$version"
+	check_ancestry "$sha" "$version"
+	check_ci "$sha"
+	;;
+*) usage ;;
+esac
+
+prerelease=false
+[[ $tag == *-* ]] && prerelease=true
+
+emit sha "$sha"
+emit version "$version"
+emit tag "$tag"
+emit prerelease "$prerelease"

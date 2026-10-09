@@ -5,10 +5,12 @@ use ::weftdb::{
 };
 use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, Criterion};
 use splimes::{Resolution, Spline};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
+
+mod common;
 
 fn benchmark_cache_miss_vs_hit(c: &mut Criterion) {
 	// Suppress verbose logging during benchmarks
@@ -67,7 +69,7 @@ fn benchmark_cache_miss_vs_hit(c: &mut Criterion) {
 	// Cleanup
 	rt.block_on(async {
 		db.close().await.unwrap();
-		std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+		common::discard_database(&db_name).await;
 	});
 }
 
@@ -99,7 +101,7 @@ fn benchmark_cache_invalidation(c: &mut Criterion) {
 				let result = db.analyze_point(&aspect.id(), analyze_time, &Resolution::Seconds, &Spline::Linear).await.unwrap();
 
 				db.close().await.unwrap();
-				std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+				common::discard_database(&db_name).await;
 				black_box(result)
 			})
 		});
@@ -142,7 +144,7 @@ fn benchmark_concurrent_cache_access(c: &mut Criterion) {
 				let results: Vec<_> = futures::future::join_all(handles).await.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
 
 				db.close().await.unwrap();
-				std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+				common::discard_database(&db_name).await;
 				black_box(results)
 			})
 		});
@@ -189,7 +191,7 @@ fn benchmark_cache_memory_usage(c: &mut Criterion) {
 					}
 
 					db.close().await.unwrap();
-					std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+					common::discard_database(&db_name).await;
 					black_box(results)
 				})
 			});
@@ -229,7 +231,7 @@ fn benchmark_cache_eviction_strategies(c: &mut Criterion) {
 				}
 
 				db.close().await.unwrap();
-				std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+				common::discard_database(&db_name).await;
 				black_box(results)
 			})
 		});
@@ -239,4 +241,6 @@ fn benchmark_cache_eviction_strategies(c: &mut Criterion) {
 
 criterion_group!(cache_benches, benchmark_cache_miss_vs_hit, benchmark_cache_invalidation, benchmark_concurrent_cache_access, benchmark_cache_memory_usage, benchmark_cache_eviction_strategies);
 
-criterion_main!(cache_benches);
+fn main() {
+	common::criterion_main(&[cache_benches]);
+}

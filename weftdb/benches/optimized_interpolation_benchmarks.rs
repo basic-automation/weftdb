@@ -5,11 +5,13 @@ use ::weftdb::{
 };
 use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, Criterion};
 use splimes::{Resolution, Spline};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 // use removed (duplicate)
+
+mod common;
 
 fn benchmark_optimization_strategies(c: &mut Criterion) {
 	let rt = Runtime::new().unwrap();
@@ -25,7 +27,7 @@ fn benchmark_optimization_strategies(c: &mut Criterion) {
 	// Create shared database infrastructure to reduce setup overhead
 	let shared_db_name = format!("bench_opt_shared_{}", Uuid::new_v4());
 	let (shared_db, shared_subject) = rt.block_on(async {
-		std::fs::remove_dir_all(format!("data/{shared_db_name}")).ok();
+		common::remove_database(&shared_db_name);
 		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
 		let db = Database::new(&shared_db_name).await.unwrap();
@@ -76,7 +78,7 @@ fn benchmark_optimization_strategies(c: &mut Criterion) {
 	rt.block_on(async {
 		shared_db.close().await.unwrap();
 		tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-		std::fs::remove_dir_all(format!("data/{shared_db_name}")).ok();
+		common::discard_database(&shared_db_name).await;
 	});
 }
 
@@ -91,7 +93,7 @@ fn benchmark_memory_efficiency(c: &mut Criterion) {
 	];
 
 	let db_name = format!("bench_mem_{}", Uuid::new_v4());
-	std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+	common::remove_database(&db_name);
 
 	// Setup shared database and subject
 	let (db, subject) = rt.block_on(async {
@@ -141,9 +143,12 @@ fn benchmark_memory_efficiency(c: &mut Criterion) {
 	// Cleanup after all benchmarks
 	rt.block_on(async {
 		db.close().await.unwrap();
-		std::fs::remove_dir_all(format!("data/{db_name}")).ok();
+		common::discard_database(&db_name).await;
 	});
 }
 
 criterion_group!(benches, benchmark_optimization_strategies, benchmark_memory_efficiency);
-criterion_main!(benches);
+
+fn main() {
+	common::criterion_main(&[benches]);
+}

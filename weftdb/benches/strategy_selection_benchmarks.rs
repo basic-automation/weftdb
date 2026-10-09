@@ -5,10 +5,12 @@ use ::weftdb::{
 };
 use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, Criterion};
 use splimes::{Resolution, Spline};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
+
+mod common;
 
 fn benchmark_strategy_selection(c: &mut Criterion) {
 	let rt = Runtime::new().unwrap();
@@ -32,8 +34,7 @@ fn benchmark_strategy_selection(c: &mut Criterion) {
 				rt.block_on(async {
 					// Create unique database for each iteration
 					let db_name = format!("bench_strategy_{}_{}", name, Uuid::new_v4());
-					let db_path = format!("data/{db_name}");
-					std::fs::remove_dir_all(&db_path).ok();
+					common::remove_database(&db_name);
 					tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
 					let db = Database::new(&db_name).await.unwrap();
@@ -59,7 +60,7 @@ fn benchmark_strategy_selection(c: &mut Criterion) {
 
 					// Add small delay before cleanup
 					tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-					std::fs::remove_dir_all(&db_path).ok();
+					common::discard_database(&db_name).await;
 
 					black_box(result)
 				})
@@ -70,4 +71,7 @@ fn benchmark_strategy_selection(c: &mut Criterion) {
 }
 
 criterion_group!(benches, benchmark_strategy_selection);
-criterion_main!(benches);
+
+fn main() {
+	common::criterion_main(&[benches]);
+}

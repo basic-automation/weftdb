@@ -824,8 +824,10 @@ vector DB. *(Maps backlog Themes 5, 6, 8.)*
 
 The phases above define **beta** (Phase 7) and **paid beta** (Phase 8); this section
 defines **1.0 / stable**: the point at which WeftDB makes a semver promise about its
-API, its on-disk format, and its durability. Today WeftDB is **pre-beta** — every crate
-is `0.1.0` and nothing is tagged. 1.0 ships when every box below is ticked.
+API, its on-disk format, and its durability. Today WeftDB is **pre-beta**: every crate
+is `0.1.0`, and v0.1.0 is the pre-beta baseline release (GitHub release binaries only, no
+crates.io), the previous release the upgrade, rollback and compatibility gates below test
+against. 1.0 ships when every box below is ticked.
 
 **Execution plan:** [`docs/release/1.0-plan.md`](docs/release/1.0-plan.md) orders every
 remaining box into waves W0–W15. Its preface records the owner's decisions of 2026-10-08:

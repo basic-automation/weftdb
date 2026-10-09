@@ -1,14 +1,16 @@
-use std::{hint::black_box, path::Path, str::FromStr};
+use std::{hint::black_box, str::FromStr};
 
 use ::weftdb::{
 	database::traits::{AspectStructure, DatabaseStructure, Inputs, Outputs}, Database, DatasetId, InputMeasurement
 };
 use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{criterion_group, BatchSize, Criterion};
 use splimes::{Resolution, Spline};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
+
+mod common;
 
 fn benchmark_production_workloads(c: &mut Criterion) {
 	let rt = Runtime::new().unwrap();
@@ -34,12 +36,9 @@ fn benchmark_production_workloads(c: &mut Criterion) {
 				|| {
 					rt.block_on(async {
 						let db_name = format!("bench_prod_{}_{}", name, Uuid::new_v4());
-						let db_path = format!("data/{db_name}");
 
 						// Clean up any existing data
-						if Path::new(&db_path).exists() {
-							std::fs::remove_dir_all(&db_path).ok();
-						}
+						common::remove_database(&db_name);
 						tokio::time::sleep(std::time::Duration::from_millis(50)).await; // Reduced delay
 
 						// Create database and setup data
@@ -60,11 +59,11 @@ fn benchmark_production_workloads(c: &mut Criterion) {
 						let start = data_start;
 						let end = start + Duration::minutes(window_minutes);
 
-						(db, aspect.id(), start, end, db_path)
+						(db, aspect.id(), start, end, db_name)
 					})
 				},
 				// Measurement phase: only the operation being benchmarked
-				|(db, aspect_id, start, end, db_path)| {
+				|(db, aspect_id, start, end, db_name)| {
 					rt.block_on(async {
 						// This is the only part being measured - use coarser resolution
 						let result = db
@@ -81,7 +80,7 @@ fn benchmark_production_workloads(c: &mut Criterion) {
 						// Immediate cleanup (not measured due to iter_batched)
 						db.close().await.unwrap();
 						tokio::time::sleep(std::time::Duration::from_millis(50)).await; // Reduced delay
-						std::fs::remove_dir_all(&db_path).ok();
+						common::discard_database(&db_name).await;
 
 						black_box(result)
 					})
@@ -117,12 +116,9 @@ fn benchmark_full_integration_pipeline(c: &mut Criterion) {
 				|| {
 					rt.block_on(async {
 						let db_name = format!("bench_pipeline_{}_{}", name, Uuid::new_v4());
-						let db_path = format!("data/{db_name}");
 
 						// Clean up existing data
-						if Path::new(&db_path).exists() {
-							std::fs::remove_dir_all(&db_path).ok();
-						}
+						common::remove_database(&db_name);
 						tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
 						// Create database
@@ -142,11 +138,11 @@ fn benchmark_full_integration_pipeline(c: &mut Criterion) {
 						let start = base_time;
 						let end = base_time + Duration::minutes(measurement_count as i64);
 
-						(db, aspect.id(), start, end, resolution, db_path)
+						(db, aspect.id(), start, end, resolution, db_name)
 					})
 				},
 				// Measurement phase
-				|(db, aspect_id, start, end, resolution, db_path)| {
+				|(db, aspect_id, start, end, resolution, db_name)| {
 					rt.block_on(async {
 						// Only this operation is measured
 						let result = db.analyze_range(&aspect_id, start, end, resolution, Spline::Linear).await.unwrap();
@@ -154,7 +150,7 @@ fn benchmark_full_integration_pipeline(c: &mut Criterion) {
 						// Cleanup (not measured)
 						db.close().await.unwrap();
 						tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-						std::fs::remove_dir_all(&db_path).ok();
+						common::discard_database(&db_name).await;
 
 						black_box(result)
 					})
@@ -167,4 +163,7 @@ fn benchmark_full_integration_pipeline(c: &mut Criterion) {
 }
 
 criterion_group!(benches, benchmark_production_workloads, benchmark_full_integration_pipeline);
-criterion_main!(benches);
+
+fn main() {
+	common::criterion_main(&[benches]);
+}

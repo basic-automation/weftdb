@@ -1,10 +1,12 @@
+use std::future::Future;
+
 use anyhow::Result;
 
 use crate::{
-	cache::Connection, database::traits::{AspectStructure, Inputs}, types::{
+	cache::Connection, database::traits::{AspectStructure, Inputs}, error::is_transient_mvcc_error, types::{
 		database::{
 			helpers::safe_usize_to_f64, traits::{config::Config, connection::Connection as ConnectionTrait, DatabaseStructure}
-		}, durable::{fault, FaultPoint}, error::is_transient_mvcc_error, TxId
+		}, durable::{fault, FaultPoint}, TxId
 	}, Aspect, AspectId, Batch, BatchId, Correlation, CorrelationID, Database, DatasetId, DictionaryConstraints, DictionaryId, DictionaryMetadata, Error, Event, EventID, InputMeasurement, Measurement, Pattern, PatternID, UnbatchedEntry
 };
 
@@ -223,7 +225,7 @@ impl Inputs for Database {
 
 			let res = conn.as_ref().execute(&delete_sql, turso::params_from_iter(params)).await;
 			if let Err(e) = res {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to dequeue unbatched measurements: {e}"));
 			}
 		}
@@ -264,7 +266,7 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => tracing::debug!("Cleared all unbatched measurements for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to clear unbatched measurements: {e}"));
 			}
 		}
@@ -310,7 +312,7 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => tracing::debug!("Successfully inserted measurement for dataset {dataset_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("SQL execution failure 1: `{e}`"));
 			}
 		}
@@ -367,7 +369,7 @@ impl Inputs for Database {
 		match res {
 			Ok(rows) => tracing::debug!("Inserted {rows} rows"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("SQL execution failure 2: `{e}`"));
 			}
 		}
@@ -633,7 +635,7 @@ impl Inputs for Database {
 					successful_timestamps.push(m.timestamp());
 				}
 				Err(e) => {
-					Self::rollback_concurrent(&conn).await?;
+					Self::rollback_after_error(&conn).await;
 					return Err(anyhow::anyhow!("Failed to insert in chunk: {e}"));
 				}
 			}
@@ -753,7 +755,7 @@ impl Inputs for Database {
 
 		let res = conn.as_ref().execute(delete_sql, turso::params![batch_id.to_string()]).await;
 		if let Err(e) = res {
-			Self::rollback_concurrent(&conn).await?;
+			Self::rollback_after_error(&conn).await;
 			return Err(anyhow::anyhow!("Failed to remove unprocessed batch: {e}"));
 		}
 
@@ -774,7 +776,7 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => tracing::debug!("Cleared all unprocessed batches for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to clear unprocessed batches: {e}"));
 			}
 		}
@@ -795,7 +797,7 @@ impl Inputs for Database {
 		match res {
 			Ok(deleted) => tracing::debug!("Cleaned up {deleted} unprocessed batches older than {older_than} for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to cleanup unprocessed batches: {e}"));
 			}
 		}
@@ -819,7 +821,7 @@ impl Inputs for Database {
 		let batch_metadata_size: i64 = match i64::try_from(batch.metadata.size) {
 			Ok(size) => size,
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Batch size conversion error: {e}"));
 			}
 		};
@@ -827,7 +829,7 @@ impl Inputs for Database {
 		let res = conn.as_ref().execute(insert_sql, turso::params![batch_id.clone(), aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string(), batch_metadata_size, format!("{}", batch.metadata.resolution), measurements_json.clone(), batch_hash.clone(), "processed", chrono::Utc::now().timestamp_millis()]).await;
 		if let Err(e) = res {
 			tracing::warn!("Failed to insert processed batch {batch_id}: {e}");
-			Self::rollback_concurrent(&conn).await?;
+			Self::rollback_after_error(&conn).await;
 			return Err(anyhow::anyhow!("Failed to insert processed batch: {e}"));
 		}
 
@@ -864,7 +866,7 @@ impl Inputs for Database {
 
 		let res = conn.as_ref().execute(delete_sql, turso::params![batch_id.to_string()]).await;
 		if let Err(e) = res {
-			Self::rollback_concurrent(&conn).await?;
+			Self::rollback_after_error(&conn).await;
 			return Err(anyhow::anyhow!("Failed to remove processed batch: {e}"));
 		}
 
@@ -952,7 +954,7 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => tracing::debug!("Cleared all processed batches for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to clear processed batches: {e}"));
 			}
 		}
@@ -974,7 +976,7 @@ impl Inputs for Database {
 		match res {
 			Ok(deleted) => tracing::debug!("Cleaned up {deleted} processed batches older than {older_than} for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to cleanup processed batches: {e}"));
 			}
 		}
@@ -1094,7 +1096,7 @@ impl Inputs for Database {
 			Err(e) => {
 				let id = pattern.id();
 				tracing::warn!("Failed to insert pattern '{id}' for aspect {aspect_id}: {e}");
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to insert pattern: {e}"));
 			}
 		}
@@ -1110,7 +1112,7 @@ impl Inputs for Database {
 				Err(e) => {
 					let id = pattern.id();
 					tracing::warn!("Failed to insert occurrence for pattern '{id}': {e}");
-					Self::rollback_concurrent(&conn).await?;
+					Self::rollback_after_error(&conn).await;
 					return Err(anyhow::anyhow!("Failed to insert occurrence: {e}"));
 				}
 			}
@@ -1127,7 +1129,7 @@ impl Inputs for Database {
 				Err(e) => {
 					let id = pattern.id();
 					tracing::warn!("Failed to insert relative {i} for pattern '{id}': {e}");
-					Self::rollback_concurrent(&conn).await?;
+					Self::rollback_after_error(&conn).await;
 					return Err(anyhow::anyhow!("Failed to insert relative: {e}"));
 				}
 			}
@@ -1161,7 +1163,7 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => tracing::debug!("Removed pattern '{pattern}' for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to remove pattern: {e}"));
 			}
 		}
@@ -1180,7 +1182,7 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => tracing::debug!("Cleared all patterns for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to clear patterns: {e}"));
 			}
 		}
@@ -1247,7 +1249,7 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => tracing::debug!("Removed event {event_id} for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to remove event: {e}"));
 			}
 		}
@@ -1267,7 +1269,7 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => tracing::debug!("Cleared all events for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to clear events: {e}"));
 			}
 		}
@@ -1284,7 +1286,7 @@ impl Inputs for Database {
 		Self::check_dictionary_constraints(dictionary_name, &metadata.constraints)?;
 		let aspect = self.get_aspect(aspect_id).await?;
 		let db_name = &self.name;
-		let db_path = Self::aspect_dictionaries_db_path(db_name.as_str(), aspect.subject_name(), aspect.name(), dictionary_name);
+		let db_path = Self::aspect_dictionaries_db_path(db_name.as_str(), aspect.subject_name(), aspect.name(), dictionary_name)?;
 		let (db, _was_new) = Self::get_or_create_turso_database(&db_path).await?;
 		// Create the schema FIRST, in an exclusive transaction. Turso rejects DDL inside
 		// `BEGIN CONCURRENT` ("DDL statements require an exclusive transaction"), so the
@@ -1306,12 +1308,16 @@ impl Inputs for Database {
 		// found the dictionary, and every `load_dictionary` inserted another metadata row.
 		if let Err(e) = Self::replace_dictionary_registration(&conn, &metadata.id, dictionary_name, &metadata.description, &metadata.constraints).await {
 			tracing::warn!("Failed to set metadata for dictionary '{dictionary_name}' for aspect {aspect_id}: {e}");
-			Self::rollback_concurrent(&conn).await?;
-			return Err(anyhow::anyhow!("Failed to set dictionary metadata: {e}"));
+			Self::rollback_after_error(&conn).await;
+			// Keep `e` as the source: a write-write conflict is what makes the write retryable.
+			let message = format!("Failed to set dictionary metadata: {e}");
+			return Err(e.context(message));
 		}
 
 		Self::commit_concurrent(&conn).await?;
-		self.cache.lock().await.invalidate(&Self::dictionary_metadata_cache_key(aspect_id, dictionary_name)).await;
+		// After the commit, and as a new generation: a read whose snapshot predates the commit
+		// then does not cache the registration this replaced.
+		self.cache.lock().await.invalidate_generation(&Self::dictionary_metadata_cache_key(aspect_id, dictionary_name)).await;
 
 		let log = format!("Set metadata for dictionary '{dictionary_name}' for aspect {aspect_id}");
 		let _ = self.record_transaction(&log).await?;
@@ -1319,12 +1325,17 @@ impl Inputs for Database {
 		Ok(tx_id)
 	}
 
+	async fn register_dictionary_if_absent(&self, aspect_id: &AspectId, dictionary_name: &str, metadata: &DictionaryMetadata) -> Result<bool> {
+		Self::check_dictionary_constraints(dictionary_name, &metadata.constraints)?;
+		retry_once_if_transient(dictionary_name, || self.register_dictionary_if_absent_once(aspect_id, dictionary_name, metadata)).await
+	}
+
 	/// insert pattern into dictionary for a given aspect
 	async fn insert_pattern_into_dictionary(&self, aspect_id: &AspectId, dictionary_name: &str, pattern: &Pattern) -> Result<TxId> {
 		let tx_id = TxId::new();
 		let aspect = self.get_aspect(aspect_id).await?;
 		let db_name = &self.name;
-		let db_path = Self::aspect_dictionaries_db_path(db_name.as_str(), aspect.subject_name(), aspect.name(), dictionary_name);
+		let db_path = Self::aspect_dictionaries_db_path(db_name.as_str(), aspect.subject_name(), aspect.name(), dictionary_name)?;
 		let (db, _was_new) = Self::get_or_create_turso_database(&db_path).await?;
 		let conn = Self::begin_concurrent(&db, db_name, Some(self.cache.clone())).await?;
 
@@ -1336,7 +1347,7 @@ impl Inputs for Database {
 			Err(e) => {
 				let id = pattern.id();
 				tracing::warn!("Failed to insert pattern '{id}' into dictionary '{dictionary_name}' for aspect {aspect_id}: {e}");
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to insert pattern into dictionary: {e}"));
 			}
 		}
@@ -1353,7 +1364,7 @@ impl Inputs for Database {
 				Err(e) => {
 					let id = pattern.id();
 					tracing::warn!("Failed to insert occurrence for pattern '{id}' in dictionary '{dictionary_name}': {e}");
-					Self::rollback_concurrent(&conn).await?;
+					Self::rollback_after_error(&conn).await;
 					return Err(anyhow::anyhow!("Failed to insert occurrence: {e}"));
 				}
 			}
@@ -1370,7 +1381,7 @@ impl Inputs for Database {
 				Err(e) => {
 					let id = pattern.id();
 					tracing::warn!("Failed to insert relative {i} for pattern '{id}' in dictionary '{dictionary_name}': {e}");
-					Self::rollback_concurrent(&conn).await?;
+					Self::rollback_after_error(&conn).await;
 					return Err(anyhow::anyhow!("Failed to insert relative: {e}"));
 				}
 			}
@@ -1415,7 +1426,7 @@ impl Inputs for Database {
 			Err(e) => {
 				let id = correlation.id();
 				tracing::warn!("Failed to insert correlation '{id}' for aspect {aspect_id}: {e}");
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to insert correlation: {e}"));
 			}
 		}
@@ -1429,7 +1440,7 @@ impl Inputs for Database {
 				Err(e) => {
 					let id = correlation.id();
 					tracing::warn!("Failed to insert error rate for correlation '{id}': {e}");
-					Self::rollback_concurrent(&conn).await?;
+					Self::rollback_after_error(&conn).await;
 					return Err(anyhow::anyhow!("Failed to insert correlation error rate: {e}"));
 				}
 			}
@@ -1447,7 +1458,7 @@ impl Inputs for Database {
 				Err(e) => {
 					let id = correlation.id();
 					tracing::warn!("Failed to insert occurrence {index} for correlation '{id}': {e}");
-					Self::rollback_concurrent(&conn).await?;
+					Self::rollback_after_error(&conn).await;
 					return Err(anyhow::anyhow!("Failed to insert correlation occurrence: {e}"));
 				}
 			}
@@ -1477,7 +1488,7 @@ impl Inputs for Database {
 			Err(e) => {
 				let id = correlation.id();
 				tracing::warn!("Failed to update correlation '{id}' for aspect {aspect_id}: {e}");
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to update correlation: {e}"));
 			}
 		}
@@ -1488,7 +1499,7 @@ impl Inputs for Database {
 		if let Err(e) = res {
 			let id = correlation.id();
 			tracing::warn!("Failed to delete error rates for correlation '{id}': {e}");
-			Self::rollback_concurrent(&conn).await?;
+			Self::rollback_after_error(&conn).await;
 			return Err(anyhow::anyhow!("Failed to delete correlation error rates: {e}"));
 		}
 
@@ -1501,7 +1512,7 @@ impl Inputs for Database {
 				Err(e) => {
 					let id = correlation.id();
 					tracing::warn!("Failed to insert error rate for correlation '{id}': {e}");
-					Self::rollback_concurrent(&conn).await?;
+					Self::rollback_after_error(&conn).await;
 					return Err(anyhow::anyhow!("Failed to insert correlation error rate: {e}"));
 				}
 			}
@@ -1513,7 +1524,7 @@ impl Inputs for Database {
 		if let Err(e) = res {
 			let id = correlation.id();
 			tracing::warn!("Failed to delete occurrences for correlation '{id}': {e}");
-			Self::rollback_concurrent(&conn).await?;
+			Self::rollback_after_error(&conn).await;
 			return Err(anyhow::anyhow!("Failed to delete correlation occurrences: {e}"));
 		}
 
@@ -1529,7 +1540,7 @@ impl Inputs for Database {
 				Err(e) => {
 					let id = correlation.id();
 					tracing::warn!("Failed to insert occurrence {index} for correlation '{id}': {e}");
-					Self::rollback_concurrent(&conn).await?;
+					Self::rollback_after_error(&conn).await;
 					return Err(anyhow::anyhow!("Failed to insert correlation occurrence: {e}"));
 				}
 			}
@@ -1557,7 +1568,7 @@ impl Inputs for Database {
 		let res = conn.as_ref().execute(delete_err_sql, turso::params![correlation_id.to_string()]).await;
 		if let Err(e) = res {
 			tracing::warn!("Failed to delete error rates for correlation '{correlation_id}': {e}");
-			Self::rollback_concurrent(&conn).await?;
+			Self::rollback_after_error(&conn).await;
 			return Err(anyhow::anyhow!("Failed to delete correlation error rates: {e}"));
 		}
 
@@ -1566,7 +1577,7 @@ impl Inputs for Database {
 		let res = conn.as_ref().execute(delete_occ_sql, turso::params![correlation_id.to_string()]).await;
 		if let Err(e) = res {
 			tracing::warn!("Failed to delete occurrences for correlation '{correlation_id}': {e}");
-			Self::rollback_concurrent(&conn).await?;
+			Self::rollback_after_error(&conn).await;
 			return Err(anyhow::anyhow!("Failed to delete correlation occurrences: {e}"));
 		}
 
@@ -1576,7 +1587,7 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => tracing::debug!("Removed correlation {correlation_id} for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to remove correlation: {e}"));
 			}
 		}
@@ -1637,7 +1648,7 @@ impl Inputs for Database {
 		let res = conn.as_ref().execute(delete_manifestations_sql, turso::params![event_id.to_string()]).await;
 		if let Err(e) = res {
 			tracing::warn!("Failed to delete manifestations for unprocessed event '{event_id}': {e}");
-			Self::rollback_concurrent(&conn).await?;
+			Self::rollback_after_error(&conn).await;
 			return Err(anyhow::anyhow!("Failed to delete unprocessed event manifestations: {e}"));
 		}
 
@@ -1647,7 +1658,7 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => tracing::debug!("Removed unprocessed event {event_id} for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to remove unprocessed event: {e}"));
 			}
 		}
@@ -1667,7 +1678,7 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => tracing::debug!("Cleared all unprocessed event manifestations for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to clear unprocessed event manifestations: {e}"));
 			}
 		}
@@ -1677,7 +1688,7 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => tracing::debug!("Cleared all unprocessed events for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to clear unprocessed events: {e}"));
 			}
 		}
@@ -1697,7 +1708,7 @@ impl Inputs for Database {
 		match res {
 			Ok(deleted) => tracing::debug!("Cleaned up {deleted} unprocessed events older than {older_than} for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to cleanup unprocessed events: {e}"));
 			}
 		}
@@ -1755,7 +1766,7 @@ impl Inputs for Database {
 		let res = conn.as_ref().execute(delete_manifestations_sql, turso::params![event_id.to_string()]).await;
 		if let Err(e) = res {
 			tracing::warn!("Failed to delete manifestations for processed event '{event_id}': {e}");
-			Self::rollback_concurrent(&conn).await?;
+			Self::rollback_after_error(&conn).await;
 			return Err(anyhow::anyhow!("Failed to delete processed event manifestations: {e}"));
 		}
 
@@ -1765,7 +1776,7 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => tracing::debug!("Removed processed event {event_id} for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to remove processed event: {e}"));
 			}
 		}
@@ -1785,7 +1796,7 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => tracing::debug!("Cleared all processed event manifestations for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to clear processed event manifestations: {e}"));
 			}
 		}
@@ -1795,7 +1806,7 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => tracing::debug!("Cleared all processed events for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to clear processed events: {e}"));
 			}
 		}
@@ -1815,7 +1826,7 @@ impl Inputs for Database {
 		match res {
 			Ok(deleted) => tracing::debug!("Cleaned up {deleted} processed events older than {older_than} for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to cleanup processed events: {e}"));
 			}
 		}
@@ -1841,7 +1852,7 @@ impl Inputs for Database {
 			let delete_sql = "DELETE FROM measurements WHERE timestamp >= ? AND timestamp <= ?";
 			let res = conn.as_ref().execute(delete_sql, turso::params![start.timestamp_millis(), end.timestamp_millis()]).await;
 			if let Err(e) = res {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to delete measurements in range: {e}"));
 			}
 
@@ -1858,7 +1869,7 @@ impl Inputs for Database {
 		let delete_sql = "DELETE FROM measurements WHERE timestamp >= ? AND timestamp <= ?";
 		let res = conn.as_ref().execute(delete_sql, turso::params![start.timestamp_millis(), end.timestamp_millis()]).await;
 		if let Err(e) = res {
-			Self::rollback_concurrent(&conn).await?;
+			Self::rollback_after_error(&conn).await;
 			return Err(anyhow::anyhow!("Failed to delete measurements in range: {e}"));
 		}
 
@@ -1883,7 +1894,7 @@ impl Inputs for Database {
 
 			let res = conn.as_ref().execute(&bulk_sql, turso::params_from_iter(params)).await;
 			if let Err(e) = res {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to insert compressed measurements: {e}"));
 			}
 		}
@@ -2071,7 +2082,7 @@ impl Database {
 		let res = conn.as_ref().execute(insert_sql, turso::params![batch_id.clone(), aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string(), batch_metadata_size, format!("{}", batch.metadata.resolution), measurements_json, batch_hash, "unprocessed", chrono::Utc::now().timestamp_millis()]).await;
 		if let Err(e) = res {
 			tracing::warn!("Failed to insert unprocessed batch {batch_id}: {e}");
-			Self::rollback_concurrent(conn).await?;
+			Self::rollback_after_error(conn).await;
 			return Err(anyhow::anyhow!("Failed to insert unprocessed batch: {e}"));
 		}
 		Ok(())
@@ -2208,6 +2219,50 @@ impl Database {
 		Ok(())
 	}
 
+	/// One attempt of [`register_dictionary_if_absent`](Inputs::register_dictionary_if_absent).
+	async fn register_dictionary_if_absent_once(&self, aspect_id: &AspectId, dictionary_name: &str, metadata: &DictionaryMetadata) -> Result<bool> {
+		let aspect = self.get_aspect(aspect_id).await?;
+		let db_path = Self::aspect_dictionaries_db_path(self.name.as_str(), aspect.subject_name(), aspect.name(), dictionary_name)?;
+		let (db, _was_new) = Self::get_or_create_turso_database(&db_path).await?;
+		Aspect::ensure_dictionary_tables(&db).await?;
+		let conn = Self::begin_concurrent(&db, &self.name, Some(self.cache.clone())).await?;
+
+		// Check again in this transaction: a registration committed since the caller read
+		// none is kept. Only rows without constraints are replaced.
+		let registered = match Self::has_complete_registration(&conn, dictionary_name).await {
+			Ok(true) => Ok(false),
+			Ok(false) => Self::replace_dictionary_registration(&conn, &metadata.id, dictionary_name, &metadata.description, &metadata.constraints).await.map(|()| true),
+			Err(e) => Err(e),
+		};
+		let registered = match registered {
+			Ok(registered) => registered,
+			Err(e) => {
+				Self::rollback_after_error(&conn).await;
+				let message = format!("Failed to register dictionary '{dictionary_name}': {e}");
+				return Err(e.context(message));
+			}
+		};
+		Self::commit_concurrent(&conn).await?;
+		if registered {
+			self.cache.lock().await.invalidate_generation(&Self::dictionary_metadata_cache_key(aspect_id, dictionary_name)).await;
+			let log = format!("Registered dictionary '{dictionary_name}' for aspect {aspect_id}");
+			let _ = self.record_transaction(&log).await?;
+		}
+		Ok(registered)
+	}
+
+	/// Whether `name` has a complete registration, a `dictionary_metadata` row with a
+	/// `dictionary_constraints` row, on `conn`, a transaction on the dictionary's database.
+	/// Whether its stored values parse does not matter here.
+	///
+	/// # Errors
+	///
+	/// A failed query.
+	pub(crate) async fn has_complete_registration(conn: &Connection, name: &str) -> Result<bool> {
+		let mut rows = conn.as_ref().query("SELECT 1 FROM dictionary_metadata m JOIN dictionary_constraints c ON c.dictionary_id = m.id WHERE m.name = ? LIMIT 1", turso::params![name]).await?;
+		Ok(rows.next().await?.is_some())
+	}
+
 	/// Write `name`'s registration on `conn`, a `BEGIN CONCURRENT` transaction on the
 	/// dictionary's database that the caller commits, or rolls back on an error.
 	///
@@ -2247,9 +2302,84 @@ impl Database {
 	}
 }
 
+/// How long [`retry_once_if_transient`] waits before its second attempt, in milliseconds:
+/// a random delay in this range, like `begin_concurrent`'s first backoff.
+const RETRY_DELAY_MS: std::ops::RangeInclusive<u64> = 10..=50;
+
+/// Run `attempt`, and once more if it fails with a transient MVCC error
+/// ([`is_transient_mvcc_error`]): a write-write conflict or a stale snapshot, after which
+/// the transaction is gone and a new one can succeed. The second attempt's result is
+/// returned as it is.
+///
+/// It waits a short random delay ([`RETRY_DELAY_MS`]) first. A write-write conflict also
+/// fires against another transaction's uncommitted write, and a second attempt made at
+/// once, while that writer is still open, would most likely conflict again; after the
+/// delay it usually sees the winner's commit (and `register_dictionary_if_absent` then
+/// finds its registration).
+async fn retry_once_if_transient<T, F, Fut>(dictionary_name: &str, mut attempt: F) -> Result<T>
+where
+	F: FnMut() -> Fut + Send,
+	Fut: Future<Output = Result<T>> + Send,
+	T: Send,
+{
+	match attempt().await {
+		Err(e) if is_transient_mvcc_error(&e) => {
+			tracing::debug!(error = %e, dictionary = dictionary_name, "Registering the dictionary conflicted with another write; trying once more");
+			tokio::time::sleep(std::time::Duration::from_millis(fastrand::u64(RETRY_DELAY_MS))).await;
+			attempt().await
+		}
+		result => result,
+	}
+}
+
 #[cfg(test)]
 mod tests {
+	use std::sync::atomic::{AtomicUsize, Ordering};
+
 	use super::*;
+
+	fn conflict() -> anyhow::Error {
+		anyhow::Error::new(turso::Error::Error("Write-write conflict".to_string())).context("Failed to register dictionary 'd': Write-write conflict")
+	}
+
+	#[tokio::test]
+	async fn a_transient_failure_is_tried_once_more_after_a_delay() {
+		let attempts = AtomicUsize::new(0);
+		let started = std::time::Instant::now();
+		let result = retry_once_if_transient("d", || async {
+			if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+				Err(conflict())
+			} else {
+				Ok(true)
+			}
+		})
+		.await;
+		assert!(result.expect("the second attempt succeeds"));
+		assert_eq!(attempts.load(Ordering::SeqCst), 2);
+		assert!(started.elapsed() >= std::time::Duration::from_millis(*RETRY_DELAY_MS.start()), "it waited before trying again: {:?}", started.elapsed());
+	}
+
+	#[tokio::test]
+	async fn only_once_and_only_for_a_transient_failure() {
+		let attempts = AtomicUsize::new(0);
+		let err = retry_once_if_transient("d", || async {
+			attempts.fetch_add(1, Ordering::SeqCst);
+			Err::<bool, _>(conflict())
+		})
+		.await
+		.expect_err("still conflicting");
+		assert!(is_transient_mvcc_error(&err), "the second conflict is returned: {err:#}");
+		assert_eq!(attempts.load(Ordering::SeqCst), 2, "tried twice, not more");
+
+		let attempts = AtomicUsize::new(0);
+		retry_once_if_transient("d", || async {
+			attempts.fetch_add(1, Ordering::SeqCst);
+			Err::<bool, _>(anyhow::anyhow!("no such table: dictionary_metadata"))
+		})
+		.await
+		.expect_err("not transient");
+		assert_eq!(attempts.load(Ordering::SeqCst), 1, "a failure that is not transient is not retried");
+	}
 
 	/// `WEFT_EXTRACTED_BATCH_RETENTION_SECS` takes a positive whole number of seconds;
 	/// anything else keeps the default, so a typo cannot switch the record off (or make

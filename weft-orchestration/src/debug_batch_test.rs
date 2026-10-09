@@ -5,17 +5,15 @@ use bigdecimal::BigDecimal;
 use chrono::{TimeZone, Utc};
 use futures::TryStreamExt;
 use splimes::{Resolution, Spline};
-use tokio::fs::remove_dir_all;
-use weftdb::{data_dir, database::traits::DatabaseStructure, Database, DatasetId, InputMeasurement};
+use weftdb::{database::traits::DatabaseStructure, Database, DatasetId, InputMeasurement};
 
-use crate::batch_utils::build_unprocessed_queue;
+use crate::{batch_utils::build_unprocessed_queue, test_support::remove_database};
 
 #[tokio::test]
 async fn debug_batch_processing() -> Result<()> {
 	println!("=== Starting debug batch processing test ===");
 	// Create a test database with a smaller dataset first
-	let db_path = format!("{}/debug_batch_test", data_dir());
-	remove_dir_all(&db_path).await.ok();
+	remove_database("debug_batch_test");
 
 	let db = Database::new("debug_batch_test").await.unwrap();
 	let test_subject = db.observe_subject("TestSubject").await.unwrap();
@@ -64,5 +62,6 @@ async fn debug_batch_processing() -> Result<()> {
 	// 	Err(e) => println!("Failed to mark batch as processed: {e}"),
 	// }
 
+	remove_database("debug_batch_test");
 	Ok(())
 }

@@ -71,8 +71,8 @@
 //! change or disappear in any release), and is **pending patent review** (ROADMAP.md, the
 //! Phase 6.1 codec patent/licence gate). None of them is needed to read or write a frame under
 //! the default configuration, that is with [`FrameOptions::transposed_max_overhead`] unset. A
-//! frame written with that option set (as 0.1.0 did whenever it was set) needs
-//! `bitsliced-codec`.
+//! frame written with that option set (as builds from before v0.1.0 did whenever it was set)
+//! needs `bitsliced-codec`.
 //!
 //! - `experimental-codecs` — the advisory float and timestamp codecs the `.weftseg` writer
 //!   never emits: the `floatcodec` module (Gorilla-XOR, Chimp, Chimp128, Elf, and the
