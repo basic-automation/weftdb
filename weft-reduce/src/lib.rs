@@ -376,17 +376,21 @@ impl BucketAcc {
 	/// Materialize the requested reductions and the grid-aligned bucket start.
 	fn finish(self, resolution: Resolution, base: i64, aggregations: &[Aggregation]) -> Result<Bucket, ReduceError> {
 		let timestamp = bucket_start(resolution, base).ok_or(ReduceError::BucketStartOverflow)?;
-		// Percentiles read the values in ascending value order; sort a value-only copy
-		// once, lazily, only if a percentile is requested.
-		let sorted_values: Option<Vec<BigDecimal>> = aggregations.iter().any(|a| a.percentile_rank().is_some()).then(|| {
-			let mut v: Vec<BigDecimal> = self.samples.iter().map(|(_, val)| val.clone()).collect();
-			v.sort();
-			v
+		// Percentiles read borrowed values, built once, lazily, only if one is requested. One
+		// percentile selects in linear time; several sort the borrowed values once instead.
+		let percentiles = aggregations.iter().filter(|a| a.percentile_rank().is_some()).count();
+		let sorted = percentiles > 1;
+		let mut ranked: Option<Vec<(&BigDecimal, usize)>> = (percentiles > 0).then(|| {
+			let mut ranked: Vec<_> = self.samples.iter().enumerate().map(|(i, (_, v))| (v, i)).collect();
+			if sorted {
+				ranked.sort_unstable_by(rank_order);
+			}
+			ranked
 		});
 		let mut values: BTreeMap<String, BigDecimal> = BTreeMap::new();
 		for &agg in aggregations {
 			let value = if let Some(rank) = agg.percentile_rank() {
-				sorted_values.as_deref().and_then(|s| percentile(s, rank))
+				ranked.as_deref_mut().and_then(|r| percentile(r, rank, sorted))
 			} else if let Some(q) = agg.sketch_quantile() {
 				self.sketch.as_ref().and_then(|s| s.quantile_decimal(q))
 			} else {
@@ -477,11 +481,19 @@ fn time_weighted_average(samples: &[(DateTime<Utc>, BigDecimal)], method: TwaMet
 	Some(weighted / BigDecimal::from(total_ms))
 }
 
-/// The nearest-rank percentile of a **sorted** `samples` slice: the value at rank
-/// `ceil(rank/100 * n)` (1-based, clamped into range). `None` for an empty slice.
+/// The nearest-rank percentile of `samples`: the value at rank `ceil(rank/100 * n)`
+/// (1-based, clamped into range) in ascending value order. `None` for an empty slice.
 /// Nearest-rank returns an actual observed value (no interpolation), which keeps the
 /// result exact in [`BigDecimal`].
-fn percentile(samples: &[BigDecimal], rank: u8) -> Option<BigDecimal> {
+///
+/// Each sample is paired with its arrival index, which breaks ties between numerically
+/// equal values (`1.0` and `1.00` compare equal but print differently). Ordered by
+/// `(value, index)`, the selected sample is exactly the one a stable sort of the values
+/// puts at that rank. It is found by `select_nth_unstable_by`, in linear time rather than
+/// a sort, over borrowed values, so only the selected value is cloned. When `sorted`, the
+/// caller has already sorted `samples` by that order (it wants several percentiles of one
+/// bucket) and the value is read off directly.
+fn percentile(samples: &mut [(&BigDecimal, usize)], rank: u8, sorted: bool) -> Option<BigDecimal> {
 	if samples.is_empty() {
 		return None;
 	}
@@ -490,7 +502,17 @@ fn percentile(samples: &[BigDecimal], rank: u8) -> Option<BigDecimal> {
 	let n = samples.len();
 	let ordinal = (usize::from(rank) * n).div_ceil(100); // 1-based, >= 1 for rank >= 1
 	let idx = ordinal.saturating_sub(1).min(n - 1);
-	Some(samples[idx].clone())
+	if sorted {
+		return Some(samples[idx].0.clone());
+	}
+	let (_, &mut (value, _), _) = samples.select_nth_unstable_by(idx, rank_order);
+	Some(value.clone())
+}
+
+/// The order [`percentile`] ranks samples by: value, then arrival index, which is the
+/// order a stable sort of the values produces.
+fn rank_order(a: &(&BigDecimal, usize), b: &(&BigDecimal, usize)) -> std::cmp::Ordering {
+	a.0.cmp(b.0).then(a.1.cmp(&b.1))
 }
 
 /// Reduce `points` into grid-aligned buckets at `resolution`.
@@ -835,6 +857,47 @@ mod tests {
 		assert!((get(b, Aggregation::P90) - 9.0).abs() < 1e-9, "p90 is 9");
 		assert!((get(b, Aggregation::P95) - 10.0).abs() < 1e-9, "p95 is 10");
 		assert!((get(b, Aggregation::P99) - 10.0).abs() < 1e-9, "p99 is 10");
+	}
+
+	#[test]
+	fn percentiles_equal_a_stable_sort_including_the_representation_of_ties() {
+		// Numerically equal values at different scales ("2.5" vs "2.50") tie; the selected
+		// sample must be the one a stable sort places at the rank, so its scale is fixed.
+		let mut state = 0x2545_f491_4f6c_dd1d_u64;
+		let mut next = move || {
+			state ^= state << 13;
+			state ^= state >> 7;
+			state ^= state << 17;
+			state
+		};
+		for n in [1_usize, 2, 3, 7, 10, 64, 101, 1_000] {
+			let values: Vec<BigDecimal> = (0..n)
+				.map(|_| {
+					let m = (next() % 40).cast_signed() - 20;
+					// Half the samples carry one extra trailing zero, so ties differ in scale.
+					if next() % 2 == 0 {
+						BigDecimal::new(m.into(), 1)
+					} else {
+						BigDecimal::new((m * 10).into(), 2)
+					}
+				})
+				.collect();
+			let points: Vec<Point> = values.iter().enumerate().map(|(i, v)| Point { timestamp: DateTime::from_timestamp(i64::try_from(i).unwrap(), 0).unwrap(), value: v.clone() }).collect();
+			let aggs = [Aggregation::P50, Aggregation::P90, Aggregation::P95, Aggregation::P99];
+			let together = &reduce(&points, Resolution::Hours, None, None, &aggs).expect("reduces")[0];
+			let mut sorted = values;
+			sorted.sort();
+			for agg in aggs {
+				let rank = usize::from(agg.percentile_rank().unwrap());
+				let expected = &sorted[(rank * n).div_ceil(100).saturating_sub(1).min(n - 1)];
+				// Several percentiles share one sort; a lone percentile selects.
+				let alone = &reduce(&points, Resolution::Hours, None, None, &[agg]).expect("reduces")[0];
+				for bucket in [together, alone] {
+					let got = bucket.values.get(agg.as_str()).unwrap();
+					assert_eq!((got, got.fractional_digit_count()), (expected, expected.fractional_digit_count()), "{} of {n}", agg.as_str());
+				}
+			}
+		}
 	}
 
 	#[test]

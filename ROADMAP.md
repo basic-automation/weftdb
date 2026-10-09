@@ -1599,10 +1599,26 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
     - [ ] **FOUND (2026-10-09) — `sketch_p99`'s published ~2.6× speed-up over exact `p99` was the
       generator's.** On two-decimal values the two run level (74.1 vs 74.9 ms, 500k points hourly,
       10 reps); on 1M real BTC closes the sketch is 1.36× faster. The README now says speed is not the
-      reason to pick the sketch. Residue: the exact percentile's cost is the per-bucket
-      materialize-and-sort of `BigDecimal`s, so an integer-mantissa sort on `ScaledI64` input (the
-      `reduce_scaled` approach, which returns `None` for percentiles today) is the lever if exact
-      percentiles need to get faster.
+      reason to pick the sketch.
+      - [x] **DONE (2026-10-09) — exact percentiles select instead of clone-and-sort.** `BucketAcc::finish`
+        ranks borrowed `(value, arrival index)` pairs, so the result equals the old stable sort
+        including the scale of tied values (tested); one percentile uses `select_nth_unstable_by`,
+        several share one sort, and only the selected value is cloned. Single `p99`, hourly, 10 reps,
+        two runs each, before → after: two-decimal 500k **59.7/59.1 → 32.3/38.7 ms**, real BTC 1M
+        **203/116 → 77/96 ms**, full-expansion 500k (5 reps) **1,451/1,362 → 387/418 ms**; all four
+        percentiles together level (real 120/155 → 119/115 ms). Exact `p99` is now ~2× faster than
+        `sketch_p99`.
+      - [ ] **NEXT — the sketch's per-sample `BigDecimal → f64`.** `sketch_p99` now costs ~2× exact
+        `p99` because `DdSketch::add_decimal` converts every sample through `bigdecimal`'s
+        digit-trimming `to_f64`. On `ScaledI64` input a correctly-rounded `mantissa / 10^scale`
+        would be cheaper, but it is not provably the same `f64` as `to_f64` (the reason
+        `reduce_partial_scaled` kept `add_decimal`), so it needs either a proof over the
+        mantissa range or a sketch-format note that the image may differ by one ulp.
+      - [ ] **NEXT — integer-mantissa percentiles in the scaled path.** `reduce_partial_scaled`
+        still returns `None` for `p*`, so a stored-range percentile downsample builds a
+        `BigDecimal` per row; selecting on the `i64` mantissas would materialize one value per
+        bucket, but a `PartialReduction` carries `BigDecimal` samples for merging, so the
+        unmerged single-segment case is the one to take first.
 
 - [x] **DONE (2026-07-20) — BUG ROOT-CAUSED + FIXED: the "flaky GPU interpolation tests" were never a
   GPU bug.** The roadmap offered two hypotheses — a real GPU race, or an unsound check. **Both the

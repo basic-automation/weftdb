@@ -201,6 +201,12 @@ only the control plane, not the segment frames.
 
 ### Changed
 
+- **Exact percentiles (`p50`/`p90`/`p95`/`p99`) no longer clone and sort every bucket**
+  (`weft-reduce`). A single percentile selects its rank in linear time over borrowed values
+  and several share one sort; only the result is cloned. Results are identical, including
+  which of two numerically equal values (`1.0`, `1.00`) is returned. A lone hourly `p99`
+  runs ~1.6–3.4× faster on the bench (two-decimal, real BTC and full-expansion series),
+  which makes it about twice as fast as `sketch_p99`.
 - **Breaking for Rust users: `weftdb` reads no `WEFT_*` variable when it opens a
   segment store, and never exits the process** (release plan C-1).
   `SegmentStore::open` and `open_scoped` now use `SegmentStoreOptions::default()`

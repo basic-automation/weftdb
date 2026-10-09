@@ -323,9 +323,9 @@ as results.
 At 500k two-decimal points, hour buckets, correctness-gated
 ([`weft-bench --downsample`](weft-bench); re-measured 2026-10-09 on the two-decimal generator, full
 table under [Compute endpoints](#compute-endpoints)): `avg` takes **14.4 ms (34.5M points/sec)**;
-time-weighted average costs about 3.4× that. The approximate `sketch_p99` is **no faster than exact
-`p99`** on two-decimal values (59.1 ms vs 57.9 ms) and 1.36× faster on real BTC closes; what it buys
-is bounded memory per bucket and mergeability, within its 1% bound.
+time-weighted average costs about 3.4× that. Exact `p99` takes **31.5 ms** and is about **2× faster
+than the approximate `sketch_p99`** (59.7 ms), on real BTC closes too; what the sketch buys is
+bounded memory per bucket and mergeability, within its 1% bound.
 
 ### Where it doesn't pay off
 
@@ -447,8 +447,8 @@ and the old generator at **0.61M points/sec**, 7.3× slower than real data:
 | `twa` | 49.0 ms | 10,006,950 points/sec | 257.6 ms | 1,878,669 points/sec | 3.4× the streaming cost: dwell-weighting needs the time-ordered samples |
 | `twa_bucket_end` | 48.5 ms | 10,006,152 points/sec | 259.1 ms | 1,876,355 points/sec | within noise of `twa` — one extra weight, effectively free |
 | `twa_linear` | 99.3 ms | 5,002,694 points/sec | 345.5 ms | 1,430,149 points/sec | 2.0× `twa`: an extra `BigDecimal` add + divide per interval for the trapezoidal mean |
-| `p99` (exact) | 57.9 ms | 8,623,594 points/sec | 1,397.7 ms | 362,325 points/sec | materializes and sorts each bucket |
-| `sketch_p99` | 59.1 ms | 8,459,360 points/sec | 272.4 ms | 1,848,855 points/sec | streams into a DDSketch; see below |
+| `p99` (exact) | 31.5 ms | 15,749,611 points/sec | 414.2 ms | 1,207,521 points/sec | collects each bucket and selects the rank in linear time (was 57.9 ms / 1,397.7 ms with a full sort of cloned values) |
+| `sketch_p99` | 59.7 ms | 8,356,282 points/sec | 299.3 ms | 1,661,408 points/sec | streams into a DDSketch; see below |
 
 **Exact vs sketch percentiles — which to ask for.** The `p50`/`p90`/`p95`/`p99` reductions are
 *exact* nearest-rank: they return an actual observed `BigDecimal` from the bucket, but they
@@ -458,12 +458,14 @@ materialize and sort the whole bucket, and two buckets' results cannot be combin
 (`weft_reduce::SKETCH_ALPHA`), **bounded memory** regardless of bucket size (values fold in as they
 arrive; `SKETCH_MAX_BINS` caps the store absolutely), and an **exactly mergeable** structure, so a
 p99 can be computed over a large or streaming bucket. **Speed is not the reason to choose it.** On the
-shipped harness (10 reps, correctness PASS, 2026-10-09) the two run level on two-decimal values
-(500k points, hourly: p50 **74.1 ms** sketch vs **74.9 ms** exact) and the sketch is **1.36×**
-faster on 1M real BTC closes (hourly: 167.7 ms vs 227.6 ms), where values carry up to eight decimal
-places (`weft-bench --downsample --ds-aggs sketch_p99` vs `--ds-aggs p99`, with `--ds-csv` for the
-real series). The ~2.6× once quoted here (327 vs 852 ms) was measured on the old generator's
-~50-digit values, whose sort is what made exact `p99` slow; the `full` column above reproduces it.
+shipped harness (10 reps, correctness PASS, 2026-10-09) exact `p99` is about twice as fast: p50
+**30.6 ms** exact vs **63.3 ms** sketch on two-decimal values (500k points, hourly), and **79.7 ms**
+vs **151.6 ms** on 1M real BTC closes (hourly), where values carry up to eight decimal places
+(`weft-bench --downsample --ds-aggs p99` vs `--ds-aggs sketch_p99`, with `--ds-csv` for the real
+series). The exact percentile selects its rank in linear time over borrowed values, cloning only the
+result; the sketch pays a `BigDecimal → f64` conversion per sample. The ~2.6× sketch advantage once
+quoted here (327 vs 852 ms) was measured on the old generator's ~50-digit values, before that
+change, when the exact path cloned and fully sorted every bucket.
 
 The approximation is **declared, never silent** — WeftDB's precision principle. The sketch shares the
 exact percentiles' **nearest-rank convention** (`⌈q·n⌉`), so `sketch_p*` and `p*` name the same
