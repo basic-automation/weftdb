@@ -278,7 +278,28 @@ fn resolve(bytes: &[u8], queries: &[i64], mode: LookupMode, paged: bool) -> anyh
 /// Returns an error if `reps == 0`, if the corpus cannot be sealed into a segment,
 /// or if any rep's read fails.
 pub fn run_point_lookup(profile: &PointLookupProfile, reps: usize) -> anyhow::Result<BenchResult> {
+	let generate_start = Instant::now();
+	let (timestamps, values) = profile.generate();
+	let generation_ns = span_ns(generate_start);
+	run_point_lookup_on(profile, &timestamps, &values, SEGMENT_UNIT, generation_ns, reps)
+}
+
+/// Run the point-lookup workload over an explicit, time-sorted `(timestamps, values)` corpus
+/// in `unit`.
+///
+/// The engine behind [`run_point_lookup`], exposed so a real corpus
+/// ([`load_csv_corpus`](crate::load_csv_corpus)) is measured by exactly the same code: the
+/// profile supplies the query knobs (count, absent share, mode, paging, seed) and the queries
+/// are drawn from these timestamps. `generation_ns` (producing or loading the corpus) is
+/// charged to setup. `irregular` in the result is derived from the data.
+///
+/// # Errors
+///
+/// Returns an error if `reps == 0`, if the corpus has fewer than two rows or cannot be sealed
+/// (unsorted timestamps, or a value unrepresentable exactly), or if any rep's read fails.
+pub fn run_point_lookup_on(profile: &PointLookupProfile, timestamps: &[i64], values: &[BigDecimal], unit: TimeUnit, generation_ns: u64, reps: usize) -> anyhow::Result<BenchResult> {
 	anyhow::ensure!(reps > 0, "reps must be > 0");
+	anyhow::ensure!(timestamps.len() >= 2, "a point-lookup corpus needs at least two rows");
 
 	// The end-to-end span covers the whole timed function; the setup (dataset gen +
 	// seal + query build) is measured separately and excluded from latency, exactly
@@ -286,23 +307,22 @@ pub fn run_point_lookup(profile: &PointLookupProfile, reps: usize) -> anyhow::Re
 	let run_start = Instant::now();
 
 	let setup_start = Instant::now();
-	let (timestamps, values) = profile.generate();
-	let queries = profile.queries(&timestamps);
+	let queries = profile.queries(timestamps);
 	let paged = profile.rows_per_page > 0;
 	// Seal the corpus once (single-block or paged) and compute the full-decode ground
 	// truth for the correctness gate from the same in-memory segment. `value_at`
 	// searches the already-decoded segment, so the reference is cheap and independent
 	// of the streaming read path under test.
 	let (bytes, expected): (Vec<u8>, Vec<Option<BigDecimal>>) = if paged {
-		let segment = PagedSegment::build(&timestamps, &values, SEGMENT_UNIT, &BigDecimal::from(0), profile.rows_per_page).map_err(|e| anyhow::anyhow!("cannot seal paged point-lookup segment: {e:?}"))?;
+		let segment = PagedSegment::build(timestamps, values, unit, &BigDecimal::from(0), profile.rows_per_page).map_err(|e| anyhow::anyhow!("cannot seal paged point-lookup segment: {e:?}"))?;
 		let expected = queries.iter().map(|&t| segment.value_at(t)).collect();
 		(segment.write_to(), expected)
 	} else {
-		let segment = Segment::build_sorted(&timestamps, &values, SEGMENT_UNIT, &BigDecimal::from(0)).map_err(|e| anyhow::anyhow!("cannot seal point-lookup segment: {e:?}"))?;
+		let segment = Segment::build_sorted(timestamps, values, unit, &BigDecimal::from(0)).map_err(|e| anyhow::anyhow!("cannot seal point-lookup segment: {e:?}"))?;
 		let expected = queries.iter().map(|&t| segment.value_at(t)).collect();
 		(segment.write_to(), expected)
 	};
-	let setup_ns = span_ns(setup_start);
+	let setup_ns = span_ns(setup_start).saturating_add(generation_ns);
 
 	let mut samples_ns: Vec<u64> = Vec::with_capacity(reps);
 	let mut last_output: Vec<Option<BigDecimal>> = Vec::new();
@@ -314,7 +334,7 @@ pub fn run_point_lookup(profile: &PointLookupProfile, reps: usize) -> anyhow::Re
 	}
 
 	let measured_ns = samples_ns.iter().copied().fold(0_u64, u64::saturating_add);
-	let end_to_end_ns = span_ns(run_start);
+	let end_to_end_ns = span_ns(run_start).saturating_add(generation_ns);
 	let timing = TimingBreakdown { dataset_generation_ns: setup_ns, measured_ns, end_to_end_ns };
 
 	// Correctness: the streaming read must reproduce the full-decode value for every
@@ -327,7 +347,7 @@ pub fn run_point_lookup(profile: &PointLookupProfile, reps: usize) -> anyhow::Re
 	// North-star storage term for the *stored* corpus (value + timestamp columns),
 	// the same figure a sealed segment reports — the bytes/point the point-lookup
 	// latency is amortized against.
-	let storage = Some(StorageEstimate::from_columns(&values, &timestamps, SEGMENT_UNIT, &BigDecimal::from(0)));
+	let storage = Some(StorageEstimate::from_columns(values, timestamps, unit, &BigDecimal::from(0)));
 
 	let latency = LatencyStats::from_samples(&samples_ns);
 	let latency_ci = Some(LatencyStats::bootstrap_cis(&samples_ns, &BootstrapConfig { seed: profile.seed ^ 0x_C0FF_EE15_C0DE_u64, ..BootstrapConfig::default() }));
@@ -342,7 +362,7 @@ pub fn run_point_lookup(profile: &PointLookupProfile, reps: usize) -> anyhow::Re
 		0.0
 	};
 
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_POINT_LOOKUP.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: queries.len(), irregular: !profile.regular, missingness_fraction: 0.0, seed: profile.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_POINT_LOOKUP.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: queries.len(), irregular: timestamps.windows(3).any(|w| w[2] - w[1] != w[1] - w[0]), missingness_fraction: 0.0, seed: profile.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage })
 }
 
 #[cfg(test)]
@@ -352,6 +372,22 @@ mod tests {
 	/// A small profile so the correctness/round-trip tests stay fast.
 	fn small(regular: bool, mode: LookupMode) -> PointLookupProfile {
 		PointLookupProfile::new(if regular { "pl-regular-small" } else { "pl-irregular-small" }, PointLookupParams { point_count: 2_000, query_count: 64, regular, mode, ..PointLookupParams::default() })
+	}
+
+	#[test]
+	fn an_explicit_corpus_runs_through_the_same_lookup_engine() {
+		// A real-shaped corpus (a 60 s stride in seconds, exact 8-decimal values) resolved by
+		// both modes, single-block and paged, passes the full-decode correctness gate.
+		let ts: Vec<i64> = (0..3_000_i64).map(|i| 1_505_412_060 + i * 60).collect();
+		let vals: Vec<BigDecimal> = (0..3_000_i64).map(|i| BigDecimal::new((355_893_000_000 + i * 1_234_567).into(), 8)).collect();
+		for (mode, rows_per_page) in [(LookupMode::Batch, 0), (LookupMode::Single, 0), (LookupMode::Batch, 512)] {
+			let profile = PointLookupProfile::new("pl-csv", PointLookupParams { query_count: 64, mode, rows_per_page, ..PointLookupParams::default() });
+			let result = run_point_lookup_on(&profile, &ts, &vals, TimeUnit::Seconds, 0, 2).expect("runs");
+			assert!(result.correctness.passed(), "{mode:?}/{rows_per_page}: {:?}", result.correctness);
+			assert!(!result.dataset.irregular);
+			assert_eq!(result.storage.expect("storage").timestamp_unit, "seconds");
+		}
+		assert!(run_point_lookup_on(&PointLookupProfile::regular("x"), &ts[..1], &vals[..1], TimeUnit::Seconds, 0, 1).is_err());
 	}
 
 	#[test]

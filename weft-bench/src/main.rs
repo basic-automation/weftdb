@@ -31,7 +31,7 @@ use std::{path::PathBuf, process::ExitCode};
 use chrono::Utc;
 use splimes::{Resolution, Spline};
 use weft_bench::{
-	engine, report::{default_filename, default_html_filename}, run_compression, run_downsample, run_point_lookup, run_profile, run_range_fetch, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CalibrationStatus, CompressionParams, CompressionProfile, DownsampleParams, DownsampleProfile, EngineMetadata, ForwardFillAdapter, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter
+	engine, load_csv_corpus, report::{default_filename, default_html_filename}, run_compression, run_compression_on, run_downsample, run_downsample_on, run_point_lookup, run_point_lookup_on, run_profile, run_range_fetch, run_range_fetch_on, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CalibrationStatus, CompressionParams, CompressionProfile, CorpusRun, DownsampleParams, DownsampleProfile, EngineMetadata, ForwardFillAdapter, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter
 };
 
 /// Program name used in usage / error output.
@@ -161,7 +161,16 @@ fn run_point_lookup_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 	let profile_name = cli.name.clone().unwrap_or_else(|| if cli.irregular { "point-lookup-irregular".to_string() } else { "point-lookup-regular".to_string() });
 	let params = PointLookupParams { seed: cli.seed, point_count: cli.pl_rows, query_count: cli.pl_queries, regular: !cli.irregular, absent_fraction: cli.pl_absent, mode: cli.pl_mode, rows_per_page: cli.pl_rows_per_page };
 	let profile = PointLookupProfile::new(profile_name, params);
-	let result = run_point_lookup(&profile, cli.reps).map_err(|e| anyhow::anyhow!("point-lookup benchmark run failed: {e}"))?;
+	let result = if let Some(path) = &cli.csv.point_lookup {
+		// A real corpus: the same lookup engine, queries drawn from the loaded timestamps.
+		let load_start = std::time::Instant::now();
+		let (timestamps, values) = load_csv_corpus(path, cli.csv.value_column, cli.csv.skip_rows, cli.pl_rows)?;
+		let generation_ns = u64::try_from(load_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+		run_point_lookup_on(&profile, &timestamps, &values, weft_physical_type::TimeUnit::Seconds, generation_ns, cli.reps)
+	} else {
+		run_point_lookup(&profile, cli.reps)
+	}
+	.map_err(|e| anyhow::anyhow!("point-lookup benchmark run failed: {e}"))?;
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
 	let report = BenchReport::with_results(metadata, vec![result]);
 	finish(cli, &report)
@@ -178,7 +187,16 @@ fn run_range_fetch_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 	let profile_name = cli.name.clone().unwrap_or_else(|| if cli.irregular { "range-fetch-irregular".to_string() } else { "range-fetch-regular".to_string() });
 	let params = RangeFetchParams { seed: cli.seed, point_count: cli.rf_rows, window_rows: cli.rf_window, window_count: cli.rf_windows, regular: !cli.irregular, rows_per_page: cli.rf_rows_per_page };
 	let profile = RangeFetchProfile::new(profile_name, params);
-	let result = run_range_fetch(&profile, cli.reps).map_err(|e| anyhow::anyhow!("range-fetch benchmark run failed: {e}"))?;
+	let result = if let Some(path) = &cli.csv.range_fetch {
+		// A real corpus: the same windowed-read engine, windows drawn from the loaded timestamps.
+		let load_start = std::time::Instant::now();
+		let (timestamps, values) = load_csv_corpus(path, cli.csv.value_column, cli.csv.skip_rows, cli.rf_rows)?;
+		let generation_ns = u64::try_from(load_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+		run_range_fetch_on(&profile, &timestamps, &values, weft_physical_type::TimeUnit::Seconds, generation_ns, cli.reps)
+	} else {
+		run_range_fetch(&profile, cli.reps)
+	}
+	.map_err(|e| anyhow::anyhow!("range-fetch benchmark run failed: {e}"))?;
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
 	let report = BenchReport::with_results(metadata, vec![result]);
 	finish(cli, &report)
@@ -189,6 +207,18 @@ fn run_range_fetch_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 /// the report (headline: realized bytes/point + compression ratio + decode
 /// throughput). No analytic ground truth — correctness is an exact decode round-trip.
 fn run_compression_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
+	if let Some(path) = &cli.csv.compression {
+		// A real corpus: same workload, loaded rows instead of a seeded shape.
+		let load_start = std::time::Instant::now();
+		let (timestamps, values) = load_csv_corpus(path, cli.csv.value_column, cli.csv.skip_rows, cli.comp_rows)?;
+		let generation_ns = u64::try_from(load_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+		let profile_name = cli.name.clone().unwrap_or_else(|| format!("compression-csv-{}", path.file_stem().map_or_else(|| "corpus".into(), |s| s.to_string_lossy())));
+		let run = CorpusRun { name: &profile_name, seed: 0, unit: weft_physical_type::TimeUnit::Seconds, generation_ns };
+		let result = run_compression_on(&run, &timestamps, &values, cli.reps).map_err(|e| anyhow::anyhow!("compression benchmark run failed: {e}"))?;
+		let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
+		let report = BenchReport::with_results(metadata, vec![result]);
+		return finish(cli, &report);
+	}
 	let profile_name = cli.name.clone().unwrap_or_else(|| format!("compression-{}", cli.comp_shape.as_str()));
 	let params = CompressionParams { seed: cli.seed, point_count: cli.comp_rows, regular: !cli.irregular, value_shape: cli.comp_shape };
 	let profile = CompressionProfile::new(profile_name, params);
@@ -206,7 +236,17 @@ fn run_downsample_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 	let profile_name = cli.name.clone().unwrap_or_else(|| "downsample".to_string());
 	let params = DownsampleParams { seed: cli.seed, point_count: cli.ds_points, input_stride_secs: cli.ds_stride, bucket_resolution: cli.ds_bucket, aggregations: cli.ds_aggs.clone(), parallel_chunks: cli.ds_parallel };
 	let profile = DownsampleProfile::new(profile_name, params);
-	let result = run_downsample(&profile, cli.reps).map_err(|e| anyhow::anyhow!("downsample benchmark run failed: {e}"))?;
+	let result = if let Some(path) = &cli.csv.downsample {
+		// A real series: the same reduction engine over loaded rows (epoch seconds, exact decimals).
+		let load_start = std::time::Instant::now();
+		let (timestamps, values) = load_csv_corpus(path, cli.csv.value_column, cli.csv.skip_rows, cli.ds_points)?;
+		let points = timestamps.iter().zip(values).map(|(&t, value)| chrono::DateTime::from_timestamp(t, 0).map(|timestamp| splimes::Point { timestamp, value }).ok_or_else(|| anyhow::anyhow!("epoch {t} is out of range"))).collect::<anyhow::Result<Vec<_>>>()?;
+		let generation_ns = u64::try_from(load_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+		run_downsample_on(&profile, &points, generation_ns, cli.reps)
+	} else {
+		run_downsample(&profile, cli.reps)
+	}
+	.map_err(|e| anyhow::anyhow!("downsample benchmark run failed: {e}"))?;
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
 	let report = BenchReport::with_results(metadata, vec![result]);
 	finish(cli, &report)
@@ -315,6 +355,49 @@ fn derive_profile_name(input: &std::path::Path) -> String {
 	input.file_stem().and_then(|s| s.to_str()).map_or_else(|| "line-protocol".to_string(), ToString::to_string)
 }
 
+/// The real-corpus CSV knobs shared by the storage workloads: one optional CSV file per
+/// workload, plus the value column and head skip they share (see `load_csv_corpus`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CsvKnobs {
+	/// `--comp-csv`: compression workload corpus (`--comp-rows` caps it).
+	compression: Option<PathBuf>,
+	/// `--pl-csv`: point-lookup corpus (`--pl-rows` caps it).
+	point_lookup: Option<PathBuf>,
+	/// `--rf-csv`: range-fetch corpus (`--rf-rows` caps it).
+	range_fetch: Option<PathBuf>,
+	/// `--ds-csv`: downsample series (`--ds-points` caps it).
+	downsample: Option<PathBuf>,
+	/// `--csv-value-col`: 0-based column holding the value.
+	value_column: usize,
+	/// `--csv-skip`: data rows skipped after the header.
+	skip_rows: usize,
+}
+
+impl Default for CsvKnobs {
+	fn default() -> Self {
+		Self { compression: None, point_lookup: None, range_fetch: None, downsample: None, value_column: 1, skip_rows: 0 }
+	}
+}
+
+impl CsvKnobs {
+	/// Every flag this group owns.
+	const FLAGS: [&'static str; 6] = ["--comp-csv", "--pl-csv", "--rf-csv", "--ds-csv", "--csv-value-col", "--csv-skip"];
+
+	/// Apply one of [`Self::FLAGS`] with its value.
+	fn set(&mut self, flag: &str, value: String) -> Result<(), String> {
+		match flag {
+			"--comp-csv" => self.compression = Some(PathBuf::from(value)),
+			"--pl-csv" => self.point_lookup = Some(PathBuf::from(value)),
+			"--rf-csv" => self.range_fetch = Some(PathBuf::from(value)),
+			"--ds-csv" => self.downsample = Some(PathBuf::from(value)),
+			"--csv-value-col" => self.value_column = value.parse().map_err(|_| "invalid --csv-value-col (expected a 0-based column index)".to_string())?,
+			"--csv-skip" => self.skip_rows = value.parse().map_err(|_| "invalid --csv-skip (expected a row count)".to_string())?,
+			other => return Err(format!("unknown CSV flag `{other}`")),
+		}
+		Ok(())
+	}
+}
+
 /// The parsed, validated run configuration.
 ///
 /// The input source is exactly one of two modes: a line-protocol file
@@ -335,6 +418,9 @@ struct Cli {
 	comp_rows: usize,
 	/// Compression mode: the value-column shape (which codec regime to exercise).
 	comp_shape: ValueShape,
+	/// The real-corpus CSV knobs shared by the storage workloads (`--comp-csv`, `--pl-csv`,
+	/// `--rf-csv`, `--ds-csv`, `--csv-value-col`, `--csv-skip`).
+	csv: CsvKnobs,
 	/// Downsample mode: input sample count.
 	ds_points: usize,
 	/// Downsample mode: input sample spacing, in seconds.
@@ -452,17 +538,15 @@ impl Cli {
 		let comp_defaults = CompressionParams::default();
 		let ds_defaults = DownsampleParams::default();
 
-		let mut input: Option<PathBuf> = None;
-		let mut field: Option<String> = None;
+		let (mut input, mut field): (Option<PathBuf>, Option<String>) = (None, None);
 		let mut synthetic = false;
 		let mut point_lookup = false;
 		let mut range_fetch = false;
 		let mut compression = false;
 		let mut downsample = false;
-		let (mut comp_rows, mut comp_shape) = (comp_defaults.point_count, comp_defaults.value_shape);
+		let (mut comp_rows, mut comp_shape, mut csv) = (comp_defaults.point_count, comp_defaults.value_shape, CsvKnobs::default());
 		let (mut ds_points, mut ds_stride, mut ds_bucket) = (ds_defaults.point_count, ds_defaults.input_stride_secs, ds_defaults.bucket_resolution);
-		let mut ds_aggs = ds_defaults.aggregations;
-		let mut ds_parallel = ds_defaults.parallel_chunks.max(1);
+		let (mut ds_aggs, mut ds_parallel) = (ds_defaults.aggregations, ds_defaults.parallel_chunks.max(1));
 		let mut irregular = false;
 		let (mut pl_rows, mut pl_queries, mut pl_absent, mut pl_mode, mut pl_rows_per_page) = (pl_defaults.point_count, pl_defaults.query_count, pl_defaults.absent_fraction, pl_defaults.mode, pl_defaults.rows_per_page);
 		let (mut rf_rows, mut rf_window, mut rf_windows, mut rf_rows_per_page) = (rf_defaults.point_count, rf_defaults.window_rows, rf_defaults.window_count, rf_defaults.rows_per_page);
@@ -509,6 +593,7 @@ impl Cli {
 				"-z" | "--compression" => compression = true,
 				"--comp-rows" => comp_rows = parse_points_count(&take_value(&key)?)?,
 				"--comp-shape" => comp_shape = parse_value_shape(&take_value(&key)?)?,
+				flag if CsvKnobs::FLAGS.contains(&flag) => csv.set(flag, take_value(&key)?)?,
 				"-d" | "--downsample" => downsample = true,
 				"--ds-points" => ds_points = parse_points_count(&take_value(&key)?)?,
 				"--ds-stride" => ds_stride = parse_stride_secs(&take_value(&key)?)?,
@@ -555,7 +640,7 @@ impl Cli {
 		let mode = select_workload_mode(&[(synthetic, InputMode::Synthetic), (point_lookup, InputMode::PointLookup), (range_fetch, InputMode::RangeFetch), (compression, InputMode::Compression), (downsample, InputMode::Downsample)])?;
 		validate_mode(mode, input.as_ref(), field.as_deref(), compare, gpu_calibrate)?;
 
-		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare, html, gpu_calibrate })))
+		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare, html, gpu_calibrate })))
 	}
 }
 
@@ -837,6 +922,9 @@ STORAGE-WORKLOAD OPTIONS (with --point-lookup or --range-fetch):
 
 POINT-LOOKUP OPTIONS (with --point-lookup):
         --pl-rows <N>        Rows sealed into the segment (>=2)     [default: 20000]
+        --pl-csv <FILE>      Look up in a REAL corpus instead of the generated one
+                             (same CSV rules as --comp-csv; --pl-rows caps it,
+                             --csv-value-col / --csv-skip apply)
         --pl-queries <N>     Instants resolved per rep (>=1)           [default: 128]
         --pl-absent <F>      Off-grid-miss fraction in [0, 1]          [default: 0.25]
         --pl-mode <M>        Issue mode: single|batch                [default: batch]
@@ -845,6 +933,8 @@ POINT-LOOKUP OPTIONS (with --point-lookup):
                              (a paged segment exercises the page-pruning read path)
 
 RANGE-FETCH OPTIONS (with --range-fetch):
+        --rf-csv <FILE>      Fetch windows from a REAL corpus instead of the generated
+                             one (same CSV rules as --comp-csv; --rf-rows caps it)
         --rf-rows <N>        Rows sealed into the segment (>=2)     [default: 20000]
         --rf-window <N>      Rows spanned by each fetched window (>=1)  [default: 100]
         --rf-windows <N>     Windows fetched per rep (>=1)              [default: 32]
@@ -855,9 +945,17 @@ COMPRESSION OPTIONS (with --compression):
         --comp-rows <N>      Rows sealed into the segment (>=2)     [default: 20000]
         --comp-shape <S>     Value shape: clustered|trending|jitter
                              (each exercises a different codec) [default: clustered]
+        --comp-csv <FILE>    Measure a REAL corpus instead of a shape: CSV whose first
+                             field is an epoch in seconds (a header line is skipped);
+                             values are read as exact decimal text. --comp-rows caps it.
+        --csv-value-col <N>  0-based CSV column holding the value (with --comp-csv /
+                             --pl-csv / --rf-csv / --ds-csv)          [default: 1]
+        --csv-skip <N>       Data rows skipped first (skip a degenerate head) [default: 0]
 
 DOWNSAMPLE OPTIONS (with --downsample):
         --ds-points <N>      Input sample count (>=2)              [default: 60000]
+        --ds-csv <FILE>      Reduce a REAL series instead of the generated one (same
+                             CSV rules as --comp-csv; --ds-points caps it)
         --ds-parallel <N>    Reduce in N parallel chunks (partials merged);
                              the merged result is identical to serial [default: 1]
         --ds-stride <N>      Seconds between input samples (>=1)        [default: 1]
@@ -1065,6 +1163,14 @@ mod tests {
 		assert_eq!(cli.comp_shape, ValueShape::Trending);
 		assert_eq!(expect_run(&["-z", "--comp-shape", "jitter"]).comp_shape, ValueShape::Jitter);
 		assert!(run_cli(&["-z", "--comp-shape", "triangle"]).unwrap_err().contains("invalid --comp-shape"));
+		// A real corpus: path, value column and skip parse; bad numbers are rejected.
+		let cli = expect_run(&["-z", "--comp-csv", "btc.csv", "--csv-value-col", "4", "--csv-skip", "3000000"]);
+		assert_eq!((cli.csv.compression.as_deref(), cli.csv.value_column, cli.csv.skip_rows), (Some(std::path::Path::new("btc.csv")), 4, 3_000_000));
+		assert_eq!(expect_run(&["-z"]).csv, CsvKnobs::default());
+		assert!(run_cli(&["-z", "--comp-csv", "x.csv", "--csv-value-col", "four"]).unwrap_err().contains("invalid --csv-value-col"));
+		assert_eq!(expect_run(&["-p", "--pl-csv", "btc.csv"]).csv.point_lookup.as_deref(), Some(std::path::Path::new("btc.csv")));
+		assert_eq!(expect_run(&["-r", "--rf-csv", "btc.csv"]).csv.range_fetch.as_deref(), Some(std::path::Path::new("btc.csv")));
+		assert_eq!(expect_run(&["-d", "--ds-csv", "btc.csv"]).csv.downsample.as_deref(), Some(std::path::Path::new("btc.csv")));
 		// Conflicts: another mode, an input file, and --compare.
 		assert!(run_cli(&["--compression", "--synthetic"]).unwrap_err().contains("only one workload mode"));
 		assert!(run_cli(&["--compression", "--input", "x.lp"]).unwrap_err().contains("cannot be combined with an input file"));
