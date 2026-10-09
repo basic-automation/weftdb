@@ -1060,7 +1060,8 @@ are on main, S10 and S11 merged on the durability integration branch, S12 in pro
 - [ ] **W11 · Contract candidate, beta tag, calibration** — ticks **7.6 Quotas/limits** (ROB-24 evidence), **B-tags** (TAG-12) and **Panic audit on server paths** (ROB-2/3/4 + ROB-24)
   - [ ] Move the T7 reference drive (`/mnt/weftbench`) to a 10 Gbps port before calibration *(owner)*
   - [ ] **FRE-9b** OpenAPI: storage and operator endpoints — the last change before the beta tag
-    - [ ] Approve and push the **v1.0.0-beta.1** tag on FRE-9b's merge *(owner)*; the release workflow runs on that tag push and drafts the beta release
+    - [ ] Extend the release tag grammar to `vX.Y.Z-beta.N` (`TAG_RE` in `scripts/release/verify.sh` accepts only `vX.Y.Z` and `vX.Y.Z-rc.N` today, so a beta tag would fail the release workflow's verify job)
+    - [ ] Approve and push the **v1.0.0-beta.1** tag on FRE-9b's merge *(owner)*; once the grammar accepts it, the release workflow runs on that tag push and drafts the beta release
   - [ ] → **SOA-17** Calibration on a pre-grown store, frozen acceptance profiles, `scripts/crash-soak.sh` — on the beta tag
   - [ ] **FRE-10b** Contract tests: storage and operator endpoints, plus coverage — tests and CI only, during calibration
   - [ ] → **FRE-16** CI compatibility gates: OpenAPI breaking-change check, fixture guard, golden coverage — tests and CI only, during calibration
